@@ -51,7 +51,7 @@ import {
   recordEquitySymbolEvaluated,
   recordEquitySymbolSkipped,
   __resetEquityEntryFunnelForTests,
-  type EquityEntryFunnelView,
+  type EquityEntryFunnelBlock,
 } from '../equity-entry-funnel.js';
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
@@ -1628,11 +1628,15 @@ describe('GET /api/health/scaleout-ladder — TRA-1729 observe-pass readout', ()
 // invokes the registered handler and inspects what it actually emitted.
 interface FunnelResponse {
   ok: boolean;
-  demo: EquityEntryFunnelView;
-  live: EquityEntryFunnelView;
+  // TRA-1834 — per-engine blocks, never a single pooled row. Empty list = fleet never_ran.
+  demo: EquityEntryFunnelBlock[];
+  live: EquityEntryFunnelBlock[];
   intradayChurnersDisabled: string[];
   symbolReadRule: string;
 }
+
+/** TRA-1834 — a stable engineId for these direct-call route tests (one engine per test). */
+const FE = 'engine-route-test';
 
 function funnelBody(): FunnelResponse {
   const { app, routes } = fakeApp();
@@ -1661,47 +1665,46 @@ describe('GET /api/health/equity-entry-funnel (TRA-1768)', () => {
     const body = funnelBody();
 
     expect(body.ok).toBe(true);
-    // No reading ≠ a dry signal side. Both books say so, independently.
-    expect(body.demo.funnelStatus).toBe('never_ran');
-    expect(body.live.funnelStatus).toBe('never_ran');
-    expect(body.demo.cumulative.candidatesEvaluated).toBeNull();
-    expect(body.live.cumulative.candidatesEvaluated).toBeNull();
-    expect(body.demo.passCount).toBe(0);
+    // No reading ≠ a dry signal side. TRA-1834 — with no engine ticked, each list is EMPTY
+    // (fleet-level never_ran): nothing to report, not a zero row.
+    expect(body.demo).toEqual([]);
+    expect(body.live).toEqual([]);
   });
 
   it('THE ALARM: a pass that ran and generated nothing serves candidatesEvaluated 0 / no_candidates', () => {
-    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
+    beginEquityEntryPass('demo', FE, { symbolsConsidered: 21, at: NOW });
     const body = funnelBody();
 
-    expect(body.demo.lastPass.candidatesEvaluated).toBe(0);
-    expect(body.demo.funnelStatus).toBe('no_candidates');
-    expect(body.demo.passGateBlockedReason).toBeNull(); // it RAN — no gate to blame
-    expect(body.demo.lastPassAt).not.toBeNull();
+    expect(body.demo[0].label).toBe('demo-1');
+    expect(body.demo[0].lastPass.candidatesEvaluated).toBe(0);
+    expect(body.demo[0].funnelStatus).toBe('no_candidates');
+    expect(body.demo[0].passGateBlockedReason).toBeNull(); // it RAN — no gate to blame
+    expect(body.demo[0].lastPassAt).not.toBeNull();
     // The live book is untouched and must NOT inherit demo's reading.
-    expect(body.live.funnelStatus).toBe('never_ran');
+    expect(body.live).toEqual([]);
   });
 
   it('a gated pass serves the GATE, not a false zero', () => {
-    recordEquityEntryPassGated('demo', 'market_closed', NOW);
+    recordEquityEntryPassGated('demo', FE, 'market_closed', NOW);
     const body = funnelBody();
 
-    expect(body.demo.funnelStatus).toBe('gated');
-    expect(body.demo.passGateBlockedReason).toBe('market_closed');
-    expect(body.demo.cumulative.candidatesEvaluated).toBeNull(); // NOT 0
-    expect(body.demo.passCount).toBe(1); // the tick fired; gated ≠ never_ran
+    expect(body.demo[0].funnelStatus).toBe('gated');
+    expect(body.demo[0].passGateBlockedReason).toBe('market_closed');
+    expect(body.demo[0].cumulative.candidatesEvaluated).toBeNull(); // NOT 0
+    expect(body.demo[0].passCount).toBe(1); // the tick fired; gated ≠ never_ran
   });
 
   it('a candidate eaten by a guardrail serves the EATER by name', () => {
-    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
-    recordEquityCandidate('demo', 'deterministic');
-    recordEquityEntryRejected('demo', 'churn_brake');
+    beginEquityEntryPass('demo', FE, { symbolsConsidered: 21, at: NOW });
+    recordEquityCandidate('demo', FE, 'deterministic');
+    recordEquityEntryRejected('demo', FE, 'churn_brake');
     const body = funnelBody();
 
-    expect(body.demo.funnelStatus).toBe('all_rejected');
-    expect(body.demo.cumulative.candidatesEvaluated).toBe(1);
-    expect(body.demo.cumulative.admitted).toBe(0);
-    expect(body.demo.cumulative.rejectedByReason).toEqual({ churn_brake: 1 });
-    expect(body.demo.cumulative.candidatesBySource).toEqual({ deterministic: 1 });
+    expect(body.demo[0].funnelStatus).toBe('all_rejected');
+    expect(body.demo[0].cumulative.candidatesEvaluated).toBe(1);
+    expect(body.demo[0].cumulative.admitted).toBe(0);
+    expect(body.demo[0].cumulative.rejectedByReason).toEqual({ churn_brake: 1 });
+    expect(body.demo[0].cumulative.candidatesBySource).toEqual({ deterministic: 1 });
   });
 
   it('surfaces that swing mode hard-nulls the intraday churners (context for a dry deterministic bucket)', () => {
@@ -1736,58 +1739,58 @@ describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () =
   const overTheWire = (): FunnelResponse => JSON.parse(JSON.stringify(funnelBody())) as FunnelResponse;
 
   it('serves symbolsConsidered / symbolsEvaluated / symbolsSkippedByReason — per-pass AND cumulative', () => {
-    beginEquityEntryPass('demo', { symbolsConsidered: 3, at: NOW });
-    recordEquitySymbolSkipped('demo', 'stale_feed');
-    recordEquitySymbolSkipped('demo', 'stale_feed');
-    recordEquitySymbolEvaluated('demo');
+    beginEquityEntryPass('demo', FE, { symbolsConsidered: 3, at: NOW });
+    recordEquitySymbolSkipped('demo', FE, 'stale_feed');
+    recordEquitySymbolSkipped('demo', FE, 'stale_feed');
+    recordEquitySymbolEvaluated('demo', FE);
 
     const body = overTheWire();
 
-    expect(body.demo.lastPass.symbolsConsidered).toBe(3);
-    expect(body.demo.lastPass.symbolsEvaluated).toBe(1);
-    expect(body.demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
-    expect(body.demo.cumulative.symbolsConsidered).toBe(3);
-    expect(body.demo.cumulative.symbolsEvaluated).toBe(1);
-    expect(body.demo.cumulative.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
+    expect(body.demo[0].lastPass.symbolsConsidered).toBe(3);
+    expect(body.demo[0].lastPass.symbolsEvaluated).toBe(1);
+    expect(body.demo[0].lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
+    expect(body.demo[0].cumulative.symbolsConsidered).toBe(3);
+    expect(body.demo[0].cumulative.symbolsEvaluated).toBe(1);
+    expect(body.demo[0].cumulative.symbolsSkippedByReason).toEqual({ stale_feed: 2 });
     // …and the live book, which swept nothing, is NOT pooled with it.
-    expect(body.live.cumulative.symbolsEvaluated).toBeNull();
+    expect(body.live).toEqual([]);
   });
 
   it('THE ALARM on the wire: an iterated pass where every symbol was stale serves symbolsEvaluated 0 next to candidatesEvaluated 0', () => {
-    beginEquityEntryPass('demo', { symbolsConsidered: 21, at: NOW });
-    for (let i = 0; i < 21; i++) recordEquitySymbolSkipped('demo', 'stale_feed');
+    beginEquityEntryPass('demo', FE, { symbolsConsidered: 21, at: NOW });
+    for (let i = 0; i < 21; i++) recordEquitySymbolSkipped('demo', FE, 'stale_feed');
 
     const body = overTheWire();
 
     // Identical to a dry Ichimoku by TRA-1768's fields alone…
-    expect(body.demo.funnelStatus).toBe('no_candidates');
-    expect(body.demo.lastPass.candidatesEvaluated).toBe(0);
+    expect(body.demo[0].funnelStatus).toBe('no_candidates');
+    expect(body.demo[0].lastPass.candidatesEvaluated).toBe(0);
     // …and separated from it by exactly one number, which is now on the wire.
-    expect(body.demo.lastPass.symbolsEvaluated).toBe(0);
-    expect(body.demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 21 });
+    expect(body.demo[0].lastPass.symbolsEvaluated).toBe(0);
+    expect(body.demo[0].lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 21 });
     // The rule that tells the reader which of the two it is ships WITH the reading —
     // a read rule that lives only in a ticket is not held by whoever curls the route.
     expect(body.symbolReadRule).toContain('Read symbolsEvaluated BEFORE candidatesEvaluated');
   });
 
   it('the nulls survive JSON serialization as PRESENT KEYS — an absent key is not a null, it is a void', () => {
-    recordEquityEntryPassGated('demo', 'market_closed', NOW);
+    recordEquityEntryPassGated('demo', FE, 'market_closed', NOW);
 
     const raw = JSON.stringify(funnelBody());
     const body = JSON.parse(raw) as FunnelResponse;
 
     // `JSON.stringify` drops `undefined` silently. If any of these were ever produced as
     // `undefined` rather than `null`, the key would VANISH from the body and a reader
-    // doing `body.demo.lastPass.symbolsEvaluated ?? 0` would book a false zero on a GATED
+    // doing `body.demo[0].lastPass.symbolsEvaluated ?? 0` would book a false zero on a GATED
     // pass — the exact bug, re-minted in the field built to kill it. So assert PRESENCE
     // first, and value second.
     for (const key of ['symbolsConsidered', 'symbolsEvaluated', 'symbolsSkippedByReason'] as const) {
-      expect(Object.hasOwn(body.demo.lastPass, key)).toBe(true);
-      expect(Object.hasOwn(body.demo.cumulative, key)).toBe(true);
-      expect(body.demo.lastPass[key]).toBeNull();
-      expect(body.demo.cumulative[key]).toBeNull();
+      expect(Object.hasOwn(body.demo[0].lastPass, key)).toBe(true);
+      expect(Object.hasOwn(body.demo[0].cumulative, key)).toBe(true);
+      expect(body.demo[0].lastPass[key]).toBeNull();
+      expect(body.demo[0].cumulative[key]).toBeNull();
     }
-    expect(body.demo.funnelStatus).toBe('gated'); // …and it is a GATE, not a verdict
+    expect(body.demo[0].funnelStatus).toBe('gated'); // …and it is a GATE, not a verdict
     expect(raw).toContain('"symbolsEvaluated":null'); // literally, on the wire
   });
 });

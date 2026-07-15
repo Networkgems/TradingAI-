@@ -105,6 +105,7 @@ import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
 // found nothing"), so the sweep counts what it skips and why.
 import {
   beginEquityEntryPass,
+  endEquityEntryPass,
   recordEquityEntryPassGated,
   recordEquityCandidate,
   recordEquityEntryRejected,
@@ -2584,7 +2585,9 @@ export class SignalEngine {
   private async sweepEquityEntryUniverse(activeSymbols: string[]): Promise<Array<{ sym: string; candles: Candle[] }>> {
     // The pass is ITERATING. From here `candidatesEvaluated` is a real number and a
     // `0` is a TRUE zero — we looked and the signal side was dry.
-    beginEquityEntryPass(this.mode, { symbolsConsidered: activeSymbols.length });
+    // TRA-1834 — key the funnel by (mode, engineId) so this engine's pass can never be
+    // nulled by a sibling demo engine's gated tick. `feedContextKey` is the stable id.
+    beginEquityEntryPass(this.mode, this.feedContextKey, { symbolsConsidered: activeSymbols.length });
     // TRA-418 — data-feed freshness gate. During market hours a working feed
     // delivers fresh minute bars every tick; when the latest cached bar has
     // aged past the staleness threshold the equity feed (Tradier → Yahoo →
@@ -2609,24 +2612,27 @@ export class SignalEngine {
       if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) {
-        recordEquitySymbolSkipped(this.mode, 'insufficient_candles');
+        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'insufficient_candles');
         continue;
       }
       if (swingMode && !isLiquidSwingSymbol(sym)) {
-        recordEquitySymbolSkipped(this.mode, 'off_swing_universe');
+        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'off_swing_universe');
         continue;
       }
       if (equityFeedGateActive) {
         const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
         if (verdict.stale) {
           log.warn('equity feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
-          recordEquitySymbolSkipped(this.mode, 'stale_feed');
+          recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'stale_feed');
           continue;
         }
       }
-      recordEquitySymbolEvaluated(this.mode);
+      recordEquitySymbolEvaluated(this.mode, this.feedContextKey);
       evaluable.push({ sym, candles });
     }
+    // TRA-1834 — the sweep finished iterating. Finalize the pass so a LATER tick's gate,
+    // which nulls this lingering slot, is not miscounted as a mid-sweep truncation.
+    endEquityEntryPass(this.mode, this.feedContextKey);
     if (evaluable.length === 0 && activeSymbols.length > 0) {
       log.warn('tick: no symbols had sufficient candle data (market closed or data unavailable)');
     }
@@ -3184,7 +3190,7 @@ export class SignalEngine {
           : this.riskGovernor.isHalted() ? 'risk_halted'
             : !isStockMarketOpen() ? 'market_closed'
               : null;
-    if (equityPassGate !== null) recordEquityEntryPassGated(this.mode, equityPassGate);
+    if (equityPassGate !== null) recordEquityEntryPassGated(this.mode, this.feedContextKey, equityPassGate);
     if (equityPassGate === null) {
       // TRA-1793 — the universe sweep OPENS the pass and counts every symbol it skips.
       // It is the loop; nothing here re-implements it.
@@ -3725,7 +3731,8 @@ export class SignalEngine {
     // Its gates are per-CANDIDATE (checked after a signal fired), not per-pass, so
     // auto-trading/halt/market-closed are rejections here rather than pass gates.
     const funnelMode = this.mode;
-    recordEquityCandidate(funnelMode, 'sma200-pullback');
+    const funnelEngineId = this.feedContextKey; // TRA-1834 — split per engine, never pooled
+    recordEquityCandidate(funnelMode, funnelEngineId, 'sma200-pullback');
     if (!isLiveEntryGatePassed(signal.type)) {
       const demoForwardTest =
         this.mode !== 'live'
@@ -3733,7 +3740,7 @@ export class SignalEngine {
       if (!demoForwardTest) {
         signal.liveSkipReason =
           'display-only: sma200_pullback is not registered in the TRA-817 capital-gate manifest (no out-of-sample pass)';
-        recordEquityEntryRejected(funnelMode, 'capital_gate_manifest');
+        recordEquityEntryRejected(funnelMode, funnelEngineId, 'capital_gate_manifest');
         return;
       }
       // Demo forward-test open. Tag the signal so the paper fill below is stamped
@@ -3744,27 +3751,27 @@ export class SignalEngine {
     }
     // TRA-544: suspended when the agent layer owns the decision (§2B).
     if (!this.isDeterministicAutoTradingEnabled()) {
-      recordEquityEntryRejected(funnelMode, 'auto_trading_disabled');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'auto_trading_disabled');
       return;
     }
     if (this.riskGovernor.isHalted()) {
-      recordEquityEntryRejected(funnelMode, 'risk_halted');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'risk_halted');
       return;
     }
     // TRA-726: no day trading after the close — defer the SMA-200 pullback open
     // to the next regular session. The display signal is still surfaced by the
     // caller (runSma200Scan) before this point; only the position open is gated.
     if (!isStockMarketOpen()) {
-      recordEquityEntryRejected(funnelMode, 'market_closed');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'market_closed');
       return;
     }
     // Skip when an equity position for this symbol+type is already open.
     if (this.account.hasOpenPositionForSignalType(signal.symbol, signal.type)) {
-      recordEquityEntryRejected(funnelMode, 'already_open');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'already_open');
       return;
     }
     if (this.mode === 'live' && this.hasOpenLiveEquityPosition(signal.symbol, signal.type)) {
-      recordEquityEntryRejected(funnelMode, 'already_open');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'already_open');
       return;
     }
 
@@ -3775,7 +3782,7 @@ export class SignalEngine {
     const churnCap = this.churnOpenCapVerdict(signal.symbol);
     if (churnCap.blocked) {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
-      recordEquityEntryRejected(funnelMode, 'churn_brake');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'churn_brake');
       return;
     }
 
@@ -3784,7 +3791,7 @@ export class SignalEngine {
     // helper). DARK until CORRELATED_EXPOSURE_CAP_ENABLED is armed.
     const correlatedCapScale = this.applyEquityCorrelatedCap(signal, price);
     if (correlatedCapScale === null) {
-      recordEquityEntryRejected(funnelMode, 'correlated_exposure_cap');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'correlated_exposure_cap');
       return;
     }
 
@@ -3793,7 +3800,7 @@ export class SignalEngine {
       const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
       if (!placement.ok) {
         signal.liveSkipReason = placement.reason;
-        recordEquityEntryRejected(funnelMode, 'live_order_rejected');
+        recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_order_rejected');
         return;
       }
       liveOrderId = placement.orderId;
@@ -3813,9 +3820,9 @@ export class SignalEngine {
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
-      recordEquityEntryAdmitted(funnelMode); // TRA-1768 — reached the book
+      recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
     } else {
-      recordEquityEntryRejected(funnelMode, 'sizing_returned_no_position'); // TRA-1768
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'sizing_returned_no_position'); // TRA-1768
     }
   }
 
@@ -8384,7 +8391,8 @@ export class SignalEngine {
     // names why it died. Several of those returns used to be SILENT (no skip reason
     // stamped anywhere), which is why an 8-day-empty book was unreadable.
     const funnelMode = this.mode;
-    recordEquityCandidate(funnelMode, source);
+    const funnelEngineId = this.feedContextKey; // TRA-1834 — split per engine, never pooled
+    recordEquityCandidate(funnelMode, funnelEngineId, source);
     // TRA-952 — swing universe gate (backstop for the agent-gating path; the
     // deterministic scan already skips off-universe symbols before evaluation).
     // Block equity entries on names outside the curated liquid universe (thin
@@ -8394,18 +8402,18 @@ export class SignalEngine {
       log.info('equity signal suppressed: symbol outside liquid swing universe', {
         component: 'equity-scan', via: source, sym, signalType: signal.type,
       });
-      recordEquityEntryRejected(funnelMode, 'swing_universe');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'swing_universe');
       return null;
     }
     // Skip if an equity position for this symbol+strategy type is already open
     if (this.account.hasOpenPositionForSignalType(sym, signal.type)) {
-      recordEquityEntryRejected(funnelMode, 'already_open');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'already_open');
       return null;
     }
     // TRA-335 — same dedup against the live mirror so we don't
     // submit a second Tradier bracket for an already-open live row.
     if (this.mode === 'live' && this.hasOpenLiveEquityPosition(sym, signal.type)) {
-      recordEquityEntryRejected(funnelMode, 'already_open');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'already_open');
       return null;
     }
     // Deduplicate: skip if same symbol+type signal emitted in last 5 minutes
@@ -8413,7 +8421,7 @@ export class SignalEngine {
       s => s.symbol === signal.symbol && s.type === signal.type && Date.now() - s.timestamp < 5 * 60_000
     );
     if (recent) {
-      recordEquityEntryRejected(funnelMode, 'recent_signal_dedup');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'recent_signal_dedup');
       return null;
     }
 
@@ -8423,7 +8431,7 @@ export class SignalEngine {
     // saw the same signal fire every 5 minutes for hours with zero positions opened.
     if (!price) {
       log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type, via: source });
-      recordEquityEntryRejected(funnelMode, 'no_quote');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'no_quote');
       return null;
     }
 
@@ -8448,7 +8456,7 @@ export class SignalEngine {
       });
       this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
       if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-      recordEquityEntryRejected(funnelMode, 'invalid_bracket');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'invalid_bracket');
       return null;
     }
 
@@ -8472,7 +8480,7 @@ export class SignalEngine {
       signal.liveSkipReason = `daily equity limit reached (${equityTradesOpenedToday}/${this.equityDailyTradesLimit})`;
       this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
       if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-      recordEquityEntryRejected(funnelMode, 'daily_trades_limit');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'daily_trades_limit');
       return null;
     }
 
@@ -8486,7 +8494,7 @@ export class SignalEngine {
       signal.signalSkipReason = `churn brake: ${signal.symbol} hit same-session open cap (${churnCap.count}/${churnCap.cap})`;
       this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
       if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-      recordEquityEntryRejected(funnelMode, 'churn_brake');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'churn_brake');
       return null;
     }
 
@@ -8499,7 +8507,7 @@ export class SignalEngine {
     if (correlatedCapScale === null) {
       this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
       if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-      recordEquityEntryRejected(funnelMode, 'correlated_exposure_cap');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'correlated_exposure_cap');
       return null;
     }
 
@@ -8516,7 +8524,7 @@ export class SignalEngine {
         signal.liveSkipReason = 'Tradier equity client not configured';
         this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-        recordEquityEntryRejected(funnelMode, 'live_client_missing');
+        recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_client_missing');
         return null;
       }
       const placement = await this.placeTradierEquityBracket(signal, price, correlatedCapScale);
@@ -8524,7 +8532,7 @@ export class SignalEngine {
         signal.liveSkipReason = placement.reason;
         this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
         if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-        recordEquityEntryRejected(funnelMode, 'live_order_rejected');
+        recordEquityEntryRejected(funnelMode, funnelEngineId, 'live_order_rejected');
         return null;
       }
       liveOrderId = placement.orderId;
@@ -8560,13 +8568,13 @@ export class SignalEngine {
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
-      recordEquityEntryAdmitted(funnelMode); // TRA-1768 — reached the book
+      recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
     } else {
       // TRA-1768 — the last silent hole: the account/mirror can decline to open (e.g.
       // sized below a risk floor) and the candidate simply evaporated, no reason
       // stamped anywhere. `admitted` must count POSITIONS, never candidates that got
       // this far, or a sleeve that sizes everything to zero reads as "admitting".
-      recordEquityEntryRejected(funnelMode, 'sizing_returned_no_position');
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'sizing_returned_no_position');
     }
 
     // Record signal for daily accuracy tracking

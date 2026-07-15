@@ -15,6 +15,7 @@ import type { Candle, TradeSignal } from '@trading-app/shared';
 import {
   beginEquityEntryPass,
   recordEquityEntryPassGated,
+  recordEquitySymbolEvaluated,
   summarizeEquityEntryFunnel,
   __resetEquityEntryFunnelForTests,
 } from './equity-entry-funnel.js';
@@ -35,6 +36,12 @@ type Privates = {
   /** TRA-1793 — the universe sweep. THE loop the engine runs; the tests call the same one. */
   sweepEquityEntryUniverse: (activeSymbols: string[]) => Promise<Array<{ sym: string; candles: Candle[] }>>;
   candleCache: Map<string, Candle[]>;
+  /**
+   * TRA-1834 — the engine's stable per-instance funnel key. A test that opens a pass
+   * DIRECTLY must use the SAME id the engine records candidates under, or the candidate
+   * folds into a different slot and the assertion is meaningless.
+   */
+  feedContextKey: string;
 };
 
 const priv = (e: SignalEngine) => e as unknown as Privates;
@@ -61,6 +68,9 @@ async function demoEngine(): Promise<SignalEngine> {
   return engine;
 }
 
+/** TRA-1834 — a stable engineId for tests that open a pass DIRECTLY (no engine). */
+const E1 = 'engine-test-1';
+
 describe('TRA-1768 — equity entry funnel', () => {
   const priorFlag = process.env[CHURN_LOSS_BRAKE_FLAG];
   const priorCap = process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE];
@@ -83,20 +93,19 @@ describe('TRA-1768 — equity entry funnel', () => {
 
   // ── The three-valued contract: null ≠ 0 ─────────────────────────────────────
 
-  it('no pass since boot: candidatesEvaluated is NULL, not 0 — "no reading" is not "the signal is dry"', () => {
-    const { demo } = summarizeEquityEntryFunnel();
-    expect(demo.funnelStatus).toBe('never_ran');
-    expect(demo.cumulative.candidatesEvaluated).toBeNull();
-    expect(demo.lastPass.candidatesEvaluated).toBeNull();
-    expect(demo.lastPass.rejectedByReason).toBeNull();
-    expect(demo.passCount).toBe(0);
-    expect(demo.lastPassAt).toBeNull();
+  it('no pass since boot: NO engine block at all — "no reading" is not "the signal is dry"', () => {
+    // TRA-1834 — with per-engine keying, "no pass since boot" is an EMPTY list: no engine
+    // of that mode has ticked, so there is genuinely nothing to report — not a zero row.
+    const { demo, live } = summarizeEquityEntryFunnel();
+    expect(demo).toEqual([]);
+    expect(live).toEqual([]);
   });
 
   it('acceptance 2a — a pass that RAN and saw nothing: candidatesEvaluated 0, funnelStatus no_candidates', () => {
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', E1, { symbolsConsidered: 21 });
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
+    expect(demo.label).toBe('demo-1');
     expect(demo.lastPass.candidatesEvaluated).toBe(0);
     expect(demo.cumulative.candidatesEvaluated).toBe(0);
     expect(demo.funnelStatus).toBe('no_candidates');
@@ -108,14 +117,16 @@ describe('TRA-1768 — equity entry funnel', () => {
     expect(demo.passGateBlockedReason).toBeNull();
     // 0 candidates were REJECTED FOR A REASON — there were no candidates at all.
     expect(demo.lastPass.rejectedByReason).toEqual({});
+    // TRA-1834 — no sibling engine nulled this pass, so nothing was truncated.
+    expect(demo.passesTruncated).toBe(0);
   });
 
   it('a GATED pass is NOT a dry signal: candidatesEvaluated stays null and the gate is named', () => {
     // The whole reason passGateBlockedReason exists. A shut market must never be able
     // to stamp `candidatesEvaluated: 0` and libel the strategy as "generating no ideas".
-    recordEquityEntryPassGated('demo', 'market_closed');
+    recordEquityEntryPassGated('demo', E1, 'market_closed');
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.funnelStatus).toBe('gated');
     expect(demo.funnelStatus).not.toBe('no_candidates'); // the collision this kills
     expect(demo.cumulative.candidatesEvaluated).toBeNull();
@@ -123,20 +134,22 @@ describe('TRA-1768 — equity entry funnel', () => {
     // The tick still fired — never_ran and gated are different states.
     expect(demo.passCount).toBe(1);
     expect(demo.iteratedPassCount).toBe(0);
+    // A gate that lands on NO open pass is a clean close, not a truncation.
+    expect(demo.passesTruncated).toBe(0);
   });
 
   // ── Driven through the REAL engine entry chokepoint ─────────────────────────
 
   it('ENGINE: a candidate that reaches the book counts as admitted (funnelStatus admitting)', async () => {
     const engine = await demoEngine();
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
 
     await priv(engine).routeEquitySignal(buildSignal(), 100, 'deterministic');
 
     // Sanity: the real engine actually opened the position we are claiming to count.
     expect(engine.getState().account.openPositions.some(p => p.symbol === 'AAPL')).toBe(true);
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.cumulative.candidatesEvaluated).toBe(1);
     expect(demo.cumulative.admitted).toBe(1);
     expect(demo.funnelStatus).toBe('admitting');
@@ -154,10 +167,10 @@ describe('TRA-1768 — equity entry funnel', () => {
     process.env[CHURN_SAME_SESSION_OPEN_CAP_VALUE] = '1';
     priv(engine).recordChurnOpen('AAPL');
 
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
     await priv(engine).routeEquitySignal(buildSignal(), 100, 'deterministic');
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     // The signal FIRED — this is the state that must not look like a dry strategy.
     expect(demo.lastPass.candidatesEvaluated).toBe(1);
     expect(demo.lastPass.admitted).toBe(0);
@@ -170,12 +183,12 @@ describe('TRA-1768 — equity entry funnel', () => {
 
   it('ENGINE: a candidate outside the swing universe is named, not silently dropped', async () => {
     const engine = await demoEngine();
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
 
     // A thin small-cap that cannot be in the curated 21-name liquid universe.
     await priv(engine).routeEquitySignal(buildSignal('ZZZZ', 'sig-zzzz'), 100, 'deterministic');
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.candidatesEvaluated).toBe(1);
     expect(demo.lastPass.admitted).toBe(0);
     expect(demo.lastPass.rejectedByReason).toEqual({ swing_universe: 1 });
@@ -184,11 +197,11 @@ describe('TRA-1768 — equity entry funnel', () => {
 
   it('ENGINE: a candidate with no quote is counted and named (was a silent return null)', async () => {
     const engine = await demoEngine();
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
 
     await priv(engine).routeEquitySignal(buildSignal(), undefined, 'deterministic');
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.candidatesEvaluated).toBe(1);
     expect(demo.lastPass.rejectedByReason).toEqual({ no_quote: 1 });
   });
@@ -197,29 +210,70 @@ describe('TRA-1768 — equity entry funnel', () => {
 
   it('demo and live are reported SEPARATELY — a live sleeve holding no risk cannot hide behind demo', async () => {
     const engine = await demoEngine();
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', priv(engine).feedContextKey, { symbolsConsidered: 21 });
     await priv(engine).routeEquitySignal(buildSignal(), 100, 'deterministic');
 
     const { demo, live } = summarizeEquityEntryFunnel();
-    expect(demo.funnelStatus).toBe('admitting');
+    expect(demo[0].funnelStatus).toBe('admitting');
     // The live book was never touched, and it says so — it does NOT inherit demo's health.
-    expect(live.funnelStatus).toBe('never_ran');
-    expect(live.cumulative.candidatesEvaluated).toBeNull();
-    expect(live.cumulative.admitted).toBeNull();
+    // No live engine ticked, so the live list is EMPTY (fleet-level never_ran).
+    expect(live).toEqual([]);
   });
 
   it('the cumulative verdict survives a later flat pass — one quiet tick cannot report no_candidates over a book that opened', async () => {
     const engine = await demoEngine();
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    const eid = priv(engine).feedContextKey;
+    beginEquityEntryPass('demo', eid, { symbolsConsidered: 21 });
     await priv(engine).routeEquitySignal(buildSignal(), 100, 'deterministic');
     // A later tick generates nothing (perfectly normal in a flat market).
-    beginEquityEntryPass('demo', { symbolsConsidered: 21 });
+    beginEquityEntryPass('demo', eid, { symbolsConsidered: 21 });
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.candidatesEvaluated).toBe(0); // this pass was dry...
     expect(demo.funnelStatus).toBe('admitting');       // ...but the sleeve is demonstrably alive
     expect(demo.cumulative.admitted).toBe(1);
     expect(demo.passCount).toBe(2);
+  });
+
+  // ── TRA-1834 — two demo engines never pool, and neither drops the other's counts ──
+
+  it('acceptance 4 — a gated tick on demo-2 does NOT null demo-1 mid-sweep: all 6 symbols counted, passesTruncated 0', () => {
+    // The exact regime the 20:10Z capture sat inside: demo-1 is iterating a pass while
+    // demo-2 is halted and gates every tick. Before the split, demo-2's gate nulled the
+    // SHARED open pass and every symbol demo-1 recorded after it was silently dropped.
+    const demo1 = 'engine-demo-1';
+    const demo2 = 'engine-demo-2';
+
+    // demo-1 opens a pass and records 3 symbols…
+    beginEquityEntryPass('demo', demo1, { symbolsConsidered: 6 });
+    recordEquitySymbolEvaluated('demo', demo1);
+    recordEquitySymbolEvaluated('demo', demo1);
+    recordEquitySymbolEvaluated('demo', demo1);
+
+    // …then demo-2 (halted, "no new entries for the day") gates mid-sweep…
+    recordEquityEntryPassGated('demo', demo2, 'risk_halted');
+
+    // …and demo-1 resumes and records 3 more. Under the old mode-only keying these last
+    // three hit the null-guard and vanished.
+    recordEquitySymbolEvaluated('demo', demo1);
+    recordEquitySymbolEvaluated('demo', demo1);
+    recordEquitySymbolEvaluated('demo', demo1);
+
+    const { demo } = summarizeEquityEntryFunnel();
+    // Two engines, two labelled blocks — never summed into one row.
+    expect(demo.map(b => b.engineId).sort()).toEqual([demo1, demo2]);
+    const b1 = demo.find(b => b.engineId === demo1)!;
+    const b2 = demo.find(b => b.engineId === demo2)!;
+
+    // All 6 survive — nothing was dropped, and NOTHING was truncated.
+    expect(b1.lastPass.symbolsEvaluated).toBe(6);
+    expect(b1.cumulative.symbolsEvaluated).toBe(6);
+    expect(b1.passesTruncated).toBe(0);
+
+    // demo-2's gate landed on ITS OWN (empty) slot — it never touched demo-1's pass.
+    expect(b2.funnelStatus).toBe('gated');
+    expect(b2.passGateBlockedReason).toBe('risk_halted');
+    expect(b2.passesTruncated).toBe(0);
   });
 });
 
@@ -281,7 +335,7 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     const evaluable = await priv(engine).sweepEquityEntryUniverse(universe);
 
     expect(evaluable).toHaveLength(0); // no strategy ran on any symbol
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.symbolsConsidered).toBe(3);
     expect(demo.lastPass.symbolsEvaluated).toBe(0);                     // THE ALARM
     expect(demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 3 });
@@ -301,7 +355,7 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     const evaluable = await priv(engine).sweepEquityEntryUniverse(['AAPL', 'MSFT']);
 
     expect(evaluable).toHaveLength(0);
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.symbolsEvaluated).toBe(0);
     expect(demo.lastPass.symbolsSkippedByReason).toEqual({ insufficient_candles: 2 });
     expect(demo.funnelStatus).toBe('no_candidates'); // …which is why the buckets are load-bearing
@@ -319,16 +373,16 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     // The universe gate ate ZZZZ — and AAPL still REACHED strategy evaluation, which is
     // the whole point: a large off_swing_universe count is not an outage.
     expect(evaluable.map(e => e.sym)).toEqual(['AAPL']);
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.lastPass.symbolsConsidered).toBe(2);
     expect(demo.lastPass.symbolsEvaluated).toBe(1); // > 0 ⇒ the strategy DID run: a real reading
     expect(demo.lastPass.symbolsSkippedByReason).toEqual({ off_swing_universe: 1 });
   });
 
   it('a GATED pass leaves symbolsEvaluated NULL — never 0. A shut market did not evaluate zero symbols; it evaluated none.', () => {
-    recordEquityEntryPassGated('demo', 'market_closed');
+    recordEquityEntryPassGated('demo', E1, 'market_closed');
 
-    const { demo } = summarizeEquityEntryFunnel();
+    const [demo] = summarizeEquityEntryFunnel().demo;
     expect(demo.funnelStatus).toBe('gated');
     expect(demo.lastPass.symbolsEvaluated).toBeNull();       // NOT 0
     expect(demo.lastPass.symbolsConsidered).toBeNull();
@@ -345,12 +399,13 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     await priv(engine).sweepEquityEntryUniverse(['AAPL', 'MSFT']);
 
     const { demo, live } = summarizeEquityEntryFunnel();
-    expect(demo.cumulative.symbolsConsidered).toBe(4);
-    expect(demo.cumulative.symbolsEvaluated).toBe(2);
-    expect(demo.cumulative.symbolsSkippedByReason).toEqual({ insufficient_candles: 2 });
-    expect(demo.lastPass.symbolsEvaluated).toBe(1); // the per-pass view is not the cumulative one
-    // The live book swept nothing. It must say NO READING, not zero.
-    expect(live.cumulative.symbolsEvaluated).toBeNull();
-    expect(live.lastPass.symbolsSkippedByReason).toBeNull();
+    expect(demo[0].cumulative.symbolsConsidered).toBe(4);
+    expect(demo[0].cumulative.symbolsEvaluated).toBe(2);
+    expect(demo[0].cumulative.symbolsSkippedByReason).toEqual({ insufficient_candles: 2 });
+    expect(demo[0].lastPass.symbolsEvaluated).toBe(1); // the per-pass view is not the cumulative one
+    // TRA-1834 — two clean sweeps, no sibling null: nothing truncated.
+    expect(demo[0].passesTruncated).toBe(0);
+    // The live book swept nothing. No live engine registered, so the list is EMPTY.
+    expect(live).toEqual([]);
   });
 });

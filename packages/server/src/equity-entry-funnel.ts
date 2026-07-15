@@ -35,6 +35,20 @@
 // durable one — and it is the one we can actually READ, on the FIRST tick after the
 // pin lifts. That trade is the whole point.
 //
+// ── PER-ENGINE, NEVER POOLED (TRA-1834) ──────────────────────────────────────
+// The fleet runs MORE THAN ONE demo engine (`/api/health/demo-book-public` reports
+// `demoEngineCount: 2`). They are two SignalEngine instances, both `mode === 'demo'`.
+// Keying the ledger by `mode` ALONE made them share one slot — and the deterministic
+// sweep yields to the event loop mid-pass (TRA-1082, `EQUITY_EVAL_YIELD_EVERY`), which
+// lets the two interleave. A gated tick on demo-2 called `recordEquityEntryPassGated`,
+// which NULLED the shared open pass — the one demo-1 was still iterating. Every symbol
+// demo-1 evaluated after that hit the null-guard and was SILENTLY DROPPED. A truncated
+// pass and an idle pass then emit the same bytes: this module's own bug class, one layer
+// down. So the ledger is keyed by `(mode, engineId)` — a halted book and an active book
+// never sum into one row, and one engine can no longer null another's in-flight pass.
+// The report labels each engine as its own block (`demo-1`, `demo-2`), the same way demo
+// and live are already kept apart.
+//
 // ── THREE-VALUED, NO FALSE ZEROES ────────────────────────────────────────────
 // `null` = no reading. `0` = the pass ran and genuinely saw nothing. `>0` = real.
 //
@@ -168,6 +182,14 @@ interface ModeLedger {
   gatedPassCount: number;
   /** Passes that actually ITERATED the candidate loop. 0 ⇒ candidatesEvaluated is null. */
   iteratedPassCount: number;
+  /**
+   * TRA-1834 — passes whose open slot was nulled while STILL ITERATING (before
+   * `endEquityEntryPass` finalized them). The detector for the pooling disease this
+   * ticket cured: with per-engine keying no sibling engine can reach this slot, and a
+   * single engine's tick either gates OR sweeps (never both), so this MUST stay `0`. If
+   * it ever moves, an `engineId` is being shared and the drop-counts bug is back.
+   */
+  passesTruncated: number;
   lastPassAt: number | null;
   lastPassGateBlockedReason: EquityEntryPassGateReason | null;
   lastAdmittedAt: number | null;
@@ -197,6 +219,7 @@ function emptyLedger(): ModeLedger {
     passCount: 0,
     gatedPassCount: 0,
     iteratedPassCount: 0,
+    passesTruncated: 0,
     lastPassAt: null,
     lastPassGateBlockedReason: null,
     lastAdmittedAt: null,
@@ -216,13 +239,8 @@ function emptyLedger(): ModeLedger {
   };
 }
 
-const LEDGERS: Record<EquityEntryMode, ModeLedger> = {
-  demo: emptyLedger(),
-  live: emptyLedger(),
-};
-
 /**
- * The pass currently being accumulated, per mode. Present only between
+ * The pass currently being accumulated, per engine. Present only between
  * `beginEquityEntryPass` and the next pass boundary; candidate hooks fold into BOTH
  * this and the cumulative ledger.
  *
@@ -232,6 +250,12 @@ const LEDGERS: Record<EquityEntryMode, ModeLedger> = {
  * `lastPass` only when a window happens to be open (same tick, same funnel). This is
  * why `funnelStatus` keys off the cumulative counters, not `lastPass`: an SMA-200
  * candidate admitted during a gated tick must not read as `never_ran`.
+ *
+ * TRA-1834 — `complete` is set by `endEquityEntryPass` when the sweep finishes iterating.
+ * A slot nulled (by a gate) or overwritten (by the next `beginEquityEntryPass`) while
+ * `complete` is still false was cut off MID-ITERATION — that is a truncation. The flag
+ * is what keeps the normal sweep→gate→sweep sequence from reading as a truncation: a
+ * completed pass that lingers until the next tick's gate nulls it is not a drop.
  */
 interface OpenPass {
   candidates: number;
@@ -239,12 +263,44 @@ interface OpenPass {
   rejected: Counter<EquityEntryRejectReason>;
   symbolsEvaluated: number;
   symbolsSkipped: Counter<EquitySymbolSkipReason>;
+  /** TRA-1834 — the sweep finished iterating this pass. See the truncation detector. */
+  complete: boolean;
 }
 
-const OPEN_PASS: Record<EquityEntryMode, OpenPass | null> = {
-  demo: null,
-  live: null,
-};
+/**
+ * TRA-1834 — one engine's funnel state. Keyed by `(mode, engineId)` so two demo engines
+ * never share a ledger or an open pass. `engineId` is the engine's stable per-instance
+ * id (`SignalEngine.feedContextKey`), so it survives every tick and never collides.
+ */
+interface EngineSlot {
+  mode: EquityEntryMode;
+  engineId: string;
+  led: ModeLedger;
+  open: OpenPass | null;
+}
+
+/**
+ * All engine slots, in first-seen order. The Map's insertion order is load-bearing: it
+ * fixes the `demo-1`/`demo-2` labels in the report, so the same engine keeps the same
+ * label for the life of the process.
+ */
+const SLOTS = new Map<string, EngineSlot>();
+
+/** `mode` is a closed union with no space, so a space separator can never alias keys. */
+function slotKey(mode: EquityEntryMode, engineId: string): string {
+  return `${mode} ${engineId}`;
+}
+
+/** The slot for one engine, created on first use (its first tick after boot). */
+function slotFor(mode: EquityEntryMode, engineId: string): EngineSlot {
+  const key = slotKey(mode, engineId);
+  let slot = SLOTS.get(key);
+  if (slot === undefined) {
+    slot = { mode, engineId, led: emptyLedger(), open: null };
+    SLOTS.set(key, slot);
+  }
+  return slot;
+}
 
 function bump<K extends string>(c: Counter<K>, k: K): void {
   c[k] = (c[k] ?? 0) + 1;
@@ -257,6 +313,11 @@ function bump<K extends string>(c: Counter<K>, k: K): void {
  */
 export function beginEquityEntryPass(
   mode: EquityEntryMode,
+  // TRA-1834 — `engineId` is REQUIRED and positional (not optional with a default):
+  // an omitted id would collapse two demo engines back into one slot, which is the exact
+  // bug this ticket cures. Making it a required parameter turns every unmigrated call
+  // site into a COMPILE error rather than a silent re-pool.
+  engineId: string,
   // TRA-1793 — an options object, not positional args: the previous signature was
   // `(mode, at)`, and adding `symbolsConsidered` positionally would let an unmigrated
   // `beginEquityEntryPass('demo', NOW)` silently book a 1.7e12-symbol universe. A
@@ -267,13 +328,18 @@ export function beginEquityEntryPass(
     at?: number;
   },
 ): void {
-  const led = LEDGERS[mode];
+  const slot = slotFor(mode, engineId);
+  const led = slot.led;
   const at = opts.at ?? Date.now();
+  // TRA-1834 — a still-iterating pass being replaced was cut off mid-flight. Cannot
+  // happen from a sibling engine (separate slot) nor from this engine's own tick (a tick
+  // sweeps at most once), so it must stay 0; it is the sentinel that the split holds.
+  if (slot.open !== null && !slot.open.complete) led.passesTruncated += 1;
   led.passCount += 1;
   led.iteratedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = null;
-  OPEN_PASS[mode] = { candidates: 0, admitted: 0, rejected: {}, symbolsEvaluated: 0, symbolsSkipped: {} };
+  slot.open = { candidates: 0, admitted: 0, rejected: {}, symbolsEvaluated: 0, symbolsSkipped: {}, complete: false };
   // Seed the last-pass fields immediately, so a pass that iterates and finds nothing
   // still reports `candidatesEvaluated: 0` (not null) even if no hook fires after this.
   led.lastPassCandidates = 0;
@@ -286,6 +352,19 @@ export function beginEquityEntryPass(
 }
 
 /**
+ * TRA-1834 — the sweep finished iterating; finalize the open pass.
+ *
+ * This marks the pass `complete` so a LATER tick's gate (which nulls the lingering slot)
+ * is not miscounted as a truncation. It does NOT null the slot: `openSma200Pullback` and
+ * the strategy loop still fold candidates/rejections/admits into this pass after the
+ * sweep returns, on the same tick. Idempotent and a no-op if no pass is open.
+ */
+export function endEquityEntryPass(mode: EquityEntryMode, engineId: string): void {
+  const slot = slotFor(mode, engineId);
+  if (slot.open !== null) slot.open.complete = true;
+}
+
+/**
  * The pass FIRED but was held at the gate — the candidate loop never iterated.
  *
  * `passCount` still increments (it is the monotone proof the tick is alive: a pass
@@ -295,15 +374,23 @@ export function beginEquityEntryPass(
  */
 export function recordEquityEntryPassGated(
   mode: EquityEntryMode,
+  engineId: string,
   reason: EquityEntryPassGateReason,
   at: number = Date.now(),
 ): void {
-  const led = LEDGERS[mode];
+  const slot = slotFor(mode, engineId);
+  const led = slot.led;
   led.passCount += 1;
   led.gatedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = reason;
-  OPEN_PASS[mode] = null;
+  // TRA-1834 — nulling a still-iterating pass is the disease itself: the pass was cut off
+  // mid-sweep and every symbol after this is dropped. With per-engine keying the gate
+  // only ever reaches THIS engine's slot, and this engine's tick gates XOR sweeps, so its
+  // own open pass is always `complete` by now. A `complete` (or already-null) pass is a
+  // clean close, not a truncation.
+  if (slot.open !== null && !slot.open.complete) led.passesTruncated += 1;
+  slot.open = null;
 }
 
 /**
@@ -311,34 +398,42 @@ export function recordEquityEntryPassGated(
  *
  * This is the number that separates a dry signal from a dead feed. `0` on an iterated
  * pass is THE ALARM: no strategy was ever run, so nothing about the strategy can be
- * concluded. Only counted inside an open pass — a symbol cannot be evaluated by a pass
- * that never iterated, and stamping one outside would mint the false zero's inverse.
+ * concluded.
+ *
+ * TRA-1834 — the cumulative counter now increments BEFORE the open-pass guard, matching
+ * `recordEquityCandidate`/`recordEquityEntryRejected`/`recordEquityEntryAdmitted`. Under
+ * the old mode-only keying a sibling engine could null this slot's pass mid-sweep, and
+ * the guard-first order then DROPPED the count — the exact bytes this ticket chased. With
+ * per-engine keying that null can no longer happen, so folding the cumulative before the
+ * guard is defence-in-depth: even a stray call outside a pass now preserves the since-boot
+ * total, and the per-pass fields still require an open pass.
  */
-export function recordEquitySymbolEvaluated(mode: EquityEntryMode): void {
-  const led = LEDGERS[mode];
-  const pass = OPEN_PASS[mode];
+export function recordEquitySymbolEvaluated(mode: EquityEntryMode, engineId: string): void {
+  const slot = slotFor(mode, engineId);
+  slot.led.cumSymbolsEvaluated += 1;
+  const pass = slot.open;
   if (!pass) return;
-  led.cumSymbolsEvaluated += 1;
   pass.symbolsEvaluated += 1;
-  led.lastPassSymbolsEvaluated = pass.symbolsEvaluated;
+  slot.led.lastPassSymbolsEvaluated = pass.symbolsEvaluated;
 }
 
 /** TRA-1793 — a symbol was SKIPPED before strategy evaluation, and this is why. */
-export function recordEquitySymbolSkipped(mode: EquityEntryMode, reason: EquitySymbolSkipReason): void {
-  const led = LEDGERS[mode];
-  const pass = OPEN_PASS[mode];
+export function recordEquitySymbolSkipped(mode: EquityEntryMode, engineId: string, reason: EquitySymbolSkipReason): void {
+  const slot = slotFor(mode, engineId);
+  bump(slot.led.cumSymbolsSkipped, reason); // TRA-1834 — cumulative BEFORE the guard (see above)
+  const pass = slot.open;
   if (!pass) return;
-  bump(led.cumSymbolsSkipped, reason);
   bump(pass.symbolsSkipped, reason);
-  led.lastPassSymbolsSkipped = { ...pass.symbolsSkipped };
+  slot.led.lastPassSymbolsSkipped = { ...pass.symbolsSkipped };
 }
 
 /** One equity entry candidate was evaluated (i.e. reached the entry chokepoint). */
-export function recordEquityCandidate(mode: EquityEntryMode, source: EquityEntrySource): void {
-  const led = LEDGERS[mode];
+export function recordEquityCandidate(mode: EquityEntryMode, engineId: string, source: EquityEntrySource): void {
+  const slot = slotFor(mode, engineId);
+  const led = slot.led;
   led.cumCandidates += 1;
   bump(led.cumBySource, source);
-  const pass = OPEN_PASS[mode];
+  const pass = slot.open;
   if (pass) {
     pass.candidates += 1;
     led.lastPassCandidates = pass.candidates;
@@ -346,10 +441,11 @@ export function recordEquityCandidate(mode: EquityEntryMode, source: EquityEntry
 }
 
 /** A candidate was evaluated and REJECTED before reaching the book. */
-export function recordEquityEntryRejected(mode: EquityEntryMode, reason: EquityEntryRejectReason): void {
-  const led = LEDGERS[mode];
+export function recordEquityEntryRejected(mode: EquityEntryMode, engineId: string, reason: EquityEntryRejectReason): void {
+  const slot = slotFor(mode, engineId);
+  const led = slot.led;
   bump(led.cumRejected, reason);
-  const pass = OPEN_PASS[mode];
+  const pass = slot.open;
   if (pass) {
     bump(pass.rejected, reason);
     led.lastPassRejected = { ...pass.rejected };
@@ -357,11 +453,12 @@ export function recordEquityEntryRejected(mode: EquityEntryMode, reason: EquityE
 }
 
 /** A candidate reached `openPosition` / the broker and a position exists. */
-export function recordEquityEntryAdmitted(mode: EquityEntryMode, at: number = Date.now()): void {
-  const led = LEDGERS[mode];
+export function recordEquityEntryAdmitted(mode: EquityEntryMode, engineId: string, at: number = Date.now()): void {
+  const slot = slotFor(mode, engineId);
+  const led = slot.led;
   led.cumAdmitted += 1;
   led.lastAdmittedAt = at;
-  const pass = OPEN_PASS[mode];
+  const pass = slot.open;
   if (pass) {
     pass.admitted += 1;
     led.lastPassAdmitted = pass.admitted;
@@ -378,7 +475,7 @@ function statusFor(led: ModeLedger): EquityEntryFunnelStatus {
   return 'no_candidates';
 }
 
-/** Serialized funnel for one mode. Every count is three-valued; `null` means NO READING. */
+/** Serialized funnel for ONE engine. Every count is three-valued; `null` means NO READING. */
 export interface EquityEntryFunnelView {
   funnelStatus: EquityEntryFunnelStatus;
   /** Monotone proof the pass fires at all. 0 ⇒ the engine never reached the pass. */
@@ -387,6 +484,13 @@ export interface EquityEntryFunnelView {
   gatedPassCount: number;
   /** Passes that actually iterated the candidate loop. 0 ⇒ candidatesEvaluated is null. */
   iteratedPassCount: number;
+  /**
+   * TRA-1834 — passes cut off mid-iteration by a slot null. MUST be 0: per-engine keying
+   * makes it structurally impossible, so any non-zero here means an engineId collision
+   * and the drop-counts bug is live again. `symbolsEvaluated`/`symbolsSkippedByReason`
+   * would then be LOWER BOUNDS, not real counts.
+   */
+  passesTruncated: number;
   lastPassAt: string | null;
   /** Which gate held the most recent pass; null when it iterated. */
   passGateBlockedReason: EquityEntryPassGateReason | null;
@@ -414,8 +518,7 @@ export interface EquityEntryFunnelView {
   };
 }
 
-function viewFor(mode: EquityEntryMode): EquityEntryFunnelView {
-  const led = LEDGERS[mode];
+function viewOf(led: ModeLedger): EquityEntryFunnelView {
   // Three-valued: with no ITERATED pass since boot there is NO READING of the
   // candidate side — not a zero. `0` here must only ever mean "we looked and the
   // signal side was dry", because that reading is what indicts the strategy.
@@ -433,6 +536,7 @@ function viewFor(mode: EquityEntryMode): EquityEntryFunnelView {
     passCount: led.passCount,
     gatedPassCount: led.gatedPassCount,
     iteratedPassCount: led.iteratedPassCount,
+    passesTruncated: led.passesTruncated,
     lastPassAt: led.lastPassAt === null ? null : new Date(led.lastPassAt).toISOString(),
     passGateBlockedReason: led.lastPassGateBlockedReason,
     lastAdmittedAt: led.lastAdmittedAt === null ? null : new Date(led.lastAdmittedAt).toISOString(),
@@ -456,15 +560,37 @@ function viewFor(mode: EquityEntryMode): EquityEntryFunnelView {
   };
 }
 
-/** Demo and live, separately labelled. Never pooled — see the module header. */
-export function summarizeEquityEntryFunnel(): { demo: EquityEntryFunnelView; live: EquityEntryFunnelView } {
-  return { demo: viewFor('demo'), live: viewFor('live') };
+/**
+ * TRA-1834 — one engine's funnel, labelled. The fleet runs more than one demo engine and
+ * they must never sum into one row, so the report is a LIST per mode: each block carries
+ * its own `engineId` (the stable `feedContextKey`) and a positional `label` (`demo-1`,
+ * `demo-2`, …) assigned in first-seen order.
+ */
+export interface EquityEntryFunnelBlock extends EquityEntryFunnelView {
+  /** Stable per-instance engine id (`SignalEngine.feedContextKey`). */
+  engineId: string;
+  /** Positional label within the mode, first-seen order. `demo-1`, `live-1`, … */
+  label: string;
+}
+
+/**
+ * Every engine's funnel, split by mode and NEVER pooled — see the module header.
+ *
+ * An EMPTY array is the fleet-level `never_ran`: no engine of that mode has ticked since
+ * boot, so there is genuinely nothing to report — not a zero. A reader takes each block's
+ * own `funnelStatus`; there is deliberately no aggregate row, because a halted book and an
+ * active book summing into one is the bug this ticket cured.
+ */
+export function summarizeEquityEntryFunnel(): { demo: EquityEntryFunnelBlock[]; live: EquityEntryFunnelBlock[] } {
+  const out: { demo: EquityEntryFunnelBlock[]; live: EquityEntryFunnelBlock[] } = { demo: [], live: [] };
+  for (const slot of SLOTS.values()) {
+    const bucket = out[slot.mode];
+    bucket.push({ engineId: slot.engineId, label: `${slot.mode}-${bucket.length + 1}`, ...viewOf(slot.led) });
+  }
+  return out;
 }
 
 /** Test-only: drop all state back to boot. */
 export function __resetEquityEntryFunnelForTests(): void {
-  LEDGERS.demo = emptyLedger();
-  LEDGERS.live = emptyLedger();
-  OPEN_PASS.demo = null;
-  OPEN_PASS.live = null;
+  SLOTS.clear();
 }
