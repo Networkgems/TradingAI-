@@ -1,6 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
-import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision } from '@trading-app/engine';
+import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
 import type { TradierAccountBalance } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
@@ -91,6 +91,7 @@ import {
   type OpenSleeve,
 } from './directional-open-ledger.js';
 import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject, recordEntryDeltaCeilingObserved } from './cost-aware-gate-ledger.js';
+import { recordGiveBackState, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -907,6 +908,14 @@ export class DailyRiskGovernor {
   private peakOpenGain = 0;
   private sessionHalted = false;
   private sessionHaltReason: string | null = null;
+  /**
+   * TRA-1892 — the machine-readable REASON the book halt latched (`giveback_cap` /
+   * `session_net_negative`), captured at the false→true transition. The human
+   * `sessionHaltReason` string encodes the same fact for the alert, but a grader needs
+   * the code without parsing prose. Resets on the ET day roll with the rest of the
+   * book-halt state. Null while unhalted.
+   */
+  private sessionHaltReasonCode: BookHaltReason | null = null;
 
   /**
    * TRA-563 — optional listener fired exactly once when the governor TRANSITIONS
@@ -964,6 +973,7 @@ export class DailyRiskGovernor {
       this.peakOpenGain = 0;
       this.sessionHalted = false;
       this.sessionHaltReason = null;
+      this.sessionHaltReasonCode = null; // TRA-1892 — clears with the rest of book-halt state
       this.currentDay = today;
       // TRA-995 — the autopilot throttle is a DAILY breaker like the halt: it
       // clears on the fresh ET day. This is not an "autonomous limit increase"
@@ -1071,7 +1081,11 @@ export class DailyRiskGovernor {
    * peak behavior, unchanged). The session stop keeps its own arm and is not
    * affected.
    */
-  markBook(realizedPlusOpen: number, bookEquity: number, giveBackArmFloor = 0): { tripped: boolean } {
+  markBook(
+    realizedPlusOpen: number,
+    bookEquity: number,
+    giveBackArmFloor = 0,
+  ): { tripped: boolean; snapshot: BookGiveBackSnapshot } {
     this.resetIfNewDay();
 
     // Monotonic intraday high-water mark of book gain, floored at 0.
@@ -1089,24 +1103,40 @@ export class DailyRiskGovernor {
       giveBackArmFloor,
     });
 
-    if (!decision.shouldFlattenAndHalt || this.sessionHalted) {
-      return { tripped: false };
+    let tripped = false;
+    if (decision.shouldFlattenAndHalt && !this.sessionHalted) {
+      // False→true transition: latch for the session and alert once.
+      this.sessionHalted = true;
+      this.sessionHaltReasonCode = decision.reason; // TRA-1892 — machine-readable code
+      this.sessionHaltReason =
+        decision.reason === 'session_net_negative'
+          ? `Book session stop — net-negative after being up ≥ ${(BOOK_SESSION_STOP_R * DEFAULT_RISK_PER_TRADE * 100).toFixed(2)}% of book equity; no new entries for the day`
+          : `Book give-back cap — surrendered >${(BOOK_GIVEBACK_CAP_PCT * 100).toFixed(0)}% of the day's +$${this.peakOpenGain.toFixed(0)} peak (floor +$${decision.retainedFloor.toFixed(0)}); no new entries for the day`;
+      if (this.haltListener) {
+        try {
+          this.haltListener(this.sessionHaltReason);
+        } catch {
+          // A notification failure must never break the risk-governor accounting.
+        }
+      }
+      tripped = true;
     }
 
-    // False→true transition: latch for the session and alert once.
-    this.sessionHalted = true;
-    this.sessionHaltReason =
-      decision.reason === 'session_net_negative'
-        ? `Book session stop — net-negative after being up ≥ ${(BOOK_SESSION_STOP_R * DEFAULT_RISK_PER_TRADE * 100).toFixed(2)}% of book equity; no new entries for the day`
-        : `Book give-back cap — surrendered >${(BOOK_GIVEBACK_CAP_PCT * 100).toFixed(0)}% of the day's +$${this.peakOpenGain.toFixed(0)} peak (floor +$${decision.retainedFloor.toFixed(0)}); no new entries for the day`;
-    if (this.haltListener) {
-      try {
-        this.haltListener(this.sessionHaltReason);
-      } catch {
-        // A notification failure must never break the risk-governor accounting.
-      }
-    }
-    return { tripped: true };
+    // TRA-1892 — the give-back state snapshot the durable arm-floor ledger records each
+    // tick, so a missed post-close grade fire is recoverable after the nightly reboot.
+    // `armFloorCleared` is the discriminator the forward-test needs: a sub-floor-peak
+    // day (peak below the arm floor) reads false and MUST NOT give-back halt.
+    const snapshot: BookGiveBackSnapshot = {
+      peakPnl: this.peakOpenGain,
+      currentPnl: realizedPlusOpen,
+      retainedFloor: decision.retainedFloor,
+      giveBackArmFloor: decision.giveBackArmFloor,
+      giveBackCapPct: BOOK_GIVEBACK_CAP_PCT,
+      armFloorCleared: this.peakOpenGain > 0 && this.peakOpenGain >= decision.giveBackArmFloor,
+      haltLatched: this.sessionHalted,
+      haltReason: this.sessionHaltReasonCode,
+    };
+    return { tripped, snapshot };
   }
 
   /**
@@ -3095,7 +3125,13 @@ export class SignalEngine {
             BOOK_GIVEBACK_ARM_FLOOR_R * Math.max(0, bookEquity) * DEFAULT_RISK_PER_TRADE,
           )
         : 0;
-      const { tripped } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity, giveBackArmFloor);
+      const { tripped, snapshot } = this.riskGovernor.markBook(realizedPlusOpen, bookEquity, giveBackArmFloor);
+      // TRA-1892 — durably record the give-back outcome per (mode, engineId, ET day) so
+      // the ≥5-session arm-floor forward-test (TRA-1592) accrues across the nightly
+      // reboot even when the 21:40Z grade fire is missed. Observe-only, best-effort IO,
+      // throttled to genuine state transitions inside the ledger. SPLIT per engine
+      // (feedContextKey) so a sibling demo book's tick can never clobber this one's row.
+      recordGiveBackState(this.mode, this.feedContextKey, etDateString(new Date()), snapshot);
       if (tripped) {
         this.flattenOnBookHalt(prices, this.riskGovernor.getBookHaltReason() ?? 'book give-back halt');
       }

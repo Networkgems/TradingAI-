@@ -130,6 +130,7 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+import { hydrateGiveBackArmFloorFromDisk } from './giveback-arm-floor-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -2369,6 +2370,24 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     log.info('cost-aware fire-bar ledger hydrated (TRA-1602)', {
       records: h.records,
       days: h.days,
+    });
+  }
+}
+
+// TRA-1892 (parent TRA-1592 → TRA-1435) — rebuild the DURABLE give-back arm-floor
+// outcome ledger and remember DATA_DIR for subsequent appends. This is what makes the
+// ≥5-session forward-test recoverable: bqb1's in-memory give-back state is wiped by
+// the ~04:30Z nightly reboot, so a missed 21:40Z grade fire used to be a permanently
+// lost session. Rebuilt on boot, a catch-up read of /api/health/giveback-arm-floor
+// recovers it — provided DATA_DIR is a persistent mount (else `durability.ephemeral`
+// says so; the fix is DATA_DIR=/data per TRA-1719). Best-effort; compacted to 30 days.
+{
+  const h = hydrateGiveBackArmFloorFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('give-back arm-floor ledger hydrated (TRA-1892)', {
+      records: h.records,
+      days: h.days,
+      sessions: h.sessions,
     });
   }
 }

@@ -45,6 +45,7 @@ import { summarizeDirectionalGate } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
+import { summarizeGiveBackArmFloor } from '../giveback-arm-floor-ledger.js'; // TRA-1892
 import { evaluateDurability } from '../durability.js'; // TRA-1681
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
@@ -69,7 +70,7 @@ import {
 import { isScaleoutLadderEnabled } from '../scaleout-ladder-flag.js';
 import { summarizeScaleoutLadder } from '../scaleout-ladder-ledger.js';
 import { summarizeEquityEntryFunnel } from '../equity-entry-funnel.js'; // TRA-1768
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv } from '../demo-flags.js';
@@ -1299,6 +1300,50 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note: report.ok
         ? 'Durable state is intact: DATA_DIR is on a persistent mount, the hot-state store is open, and the journal loaded clean. Counts on this box survive a redeploy.'
         : `NOT DURABLE${report.violations.length > 0 ? ` — broken: ${report.violations.join(', ')}` : ''}${report.unmeasured.length > 0 ? ` — unmeasured (VOIDS a grade, does not stop a boot): ${report.unmeasured.join(', ')}` : ''}. Any multi-session window read off this box is VOID. Policy is '${report.policy}' (set DURABILITY_POLICY=refuse to make a broken guarantee stop the boot).`,
+    });
+  });
+
+  // TRA-1892 (parent TRA-1592 → TRA-1435) — DURABLE give-back arm-floor forward-test
+  // readout. The ≥5-session validation for the give-back cap's minimum arm floor
+  // (TRA-1435, armed demo+live) could not accrue: the give-back state is in-memory and
+  // wiped by bqb1's ~04:30Z reboot, and the local grade fire missed two weekday windows,
+  // so a missed 21:40Z fire was a permanently lost session. This route folds the durable
+  // per-(mode, engineId, ET-day) outcome ledger so a CATCH-UP read recovers the whole
+  // window after a reboot — PROVIDED the ledger is on a persistent mount. Read
+  // `durability.ephemeral` FIRST: true ⇒ the outcomes below die at the next redeploy and
+  // recoverability is VOID (fix = DATA_DIR=/data on bqb1, TRA-1719). `invalidations > 0`
+  // is the PRIMARY-AC breach: a sub-floor-peak day that give-back halted.
+  app.get('/api/health/giveback-arm-floor', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    // The live book reads process.env; the demo book overlays demo-flags.json — mirror
+    // the engine's `bookMarkEnv` resolution so `armed` reflects what each book sees.
+    const liveEnv = process.env;
+    const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const summary = summarizeGiveBackArmFloor();
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      masterFlag: EXIT_RISK_RULES_FLAG,
+      armFloorFlag: BOOK_GIVEBACK_ARM_FLOOR_FLAG,
+      // Both books run under the SAME service env var; report each book's resolved arm
+      // state so a grader knows the floor was live for the sessions below.
+      armed: {
+        demo: isExitRiskRulesEnabled(demoEnv) && isBookGiveBackArmFloorEnabled(demoEnv),
+        live: isExitRiskRulesEnabled(liveEnv) && isBookGiveBackArmFloorEnabled(liveEnv),
+      },
+      sessionsObserved: summary.sessionsObserved,
+      invalidations: summary.invalidations,
+      verdictCounts: summary.verdictCounts,
+      retentionDays: summary.retentionDays,
+      // TRA-1681 — read this FIRST. `ephemeral: true` ⇒ the sessions below are wiped at
+      // the next reboot exactly like the in-memory state this ledger exists to outlast.
+      durability: summary.durability,
+      sessions: summary.sessions,
+      lastRecordAt: summary.lastRecordAt,
+      note: summary.durability.ephemeral
+        ? `NOT RECOVERABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}), so these ${summary.sessionsObserved} session(s) die at the next reboot just like the in-memory book state. The ≥5-session gate cannot rely on this until DATA_DIR points at a persistent mount (DATA_DIR=/data on bqb1, TRA-1719). Read durability.ephemeral before trusting any count here.`
+        : `RECOVERABLE: ${summary.sessionsObserved} session(s) durable on ${summary.durability.dataDir}. invalidations=${summary.invalidations} (sub-floor-peak give-back halts — a PRIMARY-AC breach if > 0). A missed 21:40Z grade fire is recoverable by re-reading this route any time within ${summary.retentionDays} days.`,
     });
   });
 
