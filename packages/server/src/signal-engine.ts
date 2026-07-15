@@ -30,7 +30,7 @@ import { evaluateExecutionGate, buildOrderAudit, killSwitchClear } from './agent
 import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
-import { withPhase } from './phase-timing.js';
+import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
@@ -3366,10 +3366,12 @@ export class SignalEngine {
         // TRA-1084 — each gated by its own kill switch (supertrend DEFAULT-ON;
         // reversal opt-in via ENABLE_REVERSAL_SHADOW). evaluateReversalShadow also
         // self-checks the flag, so the guard here just avoids the call overhead.
-        if (supertrendShadowOn) await this.evaluateSupertrendShadow(activeSymbols);
+        // TRA-1894 — withPhase sub-attribution so the watchdog names the exact
+        // shadow pass that stalled the loop, not just the outer `signal.doTick`.
+        if (supertrendShadowOn) await withPhase('signal.supertrendShadowEval', () => this.evaluateSupertrendShadow(activeSymbols));
         // TRA-921 (TRA-920 B) — OBSERVE-ONLY reversal-checklist shadow capture.
         // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
-        if (reversalShadowOn) await this.evaluateReversalShadow(activeSymbols);
+        if (reversalShadowOn) await withPhase('signal.reversalShadowEval', () => this.evaluateReversalShadow(activeSymbols));
       }
     }
 
@@ -3446,7 +3448,8 @@ export class SignalEngine {
         if (sharedShadow) sharedOptionShadowAt = nowMs;
         this.lastOptionShadowRefreshAt = nowMs;
         try {
-          await this.evaluateOptionShadow(activeSymbols);
+          // TRA-1894 — sub-attribution for the watchdog.
+          await withPhase('signal.optionShadowEval', () => this.evaluateOptionShadow(activeSymbols));
         } catch (err: unknown) {
           optionShadowLog.warn('option shadow pass threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -5783,7 +5786,9 @@ export class SignalEngine {
       // TRA-840 — derive the raw Supertrend read (line + flip state) over the
       // FULL 5m series first; both the ledger row (candidate or emit) and the
       // emit log line below reuse it.
-      const stSeries = supertrend(fiveMin);
+      // TRA-1894 — time the supertrend compute so a slow run names this sub-phase
+      // in the watchdog trip breadcrumb rather than just `signal.doTick`.
+      const stSeries = timeSyncPhase(`signal.supertrend:${sym}`, () => supertrend(fiveMin));
       let stLine: number | null = null;
       let stDirection: 'green' | 'red' | null = null;
       let stFlipped = false;
@@ -6817,7 +6822,15 @@ export class SignalEngine {
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
-    for (const sym of symbols) {
+    for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
+      // TRA-1894 — yield to the event loop (macrotask, via setImmediate) every
+      // EQUITY_EVAL_YIELD_EVERY symbols so the event-loop watchdog's setInterval
+      // and Render's health-check I/O can fire mid-sweep. The per-symbol
+      // `getSelectorChain` await only yields to the microtask queue (Promise
+      // resolution from cache), which does NOT unblock setInterval / setImmediate
+      // callers — leaving the full 519-symbol burst as one macrotask-level block.
+      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      const sym = symbols[symIdx]!;
       try {
         // Underlying technicals come from the SAME TRA-734 5m shadow series the
         // Supertrend/reversal shadow passes read, so trend / breakout / ATR /
