@@ -26,6 +26,85 @@ export const BETA: Record<string, number> = Object.fromEntries(
   ]),
 );
 
+/** The idiosyncratic loading of the ORIGINAL (TRA-1664) generator, before TRA-1830. */
+const BASE_IDIO = 0.6;
+
+/**
+ * TRA-1830 — THE FACTOR-STRUCTURE CALIBRATION.
+ *
+ * A daily return here is `beta_i * m + idio_i * e`. The ORIGINAL generator used
+ * `factorScale = 1` and `idio_i = 0.6` for every name, which makes the cross-section
+ * far too market-factor-dominated:
+ *
+ *     within-session ICC:   SYNTH 0.712   vs   REAL 0.358      (TRA-1810, measured on
+ *     the live 25-name watchlist, 2y of daily OHLC, 12,050 name-sessions)
+ *
+ * THE SYNTH WAS 2.0x MORE FACTOR-DOMINATED THAN REALITY, and that is not a cosmetic
+ * defect. The `edge:'real'` generator injects its edge THROUGH THE MARKET FACTOR, so an
+ * over-loaded factor makes the SAME `gamma` knob buy TWICE the uplift it buys on real
+ * bars: `gamma=1.2` measured +1.48R on the synth and only +0.70R on real bars. Every
+ * effect size ever quoted off this generator — including TRA-1756 R3's headline
+ * "MDE ~ +1.5R / 30x the bar" — was ~2x optimistic BECAUSE OF THIS ONE NUMBER.
+ * A control that misreports the size of the thing it is controlling for is not a control.
+ *
+ * The fix is a REPARAMETERISATION, not a rescale. Scale the factor loading by
+ * `factorScale` and give each name an idiosyncratic loading that HOLDS ITS TOTAL DAILY
+ * VARIANCE CONSTANT:
+ *
+ *     idio_i = sqrt( beta_i^2 + BASE_IDIO^2 - (factorScale * beta_i)^2 )
+ *
+ * so `beta_i^2*s^2 + idio_i^2 == beta_i^2 + 0.6^2` for every name and every s. That
+ * matters: rMultiple is normalized by the name's OWN ATR, so moving variance between the
+ * two channels while holding the total fixed changes the CROSS-NAME correlation (the ICC,
+ * which is what was wrong) and leaves the R-SCALE (`rho_total`, which TRA-1810 measured as
+ * already correct — `k_total = 0.92`) where it is. It fixes the broken axis without
+ * disturbing the calibrated one.
+ *
+ * At `factorScale = 1` the expression collapses to `idio_i = 0.6` and the generator is
+ * BIT-IDENTICAL to the TRA-1664 original — same RNG draws, same order, same bars. Pinned
+ * as a test, because a "generalization" that silently moved the baseline would invalidate
+ * every control in the suite at once.
+ *
+ * The default below is the CALIBRATED value: it is the `factorScale` at which this
+ * generator's measured within-session ICC matches the real watchlist's 0.358. It is
+ * MEASURED (`_1830_icc.mjs`, and re-derived from the real bars in the same run), not
+ * assumed — the analytic solution `s = sqrt(ICC * (b^2 + 0.36) / b^2)` is only a starting
+ * guess, because the ICC of the R-MULTIPLE is not the ICC of the daily return (the ATR
+ * normalizer and the H-session sum both touch it). It landed at 0.692 against a measured
+ * 0.695, which is the check that the mechanism is understood and not merely fitted.
+ *
+ * MEASURED, 8 seeds x 90 sessions, the study's own ATR(14), vs 25 real names / 482
+ * sessions / 12,050 name-sessions:
+ *
+ *   factorScale | within-session ICC | rho_total | k_total (= real / synth)
+ *   ------------+--------------------+-----------+-------------------------
+ *      1.000    |       0.700        |  1.950 R  |  0.922    <- the TRA-1664 original
+ *    * 0.695 *  |     * 0.357 *      |  2.000 R  |  0.899    <- THIS. real ICC = 0.358
+ *
+ * THE SECOND CONTROL IS THE ONE THAT MATTERS: `k_total` — the R-SCALE, the axis TRA-1810
+ * measured as ALREADY CORRECT — moves 0.922 -> 0.899, i.e. 2.5%. The reparameterisation
+ * fixes the broken axis without disturbing the calibrated one, which is exactly what
+ * holding total variance constant was for. A "fix" that had silently re-broken the R-scale
+ * would have been indistinguishable from this one in any test that only looked at the ICC.
+ */
+export const SYNTH_FACTOR_SCALE = 0.695;
+
+/** Per-name idiosyncratic loading that holds the name's TOTAL daily variance constant. */
+export function idioLoading(name: string, factorScale: number): number {
+  const b = BETA[name];
+  const total = b * b + BASE_IDIO * BASE_IDIO;
+  const factor = (factorScale * b) ** 2;
+  // A factorScale big enough to eat the whole variance budget would leave nothing for the
+  // idiosyncratic channel. Refuse rather than emit a NaN price path.
+  if (!(total > factor)) {
+    throw new Error(
+      `factorScale ${factorScale} exceeds ${name}'s total variance budget — no idiosyncratic ` +
+        `variance left. Max is ${Math.sqrt(total / (b * b)).toFixed(3)}.`,
+    );
+  }
+  return Math.sqrt(total - factor);
+}
+
 const WARMUP = 20; // bars before the first ledger session (ATR(14) + trailing window)
 const TAIL = 15;   // bars after the last ledger session, so H=10 can resolve
 
@@ -75,11 +154,19 @@ export function synth(opts: {
    * what makes `edge: 'real'` a legitimate NEGATIVE control for the secondary.
    */
   crossSectionalEdge?: number;
+  /**
+   * TRA-1830. The market-factor loading multiplier. Defaults to `SYNTH_FACTOR_SCALE`, the
+   * value CALIBRATED so this generator's within-session ICC matches the real watchlist's
+   * 0.358. Pass 1 to reproduce the (mis-calibrated) TRA-1664 original bit for bit — which
+   * is what the calibration script sweeps and what one test pins.
+   */
+  factorScale?: number;
 }): { ledger: PcrShadowRow[]; bars: DailyBar[] } {
   const { sessions: N, seed, edge } = opts;
   const H = opts.horizon ?? 5;
   const gamma = opts.gamma ?? 1.2;
   const xsEdge = opts.crossSectionalEdge ?? 0;
+  const factorScale = opts.factorScale ?? SYNTH_FACTOR_SCALE;
   const rng = mulberry32(seed);
 
   const total = WARMUP + N + TAIL;
@@ -95,10 +182,13 @@ export function synth(opts: {
   for (const name of NAMES) {
     let px = 100;
     const eps: number[] = [];
+    // TRA-1830: variance moved from the factor channel to the idiosyncratic one, with the
+    // name's TOTAL daily variance held constant. At factorScale = 1 this is `0.6`.
+    const idioScale = idioLoading(name, factorScale);
     for (let i = 0; i < total; i++) {
       const e = gauss(rng);
       eps.push(e);
-      px = px * (1 + (BETA[name] * m[i] + 0.6 * e) * 0.01);
+      px = px * (1 + (factorScale * BETA[name] * m[i] + idioScale * e) * 0.01);
       bars.push({
         underlying: name,
         session: session(i),

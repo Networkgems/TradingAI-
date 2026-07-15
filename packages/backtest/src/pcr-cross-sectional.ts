@@ -5,6 +5,7 @@ import {
   type PboResult,
 } from './overfitting-stats.js';
 import {
+  DETECTABILITY_FLOOR_CONSTRAINT,
   HORIZONS,
   PCR_BOOTSTRAP_CONFIDENCE,
   PCR_BOOTSTRAP_ITERS,
@@ -13,6 +14,9 @@ import {
   PCR_UPLIFT_BAR_R,
   PCR_Z_SIDE_THRESHOLD,
   PRIMARY_HORIZON,
+  clearsEffectiveBar,
+  effectiveBar,
+  effectiveBarReason,
   joinForwardReturns,
   mean,
   mulberry32,
@@ -20,6 +24,7 @@ import {
   percentile,
   sampleShape,
   type Ci,
+  type EffectiveBar,
   type DailyBar,
   type JoinDiagnostics,
   type JoinedRow,
@@ -652,8 +657,20 @@ export interface XsCellResult {
   adjustedContrastR: number;
   /** BINDING: session-clustered moving-block 90% CI on the ADJUSTED contrast. */
   clustered: Ci;
+  /**
+   * TRA-1830. THE BINDING PROMOTION BAR: `max(economic floor, this cell's CI half-width)`.
+   *
+   * THE SECONDARY HAS THE SAME DISEASE AS THE PRIMARY AND ITS OWN `POWER_CONSTRAINT` SAYS SO
+   * IN TERMS: "the bar sits 4-6x BELOW the noise floor of the estimator that grades it".
+   * TRA-1830 was written against the primary, but a detectability floor fitted to the primary
+   * ALONE would have left the secondary free to promote an uplift it cannot resolve — and the
+   * secondary is the read that fires FIRST (N=30 vs N=90). Fixing one arm of a two-arm study
+   * and leaving the other is how the fix gets laundered into a false PASS on the arm nobody
+   * re-read. Same function, imported from `pcr-expectancy.ts`, NOT a second copy of it.
+   */
+  bar: EffectiveBar;
   legs: {
-    /** ADJUSTED contrast clears the pre-registered +0.05R bar. */
+    /** ADJUSTED contrast clears the EFFECTIVE bar — `max(+0.05R, the CI half-width)` (TRA-1830). */
     upliftBar: boolean;
     /** 90% CI lower bound on the ADJUSTED contrast > 0. */
     clusteredCiPositive: boolean;
@@ -734,8 +751,14 @@ export function evaluateXsCell(
     );
   }
 
+  // TRA-1830 — THE BINDING BAR. `max(economic floor, the estimator's own resolution)`.
+  const bar = effectiveBar(clustered);
+  if (bar.binding === 'detectability') {
+    notes.push(effectiveBarReason(bar, adjustedContrastR));
+  }
+
   const legs = {
-    upliftBar: Number.isFinite(adjustedContrastR) && adjustedContrastR >= PCR_UPLIFT_BAR_R,
+    upliftBar: clearsEffectiveBar(adjustedContrastR, bar),
     clusteredCiPositive: Number.isFinite(clustered.lo) && clustered.lo > 0,
     sessionFloor: sessions >= XS_MIN_SESSIONS,
   };
@@ -750,6 +773,7 @@ export function evaluateXsCell(
     placeboContrastR,
     adjustedContrastR,
     clustered,
+    bar,
     legs,
     pass: Object.values(legs).every(Boolean),
     diagnostics: s.diagnostics,
@@ -1197,6 +1221,16 @@ export function runPcrCrossSectional(
 
   const reasons: string[] = [...primary.notes, ...guards.notes];
 
+  // TRA-1830 — THE EFFECTIVE BAR TRAVELS WITH EVERY VERDICT, PASS / FAIL / HELD alike, and it
+  // goes in BEFORE the verdict's own reasoning because it is the number the verdict was graded
+  // against. Note the FAIL branch below still reads the ECONOMIC bar via `xsCondemnRuling` —
+  // deliberately, and for the reason set out in DETECTABILITY_FLOOR_CONSTRAINT: the floor makes
+  // a PASS harder and must never make an irreversible CONDEMNATION easier. (`xsCondemnRuling`
+  // already carries its own, opposite-facing half-width term — the shortfall must EXCEED the
+  // resolution before it may condemn. The two rules use the same half-width to make BOTH
+  // branches harder, which is the invariant: ignorance narrows the gate from both sides.)
+  reasons.push(effectiveBarReason(primary.bar, primary.adjustedContrastR));
+
   const guardsPass =
     guards.dsrEvaluable &&
     guards.pboEvaluable &&
@@ -1257,7 +1291,9 @@ export function runPcrCrossSectional(
     if (!primary.legs.upliftBar) {
       reasons.push(
         `HELD leg: adjusted cross-sectional contrast ${primary.adjustedContrastR.toFixed(4)}R < ` +
-          `${PCR_UPLIFT_BAR_R}R bar (point estimate only — the interval still reaches it)`,
+          `the EFFECTIVE bar of ${primary.bar.effectiveR.toFixed(4)}R (binding term: ` +
+          `${primary.bar.binding}; economic floor ${PCR_UPLIFT_BAR_R}R, CI half-width ` +
+          `${primary.bar.halfWidthR.toFixed(4)}R)`,
       );
     }
     if (!primary.legs.clusteredCiPositive) {

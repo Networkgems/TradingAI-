@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   adjustedUpliftStat,
   atrBySession,
+  ciHalfWidth,
+  clearsEffectiveBar,
   cohortize,
+  DETECTABILITY_FLOOR_CONSTRAINT,
+  effectiveBar,
+  effectiveBarReason,
   evaluateCell,
   joinForwardReturns,
   mean,
@@ -22,7 +27,14 @@ import {
 // is controlled against the SAME generator as the primary rather than a copy of it.
 // The pinned seed-by-seed counts below are what prove the extraction was faithful: any
 // drift in the RNG consumption order would move them.
-import { session, synth } from './pcr-synth.fixture.js';
+import {
+  BETA,
+  idioLoading,
+  NAMES,
+  session,
+  synth,
+  SYNTH_FACTOR_SCALE,
+} from './pcr-synth.fixture.js';
 
 // TRA-1664 — the harness's own gate.
 //
@@ -288,7 +300,14 @@ describe('real-edge control (POSITIVE)', () => {
     // clear at ANY sample size, because the DSR trial set contained the sign-mirror of
     // the signal itself and so raised its own benchmark as the edge got stronger.
     // Auditing only the refusal path would never have found it.
-    const { ledger, bars } = synth({ sessions: 90, seed: 5, edge: 'real', gamma: 2.0 });
+    //
+    // RE-PINNED FOR TRA-1830. The factor-calibrated generator buys ~half the uplift per gamma
+    // that the old synth did (ICC 0.712 -> 0.358), and the effective bar now floors the PASS
+    // leg at the CI half-width (~0.4R at N=90). So a positive control has to carry a LARGER,
+    // LONGER edge to clear — which is the whole point of the change, not a regression: N=120,
+    // gamma=3.5 gives a true uplift of ~+1.3R and releases with margin (lo ~0.8R > 0). The
+    // gate still RELEASES; it is not wired shut by the detectability floor.
+    const { ledger, bars } = synth({ sessions: 120, seed: 5, edge: 'real', gamma: 3.5 });
     const report = runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 });
 
     expect(report.verdict).toBe('PASS');
@@ -346,8 +365,13 @@ describe('the decisive-NO-GO rule (TRA-1726)', () => {
    *
    * The two safety legs are unchanged and are what this test is really for: FAIL stays
    * rare (a real edge is not condemned) and HELD stays reachable.
+   *
+   * RE-PINNED AGAIN FOR TRA-1830 (was 2 / 2 / 4). The factor-calibrated generator buys ~half
+   * the uplift per gamma, and the detectability floor tightened the PASS leg, so PASS on these
+   * THIN samples fell to 1 / 1 / 1 — further toward ABSTENTION, the safe direction, and still
+   * a declared method change measured on synthetic controls before any real row was read.
    */
-  const REAL_THIN: Array<[number, number]> = [[20, 2], [30, 2], [45, 4]];
+  const REAL_THIN: Array<[number, number]> = [[20, 1], [30, 1], [45, 1]];
 
   it('HELD control — a GENUINE edge on a thin sample ABSTAINS; it is not condemned', () => {
     // The regression this issue exists for. Under the old branch this matrix was
@@ -443,11 +467,17 @@ describe('the decisive-NO-GO rule (TRA-1726)', () => {
   });
 
   it('zero edge at the planned read CAN be decisively refused — N=90 => FAIL', () => {
-    // The early exit on the exact cell TRA-1726 asked to pin. Here the clustered
+    // The early exit on the exact cell TRA-1726 asked to pin. On THIS seed the clustered
     // interval HAS tightened under the +0.05R bar, so the sample genuinely refutes the
     // overlay and the harness says so plainly. FAIL is a real, reachable outcome at
     // the planned window — it is simply no longer the DEFAULT for "not PASS".
-    const { ledger, bars } = synth({ sessions: 90, seed: 42, edge: 'none' });
+    //
+    // RE-PINNED FOR TRA-1830 (was seed 42). On the factor-calibrated generator a truly-zero
+    // overlay is decisively refused on only a MINORITY of N=90 draws (the noise floor is
+    // ~0.20R against a 0.05R bar, so the interval usually straddles) — the companion test
+    // below pins that rate. seed 528 is one of the draws where the whole interval clears
+    // the bar (ciHi ~ -0.07R, a comfortable margin), so the decisive branch is REACHABLE.
+    const { ledger, bars } = synth({ sessions: 90, seed: 528, edge: 'none' });
     const report = runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 });
 
     expect(report.verdict).toBe('FAIL');
@@ -523,25 +553,32 @@ describe('fail-closed on a thin ledger', () => {
 
 // ---------------------------------------------------------------------------
 // TRA-1756 R3 — THE BAR WAS NEVER CHECKED FOR DETECTABILITY.
+// RE-ISSUED FOR TRA-1830 against the factor-calibrated generator (ICC 0.712 -> 0.358).
 //
 // TRA-1727's review found that the SECONDARY estimand can only release on an edge that does
-// not exist. The primary has the same disease and slightly worse: its MDE at the planned
-// N=90 read is ~+1.5R against a +0.05R promotion bar. The bar is a PROMOTION threshold —
-// "an edge this small is not worth trading" — and nobody ever checked it was a DETECTABLE
-// one. Both things are true at once, and only the first was ever a decision.
+// not exist. The primary has the same disease: its MDE at the planned N=90 read is ~+1.0R
+// against a +0.05R promotion bar. The bar is a PROMOTION threshold — "an edge this small is
+// not worth trading" — and nobody ever checked it was a DETECTABLE one. Both things are true
+// at once, and only the first was ever a decision.
+//
+// The magnitudes here are ~30% smaller than the pre-TRA-1830 table (MDE +1.5R -> +1.0R, the
+// half-width 0.19-0.61R -> 0.20-0.47R) because the old synth was 2x too market-factor-
+// dominated and so bought 2x the uplift per gamma. THE DISEASE SURVIVED THE FIX: the bar is
+// still far under the noise floor after the generator was made realistic.
 //
 // These tests MEASURE the claim `PRIMARY_POWER_CONSTRAINT` makes. A caveat nobody checked
 // is just a comment, and this one is load-bearing for how the November verdict gets read.
 // ---------------------------------------------------------------------------
 
 describe('TRA-1756 R3 — the primary MDE, pinned', () => {
-  it('the CI half-width is 4-12x the bar it is asked to grade — the bar is UNDER the noise floor', () => {
+  it('the CI half-width is 4-9x the bar it is asked to grade — the bar is UNDER the noise floor', () => {
     // The mechanism behind the whole finding, in one number. And note the direction: the
     // interval WIDENS as the true edge grows, so the instrument gets LESS precise exactly
     // when there is something to see. That is why the power curve climbs so slowly.
     //
-    // Measured (12 worlds/cell, N=90): zero edge -> 0.190R half-width at gamma 2.0 and
-    // 0.214R at gamma 1.2; the +1.48R positive control -> 0.612R. Against a +0.05R bar.
+    // Measured on the corrected generator (12 worlds/cell, N=90): zero edge -> ~0.20R
+    // half-width at gamma 2.0; the +1.02R positive control (gamma 1.2) -> ~0.47R. Against
+    // a +0.05R bar.
     const halfWidthAt = (gamma: number, edge: 'none' | 'real'): number => {
       const hws: number[] = [];
       for (let t = 0; t < 12; t++) {
@@ -555,38 +592,39 @@ describe('TRA-1756 R3 — the primary MDE, pinned', () => {
     const zeroEdge = halfWidthAt(2.0, 'none');
     const posControl = halfWidthAt(1.2, 'real');
 
-    expect(zeroEdge).toBeGreaterThan(3 * PCR_UPLIFT_BAR_R); // ~0.19R vs a 0.05R bar
-    expect(posControl).toBeGreaterThan(8 * PCR_UPLIFT_BAR_R); // ~0.61R
+    expect(zeroEdge).toBeGreaterThan(3 * PCR_UPLIFT_BAR_R); // ~0.20R vs a 0.05R bar
+    expect(posControl).toBeGreaterThan(7 * PCR_UPLIFT_BAR_R); // ~0.47R
     // ...and it gets WORSE, not better, when a real edge is present.
     expect(posControl).toBeGreaterThan(zeroEdge);
   }, 300000);
 
-  it('a SEVEN-TIMES-THE-BAR true edge is INVISIBLE to the primary at the planned N=90 read', () => {
-    // `gamma: 0.15` is a true bias-adjusted uplift of +0.33R (+/-0.07, N=250 x 15 worlds) —
-    // 6.6x the +0.05R promotion bar, and far larger than any PCR edge anyone has claimed.
+  it('a NEARLY-TEN-TIMES-THE-BAR true edge is all but INVISIBLE at the planned N=90 read', () => {
+    // `gamma: 0.3` is a true bias-adjusted uplift of +0.48R (+/-0.05, N=250 x 15 worlds) on
+    // the corrected generator — 9.6x the +0.05R promotion bar, far larger than any PCR edge
+    // anyone has claimed.
     //
-    // It releases ZERO times out of 12 at N=90. This is the number that makes the November
-    // read uninterpretable without the caveat: the study is being run at an N where an edge
-    // many times better than the bar cannot be distinguished from nothing.
+    // It releases 2 times out of 12 at N=90. This is the number that makes the November read
+    // uninterpretable without the caveat: the study is being run at an N where an edge many
+    // times better than the bar is essentially indistinguishable from nothing.
     let passes = 0;
     for (let t = 0; t < 12; t++) {
-      const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge: 'real', gamma: 0.15 });
+      const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge: 'real', gamma: 0.3 });
       if (runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).verdict === 'PASS') passes++;
     }
-    expect(passes).toBe(0);
+    expect(passes).toBeLessThanOrEqual(3); // ~17% power on a ~10x-bar edge
   }, 300000);
 
-  it('the gate is NOT simply wired shut — its own 30x-the-bar positive control DOES release', () => {
+  it('the gate is NOT simply wired shut — its own 20x-the-bar positive control DOES release', () => {
     // The other half of the two-sided control, and the reason the test above means anything.
-    // A gate that never releases would produce the identical 0/12 above. This one releases
-    // 7/12 on a +1.48R edge (gamma 1.2, the pre-registered `edge:'real'` control) — which is
-    // exactly the point: the ONLY thing it can see is ~30x the bar it is grading against.
+    // A gate that never releases would produce the identical near-0/12 above. This one
+    // releases ~7/12 on a +1.02R edge (gamma 1.2, the pre-registered `edge:'real'` control)
+    // — which is exactly the point: the ONLY thing it can see is ~20x the bar it grades.
     let passes = 0;
     for (let t = 0; t < 12; t++) {
       const { ledger, bars } = synth({ sessions: 90, seed: 1000 + t, edge: 'real', gamma: 1.2 });
       if (runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 }).verdict === 'PASS') passes++;
     }
-    expect(passes).toBeGreaterThanOrEqual(5); // MDE territory: ~58% power on a 30x-bar edge
+    expect(passes).toBeGreaterThanOrEqual(5); // MDE territory: ~58% power on a 20x-bar edge
   }, 300000);
 
   it('stamps PRIMARY_POWER_CONSTRAINT on every report, and into the reasons of every HELD', () => {
@@ -596,12 +634,217 @@ describe('TRA-1756 R3 — the primary MDE, pinned', () => {
     expect(rep.power).toBe(PRIMARY_POWER_CONSTRAINT);
     expect(rep.power).toMatch(/HELD IS NOT EVIDENCE OF ABSENCE/i);
     expect(rep.power).toMatch(/never checked to be a DETECTABLE one/i);
-    // The R-scale caveat must travel too — it is the one thing that could overturn all of
-    // this, and it cannot be checked until the real ledger has rows.
-    expect(rep.power).toMatch(/has NOT yet been calibrated against the real shadow ledger/i);
+    // TRA-1830: the R-scale/factor structure ARE now calibrated to real bars, and the
+    // constant must say so — plus the residual ~1.5x optimism the ICC fix leaves behind.
+    expect(rep.power).toMatch(/CALIBRATED TO REAL BARS/i);
+    expect(rep.power).toMatch(/OPTIMISTIC/);
 
     if (rep.verdict === 'HELD') {
       expect(rep.reasons.some((r) => /HELD — READ THIS BEFORE ACTING ON IT/.test(r))).toBe(true);
     }
   }, 120000);
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1830 — THE DETECTABILITY FLOOR. `effectiveBar = max(+0.05R economic, CI half-width)`.
+//
+// These MEASURE the four properties the issue asks for, they do not label them:
+//   (a) effectiveBar >= half-width, always;
+//   (b) the change is MONOTONE — no world that FAILed/HELD under the raw bar PASSes under it;
+//   (c) a positive control on a large-enough edge STILL releases (the gate is not wired shut);
+//   (d) the zero-edge control STILL refuses.
+// Plus the load-bearing asymmetry: the floor tightens PASS but is NOT wired into the FAIL
+// (decisive-NO-GO) branch, where it would convert imprecision into an irreversible condemnation.
+// ---------------------------------------------------------------------------
+
+describe('TRA-1830 — the detectability floor', () => {
+  it('(a) effectiveBar is ALWAYS >= the CI half-width AND >= the economic floor', () => {
+    // A grid of intervals spanning tight/wide and negative/positive point estimates.
+    const cis = [
+      { lo: -0.02, hi: 0.02 },   // tight, half-width 0.02 < economic
+      { lo: 0.0, hi: 0.10 },     // half-width 0.05 == economic
+      { lo: -0.30, hi: 0.30 },   // wide, half-width 0.30 > economic
+      { lo: 0.20, hi: 0.80 },    // wide and positive, half-width 0.30
+      { lo: -1.0, hi: 1.0 },     // very wide
+    ];
+    for (const ci of cis) {
+      const hw = ciHalfWidth(ci);
+      const bar = effectiveBar(ci);
+      expect(bar.effectiveR).toBeGreaterThanOrEqual(hw - 1e-12);
+      expect(bar.effectiveR).toBeGreaterThanOrEqual(PCR_UPLIFT_BAR_R - 1e-12);
+      expect(bar.effectiveR).toBeCloseTo(Math.max(PCR_UPLIFT_BAR_R, hw), 12);
+      expect(bar.binding).toBe(hw > PCR_UPLIFT_BAR_R ? 'detectability' : 'economic');
+    }
+  });
+
+  it('FAILS CLOSED: an inevaluable (NaN) interval yields no passable bar', () => {
+    const bar = effectiveBar({ lo: Number.NaN, hi: 0.5 });
+    expect(bar.binding).toBe('non-evaluable');
+    expect(Number.isNaN(bar.effectiveR)).toBe(true);
+    // "We could not measure the noise" is not a licence to promote — a huge uplift still
+    // cannot clear a non-evaluable bar.
+    expect(clearsEffectiveBar(999, bar)).toBe(false);
+    expect(effectiveBarReason(bar, 999)).toMatch(/NOT EVALUABLE/i);
+  });
+
+  it('(b) MONOTONE — clearing the effective bar IMPLIES clearing the +0.05R economic bar', () => {
+    // The property in the abstract: because effectiveR = max(0.05, hw) >= 0.05, anything that
+    // clears it clears the raw bar too. Swept over a wide grid of (uplift, interval) pairs so
+    // this is a measurement of the invariant, not a restatement of the max().
+    for (let u = -1; u <= 2; u += 0.05) {
+      for (const hw of [0.0, 0.03, 0.05, 0.2, 0.5]) {
+        const bar = effectiveBar({ lo: -hw, hi: hw });
+        if (clearsEffectiveBar(u, bar)) {
+          expect(u).toBeGreaterThanOrEqual(PCR_UPLIFT_BAR_R - 1e-12);
+        }
+      }
+    }
+  });
+
+  it('(b) MONOTONE end-to-end — no synth world PASSes on an uplift below the raw bar', () => {
+    // The same invariant through the whole harness. A PASS verdict must carry an adjusted
+    // uplift that clears BOTH the effective bar and (therefore) the +0.05R economic one. The
+    // floor can only ever make PASS harder; it cannot manufacture one.
+    for (const gamma of [0, 0.3, 1.2, 3.5]) {
+      for (let t = 0; t < 4; t++) {
+        const { ledger, bars } = synth({
+          sessions: 120, seed: 2000 + t, edge: gamma === 0 ? 'none' : 'real', gamma: gamma || 1.2,
+        });
+        const rep = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+        if (rep.verdict === 'PASS') {
+          expect(rep.primary!.adjustedUpliftR).toBeGreaterThanOrEqual(rep.primary!.bar.effectiveR);
+          expect(rep.primary!.adjustedUpliftR).toBeGreaterThanOrEqual(PCR_UPLIFT_BAR_R);
+        }
+      }
+    }
+  }, 300000);
+
+  it('(c)+(d) DISCRIMINATES — zero edge REFUSED, a large-enough edge still RELEASES', () => {
+    // The two-sided control on the floored gate. Without (c) the change could have wired the
+    // gate shut; without (d) it could have been a rubber stamp.
+    const zero = synth({ sessions: 120, seed: 5, edge: 'none' });
+    expect(runPcrExpectancy(zero.ledger, zero.bars, { iters: 500, seed: 11 }).verdict).not.toBe('PASS');
+
+    const strong = synth({ sessions: 120, seed: 5, edge: 'real', gamma: 3.5 });
+    const rep = runPcrExpectancy(strong.ledger, strong.bars, { iters: 500, seed: 11 });
+    expect(rep.verdict).toBe('PASS');
+    // ...and it passed BECAUSE the uplift cleared the (much larger than 0.05R) effective bar.
+    expect(rep.primary!.bar.effectiveR).toBeGreaterThan(PCR_UPLIFT_BAR_R);
+    expect(rep.primary!.adjustedUpliftR).toBeGreaterThan(rep.primary!.bar.effectiveR);
+  }, 180000);
+
+  it('the effective bar TRAVELS with every verdict — in reasons[], PASS/FAIL/HELD alike', () => {
+    for (const [edge, gamma] of [['none', 1.2], ['real', 3.5]] as const) {
+      const { ledger, bars } = synth({ sessions: 120, seed: 5, edge, gamma });
+      const rep = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+      const joined = rep.reasons.join(' ');
+      expect(joined).toMatch(/EFFECTIVE BAR/);
+      // The binding term is named out loud, so a November reader does not "fix" a 0.4R bar
+      // back to 0.05R.
+      expect(joined).toMatch(/binding|BINDING/);
+    }
+  }, 120000);
+
+  it('THE ASYMMETRY — the floor tightens PASS but does NOT drive the irreversible FAIL branch', () => {
+    // The load-bearing property from DETECTABILITY_FLOOR_CONSTRAINT. On a zero-edge world the
+    // effective bar is ~0.4R and the uplift plainly does NOT clear it — the uplift LEG is
+    // false — yet the world must NOT be CONDEMNED, because a wide interval is IGNORANCE and
+    // the condemn branch reads the ECONOMIC bar (`ciUpper < 0.05`), never the effective one.
+    // Wiring the floor into FAIL would condemn zero edge on ~a coin flip; this pins that it
+    // does not.
+    let held = 0;
+    for (let t = 0; t < 6; t++) {
+      const { ledger, bars } = synth({ sessions: 90, seed: 700 + t * 31, edge: 'none' });
+      const rep = runPcrExpectancy(ledger, bars, { iters: 300, seed: 11 });
+      const p = rep.primary!;
+      // The uplift leg is failed by the floor (0 uplift < ~0.4R effective bar)...
+      expect(p.legs.upliftBar).toBe(false);
+      // ...but a straddling interval is HELD, not FAIL: the floor did not manufacture a
+      // condemnation out of imprecision.
+      if (Number.isFinite(p.clustered.hi) && p.clustered.hi >= PCR_UPLIFT_BAR_R) {
+        expect(rep.verdict).not.toBe('FAIL');
+        held++;
+      }
+    }
+    expect(held).toBeGreaterThanOrEqual(1);
+    expect(DETECTABILITY_FLOOR_CONSTRAINT).toMatch(/deliberately NOT applied to the FAIL/i);
+  }, 180000);
+});
+
+// ---------------------------------------------------------------------------
+// TRA-1830 — THE SYNTH FACTOR-STRUCTURE CALIBRATION.
+//
+// The generator's within-session ICC was 0.712 vs the real watchlist's 0.358 (TRA-1810), so
+// it was 2x too market-factor-dominated and every effect size read off it was ~2x optimistic.
+// `SYNTH_FACTOR_SCALE` moves variance from the factor channel to the idiosyncratic one, HOLDING
+// each name's total daily variance constant, so the ICC drops to ~0.358 WITHOUT disturbing the
+// already-calibrated R-scale. These MEASURE that, using the SAME variance-ratio ICC estimator
+// (`1 - (rho_idio/rho_total)^2`) that produced TRA-1810's 0.358.
+// ---------------------------------------------------------------------------
+
+describe('TRA-1830 — synth factor-structure calibration', () => {
+  const sd = (xs: number[]): number => {
+    const m = mean(xs);
+    return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
+  };
+  // Within-session ICC of the R-multiple, variance-ratio form — matches TRA-1810 / _1830_icc.
+  const iccAt = (factorScale: number): number => {
+    const iccs: number[] = [];
+    for (let seed = 1; seed <= 6; seed++) {
+      const { ledger, bars } = synth({ sessions: 90, seed, edge: 'none', factorScale });
+      const { rows } = joinForwardReturns(ledger, bars, 5);
+      const bySess = new Map<string, number[]>();
+      for (const r of rows) {
+        if (!Number.isFinite(r.rMultiple)) continue;
+        if (!bySess.has(r.session)) bySess.set(r.session, []);
+        bySess.get(r.session)!.push(r.rMultiple);
+      }
+      const sessMean = new Map([...bySess].map(([s, v]) => [s, mean(v)]));
+      const rhoTotal = sd(rows.map((r) => r.rMultiple));
+      const rhoIdio = sd(rows.map((r) => r.rMultiple - sessMean.get(r.session)!));
+      iccs.push(1 - (rhoIdio / rhoTotal) ** 2);
+    }
+    return mean(iccs);
+  };
+
+  it('the default factorScale is CALIBRATED (< 1) and its ICC matches the real 0.358', () => {
+    expect(SYNTH_FACTOR_SCALE).toBeLessThan(1);
+    const calibrated = iccAt(SYNTH_FACTOR_SCALE);
+    const original = iccAt(1);
+    // The original synth is ~0.70 (2x the real target); the calibrated one lands near 0.358.
+    expect(original).toBeGreaterThan(0.62);
+    expect(calibrated).toBeGreaterThan(0.30);
+    expect(calibrated).toBeLessThan(0.42);
+    // And the WHOLE POINT: calibration moved the ICC MUCH closer to reality than it was.
+    const REAL_ICC = 0.358;
+    expect(Math.abs(calibrated - REAL_ICC)).toBeLessThan(Math.abs(original - REAL_ICC));
+  }, 60000);
+
+  it('holds TOTAL daily variance constant — the R-scale axis is not disturbed', () => {
+    // The invariant that lets the ICC be fixed without re-breaking the (already calibrated)
+    // R-scale: for every name and every scale, (s*beta)^2 + idio^2 == beta^2 + 0.36.
+    for (const name of NAMES) {
+      const b = BETA[name];
+      for (const s of [1.0, SYNTH_FACTOR_SCALE, 0.5, 0.8]) {
+        const idio = idioLoading(name, s);
+        expect((s * b) ** 2 + idio ** 2).toBeCloseTo(b * b + 0.36, 10);
+      }
+    }
+  });
+
+  it('is BIT-IDENTICAL to the TRA-1664 original at factorScale = 1', () => {
+    // idioLoading collapses to exactly the old 0.6, so the RNG draws and the bars are
+    // unchanged — a "generalization" that silently moved the baseline would invalidate every
+    // control in the suite at once.
+    for (const name of NAMES) expect(idioLoading(name, 1)).toBeCloseTo(0.6, 12);
+    const a = synth({ sessions: 40, seed: 7, edge: 'real', gamma: 2.0, factorScale: 1 });
+    const b = synth({ sessions: 40, seed: 7, edge: 'real', gamma: 2.0, factorScale: 1 });
+    expect(a.bars.map((x) => x.close)).toEqual(b.bars.map((x) => x.close));
+  });
+
+  it('REFUSES a factorScale that would leave no idiosyncratic variance', () => {
+    // beta=1.0 name: total budget 1.36, so factorScale 1.2 (factor var 1.44) overruns it.
+    // Emit an error rather than a NaN price path.
+    expect(() => idioLoading('SPY', 1.2)).toThrow(/variance budget/);
+  });
 });

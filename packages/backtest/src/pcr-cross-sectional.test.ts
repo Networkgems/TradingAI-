@@ -233,7 +233,11 @@ describe('THE SELECTION-ONLY CONSTRAINT, proven rather than asserted', () => {
 
     // ...and the PRIMARY, on the very same generator, DOES release. Without this half the
     // test above proves nothing: a gate wired shut also refuses every timing edge.
-    const { ledger, bars } = synth({ sessions: 90, seed: 5, edge: 'real', gamma: 2.0 });
+    //
+    // RE-PINNED FOR TRA-1830 (was N=90, gamma=2.0). The factor-calibrated generator buys ~half
+    // the uplift per gamma and the detectability floor raised the primary's PASS bar, so the
+    // primary positive control needs a larger/longer edge to clear: N=120, gamma=3.5.
+    const { ledger, bars } = synth({ sessions: 120, seed: 5, edge: 'real', gamma: 3.5 });
     expect(runPcrExpectancy(ledger, bars, { iters: 500, seed: 11 }).verdict).toBe('PASS');
   }, 180000);
 });
@@ -648,18 +652,19 @@ describe('TRA-1756 R2 — a HELD is NOT evidence of absence', () => {
     expect(pass.power).toBe(POWER_CONSTRAINT);
   }, 120000);
 
-  it('the caveat is TRUE: the CI half-width is 4-6x the bar it is asked to grade', () => {
+  it('the caveat is TRUE: the CI half-width is 6-8x the bar it is asked to grade', () => {
     // POWER_CONSTRAINT is a claim about this estimator, so it is MEASURED, not asserted.
     // A caveat nobody checked is just a comment.
     //
     // This one number is the whole of R2 and R3: the promotion bar is +0.05R and the
-    // instrument's resolution is 0.2-0.3R. The bar was chosen as a PROMOTION threshold and
+    // instrument's resolution is 0.3-0.4R. The bar was chosen as a PROMOTION threshold and
     // nobody ever checked it was a DETECTABLE one.
     //
-    // The constant claims a BAND (0.2-0.3R), so the band is what gets asserted — not a
-    // decimal point estimate that 12 worlds cannot resolve. (Over 200 worlds: 0.309R at
-    // calendar 45, 0.286R at 60, 0.246R at 90, 0.203R at 150 — it shrinks with N, but
-    // nowhere near fast enough to reach the bar.)
+    // RE-MEASURED FOR TRA-1830 on the factor-calibrated generator (ICC 0.712 -> 0.358). The
+    // WITHIN-session contrast now carries MORE idiosyncratic dispersion (less of the variance
+    // is shared market factor), so the secondary's half-width GREW: ~0.41R at calendar 45,
+    // 0.40R at 90, shrinking to 0.32R at 150 — the detectability gap got WORSE, not better,
+    // when the generator was made realistic.
     for (const sessions of [45, 90]) {
       const hws: number[] = [];
       for (let t = 0; t < 12; t++) {
@@ -667,9 +672,9 @@ describe('TRA-1756 R2 — a HELD is NOT evidence of absence', () => {
         const p = runPcrCrossSectional(ledger, bars, { iters: 400, seed: 11 }).primary!;
         if (Number.isFinite(p.clustered.hi)) hws.push((p.clustered.hi - p.clustered.lo) / 2);
       }
-      expect(mean(hws)).toBeGreaterThan(0.2);
-      expect(mean(hws)).toBeLessThan(0.35);
-      expect(mean(hws)).toBeGreaterThan(4 * PCR_UPLIFT_BAR_R); // the bar is BELOW the noise floor
+      expect(mean(hws)).toBeGreaterThan(0.30);
+      expect(mean(hws)).toBeLessThan(0.50);
+      expect(mean(hws)).toBeGreaterThan(6 * PCR_UPLIFT_BAR_R); // the bar is BELOW the noise floor
     }
   }, 300000);
 });
@@ -857,11 +862,15 @@ describe('TRA-1800 — NON-EVALUABLE ⇒ RETIRE, and it INVERTS the condemn rule
 
 describe('TRA-1800 — what the gate DOES on the generator (and it is a kill)', () => {
   // The honest, load-bearing prediction of Spec v3.1: WE EXPECT THIS GATE TO KILL THE STUDY
-  // AT N=30. On our best prior the secondary's hw(30) is ~0.30R against a 0.073R threshold —
-  // 4x above it. If this ever starts returning FEASIBLE on the synth, either the generator
+  // AT N=30. On our best prior the secondary's hw(30) is ~0.35-0.47R against a 0.073R threshold
+  // — 5-6x above it. If this ever starts returning FEASIBLE on the synth, either the generator
   // or the threshold has moved and the ruling must be re-opened BEFORE the flip.
+  //
+  // RE-MEASURED FOR TRA-1830: on the factor-calibrated generator the within-session contrast
+  // carries more idiosyncratic dispersion, so hw(30) grew from ~0.30R to ~0.35-0.47R — the
+  // kill is even more decisive than Spec v3.1 assumed.
 
-  it('at calendar N=30 the half-width is ~0.30R — 4x ABOVE the 0.073R gate, in EVERY world', () => {
+  it('at calendar N=30 the half-width is ~0.35-0.47R — 5-6x ABOVE the 0.073R gate, in EVERY world', () => {
     for (const [label, edge, xs] of [
       ['zero', 'none', 0],
       ['market-factor edge', 'real', 0],
@@ -880,7 +889,7 @@ describe('TRA-1800 — what the gate DOES on the generator (and it is a kill)', 
       }
       const m = mean(hws);
       expect(m, `${label}: hw(30)`).toBeGreaterThan(3 * XS_HW30_FEASIBILITY_R);
-      expect(m, `${label}: hw(30)`).toBeLessThan(0.45);
+      expect(m, `${label}: hw(30)`).toBeLessThan(0.55);
     }
   }, 120000);
 

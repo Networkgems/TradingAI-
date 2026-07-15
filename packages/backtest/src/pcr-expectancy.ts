@@ -18,67 +18,243 @@ import {
 // If you are changing a number below AFTER looking at a result, you are p-hacking.
 
 /**
- * Incremental expectancy uplift the PCR overlay must clear, in R.
+ * THE ECONOMIC FLOOR. The incremental expectancy uplift the PCR overlay must clear, in R.
  *
- * *** TRA-1756 R3: THIS BAR WAS NEVER CHECKED FOR DETECTABILITY. See PRIMARY_POWER_CONSTRAINT. ***
- * It is a PROMOTION threshold — "an edge this small is not worth trading" — and it is
- * ~30x BELOW the smallest edge this study can actually SEE. Both facts are true at once,
- * and the second one was nobody's decision; it was simply never measured.
+ * *** THIS BAR IS SOUND AS AN ECONOMIC FLOOR AND WAS NEVER A STATISTICAL ONE. ***
+ *
+ * It says "an edge smaller than +0.05R is not worth trading". That is a business judgement
+ * and it stands. What it CANNOT say — and what it silently did duty as for four months —
+ * is "an edge of +0.05R is one this study could SEE". It is not. Measured on REAL bars
+ * (TRA-1810), the session-clustered interval that grades this bar has a half-width of
+ * 0.18R-0.44R at the planned N=90 read, so the bar sits 3.6x-8.9x BELOW THE NOISE FLOOR OF
+ * THE ESTIMATOR THAT GRADES IT. Resolving +0.05R at 80% power needs ~2,300-2,700 sessions —
+ * NINE TO ELEVEN YEARS.
+ *
+ * A bar you cannot resolve is not a bar; it is a coin flip with a number written on it. So
+ * this constant is NO LONGER THE BINDING THRESHOLD ON ITS OWN. It is one of two terms in
+ * `effectiveBar()`, which takes the LARGER of this and the measured resolution of the
+ * instrument. See `DETECTABILITY_FLOOR_CONSTRAINT` (TRA-1830).
+ *
+ * The value is UNCHANGED, deliberately: nothing here moves the economic floor. Landing
+ * this BEFORE the ledger's first row is what makes it legitimate — see the header.
  */
 export const PCR_UPLIFT_BAR_R = 0.05;
 
 /**
- * TRA-1756 R3. The PRIMARY's minimum detectable effect. Stamped into every primary report
- * for the same reason TRA-1727's SELECTION_ONLY_CONSTRAINT is stamped into every secondary
- * one: in November somebody reads a verdict off a table, not this file.
+ * ===========================================================================
+ * TRA-1830 — THE DETECTABILITY FLOOR. The bar the estimator can actually resolve.
+ * ===========================================================================
  *
- * The secondary (TRA-1727) was found to be unable to release on any edge we could plausibly
- * find. THE PRIMARY HAS THE SAME DISEASE, AND SLIGHTLY WORSE. Measured on the shared synth,
- * calibrating the generator's knob to an EFFECT SIZE first (nobody had ever done that —
- * `gamma` is a coefficient, not an uplift) and only then reading power against it:
+ * THE PROBLEM, IN ONE LINE: `PCR_UPLIFT_BAR_R` is an ECONOMIC floor that has been quietly
+ * doing duty as a STATISTICAL one, and it cannot. Nobody chose that; it was never measured.
+ *
+ * TRA-1756 R3 measured the primary's MDE on the synth and found the bar ~4-12x under the
+ * interval's own half-width. TRA-1810 then calibrated the synth against the REAL 25-name
+ * watchlist and closed the last escape hatch: `k_total = 0.92`, so the real cross-section is
+ * NOT more dispersed than the synth and the finding is a CALIBRATED CLAIM ABOUT REAL BARS,
+ * not a claim about a generator. On real bars the half-width runs 0.18R (null) to 0.44R (a
+ * real edge) against a 0.05R bar.
+ *
+ * THE FIX. The binding bar becomes
+ *
+ *     effectiveBar = max(PCR_UPLIFT_BAR_R, clustered CI half-width)
+ *
+ * - It PRESERVES the economic floor: never promote below +0.05R.
+ * - It ENFORCES the statistical floor: never promote an uplift the estimator cannot resolve.
+ * - It makes the impossibility VISIBLE IN THE REPORT. At N=90 the effective bar surfaces as
+ *   ~0.4R and the report SAYS SO, out loud, on the page where the verdict is read — instead
+ *   of being hidden inside a constant that reads as 0.05. IN NOVEMBER SOMEBODY READS A
+ *   VERDICT OFF A TABLE, NOT THIS FILE. That is the whole point of the change.
+ * - It is SELF-CALIBRATING: it tightens automatically as sessions accrue, and it needs no
+ *   input from the synthetic generator, whose R-scale is the one thing that could have been
+ *   wrong. (Same construction as TRA-1756 R1's condemn rule in `pcr-cross-sectional.ts`:
+ *   "the shortfall must exceed the resolution". Same idea, the other side of the bar.)
+ *
+ * *** IT IS MONOTONE. IT CAN ONLY EVER MAKE A PASS HARDER. ***
+ *
+ * `effectiveBar >= PCR_UPLIFT_BAR_R` always, so the PASS leg is strictly tightened and no
+ * sample that FAILed or HELD under the old bar can PASS under the new one. It CANNOT
+ * manufacture a promotion. That is the same safety property that let TRA-1726's FAIL->HELD
+ * change land without re-opening the pre-registration, and it is why this one can too.
+ *
+ * *** AND IT DOES NOT TOUCH THE FAIL BRANCH. THIS IS THE LOAD-BEARING ASYMMETRY. ***
+ *
+ * The obvious-looking move — swap `effectiveBar` into the decisive-NO-GO rule as well, "for
+ * consistency" — is a CATASTROPHE, and it is worth spelling out because it looks like tidying:
+ *
+ *     FAIL iff  ciUpper < effectiveBar  ~=  point + hw < hw  ~=  point < 0
+ *
+ * On a NULL world the point estimate is negative half the time. That rule would CONDEMN the
+ * overlay — irreversibly, TRA-1726: a FAIL retires TRA-1609 — on roughly a COIN FLIP. The
+ * detectability floor exists to stop imprecision being read as PROMOTION; wiring it into the
+ * condemn branch would convert that same imprecision into CONDEMNATION, which is the exact
+ * error TRA-1726 fixed, running backwards. A wide interval is IGNORANCE. Ignorance must make
+ * both PASS and FAIL harder, never one of them easier.
+ *
+ * So: the FAIL branch keeps the ECONOMIC bar. PASS gets the effective one. The two branches
+ * disagree ON PURPOSE — as `xsFeasibilityRuling` and `xsCondemnRuling` already do, and for
+ * the same reason: they are asking different questions, and reading either as the other is
+ * how a fail-closed gate becomes a fail-open one.
+ */
+export const DETECTABILITY_FLOOR_CONSTRAINT =
+  'DETECTABILITY FLOOR (TRA-1830). The promotion bar is `max(+0.05R, the session-clustered ' +
+  'CI half-width)` — the LARGER of the ECONOMIC floor ("an edge this small is not worth ' +
+  'trading") and the STATISTICAL one ("an edge this small cannot be told from zero by this ' +
+  'estimator"). The +0.05R constant is ONLY the economic term and it was never a detectable ' +
+  'threshold: on REAL bars the half-width runs 0.18-0.44R at N=90, so the raw bar sits ' +
+  '3.6x-8.9x BELOW the noise floor of the estimator that grades it, and resolving +0.05R at ' +
+  '80% power would take ~2,300-2,700 sessions (NINE TO ELEVEN YEARS). *** IF THE EFFECTIVE ' +
+  'BAR PRINTED ON THIS REPORT IS MUCH LARGER THAN 0.05R, THAT IS NOT A BUG — IT IS THE ' +
+  'INSTRUMENT TELLING YOU WHAT IT CAN ACTUALLY SEE. *** The floor only ever makes a PASS ' +
+  'HARDER; it can never manufacture one, and it is deliberately NOT applied to the FAIL ' +
+  'branch (there it would convert imprecision into an irreversible condemnation).';
+
+/** How the effective bar was decided, and out of what. Reported on every cell. */
+export interface EffectiveBar {
+  /** The ECONOMIC floor — `PCR_UPLIFT_BAR_R`. Never moves. */
+  economicR: number;
+  /** The STATISTICAL floor — the session-clustered CI's half-width. NaN if inevaluable. */
+  halfWidthR: number;
+  /** THE BINDING BAR: max of the two. NaN (=> no PASS) when the CI is inevaluable. */
+  effectiveR: number;
+  /** WHICH TERM IS BINDING. `non-evaluable` fails closed: the uplift leg cannot pass. */
+  binding: 'economic' | 'detectability' | 'non-evaluable';
+}
+
+/** The half-width of an interval — the estimator's own resolution, in R. */
+export function ciHalfWidth(ci: Pick<Ci, 'lo' | 'hi'>): number {
+  if (!Number.isFinite(ci.lo) || !Number.isFinite(ci.hi)) return Number.NaN;
+  return (ci.hi - ci.lo) / 2;
+}
+
+/**
+ * THE BINDING PROMOTION BAR (TRA-1830). The single source of truth — the verdict calls it,
+ * the report prints it, and every test calls it. NOBODY RETYPES IT: a grader written from
+ * recall is a different grader, and this study has already shipped three controls that did
+ * not discriminate because a second copy of a rule drifted from the first.
+ *
+ * FAILS CLOSED. An inevaluable interval yields `NaN`, and `NaN >= x` is false, so the uplift
+ * leg cannot pass on an instrument that could not produce a number. "We could not measure the
+ * noise" is not a licence to promote.
+ */
+export function effectiveBar(ci: Pick<Ci, 'lo' | 'hi'>): EffectiveBar {
+  const halfWidthR = ciHalfWidth(ci);
+  if (!Number.isFinite(halfWidthR)) {
+    return {
+      economicR: PCR_UPLIFT_BAR_R,
+      halfWidthR: Number.NaN,
+      effectiveR: Number.NaN,
+      binding: 'non-evaluable',
+    };
+  }
+  const effectiveR = Math.max(PCR_UPLIFT_BAR_R, halfWidthR);
+  return {
+    economicR: PCR_UPLIFT_BAR_R,
+    halfWidthR,
+    effectiveR,
+    binding: halfWidthR > PCR_UPLIFT_BAR_R ? 'detectability' : 'economic',
+  };
+}
+
+/** Does an uplift clear the binding bar? The ONLY place the PASS comparison is made. */
+export function clearsEffectiveBar(upliftR: number, bar: EffectiveBar): boolean {
+  return Number.isFinite(upliftR) && Number.isFinite(bar.effectiveR) && upliftR >= bar.effectiveR;
+}
+
+/**
+ * The line that travels with every verdict. It names the effective bar, the half-width, and
+ * WHICH of the two terms is binding — because a reader who sees a 0.4R bar and does not know
+ * where it came from will "fix" it back to 0.05R.
+ */
+export function effectiveBarReason(bar: EffectiveBar, upliftR: number): string {
+  if (bar.binding === 'non-evaluable') {
+    return (
+      'EFFECTIVE BAR: NOT EVALUABLE — the session-clustered interval could not be computed, so ' +
+      'the estimator\'s resolution is unknown and the detectability floor cannot be checked. ' +
+      'FAILS CLOSED: no PASS is available. (Economic floor is still ' +
+      `${PCR_UPLIFT_BAR_R}R; measured uplift ${Number.isFinite(upliftR) ? upliftR.toFixed(4) : 'n/a'}R.)`
+    );
+  }
+  if (bar.binding === 'economic') {
+    return (
+      `EFFECTIVE BAR ${bar.effectiveR.toFixed(4)}R — the ECONOMIC floor is binding ` +
+      `(${PCR_UPLIFT_BAR_R}R >= the ${bar.halfWidthR.toFixed(4)}R CI half-width). The estimator ` +
+      `can resolve its own bar on this sample. Measured uplift ` +
+      `${Number.isFinite(upliftR) ? upliftR.toFixed(4) : 'n/a'}R.`
+    );
+  }
+  return (
+    `EFFECTIVE BAR ${bar.effectiveR.toFixed(4)}R — *** THE DETECTABILITY FLOOR IS BINDING *** ` +
+    `(the session-clustered CI half-width ${bar.halfWidthR.toFixed(4)}R exceeds the ` +
+    `${PCR_UPLIFT_BAR_R}R economic floor by ${(bar.halfWidthR / PCR_UPLIFT_BAR_R).toFixed(1)}x). ` +
+    `THE +0.05R BAR IS BELOW THE NOISE FLOOR OF THE ESTIMATOR THAT GRADES IT, so promoting on ` +
+    `it would promote an uplift this study cannot tell from zero. Measured uplift ` +
+    `${Number.isFinite(upliftR) ? upliftR.toFixed(4) : 'n/a'}R. ${DETECTABILITY_FLOOR_CONSTRAINT}`
+  );
+}
+
+/**
+ * TRA-1756 R3, RE-ISSUED AGAINST THE TRA-1830 FACTOR-CALIBRATED GENERATOR. The PRIMARY's
+ * minimum detectable effect. Stamped into every primary report for the same reason TRA-1727's
+ * SELECTION_ONLY_CONSTRAINT is stamped into every secondary one: in November somebody reads a
+ * verdict off a table, not this file.
+ *
+ * WHY THIS TABLE MOVED. The original R3 table was measured on the pre-TRA-1830 synth, whose
+ * within-session ICC was 0.712 — 2.0x the real watchlist's 0.358 (TRA-1810). Because
+ * `edge:'real'` injects its edge THROUGH the market factor, an over-loaded factor made the
+ * same `gamma` buy ~2x the uplift it buys on realistic bars, so the old headline "MDE ~+1.5R"
+ * was itself a synth artefact. TRA-1830 reparameterised the generator to ICC 0.358 (holding
+ * the already-calibrated R-scale fixed, k_total 0.92 -> 0.90) and this table is the re-read.
+ *
+ * The secondary (TRA-1727) was found unable to release on any edge we could plausibly find.
+ * THE PRIMARY HAS THE SAME DISEASE. Measured on the CORRECTED synth, calibrating the knob to
+ * an EFFECT SIZE first (`gamma` is a coefficient, not an uplift) and only then reading power:
  *
  *   generator     | true uplift | vs the bar | PASS at N=45 | PASS at N=90 | half-width N=90
  *   --------------+-------------+------------+--------------+--------------+----------------
- *   zero edge     |   -0.04R    |     -      |     0/12     |     0/12     |  0.214R (g=1.2)
- *                 |             |            |              |              |  0.190R (g=2.0)
- *   real, g=0.15  |   +0.33R    |    6.6x    |     1/12     |     0/12     |  0.480R
- *   real, g=0.3   |   +0.70R    |   14.1x    |     1/12     |     1/12     |  0.515R
- *   real, g=0.6   |   +1.17R    |   23.5x    |     1/12     |     2/12     |  0.583R
- *   real, g=1.2   |   +1.48R    |   29.7x    |     5/12     |     7/12     |  0.612R  <- the
- *   real, g=2.0   |   +1.53R    |   30.6x    |     6/12     |     9/12     |  0.611R  positive
+ *   zero edge     |   -0.03R    |     -      |     0/12     |     0/12     |  0.205R
+ *   real, g=0.15  |   +0.22R    |    4.3x    |     1/12     |     1/12     |  0.378R
+ *   real, g=0.3   |   +0.48R    |    9.6x    |     0/12     |     2/12     |  0.406R
+ *   real, g=0.6   |   +0.80R    |   16.1x    |     1/12     |     2/12     |  0.450R
+ *   real, g=1.2   |   +1.02R    |   20.5x    |     3/12     |     7/12     |  0.466R  <- the
+ *   real, g=2.0   |   +1.06R    |   21.2x    |     5/12     |     7/12     |  0.462R  positive
  *                                                                                     control
  *
- * READ THE `g=0.3` ROW. A TRUE EDGE OF FOURTEEN TIMES THE PROMOTION BAR MUSTERS 8% POWER AT
- * THE PLANNED N=90 READ. The MDE is ~+1.5R. The bar is +0.05R. The gate's own positive
- * control (`edge:'real'`, gamma 1.2) is +1.48R — 30x the bar — and it only just releases.
+ * READ THE `g=0.3` ROW. A TRUE EDGE OF NEARLY TEN TIMES THE PROMOTION BAR MUSTERS ~17% POWER
+ * AT THE PLANNED N=90 READ. The MDE is ~+1.0R (about 20x the bar). The gate's own positive
+ * control (`edge:'real'`, gamma 1.2) is +1.02R and only reaches ~58% power. The magnitudes
+ * shrank ~30% from the old synth's 30x/+1.5R headline, and THE DISEASE SURVIVED THE FIX: the
+ * bar is still far under the noise floor after the generator was made realistic.
  *
- * The right-hand column is the mechanism, and it is the number to remember: the
- * session-clustered interval runs 0.19R to 0.61R at the HALF-width, against a bar of 0.05R.
- * THE BAR SITS ROUGHLY 4x TO 12x BELOW THE NOISE FLOOR OF THE ESTIMATOR THAT GRADES IT.
- * Worse, the interval WIDENS as the true edge grows (0.19R -> 0.61R), so the instrument gets
- * LESS precise exactly when there is something to see — which is why the power curve climbs
- * so slowly. (Noted on TRA-1741 and unexplained then; this is what it costs.)
+ * The right-hand column is the mechanism: the session-clustered interval runs 0.20R (null) to
+ * 0.47R (a real edge) at the HALF-width, against a bar of 0.05R. THE BAR SITS ROUGHLY 4x TO 9x
+ * BELOW THE NOISE FLOOR OF THE ESTIMATOR THAT GRADES IT, and the interval WIDENS as the true
+ * edge grows, so the instrument gets LESS precise exactly when there is something to see.
  *
  * CONSEQUENCE FOR THE NOVEMBER READ: a HELD is the overwhelmingly likely outcome and it is
- * NOT EVIDENCE OF ABSENCE. It means "no edge larger than ~+1.5R", which rules out nothing
+ * NOT EVIDENCE OF ABSENCE. It means "no edge larger than ~+1.0R", which rules out nothing
  * anyone ever believed about PCR. Do not read it as "PCR does not work — drop TRA-1609".
  *
- * THE ONE THING THAT COULD OVERTURN THIS: every number above is measured on ONE synthetic
- * generator, whose R-scale (a 1-SD idiosyncratic move => ~1R of contrast) is what sets the
- * MDE — and that scale has never been checked against the real shadow ledger, which does not
- * yet have the rows to check it with. If the real cross-section is far more dispersed than
- * the synth, the MDE in R stands but its PLAUSIBILITY reading softens. Calibrate it when the
- * ledger has rows; until then this constant is a claim about the synth, stated as one.
+ * THE REMAINING SYNTH-vs-REAL GAP. The R-scale and factor structure are now calibrated to real
+ * bars, but the edge injected per `gamma` still reads ~1.5x above the real-bars uplift measured
+ * on TRA-1810 (g=1.2 = +1.02R here vs +0.70R on real bars) — the ICC fix does not fully calibrate
+ * the edge-injection mechanism. So every effect size above is, if anything, still OPTIMISTIC:
+ * the real detectability floor is at least this bad, and the DETECTABILITY_FLOOR of TRA-1830 —
+ * which reads the resolution off the SAMPLE, not off this generator — is the guard that does not
+ * depend on any of these numbers being exactly right.
  */
 export const PRIMARY_POWER_CONSTRAINT =
-  'POWER. The minimum detectable effect of this PRIMARY read is roughly +1.5R at N=90 — about ' +
-  '30x the +0.05R promotion bar. A true uplift of +0.70R (FOURTEEN times the bar) still only ' +
-  'releases 1 time in 12. The session-clustered 90% CI runs 0.19-0.61R at the half-width, so the ' +
-  'bar sits roughly 4x to 12x BELOW the noise floor of the estimator that grades it: the bar was chosen ' +
-  'as a PROMOTION threshold and was never checked to be a DETECTABLE one. *** A HELD IS NOT ' +
-  'EVIDENCE OF ABSENCE. *** It means "no edge larger than the MDE" — it does NOT mean "no edge", ' +
-  'and it is NOT a reason to drop the PCR overlay. Measured on the synthetic generator, whose ' +
-  'R-scale has NOT yet been calibrated against the real shadow ledger (TRA-1756 R3).';
+  'POWER. The minimum detectable effect of this PRIMARY read is roughly +1.0R at N=90 — about ' +
+  '20x the +0.05R promotion bar — measured on the TRA-1830 factor-calibrated generator (its ' +
+  'within-session ICC is matched to the real watchlist at 0.358). A true uplift of +0.48R — nearly ' +
+  'TEN times the bar — still releases only ~2 times in 12. The session-clustered 90% CI runs ' +
+  '0.20-0.47R at the half-width, so the bar sits roughly 4x to 9x BELOW the noise floor of the ' +
+  'estimator that grades it: the bar was chosen as a PROMOTION threshold and was never checked to ' +
+  'be a DETECTABLE one. *** A HELD IS NOT EVIDENCE OF ABSENCE. *** It means "no edge larger than ' +
+  'the MDE" — it does NOT mean "no edge", and it is NOT a reason to drop the PCR overlay. The ' +
+  'generator R-scale and factor structure are now CALIBRATED TO REAL BARS (TRA-1810/1830, k_total ' +
+  '0.92), but the edge injected per gamma still reads ~1.5x above the real-bars uplift (g=1.2 = ' +
+  '+1.0R synth vs +0.70R on real bars), so every synth effect size here is if anything OPTIMISTIC.';
 /** Bootstrap confidence level — the binding CI is the session-clustered one. */
 export const PCR_BOOTSTRAP_CONFIDENCE = 0.9;
 /** Bootstrap resamples. Fixed so a run is reproducible from the seed alone. */
@@ -691,8 +867,14 @@ export interface CellResult {
   clustered: Ci;
   /** Reported only to expose the illusion. Never binding. */
   naive: Ci;
+  /**
+   * TRA-1830. THE BINDING PROMOTION BAR on this cell: `max(economic floor, CI half-width)`,
+   * and which of the two is binding. Reported on EVERY cell — the number the `upliftBar` leg
+   * is actually graded against is not 0.05R and must never look like it is.
+   */
+  bar: EffectiveBar;
   legs: {
-    /** ADJUSTED uplift clears the pre-registered +0.05R bar. */
+    /** ADJUSTED uplift clears the EFFECTIVE bar — `max(+0.05R, the CI half-width)` (TRA-1830). */
     upliftBar: boolean;
     /** Session-clustered 90% CI lower bound on the ADJUSTED uplift > 0. */
     clusteredCiPositive: boolean;
@@ -739,8 +921,14 @@ export function evaluateCell(
     );
   }
 
+  // TRA-1830 — THE BINDING BAR. `max(economic floor, the estimator's own resolution)`.
+  const bar = effectiveBar(clustered);
+  if (bar.binding === 'detectability') {
+    notes.push(effectiveBarReason(bar, adjustedUpliftR));
+  }
+
   const legs = {
-    upliftBar: Number.isFinite(adjustedUpliftR) && adjustedUpliftR >= PCR_UPLIFT_BAR_R,
+    upliftBar: clearsEffectiveBar(adjustedUpliftR, bar),
     clusteredCiPositive: Number.isFinite(clustered.lo) && clustered.lo > 0,
     sessionFloor: sessionCount >= MIN_INDEPENDENT_SESSIONS,
   };
@@ -765,6 +953,7 @@ export function evaluateCell(
     adjustedUpliftR,
     clustered,
     naive,
+    bar,
     legs,
     pass: Object.values(legs).every(Boolean),
     notes,
@@ -916,6 +1105,12 @@ export interface PcrExpectancyReport {
    * the one that reads, wrongly, as "PCR does not work".
    */
   power: string;
+  /**
+   * TRA-1830. Stamped on every report, alongside `power`, for the same reason: the bar the
+   * verdict was ACTUALLY graded against is `primary.bar.effectiveR`, not the 0.05R constant,
+   * and a reader who does not know that will misread a HELD as a near miss.
+   */
+  detectability: string;
   diagnostics: Record<number, JoinDiagnostics>;
   shape: SampleShape;
   cells: CellResult[];
@@ -990,6 +1185,7 @@ export function runPcrExpectancy(
   if (!primary) {
     return {
       power: PRIMARY_POWER_CONSTRAINT,
+      detectability: DETECTABILITY_FLOOR_CONSTRAINT,
       diagnostics,
       shape,
       cells,
@@ -1048,6 +1244,20 @@ export function runPcrExpectancy(
   //     never FAIL, never PASS. "Don't know" has its own verdict now, and the tests
   //     assert the EXACT verdict: a `not.toBe('PASS')` assertion cannot tell a
   //     rejection from an abstention, and that is precisely what hid this bug.
+  // TRA-1830 — THE EFFECTIVE BAR TRAVELS WITH EVERY VERDICT, PASS / FAIL / HELD ALIKE.
+  //
+  // It goes in FIRST, before the verdict's own reasoning, because it is the number the
+  // verdict was graded against. `PCR_UPLIFT_BAR_R` is only ONE of its two terms and on any
+  // realistic sample it is not the binding one. A reader who takes "0.05R" off this report is
+  // reading a number the gate did not use.
+  reasons.push(effectiveBarReason(primary.bar, primary.adjustedUpliftR));
+
+  // *** THE FAIL BRANCH KEEPS THE ECONOMIC BAR. THIS IS DELIBERATE. ***
+  //
+  // See DETECTABILITY_FLOOR_CONSTRAINT: `ciUpper < effectiveBar` reduces to `point < 0`, which
+  // would condemn the overlay — IRREVERSIBLY — on roughly a coin flip in a null world. The
+  // detectability floor makes PASS harder; it must never make FAIL easier. Ignorance is not
+  // condemnation (TRA-1726), and a wide interval is ignorance.
   const ciUpper = primary.clustered.hi;
   const decisiveNoGo = Number.isFinite(ciUpper) && ciUpper < PCR_UPLIFT_BAR_R;
 
@@ -1083,8 +1293,10 @@ export function runPcrExpectancy(
     }
     if (!primary.legs.upliftBar) {
       reasons.push(
-        `HELD leg: bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R < ` +
-          `${PCR_UPLIFT_BAR_R}R bar (point estimate only — the interval still reaches it)`,
+        `HELD leg: bias-adjusted uplift ${primary.adjustedUpliftR.toFixed(4)}R < the EFFECTIVE ` +
+          `bar of ${primary.bar.effectiveR.toFixed(4)}R ` +
+          `(binding term: ${primary.bar.binding}; economic floor ${PCR_UPLIFT_BAR_R}R, CI ` +
+          `half-width ${primary.bar.halfWidthR.toFixed(4)}R)`,
       );
     }
     if (!primary.legs.clusteredCiPositive) {
@@ -1098,5 +1310,15 @@ export function runPcrExpectancy(
     reasons.push(`HELD — READ THIS BEFORE ACTING ON IT. ${PRIMARY_POWER_CONSTRAINT}`);
   }
 
-  return { power: PRIMARY_POWER_CONSTRAINT, diagnostics, shape, cells, primary, guards, verdict, reasons };
+  return {
+    power: PRIMARY_POWER_CONSTRAINT,
+    detectability: DETECTABILITY_FLOOR_CONSTRAINT,
+    diagnostics,
+    shape,
+    cells,
+    primary,
+    guards,
+    verdict,
+    reasons,
+  };
 }
