@@ -34,7 +34,12 @@ import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
 import { summarizeCryptoRegimeScans } from '../crypto-regime-scanner.js';
-import { isRegimeTsmomEnabled, isRegimeTsmomDemoRouteEnabled } from '../crypto-regime-tsmom-flag.js';
+import {
+  isRegimeTsmomEnabled,
+  isRegimeTsmomDemoRouteEnabled,
+  REGIME_TSMOM_OBSERVE_KILLED,
+  REGIME_TSMOM_OBSERVE_KILLED_REASON,
+} from '../crypto-regime-tsmom-flag.js';
 import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
 import { summarizeRegimeTsmomDemoRoute } from '../crypto-regime-tsmom-demo-route.js';
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
@@ -1088,6 +1093,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: isRegimeTsmomEnabled(),
+      // TRA-1734 — an explicit retire marker. A killed strategy MUST NOT read
+      // identically to one that was simply never switched on: a future reader
+      // hitting a silent `enabled:false` cannot tell "retired after a NO-GO at
+      // n=18" from "flag never set", and that ambiguity is how a dead strategy
+      // gets revived by accident. `killed:true` + `killedReason` name the verdict.
+      killed: REGIME_TSMOM_OBSERVE_KILLED,
+      killedReason: REGIME_TSMOM_OBSERVE_KILLED ? REGIME_TSMOM_OBSERVE_KILLED_REASON : null,
       ...summarizeRegimeTsmomScans(now()),
       demoRoute: {
         enabled: isRegimeTsmomDemoRouteEnabled(routeEnv),

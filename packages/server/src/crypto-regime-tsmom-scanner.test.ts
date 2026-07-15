@@ -14,6 +14,7 @@ import {
   resolveRegimeTsmomConfig,
   resolveRegimeTsmomWatchlist,
   isRegimeTsmomEnabled,
+  REGIME_TSMOM_OBSERVE_KILLED,
   type RegimeTsmomConfig,
 } from './crypto-regime-tsmom-flag.js';
 import { CRYPTO_REGIME_DEFAULTS, type CryptoRegimeReading, type CryptoRegimeLabel } from '@trading-app/engine';
@@ -379,10 +380,21 @@ describe('config + flag resolution (spec §4)', () => {
     expect(c.allowChopLong).toBe(true);
   });
 
-  it('flag checker + watchlist default to the 12-major universe', () => {
-    expect(isRegimeTsmomEnabled({ ENABLE_CRYPTO_REGIME_TSMOM: 'on' })).toBe(true);
-    expect(isRegimeTsmomEnabled({})).toBe(false);
+  it('watchlist defaults to the 12-major universe', () => {
     expect(resolveRegimeTsmomWatchlist({})).toContain('BTC-USD');
     expect(resolveRegimeTsmomWatchlist({ CRYPTO_REGIME_TSMOM_WATCHLIST: 'sol-usd, avax-usd' })).toEqual(['SOL-USD', 'AVAX-USD']);
+  });
+
+  // TRA-1734 — the RETIRE kill. The observe master is permanently dead (TRA-1219
+  // RETIRE verdict, TRA-1229 forward gate NO-GO at n=18). `isRegimeTsmomEnabled()`
+  // must stay hard-false even when the env flag is explicitly `on`, so no operator
+  // and no stale bqb1 env can revive the scanner's cost/IO. If TSMOM is ever
+  // revived by a fresh board decision, flip REGIME_TSMOM_OBSERVE_KILLED and this
+  // assertion is the trip-wire that forces the revival to be deliberate.
+  it('stays killed even with ENABLE_CRYPTO_REGIME_TSMOM=on in env (TRA-1734)', () => {
+    expect(REGIME_TSMOM_OBSERVE_KILLED).toBe(true);
+    expect(isRegimeTsmomEnabled({ ENABLE_CRYPTO_REGIME_TSMOM: 'on' })).toBe(false);
+    expect(isRegimeTsmomEnabled({ ENABLE_CRYPTO_REGIME_TSMOM: 'true' })).toBe(false);
+    expect(isRegimeTsmomEnabled({})).toBe(false);
   });
 });

@@ -26,8 +26,32 @@ function flagOn(raw: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-/** True iff the observe-only regime-gated TSMOM scanner flag is enabled. */
+// TRA-1734 KILL (parent TRA-1219, rec #2 of the TRA-1211 memo) — the OBSERVE
+// master is RETIRED, mirroring the TRA-1440 demo-route kill above. The forward
+// gate TRA-1229 closed NO-GO (n=18, -0.37R, no path to positive) and QuantTrader
+// issued the RETIRE verdict on TRA-1219, so the strategy is permanently dead, not
+// merely toggled off. This constant HARD-DISABLES the observe capture regardless
+// of the env / demo-flags.json flag, restoring the "OFF ⇒ zero cost/IO" invariant:
+// no 4H candle fetch, no classify, no store writes. The running bqb1 env flag
+// (`ENABLE_CRYPTO_REGIME_TSMOM=on`) cannot be cleared from our side — the Render
+// blueprint key is blocked (TRA-969) and there are no non-secret admin creds for a
+// demo-flags POST — so the kill lives in code, the only lever we hold. The scanner
+// code, its tests, and the health route stay in place: this is a RETIREMENT, not a
+// deletion. Reviving TSMOM is a fresh board decision + a deliberate flip of this
+// constant.
+export const REGIME_TSMOM_OBSERVE_KILLED = true;
+
+/** Names the retire verdict so a health reader can tell "retired" from "never set". */
+export const REGIME_TSMOM_OBSERVE_KILLED_REASON =
+  'Retired per TRA-1219 RETIRE verdict (TRA-1229 forward gate closed NO-GO at n=18, -0.37R). Observe capture hard-disabled by TRA-1734.';
+
+/**
+ * True iff the observe-only regime-gated TSMOM scanner flag is enabled.
+ * Hard-returns `false` while {@link REGIME_TSMOM_OBSERVE_KILLED} (the TRA-1734
+ * retire kill) is set — the retired scanner never captures, whatever the flag says.
+ */
 export function isRegimeTsmomEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (REGIME_TSMOM_OBSERVE_KILLED) return false;
   return flagOn(env[CRYPTO_REGIME_TSMOM_FLAG]);
 }
 

@@ -39,11 +39,11 @@ export const DEMO_FLAG_ALLOWLIST = [
   // file override so a non-admin operator can arm the forward label stream on the
   // self-hosted host.
   'ENABLE_CRYPTO_REGIME_OVERLAY',
-  // TRA-1221 — observe-only regime-gated TSMOM crypto scanner. Non-secret,
-  // read-only, no order path — emits would-be signals only. Safe for the file
-  // override so a non-admin operator can arm the forward capture on the self-hosted
-  // host.
-  'ENABLE_CRYPTO_REGIME_TSMOM',
+  // TRA-1221 — observe-only regime-gated TSMOM crypto scanner. RETIRED per
+  // TRA-1734 (parent TRA-1219 RETIRE verdict): `ENABLE_CRYPTO_REGIME_TSMOM` is
+  // REMOVED from the allowlist so no operator can flip a permanently-dead strategy
+  // back on by hand via demo-flags.json. `isRegimeTsmomEnabled()` also hard-returns
+  // false (REGIME_TSMOM_OBSERVE_KILLED). Reviving TSMOM is a fresh board decision.
   // TRA-1271 - observe-only crypto ignition scanner (strict RVOL>=6 breakout).
   // Non-secret, read-only, ZERO capital / no order path - emits would-be forward
   // records + the would-a-limit-fill instrument only. Safe for the file override
