@@ -1633,6 +1633,8 @@ interface FunnelResponse {
   live: EquityEntryFunnelBlock[];
   intradayChurnersDisabled: string[];
   symbolReadRule: string;
+  bucketOrderNote: string; // TRA-1835
+  symbolNamesNote: string; // TRA-1835
 }
 
 /** TRA-1834 — a stable engineId for these direct-call route tests (one engine per test). */
@@ -1792,5 +1794,33 @@ describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () =
     }
     expect(body.demo[0].funnelStatus).toBe('gated'); // …and it is a GATE, not a verdict
     expect(raw).toContain('"symbolsEvaluated":null'); // literally, on the wire
+
+    // TRA-1835 — the NAME fields obey the same three-valued discipline: null on a gate,
+    // as PRESENT keys, never absent (an absent key reads as a void, not a null).
+    expect(Object.hasOwn(body.demo[0].lastPass, 'symbolsSkippedSymbols')).toBe(true);
+    expect(body.demo[0].lastPass.symbolsSkippedSymbols).toBeNull();
+    expect(Object.hasOwn(body.demo[0].cumulative, 'symbolsSkippedByName')).toBe(true);
+    expect(body.demo[0].cumulative.symbolsSkippedByName).toBeNull();
+  });
+
+  // TRA-1835 — the whole point of the ticket, served over the wire: a `stale_feed: N` that
+  // does not NAME its N reads identically whether the dark names are the tail or the head.
+  it('names the dark in-universe symbols on the wire, and flags truncation rather than cutting silently', () => {
+    beginEquityEntryPass('demo', FE, { symbolsConsidered: 21, at: NOW });
+    // Two curated names dark, one off-universe skip that must be COUNTED but never NAMED.
+    recordEquitySymbolSkipped('demo', FE, 'stale_feed', { symbol: 'NVDA', inUniverse: true });
+    recordEquitySymbolSkipped('demo', FE, 'stale_feed', { symbol: 'COIN', inUniverse: true });
+    recordEquitySymbolSkipped('demo', FE, 'off_swing_universe', { symbol: 'ZZZZ', inUniverse: false });
+
+    const body = overTheWire();
+
+    // The count still closes; the NAMES ride alongside it. off_swing_universe is unnamed.
+    expect(body.demo[0].lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 2, off_swing_universe: 1 });
+    expect(body.demo[0].lastPass.symbolsSkippedSymbols).toEqual({ stale_feed: ['NVDA', 'COIN'] });
+    expect(body.demo[0].lastPass.symbolsSkippedSymbolsTruncated).toBe(false);
+    expect(body.demo[0].cumulative.symbolsSkippedByName).toEqual({ stale_feed: { NVDA: 1, COIN: 1 } });
+    // The read guidance the ticket asked for ships WITH the reading, not only in the ticket.
+    expect(body.bucketOrderNote).toContain('first-match-wins');
+    expect(body.symbolNamesNote).toContain('symbolsSkippedSymbols');
   });
 });

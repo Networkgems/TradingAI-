@@ -409,3 +409,94 @@ describe('TRA-1793 — a dry signal vs a dead feed', () => {
     expect(live).toEqual([]);
   });
 });
+
+// ── TRA-1835 — NAME the dark symbols, don't just count them ─────────────────────
+//
+// `stale_feed: 4` reads IDENTICALLY whether the 4 dark names are the benign tail
+// (DIA/IWM/XLF/ORCL) or the high-signal head (NVDA/TSLA/COIN/MSTR). A "the strategy is
+// dry" verdict written over a universe with its best names amputated is a false verdict.
+// These tests prove the ACTUAL tickers are named, in-universe only, and that the
+// off_swing_universe cut is counted but NOT named.
+
+describe('TRA-1835 — name the dark symbols', () => {
+  const priorSwing = process.env.EQUITY_SWING_MODE;
+
+  beforeEach(() => {
+    __resetEquityEntryFunnelForTests();
+    process.env.EQUITY_SWING_MODE = 'true'; // the whole ticket lives under swing mode
+    vi.useFakeTimers();
+    vi.setSystemTime(RTH_OPEN_MS);
+    expect(isStockMarketOpen()).toBe(true); // the TRA-418 stale gate is only armed in RTH
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (priorSwing === undefined) delete process.env.EQUITY_SWING_MODE;
+    else process.env.EQUITY_SWING_MODE = priorSwing;
+    __resetEquityEntryFunnelForTests();
+  });
+
+  it('the in-universe stale names are NAMED; the off-universe cut is counted but NOT named', async () => {
+    const engine = await demoEngine();
+    // AAPL + NVDA are curated swing names on a DEAD feed (bars 1h old). MSFT is fresh and
+    // clears. ZZZZ is off-universe and fresh — the benign cut we must count but never name.
+    priv(engine).candleCache.set('AAPL', candles('AAPL', RTH_OPEN_MS - 60 * 60_000));
+    priv(engine).candleCache.set('NVDA', candles('NVDA', RTH_OPEN_MS - 60 * 60_000));
+    priv(engine).candleCache.set('MSFT', candles('MSFT', RTH_OPEN_MS - 60_000));
+    priv(engine).candleCache.set('ZZZZ', candles('ZZZZ', RTH_OPEN_MS - 60_000));
+
+    const evaluable = await priv(engine).sweepEquityEntryUniverse(['AAPL', 'NVDA', 'MSFT', 'ZZZZ']);
+    expect(evaluable.map(e => e.sym)).toEqual(['MSFT']); // only the fresh in-universe name ran
+
+    const [demo] = summarizeEquityEntryFunnel().demo;
+    // The COUNT still closes exactly as before — this is purely additive.
+    expect(demo.lastPass.symbolsSkippedByReason).toEqual({ stale_feed: 2, off_swing_universe: 1 });
+    // …and now the 2 dark names have NAMES. ZZZZ (off-universe) is deliberately absent.
+    expect(demo.lastPass.symbolsSkippedSymbols).toEqual({ stale_feed: ['AAPL', 'NVDA'] });
+    expect(demo.lastPass.symbolsSkippedSymbols).not.toHaveProperty('off_swing_universe');
+    expect(demo.lastPass.symbolsSkippedSymbolsTruncated).toBe(false);
+    // Cumulative per-symbol tally, in-universe only.
+    expect(demo.cumulative.symbolsSkippedByName).toEqual({ stale_feed: { AAPL: 1, NVDA: 1 } });
+  });
+
+  it('an intermittently-dark name is distinguishable from an always-dark one via the cumulative tally', async () => {
+    const engine = await demoEngine();
+    // Pass 1: both AAPL and NVDA dark.
+    priv(engine).candleCache.set('AAPL', candles('AAPL', RTH_OPEN_MS - 60 * 60_000));
+    priv(engine).candleCache.set('NVDA', candles('NVDA', RTH_OPEN_MS - 60 * 60_000));
+    await priv(engine).sweepEquityEntryUniverse(['AAPL', 'NVDA']);
+    // Pass 2: NVDA's feed recovered (fresh bars); AAPL still dark.
+    priv(engine).candleCache.set('NVDA', candles('NVDA', RTH_OPEN_MS - 60_000));
+    await priv(engine).sweepEquityEntryUniverse(['AAPL', 'NVDA']);
+
+    const [demo] = summarizeEquityEntryFunnel().demo;
+    // AAPL dark on BOTH passes (2/2 — a broken subscription), NVDA dark on 1/2 (jitter).
+    // The integer `stale_feed: 3` alone could never tell these apart.
+    expect(demo.cumulative.symbolsSkippedByName).toEqual({ stale_feed: { AAPL: 2, NVDA: 1 } });
+    expect(demo.iteratedPassCount).toBe(2); // the denominator for the dark-rate
+    // The last pass only names AAPL — NVDA cleared.
+    expect(demo.lastPass.symbolsSkippedSymbols).toEqual({ stale_feed: ['AAPL'] });
+  });
+
+  it('an iterated pass with no in-universe drop reports {} (a real reading), never null', async () => {
+    const engine = await demoEngine();
+    // Every curated name fresh and clean.
+    priv(engine).candleCache.set('AAPL', candles('AAPL', RTH_OPEN_MS - 60_000));
+    priv(engine).candleCache.set('MSFT', candles('MSFT', RTH_OPEN_MS - 60_000));
+    await priv(engine).sweepEquityEntryUniverse(['AAPL', 'MSFT']);
+
+    const [demo] = summarizeEquityEntryFunnel().demo;
+    expect(demo.lastPass.symbolsEvaluated).toBe(2);
+    expect(demo.lastPass.symbolsSkippedSymbols).toEqual({});          // looked, nothing dark
+    expect(demo.lastPass.symbolsSkippedSymbols).not.toBeNull();       // distinct from never-ran
+    expect(demo.cumulative.symbolsSkippedByName).toEqual({});
+  });
+
+  it('a GATED pass leaves the name fields NULL — a shut market skipped no NAMED symbol', () => {
+    recordEquityEntryPassGated('demo', E1, 'market_closed');
+    const [demo] = summarizeEquityEntryFunnel().demo;
+    expect(demo.funnelStatus).toBe('gated');
+    expect(demo.lastPass.symbolsSkippedSymbols).toBeNull();
+    expect(demo.cumulative.symbolsSkippedByName).toBeNull();
+  });
+});

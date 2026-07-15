@@ -149,6 +149,18 @@ export type EquitySymbolSkipReason =
   | 'stale_feed';            // TRA-418 — the equity feed is dead during RTH
 
 /**
+ * TRA-1835 — cap on the per-reason symbol-NAME list.
+ *
+ * The name list is IN-UNIVERSE-only (swing mode: the curated 21 names; swing off: the
+ * active set), so under the ticket's regime it can never exceed 21 and this cap never
+ * bites. It exists so that if the universe ever grows past this the route says so with an
+ * explicit `symbolsSkippedSymbolsTruncated: true` rather than SILENTLY cutting the list —
+ * a silently-cut list reads as a complete one, which is this program's whole disease
+ * (`stale_feed: 4` that names 3 is worse than a count of 4). 64 leaves generous headroom.
+ */
+const MAX_SKIPPED_SYMBOLS_PER_REASON = 64;
+
+/**
  * NOTE (TRA-1793) — the status enum is DELIBERATELY unchanged. A pass that iterated but
  * evaluated no symbol still reports `no_candidates`, because QuantTrader's read rule
  * (TRA-1794) is pre-registered against these five values and moving the goalposts under
@@ -204,6 +216,19 @@ interface ModeLedger {
   lastPassSymbolsEvaluated: number | null;
   lastPassSymbolsSkipped: Counter<EquitySymbolSkipReason> | null;
 
+  /**
+   * TRA-1835 — the ACTUAL tickers skipped on the last iterated pass, IN-UNIVERSE only,
+   * `reason → string[]`. The point of the ticket: `stale_feed: 4` reads identically
+   * whether the 4 dark names are the tail (DIA/IWM/XLF/ORCL — lose nothing) or the head
+   * (NVDA/TSLA/COIN/MSTR — the book is amputated). A count cannot tell those apart; names
+   * can. `off_swing_universe` is deliberately NOT listed — those ~134 skips are the
+   * expected, benign off-universe cut and QuantTrader explicitly does not want them named.
+   * `null` until an iterated pass has run.
+   */
+  lastPassSymbolsSkippedSymbols: Partial<Record<EquitySymbolSkipReason, string[]>> | null;
+  /** TRA-1835 — a per-reason list hit `MAX_SKIPPED_SYMBOLS_PER_REASON` and was capped. */
+  lastPassSymbolsSkippedTruncated: boolean;
+
   /** Cumulative since boot. */
   cumCandidates: number;
   cumAdmitted: number;
@@ -212,6 +237,13 @@ interface ModeLedger {
   cumSymbolsConsidered: number;
   cumSymbolsEvaluated: number;
   cumSymbolsSkipped: Counter<EquitySymbolSkipReason>;
+  /**
+   * TRA-1835 — since-boot per-symbol skip tally, IN-UNIVERSE only: `reason → symbol → n`.
+   * A name dark on 100% of passes (a broken feed subscription) and a name dark on 5% (feed
+   * jitter) both land in the same `stale_feed` integer today; this splits them. Read against
+   * `iteratedPassCount` for the rate. Bounded by the universe size (≤21 under swing mode).
+   */
+  cumSymbolsSkippedByName: Partial<Record<EquitySymbolSkipReason, Record<string, number>>>;
 }
 
 function emptyLedger(): ModeLedger {
@@ -229,6 +261,8 @@ function emptyLedger(): ModeLedger {
     lastPassSymbolsConsidered: null,
     lastPassSymbolsEvaluated: null,
     lastPassSymbolsSkipped: null,
+    lastPassSymbolsSkippedSymbols: null,
+    lastPassSymbolsSkippedTruncated: false,
     cumCandidates: 0,
     cumAdmitted: 0,
     cumRejected: {},
@@ -236,6 +270,7 @@ function emptyLedger(): ModeLedger {
     cumSymbolsConsidered: 0,
     cumSymbolsEvaluated: 0,
     cumSymbolsSkipped: {},
+    cumSymbolsSkippedByName: {},
   };
 }
 
@@ -263,6 +298,10 @@ interface OpenPass {
   rejected: Counter<EquityEntryRejectReason>;
   symbolsEvaluated: number;
   symbolsSkipped: Counter<EquitySymbolSkipReason>;
+  /** TRA-1835 — in-universe tickers skipped this pass, `reason → string[]`. */
+  symbolsSkippedSymbols: Partial<Record<EquitySymbolSkipReason, string[]>>;
+  /** TRA-1835 — a per-reason list hit the cap this pass. */
+  symbolsSkippedTruncated: boolean;
   /** TRA-1834 — the sweep finished iterating this pass. See the truncation detector. */
   complete: boolean;
 }
@@ -339,7 +378,16 @@ export function beginEquityEntryPass(
   led.iteratedPassCount += 1;
   led.lastPassAt = at;
   led.lastPassGateBlockedReason = null;
-  slot.open = { candidates: 0, admitted: 0, rejected: {}, symbolsEvaluated: 0, symbolsSkipped: {}, complete: false };
+  slot.open = {
+    candidates: 0,
+    admitted: 0,
+    rejected: {},
+    symbolsEvaluated: 0,
+    symbolsSkipped: {},
+    symbolsSkippedSymbols: {},
+    symbolsSkippedTruncated: false,
+    complete: false,
+  };
   // Seed the last-pass fields immediately, so a pass that iterates and finds nothing
   // still reports `candidatesEvaluated: 0` (not null) even if no hook fires after this.
   led.lastPassCandidates = 0;
@@ -348,6 +396,11 @@ export function beginEquityEntryPass(
   led.lastPassSymbolsConsidered = opts.symbolsConsidered;
   led.lastPassSymbolsEvaluated = 0;
   led.lastPassSymbolsSkipped = {};
+  // TRA-1835 — an iterated pass that skipped no in-universe name reports an EMPTY object,
+  // not null: it looked and found nothing dark, which is a real reading (all 21 clean),
+  // distinct from `null` = no iterated pass since boot.
+  led.lastPassSymbolsSkippedSymbols = {};
+  led.lastPassSymbolsSkippedTruncated = false;
   led.cumSymbolsConsidered += opts.symbolsConsidered;
 }
 
@@ -417,14 +470,61 @@ export function recordEquitySymbolEvaluated(mode: EquityEntryMode, engineId: str
   slot.led.lastPassSymbolsEvaluated = pass.symbolsEvaluated;
 }
 
-/** TRA-1793 — a symbol was SKIPPED before strategy evaluation, and this is why. */
-export function recordEquitySymbolSkipped(mode: EquityEntryMode, engineId: string, reason: EquitySymbolSkipReason): void {
+/**
+ * TRA-1793 — a symbol was SKIPPED before strategy evaluation, and this is why.
+ *
+ * TRA-1835 — `opts.symbol` names the ticker and `opts.inUniverse` says whether it is one of
+ * the curated swing names. The NAME is recorded (per-pass list + since-boot tally) ONLY when
+ * `inUniverse` is true, so the ~134 benign `off_swing_universe` skips are counted but never
+ * NAMED — QuantTrader wants the 21 in-universe drops named and the off-universe cut left as a
+ * bare integer. `opts` is optional so the pure-count contract survives a caller that has no
+ * symbol to hand (and the existing tests that drive counts alone keep passing); a call without
+ * it degrades to exactly the old behaviour — the count moves, no name is listed.
+ */
+export function recordEquitySymbolSkipped(
+  mode: EquityEntryMode,
+  engineId: string,
+  reason: EquitySymbolSkipReason,
+  opts?: { symbol?: string; inUniverse?: boolean },
+): void {
   const slot = slotFor(mode, engineId);
-  bump(slot.led.cumSymbolsSkipped, reason); // TRA-1834 — cumulative BEFORE the guard (see above)
+  const led = slot.led;
+  bump(led.cumSymbolsSkipped, reason); // TRA-1834 — cumulative BEFORE the guard (see above)
+  // TRA-1835 — the since-boot per-symbol tally, in-universe only. Folds cumulatively (before
+  // the open-pass guard) so an intermittently-dark name's history survives across passes.
+  if (opts?.inUniverse && opts.symbol) {
+    const byName = (led.cumSymbolsSkippedByName[reason] ??= {});
+    byName[opts.symbol] = (byName[opts.symbol] ?? 0) + 1;
+  }
   const pass = slot.open;
   if (!pass) return;
   bump(pass.symbolsSkipped, reason);
-  slot.led.lastPassSymbolsSkipped = { ...pass.symbolsSkipped };
+  led.lastPassSymbolsSkipped = { ...pass.symbolsSkipped };
+  // TRA-1835 — the last-pass NAME list, in-universe only and capped. A name already listed
+  // this pass is not duplicated (a symbol is evaluated once per sweep, but guard defensively).
+  if (opts?.inUniverse && opts.symbol) {
+    const names = (pass.symbolsSkippedSymbols[reason] ??= []);
+    if (!names.includes(opts.symbol)) {
+      if (names.length < MAX_SKIPPED_SYMBOLS_PER_REASON) {
+        names.push(opts.symbol);
+      } else {
+        pass.symbolsSkippedTruncated = true;
+      }
+    }
+    led.lastPassSymbolsSkippedSymbols = cloneNameLists(pass.symbolsSkippedSymbols);
+    led.lastPassSymbolsSkippedTruncated = pass.symbolsSkippedTruncated;
+  }
+}
+
+/** TRA-1835 — deep-copy a `reason → string[]` map so a later push cannot mutate a served view. */
+function cloneNameLists(
+  src: Partial<Record<EquitySymbolSkipReason, string[]>>,
+): Partial<Record<EquitySymbolSkipReason, string[]>> {
+  const out: Partial<Record<EquitySymbolSkipReason, string[]>> = {};
+  for (const [reason, names] of Object.entries(src) as [EquitySymbolSkipReason, string[]][]) {
+    out[reason] = [...names];
+  }
+  return out;
 }
 
 /** One equity entry candidate was evaluated (i.e. reached the entry chokepoint). */
@@ -505,6 +605,15 @@ export interface EquityEntryFunnelView {
     /** TRA-1793 — symbols that reached strategy evaluation. `0` on an iterated pass is THE ALARM. */
     symbolsEvaluated: number | null;
     symbolsSkippedByReason: Counter<EquitySymbolSkipReason> | null;
+    /**
+     * TRA-1835 — the ACTUAL in-universe tickers skipped this pass, `reason → string[]`.
+     * `off_swing_universe` is intentionally absent (the benign off-universe cut is counted
+     * in `symbolsSkippedByReason` but not named). `{}` = an iterated pass skipped no
+     * in-universe name; `null` = no iterated pass since boot.
+     */
+    symbolsSkippedSymbols: Partial<Record<EquitySymbolSkipReason, string[]>> | null;
+    /** TRA-1835 — a per-reason name list was capped at MAX_SKIPPED_SYMBOLS_PER_REASON. */
+    symbolsSkippedSymbolsTruncated: boolean;
   };
   /** Since boot. `candidatesEvaluated: 0` after an iterated pass is THE ALARM. */
   cumulative: {
@@ -515,6 +624,13 @@ export interface EquityEntryFunnelView {
     symbolsConsidered: number | null;
     symbolsEvaluated: number | null;
     symbolsSkippedByReason: Counter<EquitySymbolSkipReason> | null;
+    /**
+     * TRA-1835 — since-boot per-symbol skip tally, in-universe only: `reason → symbol → n`.
+     * Divides a name dark on every pass (a dead subscription) from one dark occasionally
+     * (feed jitter) — read each count against `iteratedPassCount`. `null` on a pass that
+     * never swept the universe (same predicate as the other cumulative symbol fields).
+     */
+    symbolsSkippedByName: Partial<Record<EquitySymbolSkipReason, Record<string, number>>> | null;
   };
 }
 
@@ -547,6 +663,8 @@ function viewOf(led: ModeLedger): EquityEntryFunnelView {
       symbolsConsidered: led.lastPassSymbolsConsidered,
       symbolsEvaluated: led.lastPassSymbolsEvaluated,
       symbolsSkippedByReason: led.lastPassSymbolsSkipped,
+      symbolsSkippedSymbols: led.lastPassSymbolsSkippedSymbols,
+      symbolsSkippedSymbolsTruncated: led.lastPassSymbolsSkippedTruncated,
     },
     cumulative: {
       candidatesEvaluated: looked ? led.cumCandidates : null,
@@ -556,6 +674,7 @@ function viewOf(led: ModeLedger): EquityEntryFunnelView {
       symbolsConsidered: swept ? led.cumSymbolsConsidered : null,
       symbolsEvaluated: swept ? led.cumSymbolsEvaluated : null,
       symbolsSkippedByReason: swept ? led.cumSymbolsSkipped : null,
+      symbolsSkippedByName: swept ? led.cumSymbolsSkippedByName : null,
     },
   };
 }

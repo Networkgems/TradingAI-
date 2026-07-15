@@ -1532,6 +1532,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // pass means no strategy was EVER RUN (a DATA problem — cold cache, dead feed, empty
       // universe), so the strategy cannot be indicted. Read symbolsEvaluated FIRST.
       symbolReadRule: 'Read symbolsEvaluated BEFORE candidatesEvaluated. symbolsEvaluated > 0 with candidatesEvaluated = 0 ⇒ strategies RAN and were dry (a STRATEGY verdict). symbolsEvaluated = 0 on an ITERATED pass ⇒ NO strategy ever ran — candidatesEvaluated: 0 is then a DATA verdict, not a strategy one, and symbolsSkippedByReason names the cause (insufficient_candles = cold candle cache, stale_feed = TRA-418 dead equity feed during RTH, off_swing_universe = TRA-952, EXPECTED to be large and benign under swing mode: the universe is 21 of N watchlist names). symbolsEvaluated is null — never 0 — on a GATED pass, for the same reason candidatesEvaluated is.',
+      // TRA-1835 — the bucket ORDER is FIRST-MATCH-WINS (insufficient_candles → off_swing_universe
+      // → stale_feed) and that is CORRECT — do not "fix" it. It is what lets a reader derive
+      // `stale_feed + symbolsEvaluated = in-universe survivors` and prove the candle cache warmed
+      // for the whole universe. The consequence: a `0` in a LATER bucket does NOT mean that gate
+      // is idle — it means an EARLIER gate ate the symbol first. Treat the buckets as an ordered
+      // sieve, never as independent tallies.
+      bucketOrderNote: 'symbolsSkippedByReason buckets are ORDERED, first-match-wins: insufficient_candles → off_swing_universe → stale_feed. A 0 in a later bucket means an EARLIER gate consumed the symbol, NOT that the later gate is idle. This ordering is deliberate and correct — keep it.',
+      // TRA-1835 — the count `stale_feed: 4` reads IDENTICALLY whether the 4 dark names are the
+      // benign tail (DIA/IWM/XLF) or the high-signal head (NVDA/TSLA/COIN/MSTR). symbolsSkippedSymbols
+      // NAMES them so a "the strategy is dry" verdict is not measuring a universe with its best names
+      // amputated. IN-UNIVERSE only — off_swing_universe is counted in symbolsSkippedByReason but NOT
+      // named (its ~134 skips are the expected off-universe cut). {} = an iterated pass with no
+      // in-universe drop (all curated names clean); null = no iterated pass since boot. If a per-reason
+      // list is ever capped, symbolsSkippedSymbolsTruncated goes true rather than the list being cut
+      // silently. cumulative.symbolsSkippedByName (reason → symbol → n) splits a name dark EVERY pass
+      // (dead subscription) from one dark occasionally (jitter) — read each against iteratedPassCount.
+      symbolNamesNote: 'lastPass.symbolsSkippedSymbols names the ACTUAL in-universe tickers skipped last pass (reason → string[]); off_swing_universe is intentionally NOT named. {} = iterated pass, no in-universe drop; null = no iterated pass since boot. symbolsSkippedSymbolsTruncated flags a capped list (never silently cut). cumulative.symbolsSkippedByName (reason → symbol → count) is the since-boot per-symbol tally: divide by iteratedPassCount for the dark-rate — 100% ⇒ a broken feed subscription, low ⇒ normal jitter.',
       note: 'candidatesEvaluated is three-valued: null = no ITERATED pass since boot (says nothing about the signal side), 0 = a pass ran and generated NO candidates (THE ALARM — the strategy is dry, no guardrail can be blamed), >0 = ideas exist. If candidatesEvaluated > 0 and admitted = 0, rejectedByReason names the guardrail eating them. passGateBlockedReason is set when the pass FIRED but never iterated (market closed / halted / auto-trading off) — that is NOT a strategy verdict and candidatesEvaluated stays null. Counters are SINCE-BOOT and in-memory by design: DATA_DIR is ephemeral (TRA-1719), so a durable counter here would be pinned at 0 forever; this instrument needs n=1 and reads correctly on the FIRST tick after a deploy. There is deliberately NO min_holding_days bucket — that guardrail gates discretionary CLOSES, never entries, so the bucket could never increment. TRA-1834 — demo/live are LISTS of per-engine blocks (each with engineId + label), never pooled: two demo engines shared one ledger before, and a gated tick on one nulled the other pass mid-sweep, silently DROPPING symbolsEvaluated/symbolsSkippedByReason. passesTruncated is the sentinel — it MUST be 0; a non-zero value means an engineId collision and those two symbol counters are lower bounds, not real counts.',
     });
   });

@@ -2610,20 +2610,27 @@ export class SignalEngine {
       // HTTP health probe is serviced mid-sweep; the whole universe would otherwise run
       // as one synchronous burst, which is exactly what starved Render's 5s health check.
       if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      // TRA-1835 — is this one of the curated swing names? Only IN-UNIVERSE tickers are
+      // NAMED in the funnel (the ~134 off-universe skips are counted but not listed — that
+      // benign cut is not what QuantTrader is hunting). When swing mode is off there is no
+      // curated restriction, so every active symbol is in-universe. Computed once here so
+      // the `insufficient_candles` bucket — which sits AHEAD of the universe cut and can hold
+      // an off-universe cold-cache name — still only names names that belong to the sleeve.
+      const inUniverse = !swingMode || isLiquidSwingSymbol(sym);
       const candles = this.candleCache.get(sym) ?? [];
       if (candles.length < 15) {
-        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'insufficient_candles');
+        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'insufficient_candles', { symbol: sym, inUniverse });
         continue;
       }
       if (swingMode && !isLiquidSwingSymbol(sym)) {
-        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'off_swing_universe');
+        recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'off_swing_universe', { symbol: sym, inUniverse: false });
         continue;
       }
       if (equityFeedGateActive) {
         const verdict = evaluateFeedFreshness({ candles }, freshnessNow);
         if (verdict.stale) {
           log.warn('equity feed stale; skipping signal evaluation', { sym, reason: verdict.reason });
-          recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'stale_feed');
+          recordEquitySymbolSkipped(this.mode, this.feedContextKey, 'stale_feed', { symbol: sym, inUniverse });
           continue;
         }
       }
