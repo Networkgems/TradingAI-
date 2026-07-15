@@ -271,6 +271,73 @@ export const PRIMARY_HORIZON = 5;
 /** Pre-declared robustness horizons. Publishing all three is mandatory. */
 export const HORIZONS = [3, 5, 10] as const;
 
+// ===========================================================================
+// SPEC v3.1(A) — THE PRIMARY'S N=30 FEASIBILITY KILL-GATE       TRA-1741/1829
+// ===========================================================================
+//
+// TRA-1741 ruled a KILL GATE at calendar N=30: on the REAL ledger, if the primary read
+// cannot resolve its own bar, TRA-1609 is RETIRED and we do NOT accrue to the N=90
+// terminal read. The ruling gave the number as `hw(30) <= 0.09R`. That number was
+// pre-registered ONLY in the issue prose — never in this file — which is exactly the
+// hazard TRA-1829 escalated: a constant read in six weeks by someone who was not here.
+// This IS the number, in code, tested, and RE-RULED. TRA-1829.
+//
+// --- THE DERIVATION, AND WHY 0.09R WAS THE NULL-WORLD NUMBER ---
+//
+// "Feasible" means the TERMINAL read at N=90 can resolve the bar: `hw(90) <= bar = 0.05R`.
+// Back-propagate to the gate at N=30 assuming a power-law decay `hw(N) = c * N^-p`:
+//
+//     hw(30) = hw(90) * (90/30)^p = bar * 3^p       =>   THRESHOLD T = bar * 3^p
+//
+// The ONLY estimand-specific input is p, the decay exponent of the SESSION-CLUSTERED
+// half-width. `T = 0.05 * 3^0.5 = 0.0866 ~ 0.09R` reproduces the ruled number EXACTLY —
+// but only at p = 0.5, the i.i.d. 1/sqrt(N) rate. These observations are NOT i.i.d.: the
+// bootstrap is a MOVING-BLOCK resample over session contrasts that are serially dependent
+// by construction (an H-session forward return at session i shares H-1 days with i+1). So
+// p = 0.5 holds in the NULL world; in the world where a promotion decision actually gets
+// made it is ~0.34, and 0.09R is ~23% TOO LOOSE — it projects hw(90) smaller than it will
+// be and would certify as "feasible" a study that cannot resolve the bar at the terminal
+// read. This is the SAME error shape TRA-1741 itself corrected one level down (it read the
+// half-width under H0 and applied it to a decision only ever made in the alternative);
+// here it is the DECAY EXPONENT read under H0. Same mistake, same reassuring direction.
+//
+//   MEASURED on the shipped generator (HEAD da2193a, factor-calibrated), primary cell
+//   (H=5, raw, contrarian), OLS of ln(hw) on ln(N) over N = 30/45/60/90/150, 30 seeds:
+//     zero edge (null) ........ p = 0.530   =>  T = 0.0895R  (~= the ruled 0.09R)
+//   * real, gamma=1.2 (ACT) ... p = 0.343   =>  T = 0.0729R  <- rounds to 0.073R
+//   INDEPENDENT CONTROL (TRA-1756 R2 table, 200 worlds/cell, different author): p = 0.354.
+//   T depends only on the RATIO hw(30)/hw(90), so the level disagreement between runs does
+//   not move it. All three act-world / control p land at ~0.34-0.35.
+//
+// --- THE RE-RULE (CTO, TRA-1829, option A) ---
+//
+// Tighten to `hw(30) <= 0.073R` — the SAME constant as the secondary (XS_HW30_FEASIBILITY_R).
+// Both estimands' act-world p land at ~0.34, so one number covers both, and a single shared
+// value is far harder to misread in November than two that differ at the 4th significant
+// figure for a reason nobody remembers. 0.072R (the primary's own act-world p = 0.335/0.343)
+// vs 0.073R lies BELOW the estimation noise of p itself (the three measurements span
+// 0.335-0.354, ~+-0.02, i.e. ~+-0.002R on T), so the two are statistically indistinguishable;
+// the tie-breaker is operational. Tighter than 0.09R is the CORRECT direction (fixes a loose
+// gate) and IMMATERIAL to the conclusion: the act-world hw(30) is ~0.6-0.8R, ~8-11x above even
+// this threshold, so the gate kills the study either way. The point is the pre-registered
+// constant, not the verdict.
+
+/** The calendar session count at which Spec v3.1(A)'s primary feasibility gate is read. */
+export const PRIMARY_FEASIBILITY_GATE_N = 30;
+
+/**
+ * SPEC v3.1(A). The PRIMARY's N=30 feasibility kill-threshold, in R. TRA-1741, RE-RULED
+ * on TRA-1829 (was 0.09R, the null-world number; see the block above for the derivation).
+ *
+ * `hw(30) <= 0.073R` => FEASIBLE, accrue on to the N=90 terminal read.
+ * `hw(30) >  0.073R` => RETIRE. Non-evaluable => RETIRE. Fail-closed, both ways.
+ *
+ * = bar * 3^p with the act-world decay exponent p ~ 0.34 (NOT the null-world 0.5 that gave
+ * 0.09R), rounded to match the secondary. EQUALS `XS_HW30_FEASIBILITY_R` (0.073R) BY DESIGN:
+ * both estimands' act-world p coincide at ~0.34, so one number is pre-registered for both.
+ */
+export const PRIMARY_HW30_FEASIBILITY_R = 0.073;
+
 /**
  * TOTAL multiplicity of the WHOLE PCR study, and the DSR trial count for BOTH reads.
  *

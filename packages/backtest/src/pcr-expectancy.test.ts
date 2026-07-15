@@ -15,6 +15,8 @@ import {
   PCR_UPLIFT_BAR_R,
   pcrSideFor,
   placeboUpliftStat,
+  PRIMARY_FEASIBILITY_GATE_N,
+  PRIMARY_HW30_FEASIBILITY_R,
   PRIMARY_POWER_CONSTRAINT,
   rawUpliftStat,
   runPcrExpectancy,
@@ -35,6 +37,12 @@ import {
   synth,
   SYNTH_FACTOR_SCALE,
 } from './pcr-synth.fixture.js';
+// TRA-1829 — the secondary's constants, imported only to PIN that the primary's re-ruled
+// feasibility threshold equals them (one number pre-registered for both estimands).
+import {
+  XS_FEASIBILITY_GATE_N,
+  XS_HW30_FEASIBILITY_R,
+} from './pcr-cross-sectional.js';
 
 // TRA-1664 — the harness's own gate.
 //
@@ -846,5 +854,28 @@ describe('TRA-1830 — synth factor-structure calibration', () => {
     // beta=1.0 name: total budget 1.36, so factorScale 1.2 (factor var 1.44) overruns it.
     // Emit an error rather than a NaN price path.
     expect(() => idioLoading('SPY', 1.2)).toThrow(/variance budget/);
+  });
+});
+
+// SPEC v3.1(A) — the PRIMARY's N=30 feasibility kill-gate constant. TRA-1741, re-ruled 1829.
+describe('Spec v3.1(A) — primary N=30 feasibility threshold', () => {
+  it('BINDS at 0.073R — the CTO re-rule (TRA-1829), NOT the null-world 0.09R', () => {
+    // 0.09R = 0.05 * 3^0.5 assumed an i.i.d. 1/sqrt(N) decay that holds only under H0.
+    // The act-world decay exponent is ~0.34, which puts the threshold at ~0.073R. Pinning
+    // the RULED value so it cannot silently drift back to the loose null-world number.
+    expect(PRIMARY_HW30_FEASIBILITY_R).toBe(0.073);
+    // Strictly tighter than the originally-ruled null-world number.
+    expect(PRIMARY_HW30_FEASIBILITY_R).toBeLessThan(0.0866);
+  });
+
+  it('EQUALS the secondary constant by design — one number pre-registered for both', () => {
+    // Both estimands' act-world decay exponent lands at ~0.34, so a single shared value is
+    // pre-registered. If either estimand is re-derived to a different p, this MUST break.
+    expect(PRIMARY_HW30_FEASIBILITY_R).toBe(XS_HW30_FEASIBILITY_R);
+  });
+
+  it('is read at calendar N=30, the same gate the secondary uses', () => {
+    expect(PRIMARY_FEASIBILITY_GATE_N).toBe(30);
+    expect(PRIMARY_FEASIBILITY_GATE_N).toBe(XS_FEASIBILITY_GATE_N);
   });
 });

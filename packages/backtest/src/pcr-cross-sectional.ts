@@ -268,11 +268,12 @@ export const XS_FEASIBILITY_GATE_N = 30;
  *
  * = bar * 3^p with p = 0.349 (the fail-closed decay exponent), rounded DOWN. See above.
  *
- * TIGHTER than the primary's ruled 0.09R, and that is not a typo: this estimand's
- * half-width decays MORE SLOWLY than the 1/sqrt(N) the primary's number assumed, so the
- * same hw at N=30 buys LESS resolution at N=90. (The primary's own act-world p measures
- * 0.335, which would put ITS threshold at 0.072R too — reported to the CTO on TRA-1741;
- * changing a ruled number is not this file's call.)
+ * TIGHTER than the primary's ORIGINALLY-ruled 0.09R, and that is not a typo: this estimand's
+ * half-width decays MORE SLOWLY than the 1/sqrt(N) that number assumed, so the same hw at
+ * N=30 buys LESS resolution at N=90. (The primary had the SAME disease: its 0.09R was the
+ * null-world number, its act-world p measures ~0.34. The CTO RE-RULED the primary to 0.073R
+ * on TRA-1829 — see `PRIMARY_HW30_FEASIBILITY_R` in `pcr-expectancy.ts`, which now equals
+ * THIS constant by design, one number pre-registered for both estimands.)
  *
  * ON OUR BEST PRIOR (the synthetic) hw_xs(30) ~ 0.30R — 4x ABOVE THIS GATE. We therefore
  * EXPECT this gate to kill the secondary at N=30, exactly as we expect the primary's to
