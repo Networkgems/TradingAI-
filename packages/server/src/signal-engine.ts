@@ -2718,8 +2718,15 @@ export class SignalEngine {
       this.lastAutopilotDecayRefreshAt = Date.now();
       try {
         const rows = await listOptionTradeJournal({ mode: 'demo' });
-        this.autopilotDecayingStrategies = computeStrategyIntrospection(
-          optionJournalToStrategyRows(rows),
+        // TRA-1905 — the introspection fold is a SYNCHRONOUS O(journal) CPU pass
+        // whose cost grows with the durable demo journal across a session/days;
+        // it is a prime suspect for the `signal.doTick` block trip. Name it at the
+        // sub-phase so the next watchdog trip breadcrumb resolves the culprit
+        // beyond the coarse `signal.doTick`. Only the sync compute is wrapped —
+        // the `await` above stays outside (wrapping I/O would mislabel it).
+        this.autopilotDecayingStrategies = timeSyncPhase(
+          'signal.doTick.autopilot-introspection',
+          () => computeStrategyIntrospection(optionJournalToStrategyRows(rows)),
         ).degradingStrategies;
       } catch (err: unknown) {
         log.warn('autopilot edge-decay refresh threw', {
@@ -2727,7 +2734,9 @@ export class SignalEngine {
         });
       }
     }
-    this.runRiskAutopilot();
+    // TRA-1905 — TIGHTEN-ONLY synchronous autopilot pass; named so a block here is
+    // attributed away from the coarse parent phase.
+    timeSyncPhase('signal.doTick.risk-autopilot', () => this.runRiskAutopilot());
 
     // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
     // applySettings does an immediate fetch when creds change so the user
@@ -2777,7 +2786,9 @@ export class SignalEngine {
 
     // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
     // only shows entries that are still actionable.
-    this.pruneInvalidSignals(prices);
+    // TRA-1905 — synchronous scan over the live signal set; named for sub-phase
+    // attribution of a `signal.doTick` block trip.
+    timeSyncPhase('signal.doTick.prune-signals', () => this.pruneInvalidSignals(prices));
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
@@ -2975,6 +2986,10 @@ export class SignalEngine {
     // `this.mode === 'demo'` so the LIVE exec gate stays untouched (the filter
     // below already restricts to positions of `this.mode`).
     let rvStructuralExitStates: Map<string, ExitState> | undefined;
+    // TRA-1905 — the per-position Supertrend/MA20 exit-state build is a synchronous
+    // indicator pass over every open RV position; named so a block here resolves at
+    // the sub-phase rather than the coarse `signal.doTick`.
+    timeSyncPhase('signal.doTick.rv-exit-state-build', () => {
     if (isOptionExecEnabled() || this.mode === 'demo') {
       const openRvPositions = this.optionsAccount.getState().openOptions.filter(
         (p) => p.signalType === 'relative_value' && !p.legs && (p.mode ?? 'demo') === this.mode,
@@ -3017,6 +3032,7 @@ export class SignalEngine {
         if (stateMap.size > 0) rvStructuralExitStates = stateMap;
       }
     }
+    });
 
     // TRA-1409 (parent TRA-1406) — RV exit re-tune: when the standalone demo-only
     // flag is armed, require a CONFIRMED N-bar Supertrend flip (QuantTrader
