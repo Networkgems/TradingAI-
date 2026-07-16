@@ -131,7 +131,11 @@ import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { hydrateGiveBackArmFloorFromDisk } from './giveback-arm-floor-ledger.js';
-import { hydrateLiveOptionsFeeSlippageFromDisk } from './live-options-fee-slippage-ledger.js';
+import {
+  hydrateLiveOptionsFeeSlippageFromDisk,
+  backfillLiveOptionFees,
+  summarizeLiveOptionsFeeSlippage,
+} from './live-options-fee-slippage-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -5490,6 +5494,77 @@ app.get('/api/health/options-live', async (_req, res) => {
     });
     res.status(500).json({ ok: false, error: 'Failed to read options-live status' });
   }
+});
+
+// TRA-1954 (parent TRA-1916) — fee back-fill reconcile trigger. Fees are the ONE
+// calibration field the fill-time ledger cannot capture (Tradier's order-status
+// payload carries no commission), so `feesMeasured` is 0/n until this pass runs.
+// Commission lives only on the account-HISTORY endpoint; this route pulls history
+// for [start,end] on the live PRODUCTION options account and back-fills `fees` on
+// every ledger row with an unambiguous match, then rewrites the durable JSONL so a
+// redeploy keeps them. Read/reconcile only — moves NO capital. Admin-gated (mutates
+// durable calibration state + reads a broker account). `start`/`end` are
+// `YYYY-MM-DD` (inclusive); both default to a 7-day ET lookback ending today.
+app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, requireAdmin, async (req, res) => {
+  const isDate = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const q = req.query as Record<string, unknown>;
+  const end = isDate(q['end']) ? q['end'] : etDateString(new Date());
+  const start = isDate(q['start']) ? q['start'] : etDateString(new Date(Date.now() - 7 * 86_400_000));
+  if ((q['start'] !== undefined && !isDate(q['start'])) || (q['end'] !== undefined && !isDate(q['end']))) {
+    res.status(400).json({ ok: false, error: 'start/end must be YYYY-MM-DD' });
+    return;
+  }
+  if (start > end) {
+    res.status(400).json({ ok: false, error: 'start must be <= end' });
+    return;
+  }
+  // The reconcile targets the LIVE PRODUCTION options account (sandbox commissions
+  // are 0/absent — no real calibration there). Resolve the pinned live operator +
+  // its production client exactly like the order path (env-var fallback included).
+  const operator = resolveLiveBrokerOperator();
+  const settings = await loadSettings(operator);
+  const client = buildTradierOptionsClientForEnv(settings, 'production');
+  if (!client) {
+    res.status(409).json({
+      ok: false,
+      error: 'No production Tradier options credentials resolvable for the live operator',
+    });
+    return;
+  }
+  let fills;
+  try {
+    fills = await client.listAccountHistory({ start, end, type: 'trade', limit: 2000 });
+  } catch (err) {
+    log.warn('live-options fee reconcile: history fetch failed', {
+      operator,
+      start,
+      end,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(502).json({ ok: false, error: 'Tradier account-history fetch failed' });
+    return;
+  }
+  const { updated } = backfillLiveOptionFees(fills);
+  const summary = summarizeLiveOptionsFeeSlippage();
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    window: { start, end },
+    historyFills: fills.length,
+    updated,
+    // The read route reports these too; echo so a single POST proves the back-fill.
+    n: summary.n,
+    feesMeasured: summary.feesMeasured,
+    totalFees: summary.totalFees,
+    // Read durability.ephemeral FIRST — a back-fill on an ephemeral dir dies at the
+    // next redeploy exactly like the fill-time rows (fix = DATA_DIR=/data, TRA-1719).
+    durability: summary.durability,
+    note:
+      updated > 0
+        ? `Back-filled ${updated} fee(s) from ${fills.length} history fill(s); feesMeasured now ${summary.feesMeasured}/${summary.n}. ${summary.durability.ephemeral ? 'NOT DURABLE — DATA_DIR ephemeral; re-run after DATA_DIR=/data (TRA-1719).' : `Durable on ${summary.durability.dataDir}.`}`
+        : `No rows back-filled — ${fills.length} history fill(s) in window, none matched an unmeasured ledger row (or all already reconciled). Unmatched rows stay fees:null (never 0, TRA-1707).`,
+  });
 });
 
 // Admin-only on-demand regeneration — lets QA / the desk refresh the review

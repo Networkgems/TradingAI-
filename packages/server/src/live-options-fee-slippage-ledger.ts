@@ -31,6 +31,7 @@
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import type { TradierTradeHistoryFill } from '@trading-app/engine';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
@@ -288,6 +289,166 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
 
   hydratedRecords = kept.length;
   return { records: kept.length };
+}
+
+// ── TRA-1954: fee back-fill reconcile ────────────────────────────────────────
+//
+// Fees are the ONE calibration field the fill-time path cannot capture: Tradier's
+// order-status payload carries no commission, so `recordLiveOptionFill` always
+// writes `fees: null` (honest-unmeasured, TRA-1707). Commission is only on the
+// account-HISTORY endpoint (`TradierTradeHistoryFill.commission`). This pass joins
+// the two AFTER the fills land and back-fills `fees` where an unambiguous match
+// exists.
+//
+// THE JOIN HAS NO CLEAN KEY. History fills carry no `orderId`, so we match on the
+// composite (optionSymbol==symbol, etDay==date, side↔description, contracts==quantity).
+// Collisions (two identical symbol/day/side/qty fills) are paired DETERMINISTICALLY —
+// ledger rows ascending by ts, history fills ascending by transactionId, zipped — and
+// a history fill is NEVER assigned to two ledger rows. A ledger row with no unconsumed
+// history fill keeps `fees: null` (never 0 — an unmatched row is UNMEASURED, not a
+// measured zero — TRA-1707).
+//
+// CAVEAT the reader must hold: `parseTradierHistory` coerces an ABSENT commission to 0
+// (it cannot tell absent from a genuine $0). Sandbox history reports no commission, so
+// a sandbox reconcile back-fills `fees: 0` on matched rows — a real number for a real
+// (zero-fee) sandbox fill, but NOT production calibration. Real fee numbers only exist
+// after PRODUCTION fills (TRA-1929 scope note); read the arm/durability context before
+// trusting a `totalFees` harvested off sandbox.
+
+/** Result of a back-fill pass: how many rows gained a fee + the full re-derived set. */
+export interface FeeBackfillResult {
+  /** Ledger rows that went from `fees: null` to a measured commission this pass. */
+  updated: number;
+  /** The full record set, re-derived through {@link toRecord} (slippage invariants hold). */
+  records: LiveOptionFillRecord[];
+}
+
+/** Map a history fill's `description` to the ledger side it can back-fill, or null. */
+function historyFillSide(description: string): LiveFillSide | null {
+  const s = description.toLowerCase();
+  if (s.includes('buy to open')) return 'buy_to_open';
+  if (s.includes('sell to close')) return 'sell_to_close';
+  return null; // Buy-to-Close / Sell-to-Open short legs aren't in the live sleeves.
+}
+
+/** Composite join key. ` ` separator can't collide with an OCC symbol / date. */
+function feeMatchKey(symbol: string, day: string, side: LiveFillSide, qty: number): string {
+  return `${symbol} ${day} ${side} ${qty}`;
+}
+
+/** Reverse a record into the input shape {@link toRecord} consumes (optionally overriding fees). */
+function recordToInput(rec: LiveOptionFillRecord, feesOverride?: number | null): LiveOptionFillInput {
+  return {
+    ts: rec.ts,
+    etDay: rec.etDay,
+    sleeve: rec.sleeve,
+    optionSymbol: rec.optionSymbol,
+    side: rec.side,
+    contracts: rec.contracts,
+    submittedLimit: rec.submittedLimit,
+    askAtSubmit: rec.askAtSubmit,
+    midAtSubmit: rec.midAtSubmit,
+    filledPrice: rec.filledPrice,
+    fees: feesOverride !== undefined ? feesOverride : rec.fees,
+    orderId: rec.orderId,
+  };
+}
+
+/**
+ * PURE back-fill: given ledger `records` and Tradier account-history `historyFills`,
+ * return a new record set with `fees` populated on every ledger row that has an
+ * unambiguous history match. See the section header for the join key + collision
+ * rule. Deterministic and idempotent: an already-populated row still CONSUMES its
+ * matched history fill (so a duplicate null row can't steal it) but is not re-counted
+ * as `updated`. Unmatched rows keep `fees: null` (never 0). No IO — fully fixture-testable.
+ */
+export function reconcileLedgerFees(
+  records: readonly LiveOptionFillRecord[],
+  historyFills: readonly TradierTradeHistoryFill[],
+): FeeBackfillResult {
+  // Group history option fills by composite key; each group a queue sorted ascending
+  // by transactionId so collision pairing is stable across runs.
+  const historyByKey = new Map<string, TradierTradeHistoryFill[]>();
+  for (const f of historyFills) {
+    if (f.tradeType !== 'option') continue;
+    const side = historyFillSide(f.description);
+    if (side === null) continue;
+    if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
+    if (typeof f.commission !== 'number' || !Number.isFinite(f.commission)) continue;
+    const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
+    const q = historyByKey.get(key);
+    if (q) q.push(f);
+    else historyByKey.set(key, [f]);
+  }
+  for (const q of historyByKey.values()) {
+    q.sort((a, b) =>
+      a.transactionId < b.transactionId ? -1 : a.transactionId > b.transactionId ? 1 : 0,
+    );
+  }
+
+  // Walk ledger rows in deterministic order (ts asc, then original index) so the
+  // ascending-ts pairing the collision rule promises is exactly what runs.
+  const order = records
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => a.r.ts - b.r.ts || a.i - b.i);
+
+  const cursor = new Map<string, number>(); // key → next unconsumed history-fill index
+  const feeByIndex = new Map<number, number>(); // original record index → back-filled commission
+  for (const { r, i } of order) {
+    const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, r.contracts);
+    const q = historyByKey.get(key);
+    if (!q) continue;
+    const c = cursor.get(key) ?? 0;
+    if (c >= q.length) continue; // no unconsumed history fill for this row
+    cursor.set(key, c + 1); // consume — never double-assign, even to an already-filled row
+    if (r.fees !== null) continue; // already back-filled; slot consumed, count nothing
+    feeByIndex.set(i, q[c]!.commission);
+  }
+
+  let updated = 0;
+  const out = records.map((r, i) => {
+    if (feeByIndex.has(i)) {
+      updated += 1;
+      return toRecord(recordToInput(r, feeByIndex.get(i)!));
+    }
+    return toRecord(recordToInput(r));
+  });
+  return { updated, records: out };
+}
+
+/**
+ * Apply {@link reconcileLedgerFees} against the module's in-memory store, replace it
+ * with the reconciled records, and REWRITE the durable JSONL so a redeploy keeps the
+ * back-filled fees. The rewrite reuses the compaction write shape and is best-effort +
+ * COUNTED (a failure logs, bumps `appendErrors`, and is swallowed so the reconcile can
+ * never throw). Only rewrites when at least one row changed. When no dataDir is
+ * configured (unit tests / CLI without boot) only the in-memory store updates.
+ */
+export function backfillLiveOptionFees(
+  historyFills: readonly TradierTradeHistoryFill[],
+): FeeBackfillResult {
+  const result = reconcileLedgerFees(fills, historyFills);
+  // Swap in the reconciled (re-derived) records.
+  fills.length = 0;
+  for (const r of result.records) fills.push(r);
+
+  if (dataDir !== null && result.updated > 0) {
+    const path = liveOptionsFeeSlippageLogPath(dataDir);
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(
+        path,
+        fills.length > 0 ? fills.map((r) => JSON.stringify(r)).join('\n') + '\n' : '',
+        'utf8',
+      );
+    } catch (err) {
+      // Swallowed so the reconcile pass survives — but COUNTED, so the swallow is not silent.
+      appendErrors += 1;
+      lastAppendError = err instanceof Error ? err.message : String(err);
+      log.warn('live-options-fee-slippage back-fill rewrite failed', { reason: lastAppendError });
+    }
+  }
+  return result;
 }
 
 // ── Health summary ───────────────────────────────────────────────────────────
