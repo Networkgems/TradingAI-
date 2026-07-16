@@ -18,6 +18,17 @@
 export const TEST_ACCOUNT_PREFIX_ENV = 'TEST_ACCOUNT_PREFIXES';
 
 /**
+ * TRA-1949 — the throwaway QA books are also all provisioned with an
+ * `@qa.test` signup email, so a book is a test book if EITHER its username
+ * matches a test pattern OR its email carries this suffix. Matched
+ * case-insensitively as `endsWith`. The username prefix already catches the
+ * current fleet (`qa_reg_*`, `qa_tra1475_*`, `qa_mirror_*` → `^qa`); the email
+ * rule keeps the classifier complete for any caller that has the email but a
+ * non-`qa`-prefixed username.
+ */
+export const TEST_ACCOUNT_EMAIL_SUFFIX = '@qa.test';
+
+/**
  * Built-in QA/test-account name patterns. Anchored at the start so a real book
  * whose name merely CONTAINS one of these substrings (e.g. `aqua`, `monitorly`)
  * is not misclassified.
@@ -38,16 +49,28 @@ function extraPrefixes(env: NodeJS.ProcessEnv): string[] {
     .filter((p) => p.length > 0);
 }
 
+/** TRA-1949 — true iff `email` carries the {@link TEST_ACCOUNT_EMAIL_SUFFIX}. */
+export function isTestEmail(email: string | undefined): boolean {
+  if (typeof email !== 'string') return false;
+  return email.trim().toLowerCase().endsWith(TEST_ACCOUNT_EMAIL_SUFFIX);
+}
+
 /**
- * True iff `username` is a QA/test/throwaway book that should be excluded from
- * the firm-wide DESK number. Matches the built-in patterns plus any
- * {@link TEST_ACCOUNT_PREFIX_ENV} prefixes. Empty/blank names are NOT test
- * accounts (nothing to classify → keep). Case-insensitive.
+ * True iff the book is a QA/test/throwaway book that should be excluded from
+ * the firm-wide DESK number and the board-facing demo-book list. A book is a
+ * test book if EITHER its `username` matches a built-in pattern / a
+ * {@link TEST_ACCOUNT_PREFIX_ENV} prefix, OR (TRA-1949) its optional `email`
+ * ends with {@link TEST_ACCOUNT_EMAIL_SUFFIX}. Empty/blank names with no
+ * matching email are NOT test accounts (nothing to classify → keep).
+ * Case-insensitive. `email` is optional so existing `(username, env)` callers
+ * are unchanged.
  */
 export function isTestAccount(
   username: string,
   env: NodeJS.ProcessEnv = process.env,
+  email?: string,
 ): boolean {
+  if (isTestEmail(email)) return true;
   if (typeof username !== 'string') return false;
   const name = username.trim();
   if (name.length === 0) return false;

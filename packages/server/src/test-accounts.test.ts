@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { isTestAccount, excludeTestAccountRows, TEST_ACCOUNT_PREFIX_ENV } from './test-accounts.js';
+import {
+  isTestAccount,
+  isTestEmail,
+  excludeTestAccountRows,
+  TEST_ACCOUNT_PREFIX_ENV,
+} from './test-accounts.js';
 
 // TRA-1475 — the QA/test-account classifier drives the firm-wide DESK de-noise.
 
@@ -22,6 +27,24 @@ describe('isTestAccount — built-in patterns', () => {
     expect(isTestAccount('   ')).toBe(false);
     // defensive: callers may hand us a stray non-string
     expect(isTestAccount(undefined as unknown as string)).toBe(false);
+  });
+});
+
+describe('isTestAccount — TRA-1949 @qa.test email rule', () => {
+  it('flags a book whose email ends @qa.test even with a non-test username', () => {
+    expect(isTestAccount('richard', process.env, 'richard@qa.test')).toBe(true);
+    expect(isTestAccount('richard', process.env, 'RICHARD@QA.TEST')).toBe(true);
+    // real email → not a test book
+    expect(isTestAccount('richard', process.env, 'richard@example.com')).toBe(false);
+    // no email → falls back to username classification only
+    expect(isTestAccount('richard')).toBe(false);
+  });
+
+  it('isTestEmail matches only the @qa.test suffix', () => {
+    expect(isTestEmail('a@qa.test')).toBe(true);
+    expect(isTestEmail('a@qa.test.evil.com')).toBe(false);
+    expect(isTestEmail('a@example.com')).toBe(false);
+    expect(isTestEmail(undefined)).toBe(false);
   });
 });
 

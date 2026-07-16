@@ -601,12 +601,102 @@ describe('TRA-898 demo-book summary', () => {
     const body = res.body as {
       ok: boolean;
       demoEngineCount: number;
-      books: Array<{ label: string; book: { equity: { totalEquity: number } } }>;
+      hiddenTestBookCount: number;
+      testBookNote: string | null;
+      books: Array<{ label: string; role: string; book: { equity: { totalEquity: number } } }>;
     };
     expect(body.ok).toBe(true);
     expect(body.demoEngineCount).toBe(1);
     expect(body.books[0]!.label).toBe('demo-1');
+    expect(body.books[0]!.role).toBe('demo');
     expect(body.books[0]!.book.equity.totalEquity).toBe(25_500);
+    // TRA-1949 — no test books here, so nothing hidden and no note.
+    expect(body.hiddenTestBookCount).toBe(0);
+    expect(body.testBookNote).toBeNull();
+  });
+
+  it('TRA-1949 hides QA/test books by default with a note; ?includeTest=1 restores them', async () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => {
+        throw new Error('userCtx must not run on the public path');
+      },
+      getSettings: () => settings(),
+      demoBooks: () => [
+        { username: 'richard', state: demoState(), mode: 'demo' },
+        { username: 'qa_reg_1', state: demoState(), mode: 'demo' },
+        { username: 'qa_mirror_2', state: demoState(), mode: 'demo' },
+      ],
+      now: () => NOW,
+    });
+    const handler = routes.get('/api/health/demo-book-public')![0]!;
+
+    // Default — the two QA books are hidden, Richard remains.
+    const resDefault = resWithLocals();
+    await handler({ query: {} }, resDefault);
+    const bodyDefault = resDefault.body as {
+      demoEngineCount: number;
+      hiddenTestBookCount: number;
+      testBookNote: string | null;
+      books: Array<{ label: string; role: string }>;
+    };
+    expect(bodyDefault.demoEngineCount).toBe(1);
+    expect(bodyDefault.hiddenTestBookCount).toBe(2);
+    expect(bodyDefault.testBookNote).toContain('2 QA/test books hidden');
+    expect(bodyDefault.books.map(b => b.role)).toEqual(['demo']);
+
+    // ?includeTest=1 — every book returns, QA books tagged role 'test'.
+    const resAll = resWithLocals();
+    await handler({ query: { includeTest: '1' } }, resAll);
+    const bodyAll = resAll.body as {
+      demoEngineCount: number;
+      hiddenTestBookCount: number;
+      testBookNote: string | null;
+      books: Array<{ label: string; role: string }>;
+    };
+    expect(bodyAll.demoEngineCount).toBe(3);
+    expect(bodyAll.hiddenTestBookCount).toBe(0);
+    expect(bodyAll.testBookNote).toBeNull();
+    expect(bodyAll.books.filter(b => b.role === 'test')).toHaveLength(2);
+  });
+
+  it('TRA-1949 labels the LIVE_EQUITY_BOOT_USER operator book distinctly and never hides it', async () => {
+    const { app, routes } = fakeApp();
+    const prev = process.env['LIVE_EQUITY_BOOT_USER'];
+    process.env['LIVE_EQUITY_BOOT_USER'] = 'admin';
+    try {
+      registerLiveHealthRoutes(app, {
+        requireAuth: (() => undefined) as never,
+        userCtx: async () => {
+          throw new Error('userCtx must not run on the public path');
+        },
+        getSettings: () => settings(),
+        demoBooks: () => [
+          { username: 'admin', state: demoState(), mode: 'demo' },
+          { username: 'richard', state: demoState(), mode: 'demo' },
+          { username: 'qa_reg_1', state: demoState(), mode: 'demo' },
+        ],
+        now: () => NOW,
+      });
+      const handler = routes.get('/api/health/demo-book-public')![0]!;
+      const res = resWithLocals();
+      await handler({ query: {} }, res);
+      const body = res.body as {
+        demoEngineCount: number;
+        hiddenTestBookCount: number;
+        books: Array<{ label: string; role: string }>;
+      };
+      // admin → operator (kept, labelled), richard → demo, qa_reg_1 → hidden.
+      expect(body.demoEngineCount).toBe(2);
+      expect(body.hiddenTestBookCount).toBe(1);
+      const operator = body.books.find(b => b.role === 'operator');
+      expect(operator?.label).toBe('operator (live)');
+      expect(body.books.map(b => b.role).sort()).toEqual(['demo', 'operator']);
+    } finally {
+      if (prev === undefined) delete process.env['LIVE_EQUITY_BOOT_USER'];
+      else process.env['LIVE_EQUITY_BOOT_USER'] = prev;
+    }
   });
 });
 

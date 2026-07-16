@@ -10,7 +10,8 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { EngineState, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown } from '../signal-engine.js';
+import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown, isLiveBrokerOperator } from '../signal-engine.js';
+import { isTestAccount } from '../test-accounts.js'; // TRA-1949
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { checkStaleState } from './alerts.js';
@@ -468,22 +469,83 @@ export interface DemoBookPublicReport {
   ok: true;
   time: string;
   build: ReturnType<typeof resolveBuildInfo>;
+  /** Count of the books actually shown in `books` (visible after the test gate). */
   demoEngineCount: number;
-  books: Array<{ label: string; book: DemoBookReport }>;
+  /**
+   * TRA-1949 — QA/test books excluded from the board-facing list this read (0
+   * when `?includeTest=1`). NEVER a silent drop: `testBookNote` carries the
+   * human-readable "N test books hidden" line whenever this is > 0.
+   */
+  hiddenTestBookCount: number;
+  /** Human note when test books were hidden, else null. */
+  testBookNote: string | null;
+  /**
+   * Each book carries a `role` so the board can tell the live/broker operator
+   * book (`admin`, `LIVE_EQUITY_BOOT_USER`) apart from true demo peers, and —
+   * when `?includeTest=1` — from QA/test books. Labels stay anonymized.
+   */
+  books: Array<{ label: string; role: 'demo' | 'operator' | 'test'; book: DemoBookReport }>;
 }
 
-/** Anonymized, no-auth fleet demo-book summary (usernames → `demo-N`). */
+/**
+ * Anonymized, no-auth fleet demo-book summary. TRA-1949 — the board-facing view
+ * must be READABLE, so by default QA/test books (`qa_*` username or `@qa.test`
+ * email — see {@link isTestAccount}) are excluded and the operator/live book is
+ * labelled distinctly from demo peers (mirrors the desk-calendar `?includeTest`
+ * gate). Pass `includeTest: true` to keep every book (test books surface with
+ * `role: 'test'`). The operator book is NEVER hidden — it is the live/broker
+ * engine, not a demo peer — only re-labelled. Usernames stay anonymized to
+ * `demo-N` / `operator (live)` / `test-N`; identity is never leaked.
+ */
 export function summarizeDemoBooksPublic(
-  engines: Array<{ username: string; state: EngineState; mode: string }>,
+  engines: Array<{ username: string; state: EngineState; mode: string; email?: string }>,
   now: number,
+  opts: { includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): DemoBookPublicReport {
-  const fleet = summarizeDemoBooks(engines, now);
+  const env = opts.env ?? process.env;
+  const includeTest = opts.includeTest === true;
+  // Classify BEFORE anonymization — the operator flag and test flag both need
+  // the real username/email, which the public shape strips.
+  const classified = engines.map(e => ({
+    e,
+    operator: isLiveBrokerOperator(e.username, env),
+    // An operator book is never a "test" book even if its name matched a
+    // pattern — the operator wins so it is never hidden.
+    test: !isLiveBrokerOperator(e.username, env) && isTestAccount(e.username, env, e.email),
+  }));
+  const hiddenCount = includeTest ? 0 : classified.filter(c => c.test).length;
+  const visible = includeTest ? classified : classified.filter(c => !c.test);
+  let demoIdx = 0;
+  let opIdx = 0;
+  let testIdx = 0;
+  const books = visible.map(c => {
+    const book = summarizeDemoBook(c.e.state, c.e.mode, now);
+    if (c.operator) {
+      opIdx += 1;
+      return {
+        label: opIdx === 1 ? 'operator (live)' : `operator-${opIdx}`,
+        role: 'operator' as const,
+        book,
+      };
+    }
+    if (c.test) {
+      testIdx += 1;
+      return { label: `test-${testIdx}`, role: 'test' as const, book };
+    }
+    demoIdx += 1;
+    return { label: `demo-${demoIdx}`, role: 'demo' as const, book };
+  });
   return {
     ok: true,
-    time: fleet.time,
-    build: fleet.build,
-    demoEngineCount: fleet.demoEngineCount,
-    books: fleet.books.map((b, i) => ({ label: `demo-${i + 1}`, book: b.book })),
+    time: new Date(now).toISOString(),
+    build: resolveBuildInfo(),
+    demoEngineCount: books.length,
+    hiddenTestBookCount: hiddenCount,
+    testBookNote: hiddenCount > 0
+      ? `${hiddenCount} QA/test book${hiddenCount === 1 ? '' : 's'} hidden `
+        + `(pass ?includeTest=1 to show)`
+      : null,
+    books,
   };
 }
 
@@ -982,8 +1044,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // only the dashboard can set; a committed secret would be public anyway), so
   // the watch reads this surface instead. Paper-money state only, no secrets,
   // usernames stripped to `demo-N` — see summarizeDemoBooksPublic.
-  app.get('/api/health/demo-book-public', (_req, res) => {
-    res.json(summarizeDemoBooksPublic(deps.demoBooks?.() ?? [], now()));
+  // TRA-1949 — de-noise the board-facing view: QA/test books hidden by default
+  // (with a "N hidden" note, never a silent drop), operator/live book labelled;
+  // `?includeTest=1` restores the full fleet, mirroring the desk-calendar gate.
+  app.get('/api/health/demo-book-public', (req, res) => {
+    const includeTest =
+      (req as { query?: Record<string, unknown> }).query?.['includeTest'] === '1';
+    res.json(summarizeDemoBooksPublic(deps.demoBooks?.() ?? [], now(), { includeTest }));
   });
 
   const liveEquityAcceptance = deps.liveEquityAcceptance;
