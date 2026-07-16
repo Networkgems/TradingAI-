@@ -469,6 +469,56 @@ class EvalYielder {
   }
 }
 
+// TRA-1942 — the TICK-WIDE macrotask pacer (the root-cause fix for the residual
+// bqb1 `signal.doTick` event-loop-block self-restart loop, parent TRA-1894).
+//
+// The watchdog's `block` trip named the COARSE `signal.doTick` with NO wrapped
+// sub-phase ever crossing the 1s record threshold (every timeSyncPhase region —
+// checkExits, getstate-broadcast, imported-marks, prune-signals, autopilot-
+// introspection, risk-autopilot, scaleout-ladder, rv-exit-state-build — is
+// individually FAST; the withPhase shadow evals name themselves). That signature
+// is not one hot op — it is the SUM of the whole tick body running as ONE
+// contiguous event-loop block.
+//
+// Why the whole body runs contiguously: on the cache-served path (the 2nd tick of
+// each minute, a warm minute-bar cache, or an open feed breaker) EVERY `await`
+// inside doTick — fetchQuotes, refreshCandles, the reconciles, refreshOptionMarks,
+// the RV/OTM/technical scans — resolves from cache SYNCHRONOUSLY, i.e. in a
+// MICROTASK (see fetchMinuteBarsWithSource's cache-hit early return). A chain of
+// microtask-only awaits never lets libuv advance to the timer/check phase, so the
+// watchdog's `setInterval` and the HTTP health listener cannot fire: the loop is
+// starved for the full span of back-to-back synchronous sub-phases even though NO
+// single phase blocks >1s. The cost grows with the session (more open positions /
+// active-interest symbols / accrued state → heavier per-phase sync work), which is
+// the observed grows-with-uptime trip cadence.
+//
+// EvalYielder already paces the two hot per-symbol LOOPS; this paces the tick as a
+// WHOLE. A `setImmediate` (macrotask) yield is inserted between the major phases
+// whenever the contiguous synchronous stretch since the last real yield crosses
+// TICK_PACER_BUDGET_MS, so the event loop reaches its timer/check phase well under
+// the 4s watchdog budget no matter how many sub-1s phases run back-to-back.
+// Behaviour-preserving: it only interleaves a macrotask hop at a phase boundary,
+// and doTick already awaits repeatedly mid-tick, so every boundary is already a
+// legal suspension point. The gate is a single Date.now() read when not due.
+const TICK_PACER_BUDGET_MS = 500;
+class TickPacer {
+  private lastYieldAt = Date.now();
+  /**
+   * SYNCHRONOUS decision: true (resetting the clock) once more than
+   * TICK_PACER_BUDGET_MS have elapsed since the last macrotask yield. Kept sync
+   * for the same reason as {@link EvalYielder.shouldYield} — the caller awaits a
+   * real `yieldToEventLoop()` ONLY when a yield is actually due, so a tick whose
+   * awaits already hit real I/O (macrotask boundaries) adds zero extra hops.
+   */
+  shouldYield(): boolean {
+    if (Date.now() - this.lastYieldAt >= TICK_PACER_BUDGET_MS) {
+      this.lastYieldAt = Date.now();
+      return true;
+    }
+    return false;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-1089 — shared per-tick shadow research pass.
 //
@@ -2737,6 +2787,11 @@ export class SignalEngine {
   }
 
   private async doTick(): Promise<void> {
+    // TRA-1942 — pace the whole tick: yield a macrotask between the major phases
+    // whenever the contiguous synchronous stretch since the last real yield
+    // crosses the budget, so the SUM of many sub-1s cache-served phases can never
+    // hold the event loop past the 4s watchdog budget. See {@link TickPacer}.
+    const tickPacer = new TickPacer();
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
       const news = await fetchStocksNews(this.getActiveSymbols());
       // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
@@ -2859,6 +2914,7 @@ export class SignalEngine {
       const earlyState = timeSyncPhase('signal.doTick.getstate-broadcast', () => this.getState());
       for (const h of this.handlers) h(earlyState);
     }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-220 — split trading paths by account mode:
     //   • Demo mode: BOTH stocks AND options trade. Stock paper trading runs
@@ -2928,6 +2984,7 @@ export class SignalEngine {
         }
       }
     }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
     // options account also unwinds at SL/TP. TRA-159 — refresh option marks
@@ -3013,6 +3070,7 @@ export class SignalEngine {
     // accounts; named so a block here resolves at the sub-phase rather than the
     // coarse `signal.doTick`.
     timeSyncPhase('signal.doTick.imported-marks', () => this.refreshImportedMarksAllAccounts(optionMarks));
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-354 — wait-and-hold exit policy for ENGINE-FIRED exits (distinct
     // from the TRA-352 USER-initiated close reconciler that ran above).
@@ -3227,6 +3285,7 @@ export class SignalEngine {
         this.flattenOnBookHalt(prices, this.riskGovernor.getBookHaltReason() ?? 'book give-back halt');
       }
     }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-154: tag symbols that have an open position or a recent signal as
     // "active interest". The Twelve Data candle fallback (800/day cap) is gated
@@ -3276,6 +3335,9 @@ export class SignalEngine {
           await Promise.all(
             symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
           );
+          // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
+          // so this full-universe loop can starve the loop by itself; pace it.
+          if (tickPacer.shouldYield()) await yieldToEventLoop();
         }
       }
     }
@@ -3388,6 +3450,7 @@ export class SignalEngine {
       // and holds the per-symbol notional cap + the fixed-stop R invariant.
       await this.evaluateLiveConvictionDcaAdds(prices);
     }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-787 — SupertrendConfluence SHADOW pass. Evaluates every watchlist
     // symbol off the live tape and surfaces the result on the dedicated
@@ -3466,6 +3529,7 @@ export class SignalEngine {
         if (reversalShadowOn) await withPhase('signal.reversalShadowEval', () => this.evaluateReversalShadow(activeSymbols));
       }
     }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-191: relative-value scanner — the sole stock-options strategy in
     // this iteration. Routes the highest-scoring `cheap` candidate per symbol
@@ -3723,6 +3787,7 @@ export class SignalEngine {
       }
     }
 
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
     // TRA-1350 — mark the tick complete before pushing state so getState()
     // (and the WS `state` frame) carry a fresh scan timestamp on this cycle.
     this.lastScanAt = Date.now();
