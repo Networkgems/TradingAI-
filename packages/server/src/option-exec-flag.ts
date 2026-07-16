@@ -468,3 +468,106 @@ export const OPTION_LIVE_DIRECTIONAL_FLAG = 'ENABLE_OPTION_LIVE_DIRECTIONAL';
 export function isOptionLiveDirectionalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagOn(env[OPTION_LIVE_DIRECTIONAL_FLAG]);
 }
+
+// --------------------------------------------------------------------------
+// TRA-1929 (parent TRA-1916) — DARK live-capital gate on the OTM
+// (`single_leg_otm`) single-leg long options order path, PLUS a shared,
+// self-expiring 2-day test WINDOW that governs BOTH the OTM and RV live sleeves
+// for the board-authorized bounded real-money fee/slippage calibration test.
+//
+// The OTM scan (`runOtmScan`) runs in BOTH demo and live, but until now the live
+// branch had NO real-money open — it only stamped a `liveSkipReason` and skipped
+// (signal-engine `runOtmScan` ~5538). This flag is the arm for wiring the same
+// audited broker mirror (`mirrorLiveOptionOpen`) the RV path uses. Like the RV /
+// directional live flags it is SECRET-ADJACENT (it authorizes real orders), so it
+// is read ONLY from the process env — never from the `demo-flags.json` file
+// override — and is NOT on the demo-flag allowlist. OFF by default ⇒ the live OTM
+// entry is inert (byte-for-byte the pre-TRA-1929 suppress-and-skip behaviour), so
+// the shipped state carries zero real-capital risk.
+//
+// ── THE 2-DAY AUTO-DISABLE (must be CODE, not config trust) ──────────────────
+// The board authorized a BOUNDED 2-day test. A boolean flag left armed is exactly
+// the "missed manual disable leaves real money armed" failure mode, so the arm
+// SELF-EXPIRES: `OPTION_LIVE_TEST_UNTIL=<epoch-ms>` is a hard window end. Past it,
+// BOTH `ENABLE_OPTION_LIVE_OTM` and `ENABLE_OPTION_LIVE_RV_LONG` are treated as OFF
+// regardless of their boolean value ({@link isOptionLiveOtmArmed} /
+// {@link isOptionLiveRvLongArmed}). FAIL-CLOSED: an unset or malformed
+// `OPTION_LIVE_TEST_UNTIL` reads as a CLOSED window ⇒ neither sleeve can arm. Prod
+// today runs both sleeve flags OFF, so adding the window gate only ever tightens
+// (a flag-OFF sleeve is unarmed regardless of the window).
+// --------------------------------------------------------------------------
+
+export const OPTION_LIVE_OTM_FLAG = 'ENABLE_OPTION_LIVE_OTM';
+
+/**
+ * True iff the DARK live-capital OTM single-leg long options order path flag is
+ * set (accepts 1/true/yes/on). Default OFF. Read from the process env only — this
+ * is a live-order toggle, never sourced from the demo-flags file override. NOTE:
+ * this is the RAW boolean; the actual arm additionally requires the test window to
+ * be open — use {@link isOptionLiveOtmArmed} at the order-decision sites.
+ */
+export function isOptionLiveOtmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_LIVE_OTM_FLAG]);
+}
+
+export const OPTION_LIVE_TEST_UNTIL_VAR = 'OPTION_LIVE_TEST_UNTIL';
+
+/**
+ * The bounded-test hard cap on a single live entry's notional, in USD. The board
+ * (TRA-1916) sized the test off the live Tradier Production account's ~$268.58
+ * tradeable cash. The per-entry cap the guardrail enforces is
+ * `min(available cash, LIVE_OPTION_TEST_NOTIONAL_CAP_USD)`.
+ */
+export const LIVE_OPTION_TEST_NOTIONAL_CAP_USD = 268.58;
+
+/**
+ * Parse `OPTION_LIVE_TEST_UNTIL` (the bounded-test window end, epoch-ms). Returns
+ * the finite positive epoch, or `null` when unset / non-numeric / non-positive.
+ * `null` is the FAIL-CLOSED sentinel — the caller treats a null window as CLOSED.
+ */
+export function parseOptionLiveTestUntil(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = env[OPTION_LIVE_TEST_UNTIL_VAR];
+  if (typeof raw !== 'string') return null;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * True iff the bounded live-options test window is currently OPEN: a valid
+ * `OPTION_LIVE_TEST_UNTIL` in the future (`now <= until`). FAIL-CLOSED — an unset
+ * or malformed window var, or a window whose end has passed, returns false so a
+ * missed manual disable cannot leave real money armed.
+ */
+export function isOptionLiveTestWindowOpen(
+  env: NodeJS.ProcessEnv = process.env,
+  now: number = Date.now(),
+): boolean {
+  const until = parseOptionLiveTestUntil(env);
+  if (until === null) return false; // fail-closed: unset/malformed ⇒ window CLOSED
+  return now <= until;
+}
+
+/**
+ * True iff the live RV single-leg long path is ACTUALLY armed for the bounded test:
+ * the `ENABLE_OPTION_LIVE_RV_LONG` boolean is on AND the test window is open. This
+ * is the value the order-decision sites must consult (not the raw flag) so the
+ * 2-day auto-disable holds for RV too (TRA-1929).
+ */
+export function isOptionLiveRvLongArmed(
+  env: NodeJS.ProcessEnv = process.env,
+  now: number = Date.now(),
+): boolean {
+  return isOptionLiveRvLongEnabled(env) && isOptionLiveTestWindowOpen(env, now);
+}
+
+/**
+ * True iff the live OTM single-leg long path is ACTUALLY armed for the bounded
+ * test: the `ENABLE_OPTION_LIVE_OTM` boolean is on AND the test window is open.
+ * This is the value the OTM order-decision sites must consult (TRA-1929).
+ */
+export function isOptionLiveOtmArmed(
+  env: NodeJS.ProcessEnv = process.env,
+  now: number = Date.now(),
+): boolean {
+  return isOptionLiveOtmEnabled(env) && isOptionLiveTestWindowOpen(env, now);
+}

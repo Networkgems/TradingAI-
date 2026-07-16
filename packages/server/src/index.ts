@@ -131,6 +131,7 @@ import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { hydrateGiveBackArmFloorFromDisk } from './giveback-arm-floor-ledger.js';
+import { hydrateLiveOptionsFeeSlippageFromDisk } from './live-options-fee-slippage-ledger.js';
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -243,6 +244,8 @@ import {
   isOptionDemoAutoConfirmEnabled,
   isOptionIdeasAutoExecuteEnabled,
   isOptionLiveRvLongEnabled,
+  isOptionLiveOtmEnabled,
+  isOptionLiveTestWindowOpen,
   isOptionLiveDirectionalEnabled,
 } from './option-exec-flag.js';
 import { runIdeasAutoExecute } from './options-ideas-auto-execute.js';
@@ -2389,6 +2392,19 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       days: h.days,
       sessions: h.sessions,
     });
+  }
+}
+
+// TRA-1929 (parent TRA-1916) — rebuild the durable per-trade live-options fee/slippage
+// calibration ledger from disk on boot and remember DATA_DIR for subsequent appends, so
+// the bounded 2-day real-money test's fills survive bqb1's nightly reboot and remain
+// readable at /api/health/live-options-fee-slippage. Durable only when DATA_DIR is a
+// persistent mount (else `durability.ephemeral` says so; the fix is DATA_DIR=/data per
+// TRA-1719). Best-effort; compacted to 30 days.
+{
+  const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('live-options fee/slippage ledger hydrated (TRA-1929)', { records: h.records });
   }
 }
 
@@ -5462,6 +5478,11 @@ app.get('/api/health/options-live', async (_req, res) => {
       // — an armed flag with no live broker still places no order.
       liveRvLongArmed: isOptionLiveRvLongEnabled(process.env),
       liveDirectionalArmed: isOptionLiveDirectionalEnabled(process.env),
+      // TRA-1929 — OTM live bounded-test flag + the shared self-expiring test window.
+      // These are the RAW booleans; the ACTUAL arm each order site consults is the
+      // flag AND `liveTestWindowOpen` (see /api/health/live-options-fee-slippage).
+      liveOtmArmed: isOptionLiveOtmEnabled(process.env),
+      liveTestWindowOpen: isOptionLiveTestWindowOpen(process.env),
     });
   } catch (err) {
     log.error('options-live health probe failed', {

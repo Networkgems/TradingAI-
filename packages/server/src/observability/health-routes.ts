@@ -27,7 +27,15 @@ import {
   isOptionDemoDirectionalEnabled,
   isOptionIvRvScannerEnabled,
   isOptionShortPremiumScannerEnabled,
+  isOptionLiveOtmEnabled,
+  isOptionLiveRvLongEnabled,
+  isOptionLiveTestWindowOpen,
+  isOptionLiveOtmArmed,
+  isOptionLiveRvLongArmed,
+  parseOptionLiveTestUntil,
+  LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
 } from '../option-exec-flag.js';
+import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
@@ -1356,6 +1364,57 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note: summary.durability.ephemeral
         ? `NOT RECOVERABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}), so these ${summary.sessionsObserved} session(s) die at the next reboot just like the in-memory book state. The ≥5-session gate cannot rely on this until DATA_DIR points at a persistent mount (DATA_DIR=/data on bqb1, TRA-1719). Read durability.ephemeral before trusting any count here.`
         : `RECOVERABLE: ${summary.sessionsObserved} session(s) durable on ${summary.durability.dataDir}. invalidations=${summary.invalidations} (sub-floor-peak give-back halts — a PRIMARY-AC breach if > 0). A missed 21:40Z grade fire is recoverable by re-reading this route any time within ${summary.retentionDays} days.`,
+    });
+  });
+
+  // TRA-1929 (parent TRA-1916) — read the bounded 2-day real-money options test's
+  // per-trade fee + slippage calibration, plus the CURRENT live arm state (both
+  // sleeves + the self-expiring window). The board authorized the test to harvest
+  // live fee/slippage before the August go-live gate; this route is how the board and
+  // LeadDev read that data WITHOUT shell access to bqb1. Read `durability.ephemeral`
+  // FIRST: true ⇒ the records below die on the next redeploy and the calibration is
+  // NOT durably captured (fix = DATA_DIR=/data, TRA-1719). `feesMeasured < n` ⇒
+  // commission is not yet back-filled (fill-time payload carries none — a follow-up
+  // reconcile from the account-history endpoint), so `totalFees` is incomplete.
+  app.get('/api/health/live-options-fee-slippage', (_req, res) => {
+    // Live-order flags are read from the process env ONLY (secret-adjacent — never the
+    // demo-flags file), so `armed` reflects exactly what the live book's order sites see.
+    const liveEnv = process.env;
+    const nowMs = now();
+    const summary = summarizeLiveOptionsFeeSlippage();
+    const testUntil = parseOptionLiveTestUntil(liveEnv);
+    res.json({
+      ok: true,
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      otmFlag: 'ENABLE_OPTION_LIVE_OTM',
+      rvFlag: 'ENABLE_OPTION_LIVE_RV_LONG',
+      windowVar: 'OPTION_LIVE_TEST_UNTIL',
+      notionalCapUsd: LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+      // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
+      // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
+      arm: {
+        otmFlagOn: isOptionLiveOtmEnabled(liveEnv),
+        rvFlagOn: isOptionLiveRvLongEnabled(liveEnv),
+        windowOpen: isOptionLiveTestWindowOpen(liveEnv, nowMs),
+        testUntilEpochMs: testUntil,
+        testUntilIso: testUntil !== null ? new Date(testUntil).toISOString() : null,
+        otmArmed: isOptionLiveOtmArmed(liveEnv, nowMs),
+        rvArmed: isOptionLiveRvLongArmed(liveEnv, nowMs),
+      },
+      n: summary.n,
+      opens: summary.opens,
+      closes: summary.closes,
+      slippage: summary.slippage,
+      totalFees: summary.totalFees,
+      feesMeasured: summary.feesMeasured,
+      retentionDays: summary.retentionDays,
+      durability: summary.durability,
+      lastRecordAt: summary.lastRecordAt,
+      records: summary.records,
+      note: summary.durability.ephemeral
+        ? `NOT DURABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}); these ${summary.n} fill(s) die at the next reboot and the calibration is not captured. Fix = DATA_DIR=/data on bqb1 (TRA-1719). Read durability.ephemeral before trusting any count.`
+        : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees back-fill is a TRA-1929 follow-up (${summary.feesMeasured}/${summary.n} measured) — the fill-time order payload carries no commission; slippage-vs-ask/mid IS captured on every measured leg.`,
     });
   });
 

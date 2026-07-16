@@ -1315,6 +1315,18 @@ export class PaperOptionsAccount {
     underlyingSpot?: number,
     /** TRA-991 — selector setup for the option-trade journal (observe-only). */
     journalSetup?: OptionTradeJournalSetup,
+    /**
+     * TRA-1929 (parent TRA-1916) — bounded real-money OTM live TEST override.
+     * When supplied (live OTM bounded test only), the position opens EXACTLY this
+     * many contracts and BYPASSES both the {@link OPTIONS_OTM_MIN_EQUITY} $5k gate
+     * and the standard 15%/$150 per-position sizing (the $268 test account can
+     * never clear those, and the board sized the test off a fixed per-entry
+     * notional cap enforced UPSTREAM in signal-engine, not the % cap). The paper
+     * cash check is also skipped — paper cash is bookkeeping; the real constraint
+     * is the live notional cap checked before this call. Absent ⇒ byte-for-byte
+     * the prior demo/live sizing behaviour.
+     */
+    boundedLiveContracts?: number,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -1327,7 +1339,11 @@ export class PaperOptionsAccount {
     // off and is wrong for a sub-$5k book. Below the equity floor we run RV
     // only. Demo (no `equityOverride`) is unaffected — it sizes off paper
     // equity and the OTM scanner is disabled there anyway.
-    if (equityOverride !== undefined && equityOverride < OPTIONS_OTM_MIN_EQUITY) return null;
+    if (
+      boundedLiveContracts === undefined
+      && equityOverride !== undefined
+      && equityOverride < OPTIONS_OTM_MIN_EQUITY
+    ) return null;
 
     // Dedup by OCC symbol — one open contract at a time per strike/expiration.
     const existing = Array.from(this.openOptions.values()).find(
@@ -1349,12 +1365,18 @@ export class PaperOptionsAccount {
     const budget = this.otmBudgetPerTrade(equityOverride);
     const costPerContract = premiumPaid * 100;
     // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
-    const contracts = this.sizeContracts(budget, costPerContract, equityOverride);
+    // TRA-1929 — the bounded live test forces an exact contract count and skips the
+    // % sizing entirely (the notional cap is enforced upstream against real cash).
+    const contracts = boundedLiveContracts !== undefined
+      ? boundedLiveContracts
+      : this.sizeContracts(budget, costPerContract, equityOverride);
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
     const demoFee = mode === 'demo' ? contracts * this.demoFeePerContract : 0;
-    if (equityOverride === undefined && totalCost + demoFee > this.cash) return null;
+    // TRA-1929 — skip the paper-cash check for the bounded live test (paper cash is
+    // bookkeeping; the real per-entry notional cap was checked before this call).
+    if (boundedLiveContracts === undefined && equityOverride === undefined && totalCost + demoFee > this.cash) return null;
 
     this.cash -= totalCost + demoFee;
     this.dailyOtmCount += 1;

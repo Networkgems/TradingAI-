@@ -85,7 +85,18 @@ import {
   OPTION_IV_RV_SCANNER_FLAG,
   OPTION_IV_RV_ROUTING_FLAG,
   OPTION_LIVE_RV_LONG_FLAG,
+  OPTION_LIVE_OTM_FLAG,
+  OPTION_LIVE_TEST_UNTIL_VAR,
 } from './option-exec-flag.js';
+import {
+  clearLiveOptionsFeeSlippageLedger,
+  summarizeLiveOptionsFeeSlippage,
+} from './live-options-fee-slippage-ledger.js';
+
+// TRA-1929 — the RV live arm is now the flag AND an open bounded-test window
+// (`OPTION_LIVE_TEST_UNTIL`). The armed-path suites below set a far-future window so
+// the flag alone reaches the mirror mechanics they exercise.
+const FAR_FUTURE_TEST_UNTIL = '99999999999999';
 import { resetProposalStoreForTests, listProposals, getProposal } from './proposal-store.js';
 import { PaperAccount } from './paper-account.js';
 import type { RelativeValueScannerService, RelativeValueScanResult, OtmMispricingScanResult, SelectorChainSnapshot } from './relative-value-scanner.js';
@@ -911,8 +922,14 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   // void-on-reject — not the arming policy, so they arm the flag. The dark default
   // gets its own coverage below ('live RV entry is suppressed while the dark flag
   // is off'), which is what actually protects real capital. (TRA-1677)
-  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
-  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+  beforeEach(() => {
+    process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
+  });
+  afterEach(() => {
+    delete process.env[OPTION_LIVE_RV_LONG_FLAG];
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
+  });
 
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
   /**
@@ -1325,8 +1342,14 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
 //     the dashboard so the user can self-diagnose
 describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => {
   // TRA-1677 — armed-path mechanics; see the TRA-319 block for why.
-  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
-  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+  beforeEach(() => {
+    process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
+  });
+  afterEach(() => {
+    delete process.env[OPTION_LIVE_RV_LONG_FLAG];
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
+  });
 
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
   /**
@@ -3906,8 +3929,14 @@ describe('SignalEngine — TRA-416 partial-fill close reconciliation', () => {
 describe('SignalEngine — TRA-495 live stocks + options coexistence', () => {
   // TRA-1677 — the options leg of this coexistence check is the live RV long, so
   // it needs TRA-1491's dark flag armed; see the TRA-319 block.
-  beforeEach(() => { process.env[OPTION_LIVE_RV_LONG_FLAG] = '1'; });
-  afterEach(() => { delete process.env[OPTION_LIVE_RV_LONG_FLAG]; });
+  beforeEach(() => {
+    process.env[OPTION_LIVE_RV_LONG_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL; // TRA-1929 window open
+  });
+  afterEach(() => {
+    delete process.env[OPTION_LIVE_RV_LONG_FLAG];
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
+  });
 
   type WaitOpts = { timeoutMs?: number; intervalMs?: number; sleep?: (ms: number) => Promise<void> };
 
@@ -6021,5 +6050,144 @@ describe('SignalEngine — churn + same-day-loss brake (TRA-1408)', () => {
     expect(inner.realizedEquityPnlToday('GIS', etDay)).toBe(-2236); // matches the issue's proof case
     expect(inner.realizedEquityPnlToday('AAPL', etDay)).toBe(300);
     expect(inner.realizedEquityPnlToday('MSFT', etDay)).toBe(0);
+  });
+});
+
+// ─── TRA-1929 — live OTM bounded-test buy-to-open mirror + guardrails ──────────
+// The board (TRA-1916) authorized a bounded 2-day real-money OTM test. These
+// integration tests pin the CODE guardrails (not config trust): fail-closed when
+// the flag is off OR the self-expiring window is closed; the entry limit is the
+// ASK (never a market cross); a 1-contract notional over min(cash,$268.58) is
+// skipped; and an armed fill writes exactly one calibration ledger row.
+describe('SignalEngine — TRA-1929 live OTM bounded-test buy-to-open mirror', () => {
+  const OTM_ENV = [OPTION_LIVE_OTM_FLAG, OPTION_LIVE_TEST_UNTIL_VAR] as const;
+  const savedOtmEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of OTM_ENV) savedOtmEnv[k] = process.env[k];
+    clearLiveOptionsFeeSlippageLedger();
+  });
+  afterEach(() => {
+    for (const k of OTM_ENV) {
+      if (savedOtmEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedOtmEnv[k];
+    }
+    clearLiveOptionsFeeSlippageLedger();
+  });
+
+  interface OtmLiveStub {
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+
+  const RICH_BALANCE = {
+    totalEquity: 268.58, totalCash: 268.58, optionBuyingPower: 268.58, dayTradeBuyingPower: 268.58,
+  };
+
+  function fillStub(): OtmLiveStub {
+    return {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'AAPL240705C00210000', bid: 0.78, ask: 0.82 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 42, status: 'filled', avg_fill_price: 0.82 })),
+    };
+  }
+
+  function otmScanner(candidate = makeOtmCandidate()): StubScanner {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05', candidates: [candidate], reason: 'ok',
+    });
+    return scanner;
+  }
+
+  function setupLiveOtmEngine(stub: OtmLiveStub, scanner: StubScanner): SignalEngine {
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = RICH_BALANCE;
+    return engine;
+  }
+
+  const runOtm = (engine: SignalEngine, syms: string[]) =>
+    (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(syms);
+
+  it('dark default (flag OFF) places NO broker order and surfaces a skip-reason signal', async () => {
+    delete process.env[OPTION_LIVE_OTM_FLAG];
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
+    const stub = fillStub();
+    const engine = setupLiveOtmEngine(stub, otmScanner());
+    await runOtm(engine, ['AAPL']);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.signals[0]!.liveSkipReason).toMatch(/dark/);
+    expect(summarizeLiveOptionsFeeSlippage().n).toBe(0);
+  });
+
+  it('window EXPIRED (flag ON, OPTION_LIVE_TEST_UNTIL in the past) places NO order (fail-closed)', async () => {
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = '1'; // epoch 1ms — long past
+    const stub = fillStub();
+    const engine = setupLiveOtmEngine(stub, otmScanner());
+    await runOtm(engine, ['AAPL']);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  it('window UNSET (flag ON, OPTION_LIVE_TEST_UNTIL absent) places NO order (fail-closed)', async () => {
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    delete process.env[OPTION_LIVE_TEST_UNTIL_VAR];
+    const stub = fillStub();
+    const engine = setupLiveOtmEngine(stub, otmScanner());
+    await runOtm(engine, ['AAPL']);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+  });
+
+  it('oversize 1-contract ask notional over min(cash, $268.58) is skipped, no order', async () => {
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
+    const stub = fillStub();
+    // ask 3.00 → 1-contract notional $300 > $268.58 test cap → skip.
+    const engine = setupLiveOtmEngine(
+      stub,
+      otmScanner(makeOtmCandidate({ mark: 2.95, bid: 2.98, ask: 3.00 })),
+    );
+    await runOtm(engine, ['AAPL']);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(engine.getState().signals[0]!.liveSkipReason).toMatch(/exceeds the test cap/);
+  });
+
+  it('ARMED — opens exactly 1 contract, submits the LIMIT at the ASK, writes one ledger row', async () => {
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
+    const stub = fillStub();
+    const engine = setupLiveOtmEngine(stub, otmScanner());
+    await runOtm(engine, ['AAPL']);
+
+    // ASK-only ladder: a single LIMIT at the ask (0.82) for exactly 1 contract —
+    // never a market order.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(stub.buyContractsLimit).toHaveBeenCalledWith('AAPL240705C00210000', 1, 0.82);
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0]!.contracts).toBe(1);
+
+    const led = summarizeLiveOptionsFeeSlippage();
+    expect(led.n).toBe(1);
+    expect(led.opens).toBe(1);
+    const rec = led.records[0]!;
+    expect(rec.sleeve).toBe('single_leg_otm');
+    expect(rec.side).toBe('buy_to_open');
+    expect(rec.mode).toBe('live');
+    expect(rec.contracts).toBe(1);
+    expect(rec.filledPrice).toBe(0.82);
+    expect(rec.askAtSubmit).toBe(0.82);
+    expect(rec.slippageVsAsk).toBeCloseTo(0, 6); // filled exactly at the ask
+    expect(rec.fees).toBeNull();                 // unmeasured at fill time (never 0)
   });
 });

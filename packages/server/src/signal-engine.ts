@@ -66,7 +66,8 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveDirectionalEnabled } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
+import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
@@ -151,7 +152,7 @@ import {
   isOptionMakerShadowEnabled,
   type ShadowChaseState,
 } from './option-maker-shadow.js';
-import { resolveMakerWalkConfig } from './option-maker-config.js';
+import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-config.js';
 
 /**
  * TRA-1662 — cap on concurrent in-flight shadow chases. A chase lives at most
@@ -4465,10 +4466,18 @@ export class SignalEngine {
           if (!detail) continue;
           const status = detail.status;
           if (status === 'filled') {
-            const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
-              ? detail.avg_fill_price
-              : pendingExit.limitPrice;
+            const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
+            const fill = hasAvg ? (detail.avg_fill_price as number) : pendingExit.limitPrice;
             acct.finalizePendingExit(opt.id, fill);
+            // TRA-1929 — record the real close fill (async fill on a later tick).
+            this.recordLiveOptionCloseToLedger(
+              opt,
+              pendingExit.qty,
+              typeof pendingExit.limitPrice === 'number' ? pendingExit.limitPrice : null,
+              hasAvg ? (detail.avg_fill_price as number) : null,
+              typeof pendingExit.tradierOrderId === 'number' ? pendingExit.tradierOrderId : null,
+              null,
+            );
             log.info('tradier sell_to_close filled', {
               optionSymbol: opt.optionSymbol,
               qty: pendingExit.qty,
@@ -4525,9 +4534,13 @@ export class SignalEngine {
       // fails or yields no usable price we fall back to the staged trigger
       // price (pre-TRA-450 behaviour) rather than block the exit entirely.
       let submitLimit = intent.limitPrice;
+      // TRA-1929 — capture the exit-time quote so a live close's slippage-vs-ask/mid
+      // can be measured in the calibration ledger.
+      let exitQuoteForLedger: { bid?: number | null; ask?: number | null } | null = null;
       if (!isMarket) {
         try {
           const quote = await this.tradierLiveClient.getOptionQuote(snapshot.optionSymbol);
+          exitQuoteForLedger = { bid: quote?.bid ?? null, ask: quote?.ask ?? null };
           const level = intent.kind === 'sl' || intent.kind === 'trail' ? 'bid' : 'mid';
           const live = liveSellLimit(quote, level);
           if (live !== null) submitLimit = live;
@@ -4579,10 +4592,18 @@ export class SignalEngine {
         const detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
         if (!detail) continue;
         if (detail.status === 'filled') {
-          const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
-            ? detail.avg_fill_price
-            : submitLimit;
+          const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
+          const fill = hasAvg ? (detail.avg_fill_price as number) : submitLimit;
           acct.finalizePendingExit(snapshot.id, fill);
+          // TRA-1929 — record the real close fill (market exits carry no submit limit/quote).
+          this.recordLiveOptionCloseToLedger(
+            snapshot,
+            intent.qty,
+            isMarket ? null : submitLimit,
+            hasAvg ? (detail.avg_fill_price as number) : null,
+            typeof resp.id === 'number' ? resp.id : null,
+            isMarket ? null : exitQuoteForLedger,
+          );
         } else if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
           acct.clearPendingExit(snapshot.id, `Tradier sell_to_close ${detail.status}${reasonSuffix}`);
@@ -5228,10 +5249,13 @@ export class SignalEngine {
         // placed (avoiding a broker-less phantom live fill). Default OFF ⇒ the
         // shipped state is byte-for-byte inert on real capital. Demo is untouched
         // (guard is live-only). Read from process env — never the demo-flags file.
-        if (this.mode === 'live' && !isOptionLiveRvLongEnabled(process.env)) {
+        // TRA-1929 — the arm is now the RV flag AND the bounded-test window
+        // (`OPTION_LIVE_TEST_UNTIL`): once the 2-day window closes the flag reads
+        // OFF regardless, so a missed manual disable cannot leave real money armed.
+        if (this.mode === 'live' && !isOptionLiveRvLongArmed(process.env)) {
           signal.signalSkipReason =
-            'RV single-leg long live path dark (ENABLE_OPTION_LIVE_RV_LONG off) — build shipped, capital arm gated on board approval (TRA-1491)';
-          log.info('RV long live entry suppressed — dark flag off (TRA-1491)', { sym });
+            'RV single-leg long live path dark (ENABLE_OPTION_LIVE_RV_LONG off or bounded-test window closed) — build shipped, capital arm gated on board approval (TRA-1491/TRA-1929)';
+          log.info('RV long live entry suppressed — dark flag off / window closed (TRA-1491/TRA-1929)', { sym });
           continue;
         }
 
@@ -5261,10 +5285,10 @@ export class SignalEngine {
         // rolls the paper open back when the broker leg fails → skip the fill.
         if (
           this.mode === 'live'
-          && isOptionLiveRvLongEnabled(process.env)
+          && isOptionLiveRvLongArmed(process.env)
           && this.tradierLiveOptionsEnabled
         ) {
-          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip);
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, { sleeve: 'single_leg_rv' });
           if (!mirrored) continue;
         }
 
@@ -5311,6 +5335,15 @@ export class SignalEngine {
   private async mirrorLiveOptionOpen(
     opened: import('@trading-app/shared').OptionPosition,
     surfaceLiveSkip: (reason: string) => void,
+    /**
+     * TRA-1929 — `sleeve` tags the fee/slippage ledger row so the calibration read
+     * attributes real fills per sleeve. `walk` overrides the smart-open ladder — the
+     * OTM bounded test passes an ASK-ONLY ladder (`fractions:[1], maxCrossTicks:0`)
+     * so the entry limit is the ask (never a market cross). Absent ⇒ the default
+     * TRA-374 mid→ask walk and no ledger row (the RV/directional legacy behaviour is
+     * preserved only when no sleeve is passed).
+     */
+    opts?: { sleeve?: LiveFillSleeve; walk?: MakerWalkConfig },
   ): Promise<boolean> {
     if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) {
       return true;
@@ -5357,8 +5390,30 @@ export class SignalEngine {
         this.tradierLiveClient,
         opened.optionSymbol,
         opened.contracts,
+        opts?.walk ? { walk: opts.walk } : {},
       );
       if (outcome.status === 'filled') {
+        // TRA-1929 — capture the real fill for the fee/slippage calibration ledger.
+        // Slippage is per-contract; `fees` is null at fill time (the order payload
+        // carries no commission — that lives on the account-history endpoint, a
+        // follow-up reconcile). null (never 0) for any unmeasured leg (TRA-1707).
+        if (opts?.sleeve) {
+          const askAtSubmit = Number.isFinite(outcome.ask) ? outcome.ask : null;
+          recordLiveOptionFill({
+            ts: Date.now(),
+            etDay: etDateString(new Date()),
+            sleeve: opts.sleeve,
+            optionSymbol: opened.optionSymbol,
+            side: 'buy_to_open',
+            contracts: opened.contracts,
+            submittedLimit: outcome.limitPrice,
+            askAtSubmit,
+            midAtSubmit: outcome.mid,
+            filledPrice: outcome.avgFillPrice,
+            fees: null,
+            orderId: outcome.orderId,
+          });
+        }
         const midStr = outcome.mid == null ? 'n/a' : `$${outcome.mid.toFixed(2)}`;
         log.info('smart-open filled', {
           component: 'smart-open',
@@ -5422,6 +5477,52 @@ export class SignalEngine {
         `Tradier live buy threw ${err instanceof Error ? err.message : String(err)}`,
       );
       return false;
+    }
+  }
+
+  /**
+   * TRA-1929 — record one REAL live option CLOSE fill to the fee/slippage
+   * calibration ledger. Best-effort + swallowed (accounting must never break the
+   * exit path). `fees` is null at fill time (commission lives on the account-history
+   * endpoint — a follow-up reconcile). Sleeve is derived from the position's signal
+   * type (OTM vs the RV/directional single-leg bucket). Only called on the LIVE
+   * broker close sites; demo closes pay a modelled cost and have nothing to
+   * calibrate. `quote` is the exit-time quote when the caller has it (for the close
+   * slippage-vs-ask/mid); null when unavailable ⇒ those legs stay null (never 0).
+   */
+  private recordLiveOptionCloseToLedger(
+    position: import('@trading-app/shared').OptionPosition,
+    qty: number,
+    submittedLimit: number | null,
+    filledPrice: number | null,
+    orderId: number | null,
+    quote?: { bid?: number | null; ask?: number | null } | null,
+  ): void {
+    if (!position.optionSymbol) return;
+    const sleeve: LiveFillSleeve =
+      position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_rv';
+    const ask =
+      quote && typeof quote.ask === 'number' && Number.isFinite(quote.ask) ? quote.ask : null;
+    const bid =
+      quote && typeof quote.bid === 'number' && Number.isFinite(quote.bid) ? quote.bid : null;
+    const mid = ask !== null && bid !== null ? (ask + bid) / 2 : null;
+    try {
+      recordLiveOptionFill({
+        ts: Date.now(),
+        etDay: etDateString(new Date()),
+        sleeve,
+        optionSymbol: position.optionSymbol,
+        side: 'sell_to_close',
+        contracts: qty,
+        submittedLimit,
+        askAtSubmit: ask,
+        midAtSubmit: mid,
+        filledPrice,
+        fees: null,
+        orderId,
+      });
+    } catch {
+      // accounting must never break the exit path
     }
   }
 
@@ -5560,22 +5661,117 @@ export class SignalEngine {
           continue;
         }
 
-        // TRA-1207 — the live single-leg broker mirror (buy_to_open + DTBP
-        // pre-check stack at ~:3400) is RV-specific and lives inside
-        // `runRelativeValueScan`. The OTM engine is a demo/paper strategy; to
-        // avoid opening an un-mirrored phantom on a live-options account, in
-        // live+options mode we surface the signal with a skip reason and DON'T
-        // open a paper position. Demo — the active book — opens normally.
-        // (Live-equity-only was already filtered by the shouldRunOtmScan gate.)
+        // TRA-1929 (parent TRA-1916) — live+options OTM path. Until TRA-1929 this
+        // branch had NO real-money open: it stamped a `liveSkipReason` and skipped,
+        // so OTM (the sleeve that actually generates candidates) never contributed
+        // live fills. It is now the bounded 2-day real-money test's ENTRY path,
+        // behind the DARK, self-expiring arm `isOptionLiveOtmArmed`
+        // (ENABLE_OPTION_LIVE_OTM + OPTION_LIVE_TEST_UNTIL window). Demo — the active
+        // book — always opens normally below (this whole branch is live-only).
         if (this.mode === 'live' && this.tradierLiveOptionsEnabled) {
+          const surfaceOtmLiveSkip = (reason: string): void => {
+            signal.mode = 'live';
+            signal.liveSkipReason = reason;
+            this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+            if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+            this.dailySignals.push({
+              id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+            });
+          };
+
+          // Dark default (flag off OR bounded-test window closed): suppress + skip,
+          // exactly as before TRA-1929 — the shipped state opens no real OTM order.
+          if (!isOptionLiveOtmArmed(process.env)) {
+            surfaceOtmLiveSkip(
+              'OTM single-leg live path dark (ENABLE_OPTION_LIVE_OTM off or bounded-test window closed) — build shipped, capital arm gated on board confirm (TRA-1916/TRA-1929)',
+            );
+            log.info('live OTM entry suppressed — dark flag off / window closed (TRA-1929)', { sym });
+            continue;
+          }
+
+          // ARMED — bounded real-money OTM test. Hard guardrails IN CODE (not config
+          // trust): entry limit at the ASK, notional ≤ min(available cash, $268.58),
+          // max 1 contract. On any guard miss we skip with a visible reason and never
+          // partial/oversize.
+          const askLimit = Number.isFinite(cheap.ask) && (cheap.ask ?? 0) > 0 ? (cheap.ask as number) : null;
+          if (askLimit === null) {
+            surfaceOtmLiveSkip('OTM live test skipped — no usable ask to submit an ask-limit entry (never a market cross)');
+            log.warn('live OTM bounded test: no ask', { sym, optionSymbol: cheap.optionSymbol });
+            continue;
+          }
+          // Available cash — require a known live balance; fail-closed if absent (do
+          // not arm real money against an unknown balance).
+          const bal = this.liveTradierBalance;
+          const availCandidates = [bal?.optionBuyingPower, bal?.totalCash, bal?.totalEquity]
+            .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+          if (availCandidates.length === 0) {
+            surfaceOtmLiveSkip('OTM live test skipped — no live Tradier balance snapshot to size against (fail-closed)');
+            log.warn('live OTM bounded test: no balance snapshot', { sym });
+            continue;
+          }
+          const availableCash = Math.min(...availCandidates);
+          const notionalCap = Math.min(availableCash, LIVE_OPTION_TEST_NOTIONAL_CAP_USD);
+          const oneContractNotional = askLimit * 100; // max 1 contract for the test
+          if (oneContractNotional > notionalCap) {
+            surfaceOtmLiveSkip(
+              `OTM live test skipped — 1-contract ask notional $${oneContractNotional.toFixed(2)} exceeds the test cap `
+                + `$${notionalCap.toFixed(2)} (min of available cash $${availableCash.toFixed(2)} and $${LIVE_OPTION_TEST_NOTIONAL_CAP_USD})`,
+            );
+            log.info('live OTM bounded test: over cap, skipped', {
+              sym, optionSymbol: cheap.optionSymbol, oneContractNotional, notionalCap,
+            });
+            continue;
+          }
+
+          const underlyingSpotLive =
+            typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
+          const otmLiveJournalSetup: OptionTradeJournalSetup = {
+            ivRank: null,
+            trend: 'sideways',
+            entryDelta: cheap.delta,
+            sentiment: null,
+            sentimentIcBand: null,
+            agentConviction: null,
+          };
+          // Open exactly 1 contract on the paper book (bounded-test override bypasses
+          // the $5k OTM min-equity gate + the 15% cap the $268 account can't clear);
+          // the mirror books the real broker order and voids this on reject.
+          const openedLive = this.optionsAccount.openOptionFromCandidate(
+            signal,
+            this.mode,
+            undefined,
+            underlyingSpotLive,
+            otmLiveJournalSetup,
+            1,
+          );
+          if (!openedLive) {
+            surfaceOtmLiveSkip('OTM live test skipped — paper open returned null (window/daily-cap/dedup/DTE guard)');
+            log.info('live OTM bounded test: paper open null', { sym, optionSymbol: cheap.optionSymbol });
+            continue;
+          }
+          this.recordChurnOpen(signal.symbol);
+          this.beginShadowMakerChase('single_leg_otm', signal, openedLive);
+
+          // ASK-ONLY smart-open ladder: the single limit is the ask (fraction 1, no
+          // cross-ticks past it) — matches the board's "the ask price is the one that
+          // gets filled" and structurally cannot fire a naked market order.
+          const askOnlyWalk: MakerWalkConfig = { ...resolveMakerWalkConfig(), fractions: [1], maxCrossTicks: 0 };
+          const mirrored = await this.mirrorLiveOptionOpen(openedLive, surfaceOtmLiveSkip, {
+            sleeve: 'single_leg_otm',
+            walk: askOnlyWalk,
+          });
+          if (!mirrored) continue;
+
+          this.emitOptionFillAlert(openedLive);
           signal.mode = 'live';
-          signal.liveSkipReason = 'OTM live broker mirror not wired (demo/paper only)';
           this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
           if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
-          log.warn('live OTM signal suppressed', { optionSymbol: cheap.optionSymbol });
+          log.info('live OTM bounded-test entry opened (TRA-1929)', {
+            sym, optionSymbol: cheap.optionSymbol, askLimit, notionalCap,
+          });
           continue;
         }
 
@@ -6543,7 +6739,7 @@ export class SignalEngine {
           && isOptionLiveDirectionalEnabled(process.env)
           && this.tradierLiveOptionsEnabled
         ) {
-          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip);
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, { sleeve: 'directional' });
           if (!mirrored) continue;
         }
 
@@ -9935,10 +10131,18 @@ export class SignalEngine {
       const detail = await client.waitForOrderTerminalStatus(resp.id);
       if (detail) {
         if (detail.status === 'filled') {
-          const fill = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0
-            ? detail.avg_fill_price
-            : intent.limitPrice;
+          const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
+          const fill = hasAvg ? (detail.avg_fill_price as number) : intent.limitPrice;
           acct.finalizePendingExit(optionId, fill);
+          // TRA-1929 — record the real manual close fill.
+          this.recordLiveOptionCloseToLedger(
+            located.position,
+            intent.qty,
+            typeof intent.limitPrice === 'number' ? intent.limitPrice : null,
+            hasAvg ? (detail.avg_fill_price as number) : null,
+            typeof resp.id === 'number' ? resp.id : null,
+            null,
+          );
           this.tracker?.saveEquity(
             this.account.getState().totalEquity,
             this.optionsAccount.getState().optionsPnl,

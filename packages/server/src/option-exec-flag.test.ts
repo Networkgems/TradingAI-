@@ -10,7 +10,14 @@ import {
   isOptionIvRvRoutingEnabled,
   resolveIvRvRoutingOverride,
   isOptionLiveRvLongEnabled,
+  isOptionLiveOtmEnabled,
+  isOptionLiveTestWindowOpen,
+  isOptionLiveOtmArmed,
+  isOptionLiveRvLongArmed,
+  parseOptionLiveTestUntil,
   OPTION_LIVE_RV_LONG_FLAG,
+  OPTION_LIVE_OTM_FLAG,
+  OPTION_LIVE_TEST_UNTIL_VAR,
   OPTION_EXEC_FLAG,
   OPTION_EMA_PULLBACK_FLAG,
   OPTION_VOLUME_BREAKOUT_FLAG,
@@ -67,6 +74,57 @@ describe('isOptionLiveRvLongEnabled (TRA-1491 dark live-capital gate)', () => {
     expect(isOptionLiveRvLongEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
     // and arming the live path does not turn on the exec-selector
     expect(isOptionExecEnabled({ [OPTION_LIVE_RV_LONG_FLAG]: ON })).toBe(false);
+  });
+});
+
+describe('TRA-1929 — live OTM flag + self-expiring bounded-test window', () => {
+  const FUTURE = String(4102444800000); // 2100-01-01
+  const PAST = String(1);
+
+  it('isOptionLiveOtmEnabled is OFF by default and armed only for truthy values', () => {
+    expect(isOptionLiveOtmEnabled({})).toBe(false);
+    expect(isOptionLiveOtmEnabled({ [OPTION_LIVE_OTM_FLAG]: '1' })).toBe(true);
+    expect(isOptionLiveOtmEnabled({ [OPTION_LIVE_OTM_FLAG]: 'true' })).toBe(true);
+    expect(isOptionLiveOtmEnabled({ [OPTION_LIVE_OTM_FLAG]: 'on' })).toBe(true);
+    expect(isOptionLiveOtmEnabled({ [OPTION_LIVE_OTM_FLAG]: 'off' })).toBe(false);
+  });
+
+  it('parseOptionLiveTestUntil returns the epoch, or null for unset/malformed/non-positive', () => {
+    expect(parseOptionLiveTestUntil({})).toBeNull();
+    expect(parseOptionLiveTestUntil({ [OPTION_LIVE_TEST_UNTIL_VAR]: 'nope' })).toBeNull();
+    expect(parseOptionLiveTestUntil({ [OPTION_LIVE_TEST_UNTIL_VAR]: '0' })).toBeNull();
+    expect(parseOptionLiveTestUntil({ [OPTION_LIVE_TEST_UNTIL_VAR]: '-5' })).toBeNull();
+    expect(parseOptionLiveTestUntil({ [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE })).toBe(Number(FUTURE));
+  });
+
+  it('isOptionLiveTestWindowOpen is FAIL-CLOSED: unset/malformed/expired ⇒ closed', () => {
+    expect(isOptionLiveTestWindowOpen({}, 1000)).toBe(false); // unset
+    expect(isOptionLiveTestWindowOpen({ [OPTION_LIVE_TEST_UNTIL_VAR]: 'nope' }, 1000)).toBe(false);
+    expect(isOptionLiveTestWindowOpen({ [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false); // expired
+    expect(isOptionLiveTestWindowOpen({ [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true); // open
+  });
+
+  it('OTM arm requires BOTH the flag AND an open window (2-day auto-disable)', () => {
+    // flag on but window closed ⇒ NOT armed
+    expect(isOptionLiveOtmArmed({ [OPTION_LIVE_OTM_FLAG]: '1' }, 1000)).toBe(false);
+    // flag on but window expired ⇒ NOT armed
+    expect(isOptionLiveOtmArmed({ [OPTION_LIVE_OTM_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
+    // window open but flag off ⇒ NOT armed
+    expect(isOptionLiveOtmArmed({ [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(false);
+    // both ⇒ armed
+    expect(isOptionLiveOtmArmed({ [OPTION_LIVE_OTM_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+  });
+
+  it('RV arm is ALSO window-gated so the window closing disarms real money on both sleeves', () => {
+    // RV flag on but window closed ⇒ NOT armed (the missed-manual-disable safety)
+    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1' }, 1000)).toBe(false);
+    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: PAST }, 1000)).toBe(false);
+    expect(isOptionLiveRvLongArmed({ [OPTION_LIVE_RV_LONG_FLAG]: '1', [OPTION_LIVE_TEST_UNTIL_VAR]: FUTURE }, 1000)).toBe(true);
+  });
+
+  it('OTM live flag is a STANDALONE toggle — exec-selector neither arms nor blocks it', () => {
+    expect(isOptionLiveOtmEnabled({ [OPTION_EXEC_FLAG]: ON })).toBe(false);
+    expect(isOptionExecEnabled({ [OPTION_LIVE_OTM_FLAG]: ON })).toBe(false);
   });
 });
 
