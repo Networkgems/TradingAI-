@@ -23,6 +23,14 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'promotion-service' });
 
+// TRA-1916 — the OPTIONS sleeves an options → Tradier-Production go-live is
+// gated on. The board named these two on TRA-1916: Relative Value
+// (`single_leg_rv`) and OTM Mispricing (`single_leg_otm`). Kept as a named
+// roster (not the crypto preset) so an options production switch is judged on
+// options-strategy evidence. Fail-closed: neither has cleared net-of-fee
+// forward validation yet (TRA-1690 RV, TRA-1585 OTM), so both currently BLOCK.
+export const OPTIONS_PRODUCTION_STRATEGIES = ['single_leg_rv', 'single_leg_otm'] as const;
+
 // TRA-532 — assembles a strategy's `promotion_status` from the three data
 // sources the gate spec requires, and decides whether a "go live" transition
 // may proceed:
@@ -348,8 +356,26 @@ export async function evaluateLiveTransitionGate(
   const gateFires = cryptoEscalates || optionsEscalates;
   if (!gateFires) return { allowed: true, blocked: [] };
 
+  // TRA-1916 — gate each escalating axis against ITS OWN strategy roster. The
+  // prior code always looped over the active *crypto* preset's roster, so an
+  // options → Tradier-Production switch was judged entirely against the crypto
+  // `dca` strategy (every shipped preset is crypto-only). That was wrong twice:
+  // it false-blocked options on a failing crypto strategy, AND it never checked
+  // any options sleeve's promotion at all. We now assemble the roster from the
+  // axes that actually escalate:
+  //   • crypto escalation  → the active crypto preset's enabledStrategies
+  //   • options production  → OPTIONS_PRODUCTION_STRATEGIES (the board named
+  //     Relative Value + OTM Mispricing on TRA-1916)
+  // Fail-closed is preserved by construction: buildPromotionStatus →
+  // evaluatePromotion returns canGoLive:false for any sleeve without a full
+  // backtest+paper+signoff record, so an unpromoted options sleeve BLOCKS
+  // (honoring the TRA-1897 HOLD) and the gate only opens once a named options
+  // sleeve actually clears its net-of-fee promotion evidence.
   const preset = resolveStrategyPreset(updated.activeStrategyPreset);
-  const strategies = preset.enabledStrategies;
+  const rosterStrategies: string[] = [];
+  if (cryptoEscalates) rosterStrategies.push(...preset.enabledStrategies);
+  if (optionsEscalates) rosterStrategies.push(...OPTIONS_PRODUCTION_STRATEGIES);
+  const strategies = [...new Set(rosterStrategies)];
   const blocked: Array<{ strategyId: string; reasons: string[] }> = [];
 
   for (const strategyId of strategies) {
@@ -360,7 +386,9 @@ export async function evaluateLiveTransitionGate(
   if (blocked.length > 0) {
     log.warn('TRA-532 promotion gate blocked live transition', {
       username,
+      escalatingAxes: { crypto: cryptoEscalates, optionsProduction: optionsEscalates },
       preset: preset.id,
+      roster: strategies,
       blocked: blocked.map(b => b.strategyId),
     });
     return { allowed: false, blocked };

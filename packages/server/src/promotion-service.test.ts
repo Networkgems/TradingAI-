@@ -248,24 +248,38 @@ describe('TRA-1436 promotion gate — environment-aware (Tradier Sandbox exempt)
     }
   });
 
-  it('(b) Live + Tradier Production + unpromoted strategy → BLOCKED (real money, fail-closed)', async () => {
+  it('(b) Live + Tradier Production → BLOCKED on the OPTIONS sleeves, never on crypto dca (TRA-1916)', async () => {
     process.env[FLAG] = '1';
     try {
       const gate = await svc.evaluateLiveTransitionGate(ENV_USER, liveOptions('production'));
       expect(gate.allowed).toBe(false);
-      expect(gate.blocked[0]?.strategyId).toBe('dca');
+      const blockedIds = gate.blocked.map(b => b.strategyId);
+      // TRA-1916 — an options production switch is judged against the options
+      // roster the board named (RV + OTM Mispricing), fail-closed while both are
+      // unpromoted. The crypto `dca` strategy must NEVER appear here — that was
+      // the mis-scoping bug.
+      expect(blockedIds).toContain('single_leg_rv');
+      expect(blockedIds).toContain('single_leg_otm');
+      expect(blockedIds).not.toContain('dca');
     } finally {
       delete process.env[FLAG];
     }
   });
 
-  it('(c) Live + Tradier Production + fully promoted strategy → ALLOWED (unchanged)', async () => {
+  it('(c) Live + Tradier Production + a fully promoted CRYPTO strategy → still BLOCKED (TRA-1916: dca promotion does not clear an options go-live)', async () => {
     // USER has dca fully promoted (backtest + paper + sign-off) from the
-    // end-to-end block above.
+    // end-to-end block above. Pre-TRA-1916 that wrongly ALLOWED an options
+    // production switch; the options axis is now gated on options-sleeve
+    // evidence, which USER does not have, so the switch must stay blocked and
+    // must not be cleared by the crypto dca sign-off.
     process.env[FLAG] = '1';
     try {
       const gate = await svc.evaluateLiveTransitionGate(USER, liveOptions('production'));
-      expect(gate.allowed).toBe(true);
+      expect(gate.allowed).toBe(false);
+      const blockedIds = gate.blocked.map(b => b.strategyId);
+      expect(blockedIds).toContain('single_leg_rv');
+      expect(blockedIds).toContain('single_leg_otm');
+      expect(blockedIds).not.toContain('dca');
     } finally {
       delete process.env[FLAG];
     }
@@ -349,7 +363,12 @@ describe('TRA-1590 promotion gate — de-escalation saves are never blocked', ()
       const updated = cryptoLive('production');
       const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
       expect(gate.allowed).toBe(false);
-      expect(gate.blocked[0]?.strategyId).toBe('dca');
+      // TRA-1916 — crypto is already ON (not escalating), so only the options
+      // axis escalates and the block is scoped to the options roster, not dca.
+      const blockedIds = gate.blocked.map(b => b.strategyId);
+      expect(blockedIds).toContain('single_leg_rv');
+      expect(blockedIds).toContain('single_leg_otm');
+      expect(blockedIds).not.toContain('dca');
     } finally {
       delete process.env[FLAG];
     }
