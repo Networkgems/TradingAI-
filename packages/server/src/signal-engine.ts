@@ -420,6 +420,55 @@ const MAX_SIGNALS = 50;
 const EQUITY_EVAL_YIELD_EVERY = 25;
 const yieldToEventLoop = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
 
+// TRA-1905 — the count-based yield above ("every 25 symbols") assumes a UNIFORM
+// per-symbol cost. That assumption does not hold: under a wide/heavy universe or a
+// slow indicator recompute, a single 25-symbol batch can still hold the loop past
+// the 4s watchdog budget. The residual bqb1 block proves it — lagMax 9420ms in one
+// window, attributed to the COARSE `signal.doTick` with NO wrapped sync sub-phase
+// (autopilot-introspection, risk-autopilot, prune-signals, getstate-broadcast,
+// equity-checkExits, scaleout-ladder, imported-marks, rv-exit-state-build, the
+// per-symbol supertrend) ever crossing the 1s record threshold, and with the trip's
+// `activePhase` reading `signal.doTick` (the main tick body) rather than a nested
+// shadow-eval phase. That signature is the ACCUMULATED cost of a batch, not any one
+// named op. Bound the CONTIGUOUS synchronous stretch by WALL TIME instead of by an
+// item count: hand control back once more than EVAL_YIELD_BUDGET_MS have elapsed
+// since the last yield, so the loop services the health probe well under the 4s/5s
+// budget no matter how many symbols run or how heavy each one is. The legacy count
+// gate is retained as a cheap secondary floor (yield at least every 25 symbols even
+// when each is fast) so behaviour is a strict superset of the prior yielding.
+const EVAL_YIELD_BUDGET_MS = 750;
+/**
+ * Cooperative wall-time yielder for a hot synchronous per-symbol loop. Construct
+ * one immediately before the loop, then use it as the loop's yield gate:
+ *
+ *     if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
+ *
+ * `shouldYield` is SYNCHRONOUS and returns true (resetting its clock) when EITHER
+ * more than EVAL_YIELD_BUDGET_MS have elapsed since the last yield (the real bound
+ * on the contiguous block) OR the legacy every-EQUITY_EVAL_YIELD_EVERY count is hit
+ * (the cheap floor). It must NOT be an `async` method that the caller always awaits:
+ * `await asyncFn()` defers the continuation to a microtask even when the method did
+ * no internal awaiting, which would add a microtask hop to EVERY iteration and break
+ * callers that rely on a single-symbol pass completing synchronously (TRA-936). By
+ * keeping the decision sync and awaiting only when a yield is actually due, the
+ * behaviour is a strict superset of the prior `symIdx % 25 === 0` gate: identical
+ * (fully synchronous) when nothing is due, an extra macrotask yield when a batch
+ * runs long. Cost is one `Date.now()` per symbol — negligible against the indicator
+ * math it guards.
+ */
+class EvalYielder {
+  private lastYieldAt = Date.now();
+  shouldYield(symIdx: number): boolean {
+    const overCount = symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0;
+    const overTime = Date.now() - this.lastYieldAt >= EVAL_YIELD_BUDGET_MS;
+    if (overCount || overTime) {
+      this.lastYieldAt = Date.now();
+      return true;
+    }
+    return false;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TRA-1089 — shared per-tick shadow research pass.
 //
@@ -2644,12 +2693,13 @@ export class SignalEngine {
     // so the other two buckets are readable against a known baseline.
     const swingMode = this.equitySwingModeEnabled();
     const evaluable: Array<{ sym: string; candles: Candle[] }> = [];
+    const evalYielder = new EvalYielder();
     for (let symIdx = 0; symIdx < activeSymbols.length; symIdx++) {
       const sym = activeSymbols[symIdx]!;
-      // TRA-1082 — yield to the event loop every EQUITY_EVAL_YIELD_EVERY symbols so the
-      // HTTP health probe is serviced mid-sweep; the whole universe would otherwise run
-      // as one synchronous burst, which is exactly what starved Render's 5s health check.
-      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      // TRA-1082 / TRA-1905 — yield mid-sweep so the whole universe never runs as one
+      // synchronous burst that starves Render's 5s health check. Time-bounded (see
+      // EvalYielder): control returns once the contiguous stretch crosses the budget.
+      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
       // TRA-1835 — is this one of the curated swing names? Only IN-UNIVERSE tickers are
       // NAMED in the funnel (the ~134 off-universe skips are counted but not listed — that
       // benign cut is not what QuantTrader is hunting). When swing mode is off there is no
@@ -3283,14 +3333,15 @@ export class SignalEngine {
       // the sweep above has already dropped the off-universe names.
       const swingMode = this.equitySwingModeEnabled();
       // Run strategies and collect new signals
+      const evalYielder = new EvalYielder();
       for (let symIdx = 0; symIdx < evaluable.length; symIdx++) {
         const { sym, candles } = evaluable[symIdx]!;
-        // TRA-1082 — yield to the event loop every EQUITY_EVAL_YIELD_EVERY symbols
-        // so the HTTP health probe is serviced mid-tick. This pass only awaits
-        // when a signal actually fires (routeEquitySignal below); in a flat
-        // market the whole universe runs as one synchronous burst with no yield,
-        // which is exactly what starved Render's 5s health check.
-        if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+        // TRA-1082 / TRA-1905 — yield mid-tick so the per-symbol indicator math
+        // (adx/orb/bbFade/ichimoku) does not run as one synchronous burst. This pass
+        // only awaits when a signal fires (routeEquitySignal below); in a flat market
+        // it is otherwise pure sync. `activePhase = signal.doTick` at the 9420ms trip
+        // named THIS loop as the block — so the yield is now time-bounded, not counted.
+        if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
 
         // TRA-952 — swing cadence: disable the intraday churners (ORB
         // opening-range breakout and the 1h-bar BbFade) whose tight intraday
@@ -6031,12 +6082,13 @@ export class SignalEngine {
    */
   private async evaluateSupertrendShadow(symbols: string[]): Promise<void> {
     const emitted: TradeSignal[] = [];
+    const evalYielder = new EvalYielder();
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
       const sym = symbols[symIdx];
-      // TRA-1082 — yield mid-sweep so the per-symbol supertrend()/confluenceSide()
-      // indicator math over the full watchlist doesn't run as one synchronous
-      // burst that blows Render's 5s health check.
-      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      // TRA-1082 / TRA-1905 — yield mid-sweep so the per-symbol supertrend()/
+      // confluenceSide() indicator math over the full watchlist never runs as one
+      // synchronous burst; time-bounded so a heavy batch can't blow the 5s budget.
+      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       // Uses the TRA-728 shipped defaults end-to-end: confluenceSide for the
@@ -6291,12 +6343,14 @@ export class SignalEngine {
    */
   private async evaluateReversalShadow(symbols: string[]): Promise<void> {
     if (!isReversalShadowEnabled()) return;
+    const evalYielder = new EvalYielder();
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
       const sym = symbols[symIdx];
-      // TRA-1082 — yield mid-sweep so the per-symbol reversalChecklist() pass
-      // over the full watchlist doesn't starve the event loop. ENABLE_REVERSAL_
-      // SHADOW is ON in prod (TRA-1064), so this loop runs the full universe.
-      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      // TRA-1082 / TRA-1905 — yield mid-sweep so the per-symbol reversalChecklist()
+      // pass over the full watchlist doesn't starve the event loop. ENABLE_REVERSAL_
+      // SHADOW is ON in prod (TRA-1064), so this loop runs the full universe; the
+      // yield is time-bounded so a heavy batch can't blow the 5s health-check budget.
+      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
       const fiveMin = this.shadowCandleCache.get(sym);
       if (!fiveMin || fiveMin.length === 0) continue;
       const lastBar = fiveMin[fiveMin.length - 1];
@@ -7081,14 +7135,15 @@ export class SignalEngine {
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
+    const evalYielder = new EvalYielder();
     for (let symIdx = 0; symIdx < symbols.length; symIdx++) {
-      // TRA-1894 — yield to the event loop (macrotask, via setImmediate) every
-      // EQUITY_EVAL_YIELD_EVERY symbols so the event-loop watchdog's setInterval
-      // and Render's health-check I/O can fire mid-sweep. The per-symbol
-      // `getSelectorChain` await only yields to the microtask queue (Promise
-      // resolution from cache), which does NOT unblock setInterval / setImmediate
-      // callers — leaving the full 519-symbol burst as one macrotask-level block.
-      if (symIdx > 0 && symIdx % EQUITY_EVAL_YIELD_EVERY === 0) await yieldToEventLoop();
+      // TRA-1894 / TRA-1905 — yield to the event loop (macrotask, via setImmediate)
+      // mid-sweep so the watchdog's setInterval and Render's health-check I/O can
+      // fire. The per-symbol `getSelectorChain` await only yields to the microtask
+      // queue (cache-resolved Promise), which does NOT unblock setInterval /
+      // setImmediate callers — leaving the full 519-symbol burst as one macrotask-
+      // level block. Now time-bounded so a heavy batch can't cross the 5s budget.
+      if (evalYielder.shouldYield(symIdx)) await yieldToEventLoop();
       const sym = symbols[symIdx]!;
       try {
         // Underlying technicals come from the SAME TRA-734 5m shadow series the
