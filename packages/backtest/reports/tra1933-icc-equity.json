@@ -1,0 +1,433 @@
+{
+  "issue": "TRA-1933",
+  "parent": "TRA-1932",
+  "kind": "equity-probe (board follow-up: stocks & stock options)",
+  "generatedAt": "2026-07-16T03:49:48.424Z",
+  "dataCoverage": {
+    "tradeable": [
+      "pltr"
+    ],
+    "minBars": 250,
+    "skipped": [
+      {
+        "sym": "aapl",
+        "bars": 5
+      },
+      {
+        "sym": "adbe",
+        "bars": 5
+      },
+      {
+        "sym": "amd",
+        "bars": 5
+      },
+      {
+        "sym": "amzn",
+        "bars": 5
+      },
+      {
+        "sym": "avgo",
+        "bars": 5
+      },
+      {
+        "sym": "coin",
+        "bars": 5
+      },
+      {
+        "sym": "crm",
+        "bars": 5
+      },
+      {
+        "sym": "dia",
+        "bars": 5
+      },
+      {
+        "sym": "googl",
+        "bars": 5
+      },
+      {
+        "sym": "intc",
+        "bars": 5
+      },
+      {
+        "sym": "iwm",
+        "bars": 5
+      },
+      {
+        "sym": "meta",
+        "bars": 5
+      },
+      {
+        "sym": "msft",
+        "bars": 5
+      },
+      {
+        "sym": "mstr",
+        "bars": 5
+      },
+      {
+        "sym": "nflx",
+        "bars": 5
+      },
+      {
+        "sym": "nvda",
+        "bars": 5
+      },
+      {
+        "sym": "orcl",
+        "bars": 5
+      },
+      {
+        "sym": "pypl",
+        "bars": 5
+      },
+      {
+        "sym": "qcom",
+        "bars": 5
+      },
+      {
+        "sym": "qqq",
+        "bars": 5
+      },
+      {
+        "sym": "shop",
+        "bars": 5
+      },
+      {
+        "sym": "spy",
+        "bars": 5
+      },
+      {
+        "sym": "tsla",
+        "bars": 5
+      },
+      {
+        "sym": "xlf",
+        "bars": 5
+      },
+      {
+        "sym": "xyz",
+        "bars": 5
+      }
+    ],
+    "note": "ONLY PLTR has a gradeable equity history on disk; all other equity caches are 5–99-bar stubs. This is a SINGLE-NAME anecdote, NOT a graded gate (n>=40 unreachable). There is NO options data on disk — the options question cannot be backtested here.",
+    "window": {
+      "start": "2024-01-02T14:30:00.000Z",
+      "end": "2026-07-02T13:30:00.000Z"
+    }
+  },
+  "gateArm": "eq_retail",
+  "configs": [
+    {
+      "params": {
+        "swingK": 2,
+        "regimeFilter": true,
+        "rrFilter": true
+      },
+      "nTrades": 1,
+      "arms": {
+        "gross_0": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.401443628023118,
+          "realizedRR": 0,
+          "sharpe": 4401443628.023118
+        },
+        "eq_liquid": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.393932950359265,
+          "realizedRR": 0,
+          "sharpe": 4393932950.359264
+        },
+        "eq_retail": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.382666933863484,
+          "realizedRR": 0,
+          "sharpe": 4382666933.863483
+        },
+        "eq_wide": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.360134900871923,
+          "realizedRR": 0,
+          "sharpe": 4360134900.8719225
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 2,
+        "regimeFilter": true,
+        "rrFilter": false
+      },
+      "nTrades": 5,
+      "arms": {
+        "gross_0": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7936895628298708,
+          "realizedRR": 0,
+          "sharpe": 1.3457219950262844
+        },
+        "eq_liquid": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7897887004012638,
+          "realizedRR": 0,
+          "sharpe": 1.3445474880438635
+        },
+        "eq_retail": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7839374067583538,
+          "realizedRR": 0,
+          "sharpe": 1.342778909680271
+        },
+        "eq_wide": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7722348194725341,
+          "realizedRR": 0,
+          "sharpe": 1.3392170224305344
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 2,
+        "regimeFilter": false,
+        "rrFilter": true
+      },
+      "nTrades": 1,
+      "arms": {
+        "gross_0": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.401443628023118,
+          "realizedRR": 0,
+          "sharpe": 4401443628.023118
+        },
+        "eq_liquid": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.393932950359265,
+          "realizedRR": 0,
+          "sharpe": 4393932950.359264
+        },
+        "eq_retail": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.382666933863484,
+          "realizedRR": 0,
+          "sharpe": 4382666933.863483
+        },
+        "eq_wide": {
+          "n": 1,
+          "winRate": 1,
+          "expectancyR": 4.360134900871923,
+          "realizedRR": 0,
+          "sharpe": 4360134900.8719225
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 2,
+        "regimeFilter": false,
+        "rrFilter": false
+      },
+      "nTrades": 5,
+      "arms": {
+        "gross_0": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7936895628298708,
+          "realizedRR": 0,
+          "sharpe": 1.3457219950262844
+        },
+        "eq_liquid": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7897887004012638,
+          "realizedRR": 0,
+          "sharpe": 1.3445474880438635
+        },
+        "eq_retail": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7839374067583538,
+          "realizedRR": 0,
+          "sharpe": 1.342778909680271
+        },
+        "eq_wide": {
+          "n": 5,
+          "winRate": 1,
+          "expectancyR": 1.7722348194725341,
+          "realizedRR": 0,
+          "sharpe": 1.3392170224305344
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 3,
+        "regimeFilter": true,
+        "rrFilter": true
+      },
+      "nTrades": 0,
+      "arms": {
+        "gross_0": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_liquid": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_retail": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_wide": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 3,
+        "regimeFilter": true,
+        "rrFilter": false
+      },
+      "nTrades": 2,
+      "arms": {
+        "gross_0": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.40501510542742974,
+          "realizedRR": 0,
+          "sharpe": 1.4031014463058733
+        },
+        "eq_liquid": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.4036266279279993,
+          "realizedRR": 0,
+          "sharpe": 1.397748455004822
+        },
+        "eq_retail": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.4015439116788537,
+          "realizedRR": 0,
+          "sharpe": 1.389726756793487
+        },
+        "eq_wide": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.39737847918056246,
+          "realizedRR": 0,
+          "sharpe": 1.3737113400679792
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 3,
+        "regimeFilter": false,
+        "rrFilter": true
+      },
+      "nTrades": 0,
+      "arms": {
+        "gross_0": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_liquid": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_retail": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        },
+        "eq_wide": {
+          "n": 0,
+          "winRate": 0,
+          "expectancyR": 0,
+          "realizedRR": 0,
+          "sharpe": 0
+        }
+      }
+    },
+    {
+      "params": {
+        "swingK": 3,
+        "regimeFilter": false,
+        "rrFilter": false
+      },
+      "nTrades": 2,
+      "arms": {
+        "gross_0": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.40501510542742974,
+          "realizedRR": 0,
+          "sharpe": 1.4031014463058733
+        },
+        "eq_liquid": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.4036266279279993,
+          "realizedRR": 0,
+          "sharpe": 1.397748455004822
+        },
+        "eq_retail": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.4015439116788537,
+          "realizedRR": 0,
+          "sharpe": 1.389726756793487
+        },
+        "eq_wide": {
+          "n": 2,
+          "winRate": 1,
+          "expectancyR": 0.39737847918056246,
+          "realizedRR": 0,
+          "sharpe": 1.3737113400679792
+        }
+      }
+    }
+  ],
+  "headline": {
+    "primaryConfig": "weekly→daily, k=2, regime+R:R ON",
+    "n": 1,
+    "grossExpectancyR": 4.401443628023118,
+    "netExpectancyR_eqRetail": 4.382666933863484,
+    "verdict": "INCONCLUSIVE BY DATA — single-name, n<40; cannot grade. Directional read only."
+  }
+}
