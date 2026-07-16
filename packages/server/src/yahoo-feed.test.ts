@@ -9,6 +9,8 @@ import {
   canReuseCachedTradierBars,
   getTradierBarPullRateState,
   chartQuoteFromResult,
+  shouldTripTradierBreaker,
+  getFeedDegradationState,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -367,5 +369,53 @@ describe('chartQuoteFromResult (TRA-1035 keyless chart-quote)', () => {
     expect(chartQuoteFromResult(undefined)).toBeNull();
     expect(chartQuoteFromResult({ meta: {}, quotes: [{ close: null, volume: null }] })).toBeNull();
     expect(chartQuoteFromResult({ meta: { regularMarketPrice: 0 }, quotes: [{ close: 0 }] })).toBeNull();
+  });
+});
+
+// TRA-1940 — feed-provider fallback hardening.
+//
+// Root cause: a Tradier account-wide quota breach surfaces as `HTTP 400: Quota
+// Violation`, which the old breaker predicate (429/5xx only) did NOT match — so the
+// client was re-hammered as "primary" every tick, every leftover symbol spilled onto
+// the degraded Yahoo chain, doTick stretched to minutes, and trade accrual zeroed
+// (the trade-volume-zero symptom). shouldTripTradierBreaker now also opens the
+// breaker on a quota violation so the tick backs off instead of hot-looping.
+describe('shouldTripTradierBreaker (TRA-1940 quota back-off)', () => {
+  it('trips on a Tradier account-wide quota violation (HTTP 400 body)', () => {
+    // The exact message the client throws: `Tradier quotes HTTP 400: Quota Violation`.
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 400: Quota Violation')).toBe(true);
+  });
+
+  it('trips on transient 429 / 5xx errors (unchanged behavior)', () => {
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 429: Too Many Requests')).toBe(true);
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 503: Service Unavailable')).toBe(true);
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 500: err')).toBe(true);
+  });
+
+  it('does NOT trip on a benign HTTP 400 (e.g. bad symbol) — breaker stays closed', () => {
+    // A non-quota 400 must not disable the primary feed for the whole cooldown.
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 400: Invalid symbol')).toBe(false);
+    expect(shouldTripTradierBreaker('Tradier quotes HTTP 404: Not Found')).toBe(false);
+  });
+});
+
+describe('getFeedDegradationState (TRA-1940 observability)', () => {
+  it('reports a closed-breaker snapshot with the enforced fan-out budget', () => {
+    const s = getFeedDegradationState();
+    // Shape the /api/health/quotes route surfaces so ops can see which provider is
+    // degraded, why, and when it recovers.
+    expect(s).toHaveProperty('tradier');
+    expect(s).toHaveProperty('yahoo');
+    expect(typeof s.fanoutBudgetMs).toBe('number');
+    expect(s.fanoutBudgetMs).toBeGreaterThan(0);
+    // With no breaker tripped in this unit context, both providers read closed and
+    // carry no expiry timestamp (null, not a stale 1970 date).
+    expect(typeof s.tradier.open).toBe('boolean');
+    expect(typeof s.yahoo.open).toBe('boolean');
+    if (!s.tradier.open) {
+      expect(s.tradier.reason).toBeNull();
+      expect(s.tradier.blockedUntil).toBeNull();
+    }
+    if (!s.yahoo.open) expect(s.yahoo.blockedUntil).toBeNull();
   });
 });

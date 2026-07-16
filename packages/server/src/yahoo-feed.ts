@@ -156,18 +156,49 @@ const TRADIER_MARKET_DATA_TOKEN =
 let tradierStocksClient: TradierStocksClient | null = null;
 
 const TRADIER_BREAKER_COOLDOWN_MS = 90_000;
+// TRA-1940 — a Tradier account-wide quota breach surfaces as `HTTP 400: Quota
+// Violation`, NOT a 429/5xx. The old breaker predicate only matched 429/5xx, so a
+// quota breach was caught-and-logged but NEVER opened the breaker: the client kept
+// getting re-hammered as "primary" every tick, every call failed, every leftover
+// symbol spilled onto the (also-degraded) Yahoo secondary chain, and doTick
+// stretched to minutes with trade accrual pinned at zero (the trade-volume-zero
+// symptom). A quota breach means the whole account is over budget, so back off for
+// the full cooldown instead of probing per tick. Tradier quota windows are per-
+// minute, so 90s comfortably covers a reset while cutting re-hit rate from once a
+// tick (~every 30s → every request) to at most one probe per cooldown.
+const TRADIER_QUOTA_COOLDOWN_MS = 90_000;
 let tradierBlockedUntil = 0;
+let tradierBlockedReason: 'quota' | 'http_error' | null = null;
 function isTradierBlocked(): boolean {
   return Date.now() < tradierBlockedUntil;
 }
+/** Whether a Tradier error should open the breaker: transient server/rate errors
+ *  (429/5xx) OR an account-wide quota violation (surfaced as an HTTP 400 whose body
+ *  contains "Quota Violation"). See TRA-1940. */
+export function shouldTripTradierBreaker(msg: string): boolean {
+  return /HTTP\s+(429|5\d\d)/.test(msg) || /quota/i.test(msg);
+}
 function tripTradierBreaker(label: string, msg: string): void {
-  tradierBlockedUntil = Date.now() + TRADIER_BREAKER_COOLDOWN_MS;
-  console.warn(`[yahoo-feed] Tradier breaker tripped for ${TRADIER_BREAKER_COOLDOWN_MS / 1000}s after ${label}: ${msg}`);
+  const isQuota = /quota/i.test(msg);
+  const cooldownMs = isQuota ? TRADIER_QUOTA_COOLDOWN_MS : TRADIER_BREAKER_COOLDOWN_MS;
+  tradierBlockedUntil = Date.now() + cooldownMs;
+  tradierBlockedReason = isQuota ? 'quota' : 'http_error';
+  console.warn(`[yahoo-feed] Tradier breaker tripped for ${cooldownMs / 1000}s (${tradierBlockedReason}) after ${label}: ${msg}`);
 }
 
 export function isTradierStocksConfigured(): boolean {
   return tradierStocksClient !== null;
 }
+
+// TRA-1940 — hard ceiling on the wall-time any single fetchQuotes call may spend
+// fanning symbols out to the Yahoo/Stooq secondary chain. Bounds a fully-degraded
+// tick to seconds instead of minutes. Env-overridable for the simulated dual-feed-
+// down acceptance window; default 8s comfortably covers the 25-symbol watchlist
+// under a healthy secondary feed while capping a 535-symbol storm.
+const FEED_FANOUT_BUDGET_MS = (() => {
+  const raw = Number(process.env['FEED_FANOUT_BUDGET_MS']);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8_000;
+})();
 
 // ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
 // TRA-505: the live app writes each user's Tradier creds into per-user account
@@ -987,7 +1018,7 @@ export async function fetchTradierDailyCandles(symbol: string, count = 30): Prom
     return await tradierStocksClient.getDailyBars(symbol, count);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`history(${symbol})`, msg);
+    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`history(${symbol})`, msg);
     else console.warn(`[yahoo-feed] tradier history(${symbol}) error: ${msg}`);
     return [];
   }
@@ -1013,7 +1044,7 @@ async function fetchTradierMinuteBars(
     return { bars, diag: { reason: bars.length > 0 ? 'ok' : 'no_data', filteredLen: bars.length } };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`timesales(${symbol})`, msg);
+    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`timesales(${symbol})`, msg);
     return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
   }
 }
@@ -1248,7 +1279,7 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker(`quote(${symbol})`, msg);
+      if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`quote(${symbol})`, msg);
       else console.warn(`[yahoo-feed] tradier quote(${symbol}) error: ${msg}`);
     }
   }
@@ -1343,7 +1374,7 @@ export async function fetchQuotes(
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (/HTTP\s+(429|5\d\d)/.test(msg)) tripTradierBreaker('quotes(batch)', msg);
+          if (shouldTripTradierBreaker(msg)) tripTradierBreaker('quotes(batch)', msg);
           else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
         }
       })();
@@ -1364,8 +1395,24 @@ export async function fetchQuotes(
   // gain and queues unnecessary microtask callbacks during the boot window.
   if (remaining.length > 0 && isRateLimited()) return results;
   const QUOTE_BATCH = 5;
+  // TRA-1940 — cap total wall-time spent on the secondary fan-out per call. The
+  // start-of-loop short-circuit above can't catch either (a) a Yahoo breaker that
+  // trips PARTWAY through the loop — the remaining batches then each burn a 200ms
+  // inter-batch sleep for zero data — or (b) a large universe (e.g. 535 symbols =
+  // 107 batches) whose sleeps alone total ~21s before any network. Both stretch a
+  // degraded-feed doTick into minutes and stall trade accrual. We re-check the
+  // breaker AND a fan-out deadline before each batch and stop cleanly, leaving the
+  // remaining symbols unpriced (the tick acts on the N it has; callers skip the
+  // rest — see doTick quoteStatus handling).
+  const fanoutDeadline = Date.now() + FEED_FANOUT_BUDGET_MS;
   let failures = 0;
+  let budgetHit = false;
   for (let i = 0; i < remaining.length; i += QUOTE_BATCH) {
+    if (isRateLimited() || Date.now() >= fanoutDeadline) {
+      budgetHit = true;
+      failures += remaining.length - i;
+      break;
+    }
     const slice = remaining.slice(i, i + QUOTE_BATCH);
     const settled = await Promise.all(slice.map(sym => fetchSecondaryQuote(sym).then(q => [sym, q] as const)));
     for (const [sym, q] of settled) {
@@ -1375,7 +1422,8 @@ export async function fetchQuotes(
     if (i + QUOTE_BATCH < remaining.length) await sleep(200);
   }
   if (failures > 0) {
-    console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${isRateLimited() ? ' (Yahoo breaker open)' : ''}`);
+    const reason = isRateLimited() ? ' (Yahoo breaker open)' : budgetHit ? ' (feed budget exhausted)' : '';
+    console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${reason}`);
   }
 
   // TRA-552 — cache the freshly resolved (stale-set) quotes so overlapping
@@ -1586,6 +1634,35 @@ export function tripYahooBreakerFromExternal(label: string, msg: string): void {
 /** Whether the Tradier circuit breaker is currently open. */
 export function isTradierBreakerOpen(): boolean {
   return isTradierBlocked();
+}
+
+/**
+ * TRA-1940 — degraded-feed snapshot for the `/api/health/quotes` route so ops can
+ * see, at a glance, WHICH provider is degraded, WHY, and WHEN it recovers:
+ *  - Tradier breaker: open flag, why it tripped (quota vs http_error), and the
+ *    expiry (quota-expiry) timestamp.
+ *  - Yahoo breaker: open flag and its cooldown expiry.
+ *  - `fanoutBudgetMs`: the per-tick secondary-fetch wall-time ceiling in force.
+ */
+export function getFeedDegradationState(): {
+  tradier: { open: boolean; reason: 'quota' | 'http_error' | null; blockedUntil: string | null };
+  yahoo: { open: boolean; blockedUntil: string | null };
+  fanoutBudgetMs: number;
+} {
+  const tradierOpen = isTradierBlocked();
+  const yahooOpen = isRateLimited();
+  return {
+    tradier: {
+      open: tradierOpen,
+      reason: tradierOpen ? tradierBlockedReason : null,
+      blockedUntil: tradierOpen ? new Date(tradierBlockedUntil).toISOString() : null,
+    },
+    yahoo: {
+      open: yahooOpen,
+      blockedUntil: yahooOpen ? new Date(rateLimitedUntil).toISOString() : null,
+    },
+    fanoutBudgetMs: FEED_FANOUT_BUDGET_MS,
+  };
 }
 
 // ── Boot env-token seed (TRA-574) ─────────────────────────────────────────────

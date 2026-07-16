@@ -8119,6 +8119,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getTwelveDataQuotaState,
     getTradierQuoteRateState,
     getTradierBarPullRateState,
+    getFeedDegradationState,
   } = await import('./yahoo-feed.js');
   const {
     testCoinMarketCap,
@@ -8270,6 +8271,9 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     tradierBreakerOpen: isTradierBreakerOpen(),
     yahooBreakerOpen: isYahooBreakerOpen(),
     coinbaseBreakerOpen: isCoinbaseBreakerOpen(),
+    // TRA-1940 — degraded-feed detail: which provider, why, quota/breaker expiry,
+    // and the per-tick secondary-fetch wall-time budget currently enforced.
+    feedDegradation: getFeedDegradationState(),
     bootEnv,
     results,
     ts: new Date().toISOString(),
