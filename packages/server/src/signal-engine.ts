@@ -6282,7 +6282,8 @@ export class SignalEngine {
     // TRA-791 — label any still-OPEN ledger rows against the freshest 5m series.
     // The horizon rule (intra-session TP/SL touch, TIMEOUT at session close)
     // lives in `resolveOutcome`; we feed it the cached bars per symbol.
-    this.labelOpenShadowSignals();
+    // TRA-1944 — awaited so the unbounded label sweep yields mid-pass.
+    await this.labelOpenShadowSignals();
   }
 
   /**
@@ -6382,9 +6383,20 @@ export class SignalEngine {
    * the symbol's cached 5m series past the signal bar and resolve it to
    * TP_HIT | SL_HIT | TIMEOUT (see {@link resolveOutcome}). Best-effort and
    * fire-and-forget so labelling never blocks the engine tick.
+   *
+   * TRA-1944 — same un-paced-contiguous-block hazard as the reversal sibling
+   * ({@link labelOpenReversalShadowSignals}): this walks EVERY still-OPEN supertrend
+   * row, an unbounded set that grows with session uptime, resolving each against
+   * ~480 cached 5m bars with no yield. Bound it by WALL TIME with an
+   * {@link EvalYielder} so the `signal.supertrendShadowEval` phase can't hold the
+   * loop past the 4s watchdog ceiling once the open set is large.
    */
-  private labelOpenShadowSignals(): void {
-    for (const rec of openShadowSignalsSync()) {
+  private async labelOpenShadowSignals(): Promise<void> {
+    const yielder = new EvalYielder();
+    const open = openShadowSignalsSync();
+    for (let idx = 0; idx < open.length; idx++) {
+      if (yielder.shouldYield(idx)) await yieldToEventLoop();
+      const rec = open[idx]!;
       const bars = this.shadowCandleCache.get(rec.symbol);
       if (!bars || bars.length === 0) continue;
       const res = resolveOutcome(rec, bars);
@@ -6436,7 +6448,9 @@ export class SignalEngine {
       // for QuantTrader's promotion A/B (TRA-789/1245 lineage).
       this.recordPreTradeGate(sym, open, fiveMin);
     }
-    this.labelOpenReversalShadowSignals();
+    // TRA-1944 — awaited so the (unbounded, grows-with-uptime) label sweep can
+    // yield to the event loop mid-pass and never run as one contiguous >4s block.
+    await this.labelOpenReversalShadowSignals();
   }
 
   /**
@@ -6485,9 +6499,29 @@ export class SignalEngine {
    * 5m series, reusing the shared intra-session TP/SL/TIMEOUT horizon rule
    * ({@link resolveReversalOutcome}). Best-effort and fire-and-forget so
    * labelling never blocks the engine tick.
+   *
+   * TRA-1944 — this sweep, not the per-symbol eval loop above, is what tripped the
+   * bqb1 watchdog on the `signal.reversalShadowEval` phase (lagMax 4851ms > 4000ms
+   * ceiling → self-restart). The per-symbol loop is bounded by the watchlist and
+   * already paced by an {@link EvalYielder}; THIS loop walks EVERY still-OPEN
+   * ledger row (an unbounded set that GROWS with session uptime — a reversal row
+   * stays OPEN until TP/SL touches or the session-close TIMEOUT) and resolves each
+   * against ~480 cached 5m bars with NO yield. That is the grows-with-uptime
+   * ~5-6min self-restart cadence the monitor reported: by hour 5-6 the accrued
+   * open set alone runs one contiguous >4s block. Pace it by WALL TIME the same
+   * way EvalYielder bounds the eval loops — hand control back to the event loop
+   * once the contiguous stretch since the last yield crosses the budget, so the
+   * watchdog's setInterval + Render's health probe fire well under the 4s ceiling
+   * no matter how many rows have accrued. The gate stays SYNC (a single Date.now()
+   * per row) and only awaits when a yield is actually due, so a short open set
+   * still resolves in one synchronous pass (no added microtask hops — TRA-936).
    */
-  private labelOpenReversalShadowSignals(): void {
-    for (const rec of openReversalShadowSignalsSync()) {
+  private async labelOpenReversalShadowSignals(): Promise<void> {
+    const yielder = new EvalYielder();
+    const open = openReversalShadowSignalsSync();
+    for (let idx = 0; idx < open.length; idx++) {
+      if (yielder.shouldYield(idx)) await yieldToEventLoop();
+      const rec = open[idx]!;
       const bars = this.shadowCandleCache.get(rec.symbol);
       if (!bars || bars.length === 0) continue;
       const res = resolveReversalOutcome(rec, bars);
