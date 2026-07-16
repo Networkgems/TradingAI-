@@ -140,6 +140,13 @@ const TRADIER_ENV = (process.env['TRADIER_ENV'] as TradierEnv) ?? 'sandbox';
 const TRADIER_API_TOKEN = TRADIER_ENV === 'production'
   ? (process.env['TRADIER_API_TOKEN'] ?? '')
   : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
+// TRA-1937: Tradier sandbox.tradier.com does NOT serve live market data — only
+// api.tradier.com does. Use a dedicated token for market-data calls so the quote
+// feed always reaches the production endpoint regardless of the trading env.
+// On standard (prod) deployments this equals TRADIER_API_TOKEN. On sandbox
+// runs, set TRADIER_MARKET_DATA_TOKEN to the production key separately.
+const TRADIER_MARKET_DATA_TOKEN =
+  (process.env['TRADIER_MARKET_DATA_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
 
 // The stock quote client is a process-global singleton. Its token can come from
 // the boot env (seeded below) and/or from each logged-in user's saved Tradier
@@ -208,7 +215,10 @@ function reconcileTradierFeedClient(): void {
   if (nextToken === tradierFeedToken && nextEnv === tradierFeedEnv) return;
   tradierFeedToken = nextToken;
   tradierFeedEnv = nextEnv;
-  tradierStocksClient = nextToken ? new TradierStocksClient(nextToken, nextEnv) : null;
+  // TRA-1937: always use the production endpoint for market data — sandbox.tradier.com
+  // has no live quotes feed. The trading client (order routing) separately uses sandbox
+  // when TRADIER_ENV=sandbox; that is unaffected by this URL choice.
+  tradierStocksClient = nextToken ? new TradierStocksClient(nextToken, 'production') : null;
   // A credential change earns Tradier an immediate retry: clear any breaker the
   // old (empty/stale) token tripped on a 401/429 so the next tick uses the new
   // token instead of staying on Yahoo for another cooldown window.
@@ -1590,8 +1600,9 @@ export function isTradierBreakerOpen(): boolean {
 // crash-looping the prod deploy. Running it as the final top-level statement
 // guarantees the caches exist before the seed touches them.
 function seedBootEnvTradierToken(): void {
-  if (TRADIER_API_TOKEN) {
-    setTradierStocksFeedClient(TRADIER_API_TOKEN, TRADIER_ENV, FEED_ENV_CONTEXT_KEY);
+  if (TRADIER_MARKET_DATA_TOKEN) {
+    // TRA-1937: seed with 'production' so market data always hits api.tradier.com.
+    setTradierStocksFeedClient(TRADIER_MARKET_DATA_TOKEN, 'production', FEED_ENV_CONTEXT_KEY);
   } else {
     console.warn('[yahoo-feed] Tradier stocks feed disabled (no TRADIER_*_API_TOKEN at boot) — using Yahoo as primary until settings supply a token');
   }
