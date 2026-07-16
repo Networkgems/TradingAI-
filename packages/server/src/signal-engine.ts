@@ -2802,7 +2802,11 @@ export class SignalEngine {
 
     // Broadcast watchlist state early so the UI populates without waiting for candles
     if (this.symbolState.size > 0) {
-      const earlyState = this.getState();
+      // TRA-1905 — getState() rebuilds the full engine snapshot (option Greeks
+      // rollup, per-mode signal/closed-position scoping) every tick; named so a
+      // block in the snapshot build resolves at the sub-phase rather than the
+      // coarse `signal.doTick`.
+      const earlyState = timeSyncPhase('signal.doTick.getstate-broadcast', () => this.getState());
       for (const h of this.handlers) h(earlyState);
     }
 
@@ -2826,7 +2830,13 @@ export class SignalEngine {
       const equityExitRisk = isExitRiskRulesEnabled(this.resolveDemoFlagEnv())
         ? this.buildEquityExitRisk()
         : undefined;
-      const closed = this.account.checkExits(prices, equityExitRisk);
+      // TRA-1905 — checkExits runs the synchronous ATR/indicator exit pass over
+      // every open equity position; named so a block here is attributed away from
+      // the coarse `signal.doTick`.
+      const closed = timeSyncPhase(
+        'signal.doTick.equity-checkExits',
+        () => this.account.checkExits(prices, equityExitRisk),
+      );
       if (closed.length > 0) {
         this.allClosedPositions.push(...closed);
         const accountState = this.account.getState();
@@ -2858,7 +2868,9 @@ export class SignalEngine {
       // owned by the chandelier + give-back cap (run above via `equityExitRisk`).
       if (isScaleoutLadderEnabled()) {
         try {
-          this.evaluateScaleoutLadder(prices);
+          // TRA-1905 — synchronous scale-out ladder pass over open demo positions;
+          // named for sub-phase attribution of a `signal.doTick` block trip.
+          timeSyncPhase('signal.doTick.scaleout-ladder', () => this.evaluateScaleoutLadder(prices));
         } catch (err) {
           log.warn('scale-out ladder observe pass threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -2947,7 +2959,10 @@ export class SignalEngine {
     // so it won't touch them; this pass is purely for the dashboard's
     // Current Mark / unrealized P&L display, which is what the user
     // compares side-by-side with Tradier's web UI.
-    this.refreshImportedMarksAllAccounts(optionMarks);
+    // TRA-1905 — synchronous mark-refresh pass over every imported row across
+    // accounts; named so a block here resolves at the sub-phase rather than the
+    // coarse `signal.doTick`.
+    timeSyncPhase('signal.doTick.imported-marks', () => this.refreshImportedMarksAllAccounts(optionMarks));
 
     // TRA-354 — wait-and-hold exit policy for ENGINE-FIRED exits (distinct
     // from the TRA-352 USER-initiated close reconciler that ran above).
