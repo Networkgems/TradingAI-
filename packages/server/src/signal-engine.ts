@@ -697,6 +697,15 @@ const SMA200_SCAN_INTERVAL_MS = 4 * 60 * 60_000;
 // ≥ 250 sessions; an extra ~30-bar cushion covers holidays / missing prints.
 const SMA200_DAILY_BARS = SMA200_MIN_BARS + 30;
 
+// TRA-1926 — collapse a daily-bar timestamp to its UTC calendar day. Yahoo can
+// hand back the same session with a drifting sub-day timestamp (an intraday
+// forming bar vs the settled bar), so debouncing on the raw millisecond value
+// defeats itself; the calendar day is the stable identity of "the same daily
+// bar" for dedupe purposes.
+function sma200BarDay(ts: number): number {
+  return Math.floor(ts / 86_400_000);
+}
+
 // TRA-533 (TRA-530 Part A) — multi-timeframe technical snapshot refresh. A full
 // snapshot for one symbol pulls a deep minute-bar history (resampled to 15m/1h)
 // plus daily candles, so it is materially heavier than the 30s candle refresh.
@@ -3686,9 +3695,29 @@ export class SignalEngine {
           const latestBarTs = candles[candles.length - 1].timestamp;
           for (const result of evalResult.signals) {
             const key = `${sym}:${result.kind}`;
+            const latestBarDay = sma200BarDay(latestBarTs);
             const lastFiredBarTs = this.sma200LastFired.get(key);
             // Already emitted for this exact daily bar — never duplicate it.
             if (lastFiredBarTs === latestBarTs) continue;
+            // TRA-1926 — restart-proof dedupe against the DISPLAYED feed. The
+            // `sma200LastFired` debounce above is in-memory only and starts
+            // empty after every redeploy, but `recentSignals` is restored from
+            // the snapshot; on a restart-heavy host the boot scan otherwise
+            // re-fires the same daily-bar pullback and appends yet another
+            // identical card, which is exactly the "Pullback → 200" noise
+            // pile-up in the report. Compare on the UTC calendar day so a
+            // drifting intraday-vs-settled bar timestamp can't slip a dupe past.
+            const alreadyShown = this.recentSignals.some(s => {
+              if (s.symbol !== sym || s.type !== result.kind) return false;
+              const barTs = (s as Sma200Signal).barTimestamp;
+              return typeof barTs === 'number' && sma200BarDay(barTs) === latestBarDay;
+            });
+            if (alreadyShown) {
+              // Repair the empty in-memory map so subsequent scans this process
+              // short-circuit on the exact-bar check above.
+              this.sma200LastFired.set(key, latestBarTs);
+              continue;
+            }
             // 5-bar debounce: suppress until 5 daily bars have elapsed since
             // the last fire of this symbol+type.
             if (lastFiredBarTs !== undefined) {
@@ -3716,6 +3745,9 @@ export class SignalEngine {
               trendQuality: result.trendQuality,
               goldenCross: result.goldenCross,
               context: result.label,
+              // TRA-1926 — source daily-bar time, used by the restart-proof
+              // dedupe above and by `importTradeSnapshot`'s debounce rehydrate.
+              barTimestamp: latestBarTs,
             };
             this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
             if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
@@ -11043,6 +11075,21 @@ export class SignalEngine {
       this.allClosedPositions = [...snap.closedPositions];
     }
     this.recentSignals = [...snap.recentSignals];
+    // TRA-1926 — rebuild the SMA-200 one-per-symbol-per-bar debounce from the
+    // restored feed. The map is otherwise in-memory only, so a redeploy wipes it
+    // and the boot scan re-fires every daily-bar signal still on the feed (the
+    // duplicate "Pullback → 200" pile-up). Seed each key with the most recent
+    // fired bar so the exact-bar and 5-bar-debounce checks both hold across the
+    // restart.
+    this.sma200LastFired.clear();
+    for (const sig of this.recentSignals) {
+      if (sig.type !== 'sma200_pullback' && sig.type !== 'sma200_reclaim') continue;
+      const barTs = (sig as Sma200Signal).barTimestamp;
+      if (typeof barTs !== 'number') continue;
+      const key = `${sig.symbol}:${sig.type}`;
+      const prev = this.sma200LastFired.get(key);
+      if (prev === undefined || barTs > prev) this.sma200LastFired.set(key, barTs);
+    }
     this.dailySignals = [...snap.dailySignals];
     this.positionSignalType = new Map(snap.positionSignalType);
     this.account.importSnapshot(snap.account);

@@ -185,3 +185,53 @@ describe('TRA-1289 — demo-only, flag-gated sma200_pullback forward-test fill',
     expect(isLiveEntryGatePassed('sma200_pullback')).toBe(false);
   });
 });
+
+describe('TRA-1926 — SMA-200 scan does not pile up duplicate cards across restarts', () => {
+  const pullbacks = (e: SignalEngine) =>
+    e.getState().signals.filter(s => s.type === 'sma200_pullback');
+
+  it('stamps the source daily-bar timestamp on the emitted signal', async () => {
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+
+    await (engine as unknown as {
+      runSma200Scan: (symbols: string[]) => Promise<void>;
+    }).runSma200Scan(['TEST']);
+
+    const sig = pullbacks(engine)[0] as Sma200Signal;
+    expect(sig).toBeDefined();
+    // Fixture is 250 bars at index*DAY, so the latest bar is 249 * DAY.
+    expect(sig.barTimestamp).toBe(249 * DAY);
+  });
+
+  it('re-scanning the same daily bar after an in-memory-map wipe (a redeploy) adds no second card', async () => {
+    const engine = new SignalEngine();
+    vi.spyOn(yahooFeed, 'fetchDailyCandles').mockResolvedValue(pullbackSeries());
+    const scan = () => (engine as unknown as {
+      runSma200Scan: (symbols: string[]) => Promise<void>;
+    }).runSma200Scan(['TEST']);
+
+    await scan();
+    expect(pullbacks(engine)).toHaveLength(1);
+
+    // Simulate a redeploy: the in-memory debounce map is lost, but the display
+    // feed is restored from the snapshot (recentSignals survives).
+    (engine as unknown as { sma200LastFired: Map<string, number> }).sma200LastFired.clear();
+
+    await scan();
+    // The restart-proof feed dedupe keeps it at a single card.
+    expect(pullbacks(engine)).toHaveLength(1);
+  });
+
+  it('importTradeSnapshot rehydrates the debounce map from the restored feed', () => {
+    const source = new SignalEngine();
+    const base = source.exportTradeSnapshot();
+    const restored = makePullbackSignal({ barTimestamp: 249 * DAY, mode: 'demo' });
+
+    const engine = new SignalEngine();
+    engine.importTradeSnapshot({ ...base, recentSignals: [restored] });
+
+    const map = (engine as unknown as { sma200LastFired: Map<string, number> }).sma200LastFired;
+    expect(map.get('TEST:sma200_pullback')).toBe(249 * DAY);
+  });
+});

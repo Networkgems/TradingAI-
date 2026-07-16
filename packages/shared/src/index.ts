@@ -247,6 +247,16 @@ export interface Sma200Signal extends TradeSignal {
   goldenCross?: boolean;
   /** Human-readable context label from the spec ("continuation …" etc.). */
   context: string;
+  /**
+   * TRA-1926 — timestamp of the DAILY bar that fired this signal (distinct from
+   * `timestamp`, the wall-clock fire time). The scan's one-per-symbol-per-bar
+   * debounce (`sma200LastFired`) is in-memory only and is lost on every
+   * redeploy, while the display feed is restored from the snapshot; stamping the
+   * source bar here lets the scan dedupe a re-fire against the already-restored
+   * feed so a restart-heavy host stops piling up identical "Pullback → 200"
+   * cards. Optional for back-compat with snapshots persisted before the field.
+   */
+  barTimestamp?: number;
 }
 
 /** Result of a protective-bracket sanity check (TRA-520). */
