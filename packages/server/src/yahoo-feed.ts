@@ -167,10 +167,51 @@ const TRADIER_BREAKER_COOLDOWN_MS = 90_000;
 // minute, so 90s comfortably covers a reset while cutting re-hit rate from once a
 // tick (~every 30s → every request) to at most one probe per cooldown.
 const TRADIER_QUOTA_COOLDOWN_MS = 90_000;
-let tradierBlockedUntil = 0;
+// TRA-1996 — the Tradier market-data breaker is tracked PER SOURCE. The dominant
+// request volume is per-symbol `timesales` (minute-bar) pulls across the tracked
+// universe; when the universe grew (~364 → 545 symbols) that bar-pull rate
+// climbed back over the account's per-minute quota and re-tripped the breaker.
+// Under TRA-1940 the breaker was a SINGLE shared flag, so a quota trip caused by
+// a bar pull ALSO blocked the once-per-tick, whole-universe quote batch — the
+// cheap, freshness-critical call — for the full 90s cooldown. With quotes gated
+// off Tradier and 545 symbols spilling onto the Yahoo secondary chain (capped at
+// FEED_FANOUT_BUDGET_MS), every quote aged past MAX_QUOTE_AGE_MS and the feed
+// read 0/545 fresh, 6×/session (the C4 stale-state regression). Splitting the
+// breaker lets a BAR-pull quota storm back off bar pulls only, while the cheap
+// quote batch keeps refreshing quotes. A quota trip on a QUOTE call means the
+// account is genuinely saturated, so it backs off both paths.
+let tradierBarBlockedUntil = 0;
+let tradierQuoteBlockedUntil = 0;
 let tradierBlockedReason: 'quota' | 'http_error' | null = null;
+/**
+ * TRA-1996 — pure per-source breaker decision. Extracted so the asymmetric
+ * blocking (a BAR trip must NOT block the quote path; a QUOTE trip blocks both)
+ * is unit-testable without a live feed.
+ *  - `barBlocked`: bar pulls back off while EITHER source is cooling down — a
+ *    quote-caused breach means the account is genuinely over budget.
+ *  - `quoteBlocked`: the freshness-critical quote batch backs off ONLY when a
+ *    QUOTE call itself tripped the breaker, so a bar-pull quota storm never takes
+ *    quotes dark.
+ */
+export function tradierBreakerGate(
+  now: number,
+  barBlockedUntil: number,
+  quoteBlockedUntil: number,
+): { barBlocked: boolean; quoteBlocked: boolean } {
+  return {
+    barBlocked: now < Math.max(barBlockedUntil, quoteBlockedUntil),
+    quoteBlocked: now < quoteBlockedUntil,
+  };
+}
 function isTradierBlocked(): boolean {
-  return Date.now() < tradierBlockedUntil;
+  return tradierBreakerGate(Date.now(), tradierBarBlockedUntil, tradierQuoteBlockedUntil).barBlocked;
+}
+function isTradierQuoteBlocked(): boolean {
+  return tradierBreakerGate(Date.now(), tradierBarBlockedUntil, tradierQuoteBlockedUntil).quoteBlocked;
+}
+/** ms epoch the Tradier breaker (either source) recovers, for diagnostics. */
+function tradierBlockedUntilMax(): number {
+  return Math.max(tradierBarBlockedUntil, tradierQuoteBlockedUntil);
 }
 /** Whether a Tradier error should open the breaker: transient server/rate errors
  *  (429/5xx) OR an account-wide quota violation (surfaced as an HTTP 400 whose body
@@ -178,12 +219,14 @@ function isTradierBlocked(): boolean {
 export function shouldTripTradierBreaker(msg: string): boolean {
   return /HTTP\s+(429|5\d\d)/.test(msg) || /quota/i.test(msg);
 }
-function tripTradierBreaker(label: string, msg: string): void {
+function tripTradierBreaker(label: string, msg: string, source: 'quote' | 'bar'): void {
   const isQuota = /quota/i.test(msg);
   const cooldownMs = isQuota ? TRADIER_QUOTA_COOLDOWN_MS : TRADIER_BREAKER_COOLDOWN_MS;
-  tradierBlockedUntil = Date.now() + cooldownMs;
+  const until = Date.now() + cooldownMs;
+  if (source === 'quote') tradierQuoteBlockedUntil = until;
+  else tradierBarBlockedUntil = until;
   tradierBlockedReason = isQuota ? 'quota' : 'http_error';
-  console.warn(`[yahoo-feed] Tradier breaker tripped for ${cooldownMs / 1000}s (${tradierBlockedReason}) after ${label}: ${msg}`);
+  console.warn(`[yahoo-feed] Tradier ${source} breaker tripped for ${cooldownMs / 1000}s (${tradierBlockedReason}) after ${label}: ${msg}`);
 }
 
 export function isTradierStocksConfigured(): boolean {
@@ -253,7 +296,8 @@ function reconcileTradierFeedClient(): void {
   // A credential change earns Tradier an immediate retry: clear any breaker the
   // old (empty/stale) token tripped on a 401/429 so the next tick uses the new
   // token instead of staying on Yahoo for another cooldown window.
-  tradierBlockedUntil = 0;
+  tradierBarBlockedUntil = 0;
+  tradierQuoteBlockedUntil = 0;
   // TRA-552 — drop quotes cached under the previous token so a key rotation never
   // serves stale-cred data from the short-TTL cache.
   clearQuoteCache();
@@ -1018,7 +1062,7 @@ export async function fetchTradierDailyCandles(symbol: string, count = 30): Prom
     return await tradierStocksClient.getDailyBars(symbol, count);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`history(${symbol})`, msg);
+    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`history(${symbol})`, msg, 'bar');
     else console.warn(`[yahoo-feed] tradier history(${symbol}) error: ${msg}`);
     return [];
   }
@@ -1044,7 +1088,7 @@ async function fetchTradierMinuteBars(
     return { bars, diag: { reason: bars.length > 0 ? 'ok' : 'no_data', filteredLen: bars.length } };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`timesales(${symbol})`, msg);
+    if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`timesales(${symbol})`, msg, 'bar');
     return { bars: [], diag: { reason: 'fetch_error', errorMsg: msg } };
   }
 }
@@ -1303,7 +1347,7 @@ export async function fetchYahooChartQuote(symbol: string): Promise<QuoteResult 
 export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
   // Primary: Tradier. (Single-symbol path — `fetchQuotes` uses the multi-symbol
   // endpoint to save round-trips for the watchlist refresh.)
-  if (tradierStocksClient && !isTradierBlocked()) {
+  if (tradierStocksClient && !isTradierQuoteBlocked()) {
     try {
       const map = await tradierStocksClient.getQuotes([symbol]);
       const q = map.get(symbol);
@@ -1312,7 +1356,7 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`quote(${symbol})`, msg);
+      if (shouldTripTradierBreaker(msg)) tripTradierBreaker(`quote(${symbol})`, msg, 'quote');
       else console.warn(`[yahoo-feed] tradier quote(${symbol}) error: ${msg}`);
     }
   }
@@ -1377,7 +1421,10 @@ export async function fetchQuotes(
   // TRA-739 singleflight: coalesce concurrent callers that all find the same stale
   // symbols — only the first one fires a Tradier batch; the others await that same
   // promise and then read the now-populated cache entries.
-  if (tradierStocksClient && !isTradierBlocked()) {
+  // TRA-1996: gate on the QUOTE-path breaker, not the shared one — a bar-pull
+  // quota storm must not take this single cheap batch call dark (that is the
+  // 0/545-fresh regression). See the per-source breaker note above.
+  if (tradierStocksClient && !isTradierQuoteBlocked()) {
     const existingQuoteInflight = quoteInflight.get(TRADIER_QUOTE_INFLIGHT_KEY);
     if (existingQuoteInflight) {
       await existingQuoteInflight;
@@ -1407,7 +1454,7 @@ export async function fetchQuotes(
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (shouldTripTradierBreaker(msg)) tripTradierBreaker('quotes(batch)', msg);
+          if (shouldTripTradierBreaker(msg)) tripTradierBreaker('quotes(batch)', msg, 'quote');
           else console.warn(`[yahoo-feed] tradier quotes(batch) error: ${msg}`);
         }
       })();
@@ -1678,7 +1725,15 @@ export function isTradierBreakerOpen(): boolean {
  *  - `fanoutBudgetMs`: the per-tick secondary-fetch wall-time ceiling in force.
  */
 export function getFeedDegradationState(): {
-  tradier: { open: boolean; reason: 'quota' | 'http_error' | null; blockedUntil: string | null };
+  tradier: {
+    open: boolean;
+    reason: 'quota' | 'http_error' | null;
+    blockedUntil: string | null;
+    // TRA-1996 — per-source split so ops can see whether QUOTES are still flowing
+    // through Tradier while a BAR-pull quota storm backs off the bar path.
+    quotePathOpen: boolean;
+    barPathOpen: boolean;
+  };
   yahoo: { open: boolean; blockedUntil: string | null };
   fanoutBudgetMs: number;
 } {
@@ -1688,7 +1743,9 @@ export function getFeedDegradationState(): {
     tradier: {
       open: tradierOpen,
       reason: tradierOpen ? tradierBlockedReason : null,
-      blockedUntil: tradierOpen ? new Date(tradierBlockedUntil).toISOString() : null,
+      blockedUntil: tradierOpen ? new Date(tradierBlockedUntilMax()).toISOString() : null,
+      quotePathOpen: isTradierQuoteBlocked(),
+      barPathOpen: Date.now() < tradierBarBlockedUntil,
     },
     yahoo: {
       open: yahooOpen,

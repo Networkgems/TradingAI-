@@ -11,6 +11,7 @@ import {
   chartQuoteFromResult,
   shouldTripTradierBreaker,
   getFeedDegradationState,
+  tradierBreakerGate,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -396,6 +397,44 @@ describe('shouldTripTradierBreaker (TRA-1940 quota back-off)', () => {
     // A non-quota 400 must not disable the primary feed for the whole cooldown.
     expect(shouldTripTradierBreaker('Tradier quotes HTTP 400: Invalid symbol')).toBe(false);
     expect(shouldTripTradierBreaker('Tradier quotes HTTP 404: Not Found')).toBe(false);
+  });
+});
+
+// TRA-1996 — the Tradier market-data breaker is tracked PER SOURCE. The bug it
+// fixes: bar-pull (`timesales`) volume across the grown 545-symbol universe trips
+// the account quota, which under TRA-1940's SINGLE shared breaker also blocked the
+// cheap once-per-tick quote batch for 90s → quotes aged past MAX_QUOTE_AGE_MS →
+// 0/545 fresh 6×/session. The split lets a BAR trip back off bar pulls only while
+// quotes keep flowing; a QUOTE trip (account genuinely saturated) backs off both.
+describe('tradierBreakerGate (TRA-1996 per-source breaker split)', () => {
+  const NOW = 1_000_000;
+  const OPEN = NOW + 90_000; // a future cooldown expiry
+  const PAST = NOW - 1;      // already recovered
+
+  it('a BAR-pull trip backs off bars but NOT the quote path', () => {
+    const g = tradierBreakerGate(NOW, /*bar*/ OPEN, /*quote*/ 0);
+    expect(g.barBlocked).toBe(true);
+    expect(g.quoteBlocked).toBe(false); // quotes keep refreshing — the fix
+  });
+
+  it('a QUOTE trip backs off BOTH paths (account genuinely over quota)', () => {
+    const g = tradierBreakerGate(NOW, /*bar*/ 0, /*quote*/ OPEN);
+    expect(g.barBlocked).toBe(true);
+    expect(g.quoteBlocked).toBe(true);
+  });
+
+  it('both closed once cooldowns elapse', () => {
+    const g = tradierBreakerGate(NOW, PAST, PAST);
+    expect(g.barBlocked).toBe(false);
+    expect(g.quoteBlocked).toBe(false);
+  });
+
+  it('a stale BAR block never keeps the quote path down after a QUOTE recovery', () => {
+    // Quote path recovered (quoteUntil in the past) but a bar-pull storm is still
+    // cooling down: quotes must be free even though bars remain blocked.
+    const g = tradierBreakerGate(NOW, /*bar*/ OPEN, /*quote*/ PAST);
+    expect(g.barBlocked).toBe(true);
+    expect(g.quoteBlocked).toBe(false);
   });
 });
 
