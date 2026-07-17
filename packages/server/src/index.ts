@@ -301,6 +301,8 @@ import {
   isPreTradeLiquidityEnabled,
   liquidityGateSummary,
 } from './pre-trade-liquidity-ledger.js';
+// TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI.
+import { buildExecutionQualityKpi } from './execution-quality-kpi.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
@@ -1097,6 +1099,33 @@ async function generateAndSaveReport(
       });
     }
   }
+  // TRA-1981 (parent TRA-1967 item 2) — fold the realized-vs-modeled execution-quality
+  // KPI (per asset class) into the EOD markdown so the board sees execution decay next
+  // to the day's P&L. Options come from the durable fee/slippage ledger; equity from
+  // this book's open + closed positions carrying the TRA-536 entry-slippage stamp;
+  // crypto from the paired crypto book. Pure read of already-persisted data (no new
+  // writes). Best-effort — a fold failure logs and leaves the section absent, never
+  // blocking the report.
+  try {
+    const equityPositions: Position[] = [
+      ...finalSnapshot.state.account.openPositions,
+      ...finalSnapshot.allClosedPositions,
+    ];
+    let cryptoPositions: Position[] = [];
+    try {
+      const cs = ctx.cryptoEngine.getState();
+      cryptoPositions = [...cs.account.openPositions, ...cs.closedPositions];
+    } catch {
+      // Crypto book unavailable this tick — the equity + (durable) options legs still fold.
+    }
+    finalSnapshot.executionQuality = buildExecutionQualityKpi({ equityPositions, cryptoPositions });
+  } catch (err) {
+    log.warn('execution-quality EOD fold failed', {
+      username: ctx.username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
   // TRA-359 — in live mode, override the report's `combinedPnl` with the
@@ -5350,6 +5379,52 @@ app.get('/api/health/pre-trade-liquidity', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read pre-trade liquidity ledger' });
+  }
+});
+
+// TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled EXECUTION-QUALITY KPI per
+// asset class. The pre-trade liquidity gate above MODELS a cost per fill; this probe
+// measures the REALIZED cost against it — options fills vs mid (durable fee/slippage
+// ledger), equity/crypto against the TRA-536 per-fill bps budget stamped at open — so
+// execution decay is visible per asset class before it eats the edge. The decay ratio
+// (Σ|realized| ÷ Σ|modeled|) is the OOS check that justifies arming the liquidity-gate
+// veto: > 1× means realized cost runs hotter than the model. Pure read of already-
+// persisted data (no new writes, no behavior change); unmeasured legs are `null`,
+// never `0` (TRA-1707). The options leg is durable; the equity/crypto legs are
+// session-scoped live open positions (folded across all user books).
+app.get('/api/health/execution-quality', (_req, res) => {
+  try {
+    const equityPositions: Position[] = [];
+    const cryptoPositions: Position[] = [];
+    for (const ctx of getAllUserContexts()) {
+      try {
+        equityPositions.push(...ctx.engine.getState().account.openPositions);
+      } catch {
+        // Skip a context whose engine can't render state this tick — the others still fold.
+      }
+      try {
+        cryptoPositions.push(...ctx.cryptoEngine.getState().account.openPositions);
+      } catch {
+        // Same guard for the crypto book.
+      }
+    }
+    const kpi = buildExecutionQualityKpi({ equityPositions, cryptoPositions });
+    res.json({
+      issue: 'TRA-1981',
+      model:
+        'realized vs modeled cost per fill — options: fill-vs-mid signed into cost vs modeled half-spread (|ask−mid|); '
+        + 'equity/crypto: TRA-536 entry drift (|fill−intended|×qty) vs the per-fill bps budget the trade was charged',
+      decayRatio: 'Σ|realized| ÷ Σ|modeled|; > 1× ⇒ realized execution cost is running hotter than the model',
+      durabilityNote:
+        'options leg is durable (fee/slippage ledger, survives restart); equity/crypto legs are session-scoped '
+        + 'live open positions. Unmeasured legs are null, never 0 (TRA-1707).',
+      kpi,
+    });
+  } catch (err) {
+    log.error('execution-quality health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build execution-quality KPI' });
   }
 });
 

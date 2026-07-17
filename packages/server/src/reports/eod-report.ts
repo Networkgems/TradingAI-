@@ -9,6 +9,8 @@ import type {
   SignalType,
 } from '@trading-app/shared';
 import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
+// TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled slippage KPI per asset class.
+import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/shared';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import type { EngineState, SymbolState } from '../signal-engine.js';
@@ -512,6 +514,41 @@ ${s.recent.length > 0
   : ''}`;
 }
 
+/**
+ * TRA-1981 (parent TRA-1967 item 2) — render the realized-vs-modeled execution-
+ * quality KPI per asset class: mean realized cost, mean modeled cost, and the decay
+ * ratio (Σ|realized| ÷ Σ|modeled|) the board reads to decide whether the liquidity
+ * gate's modeled cost is real enough to arm a live veto. Returns '' when no KPI is
+ * threaded. Renders all three asset classes even when a class has no measured fills
+ * (so "no data" reads distinctly from "measured zero" — the TRA-1707 convention),
+ * but stays terse when nothing at all has been measured. Observe-only.
+ */
+function buildExecutionQualityMarkdown(kpi: ExecutionQualityKpi | undefined): string {
+  if (!kpi) return '';
+
+  const usd = (n: number | null) => (n == null ? '—' : (n >= 0 ? '+' : '-') + '$' + Math.abs(n).toFixed(2));
+  const ratio = (n: number | null) => (n == null ? '—' : n.toFixed(2) + '×');
+
+  const rows = EXECUTION_ASSET_CLASSES.map((ac) => {
+    const c = kpi.byAssetClass[ac];
+    return `| ${ac} | ${c.measured}/${c.fills} | ${usd(c.meanRealizedUsd)} | ${usd(c.meanModeledUsd)} | ${ratio(c.decayRatio)} |`;
+  }).join('\n');
+  const o = kpi.overall;
+  const emptyNote =
+    o.measured === 0
+      ? '\n\n_No fill carries both a realized and a modeled leg yet — the KPI is honestly empty (accumulation feeds largely off per TRA-1965), not a measured zero._'
+      : '';
+
+  return `
+
+## Execution Quality — Realized vs Modeled Slippage (TRA-1981, observe-only)
+_Per-fill realized execution cost measured against the modeled cost the trade was charged (options: fill-vs-mid signed into cost vs the modeled half-spread; equity/crypto: TRA-536 entry drift vs the per-fill bps budget). **Decay ratio = Σ|realized| ÷ Σ|modeled|** — > 1× means realized cost is running hotter than the model, the out-of-sample check behind arming the TRA-1967 liquidity-gate veto. Unmeasured legs are '—', never 0 (TRA-1707). The options leg is durable (fee/slippage ledger); equity/crypto are session-scoped open positions._
+| Asset Class | Measured/Fills | Mean Realized | Mean Modeled | Decay Ratio |
+|-------------|----------------|---------------|--------------|-------------|
+${rows}
+| **Overall** | **${o.measured}/${o.fills}** | **${usd(o.meanRealizedUsd)}** | **${usd(o.meanModeledUsd)}** | **${ratio(o.decayRatio)}** |${emptyNote}`;
+}
+
 function buildMarkdown(
   report: Omit<EodReport, 'markdown'>,
   optionJournal?: OptionTradeJournalSummary,
@@ -523,6 +560,7 @@ function buildMarkdown(
   analystPlan?: AnalystPlan,
   analystReview?: AnalystReview,
   hypothesisQueue?: HypothesisQueueHealth,
+  executionQuality?: ExecutionQualityKpi,
 ): string {
   const { date, realizedPnl, unrealizedPnl, optionsPnl, combinedPnl,
           totalEquity, managedEquity, availableCash,
@@ -588,7 +626,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
 }
 
 export interface ReportInput {
@@ -658,6 +696,14 @@ export interface ReportInput {
    * pipeline's staged/ratified view. Optional ↔ no section. DEMO ONLY.
    */
   hypothesisQueue?: HypothesisQueueHealth;
+  /**
+   * TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI
+   * per asset class, built by the caller from the option fee/slippage ledger + the
+   * equity/crypto TRA-536 entry-slippage stamps (`buildExecutionQualityKpi`).
+   * Optional ↔ no section. Observe-only — surfaces execution decay so the board can
+   * judge the liquidity gate's modeled cost before arming a live veto.
+   */
+  executionQuality?: ExecutionQualityKpi;
 }
 
 /**
@@ -675,7 +721,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
           sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
-          hypothesisQueue } = input;
+          hypothesisQueue, executionQuality } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -806,6 +852,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
       analystPlan,
       analystReview,
       hypothesisQueue,
+      executionQuality,
     ),
   };
 }

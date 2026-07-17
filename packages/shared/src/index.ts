@@ -4,6 +4,10 @@
 // computation from data, per-stage evaluation, overall verdict, audit record).
 export * from './promotion-gate.js';
 
+// TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled slippage KPI per fill,
+// aggregated per asset class (the OOS check behind arming the liquidity-gate veto).
+export * from './execution-quality.js';
+
 // TRA-534 — News-sentiment scorer (lexicon-v1) + per-symbol aggregate.
 export * from './news-sentiment.js';
 export * from './news-catalyst.js';
