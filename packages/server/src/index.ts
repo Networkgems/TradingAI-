@@ -3758,6 +3758,47 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
   }
 });
 
+// TRA-2004 (TRA-2000) — per-cell DECOMPOSITION of the resolved AI-Options-Ideas
+// set, as a redacted read-only diagnostic (same unauth, secrets-free basis as
+// /api/health/live-capital-gate + /api/health/option-journal). It re-uses the
+// forward-test report — no per-idea text, no per-symbol P&L, no PII — and returns
+// only aggregate cell statistics (n, gross/net R, POP-vs-realized, credit/width)
+// sliced by structure / DTE / IV-rank / ticker. QuantTrader has no auth on bqb1's
+// authed /api/options/forward-test/report; this public redacted probe is why the
+// task needs it (localhost journal is empty; bqb1 holds the n=43 resolved set).
+//
+// The `overall` cell reconciles with /api/health/live-capital-gate `evidence`
+// (grossR = expectancyR, netR = expectancyNetR) — same resolved-and-included
+// basis. Read-only; no flag, wires no capital, no behavior change on the trade path.
+app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const outcomes = await forwardTestIdeas(entries);
+    const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+    res.json({
+      ok: true,
+      issue: 'TRA-2004',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      // Reconciliation anchors so a reader can verify the overall cell against the
+      // gate totals without a second probe call.
+      totals: {
+        resolved: report.totals.resolved,
+        excluded: report.totals.excluded,
+        expectancyR: report.totals.expectancyR,
+        expectancyNetR: report.totals.expectancyNetR,
+        popCalibrationGap: report.totals.popCalibrationGap,
+      },
+      ...report.decomposition,
+    });
+  } catch (err) {
+    log.error('options-ideas-decomposition probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the options-ideas decomposition.' });
+  }
+});
+
 // TRA-1141 (TRA-1139) — combined accuracy scorecard: both idea engines side by
 // side on out-of-sample data, so the board can compare them honestly instead of
 // guessing "which is more accurate". Read-only; wires no capital. Unauthenticated

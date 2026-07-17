@@ -59,6 +59,25 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
       ...totals,
     },
     weeks: [],
+    decomposition: {
+      asOfDate: '2026-06-25',
+      n: 0,
+      overall: {
+        key: 'overall',
+        n: 0,
+        grossR: null,
+        netR: null,
+        meanPop: null,
+        hitRate: null,
+        popCalibrationGap: null,
+        meanCreditWidth: null,
+      },
+      byStructure: [],
+      byDteBucket: [],
+      byIvRankBucket: [],
+      byTicker: [],
+      note: 'test',
+    },
     methodology: 'test',
   };
 }

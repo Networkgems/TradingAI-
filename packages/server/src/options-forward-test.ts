@@ -96,6 +96,18 @@ export interface IdeaOutcome {
   maxLossUsd: number;
   maxProfitUsd: number;
   entryNetUsd: number;
+  /**
+   * TRA-2004 — days-to-expiration at surface time, carried from the journal entry
+   * so the decomposition probe can slice by DTE bucket. Optional (absent on legacy
+   * outcomes / hand-built test fixtures) → those land in the `unknown` DTE cell.
+   */
+  dte?: number | null;
+  /**
+   * TRA-2004 — IV-rank (0–100) at surface time, carried from the journal entry so
+   * the decomposition probe can slice by IV-rank bucket. Null/absent when unknown
+   * → those land in the `unknown` IV-rank cell.
+   */
+  ivRank?: number | null;
   status: IdeaStatus;
   /** ET date of the chain snapshot used to value the idea (null when unvalued). */
   valuedAt: string | null;
@@ -254,6 +266,10 @@ export function valueIdea(
     maxLossUsd: entry.maxLossUsd,
     maxProfitUsd: entry.maxProfitUsd,
     entryNetUsd: entry.entryNetUsd,
+    // TRA-2004 — carry DTE + IV-rank for the decomposition slices. Legacy journal
+    // entries may lack a finite dte → null (lands in the `unknown` bucket).
+    dte: typeof entry.dte === 'number' && Number.isFinite(entry.dte) ? entry.dte : null,
+    ivRank: entry.ivRank ?? null,
     status: 'no_data',
     valuedAt: null,
     liquidationUsd: null,
@@ -451,8 +467,187 @@ export interface ForwardTestReport {
   };
   /** Per-week breakdown, ascending by ISO week. */
   weeks: WeeklyStats[];
+  /**
+   * TRA-2004 — per-cell decomposition of the RESOLVED (non-excluded) idea set,
+   * sliced by structure / DTE bucket / IV-rank bucket / ticker. The `overall`
+   * cell reconciles with `totals` (gross `expectancyR`, net `expectancyNetR`,
+   * calib `popCalibrationGap`) — same resolved-and-included basis. Diagnostic
+   * only; wires nothing.
+   */
+  decomposition: IdeasDecomposition;
   /** Methodology + look-ahead note, surfaced to the report consumer/QA. */
   methodology: string;
+}
+
+// ── TRA-2004 (TRA-2000) — per-cell decomposition of the resolved idea set ──────
+//
+// Read-only diagnostic (no live wiring — that is TRA-1985). QuantTrader needs to
+// LOCATE the gross-edge leak (which structure/DTE/IVR/ticker bleeds R) and FIT the
+// POP calibration map (where stated POP diverges from the realized hit-rate). The
+// gate's `totals` roll everything into one number; this decomposes the SAME
+// resolved-and-included set into marginal slices so the leak is attributable.
+//
+// Basis: RESOLVED and NON-excluded outcomes only — identical to the filter the
+// live-capital gate aggregates — so the `overall` cell reconciles exactly with the
+// gate's gross/net R and calibration gap. Marginal 1-D slices (not the full
+// cross-product, which is mostly n=1 at these sample sizes) keep every cell large
+// enough to read.
+
+/** One decomposition cell — a slice of the resolved idea set. Null-never-0. */
+export interface DecompositionCell {
+  /** Bucket label (structure id, DTE/IVR bucket, ticker, or `overall`). */
+  key: string;
+  /** Resolved, non-excluded ideas in this cell. */
+  n: number;
+  /** Mean PRE-cost R (`pnlR`) — the gross edge. Null when the cell is empty. */
+  grossR: number | null;
+  /** Mean COST-NET R (`pnlNetR`) — the gated edge. Null when empty. */
+  netR: number | null;
+  /** Mean stated model POP (0–1). Null when empty. */
+  meanPop: number | null;
+  /** Realized hit-rate (wins ÷ n). Null when empty. */
+  hitRate: number | null;
+  /** `hitRate − meanPop`: + = POP under-promised, − = over-promised. Null when empty. */
+  popCalibrationGap: number | null;
+  /**
+   * Mean credit/width = `entryNetUsd ÷ (maxProfitUsd + maxLossUsd)` (signed:
+   * + = net credit as a fraction of defined width, − = net debit). Averaged over
+   * cell members with a positive width denominator. Null when none have one.
+   */
+  meanCreditWidth: number | null;
+}
+
+/** The full per-cell decomposition returned by {@link buildIdeasDecomposition}. */
+export interface IdeasDecomposition {
+  asOfDate: string;
+  /** Resolved, non-excluded ideas the decomposition is fit on (reconciles w/ the gate). */
+  n: number;
+  /** Overall row over the whole resolved-and-included set — reconciles with `totals`. */
+  overall: DecompositionCell;
+  /** By engine structure id (bull_put / bear_call / iron_condor / long_call / …). */
+  byStructure: DecompositionCell[];
+  /** By DTE bucket (≤14 / 15–30 / 31–45 / >45 / unknown). */
+  byDteBucket: DecompositionCell[];
+  /** By IV-rank-at-entry bucket (<25 / 25–50 / 50–75 / >75 / unknown). */
+  byIvRankBucket: DecompositionCell[];
+  /** By ticker / universe. */
+  byTicker: DecompositionCell[];
+  /** Methodology + reconciliation note. */
+  note: string;
+}
+
+/** Fixed display order for the DTE buckets (unknown last). */
+const DTE_BUCKET_ORDER = ['≤14', '15–30', '31–45', '>45', 'unknown'] as const;
+/** Fixed display order for the IV-rank buckets (unknown last). */
+const IVR_BUCKET_ORDER = ['<25', '25–50', '50–75', '>75', 'unknown'] as const;
+
+function dteBucket(dte: number | null | undefined): string {
+  if (dte == null || !Number.isFinite(dte)) return 'unknown';
+  if (dte <= 14) return '≤14';
+  if (dte <= 30) return '15–30';
+  if (dte <= 45) return '31–45';
+  return '>45';
+}
+
+function ivRankBucket(ivr: number | null | undefined): string {
+  if (ivr == null || !Number.isFinite(ivr)) return 'unknown';
+  if (ivr < 25) return '<25';
+  if (ivr < 50) return '25–50';
+  if (ivr < 75) return '50–75';
+  return '>75';
+}
+
+/** Signed credit/width ratio, or null when the defined width is non-positive. */
+function creditWidthRatio(o: IdeaOutcome): number | null {
+  const width = o.maxProfitUsd + o.maxLossUsd;
+  return width > 0 ? o.entryNetUsd / width : null;
+}
+
+/**
+ * Build one decomposition cell from a set of resolved, non-excluded outcomes.
+ * Gross/net R use the SAME `?? 0` fold the gate's `statsFor` uses, so a cell over
+ * the full set reproduces the gate's `expectancyR`/`expectancyNetR` exactly.
+ */
+function cellFor(key: string, os: readonly IdeaOutcome[]): DecompositionCell {
+  const n = os.length;
+  const wins = os.filter((o) => o.win === true).length;
+  const grossR = mean(os.map((o) => o.pnlR ?? 0));
+  const netR = mean(os.map((o) => o.pnlNetR ?? 0));
+  const meanPop = mean(os.map((o) => o.pop));
+  const hitRate = n ? wins / n : null;
+  const cw = os.map(creditWidthRatio).filter((x): x is number => x != null);
+  const meanCreditWidth = cw.length ? mean(cw) : null;
+  return {
+    key,
+    n,
+    grossR: grossR == null ? null : r2(grossR),
+    netR: netR == null ? null : r2(netR),
+    meanPop: meanPop == null ? null : r2(meanPop),
+    hitRate: hitRate == null ? null : r2(hitRate),
+    popCalibrationGap: hitRate != null && meanPop != null ? r2(hitRate - meanPop) : null,
+    meanCreditWidth: meanCreditWidth == null ? null : r2(meanCreditWidth),
+  };
+}
+
+function groupOutcomes(
+  os: readonly IdeaOutcome[],
+  keyFn: (o: IdeaOutcome) => string,
+): Map<string, IdeaOutcome[]> {
+  const m = new Map<string, IdeaOutcome[]>();
+  for (const o of os) {
+    const k = keyFn(o);
+    const arr = m.get(k) ?? [];
+    arr.push(o);
+    m.set(k, arr);
+  }
+  return m;
+}
+
+/** Cells in a fixed bucket order (buckets with no members are omitted, not zero-filled). */
+function orderedCells(m: Map<string, IdeaOutcome[]>, order: readonly string[]): DecompositionCell[] {
+  return [...m.entries()]
+    .sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+    .map(([k, os]) => cellFor(k, os));
+}
+
+/** Cells sorted alphabetically by key (structure ids, tickers). */
+function alphaCells(m: Map<string, IdeaOutcome[]>): DecompositionCell[] {
+  return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, os]) => cellFor(k, os));
+}
+
+const DECOMPOSITION_NOTE =
+  'TRA-2004 diagnostic. Cells cover RESOLVED, non-excluded ideas only — the same basis the ' +
+  'live-capital gate aggregates — so the `overall` cell reconciles with the gate totals ' +
+  '(grossR = expectancyR, netR = expectancyNetR, popCalibrationGap = hitRate − avgPredictedPop). ' +
+  'Slices are 1-D marginals (structure / DTE / IV-rank / ticker), NOT the full cross-product, ' +
+  'so each cell stays large enough to read at current sample sizes. popCalibrationGap < 0 means ' +
+  'stated POP over-promised vs realized hit-rate. Null-never-0: an empty statistic is null, not 0. ' +
+  'Read-only; wires no capital.';
+
+/**
+ * Decompose the resolved (non-excluded) idea set into marginal slices. Pure given
+ * the outcomes; `asOf` only stamps the readout date. Exported so the health probe
+ * and unit tests can call it directly.
+ */
+export function buildIdeasDecomposition(
+  outcomes: readonly IdeaOutcome[],
+  opts: { asOf?: number } = {},
+): IdeasDecomposition {
+  const asOf = opts.asOf ?? Date.now();
+  const resolved = outcomes.filter((o) => o.status === 'resolved' && !o.excluded);
+  return {
+    asOfDate: etDateKey(asOf),
+    n: resolved.length,
+    overall: cellFor('overall', resolved),
+    byStructure: alphaCells(groupOutcomes(resolved, (o) => o.strategy)),
+    byDteBucket: orderedCells(groupOutcomes(resolved, (o) => dteBucket(o.dte)), DTE_BUCKET_ORDER),
+    byIvRankBucket: orderedCells(
+      groupOutcomes(resolved, (o) => ivRankBucket(o.ivRank)),
+      IVR_BUCKET_ORDER,
+    ),
+    byTicker: alphaCells(groupOutcomes(resolved, (o) => o.ticker)),
+    note: DECOMPOSITION_NOTE,
+  };
 }
 
 function mean(xs: number[]): number | null {
@@ -578,6 +773,9 @@ export function buildForwardTestReport(
       weeksPositiveExpectancyNet: weeksWithResolved.filter((w) => w.positiveExpectancyNet).length,
     },
     weeks,
+    // TRA-2004 — per-cell decomposition of the same resolved-and-included set the
+    // totals aggregate, so QuantTrader can locate the gross-edge leak + fit POP.
+    decomposition: buildIdeasDecomposition(outcomes, { asOf }),
     methodology: METHODOLOGY,
   };
 }

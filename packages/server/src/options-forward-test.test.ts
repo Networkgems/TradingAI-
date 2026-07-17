@@ -6,6 +6,7 @@ import type { IdeaLeg } from './options-ideas-feed.js';
 import {
   valueIdea,
   buildForwardTestReport,
+  buildIdeasDecomposition,
   buildAccumulationMonitor,
   renderWeeklyRollupMarkdown,
   structureCostUsd,
@@ -732,5 +733,111 @@ describe('renderWeeklyRollupMarkdown', () => {
     expect(md).toContain('STARTED');
     expect(md).toContain('### Recent weeks');
     expect(md).toContain('2026-W02');
+  });
+});
+
+// ── TRA-2004 — per-cell decomposition of the resolved idea set ─────────────────
+
+describe('buildIdeasDecomposition', () => {
+  /** A resolved, non-excluded outcome with sensible defaults; override any field. */
+  function mkResolved(over: Partial<IdeaOutcome> = {}): IdeaOutcome {
+    return {
+      key: 'k',
+      ticker: 'AAA',
+      strategy: 'bull_put',
+      surfacedDate: '2026-01-05',
+      surfacedWeek: '2026-W02',
+      expiration: '2026-02-20',
+      pop: 0.7,
+      dte: 30,
+      ivRank: 60,
+      maxLossUsd: 300,
+      maxProfitUsd: 200,
+      entryNetUsd: 200, // credit
+      status: 'resolved',
+      valuedAt: '2026-02-20',
+      liquidationUsd: 0,
+      pnlUsd: 30,
+      pnlR: 0.1,
+      costsUsd: 6,
+      pnlNetUsd: 24,
+      pnlNetR: 0.08,
+      costEfficiencyRatio: 0.02,
+      win: true,
+      excluded: false,
+      excludeReason: null,
+      settleLagDays: 0,
+      maxLossBreached: false,
+      ...over,
+    };
+  }
+
+  it('the overall cell reconciles with the report totals (same resolved-included basis)', () => {
+    const outcomes: IdeaOutcome[] = [
+      mkResolved({ key: 'a', pnlR: 0.1, pnlNetR: 0.05, pop: 0.7, win: true }),
+      mkResolved({ key: 'b', pnlR: -0.2, pnlNetR: -0.3, pop: 0.6, win: false, pnlUsd: -60, pnlNetUsd: -66 }),
+      // Excluded + open outcomes must NOT enter the decomposition.
+      mkResolved({ key: 'c', excluded: true, excludeReason: 'cost_uneconomic' }),
+      mkResolved({ key: 'd', status: 'open', win: null }),
+    ];
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-03-01') });
+    const decomp = report.decomposition;
+    expect(decomp.n).toBe(2); // only the two resolved-included
+    expect(decomp.overall.n).toBe(2);
+    expect(decomp.overall.grossR).toBe(report.totals.expectancyR);
+    expect(decomp.overall.netR).toBe(report.totals.expectancyNetR);
+    expect(decomp.overall.popCalibrationGap).toBe(report.totals.popCalibrationGap);
+    // hitRate = 1 win / 2 resolved; meanPop = (0.7+0.6)/2 = 0.65
+    expect(decomp.overall.hitRate).toBe(0.5);
+    expect(decomp.overall.meanPop).toBe(0.65);
+  });
+
+  it('slices by structure / DTE / IV-rank / ticker into the right buckets', () => {
+    const outcomes: IdeaOutcome[] = [
+      mkResolved({ key: 'a', strategy: 'bull_put', ticker: 'AAA', dte: 10, ivRank: 80 }),
+      mkResolved({ key: 'b', strategy: 'iron_condor', ticker: 'BBB', dte: 40, ivRank: 20 }),
+      mkResolved({ key: 'c', strategy: 'bull_put', ticker: 'AAA', dte: 60, ivRank: 55 }),
+    ];
+    const d = buildIdeasDecomposition(outcomes, { asOf: ET_NOON('2026-03-01') });
+
+    expect(d.byStructure.map((c) => c.key)).toEqual(['bull_put', 'iron_condor']);
+    expect(d.byStructure.find((c) => c.key === 'bull_put')?.n).toBe(2);
+
+    // DTE 10 → ≤14, 40 → 31–45, 60 → >45, ordered.
+    expect(d.byDteBucket.map((c) => c.key)).toEqual(['≤14', '31–45', '>45']);
+    // IVR 80 → >75, 20 → <25, 55 → 50–75, ordered (unknown last if present).
+    expect(d.byIvRankBucket.map((c) => c.key)).toEqual(['<25', '50–75', '>75']);
+    expect(d.byTicker.map((c) => c.key)).toEqual(['AAA', 'BBB']);
+    expect(d.byTicker.find((c) => c.key === 'AAA')?.n).toBe(2);
+  });
+
+  it('null IV-rank / DTE land in the `unknown` bucket (null-never-0)', () => {
+    const d = buildIdeasDecomposition(
+      [mkResolved({ key: 'a', dte: null, ivRank: null })],
+      { asOf: ET_NOON('2026-03-01') },
+    );
+    expect(d.byDteBucket.map((c) => c.key)).toEqual(['unknown']);
+    expect(d.byIvRankBucket.map((c) => c.key)).toEqual(['unknown']);
+  });
+
+  it('empty resolved set → overall is a null-filled cell with n=0', () => {
+    const d = buildIdeasDecomposition([], { asOf: ET_NOON('2026-03-01') });
+    expect(d.n).toBe(0);
+    expect(d.overall.n).toBe(0);
+    expect(d.overall.grossR).toBeNull();
+    expect(d.overall.netR).toBeNull();
+    expect(d.overall.hitRate).toBeNull();
+    expect(d.overall.popCalibrationGap).toBeNull();
+    expect(d.overall.meanCreditWidth).toBeNull();
+    expect(d.byStructure).toEqual([]);
+  });
+
+  it('meanCreditWidth is the signed credit ÷ width; non-positive width → null', () => {
+    // credit 200, width = maxProfit(200)+maxLoss(300) = 500 → 200/500 = 0.4
+    const credit = buildIdeasDecomposition([mkResolved({ entryNetUsd: 200, maxProfitUsd: 200, maxLossUsd: 300 })]);
+    expect(credit.overall.meanCreditWidth).toBe(0.4);
+    // width denominator 0 → excluded from the mean → null.
+    const noWidth = buildIdeasDecomposition([mkResolved({ maxProfitUsd: 0, maxLossUsd: 0 })]);
+    expect(noWidth.overall.meanCreditWidth).toBeNull();
   });
 });
