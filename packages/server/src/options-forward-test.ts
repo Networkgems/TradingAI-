@@ -564,3 +564,141 @@ export function buildForwardTestReport(
     methodology: METHODOLOGY,
   };
 }
+
+// ── TRA-1971 (TRA-1965) — accumulation monitor ────────────────────────────────
+//
+// The live-capital gate is stuck at 0/6 not because the strategy is bad but
+// because the forward-test RECORD is empty: both accumulation feeds must be on
+// AND writing to the DURABLE data dir before the ≥8-week clock can even start.
+// This is the pure shape behind `GET /api/health/options-accumulation`: it makes
+// accumulation progress visible without manual polling — the first/last recorded
+// chain date, the first/last journaled idea date, the current
+// surfaced/resolved/weeksWithResolved counts, and — for at-a-glance ops — WHY the
+// clock has or hasn't started (which feed's credential is unset, which artifact
+// is still missing). Secrets-free: it reports whether each credential is
+// CONFIGURED as a boolean, never the value.
+
+/** Snapshot of AI-Options-Ideas forward-test accumulation progress. */
+export interface AccumulationMonitor {
+  asOfDate: string;
+  /** Whether each accumulation feed's credential is configured (never the value). */
+  feeds: {
+    /** `TRADIER_API_TOKEN` present → the daily chain recorder can write. */
+    tradierConfigured: boolean;
+    /** `ANTHROPIC_API_KEY` present → the live ideas pass can surface + journal. */
+    anthropicConfigured: boolean;
+  };
+  chains: {
+    /** The durable chain-recorder output root the report read from. */
+    outDir: string;
+    /** Count of date-partitioned chain snapshots on disk. */
+    partitionDays: number;
+    /** Earliest recorded chain partition date (ET, YYYY-MM-DD), or null if none. */
+    firstRecordedDate: string | null;
+    /** Latest recorded chain partition date, or null if none. */
+    lastRecordedDate: string | null;
+  };
+  journal: {
+    /** Count of journaled surfaced ideas. */
+    ideaCount: number;
+    /** ET date the first idea was journaled, or null if none. */
+    firstJournaledDate: string | null;
+    /** ET date the most recent idea was journaled, or null if none. */
+    lastJournaledDate: string | null;
+  };
+  accumulation: {
+    surfaced: number;
+    resolved: number;
+    open: number;
+    excluded: number;
+    weeksWithResolved: number;
+    weeksPositiveExpectancyNet: number;
+    expectancyNetR: number | null;
+  };
+  gate: {
+    minWeeksWithResolved: number;
+    minResolvedIdeas: number;
+    /** Weeks-with-resolved still needed to clear the gate's sample-window bar. */
+    weeksRemaining: number;
+    /** Resolved ideas still needed to clear the gate's sample-size floor. */
+    resolvedRemaining: number;
+  };
+  clock: {
+    /** True once BOTH feeds have produced their first durable artifact. */
+    started: boolean;
+    /** Machine-readable reasons the clock hasn't started (empty once started). */
+    blockedOn: string[];
+  };
+}
+
+/**
+ * Assemble the accumulation monitor from already-computed inputs. Pure — no I/O,
+ * no `Date.now()`, no `process.env` reads — so the route stays a thin adapter and
+ * the interesting logic (blocked-reason derivation, gate remaining-to-threshold
+ * clamping) is unit-testable in isolation. `chainDates` is the ascending list of
+ * recorded partition dates (as `loadChainDays` returns them); the journal scalars
+ * are pre-extracted so this stays decoupled from the entry shape.
+ */
+export function buildAccumulationMonitor(input: {
+  report: ForwardTestReport;
+  /** Gate thresholds (subset) — passed in to avoid a live-capital-gate import cycle. */
+  gate: { minWeeksWithResolved: number; minResolvedIdeas: number };
+  chainOutDir: string;
+  /** Recorded chain partition dates, ascending. */
+  chainDates: readonly string[];
+  journalCount: number;
+  firstJournaledDate: string | null;
+  lastJournaledDate: string | null;
+  tradierConfigured: boolean;
+  anthropicConfigured: boolean;
+}): AccumulationMonitor {
+  const t = input.report.totals;
+  const firstRecordedDate = input.chainDates[0] ?? null;
+  const lastRecordedDate =
+    input.chainDates.length > 0 ? input.chainDates[input.chainDates.length - 1] : null;
+
+  // The clock starts only once BOTH feeds have produced their first durable
+  // artifact on disk. Surface the specific reasons it hasn't so ops reads
+  // "why 0/6" directly instead of inferring it from empty counts.
+  const blockedOn: string[] = [];
+  if (!input.tradierConfigured) blockedOn.push('tradier_token_unset');
+  if (!input.anthropicConfigured) blockedOn.push('anthropic_key_unset');
+  if (firstRecordedDate === null) blockedOn.push('no_chain_partitions');
+  if (input.firstJournaledDate === null) blockedOn.push('no_journaled_ideas');
+  const started = firstRecordedDate !== null && input.firstJournaledDate !== null;
+
+  return {
+    asOfDate: input.report.asOfDate,
+    feeds: {
+      tradierConfigured: input.tradierConfigured,
+      anthropicConfigured: input.anthropicConfigured,
+    },
+    chains: {
+      outDir: input.chainOutDir,
+      partitionDays: input.chainDates.length,
+      firstRecordedDate,
+      lastRecordedDate,
+    },
+    journal: {
+      ideaCount: input.journalCount,
+      firstJournaledDate: input.firstJournaledDate,
+      lastJournaledDate: input.lastJournaledDate,
+    },
+    accumulation: {
+      surfaced: t.surfaced,
+      resolved: t.resolved,
+      open: t.open,
+      excluded: t.excluded,
+      weeksWithResolved: t.weeksWithResolved,
+      weeksPositiveExpectancyNet: t.weeksPositiveExpectancyNet,
+      expectancyNetR: t.expectancyNetR,
+    },
+    gate: {
+      minWeeksWithResolved: input.gate.minWeeksWithResolved,
+      minResolvedIdeas: input.gate.minResolvedIdeas,
+      weeksRemaining: Math.max(0, input.gate.minWeeksWithResolved - t.weeksWithResolved),
+      resolvedRemaining: Math.max(0, input.gate.minResolvedIdeas - t.resolved),
+    },
+    clock: { started, blockedOn },
+  };
+}

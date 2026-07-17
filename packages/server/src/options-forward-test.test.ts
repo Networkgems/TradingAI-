@@ -6,6 +6,7 @@ import type { IdeaLeg } from './options-ideas-feed.js';
 import {
   valueIdea,
   buildForwardTestReport,
+  buildAccumulationMonitor,
   structureCostUsd,
   DEFAULT_COST_MODEL,
   type IdeaOutcome,
@@ -405,5 +406,139 @@ describe('evaluateLiveCapitalGate', () => {
     expect(report.totals.maxLossBreaches).toBe(1);
     expect(gate.passed).toBe(false);
     expect(gate.criteria.find((c) => c.name === 'defined_risk_integrity')?.pass).toBe(false);
+  });
+});
+
+// ── TRA-1971 — accumulation monitor ──────────────────────────────────────────
+
+describe('buildAccumulationMonitor', () => {
+  const GATE = { minWeeksWithResolved: 8, minResolvedIdeas: 30 };
+
+  it('reports the clock NOT started and every blocker when nothing is wired', () => {
+    // The current 0/6 reality: no creds, no chains, no journaled ideas.
+    const report = buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') });
+    const m = buildAccumulationMonitor({
+      report,
+      gate: GATE,
+      chainOutDir: '/data/option-chains',
+      chainDates: [],
+      journalCount: 0,
+      firstJournaledDate: null,
+      lastJournaledDate: null,
+      tradierConfigured: false,
+      anthropicConfigured: false,
+    });
+    expect(m.clock.started).toBe(false);
+    expect(m.clock.blockedOn).toEqual([
+      'tradier_token_unset',
+      'anthropic_key_unset',
+      'no_chain_partitions',
+      'no_journaled_ideas',
+    ]);
+    expect(m.chains).toMatchObject({
+      outDir: '/data/option-chains',
+      partitionDays: 0,
+      firstRecordedDate: null,
+      lastRecordedDate: null,
+    });
+    expect(m.journal).toMatchObject({ ideaCount: 0, firstJournaledDate: null });
+    // The full window is still ahead of it.
+    expect(m.gate.weeksRemaining).toBe(8);
+    expect(m.gate.resolvedRemaining).toBe(30);
+    expect(m.accumulation.surfaced).toBe(0);
+  });
+
+  it('starts the clock once BOTH feeds have produced their first durable artifact', () => {
+    const report = buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') });
+    const m = buildAccumulationMonitor({
+      report,
+      gate: GATE,
+      chainOutDir: '/data/option-chains',
+      chainDates: ['2026-07-10', '2026-07-13', '2026-07-14'],
+      journalCount: 5,
+      firstJournaledDate: '2026-07-11',
+      lastJournaledDate: '2026-07-14',
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+    expect(m.clock.started).toBe(true);
+    expect(m.clock.blockedOn).toEqual([]);
+    expect(m.chains.firstRecordedDate).toBe('2026-07-10');
+    expect(m.chains.lastRecordedDate).toBe('2026-07-14');
+    expect(m.chains.partitionDays).toBe(3);
+    expect(m.journal).toMatchObject({
+      ideaCount: 5,
+      firstJournaledDate: '2026-07-11',
+      lastJournaledDate: '2026-07-14',
+    });
+  });
+
+  it('does NOT start the clock when one feed is producing but the other is empty', () => {
+    // Chains recording, but no ideas journaled yet (Anthropic key still unset).
+    const report = buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') });
+    const m = buildAccumulationMonitor({
+      report,
+      gate: GATE,
+      chainOutDir: '/data/option-chains',
+      chainDates: ['2026-07-14'],
+      journalCount: 0,
+      firstJournaledDate: null,
+      lastJournaledDate: null,
+      tradierConfigured: true,
+      anthropicConfigured: false,
+    });
+    expect(m.clock.started).toBe(false);
+    expect(m.clock.blockedOn).toEqual(['anthropic_key_unset', 'no_journaled_ideas']);
+  });
+
+  it('surfaces accumulation counts and clamps remaining-to-gate at zero once cleared', () => {
+    // Simulate a matured record: many resolved ideas across many weeks so both
+    // gate remainders floor at 0 (never go negative).
+    const outcomes: IdeaOutcome[] = [];
+    for (let w = 0; w < 10; w++) {
+      for (let i = 0; i < 4; i++) {
+        outcomes.push({
+          key: `w${w}-${i}`,
+          ticker: 'AAA',
+          strategy: 'long_call',
+          surfacedDate: `2026-0${1 + Math.floor(w / 4)}-0${1 + (w % 4)}`,
+          surfacedWeek: `2026-W${String(w + 2).padStart(2, '0')}`,
+          expiration: '2026-02-20',
+          pop: 0.6,
+          maxLossUsd: 300,
+          maxProfitUsd: 600,
+          entryNetUsd: -300,
+          status: 'resolved',
+          valuedAt: '2026-02-20',
+          liquidationUsd: 450,
+          pnlUsd: 150,
+          pnlR: 0.5,
+          costsUsd: 6,
+          pnlNetUsd: 144,
+          pnlNetR: 0.48,
+          win: true,
+          excluded: false,
+          excludeReason: null,
+          settleLagDays: 0,
+          maxLossBreached: false,
+        });
+      }
+    }
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-07-16') });
+    const m = buildAccumulationMonitor({
+      report,
+      gate: GATE,
+      chainOutDir: '/data/option-chains',
+      chainDates: ['2026-01-05'],
+      journalCount: outcomes.length,
+      firstJournaledDate: '2026-01-05',
+      lastJournaledDate: '2026-03-01',
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+    expect(m.accumulation.resolved).toBe(40);
+    expect(m.accumulation.weeksWithResolved).toBe(10);
+    expect(m.gate.weeksRemaining).toBe(0); // 8 needed, 10 have → clamped, not −2
+    expect(m.gate.resolvedRemaining).toBe(0); // 30 needed, 40 have → clamped
   });
 });

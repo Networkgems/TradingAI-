@@ -306,6 +306,7 @@ import {
 import {
   forwardTestIdeas,
   buildForwardTestReport,
+  buildAccumulationMonitor,
   defaultChainsDir,
 } from './options-forward-test.js';
 import { evaluateLiveCapitalGate, resolveLiveCapitalGateCriteria } from './live-capital-gate.js';
@@ -4067,6 +4068,51 @@ app.get('/api/health/options-replay-smoke', async (_req, res) => {
   } catch (err) {
     res.status(500).json({
       issue: 'TRA-779',
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+// TRA-1971 (TRA-1965) — AI-Options-Ideas ACCUMULATION MONITOR. The live-capital
+// gate reads a ≥8-week forward-test record, but that record is empty until BOTH
+// accumulation feeds are on AND writing to the durable data dir: the daily chain
+// recorder (needs `TRADIER_API_TOKEN`) and the live ideas pass (needs
+// `ANTHROPIC_API_KEY`). This probe makes accumulation progress visible WITHOUT
+// manual polling — first/last recorded-chain date, first/last journaled-idea
+// date, the current surfaced/resolved/weeksWithResolved counts, remaining-to-gate,
+// and WHY the clock has or hasn't started yet. Read-only, unauthenticated, and
+// secrets-free (parity with the other /api/health/* probes): it reports whether
+// each feed's credential is CONFIGURED as a boolean, never the value. Evaluating
+// it wires no capital.
+app.get('/api/health/options-accumulation', async (_req, res) => {
+  try {
+    const [days, entries] = await Promise.all([
+      loadChainDays(CHAIN_RECORD_OUT_DIR),
+      listJournalEntries(),
+    ]);
+    const outcomes = await forwardTestIdeas(entries);
+    const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+    const gate = resolveLiveCapitalGateCriteria();
+    // Journal entries are ascending by surface time (see listJournalEntries).
+    const monitor = buildAccumulationMonitor({
+      report,
+      gate,
+      chainOutDir: CHAIN_RECORD_OUT_DIR,
+      chainDates: days.map((d) => d.date),
+      journalCount: entries.length,
+      firstJournaledDate: entries[0]?.surfacedDate ?? null,
+      lastJournaledDate: entries.length ? entries[entries.length - 1].surfacedDate : null,
+      tradierConfigured: Boolean(process.env['TRADIER_API_TOKEN']),
+      anthropicConfigured: Boolean(process.env['ANTHROPIC_API_KEY']),
+    });
+    res.json({ issue: 'TRA-1971', ok: true, ...monitor });
+  } catch (err) {
+    log.error('options-accumulation monitor failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      issue: 'TRA-1971',
       ok: false,
       reason: err instanceof Error ? err.message : String(err),
     });
