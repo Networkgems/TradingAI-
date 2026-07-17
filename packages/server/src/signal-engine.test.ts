@@ -682,6 +682,12 @@ describe('SignalEngine — TRA-791 shadow channel state exposure', () => {
     const state = engine.getState();
     expect(Array.isArray(state.supertrendShadowSignals)).toBe(true);
   });
+
+  it('getState() carries a catalystGateShadowDecisions array (TRA-1972 observe-only surface)', () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    const state = engine.getState();
+    expect(Array.isArray(state.catalystGateShadowDecisions)).toBe(true);
+  });
 });
 
 describe('SignalEngine — Tradier live balance surfacing (TRA-226)', () => {

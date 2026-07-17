@@ -107,6 +107,17 @@ export interface TradeSignal {
    */
   signalSkipReason?: string;
   /**
+   * TRA-1972 (D1 of TRA-1968) — catalyst event-proximity SHADOW decision. When
+   * the earnings/macro gate WOULD block this new entry, the reason is stamped
+   * here for observability — but in D1 the engine does NOT suppress the open
+   * (SHADOW-first, per the TRA-787 pattern). Distinct from `signalSkipReason`
+   * (which marks an entry the engine actually declined to route): a signal can
+   * carry `catalystGateShadowReason` and still open. Absent when the gate is
+   * clear or inert. Live suppression flips on `ENABLE_CATALYST_EARNINGS_GATE=1`
+   * after the D2 out-of-sample grade + QuantTrader Stage-3 sign-off.
+   */
+  catalystGateShadowReason?: string;
+  /**
    * TRA-1325 / TRA-255 §4.4 — trigger-family diagnostic tag on crypto perp
    * short entries emitted by `MomentumStrategy` on 4H bars. Distinguishes the
    * three entry-rule families that can produce a short on the same router:

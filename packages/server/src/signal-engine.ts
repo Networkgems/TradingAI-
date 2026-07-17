@@ -33,6 +33,12 @@ import { getLatestMarketReview } from './market-review.js';
 import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
+import {
+  evaluateCatalystGate,
+  resolveCatalystGateConfig,
+  isCatalystGateTarget,
+  type CatalystGateDecision,
+} from './catalyst-gate.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
 import {
   isReversalShadowEnabled,
@@ -207,6 +213,11 @@ const log = logger.child({ module: 'signal-engine' });
 // order (live promotion is gated on the TRA-734 real-chain go/no-go).
 const supertrendShadowLog = logger.child({ module: 'supertrend-shadow' });
 const reversalShadowLog = logger.child({ module: 'reversal-shadow' });
+// TRA-1972 (D1 of TRA-1968) — dedicated child for the catalyst earnings/macro
+// proximity gate. In D1 every line is `routed:false, gatedOn:'TRA-1968'`: the
+// gate decision is computed + surfaced but NEVER suppresses the open. Live
+// suppression waits on the D2 OOS grade + QuantTrader Stage-3 sign-off.
+const catalystGateLog = logger.child({ module: 'catalyst-gate' });
 // TRA-917 (TRA-908 Phase A) — option-structure SHADOW selector channel. Wholly
 // observe-only: every emit is flag-gated (ENABLE_OPTION_SHADOW_SELECTOR, default
 // OFF) and goes to the option-shadow ledger, NEVER to an order path.
@@ -248,6 +259,13 @@ export interface EngineState {
    * off the WS `state` message. Empty until the first qualifying tick.
    */
   supertrendShadowSignals: TradeSignal[];
+  /**
+   * TRA-1972 (D1 of TRA-1968) — recent catalyst earnings/macro proximity SHADOW
+   * decisions (the entries the gate WOULD block on the live equity path). Purely
+   * observe-only: nothing here suppresses an open in D1. Optional so existing
+   * partial `EngineState` fixtures stay valid; the live builders always set it.
+   */
+  catalystGateShadowDecisions?: CatalystGateDecision[];
   account: AccountState;
   closedPositions: ReturnType<PaperAccount['checkExits']>;
   options: OptionsAccountState;
@@ -1857,6 +1875,14 @@ export class SignalEngine {
    * {@link recentSignals} and never routed to an order path.
    */
   private supertrendShadowSignals: TradeSignal[] = [];
+  /**
+   * TRA-1972 (D1 of TRA-1968) — ring buffer of the most recent catalyst
+   * earnings/macro proximity SHADOW decisions (both gated and clear), surfaced
+   * on EngineState.catalystGateShadowDecisions so QuantTrader can eyeball what
+   * WOULD get gated on the live path before any live suppression is armed.
+   * Observe-only: appended by {@link evaluateCatalystGateShadow}; never routes.
+   */
+  private catalystGateShadowDecisions: CatalystGateDecision[] = [];
   /** TRA-451 — last SMA-200 daily-bar scan timestamp (gates the 4h cadence). */
   private lastSma200ScanAt = 0;
   /**
@@ -3435,6 +3461,11 @@ export class SignalEngine {
 
         for (const signal of [orbSignal, bbFadeSignal, ichimokuSignal]) {
           if (!signal) continue;
+          // TRA-1972 (D1 of TRA-1968) — catalyst earnings/macro proximity gate,
+          // SHADOW-first. Compute + surface + log the intraday-cadence (1d)
+          // decision alongside the existing validateBracket/daily-cap idiom, but
+          // do NOT suppress: `routeEquitySignal` runs regardless in D1.
+          if (isCatalystGateTarget(signal.type)) this.evaluateCatalystGateShadow(signal, Date.now());
           // TRA-796 — the per-signal entry guards + open were extracted into
           // routeEquitySignal so the agent-gating path routes through the
           // IDENTICAL risk-checked order path (dedup, bracket guard, daily cap,
@@ -3803,6 +3834,50 @@ export class SignalEngine {
     for (const h of this.handlers) h(this.getState());
   }
 
+  /** TRA-1972 — cap on the surfaced catalyst-gate SHADOW decision ring buffer. */
+  private static readonly CATALYST_SHADOW_MAX = 100;
+
+  /**
+   * TRA-1972 (D1 of TRA-1968) — compute the catalyst earnings/macro proximity
+   * gate for a NEW equity entry, in SHADOW mode. When the gate WOULD block the
+   * entry it stamps `signal.catalystGateShadowReason`, logs a `routed:false,
+   * gatedOn:'TRA-1968'` line, and appends the decision to the surfaced ring
+   * buffer — but it NEVER suppresses the open (the caller routes regardless).
+   * Live suppression flips on `ENABLE_CATALYST_EARNINGS_GATE=1` only after the
+   * D2 OOS grade + QuantTrader Stage-3 sign-off. Returns the decision so a
+   * future D2 enforcement wiring can gate on `.gated` at the call site.
+   */
+  private evaluateCatalystGateShadow(signal: TradeSignal, asOf: number): CatalystGateDecision {
+    const decision = evaluateCatalystGate({
+      symbol: signal.symbol,
+      strategy: signal.type,
+      asOf,
+      config: resolveCatalystGateConfig(),
+    });
+    if (decision.gated) {
+      signal.catalystGateShadowReason = decision.reason ?? undefined;
+      catalystGateLog.info('catalyst gate SHADOW decision (observe-only, not routed)', {
+        routed: false,
+        gatedOn: 'TRA-1968',
+        symbol: decision.symbol,
+        strategy: decision.strategy,
+        rule: decision.rule,
+        reason: decision.reason,
+        earningsInDays: decision.earningsInDays,
+        thresholdDays: decision.thresholdDays,
+        daysToFomc: decision.daysToFomc,
+        enforce: decision.enforce,
+        mode: this.mode,
+        engineId: this.feedContextKey,
+      });
+      this.catalystGateShadowDecisions.push(decision);
+      if (this.catalystGateShadowDecisions.length > SignalEngine.CATALYST_SHADOW_MAX) {
+        this.catalystGateShadowDecisions.shift();
+      }
+    }
+    return decision;
+  }
+
   /**
    * TRA-451 — scan the watchlist for SMA-200 pullback/reclaim signals on daily
    * bars. Fetches ≥ 250 daily candles per symbol, evaluates the spec's three
@@ -3901,6 +3976,12 @@ export class SignalEngine {
             // FAIL; TRA-458 was an in-sample re-sweep). It opens NO position
             // until registered as gate-passed. sma200_reclaim is display-only.
             if (result.kind === 'sma200_pullback') {
+              // TRA-1972 (D1 of TRA-1968) — catalyst earnings/macro proximity
+              // gate, SHADOW-first. Compute + surface + log the swing-cadence
+              // (10d) decision immediately before the open, but do NOT suppress:
+              // `openSma200Pullback` runs regardless in D1 (SHADOW-only until the
+              // D2 OOS grade + QuantTrader Stage-3 sign-off flips enforcement).
+              this.evaluateCatalystGateShadow(signal, signal.timestamp);
               await this.openSma200Pullback(signal);
             }
           }
@@ -11229,6 +11310,8 @@ export class SignalEngine {
         signals: scopedSignals,
         // TRA-787 — observe-only supertrend shadow channel (never routed).
         supertrendShadowSignals: this.supertrendShadowSignals,
+        // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
+        catalystGateShadowDecisions: this.catalystGateShadowDecisions,
         account: liveAccount,
         closedPositions: [],
         options: {
@@ -11274,6 +11357,8 @@ export class SignalEngine {
       signals: scopedSignals,
       // TRA-787 — observe-only supertrend shadow channel (never routed).
       supertrendShadowSignals: this.supertrendShadowSignals,
+      // TRA-1972 — observe-only catalyst earnings/macro proximity gate decisions.
+      catalystGateShadowDecisions: this.catalystGateShadowDecisions,
       account: demoAccountWithBreakdown,
       closedPositions: this.allClosedPositions.filter(p => isMode(p.mode)).slice(-20),
       options: {
