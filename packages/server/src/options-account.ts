@@ -1939,6 +1939,199 @@ export class PaperOptionsAccount {
     return opt;
   }
 
+  /**
+   * TRA-1966 — open a CASH-SECURED PUT (the entry leg of the wheel) as a single
+   * short paper position. This is the premium-selling counterpart to the long
+   * open paths: instead of paying a debit we SELL an OTM put for a credit and
+   * RESERVE the full strike as cash collateral.
+   *
+   * Cash accounting (paper) — mirrors {@link openDefinedRiskSpread}'s
+   * capital-at-risk model but with the wheel's own collateral convention:
+   *   • Collateral = `strike × 100 × contracts` is debited from paper cash
+   *     ("cash-secured" — the whole strike is set aside so an assignment can be
+   *     paid for). This is deliberately the FULL strike, not a spread's
+   *     `width − credit`, because a CSP's obligation is to buy 100 shares AT
+   *     the strike.
+   *   • The `credit` collected is HELD against the position (recorded in
+   *     `creditUsd`), NOT added to free cash, so it can't masquerade as
+   *     spendable buying power and free up capital to over-trade.
+   *   • `maxLossUsd = (strike − credit) × 100 × contracts` (assignment to a $0
+   *     stock) and `maxProfitUsd = credit` (put expires worthless).
+   *
+   * Guardrail: cash-secured ONLY. There is no naked-put path — an entry that
+   * can't reserve the full strike from paper cash is refused, never downgraded
+   * to an uncovered short.
+   *
+   * Sizing reuses {@link rvBudgetPerTrade} so the 1%/trade budget and the
+   * `OPTIONS_POSITION_CAP_RATIO` per-position cap apply exactly as they do to
+   * the RV / spread paths, with the same forced-1-lot-if-it-fits behaviour.
+   *
+   * Held to roll / assignment / expiry: the per-tick SL/TP/trailing engine
+   * ({@link checkExits}) skips covered writes, and {@link closeOption} refuses
+   * them (their P&L is inverted). Settlement flows through
+   * {@link settleCoveredWrite}. Returns `null` (consuming nothing) outside the
+   * trading window, when the daily cap is hit, on a duplicate short for the same
+   * contract, when the C3 DTE guard blocks it, on a non-positive strike/credit,
+   * or when paper cash can't secure even one lot.
+   */
+  openCashSecuredPut(
+    params: {
+      symbol: string;
+      /** OCC symbol of the short put (real, so the engine's mark refresh matches it). */
+      optionSymbol: string;
+      strike: number;
+      expiration: string;
+      /** Premium collected per share (> 0). */
+      creditPerShare: number;
+      /** Underlying spot at entry. */
+      spot: number;
+      /** Sign-adjusted entry delta, for evidence / roll decisions. */
+      entryDelta?: number;
+      signalId?: string;
+    },
+    mode: AccountMode = 'demo',
+  ): OptionPosition | null {
+    this.resetDayIfNeeded();
+
+    if (!isValidTradingWindow(Date.now())) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
+
+    const { symbol, optionSymbol, strike, expiration, creditPerShare, spot } = params;
+    if (!Number.isFinite(strike) || strike <= 0) return null;
+    if (!Number.isFinite(creditPerShare) || creditPerShare <= 0) return null;
+
+    // One CSP per (contract) — the short leg is keyed by its OCC symbol.
+    const existing = Array.from(this.openOptions.values()).find(
+      (o) => o.optionSymbol === optionSymbol && o.coveredWrite === 'cash_secured_put',
+    );
+    if (existing) return null;
+
+    // No-day-trading entry gate on the short put's expiration.
+    if (!this.passesEntryDteGuard(optionSymbol, expiration, Date.now())) return null;
+
+    // Cash-secured: the full strike is the collateral per contract.
+    const collateralPerContract = strike * 100;
+
+    const budget = this.rvBudgetPerTrade();
+    let contracts = Math.floor(budget / collateralPerContract);
+    if (contracts < 1 && collateralPerContract <= this.cash) contracts = 1;
+    if (contracts < 1) return null;
+
+    let totalCollateral = contracts * collateralPerContract;
+    if (totalCollateral > this.cash) {
+      contracts = Math.floor(this.cash / collateralPerContract);
+      if (contracts < 1) return null;
+      totalCollateral = contracts * collateralPerContract;
+    }
+
+    this.cash -= totalCollateral;
+    this.dailyRvCount += 1;
+
+    const creditUsd = r2(creditPerShare * 100 * contracts);
+    const maxLossUsd = r2(Math.max(0, strike - creditPerShare) * 100 * contracts);
+
+    const position: OptionPosition = {
+      id: randomUUID(),
+      symbol: symbol.toUpperCase(),
+      optionSymbol,
+      optionType: 'put',
+      strike,
+      expiration,
+      contracts,
+      contractsRemaining: contracts,
+      // Short basis: the premium sold per share. Settlement reads creditUsd /
+      // collateralUsd directly rather than the long `(mark − premiumPaid)` math.
+      premiumPaid: creditPerShare,
+      currentPremium: creditPerShare,
+      // Held to roll / assignment / expiry — sentinels keep the long exit
+      // engine a no-op even if a covered write ever reached it.
+      tp1Premium: Number.POSITIVE_INFINITY,
+      tp1Hit: false,
+      stopLossPremium: 0,
+      peakPremium: creditPerShare,
+      trailingActive: false,
+      trailingStopPremium: 0,
+      underlyingEntryPrice: Number.isFinite(spot) && spot > 0 ? spot : 0,
+      openedAt: Date.now(),
+      signalId: params.signalId ?? randomUUID(),
+      signalType: 'relative_value',
+      mode,
+      ...(params.entryDelta !== undefined ? { entryDelta: params.entryDelta } : {}),
+      // TRA-1966 — covered-write payload.
+      coveredWrite: 'cash_secured_put',
+      collateralUsd: r2(totalCollateral),
+      creditUsd,
+      spreadStrategy: 'cash_secured_put',
+      netUsd: creditUsd,
+      maxLossUsd,
+      maxProfitUsd: creditUsd,
+      breakevens: [r2(strike - creditPerShare)],
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+    };
+
+    this.openOptions.set(position.id, position);
+    return position;
+  }
+
+  /**
+   * TRA-1966 — settle a covered write ({@link openCashSecuredPut}) at roll /
+   * take-profit / expiry. Releases the reserved collateral back to paper cash
+   * and books the short-leg P&L (inverted from a long close — profit is the
+   * credit kept minus any buy-back debit):
+   *   • `expired_worthless` — the short expired OTM; keep the full credit.
+   *   • `bought_back` — rolled or taken to profit by buying the short back for
+   *     `debitPerShare`; P&L = credit − debit.
+   *
+   * Assignment (put → long 100 shares at strike, then sell a covered call) is
+   * intentionally NOT handled here: it converts reserved cash into an equity
+   * position, which needs the paper equity inventory. That state-machine step
+   * is the follow-up (see the wheel child issue) — passing `assigned` returns
+   * `null` so nothing books phantom cash off a half-modelled assignment.
+   *
+   * Returns `null` for an unknown id, a non-covered-write position, an imported
+   * Tradier position (separate cash bucket), or an unsupported outcome.
+   */
+  settleCoveredWrite(
+    optionId: string,
+    outcome:
+      | { kind: 'expired_worthless' }
+      | { kind: 'bought_back'; debitPerShare: number }
+      | { kind: 'assigned' },
+  ): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt || !opt.coveredWrite) return null;
+    if (opt.importedFromTradier) return null;
+    if (outcome.kind === 'assigned') return null; // follow-up: needs equity inventory
+
+    const contracts = opt.contractsRemaining;
+    const collateral = opt.collateralUsd ?? 0;
+    const credit = opt.creditUsd ?? 0;
+
+    let pnl: number;
+    let closeMark: number;
+    if (outcome.kind === 'bought_back') {
+      const debitPerShare = Math.max(0, outcome.debitPerShare);
+      pnl = r2(credit - debitPerShare * 100 * contracts);
+      closeMark = debitPerShare;
+    } else {
+      pnl = credit;
+      closeMark = 0;
+    }
+
+    // Release the reserved collateral, then apply the realized leg P&L.
+    this.cash += collateral + pnl;
+    this.equity += pnl;
+    opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.currentPremium = closeMark;
+    opt.closedAt = Date.now();
+    opt.contractsRemaining = 0;
+    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+
+    this.openOptions.delete(optionId);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
   /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
   openOption(signal: TradeSignal, underlyingPrice: number, mode: AccountMode = 'demo'): OptionPosition | null {
     this.resetDayIfNeeded();
@@ -2132,6 +2325,11 @@ export class PaperOptionsAccount {
         }
         continue;
       }
+      // TRA-1966 — covered writes (cash-secured put / covered call) are SHORT
+      // credit positions held to roll / assignment / expiry. The long-side
+      // SL/TP/trailing schedule doesn't apply (its P&L basis is inverted), so
+      // the per-tick engine skips them; they settle via settleCoveredWrite.
+      if (opt.coveredWrite) continue;
       const isImported = opt.importedFromTradier === true;
       if (isImported) {
         // TRA-361 — imports flow through SL/TP1/trail when auto-management is
@@ -3403,6 +3601,11 @@ export class PaperOptionsAccount {
     // `dropImportedPosition` after submitting a real `sell_to_close`
     // order to Tradier; refusing here is a defensive guard.
     if (opt.importedFromTradier) return null;
+    // TRA-1966 — covered writes are short credit positions; routing them
+    // through this long-close path (which credits the mark as proceeds and
+    // uses `mark − premiumPaid` P&L) would invert their P&L and double-book
+    // the collateral. They settle only through `settleCoveredWrite`.
+    if (opt.coveredWrite) return null;
     // TRA-949 — see `checkExits`: roll the ET-day before this manual close books
     // realized P&L so today's opening baseline is captured first and the daily
     // pill reconciles with the Closed-Today total on a close-only day.
@@ -3462,12 +3665,16 @@ export class PaperOptionsAccount {
   voidOpenOption(optionId: string): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt) return false;
-    // Refund the premium that was deducted in the open path. Use
-    // `contractsRemaining` so a position that already had a partial fill /
-    // partial exit isn't double-credited (in practice the caller voids
-    // immediately after open, so remaining === contracts; the Math.max guard
-    // is defensive).
-    const refund = opt.premiumPaid * Math.max(opt.contractsRemaining, 0) * 100;
+    // Refund whatever the open path debited. For a covered write
+    // (TRA-1966) that is the RESERVED COLLATERAL, not a premium — the credit
+    // was never added to cash — so undoing the open just releases the
+    // collateral. For every other position the open debited the premium /
+    // capital-at-risk, refunded per remaining contract. `contractsRemaining`
+    // (Math.max guard) keeps a partially-filled/exited position from being
+    // double-credited; in practice the caller voids immediately after open.
+    const refund = opt.coveredWrite
+      ? opt.collateralUsd ?? 0
+      : opt.premiumPaid * Math.max(opt.contractsRemaining, 0) * 100;
     this.cash += refund;
     // Roll back the per-source daily counter so the user doesn't lose a slot
     // to a trade that never happened on the broker side.

@@ -681,6 +681,60 @@ describe('TradierOptionsClient.buyContracts / sellContracts', () => {
   });
 });
 
+// TRA-1966 — premium-selling (write) primitive: sell_to_open / buy_to_close.
+// Verifies the covered-write order bodies carry the right side so the broker
+// holds buying power for a cash-secured put / covered call.
+describe('TradierOptionsClient covered-write primitive (TRA-1966)', () => {
+  it('posts a sell_to_open MARKET order for a short write', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 21, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const r = await client.sellToOpenContracts('AAPL260515P00150000', 2);
+    expect(r.id).toBe(21);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('class')).toBe('option');
+    expect(params.get('symbol')).toBe('AAPL');
+    expect(params.get('option_symbol')).toBe('AAPL260515P00150000');
+    expect(params.get('side')).toBe('sell_to_open');
+    expect(params.get('quantity')).toBe('2');
+    expect(params.get('type')).toBe('market');
+  });
+
+  it('posts a sell_to_open LIMIT order with rounded cent price', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 22, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    await client.sellToOpenContractsLimit('AAPL260515C00160000', 3, 1.257);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('side')).toBe('sell_to_open');
+    expect(params.get('option_symbol')).toBe('AAPL260515C00160000');
+    expect(params.get('quantity')).toBe('3');
+    expect(params.get('type')).toBe('limit');
+    // 1.257 → 1.26 (round to nearest cent).
+    expect(params.get('price')).toBe('1.26');
+    expect(params.get('duration')).toBe('day');
+  });
+
+  it('posts a buy_to_close MARKET order to close a short write', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 23, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    await client.buyToCloseContracts('AAPL260515P00150000', 2);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('side')).toBe('buy_to_close');
+    expect(params.get('option_symbol')).toBe('AAPL260515P00150000');
+    expect(params.get('quantity')).toBe('2');
+  });
+
+  it('posts a buy_to_close LIMIT order (roll / take-profit) with rounded cent price', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 24, status: 'ok' } }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    await client.buyToCloseContractsLimit('AAPL260515C00160000', 1, 0.043);
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('side')).toBe('buy_to_close');
+    expect(params.get('type')).toBe('limit');
+    // 0.043 → 0.04.
+    expect(params.get('price')).toBe('0.04');
+  });
+});
+
 // ─── TRA-319 — order status reconciliation ──────────────────────────────────
 
 describe('TradierOrderClient.getOrderStatus', () => {

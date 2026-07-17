@@ -2507,6 +2507,32 @@ export interface OptionPosition {
    * Absent ↔ chandelier not yet armed / rules-off snapshot.
    */
   chandelierStop?: number;
+  /**
+   * TRA-1966 — premium-selling ("write") discriminator. When present this
+   * position is a SHORT option opened for credit (the wheel): a cash-secured
+   * put (`cash_secured_put`) or a covered call (`covered_call`). Unlike the
+   * long-side single-leg positions the entry COLLECTS `creditUsd` and RESERVES
+   * `collateralUsd` (cash for a CSP, share notional for a CC) rather than
+   * paying a debit. Covered writes are SKIPPED by the per-tick SL/TP/trailing
+   * exit engine ({@link OptionPosition.legs} combos are skipped the same way)
+   * and are held to roll / assignment / expiry, then settled through the
+   * dedicated covered-write settlement path (never the long-close P&L math).
+   * Absent ↔ a long single-leg or a multi-leg defined-risk combo.
+   */
+  coveredWrite?: 'cash_secured_put' | 'covered_call';
+  /**
+   * TRA-1966 — collateral held against a covered write, USD across all
+   * `contracts`. Cash-secured put: `strike × 100 × contracts` reserved from
+   * paper cash. Covered call: `100 × contracts` shares of the underlying
+   * locked (their notional at entry). Released back on settlement.
+   */
+  collateralUsd?: number;
+  /**
+   * TRA-1966 — premium credit collected at entry on a covered write, USD across
+   * all `contracts` (always ≥ 0). Held against the position — NOT booked as
+   * free cash at open — so a credit can't masquerade as spendable buying power.
+   */
+  creditUsd?: number;
 }
 
 /**

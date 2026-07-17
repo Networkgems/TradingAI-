@@ -3079,3 +3079,103 @@ describe('PaperOptionsAccount — TRA-1301 correlated-exposure cap wiring', () =
     expect(acct.exposureSnapshotForMode('live')).toHaveLength(0);
   });
 });
+
+// TRA-1966 — premium-selling primitive: cash-secured put (entry leg of the wheel).
+describe('PaperOptionsAccount.openCashSecuredPut', () => {
+  const cspParams = (overrides: Record<string, unknown> = {}) => ({
+    symbol: 'AAPL',
+    optionSymbol: 'AAPL240705P00050000',
+    strike: 50,
+    expiration: '2024-07-05', // ~31 DTE from the pinned Tuesday → clears the C3 floor
+    creditPerShare: 1.5,
+    spot: 55,
+    entryDelta: -0.25,
+    ...overrides,
+  });
+
+  it('reserves the FULL strike as cash collateral and holds the credit (not free cash)', () => {
+    // Equity $50k → one $50-strike lot ($5,000 collateral) fits under the cap.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams());
+
+    expect(pos).not.toBeNull();
+    expect(pos!.contracts).toBe(1);
+    expect(pos!.coveredWrite).toBe('cash_secured_put');
+    expect(pos!.optionType).toBe('put');
+    // Cash-secured: full strike × 100 reserved; credit is NOT added to cash.
+    expect(pos!.collateralUsd).toBe(5_000);
+    expect(pos!.creditUsd).toBe(150);
+    expect(acct.getState().optionsCash).toBe(45_000);
+    // Assignment-to-zero downside, capped-upside credit, breakeven at strike−credit.
+    expect(pos!.maxLossUsd).toBe(4_850);
+    expect(pos!.maxProfitUsd).toBe(150);
+    expect(pos!.netUsd).toBe(150);
+    expect(pos!.breakevens).toEqual([48.5]);
+    expect(pos!.premiumPaid).toBeCloseTo(1.5, 5);
+    expect(pos!.entryDelta).toBe(-0.25);
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+  });
+
+  it('refuses a second short on the same contract (dedup) and non-positive strike/credit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openCashSecuredPut(cspParams())).not.toBeNull();
+    expect(acct.openCashSecuredPut(cspParams())).toBeNull();
+    expect(acct.openCashSecuredPut(cspParams({ optionSymbol: 'AAPL240705P00040000', creditPerShare: 0 }))).toBeNull();
+    expect(acct.openCashSecuredPut(cspParams({ optionSymbol: 'AAPL240705P00040000', strike: 0 }))).toBeNull();
+    // Only the first entry consumed cash / a daily slot.
+    expect(acct.getState().optionsCash).toBe(45_000);
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+  });
+
+  it('honors the C3 entry-DTE guard (sub-floor expiration refused, nothing consumed)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams({ expiration: '2024-06-06' })); // 2 DTE
+    expect(pos).toBeNull();
+    expect(acct.getState().optionsCash).toBe(50_000);
+    expect(acct.getState().dailyOptionsCount).toBe(0);
+  });
+
+  it('is skipped by the per-tick exit engine and refused by the long closeOption path', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams())!;
+    // Adverse tick must not close the short via the long SL/TP engine.
+    const exited = acct.checkExits(new Map([['AAPL', 1]]), new Map([[pos.optionSymbol!, 9]]), 'demo');
+    expect(exited).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    // The long-close path refuses a covered write (its P&L is inverted).
+    expect(acct.closeOption(pos.id)).toBeNull();
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().optionsCash).toBe(45_000);
+  });
+
+  it('settles an expired-worthless CSP: releases collateral and books the full credit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams())!;
+    const closed = acct.settleCoveredWrite(pos.id, { kind: 'expired_worthless' });
+    expect(closed).not.toBeNull();
+    expect(closed!.pnl).toBe(150);
+    // Collateral (5,000) + credit (150) back in cash.
+    expect(acct.getState().optionsCash).toBe(50_150);
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('settles a bought-back CSP (roll / take-profit): credit minus the buy-back debit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams())!;
+    const closed = acct.settleCoveredWrite(pos.id, { kind: 'bought_back', debitPerShare: 0.4 });
+    expect(closed).not.toBeNull();
+    // credit 150 − debit (0.4×100) = 110.
+    expect(closed!.pnl).toBe(110);
+    // Collateral (5,000) released + P&L (110) → 45,000 + 5,110.
+    expect(acct.getState().optionsCash).toBe(50_110);
+  });
+
+  it('refuses to settle an assignment here (equity-inventory follow-up)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openCashSecuredPut(cspParams())!;
+    expect(acct.settleCoveredWrite(pos.id, { kind: 'assigned' })).toBeNull();
+    // Position stays open; nothing booked.
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().optionsCash).toBe(45_000);
+  });
+});

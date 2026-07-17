@@ -717,10 +717,77 @@ export class TradierOptionsClient extends TradierOrderClient {
     );
   }
 
+  /**
+   * TRA-1966 — premium-selling ("write") primitive: open a SHORT option
+   * position (`sell_to_open`). This is the broker leg of a cash-secured put
+   * (short put, collateral = strike × 100 × qty held in cash) or a covered
+   * call (short call, collateral = 100 × qty shares of the underlying held
+   * long). Tradier holds the buying-power / margin against the account
+   * automatically on submission; the CALLER is responsible for guaranteeing
+   * the collateral is actually cash-secured / covered before routing here.
+   *
+   * Guardrail: this client deliberately exposes ONLY the covered/secured
+   * write. There is no naked-short helper — a naked short call has undefined
+   * risk and the strategy layer must never reach for one. Assignment (put →
+   * long 100 shares at strike; call → deliver 100 shares) is booked by
+   * Tradier into the equity account and reconciled by the position sync; the
+   * short leg is closed by {@link buyToCloseContracts} (roll / take profit).
+   */
+  async sellToOpenContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
+    return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'sell_to_open'));
+  }
+
+  /**
+   * TRA-1966 — limit `sell_to_open`. The premium-selling counterpart to
+   * {@link buyContractsLimit}: the smart-open walk for a short write starts at
+   * the mid and walks DOWN toward the bid until it fills (we want to collect
+   * as much credit as possible, so we never chase below our floor). `limitPrice`
+   * is rounded to the nearest cent because Tradier rejects sub-cent option
+   * limit prices.
+   */
+  async sellToOpenContractsLimit(
+    optionSymbol: string,
+    qty: number,
+    limitPrice: number,
+    duration: TradierOrderDuration = 'day',
+  ): Promise<TradierOrderResponse> {
+    return this.postOrder(
+      this.optionOrderBody(optionSymbol, qty, 'sell_to_open', { type: 'limit', price: limitPrice, duration }),
+    );
+  }
+
+  /**
+   * TRA-1966 — close a SHORT option leg (`buy_to_close`). Used to buy back a
+   * cash-secured put / covered call to take profit or to roll the position to
+   * a later expiration before assignment. Counterpart to
+   * {@link sellToOpenContracts}.
+   */
+  async buyToCloseContracts(optionSymbol: string, qty: number): Promise<TradierOrderResponse> {
+    return this.postOrder(this.optionOrderBody(optionSymbol, qty, 'buy_to_close'));
+  }
+
+  /**
+   * TRA-1966 — limit `buy_to_close`. Roll / take-profit on a short write at a
+   * capped debit; walks the limit UP toward the ask until it fills. Cent-rounded.
+   */
+  async buyToCloseContractsLimit(
+    optionSymbol: string,
+    qty: number,
+    limitPrice: number,
+    duration: TradierOrderDuration = 'day',
+  ): Promise<TradierOrderResponse> {
+    return this.postOrder(
+      this.optionOrderBody(optionSymbol, qty, 'buy_to_close', { type: 'limit', price: limitPrice, duration }),
+    );
+  }
+
   private optionOrderBody(
     optionSymbol: string,
     qty: number,
-    side: 'buy_to_open' | 'sell_to_close',
+    // TRA-1966 — `sell_to_open` / `buy_to_close` added for the covered-write
+    // (cash-secured put / covered call) primitive alongside the original
+    // long-side `buy_to_open` / `sell_to_close`.
+    side: 'buy_to_open' | 'sell_to_close' | 'sell_to_open' | 'buy_to_close',
     /**
      * TRA-352 — when omitted, defaults to a `market` order (legacy behaviour
      * for the buy_to_open mirror). When provided, submits a `limit` order
