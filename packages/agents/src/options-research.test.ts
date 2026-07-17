@@ -188,6 +188,86 @@ describe('runOptionsResearch', () => {
     expect(out.rejected[0]!.reasons.join(' ')).toMatch(/day-trade guardrail/);
   });
 
+  // TRA-1974 (D3) — event-IV "sell the crush". A net-long-vega debit single-leg
+  // (long_call / long_put) proposed on a name with a catalyst INSIDE its expiry
+  // and elevated IV (ivRank >= 50) is dropped deterministically post-model, so a
+  // defined-risk CREDIT structure surfaces for that name instead.
+  describe('sell-the-crush event-IV rule', () => {
+    // ivRank 72, earnings in 18d — inside a 39-DTE expiry.
+    const crush = () => symbol({ ivRank: 72, nextEarningsInDays: 18, daysToFOMC: null });
+
+    it('DoD: a would-be long-premium debit pre-earnings surfaces as a credit structure instead', async () => {
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({
+          ideas: [
+            goodIdea({ strategy: 'long_call', dteDays: 39, maxLossUsd: 250, pop: 0.55 }), // crushed → drop
+            goodIdea({ strategy: 'bull_put_spread', dteDays: 39, maxLossUsd: 320, pop: 0.7 }), // credit → keep
+          ],
+        }),
+      );
+      const out = await runOptionsResearch(input({ symbols: [crush()] }), { llm });
+      expect(out.ideas.map((i) => i.strategy)).toEqual(['bull_put_spread']);
+      const reasonBlob = out.rejected.flatMap((r) => r.reasons).join(' ');
+      expect(reasonBlob).toMatch(/sell-the-crush/);
+      expect(reasonBlob).toMatch(/earnings in 18d/);
+    });
+
+    it('drops long_put too, not just long_call', async () => {
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({ ideas: [goodIdea({ strategy: 'long_put', dteDays: 39 })] }),
+      );
+      const out = await runOptionsResearch(input({ symbols: [crush()] }), { llm });
+      expect(out.ideas).toHaveLength(0);
+      expect(out.rejected[0]!.reasons.join(' ')).toMatch(/sell-the-crush/);
+    });
+
+    it('KEEPS a long single-leg when the catalyst sits OUTSIDE the chosen expiry', async () => {
+      // Earnings 45d out, idea expires in 39d → the crush lands after expiry.
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({ ideas: [goodIdea({ strategy: 'long_call', dteDays: 39 })] }),
+      );
+      const sym = symbol({ ivRank: 72, nextEarningsInDays: 45, daysToFOMC: null });
+      const out = await runOptionsResearch(input({ symbols: [sym] }), { llm });
+      expect(out.ideas.map((i) => i.strategy)).toEqual(['long_call']);
+    });
+
+    it('KEEPS a long single-leg when IV-rank is below the elevated threshold', async () => {
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({ ideas: [goodIdea({ strategy: 'long_call', dteDays: 39 })] }),
+      );
+      const sym = symbol({ ivRank: 40, nextEarningsInDays: 5, daysToFOMC: null });
+      const out = await runOptionsResearch(input({ symbols: [sym] }), { llm });
+      expect(out.ideas.map((i) => i.strategy)).toEqual(['long_call']);
+    });
+
+    it('fires on an FOMC-inside catalyst when earnings is absent (secondary trigger)', async () => {
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({ ideas: [goodIdea({ strategy: 'long_call', dteDays: 30 })] }),
+      );
+      const sym = symbol({ ivRank: 60, nextEarningsInDays: null, daysToFOMC: 6 });
+      const out = await runOptionsResearch(input({ symbols: [sym] }), { llm });
+      expect(out.ideas).toHaveLength(0);
+      expect(out.rejected[0]!.reasons.join(' ')).toMatch(/FOMC in 6d/);
+    });
+
+    it('never drops a credit / spread structure on a sell-the-crush name', async () => {
+      // FOMC-based crush (no earnings key) so the TRA-846 earnings de-dupe does not
+      // collapse the two same-ticker survivors — this test isolates the D3 drop.
+      const fomcCrush = symbol({ ivRank: 72, nextEarningsInDays: null, daysToFOMC: 6 });
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({
+          ideas: [
+            goodIdea({ strategy: 'bear_call_spread', dteDays: 39, pop: 0.68 }),
+            goodIdea({ strategy: 'iron_condor', dteDays: 39, pop: 0.6 }),
+          ],
+        }),
+      );
+      const out = await runOptionsResearch(input({ symbols: [fomcCrush] }), { llm });
+      expect(out.ideas.map((i) => i.strategy).sort()).toEqual(['bear_call_spread', 'iron_condor']);
+      expect(out.rejected).toHaveLength(0);
+    });
+  });
+
   it('every returned idea is defined-risk and clears the guardrail', async () => {
     const llm = new StubLlmClient(() =>
       JSON.stringify({
@@ -198,10 +278,10 @@ describe('runOptionsResearch', () => {
         ],
       }),
     );
-    // No earnings event on the symbol so the TRA-846 earnings de-dupe doesn't
-    // collapse the two same-ticker survivors — this test is about the HARD guardrail.
+    // No catalyst on the symbol so neither the TRA-846 earnings de-dupe nor the
+    // TRA-1974 sell-the-crush drop fires — this test is about the HARD guardrail.
     const out = await runOptionsResearch(
-      input({ maxIdeas: 10, symbols: [symbol({ nextEarningsInDays: null })] }),
+      input({ maxIdeas: 10, symbols: [symbol({ nextEarningsInDays: null, daysToFOMC: null })] }),
       { llm },
     );
     for (const idea of out.ideas) {
@@ -221,10 +301,10 @@ describe('runOptionsResearch', () => {
         ],
       }),
     );
-    // No earnings event → no de-dupe; same (unknown) sector so the per-sector cap
-    // (2) admits the top-2 by score, exercising pure ranking + truncation.
+    // No catalyst → no de-dupe and no sell-the-crush drop; same (unknown) sector so
+    // the per-sector cap (2) admits the top-2 by score, exercising pure ranking.
     const out = await runOptionsResearch(
-      input({ maxIdeas: 2, symbols: [symbol({ nextEarningsInDays: null })] }),
+      input({ maxIdeas: 2, symbols: [symbol({ nextEarningsInDays: null, daysToFOMC: null })] }),
       { llm },
     );
     expect(out.ideas).toHaveLength(2);
@@ -271,10 +351,10 @@ describe('runOptionsResearch', () => {
 
   it('caps ideas per sector when sectors are supplied', async () => {
     const symbols: OptionsResearchSymbol[] = [
-      symbol({ symbol: 'TEC1', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
-      symbol({ symbol: 'TEC2', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
-      symbol({ symbol: 'TEC3', sector: 'Technology', nextEarningsInDays: null, candidates: symbol().candidates }),
-      symbol({ symbol: 'FIN1', sector: 'Financials', nextEarningsInDays: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'TEC1', sector: 'Technology', nextEarningsInDays: null, daysToFOMC: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'TEC2', sector: 'Technology', nextEarningsInDays: null, daysToFOMC: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'TEC3', sector: 'Technology', nextEarningsInDays: null, daysToFOMC: null, candidates: symbol().candidates }),
+      symbol({ symbol: 'FIN1', sector: 'Financials', nextEarningsInDays: null, daysToFOMC: null, candidates: symbol().candidates }),
     ];
     const llm = new StubLlmClient(() =>
       JSON.stringify({

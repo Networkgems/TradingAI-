@@ -19,18 +19,30 @@ import type { RiskManager } from '../risk.js';
 // 1. IV gate → structure selection
 // ---------------------------------------------------------------------------
 
-export type OptionsStructure = 'single_leg' | 'debit_vertical';
+export type OptionsStructure = 'single_leg' | 'debit_vertical' | 'credit_spread';
 
 export interface IvGateParams {
   /** Below this IV-rank, prefer a single-leg call/put (default 40). */
   singleLegMaxIvRank: number;
   /** At/above this IV-rank, switch to a debit vertical to cut vega (default 60). */
   verticalMinIvRank: number;
+  /**
+   * TRA-1974 — event-IV "sell-the-crush" min IV-rank (default 50). When a
+   * scheduled catalyst (earnings — primary; FOMC — secondary) sits INSIDE the
+   * candidate's expiry AND IV-rank ≥ this, prefer a net-credit defined-risk
+   * structure over any long-vega debit: a long-premium debit into the event gets
+   * IV-crushed on the post-event vol collapse, so we sell the rich premium with a
+   * capped wing instead. Set deliberately BELOW {@link verticalMinIvRank} (60):
+   * a known catalyst LOWERS the bar for going credit, because the post-event
+   * crush is the specific, dated risk the rule exists to dodge.
+   */
+  eventIvMinRank: number;
 }
 
 export const DEFAULT_IV_GATE: IvGateParams = {
   singleLegMaxIvRank: 40,
   verticalMinIvRank: 60,
+  eventIvMinRank: 50,
 };
 
 export interface StructureDecision {
@@ -39,16 +51,76 @@ export interface StructureDecision {
 }
 
 /**
+ * TRA-1974 — point-in-time catalyst proximity for the event-IV rule. A catalyst
+ * "sits inside" the expiry when it is scheduled at/before the candidate's
+ * expiration (`0 <= daysAway <= daysToExpiration`), so the option is still open
+ * across the vol event. Absent/`null` → uncovered (no trigger; we never fabricate
+ * a catalyst).
+ */
+export interface EventProximity {
+  /** Days to next scheduled earnings (C1), or `null` if none/uncovered. Primary trigger. */
+  nextEarningsInDays: number | null;
+  /** Days to the next FOMC decision (C2), or `null` if unknown. Secondary, lower-priority trigger. */
+  daysToFOMC: number | null;
+  /** The candidate's days-to-expiration — the window the catalyst must sit inside. */
+  daysToExpiration: number;
+}
+
+/** A catalyst `daysAway` sits inside a `dte`-day expiry when 0 ≤ daysAway ≤ dte. */
+function catalystInsideExpiry(daysAway: number | null, dte: number): boolean {
+  return daysAway !== null && Number.isFinite(daysAway) && daysAway >= 0 && daysAway <= dte;
+}
+
+/**
+ * TRA-1974 — is the event-IV "sell-the-crush" rule active? True when IV is
+ * elevated (`ivRank >= params.eventIvMinRank`) AND a scheduled catalyst sits
+ * inside the candidate's expiry (earnings primary, FOMC secondary). Pure;
+ * unknown IV-rank or no in-window catalyst → false (no fabricated edge).
+ */
+export function preferCreditForEvent(
+  ivRank: number | null,
+  event: EventProximity,
+  params: IvGateParams = DEFAULT_IV_GATE,
+): boolean {
+  if (ivRank === null || !Number.isFinite(ivRank) || ivRank < params.eventIvMinRank) return false;
+  return (
+    catalystInsideExpiry(event.nextEarningsInDays, event.daysToExpiration) ||
+    catalystInsideExpiry(event.daysToFOMC, event.daysToExpiration)
+  );
+}
+
+/**
  * Pick the option structure from the underlying's IV-rank (0–100). Low IV → buy
  * premium outright (single leg); high IV → a debit vertical so we are not long
  * pure vega into a rich tape. In the in-between band (and when IV-rank is
  * unknown) we default to the single leg — the cheaper, simpler expression — and
  * let Phase 2 decide whether the dead-zone deserves its own rule.
+ *
+ * TRA-1974 — when `event` is supplied and the "sell-the-crush" rule is active
+ * (catalyst inside the expiry + elevated IV), it takes PRIORITY over the plain
+ * IV-rank bands and routes to a net-credit defined-risk structure: a long-vega
+ * debit held across an earnings/FOMC print is exactly what the post-event vol
+ * collapse crushes, so we sell the rich premium (capped wing) instead. Omitting
+ * `event` preserves the legacy IV-rank-only behaviour verbatim.
  */
 export function selectStructureByIv(
   ivRank: number | null,
   params: IvGateParams = DEFAULT_IV_GATE,
+  event?: EventProximity,
 ): StructureDecision {
+  // TRA-1974 — event-IV "sell-the-crush" first: a dated catalyst inside the
+  // expiry with elevated IV overrides the plain IV bands (the debit would be
+  // crushed post-event). Earnings is the primary trigger; FOMC the secondary.
+  if (event && preferCreditForEvent(ivRank, event, params)) {
+    const earningsInside = catalystInsideExpiry(event.nextEarningsInDays, event.daysToExpiration);
+    const which = earningsInside
+      ? `earnings in ${event.nextEarningsInDays}d`
+      : `FOMC in ${event.daysToFOMC}d`;
+    return {
+      structure: 'credit_spread',
+      reason: `sell_the_crush: ${which} inside ${event.daysToExpiration}d DTE, iv_rank ${(ivRank as number).toFixed(0)} >= ${params.eventIvMinRank}`,
+    };
+  }
   if (ivRank === null || !Number.isFinite(ivRank)) {
     return { structure: 'single_leg', reason: 'iv_rank_unknown' };
   }

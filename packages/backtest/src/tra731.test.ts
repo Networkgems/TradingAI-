@@ -211,11 +211,11 @@ describe('supertrend-confluence synthetic replay (Track B)', () => {
     const bars = mixedRegimeCandles(400, 'MSFT', 300, 9);
     const low = replaySymbol('MSFT', bars, {
       ...DEFAULT_REPLAY_PARAMS,
-      ivGate: { singleLegMaxIvRank: 40, verticalMinIvRank: 30 },
+      ivGate: { singleLegMaxIvRank: 40, verticalMinIvRank: 30, eventIvMinRank: 50 },
     });
     const high = replaySymbol('MSFT', bars, {
       ...DEFAULT_REPLAY_PARAMS,
-      ivGate: { singleLegMaxIvRank: 40, verticalMinIvRank: 95 },
+      ivGate: { singleLegMaxIvRank: 40, verticalMinIvRank: 95, eventIvMinRank: 50 },
     });
     expect(high.trades.length).toBeGreaterThanOrEqual(low.trades.length);
   });

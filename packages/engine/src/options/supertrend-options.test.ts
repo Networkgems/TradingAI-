@@ -3,6 +3,8 @@ import type { AccountState } from '@trading-app/shared';
 import { RiskManager } from '../risk.js';
 import {
   selectStructureByIv,
+  preferCreditForEvent,
+  DEFAULT_IV_GATE,
   selectExpiry,
   isThirdFriday,
   selectStrikeByDelta,
@@ -31,9 +33,76 @@ describe('selectStructureByIv (IV gate)', () => {
     expect(selectStructureByIv(50).structure).toBe('single_leg');
   });
   it('honours custom thresholds', () => {
-    expect(selectStructureByIv(45, { singleLegMaxIvRank: 30, verticalMinIvRank: 45 }).structure).toBe(
-      'debit_vertical',
-    );
+    expect(
+      selectStructureByIv(45, { singleLegMaxIvRank: 30, verticalMinIvRank: 45, eventIvMinRank: 50 }).structure,
+    ).toBe('debit_vertical');
+  });
+});
+
+describe('selectStructureByIv — TRA-1974 event-IV "sell-the-crush"', () => {
+  // Earnings-inside-DTE × IV-rank matrix. Trigger = catalyst inside expiry AND
+  // ivRank >= eventIvMinRank (50) → net-credit structure; else the legacy bands.
+  const dte = 30;
+  const earningsInside = { nextEarningsInDays: 5, daysToFOMC: null, daysToExpiration: dte };
+  const earningsOutside = { nextEarningsInDays: 45, daysToFOMC: null, daysToExpiration: dte };
+  const noEvent = { nextEarningsInDays: null, daysToFOMC: null, daysToExpiration: dte };
+
+  it('routes to credit_spread when earnings sits inside the expiry and IV is elevated', () => {
+    const d = selectStructureByIv(55, DEFAULT_IV_GATE, earningsInside);
+    expect(d.structure).toBe('credit_spread');
+    expect(d.reason).toContain('sell_the_crush');
+    expect(d.reason).toContain('earnings in 5d');
+  });
+
+  it('fires exactly at the eventIvMinRank boundary (ivRank === 50)', () => {
+    expect(selectStructureByIv(50, DEFAULT_IV_GATE, earningsInside).structure).toBe('credit_spread');
+    expect(selectStructureByIv(49.9, DEFAULT_IV_GATE, earningsInside).structure).not.toBe('credit_spread');
+  });
+
+  it('fires at the DTE boundary (earnings on the expiry day) but not beyond it', () => {
+    const onExpiry = { nextEarningsInDays: dte, daysToFOMC: null, daysToExpiration: dte };
+    const dayAfter = { nextEarningsInDays: dte + 1, daysToFOMC: null, daysToExpiration: dte };
+    expect(selectStructureByIv(70, DEFAULT_IV_GATE, onExpiry).structure).toBe('credit_spread');
+    // Catalyst after expiry → no crush risk on this contract → legacy high-IV band.
+    expect(selectStructureByIv(70, DEFAULT_IV_GATE, dayAfter).structure).toBe('debit_vertical');
+  });
+
+  it('does NOT fire when earnings is outside the expiry, regardless of IV', () => {
+    expect(selectStructureByIv(90, DEFAULT_IV_GATE, earningsOutside).structure).toBe('debit_vertical');
+    expect(selectStructureByIv(30, DEFAULT_IV_GATE, earningsOutside).structure).toBe('single_leg');
+  });
+
+  it('does NOT fire on elevated IV alone with no catalyst (falls through to bands)', () => {
+    expect(selectStructureByIv(55, DEFAULT_IV_GATE, noEvent).structure).toBe('single_leg'); // 50-60 dead-zone
+    expect(selectStructureByIv(65, DEFAULT_IV_GATE, noEvent).structure).toBe('debit_vertical');
+  });
+
+  it('does NOT fire when IV-rank is unknown even with earnings inside', () => {
+    expect(selectStructureByIv(null, DEFAULT_IV_GATE, earningsInside).structure).toBe('single_leg');
+  });
+
+  it('treats FOMC-inside as a (secondary) trigger when earnings is absent', () => {
+    const fomcInside = { nextEarningsInDays: null, daysToFOMC: 3, daysToExpiration: dte };
+    const d = selectStructureByIv(60, DEFAULT_IV_GATE, fomcInside);
+    expect(d.structure).toBe('credit_spread');
+    expect(d.reason).toContain('FOMC in 3d');
+  });
+
+  it('earnings takes priority over FOMC in the reason when both sit inside', () => {
+    const both = { nextEarningsInDays: 4, daysToFOMC: 2, daysToExpiration: dte };
+    expect(selectStructureByIv(60, DEFAULT_IV_GATE, both).reason).toContain('earnings in 4d');
+  });
+
+  it('omitting the event arg preserves the legacy IV-rank-only behaviour', () => {
+    expect(selectStructureByIv(90).structure).toBe('debit_vertical');
+    expect(selectStructureByIv(30).structure).toBe('single_leg');
+  });
+
+  it('preferCreditForEvent is the pure predicate backing the rule', () => {
+    expect(preferCreditForEvent(55, earningsInside)).toBe(true);
+    expect(preferCreditForEvent(49, earningsInside)).toBe(false);
+    expect(preferCreditForEvent(55, earningsOutside)).toBe(false);
+    expect(preferCreditForEvent(null, earningsInside)).toBe(false);
   });
 });
 

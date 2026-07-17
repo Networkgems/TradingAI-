@@ -101,6 +101,49 @@ export function isDefinedRiskStrategy(strategy: string): strategy is DefinedRisk
   return DEFINED_RISK_STRATEGIES.has(strategy);
 }
 
+// ── TRA-1974 event-IV "sell the crush" ────────────────────────────────────────
+//
+// The deterministic teeth of the D3 rule: when a scheduled catalyst sits INSIDE
+// an idea's expiry and IV is elevated, a net-long-vega DEBIT single-leg
+// (long_call / long_put) is exactly what the post-event IV crush punishes. We
+// drop those ideas post-model and let a defined-risk CREDIT structure surface
+// instead. This mirrors the engine's `selectStructureByIv` / `preferCreditForEvent`
+// rule (packages/engine/src/options/supertrend-options.ts) — the agents package is
+// deliberately decoupled from the engine, so the threshold is mirrored here, not
+// imported. Keep the two in sync (both = 50, below the 60 vertical-IV cutoff).
+
+/**
+ * TRA-1974 — event-IV "sell-the-crush" min IV-rank. A scheduled catalyst lowers
+ * the bar for going credit vs the plain high-IV cutoff, because the post-event
+ * vol collapse is the specific, dated risk the rule exists to dodge. Mirrors
+ * `DEFAULT_IV_GATE.eventIvMinRank` in `@trading-app/engine`.
+ */
+export const EVENT_IV_MIN_RANK = 50;
+
+/** The net-long-vega debit single-legs the IV crush hurts most. */
+export const LONG_VEGA_DEBIT_SINGLE_LEGS: ReadonlySet<string> = new Set(['long_call', 'long_put']);
+
+/** A catalyst `daysAway` sits inside a `dte`-day expiry when 0 ≤ daysAway ≤ dte. */
+function catalystInsideExpiry(daysAway: number | null | undefined, dte: number): boolean {
+  return daysAway != null && Number.isFinite(daysAway) && daysAway >= 0 && daysAway <= dte;
+}
+
+/**
+ * TRA-1974 — is the event-IV "sell-the-crush" rule active for an idea on `sym`
+ * with `dteDays` to expiry? True when IV is elevated (`ivRank >= EVENT_IV_MIN_RANK`)
+ * AND a scheduled catalyst sits INSIDE the chosen expiry — earnings (primary) or
+ * FOMC (secondary). Pure; unknown IV-rank, missing symbol, or no in-window
+ * catalyst → false (no fabricated edge). This is the same read
+ * (`ivRank` + `nextEarningsInDays` / `daysToFOMC`) the server fusion attaches to
+ * each symbol, now consumed as a deterministic rule rather than only an LLM badge.
+ */
+export function sellTheCrushActive(sym: OptionsResearchSymbol | undefined, dteDays: number): boolean {
+  if (!sym || sym.ivRank == null || !Number.isFinite(sym.ivRank) || sym.ivRank < EVENT_IV_MIN_RANK) {
+    return false;
+  }
+  return catalystInsideExpiry(sym.nextEarningsInDays, dteDays) || catalystInsideExpiry(sym.daysToFOMC, dteDays);
+}
+
 /**
  * One scanner-surfaced contract, normalised from the RV and OTM-mispricing
  * scanners (`@trading-app/engine`). The server adapter projects either
@@ -420,6 +463,13 @@ const SYSTEM_PROMPT = [
   '4. maxLossUsd is the DEFINED dollar loss per 1-lot (100 multiplier). It must be > 0.',
   '5. pop is your honest probability-of-profit estimate at expiry, 0..1, grounded in the',
   '   data given (delta, mispricing, IV-rank). When IV-rank is unknown, do not claim an IV edge.',
+  '6. SELL THE CRUSH (event-IV, HARD). When a symbol carries `sellTheCrush: true` — a scheduled',
+  '   catalyst (earnings, primary; FOMC, secondary) lands at/inside a tradeable expiry AND ivRank >= 50',
+  '   — DO NOT propose long_call or long_put on it: a long-premium debit gets IV-crushed on the',
+  '   post-event vol collapse. Use a defined-risk NET-CREDIT structure instead (bull_put_spread /',
+  '   bear_call_spread / iron_condor / iron_butterfly), keeping your directional lean. A long single-leg',
+  '   debit on a sell-the-crush name is DISCARDED deterministically after you answer — spend the slot on a',
+  '   credit structure.',
   '',
   'CANDIDATE PROVENANCE. Each candidate carries a `source`: `relative_value` / `otm_mispricing`',
   'are real scanner anomalies (`mispricingPct` is meaningful). `source: "atm_seed"` is NOT an',
@@ -434,13 +484,13 @@ const SYSTEM_PROMPT = [
   'prefer spreads over long single options to blunt IV-crush.',
   '',
   'DIVERSIFICATION — build a SPREAD slate, not a clustered one:',
-  '6. Spread ideas across catalyst horizons. Use the soonest scheduled catalyst for each name',
+  '7. Spread ideas across catalyst horizons. Use the soonest scheduled catalyst for each name',
   '   (earnings / FOMC / macro print) to gauge horizon: NEAR (catalyst within ~2 weeks),',
   '   MEDIUM (~2–5 weeks), LONG (no near catalyst / a longer-dated thesis). Do NOT return an',
   '   all-earnings-week book — mix the horizons when the data supports it.',
-  '7. Spread ideas across sectors. The `sector` field is given when known; otherwise use your own',
+  '8. Spread ideas across sectors. The `sector` field is given when known; otherwise use your own',
   '   knowledge of each ticker. Avoid concentrating the slate in a single sector (e.g. all mega-cap Tech).',
-  '8. DE-DUPE earnings events: never return more than ONE idea riding the same underlying\'s upcoming',
+  '9. DE-DUPE earnings events: never return more than ONE idea riding the same underlying\'s upcoming',
   '   earnings. Pick the single best structure for that event and drop the rest.',
   'A diversification re-rank is applied deterministically after you answer, so a clustered slate',
   'will be thinned — give a spread of your strongest distinct ideas, ranked best-first.',
@@ -476,6 +526,14 @@ function buildUserPrompt(
       ivRank: s.ivRank,
       nextEarningsInDays: s.nextEarningsInDays,
       daysToFOMC: s.daysToFOMC,
+      // TRA-1974 — advisory event-IV "sell-the-crush" flag (rule 6). True when a
+      // catalyst sits inside at least one candidate expiry AND ivRank >= 50, so
+      // the model needn't redo the DTE arithmetic. The deterministic post-answer
+      // drop enforces it per-idea regardless of what the model does with this.
+      sellTheCrush: sellTheCrushActive(
+        s,
+        s.candidates.reduce((m, c) => Math.max(m, c.daysToExpiration), 0),
+      ),
       macroEventsNearby: s.macroEventsNearby,
       newsSentiment: s.newsSentiment,
       candidates: s.candidates.map((c) => ({
@@ -595,6 +653,7 @@ function enforceGuardrail(
 
   for (const r of raw) {
     const ticker = r.ticker.trim().toUpperCase();
+    const sym = symByTicker.get(ticker);
     const reasons: string[] = [];
     if (!universe.has(ticker)) reasons.push(`ticker ${ticker} not in universe`);
     if (guardrail.definedRiskOnly && !isDefinedRiskStrategy(r.strategy)) {
@@ -608,6 +667,24 @@ function enforceGuardrail(
     else if (guardrail.definedRiskOnly && isCoveredStrategy(r.strategy)) {
       reasons.push(`strategy "${r.strategy}" is sleeve-managed, not an LLM idea`);
     }
+    // TRA-1974 — event-IV "sell the crush": a net-long-vega debit single-leg
+    // (long_call / long_put) held across a scheduled catalyst inside its expiry,
+    // with elevated IV, gets IV-crushed post-event. Drop it deterministically so
+    // a defined-risk CREDIT structure surfaces for that name instead. This is the
+    // hard rule replacing the old LLM-badge nudge; it consumes the same
+    // ivRank + earnings/FOMC read the fusion attaches to each symbol.
+    if (LONG_VEGA_DEBIT_SINGLE_LEGS.has(r.strategy) && sellTheCrushActive(sym, r.dteDays)) {
+      const earningsInside =
+        sym!.nextEarningsInDays != null &&
+        sym!.nextEarningsInDays >= 0 &&
+        sym!.nextEarningsInDays <= r.dteDays;
+      const cat = earningsInside ? `earnings in ${sym!.nextEarningsInDays}d` : `FOMC in ${sym!.daysToFOMC}d`;
+      reasons.push(
+        `strategy "${r.strategy}" is net-long-vega debit into an elevated-IV pre-event window ` +
+          `(sell-the-crush: ${cat} inside ${r.dteDays}d DTE, ivRank ${Math.round(sym!.ivRank as number)} >= ${EVENT_IV_MIN_RANK}); ` +
+          `prefer a defined-risk credit structure`,
+      );
+    }
     if (r.dteDays < guardrail.minDteDays) {
       reasons.push(`dteDays ${r.dteDays} < minDteDays ${guardrail.minDteDays} (day-trade guardrail)`);
     }
@@ -618,7 +695,6 @@ function enforceGuardrail(
       });
       continue;
     }
-    const sym = symByTicker.get(ticker);
     const horizon = classifyHorizon(sym, r.dteDays, policy);
     kept.push({
       idea: {

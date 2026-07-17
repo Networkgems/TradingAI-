@@ -348,6 +348,7 @@ export { blackScholesPrice, blackScholesDelta, blackScholesGreeks, bsImpliedVola
 export type { BlackScholesInputs, BlackScholesGreeks, ImpliedVolInputs } from './options/black-scholes.js';
 export {
   selectStructureByIv,
+  preferCreditForEvent,
   selectExpiry,
   isThirdFriday,
   selectStrikeByDelta,
@@ -364,6 +365,7 @@ export {
 export type {
   OptionsStructure,
   IvGateParams,
+  EventProximity,
   StructureDecision,
   ExpiryParams,
   ExpiryCandidate,
