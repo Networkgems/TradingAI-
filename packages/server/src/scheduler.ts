@@ -122,6 +122,18 @@ export function missedTradingDays(
   return out;
 }
 
+/**
+ * TRA-1971 — day-of-week (0=Sun … 6=Sat) for a `YYYY-MM-DD` ET date. Parses the
+ * date-only value at UTC midnight so the result is timezone-independent (the same
+ * technique `isMarketDayIso` uses); deriving it from a host-local `Date` would be
+ * wrong for a date-only value. Used to gate the weekly roll-up to Mondays in ET.
+ */
+export function etDayOfWeekIso(dateIso: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return -1;
+  const [y, m, d] = dateIso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
 /** Returns the current hour and minute in ET. */
 function nowET(): { hour: number; minute: number; date: Date } {
   const now = new Date();
@@ -238,6 +250,20 @@ export interface ScheduleCallbacks {
    */
   onChainRecord?: EodTriggerCallback;
   /**
+   * TRA-1971 — fires once per week on MONDAY at OR AFTER 7:00 AM ET (through
+   * noon), after the prior trading week's chains + Friday settlements have
+   * accumulated on the durable disk. Publishes the AI-Options-Ideas forward-test
+   * weekly roll-up (see `runWeeklyOptionsRollup` in index.ts) to the Stocks →
+   * News tab so the live-capital-gate track record is auditable weekly without
+   * manual polling. Deduped per ET Monday date (unique per ISO week) so a
+   * Monday-morning restart can't double-publish; the at-or-after window (rather
+   * than the exact 7:00 minute) means a server asleep/redeploying at 7:00 still
+   * publishes later that morning — the same resilience the chain-recorder and
+   * archive hooks have. Not market-day gated: it publishes bookkeeping, and a
+   * Monday holiday roll-up of the just-closed week is still wanted.
+   */
+  onWeeklyRollup?: EodTriggerCallback;
+  /**
    * TRA-406 — fires on every 60s scheduler tick. Drives the observability
    * monitor (health probe, disk-space, restart-storm and trade-volume
    * checks). Unlike the other hooks it is not time-gated; the individual
@@ -308,6 +334,8 @@ export class MarketScheduler {
   private lastMorningBriefDate = '';
   /** TRA-380 — last ET date the 3:55 PM option-chain recorder hook fired. Dedupes within the day. */
   private lastChainRecordDate = '';
+  /** TRA-1971 — last ET Monday date the weekly options roll-up fired. Dedupes per ISO week. */
+  private lastWeeklyRollupDate = '';
   /** TRA-1404 — persists `lastArchiveDate` so a post-21:00 restart doesn't re-fire the archive. */
   private archiveDateStore: ArchiveDateStore | null = null;
 
@@ -397,6 +425,18 @@ export class MarketScheduler {
           this.lastChainRecordDate = todayKey;
           log.info('option-chain recorder trigger fired', { date: todayKey, etHour: hour, etMinute: minute });
           runScheduled('option-chain recorder', cfg.onChainRecord);
+        }
+      }
+
+      // TRA-1971 — weekly options-ideas roll-up. Monday 07:00–11:59 ET window,
+      // deduped per ET Monday date (unique per ISO week). The at-or-after window
+      // heals a server that was asleep across 07:00; publishing bookkeeping is
+      // not time-critical so a late-morning post is fine.
+      if (cfg.onWeeklyRollup && hour >= 7 && hour < 12 && etDayOfWeekIso(todayKey) === 1) {
+        if (this.lastWeeklyRollupDate !== todayKey) {
+          this.lastWeeklyRollupDate = todayKey;
+          log.info('weekly options roll-up trigger fired', { date: todayKey, etHour: hour });
+          runScheduled('weekly options roll-up', cfg.onWeeklyRollup);
         }
       }
 

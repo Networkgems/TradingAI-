@@ -307,6 +307,7 @@ import {
   forwardTestIdeas,
   buildForwardTestReport,
   buildAccumulationMonitor,
+  renderWeeklyRollupMarkdown,
   defaultChainsDir,
 } from './options-forward-test.js';
 import { evaluateLiveCapitalGate, resolveLiveCapitalGateCriteria } from './live-capital-gate.js';
@@ -2681,6 +2682,55 @@ async function backfillChainEnrichment(): Promise<void> {
 }
 // Fire-and-forget at boot — never blocks startup; the IV store was warmed above.
 void backfillChainEnrichment();
+
+// TRA-1971 (TRA-1965, item 5) — publish the AI-Options-Ideas weekly forward-test
+// roll-up. Reads the SAME report + gate the `/api/options/forward-test/report` and
+// `/api/health/live-capital-gate` probes expose, renders a News-tab markdown
+// summary, and upserts it to the research store IN-PROCESS (no admin-token HTTP
+// hop — the exact creds gap that kept the old routine from posting). Idempotent
+// per week via the `weekly_review-options-ideas-<asOfDate>` id; the scheduler
+// fires this once per ET Monday. Read-only: wires no capital.
+async function runWeeklyOptionsRollup(): Promise<void> {
+  const [entries, days] = await Promise.all([
+    listJournalEntries(),
+    loadChainDays(CHAIN_RECORD_OUT_DIR),
+  ]);
+  const outcomes = await forwardTestIdeas(entries);
+  const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
+  const gateCriteria = resolveLiveCapitalGateCriteria();
+  const gate = evaluateLiveCapitalGate(report, gateCriteria);
+  const monitor = buildAccumulationMonitor({
+    report,
+    gate: gateCriteria,
+    chainOutDir: CHAIN_RECORD_OUT_DIR,
+    chainDates: days.map((d) => d.date),
+    journalCount: entries.length,
+    firstJournaledDate: entries[0]?.surfacedDate ?? null,
+    lastJournaledDate: entries.length ? entries[entries.length - 1].surfacedDate : null,
+    tradierConfigured: Boolean(process.env['TRADIER_API_TOKEN']),
+    anthropicConfigured: Boolean(process.env['ANTHROPIC_API_KEY']),
+  });
+  const bodyMarkdown = renderWeeklyRollupMarkdown({
+    monitor,
+    report,
+    gatePassed: gate.passed,
+    gateSummary: gate.summary,
+  });
+  await saveResearchReport({
+    id: `weekly_review-options-ideas-${report.asOfDate}`,
+    kind: 'weekly_review',
+    title: `AI Options Ideas — Forward-Test Roll-Up (week of ${report.asOfDate})`,
+    bodyMarkdown,
+  });
+  log.info('weekly options-ideas roll-up published', {
+    asOfDate: report.asOfDate,
+    surfaced: report.totals.surfaced,
+    resolved: report.totals.resolved,
+    weeksWithResolved: report.totals.weeksWithResolved,
+    gatePassed: gate.passed,
+    clockStarted: monitor.clock.started,
+  });
+}
 
 // TRA-845 — Layer-4 alert push. Runs right after the daily chain capture so it
 // diffs the freshly-written partition against yesterday's. Chain-diff + IV-move
@@ -8775,6 +8825,17 @@ scheduler.start({
     // Isolated so a push failure can't drop the capture above (or vice-versa).
     await runOptionsAlertPush().catch((err) =>
       log.error('options-alert push failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  },
+  // TRA-1971 — Monday-morning AI-Options-Ideas weekly forward-test roll-up.
+  // Publishes the accumulation record to the News tab so the live-capital-gate
+  // track record is auditable weekly without manual polling. Isolated so a
+  // publish failure can't affect any other hook.
+  onWeeklyRollup: async () => {
+    await runWeeklyOptionsRollup().catch((err) =>
+      log.error('weekly options roll-up failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );

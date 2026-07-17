@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays } from './scheduler.js';
+import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDayOfWeekIso } from './scheduler.js';
 
 /**
  * TRA-193 — coverage for the scheduler that drives both the per-market-day
@@ -756,5 +756,70 @@ describe('missedTradingDays', () => {
     // (today 5/15 itself is always excluded), and 5/11 falls outside the cap.
     const out = missedTradingDays(['2026-04-01'], '2026-05-15', 3);
     expect(out).toEqual(['2026-05-12', '2026-05-13', '2026-05-14']);
+  });
+});
+
+// ── TRA-1971 — weekly options roll-up hook ───────────────────────────────────
+
+describe('etDayOfWeekIso', () => {
+  it('returns the day-of-week (0=Sun … 6=Sat) for a YYYY-MM-DD, TZ-independent', () => {
+    expect(etDayOfWeekIso('2026-07-12')).toBe(0); // Sunday
+    expect(etDayOfWeekIso('2026-07-13')).toBe(1); // Monday
+    expect(etDayOfWeekIso('2026-07-14')).toBe(2); // Tuesday
+    expect(etDayOfWeekIso('2026-07-17')).toBe(5); // Friday
+  });
+
+  it('returns -1 for a malformed date', () => {
+    expect(etDayOfWeekIso('not-a-date')).toBe(-1);
+  });
+});
+
+describe('MarketScheduler — TRA-1971 onWeeklyRollup hook', () => {
+  // 07:00 EDT (July, UTC-4) → 11:00 UTC → back off 60 s → 10:59 UTC.
+  const at0700EDT = (yyyy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yyyy, mm - 1, dd, 10, 59, 0));
+
+  let scheduler: MarketScheduler;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    scheduler = new MarketScheduler();
+  });
+  afterEach(() => {
+    scheduler.stop();
+    vi.useRealTimers();
+  });
+
+  it('fires once on Monday 07:00 ET', () => {
+    vi.setSystemTime(at0700EDT(2026, 7, 13)); // 2026-07-13 = Monday
+    const onWeeklyRollup = vi.fn();
+    scheduler.start({ onWeeklyRollup });
+    vi.advanceTimersByTime(60_000);
+    expect(onWeeklyRollup).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT fire on a Tuesday', () => {
+    vi.setSystemTime(at0700EDT(2026, 7, 14)); // Tuesday
+    const onWeeklyRollup = vi.fn();
+    scheduler.start({ onWeeklyRollup });
+    vi.advanceTimersByTime(60_000);
+    expect(onWeeklyRollup).not.toHaveBeenCalled();
+  });
+
+  it('dedupes to a single fire per Monday across multiple ticks', () => {
+    vi.setSystemTime(at0700EDT(2026, 7, 13)); // Monday
+    const onWeeklyRollup = vi.fn();
+    scheduler.start({ onWeeklyRollup });
+    vi.advanceTimersByTime(60_000); // 07:00 ET
+    vi.advanceTimersByTime(60_000); // 07:01 ET — still Monday-morning window
+    expect(onWeeklyRollup).toHaveBeenCalledTimes(1);
+  });
+
+  it('still fires later in the Monday morning window (07:00–11:59 ET catch-up)', () => {
+    // Server was asleep at 07:00; comes up at 09:30 ET (13:30 UTC → back off 60s).
+    vi.setSystemTime(new Date(Date.UTC(2026, 6, 13, 13, 29, 0)));
+    const onWeeklyRollup = vi.fn();
+    scheduler.start({ onWeeklyRollup });
+    vi.advanceTimersByTime(60_000); // 09:30 ET Monday
+    expect(onWeeklyRollup).toHaveBeenCalledTimes(1);
   });
 });

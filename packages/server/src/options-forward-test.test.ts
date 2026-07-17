@@ -7,6 +7,7 @@ import {
   valueIdea,
   buildForwardTestReport,
   buildAccumulationMonitor,
+  renderWeeklyRollupMarkdown,
   structureCostUsd,
   DEFAULT_COST_MODEL,
   type IdeaOutcome,
@@ -540,5 +541,88 @@ describe('buildAccumulationMonitor', () => {
     expect(m.accumulation.weeksWithResolved).toBe(10);
     expect(m.gate.weeksRemaining).toBe(0); // 8 needed, 10 have → clamped, not −2
     expect(m.gate.resolvedRemaining).toBe(0); // 30 needed, 40 have → clamped
+  });
+});
+
+describe('renderWeeklyRollupMarkdown', () => {
+  const emptyMonitor = (blockedOn: string[]) =>
+    buildAccumulationMonitor({
+      report: buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') }),
+      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30 },
+      chainOutDir: '/data/option-chains',
+      chainDates: [],
+      journalCount: 0,
+      firstJournaledDate: null,
+      lastJournaledDate: null,
+      tradierConfigured: false,
+      anthropicConfigured: false,
+    });
+
+  it('renders the not-started state with the gate HOLD verdict and blockers', () => {
+    const report = buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') });
+    const md = renderWeeklyRollupMarkdown({
+      monitor: emptyMonitor([]),
+      report,
+      gatePassed: false,
+      gateSummary: 'HOLD — insufficient track record',
+    });
+    expect(md).toContain('AI Options Ideas — Forward-Test Roll-Up');
+    expect(md).toContain('NOT started');
+    expect(md).toContain('tradier_token_unset');
+    expect(md).toContain('⛔ HOLD');
+    // Gate bars are surfaced so the reader sees the target, not just the current.
+    expect(md).toContain('| Weeks with resolved ideas | 0 | 8 | 8 |');
+    expect(md).toContain('| Resolved ideas | 0 | 30 | 30 |');
+  });
+
+  it('renders a per-week table when weeks have resolved ideas', () => {
+    const outcomes: IdeaOutcome[] = [
+      {
+        key: 'k1',
+        ticker: 'AAA',
+        strategy: 'long_call',
+        surfacedDate: '2026-01-05',
+        surfacedWeek: '2026-W02',
+        expiration: '2026-02-20',
+        pop: 0.6,
+        maxLossUsd: 300,
+        maxProfitUsd: 600,
+        entryNetUsd: -300,
+        status: 'resolved',
+        valuedAt: '2026-02-20',
+        liquidationUsd: 600,
+        pnlUsd: 300,
+        pnlR: 1.0,
+        costsUsd: 6,
+        pnlNetUsd: 294,
+        pnlNetR: 0.98,
+        win: true,
+        excluded: false,
+        excludeReason: null,
+        settleLagDays: 0,
+        maxLossBreached: false,
+      },
+    ];
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-02-23') });
+    const monitor = buildAccumulationMonitor({
+      report,
+      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30 },
+      chainOutDir: '/data/option-chains',
+      chainDates: ['2026-01-05'],
+      journalCount: 1,
+      firstJournaledDate: '2026-01-05',
+      lastJournaledDate: '2026-01-05',
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+    const md = renderWeeklyRollupMarkdown({
+      monitor,
+      report,
+      gatePassed: false,
+      gateSummary: 'HOLD — needs more weeks',
+    });
+    expect(md).toContain('STARTED');
+    expect(md).toContain('### Recent weeks');
+    expect(md).toContain('2026-W02');
   });
 });

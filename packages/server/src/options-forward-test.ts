@@ -702,3 +702,71 @@ export function buildAccumulationMonitor(input: {
     clock: { started, blockedOn },
   };
 }
+
+// ── TRA-1971 — weekly roll-up (item 5) ────────────────────────────────────────
+//
+// The parent's "publish the weekly roll-up" deliverable. A weekly scheduler hook
+// (see index.ts) renders this markdown from the forward-test report + gate verdict
+// + accumulation monitor and publishes it to the Stocks → News tab via the
+// in-process research store, so the live-capital-gate track record is auditable
+// weekly WITHOUT manual polling or an admin-token HTTP hop. Pure (no I/O) so the
+// content is unit-testable.
+
+const fmtR = (v: number | null): string => (v == null ? 'n/a' : v.toFixed(2));
+const fmtPct = (v: number | null): string => (v == null ? 'n/a' : `${Math.round(v * 100)}%`);
+
+/** Render the AI-Options-Ideas weekly forward-test roll-up as News-tab markdown. */
+export function renderWeeklyRollupMarkdown(input: {
+  monitor: AccumulationMonitor;
+  report: ForwardTestReport;
+  gatePassed: boolean;
+  gateSummary: string;
+}): string {
+  const { monitor: m, report } = input;
+  const t = report.totals;
+  const clockLine = m.clock.started
+    ? `▶ **Accumulation clock: STARTED** (first chain ${m.chains.firstRecordedDate}, first idea ${m.journal.firstJournaledDate})`
+    : `⏸ **Accumulation clock: NOT started** — blocked on: ${m.clock.blockedOn.join(', ') || 'unknown'}`;
+
+  const lines: string[] = [];
+  lines.push(`## AI Options Ideas — Forward-Test Roll-Up`);
+  lines.push('');
+  lines.push(`_As of ${report.asOfDate}. Read-only track record for the live-capital gate — wires no capital._`);
+  lines.push('');
+  lines.push(clockLine);
+  lines.push('');
+  lines.push(`**Live-capital gate:** ${input.gatePassed ? '✅ PASS' : '⛔ HOLD'} — ${input.gateSummary}`);
+  lines.push('');
+  lines.push(`### Accumulation progress`);
+  lines.push('');
+  lines.push(`| Metric | Current | Gate bar | Remaining |`);
+  lines.push(`| --- | ---: | ---: | ---: |`);
+  lines.push(`| Weeks with resolved ideas | ${t.weeksWithResolved} | ${m.gate.minWeeksWithResolved} | ${m.gate.weeksRemaining} |`);
+  lines.push(`| Resolved ideas | ${t.resolved} | ${m.gate.minResolvedIdeas} | ${m.gate.resolvedRemaining} |`);
+  lines.push(`| Surfaced (journaled) | ${t.surfaced} | — | — |`);
+  lines.push(`| Open / awaiting settle | ${t.open} | — | — |`);
+  lines.push(`| Excluded (data hygiene) | ${t.excluded} | — | — |`);
+  lines.push('');
+  lines.push(`**Cost-net expectancy (R):** ${fmtR(t.expectancyNetR)} · **Weeks positive (net):** ${t.weeksPositiveExpectancyNet}/${t.weeksWithResolved} · **Hit-rate:** ${fmtPct(t.hitRate)}`);
+  lines.push('');
+  lines.push(`### Feeds`);
+  lines.push('');
+  lines.push(`- Chain recorder (Tradier): ${m.feeds.tradierConfigured ? 'configured' : 'NOT configured'} — ${m.chains.partitionDays} partition day(s) on disk${m.chains.lastRecordedDate ? `, latest ${m.chains.lastRecordedDate}` : ''}`);
+  lines.push(`- Ideas pass (Anthropic): ${m.feeds.anthropicConfigured ? 'configured' : 'NOT configured'} — ${m.journal.ideaCount} idea(s) journaled${m.journal.lastJournaledDate ? `, latest ${m.journal.lastJournaledDate}` : ''}`);
+
+  // Most-recent weeks (up to 6), newest first, so the roll-up reads at a glance.
+  const recent = [...report.weeks].slice(-6).reverse();
+  if (recent.length > 0) {
+    lines.push('');
+    lines.push(`### Recent weeks`);
+    lines.push('');
+    lines.push(`| Week | Resolved | Hit-rate | Net R |`);
+    lines.push(`| --- | ---: | ---: | ---: |`);
+    for (const w of recent) {
+      lines.push(`| ${w.week} | ${w.resolved} | ${fmtPct(w.hitRate)} | ${fmtR(w.expectancyNetR)} |`);
+    }
+  }
+  lines.push('');
+  lines.push(`_Methodology: no look-ahead; each idea re-priced only against chains recorded on/after its surface date. Gate evaluates the cost-NET R-expectancy. A pass is permission to PROPOSE live wiring — nothing is auto-wired._`);
+  return lines.join('\n');
+}
