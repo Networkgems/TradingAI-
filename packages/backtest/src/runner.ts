@@ -468,6 +468,13 @@ export class BacktestRunner {
 
         if (finalQty > 0) {
           const opened = positions.open(signal, finalQty);
+          // Backtest positions open AT THE ENTRY BAR, not wall-clock.
+          // `PositionManager.open` stamps `openedAt: Date.now()` (correct for the
+          // live path); in a replay that value is meaningless and prevents any
+          // point-in-time, entry-time analysis of the trade ledger (TRA-1973's
+          // earnings-gate OOS split keys on it). Overwrite it with the fill bar's
+          // timestamp — deterministic, and strictly more correct for a backtest.
+          opened.openedAt = latest.timestamp;
           // TRA-420 §4: entry fills at THIS bar's open — the first price
           // obtainable after the prior bar's close-derived signal.
           entryFills.set(opened.id, applyEntryFill(signal.side, latest.open));
