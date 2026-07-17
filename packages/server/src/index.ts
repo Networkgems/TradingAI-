@@ -303,6 +303,10 @@ import {
 } from './pre-trade-liquidity-ledger.js';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI.
 import { buildExecutionQualityKpi } from './execution-quality-kpi.js';
+// TRA-1982 (parent TRA-1967 item 3) — data-driven maker-ladder recommendation.
+import { buildMakerLadderRecommendation } from './maker-ladder-recommendation.js';
+import { listMakerFillEvents } from './option-maker-fill-ledger.js';
+import { resolveMakerWalkConfig } from './option-maker-config.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
@@ -5425,6 +5429,51 @@ app.get('/api/health/execution-quality', (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to build execution-quality KPI' });
+  }
+});
+
+// TRA-1982 (parent TRA-1967 item 3) — DATA-DRIVEN maker-ladder recommendation. Folds the
+// raw maker-fill telemetry ledger (which walk step actually fills, realised-vs-mid by step,
+// time-to-fill) into a read-only recommendation for the reprice ladder (`fractions`,
+// `stepWaitMs`, `maxCrossTicks`), expressed as deltas against the currently-resolved
+// `OPTION_MAKER_*` config. RECOMMENDATION-ONLY: this route mutates nothing — the flip to
+// live config is a separate governance-gated step (TRA-1967). The per-step histogram is
+// returned so every recommended number is auditable against option-maker-fills.jsonl.
+// Defaults to the LIVE book; `?mode=demo` reads the demo cohort, `?since=<ms>` scopes a
+// post-arm window, and `?minSamples=`/`?minStepShare=` tune the gate/drop thresholds.
+app.get('/api/health/maker-ladder-recommendation', async (req, res) => {
+  try {
+    const q = req.query as Record<string, unknown>;
+    const mode = q['mode'] === 'demo' ? 'demo' : 'live';
+    const sinceRaw = typeof q['since'] === 'string' ? Number(q['since']) : Number.NaN;
+    const sinceTs = Number.isFinite(sinceRaw) ? sinceRaw : undefined;
+    const minSamplesRaw = typeof q['minSamples'] === 'string' ? Number(q['minSamples']) : Number.NaN;
+    const minStepShareRaw = typeof q['minStepShare'] === 'string' ? Number(q['minStepShare']) : Number.NaN;
+
+    const events = await listMakerFillEvents({ mode, ...(sinceTs !== undefined ? { sinceTs } : {}) });
+    const config = resolveMakerWalkConfig();
+    const recommendation = buildMakerLadderRecommendation(events, config, {
+      ...(Number.isFinite(minSamplesRaw) && minSamplesRaw > 0 ? { minSamples: Math.floor(minSamplesRaw) } : {}),
+      ...(Number.isFinite(minStepShareRaw) && minStepShareRaw >= 0 && minStepShareRaw <= 1
+        ? { minStepShare: minStepShareRaw }
+        : {}),
+    });
+    res.json({
+      issue: 'TRA-1982',
+      mode,
+      model:
+        'per-side (open/close) reprice-ladder params re-derived from measured maker-fill outcomes — '
+        + 'drop interior steps with negligible fill share (dead wait windows; opener + ask preserved), '
+        + 'stepWaitMs from p90 per-step fill latency, maxCrossTicks only where cross-tick fills were observed',
+      recommendationOnly:
+        'nothing here mutates the live ladder config; applying a recommendation is a separate governance-gated step (TRA-1967)',
+      recommendation,
+    });
+  } catch (err) {
+    log.error('maker-ladder-recommendation health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build maker-ladder recommendation' });
   }
 });
 
