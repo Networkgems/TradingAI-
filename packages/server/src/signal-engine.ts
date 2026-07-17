@@ -66,10 +66,19 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
-import { scanShortPremiumFromSnapshot, recordShortPremiumScan } from './short-premium-scanner.js';
+import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
+import {
+  DEFAULT_WHEEL_GUARDS,
+  isWheelUniverseSymbol,
+  selectWheelCsp,
+  selectWheelCoveredCall,
+  isAtOrPastExpiry,
+  planExpirySettlement,
+  planLotGuard,
+} from './wheel-router.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
@@ -7073,6 +7082,13 @@ export class SignalEngine {
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
+    // TRA-1977 — the wheel router reads this tick's fresh scans (candidates +
+    // spot) so its entry/roll passes ride the SAME warm selector chain; keyed by
+    // symbol so settlement (which iterates ALL open wheel state) can look up a
+    // spot even for a symbol whose scan produced no candidate this pass.
+    const routeWheel = isOptionWheelRoutingEnabled();
+    const wheelScans = new Map<string, { result: ShortPremiumScanResult; spot: number }>();
+
     for (const sym of symbols) {
       try {
         const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
@@ -7106,6 +7122,9 @@ export class SignalEngine {
           ivRank,
         );
         recordShortPremiumScan(result, asOf);
+        if (routeWheel && isWheelUniverseSymbol(result.symbol)) {
+          wheelScans.set(result.symbol.toUpperCase(), { result, spot: snap.spot });
+        }
 
         if (result.candidates.length > 0) {
           log.info('short-premium structures (TRA-1292)', {
@@ -7122,6 +7141,163 @@ export class SignalEngine {
         log.warn('short-premium scan eval threw', {
           symbol: sym,
           reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // TRA-1977 — drive the wheel paper cycle off this tick's scans (demo/paper
+    // only; caller already gated on `mode === 'demo'`). Guarded so a wheel bug
+    // can never break the observe-only short-premium pass above.
+    if (routeWheel) {
+      try {
+        this.runWheelCycle(wheelScans, asOf);
+      } catch (err: unknown) {
+        log.warn('wheel cycle pass threw (TRA-1977)', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * TRA-1977 — the wheel state machine driven once per short-premium pass, on the
+   * DEMO paper book, behind the `ENABLE_OPTION_WHEEL_ROUTING` sub-flag. Ties the
+   * TRA-1966/1976 primitives into a put→stock→call→flat cycle:
+   *
+   *   1. SETTLE  — every covered write at/past expiry settles via
+   *      {@link PaperOptionsAccount.settleCoveredWrite}: an ITM CSP is ASSIGNED
+   *      (→ an assigned-share lot), an OTM CSP expires worthless; an ITM covered
+   *      call is CALLED AWAY (stock→flat), an OTM one expires worthless and leaves
+   *      the shares to be re-written.
+   *   2. GUARD   — each assigned lot is checked against the TRA-1322 tail guards
+   *      ({@link planLotGuard}): a stock-stop or max-window breach liquidates the
+   *      lot at the current spot via {@link liquidateAssignedShares}.
+   *   3. WRITE   — a free assigned lot gets a fresh covered call
+   *      ({@link openCoveredCall}, floored at cost basis); an in-universe full-pass
+   *      scan with NO existing wheel state opens a new cash-secured put
+   *      ({@link openCashSecuredPut}). Both reuse the account's window / cap /
+   *      sizing / DTE gates.
+   *
+   * Every write opens `mode:'demo'` (no equity override → no Tradier mirror), so
+   * there is no live-capital path here. `spotBySymbol` is derived from
+   * {@link wheelScans}; a covered write whose symbol wasn't scanned this pass is
+   * left to settle on a later tick rather than settled against a stale mark.
+   */
+  private runWheelCycle(
+    wheelScans: Map<string, { result: ShortPremiumScanResult; spot: number }>,
+    now: number,
+  ): void {
+    const acct = this.optionsAccount;
+    const spotOf = (symbol: string): number | null => {
+      const s = wheelScans.get(symbol.toUpperCase());
+      return s && s.spot > 0 ? s.spot : null;
+    };
+
+    // ── 1. Settle covered writes at/past expiry ──────────────────────────────
+    const coveredWrites = acct
+      .getStateForMode('demo')
+      .openOptions.filter((o) => o.coveredWrite && o.expiration);
+    for (const opt of coveredWrites) {
+      if (!isAtOrPastExpiry(opt.expiration!, now)) continue;
+      const spot = spotOf(opt.symbol);
+      if (spot == null) continue; // no fresh mark — settle on a later tick
+      const outcome = planExpirySettlement(opt.coveredWrite!, opt.strike ?? 0, spot);
+      const settled = acct.settleCoveredWrite(opt.id, outcome);
+      if (settled) {
+        log.info('wheel write settled (TRA-1977)', {
+          symbol: opt.symbol,
+          write: opt.coveredWrite,
+          strike: opt.strike,
+          spot,
+          outcome: outcome.kind,
+        });
+      }
+    }
+
+    // ── 2. Tail guards on assigned lots ──────────────────────────────────────
+    for (const lot of acct.getAssignedShares('demo')) {
+      const spot = spotOf(lot.symbol);
+      if (spot == null) continue;
+      const guard = planLotGuard(
+        { costBasisPerShare: lot.costBasisPerShare, ccCount: lot.ccCount, hasOpenCoveredCall: !!lot.openCoveredCallId },
+        spot,
+        DEFAULT_WHEEL_GUARDS,
+      );
+      if (!guard) continue;
+      const removed = acct.liquidateAssignedShares(lot.id, spot, guard);
+      if (removed) {
+        log.info('wheel lot liquidated (TRA-1977)', {
+          symbol: lot.symbol,
+          reason: guard,
+          costBasisPerShare: lot.costBasisPerShare,
+          spot,
+        });
+      }
+    }
+
+    // ── 3a. Write covered calls against free assigned lots ───────────────────
+    for (const lot of acct.getAssignedShares('demo')) {
+      if (lot.openCoveredCallId) continue;
+      if (lot.ccCount >= DEFAULT_WHEEL_GUARDS.maxCcCycles) continue; // max-window; step 2 liquidates
+      const scan = wheelScans.get(lot.symbol.toUpperCase());
+      if (!scan) continue;
+      const cc = selectWheelCoveredCall(scan.result, lot.costBasisPerShare);
+      if (!cc) continue;
+      const opened = acct.openCoveredCall(
+        {
+          symbol: cc.symbol,
+          optionSymbol: cc.optionSymbol,
+          strike: cc.strike,
+          expiration: cc.expiration,
+          creditPerShare: cc.creditPerShare,
+          spot: cc.spot,
+          entryDelta: cc.entryDelta,
+          lotId: lot.id,
+          guards: { maxCcCycles: DEFAULT_WHEEL_GUARDS.maxCcCycles },
+        },
+        'demo',
+      );
+      if (opened) {
+        log.info('wheel covered call written (TRA-1977)', {
+          symbol: cc.symbol,
+          optionSymbol: cc.optionSymbol,
+          strike: cc.strike,
+          expiration: cc.expiration,
+          creditPerShare: cc.creditPerShare,
+          ccCycle: lot.ccCount + 1,
+        });
+      }
+    }
+
+    // ── 3b. Open new cash-secured puts on idle in-universe names ─────────────
+    for (const [symbol, scan] of wheelScans) {
+      // One wheel per symbol: skip if any covered write or assigned lot exists.
+      const hasWrite = acct
+        .getStateForMode('demo')
+        .openOptions.some((o) => o.coveredWrite && o.symbol.toUpperCase() === symbol);
+      const hasLot = acct.getAssignedShares('demo').some((l) => l.symbol.toUpperCase() === symbol);
+      if (hasWrite || hasLot) continue;
+      const csp = selectWheelCsp(scan.result);
+      if (!csp) continue;
+      const opened = acct.openCashSecuredPut(
+        {
+          symbol: csp.symbol,
+          optionSymbol: csp.optionSymbol,
+          strike: csp.strike,
+          expiration: csp.expiration,
+          creditPerShare: csp.creditPerShare,
+          spot: csp.spot,
+          entryDelta: csp.entryDelta,
+        },
+        'demo',
+      );
+      if (opened) {
+        log.info('wheel cash-secured put opened (TRA-1977)', {
+          symbol: csp.symbol,
+          optionSymbol: csp.optionSymbol,
+          strike: csp.strike,
+          expiration: csp.expiration,
+          creditPerShare: csp.creditPerShare,
         });
       }
     }

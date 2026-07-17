@@ -117,6 +117,37 @@ export function isOptionShortPremiumScannerEnabled(env: NodeJS.ProcessEnv = proc
 }
 
 // --------------------------------------------------------------------------
+// TRA-1977 (parent TRA-1976, rides TRA-1292's scanner) — route the short-premium
+// scanner into the WHEEL paper primitive under a SHADOW/paper sub-flag.
+//
+// TRA-1966/1976 landed the write/settle primitives end-to-end
+// (`openCashSecuredPut` → assignment → `openCoveredCall` → called-away /
+// liquidation, with the TRA-1322 guards). This sub-flag turns on a DEMO-ONLY
+// pass that feeds the SAME observe-only short-premium candidates (already gated
+// on ivRank >= 50 + VRP-positive + short-strike |Δ| 0.15–0.30) into those
+// primitives on the `WHEEL_QUALITY_UNIVERSE` names, and drives the put→stock→call
+// cycle in the tick (hold-to-expiry settlement, assignment → covered call, the
+// stock-stop / max-window liquidation guards).
+//
+// Layered ON TOP OF the scanner flag (mirrors the TRA-1203 IV-RV routing sub-flag
+// pattern): it only takes effect when `isOptionShortPremiumScannerEnabled()` is
+// ALSO true, so the observe-only ledger and the paper-routing path can never
+// diverge, and turning the scanner off kills routing too. OFF by default ⇒ the
+// short-premium pass stays exactly observe-only and prod/live paths are
+// byte-for-byte unchanged. Paper-only by construction: every write opens
+// `mode:'demo'` with no Tradier mirror — live `sell_to_open`/`buy_to_close`
+// routing stays gate-sequenced behind TRA-1965 + real-chain gates TRA-1143, no
+// live capital until cleared.
+// --------------------------------------------------------------------------
+
+export const OPTION_WHEEL_ROUTING_FLAG = 'ENABLE_OPTION_WHEEL_ROUTING';
+
+/** True iff the short-premium scanner flag AND the wheel demo-routing sub-flag are both on. */
+export function isOptionWheelRoutingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isOptionShortPremiumScannerEnabled(env) && flagOn(env[OPTION_WHEEL_ROUTING_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1203 (board: "try mispriced options for the rest of the week instead of
 // relative value") — turn the TRA-1156 OBSERVE-ONLY IV-vs-RV scan into an
 // EXECUTING demo paper-routing path.

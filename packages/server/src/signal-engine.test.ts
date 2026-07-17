@@ -84,10 +84,13 @@ import {
   OPTION_LIVE_DIRECTIONAL_FLAG,
   OPTION_IV_RV_SCANNER_FLAG,
   OPTION_IV_RV_ROUTING_FLAG,
+  OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+  OPTION_WHEEL_ROUTING_FLAG,
   OPTION_LIVE_RV_LONG_FLAG,
   OPTION_LIVE_OTM_FLAG,
   OPTION_LIVE_TEST_UNTIL_VAR,
 } from './option-exec-flag.js';
+import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
 import {
   clearLiveOptionsFeeSlippageLedger,
   summarizeLiveOptionsFeeSlippage,
@@ -6189,5 +6192,118 @@ describe('SignalEngine — TRA-1929 live OTM bounded-test buy-to-open mirror', (
     expect(rec.askAtSubmit).toBe(0.82);
     expect(rec.slippageVsAsk).toBeCloseTo(0, 6); // filled exactly at the ask
     expect(rec.fees).toBeNull();                 // unmeasured at fill time (never 0)
+  });
+});
+
+// TRA-1977 — wheel paper routing. The TRA-1292 short-premium scan is observe-only
+// by default; this proves the `ENABLE_OPTION_WHEEL_ROUTING` sub-flag turns the
+// best in-universe put-credit-spread's short-put leg into a REAL cash-secured put
+// on the demo book (single-leg, no live capital), and that the pass stays wholly
+// observe-only when the sub-flag is off.
+describe('SignalEngine — wheel paper routing (TRA-1977)', () => {
+  const EXP = '2024-07-19'; // ~45 DTE from TRADING_TIME → clears the 21 DTE C3 gate
+  const SPOT = 100;
+  const T = dteForWheel(EXP, TRADING_TIME) / 365;
+  // Near-flat closes → tiny realised vol, so the 0.45-IV chain is strongly
+  // VRP-positive and put-credit-spreads assemble.
+  const CALM_CLOSES = Array.from({ length: 25 }, (_, i) => 100 + (i % 2 === 0 ? 0.1 : -0.1));
+
+  function wheelRow(underlying: string, strike: number, optionType: 'call' | 'put', iv = 0.45) {
+    const mark = bsPriceForWheel({ spot: SPOT, strike, timeToExpiryYears: T, riskFreeRate: 0.045, volatility: iv, optionType });
+    const half = Math.max(mark * 0.02, 0.01);
+    return {
+      optionSymbol: `${underlying}${strike}${optionType[0]!.toUpperCase()}`,
+      underlying, optionType, strike, expiration: EXP,
+      bid: mark - half, ask: mark + half, last: mark,
+      volume: 500, openInterest: 2000, smvVol: iv, midIv: iv,
+    };
+  }
+  function wheelChain(underlying: string) {
+    const strikes = [82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118];
+    return strikes.flatMap((k) => [wheelRow(underlying, k, 'put'), wheelRow(underlying, k, 'call')]);
+  }
+  function scannerFor(snaps: Record<string, SelectorChainSnapshot>): RelativeValueScannerService {
+    return {
+      scan: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'ok' as const })),
+      scanOtm: vi.fn(async () => ({ symbol: '', spot: null, expiration: null, candidates: [], reason: 'unavailable' as const })),
+      getSelectorChain: vi.fn(async (sym: string) => snaps[sym] ?? null),
+      getOptionMark: vi.fn(async () => null),
+      diagnostics: vi.fn(() => ({ configured: true, breakerOpen: false, breakerOpenedAtMs: null, cacheSize: 0, expirationsCacheSize: 0, chainCacheMaxEntries: 64, expirationsCacheMaxEntries: 64 })),
+    };
+  }
+  function runShortPremium(engine: SignalEngine, syms: string[]): Promise<void> {
+    return (engine as unknown as { evaluateShortPremiumScan: (s: string[]) => Promise<void> }).evaluateShortPremiumScan(syms);
+  }
+  function seedCloses(engine: SignalEngine, sym: string, closes: number[]): void {
+    (engine as unknown as { dailyCloseCache: Map<string, number[]> }).dailyCloseCache.set(sym, closes);
+  }
+  function demoCoveredWrites(engine: SignalEngine, sym: string) {
+    const acct = (engine as unknown as { optionsAccount: { getStateForMode: (m: 'demo' | 'live') => { openOptions: Array<{ symbol: string; coveredWrite?: string; optionType?: string; strike?: number }> } } }).optionsAccount;
+    return acct.getStateForMode('demo').openOptions.filter((o) => o.coveredWrite && o.symbol === sym);
+  }
+
+  let ivFile: string;
+  let m = 0;
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(TRADING_TIME);
+    ivFile = join(tmpdir(), `wheel-iv-${process.pid}-${m++}.json`);
+    setIvStoreFileForTests(ivFile);
+    await initIvRankStore();
+    // Warm the trailing-year IV store so AAPL's ~0.45 ATM IV ranks well above the
+    // 50 elevated-IV floor (the full-pass routing gate). 30 ascending samples.
+    for (let i = 1; i <= 30; i++) {
+      await recordDailyIv('AAPL', 0.05 + (0.40 * (30 - i)) / 29, TRADING_TIME - i * 86_400_000);
+    }
+    delete process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG];
+    delete process.env[OPTION_WHEEL_ROUTING_FLAG];
+  });
+  afterEach(() => {
+    setIvStoreFileForTests(null);
+    delete process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG];
+    delete process.env[OPTION_WHEEL_ROUTING_FLAG];
+    try { rmSync(ivFile); } catch { /* ignore */ }
+    vi.useRealTimers();
+  });
+
+  it('both flags on — opens a cash-secured put on the demo book for an in-universe name', async () => {
+    process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG] = '1';
+    process.env[OPTION_WHEEL_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ AAPL: { symbol: 'AAPL', spot: SPOT, expiration: EXP, rows: wheelChain('AAPL') } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedCloses(engine, 'AAPL', CALM_CLOSES);
+
+    await runShortPremium(engine, ['AAPL']);
+
+    const writes = demoCoveredWrites(engine, 'AAPL');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.coveredWrite).toBe('cash_secured_put');
+    expect(writes[0]!.optionType).toBe('put');
+    expect(writes[0]!.strike).toBeLessThan(SPOT); // OTM short put
+  });
+
+  it('scanner on but wheel sub-flag off — stays observe-only, routes nothing', async () => {
+    process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG] = '1';
+    // wheel routing flag left OFF
+    const svc = scannerFor({ AAPL: { symbol: 'AAPL', spot: SPOT, expiration: EXP, rows: wheelChain('AAPL') } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedCloses(engine, 'AAPL', CALM_CLOSES);
+
+    await runShortPremium(engine, ['AAPL']);
+
+    expect(demoCoveredWrites(engine, 'AAPL')).toHaveLength(0);
+  });
+
+  it('does not route an off-universe name even with both flags on', async () => {
+    process.env[OPTION_SHORT_PREMIUM_SCANNER_FLAG] = '1';
+    process.env[OPTION_WHEEL_ROUTING_FLAG] = '1';
+    const svc = scannerFor({ GME: { symbol: 'GME', spot: SPOT, expiration: EXP, rows: wheelChain('GME') } });
+    const engine = new SignalEngine(undefined, undefined, svc);
+    seedCloses(engine, 'GME', CALM_CLOSES);
+    await recordDailyIv('GME', 0.45, TRADING_TIME - 86_400_000);
+
+    await runShortPremium(engine, ['GME']);
+
+    expect(demoCoveredWrites(engine, 'GME')).toHaveLength(0);
   });
 });

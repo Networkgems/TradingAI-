@@ -8,6 +8,10 @@ import {
   resolveRvMinDailyVolume,
   isOptionIvRvScannerEnabled,
   isOptionIvRvRoutingEnabled,
+  isOptionShortPremiumScannerEnabled,
+  isOptionWheelRoutingEnabled,
+  OPTION_SHORT_PREMIUM_SCANNER_FLAG,
+  OPTION_WHEEL_ROUTING_FLAG,
   resolveIvRvRoutingOverride,
   isOptionLiveRvLongEnabled,
   isOptionLiveOtmEnabled,
@@ -213,6 +217,23 @@ describe('isOptionIvRvRoutingEnabled (TRA-1203)', () => {
 
   it('does not flip the observe-only scanner flag', () => {
     expect(isOptionIvRvScannerEnabled({ [OPTION_IV_RV_ROUTING_FLAG]: ON })).toBe(false);
+  });
+});
+
+describe('isOptionWheelRoutingEnabled (TRA-1977)', () => {
+  it('requires the short-premium scanner flag too — inert on its own', () => {
+    // wheel sub-flag alone does nothing without the scanner flag
+    expect(isOptionWheelRoutingEnabled({ [OPTION_WHEEL_ROUTING_FLAG]: ON })).toBe(false);
+    // scanner on but wheel off -> still observe-only
+    expect(isOptionWheelRoutingEnabled({ [OPTION_SHORT_PREMIUM_SCANNER_FLAG]: ON })).toBe(false);
+    // both on -> wheel paper routing live
+    expect(
+      isOptionWheelRoutingEnabled({ [OPTION_SHORT_PREMIUM_SCANNER_FLAG]: ON, [OPTION_WHEEL_ROUTING_FLAG]: ON }),
+    ).toBe(true);
+  });
+
+  it('does not flip the observe-only short-premium scanner flag', () => {
+    expect(isOptionShortPremiumScannerEnabled({ [OPTION_WHEEL_ROUTING_FLAG]: ON })).toBe(false);
   });
 });
 
