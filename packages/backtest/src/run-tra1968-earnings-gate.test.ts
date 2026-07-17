@@ -4,6 +4,12 @@ import {
   earningsInDaysAsOf,
   gatedAtEntry,
   splitByGate,
+  toGatedRecords,
+  armAtThreshold,
+  percentile,
+  worstDecileMean,
+  stopHitRate,
+  summarizeArm,
   SWING_MAX_DAYS,
 } from './run-tra1968-earnings-gate.js';
 import type { EarningsEvent } from '@trading-app/engine';
@@ -68,5 +74,77 @@ describe('TRA-1973 earnings-gate OOS harness — point-in-time helpers', () => {
     const arm = splitByGate('MSFT', trades, [-1.2], idx);
     expect(arm.gatedRs).toEqual([-1.2]);
     expect(arm.removedRs).toEqual([]);
+  });
+});
+
+describe('TRA-1973 earnings-gate OOS harness — threshold sweep + tail stats', () => {
+  it('toGatedRecords tags each entry with point-in-time days-to-earnings', () => {
+    const idx = buildEarningsIndex([ev('AAPL', '2024-01-15')]);
+    const recs = toGatedRecords(
+      'AAPL',
+      [
+        { openedAt: D(2024, 1, 10), pnl: -100 }, // 5d before
+        { openedAt: D(2023, 12, 1), pnl: 50 }, // 45d before
+      ],
+      [-1.2, 0.5],
+      idx,
+    );
+    expect(recs.map((r) => r.eDays)).toEqual([5, 45]);
+    expect(recs.map((r) => r.r)).toEqual([-1.2, 0.5]);
+  });
+
+  it('armAtThreshold re-splits the same records at any threshold (free sweep)', () => {
+    // eDays 5 / 8 / 12 / null → the threshold moves what is suppressed.
+    const recs = [
+      { eDays: 5, r: -1.2, pnl: -120 },
+      { eDays: 8, r: -0.4, pnl: -40 },
+      { eDays: 12, r: 0.9, pnl: 90 },
+      { eDays: null, r: 0.3, pnl: 30 },
+    ];
+    // ≤7d → only the 5d entry is removed.
+    const t7 = armAtThreshold(recs, 7);
+    expect(t7.removedRs).toEqual([-1.2]);
+    expect(t7.gatedRs).toEqual([-0.4, 0.9, 0.3]);
+    // ≤10d → 5d and 8d removed; 12d and null kept.
+    const t10 = armAtThreshold(recs, 10);
+    expect(t10.removedRs).toEqual([-1.2, -0.4]);
+    expect(t10.gatedRs).toEqual([0.9, 0.3]);
+    // ≤14d → 5/8/12 removed; the uncovered (null) entry is NEVER gated.
+    const t14 = armAtThreshold(recs, 14);
+    expect(t14.removedRs).toEqual([-1.2, -0.4, 0.9]);
+    expect(t14.gatedRs).toEqual([0.3]);
+  });
+
+  it('percentile interpolates linearly on the ascending series', () => {
+    expect(percentile([], 0.1)).toBe(0);
+    expect(percentile([2], 0.1)).toBe(2);
+    // p10 of 0..10 (11 points) → idx 0.1*10 = 1.0 → the value 1.
+    expect(percentile([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.1)).toBeCloseTo(1, 10);
+    // p50 → the median 5.
+    expect(percentile([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.5)).toBeCloseTo(5, 10);
+  });
+
+  it('worstDecileMean averages the bottom 10% (at least one sample)', () => {
+    expect(worstDecileMean([])).toBe(0);
+    // 20 values 1..20 → bottom decile is {1,2} → mean 1.5.
+    const xs = Array.from({ length: 20 }, (_, i) => i + 1);
+    expect(worstDecileMean(xs)).toBeCloseTo(1.5, 10);
+    // Fewer than 10 → still takes at least one (the min).
+    expect(worstDecileMean([3, -2, 5])).toBe(-2);
+  });
+
+  it('stopHitRate is the fraction of full-risk (R ≤ −1) losses', () => {
+    expect(stopHitRate([])).toBe(0);
+    expect(stopHitRate([-1, -1.5, -0.5, 0.8])).toBeCloseTo(0.5, 10);
+  });
+
+  it('summarizeArm surfaces the left-tail fields the D2 grade keys on', () => {
+    const rs = [-2, -1, -0.5, 0.5, 1, 2];
+    const s = summarizeArm(rs, rs.map((r) => r * 100));
+    expect(s.worstR).toBe(-2);
+    expect(s.tailLosses).toBe(2); // -2 and -1
+    expect(s.stopHitRate).toBeCloseTo(2 / 6, 3); // rounded to 4dp in summarizeArm
+    expect(s.p10R).toBeLessThan(0); // left tail is negative
+    expect(s.worstDecileMeanR).toBe(-2); // bottom decile of 6 → 1 sample → min
   });
 });
