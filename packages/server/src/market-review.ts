@@ -47,9 +47,16 @@ import {
   buildSessionLeanInputs,
   assembleNameLeans,
   strongestLeaders,
-  renderLeanMarkdown,
+  type NameLean,
 } from './news-catalyst-lean.js';
 import { recordCatalystLean } from './news-catalyst-lean-ledger.js';
+import { readAnalystPlan } from './analyst-agent.js';
+import {
+  renderWatchlistLevelsSection,
+  renderSentimentTapeSection,
+  renderCallPutLeanSection,
+  loadLatestSentimentSnapshot,
+} from './market-review-enrichment.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'market-review' });
@@ -677,19 +684,20 @@ export async function generateMarketReview(
     },
   };
 
-  // TRA-1629 (TRA-1623A) — D2 calls-vs-puts per-name lean. Flag-gated (default
-  // OFF): when off this whole block is skipped and the review is byte-identical
-  // to the pre-TRA-1629 index-only output. OBSERVE-ONLY — the lean annotates the
-  // report body + seeds `reviewBlock.leaders`; it routes no order, sizes nothing,
-  // touches no exit. Never throws: a lean-build failure degrades to no section.
-  let leanMarkdown = '';
-  if (isNewsCatalystEnabled()) {
+  // TRA-1629 (TRA-1623A) — D2 calls-vs-puts per-name lean. The live-compute +
+  // persistence path stays flag-gated (default OFF): the discovery cohort and the
+  // per-name-day lean ledger only exist when `ENABLE_NEWS_CATALYST_WATCHLIST` is
+  // on. OBSERVE-ONLY — the lean seeds `reviewBlock.leaders` and annotates the
+  // report; it routes no order, sizes nothing, touches no exit. Never throws: a
+  // lean-build failure degrades to an empty cohort (→ a health line via TRA-1970).
+  const discoveryEnabled = isNewsCatalystEnabled();
+  let leans: NameLean[] = [];
+  if (discoveryEnabled) {
     try {
       const leanInputs = await buildSessionLeanInputs(gates.trendState ?? 'unknown', now.getTime());
-      const leans = assembleNameLeans(leanInputs);
+      leans = assembleNameLeans(leanInputs);
       if (leans.length > 0 && review.reviewBlock) {
         review.reviewBlock.leaders = strongestLeaders(leans);
-        leanMarkdown = `\n\n${renderLeanMarkdown(leans)}`;
       }
       // TRA-1632 — persist the resolved lean per name-day so QuantTrader can join
       // it against realized next-day/3-day underlying direction offline (TRA-1630).
@@ -707,7 +715,31 @@ export async function generateMarketReview(
         reviewId: review.id,
         reason: err instanceof Error ? err.message : String(err),
       });
+      leans = [];
     }
+  }
+
+  // TRA-1970 — pre/post-market report enrichment (render-only). The engine
+  // already computes a next-day watchlist + per-name S/R + a sentiment tape, but
+  // only the regime slice above was ever printed. These three sections close that
+  // render gap: ADDITIVE, READ-ONLY, from PERSISTED artifacts (no network, no
+  // engine, no execution). Each degrades to a VISIBLE health flag when its source
+  // is cold/blocked/absent (the TRA-1963 board ask). Never throws.
+  let enrichmentMarkdown = '';
+  try {
+    const [plan, sentiment] = await Promise.all([
+      readAnalystPlan(date).catch(() => null),
+      loadLatestSentimentSnapshot(now.getTime()).catch(() => null),
+    ]);
+    enrichmentMarkdown =
+      `\n\n${renderWatchlistLevelsSection(plan)}` +
+      `\n\n${renderSentimentTapeSection(sentiment, date)}` +
+      `\n\n${renderCallPutLeanSection(leans, { discoveryEnabled })}`;
+  } catch (err) {
+    log.error('report enrichment render failed', {
+      reviewId: review.id,
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 
   // Persist the structured review (upsert by id).
@@ -729,7 +761,7 @@ export async function generateMarketReview(
       id: `${kind}-${date}`,
       kind,
       title: `${kindLabel} Review — ${date} (auto)`,
-      bodyMarkdown: renderMarkdown(review) + leanMarkdown,
+      bodyMarkdown: renderMarkdown(review) + enrichmentMarkdown,
       publishedAt: review.generatedAt,
       tickers: [SPX_SYMBOL, VIX_SYMBOL, TNX_SYMBOL],
     });
