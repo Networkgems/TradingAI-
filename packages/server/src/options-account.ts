@@ -96,6 +96,44 @@ export interface OptionTradeJournalSetup {
 const MS_PER_DAY = 86_400_000;
 
 /**
+ * TRA-1976 — a lot of equity shares the paper book took on when a cash-secured
+ * put ({@link PaperOptionsAccount.openCashSecuredPut}) was ASSIGNED. This is the
+ * equity inventory the TRA-1966 primitive deliberately deferred: an assigned CSP
+ * converts its reserved cash collateral into `100 × contracts` long shares, which
+ * a covered call ({@link PaperOptionsAccount.openCoveredCall}) is then written
+ * against — the wheel's put→stock→call→flat cycle, ported from the board-approved
+ * guarded state machine in `packages/backtest/src/wheel-recovery.ts` (TRA-1322,
+ * confirmation 996bbfb2).
+ *
+ * The shares are carried at the assignment strike (`assignmentStrike` — what we
+ * paid); stock P&L is measured against that on called-away / liquidation. The
+ * `costBasisPerShare` (strike − put-credit/share) is the effective basis the wheel
+ * guards floor against — the covered-call strike is kept at/above it so the call
+ * leg can never lock a realized loss (TRA-1322 guard #1). Like the backtest wheel,
+ * the shares are held at cost (not marked per tick) until the cycle closes; the
+ * realized delta books at called-away / stop / window-liquidation.
+ */
+export interface AssignedShareLot {
+  /** Lot id (distinct from the source CSP's position id). */
+  id: string;
+  symbol: string;
+  /** Shares held (100 × the assigned CSP's contract count). */
+  shares: number;
+  /** Strike the put was assigned at = price paid per share (stock P&L basis). */
+  assignmentStrike: number;
+  /** Effective cost basis per share (strike − put credit/share) — guard floor. */
+  costBasisPerShare: number;
+  mode: AccountMode;
+  assignedAt: number;
+  /** Position id of the cash-secured put this lot was assigned from. */
+  sourceCspId: string;
+  /** Covered-call cycles opened against this lot so far (TRA-1322 guard #3). */
+  ccCount: number;
+  /** Position id of the currently-open covered call against this lot, if any. */
+  openCoveredCallId?: string;
+}
+
+/**
  * TRA-991 — canonicalise a defined-risk strategy id to the journal's structure
  * vocabulary (bull_put / bear_call / iron_condor / debit_spread). Unknown ids
  * fall through lower-cased so a new structure still buckets under a stable key.
@@ -407,6 +445,14 @@ export class PaperOptionsAccount {
   private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
+  /**
+   * TRA-1976 — equity shares taken on when a cash-secured put is assigned, keyed
+   * by lot id. This is the equity inventory the TRA-1966 primitive deferred; it
+   * lets {@link settleCoveredWrite}'s `assigned` branch convert a short put into
+   * long stock and {@link openCoveredCall} write a call against it (the wheel's
+   * put→stock→call cycle). Empty until the first assignment.
+   */
+  private assignedShares: Map<string, AssignedShareLot> = new Map();
   /**
    * TRA-1117 — the reason the most recent user-initiated open path bailed,
    * recorded so the `…/paper-enter` endpoint can surface a SPECIFIC 409 reason
@@ -734,6 +780,8 @@ export class PaperOptionsAccount {
     this.cash = this.initialEquity;
     this.openOptions.clear();
     this.closedOptions = [];
+    // TRA-1976 — drop any assigned-share inventory on a book reset.
+    this.assignedShares.clear();
     this.optionsPnlByMode = { demo: 0, live: 0 };
     // TRA-475 — rebase the daily baseline on reset so the next "Daily Opts P&L"
     // sample starts at 0 (matches realized buckets that just zeroed).
@@ -2074,22 +2122,28 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-1966 — settle a covered write ({@link openCashSecuredPut}) at roll /
-   * take-profit / expiry. Releases the reserved collateral back to paper cash
-   * and books the short-leg P&L (inverted from a long close — profit is the
-   * credit kept minus any buy-back debit):
+   * TRA-1966 / TRA-1976 — settle a covered write ({@link openCashSecuredPut} or
+   * {@link openCoveredCall}) at roll / take-profit / expiry / assignment. Books
+   * the short-leg P&L (inverted from a long close — profit is the credit kept
+   * minus any buy-back debit):
    *   • `expired_worthless` — the short expired OTM; keep the full credit.
    *   • `bought_back` — rolled or taken to profit by buying the short back for
    *     `debitPerShare`; P&L = credit − debit.
+   *   • `assigned` — the short was exercised against us. For a cash-secured PUT
+   *     this is the wheel's put→stock transition: the reserved collateral becomes
+   *     `100 × contracts` long shares (see {@link assignCashSecuredPut}). For a
+   *     covered CALL it is "called away": the backing shares are sold at the call
+   *     strike (see {@link settleCalledAway}). TRA-1966 deferred both; TRA-1976
+   *     wires the equity inventory that receives / releases the shares.
    *
-   * Assignment (put → long 100 shares at strike, then sell a covered call) is
-   * intentionally NOT handled here: it converts reserved cash into an equity
-   * position, which needs the paper equity inventory. That state-machine step
-   * is the follow-up (see the wheel child issue) — passing `assigned` returns
-   * `null` so nothing books phantom cash off a half-modelled assignment.
+   * The reserved collateral is released to paper cash ONLY for a cash-secured put
+   * — a covered call's collateral is the assigned SHARES (still held in
+   * inventory), not free cash, so its settlement releases only the realized leg
+   * P&L and leaves the shares in place to be re-written against.
    *
    * Returns `null` for an unknown id, a non-covered-write position, an imported
-   * Tradier position (separate cash bucket), or an unsupported outcome.
+   * Tradier position (separate cash bucket), or — for `assigned` — a covered call
+   * whose backing lot can't be resolved.
    */
   settleCoveredWrite(
     optionId: string,
@@ -2101,10 +2155,16 @@ export class PaperOptionsAccount {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.coveredWrite) return null;
     if (opt.importedFromTradier) return null;
-    if (outcome.kind === 'assigned') return null; // follow-up: needs equity inventory
+
+    // TRA-1976 — assignment converts reserved cash into equity (CSP) or releases
+    // it as a stock sale (called-away CC); both need the equity inventory.
+    if (outcome.kind === 'assigned') {
+      return opt.coveredWrite === 'cash_secured_put'
+        ? this.assignCashSecuredPut(opt)
+        : this.settleCalledAway(opt);
+    }
 
     const contracts = opt.contractsRemaining;
-    const collateral = opt.collateralUsd ?? 0;
     const credit = opt.creditUsd ?? 0;
 
     let pnl: number;
@@ -2118,8 +2178,20 @@ export class PaperOptionsAccount {
       closeMark = 0;
     }
 
-    // Release the reserved collateral, then apply the realized leg P&L.
-    this.cash += collateral + pnl;
+    if (opt.coveredWrite === 'cash_secured_put') {
+      // Cash-secured: the reserved collateral is free cash — release it with the
+      // realized leg P&L.
+      const collateral = opt.collateralUsd ?? 0;
+      this.cash += collateral + pnl;
+    } else {
+      // TRA-1976 — covered call: the collateral is the assigned SHARES, which stay
+      // in inventory to be re-written against (roll / expire-OTM-and-resell), so
+      // only the realized leg P&L is released to cash. Free the lot's open-CC slot
+      // so the next covered call can be written.
+      this.cash += pnl;
+      const lot = this.lotForCoveredCall(opt.id);
+      if (lot) lot.openCoveredCallId = undefined;
+    }
     this.equity += pnl;
     opt.pnl = (opt.pnl ?? 0) + pnl;
     opt.currentPremium = closeMark;
@@ -2130,6 +2202,308 @@ export class PaperOptionsAccount {
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     return { ...opt };
+  }
+
+  /** TRA-1976 — the assigned-share lot a covered call is written against, if any. */
+  private lotForCoveredCall(coveredCallId: string): AssignedShareLot | undefined {
+    for (const lot of this.assignedShares.values()) {
+      if (lot.openCoveredCallId === coveredCallId) return lot;
+    }
+    return undefined;
+  }
+
+  /**
+   * TRA-1976 — the wheel's put→stock transition. An assigned cash-secured put
+   * converts its reserved cash collateral into `100 × contracts` long shares at
+   * the strike; the put credit is kept as realized P&L (it lowers the effective
+   * cost basis). Ports the backtest assignment leg (`wheel-recovery.ts` L241-256:
+   * keep credit, `basis = K − credit`, `shares = 100`, phase → stock).
+   *
+   * Cash accounting: the collateral (`strike × 100 × contracts`) was debited from
+   * free cash at CSP open and is NOT refunded — it is now the cost of the shares,
+   * carried in inventory. The credit returns to free cash as a realized gain.
+   */
+  private assignCashSecuredPut(opt: OptionPosition): OptionPosition {
+    const contracts = opt.contractsRemaining;
+    const credit = opt.creditUsd ?? 0;
+    const strike = opt.strike ?? 0;
+    const shares = 100 * contracts;
+    const creditPerShare = shares > 0 ? credit / shares : 0;
+    const mode = opt.mode ?? 'demo';
+
+    // Keep the put credit as a realized gain; it returns to free cash.
+    this.cash += credit;
+    this.equity += credit;
+    this.optionsPnlByMode[mode] += credit;
+
+    // The reserved collateral becomes the assigned shares (held at cost = strike);
+    // the effective basis nets out the credit for the guard floors.
+    const lot: AssignedShareLot = {
+      id: randomUUID(),
+      symbol: opt.symbol,
+      shares,
+      assignmentStrike: strike,
+      costBasisPerShare: r2(Math.max(0, strike - creditPerShare)),
+      mode,
+      assignedAt: Date.now(),
+      sourceCspId: opt.id,
+      ccCount: 0,
+    };
+    this.assignedShares.set(lot.id, lot);
+
+    // Close the short-put record (credit realized; the stock leg lives in the lot).
+    opt.pnl = (opt.pnl ?? 0) + credit;
+    opt.currentPremium = 0;
+    opt.closedAt = Date.now();
+    opt.contractsRemaining = 0;
+    this.openOptions.delete(opt.id);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
+  /**
+   * TRA-1976 — the wheel's stock→flat (called-away) transition. A covered call
+   * that finished ITM sells the backing shares at the CALL strike: proceeds return
+   * to free cash, the stock P&L books against the assignment strike, and the call
+   * credit is kept (ports `wheel-recovery.ts` L285-291). The lot is removed once
+   * the shares are sold. Returns `null` if the backing lot can't be resolved.
+   */
+  private settleCalledAway(opt: OptionPosition): OptionPosition | null {
+    const lot = this.lotForCoveredCall(opt.id);
+    if (!lot) return null;
+    const contracts = opt.contractsRemaining;
+    const ccCredit = opt.creditUsd ?? 0;
+    const ccStrike = opt.strike ?? 0;
+    const mode = opt.mode ?? 'demo';
+
+    // Shares sold at the call strike: full proceeds to free cash, stock P&L vs the
+    // assignment strike, call credit kept.
+    const proceeds = ccStrike * 100 * contracts;
+    const stockPnl = (ccStrike - lot.assignmentStrike) * 100 * contracts;
+    this.cash += proceeds + ccCredit;
+    this.equity += stockPnl + ccCredit;
+    const realized = r2(stockPnl + ccCredit);
+    this.optionsPnlByMode[mode] += realized;
+
+    // The shares are gone — drop the lot and close the call record.
+    this.assignedShares.delete(lot.id);
+    opt.pnl = (opt.pnl ?? 0) + realized;
+    opt.currentPremium = 0;
+    opt.closedAt = Date.now();
+    opt.contractsRemaining = 0;
+    this.openOptions.delete(opt.id);
+    this.closedOptions.push({ ...opt });
+    return { ...opt };
+  }
+
+  /**
+   * TRA-1976 — read the current assigned-share inventory (optionally scoped by
+   * mode). Exposed for the dashboard / forward-test and for tests. Returns copies
+   * so callers can't mutate the book's inventory.
+   */
+  getAssignedShares(mode?: AccountMode): AssignedShareLot[] {
+    const lots = Array.from(this.assignedShares.values());
+    const scoped = mode ? lots.filter((l) => l.mode === mode) : lots;
+    return scoped.map((l) => ({ ...l }));
+  }
+
+  /**
+   * TRA-1976 — write a COVERED CALL against an assigned-share lot (the wheel's
+   * stock→call leg). Ports the board-approved guarded mechanics from
+   * `packages/backtest/src/wheel-recovery.ts` (TRA-1322, confirmation 996bbfb2):
+   *
+   *   • GUARD #1 (call floored at cost basis) — the strike must be at/above the
+   *     lot's `costBasisPerShare`, so a covered call can never lock a realized loss
+   *     on the stock leg (`pickStrike(..., floor)` in the backtest).
+   *   • GUARD #3 (max recovery window) — refuse a new covered-call cycle once the
+   *     lot has run `guards.maxCcCycles` of them; the caller then liquidates via
+   *     {@link liquidateAssignedShares}. Omit → unbounded (bare wheel).
+   *
+   * The collateral is the shares themselves (already locked in inventory), so no
+   * additional cash is reserved; the credit is held against the position (recorded
+   * in `creditUsd`, NOT added to free cash) exactly like a CSP, and is realized on
+   * {@link settleCoveredWrite}. Covered-call-ONLY: an entry with no free assigned
+   * shares to cover is refused, never downgraded to a naked short.
+   *
+   * Returns `null` (consuming nothing) outside the trading window, over the daily
+   * cap, with no resolvable free lot, on a duplicate short for the same OCC symbol,
+   * on a strike below the cost-basis floor, past the max-cycle guard, when the C3
+   * DTE guard blocks it, or on a non-positive strike/credit.
+   */
+  openCoveredCall(
+    params: {
+      symbol: string;
+      /** OCC symbol of the short call. */
+      optionSymbol: string;
+      strike: number;
+      expiration: string;
+      /** Premium collected per share (> 0). */
+      creditPerShare: number;
+      /** Underlying spot at entry. */
+      spot: number;
+      /** Sign-adjusted entry delta, for evidence / roll decisions. */
+      entryDelta?: number;
+      signalId?: string;
+      /** Specific lot to cover; when omitted the first free lot for the symbol is used. */
+      lotId?: string;
+      /** TRA-1322 guard #3 — max covered-call cycles before the caller liquidates. */
+      guards?: { maxCcCycles?: number };
+    },
+    mode: AccountMode = 'demo',
+  ): OptionPosition | null {
+    this.resetDayIfNeeded();
+
+    if (!isValidTradingWindow(Date.now())) return null;
+    if (this.dailyOptionsTotal() >= this.optionsDailyTradesLimit) return null;
+
+    const { symbol, optionSymbol, strike, expiration, creditPerShare, spot } = params;
+    if (!Number.isFinite(strike) || strike <= 0) return null;
+    if (!Number.isFinite(creditPerShare) || creditPerShare <= 0) return null;
+
+    // Resolve a free assigned-share lot for this symbol/mode (covered-only).
+    const lot = params.lotId
+      ? this.assignedShares.get(params.lotId)
+      : Array.from(this.assignedShares.values()).find(
+          (l) => l.symbol === symbol.toUpperCase() && l.mode === mode && !l.openCoveredCallId,
+        );
+    if (!lot || lot.openCoveredCallId) return null;
+    if (lot.mode !== mode) return null;
+    const contracts = Math.floor(lot.shares / 100);
+    if (contracts < 1) return null;
+
+    // GUARD #1 — never write a call below the cost basis (would lock a loss).
+    if (strike < lot.costBasisPerShare) return null;
+    // GUARD #3 — cap the recovery window.
+    const maxCcCycles = params.guards?.maxCcCycles;
+    if (maxCcCycles != null && lot.ccCount >= maxCcCycles) return null;
+
+    // No-day-trading entry gate on the short call's expiration.
+    if (!this.passesEntryDteGuard(optionSymbol, expiration, Date.now())) return null;
+
+    // One covered call per (contract).
+    const existing = Array.from(this.openOptions.values()).find(
+      (o) => o.optionSymbol === optionSymbol && o.coveredWrite === 'covered_call',
+    );
+    if (existing) return null;
+
+    this.dailyRvCount += 1;
+
+    const creditUsd = r2(creditPerShare * 100 * contracts);
+    // Collateral = the shares' notional (already locked in inventory); recorded
+    // for display parity with the CSP path, not re-debited from cash.
+    const collateralUsd = r2(lot.assignmentStrike * 100 * contracts);
+
+    const position: OptionPosition = {
+      id: randomUUID(),
+      symbol: symbol.toUpperCase(),
+      optionSymbol,
+      optionType: 'call',
+      strike,
+      expiration,
+      contracts,
+      contractsRemaining: contracts,
+      premiumPaid: creditPerShare,
+      currentPremium: creditPerShare,
+      tp1Premium: Number.POSITIVE_INFINITY,
+      tp1Hit: false,
+      stopLossPremium: 0,
+      peakPremium: creditPerShare,
+      trailingActive: false,
+      trailingStopPremium: 0,
+      underlyingEntryPrice: Number.isFinite(spot) && spot > 0 ? spot : 0,
+      openedAt: Date.now(),
+      signalId: params.signalId ?? randomUUID(),
+      signalType: 'relative_value',
+      mode,
+      ...(params.entryDelta !== undefined ? { entryDelta: params.entryDelta } : {}),
+      coveredWrite: 'covered_call',
+      collateralUsd,
+      creditUsd,
+      spreadStrategy: 'covered_call',
+      netUsd: creditUsd,
+      // The covered call's own leg loss is 0 (the shares cover it); called-away
+      // caps upside at the strike. Credit is the leg's max profit.
+      maxLossUsd: 0,
+      maxProfitUsd: creditUsd,
+      breakevens: [r2(strike)],
+      ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
+    };
+
+    lot.openCoveredCallId = position.id;
+    lot.ccCount += 1;
+    this.openOptions.set(position.id, position);
+    return position;
+  }
+
+  /**
+   * TRA-1976 — liquidate an assigned-share lot at market (the wheel's tail-cap
+   * guards). Ports the guarded exits from `wheel-recovery.ts`:
+   *   • GUARD #2 (hard stock-side stop) — the caller invokes this when the close
+   *     falls a fixed % below the lot's cost basis, removing the unbounded left
+   *     tail (`stock_stop`, L259-279).
+   *   • GUARD #3 (max recovery window) — after the covered-call cycle cap the
+   *     caller liquidates rather than holding indefinitely (`max_window_liquidation`,
+   *     L306-315).
+   *
+   * If a covered call is open against the lot, it is bought to close first at its
+   * intrinsic value vs `marketPrice` (in a crash the call is deep OTM ≈ 0, so ~all
+   * the credit is kept). The shares are then sold at `marketPrice`: proceeds to
+   * free cash, stock P&L booked against the assignment strike. Returns the removed
+   * lot, or `null` for an unknown lot / invalid price.
+   */
+  liquidateAssignedShares(
+    lotId: string,
+    marketPrice: number,
+    reason: 'stock_stop' | 'max_window_liquidation' | 'manual' = 'manual',
+  ): AssignedShareLot | null {
+    const lot = this.assignedShares.get(lotId);
+    if (!lot) return null;
+    if (!Number.isFinite(marketPrice) || marketPrice < 0) return null;
+    const contracts = Math.floor(lot.shares / 100);
+    if (contracts < 1) {
+      this.assignedShares.delete(lotId);
+      return { ...lot };
+    }
+    const mode = lot.mode;
+
+    // Buy back an open covered call first (intrinsic vs market; deep-OTM ≈ 0).
+    if (lot.openCoveredCallId) {
+      const cc = this.openOptions.get(lot.openCoveredCallId);
+      if (cc) {
+        const buybackPerShare = Math.max(0, marketPrice - (cc.strike ?? 0));
+        const ccCredit = cc.creditUsd ?? 0;
+        const ccPnl = r2(ccCredit - buybackPerShare * 100 * contracts);
+        this.cash += ccPnl;
+        this.equity += ccPnl;
+        this.optionsPnlByMode[cc.mode ?? mode] += ccPnl;
+        cc.pnl = (cc.pnl ?? 0) + ccPnl;
+        cc.currentPremium = buybackPerShare;
+        cc.closedAt = Date.now();
+        cc.contractsRemaining = 0;
+        this.openOptions.delete(cc.id);
+        this.closedOptions.push({ ...cc });
+      }
+      lot.openCoveredCallId = undefined;
+    }
+
+    // Sell the shares at market: full proceeds to cash, stock P&L vs assignment strike.
+    const proceeds = marketPrice * 100 * contracts;
+    const stockPnl = (marketPrice - lot.assignmentStrike) * 100 * contracts;
+    this.cash += proceeds;
+    this.equity += stockPnl;
+    this.optionsPnlByMode[mode] += stockPnl;
+
+    accountLog.info('assigned shares liquidated', {
+      lotId,
+      symbol: lot.symbol,
+      reason,
+      shares: lot.shares,
+      marketPrice,
+      stockPnl: r2(stockPnl),
+    });
+
+    this.assignedShares.delete(lotId);
+    return { ...lot };
   }
 
   /** TRA-231 — see {@link openOptionFromCandidate} for the `mode` stamp rationale. */
@@ -3759,6 +4133,12 @@ export class PaperOptionsAccount {
     equity: number;
     /** TRA-233 — env this snapshot belongs to (null for the demo bucket). */
     tradierEnv?: TradierEnv | null;
+    /**
+     * TRA-1976 — assigned-share inventory from CSP assignments. Persisted so a
+     * mid-cycle restart doesn't strand the long shares (or the covered call
+     * written against them). Optional so legacy snapshots without it still import.
+     */
+    assignedShares?: AssignedShareLot[];
   } {
     return {
       openOptions: Array.from(this.openOptions.values()),
@@ -3773,6 +4153,7 @@ export class PaperOptionsAccount {
       cash: this.cash,
       equity: this.equity,
       tradierEnv: this.tradierEnv,
+      assignedShares: Array.from(this.assignedShares.values()).map((l) => ({ ...l })),
     };
   }
 
@@ -3805,10 +4186,15 @@ export class PaperOptionsAccount {
     currentDayKey: string;
     cash: number;
     equity: number;
+    /** TRA-1976 — assigned-share inventory; older snapshots don't carry it. */
+    assignedShares?: AssignedShareLot[];
   }): void {
     this.openOptions.clear();
     for (const o of snap.openOptions) this.openOptions.set(o.id, o);
     this.closedOptions = [...snap.closedOptions];
+    // TRA-1976 — restore assigned-share inventory (empty for legacy snapshots).
+    this.assignedShares.clear();
+    for (const l of snap.assignedShares ?? []) this.assignedShares.set(l.id, { ...l });
     if (snap.optionsPnlByMode) {
       this.optionsPnlByMode = {
         demo: snap.optionsPnlByMode.demo ?? 0,

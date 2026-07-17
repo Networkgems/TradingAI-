@@ -3170,12 +3170,155 @@ describe('PaperOptionsAccount.openCashSecuredPut', () => {
     expect(acct.getState().optionsCash).toBe(50_110);
   });
 
-  it('refuses to settle an assignment here (equity-inventory follow-up)', () => {
+  it('assigns a CSP into 100 shares/contract, keeps the credit, and closes the short (TRA-1976)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openCashSecuredPut(cspParams())!;
-    expect(acct.settleCoveredWrite(pos.id, { kind: 'assigned' })).toBeNull();
-    // Position stays open; nothing booked.
-    expect(acct.getState().openOptions).toHaveLength(1);
-    expect(acct.getState().optionsCash).toBe(45_000);
+    const closed = acct.settleCoveredWrite(pos.id, { kind: 'assigned' });
+    expect(closed).not.toBeNull();
+    // The put credit is kept as realized P&L.
+    expect(closed!.pnl).toBe(150);
+    // Short is closed; a share lot now exists.
+    expect(acct.getState().openOptions).toHaveLength(0);
+    const lots = acct.getAssignedShares();
+    expect(lots).toHaveLength(1);
+    expect(lots[0].symbol).toBe('AAPL');
+    expect(lots[0].shares).toBe(100);
+    expect(lots[0].assignmentStrike).toBe(50);
+    // Effective basis nets out the credit (50 − 1.5).
+    expect(lots[0].costBasisPerShare).toBe(48.5);
+    expect(lots[0].ccCount).toBe(0);
+    expect(lots[0].openCoveredCallId).toBeUndefined();
+    // Collateral (5,000) was NOT refunded — it is now the shares' cost; only the
+    // credit (150) returns to free cash: 45,000 + 150.
+    expect(acct.getState().optionsCash).toBe(45_150);
+    expect(acct.getEquity()).toBe(50_150);
+  });
+
+  const ccParams = (overrides: Record<string, unknown> = {}) => ({
+    symbol: 'AAPL',
+    optionSymbol: 'AAPL240705C00052000',
+    strike: 52,
+    expiration: '2024-07-05',
+    creditPerShare: 1.0,
+    spot: 55,
+    entryDelta: 0.3,
+    ...overrides,
+  });
+
+  it('writes a covered call against an assigned lot; credit is held, not added to cash', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams());
+    expect(cc).not.toBeNull();
+    expect(cc!.coveredWrite).toBe('covered_call');
+    expect(cc!.optionType).toBe('call');
+    expect(cc!.contracts).toBe(1);
+    expect(cc!.creditUsd).toBe(100);
+    // Credit held off free cash (still 45,150 after assignment) — no CC re-debit.
+    expect(acct.getState().optionsCash).toBe(45_150);
+    const lots = acct.getAssignedShares();
+    expect(lots[0].ccCount).toBe(1);
+    expect(lots[0].openCoveredCallId).toBe(cc!.id);
+    expect(acct.getState().dailyOptionsCount).toBe(2);
+  });
+
+  it('GUARD #1: refuses a covered call struck below the lot cost basis', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    // Cost basis is 48.5; a 48-strike call would lock a loss on the stock leg.
+    expect(acct.openCoveredCall(ccParams({ optionSymbol: 'AAPL240705C00048000', strike: 48 }))).toBeNull();
+    // Nothing consumed.
+    expect(acct.getState().dailyOptionsCount).toBe(1);
+  });
+
+  it('refuses a covered call when there is no free assigned lot for the symbol', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // No assignment yet → nothing to cover.
+    expect(acct.openCoveredCall(ccParams())).toBeNull();
+  });
+
+  it('settles an expired-worthless covered call: keeps credit, shares stay, lot re-armed', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams())!;
+    const closed = acct.settleCoveredWrite(cc.id, { kind: 'expired_worthless' });
+    expect(closed).not.toBeNull();
+    expect(closed!.pnl).toBe(100);
+    // Credit realized to cash (45,150 + 100); shares NOT sold (collateral not released).
+    expect(acct.getState().optionsCash).toBe(45_250);
+    const lots = acct.getAssignedShares();
+    expect(lots).toHaveLength(1);
+    // Lot re-armed for the next covered call; the cycle counter is retained.
+    expect(lots[0].openCoveredCallId).toBeUndefined();
+    expect(lots[0].ccCount).toBe(1);
+  });
+
+  it('called away: sells the shares at the call strike and books stock P&L + credit (TRA-1976)', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams())!;
+    const closed = acct.settleCoveredWrite(cc.id, { kind: 'assigned' });
+    expect(closed).not.toBeNull();
+    // Stock P&L (52 − 50)×100 = 200 + call credit 100 = 300.
+    expect(closed!.pnl).toBe(300);
+    // Shares gone; book flat.
+    expect(acct.getAssignedShares()).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+    // Full round-trip: −5,000 buy + 150 put credit + 100 call credit + 5,200 sale = +450.
+    expect(acct.getEquity()).toBe(50_450);
+    expect(acct.getState().optionsCash).toBe(50_450);
+  });
+
+  it('GUARD #3: refuses a new covered-call cycle past the max-recovery window', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    // Cycle 1 (allowed), then expire it OTM so the lot re-arms.
+    const cc1 = acct.openCoveredCall(ccParams({ guards: { maxCcCycles: 1 } }))!;
+    expect(cc1).not.toBeNull();
+    acct.settleCoveredWrite(cc1.id, { kind: 'expired_worthless' });
+    // Cycle 2 would exceed the cap → refused; caller liquidates instead.
+    expect(
+      acct.openCoveredCall(ccParams({ optionSymbol: 'AAPL240705C00053000', strike: 53, guards: { maxCcCycles: 1 } })),
+    ).toBeNull();
+  });
+
+  it('GUARD #2: liquidateAssignedShares books the stock loss and buys back an open call', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams())!;
+    const lotId = acct.getAssignedShares()[0].id;
+    // Crash to 40: call is deep OTM (buyback ≈ 0, keep the 100 credit), stock
+    // realizes (40 − 50)×100 = −1,000.
+    const removed = acct.liquidateAssignedShares(lotId, 40, 'stock_stop');
+    expect(removed).not.toBeNull();
+    expect(acct.getAssignedShares()).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(0);
+    // Net: −5,000 buy + 150 put + 100 call + 4,000 sale = −750.
+    expect(acct.getEquity()).toBe(49_250);
+    expect(acct.getState().optionsCash).toBe(49_250);
+  });
+
+  it('round-trips assigned-share inventory through export/import snapshot', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams())!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const snap = acct.exportSnapshot();
+    expect(snap.assignedShares).toHaveLength(1);
+
+    const restored = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    restored.importSnapshot(snap);
+    const lots = restored.getAssignedShares();
+    expect(lots).toHaveLength(1);
+    expect(lots[0].symbol).toBe('AAPL');
+    expect(lots[0].shares).toBe(100);
+    expect(lots[0].costBasisPerShare).toBe(48.5);
+    // A covered call can be written against the restored lot.
+    expect(restored.openCoveredCall(ccParams())).not.toBeNull();
   });
 });
