@@ -80,6 +80,34 @@ describe('fetchStockTwitsStream', () => {
     expect(await fetchStockTwitsStream('AAPL')).toBeNull();
   });
 
+  it('does NOT attach an access_token when the env is unset (TRA-1963)', async () => {
+    const prev = process.env.STOCKTWITS_ACCESS_TOKEN;
+    delete process.env.STOCKTWITS_ACCESS_TOKEN;
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchStockTwitsStream('AAPL');
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.not.stringContaining('access_token'),
+      expect.anything(),
+    );
+    if (prev !== undefined) process.env.STOCKTWITS_ACCESS_TOKEN = prev;
+  });
+
+  it('attaches the OAuth access_token as a query param when the env is set (TRA-1963)', async () => {
+    const prev = process.env.STOCKTWITS_ACCESS_TOKEN;
+    process.env.STOCKTWITS_ACCESS_TOKEN = 'secret tok/en';
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchStockTwitsStream('AAPL');
+    // URL-encoded, appended with the correct separator on a path that had no query.
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/symbol/AAPL.json?access_token=secret%20tok%2Fen'),
+      expect.anything(),
+    );
+    if (prev === undefined) delete process.env.STOCKTWITS_ACCESS_TOKEN;
+    else process.env.STOCKTWITS_ACCESS_TOKEN = prev;
+  });
+
   it('returns null (not throw) when fetch rejects', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down'); }));
     expect(await fetchStockTwitsStream('AAPL')).toBeNull();

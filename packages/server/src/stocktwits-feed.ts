@@ -52,6 +52,26 @@ const BROWSER_HEADERS: Readonly<Record<string, string>> = {
   Origin: 'https://stocktwits.com',
 };
 
+/**
+ * TRA-1963 — optional authenticated access. The keyless v2 stream endpoints cap
+ * anonymous callers at ~200 req/hr per IP; presenting a valid OAuth
+ * `access_token` raises that ceiling (~400/hr) and is honored by every
+ * `/api/2/streams/*` route (an invalid token → HTTP 401, verified live, so we
+ * only attach a non-empty one). The token is a SECRET — supplied via the
+ * `STOCKTWITS_ACCESS_TOKEN` env, never committed, and it is an OAuth
+ * access_token, NOT an account username/password (this API has no password
+ * grant). NOTE: a token raises rate limits but does NOT clear a Cloudflare
+ * IP-reputation block on datacenter egress — that is a separate axis, mitigated
+ * on the request-fingerprint side by {@link BROWSER_HEADERS} and otherwise a
+ * function of the egress IP itself.
+ */
+function withAccessToken(url: string, env: NodeJS.ProcessEnv = process.env): string {
+  const token = env['STOCKTWITS_ACCESS_TOKEN']?.trim();
+  if (!token) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}access_token=${encodeURIComponent(token)}`;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
@@ -145,7 +165,7 @@ async function fetchStreamMessages(
     return null;
   }
   try {
-    const resp = await withTimeout(fetch(url, { headers: BROWSER_HEADERS }), ST_CALL_TIMEOUT_MS, label);
+    const resp = await withTimeout(fetch(withAccessToken(url), { headers: BROWSER_HEADERS }), ST_CALL_TIMEOUT_MS, label);
     if (resp.status === 429) {
       const until = resetDeadlineFrom(resp, now);
       tripStockTwitsBreaker(until);
@@ -272,7 +292,7 @@ export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeR
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
   try {
     const resp = await withTimeout(
-      fetch(url, { headers: BROWSER_HEADERS }),
+      fetch(withAccessToken(url), { headers: BROWSER_HEADERS }),
       ST_CALL_TIMEOUT_MS,
       `stocktwits-probe(${sym})`,
     );
