@@ -253,6 +253,16 @@ export type {
   PreTradeGateInput,
   PreTradeGateResult,
 } from './pre-trade-gate.js';
+// TRA-1967 — pre-trade LIQUIDITY gate (pure): L1 spread cost + naive impact →
+// allow / downsize / veto. Wired SHADOW-first via pre-trade-liquidity-ledger.
+export { evaluateLiquidityGate, DEFAULT_LIQUIDITY_GATE_CONFIG } from './liquidity-gate.js';
+export type {
+  LiquiditySide,
+  LiquidityGateReason,
+  LiquidityGateConfig,
+  LiquidityGateInput,
+  LiquidityGateResult,
+} from './liquidity-gate.js';
 // TRA-1220 (parent TRA-1218) — crypto ADX/CHOP/ER regime classifier. DISTINCT
 // from `classifyRegime` above; the shared substrate rec #2 (regime-gated TSMOM)
 // imports.

@@ -295,6 +295,12 @@ import {
   isPreTradeGateEnabled,
   preTradeGateSummary,
 } from './pre-trade-gate-ledger.js';
+import {
+  initPreTradeLiquidityLedger,
+  listLiquidityGateDecisions,
+  isPreTradeLiquidityEnabled,
+  liquidityGateSummary,
+} from './pre-trade-liquidity-ledger.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
@@ -854,6 +860,12 @@ await initReversalShadowLedger();
 // appends decisions when ENABLE_PRE_TRADE_GATE is set (default OFF); nothing here
 // routes or modifies an order.
 await initPreTradeGateLedger();
+
+// TRA-1967 — warm the SHADOW-FIRST pre-trade LIQUIDITY gate ledger so its read
+// endpoint has history right after boot. The live equity/options signal paths
+// append decisions when ENABLE_PRE_TRADE_LIQUIDITY_GATE is set (default OFF);
+// nothing here routes, downsizes, or modifies an order.
+await initPreTradeLiquidityLedger();
 
 // TRA-850 — warm the persistent per-user trading-memory store from disk so the
 // synchronous `getUserMemorySync` read the advisory tick uses has each user's
@@ -5306,6 +5318,38 @@ app.get('/api/health/pre-trade-gate', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read pre-trade gate ledger' });
+  }
+});
+
+// TRA-1967 — pre-trade LIQUIDITY gate shadow readout. SHADOW-FIRST / flag-OFF: the
+// engine's `evaluateLiquidityGate` charges an L1 spread cost + naive impact per
+// candidate order and the server ledger records the allow/downsize/veto verdict WHEN
+// ENABLE_PRE_TRADE_LIQUIDITY_GATE is set. With the flag off (the default on
+// bqb1/prod) this returns an empty, honest ledger and nothing routes or downsizes an
+// order. The summary (veto/intervention rate + modeled-cost distribution per asset
+// class) is the calibration the realized-slippage KPI (TRA-1967 item 2) checks OOS
+// before any live veto is armed.
+app.get('/api/health/pre-trade-liquidity', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseTs = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return typeof v === 'string' && v !== '' && Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const decisions = await listLiquidityGateDecisions({ from: parseTs(q['from']), to: parseTs(q['to']) });
+    res.json({
+      issue: 'TRA-1967',
+      flagEnabled: isPreTradeLiquidityEnabled(),
+      model: 'L1 spread cost + naive linear impact (no L2/market-maker model)',
+      count: decisions.length,
+      summary: liquidityGateSummary(decisions),
+      decisions,
+    });
+  } catch (err) {
+    log.error('pre-trade-liquidity health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read pre-trade liquidity ledger' });
   }
 });
 
