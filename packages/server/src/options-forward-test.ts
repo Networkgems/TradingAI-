@@ -14,6 +14,12 @@ import {
   COST_EFFICIENCY_MAX,
   type CostModel,
 } from './options-cost-model.js';
+import {
+  buildPopCalibrationSummary,
+  DEFAULT_POP_CALIBRATION_CONFIG,
+  type PopCalibrationConfig,
+  type PopCalibrationSummary,
+} from './options-pop-calibration.js';
 
 // TRA-678 (F1) + TRA-1991 — the cost model + cost-efficiency threshold live in a
 // leaf module (`options-cost-model.ts`) to keep them a single source of truth
@@ -457,6 +463,17 @@ export interface ForwardTestReport {
     profitFactor: number | null;
     avgPredictedPop: number | null;
     popCalibrationGap: number | null;
+    /**
+     * TRA-2006 — mean CALIBRATED POP over included resolved ideas (each stated POP
+     * mapped through the post-calibration fit). Null when none resolved.
+     */
+    avgCalibratedPop: number | null;
+    /**
+     * TRA-2006 — `hitRate − avgCalibratedPop`: the POP-calibration gap measured
+     * against the CALIBRATED POP. SHADOW: the gate scores `popCalibrationGap` (raw)
+     * unless `ENABLE_POP_CALIBRATION` is set. Retained alongside raw for audit.
+     */
+    popCalibrationGapCalibrated: number | null;
     maxLossBreaches: number;
     /** Distinct ISO weeks that have ≥1 (included) resolved idea. */
     weeksWithResolved: number;
@@ -475,6 +492,15 @@ export interface ForwardTestReport {
    * only; wires nothing.
    */
   decomposition: IdeasDecomposition;
+  /**
+   * TRA-2006 — POP post-calibration audit: the fit (flat / isotonic), raw-vs-
+   * calibrated mean POP, and both gaps over the same resolved-and-included set.
+   * `avgStatedPop`/`rawGap` reconcile with `totals.avgPredictedPop`/
+   * `totals.popCalibrationGap`; `avgCalibratedPop`/`calibratedGap` reconcile with
+   * `totals.avgCalibratedPop`/`totals.popCalibrationGapCalibrated`. SHADOW —
+   * surfaced regardless of the flag; the gate consumes it only when enabled.
+   */
+  popCalibration: PopCalibrationSummary;
   /** Methodology + look-ahead note, surfaced to the report consumer/QA. */
   methodology: string;
 }
@@ -713,7 +739,7 @@ const METHODOLOGY =
 /** Roll a set of idea outcomes into the weekly + overall forward-test report. */
 export function buildForwardTestReport(
   outcomes: readonly IdeaOutcome[],
-  opts: { asOf?: number; chainsDir?: string } = {},
+  opts: { asOf?: number; chainsDir?: string; popCalibration?: PopCalibrationConfig } = {},
 ): ForwardTestReport {
   const asOf = opts.asOf ?? Date.now();
   const byWeek = new Map<string, IdeaOutcome[]>();
@@ -742,6 +768,15 @@ export function buildForwardTestReport(
   const costRatios = outcomes.map((o) => o.costEfficiencyRatio).filter((x): x is number => x != null);
   const avgCostEfficiencyRatio = costRatios.length ? r2(mean(costRatios) ?? 0) : null;
 
+  // TRA-2006 — fit the POP post-calibration on the SAME resolved-and-included set
+  // (refit on every report build → "refits weekly as the sample grows") and
+  // surface raw-vs-calibrated POP. Pure measurement; the gate consumes the
+  // calibrated gap only when ENABLE_POP_CALIBRATION is set (SHADOW by default).
+  const popCalibration = buildPopCalibrationSummary(
+    resolved.map((o) => ({ pop: o.pop, win: o.win === true })),
+    opts.popCalibration ?? DEFAULT_POP_CALIBRATION_CONFIG,
+  );
+
   return {
     generatedAt: asOf,
     asOfDate: etDateKey(asOf),
@@ -767,6 +802,9 @@ export function buildForwardTestReport(
       avgPredictedPop: avgPredictedPop == null ? null : r2(avgPredictedPop),
       popCalibrationGap:
         hitRate != null && avgPredictedPop != null ? r2(hitRate - avgPredictedPop) : null,
+      // TRA-2006 — calibrated-POP mirror of the two lines above (SHADOW audit).
+      avgCalibratedPop: popCalibration.avgCalibratedPop,
+      popCalibrationGapCalibrated: popCalibration.calibratedGap,
       maxLossBreaches: resolved.filter((o) => o.maxLossBreached).length,
       weeksWithResolved: weeksWithResolved.length,
       weeksPositiveExpectancy: weeksWithResolved.filter((w) => w.positiveExpectancy).length,
@@ -776,6 +814,8 @@ export function buildForwardTestReport(
     // TRA-2004 — per-cell decomposition of the same resolved-and-included set the
     // totals aggregate, so QuantTrader can locate the gross-edge leak + fit POP.
     decomposition: buildIdeasDecomposition(outcomes, { asOf }),
+    // TRA-2006 — POP post-calibration audit (raw vs calibrated); SHADOW.
+    popCalibration,
     methodology: METHODOLOGY,
   };
 }

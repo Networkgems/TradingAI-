@@ -110,13 +110,18 @@ const pct = (v: number | null): string => (v == null ? 'n/a' : `${Math.round(v *
 export function evaluateLiveCapitalGate(
   report: ForwardTestReport,
   criteria: LiveCapitalGateCriteria = LIVE_CAPITAL_GATE,
+  opts: { useCalibratedPop?: boolean } = {},
 ): LiveCapitalGateResult {
   const t = report.totals;
   // TRA-678 (F1) — durability is measured on the COST-NET weekly edge.
   const positiveWeekFraction =
     t.weeksWithResolved > 0 ? t.weeksPositiveExpectancyNet / t.weeksWithResolved : null;
   // Calibration only meaningful once there's a hit-rate to compare against.
-  const calGap = t.popCalibrationGap;
+  // TRA-2006 — score the CALIBRATED gap when the calibration flag is on (caller
+  // resolves the flag); OFF by default → the raw gap the gate has always scored,
+  // byte-for-byte. The report surfaces both regardless.
+  const useCalibratedPop = opts.useCalibratedPop === true;
+  const calGap = useCalibratedPop ? t.popCalibrationGapCalibrated : t.popCalibrationGap;
 
   const criteriaResults: GateCriterionResult[] = [
     {
@@ -149,7 +154,9 @@ export function evaluateLiveCapitalGate(
     },
     {
       name: 'pop_calibration',
-      description: '|realized hit-rate − mean stated POP| within band',
+      description: useCalibratedPop
+        ? '|realized hit-rate − mean CALIBRATED POP| within band (TRA-2006)'
+        : '|realized hit-rate − mean stated POP| within band',
       required: `≤ ${pct(criteria.maxPopCalibrationGap)}`,
       actual: calGap == null ? null : Math.abs(calGap),
       pass: calGap != null && Math.abs(calGap) <= criteria.maxPopCalibrationGap,

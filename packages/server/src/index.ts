@@ -323,6 +323,7 @@ import {
   defaultChainsDir,
 } from './options-forward-test.js';
 import { evaluateLiveCapitalGate, resolveLiveCapitalGateCriteria } from './live-capital-gate.js';
+import { isPopCalibrationEnabled, resolvePopCalibrationConfig } from './options-pop-calibration.js';
 import {
   loadProposalsScorecard,
   buildAiIdeasScorecard,
@@ -2743,7 +2744,9 @@ async function runWeeklyOptionsRollup(): Promise<void> {
   const outcomes = await forwardTestIdeas(entries);
   const report = buildForwardTestReport(outcomes, { chainsDir: defaultChainsDir() });
   const gateCriteria = resolveLiveCapitalGateCriteria();
-  const gate = evaluateLiveCapitalGate(report, gateCriteria);
+  const gate = evaluateLiveCapitalGate(report, gateCriteria, {
+    useCalibratedPop: isPopCalibrationEnabled(),
+  });
   const monitor = buildAccumulationMonitor({
     report,
     gate: gateCriteria,
@@ -3722,7 +3725,11 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
     // cost-aware gate flag is on; defaults to the shipped LIVE_CAPITAL_GATE
     // (net > 0) when off, so the readout is unchanged until an operator opts in.
     const gateCriteria = resolveLiveCapitalGateCriteria();
-    const gate = evaluateLiveCapitalGate(report, gateCriteria);
+    // TRA-2006 — score the CALIBRATED POP gap when ENABLE_POP_CALIBRATION is set;
+    // OFF by default → the raw gap, so the readout is unchanged until opt-in.
+    const gate = evaluateLiveCapitalGate(report, gateCriteria, {
+      useCalibratedPop: isPopCalibrationEnabled(),
+    });
     res.json({
       passed: gate.passed,
       asOfDate: gate.asOfDate,
@@ -3748,6 +3755,13 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
         weeksPositiveExpectancyNet: report.totals.weeksPositiveExpectancyNet,
         expectancyR: report.totals.expectancyR,
         expectancyNetR: report.totals.expectancyNetR,
+      },
+      // TRA-2006 — raw-vs-calibrated POP so the `pop_calibration` criterion is
+      // auditable from this probe. `scoredAgainst` names which gap the criterion
+      // above actually used (calibrated only when ENABLE_POP_CALIBRATION is set).
+      popCalibration: {
+        scoredAgainst: isPopCalibrationEnabled() ? 'calibrated' : 'raw',
+        ...report.popCalibration,
       },
     });
   } catch (err) {
@@ -3796,6 +3810,60 @@ app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to build the options-ideas decomposition.' });
+  }
+});
+
+// TRA-2006 (TRA-2000, item 2) — POP POST-CALIBRATION readout, as a redacted
+// read-only diagnostic (same unauth, secrets-free basis as the sibling
+// /api/health/live-capital-gate + /api/health/options-ideas-decomposition
+// probes). Surfaces the fit (flat / isotonic) and the RAW-vs-CALIBRATED POP gap
+// over the same resolved-and-included set the gate scores, so QuantTrader can
+// sign off on the fit against bqb1's cohort (localhost journal is empty; bqb1
+// holds the n≈43 resolved set). `enabled` reports whether the calibrated gap is
+// currently CONSUMED by the gate (ENABLE_POP_CALIBRATION); SHADOW/false by
+// default. Read-only — no capital, no feed reorder, no trade-path change.
+app.get('/api/health/pop-calibration', async (_req, res) => {
+  try {
+    const entries = await listJournalEntries();
+    const outcomes = await forwardTestIdeas(entries);
+    const report = buildForwardTestReport(outcomes, {
+      chainsDir: defaultChainsDir(),
+      popCalibration: resolvePopCalibrationConfig(),
+    });
+    const c = report.popCalibration;
+    const band = resolveLiveCapitalGateCriteria().maxPopCalibrationGap;
+    res.json({
+      ok: true,
+      issue: 'TRA-2006',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      // Whether the calibrated gap is CONSUMED by the live-capital gate right now.
+      enabled: isPopCalibrationEnabled(),
+      // The ≤0.10 band the gate's pop_calibration criterion enforces.
+      band,
+      // Reconciliation anchors: rawGap/calibratedGap here equal
+      // totals.popCalibrationGap / totals.popCalibrationGapCalibrated.
+      totals: {
+        resolved: report.totals.resolved,
+        excluded: report.totals.excluded,
+        hitRate: report.totals.hitRate,
+        avgStatedPop: report.totals.avgPredictedPop,
+        avgCalibratedPop: report.totals.avgCalibratedPop,
+        popCalibrationGap: report.totals.popCalibrationGap,
+        popCalibrationGapCalibrated: report.totals.popCalibrationGapCalibrated,
+      },
+      // Does each gap clear the band? (null = not yet measurable.)
+      clearsBand: {
+        raw: c.rawGap == null ? null : Math.abs(c.rawGap) <= band,
+        calibrated: c.calibratedGap == null ? null : Math.abs(c.calibratedGap) <= band,
+      },
+      fit: c,
+    });
+  } catch (err) {
+    log.error('pop-calibration probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the POP-calibration readout.' });
   }
 });
 

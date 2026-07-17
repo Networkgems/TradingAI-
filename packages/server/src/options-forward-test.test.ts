@@ -379,6 +379,27 @@ describe('buildForwardTestReport', () => {
     expect(report.totals.popCalibrationGap).toBeCloseTo(0.5 - 0.6, 5);
   });
 
+  it('TRA-2006 — surfaces a calibrated POP mirror that reconciles with totals', () => {
+    const win = entry({ key: 'w', legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300 });
+    const loss = entry({ key: 'l', legs: [leg('buy', 'call', 100, '2026-02-20')], entryNetUsd: -300 });
+    const outcomes: IdeaOutcome[] = [
+      valueIdea(win, [day('2026-02-20', 110, [])], ET_NOON('2026-02-23')),
+      valueIdea(loss, [day('2026-02-20', 95, [])], ET_NOON('2026-02-23')),
+    ];
+    const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-02-23') });
+    const cal = report.popCalibration;
+    // n=2 < 43 → interim flat haircut. avgStated 0.6 → avgCalibrated 0.45.
+    expect(cal.mode).toBe('flat');
+    expect(report.totals.avgCalibratedPop).toBeCloseTo(0.45, 5);
+    // The calibrated gap (0.5 − 0.45 = 0.05) is smaller than the raw gap (−0.10).
+    expect(report.totals.popCalibrationGapCalibrated).toBeCloseTo(0.05, 5);
+    // The audit block reconciles field-for-field with totals.
+    expect(cal.avgStatedPop).toBe(report.totals.avgPredictedPop);
+    expect(cal.rawGap).toBe(report.totals.popCalibrationGap);
+    expect(cal.avgCalibratedPop).toBe(report.totals.avgCalibratedPop);
+    expect(cal.calibratedGap).toBe(report.totals.popCalibrationGapCalibrated);
+  });
+
   it('excludes open/awaiting/no_data from the hit-rate denominator', () => {
     const open = entry({
       key: 'o',

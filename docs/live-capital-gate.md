@@ -134,6 +134,27 @@ Live-capital wiring may be **proposed** only when **all** of the following hold
 The verdict and per-criterion booleans (no PII, no per-symbol P&L) are exposed
 for acceptance verification at `GET /api/health/live-capital-gate`.
 
+### Criterion 5 — POP post-calibration (TRA-2006, SHADOW-first)
+
+The stated POP is the LLM's free-form estimate (TRA-2000 diagnosis), which runs a
+systematic ~17-pt over-statement (realized ≈ stated − 0.17) and fails this band.
+TRA-2006 adds a **POP post-calibration / shrinkage layer** (`options-pop-calibration.ts`)
+that maps `statedPop → calibratedPop` off the resolved journal: an interim flat
+−0.15 haircut below the fit floor, and a **monotone isotonic** fit `realized = f(stated)`
+at/above it (default `n ≥ 43`), refit on every report build. The forward-test report
+surfaces **both** gaps — raw (`totals.popCalibrationGap`) and calibrated
+(`totals.popCalibrationGapCalibrated`) — plus the full fit for audit
+(`report.popCalibration`), served redacted at `GET /api/health/pop-calibration`.
+
+This is **flag-off by default**: criterion 5 keeps scoring the **raw** gap until an
+operator sets `ENABLE_POP_CALIBRATION`, at which point it scores the calibrated gap
+instead (the `/api/health/live-capital-gate` `popCalibration.scoredAgainst` field
+names which). **In-sample caveat:** the fit trains on the same resolved set it is
+scored against, so a small *calibrated* gap is expected by construction and is **not**
+out-of-sample proof the map generalizes, nor proof of gross edge (TRA-1965). QuantTrader
+signs off on the fit — ideally against a holdout / forward slice — before any default
+flip, and the flip also arms the ideas-ranking / entry-gate / idea-view consumers.
+
 ## Disposition when the gate passes
 
 A pass does **not** ship live trading. It unlocks a single next step: **Lead Dev
