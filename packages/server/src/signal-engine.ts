@@ -7337,6 +7337,8 @@ export class SignalEngine {
           guards: { maxCcCycles: DEFAULT_WHEEL_GUARDS.maxCcCycles },
         },
         'demo',
+        // TRA-1978 — journal the covered-call write against the assigned lot.
+        this.wheelJournalSetup(scan.result.ivRank, cc.entryDelta, 'wheel-cc'),
       );
       if (opened) {
         log.info('wheel covered call written (TRA-1977)', {
@@ -7371,6 +7373,11 @@ export class SignalEngine {
           entryDelta: csp.entryDelta,
         },
         'demo',
+        // TRA-1978 — per-fill journal setup so the CSP write accrues evidence. The
+        // scan's trailing-year IV-rank is the wheel's core premium gate (≥50);
+        // a wheel write is a neutral vol-selling sleeve (trend 'sideways'), tagged
+        // `wheel-csp` so it's distinguishable from the RV/directional archetypes.
+        this.wheelJournalSetup(scan.result.ivRank, csp.entryDelta, 'wheel-csp'),
       );
       if (opened) {
         log.info('wheel cash-secured put opened (TRA-1977)', {
@@ -7382,6 +7389,30 @@ export class SignalEngine {
         });
       }
     }
+  }
+
+  /**
+   * TRA-1978 — build the per-fill journal setup for a wheel write. Carries the
+   * scan's trailing-year IV-rank (the wheel's core ≥50 premium gate) and the
+   * short-leg entry delta; a premium-selling wheel is a direction-neutral vol
+   * sleeve, so `trend` is `sideways` and no sentiment/conviction is attributed.
+   * `archetype` (`wheel-csp` / `wheel-cc`) keeps the wheel fills distinguishable
+   * from the RV/directional sleeves in the journal's byArchetype rollup.
+   */
+  private wheelJournalSetup(
+    ivRank: number | null,
+    entryDelta: number,
+    archetype: 'wheel-csp' | 'wheel-cc',
+  ): OptionTradeJournalSetup {
+    return {
+      ivRank: typeof ivRank === 'number' && Number.isFinite(ivRank) ? ivRank : null,
+      trend: 'sideways',
+      entryDelta,
+      sentiment: null,
+      sentimentIcBand: null,
+      agentConviction: null,
+      entryArchetype: archetype,
+    };
   }
 
   /**

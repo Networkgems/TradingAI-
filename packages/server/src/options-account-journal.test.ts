@@ -380,3 +380,150 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
     expect(ema.winRate).toBe(1);
   });
 });
+
+// TRA-1978 — the wheel's covered-write opens (CSP / CC, TRA-1976/1977) must
+// journal to the per-fill option-trade journal so CSP/CC outcomes accrue
+// evidence, folded closed on settlement (expired / bought-back / assigned /
+// called-away / liquidation). Additive + flag-gated; journaling never alters
+// execution (mirrors the TRA-991 fire-and-forget pattern on the long paths).
+describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
+  const cspParams = (overrides: Record<string, unknown> = {}) => ({
+    symbol: 'AAPL',
+    optionSymbol: 'AAPL240705P00050000',
+    strike: 50,
+    expiration: '2024-07-05', // ~31 DTE from the pinned Tuesday → clears the C3 floor
+    creditPerShare: 1.5,
+    spot: 55,
+    entryDelta: -0.25,
+    ...overrides,
+  });
+  const ccParams = (overrides: Record<string, unknown> = {}) => ({
+    symbol: 'AAPL',
+    optionSymbol: 'AAPL240705C00052000',
+    strike: 52,
+    expiration: '2024-07-05',
+    creditPerShare: 1.0,
+    spot: 55,
+    entryDelta: 0.3,
+    ...overrides,
+  });
+  const wheelSetup = (
+    archetype: 'wheel-csp' | 'wheel-cc',
+    entryDelta: number,
+  ): OptionTradeJournalSetup => ({
+    ivRank: 62,
+    trend: 'sideways', // a premium-selling wheel is a direction-neutral vol sleeve
+    entryDelta,
+    sentiment: null,
+    sentimentIcBand: null,
+    agentConviction: null,
+    entryArchetype: archetype,
+  });
+
+  it('journals a CSP open (cash_secured_put, at-risk = collateral) and folds the expired-worthless close', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams(), 'demo', wheelSetup('wheel-csp', -0.25))!;
+    expect(csp).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    let rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.id).toBe(csp.id);
+    expect(rows[0]!.structure).toBe('cash_secured_put');
+    expect(rows[0]!.outcome).toBe('OPEN');
+    // Honest at-risk basis: the full-strike cash COLLATERAL (50 × 100), not the
+    // (strike − credit) max-loss figure.
+    expect(rows[0]!.atRiskUsd).toBe(5_000);
+    expect(rows[0]!.ivRank).toBe(62);
+    expect(rows[0]!.trend).toBe('sideways');
+    expect(rows[0]!.entryArchetype).toBe('wheel-csp');
+    expect(rows[0]!.entryDelta).toBeCloseTo(0.25, 5); // |delta| folded
+
+    // Expire OTM: keep the full $150 credit against the $5k collateral basis.
+    acct.settleCoveredWrite(csp.id, { kind: 'expired_worthless' });
+    await acct.flushOptionTradeJournal();
+
+    rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1); // folded onto the same id, not a new row
+    expect(rows[0]!.outcome).not.toBe('OPEN');
+    expect(rows[0]!.exitReason).toBe('expired');
+    expect(rows[0]!.realizedPnlUsd).toBe(150);
+    expect(rows[0]!.realizedR).toBeCloseTo(150 / 5_000, 5);
+  });
+
+  it('journals a bought-back CSP close under the bought_back exit reason', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams(), 'demo', wheelSetup('wheel-csp', -0.25))!;
+    acct.settleCoveredWrite(csp.id, { kind: 'bought_back', debitPerShare: 0.4 });
+    await acct.flushOptionTradeJournal();
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.exitReason).toBe('bought_back');
+    expect(rows[0]!.realizedPnlUsd).toBe(110); // 150 credit − 40 buy-back
+  });
+
+  it('journals an assigned CSP (exit reason assigned) then the covered call called-away', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams(), 'demo', wheelSetup('wheel-csp', -0.25))!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams(), 'demo', wheelSetup('wheel-cc', 0.3))!;
+    expect(cc).not.toBeNull();
+    // Called away: stock (52 − 50)×100 + call credit 100 = 300.
+    acct.settleCoveredWrite(cc.id, { kind: 'assigned' });
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+    const cspRow = rows.find((r) => r.id === csp.id)!;
+    const ccRow = rows.find((r) => r.id === cc.id)!;
+    // CSP leg resolves at assignment keeping just the credit (the stock P&L then
+    // accrues under the covered-call row).
+    expect(cspRow.structure).toBe('cash_secured_put');
+    expect(cspRow.exitReason).toBe('assigned');
+    expect(cspRow.realizedPnlUsd).toBe(150);
+    // CC leg: assignment-strike notional at-risk basis + the wheel's stock-leg
+    // P&L booked on called-away.
+    expect(ccRow.structure).toBe('covered_call');
+    expect(ccRow.exitReason).toBe('called_away');
+    expect(ccRow.atRiskUsd).toBe(5_000); // assignmentStrike (50) × 100
+    expect(ccRow.entryArchetype).toBe('wheel-cc');
+    expect(ccRow.realizedPnlUsd).toBe(300);
+  });
+
+  it('journals a covered-call close under the liquidation reason (stock_stop)', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const csp = acct.openCashSecuredPut(cspParams(), 'demo', wheelSetup('wheel-csp', -0.25))!;
+    acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
+    const cc = acct.openCoveredCall(ccParams(), 'demo', wheelSetup('wheel-cc', 0.3))!;
+    const lotId = acct.getAssignedShares()[0]!.id;
+    // Crash to 40: the call is deep OTM (bought back ≈ 0, keep the $100 credit),
+    // and the lot is liquidated on the stock-side stop.
+    acct.liquidateAssignedShares(lotId, 40, 'stock_stop');
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    const ccRow = rows.find((r) => r.id === cc.id)!;
+    expect(ccRow.structure).toBe('covered_call');
+    expect(ccRow.outcome).not.toBe('OPEN');
+    expect(ccRow.exitReason).toBe('stock_stop');
+    expect(ccRow.realizedPnlUsd).toBe(100); // credit kept; buy-back ≈ 0
+  });
+
+  it('no-ops when the journal flag is off, and when the flag is on but no setup is supplied', async () => {
+    // Flag off → even with a setup, nothing is journaled.
+    delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
+    const off = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const a = off.openCashSecuredPut(cspParams(), 'demo', wheelSetup('wheel-csp', -0.25))!;
+    off.settleCoveredWrite(a.id, { kind: 'expired_worthless' });
+    await off.flushOptionTradeJournal();
+    expect(await listOptionTradeJournal()).toHaveLength(0);
+
+    // Flag on but no journalSetup passed → nothing to attribute, still no row.
+    process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
+    const noSetup = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const b = noSetup.openCashSecuredPut(cspParams({ optionSymbol: 'AAPL240705P00045000', strike: 45 }))!;
+    noSetup.settleCoveredWrite(b.id, { kind: 'expired_worthless' });
+    await noSetup.flushOptionTradeJournal();
+    expect(await listOptionTradeJournal()).toHaveLength(0);
+  });
+});

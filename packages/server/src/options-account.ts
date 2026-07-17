@@ -2038,6 +2038,12 @@ export class PaperOptionsAccount {
       signalId?: string;
     },
     mode: AccountMode = 'demo',
+    // TRA-1978 — optional per-fill journal setup (IV-rank / trend / delta /
+    // archetype). When supplied AND the ENABLE_OPTION_TRADE_JOURNAL flag is on,
+    // the CSP write is recorded to the option-trade journal so wheel CSP outcomes
+    // accrue evidence (folded closed at settlement). Purely observe-only:
+    // {@link queueJournalOpen} is fire-and-forget and never alters execution.
+    journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -2118,6 +2124,14 @@ export class PaperOptionsAccount {
     };
 
     this.openOptions.set(position.id, position);
+    // TRA-1978 — journal the CSP write. At-risk basis is the cash COLLATERAL the
+    // put obligates (strike × 100 × contracts) — the honest denominator realized
+    // R is measured from on settlement. No-op unless the flag is on + a setup was
+    // supplied; the close row lands via {@link queueJournalClose} in the settle
+    // paths (expired/bought-back/assigned).
+    if (journalSetup) {
+      this.queueJournalOpen(position, 'cash_secured_put', position.collateralUsd ?? 0, journalSetup);
+    }
     return position;
   }
 
@@ -2199,6 +2213,11 @@ export class PaperOptionsAccount {
     opt.contractsRemaining = 0;
     this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
 
+    // TRA-1978 — fold the realized outcome into the per-fill journal (no-op unless
+    // the write was journaled at open). `expired` = kept the full credit; a
+    // bought-back roll/TP books credit − debit.
+    this.queueJournalClose(opt, outcome.kind === 'bought_back' ? 'bought_back' : 'expired');
+
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     return { ...opt };
@@ -2256,6 +2275,10 @@ export class PaperOptionsAccount {
     opt.currentPremium = 0;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
+    // TRA-1978 — the CSP leg resolves here: assignment keeps the credit and hands
+    // the stock leg to the lot. The realized OPTION outcome is the credit kept;
+    // the subsequent stock P&L accrues under the covered-call / liquidation rows.
+    this.queueJournalClose(opt, 'assigned');
     this.openOptions.delete(opt.id);
     this.closedOptions.push({ ...opt });
     return { ...opt };
@@ -2291,6 +2314,10 @@ export class PaperOptionsAccount {
     opt.currentPremium = 0;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
+    // TRA-1978 — the covered call resolves called-away: realized = stock P&L vs
+    // the assignment strike + the call credit. Folds the wheel's stock→flat leg
+    // into the journal against the CC's assignment-notional at-risk basis.
+    this.queueJournalClose(opt, 'called_away');
     this.openOptions.delete(opt.id);
     this.closedOptions.push({ ...opt });
     return { ...opt };
@@ -2350,6 +2377,10 @@ export class PaperOptionsAccount {
       guards?: { maxCcCycles?: number };
     },
     mode: AccountMode = 'demo',
+    // TRA-1978 — optional per-fill journal setup; see {@link openCashSecuredPut}.
+    // Records the covered-call write so the wheel's stock→call leg accrues
+    // evidence, folded closed at called-away / expire / liquidation.
+    journalSetup?: OptionTradeJournalSetup,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -2432,6 +2463,12 @@ export class PaperOptionsAccount {
     lot.openCoveredCallId = position.id;
     lot.ccCount += 1;
     this.openOptions.set(position.id, position);
+    // TRA-1978 — journal the covered-call write. At-risk basis is the ASSIGNMENT-
+    // STRIKE NOTIONAL locked in the backing shares (== collateralUsd); the stock
+    // leg's realized P&L folds into the CC's close row at called-away/liquidation.
+    if (journalSetup) {
+      this.queueJournalOpen(position, 'covered_call', position.collateralUsd ?? 0, journalSetup);
+    }
     return position;
   }
 
@@ -2480,6 +2517,9 @@ export class PaperOptionsAccount {
         cc.currentPremium = buybackPerShare;
         cc.closedAt = Date.now();
         cc.contractsRemaining = 0;
+        // TRA-1978 — fold the covered call's realized leg P&L (credit − buyback)
+        // into the journal under the liquidation reason (stock_stop / max-window).
+        this.queueJournalClose(cc, reason);
         this.openOptions.delete(cc.id);
         this.closedOptions.push({ ...cc });
       }
