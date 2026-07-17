@@ -15,7 +15,8 @@
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "dev": "tsc -b --watch",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "verify:finnhub-token": "tsx src/verify-finnhub-token.ts"
   },
   "dependencies": {
     "@trading-app/agents": "workspace:*",
