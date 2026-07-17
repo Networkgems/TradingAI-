@@ -9,6 +9,8 @@ import {
   buildAccumulationMonitor,
   renderWeeklyRollupMarkdown,
   structureCostUsd,
+  costEfficiencyRatio,
+  COST_EFFICIENCY_MAX,
   DEFAULT_COST_MODEL,
   type IdeaOutcome,
 } from './options-forward-test.js';
@@ -205,7 +207,7 @@ describe('TRA-678 F1 — transaction-cost haircut', () => {
           surfacedDate: '2026-01-05', surfacedWeek: `2026-W${String(w + 2).padStart(2, '0')}`,
           expiration: '2026-02-20', pop: 0.5, maxLossUsd: 300, maxProfitUsd: 600,
           entryNetUsd: -300, status: 'resolved', valuedAt: '2026-02-20', liquidationUsd: 305,
-          pnlUsd: 5, pnlR: 0.02, costsUsd: 11, pnlNetUsd: -6, pnlNetR: -0.02,
+          pnlUsd: 5, pnlR: 0.02, costsUsd: 11, pnlNetUsd: -6, pnlNetR: -0.02, costEfficiencyRatio: 0.037,
           win: true, maxLossBreached: false, excluded: false, excludeReason: null, settleLagDays: 0,
         });
       }
@@ -282,6 +284,80 @@ describe('TRA-678 F4 — guard the R denominator', () => {
   });
 });
 
+// ── TRA-1991: cost-efficiency gate (net-R fix) ───────────────────────────────
+
+describe('TRA-1991 — cost-efficiency gate', () => {
+  it('computes a lot-invariant cost/max-loss ratio and defaults the threshold to 0.15', () => {
+    expect(COST_EFFICIENCY_MAX).toBe(0.15);
+    // 2-leg round-trip cost $10.60; a $50 max-loss spread → 0.212 (cost > 15%).
+    expect(costEfficiencyRatio(2, 50)).toBeCloseTo(0.212, 4);
+    // A wide $500 spread is cheap: 10.6 / 500 = 0.0212 << 0.15.
+    expect(costEfficiencyRatio(2, 500)!).toBeLessThan(0.15);
+    // Lot-INVARIANCE: cost and max-loss both scale ×N, so the ratio is unchanged
+    // (a 27-lot $50/lot spread risks $1350 and costs $286.20 → same 0.212 ratio).
+    expect((structureCostUsd(2) * 27) / (50 * 27)).toBeCloseTo(structureCostUsd(2) / 50, 6);
+    // Null denom guard (no divide-by-zero on the F4 non-positive-max-loss case).
+    expect(costEfficiencyRatio(2, 0)).toBeNull();
+  });
+
+  it('excludes a penny-wide (cost-uneconomic) spread from the gate metrics but still values it', () => {
+    // $0.50 credit on a $1-wide spread → $50 max loss; $10.60 round-trip cost is
+    // 21% of the defined risk — the structural net-R killer the ticket describes.
+    const pennyWide = entry({
+      key: 'cu',
+      strategy: 'bull_put_spread',
+      legs: [leg('sell', 'put', 100, '2026-02-20'), leg('buy', 'put', 99, '2026-02-20')],
+      entryNetUsd: 50,
+      maxLossUsd: 50,
+      maxProfitUsd: 50,
+    });
+    const o = valueIdea(pennyWide, [day('2026-02-20', 105, [])], ET_NOON('2026-02-23'));
+    expect(o.status).toBe('resolved'); // still valued for transparency
+    expect(o.costEfficiencyRatio).toBeCloseTo(0.212, 4); // 10.6 / 50
+    expect(o.excluded).toBe(true);
+    expect(o.excludeReason).toBe('cost_uneconomic');
+    // …and kept out of every gate metric.
+    const report = buildForwardTestReport([o], { asOf: ET_NOON('2026-02-23') });
+    expect(report.totals.resolved).toBe(0);
+    expect(report.totals.excluded).toBe(1);
+    expect(report.totals.excludedCostUneconomic).toBe(1);
+    expect(report.totals.avgCostEfficiencyRatio).toBe(0.21); // r2 of 0.212
+  });
+
+  it('keeps a wide spread whose cost is a small fraction of its max-loss', () => {
+    const wide = entry({
+      key: 'wide',
+      strategy: 'bull_put_spread',
+      legs: [leg('sell', 'put', 100, '2026-02-20'), leg('buy', 'put', 95, '2026-02-20')],
+      entryNetUsd: 150,
+      maxLossUsd: 350, // 10.6 / 350 = 0.03 << 0.15
+      maxProfitUsd: 150,
+    });
+    const o = valueIdea(wide, [day('2026-02-20', 105, [])], ET_NOON('2026-02-23'));
+    expect(o.excluded).toBe(false);
+    expect(o.excludeReason).toBeNull();
+    expect(o.costEfficiencyRatio!).toBeLessThan(0.15);
+  });
+
+  it('respects a caller-supplied cost-efficiency threshold', () => {
+    const spread = entry({
+      key: 'thr',
+      strategy: 'bull_put_spread',
+      legs: [leg('sell', 'put', 100, '2026-02-20'), leg('buy', 'put', 98, '2026-02-20')],
+      entryNetUsd: 100,
+      maxLossUsd: 100, // 10.6 / 100 = 0.106 — under the 0.15 default…
+      maxProfitUsd: 100,
+    });
+    const chains = [day('2026-02-20', 105, [])];
+    const asOf = ET_NOON('2026-02-23');
+    expect(valueIdea(spread, chains, asOf).excluded).toBe(false); // 0.106 < 0.15
+    // …but excluded under a stricter 0.10 bar.
+    const strict = valueIdea(spread, chains, asOf, DEFAULT_COST_MODEL, 0.1);
+    expect(strict.excluded).toBe(true);
+    expect(strict.excludeReason).toBe('cost_uneconomic');
+  });
+});
+
 // ── report ────────────────────────────────────────────────────────────────
 
 describe('buildForwardTestReport', () => {
@@ -355,6 +431,7 @@ describe('evaluateLiveCapitalGate', () => {
           costsUsd: 6,
           pnlNetUsd: 294,
           pnlNetR: 0.98,
+          costEfficiencyRatio: 0.02,
           win: true,
           excluded: false,
           excludeReason: null,
@@ -394,6 +471,7 @@ describe('evaluateLiveCapitalGate', () => {
           costsUsd: 6,
           pnlNetUsd: 294,
           pnlNetR: 0.98,
+          costEfficiencyRatio: 0.02,
           win: true,
           excluded: false,
           excludeReason: null,
@@ -517,6 +595,7 @@ describe('buildAccumulationMonitor', () => {
           costsUsd: 6,
           pnlNetUsd: 144,
           pnlNetR: 0.48,
+          costEfficiencyRatio: 0.02,
           win: true,
           excluded: false,
           excludeReason: null,
@@ -541,6 +620,34 @@ describe('buildAccumulationMonitor', () => {
     expect(m.accumulation.weeksWithResolved).toBe(10);
     expect(m.gate.weeksRemaining).toBe(0); // 8 needed, 10 have → clamped, not −2
     expect(m.gate.resolvedRemaining).toBe(0); // 30 needed, 40 have → clamped
+  });
+
+  it('surfaces the cost-uneconomic count + avg cost ratio (TRA-1991)', () => {
+    const penny = entry({
+      key: 'p',
+      strategy: 'bull_put_spread',
+      legs: [leg('sell', 'put', 100, '2026-02-20'), leg('buy', 'put', 99, '2026-02-20')],
+      entryNetUsd: 50,
+      maxLossUsd: 50, // 10.6 / 50 = 0.212 > 0.15 → cost_uneconomic
+      maxProfitUsd: 50,
+    });
+    const report = buildForwardTestReport(
+      [valueIdea(penny, [day('2026-02-20', 105, [])], ET_NOON('2026-02-23'))],
+      { asOf: ET_NOON('2026-02-23') },
+    );
+    const m = buildAccumulationMonitor({
+      report,
+      gate: GATE,
+      chainOutDir: '/data/option-chains',
+      chainDates: ['2026-02-20'],
+      journalCount: 1,
+      firstJournaledDate: '2026-01-05',
+      lastJournaledDate: '2026-01-05',
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+    expect(m.accumulation.costUneconomicExcluded).toBe(1);
+    expect(m.accumulation.avgCostEfficiencyRatio).toBe(0.21);
   });
 });
 
@@ -596,6 +703,7 @@ describe('renderWeeklyRollupMarkdown', () => {
         costsUsd: 6,
         pnlNetUsd: 294,
         pnlNetR: 0.98,
+        costEfficiencyRatio: 0.02,
         win: true,
         excluded: false,
         excludeReason: null,

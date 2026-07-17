@@ -726,6 +726,47 @@ describe('buildOptionsIdeasFeed', () => {
     expect(feed.ideas.find((i) => i.ticker === 'BBB')!.dte).toBe(46);
   });
 
+  // TRA-1991 — cost-efficiency gate. A penny-wide 1-wide credit spread (~$0.60
+  // credit → ~$40 defined max-loss) carries a $10.60 round-trip cost = ~26% of its
+  // risk denominator, so its live NET R is structurally negative regardless of a
+  // marginally-positive gross edge. The surface-time filter drops it entirely — no
+  // idea, no intent — so the penny-wide, high-credit structures that were dragging
+  // the gate's net-R to −0.63 never reach the journal. A wide spread (below) is kept.
+  it('drops a penny-wide spread whose modeled cost dwarfs its max-loss (TRA-1991)', () => {
+    const pennySym: OptionsResearchSymbol = {
+      ...sym,
+      spot: 421, // short 420 put sits OTM (below spot) so the coherence guard passes
+      candidates: [candidate({ strike: 420, optionType: 'put', mispricingPct: -0.25 })],
+    };
+    const pennyInput: OptionsResearchInput = { asOf: input.asOf, symbols: [pennySym] };
+    // 1-wide put spread, ~$0.60 credit → ~$40 max loss; cost $10.60 ≈ 26% of risk.
+    const pennyRows = new Map<string, OptionChainRow[]>([
+      ['MSFT', [putRow(419, 3.58, 3.62), putRow(420, 4.18, 4.22)]],
+    ]);
+    const { feed, intents } = buildOptionsIdeasFeed({
+      research,
+      input: pennyInput,
+      rowsBySymbol: pennyRows,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(0);
+    expect(intents.size).toBe(0);
+  });
+
+  it('keeps a wide spread whose cost is a small fraction of its max-loss (TRA-1991)', () => {
+    // The default 5-wide bull put spread models a $380 max loss → cost ratio 0.028.
+    const { feed } = buildOptionsIdeasFeed({
+      research,
+      input,
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: 1,
+    });
+    expect(feed.ideas).toHaveLength(1);
+    expect(feed.ideas[0]!.maxLossUsd).toBeCloseTo(380, 4);
+  });
+
   it('drops ideas whose symbol has no anchor candidate', () => {
     const noCand: OptionsResearchInput = { asOf: input.asOf, symbols: [{ ...sym, candidates: [] }] };
     const { feed } = buildOptionsIdeasFeed({

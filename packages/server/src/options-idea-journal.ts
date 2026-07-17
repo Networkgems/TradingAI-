@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import type { DefinedRiskStrategy } from '@trading-app/agents';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { costEfficiencyRatio } from './options-cost-model.js';
 import type { OptionsIdeaView, IdeaLeg } from './options-ideas-feed.js';
 
 // TRA-601 (TRA-595 C6) — the forward-test idea journal.
@@ -95,6 +96,14 @@ export interface IdeaJournalEntry {
    * gate metrics. Optional/absent on legacy entries → treated as priced (true).
    */
   priced?: boolean;
+  /**
+   * TRA-1991 — cost-efficiency ratio = modeled round-trip cost ÷ defined max-loss
+   * (F1 cost model), lot-invariant. Stamped at capture for auditability; the
+   * forward-test EXCLUDES entries whose ratio exceeds `COST_EFFICIENCY_MAX` as
+   * `cost_uneconomic`. Null when max-loss is non-positive; absent on legacy
+   * entries (the scorer recomputes it from leg-count + max-loss regardless).
+   */
+  costEfficiencyRatio?: number | null;
 }
 
 interface StoreFile {
@@ -201,6 +210,7 @@ function toEntry(
       ? (idea.contracts as number)
       : 1;
   const perLot = (usd: number): number => Math.round((usd / lots) * 100) / 100;
+  const maxLossUsd = perLot(idea.maxLossUsd);
   return {
     key: journalKey(surfacedDate, idea.ticker, strategy, expiration),
     surfacedAt,
@@ -214,7 +224,7 @@ function toEntry(
     expiration,
     legs: idea.legs,
     entryNetUsd: perLot(idea.netUsd),
-    maxLossUsd: perLot(idea.maxLossUsd),
+    maxLossUsd,
     maxProfitUsd: perLot(idea.maxProfitUsd),
     breakevens: idea.breakevens,
     spotAtEntry: idea.underlyingPrice ?? null,
@@ -222,6 +232,10 @@ function toEntry(
     // TRA-678 (F2) — capture whether the structure was really priced; absent
     // on a non-live view defaults to priced (true).
     priced: idea.priced ?? true,
+    // TRA-1991 — stamp the (per-lot, lot-invariant) cost-efficiency ratio for
+    // auditability. Computed off the SAME F1 cost model the forward-test scorer
+    // uses, so a journaled stamp and the scorer's recompute agree.
+    costEfficiencyRatio: costEfficiencyRatio(idea.legs.length, maxLossUsd),
   };
 }
 

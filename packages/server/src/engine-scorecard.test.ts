@@ -39,6 +39,8 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
       awaitingData: 0,
       noData: 0,
       excluded: 5,
+      excludedCostUneconomic: 0,
+      avgCostEfficiencyRatio: 0.05,
       wins: 21,
       losses: 12,
       scratches: 2,

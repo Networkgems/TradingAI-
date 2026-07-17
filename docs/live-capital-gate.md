@@ -66,10 +66,11 @@ negative net of costs.
 The forward-test therefore models a conservative, fully-disclosed round-trip cost
 haircut and reports expectancy **both pre-cost and cost-net**:
 
-- **Model** (`DEFAULT_COST_MODEL` in `options-forward-test.ts`, the single source
-  of truth): `$0.65`/contract commission + a `$0.02` half-spread per leg, **per
-  side** (entry and exit). Cost scales with leg count: `legs × 2 sides ×
-  (commission + halfSpread × 100)` USD per 1-lot.
+- **Model** (`DEFAULT_COST_MODEL` in `options-cost-model.ts`, the single source of
+  truth, re-exported from `options-forward-test.ts`): `$0.65`/contract commission +
+  a `$0.02` half-spread per leg, **per side** (entry and exit). Cost scales with
+  leg count: `legs × 2 sides × (commission + halfSpread × 100)` USD per 1-lot
+  (`$10.60` per 2-leg vertical, `$21.20` per 4-leg condor, 1-lot).
 - `costsUsd`, `pnlNetUsd`, `pnlNetR` are added to every outcome; `expectancyNetR`
   / `expectancyNetUsd` and `weeksPositiveExpectancyNet` to the report totals. The
   gross figures are retained alongside so the bias is auditable.
@@ -100,6 +101,21 @@ breaches). Each carries an `excludeReason`; the report totals expose an
   meaningful R denominator. We do **not** substitute `denom = 1` (which would make
   that idea's R equal raw dollars and distort `expectancyR`); its R is left null
   and it is excluded.
+- **`cost_uneconomic` (TRA-1991)** — the modeled round-trip cost exceeds
+  `COST_EFFICIENCY_MAX` (default **0.15**, overridable via
+  `OPTIONS_COST_EFFICIENCY_MAX`) of the defined max-loss. These are penny-wide,
+  high-credit spreads whose defined risk (~$13–25) is barely larger than the fixed
+  $10–21 round-trip cost, so their live NET R is structurally negative regardless
+  of gross edge (measured `-0.63` net vs `+0.20` gross on bqb1, 2026-07-17 — an
+  0.83R cost haircut). The gate must measure the strategy *as we would actually
+  trade it live*, so these are valued and reported but excluded. Two coordinated
+  guards: a **surface-time filter** (`options-ideas-feed.ts`) stops new such ideas
+  from ever being journaled, and this exclusion reclassifies pre-existing journaled
+  history at scoring time. The ratio is **lot-invariant** (both cost and max-loss
+  scale with contracts), so the only levers are wider spreads, fewer legs, or a
+  thicker gross edge — not size. Each idea carries an auditable `costEfficiencyRatio`
+  (journal + outcome), and the accumulation monitor surfaces the excluded count +
+  mean ratio. Surfacing-only — live execution stays gated by TRA-1965 → TRA-532.
 
 ## The gate criteria
 

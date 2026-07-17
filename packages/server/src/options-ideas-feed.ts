@@ -32,6 +32,7 @@ type EmittableStrategy = Exclude<DefinedRiskStrategy, CoveredStrategy>;
 import type { OptionChainRow } from '@trading-app/engine';
 import { evaluateMultiLegPreTrade, DEFAULT_MAX_LOSS_PCT_CAP, maxLossCapUsd } from '@trading-app/engine';
 import type { DayTradingGuardrailConfig } from '@trading-app/shared';
+import { costEfficiencyRatio, COST_EFFICIENCY_MAX } from './options-cost-model.js';
 
 // ── UI contract (mirrors AiOptionsIdeasPanel.tsx) ────────────────────────────
 export type EventKind = 'earnings' | 'fomc' | 'cpi' | 'jobs' | 'pce' | 'fed_headline';
@@ -850,6 +851,19 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
     // renders and can't be entered. Belt-and-suspenders to the strike-selection
     // fix above, which already keeps credit shorts OTM.
     if (!ideaPopPlacementCoherent(idea.strategy, structure, sym.spot, idea.pop)) continue;
+
+    // TRA-1991 — cost-efficiency gate (net-R fix). Drop any defined-risk structure
+    // whose modeled round-trip cost (F1) would consume more than COST_EFFICIENCY_MAX
+    // of its defined max-loss. These are the penny-wide, high-credit spreads whose
+    // fixed ~$10–21 retail round-trip cost dwarfs a ~$13–25 risk denominator, so
+    // their live NET R is structurally negative regardless of a marginally-positive
+    // gross edge (measured −0.63 net vs +0.20 gross on bqb1, 2026-07-17). The ratio
+    // is LOT-INVARIANT (cost and max-loss both scale with contracts), so evaluate on
+    // the PER-LOT max-loss BEFORE sizing. Registers no idea and no intent, so an
+    // uneconomic card never renders and can't be entered. Recommendation/surfacing-
+    // only; live execution stays gated by TRA-1965 → TRA-532 + human sign-off.
+    const costRatio = costEfficiencyRatio(structure.legs.length, structure.maxLossUsd);
+    if (costRatio != null && costRatio > COST_EFFICIENCY_MAX) continue;
 
     // TRA-1368 — derive the DTE + catalyst horizon from the EXECUTED legs, not the
     // model's intended `idea.dteDays`. The legs are the single source of truth for

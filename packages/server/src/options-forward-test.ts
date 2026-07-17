@@ -7,6 +7,20 @@ import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import { isoWeek, type IdeaJournalEntry } from './options-idea-journal.js';
 import type { IdeaLeg } from './options-ideas-feed.js';
+import {
+  DEFAULT_COST_MODEL,
+  structureCostUsd,
+  costEfficiencyRatio,
+  COST_EFFICIENCY_MAX,
+  type CostModel,
+} from './options-cost-model.js';
+
+// TRA-678 (F1) + TRA-1991 — the cost model + cost-efficiency threshold live in a
+// leaf module (`options-cost-model.ts`) to keep them a single source of truth
+// without a forward-test ⇄ journal import cycle. Re-exported here so existing
+// importers (tests, callers) resolve these names from this module unchanged.
+export { DEFAULT_COST_MODEL, structureCostUsd, costEfficiencyRatio, COST_EFFICIENCY_MAX };
+export type { CostModel };
 
 // TRA-601 (TRA-595 C6) — the forward-test *valuation* + weekly report.
 //
@@ -59,7 +73,17 @@ export type ExcludeReason =
   /** F4 — non-positive defined max-loss makes its R meaningless. */
   | 'non_positive_max_loss'
   /** F3 — settled on a chain too many trading days after expiry (drifted spot). */
-  | 'stale_settlement';
+  | 'stale_settlement'
+  /**
+   * TRA-1991 — modeled round-trip cost exceeds `COST_EFFICIENCY_MAX` of the
+   * defined max-loss (a penny-wide, high-credit spread whose fixed retail cost
+   * dwarfs its risk denominator). We would never take it with real capital, so it
+   * is valued and reported but excluded from the gate's aggregate metrics — the
+   * gate must measure the strategy as we would actually trade it live. The
+   * surface-time filter (`options-ideas-feed`) now stops NEW such ideas from being
+   * journaled; this reclassifies pre-existing journaled history at scoring time.
+   */
+  | 'cost_uneconomic';
 
 export interface IdeaOutcome {
   key: string;
@@ -91,6 +115,12 @@ export interface IdeaOutcome {
   pnlNetUsd: number | null;
   /** F1 — cost-net R-multiple (pnlNet ÷ maxLoss). Null when unvalued or no denom. */
   pnlNetR: number | null;
+  /**
+   * TRA-1991 — cost-efficiency ratio = modeled round-trip cost ÷ defined max-loss
+   * (lot-invariant). Null when max-loss is non-positive. An idea whose ratio
+   * exceeds `COST_EFFICIENCY_MAX` is excluded (`cost_uneconomic`).
+   */
+  costEfficiencyRatio: number | null;
   /** Win iff a RESOLVED idea's realized P/L > 0. Null while open/unvalued. */
   win: boolean | null;
   /** True when realized loss exceeded the stated defined-risk max (integrity flag). */
@@ -159,42 +189,6 @@ function snapshotSpot(day: ChainDay, ticker: string): number | null {
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
 
-// ── transaction-cost model (F1) ─────────────────────────────────────────────
-//
-// Entry net and (open) marks price at MID; settlement is intrinsic. Real fills
-// cross the bid/ask per leg and pay commission, on BOTH the entry and the exit.
-// So mid-to-mid R is optimistically biased — a 4-leg condor crosses up to 8
-// half-spreads round-trip. We haircut a conservative, fully-disclosed cost so the
-// gate evaluates a *net* edge, not the paper-perfect one. Gross figures are kept
-// alongside so the bias is auditable and the model can be retuned in one place.
-
-export interface CostModel {
-  /** Commission per contract, per side (entry and exit are separate sides), USD. */
-  commissionPerContract: number;
-  /** Half bid/ask spread crossed per contract, per side, in premium points (× 100). */
-  halfSpreadPerContract: number;
-}
-
-/**
- * Default round-trip cost model — deliberately conservative-but-modest retail
- * assumptions for liquid US single-name/ETF options ($0.65/contract commission,
- * a $0.02 half-spread per leg per side). One source of truth; mirrored in
- * `docs/live-capital-gate.md`.
- */
-export const DEFAULT_COST_MODEL: CostModel = {
-  commissionPerContract: 0.65,
-  halfSpreadPerContract: 0.02,
-};
-
-const SIDES = 2; // round trip: entry + exit
-
-/** Modeled round-trip transaction cost (USD per 1-lot) for a structure's legs. */
-export function structureCostUsd(legCount: number, model: CostModel = DEFAULT_COST_MODEL): number {
-  const commission = legCount * SIDES * model.commissionPerContract;
-  const spread = legCount * SIDES * model.halfSpreadPerContract * CONTRACT;
-  return r2(commission + spread);
-}
-
 /** F3 — max trading days a settlement chain may lag expiry before it's quarantined. */
 const MAX_SETTLE_LAG_TRADING_DAYS = 1;
 
@@ -228,19 +222,26 @@ export function valueIdea(
   chainDays: readonly ChainDay[],
   asOf: number,
   costModel: CostModel = DEFAULT_COST_MODEL,
+  costEfficiencyMax: number = COST_EFFICIENCY_MAX,
 ): IdeaOutcome {
   const asOfDate = etDateKey(asOf);
   const costsUsd = structureCostUsd(entry.legs.length, costModel);
   const hasDenom = entry.maxLossUsd > 0;
+  // TRA-1991 — recompute the cost-efficiency ratio from the entry's leg-count +
+  // defined max-loss (not the persisted stamp) so the exclusion applies uniformly
+  // to legacy journal history captured before the surface-time filter existed.
+  const costEffRatio = costEfficiencyRatio(entry.legs.length, entry.maxLossUsd, costModel);
 
-  // Exclusion is decided from the captured entry up-front (F2/F4); a settlement
-  // lag (F3) can add an exclusion at resolve time. An excluded outcome is still
-  // valued and reported, but never counts toward the gate's aggregate metrics.
+  // Exclusion is decided from the captured entry up-front (F2/F4/TRA-1991); a
+  // settlement lag (F3) can add an exclusion at resolve time. An excluded outcome
+  // is still valued and reported, but never counts toward the gate's metrics.
   const entryExclude: ExcludeReason | null = !hasDenom
     ? 'non_positive_max_loss' // F4 — no meaningful R denominator
     : entry.priced === false
       ? 'fallback_priced' // F2 — fabricated entry basis
-      : null;
+      : costEffRatio != null && costEffRatio > costEfficiencyMax
+        ? 'cost_uneconomic' // TRA-1991 — cost dwarfs defined risk; uneconomic live
+        : null;
 
   const base: IdeaOutcome = {
     key: entry.key,
@@ -261,6 +262,7 @@ export function valueIdea(
     costsUsd,
     pnlNetUsd: null,
     pnlNetR: null,
+    costEfficiencyRatio: costEffRatio,
     win: null,
     maxLossBreached: false,
     excluded: entryExclude != null,
@@ -416,6 +418,14 @@ export interface ForwardTestReport {
     noData: number;
     /** TRA-678 — outcomes excluded from every aggregate metric below. */
     excluded: number;
+    /** TRA-1991 — of `excluded`, how many were dropped as `cost_uneconomic`. */
+    excludedCostUneconomic: number;
+    /**
+     * TRA-1991 — mean cost-efficiency ratio (cost ÷ max-loss) across ALL surfaced
+     * outcomes with a positive max-loss denominator. Null when none have one.
+     * Inspectable proxy for "how close to the cost floor is the surfaced slate".
+     */
+    avgCostEfficiencyRatio: number | null;
     wins: number;
     losses: number;
     scratches: number;
@@ -531,6 +541,11 @@ export function buildForwardTestReport(
   const expectancyNetR = mean(resolved.map((o) => o.pnlNetR ?? 0));
   const avgPredictedPop = mean(resolved.map((o) => o.pop));
   const weeksWithResolved = weeks.filter((w) => w.resolved > 0);
+  // TRA-1991 — cost-efficiency inspection over ALL surfaced outcomes (not just
+  // included/resolved): the surfaced slate's mean cost/max-loss ratio + the count
+  // dropped as uneconomic make the gate's cost haircut directly auditable.
+  const costRatios = outcomes.map((o) => o.costEfficiencyRatio).filter((x): x is number => x != null);
+  const avgCostEfficiencyRatio = costRatios.length ? r2(mean(costRatios) ?? 0) : null;
 
   return {
     generatedAt: asOf,
@@ -543,6 +558,8 @@ export function buildForwardTestReport(
       awaitingData: outcomes.filter((o) => o.status === 'awaiting_data').length,
       noData: outcomes.filter((o) => o.status === 'no_data').length,
       excluded: outcomes.filter((o) => o.excluded).length,
+      excludedCostUneconomic: outcomes.filter((o) => o.excludeReason === 'cost_uneconomic').length,
+      avgCostEfficiencyRatio,
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,
@@ -611,6 +628,10 @@ export interface AccumulationMonitor {
     resolved: number;
     open: number;
     excluded: number;
+    /** TRA-1991 — of `excluded`, how many were dropped as `cost_uneconomic`. */
+    costUneconomicExcluded: number;
+    /** TRA-1991 — mean cost ÷ max-loss across surfaced ideas (null when none priced). */
+    avgCostEfficiencyRatio: number | null;
     weeksWithResolved: number;
     weeksPositiveExpectancyNet: number;
     expectancyNetR: number | null;
@@ -689,6 +710,8 @@ export function buildAccumulationMonitor(input: {
       resolved: t.resolved,
       open: t.open,
       excluded: t.excluded,
+      costUneconomicExcluded: t.excludedCostUneconomic,
+      avgCostEfficiencyRatio: t.avgCostEfficiencyRatio,
       weeksWithResolved: t.weeksWithResolved,
       weeksPositiveExpectancyNet: t.weeksPositiveExpectancyNet,
       expectancyNetR: t.expectancyNetR,
@@ -748,6 +771,9 @@ export function renderWeeklyRollupMarkdown(input: {
   lines.push(`| Excluded (data hygiene) | ${t.excluded} | — | — |`);
   lines.push('');
   lines.push(`**Cost-net expectancy (R):** ${fmtR(t.expectancyNetR)} · **Weeks positive (net):** ${t.weeksPositiveExpectancyNet}/${t.weeksWithResolved} · **Hit-rate:** ${fmtPct(t.hitRate)}`);
+  lines.push('');
+  // TRA-1991 — surface the cost-efficiency effect so the net-R haircut is auditable.
+  lines.push(`**Cost-efficiency (TRA-1991):** avg cost/max-loss ${fmtR(t.avgCostEfficiencyRatio)} · ${t.excludedCostUneconomic} idea(s) excluded as cost-uneconomic (cost > ${Math.round(COST_EFFICIENCY_MAX * 100)}% of defined risk)`);
   lines.push('');
   lines.push(`### Feeds`);
   lines.push('');
