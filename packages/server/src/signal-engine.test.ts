@@ -95,6 +95,11 @@ import {
   clearLiveOptionsFeeSlippageLedger,
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
+import {
+  setPreTradeLiquidityLedgerFileForTests,
+  listLiquidityGateDecisions,
+  PRE_TRADE_LIQUIDITY_FLAG,
+} from './pre-trade-liquidity-ledger.js';
 
 // TRA-1929 — the RV live arm is now the flag AND an open bounded-test window
 // (`OPTION_LIVE_TEST_UNTIL`). The armed-path suites below set a far-future window so
@@ -6311,5 +6316,113 @@ describe('SignalEngine — wheel paper routing (TRA-1977)', () => {
     await runShortPremium(engine, ['GME']);
 
     expect(demoCoveredWrites(engine, 'GME')).toHaveLength(0);
+  });
+});
+
+// TRA-1980 — the SHADOW-first record call-sites: the live-equity and live-option
+// mirror paths now feed `recordLiquidityGateDecision`. These exercise the two
+// private record helpers directly (the same seam the mirror paths call), asserting
+// (a) the candidate shape/id/orderQty per engine, and (b) that the kill switch keeps
+// flag-off a total no-op — no ledger row and, for options, not even a broker quote.
+describe('TRA-1980 — pre-trade liquidity record call-sites (SHADOW-first)', () => {
+  const tmpFile = join(
+    tmpdir(),
+    `pre-trade-liquidity-callsite-${process.pid}-${Math.random().toString(36).slice(2)}.jsonl`,
+  );
+
+  beforeEach(() => {
+    setPreTradeLiquidityLedgerFileForTests(tmpFile);
+    try { rmSync(tmpFile); } catch { /* fresh run */ }
+    delete process.env[PRE_TRADE_LIQUIDITY_FLAG];
+  });
+  afterEach(() => {
+    delete process.env[PRE_TRADE_LIQUIDITY_FLAG];
+    setPreTradeLiquidityLedgerFileForTests(null);
+    try { rmSync(tmpFile); } catch { /* best-effort cleanup */ }
+  });
+
+  const equitySignal = {
+    symbol: 'AAPL', side: 'buy', timestamp: 1_720_000_000_000,
+  } as unknown as TradeSignal;
+  const equityPos = { quantity: 100 } as unknown as Position;
+
+  function engineWithEquityBook(book: Record<string, unknown> = {}): SignalEngine {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    (engine as unknown as { symbolState: Map<string, unknown> }).symbolState.set('AAPL', {
+      symbol: 'AAPL', price: 100, volume: 1, change: 0, changePct: 0,
+      lastUpdated: Date.now(), quoteStatus: 'ok',
+      bid: 99.9, ask: 100.1, bidSize: 10, askSize: 12, ...book,
+    });
+    return engine;
+  }
+
+  const callEquity = (engine: SignalEngine): Promise<void> =>
+    (engine as unknown as {
+      recordEquityLiquidityShadow: (s: TradeSignal, p: Position) => Promise<void>;
+    }).recordEquityLiquidityShadow(equitySignal, equityPos);
+
+  it('equity: records an engine:equity decision off the symbol L1 book when the flag is on', async () => {
+    process.env[PRE_TRADE_LIQUIDITY_FLAG] = 'true';
+    await callEquity(engineWithEquityBook());
+    const rows = await listLiquidityGateDecisions();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: 'equity:AAPL:buy:1720000000000',
+      engine: 'equity', side: 'buy',
+      bid: 99.9, ask: 100.1, bidSize: 10, askSize: 12,
+      orderQty: 100, // shares
+      impactMeasured: true,
+    });
+  });
+
+  it('equity: flag OFF is a total no-op (nothing written)', async () => {
+    await callEquity(engineWithEquityBook());
+    expect(await listLiquidityGateDecisions()).toHaveLength(0);
+  });
+
+  it('equity: skips a symbol with no L1 book (fallback feed) rather than recording a bogus row', async () => {
+    process.env[PRE_TRADE_LIQUIDITY_FLAG] = 'true';
+    // Book fields cleared → a Yahoo/Stooq-sourced quote with no bid/ask.
+    await callEquity(engineWithEquityBook({ bid: undefined, ask: undefined, bidSize: undefined, askSize: undefined }));
+    expect(await listLiquidityGateDecisions()).toHaveLength(0);
+  });
+
+  const callOption = (engine: SignalEngine, opened: unknown): Promise<void> =>
+    (engine as unknown as {
+      recordOptionLiquidityShadow: (o: unknown) => Promise<void>;
+    }).recordOptionLiquidityShadow(opened);
+
+  it('options: records an engine:options buy decision with orderQty=contracts*100 from the option quote', async () => {
+    process.env[PRE_TRADE_LIQUIDITY_FLAG] = 'true';
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    const getOptionQuote = vi.fn(async () => ({ symbol: 'AAPL240920C00190000', bid: 1.00, ask: 1.20 }));
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = { getOptionQuote };
+
+    await callOption(engine, {
+      symbol: 'AAPL', optionSymbol: 'AAPL240920C00190000', contracts: 2, openedAt: 999,
+    });
+
+    expect(getOptionQuote).toHaveBeenCalledWith('AAPL240920C00190000');
+    const rows = await listLiquidityGateDecisions();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: 'options:AAPL:buy:999', engine: 'options', side: 'buy',
+      bid: 1.00, ask: 1.20, orderQty: 200,
+    });
+    // The Tradier option quote carries no displayed sizes ⇒ spread-only (unmeasured impact).
+    expect(rows[0]!.impactMeasured).toBe(false);
+  });
+
+  it('options: flag OFF makes no broker quote call and writes nothing', async () => {
+    const engine = new SignalEngine(undefined, undefined, undefined);
+    const getOptionQuote = vi.fn(async () => ({ symbol: 'X', bid: 1, ask: 2 }));
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = { getOptionQuote };
+
+    await callOption(engine, {
+      symbol: 'AAPL', optionSymbol: 'AAPL240920C00190000', contracts: 2, openedAt: 1,
+    });
+
+    expect(getOptionQuote).not.toHaveBeenCalled();
+    expect(await listLiquidityGateDecisions()).toHaveLength(0);
   });
 });

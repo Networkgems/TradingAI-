@@ -39,6 +39,10 @@ import {
   isCatalystGateTarget,
   type CatalystGateDecision,
 } from './catalyst-gate.js';
+import {
+  recordLiquidityGateDecision,
+  isPreTradeLiquidityEnabled,
+} from './pre-trade-liquidity-ledger.js';
 import { recordShadowSignal, resolveShadowSignal, resolveOutcome, openShadowSignalsSync, type ShadowSignalRecord } from './shadow-signal-ledger.js';
 import {
   isReversalShadowEnabled,
@@ -243,6 +247,16 @@ export interface SymbolState {
    * permanent "Loading…" spinner when upstream providers are down.
    */
   quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  /**
+   * TRA-1980 — L1 best bid/ask (+ displayed sizes) when the quote source carries a
+   * book (Tradier only; the Yahoo/Stooq fallbacks leave these undefined). Consumed
+   * by the SHADOW-first pre-trade liquidity gate on the live-equity mirror path.
+   * Purely additive: nothing on the render/signal paths reads them.
+   */
+  bid?: number;
+  ask?: number;
+  bidSize?: number;
+  askSize?: number;
 }
 
 export interface EngineState {
@@ -2915,6 +2929,13 @@ export class SignalEngine {
         changePct: q.changePct,
         lastUpdated: Date.now(),
         quoteStatus: 'ok',
+        // TRA-1980 — carry the L1 book through when the source provided one
+        // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
+        // no-record rather than a bogus decision on a book it never saw.
+        ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
+        ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
+        ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
+        ...(typeof q.askSize === 'number' ? { askSize: q.askSize } : {}),
       });
     }
     // For symbols we attempted but couldn't quote, surface a status so the watchlist
@@ -4137,6 +4158,8 @@ export class SignalEngine {
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
       recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
+      // TRA-1980 — SHADOW-first pre-trade liquidity record on the live-equity mirror.
+      if (this.mode === 'live') void this.recordEquityLiquidityShadow(signal, pos);
     } else {
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'sizing_returned_no_position'); // TRA-1768
     }
@@ -5569,6 +5592,10 @@ export class SignalEngine {
     if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) {
       return true;
     }
+    // TRA-1980 — SHADOW-first pre-trade liquidity record at order-decision time
+    // (before the smart-open walk moves the book). Fire-and-forget: a no-op when the
+    // flag is off, and best-effort so it can never delay or throw into the fill path.
+    void this.recordOptionLiquidityShadow(opened);
     const notionalCost = opened.premiumPaid * opened.contracts * 100;
     // TRA-332 — surface the void reason on the dashboard so the user sees why no
     // trade opened, not just a silent log line.
@@ -9326,6 +9353,8 @@ export class SignalEngine {
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
       recordEquityEntryAdmitted(funnelMode, funnelEngineId); // TRA-1768 — reached the book
+      // TRA-1980 — SHADOW-first pre-trade liquidity record on the live-equity mirror.
+      if (this.mode === 'live') void this.recordEquityLiquidityShadow(signal, pos);
     } else {
       // TRA-1768 — the last silent hole: the account/mirror can decline to open (e.g.
       // sized below a risk floor) and the candidate simply evaporated, no reason
@@ -12036,6 +12065,86 @@ export class SignalEngine {
     this.liveEquityPositions.set(position.id, position);
     this.liveEquityOrderIds.set(position.id, tradierOrderId);
     return position;
+  }
+
+  /**
+   * TRA-1980 (parent TRA-1967) — SHADOW-first pre-trade LIQUIDITY record for the
+   * live-EQUITY mirror path. Reads the L1 book off the cached symbol quote and
+   * appends an `engine:'equity'` liquidity-gate decision to the shadow ledger WHEN
+   * `ENABLE_PRE_TRADE_LIQUIDITY_GATE` is on. Flag OFF (default, prod) ⇒ a total
+   * no-op: no ledger write, no behavior change. This is the shadow-POPULATION step
+   * only — the recorded verdict is never acted on here (no veto / downsize routing),
+   * per the TRA-1980 DoD. Best-effort: any failure is swallowed so accounting can
+   * never break the order path. A symbol whose quote source carried no book
+   * (Yahoo/Stooq fallback, or a pre-book cache row) is skipped rather than recorded
+   * against a book we never saw — a missing feed is not a wide book.
+   */
+  private async recordEquityLiquidityShadow(signal: TradeSignal, position: Position): Promise<void> {
+    if (!isPreTradeLiquidityEnabled()) return;
+    const state = this.symbolState.get(signal.symbol);
+    if (!state || typeof state.bid !== 'number' || typeof state.ask !== 'number') return;
+    try {
+      await recordLiquidityGateDecision({
+        // Stable per-candidate-bar id: a re-fire on the same signal bar folds to a
+        // no-op in the ledger, so a per-tick shadow pass can't inflate the sample.
+        id: `equity:${signal.symbol}:${signal.side}:${signal.timestamp}`,
+        ts: Date.now(),
+        symbol: signal.symbol,
+        engine: 'equity',
+        input: {
+          side: signal.side,
+          bid: state.bid,
+          ask: state.ask,
+          orderQty: position.quantity, // equity order size is in shares
+          ...(typeof state.bidSize === 'number' ? { bidSize: state.bidSize } : {}),
+          ...(typeof state.askSize === 'number' ? { askSize: state.askSize } : {}),
+        },
+      });
+    } catch (err) {
+      log.warn('pre-trade liquidity shadow (equity) record failed', {
+        symbol: signal.symbol,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * TRA-1980 — SHADOW-first pre-trade LIQUIDITY record for the live-OPTION mirror
+   * path (RV / OTM / directional — all routed through {@link mirrorLiveOptionOpen}).
+   * Same governance as the equity twin: with `ENABLE_PRE_TRADE_LIQUIDITY_GATE` off
+   * (default, prod) this returns before any broker call, so there is zero behavior
+   * change AND zero extra Tradier request. When the flag is on it pulls the option's
+   * L1 quote — the same touch the smart-open walk will cross — and records a `buy`
+   * decision with `orderQty = contracts × 100`. The Tradier option quote carries no
+   * displayed sizes today, so the impact term stays unmeasured (spread-only) until a
+   * sized options feed exists — exactly the DoD's "sizes when the quote carries
+   * them". Best-effort; never throws into the order path.
+   */
+  private async recordOptionLiquidityShadow(
+    opened: import('@trading-app/shared').OptionPosition,
+  ): Promise<void> {
+    if (!isPreTradeLiquidityEnabled()) return;
+    if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) return;
+    try {
+      const quote = await this.tradierLiveClient.getOptionQuote(opened.optionSymbol);
+      await recordLiquidityGateDecision({
+        id: `options:${opened.symbol}:buy:${opened.openedAt}`,
+        ts: Date.now(),
+        symbol: opened.symbol,
+        engine: 'options',
+        input: {
+          side: 'buy',
+          bid: typeof quote?.bid === 'number' ? quote.bid : Number.NaN,
+          ask: typeof quote?.ask === 'number' ? quote.ask : Number.NaN,
+          orderQty: opened.contracts * 100,
+        },
+      });
+    } catch (err) {
+      log.warn('pre-trade liquidity shadow (options) record failed', {
+        optionSymbol: opened.optionSymbol,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**

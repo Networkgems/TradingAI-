@@ -1,5 +1,5 @@
 import YahooFinance from 'yahoo-finance2';
-import { TradierStocksClient, type TradierEnv } from '@trading-app/engine';
+import { TradierStocksClient, type TradierEnv, type TradierEquityQuote } from '@trading-app/engine';
 import type { Candle, NewsItem } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
 
@@ -1182,7 +1182,40 @@ export async function fetchMinuteBarsWithSource(
   }
 }
 
-type QuoteResult = { price: number; volume: number; change: number; changePct: number };
+type QuoteResult = {
+  price: number;
+  volume: number;
+  change: number;
+  changePct: number;
+  /**
+   * TRA-1980 — L1 book, present only on the Tradier quote path (the Yahoo / chart
+   * / Stooq fallbacks carry no book). Feeds the SHADOW-first pre-trade liquidity
+   * gate; every consumer must treat these as optional.
+   */
+  bid?: number;
+  ask?: number;
+  bidSize?: number;
+  askSize?: number;
+};
+
+/**
+ * TRA-1980 — project a Tradier equity quote onto the internal {@link QuoteResult},
+ * carrying the L1 book (bid/ask/sizes) through ONLY when Tradier reported a finite
+ * touch. The Yahoo / chart / Stooq fallbacks build a `QuoteResult` with no book, so
+ * a downstream reader (the pre-trade liquidity gate) treats the absence as "no L1".
+ */
+function tradierQuoteToResult(q: TradierEquityQuote): QuoteResult {
+  return {
+    price: q.price,
+    volume: q.volume,
+    change: q.change,
+    changePct: q.changePct,
+    ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
+    ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
+    ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
+    ...(typeof q.askSize === 'number' ? { askSize: q.askSize } : {}),
+  };
+}
 
 /**
  * TRA-1035 — pure: synthesise a spot quote from a Yahoo *chart* result's `meta`
@@ -1275,7 +1308,7 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
       const map = await tradierStocksClient.getQuotes([symbol]);
       const q = map.get(symbol);
       if (q) {
-        return { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct };
+        return tradierQuoteToResult(q);
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1368,7 +1401,7 @@ export async function fetchQuotes(
           const tradier = await tradierStocksClient!.getQuotes(toFetchArr);
           const storedAt = Date.now();
           for (const [sym, q] of tradier) {
-            const quote = { price: q.price, volume: q.volume, change: q.change, changePct: q.changePct };
+            const quote = tradierQuoteToResult(q);
             quoteCache.set(sym, { quote, storedAt });
             if (staleSet.has(sym)) results.set(sym, quote);
           }

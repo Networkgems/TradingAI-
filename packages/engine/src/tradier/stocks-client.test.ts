@@ -85,6 +85,37 @@ describe('TradierStocksClient.getQuotes', () => {
     await client.getQuotes(['AAPL']);
     expect(String(fetchMock.mock.calls[0][0])).toMatch(/^https:\/\/api\.tradier\.com\/v1\/markets\/quotes/);
   });
+
+  // TRA-1980 — the L1 book (bid/ask + sizes) is now plumbed through for the
+  // pre-trade liquidity gate. It must be carried when Tradier reports it and
+  // stay absent (never a bogus 0) when it doesn't, so the gate can degrade.
+  it('surfaces the L1 book (bid/ask + sizes) when the Tradier quote carries it', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: {
+          symbol: 'AAPL', last: 195.25, change: 0, change_percentage: 0, volume: 1,
+          bid: 195.20, ask: 195.30, bidsize: 4, asksize: 7,
+        },
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['AAPL']);
+    expect(out.get('AAPL')).toMatchObject({
+      price: 195.25, bid: 195.20, ask: 195.30, bidSize: 4, askSize: 7,
+    });
+  });
+
+  it('leaves L1 book fields absent when the Tradier quote omits them', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'MSFT', last: 422.80, change: 0, change_percentage: 0, volume: 1 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const q = (await client.getQuotes(['MSFT'])).get('MSFT')!;
+    expect(q.bid).toBeUndefined();
+    expect(q.ask).toBeUndefined();
+    expect(q.bidSize).toBeUndefined();
+    expect(q.askSize).toBeUndefined();
+  });
 });
 
 describe('TradierStocksClient.getMinuteBars', () => {

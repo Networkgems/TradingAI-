@@ -11,6 +11,16 @@ export interface TradierEquityQuote {
   change: number;
   /** Pct change since previous close (0..100 scale, matching Yahoo). */
   changePct: number;
+  /**
+   * TRA-1980 — L1 best bid/ask (and displayed sizes, in shares) when the Tradier
+   * quote carries them. Optional: the Yahoo/Stooq fallbacks and older cached rows
+   * have no book, so a consumer (the pre-trade liquidity gate) that reads these
+   * must tolerate their absence. Zero/absent ⇒ "no L1 book for this quote".
+   */
+  bid?: number;
+  ask?: number;
+  bidSize?: number;
+  askSize?: number;
 }
 
 interface TradierRawQuote {
@@ -19,9 +29,11 @@ interface TradierRawQuote {
   change?: number;
   change_percentage?: number;
   volume?: number;
-  // Useful for diagnostics; not consumed today:
+  // TRA-1980 — the L1 book is now consumed: it feeds the pre-trade liquidity gate.
   bid?: number;
   ask?: number;
+  bidsize?: number;
+  asksize?: number;
   trade_date?: number;
 }
 
@@ -148,6 +160,17 @@ export class TradierStocksClient {
         volume: q.volume ?? 0,
         change: q.change ?? 0,
         changePct: q.change_percentage ?? 0,
+        // TRA-1980 — carry the L1 book through for the pre-trade liquidity gate.
+        // Only surfaced when Tradier actually returns them (a finite touch);
+        // `bidsize`/`asksize` are passed through in the native units Tradier reports
+        // them in, matching the TradierFeed convention (packages/engine/src/feed/
+        // tradier-feed.ts) — the shadow-first slippage KPI (TRA-1981) reconciles the
+        // modeled-vs-realized depth so any lot/share unit skew is calibrated, not
+        // hard-coded here.
+        ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
+        ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
+        ...(typeof q.bidsize === 'number' ? { bidSize: q.bidsize } : {}),
+        ...(typeof q.asksize === 'number' ? { askSize: q.asksize } : {}),
       });
     }
     return out;
