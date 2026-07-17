@@ -7,6 +7,7 @@ import {
   isStockTwitsBreakerOpen,
   resetStockTwitsBreaker,
   tripStockTwitsBreaker,
+  resetStockTwitsProxy,
   probeStockTwits,
 } from './stocktwits-feed.js';
 
@@ -106,6 +107,39 @@ describe('fetchStockTwitsStream', () => {
     );
     if (prev === undefined) delete process.env.STOCKTWITS_ACCESS_TOKEN;
     else process.env.STOCKTWITS_ACCESS_TOKEN = prev;
+  });
+
+  it('does NOT attach a proxy dispatcher when STOCKTWITS_PROXY_URL is unset (TRA-1969)', async () => {
+    const prev = process.env.STOCKTWITS_PROXY_URL;
+    delete process.env.STOCKTWITS_PROXY_URL;
+    resetStockTwitsProxy();
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchStockTwitsStream('AAPL');
+    // Inert: the init is headers-only, byte-for-byte identical to pre-TRA-1969.
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.not.objectContaining({ dispatcher: expect.anything() }),
+    );
+    resetStockTwitsProxy();
+    if (prev !== undefined) process.env.STOCKTWITS_PROXY_URL = prev;
+  });
+
+  it('routes through a proxy dispatcher when STOCKTWITS_PROXY_URL is set (TRA-1969)', async () => {
+    const prev = process.env.STOCKTWITS_PROXY_URL;
+    process.env.STOCKTWITS_PROXY_URL = 'http://user:pass@static.example.com:9293';
+    resetStockTwitsProxy();
+    const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
+    vi.stubGlobal('fetch', fetchMock);
+    await fetchStockTwitsStream('AAPL');
+    // A dispatcher (undici ProxyAgent) is attached so Cloudflare sees the clean egress IP.
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ dispatcher: expect.anything() }),
+    );
+    resetStockTwitsProxy();
+    if (prev === undefined) delete process.env.STOCKTWITS_PROXY_URL;
+    else process.env.STOCKTWITS_PROXY_URL = prev;
   });
 
   it('returns null (not throw) when fetch rejects', async () => {

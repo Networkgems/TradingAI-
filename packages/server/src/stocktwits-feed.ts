@@ -21,6 +21,7 @@
  * rather than 500ing.
  */
 import type { StockTwitsMessage } from '@trading-app/shared';
+import { ProxyAgent, type Dispatcher } from 'undici';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'stocktwits-feed' });
@@ -70,6 +71,54 @@ function withAccessToken(url: string, env: NodeJS.ProcessEnv = process.env): str
   if (!token) return url;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}access_token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * TRA-1969 — optional clean-egress proxy. The StockTwits stream sits behind
+ * Cloudflare, which blocks our datacenter egress IP by *reputation*
+ * (TRA-1330) — a decision Cloudflare makes at the edge BEFORE any token is
+ * read, so neither {@link withAccessToken} nor {@link BROWSER_HEADERS} can
+ * clear it. The only lever is presenting a clean/dedicated egress IP. When the
+ * `STOCKTWITS_PROXY_URL` secret is set (a managed dedicated-IP HTTP proxy,
+ * e.g. `http://user:pass@static.host:9293`), every StockTwits stream/probe
+ * call is routed through it via an undici {@link ProxyAgent} dispatcher so
+ * Cloudflare sees the proxy's clean IP instead of Render's. The proxy is
+ * SCOPED to this feed only (per-call `dispatcher`, never the global one) so it
+ * cannot touch broker/quote/execution egress. It is a SECRET — supplied via
+ * env, never committed. When unset this is fully inert: no dispatcher is
+ * attached and behavior is byte-for-byte identical to today.
+ */
+let cachedStockTwitsProxy: { url: string; agent: ProxyAgent } | null = null;
+
+function stockTwitsProxyDispatcher(env: NodeJS.ProcessEnv = process.env): Dispatcher | undefined {
+  const url = env['STOCKTWITS_PROXY_URL']?.trim();
+  if (!url) return undefined;
+  // Memoize by URL so we reuse one pooled agent across calls (and rebuild only
+  // if the secret is rotated to a different endpoint).
+  if (cachedStockTwitsProxy?.url !== url) {
+    cachedStockTwitsProxy = { url, agent: new ProxyAgent(url) };
+  }
+  return cachedStockTwitsProxy.agent;
+}
+
+/** Reset the memoized proxy agent. Exported for tests. */
+export function resetStockTwitsProxy(): void {
+  cachedStockTwitsProxy = null;
+}
+
+/** undici's `fetch` accepts a `dispatcher`; the DOM `RequestInit` type does not. */
+type StockTwitsFetchInit = RequestInit & { dispatcher?: Dispatcher };
+
+/**
+ * Build the `fetch` init shared by every StockTwits call: the browser-like
+ * header fingerprint (TRA-1330) plus, when `STOCKTWITS_PROXY_URL` is set, a
+ * clean-egress proxy dispatcher (TRA-1969). Inert (headers only) when unset.
+ */
+function stockTwitsFetchInit(env: NodeJS.ProcessEnv = process.env): StockTwitsFetchInit {
+  const init: StockTwitsFetchInit = { headers: BROWSER_HEADERS };
+  const dispatcher = stockTwitsProxyDispatcher(env);
+  if (dispatcher) init.dispatcher = dispatcher;
+  return init;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -165,7 +214,7 @@ async function fetchStreamMessages(
     return null;
   }
   try {
-    const resp = await withTimeout(fetch(withAccessToken(url), { headers: BROWSER_HEADERS }), ST_CALL_TIMEOUT_MS, label);
+    const resp = await withTimeout(fetch(withAccessToken(url), stockTwitsFetchInit()), ST_CALL_TIMEOUT_MS, label);
     if (resp.status === 429) {
       const until = resetDeadlineFrom(resp, now);
       tripStockTwitsBreaker(until);
@@ -292,7 +341,7 @@ export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeR
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
   try {
     const resp = await withTimeout(
-      fetch(withAccessToken(url), { headers: BROWSER_HEADERS }),
+      fetch(withAccessToken(url), stockTwitsFetchInit()),
       ST_CALL_TIMEOUT_MS,
       `stocktwits-probe(${sym})`,
     );
