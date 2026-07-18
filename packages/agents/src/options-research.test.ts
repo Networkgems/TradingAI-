@@ -413,6 +413,47 @@ describe('runOptionsResearch', () => {
   });
 });
 
+describe('TRA-2005 — creditUsd + SHADOW expectancy gate', () => {
+  it('accepts an optional positive creditUsd and rejects a non-positive one', () => {
+    expect(validateOptionsIdeaBatch({ ideas: [goodIdea({ creditUsd: 76 })] })).toEqual([]);
+    expect(validateOptionsIdeaBatch({ ideas: [goodIdea()] })).toEqual([]); // absent is fine
+    const errs = validateOptionsIdeaBatch({ ideas: [goodIdea({ creditUsd: 0 })] });
+    expect(errs.some((e) => /creditUsd must be a number > 0/.test(e))).toBe(true);
+  });
+
+  it('threads creditUsd onto the surfaced idea', async () => {
+    const llm = new StubLlmClient(() => JSON.stringify({ ideas: [goodIdea({ creditUsd: 76 })] }));
+    const out = await runOptionsResearch(input(), { llm });
+    expect(out.ideas[0]!.creditUsd).toBe(76);
+  });
+
+  it('is byte-for-byte inert when the gate flag is OFF (no expectancyShadow)', async () => {
+    delete process.env.ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE;
+    const llm = new StubLlmClient(() => JSON.stringify({ ideas: [goodIdea({ creditUsd: 76 })] }));
+    const out = await runOptionsResearch(input(), { llm });
+    expect(out.expectancyShadow).toBeUndefined();
+  });
+
+  it('attaches a SHADOW ledger when the flag is ON, without changing the slate', async () => {
+    process.env.ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE = '1';
+    try {
+      // ivRank 72 (from symbol()), a penny-wide credit at raw POP 0.7 → −EV → shadow drop,
+      // but the slate is unchanged (SHADOW only).
+      const llm = new StubLlmClient(() =>
+        JSON.stringify({ ideas: [goodIdea({ pop: 0.7, creditUsd: 40, maxLossUsd: 280 })] }),
+      );
+      const out = await runOptionsResearch(input(), { llm });
+      expect(out.ideas).toHaveLength(1); // slate NOT thinned
+      expect(out.expectancyShadow).toBeDefined();
+      expect(out.expectancyShadow!.counts.total).toBe(1);
+      expect(out.expectancyShadow!.counts.drop).toBe(1);
+      expect(out.expectancyShadow!.entries[0]!.result.verdict).toBe('drop');
+    } finally {
+      delete process.env.ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE;
+    }
+  });
+});
+
 describe('optionsResearchBatchKey', () => {
   it('is stable for identical inputs and busts when the spot moves', () => {
     const a = optionsResearchBatchKey(input());

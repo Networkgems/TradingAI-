@@ -18,6 +18,11 @@
 // deterministic batch key so a re-run within the same trading day costs $0.
 import { DAY_TRADING_GUARDRAIL, type OptionType } from '@trading-app/shared';
 import { completeJson, type CompleteJsonResult, type LlmClient, type LlmMessage } from './llm-client.js';
+import {
+  evaluateIdeasExpectancyShadow,
+  resolveExpectancyGateConfig,
+  type IdeaExpectancyShadow,
+} from './options-ideas-expectancy-gate.js';
 
 /**
  * The capped-loss strategies. Anything outside this allowlist (naked/short single
@@ -295,6 +300,13 @@ export interface OptionsIdea {
   pop: number;
   /** Defined max loss per 1-lot in USD — finite and > 0 by construction. */
   maxLossUsd: number;
+  /**
+   * TRA-2005 — net credit received per 1-lot in USD (= credit·100), for net-credit
+   * structures. Optional: absent on debit families and on any credit idea the model
+   * didn't price. With `maxLossUsd` (= (width − credit)·100) this fully prices the
+   * spread for the positive-expectancy gate (`credit/(width−credit) = creditUsd/maxLossUsd`).
+   */
+  creditUsd?: number;
   /** Nearest-leg DTE; guaranteed ≥ guardrail.minDteDays in the returned list. */
   dteDays: number;
   /** Event-context badges for the UI, e.g. ["earnings in 3d", "FOMC in 1d"]. */
@@ -319,6 +331,12 @@ export interface OptionsResearchResult {
   rejected: RejectedIdea[];
   /** True when the batch was served from cache (no LLM call this run). */
   cached: boolean;
+  /**
+   * TRA-2005 — SHADOW-only positive-expectancy + IVR/credit-width verdicts over the
+   * surfaced slate. Present ONLY when the gate flag is on; the slate itself is
+   * unchanged (records what the gate WOULD drop, never acts). Absent = flag off.
+   */
+  expectancyShadow?: IdeaExpectancyShadow;
 }
 
 /** Optional batch cache (TRA-595 §5: "one structured call per idea batch, cacheable"). */
@@ -430,6 +448,12 @@ export function validateOptionsIdeaBatch(value: unknown): string[] {
     if (!isFiniteNumber(idea.maxLossUsd) || idea.maxLossUsd <= 0) {
       errors.push(`${at}.maxLossUsd must be a number > 0 (defined-risk only)`);
     }
+    // TRA-2005 — creditUsd is OPTIONAL (only credit structures carry it); when
+    // present it must be a positive net credit. A bad/absent value simply leaves
+    // the idea 'unpriced' for the shadow expectancy gate, never a batch retry.
+    if (idea.creditUsd !== undefined && (!isFiniteNumber(idea.creditUsd) || idea.creditUsd <= 0)) {
+      errors.push(`${at}.creditUsd must be a number > 0 when present`);
+    }
     if (!isFiniteNumber(idea.dteDays) || idea.dteDays < 0) {
       errors.push(`${at}.dteDays must be a number ≥ 0`);
     }
@@ -461,6 +485,10 @@ const SYSTEM_PROMPT = [
   '   are given. Never propose 0DTE or sub-minimum-DTE ideas.',
   '3. Only trade tickers present in the supplied universe.',
   '4. maxLossUsd is the DEFINED dollar loss per 1-lot (100 multiplier). It must be > 0.',
+  '   For a NET-CREDIT vertical, maxLossUsd = (width − credit) × 100. Also emit creditUsd = the',
+  '   net credit received per 1-lot × 100 (so creditUsd + maxLossUsd = width × 100). creditUsd is',
+  '   REQUIRED for credit structures (bull_put_spread / bear_call_spread / iron_condor /',
+  '   iron_butterfly) and omitted for debit / long-premium structures.',
   '5. pop is your honest probability-of-profit estimate at expiry, 0..1, grounded in the',
   '   data given (delta, mispricing, IV-rank). When IV-rank is unknown, do not claim an IV edge.',
   '6. SELL THE CRUSH (event-IV, HARD). When a symbol carries `sellTheCrush: true` — a scheduled',
@@ -497,7 +525,8 @@ const SYSTEM_PROMPT = [
   '',
   'Return ONLY a JSON object, no prose, of the form:',
   '{ "ideas": [ { "ticker": str, "strategy": str, "thesis": str, "pop": num(0..1),',
-  '  "maxLossUsd": num>0, "dteDays": int, "eventContext": [str] } ] }',
+  '  "maxLossUsd": num>0, "creditUsd": num>0 (credit structures only), "dteDays": int,',
+  '  "eventContext": [str] } ] }',
   'Rank best-first. Keep theses concise and tied to the data. If nothing clears the bar,',
   'return { "ideas": [] }.',
 ].join('\n');
@@ -569,6 +598,8 @@ interface RawIdea {
   thesis: string;
   pop: number;
   maxLossUsd: number;
+  /** TRA-2005 — net credit per 1-lot in USD; optional (credit structures only). */
+  creditUsd?: number;
   dteDays: number;
   eventContext?: string[];
 }
@@ -703,6 +734,9 @@ function enforceGuardrail(
         thesis: r.thesis.trim(),
         pop: r.pop,
         maxLossUsd: r.maxLossUsd,
+        ...(typeof r.creditUsd === 'number' && Number.isFinite(r.creditUsd) && r.creditUsd > 0
+          ? { creditUsd: r.creditUsd }
+          : {}),
         dteDays: r.dteDays,
         eventContext: r.eventContext ?? [],
         catalystHorizon: horizon,
@@ -832,7 +866,41 @@ export async function runOptionsResearch(
     attempts: completion.attempts,
     rejected,
     cached: false,
+    // TRA-2005 — SHADOW-only: when the flag is on, score the surfaced slate against
+    // the positive-expectancy + IVR/credit-width gate and attach the verdicts. The
+    // slate itself is UNCHANGED (records what the gate would drop, never acts).
+    // Flag off → config is null → field absent → byte-for-byte the old result.
+    ...buildExpectancyShadow(ideas, input.symbols),
   };
   deps.cache?.set(key, result);
   return result;
+}
+
+/**
+ * TRA-2005 — build the SHADOW expectancy ledger for a surfaced slate, or `{}` when
+ * the gate flag is off (so the result is spread-in unchanged). Looks up each idea's
+ * underlying IV-rank from the input symbols; POP is the raw stated POP (the interim
+ * −0.15 haircut stands in for the TRA-2006 calibrated POP until it is armed here).
+ */
+function buildExpectancyShadow(
+  ideas: OptionsIdea[],
+  symbols: OptionsResearchSymbol[],
+): { expectancyShadow?: IdeaExpectancyShadow } {
+  const config = resolveExpectancyGateConfig();
+  if (config == null) return {};
+  const ivByTicker = new Map<string, number | null>();
+  for (const s of symbols) ivByTicker.set(s.symbol.toUpperCase(), s.ivRank);
+  const shadow = evaluateIdeasExpectancyShadow(
+    ideas.map((idea) => ({
+      ticker: idea.ticker,
+      strategy: idea.strategy,
+      rank: idea.rank,
+      pop: idea.pop,
+      maxLossUsd: idea.maxLossUsd,
+      creditUsd: idea.creditUsd,
+      ivRank: ivByTicker.get(idea.ticker.toUpperCase()) ?? null,
+    })),
+    config,
+  );
+  return { expectancyShadow: shadow };
 }
