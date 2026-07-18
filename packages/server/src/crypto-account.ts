@@ -1,6 +1,7 @@
 import type { AccountState, Position, PositionQuoteSource, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { cryptoTieredCostModel, type CostModel } from '@trading-app/engine';
+import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import { randomUUID } from 'crypto';
 // Import the logger from its own module, NOT the ./observability/index.js barrel: the
 // barrel re-exports ./health-routes.js, which reaches crypto-regime-tsmom-demo-route.ts,
@@ -181,12 +182,19 @@ export class CryptoPaperAccount {
     return this.managedEquity() * this.riskPerTrade;
   }
 
-  /** Fractional sizing for crypto (6 decimal places). */
+  /**
+   * TRA-2034 — fractional crypto sizing through the shared engine `RiskManager`
+   * (the same code the backtest runner uses) instead of a bespoke
+   * `round(maxRisk / dist, 6dp)`. Crypto sizes with `fractionalQuantity` (8dp
+   * floor, matching the runner's TRA-186 crypto path) and now inherits the
+   * TRA-178 notional cap. See {@link sizeFromStopViaRiskManager}.
+   */
   sizeFromStop(entryPrice: number, stopPrice: number): number {
-    const dist = Math.abs(entryPrice - stopPrice);
-    if (dist === 0) return 0;
-    const rawQty = this.maxRiskPerTrade() / dist;
-    return Math.round(rawQty * 1_000_000) / 1_000_000;
+    return sizeFromStopViaRiskManager(entryPrice, stopPrice, {
+      managedEquity: this.managedEquity(),
+      riskPerTrade: this.riskPerTrade,
+      fractionalQuantity: true,
+    });
   }
 
   /**

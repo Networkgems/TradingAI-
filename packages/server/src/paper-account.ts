@@ -1,6 +1,7 @@
 import type { AccountState, ExitReason, Position, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS, validateBracket } from '@trading-app/shared';
 import { chandelierStop, chandelierExitTriggered, profitLockDecision } from '@trading-app/engine';
+import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
 
@@ -114,10 +115,18 @@ export class PaperAccount {
     return this.managedEquity() * this.riskPerTrade;
   }
 
+  /**
+   * TRA-2034 — size through the shared engine `RiskManager` (the same code the
+   * backtest runner uses) instead of a bespoke `floor(maxRisk / dist)`, so demo
+   * and backtest size identically from the same risk inputs and the TRA-178
+   * notional cap now runs on the demo book too. See {@link sizeFromStopViaRiskManager}.
+   */
   sizeFromStop(entryPrice: number, stopPrice: number): number {
-    const dist = Math.abs(entryPrice - stopPrice);
-    if (dist === 0) return 0;
-    return Math.floor(this.maxRiskPerTrade() / dist);
+    return sizeFromStopViaRiskManager(entryPrice, stopPrice, {
+      managedEquity: this.managedEquity(),
+      riskPerTrade: this.riskPerTrade,
+      fractionalQuantity: false,
+    });
   }
 
   /**

@@ -26,6 +26,7 @@ import {
 } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
 
+import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'crypto-live-account' });
@@ -1090,12 +1091,24 @@ export class CryptoLiveAccount {
     return this.managedEquity() * this.riskPerTrade;
   }
 
-  /** Same fractional sizing as the paper account — 6 decimal places. */
+  /**
+   * TRA-2034 — long-side risk→qty sizing through the shared engine
+   * `RiskManager` (the same code the backtest runner + demo accounts use), so
+   * the live book sizes identically to sim from the same risk inputs and
+   * inherits the TRA-178 notional cap. The live-only guards below the call site
+   * (managed-equity cap `:1357`, cash-with-fee-buffer `:1364`, min-notional
+   * `:1401`, per-symbol notional clamp `:1378`) still layer ON TOP of this — it
+   * only replaces the bespoke `round(maxRisk / dist, 6dp)` budget, and the final
+   * quantity is re-floored to Coinbase's `base_increment` before submission.
+   * The perp-short path (`sizeShortFromStop`) keeps its TRA-264 risk-fraction
+   * sizer and §6 notional governance untouched. See {@link sizeFromStopViaRiskManager}.
+   */
   sizeFromStop(entryPrice: number, stopPrice: number): number {
-    const dist = Math.abs(entryPrice - stopPrice);
-    if (dist === 0) return 0;
-    const rawQty = this.maxRiskPerTrade() / dist;
-    return Math.round(rawQty * 1_000_000) / 1_000_000;
+    return sizeFromStopViaRiskManager(entryPrice, stopPrice, {
+      managedEquity: this.managedEquity(),
+      riskPerTrade: this.riskPerTrade,
+      fractionalQuantity: true,
+    });
   }
 
   /**
