@@ -121,7 +121,6 @@ if (days.length === 0) {
 console.log(`[tra1308] loaded ${days.length} days ${days[0].date}..${days[days.length - 1].date}`);
 
 // per-symbol ordered close series and quick day lookup
-const dayIndex = new Map(days.map((d, i) => [d.date, i]));
 const closesBySym = new Map(); // symbol -> [{i, date, spot}]
 for (let i = 0; i < days.length; i++) {
   for (const [sym, snap] of days[i].bySymbol) {
@@ -434,7 +433,7 @@ const md = `# TRA-1308 Phase A — Short-premium demo-routing GO/NO-GO
 - **Forward window is short** (${report.method.dateRange}, IV-rank only populated from 2026-05-29). Sample is trade-level, not independent: consecutive-day same-symbol entries are correlated; the routing proxy applies a one-open-per-symbol filter to reduce this.
 - **Settlement bias:** only structures expiring within the capture window are scored, tilting the sample toward shorter DTE. Longer-dated candidates (${report.coverage.unsettleableTopEntries} top entries) are excluded.
 - Held-to-expiry ignores pin/assignment risk and early-assignment on American options; managed exit assumes daily (not intraday) monitoring at the recorder's ~15:55 ET mark.
-- No commissions modelled (≈\$0.65/contract/leg would shave taker expectancy further).
+- No commissions modelled (≈$0.65/contract/leg would shave taker expectancy further).
 `;
 
 await writeFile(join(REPORTS_DIR, 'tra1308-short-premium.json'), JSON.stringify(report, null, 2), 'utf-8');

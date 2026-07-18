@@ -674,7 +674,7 @@ describe('buildAccumulationMonitor', () => {
 });
 
 describe('renderWeeklyRollupMarkdown', () => {
-  const emptyMonitor = (blockedOn: string[]) =>
+  const emptyMonitor = (_blockedOn: string[]) =>
     buildAccumulationMonitor({
       report: buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') }),
       gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30 },

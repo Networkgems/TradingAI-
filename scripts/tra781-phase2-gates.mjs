@@ -105,7 +105,6 @@ function entrySlippageCost(pos, entryRowsBySymbol) {
     if (!row || typeof row.bid !== 'number' || typeof row.ask !== 'number' || row.ask <= 0) {
       return null; // missing quote -> exclude trade from G3 rather than guess
     }
-    const mid = (row.bid + row.ask) / 2;
     const half = Math.max(0, (row.ask - row.bid) / 2);
     // sell -> you receive bid (lose half-spread); buy -> you pay ask (lose half-spread)
     extraPerShare += half + PER_LEG_SLIPPAGE;
@@ -151,7 +150,7 @@ async function main() {
   for (let bi = 0; bi < EQUITIES.length; bi++) {
     const eq = EQUITIES[bi];
     CAPTURE = [];
-    const bucket = replayBucket(days, eq, cfg);
+    replayBucket(days, eq, cfg);
     const closed = CAPTURE.slice();
 
     // fidelity cross-check: my captured aggregates must equal canonical byStructure

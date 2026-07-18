@@ -10,7 +10,7 @@
 //   4. a genuine 404 (endpoint not deployed) still softens to the preview.
 // fetch is stubbed so the 60s poll never touches the network.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AiOptionsIdeasPanel } from './AiOptionsIdeasPanel';
 

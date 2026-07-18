@@ -137,9 +137,6 @@ function isActiveInterest(symbol: string): boolean {
 // 429s or the env vars are missing.
 
 const TRADIER_ENV = (process.env['TRADIER_ENV'] as TradierEnv) ?? 'sandbox';
-const TRADIER_API_TOKEN = TRADIER_ENV === 'production'
-  ? (process.env['TRADIER_API_TOKEN'] ?? '')
-  : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN'] ?? '');
 // TRA-1937: Tradier sandbox.tradier.com does NOT serve live market data — only
 // api.tradier.com does. Use a dedicated token for market-data calls so the quote
 // feed always reaches the production endpoint regardless of the trading env.

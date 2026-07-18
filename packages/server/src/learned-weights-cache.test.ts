@@ -51,7 +51,7 @@ function lossRow(): OptionTradeJournalRecord {
 
 describe('OptionWeightsCache (intraday refresh)', () => {
   it('recomputes on invalidate and the weights change after a close', async () => {
-    let clock = 1_000;
+    const clock = 1_000;
     const rows: OptionTradeJournalRecord[] = [];
     const cache = new OptionWeightsCache({
       ttlMs: 60_000,

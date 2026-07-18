@@ -215,6 +215,7 @@ function main() {
   const configs: RunParams[] = [];
   for (const swingK of [2, 3]) for (const regimeFilter of [true, false]) for (const rrFilter of [true, false]) configs.push({ swingK, regimeFilter, rrFilter });
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose result rows aggregated for the harness report
   const results: any[] = [];
   for (const p of configs) {
     const all: Trade[] = [];

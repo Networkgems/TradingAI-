@@ -45,7 +45,6 @@ const DATA_DIR = resolve(HERE, '..', 'data');
 const REPORT_DIR = resolve(HERE, '..', 'reports');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const YEAR_MS = 365.25 * DAY_MS;
 
 // OOS forward window: the held-out span not used for any parameter choice. DCA
 // has no fitted parameters (cadence + EMA-200 gate are fixed design), so this is

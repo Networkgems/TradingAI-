@@ -3291,7 +3291,7 @@ describe('PaperOptionsAccount.openCashSecuredPut', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const csp = acct.openCashSecuredPut(cspParams())!;
     acct.settleCoveredWrite(csp.id, { kind: 'assigned' });
-    const cc = acct.openCoveredCall(ccParams())!;
+    acct.openCoveredCall(ccParams());
     const lotId = acct.getAssignedShares()[0].id;
     // Crash to 40: call is deep OTM (buyback ≈ 0, keep the 100 credit), stock
     // realizes (40 − 50)×100 = −1,000.

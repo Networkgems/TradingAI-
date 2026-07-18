@@ -3,6 +3,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+// `ShellExt` (the `.shell()` accessor) is only used to spawn the bundled server
+// sidecar in release builds; gate the import to the same cfg so debug/test builds
+// (where the sidecar block is compiled out) don't see an unused import under
+// clippy's `-D warnings`.
+#[cfg(not(debug_assertions))]
 use tauri_plugin_shell::ShellExt;
 
 #[tauri::command]

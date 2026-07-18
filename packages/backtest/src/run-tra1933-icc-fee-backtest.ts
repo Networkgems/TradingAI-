@@ -438,6 +438,7 @@ function main() {
   }
 
   // Precompute per-symbol setups + base ATR once per (htfMult, swingK).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose result rows aggregated for the harness report
   const results: any[] = [];
   const symbolsUsed: string[] = [];
   let dataStart = Infinity, dataEnd = -Infinity;
@@ -483,10 +484,12 @@ function main() {
 }
 
 interface Gate { verdict: string; passes: Record<string, boolean>; detail: string }
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose result object from the harness run
 function gradeGate(primary: any): Gate {
   const taker = primary.arms[GATE_ARM] as Stats;
   const regimesPositive = Object.entries(taker.byRegime)
     .filter(([g]) => g === 'trend_up' || g === 'chop_down');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- byRegime values are loosely typed
   const nRegimesPositive = regimesPositive.filter(([, v]) => (v as any).expectancyR > 0).length;
   const passes = {
     'net-of-taker expectancy > 0': taker.expectancyR > 0,
@@ -513,6 +516,7 @@ function gradeGate(primary: any): Gate {
 }
 
 function fmt(n: number, d = 3): string { return Number.isFinite(n) ? n.toFixed(d) : 'n/a'; }
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose report object assembled by the harness
 function renderMd(r: any): string {
   const L: string[] = [];
   L.push(`# TRA-1933 — ICC net-of-fee backtest`);
@@ -535,6 +539,7 @@ function renderMd(r: any): string {
   L.push('');
   L.push(`| cost arm | n | expectancy (R) | win% | realized R:R | Sharpe | Sortino | maxDD (R) |`);
   L.push(`|---|--:|--:|--:|--:|--:|--:|--:|`);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- config rows are loosely typed
   const primary = r.configs.find((c: any) => c.params.htfMult === 6 && c.params.swingK === 2 && c.params.regimeFilter && c.params.rrFilter);
   for (const arm of COST_ARMS) {
     const s = primary.arms[arm.key];
@@ -546,6 +551,7 @@ function renderMd(r: any): string {
   const preg = primary.arms[GATE_ARM].byRegime;
   L.push(`| regime | n | expectancy (R) |`);
   L.push(`|---|--:|--:|`);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- byRegime values are loosely typed
   for (const [g, v] of Object.entries(preg)) L.push(`| ${g} | ${(v as any).n} | ${fmt((v as any).expectancyR, 4)} |`);
   L.push('');
   L.push(`## Sensitivity — net-of-taker (${GATE_ARM}) expectancy across all configs`);

@@ -28,7 +28,6 @@ function lcg(seed: number): () => number {
 
 const UNIVERSE = 30;
 const BARS = 80; // matches the engine's candle-cache depth
-const SESSION_BARS_PER_DAY = 390;
 
 /** Build a 1-minute OHLCV series inside a US RTH session so ORB/BbFade gates engage. */
 function buildSeries(seed: number): Candle[] {

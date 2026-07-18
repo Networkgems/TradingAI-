@@ -270,22 +270,6 @@ function optionsProductionIntent(s: AccountSettings): boolean {
 }
 
 /**
- * TRA-1436 — would the post-PUT settings place REAL-CAPITAL live orders, the
- * state the TRA-532 promotion gate exists to guard?
- *   • Crypto — Coinbase live has NO sandbox, so `mode==='live'` with crypto
- *     auto-trading ON is always real capital and stays gated as-is (#2).
- *   • Options — real capital ⇔ Tradier Environment = Production. Sandbox (paper)
- *     risks zero real capital and must NOT be gated (#1); Production stays
- *     fail-closed (#3).
- * Used only when the environment-aware gate is armed; otherwise the legacy
- * crypto-only trigger (`liveCryptoOn`) is preserved verbatim.
- */
-function liveRealCapitalIntent(s: AccountSettings): boolean {
-  if (s.mode !== 'live') return false;
-  return liveCryptoOn(s) || optionsProductionIntent(s);
-}
-
-/**
  * TRA-1590 — the independent REAL-CAPITAL "intent axes" the promotion gate
  * guards. Each is a distinct way the resulting live config would place
  * real-money orders. De-escalation logic compares axes before/after a PUT and

@@ -5,7 +5,6 @@ import {
   type PboResult,
 } from './overfitting-stats.js';
 import {
-  DETECTABILITY_FLOOR_CONSTRAINT,
   HORIZONS,
   PCR_BOOTSTRAP_CONFIDENCE,
   PCR_BOOTSTRAP_ITERS,

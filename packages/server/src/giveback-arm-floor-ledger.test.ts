@@ -1,7 +1,7 @@
 // TRA-1892 (parent TRA-1592 → TRA-1435) — durable, recoverable give-back arm-floor
 // forward-test ledger.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, appendFileSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, appendFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
