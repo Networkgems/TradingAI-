@@ -28,6 +28,7 @@ import {
   isOptionDemoDirectionalEnabled,
   isOptionIvRvScannerEnabled,
   isOptionShortPremiumScannerEnabled,
+  isWheelIvEntryFilterEnabled,
   isOptionLiveOtmEnabled,
   isOptionLiveRvLongEnabled,
   isOptionLiveTestWindowOpen,
@@ -39,6 +40,7 @@ import {
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
+import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
 import { summarizeFundingCarryScans } from '../perp-funding-carry-scanner.js';
 import { isCryptoRegimeEnabled } from '../crypto-regime-flag.js';
@@ -1106,6 +1108,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       enabled: isOptionShortPremiumScannerEnabled(),
       ...summarizeShortPremiumScans(now()),
+    });
+  });
+
+  // TRA-2028 — unauthenticated, secrets-free WHEEL PROMOTION GATE readout. Folds
+  // three observe-only pieces: the IV-percentile entry-filter ledger
+  // (entered-vs-skipped by IVP decile, Part A), the vol-spike stress suite
+  // re-priced over the current demo wheel book (Part B), and the combined
+  // promotion-gate rule (pass/fail/pending per criterion). Carries only the demo
+  // book's own defined-risk figures — no balances/PII — so it is unauthenticated
+  // (parity with /short-premium). `enabled` mirrors the EFFECTIVE
+  // ENABLE_WHEEL_IV_ENTRY_FILTER through the demo-flags overlay (file over env, so
+  // it reflects a daemon-free arm). OFF ⇒ the filter is observe-only and the gate
+  // reads mostly `pending` on a calm/empty forward book — an honest not-yet, never
+  // a silent pass. Read-only: routes no order. Live stays gated on TRA-382.
+  app.get('/api/health/wheel-promotion-gate', (_req, res) => {
+    const dir = process.env.DATA_DIR;
+    const env = dir ? resolveDemoFlagEnv(dir) : process.env;
+    const ivFilterEnabled = isWheelIvEntryFilterEnabled(env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      enabled: ivFilterEnabled,
+      liveCapitalReachable: false,
+      ...buildWheelPromotionGateSummary({ now: now(), ivFilterEnabled }),
     });
   });
 

@@ -57,7 +57,7 @@ import {
   isPreTradeGateEnabled,
   recordPreTradeGateDecision,
 } from './pre-trade-gate-ledger.js';
-import { ivRankSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
+import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
 import { listOptionTradeJournal } from './option-trade-journal.js';
 import {
@@ -76,7 +76,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
@@ -89,6 +89,15 @@ import {
   planExpirySettlement,
   planLotGuard,
 } from './wheel-router.js';
+import {
+  evaluateWheelIvEntry,
+  recordWheelIvDecision,
+  resolveWheelIvFilterConfig,
+  type WheelIvMarkKind,
+  type WheelIvLeg,
+} from './wheel-iv-entry-filter.js';
+import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
+import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
@@ -7195,7 +7204,10 @@ export class SignalEngine {
     // symbol so settlement (which iterates ALL open wheel state) can look up a
     // spot even for a symbol whose scan produced no candidate this pass.
     const routeWheel = isOptionWheelRoutingEnabled();
-    const wheelScans = new Map<string, { result: ShortPremiumScanResult; spot: number }>();
+    const wheelScans = new Map<
+      string,
+      { result: ShortPremiumScanResult; spot: number; ivPercentile: number | null; markKind: WheelIvMarkKind; atmIv: number | null }
+    >();
 
     for (const sym of symbols) {
       try {
@@ -7223,6 +7235,11 @@ export class SignalEngine {
         const atmIv = atmIvFromRows(snap.rows, snap.spot);
         if (atmIv != null) void recordDailyIv(sym, atmIv, asOf).catch(() => {});
         const ivRank = atmIv != null ? ivRankSync(sym, atmIv, asOf) : null;
+        // TRA-2028 — the IV-PERCENTILE the wheel entry filter gates on, off the
+        // SAME mid-mark ATM-IV surface. `markKind:'stale'` when no usable mid IV
+        // this pass (fail-loud), so the filter never gates on a proxy.
+        const ivPercentile = atmIv != null ? ivPercentileSync(sym, atmIv, asOf) : null;
+        const markKind: WheelIvMarkKind = atmIv != null ? 'mid' : 'stale';
 
         const result = scanShortPremiumFromSnapshot(
           { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, rows: snap.rows },
@@ -7231,7 +7248,7 @@ export class SignalEngine {
         );
         recordShortPremiumScan(result, asOf);
         if (routeWheel && isWheelUniverseSymbol(result.symbol)) {
-          wheelScans.set(result.symbol.toUpperCase(), { result, spot: snap.spot });
+          wheelScans.set(result.symbol.toUpperCase(), { result, spot: snap.spot, ivPercentile, markKind, atmIv });
         }
 
         if (result.candidates.length > 0) {
@@ -7292,13 +7309,46 @@ export class SignalEngine {
    * left to settle on a later tick rather than settled against a stale mark.
    */
   private runWheelCycle(
-    wheelScans: Map<string, { result: ShortPremiumScanResult; spot: number }>,
+    wheelScans: Map<
+      string,
+      { result: ShortPremiumScanResult; spot: number; ivPercentile: number | null; markKind: WheelIvMarkKind; atmIv: number | null }
+    >,
     now: number,
   ): void {
     const acct = this.optionsAccount;
     const spotOf = (symbol: string): number | null => {
       const s = wheelScans.get(symbol.toUpperCase());
       return s && s.spot > 0 ? s.spot : null;
+    };
+
+    // TRA-2028 — evaluate + ledger the IV-percentile entry filter for one wheel
+    // write idea, then report whether the caller should SKIP the open. Observe-
+    // only unless ENABLE_WHEEL_IV_ENTRY_FILTER is set: the decision is recorded
+    // on EVERY idea (entered AND skipped) for the by-decile calibration, but the
+    // open is only suppressed when the flag is ON. The TRA-1968 catalyst check
+    // for the extreme (>90) band is not yet wired here, so `hasBinaryEventInLife`
+    // is passed as `null` — conservatively blocking extreme-IVP sells when the
+    // filter enforces, the correct fail-safe until that dependency lands.
+    const ivFilterEnforced = isWheelIvEntryFilterEnabled();
+    const ivFilterConfig = resolveWheelIvFilterConfig();
+    const applyIvFilter = (
+      scan: { result: ShortPremiumScanResult; ivPercentile: number | null; markKind: WheelIvMarkKind },
+      leg: WheelIvLeg,
+    ): boolean => {
+      const decision = evaluateWheelIvEntry({
+        symbol: scan.result.symbol,
+        ivRank: scan.result.ivRank,
+        ivPercentile: scan.ivPercentile,
+        markKind: scan.markKind,
+        hasBinaryEventInLife: null,
+        config: ivFilterConfig,
+      });
+      recordWheelIvDecision(scan.result.symbol, leg, decision, now);
+      // Suppress the open only when enforcing AND the filter says skip. Marginal
+      // (sized-down) entries still open the standard lot for now — the size-down
+      // multiplier is carried on the recorded decision; enforcing it on contract
+      // count is a follow-up once the wheel primitive exposes sizing.
+      return ivFilterEnforced && decision.action === 'skip';
     };
 
     // ── 1. Settle covered writes at/past expiry ──────────────────────────────
@@ -7351,6 +7401,8 @@ export class SignalEngine {
       if (!scan) continue;
       const cc = selectWheelCoveredCall(scan.result, lot.costBasisPerShare);
       if (!cc) continue;
+      // TRA-2028 — IV-percentile entry filter (observe-only unless the flag is on).
+      if (applyIvFilter(scan, 'cc')) continue;
       const opened = acct.openCoveredCall(
         {
           symbol: cc.symbol,
@@ -7389,6 +7441,8 @@ export class SignalEngine {
       if (hasWrite || hasLot) continue;
       const csp = selectWheelCsp(scan.result);
       if (!csp) continue;
+      // TRA-2028 — IV-percentile entry filter (observe-only unless the flag is on).
+      if (applyIvFilter(scan, 'csp')) continue;
       const opened = acct.openCashSecuredPut(
         {
           symbol: csp.symbol,
@@ -7415,6 +7469,86 @@ export class SignalEngine {
           creditPerShare: csp.creditPerShare,
         });
       }
+    }
+
+    // ── 4. Record the current book for the promotion-gate stress readout ──────
+    // TRA-2028 — snapshot the post-cycle wheel book (covered writes + assigned
+    // lots) into the process-global store the read-only
+    // `GET /api/health/wheel-promotion-gate` surface re-prices under the vol-spike
+    // stress suite. Only positions whose symbol was scanned this pass carry a
+    // fresh spot/ATM-IV; others are left out (they re-appear on a later pass with
+    // a fresh mark) rather than stressed against a stale one.
+    this.recordWheelBookSnapshot(wheelScans, now);
+  }
+
+  /**
+   * TRA-2028 — map the demo wheel book (covered writes + assigned lots) to the
+   * stress-harness `WheelBookPosition` shape and record it for the promotion-gate
+   * readout. Uses the per-symbol scan (`wheelScans`) for the fresh spot + ATM IV;
+   * a position whose symbol wasn't scanned this pass is skipped. Best-effort and
+   * fully guarded — a snapshot failure can never break the wheel cycle.
+   */
+  private recordWheelBookSnapshot(
+    wheelScans: Map<
+      string,
+      { result: ShortPremiumScanResult; spot: number; ivPercentile: number | null; markKind: WheelIvMarkKind; atmIv: number | null }
+    >,
+    now: number,
+  ): void {
+    try {
+      const acct = this.optionsAccount;
+      const positions: WheelBookPosition[] = [];
+      const dteOf = (expiration: string | undefined): number => {
+        if (!expiration) return 0;
+        const t = Date.parse(`${expiration}T00:00:00Z`);
+        return Number.isFinite(t) ? Math.max(0, Math.round((t - now) / 86_400_000)) : 0;
+      };
+
+      // Covered writes (CSP + covered calls) still open on the book.
+      for (const opt of acct.getStateForMode('demo').openOptions) {
+        if (!opt.coveredWrite) continue;
+        const scan = wheelScans.get(opt.symbol.toUpperCase());
+        if (!scan || scan.atmIv == null || !(scan.spot > 0)) continue;
+        const contracts = Number.isFinite(opt.contracts) ? (opt.contracts as number) : 1;
+        const creditPerShare = Number.isFinite(opt.premiumPaid) ? opt.premiumPaid : 0;
+        positions.push({
+          symbol: opt.symbol.toUpperCase(),
+          kind: opt.coveredWrite === 'covered_call' ? 'covered_call' : 'cash_secured_put',
+          contracts,
+          shares: opt.coveredWrite === 'covered_call' ? contracts * 100 : 0,
+          strike: opt.strike ?? 0,
+          spot: scan.spot,
+          creditPerShare,
+          costBasisPerShare: opt.coveredWrite === 'covered_call' ? (opt.strike ?? 0) : 0,
+          atmIv: scan.atmIv,
+          dte: dteOf(opt.expiration ?? undefined),
+        });
+      }
+
+      // Bare assigned lots (assigned CSP awaiting a covered-call write).
+      for (const lot of acct.getAssignedShares('demo')) {
+        if (lot.openCoveredCallId) continue; // its covered call is captured above
+        const scan = wheelScans.get(lot.symbol.toUpperCase());
+        if (!scan || scan.atmIv == null || !(scan.spot > 0)) continue;
+        positions.push({
+          symbol: lot.symbol.toUpperCase(),
+          kind: 'assigned_lot',
+          contracts: 0,
+          shares: lot.shares,
+          strike: 0,
+          spot: scan.spot,
+          creditPerShare: 0,
+          costBasisPerShare: lot.costBasisPerShare,
+          atmIv: scan.atmIv,
+          dte: 0,
+        });
+      }
+
+      recordWheelBookSnapshot(positions, acct.getEquity(), now);
+    } catch (err: unknown) {
+      log.warn('wheel book snapshot failed (TRA-2028)', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

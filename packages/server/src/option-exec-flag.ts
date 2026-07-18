@@ -148,6 +148,39 @@ export function isOptionWheelRoutingEnabled(env: NodeJS.ProcessEnv = process.env
 }
 
 // --------------------------------------------------------------------------
+// TRA-2028 (parent TRA-1966, spec TRA-2026) — IV-PERCENTILE entry filter on the
+// wheel loop, OBSERVE-ONLY behind an OFF flag.
+//
+// Premium selling is only positive-EV when the premium pays for the risk —
+// selling when implied vol is CHEAP is systematically negative-EV. This gates
+// CSP/CC `sell_to_open` on the underlying's IV PERCENTILE (fraction of the
+// trailing window below today's IV): block < 30, prefer ≥ 50, size down in the
+// 30–50 `marginal` band, and require the TRA-1968 catalyst check above 90 (rich
+// IV is usually a ticking event, not a mispricing). Thresholds are wired as
+// config (`WHEEL_IV_FILTER_*` env), not magic numbers.
+//
+// SHADOW-FIRST like {@link isPopCalibrationEnabled}: the filter's decision is
+// EVALUATED and ledgered on every wheel idea (entered AND skipped) for the
+// entered-vs-skipped-by-decile calibration the gate needs, but it does NOT
+// suppress or resize any write until an operator sets the flag. OFF by default ⇒
+// the wheel routing path is byte-for-byte the pre-TRA-2028 behaviour; the ledger
+// still accrues so the forward book can prove the entered set beats the
+// unfiltered set before the filter earns enforcement. Live promotion stays gated
+// on TRA-382 regardless.
+// --------------------------------------------------------------------------
+
+export const WHEEL_IV_FILTER_FLAG = 'ENABLE_WHEEL_IV_ENTRY_FILTER';
+
+/**
+ * True iff the wheel IV-percentile entry filter is allowed to SUPPRESS/RESIZE
+ * writes (accepts 1/true/yes/on). Default OFF ⇒ observe-only: the decision is
+ * still recorded for calibration, but the wheel routes exactly as before.
+ */
+export function isWheelIvEntryFilterEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[WHEEL_IV_FILTER_FLAG]);
+}
+
+// --------------------------------------------------------------------------
 // TRA-1203 (board: "try mispriced options for the rest of the week instead of
 // relative value") — turn the TRA-1156 OBSERVE-ONLY IV-vs-RV scan into an
 // EXECUTING demo paper-routing path.

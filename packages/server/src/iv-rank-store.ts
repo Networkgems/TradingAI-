@@ -159,6 +159,26 @@ export function computeIvRank(samples: readonly IvSample[], currentIv: number): 
   return ((clamped - min) / (max - min)) * 100;
 }
 
+/**
+ * TRA-2028 — IV PERCENTILE (distinct from IV RANK above). Per the TRA-2026
+ * acceptance criteria the wheel promotion gate keys on the PERCENTILE, which is
+ * more robust to a single outlier high/low than the rank: the fraction of the
+ * trailing sessions whose IV closed strictly BELOW today's IV, scaled 0–100.
+ * Same honest-`null` discipline as {@link computeIvRank}: fewer than
+ * {@link MIN_IV_SAMPLES} in-window ⇒ `null`, never a fabricated percentile on a
+ * thin store. Pure — exported for tests and the wheel IV-entry filter.
+ */
+export function computeIvPercentile(
+  samples: readonly IvSample[],
+  currentIv: number,
+): number | null {
+  if (!Number.isFinite(currentIv) || currentIv <= 0) return null;
+  const ivs = samples.map((s) => s.iv).filter((v) => Number.isFinite(v) && v > 0);
+  if (ivs.length < MIN_IV_SAMPLES) return null;
+  const below = ivs.filter((v) => v < currentIv).length;
+  return (below / ivs.length) * 100;
+}
+
 /** Samples within the trailing window relative to `asOf`. */
 function windowFor(samples: readonly IvSample[], asOf: number): IvSample[] {
   const cutoffMs = asOf - TRAILING_DAYS * 86_400_000;
@@ -184,11 +204,35 @@ export function ivRankSync(
 }
 
 /**
+ * Synchronous IV-PERCENTILE read (TRA-2028), the sibling of {@link ivRankSync}
+ * the wheel IV-entry filter gates on. Returns the 0–100 percentile of
+ * `currentIv` in `symbol`'s trailing window, or `null` when the cache is
+ * unloaded / the symbol is uncovered / there is insufficient history. Reads the
+ * SAME store the rank does so both are computed off one mid-mark ATM-IV series.
+ */
+export function ivPercentileSync(
+  symbol: string,
+  currentIv: number,
+  asOf: number = Date.now(),
+): number | null {
+  if (!cache) return null;
+  const samples = cache.get(symbol.trim().toUpperCase());
+  if (!samples) return null;
+  return computeIvPercentile(windowFor(samples, asOf), currentIv);
+}
+
+/**
  * The at-the-money implied volatility for one underlying, read off a chain
  * snapshot: the IV of the contract whose strike is nearest `spot`, preferring
  * the smoothed `smvVol` and falling back to `midIv`. Returns `null` when no row
  * carries a usable IV. This is the value the daily recorder feeds to
  * {@link recordDailyIv} and the per-request adapter ranks.
+ *
+ * Both source fields (`smvVol`, `midIv`) are MID-derived by construction — the
+ * chain marks legs at the bid/ask midpoint, never the last trade — so a non-null
+ * return is always a mid mark. The wheel IV-entry filter (TRA-2028) treats a
+ * `null` here as "no usable mid IV this pass" and stands its entry down rather
+ * than gating on a stale/last-trade proxy.
  */
 export function atmIvFromRows(rows: readonly OptionChainRow[], spot: number): number | null {
   if (!Number.isFinite(spot) || spot <= 0) return null;

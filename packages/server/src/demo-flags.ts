@@ -233,6 +233,20 @@ export const DEMO_FLAG_ALLOWLIST = [
   // can never touch live capital. Allowlisted so the desk can arm/disarm the
   // measurement without a redeploy. Non-secret, demo-only.
   'ENABLE_OPTION_MAKER_SHADOW',
+  // TRA-2028 (parent TRA-1966, spec TRA-2026) — the IV-PERCENTILE entry filter on
+  // the wheel loop, plus its tunable thresholds. The wheel routing path is DEMO/
+  // paper-only by construction (every write opens `mode:'demo'`, no Tradier mirror;
+  // live premium selling stays gated on TRA-382), and the filter is consulted only
+  // inside `runWheelCycle`, so a file flip can never touch live capital. Default
+  // OFF ⇒ observe-only: the decision is ledgered for calibration but never
+  // suppresses/resizes a write. Allowlisted so the board can arm the filter — and
+  // retune the IVP band / marginal size-down daemon-free — after the entered-vs-
+  // unfiltered forward readout, without a redeploy (the TRA-1677 lesson).
+  'ENABLE_WHEEL_IV_ENTRY_FILTER',
+  'WHEEL_IV_FILTER_BLOCK_BELOW_PERCENTILE',
+  'WHEEL_IV_FILTER_PREFERRED_PERCENTILE',
+  'WHEEL_IV_FILTER_CATALYST_PERCENTILE',
+  'WHEEL_IV_FILTER_MARGINAL_SIZE_MULT',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
