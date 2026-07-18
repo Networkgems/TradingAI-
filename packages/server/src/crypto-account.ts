@@ -1,5 +1,6 @@
 import type { AccountState, Position, PositionQuoteSource, TradeSignal, SignalType } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
+import { cryptoTieredCostModel, type CostModel } from '@trading-app/engine';
 import { randomUUID } from 'crypto';
 // Import the logger from its own module, NOT the ./observability/index.js barrel: the
 // barrel re-exports ./health-routes.js, which reaches crypto-regime-tsmom-demo-route.ts,
@@ -22,17 +23,16 @@ const INITIAL_EQUITY = 25_000;
  */
 export const CRYPTO_MAX_EQUITY = 100_000_000;
 
-// TRA-342 — Coinbase Advanced Trade taker fee (~40 bps) and modeled slippage
-// on TP/SL fills (~5 bps). Mirror the values used in
-// packages/backtest/src/run-tra306-sweep.ts so demo, the sweep harness, and
-// what live actually pays all share a single cost model. Without these the
-// demo paper account exits at the exact trigger and bb_fade in particular
-// looks ~3–8× more profitable than what live can capture, since its risk
-// distance is 10–25 bps and a round-trip fee alone is ~80 bps.
-export const CRYPTO_FEE_BPS = 40;
-export const CRYPTO_SLIPPAGE_BPS = 5;
-const FEE_RATE = CRYPTO_FEE_BPS / 10_000;
-const SLIPPAGE_RATE = CRYPTO_SLIPPAGE_BPS / 10_000;
+// TRA-342 / TRA-2033 — commission + modeled slippage are resolved PER SYMBOL
+// from the shared TRA-185 tiered cost model (`cryptoTieredCostModel` in
+// `@trading-app/engine`), the single source of truth the backtest runner and
+// the TRA-306 sweep harness also consume. This kills the silent-drift class:
+// there is no local flat 40+5 bps copy to fall out of sync — a BTC/ETH major
+// now pays 6 bps/fill, a small-cap alt 50 bps/fill, exactly what the backtest
+// models. Both bps fire per fill (entry AND exit), matching the runner. Without
+// modeled cost the demo paper account exits at the exact trigger and bb_fade in
+// particular looks ~3–8× more profitable than live can capture, since its risk
+// distance is 10–25 bps and a round-trip fee alone can exceed it.
 
 export class CryptoPaperAccount {
   private equity: number;
@@ -46,12 +46,30 @@ export class CryptoPaperAccount {
   // the Crypto dashboard honors what the user enters in Settings.
   private managedAccountRatio: number = DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
   private riskPerTrade: number = DEFAULT_ACCOUNT_SETTINGS.riskPerTrade;
+  // TRA-2033 — shared TRA-185 tiered cost model; per-symbol fee/slippage lookup.
+  private readonly costModel: CostModel;
 
-  constructor(savedEquity = INITIAL_EQUITY, openingEquityToday = savedEquity) {
+  constructor(
+    savedEquity = INITIAL_EQUITY,
+    openingEquityToday = savedEquity,
+    costModel: CostModel = cryptoTieredCostModel(),
+  ) {
     this.initialEquity = savedEquity;
     this.equity = savedEquity;
     this.cash = savedEquity;
     this.openingEquityToday = openingEquityToday;
+    this.costModel = costModel;
+  }
+
+  /**
+   * TRA-2033 — per-symbol fee + slippage rates from the shared TRA-185 tiered
+   * cost model. Both bps are per fill (charged on entry AND exit), the same
+   * convention the backtest runner applies, so demo accounting mirrors the
+   * economics the backtest models for that symbol's liquidity tier.
+   */
+  private costRatesFor(symbol: string): { feeRate: number; slipRate: number } {
+    const fill = this.costModel.resolve(symbol);
+    return { feeRate: fill.commissionBps / 10_000, slipRate: fill.slippageBps / 10_000 };
   }
 
   /**
@@ -234,8 +252,9 @@ export class CryptoPaperAccount {
     // short receives proceeds rather than spending them, so the `cost > cash`
     // gate never applied to them. Longs keep the spot gate; shorts use the
     // managedEquity sizing cap above as their margin floor.
+    const { feeRate, slipRate } = this.costRatesFor(signal.symbol);
     const notional = currentPrice * qty;
-    const entryFee = notional * FEE_RATE;
+    const entryFee = notional * feeRate;
     const cost = notional + entryFee;
     if (signal.side === 'buy' && cost > this.cash) {
       log.warn('skip signal: cost exceeds cash (existing positions consuming cash)', {
@@ -259,14 +278,14 @@ export class CryptoPaperAccount {
     // TRA-536 — stamp realized vs modeled entry slippage for the Stage-2
     // promotion gate. Realized = drift between the strategy's intended entry
     // (`signal.entryPrice`) and the live Coinbase fill (`currentPrice`);
-    // modeled = the CRYPTO_SLIPPAGE_BPS (5 bps) per-fill budget the backtest
-    // cost model charges. Guard a non-finite signal entry so we never write
-    // NaN onto the persisted snapshot.
+    // modeled = the shared tiered per-fill slippage budget (TRA-185 /
+    // TRA-2033) the backtest cost model charges for this symbol's tier. Guard a
+    // non-finite signal entry so we never write NaN onto the persisted snapshot.
     const intendedEntry = signal.entryPrice;
     const realizedSlippage = Number.isFinite(intendedEntry)
       ? Math.abs(currentPrice - intendedEntry) * qty
       : undefined;
-    const modeledSlippage = realizedSlippage === undefined ? undefined : SLIPPAGE_RATE * currentPrice * qty;
+    const modeledSlippage = realizedSlippage === undefined ? undefined : slipRate * currentPrice * qty;
     const position: Position = {
       id: randomUUID(),
       symbol: signal.symbol,
@@ -310,8 +329,9 @@ export class CryptoPaperAccount {
     if (!pos) return null;
     if (!Number.isFinite(addQty) || addQty <= 0) return null;
     if (!Number.isFinite(addPrice) || addPrice <= 0) return null;
+    const { feeRate } = this.costRatesFor(pos.symbol);
     const notional = addPrice * addQty;
-    const entryFee = notional * FEE_RATE;
+    const entryFee = notional * feeRate;
     const cost = notional + entryFee;
     if (cost > this.cash) {
       log.warn('skip DCA add: cost exceeds cash', {
@@ -358,12 +378,13 @@ export class CryptoPaperAccount {
         // trigger (longs fill below, shorts fill above), then book P&L net
         // of round-trip fees. Manual closes via closePosition still use the
         // quote price since they represent an explicit user click.
+        const { feeRate, slipRate } = this.costRatesFor(pos.symbol);
         const trigger = hit === 'tp' ? pos.takeProfit : pos.stopLoss;
         const slipDir = pos.side === 'buy' ? -1 : 1;
-        const exitPrice = trigger * (1 + slipDir * SLIPPAGE_RATE);
+        const exitPrice = trigger * (1 + slipDir * slipRate);
         const multiplier = pos.side === 'buy' ? 1 : -1;
         const grossPnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
-        const totalFee = (pos.entryPrice + exitPrice) * pos.quantity * FEE_RATE;
+        const totalFee = (pos.entryPrice + exitPrice) * pos.quantity * feeRate;
         const pnl = grossPnl - totalFee;
         pos.pnl = pnl;
         pos.closedAt = Date.now();
@@ -372,7 +393,7 @@ export class CryptoPaperAccount {
         // baked in: longs sell on close and receive proceeds net of fee,
         // shorts buy back on close and pay notional plus fee.
         const exitNotional = exitPrice * pos.quantity;
-        const exitFee = exitNotional * FEE_RATE;
+        const exitFee = exitNotional * feeRate;
         if (pos.side === 'buy') this.cash += exitNotional - exitFee;
         else this.cash -= exitNotional + exitFee;
         this.equity += pnl;
@@ -390,9 +411,10 @@ export class CryptoPaperAccount {
     // close at the live quote, but Coinbase still takes its taker cut on the
     // exit leg). Skip the slippage modeling — the user picked this price
     // explicitly, no spread crossing to model on top.
+    const { feeRate } = this.costRatesFor(pos.symbol);
     const multiplier = pos.side === 'buy' ? 1 : -1;
     const grossPnl = (currentPrice - pos.entryPrice) * pos.quantity * multiplier;
-    const totalFee = (pos.entryPrice + currentPrice) * pos.quantity * FEE_RATE;
+    const totalFee = (pos.entryPrice + currentPrice) * pos.quantity * feeRate;
     const pnl = grossPnl - totalFee;
     pos.pnl = pnl;
     pos.exitPrice = currentPrice;
@@ -400,7 +422,7 @@ export class CryptoPaperAccount {
     // TRA-330 + TRA-342 — long sells with proceeds net of exit fee,
     // short buys back paying notional + exit fee.
     const exitNotional = currentPrice * pos.quantity;
-    const exitFee = exitNotional * FEE_RATE;
+    const exitFee = exitNotional * feeRate;
     if (pos.side === 'buy') this.cash += exitNotional - exitFee;
     else this.cash -= exitNotional + exitFee;
     this.equity += pnl;

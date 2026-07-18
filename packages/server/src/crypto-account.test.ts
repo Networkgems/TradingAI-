@@ -1,6 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { TradeSignal } from '@trading-app/shared';
-import { CryptoPaperAccount, CRYPTO_MAX_EQUITY, CRYPTO_SLIPPAGE_BPS } from './crypto-account.js';
+import { cryptoTieredCostModel } from '@trading-app/engine';
+import { CryptoPaperAccount, CRYPTO_MAX_EQUITY } from './crypto-account.js';
+
+// TRA-2033 — the crypto account now resolves cost per symbol from the shared
+// TRA-185 tiered model. The signals below trade BTC-USD (the `major` tier:
+// 4 bps commission + 2 bps slippage per fill); derive the rates from that
+// single source so the assertions track the model, not a hand-copied bps.
+const BTC_FILL = cryptoTieredCostModel().resolve('BTC-USD');
+const BTC_FEE_RATE = BTC_FILL.commissionBps / 10_000;
+const BTC_SLIPPAGE_RATE = BTC_FILL.slippageBps / 10_000;
 
 function buildSignal(overrides: Partial<TradeSignal> = {}): TradeSignal {
   return {
@@ -128,7 +137,7 @@ describe('CryptoPaperAccount.addToPosition — DCA accumulation (TRA-961)', () =
     const addPrice = 90;
     acct.addToPosition(pos.id, addQty, addPrice);
     const spent = cashBefore - acct.getState().availableCash;
-    expect(spent).toBeCloseTo(addPrice * addQty * (1 + 40 / 10_000), 6); // CRYPTO_FEE_BPS = 40
+    expect(spent).toBeCloseTo(addPrice * addQty * (1 + BTC_FEE_RATE), 6); // BTC major tier
   });
 
   it('rejects bad inputs and an add larger than available cash', () => {
@@ -285,7 +294,7 @@ describe('CryptoPaperAccount slippage instrumentation (TRA-536)', () => {
     expect(opened).not.toBeNull();
     const qty = opened!.quantity;
     expect(opened!.realizedSlippage).toBeCloseTo(Math.abs(100.4 - 100) * qty, 9);
-    expect(opened!.modeledSlippage).toBeCloseTo((CRYPTO_SLIPPAGE_BPS / 10_000) * 100.4 * qty, 9);
+    expect(opened!.modeledSlippage).toBeCloseTo(BTC_SLIPPAGE_RATE * 100.4 * qty, 9);
   });
 
   it('carries both slippage figures through the close onto the realized position', () => {

@@ -25,8 +25,8 @@
  * comments in `reversal.ts`, `mean-reversion-crypto.ts`, etc.) and we
  * already have validated tooling for it (TRA-261 / TRA-267 / TRA-297).
  *
- * Run config matches the live demo account (initialEquity $25k, 40 bps
- * Coinbase taker, 5 bps slippage, fractionalQuantity true, default
+ * Run config matches the live demo account (initialEquity $25k, shared
+ * TRA-185 tiered per-symbol cost model, fractionalQuantity true, default
  * portfolio caps). The live `applyShortGates` / BTC-regime / funding overlay
  * is intentionally NOT applied — this sweep evaluates per-strategy raw edge
  * per side, not the live filtering stack.
@@ -39,6 +39,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Candle, Position } from '@trading-app/shared';
+import { cryptoTieredCostModel, cryptoTierOf } from '@trading-app/engine';
 import { BacktestRunner } from './runner.js';
 import type { BacktestConfig, BacktestResult } from './types.js';
 import {
@@ -55,8 +56,16 @@ const WINDOW_END_MS = Date.UTC(2026, 4, 1) - 1;                  // 2026-04-30 2
 const SYMBOLS = ['SOL-USD', 'DOGE-USD'] as const;
 
 const INITIAL_EQUITY_USD = 25_000;
-const FEE_BPS = 40;
-const SLIPPAGE_BPS = 5;
+
+/**
+ * TRA-2033 — cost comes from the shared TRA-185 tiered model
+ * (`cryptoTieredCostModel` in `@trading-app/engine`), the single source of
+ * truth the live/demo crypto account and every other backtest validation
+ * harness now consume. No local flat 40+5 bps copy to drift: BTC/ETH majors
+ * pay 6 bps/fill, SOL (high-liq) 18 bps/fill, small-caps like DOGE 50 bps/fill.
+ * One instance, reused for every cell (the model is pure per-symbol data).
+ */
+const COST_MODEL = cryptoTieredCostModel();
 
 /**
  * Scalping override — 12 months of 1m bars is infeasible for an O(N²) runner
@@ -465,8 +474,7 @@ async function main() {
         endDate: cell.windowEndMs,
         initialEquity: INITIAL_EQUITY_USD,
         strategyType: cell.strategyType,
-        feeBps: FEE_BPS,
-        slippageBps: SLIPPAGE_BPS,
+        costModel: COST_MODEL,
         fractionalQuantity: true,
         ...opts,
       };
@@ -500,8 +508,20 @@ async function main() {
     windowStart: new Date(WINDOW_START_MS).toISOString().slice(0, 10),
     windowEnd: new Date(WINDOW_END_MS).toISOString().slice(0, 10),
     initialEquityUsd: INITIAL_EQUITY_USD,
-    feeBps: FEE_BPS,
-    slippageBps: SLIPPAGE_BPS,
+    // TRA-2033 — per-symbol tiered cost (round-trip bps by liquidity tier)
+    // from the shared TRA-185 model, replacing the old flat 40+5 bps copy.
+    costModel: 'cryptoTieredCostModel (TRA-185)',
+    costBySymbol: Object.fromEntries(
+      SYMBOLS.map((symbol) => {
+        const fill = COST_MODEL.resolve(symbol);
+        return [symbol, {
+          tier: cryptoTierOf(symbol),
+          commissionBps: fill.commissionBps,
+          slippageBps: fill.slippageBps,
+          roundTripBps: 2 * (fill.commissionBps + fill.slippageBps),
+        }];
+      }),
+    ),
     caveats: {
       timeframeBoundary:
         '6 router/legacy strategies (momentum/breakout_vol/mean_reversion/reversal/macd_trend/bb_fade) ' +

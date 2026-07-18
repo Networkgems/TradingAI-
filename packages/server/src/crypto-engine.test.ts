@@ -32,11 +32,8 @@ import {
   _resetCoinbaseProductCatalogForTests,
 } from './crypto-feed.js';
 import { CryptoLiveAccount } from './crypto-live-account.js';
-import {
-  CryptoPaperAccount,
-  CRYPTO_FEE_BPS,
-  CRYPTO_SLIPPAGE_BPS,
-} from './crypto-account.js';
+import { CryptoPaperAccount } from './crypto-account.js';
+import { cryptoTieredCostModel } from '@trading-app/engine';
 import type { PositionQuoteSource, StrategyPreset } from '@trading-app/shared';
 
 // TRA-320 — exercise the CryptoSignalEngine.manualClosePosition wiring against
@@ -564,8 +561,14 @@ describe('CryptoPaperAccount fee + slippage modeling — TRA-342', () => {
   // round-trip fee alone is ~80 bps). These tests pin the fee/slip math so
   // a future refactor can't silently restore the optimistic exit pricing.
 
-  const FEE_RATE = CRYPTO_FEE_BPS / 10_000;
-  const SLIPPAGE_RATE = CRYPTO_SLIPPAGE_BPS / 10_000;
+  // TRA-2033 — the demo/live crypto account now resolves cost PER SYMBOL from
+  // the shared TRA-185 tiered model. SOL-USD (the symbol these tests trade) is
+  // the `high_liq` tier: 10 bps commission + 8 bps slippage per fill. Derive
+  // the rates from that single source so the math below tracks the model, not a
+  // hand-copied constant.
+  const SOL_FILL = cryptoTieredCostModel().resolve('SOL-USD');
+  const FEE_RATE = SOL_FILL.commissionBps / 10_000;
+  const SLIPPAGE_RATE = SOL_FILL.slippageBps / 10_000;
 
   function buildBuySignal(): TradeSignal {
     return {
@@ -581,12 +584,22 @@ describe('CryptoPaperAccount fee + slippage modeling — TRA-342', () => {
     };
   }
 
-  it('exposes the fee + slippage constants used by the sweep harness', () => {
-    // Ground truth: these match packages/backtest/src/run-tra306-sweep.ts so
-    // demo, live and the sweep all share a single cost model. Don't drop the
-    // values without coordinating with that file.
-    expect(CRYPTO_FEE_BPS).toBe(40);
-    expect(CRYPTO_SLIPPAGE_BPS).toBe(5);
+  it('pins live-side crypto economics to the shared TRA-185 cost model', () => {
+    // TRA-2033 — this test used to assert local flat CRYPTO_FEE_BPS/…_SLIPPAGE
+    // constants (40/5). Those copies are gone: the demo/live crypto account,
+    // the backtest runner, and the TRA-306 sweep now all resolve per-symbol
+    // cost from `cryptoTieredCostModel` (@trading-app/engine). Guard the tiers
+    // the demo book actually trades so a tier edit is a deliberate change, and
+    // guard the SOURCE rather than a copy. See docs/cost-model.md for sourcing.
+    const model = cryptoTieredCostModel();
+    // Majors (BTC/ETH) — 6 bps/fill → 12 bps round-trip, the cheapest tier.
+    expect(model.resolve('BTC-USD')).toEqual({ commissionBps: 4, slippageBps: 2 });
+    expect(model.resolve('ETH-USD')).toEqual({ commissionBps: 4, slippageBps: 2 });
+    // SOL — high-liq alt, 18 bps/fill.
+    expect(model.resolve('SOL-USD')).toEqual({ commissionBps: 10, slippageBps: 8 });
+    // Small-cap / unknown fallback — 50 bps/fill → 100 bps round-trip.
+    expect(model.resolve('DOGE-USD')).toEqual({ commissionBps: 35, slippageBps: 15 });
+    expect(model.resolve('UNLISTED-USD')).toEqual({ commissionBps: 35, slippageBps: 15 });
   });
 
   it('debits cash by entry notional × (1 + fee) when opening', () => {
