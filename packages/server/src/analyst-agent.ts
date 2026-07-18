@@ -26,7 +26,7 @@ import type { Candle, MarketReviewGates, ReviewBlock, ReviewRegimeLabel } from '
 import { supportResistance, reversalChecklist, atr } from '@trading-app/engine';
 
 import { logger } from './observability/index.js';
-import { simpleMa } from './market-review.js';
+import { simpleMa } from './ma-utils.js';
 import {
   makeHypothesis,
   runHypothesis,

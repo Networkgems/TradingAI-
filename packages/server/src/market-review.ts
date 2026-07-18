@@ -51,6 +51,7 @@ import {
 } from './news-catalyst-lean.js';
 import { recordCatalystLean } from './news-catalyst-lean-ledger.js';
 import { readAnalystPlan } from './analyst-agent.js';
+import { simpleMa } from './ma-utils.js';
 import {
   renderWatchlistLevelsSection,
   renderSentimentTapeSection,
@@ -240,12 +241,10 @@ export function normalizeTnx(raw: number | null): number | null {
   return raw > 20 ? raw / 10 : raw;
 }
 
-/** Simple moving average of the last `period` closes; `null` if too short. */
-export function simpleMa(candles: Candle[], period: number): number | null {
-  if (candles.length < period) return null;
-  const tail = candles.slice(-period);
-  return tail.reduce((sum, c) => sum + c.close, 0) / period;
-}
+// `simpleMa` now lives in `./ma-utils.js` (TRA-2032) to break the import cycle
+// with `analyst-agent.ts`. Imported above for local use and re-exported here so
+// existing importers/tests that pull it from `market-review` keep working.
+export { simpleMa };
 
 /**
  * Classify the GREEN / YELLOW / RED regime from the index readings, applying
