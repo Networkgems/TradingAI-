@@ -225,7 +225,9 @@ function buildGateResult(symbol: string, candles: Candle[]): SymbolGateResult {
 /** Exported so the unit test can assert the mapping + verdict on the pinned dataset. */
 export function computeTra1579DcaGate(): { core: SymbolGateResult; context: SymbolGateResult[] } {
   const core = buildGateResult(CORE_SYMBOL, loadCachedCandles(CORE_SYMBOL));
-  const context = CONTEXT_SYMBOLS.map(s => buildGateResult(s, loadCachedCandles(s)));
+  const context = CONTEXT_SYMBOLS
+    .filter(s => existsSync(resolve(DATA_DIR, `${s.toLowerCase()}.4h.json`)))
+    .map(s => buildGateResult(s, loadCachedCandles(s)));
   return { core, context };
 }
 
