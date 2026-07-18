@@ -266,6 +266,11 @@ import { proposalTtlMs } from './proposal-store.js';
 import { initIvRankStore, recordDailyIv, ivRankSync, atmIvFromRows } from './iv-rank-store.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
+import {
+  isShadowExpectancyGuardEnabled,
+  isShadowExpectancyGuardEnforcing,
+  shadowExpectancyGuardFromLedger,
+} from './shadow-expectancy-guard-config.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
 import {
   initPcrShadowLedger,
@@ -5223,6 +5228,44 @@ app.get('/api/health/shadow-signals', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read shadow ledger' });
+  }
+});
+
+// TRA-2036 — read-only probe over the shadow-expectancy PROMOTION GUARD. The
+// promotion gate historically DISPLAYED shadow expectancy but did not ENFORCE it
+// (a strategy with negative net shadow E[R] could still clear the six guards and
+// advance). This surfaces the new fail-closed guard's OBSERVE-ONLY verdict over
+// the Supertrend shadow ledger — the canonical frozen NO-GO candidate (TRA-789/
+// 1245: net E[R] -0.047R). It reports rawN vs the correlation-adjusted effective
+// N (day/episode clustered), the block-bootstrap CI on E[R], and the per-
+// candidate "would block: yes/no" so we can see how many current candidates the
+// guard would block BEFORE it enforces. `flagEnabled`/`enforcing` say whether the
+// guard is wired into the gate and whether a would-block actually blocks; both
+// default OFF, so this is observe-only and nothing routes an order. Open like the
+// sibling shadow probes (pure strategy telemetry, no PII/positions).
+app.get('/api/health/shadow-expectancy-guard', async (_req, res) => {
+  try {
+    const signals = await listShadowSignals();
+    const verdict = shadowExpectancyGuardFromLedger(signals);
+    res.json({
+      issue: 'TRA-2036',
+      flagEnabled: isShadowExpectancyGuardEnabled(),
+      enforcing: isShadowExpectancyGuardEnforcing(),
+      shadowLineage: 'TRA-789/1245 (frozen NO-GO baseline: net E[R] -0.047R / 18.5% hit)',
+      rawN: verdict.rawN,
+      effectiveN: verdict.effectiveN,
+      sampleSize: verdict.sampleSize,
+      expectancyR: verdict.expectancyR,
+      ci: verdict.ci,
+      wouldBlock: verdict.wouldBlock,
+      blocks: verdict.blocks,
+      reasons: verdict.reasons,
+    });
+  } catch (err) {
+    log.error('shadow-expectancy-guard health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to evaluate shadow-expectancy guard' });
   }
 });
 

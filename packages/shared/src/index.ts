@@ -4,6 +4,11 @@
 // computation from data, per-stage evaluation, overall verdict, audit record).
 export * from './promotion-gate.js';
 
+// TRA-2036 — shadow-expectancy promotion guard (pure core): blocks promotion on
+// non-positive net shadow E[R], with a correlation-adjusted effective sample
+// size and a day/episode block-bootstrap CI. Flag-gated, observe-only first.
+export * from './shadow-expectancy-guard.js';
+
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled slippage KPI per fill,
 // aggregated per asset class (the OOS check behind arming the liquidity-gate veto).
 export * from './execution-quality.js';

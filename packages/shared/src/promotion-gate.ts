@@ -16,6 +16,8 @@
 // then calls `evaluatePromotion()` to decide whether the mode-switch route may
 // flip a strategy live.
 
+import type { ShadowExpectancyGuardVerdict } from './shadow-expectancy-guard.js';
+
 /** Per-stage state surfaced on a strategy's `promotion_status`. */
 export type PromotionStageState = 'pass' | 'fail' | 'missing';
 
@@ -806,6 +808,17 @@ export interface PromotionEvaluationInput {
   /** Whether a Stage-3 sign-off (`promotion_decision`) record exists. */
   signoff: SignoffState;
   thresholds?: PromotionThresholds;
+  /**
+   * TRA-2036 — the shadow-expectancy guard verdict for this strategy, if the
+   * guard is wired in (its server flag is on). Computed by
+   * `evaluateShadowExpectancyGuard` over the strategy's cost-netted shadow
+   * sample. Absent/null when the guard is off — then it is a pure no-op and the
+   * gate behaves exactly as before. When present it is always surfaced on
+   * `promotion_status`; it only contributes a `blockedReason` when it is
+   * ENFORCING and `wouldBlock` (i.e. `verdict.blocks === true`). In observe-only
+   * mode it reports "would block: yes/no" without blocking.
+   */
+  shadowExpectancy?: ShadowExpectancyGuardVerdict | null;
 }
 
 /**
@@ -843,6 +856,13 @@ export interface PromotionStatus {
     failedChecks: string[];
   };
   signoff: SignoffState;
+  /**
+   * TRA-2036 — the shadow-expectancy guard verdict, when the guard is wired in.
+   * Always surfaced on the readout (so the observe-only "would block: yes/no"
+   * per candidate is visible), but only affects `canGoLive` when it is enforcing
+   * (`blocks === true`). Absent when the guard flag is off.
+   */
+  shadowExpectancy?: ShadowExpectancyGuardVerdict | null;
   /** True iff backtest=pass AND stage-2=pass AND signoff=present. */
   canGoLive: boolean;
   /** Empty when `canGoLive`. Human-readable reasons the live transition is refused. */
@@ -888,6 +908,19 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
     blockedReasons.push(`Stage 2 (${stage2Label}) ${stage2.state}: ${stage2.failedChecks.join('; ')}`);
   if (input.signoff !== 'present') blockedReasons.push('Stage 3 (sign-off) absent: no promotion_decision on record');
 
+  // TRA-2036 — shadow-expectancy guard. Only an ENFORCING would-block
+  // (`blocks === true`) contributes a blocked reason; an observe-only verdict is
+  // surfaced below but never blocks. When the guard is off (`shadowExpectancy`
+  // absent) this is a no-op and the gate is unchanged.
+  const shadowExpectancy = input.shadowExpectancy ?? null;
+  if (shadowExpectancy?.blocks) {
+    blockedReasons.push(
+      `Shadow-expectancy guard BLOCK (net E[R] ${fmt(shadowExpectancy.expectancyR)}, `
+        + `effN ${fmt(shadowExpectancy.effectiveN)}/${shadowExpectancy.rawN}): `
+        + shadowExpectancy.reasons.join('; '),
+    );
+  }
+
   return {
     strategyId: input.strategyId,
     strategyClass,
@@ -906,6 +939,7 @@ export function evaluatePromotion(input: PromotionEvaluationInput): PromotionSta
       failedChecks: stage2.failedChecks,
     },
     signoff: input.signoff,
+    shadowExpectancy,
     canGoLive: blockedReasons.length === 0,
     blockedReasons,
   };

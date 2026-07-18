@@ -16,6 +16,11 @@ import {
   type BacktestGateMetrics,
   type PromotionTradeSample,
 } from './promotion-gate.js';
+import {
+  DEFAULT_SHADOW_EXPECTANCY_GUARD_CONFIG,
+  evaluateShadowExpectancyGuard,
+  type ShadowExpectancySample,
+} from './shadow-expectancy-guard.js';
 
 /**
  * TRA-1465 — an accumulation-backtest verdict that clears every accumulate
@@ -215,6 +220,55 @@ describe('evaluatePromotion — verdict.pass=false blocks live even with passing
     expect(r.canGoLive).toBe(true);
     expect(r.backtest.state).toBe('pass');
     expect(r.backtest.verdict?.pass).toBe(true);
+  });
+});
+
+describe('evaluatePromotion — shadow-expectancy guard (TRA-2036)', () => {
+  // A strategy that clears Stage 1 (passing six-guard verdict), Stage 2 (strong
+  // paper), and Stage 3 (sign-off): absent the new guard it can go live.
+  const strongPaper = computePaperGateMetrics(
+    spaced(Array.from({ length: 60 }, (_, i) => (i % 6 === 0 ? -0.5 : 1.5))),
+  );
+  const clearsAllStages = {
+    strategyId: 'bb_fade',
+    backtest: PASSING_BT,
+    backtestVerdict: { pass: true },
+    paper: strongPaper,
+    signoff: 'present' as const,
+  };
+
+  // A negative-expectancy shadow sample (the frozen NO-GO shape: net E[R] < 0),
+  // 40 independent episodes averaging -0.05R.
+  const negativeShadow: ShadowExpectancySample[] = Array.from({ length: 40 }, (_, i) => ({
+    netR: -0.05,
+    clusterKey: `ep-${i}`,
+  }));
+
+  it('is a no-op when the guard is off (shadowExpectancy absent)', () => {
+    const r = evaluatePromotion(clearsAllStages);
+    expect(r.canGoLive).toBe(true);
+    expect(r.shadowExpectancy ?? null).toBeNull();
+  });
+
+  it('BLOCKS an otherwise-passing strategy on negative shadow expectancy when enforcing', () => {
+    const verdict = evaluateShadowExpectancyGuard(negativeShadow, {
+      ...DEFAULT_SHADOW_EXPECTANCY_GUARD_CONFIG,
+      enforce: true,
+    });
+    const r = evaluatePromotion({ ...clearsAllStages, shadowExpectancy: verdict });
+    expect(r.canGoLive).toBe(false); // the guard overrode an all-green gate
+    expect(r.blockedReasons.join(' ')).toMatch(/Shadow-expectancy guard BLOCK/);
+    expect(r.shadowExpectancy?.wouldBlock).toBe(true);
+    expect(r.shadowExpectancy?.blocks).toBe(true);
+  });
+
+  it('surfaces "would block" but does NOT block in observe-only mode', () => {
+    const verdict = evaluateShadowExpectancyGuard(negativeShadow, DEFAULT_SHADOW_EXPECTANCY_GUARD_CONFIG);
+    const r = evaluatePromotion({ ...clearsAllStages, shadowExpectancy: verdict });
+    expect(r.canGoLive).toBe(true); // observe-only never blocks
+    expect(r.shadowExpectancy?.wouldBlock).toBe(true); // …but the decision is visible
+    expect(r.shadowExpectancy?.blocks).toBe(false);
+    expect(r.blockedReasons.join(' ')).not.toMatch(/Shadow-expectancy/);
   });
 });
 
