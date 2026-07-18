@@ -16,6 +16,8 @@ apps/desktop/src-tauri/gen
 # Local Yahoo-Finance candle cache for backtest sweeps (TRA-181, TRA-266)
 packages/server/.cache/
 packages/backtest/data/
+# Pinned fixtures committed for deterministic CI tests (TRA-1579)
+!packages/backtest/data/btc-usd.4h.json
 
 # Server runtime output — never commit user data, logs, or QA scratch (TRA-689)
 packages/server/data/

@@ -89,7 +89,7 @@ fn take_crash_reports() -> Vec<String> {
     };
     let reports: Vec<String> = BufReader::new(file)
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(|line| line.ok())
         .filter(|line| !line.trim().is_empty())
         .collect();
     let _ = std::fs::remove_file(&path);
