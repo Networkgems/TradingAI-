@@ -2228,6 +2228,29 @@ export function minutesToSessionClose(utcMs: number = Date.now()): number {
 }
 
 /**
+ * Minutes elapsed since the 9:30 AM ET regular-session open. Returns 0 on
+ * weekends, before 9:30 AM ET, and at/after the 4:00 PM ET close — the mirror of
+ * {@link minutesToSessionClose}. DST-aware via {@link getEasternUtcOffset}. Used
+ * by the TRA-2049 edge-of-session entry blackout to size the first-N-minutes edge
+ * (the close edge reuses {@link minutesToSessionClose}). Because it collapses to 0
+ * both at the open and outside the session, callers MUST gate on
+ * {@link isStockMarketOpen} before reading it — a bare 0 does not distinguish
+ * "at the bell" from "market shut".
+ */
+export function minutesSinceSessionOpen(utcMs: number = Date.now()): number {
+  const offsetHours = getEasternUtcOffset(utcMs);
+  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
+  const etDate = new Date(etMs);
+  const dayOfWeek = etDate.getUTCDay(); // 0=Sun, 6=Sat
+  if (dayOfWeek === 0 || dayOfWeek === 6) return 0;
+  const etMinutes = etDate.getUTCHours() * 60 + etDate.getUTCMinutes();
+  const openEt = 9 * 60 + 30;
+  const closeEt = 16 * 60;
+  if (etMinutes < openEt || etMinutes >= closeEt) return 0;
+  return etMinutes - openEt;
+}
+
+/**
  * TRA-1157 — agent activity window. Returns true only when the regular US equity
  * session is open AND we are `bufferMinutes` past the open and `bufferMinutes`
  * before the close (default 15: 9:45 AM–3:45 PM ET, Mon–Fri). This narrows the

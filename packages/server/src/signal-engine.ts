@@ -103,6 +103,7 @@ import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
+import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
 import {
   recordChurnBrakeOpen,
   recordChurnBrakeOpenRejected,
@@ -4130,6 +4131,13 @@ export class SignalEngine {
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'already_open');
       return;
     }
+    // TRA-2049 — edge-of-session entry blackout (first/last N min of RTH). DARK
+    // until ENABLE_SESSION_EDGE_BLACKOUT; suppresses this NEW open only — the exit
+    // ratchet ran earlier in the tick and never reaches here.
+    if (this.sessionEdgeBlackoutBlocked()) {
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'session_edge_blackout');
+      return;
+    }
 
     // Entry = the signal's daily close (carried on `entryPrice`).
     const price = signal.entryPrice;
@@ -4463,6 +4471,28 @@ export class SignalEngine {
     // `/api/health/churn-brake` instead of only inferable from desk churn.
     if (blocked) recordChurnBrakeOpenRejected(symbol, count, cap, now);
     return { blocked, count, cap };
+  }
+
+  /**
+   * TRA-2049 (parent TRA-2044) — edge-of-session entry blackout. Returns the
+   * blackout verdict for opening a NEW equity position `now`. DARK by default: a
+   * no-op (`blocked:false`) unless the board armed `ENABLE_SESSION_EDGE_BLACKOUT`
+   * (read through demo-flags.json, so it can also be flipped daemon-free like the
+   * churn brake). Reads the same env source regardless of mode — the gate is
+   * TIGHTENING-only (it can only suppress an entry, never open one), so applying it
+   * to both books is safe, and flag-off means neither is affected. Consulted at the
+   * equity entry chokepoints ONLY (routeEquitySignal / openSma200Pullback), never on
+   * the exit/management paths, so positions still get managed inside the edges.
+   */
+  private sessionEdgeBlackoutBlocked(now = Date.now()): boolean {
+    const verdict = sessionEdgeBlackoutVerdict(now, this.resolveDemoFlagEnv());
+    if (verdict.blocked) {
+      log.info('equity entry suppressed: edge-of-session blackout', {
+        component: 'equity-scan', mode: this.mode, edge: verdict.edge,
+        openMinutes: verdict.openMinutes, closeMinutes: verdict.closeMinutes,
+      });
+    }
+    return verdict.blocked;
   }
 
   /**
@@ -9403,6 +9433,15 @@ export class SignalEngine {
     if (!price) {
       log.warn('no quote in cache — skipping (will retry next tick)', { sym, signalType: signal.type, via: source });
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'no_quote');
+      return null;
+    }
+
+    // TRA-2049 — edge-of-session entry blackout (first/last N min of RTH). DARK
+    // until ENABLE_SESSION_EDGE_BLACKOUT; suppresses this NEW entry only. This is
+    // the shared deterministic + agent-gating chokepoint; exits/management run
+    // earlier in the tick and never route through here.
+    if (this.sessionEdgeBlackoutBlocked()) {
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'session_edge_blackout');
       return null;
     }
 

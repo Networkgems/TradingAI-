@@ -113,7 +113,9 @@ export type EquityEntryRejectReason =
   | 'capital_gate_manifest'      // TRA-819/817 — not registered as an OOS-passed live entry
   | 'auto_trading_disabled'      // TRA-544 — auto-trading off / agent layer owns the decision
   | 'risk_halted'                // TRA-526 — kill switch / daily circuit-breaker
-  | 'market_closed';             // TRA-726 — no entries outside regular trading hours
+  | 'market_closed'              // TRA-726 — no entries outside regular trading hours
+  // ── routeEquitySignal + openSma200Pullback (intraday edge overlay) ───────────
+  | 'session_edge_blackout';     // TRA-2049 — first/last N min of the session; DARK until ENABLE_SESSION_EDGE_BLACKOUT (like churn_brake)
 
 /**
  * Why the deterministic pass never iterated at all. Distinct from a rejection: no

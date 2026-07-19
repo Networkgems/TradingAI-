@@ -247,6 +247,19 @@ export const DEMO_FLAG_ALLOWLIST = [
   'WHEEL_IV_FILTER_PREFERRED_PERCENTILE',
   'WHEEL_IV_FILTER_CATALYST_PERCENTILE',
   'WHEEL_IV_FILTER_MARGINAL_SIZE_MULT',
+  // TRA-2049 (parent TRA-2044 "how to actually reduce slippage", board-funded) — the
+  // edge-of-session entry blackout: suppress NEW equity entries in the first/last N
+  // minutes of the regular session (widest spreads / auction churn = worst slippage).
+  // TIGHTENING-only — it can only PREVENT an entry, never open/resize one — and the
+  // signal-engine consults it at the equity entry chokepoints ONLY (exits/management
+  // run earlier in the tick), so a file flip can never weaken a guardrail or touch an
+  // exit. Default OFF (byte-for-byte prior behavior until armed). The two numeric edge
+  // widths (minutes; `0` disables an edge) are allowlisted so the board can arm/tune/
+  // revert daemon-free on the self-hosted host (no PM2/admin), consistent with the
+  // TRA-1897 live-trading HOLD (a tightening gate never re-enables trading).
+  'ENABLE_SESSION_EDGE_BLACKOUT',
+  'SESSION_EDGE_BLACKOUT_OPEN_MINUTES',
+  'SESSION_EDGE_BLACKOUT_CLOSE_MINUTES',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
