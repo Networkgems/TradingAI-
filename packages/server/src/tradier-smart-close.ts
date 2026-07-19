@@ -7,6 +7,10 @@ import {
   roundToCent,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import {
+  recordCancelReplaceLatency,
+  recordOrderFillOutcome,
+} from './execution-quality-telemetry.js';
 
 const closeLog = logger.child({ module: 'tradier-smart-close' });
 
@@ -49,6 +53,12 @@ export interface SmartSellOptions {
   maxAttempts?: number;
   /** Injectable for tests so we don't need real timers. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * TRA-2046 — clock seam for cancel/replace latency telemetry (ms epoch).
+   * Defaults to `Date.now`. Injectable so the latency capture is deterministic
+   * in unit tests.
+   */
+  clock?: () => number;
 }
 
 /**
@@ -84,6 +94,7 @@ export async function submitSmartSellToClose(
   const timeoutMs = options.timeoutMs ?? 5000;
   const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+  const clock = options.clock ?? Date.now;
 
   let quote: TradierOptionQuote | null = null;
   try {
@@ -117,6 +128,7 @@ export async function submitSmartSellToClose(
     }
 
     let order;
+    const submitStart = clock();
     try {
       order = await client.sellContractsLimit(optionSymbol, qty, limitPrice);
     } catch (err: unknown) {
@@ -126,10 +138,26 @@ export async function submitSmartSellToClose(
         ...(lastOrderId !== undefined ? { orderId: lastOrderId } : {}),
       };
     }
+    // TRA-2046 — attempt > 0 is a reprice re-submit (the "replace" leg); capture
+    // its submit->ack latency. Attempt 0 is the initial submit, not a replace.
+    if (attempt > 0) {
+      recordCancelReplaceLatency({
+        engine: 'options',
+        side: 'close',
+        kind: 'replace',
+        latencyMs: Math.max(0, clock() - submitStart),
+      });
+    }
     lastOrderId = order.id;
     const detail = await client.waitForOrderTerminalStatus(order.id, { timeoutMs, sleep });
     lastDetail = detail;
     const status = detail?.status ?? '';
+    // TRA-2046 — partial-fill telemetry. Record only when the broker reported a
+    // finite executed quantity (an omitted exec_quantity is UNMEASURED, never a
+    // false-zero fill — TRA-1707).
+    if (detail && typeof detail.exec_quantity === 'number' && Number.isFinite(detail.exec_quantity)) {
+      recordOrderFillOutcome({ engine: 'options', side: 'close', orderedQty: qty, execQty: detail.exec_quantity });
+    }
     if (status === 'filled') {
       const avgFill = detail?.avg_fill_price;
       return {
@@ -155,8 +183,16 @@ export async function submitSmartSellToClose(
     // 422 when the order already terminated between our last poll and the
     // cancel call; either way, we proceed to the next attempt or return.
     if (attempt < maxAttempts - 1) {
+      const cancelStart = clock();
       try {
         await client.cancelOrder(order.id);
+        // TRA-2046 — cancel->ack latency, recorded only on a successful ack.
+        recordCancelReplaceLatency({
+          engine: 'options',
+          side: 'close',
+          kind: 'cancel',
+          latencyMs: Math.max(0, clock() - cancelStart),
+        });
       } catch (err) {
         // Best-effort cleanup; the next limit submission still proceeds.
         // TRA-406 — was a bare `catch {}`. Cancel failures are expected when

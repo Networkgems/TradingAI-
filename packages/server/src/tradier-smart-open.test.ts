@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { derivePricingPath, submitSmartBuyToOpen, SMART_BUY_WALK_FRACTIONS, buildWalkLimits } from './tradier-smart-open.js';
+import {
+  snapshotExecutionQuality,
+  resetExecutionQualityTelemetryForTests,
+} from './execution-quality-telemetry.js';
 import type {
   TradierOptionQuote,
   TradierOptionsClient,
@@ -317,5 +321,50 @@ describe('submitSmartBuyToOpen — cross-tick config end to end', () => {
     expect(outcome.status).toBe('walk_exhausted');
     // No price ever exceeds the ask.
     expect(Math.max(...prices)).toBeCloseTo(1.2, 2);
+  });
+});
+
+// TRA-2046 — proves the walk actually FEEDS the execution-quality telemetry
+// (cancel/replace latency + partial-fill), not just that the pure fold works.
+describe('submitSmartBuyToOpen — execution-quality telemetry wiring (TRA-2046)', () => {
+  afterEach(() => resetExecutionQualityTelemetryForTests());
+
+  it('records cancel + replace latency and partial-fill across a multi-step walk', async () => {
+    resetExecutionQualityTelemetryForTests();
+    // A monotonically-advancing clock: every clock() call steps +1000ms, so each
+    // cancel->ack and reprice->ack round-trip measures exactly 1000ms.
+    let t = 0;
+    const clock = () => (t += 1000);
+    // Attempt 0 stays open (→ cancel + reprice); attempt 1 fills fully.
+    const details: TradierOrderDetail[] = [
+      { id: 1, status: 'open', exec_quantity: 0, remaining_quantity: 2 },
+      { id: 2, status: 'filled', exec_quantity: 2, remaining_quantity: 0, avg_fill_price: 1.1 },
+    ];
+    let submitCount = 0;
+    const client = buildClient({
+      getOptionQuote: vi.fn(async () => ({ symbol: 'X', bid: 1.0, ask: 1.2 } as TradierOptionQuote)),
+      buyContractsLimit: vi.fn(async () => ({ id: ++submitCount, status: 'ok' } as TradierOrderResponse)),
+      waitForOrderTerminalStatus: vi.fn(async (id: number) => details.find((d) => d.id === id) ?? null),
+      cancelOrder: vi.fn(async () => undefined),
+    });
+
+    const outcome = await submitSmartBuyToOpen(client, 'X', 2, {
+      timeoutMs: 1,
+      sleep: async () => {},
+      clock,
+    });
+    expect(outcome.status).toBe('filled');
+
+    const snap = snapshotExecutionQuality();
+    // One cancel (after attempt 0) and one replace (attempt 1 re-submit).
+    expect(snap.cancelReplaceLatencyMs.cancel.n).toBe(1);
+    expect(snap.cancelReplaceLatencyMs.cancel.p50).toBe(1000);
+    expect(snap.cancelReplaceLatencyMs.replace.n).toBe(1);
+    expect(snap.cancelReplaceLatencyMs.replace.p50).toBe(1000);
+    // Two terminal orders observed: attempt 0 unfilled (0/2), attempt 1 full (2/2).
+    expect(snap.partialFills.orders).toBe(2);
+    expect(snap.partialFills.unfilled).toBe(1);
+    expect(snap.partialFills.fullyFilled).toBe(1);
+    expect(snap.partialFills.partiallyFilled).toBe(0);
   });
 });

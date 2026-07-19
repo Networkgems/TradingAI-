@@ -24,6 +24,10 @@ import {
   recordOrderGuardOutcome,
   type OrderQuoteGuardConfig,
 } from './order-quote-guard.js';
+import {
+  recordCancelReplaceLatency,
+  recordOrderFillOutcome,
+} from './execution-quality-telemetry.js';
 
 const openLog = logger.child({ module: 'tradier-smart-open' });
 
@@ -241,6 +245,7 @@ export async function submitSmartBuyToOpen(
     lastLimitPrice = limitPrice;
 
     let order;
+    const submitStart = clock();
     try {
       order = await client.buyContractsLimit(optionSymbol, qty, limitPrice);
     } catch (err: unknown) {
@@ -250,12 +255,29 @@ export async function submitSmartBuyToOpen(
         ...(lastOrderId !== undefined ? { orderId: lastOrderId } : {}),
       };
     }
+    // TRA-2046 — a re-submit after a cancelled prior step IS the "replace" leg of
+    // the maker walk; capture its submit->ack latency (attempt 0 is the initial
+    // submit, not a replace, so it is not counted).
+    if (attempt > 0) {
+      recordCancelReplaceLatency({
+        engine: 'options',
+        side: 'open',
+        kind: 'replace',
+        latencyMs: Math.max(0, clock() - submitStart),
+      });
+    }
     lastOrderId = order.id;
     const detail: TradierOrderDetail | null = await client.waitForOrderTerminalStatus(order.id, {
       timeoutMs,
       sleep,
     });
     const status = detail?.status ?? '';
+    // TRA-2046 — partial-fill telemetry. Record only when the broker reported a
+    // finite executed quantity; an omitted exec_quantity is UNMEASURED, never a
+    // false-zero fill (TRA-1707).
+    if (detail && typeof detail.exec_quantity === 'number' && Number.isFinite(detail.exec_quantity)) {
+      recordOrderFillOutcome({ engine: 'options', side: 'open', orderedQty: qty, execQty: detail.exec_quantity });
+    }
     if (status === 'filled') {
       const avgFill = detail?.avg_fill_price;
       return {
@@ -282,8 +304,17 @@ export async function submitSmartBuyToOpen(
     // attempts. Cancel failures are swallowed — Tradier sometimes reports
     // 422 when the order already terminated between our last poll and the
     // cancel call; either way, we proceed to the next attempt or return.
+    const cancelStart = clock();
     try {
       await client.cancelOrder(order.id);
+      // TRA-2046 — cancel->ack latency, recorded only on a successful ack (a
+      // throw is not an ack, so it must not enter the latency rollup).
+      recordCancelReplaceLatency({
+        engine: 'options',
+        side: 'open',
+        kind: 'cancel',
+        latencyMs: Math.max(0, clock() - cancelStart),
+      });
     } catch (err) {
       // Best-effort cleanup; the next limit submission still proceeds.
       // TRA-406 — was a bare `catch {}`. Logged so a persistent cancel

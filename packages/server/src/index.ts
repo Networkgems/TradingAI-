@@ -310,6 +310,9 @@ import {
   resolveOrderQuoteGuardConfig,
   snapshotOrderGuardMetrics,
 } from './order-quote-guard.js';
+// TRA-2046 (parent TRA-2044) — execution-quality telemetry: cancel/replace
+// latency + partial-fill fraction + stale-quote counts.
+import { snapshotExecutionQuality } from './execution-quality-telemetry.js';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI.
 import { buildExecutionQualityKpi } from './execution-quality-kpi.js';
 // TRA-1982 (parent TRA-1967 item 3) — data-driven maker-ladder recommendation.
@@ -5565,6 +5568,34 @@ app.get('/api/health/order-quote-guard', (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read order-quote-guard metrics' });
+  }
+});
+
+// TRA-2046 (parent TRA-2044) — execution-quality telemetry completeness. Since-
+// boot, memory-only, always-on (no flag, no IO, no order-behavior change): the
+// order paths already produce these measurements; this only folds them. Closes
+// the slippage proposal's "track partial fills, rejected orders, stale quotes,
+// cancel/replace latency" ask:
+//  - cancelReplaceLatencyMs — per-step cancel->ack + reprice->ack round-trips
+//    from the maker walk, aggregated to p50/p95 (only end-to-end time-to-fill
+//    was measured before).
+//  - partialFills — exec_quantity/remaining_quantity folded into a partial-fill
+//    rate (among orders that got ANY fill) + average filled fraction.
+//  - staleQuotes — the counted stale-quote reasons from the TRA-2045 order-guard
+//    registry (same source as /api/health/order-quote-guard, so they can't drift).
+// Counters read empty until live orders flow (live auto-trading is on HOLD,
+// TRA-1897); a `total: 0` here means no orders observed this uptime, not a fault.
+app.get('/api/health/execution-quality', (_req, res) => {
+  try {
+    res.json({
+      issue: 'TRA-2046',
+      telemetry: snapshotExecutionQuality(),
+    });
+  } catch (err) {
+    log.error('execution-quality telemetry probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read execution-quality telemetry' });
   }
 });
 
