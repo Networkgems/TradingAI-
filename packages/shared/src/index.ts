@@ -2704,6 +2704,16 @@ export interface OptionsAccountState {
   portfolioGreeks?: PortfolioGreeks;
 }
 
+/**
+ * TRA-2043 — HONESTY CAVEAT (survivorship bias): this list is
+ * SURVIVORSHIP-SELECTED. It is the equity universe as of 2026-07-18 (today's
+ * names) applied uniformly across ALL historical backtest windows — delisted,
+ * merged, and index-dropped tickers of the relevant era are absent, so any
+ * historical backtest run over this set overstates realised returns by the
+ * survivorship premium. True point-in-time / delisted-inclusive universe
+ * reconstruction requires the paid Norgate feed gated behind TRA-2039 board
+ * confirmation and is out of scope for the free adjClose correctness fix.
+ */
 export const WATCHLIST: readonly string[] = [
   'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN',
   'META',  'TSLA', 'AMD',  'NFLX',  'ORCL',

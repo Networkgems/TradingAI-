@@ -82,17 +82,38 @@ async function fetchYahooDaily(symbol: string, fromMs: number, toMs: number): Pr
     interval: '1d',
   });
   const quotes = result.quotes ?? [];
-  return quotes
-    .filter((q) => q.open != null && q.high != null && q.low != null && q.close != null)
-    .map((q) => ({
-      symbol,
-      timestamp: new Date(q.date).getTime(),
-      open: q.open!,
-      high: q.high!,
-      low: q.low!,
-      close: q.close!,
-      volume: q.volume ?? 0,
-    }));
+  return (
+    quotes
+      .filter((q) => q.open != null && q.high != null && q.low != null && q.close != null)
+      // TRA-2043 — equity daily fixtures now carry a dividend + split adjusted
+      // TOTAL-RETURN series, not vendor-raw price. Yahoo returns `adjclose`
+      // (back-adjusted to the latest bar); we scale the whole OHLC bar by the
+      // per-bar factor `adjclose/close` so bar geometry (ranges, gaps, ATR)
+      // stays internally consistent on the adjusted series rather than only the
+      // close being adjusted (which would leave close < low on ex-div bars).
+      //
+      // Scope: backtest fixtures only. `volume` is left raw — the adjclose
+      // factor conflates dividends and splits, so it can't be cleanly inverted
+      // into a split-only volume adjustment; split events are absent from the
+      // current fixture windows, so raw volume is faithful here. Crypto and the
+      // live/server candle paths are untouched (this fn only feeds on-disk
+      // equity/daily caches). If `adjclose` is missing for a bar the factor is
+      // 1 (raw close), so the series never regresses below the old behaviour.
+      .map((q) => {
+        const rawClose = q.close!;
+        const adjClose = q.adjclose ?? rawClose;
+        const factor = rawClose !== 0 ? adjClose / rawClose : 1;
+        return {
+          symbol,
+          timestamp: new Date(q.date).getTime(),
+          open: q.open! * factor,
+          high: q.high! * factor,
+          low: q.low! * factor,
+          close: adjClose,
+          volume: q.volume ?? 0,
+        };
+      })
+  );
 }
 
 export async function loadOrFetchDailyBars(
