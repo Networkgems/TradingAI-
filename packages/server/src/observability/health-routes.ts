@@ -36,6 +36,10 @@ import {
   isOptionLiveRvLongArmed,
   parseOptionLiveTestUntil,
   LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+  isOptionCostGateLiveEnforceEnabled,
+  isOptionLiquidityLiveEnforceEnabled,
+  OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
+  OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG,
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
@@ -61,6 +65,7 @@ import { summarizeDirectionalGate } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
+import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
 import { summarizeGiveBackArmFloor } from '../giveback-arm-floor-ledger.js'; // TRA-1892
 import { evaluateDurability } from '../durability.js'; // TRA-1681
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
@@ -1576,6 +1581,44 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         };
       })(),
       ...summarizeCostAwareGate(etDay),
+    });
+  });
+
+  // TRA-2048 (parent TRA-2044) — read the LIVE enforcement state of the two gates
+  // promoted from shadow to enforcing: the cost-vs-edge bar and the liquidity/spread
+  // veto. Unauthenticated + secrets-free (mirrors the other health probes). This is
+  // the counter the CTO required ("do not silently enforce with no counter"): it
+  // reports, per gate, the CURRENT arm state each live order site reads AND how many
+  // armed live evaluations were allowed vs BLOCKED. `armed:false` ⇒ shadow-only (the
+  // live path is unchanged); `armed:true` with `evaluated>0, blocked:0` is an armed
+  // gate passing everything; `blocked>0` is the direct proof it is biting. Read
+  // `durability.ephemeral` FIRST — true ⇒ these counts die on the next redeploy
+  // (fix = DATA_DIR=/data, TRA-1719). Live-order flags are read from the PROCESS env
+  // only (secret-adjacent — never the demo-flags file).
+  app.get('/api/health/live-enforce-gates', (_req, res) => {
+    const liveEnv = process.env;
+    const nowMs = now();
+    const etDay = etDateString(new Date(nowMs));
+    const costArmed = isOptionCostGateLiveEnforceEnabled(liveEnv);
+    const spreadArmed = isOptionLiquidityLiveEnforceEnabled(liveEnv);
+    const summary = summarizeLiveEnforceGate(etDay);
+    res.json({
+      ok: true,
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      etDay,
+      // The arm each live order site actually consults, plus its flag name for ops.
+      arm: {
+        costBar: { flag: OPTION_COST_GATE_LIVE_ENFORCE_FLAG, armed: costArmed },
+        spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
+      },
+      tighteningOnly: true,
+      // Both gates can ONLY add rejections (TRA-1897-HOLD-safe); neither loosens.
+      ...summary,
+      note:
+        !costArmed && !spreadArmed
+          ? `SHADOW-ONLY: both live enforcement flags OFF — the live options path is byte-for-byte the pre-TRA-2048 behaviour (no rejection). Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 on bqb1 (process env, never demo-flags).`
+          : `ENFORCING (live): cost_bar=${costArmed ? 'ARMED' : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
     });
   });
 

@@ -131,6 +131,7 @@ import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { hydrateGiveBackArmFloorFromDisk } from './giveback-arm-floor-ledger.js';
+import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import {
   hydrateLiveOptionsFeeSlippageFromDisk,
   backfillLiveOptionFees,
@@ -2469,6 +2470,19 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
   if (h.records > 0) {
     log.info('live-options fee/slippage ledger hydrated (TRA-1929)', { records: h.records });
+  }
+}
+
+// TRA-2048 (parent TRA-2044) — rebuild the durable LIVE gate-enforcement ledger
+// (cost-bar + spread veto promoted from shadow to enforcing) and remember DATA_DIR
+// for subsequent appends, so armed-live enforcement counts survive bqb1's nightly
+// reboot and stay readable at /api/health/live-enforce-gates. Durable only when
+// DATA_DIR is a persistent mount (else `durability.ephemeral` says so; the fix is
+// DATA_DIR=/data per TRA-1719). Best-effort; compacted to 30 days.
+{
+  const h = hydrateLiveEnforceGateFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('live-enforce gate ledger hydrated (TRA-2048)', { records: h.records, days: h.days });
   }
 }
 

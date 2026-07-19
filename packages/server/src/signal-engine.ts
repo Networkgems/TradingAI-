@@ -1,5 +1,6 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
+import { evaluateLiquidityGate, DEFAULT_LIQUIDITY_GATE_CONFIG } from '@trading-app/engine'; // TRA-2048 — live spread veto
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
 import type { TradierAccountBalance, TradierEquityQuote } from '@trading-app/engine';
 import { roundToCent } from '@trading-app/engine';
@@ -77,7 +78,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
@@ -121,6 +122,7 @@ import {
   type OpenSleeve,
 } from './directional-open-ledger.js';
 import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject, recordEntryDeltaCeilingObserved } from './cost-aware-gate-ledger.js';
+import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
@@ -4211,37 +4213,69 @@ export class SignalEngine {
    * safety margin). GROSS-in: the gate nets the cost exactly once, so the
    * estimator must NOT also net it (TRA-1603 decision #4).
    *
-   * DEMO-ONLY + OFF by default. Enforced only when `mode === 'demo'` AND the
-   * operator has armed `ENABLE_OPTION_COST_AWARE_GATE` via demo-flags.json — the
-   * same containment the greeks-gate / churn-brake / correlated-cap use, so this
-   * flag is structurally incapable of rejecting a LIVE option open regardless of
-   * any service-wide env. Both the estimator config and the cost-gate config are
-   * env-overridable so QuantTrader can retune the delta→win-prob multiplier and
-   * the per-structure cost inputs from the option journal / measured slippage
-   * ledger (deliverable D) WITHOUT a code change.
+   * TWO enforcement modes, each behind its OWN flag and its OWN telemetry:
+   *   • DEMO — enforced when `mode === 'demo'` AND `ENABLE_OPTION_COST_AWARE_GATE`
+   *     is armed via demo-flags.json (the same containment the greeks-gate /
+   *     churn-brake / correlated-cap use). Records to `/api/health/cost-aware-gate`.
+   *   • LIVE (TRA-2048) — enforced when `mode === 'live'` AND the SECRET-ADJACENT
+   *     `ENABLE_OPTION_COST_GATE_LIVE_ENFORCE` is armed in the PROCESS env (never
+   *     the demo-flags file). This is the board-funded promotion of the cost bar
+   *     from demo-shadow to LIVE enforcement: it rejects a live candidate whose
+   *     modeled gross R can't clear its structure's cost bar BEFORE the open, and
+   *     records every armed live verdict (allowed AND blocked) to
+   *     `/api/health/live-enforce-gates`. TIGHTENING-ONLY (it only ADDS rejections)
+   *     and OFF by default ⇒ the live path is byte-for-byte unchanged until an
+   *     operator arms it as an ops action (TRA-1897-HOLD-safe).
+   *
+   * Both the estimator config and the cost-gate config are env-overridable so
+   * QuantTrader can retune the delta→win-prob multiplier and the per-structure
+   * cost inputs from the option journal / measured slippage ledger WITHOUT a code
+   * change (demo reads the demo-flags env; live reads the process env).
    *
    * Returns a human-readable rejection reason when the candidate should be
    * skipped, or `null` when admitted OR when the gate is inactive (no behaviour
    * change — the caller opens exactly as before).
    */
   private costAwareGateReject(structure: string, inputs: ModeledGrossRInputs): string | null {
-    if (this.mode !== 'demo') return null;
-    const env = this.resolveDemoFlagEnv();
-    if (!isOptionCostAwareGateEnabled(env)) return null;
-    const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
-    const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
-    // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
-    // evidence is the trades that DIDN'T happen, so record every armed verdict for
-    // `/api/health/cost-aware-gate`. Observe-only and demo-only (both early-returns
-    // above already fired), best-effort on IO — never breaks the trade pass.
-    recordCostAwareGateDecision(
-      structure,
-      verdict.admit,
-      verdict.modeledGrossR,
-      verdict.barR,
-      etDateString(new Date()),
-    );
-    return verdict.admit ? null : verdict.reason;
+    if (this.mode === 'demo') {
+      const env = this.resolveDemoFlagEnv();
+      if (!isOptionCostAwareGateEnabled(env)) return null;
+      const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
+      const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
+      // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
+      // evidence is the trades that DIDN'T happen, so record every armed verdict for
+      // `/api/health/cost-aware-gate`. Observe-only, best-effort on IO — never breaks
+      // the trade pass.
+      recordCostAwareGateDecision(
+        structure,
+        verdict.admit,
+        verdict.modeledGrossR,
+        verdict.barR,
+        etDateString(new Date()),
+      );
+      return verdict.admit ? null : verdict.reason;
+    }
+    // TRA-2048 — LIVE enforcing branch. Read the arm from the PROCESS env only (a
+    // secret-adjacent live-order toggle, never the demo-flags file). OFF by default
+    // ⇒ this returns null and no live open is ever touched. When armed the SAME pure
+    // gate runs on the process-env config and rejects an over-cost live candidate
+    // before the open; every armed live verdict (allowed AND blocked) is recorded to
+    // `/api/health/live-enforce-gates` so an armed-but-inert flip cannot read as
+    // armed-and-biting. Best-effort telemetry — never breaks the live trade pass.
+    if (this.mode === 'live') {
+      if (!isOptionCostGateLiveEnforceEnabled(process.env)) return null;
+      const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(process.env));
+      const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(process.env));
+      recordLiveEnforceDecision(
+        'cost_bar',
+        structure,
+        !verdict.admit,
+        etDateString(new Date()),
+        verdict.admit ? undefined : verdict.reason,
+      );
+      return verdict.admit ? null : verdict.reason;
+    }
+    return null;
   }
 
   /**
@@ -5644,6 +5678,17 @@ export class SignalEngine {
       tradierVoid(
         `Tradier day-trade buying power $${dtbp.toFixed(2)} < required $${notionalCost.toFixed(2)}`,
       );
+      return false;
+    }
+
+    // TRA-2048 — LIVE liquidity/spread veto, promoted from shadow to enforcing behind
+    // the secret-adjacent `ENABLE_OPTION_LIQUIDITY_LIVE_ENFORCE` flag (default OFF ⇒
+    // no-op, byte-for-byte the shadow behaviour). When armed, a pathologically wide /
+    // thin book vetoes the open here — BEFORE the smart-open walk moves the book —
+    // rolling back the paper open exactly like the BP guards above. Tightening-only.
+    const spreadVeto = await this.enforceLiveOptionSpreadVeto(opened);
+    if (spreadVeto) {
+      tradierVoid(spreadVeto);
       return false;
     }
 
@@ -12372,6 +12417,74 @@ export class SignalEngine {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /**
+   * TRA-2048 (parent TRA-2044) — LIVE liquidity/spread VETO for the live-options
+   * broker seam ({@link mirrorLiveOptionOpen}), the board-funded promotion of the
+   * TRA-1967 shadow liquidity gate from OBSERVE to ENFORCING on real capital.
+   *
+   * Reads the SECRET-ADJACENT `ENABLE_OPTION_LIQUIDITY_LIVE_ENFORCE` from the
+   * PROCESS env only (never the demo-flags file). OFF by default ⇒ returns null and
+   * the live open proceeds exactly as before (the TRA-1980 shadow record is
+   * untouched). When armed, pulls the option's L1 quote — the same touch the
+   * smart-open walk will cross — and runs the PURE {@link evaluateLiquidityGate}. It
+   * blocks ONLY the hard liquidity vetoes (`SPREAD_TOO_WIDE` / `THIN_BOOK_VETO`):
+   *   • a `downsize` is deliberately NOT acted on — options carry no displayed depth
+   *     so it is unreachable, and resizing a live order exceeds this tightening-only
+   *     flip's mandate;
+   *   • an `UNUSABLE_QUOTE` (empty/one-sided/crossed book) is treated as a
+   *     quote-availability problem, NOT a spread-policy block: it returns null and
+   *     lets the smart-open walk's own `no_quote` handling void the open, so the
+   *     spread-gate `blocked` counter means "the book was too wide," not "the feed
+   *     hiccuped." A quote FETCH failure is likewise never a veto (a transient blip
+   *     must not block a live order).
+   *
+   * Every armed evaluation that reached a usable verdict (allowed OR blocked) is
+   * recorded to `/api/health/live-enforce-gates`, so an armed-but-inert flip cannot
+   * read as armed-and-biting. Best-effort telemetry; never throws into the order
+   * path. Returns the veto reason when the open must be rolled back, else null.
+   */
+  private async enforceLiveOptionSpreadVeto(
+    opened: import('@trading-app/shared').OptionPosition,
+  ): Promise<string | null> {
+    if (!isOptionLiquidityLiveEnforceEnabled(process.env)) return null;
+    if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) return null;
+
+    let bid = Number.NaN;
+    let ask = Number.NaN;
+    try {
+      const quote = await this.tradierLiveClient.getOptionQuote(opened.optionSymbol);
+      bid = typeof quote?.bid === 'number' ? quote.bid : Number.NaN;
+      ask = typeof quote?.ask === 'number' ? quote.ask : Number.NaN;
+    } catch (err) {
+      // A quote-fetch failure must NOT veto — enforcement is tightening-only and a
+      // transient feed blip cannot be allowed to block a live order. Fall through to
+      // the broker path (the smart-open walk has its own no_quote handling).
+      log.warn('live spread-veto quote fetch failed — not vetoing', {
+        optionSymbol: opened.optionSymbol,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    const result = evaluateLiquidityGate(
+      { side: 'buy', bid, ask, orderQty: opened.contracts * 100 },
+      DEFAULT_LIQUIDITY_GATE_CONFIG,
+    );
+    // Quote-availability problem, not a spread-policy decision — let downstream void.
+    if (result.action === 'veto' && result.reasons.includes('UNUSABLE_QUOTE')) return null;
+
+    const blocked =
+      result.action === 'veto' &&
+      (result.reasons.includes('SPREAD_TOO_WIDE') || result.reasons.includes('THIN_BOOK_VETO'));
+    const reason = blocked
+      ? `live liquidity gate veto: ${result.reasons.join(',')} (spread ${
+          result.spreadCostBps === null ? 'n/a' : result.spreadCostBps.toFixed(1)
+        }bps vs ${DEFAULT_LIQUIDITY_GATE_CONFIG.maxCostBps}bps ceiling) on ${opened.symbol}`
+      : undefined;
+    recordLiveEnforceDecision('spread', opened.symbol, blocked, etDateString(new Date()), reason);
+    return blocked ? reason! : null;
   }
 
   /**

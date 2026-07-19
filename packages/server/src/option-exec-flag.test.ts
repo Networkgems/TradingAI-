@@ -19,6 +19,10 @@ import {
   isOptionLiveOtmArmed,
   isOptionLiveRvLongArmed,
   parseOptionLiveTestUntil,
+  isOptionCostGateLiveEnforceEnabled,
+  isOptionLiquidityLiveEnforceEnabled,
+  OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
+  OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG,
   OPTION_LIVE_RV_LONG_FLAG,
   OPTION_LIVE_OTM_FLAG,
   OPTION_LIVE_TEST_UNTIL_VAR,
@@ -234,6 +238,30 @@ describe('isOptionWheelRoutingEnabled (TRA-1977)', () => {
 
   it('does not flip the observe-only short-premium scanner flag', () => {
     expect(isOptionShortPremiumScannerEnabled({ [OPTION_WHEEL_ROUTING_FLAG]: ON })).toBe(false);
+  });
+});
+
+describe('live enforcement flags (TRA-2048)', () => {
+  const ON = '1';
+
+  it('both live-enforce flags default OFF (shadow-only, byte-for-byte unchanged live path)', () => {
+    expect(isOptionCostGateLiveEnforceEnabled({})).toBe(false);
+    expect(isOptionLiquidityLiveEnforceEnabled({})).toBe(false);
+  });
+
+  it('arm on the usual truthy spellings, independently', () => {
+    for (const v of ['1', 'true', 'yes', 'on', 'ON', ' True ']) {
+      expect(isOptionCostGateLiveEnforceEnabled({ [OPTION_COST_GATE_LIVE_ENFORCE_FLAG]: v })).toBe(true);
+      expect(isOptionLiquidityLiveEnforceEnabled({ [OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]: v })).toBe(true);
+    }
+    // One flag does not arm the other — they are separate ops toggles.
+    expect(isOptionLiquidityLiveEnforceEnabled({ [OPTION_COST_GATE_LIVE_ENFORCE_FLAG]: ON })).toBe(false);
+    expect(isOptionCostGateLiveEnforceEnabled({ [OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]: ON })).toBe(false);
+  });
+
+  it('treats a non-truthy value as off (fail-safe: a fat-finger env never arms)', () => {
+    expect(isOptionCostGateLiveEnforceEnabled({ [OPTION_COST_GATE_LIVE_ENFORCE_FLAG]: '0' })).toBe(false);
+    expect(isOptionLiquidityLiveEnforceEnabled({ [OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]: 'maybe' })).toBe(false);
   });
 });
 

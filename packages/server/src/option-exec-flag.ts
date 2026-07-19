@@ -635,3 +635,57 @@ export function isOptionLiveOtmArmed(
 ): boolean {
   return isOptionLiveOtmEnabled(env) && isOptionLiveTestWindowOpen(env, now);
 }
+
+// --------------------------------------------------------------------------
+// TRA-2048 (parent TRA-2044 "how to reduce slippage", board-funded fork) —
+// promote the two already-built, shadow-only pre-trade gates from OBSERVE to
+// ENFORCING on the LIVE options path, each behind its OWN secret-adjacent env
+// flag so the flip to real rejection is an OPS action, not a code default.
+//
+//   • the COST-vs-edge gate (`option-cost-gate.ts` — commission + maker-adjusted
+//     spread-cross + safety-margin admission bar). Today it enforces ONLY in demo
+//     (`SignalEngine.costAwareGateReject` early-returns on `mode !== 'demo'`); this
+//     flag adds a LIVE-mode enforcing branch that rejects a live candidate whose
+//     modeled gross R can't clear its structure's cost bar BEFORE the open.
+//   • the LIQUIDITY / SPREAD gate (`packages/engine/src/liquidity-gate.ts` —
+//     `SPREAD_TOO_WIDE` / thin-book veto). Today it only SHADOW-records post-open
+//     (`recordOptionLiquidityShadow`); this flag adds a pre-submit veto at the
+//     single audited live-options broker seam (`mirrorLiveOptionOpen`).
+//
+// TIGHTENING-ONLY and TRA-1897-HOLD-safe: both flags can only ADD rejections
+// (reject a bad-spread / over-cost order) — neither can loosen, upsize, or admit
+// anything the current path wouldn't already admit. OFF by default ⇒ the live
+// options path is byte-for-byte the pre-TRA-2048 shadow behaviour: no rejection,
+// same fills. Like the sleeve-arm flags these are SECRET-ADJACENT live toggles
+// (they change what real orders do), so they are read from the process env ONLY —
+// never from the `demo-flags.json` file override — and are NOT on the demo-flag
+// allowlist. Every ARMED evaluation (allowed AND blocked) is recorded durably to
+// `live-enforce-gate-ledger.ts` and surfaced at `/api/health/live-enforce-gates`,
+// so an armed-but-inert flip cannot read the same as an armed-and-biting one
+// (the TRA-1486 / TRA-1682 lesson): `armed:true` with a positive `evaluated` and a
+// `blocked` count is the direct proof the gate is firing.
+// --------------------------------------------------------------------------
+
+export const OPTION_COST_GATE_LIVE_ENFORCE_FLAG = 'ENABLE_OPTION_COST_GATE_LIVE_ENFORCE';
+export const OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG = 'ENABLE_OPTION_LIQUIDITY_LIVE_ENFORCE';
+
+/**
+ * True iff the LIVE cost-vs-edge gate is armed to REJECT real option opens
+ * (accepts 1/true/yes/on). Default OFF ⇒ live opens are never blocked by the cost
+ * bar (the demo-only enforcement is unchanged). Read from the process env only —
+ * this is a live-order toggle, never sourced from the demo-flags file override.
+ */
+export function isOptionCostGateLiveEnforceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_COST_GATE_LIVE_ENFORCE_FLAG]);
+}
+
+/**
+ * True iff the LIVE liquidity/spread gate is armed to VETO real option opens on a
+ * pathologically wide / dead book (accepts 1/true/yes/on). Default OFF ⇒ the
+ * liquidity gate stays shadow-only on the live path (records, never blocks). Read
+ * from the process env only — this is a live-order toggle, never sourced from the
+ * demo-flags file override.
+ */
+export function isOptionLiquidityLiveEnforceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]);
+}
