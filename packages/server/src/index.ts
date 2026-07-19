@@ -302,6 +302,10 @@ import {
   preTradeGateSummary,
 } from './pre-trade-gate-ledger.js';
 import {
+  initLiveCanaryLedger,
+  buildCanaryHealth,
+} from './live-canary-ledger.js';
+import {
   initPreTradeLiquidityLedger,
   listLiquidityGateDecisions,
   isPreTradeLiquidityEnabled,
@@ -880,6 +884,11 @@ await initReversalShadowLedger();
 // appends decisions when ENABLE_PRE_TRADE_GATE is set (default OFF); nothing here
 // routes or modifies an order.
 await initPreTradeGateLedger();
+
+// TRA-2051 — warm the live-canary state ledger so the health endpoint reflects the
+// folded state (incl. any latched demotion) right after boot. Inert with
+// ENABLE_LIVE_CANARY off (default): no candidate is armed and no capital moves.
+await initLiveCanaryLedger();
 
 // TRA-1967 — warm the SHADOW-FIRST pre-trade LIQUIDITY gate ledger so its read
 // endpoint has history right after boot. The live equity/options signal paths
@@ -5524,6 +5533,25 @@ app.get('/api/health/pre-trade-gate', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read pre-trade gate ledger' });
+  }
+});
+
+// TRA-2051 — live-canary staging harness readout. Reports the promotion stage
+// (shadow -> canary -> full_live), the canary allocation, per-hard-limit headroom
+// from the last guard sweep, and the breach/demotion state (incl. the latched
+// `canaryDemoted`). Flag-OFF/fail-closed: with ENABLE_LIVE_CANARY off (default,
+// and while TRA-382 holds live trading) this reports the safe default state
+// (shadow, latch clear, empty headroom) and NO candidate is armed / no capital
+// moves. Unauthenticated by design (booleans + telemetry aggregates, no PII),
+// matching the sibling shadow/gate probes.
+app.get('/api/health/live-canary', async (_req, res) => {
+  try {
+    res.json(await buildCanaryHealth());
+  } catch (err) {
+    log.error('live-canary health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read live-canary ledger' });
   }
 });
 

@@ -263,6 +263,32 @@ export type {
   LiquidityGateInput,
   LiquidityGateResult,
 } from './liquidity-gate.js';
+// TRA-2051 — live-canary staging harness (pure): hard-limit guards + state
+// machine (shadow -> canary -> full_live) + inert promotion criteria. Wired
+// server-side behind ENABLE_LIVE_CANARY (default OFF) via live-canary-ledger.
+export {
+  DEFAULT_CANARY_LIMITS,
+  DEFAULT_CANARY_PROMOTION_CRITERIA,
+  evaluateCanaryGuards,
+  applyGuardEvaluation,
+  initialCanaryState,
+  evaluateCanaryPromotion,
+} from './live-canary.js';
+export type {
+  CanaryStage,
+  CanaryBreachReason,
+  CanaryLimits,
+  CanaryTelemetry,
+  CanaryLimitHeadroom,
+  CanaryGuardEvaluation,
+  CanaryState,
+  CanaryAction,
+  CanaryTransition,
+  CanaryPromotionCriteria,
+  CanaryPromotionInput,
+  CanaryPromotionBlocker,
+  CanaryPromotionVerdict,
+} from './live-canary.js';
 // TRA-1220 (parent TRA-1218) — crypto ADX/CHOP/ER regime classifier. DISTINCT
 // from `classifyRegime` above; the shared substrate rec #2 (regime-gated TSMOM)
 // imports.
