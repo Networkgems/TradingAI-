@@ -1,0 +1,22 @@
+{
+  "//": "TRA-2052 — reference LEAN CLI project config. Copy into the `lean init`",
+  "//1": "workspace. data-folder points at the gitignored converter output tree so",
+  "//2": "LEAN and packages/backtest/src/databento-to-lean.ts read/write one layout.",
+
+  "data-folder": "../packages/backtest/data/lean",
+
+  "engine-config": {
+    "environment": "backtesting",
+    "data-provider": "QuantConnect.Lean.Engine.DataFeeds.DefaultDataProvider",
+    "map-file-provider": "QuantConnect.Data.Auxiliary.LocalDiskMapFileProvider",
+    "factor-file-provider": "QuantConnect.Data.Auxiliary.LocalDiskFactorFileProvider"
+  },
+
+  "reconciliation": {
+    "//": "Consumed by the sibling child TRA-2053, not this issue.",
+    "market": "usa",
+    "security-type": "equity",
+    "resolutions": ["Daily", "Minute"],
+    "symbols-source": "@trading-app/shared WATCHLIST (25 names incl. SPY/QQQ)"
+  }
+}
