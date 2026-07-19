@@ -315,6 +315,11 @@ import {
   resolveOrderQuoteGuardConfig,
   snapshotOrderGuardMetrics,
 } from './order-quote-guard.js';
+// TRA-2050 (parent TRA-2044) — TWAP/participation order-splitting shadow planner.
+import {
+  resolveOrderSplitConfig,
+  snapshotOrderSplitMetrics,
+} from './order-splitter.js';
 // TRA-2046 (parent TRA-2044) — execution-quality telemetry: cancel/replace
 // latency + partial-fill fraction + stale-quote counts.
 import { snapshotExecutionQuality } from './execution-quality-telemetry.js';
@@ -5610,6 +5615,40 @@ app.get('/api/health/order-quote-guard', (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read order-quote-guard metrics' });
+  }
+});
+
+// TRA-2050 (parent TRA-2044) — TWAP/participation order-splitting readout. Since-
+// boot counted PLANNING outcomes keyed `enabled:reason` (equity path only —
+// options stay single-clip). Flag-OFF (default): `enabled:false`, no plan
+// computed, empty counters. `ENABLE_ORDER_SPLITTING` on ⇒ SHADOW: the equity
+// submit path computes the child-slice plan and records what it WOULD do, but
+// still submits the single aggregate order (the multi-tick executor is a gated
+// follow-up, blocked on the TRA-1897 HOLD lift). Inert below
+// `ORDER_SPLIT_MIN_NOTIONAL` regardless of the flag, so it stays a no-op at
+// today's sizes; the `below_threshold` count vs `split_*` counts show WHEN
+// order sizes start crossing the threshold — the trigger to build/arm the
+// executor. `slices_scheduled` is the running total of planned child slices.
+app.get('/api/health/order-splitting', (_req, res) => {
+  try {
+    const cfg = resolveOrderSplitConfig();
+    res.json({
+      issue: 'TRA-2050',
+      enabled: cfg.enabled,
+      strategy: cfg.strategy,
+      minNotional: cfg.minNotional,
+      childCount: cfg.childCount,
+      intervalMs: cfg.intervalMs,
+      maxParticipationRate: cfg.maxParticipationRate,
+      // Execution of the schedule is NOT yet wired — this is a shadow planner.
+      execution: 'shadow_only',
+      metrics: snapshotOrderSplitMetrics(),
+    });
+  } catch (err) {
+    log.error('order-splitting health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read order-splitting metrics' });
   }
 });
 

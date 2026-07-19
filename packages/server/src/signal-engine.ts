@@ -169,6 +169,11 @@ import {
   recordOrderGuardOutcome,
   type OrderQuoteGuardConfig,
 } from './order-quote-guard.js';
+import {
+  resolveOrderSplitConfig,
+  planOrderSlices,
+  recordOrderSplitOutcome,
+} from './order-splitter.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
@@ -12207,6 +12212,37 @@ export class SignalEngine {
         ok: false,
         reason: `Tradier sizing yielded qty=0 (cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
       };
+    }
+    // TRA-2050 — TWAP/participation order splitting for larger equity orders,
+    // SHADOW-first. Flag-off (default) ⇒ this whole block is skipped: byte-for-
+    // byte the prior single-clip submit. Flag-on ⇒ compute the child-slice plan
+    // and RECORD what it WOULD do (counted reason + slice count) via the
+    // order-splitter registry, but STILL submit the single aggregate order
+    // below — the multi-tick child-order dispatcher is a gated follow-up
+    // (blocked on the TRA-1897 HOLD lift; the equity sandbox has no market data
+    // to verify a live scheduler against). Inert below `ORDER_SPLIT_MIN_NOTIONAL`
+    // regardless of the flag, so it's a no-op at today's sizes. Options stay
+    // single-clip by design — this planner is only ever consulted on the equity
+    // path. The telemetry surfaces WHEN order sizes start crossing the split
+    // threshold, i.e. when it's time to build/arm the executor.
+    const splitCfg = resolveOrderSplitConfig();
+    if (splitCfg.enabled) {
+      const splitPlan = planOrderSlices({
+        side: signal.side,
+        totalQty: qty,
+        referencePrice: currentPrice,
+        config: splitCfg,
+      });
+      recordOrderSplitOutcome(splitPlan, splitCfg.enabled);
+      if (splitPlan.split) {
+        log.info('order-splitter shadow plan (execution deferred — single clip submitted)', {
+          symbol: signal.symbol,
+          totalQty: qty,
+          notional: Math.round(splitPlan.notional),
+          strategy: splitPlan.strategy,
+          slices: splitPlan.slices.length,
+        });
+      }
     }
     // TRA-2045 — order-time quote-freshness + max-slippage guard. Flag-off
     // (default) ⇒ `entryLimit` stays `currentPrice` (byte-for-byte the prior
