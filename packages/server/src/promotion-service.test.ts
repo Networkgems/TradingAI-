@@ -735,7 +735,10 @@ describe('TRA-803 public promotion probe — aggregates paper, keeps gate honest
     const status = await svc.buildPublicPromotionProbe(STRATEGY);
     const keys = Object.keys(status).sort();
     expect(keys).toEqual(
-      ['backtest', 'blockedReasons', 'canGoLive', 'paper', 'signoff', 'strategyClass', 'strategyId'].sort(),
+      // TRA-2036 added the observe-only shadow-expectancy guard verdict to the
+      // promotion status (null when the guard is off). It is gate telemetry, so
+      // it belongs in this exposed-keys allowlist alongside the other gates.
+      ['backtest', 'blockedReasons', 'canGoLive', 'paper', 'shadowExpectancy', 'signoff', 'strategyClass', 'strategyId'].sort(),
     );
   });
 });
