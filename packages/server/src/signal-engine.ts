@@ -1,7 +1,8 @@
 import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStrategy, confluenceSide, supertrend, supertrendLatest, reversalChecklist, adx, atr, atrPct, donchian, supportResistance, blackScholesDelta, blackScholesGreeks, daysToExpiration, bookGiveBackDecision, correlatedExposureDecision, entryGreeksGateDecision, chandelierStop, stopModifyDecision, selectRvLongCandidate, RV_LONG_DELTA_FLOOR, selectShadowOptionSignal, emaPullbackTrigger, volumeConfirmedBreakout, computePutCallRatio, computeOiTotals, rsi, TradierOptionsClient, TradierOrderClient, TRADIER_REJECTED_STATUSES, TRADIER_TERMINAL_STATUSES, evaluateSma200, SMA200_MIN_BARS, SMA200_DEBOUNCE_BARS, composeTechnicalSnapshot, resampleCandles, TF_BUCKET_MS, OptionsRiskBreaker, DEFAULT_OPTIONS_BREAKER_PARAMS } from '@trading-app/engine';
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
-import type { TradierAccountBalance } from '@trading-app/engine';
+import type { TradierAccountBalance, TradierEquityQuote } from '@trading-app/engine';
+import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
@@ -157,7 +158,14 @@ import {
   MIN_RISK_THROTTLE,
 } from './risk-autopilot.js';
 import type { Regime } from '@trading-app/engine';
-import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient } from './yahoo-feed.js';
+import {
+  resolveOrderQuoteGuardConfig,
+  computeMarketableLimit,
+  evaluateQuoteFreshness,
+  recordOrderGuardOutcome,
+  type OrderQuoteGuardConfig,
+} from './order-quote-guard.js';
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
@@ -12116,13 +12124,27 @@ export class SignalEngine {
         reason: `Tradier sizing yielded qty=0 (cash=${balance.totalCash.toFixed(2)} stockBP=${balance.stockBuyingPower ?? 'null'})`,
       };
     }
+    // TRA-2045 — order-time quote-freshness + max-slippage guard. Flag-off
+    // (default) ⇒ `entryLimit` stays `currentPrice` (byte-for-byte the prior
+    // behavior: a bracket limit at the last polled engine tick, no re-quote, no
+    // slippage offset). Flag-on ⇒ pull a FRESH L1 quote, reject a stale one (in
+    // enforce mode), and price a marketable limit bounded by the max-slippage
+    // budget. Shadow mode records the counted reason + the limit it WOULD price
+    // but still submits at `currentPrice`.
+    const guardCfg = resolveOrderQuoteGuardConfig();
+    let entryLimit = currentPrice;
+    if (guardCfg.mode !== 'off') {
+      const guardResult = await this.resolveEquityEntryLimit(signal, currentPrice, guardCfg);
+      if (!guardResult.ok) return guardResult;
+      entryLimit = guardResult.limitPrice;
+    }
     let resp;
     try {
       resp = await client.submitBracketOrder({
         symbol: signal.symbol,
         qty,
         side: signal.side,
-        limitPrice: currentPrice,
+        limitPrice: entryLimit,
         takeProfitPrice: signal.takeProfit,
         stopLossPrice: signal.stopLoss,
       });
@@ -12154,6 +12176,77 @@ export class SignalEngine {
       };
     }
     return { ok: true, orderId: resp.id };
+  }
+
+  /**
+   * TRA-2045 — pull a FRESH L1 equity quote at submit and price the entry limit.
+   *
+   * Shadow mode: record the freshness verdict + the marketable limit we WOULD
+   * price, but return `currentPrice` so the order is unchanged (measure only).
+   * Enforce mode: reject a stale/unavailable quote with a counted reason, else
+   * return the max-slippage-bounded marketable limit (clamped to the fresh ask
+   * for buys / bid for sells). A re-quote that fails (no client / network /
+   * empty book) counts `no_fresh_quote`: shadow proceeds at `currentPrice`;
+   * enforce falls back to `currentPrice` too — we never BLOCK an order just
+   * because the extra freshness pull failed (that would turn a hardening gate
+   * into a new outage surface), we only skip on a quote we saw and proved stale.
+   */
+  private async resolveEquityEntryLimit(
+    signal: TradeSignal,
+    currentPrice: number,
+    cfg: OrderQuoteGuardConfig,
+  ): Promise<{ ok: true; limitPrice: number } | { ok: false; reason: string }> {
+    const stocksClient = getTradierStocksFeedClient();
+    let quote: TradierEquityQuote | undefined;
+    if (stocksClient) {
+      try {
+        const quotes = await stocksClient.getQuotes([signal.symbol]);
+        quote = quotes.get(signal.symbol);
+      } catch (err) {
+        log.warn('order-quote-guard fresh equity re-quote failed', {
+          symbol: signal.symbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (!quote) {
+      // No fresh quote to gate on — record it and proceed at the caller's price
+      // in BOTH modes. A missing re-quote is not evidence of a stale market.
+      recordOrderGuardOutcome('equity', 'no_fresh_quote', cfg.mode);
+      return { ok: true, limitPrice: currentPrice };
+    }
+
+    const freshness = evaluateQuoteFreshness({
+      quoteTimeMs: quote.quoteTimeMs,
+      nowMs: Date.now(),
+      maxQuoteAgeMs: cfg.maxQuoteAgeMs,
+    });
+    if (!freshness.reason) {
+      // fresh — fall through to price the limit
+    } else {
+      recordOrderGuardOutcome('equity', freshness.reason, cfg.mode);
+      if (cfg.mode === 'enforce') {
+        const ageStr = freshness.ageMs === null ? 'no timestamp' : `${Math.round(freshness.ageMs / 1000)}s old`;
+        return {
+          ok: false,
+          reason: `stale quote at submit (${freshness.reason}, ${ageStr}) — order skipped by freshness gate`,
+        };
+      }
+      // shadow: recorded, proceed unchanged
+      return { ok: true, limitPrice: currentPrice };
+    }
+
+    const limit = computeMarketableLimit({
+      side: signal.side,
+      signalPrice: currentPrice,
+      ask: quote.ask,
+      bid: quote.bid,
+      maxSlippage: cfg.maxSlippage,
+    });
+    recordOrderGuardOutcome('equity', limit.marketable ? 'passed' : 'slippage_capped', cfg.mode);
+    // Shadow measures only — never move the actual submit price.
+    if (cfg.mode !== 'enforce') return { ok: true, limitPrice: currentPrice };
+    return { ok: true, limitPrice: roundToCent(limit.limitPrice) };
   }
 
   /**

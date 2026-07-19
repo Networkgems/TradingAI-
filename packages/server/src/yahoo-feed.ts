@@ -322,6 +322,18 @@ export function setTradierStocksFeedClient(
   reconcileTradierFeedClient();
 }
 
+/**
+ * TRA-2045 — expose the shared Tradier stocks-feed client so the order-time
+ * quote-freshness / max-slippage guard can pull a FRESH L1 quote right before
+ * an equity submit (bypassing the short-TTL quote cache), reusing the same
+ * production market-data client that already powers `fetchQuotes`. Returns
+ * `null` when no context supplies a token — the guard degrades to a
+ * `no_fresh_quote` counted reason rather than blocking the path.
+ */
+export function getTradierStocksFeedClient(): TradierStocksClient | null {
+  return tradierStocksClient;
+}
+
 // NOTE: the boot env-token seed call lives at the BOTTOM of this module
 // (`seedBootEnvTradierToken()`), not here. It runs `reconcileTradierFeedClient`
 // → `clearQuoteCache()` → `quoteCache.clear()`, and `quoteCache` is a `const`

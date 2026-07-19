@@ -306,6 +306,10 @@ import {
   isPreTradeLiquidityEnabled,
   liquidityGateSummary,
 } from './pre-trade-liquidity-ledger.js';
+import {
+  resolveOrderQuoteGuardConfig,
+  snapshotOrderGuardMetrics,
+} from './order-quote-guard.js';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled execution-quality KPI.
 import { buildExecutionQualityKpi } from './execution-quality-kpi.js';
 // TRA-1982 (parent TRA-1967 item 3) — data-driven maker-ladder recommendation.
@@ -5535,6 +5539,32 @@ app.get('/api/health/pre-trade-liquidity', async (req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read pre-trade liquidity ledger' });
+  }
+});
+
+// TRA-2045 (parent TRA-2044) — order-time quote-freshness + max-slippage guard
+// readout. Since-boot counted reasons keyed by `engine:mode:outcome` for BOTH
+// order paths (equity bracket submit + options smart-open). Flag-OFF (default):
+// mode `off`, no re-quote, empty counters. `ENABLE_ORDER_QUOTE_GUARD` on ⇒
+// `shadow` (measure only); `ORDER_QUOTE_GUARD_ENFORCE` also on ⇒ `enforce`
+// (reject stale quotes + price the max-slippage-bounded marketable limit). The
+// counted `stale_quote` / `missing_quote_timestamp` / `slippage_capped` reasons
+// feed the TRA-2044 telemetry child.
+app.get('/api/health/order-quote-guard', (_req, res) => {
+  try {
+    const cfg = resolveOrderQuoteGuardConfig();
+    res.json({
+      issue: 'TRA-2045',
+      mode: cfg.mode,
+      maxSlippage: cfg.maxSlippage,
+      maxQuoteAgeMs: cfg.maxQuoteAgeMs,
+      metrics: snapshotOrderGuardMetrics(),
+    });
+  } catch (err) {
+    log.error('order-quote-guard health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read order-quote-guard metrics' });
   }
 });
 

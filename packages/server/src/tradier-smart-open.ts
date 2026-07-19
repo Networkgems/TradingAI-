@@ -18,6 +18,12 @@ import {
   resolveMakerWalkConfig,
 } from './option-maker-config.js';
 import { logger } from './observability/index.js';
+import {
+  resolveOrderQuoteGuardConfig,
+  evaluateQuoteFreshness,
+  recordOrderGuardOutcome,
+  type OrderQuoteGuardConfig,
+} from './order-quote-guard.js';
 
 const openLog = logger.child({ module: 'tradier-smart-open' });
 
@@ -91,6 +97,15 @@ export interface SmartBuyOptions {
   guardrail?: DayTradingGuardrailConfig;
   /** Clock seam for the DTE backstop (ms epoch). Defaults to `Date.now()`. */
   now?: number;
+  /**
+   * TRA-2045 — order-time quote-freshness guard config. Defaults to
+   * {@link resolveOrderQuoteGuardConfig}(process.env) (mode `off` unless the
+   * `ENABLE_ORDER_QUOTE_GUARD` env flag is set). Injectable for tests. When the
+   * mode is not `off` the helper evaluates the option quote's own timestamp and,
+   * in `enforce` mode, rejects a stale/timestamp-less quote before the walk;
+   * `shadow` records the counted reason but proceeds.
+   */
+  quoteGuard?: OrderQuoteGuardConfig;
 }
 
 /**
@@ -177,6 +192,32 @@ export async function submitSmartBuyToOpen(
       status: 'no_quote',
       reason: 'No quote available — refusing market buy on dead contract.',
     };
+  }
+
+  // TRA-2045 — order-time stale-quote gate (parity with the equity path). Off by
+  // default (no-op). The option quote carries a broker timestamp only when
+  // Tradier stamps `trade_date`; a quote without one records
+  // `missing_quote_timestamp`. Enforce mode rejects a stale quote before the
+  // walk; shadow records the counted reason and proceeds.
+  const quoteGuard = options.quoteGuard ?? resolveOrderQuoteGuardConfig();
+  if (quoteGuard.mode !== 'off') {
+    const freshness = evaluateQuoteFreshness({
+      quoteTimeMs: quote?.quoteTimeMs,
+      nowMs: clock(),
+      maxQuoteAgeMs: quoteGuard.maxQuoteAgeMs,
+    });
+    if (freshness.reason) {
+      recordOrderGuardOutcome('options', freshness.reason, quoteGuard.mode);
+      if (quoteGuard.mode === 'enforce') {
+        const ageStr = freshness.ageMs === null ? 'no timestamp' : `${Math.round(freshness.ageMs / 1000)}s old`;
+        return {
+          status: 'rejected',
+          reason: `stale quote at submit (${freshness.reason}, ${ageStr}) — buy_to_open skipped by freshness gate`,
+        };
+      }
+    } else {
+      recordOrderGuardOutcome('options', 'passed', quoteGuard.mode);
+    }
   }
 
   // TRA-1601 (A) — materialise the full ladder of limit prices up front:

@@ -20,6 +20,12 @@ export interface TradierOptionQuote {
   bid?: number;
   ask?: number;
   last?: number;
+  /**
+   * TRA-2045 — quote timestamp (ms epoch) parsed from Tradier `trade_date`,
+   * when present. Feeds the order-time stale-quote gate on the smart-open path.
+   * Optional: an option quote that omits the field can't be freshness-proven.
+   */
+  quoteTimeMs?: number;
 }
 
 interface TradierExpirationsEnvelope {
@@ -67,6 +73,8 @@ interface TradierRawQuote {
   bid?: number;
   ask?: number;
   last?: number;
+  // TRA-2045 — quote timestamp (ms epoch) surfaced by Tradier `/markets/quotes`.
+  trade_date?: number;
 }
 
 /**
@@ -487,6 +495,10 @@ export class TradierOptionsClient extends TradierOrderClient {
     if (typeof quote.bid === 'number' && Number.isFinite(quote.bid)) result.bid = quote.bid;
     if (typeof quote.ask === 'number' && Number.isFinite(quote.ask)) result.ask = quote.ask;
     if (typeof quote.last === 'number' && Number.isFinite(quote.last)) result.last = quote.last;
+    // TRA-2045 — carry the broker quote timestamp when present (finite, > 0).
+    if (typeof quote.trade_date === 'number' && Number.isFinite(quote.trade_date) && quote.trade_date > 0) {
+      result.quoteTimeMs = quote.trade_date;
+    }
     return result;
   }
 

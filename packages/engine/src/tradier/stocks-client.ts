@@ -21,6 +21,15 @@ export interface TradierEquityQuote {
   ask?: number;
   bidSize?: number;
   askSize?: number;
+  /**
+   * TRA-2045 — the quote's own timestamp (ms epoch), parsed from Tradier
+   * `trade_date`. Feeds the order-time stale-quote gate, which measures the
+   * age of the quote AT THE BROKER at submit — distinct from the feed's local
+   * receive time (`symbolState.lastUpdated`). Optional: the Yahoo/Stooq
+   * fallbacks carry no broker timestamp, so a consumer must tolerate its
+   * absence (absent ⇒ "freshness unprovable for this quote").
+   */
+  quoteTimeMs?: number;
 }
 
 interface TradierRawQuote {
@@ -171,6 +180,12 @@ export class TradierStocksClient {
         ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
         ...(typeof q.bidsize === 'number' ? { bidSize: q.bidsize } : {}),
         ...(typeof q.asksize === 'number' ? { askSize: q.asksize } : {}),
+        // TRA-2045 — Tradier reports the quote timestamp as `trade_date` in ms
+        // epoch. Carry it through only when finite and positive; a 0/absent
+        // value means the source didn't stamp the quote (fallback feeds).
+        ...(typeof q.trade_date === 'number' && Number.isFinite(q.trade_date) && q.trade_date > 0
+          ? { quoteTimeMs: q.trade_date }
+          : {}),
       });
     }
     return out;
