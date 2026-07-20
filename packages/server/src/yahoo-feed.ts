@@ -1645,12 +1645,17 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
   const DEADLINE_MS = 45_000;
   const startedAt = Date.now();
 
+  // TRA-2088 — headlines are bucketed BY THE QUERY THAT RETURNED THEM, not piled
+  // into one flat list. See the allocation comment at the tail of this function.
+  const PER_SYMBOL_TOP_K = 3;
+
   const queries = [...symbols];
-  const items: NewsItem[] = [];
+  const perSymbol = new Map<string, NewsItem[]>();
   const seen = new Set<string>();
   let queriesAttempted = 0;
   let queriesSucceeded = 0;
   const collect = (
+    query: string,
     newsArr: ReadonlyArray<{
       title?: string;
       link?: string;
@@ -1659,10 +1664,19 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
       providerPublishTime?: Date | number | string;
     }>,
   ): void => {
+    let bucket = perSymbol.get(query);
+    if (!bucket) {
+      bucket = [];
+      perSymbol.set(query, bucket);
+    }
     for (const n of newsArr) {
+      // `seen` stays GLOBAL: a wire duplicate is attributed to the first query
+      // that returned it. Downstream `mapNewsToCandidates` maps by mention text,
+      // not by bucket key, so a shared headline still reaches every symbol it
+      // names — the bucket only decides which symbol spends a slot on it.
       if (!n?.link || !n?.title || seen.has(n.link)) continue;
       seen.add(n.link);
-      items.push({
+      bucket.push({
         title: n.title,
         url: n.link,
         source: n.publisher ?? 'Yahoo Finance',
@@ -1686,19 +1700,65 @@ export async function fetchMarketNews(symbols: readonly string[] = []): Promise<
         ),
       ),
     );
-    for (const r of settled) {
+    for (const [idx, r] of settled.entries()) {
       // `withRetry` yields `null` on exhaustion. Counting only non-null keeps a
       // feed outage separable from a genuinely quiet news day — the two used to
       // land on the identical empty array.
       if (!r) continue;
       queriesSucceeded += 1;
-      collect(r.news ?? []);
+      collect(slice[idx]!, r.news ?? []);
     }
     if (i + NEWS_BATCH < queries.length) await sleep(BATCH_PAUSE_MS);
   }
 
+  // TRA-2088 — ALLOCATION, not truncation.
+  //
+  // This used to be `items.sort(recency).slice(0, RESULT_CAP)` over one flat
+  // list. That is a BIASED SAMPLER, not a bound: a global recency sort allocates
+  // the 60 slots BY NEWS VOLUME, and `CATALYST_FRESHNESS_MAX_MINUTES` (6h) admits
+  // far more than 60 items on a normal morning — so the cap binds before freshness
+  // ever filters. Measured on the TRA-2064 run: `headlines=60 -> 13 mapped
+  // candidates`; 12 of 25 names were structurally unreachable, crowded out by
+  // NVDA/AAPL/TSLA rather than by having no fresh catalyst.
+  //
+  // That is close to the exact inverse of what a catalyst screener wants. Its
+  // highest-information event is a single unexpected headline on a normally-quiet
+  // name — precisely the row a volume-ranked sampler drops first.
+  //
+  // Fix: drain the per-symbol buckets RANK-INTERLEAVED. Every symbol's freshest
+  // headline is admitted before any symbol's second, so a quiet name's one fresh
+  // headline can never be evicted by a noisy name's twelfth.
+  //
+  // NOTE a plain per-symbol top-K followed by a global recency cap does NOT give
+  // that guarantee: 25 symbols x K=3 is 75 > RESULT_CAP 60, so the global sort
+  // would still evict ~15 by volume — the same defect, one order smaller. The
+  // interleave is what makes the guarantee structural.
+  //
+  const buckets = [...perSymbol.values()]
+    .map((b) => [...b].sort((x, y) => y.publishedAt.localeCompare(x.publishedAt)).slice(0, PER_SYMBOL_TOP_K))
+    .filter((b) => b.length > 0);
+
+  // The cap must never bind BELOW one-slot-per-symbol, or the rank-0 pass starts
+  // truncating in QUERY ORDER — a positional bias just as arbitrary as the volume
+  // bias removed above, and just as silent. Today this is inert (25 symbols, cap
+  // 60); it exists so the guarantee survives a future universe widening instead of
+  // depending on someone reading a comment. Still hard-bounded: the ceiling is
+  // max(60, universe) and each symbol contributes at most PER_SYMBOL_TOP_K.
+  const effectiveCap = Math.max(RESULT_CAP, buckets.length);
+
+  const items: NewsItem[] = [];
+  for (let rank = 0; rank < PER_SYMBOL_TOP_K && items.length < effectiveCap; rank += 1) {
+    for (const b of buckets) {
+      if (items.length >= effectiveCap) break;
+      const pick = b[rank];
+      if (pick) items.push(pick);
+    }
+  }
+
+  // Callers receive a recency-ordered list, exactly as before — the interleave
+  // decides MEMBERSHIP, not the emitted order.
   items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
-  return { items: items.slice(0, RESULT_CAP), queriesAttempted, queriesSucceeded };
+  return { items, queriesAttempted, queriesSucceeded };
 }
 
 /** Test Yahoo Finance connectivity — returns a quote or throws. */
