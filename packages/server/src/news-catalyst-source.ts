@@ -31,6 +31,7 @@ import {
   type CatalystDropReason,
   type CatalystObservationInput,
 } from './news-catalyst-ledger.js';
+import { recordCatalystRun } from './news-catalyst-run-ledger.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'news-catalyst-source' });
@@ -277,8 +278,18 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
   try {
     news = await deps.fetchNews();
   } catch (err) {
-    log.warn('market news fetch failed', {
-      reason: err instanceof Error ? err.message : String(err),
+    const reason = err instanceof Error ? err.message : String(err);
+    log.warn('market news fetch failed', { reason });
+    // TRA-2064 — `headlineCount: null`, NOT 0: the feed never returned, so
+    // there is nothing measured. A `0` here would read identically to a feed
+    // that legitimately returned no headlines.
+    await recordCatalystRun({
+      at: deps.now,
+      outcome: 'fetch_failed',
+      headlineCount: null,
+      candidateCount: null,
+      chosenCount: null,
+      reason,
     });
     return [];
   }
@@ -286,6 +297,13 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
   const base = mapNewsToCandidates(news, deps.now);
   if (base.length === 0) {
     log.info('news-catalyst: no mapped candidates', { headlines: news.length });
+    await recordCatalystRun({
+      at: deps.now,
+      outcome: 'no_mapped_candidates',
+      headlineCount: news.length,
+      candidateCount: 0,
+      chosenCount: 0,
+    });
     return [];
   }
 
@@ -324,6 +342,13 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
   }
 
   const picks = chosen.map((s) => s.symbol.toUpperCase());
+  await recordCatalystRun({
+    at: deps.now,
+    outcome: 'picks_built',
+    headlineCount: news.length,
+    candidateCount: scored.length,
+    chosenCount: picks.length,
+  });
   log.info('news-catalyst picks built', {
     headlines: news.length,
     candidates: scored.length,

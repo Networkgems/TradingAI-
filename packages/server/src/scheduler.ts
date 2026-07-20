@@ -401,7 +401,26 @@ export class MarketScheduler {
       // Gated on market days so weekends + NYSE holidays are skipped. The
       // callback is responsible for replaying the prior session's post-market
       // EOD review + a fresh pre-market scan into a curated watchlist.
-      if (hour === 9 && minute === 0) {
+      //
+      // TRA-2064 — fire at OR AFTER 9:00 ET but STRICTLY BEFORE the 9:30 bell,
+      // instead of demanding the exact 9:00 minute. This tick loop is a 60s
+      // `setInterval`: a restart, a redeploy, or an event-loop stall across that
+      // single minute (TRA-1894 / TRA-1905 / TRA-1996 all document exactly that
+      // on bqb1) skipped the sample and dropped the ENTIRE trading day, with no
+      // catch-up and no error — the same failure the chain-record hook already
+      // fixed below, and the same one the morning-brief hook fixed above.
+      //
+      // This is the leading root cause of TRA-1630 accruing 0 news-catalyst rows
+      // across 5 armed sessions: the writer's ONLY caller is this hook. The
+      // differential is the evidence — `onChainRecord`, which runs in the SAME
+      // process over the SAME period but has a wide catch-up window, captured
+      // 23 of ~24 trading days; this exact-minute hook captured 0 of 5.
+      //
+      // The window stops at the bell ON PURPOSE. The callback writes a
+      // regime review labelled `premarket` and builds a *pre*-market watchlist;
+      // letting it fire intraday would stamp a mid-session read with pre-market
+      // semantics. Better to drop a day than to mislabel one.
+      if (hour === 9 && minute < 30) {
         if (cfg.onPremarket && isMarketDay(date) && this.lastPremarketDate !== todayKey) {
           this.lastPremarketDate = todayKey;
           log.info('pre-market trigger fired', { date: todayKey });

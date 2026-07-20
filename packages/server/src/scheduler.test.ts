@@ -424,6 +424,47 @@ describe('MarketScheduler — TRA-368 onPremarket 9 AM ET hook', () => {
     expect(onPremarket).toHaveBeenCalledTimes(1);
   });
 
+  // TRA-2064 — the pre-bell catch-up window. The old gate was `minute === 0`:
+  // one 60s sample per day. A restart or an event-loop stall across that single
+  // minute dropped the whole trading day silently, starving the only caller of
+  // the news-catalyst writer (TRA-1630 accrued 0 rows in 5 armed sessions).
+  it('catches up when the process misses the exact 9:00 minute', () => {
+    // Boot at 9:07 ET — the 9:00 sample never happened.
+    vi.setSystemTime(new Date(Date.UTC(2026, 3, 30, 13, 6, 0)));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+  });
+
+  it('still fires only once per ET day across the catch-up window', () => {
+    vi.setSystemTime(at0900EDT(2026, 4, 30));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+
+    // Walk forward through the rest of the window (9:01 … 9:29).
+    for (let m = 1; m < 30; m += 1) {
+      vi.setSystemTime(new Date(Date.UTC(2026, 3, 30, 13, m, 0)));
+      vi.advanceTimersByTime(60_000);
+    }
+    expect(onPremarket).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT fire at or after the 9:30 bell — pre-market semantics stop there', () => {
+    // 9:30 ET. The callback stamps a regime review labelled `premarket` and
+    // builds a pre-market watchlist; firing intraday would mislabel the day.
+    vi.setSystemTime(new Date(Date.UTC(2026, 3, 30, 13, 29, 0)));
+    const onPremarket = vi.fn();
+    scheduler.start({ onPremarket });
+
+    vi.advanceTimersByTime(60_000);
+    expect(onPremarket).not.toHaveBeenCalled();
+  });
+
   it('fires onPremarket again on the next trading day', () => {
     vi.setSystemTime(at0900EDT(2026, 4, 30));
     const onPremarket = vi.fn();

@@ -287,6 +287,7 @@ import {
 } from './pcr-shadow-ledger.js';
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
+import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
@@ -864,6 +865,10 @@ await initOiShadowLedger();
 // the capture is observe-only (D1 only ADDS names to watch, D2 annotates a report)
 // and never touches sizing or exits.
 await initNewsCatalystLedger();
+// TRA-2064 — rehydrate the durable RUN history so the health probe can answer
+// "did the writer ever run?" immediately after a restart. The restarts are the
+// thing under investigation, so this must not start empty.
+await initNewsCatalystRunLedger();
 
 // TRA-1632 (parent TRA-1630/TRA-1623) — warm the flag-gated SHADOW D2 lean ledger
 // so the read endpoint has history right after boot. The post/pre-market review
@@ -5425,11 +5430,17 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
     // rows so QuantTrader can grade lean-hit-rate (TRA-1630) from one probe. The
     // lean is captured point-in-time (PCR/OI cannot be reconstructed later).
     const leans = await listCatalystLeans();
+    // TRA-2064 — run observability. `count: 0` alone cannot distinguish "no
+    // catalyst names today" from "the writer never executed"; these fields can.
+    // Read `lastRunAt: null` while `flagEnabled` is true as: the premarket hook
+    // never reached the writer on this disk.
+    const runs = await summarizeCatalystRuns();
     res.json({
       issue: 'TRA-1629',
       flagEnabled: isNewsCatalystEnabled(),
       promotionThreshold: 100,
       count: signals.length,
+      ...runs,
       chosenCount: chosen,
       promotionReady: chosen >= 100,
       signals,

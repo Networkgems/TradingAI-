@@ -41,6 +41,7 @@ import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
 import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
 import { isNewsCatalystEnabled } from './news-catalyst-ledger.js';
 import { buildNewsCatalystPicks, fetchCatalystMetrics } from './news-catalyst-source.js';
+import { recordCatalystRun } from './news-catalyst-run-ledger.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { getSettings } from './account-settings.js';
 import {
@@ -270,9 +271,19 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
         hidden,
       });
     } catch (err) {
-      log.warn('news-catalyst source failed', {
-        username: ctx.username,
-        reason: err instanceof Error ? err.message : String(err),
+      const reason = err instanceof Error ? err.message : String(err);
+      log.warn('news-catalyst source failed', { username: ctx.username, reason });
+      // TRA-2064 — the outermost exit. `buildNewsCatalystPicks` never throws,
+      // so reaching here means the failure was in building its deps (e.g. the
+      // hidden-list read) — a case no in-function recorder can see. All counts
+      // are `null`: nothing was measured.
+      await recordCatalystRun({
+        at: Date.now(),
+        outcome: 'source_failed',
+        headlineCount: null,
+        candidateCount: null,
+        chosenCount: null,
+        reason,
       });
     }
   }
