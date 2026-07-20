@@ -12,7 +12,9 @@ import {
   computeIc,
   bucketByQuintile,
   isMonotoneIncreasing,
+  isMeasured,
   runSentimentStudy,
+  HORIZONS,
   type SentimentSymbolDay,
   type Horizon,
   type DatedBar,
@@ -203,10 +205,13 @@ describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () 
     netScore: (sym: number, day: number) => number;
     fwd: (sym: number, day: number) => number | null;
     flow?: (sym: number, day: number) => number | null;
+    taggedCount?: number;
+    freshnessMinutes?: number;
   }): SentimentSymbolDay[] {
     const out: SentimentSymbolDay[] = [];
     for (let d = 0; d < opts.nDays; d++) {
-      const date = `2026-03-${String(d + 1).padStart(2, '0')}`;
+      // Real rolling dates so a 60-day sample doesn't produce `2026-03-61`.
+      const date = new Date(Date.UTC(2026, 2, 1) + d * 86_400_000).toISOString().slice(0, 10);
       for (let s = 0; s < opts.nSymbols; s++) {
         const f = opts.fwd(s, d);
         out.push(
@@ -215,6 +220,8 @@ describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () 
             symbol: `S${s}`,
             netScore: opts.netScore(s, d),
             netOTMflow: opts.flow ? opts.flow(s, d) : null,
+            taggedCount: opts.taggedCount ?? 10,
+            freshnessMinutes: opts.freshnessMinutes ?? 30,
             usable: true,
             fwd: { '1d': f, '5d': f, '20d': f },
           }),
@@ -259,20 +266,135 @@ describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () 
     expect(report.verdictReasons.join(' ')).toMatch(/S1 \(sentiment-alone\).*INCONCLUSIVE/);
   });
 
-  it('still fires the S2-driven FAIL once chain-days are present and S2 IC is dead (no regression)', () => {
-    // Bar met, flow present on every usable day (≥1 chain-day), but netScore below
-    // the confirmation floor ⇒ no confirmed S2 days ⇒ S2 IC measured as zero ⇒ FAIL.
+  it('still fires the S2-driven FAIL once S2 is MEASURED and dead (true negative, no regression)', () => {
+    // Bar met, chain-days present, and — the part that makes this a real true
+    // negative — the S2 subset is non-empty with RESOLVED forward returns, so the
+    // IC is genuinely measured. netScore clears NETSCORE_FLOOR and flow agrees in
+    // sign, so every symbol-day is confirmed. The cross-sectional relation flips
+    // sign every other day ⇒ daily ICs alternate +1/−1 ⇒ meanIC = 0 across 20
+    // measured days: a signal that was looked at and found dead.
+    const days = bulkDays({
+      nDays: 20,
+      nSymbols: 16,
+      netScore: (s) => 0.3 + s * 0.01, // ≥ NETSCORE_FLOOR, varied for rank variance
+      fwd: (s, d) => (d % 2 === 0 ? s : -s) * 0.001,
+      flow: () => 0.3, // same sign as netScore ⇒ confirmed
+    });
+    const report = runSentimentStudy(days);
+    expect(report.sample.nChainDays).toBe(20);
+    expect(report.sample.nConfirmedSymbolDays).toBe(320);
+    // The separator: this FAIL is backed by real coverage, unlike TRA-2076 Case B.
+    for (const h of HORIZONS) {
+      expect(report.s2Ic[h].nDays).toBe(20);
+      expect(report.s2Ic[h].nPairs).toBe(320);
+      expect(report.s2Ic[h].meanIC).not.toBeNull();
+    }
+    expect(report.verdict).toBe('FAIL');
+    expect(report.verdictReasons.join(' ')).toMatch(/kill the direction/);
+  });
+
+  it('grades zero CONFIRMED symbol-days as INCONCLUSIVE, not FAIL', () => {
+    // Chain data captured, but netScore below the confirmation floor ⇒ the S2
+    // subset is empty ⇒ nothing was measured. Pre-TRA-2076 this returned FAIL.
     const days = bulkDays({
       nDays: 20,
       nSymbols: 16,
       netScore: () => 0, // below NETSCORE_FLOOR ⇒ never confirmed
       fwd: () => 0.01,
-      flow: () => 0.3, // chain data IS captured
+      flow: () => 0.3,
     });
     const report = runSentimentStudy(days);
     expect(report.sample.nChainDays).toBe(20);
     expect(report.sample.nConfirmedSymbolDays).toBe(0);
-    expect(report.verdict).toBe('FAIL');
-    expect(report.verdictReasons.join(' ')).toMatch(/kill the direction/);
+    expect(report.verdict).toBe('INCONCLUSIVE');
+    expect(report.verdictReasons.join(' ')).toMatch(/zero coverage/);
+    expect(report.verdictReasons.join(' ')).not.toMatch(/kill the direction/);
+  });
+});
+
+// ── TRA-2076: zero IC coverage is INCONCLUSIVE, never FAIL ───────────────────
+describe('TRA-2076 — IC-coverage precondition (mean([]) === 0 false zero)', () => {
+  /**
+   * Case B verbatim from TRA-2076: 60 dates × 6 symbols, every day-count clears
+   * its §4 bar, chain flow present on every symbol-day, real varied netScore —
+   * and ONLY the daily bars missing (`fwd` all-null). This is what
+   * `TRA822_NO_FETCH=1` or a rate-limited daily feed produces. No existing guard
+   * engages: `nChainDays` is sourced from chain snapshots and `nTradingDays` /
+   * `nUsableSymbolDays` count sentiment symbol-days whose `usable` flag never
+   * considers whether `fwd` resolved.
+   */
+  function caseBDays(): SentimentSymbolDay[] {
+    const out: SentimentSymbolDay[] = [];
+    for (let d = 0; d < 60; d++) {
+      const date = new Date(Date.UTC(2026, 4, 1) + d * 86_400_000).toISOString().slice(0, 10);
+      for (let s = 0; s < 6; s++) {
+        out.push(
+          symbolDay({
+            date,
+            symbol: `S${s}`,
+            netScore: 0.3 + s * 0.05, // real varied netScore, clears NETSCORE_FLOOR
+            taggedCount: 40,
+            freshnessMinutes: 5,
+            netOTMflow: 0.42, // chains load fine
+            usable: true,
+            fwd: { '1d': null, '5d': null, '20d': null }, // ONLY the bars missing
+          }),
+        );
+      }
+    }
+    return out;
+  }
+
+  it('returns INCONCLUSIVE (never FAIL) when every day-count clears its bar but no forward return resolved', () => {
+    const report = runSentimentStudy(caseBDays());
+
+    // Every guard that exists today is satisfied — this is why the bug was live.
+    expect(report.sample.nTradingDays).toBe(60);
+    expect(report.sample.nUsableSymbolDays).toBe(360);
+    expect(report.sample.nChainDays).toBe(60);
+    expect(report.sample.nConfirmedSymbolDays).toBe(360);
+
+    // ...and yet nothing was measured.
+    for (const h of HORIZONS) {
+      expect(report.s2Ic[h].nDays).toBe(0);
+      expect(report.s2Ic[h].nPairs).toBe(0);
+      expect(report.s2Ic[h].meanIC).toBeNull(); // NOT 0 — `0` is never "not measured"
+      expect(report.s2Ic[h].icir).toBeNull();
+      expect(report.confirmedVsAloneDelta[h]).toBeNull();
+    }
+
+    expect(report.verdict).toBe('INCONCLUSIVE');
+    expect(report.verdict).not.toBe('FAIL');
+    expect(report.verdictReasons.join(' ')).toMatch(/zero coverage/);
+    expect(report.verdictReasons.join(' ')).toMatch(/nDays=0, nPairs=0/);
+    // It must not have killed the direction off data that never arrived.
+    expect(report.verdictReasons.join(' ')).not.toMatch(/kill the direction/);
+  });
+
+  it('computeIc reports null (not 0) for an unmeasured horizon', () => {
+    const ic = computeIc([]);
+    for (const h of HORIZONS) {
+      expect(ic[h].meanIC).toBeNull();
+      expect(ic[h].icStd).toBeNull();
+      expect(ic[h].icir).toBeNull();
+      expect(ic[h].nDays).toBe(0);
+      expect(ic[h].nPairs).toBe(0);
+      expect(isMeasured(ic[h])).toBe(false);
+    }
+  });
+
+  it('gradeSignalAlone has the same precondition — a zero-coverage S1 is INCONCLUSIVE', () => {
+    // Same Case-B shape but with NO flow, so the run takes the PENDING_FLOW path
+    // and S1 is graded standalone. S1's `!anySignal` branch had the identical hole.
+    const days = caseBDays().map((d) => ({ ...d, netOTMflow: null }));
+    const report = runSentimentStudy(days);
+    expect(report.sample.nChainDays).toBe(0);
+    expect(report.verdict).toBe('PENDING_FLOW');
+    const joined = report.verdictReasons.join(' ');
+    expect(joined).toMatch(/S1 \(sentiment-alone\).*zero IC coverage/);
+    expect(joined).toMatch(/S1 \(sentiment-alone\).*INCONCLUSIVE/);
+    // The S1 FAIL branch must not have fired. (Matched precisely: the
+    // PENDING_FLOW preamble legitimately contains "measured-dead signal".)
+    expect(joined).not.toMatch(/S1 \(sentiment-alone\) IC indistinguishable from zero/);
   });
 });

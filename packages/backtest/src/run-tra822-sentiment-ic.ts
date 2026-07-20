@@ -90,6 +90,11 @@ async function main(): Promise<void> {
   // the empty smoke stays fully offline).
   const barsBySymbol = new Map<string, DatedBar[]>();
   const allSymbols = [...studyUniverse, ...etfUniverse];
+  // TRA-2076 — bar-fetch failures must reach the report payload. A `console.warn`
+  // that nobody reads is not an instrument: the routine that grades this run
+  // reads the JSON, and a rate-limited daily feed silently produces the same
+  // all-`fwd`-null state as TRA822_NO_FETCH=1.
+  const barFetchFailures: { symbol: string; message: string }[] = [];
   if (sentimentDays.length > 0 && !NO_FETCH) {
     const dates = sentimentDays.map((d) => d.date).sort();
     const fromMs = Date.parse(`${dates[0]}T00:00:00Z`) - 5 * 86_400_000;
@@ -103,7 +108,9 @@ async function main(): Promise<void> {
           .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
         barsBySymbol.set(sym, bars);
       } catch (err) {
-        console.warn(`  bars fetch failed for ${sym}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        barFetchFailures.push({ symbol: sym, message });
+        console.warn(`  bars fetch failed for ${sym}: ${message}`);
       }
     }
   }
@@ -170,6 +177,12 @@ async function main(): Promise<void> {
       studyUniverse,
       etfUniverse,
       noFetch: NO_FETCH,
+      // TRA-2076 bar-coverage instruments. `symbolsWithBars === 0` with a
+      // non-zero `symbolsAttempted` is the total-outage signature that used to
+      // grade as FAIL.
+      symbolsAttempted: allSymbols.length,
+      symbolsWithBars: barsBySymbol.size,
+      barFetchFailures,
     },
     study,
   };
@@ -189,8 +202,12 @@ async function main(): Promise<void> {
 function pct(x: number): string {
   return `${(x * 100).toFixed(2)}%`;
 }
-function num(x: number, dp = 4): string {
-  return Number.isFinite(x) ? x.toFixed(dp) : 'n/a';
+/**
+ * TRA-2076 — `null` means "not measured" and renders `n/a`, never `0.0000`. A
+ * rendered zero for an unmeasured IC is how a bar outage read as a dead signal.
+ */
+function num(x: number | null, dp = 4): string {
+  return x != null && Number.isFinite(x) ? x.toFixed(dp) : 'n/a';
 }
 
 function renderMarkdown(report: {
@@ -200,6 +217,9 @@ function renderMarkdown(report: {
     chainDaysLoaded: number;
     studyUniverse: string[];
     etfUniverse: string[];
+    symbolsAttempted: number;
+    symbolsWithBars: number;
+    barFetchFailures: { symbol: string; message: string }[];
   };
   study: StudyReport;
 }): string {
@@ -220,6 +240,13 @@ function renderMarkdown(report: {
   L.push(`- Symbol-days (total / usable / buzz-only): ${s.sample.nSymbolDays} / ${s.sample.nUsableSymbolDays} / ${s.sample.nBuzzOnlySymbolDays}`);
   L.push(`- Trading days: ${s.sample.nTradingDays}`);
   L.push(`- Chain days joined (S2 flow coverage): ${s.sample.nChainDays}`);
+  L.push(
+    `- Daily-bar coverage: ${report.inputs.symbolsWithBars}/${report.inputs.symbolsAttempted} symbols` +
+      (report.inputs.barFetchFailures.length > 0
+        ? ` · **${report.inputs.barFetchFailures.length} bar-fetch failure(s)**: ` +
+          report.inputs.barFetchFailures.map((f) => `${f.symbol} (${f.message})`).join('; ')
+        : ''),
+  );
   L.push(`- Confirmed (S2) symbol-days: ${s.sample.nConfirmedSymbolDays}`);
   L.push(`- Study universe (single names): ${report.inputs.studyUniverse.join(', ') || '(none recorded yet)'}`);
   L.push('');

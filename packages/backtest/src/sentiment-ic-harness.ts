@@ -295,16 +295,36 @@ export function deMarket(
 
 export interface IcStat {
   horizon: Horizon;
-  /** Mean of the per-day Spearman ICs. */
-  meanIC: number;
-  icStd: number;
-  /** Information ratio = meanIC / icStd. */
-  icir: number;
+  /**
+   * Mean of the per-day Spearman ICs — `null` when NOTHING was measured
+   * (`nDays === 0`).
+   *
+   * TRA-2076: this used to be `mean([]) === 0`, a writer-side false zero. An
+   * unmeasured horizon then compared **identically** to a measured-and-dead one
+   * (`0 >= IC_FLOOR` is false either way), so a total daily-bar outage graded as
+   * `FAIL` — "kill the direction" — off data that never resolved. `0` is never
+   * "not measured"; `null` is. Keeping it nullable makes every comparison a type
+   * error at the call site instead of a silent false negative.
+   */
+  meanIC: number | null;
+  icStd: number | null;
+  /** Information ratio = meanIC / icStd; null when unmeasured. */
+  icir: number | null;
   /** Number of trading days with a usable cross-section. */
   nDays: number;
   /** Pooled Spearman across all (signal, return) pairs. */
   pooledIC: number | null;
   nPairs: number;
+}
+
+/** True when this horizon's IC was actually measured (not a zero-coverage stat). */
+export function isMeasured(s: IcStat): boolean {
+  return s.nDays > 0 && s.nPairs > 0;
+}
+
+/** Null-safe `|ic| >= floor`. An unmeasured IC never clears a floor. */
+function icAtLeast(v: number | null, floor: number): boolean {
+  return v != null && Math.abs(v) >= floor;
 }
 
 /**
@@ -343,13 +363,16 @@ export function computeIc(days: readonly SentimentSymbolDay[]): Record<Horizon, 
         if (ic != null) dailyICs.push(ic);
       }
     }
-    const m = mean(dailyICs);
-    const s = std(dailyICs);
+    // TRA-2076 — no measured days ⇒ the stat is UNMEASURED, not zero. Emitting
+    // `0` here is what let a bar outage read as a measured-dead signal.
+    const measured = dailyICs.length > 0;
+    const m = measured ? mean(dailyICs) : null;
+    const s = measured ? std(dailyICs) : null;
     result[h] = {
       horizon: h,
       meanIC: m,
       icStd: s,
-      icir: s > 0 ? m / s : 0,
+      icir: m != null && s != null && s > 0 ? m / s : measured ? 0 : null,
       nDays: dailyICs.length,
       pooledIC: spearman(pooledSig, pooledRet),
       nPairs: pooledSig.length,
@@ -437,8 +460,11 @@ export interface StudyReport {
   s1Ic: Record<Horizon, IcStat>;
   /** S2 — confirmed subset. */
   s2Ic: Record<Horizon, IcStat>;
-  /** IC(S2 confirmed) − IC(S1 all) per horizon (§3.3 headline). */
-  confirmedVsAloneDelta: Record<Horizon, number>;
+  /**
+   * IC(S2 confirmed) − IC(S1 all) per horizon (§3.3 headline). Null when either
+   * side is unmeasured — a delta against an unmeasured leg is not a number.
+   */
+  confirmedVsAloneDelta: Record<Horizon, number | null>;
   s1BucketsByQuintile: Record<Horizon, BucketStat[]>;
   s2BucketsByQuintile: Record<Horizon, BucketStat[]>;
   s2BucketsByTilt: Record<Horizon, BucketStat[]>;
@@ -467,8 +493,12 @@ export function runSentimentStudy(days: readonly SentimentSymbolDay[]): StudyRep
   const s1Ic = computeIc(usable);
   const s2Ic = computeIc(confirmed);
 
-  const confirmedVsAloneDelta = {} as Record<Horizon, number>;
-  for (const h of HORIZONS) confirmedVsAloneDelta[h] = s2Ic[h].meanIC - s1Ic[h].meanIC;
+  const confirmedVsAloneDelta = {} as Record<Horizon, number | null>;
+  for (const h of HORIZONS) {
+    const a = s2Ic[h].meanIC;
+    const b = s1Ic[h].meanIC;
+    confirmedVsAloneDelta[h] = a != null && b != null ? a - b : null;
+  }
 
   const s1BucketsByQuintile = {} as Record<Horizon, BucketStat[]>;
   const s2BucketsByQuintile = {} as Record<Horizon, BucketStat[]>;
@@ -531,8 +561,10 @@ function gradeSignalAlone(
         `${sample.nUsableSymbolDays}/${MIN_USABLE_SYMBOL_DAYS} usable symbol-days) — ${label} INCONCLUSIVE, keep collecting.`,
     };
   }
-  const passing = HORIZONS.filter((h) => Math.abs(ic[h].meanIC) >= IC_FLOOR && ic[h].icir >= ICIR_FLOOR);
-  const signs = new Set(passing.map((h) => Math.sign(ic[h].meanIC)));
+  const passing = HORIZONS.filter(
+    (h) => icAtLeast(ic[h].meanIC, IC_FLOOR) && (ic[h].icir ?? Number.NEGATIVE_INFINITY) >= ICIR_FLOOR,
+  );
+  const signs = new Set(passing.map((h) => Math.sign(ic[h].meanIC as number)));
   const consistentSign = passing.length >= 2 && signs.size === 1;
   const monotone =
     isMonotoneIncreasing(bucketsByQuintile['5d']) || isMonotoneIncreasing(bucketsByQuintile['20d']);
@@ -545,7 +577,20 @@ function gradeSignalAlone(
         `(|IC|≥${IC_FLOOR}, ICIR≥${ICIR_FLOOR}, consistent sign, monotone buckets) — ${label} PASS.`,
     };
   }
-  const anySignal = HORIZONS.some((h) => Math.abs(ic[h].meanIC) >= IC_FLOOR);
+  // TRA-2076 — coverage precondition. `!anySignal` is satisfied both by a
+  // measured-dead signal AND by one that was never measured at all; only the
+  // former may FAIL.
+  if (!HORIZONS.some((h) => isMeasured(ic[h]))) {
+    return {
+      verdict: 'INCONCLUSIVE',
+      reason:
+        `${label} has zero IC coverage (nDays=0, nPairs=0 on every horizon) despite ` +
+        `${sample.nTradingDays} trading day(s) and ${sample.nUsableSymbolDays} usable symbol-day(s) — ` +
+        `forward returns did not resolve (bars missing / TRA822_NO_FETCH / feed outage). ` +
+        `${label} INCONCLUSIVE, never FAIL.`,
+    };
+  }
+  const anySignal = HORIZONS.some((h) => icAtLeast(ic[h].meanIC, IC_FLOOR));
   if (!anySignal) {
     return {
       verdict: 'FAIL',
@@ -574,7 +619,7 @@ export function gradeGate(args: {
   sample: { nTradingDays: number; nUsableSymbolDays: number; nChainDays: number };
   s1Ic: Record<Horizon, IcStat>;
   s2Ic: Record<Horizon, IcStat>;
-  confirmedVsAloneDelta: Record<Horizon, number>;
+  confirmedVsAloneDelta: Record<Horizon, number | null>;
   s1BucketsByQuintile: Record<Horizon, BucketStat[]>;
   s2BucketsByQuintile: Record<Horizon, BucketStat[]>;
 }): { verdict: Verdict; verdictReasons: string[] } {
@@ -607,16 +652,34 @@ export function gradeGate(args: {
     return { verdict: 'INCONCLUSIVE', verdictReasons: reasons };
   }
 
+  // ── TRA-2076 IC-coverage precondition ──────────────────────────────────────
+  // The guards above key off day-counts that SURVIVE a total daily-bar outage:
+  // `nChainDays` comes from chain snapshots, and `nTradingDays` /
+  // `nUsableSymbolDays` count sentiment symbol-days whose `usable` flag never
+  // considers whether `fwd` resolved. So sentiment + chains can load fine, every
+  // count clears its bar, and the S2 IC is still built from ZERO pairs. Before
+  // any FAIL, require the graded set to have actually been measured.
+  if (!HORIZONS.some((h) => isMeasured(s2Ic[h]))) {
+    reasons.push(
+      `S2 IC has zero coverage (nDays=0, nPairs=0 on every horizon) despite ` +
+        `${sample.nChainDays} chain-day(s) and ${sample.nTradingDays} trading day(s) — forward returns did ` +
+        `not resolve (bars missing / TRA822_NO_FETCH / feed outage). INCONCLUSIVE, never FAIL.`,
+    );
+    return { verdict: 'INCONCLUSIVE', verdictReasons: reasons };
+  }
+
   // S2 confirmed: |meanIC| ≥ 0.03 AND ICIR ≥ 0.3 on ≥ 2 horizons, consistent sign.
   const passingHorizons = HORIZONS.filter(
-    (h) => Math.abs(s2Ic[h].meanIC) >= IC_FLOOR && s2Ic[h].icir >= ICIR_FLOOR,
+    (h) => icAtLeast(s2Ic[h].meanIC, IC_FLOOR) && (s2Ic[h].icir ?? Number.NEGATIVE_INFINITY) >= ICIR_FLOOR,
   );
-  const signs = new Set(passingHorizons.map((h) => Math.sign(s2Ic[h].meanIC)));
+  const signs = new Set(passingHorizons.map((h) => Math.sign(s2Ic[h].meanIC as number)));
   const consistentSign = passingHorizons.length >= 2 && signs.size === 1;
 
-  // S2 beats S1 on the passing horizon(s).
-  const beatsS1 = passingHorizons.every((h) => confirmedVsAloneDelta[h] >= S2_BEATS_S1_FLOOR)
-    && passingHorizons.length >= 2;
+  // S2 beats S1 on the passing horizon(s). An unmeasured delta never counts.
+  const beatsS1 = passingHorizons.every((h) => {
+    const d = confirmedVsAloneDelta[h];
+    return d != null && d >= S2_BEATS_S1_FLOOR;
+  }) && passingHorizons.length >= 2;
 
   // Monotone bucketed returns on the 5d or 20d horizon.
   const monotone =
@@ -634,9 +697,11 @@ export function gradeGate(args: {
 
   // Distinguish a clean FAIL (signal is dead / no flow edge) from INCONCLUSIVE.
   // Reachable only with ≥1 captured chain-day (the TRA-1182 guard returns
-  // PENDING_FLOW above when flow data is absent), so this is a *measured* dead
-  // signal, not a false negative off missing data.
-  const anyS2Signal = HORIZONS.some((h) => Math.abs(s2Ic[h].meanIC) >= IC_FLOOR);
+  // PENDING_FLOW above when flow data is absent) AND ≥1 measured horizon (the
+  // TRA-2076 coverage guard returns INCONCLUSIVE above when forward returns
+  // never resolved), so this is a *measured* dead signal, not a false negative
+  // off missing data.
+  const anyS2Signal = HORIZONS.some((h) => icAtLeast(s2Ic[h].meanIC, IC_FLOOR));
   if (!anyS2Signal) {
     reasons.push(
       `S2 confirmed IC indistinguishable from zero on every horizon over ` +
