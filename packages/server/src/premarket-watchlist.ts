@@ -40,7 +40,11 @@ import { scanStocksMarket, type ScanResult } from './market-scanner.js';
 import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
 import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
 import { isNewsCatalystEnabled } from './news-catalyst-ledger.js';
-import { buildNewsCatalystPicks, fetchCatalystMetrics } from './news-catalyst-source.js';
+import {
+  buildNewsCatalystPicks,
+  catalystUniverse,
+  fetchCatalystMetrics,
+} from './news-catalyst-source.js';
 import { recordCatalystRun } from './news-catalyst-run-ledger.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import { getSettings } from './account-settings.js';
@@ -264,7 +268,12 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
         getStocksWatchlistData(ctx.username).hidden.map(s => s.toUpperCase()),
       );
       newsCatalyst = await buildNewsCatalystPicks({
-        fetchNews: () => fetchMarketNews(),
+        // TRA-2064 — sweep the catalyst universe by ENTITY. Yahoo's search
+        // returns news only for a resolvable ticker/company; the free-text topic
+        // queries this used to rely on came back empty every session. The
+        // universe is passed in (not imported inside yahoo-feed) to keep the feed
+        // module provider-generic and out of a cycle with the source module.
+        fetchNews: () => fetchMarketNews(catalystUniverse()),
         fetchMetrics: fetchCatalystMetrics,
         earningsInDays: earningsInDaysSync,
         now: Date.now(),
@@ -283,6 +292,8 @@ export async function generateSmartWatchlist(ctx: UserContext): Promise<string[]
         headlineCount: null,
         candidateCount: null,
         chosenCount: null,
+        queriesAttempted: null,
+        queriesSucceeded: null,
         reason,
       });
     }

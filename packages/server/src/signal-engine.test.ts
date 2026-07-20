@@ -41,7 +41,11 @@ vi.mock('./yahoo-feed.js', () => ({
   fetchQuote: vi.fn(async () => null),
   fetchQuotes: vi.fn(async () => []),
   fetchStocksNews: vi.fn(async () => []),
-  fetchMarketNews: vi.fn(async () => []),
+  fetchMarketNews: vi.fn(async () => ({
+    items: [],
+    queriesAttempted: 0,
+    queriesSucceeded: 0,
+  })),
   fetchShortInterestFundamentals: vi.fn(async () => null),
   // Pure/stateful helpers other modules in the graph import. Faithful enough to
   // stand in; nothing in this file exercises them.

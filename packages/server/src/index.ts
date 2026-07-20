@@ -288,6 +288,7 @@ import {
 import { initOiShadowLedger, listOiShadowSignals, isOiShadowEnabled, usableSignalCount as usableOiSignalCount } from './oi-shadow-ledger.js';
 import { initNewsCatalystLedger, listNewsCatalystSignals, isNewsCatalystEnabled, chosenSignalCount } from './news-catalyst-ledger.js';
 import { initNewsCatalystRunLedger, summarizeCatalystRuns } from './news-catalyst-run-ledger.js';
+import { catalystUniverse } from './news-catalyst-source.js';
 import { initNewsCatalystLeanLedger, listCatalystLeans, leanBreakdown } from './news-catalyst-lean-ledger.js';
 import { initPcsShadowLedger, listPcsShadowSignals, isPcsShadowEnabled, settledSignalCount, PCS_SHADOW_STRATEGY_ID } from './pcs-shadow-ledger.js';
 import {
@@ -5441,6 +5442,10 @@ app.get('/api/health/news-catalyst-signals', async (_req, res) => {
       promotionThreshold: 100,
       count: signals.length,
       ...runs,
+      // TRA-2064 — the denominator for `lastRunQueriesAttempted`. Attempted <
+      // this ⇒ the sweep hit its wall-clock bound; succeeded < attempted ⇒ the
+      // feed is degraded. Without it, `queriesAttempted` has no scale.
+      catalystUniverseSize: catalystUniverse().length,
       chosenCount: chosen,
       promotionReady: chosen >= 100,
       signals,

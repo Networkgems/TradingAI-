@@ -1606,31 +1606,50 @@ export async function fetchStocksNews(symbols: readonly string[]): Promise<NewsI
   return items.slice(0, RESULT_CAP);
 }
 
-// TRA-1629 (TRA-1623A) — market-wide / topic news pull for catalyst discovery.
+/** Outcome of a {@link fetchMarketNews} sweep — headlines PLUS feed health. */
+export interface MarketNewsResult {
+  items: NewsItem[];
+  /** Queries actually issued (≤ symbols.length; a wall-clock cut lowers this). */
+  queriesAttempted: number;
+  /** Queries that returned a response. `0` with `attempted > 0` ⇒ feed outage. */
+  queriesSucceeded: number;
+}
+
+// TRA-1629 (TRA-1623A) — news pull for catalyst discovery.
+// TRA-2064 — REWRITTEN: this used four broad free-text topic queries
+// ('stock market movers today', …). Yahoo's search endpoint resolves an *entity*
+// (ticker / company name) and returns that entity's news; a topic phrase resolves
+// to nothing and comes back `news: []` — **with no error and no throw**. Measured
+// 2026-07-20: all four topic queries → 0 headlines, while 'AAPL'/'NVDA'/'Apple Inc'
+// → 10 each. So this function returned an empty list *every session by
+// construction*, which is the whole of TRA-1630's "0 rows in 6 armed sessions".
 //
-// `fetchStocksNews` above is *per-symbol-scoped*: it only pulls news for symbols
-// already on the watchlist, so it can annotate but never DISCOVER a catalyst
-// name. This sibling runs a set of non-symbol-scoped market/topic queries so the
-// news-catalyst source (news-catalyst-source.ts) has a broad headline stream to
-// map onto tickers. Keyless Yahoo search, $0 incremental cost — same provider as
-// `fetchStocksNews`. Returns items with a `summary` when Yahoo supplies one so
-// the lexicon scorer has both title + body to work with.
-export async function fetchMarketNews(extraQueries: readonly string[] = []): Promise<NewsItem[]> {
-  // Broad, catalyst-oriented topic queries. These surface market-moving headlines
-  // (earnings, upgrades/downgrades, M&A, guidance) that name a company without
-  // us having to know the ticker in advance.
-  const DEFAULT_QUERIES = [
-    'stock market movers today',
-    'earnings beat miss guidance',
-    'analyst upgrade downgrade price target',
-    'stocks surge plunge today',
-  ];
-  const queries = [...DEFAULT_QUERIES, ...extraQueries];
+// `fetchStocksNews` above carries the same lesson in its TRA-196 header — a broad
+// query 'stocks market NYSE trading' returning no news, fixed by per-symbol
+// fan-out. TRA-1629 reintroduced the bug this codebase had already retired once.
+//
+// Discovery is NOT lost by going entity-scoped: `mapNewsToCandidates` only ever
+// emits `universe ∩ mentioned`, so sweeping the universe directly yields exactly
+// the reachable set — strictly more recall than the topic stream's zero. The
+// discovery claim is relative to the *daily* price/volume watchlist, not to the
+// universe. Keyless Yahoo search, $0 incremental cost.
+export async function fetchMarketNews(symbols: readonly string[] = []): Promise<MarketNewsResult> {
   const PER_QUERY_NEWS = 12;
   const RESULT_CAP = 60;
+  const NEWS_BATCH = 3;
+  const BATCH_PAUSE_MS = 200;
+  // TRA-1940 — bound the fan-out by WALL TIME, not by item count. This runs in
+  // the pre-market hook ahead of the bell; a slow feed must not push the whole
+  // watchlist build past 9:30. A cut here lowers `queriesAttempted`, so the
+  // attempted/succeeded ratio stays an honest read of the queries we did issue.
+  const DEADLINE_MS = 45_000;
+  const startedAt = Date.now();
 
+  const queries = [...symbols];
   const items: NewsItem[] = [];
   const seen = new Set<string>();
+  let queriesAttempted = 0;
+  let queriesSucceeded = 0;
   const collect = (
     newsArr: ReadonlyArray<{
       title?: string;
@@ -1653,17 +1672,33 @@ export async function fetchMarketNews(extraQueries: readonly string[] = []): Pro
     }
   };
 
-  for (const q of queries) {
-    const r = await withRetry(
-      () => yf.search(q, { newsCount: PER_QUERY_NEWS, quotesCount: 0 }),
-      `search(market news "${q}")`,
+  for (let i = 0; i < queries.length; i += NEWS_BATCH) {
+    // A cut shows up downstream as `queriesAttempted < universe size` on the
+    // health probe — no log line, which nothing downstream could read anyway.
+    if (Date.now() - startedAt > DEADLINE_MS) break;
+    const slice = queries.slice(i, i + NEWS_BATCH);
+    queriesAttempted += slice.length;
+    const settled = await Promise.all(
+      slice.map((q) =>
+        withRetry(
+          () => yf.search(q, { newsCount: PER_QUERY_NEWS, quotesCount: 0 }),
+          `search(market news "${q}")`,
+        ),
+      ),
     );
-    if (r) collect(r.news ?? []);
-    await sleep(150);
+    for (const r of settled) {
+      // `withRetry` yields `null` on exhaustion. Counting only non-null keeps a
+      // feed outage separable from a genuinely quiet news day — the two used to
+      // land on the identical empty array.
+      if (!r) continue;
+      queriesSucceeded += 1;
+      collect(r.news ?? []);
+    }
+    if (i + NEWS_BATCH < queries.length) await sleep(BATCH_PAUSE_MS);
   }
 
   items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
-  return items.slice(0, RESULT_CAP);
+  return { items: items.slice(0, RESULT_CAP), queriesAttempted, queriesSucceeded };
 }
 
 /** Test Yahoo Finance connectivity — returns a quote or throws. */

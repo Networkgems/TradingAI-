@@ -42,6 +42,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export type CatalystRunOutcome =
   | 'picks_built' // writer completed; scored `candidateCount`, chose `chosenCount`
   | 'no_mapped_candidates' // feed returned headlines, none mapped onto the universe
+  | 'fetch_degraded' // TRA-2064 — feed returned, but EVERY query failed
   | 'fetch_failed' // `fetchNews()` threw — feed/breaker problem
   | 'source_failed'; // the call site threw around the whole build
 
@@ -65,6 +66,18 @@ export interface CatalystRunRecord {
   candidateCount: number | null;
   /** Candidates injected into the watchlist. `null` when never reached. */
   chosenCount: number | null;
+  /**
+   * TRA-2064 — feed queries issued / answered on this run. `null` when the feed
+   * never reported (it threw, or the run predates this field).
+   *
+   * These are what make `headlineCount: 0` READABLE. A measured zero with
+   * `queriesSucceeded === queriesAttempted > 0` is a genuinely quiet news day;
+   * the same zero with `queriesSucceeded === 0` is an outage. Before this pair
+   * existed both wrote `no_mapped_candidates / headlineCount: 0` and the actual
+   * defect — every query resolving to nothing — was unfalsifiable for 6 sessions.
+   */
+  queriesAttempted: number | null;
+  queriesSucceeded: number | null;
   /** Error message on the failure outcomes. */
   reason?: string;
 }
@@ -180,6 +193,9 @@ export interface CatalystRunSummary {
   lastRunHeadlineCount: number | null;
   lastRunCandidateCount: number | null;
   lastRunChosenCount: number | null;
+  /** TRA-2064 — feed health on the last run; see {@link CatalystRunRecord}. */
+  lastRunQueriesAttempted: number | null;
+  lastRunQueriesSucceeded: number | null;
   lastRunReason: string | null;
   /** Cumulative invocations across ALL boots (durable — survives a restart). */
   runCount: number;
@@ -209,6 +225,10 @@ export async function summarizeCatalystRuns(tail = 20): Promise<CatalystRunSumma
     lastRunHeadlineCount: last ? last.headlineCount : null,
     lastRunCandidateCount: last ? last.candidateCount : null,
     lastRunChosenCount: last ? last.chosenCount : null,
+    // `?? null` (not `last ? … : null`) — runs written before TRA-2064 have no
+    // such key, and an absent measurement is `null`, never `0`.
+    lastRunQueriesAttempted: last?.queriesAttempted ?? null,
+    lastRunQueriesSucceeded: last?.queriesSucceeded ?? null,
     lastRunReason: last?.reason ?? null,
     runCount: rows.length,
     runCountSinceBoot: runsSinceBoot,

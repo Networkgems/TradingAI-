@@ -39,6 +39,8 @@ describe('news-catalyst run ledger — never-ran vs ran-empty', () => {
       headlineCount: 30,
       candidateCount: 0,
       chosenCount: 0,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
     });
     const s = await summarizeCatalystRuns();
     // The distinguishing observation: a run EXISTS, and it measured 30
@@ -59,6 +61,8 @@ describe('news-catalyst run ledger — false-zero discipline', () => {
       headlineCount: null,
       candidateCount: null,
       chosenCount: null,
+      queriesAttempted: null,
+      queriesSucceeded: null,
       reason: 'ETIMEDOUT',
     });
     const s = await summarizeCatalystRuns();
@@ -79,6 +83,8 @@ describe('news-catalyst run ledger — durability across a restart', () => {
       headlineCount: 30,
       candidateCount: 7,
       chosenCount: 3,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
     });
 
     // Simulate a process restart: drop the in-memory cache, keep the file. The
@@ -100,6 +106,8 @@ describe('news-catalyst run ledger — durability across a restart', () => {
       headlineCount: 30,
       candidateCount: 5,
       chosenCount: 2,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
     });
     await recordCatalystRun({
       at: Date.UTC(2026, 6, 17, 13, 5),
@@ -107,6 +115,8 @@ describe('news-catalyst run ledger — durability across a restart', () => {
       headlineCount: 31,
       candidateCount: 6,
       chosenCount: 2,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
     });
     const s = await summarizeCatalystRuns();
     expect(s.runCount).toBe(2);
@@ -124,6 +134,8 @@ describe('news-catalyst run ledger — durability across a restart', () => {
         headlineCount: 1,
         candidateCount: 1,
         chosenCount: 1,
+        queriesAttempted: 25,
+        queriesSucceeded: 25,
       }),
     ).resolves.toBeUndefined();
   });
@@ -137,6 +149,8 @@ describe('news-catalyst run ledger — durability across a restart', () => {
       headlineCount: 30,
       candidateCount: 5,
       chosenCount: 2,
+      queriesAttempted: 25,
+      queriesSucceeded: 25,
     });
     const { appendFileSync } = await import('fs');
     appendFileSync(path, '{not json\n', 'utf-8');

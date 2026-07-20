@@ -25,7 +25,7 @@ import {
   EQUITY_NAME_ALIASES,
   CATALYST_FRESHNESS_MAX_MINUTES,
 } from '@trading-app/shared';
-import { fetchDailyCandles } from './yahoo-feed.js';
+import { fetchDailyCandles, type MarketNewsResult } from './yahoo-feed.js';
 import {
   recordCatalystObservation,
   type CatalystDropReason,
@@ -199,8 +199,13 @@ export interface CatalystMetrics {
 }
 
 export interface CatalystSourceDeps {
-  /** Market-wide news stream (defaults to `fetchMarketNews`). */
-  fetchNews: () => Promise<NewsItem[]>;
+  /**
+   * News stream for the run (defaults to `fetchMarketNews` over the catalyst
+   * universe). Returns feed HEALTH alongside the headlines so an empty
+   * `items` can be told apart from a feed that answered nothing — see
+   * {@link MarketNewsResult}.
+   */
+  fetchNews: () => Promise<MarketNewsResult>;
   /** Per-name metrics (defaults to {@link fetchCatalystMetrics}). */
   fetchMetrics: (symbol: string) => Promise<CatalystMetrics>;
   /** Sessions-until-earnings lookup (defaults to `earningsInDaysSync`). */
@@ -274,9 +279,9 @@ function toLedgerRow(s: ScoredCandidate, asof: number): CatalystObservationInput
  * failure logs and yields an empty pick list so the watchlist build continues.
  */
 export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<string[]> {
-  let news: NewsItem[] = [];
+  let feed: MarketNewsResult;
   try {
-    news = await deps.fetchNews();
+    feed = await deps.fetchNews();
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log.warn('market news fetch failed', { reason });
@@ -289,7 +294,33 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       headlineCount: null,
       candidateCount: null,
       chosenCount: null,
+      queriesAttempted: null,
+      queriesSucceeded: null,
       reason,
+    });
+    return [];
+  }
+
+  const news = feed.items;
+
+  // TRA-2064 — the branch that hid the original defect. `fetchMarketNews` never
+  // throws: on total failure it resolves to an empty list, which used to fall
+  // through and record `no_mapped_candidates / headlineCount: 0` — the same row
+  // a quiet news day writes. Separate it BEFORE the mapping step so an outage
+  // can never again be filed as "no catalysts today".
+  if (feed.queriesAttempted > 0 && feed.queriesSucceeded === 0) {
+    log.warn('news-catalyst: every market-news query failed', {
+      queriesAttempted: feed.queriesAttempted,
+    });
+    await recordCatalystRun({
+      at: deps.now,
+      outcome: 'fetch_degraded',
+      headlineCount: null, // nothing was measured — the queries did not answer
+      candidateCount: null,
+      chosenCount: null,
+      queriesAttempted: feed.queriesAttempted,
+      queriesSucceeded: 0,
+      reason: 'all market-news queries failed',
     });
     return [];
   }
@@ -303,6 +334,8 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
       headlineCount: news.length,
       candidateCount: 0,
       chosenCount: 0,
+      queriesAttempted: feed.queriesAttempted,
+      queriesSucceeded: feed.queriesSucceeded,
     });
     return [];
   }
@@ -348,6 +381,8 @@ export async function buildNewsCatalystPicks(deps: CatalystSourceDeps): Promise<
     headlineCount: news.length,
     candidateCount: scored.length,
     chosenCount: picks.length,
+    queriesAttempted: feed.queriesAttempted,
+    queriesSucceeded: feed.queriesSucceeded,
   });
   log.info('news-catalyst picks built', {
     headlines: news.length,
