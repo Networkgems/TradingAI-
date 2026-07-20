@@ -274,6 +274,11 @@ describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () 
     // sign every other day ⇒ daily ICs alternate +1/−1 ⇒ meanIC = 0 across 20
     // measured days: a signal that was looked at and found dead.
     const days = bulkDays({
+      // MUST stay EVEN: the alternating ±IC construction lands meanIC at exactly 0
+      // only because nDays is even (10×+1, 10×−1). At odd nDays the residual 1/nDays
+      // clears IC_FLOOR (0.03) and the verdict flips FAIL→INCONCLUSIVE, silently
+      // dismantling this regression guard (measured: 21→0.0476, 19→0.0526). If you
+      // raise the day count for coverage, keep it even.
       nDays: 20,
       nSymbols: 16,
       netScore: (s) => 0.3 + s * 0.01, // ≥ NETSCORE_FLOOR, varied for rank variance
@@ -288,6 +293,7 @@ describe('TRA-1182 — flow-coverage guard (PENDING_FLOW vs spurious FAIL)', () 
       expect(report.s2Ic[h].nDays).toBe(20);
       expect(report.s2Ic[h].nPairs).toBe(320);
       expect(report.s2Ic[h].meanIC).not.toBeNull();
+      expect(report.s2Ic[h].meanIC).toBeCloseTo(0, 10); // the pair's whole point: SAME value as Case B's null-vs-0
     }
     expect(report.verdict).toBe('FAIL');
     expect(report.verdictReasons.join(' ')).toMatch(/kill the direction/);
