@@ -1481,6 +1481,118 @@ describe('buildOptionJournalReport', () => {
       expect(cohort.weights.generatedFrom.rows).toBe(2);
     });
   });
+
+  // TRA-2082 — `sinceTs` scoped `summary` but NOT the `?rows=demo` dump, so one 200
+  // carried two populations with nothing on the wire marking the difference. That is
+  // the false-PASS shape: a TRA-1585 delta-floor grade counting `rows` under a
+  // `sinceTs` reads n=1035/+0.0173R (PASS, auto-unblocks TRA-1407) where the truthful
+  // cohort is n=10.
+  //
+  // Per TRA-2076 the assertion is on the COVERAGE COUNTS, not the verdict: a fixture
+  // with zero rows outside the boundary passes a naive version of this test in BOTH
+  // the fixed and broken states, so the fixture below is asserted to straddle it.
+  describe('sinceTs applies to the rows dump, not just the summary (TRA-2082)', () => {
+    const armTs = NOW - 3_600_000;
+    const otm = (id: string, openTs: number, r: number): OptionTradeJournalRecord => ({
+      ...closedRow,
+      id,
+      openTs,
+      structure: 'single_leg_otm',
+      outcome: r > 0 ? 'WIN' : 'LOSS',
+      realizedR: r,
+      realizedPnlUsd: r * 320,
+    });
+    // 3 pre-arm, 2 post-arm. The pre-arm side is deliberately the LARGER and the
+    // opposite-signed one, so the broken (unfiltered-rows) build reads a different
+    // count AND a different avgR — the two states cannot look alike.
+    const rows = [
+      otm('pre1', armTs - 86_400_000, -1),
+      otm('pre2', armTs - 72_000_000, -1),
+      otm('pre3', armTs - 60_000_000, -1),
+      otm('post1', armTs + 60_000, 1),
+      otm('post2', armTs + 120_000, 1),
+    ];
+    // An OPEN row and a live-mode row: the dump's own filters must survive the change.
+    const excluded = [
+      { ...otm('open', armTs + 90_000, 0), outcome: 'OPEN' as const },
+      { ...otm('live', armTs + 95_000, 1), mode: 'live' as const },
+    ];
+
+    it('fixture straddles the boundary (guards the test itself)', () => {
+      expect(rows.filter((r) => r.openTs < armTs)).toHaveLength(3);
+      expect(rows.filter((r) => r.openTs >= armTs)).toHaveLength(2);
+    });
+
+    it('rows and summary.closed describe the SAME population under sinceTs', () => {
+      const report = buildOptionJournalReport(rows, NOW, true, undefined, armTs, true);
+      const otmSummary = report.summary.byStructure.find(
+        (s) => s.structure === 'single_leg_otm',
+      );
+
+      // The load-bearing assertion: the two halves agree on n.
+      expect(report.rows).toHaveLength(2);
+      expect(otmSummary?.closed).toBe(2);
+      expect(report.rows).toHaveLength(otmSummary!.closed);
+
+      // ...and on the number a gate would actually read. Broken build: n=5, avgR −0.2.
+      expect(otmSummary?.avgR).toBe(1);
+      expect(report.rows!.map((r) => r.id).sort()).toEqual(['post1', 'post2']);
+
+      // The applied filter is on the wire, so a consumer asserts instead of assuming.
+      expect(report.appliedSinceTs).toBe(armTs);
+      expect(report.filterAxis).toBe('openTs');
+      expect(report.rowsFiltered).toBe(true);
+      expect(report.rowsMode).toBe('demo');
+    });
+
+    it('without sinceTs the dump is the cumulative pool and says so', () => {
+      const report = buildOptionJournalReport(rows, NOW, true, undefined, undefined, true);
+      const otmSummary = report.summary.byStructure.find(
+        (s) => s.structure === 'single_leg_otm',
+      );
+      expect(report.rows).toHaveLength(5);
+      expect(report.rows).toHaveLength(otmSummary!.closed);
+      // `null`, not `0` — `0` is a real epoch and would read as a filter that applied.
+      expect(report.appliedSinceTs).toBeNull();
+      expect(report.rowsFiltered).toBe(false);
+    });
+
+    // The SECOND population axis, found while writing the test above. `rows` is
+    // demo-and-resolved; `summary` folds BOTH modes. So the two halves agree on the
+    // sinceTs cohort but NOT on mode, and `rows.length === summary.closed` is a
+    // coincidence of an all-demo book, not a contract. `rowsMode` says so on the wire
+    // rather than leaving the next consumer to rediscover it the hard way.
+    it('rows stays demo-and-resolved while summary spans both modes — stated, not hidden', () => {
+      const report = buildOptionJournalReport(
+        [...rows, ...excluded],
+        NOW,
+        true,
+        undefined,
+        armTs,
+        true,
+      );
+      const otmSummary = report.summary.byStructure.find(
+        (s) => s.structure === 'single_leg_otm',
+      );
+
+      // Both post-arm exclusions are inside the sinceTs cohort, so this gap is the
+      // MODE/OPEN axis alone — not a filter leak.
+      expect(report.rows!.map((r) => r.id).sort()).toEqual(['post1', 'post2']);
+      expect(report.rows!.every((r) => r.mode === 'demo' && r.outcome !== 'OPEN')).toBe(true);
+      // summary counts the live close too: 2 demo + 1 live = 3, vs 2 rows.
+      expect(otmSummary?.closed).toBe(3);
+      expect(report.rows).toHaveLength(2);
+      expect(report.rowsMode).toBe('demo');
+    });
+
+    it('omits rows entirely when the dump was not requested', () => {
+      const report = buildOptionJournalReport(rows, NOW, true, undefined, armTs);
+      expect(report.rows).toBeUndefined();
+      // `rowsFiltered` is absent WITH `rows` — the pair can never be read apart.
+      expect(report.rowsFiltered).toBeUndefined();
+      expect(report.appliedSinceTs).toBe(armTs);
+    });
+  });
 });
 
 // TRA-1656 (TRA-1602B) — the MEASURED option spread cross probe. Drives the real

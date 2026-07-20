@@ -112,6 +112,7 @@ import {
   getOptionTradeJournalIntegrity,
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
+  type OptionTradeJournalRecord,
 } from '../option-trade-journal.js';
 import {
   computeOptionLearnedWeights,
@@ -867,6 +868,33 @@ export interface OptionJournalReport {
    */
   sinceTs?: number;
   /**
+   * TRA-2082 — the cohort filter ACTUALLY applied, always present so a consumer
+   * asserts what it got instead of assuming its query param took effect.
+   * `null` = no filter (cumulative pool); never `0`, which is a real epoch.
+   * `filterAxis` names the timestamp the filter compares against — it is `openTs`
+   * (ENTRY), not `closeTs`, and the two give different counts on the same book.
+   */
+  appliedSinceTs: number | null;
+  filterAxis: 'openTs';
+  /**
+   * TRA-2082 — the `?rows=demo` dump. Present only when rows were requested, and
+   * ALWAYS paired with `rowsFiltered` so the two can never be read apart: before
+   * this fix `sinceTs` scoped `summary` but not `rows`, so one 200 carried two
+   * populations with nothing on the wire marking the difference. Both halves now
+   * derive from the same filtered set; `rowsFiltered` states it on the wire.
+   */
+  rows?: OptionTradeJournalRecord[];
+  rowsFiltered?: boolean;
+  /**
+   * TRA-2082 — the SECOND population axis, surfaced for the same reason as the
+   * first. `rows` is demo-and-resolved only; `summary` folds BOTH modes and is
+   * not restricted to `mode: 'demo'`. So `rows.length === summary.closed` holds
+   * only while the book carries no live/OPEN rows, and a consumer that treats
+   * the dump as a row-level expansion of the summary will silently undercount
+   * the moment it does. This states the dump's own scope on the wire.
+   */
+  rowsMode?: 'demo';
+  /**
    * TRA-1046 (TRA-1041c L1) — freshness of the learned-weights fold. `generation`
    * bumps on each recompute (a close event or TTL lapse), so a probe can confirm
    * the weights refreshed intraday after a demo trade closed rather than only at
@@ -922,6 +950,15 @@ export async function buildSourceQualityReport(
  * (regression-safe). `weights`/`weightsFreshness` are deliberately left over the
  * FULL row set: the learned-weights fold and its cache generation are a
  * process-global concern the cohort filter must not perturb.
+ *
+ * TRA-2082 — `includeDemoRows` serves the `?rows=demo` dump from the SAME
+ * `sinceTs`-filtered set the summary folds. Previously the route filtered the
+ * rows itself and skipped `sinceTs`, so `summary` and `rows` described two
+ * different populations in one 200 with nothing distinguishing them — the
+ * false-PASS shape (n=1035 all-time reads as the n=10 post-arm cohort). Deriving
+ * both from `summaryRows` makes the divergence unrepresentable rather than
+ * merely fixed, and `appliedSinceTs`/`filterAxis`/`rowsFiltered` put the applied
+ * filter on the wire so a consumer can assert it.
  */
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
@@ -929,6 +966,7 @@ export function buildOptionJournalReport(
   enabled: boolean,
   cached?: CachedOptionWeights,
   sinceTs?: number,
+  includeDemoRows = false,
 ): OptionJournalReport {
   const summaryRows =
     sinceTs === undefined ? rows : rows.filter((r) => r.openTs >= sinceTs);
@@ -943,6 +981,17 @@ export function buildOptionJournalReport(
     weights: cached?.weights ?? computeOptionLearnedWeights(rows),
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),
+    appliedSinceTs: sinceTs ?? null,
+    filterAxis: 'openTs',
+    ...(includeDemoRows
+      ? {
+          rows: (summaryRows as OptionTradeJournalRecord[]).filter(
+            (r) => r.mode === 'demo' && r.outcome !== 'OPEN',
+          ),
+          rowsFiltered: sinceTs !== undefined,
+          rowsMode: 'demo' as const,
+        }
+      : {}),
   };
 }
 
@@ -2102,23 +2151,22 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const sinceTsRaw = req.query['sinceTs'];
     const sinceTsParsed = typeof sinceTsRaw === 'string' ? Number(sinceTsRaw) : NaN;
     const sinceTs = Number.isFinite(sinceTsParsed) ? sinceTsParsed : undefined;
-    const report = buildOptionJournalReport(
-      rows,
-      now(),
-      isOptionTradeJournalEnabled(),
-      cached,
-      sinceTs,
-    );
     // TRA-1133 — opt-in row-level dump for the OOS validation harness (TRA-992 Step
     // 1). `?rows=demo` appends the RESOLVED demo rows (setup key + realizedR +
     // outcome) so an offline run can fold the journal leave-one-out. Same demo-only,
     // secrets-free basis the route already documents — rows carry no balances/PII.
-    if (req.query['rows'] === 'demo') {
-      const demoResolved = rows.filter((r) => r.mode === 'demo' && r.outcome !== 'OPEN');
-      res.json({ ...report, rows: demoResolved });
-      return;
-    }
-    res.json(report);
+    // TRA-2082 — the dump is built INSIDE the report off the same `sinceTs`-filtered
+    // set as the summary; the route must not re-derive it from the unfiltered `rows`.
+    res.json(
+      buildOptionJournalReport(
+        rows,
+        now(),
+        isOptionTradeJournalEnabled(),
+        cached,
+        sinceTs,
+        req.query['rows'] === 'demo',
+      ),
+    );
   });
 
   // TRA-1601 (TRA-1600 A/telemetry) — maker-fill routing readout. Surfaces the
