@@ -1835,6 +1835,8 @@ export function getFeedDegradationState(): {
     blockedUntil: string | null;
     // TRA-1996 — per-source split so ops can see whether QUOTES are still flowing
     // through Tradier while a BAR-pull quota storm backs off the bar path.
+    // Naming follows the breaker convention: `*PathOpen === true` means the
+    // breaker for that path is OPEN, i.e. that path is BLOCKED (backing off).
     quotePathOpen: boolean;
     barPathOpen: boolean;
   };
@@ -1849,7 +1851,13 @@ export function getFeedDegradationState(): {
       reason: tradierOpen ? tradierBlockedReason : null,
       blockedUntil: tradierOpen ? new Date(tradierBlockedUntilMax()).toISOString() : null,
       quotePathOpen: isTradierQuoteBlocked(),
-      barPathOpen: Date.now() < tradierBarBlockedUntil,
+      // TRA-2073: the EFFECTIVE bar-path block is `now < max(barUntil, quoteUntil)`
+      // (a QUOTE-side quota trip means the account is genuinely saturated, so bars
+      // back off too). The raw `now < tradierBarBlockedUntil` bypassed that `max()`
+      // gate and under-reported `barPathOpen:false` on a quote-side trip while
+      // `tradier.open` above already read true — a self-contradictory snapshot that
+      // mis-led the first read of this telemetry. Route it through the same gate.
+      barPathOpen: isTradierBlocked(),
     },
     yahoo: {
       open: yahooOpen,

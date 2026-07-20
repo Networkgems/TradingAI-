@@ -456,5 +456,11 @@ describe('getFeedDegradationState (TRA-1940 observability)', () => {
       expect(s.tradier.blockedUntil).toBeNull();
     }
     if (!s.yahoo.open) expect(s.yahoo.blockedUntil).toBeNull();
+    // TRA-2073 invariant: the reported bar path is BLOCKED exactly when the overall
+    // Tradier breaker is open. `barPathOpen` must equal `tradier.open` (both route
+    // through the effective `now < max(bar, quote)` gate). The old code read the raw
+    // `tradierBarBlockedUntil` epoch, so on a QUOTE-side quota trip it printed
+    // `barPathOpen:false` while `tradier.open` was true — the contradiction this locks.
+    expect(s.tradier.barPathOpen).toBe(s.tradier.open);
   });
 });
