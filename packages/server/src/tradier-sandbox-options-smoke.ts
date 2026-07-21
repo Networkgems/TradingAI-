@@ -312,6 +312,136 @@ async function snapQuote(
 }
 
 /**
+ * TRA-2134 Tier-1 — run ONE contract's SHORT round trip:
+ * sell_to_open (collect credit) → wait terminal → buy_to_close (pay debit back).
+ *
+ * This is the sandbox smoke for cash-secured put (CSP) or covered call: we
+ * immediately buy the short back so there is zero possibility of assignment. The
+ * metrics shape is identical to the long round trip so the journal can store and
+ * grade both without branching.
+ *
+ * On the `side` field the legs are *reversed* from the long trip:
+ *   entry = 'sell' (sell_to_open), exit = 'buy' (buy_to_close).
+ *
+ * Slippage semantics flip accordingly: on a sell entry the far touch is the BID
+ * (we receive less than mid if we pay up to the bid), and `computeLegMetrics` with
+ * `side='sell'` already handles that — no caller change needed.
+ *
+ * Same safety contract as the long trip: never throws for expected "can't build the
+ * trip" reasons; a broker/network error propagates to the route's catch.
+ */
+export async function runShortContractRoundTrip(
+  client: TradierOptionsClient,
+  underlying: string,
+  optionType: 'call' | 'put',
+  qty: number,
+  deps: SmokeDeps,
+): Promise<SmokeContractResult> {
+  const { clock, sleep } = deps;
+  const waitOptions = deps.waitOptions ?? DEFAULT_WAIT;
+  const modeledCommissionUsd = modeledRoundTripCommissionUsd(qty);
+  const base: SmokeContractResult = {
+    ok: false,
+    optionType,
+    underlying,
+    realizedRoundTripUsd: null,
+    modeledCommissionUsd,
+  };
+
+  const nowForExpiry = clock();
+  const expirations = await client.getExpirations(underlying);
+  const expiration = selectSmokeExpiry(expirations, nowForExpiry);
+  if (!expiration) {
+    return {
+      ...base,
+      error: `No expiration within [${SMOKE_MIN_DTE}, ${SMOKE_MAX_DTE}] DTE for ${underlying}.`,
+    };
+  }
+
+  const underlyingRaw = await client.getOptionQuote(underlying);
+  const underlyingRefPrice = referencePrice(underlyingRaw ?? {});
+  if (underlyingRefPrice == null) {
+    return { ...base, error: `No usable underlying reference price for ${underlying}.` };
+  }
+
+  const chain = await client.getChain(underlying, expiration);
+  const contract = selectAtmContract(chain, underlyingRefPrice, optionType);
+  if (!contract) {
+    return {
+      ...base,
+      error: `No ${optionType} contract in the ${underlying} ${expiration} chain.`,
+    };
+  }
+
+  const dte = (Date.parse(`${expiration}T00:00:00Z`) - nowForExpiry) / MS_PER_DAY;
+  const contractInfo = {
+    optionSymbol: contract.optionSymbol,
+    strike: contract.strike,
+    expiration,
+    dte: Math.round(dte * 100) / 100,
+    underlyingRefPrice,
+  };
+
+  const runLeg = async (side: 'buy' | 'sell'): Promise<SmokeLegResult> => {
+    const decisionQuote = await snapQuote(client, contract.optionSymbol, clock);
+    const tSubmit = clock();
+    const order =
+      side === 'sell'
+        ? await client.sellToOpenContracts(contract.optionSymbol, qty) // sell_to_open entry
+        : await client.buyToCloseContracts(contract.optionSymbol, qty); // buy_to_close exit
+    const tAck = clock();
+    const final: TradierOrderDetail | null = await client.waitForOrderTerminalStatus(order.id, {
+      ...waitOptions,
+      sleep,
+    });
+    const isTerminal = final != null && TRADIER_TERMINAL_STATUSES.has(final.status);
+    const tFill = isTerminal ? clock() : null;
+    const avgFillPrice =
+      final != null && typeof final.avg_fill_price === 'number' && Number.isFinite(final.avg_fill_price)
+        ? final.avg_fill_price
+        : null;
+    const timeline: LegTimeline = { tSignal: decisionQuote.tSignal, tSubmit, tAck, tFill };
+    return {
+      side,
+      orderId: order.id,
+      status: final?.status ?? order.status ?? null,
+      reason: final?.reason_description ?? null,
+      avgFillPrice,
+      execQuantity:
+        final != null && typeof final.exec_quantity === 'number' ? final.exec_quantity : null,
+      decisionQuote,
+      timeline,
+      metrics: computeLegMetrics(side, decisionQuote, timeline, avgFillPrice),
+    };
+  };
+
+  // entry = sell_to_open, exit = buy_to_close (the reverse of the long trip)
+  const entry = await runLeg('sell');
+  const exit = await runLeg('buy');
+
+  // For a short round-trip the credit received is the ENTRY fill and the debit paid is
+  // the EXIT fill — realized P&L = (entryFill - exitFill) × 100 × qty - commission.
+  const realizedRoundTripUsd =
+    entry.avgFillPrice != null && exit.avgFillPrice != null
+      ? (entry.avgFillPrice - exit.avgFillPrice) * 100 * qty - modeledCommissionUsd
+      : null;
+
+  return {
+    ...base,
+    ok:
+      entry.status === 'filled'
+      && exit.status === 'filled'
+      && entry.avgFillPrice != null
+      && exit.avgFillPrice != null,
+    contract: contractInfo,
+    entry,
+    exit,
+    realizedRoundTripUsd,
+    modeledCommissionUsd,
+  };
+}
+
+/**
  * Run ONE contract's long round trip: buy_to_open → wait terminal → sell_to_close
  * → wait terminal, capturing the decision quote + timeline for each leg. Never
  * throws for an expected "couldn't build the trip" reason (no expiry in window,

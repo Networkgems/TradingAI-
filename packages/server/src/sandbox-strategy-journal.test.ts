@@ -6,6 +6,7 @@ import {
   recordFromContractResult,
   recordSandboxStrategy,
   longStrategyFor,
+  shortStrategyFor,
   summarizeSandboxStrategyJournal,
   hydrateSandboxStrategyJournalFromDisk,
   clearSandboxStrategyJournal,
@@ -192,6 +193,13 @@ describe('longStrategyFor', () => {
   it('maps option type to the single-leg long strategy tag', () => {
     expect(longStrategyFor('call')).toBe('long_call');
     expect(longStrategyFor('put')).toBe('long_put');
+  });
+});
+
+describe('shortStrategyFor', () => {
+  it('maps put to csp and call to covered_call', () => {
+    expect(shortStrategyFor('put')).toBe('csp');
+    expect(shortStrategyFor('call')).toBe('covered_call');
   });
 });
 

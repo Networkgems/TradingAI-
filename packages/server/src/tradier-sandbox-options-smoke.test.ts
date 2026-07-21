@@ -9,6 +9,7 @@ import {
   computeLegMetrics,
   modeledRoundTripCommissionUsd,
   runContractRoundTrip,
+  runShortContractRoundTrip,
   OPTIONS_SMOKE_UNDERLYINGS,
   SMOKE_MIN_DTE,
   SMOKE_MAX_DTE,
@@ -310,5 +311,136 @@ describe('runContractRoundTrip (fetch-mock happy path)', () => {
     const result = await runContractRoundTrip(client, 'SPY', 'put', 1, deps);
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(new RegExp(`\\[${SMOKE_MIN_DTE}, ${SMOKE_MAX_DTE}\\] DTE`));
+  });
+});
+
+// ── runShortContractRoundTrip (TRA-2134 Tier-1 CSP/covered-call) ─────────────
+//
+// Proves: the short round-trip posts sell_to_open as the ENTRY and buy_to_close
+// as the EXIT (the reverse of the long trip), P&L is (entryFill - exitFill)*100*qty
+// minus commission, and the { ok:false, error } no-throw contract holds for the same
+// failure modes as the long trip.
+
+/**
+ * Same mock as installSandboxMock but assigns order ids to match the short-trip leg
+ * sequence: first POST → sell_to_open (id 333), second → buy_to_close (id 444),
+ * each polled to `filled` with distinct fill prices.
+ */
+function installShortSandboxMock(entryFill = 1.95, exitFill = 1.80): void {
+  let orderSeq = 0;
+  fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    const method = init?.method ?? 'GET';
+    if (u.includes('/markets/options/expirations')) {
+      return jsonResponse({ expirations: { date: ['2026-07-25', '2026-08-20'] } });
+    }
+    if (u.includes('/markets/options/chains')) {
+      return jsonResponse({
+        options: {
+          option: [
+            { symbol: 'SPY260725C00500000', underlying: 'SPY', description: '', option_type: 'call', strike: 500, expiration_date: '2026-07-25' },
+            { symbol: 'SPY260725P00500000', underlying: 'SPY', description: '', option_type: 'put', strike: 500, expiration_date: '2026-07-25' },
+          ],
+        },
+      });
+    }
+    if (u.includes('/markets/quotes')) {
+      if (u.includes('symbols=SPY&') || /symbols=SPY$/.test(u)) {
+        return jsonResponse({ quotes: { quote: { symbol: 'SPY', bid: 499, ask: 501 } } });
+      }
+      return jsonResponse({ quotes: { quote: { symbol: 'OPT', bid: 1.9, ask: 2.0 } } });
+    }
+    if (u.includes('/orders') && method === 'POST') {
+      orderSeq += 1;
+      const id = orderSeq === 1 ? 333 : 444;
+      return jsonResponse({ order: { id, status: 'ok' } });
+    }
+    if (/\/orders\/\d+$/.test(u) && method === 'GET') {
+      const id = Number(/\/orders\/(\d+)$/.exec(u)?.[1]);
+      const avg = id === 333 ? entryFill : exitFill;
+      return jsonResponse({ order: { id, status: 'filled', avg_fill_price: avg, exec_quantity: 1 } });
+    }
+    return jsonResponse({});
+  });
+}
+
+describe('runShortContractRoundTrip (fetch-mock happy path)', () => {
+  it('short put (CSP): entry=sell_to_open → filled → exit=buy_to_close → filled, P&L = (entry-exit)*100 - comm', async () => {
+    installShortSandboxMock(1.95, 1.80);
+    const client = new TradierOptionsClient('tok', 'VA20296703', 'sandbox');
+    let t = Date.parse('2026-07-21T00:00:00Z');
+    const deps = {
+      clock: () => (t += 10),
+      sleep: async () => {},
+      waitOptions: { timeoutMs: 5000, intervalMs: 10 },
+    };
+
+    const result = await runShortContractRoundTrip(client, 'SPY', 'put', 1, deps);
+
+    expect(result.ok).toBe(true);
+    expect(result.optionType).toBe('put');
+    expect(result.contract?.strike).toBe(500);
+    expect(result.entry?.status).toBe('filled');
+    expect(result.exit?.status).toBe('filled');
+    expect(result.entry?.side).toBe('sell');   // sell_to_open
+    expect(result.exit?.side).toBe('buy');     // buy_to_close
+    expect(result.entry?.avgFillPrice).toBe(1.95);
+    expect(result.exit?.avgFillPrice).toBe(1.80);
+    // (1.95 − 1.80) × 100 × 1 − 1.30 = 13.70
+    expect(result.realizedRoundTripUsd).toBeCloseTo(13.7, 6);
+
+    const postCalls = fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
+    );
+    const entryBody = new URLSearchParams((postCalls[0][1] as RequestInit).body as string);
+    expect(entryBody.get('class')).toBe('option');
+    expect(entryBody.get('side')).toBe('sell_to_open');
+    expect(entryBody.get('option_symbol')).toBe('SPY260725P00500000');
+    const exitBody = new URLSearchParams((postCalls[1][1] as RequestInit).body as string);
+    expect(exitBody.get('side')).toBe('buy_to_close');
+  });
+
+  it('short call (covered call): entry=sell_to_open call → exit=buy_to_close call', async () => {
+    installShortSandboxMock(2.10, 1.90);
+    const client = new TradierOptionsClient('tok', 'VA20296703', 'sandbox');
+    let t = Date.parse('2026-07-21T00:00:00Z');
+    const deps = {
+      clock: () => (t += 10),
+      sleep: async () => {},
+      waitOptions: { timeoutMs: 5000, intervalMs: 10 },
+    };
+
+    const result = await runShortContractRoundTrip(client, 'SPY', 'call', 1, deps);
+
+    expect(result.ok).toBe(true);
+    expect(result.optionType).toBe('call');
+    expect(result.entry?.side).toBe('sell');
+    expect(result.exit?.side).toBe('buy');
+    // (2.10 − 1.90) × 100 − 1.30 = 18.70
+    expect(result.realizedRoundTripUsd).toBeCloseTo(18.7, 6);
+
+    const postCalls = fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
+    );
+    const entryBody = new URLSearchParams((postCalls[0][1] as RequestInit).body as string);
+    expect(entryBody.get('side')).toBe('sell_to_open');
+    expect(entryBody.get('option_symbol')).toBe('SPY260725C00500000');
+    const exitBody = new URLSearchParams((postCalls[1][1] as RequestInit).body as string);
+    expect(exitBody.get('side')).toBe('buy_to_close');
+  });
+
+  it('returns { ok:false, error } (no throw) when no expiry in the DTE window', async () => {
+    fetchMock.mockImplementation(async (url: string | URL) => {
+      if (String(url).includes('/markets/options/expirations')) {
+        return jsonResponse({ expirations: { date: ['2026-12-31'] } });
+      }
+      return jsonResponse({});
+    });
+    const client = new TradierOptionsClient('tok', 'VA20296703', 'sandbox');
+    const deps = { clock: () => Date.parse('2026-07-21T00:00:00Z'), sleep: async () => {} };
+    const result = await runShortContractRoundTrip(client, 'SPY', 'put', 1, deps);
+    expect(result.ok).toBe(false);
+    expect(result.entry).toBeUndefined();
+    expect(result.error).toMatch(/DTE/);
   });
 });

@@ -260,6 +260,18 @@ export const DEMO_FLAG_ALLOWLIST = [
   'ENABLE_SESSION_EDGE_BLACKOUT',
   'SESSION_EDGE_BLACKOUT_OPEN_MINUTES',
   'SESSION_EDGE_BLACKOUT_CLOSE_MINUTES',
+  // TRA-2134 (parent TRA-2125, foundation TRA-2130) — SANDBOX-only Tier-1 premium-
+  // selling round-trip: cash-secured put (short put → buy_to_close) + covered call
+  // (short call → buy_to_close). The route is structurally SANDBOX-only by construction
+  // (it reaches the Tradier sandbox client the same way the existing options-smoke-order
+  // does, and it carries the same `confirm:"SANDBOX"` guard + qty cap + underlying
+  // allow-list), so a file flip can NEVER touch the live Tradier account.  Default OFF
+  // ⇒ the no-auth journal reader shows neither `csp` nor `covered_call` strategies;
+  // arming it via this flag (or ENABLE_SANDBOX_CSP_COVERED_CALL=1 in process.env) adds
+  // those two round-trips to the same `POST /api/health/tradier-sandbox/options-smoke-order`
+  // call and records them in the durable sandbox-strategy-journal. This is the issue-body
+  // "gate each [strategy] behind a flag" requirement for Tier-1 non-long strategies.
+  'ENABLE_SANDBOX_CSP_COVERED_CALL',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

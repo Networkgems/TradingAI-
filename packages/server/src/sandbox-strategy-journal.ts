@@ -70,6 +70,15 @@ export function longStrategyFor(optionType: 'call' | 'put'): SandboxStrategy {
   return optionType === 'call' ? 'long_call' : 'long_put';
 }
 
+/**
+ * Derive the strategy tag for a TRA-2134 Tier-1 short round-trip:
+ * - short put → 'csp' (cash-secured put)
+ * - short call → 'covered_call'
+ */
+export function shortStrategyFor(optionType: 'call' | 'put'): SandboxStrategy {
+  return optionType === 'call' ? 'covered_call' : 'csp';
+}
+
 /** One leg of a recorded round-trip — exactly the fields TRA-2134 acceptance names. */
 export interface SandboxStrategyLeg {
   side: 'buy' | 'sell';

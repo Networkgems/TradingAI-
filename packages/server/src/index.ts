@@ -444,6 +444,7 @@ import { recordMakerFill } from './option-maker-fill-ledger.js';
 import {
   validateOptionsSmokeRequest,
   runContractRoundTrip,
+  runShortContractRoundTrip,
   FILL_REALISM,
   FILL_REALISM_NOTE,
 } from './tradier-sandbox-options-smoke.js';
@@ -451,6 +452,7 @@ import {
   recordFromContractResult,
   recordSandboxStrategy,
   longStrategyFor,
+  shortStrategyFor,
   summarizeSandboxStrategyJournal,
   hydrateSandboxStrategyJournalFromDisk,
 } from './sandbox-strategy-journal.js';
@@ -9071,6 +9073,17 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
     const call = await runContractRoundTrip(client, underlying, 'call', qty, deps);
     const put = await runContractRoundTrip(client, underlying, 'put', qty, deps);
     const okAll = call.ok && put.ok;
+    // TRA-2134 Tier-1 short (CSP + covered call), flag-gated. Default OFF — the journal
+    // reader shows neither 'csp' nor 'covered_call' until ENABLE_SANDBOX_CSP_COVERED_CALL
+    // is armed via demo-flags.json or process.env. Sequential for the same reason as the
+    // long trips above: avoid racing the sandbox order pipeline.
+    const cspEnabled = demoFlagEnv().ENABLE_SANDBOX_CSP_COVERED_CALL === '1';
+    let csp: import('./tradier-sandbox-options-smoke.js').SmokeContractResult | null = null;
+    let coveredCall: import('./tradier-sandbox-options-smoke.js').SmokeContractResult | null = null;
+    if (cspEnabled) {
+      csp = await runShortContractRoundTrip(client, underlying, 'put', qty, deps);
+      coveredCall = await runShortContractRoundTrip(client, underlying, 'call', qty, deps);
+    }
     // TRA-2134 — land each round-trip that actually built a contract in the durable
     // multi-strategy journal so a scheduled runner accrues a graded-able series (the
     // Tradier sandbox account history is NOT a no-auth /api/health surface). A trip
@@ -9079,16 +9092,24 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
     let journalRecorded = 0;
     for (const [optionType, result] of [['call', call], ['put', put]] as const) {
       const rec = recordFromContractResult(longStrategyFor(optionType), result, etDay);
-      if (rec) {
-        recordSandboxStrategy(rec);
-        journalRecorded += 1;
-      }
+      if (rec) { recordSandboxStrategy(rec); journalRecorded += 1; }
     }
-    log.info('TRA-2130 sandbox options smoke round-trip', {
+    if (csp) {
+      const rec = recordFromContractResult(shortStrategyFor('put'), csp, etDay);
+      if (rec) { recordSandboxStrategy(rec); journalRecorded += 1; }
+    }
+    if (coveredCall) {
+      const rec = recordFromContractResult(shortStrategyFor('call'), coveredCall, etDay);
+      if (rec) { recordSandboxStrategy(rec); journalRecorded += 1; }
+    }
+    log.info('TRA-2130/2134 sandbox options smoke round-trip', {
       underlying,
       qty,
       callOk: call.ok,
       putOk: put.ok,
+      cspEnabled,
+      cspOk: csp?.ok ?? null,
+      coveredCallOk: coveredCall?.ok ?? null,
       journalRecorded,
       callEntrySignalToSubmitMs: call.entry?.metrics.latencyMs.signalToSubmit ?? null,
       putEntrySignalToSubmitMs: put.entry?.metrics.latencyMs.signalToSubmit ?? null,
@@ -9099,7 +9120,7 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
       accountNumber: accountId,
       underlying,
       qty,
-      contracts: { call, put },
+      contracts: { call, put, ...(cspEnabled ? { csp, coveredCall } : {}) },
       journal: {
         // Still bypasses the OPTION-IDEA journal / paper book (that models the real book).
         landsInOptionJournal: false,
