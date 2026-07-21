@@ -383,8 +383,7 @@ import {
   consumeBackupCode,
 } from './users.js';
 import { sendPasswordResetEmail, sendOtpEmail } from './email.js';
-import { startEventLoopWatchdog, getWatchdogStatus, type WatchdogHandle } from './event-loop-watchdog.js';
-import { getPhaseAttribution } from './phase-timing.js';
+import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import {
   logger,
   flushLogs,
@@ -3138,38 +3137,6 @@ async function runMacroRefresh(): Promise<void> {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
-});
-
-// TRA-2111 / TRA-1463 — event-loop watchdog + synchronous-phase attribution probe.
-//
-// The phase-timing module (TRA-1463) records every synchronous phase that holds
-// the loop >= PHASE_TIMING_SLOW_MS (default 1s) into an in-memory ring, and its
-// header comment promises "a single `/api/health/watchdog` poll after a block
-// names which instrumented synchronous phase held the loop, WITHOUT waiting for a
-// self-restart." That route was never actually registered — so the ONLY way the
-// ring ever reached anyone was the persisted breadcrumb the watchdog writes when
-// IT trips. TRA-2111's failure mode is the one case that breadcrumb can't cover:
-// a >=5s synchronous block where Render's independent 5s HTTP health probe kills
-// the process BEFORE the watchdog's setInterval can fire and persist a trip. The
-// sub-5s tail (blocks in [1s, 5s), which the issue says is most of the residual
-// distribution) never trips the watchdog OR Render, so it is invisible today.
-//
-// This route closes that gap: it reads the LIVE ring at request time, so any
-// slow phase since boot is curl-able before it ever grows into a 5s kill. That
-// turns the "3 static suspects" (autopilot introspection fold / getState rebuild
-// / quote assembly) into 1 named culprit with a single poll — the evidence the
-// targeted chunk fix depends on. Unauthenticated by design (parity with the other
-// `/api/health/*` probes; bqb1 admin auth is dead): the payload carries only
-// phase names, durations, lag/heap counts, and timestamps — no trade specifics,
-// prices, or credentials. `phaseAttribution` is re-read here (not taken from the
-// stale ~1s watchdog snapshot) so `recentSlowPhases` and the in-flight
-// `activePhase` elapsed are current as of the request.
-app.get('/api/health/watchdog', (_req, res) => {
-  res.json({
-    time: new Date().toISOString(),
-    watchdog: getWatchdogStatus(),
-    phaseAttribution: getPhaseAttribution(),
-  });
 });
 
 // TRA-528 — live reliability + observability surface:

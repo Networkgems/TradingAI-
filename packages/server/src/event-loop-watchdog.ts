@@ -102,8 +102,19 @@ export interface PersistedTrip {
    * threshold — i.e. the code that blocked the loop — turning the very next
    * self-restart's breadcrumb into a NAMED culprit instead of a bare lag number.
    * Optional so pre-existing trip files stay readable and non-`block` trips omit it.
+   *
+   * ⚠️ TRA-2111 — this may be an `async` (I/O-bound) phase whose wall time includes
+   * awaited I/O and did NOT starve the loop. For the actual block attribution read
+   * {@link slowSyncPhase}; check `slowPhase.kind` before trusting it as a block.
    */
   slowPhase?: SlowPhase | null;
+  /**
+   * TRA-2111 — the most-recent PURE-SYNC phase (`kind: 'sync'`) at trip time: the
+   * code that actually starved the event loop, never overwritten by a slow I/O
+   * tick. This is the field a `block`-trip root-cause should read. Optional so
+   * pre-existing trip files stay readable.
+   */
+  slowSyncPhase?: SlowPhase | null;
   /**
    * TRA-1463 — the async tick/driver phase IN FLIGHT at the moment of the trip.
    * For a `block` occurring inside an async tick this names the SUBSYSTEM whose
@@ -161,8 +172,21 @@ export interface PersistedLiveness {
    * (external SIGKILL 137 / health-check SIGTERM), the NEXT boot reads this as
    * `priorLiveness.slowPhase` — the last synchronous phase that held the loop
    * before the box went dark. Optional so older breadcrumbs stay readable.
+   *
+   * ⚠️ TRA-2111 — may be an `async` I/O-bound tick (loop NOT starved); a Render
+   * health-check-timeout kill during a both-feeds-down stampede writes a 13s
+   * `signal.doTick` here that is awaited fetchQuotes, not a block. Read {@link
+   * slowSyncPhase} for the actual synchronous-block attribution.
    */
   slowPhase?: SlowPhase | null;
+  /**
+   * TRA-2111 — the most-recent PURE-SYNC block at this heartbeat, never overwritten
+   * by a slow I/O tick. On a health-check-timeout kill the NEXT boot reads this as
+   * the real synchronous burst (if any) that was starving the loop before the box
+   * went dark — distinct from a coincident slow feed tick. Optional so older
+   * breadcrumbs stay readable.
+   */
+  slowSyncPhase?: SlowPhase | null;
   /**
    * TRA-1463 — the async tick/driver phase in flight at this heartbeat. On an
    * external kill (SIGKILL 137 / health-check SIGTERM) mid-block, the next boot's
@@ -1011,6 +1035,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           lagMeanMs: Math.round(sample.lagMeanMs),
           lagMaxMs: Math.round(sample.lagMaxMs),
           slowPhase: phaseAttribution.lastSlowPhase,
+          slowSyncPhase: phaseAttribution.lastSlowSyncPhase,
           activePhase: phaseAttribution.activePhase,
         },
         opts.env,
@@ -1112,6 +1137,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             lagMeanMs: Math.round(sample.lagMeanMs),
             lagMaxMs: Math.round(sample.lagMaxMs),
             slowPhase: tripAttribution.lastSlowPhase,
+            slowSyncPhase: tripAttribution.lastSlowSyncPhase,
             activePhase: tripAttribution.activePhase,
           },
           opts.env,
