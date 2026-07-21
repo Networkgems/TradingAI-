@@ -447,6 +447,13 @@ import {
   FILL_REALISM,
   FILL_REALISM_NOTE,
 } from './tradier-sandbox-options-smoke.js';
+import {
+  recordFromContractResult,
+  recordSandboxStrategy,
+  longStrategyFor,
+  summarizeSandboxStrategyJournal,
+  hydrateSandboxStrategyJournalFromDisk,
+} from './sandbox-strategy-journal.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
@@ -2449,6 +2456,21 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       admitted: h.admitted,
       rejects: h.rejects,
       days: h.days,
+    });
+  }
+}
+
+// TRA-2134 — rebuild the durable multi-strategy SANDBOX journal and remember DATA_DIR
+// for subsequent appends. Durable so the standing learning program survives bqb1's
+// daily reboot; a post-session read of /api/health/sandbox-strategy-journal recovers
+// the whole series (provided DATA_DIR is a persistent mount — else the payload's
+// `durability.ephemeral` says so). Compacted to a 60-day window.
+{
+  const h = hydrateSandboxStrategyJournalFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('sandbox strategy journal hydrated (TRA-2134)', {
+      records: h.records,
+      strategies: h.strategies,
     });
   }
 }
@@ -9049,11 +9071,25 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
     const call = await runContractRoundTrip(client, underlying, 'call', qty, deps);
     const put = await runContractRoundTrip(client, underlying, 'put', qty, deps);
     const okAll = call.ok && put.ok;
+    // TRA-2134 — land each round-trip that actually built a contract in the durable
+    // multi-strategy journal so a scheduled runner accrues a graded-able series (the
+    // Tradier sandbox account history is NOT a no-auth /api/health surface). A trip
+    // that never built a contract maps to null and is intentionally NOT recorded.
+    const etDay = etDateString();
+    let journalRecorded = 0;
+    for (const [optionType, result] of [['call', call], ['put', put]] as const) {
+      const rec = recordFromContractResult(longStrategyFor(optionType), result, etDay);
+      if (rec) {
+        recordSandboxStrategy(rec);
+        journalRecorded += 1;
+      }
+    }
     log.info('TRA-2130 sandbox options smoke round-trip', {
       underlying,
       qty,
       callOk: call.ok,
       putOk: put.ok,
+      journalRecorded,
       callEntrySignalToSubmitMs: call.entry?.metrics.latencyMs.signalToSubmit ?? null,
       putEntrySignalToSubmitMs: put.entry?.metrics.latencyMs.signalToSubmit ?? null,
     });
@@ -9065,12 +9101,19 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
       qty,
       contracts: { call, put },
       journal: {
+        // Still bypasses the OPTION-IDEA journal / paper book (that models the real book).
         landsInOptionJournal: false,
+        // TRA-2134 — but each round-trip that built a contract now DOES land in the durable
+        // multi-strategy sandbox journal, readable no-auth at /api/health/sandbox-strategy-journal.
+        landsInSandboxStrategyJournal: true,
+        recorded: journalRecorded,
+        readAt: '/api/health/sandbox-strategy-journal',
         note:
           'This smoke route calls TradierOptionsClient.buyContracts / sellContracts directly and '
           + 'deliberately BYPASSES the local option-idea journal and paper book. The fills are '
-          + 'recorded ONLY in the Tradier sandbox account (readable via GET /api/health/tradier-sandbox '
-          + 'positions, or Tradier account history via listAccountHistory).',
+          + 'recorded in the Tradier sandbox account (GET /api/health/tradier-sandbox positions / '
+          + 'listAccountHistory) AND in the durable TRA-2134 sandbox-strategy journal '
+          + '(GET /api/health/sandbox-strategy-journal) for the standing learning program.',
       },
       fillRealism: FILL_REALISM,
       fillRealismNote: FILL_REALISM_NOTE,
@@ -9085,6 +9128,21 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
       ts: new Date().toISOString(),
     });
   }
+});
+
+// TRA-2134 — no-auth read of the durable multi-strategy SANDBOX journal (bqb1 admin
+// auth is dead, TRA-1992). Reports, per strategy, the acceptance-unit counts (clean
+// round-trips within the <500ms signal→submit budget) + latency/slippage quality, and
+// a `durability.ephemeral` flag so a reader can tell a real /data mount from the
+// in-bundle fallback that evaporates on redeploy. Observe-only; never places an order.
+app.get('/api/health/sandbox-strategy-journal', (_req, res) => {
+  res.status(200).json({
+    ...summarizeSandboxStrategyJournal(),
+    scope: 'SANDBOX ONLY (acct VA20296703), $0 real notional — TRA-1897 HOLD POSTURE unaffected.',
+    fillRealism: FILL_REALISM,
+    fillRealismNote: FILL_REALISM_NOTE,
+    ts: new Date().toISOString(),
+  });
 });
 
 async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
