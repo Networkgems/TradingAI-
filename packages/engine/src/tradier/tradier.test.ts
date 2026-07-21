@@ -148,6 +148,42 @@ describe('TradierOrderClient', () => {
     expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/orders/99');
     expect(callInit(0).method).toBe('DELETE');
   });
+
+  // TRA-2126 — plain equity order (smoke-order path).
+  it('submitEquityOrder posts a market equity order with class=equity', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 7, status: 'ok' } }));
+    const client = new TradierOrderClient('tok', 'A1');
+    const order = await client.submitEquityOrder({ symbol: 'AAPL', side: 'buy', qty: 1 });
+    expect(order).toEqual({ id: 7, status: 'ok' });
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/A1/orders');
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('class')).toBe('equity');
+    expect(params.get('symbol')).toBe('AAPL');
+    expect(params.get('side')).toBe('buy');
+    expect(params.get('quantity')).toBe('1');
+    expect(params.get('type')).toBe('market');
+    expect(params.get('duration')).toBe('day');
+    // A market order carries no price.
+    expect(params.get('price')).toBeNull();
+  });
+
+  it('submitEquityOrder includes a formatted price for a limit order', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ order: { id: 8, status: 'ok' } }));
+    const client = new TradierOrderClient('tok', 'A1');
+    await client.submitEquityOrder({ symbol: 'MSFT', side: 'sell', qty: 3, type: 'limit', limitPrice: 421.5 });
+    const params = new URLSearchParams(callInit(0).body as string);
+    expect(params.get('type')).toBe('limit');
+    expect(params.get('price')).toBe('421.50');
+  });
+
+  it('submitEquityOrder rejects a limit order without a positive limitPrice', async () => {
+    const client = new TradierOrderClient('tok', 'A1');
+    await expect(
+      client.submitEquityOrder({ symbol: 'MSFT', side: 'buy', qty: 1, type: 'limit' }),
+    ).rejects.toThrow(/requires a positive limitPrice/);
+    // No network call was made — the guard fires before postOrder.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 // ─── TradierOptionsClient ───────────────────────────────────────────────────

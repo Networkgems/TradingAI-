@@ -443,6 +443,44 @@ export class TradierOrderClient {
     return parseTradierEquityPositions(data);
   }
 
+  /**
+   * TRA-2126 — submit a single plain equity order (market by default). Used by
+   * the no-auth SANDBOX smoke-order health route to validate the
+   * order → fill → reconcile → journal path end to end. `postOrder` is
+   * `protected`, so this is the public entry point for a non-bracket equity
+   * order. Only `market` and `limit` types are supported here; a `limit` order
+   * requires a positive `limitPrice`.
+   */
+  async submitEquityOrder(params: {
+    symbol: string;
+    side: 'buy' | 'sell' | 'buy_to_cover' | 'sell_short';
+    qty: number;
+    type?: 'market' | 'limit';
+    limitPrice?: number;
+    duration?: 'day' | 'gtc';
+  }): Promise<TradierOrderResponse> {
+    const type = params.type ?? 'market';
+    const body = new URLSearchParams({
+      class: 'equity',
+      symbol: params.symbol,
+      side: params.side,
+      quantity: String(params.qty),
+      type,
+      duration: params.duration ?? 'day',
+    });
+    if (type === 'limit') {
+      if (
+        typeof params.limitPrice !== 'number'
+        || !Number.isFinite(params.limitPrice)
+        || params.limitPrice <= 0
+      ) {
+        throw new Error('submitEquityOrder: a limit order requires a positive limitPrice');
+      }
+      body.set('price', params.limitPrice.toFixed(2));
+    }
+    return this.postOrder(body);
+  }
+
   protected async postOrder(body: URLSearchParams): Promise<TradierOrderResponse> {
     const resp = await fetch(
       `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/orders`,

@@ -8802,6 +8802,213 @@ app.get('/api/health/quotes', async (_req, res) => {
   }
 });
 
+// TRA-2126 — no-auth SANDBOX-ONLY Tradier probe + smoke-order path.
+//
+// Context: bqb1's admin API auth is dead, so the authenticated sandbox routes
+// (`POST /api/options/tradier/test-connection {env:sandbox}`,
+// `/api/tradier/positions/sync`, balances) are unreachable there — yet the
+// deployment already carries the sandbox credential pair
+// (`TRADIER_SANDBOX_API_TOKEN` / `TRADIER_SANDBOX_ACCOUNT_ID`, acct
+// `VA20296703`). These routes give QuantTrader a reachable path to the sandbox
+// account WITHOUT restoring admin auth or exposing any live/production surface.
+//
+// SANDBOX-ONLY by construction — this is the safety property, not a convenience:
+//   • `env` is hard-pinned to `'sandbox'`; the resolver reads ONLY the
+//     `TRADIER_SANDBOX_*` pair and NEVER falls back to the production
+//     `TRADIER_API_TOKEN` / `TRADIER_ACCOUNT_ID` pair (bqb1 runs
+//     `TRADIER_ENV=production`, so those are the LIVE creds — a fallback would
+//     authenticate a no-auth route against a real funded account);
+//   • the sandbox token only authenticates against Tradier's sandbox host
+//     (`sandbox.tradier.com` via `tradierBaseUrl('sandbox')`), so even a
+//     misrouted call cannot reach a production account.
+// The smoke-order route additionally requires an explicit `confirm:"SANDBOX"`
+// body field and caps quantity, so it cannot fire by accident.
+function resolveSandboxTradierCreds(): { apiToken: string; accountId: string } | null {
+  const apiToken = (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? '').trim();
+  const accountId = (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? '').trim();
+  // No production fallback — see the safety note above.
+  if (!apiToken || !accountId) return null;
+  return { apiToken, accountId };
+}
+
+function sandboxNotConfiguredPayload(): Record<string, unknown> {
+  return {
+    ok: false,
+    env: 'sandbox',
+    configured: false,
+    error:
+      'TRADIER_SANDBOX_API_TOKEN / TRADIER_SANDBOX_ACCOUNT_ID are not set on this deployment. '
+      + 'Provision the sandbox credential pair (acct VA20296703) and restart.',
+    apiTokenSet: !!process.env['TRADIER_SANDBOX_API_TOKEN'],
+    accountIdSet: !!process.env['TRADIER_SANDBOX_ACCOUNT_ID'],
+    ts: new Date().toISOString(),
+  };
+}
+
+app.get('/api/health/tradier-sandbox', async (_req, res) => {
+  const creds = resolveSandboxTradierCreds();
+  if (!creds) {
+    // 200 with configured:false — this is a diagnostics endpoint; the "creds
+    // missing" state is a body flag, not an HTTP error (same convention as
+    // /api/health/quotes).
+    res.status(200).json(sandboxNotConfiguredPayload());
+    return;
+  }
+  const { apiToken, accountId } = creds;
+  try {
+    // Prove the token authenticates and the configured account belongs to it
+    // (mirrors the authenticated test-connection route's profile check).
+    const profileResp = await fetch(`${tradierBaseUrl('sandbox')}/user/profile`, {
+      headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
+    });
+    if (!profileResp.ok) {
+      const text = await profileResp.text().catch(() => '');
+      res.status(200).json({
+        ok: false,
+        env: 'sandbox',
+        configured: true,
+        error: `Tradier sandbox ${profileResp.status} — ${text || profileResp.statusText}`,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+    const profileData = (await profileResp.json()) as {
+      profile?: {
+        account?:
+          | { account_number?: string; status?: string; classification?: string; type?: string }
+          | { account_number?: string; status?: string; classification?: string; type?: string }[];
+      };
+    };
+    const accountsRaw = profileData.profile?.account;
+    const accounts = Array.isArray(accountsRaw) ? accountsRaw : accountsRaw ? [accountsRaw] : [];
+    const matched = accounts.find(a => a.account_number === accountId);
+    const client = new TradierOptionsClient(apiToken, accountId, 'sandbox');
+    // Best-effort — a failed balances/positions read does not flip `ok` when the
+    // profile lookup already proved the creds work.
+    const balance = await client.getAccountBalance().catch(() => null);
+    const positions = await client.listOpenEquityPositions().catch(() => []);
+    res.status(200).json({
+      ok: !!matched,
+      env: 'sandbox',
+      configured: true,
+      accountNumber: matched?.account_number ?? null,
+      accountStatus: matched?.status ?? null,
+      accountType: matched?.type ?? null,
+      accountMatched: !!matched,
+      knownAccounts: accounts.map(a => a.account_number).filter(Boolean),
+      buyingPower: balance
+        ? (balance.stockBuyingPower ?? balance.optionBuyingPower ?? (Number.isFinite(balance.totalCash) ? balance.totalCash : null))
+        : null,
+      balance: balance
+        ? {
+            totalEquity: balance.totalEquity,
+            totalCash: balance.totalCash,
+            stockBuyingPower: balance.stockBuyingPower,
+            optionBuyingPower: balance.optionBuyingPower,
+            accountType: balance.accountType,
+          }
+        : null,
+      positions: positions.map(p => ({
+        symbol: p.symbol,
+        quantity: p.quantity,
+        side: p.side,
+        costBasis: p.costBasis,
+      })),
+      positionCount: positions.length,
+      ts: new Date().toISOString(),
+    });
+  } catch (err: unknown) {
+    res.status(200).json({
+      ok: false,
+      env: 'sandbox',
+      configured: true,
+      error: err instanceof Error ? err.message : String(err),
+      ts: new Date().toISOString(),
+    });
+  }
+});
+
+// TRA-2126 — place ONE small SANDBOX paper smoke order and report its terminal
+// fill status. Guarded: SANDBOX creds only (see resolveSandboxTradierCreds),
+// explicit `confirm:"SANDBOX"` required, quantity hard-capped. Equity market
+// order by default. Body: { confirm, symbol, qty?, side? }.
+const SANDBOX_SMOKE_QTY_CAP = 10;
+app.post('/api/health/tradier-sandbox/smoke-order', async (req, res) => {
+  const creds = resolveSandboxTradierCreds();
+  if (!creds) {
+    res.status(200).json(sandboxNotConfiguredPayload());
+    return;
+  }
+  const body = (req.body ?? {}) as {
+    confirm?: unknown;
+    symbol?: unknown;
+    qty?: unknown;
+    side?: unknown;
+  };
+  if (body.confirm !== 'SANDBOX') {
+    res.status(400).json({
+      ok: false,
+      error: 'Refused: body.confirm must equal "SANDBOX" to place a sandbox paper order.',
+    });
+    return;
+  }
+  const symbol = (typeof body.symbol === 'string' ? body.symbol : '').trim().toUpperCase();
+  if (!/^[A-Z][A-Z.]{0,5}$/.test(symbol)) {
+    res.status(400).json({ ok: false, error: `Refused: invalid symbol ${JSON.stringify(body.symbol)}.` });
+    return;
+  }
+  const side: 'buy' | 'sell' = body.side === 'sell' ? 'sell' : 'buy';
+  const qtyRaw = Number(body.qty ?? 1);
+  const qty = Number.isInteger(qtyRaw) ? qtyRaw : 0;
+  if (qty < 1 || qty > SANDBOX_SMOKE_QTY_CAP) {
+    res.status(400).json({
+      ok: false,
+      error: `Refused: qty must be an integer in [1, ${SANDBOX_SMOKE_QTY_CAP}] for a smoke order.`,
+    });
+    return;
+  }
+  const { apiToken, accountId } = creds;
+  try {
+    const client = new TradierOptionsClient(apiToken, accountId, 'sandbox');
+    const order = await client.submitEquityOrder({ symbol, side, qty, type: 'market', duration: 'day' });
+    // Poll to a terminal state so the response carries the fill (validates the
+    // order → fill leg). Sandbox risk-checks are fast; keep the window short.
+    const finalStatus = await client.waitForOrderTerminalStatus(order.id, {
+      timeoutMs: 8000,
+      intervalMs: 750,
+    });
+    log.info('TRA-2126 sandbox smoke order placed', {
+      symbol,
+      side,
+      qty,
+      orderId: order.id,
+      status: finalStatus?.status ?? order.status,
+    });
+    res.status(200).json({
+      ok: true,
+      env: 'sandbox',
+      accountNumber: accountId,
+      order: { id: order.id, status: order.status },
+      fill: finalStatus
+        ? {
+            status: finalStatus.status,
+            execQuantity: finalStatus.exec_quantity ?? null,
+            avgFillPrice: finalStatus.avg_fill_price ?? null,
+            reason: finalStatus.reason_description ?? null,
+          }
+        : null,
+      ts: new Date().toISOString(),
+    });
+  } catch (err: unknown) {
+    res.status(200).json({
+      ok: false,
+      env: 'sandbox',
+      error: err instanceof Error ? err.message : String(err),
+      ts: new Date().toISOString(),
+    });
+  }
+});
+
 async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   const {
     testYahooFinance,
