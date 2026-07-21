@@ -124,7 +124,7 @@ import {
 } from './directional-open-ledger.js';
 import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject, recordEntryDeltaCeilingObserved } from './cost-aware-gate-ledger.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
-import { recordGiveBackState, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
+import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -1312,6 +1312,31 @@ export class DailyRiskGovernor {
       haltReason: this.sessionHaltReasonCode,
     };
     return { tripped, snapshot };
+  }
+
+  /**
+   * TRA-2110 — re-derive the intraday give-back high-water mark on boot from a
+   * DURABLE source (the give-back ledger's TODAY session peak), so a mid-session
+   * process restart (crash — TRA-1905 — or deploy) cannot silently DISARM the
+   * give-back governor. `peakOpenGain` and `sessionHalted` are in-memory only:
+   * without this seam the post-restart governor takes the COLLAPSED post-restart
+   * book as its peak, and a give-back that straddles the restart is never seen.
+   *
+   * RAISES the running peak only (`max` — never lowers), floored at 0, and
+   * respects the current ET day-key: `resetIfNewDay` runs first, so a seed value
+   * carried from a prior session is discarded by the day roll rather than
+   * resurrecting yesterday's peak. It does NOT re-latch `sessionHalted` itself —
+   * the next {@link markBook} tick re-evaluates the LIVE current book against the
+   * restored peak via the existing {@link bookGiveBackDecision} path and
+   * self-heals the latch. So it only trips if the live current is still below the
+   * retained floor of the true peak — never a false halt off the seed alone.
+   *
+   * A non-positive / non-finite seed is a no-op (nothing to restore).
+   */
+  seedBookPeak(peak: number): void {
+    this.resetIfNewDay();
+    if (!Number.isFinite(peak) || !(peak > 0)) return;
+    this.peakOpenGain = Math.max(this.peakOpenGain, peak, 0);
   }
 
   /**
@@ -11959,6 +11984,32 @@ export class SignalEngine {
       supertrendPaper: this.supertrendPaper.exportSnapshot(),
       supertrendPaperClosed: [...this.supertrendPaperClosed],
     };
+  }
+
+  /**
+   * TRA-2110 — boot seam: re-derive THIS book's give-back governor peak from the
+   * durable give-back ledger's TODAY (ET) session and seed the governor. Wired at
+   * boot AFTER `hydrateGiveBackArmFloorFromDisk` and `importTradeSnapshot`, so a
+   * mid-session restart (crash/deploy) re-arms the give-back governor against its
+   * true intraday peak instead of the collapsed post-restart book.
+   *
+   * Keyed on `(this.mode, this.feedContextKey)` — the SAME key `recordGiveBackState`
+   * writes under, so the read is self-consistent with the write regardless of the
+   * `engine-N` counter's absolute value (TRA-2110 AC#5: across a deterministic
+   * single-operator boot the counter is stable, and even if it weren't, seed and
+   * ledger share the identical key). The seed only RAISES the peak; the next
+   * `markBook` tick self-heals the latch via `bookGiveBackDecision`.
+   *
+   * Returns what it did so the boot log line can report per-book coverage. Does
+   * NOT check durability itself — the caller MUST gate on `durability.ephemeral
+   * === false` (TRA-2110 AC#3): never seed a real-capital latch off a non-durable
+   * ledger. `null`/non-positive ledger peak ⇒ no today-session ⇒ `seeded:false`.
+   */
+  seedBookGiveBackPeakFromLedger(now: Date = new Date()): { seeded: boolean; peak: number } {
+    const peak = getBookSessionPeak(this.mode, this.feedContextKey, etDateString(now));
+    if (peak == null || !(peak > 0)) return { seeded: false, peak: 0 };
+    this.riskGovernor.seedBookPeak(peak);
+    return { seeded: true, peak };
   }
 
   /**

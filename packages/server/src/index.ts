@@ -130,7 +130,7 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
-import { hydrateGiveBackArmFloorFromDisk } from './giveback-arm-floor-ledger.js';
+import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import {
   hydrateLiveOptionsFeeSlippageFromDisk,
@@ -2477,6 +2477,54 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       days: h.days,
       sessions: h.sessions,
     });
+  }
+
+  // TRA-2110 (parent TRA-2109 outcome-2) — re-derive each book's give-back
+  // governor peak from the ledger's TODAY (ET) session so a mid-session process
+  // restart (crash — TRA-1905 — or deploy) cannot silently DISARM the give-back
+  // governor. `DailyRiskGovernor.peakOpenGain`/`sessionHalted` are in-memory only
+  // and reset on restart; without this the post-restart governor takes the
+  // collapsed book as its peak and a restart-straddling give-back is never seen.
+  //
+  // Runs AFTER hydrate AND after `initAllUserContexts()` (line ~759, which imports
+  // trade snapshots), so both preconditions hold. GATED on `durability.ephemeral
+  // === false` (TRA-2110 AC#3): NEVER seed a real-capital latch off a non-durable
+  // ledger — on an ephemeral DATA_DIR the ledger is wiped at the same reboot as the
+  // memory it would seed, so its peak is untrustworthy. The seed only RAISES the
+  // peak; the next markBook tick self-heals the latch via bookGiveBackDecision (it
+  // trips only if the live current is still below the retained floor of the true
+  // peak — never a false halt off the seed alone). COUPLED to TRA-1719
+  // (DATA_DIR=/data): until that lands, `ephemeral` is true and this is a no-op.
+  const durability = summarizeGiveBackArmFloor().durability;
+  if (durability.ephemeral === false) {
+    let seededBooks = 0;
+    for (const ctx of getAllUserContexts()) {
+      try {
+        const r = ctx.engine.seedBookGiveBackPeakFromLedger();
+        if (r.seeded) {
+          seededBooks += 1;
+          log.info('give-back governor peak re-derived on boot (TRA-2110)', {
+            username: ctx.username,
+            peak: r.peak,
+          });
+        }
+      } catch (err: unknown) {
+        // Best-effort: a seed failure must never break boot. The governor simply
+        // runs unseeded (the pre-fix behavior), so this fails SAFE, not open.
+        log.warn('give-back governor boot re-derive failed (TRA-2110)', {
+          username: ctx.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (seededBooks > 0) {
+      log.info('give-back governor boot re-derive complete (TRA-2110)', { seededBooks });
+    }
+  } else {
+    log.warn(
+      'give-back governor boot re-derive SKIPPED — ledger ephemeral (TRA-2110/TRA-1719)',
+      { dataDir: durability.dataDir },
+    );
   }
 }
 

@@ -399,6 +399,33 @@ export function hydrateGiveBackArmFloorFromDisk(
   return { days: byDay.size, records: kept.length, sessions };
 }
 
+/**
+ * TRA-2110 — pure read of the folded intraday PEAK (realized+open book P&L,
+ * floored at 0) for one book's ET session `(mode, engineId, etDay)`. Returns
+ * `null` when NO session has been recorded for that key — decisively distinct
+ * from a recorded session whose peak is `0` (TRA-1707: `0` is a measurement,
+ * `null` is the absence of one). The boot governor-hydration seam (TRA-2110)
+ * uses this to re-derive `DailyRiskGovernor.peakOpenGain` after a mid-session
+ * restart; `null`/non-positive ⇒ nothing to seed, skip.
+ *
+ * Reads only the in-memory fold (built by the boot hydrate + live pass), so the
+ * caller MUST have run {@link hydrateGiveBackArmFloorFromDisk} first and MUST
+ * check `durability.ephemeral === false` before trusting a value for a
+ * real-capital latch — an ephemeral ledger's peak is no more durable than the
+ * in-memory state it would seed.
+ */
+export function getBookSessionPeak(
+  mode: 'demo' | 'live',
+  engineId: string,
+  etDay: string,
+): number | null {
+  const day = byDay.get(etDay);
+  if (!day) return null;
+  const o = day.get(bookKey(mode, engineId));
+  if (!o) return null;
+  return Math.max(0, o.peakPnl);
+}
+
 // ── Health summary ───────────────────────────────────────────────────────────
 
 /**

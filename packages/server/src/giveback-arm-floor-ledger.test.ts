@@ -8,6 +8,7 @@ import {
   recordGiveBackState,
   hydrateGiveBackArmFloorFromDisk,
   summarizeGiveBackArmFloor,
+  getBookSessionPeak,
   clearGiveBackArmFloorLedger,
   giveBackArmFloorLogPath,
   type BookGiveBackSnapshot,
@@ -223,5 +224,38 @@ describe('giveback-arm-floor-ledger', () => {
     const h = hydrateGiveBackArmFloorFromDisk(dir, now);
     expect(h.sessions).toBe(1); // only the recent one survives
     expect(summarizeGiveBackArmFloor().sessions[0]!.sessionDate).toBe(DAY);
+  });
+
+  // TRA-2110 — the boot governor-hydration accessor. Reads the folded intraday peak
+  // for one book's ET session; the seam that re-arms the give-back governor after a
+  // mid-session restart.
+  describe('getBookSessionPeak (TRA-2110)', () => {
+    it('returns the folded intraday peak (monotonic max, not the last mark)', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      // Peak climbs to +$183 then the book collapses to +$30.94 — the accessor must
+      // return the HIGH-WATER +$183 (what the governor lost on restart), not +$30.94.
+      recordGiveBackState('demo', 'engine-4', DAY, snap(50, 50), 1_001);
+      recordGiveBackState('demo', 'engine-4', DAY, snap(183, 120), 1_002);
+      recordGiveBackState('demo', 'engine-4', DAY, snap(183, 30.94), 1_003);
+      expect(getBookSessionPeak('demo', 'engine-4', DAY)).toBeCloseTo(183, 5);
+    });
+
+    it('returns null for a book-session that was never recorded (null ≠ 0 — TRA-1707)', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      recordGiveBackState('demo', 'engine-4', DAY, snap(183, 120), 1_001);
+      // Wrong day, wrong engine, and wrong mode each read the absence decisively as
+      // null — the boot seam must SKIP these, not seed a peak of 0.
+      expect(getBookSessionPeak('demo', 'engine-4', '2026-07-14')).toBeNull();
+      expect(getBookSessionPeak('demo', 'engine-9', DAY)).toBeNull();
+      expect(getBookSessionPeak('live', 'engine-4', DAY)).toBeNull();
+    });
+
+    it('is SPLIT per (mode, engineId) — one book never reads another book\'s peak', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      recordGiveBackState('demo', 'engine-4', DAY, snap(183, 30.94), 1_001);
+      recordGiveBackState('live', 'engine-4', DAY, snap(40, 40), 1_002);
+      expect(getBookSessionPeak('demo', 'engine-4', DAY)).toBeCloseTo(183, 5);
+      expect(getBookSessionPeak('live', 'engine-4', DAY)).toBeCloseTo(40, 5);
+    });
   });
 });

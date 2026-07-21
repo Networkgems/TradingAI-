@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { DailyRiskGovernor } from './signal-engine.js';
 import { etDateString } from './scheduler.js';
+import {
+  BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
+  BOOK_GIVEBACK_ARM_FLOOR_R,
+  DEFAULT_RISK_PER_TRADE,
+} from '@trading-app/shared';
 
 // TRA-407 (C3) — the daily risk governor must roll its "trading day" on the
 // ET calendar date, not the UTC date. These tests pin the day-boundary
@@ -338,6 +343,86 @@ describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
     // Releasing reveals the still-latched book halt underneath.
     expect(gov.isHalted()).toBe(true);
     expect(gov.getHaltReason()).toMatch(/give-back/i);
+  });
+});
+
+// TRA-2110 (parent TRA-2109 outcome-2) — crash-robust governor hydration. The
+// give-back peak/latch are in-memory only; a mid-session process restart collapses
+// the governor's peak to the post-restart book, silently DISARMING the give-back
+// governor for the rest of the session. `seedBookPeak` re-derives the true peak on
+// boot from the durable ledger; the next markBook tick self-heals the latch.
+describe('DailyRiskGovernor — TRA-2110 crash-robust give-back peak hydration', () => {
+  // The exact 07-20 engine-4 signature: peak +$183 recorded PRE-restart; the book
+  // then collapsed and the process restarted with peakOpenGain reset to 0; the
+  // current (realized+open) book at the first post-restart mark was +$30.94. A book
+  // of ~$2.2k → give-back arm floor = max($25, 0.5R = 0.5 × 1% × $2,200 = $11) = $25,
+  // which the +$183 peak clears; session-stop arm = 0.5R = $11. Give-back cap 40% ⇒
+  // retained floor = 183 × 0.6 = +$109.80. The live current +$30.94 sits far below
+  // that floor — the give-back governor SHOULD halt, but only if it knows the peak.
+  const BOOK_EQ = 2_200;
+  const ARM_FLOOR = Math.max(
+    BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
+    BOOK_GIVEBACK_ARM_FLOOR_R * BOOK_EQ * DEFAULT_RISK_PER_TRADE,
+  );
+  const PRE_RESTART_PEAK = 183;
+  const POST_RESTART_CURRENT = 30.94;
+
+  it('seed(183) → the next markBook tick at current=30.94 trips giveback_cap', () => {
+    // Reconstruct the governor as it exists immediately after a mid-session restart:
+    // fresh instance, peakOpenGain=0 (the pre-restart +$183 high-water was lost).
+    const gov = new DailyRiskGovernor(() => new Date('2026-07-20T18:00:00Z'));
+
+    // Boot re-derive: seed the true intraday peak from the durable ledger.
+    gov.seedBookPeak(PRE_RESTART_PEAK);
+
+    // The next live mark re-evaluates the CURRENT book against the restored peak and
+    // self-heals the latch — no separate re-latch logic.
+    const { tripped, snapshot } = gov.markBook(POST_RESTART_CURRENT, BOOK_EQ, ARM_FLOOR);
+    expect(tripped).toBe(true);
+    expect(snapshot.haltReason).toBe('giveback_cap'); // machine code, not the prose
+    expect(gov.isBookHalted()).toBe(true);
+    expect(gov.getBookHaltReason()).toMatch(/give-back/i);
+  });
+
+  it('MUTATION — WITHOUT the seed the SAME tick does NOT trip (guards the seed, not incidental state)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-07-20T18:00:00Z'));
+
+    // No seed: the governor only ever sees the collapsed post-restart book, so its
+    // peak is +$30.94 and current +$30.94 == peak ⇒ nothing surrendered ⇒ no halt.
+    // This is the exact silent-disarm the fix removes. If this ever trips, the test
+    // above is passing for some reason OTHER than the seed and is not guarding it.
+    const { tripped, snapshot } = gov.markBook(POST_RESTART_CURRENT, BOOK_EQ, ARM_FLOOR);
+    expect(tripped).toBe(false);
+    expect(snapshot.haltReason).toBeNull();
+    expect(gov.isBookHalted()).toBe(false);
+  });
+
+  it('seedBookPeak RAISES only — never lowers a live peak, floored at 0, and a non-positive seed is a no-op', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-07-20T18:00:00Z'));
+
+    // A live peak already above the seed must not be lowered by a stale/smaller seed.
+    gov.markBook(500, BOOK_EQ, ARM_FLOOR); // live peak +$500, floor +$300
+    gov.seedBookPeak(183); // smaller — must NOT lower the peak
+    gov.seedBookPeak(-1_000); // non-positive — no-op
+    gov.seedBookPeak(0); // no-op
+    // Peak is still +$500 → a give-back to +$350 (> +$300 floor) does not trip…
+    expect(gov.markBook(350, BOOK_EQ, ARM_FLOOR).tripped).toBe(false);
+    // …but +$250 (< +$300 floor) does — proving the peak stayed at +$500, not +$183.
+    expect(gov.markBook(250, BOOK_EQ, ARM_FLOOR).tripped).toBe(true);
+  });
+
+  it('respects the ET day-key — a seed does NOT resurrect a peak across the day roll', () => {
+    let now = new Date('2026-07-20T18:00:00Z');
+    const gov = new DailyRiskGovernor(() => now);
+    gov.seedBookPeak(PRE_RESTART_PEAK); // seed on day 1
+
+    // Roll to the next ET trading day BEFORE any mark — resetIfNewDay must clear the
+    // seeded peak so yesterday's high-water can never latch today's fresh session.
+    now = new Date('2026-07-21T18:00:00Z');
+    // Fresh day: peak rebuilds from 0. A +$40 → +$31 give-back is only 22.5%, no halt.
+    gov.markBook(40, BOOK_EQ, ARM_FLOOR);
+    expect(gov.markBook(31, BOOK_EQ, ARM_FLOOR).tripped).toBe(false);
+    expect(gov.isBookHalted()).toBe(false);
   });
 });
 
