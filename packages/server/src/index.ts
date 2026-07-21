@@ -441,6 +441,12 @@ import {
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import { recordMakerFill } from './option-maker-fill-ledger.js';
+import {
+  validateOptionsSmokeRequest,
+  runContractRoundTrip,
+  FILL_REALISM,
+  FILL_REALISM_NOTE,
+} from './tradier-sandbox-options-smoke.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
@@ -9003,6 +9009,78 @@ app.post('/api/health/tradier-sandbox/smoke-order', async (req, res) => {
     res.status(200).json({
       ok: false,
       env: 'sandbox',
+      error: err instanceof Error ? err.message : String(err),
+      ts: new Date().toISOString(),
+    });
+  }
+});
+
+// TRA-2130 — SANDBOX options (call + put) round-trip smoke route. Extends the
+// TRA-2126 equity smoke path to options: place a long call and a long put in the
+// sandbox, close each, and capture the full signal→submit→ack→fill timeline plus
+// slippage vs the decision quote. Guarded IDENTICALLY to the equity route —
+// SANDBOX creds only (resolveSandboxTradierCreds), explicit confirm:"SANDBOX",
+// qty hard-capped to 1, underlying allow-list SPY/AAPL, hard-pinned 'sandbox'
+// client with NO prod fallback. Deliberately bypasses the local option-idea
+// journal / paper book: the fills exist only in the Tradier sandbox account
+// history (readable via GET /api/health/tradier-sandbox positions / Tradier
+// account history). Body: { confirm:"SANDBOX", underlying:"SPY"|"AAPL", qty?:1 }.
+app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => {
+  const creds = resolveSandboxTradierCreds();
+  if (!creds) {
+    res.status(200).json(sandboxNotConfiguredPayload());
+    return;
+  }
+  const validation = validateOptionsSmokeRequest(req.body);
+  if (!validation.ok) {
+    res.status(validation.status).json({ ok: false, error: validation.error });
+    return;
+  }
+  const { underlying, qty } = validation;
+  const { apiToken, accountId } = creds;
+  try {
+    // Hard-pinned 'sandbox' — NO prod fallback (see resolveSandboxTradierCreds).
+    const client = new TradierOptionsClient(apiToken, accountId, 'sandbox');
+    const deps = {
+      clock: () => Date.now(),
+      sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+    };
+    // Call first, then put — sequential so the sandbox order pipeline isn't raced.
+    const call = await runContractRoundTrip(client, underlying, 'call', qty, deps);
+    const put = await runContractRoundTrip(client, underlying, 'put', qty, deps);
+    const okAll = call.ok && put.ok;
+    log.info('TRA-2130 sandbox options smoke round-trip', {
+      underlying,
+      qty,
+      callOk: call.ok,
+      putOk: put.ok,
+      callEntrySignalToSubmitMs: call.entry?.metrics.latencyMs.signalToSubmit ?? null,
+      putEntrySignalToSubmitMs: put.entry?.metrics.latencyMs.signalToSubmit ?? null,
+    });
+    res.status(200).json({
+      ok: okAll,
+      env: 'sandbox',
+      accountNumber: accountId,
+      underlying,
+      qty,
+      contracts: { call, put },
+      journal: {
+        landsInOptionJournal: false,
+        note:
+          'This smoke route calls TradierOptionsClient.buyContracts / sellContracts directly and '
+          + 'deliberately BYPASSES the local option-idea journal and paper book. The fills are '
+          + 'recorded ONLY in the Tradier sandbox account (readable via GET /api/health/tradier-sandbox '
+          + 'positions, or Tradier account history via listAccountHistory).',
+      },
+      fillRealism: FILL_REALISM,
+      fillRealismNote: FILL_REALISM_NOTE,
+      ts: new Date().toISOString(),
+    });
+  } catch (err: unknown) {
+    res.status(200).json({
+      ok: false,
+      env: 'sandbox',
+      underlying,
       error: err instanceof Error ? err.message : String(err),
       ts: new Date().toISOString(),
     });
