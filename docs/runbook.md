@@ -203,6 +203,37 @@ fine — they cannot reach the running process. This keeps the drift bounded.
 Lifting the freeze (after go-live sign-off, TRA-1648): set `autoDeploy=yes` /
 `autoDeployTrigger=commit` on the service, then delete `launch-window-base`.
 
+### RTH time-window freeze (TRA-1996) — no bqb1 deploy during market hours
+
+The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a
+correct-SHA deploy to `tradingai-bqb1` **during Regular Trading Hours dumps the warm
+quote cache and resets the soak clock** — every mid-RTH deploy disqualifies the
+session as the clean, no-mid-RTH-deploy acceptance sample TRA-1648 requires. This bit
+us repeatedly (07-20: 2 deploys, 07-21: 4) when the SANDBOX-options learning tree
+(TRA-2125 / TRA-2134) — which ships its adapter to the **same** Render service —
+deployed mid-session.
+
+**The rule: no `tradingai-bqb1` deploy during RTH 13:30–20:00Z, Mon–Fri.** Stage
+feed/host/adapter changes for pre-open (`<13:30Z`) or post-close (`>20:00Z`). This
+applies to **every** work stream, including sandbox-options — not just feed fixes.
+
+**Route all bqb1 deploys through the wrapper**, which enforces this as a technical
+gate rather than a convention (it refuses in-window deploys unless overridden):
+
+```bash
+# refuses if it is 13:30–20:00Z Mon–Fri on the soak host; else triggers the deploy
+RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>
+node scripts/render-redeploy.mjs --dry-run            # print the gate decision only
+# genuine emergency only — the reason is recorded and the session is disqualified:
+node scripts/render-redeploy.mjs --commit=<sha> --force-rth-override="why this cannot wait"
+```
+
+The gate window is matched to `tra1648_soak_check.mjs`, so the wrapper and the
+acceptance grader agree with no DST drift. A raw `POST /v1/services/…/deploys` curl
+still bypasses it — so the wrapper is the *documented, enforced* path; do not
+hand-roll the curl during the soak. This rule lifts together with the launch-window
+freeze at go-live sign-off (TRA-1648).
+
 ### Standard deploy (self-hosted PM2)
 
 1. On the production machine, sync the target commit — deploys track `main`:
