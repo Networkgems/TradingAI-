@@ -17,7 +17,7 @@
 import { join } from 'path';
 import { statfs, readFile } from 'fs/promises';
 import { appendJsonLine, LOG_DIR, logger } from './logger.js';
-import { sendOpsAlertEmail } from '../email.js';
+import { sendOpsAlertEmail, isSmtpConfigured } from '../email.js';
 
 export type AlertKey =
   | 'health-check'
@@ -58,6 +58,65 @@ export function getRecentAlerts(): readonly Alert[] {
 export function __resetAlertsForTest(): void {
   lastFiredAt.clear();
   ring.length = 0;
+}
+
+export interface AlertingPosture {
+  /** Whether any PUSH channel (email or webhook) can actually deliver an alert. */
+  pushAlertingConfigured: boolean;
+  /**
+   * When no push channel is configured, alerting still records to the error log,
+   * the on-disk `alerts.jsonl`, and the in-memory ring (readable via
+   * `/api/health/alerts`). This names that fallback so a monitor can tell
+   * "degraded, poll me" from "silently dark".
+   */
+  degradedTo: 'log+ring+poll' | null;
+  channels: {
+    email: { configured: boolean; recipientCount: number };
+    webhook: { configured: boolean };
+  };
+  recent: {
+    total: number;
+    byKey: Partial<Record<AlertKey, number>>;
+    newestTs: string | null;
+    newestKey: AlertKey | null;
+  };
+}
+
+/**
+ * TRA-2136 — the alerting POSTURE: which push channels are wired and a count-only
+ * summary of the recent alert ring. Exposed no-auth at `/api/health/alerting` so
+ * ops can confirm alerting is not silently dark after a deploy — the exact risk
+ * the Render env-var wipe created when SMTP became unrestorable. Counts only, no
+ * alert detail (detail can carry host/path info, which is why `/api/health/alerts`
+ * stays auth-gated).
+ */
+export function getAlertingPosture(): AlertingPosture {
+  const recipientCount = (process.env['ALERT_EMAIL'] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean).length;
+  const emailConfigured = isSmtpConfigured() && recipientCount > 0;
+  const webhookConfigured = Boolean(ALERT_WEBHOOK_URL);
+  const pushAlertingConfigured = emailConfigured || webhookConfigured;
+
+  const byKey: Partial<Record<AlertKey, number>> = {};
+  for (const a of ring) byKey[a.key] = (byKey[a.key] ?? 0) + 1;
+  const newest = ring.at(-1) ?? null;
+
+  return {
+    pushAlertingConfigured,
+    degradedTo: pushAlertingConfigured ? null : 'log+ring+poll',
+    channels: {
+      email: { configured: emailConfigured, recipientCount },
+      webhook: { configured: webhookConfigured },
+    },
+    recent: {
+      total: ring.length,
+      byKey,
+      newestTs: newest?.ts ?? null,
+      newestKey: newest?.key ?? null,
+    },
+  };
 }
 
 async function deliver(alert: Alert): Promise<void> {

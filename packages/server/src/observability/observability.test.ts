@@ -12,6 +12,7 @@ import { TradeAuditTracker, getTradeOpenCount } from './audit.js';
 import {
   __resetAlertsForTest,
   getRecentAlerts,
+  getAlertingPosture,
   dispatchAlert,
   runHealthCheck,
   recordBootAndCheckRestarts,
@@ -130,6 +131,44 @@ describe('alerting', () => {
   it('alerts on an error spike above threshold', () => {
     expect(checkErrorSpike(30, 25)).toBe(true);
     expect(checkErrorSpike(10, 25)).toBe(false);
+  });
+});
+
+// TRA-2136 — alerting posture surfaced no-auth at /api/health/alerting. The
+// SMTP secrets could not be restored after the Render env-var wipe, so this
+// verifies the "no push channel → observable degraded fallback" contract that
+// the fix depends on, rather than a silent hole.
+describe('alerting posture', () => {
+  beforeEach(() => __resetAlertsForTest());
+
+  it('reports the degraded fallback when no push channel is configured', () => {
+    // The server test env carries no SMTP/webhook creds, so push is unconfigured.
+    const p = getAlertingPosture();
+    expect(p.pushAlertingConfigured).toBe(false);
+    expect(p.degradedTo).toBe('log+ring+poll');
+    expect(p.channels.email.configured).toBe(false);
+    expect(p.channels.webhook.configured).toBe(false);
+  });
+
+  it('summarizes the recent ring by key without leaking alert detail', () => {
+    dispatchAlert('health-check', 'critical', 'down', { host: 'secret-host' });
+    dispatchAlert('disk-near-full', 'critical', 'low');
+    const p = getAlertingPosture();
+    expect(p.recent.total).toBe(2);
+    expect(p.recent.byKey['health-check']).toBe(1);
+    expect(p.recent.byKey['disk-near-full']).toBe(1);
+    expect(p.recent.newestKey).toBe('disk-near-full');
+    expect(p.recent.newestTs).toBeTruthy();
+    // Posture is a count-only summary — it must not carry the alert `detail`
+    // (host/path info) that keeps /api/health/alerts auth-gated.
+    expect(JSON.stringify(p)).not.toContain('secret-host');
+  });
+
+  it('reports an empty ring cleanly after reset', () => {
+    const p = getAlertingPosture();
+    expect(p.recent.total).toBe(0);
+    expect(p.recent.newestKey).toBeNull();
+    expect(p.recent.newestTs).toBeNull();
   });
 });
 

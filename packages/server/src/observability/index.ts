@@ -30,6 +30,7 @@ export type { TradeAuditEntry, AuditEngine, AuditStateLike } from './audit.js';
 export {
   dispatchAlert,
   getRecentAlerts,
+  getAlertingPosture,
   runHealthCheck,
   checkDiskSpace,
   recordBootAndCheckRestarts,
@@ -38,7 +39,7 @@ export {
   checkStaleState,
   __resetAlertsForTest,
 } from './alerts.js';
-export type { Alert, AlertKey, AlertSeverity, DiskReading } from './alerts.js';
+export type { Alert, AlertKey, AlertSeverity, DiskReading, AlertingPosture } from './alerts.js';
 
 // TRA-528 — live reliability + observability dashboard.
 export { resolveBuildInfo, computeBuildInfo, interpretGitHead } from './build-info.js';

@@ -396,6 +396,7 @@ import {
   TradeAuditTracker,
   getTradeOpenCount,
   getRecentAlerts,
+  getAlertingPosture,
   getErrorCountSince,
   runHealthCheck,
   checkDiskSpace,
@@ -3291,6 +3292,23 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
 app.get('/api/health/alerts', requireAuth, (_req, res) => {
   res.json({
     alerts: getRecentAlerts(),
+    errorCount15m: getErrorCountSince(),
+    time: new Date().toISOString(),
+  });
+});
+
+// TRA-2136 — no-auth alerting POSTURE. The auth-gated /api/health/alerts above
+// returns full alert detail (which can carry host/path info, hence the gate);
+// this route returns only channel configuration + counts, so ops can confirm
+// alerting is not silently dark after a deploy — including on bqb1, where admin
+// auth is unavailable. Motivated by the PUT /env-vars wipe that left SMTP
+// unrestorable: with no email or webhook push channel, alerts still land in the
+// error log + on-disk alerts.jsonl + in-memory ring, and `degradedTo:
+// 'log+ring+poll'` makes that fallback observable to a polling monitor instead
+// of a silent hole.
+app.get('/api/health/alerting', (_req, res) => {
+  res.json({
+    ...getAlertingPosture(),
     errorCount15m: getErrorCountSince(),
     time: new Date().toISOString(),
   });
