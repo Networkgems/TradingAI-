@@ -27,7 +27,7 @@
 // depth-2 edge the first three miss — the mutation test at depth 2 this board keeps asking for.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, basename } from 'node:path';
 
@@ -226,7 +226,6 @@ function resolveTsSpecifier(fromFile: string, spec: string): string | null {
 
 /** Recursively collect .ts sources, skipping dist/node_modules. */
 function globTs(root: string): string[] {
-  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs');
   const out: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir)) {
