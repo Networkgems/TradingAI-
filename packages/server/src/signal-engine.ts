@@ -3557,14 +3557,22 @@ export class SignalEngine {
         const symbolsToFetch = activeSymbols.filter(
           (sym, idx) => activeInterest.has(sym) || idx % COLD_SCAN_INTERVAL === coldScanShard,
         );
-        for (let i = 0; i < symbolsToFetch.length; i += CANDLE_BATCH) {
-          await Promise.all(
-            symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-          );
-          // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
-          // so this full-universe loop can starve the loop by itself; pace it.
-          if (tickPacer.shouldYield()) await yieldToEventLoop();
-        }
+        // TRA-2171 — name the cold-bar candle fan-out as its own async sub-phase so
+        // its wall-clock is attributed in the phase tape instead of folding into the
+        // coarse `signal.doTick`. `async` kind (includes awaited feed I/O, so it does
+        // NOT poison `lastSlowSyncPhase` — the TRA-2111 split keeps a slow I/O tick
+        // out of the block-attribution pointer). Prime suspected doTick I/O sink at
+        // the ~568-symbol universe; this is what lets us pick the right bound.
+        await withPhase('signal.doTick.cold-bar-scan', async () => {
+          for (let i = 0; i < symbolsToFetch.length; i += CANDLE_BATCH) {
+            await Promise.all(
+              symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
+            );
+            // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
+            // so this full-universe loop can starve the loop by itself; pace it.
+            if (tickPacer.shouldYield()) await yieldToEventLoop();
+          }
+        });
       }
     }
 
@@ -4007,7 +4015,14 @@ export class SignalEngine {
           : activeSymbols.filter(sym => activeInterest.has(sym));
         if (mtfSymbols.length > 0) {
           try {
-            await this.refreshTechnicalSnapshots(mtfSymbols);
+            // TRA-2171 — name the MTF snapshot fan-out (a SECOND Tradier bar consumer,
+            // MTF_MINUTE_BARS=2000 bars/symbol that the 80-bar candle cache can never
+            // satisfy) as its own async sub-phase, distinct from the cold-bar scan, so
+            // the tape resolves WHICH of the two feed consumers dominates the tick.
+            await withPhase(
+              'signal.doTick.mtf-refresh',
+              () => this.refreshTechnicalSnapshots(mtfSymbols),
+            );
           } catch (err: unknown) {
             log.warn('technical snapshot scan threw', {
               component: 'mtf',
