@@ -269,7 +269,20 @@ import { optionsSpendStatus } from './options-spend-store.js';
 import { agentSpendAggregate } from './agent-spend-store.js';
 import { executionCapStatus } from './agent-execution-caps-store.js';
 import { proposalTtlMs } from './proposal-store.js';
-import { initIvRankStore, recordDailyIv, ivRankSync, atmIvFromRows } from './iv-rank-store.js';
+import {
+  initIvRankStore,
+  recordDailyIv,
+  ivRankSync,
+  atmIvFromRows,
+  seedFromArchive,
+} from './iv-rank-store.js';
+// TRA-2206 (TRA-1965) — chain-archive IV-rank reconstruction + the (default-OFF)
+// store seed that makes the TRA-2005 expectancy shadow gradeable on a fresh cohort.
+import {
+  buildIvSeriesFromChains,
+  isIvArchiveSeedEnabled,
+  IV_ARCHIVE_SEED_FLAG,
+} from './iv-rank-archive.js';
 import { initIdeaJournal, listJournalEntries } from './options-idea-journal.js';
 import { initShadowLedger, listShadowSignals } from './shadow-signal-ledger.js';
 import {
@@ -855,6 +868,43 @@ void runMacroRefresh();
 // synchronous `ivRankSync` read used by the AI Options Ideas fusion has data
 // available right after boot. The store is appended to as chains are pulled.
 await initIvRankStore();
+
+// TRA-2206 (TRA-1965) — optionally deepen that store from the recorded chain
+// archive. The store only starts accumulating for a symbol once that symbol
+// first flows through a chain pull, so every idea surfaced during the warm-up
+// window got `ivRank: null` — 81% of bqb1's n=43 resolved cohort. The daily
+// recorder has far deeper history; seeding from it lets `ivRankSync` clear
+// MIN_IV_SAMPLES for symbols whose chains were being recorded all along, which
+// is what makes the TRA-2005 expectancy shadow gradeable on a FRESH cohort
+// (its IV-rank floor is check 3 of 6 and treats unknown as a hard fail).
+//
+// Gated OFF by default and awaited before the first request: unlike the
+// retrospective reconstruction on the decomposition probe (read-only), this
+// changes what the live research prompt sees, so a deploy alone must not arm it.
+// Samples are ADD-ONLY — a live-recorded day is never overwritten — and each
+// archive sample is dated by its own capture day, so no look-ahead is possible.
+if (isIvArchiveSeedEnabled()) {
+  try {
+    // `defaultChainsDir()` (not CHAIN_RECORD_OUT_DIR): that const is declared far
+    // below this boot block, so referencing it here would hit the TDZ. The two
+    // resolve identically — CHAINS_OUT_DIR, else <DATA_DIR>/option-chains.
+    const archiveDays = await loadChainDays(defaultChainsDir());
+    const series = buildIvSeriesFromChains(archiveDays, estimateSpotFromChain);
+    const seeded = await seedFromArchive(series);
+    log.info('IV-rank archive seed applied', {
+      flag: IV_ARCHIVE_SEED_FLAG,
+      partitionDays: archiveDays.length,
+      symbols: series.size,
+      ...seeded,
+    });
+  } catch (err) {
+    // Never fatal: a missing/unreadable archive must not block boot. The store
+    // simply stays at whatever depth it had, and coverage reports the shortfall.
+    log.warn('IV-rank archive seed skipped', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 // TRA-601 (TRA-595 C6) — warm the forward-test idea journal so the report read
 // has the surfaced-idea history available right after boot. The journal is

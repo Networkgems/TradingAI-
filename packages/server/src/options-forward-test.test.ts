@@ -9,12 +9,15 @@ import {
   buildIdeasDecomposition,
   buildAccumulationMonitor,
   renderWeeklyRollupMarkdown,
+  applyIvRankReconstruction,
   structureCostUsd,
   costEfficiencyRatio,
   COST_EFFICIENCY_MAX,
   DEFAULT_COST_MODEL,
   type IdeaOutcome,
 } from './options-forward-test.js';
+import { MAX_IV_STALENESS_DAYS } from './iv-rank-archive.js';
+import { MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
 import { evaluateLiveCapitalGate, LIVE_CAPITAL_GATE } from './live-capital-gate.js';
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -860,5 +863,170 @@ describe('buildIdeasDecomposition', () => {
     // width denominator 0 → excluded from the mean → null.
     const noWidth = buildIdeasDecomposition([mkResolved({ maxProfitUsd: 0, maxLossUsd: 0 })]);
     expect(noWidth.overall.meanCreditWidth).toBeNull();
+  });
+
+  // ── TRA-2206 — IV-rank coverage as a first-class admissibility number ────────
+
+  describe('ivRankCoverage', () => {
+    it('reports coverage over the same resolved-included basis as `n`', () => {
+      const d = buildIdeasDecomposition([
+        mkResolved({ key: 'a', ivRank: 60, ivRankSource: 'journal' }),
+        mkResolved({ key: 'b', ivRank: 30, ivRankSource: 'reconstructed' }),
+        mkResolved({ key: 'c', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'insufficient_history' }),
+        mkResolved({ key: 'd', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'insufficient_history' }),
+        // Excluded / open rows are outside the cohort and outside the coverage.
+        mkResolved({ key: 'e', ivRank: null, excluded: true, excludeReason: 'cost_uneconomic' }),
+        mkResolved({ key: 'f', ivRank: null, status: 'open', win: null }),
+      ]);
+      expect(d.ivRankCoverage.n).toBe(d.n);
+      expect(d.ivRankCoverage.n).toBe(4);
+      expect(d.ivRankCoverage.stamped).toBe(2);
+      expect(d.ivRankCoverage.unknown).toBe(2);
+      expect(d.ivRankCoverage.pct).toBe(50);
+    });
+
+    it('splits stamped rows by provenance so a reconstructed read is never mistaken for a live one', () => {
+      const d = buildIdeasDecomposition([
+        mkResolved({ key: 'a', ivRank: 60, ivRankSource: 'journal' }),
+        mkResolved({ key: 'b', ivRank: 30, ivRankSource: 'reconstructed' }),
+        mkResolved({ key: 'c', ivRank: 45, ivRankSource: 'reconstructed' }),
+      ]);
+      expect(d.ivRankCoverage.fromJournal).toBe(1);
+      expect(d.ivRankCoverage.reconstructed).toBe(2);
+      expect(d.ivRankCoverage.fromJournal + d.ivRankCoverage.reconstructed).toBe(
+        d.ivRankCoverage.stamped,
+      );
+    });
+
+    it('the unknown reasons always sum to `unknown` — nothing is silently dropped', () => {
+      const d = buildIdeasDecomposition([
+        mkResolved({ key: 'a', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'insufficient_history' }),
+        mkResolved({ key: 'b', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'no_archive_coverage' }),
+        mkResolved({ key: 'c', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'stale_iv' }),
+        // A legacy / hand-built outcome that never went through the pass.
+        mkResolved({ key: 'd', ivRank: null }),
+      ]);
+      const reasons = d.ivRankCoverage.unknownReasons;
+      expect(reasons).toEqual({
+        insufficient_history: 1,
+        no_archive_coverage: 1,
+        stale_iv: 1,
+        not_evaluated: 1,
+      });
+      const total = Object.values(reasons).reduce((a, b) => a + b, 0);
+      expect(total).toBe(d.ivRankCoverage.unknown);
+    });
+
+    it('reconciles with the byIvRankBucket `unknown` cell', () => {
+      const outcomes = [
+        mkResolved({ key: 'a', ivRank: 60, ivRankSource: 'journal' }),
+        mkResolved({ key: 'b', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'stale_iv' }),
+        mkResolved({ key: 'c', ivRank: null, ivRankSource: 'unknown', ivRankMiss: 'stale_iv' }),
+      ];
+      const d = buildIdeasDecomposition(outcomes);
+      const unknownCell = d.byIvRankBucket.find((c) => c.key === 'unknown');
+      expect(unknownCell?.n).toBe(d.ivRankCoverage.unknown);
+    });
+
+    it('pct is null-never-0 on an empty cohort, and 100 when fully covered', () => {
+      expect(buildIdeasDecomposition([]).ivRankCoverage.pct).toBeNull();
+      expect(buildIdeasDecomposition([]).ivRankCoverage.stamped).toBe(0);
+      const full = buildIdeasDecomposition([mkResolved({ ivRank: 60, ivRankSource: 'journal' })]);
+      expect(full.ivRankCoverage.pct).toBe(100);
+    });
+
+    it('states the reconstruction method and the floors it was computed under', () => {
+      const c = buildIdeasDecomposition([mkResolved()]).ivRankCoverage;
+      expect(c.minSamples).toBe(MIN_IV_SAMPLES);
+      expect(c.maxStalenessDays).toBe(MAX_IV_STALENESS_DAYS);
+      expect(c.method).toMatch(/NO LOOK-AHEAD/);
+      expect(c.method).toMatch(/day <= surfacedDate/);
+    });
+  });
+});
+
+// ── TRA-2206 — the reconstruction pass over already-valued outcomes ────────────
+
+describe('applyIvRankReconstruction', () => {
+  function mk(over: Partial<IdeaOutcome> = {}): IdeaOutcome {
+    return {
+      key: 'k',
+      ticker: 'AAA',
+      strategy: 'bull_put',
+      surfacedDate: '2026-01-24',
+      surfacedWeek: '2026-W04',
+      expiration: '2026-02-20',
+      pop: 0.7,
+      dte: 30,
+      ivRank: null,
+      maxLossUsd: 300,
+      maxProfitUsd: 200,
+      entryNetUsd: 200,
+      status: 'resolved',
+      valuedAt: '2026-02-20',
+      liquidationUsd: 0,
+      pnlUsd: 30,
+      pnlR: 0.1,
+      costsUsd: 6,
+      pnlNetUsd: 24,
+      pnlNetR: 0.08,
+      costEfficiencyRatio: 0.02,
+      win: true,
+      excluded: false,
+      excludeReason: null,
+      settleLagDays: 0,
+      maxLossBreached: false,
+      ...over,
+    };
+  }
+
+  /** 30 ascending days of IV from 2026-01-05, keyed to ticker AAA. */
+  const series = new Map<string, IvSample[]>([
+    [
+      'AAA',
+      Array.from({ length: 30 }, (_, i) => ({
+        day: new Date(Date.UTC(2026, 0, 5) + i * 86_400_000).toISOString().slice(0, 10),
+        iv: 0.2 + i * 0.01,
+      })),
+    ],
+  ]);
+
+  it('back-fills a null IV-rank from the archive and marks it reconstructed', () => {
+    const [o] = applyIvRankReconstruction([mk()], series);
+    expect(o?.ivRank).toBe(100); // rising series ⇒ surface day is the window max
+    expect(o?.ivRankSource).toBe('reconstructed');
+    expect(o?.ivRankMiss).toBeNull();
+  });
+
+  it('NEVER overwrites a live journal stamp — it can only add coverage', () => {
+    const [o] = applyIvRankReconstruction([mk({ ivRank: 42 })], series);
+    expect(o?.ivRank).toBe(42);
+    expect(o?.ivRankSource).toBe('journal');
+  });
+
+  it('leaves a row honestly unknown, with a reason, when the archive cannot support a rank', () => {
+    const [o] = applyIvRankReconstruction([mk({ ticker: 'ZZZ' })], series);
+    expect(o?.ivRank).toBeNull();
+    expect(o?.ivRankSource).toBe('unknown');
+    expect(o?.ivRankMiss).toBe('no_archive_coverage');
+  });
+
+  it('is unaffected by archive samples dated after the surface date (no look-ahead)', () => {
+    const withFuture = new Map<string, IvSample[]>([
+      ['AAA', [...(series.get('AAA') as IvSample[]), { day: '2026-06-01', iv: 9 }]],
+    ]);
+    expect(applyIvRankReconstruction([mk()], withFuture)).toEqual(
+      applyIvRankReconstruction([mk()], series),
+    );
+  });
+
+  it('preserves every other valuation field untouched', () => {
+    const before = mk();
+    const [after] = applyIvRankReconstruction([before], series);
+    expect({ ...after, ivRank: null, ivRankSource: undefined, ivRankMiss: undefined }).toEqual({
+      ...before,
+      ivRankSource: undefined,
+      ivRankMiss: undefined,
+    });
   });
 });

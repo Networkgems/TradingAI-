@@ -3,7 +3,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import type { AgentScoreReport } from '@trading-app/backtest';
-import type { ForwardTestReport } from './options-forward-test.js';
+import { buildIvRankCoverage, type ForwardTestReport } from './options-forward-test.js';
 import {
   SCORECARD_MIN_SAMPLE,
   classifySample,
@@ -78,6 +78,9 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
       byDteBucket: [],
       byIvRankBucket: [],
       byTicker: [],
+      // TRA-2206 — build the empty-cohort coverage block rather than inlining it,
+      // so this fixture tracks the shape instead of pinning a stale literal.
+      ivRankCoverage: buildIvRankCoverage([]),
       note: 'test',
     },
     popCalibration: {

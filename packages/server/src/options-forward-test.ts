@@ -20,6 +20,14 @@ import {
   type PopCalibrationConfig,
   type PopCalibrationSummary,
 } from './options-pop-calibration.js';
+import {
+  buildIvSeriesFromChains,
+  reconstructIvRankAt,
+  MAX_IV_STALENESS_DAYS,
+  type IvRankSource,
+  type ReconstructionMiss,
+} from './iv-rank-archive.js';
+import { MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
 
 // TRA-678 (F1) + TRA-1991 — the cost model + cost-efficiency threshold live in a
 // leaf module (`options-cost-model.ts`) to keep them a single source of truth
@@ -112,8 +120,21 @@ export interface IdeaOutcome {
    * TRA-2004 — IV-rank (0–100) at surface time, carried from the journal entry so
    * the decomposition probe can slice by IV-rank bucket. Null/absent when unknown
    * → those land in the `unknown` IV-rank cell.
+   *
+   * TRA-2206 — may ALSO be back-filled from the recorded chain archive when the
+   * journal stamp is null (the trailing-IV store was still cold at surface time).
+   * The reconstruction is backward-only; see {@link ivRankSource} for provenance.
    */
   ivRank?: number | null;
+  /**
+   * TRA-2206 — provenance of {@link ivRank}: `journal` (stamped live at surface
+   * time), `reconstructed` (re-derived from chain partitions dated at/before the
+   * surface date — no look-ahead), or `unknown` (neither available). Present only
+   * once the reconstruction pass has run; absent on hand-built fixtures.
+   */
+  ivRankSource?: IvRankSource;
+  /** TRA-2206 — why reconstruction produced nothing. Set only when `ivRankSource === 'unknown'`. */
+  ivRankMiss?: ReconstructionMiss | null;
   status: IdeaStatus;
   /** ET date of the chain snapshot used to value the idea (null when unvalued). */
   valuedAt: string | null;
@@ -370,9 +391,46 @@ export function valueIdea(
 }
 
 /**
+ * TRA-2206 — stamp IV-rank provenance on already-valued outcomes, back-filling
+ * `ivRank` from the chain archive wherever the journal stamp is null.
+ *
+ * Pure given `ivSeries`, so the no-look-ahead property is unit-testable in
+ * isolation. Precedence is journal-first: a live stamp is never overwritten by a
+ * reconstruction, so this can only ADD coverage, never revise a recorded value.
+ * A row that cannot be reconstructed keeps `ivRank: null` and carries the reason
+ * — the decomposition's `unknown` bucket stays honest rather than being papered
+ * over with a synthesised number.
+ */
+export function applyIvRankReconstruction(
+  outcomes: readonly IdeaOutcome[],
+  ivSeries: ReadonlyMap<string, readonly IvSample[]>,
+): IdeaOutcome[] {
+  return outcomes.map((o) => {
+    if (o.ivRank != null && Number.isFinite(o.ivRank)) {
+      return { ...o, ivRankSource: 'journal' as const, ivRankMiss: null };
+    }
+    const series = ivSeries.get(o.ticker.toUpperCase()) ?? [];
+    const r = reconstructIvRankAt(series, o.surfacedDate);
+    if (r.ivRank == null) {
+      return { ...o, ivRank: null, ivRankSource: 'unknown' as const, ivRankMiss: r.miss };
+    }
+    return {
+      ...o,
+      ivRank: r2(r.ivRank),
+      ivRankSource: 'reconstructed' as const,
+      ivRankMiss: null,
+    };
+  });
+}
+
+/**
  * Forward-test every journaled idea against the recorded chains under `dataDir`.
  * Loads the chain history once and values each idea. Returns outcomes in journal
  * order.
+ *
+ * TRA-2206 — the same already-loaded `chainDays` also feed the IV-rank
+ * reconstruction pass, so back-filling costs no extra I/O. Read-only: it stamps
+ * a diagnostic field on the returned outcomes and never writes the journal.
  */
 export async function forwardTestIdeas(
   entries: readonly IdeaJournalEntry[],
@@ -384,7 +442,9 @@ export async function forwardTestIdeas(
   if (chainDays.length === 0) {
     log.info('forward-test: no recorded chains found', { dataDir });
   }
-  return entries.map((e) => valueIdea(e, chainDays, asOf, costModel));
+  const valued = entries.map((e) => valueIdea(e, chainDays, asOf, costModel));
+  const ivSeries = buildIvSeriesFromChains(chainDays, estimateSpotFromChain);
+  return applyIvRankReconstruction(valued, ivSeries);
 }
 
 // ── weekly report ───────────────────────────────────────────────────────────
@@ -558,8 +618,92 @@ export interface IdeasDecomposition {
   byIvRankBucket: DecompositionCell[];
   /** By ticker / universe. */
   byTicker: DecompositionCell[];
+  /**
+   * TRA-2206 — first-class IV-rank COVERAGE over the same resolved-and-included
+   * set. `byIvRankBucket` alone shows the `unknown` cell's size but not whether
+   * an IVR-conditioned read is ADMISSIBLE; this is that admissibility number.
+   */
+  ivRankCoverage: IvRankCoverage;
   /** Methodology + reconciliation note. */
   note: string;
+}
+
+/**
+ * TRA-2206 — how much of the resolved cohort carries a usable IV-rank, split by
+ * provenance and, for the remainder, by the reason it could not be obtained.
+ *
+ * Read this BEFORE reading any IVR-conditioned cell. At `pct` well below 100 the
+ * IV-rank slices describe a minority sub-cohort, and — because the TRA-2005
+ * expectancy gate treats an unknown IV-rank as a hard fail at check 3 of 6 — the
+ * missing rows are exactly the ones whose expectancy was never evaluated. A
+ * shadow-ledger drop-rate read against low coverage measures data completeness,
+ * not edge.
+ */
+export interface IvRankCoverage {
+  /** Resolved, non-excluded ideas the coverage is computed over (= `IdeasDecomposition.n`). */
+  n: number;
+  /** Rows carrying a usable IV-rank from either source. */
+  stamped: number;
+  /** Rows with no usable IV-rank — the `unknown` bucket. */
+  unknown: number;
+  /** `stamped / n` as a 0–100 percentage, rounded to 2dp. Null when `n === 0`. */
+  pct: number | null;
+  /** Of `stamped`, how many were stamped live at surface time by `ivRankSync`. */
+  fromJournal: number;
+  /** Of `stamped`, how many were back-filled from the chain archive (no look-ahead). */
+  reconstructed: number;
+  /** Of `unknown`, a count per reason the backward-only reconstruction produced nothing. */
+  unknownReasons: Record<string, number>;
+  /** The sample floor a trailing window must clear before any rank is emitted. */
+  minSamples: number;
+  /** Max calendar-day gap allowed between surface date and the IV read used. */
+  maxStalenessDays: number;
+  /** Method statement — how the back-filled values were obtained, and why they are sound. */
+  method: string;
+}
+
+const IV_RANK_METHOD_NOTE =
+  'TRA-2206. `journal` rows carry the IV-rank `ivRankSync` stamped live at surface time. ' +
+  '`reconstructed` rows were RE-DERIVED, not synthesised: for each idea we take the ' +
+  'at-the-money IV of every recorded option-chain partition (the daily recorder writes ' +
+  '<DATA_DIR>/option-chains/<ET-DATE>/<SYMBOL>.json, each stamped with its OWN capture date), ' +
+  'filter that series to `day <= surfacedDate`, and rank the newest surviving sample against ' +
+  'the trailing 366d of the same backward-only window. Because the filter precedes every ' +
+  'computation and each sample is dated by its capture day, a reconstructed rank uses only ' +
+  'information available at surface time — NO LOOK-AHEAD. The floor (>= minSamples in-window, ' +
+  'non-flat range) and the trailing window are identical to the live `ivRankSync` path, so a ' +
+  'reconstructed value is the SAME statistic, not a differently-scoped proxy. Where the ' +
+  'backward window cannot support a rank the row stays `unknown` with a reason — a ' +
+  'look-ahead-contaminated IV-rank would be strictly worse than a null, because it would ' +
+  'silently poison every IVR-conditioned grade downstream. Journal stamps are never overwritten.';
+
+/** Build the coverage block from resolved, non-excluded outcomes. Pure. */
+export function buildIvRankCoverage(resolved: readonly IdeaOutcome[]): IvRankCoverage {
+  const n = resolved.length;
+  const has = (o: IdeaOutcome): boolean => o.ivRank != null && Number.isFinite(o.ivRank);
+  const stamped = resolved.filter(has).length;
+  const fromJournal = resolved.filter((o) => has(o) && o.ivRankSource === 'journal').length;
+  const reconstructed = resolved.filter((o) => has(o) && o.ivRankSource === 'reconstructed').length;
+  const unknownReasons: Record<string, number> = {};
+  for (const o of resolved) {
+    if (has(o)) continue;
+    // A hand-built fixture / pre-TRA-2206 outcome carries no miss reason; label it
+    // rather than dropping it, so the reasons always sum to `unknown`.
+    const reason = o.ivRankMiss ?? 'not_evaluated';
+    unknownReasons[reason] = (unknownReasons[reason] ?? 0) + 1;
+  }
+  return {
+    n,
+    stamped,
+    unknown: n - stamped,
+    pct: n ? r2((stamped / n) * 100) : null,
+    fromJournal,
+    reconstructed,
+    unknownReasons,
+    minSamples: MIN_IV_SAMPLES,
+    maxStalenessDays: MAX_IV_STALENESS_DAYS,
+    method: IV_RANK_METHOD_NOTE,
+  };
 }
 
 /** Fixed display order for the DTE buckets (unknown last). */
@@ -648,6 +792,9 @@ const DECOMPOSITION_NOTE =
   'Slices are 1-D marginals (structure / DTE / IV-rank / ticker), NOT the full cross-product, ' +
   'so each cell stays large enough to read at current sample sizes. popCalibrationGap < 0 means ' +
   'stated POP over-promised vs realized hit-rate. Null-never-0: an empty statistic is null, not 0. ' +
+  'TRA-2206: read `ivRankCoverage` BEFORE `byIvRankBucket` — at low coverage the IV-rank cells ' +
+  'describe a minority sub-cohort, and the missing rows are exactly the ones the TRA-2005 ' +
+  'expectancy gate hard-fails at check 3 of 6 without ever evaluating their expectancy. ' +
   'Read-only; wires no capital.';
 
 /**
@@ -672,6 +819,7 @@ export function buildIdeasDecomposition(
       IVR_BUCKET_ORDER,
     ),
     byTicker: alphaCells(groupOutcomes(resolved, (o) => o.ticker)),
+    ivRankCoverage: buildIvRankCoverage(resolved),
     note: DECOMPOSITION_NOTE,
   };
 }

@@ -144,6 +144,82 @@ export async function recordDailyIv(
 }
 
 /**
+ * TRA-2206 — merge archive-derived samples into a store map, adding ONLY days the
+ * store has no sample for. Pure (exported for tests); {@link seedFromArchive}
+ * wraps it with load/persist.
+ *
+ * Add-only, never overwrite, is the load-bearing rule. The live recorder keys a
+ * sample by UTC day ({@link recordDailyIv}) while the chain archive is
+ * partitioned by ET date, so the two can disagree by up to one day at a
+ * boundary. Refusing to overwrite means a live-recorded sample always wins and
+ * the seed can only fill genuine holes; the residual risk is at most one extra
+ * sample near a boundary, which is immaterial to a min/max range statistic over
+ * a 20+ sample window and can never displace a real observation.
+ */
+export function mergeMissingDays(
+  existing: ReadonlyMap<string, readonly IvSample[]>,
+  archived: ReadonlyMap<string, readonly IvSample[]>,
+): { merged: Map<string, IvSample[]>; samplesAdded: number; symbolsTouched: number } {
+  const merged = new Map<string, IvSample[]>();
+  for (const [sym, samples] of existing) merged.set(sym, [...samples]);
+  let samplesAdded = 0;
+  let symbolsTouched = 0;
+  for (const [rawSym, samples] of archived) {
+    const sym = rawSym.toUpperCase();
+    const current = merged.get(sym) ?? [];
+    const haveDays = new Set(current.map((s) => s.day));
+    const additions = samples.filter(
+      (s) => !haveDays.has(s.day) && Number.isFinite(s.iv) && s.iv > 0,
+    );
+    if (additions.length === 0) continue;
+    const next = [...current, ...additions].sort((a, b) => a.day.localeCompare(b.day));
+    merged.set(sym, next.slice(-MAX_SAMPLES));
+    samplesAdded += additions.length;
+    symbolsTouched++;
+  }
+  return { merged, samplesAdded, symbolsTouched };
+}
+
+/**
+ * TRA-2206 — seed the trailing-IV store from archive-derived samples and persist.
+ *
+ * Why this exists: the store only starts accumulating when a symbol first flows
+ * through a chain pull, so every idea surfaced during the warm-up window was
+ * stamped `ivRank: null` — 81% of the TRA-2000 resolved cohort on bqb1. The
+ * daily chain recorder has far deeper history than the store; this backfills the
+ * store from it so `ivRankSync` clears {@link MIN_IV_SAMPLES} for symbols whose
+ * chains were recorded all along.
+ *
+ * NOT read-only: a previously-null `ivRank` becoming a number is visible to the
+ * research prompt and the (separately flag-gated) wheel IV entry filter. The
+ * caller must therefore gate this on `ENABLE_IV_RANK_ARCHIVE_SEED`; it is off by
+ * default so a deploy alone changes nothing.
+ */
+export async function seedFromArchive(
+  archived: ReadonlyMap<string, readonly IvSample[]>,
+): Promise<{ samplesAdded: number; symbolsTouched: number }> {
+  const map = await ensureLoaded();
+  const { merged, samplesAdded, symbolsTouched } = mergeMissingDays(map, archived);
+  if (samplesAdded === 0) return { samplesAdded: 0, symbolsTouched: 0 };
+  cache = merged;
+  await persist();
+  log.info('IV store seeded from chain archive', { samplesAdded, symbolsTouched });
+  return { samplesAdded, symbolsTouched };
+}
+
+/**
+ * TRA-2206 — in-window sample depth for `symbol`, the diagnostic that separates
+ * "the store is cold, coverage will self-heal" from "no usable IV in the chains,
+ * it never will". Returns 0 when the cache is unloaded or the symbol is unknown.
+ */
+export function ivSampleDepthSync(symbol: string, asOf: number = Date.now()): number {
+  if (!cache) return 0;
+  const samples = cache.get(symbol.trim().toUpperCase());
+  if (!samples) return 0;
+  return windowFor(samples, asOf).length;
+}
+
+/**
  * Compute the IV-rank of `currentIv` against a trailing sample window. Returns
  * `null` (honest unknown) when there are fewer than {@link MIN_IV_SAMPLES} or the
  * window is flat (max === min). Pure — exported for tests.
