@@ -82,6 +82,8 @@ import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
+// TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
+import { beginRvScan } from './rv-scan-telemetry.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
 import {
   DEFAULT_WHEEL_GUARDS,
@@ -851,6 +853,19 @@ const IV_RV_RESERVED_CAP_SLOTS = 2;
 // mode); the OTM-mispricing engine below is re-armed in its place. Existing RV
 // positions still get marks via refreshOptionMarks() and exit normally.
 const RV_ENGINE_ENABLED: boolean = false;
+
+/**
+ * TRA-2193 — read the RV kill switch from outside this module.
+ *
+ * `/api/health/rv-scan` has to say whether the RV entry path is ARMED, and this
+ * arm is a compile-time constant rather than an env flag — so unlike every other
+ * option sleeve it cannot be read off `process.env` by a health route. Without
+ * this accessor the route would have to hardcode a duplicate of the value, which
+ * is exactly the kind of second copy that drifts and then lies.
+ */
+export function isRvEngineEnabled(): boolean {
+  return RV_ENGINE_ENABLED;
+}
 
 // TRA-1207 — master on/off switch for the OTM-mispricing options engine (the
 // original TRA-158/TRA-159 strategy: long-only far-OTM contracts trading cheap
@@ -5193,6 +5208,13 @@ export class SignalEngine {
       ? { minDailyVolume: resolveRvMinDailyVolume() }
       : undefined;
 
+    // TRA-2193 — instrumented even though `RV_ENGINE_ENABLED` has held this path
+    // shut since TRA-1207 (2026-06-30). That is the point: the day the board
+    // re-arms it, the very first tick has to be able to PROVE it fired, instead
+    // of leaving us to infer liveness from journal rows that three other sleeves
+    // also write (TRA-1682).
+    const scanRun = beginRvScan('rv_scan', activeSymbols.length);
+
     for (const sym of activeSymbols) {
       // TRA-1231 — leave cap headroom for the iv-rv routing pass (runs last in
       // the demo tick, shares this cap). Only bites when routing is enabled on
@@ -5201,10 +5223,21 @@ export class SignalEngine {
         this.mode === 'demo'
         && isOptionIvRvRoutingEnabled()
         && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
-      ) break;
+      ) {
+        // TRA-2193 — name the early break. Otherwise `universeSize` exceeds
+        // `candidatesEvaluated` with no stated cause, which is indistinguishable
+        // from the loop dying part-way through.
+        scanRun.stopEarly('iv_rv_cap_headroom');
+        break;
+      }
+      scanRun.enterSymbol();
       try {
         const result = await this.rvScanner.scan(sym, scanOpts, dtePrefs);
-        if (result.reason !== 'ok' || result.candidates.length === 0) continue;
+        if (result.reason === 'ok') scanRun.fetchOk();
+        if (result.reason !== 'ok' || result.candidates.length === 0) {
+          scanRun.reject(result.reason !== 'ok' ? `scan:${result.reason}` : 'no_candidates');
+          continue;
+        }
 
         // TRA-968 — gate the single-leg long on the daily-trend confluence and
         // a directional delta target (swing spec). The bare scanner ranks
@@ -5242,7 +5275,7 @@ export class SignalEngine {
           dteEntryMin: dteOverride.min,
           dteEntryMax: dteOverride.max,
         });
-        if (!cheap) continue;
+        if (!cheap) { scanRun.reject('no_trend_aligned_candidate'); continue; }
 
         // TRA-1028 item 1 — EMA-pullback (Trend-Pullback) entry archetype. When
         // the sub-flag is on (exec flag must also be on), the bare RV long
@@ -5253,9 +5286,11 @@ export class SignalEngine {
         // is unchanged; recorded via the signal reason for the ledger readout.
         let emaPullbackReason: string | null = null;
         if (isOptionEmaPullbackEnabled()) {
-          if (!trendSeries || trendSeries.length === 0 || trendSide == null) continue;
+          if (!trendSeries || trendSeries.length === 0 || trendSide == null) {
+            scanRun.reject('ema_pullback_no_series'); continue;
+          }
           const pullback = emaPullbackTrigger(trendSeries, trendSide);
-          if (!pullback.fired) continue;
+          if (!pullback.fired) { scanRun.reject('ema_pullback_not_fired'); continue; }
           emaPullbackReason = pullback.reason;
           log.info('RV long admitted by EMA-pullback archetype (TRA-1028)', {
             sym,
@@ -5413,6 +5448,7 @@ export class SignalEngine {
                 }
               }
             }
+            scanRun.reject('ivr_ceiling');
             continue; // Always skip the bare long when IVR > 25
           }
 
@@ -5421,6 +5457,7 @@ export class SignalEngine {
           // earnings event (vol crush + thesis-break risk).
           const earningsDays = earningsInDaysSync(sym, asOf);
           if (earningsDays != null && earningsDays >= 0 && earningsDays <= cheap.daysToExpiration) {
+            scanRun.reject('earnings_before_expiry');
             continue;
           }
         }
@@ -5477,6 +5514,7 @@ export class SignalEngine {
         if (rvCostReject) {
           signal.signalSkipReason = rvCostReject;
           log.info('RV long rejected by cost-aware fire bar (TRA-1602)', { sym, reason: rvCostReject });
+          scanRun.reject('cost_aware_bar');
           continue;
         }
 
@@ -5491,6 +5529,7 @@ export class SignalEngine {
           log.info('RV long rejected by entry-delta ceiling (TRA-1670)', {
             sym, delta: cheap.delta, reason: rvDeltaCeiling,
           });
+          scanRun.reject('entry_delta_ceiling');
           continue;
         }
 
@@ -5501,7 +5540,7 @@ export class SignalEngine {
             && (s as RelativeValueSignal).optionSymbol === cheap.optionSymbol
             && Date.now() - s.timestamp < 60 * 60_000,
         );
-        if (recentDup) continue;
+        if (recentDup) { scanRun.reject('recent_duplicate'); continue; }
 
         // TRA-332 — surface a signal whose live mirror was suppressed instead
         // of skipping silently. Reuses the `liveSkipReason` field (TRA-243)
@@ -5786,9 +5825,13 @@ export class SignalEngine {
           signal.signalSkipReason =
             'RV single-leg long live path dark (ENABLE_OPTION_LIVE_RV_LONG off or bounded-test window closed) — build shipped, capital arm gated on board approval (TRA-1491/TRA-1929)';
           log.info('RV long live entry suppressed — dark flag off / window closed (TRA-1491/TRA-1929)', { sym });
+          scanRun.reject('live_arm_dark');
           continue;
         }
 
+        // TRA-2193 — see the directional path: counted before the account can
+        // refuse, so scanner rejections and account refusals stay separable.
+        scanRun.pass();
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
@@ -5824,6 +5867,7 @@ export class SignalEngine {
 
         // TRA-563 — option open is confirmed here (every void/rollback path
         // above `continue`d), so emit the fill alert for the opened contract.
+        scanRun.opened(); // TRA-2193 — final, post-rollback open count
         this.emitOptionFillAlert(opened);
         // TRA-231 — stamp the active mode so the Signals panel scopes the
         // entry per-mode. RV runs in both demo and live (TRA-220 fix).
@@ -5837,9 +5881,13 @@ export class SignalEngine {
           firedAt: signal.timestamp,
         });
       } catch (err: unknown) {
-        log.warn('RV scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warn('RV scan failed', { sym, reason });
+        scanRun.reject('scan_error'); // TRA-2193 — a swallowed throw is a tagged drop, not a silent one
+        scanRun.fetchError(`${sym}: ${reason}`);
       }
     }
+    scanRun.finish();
   }
 
   /**
@@ -7016,23 +7064,38 @@ export class SignalEngine {
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
 
+    // TRA-2193 — this is the path that actually feeds the journal's
+    // `single_leg_rv` bucket (the gated RV scan is compile-time OFF since
+    // TRA-1207), so it is the one whose silence had to become legible. The run is
+    // opened AFTER the flag gate above on purpose: a disarmed path must record no
+    // scan at all, leaving `lastScanAt: null` — "never ran" — rather than a
+    // zero-count scan that would read as "ran, found nothing".
+    const scanRun = beginRvScan('directional', symbols.length);
+
     for (const sym of symbols) {
+      // Count the INPUT. Incremented before the try/continue chain so an
+      // all-`continue` pass reports the symbols it CONSIDERED, not zero.
+      scanRun.enterSymbol();
       try {
         // Trend from the SAME confluence stack the RV-long + shadow selectors
         // read, off the cached 5m shadow series. No confluence (range / cold
         // series) → stand down rather than open a trend-blind long.
         const series = this.shadowCandleCache.get(sym);
-        if (!series || series.length === 0) continue;
+        if (!series || series.length === 0) { scanRun.reject('no_shadow_series'); continue; }
         const decision = confluenceSide(series);
         const wantType: OptionType | null =
           decision?.side === 'buy' ? 'call' : decision?.side === 'sell' ? 'put' : null;
-        if (wantType === null) continue;
+        if (wantType === null) { scanRun.reject('no_trend_confluence'); continue; }
 
         // Live chain (rides the scanner's warm 60s cache). Picks the nearest-
         // the-money liquid contract of the wanted type: a two-sided quote and a
         // positive mid, preferring real open interest so the fill is realistic.
         const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
-        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
+        if (!snap || !(snap.spot > 0) || snap.rows.length === 0) { scanRun.reject('no_chain'); continue; }
+        // TRA-2193 — a usable chain came back, so the market-data leg is healthy
+        // as of now. This is what lets `dataSource.lastFetchOkAt` separate a dead
+        // feed from a quiet tape.
+        scanRun.fetchOk();
         const { spot, expiration, rows } = snap;
 
         let best: { row: OptionChainRow; mark: number } | null = null;
@@ -7047,7 +7110,7 @@ export class SignalEngine {
             best = { row: r, mark: mid };
           }
         }
-        if (best === null) continue;
+        if (best === null) { scanRun.reject('no_liquid_contract'); continue; }
 
         // TRA-1476 (parent TRA-1471) — liquidity/quality + per-name churn gate on
         // the directional "ignition" entry. This path stacked AMPG (a thin sub-$5
@@ -7094,6 +7157,11 @@ export class SignalEngine {
             if (verdict.code !== 'ok') {
               recordDirectionalGateReject(verdict.code, etDateString(new Date(asOf)), asOf);
             }
+            // TRA-2193 — carry the gate's own reject CODE into the bucket key
+            // rather than collapsing to a single `quality_gate` tally: which of
+            // the sub-thresholds is biting is the difference between a thin tape
+            // and a mis-set floor.
+            scanRun.reject(`quality_gate:${verdict.code}`);
             continue;
           }
         }
@@ -7113,6 +7181,7 @@ export class SignalEngine {
           log.info('demo directional rejected by churn brake (TRA-1408)', {
             symbol: sym, count: dirChurnCap.count, cap: dirChurnCap.cap,
           });
+          scanRun.reject('churn_brake');
           continue;
         }
 
@@ -7198,6 +7267,7 @@ export class SignalEngine {
           log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
             symbol: sym, reason: dirCostReject,
           });
+          scanRun.reject('cost_aware_bar');
           continue;
         }
 
@@ -7208,6 +7278,7 @@ export class SignalEngine {
           log.info('demo directional rejected by entry-delta ceiling (TRA-1670)', {
             symbol: sym, delta: signal.delta, reason: dirDeltaCeiling,
           });
+          scanRun.reject('entry_delta_ceiling');
           continue;
         }
 
@@ -7218,7 +7289,7 @@ export class SignalEngine {
             && (s as RelativeValueSignal).optionSymbol === signal.optionSymbol
             && asOf - s.timestamp < 60 * 60_000,
         );
-        if (recentDup) continue;
+        if (recentDup) { scanRun.reject('recent_duplicate'); continue; }
 
         // TRA-1123 — journal the directional single-leg open (observe-only,
         // behind ENABLE_OPTION_TRADE_JOURNAL). This is the ONLY single-leg demo
@@ -7289,6 +7360,11 @@ export class SignalEngine {
         // Open on the active book. Demo: no equity override → no Tradier mirror
         // (byte-for-byte TRA-1114). Live (armed): sizes off `liveEquity` and the
         // paper open is mirrored to a real `buy_to_open` just below.
+        // TRA-2193 — every gate cleared; this symbol is a genuine candidate. Counted
+        // HERE, before the account can refuse it, so `candidatesPassed - opensPlaced`
+        // isolates account-level refusals (daily cap, sizing, trading window) from
+        // scanner-level rejections, which live in `rejectionsByGate`.
+        scanRun.pass();
         const opened = this.optionsAccount.openOptionFromRvCandidate(
           signal,
           this.mode,
@@ -7325,6 +7401,10 @@ export class SignalEngine {
           if (!mirrored) continue;
         }
 
+        // TRA-2193 — counted only once the open is FINAL. A failed broker mirror
+        // rolls the paper open back, so booking it at `openOptionFromRvCandidate`
+        // would report opens the book does not hold.
+        scanRun.opened();
         this.emitOptionFillAlert(opened);
         signal.mode = this.mode;
         this.recentSignals.unshift(signal);
@@ -7345,12 +7425,17 @@ export class SignalEngine {
           mark: signal.mark,
         });
       } catch (err: unknown) {
-        log.warn('demo directional eval threw', {
-          symbol: sym,
-          reason: err instanceof Error ? err.message : String(err),
-        });
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warn('demo directional eval threw', { symbol: sym, reason });
+        // TRA-2193 — a swallowed per-symbol throw is exactly the silent drop the
+        // bucket-sum invariant exists to expose. Tag it and record it as a feed
+        // error, so a systematically failing chain reads as an OUTAGE here rather
+        // than as an empty scan.
+        scanRun.reject('scan_error');
+        scanRun.fetchError(`${sym}: ${reason}`);
       }
     }
+    scanRun.finish();
   }
 
   /**

@@ -53,6 +53,7 @@ import {
   __resetEquityEntryFunnelForTests,
   type EquityEntryFunnelBlock,
 } from '../equity-entry-funnel.js';
+import { beginRvScan, __resetRvScanTelemetry } from '../rv-scan-telemetry.js'; // TRA-2193
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
@@ -2024,5 +2025,322 @@ describe('GET /api/health/equity-entry-funnel — symbol layer (TRA-1793)', () =
     // The read guidance the ticket asked for ships WITH the reading, not only in the ticket.
     expect(body.bucketOrderNote).toContain('first-match-wins');
     expect(body.symbolNamesNote).toContain('symbolsSkippedSymbols');
+  });
+});
+
+// TRA-2193 — GET /api/health/rv-scan.
+//
+// The acceptance criterion is not "the route exists" but "the route can tell an
+// outage from a drought", so these assert the SEPARATION, not the shape.
+describe('TRA-2193 GET /api/health/rv-scan', () => {
+  function mountRvScan(env: Record<string, string | undefined> = {}) {
+    const saved: Record<string, string | undefined> = {};
+    for (const k of Object.keys(env)) {
+      saved[k] = process.env[k];
+      if (env[k] === undefined) delete process.env[k];
+      else process.env[k] = env[k];
+    }
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/rv-scan')!;
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    return { handlers, body: res.body as Record<string, never> };
+  }
+
+  beforeEach(() => {
+    __resetRvScanTelemetry();
+  });
+
+  it('is unauthenticated, matching the rest of the public /api/health/* posture', () => {
+    const { handlers } = mountRvScan();
+    expect(handlers).toHaveLength(1);
+  });
+
+  it('reports the DISARMED state as its own verdict — silence is correct, not a fault', () => {
+    // This is the 2026-07-22 state: the flag was wiped, so the loop never ran.
+    // Before this route there was no name for it.
+    const { body } = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: undefined });
+    expect(body.verdict).toBe('disarmed');
+    expect(body.enabled).toBe(false);
+    // NULL, not 0. A 0 here is a valid epoch and would survive a finite-check on
+    // the consumer side while asserting a scan that never happened.
+    expect(body.lastScanAt).toBeNull();
+    const dir = (body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'directional')!;
+    expect(dir.enabled).toBe(false);
+    expect(dir.lastScan).toBeNull();
+  });
+
+  it('PROOF OF FIRE: after one real scan the route reports a non-null lastScanAt and non-zero candidatesEvaluated', () => {
+    const run = beginRvScan('directional', 3, () => NOW);
+    run.enterSymbol(); run.reject('no_trend_confluence');
+    run.enterSymbol(); run.pass(); run.opened();
+    run.enterSymbol(); run.reject('churn_brake');
+    run.fetchOk();
+    run.finish();
+
+    const { body } = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: '1' });
+    expect(body.verdict).toBe('scanning');
+    expect(body.enabled).toBe(true);
+    expect(body.lastScanAt).toBe(NOW);
+    expect(body.scanCountSinceBoot).toBe(1);
+
+    const dir = (body.paths as unknown as Array<Record<string, never>>)
+      .find((p) => (p as Record<string, unknown>).path === 'directional')!;
+    const last = dir.lastScan as unknown as Record<string, number>;
+    expect(last.candidatesEvaluated).toBe(3);
+    expect(last.opensPlaced).toBe(1);
+    // The invariant, asserted on the wire and not only in the store.
+    expect(
+      Object.values(last.rejectionsByGate as unknown as Record<string, number>)
+        .reduce((a, b) => a + b, 0),
+    ).toBe(last.candidatesEvaluated - last.candidatesPassed);
+    expect(dir.lastScan!['bucketsBalance']).toBe(true);
+    expect((body.dataSource as unknown as Record<string, unknown>).lastFetchOkAt).toBe(NOW);
+  });
+
+  it('separates ARMED-BUT-NEVER-RAN from DISARMED — the two an operator must not confuse', () => {
+    const armed = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: '1' }).body;
+    const disarmed = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: undefined }).body;
+
+    // Both have zero opens and a null lastScanAt. Only `verdict` tells them apart,
+    // and they demand opposite remedies: restore a wiped env var vs. investigate a
+    // scanner that is armed and not ticking.
+    expect(armed.lastScanAt).toBeNull();
+    expect(disarmed.lastScanAt).toBeNull();
+    expect(armed.verdict).toBe('armed_but_never_ran');
+    expect(disarmed.verdict).toBe('disarmed');
+  });
+
+  it('reports the UN-INSTRUMENTED iv-rv path with null counters, never zeros', () => {
+    const { body } = mountRvScan();
+    const ivrv = (body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'iv_rv_buy_premium')!;
+    expect(ivrv.instrumented).toBe(false);
+    // 0 would claim a measurement this iteration does not take.
+    expect(ivrv.scanCountSinceBoot).toBeNull();
+    expect(ivrv.lastScanAt).toBeNull();
+  });
+
+  it('carries the structure-vs-sleeve warning in the PAYLOAD, not only in the ticket', () => {
+    const { body } = mountRvScan();
+    expect(body.structureLabel).toBe('single_leg_rv');
+    // `single_leg_rv` is shared by every caller of openOptionFromRvCandidate
+    // (TRA-1682). A reader who does not know that grades the wrong population,
+    // and a fact that only reaches a ticket does not exist downstream.
+    expect(String(body.note)).toContain('entryArchetype');
+    expect(String(body.note)).toContain('not a sleeve');
+    // All three producer paths are enumerated, so none can go quiet unnoticed.
+    expect((body.paths as unknown as unknown[]).length).toBe(3);
+  });
+});
+
+// TRA-2193 item 3 — fixture-vs-desk partition on the option-journal summary.
+//
+// Reproduces the 2026-07-22 session exactly: one real desk trade plus the SAME
+// SMCI trail exit mirrored into three QA fixture books. The mirrored rows carry
+// DISTINCT ids, so id-dedupe finds nothing and the pooled number reads as clean.
+describe('TRA-2193 option-journal fixture-vs-desk partition', () => {
+  function row(
+    id: string,
+    account: string | undefined,
+    pnl: number,
+    r: number,
+  ): OptionTradeJournalRecord {
+    return {
+      id,
+      openTs: NOW - 3_600_000,
+      symbol: 'SMCI',
+      structure: 'single_leg_otm',
+      mode: 'demo',
+      ivRank: null,
+      trend: 'up',
+      sentiment: null,
+      entryDelta: 0.5,
+      entryDte: 20,
+      atRiskUsd: 181.9999999999999,
+      agentConviction: null,
+      outcome: 'WIN',
+      closeTs: NOW,
+      realizedPnlUsd: pnl,
+      realizedR: r,
+      exitReason: 'trail',
+      holdDays: 1,
+      ...(account === undefined ? {} : { account }),
+    } as OptionTradeJournalRecord;
+  }
+
+  // Bit-identical economics, three different fixture books, three different ids.
+  const mirrored = [
+    row('m1', 'qa_mirror_1578_38096', 1600, 8.791),
+    row('m2', 'qa_tra1475_1783821169', 1600, 8.791),
+    row('m3', 'qa_reg_0710202220', 1600, 8.791),
+  ];
+  const desk = row('d1', 'admin', 119.5, 0.1079);
+  const legacy = row('old1', undefined, 50, 0.25); // pre-TRA-1475, no `account`
+
+  it('separates the 41x fixture inflation the pooled summary hides', () => {
+    const report = buildOptionJournalReport([...mirrored, desk], NOW, true);
+
+    // The pooled number — unchanged, still wrong to grade on, and still published
+    // so no existing consumer's number moves under it (TRA-2079).
+    expect(report.summary.realizedPnlUsd).toBe(4919.5);
+
+    // The number that is actually true of the desk.
+    expect(report.summary.byAccountClass.desk.realizedPnlUsd).toBe(119.5);
+    expect(report.summary.byAccountClass.desk.closed).toBe(1);
+    expect(report.summary.byAccountClass.fixture.realizedPnlUsd).toBe(4800);
+    expect(report.summary.byAccountClass.fixture.closed).toBe(3);
+
+    // ~41x on realized $, which is the whole reason this partition exists.
+    expect(
+      report.summary.realizedPnlUsd / report.summary.byAccountClass.desk.realizedPnlUsd,
+    ).toBeGreaterThan(40);
+
+    expect(report.fixtureRowCount).toBe(3);
+    expect(report.deskRowCount).toBe(1);
+  });
+
+  it('id-dedupe CANNOT find these — the ids are distinct; only `account` separates them', () => {
+    // Stated as a test because it is the trap: a consumer that de-duplicates on
+    // `id` gets 0 duplicates back and concludes the pool is clean.
+    const ids = new Set(mirrored.map((m) => m.id));
+    expect(ids.size).toBe(3);
+    const economics = new Set(mirrored.map((m) => `${m.realizedPnlUsd}:${m.realizedR}`));
+    expect(economics.size).toBe(1);
+  });
+
+  it('rows with NO account are `unattributed`, never folded into desk', () => {
+    const report = buildOptionJournalReport([desk, legacy], NOW, true);
+
+    // Folding pre-TRA-1475 rows into `desk` would re-commit the pooling bug for
+    // exactly the historical rows a long-window grade leans on hardest.
+    expect(report.unattributedRowCount).toBe(1);
+    expect(report.deskRowCount).toBe(1);
+    expect(report.summary.byAccountClass.desk.realizedPnlUsd).toBe(119.5);
+    expect(report.summary.byAccountClass.unattributed.realizedPnlUsd).toBe(50);
+  });
+
+  it('the three classes SUM to the row count — a partition that is not a partition is a new bug', () => {
+    const rows = [...mirrored, desk, legacy];
+    const report = buildOptionJournalReport(rows, NOW, true);
+
+    expect(report.fixtureRowCount + report.deskRowCount + report.unattributedRowCount)
+      .toBe(rows.length);
+    expect(report.summary.accountClassCountsSumToRows).toBe(true);
+  });
+
+  it('respects the sinceTs cohort filter — the partition folds the SAME rows as the summary', () => {
+    const old = { ...desk, id: 'old-desk', openTs: NOW - 90_000_000 };
+    const report = buildOptionJournalReport(
+      [old, desk, ...mirrored],
+      NOW,
+      true,
+      undefined,
+      NOW - 7_200_000,
+    );
+    // `old` is outside the cohort, so it must be absent from BOTH folds. Summary
+    // and partition describing different populations in one 200 is the TRA-2082
+    // false-PASS shape.
+    expect(report.deskRowCount).toBe(1);
+    expect(report.summary.closed).toBe(4);
+    expect(report.summary.accountClassCountsSumToRows).toBe(true);
+  });
+
+  it('names the desk field to grade on, in the payload rather than only in the ticket', () => {
+    const report = buildOptionJournalReport([desk], NOW, true);
+    expect(report.summary.accountClassNote).toContain('byAccountClass.desk');
+    expect(report.summary.accountClassNote).toContain('id-dedupe');
+  });
+});
+
+// TRA-2193 item 4 — enumerate open positions.
+//
+// `summary.open` reported a count (37 on bqb1) that no `rows` mode could expand,
+// so unrealized MTM was unobservable and the mid-vs-bid mark parity work on
+// TRA-2174 / TRA-2131 had nothing to reconcile against.
+describe('TRA-2193 option-journal rows=open / rows=all', () => {
+  const base = {
+    openTs: NOW - 3_600_000,
+    symbol: 'AAPL',
+    structure: 'single_leg_rv',
+    ivRank: null,
+    trend: 'up',
+    sentiment: null,
+    entryDelta: 0.5,
+    entryDte: 20,
+    atRiskUsd: 100,
+    agentConviction: null,
+  };
+  const openDemo = { ...base, id: 'o1', mode: 'demo', outcome: 'OPEN' } as OptionTradeJournalRecord;
+  const openLive = { ...base, id: 'o2', mode: 'live', outcome: 'OPEN' } as OptionTradeJournalRecord;
+  const closedDemo = {
+    ...base, id: 'c1', mode: 'demo', outcome: 'WIN',
+    closeTs: NOW, realizedPnlUsd: 10, realizedR: 0.5, exitReason: 'trail', holdDays: 1,
+  } as OptionTradeJournalRecord;
+  const all = [openDemo, openLive, closedDemo];
+
+  it('rows=open enumerates exactly what summary.open counts', () => {
+    const report = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'open');
+    expect(report.rowsMode).toBe('open');
+    // The count and the enumeration must agree, or one of them is lying.
+    expect(report.rows).toHaveLength(report.summary.open);
+    expect(report.rows?.map((r) => r.id).sort()).toEqual(['o1', 'o2']);
+  });
+
+  it('rows=all returns both modes and both outcomes', () => {
+    const report = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'all');
+    expect(report.rowsMode).toBe('all');
+    expect(report.rows).toHaveLength(3);
+  });
+
+  it('rows=demo is byte-for-byte unchanged — demo AND resolved only', () => {
+    const viaString = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'demo');
+    const viaLegacyBool = buildOptionJournalReport(all, NOW, true, undefined, undefined, true);
+    expect(viaString.rows?.map((r) => r.id)).toEqual(['c1']);
+    // The old boolean call signature still means `demo`, so no existing caller moves.
+    expect(viaLegacyBool.rows).toEqual(viaString.rows);
+    expect(viaLegacyBool.rowsMode).toBe('demo');
+  });
+
+  it('an UNKNOWN rows value yields an empty dump and a NULL mode, not a silent demo fallback', () => {
+    const report = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'unknown');
+    // Serving a different population than the one asked for, under a 200, is the
+    // exact failure shape TRA-2082 closed. `rowsMode: null` says "I did not
+    // recognise that" instead of quietly answering a different question.
+    expect(report.rowsMode).toBeNull();
+    expect(report.rows).toEqual([]);
+  });
+
+  it('states that journal rows carry NO marks, so a missing P&L is not a zero', () => {
+    const report = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'open');
+    // Enumeration answers WHICH contracts are open; it cannot price them. Unrealized
+    // MTM still needs a mark source (TRA-2174 / TRA-2131).
+    expect(report.rowsCarryMarks).toBe(false);
+  });
+
+  it('omits the rows fields entirely when no dump was requested', () => {
+    const report = buildOptionJournalReport(all, NOW, true);
+    expect(report.rows).toBeUndefined();
+    expect(report.rowsMode).toBeUndefined();
+  });
+
+  it('rows=open still honours the sinceTs cohort filter', () => {
+    const stale = { ...openDemo, id: 'o0', openTs: NOW - 90_000_000 };
+    const report = buildOptionJournalReport(
+      [stale, ...all], NOW, true, undefined, NOW - 7_200_000, 'open',
+    );
+    expect(report.rows?.map((r) => r.id).sort()).toEqual(['o1', 'o2']);
+    expect(report.rowsFiltered).toBe(true);
   });
 });

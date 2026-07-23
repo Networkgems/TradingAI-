@@ -10,7 +10,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { EngineState, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown, isLiveBrokerOperator } from '../signal-engine.js';
+import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
 import { isTestAccount } from '../test-accounts.js'; // TRA-1949
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
@@ -26,6 +26,7 @@ import {
   isOptionEmaPullbackEnabled,
   isOptionVolumeBreakoutEnabled,
   isOptionDemoDirectionalEnabled,
+  isOptionIvRvRoutingEnabled, // TRA-2193
   isOptionIvRvScannerEnabled,
   isOptionShortPremiumScannerEnabled,
   isWheelIvEntryFilterEnabled,
@@ -43,6 +44,7 @@ import {
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
+import { summarizeRvScanPath } from '../rv-scan-telemetry.js'; // TRA-2193
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
@@ -850,7 +852,31 @@ export interface OptionJournalReport {
    * = hard-gate).
    */
   shrinkageEnabled: boolean;
-  summary: OptionTradeJournalSummary;
+  /**
+   * TRA-2193 — the pooled fold, UNCHANGED for back-compat, now carrying a
+   * `byAccountClass` partition beside it. The pooled numbers include QA fixture
+   * books, which mirror one economic trade into several accounts under distinct
+   * `id`s: grade `summary.byAccountClass.desk`, not this. See
+   * {@link partitionByAccountClass}.
+   */
+  summary: OptionTradeJournalSummary & {
+    byAccountClass: {
+      fixture: OptionTradeJournalSummary;
+      desk: OptionTradeJournalSummary;
+      unattributed: OptionTradeJournalSummary;
+    };
+    accountClassCountsSumToRows: boolean;
+    accountClassNote: string;
+  };
+  /**
+   * TRA-2193 — row counts per account class, hoisted so a consumer reading
+   * nothing else still cannot miss that fixture rows are in the pool. The three
+   * sum to the filtered row count (asserted via `accountClassCountsSumToRows`).
+   * `unattributed` = pre-TRA-1475 rows with no `account`; it is NOT desk.
+   */
+  fixtureRowCount: number;
+  deskRowCount: number;
+  unattributedRowCount: number;
   /**
    * TRA-1681 — what the last journal load DROPPED (unparseable lines skipped,
    * read errors that forced the empty-book fallback). A grade that passes on
@@ -893,7 +919,25 @@ export interface OptionJournalReport {
    * the dump as a row-level expansion of the summary will silently undercount
    * the moment it does. This states the dump's own scope on the wire.
    */
-  rowsMode?: 'demo';
+  /**
+   * TRA-2193 — the dump's scope, now three-valued.
+   *   `demo` — demo + RESOLVED only (the original TRA-1133 dump, unchanged).
+   *   `open` — the still-OPEN rows. `summary.open` reported a count with no way
+   *            to enumerate what it counted, which left unrealized MTM
+   *            unobservable and blocked the mid-vs-bid mark parity work
+   *            (TRA-2174 / TRA-2131).
+   *   `all`  — every row in the filtered set, open and closed, both modes.
+   * `null` when a `rows` value was supplied but not recognised — an unknown mode
+   * must not silently degrade to a populated dump of some OTHER population.
+   */
+  rowsMode?: 'demo' | 'open' | 'all' | null;
+  /**
+   * TRA-2193 — journal rows carry entry economics, NOT live marks. So `rows=open`
+   * enumerates WHICH contracts are open (the thing that was missing) but cannot
+   * price them; unrealized MTM still needs a mark source. Stated on the wire so a
+   * consumer does not read the absence of a P&L field as a zero.
+   */
+  rowsCarryMarks?: false;
   /**
    * TRA-1046 (TRA-1041c L1) — freshness of the learned-weights fold. `generation`
    * bumps on each recompute (a close event or TTL lapse), so a probe can confirm
@@ -960,38 +1004,159 @@ export async function buildSourceQualityReport(
  * merely fixed, and `appliedSinceTs`/`filterAxis`/`rowsFiltered` put the applied
  * filter on the wire so a consumer can assert it.
  */
+/**
+ * TRA-2193 — split journal rows into QA-fixture books, real desk books, and rows
+ * that predate account attribution.
+ *
+ * WHY. The 2026-07-22 session read **+$4,919.50 / avgR +2.7129 / WR 90%** at the
+ * top level. Three of those rows — `qa_mirror_1578_38096`, `qa_tra1475_1783821169`,
+ * `qa_reg_0710202220` — are the SAME SMCI trail exit mirrored into three fixture
+ * books, bit-identical at +$1,600.00 / +8.791R / atRisk $181.9999999999999. Strip
+ * the fixtures and the session is **+$119.50 / avgR +0.1079**: a 41× overstatement
+ * of realized $ and 25× of avgR, on a number that would clear any forward-validation
+ * gate.
+ *
+ * The rows carry DISTINCT `id`s, so identity de-duplication finds zero duplicates
+ * and reports the pool as clean. `account` is the axis that separates them, and it
+ * is the only one that does.
+ *
+ * THREE buckets, not two. Rows written before TRA-1475 carry no `account` at all,
+ * and folding those into `desk` would silently re-commit the pooling bug for
+ * exactly the historical rows a long-window grade leans on hardest. Unattributable
+ * is its own answer — it is not the same claim as "desk".
+ *
+ * ADDITIVE, not a redefinition of `summary`. Defaulting the top-level fold to
+ * desk-only would move a published number under every consumer mid-flight, and a
+ * grader watching for drift would read the CORRECTION as a new defect (TRA-2079).
+ * The pooled fold stays exactly where it was; the partition sits beside it.
+ */
+function partitionRowsByAccountClass(rows: OptionTradeJournalRecord[]): {
+  fixture: OptionTradeJournalRecord[];
+  desk: OptionTradeJournalRecord[];
+  unattributed: OptionTradeJournalRecord[];
+} {
+  const fixture: OptionTradeJournalRecord[] = [];
+  const desk: OptionTradeJournalRecord[] = [];
+  const unattributed: OptionTradeJournalRecord[] = [];
+  for (const r of rows) {
+    if (typeof r.account !== 'string' || r.account.trim().length === 0) unattributed.push(r);
+    else if (isTestAccount(r.account)) fixture.push(r);
+    else desk.push(r);
+  }
+  return { fixture, desk, unattributed };
+}
+
+/** TRA-2193 — top-level row counts per account class, plus the sum check. */
+function accountClassRowCounts(rows: OptionTradeJournalRecord[]): {
+  fixtureRowCount: number;
+  deskRowCount: number;
+  unattributedRowCount: number;
+} {
+  const p = partitionRowsByAccountClass(rows);
+  return {
+    fixtureRowCount: p.fixture.length,
+    deskRowCount: p.desk.length,
+    unattributedRowCount: p.unattributed.length,
+  };
+}
+
+/** TRA-2193 — the same fold, run separately over each account class. */
+function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
+  byAccountClass: {
+    fixture: ReturnType<typeof summarizeOptionTradeJournal>;
+    desk: ReturnType<typeof summarizeOptionTradeJournal>;
+    unattributed: ReturnType<typeof summarizeOptionTradeJournal>;
+  };
+  /**
+   * The buckets must account for every row. Overshoot means a row landed in two
+   * classes, undershoot means one was dropped — either way the partition is not a
+   * partition, and publishing it unchecked would just relocate the original bug.
+   */
+  accountClassCountsSumToRows: boolean;
+  accountClassNote: string;
+} {
+  const p = partitionRowsByAccountClass(rows);
+  return {
+    byAccountClass: {
+      fixture: summarizeOptionTradeJournal(p.fixture),
+      desk: summarizeOptionTradeJournal(p.desk),
+      unattributed: summarizeOptionTradeJournal(p.unattributed),
+    },
+    accountClassCountsSumToRows:
+      p.fixture.length + p.desk.length + p.unattributed.length === rows.length,
+    accountClassNote:
+      'Top-level `summary` POOLS all three classes and is unchanged for back-compat. '
+      + 'Grade on `byAccountClass.desk`. QA fixture books mirror one economic trade into '
+      + 'several accounts with DISTINCT ids, so id-dedupe reports 0 duplicates while the '
+      + 'pooled realized $ and avgR are inflated (2026-07-22: pooled +$4,919.50/+2.7129R '
+      + 'vs desk +$119.50/+0.1079R). `unattributed` = rows written before TRA-1475 added '
+      + '`account`; it is NOT desk.',
+  };
+}
+
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
   enabled: boolean,
   cached?: CachedOptionWeights,
   sinceTs?: number,
-  includeDemoRows = false,
+  // TRA-2193 — widened from the original `includeDemoRows: boolean`. `true` is
+  // still accepted and still means `demo`, so every existing caller and test is
+  // unchanged; the new modes are additive.
+  rowsRequest: boolean | 'demo' | 'open' | 'all' | 'unknown' = false,
 ): OptionJournalReport {
   const summaryRows =
     sinceTs === undefined ? rows : rows.filter((r) => r.openTs >= sinceTs);
+  const rowsMode: 'demo' | 'open' | 'all' | null | undefined =
+    rowsRequest === false ? undefined
+      : rowsRequest === true || rowsRequest === 'demo' ? 'demo'
+        : rowsRequest === 'open' ? 'open'
+          : rowsRequest === 'all' ? 'all'
+            // An unrecognised `?rows=` value. Emit an EMPTY dump with a null mode
+            // rather than falling back to `demo`: silently serving a different
+            // population than the one asked for is the TRA-2082 failure shape.
+            : null;
+  const dumpRows: OptionTradeJournalRecord[] | undefined =
+    rowsMode === undefined
+      ? undefined
+      : rowsMode === 'demo'
+        ? (summaryRows as OptionTradeJournalRecord[]).filter(
+            (r) => r.mode === 'demo' && r.outcome !== 'OPEN',
+          )
+        : rowsMode === 'open'
+          ? (summaryRows as OptionTradeJournalRecord[]).filter((r) => r.outcome === 'OPEN')
+          : rowsMode === 'all'
+            ? (summaryRows as OptionTradeJournalRecord[])
+            : [];
   return {
     ok: true,
     time: new Date(now).toISOString(),
     build: resolveBuildInfo(),
     enabled,
     shrinkageEnabled: isLearnedShrinkageEnabled(),
-    summary: summarizeOptionTradeJournal(summaryRows),
+    summary: {
+      ...summarizeOptionTradeJournal(summaryRows),
+      ...partitionByAccountClass(summaryRows as OptionTradeJournalRecord[]),
+    },
+    // TRA-2193 — hoisted to the top level so a consumer that reads nothing else
+    // still cannot miss that fixture rows are in the pool.
+    ...accountClassRowCounts(summaryRows as OptionTradeJournalRecord[]),
     integrity: getOptionTradeJournalIntegrity(),
     weights: cached?.weights ?? computeOptionLearnedWeights(rows),
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),
     appliedSinceTs: sinceTs ?? null,
     filterAxis: 'openTs',
-    ...(includeDemoRows
-      ? {
-          rows: (summaryRows as OptionTradeJournalRecord[]).filter(
-            (r) => r.mode === 'demo' && r.outcome !== 'OPEN',
-          ),
+    ...(dumpRows === undefined
+      ? {}
+      : {
+          rows: dumpRows,
           rowsFiltered: sinceTs !== undefined,
-          rowsMode: 'demo' as const,
-        }
-      : {}),
+          rowsMode,
+          // Journal rows are entry economics; they hold no live mark. Say so
+          // rather than letting a consumer read a missing field as $0 unrealized.
+          rowsCarryMarks: false as const,
+        }),
   };
 }
 
@@ -2164,7 +2329,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         isOptionTradeJournalEnabled(),
         cached,
         sinceTs,
-        req.query['rows'] === 'demo',
+        // TRA-2193 — `demo` (unchanged) plus `open` / `all`. `summary.open`
+        // reported a count of positions that could not be enumerated, so
+        // unrealized MTM was unobservable and the mid-vs-bid mark parity work
+        // (TRA-2174 / TRA-2131) had nothing to reconcile against. Anything else
+        // is passed through as `unknown` → empty dump + `rowsMode: null`, so a
+        // typo'd param cannot quietly return a different population.
+        typeof req.query['rows'] === 'string'
+          ? (['demo', 'open', 'all'].includes(req.query['rows'] as string)
+              ? (req.query['rows'] as 'demo' | 'open' | 'all')
+              : 'unknown')
+          : false,
       ),
     );
   });
@@ -2362,6 +2537,134 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // null when the watchdog is disabled via env (WATCHDOG_ENABLED=false). The
   // fact that THIS route answers <500ms is itself the live "event loop is not
   // starved" signal the ticket's acceptance asks for.
+  // TRA-2193 — unauthenticated, secrets-free liveness readout for the option
+  // entry paths that journal `structure: 'single_leg_rv'`.
+  //
+  // WHY THIS EXISTS. On 2026-07-22 and 07-23 the book produced zero `single_leg_rv`
+  // opens after five sessions of 18–38, and nothing in the process could say
+  // whether the scanner had run and found nothing or had never run at all. Both
+  // states rendered as the same thing: no rows. The cause was a wiped
+  // `ENABLE_OPTION_DEMO_DIRECTIONAL` (TRA-2136's bulk env PUT) — the loop executed
+  // zero iterations — but a genuine drought would have looked identical from
+  // outside. That ambiguity, not the outage, was the defect.
+  //
+  // WHY IT REPORTS PATHS AND NOT "THE RV SCANNER". `single_leg_rv` is a STRUCTURE
+  // label, not a sleeve: `openOptionFromRvCandidate` stamps it unconditionally for
+  // every caller (TRA-1682), and the gated RV scan is only one of them — and has
+  // been compile-time OFF since TRA-1207 on 2026-06-30. A route that described
+  // only `runRelativeValueScan` would answer "disarmed, never ran": true, and
+  // useless, because it would say nothing about the path that actually produced
+  // those 18–38 opens/session. So each producer reports separately and the caller
+  // can see WHICH one went quiet. `entryArchetype` on the journal row is the
+  // matching axis for grading (TRA-1691).
+  //
+  // The null discipline is the whole point and is load-bearing in three places:
+  //   • `lastScanAt` / `lastFetchOkAt` are null when unmeasured, NEVER 0 — a 0
+  //     epoch is a timestamp, and publishing one re-creates the exact false zero
+  //     this route exists to kill (TRA-1707).
+  //   • `universeSize: 0` (ran, empty universe) stays distinguishable from never
+  //     having run, because in the never-ran case `lastScan` is null OUTRIGHT
+  //     rather than an object full of zeros.
+  //   • a path we do not instrument reports `scanCountSinceBoot: null`, not 0.
+  //     Zero is a claim about a measurement we did not take.
+  //
+  // `scanCountSinceBoot`, never a lifetime count: a lifetime counter that survives
+  // a reboot cannot prove the scanner ran TODAY, which is the only question worth
+  // asking after an unexplained flat session.
+  app.get('/api/health/rv-scan', (_req, res) => {
+    // The engine resolves the directional arm via `isOptionDemoDirectionalEnabled()`
+    // with NO argument — i.e. `process.env` ONLY, deliberately bypassing the
+    // DATA_DIR/demo-flags.json overlay that most other option flags honour
+    // (`option-exec-flag.ts`, and the call site in `evaluateDemoDirectional`).
+    // This route MUST resolve it the same way. Reading the overlay here would let
+    // the route report `enabled: true` off demo-flags.json while the engine reads
+    // `false` off process.env — a liveness surface that lies in precisely the
+    // situation it was built for. Do not "fix" this to use resolveDemoFlagEnv.
+    const directionalEnabled = isOptionDemoDirectionalEnabled(process.env);
+    const ivRvRoutingEnabled = isOptionIvRvRoutingEnabled(process.env);
+
+    // Chain provider wiring. Null — not false — when the pipeline dep is absent,
+    // because "we cannot see it from here" is not the same fact as "it is missing".
+    const chainConfigured: boolean | null = deps.optionsPipeline
+      ? summarizeOptionsPipeline(deps.optionsPipeline(), now()).rvScannerConfigured
+      : null;
+
+    const paths = [
+      // Instrumented: the demo directional pass. This is the one that actually
+      // fed the `single_leg_rv` bucket, so it is the one whose silence had to
+      // become readable.
+      summarizeRvScanPath('directional', {
+        enabled: directionalEnabled,
+        instrumented: true,
+      }),
+      // Instrumented, but held shut by the compile-time TRA-1207 kill switch.
+      // Wired now so that re-arming it is self-evidencing on the first tick.
+      summarizeRvScanPath('rv_scan', {
+        enabled: isRvEngineEnabled(),
+        instrumented: true,
+      }),
+      // NOT instrumented this iteration. Reports null counters rather than zeros —
+      // see the null discipline above.
+      summarizeRvScanPath('iv_rv_buy_premium', {
+        enabled: ivRvRoutingEnabled,
+        instrumented: false,
+      }),
+    ];
+
+    // Roll-up over the INSTRUMENTED paths only. An un-instrumented path must not
+    // be able to drag the aggregate toward a confident zero.
+    const watched = paths.filter((p) => p.instrumented);
+    const armed = watched.filter((p) => p.enabled);
+    const scanned = watched.filter((p) => (p.scanCountSinceBoot ?? 0) > 0);
+    const lastScanAt = watched.reduce<number | null>(
+      (acc, p) => (p.lastScanAt != null && (acc == null || p.lastScanAt > acc) ? p.lastScanAt : acc),
+      null,
+    );
+
+    // The verdict the issue actually asked for, stated rather than left to be
+    // inferred. `disarmed` is the state that had no name before this route: the
+    // path is off, so silence is CORRECT and no amount of staring at the journal
+    // would ever have revealed it.
+    const verdict =
+      armed.length === 0
+        ? 'disarmed'
+        : scanned.length === 0
+          ? 'armed_but_never_ran'
+          : 'scanning';
+
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      // Top-level `enabled` = is ANY producer of `single_leg_rv` rows armed.
+      enabled: armed.length > 0,
+      verdict,
+      lastScanAt,
+      scanCountSinceBoot: watched.reduce((n, p) => n + (p.scanCountSinceBoot ?? 0), 0),
+      structureLabel: 'single_leg_rv',
+      // Stated inline because every reader of this route has, historically, been
+      // one step away from grading the wrong population (TRA-1682 / TRA-1691).
+      note:
+        '`single_leg_rv` is a STRUCTURE label shared by every caller of '
+        + 'openOptionFromRvCandidate, not a sleeve. Group journal rows by '
+        + '`structure × entryArchetype` (forward-only since TRA-1682) before grading; '
+        + '`single_leg_rv × unspecified` is pre-tagging history, not a gradeable sleeve.',
+      dataSource: {
+        provider: 'tradier-chain',
+        // Whether the chain client is wired at all. Null = unobservable here.
+        keyPresent: chainConfigured,
+        // Measured, not inferred: stamped when a scan actually received a usable
+        // chain, and cleared to null until one does.
+        lastFetchOkAt: watched.reduce<number | null>(
+          (acc, p) => (p.lastFetchOkAt != null && (acc == null || p.lastFetchOkAt > acc) ? p.lastFetchOkAt : acc),
+          null,
+        ),
+        lastFetchError: watched.find((p) => p.lastFetchError != null)?.lastFetchError ?? null,
+      },
+      paths,
+    });
+  });
+
   app.get('/api/health/watchdog', (_req, res) => {
     const watchdog = getWatchdogStatus();
     res.json({
