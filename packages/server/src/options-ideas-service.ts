@@ -38,6 +38,7 @@ import {
   optionsSpendStatus,
 } from './options-spend-store.js';
 import { recordSurfacedIdeas } from './options-idea-journal.js';
+import { recordExpectancyShadowSlate } from './options-ideas-expectancy-ledger.js';
 import type { DefinedRiskStrategy } from '@trading-app/agents';
 import { logger } from './observability/index.js';
 
@@ -323,6 +324,21 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     return nonLive(
       `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 200)}${credNote}`,
     );
+  }
+
+  // TRA-2199 (parent TRA-2175 → TRA-2005) — persist the SHADOW expectancy verdicts
+  // for this slate. The gate computes `expectancyShadow` and, until this call
+  // existed, NOTHING read it: no persistence, no route, unobservable by
+  // construction. Absent ⇒ ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE is off and the gate
+  // skipped the shadow pass entirely (the probe reports that as `enabled:false`, so
+  // "gate off" stays distinguishable from "gate on, nothing qualified").
+  //
+  // Guarded on `!research.cached` for the same reason the spend accounting below is:
+  // a batch-cache hit re-serves the SAME result object, so recording it again would
+  // inflate the verdict cohort with duplicate slates off the panel's 60s poll.
+  // SHADOW-only — reads verdicts already computed; changes no routing, no slate.
+  if (research.expectancyShadow && !research.cached) {
+    recordExpectancyShadowSlate(research.expectancyShadow, now);
   }
 
   // 4) map engine ideas → panel feed; refresh the entry-intent registry.

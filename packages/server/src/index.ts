@@ -127,6 +127,10 @@ import {
   hydrateIgnitionFromDisk,
 } from './crypto-ignition-scanner.js';
 import { hydrateConvictionDcaFromDisk } from './conviction-dca-ledger.js';
+import {
+  hydrateOptionsIdeasExpectancyFromDisk,
+  summarizeOptionsIdeasExpectancy,
+} from './options-ideas-expectancy-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
@@ -2421,6 +2425,23 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
   }
 }
 
+// TRA-2199 (parent TRA-2175 → TRA-2005) — hydrate the options-ideas expectancy
+// SHADOW ledger on boot and remember DATA_DIR for subsequent appends. Durable for
+// the same reason the ledgers above are: bqb1 reboots ~daily, so a since-boot
+// counter would read a structural 0 by the time a post-close grade fires — and this
+// leg has already been mistaken for armed once. Runs regardless of the gate flag:
+// reading one small file at boot is cheap, and hydrating when the flag is OFF is
+// what lets a reader still see the cohort a previously-ON window accrued.
+{
+  const h = hydrateOptionsIdeasExpectancyFromDisk(DATA_DIR);
+  if (h.slates > 0) {
+    log.info('options-ideas expectancy shadow ledger hydrated (TRA-2199)', {
+      slates: h.slates,
+      days: h.days,
+    });
+  }
+}
+
 // TRA-1300 — hydrate the observe-only scale-out ladder ledger on boot and remember
 // DATA_DIR for subsequent appends, so the QuantTrader forward-validation trim counts
 // and the per-position fired-rung set survive the ~daily demo-host restart (a rung
@@ -3964,6 +3985,44 @@ app.get('/api/health/options-ideas-decomposition', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to build the options-ideas decomposition.' });
+  }
+});
+
+// TRA-2199 (parent TRA-2175 → TRA-2005) — the SHADOW positive-expectancy ledger
+// readout, on the same unauth, secrets-free basis as the sibling
+// /api/health/options-ideas-decomposition + /api/health/pop-calibration probes.
+// QuantTrader has no auth on bqb1, which is why the verdict needs a public probe.
+//
+// WHY THIS ROUTE EXISTS. `options-research.ts` computed `expectancyShadow` and
+// dropped it on the floor — no persistence, no reader, no route. The ledger was
+// unobservable BY CONSTRUCTION, so the TRA-2005 leg read as armed while recording
+// nothing. This is the reader.
+//
+// READ `enabled` FIRST. It reports whether ENABLE_OPTIONS_IDEA_EXPECTANCY_GATE is
+// on — i.e. whether the gate is RECORDING at all. Semantics are INVERTED versus
+// TRA-2006's ENABLE_POP_CALIBRATION: there OFF still computes the shadow fit, so a
+// readout with `enabled:false` is still evidence. Here OFF skips the shadow pass
+// entirely, so `enabled:false` + `slates:0` means "nothing was recorded", NOT
+// "nothing qualified". Without that distinction the two are indistinguishable, and
+// conflating them is exactly what hid this defect.
+//
+// Aggregate-only: verdict counts, config, expectancy statistics and drop-code
+// histogram sliced by structure FAMILY. No per-idea text, no tickers, no P&L.
+// Read-only — wires no capital, reorders nothing, alters no surfaced slate.
+app.get('/api/health/options-ideas-expectancy', (_req, res) => {
+  try {
+    res.json({
+      ok: true,
+      issue: 'TRA-2199',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      ...summarizeOptionsIdeasExpectancy(Date.now()),
+    });
+  } catch (err) {
+    log.error('options-ideas-expectancy probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the options-ideas expectancy rollup.' });
   }
 });
 

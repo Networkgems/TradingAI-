@@ -96,3 +96,24 @@ export {
   type OptionsResearchCache,
   type OptionsResearchDeps,
 } from './options-research.js';
+// TRA-2199 (parent TRA-2175 → TRA-2005) — the SHADOW expectancy gate's contracts.
+// Previously the whole module was barrel-private, so the shadow ledger the producer
+// builds had no way to reach a server-side reader at all: the server package can
+// only import through this barrel. Exporting the types + the flag resolver (so a
+// probe can report `enabled`) is what makes the ledger observable at all.
+//
+// `evaluateIdeasExpectancyShadow`/`DEFAULT_EXPECTANCY_GATE_CONFIG` are exported for
+// the server-side ledger TEST, so it asserts against the REAL scorer rather than a
+// hand-rolled fixture that would silently drift from the gate. The live scoring call
+// stays where it was — inside `options-research.ts`; nothing on the server re-scores.
+export {
+  resolveExpectancyGateConfig,
+  evaluateIdeasExpectancyShadow,
+  EXPECTANCY_GATE_ENABLE_VAR,
+  DEFAULT_EXPECTANCY_GATE_CONFIG,
+  type ExpectancyGateConfig,
+  type ExpectancyVerdict,
+  type IdeaExpectancyResult,
+  type IdeaExpectancyShadow,
+  type IdeaExpectancyShadowEntry,
+} from './options-ideas-expectancy-gate.js';
