@@ -10,10 +10,14 @@
  * because the routine harness was missing `TRADING_API_BASE` / admin creds.
  *
  * This module replaces the *deterministic* core of that routine with a
- * server-side job. It pulls three index-level series from Yahoo:
+ * server-side job. It pulls four index-level series from Yahoo:
  *
  *   - `^GSPC` — S&P 500, with its trend moving average (the trend filter —
  *     TRA-472: a 50-day SMA with a ±1% hysteresis band).
+ *   - `^NDX`  — Nasdaq 100, the second leg of the trend filter (TRA-2197). The
+ *     gate takes the WEAKER of the two indices: the engine's equity universe is
+ *     mega-cap-tech dominated, so grading `^GSPC` alone let a 2026-07-23 tape
+ *     with ^NDX 3.67% under its 50-DMA still enable ORB longs.
  *   - `^VIX`  — volatility index (breakout / mean-reversion gate).
  *   - `^TNX`  — 10-year Treasury yield (rate-pressure / sizing gate).
  *
@@ -39,6 +43,7 @@ import type {
   MarketReview,
   MarketReviewGates,
   MarketReviewIndexReading,
+  MarketReviewTrendComponent,
 } from '@trading-app/shared';
 import { fetchDailyCandles, fetchQuote, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { saveResearchReport } from './research-store.js';
@@ -74,6 +79,16 @@ const SPX_SYMBOL = '^GSPC';
  * scale-free test — so the proxy yields an identical up/down read.
  */
 const SPX_FALLBACK_SYMBOL = 'SPY';
+/**
+ * TRA-2197 — second leg of the trend gate. The engine's equity universe is
+ * mega-cap-tech / semi dominated, so its real benchmark behaves like the
+ * Nasdaq 100, not the S&P 500. Grading `^GSPC` alone let a tape where ^NDX
+ * closed 3.67% under its own 50-DMA (2026-07-23) still print `trendState: up`
+ * and enable ORB longs. The composite gates on the WEAKER of the two.
+ */
+const NDX_SYMBOL = '^NDX';
+/** ETF proxy for `^NDX`, same role `SPY` plays for `^GSPC` (TRA-469 pattern). */
+const NDX_FALLBACK_SYMBOL = 'QQQ';
 const VIX_SYMBOL = '^VIX';
 /**
  * TRA-586 — Tradier quotes the CBOE Volatility Index under the bare `VIX`
@@ -179,6 +194,14 @@ export interface RegimeInputs {
   spx: number | null;
   /** S&P 500 trend moving average ({@link MA_PERIOD}-day SMA), or `null`. */
   spxTrendMa: number | null;
+  /**
+   * TRA-2197 — latest Nasdaq 100 close, or `null`. Optional so every existing
+   * caller/test that only supplies the S&P leg keeps its exact behaviour: with
+   * `ndx` absent the composite folds to the single readable leg.
+   */
+  ndx?: number | null;
+  /** TRA-2197 — Nasdaq 100 trend MA ({@link MA_PERIOD}-day SMA), or `null`. */
+  ndxTrendMa?: number | null;
   /** Latest VIX value, or `null`. */
   vix: number | null;
   /** 10-year Treasury yield as a percent (e.g. `4.31`), or `null`. */
@@ -193,41 +216,261 @@ export interface TrendRead {
   trendDown: boolean;
   /** False ↔ the trend feed was dark (`spx` or the trend MA was `null`). */
   trendKnown: boolean;
+  /**
+   * TRA-2197 — signed distance of price from the MA as a FRACTION
+   * (`-0.0085` ↔ 0.85% below). `null` when the feed was dark. This is the
+   * number the note must quote: the old note asserted "Above 50-DMA" off
+   * `trendUp` alone, which is true of the STATE and false of the PRICE
+   * whenever the band is doing the holding.
+   */
+  distancePct: number | null;
+  /**
+   * TRA-2197 — true ↔ price sits INSIDE the ±band, so the returned state is
+   * carried by tolerance rather than confirmed by price.
+   */
+  heldByTolerance: boolean;
+  /**
+   * TRA-2197 — true ↔ price cleared the upper band but the dwell lock refused
+   * the flip because a `→ down` transition already committed this session.
+   */
+  upFlipSuppressed: boolean;
 }
 
 /**
- * TRA-472 — resolve the S&P 500 trend direction with a ±1% hysteresis band.
+ * TRA-2197 — the dwell lock for one trend leg. A `→ up` (permissive) flip is
+ * refused while `downFlipDate` equals `sessionDate`; a `→ down` (restrictive)
+ * flip is NEVER blocked. The asymmetry is deliberate: the property the desk
+ * asked for is "the state cannot flip twice in one session", and where a
+ * second flip is unavoidable it must land on the safe side.
+ */
+export interface TrendDwell {
+  /** ET date of this leg's most recent committed `up → down` transition. */
+  downFlipDate?: string | null;
+  /** Current ET session date. Omit to disable the lock entirely. */
+  sessionDate?: string | null;
+}
+
+/**
+ * TRA-472 / TRA-2197 — resolve one index's trend direction with a ±1%
+ * hysteresis band plus a same-session dwell lock.
  *
- *   - flip to **up** only when `spx > trendMa·(1 + {@link TREND_HYSTERESIS})`;
- *   - flip to **down** only when `spx < trendMa·(1 - TREND_HYSTERESIS)`;
- *   - inside the band: **hold** `prevTrendUp` (the prior review's trend state);
+ *   - flip to **down** whenever `px < trendMa·(1 - {@link TREND_HYSTERESIS})`
+ *     — always immediate, never blocked (restrictive direction);
+ *   - flip to **up** when `px > trendMa·(1 + TREND_HYSTERESIS)`, *unless* the
+ *     dwell lock is engaged (a `→ down` flip already committed this session),
+ *     in which case the leg holds `down` and reports `upFlipSuppressed`;
+ *   - inside the band: **hold** `prevTrendUp` (the prior review's state);
  *   - cold store (`prevTrendUp` null/undefined) inside the band: seed from the
- *     plain `spx >= trendMa` comparison.
+ *     plain `px >= trendMa` comparison.
  *
- * Pure so both {@link classifyMarketRegime} and {@link deriveGates} resolve an
- * identical trend, and the band is unit-testable in isolation.
+ * Note what the band already guarantees on its own, and what it does not. The
+ * band is a genuine dead-zone in both directions — a price oscillating around
+ * the −1% floor cannot toggle `up → down → up`, because re-entry to `up`
+ * requires clearing `+1%`, a ~2% move. What it does NOT stop is a leg that
+ * flips down early in a session and back up after a violent intraday reversal;
+ * the dwell lock closes that, and it is also the property the regression test
+ * pins.
+ *
+ * Pure so {@link classifyMarketRegime}, {@link deriveGates} and the rendered
+ * note all resolve an identical trend, and the band is unit-testable alone.
  */
 export function resolveTrend(
-  spx: number | null,
+  px: number | null,
   trendMa: number | null,
   prevTrendUp?: boolean | null,
+  dwell?: TrendDwell | null,
 ): TrendRead {
-  if (spx == null || trendMa == null) {
-    return { trendUp: false, trendDown: false, trendKnown: false };
+  if (px == null || trendMa == null || !Number.isFinite(px) || !Number.isFinite(trendMa) || trendMa === 0) {
+    return {
+      trendUp: false,
+      trendDown: false,
+      trendKnown: false,
+      distancePct: null,
+      heldByTolerance: false,
+      upFlipSuppressed: false,
+    };
   }
   const upperBand = trendMa * (1 + TREND_HYSTERESIS);
   const lowerBand = trendMa * (1 - TREND_HYSTERESIS);
+  const distancePct = px / trendMa - 1;
+  // The dwell lock is engaged only when a `→ down` flip committed in THIS ET
+  // session. A stale `downFlipDate` from an earlier session never matches, so
+  // the lock releases on its own at the session boundary — no expiry sweep.
+  const dwellLocked =
+    dwell?.sessionDate != null && dwell.downFlipDate != null && dwell.downFlipDate === dwell.sessionDate;
+
   let up: boolean;
-  if (spx > upperBand) {
-    up = true;
-  } else if (spx < lowerBand) {
-    up = false;
+  let heldByTolerance = false;
+  let upFlipSuppressed = false;
+  if (px < lowerBand) {
+    up = false; // restrictive — always immediate
+  } else if (px > upperBand) {
+    if (dwellLocked && prevTrendUp === false) {
+      up = false;
+      upFlipSuppressed = true;
+    } else {
+      up = true;
+    }
   } else if (prevTrendUp != null) {
     up = prevTrendUp; // inside the band — hold the prior review's state
+    heldByTolerance = true;
   } else {
-    up = spx >= trendMa; // cold store — seed from the plain comparison
+    up = px >= trendMa; // cold store — seed from the plain comparison
+    heldByTolerance = true;
   }
-  return { trendUp: up, trendDown: !up, trendKnown: true };
+  return { trendUp: up, trendDown: !up, trendKnown: true, distancePct, heldByTolerance, upFlipSuppressed };
+}
+
+// ── TRA-2197 — composite (multi-index) trend gate ────────────────────────────
+
+/**
+ * Prior trend state threaded from the last persisted review, keyed on the
+ * CANONICAL index symbol (`^GSPC` / `^NDX`) — never the ETF proxy, so a day
+ * served by `SPY`/`QQQ` does not lose the leg's state.
+ */
+export interface TrendMemory {
+  states?: Record<string, 'up' | 'down' | 'unknown'>;
+  /** ET date of each leg's most recent committed `up → down` transition. */
+  downFlipDates?: Record<string, string | null>;
+  /** Current ET session date — the dwell window. Omit to disable the lock. */
+  sessionDate?: string | null;
+}
+
+/**
+ * Back-compat shim. Callers (and the pre-TRA-2197 test suite) may pass a bare
+ * `prevTrendUp` boolean meaning "the prior S&P leg's state, no NDX memory, no
+ * dwell lock". Normalise both shapes into a {@link TrendMemory}.
+ */
+export type TrendMemoryInput = boolean | null | undefined | TrendMemory;
+
+function toTrendMemory(input: TrendMemoryInput): TrendMemory {
+  if (input == null) return {};
+  if (typeof input === 'boolean') return { states: { [SPX_SYMBOL]: input ? 'up' : 'down' } };
+  return input;
+}
+
+/** The trend legs the composite gate folds, in display order. */
+const TREND_LEGS: ReadonlyArray<{ symbol: string; label: string }> = [
+  { symbol: SPX_SYMBOL, label: 'S&P 500' },
+  { symbol: NDX_SYMBOL, label: 'Nasdaq 100' },
+];
+
+/** Resolved composite trend — output of {@link resolveCompositeTrend}. */
+export interface CompositeTrendRead {
+  /** True ↔ EVERY readable leg is up. */
+  trendUp: boolean;
+  /** True ↔ at least one readable leg is down. */
+  trendDown: boolean;
+  /** False ↔ every leg's feed was dark. */
+  trendKnown: boolean;
+  /** Per-leg detail, including the dwell bookkeeping the next review threads back in. */
+  components: MarketReviewTrendComponent[];
+  /** Canonical symbol of the weakest readable leg (the one that binds the gate), or `null`. */
+  bindingSymbol: string | null;
+  /** Per-leg reads, keyed by canonical symbol — used to render the notes. */
+  reads: Record<string, TrendRead>;
+}
+
+/**
+ * TRA-2197 — resolve the gating trend across `^GSPC` and `^NDX` and fold to the
+ * WEAKER of the two.
+ *
+ * The failure this closes: on 2026-07-23 `^GSPC` closed 0.85% under its 50-DMA
+ * — inside the ±1% band, so the gate held `up` — while `^NDX`, the index the
+ * engine's ~191-name mega-cap-tech universe actually tracks, closed 3.67%
+ * under its own 50-DMA, unambiguously outside any band. A single-`^GSPC` gate
+ * cannot see that split, and it enabled ORB longs for a book whose real
+ * benchmark was 3.7% under water.
+ *
+ * Fold rule (fail-safe): `up` only when every READABLE leg is up. A dark leg is
+ * skipped rather than forcing `unknown` — losing one feed should not blank the
+ * regime, and the surviving leg is still evidence. Every leg dark ⇒ `unknown`,
+ * exactly as before.
+ */
+export function resolveCompositeTrend(
+  inputs: RegimeInputs,
+  memory?: TrendMemoryInput,
+): CompositeTrendRead {
+  const mem = toTrendMemory(memory);
+  const sessionDate = mem.sessionDate ?? null;
+  const values: Record<string, { value: number | null; ma: number | null }> = {
+    [SPX_SYMBOL]: { value: inputs.spx, ma: inputs.spxTrendMa },
+    [NDX_SYMBOL]: { value: inputs.ndx ?? null, ma: inputs.ndxTrendMa ?? null },
+  };
+
+  const components: MarketReviewTrendComponent[] = [];
+  const reads: Record<string, TrendRead> = {};
+
+  for (const leg of TREND_LEGS) {
+    const { value, ma } = values[leg.symbol];
+    const priorState = mem.states?.[leg.symbol];
+    const prevUp = priorState === 'up' ? true : priorState === 'down' ? false : null;
+    const priorDownFlip = mem.downFlipDates?.[leg.symbol] ?? null;
+    const read = resolveTrend(value, ma, prevUp, { downFlipDate: priorDownFlip, sessionDate });
+    reads[leg.symbol] = read;
+
+    const state: 'up' | 'down' | 'unknown' = !read.trendKnown ? 'unknown' : read.trendUp ? 'up' : 'down';
+    // A `→ down` transition COMMITS the dwell lock for the rest of the session.
+    // Only a real transition counts: a leg that was already down (or seeded
+    // down from a cold store) must not re-stamp the date every review, or the
+    // lock would never release.
+    const flippedDown = read.trendKnown && !read.trendUp && prevUp === true;
+    components.push({
+      symbol: leg.symbol,
+      label: leg.label,
+      value,
+      trendMa: ma,
+      state,
+      distancePct: read.distancePct,
+      heldByTolerance: read.heldByTolerance,
+      downFlipDate: flippedDown && sessionDate != null ? sessionDate : priorDownFlip,
+    });
+  }
+
+  const readable = components.filter(c => c.state !== 'unknown');
+  if (readable.length === 0) {
+    return { trendUp: false, trendDown: false, trendKnown: false, components, bindingSymbol: null, reads };
+  }
+  const trendUp = readable.every(c => c.state === 'up');
+  // The binding leg is the weakest readable one by signed distance — in BOTH
+  // directions, so a green tape still names the leg with the thinnest cushion.
+  const binding = readable.reduce((weakest, c) =>
+    (c.distancePct ?? 0) < (weakest.distancePct ?? 0) ? c : weakest,
+  );
+  return {
+    trendUp,
+    trendDown: !trendUp,
+    trendKnown: true,
+    components,
+    bindingSymbol: binding.symbol,
+    reads,
+  };
+}
+
+/**
+ * TRA-2197 — rebuild the {@link TrendMemory} the next review threads in from a
+ * persisted review's gates. Falls back to the legacy single-leg
+ * `gates.trendState` when `trendComponents` is absent, so reviews written
+ * before TRA-2197 still seed the `^GSPC` leg instead of reading as a cold
+ * store (which would re-seed from the plain `px >= MA` comparison and drop the
+ * hysteresis the band exists to provide).
+ */
+export function buildTrendMemory(
+  gates: MarketReviewGates | null | undefined,
+  sessionDate: string,
+): TrendMemory {
+  const states: Record<string, 'up' | 'down' | 'unknown'> = {};
+  const downFlipDates: Record<string, string | null> = {};
+  const components = gates?.trendComponents;
+  if (components && components.length > 0) {
+    for (const c of components) {
+      states[c.symbol] = c.state;
+      downFlipDates[c.symbol] = c.downFlipDate ?? null;
+    }
+  } else if (gates?.trendState != null) {
+    states[SPX_SYMBOL] = gates.trendState;
+  }
+  return { states, downFlipDates, sessionDate };
 }
 
 /**
@@ -262,13 +505,14 @@ export { simpleMa };
  */
 export function classifyMarketRegime(
   inputs: RegimeInputs,
-  prevTrendUp?: boolean | null,
+  memory?: TrendMemoryInput,
 ): {
   regime: MarketRegimeLabel;
   rationale: string;
 } {
-  const { spx, spxTrendMa, vix, tnx } = inputs;
-  const { trendKnown, trendUp, trendDown } = resolveTrend(spx, spxTrendMa, prevTrendUp);
+  const { vix, tnx } = inputs;
+  const composite = resolveCompositeTrend(inputs, memory);
+  const { trendKnown, trendUp, trendDown } = composite;
   const highVix = vix != null && vix > VIX_NO_BREAKOUT;
   const elevatedVix = vix != null && vix >= VIX_TREND_FOLLOW && vix <= VIX_NO_BREAKOUT;
   const highRates = tnx != null && tnx > TNX_HIGH;
@@ -276,7 +520,7 @@ export function classifyMarketRegime(
   const reasons: string[] = [];
 
   if (trendDown || highVix) {
-    if (trendDown) reasons.push(`S&P 500 is below its ${MA_PERIOD}-day average (downtrend)`);
+    if (trendDown) reasons.push(`${describeBindingLeg(composite)} (downtrend)`);
     if (highVix) reasons.push(`VIX ${vix!.toFixed(1)} > ${VIX_NO_BREAKOUT} (high volatility)`);
     return { regime: 'red', rationale: reasons.join('; ') + '.' };
   }
@@ -284,11 +528,11 @@ export function classifyMarketRegime(
   if (elevatedVix || highRates || !trendKnown) {
     if (elevatedVix) reasons.push(`VIX ${vix!.toFixed(1)} in the ${VIX_TREND_FOLLOW}–${VIX_NO_BREAKOUT} mean-reversion band`);
     if (highRates) reasons.push(`10Y yield ${tnx!.toFixed(2)}% > ${TNX_HIGH}% (rate pressure)`);
-    if (!trendKnown) reasons.push('S&P 500 trend feed unavailable — defaulting to cautious');
+    if (!trendKnown) reasons.push('index trend feeds unavailable — defaulting to cautious');
     return { regime: 'yellow', rationale: reasons.join('; ') + '.' };
   }
 
-  if (trendUp) reasons.push(`S&P 500 above its ${MA_PERIOD}-day average`);
+  if (trendUp) reasons.push(describeBindingLeg(composite));
   if (vix != null) reasons.push(`VIX ${vix.toFixed(1)} < ${VIX_TREND_FOLLOW} (trend-follow)`);
   if (tnx != null) reasons.push(`10Y yield ${tnx.toFixed(2)}% ≤ ${TNX_HIGH}%`);
   return { regime: 'green', rationale: reasons.join('; ') + '.' };
@@ -302,10 +546,11 @@ export function classifyMarketRegime(
 export function deriveGates(
   regime: MarketRegimeLabel,
   inputs: RegimeInputs,
-  prevTrendUp?: boolean | null,
+  memory?: TrendMemoryInput,
 ): MarketReviewGates {
-  const { spx, spxTrendMa, vix, tnx } = inputs;
-  const { trendKnown, trendUp, trendDown } = resolveTrend(spx, spxTrendMa, prevTrendUp);
+  const { vix, tnx } = inputs;
+  const composite = resolveCompositeTrend(inputs, memory);
+  const { trendKnown, trendUp, trendDown } = composite;
   const highVix = vix != null && vix > VIX_NO_BREAKOUT;
   const elevatedVix = vix != null && vix >= VIX_TREND_FOLLOW && vix <= VIX_NO_BREAKOUT;
   const highRates = tnx != null && tnx > TNX_HIGH;
@@ -330,7 +575,113 @@ export function deriveGates(
     breakoutsEnabled: !highVix,
     sizingMultiplier,
     trendState,
+    // TRA-2197 — the per-leg detail behind the composite. Load-bearing: the
+    // next review reads `downFlipDate` back out of here to re-arm the dwell
+    // lock, so this is persisted state, not decoration.
+    trendComponents: composite.components,
+    trendBindingSymbol: composite.bindingSymbol,
   };
+}
+
+// ── TRA-2197 — truthful trend prose ──────────────────────────────────────────
+
+/** Signed percent with an explicit sign, e.g. `-0.85%` / `+1.42%`. */
+export function fmtSignedPct(fraction: number | null): string {
+  if (fraction == null || !Number.isFinite(fraction)) return 'n/a';
+  const pct = fraction * 100;
+  return `${pct >= 0 ? '+' : '-'}${Math.abs(pct).toFixed(2)}%`;
+}
+
+const BAND_LABEL = `${(TREND_HYSTERESIS * 100).toFixed(0)}%`;
+
+/**
+ * TRA-2197 — describe the leg that BINDS the composite gate, quoting its real
+ * signed distance. Replaces the old flat `S&P 500 is below its 50-day average`
+ * rationale, which named the wrong index whenever `^NDX` was the weaker leg
+ * and asserted an above/below relation the numbers did not support whenever
+ * the tolerance band was doing the holding.
+ */
+function describeBindingLeg(composite: CompositeTrendRead): string {
+  const leg =
+    composite.components.find(c => c.symbol === composite.bindingSymbol) ?? composite.components[0];
+  if (!leg || leg.state === 'unknown') return 'index trend feeds unavailable';
+  const held = leg.heldByTolerance
+    ? `, inside the ±${BAND_LABEL} band so the state is HELD by tolerance, not confirmed by price`
+    : '';
+  const others = composite.components.filter(c => c.symbol !== leg.symbol && c.state !== 'unknown');
+  const contrast =
+    others.length > 0
+      ? ` [weakest of ${composite.components.map(c => c.symbol).join('/')}; ` +
+        `${others.map(c => `${c.symbol} ${fmtSignedPct(c.distancePct)}`).join(', ')}]`
+      : '';
+  return `${leg.label} (${leg.symbol}) ${fmtSignedPct(leg.distancePct)} vs its ${MA_PERIOD}-day average${held}${contrast}`;
+}
+
+/**
+ * TRA-2197 — the per-index note. The old string was built off `trendUp` alone
+ * and therefore printed `Above 50-DMA (7471.79, ±1% band)` next to
+ * `value: 7408.30` — the prose asserting the opposite of the numbers beside
+ * it, on the exact line the desk display and the News-tab review quote.
+ *
+ * The replacement leads with the signed distance (an arithmetic fact), then
+ * says what the state is and WHY it is that: confirmed by price, or held by
+ * the tolerance band, or pinned by the same-session dwell lock.
+ */
+export function renderTrendNote(
+  component: MarketReviewTrendComponent,
+  read: TrendRead | undefined,
+  darkNote: string,
+  proxyNote = '',
+): string {
+  if (component.state === 'unknown' || component.trendMa == null) return darkNote;
+  const maLabel = `${MA_PERIOD}-DMA`;
+  const head = `${fmtSignedPct(component.distancePct)} vs ${maLabel} (${component.trendMa.toFixed(2)})`;
+  let body: string;
+  if (component.heldByTolerance) {
+    body =
+      `inside the ±${BAND_LABEL} tolerance band — trend HELD \`${component.state}\` by tolerance ` +
+      `(not confirmed by price).`;
+  } else if (component.state === 'up') {
+    body = `clear of the +${BAND_LABEL} band — confirmed uptrend.`;
+  } else {
+    body = `clear of the -${BAND_LABEL} band — confirmed downtrend.`;
+  }
+  const dwell = read?.upFlipSuppressed
+    ? ` Up-flip suppressed by the same-session dwell lock (a down transition already committed today).`
+    : '';
+  return `${head} — ${body}${dwell}${proxyNote}`;
+}
+
+/**
+ * TRA-2197 — append the COMPOSITE verdict to the leading trend reading.
+ *
+ * Deliberately takes the already-derived `gates` object rather than
+ * recomputing: a display computed from a different source than the verdict is
+ * a second source of truth, and it is the one humans quote. `orbLongs` printed
+ * here is byte-for-byte the gate the engine consumes.
+ */
+export function applyCompositeGateClause(
+  readings: MarketReviewIndexReading[],
+  gates: MarketReviewGates,
+): MarketReviewIndexReading[] {
+  const legSymbols = TREND_LEGS.map(l => l.symbol);
+  const components = gates.trendComponents ?? [];
+  const binding = components.find(c => c.symbol === gates.trendBindingSymbol);
+  const bindingClause = binding
+    ? `; ${binding.symbol} binds at ${fmtSignedPct(binding.distancePct)}`
+    : '';
+  const clause =
+    ` Composite gate trend = \`${gates.trendState ?? 'unknown'}\` ` +
+    `(weaker of ${legSymbols.join('/')}${bindingClause}) — ORB longs ${gates.orbLongs ? 'ENABLED' : 'OFF'}.`;
+  let applied = false;
+  return readings.map(r => {
+    // Anchor on the leading trend leg. `symbol` may be the ETF proxy on a
+    // fallback day, so match the component's canonical symbol via the reading
+    // order instead of a string compare against `^GSPC`.
+    if (applied || r.trendState == null) return r;
+    applied = true;
+    return { ...r, note: `${r.note}${clause}` };
+  });
 }
 
 // ── Feed reads ───────────────────────────────────────────────────────────────
@@ -369,21 +720,37 @@ export function pickSpxTrendCandles(
   yahooFallback: Candle[],
   tradierFallback: Candle[] = [],
 ): SpxTrendSource {
+  return pickTrendCandles(SPX_SYMBOL, SPX_FALLBACK_SYMBOL, primary, yahooFallback, tradierFallback);
+}
+
+/**
+ * TRA-2197 — symbol-parameterised form of {@link pickSpxTrendCandles}, so the
+ * `^NDX` leg reuses the identical three-source precedence (index → ETF proxy
+ * via Yahoo → ETF proxy via Tradier) rather than growing a second, subtly
+ * different cascade.
+ */
+export function pickTrendCandles(
+  indexSymbol: string,
+  proxySymbol: string,
+  primary: Candle[],
+  yahooFallback: Candle[],
+  tradierFallback: Candle[] = [],
+): SpxTrendSource {
   if (primary.length >= MA_PERIOD) {
-    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' };
+    return { candles: primary, symbol: indexSymbol, viaFallback: false, provider: 'yahoo' };
   }
   if (yahooFallback.length >= MA_PERIOD) {
-    return { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' };
+    return { candles: yahooFallback, symbol: proxySymbol, viaFallback: true, provider: 'yahoo' };
   }
   if (tradierFallback.length >= MA_PERIOD) {
-    return { candles: tradierFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'tradier' };
+    return { candles: tradierFallback, symbol: proxySymbol, viaFallback: true, provider: 'tradier' };
   }
   // No source has enough history — keep whichever has the most bars (preserving
   // the precedence order on ties) so `simpleMa` degrades to `null` cleanly.
   const candidates: SpxTrendSource[] = [
-    { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' },
-    { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' },
-    { candles: tradierFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'tradier' },
+    { candles: primary, symbol: indexSymbol, viaFallback: false, provider: 'yahoo' },
+    { candles: yahooFallback, symbol: proxySymbol, viaFallback: true, provider: 'yahoo' },
+    { candles: tradierFallback, symbol: proxySymbol, viaFallback: true, provider: 'tradier' },
   ];
   return candidates.reduce((best, c) => (c.candles.length > best.candles.length ? c : best));
 }
@@ -394,25 +761,27 @@ export function pickSpxTrendCandles(
  * comes up short, so a healthy `^GSPC` read costs nothing extra and the Tradier
  * call only fires when both Yahoo paths are dark (TRA-586).
  */
-async function readSpxTrend(): Promise<SpxTrendSource> {
-  const primary = await fetchDailyCandles(SPX_SYMBOL, TREND_FETCH_BARS).catch(() => [] as Candle[]);
+async function readIndexTrend(indexSymbol: string, proxySymbol: string): Promise<SpxTrendSource> {
+  const primary = await fetchDailyCandles(indexSymbol, TREND_FETCH_BARS).catch(() => [] as Candle[]);
   if (primary.length >= MA_PERIOD) {
-    return { candles: primary, symbol: SPX_SYMBOL, viaFallback: false, provider: 'yahoo' };
+    return { candles: primary, symbol: indexSymbol, viaFallback: false, provider: 'yahoo' };
   }
-  const yahooFallback = await fetchDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
+  const yahooFallback = await fetchDailyCandles(proxySymbol, TREND_FETCH_BARS).catch(
     () => [] as Candle[],
   );
   if (yahooFallback.length >= MA_PERIOD) {
-    return { candles: yahooFallback, symbol: SPX_FALLBACK_SYMBOL, viaFallback: true, provider: 'yahoo' };
+    return { candles: yahooFallback, symbol: proxySymbol, viaFallback: true, provider: 'yahoo' };
   }
   // TRA-586 — both Yahoo daily paths are dark (breaker open). Reach for the
   // Tradier `/markets/history` feed that already powers /api/health/quotes.
-  const tradierFallback = await fetchTradierDailyCandles(SPX_FALLBACK_SYMBOL, TREND_FETCH_BARS).catch(
+  const tradierFallback = await fetchTradierDailyCandles(proxySymbol, TREND_FETCH_BARS).catch(
     () => [] as Candle[],
   );
-  const picked = pickSpxTrendCandles(primary, yahooFallback, tradierFallback);
+  const picked = pickTrendCandles(indexSymbol, proxySymbol, primary, yahooFallback, tradierFallback);
   if (picked.viaFallback) {
-    log.warn('^GSPC trend feed dark — using SPY proxy', {
+    log.warn('index trend feed dark — using ETF proxy', {
+      indexSymbol,
+      proxySymbol,
       provider: picked.provider,
       primaryBars: primary.length,
       yahooFallbackBars: yahooFallback.length,
@@ -439,14 +808,17 @@ async function readVix(): Promise<number | null> {
  * `prevTrendUp` carries the prior review's trend state so the S&P 500 note
  * reflects the same ±1% hysteresis-banded read the gates use.
  */
-async function readIndexes(prevTrendUp?: boolean | null): Promise<{
+async function readIndexes(memory?: TrendMemoryInput): Promise<{
   inputs: RegimeInputs;
   readings: MarketReviewIndexReading[];
   /** TRA-586 — the resolved S&P 500 trend source (provider / fallback flags). */
   spxTrend: SpxTrendSource;
+  /** TRA-2197 — the resolved Nasdaq 100 trend source. */
+  ndxTrend: SpxTrendSource;
 }> {
-  const [spxTrend, vix, tnxQuote] = await Promise.all([
-    readSpxTrend(),
+  const [spxTrend, ndxTrend, vix, tnxQuote] = await Promise.all([
+    readIndexTrend(SPX_SYMBOL, SPX_FALLBACK_SYMBOL),
+    readIndexTrend(NDX_SYMBOL, NDX_FALLBACK_SYMBOL),
     readVix(),
     fetchQuote(TNX_SYMBOL).catch(() => null),
   ]);
@@ -454,22 +826,42 @@ async function readIndexes(prevTrendUp?: boolean | null): Promise<{
   const spxCandles = spxTrend.candles;
   const spx = spxCandles.length > 0 ? spxCandles[spxCandles.length - 1].close : null;
   const spxTrendMa = simpleMa(spxCandles, MA_PERIOD);
+  const ndxCandles = ndxTrend.candles;
+  const ndx = ndxCandles.length > 0 ? ndxCandles[ndxCandles.length - 1].close : null;
+  const ndxTrendMa = simpleMa(ndxCandles, MA_PERIOD);
   const tnx = normalizeTnx(tnxQuote?.price ?? null);
 
-  const inputs: RegimeInputs = { spx, spxTrendMa, vix, tnx };
+  const inputs: RegimeInputs = { spx, spxTrendMa, ndx, ndxTrendMa, vix, tnx };
 
-  const spxProxyNote = spxTrend.viaFallback
-    ? spxTrend.provider === 'tradier'
-      ? ' (via SPY/Tradier proxy — Yahoo ^GSPC + SPY feed down)'
-      : ' (via SPY proxy — ^GSPC feed down)'
-    : '';
-  const trend = resolveTrend(spx, spxTrendMa, prevTrendUp);
-  const maLabel = `${MA_PERIOD}-DMA`;
-  const spxNote = !trend.trendKnown
-    ? 'Feed unavailable — trend filter cannot be confirmed (^GSPC, SPY/Yahoo and SPY/Tradier all unreachable).'
-    : trend.trendUp
-      ? `Above ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — uptrend, ORB longs enabled.${spxProxyNote}`
-      : `Below ${maLabel} (${spxTrendMa!.toFixed(2)}, ±1% band) — downtrend, ORB longs OFF.${spxProxyNote}`;
+  const proxyNote = (src: SpxTrendSource, indexSymbol: string, proxySymbol: string): string =>
+    !src.viaFallback
+      ? ''
+      : src.provider === 'tradier'
+        ? ` (via ${proxySymbol}/Tradier proxy — Yahoo ${indexSymbol} + ${proxySymbol} feed down)`
+        : ` (via ${proxySymbol} proxy — ${indexSymbol} feed down)`;
+  const darkNote = (indexSymbol: string, proxySymbol: string): string =>
+    `Feed unavailable — trend filter cannot be confirmed (${indexSymbol}, ${proxySymbol}/Yahoo and ${proxySymbol}/Tradier all unreachable).`;
+
+  // Resolve the composite here so each leg's note quotes the SAME read the
+  // gates are derived from. The composite verdict + ORB clause is appended
+  // later by `applyCompositeGateClause`, off the real gates object.
+  const composite = resolveCompositeTrend(inputs, memory);
+  const bySymbol = new Map(composite.components.map(c => [c.symbol, c]));
+  const spxComponent = bySymbol.get(SPX_SYMBOL)!;
+  const ndxComponent = bySymbol.get(NDX_SYMBOL)!;
+
+  const spxNote = renderTrendNote(
+    spxComponent,
+    composite.reads[SPX_SYMBOL],
+    darkNote(SPX_SYMBOL, SPX_FALLBACK_SYMBOL),
+    proxyNote(spxTrend, SPX_SYMBOL, SPX_FALLBACK_SYMBOL),
+  );
+  const ndxNote = renderTrendNote(
+    ndxComponent,
+    composite.reads[NDX_SYMBOL],
+    darkNote(NDX_SYMBOL, NDX_FALLBACK_SYMBOL),
+    proxyNote(ndxTrend, NDX_SYMBOL, NDX_FALLBACK_SYMBOL),
+  );
   const vixNote =
     vix == null
       ? 'Feed unavailable.'
@@ -486,12 +878,34 @@ async function readIndexes(prevTrendUp?: boolean | null): Promise<{
         : `≤ ${TNX_HIGH}% — no rate-driven sizing cut.`;
 
   const readings: MarketReviewIndexReading[] = [
-    { symbol: spxTrend.symbol, label: 'S&P 500', value: spx, trendMa: spxTrendMa, note: spxNote },
+    {
+      symbol: spxTrend.symbol,
+      label: 'S&P 500',
+      value: spx,
+      trendMa: spxTrendMa,
+      note: spxNote,
+      trendState: spxComponent.state,
+      distancePct: spxComponent.distancePct,
+      heldByTolerance: spxComponent.heldByTolerance,
+    },
+    // TRA-2197 — the second gating leg, surfaced in its own right so the desk
+    // can see a ^GSPC/^NDX divergence (2026-07-23: -0.85% vs -3.67%) instead of
+    // only the index whose deficit was small enough to be papered over.
+    {
+      symbol: ndxTrend.symbol,
+      label: 'Nasdaq 100',
+      value: ndx,
+      trendMa: ndxTrendMa,
+      note: ndxNote,
+      trendState: ndxComponent.state,
+      distancePct: ndxComponent.distancePct,
+      heldByTolerance: ndxComponent.heldByTolerance,
+    },
     { symbol: VIX_SYMBOL, label: 'VIX', value: vix, trendMa: null, note: vixNote },
     { symbol: TNX_SYMBOL, label: '10Y Yield', value: tnx, trendMa: null, note: tnxNote },
   ];
 
-  return { inputs, readings, spxTrend };
+  return { inputs, readings, spxTrend, ndxTrend };
 }
 
 // ── Markdown rendering ───────────────────────────────────────────────────────
@@ -523,14 +937,25 @@ function renderMarkdown(review: MarketReview): string {
   lines.push('');
   lines.push('## Index readings');
   lines.push('');
-  lines.push(`| Index | Value | ${MA_PERIOD}-DMA | Read |`);
-  lines.push('|---|---|---|---|');
+  // TRA-2197 — the signed distance gets its own column. The defect this closes
+  // was a note asserting "Above 50-DMA" beside a value that was below it; the
+  // arithmetic now sits in the table where a reader cannot skip past it.
+  lines.push(`| Index | Value | ${MA_PERIOD}-DMA | vs MA | Read |`);
+  lines.push('|---|---|---|---|---|');
   for (const r of indexes) {
-    lines.push(`| ${r.label} | ${fmt(r.value)} | ${fmt(r.trendMa)} | ${r.note} |`);
+    const dist = r.trendMa == null ? '—' : fmtSignedPct(r.distancePct ?? null);
+    lines.push(`| ${r.label} | ${fmt(r.value)} | ${fmt(r.trendMa)} | ${dist} | ${r.note} |`);
   }
   lines.push('');
   lines.push('## Strategy gates');
   lines.push('');
+  // TRA-2197 — print the composite trend and the leg that binds it, so the
+  // gate line and the index table can never tell different stories.
+  const binding = (gates.trendComponents ?? []).find(c => c.symbol === gates.trendBindingSymbol);
+  const bindingClause = binding ? ` — binding leg ${binding.symbol} at ${fmtSignedPct(binding.distancePct)}` : '';
+  lines.push(
+    `- **Trend (composite, weaker of ^GSPC/^NDX):** ${gates.trendState ?? 'unknown'}${bindingClause}`,
+  );
   lines.push(`- **ORB longs:** ${gates.orbLongs ? 'enabled' : 'OFF'}`);
   lines.push(`- **ORB shorts:** ${gates.orbShorts ? 'enabled' : 'OFF'}`);
   lines.push(`- **Mean-reversion tilt:** ${gates.meanReversionTilt ? 'on' : 'off'}`);
@@ -554,28 +979,20 @@ function etDate(now: Date = new Date()): string {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * TRA-472 — map a persisted review's `trendState` gate into the `prevTrendUp`
- * the hysteresis band consumes: `'up'` → true, `'down'` → false, and
- * `'unknown'`/absent → `null` (cold-store seed via the plain comparison).
+ * TRA-472 / TRA-2197 — the most-recent persisted review's per-leg trend state,
+ * plus the current ET session date, folded into the {@link TrendMemory} the
+ * hysteresis band and the dwell lock consume. Read-only — used by both the
+ * persisting {@link generateMarketReview} and the read-only
+ * {@link peekMarketRegime}, so the two can never disagree about the prior
+ * state they are holding from.
  */
-function trendStateToPrev(
-  state: 'up' | 'down' | 'unknown' | undefined,
-): boolean | null {
-  return state === 'up' ? true : state === 'down' ? false : null;
-}
-
-/**
- * The most-recent persisted review's trend state, mapped to the `prevTrendUp`
- * the ±1% hysteresis band consumes. Read-only — used by both the persisting
- * {@link generateMarketReview} and the read-only {@link peekMarketRegime}.
- */
-async function latestPrevTrendUp(): Promise<boolean | null> {
+async function latestTrendMemory(now: Date): Promise<TrendMemory> {
   const persisted = await ensureLoaded();
   const latestPrior =
     persisted.length > 0
       ? persisted.reduce((a, b) => (b.generatedAt > a.generatedAt ? b : a))
       : null;
-  return trendStateToPrev(latestPrior?.gates.trendState);
+  return buildTrendMemory(latestPrior?.gates, etDate(now));
 }
 
 /**
@@ -604,16 +1021,16 @@ export interface MarketRegimePeek {
  * store. Reads the persisted latest review only to thread `prevTrendUp` into the
  * hysteresis band. Never persists, never publishes.
  */
-export async function peekMarketRegime(): Promise<MarketRegimePeek> {
-  const prevTrendUp = await latestPrevTrendUp();
-  const { inputs, readings, spxTrend } = await readIndexes(prevTrendUp);
-  const { regime, rationale } = classifyMarketRegime(inputs, prevTrendUp);
-  const gates = deriveGates(regime, inputs, prevTrendUp);
+export async function peekMarketRegime(now: Date = new Date()): Promise<MarketRegimePeek> {
+  const memory = await latestTrendMemory(now);
+  const { inputs, readings, spxTrend } = await readIndexes(memory);
+  const { regime, rationale } = classifyMarketRegime(inputs, memory);
+  const gates = deriveGates(regime, inputs, memory);
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt: now.toISOString(),
     regime,
     regimeRationale: rationale,
-    indexes: readings,
+    indexes: applyCompositeGateClause(readings, gates),
     gates,
     spxTrendProvider: inputs.spx == null ? null : spxTrend.provider,
     spxTrendViaFallback: spxTrend.viaFallback,
@@ -634,15 +1051,17 @@ export async function generateMarketReview(
   const now = new Date();
   const date = etDate(now);
 
-  // TRA-472 — thread the most-recent persisted review's trend state into the
-  // ±1% hysteresis band so a price inside the band holds rather than flips.
-  // On a cold store this is `null` and `resolveTrend` seeds from `spx ≥ MA`.
-  const prevTrendUp = await latestPrevTrendUp();
+  // TRA-472 / TRA-2197 — thread the most-recent persisted review's per-leg
+  // trend state (and its dwell-lock dates) into the ±1% hysteresis band so a
+  // price inside the band holds rather than flips, and a leg that already went
+  // `down` today cannot flip back `up` in the same session. On a cold store the
+  // states map is empty and `resolveTrend` seeds from `px ≥ MA`.
+  const memory = await latestTrendMemory(now);
 
-  let inputs: RegimeInputs = { spx: null, spxTrendMa: null, vix: null, tnx: null };
+  let inputs: RegimeInputs = { spx: null, spxTrendMa: null, ndx: null, ndxTrendMa: null, vix: null, tnx: null };
   let readings: MarketReviewIndexReading[] = [];
   try {
-    const read = await readIndexes(prevTrendUp);
+    const read = await readIndexes(memory);
     inputs = read.inputs;
     readings = read.readings;
   } catch (err) {
@@ -653,13 +1072,15 @@ export async function generateMarketReview(
     });
     readings = [
       { symbol: SPX_SYMBOL, label: 'S&P 500', value: null, trendMa: null, note: 'Feed unavailable.' },
+      { symbol: NDX_SYMBOL, label: 'Nasdaq 100', value: null, trendMa: null, note: 'Feed unavailable.' },
       { symbol: VIX_SYMBOL, label: 'VIX', value: null, trendMa: null, note: 'Feed unavailable.' },
       { symbol: TNX_SYMBOL, label: '10Y Yield', value: null, trendMa: null, note: 'Feed unavailable.' },
     ];
   }
 
-  const { regime, rationale } = classifyMarketRegime(inputs, prevTrendUp);
-  const gates = deriveGates(regime, inputs, prevTrendUp);
+  const { regime, rationale } = classifyMarketRegime(inputs, memory);
+  const gates = deriveGates(regime, inputs, memory);
+  readings = applyCompositeGateClause(readings, gates);
 
   const review: MarketReview = {
     id: `${kind}-${date}`,
@@ -762,7 +1183,7 @@ export async function generateMarketReview(
       title: `${kindLabel} Review — ${date} (auto)`,
       bodyMarkdown: renderMarkdown(review) + enrichmentMarkdown,
       publishedAt: review.generatedAt,
-      tickers: [SPX_SYMBOL, VIX_SYMBOL, TNX_SYMBOL],
+      tickers: [SPX_SYMBOL, NDX_SYMBOL, VIX_SYMBOL, TNX_SYMBOL],
     });
   } catch (err) {
     log.error('failed to publish research report', {
@@ -777,8 +1198,12 @@ export async function generateMarketReview(
     regime,
     spx: fmt(inputs.spx),
     trendMa: fmt(inputs.spxTrendMa),
+    ndx: fmt(inputs.ndx ?? null),
+    ndxTrendMa: fmt(inputs.ndxTrendMa ?? null),
     vix: fmt(inputs.vix),
     tnx: fmt(inputs.tnx),
+    trendState: gates.trendState,
+    trendBindingSymbol: gates.trendBindingSymbol,
     sizingMultiplier: gates.sizingMultiplier,
   });
 

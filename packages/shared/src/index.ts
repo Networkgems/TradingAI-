@@ -3206,6 +3206,54 @@ export interface MarketReviewIndexReading {
   trendMa: number | null;
   /** One-line interpretation of this reading. */
   note: string;
+  /**
+   * TRA-2197 — this index's OWN trend state, so the desk can see a divergence
+   * between ^GSPC and ^NDX instead of only the composite. Absent on the
+   * non-trend readings (VIX / 10Y) and on reviews persisted before TRA-2197.
+   */
+  trendState?: 'up' | 'down' | 'unknown';
+  /**
+   * TRA-2197 — signed distance of `value` from `trendMa` as a FRACTION
+   * (`-0.0085` ↔ 0.85% *below* the MA). The defect this closes: the note used
+   * to assert "Above 50-DMA" for a close that was below it but inside the
+   * tolerance band, so the prose contradicted the numbers beside it.
+   */
+  distancePct?: number | null;
+  /**
+   * TRA-2197 — true ↔ `trendState` is carried by the ±1% tolerance band rather
+   * than confirmed by price (price sits inside the band). A `true` here on an
+   * `'up'` state means the uptrend is an inherited assumption, not a reading.
+   */
+  heldByTolerance?: boolean;
+}
+
+/**
+ * TRA-2197 — per-index leg of the composite trend gate. The gate used to grade
+ * `^GSPC` alone while the engine's equity universe behaves like `^NDX`; it now
+ * resolves each index independently and gates on the WEAKER of the two.
+ */
+export interface MarketReviewTrendComponent {
+  /** Canonical index symbol the leg is keyed on (`^GSPC` / `^NDX`) — never the ETF proxy. */
+  symbol: string;
+  /** Human label (`S&P 500`, `Nasdaq 100`). */
+  label: string;
+  /** Latest close for this index, or `null` when every feed for it was dark. */
+  value: number | null;
+  /** This index's own trend MA, or `null`. */
+  trendMa: number | null;
+  /** Resolved state for THIS index alone (not the composite). */
+  state: 'up' | 'down' | 'unknown';
+  /** Signed distance from `trendMa` as a fraction; `null` when dark. */
+  distancePct: number | null;
+  /** True ↔ the state is held by the tolerance band, not confirmed by price. */
+  heldByTolerance: boolean;
+  /**
+   * ET date (`YYYY-MM-DD`) on which this leg's most recent `up → down`
+   * transition committed. The dwell lock: while this equals the current
+   * session's date the leg refuses to flip back to `up`, so the state cannot
+   * reverse twice inside one session.
+   */
+  downFlipDate?: string | null;
 }
 
 /**
@@ -3235,8 +3283,28 @@ export interface MarketReviewGates {
    * suppression to the real cause instead of always reporting a downtrend
    * (the gate-reason contradiction TRA-468 surfaced). Optional so reviews
    * persisted before TRA-469 still deserialise.
+   *
+   * TRA-2197 — this is now the COMPOSITE state across `^GSPC` and `^NDX`,
+   * resolved to the weaker of the two (fail-safe): `'up'` only when every
+   * readable index is up. Per-index states live in {@link trendComponents}.
    */
   trendState?: 'up' | 'down' | 'unknown';
+  /**
+   * TRA-2197 — the per-index legs the composite {@link trendState} was folded
+   * from, newest state included. Carries the dwell-lock bookkeeping
+   * (`downFlipDate`) that the next review threads back in, so this field is
+   * load-bearing state, not just a display. Optional so reviews persisted
+   * before TRA-2197 still deserialise (they degrade to a single `^GSPC` leg
+   * seeded from `trendState`).
+   */
+  trendComponents?: MarketReviewTrendComponent[];
+  /**
+   * TRA-2197 — canonical symbol of the leg that BINDS the composite (the
+   * weakest readable index by signed distance from its MA). `null` when every
+   * trend feed is dark. This is the index a reader should look at to
+   * understand why the gate says what it says.
+   */
+  trendBindingSymbol?: string | null;
 }
 
 export interface MarketReview {

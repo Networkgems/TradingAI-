@@ -37,7 +37,13 @@ import {
   deriveGates,
   normalizeTnx,
   pickSpxTrendCandles,
+  pickTrendCandles,
   resolveTrend,
+  resolveCompositeTrend,
+  buildTrendMemory,
+  renderTrendNote,
+  applyCompositeGateClause,
+  fmtSignedPct,
   simpleMa,
   listMarketReviews,
   getLatestMarketReview,
@@ -143,6 +149,244 @@ describe('resolveTrend (TRA-472 hysteresis band)', () => {
     const dark = resolveTrend(null, null);
     expect(dark.trendUp).toBe(false);
     expect(dark.trendDown).toBe(false);
+  });
+});
+
+// ── TRA-2197 — composite trend gate, dwell lock, truthful note ───────────────
+
+/**
+ * The 2026-07-23 close, pinned verbatim from the `GET /api/market-review/latest`
+ * payload that surfaced the defect. `^GSPC` sits 0.85% UNDER its 50-DMA — inside
+ * the ±1% band, so the old single-index gate held `up` and printed
+ * `Above 50-DMA (7471.79, ±1% band)` beside `value: 7408.30` — while `^NDX`, the
+ * index the engine's mega-cap-tech universe actually tracks, was 3.67% under its
+ * own MA and outside any band.
+ */
+const JUL23: RegimeInputs = {
+  spx: 7408.2998046875,
+  spxTrendMa: 7471.79302734375,
+  ndx: 28454.81,
+  ndxTrendMa: 29538.6,
+  vix: 13,
+  tnx: 4.0,
+};
+
+describe('TRA-2197 — composite ^GSPC/^NDX trend gate', () => {
+  // AC 4 — the fixture that must NOT produce `orbLongs: true`.
+  it('2026-07-23 fixture: does not enable ORB longs (^NDX binds at -3.67%)', () => {
+    // The prior review said `up` — exactly the state the old gate inherited
+    // through the band. The NDX leg must override it anyway.
+    const memory = { states: { '^GSPC': 'up' as const, '^NDX': 'up' as const } };
+    const gates = deriveGates('yellow', JUL23, memory);
+    expect(gates.orbLongs).toBe(false);
+    expect(gates.trendState).toBe('down');
+    expect(gates.trendBindingSymbol).toBe('^NDX');
+    // …and the regime the same inputs classify to is RED, not YELLOW.
+    expect(classifyMarketRegime(JUL23, memory).regime).toBe('red');
+  });
+
+  // AC 3 — the fold is to the WEAKER leg, in both directions.
+  it('folds to the weaker leg: `up` only when every readable index is up', () => {
+    const up: RegimeInputs = {
+      spx: 5100,
+      spxTrendMa: 5000,
+      ndx: 20400,
+      ndxTrendMa: 20000,
+      vix: 13,
+      tnx: 4.0,
+    };
+    expect(deriveGates('green', up).trendState).toBe('up');
+    // ^GSPC strongly up, ^NDX clearly below its band → composite down.
+    const gates = deriveGates('green', { ...up, ndx: 19600 }); // -2% vs its MA
+    expect(gates.trendState).toBe('down');
+    expect(gates.orbLongs).toBe(false);
+    expect(gates.orbShorts).toBe(true);
+    expect(gates.trendBindingSymbol).toBe('^NDX');
+    // Symmetrically: a weak ^GSPC binds when IT is the laggard.
+    const inverse = deriveGates('green', { ...up, spx: 4900 });
+    expect(inverse.trendState).toBe('down');
+    expect(inverse.trendBindingSymbol).toBe('^GSPC');
+  });
+
+  it('a dark leg is skipped, not fatal — the readable leg still gates', () => {
+    const gates = deriveGates('green', {
+      spx: 5100,
+      spxTrendMa: 5000,
+      ndx: null,
+      ndxTrendMa: null,
+      vix: 13,
+      tnx: 4.0,
+    });
+    expect(gates.trendState).toBe('up');
+    expect(gates.trendBindingSymbol).toBe('^GSPC');
+    expect(gates.trendComponents?.find(c => c.symbol === '^NDX')?.state).toBe('unknown');
+    // Every leg dark → unknown, exactly as before TRA-2197.
+    const allDark = deriveGates('yellow', { spx: null, spxTrendMa: null, vix: 13, tnx: 4.0 });
+    expect(allDark.trendState).toBe('unknown');
+    expect(allDark.trendBindingSymbol).toBeNull();
+  });
+
+  it('back-compat: a bare `prevTrendUp` boolean still seeds the ^GSPC leg', () => {
+    const inBand: RegimeInputs = { spx: 4975, spxTrendMa: 5000, vix: 13, tnx: 4.0 };
+    expect(deriveGates('green', inBand, true).trendState).toBe('up');
+    expect(deriveGates('green', inBand, false).trendState).toBe('down');
+  });
+});
+
+// AC 2 — the state cannot flip twice in one session on a sub-band oscillation.
+describe('TRA-2197 — same-session dwell lock', () => {
+  const MA = 7471.79302734375;
+  const SESSION = '2026-07-24';
+
+  /**
+   * Replay a price path the way production does: derive gates, fold them into
+   * the {@link buildTrendMemory} the next review threads back in, repeat. This
+   * exercises the real persistence round-trip, not a hand-built memory object.
+   */
+  function replay(path: number[], sessionDates: string[], seed: 'up' | 'down' = 'up') {
+    let memory = buildTrendMemory(
+      { orbLongs: false, orbShorts: false, meanReversionTilt: false, breakoutsEnabled: true, sizingMultiplier: 1, trendState: seed },
+      sessionDates[0],
+    );
+    const states: Array<'up' | 'down' | 'unknown'> = [];
+    path.forEach((px, i) => {
+      const inputs: RegimeInputs = { spx: px, spxTrendMa: MA, vix: 13, tnx: 4.0 };
+      const gates = deriveGates('green', inputs, { ...memory, sessionDate: sessionDates[i] });
+      states.push(gates.trendState ?? 'unknown');
+      memory = buildTrendMemory(gates, sessionDates[i]);
+    });
+    return states;
+  }
+
+  it('crosses the -1% floor three times in one session and flips exactly once', () => {
+    // floor = MA*0.99 = 7397.08. Every rebound stays INSIDE the band, so the
+    // oscillation is strictly smaller than the band width.
+    const path = [7420, 7390, 7420, 7385, 7425, 7396, 7430];
+    const states = replay(
+      path,
+      path.map(() => SESSION),
+    );
+    expect(states).toEqual(['up', 'down', 'down', 'down', 'down', 'down', 'down']);
+    const transitions = states.filter((s, i) => i > 0 && s !== states[i - 1]).length;
+    expect(transitions).toBe(1);
+  });
+
+  it('refuses the up-flip in-session even on a violent reversal clear of the +1% band', () => {
+    // Down through the floor, then a 2%+ intraday rip clear of the upper band.
+    const path = [7420, 7380, 7560];
+    const states = replay(
+      path,
+      path.map(() => SESSION),
+    );
+    expect(states).toEqual(['up', 'down', 'down']);
+  });
+
+  it('releases the lock at the session boundary (no expiry sweep needed)', () => {
+    const states = replay([7420, 7380, 7560, 7560], [SESSION, SESSION, SESSION, '2026-07-27']);
+    expect(states).toEqual(['up', 'down', 'down', 'up']);
+  });
+
+  it('never blocks the restrictive direction — `→ down` is always immediate', () => {
+    // Seeded down, ripped up clear of the band, then straight back below the
+    // floor in the SAME session: the down flip must land.
+    const states = replay([7560, 7380], [SESSION, SESSION], 'down');
+    expect(states).toEqual(['up', 'down']);
+  });
+
+  it('buildTrendMemory degrades a pre-TRA-2197 review to a seeded ^GSPC leg', () => {
+    const legacy = buildTrendMemory(
+      { orbLongs: true, orbShorts: false, meanReversionTilt: false, breakoutsEnabled: true, sizingMultiplier: 1, trendState: 'up' },
+      SESSION,
+    );
+    expect(legacy.states).toEqual({ '^GSPC': 'up' });
+    expect(legacy.sessionDate).toBe(SESSION);
+    // …and a cold store stays cold rather than inventing a state.
+    expect(buildTrendMemory(null, SESSION).states).toEqual({});
+  });
+});
+
+// AC 1 — the note must state the true signed distance, never "Above 50-DMA".
+describe('TRA-2197 — truthful trend prose', () => {
+  function noteFor(
+    inputs: RegimeInputs,
+    symbol: string,
+    memory?: Parameters<typeof resolveCompositeTrend>[1],
+  ): string {
+    const composite = resolveCompositeTrend(inputs, memory);
+    const component = composite.components.find(c => c.symbol === symbol)!;
+    return renderTrendNote(component, composite.reads[symbol], 'Feed unavailable.');
+  }
+
+  it('a below-MA close held by tolerance says so, and never says "Above"', () => {
+    const note = noteFor(JUL23, '^GSPC', { states: { '^GSPC': 'up', '^NDX': 'up' } });
+    expect(note).not.toMatch(/Above 50-DMA/i);
+    expect(note).toContain('-0.85%');
+    expect(note).toContain('7471.79');
+    expect(note).toMatch(/HELD `up` by tolerance/);
+    expect(note).toMatch(/not confirmed by price/);
+  });
+
+  it('a leg clear of the band is described as confirmed, not held', () => {
+    const note = noteFor({ spx: 5100, spxTrendMa: 5000, vix: 13, tnx: 4.0 }, '^GSPC');
+    expect(note).toContain('+2.00%');
+    expect(note).toMatch(/confirmed uptrend/);
+    expect(note).not.toMatch(/tolerance/);
+    // The NDX 2026-07-23 leg, 3.67% under water, reads as a confirmed downtrend.
+    expect(noteFor(JUL23, '^NDX')).toMatch(/-3\.67% vs 50-DMA .*confirmed downtrend/);
+  });
+
+  it('surfaces the dwell lock in the prose when it suppressed an up-flip', () => {
+    const note = noteFor({ spx: 7560, spxTrendMa: 7471.79302734375, vix: 13, tnx: 4.0 }, '^GSPC', {
+      states: { '^GSPC': 'down' },
+      downFlipDates: { '^GSPC': '2026-07-24' },
+      sessionDate: '2026-07-24',
+    });
+    expect(note).toMatch(/dwell lock/i);
+  });
+
+  it('a dark leg renders the dark note, not a fabricated distance', () => {
+    expect(noteFor({ spx: null, spxTrendMa: null, vix: 13, tnx: 4.0 }, '^GSPC')).toBe(
+      'Feed unavailable.',
+    );
+  });
+
+  it('fmtSignedPct always carries an explicit sign', () => {
+    expect(fmtSignedPct(-0.0085)).toBe('-0.85%');
+    expect(fmtSignedPct(0.0142)).toBe('+1.42%');
+    expect(fmtSignedPct(0)).toBe('+0.00%');
+    expect(fmtSignedPct(null)).toBe('n/a');
+  });
+
+  it('the composite clause quotes the SAME gates object the engine consumes', () => {
+    const gates = deriveGates('red', JUL23, { states: { '^GSPC': 'up', '^NDX': 'up' } });
+    const readings = applyCompositeGateClause(
+      [
+        { symbol: '^GSPC', label: 'S&P 500', value: JUL23.spx, trendMa: JUL23.spxTrendMa, note: 'x', trendState: 'up' },
+        { symbol: '^NDX', label: 'Nasdaq 100', value: JUL23.ndx ?? null, trendMa: JUL23.ndxTrendMa ?? null, note: 'y', trendState: 'down' },
+        { symbol: '^VIX', label: 'VIX', value: 13, trendMa: null, note: 'z' },
+      ],
+      gates,
+    );
+    // Appended exactly once, on the leading trend leg.
+    expect(readings[0].note).toContain('ORB longs OFF');
+    expect(readings[0].note).toContain('^NDX binds at -3.67%');
+    expect(readings[1].note).toBe('y');
+    expect(readings[2].note).toBe('z');
+  });
+});
+
+// TRA-2197 — the ^NDX leg reuses the identical index → ETF → Tradier cascade.
+describe('pickTrendCandles (TRA-2197 symbol-parameterised)', () => {
+  it('prefers the index feed, then the ETF proxy, then Tradier', () => {
+    const full = candles(Array.from({ length: MA_PERIOD }, (_, i) => 20000 + i));
+    expect(pickTrendCandles('^NDX', 'QQQ', full, [], []).symbol).toBe('^NDX');
+    expect(pickTrendCandles('^NDX', 'QQQ', [], full, []).symbol).toBe('QQQ');
+    expect(pickTrendCandles('^NDX', 'QQQ', [], full, []).viaFallback).toBe(true);
+    expect(pickTrendCandles('^NDX', 'QQQ', [], [], full).provider).toBe('tradier');
+  });
+
+  it('keeps the longest series when no source has MA_PERIOD bars', () => {
+    expect(pickTrendCandles('^NDX', 'QQQ', candles([1]), candles([1, 2, 3]), []).candles).toHaveLength(3);
   });
 });
 
