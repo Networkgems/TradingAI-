@@ -534,6 +534,53 @@ export function getTradierBarPullRateState(now: number = Date.now()): {
   return { requestsLastMin: count, windowSec: BAR_PULL_RATE_WINDOW_MS / 1000 };
 }
 
+// TRA-2170 — process-global bar-pull ceiling (req/min). Default DISABLED
+// (Infinity) so the wired throttle is provably inert on the frozen bqb1 host
+// until an operator opts in via the env knob. Spec target when enabled: ~150
+// (reserve ~50/min under the ~200/min account-wide Tradier market-data budget).
+// See barPullThrottleGate below for the scope caveat (this is NOT the C4 fix).
+const TRADIER_BAR_PULL_CEILING = (() => {
+  const raw = Number(process.env['TRADIER_BAR_PULL_CEILING']);
+  return Number.isFinite(raw) && raw > 0 ? raw : Number.POSITIVE_INFINITY;
+})();
+
+/**
+ * TRA-2170 — process-global bar-pull ceiling that reserves account-quota headroom
+ * for the freshness-critical quote path. Pure so it can be unit-tested like
+ * {@link tradierBreakerGate}.
+ *
+ * SCOPE CAVEAT (read before enabling): this ceiling was proposed as "the real
+ * TRA-1996 C4 fix" on the shared-quota-exhaustion theory. That theory was
+ * FALSIFIED at the byte level on the 2026-07-22 Render tape (TRA-1996 comment
+ * `159816ca`): at all six `stale-state` windows `quotePathOpen` was false, zero
+ * `Quota Violation`, zero quote-breaker trips — the C4 dark-feed was quote-
+ * freshness STAMP starvation, fixed by `e5f43b4` (decoupled 30s quote refresh,
+ * live on bqb1). This ceiling is therefore NOT the C4 remedy. It is retained as
+ * OPT-IN quota-headroom / doTick-I/O-relief insurance (the 568-symbol signal
+ * doTick wall-clock 900-1489s problem): trimming COLD bar-pull volume reduces
+ * per-tick upstream I/O and keeps total load under the account budget.
+ *
+ * Decision:
+ *   • disabled (unset / non-positive / non-finite ceiling) → never defer;
+ *   • hot / active-interest pulls → never defer (live entry/exit needs fresh bars);
+ *   • deep-MTF snapshot pulls (`count >= MTF_DEPTH_THRESHOLD`) → never defer;
+ *   • cold pulls → defer only once the process-global bar-pull rate has reached
+ *     the ceiling (the caller then serves cached bars instead of hitting Tradier).
+ */
+export function barPullThrottleGate(input: {
+  isActiveInterest: boolean;
+  isDeepMtf: boolean;
+  barPullsLastMin: number;
+  ceiling: number;
+}): { allowed: boolean; reason: string } {
+  const { isActiveInterest, isDeepMtf, barPullsLastMin, ceiling } = input;
+  if (!(Number.isFinite(ceiling) && ceiling > 0)) return { allowed: true, reason: 'ceiling_disabled' };
+  if (isActiveInterest) return { allowed: true, reason: 'active_interest' };
+  if (isDeepMtf) return { allowed: true, reason: 'deep_mtf' };
+  if (barPullsLastMin >= ceiling) return { allowed: false, reason: 'cold_deferred_ceiling' };
+  return { allowed: true, reason: 'under_ceiling' };
+}
+
 // ── Per-symbol minute-bar cache ──────────────────────────────────────────────
 // fetchMinuteBarsWithSource is called once per active symbol per 30-second
 // signal-engine tick. Bars only refresh on the minute boundary, so two ticks
@@ -1115,6 +1162,9 @@ export async function fetchMinuteBarsWithSource(
   source: MinuteBarSource;
   yahooSkipped: boolean;
   cached?: boolean;
+  // TRA-2170: true when the bar-pull ceiling deferred a cold pull and we served
+  // cached (possibly expired) bars instead of hitting Tradier.
+  coldDeferred?: boolean;
   tradierDiag?: TradierCandleDiag;
   twelveDataDiag?: TwelveDataCandleDiag;
 }> {
@@ -1138,6 +1188,26 @@ export async function fetchMinuteBarsWithSource(
   const fresh = minuteBarCache.get(symbol);
   if (fresh && canReuseCachedTradierBars(fresh, count, Date.now(), isActiveInterest(symbol))) {
     return { bars: fresh.bars.slice(-count), source: 'tradier', yahooSkipped, cached: true };
+  }
+
+  // TRA-2170 — process-global bar-pull ceiling (opt-in; DISABLED by default).
+  // Before joining the singleflight / hitting Tradier, defer a COLD pull once the
+  // reserved bar-pull ceiling is reached and serve cached (even expired) bars
+  // instead, preserving account-quota headroom for the freshness-critical quote
+  // path. Hot/active-interest and deep-MTF pulls are never deferred; a never-seen
+  // symbol (no cached bars) falls through and still pulls.
+  const throttle = barPullThrottleGate({
+    isActiveInterest: isActiveInterest(symbol),
+    isDeepMtf: count >= MTF_DEPTH_THRESHOLD,
+    barPullsLastMin: getTradierBarPullRateState().requestsLastMin,
+    ceiling: TRADIER_BAR_PULL_CEILING,
+  });
+  if (!throttle.allowed) {
+    const stale = minuteBarCache.get(symbol);
+    if (stale && stale.bars.length > 0) {
+      return { bars: stale.bars.slice(-count), source: stale.source, yahooSkipped, cached: true, coldDeferred: true };
+    }
+    // never-seen symbol: nothing to serve — fall through and pull.
   }
 
   // TRA-739 singleflight: tier the key by depth so std (count<MTF_DEPTH_THRESHOLD)

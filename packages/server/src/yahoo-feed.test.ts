@@ -12,6 +12,7 @@ import {
   shouldTripTradierBreaker,
   getFeedDegradationState,
   tradierBreakerGate,
+  barPullThrottleGate,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -435,6 +436,38 @@ describe('tradierBreakerGate (TRA-1996 per-source breaker split)', () => {
     const g = tradierBreakerGate(NOW, /*bar*/ OPEN, /*quote*/ PAST);
     expect(g.barBlocked).toBe(true);
     expect(g.quoteBlocked).toBe(false);
+  });
+});
+
+// TRA-2170 — process-global bar-pull ceiling. Reserves account-quota headroom for
+// the freshness-critical quote path by deferring COLD bar pulls once the reserved
+// ceiling is reached. NB: this is NOT the TRA-1996 C4 fix (that theory was falsified
+// at the byte level; `e5f43b4` decoupled-quote-refresh is the C4 fix) — it is opt-in
+// quota-headroom / doTick-I/O-relief insurance, DISABLED by default.
+describe('barPullThrottleGate (TRA-2170 bar-pull ceiling)', () => {
+  const base = { isActiveInterest: false, isDeepMtf: false, barPullsLastMin: 999, ceiling: 150 };
+
+  it('defers a COLD pull once bar-pull rate reaches the ceiling', () => {
+    expect(barPullThrottleGate({ ...base, barPullsLastMin: 150 })).toEqual({ allowed: false, reason: 'cold_deferred_ceiling' });
+    expect(barPullThrottleGate({ ...base, barPullsLastMin: 220 }).allowed).toBe(false);
+  });
+
+  it('allows a COLD pull while under the ceiling', () => {
+    expect(barPullThrottleGate({ ...base, barPullsLastMin: 149 })).toEqual({ allowed: true, reason: 'under_ceiling' });
+  });
+
+  it('NEVER defers an active-interest (hot) pull, even far over the ceiling', () => {
+    expect(barPullThrottleGate({ ...base, isActiveInterest: true, barPullsLastMin: 500 })).toEqual({ allowed: true, reason: 'active_interest' });
+  });
+
+  it('NEVER defers a deep-MTF snapshot pull, even far over the ceiling', () => {
+    expect(barPullThrottleGate({ ...base, isDeepMtf: true, barPullsLastMin: 500 })).toEqual({ allowed: true, reason: 'deep_mtf' });
+  });
+
+  it('is DISABLED (never defers) for an unset / non-positive / non-finite ceiling', () => {
+    for (const ceiling of [Number.POSITIVE_INFINITY, 0, -1, Number.NaN]) {
+      expect(barPullThrottleGate({ ...base, barPullsLastMin: 10_000, ceiling })).toEqual({ allowed: true, reason: 'ceiling_disabled' });
+    }
   });
 });
 
