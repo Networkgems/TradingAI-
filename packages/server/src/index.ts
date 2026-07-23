@@ -12,6 +12,7 @@ import { reconcilePnl, resolvePnlBaselineDate } from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { aggregateDeskCalendar } from './reports/desk-calendar.js';
 import { excludeTestAccountRows } from './test-accounts.js';
+import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
   summarizeOptionTradeJournal,
@@ -6171,7 +6172,10 @@ app.get('/api/health/options-live', async (_req, res) => {
       // a healthy prod boot, because `createUserContext` repairs them at startup; a
       // non-empty list here means the repair could not run (or something rewrote the
       // operator after boot).
-      serviceTradierEnv: (process.env['TRADIER_ENV'] ?? '').trim() || null,
+      // TRA-2163 — emit only a recognized LABEL; redact any other value so a
+      // mis-set `TRADIER_ENV` (e.g. the raw token) can never leak here.
+      serviceTradierEnv: redactTradierEnvLabel(process.env['TRADIER_ENV']),
+      serviceTradierEnvRecognized: isRecognizedTradierEnvLabel(process.env['TRADIER_ENV']),
       bootArmEligible: shouldBootArmLiveEquity(settings, operator),
       bootArmDrift: resolveLiveBrokerArmDrift(settings, operator),
       // TRA-1490 / TRA-1491 — DARK strategy arm-flag states so the board/QA can
@@ -9365,7 +9369,9 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // presence only — no secret values). Lets ops confirm whether Render is actually
   // injecting the credentials before each new process starts.
   const bootEnv = {
-    TRADIER_ENV: process.env['TRADIER_ENV'] ?? '(unset — defaults to sandbox)',
+    // TRA-2163 — redact any non-label value so a mis-set token cannot leak on
+    // this no-auth health surface; presence is still visible via the label.
+    TRADIER_ENV: redactTradierEnvLabel(process.env['TRADIER_ENV']) ?? '(unset — defaults to sandbox)',
     TRADIER_API_TOKEN_set: !!process.env['TRADIER_API_TOKEN'],
     TRADIER_SANDBOX_API_TOKEN_set: !!process.env['TRADIER_SANDBOX_API_TOKEN'],
     TRADIER_ACCOUNT_ID_set: !!process.env['TRADIER_ACCOUNT_ID'],
