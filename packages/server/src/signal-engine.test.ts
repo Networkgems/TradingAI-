@@ -61,7 +61,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
 import {
@@ -6428,5 +6428,45 @@ describe('TRA-1980 — pre-trade liquidity record call-sites (SHADOW-first)', ()
 
     expect(getOptionQuote).not.toHaveBeenCalled();
     expect(await listLiquidityGateDecisions()).toHaveLength(0);
+  });
+});
+
+describe('TRA-1996 — decoupled quote-refresh gate (shouldRunDecoupledQuoteRefresh)', () => {
+  const base = { running: false, marketOpen: true, now: 1_000_000, lastQuoteStampAt: 0 };
+
+  it('runs when the market is open, idle, and no recent stamp', () => {
+    expect(shouldRunDecoupledQuoteRefresh(base)).toBe(true);
+  });
+
+  it('never runs while a quote refresh is already in flight (no self-overlap)', () => {
+    expect(shouldRunDecoupledQuoteRefresh({ ...base, running: true })).toBe(false);
+  });
+
+  it('never runs off-hours — the 250s-tick starvation it covers only happens during RTH', () => {
+    expect(shouldRunDecoupledQuoteRefresh({ ...base, marketOpen: false })).toBe(false);
+  });
+
+  it('dedups against a doTick (or prior) stamp inside the min gap, then re-arms past it', () => {
+    // A stamp 5s ago (< 20s gap) suppresses the refresh...
+    expect(
+      shouldRunDecoupledQuoteRefresh({ ...base, now: 100_000, lastQuoteStampAt: 95_000 }),
+    ).toBe(false);
+    // ...but once the gap has elapsed it fires again, so a stuck 250s tick never
+    // lets quotes age past the freshness gate.
+    expect(
+      shouldRunDecoupledQuoteRefresh({ ...base, now: 100_000, lastQuoteStampAt: 79_000 }),
+    ).toBe(true);
+  });
+
+  it('honours an explicit minGapMs override', () => {
+    // gap = now - lastQuoteStampAt = 45_000ms.
+    // A tighter 40s gap has elapsed -> runs.
+    expect(
+      shouldRunDecoupledQuoteRefresh({ ...base, now: 100_000, lastQuoteStampAt: 55_000, minGapMs: 40_000 }),
+    ).toBe(true);
+    // A wider 50s gap has not -> suppressed.
+    expect(
+      shouldRunDecoupledQuoteRefresh({ ...base, now: 100_000, lastQuoteStampAt: 55_000, minGapMs: 50_000 }),
+    ).toBe(false);
   });
 });

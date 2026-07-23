@@ -677,6 +677,50 @@ export function _claimSharedShadowEval(): void {
 // invisible in normal use. On-disk export/calendar history is unaffected — it
 // is sourced from per-day EOD report files, not this in-memory list.
 const MAX_RESTORED_CLOSED_POSITIONS = 2_000;
+// TRA-1996 — the whole-universe quote batch is a single cheap call, but under
+// TRA-418 it stamps `symbolState.lastUpdated` (the 5-min quote-freshness SLA
+// behind the `stale-state` go-live gate) only from INSIDE doTick. During RTH the
+// full analysis tick's async I/O wall-clock has grown to 120-280s at the ~568
+// symbol universe (heavy cold-bar scan + MTF + per-symbol eval), and the
+// `tickRunning` reentrancy guard holds the next tick — and therefore the next
+// quote stamp — until the current one finishes. So quotes only re-stamp once per
+// ~250s tick, riding the 300s freshness gate and tipping past it on the longer
+// ticks -> `0/568 fresh` -> a FALSE `stale-state` blackout alert even though the
+// quote feed itself is healthy (proven off the 2026-07-22 Render tape). Fix: run
+// a lightweight quote-only refresh on its own short cadence so freshness is
+// decoupled from the analysis tick's duration. A genuine >5-min fetch failure
+// still ages the stamps and fires the alert for real, so the gate keeps its
+// discrimination; the candle-age eval gate (12-min) still guards signal eval.
+const QUOTE_REFRESH_MS = 30_000;
+// Suppress a quote-only refresh that would land right on top of a doTick (or a
+// prior quote refresh) stamp — caps the combined whole-universe quote-call rate
+// at ~1 per 20s regardless of how the two timers phase against each other.
+const QUOTE_MIN_REFRESH_GAP_MS = 20_000;
+
+/**
+ * TRA-1996 — pure decision for the decoupled quote-only refresher. Extracted so
+ * the gate is unit-testable without a live clock or feed (house idiom: cf.
+ * {@link evaluateFeedFreshness}, `checkStaleState`, `tradierBreakerGate`).
+ *
+ * Runs only when: not already refreshing (no self-overlap), the market is open
+ * (the only window the 250s-tick starvation this covers can occur — off-hours the
+ * cold-bar scan is skipped and doTick is fast), and no quote batch stamped
+ * freshness within the last `minGapMs` (dedup against a recent doTick stamp so the
+ * combined whole-universe quote-call rate stays ~1 per gap regardless of phasing).
+ */
+export function shouldRunDecoupledQuoteRefresh(opts: {
+  running: boolean;
+  marketOpen: boolean;
+  now: number;
+  lastQuoteStampAt: number;
+  minGapMs?: number;
+}): boolean {
+  if (opts.running) return false;
+  if (!opts.marketOpen) return false;
+  if (opts.now - opts.lastQuoteStampAt < (opts.minGapMs ?? QUOTE_MIN_REFRESH_GAP_MS)) return false;
+  return true;
+}
+
 const NEWS_REFRESH_MS = 5 * 60_000;
 // TRA-602 — StockTwits social-sentiment refresh cadence. Matches the news
 // refresh; the feed's own rate-limit breaker is the harder backstop. Capped to a
@@ -2012,6 +2056,13 @@ export class SignalEngine {
 
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tickRunning = false;
+  // TRA-1996 — dedicated short-cadence quote refresher so `symbolState.lastUpdated`
+  // (the quote-freshness SLA) never depends on the full analysis tick's duration.
+  private quoteTimer: ReturnType<typeof setInterval> | null = null;
+  private quoteRefreshRunning = false;
+  // Wall-clock (ms) of the last time a quote batch stamped `symbolState` — set by
+  // BOTH doTick's inline fetch and the decoupled refresher, so the two dedup.
+  private lastQuoteStampAt = 0;
   // TRA-1350 — wall-clock (ms) of the last COMPLETED scan tick. Unlike
   // `lastTick` (stamped `Date.now()` at getState() serialization time, so it
   // always reads "now"), this only advances when `doTick()` actually finishes a
@@ -2692,6 +2743,13 @@ export class SignalEngine {
     const beginTicking = (): void => {
       this.tick();
       this.tickTimer = setInterval(() => this.tick(), 30_000);
+      // TRA-1996 — decoupled quote-freshness refresher. Shares the staggered boot
+      // phase (so per-engine quote batches don't re-align every 30s) and keeps
+      // `symbolState.lastUpdated` under the freshness gate independently of how long
+      // the analysis tick's cold-bar / MTF I/O runs. Self-guards + dedups internally.
+      this.quoteTimer = setInterval(() => {
+        void this.refreshQuotesOnly();
+      }, QUOTE_REFRESH_MS);
     };
     const initialDelayMs = Math.max(0, opts?.initialDelayMs ?? 0);
     if (initialDelayMs === 0) {
@@ -2708,6 +2766,11 @@ export class SignalEngine {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    // TRA-1996 — tear down the decoupled quote refresher alongside the tick timer.
+    if (this.quoteTimer) {
+      clearInterval(this.quoteTimer);
+      this.quoteTimer = null;
     }
   }
 
@@ -2777,6 +2840,97 @@ export class SignalEngine {
       log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
       this.tickRunning = false;
+    }
+  }
+
+  /**
+   * TRA-418 / TRA-1980 — stamp `symbolState` from a whole-universe quote batch and
+   * return the price map. Quoted symbols get a fresh `lastUpdated`; symbols we
+   * attempted but couldn't quote keep their previous stamp and surface a status so
+   * the watchlist shows "Quote unavailable" instead of a permanent "Loading…".
+   *
+   * TRA-1996 — EXTRACTED from doTick so the decoupled quote refresher below stamps
+   * freshness identically. Advancing `lastQuoteStampAt` here lets the two paths
+   * dedup (see refreshQuotesOnly). Pure book-keeping: no I/O, no signal eval — the
+   * candle-age freshness gate in sweepEquityEntryUniverse is untouched, so keeping
+   * quotes fresh never lets a strategy fire off a stale candle series.
+   */
+  private applyQuotes(
+    quotes: Awaited<ReturnType<typeof fetchQuotes>>,
+    activeSymbols: string[],
+  ): Map<string, number> {
+    const prices = new Map<string, number>();
+    for (const [sym, q] of quotes) {
+      prices.set(sym, q.price);
+      this.symbolState.set(sym, {
+        symbol: sym,
+        price: q.price,
+        volume: q.volume,
+        change: q.change,
+        changePct: q.changePct,
+        lastUpdated: Date.now(),
+        quoteStatus: 'ok',
+        // TRA-1980 — carry the L1 book through when the source provided one
+        // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
+        // no-record rather than a bogus decision on a book it never saw.
+        ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
+        ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
+        ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
+        ...(typeof q.askSize === 'number' ? { askSize: q.askSize } : {}),
+      });
+    }
+    // For symbols we attempted but couldn't quote, surface a status so the watchlist
+    // UI can show "Quote unavailable" instead of a permanent "Loading…" spinner.
+    const breakerOpen = isYahooBreakerOpen();
+    for (const sym of activeSymbols) {
+      if (quotes.has(sym)) continue;
+      const prev = this.symbolState.get(sym);
+      this.symbolState.set(sym, {
+        symbol: sym,
+        price: prev?.price ?? 0,
+        volume: prev?.volume ?? 0,
+        change: prev?.change ?? 0,
+        changePct: prev?.changePct ?? 0,
+        lastUpdated: prev?.lastUpdated ?? 0,
+        quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
+      });
+    }
+    // TRA-1996 — record that a quote batch just stamped freshness, so a quote-only
+    // refresh landing right after a doTick (or vice-versa) is skipped.
+    this.lastQuoteStampAt = Date.now();
+    return prices;
+  }
+
+  /**
+   * TRA-1996 — decoupled, lightweight quote refresh. Runs on its own short cadence
+   * (QUOTE_REFRESH_MS) so `symbolState.lastUpdated` stays under the 5-min quote
+   * freshness gate even when the full analysis tick is stuck for 120-280s behind
+   * its cold-bar / MTF I/O and the `tickRunning` guard is holding the next tick.
+   *
+   * Only refreshes quotes and their state stamp — no signal eval, no exits, no
+   * order routing. Guarded against self-overlap and deduped against a recent
+   * doTick stamp so it adds at most one cheap whole-universe quote batch per
+   * ~QUOTE_MIN_REFRESH_GAP_MS. RTH-only: the starvation it covers only happens
+   * while the cold-bar scan is active (market open), and off-hours doTick is fast.
+   */
+  private async refreshQuotesOnly(): Promise<void> {
+    if (!shouldRunDecoupledQuoteRefresh({
+      running: this.quoteRefreshRunning,
+      marketOpen: isStockMarketOpen(),
+      now: Date.now(),
+      lastQuoteStampAt: this.lastQuoteStampAt,
+    })) return;
+    this.quoteRefreshRunning = true;
+    try {
+      const activeSymbols = this.getActiveSymbols();
+      const quotes = await fetchQuotes(activeSymbols);
+      this.applyQuotes(quotes, activeSymbols);
+    } catch (err: unknown) {
+      log.warn('quote-only refresh threw', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.quoteRefreshRunning = false;
     }
   }
 
@@ -2967,43 +3121,9 @@ export class SignalEngine {
 
     const activeSymbols = this.getActiveSymbols();
     const quotes = await fetchQuotes(activeSymbols);
-
-    const prices = new Map<string, number>();
-    for (const [sym, q] of quotes) {
-      prices.set(sym, q.price);
-      this.symbolState.set(sym, {
-        symbol: sym,
-        price: q.price,
-        volume: q.volume,
-        change: q.change,
-        changePct: q.changePct,
-        lastUpdated: Date.now(),
-        quoteStatus: 'ok',
-        // TRA-1980 — carry the L1 book through when the source provided one
-        // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
-        // no-record rather than a bogus decision on a book it never saw.
-        ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
-        ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
-        ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
-        ...(typeof q.askSize === 'number' ? { askSize: q.askSize } : {}),
-      });
-    }
-    // For symbols we attempted but couldn't quote, surface a status so the watchlist
-    // UI can show "Quote unavailable" instead of a permanent "Loading…" spinner.
-    const breakerOpen = isYahooBreakerOpen();
-    for (const sym of activeSymbols) {
-      if (quotes.has(sym)) continue;
-      const prev = this.symbolState.get(sym);
-      this.symbolState.set(sym, {
-        symbol: sym,
-        price: prev?.price ?? 0,
-        volume: prev?.volume ?? 0,
-        change: prev?.change ?? 0,
-        changePct: prev?.changePct ?? 0,
-        lastUpdated: prev?.lastUpdated ?? 0,
-        quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
-      });
-    }
+    // TRA-1996 — stamp via the shared helper the decoupled quote refresher also
+    // uses, so `symbolState.lastUpdated` is written the same way on both paths.
+    const prices = this.applyQuotes(quotes, activeSymbols);
 
     // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
     // only shows entries that are still actionable.
