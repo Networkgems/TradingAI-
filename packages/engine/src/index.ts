@@ -410,6 +410,19 @@ export {
   isLiquid,
   DEFAULT_SELECTOR_PARAMS,
 } from './options/strategy-selector.js';
+// TRA-2172 — Fully-automated ORB for calls/puts (pure directional intent core).
+export {
+  evaluateOrbOptions,
+  openingRangeForSession,
+  optionTypeForBreakout,
+  DEFAULT_ORB_OPTIONS_PARAMS,
+} from './options/orb-options.js';
+export type {
+  OrbOptionsParams,
+  OrbOptionsSignal,
+  OrbOptionsSignalType,
+  OrbOptionsBox,
+} from './options/orb-options.js';
 export {
   OptionsRiskBreaker,
   DEFAULT_OPTIONS_BREAKER_PARAMS,
