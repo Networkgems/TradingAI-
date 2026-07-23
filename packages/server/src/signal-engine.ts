@@ -3093,7 +3093,7 @@ export class SignalEngine {
     // keeps serving the last good read. Capped to SOCIAL_SYMBOL_LIMIT symbols to
     // stay within the unauthenticated per-IP budget.
     if (Date.now() - this.lastSocialRefresh > SOCIAL_REFRESH_MS) {
-      await this.refreshSocialSentiment();
+      await withPhase('signal.doTick.social-sentiment', () => this.refreshSocialSentiment());
       this.lastSocialRefresh = Date.now();
     }
 
@@ -3147,7 +3147,7 @@ export class SignalEngine {
       && this.tradierLiveClient
       && Date.now() - this.lastTradierBalanceFetchAt > TRADIER_BALANCE_REFRESH_MS
     ) {
-      await this.refreshTradierBalance();
+      await withPhase('signal.doTick.tradier-balance', () => this.refreshTradierBalance());
     }
 
     const activeSymbols = this.getActiveSymbols();
@@ -3259,7 +3259,7 @@ export class SignalEngine {
     // Errors are swallowed inside the reconciler so a single bad row
     // can't take down the rest of the tick.
     try {
-      const summary = await this.reconcilePendingCloses();
+      const summary = await withPhase('signal.doTick.reconcile-pending-closes', () => this.reconcilePendingCloses());
       if (summary.filled + summary.cleared + summary.repriced > 0) {
         log.info('tradier-reconcile tick summary', {
           component: 'tradier-reconcile',
@@ -3284,7 +3284,7 @@ export class SignalEngine {
     // local imports. Errors are caught inside the method so one bad sweep
     // doesn't break the rest of the tick.
     try {
-      await this.reconcileLivePortfolio();
+      await withPhase('signal.doTick.reconcile-live-portfolio', () => this.reconcileLivePortfolio());
     } catch (err: unknown) {
       log.warn('tradier-portfolio-reconcile sweep threw', {
         component: 'tradier-portfolio-reconcile',
@@ -3300,7 +3300,7 @@ export class SignalEngine {
     // method; this guard only covers an unexpected throw.
     try {
       const bootSweep = !this.equityReconciledOnBoot;
-      const summary = await this.reconcileLiveEquityPortfolio({ force: bootSweep });
+      const summary = await withPhase('signal.doTick.reconcile-live-equity', () => this.reconcileLiveEquityPortfolio({ force: bootSweep }));
       // Flip the boot flag only once a sweep actually reached Tradier so a
       // boot with no creds yet keeps the forced sweep armed for the tick
       // after the equity client is built.
@@ -3315,9 +3315,9 @@ export class SignalEngine {
     }
     // TRA-1662 — walk the observe-only shadow maker chases before the mark
     // refresh, so a chase reads the same-age chain snapshot the marks do.
-    await this.advanceShadowChases();
+    await withPhase('signal.doTick.shadow-chases', () => this.advanceShadowChases());
 
-    const optionMarks = await this.refreshOptionMarks();
+    const optionMarks = await withPhase('signal.doTick.option-marks', () => this.refreshOptionMarks());
     // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
     // checkExits runs. checkExits skips imports (line 525 of options-account)
     // so it won't touch them; this pass is purely for the dashboard's
@@ -3350,7 +3350,7 @@ export class SignalEngine {
       // Poll any in-flight sell_to_close from a prior tick regardless of the
       // clock — this only finalises/clears existing broker orders, it never
       // creates new ones, so an order left working into the close still resolves.
-      await this.resolvePendingOptionExits();
+      await withPhase('signal.doTick.resolve-option-exits', () => this.resolvePendingOptionExits());
     }
     // TRA-726 — no day trading after the close. In LIVE mode, only evaluate and
     // submit options exits (TP1 / SL / trail sell_to_close) during regular
@@ -3483,7 +3483,7 @@ export class SignalEngine {
       // `checkExits` returned position snapshots already carrying the
       // pendingExit intent; we attach the order id (or clear the intent
       // on failure) inside this helper.
-      await this.submitStagedOptionExits(optsClosed);
+      await withPhase('signal.doTick.submit-option-exits', () => this.submitStagedOptionExits(optsClosed));
     }
     if (optsClosed.length > 0) {
       // Persist equity after options positions close
@@ -3617,7 +3617,7 @@ export class SignalEngine {
     // a throw here can't take down the rest of the tick.
     if (this.mode === 'live' && isLiveEquityStopModifyEnabled() && isStockMarketOpen()) {
       try {
-        await this.trailLiveEquityStops(prices);
+        await withPhase('signal.doTick.trail-equity-stops', () => this.trailLiveEquityStops(prices));
       } catch (err: unknown) {
         log.warn('live-equity chandelier trail sweep threw', {
           component: 'live-equity-trail',
@@ -3655,7 +3655,7 @@ export class SignalEngine {
     if (equityPassGate === null) {
       // TRA-1793 — the universe sweep OPENS the pass and counts every symbol it skips.
       // It is the loop; nothing here re-implements it.
-      const evaluable = await this.sweepEquityEntryUniverse(activeSymbols);
+      const evaluable = await withPhase('signal.doTick.equity-entry-sweep', () => this.sweepEquityEntryUniverse(activeSymbols));
       // TRA-952 — in swing mode, only the curated liquid universe is tradable;
       // the sweep above has already dropped the off-universe names.
       const swingMode = this.equitySwingModeEnabled();
@@ -3718,7 +3718,7 @@ export class SignalEngine {
       // operator armed `liveEquityDcaAddsTradier` AND CONVICTION_DCA.enabled;
       // every add is pinned to the conviction watchlist, hard-excludes options,
       // and holds the per-symbol notional cap + the fixed-stop R invariant.
-      await this.evaluateLiveConvictionDcaAdds(prices);
+      await withPhase('signal.doTick.conviction-dca-adds', () => this.evaluateLiveConvictionDcaAdds(prices));
     }
     if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
@@ -3756,7 +3756,7 @@ export class SignalEngine {
         if (sharedShadow) _claimSharedShadowRefresh(nowMs);
         this.lastSupertrendShadowRefreshAt = nowMs;
         try {
-          await this.refreshSupertrendShadowSeries(activeSymbols);
+          await withPhase('signal.doTick.supertrend-series', () => this.refreshSupertrendShadowSeries(activeSymbols));
         } catch (err: unknown) {
           supertrendShadowLog.warn('shadow 5m-series refresh threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -3829,7 +3829,7 @@ export class SignalEngine {
     })) {
       if (Date.now() - this.lastRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastRvScanAt = Date.now();
-        await this.runRelativeValueScan(activeSymbols);
+        await withPhase('signal.doTick.rv-scan', () => this.runRelativeValueScan(activeSymbols));
       }
     }
 
@@ -3846,7 +3846,7 @@ export class SignalEngine {
     })) {
       if (Date.now() - this.lastOtmScanAt >= OTM_SCAN_INTERVAL_MS) {
         this.lastOtmScanAt = Date.now();
-        await this.runOtmScan(activeSymbols);
+        await withPhase('signal.doTick.otm-scan', () => this.runOtmScan(activeSymbols));
       }
     }
 
@@ -3937,7 +3937,7 @@ export class SignalEngine {
       if (Date.now() - this.lastDemoDirectionalAt >= RV_SCAN_INTERVAL_MS) {
         this.lastDemoDirectionalAt = Date.now();
         try {
-          await this.evaluateDemoDirectional(activeSymbols);
+          await withPhase('signal.doTick.demo-directional', () => this.evaluateDemoDirectional(activeSymbols));
         } catch (err: unknown) {
           log.warn('demo directional pass threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -3962,7 +3962,7 @@ export class SignalEngine {
       if (Date.now() - this.lastIvRvScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastIvRvScanAt = Date.now();
         try {
-          await this.evaluateIvRvScan(activeSymbols);
+          await withPhase('signal.doTick.ivrv-scan', () => this.evaluateIvRvScan(activeSymbols));
         } catch (err: unknown) {
           log.warn('iv-rv scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -3987,7 +3987,7 @@ export class SignalEngine {
       if (Date.now() - this.lastShortPremiumScanAt >= RV_SCAN_INTERVAL_MS) {
         this.lastShortPremiumScanAt = Date.now();
         try {
-          await this.evaluateShortPremiumScan(activeSymbols);
+          await withPhase('signal.doTick.short-premium-scan', () => this.evaluateShortPremiumScan(activeSymbols));
         } catch (err: unknown) {
           log.warn('short-premium scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
@@ -4010,7 +4010,7 @@ export class SignalEngine {
     // Outside the window we fall through to the stale-recommendation clear below.
     const agentMarketWindowOpen = isAgentMarketHoursGateDisabled() || isAgentTradingWindowOpen();
     if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted() && agentMarketWindowOpen) {
-      await this.runTradingAgentsAdvisory(activeSymbols);
+      await withPhase('signal.doTick.agents-advisory', () => this.runTradingAgentsAdvisory(activeSymbols));
       // TRA-941 (TRA-813 P2/3) — proposal queue. Each APPROVE recommendation
       // becomes a PENDING proposal (never an immediate order); the demo auto-
       // confirm rule (conviction ≥ 0.70 AND notional ≤ $250 AND toggles on)
@@ -4018,7 +4018,7 @@ export class SignalEngine {
       // and ALL live proposals — waits for a manual operator confirm via the
       // pending-proposals panel. This replaces the TRA-796 blanket auto-route so
       // a confirmed proposal is the ONLY thing that reaches capital.
-      await this.processAgentProposals(prices);
+      await withPhase('signal.doTick.agent-proposals', () => this.processAgentProposals(prices));
     } else if (this.latestAgentRecommendations.length > 0) {
       // Clear stale recommendations once the layer is switched back off.
       this.latestAgentRecommendations = [];
@@ -4033,7 +4033,7 @@ export class SignalEngine {
     if (Date.now() - this.lastSma200ScanAt >= SMA200_SCAN_INTERVAL_MS) {
       this.lastSma200ScanAt = Date.now();
       try {
-        await this.runSma200Scan(activeSymbols);
+        await withPhase('signal.doTick.sma200-scan', () => this.runSma200Scan(activeSymbols));
       } catch (err: unknown) {
         log.warn('sma200 scan threw', {
           component: 'sma200-scan',
