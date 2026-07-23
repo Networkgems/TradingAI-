@@ -9,8 +9,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
-import type { EngineState, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { LIVE_SKIP_CATEGORIES, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
+import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
+import { EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
 import { isTestAccount } from '../test-accounts.js'; // TRA-1949
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
@@ -176,6 +176,13 @@ export interface LiveHealthDeps {
    * working; the route is only mounted when this is provided.
    */
   liveEquityAcceptance?: () => LiveEquityAcceptance[];
+  /**
+   * TRA-2200 (parent TRA-2171) — per-engine exit-cadence readout backing the
+   * unauthenticated `GET /api/health/exit-cadence`. Secrets-free (flags, counts,
+   * intervals). Optional so existing callers/tests keep working; the route is
+   * only mounted when this is provided.
+   */
+  exitCadence?: () => ExitCadenceHealth[];
   /**
    * TRA-901 — the shared secret that grants the unattended TRA-898 daily-watch
    * routine access to the auth-gated `/api/health/demo-book` surface without a
@@ -2664,6 +2671,85 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       paths,
     });
   });
+
+  // TRA-2200 (parent TRA-2171) — unauthenticated, secrets-free readout of the
+  // decoupled exit-evaluation cadence.
+  //
+  // WHY THIS EXISTS. The TRA-2200 invalidation criterion is written against a
+  // quantity nothing in the shipped build measured: "if a post-fix RTH session
+  // shows p99 exit-evaluation INTERVAL > 30s, the bound chosen was the wrong one."
+  // Before this fix that interval was inferable from `signal.doTick` async
+  // wall-clock, because exits rode inside the tick. Hoisting them off the tick is
+  // exactly what severs that proxy from its subject — so shipping the hoist
+  // without this route would ship a change whose own success criterion had become
+  // unmeasurable. Grade the quantity the criterion names, not its former proxy.
+  //
+  // The histogram is bucketed with the 30s bar on a BUCKET EDGE, so the grade
+  // reads off it directly — `(lt60s + lt120s + lt300s + gte300s) / total < 1%` IS
+  // "p99 under 30s", with no interpolation across a straddling bucket.
+  //
+  // `enabled` vs `timerArmed` are reported separately and the roll-up keys the
+  // verdict on `timerArmed`. The flag can read true off a mid-session
+  // demo-flags.json flip while no timer exists (arming needs a restart), and a
+  // route that published only `enabled` would claim the hoist was live when it was
+  // not — the same class of confident falsehood `/api/health/rv-scan` was built to
+  // kill, and the same one the 16-slot `recentSlowPhases` ring produced on
+  // 2026-07-23 (a post-close read that reported "sub-labels missing" when they had
+  // been emitting all session).
+  const exitCadence = deps.exitCadence;
+  if (exitCadence) {
+    app.get('/api/health/exit-cadence', (_req, res) => {
+      const engines = exitCadence();
+      const armed = engines.filter((e) => e.timerArmed);
+      // Fleet histogram. Summed across engines because the criterion is about the
+      // exit path as a whole; per-engine rows are published alongside so a single
+      // sick engine stays visible instead of being averaged away.
+      const histogram = engines.reduce<Record<ExitIntervalBucket, number>>((acc, e) => {
+        for (const b of EXIT_INTERVAL_BUCKETS) acc[b] += e.intervalHistogram[b];
+        return acc;
+      }, emptyExitIntervalHistogram());
+      const samples = EXIT_INTERVAL_BUCKETS.reduce((n, b) => n + histogram[b], 0);
+      const atOrAbove30s = histogram.lt60s + histogram.lt120s + histogram.lt300s + histogram.gte300s;
+      // Null, not 0 or false, until there is a sample to judge. "No measurement
+      // yet" and "measured, and it passes" are different facts, and only the
+      // second one clears the gate.
+      const p99Under30s = samples > 0 ? atOrAbove30s / samples < 0.01 : null;
+      const maxExitIntervalMs = engines.reduce<number | null>(
+        (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
+        null,
+      );
+      res.json({
+        ok: true,
+        time: new Date(now()).toISOString(),
+        build: resolveBuildInfo(),
+        // Fleet-level: is the hoist actually running anywhere.
+        enabled: armed.length > 0,
+        verdict:
+          armed.length === 0
+            ? 'disarmed'
+            : samples === 0
+              ? 'armed_but_no_interval_measured'
+              : p99Under30s
+                ? 'bounded'
+                : 'over_bar',
+        engineCount: engines.length,
+        armedEngineCount: armed.length,
+        samples,
+        atOrAbove30s,
+        p99Under30s,
+        maxExitIntervalMs,
+        intervalHistogram: histogram,
+        note:
+          'Grade `p99Under30s` (TRA-2200 invalidation criterion). Buckets put the 30s '
+          + 'bar on an edge, so `atOrAbove30s / samples < 0.01` IS p99 < 30s. '
+          + '`samples` counts INTERVALS, which is one fewer than passes per engine — '
+          + 'the first pass after boot has no predecessor to measure against. Read '
+          + '`decoupledExitSkippedStalePrices`: a rising count means quote staleness, '
+          + 'not the tick, is the binding constraint (the TRA-2200 tail branch).',
+        engines,
+      });
+    });
+  }
 
   app.get('/api/health/watchdog', (_req, res) => {
     const watchdog = getWatchdogStatus();

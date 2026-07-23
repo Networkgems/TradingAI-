@@ -3225,6 +3225,11 @@ registerLiveHealthRoutes(app, {
   userCtx,
   getSettings,
   liveEquityAcceptance: () => getAllUserContexts().map(ctx => ctx.engine.getLiveEquityAcceptance()),
+  // TRA-2200 (parent TRA-2171) — unauth exit-cadence probe. Enumerates every
+  // engine's exit-evaluation interval instrument so the "p99 exit-evaluation
+  // interval > 30s" invalidation criterion is readable off the live box without a
+  // login. Secrets-free (flags, counts, interval buckets).
+  exitCadence: () => getAllUserContexts().map(ctx => ctx.engine.getExitCadenceHealth()),
   internalToken: () => (process.env['DEMO_BOOK_INTERNAL_TOKEN'] ?? '').trim() || undefined,
   demoBooks: () =>
     getAllUserContexts()

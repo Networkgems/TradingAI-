@@ -70,7 +70,36 @@ function resolveSlowMs(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(n) && n > 0 ? n : 1_000;
 }
 
-const RING_MAX = 16;
+/**
+ * How many slow phases the ring retains.
+ *
+ * TRA-2200 (raised 16 → 512, parent TRA-2171). At 16 slots the ring held only
+ * ~10 MINUTES of a 6.4-hour session at the observed slow-phase rate: the
+ * 2026-07-23 post-close read of `/api/health/watchdog` returned 16/16 coarse
+ * `signal.doTick` entries spanning 22:58:02Z→23:08:06Z and ZERO sub-labels, so
+ * the attribution had to be reconstructed from the Render log tape instead. That
+ * is worse than a gap — it reads as a POSITIVE "the sub-labels are missing",
+ * i.e. an instrumentation-bug verdict, when the sub-labels were in fact emitting
+ * all session. An instrument whose default read is a confident falsehood is a
+ * trap, not a gap.
+ *
+ * 512 covers a full RTH session at the 2026-07-23 rate (1,451 parent + 1,086
+ * child slow phases across 3 engines ≈ 2,537 records / 6.4h ≈ 400/h, so ~1.3h of
+ * memory) and still bounds the array: each `SlowPhase` is 4 primitive fields plus
+ * a short interned label, so 512 entries is single-digit KB — invisible against
+ * the ~420MB RSS this box runs at. Env-tunable so a diagnosis window can widen it
+ * without a redeploy of the constant, matching `PHASE_TIMING_SLOW_MS`.
+ *
+ * This does NOT make a post-close read of a whole session reliable — the durable
+ * Render log tape (`module:"phase-timing"`) is still the only complete source.
+ * It makes the LIVE read stop lying at ordinary session length.
+ */
+function resolveRingMax(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env['PHASE_TIMING_RING_MAX'];
+  const n = raw != null && raw.trim() !== '' ? Number(raw.trim()) : NaN;
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 512;
+}
+
 let lastSlowPhase: SlowPhase | null = null;
 let lastSlowSyncPhase: SlowPhase | null = null;
 const recentSlowPhases: SlowPhase[] = [];
@@ -95,7 +124,11 @@ export function recordPhaseDuration(
   // block diagnosis reads. `recentSlowPhases` still carries both, tagged.
   if (kind === 'sync') lastSlowSyncPhase = rec;
   recentSlowPhases.push(rec);
-  if (recentSlowPhases.length > RING_MAX) recentSlowPhases.shift();
+  // TRA-2200 — `resolveRingMax` is read per-record (not captured once) so a
+  // PHASE_TIMING_RING_MAX change takes effect without a restart, and so a SHRINK
+  // drains the ring instead of leaving it permanently over the new cap.
+  const ringMax = resolveRingMax(env);
+  while (recentSlowPhases.length > ringMax) recentSlowPhases.shift();
   // A single log line at record time is the live Render-log breadcrumb; the
   // persisted watchdog trip is the after-death one. Only a `sync` phase actually
   // held the loop — an `async` entry is a slow tick, not a block.

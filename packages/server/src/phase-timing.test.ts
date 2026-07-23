@@ -117,10 +117,55 @@ describe('phase-timing', () => {
   });
 
   it('keeps only the most recent RING_MAX slow phases, newest last', () => {
+    // TRA-2200 raised the default cap 16 -> 512, so 20 records now all fit.
     for (let i = 0; i < 20; i += 1) recordPhaseDuration(`phase-${i}`, 2_000, i);
     const { recentSlowPhases, lastSlowPhase } = getPhaseAttribution();
-    expect(recentSlowPhases).toHaveLength(16);
+    expect(recentSlowPhases).toHaveLength(20);
     expect(recentSlowPhases[recentSlowPhases.length - 1]?.name).toBe('phase-19');
     expect(lastSlowPhase?.name).toBe('phase-19');
+  });
+
+  it('TRA-2200: the ring retains a full RTH session, not the ~10 minutes 16 slots held', () => {
+    // The 2026-07-23 tape carried 2,537 slow-phase records across 6.4h and 3
+    // engines (~400/h). At 16 slots a post-close read of /api/health/watchdog
+    // spanned 10.1 MINUTES and reported "16/16 signal.doTick, zero sub-labels" —
+    // read as an instrumentation bug when both sub-labels had in fact been
+    // emitting all session. That is a confident falsehood, not a gap.
+    for (let i = 0; i < 400; i += 1) recordPhaseDuration(`phase-${i}`, 2_000, i);
+    const { recentSlowPhases } = getPhaseAttribution();
+    expect(recentSlowPhases).toHaveLength(400);
+    // The OLDEST record survives — this is the property the 16-slot ring lacked.
+    expect(recentSlowPhases[0]?.name).toBe('phase-0');
+  });
+
+  it('TRA-2200: PHASE_TIMING_RING_MAX overrides the default without a redeploy', () => {
+    const env = { PHASE_TIMING_RING_MAX: '3' } as NodeJS.ProcessEnv;
+    for (let i = 0; i < 10; i += 1) recordPhaseDuration(`phase-${i}`, 2_000, i, env);
+    const { recentSlowPhases } = getPhaseAttribution();
+    expect(recentSlowPhases.map((p) => p.name)).toEqual(['phase-7', 'phase-8', 'phase-9']);
+  });
+
+  it('TRA-2200: a SHRUNK cap drains the ring instead of leaving it over the new cap', () => {
+    // The cap is re-read per record (not captured once), and the drain is a
+    // `while`, not a single `shift()`. With a single shift a ring holding 400
+    // entries would take 398 further records to reach a newly-set cap of 2 —
+    // i.e. the override would appear not to work for the rest of the session.
+    for (let i = 0; i < 50; i += 1) recordPhaseDuration(`phase-${i}`, 2_000, i);
+    expect(getPhaseAttribution().recentSlowPhases).toHaveLength(50);
+    recordPhaseDuration('after-shrink', 2_000, 99, { PHASE_TIMING_RING_MAX: '2' } as NodeJS.ProcessEnv);
+    const { recentSlowPhases } = getPhaseAttribution();
+    expect(recentSlowPhases).toHaveLength(2);
+    expect(recentSlowPhases[recentSlowPhases.length - 1]?.name).toBe('after-shrink');
+  });
+
+  it('TRA-2200: a junk or non-positive PHASE_TIMING_RING_MAX falls back to the default', () => {
+    for (const raw of ['', '   ', 'abc', '0', '-5']) {
+      _resetPhaseTimingForTests();
+      const env = { PHASE_TIMING_RING_MAX: raw } as NodeJS.ProcessEnv;
+      for (let i = 0; i < 20; i += 1) recordPhaseDuration(`phase-${i}`, 2_000, i, env);
+      // Default 512 -> all 20 retained. A cap of 0 would silently blind the
+      // instrument entirely, which is the failure this guards.
+      expect(getPhaseAttribution().recentSlowPhases).toHaveLength(20);
+    }
   });
 });

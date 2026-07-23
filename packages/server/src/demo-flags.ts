@@ -272,6 +272,18 @@ export const DEMO_FLAG_ALLOWLIST = [
   // call and records them in the durable sandbox-strategy-journal. This is the issue-body
   // "gate each [strategy] behind a flag" requirement for Tier-1 non-long strategies.
   'ENABLE_SANDBOX_CSP_COVERED_CALL',
+  // TRA-2200 (parent TRA-2171) — decoupled (off-tick) exit-evaluation cadence. The
+  // 2026-07-23 tape put worst-case stop/target evaluation latency at 853s because
+  // `checkExits` rides inside `signal.doTick` and the `tickRunning` guard holds the
+  // next tick; this hoists the exit passes onto their own short timer. On the
+  // allowlist so the DEMO book can be armed through `demo-flags.json` — bqb1 is the
+  // frozen TRA-1648 soak host and a Render ENV write REDEPLOYS it (trigger
+  // `service_updated`), which is the very thing the soak window cannot absorb. The
+  // LIVE book still reads `process.env` only (`resolveDemoFlagEnv` is consulted on
+  // the demo branch), so a file flip can NEVER arm the live broker-order exit path
+  // — it only ever makes the demo paper book evaluate its exits MORE often, which
+  // is risk-reducing. Default OFF.
+  'ENABLE_DECOUPLED_EXIT_CADENCE',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';

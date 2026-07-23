@@ -133,6 +133,7 @@ import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
 import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
+import { isDecoupledExitCadenceEnabled } from './exit-cadence-flag.js';
 import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
 // TRA-1768 — READ-ONLY equity entry funnel counters. Pure side-effecting counters:
 // every call below is a no-op on the entry decision, and deleting them all must not
@@ -734,6 +735,152 @@ export function shouldRunDecoupledQuoteRefresh(opts: {
   if (opts.running) return false;
   if (!opts.marketOpen) return false;
   if (opts.now - opts.lastQuoteStampAt < (opts.minGapMs ?? QUOTE_MIN_REFRESH_GAP_MS)) return false;
+  return true;
+}
+
+// TRA-2200 (parent TRA-2171) — decoupled exit-evaluation cadence.
+//
+// Same disease as TRA-1996, different victim. `checkExits` (equity + options)
+// runs INSIDE doTick, and the `tickRunning` guard holds the next tick until the
+// current one finishes — so the SPACING between two consecutive stop/target
+// evaluations is the 30s tick period PLUS the tick's own wall-clock. On the
+// 2026-07-23 bqb1 RTH tape that tick had p90 70s / p95 118s / p99 296s / max
+// 853s, and each engine spent ~65.7% of the session inside a single slow tick:
+// worst-case exit evaluation latency 14.2 MINUTES. TRA-2171 phase-2 attribution
+// showed the two instrumented sinks (`cold-bar-scan` 36.8%, `mtf-refresh` 12.9%)
+// together own under half of it — ~50.3% is code neither sub-label wraps — so
+// capping a sink shortens the tick but cannot BOUND exit latency. Hoisting the
+// exit passes onto their own timer bounds it regardless of which sink dominates.
+//
+// 10s: fast enough that the exit-evaluation interval lands an order of magnitude
+// under the 30s p99 bar in the TRA-2200 invalidation criteria, and it costs no
+// extra feed I/O — the decoupled pass reads prices from the `symbolState` the
+// TRA-1996 quote refresher already keeps fresh, and option marks from the
+// scanner's 60s chain cache. It does NOT add a quote fan-out.
+const EXIT_REFRESH_MS = 10_000;
+// Suppress a decoupled exit pass that would land right on top of doTick's own
+// inline exit pass (or a prior decoupled pass) — caps the combined exit-evaluation
+// rate at ~1 per 8s regardless of how the two timers phase against each other.
+const EXIT_MIN_GAP_MS = 8_000;
+// TRA-2200 — a decoupled exit pass reads prices out of `symbolState` rather than
+// issuing its own quote batch. Reject any symbol whose stamp is older than this so
+// the hoist can never fire a stop off a stale print: that would convert a latency
+// fix into a bad-exit generator, which is strictly worse than the latency. Matches
+// the TRA-418 5-min quote-freshness SLA the `stale-state` gate already enforces,
+// and the TRA-1996 refresher re-stamps every ~30s, so in a healthy session every
+// symbol passes. In an unhealthy one the pass degrades to "evaluate nothing" and
+// doTick's own inline pass (which fetches fresh quotes) remains the only exit path
+// — i.e. it fails back to TODAY's behaviour, never to a worse one.
+const EXIT_PRICE_MAX_AGE_MS = 5 * 60_000;
+
+// TRA-2200 — only exit-evaluation intervals at or above this land on the Render
+// tape. Set BELOW the 30s invalidation bar so an interval approaching the bar is
+// already recorded before it crosses it; the full distribution lives in the
+// histogram on `GET /api/health/exit-cadence`, so the tape carries the tail
+// (which is what the grade reads) without ~2,000 lines/session/engine of noise.
+const EXIT_INTERVAL_LOG_MS = 20_000;
+
+/**
+ * TRA-2200 — exit-evaluation interval buckets.
+ *
+ * Chosen so the 30s invalidation bar is a BUCKET EDGE (`lt30s` vs `lt60s`): a
+ * grade of "is p99 under 30s?" then reads straight off the histogram as
+ * `(count at or above 30s) / total < 1%`, with no interpolation across a bucket
+ * that straddles the threshold. The upper buckets are the 2026-07-23 doTick
+ * tail landmarks (p95 118s, p99 296s, max 853s) so a post-fix read is directly
+ * comparable to the pre-fix headline rather than to a rescaled axis.
+ */
+export type ExitIntervalBucket = 'lt5s' | 'lt10s' | 'lt15s' | 'lt30s' | 'lt60s' | 'lt120s' | 'lt300s' | 'gte300s';
+
+export const EXIT_INTERVAL_BUCKETS: readonly ExitIntervalBucket[] = [
+  'lt5s', 'lt10s', 'lt15s', 'lt30s', 'lt60s', 'lt120s', 'lt300s', 'gte300s',
+] as const;
+
+/** Classify one exit-evaluation interval (ms) into its {@link ExitIntervalBucket}. */
+export function bucketExitInterval(intervalMs: number): ExitIntervalBucket {
+  if (intervalMs < 5_000) return 'lt5s';
+  if (intervalMs < 10_000) return 'lt10s';
+  if (intervalMs < 15_000) return 'lt15s';
+  if (intervalMs < 30_000) return 'lt30s';
+  if (intervalMs < 60_000) return 'lt60s';
+  if (intervalMs < 120_000) return 'lt120s';
+  if (intervalMs < 300_000) return 'lt300s';
+  return 'gte300s';
+}
+
+/** Zeroed histogram over {@link EXIT_INTERVAL_BUCKETS}. */
+export function emptyExitIntervalHistogram(): Record<ExitIntervalBucket, number> {
+  return {
+    lt5s: 0, lt10s: 0, lt15s: 0, lt30s: 0, lt60s: 0, lt120s: 0, lt300s: 0, gte300s: 0,
+  };
+}
+
+/**
+ * TRA-2200 — one engine's exit-cadence readout, surfaced (per engine, then rolled
+ * up) on the unauthenticated `GET /api/health/exit-cadence`. Secrets-free.
+ */
+export interface ExitCadenceHealth {
+  /** The `ENABLE_DECOUPLED_EXIT_CADENCE` flag as THIS engine resolves it. */
+  enabled: boolean;
+  /**
+   * Whether a decoupled exit timer actually exists on this engine. Distinct from
+   * `enabled` on purpose: arming needs a restart, so a mid-session flag flip can
+   * read `enabled: true` with `timerArmed: false` — i.e. the hoist is NOT live.
+   */
+  timerArmed: boolean;
+  intervalMs: number;
+  minGapMs: number;
+  mode: 'demo' | 'live';
+  engine: string;
+  /** Null until the first exit pass completes — never 0 (TRA-1707 null discipline). */
+  lastExitPassAt: number | null;
+  exitPassCount: number;
+  /** Null until a SECOND pass completes: one pass yields no interval to measure. */
+  lastExitIntervalMs: number | null;
+  maxExitIntervalMs: number | null;
+  intervalHistogram: Record<ExitIntervalBucket, number>;
+  /** Decoupled passes that found no price fresh enough to evaluate an exit against. */
+  decoupledExitSkippedStalePrices: number;
+}
+
+/**
+ * TRA-2200 — pure decision for the decoupled exit-evaluation pass. Extracted so
+ * the gate is unit-testable without a live clock, feed, or account (house idiom:
+ * cf. {@link shouldRunDecoupledQuoteRefresh}, `evaluateFeedFreshness`,
+ * `tradierBreakerGate`).
+ *
+ * Runs only when ALL of:
+ * - `enabled` — the default-OFF `ENABLE_DECOUPLED_EXIT_CADENCE` flag is armed.
+ * - `running` is false — no self-overlap.
+ * - `tickExitRegionActive` is false — **the safety interlock.** doTick holds this
+ *   true from entry through the end of its own options-exit block. Without it a
+ *   decoupled pass could interleave with doTick's exit region and produce a
+ *   SECOND concurrent caller of `optionsAccount.checkExits` /
+ *   `submitStagedOptionExits` / the pending-close reconciler — i.e. a double
+ *   `sell_to_close` on a real broker order. Note this gate is NOT `tickRunning`:
+ *   gating on the whole tick would re-serialise exits behind the very 853s tail
+ *   this exists to escape. The exit-critical work is concentrated at the FRONT of
+ *   doTick; the long sinks (`cold-bar-scan`, `mtf-refresh`, the dark ~50%) all
+ *   run AFTER it, and that post-region stretch is exactly the window we reclaim.
+ * - `marketOpen` — off-hours doTick is fast (no cold-bar scan), so the starvation
+ *   this covers cannot occur, and the options exit path is itself RTH-gated in
+ *   live mode (TRA-726: no day trading after the close).
+ * - no exit pass (either path) evaluated within the last `minGapMs`.
+ */
+export function shouldRunDecoupledExitPass(opts: {
+  enabled: boolean;
+  running: boolean;
+  tickExitRegionActive: boolean;
+  marketOpen: boolean;
+  now: number;
+  lastExitPassAt: number;
+  minGapMs?: number;
+}): boolean {
+  if (!opts.enabled) return false;
+  if (opts.running) return false;
+  if (opts.tickExitRegionActive) return false;
+  if (!opts.marketOpen) return false;
+  if (opts.now - opts.lastExitPassAt < (opts.minGapMs ?? EXIT_MIN_GAP_MS)) return false;
   return true;
 }
 
@@ -2094,6 +2241,52 @@ export class SignalEngine {
   // Wall-clock (ms) of the last time a quote batch stamped `symbolState` — set by
   // BOTH doTick's inline fetch and the decoupled refresher, so the two dedup.
   private lastQuoteStampAt = 0;
+  // TRA-2200 (parent TRA-2171) — dedicated short-cadence exit-evaluation pass so
+  // stop/target evaluation latency never depends on the full analysis tick's
+  // duration (853s worst case on the 2026-07-23 tape). Only created when
+  // `ENABLE_DECOUPLED_EXIT_CADENCE` is armed — default OFF ⇒ no second timer.
+  private exitTimer: ReturnType<typeof setInterval> | null = null;
+  private exitPassRunning = false;
+  /**
+   * TRA-2200 SAFETY INTERLOCK — true while doTick is inside its own exit-critical
+   * region (entry → end of the options-exit / book-mark block). The decoupled pass
+   * refuses to start while it is set, so there is never a second concurrent caller
+   * of `optionsAccount.checkExits` / `submitStagedOptionExits` / the pending-close
+   * reconciler. Deliberately NARROWER than `tickRunning`: the long sinks
+   * (`cold-bar-scan`, `mtf-refresh`, the unattributed ~50%) all run AFTER this
+   * region clears, and that post-region stretch is the window the hoist reclaims.
+   * Cleared in doTick's `finally` so a throw mid-tick cannot wedge it true and
+   * silently disarm the decoupled pass for the life of the process.
+   */
+  private tickExitRegionActive = false;
+  /**
+   * Wall-clock (ms) of the last COMPLETED exit evaluation — stamped by BOTH
+   * doTick's inline pass and the decoupled pass, so the two dedup against each
+   * other (cf. `lastQuoteStampAt`). 0 until the first pass completes.
+   */
+  private lastExitPassAt = 0;
+  /**
+   * TRA-2200 — live exit-evaluation interval instrument. The invalidation
+   * criterion for this fix is stated as a p99 exit-evaluation INTERVAL, and
+   * nothing in the shipped build measured that: doTick's async wall-clock is a
+   * proxy that stops tracking the moment exits are hoisted off the tick. Grade the
+   * quantity the criterion names, not its former proxy. `maxExitIntervalMs` is
+   * the session high-water mark — the direct analogue of the 853s headline.
+   */
+  private lastExitIntervalMs = 0;
+  private maxExitIntervalMs = 0;
+  private exitPassCount = 0;
+  private exitIntervalHistogram: Record<ExitIntervalBucket, number> = emptyExitIntervalHistogram();
+  /**
+   * TRA-2200 — decoupled passes skipped because NO symbol carried a stamp fresh
+   * enough to price an exit against. Surfaced because "the hoist is armed and
+   * evaluating nothing" and "the hoist is armed and healthy" are otherwise the
+   * same reading: both show a timer and no exits. A rising count here means the
+   * quote feed is the binding constraint, not the tick — which is the TAIL branch
+   * of the TRA-2200 bull/bear (feed rate-limiting, ~15%), and it would be graded
+   * as a failed hoist without this counter.
+   */
+  private decoupledExitSkippedStalePrices = 0;
   // TRA-1350 — wall-clock (ms) of the last COMPLETED scan tick. Unlike
   // `lastTick` (stamped `Date.now()` at getState() serialization time, so it
   // always reads "now"), this only advances when `doTick()` actually finishes a
@@ -2781,6 +2974,24 @@ export class SignalEngine {
       this.quoteTimer = setInterval(() => {
         void this.refreshQuotesOnly();
       }, QUOTE_REFRESH_MS);
+      // TRA-2200 — decoupled exit-evaluation pass, same shape as the TRA-1996
+      // quote refresher. Created ONLY when the flag is armed so the default-OFF
+      // path allocates no timer at all and the shipped behaviour is unchanged
+      // byte-for-byte. Resolved once at start(): a mid-session flip should not
+      // silently arm a broker-order path on a running engine — it takes a restart
+      // (or an explicit `applySettings` re-start), which is the board-visible
+      // event the flag's contract requires.
+      if (isDecoupledExitCadenceEnabled(this.exitCadenceFlagEnv())) {
+        log.info('decoupled exit cadence armed', {
+          component: 'exit-cadence',
+          intervalMs: EXIT_REFRESH_MS,
+          minGapMs: EXIT_MIN_GAP_MS,
+          mode: this.mode,
+        });
+        this.exitTimer = setInterval(() => {
+          void this.refreshExitsOnly();
+        }, EXIT_REFRESH_MS);
+      }
     };
     const initialDelayMs = Math.max(0, opts?.initialDelayMs ?? 0);
     if (initialDelayMs === 0) {
@@ -2802,6 +3013,14 @@ export class SignalEngine {
     if (this.quoteTimer) {
       clearInterval(this.quoteTimer);
       this.quoteTimer = null;
+    }
+    // TRA-2200 — and the decoupled exit pass. `start()` is idempotent on
+    // `tickTimer` only, so leaving this armed after a stop would leave an engine
+    // that evaluates exits (and, in live mirroring, submits sell_to_close orders)
+    // with no tick behind it.
+    if (this.exitTimer) {
+      clearInterval(this.exitTimer);
+      this.exitTimer = null;
     }
   }
 
@@ -2871,6 +3090,13 @@ export class SignalEngine {
       log.error('tick error', { reason: err instanceof Error ? err.message : String(err) });
     } finally {
       this.tickRunning = false;
+      // TRA-2200 — backstop release of the exit-region interlock. doTick clears it
+      // on the happy path right after its options exit pass; this covers a throw
+      // anywhere in the front half of the tick. Without it a single mid-tick
+      // exception would leave the flag latched true FOREVER, and the decoupled exit
+      // pass would silently return early on every subsequent fire — an armed hoist
+      // that evaluates nothing, which reads externally exactly like a working one.
+      this.tickExitRegionActive = false;
     }
   }
 
@@ -3070,122 +3296,186 @@ export class SignalEngine {
     return evaluable;
   }
 
-  private async doTick(): Promise<void> {
-    // TRA-1942 — pace the whole tick: yield a macrotask between the major phases
-    // whenever the contiguous synchronous stretch since the last real yield
-    // crosses the budget, so the SUM of many sub-1s cache-served phases can never
-    // hold the event loop past the 4s watchdog budget. See {@link TickPacer}.
-    const tickPacer = new TickPacer();
-    if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
-      const news = await fetchStocksNews(this.getActiveSymbols());
-      // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
-      // the 5-min refresh so getNews()/getSymbolSentiment() and the News tab
-      // read scored items without re-scoring per request.
-      if (news.length > 0) {
-        this.newsCache = news.map(n => ({ ...n, sentiment: scoreNewsSentiment(n) }));
-      }
-      this.lastNewsRefresh = Date.now();
-    }
+  /**
+   * TRA-2200 — which env the decoupled-exit-cadence flag resolves against.
+   * LIVE reads `process.env` ONLY; DEMO additionally honours the
+   * `DATA_DIR/demo-flags.json` overlay. Same split as `optionExitRisk` /
+   * `bookMarkEnv` in the options exit pass. This is what makes a demo-flags file
+   * flip incapable of arming the live broker-order exit path — see the allowlist
+   * note in `demo-flags.ts`. Do not collapse the two branches.
+   */
+  private exitCadenceFlagEnv(): NodeJS.ProcessEnv {
+    return this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+  }
 
-    // TRA-602 — refresh the StockTwits social-message cache on the same 5-min
-    // cadence. Best-effort: each symbol fetch degrades to null (breaker open /
-    // throttled / cold) without disturbing the cached batch, so getSocialSentiment
-    // keeps serving the last good read. Capped to SOCIAL_SYMBOL_LIMIT symbols to
-    // stay within the unauthenticated per-IP budget.
-    if (Date.now() - this.lastSocialRefresh > SOCIAL_REFRESH_MS) {
-      await withPhase('signal.doTick.social-sentiment', () => this.refreshSocialSentiment());
-      this.lastSocialRefresh = Date.now();
+  /**
+   * TRA-2200 — build the price map for a DECOUPLED exit pass out of `symbolState`
+   * instead of issuing a quote batch.
+   *
+   * Two reasons it reads state rather than fetching: (a) the TRA-1996 refresher
+   * already re-stamps the whole universe every ~30s, so a fetch here would only
+   * duplicate feed load on a box whose quota breaker is itself a live incident
+   * (TRA-2073/TRA-1996); (b) an exit pass that awaits a fan-out is an exit pass
+   * that can be starved by the same I/O it was hoisted to escape.
+   *
+   * Every symbol is age-filtered against {@link EXIT_PRICE_MAX_AGE_MS}. That
+   * filter is load-bearing, not hygiene: `applyQuotes` deliberately RETAINS the
+   * previous `price` and previous `lastUpdated` for a symbol it could not quote
+   * (so the watchlist shows "Quote unavailable" rather than a zero), which means
+   * `symbolState` always carries a plausible-looking last price for a dead symbol.
+   * Keying on presence would hand `checkExits` a stale print and fire a stop off
+   * it. Keying on the STAMP is what distinguishes the two.
+   */
+  private pricesFromSymbolState(now: number = Date.now()): Map<string, number> {
+    const prices = new Map<string, number>();
+    for (const [sym, s] of this.symbolState) {
+      // lastUpdated === 0 is the pre-seeded "loading" sentinel from `start()`, not
+      // a 1970 timestamp — exclude it explicitly rather than letting the age
+      // arithmetic happen to reject it.
+      if (!(s.lastUpdated > 0)) continue;
+      if (!(s.price > 0)) continue;
+      if (now - s.lastUpdated > EXIT_PRICE_MAX_AGE_MS) continue;
+      prices.set(sym, s.price);
     }
+    return prices;
+  }
 
-    // TRA-389 — refresh the cached premarket market-review so the per-tick
-    // gate read stays off disk. Only when the consumption flag is on;
-    // getLatestMarketReview returns null before the first review of the
-    // process's lifetime, which the gate logic treats as "no gates".
-    if (
-      this.marketReviewGatesEnabled
-      && Date.now() - this.lastMarketReviewFetchAt > MARKET_REVIEW_REFRESH_MS
-    ) {
-      this.cachedMarketReview = await getLatestMarketReview('premarket').catch(() => null);
-      this.lastMarketReviewFetchAt = Date.now();
-    }
-
-    // TRA-995 — refresh the edge-decay watch list on a slow cadence (async fold
-    // over the demo option-trade journal), then run the standing risk autopilot
-    // for this tick. The autopilot is TIGHTEN-ONLY: it can halt or throttle but
-    // never raises a limit (DailyRiskGovernor enforces that at the boundary).
-    if (Date.now() - this.lastAutopilotDecayRefreshAt > AUTOPILOT_DECAY_REFRESH_MS) {
-      this.lastAutopilotDecayRefreshAt = Date.now();
-      try {
-        const rows = await listOptionTradeJournal({ mode: 'demo' });
-        // TRA-1905 — the introspection fold is a SYNCHRONOUS O(journal) CPU pass
-        // whose cost grows with the durable demo journal across a session/days;
-        // it is a prime suspect for the `signal.doTick` block trip. Name it at the
-        // sub-phase so the next watchdog trip breadcrumb resolves the culprit
-        // beyond the coarse `signal.doTick`. Only the sync compute is wrapped —
-        // the `await` above stays outside (wrapping I/O would mislabel it).
-        this.autopilotDecayingStrategies = timeSyncPhase(
-          'signal.doTick.autopilot-introspection',
-          () => computeStrategyIntrospection(optionJournalToStrategyRows(rows)),
-        ).degradingStrategies;
-      } catch (err: unknown) {
-        log.warn('autopilot edge-decay refresh threw', {
-          reason: err instanceof Error ? err.message : String(err),
+  /**
+   * TRA-2200 — record that an exit evaluation COMPLETED, from either cadence, and
+   * measure the interval since the previous one. This interval is the quantity
+   * TRA-2200's invalidation criterion is written against ("p99 exit-evaluation
+   * interval > 30s ⇒ the bound chosen was the wrong one"), and nothing in the
+   * shipped build measured it: `signal.doTick` async wall-clock was only ever a
+   * PROXY for it, and hoisting exits off the tick severs the proxy from its
+   * subject. Grade the quantity the criterion names.
+   *
+   * The first pass after boot records no interval (there is no predecessor to
+   * measure against) — it must not be published as a 0ms interval, which would be
+   * a claim about a measurement not taken (cf. the `/api/health/rv-scan` null
+   * discipline, TRA-1707).
+   */
+  private stampExitPass(source: 'tick' | 'decoupled'): void {
+    const now = Date.now();
+    if (this.lastExitPassAt > 0) {
+      const intervalMs = now - this.lastExitPassAt;
+      this.lastExitIntervalMs = intervalMs;
+      if (intervalMs > this.maxExitIntervalMs) this.maxExitIntervalMs = intervalMs;
+      this.exitIntervalHistogram[bucketExitInterval(intervalMs)] += 1;
+      // Tape breadcrumb for the tail only. One line per pass would be ~2,000
+      // lines/session/engine of pure noise; the grade only needs the tail, and the
+      // histogram + `exitPassCount` on the health route carry the full shape. The
+      // threshold sits BELOW the 30s bar so an interval approaching the bar is
+      // already on the tape before it crosses it.
+      if (intervalMs >= EXIT_INTERVAL_LOG_MS) {
+        log.warn('exit evaluation interval exceeded the log threshold', {
+          component: 'exit-cadence',
+          source,
+          intervalMs,
+          thresholdMs: EXIT_INTERVAL_LOG_MS,
+          mode: this.mode,
+          engine: this.feedContextKey,
         });
       }
     }
-    // TRA-1905 — TIGHTEN-ONLY synchronous autopilot pass; named so a block here is
-    // attributed away from the coarse parent phase.
-    timeSyncPhase('signal.doTick.risk-autopilot', () => this.runRiskAutopilot());
+    this.lastExitPassAt = now;
+    this.exitPassCount += 1;
+  }
 
-    // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
-    // applySettings does an immediate fetch when creds change so the user
-    // doesn't see $0 right after saving; this tick handles ongoing refreshes
-    // (deposits, options fills moving cash, etc.) without blocking the rest
-    // of doTick.
-    if (
-      this.mode === 'live'
-      && this.tradierLiveClient
-      && Date.now() - this.lastTradierBalanceFetchAt > TRADIER_BALANCE_REFRESH_MS
-    ) {
-      await withPhase('signal.doTick.tradier-balance', () => this.refreshTradierBalance());
+  /**
+   * TRA-2200 (parent TRA-2171) — decoupled, off-tick exit evaluation. Runs on its
+   * own short cadence (EXIT_REFRESH_MS) so stop/target evaluation latency is
+   * bounded by THIS timer rather than by the analysis tick's wall-clock, which the
+   * 2026-07-23 tape put at p99 296s / max 853s.
+   *
+   * Ordering matches doTick exactly — equity pass, then options pass — so the two
+   * cadences are the same code in the same sequence, differing only in where the
+   * price map comes from. Reconciles, entry scans, cold-bar and MTF refresh are
+   * deliberately NOT hoisted: they are not exit-critical, and pulling broker
+   * reconciliation onto a 10s timer would multiply Tradier calls for no latency
+   * benefit.
+   *
+   * The flag is re-read every pass even though `start()` already gated the timer's
+   * creation. The asymmetry is intentional: a mid-session file flip can DISARM
+   * this path immediately (a kill switch that needs no restart), but cannot ARM it
+   * (no timer exists to re-read the flag). Arming a second broker-order path stays
+   * a deliberate restart.
+   */
+  private async refreshExitsOnly(): Promise<void> {
+    if (!shouldRunDecoupledExitPass({
+      enabled: isDecoupledExitCadenceEnabled(this.exitCadenceFlagEnv()),
+      running: this.exitPassRunning,
+      tickExitRegionActive: this.tickExitRegionActive,
+      marketOpen: isStockMarketOpen(),
+      now: Date.now(),
+      lastExitPassAt: this.lastExitPassAt,
+    })) return;
+    this.exitPassRunning = true;
+    try {
+      const prices = this.pricesFromSymbolState();
+      // No symbol carries a fresh enough stamp to price an exit against. Skipping
+      // WITHOUT stamping is the important half: stamping here would suppress the
+      // next decoupled pass for another gap AND reset the interval clock, so a
+      // feed outage would read as healthy exit cadence. doTick's own inline pass
+      // (which fetches its own quotes) remains the exit path, i.e. this degrades
+      // to today's behaviour rather than to a worse one.
+      if (prices.size === 0) {
+        this.decoupledExitSkippedStalePrices += 1;
+        return;
+      }
+      this.runEquityExitPass(prices);
+      await this.runOptionsExitPass(prices);
+      this.stampExitPass('decoupled');
+    } catch (err: unknown) {
+      log.warn('decoupled exit pass threw', {
+        component: 'exit-cadence',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.exitPassRunning = false;
     }
+  }
 
-    const activeSymbols = this.getActiveSymbols();
-    const quotes = await fetchQuotes(activeSymbols);
-    // TRA-1996 — stamp via the shared helper the decoupled quote refresher also
-    // uses, so `symbolState.lastUpdated` is written the same way on both paths.
-    const prices = this.applyQuotes(quotes, activeSymbols);
+  /**
+   * TRA-2200 — exit-cadence liveness readout, surfaced on
+   * `GET /api/health/exit-cadence`. Null discipline per TRA-1707 / the
+   * `/api/health/rv-scan` contract: a counter we have not taken reports `null`,
+   * never 0, because a zero is a claim.
+   */
+  getExitCadenceHealth(): ExitCadenceHealth {
+    return {
+      enabled: isDecoupledExitCadenceEnabled(this.exitCadenceFlagEnv()),
+      // Distinct from `enabled`: the flag can read true off a mid-session file
+      // flip while NO timer exists (arming needs a restart). Publishing only
+      // `enabled` would let this route claim the hoist is live when it is not —
+      // the exact shape of failure `/api/health/rv-scan` was built to kill.
+      timerArmed: this.exitTimer !== null,
+      intervalMs: EXIT_REFRESH_MS,
+      minGapMs: EXIT_MIN_GAP_MS,
+      mode: this.mode,
+      engine: this.feedContextKey,
+      lastExitPassAt: this.lastExitPassAt > 0 ? this.lastExitPassAt : null,
+      exitPassCount: this.exitPassCount,
+      // Null until a SECOND pass completes — the first has no predecessor, so
+      // there is no interval to report.
+      lastExitIntervalMs: this.exitPassCount > 1 ? this.lastExitIntervalMs : null,
+      maxExitIntervalMs: this.exitPassCount > 1 ? this.maxExitIntervalMs : null,
+      intervalHistogram: { ...this.exitIntervalHistogram },
+      decoupledExitSkippedStalePrices: this.decoupledExitSkippedStalePrices,
+    };
+  }
 
-    // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
-    // only shows entries that are still actionable.
-    // TRA-1905 — synchronous scan over the live signal set; named for sub-phase
-    // attribution of a `signal.doTick` block trip.
-    timeSyncPhase('signal.doTick.prune-signals', () => this.pruneInvalidSignals(prices));
-
-    // Broadcast watchlist state early so the UI populates without waiting for candles
-    if (this.symbolState.size > 0) {
-      // TRA-1905 — getState() rebuilds the full engine snapshot (option Greeks
-      // rollup, per-mode signal/closed-position scoping) every tick; named so a
-      // block in the snapshot build resolves at the sub-phase rather than the
-      // coarse `signal.doTick`.
-      const earlyState = timeSyncPhase('signal.doTick.getstate-broadcast', () => this.getState());
-      for (const h of this.handlers) h(earlyState);
-    }
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
-
-    // TRA-220 — split trading paths by account mode:
-    //   • Demo mode: BOTH stocks AND options trade. Stock paper trading runs
-    //     against PaperAccount and the RV options scanner runs against
-    //     PaperOptionsAccount. Nothing is mirrored to a real broker.
-    //   • Tradier Live (production) and Tradier Sandbox (both selected via
-    //     `mode === 'live'` with `liveTradierEnvOptions = production|sandbox`):
-    //     ONLY options trade. Stock entries/exits are skipped because the live
-    //     equity broker (Webull) isn't integrated yet — the stock account is
-    //     masked to zero in getState(). Options trading runs through
-    //     PaperOptionsAccount for accounting/UI, and TRA-221 mirrors each RV
-    //     open as a real Tradier `buy_to_open` market order when creds are
-    //     configured.
-
+  /**
+   * TRA-2200 (parent TRA-2171) — the DEMO-equity exit evaluation, extracted
+   * VERBATIM from doTick so it has exactly one implementation and can be driven
+   * from two cadences: doTick's inline call (unchanged position and ordering) and
+   * the decoupled `refreshExitsOnly` timer. Callers are serialised by
+   * `tickExitRegionActive` + `exitPassRunning`, so the two can never interleave.
+   *
+   * Synchronous throughout (`account.checkExits` is a pure ATR/indicator pass over
+   * open positions); the surrounding method is not async by accident — it is kept
+   * void-returning so the two call sites read identically.
+   */
+  private runEquityExitPass(prices: Map<string, number>): void {
     if (this.mode === 'demo') {
       // TRA-1268 (TRA-1250 Rules 1-2) — feed the demo-equity exit loop live
       // ATR(14) per open symbol so it can run the ATR chandelier trail +
@@ -3241,82 +3531,31 @@ export class SignalEngine {
         }
       }
     }
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+  }
 
-    // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
-    // options account also unwinds at SL/TP. TRA-159 — refresh option marks
-    // from the cached chain snapshot for any open OTM/RV positions; each
-    // lookup hits the scanner's 60s chain cache so a 30s tick rarely costs a
-    // real Tradier round-trip. Positions whose mark we couldn't refresh are
-    // skipped this tick by `checkExits`. TRA-231 — pass `this.mode` so each
-    // tick only closes positions opened under the current mode (demo or
-    // live), preventing the inactive bucket from being silently unwound when
-    // the user switches modes.
-    // TRA-352 follow-up — reconcile any open row whose `sell_to_close`
-    // limit was still pending after the smart-close walk's 10s window.
-    // Runs BEFORE `checkExits` so a position that just got filled on
-    // Tradier doesn't bounce through a phantom auto-exit on the same tick.
-    // Errors are swallowed inside the reconciler so a single bad row
-    // can't take down the rest of the tick.
-    try {
-      const summary = await withPhase('signal.doTick.reconcile-pending-closes', () => this.reconcilePendingCloses());
-      if (summary.filled + summary.cleared + summary.repriced > 0) {
-        log.info('tradier-reconcile tick summary', {
-          component: 'tradier-reconcile',
-          filled: summary.filled,
-          cleared: summary.cleared,
-          repriced: summary.repriced,
-          stillPending: summary.stillPending,
-          noClient: summary.noClient,
-        });
-      }
-    } catch (err: unknown) {
-      log.warn('tradier-reconcile sweep threw', {
-        component: 'tradier-reconcile',
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // TRA-356 — portfolio-level reconcile so manual Tradier-side activity
-    // (opens, closes, partial fills) flows back into local state between
-    // ticks without the user pressing "Sync Tradier positions". Runs AFTER
-    // `reconcilePendingCloses` so an order that just filled this tick has
-    // already cleared its row before we cross-check broker state against
-    // local imports. Errors are caught inside the method so one bad sweep
-    // doesn't break the rest of the tick.
-    try {
-      await withPhase('signal.doTick.reconcile-live-portfolio', () => this.reconcileLivePortfolio());
-    } catch (err: unknown) {
-      log.warn('tradier-portfolio-reconcile sweep threw', {
-        component: 'tradier-portfolio-reconcile',
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // TRA-415 — equity-position reconcile so a stock opened / closed
-    // out-of-band on the Tradier UI (or left behind by a failed mirror
-    // order) flows back into the live equity mirror between ticks. The
-    // first tick forces a sweep (bypassing the cadence + idle throttle)
-    // since the mirror starts empty on every boot and would otherwise be
-    // skipped by the idle-account throttle. Errors are caught inside the
-    // method; this guard only covers an unexpected throw.
-    try {
-      const bootSweep = !this.equityReconciledOnBoot;
-      const summary = await withPhase('signal.doTick.reconcile-live-equity', () => this.reconcileLiveEquityPortfolio({ force: bootSweep }));
-      // Flip the boot flag only once a sweep actually reached Tradier so a
-      // boot with no creds yet keeps the forced sweep armed for the tick
-      // after the equity client is built.
-      if (bootSweep && summary.skipped === null) {
-        this.equityReconciledOnBoot = true;
-      }
-    } catch (err: unknown) {
-      log.warn('tradier-equity-reconcile sweep threw', {
-        component: 'tradier-equity-reconcile',
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // TRA-1662 — walk the observe-only shadow maker chases before the mark
-    // refresh, so a chase reads the same-age chain snapshot the marks do.
-    await withPhase('signal.doTick.shadow-chases', () => this.advanceShadowChases());
-
+  /**
+   * TRA-2200 (parent TRA-2171) — the OPTIONS exit evaluation (mark refresh →
+   * pending-exit resolution → `checkExits` → staged sell_to_close submission →
+   * book-level give-back mark), extracted VERBATIM from doTick. Same contract as
+   * {@link runEquityExitPass}: one implementation, two cadences, serialised by
+   * `tickExitRegionActive` + `exitPassRunning`.
+   *
+   * ⚠ THIS METHOD CAN SUBMIT REAL BROKER ORDERS (`submitStagedOptionExits`, when
+   * `mode === 'live'` and options mirroring is on). That is precisely why the
+   * decoupled caller is interlocked against doTick's exit region rather than
+   * merely guarded against self-overlap — two concurrent passes over the same
+   * `pendingExit` intents would double-submit a `sell_to_close`.
+   *
+   * Feed cost of the extra cadence is bounded by the caching that already exists:
+   * `refreshOptionMarks` returns immediately with no open eligible positions, and
+   * otherwise issues at most ONE chain fetch per (symbol, expiration) per 60s
+   * chain-cache TTL — so driving it every 10s does not raise the Tradier call rate
+   * above what a 60s cache already permits.
+   *
+   * @param pacer doTick's {@link TickPacer} when driven from the tick; omitted on
+   *   the decoupled path, which is short and yields at each await anyway.
+   */
+  private async runOptionsExitPass(prices: Map<string, number>, pacer?: TickPacer): Promise<void> {
     const optionMarks = await withPhase('signal.doTick.option-marks', () => this.refreshOptionMarks());
     // TRA-351 — push the freshly-fetched marks onto imported rows BEFORE
     // checkExits runs. checkExits skips imports (line 525 of options-account)
@@ -3327,7 +3566,9 @@ export class SignalEngine {
     // accounts; named so a block here resolves at the sub-phase rather than the
     // coarse `signal.doTick`.
     timeSyncPhase('signal.doTick.imported-marks', () => this.refreshImportedMarksAllAccounts(optionMarks));
-    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+    // TRA-1942 tick pacer — only when driven from doTick; the decoupled pass has no
+    // pacer (it is short and yields naturally at each await).
+    if (pacer?.shouldYield() ?? false) await yieldToEventLoop();
 
     // TRA-354 — wait-and-hold exit policy for ENGINE-FIRED exits (distinct
     // from the TRA-352 USER-initiated close reconciler that ran above).
@@ -3542,6 +3783,219 @@ export class SignalEngine {
         this.flattenOnBookHalt(prices, this.riskGovernor.getBookHaltReason() ?? 'book give-back halt');
       }
     }
+  }
+
+  private async doTick(): Promise<void> {
+    // TRA-2200 SAFETY INTERLOCK — claim the exit-critical region for the whole
+    // front half of the tick, so the decoupled exit pass cannot start a second
+    // concurrent `optionsAccount.checkExits` / `submitStagedOptionExits` /
+    // pending-close reconcile while this one is in flight (a double
+    // `sell_to_close` on a real broker order). Released immediately after
+    // `runOptionsExitPass` below — NOT at the end of the tick — because the long
+    // sinks that follow (`cold-bar-scan`, `mtf-refresh`, the unattributed ~50%)
+    // are precisely the window the hoist exists to reclaim. `runTickGuarded`
+    // clears it again in a `finally` so a throw anywhere in here cannot wedge it
+    // true and silently disarm the decoupled pass for the life of the process.
+    this.tickExitRegionActive = true;
+    // TRA-1942 — pace the whole tick: yield a macrotask between the major phases
+    // whenever the contiguous synchronous stretch since the last real yield
+    // crosses the budget, so the SUM of many sub-1s cache-served phases can never
+    // hold the event loop past the 4s watchdog budget. See {@link TickPacer}.
+    const tickPacer = new TickPacer();
+    if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
+      const news = await fetchStocksNews(this.getActiveSymbols());
+      // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
+      // the 5-min refresh so getNews()/getSymbolSentiment() and the News tab
+      // read scored items without re-scoring per request.
+      if (news.length > 0) {
+        this.newsCache = news.map(n => ({ ...n, sentiment: scoreNewsSentiment(n) }));
+      }
+      this.lastNewsRefresh = Date.now();
+    }
+
+    // TRA-602 — refresh the StockTwits social-message cache on the same 5-min
+    // cadence. Best-effort: each symbol fetch degrades to null (breaker open /
+    // throttled / cold) without disturbing the cached batch, so getSocialSentiment
+    // keeps serving the last good read. Capped to SOCIAL_SYMBOL_LIMIT symbols to
+    // stay within the unauthenticated per-IP budget.
+    if (Date.now() - this.lastSocialRefresh > SOCIAL_REFRESH_MS) {
+      await withPhase('signal.doTick.social-sentiment', () => this.refreshSocialSentiment());
+      this.lastSocialRefresh = Date.now();
+    }
+
+    // TRA-389 — refresh the cached premarket market-review so the per-tick
+    // gate read stays off disk. Only when the consumption flag is on;
+    // getLatestMarketReview returns null before the first review of the
+    // process's lifetime, which the gate logic treats as "no gates".
+    if (
+      this.marketReviewGatesEnabled
+      && Date.now() - this.lastMarketReviewFetchAt > MARKET_REVIEW_REFRESH_MS
+    ) {
+      this.cachedMarketReview = await getLatestMarketReview('premarket').catch(() => null);
+      this.lastMarketReviewFetchAt = Date.now();
+    }
+
+    // TRA-995 — refresh the edge-decay watch list on a slow cadence (async fold
+    // over the demo option-trade journal), then run the standing risk autopilot
+    // for this tick. The autopilot is TIGHTEN-ONLY: it can halt or throttle but
+    // never raises a limit (DailyRiskGovernor enforces that at the boundary).
+    if (Date.now() - this.lastAutopilotDecayRefreshAt > AUTOPILOT_DECAY_REFRESH_MS) {
+      this.lastAutopilotDecayRefreshAt = Date.now();
+      try {
+        const rows = await listOptionTradeJournal({ mode: 'demo' });
+        // TRA-1905 — the introspection fold is a SYNCHRONOUS O(journal) CPU pass
+        // whose cost grows with the durable demo journal across a session/days;
+        // it is a prime suspect for the `signal.doTick` block trip. Name it at the
+        // sub-phase so the next watchdog trip breadcrumb resolves the culprit
+        // beyond the coarse `signal.doTick`. Only the sync compute is wrapped —
+        // the `await` above stays outside (wrapping I/O would mislabel it).
+        this.autopilotDecayingStrategies = timeSyncPhase(
+          'signal.doTick.autopilot-introspection',
+          () => computeStrategyIntrospection(optionJournalToStrategyRows(rows)),
+        ).degradingStrategies;
+      } catch (err: unknown) {
+        log.warn('autopilot edge-decay refresh threw', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // TRA-1905 — TIGHTEN-ONLY synchronous autopilot pass; named so a block here is
+    // attributed away from the coarse parent phase.
+    timeSyncPhase('signal.doTick.risk-autopilot', () => this.runRiskAutopilot());
+
+    // TRA-226 — keep the live Tradier equity figure fresh while in live mode.
+    // applySettings does an immediate fetch when creds change so the user
+    // doesn't see $0 right after saving; this tick handles ongoing refreshes
+    // (deposits, options fills moving cash, etc.) without blocking the rest
+    // of doTick.
+    if (
+      this.mode === 'live'
+      && this.tradierLiveClient
+      && Date.now() - this.lastTradierBalanceFetchAt > TRADIER_BALANCE_REFRESH_MS
+    ) {
+      await withPhase('signal.doTick.tradier-balance', () => this.refreshTradierBalance());
+    }
+
+    const activeSymbols = this.getActiveSymbols();
+    const quotes = await fetchQuotes(activeSymbols);
+    // TRA-1996 — stamp via the shared helper the decoupled quote refresher also
+    // uses, so `symbolState.lastUpdated` is written the same way on both paths.
+    const prices = this.applyQuotes(quotes, activeSymbols);
+
+    // TRA-230: drop stale or stop/target-crossed signals so the Signals tab
+    // only shows entries that are still actionable.
+    // TRA-1905 — synchronous scan over the live signal set; named for sub-phase
+    // attribution of a `signal.doTick` block trip.
+    timeSyncPhase('signal.doTick.prune-signals', () => this.pruneInvalidSignals(prices));
+
+    // Broadcast watchlist state early so the UI populates without waiting for candles
+    if (this.symbolState.size > 0) {
+      // TRA-1905 — getState() rebuilds the full engine snapshot (option Greeks
+      // rollup, per-mode signal/closed-position scoping) every tick; named so a
+      // block in the snapshot build resolves at the sub-phase rather than the
+      // coarse `signal.doTick`.
+      const earlyState = timeSyncPhase('signal.doTick.getstate-broadcast', () => this.getState());
+      for (const h of this.handlers) h(earlyState);
+    }
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+
+    // TRA-220 — split trading paths by account mode:
+    //   • Demo mode: BOTH stocks AND options trade. Stock paper trading runs
+    //     against PaperAccount and the RV options scanner runs against
+    //     PaperOptionsAccount. Nothing is mirrored to a real broker.
+    //   • Tradier Live (production) and Tradier Sandbox (both selected via
+    //     `mode === 'live'` with `liveTradierEnvOptions = production|sandbox`):
+    //     ONLY options trade. Stock entries/exits are skipped because the live
+    //     equity broker (Webull) isn't integrated yet — the stock account is
+    //     masked to zero in getState(). Options trading runs through
+    //     PaperOptionsAccount for accounting/UI, and TRA-221 mirrors each RV
+    //     open as a real Tradier `buy_to_open` market order when creds are
+    //     configured.
+
+    this.runEquityExitPass(prices);
+    if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
+
+    // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
+    // options account also unwinds at SL/TP. TRA-159 — refresh option marks
+    // from the cached chain snapshot for any open OTM/RV positions; each
+    // lookup hits the scanner's 60s chain cache so a 30s tick rarely costs a
+    // real Tradier round-trip. Positions whose mark we couldn't refresh are
+    // skipped this tick by `checkExits`. TRA-231 — pass `this.mode` so each
+    // tick only closes positions opened under the current mode (demo or
+    // live), preventing the inactive bucket from being silently unwound when
+    // the user switches modes.
+    // TRA-352 follow-up — reconcile any open row whose `sell_to_close`
+    // limit was still pending after the smart-close walk's 10s window.
+    // Runs BEFORE `checkExits` so a position that just got filled on
+    // Tradier doesn't bounce through a phantom auto-exit on the same tick.
+    // Errors are swallowed inside the reconciler so a single bad row
+    // can't take down the rest of the tick.
+    try {
+      const summary = await withPhase('signal.doTick.reconcile-pending-closes', () => this.reconcilePendingCloses());
+      if (summary.filled + summary.cleared + summary.repriced > 0) {
+        log.info('tradier-reconcile tick summary', {
+          component: 'tradier-reconcile',
+          filled: summary.filled,
+          cleared: summary.cleared,
+          repriced: summary.repriced,
+          stillPending: summary.stillPending,
+          noClient: summary.noClient,
+        });
+      }
+    } catch (err: unknown) {
+      log.warn('tradier-reconcile sweep threw', {
+        component: 'tradier-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // TRA-356 — portfolio-level reconcile so manual Tradier-side activity
+    // (opens, closes, partial fills) flows back into local state between
+    // ticks without the user pressing "Sync Tradier positions". Runs AFTER
+    // `reconcilePendingCloses` so an order that just filled this tick has
+    // already cleared its row before we cross-check broker state against
+    // local imports. Errors are caught inside the method so one bad sweep
+    // doesn't break the rest of the tick.
+    try {
+      await withPhase('signal.doTick.reconcile-live-portfolio', () => this.reconcileLivePortfolio());
+    } catch (err: unknown) {
+      log.warn('tradier-portfolio-reconcile sweep threw', {
+        component: 'tradier-portfolio-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // TRA-415 — equity-position reconcile so a stock opened / closed
+    // out-of-band on the Tradier UI (or left behind by a failed mirror
+    // order) flows back into the live equity mirror between ticks. The
+    // first tick forces a sweep (bypassing the cadence + idle throttle)
+    // since the mirror starts empty on every boot and would otherwise be
+    // skipped by the idle-account throttle. Errors are caught inside the
+    // method; this guard only covers an unexpected throw.
+    try {
+      const bootSweep = !this.equityReconciledOnBoot;
+      const summary = await withPhase('signal.doTick.reconcile-live-equity', () => this.reconcileLiveEquityPortfolio({ force: bootSweep }));
+      // Flip the boot flag only once a sweep actually reached Tradier so a
+      // boot with no creds yet keeps the forced sweep armed for the tick
+      // after the equity client is built.
+      if (bootSweep && summary.skipped === null) {
+        this.equityReconciledOnBoot = true;
+      }
+    } catch (err: unknown) {
+      log.warn('tradier-equity-reconcile sweep threw', {
+        component: 'tradier-equity-reconcile',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // TRA-1662 — walk the observe-only shadow maker chases before the mark
+    // refresh, so a chase reads the same-age chain snapshot the marks do.
+    await withPhase('signal.doTick.shadow-chases', () => this.advanceShadowChases());
+
+    await this.runOptionsExitPass(prices, tickPacer);
+    // TRA-2200 — exit evaluation for this tick is COMPLETE. Stamp the interval
+    // (the two cadences dedup against this stamp) and release the interlock: the
+    // remainder of the tick is entry-scan / cold-bar / MTF work that the decoupled
+    // pass is safe to run alongside, and that is where the 853s lives.
+    this.stampExitPass('tick');
+    this.tickExitRegionActive = false;
     if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-154: tag symbols that have an open position or a recent signal as

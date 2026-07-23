@@ -61,7 +61,7 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS } from './signal-engine.js';
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
 import {
@@ -6468,5 +6468,104 @@ describe('TRA-1996 — decoupled quote-refresh gate (shouldRunDecoupledQuoteRefr
     expect(
       shouldRunDecoupledQuoteRefresh({ ...base, now: 100_000, lastQuoteStampAt: 55_000, minGapMs: 50_000 }),
     ).toBe(false);
+  });
+});
+
+describe('TRA-2200 — decoupled exit-evaluation gate (shouldRunDecoupledExitPass)', () => {
+  const base = {
+    enabled: true,
+    running: false,
+    tickExitRegionActive: false,
+    marketOpen: true,
+    now: 1_000_000,
+    lastExitPassAt: 0,
+  };
+
+  it('runs when armed, idle, in-hours, outside doTick\'s exit region, past the gap', () => {
+    expect(shouldRunDecoupledExitPass(base)).toBe(true);
+  });
+
+  it('is inert until the flag is armed — default OFF means no second exit path', () => {
+    expect(shouldRunDecoupledExitPass({ ...base, enabled: false })).toBe(false);
+  });
+
+  it('never runs while a decoupled pass is already in flight (no self-overlap)', () => {
+    expect(shouldRunDecoupledExitPass({ ...base, running: true })).toBe(false);
+  });
+
+  it('THE SAFETY INTERLOCK: never runs while doTick is inside its own exit region', () => {
+    // This is the one that prevents a double `sell_to_close`. Two concurrent
+    // passes over the same `pendingExit` intents would each stage and submit.
+    expect(shouldRunDecoupledExitPass({ ...base, tickExitRegionActive: true })).toBe(false);
+  });
+
+  it('DOES run while a tick is in flight but PAST its exit region — the whole point', () => {
+    // The interlock is keyed on the exit region, NOT on `tickRunning`. Gating on
+    // the whole tick would re-serialise exits behind the same 853s tail this
+    // exists to escape, i.e. it would ship the bug it is fixing. There is
+    // deliberately no `tickRunning` field on this gate to key on.
+    expect(shouldRunDecoupledExitPass({ ...base, tickExitRegionActive: false })).toBe(true);
+  });
+
+  it('never runs off-hours', () => {
+    expect(shouldRunDecoupledExitPass({ ...base, marketOpen: false })).toBe(false);
+  });
+
+  it('dedups against a recent exit pass from EITHER cadence, then re-arms past the gap', () => {
+    // doTick stamped 3s ago (< 8s gap) -> suppressed, so the two cadences do not
+    // double-evaluate when they phase together.
+    expect(
+      shouldRunDecoupledExitPass({ ...base, now: 100_000, lastExitPassAt: 97_000 }),
+    ).toBe(false);
+    // 9s ago -> the gap has elapsed, so a tick stuck in its cold-bar tail can
+    // never stall exit evaluation.
+    expect(
+      shouldRunDecoupledExitPass({ ...base, now: 100_000, lastExitPassAt: 91_000 }),
+    ).toBe(true);
+  });
+
+  it('honours an explicit minGapMs override', () => {
+    // gap = 15_000ms.
+    expect(
+      shouldRunDecoupledExitPass({ ...base, now: 100_000, lastExitPassAt: 85_000, minGapMs: 10_000 }),
+    ).toBe(true);
+    expect(
+      shouldRunDecoupledExitPass({ ...base, now: 100_000, lastExitPassAt: 85_000, minGapMs: 20_000 }),
+    ).toBe(false);
+  });
+});
+
+describe('TRA-2200 — exit-interval histogram (bucketExitInterval)', () => {
+  it('puts the 30s invalidation bar on a BUCKET EDGE so p99 needs no interpolation', () => {
+    // 29_999ms is the last value that counts as "under the bar"; 30_000 is the
+    // first that counts as over it. A bucket straddling 30s would force the grade
+    // to interpolate, and the whole point of the edge is that
+    // `atOrAbove30s / samples < 0.01` IS "p99 < 30s".
+    expect(bucketExitInterval(29_999)).toBe('lt30s');
+    expect(bucketExitInterval(30_000)).toBe('lt60s');
+  });
+
+  it('classifies each bucket at its lower edge', () => {
+    expect(bucketExitInterval(0)).toBe('lt5s');
+    expect(bucketExitInterval(5_000)).toBe('lt10s');
+    expect(bucketExitInterval(10_000)).toBe('lt15s');
+    expect(bucketExitInterval(15_000)).toBe('lt30s');
+    expect(bucketExitInterval(60_000)).toBe('lt120s');
+    expect(bucketExitInterval(120_000)).toBe('lt300s');
+    expect(bucketExitInterval(300_000)).toBe('gte300s');
+  });
+
+  it('keeps the 2026-07-23 pre-fix headline in the top bucket (853s max, 296s p99)', () => {
+    // Directly comparable to the pre-fix numbers rather than a rescaled axis: if
+    // the hoist did nothing, the post-fix read lands in the same buckets.
+    expect(bucketExitInterval(853_400)).toBe('gte300s');
+    expect(bucketExitInterval(296_400)).toBe('lt300s');
+    expect(bucketExitInterval(70_000)).toBe('lt120s');
+  });
+
+  it('emptyExitIntervalHistogram zeroes exactly the declared buckets', () => {
+    const h = emptyExitIntervalHistogram();
+    expect(Object.keys(h).sort()).toEqual([...EXIT_INTERVAL_BUCKETS].sort());
+    expect(Object.values(h).every((n) => n === 0)).toBe(true);
   });
 });
