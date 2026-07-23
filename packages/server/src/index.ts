@@ -10,8 +10,7 @@ import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import { reconcilePnl, resolvePnlBaselineDate } from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
-import { aggregateDeskCalendar } from './reports/desk-calendar.js';
-import { excludeTestAccountRows } from './test-accounts.js';
+import { buildJournalCalendarCells } from './reports/desk-calendar.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
@@ -6699,9 +6698,16 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
 // This reuses the exact `aggregateDeskCalendar` fold (demo-only, realized option
 // P&L keyed by ET close day) so the account and Desk views agree cell-for-cell.
 // Applies to DEMO only; live/sandbox keep their Tradier balance-truth path.
+//
+// TRA-2210 — "agree cell-for-cell" was false: this fold skipped the TRA-1475
+// QA/test-book de-noise that BOTH `/api/reports/desk*` routes apply, so a filled
+// day here summed fixture churn the Desk view drops (2026-07-22: +$4,919.50 here
+// vs +$119.50 on Desk — $4,800 of it three mirrors of one SMCI close). Now goes
+// through `buildJournalCalendarCells`, which folds the filter in, so the two
+// views cannot diverge again.
 async function demoJournalCalendarCells(): Promise<Map<string, EodReport>> {
   const rows = await listOptionTradeJournal({ mode: 'demo' });
-  return aggregateDeskCalendar(rows, Date.now());
+  return buildJournalCalendarCells(rows, Date.now());
 }
 
 /** A personal report cell carries no realized activity → safe to fill from journal. */
@@ -6786,11 +6792,11 @@ app.get('/api/reports/desk', requireAuth, requireAdmin, async (req, res) => {
     // …) so the firm Desk number reflects real books only. `?includeTest=1` opts
     // the test churn back in for debugging. Legacy un-owned rows are kept.
     const includeTest = req.query['includeTest'] === '1';
-    const rows = excludeTestAccountRows(
+    const cells = buildJournalCalendarCells(
       await listOptionTradeJournal({ mode: 'demo' }),
+      Date.now(),
       { includeTest },
     );
-    const cells = aggregateDeskCalendar(rows, Date.now());
     res.json({ dates: [...cells.keys()].sort().reverse() });
   } catch (err) {
     log.warn('desk calendar date list failed', {
@@ -6810,11 +6816,11 @@ app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) =
     // TRA-1475 — same QA/test de-noise as the date-list route so a drilled-in
     // day cell matches the (filtered) figure the grid shows.
     const includeTest = req.query['includeTest'] === '1';
-    const rows = excludeTestAccountRows(
+    const cell = buildJournalCalendarCells(
       await listOptionTradeJournal({ mode: 'demo' }),
+      Date.now(),
       { includeTest },
-    );
-    const cell = aggregateDeskCalendar(rows, Date.now()).get(date);
+    ).get(date);
     if (!cell) {
       res.status(404).json({ error: `No desk report for ${date}` });
       return;

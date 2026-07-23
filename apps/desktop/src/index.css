@@ -1645,6 +1645,9 @@ tr:hover td { background: var(--bg-hover); }
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
+  /* TRA-2210 — let the control row drop below the title instead of squeezing
+     the controls into a width that clips them. */
+  flex-wrap: wrap;
 }
 
 .cal-title {
@@ -1658,6 +1661,13 @@ tr:hover td { background: var(--bg-hover); }
   display: flex;
   align-items: center;
   gap: 1rem;
+  /* TRA-2210 — the control row grew past the header width (source segment +
+     Month/Year + date filter + nav + Refresh + Export). Without wrapping, the
+     overflow was absorbed by shrinking the segmented toggles, which clipped
+     them. Wrap to a second line and keep the row right-aligned under the title. */
+  flex-wrap: wrap;
+  row-gap: 0.5rem;
+  justify-content: flex-end;
 }
 
 /* Month / Year toggle */
@@ -1667,6 +1677,15 @@ tr:hover td { background: var(--bg-hover); }
   border: 1px solid var(--border);
   border-radius: 4px;
   overflow: hidden;
+  /* TRA-2210 — `overflow: hidden` sets this flex item's automatic minimum size
+     to 0 (per flexbox: an item with non-visible overflow has no content-based
+     minimum), so it was the ONE control that could shrink below its own labels
+     — and then hid the overflow it caused. The board saw "Month | Ye" with the
+     Year button sliced off and no scrollbar, ellipsis, or any other tell that a
+     control was there at all. Pin it to its content width so a cramped header
+     wraps the row (above) instead of amputating a button. */
+  flex: 0 0 auto;
+  min-width: max-content;
 }
 
 .cal-toggle-btn {
@@ -1679,6 +1698,8 @@ tr:hover td { background: var(--bg-hover); }
   font-size: 0.75rem;
   font-weight: 600;
   transition: color 0.15s, background 0.15s;
+  /* TRA-2210 — a label must never wrap mid-word inside its own button. */
+  white-space: nowrap;
 }
 
 .cal-toggle-btn.active { background: var(--blue); color: var(--accent-on); }

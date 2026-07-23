@@ -1,6 +1,7 @@
 import type { EodReport, EodTradeEntry } from '@trading-app/shared';
 import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
 import { etDateString } from '../scheduler.js';
+import { excludeTestAccountRows } from '../test-accounts.js';
 
 // TRA-1413 — the DESK (all demo books) calendar aggregation.
 //
@@ -124,4 +125,31 @@ export function aggregateDeskCalendar(
     out.set(date, buildDeskDayReport(date, list, generatedAt));
   }
   return out;
+}
+
+/**
+ * TRA-2210 — the ONE way to turn firm-wide demo journal rows into calendar
+ * cells: QA/test-book de-noise (TRA-1475) composed with the fold, in that order.
+ *
+ * The de-noise used to live at the two `/api/reports/desk*` call sites only.
+ * TRA-1572 then added a THIRD consumer — the per-account DEMO calendar fills a
+ * day the personal book was silent on from this same journal — and it called
+ * the bare `aggregateDeskCalendar`, so it summed the QA churn the Desk view
+ * drops. Both views read the same journal and disagreed: on 2026-07-22 "My
+ * Account" showed **+$4,919.50** against Desk's **+$119.50** — a 41x overstatement,
+ * $4,800 of it three fixture mirrors of ONE SMCI close (+$1,600 x3, each with a
+ * distinct `id`, so id-dedupe sees no duplicate). A per-user view reading HIGHER
+ * than the whole firm is the shape of that bug, and it is exactly what the board
+ * saw.
+ *
+ * Filtering here rather than at each caller makes the omission structurally
+ * impossible: there is no longer a call site that CAN forget. `includeTest`
+ * (the routes' `?includeTest=1`) still opts the churn back in for debugging.
+ */
+export function buildJournalCalendarCells(
+  rows: OptionTradeJournalRecord[],
+  generatedAt: number,
+  opts: { includeTest?: boolean } = {},
+): Map<string, EodReport> {
+  return aggregateDeskCalendar(excludeTestAccountRows(rows, opts), generatedAt);
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { aggregateDeskCalendar, buildDeskDayReport } from './desk-calendar.js';
+import { aggregateDeskCalendar, buildDeskDayReport, buildJournalCalendarCells } from './desk-calendar.js';
 import { excludeTestAccountRows } from '../test-accounts.js';
 import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
 
@@ -111,6 +111,54 @@ describe('DESK de-noise — excludeTestAccountRows feeding the fold (TRA-1475)',
     ).get('2026-07-01');
     expect(cell!.combinedPnl).toBe(9300);
     expect(cell!.totalTrades).toBe(2);
+  });
+});
+
+// TRA-2210 — the per-account DEMO calendar (TRA-1572) fills a day the personal
+// book was silent on from this SAME firm-wide journal, and it used to call the
+// bare fold — skipping the TRA-1475 QA de-noise both Desk routes apply. The two
+// views then disagreed on identical input: 2026-07-22 read +$4,919.50 under "My
+// Account" against +$119.50 on Desk. `buildJournalCalendarCells` is the single
+// entry point that folds the filter in, so no caller can omit it.
+describe('buildJournalCalendarCells — journal → cells, de-noise not optional (TRA-2210)', () => {
+  // The real 2026-07-22 shape: one genuine +$1,600 SMCI close mirrored into
+  // three QA fixture books with DISTINCT ids (id-dedupe finds no duplicate), on
+  // top of $119.50 of real-book closes.
+  const jul22 = [
+    closed({ id: 'r1', closeTs: JUL01, realizedPnlUsd: 100, account: 'richard' }),
+    closed({ id: 'r2', closeTs: JUL01, realizedPnlUsd: 19.5, account: 'admin' }),
+    closed({ id: 'm1', closeTs: JUL01, realizedPnlUsd: 1600, symbol: 'SMCI', account: 'qa_mirror_1578_38096' }),
+    closed({ id: 'm2', closeTs: JUL01, realizedPnlUsd: 1600, symbol: 'SMCI', account: 'qa_tra1475_1783821169' }),
+    closed({ id: 'm3', closeTs: JUL01, realizedPnlUsd: 1600, symbol: 'SMCI', account: 'qa_reg_0710202220' }),
+  ];
+
+  it('drops QA fixture mirrors by default — the account view can no longer read 41x the desk', () => {
+    const cell = buildJournalCalendarCells(jul22, GEN).get('2026-07-01');
+    expect(cell!.combinedPnl).toBeCloseTo(119.5, 2);
+    expect(cell!.totalTrades).toBe(2);
+    // The pre-fix number, asserted explicitly so a regression names itself.
+    expect(cell!.combinedPnl).not.toBeCloseTo(4919.5, 2);
+  });
+
+  it('produces the SAME cell the Desk routes do for identical rows', () => {
+    const account = buildJournalCalendarCells(jul22, GEN).get('2026-07-01');
+    const desk = aggregateDeskCalendar(excludeTestAccountRows(jul22), GEN).get('2026-07-01');
+    expect(account!.combinedPnl).toBe(desk!.combinedPnl);
+    expect(account!.totalTrades).toBe(desk!.totalTrades);
+  });
+
+  it('includeTest still opts the churn back in for debugging', () => {
+    const cell = buildJournalCalendarCells(jul22, GEN, { includeTest: true }).get('2026-07-01');
+    expect(cell!.combinedPnl).toBeCloseTo(4919.5, 2);
+    expect(cell!.totalTrades).toBe(5);
+  });
+
+  it('keeps legacy un-owned rows — they cannot be classified, so excluding them would shrink history', () => {
+    const cell = buildJournalCalendarCells(
+      [closed({ id: 'legacy', closeTs: JUL01, realizedPnlUsd: 40 })],
+      GEN,
+    ).get('2026-07-01');
+    expect(cell!.combinedPnl).toBe(40);
   });
 });
 
