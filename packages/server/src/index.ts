@@ -707,7 +707,11 @@ setRvScanner(
   relativeValueScannerService.diagnostics().configured ? relativeValueScannerService : undefined,
 );
 log.info('rv-scanner initialized', {
-  env: tradierEnv,
+  // TRA-2163 (leg 3) — `tradierEnv` is cast from the raw `TRADIER_ENV` env var,
+  // which was mis-set to the live Tradier token on bqb1. Redact through the same
+  // choke point so a mis-set value can never be written to the (persisted) logs;
+  // routing itself still uses the raw `tradierEnv` const above, unchanged.
+  env: redactTradierEnvLabel(tradierEnv),
   configured: relativeValueScannerService.diagnostics().configured,
 });
 
