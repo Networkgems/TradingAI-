@@ -273,6 +273,7 @@ import {
   shadowExpectancyGuardFromLedger,
 } from './shadow-expectancy-guard-config.js';
 import { initOptionShadowLedger, listOptionShadowSignals, isOptionShadowEnabled, OPTION_SHADOW_EMERGENCY_OFF } from './option-shadow-ledger.js';
+import { initOrbOptionsShadowLedger, listOrbOptionsShadowSignals, isOrbOptionsShadowEnabled } from './orb-options-shadow-ledger.js';
 import {
   initPcrShadowLedger,
   listPcrShadowSignals,
@@ -862,6 +863,12 @@ await initShadowLedger();
 // appends to it is observe-only and OFF unless ENABLE_OPTION_SHADOW_SELECTOR is
 // set; nothing here routes an order.
 await initOptionShadowLedger();
+
+// TRA-2173 (parent TRA-2172) — warm the flag-gated SHADOW ORB-for-options ledger
+// so the read endpoint has history right after boot. The signal-engine ORB-
+// options pass appends at most one directional-intent row per underlying per ET
+// session when ENABLE_ORB_OPTIONS_SHADOW is set; observe-only, routes no order.
+await initOrbOptionsShadowLedger();
 
 // TRA-1609 (parent TRA-1607) — warm the flag-gated SHADOW Put-Call-Ratio ledger
 // so the read endpoint has history right after boot. The signal-engine option-
@@ -5428,6 +5435,28 @@ app.get('/api/health/option-shadow-signals', async (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to read option shadow ledger' });
+  }
+});
+
+// TRA-2173 (parent TRA-2172) — read-only probe over the SHADOW ORB-for-options
+// ledger, open like the other shadow probes so QuantTrader can pull the breakout-
+// intent dataset for a future go/no-go without Render admin creds. Reports
+// whether the flag is enabled so a viewer can tell an empty ledger ("flag off")
+// from a live-but-silent one. Observe-only; nothing here routes an order.
+app.get('/api/health/orb-options-shadow-signals', async (_req, res) => {
+  try {
+    const signals = await listOrbOptionsShadowSignals();
+    res.json({
+      issue: 'TRA-2172',
+      flagEnabled: isOrbOptionsShadowEnabled(),
+      count: signals.length,
+      signals,
+    });
+  } catch (err) {
+    log.error('orb-options-shadow-signals health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read orb-options shadow ledger' });
   }
 });
 

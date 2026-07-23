@@ -67,6 +67,7 @@ import {
   optionJournalToStrategyRows,
 } from './strategy-introspection.js';
 import { isOptionShadowEnabled, isOptionPhaseBEnabled, emitShadowOptionSignal, shadowSignalToSpreadParams, OPTION_SHADOW_EMERGENCY_OFF, DEMO_SPREAD_MAX_LOSS_PCT_CAP } from './option-shadow-ledger.js';
+import { isOrbOptionsShadowEnabled, emitOrbOptionsShadowSignal } from './orb-options-shadow-ledger.js';
 import { isPcrShadowEnabled, recordPcrObservation, type PcrTrioVerdict } from './pcr-shadow-ledger.js';
 import { isOiShadowEnabled, recordOiObservation } from './oi-shadow-ledger.js';
 import {
@@ -258,6 +259,19 @@ const OPTION_SHADOW_RISK_FREE_RATE = 0.045;
 // on the 5m shadow series, and the chain ride-along is cache-bounded (60s), so a
 // 5-minute cadence keeps the sample fresh without burning Tradier budget.
 const OPTION_SHADOW_REFRESH_MS = 5 * 60_000;
+
+// TRA-2173 (parent TRA-2172) — ORB-for-options SHADOW pass. Observe-only, cloned
+// from the option-shadow pipeline: every emit is flag-gated
+// (ENABLE_ORB_OPTIONS_SHADOW, default OFF) and goes to the orb-options-shadow
+// ledger, NEVER to an order path. It reuses the SAME 5m `shadowCandleCache`
+// series (no extra Tradier fetch), so the pass is cheap; a 5-minute cadence
+// matches the series turnover.
+const orbOptionsShadowLog = logger.child({ module: 'orb-options-shadow' });
+const ORB_OPTIONS_SHADOW_REFRESH_MS = 5 * 60_000;
+// The options underlyings the source ORB strategies trade: SPY (SPX proxy) and
+// QQQ. Restricting the pass to these (NOT the full equity/crypto universe) keeps
+// the shadow ledger to the instruments a 0DTE index-ETF ORB would actually route.
+const ORB_OPTIONS_UNDERLYINGS = new Set(['SPY', 'QQQ']);
 
 export interface SymbolState {
   symbol: string;
@@ -1965,6 +1979,8 @@ export class SignalEngine {
   private lastShadowEvalRefreshAt = 0;
   /** TRA-917 — last option-shadow selector pass (gates {@link OPTION_SHADOW_REFRESH_MS}). */
   private lastOptionShadowRefreshAt = 0;
+  /** TRA-2173 — last ORB-options shadow pass (gates {@link ORB_OPTIONS_SHADOW_REFRESH_MS}). */
+  private lastOrbOptionsShadowRefreshAt = 0;
   /** TRA-1114 — last demo-only directional entry pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
   private lastDemoDirectionalAt = 0;
   /** TRA-1156 — last observe-only IV-vs-RV scanner pass (reuses {@link RV_SCAN_INTERVAL_MS}). */
@@ -3847,6 +3863,30 @@ export class SignalEngine {
           await withPhase('signal.optionShadowEval', () => this.evaluateOptionShadow(activeSymbols));
         } catch (err: unknown) {
           optionShadowLog.warn('option shadow pass threw', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // TRA-2173 (parent TRA-2172) — ORB-for-options SHADOW pass. Observe-only:
+    // evaluates the pure `evaluateOrbOptions` core off the SAME warm 5m
+    // `shadowCandleCache` series (zero extra Tradier fetch) for the ORB options
+    // underlyings and appends at most one directional-intent row per underlying
+    // per ET session to the orb-options-shadow ledger. Wholly flag-gated
+    // (ENABLE_ORB_OPTIONS_SHADOW, default OFF) and NEVER routes an order; live
+    // promotion is a separate future issue gated on TRA-382. Gated to market
+    // hours (the 5m series is stale off-session) and throttled on its own latch.
+    // Shares the option-shadow emergency kill switch (TRA-937) so the whole
+    // options-shadow class sheds together under memory pressure.
+    if (!OPTION_SHADOW_EMERGENCY_OFF && isStockMarketOpen() && isOrbOptionsShadowEnabled()) {
+      const nowMs = Date.now();
+      if (nowMs - this.lastOrbOptionsShadowRefreshAt >= ORB_OPTIONS_SHADOW_REFRESH_MS) {
+        this.lastOrbOptionsShadowRefreshAt = nowMs;
+        try {
+          await withPhase('signal.orbOptionsEval', () => this.evaluateOrbOptionsShadow(activeSymbols));
+        } catch (err: unknown) {
+          orbOptionsShadowLog.warn('orb-options shadow pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -7921,6 +7961,46 @@ export class SignalEngine {
       ivRvRatio: buy.ivRvRatio,
       mispricingPct: buy.mispricingPct,
     });
+  }
+
+  /**
+   * TRA-2173 (parent TRA-2172) — ORB-for-options SHADOW pass. Mirrors
+   * {@link evaluateOptionShadow}: reuse the existing 5m `shadowCandleCache`
+   * series per underlying and hand it to {@link emitOrbOptionsShadowSignal},
+   * which re-checks the flag, runs the pure `evaluateOrbOptions` core, and
+   * appends at most one directional-intent row per underlying per ET session.
+   * Restricted to the ORB options underlyings (SPY/QQQ, NOT crypto). Observe-only
+   * — never routes an order.
+   */
+  private async evaluateOrbOptionsShadow(symbols: string[]): Promise<void> {
+    // Defense-in-depth: the caller already flag-gates, but re-check so a direct
+    // unit-test call also no-ops with the flag off.
+    if (!isOrbOptionsShadowEnabled()) return;
+
+    const now = Date.now();
+    for (const sym of symbols) {
+      if (!ORB_OPTIONS_UNDERLYINGS.has(sym.toUpperCase())) continue;
+      try {
+        // Same TRA-734 5m shadow series the option/supertrend/reversal shadow
+        // passes read — no extra fetch.
+        const series = this.shadowCandleCache.get(sym);
+        if (!series || series.length === 0) continue;
+        const res = await emitOrbOptionsShadowSignal({ symbol: sym, candles: series, now });
+        if (res.emitted) {
+          orbOptionsShadowLog.info('orb-options shadow signal recorded', {
+            symbol: sym,
+            type: res.signal?.type,
+            breakLevel: res.signal?.breakLevel,
+            underlyingEntry: res.signal?.underlyingEntry,
+          });
+        }
+      } catch (err: unknown) {
+        orbOptionsShadowLog.warn('orb-options shadow eval threw', {
+          symbol: sym,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private async evaluateOptionShadow(symbols: string[]): Promise<void> {
