@@ -222,13 +222,20 @@ async function pullWatchdogRestarts(from, to) {
     return null;
   }
   const body = await res.json();
-  // ⚠️ Each trip surfaces on MORE THAN ONE line (the trip itself, then the
-  // relaunched process re-reporting it as `lastTrip`), so the raw line count
-  // over-counts restarts. Do NOT dedup on the `max lag NNNNms` value: two
-  // genuinely distinct restarts 16 min apart carried the SAME lag on 07-24
-  // (the second line was the new process echoing the previous trip), so a
-  // dedup-by-lag silently DELETES a real boot. Cluster by TIME instead — lines
-  // within CLUSTER_MS are one restart; anything further apart is another.
+  // ⚠️ Each trip surfaces on MORE THAN ONE line: the trip itself, and then the
+  // relaunched process re-reporting the DURABLE `lastTrip` at boot/shutdown. So
+  // the raw line count over-counts restarts, badly — 13 lines across 07-22→24
+  // all carry an identical `lag=5788ms rssMB=787` and describe ONE event.
+  //
+  // ⛔ If you are COUNTING TRIPS (an incident rate), dedupe on `(lag, rss)`:
+  // only distinct lag values are distinct events. Counting the replays reports
+  // "13 trips this week", which is a fabricated incident.
+  //
+  // Here we are building a BOOT SET, which is a different question, so cluster
+  // by TIME instead — lines within CLUSTER_MS are one boot. A replayed line
+  // that happens to land at a real boot instant is harmless: it is unioned with
+  // the deploy record for that same boot and collapses into it. Time-clustering
+  // is the robust choice for this use, not because lag values can't repeat.
   const CLUSTER_MS = 90_000;
   const lines = (body.logs ?? [])
     .map(l => {
