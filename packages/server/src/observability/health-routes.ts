@@ -12,6 +12,10 @@ import { findMissingLiveCredentials, DEFAULT_ACCOUNT_SETTINGS, type AccountSetti
 import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
 import { isTestAccount } from '../test-accounts.js'; // TRA-1949
+import {
+  applyModelFacingBasis,
+  MODEL_FACING_JOURNAL_BASIS,
+} from '../model-facing-journal.js'; // TRA-2214
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { evaluateEnvDrift, loadRenderBlueprint } from './env-drift.js'; // TRA-2209
@@ -910,6 +914,16 @@ export interface OptionJournalReport {
   integrity: OptionTradeJournalIntegrity;
   weights: OptionLearnedWeights;
   /**
+   * TRA-2214 — the account-class basis `weights` was folded on, stated because it
+   * DIFFERS from `summary`'s. `summary` stays pooled (that is the point of this
+   * readout — it publishes the TRA-2193 class census over the whole pool), while
+   * `weights` is the fold the model actually trains on and is therefore
+   * desk+unattributed. Two differently-based numbers in one payload is fine; two
+   * differently-based numbers in one payload with only ONE of them labelled is
+   * how a grader compares the wrong pair.
+   */
+  weightsBasis: 'desk+unattributed';
+  /**
    * TRA-1591 — echoes the `sinceTs` cohort filter (epoch ms) when the caller
    * passed one, so a grading poll can confirm the `summary` was scoped to the
    * post-arm cohort rather than the cumulative pool. Absent on the unfiltered
@@ -1165,7 +1179,15 @@ export function buildOptionJournalReport(
     // still cannot miss that fixture rows are in the pool.
     ...accountClassRowCounts(summaryRows as OptionTradeJournalRecord[]),
     integrity: getOptionTradeJournalIntegrity(),
-    weights: cached?.weights ?? computeOptionLearnedWeights(rows),
+    // TRA-2214 — BOTH branches must fold on the same basis. The cached branch is
+    // the `OptionWeightsCache`, which is now desk+unattributed; a cold cache used
+    // to fall through to a POOLED refold of the same field. One field, two bases,
+    // switching on cache warmth, with no tell in the payload — so the fallback is
+    // routed through the same predicate. `summary` above stays deliberately POOLED
+    // (this is the readout that publishes the TRA-2193 account-class census), which
+    // is why `weightsBasis` is stated separately rather than assumed to cover both.
+    weights: cached?.weights ?? computeOptionLearnedWeights(applyModelFacingBasis(rows).rows),
+    weightsBasis: MODEL_FACING_JOURNAL_BASIS,
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),
     appliedSinceTs: sinceTs ?? null,

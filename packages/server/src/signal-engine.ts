@@ -61,7 +61,7 @@ import {
 } from './pre-trade-gate-ledger.js';
 import { ivRankSync, ivPercentileSync, atmIvFromRows, recordDailyIv } from './iv-rank-store.js';
 import type { SentimentIcBand } from './option-trade-journal.js';
-import { listOptionTradeJournal } from './option-trade-journal.js';
+import { loadModelFacingJournalRows } from './model-facing-journal.js';
 import {
   computeStrategyIntrospection,
   optionJournalToStrategyRows,
@@ -3849,8 +3849,11 @@ export class SignalEngine {
         // TRA-2203 — named sink: the durable demo journal read, whose cost grows
         // with the journal across a session. `async` (I/O), distinct from the
         // `sync` introspection fold below — the two must not be conflated.
+        // TRA-2214 — model-facing basis (desk + unattributed): the autopilot
+        // throttles LIVE sizing off this decay list, so it must not be trained
+        // on the QA fixture books.
         const rows = await withPhase('signal.doTick.autopilot-journal-read', () =>
-          listOptionTradeJournal({ mode: 'demo' }));
+          loadModelFacingJournalRows());
         // TRA-1905 — the introspection fold is a SYNCHRONOUS O(journal) CPU pass
         // whose cost grows with the durable demo journal across a session/days;
         // it is a prime suspect for the `signal.doTick` block trip. Name it at the

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { generateEodReport } from './eod-report.js';
 import type { EngineState } from '../signal-engine.js';
 import type { OptionPosition, Position } from '@trading-app/shared';
+import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -538,6 +539,37 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     expect(onUtc16.realizedPnl).toBe(0);
   });
 
+  /** One closed bull_put winner — the minimum that renders the journal section. */
+  const journalSummaryFixture = (): OptionTradeJournalSummary => ({
+    total: 2,
+    open: 1,
+    closed: 1,
+    win: 1,
+    loss: 0,
+    scratch: 0,
+    winRate: 1,
+    realizedPnlUsd: 320,
+    avgR: 1,
+    byStructure: [
+      { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1 },
+    ],
+    byArchetype: [],
+    byExitReason: [],
+    byDelta: [],
+    byDte: [],
+    slippage: {
+      entrySampled: 0,
+      exitSampled: 0,
+      roundTripSampled: 0,
+      avgEntrySlippageUsd: null,
+      avgExitSlippageUsd: null,
+      avgEntrySlippageR: null,
+      avgExitSlippageR: null,
+      avgRoundTripCostR: null,
+      totalSlippageUsd: 0,
+    },
+  });
+
   // TRA-991 — option-trade journal P&L / learned-weights section.
   it('renders the option-trade journal section when a summary is supplied', () => {
     const report = generateEodReport({
@@ -545,41 +577,63 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
       allClosedPositions: [],
       dailySignals: [],
       signalTypeMap: new Map(),
-      optionJournal: {
-        total: 2,
-        open: 1,
-        closed: 1,
-        win: 1,
-        loss: 0,
-        scratch: 0,
-        winRate: 1,
-        realizedPnlUsd: 320,
-        avgR: 1,
-        byStructure: [
-          { structure: 'bull_put', closed: 1, realizedPnlUsd: 320, winRate: 1, avgR: 1 },
-        ],
-        byArchetype: [],
-        byExitReason: [],
-        byDelta: [],
-        byDte: [],
-        slippage: {
-          entrySampled: 0,
-          exitSampled: 0,
-          roundTripSampled: 0,
-          avgEntrySlippageUsd: null,
-          avgExitSlippageUsd: null,
-          avgEntrySlippageR: null,
-          avgExitSlippageR: null,
-          avgRoundTripCostR: null,
-          totalSlippageUsd: 0,
-        },
-      },
+      optionJournal: journalSummaryFixture(),
     });
 
     expect(report.markdown).toContain('Option-Trade Journal');
     expect(report.markdown).toContain('Journal P&L by Structure');
     expect(report.markdown).toContain('bull_put');
     expect(report.markdown).toContain('+$320.00');
+  });
+
+  // TRA-2214 — the basis the journal blocks were folded on, published beside them.
+  //
+  // These numbers MOVE with the basis change (`single_leg_otm` baseline expectancy
+  // +0.0427R pooled → +0.0167R desk+unattributed; the QA fixtures are large
+  // winners). A grader watching the EOD series would otherwise see an unexplained
+  // step change with nothing in the payload to attribute it to.
+  describe('TRA-2214 journal basis on the EOD report', () => {
+    const withBasis = (over: Partial<Parameters<typeof generateEodReport>[0]> = {}) =>
+      generateEodReport({
+        state: makeEngineState(),
+        allClosedPositions: [],
+        dailySignals: [],
+        signalTypeMap: new Map(),
+        optionJournal: journalSummaryFixture(),
+        ...over,
+      });
+
+    it('carries journalBasis + journalBasisCounts on the wire and in the markdown', () => {
+      const report = withBasis({
+        journalBasis: 'desk+unattributed',
+        journalBasisCounts: { desk: 91, unattributed: 2164, fixtureExcluded: 67 },
+      });
+
+      expect(report.journalBasis).toBe('desk+unattributed');
+      expect(report.journalBasisCounts).toEqual({
+        desk: 91,
+        unattributed: 2164,
+        fixtureExcluded: 67,
+      });
+      // `fixtureExcluded` is the self-evidencing field: 67 rows visibly dropped
+      // beats inferring the drop from a moved mean.
+      expect(report.markdown).toContain('desk+unattributed');
+      expect(report.markdown).toContain('**67 QA-fixture rows excluded**');
+      expect(report.markdown).toContain('desk 91 + unattributed 2164');
+    });
+
+    it('states no basis when the caller did not label one (no fabricated claim)', () => {
+      // The negative control. An unlabelled fold is a POOLED fold, and a report
+      // that renders the basis line unconditionally would assert de-noise that
+      // never ran — worse than saying nothing, because it reads as evidence.
+      const report = withBasis();
+
+      expect(report.journalBasis).toBeUndefined();
+      expect(report.journalBasisCounts).toBeUndefined();
+      expect(report.markdown).toContain('Option-Trade Journal'); // section still renders
+      expect(report.markdown).not.toContain('desk+unattributed');
+      expect(report.markdown).not.toContain('QA-fixture rows excluded');
+    });
   });
 
   it('omits the journal section entirely when no summary is supplied', () => {

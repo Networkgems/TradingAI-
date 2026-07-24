@@ -3548,6 +3548,26 @@ export interface EodSignalAccuracy {
   avgRR: number;
 }
 
+/**
+ * TRA-2214 — the account-class census behind a journal-folded number, published
+ * beside it so a grader reads a LABELLED basis instead of inferring one from a
+ * moved mean.
+ *
+ * `fixtureExcluded` is the self-evidencing field: it is the count of QA/test-book
+ * rows the fold DROPPED, so a non-zero value proves the de-noise ran. The other
+ * two folds' outputs can read identically with and without the filter (on live
+ * data the edge-decay list is `['single_leg_otm']` either way), so an unchanged
+ * downstream verdict is NOT evidence the basis change landed — this count is.
+ */
+export interface JournalBasisCounts {
+  /** Rows owned by a non-test book. */
+  desk: number;
+  /** Rows with no `account` stamp (pre-TRA-1475 opens). Kept in the basis. */
+  unattributed: number;
+  /** Rows dropped because a QA/test book owned them. */
+  fixtureExcluded: number;
+}
+
 export interface EodReport {
   date: string;          // YYYY-MM-DD
   generatedAt: number;   // Unix ms
@@ -3652,6 +3672,16 @@ export interface EodReport {
    * Optional for back-compat with reports persisted before the field existed.
    */
   pnlSource?: 'engine' | 'tradier-balance' | 'realized-backfill' | 'live-intraday';
+
+  /**
+   * TRA-2214 — the account-class basis the `optionJournal` / `optionLearnedWeights`
+   * / `introspection` blocks were folded on. `'desk+unattributed'` since TRA-2214;
+   * absent on reports persisted before it, which were folded POOLED (QA fixture
+   * rows included) and must not be compared like-for-like against a labelled one.
+   */
+  journalBasis?: 'desk+unattributed' | 'pooled';
+  /** TRA-2214 — the census behind {@link EodReport.journalBasis}. */
+  journalBasisCounts?: JournalBasisCounts;
 
   // Markdown report body
   markdown: string;

@@ -14,10 +14,11 @@ import { buildJournalCalendarCells } from './reports/desk-calendar.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
-  summarizeOptionTradeJournal,
   isOptionTradeJournalEnabled,
 } from './option-trade-journal.js';
-import { computeOptionLearnedWeights } from './learned-option-weights.js';
+// TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
+// no bare fold that could be fed a differently-sourced (pooled) row list.
+import { foldModelFacingEodJournal } from './model-facing-journal.js';
 // TRA-1046 (TRA-1041c L2) — synchronous on-demand hypothesis backtest behind
 // POST /api/backtest, reusing the audited apply→backtest→G0-grade pipeline.
 import {
@@ -161,12 +162,6 @@ import {
   runAnalystPremarketTick,
   runAnalystPostmarketTick,
 } from './analyst-scheduler.js';
-// TRA-995 — self-awareness introspection (per-strategy attribution + edge-decay)
-// folded from the same closed-trade journal that feeds the learned weights.
-import {
-  computeStrategyIntrospection,
-  optionJournalToStrategyRows,
-} from './strategy-introspection.js';
 import {
   computeOptionsAlerts,
   scanTargetStop,
@@ -1159,14 +1154,17 @@ async function generateAndSaveReport(
   if (isOptionTradeJournalEnabled()) {
     try {
       await ctx.engine.flushOptionTradeJournal?.();
-      const journalRows = await listOptionTradeJournal({ mode: 'demo' });
-      finalSnapshot.optionJournal = summarizeOptionTradeJournal(journalRows);
-      finalSnapshot.optionLearnedWeights = computeOptionLearnedWeights(journalRows);
-      // TRA-995 — the self-awareness readout off the same journal: per-strategy
-      // attribution + the edge-decay flag the autopilot throttles on.
-      finalSnapshot.introspection = computeStrategyIntrospection(
-        optionJournalToStrategyRows(journalRows),
-      );
+      // TRA-2214 — the three journal blocks fold together, on ONE model-facing
+      // basis (desk + unattributed; QA fixtures dropped), inside
+      // `foldModelFacingEodJournal`. The basis MOVES these published numbers, so
+      // it rides the wire beside them rather than showing up as an unexplained
+      // drift in a grader's series.
+      const fold = await foldModelFacingEodJournal();
+      finalSnapshot.optionJournal = fold.optionJournal;
+      finalSnapshot.optionLearnedWeights = fold.optionLearnedWeights;
+      finalSnapshot.introspection = fold.introspection;
+      finalSnapshot.journalBasis = fold.journalBasis;
+      finalSnapshot.journalBasisCounts = fold.journalBasisCounts;
     } catch (err) {
       log.warn('option-trade-journal EOD fold failed', {
         username: ctx.username,

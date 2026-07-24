@@ -20,10 +20,10 @@
 //     throwing into a read path; the generation/age make staleness visible.
 
 import {
-  listOptionTradeJournal,
   onOptionTradeClose,
   type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
+import { loadModelFacingJournalRows } from './model-facing-journal.js';
 import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
@@ -58,7 +58,16 @@ export interface CachedOptionWeights {
 export interface OptionWeightsCacheOpts {
   ttlMs?: number;
   now?: () => number;
-  /** Load the journal rows to fold. Defaults to the full demo-only journal. */
+  /**
+   * Load the journal rows to fold. Defaults to the demo-only journal on the
+   * TRA-2214 model-facing basis (desk + unattributed; QA fixture books dropped).
+   *
+   * The default USED to be a bare `listOptionTradeJournal()` — no `mode` filter
+   * at all, despite this doc claiming "demo-only". That was inert while 100% of
+   * the 2,359 live rows were `mode:'demo'`, but it had no wire-format tell: once
+   * TRA-2134's Tradier SANDBOX/live journaling starts writing, live rows would
+   * have entered a fold every demo consumer reads, silently.
+   */
   load?: () => Promise<OptionTradeJournalRecord[]>;
   params?: LearnedWeightsParams;
 }
@@ -81,7 +90,7 @@ export class OptionWeightsCache {
   constructor(opts: OptionWeightsCacheOpts = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_WEIGHTS_TTL_MS;
     this.now = opts.now ?? Date.now;
-    this.load = opts.load ?? (() => listOptionTradeJournal());
+    this.load = opts.load ?? (() => loadModelFacingJournalRows());
     this.params = opts.params ?? DEFAULT_LEARNED_PARAMS;
   }
 

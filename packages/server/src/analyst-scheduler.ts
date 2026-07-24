@@ -18,7 +18,7 @@ import { getAllUserContexts } from './user-context.js';
 import { getStocksWatchlistData, seedReviewLeaders } from './watchlist-store.js';
 import { fetchDailyCandles } from './yahoo-feed.js';
 import { generateMarketReview } from './market-review.js';
-import { listOptionTradeJournal } from './option-trade-journal.js';
+import { loadModelFacingJournalRows } from './model-facing-journal.js';
 import { makeBacktestExecutor, RV_CRYPTO_MAJORS_BASE_CONFIG } from './backtest-executor.js';
 import {
   isAnalystAgentEnabled,
@@ -173,7 +173,10 @@ export async function buildPostmarketDeps(
   const date = analystEtDate(nowMs);
   const plan = await readAnalystPlan(date);
   const regime = plan?.regime ?? (await generateMarketReview('postmarket')).regime;
-  const rows = await listOptionTradeJournal({ mode: 'demo' });
+  // TRA-2214 — model-facing basis (desk + unattributed). The post-market tuner
+  // proposes parameter changes off these rows; the QA fixture books must not
+  // train it.
+  const rows = await loadModelFacingJournalRows();
 
   return {
     date,

@@ -3,6 +3,7 @@ import type {
   EodTradeEntry,
   EodMover,
   EodSignalAccuracy,
+  JournalBasisCounts,
   OptionPosition,
   PortfolioGreeks,
   Position,
@@ -241,6 +242,8 @@ ${sectorRows || '_No open option premium._'}`;
 function buildOptionJournalMarkdown(
   summary: OptionTradeJournalSummary | undefined,
   weights: OptionLearnedWeights | undefined,
+  journalBasis?: EodReport['journalBasis'],
+  journalBasisCounts?: JournalBasisCounts,
 ): string {
   if (!summary || summary.total === 0) return '';
 
@@ -268,9 +271,19 @@ function buildOptionJournalMarkdown(
     .map(s => `| ${s.key} | ${s.multiplier.toFixed(3)} | ${s.resolved} | ${pct(s.winRate)} |`)
     .join('\n');
 
+  // TRA-2214 — the basis line. Rendered ONLY when the caller labelled its basis:
+  // a report folded pooled must not carry a line implying it was de-noised, and
+  // an absent line is the honest tell that the basis is unknown. `fixtureExcluded`
+  // is what makes the change self-evidencing — the reader sees the rows that were
+  // dropped rather than inferring the drop from a moved mean.
+  const basisLine =
+    journalBasis && journalBasisCounts
+      ? `\n_Basis: **${journalBasis}** — desk ${journalBasisCounts.desk} + unattributed ${journalBasisCounts.unattributed} rows folded; **${journalBasisCounts.fixtureExcluded} QA-fixture rows excluded** (TRA-2214, ruling in TRA-2212)._`
+      : '';
+
   return `
 
-## Option-Trade Journal (TRA-990, observe-only)
+## Option-Trade Journal (TRA-990, observe-only)${basisLine}
 | Metric | Value |
 |--------|-------|
 | Rows (open / closed) | ${summary.open} / ${summary.closed} |
@@ -626,7 +639,7 @@ ${moverRows || '_No data._'}
 | Winning Signals | ${signalAccuracy.winningSignals} |
 | Signal Win Rate | ${pct(signalAccuracy.winRate)} |
 | Avg R:R | 1:${signalAccuracy.avgRR.toFixed(2)} |
-${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
+${buildPortfolioGreeksMarkdown(portfolioGreeks)}${buildOptionJournalMarkdown(optionJournal, optionLearnedWeights, report.journalBasis, report.journalBasisCounts)}${buildIntrospectionMarkdown(introspection, autopilotActions)}${buildSourceQualityMarkdown(sourceQualityWeights)}${buildAutonomousDemoLoopMarkdown(autonomousDemoLoop)}${buildAnalystMarkdown(analystPlan, analystReview)}${hypothesisQueue ? buildRatificationQueueMarkdown(hypothesisQueue) : ''}${buildCorrelatedExposureCapMarkdown()}${buildExecutionQualityMarkdown(executionQuality)}`;
 }
 
 export interface ReportInput {
@@ -655,6 +668,13 @@ export interface ReportInput {
    */
   optionJournal?: OptionTradeJournalSummary;
   optionLearnedWeights?: OptionLearnedWeights;
+  /**
+   * TRA-2214 — the account-class basis the caller folded the three journal blocks
+   * on, plus its census. Optional ↔ the caller did not label its basis (legacy /
+   * crypto / test callers), which renders no basis line rather than claiming one.
+   */
+  journalBasis?: EodReport['journalBasis'];
+  journalBasisCounts?: JournalBasisCounts;
   /**
    * TRA-995 — the self-awareness introspection readout (per-strategy attribution
    * + edge-decay flags), computed by the caller from the closed-trade journal.
@@ -721,7 +741,8 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const { state, allClosedPositions, closedOptions = [], dailySignals, signalTypeMap,
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
           sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
-          hypothesisQueue, executionQuality } = input;
+          hypothesisQueue, executionQuality,
+          journalBasis, journalBasisCounts } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -837,6 +858,10 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     top5Movers: movers,
     signalAccuracy,
     portfolioGreeks,
+    // TRA-2214 — carried onto the persisted report so a grader reading a stored
+    // snapshot sees the basis its numbers were folded on, not just today's wire.
+    ...(journalBasis ? { journalBasis } : {}),
+    ...(journalBasisCounts ? { journalBasisCounts } : {}),
   };
 
   return {
