@@ -484,6 +484,10 @@ import {
   parityReconcileDurability,
   PARITY_SCOPE,
 } from './parity-reconcile.js';
+import {
+  foldMarketableMtmForwardValidation,
+  MARKETABLE_MTM_SCOPE,
+} from './marketable-mtm-forward-validation.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
@@ -9453,6 +9457,38 @@ app.get('/api/health/parity-reconcile', (_req, res) => {
     dailySeries: getParityReconcileSeries(),
     durability: parityReconcileDurability(),
     scope: PARITY_SCOPE,
+    ts: new Date().toISOString(),
+  });
+});
+
+// TRA-2247 (parent TRA-2242) — no-auth read of the marketable(bid) MTM forward-validation
+// gate. Folds the parity-true EXIT-leg cross from the SANDBOX journal (`getSandboxStrategyRecords`,
+// TRA-2134) via the SAME `foldMarketableMtmForwardValidation` the CLI harness mirrors, and
+// emits the PASS/REVIEW verdict QuantTrader reads for TRA-2242's final check — no more
+// reaching for the raw `/data` JSONL that no route exposed. Optional query params `h`, `tol`,
+// `minN`, `strategy` override the pinned defaults (h=0.134, tol=0.03, minN=30) for what-if
+// reads; unset ⇒ the exact gate. `fillRealism:'SANDBOX_SIMULATED'` rides the payload so no
+// reader mistakes a broker-simulated near-mid median for a live-execution number. Read-only;
+// SANDBOX only ($0 notional); gates/arms/graduates NOTHING under the TRA-1897 hold.
+app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
+  const numParam = (v: unknown): number | undefined => {
+    if (typeof v !== 'string' || v.trim() === '') return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const strategyParam = typeof req.query.strategy === 'string' && req.query.strategy.trim() !== ''
+    ? req.query.strategy
+    : null;
+  const result = foldMarketableMtmForwardValidation(getSandboxStrategyRecords(), {
+    h: numParam(req.query.h),
+    tol: numParam(req.query.tol),
+    minN: numParam(req.query.minN),
+    strategy: strategyParam,
+  });
+  res.status(200).json({
+    ...result,
+    fillRealismNote: FILL_REALISM_NOTE,
+    scope: MARKETABLE_MTM_SCOPE,
     ts: new Date().toISOString(),
   });
 });

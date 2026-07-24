@@ -52,6 +52,16 @@
 // the spread a live exit pays. This harness measures the parity-true source we have;
 // it does not certify live realism. It gates/arms nothing (TRA-1897 hold).
 //
+// ── The DEPLOYED single-source-of-truth (TRA-2247) ───────────────────────────
+// The identical exit-leg fold now lives server-side in
+// `packages/server/src/marketable-mtm-forward-validation.ts` and is emitted no-auth at
+//     GET /api/health/marketable-mtm-forward-validation
+// which folds the SAME sandbox journal from `getSandboxStrategyRecords()` — so once live
+// n≥30 the gate is a single curl (bqb1 admin auth is dead; the raw `/data` JSONL this CLI
+// reads is not itself a no-auth surface). This CLI stays the OFFLINE `--file` runner; both
+// implement the identity below and `marketable-mtm-forward-validation.test.ts` pins them to
+// the same numeric output on the shared synthetic corpus so they cannot silently drift.
+//
 // Usage:
 //   node scripts/marketable-mtm-forward-validation.mjs [--file PATH] [--h 0.134]
 //        [--tol 0.03] [--strategy long_call|long_put|csp|covered_call]
@@ -128,6 +138,10 @@ function toSample(rec, strategyFilter) {
   const entry = rec.legs[0];
   const exit = rec.legs[rec.legs.length - 1]; // recordFromContractResult: legs = [entry, exit]
 
+  // Reject null BEFORE Number(): `Number(null) === 0` is finite, so a one-sided quote
+  // (`requestedPx: null`) or an unfilled leg (`fillPx: null`) would slip through as a bogus
+  // $0 price and manufacture a ~100% cross. A missing price is EXCLUDED, never folded.
+  if (exit.requestedPx == null || exit.fillPx == null) return null;
   const reqExit = Number(exit.requestedPx);
   const fillExit = Number(exit.fillPx);
   if (!Number.isFinite(reqExit) || reqExit <= 0) return null; // one-sided decision quote — unprovable
@@ -143,11 +157,13 @@ function toSample(rec, strategyFilter) {
 
   // Realized ENTRY-leg half-spread, as a reference, when the entry leg is priced.
   let hEntry = null;
-  const reqEntry = Number(entry?.requestedPx);
-  const fillEntry = Number(entry?.fillPx);
-  if (Number.isFinite(reqEntry) && reqEntry > 0 && Number.isFinite(fillEntry) &&
-      (entry.side === 'buy' || entry.side === 'sell')) {
-    hEntry = signedCross(entry.side, reqEntry, fillEntry) / reqEntry;
+  if (entry != null && entry.requestedPx != null && entry.fillPx != null) {
+    const reqEntry = Number(entry.requestedPx);
+    const fillEntry = Number(entry.fillPx);
+    if (Number.isFinite(reqEntry) && reqEntry > 0 && Number.isFinite(fillEntry) &&
+        (entry.side === 'buy' || entry.side === 'sell')) {
+      hEntry = signedCross(entry.side, reqEntry, fillEntry) / reqEntry;
+    }
   }
 
   return {
