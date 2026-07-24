@@ -18,6 +18,24 @@ const DAY = '2026-07-15';
 const CAP = 0.4;
 const FLOOR = 25; // the abs arm floor for a small book
 
+// TRA-2220 — the recorder's arm state is resolved from the env its ONE call site is
+// gated on, so every fold assertion has to say which state it is folding under. These
+// two envs are the whole point of the ticket: the same records read differently.
+const ARMED_ENV = {
+  live: { EXIT_RISK_RULES_ENABLED: '1' } as NodeJS.ProcessEnv,
+  demo: { EXIT_RISK_RULES_ENABLED: '1' } as NodeJS.ProcessEnv,
+};
+const DARK_ENV = { live: {} as NodeJS.ProcessEnv, demo: {} as NodeJS.ProcessEnv };
+
+/**
+ * Summarize with the recorder ARMED and a FIXED clock. The classification tests below
+ * fold synthetic 1970-epoch timestamps, so `now` must be pinned there too — a real
+ * `Date.now()` would read every one of them as ~56 years stale.
+ */
+function sum(now = 1_100) {
+  return summarizeGiveBackArmFloor({ now, recorderEnv: ARMED_ENV });
+}
+
 /**
  * Build a give-back snapshot. `peak` is the intraday high-water mark; `current` the
  * present (realized+open) P&L. `armFloor`/`halt`/`reason` default to the natural
@@ -56,7 +74,7 @@ describe('giveback-arm-floor-ledger', () => {
   });
 
   it('summarizes an empty ledger as an honest zero', () => {
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.sessionsObserved).toBe(0);
     expect(s.invalidations).toBe(0);
     expect(s.sessions).toEqual([]);
@@ -69,7 +87,7 @@ describe('giveback-arm-floor-ledger', () => {
     recordGiveBackState('demo', 'engine-1', DAY, snap(7, 5), 1_001);
     recordGiveBackState('demo', 'engine-1', DAY, snap(7, 2), 1_002);
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.sessionsObserved).toBe(1);
     expect(s.invalidations).toBe(0);
     const [sess] = s.sessions;
@@ -88,7 +106,7 @@ describe('giveback-arm-floor-ledger', () => {
     recordGiveBackState('demo', 'engine-1', DAY, snap(100, 100), 1_001); // peak $100, floor $60
     recordGiveBackState('demo', 'engine-1', DAY, snap(100, 50, { halt: true }), 1_002); // gave back >40%
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     const [sess] = s.sessions;
     expect(sess).toMatchObject({
       peakPnl: 100,
@@ -108,7 +126,7 @@ describe('giveback-arm-floor-ledger', () => {
     // record the snapshot directly — this is the tripwire QT watches.
     recordGiveBackState('demo', 'engine-1', DAY, snap(7, 1, { halt: true, reason: 'giveback_cap' }), 1_001);
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.invalidations).toBe(1);
     expect(s.sessions[0]!.verdict).toBe('giveback_halt_sub_floor');
     expect(s.verdictCounts.giveback_halt_sub_floor).toBe(1);
@@ -120,7 +138,7 @@ describe('giveback-arm-floor-ledger', () => {
     // the arm floor — a sub-floor peak here is NOT an invalidation.
     recordGiveBackState('demo', 'engine-1', DAY, snap(15, -20, { halt: true, reason: 'session_net_negative' }), 1_001);
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.invalidations).toBe(0);
     expect(s.sessions[0]!.verdict).toBe('session_stop');
   });
@@ -130,7 +148,7 @@ describe('giveback-arm-floor-ledger', () => {
     recordGiveBackState('demo', 'engine-1', DAY, snap(0, -30), 1_001);
     recordGiveBackState('demo', 'engine-1', DAY, snap(0, -50), 1_002);
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.sessionsObserved).toBe(0);
     // Nothing on disk either.
     expect(() => readFileSync(giveBackArmFloorLogPath(dir), 'utf8')).toThrow();
@@ -142,7 +160,7 @@ describe('giveback-arm-floor-ledger', () => {
     recordGiveBackState('demo', 'engine-2', DAY, snap(50, 50), 1_002); // sibling demo engine
     recordGiveBackState('live', 'engine-3', DAY, snap(200, 120, { halt: true }), 1_003);
 
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.sessionsObserved).toBe(3);
     const byKey = Object.fromEntries(s.sessions.map((x) => [`${x.mode}:${x.engineId}`, x]));
     expect(byKey['demo:engine-1']!.peakPnl).toBe(100);
@@ -164,7 +182,7 @@ describe('giveback-arm-floor-ledger', () => {
     lines = readFileSync(giveBackArmFloorLogPath(dir), 'utf8').trim().split('\n');
     expect(lines).toHaveLength(2);
     // The fold reflects the latest peak regardless of throttle.
-    expect(summarizeGiveBackArmFloor().sessions[0]!.peakPnl).toBe(30);
+    expect(sum().sessions[0]!.peakPnl).toBe(30);
   });
 
   it('RECOVERS the session outcome after a reboot (re-hydrate from disk)', () => {
@@ -174,11 +192,11 @@ describe('giveback-arm-floor-ledger', () => {
 
     // Simulate the nightly reboot: wipe in-memory state, then rebuild from the durable file.
     clearGiveBackArmFloorLedger();
-    expect(summarizeGiveBackArmFloor().sessionsObserved).toBe(0);
+    expect(sum().sessionsObserved).toBe(0);
 
     const h = hydrateGiveBackArmFloorFromDisk(dir, 1_100);
     expect(h.sessions).toBe(1);
-    const s = summarizeGiveBackArmFloor();
+    const s = sum();
     expect(s.sessions[0]).toMatchObject({
       peakPnl: 100,
       haltLatched: true,
@@ -188,10 +206,10 @@ describe('giveback-arm-floor-ledger', () => {
 
   it('reports durability provenance — ephemeral when memory-only, real dir once hydrated', () => {
     // No hydrate ⇒ dataDir null ⇒ memory-only ⇒ ephemeral true.
-    expect(summarizeGiveBackArmFloor().durability).toMatchObject({ dataDir: null, ephemeral: true });
+    expect(sum().durability).toMatchObject({ dataDir: null, ephemeral: true });
 
     hydrateGiveBackArmFloorFromDisk(dir, 1_000);
-    const d = summarizeGiveBackArmFloor().durability;
+    const d = sum().durability;
     expect(d.dataDir).toBe(dir);
     expect(d.hydratedRecords).toBe(0);
     // A tmpdir is not inside the bundle, but DATA_DIR is unset in this test env, so the
@@ -223,7 +241,144 @@ describe('giveback-arm-floor-ledger', () => {
 
     const h = hydrateGiveBackArmFloorFromDisk(dir, now);
     expect(h.sessions).toBe(1); // only the recent one survives
-    expect(summarizeGiveBackArmFloor().sessions[0]!.sessionDate).toBe(DAY);
+    expect(sum().sessions[0]!.sessionDate).toBe(DAY);
+  });
+
+  // TRA-2220 — DARKNESS IS A FIRST-CLASS VERDICT.
+  //
+  // The bug these guard: `recordGiveBackState` is called from inside the
+  // `EXIT_RISK_RULES_ENABLED` master gate, so the master going down does not zero the
+  // counters — it FREEZES them, and a frozen `giveback_halt_sub_floor: 0` is
+  // byte-identical to "22 sessions observed, none breached". bqb1 served exactly that,
+  // with `ok: true`, for the two sessions after the TRA-2136 env wipe.
+  //
+  // The controlling rule for this block: DO NOT merely assert the clean state looks
+  // clean. Assert the dark and clean states are TELLABLE APART.
+  describe('recorder liveness (TRA-2220)', () => {
+    // 2026-07-24T00:55Z = Thu 2026-07-23 20:55 ET — after the cash close, so 07-23 is the
+    // last COMPLETED trading day. This is the exact wall-clock of the live observation.
+    const NOW = Date.UTC(2026, 6, 24, 0, 55);
+    // 2026-07-23T17:00Z = Thu 2026-07-23 13:00 ET — mid-session, close not yet passed.
+    const MIDDAY = Date.UTC(2026, 6, 23, 17, 0);
+
+    /** The live bqb1 shape: a clean run through Tue 07-21, then nothing. */
+    function recordThrough21(): void {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      recordGiveBackState('demo', 'engine-1', '2026-07-20', snap(100, 90), 1_001);
+      recordGiveBackState('demo', 'engine-1', '2026-07-21', snap(100, 90), 1_002);
+    }
+
+    it('THE DISCRIMINATOR — the same records read DIFFERENTLY dark vs armed', () => {
+      recordThrough21();
+      const armed = summarizeGiveBackArmFloor({ now: NOW, recorderEnv: ARMED_ENV });
+      const dark = summarizeGiveBackArmFloor({ now: NOW, recorderEnv: DARK_ENV });
+
+      // The fold itself is identical — same rows, same verdicts, same n.
+      expect(dark.sessionsObserved).toBe(armed.sessionsObserved);
+      expect(dark.sessions).toEqual(armed.sessions);
+      expect(dark.invalidationsRecorded).toBe(armed.invalidationsRecorded);
+
+      // ...and yet a grader can tell them apart. This is the assertion the ticket asks
+      // for: if these two payloads ever serialize the same, the instrument is blind again.
+      expect(JSON.stringify(dark)).not.toBe(JSON.stringify(armed));
+      expect(dark.recorder.state).toBe('dark');
+      expect(armed.recorder.state).not.toBe('dark');
+      expect(dark.recorder.armed).toBe(false);
+      expect(armed.recorder.armed).toBe(true);
+    });
+
+    it('A CEILING-ONLY CHECK CANNOT SEPARATE THEM — the tripwire nulls while dark', () => {
+      recordThrough21();
+      const dark = summarizeGiveBackArmFloor({ now: NOW, recorderEnv: DARK_ENV });
+
+      // `0` would pass "invalidations <= 0" forever against a recorder that stopped —
+      // the TRA-1592 reopen tripwire ("giveback_halt_sub_floor > 0") is structurally
+      // incapable of firing here, so the value must NOT read as a measurement.
+      expect(dark.invalidations).toBeNull();
+      expect(dark.verdictCounts.giveback_halt_sub_floor).toBeNull();
+      // No information is destroyed by the nulling — only its authority.
+      expect(dark.invalidationsRecorded).toBe(0);
+      expect(dark.verdictCountsTotal).toBe(dark.sessionsObserved);
+    });
+
+    it('the FLOOR assertion: a frozen recorder is stale even though its counts look clean', () => {
+      recordThrough21();
+      // Armed, so darkness is NOT the explanation — yet Wed 07-22 and Thu 07-23 both
+      // completed with zero rows. `sessionsObserved` did not move across ≥ 1 expected
+      // trading day, which is the failure signal a ceiling-only check never sees.
+      const s = summarizeGiveBackArmFloor({ now: NOW, recorderEnv: ARMED_ENV });
+      expect(s.recorder.state).toBe('armed_but_stale');
+      expect(s.recorder.staleTradingDays).toBe(2);
+      expect(s.recorder.missingTradingDays).toEqual(['2026-07-22', '2026-07-23']);
+      expect(s.recorder.lastRecordedSessionDate).toBe('2026-07-21');
+      // ...while every count it publishes still reads perfectly healthy. That gap IS the bug.
+      expect(s.invalidations).toBe(0);
+      expect(s.verdictCounts.giveback_halt_above_floor).toBe(0);
+      expect(s.sessionsObserved).toBe(2);
+    });
+
+    it('does NOT flag a session still in progress (no cry-wolf before the close)', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      recordGiveBackState('demo', 'engine-1', '2026-07-22', snap(100, 90), 1_001);
+      // Mid-session on Thu 07-23: today has no rows yet, but the day is not over. Only
+      // COMPLETED trading days count, or this fires every morning and gets ignored.
+      const s = summarizeGiveBackArmFloor({ now: MIDDAY, recorderEnv: ARMED_ENV });
+      expect(s.recorder.state).toBe('armed_and_recording');
+      expect(s.recorder.staleTradingDays).toBe(0);
+      expect(s.recorder.missingTradingDays).toEqual([]);
+    });
+
+    it('skips weekends and NYSE holidays when counting missing days', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      // Thu 2026-07-02, then nothing until Mon 2026-07-06. The gap spans Fri 07-03
+      // (Independence Day observed), Sat 07-04 and Sun 07-05 — zero MISSING trading days.
+      recordGiveBackState('demo', 'engine-1', '2026-07-02', snap(100, 90), 1_001);
+      recordGiveBackState('demo', 'engine-1', '2026-07-06', snap(100, 90), 1_002);
+      const s = summarizeGiveBackArmFloor({
+        now: Date.UTC(2026, 6, 7, 0, 55), // Mon 07-06 20:55 ET — 07-06 just completed
+        recorderEnv: ARMED_ENV,
+      });
+      expect(s.recorder.missingTradingDays).toEqual([]);
+      expect(s.recorder.state).toBe('armed_and_recording');
+    });
+
+    it('an EMPTY armed ledger is never_recorded, not stale (a fresh box is not a broken one)', () => {
+      hydrateGiveBackArmFloorFromDisk(dir, 1_000);
+      const s = summarizeGiveBackArmFloor({ now: NOW, recorderEnv: ARMED_ENV });
+      expect(s.recorder.state).toBe('never_recorded');
+      expect(s.recorder.staleTradingDays).toBe(0);
+      expect(s.recorder.firstRecordedSessionDate).toBeNull();
+      // Armed with nothing recorded is still a MEASUREMENT of zero, so no null here.
+      expect(s.invalidations).toBe(0);
+    });
+
+    it('reports the RECORDER gate, which is the master ALONE — not the arm-floor sub-flag', () => {
+      recordThrough21();
+      // Arm floor down but master up: the control is disarmed, yet rows STILL accrue and
+      // the readout is still a live measurement. Conflating the two predicates is how a
+      // disarmed floor gets mistaken for a dead recorder and vice versa.
+      const s = summarizeGiveBackArmFloor({
+        now: NOW,
+        recorderEnv: {
+          live: { EXIT_RISK_RULES_ENABLED: '1', BOOK_GIVEBACK_ARM_FLOOR_ENABLED: '0' },
+          demo: { EXIT_RISK_RULES_ENABLED: '1', BOOK_GIVEBACK_ARM_FLOOR_ENABLED: '0' },
+        },
+      });
+      expect(s.recorder.armed).toBe(true);
+      expect(s.recorder.masterFlag).toBe('EXIT_RISK_RULES_ENABLED');
+      expect(s.invalidations).not.toBeNull();
+    });
+
+    it('one book armed is enough to keep recording (per-book resolution)', () => {
+      recordThrough21();
+      const s = summarizeGiveBackArmFloor({
+        now: NOW,
+        recorderEnv: { live: {}, demo: { EXIT_RISK_RULES_ENABLED: 'true' } },
+      });
+      expect(s.recorder.armedByBook).toEqual({ demo: true, live: false });
+      expect(s.recorder.armed).toBe(true);
+      expect(s.recorder.state).not.toBe('dark');
+    });
   });
 
   // TRA-2110 — the boot governor-hydration accessor. Reads the folded intraday peak

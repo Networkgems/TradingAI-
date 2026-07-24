@@ -70,7 +70,10 @@ import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
-import { summarizeGiveBackArmFloor } from '../giveback-arm-floor-ledger.js'; // TRA-1892
+import {
+  summarizeGiveBackArmFloor,
+  type GiveBackArmFloorSummary,
+} from '../giveback-arm-floor-ledger.js'; // TRA-1892 / TRA-2220
 import { evaluateDurability } from '../durability.js'; // TRA-1681
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
@@ -1233,6 +1236,31 @@ function tokenMatches(provided: string, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/**
+ * TRA-2220 — the human-readable headline for `/api/health/giveback-arm-floor`.
+ *
+ * Ordered by what VOIDS what: recorder darkness first (no measurement is happening at
+ * all), then ledger ephemerality (the measurement happens but does not survive a reboot),
+ * then the actual counts. A note that leads with "RECOVERABLE: 22 session(s)" while the
+ * writer has been gated off for two days is precisely the failure this ticket is about.
+ *
+ * Exported so the regression test can assert the DARK and CLEAN readouts are
+ * distinguishable rather than merely asserting the clean one looks clean.
+ */
+export function givebackArmFloorNote(summary: GiveBackArmFloorSummary): string {
+  const r = summary.recorder;
+  if (r.state === 'dark') {
+    return `DARK — the give-back recorder is NOT RUNNING. ${r.masterFlag} is off for BOTH books (demo=${r.armedByBook.demo}, live=${r.armedByBook.live}), and the writer sits inside that gate, so NO snapshot has reached this ledger since ${r.lastRecordedSessionDate ?? 'never'}. The ${summary.sessionsObserved} session(s) and every count below are a FROZEN historical artifact, not a current measurement — that is why invalidations serializes as null, not 0. TRA-1592's reopen tripwire ("giveback_halt_sub_floor > 0") CANNOT FIRE in this state: with the floor disarmed no halt can be classified sub-floor. Missing completed trading days since ${r.firstRecordedSessionDate ?? 'n/a'}: ${r.missingTradingDays.length > 0 ? r.missingTradingDays.join(', ') : 'none'}. Fix = restore ${r.masterFlag} on the service (TRA-2195/TRA-2198), then re-grade forward from the first recorded session AFTER the restore.`;
+  }
+  if (r.state === 'armed_but_stale') {
+    return `STALE — ${r.masterFlag} is ON (demo=${r.armedByBook.demo}, live=${r.armedByBook.live}) but the last ${r.staleTradingDays} completed trading day(s) recorded NOTHING (last row: ${r.lastRecordedSessionDate ?? 'never'}). Missing: ${r.missingTradingDays.join(', ')}. This is a suspicion, not a proof — a book that never went green and never halted writes no row by design — but ${r.staleTradingDays} consecutive empty completed session(s) is the frozen-counter signature and must be reconciled against the calendar before any count below is graded.`;
+  }
+  if (summary.durability.ephemeral) {
+    return `NOT RECOVERABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}), so these ${summary.sessionsObserved} session(s) die at the next reboot just like the in-memory book state. The ≥5-session gate cannot rely on this until DATA_DIR points at a persistent mount (DATA_DIR=/data on bqb1, TRA-1719). Read durability.ephemeral before trusting any count here.`;
+  }
+  return `RECOVERABLE: ${summary.sessionsObserved} session(s) durable on ${summary.durability.dataDir}, recorder ${r.state} through ${r.lastRecordedSessionDate ?? 'n/a'}. invalidations=${summary.invalidations} (sub-floor-peak give-back halts — a PRIMARY-AC breach if > 0), buckets total ${summary.verdictCountsTotal}/${summary.sessionsObserved}. A missed 21:40Z grade fire is recoverable by re-reading this route any time within ${summary.retentionDays} days.`;
+}
+
 export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): void {
   const now = deps.now ?? Date.now;
 
@@ -1671,37 +1699,58 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // `durability.ephemeral` FIRST: true ⇒ the outcomes below die at the next redeploy and
   // recoverability is VOID (fix = DATA_DIR=/data on bqb1, TRA-1719). `invalidations > 0`
   // is the PRIMARY-AC breach: a sub-floor-peak day that give-back halted.
+  //
+  // TRA-2220 — and read `recorder.state` BEFORE EVEN THAT. The writer sits inside the
+  // `EXIT_RISK_RULES_ENABLED` master gate, so a wiped master does not zero these counters,
+  // it FREEZES them — and a frozen `invalidations: 0` is byte-identical to 22 clean
+  // sessions. That is what this route served on 2026-07-22/23 with `ok: true` while
+  // TRA-1592's reopen tripwire sat structurally unable to fire. `ok` is now FALSE
+  // whenever the recorder is dark or stale, and `invalidations` serializes as `null`
+  // rather than `0` while dark (TRA-1707: `0` is never "not measured").
   app.get('/api/health/giveback-arm-floor', (_req, res) => {
     const dir = process.env.DATA_DIR;
     // The live book reads process.env; the demo book overlays demo-flags.json — mirror
     // the engine's `bookMarkEnv` resolution so `armed` reflects what each book sees.
     const liveEnv = process.env;
     const demoEnv = dir ? resolveDemoFlagEnv(dir) : process.env;
-    const summary = summarizeGiveBackArmFloor();
+    const summary = summarizeGiveBackArmFloor({ now: now() });
+    const rec = summary.recorder;
+    // Darkness and staleness are BOTH failures of the instrument, not of the book: a
+    // ceiling-only check (`invalidations <= 0`) passes forever against a dead recorder,
+    // so liveness gets its own floor assertion here (TRA-2220 ask #2).
+    const healthy = rec.state === 'armed_and_recording' || rec.state === 'never_recorded';
     res.json({
-      ok: true,
+      ok: healthy,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       masterFlag: EXIT_RISK_RULES_FLAG,
       armFloorFlag: BOOK_GIVEBACK_ARM_FLOOR_FLAG,
       // Both books run under the SAME service env var; report each book's resolved arm
       // state so a grader knows the floor was live for the sessions below.
+      //
+      // NOTE the predicate difference from `recorder.armedByBook`: this is master AND
+      // arm-floor (is the CONTROL armed?); the recorder is gated on the master ALONE (is
+      // the MEASUREMENT running?). Floor off + master on ⇒ rows still accrue, all with
+      // `giveBackArmFloor: 0`. Master off ⇒ no rows at all.
       armed: {
         demo: isExitRiskRulesEnabled(demoEnv) && isBookGiveBackArmFloorEnabled(demoEnv),
         live: isExitRiskRulesEnabled(liveEnv) && isBookGiveBackArmFloorEnabled(liveEnv),
       },
+      // TRA-2220 — READ FIRST. `state: 'dark'` ⇒ nothing below is a live measurement.
+      recorder: rec,
       sessionsObserved: summary.sessionsObserved,
+      /** `null` while dark — see `recorder.state`. `invalidationsRecorded` is the raw count. */
       invalidations: summary.invalidations,
+      invalidationsRecorded: summary.invalidationsRecorded,
       verdictCounts: summary.verdictCounts,
+      verdictCountsTotal: summary.verdictCountsTotal,
       retentionDays: summary.retentionDays,
-      // TRA-1681 — read this FIRST. `ephemeral: true` ⇒ the sessions below are wiped at
+      // TRA-1681 — `ephemeral: true` ⇒ the sessions below are wiped at
       // the next reboot exactly like the in-memory state this ledger exists to outlast.
       durability: summary.durability,
       sessions: summary.sessions,
       lastRecordAt: summary.lastRecordAt,
-      note: summary.durability.ephemeral
-        ? `NOT RECOVERABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}), so these ${summary.sessionsObserved} session(s) die at the next reboot just like the in-memory book state. The ≥5-session gate cannot rely on this until DATA_DIR points at a persistent mount (DATA_DIR=/data on bqb1, TRA-1719). Read durability.ephemeral before trusting any count here.`
-        : `RECOVERABLE: ${summary.sessionsObserved} session(s) durable on ${summary.durability.dataDir}. invalidations=${summary.invalidations} (sub-floor-peak give-back halts — a PRIMARY-AC breach if > 0). A missed 21:40Z grade fire is recoverable by re-reading this route any time within ${summary.retentionDays} days.`,
+      note: givebackArmFloorNote(summary),
     });
   });
 

@@ -46,6 +46,9 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import { isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG } from './exit-risk-rules-flag.js'; // TRA-2220
+import { resolveDemoFlagEnv } from './demo-flags.js'; // TRA-2220
+import { etDateString, isMarketDayIso } from './scheduler.js'; // TRA-2220
 
 const log = logger.child({ module: 'giveback-arm-floor-ledger' });
 
@@ -504,6 +507,82 @@ export interface GiveBackArmFloorDurability {
   lastAppendError: string | null;
 }
 
+// ── TRA-2220 — recorder liveness: is a zero a MEASUREMENT or an ABSENCE? ─────
+//
+// `recordGiveBackState` is called from ONE place (signal-engine.ts), and that call sits
+// INSIDE the `isExitRiskRulesEnabled(bookMarkEnv)` master gate. Flip the master off and
+// `markBook` never runs, so no snapshot is ever handed to this ledger: the counters do
+// not fall to zero, they STOP MOVING. A frozen `giveback_halt_sub_floor: 0` is
+// byte-identical to the 0 that means "22 sessions observed, none breached the floor" —
+// which is exactly what bqb1 served for the two sessions after the TRA-2136 env wipe
+// took `EXIT_RISK_RULES_ENABLED` down (2026-07-22 / 07-23), while reading `ok: true`.
+//
+// TRA-1592 closed as a PASS with the reopen tripwire "`giveback_halt_sub_floor > 0` OR a
+// full-record miss". While the recorder is dark the FIRST branch is structurally
+// incapable of firing, and the second was already met with nothing to surface it. So the
+// state below is not decoration — it is the part of the readout that decides whether the
+// tripwire can fire at all.
+
+/** How the recorder resolves its arm state — mirrors the WRITER's own env resolution. */
+export interface GiveBackRecorderEnvOverride {
+  /** Env the LIVE book's `markBook` gate reads (`process.env`). */
+  live: NodeJS.ProcessEnv;
+  /** Env the DEMO book's gate reads (`process.env` overlaid with demo-flags.json). */
+  demo: NodeJS.ProcessEnv;
+}
+
+/**
+ * The RECORDER's own arm state and liveness. Read this BEFORE any count below.
+ *
+ * Note the predicate: the recorder is gated on the MASTER (`EXIT_RISK_RULES_ENABLED`)
+ * ALONE, not on `BOOK_GIVEBACK_ARM_FLOOR_ENABLED`. The route's separate `armed` field
+ * reports master AND arm-floor — the two differ, and the difference matters: floor off
+ * but master on ⇒ rows still accrue (they just all carry `giveBackArmFloor: 0`); master
+ * off ⇒ NO rows at all and every count here is frozen at its last live value.
+ */
+export interface GiveBackRecorderLiveness {
+  /** The env var the WRITER's gate reads. */
+  masterFlag: string;
+  /** True iff the master gate is on for AT LEAST ONE book ⇒ rows can still accrue. */
+  armed: boolean;
+  /** Per-book master-gate state, resolved from the same env each book's writer reads. */
+  armedByBook: { demo: boolean; live: boolean };
+  /** Earliest ET session date on record (null when the ledger is empty). */
+  firstRecordedSessionDate: string | null;
+  /** Latest ET session date on record (null when the ledger is empty). */
+  lastRecordedSessionDate: string | null;
+  /**
+   * NYSE trading days in `[firstRecordedSessionDate .. last COMPLETED session]` that
+   * recorded ZERO rows, ascending.
+   *
+   * HONEST CAVEAT — this is a SUSPICION, not a proof. A day can legitimately record
+   * nothing: `recordGiveBackState` skips a book that never went green and never halted
+   * (`peakPnl ≤ 0 && !haltLatched`), so an all-red session writes no row. The DECISIVE
+   * darkness signal is `armed: false`; this list is the signal for the case `armed` can
+   * NOT catch (recorder armed but not reaching disk). Both are published so a grader
+   * never has to infer one from the other.
+   */
+  missingTradingDays: string[];
+  /**
+   * Consecutive COMPLETED trading days at the tail with zero rows. This is the liveness
+   * FLOOR assertion (TRA-2220 ask #2): a ceiling-only check ("invalidations ≤ 0") passes
+   * forever against a dead recorder, so the failure signal has to be
+   * "`sessionsObserved` did not move across ≥ 1 expected trading day".
+   */
+  staleTradingDays: number;
+  /**
+   * The machine-readable verdict a grader branches on:
+   * - `dark` — master gate OFF on EVERY book. No measurement is happening; every count
+   *   below is a frozen historical artifact and `invalidations` serializes as `null`.
+   * - `armed_but_stale` — armed, yet ≥ 1 completed trading day since the first record
+   *   wrote nothing. Either an all-red session or a broken write path — investigate.
+   * - `never_recorded` — armed and nothing on record yet (a fresh/wiped ledger).
+   * - `armed_and_recording` — armed, no gap. The only state in which a `0` for
+   *   `invalidations` is an actual measurement.
+   */
+  state: 'dark' | 'armed_but_stale' | 'never_recorded' | 'armed_and_recording';
+}
+
 export interface GiveBackArmFloorSummary {
   /** Every retained book-session, most recent first. */
   sessions: GiveBackSessionSummary[];
@@ -512,10 +591,30 @@ export interface GiveBackArmFloorSummary {
   /**
    * The TRA-1592 PRIMARY-AC tripwire: sub-floor-peak days that give-back halted. > 0 is
    * an INVALIDATION — the arm floor let a tiny-peak day latch a whole-session halt.
+   *
+   * TRA-2220 — `null` whenever `recorder.state === 'dark'`. With the master gate off no
+   * snapshot reaches this ledger, so `0` would not be "no breaches occurred", it would be
+   * "nobody looked" — and `0` is never "not measured" (TRA-1707). Read
+   * {@link invalidationsRecorded} for the raw historical count, which never nulls.
    */
-  invalidations: number;
-  /** Per-verdict session counts. */
-  verdictCounts: Record<GiveBackSessionVerdict, number>;
+  invalidations: number | null;
+  /** The raw sub-floor-halt count over the retained window. NEVER null — no information
+   * is lost by the nulling above, only its authority to be read as a measurement. */
+  invalidationsRecorded: number;
+  /**
+   * Per-verdict session counts over the retained window.
+   *
+   * TRA-2220 — `giveback_halt_sub_floor` serializes as `null` while the recorder is dark
+   * (same reason as {@link invalidations}: it is the tripwire a grader reads). The other
+   * four buckets stay numeric because they are a real fold of real recorded sessions;
+   * {@link verdictCountsTotal} is published so the sum-vs-`sessionsObserved` check
+   * (TRA-2089) still has a numeric total to reconcile against.
+   */
+  verdictCounts: Record<GiveBackSessionVerdict, number | null>;
+  /** Sum of the verdict buckets AS RECORDED (never null) — must equal `sessionsObserved`. */
+  verdictCountsTotal: number;
+  /** TRA-2220 — the recorder's own arm state + liveness. Read BEFORE any count above. */
+  recorder: GiveBackRecorderLiveness;
   /** How many days back the ledger retains. A read gap wider than this can miss a session. */
   retentionDays: number;
   /** TRA-1681 — whether ANY of the above survives a reboot. Check BEFORE trusting a count. */
@@ -563,17 +662,127 @@ function toSummary(o: SessionOutcome): GiveBackSessionSummary {
   };
 }
 
+/** Add `n` days to a `YYYY-MM-DD` calendar date. UTC arithmetic ⇒ timezone-independent. */
+function addIsoDays(dateIso: string, n: number): string {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  const t = Date.UTC(y, m - 1, d) + n * 24 * 60 * 60 * 1000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
 /**
- * Fold the store into the read-only give-back forward-test diagnostics. Pure — no IO.
+ * The last ET trading day whose session is COMPLETE at `now` — i.e. the latest day a
+ * missing row is genuinely evidence rather than an in-progress session.
+ *
+ * Today counts only once the cash close has passed (16:00 ET); before that a day with no
+ * rows is simply a day whose book has not gone green YET, and flagging it would make the
+ * instrument cry wolf every single morning. Walks back over weekends/holidays.
+ */
+function lastCompletedTradingDay(now: number): string {
+  const today = etDateString(new Date(now));
+  const etHour = Number(
+    new Date(now).toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit',
+      hour12: false,
+    }),
+  );
+  let cursor = isMarketDayIso(today) && etHour >= 16 ? today : addIsoDays(today, -1);
+  // Bounded walk-back: 10 days covers the longest weekend + holiday cluster.
+  for (let i = 0; i < 10 && !isMarketDayIso(cursor); i += 1) cursor = addIsoDays(cursor, -1);
+  return cursor;
+}
+
+/**
+ * TRA-2220 — resolve the RECORDER's arm state from the same env its one call site reads.
+ *
+ * Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (`process.env.DATA_DIR` — not this
+ * module's `dataDir`, which index.ts defaults to a bundle path when the var is unset).
+ * Computed HERE rather than passed in by the route, so no caller can ship a readout that
+ * silently omits it (TRA-2210: a filter applied at some call sites is a bug awaiting the
+ * next one).
+ */
+function resolveRecorderEnvs(override?: GiveBackRecorderEnvOverride): GiveBackRecorderEnvOverride {
+  if (override) return override;
+  const dir = process.env.DATA_DIR;
+  return { live: process.env, demo: dir ? resolveDemoFlagEnv(dir) : process.env };
+}
+
+function computeRecorderLiveness(
+  sessions: GiveBackSessionSummary[],
+  now: number,
+  envOverride?: GiveBackRecorderEnvOverride,
+): GiveBackRecorderLiveness {
+  const envs = resolveRecorderEnvs(envOverride);
+  const armedByBook = {
+    demo: isExitRiskRulesEnabled(envs.demo),
+    live: isExitRiskRulesEnabled(envs.live),
+  };
+  const armed = armedByBook.demo || armedByBook.live;
+
+  const recordedDays = new Set(sessions.map((s) => s.sessionDate));
+  const sorted = [...recordedDays].sort();
+  const firstRecordedSessionDate = sorted[0] ?? null;
+  const lastRecordedSessionDate = sorted[sorted.length - 1] ?? null;
+
+  const missingTradingDays: string[] = [];
+  if (firstRecordedSessionDate !== null) {
+    const end = lastCompletedTradingDay(now);
+    for (
+      let d = firstRecordedSessionDate;
+      d <= end;
+      d = addIsoDays(d, 1) // ISO dates are lexicographically ordered — string compare is safe
+    ) {
+      if (isMarketDayIso(d) && !recordedDays.has(d)) missingTradingDays.push(d);
+    }
+  }
+  // The TAIL gap is what "frozen" means: leading/interior gaps can be all-red sessions,
+  // but N consecutive completed trading days with nothing at the end is a stopped clock.
+  let staleTradingDays = 0;
+  for (let d = lastCompletedTradingDay(now); ; d = addIsoDays(d, -1)) {
+    if (!isMarketDayIso(d)) continue;
+    if (recordedDays.has(d) || firstRecordedSessionDate === null || d < firstRecordedSessionDate)
+      break;
+    staleTradingDays += 1;
+    if (staleTradingDays >= 30) break; // bound the walk at the retention window
+  }
+
+  const state: GiveBackRecorderLiveness['state'] = !armed
+    ? 'dark'
+    : firstRecordedSessionDate === null
+      ? 'never_recorded'
+      : staleTradingDays > 0
+        ? 'armed_but_stale'
+        : 'armed_and_recording';
+
+  return {
+    masterFlag: EXIT_RISK_RULES_FLAG,
+    armed,
+    armedByBook,
+    firstRecordedSessionDate,
+    lastRecordedSessionDate,
+    missingTradingDays,
+    staleTradingDays,
+    state,
+  };
+}
+
+/**
+ * Fold the store into the read-only give-back forward-test diagnostics. Pure — no IO
+ * beyond the demo-flags read that resolves the recorder's own arm state.
  * Sessions are returned most-recent first across ALL retained days so a catch-up read
  * after a missed live fire recovers the whole accrual window at once.
  *
- * Read `durability.ephemeral` FIRST: if true, every session below is wiped at the next
- * reboot and this ledger has not actually made the outcome recoverable (TRA-1719).
+ * Read in this order:
+ *   1. `recorder.state` — TRA-2220. `dark` ⇒ nothing below is a current measurement.
+ *   2. `durability.ephemeral` — TRA-1719. `true` ⇒ nothing below survives a reboot.
+ *   3. the counts.
  */
-export function summarizeGiveBackArmFloor(): GiveBackArmFloorSummary {
+export function summarizeGiveBackArmFloor(
+  opts: { now?: number; recorderEnv?: GiveBackRecorderEnvOverride } = {},
+): GiveBackArmFloorSummary {
+  const now = opts.now ?? Date.now();
   const sessions: GiveBackSessionSummary[] = [];
-  const verdictCounts: Record<GiveBackSessionVerdict, number> = {
+  const recorded: Record<GiveBackSessionVerdict, number> = {
     giveback_halt_sub_floor: 0,
     giveback_halt_above_floor: 0,
     session_stop: 0,
@@ -584,15 +793,34 @@ export function summarizeGiveBackArmFloor(): GiveBackArmFloorSummary {
     for (const o of day.values()) {
       const s = toSummary(o);
       sessions.push(s);
-      verdictCounts[s.verdict] += 1;
+      recorded[s.verdict] += 1;
     }
   }
   sessions.sort((a, b) => b.lastTs - a.lastTs);
+
+  const recorder = computeRecorderLiveness(sessions, now, opts.recorderEnv);
+  // TRA-2220 / TRA-1707 — while the recorder is dark the tripwire is NOT 0, it is
+  // unmeasured. Null it at the source so every consumer inherits the honesty; the raw
+  // count stays available under `invalidationsRecorded`.
+  const dark = recorder.state === 'dark';
+  const verdictCountsTotal =
+    recorded.giveback_halt_sub_floor +
+    recorded.giveback_halt_above_floor +
+    recorded.session_stop +
+    recorded.clean_sub_floor +
+    recorded.clean_above_floor;
+
   return {
     sessions,
     sessionsObserved: sessions.length,
-    invalidations: verdictCounts.giveback_halt_sub_floor,
-    verdictCounts,
+    invalidations: dark ? null : recorded.giveback_halt_sub_floor,
+    invalidationsRecorded: recorded.giveback_halt_sub_floor,
+    verdictCounts: {
+      ...recorded,
+      giveback_halt_sub_floor: dark ? null : recorded.giveback_halt_sub_floor,
+    },
+    verdictCountsTotal,
+    recorder,
     retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
     durability: {
       dataDir,
