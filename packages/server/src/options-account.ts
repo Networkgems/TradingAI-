@@ -42,6 +42,14 @@ import {
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import {
+  type MarketableOpenMtmConfig,
+  DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
+  normalizeMarketableConfig,
+  marketableMarkPerShare,
+  marketableUnrealizedUsd,
+  positionSide,
+} from './marketable-open-mtm.js';
+import {
   isOptionTradeJournalEnabled,
   recordOptionTradeOpen,
   recordOptionTradeClose,
@@ -422,6 +430,18 @@ interface OptionsAccountConfig {
    * exercise the gates deterministically.
    */
   dayTradingGuardrail?: DayTradingGuardrailConfig;
+  /**
+   * TRA-2233 (parent TRA-2174) — marketable(bid) open-position valuation. When
+   * enabled, the give-back peak basis and demo close fills value open longs at
+   * the BID (shorts at the ASK) instead of the chain MID, so the paper book stops
+   * overstating realizable P&L by ~the half-spread. DARK by default
+   * ({@link DEFAULT_MARKETABLE_OPEN_MTM_CONFIG}: `enabled=false` ⇒ today's MID
+   * behavior, no change to live numbers) — gated on the forward-validation
+   * harness confirming the modeled mark against real Tradier sandbox fills, and
+   * on the TRA-1897 hold (nothing here arms a live path). Partial: unset fields
+   * fall back to the DARK default via {@link normalizeMarketableConfig}.
+   */
+  marketableOpenMtm?: Partial<MarketableOpenMtmConfig>;
 }
 
 /**
@@ -554,6 +574,14 @@ export class PaperOptionsAccount {
   private swingHoldOptions: boolean;
   /** TRA-598 (C3) — resolved no-day-trading thresholds; see {@link OptionsAccountConfig.dayTradingGuardrail}. */
   private dayTradingGuardrail: DayTradingGuardrailConfig;
+  /**
+   * TRA-2233 — marketable(bid) valuation config. DARK by default (`enabled=false`
+   * ⇒ MID behavior everywhere). When on, the give-back peak basis and demo close
+   * fills value longs at the bid / shorts at the ask via the modeled half-spread.
+   * Flipped at runtime by {@link updateConfig}; see
+   * {@link OptionsAccountConfig.marketableOpenMtm}.
+   */
+  private marketableOpenMtm: MarketableOpenMtmConfig = DEFAULT_MARKETABLE_OPEN_MTM_CONFIG;
   private currentDayKey = toDateKey(Date.now());
   /**
    * TRA-991 — serialized tail of pending option-trade-journal appends. The
@@ -589,6 +617,8 @@ export class PaperOptionsAccount {
     this.holdLiveOptionsOvernightForPdt = config.holdLiveOptionsOvernightForPdt ?? false;
     this.swingHoldOptions = config.swingHoldOptions ?? false;
     this.dayTradingGuardrail = config.dayTradingGuardrail ?? DAY_TRADING_GUARDRAIL;
+    // TRA-2233 — DARK by default; production wires it from an env resolver.
+    this.marketableOpenMtm = normalizeMarketableConfig(config.marketableOpenMtm);
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
   }
@@ -776,6 +806,9 @@ export class PaperOptionsAccount {
     if (config.dayTradingGuardrail !== undefined) {
       this.dayTradingGuardrail = config.dayTradingGuardrail;
     }
+    if (config.marketableOpenMtm !== undefined) {
+      this.marketableOpenMtm = normalizeMarketableConfig(config.marketableOpenMtm);
+    }
     this.equity = this.initialEquity;
     this.cash = this.initialEquity;
     this.openOptions.clear();
@@ -836,6 +869,14 @@ export class PaperOptionsAccount {
     if (config.dayTradingGuardrail !== undefined) {
       this.dayTradingGuardrail = config.dayTradingGuardrail;
     }
+    if (config.marketableOpenMtm !== undefined) {
+      this.marketableOpenMtm = normalizeMarketableConfig(config.marketableOpenMtm);
+    }
+  }
+
+  /** TRA-2233 — read the resolved marketable(bid) valuation config (UI/introspection/tests). */
+  getMarketableOpenMtmConfig(): MarketableOpenMtmConfig {
+    return this.marketableOpenMtm;
   }
 
   /** TRA-598 (C3) — read the resolved no-day-trading thresholds (UI/introspection). */
@@ -988,6 +1029,69 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-2233 — the REALIZABLE unrealized P&L for a mode: the same open positions
+   * as {@link unrealizedPnlForMode}, but each valued at the MARKETABLE mark (long
+   * → bid, short → ask) instead of the chain MID. This is the honest "what could I
+   * sell the open book for right now" number; the mid overstates it by ~the
+   * half-spread. Pure read. Independent of the flag — always computable — so the
+   * dashboard can surface it as a reference (`openOptionsRealizablePnl`) even while
+   * the give-back basis stays on the MID. When the modeled half-spread is 0 (or a
+   * live-side position with no haircut) this equals {@link unrealizedPnlForMode}.
+   */
+  private marketableUnrealizedPnlForMode(mode: AccountMode): number {
+    let total = 0;
+    for (const opt of this.openOptions.values()) {
+      if ((opt.mode ?? 'demo') !== mode) continue;
+      total += marketableUnrealizedUsd(opt, { halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac });
+    }
+    return total;
+  }
+
+  /**
+   * TRA-2233 — the unrealized MTM the give-back peak / daily-P&L basis should use:
+   * the MARKETABLE (bid) valuation when the flag is on, else the legacy MID. This
+   * single switch is what carries the marketable basis into the book give-back
+   * peak (`SignalEngine.computeBookMark` reads `dailyOptionsPnl`), coordinating
+   * with the TRA-2131 peak fix WITHOUT touching the give-back ledger itself.
+   *
+   * DEMO-ONLY by construction: the marketable haircut is a PAPER-book correction
+   * (live exits fill at Tradier's real spread already, so the live give-back basis
+   * must stay on the mid). `mode === 'demo'` here makes "no change to live numbers"
+   * a structural guarantee independent of how the flag is wired — TRA-1897 safe.
+   */
+  private basisUnrealizedPnlForMode(mode: AccountMode): number {
+    return this.marketableOpenMtm.enabled && mode === 'demo'
+      ? this.marketableUnrealizedPnlForMode(mode)
+      : this.unrealizedPnlForMode(mode);
+  }
+
+  /**
+   * TRA-2233 — the effective per-share DEMO exit fill price for `opt` closing at
+   * reference price `price` (the mid mark, or the TP1/SL trigger). Live mode
+   * returns `price` unchanged — Tradier pays the real spread end-to-end, so a
+   * modelled haircut would double-count. In demo:
+   *   • marketable flag ON  → a long sells at the marketable BID, a short buys
+   *     back at the ASK (modeled half-spread) — the realizable fill.
+   *   • marketable flag OFF → the legacy TRA-374 `demoSlippagePct` haircut, which
+   *     is `price` itself when the pct is 0 (today's MID close).
+   * Both model the same economic event (crossing the spread back out), so the
+   * marketable path SUPERSEDES the flat pct when armed rather than stacking on it.
+   * DARK by default. Shared by every demo close site (checkExits full/partial/SL,
+   * closeOption) so they can never drift apart.
+   */
+  private demoExitFillPrice(price: number, opt: OptionPosition): number {
+    if ((opt.mode ?? 'demo') !== 'demo') return price;
+    if (this.marketableOpenMtm.enabled) {
+      return marketableMarkPerShare({
+        midPerShare: price,
+        side: positionSide(opt),
+        halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac,
+      });
+    }
+    return price * (1 - this.demoSlippagePct);
+  }
+
+  /**
    * TRA-475 — today's options P&L for a mode: realized delta since the
    * ET-midnight rollover plus the live MTM on currently-open positions for
    * that mode. Mirrors the equity `AccountState.dailyPnl` semantics so the
@@ -1012,7 +1116,10 @@ export class PaperOptionsAccount {
     const realizedDelta = today === this.currentDayKey
       ? this.optionsPnlByMode[mode] - this.openingOptionsPnlByMode[mode]
       : 0;
-    return realizedDelta + this.unrealizedPnlForMode(mode);
+    // TRA-2233 — the OPEN term uses the marketable (bid) valuation when the flag
+    // is on, so the book give-back peak (which reads `dailyOptionsPnl`) trips on
+    // the realizable book, not the mid-inflated one. DARK default: MID.
+    return realizedDelta + this.basisUnrealizedPnlForMode(mode);
   }
 
   /**
@@ -1055,6 +1162,9 @@ export class PaperOptionsAccount {
         this.dailyRealizedOptionsPnlForMode('demo') + this.dailyRealizedOptionsPnlForMode('live'),
       openOptionsUnrealizedPnl:
         this.unrealizedPnlForMode('demo') + this.unrealizedPnlForMode('live'),
+      // TRA-2233 — realizable (marketable-mark) MTM alongside the MID figure.
+      openOptionsRealizablePnl:
+        this.marketableUnrealizedPnlForMode('demo') + this.marketableUnrealizedPnlForMode('live'),
       optionsCash: this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — surface the cumulative demo cost-model drag so the dashboard
@@ -1096,6 +1206,8 @@ export class PaperOptionsAccount {
       // realized one reconciles with the Calendar + "Closed Today" table.
       dailyRealizedOptionsPnl: this.dailyRealizedOptionsPnlForMode(mode),
       openOptionsUnrealizedPnl: this.unrealizedPnlForMode(mode),
+      // TRA-2233 — realizable (marketable-mark) MTM for this mode alongside MID.
+      openOptionsRealizablePnl: this.marketableUnrealizedPnlForMode(mode),
       optionsCash: mode === 'demo' ? 0 : this.cash,
       dailyOptionsCount: this.dailyCount + this.dailyOtmCount + this.dailyRvCount,
       // TRA-374 — the cost model is demo-only by construction; live mode
@@ -2956,7 +3068,8 @@ export class PaperOptionsAccount {
               continue;
             }
             const positionMode = opt.mode ?? 'demo';
-            const effectiveExit = positionMode === 'demo' ? mark * (1 - this.demoSlippagePct) : mark;
+            // TRA-2233 — demo exit fills at the marketable bid/ask when armed; MID otherwise.
+            const effectiveExit = this.demoExitFillPrice(mark, opt);
             const remainingContracts = opt.contractsRemaining;
             const exitFee = positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
             const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
@@ -3014,8 +3127,8 @@ export class PaperOptionsAccount {
           // cost of crossing the spread back out. Live closes go through the
           // Tradier `sell_to_close` path so we'd be double-counting.
           const positionMode = opt.mode ?? 'demo';
-          const effectiveExit =
-            positionMode === 'demo' ? mark * (1 - this.demoSlippagePct) : mark;
+          // TRA-2233 — demo partial exit fills at the marketable bid/ask when armed; MID otherwise.
+          const effectiveExit = this.demoExitFillPrice(mark, opt);
           const exitFee =
             positionMode === 'demo' ? exitContracts * this.demoFeePerContract : 0;
           const partialPnl = (effectiveExit - opt.premiumPaid) * exitContracts * 100;
@@ -3151,8 +3264,8 @@ export class PaperOptionsAccount {
         // TRA-374 — see partial-exit branch; same demo cost model on the full
         // exit so SL / trailing closes pay the modelled round-trip cost.
         const positionMode = opt.mode ?? 'demo';
-        const effectiveExit =
-          positionMode === 'demo' ? exitPremium * (1 - this.demoSlippagePct) : exitPremium;
+        // TRA-2233 — demo SL/trailing exit fills at the marketable bid/ask when armed; MID otherwise.
+        const effectiveExit = this.demoExitFillPrice(exitPremium, opt);
         const exitFee =
           positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
         const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
@@ -4040,8 +4153,9 @@ export class PaperOptionsAccount {
     // path passes Tradier's avg fill) the close price is already net of
     // real broker slippage, so we still skip the modelled haircut.
     const positionMode = opt.mode ?? 'demo';
-    const effectiveExit =
-      positionMode === 'demo' ? closePrice * (1 - this.demoSlippagePct) : closePrice;
+    // TRA-2233 — demo manual close fills at the marketable bid/ask when armed; MID otherwise.
+    // (Live path already substituted the broker's real avg fill into `closePrice`.)
+    const effectiveExit = this.demoExitFillPrice(closePrice, opt);
     const exitFee =
       positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
     const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;

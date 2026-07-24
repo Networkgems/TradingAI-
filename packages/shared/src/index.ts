@@ -2702,6 +2702,18 @@ export interface OptionsAccountState {
    * for back-compat.
    */
   openOptionsUnrealizedPnl?: number;
+  /**
+   * TRA-2233 (parent TRA-2174) — current REALIZABLE mark-to-market on the mode's
+   * OPEN contracts: the same positions as {@link openOptionsUnrealizedPnl} but
+   * valued at the MARKETABLE mark (long → bid, short → ask) instead of the chain
+   * MID. `openOptionsUnrealizedPnl` (MID) overstates realizable P&L by ~the
+   * half-spread; this is the "what could I sell the open book for right now"
+   * figure. Always computed (independent of the marketable-basis flag) so it can
+   * be surfaced as a reference alongside the MID number. Equals
+   * {@link openOptionsUnrealizedPnl} when the modeled half-spread is 0. Optional
+   * for back-compat with persisted state files that predate the field.
+   */
+  openOptionsRealizablePnl?: number;
   optionsCash: number;
   dailyOptionsCount: number;  // number of options opened today (resets at market open)
   /**

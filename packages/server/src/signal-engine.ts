@@ -213,6 +213,10 @@ import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
+// TRA-2233 — marketable(bid) open-position valuation, DARK behind
+// ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
+// mode==='demo'), so wiring it into both accounts can never change a live number.
+import { resolveMarketableOpenMtmConfig } from './marketable-open-mtm-flag.js';
 // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the executing
 // options opens (RV / OTM / directional). The estimator builds a modeled GROSS R
 // from local ingredients (mark, delta, target/stop); the gate nets the structure
@@ -2592,6 +2596,10 @@ export class SignalEngine {
     // of which env the user is trading.
     const holdLiveOptionsOvernightForPdt =
       settings ? resolveHoldLiveOptionsOvernight(settings) : true;
+    // TRA-2233 — DARK marketable(bid) valuation config from the demo-flag env
+    // (off unless ENABLE_MARKETABLE_OPEN_MTM is set). Applied to both accounts;
+    // the account only acts on it for demo positions / demo closes.
+    const marketableOpenMtm = resolveMarketableOpenMtmConfig(this.resolveDemoFlagEnv());
     this.optionsAccounts = {
       sandbox: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -2606,6 +2614,7 @@ export class SignalEngine {
         demoSlippagePct: demoCost.slippagePct,
         demoFeePerContract: demoCost.feePerContract,
         holdLiveOptionsOvernightForPdt,
+        marketableOpenMtm,
       }),
       production: new PaperOptionsAccount({
         initialEquity: currentEquity,
@@ -2617,6 +2626,7 @@ export class SignalEngine {
         demoSlippagePct: demoCost.slippagePct,
         demoFeePerContract: demoCost.feePerContract,
         holdLiveOptionsOvernightForPdt,
+        marketableOpenMtm,
       }),
     };
     this.lastSettings = settings;
@@ -2730,6 +2740,10 @@ export class SignalEngine {
     // TRA-1136 — re-read the swing-hold opt-in so a Settings toggle takes effect
     // on the next tick; extends the same-session RV exit suppression to demo.
     const swingHoldOptions = resolveSwingHoldOptions(settings);
+    // TRA-2233 — re-read the DARK marketable(bid) config so an operator arming
+    // ENABLE_MARKETABLE_OPEN_MTM via demo-flags.json takes effect on the next
+    // settings apply without a restart.
+    const marketableOpenMtm = resolveMarketableOpenMtmConfig(this.resolveDemoFlagEnv());
     this.optionsAccounts.sandbox.updateConfig({
       managedAccountRatio: demoStocksRatio,
       // TRA-378 — re-plumb riskPerTrade so a Settings PATCH re-sizes live
@@ -2741,6 +2755,7 @@ export class SignalEngine {
       demoFeePerContract: demoCost.feePerContract,
       holdLiveOptionsOvernightForPdt,
       swingHoldOptions,
+      marketableOpenMtm,
     });
     this.optionsAccounts.production.updateConfig({
       managedAccountRatio: liveStocksRatio,
@@ -2751,6 +2766,7 @@ export class SignalEngine {
       demoFeePerContract: demoCost.feePerContract,
       holdLiveOptionsOvernightForPdt,
       swingHoldOptions,
+      marketableOpenMtm,
     });
     // TRA-857 — keep the snapshot fresh so setAlertUsername can rebuild the
     // operator-scoped live clients from the latest settings.

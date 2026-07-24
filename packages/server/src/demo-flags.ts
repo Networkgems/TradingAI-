@@ -284,6 +284,19 @@ export const DEMO_FLAG_ALLOWLIST = [
   // — it only ever makes the demo paper book evaluate its exits MORE often, which
   // is risk-reducing. Default OFF.
   'ENABLE_DECOUPLED_EXIT_CADENCE',
+  // TRA-2233 (parent TRA-2174) — marketable(bid) open-position valuation. When
+  // armed, the DEMO paper book values open longs at the BID / shorts at the ASK
+  // (a modeled half-spread) instead of the chain MID, so the give-back peak basis
+  // and demo close fills stop overstating realizable P&L by ~the half-spread.
+  // Consulted ONLY on the demo branch (the account guards every marketable path
+  // on `mode === 'demo'`), so a file flip can NEVER change a live number — the
+  // TRA-1897 hold is untouched. DARK/default-OFF until the forward-validation
+  // harness confirms the modeled mark against real Tradier sandbox fills.
+  // `MARKETABLE_OPEN_MTM_HALF_SPREAD_FRAC` tunes the modeled fraction (default
+  // 0.134 = the measured demo-journal mean). Allowlisted so the forward series can
+  // be armed daemon-free on the self-hosted host (no PM2/admin).
+  'ENABLE_MARKETABLE_OPEN_MTM',
+  'MARKETABLE_OPEN_MTM_HALF_SPREAD_FRAC',
 ] as const;
 
 export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
