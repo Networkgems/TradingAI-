@@ -249,6 +249,13 @@ async function pullWatchdogRestarts(from, to) {
 
 // Is the checkExits hoist ARMED? Decides whether the parent-doTick hourly table
 // is an exit-latency curve or merely a tick-cost curve. Unauth route.
+//
+// ⛔ THIS IS A READ OF *NOW*, AND THE TAPE IS A READ OF *THEN*. The health route
+// describes the process answering the request, which on a box that restarts ~6×
+// a session is usually NOT the process that produced the window. Caught by the
+// regression control: grading the 07-23 tape stamped it "hoist ARMED", which is
+// flatly false — the arm landed 07-24 12:39Z. So carry `startedAt` and refuse to
+// apply the arm state to a window the running process did not live through.
 async function pullExitArm() {
   try {
     const res = await fetch('https://tradingai-bqb1.onrender.com/api/health/exit-cadence',
@@ -263,6 +270,9 @@ async function pullExitArm() {
       modes: modes.length ? `mode=${modes.join('+')}` : 'mode unknown',
       p99Under30s: b.p99Under30s ?? null,
       maxExitIntervalMs: b.maxExitIntervalMs ?? null,
+      // The instant this reading describes. Compared against the window below.
+      readAt: b.time ?? null,
+      startedAt: b.build?.startedAt ?? null,
     };
   } catch { return null; }
 }
@@ -402,8 +412,17 @@ function grade(recs) {
   // tick-cost curve and NOT an exit-latency curve, and quoting it as one
   // understates a fixed book or overstates a healthy one. Read the arm state
   // and say which curve this is — never print the identity unconditionally.
+  // The live read only describes THIS window if the process answering it was
+  // already running when the window closed. Otherwise it is a fact about a
+  // later process and must not be applied backwards.
+  const armCoversWindow = arm && arm.startedAt && arm.startedAt <= TO;
   if (arm === null) {
     console.log('doTick by UTC hour  [arm state UNREADABLE — do NOT quote this as exit latency]:');
+  } else if (!armCoversWindow) {
+    console.log(`doTick by UTC hour  [WHICH CURVE THIS IS, IS UNKNOWN. The live exit-cadence read`);
+    console.log(`  describes a process that booted ${arm.startedAt} — AFTER this window closed, so it`);
+    console.log(`  says nothing about whether the hoist was armed then. Establish the arm state for the`);
+    console.log(`  window from that session's own evidence before calling this exit latency.]`);
   } else if (arm.enabled && arm.armedEngineCount > 0) {
     console.log(`doTick by UTC hour — TICK-COST curve ONLY. The exit hoist is ARMED `
       + `(${arm.armedEngineCount}/${arm.engineCount} engines,`);
