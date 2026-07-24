@@ -121,9 +121,17 @@ describe('DESK de-noise — excludeTestAccountRows feeding the fold (TRA-1475)',
 // Account" against +$119.50 on Desk. `buildJournalCalendarCells` is the single
 // entry point that folds the filter in, so no caller can omit it.
 describe('buildJournalCalendarCells — journal → cells, de-noise not optional (TRA-2210)', () => {
-  // The real 2026-07-22 shape: one genuine +$1,600 SMCI close mirrored into
-  // three QA fixture books with DISTINCT ids (id-dedupe finds no duplicate), on
-  // top of $119.50 of real-book closes.
+  // The real 2026-07-22 SHAPE — not its row count. One genuine +$1,600 SMCI close
+  // mirrored into three QA fixture books with DISTINCT ids (id-dedupe finds no
+  // duplicate), on top of $119.50 of real-book closes.
+  //
+  // ⚠️ The dollar figures here are the live ones; the TRADE COUNTS are not, and the
+  // difference has already misled one verifier. Live 2026-07-22 is 7 real closes +
+  // 3 mirrors = 10; this fixture compresses the 7 into 2 rows summing to the same
+  // $119.50, because what is under test is the FILTER, not the arithmetic of seven
+  // addends. So `toBe(2)` below is right for this fixture and `totalTrades = 7` is
+  // right for the live route — anyone checking the live tape against "2 trades"
+  // will fail a correct build (TRA-2211 acceptance #2 did exactly that; TRA-2219).
   const jul22 = [
     closed({ id: 'r1', closeTs: JUL01, realizedPnlUsd: 100, account: 'richard' }),
     closed({ id: 'r2', closeTs: JUL01, realizedPnlUsd: 19.5, account: 'admin' }),
@@ -140,7 +148,13 @@ describe('buildJournalCalendarCells — journal → cells, de-noise not optional
     expect(cell!.combinedPnl).not.toBeCloseTo(4919.5, 2);
   });
 
-  it('produces the SAME cell the Desk routes do for identical rows', () => {
+  // Scope note, so this is not read as stronger than it is: the right-hand side
+  // RE-IMPLEMENTS the desk path rather than exercising it, so this pins the
+  // composition (filter-then-fold) and nothing else. It stays green if a route is
+  // re-pointed at the bare fold — which is the ONLY way this bug has ever occurred.
+  // The call-graph assertion that does catch that lives in
+  // `desk-calendar-single-entry.test.ts`; keep the two together.
+  it('composes to the same cell the Desk routes build for identical rows', () => {
     const account = buildJournalCalendarCells(jul22, GEN).get('2026-07-01');
     const desk = aggregateDeskCalendar(excludeTestAccountRows(jul22), GEN).get('2026-07-01');
     expect(account!.combinedPnl).toBe(desk!.combinedPnl);
