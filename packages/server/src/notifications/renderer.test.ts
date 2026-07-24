@@ -4,6 +4,7 @@ import type {
   BriefingAlertEvent,
   ExitAlertEvent,
   FillAlertEvent,
+  ReportAlertEvent,
   RiskHaltAlertEvent,
   RoutineAlertEvent,
   SignalAlertEvent,
@@ -233,6 +234,68 @@ describe('renderAlert', () => {
     const r = renderAlert(e);
     expect(r.html).toContain('&lt;b&gt;equity&lt;/b&gt; &amp; cash');
     expect(r.html).not.toContain('<b>equity');
+  });
+
+  // ── TRA-2252 scheduled P&L report ──────────────────────────────────────────
+
+  it('renders a scheduled P&L report as a stats table', () => {
+    const e: ReportAlertEvent = {
+      kind: 'report',
+      username: 'alice',
+      timestamp: TS,
+      cadence: 'weekly',
+      periodStart: '2026-05-11',
+      periodEnd: '2026-05-17',
+      periodLabel: 'Weekly — 2026-05-11 to 2026-05-17',
+      stats: {
+        totalPnl: 350.5,
+        stockPnl: 300.5,
+        optionsPnl: 50,
+        totalTrades: 5,
+        tradingDays: 3,
+        winDays: 2,
+        lossDays: 1,
+        startEquity: 25_000,
+        endEquity: 25_350.5,
+        bestDay: { date: '2026-05-14', pnl: 250, trades: 3 },
+        worstDay: { date: '2026-05-12', pnl: -40, trades: 1 },
+      },
+    };
+    const r = renderAlert(e);
+    expect(r.title).toBe('📈 TradingAI — Weekly Report (Weekly — 2026-05-11 to 2026-05-17)');
+    expect(r.subject).toContain('+$350.50');
+    // Table carries the labelled rows in both parts.
+    expect(r.text).toContain('Net P&L: +$350.50');
+    expect(r.text).toContain('Best day: 2026-05-14  +$250.00');
+    expect(r.text).toContain('Worst day: 2026-05-12  -$40.00');
+    expect(r.html).toContain('End equity');
+    expect(r.html).toContain('$25,350.50');
+  });
+
+  it('uses a losing-period emoji when net P&L is negative', () => {
+    const e: ReportAlertEvent = {
+      kind: 'report',
+      username: 'alice',
+      timestamp: TS,
+      cadence: 'daily',
+      periodStart: '2026-05-17',
+      periodEnd: '2026-05-17',
+      periodLabel: 'Daily — 2026-05-17',
+      stats: {
+        totalPnl: -120,
+        stockPnl: -120,
+        optionsPnl: 0,
+        totalTrades: 2,
+        tradingDays: 1,
+        winDays: 0,
+        lossDays: 1,
+        startEquity: 25_000,
+        endEquity: 24_880,
+      },
+    };
+    const r = renderAlert(e);
+    expect(r.title.startsWith('📉')).toBe(true);
+    expect(r.subject).toContain('-$120.00');
   });
 
   it('produces a non-empty html and a text/html pair for every kind', () => {

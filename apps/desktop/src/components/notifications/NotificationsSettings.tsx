@@ -21,6 +21,7 @@ import type {
   AlertDigestMode,
   AlertEventClass,
   AlertPreferences,
+  ReportCadence,
 } from '@trading-app/shared';
 import {
   ALERT_CHANNELS,
@@ -41,12 +42,23 @@ const EVENT_LABELS: Record<AlertEventClass, string> = {
   risk_halt: 'Risk halt',
   briefing: 'Daily briefing',
   routine: 'Scheduled routine',
+  report: 'P&L report',
 };
 
 const DIGEST_OPTIONS: { value: AlertDigestMode; label: string }[] = [
   { value: 'immediate', label: 'Immediate' },
   { value: '15min', label: 'Batched every 15 min' },
   { value: 'hourly', label: 'Hourly digest' },
+];
+
+// TRA-2252 — scheduled P&L report cadence. `off` opts out entirely; the chosen
+// value fires one report per period boundary via the `report` event class above.
+const REPORT_CADENCE_OPTIONS: { value: ReportCadence; label: string }[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'daily', label: 'Daily' },
+  { value: 'weekly', label: 'Weekly (Sun)' },
+  { value: 'monthly', label: 'Monthly' },
+  { value: 'yearly', label: 'Yearly' },
 ];
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error';
@@ -130,6 +142,12 @@ export function NotificationsSettings({ token, httpUrl }: { token: string; httpU
   const setDigest = (mode: AlertDigestMode) =>
     patchPrefs(p => {
       p.signalDigest = mode;
+      return p;
+    });
+
+  const setReportCadence = (cadence: ReportCadence) =>
+    patchPrefs(p => {
+      p.reportCadence = cadence;
       return p;
     });
 
@@ -414,6 +432,28 @@ export function NotificationsSettings({ token, httpUrl }: { token: string; httpU
             ))}
           </select>
           <span className="field-hint">Batches the high-frequency signal alerts only.</span>
+        </div>
+      </div>
+
+      {/* ── Scheduled P&L report (TRA-2252) ──────────────────────────────── */}
+      <h3 className="notif-subhead">Scheduled P&amp;L report</h3>
+      <div className="settings-grid">
+        <div className="settings-field">
+          <label>Report cadence</label>
+          <select
+            value={prefs.reportCadence}
+            onChange={e => setReportCadence(e.target.value as ReportCadence)}
+          >
+            {REPORT_CADENCE_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <span className="field-hint">
+            Emails a P&amp;L + trade summary at the end of each period. Routes via the
+            “P&amp;L report” row above. A period with no trades is skipped.
+          </span>
         </div>
       </div>
 

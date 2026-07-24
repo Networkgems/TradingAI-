@@ -888,8 +888,15 @@ export const ALERT_CHANNELS: readonly AlertChannel[] = ['email', 'telegram', 'di
  * low-frequency and high-value, so it routes to every channel by default (like
  * `risk_halt`) rather than the quietest defaults the high-frequency `signal`
  * class uses.
+ *
+ * TRA-2252 — `report` is the scheduled P&L + trade-summary report (daily / weekly
+ * / monthly / yearly). Like `briefing` it is low-frequency and high-value, so it
+ * routes to every channel by default. WHICH cadence fires (or whether any does)
+ * is a separate, per-user opt-in — see {@link AlertPreferences.reportCadence};
+ * the default `off` means no report is emitted until the user chooses a cadence,
+ * so this matrix only governs the channels a chosen report reaches.
  */
-export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt' | 'briefing' | 'routine';
+export type AlertEventClass = 'fill' | 'exit' | 'signal' | 'risk_halt' | 'briefing' | 'routine' | 'report';
 
 export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
   'fill',
@@ -900,10 +907,30 @@ export const ALERT_EVENT_CLASSES: readonly AlertEventClass[] = [
   // TRA-851 — output of a user-defined natural-language routine (a scheduled
   // brief/scan/status/positions push at a user-chosen time).
   'routine',
+  // TRA-2252 — scheduled P&L + trade-summary report (daily/weekly/monthly/yearly).
+  'report',
 ];
 
 /** Batching mode for the high-frequency `signal` class (TRA-410 §1.3 "Digest"). */
 export type AlertDigestMode = 'immediate' | '15min' | 'hourly';
+
+/**
+ * TRA-2252 — cadence for the scheduled P&L + trade-summary report. `off` (the
+ * default) emits nothing; the other values fire one report per period boundary
+ * (day / ISO-week-ending-Sunday / calendar-month-end / Dec 31), fanned out to
+ * whichever channels the `report` event class is routed to. A single cadence per
+ * user keeps the opt-in unambiguous — a user wanting both a daily and a monthly
+ * digest picks the one that matters; the daily already rolls up into the month.
+ */
+export type ReportCadence = 'off' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+
+export const REPORT_CADENCES: readonly ReportCadence[] = [
+  'off',
+  'daily',
+  'weekly',
+  'monthly',
+  'yearly',
+];
 
 /** Per-channel enable toggle + connection config. */
 export interface AlertChannelConfig {
@@ -956,6 +983,12 @@ export interface AlertPreferences {
   quietHours: AlertQuietHours;
   /** Batching for `signal` alerts — the only high-frequency class. */
   signalDigest: AlertDigestMode;
+  /**
+   * TRA-2252 — cadence for the scheduled P&L + trade-summary report. `off` (the
+   * default) opts the user out entirely; a chosen cadence fires one `report`
+   * event per period boundary, routed via `events.report`.
+   */
+  reportCadence: ReportCadence;
 }
 
 /**
@@ -985,9 +1018,16 @@ export const DEFAULT_ALERT_PREFERENCES: AlertPreferences = {
     // user manages them from (Telegram/Discord); email off so a frequent custom
     // scan doesn't fill the inbox. The user can flip email on per the matrix.
     routine: { email: false, telegram: true, discord: true },
+    // TRA-2252 — scheduled P&L report. Email-first (a period P&L digest is a
+    // classic email artifact) but on for every channel so a linked Telegram/
+    // Discord receives it without a matrix edit. Gated behind `reportCadence`
+    // (default off), so this only matters once the user opts into a cadence.
+    report: { email: true, telegram: true, discord: true },
   },
   quietHours: { enabled: false, start: '22:00', end: '07:00', timezone: 'America/New_York' },
   signalDigest: 'immediate',
+  // TRA-2252 — opt-in: no scheduled report until the user picks a cadence.
+  reportCadence: 'off',
 };
 
 /**
@@ -1021,6 +1061,7 @@ export function resolveAlertPreferences(
     events,
     quietHours: { ...base.quietHours, ...(saved.quietHours ?? {}) },
     signalDigest: saved.signalDigest ?? base.signalDigest,
+    reportCadence: saved.reportCadence ?? base.reportCadence,
   };
 }
 
@@ -1034,6 +1075,7 @@ function cloneAlertPreferences(prefs: AlertPreferences): AlertPreferences {
     events,
     quietHours: { ...prefs.quietHours },
     signalDigest: prefs.signalDigest,
+    reportCadence: prefs.reportCadence,
   };
 }
 

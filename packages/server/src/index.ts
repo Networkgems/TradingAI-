@@ -219,6 +219,8 @@ import {
 import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { runMorningBriefForAllUsers, buildBriefForUser, buildMacroSection } from './morning-brief.js';
+// TRA-2252 — scheduled P&L + trade-summary report emails.
+import { runScheduledReports, type ReportUser } from './scheduled-report.js';
 // TRA-851 — user-configurable natural-language routines.
 import {
   loadRoutineStore,
@@ -2817,6 +2819,34 @@ async function runDailyCloseForAllUsers(): Promise<void> {
         reason: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+}
+
+/**
+ * TRA-2252 — fire the scheduled P&L + trade-summary report for every user whose
+ * cadence closes today. Runs from the 21:00 ET archive hook AFTER
+ * `runDailyCloseForAllUsers` has booked today's snapshot into each user's
+ * `tracker` / `cryptoTracker`, so "today" is in the window. The per-user cadence
+ * decision + empty-period skip + boundary detection all live in the pure
+ * `scheduled-report.ts`; here we only gather each user's combined snapshots +
+ * resolved prefs and hand them off. Emit is fire-and-forget through the
+ * dispatcher (quiet-hours / dedup / channel routing inherited).
+ */
+function runScheduledReportsForAllUsers(now: Date = new Date()): void {
+  const users = (): ReportUser[] =>
+    getAllUserContexts().map((ctx) => ({
+      username: ctx.username,
+      // Combine both books' booked daily ledgers; the aggregator merges rows
+      // that share a date across the two trackers.
+      snapshots: [...ctx.tracker.getSnapshots(), ...ctx.cryptoTracker.getSnapshots()],
+      prefs: resolveAlertPreferences(getSettings(ctx.username)),
+    }));
+  try {
+    runScheduledReports({ users, asOfDate: etDateString(now), now: now.getTime() });
+  } catch (err) {
+    log.error('scheduled reports run failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -7423,6 +7453,16 @@ function sanitizeNotificationPrefs(
     next.signalDigest = patch.signalDigest;
   }
 
+  // TRA-2252 — scheduled P&L report cadence. Whitelisted like every other field
+  // so a bad value can't corrupt the stored snapshot (and so it isn't silently
+  // dropped — this route validates by allow-list, not pass-through).
+  if (patch.reportCadence !== undefined) {
+    if (!['off', 'daily', 'weekly', 'monthly', 'yearly'].includes(patch.reportCadence)) {
+      return { prefs: next, error: 'invalid reportCadence' };
+    }
+    next.reportCadence = patch.reportCadence;
+  }
+
   return { prefs: next };
 }
 
@@ -9950,6 +9990,11 @@ scheduler.start({
   // daily close so the EOD reports are already on disk.
   onArchive: async () => {
     await runDailyCloseForAllUsers();
+    // TRA-2252 — scheduled P&L report emails. Fired AFTER the daily close so
+    // today's snapshot is booked into each user's trackers before the period
+    // window is rolled. Fire-and-forget (no await): the dispatcher isolates and
+    // bounds each send, and a mail failure must never delay the archive tick.
+    runScheduledReportsForAllUsers();
     await generateMarketReview('postmarket').catch(err =>
       log.error('market-review post-market generation failed', {
         reason: err instanceof Error ? err.message : String(err),

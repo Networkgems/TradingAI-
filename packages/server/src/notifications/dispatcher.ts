@@ -25,6 +25,7 @@ import {
   type AlertChannel,
   type AlertEventClass,
   type AlertPreferences,
+  type ReportCadence,
 } from '@trading-app/shared';
 import { logger, type Logger } from '../observability/index.js';
 
@@ -169,13 +170,75 @@ export interface RoutineAlertEvent extends AlertEventBase {
   body: string;
 }
 
+/**
+ * TRA-2252 — one day's contribution to a period report, rolled from the
+ * `DailySnapshot` ledger. `pnl` is the day-only realized total (stock `dailyPnl`
+ * + `optionsDailyPnl`), NOT the cumulative-carrying `combinedPnl` (that leak is
+ * the TRA-1633 BUG 2 the aggregator deliberately avoids).
+ */
+export interface ReportDaySummary {
+  /** ET calendar date, `YYYY-MM-DD`. */
+  date: string;
+  /** Day-only realized P&L across stocks + options + crypto. */
+  pnl: number;
+  /** Closed trades booked that day. */
+  trades: number;
+}
+
+/**
+ * TRA-2252 — the rolled-up statistics a period report renders. Pure aggregate
+ * of the per-day snapshots in the period window; see `scheduled-report.ts`.
+ */
+export interface ReportPeriodStats {
+  /** Σ day-only realized P&L over the window. */
+  totalPnl: number;
+  /** Σ stock realized P&L (`DailySnapshot.dailyPnl`). */
+  stockPnl: number;
+  /** Σ day-only realized options P&L (`DailySnapshot.optionsDailyPnl`). */
+  optionsPnl: number;
+  /** Σ closed trades over the window. */
+  totalTrades: number;
+  /** Days with a booked snapshot in the window. */
+  tradingDays: number;
+  /** Days closing green / red (pnl > 0 / < 0). */
+  winDays: number;
+  lossDays: number;
+  /** Combined book equity at the period's opening / close (Σ across trackers). */
+  startEquity: number;
+  endEquity: number;
+  /** Best / worst single day by combined P&L (absent when the window is empty). */
+  bestDay?: ReportDaySummary;
+  worstDay?: ReportDaySummary;
+}
+
+/**
+ * TRA-2252 — scheduled P&L + trade-summary report. Emitted at a period boundary
+ * (day / ISO-week-ending-Sunday / month-end / Dec 31) by `runScheduledReports`
+ * for each user whose `reportCadence` matches, and dispatched through the same
+ * fan-out pipeline as `briefing`/`routine` so quiet-hours + dedup are inherited.
+ * `cadence` + `periodEnd` scope the per-period dedup key so a redeploy across the
+ * archive window can't double-send.
+ */
+export interface ReportAlertEvent extends AlertEventBase {
+  kind: 'report';
+  cadence: Exclude<ReportCadence, 'off'>;
+  /** Human label, e.g. "Weekly — 2026-07-20 to 2026-07-26". */
+  periodLabel: string;
+  /** ET date the period opened, `YYYY-MM-DD` (inclusive). */
+  periodStart: string;
+  /** ET date the period closed, `YYYY-MM-DD` (inclusive) — scopes the dedup key. */
+  periodEnd: string;
+  stats: ReportPeriodStats;
+}
+
 export type AlertEvent =
   | FillAlertEvent
   | ExitAlertEvent
   | SignalAlertEvent
   | RiskHaltAlertEvent
   | BriefingAlertEvent
-  | RoutineAlertEvent;
+  | RoutineAlertEvent
+  | ReportAlertEvent;
 
 /** A channel adapter rendered the event; shape is owned by A2's renderer. */
 export interface ChannelAdapter {
@@ -423,6 +486,10 @@ export class NotificationDispatcher {
         // One fire per routine per ET day — a restart across the fire minute
         // collapses to the single delivery (matches the runner's own dedup).
         return `routine:${event.username}:${event.routineId}:${event.date}`;
+      case 'report':
+        // One report per user per cadence per period end — a redeploy across the
+        // 21:00 archive window collapses to the single delivery.
+        return `report:${event.username}:${event.cadence}:${event.periodEnd}`;
     }
   }
 

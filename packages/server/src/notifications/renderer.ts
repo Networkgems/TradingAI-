@@ -23,6 +23,8 @@ import type {
   BriefSetup,
   ExitAlertEvent,
   FillAlertEvent,
+  ReportAlertEvent,
+  ReportPeriodStats,
   RiskHaltAlertEvent,
   RoutineAlertEvent,
   SignalAlertEvent,
@@ -30,10 +32,13 @@ import type {
 
 /**
  * Events with their own multi-line render path (briefing's structured digest,
- * routine's pre-rendered title+body); everything else uses the compact
- * single-context path below.
+ * routine's pre-rendered title+body, the report's stats table); everything else
+ * uses the compact single-context path below.
  */
-type SimpleAlertEvent = Exclude<AlertEvent, BriefingAlertEvent | RoutineAlertEvent>;
+type SimpleAlertEvent = Exclude<
+  AlertEvent,
+  BriefingAlertEvent | RoutineAlertEvent | ReportAlertEvent
+>;
 
 export interface RenderedAlert {
   /** Headline incl. status emoji, e.g. "🟢 TradingAI — Position Exited". */
@@ -52,6 +57,12 @@ export interface RenderedAlert {
 function fmtNum(n: number, maxFrac = 2): string {
   if (!Number.isFinite(n)) return String(n);
   return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: maxFrac });
+}
+
+/** Unsigned USD with fixed 2dp, e.g. "$25,000.00". Used for equity levels. */
+function fmtUsd(n: number): string {
+  if (!Number.isFinite(n)) return '$0.00';
+  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 /** Signed USD with fixed 2dp, e.g. "+$84.20" / "-$12.00". */
@@ -178,6 +189,8 @@ export function renderAlert(event: AlertEvent, now: number = Date.now()): Render
   if (event.kind === 'briefing') return renderBriefing(event, event.timestamp ?? now);
   // TRA-851 — a routine carries an already-rendered title + body; just frame it.
   if (event.kind === 'routine') return renderRoutine(event, event.timestamp ?? now);
+  // TRA-2252 — the scheduled P&L report is a stats table, not a single-line alert.
+  if (event.kind === 'report') return renderReport(event, event.timestamp ?? now);
 
   const r = renderBody(event);
   const ts = event.timestamp ?? now;
@@ -361,6 +374,74 @@ function renderBriefing(event: BriefingAlertEvent, ts: number): RenderedAlert {
     section(`Watchlist setups (${event.setups.length})`, setupRows),
     section(`Open positions (${event.positions.length})`, posRows),
     section(`Overnight news (${event.news.length})`, newsRows),
+    `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
+    `</div>`,
+  ].join('');
+
+  return { title, subject, text, html };
+}
+
+// ── TRA-2252 scheduled P&L report rendering ──────────────────────────────────
+
+const CADENCE_TITLE: Record<ReportAlertEvent['cadence'], string> = {
+  daily: 'Daily Report',
+  weekly: 'Weekly Report',
+  monthly: 'Monthly Report',
+  yearly: 'Yearly Report',
+};
+
+/**
+ * TRA-2252 — render the scheduled P&L + trade-summary report into one channel-
+ * agnostic message, matching the dark theme the other alerts use. Pure. The
+ * emoji follows the period's net P&L sign so a losing period reads at a glance;
+ * an empty period never reaches here (the aggregator skips it), so `bestDay`/
+ * `worstDay` are only absent for a genuinely flat-but-active period.
+ */
+function renderReport(event: ReportAlertEvent, ts: number): RenderedAlert {
+  const s: ReportPeriodStats = event.stats;
+  const up = s.totalPnl >= 0;
+  const emoji = up ? '📈' : '📉';
+  const cadenceName = CADENCE_TITLE[event.cadence];
+  const title = `${emoji} TradingAI — ${cadenceName} (${event.periodLabel})`;
+  const subject = `TradingAI — ${cadenceName}: ${fmtSignedUsd(s.totalPnl)} (${event.periodLabel})`;
+
+  // The rows both the text body and the HTML table share, in one place so they
+  // can never drift apart.
+  const rows: Array<[string, string]> = [
+    ['Net P&L', fmtSignedUsd(s.totalPnl)],
+    ['Stocks P&L', fmtSignedUsd(s.stockPnl)],
+    ['Options P&L', fmtSignedUsd(s.optionsPnl)],
+    ['Closed trades', String(s.totalTrades)],
+    ['Trading days', `${s.tradingDays} (${s.winDays} up / ${s.lossDays} down)`],
+    ['Start equity', fmtUsd(s.startEquity)],
+    ['End equity', fmtUsd(s.endEquity)],
+  ];
+  if (s.bestDay) rows.push(['Best day', `${s.bestDay.date}  ${fmtSignedUsd(s.bestDay.pnl)}`]);
+  if (s.worstDay) rows.push(['Worst day', `${s.worstDay.date}  ${fmtSignedUsd(s.worstDay.pnl)}`]);
+
+  const stamp = fmtTimestamp(ts);
+
+  const text = [
+    title,
+    '',
+    ...rows.map(([k, v]) => `${k}: ${v}`),
+    '',
+    stamp,
+  ].join('\n');
+
+  const tableRows = rows
+    .map(
+      ([k, v]) =>
+        `<tr><td style="padding:4px 12px 4px 0;color:#8b949e;font-size:14px;">${esc(k)}</td>` +
+        `<td style="padding:4px 0;color:#c9d1d9;font-size:14px;font-weight:600;">${esc(v)}</td></tr>`,
+    )
+    .join('');
+
+  const html = [
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0d1117;padding:24px;border-radius:8px;max-width:520px;">`,
+    `<div style="font-size:18px;font-weight:600;margin-bottom:4px;">${esc(title)}</div>`,
+    `<div style="color:#8b949e;font-size:13px;margin-bottom:12px;">${esc(`${event.periodStart} → ${event.periodEnd}`)}</div>`,
+    `<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;">${tableRows}</table>`,
     `<div style="color:#484f58;font-size:12px;margin-top:14px;">${esc(stamp)}</div>`,
     `</div>`,
   ].join('');
