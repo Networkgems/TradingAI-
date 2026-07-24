@@ -328,6 +328,33 @@ services:
       # layers OVER env and wins. Accepts 1/true/yes/on.
       - key: ENABLE_OPTION_COST_AWARE_GATE
         value: "1"
+      # TRA-1662 (TRA-1600 A2) — arm the observe-only MAKER-CHASE SHADOW measurement
+      # on the demo option book: re-poll quotes for contracts the book ALREADY opened
+      # and record what a maker chase would have recovered. This is the counterpart to
+      # the cost-aware bar above — TRA-1647 showed both option sleeves are net-negative
+      # at their MEASURED taker cross (TRA-1656), so maker-fill routing (TRA-1601) is
+      # the only thing that can rescue them, and its "60-70% recovery" claim has never
+      # been measured because the chase ladder and its telemetry both shipped OFF.
+      #
+      # SAFETY — OBSERVE-ONLY. It routes no order, sizes nothing, touches no exit, and
+      # reaches no capital; it only reads quotes for already-open demo contracts. Same
+      # board-independent shadow class as ENABLE_OPTION_SHADOW_SELECTOR /
+      # ENABLE_REVERSAL_SHADOW / ENABLE_NEWS_CATALYST_WATCHLIST, each of which is
+      # likewise declared here. Reads out on `GET /api/health/option-maker-recovery`.
+      #
+      # DECLARED RETROACTIVELY (TRA-2222): this arm shipped as a
+      # RENDER_RATIFIED_DEMO_DEFAULTS self-heal entry with no blueprint record, which
+      # the TRA-2209 env-drift check surfaced on its first real run as
+      # `selfHealed[].declared:false`. Declaring it here is a no-op at runtime (the
+      # seed already supplies "1" when env and demo-flags.json both lack it) and makes
+      # the blueprint tell the truth about what the box runs. `demo-flags.test.ts`
+      # now FAILS if any self-heal entry is missing from this file, so the gap cannot
+      # silently reopen. NOTE: blueprint sync != autoDeploy on bqb1 (TRA-1289) — the
+      # self-heal, not this line, is what delivers the value. Daemon-free DISARM:
+      # write `{"ENABLE_OPTION_MAKER_SHADOW":"0"}` via `/api/admin/demo-flags` — the
+      # file layers OVER env and wins. Accepts 1/true/yes/on.
+      - key: ENABLE_OPTION_MAKER_SHADOW
+        value: "1"
       # TRA-967 / TRA-953 (TRA-908 Phase B) — turn OPTIONS PHASE-B PAPER
       # EXECUTION ON. Board-approved (approval c10b717e-294f-4718-8a7c-11a2cd18875f,
       # parallel to the shadow-flag approval 8fb26954 in TRA-942). Until this is

@@ -404,6 +404,18 @@ export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   // no board gate — hence a boot-seed arm rather than an approval. An explicit `=0`
   // in demo-flags.json still layers OVER this seed, so the desk keeps a daemon-free
   // disarm. Reads out on `GET /api/health/option-maker-recovery`.
+  //
+  // TRA-2222 — this entry shipped WITHOUT a render.yaml record, the only one of the
+  // 11 that did, and the TRA-2209 drift check caught it on its first real run
+  // (`selfHealed[].declared:false`). "No board gate" excuses the absence of an
+  // APPROVAL, not the absence of a DECLARATION: every sibling observe-only shadow
+  // flag (ENABLE_OPTION_SHADOW_SELECTOR / ENABLE_REVERSAL_SHADOW /
+  // ENABLE_NEWS_CATALYST_WATCHLIST) is declared in render.yaml too. Ruled DECLARE
+  // rather than de-arm — the map exists to re-deliver a blueprint value across the
+  // TRA-1289 sync gap, and an entry with no blueprint record is an arm with no
+  // declared source of truth. `ENABLE_OPTION_MAKER_SHADOW: "1"` is now in
+  // render.yaml, and the `every self-heal key is declared in render.yaml` test below
+  // enforces criterion (1) for future entries instead of trusting this docstring.
   ENABLE_OPTION_MAKER_SHADOW: '1',
 };
 

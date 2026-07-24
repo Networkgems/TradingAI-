@@ -6,17 +6,21 @@
 // ignored), and the file value wins over the base env.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import {
   loadDemoFlagFile,
   resolveDemoFlagEnv,
   writeDemoFlagFile,
   renderRatifiedDemoDefaults,
   renderInfraDefaults,
+  RENDER_RATIFIED_DEMO_DEFAULTS,
+  RENDER_INFRA_DEFAULTS,
   DEMO_FLAGS_FILENAME,
 } from './demo-flags.js';
+import { classifyBool, parseRenderYamlEnvVars } from './observability/env-drift.js';
 import { isAutonomousDemoLoopEnabled } from './autonomous-demo-loop.js';
 import { resolveDirectionalQualityThresholds } from './ignition-quality-gate.js';
 import { isOptionCostAwareGateEnabled } from './option-cost-gate.js';
@@ -326,4 +330,68 @@ describe('resolveDemoFlagEnv', () => {
     writeFlags({ ENABLE_AUTONOMOUS_DEMO_LOOP: '1' });
     expect(isAutonomousDemoLoopEnabled(resolveDemoFlagEnv(dir, base))).toBe(true);
   });
+});
+
+// TRA-2222 — the self-heal maps' STRICT admission criterion (1), "board-ratified `=1`
+// in render.yaml", enforced instead of asserted.
+//
+// ENABLE_OPTION_MAKER_SHADOW sat in RENDER_RATIFIED_DEMO_DEFAULTS with ZERO
+// render.yaml record for its whole life. Nothing caught it: the docstring states the
+// criterion but only prose held it, and the TRA-2209 drift route can only report
+// `selfHealed[].declared:false` AFTER a deploy reaches bqb1 and someone reads the
+// route. A self-heal entry with no blueprint record is an arm with no declared source
+// of truth — render.yaml is the artifact you read to answer "what is this box supposed
+// to be running", so anything the boot seeds must appear in it.
+//
+// Deliberately keyed off the MAPS, not a literal list of flag names: a hard-coded list
+// self-disarms the moment someone renames or adds a flag, which is the exact failure
+// mode this is meant to survive.
+describe('TRA-2222 every self-healed key is declared in render.yaml', () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const declared = parseRenderYamlEnvVars(readFileSync(join(repoRoot, 'render.yaml'), 'utf8'));
+  const byKey = new Map(declared.declared.map((d) => [d.key, d]));
+
+  // Guard the count that separates: if the parse collapses, EVERY key below reads
+  // "undeclared" and the suite fails loudly — but if it collapsed the OTHER way this
+  // whole describe would be vacuously green, so pin that the parser found values.
+  it('parsed the blueprint at all (else every assertion below is vacuous)', () => {
+    expect(declared.keysParsed).toBeGreaterThan(0);
+    expect(declared.valuesParsed).toBeGreaterThan(0);
+  });
+
+  // The negative control. Everything below asserts membership in `byKey`; this proves
+  // non-membership is reachable, i.e. that the assertions can actually fail.
+  it('reports a key that is genuinely absent from render.yaml as undeclared', () => {
+    expect(byKey.has('ENABLE_A_FLAG_THAT_IS_NOT_IN_THE_BLUEPRINT')).toBe(false);
+  });
+
+  for (const [mapName, map] of [
+    ['RENDER_RATIFIED_DEMO_DEFAULTS', RENDER_RATIFIED_DEMO_DEFAULTS],
+    ['RENDER_INFRA_DEFAULTS', RENDER_INFRA_DEFAULTS],
+  ] as const) {
+    for (const [key, seeded] of Object.entries(map)) {
+      it(`${mapName}.${key} is declared in render.yaml, with the same value`, () => {
+        const entry = byKey.get(key);
+        expect(
+          entry,
+          `${key} is seeded into the boot env by ${mapName} but appears NOWHERE in ` +
+            `render.yaml. Either declare it there (criterion 1) or drop it from the map ` +
+            `and arm it with a single-key Render upsert.`,
+        ).toBeDefined();
+        expect(entry!.kind, `${key} must be a literal \`value:\`, not a dashboard/render ref`).toBe(
+          'literal',
+        );
+
+        // Compare INTENT for boolean-shaped values ("true" and "1" both mean armed),
+        // exact for the numeric tunables. A blueprint declaring `=0` under a seed of
+        // `=1` is worse than no declaration: the record would contradict the runtime.
+        const seededBool = classifyBool(seeded);
+        if (seededBool !== null) {
+          expect(classifyBool(entry!.value!), `${key} declared/seeded disagree`).toBe(seededBool);
+        } else {
+          expect(entry!.value, `${key} declared/seeded disagree`).toBe(seeded);
+        }
+      });
+    }
+  }
 });
