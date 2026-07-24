@@ -613,22 +613,29 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
         ],
         edgeDecay: [
           {
-            strategy: 'single_leg_rv',
+            // TRA-2215 — cohorts are keyed structure::entryArchetype (a bare
+            // structure label is shared by four sleeves), and the calibrated
+            // decision boundary rides along so the EOD can show it.
+            strategy: 'single_leg_rv::rv_band',
             degrading: true,
             baselineExpectancy: 1.2,
             recentExpectancy: -0.3,
             baselineTrades: 8,
             recentTrades: 6,
-            reason: 'Edge turned negative: baseline expectancy +1.20R → recent -0.30R',
+            decayThresholdR: -0.0443,
+            reason:
+              'Edge decaying: recent expectancy -0.3000R over 6 trades is below the 5th-percentile '
+              + 'of 2000 resampled 6-trade windows drawn from its own 8-trade history '
+              + '(threshold -0.0443R, baseline +1.2000R)',
           },
         ],
-        degradingStrategies: ['single_leg_rv'],
+        degradingStrategies: ['single_leg_rv::rv_band'],
       },
       autopilotActions: [
         {
           kind: 'throttle',
           trigger: 'edge_decay',
-          reason: 'Strategy "single_leg_rv" flagged edge-decaying — autopilot throttled risk to 50% and queued for review',
+          reason: 'Strategy "single_leg_rv::rv_band" flagged edge-decaying — autopilot throttled risk to 50% and queued for review',
           throttleMultiplier: 0.5,
         },
       ],

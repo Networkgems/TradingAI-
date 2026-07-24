@@ -81,30 +81,50 @@ export interface EdgeDecayFlag {
   /** baselineTrades / recentTrades used for the comparison. */
   baselineTrades: number;
   recentTrades: number;
+  /**
+   * TRA-2215 — the CALIBRATED decision boundary: the `nullQuantile` empirical
+   * percentile of bootstrapped `recentTrades`-sized window means resampled from
+   * this strategy's own baseline history. `recentExpectancy < decayThresholdR`
+   * is the fire condition. Null when there was not enough history to calibrate.
+   * Surfaced so the boundary is auditable in health/EOD rather than implicit.
+   */
+  decayThresholdR: number | null;
   /** Human-readable explanation surfaced in health + EOD. */
   reason: string;
 }
 
 export interface IntrospectionOptions {
   /**
-   * Recent-window size (most-recent N closed trades per strategy) compared
-   * against the trades before it as the baseline. Default 10.
+   * Recent-window size (most-recent N closed trades per strategy), compared
+   * against a threshold resampled from the trades before it. Default 30.
+   *
+   * TRA-2215 — was 10. At n=10 the mean of a realized-R window carries a
+   * standard error of 0.085R–0.221R against a population mean of ~0.03R–0.04R,
+   * so a 10-trade window says nothing about decay at any threshold.
    */
   recentWindow?: number;
-  /** Minimum trades in EACH window before edge-decay can fire. Default 5. */
+  /** Minimum trades in EACH window before edge-decay can fire. Default 30. */
   minWindowTrades?: number;
   /**
-   * Fraction of baseline expectancy the recent window must fall below to flag
-   * decay (only when baseline was positive). Default 0.5 (recent < half of
-   * baseline). Also flags when a positive baseline turns recent-negative.
+   * TRA-2215 — bootstrap resamples used to build the null distribution of
+   * window means. Default 2000 (SE of the 5th percentile ≈ 0.5% of the draw
+   * count; cost is ~`nullDraws * recentWindow` adds per strategy, sub-ms).
    */
-  decayDropFraction?: number;
+  nullDraws?: number;
+  /**
+   * Left-tail probability of the null distribution below which the recent
+   * window is called decay. Default 0.05 — i.e. the detector is calibrated to
+   * fire on ~5% of no-decay data, which is the property the regression test
+   * asserts. This is the ONLY tuning knob, and it means what it says.
+   */
+  nullQuantile?: number;
 }
 
 const DEFAULT_INTROSPECTION_OPTS: Required<IntrospectionOptions> = {
-  recentWindow: 10,
-  minWindowTrades: 5,
-  decayDropFraction: 0.5,
+  recentWindow: 30,
+  minWindowTrades: 30,
+  nullDraws: 2000,
+  nullQuantile: 0.05,
 };
 
 /** The whole self-awareness readout. */
@@ -149,9 +169,82 @@ export function computePerformanceStats(rows: StrategyTradeRow[]): PerformanceSt
 }
 
 /**
+ * Deterministic PRNG (mulberry32). The bootstrap below must be reproducible —
+ * this module's contract is that the readout is a PURE function of its rows, and
+ * a `Math.random` bootstrap would make the same journal yield a different risk
+ * throttle on every tick. Seeded from the data, so identical rows ⇒ identical
+ * verdict, and two strategies never share a draw sequence.
+ */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** FNV-1a over the strategy key — a stable seed that varies across strategies. */
+function seedFor(strategy: string, poolSize: number): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < strategy.length; i++) {
+    h ^= strategy.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h ^ poolSize) >>> 0;
+}
+
+/**
+ * TRA-2215 — the calibrated decision boundary.
+ *
+ * Draws `draws` bootstrap windows of `windowSize` trades (with replacement) from
+ * `pool` and returns the `q` empirical quantile of their means. Under the null
+ * "nothing has changed", a recent window IS such a draw, so the recent mean falls
+ * below this boundary with probability exactly `q` — which is what makes the
+ * false-positive rate a designed property rather than a hope.
+ *
+ * A parametric t-test was measured and REJECTED for this job: realized R is
+ * fat-tailed and skewed enough that the normal approximation over-fires at
+ * 10.5%–20.4% against a nominal 5%, and by a DIFFERENT amount per structure.
+ * Being mis-calibrated by a varying amount is worse than being wrong by a
+ * constant, because it cannot be corrected downstream. Only the resample is
+ * calibrated across both structures.
+ */
+function bootstrapWindowMeanQuantile(
+  pool: number[],
+  windowSize: number,
+  draws: number,
+  q: number,
+  seed: number,
+): number {
+  const rand = mulberry32(seed);
+  const means = new Float64Array(draws);
+  for (let d = 0; d < draws; d++) {
+    let sum = 0;
+    for (let i = 0; i < windowSize; i++) sum += pool[(rand() * pool.length) | 0]!;
+    means[d] = sum / windowSize;
+  }
+  means.sort(); // TypedArray#sort is numeric-ascending, no comparator needed.
+  const idx = Math.min(draws - 1, Math.max(0, Math.floor(q * draws)));
+  return means[idx]!;
+}
+
+/**
  * PURE — the edge-decay verdict for one strategy's chronologically-sorted rows.
- * Splits off the most-recent `recentWindow` trades as the recent window and the
- * trades immediately before it (same size, capped by availability) as baseline.
+ *
+ * The most-recent `recentWindow` trades are the RECENT window. Everything before
+ * it is the BASELINE — note that this is ALL prior history, not a same-sized
+ * window (the JSDoc claimed same-sized through TRA-2215; the code never did it).
+ * All of it is the right population here: baseline is used only to estimate the
+ * null distribution of window means, and more history means a tighter estimate.
+ *
+ * Decay fires iff the recent window's mean R falls below the `nullQuantile`
+ * percentile of that resampled null. The previous rule — "recent < 0, or recent
+ * < half of baseline" — was a hand-picked constant that sat 0.10–0.17 of ONE
+ * standard error from the baseline it compared against, and measured a 50.3% /
+ * 64.3% false-positive rate on shuffled live rows. See the shuffled-null
+ * regression test, which fails on that rule and is the reason this one exists.
  */
 export function detectEdgeDecay(
   strategy: string,
@@ -169,25 +262,36 @@ export function detectEdgeDecay(
     recent.length >= opts.minWindowTrades && baseline.length >= opts.minWindowTrades;
 
   let degrading = false;
-  let reason = 'Not enough trades in both windows to judge edge decay';
+  let decayThresholdR: number | null = null;
+  let reason =
+    `Not enough trades to judge edge decay (recent ${recent.length}, baseline ${baseline.length}; `
+    + `need ${opts.minWindowTrades} in each)`;
 
   if (enough && baselineStats.expectancy !== null && recentStats.expectancy !== null) {
     const base = baselineStats.expectancy;
     const rec = recentStats.expectancy;
     if (base > 0) {
-      // A positive edge that has either gone negative or fallen below the
-      // configured fraction of its former self is decaying.
-      if (rec < 0) {
+      decayThresholdR = bootstrapWindowMeanQuantile(
+        baseline.map((r) => r.realizedR),
+        recent.length,
+        opts.nullDraws,
+        opts.nullQuantile,
+        seedFor(strategy, baseline.length),
+      );
+      const pct = (opts.nullQuantile * 100).toFixed(0);
+      if (rec < decayThresholdR) {
         degrading = true;
-        reason = `Edge turned negative: baseline expectancy +${base.toFixed(2)}R → recent ${rec.toFixed(2)}R`;
-      } else if (rec < base * opts.decayDropFraction) {
-        degrading = true;
-        reason = `Edge eroding: recent expectancy ${rec.toFixed(2)}R is below ${(opts.decayDropFraction * 100).toFixed(0)}% of baseline +${base.toFixed(2)}R`;
+        reason =
+          `Edge decaying: recent expectancy ${rec.toFixed(4)}R over ${recent.length} trades is below the `
+          + `${pct}th-percentile of ${opts.nullDraws} resampled ${recent.length}-trade windows drawn from its own `
+          + `${baseline.length}-trade history (threshold ${decayThresholdR.toFixed(4)}R, baseline +${base.toFixed(4)}R)`;
       } else {
-        reason = `Edge intact: recent ${rec.toFixed(2)}R vs baseline +${base.toFixed(2)}R`;
+        reason =
+          `Edge intact: recent ${rec.toFixed(4)}R over ${recent.length} trades is at or above the calibrated `
+          + `${pct}th-percentile floor ${decayThresholdR.toFixed(4)}R (baseline +${base.toFixed(4)}R over ${baseline.length})`;
       }
     } else {
-      reason = `Baseline expectancy non-positive (${base.toFixed(2)}R) — nothing to decay from`;
+      reason = `Baseline expectancy non-positive (${base.toFixed(4)}R) — nothing to decay from`;
     }
   }
 
@@ -198,6 +302,7 @@ export function detectEdgeDecay(
     recentExpectancy: recentStats.expectancy,
     baselineTrades: baseline.length,
     recentTrades: recent.length,
+    decayThresholdR,
     reason,
   };
 }
@@ -248,10 +353,17 @@ export function computeStrategyIntrospection(
 }
 
 /**
- * Adapter — map closed option-trade journal records into generic strategy rows
- * keyed by structure (the option "strategy"), carrying the entry trend as the
- * regime proxy (the journal records trend, not the full regime label). Open rows
- * are dropped; only resolved (closed) trades attribute.
+ * Adapter — map closed option-trade journal records into generic strategy rows,
+ * carrying the entry trend as the regime proxy (the journal records trend, not
+ * the full regime label). Open rows are dropped; only resolved (closed) trades
+ * attribute.
+ *
+ * TRA-2215 / TRA-2193b — rows are keyed `structure::entryArchetype`, NOT by the
+ * bare structure. `structure` is a STRUCTURE LABEL, not a sleeve: four different
+ * sleeves share `single_leg_rv`. Keyed on the bare label, one spurious decay flag
+ * throttled all four sleeves at once, while a real decay in one sleeve was
+ * diluted by the three healthy ones. This is the same cohort key the TRA-1691
+ * delta rollup already uses, so the two folds now name cohorts identically.
  */
 export function optionJournalToStrategyRows(
   records: OptionTradeJournalRecord[],
@@ -271,7 +383,7 @@ export function optionJournalToStrategyRows(
   return records
     .filter((r) => r.outcome !== 'OPEN' && r.closeTs != null)
     .map((r) => ({
-      strategy: r.structure,
+      strategy: `${r.structure}::${r.entryArchetype ?? 'unspecified'}`,
       closeTs: r.closeTs as number,
       realizedPnlUsd: r.realizedPnlUsd ?? 0,
       realizedR: r.realizedR ?? 0,
