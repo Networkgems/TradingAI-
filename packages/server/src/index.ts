@@ -474,7 +474,16 @@ import {
   shortStrategyFor,
   summarizeSandboxStrategyJournal,
   hydrateSandboxStrategyJournalFromDisk,
+  getSandboxStrategyRecords,
 } from './sandbox-strategy-journal.js';
+import {
+  summarizeParityReconcile,
+  hydrateParityReconcileFromDisk,
+  appendParitySnapshotForDay,
+  getParityReconcileSeries,
+  parityReconcileDurability,
+  PARITY_SCOPE,
+} from './parity-reconcile.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
 import {
@@ -2581,6 +2590,22 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     log.info('sandbox strategy journal hydrated (TRA-2134)', {
       records: h.records,
       strategies: h.strategies,
+    });
+  }
+}
+
+// TRA-2237 — rebuild the DURABLE parity-reconcile daily series (demo-mid vs sandbox-fill
+// P&L gap per strategy) and remember DATA_DIR for subsequent snapshot appends. Same
+// durability contract as the sandbox journal it folds from (TRA-2134): the series must
+// survive bqb1's daily reboot so QuantTrader can grade the gap across weeks; a post-boot
+// read of /api/health/parity-reconcile recovers it (provided DATA_DIR is a persistent
+// mount — else the payload's `durability.ephemeral` says so). Compacted to 60 days.
+{
+  const h = hydrateParityReconcileFromDisk(DATA_DIR);
+  if (h.snapshots > 0) {
+    log.info('parity-reconcile daily series hydrated (TRA-2237)', {
+      snapshots: h.snapshots,
+      days: h.days,
     });
   }
 }
@@ -9399,11 +9424,35 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
 // a `durability.ephemeral` flag so a reader can tell a real /data mount from the
 // in-bundle fallback that evaporates on redeploy. Observe-only; never places an order.
 app.get('/api/health/sandbox-strategy-journal', (_req, res) => {
+  // TRA-2237 — the runner routine `d8ec9395` reads THIS route every weekday; piggy-back
+  // the parity-reconcile daily snapshot on that existing cadence (idempotent per ET day,
+  // best-effort) so the parity series self-accrues without a new cron.
+  appendParitySnapshotForDay(getSandboxStrategyRecords());
   res.status(200).json({
     ...summarizeSandboxStrategyJournal(),
     scope: 'SANDBOX ONLY (acct VA20296703), $0 real notional — TRA-1897 HOLD POSTURE unaffected.',
     fillRealism: FILL_REALISM,
     fillRealismNote: FILL_REALISM_NOTE,
+    ts: new Date().toISOString(),
+  });
+});
+
+// TRA-2237 — no-auth read of the parity-reconcile monitor: per-strategy demo-mark-vs-
+// sandbox-fill P&L gap folded from each sandbox round-trip's OWN mid-vs-fill (TRA-2134
+// legs), plus the durable daily series. The read SELF-ACCRUES today's snapshot the first
+// time it fires for a new ET day (the runner routine `d8ec9395` reads this every weekday,
+// so no new cron). Reads ONLY the sandbox journal — NEVER pooled with demo
+// option-trade-journal rows. `fillRealism:'SANDBOX_SIMULATED'` rides the payload so no
+// reader mistakes a broker-simulated gap for a live-execution number; observe-only under
+// the TRA-1897 hold — gates/arms/graduates nothing.
+app.get('/api/health/parity-reconcile', (_req, res) => {
+  const records = getSandboxStrategyRecords();
+  appendParitySnapshotForDay(records); // idempotent per ET day — self-accrues the series
+  res.status(200).json({
+    ...summarizeParityReconcile(records),
+    dailySeries: getParityReconcileSeries(),
+    durability: parityReconcileDurability(),
+    scope: PARITY_SCOPE,
     ts: new Date().toISOString(),
   });
 });

@@ -179,6 +179,16 @@ export function sandboxStrategyLogPath(dir: string): string {
   return join(dir, SANDBOX_STRATEGY_LOG_FILENAME);
 }
 
+/**
+ * Read-only view of the in-memory series (append + hydrate order = chronological).
+ * TRA-2237's parity-reconcile monitor folds these SAME records into a demo-mark-vs-
+ * sandbox-fill P&L-gap observable — it reads the journal, never a new order stream.
+ * Returned as `readonly` so a consumer cannot mutate the live store.
+ */
+export function getSandboxStrategyRecords(): readonly SandboxStrategyRecord[] {
+  return records;
+}
+
 /** Test seam — drop every counter and the configured dir. */
 export function clearSandboxStrategyJournal(): void {
   dataDir = null;
