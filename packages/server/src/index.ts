@@ -400,7 +400,7 @@ import {
   disableTwoFactor,
   consumeBackupCode,
 } from './users.js';
-import { sendPasswordResetEmail, sendOtpEmail } from './email.js';
+import { sendPasswordResetEmail, sendOtpEmail, sendWelcomeEmail } from './email.js';
 import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
 import {
   logger,
@@ -4919,6 +4919,14 @@ app.post('/api/auth/signup', async (req, res) => {
   // TRA-142 — spin up the new user's per-user context (fresh equity, empty
   // trade history, default settings) so their engine starts ticking right away.
   await provisionUser(username.trim());
+  // TRA-2251 — welcome email, best-effort. Fire-and-forget: a mail failure (or
+  // unconfigured SMTP) must never block account creation, so we do not await it
+  // and swallow any rejection into the log.
+  void sendWelcomeEmail(email.trim(), username.trim()).catch((err) => {
+    log.error('auth: failed to send welcome email', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  });
   res.json({ token: createToken(username.trim()) });
 });
 

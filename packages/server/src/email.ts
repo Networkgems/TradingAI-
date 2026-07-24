@@ -213,6 +213,89 @@ export async function sendOtpEmail(
   await transport.sendMail({ from: SMTP_FROM, to: toEmail, subject, text, html });
 }
 
+function buildWelcomeEmail(username: string): { subject: string; text: string; html: string } {
+  const subject = 'Welcome to TradingAI';
+  const appLink = APP_URL || null;
+
+  const text = [
+    `Hi ${username},`,
+    '',
+    'Your TradingAI account is ready. You now have access to your personal',
+    'trading dashboard with live signals, P&L tracking, and daily briefings.',
+    '',
+    appLink ? `Sign in here:\n${appLink}` : 'Sign in to get started.',
+    '',
+    'A few things worth doing first:',
+    '  • Turn on two-factor authentication for your login (Settings → Security).',
+    '  • Choose your alert channels — email, Telegram, or Discord (Settings → Notifications).',
+    '  • Set your P&L report cadence (daily / weekly / monthly / yearly).',
+    '',
+    'If you did not create this account, please contact support immediately.',
+    '',
+    '— TradingAI',
+  ].join('\n');
+
+  const ctaBlock = appLink
+    ? `<p style="text-align:center;margin:24px 0;">
+        <a href="${appLink}" style="background:#3fb950;color:#0d1117;text-decoration:none;padding:12px 28px;border-radius:6px;font-weight:600;font-size:16px;display:inline-block;">
+          Open TradingAI
+        </a>
+       </p>`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0d1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0d1117;padding:40px 20px;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:40px;">
+        <tr><td>
+          <h1 style="color:#c9d1d9;font-size:24px;font-weight:600;margin:0 0 8px;">TradingAI</h1>
+          <p style="color:#8b949e;font-size:14px;margin:0 0 32px;">Welcome aboard</p>
+          <p style="color:#c9d1d9;font-size:15px;margin:0 0 16px;">Hi <strong>${username}</strong>,</p>
+          <p style="color:#c9d1d9;font-size:15px;margin:0 0 24px;">
+            Your account is ready. You now have access to live signals, P&amp;L tracking, and daily briefings.
+          </p>
+          ${ctaBlock}
+          <p style="color:#c9d1d9;font-size:14px;margin:24px 0 8px;">A few things worth doing first:</p>
+          <ul style="color:#8b949e;font-size:14px;margin:0 0 8px;padding-left:20px;line-height:1.7;">
+            <li>Turn on two-factor authentication (Settings &rarr; Security).</li>
+            <li>Choose your alert channels &mdash; email, Telegram, or Discord.</li>
+            <li>Set your P&amp;L report cadence (daily / weekly / monthly / yearly).</li>
+          </ul>
+          <p style="color:#8b949e;font-size:13px;margin:24px 0 0;">
+            If you did not create this account, please contact support immediately.
+          </p>
+        </td></tr>
+      </table>
+      <p style="color:#484f58;font-size:12px;margin-top:20px;">© ${new Date().getFullYear()} TradingAI. All rights reserved.</p>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+  return { subject, text, html };
+}
+
+/**
+ * TRA-2251 — send a welcome email to a newly-created account. Best-effort:
+ * mirrors the reset/OTP fallback (console, not the structured logger) when SMTP
+ * is unconfigured so local signups still complete. The caller invokes this
+ * fire-and-forget so a mail failure never blocks account creation.
+ */
+export async function sendWelcomeEmail(toEmail: string, username: string): Promise<void> {
+  const transport = getTransport();
+  const { subject, text, html } = buildWelcomeEmail(username);
+
+  if (!transport) {
+    console.log(`[email] Welcome email for ${username} <${toEmail}> — no SMTP configured.`);
+    return;
+  }
+
+  await transport.sendMail({ from: SMTP_FROM, to: toEmail, subject, text, html });
+}
+
 /**
  * TRA-406 — send an operational alert email to the addresses in `ALERT_EMAIL`
  * (comma-separated). No-ops cleanly when SMTP or `ALERT_EMAIL` is unconfigured
