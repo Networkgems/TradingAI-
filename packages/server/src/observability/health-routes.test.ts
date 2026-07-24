@@ -44,6 +44,10 @@ import {
 } from '../scaleout-ladder-ledger.js';
 import { clearEntryGreeksLedger, recordEntryGreeksVerdict } from '../entry-greeks-ledger.js';
 import {
+  clearGiveBackArmFloorLedger,
+  recordGiveBackState,
+} from '../giveback-arm-floor-ledger.js'; // TRA-2220
+import {
   beginEquityEntryPass,
   recordEquityEntryPassGated,
   recordEquityCandidate,
@@ -2382,5 +2386,104 @@ describe('TRA-2193 option-journal rows=open / rows=all', () => {
     );
     expect(report.rows?.map((r) => r.id).sort()).toEqual(['o1', 'o2']);
     expect(report.rowsFiltered).toBe(true);
+  });
+});
+
+// TRA-2220 (parent TRA-2195 → TRA-2193) — the give-back arm-floor route could not report
+// its OWN blindness. `recordGiveBackState` is called from inside the
+// `EXIT_RISK_RULES_ENABLED` master gate, so the master going down does not zero the
+// counters — it FREEZES them, and a frozen `giveback_halt_sub_floor: 0` is byte-identical
+// to "22 sessions observed, none breached the floor". bqb1 served exactly that, with
+// `ok: true`, across 2026-07-22 and 07-23 while TRA-1592's recorded reopen tripwire
+// ("giveback_halt_sub_floor > 0") sat structurally unable to fire.
+//
+// These pin the HTTP surface, not just the fold: what a grader actually curls.
+describe('TRA-2220 giveback-arm-floor route — darkness is a first-class verdict', () => {
+  // 2026-07-24T00:55Z = Thu 2026-07-23 20:55 ET, after the cash close. The exact wall
+  // clock of the live observation in the ticket.
+  const GB_NOW = Date.UTC(2026, 6, 24, 0, 55);
+
+  /** Serve the route with the clock pinned to the observation, and return the body. */
+  function readRoute(): Record<string, unknown> {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => GB_NOW,
+    });
+    const handlers = routes.get('/api/health/giveback-arm-floor')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other rule probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as Record<string, unknown>;
+  }
+
+  /** The live bqb1 shape: a clean run through Tue 07-21, then two empty trading days. */
+  beforeEach(() => {
+    clearGiveBackArmFloorLedger();
+    delete process.env.EXIT_RISK_RULES_ENABLED;
+    const s = {
+      peakPnl: 100,
+      currentPnl: 90,
+      retainedFloor: 60,
+      giveBackArmFloor: 25,
+      giveBackCapPct: 0.4,
+      armFloorCleared: true,
+      haltLatched: false,
+      haltReason: null,
+    } as const;
+    recordGiveBackState('demo', 'engine-1', '2026-07-20', s, 1_001);
+    recordGiveBackState('demo', 'engine-1', '2026-07-21', s, 1_002);
+  });
+
+  afterEach(() => {
+    clearGiveBackArmFloorLedger();
+    delete process.env.EXIT_RISK_RULES_ENABLED;
+  });
+
+  it('reports ok:FALSE and a null tripwire while the recorder is dark', () => {
+    const body = readRoute(); // no EXIT_RISK_RULES_ENABLED in the env ⇒ the writer is gated off
+    expect(body.ok).toBe(false); // was unconditionally `true` — the bug
+    const rec = body.recorder as Record<string, unknown>;
+    expect(rec.state).toBe('dark');
+    expect(rec.armed).toBe(false);
+    expect(rec.lastRecordedSessionDate).toBe('2026-07-21');
+    expect(rec.missingTradingDays).toEqual(['2026-07-22', '2026-07-23']);
+
+    // `0` is never "not measured" (TRA-1707). The raw count survives alongside it, so
+    // the nulling costs no information — only the authority to read it as a measurement.
+    expect(body.invalidations).toBeNull();
+    expect((body.verdictCounts as Record<string, unknown>).giveback_halt_sub_floor).toBeNull();
+    expect(body.invalidationsRecorded).toBe(0);
+    expect(body.verdictCountsTotal).toBe(2);
+    expect(String(body.note)).toContain('DARK');
+  });
+
+  it('THE DISCRIMINATOR — dark and armed readouts of the SAME rows differ', () => {
+    const dark = readRoute();
+    process.env.EXIT_RISK_RULES_ENABLED = '1';
+    const armed = readRoute();
+
+    // Identical underlying fold...
+    expect(armed.sessionsObserved).toBe(dark.sessionsObserved);
+    expect(armed.sessions).toEqual(dark.sessions);
+    // ...and yet a grader can tell them apart. If these ever serialize the same, the
+    // route is blind again and this test is the thing that says so.
+    expect(JSON.stringify(armed)).not.toBe(JSON.stringify(dark));
+    expect((armed.recorder as Record<string, unknown>).state).toBe('armed_but_stale');
+    expect(armed.invalidations).toBe(0); // a real measurement now, not a frozen artifact
+    expect(dark.invalidations).toBeNull();
+  });
+
+  it('stays ok:FALSE when armed but frozen — a ceiling-only check would pass here', () => {
+    process.env.EXIT_RISK_RULES_ENABLED = '1';
+    const body = readRoute();
+    // `invalidations <= 0` holds, every bucket looks healthy, n is unchanged... and the
+    // recorder has written nothing for two completed trading days. THAT is the signal.
+    expect(body.invalidations).toBe(0);
+    expect(body.ok).toBe(false);
+    expect((body.recorder as Record<string, unknown>).staleTradingDays).toBe(2);
+    expect(String(body.note)).toContain('STALE');
   });
 });
