@@ -29,6 +29,19 @@
 //      read 0. BOTH are emitted, and BOTH must be > 0 for `parserOk`.
 //      cf. TRA-1729: a count derived from the OUTPUT is not a count of the INPUT.
 //
+// ── TRA-2224: AN EXEMPTION IS NOT A COMPARISON ──────────────────────────────
+// The first cut exempted self-healed keys from the drift buckets — correct, they
+// are not wipe casualties — but in doing so it stopped COMPARING them at all.
+// `selfHealed` then reported a key as a known, benign fragility no matter what
+// value the process was running, and six of the ten keys bqb1 self-heals are
+// numeric tunables whose maps promise to "match render.yaml exactly".
+//
+// Absence from every drift bucket is a PASS only if the key was actually
+// compared. Self-healed literals are now agreement-checked against the blueprint
+// (`selfHealed[].matchesDeclared`) and a disagreement counts into `driftCount`
+// via `selfHealedMismatchCount`. Both paths share ONE comparator
+// (`compareDeclaredToRunning`) so they cannot answer the same question two ways.
+//
 // ── NO VALUES, EVER ─────────────────────────────────────────────────────────
 // These keys live in the same store as TRADIER_API_TOKEN / AUTH_SECRET. This
 // surface is NO-AUTH. It therefore emits KEY NAMES AND STATE LABELS ONLY —
@@ -90,6 +103,22 @@ export interface SelfHealedEntry {
   source: string;
   /** Whether render.yaml also declares it (it should — that is the map's contract). */
   declared: boolean;
+  /**
+   * TRA-2224 — does the value the process is actually RUNNING agree with the one
+   * render.yaml declares? `null` when the blueprint declares no literal to compare
+   * against (undeclared, `sync: false`, or Render-managed).
+   *
+   * WHY THIS FIELD EXISTS: exempting a seeded key from the drift buckets was
+   * correct, but the first cut exempted it from being COMPARED AT ALL. Six of the
+   * ten keys bqb1 self-heals are NUMERIC tunables (thresholds, caps, confirm-bars),
+   * and the maps' own contract is to "make the RUNNING gate match render.yaml
+   * exactly". Nothing enforced that. A map constant edited out of step with the
+   * blueprint — or a blueprint retuned without the map — would leave the process on
+   * a number the blueprint does not declare, and the route would report the key
+   * under `selfHealed`, which reads as a KNOWN, BENIGN fragility. Absence from
+   * every drift bucket is a PASS only if the key was actually compared.
+   */
+  matchesDeclared: boolean | null;
 }
 
 export interface EnvDriftReport {
@@ -105,8 +134,25 @@ export interface EnvDriftReport {
   declaredValuesParsed: number;
   declaredDashboardManaged: number;
   declaredRenderManaged: number;
-  /** Literal-declared keys actually compared (declaredValuesParsed minus self-healed). */
+  /**
+   * Literal-declared keys compared through the DRIFT BUCKETS (declaredValuesParsed
+   * minus self-healed). Self-healed literals are compared too, but for agreement
+   * only — see {@link EnvDriftReport.selfHealedMismatchCount}.
+   */
   comparedKeys: number;
+  /**
+   * TRA-2224 — self-healed keys whose RUNNING value contradicts the render.yaml
+   * literal (`selfHealed[].matchesDeclared === false`). Counted into `driftCount`
+   * but deliberately NOT folded into the three buckets: the failure is "code
+   * fallback and blueprint disagree", not "the store was wiped", and conflating
+   * them would misdirect the fix.
+   */
+  selfHealedMismatchCount: number;
+  /**
+   * Total divergences = the three buckets PLUS `selfHealedMismatchCount`. It is
+   * therefore NOT always the sum of the three array lengths — check the count
+   * field too before reading a short bucket list as "nothing else wrong".
+   */
   driftCount: number;
   /** Declared truthy, running falsy or absent. The TRA-2136 wipe signature. */
   declaredOnButOff: EnvDriftEntry[];
@@ -202,6 +248,43 @@ function unquote(raw: string): string {
     }
   }
   return v;
+}
+
+/** Result of comparing one declared literal against the running process. */
+interface Agreement {
+  /** True ⇒ the running process honours the declaration. */
+  agrees: boolean;
+  /** Label for the running side; carries no value (see NO VALUES, EVER). */
+  runningState: EnvState;
+}
+
+/**
+ * THE ONE COMPARATOR. Both the drift buckets and the self-healed agreement check
+ * route through this, so the two accounts cannot answer the same question
+ * differently — a second, hand-rolled comparator for the self-heal path was the
+ * obvious way to write TRA-2224's fix and the obvious way to reintroduce its bug.
+ *
+ * Boolean-shaped declarations compare INTENT ("true" == "1"); anything else is an
+ * exact string compare after unquoting. Note the asymmetry, which is deliberate and
+ * matches the pre-TRA-2224 behaviour exactly: an ABSENT key contradicts a declared
+ * ON and a declared literal, but satisfies a declared OFF — absent and off are the
+ * same posture for a boolean, and flagging them apart would fire on every flag the
+ * blueprint deliberately leaves unset.
+ */
+function compareDeclaredToRunning(declaredValue: string, rawRunning: string | undefined): Agreement {
+  const runningPresent = typeof rawRunning === 'string' && rawRunning.trim() !== '';
+  const declaredBool = classifyBool(declaredValue);
+
+  if (declaredBool !== null) {
+    const armed = runningPresent && classifyBool(rawRunning!) === true;
+    return {
+      agrees: declaredBool === armed,
+      runningState: runningPresent ? (armed ? 'on' : 'off') : 'absent',
+    };
+  }
+
+  if (!runningPresent) return { agrees: false, runningState: 'absent' };
+  return { agrees: unquote(rawRunning!) === declaredValue, runningState: 'set' };
 }
 
 const ENVVARS_RE = /^(\s*)envVars:\s*$/;
@@ -313,6 +396,7 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
       declaredDashboardManaged: 0,
       declaredRenderManaged: 0,
       comparedKeys: 0,
+      selfHealedMismatchCount: 0,
       driftCount: 0,
       declaredOnButOff: [],
       declaredOffButOn: [],
@@ -332,10 +416,28 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
   const selfHealed: SelfHealedEntry[] = [];
 
   const declaredKeys = new Set(parsed.declared.map((d) => d.key));
+  // Literals only — a `sync: false` / Render-managed entry declares no value to
+  // compare against, so its agreement is `null`, never a fabricated `true`.
+  const declaredLiterals = new Map(
+    parsed.declared
+      .filter((d) => d.kind === 'literal' && d.value !== undefined)
+      .map((d) => [d.key, d.value!] as const),
+  );
+
   for (const [key, source] of Object.entries(opts.seededKeys)) {
-    selfHealed.push({ key, source, declared: declaredKeys.has(key) });
+    const declaredValue = declaredLiterals.get(key);
+    // TRA-2224 — compare against the value the process is RUNNING, not against the
+    // self-heal map constant. If anything mutated the key after the boot seed, the
+    // running value is the one that governs behaviour and the only one worth
+    // grading; reading the map back would just assert the map equals itself.
+    const matchesDeclared =
+      declaredValue === undefined
+        ? null
+        : compareDeclaredToRunning(declaredValue, opts.runningEnv[key]).agrees;
+    selfHealed.push({ key, source, declared: declaredKeys.has(key), matchesDeclared });
   }
   selfHealed.sort((a, b) => a.key.localeCompare(b.key));
+  const selfHealedMismatchCount = selfHealed.filter((s) => s.matchesDeclared === false).length;
 
   let comparedKeys = 0;
   for (const entry of parsed.declared) {
@@ -348,36 +450,28 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
 
     comparedKeys += 1;
 
-    const rawRunning = opts.runningEnv[entry.key];
-    const runningPresent = typeof rawRunning === 'string' && rawRunning.trim() !== '';
+    const cmp = compareDeclaredToRunning(entry.value, opts.runningEnv[entry.key]);
+    if (cmp.agrees) continue;
+
+    // Boolean-shaped declarations sort into the on/off buckets (the TRA-2136 wipe
+    // signature); everything else — versions, paths, numeric tunables — is a value
+    // mismatch. Same verdict either way, different bucket, because the two point at
+    // different fixes.
     const declaredBool = classifyBool(entry.value);
-
-    if (declaredBool !== null) {
-      // Boolean-shaped: compare INTENT, not spelling. render.yaml says "true"
-      // where a self-heal map says '1'; both mean armed and neither is drift.
-      const runningBool = runningPresent ? classifyBool(rawRunning!) : false;
-      if (declaredBool && runningBool !== true) {
-        declaredOnButOff.push({
-          key: entry.key,
-          declared: 'on',
-          running: runningPresent ? 'off' : 'absent',
-        });
-      } else if (!declaredBool && runningBool === true) {
-        declaredOffButOn.push({ key: entry.key, declared: 'off', running: 'on' });
-      }
-      continue;
-    }
-
-    // Non-boolean literal (versions, paths, numeric tunables): exact compare
-    // after unquoting. Absent counts as a mismatch, flagged as such.
-    if (!runningPresent) {
-      valueMismatch.push({ key: entry.key, declared: 'set', running: 'absent' });
-    } else if (unquote(rawRunning!) !== entry.value) {
-      valueMismatch.push({ key: entry.key, declared: 'set', running: 'set' });
+    if (declaredBool === true) {
+      declaredOnButOff.push({ key: entry.key, declared: 'on', running: cmp.runningState });
+    } else if (declaredBool === false) {
+      declaredOffButOn.push({ key: entry.key, declared: 'off', running: 'on' });
+    } else {
+      valueMismatch.push({ key: entry.key, declared: 'set', running: cmp.runningState });
     }
   }
 
-  const driftCount = declaredOnButOff.length + declaredOffButOn.length + valueMismatch.length;
+  const driftCount =
+    declaredOnButOff.length +
+    declaredOffButOn.length +
+    valueMismatch.length +
+    selfHealedMismatchCount;
 
   // THE INPUT-SIDE GUARD. `declaredKeysParsed > 0` alone is NOT sufficient: the
   // original CRLF bug parsed 78 keys and 0 values and printed a clean box. The
@@ -392,6 +486,10 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
         : `parser matched ${parsed.keysParsed} keys but 0 literal values — BROKEN parse (CRLF-class bug), driftCount:0 is meaningless`;
   } else if (driftCount > 0) {
     reason = `${driftCount} declared env key(s) diverge from the running process`;
+    if (selfHealedMismatchCount > 0) {
+      // Name this separately: it is the one drift class NOT fixed by an env upsert.
+      reason += ` (${selfHealedMismatchCount} of them self-healed to a value render.yaml does not declare — reconcile the code fallback map, not the store)`;
+    }
   }
 
   return {
@@ -403,6 +501,7 @@ export function evaluateEnvDrift(opts: EvaluateEnvDriftOptions): EnvDriftReport 
     declaredDashboardManaged: parsed.dashboardManaged,
     declaredRenderManaged: parsed.renderManaged,
     comparedKeys,
+    selfHealedMismatchCount,
     driftCount,
     declaredOnButOff,
     declaredOffButOn,

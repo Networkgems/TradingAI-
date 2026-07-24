@@ -20,7 +20,7 @@ import {
   classifyBool,
   loadRenderBlueprint,
 } from './env-drift.js';
-import { RENDER_RATIFIED_DEMO_DEFAULTS } from '../demo-flags.js';
+import { RENDER_RATIFIED_DEMO_DEFAULTS, RENDER_INFRA_DEFAULTS } from '../demo-flags.js';
 
 /** Join fixture lines with CRLF — the real render.yaml's line ending. */
 const crlf = (lines: string[]): string => lines.join('\r\n');
@@ -184,8 +184,11 @@ describe('TRA-2209 self-healed keys are surfaced, not counted as drift', () => {
         key: 'ENABLE_CHURN_LOSS_BRAKE',
         source: 'RENDER_RATIFIED_DEMO_DEFAULTS',
         declared: true,
+        // Exempt from the drift buckets, but still COMPARED (TRA-2224).
+        matchesDeclared: true,
       },
     ]);
+    expect(report.selfHealedMismatchCount).toBe(0);
     // Compared = literal-declared minus self-healed, so the two accounts reconcile.
     expect(report.comparedKeys).toBe(report.declaredValuesParsed - report.selfHealed.length);
   });
@@ -374,6 +377,133 @@ describe('TRA-2209 against the real render.yaml', () => {
     // which is the whole point: the exemption must not swallow real drift.
     expect(flagged).toContain('EXIT_RISK_RULES_ENABLED');
     expect(flagged).toContain('BOOK_GIVEBACK_ARM_FLOOR_ENABLED');
+  });
+
+  // ── TRA-2224 ────────────────────────────────────────────────────────────────
+  // TRA-2224 found CHURN_SAME_SESSION_OPEN_CAP declared in render.yaml and absent
+  // from the store, inert ONLY because the code default happened to equal the
+  // declared "3". The same coincidence protects the self-heal maps, and there it
+  // was not even OBSERVABLE: a seeded key was exempted from the drift buckets and
+  // therefore never compared, so `selfHealed` reported it as a known, benign
+  // fragility whatever value the process was actually running. Six of bqb1's ten
+  // seeded keys are numeric tunables.
+  it('flags a self-healed key whose RUNNING value contradicts render.yaml', () => {
+    // Blueprint declares the cap at 2; the process is running 5. Pre-TRA-2224 this
+    // was reported as a plain `selfHealed` entry and driftCount stayed 0.
+    const lines = [
+      'services:',
+      '  - type: web',
+      '    envVars:',
+      '      - key: OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME',
+      '        value: "2"',
+      '',
+    ];
+    const report = evaluateEnvDrift({
+      blueprint: crlf(lines),
+      runningEnv: { RENDER: 'true', OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: '5' },
+      seededKeys: { OPTION_DIRECTIONAL_MAX_OPENS_PER_NAME: 'RENDER_RATIFIED_DEMO_DEFAULTS' },
+      now: () => 1_784_000_000_000,
+    });
+
+    expect(report.parserOk).toBe(true);
+    expect(report.selfHealed[0]!.matchesDeclared).toBe(false);
+    expect(report.selfHealedMismatchCount).toBe(1);
+    expect(report.driftCount).toBe(1);
+    expect(report.ok).toBe(false);
+    // driftCount must NOT be reconstructable from the three buckets alone.
+    expect(report.declaredOnButOff).toEqual([]);
+    expect(report.declaredOffButOn).toEqual([]);
+    expect(report.valueMismatch).toEqual([]);
+    // The reason has to point at the code map, not at an env upsert — the wrong
+    // fix here is to write the store, which would not reconcile anything.
+    expect(report.reason).toContain('self-healed');
+    // NO VALUES, EVER still holds for the new field.
+    expect(JSON.stringify(report)).not.toContain('5');
+  });
+
+  it('reports matchesDeclared:null when the blueprint declares no literal to compare', () => {
+    // A seeded key that render.yaml carries as `sync: false` has NO declared value.
+    // Answering `true` there would be a fabricated pass — the exact false-green the
+    // whole module is built to refuse.
+    const lines = [
+      'services:',
+      '  - type: web',
+      '    envVars:',
+      '      - key: SOME_DASHBOARD_KEY',
+      '        sync: false',
+      '      - key: NODE_ENV',
+      '        value: production',
+      '',
+    ];
+    const report = evaluateEnvDrift({
+      blueprint: crlf(lines),
+      runningEnv: { RENDER: 'true', NODE_ENV: 'production', SOME_DASHBOARD_KEY: 'x' },
+      seededKeys: { SOME_DASHBOARD_KEY: 'RENDER_RATIFIED_DEMO_DEFAULTS' },
+      now: () => 1_784_000_000_000,
+    });
+    expect(report.selfHealed[0]!.matchesDeclared).toBeNull();
+    expect(report.selfHealedMismatchCount).toBe(0);
+    expect(report.driftCount).toBe(0);
+  });
+
+  it('holds the self-heal maps to their own contract against the REAL render.yaml', () => {
+    // Both maps document that seeding "makes the RUNNING gate match render.yaml
+    // exactly". Nothing enforced that — it lived only in a docstring, and a
+    // criterion that lives only in a docstring gets violated for a flag's whole
+    // life. This is the enforcement: edit either side out of step and CI fails
+    // here, at the commit, instead of on bqb1 weeks later.
+    const blueprint = loadRenderBlueprint({});
+    expect(blueprint).not.toBeNull();
+    const declared = new Map(
+      parseRenderYamlEnvVars(blueprint!)
+        .declared.filter((d) => d.kind === 'literal' && d.value !== undefined)
+        .map((d) => [d.key, d.value!] as const),
+    );
+    // Guard the count that separates: an empty/broken parse would make the loop
+    // below vacuous and report a confident pass over zero comparisons.
+    expect(declared.size).toBeGreaterThan(0);
+
+    const maps: Array<[string, Readonly<Record<string, string>>]> = [
+      ['RENDER_RATIFIED_DEMO_DEFAULTS', RENDER_RATIFIED_DEMO_DEFAULTS],
+      ['RENDER_INFRA_DEFAULTS', RENDER_INFRA_DEFAULTS],
+    ];
+    let compared = 0;
+    for (const [mapName, map] of maps) {
+      const entries = Object.entries(map);
+      expect(entries.length, `${mapName} is empty — this test would be vacuous`).toBeGreaterThan(0);
+      for (const [key, seededValue] of entries) {
+        const declaredValue = declared.get(key);
+        expect(
+          declaredValue,
+          `${mapName}.${key} is seeded but render.yaml declares no literal for it — ` +
+            `the map's admission rule requires a blueprint record`,
+        ).toBeDefined();
+        // Same intent test the route uses: "true" and "1" agree, numerics are exact.
+        const report = evaluateEnvDrift({
+          blueprint: crlf([
+            'services:',
+            '  - type: web',
+            '    envVars:',
+            `      - key: ${key}`,
+            `        value: "${declaredValue}"`,
+            '',
+          ]),
+          runningEnv: { RENDER: 'true', [key]: seededValue },
+          seededKeys: { [key]: mapName },
+          now: () => 1_784_000_000_000,
+        });
+        expect(
+          report.selfHealed[0]!.matchesDeclared,
+          `${mapName}.${key} seeds a value render.yaml does not declare — ` +
+            `bqb1 would run a number the blueprint never authorised`,
+        ).toBe(true);
+        compared += 1;
+      }
+    }
+    // Prove the loop actually ran; a silently-empty map set would pass otherwise.
+    expect(compared).toBeGreaterThanOrEqual(
+      Object.keys(RENDER_RATIFIED_DEMO_DEFAULTS).length + Object.keys(RENDER_INFRA_DEFAULTS).length,
+    );
   });
 
   it('locates render.yaml from the module path without an override', () => {
