@@ -39,6 +39,7 @@ import {
 } from './options-spend-store.js';
 import { recordSurfacedIdeas } from './options-idea-journal.js';
 import { recordExpectancyShadowSlate } from './options-ideas-expectancy-ledger.js';
+import { recordCreditWidthSlate } from './options-ideas-credit-width-ledger.js';
 import type { DefinedRiskStrategy } from '@trading-app/agents';
 import { logger } from './observability/index.js';
 
@@ -339,6 +340,22 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
   // SHADOW-only — reads verdicts already computed; changes no routing, no slate.
   if (research.expectancyShadow && !research.cached) {
     recordExpectancyShadowSlate(research.expectancyShadow, now);
+  }
+
+  // TRA-2208 (parent TRA-1965) — persist the PRE-floor credit/width verdicts for
+  // this slate. Unlike the shadow ledger above, this floor really did act when its
+  // flag is on: the `reject`/`unpriced` entries are NOT in `research.ideas`. Without
+  // this record the removal would be invisible and the slate would simply get
+  // shorter, so the survival rate — the number the TRA-1965 CUT/continue fork turns
+  // on — is only knowable because the ledger holds the PROPOSED book, not the
+  // surfaced one. Absent ⇒ ENABLE_OPTIONS_IDEA_CREDIT_WIDTH_FLOOR is off and nothing
+  // was floored (the probe reports that as `enabled:false`, so "floor off" stays
+  // distinguishable from "floor on, nothing rejected").
+  //
+  // Same `!research.cached` guard, same reason: a batch-cache hit re-serves the SAME
+  // result object off the panel's 60s poll and would inflate the cohort.
+  if (research.creditWidthFloorShadow && !research.cached) {
+    recordCreditWidthSlate(research.creditWidthFloorShadow, now);
   }
 
   // 4) map engine ideas → panel feed; refresh the entry-intent registry.

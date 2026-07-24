@@ -23,6 +23,14 @@ import {
   resolveExpectancyGateConfig,
   type IdeaExpectancyShadow,
 } from './options-ideas-expectancy-gate.js';
+import {
+  creditWidthRatioOf,
+  evaluateCreditWidthFloor,
+  evaluateIdeasCreditWidthFloor,
+  resolveCreditWidthFloorConfig,
+  type CreditWidthFloorConfig,
+  type CreditWidthFloorShadow,
+} from './options-idea-credit-width-floor.js';
 
 /**
  * The capped-loss strategies. Anything outside this allowlist (naked/short single
@@ -307,6 +315,21 @@ export interface OptionsIdea {
    * spread for the positive-expectancy gate (`credit/(width−credit) = creditUsd/maxLossUsd`).
    */
   creditUsd?: number;
+  /**
+   * TRA-2208 — short-leg |delta| the model targeted for a credit vertical, 0..1.
+   * Optional and advisory: it is recorded so the 0.20–0.30 band's effect on the
+   * book is gradeable, and never gates emission on its own. Emitted only when the
+   * credit/width floor flag states the band in the prompt contract.
+   */
+  shortDelta?: number;
+  /**
+   * TRA-2208 — realized `creditUsd / (creditUsd + maxLossUsd)` for a credit
+   * vertical, stamped so the ratio the whole diagnosis turns on is gradeable
+   * without re-deriving it downstream. Present ONLY when the credit/width floor
+   * flag is on and the idea priced a credit; absent otherwise (flag off ⇒ the
+   * emitted record is byte-for-byte the old shape).
+   */
+  creditWidthRatio?: number;
   /** Nearest-leg DTE; guaranteed ≥ guardrail.minDteDays in the returned list. */
   dteDays: number;
   /** Event-context badges for the UI, e.g. ["earnings in 3d", "FOMC in 1d"]. */
@@ -337,6 +360,15 @@ export interface OptionsResearchResult {
    * unchanged (records what the gate WOULD drop, never acts). Absent = flag off.
    */
   expectancyShadow?: IdeaExpectancyShadow;
+  /**
+   * TRA-2208 — PRE-floor credit/width ledger over the ideas the model PROPOSED,
+   * scored before the hard floor thinned them. Present ONLY when
+   * `ENABLE_OPTIONS_IDEA_CREDIT_WIDTH_FLOOR` is on; absent = flag off = the floor
+   * removed nothing and the emitted record is unchanged. Unlike the TRA-2005
+   * expectancy shadow this is NOT a counterfactual: when it is present the floor
+   * really did remove the `reject`/`unpriced` entries from `ideas`.
+   */
+  creditWidthFloorShadow?: CreditWidthFloorShadow;
 }
 
 /** Optional batch cache (TRA-595 §5: "one structured call per idea batch, cacheable"). */
@@ -454,6 +486,17 @@ export function validateOptionsIdeaBatch(value: unknown): string[] {
     if (idea.creditUsd !== undefined && (!isFiniteNumber(idea.creditUsd) || idea.creditUsd <= 0)) {
       errors.push(`${at}.creditUsd must be a number > 0 when present`);
     }
+    // TRA-2208 — shortDelta is OPTIONAL and advisory. The model is only asked for
+    // it when the credit/width floor flag states the delta band, so with the flag
+    // off it is never emitted and this branch never fires. A bad value is a real
+    // schema error (unlike an absent one) because a delta outside [0,1] means the
+    // model misunderstood the field rather than declined to answer it.
+    if (idea.shortDelta !== undefined) {
+      const d = idea.shortDelta;
+      if (!isFiniteNumber(d) || Math.abs(d) > 1) {
+        errors.push(`${at}.shortDelta must be a number in [-1,1] when present`);
+      }
+    }
     if (!isFiniteNumber(idea.dteDays) || idea.dteDays < 0) {
       errors.push(`${at}.dteDays must be a number ≥ 0`);
     }
@@ -531,6 +574,51 @@ const SYSTEM_PROMPT = [
   'return { "ideas": [] }.',
 ].join('\n');
 
+/**
+ * TRA-2208 — the credit/width floor + short-strike delta band, appended to the
+ * system prompt ONLY when the floor flag is on. Kept as an addendum rather than
+ * edited into {@link SYSTEM_PROMPT} so the flag-off prompt is the same string it
+ * has always been — the cache key, the token count and the model's answer are all
+ * unchanged when the floor is off.
+ *
+ * It states the band AND the reason for it. An unconstrained model asked to
+ * maximise POP sells far OTM where the premium is a rounding error; telling it the
+ * economics (below ~0.20 delta the premium does not clear our fee base) is what
+ * stops it optimising the wrong number. The floor is ALSO enforced deterministically
+ * after the answer — this addendum is what lets the model comply rather than be
+ * silently thinned.
+ */
+export function creditWidthFloorPromptAddendum(config: CreditWidthFloorConfig): string {
+  const floorPct = (config.minCreditWidth * 100).toFixed(0);
+  return [
+    'CREDIT-VERTICAL PREMIUM FLOOR (HARD — violations are discarded):',
+    `10. Any bull_put_spread / bear_call_spread / iron_condor / iron_butterfly must collect a NET`,
+    `    CREDIT of at least ${config.minCreditWidth.toFixed(2)} of its spread width — i.e.`,
+    `    creditUsd / (creditUsd + maxLossUsd) >= ${config.minCreditWidth.toFixed(2)}. An idea below that`,
+    `    floor is DISCARDED after you answer; do not propose one. Widen nothing to fake it: pick a`,
+    `    strike that genuinely pays ${floorPct}% of width, or leave the name out.`,
+    `11. Target the SHORT leg at ${config.shortDeltaMin.toFixed(2)}–${config.shortDeltaMax.toFixed(2)} delta.`,
+    `    Each candidate carries its own \`delta\`, so use it. WHY: below ~${config.shortDeltaMin.toFixed(2)} delta the`,
+    '    premium collected does not clear transaction costs at our fee base, so the trade is negative',
+    '    expectancy no matter how high its probability of profit; above the band the structure stops',
+    '    being a high-probability credit trade and becomes a directional bet.',
+    "12. Report the short leg's |delta| as `shortDelta` (0..1) on every credit structure.",
+    'DO NOT optimise for POP. A very high POP on a far-OTM short strike is exactly the failure mode',
+    'these two rules exist to stop: it wins almost every time and collects too little to survive one',
+    'loss. Prefer FEWER ideas that clear the floor over a full slate that does not. Returning',
+    '{ "ideas": [] } is a correct answer when nothing in the universe pays enough premium.',
+    '',
+    'Amended JSON shape (adds one optional field):',
+    '{ "ideas": [ { …, "creditUsd": num>0 (credit structures only),',
+    '  "shortDelta": num(0..1) (credit structures only) } ] }',
+  ].join('\n');
+}
+
+/** The system prompt for one pass: the constant, plus the flag-gated TRA-2208 addendum. */
+function buildSystemPrompt(floor: CreditWidthFloorConfig | null): string {
+  return floor == null ? SYSTEM_PROMPT : `${SYSTEM_PROMPT}\n\n${creditWidthFloorPromptAddendum(floor)}`;
+}
+
 function buildUserPrompt(
   input: OptionsResearchInput,
   guardrail: DayTradingGuardrail,
@@ -600,6 +688,8 @@ interface RawIdea {
   maxLossUsd: number;
   /** TRA-2005 — net credit per 1-lot in USD; optional (credit structures only). */
   creditUsd?: number;
+  /** TRA-2208 — short-leg |delta| 0..1; optional, asked for only under the floor flag. */
+  shortDelta?: number;
   dteDays: number;
   eventContext?: string[];
 }
@@ -646,6 +736,21 @@ function earningsKeyFor(sym: OptionsResearchSymbol | undefined, ticker: string):
   return `E:${ticker}`;
 }
 
+/**
+ * TRA-2208 — the optional `creditWidthRatio` / `shortDelta` stamp for one surviving
+ * idea. Each field is omitted rather than nulled when it cannot be formed, so a
+ * debit idea's record is identical with and without the flag.
+ */
+function creditWidthStamp(r: RawIdea): { creditWidthRatio?: number; shortDelta?: number } {
+  const ratio = creditWidthRatioOf(r.creditUsd, r.maxLossUsd);
+  const delta =
+    typeof r.shortDelta === 'number' && Number.isFinite(r.shortDelta) ? Math.abs(r.shortDelta) : null;
+  return {
+    ...(ratio != null ? { creditWidthRatio: ratio } : {}),
+    ...(delta != null ? { shortDelta: delta } : {}),
+  };
+}
+
 interface ScoredIdea {
   idea: OptionsIdea;
   sectorKey: string;
@@ -675,6 +780,7 @@ function enforceGuardrail(
   guardrail: DayTradingGuardrail,
   maxIdeas: number,
   policy: DiversificationPolicy,
+  floor: CreditWidthFloorConfig | null,
 ): { ideas: OptionsIdea[]; rejected: RejectedIdea[] } {
   const symByTicker = new Map<string, OptionsResearchSymbol>();
   for (const s of input.symbols) symByTicker.set(s.symbol.toUpperCase(), s);
@@ -719,6 +825,18 @@ function enforceGuardrail(
     if (r.dteDays < guardrail.minDteDays) {
       reasons.push(`dteDays ${r.dteDays} < minDteDays ${guardrail.minDteDays} (day-trade guardrail)`);
     }
+    // TRA-2208 — HARD credit/width floor. A credit vertical that collects less than
+    // `minCreditWidth` of its own defined width cannot pay for its loss rate at our
+    // cost base, and is DROPPED here rather than silently downgraded: it lands in
+    // `rejected` with the pre-floor ratio in its reason, so the removal is audited
+    // rather than invisible. `floor == null` ⇒ flag off ⇒ this block never runs.
+    if (floor != null) {
+      const verdict = evaluateCreditWidthFloor(
+        { strategy: r.strategy, maxLossUsd: r.maxLossUsd, creditUsd: r.creditUsd, shortDelta: r.shortDelta },
+        floor,
+      );
+      if (!verdict.admit) reasons.push(...verdict.reasons);
+    }
     if (reasons.length > 0) {
       rejected.push({
         idea: { ticker, strategy: r.strategy as DefinedRiskStrategy, thesis: r.thesis, pop: r.pop, maxLossUsd: r.maxLossUsd, dteDays: r.dteDays },
@@ -737,6 +855,12 @@ function enforceGuardrail(
         ...(typeof r.creditUsd === 'number' && Number.isFinite(r.creditUsd) && r.creditUsd > 0
           ? { creditUsd: r.creditUsd }
           : {}),
+        // TRA-2208 — stamp the ratio the whole TRA-1965 diagnosis turns on, plus the
+        // short-leg delta the band asked for, so both are gradeable downstream
+        // without re-deriving them. Only under the flag: with the floor off the
+        // model was never asked for `shortDelta` and the emitted record keeps its
+        // old shape exactly.
+        ...(floor != null ? creditWidthStamp(r) : {}),
         dteDays: r.dteDays,
         eventContext: r.eventContext ?? [],
         catalystHorizon: horizon,
@@ -835,14 +959,26 @@ export async function runOptionsResearch(
     return { ideas: [], costUsd: 0, attempts: 0, rejected: [], cached: false };
   }
 
-  const key = optionsResearchBatchKey(input);
+  // TRA-2208 — resolve the hard credit/width floor once per pass. `null` = flag off
+  // = the prompt, the cache key, the guardrail and the emitted idea shape are all
+  // exactly what they were before this issue.
+  const floor = resolveCreditWidthFloorConfig();
+
+  // The floor changes the PROMPT, so it must change the cache key too — otherwise a
+  // slate researched under the old prompt would be re-served to a flag-on caller and
+  // the floor would appear to have removed nothing. Suffix-only, so the flag-off key
+  // is byte-for-byte the old one.
+  const key =
+    floor == null
+      ? optionsResearchBatchKey(input)
+      : `${optionsResearchBatchKey(input)}|cwfloor${floor.minCreditWidth}:${floor.shortDeltaMin}-${floor.shortDeltaMax}`;
   const cached = deps.cache?.get(key);
   if (cached) {
     return { ...cached, cached: true };
   }
 
   const messages: LlmMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: buildSystemPrompt(floor) },
     { role: 'user', content: buildUserPrompt(input, guardrail, maxIdeas, diversification) },
   ];
 
@@ -852,12 +988,14 @@ export async function runOptionsResearch(
     { validate: validateOptionsIdeaBatch, maxAttempts: deps.maxAttempts ?? 3 },
   );
 
+  const proposed = completion.value.ideas as RawIdea[];
   const { ideas, rejected } = enforceGuardrail(
-    completion.value.ideas as RawIdea[],
+    proposed,
     input,
     guardrail,
     maxIdeas,
     diversification,
+    floor,
   );
 
   const result: OptionsResearchResult = {
@@ -871,6 +1009,24 @@ export async function runOptionsResearch(
     // slate itself is UNCHANGED (records what the gate would drop, never acts).
     // Flag off → config is null → field absent → byte-for-byte the old result.
     ...buildExpectancyShadow(ideas, input.symbols),
+    // TRA-2208 — the PRE-floor ledger, scored over what the model PROPOSED rather
+    // than what survived, because "how much of the current book the floor removes"
+    // is unanswerable from the post-floor slate alone. Flag off → `floor` is null →
+    // field absent → byte-for-byte the old result.
+    ...(floor == null
+      ? {}
+      : {
+          creditWidthFloorShadow: evaluateIdeasCreditWidthFloor(
+            proposed.map((r) => ({
+              ticker: r.ticker.trim().toUpperCase(),
+              strategy: r.strategy,
+              maxLossUsd: r.maxLossUsd,
+              ...(r.creditUsd !== undefined ? { creditUsd: r.creditUsd } : {}),
+              ...(r.shortDelta !== undefined ? { shortDelta: r.shortDelta } : {}),
+            })),
+            floor,
+          ),
+        }),
   };
   deps.cache?.set(key, result);
   return result;

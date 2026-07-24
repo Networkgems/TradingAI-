@@ -117,3 +117,25 @@ export {
   type IdeaExpectancyShadow,
   type IdeaExpectancyShadowEntry,
 } from './options-ideas-expectancy-gate.js';
+// TRA-2208 (child of TRA-1965) — the HARD credit/width floor + short-strike delta
+// band. Exported on the same reasoning as the expectancy gate above: the server can
+// only see this module through the barrel, and both the ledger reader and the
+// decomposition probe's floor-survival column need the floor constant so the
+// enforced bar and the graded bar can never drift apart.
+export {
+  resolveCreditWidthFloorConfig,
+  evaluateCreditWidthFloor,
+  evaluateIdeasCreditWidthFloor,
+  creditWidthRatioOf,
+  CREDIT_WIDTH_FLOOR_ENABLE_VAR,
+  DEFAULT_CREDIT_WIDTH_FLOOR,
+  DEFAULT_SHORT_DELTA_MIN,
+  DEFAULT_SHORT_DELTA_MAX,
+  DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG,
+  FLOORED_CREDIT_STRUCTURES,
+  type CreditWidthFloorConfig,
+  type CreditWidthVerdict,
+  type CreditWidthFloorResult,
+  type CreditWidthFloorShadow,
+  type CreditWidthFloorShadowEntry,
+} from './options-idea-credit-width-floor.js';

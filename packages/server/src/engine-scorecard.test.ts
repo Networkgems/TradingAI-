@@ -73,6 +73,7 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
         hitRate: null,
         popCalibrationGap: null,
         meanCreditWidth: null,
+        creditWidthFloor: null,
       },
       byStructure: [],
       byDteBucket: [],

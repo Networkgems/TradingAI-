@@ -865,6 +865,80 @@ describe('buildIdeasDecomposition', () => {
     expect(noWidth.overall.meanCreditWidth).toBeNull();
   });
 
+  // ── TRA-2208 — replay the credit/width floor over the REALIZED book ──────────
+  //
+  // This is the number the TRA-1965 CUT/continue fork turns on, and unlike the
+  // emission-side ledger it needs no flag and no accrual: the resolved journal
+  // already holds every entry's collected credit and defined width.
+
+  describe('creditWidthFloor', () => {
+    /** A resolved credit vertical collecting `credit` of a 500-wide spread. */
+    const spread = (credit: number, over: Partial<IdeaOutcome> = {}): IdeaOutcome =>
+      mkResolved({
+        strategy: 'bull_put_spread',
+        entryNetUsd: credit,
+        maxProfitUsd: credit,
+        maxLossUsd: 500 - credit,
+        ...over,
+      });
+
+    it('reports the survival rate of the measured bqb1 book — 3% of width clears nothing', () => {
+      // The live finding: meanCreditWidth 0.03 across the bull-put book.
+      const d = buildIdeasDecomposition([
+        spread(15, { key: 'a' }), // 15/500 = 0.03
+        spread(15, { key: 'b' }),
+        spread(5, { key: 'c' }), // 0.01
+      ]);
+      const f = d.overall.creditWidthFloor!;
+      expect(f.floor).toBe(0.2);
+      expect(f.n).toBe(3);
+      expect(f.pass).toBe(0);
+      expect(f.survivalRate).toBe(0); // a valid, informative result — the CUT signal
+      expect(d.overall.meanCreditWidth).toBe(0.02);
+    });
+
+    it('counts a member exactly at the floor as a survivor (the bar is ≥, not >)', () => {
+      const d = buildIdeasDecomposition([spread(100, { key: 'a' }), spread(15, { key: 'b' })]);
+      const f = d.overall.creditWidthFloor!;
+      expect(f.pass).toBe(1);
+      expect(f.survivalRate).toBe(0.5);
+    });
+
+    it('is null — "not governed", never "nothing survived" — on a debit-only cell', () => {
+      const d = buildIdeasDecomposition([
+        mkResolved({ key: 'a', strategy: 'long_call', entryNetUsd: -200 }),
+      ]);
+      expect(d.overall.creditWidthFloor).toBeNull();
+      expect(d.byStructure[0]!.creditWidthFloor).toBeNull();
+    });
+
+    it('counts a credit member with no formable ratio as a NON-survivor, not an exclusion', () => {
+      // Zero defined width → the ratio cannot be formed. It stays in the denominator,
+      // mirroring the emission gate's `unpriced` verdict: excluding it would flatter
+      // the rate. Note meanCreditWidth DOES drop it, so the two can legitimately differ.
+      const d = buildIdeasDecomposition([
+        spread(100, { key: 'a' }),
+        mkResolved({ key: 'b', strategy: 'bull_put_spread', maxProfitUsd: 0, maxLossUsd: 0, entryNetUsd: 0 }),
+      ]);
+      const f = d.overall.creditWidthFloor!;
+      expect(f.n).toBe(2);
+      expect(f.pass).toBe(1);
+      expect(f.survivalRate).toBe(0.5);
+      expect(d.overall.meanCreditWidth).toBe(0.2); // only the formable member
+    });
+
+    it('slices per structure so a failing family is attributable', () => {
+      const d = buildIdeasDecomposition([
+        spread(100, { key: 'a' }),
+        spread(5, { key: 'b', strategy: 'bear_call_spread' }),
+      ]);
+      const bullPut = d.byStructure.find((c) => c.key === 'bull_put_spread')!;
+      const bearCall = d.byStructure.find((c) => c.key === 'bear_call_spread')!;
+      expect(bullPut.creditWidthFloor!.survivalRate).toBe(1);
+      expect(bearCall.creditWidthFloor!.survivalRate).toBe(0);
+    });
+  });
+
   // ── TRA-2206 — IV-rank coverage as a first-class admissibility number ────────
 
   describe('ivRankCoverage', () => {

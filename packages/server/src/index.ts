@@ -130,6 +130,10 @@ import {
   hydrateOptionsIdeasExpectancyFromDisk,
   summarizeOptionsIdeasExpectancy,
 } from './options-ideas-expectancy-ledger.js';
+import {
+  hydrateOptionsIdeasCreditWidthFromDisk,
+  summarizeOptionsIdeasCreditWidth,
+} from './options-ideas-credit-width-ledger.js';
 import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
@@ -2491,6 +2495,22 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
   }
 }
 
+// TRA-2208 — hydrate the PRE-floor credit/width ledger on boot, for the same reason
+// as the sibling above: bqb1 reboots ~daily and the survival rate this feeds is the
+// number the TRA-1965 CUT/continue fork turns on, so a since-boot counter would read
+// a structural 0 at exactly the moment it is graded. Runs regardless of the floor
+// flag — hydrating with the flag OFF is what lets a reader still see the cohort a
+// previously-ON window accrued.
+{
+  const h = hydrateOptionsIdeasCreditWidthFromDisk(DATA_DIR);
+  if (h.slates > 0) {
+    log.info('options-ideas credit/width floor ledger hydrated (TRA-2208)', {
+      slates: h.slates,
+      days: h.days,
+    });
+  }
+}
+
 // TRA-1300 — hydrate the observe-only scale-out ladder ledger on boot and remember
 // DATA_DIR for subsequent appends, so the QuantTrader forward-validation trim counts
 // and the per-position fired-rung set survive the ~daily demo-host restart (a rung
@@ -4077,6 +4097,43 @@ app.get('/api/health/options-ideas-expectancy', (_req, res) => {
       reason: err instanceof Error ? err.message : String(err),
     });
     res.status(500).json({ error: 'Failed to build the options-ideas expectancy rollup.' });
+  }
+});
+
+// TRA-2208 (parent TRA-1965) — the credit/width FLOOR readout, on the same unauth,
+// secrets-free basis as its siblings above (QuantTrader has no auth on bqb1).
+//
+// WHAT TO READ, IN ORDER.
+//   1. `enabled` — is the floor enforcing/recording at all? OFF skips the pass
+//      entirely, so `enabled:false` + `slates:0` means "nothing recorded", NOT
+//      "nothing rejected".
+//   2. `survivalRate` — the share of the PROPOSED credit book that clears the floor.
+//      This is the number the TRA-1965 CUT/continue fork turns on.
+//   3. `stats.meanCreditWidth` — what the proposed book actually collects. The
+//      diagnosis that opened this issue measured 0.03 against a 0.12–0.21 breakeven.
+//
+// A LOW SURVIVAL RATE IS A VALID RESULT and must NOT be read as "the floor is too
+// tight" — it says our universe/IV regime does not offer sellable premium at our
+// cost base. The realized-book counterpart is `creditWidthFloor` per cell on
+// /api/health/options-ideas-decomposition, which needs no flag and no accrual.
+//
+// Aggregate-only: verdict counts, config and credit/width statistics sliced by
+// structure FAMILY. No per-idea text, no tickers, no P&L. Read-only — wires no
+// capital; the floor's only effect is that a below-floor credit idea is not surfaced.
+app.get('/api/health/options-ideas-credit-width', (_req, res) => {
+  try {
+    res.json({
+      ok: true,
+      issue: 'TRA-2208',
+      time: new Date().toISOString(),
+      build: resolveBuildInfo(),
+      ...summarizeOptionsIdeasCreditWidth(Date.now()),
+    });
+  } catch (err) {
+    log.error('options-ideas-credit-width probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to build the options-ideas credit/width rollup.' });
   }
 });
 

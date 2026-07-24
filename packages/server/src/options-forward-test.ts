@@ -28,6 +28,10 @@ import {
   type ReconstructionMiss,
 } from './iv-rank-archive.js';
 import { MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
+// TRA-2208 — the floor + its governed families, imported (not restated) so the
+// counterfactual this probe reports is measured against the exact bar the emission
+// gate enforces. See `CellCreditWidthFloor`.
+import { DEFAULT_CREDIT_WIDTH_FLOOR, FLOORED_CREDIT_STRUCTURES } from '@trading-app/agents';
 
 // TRA-678 (F1) + TRA-1991 — the cost model + cost-efficiency threshold live in a
 // leaf module (`options-cost-model.ts`) to keep them a single source of truth
@@ -601,6 +605,40 @@ export interface DecompositionCell {
    * cell members with a positive width denominator. Null when none have one.
    */
   meanCreditWidth: number | null;
+  /**
+   * TRA-2208 — how much of THIS cell's realized credit book would have survived the
+   * hard credit/width floor. Null when the cell holds no floored credit structure
+   * (debit families are out of the floor's scope, so a null here means "not
+   * governed", never "nothing survived").
+   */
+  creditWidthFloor: CellCreditWidthFloor | null;
+}
+
+/**
+ * TRA-2208 — the counterfactual the CUT/continue fork on TRA-1965 turns on, applied
+ * to the REALIZED book rather than to future emissions.
+ *
+ * WHY IT LIVES HERE. The emission-side floor (`options-idea-credit-width-floor.ts`)
+ * can only report a survival rate once it has been deployed and has accrued fresh
+ * slates. The resolved journal already holds the answer for the book we actually
+ * traded: every resolved idea carries `entryNetUsd` and its defined width, so the
+ * floor can be replayed over it exactly. This column is that replay — read-only,
+ * flag-INDEPENDENT (it measures the book, not the gate), and available the moment
+ * the probe is reachable.
+ *
+ * A floored structure whose entry collected no net credit counts as a NON-survivor,
+ * mirroring the emission gate's `unpriced` verdict: an unverifiable credit entry
+ * cannot clear a hard floor, and excluding it would flatter the rate.
+ */
+export interface CellCreditWidthFloor {
+  /** The floor replayed — the same constant the emission gate enforces. */
+  floor: number;
+  /** Cell members belonging to a floored credit family. */
+  n: number;
+  /** Of `n`, how many collected at least `floor` of their defined width. */
+  pass: number;
+  /** `pass / n`, 0–1, rounded to 2dp. Null when `n === 0` (never a fabricated 0). */
+  survivalRate: number | null;
 }
 
 /** The full per-cell decomposition returned by {@link buildIdeasDecomposition}. */
@@ -734,6 +772,29 @@ function creditWidthRatio(o: IdeaOutcome): number | null {
 }
 
 /**
+ * TRA-2208 — replay the emission floor over a cell's realized credit members. The
+ * floor constant is IMPORTED from the emission gate rather than restated, so the
+ * bar QuantTrader grades against here can never drift from the bar the engine
+ * actually enforces. Returns null when the cell governs no credit structure.
+ */
+function cellCreditWidthFloor(os: readonly IdeaOutcome[]): CellCreditWidthFloor | null {
+  const governed = os.filter((o) => FLOORED_CREDIT_STRUCTURES.has(o.strategy));
+  if (governed.length === 0) return null;
+  const pass = governed.filter((o) => {
+    const r = creditWidthRatio(o);
+    // A non-positive / unformable ratio is a non-survivor, not an exclusion —
+    // see the `CellCreditWidthFloor` doc on the `unpriced` mirror.
+    return r != null && r >= DEFAULT_CREDIT_WIDTH_FLOOR;
+  }).length;
+  return {
+    floor: DEFAULT_CREDIT_WIDTH_FLOOR,
+    n: governed.length,
+    pass,
+    survivalRate: r2(pass / governed.length),
+  };
+}
+
+/**
  * Build one decomposition cell from a set of resolved, non-excluded outcomes.
  * Gross/net R use the SAME `?? 0` fold the gate's `statsFor` uses, so a cell over
  * the full set reproduces the gate's `expectancyR`/`expectancyNetR` exactly.
@@ -756,6 +817,7 @@ function cellFor(key: string, os: readonly IdeaOutcome[]): DecompositionCell {
     hitRate: hitRate == null ? null : r2(hitRate),
     popCalibrationGap: hitRate != null && meanPop != null ? r2(hitRate - meanPop) : null,
     meanCreditWidth: meanCreditWidth == null ? null : r2(meanCreditWidth),
+    creditWidthFloor: cellCreditWidthFloor(os),
   };
 }
 
@@ -795,6 +857,12 @@ const DECOMPOSITION_NOTE =
   'TRA-2206: read `ivRankCoverage` BEFORE `byIvRankBucket` — at low coverage the IV-rank cells ' +
   'describe a minority sub-cohort, and the missing rows are exactly the ones the TRA-2005 ' +
   'expectancy gate hard-fails at check 3 of 6 without ever evaluating their expectancy. ' +
+  'TRA-2208: `creditWidthFloor` REPLAYS the hard credit/width floor over each cell\'s realized ' +
+  'credit members — `survivalRate` is the fraction of the book we actually traded that collected ' +
+  'at least `floor` of its defined width. It is flag-INDEPENDENT (it measures the book, not the ' +
+  'gate) and is the number the TRA-1965 CUT/continue fork turns on. A low survival rate is a ' +
+  'valid and informative answer: it says our universe/IV regime does not offer sellable premium ' +
+  'at our cost base, NOT that the floor is mis-set. Null on a cell governing no credit family. ' +
   'Read-only; wires no capital.';
 
 /**
