@@ -9,11 +9,21 @@
 // The Thursday 2026-07-23 read was done ad hoc and hit three traps that are easy
 // to hit again and hard to notice. All three are handled here:
 //
-//   1. GRADE BY GLOBAL RATIO, NEVER BY PER-TICK CONTAINMENT. bqb1 runs THREE
-//      engines concurrently and the phase log line carries no engine/correlation
-//      id, so "which sub-phase spans sit inside this tick's span" vacuums up the
-//      other two engines' sub-phases. On Thursday that produced shares of
-//      192% / 266% / 297% on the largest ticks — arithmetically impossible.
+//   1. GRADE BY GLOBAL RATIO, NEVER BY PER-TICK CONTAINMENT. bqb1 runs AT LEAST
+//      FIVE engines concurrently and the phase log line carries no engine/
+//      correlation id, so "which sub-phase spans sit inside this tick's span"
+//      vacuums up the other engines' sub-phases. On Thursday that produced
+//      shares of 192% / 266% / 297% on the largest ticks — arithmetically
+//      impossible.
+//        The count was "THREE" here until TRA-2205 measured it. `sma200-scan`
+//      stamps its throttle BEFORE awaiting, so one engine can fire it at most
+//      once per SMA200_SCAN_INTERVAL_MS (4 h) — yet every process boot emits
+//      EXACTLY FIVE fires inside ~35 s (four independent boots, 2026-07-23
+//      23:17Z / 23:27Z / 23:29Z and 07-24 00:15Z, same duration signature each
+//      time). n fires in one throttle window is a lower bound on n engines.
+//      ⇒ the per-tick over-count factor is ~5, not ~3. The global ratio is
+//      immune to the count either way, which is exactly why it is the only
+//      thing this script computes — but do not quote "three" downstream.
 //      Sigma(sub) / Sigma(doTick) is contamination-free because every engine's
 //      seconds land in BOTH numerator and denominator. This script only ever
 //      computes the global ratio, and refuses to emit a per-tick attribution.
@@ -232,6 +242,6 @@ function stats(durs) {
   }
   console.log('');
   console.log('NOTE: shares are the GLOBAL ratio Sigma(sub)/Sigma(doTick). Per-tick containment');
-  console.log('      is NOT computed and must not be — 3 concurrent engines with no engine id');
+  console.log('      is NOT computed and must not be — >=5 concurrent engines with no engine id');
   console.log('      on the phase record make it over-count by roughly the concurrency factor.');
 })();
