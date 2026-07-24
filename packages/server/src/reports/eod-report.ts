@@ -393,7 +393,7 @@ function buildIntrospectionMarkdown(
         .sort((a, b) => Number(b.degrading) - Number(a.degrading))
         .map(
           (e) =>
-            `| ${e.strategy} | ${e.degrading ? '⚠️ DECAYING' : 'ok'} | ${r(e.baselineExpectancy)} | ${r(e.recentExpectancy)} | ${e.reason} |`,
+            `| ${e.strategy} | ${e.degrading ? '⚠️ DECAYING' : e.decayThresholdR !== null ? 'ok' : 'UNJUDGED'} | ${r(e.baselineExpectancy)} | ${r(e.recentExpectancy)} | ${e.reason} |`,
         )
         .join('\n')
     : '';
