@@ -536,8 +536,17 @@ export function getTradierBarPullRateState(now: number = Date.now()): {
 
 // TRA-2170 — process-global bar-pull ceiling (req/min). Default DISABLED
 // (Infinity) so the wired throttle is provably inert on the frozen bqb1 host
-// until an operator opts in via the env knob. Spec target when enabled: ~150
-// (reserve ~50/min under the ~200/min account-wide Tradier market-data budget).
+// until an operator opts in via the env knob.
+//
+// Enable target RECALIBRATED to ~200 (TRA-2170 board disposition A, 2026-07-24).
+// The original spec's ~150 sits BELOW the measured 173-193/min steady-state
+// bar-pull rate at 568 symbols, so a 150 ceiling would defer COLD pulls
+// continuously and age cold candles past the shard cadence — a TRA-1539
+// regression. ~200 sits at the account-wide Tradier market-data budget and just
+// above steady-state: it never bites in the steady state, and on MTF-burst
+// minutes (~217-222/min) it trims only the COLD-pull contribution back toward
+// the ~200/min budget, reserving headroom for the freshness-critical quote path
+// without starving cold-candle freshness.
 // See barPullThrottleGate below for the scope caveat (this is NOT the C4 fix).
 const TRADIER_BAR_PULL_CEILING = (() => {
   const raw = Number(process.env['TRADIER_BAR_PULL_CEILING']);
