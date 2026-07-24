@@ -61,7 +61,8 @@ import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS } from './signal-engine.js';
+import { isStockMarketOpen } from '@trading-app/shared'; // TRA-2257
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
 import {
@@ -6547,6 +6548,77 @@ describe('TRA-2200 — decoupled exit-evaluation gate (shouldRunDecoupledExitPas
     expect(
       shouldRunDecoupledExitPass({ ...base, now: 100_000, lastExitPassAt: 85_000, minGapMs: 20_000 }),
     ).toBe(false);
+  });
+});
+
+describe('TRA-2257 — the gate NAMES the branch it refused on (decoupledExitPassDecision)', () => {
+  const base = {
+    enabled: true,
+    running: false,
+    tickExitRegionActive: false,
+    marketOpen: true,
+    now: 1_000_000,
+    lastExitPassAt: 0,
+  };
+
+  it('returns a null skipReason exactly when the boolean gate says run', () => {
+    expect(decoupledExitPassDecision(base).skipReason).toBeNull();
+    expect(shouldRunDecoupledExitPass(base)).toBe(true);
+  });
+
+  it('names every refusal branch, so none of them is dark from outside', () => {
+    expect(decoupledExitPassDecision({ ...base, enabled: false }).skipReason).toBe('disarmed');
+    expect(decoupledExitPassDecision({ ...base, running: true }).skipReason).toBe('selfOverlap');
+    expect(decoupledExitPassDecision({ ...base, tickExitRegionActive: true }).skipReason)
+      .toBe('tickExitRegion');
+    expect(decoupledExitPassDecision({ ...base, marketOpen: false }).skipReason)
+      .toBe('marketClosed');
+    expect(
+      decoupledExitPassDecision({ ...base, now: 100_000, lastExitPassAt: 97_000 }).skipReason,
+    ).toBe('minGap');
+  });
+
+  it('THE 2026-07-24 REGRESSION: a post-close window refuses on `marketClosed`, not on '
+    + 'the stale-price branch that WAS counted', () => {
+    // The grading session that filed this ticket read `decoupledExitSkippedStalePrices: 0`
+    // on all 10 engines and reasoned about the hoist from that zero. The zero was
+    // real and told you nothing: the gate refused two branches EARLIER, at
+    // `marketClosed`, and never reached the counter. The whole 20:16-20:18Z window
+    // sat after the 16:00 ET close.
+    //
+    // 2026-07-24T20:17:00Z == 16:17 ET, i.e. 17 minutes past the close.
+    const postClose = Date.UTC(2026, 6, 24, 20, 17, 0);
+    expect(isStockMarketOpen(postClose)).toBe(false);
+    const decision = decoupledExitPassDecision({
+      ...base,
+      marketOpen: isStockMarketOpen(postClose),
+      now: postClose,
+      lastExitPassAt: postClose - 60_000, // well past minGap: not the gap's doing
+    });
+    expect(decision.skipReason).toBe('marketClosed');
+    // ...and it is emphatically NOT `stalePrices`, which is scored after the gate.
+    expect(decision.skipReason).not.toBe('stalePrices');
+  });
+
+  it('the skip-reason set covers every refusal the gate can emit (no unlabelled branch)', () => {
+    // Positive control on the enumeration itself: if someone adds a gate clause
+    // with a new reason and forgets the counter, this catches it, because
+    // `emptyDecoupledExitSkips()` is keyed off the same list the roll-up sums.
+    expect(Object.keys(emptyDecoupledExitSkips()).sort())
+      .toEqual([...DECOUPLED_EXIT_SKIP_REASONS].sort());
+    for (const r of DECOUPLED_EXIT_SKIP_REASONS) {
+      expect(emptyDecoupledExitSkips()[r]).toBe(0);
+    }
+  });
+
+  it('the interlock outranks the market gate, so an in-region fire is never mislabelled', () => {
+    // Ordering matters for attribution, not just for correctness: during RTH the
+    // ONLY branch that can suppress the timer is `tickExitRegion`, and that is the
+    // reading TRA-2213's grade turns on.
+    expect(
+      decoupledExitPassDecision({ ...base, tickExitRegionActive: true, marketOpen: false })
+        .skipReason,
+    ).toBe('tickExitRegion');
   });
 });
 

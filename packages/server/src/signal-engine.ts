@@ -854,6 +854,61 @@ export interface ExitCadenceHealth {
   intervalHistogram: Record<ExitIntervalBucket, number>;
   /** Decoupled passes that found no price fresh enough to evaluate an exit against. */
   decoupledExitSkippedStalePrices: number;
+  /**
+   * TRA-2257 — `exitPassCount` split by which cadence stamped it. Without this
+   * split the route cannot distinguish "the timer is driving exits" from "the
+   * timer never does work and doTick's inline pass is still the only exit path":
+   * both publish a rising `exitPassCount` next to `timerArmed: true`.
+   */
+  decoupledPassCount: number;
+  tickPassCount: number;
+  /**
+   * TRA-2257 — why the decoupled timer fired and did NOT evaluate. Every fire
+   * lands in exactly one of these or in `decoupledPassCount`, so the counters sum
+   * to the number of timer fires and no branch is dark.
+   */
+  decoupledSkips: Record<DecoupledExitSkipReason, number>;
+  /** Timer fires observed since boot = the sum of the line above plus `decoupledPassCount`. */
+  decoupledFireCount: number;
+  /**
+   * TRA-2257 — how long doTick holds the `tickExitRegionActive` interlock, which
+   * is the ONLY thing that can suppress the decoupled timer during RTH. This is
+   * the quantity `p99Under30s` actually grades: a region held longer than
+   * (30s − intervalMs) manufactures an at-or-above-30s interval on every tick,
+   * and no amount of healthy 10s passes in between can pull the ratio under 1%.
+   */
+  tickExitRegionMs: {
+    lastMs: number | null;
+    maxMs: number | null;
+    samples: number;
+    atOrAbove20s: number;
+    atOrAbove30s: number;
+  };
+}
+
+/**
+ * TRA-2257 — the mutually exclusive reasons a decoupled exit timer fire performs
+ * no evaluation. `stalePrices` is scored AFTER the gate (the pass started and
+ * found nothing fresh); the rest are gate refusals, in gate order.
+ */
+export type DecoupledExitSkipReason =
+  | 'disarmed'
+  | 'selfOverlap'
+  | 'tickExitRegion'
+  | 'marketClosed'
+  | 'minGap'
+  | 'stalePrices'
+  | 'threw';
+
+export const DECOUPLED_EXIT_SKIP_REASONS: readonly DecoupledExitSkipReason[] = [
+  'disarmed', 'selfOverlap', 'tickExitRegion', 'marketClosed', 'minGap', 'stalePrices', 'threw',
+] as const;
+
+export function emptyDecoupledExitSkips(): Record<DecoupledExitSkipReason, number> {
+  return {
+    disarmed: 0, selfOverlap: 0, tickExitRegion: 0, marketClosed: 0,
+    minGap: 0, stalePrices: 0, threw: 0,
+  };
 }
 
 /**
@@ -889,12 +944,43 @@ export function shouldRunDecoupledExitPass(opts: {
   lastExitPassAt: number;
   minGapMs?: number;
 }): boolean {
-  if (!opts.enabled) return false;
-  if (opts.running) return false;
-  if (opts.tickExitRegionActive) return false;
-  if (!opts.marketOpen) return false;
-  if (opts.now - opts.lastExitPassAt < (opts.minGapMs ?? EXIT_MIN_GAP_MS)) return false;
-  return true;
+  return decoupledExitPassDecision(opts).skipReason === null;
+}
+
+/**
+ * TRA-2257 — the same gate, but NAMING the branch it refused on.
+ *
+ * `shouldRunDecoupledExitPass` returns a bare boolean, so a timer that fires
+ * every 10s and evaluates nothing is externally indistinguishable from one that
+ * is not firing at all — and on 2026-07-24 that cost a grading session: the
+ * exit-cadence histogram showed `lt15s: 0` on 326 intervals with `timerArmed:
+ * true`, `enabled: true`, `armedEngineCount: 10/10` and
+ * `decoupledExitSkippedStalePrices: 0` on every engine, and from outside there
+ * was no way to tell whether the timer was early-returning (a hoist problem) or
+ * the instrument was blind to timer-sourced passes (a measurement problem). The
+ * answer was neither: the whole window sat AFTER the 16:00 ET close, so every
+ * fire refused on `marketClosed` — a branch with no counter on it.
+ *
+ * A gate whose refusals are anonymous is a gate you cannot grade. Return the
+ * reason; let the caller score it.
+ */
+export function decoupledExitPassDecision(opts: {
+  enabled: boolean;
+  running: boolean;
+  tickExitRegionActive: boolean;
+  marketOpen: boolean;
+  now: number;
+  lastExitPassAt: number;
+  minGapMs?: number;
+}): { skipReason: DecoupledExitSkipReason | null } {
+  if (!opts.enabled) return { skipReason: 'disarmed' };
+  if (opts.running) return { skipReason: 'selfOverlap' };
+  if (opts.tickExitRegionActive) return { skipReason: 'tickExitRegion' };
+  if (!opts.marketOpen) return { skipReason: 'marketClosed' };
+  if (opts.now - opts.lastExitPassAt < (opts.minGapMs ?? EXIT_MIN_GAP_MS)) {
+    return { skipReason: 'minGap' };
+  }
+  return { skipReason: null };
 }
 
 const NEWS_REFRESH_MS = 5 * 60_000;
@@ -2340,6 +2426,31 @@ export class SignalEngine {
    * as a failed hoist without this counter.
    */
   private decoupledExitSkippedStalePrices = 0;
+  /**
+   * TRA-2257 — every decoupled timer fire is scored into exactly one of these or
+   * into `decoupledPassCount`, so the no-op branches stop being dark. The gap
+   * these close is concrete: on 2026-07-24 the ONLY skip branch with a counter
+   * was `stalePrices`, it read 0 on all 10 engines, and that zero was read as
+   * evidence about the hoist when it was really evidence that the gate refused
+   * two branches earlier (`marketClosed`) and never reached the counter.
+   */
+  private decoupledSkips: Record<DecoupledExitSkipReason, number> = emptyDecoupledExitSkips();
+  private decoupledFireCount = 0;
+  private decoupledPassCount = 0;
+  private tickPassCount = 0;
+  /**
+   * TRA-2257 — wall-clock the `tickExitRegionActive` interlock has been held for.
+   * 0 when the region is not open. During RTH this interlock is the only
+   * suppressor of the 10s timer, so the region's duration — not the timer's
+   * period — is what sets the worst-case exit-evaluation interval, and it is
+   * therefore the quantity TRA-2213's `p99Under30s` leg is really grading.
+   */
+  private tickExitRegionOpenedAt = 0;
+  private lastTickExitRegionMs = 0;
+  private maxTickExitRegionMs = 0;
+  private tickExitRegionSamples = 0;
+  private tickExitRegionAtOrAbove20s = 0;
+  private tickExitRegionAtOrAbove30s = 0;
   // TRA-1350 — wall-clock (ms) of the last COMPLETED scan tick. Unlike
   // `lastTick` (stamped `Date.now()` at getState() serialization time, so it
   // always reads "now"), this only advances when `doTick()` actually finishes a
@@ -3161,7 +3272,7 @@ export class SignalEngine {
       // exception would leave the flag latched true FOREVER, and the decoupled exit
       // pass would silently return early on every subsequent fire — an armed hoist
       // that evaluates nothing, which reads externally exactly like a working one.
-      this.tickExitRegionActive = false;
+      this.releaseTickExitRegion();
     }
   }
 
@@ -3419,8 +3530,44 @@ export class SignalEngine {
    * a claim about a measurement not taken (cf. the `/api/health/rv-scan` null
    * discipline, TRA-1707).
    */
+  /**
+   * TRA-2257 — claim the exit-critical interlock and start its clock. Paired with
+   * {@link releaseTickExitRegion}; both sites that used to assign
+   * `tickExitRegionActive` directly now go through these, so the measurement can
+   * never drift out of step with the flag it measures.
+   */
+  private openTickExitRegion(): void {
+    this.tickExitRegionActive = true;
+    this.tickExitRegionOpenedAt = Date.now();
+  }
+
+  /**
+   * TRA-2257 — release the interlock and record how long it was held. IDEMPOTENT:
+   * doTick releases on the happy path right after its options exit pass and
+   * `runTickGuarded` releases again in a `finally`, so the second call must not
+   * record a second (and, with a zeroed opener, absurd) sample.
+   *
+   * This duration is the suppression window for the decoupled timer, i.e. the
+   * floor on the worst-case exit-evaluation interval no matter how short the
+   * timer's period is. Publishing it is what lets a RED `p99Under30s` be read as
+   * "the interlock region is too long" rather than "the hoist does not work".
+   */
+  private releaseTickExitRegion(): void {
+    this.tickExitRegionActive = false;
+    if (this.tickExitRegionOpenedAt <= 0) return;
+    const heldMs = Date.now() - this.tickExitRegionOpenedAt;
+    this.tickExitRegionOpenedAt = 0;
+    this.lastTickExitRegionMs = heldMs;
+    if (heldMs > this.maxTickExitRegionMs) this.maxTickExitRegionMs = heldMs;
+    this.tickExitRegionSamples += 1;
+    if (heldMs >= 20_000) this.tickExitRegionAtOrAbove20s += 1;
+    if (heldMs >= 30_000) this.tickExitRegionAtOrAbove30s += 1;
+  }
+
   private stampExitPass(source: 'tick' | 'decoupled'): void {
     const now = Date.now();
+    if (source === 'decoupled') this.decoupledPassCount += 1;
+    else this.tickPassCount += 1;
     if (this.lastExitPassAt > 0) {
       const intervalMs = now - this.lastExitPassAt;
       this.lastExitIntervalMs = intervalMs;
@@ -3466,14 +3613,23 @@ export class SignalEngine {
    * a deliberate restart.
    */
   private async refreshExitsOnly(): Promise<void> {
-    if (!shouldRunDecoupledExitPass({
+    this.decoupledFireCount += 1;
+    const { skipReason } = decoupledExitPassDecision({
       enabled: isDecoupledExitCadenceEnabled(this.exitCadenceFlagEnv()),
       running: this.exitPassRunning,
       tickExitRegionActive: this.tickExitRegionActive,
       marketOpen: isStockMarketOpen(),
       now: Date.now(),
       lastExitPassAt: this.lastExitPassAt,
-    })) return;
+    });
+    if (skipReason !== null) {
+      // TRA-2257 — score the refusal. Every fire lands in exactly one counter, so
+      // `decoupledFireCount === sum(decoupledSkips) + decoupledPassCount` is an
+      // invariant the health route can be read against: if it holds, no branch is
+      // dark, and a zero on any one counter is a measurement, not an absence.
+      this.decoupledSkips[skipReason] += 1;
+      return;
+    }
     this.exitPassRunning = true;
     try {
       const prices = this.pricesFromSymbolState();
@@ -3485,12 +3641,14 @@ export class SignalEngine {
       // to today's behaviour rather than to a worse one.
       if (prices.size === 0) {
         this.decoupledExitSkippedStalePrices += 1;
+        this.decoupledSkips.stalePrices += 1;
         return;
       }
       this.runEquityExitPass(prices);
       await this.runOptionsExitPass(prices);
       this.stampExitPass('decoupled');
     } catch (err: unknown) {
+      this.decoupledSkips.threw += 1;
       log.warn('decoupled exit pass threw', {
         component: 'exit-cadence',
         reason: err instanceof Error ? err.message : String(err),
@@ -3526,6 +3684,19 @@ export class SignalEngine {
       maxExitIntervalMs: this.exitPassCount > 1 ? this.maxExitIntervalMs : null,
       intervalHistogram: { ...this.exitIntervalHistogram },
       decoupledExitSkippedStalePrices: this.decoupledExitSkippedStalePrices,
+      decoupledPassCount: this.decoupledPassCount,
+      tickPassCount: this.tickPassCount,
+      decoupledSkips: { ...this.decoupledSkips },
+      decoupledFireCount: this.decoupledFireCount,
+      tickExitRegionMs: {
+        // Null until a region has actually closed — a 0 here would be a claim
+        // about a measurement not taken (TRA-1707 null discipline).
+        lastMs: this.tickExitRegionSamples > 0 ? this.lastTickExitRegionMs : null,
+        maxMs: this.tickExitRegionSamples > 0 ? this.maxTickExitRegionMs : null,
+        samples: this.tickExitRegionSamples,
+        atOrAbove20s: this.tickExitRegionAtOrAbove20s,
+        atOrAbove30s: this.tickExitRegionAtOrAbove30s,
+      },
     };
   }
 
@@ -3861,7 +4032,17 @@ export class SignalEngine {
     // are precisely the window the hoist exists to reclaim. `runTickGuarded`
     // clears it again in a `finally` so a throw anywhere in here cannot wedge it
     // true and silently disarm the decoupled pass for the life of the process.
-    this.tickExitRegionActive = true;
+    //
+    // TRA-2257 — this region is NOT a thin exit-critical slice. Everything from
+    // here to `runOptionsExitPass` below is inside it: `news-refresh`,
+    // `social-sentiment`, `market-review-read`, `autopilot-journal-read`,
+    // `tradier-balance`, the whole-universe `quote-batch` (568 symbols), the three
+    // reconciles, and `shadow-chases`. The decoupled timer refuses on
+    // `tickExitRegion` for that entire stretch, so the hoist bounds exit latency
+    // at (region + minGap), NEVER at the 10s timer period. `tickExitRegionMs` on
+    // `/api/health/exit-cadence` measures it — read that before reading a RED
+    // `p99Under30s` as a verdict on the hoist.
+    this.openTickExitRegion();
     // TRA-1942 — pace the whole tick: yield a macrotask between the major phases
     // whenever the contiguous synchronous stretch since the last real yield
     // crosses the budget, so the SUM of many sub-1s cache-served phases can never
@@ -4076,7 +4257,7 @@ export class SignalEngine {
     // remainder of the tick is entry-scan / cold-bar / MTF work that the decoupled
     // pass is safe to run alongside, and that is where the 853s lives.
     this.stampExitPass('tick');
-    this.tickExitRegionActive = false;
+    this.releaseTickExitRegion();
     if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-154: tag symbols that have an open position or a recent signal as
