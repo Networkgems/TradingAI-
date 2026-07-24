@@ -346,6 +346,72 @@ describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
   });
 });
 
+// TRA-2246 — `getHaltKind()` classifies the active halt so the desktop banner can
+// decide whether its operator "Clear halt" control (POST /api/trading/reset-halt →
+// resetDailyCircuitBreaker) actually applies. The reported bug: clicking "Clear
+// halt" on a BOOK GIVE-BACK halt did nothing, because reset-halt clears only the
+// daily circuit-breaker, never the day-latched `sessionHalted`. These pin both the
+// classification AND the underlying reset asymmetry that motivated it.
+describe('DailyRiskGovernor — TRA-2246 getHaltKind + reset asymmetry', () => {
+  const EQ = 100_000;
+
+  it('returns null when the book is not halted', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    expect(gov.getHaltKind()).toBeNull();
+  });
+
+  it('classifies the loss-streak halt as daily_breaker — and reset-halt clears it', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.recordTrade(-100, EQ);
+    gov.recordTrade(-100, EQ);
+    gov.recordTrade(-100, EQ);
+    expect(gov.getHaltKind()).toBe('daily_breaker');
+    gov.resetDailyCircuitBreaker();
+    expect(gov.isHalted()).toBe(false);
+    expect(gov.getHaltKind()).toBeNull();
+  });
+
+  it('classifies the give-back cap halt as book_giveback', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ); // trip give-back
+    expect(gov.getHaltKind()).toBe('book_giveback');
+  });
+
+  it('classifies the session stop as session_stop', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(600, EQ); // up ≥ 0.5R arm
+    gov.markBook(-50, EQ); // net-negative → session stop
+    expect(gov.getHaltKind()).toBe('session_stop');
+  });
+
+  it('the kill switch classification takes precedence over a latched book halt', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ);
+    expect(gov.getHaltKind()).toBe('book_giveback');
+    gov.engageKillSwitch('operator override');
+    expect(gov.getHaltKind()).toBe('kill_switch');
+  });
+
+  // The core bug: resetDailyCircuitBreaker (what "Clear halt" invokes) must NOT
+  // and does NOT clear a book give-back halt — it stays latched until the ET day
+  // roll. This is exactly why the banner suppresses the button for this kind.
+  it('resetDailyCircuitBreaker does NOT clear a book give-back halt (bug root cause)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(1_000, EQ);
+    gov.markBook(500, EQ);
+    expect(gov.getHaltKind()).toBe('book_giveback');
+
+    gov.resetDailyCircuitBreaker(); // what POST /api/trading/reset-halt runs
+
+    // Still halted — the book give-back latch is untouched by the daily reset.
+    expect(gov.isHalted()).toBe(true);
+    expect(gov.isBookHalted()).toBe(true);
+    expect(gov.getHaltKind()).toBe('book_giveback');
+  });
+});
+
 // TRA-2110 (parent TRA-2109 outcome-2) — crash-robust governor hydration. The
 // give-back peak/latch are in-memory only; a mid-session process restart collapses
 // the governor's peak to the post-restart book, silently DISARMING the give-back

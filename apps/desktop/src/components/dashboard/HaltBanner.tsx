@@ -10,18 +10,36 @@
 // switch), show a "Clear halt" button so an operator can resume without waiting
 // for the ET midnight day-roll. Kill-switch halts must be released via the
 // dedicated KillSwitchButton — not here.
+//
+// TRA-2246 — the "Clear halt" button POSTs /api/trading/reset-halt, which resets
+// ONLY the daily circuit-breaker (loss-streak / drawdown). The book give-back cap
+// and session-stop halts are a SEPARATE, day-latched risk control that clears
+// only on the ET day roll — reset-halt never touches them. So for those halts the
+// button ran but nothing changed ("clicking Clear halt does nothing"). We now
+// classify the halt via `haltKind`: the button is offered only when the halt is
+// actually clearable here; day-latched book halts show a "lifts next day" note
+// instead of a dead control. `haltKind` is optional — when absent (older server)
+// we fall back to the prior !isKillSwitch behavior.
 export function HaltBanner({
   halted,
   reason,
   isKillSwitch = false,
   onClearHalt,
+  haltKind,
 }: {
   halted: boolean;
   reason: string | null;
   isKillSwitch?: boolean;
   onClearHalt?: () => void;
+  haltKind?: 'kill_switch' | 'daily_breaker' | 'book_giveback' | 'session_stop' | 'feed_stale' | null;
 }) {
   if (!halted) return null;
+
+  // TRA-2246 — a day-latched book give-back / session-stop halt is NOT clearable
+  // by the operator here; it lifts on the ET day roll. Suppress the button (which
+  // would silently no-op) and explain the behavior instead.
+  const isDayLatchedBookHalt = haltKind === 'book_giveback' || haltKind === 'session_stop';
+  const showClearButton = !!onClearHalt && !isKillSwitch && !isDayLatchedBookHalt;
   return (
     <div
       role="alert"
@@ -45,7 +63,7 @@ export function HaltBanner({
         Trading halted — no new entries.
         {reason ? <span style={{ fontWeight: 400 }}>{` ${reason}`}</span> : ' Global kill switch engaged.'}
       </span>
-      {!isKillSwitch && onClearHalt && (
+      {showClearButton && (
         <button
           onClick={onClearHalt}
           style={{
@@ -63,6 +81,16 @@ export function HaltBanner({
         >
           Clear halt
         </button>
+      )}
+      {/* TRA-2246 — book give-back / session-stop halts are day-latched and not
+          operator-clearable here; say so rather than showing a dead button. */}
+      {isDayLatchedBookHalt && (
+        <span
+          data-testid="halt-daylatched-note"
+          style={{ fontSize: '0.78rem', fontWeight: 500, opacity: 0.85, whiteSpace: 'nowrap', flexShrink: 0 }}
+        >
+          Lifts automatically at the next trading day (ET)
+        </span>
       )}
     </div>
   );

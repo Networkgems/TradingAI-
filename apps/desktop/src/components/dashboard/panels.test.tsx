@@ -707,6 +707,55 @@ describe('HaltBanner (TRA-535)', () => {
     render(<HaltBanner halted={true} reason={null} />);
     expect(screen.getByText(/Global kill switch engaged/)).toBeInTheDocument();
   });
+
+  // TRA-2246 — the "Clear halt" button POSTs reset-halt, which clears ONLY the
+  // daily circuit-breaker. It must be offered for a daily_breaker halt…
+  it('shows the "Clear halt" button for a daily_breaker halt', () => {
+    render(
+      <HaltBanner
+        halted={true}
+        reason="3 consecutive losses — no new entries for the day"
+        haltKind="daily_breaker"
+        onClearHalt={() => {}}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Clear halt/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('halt-daylatched-note')).not.toBeInTheDocument();
+  });
+
+  // …but NOT for a day-latched book give-back / session-stop halt, where reset-halt
+  // is a no-op (the reported bug). Those show a "lifts next day" note instead.
+  it('hides "Clear halt" and shows a lifts-next-day note for a book give-back halt', () => {
+    render(
+      <HaltBanner
+        halted={true}
+        reason="Book give-back cap — surrendered >40% of the day's +$89 peak (floor +$53); no new entries for the day"
+        haltKind="book_giveback"
+        onClearHalt={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Clear halt/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('halt-daylatched-note')).toHaveTextContent(/next trading day/i);
+  });
+
+  it('also hides "Clear halt" for a session-stop halt', () => {
+    render(
+      <HaltBanner
+        halted={true}
+        reason="Book session stop — net-negative after being up ≥ 0.50% of book equity; no new entries for the day"
+        haltKind="session_stop"
+        onClearHalt={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Clear halt/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('halt-daylatched-note')).toBeInTheDocument();
+  });
+
+  // Backward-compat: an older server sends no haltKind → prior !isKillSwitch behavior.
+  it('still shows "Clear halt" when haltKind is absent (legacy server)', () => {
+    render(<HaltBanner halted={true} reason="Daily drawdown limit hit" onClearHalt={() => {}} />);
+    expect(screen.getByRole('button', { name: /Clear halt/i })).toBeInTheDocument();
+  });
 });
 
 describe('KillSwitchButton (TRA-535)', () => {

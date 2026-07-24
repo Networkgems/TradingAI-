@@ -133,6 +133,7 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
         halted={state?.tradingHalted ?? false}
         reason={state?.haltReason ?? null}
         isKillSwitch={accountSettings?.globalKillSwitchEngaged ?? false}
+        haltKind={state?.haltKind ?? null}
         onClearHalt={async () => {
           await fetch(`${HTTP_URL}/api/trading/reset-halt`, {
             method: 'POST',

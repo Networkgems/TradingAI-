@@ -26,6 +26,13 @@ export interface AppState {
   marketOpen?: boolean;
   tradingHalted: boolean;
   haltReason: string | null;
+  // TRA-2246 — machine-readable class of the active halt, so the HaltBanner can
+  // decide whether its "Clear halt" control applies. Only 'daily_breaker' is
+  // cleared by /api/trading/reset-halt; 'book_giveback' / 'session_stop' are
+  // day-latched risk controls that lift only on the ET day roll (offering a
+  // dead "Clear halt" button for those was the reported bug). Optional so a
+  // pre-TRA-2246 server still type-checks.
+  haltKind?: 'kill_switch' | 'daily_breaker' | 'book_giveback' | 'session_stop' | 'feed_stale' | null;
   autoTradingEnabled: boolean;
   // TRA-544 — true when the "Trading Agents" multi-agent layer is the active
   // decision-maker (deterministic auto-routing suspended). Optional so a

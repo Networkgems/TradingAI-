@@ -342,6 +342,14 @@ export interface EngineState {
   /** True when the daily risk circuit-breaker has halted new entries. */
   tradingHalted: boolean;
   haltReason: string | null;
+  /**
+   * TRA-2246 — machine-readable class of the active halt (null when not halted),
+   * so the desktop banner can decide whether the operator "Clear halt" control
+   * applies. `daily_breaker` is the only kind `/api/trading/reset-halt` clears;
+   * `book_giveback` / `session_stop` lift only on the ET day roll. Optional so a
+   * pre-TRA-2246 server (and the health-route test fixtures) still type-check.
+   */
+  haltKind?: HaltKind | null;
   autoTradingEnabled: boolean;
   /**
    * TRA-544 — true when the "Trading Agents" master switch is ON, i.e. the
@@ -1258,6 +1266,19 @@ export function describeGatedStrategies(_gates: MarketReviewGates): GatedStrateg
  * actually ended. `etDateString` (shared with `scheduler.ts`) closes that
  * window. The `now` clock is injectable so the boundary is unit-testable.
  */
+
+/**
+ * TRA-2246 — machine-readable classification of the current halt, surfaced on the
+ * engine state as `haltKind` so the desktop banner can decide whether its
+ * operator "Clear halt" control applies. See {@link DailyRiskGovernor.getHaltKind}.
+ */
+export type HaltKind =
+  | 'kill_switch'
+  | 'daily_breaker'
+  | 'book_giveback'
+  | 'session_stop'
+  | 'feed_stale';
+
 export class DailyRiskGovernor {
   private consecutiveLosses = 0;
   private dailyPnl = 0;
@@ -1665,6 +1686,33 @@ export class DailyRiskGovernor {
     if (this.sessionHalted) return this.sessionHaltReason;
     // TRA-1072 — finally the transient feed-stale gate, with its freshness detail.
     if (this.feedStaleGate) return this.feedStaleReason;
+    return null;
+  }
+
+  /**
+   * TRA-2246 — a machine-readable classification of the CURRENT halt, mirroring
+   * the precedence in {@link getHaltReason}. The desktop halt banner uses this to
+   * decide whether its operator "Clear halt" control actually applies:
+   *   • `daily_breaker` — the loss-streak / drawdown halt; the ONLY kind that
+   *     `/api/trading/reset-halt` clears (→ {@link resetDailyCircuitBreaker}).
+   *   • `kill_switch`   — released via its own KillSwitchButton, never here.
+   *   • `book_giveback` / `session_stop` — the day-latched book give-back cap /
+   *     session-stop halt. These lift ONLY on the ET day roll (`resetIfNewDay`);
+   *     `resetDailyCircuitBreaker` does not touch `sessionHalted`, so offering a
+   *     "Clear halt" button for them renders a control that silently does nothing
+   *     (the reported TRA-2246 bug). The banner shows a "lifts next day" note
+   *     instead of a dead button.
+   *   • `feed_stale`    — transient; self-clears when a fresh candle returns.
+   * Null when the book is not halted.
+   */
+  getHaltKind(): HaltKind | null {
+    this.resetIfNewDay();
+    if (this.killSwitchEngaged) return 'kill_switch';
+    if (this.halted) return 'daily_breaker';
+    if (this.sessionHalted) {
+      return this.sessionHaltReasonCode === 'session_net_negative' ? 'session_stop' : 'book_giveback';
+    }
+    if (this.feedStaleGate) return 'feed_stale';
     return null;
   }
 
@@ -12443,6 +12491,7 @@ export class SignalEngine {
         lastScanAt: this.lastScanAt,
         tradingHalted: this.riskGovernor.isHalted(),
         haltReason: this.riskGovernor.getHaltReason(),
+        haltKind: this.riskGovernor.getHaltKind(), // TRA-2246
         autoTradingEnabled: this.isAutoTradingEnabled(),
         tradingAgentsEnabled: this.tradingAgentsEnabled,
         tradingAgentsGatingEnabled: this.tradingAgentsGatingEnabled,
@@ -12490,6 +12539,7 @@ export class SignalEngine {
       lastScanAt: this.lastScanAt,
       tradingHalted: this.riskGovernor.isHalted(),
       haltReason: this.riskGovernor.getHaltReason(),
+      haltKind: this.riskGovernor.getHaltKind(), // TRA-2246
       autoTradingEnabled: this.isAutoTradingEnabled(),
       tradingAgentsEnabled: this.tradingAgentsEnabled,
       tradingAgentsGatingEnabled: this.tradingAgentsGatingEnabled,

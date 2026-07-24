@@ -49,6 +49,17 @@ function isoDate(year: number, month: number, day: number): string {
   return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
+// TRA-2246 — Week view helpers. Weeks start on Monday to line up with the month
+// grid's Mon–Fri (stocks) / Mon–Sun (crypto) columns.
+function addDays(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+}
+function startOfWeekMonday(d: Date): Date {
+  const dow = d.getDay(); // 0=Sun … 6=Sat
+  const backToMon = dow === 0 ? 6 : dow - 1;
+  return addDays(d, -backToMon);
+}
+
 // Build an array of weeks for the given month. Each week is an N-element array
 // of day numbers or null for out-of-month / padding.
 // TRA-286 — crypto trades 24/7 and stock P&L can post on weekends (settlement,
@@ -184,6 +195,100 @@ function MonthSummary({ year, month, reports }: {
         <span className="cal-summary-value">{wr}%</span>
       </div>
     </div>
+  );
+}
+
+// ── Week view ────────────────────────────────────────────────────────────────
+//
+// TRA-2246 — a single-week P&L strip sitting between the Month and Year filters.
+// Renders the Mon–Fri (stocks) / Mon–Sun (crypto) days of the week starting at
+// `weekStart` as one row of the same cells the Month grid uses, plus a week
+// summary. Reads from the same fully-loaded `reports` map (all available dates),
+// so a week that straddles a month boundary renders correctly.
+
+function WeekView({ weekStart, cols, reports, onSelectDate }: {
+  weekStart: Date; cols: 5 | 7;
+  reports: Record<string, EodReport>;
+  onSelectDate: (date: string) => void;
+}) {
+  const today     = new Date();
+  const todayIso  = isoDate(today.getFullYear(), today.getMonth(), today.getDate());
+  const dayLabels = cols === 5 ? DAY_LABELS_WEEKDAYS : DAY_LABELS_FULL;
+  const days      = Array.from({ length: cols }, (_, i) => addDays(weekStart, i));
+
+  const weekReports = days
+    .map(d => reports[isoDate(d.getFullYear(), d.getMonth(), d.getDate())])
+    .filter((r): r is EodReport => !!r);
+  const net    = weekReports.reduce((s, r) => s + r.combinedPnl, 0);
+  const wins   = weekReports.filter(r => r.combinedPnl > 0).length;
+  const losses = weekReports.filter(r => r.combinedPnl < 0).length;
+  const wr     = weekReports.length ? ((wins / weekReports.length) * 100).toFixed(0) : '0';
+
+  return (
+    <>
+      <div className="cal-grid" style={{ ['--cal-cols' as string]: cols }}>
+        <div className="cal-day-headers">
+          {dayLabels.map(d => <div key={d} className="cal-day-label">{d}</div>)}
+        </div>
+        <div className="cal-week">
+          {days.map((d, col) => {
+            const date      = isoDate(d.getFullYear(), d.getMonth(), d.getDate());
+            const report    = reports[date];
+            const isToday   = date === todayIso;
+            const clickable = !!report;
+
+            let cls = 'cal-cell';
+            if (isToday)                          cls += ' cal-cell--today';
+            if (report && report.combinedPnl > 0) cls += ' cal-cell--win';
+            if (report && report.combinedPnl < 0) cls += ' cal-cell--loss';
+            if (clickable)                        cls += ' cal-cell--clickable';
+
+            return (
+              <div
+                key={col}
+                className={cls}
+                onClick={clickable ? () => onSelectDate(date) : undefined}
+                role={clickable ? 'button' : undefined}
+                title={clickable ? 'View EOD report' : undefined}
+              >
+                <span className="cal-day-num">
+                  {isToday ? 'Today' : `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`}
+                </span>
+                {report
+                  ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
+                  : <span className="cal-pnl cal-pnl--empty">--</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {weekReports.length > 0 && (
+        <div className="cal-summary">
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Net P&L</span>
+            <span className={`cal-summary-value ${net >= 0 ? 'green' : 'red'}`}>
+              {net >= 0 ? '+' : ''}${Math.abs(net).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Trading Days</span>
+            <span className="cal-summary-value">{weekReports.length}</span>
+          </div>
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Win Days</span>
+            <span className="cal-summary-value green">{wins}</span>
+          </div>
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Loss Days</span>
+            <span className="cal-summary-value red">{losses}</span>
+          </div>
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Win Rate</span>
+            <span className="cal-summary-value">{wr}%</span>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -407,9 +512,12 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // "My Account" book. The admin-only guard above still holds.
   isAdmin?: boolean;
 }) {
-  const [view,    setView]    = useState<'month' | 'year'>('month');
+  const [view,    setView]    = useState<'month' | 'week' | 'year'>('month');
   const [year,    setYear]    = useState(new Date().getFullYear());
   const [month,   setMonth]   = useState(new Date().getMonth()); // 0-indexed
+  // TRA-2246 — Monday of the week the Week view is showing. Independent of
+  // year/month (a week can straddle a month boundary); the arrows step it ±7d.
+  const [weekStart, setWeekStart] = useState<Date>(() => startOfWeekMonday(new Date()));
   const [reports, setReports] = useState<Record<string, EodReport>>({});
   const [loading, setLoading] = useState(false);
   // TRA-219 — date selected for the per-day EOD report detail view.
@@ -527,14 +635,24 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
 
   function prevPeriod() {
     if (view === 'year') { setYear(y => y - 1); return; }
+    if (view === 'week') { setWeekStart(w => addDays(w, -7)); return; }
     if (month === 0) { setYear(y => y - 1); setMonth(11); } else setMonth(m => m - 1);
   }
   function nextPeriod() {
     if (view === 'year') { setYear(y => y + 1); return; }
+    if (view === 'week') { setWeekStart(w => addDays(w, 7)); return; }
     if (month === 11) { setYear(y => y + 1); setMonth(0); } else setMonth(m => m + 1);
   }
 
-  const periodLabel = view === 'month' ? `${MONTH_NAMES[month]} ${year}` : String(year);
+  // TRA-2246 — the week label spans the row's first→last visible day (Mon–Fri for
+  // stocks, Mon–Sun for crypto), collapsing the year when both ends share it.
+  const weekEnd   = addDays(weekStart, (marketEff === 'stocks' ? 5 : 7) - 1);
+  const weekLabel = weekStart.getFullYear() === weekEnd.getFullYear()
+    ? `${MONTH_SHORT[weekStart.getMonth()]} ${weekStart.getDate()} – ${MONTH_SHORT[weekEnd.getMonth()]} ${weekEnd.getDate()}, ${weekEnd.getFullYear()}`
+    : `${MONTH_SHORT[weekStart.getMonth()]} ${weekStart.getDate()}, ${weekStart.getFullYear()} – ${MONTH_SHORT[weekEnd.getMonth()]} ${weekEnd.getDate()}, ${weekEnd.getFullYear()}`;
+  const periodLabel = view === 'year' ? String(year)
+    : view === 'week' ? weekLabel
+    : `${MONTH_NAMES[month]} ${year}`;
 
   // Sorted list of all dates with reports — feeds the "filter by date" picker
   // so users can jump straight to a day without paging through months.
@@ -579,6 +697,11 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
               className={`cal-toggle-btn${view === 'month' ? ' active' : ''}`}
               onClick={() => { setView('month'); setSelectedDate(null); }}
             >Month</button>
+            {/* TRA-2246 — single-week P&L strip, sitting between Month and Year. */}
+            <button
+              className={`cal-toggle-btn${view === 'week' ? ' active' : ''}`}
+              onClick={() => { setView('week'); setSelectedDate(null); }}
+            >Week</button>
             <button
               className={`cal-toggle-btn${view === 'year' ? ' active' : ''}`}
               onClick={() => { setView('year'); setSelectedDate(null); }}
@@ -701,6 +824,20 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
             options closed that day. Open-position gains (unrealized mark-to-market) are
             excluded until you close the position, so this view will differ from the
             “Daily Opts P&amp;L” figure in the footer, which includes open MTM.
+          </p>
+        </>
+      )}
+      {!selectedDate && !loading && view === 'week' && (
+        <>
+          <WeekView
+            weekStart={weekStart}
+            cols={marketEff === 'stocks' ? 5 : 7}
+            reports={reports}
+            onSelectDate={setSelectedDate}
+          />
+          <p className="cal-note muted" style={{ fontSize: '0.8rem', marginTop: '0.75rem' }}>
+            Each day shows <strong>realized</strong> P&amp;L only — closed stock trades plus
+            options closed that day. Use the ‹ › arrows to step week by week.
           </p>
         </>
       )}
