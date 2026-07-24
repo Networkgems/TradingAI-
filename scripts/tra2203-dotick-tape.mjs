@@ -85,6 +85,30 @@ if (!API_KEY) {
   process.exit(2);
 }
 
+// The logs API rate-limits a long pagination walk. A full RTH session is ~30+
+// pages and reliably trips a 429 partway through; the old behaviour was to
+// exit(2) mid-walk, which is loud but throws away everything already paged and
+// makes the deciding read un-runnable. Back off and retry instead — and keep
+// failing closed on a non-retryable status.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function fetchRetry(url, opts, label) {
+  let waitMs = 5_000;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, opts);
+    if (res.ok) return res;
+    if ((res.status === 429 || res.status >= 500) && attempt <= 8) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const pause = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : waitMs;
+      process.stderr.write(`\n[tape] ${label} ${res.status} — backing off ${Math.round(pause / 1000)}s `
+        + `(attempt ${attempt}/8)\n`);
+      await sleep(pause);
+      waitMs = Math.min(waitMs * 2, 60_000);
+      continue;
+    }
+    return res;
+  }
+}
+
 function defaultWindow() {
   const d = new Date();
   const day = d.toISOString().slice(0, 10);
@@ -102,9 +126,9 @@ async function pullTape(from, to) {
     const url = `${API}/logs?ownerId=${OWNER_ID}&resource=${SERVICE_ID}`
       + `&text=${encodeURIComponent('slow async phase')}`
       + `&startTime=${encodeURIComponent(from)}&endTime=${encodeURIComponent(endTime)}&limit=100`;
-    const res = await fetch(url, {
+    const res = await fetchRetry(url, {
       headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
-    });
+    }, 'logs API');
     if (!res.ok) {
       console.error(`logs API ${res.status}: ${(await res.text()).slice(0, 300)}`);
       process.exit(2);
@@ -157,9 +181,9 @@ async function pullBoots(from, to) {
   // projects its transient INTO it.
   const since = new Date(new Date(from).getTime() - BOOT_TRANSIENT_MS).toISOString();
   const url = `${API}/services/${SERVICE_ID}/deploys?limit=50`;
-  const res = await fetch(url, {
+  const res = await fetchRetry(url, {
     headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
-  });
+  }, 'deploys API');
   if (!res.ok) {
     console.error(`[tape] deploys API ${res.status} — cannot detect restarts; `
       + 'grading WITHOUT boot exclusion. Treat a dominant sma200-scan with suspicion.');
@@ -173,6 +197,74 @@ async function pullBoots(from, to) {
     .map(d => ({ id: d.id, at: d.finishedAt, commit: (d.commit?.id ?? '').slice(0, 7),
                  trigger: d.trigger ?? d.details?.trigger ?? '?' }))
     .sort((a, b) => (a.at < b.at ? -1 : 1));
+}
+
+// ⛔ A DEPLOY IS NOT THE ONLY THING THAT BOOTS THIS PROCESS (TRA-2203, 07-24).
+// The memory watchdog self-restarts on a sustained event-loop block (pm2
+// relaunch, not a Render deploy), and `POST /api/admin/restart` does the same.
+// NEITHER writes a deploy record — so a deploys-only boot detector reports
+// "steady state ✓" over a window containing several boot transients.
+// MEASURED on 2026-07-24 RTH: FIVE watchdog trips (5.8s / 14.4s / 13.5s / 12.8s
+// / 12.7s event-loop blocks), of which only TWO left a deploy record. The other
+// three were invisible to the check that exists to see exactly this.
+// So pull the trip lines too, and union them into the boot set.
+async function pullWatchdogRestarts(from, to) {
+  const since = new Date(new Date(from).getTime() - BOOT_TRANSIENT_MS).toISOString();
+  const url = `${API}/logs?ownerId=${OWNER_ID}&resource=${SERVICE_ID}`
+    + `&text=${encodeURIComponent('self-restarting')}`
+    + `&startTime=${encodeURIComponent(since)}&endTime=${encodeURIComponent(to)}&limit=100`;
+  const res = await fetchRetry(url, {
+    headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
+  }, 'logs API (watchdog)');
+  if (!res.ok) {
+    console.error(`[tape] watchdog-trip probe ${res.status} — self-restarts NOT detected; `
+      + 'boot exclusion covers deploys only.');
+    return null;
+  }
+  const body = await res.json();
+  // ⚠️ Each trip surfaces on MORE THAN ONE line (the trip itself, then the
+  // relaunched process re-reporting it as `lastTrip`), so the raw line count
+  // over-counts restarts. Do NOT dedup on the `max lag NNNNms` value: two
+  // genuinely distinct restarts 16 min apart carried the SAME lag on 07-24
+  // (the second line was the new process echoing the previous trip), so a
+  // dedup-by-lag silently DELETES a real boot. Cluster by TIME instead — lines
+  // within CLUSTER_MS are one restart; anything further apart is another.
+  const CLUSTER_MS = 90_000;
+  const lines = (body.logs ?? [])
+    .map(l => {
+      let rec;
+      try { rec = JSON.parse(l.message); } catch { rec = { detail: String(l.message) }; }
+      const detail = rec.detail ?? rec.msg ?? '';
+      return { id: l.id, at: l.timestamp, lag: /max lag (\d+)ms/.exec(detail)?.[1] ?? '?' };
+    })
+    .sort((a, b) => (a.at < b.at ? -1 : 1));
+  const out = [];
+  for (const l of lines) {
+    const last = out[out.length - 1];
+    if (last && new Date(l.at).getTime() - new Date(last.at).getTime() <= CLUSTER_MS) continue;
+    out.push({ id: l.id, at: l.at, commit: 'watchdog', trigger: `self-restart lag=${l.lag}ms` });
+  }
+  return out;
+}
+
+// Is the checkExits hoist ARMED? Decides whether the parent-doTick hourly table
+// is an exit-latency curve or merely a tick-cost curve. Unauth route.
+async function pullExitArm() {
+  try {
+    const res = await fetch('https://tradingai-bqb1.onrender.com/api/health/exit-cadence',
+      { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const b = await res.json();
+    const modes = [...new Set((b.engines ?? []).map(e => e.mode))].sort();
+    return {
+      enabled: !!b.enabled,
+      engineCount: b.engineCount ?? 0,
+      armedEngineCount: b.armedEngineCount ?? 0,
+      modes: modes.length ? `mode=${modes.join('+')}` : 'mode unknown',
+      p99Under30s: b.p99Under30s ?? null,
+      maxExitIntervalMs: b.maxExitIntervalMs ?? null,
+    };
+  } catch { return null; }
 }
 
 const inBootWindow = (ts, boots) => boots.some(b => {
@@ -229,7 +321,17 @@ function grade(recs) {
     process.exit(3);
   }
 
-  const boots = await pullBoots(FROM, TO);
+  const arm = await pullExitArm();
+  const deployBoots = await pullBoots(FROM, TO);
+  const selfRestarts = await pullWatchdogRestarts(FROM, TO);
+  // Union, then collapse anything within 90 s — a watchdog trip that ALSO
+  // produced a deploy record (two of five did on 07-24) must count once.
+  const boots = (deployBoots || selfRestarts)
+    ? [...(deployBoots ?? []), ...(selfRestarts ?? [])]
+        .sort((a, b) => (a.at < b.at ? -1 : 1))
+        .filter((b, i, all) => i === 0
+          || new Date(b.at).getTime() - new Date(all[i - 1].at).getTime() > 90_000)
+    : null;
   const warmRecs = boots && boots.length
     ? recs.filter(r => !inBootWindow(r.ts, boots))
     : recs;
@@ -266,6 +368,7 @@ function grade(recs) {
   if (has('--json')) {
     console.log(JSON.stringify({
       window: { from: FROM, to: TO }, blind,
+      exitHoistArm: arm ?? 'unreadable',
       parent: { phase: PARENT, ...p }, residualPct: residual, subs,
       hourly: [...hourly.entries()].sort().map(([h, v]) => ({ hourUTC: h, ...stats(v) })),
       restarts: boots ?? 'undetected',
@@ -292,14 +395,30 @@ function grade(recs) {
   console.log(`  ${'UNATTRIBUTED'.padEnd(38)} ${''.padStart(6)} ${''.padStart(11)} `
     + `${''.padStart(7)} ${''.padStart(7)} ${''.padStart(7)} ${residual.toFixed(1).padStart(7)}%`);
   console.log('');
-  console.log('Exit-latency curve (parent doTick by UTC hour) — interval == tick duration:');
+  // ⛔ THE PROXY IS SEVERED ON AN ARMED BUILD (TRA-2203, 07-24).
+  // "doTick duration IS the exit-evaluation interval" held only because exits
+  // ran INSIDE the tick and interval fires coalesced into it. TRA-2200 hoisted
+  // checkExits onto its own timer; wherever that is ARMED, this table is a
+  // tick-cost curve and NOT an exit-latency curve, and quoting it as one
+  // understates a fixed book or overstates a healthy one. Read the arm state
+  // and say which curve this is — never print the identity unconditionally.
+  if (arm === null) {
+    console.log('doTick by UTC hour  [arm state UNREADABLE — do NOT quote this as exit latency]:');
+  } else if (arm.enabled && arm.armedEngineCount > 0) {
+    console.log(`doTick by UTC hour — TICK-COST curve ONLY. The exit hoist is ARMED `
+      + `(${arm.armedEngineCount}/${arm.engineCount} engines,`);
+    console.log(`  ${arm.modes}), so exit latency for those engines is NOT this table — read it off`);
+    console.log(`  /api/health/exit-cadence. It REMAINS the exit-latency curve for any UNARMED engine.`);
+  } else {
+    console.log('Exit-latency curve (parent doTick by UTC hour) — hoist DISARMED, so interval == tick duration:');
+  }
   for (const [h, v] of [...hourly.entries()].sort()) {
     const s = stats(v);
     console.log(`  ${h}Z  n=${String(s.n).padStart(4)}  p50 ${s.p50.toFixed(1).padStart(6)}s  `
       + `p90 ${s.p90.toFixed(1).padStart(6)}s  max ${s.max.toFixed(1).padStart(6)}s`);
   }
   console.log('');
-  console.log('Tail owners (weight max + p90, not sum — the tail is what delays exits):');
+  console.log('Tail owners (weight max + p90, not sum — the tail is what delays a tick):');
   for (const s of [...subs].sort((a, b) => b.max - a.max).slice(0, 3)) {
     console.log(`  ${s.phase}  max ${s.max.toFixed(1)}s  p90 ${s.p90.toFixed(1)}s  share ${s.share.toFixed(1)}%`);
   }
@@ -310,7 +429,8 @@ function grade(recs) {
   } else if (boots.length === 0) {
     console.log('RESTARTS: none in this window — the grade above is steady-state. ✓');
   } else {
-    console.log(`RESTARTS: ${boots.length} deploy(s) booted inside this window. Every throttled`);
+    console.log(`RESTARTS: ${boots.length} boot(s) inside this window (deploys UNION watchdog`);
+    console.log(`          self-restarts — a self-restart leaves NO deploy record). Every throttled`);
     console.log(`          sink fires on the first tick of a new process regardless of its`);
     console.log(`          interval, so the ${BOOT_TRANSIENT_MS / 1000}s after each boot is a TRANSIENT, not steady state:`);
     for (const b of boots) console.log(`            ${b.at}  ${b.commit || '???????'}  trigger=${b.trigger}`);
