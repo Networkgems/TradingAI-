@@ -33,6 +33,7 @@ import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
 import { withPhase, timeSyncPhase } from './phase-timing.js';
+import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
 import {
@@ -4508,7 +4509,14 @@ export class SignalEngine {
     // live position; Signal 3 (sma200_reclaim) stays display-only. A failed
     // scan is swallowed so a cold Yahoo feed can't take down the rest of the
     // tick.
-    if (Date.now() - this.lastSma200ScanAt >= SMA200_SCAN_INTERVAL_MS) {
+    // TRA-2171 phase 2 — the throttle says this engine is DUE, but the
+    // process-wide slot says whether it may run NOW. Stamping the throttle only
+    // on a successful acquire is the whole point: a skipped engine stays due and
+    // retries next tick, so no scan is ever dropped, it is only spread.
+    if (
+      Date.now() - this.lastSma200ScanAt >= SMA200_SCAN_INTERVAL_MS &&
+      trySma200ScanSlot()
+    ) {
       this.lastSma200ScanAt = Date.now();
       try {
         await withPhase('signal.doTick.sma200-scan', () => this.runSma200Scan(activeSymbols));
@@ -4517,6 +4525,8 @@ export class SignalEngine {
           component: 'sma200-scan',
           reason: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        releaseSma200ScanSlot();
       }
     }
 
