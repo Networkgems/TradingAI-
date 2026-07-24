@@ -95,10 +95,22 @@ export interface OptionTradeJournalSetup {
   /**
    * TRA-1183 — entry archetype that admitted the fill (e.g. `ema-pullback`,
    * `volume-breakout`), forwarded verbatim onto the journal open row so the
-   * ema-pullback fill count is distinguishable from bare `single_leg_rv`.
+   * ema-pullback fill count is distinguishable from a bare single-leg fill.
    * Omitted/undefined for opens that weren't gated by a swing archetype.
    */
   entryArchetype?: string;
+  /**
+   * TRA-2245 — the journal STRUCTURE label this open should stamp. Introduced so
+   * the directional callers of {@link PaperOptionsAccount.openOptionFromRvCandidate}
+   * can stamp `single_leg_directional` while the genuine RV-scan caller keeps
+   * `single_leg_rv`. `openOptionFromRvCandidate` historically hardcoded
+   * `single_leg_rv` for ALL callers (TRA-1682), which is why every fill for 3+
+   * weeks read as RV even though the RV engine is compile-time OFF (TRA-1207) and
+   * the fills were really the near-ATM directional sleeve. Omitted ⇒ defaults to
+   * `single_leg_rv` (the reserved genuine-RV label), so the RV-scan caller is
+   * byte-for-byte unchanged. Forward-only: historical rows keep their old label.
+   */
+  structureLabel?: string;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -1727,7 +1739,11 @@ export class PaperOptionsAccount {
     if (journalSetup) {
       const entrySlippageUsd = (premiumPaid - rawMark) * contracts * 100;
       // TRA-1656 — retain the fill-time quote (see `openOptionFromCandidate`).
-      this.queueJournalOpen(position, 'single_leg_rv', totalCost, journalSetup, entrySlippageUsd, quoteOf(signal, rawMark));
+      // TRA-2245 — the structure label is now caller-controlled: the directional
+      // callers pass `structureLabel: 'single_leg_directional'`; the genuine RV-scan
+      // caller omits it and defaults to the reserved `single_leg_rv`. (Historically
+      // this was hardcoded `single_leg_rv` for every caller — TRA-1682.)
+      this.queueJournalOpen(position, journalSetup.structureLabel ?? 'single_leg_rv', totalCost, journalSetup, entrySlippageUsd, quoteOf(signal, rawMark));
     }
     return position;
   }

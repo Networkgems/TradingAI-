@@ -652,6 +652,12 @@ export const GATE_R_BASIS_STRUCTURES: ReadonlySet<string> = new Set([
   'single_leg',
   'single_leg_otm',
   'single_leg_rv',
+  // TRA-2245 — the directional single-leg sleeve, renamed out of the shared
+  // `single_leg_rv` label. Same instrument as the others here (full-premium
+  // atRiskUsd, `mark·0.75` stop) so it keeps the clean 4× premium→gate R basis.
+  // `directional` is the legacy live-fill-ledger tag for the same sleeve, kept
+  // for hydration back-compat.
+  'single_leg_directional',
   'directional',
 ]);
 
@@ -777,9 +783,13 @@ export interface OptionTradeJournalDeltaBucketStat {
  * TRA-1661 shipped this keyed on `structure` alone, on the stated principle that
  * "the sleeves are the confound; pooling them measures the sleeve mix, not the delta
  * slope" — and then pooled three sleeves anyway, because `structure` is not the sleeve.
- * `openOptionFromRvCandidate` journals `structure: 'single_leg_rv'` unconditionally for
- * all of its callers (TRA-1682), so that one label carries the gated RV long, the
- * ungated demo directional churner, and the IV-vs-RV premium buyer.
+ * `openOptionFromRvCandidate` historically journaled `structure: 'single_leg_rv'`
+ * unconditionally for all of its callers (TRA-1682), so that one label carried the gated
+ * RV long, the ungated demo directional churner, and the IV-vs-RV premium buyer.
+ * TRA-2245 split the two directional callers out onto `single_leg_directional`, so the
+ * `single_leg_rv` label is now reserved for the (compile-time-OFF) RV scan only —
+ * forward-only, historical rows keep the old shared label — but keying on `structure`
+ * alone is STILL wrong for pre-2245 history, hence the archetype key below.
  *
  * That is not a theoretical confound. On the live book the |Δ| ≥ 0.65 tail — the exact
  * population TRA-1690 grades — is **n=94, of which 37 are `iv-rv-buy-premium`**: a

@@ -47,8 +47,20 @@ export const LIVE_OPTIONS_FEE_SLIPPAGE_LOG_FILENAME = 'live-options-fee-slippage
  */
 const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** Which automated sleeve fired the fill. */
-export type LiveFillSleeve = 'single_leg_rv' | 'single_leg_otm' | 'directional';
+/**
+ * Which automated sleeve fired the fill.
+ *
+ * TRA-2245 — the directional single-leg sleeve is `single_leg_directional`, matching
+ * the journal structure label so the fee/slippage ledger and the trade journal name
+ * the sleeve identically. `directional` is the pre-2245 tag for the SAME sleeve, kept
+ * as a legacy alias so on-disk rows written before the rename still hydrate (forward-
+ * only — old rows are not rewritten). New writes use `single_leg_directional`.
+ */
+export type LiveFillSleeve =
+  | 'single_leg_rv'
+  | 'single_leg_otm'
+  | 'single_leg_directional'
+  | 'directional';
 
 /** Order side of the fill. */
 export type LiveFillSide = 'buy_to_open' | 'sell_to_close';
@@ -208,7 +220,14 @@ export interface LiveOptionsFeeSlippageHydration {
 }
 
 function isSleeve(v: unknown): v is LiveFillSleeve {
-  return v === 'single_leg_rv' || v === 'single_leg_otm' || v === 'directional';
+  // TRA-2245 — accept both the new `single_leg_directional` and the legacy
+  // `directional` alias so pre-rename on-disk rows still hydrate.
+  return (
+    v === 'single_leg_rv' ||
+    v === 'single_leg_otm' ||
+    v === 'single_leg_directional' ||
+    v === 'directional'
+  );
 }
 function isSide(v: unknown): v is LiveFillSide {
   return v === 'buy_to_open' || v === 'sell_to_close';

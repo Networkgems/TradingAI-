@@ -6225,6 +6225,13 @@ export class SignalEngine {
           ...(emaPullbackReason
             ? { entryArchetype: 'ema-pullback' }
             : { entryArchetype: 'rv-long' }),
+          // TRA-2245 — the ONE caller that keeps the reserved `single_leg_rv`
+          // structure label: this is the genuine RV-scan path (compile-time OFF
+          // since TRA-1207). Stamped explicitly so a future re-arm of the RV
+          // engine attributes distinctly from the directional sleeve, which now
+          // journals `single_leg_directional`. (Equivalent to the default, but
+          // stated to make the reserved-for-RV invariant legible at the call site.)
+          structureLabel: 'single_leg_rv',
         };
 
         // TRA-1293 — PoP / delta entry gate + Delta/Theta ratio floor. HARD
@@ -6630,7 +6637,7 @@ export class SignalEngine {
    * calibration ledger. Best-effort + swallowed (accounting must never break the
    * exit path). `fees` is null at fill time (commission lives on the account-history
    * endpoint — a follow-up reconcile). Sleeve is derived from the position's signal
-   * type (OTM vs the RV/directional single-leg bucket). Only called on the LIVE
+   * type (OTM vs the directional single-leg bucket — TRA-2245). Only called on the LIVE
    * broker close sites; demo closes pay a modelled cost and have nothing to
    * calibrate. `quote` is the exit-time quote when the caller has it (for the close
    * slippage-vs-ask/mid); null when unavailable ⇒ those legs stay null (never 0).
@@ -6644,8 +6651,16 @@ export class SignalEngine {
     quote?: { bid?: number | null; ask?: number | null } | null,
   ): void {
     if (!position.optionSymbol) return;
+    // TRA-2245 — a non-OTM single-leg live fill is the DIRECTIONAL sleeve, not the
+    // True RV engine: the RV scan is compile-time OFF (TRA-1207) and its live arm is
+    // separately dark, so every live non-OTM single-leg fill that reaches here is a
+    // directional open (its open-side mirror already tags `single_leg_directional`).
+    // `single_leg_rv` stays reserved for the genuine RV path if it is ever re-armed —
+    // which would require the position to carry its own sleeve provenance, out of scope
+    // while RV is compile-time off. Keeps this ledger's label consistent with the trade
+    // journal (TRA-2245) and with the open side of this same ledger.
     const sleeve: LiveFillSleeve =
-      position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_rv';
+      position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_directional';
     const ask =
       quote && typeof quote.ask === 'number' && Number.isFinite(quote.ask) ? quote.ask : null;
     const bid =
@@ -7874,6 +7889,11 @@ export class SignalEngine {
           // counter. A dead sleeve was undetectable by the exact metric we would have
           // used to detect it. Forward-only — historical rows cannot be back-attributed.
           entryArchetype: 'directional',
+          // TRA-2245 — stamp the directional STRUCTURE label so this near-ATM,
+          // trend-aligned sleeve no longer wears the `single_leg_rv` label of the
+          // (compile-time-OFF, TRA-1207) True RV engine. Keeps the board's RV vs
+          // directional read honest at the structure axis, not just the archetype.
+          structureLabel: 'single_leg_directional',
         };
         // TRA-1490 — surface a live directional signal whose broker mirror was
         // suppressed/voided instead of skipping silently (mirrors the RV path's
@@ -7949,7 +7969,10 @@ export class SignalEngine {
           && isOptionLiveDirectionalEnabled(process.env)
           && this.tradierLiveOptionsEnabled
         ) {
-          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, { sleeve: 'directional' });
+          // TRA-2245 — tag the live-fill fee/slippage ledger with the renamed
+          // directional sleeve so open and close rows share one label and neither
+          // is confused with the True RV sleeve.
+          const mirrored = await this.mirrorLiveOptionOpen(opened, surfaceLiveSkip, { sleeve: 'single_leg_directional' });
           if (!mirrored) continue;
         }
 
@@ -8569,9 +8592,13 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
-      // Attribution hook: separates these fills from bare single_leg_rv in the
+      // Attribution hook: separates these fills from the RV sleeve in the
       // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
       entryArchetype: 'iv-rv-buy-premium',
+      // TRA-2245 — a directional (`sleeve: 'directional'`) mispriced-value buy,
+      // NOT the True RV engine. Stamp the directional structure label so it stops
+      // sharing `single_leg_rv` with the (compile-time-OFF) RV scan.
+      structureLabel: 'single_leg_directional',
     };
 
     const opened = this.optionsAccount.openOptionFromRvCandidate(
@@ -11493,6 +11520,10 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
+      // TRA-2245 — an AI-Options-Ideas single-leg directional entry, not the True
+      // RV engine. Stamp the directional structure label rather than inheriting
+      // the reserved `single_leg_rv` default.
+      structureLabel: 'single_leg_directional',
     };
     const opened = acct.openOptionFromRvCandidate(
       signal,

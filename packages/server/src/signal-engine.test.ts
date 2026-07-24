@@ -4365,7 +4365,8 @@ describe('SignalEngine.enterPaperOptionsIdea — option-trade journal wiring (TR
     let rows = await listOptionTradeJournal();
     expect(rows).toHaveLength(1);
     expect(rows[0]!.id).toBe(pos!.id);
-    expect(rows[0]!.structure).toBe('single_leg_rv');
+    // TRA-2245 — AI-Options-Ideas single-leg is a directional entry: `single_leg_directional`.
+    expect(rows[0]!.structure).toBe('single_leg_directional');
     expect(rows[0]!.outcome).toBe('OPEN');
     expect(rows[0]!.ivRank).toBeNull(); // TRA-1103 honest-unknown (no per-tick chain fetch)
     expect(rows[0]!.trend).toBe('up'); // call ⇒ up
@@ -5460,9 +5461,11 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
   // TRA-1123 — the directional path is the ONLY single-leg demo open that fires
   // on a calm tape, but it previously passed no journalSetup, so the option
   // journal accrued only combo rows and never a single_leg_* row → could never
-  // reach closed>0. Prove the directional open now journals as `single_leg_rv`
-  // with the honest-unknown ivRank and the confluence-derived trend.
-  it('flag ON + journal ON — directional open journals a single_leg_rv OPEN row', async () => {
+  // reach closed>0. TRA-2245 — the directional open now journals as
+  // `single_leg_directional` (renamed out of the shared `single_leg_rv` label so
+  // it is not confused with the compile-time-OFF True RV engine), with the
+  // honest-unknown ivRank and the confluence-derived trend.
+  it('flag ON + journal ON — directional open journals a single_leg_directional OPEN row (TRA-2245)', async () => {
     process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
     process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
     const journalFile = join(tmpdir(), `tra1123-journal-${process.pid}.jsonl`);
@@ -5481,16 +5484,17 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
 
       const rows = await listOptionTradeJournal();
       expect(rows.length).toBeGreaterThanOrEqual(2);
-      expect(rows.every(r => r.structure === 'single_leg_rv')).toBe(true);
+      // TRA-2245 — directional fills stamp `single_leg_directional`, NOT `single_leg_rv`.
+      expect(rows.every(r => r.structure === 'single_leg_directional')).toBe(true);
+      expect(rows.every(r => r.structure === 'single_leg_rv')).toBe(false);
       expect(rows.every(r => r.outcome === 'OPEN')).toBe(true);
       expect(rows.every(r => r.ivRank === null)).toBe(true); // honest-unknown, no per-tick chain fetch
       const upRow = rows.find(r => r.symbol === 'UPP');
       const downRow = rows.find(r => r.symbol === 'DWN');
       expect(upRow!.trend).toBe('up'); // call ⇒ uptrend confluence
       expect(downRow!.trend).toBe('down'); // put ⇒ downtrend confluence
-      // TRA-1682 — the row still carries `structure: 'single_leg_rv'` (that string is
-      // hardcoded for all three `openOptionFromRvCandidate` callers), so the STRUCTURE
-      // alone can never identify this sleeve. The archetype is what separates it.
+      // TRA-2245 — the structure label NOW disambiguates the sleeve; `entryArchetype`
+      // still corroborates it (both axes agree this is the directional sleeve).
       expect(rows.every(r => r.entryArchetype === 'directional')).toBe(true);
     } finally {
       delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
@@ -5499,24 +5503,30 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     }
   });
 
-  // TRA-1682 — THE acceptance test. `openOptionFromRvCandidate` stamps
-  // `structure: 'single_leg_rv'` unconditionally, so all three of its callers land in
-  // ONE journal bucket. Two of them (the selector-gated + greeks-gated RV long, and the
-  // ungated demo DIRECTIONAL opener) also wrote NO `entryArchetype`, which made them
-  // indistinguishable — 416 of 1058 live `single_leg_rv` rows carried |Δ| < 0.45, a
-  // value `selectRvLongCandidate` cannot emit, i.e. directional fills wearing an RV
-  // label. Every RV-structure grade taken off that bucket was unattributable.
+  // TRA-1682 / TRA-2245 — THE acceptance test. `openOptionFromRvCandidate` USED to
+  // stamp `structure: 'single_leg_rv'` unconditionally, so all three of its callers
+  // landed in ONE journal bucket. Two of them (the selector-gated + greeks-gated RV
+  // long, and the ungated demo DIRECTIONAL opener) also wrote NO `entryArchetype`,
+  // which made them indistinguishable — 416 of 1058 live `single_leg_rv` rows carried
+  // |Δ| < 0.45, a value `selectRvLongCandidate` cannot emit, i.e. directional fills
+  // wearing an RV label. Every RV-structure grade taken off that bucket was
+  // unattributable.
   //
   // The failure this pins down is worse than mislabeling: TRA-1680's algebraically
   // impossible greeks gate would have driven the true RV long to ZERO fills while the
   // `single_leg_rv` fill count DID NOT MOVE, because directional kept feeding the same
   // counter. A dead sleeve was invisible to the exact metric we would have used to
-  // detect it. So: same structure, DISTINCT archetype — assert the partition directly.
+  // detect it.
   //
-  // Caller 3 (`routeIvRvBuyPremium` → `iv-rv-buy-premium`) has always tagged itself and
-  // is pinned by its own test ("routing ON + journal ON — open is tagged entryArchetype
-  // iv-rv-buy-premium"); it is asserted distinct from these two here.
-  it('all three openOptionFromRvCandidate callers share structure single_leg_rv but produce DISTINCT archetypes (TRA-1682)', async () => {
+  // TRA-2245 fixed the root of it: the directional caller now stamps
+  // `single_leg_directional`, so the STRUCTURE axis ALONE separates the RV long from
+  // the directional churner — and the archetype corroborates. Assert both axes agree.
+  //
+  // Caller 3 (`routeIvRvBuyPremium` → `iv-rv-buy-premium`) is a directional sleeve too
+  // (`single_leg_directional`), pinned distinct by its own test ("routing ON + journal
+  // ON — open is tagged entryArchetype iv-rv-buy-premium"); its archetype is asserted
+  // distinct from these two here.
+  it('RV-scan caller keeps single_leg_rv; directional caller stamps single_leg_directional, with DISTINCT archetypes (TRA-1682/TRA-2245)', async () => {
     process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
     process.env['ENABLE_OPTION_TRADE_JOURNAL'] = '1';
     const journalFile = join(tmpdir(), `tra1682-journal-${process.pid}.jsonl`);
@@ -5551,11 +5561,14 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       expect(rvRow).toBeDefined();
       expect(dirRow).toBeDefined();
 
-      // The bucket really is shared — this is the premise of the whole defect.
+      // TRA-2245 — the STRUCTURE label now tells them apart: RV keeps the reserved
+      // `single_leg_rv`, directional stamps `single_leg_directional`. This is the
+      // disambiguation the board asked for (they are no longer one shared bucket).
       expect(rvRow!.structure).toBe('single_leg_rv');
-      expect(dirRow!.structure).toBe('single_leg_rv');
+      expect(dirRow!.structure).toBe('single_leg_directional');
+      expect(rvRow!.structure).not.toBe(dirRow!.structure);
 
-      // …and the archetype now tells them apart. No row folds into `unspecified`.
+      // …and the archetype corroborates. No row folds into `unspecified`.
       expect(rvRow!.entryArchetype).toBe('rv-long');
       expect(dirRow!.entryArchetype).toBe('directional');
 
@@ -5604,7 +5617,7 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       const rows = await listOptionTradeJournal();
       const upRow = rows.find(r => r.symbol === 'UPP');
       expect(upRow).toBeDefined();
-      expect(upRow!.structure).toBe('single_leg_rv');
+      expect(upRow!.structure).toBe('single_leg_directional'); // TRA-2245 — directional sleeve
       // The journaled IV-rank is a real percentile, NOT the legacy hardcoded null.
       expect(upRow!.ivRank).not.toBeNull();
       expect(Number.isFinite(upRow!.ivRank!)).toBe(true);
@@ -5886,6 +5899,8 @@ describe('SignalEngine — IV-RV mispriced routing (TRA-1203)', () => {
       const rows = await listOptionTradeJournal();
       expect(rows.length).toBeGreaterThanOrEqual(1);
       expect(rows.every(r => r.entryArchetype === 'iv-rv-buy-premium')).toBe(true);
+      // TRA-2245 — a directional mispriced-value buy journals `single_leg_directional`.
+      expect(rows.every(r => r.structure === 'single_leg_directional')).toBe(true);
       expect(rows.every(r => r.outcome === 'OPEN')).toBe(true);
     } finally {
       delete process.env[OPTION_TRADE_JOURNAL_FLAG];

@@ -391,11 +391,13 @@ export function computeStrategyIntrospection(
  * attribute.
  *
  * TRA-2215 / TRA-2193b — rows are keyed `structure::entryArchetype`, NOT by the
- * bare structure. `structure` is a STRUCTURE LABEL, not a sleeve: four different
- * sleeves share `single_leg_rv`. Keyed on the bare label, one spurious decay flag
- * throttled all four sleeves at once, while a real decay in one sleeve was
- * diluted by the three healthy ones. This is the same cohort key the TRA-1691
- * delta rollup already uses, so the two folds now name cohorts identically.
+ * bare structure. `structure` is a STRUCTURE LABEL, not a sleeve: pre-TRA-2245,
+ * four different sleeves shared `single_leg_rv` (TRA-2245 split the directional
+ * callers onto `single_leg_directional`, but that is forward-only, so historical
+ * rows still carry the shared label). Keyed on the bare label, one spurious decay
+ * flag throttled all four sleeves at once, while a real decay in one sleeve was
+ * diluted by the healthy ones. This is the same cohort key the TRA-1691 delta
+ * rollup already uses, so the two folds now name cohorts identically.
  */
 export function optionJournalToStrategyRows(
   records: OptionTradeJournalRecord[],

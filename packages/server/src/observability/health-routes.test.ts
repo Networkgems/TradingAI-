@@ -2178,14 +2178,23 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
 
   it('carries the structure-vs-sleeve warning in the PAYLOAD, not only in the ticket', () => {
     const { body } = mountRvScan();
-    expect(body.structureLabel).toBe('single_leg_rv');
-    // `single_leg_rv` is shared by every caller of openOptionFromRvCandidate
-    // (TRA-1682). A reader who does not know that grades the wrong population,
-    // and a fact that only reaches a ticket does not exist downstream.
+    // TRA-2245 — per-path structure labels: only rv_scan keeps `single_leg_rv`; the
+    // directional producers journal `single_leg_directional`. A reader who does not
+    // know that grades the wrong population, and a fact that only reaches a ticket
+    // does not exist downstream.
+    expect(body.structureLabels).toEqual({
+      rv_scan: 'single_leg_rv',
+      directional: 'single_leg_directional',
+      iv_rv_buy_premium: 'single_leg_directional',
+    });
+    // Each path also carries its own structureLabel inline.
+    const paths = body.paths as unknown as Array<Record<string, unknown>>;
+    expect(paths.find((p) => p.path === 'directional')!.structureLabel).toBe('single_leg_directional');
+    expect(paths.find((p) => p.path === 'rv_scan')!.structureLabel).toBe('single_leg_rv');
     expect(String(body.note)).toContain('entryArchetype');
     expect(String(body.note)).toContain('not a sleeve');
     // All three producer paths are enumerated, so none can go quiet unnoticed.
-    expect((body.paths as unknown as unknown[]).length).toBe(3);
+    expect(paths.length).toBe(3);
   });
 });
 

@@ -1,9 +1,12 @@
-// TRA-2193 — per-scan telemetry for the option entry paths that journal
-// `structure: 'single_leg_rv'`, so "the scanner ran and found nothing" stops
-// reading identically to "the scanner never ran".
+// TRA-2193 — per-scan telemetry for the option single-leg entry paths, so "the
+// scanner ran and found nothing" stops reading identically to "the scanner never
+// ran". TRA-2245 — these paths no longer share ONE journal label: the `directional`
+// and `iv_rv_buy_premium` paths journal `single_leg_directional`; only `rv_scan`
+// (compile-time OFF, TRA-1207) journals `single_leg_rv`. Each path carries its own
+// `structureLabel` below so the readout names the right bucket per path.
 //
 // The failure this exists to kill: on 2026-07-22 and 07-23 the book produced
-// ZERO `single_leg_rv` opens after five sessions of 18–38, and no surface in the
+// ZERO directional opens after five sessions of 18–38, and no surface in the
 // process could say which of those two states we were in. The cause turned out
 // to be a wiped `ENABLE_OPTION_DEMO_DIRECTIONAL` (TRA-2136's bulk env PUT), i.e.
 // the loop never executed a single iteration — but a drought would have produced
@@ -39,7 +42,7 @@
 // since boot. A lifetime counter that survives a reboot cannot prove the scanner
 // ran today, which is the entire question being asked.
 
-/** An entry path that journals `structure: 'single_leg_rv'` (TRA-1682). */
+/** An option single-leg entry path instrumented for scan liveness (TRA-1682/TRA-2193). */
 export type RvScanPathId = 'rv_scan' | 'directional' | 'iv_rv_buy_premium';
 
 export const RV_SCAN_PATH_IDS: readonly RvScanPathId[] = [
@@ -47,6 +50,18 @@ export const RV_SCAN_PATH_IDS: readonly RvScanPathId[] = [
   'directional',
   'iv_rv_buy_premium',
 ] as const;
+
+/**
+ * TRA-2245 — the journal `structure` label each path stamps. Only `rv_scan` (the
+ * compile-time-OFF True RV engine) journals `single_leg_rv`; the two directional
+ * producers journal `single_leg_directional`. Published per path so the health
+ * readout stops implying every path feeds one shared `single_leg_rv` bucket.
+ */
+export const RV_SCAN_PATH_STRUCTURE_LABEL: Readonly<Record<RvScanPathId, string>> = {
+  rv_scan: 'single_leg_rv',
+  directional: 'single_leg_directional',
+  iv_rv_buy_premium: 'single_leg_directional',
+};
 
 /**
  * The bucket name used for symbols that entered the loop, did not pass, and were
@@ -219,6 +234,8 @@ export function beginRvScan(
 /** Read-only view of one path, shaped for the health route. */
 export interface RvScanPathView {
   path: RvScanPathId;
+  /** TRA-2245 — the journal `structure` label this path stamps (rv vs directional). */
+  structureLabel: string;
   /** Is this entry path armed right now (resolved by the caller from live flags). */
   enabled: boolean;
   /**
@@ -246,6 +263,7 @@ export function summarizeRvScanPath(
   if (!opts.instrumented || !s) {
     return {
       path,
+      structureLabel: RV_SCAN_PATH_STRUCTURE_LABEL[path],
       enabled: opts.enabled,
       instrumented: opts.instrumented,
       // Never-ran and never-watched both report null. They are distinguished by
@@ -259,6 +277,7 @@ export function summarizeRvScanPath(
   }
   return {
     path,
+    structureLabel: RV_SCAN_PATH_STRUCTURE_LABEL[path],
     enabled: opts.enabled,
     instrumented: true,
     lastScanAt: s.lastScanAt,

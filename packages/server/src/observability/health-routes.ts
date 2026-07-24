@@ -50,7 +50,7 @@ import {
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
-import { summarizeRvScanPath } from '../rv-scan-telemetry.js'; // TRA-2193
+import { summarizeRvScanPath, RV_SCAN_PATH_STRUCTURE_LABEL } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
 import { buildWheelPromotionGateSummary } from '../wheel-promotion-gate-store.js'; // TRA-2028
 import { isPerpFundingCarryEnabled } from '../perp-funding-carry-flag.js';
@@ -2629,9 +2629,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // fact that THIS route answers <500ms is itself the live "event loop is not
   // starved" signal the ticket's acceptance asks for.
   // TRA-2193 — unauthenticated, secrets-free liveness readout for the option
-  // entry paths that journal `structure: 'single_leg_rv'`.
+  // single-leg entry paths.
   //
-  // WHY THIS EXISTS. On 2026-07-22 and 07-23 the book produced zero `single_leg_rv`
+  // WHY THIS EXISTS. On 2026-07-22 and 07-23 the book produced zero single-leg
   // opens after five sessions of 18–38, and nothing in the process could say
   // whether the scanner had run and found nothing or had never run at all. Both
   // states rendered as the same thing: no rows. The cause was a wiped
@@ -2639,15 +2639,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // zero iterations — but a genuine drought would have looked identical from
   // outside. That ambiguity, not the outage, was the defect.
   //
-  // WHY IT REPORTS PATHS AND NOT "THE RV SCANNER". `single_leg_rv` is a STRUCTURE
-  // label, not a sleeve: `openOptionFromRvCandidate` stamps it unconditionally for
+  // WHY IT REPORTS PATHS AND NOT "THE RV SCANNER". The single-leg structure label
+  // is not a sleeve: `openOptionFromRvCandidate` used to stamp `single_leg_rv` for
   // every caller (TRA-1682), and the gated RV scan is only one of them — and has
-  // been compile-time OFF since TRA-1207 on 2026-06-30. A route that described
-  // only `runRelativeValueScan` would answer "disarmed, never ran": true, and
-  // useless, because it would say nothing about the path that actually produced
-  // those 18–38 opens/session. So each producer reports separately and the caller
-  // can see WHICH one went quiet. `entryArchetype` on the journal row is the
-  // matching axis for grading (TRA-1691).
+  // been compile-time OFF since TRA-1207 on 2026-06-30. A route that described only
+  // `runRelativeValueScan` would answer "disarmed, never ran": true, and useless,
+  // because it would say nothing about the path that actually produced those 18–38
+  // opens/session. So each producer reports separately and the caller can see WHICH
+  // one went quiet. `entryArchetype` on the journal row is the matching axis for
+  // grading (TRA-1691). TRA-2245 — those producers now stamp DISTINCT structure
+  // labels: `directional` + `iv_rv_buy_premium` journal `single_leg_directional`;
+  // only `rv_scan` journals `single_leg_rv`. Each path carries its own
+  // `structureLabel` so the readout names the right bucket per path.
   //
   // The null discipline is the whole point and is load-bearing in three places:
   //   • `lastScanAt` / `lastFetchOkAt` are null when unmeasured, NEVER 0 — a 0
@@ -2682,8 +2685,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
 
     const paths = [
       // Instrumented: the demo directional pass. This is the one that actually
-      // fed the `single_leg_rv` bucket, so it is the one whose silence had to
-      // become readable.
+      // fed what WAS the `single_leg_rv` bucket (now `single_leg_directional` since
+      // TRA-2245), so it is the one whose silence had to become readable.
       summarizeRvScanPath('directional', {
         enabled: directionalEnabled,
         instrumented: true,
@@ -2727,18 +2730,23 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
-      // Top-level `enabled` = is ANY producer of `single_leg_rv` rows armed.
+      // Top-level `enabled` = is ANY instrumented single-leg entry path armed.
       enabled: armed.length > 0,
       verdict,
       lastScanAt,
       scanCountSinceBoot: watched.reduce((n, p) => n + (p.scanCountSinceBoot ?? 0), 0),
-      structureLabel: 'single_leg_rv',
+      // TRA-2245 — per-path structure labels. `single_leg_rv` is now reserved for the
+      // (compile-time-OFF) rv_scan path; the directional producers journal
+      // `single_leg_directional`. Each path in `paths[]` also carries its own
+      // `structureLabel`; this map is the at-a-glance summary.
+      structureLabels: RV_SCAN_PATH_STRUCTURE_LABEL,
       // Stated inline because every reader of this route has, historically, been
       // one step away from grading the wrong population (TRA-1682 / TRA-1691).
       note:
-        '`single_leg_rv` is a STRUCTURE label shared by every caller of '
-        + 'openOptionFromRvCandidate, not a sleeve. Group journal rows by '
-        + '`structure × entryArchetype` (forward-only since TRA-1682) before grading; '
+        'Structure label is not a sleeve. Since TRA-2245 the directional producers '
+        + 'journal `single_leg_directional` and only rv_scan journals `single_leg_rv`, '
+        + 'but PRE-2245 rows still share `single_leg_rv` (forward-only). Group journal '
+        + 'rows by `structure × entryArchetype` before grading; '
         + '`single_leg_rv × unspecified` is pre-tagging history, not a gradeable sleeve.',
       dataSource: {
         provider: 'tradier-chain',
