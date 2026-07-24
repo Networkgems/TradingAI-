@@ -483,6 +483,46 @@ export function renderInfraDefaults(
 }
 
 /**
+ * TRA-2209 — record of which keys the boot self-heal ACTUALLY seeded into
+ * `process.env`, keyed to the map that supplied each one.
+ *
+ * WHY A RECORD AND NOT A RE-DERIVATION: once {@link renderRatifiedDemoDefaults}
+ * /{@link renderInfraDefaults} have been applied, a seeded key is byte-identical
+ * to a Render-supplied one — `process.env.ENABLE_CHURN_LOSS_BRAKE === '1'` either
+ * way. Calling those functions again at request time returns `{}` (the keys are
+ * now in env), so a drift check that re-derived would report every seeded key as
+ * healthy env and hide the exact fragility it exists to surface: these arms
+ * survive on a CODE FALLBACK, not because the store holds them. The boot loop is
+ * the only moment the distinction is observable, so it is captured there.
+ *
+ * Deliberately append-only within a process lifetime and never cleared outside
+ * tests — a seed that happened cannot un-happen.
+ */
+const seededEnvKeys: Record<string, string> = {};
+
+/**
+ * Record that `key` was seeded into the boot env by `source` (the name of the
+ * self-heal map). Called from the boot seed loops in index.ts.
+ */
+export function recordSeededEnvKey(key: string, source: string): void {
+  seededEnvKeys[key] = source;
+}
+
+/**
+ * Keys the boot self-heal supplied, mapped to their source map. Empty off Render
+ * (nothing is ever seeded there) and empty when the env already held every key —
+ * both of which are the honest answer, not a missing measurement.
+ */
+export function getSeededEnvKeys(): Readonly<Record<string, string>> {
+  return { ...seededEnvKeys };
+}
+
+/** Test-only: drop the seeded-key record so cases do not bleed into each other. */
+export function __resetSeededEnvKeysForTests(): void {
+  for (const key of Object.keys(seededEnvKeys)) delete seededEnvKeys[key];
+}
+
+/**
  * Read allowlisted demo flags from `<dataDir>/demo-flags.json`. Returns an empty
  * object when the file is absent or malformed — the default, zero-override path.
  * Values are coerced to strings so they slot straight into a `ProcessEnv`.

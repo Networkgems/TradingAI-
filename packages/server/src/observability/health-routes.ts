@@ -14,6 +14,8 @@ import { EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyExitIntervalHistogram
 import { isTestAccount } from '../test-accounts.js'; // TRA-1949
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
+import { evaluateEnvDrift, loadRenderBlueprint } from './env-drift.js'; // TRA-2209
+import { getSeededEnvKeys } from '../demo-flags.js'; // TRA-2209
 import { checkStaleState } from './alerts.js';
 import { ATM_SEED_ENABLED_BY_DEFAULT } from '../options-research-input.js';
 import {
@@ -183,6 +185,17 @@ export interface LiveHealthDeps {
    * only mounted when this is provided.
    */
   exitCadence?: () => ExitCadenceHealth[];
+  /**
+   * TRA-2209 — the engine's EFFECTIVE env view (process.env with the
+   * `<DATA_DIR>/demo-flags.json` overlay on top), backing the unauthenticated
+   * `GET /api/health/env-drift` comparison. Must be the same view the engine
+   * consults, or the check would report an operator's daemon-free flag flip as
+   * drift. Resolved per-call so a file flip is picked up on the next probe.
+   * Optional: falls back to raw `process.env`, which is correct off Render where
+   * no overlay is in play. Values are read for comparison ONLY and never
+   * emitted — see the route's redaction note.
+   */
+  effectiveEnv?: () => NodeJS.ProcessEnv;
   /**
    * TRA-901 — the shared secret that grants the unattended TRA-898 daily-watch
    * routine access to the auth-gated `/api/health/demo-book` surface without a
@@ -2759,6 +2772,37 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       watchdog,
     });
+  });
+
+  // TRA-2209 (spun out of TRA-2198) — NO-AUTH declared-vs-running env drift.
+  //
+  // The TRA-2136 env wipe ran SIX DAYS undetected because every health surface
+  // reads the flags the process HOLDS, and none of them had anything to compare
+  // that against. This is the only route that reads render.yaml — the declared
+  // intent — and reports the divergence.
+  //
+  // No-auth by design and by necessity: bqb1's admin auth is dead (401), so a
+  // gated drift check would be exactly as unreachable as the wipe it is meant to
+  // catch. Safe to expose because the payload is KEY NAMES AND STATE LABELS ONLY
+  // — `EnvDriftEntry` has no field that can carry a value, so no amount of drift
+  // can leak one (these keys share a store with TRADIER_API_TOKEN / AUTH_SECRET;
+  // TRA-2163).
+  //
+  // `ok:false` covers BOTH a real divergence AND a broken parse; read `parserOk`
+  // to tell them apart. `declaredKeysParsed`/`declaredValuesParsed` are INPUT-side
+  // counts — `driftCount:0` with `declaredValuesParsed:0` is a BROKEN CHECK, not a
+  // clean box, and is the specific false-green this route was built around.
+  app.get('/api/health/env-drift', (_req, res) => {
+    const report = evaluateEnvDrift({
+      blueprint: loadRenderBlueprint(),
+      // The engine's own effective view: process.env with the demo-flags.json
+      // overlay on top, so an operator's daemon-free flip reads as the running
+      // state rather than as phantom drift. Falls back to raw process.env.
+      runningEnv: deps.effectiveEnv?.() ?? process.env,
+      seededKeys: getSeededEnvKeys(),
+      now,
+    });
+    res.json({ ...report, build: resolveBuildInfo() });
   });
 }
 

@@ -124,6 +124,59 @@ All optional — defaults are listed in `render.yaml`.
 | `MAX_BOOTS_PER_WINDOW` | Restart-storm threshold (default 5 / 10 min). |
 | `ERROR_SPIKE_THRESHOLD` | Errors-per-15-min alert threshold (default 25). |
 
+## Env drift check (TRA-2209)
+
+`GET /api/health/env-drift` is an **unauthenticated, read-only** probe that
+compares `render.yaml` (declared intent) against what the running process
+actually holds. It exists because the TRA-2136 env wipe ran **six days**
+undetected: twelve declared-ON flags read OFF — four of them risk controls —
+while every other health surface stayed green, because every other surface reads
+the flags the process *holds* and none of them had anything to compare that
+against.
+
+```bash
+curl -s https://<deployment>/api/health/env-drift | jq
+```
+
+**Read `parserOk` before you read `driftCount`.** `driftCount: 0` is only good
+news when `parserOk` is true. The first hand-rolled version of this check parsed
+78 keys and **0 values** and printed empty "all clear" sections — it read exactly
+like a healthy box. Both input-side counts are therefore published, and both must
+be non-zero:
+
+| Field | Meaning |
+|---|---|
+| `ok` | `false` on drift **or** a broken parse. Never assume which. |
+| `parserOk` | `false` ⇒ the check is broken and the drift lists mean nothing. |
+| `declaredKeysParsed` | Every `- key:` found. `0` ⇒ blueprint not found/parsed. |
+| `declaredValuesParsed` | Keys with a literal `value:`. **`0` ⇒ the CRLF-class bug.** |
+| `driftCount` | `declaredOnButOff` + `declaredOffButOn` + `valueMismatch`. |
+| `selfHealed` | **Not drift** — a code fallback supplies these (see below). |
+
+`sync: false` keys are skipped (dashboard-managed, legitimately absent from the
+blueprint), as are `generateValue`/`fromService` keys.
+
+The reason that parse broke is worth keeping: `render.yaml` is stored in git as
+**LF**, but `core.autocrlf=true` checks it out **CRLF on Windows**, and JS `.`
+does not match `\r`. A naive parser therefore works on Linux CI and on Render and
+fails only on a hand-run from a Windows box — the one run CI cannot cover, by the
+operator this check exists to serve. The parser splits on `/\r?\n/`; the test
+suite asserts the report is **invariant** to line endings rather than asserting a
+particular one, which would itself be platform-dependent.
+
+`selfHealed` lists keys present only because the boot self-heal
+(`RENDER_RATIFIED_DEMO_DEFAULTS` / `RENDER_INFRA_DEFAULTS` in `demo-flags.ts`)
+re-seeded them. They are not drift, but they are shown because their arm survives
+on a **code fallback and not because the env holds it** — an env wipe leaves them
+looking healthy. `declared: false` on such an entry means the flag is armed on
+every Render boot with **no render.yaml record backing it**, which violates the
+maps' own stated admission criterion; treat it as a finding.
+
+**No values, ever.** The payload is key names and state labels
+(`on`/`off`/`set`/`absent`) only. These keys share a store with
+`TRADIER_API_TOKEN` / `AUTH_SECRET` and the route is unauthenticated, so
+`EnvDriftEntry` has no field capable of carrying a value (TRA-2163).
+
 ## Live-equity acceptance probe (TRA-580)
 
 `GET /api/health/live-equity` is an **unauthenticated, read-only** probe (parity

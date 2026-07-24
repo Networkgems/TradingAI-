@@ -153,6 +153,46 @@ describe('registerLiveHealthRoutes', () => {
     expect(typeof body.uptimeSec).toBe('number');
   });
 
+  // TRA-2209 — the env-drift route must be mounted UNCONDITIONALLY and UNGATED.
+  // bqb1's admin auth is dead (401), so an auth-gated drift check would be exactly
+  // as unreachable as the wipe it exists to catch, and an optionally-mounted one
+  // would 404 on precisely the box that needs it. Both are asserted here.
+  it('serves env drift on GET /api/health/env-drift (no auth handler, always mounted)', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never, // would BLOCK if the route were gated
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      // no `effectiveEnv` dep — the route must still mount and fall back
+    });
+
+    const handlers = routes.get('/api/health/env-drift')!;
+    expect(handlers).toBeDefined();
+    expect(handlers).toHaveLength(1); // unauthenticated
+
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as {
+      parserOk: boolean;
+      declaredKeysParsed: number;
+      declaredValuesParsed: number;
+      driftCount: number;
+      blueprintFound: boolean;
+    };
+
+    // It must actually read the committed render.yaml from the running module
+    // path — a route that reports `blueprintFound:false` in prod is a dead
+    // instrument that still returns 200.
+    expect(body.blueprintFound).toBe(true);
+    expect(body.parserOk).toBe(true);
+    expect(body.declaredKeysParsed).toBeGreaterThan(0);
+    // The count that separates a broken parse from a clean box (TRA-2075) — the
+    // original bug read 78 keys and 0 values and printed "all clear".
+    expect(body.declaredValuesParsed).toBeGreaterThan(0);
+    expect(typeof body.driftCount).toBe('number');
+  });
+
   it('serves a live-health verdict (auth-gated) on GET /api/health/live', async () => {
     const { app, routes } = fakeApp();
     registerLiveHealthRoutes(app, {

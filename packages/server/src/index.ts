@@ -54,6 +54,7 @@ import {
   writeDemoFlagFile,
   renderRatifiedDemoDefaults,
   renderInfraDefaults,
+  recordSeededEnvKey,
   DEMO_FLAG_ALLOWLIST,
 } from './demo-flags.js';
 // TRA-1216 — observe-only perp funding-carry scanner + forward funding-history
@@ -588,6 +589,11 @@ const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 // wins and the self-host is untouched. DEMO-only ⇒ zero real-capital risk.
 for (const [key, value] of Object.entries(renderRatifiedDemoDefaults(DATA_DIR))) {
   process.env[key] = value;
+  // TRA-2209 — record the seed BEFORE it becomes indistinguishable from a
+  // Render-supplied value, so `/api/health/env-drift` can report these as
+  // `selfHealed` (a code fallback holds the arm, not the env store) instead of
+  // silently counting them as healthy.
+  recordSeededEnvKey(key, 'RENDER_RATIFIED_DEMO_DEFAULTS');
   log.info('TRA-1481 seeded board-ratified demo flag on Render (blueprint-sync gap)', {
     flag: key,
     value,
@@ -605,6 +611,7 @@ for (const [key, value] of Object.entries(renderRatifiedDemoDefaults(DATA_DIR)))
 // before the first tick. Capital-incapable ⇒ zero real-money risk.
 for (const [key, value] of Object.entries(renderInfraDefaults())) {
   process.env[key] = value;
+  recordSeededEnvKey(key, 'RENDER_INFRA_DEFAULTS'); // TRA-2209 — see above
   log.info('TRA-1515 seeded infra default on Render (blueprint-sync gap)', {
     flag: key,
     value,
@@ -3299,6 +3306,11 @@ registerLiveHealthRoutes(app, {
   // interval > 30s" invalidation criterion is readable off the live box without a
   // login. Secrets-free (flags, counts, interval buckets).
   exitCadence: () => getAllUserContexts().map(ctx => ctx.engine.getExitCadenceHealth()),
+  // TRA-2209 — the effective env (process.env + demo-flags.json overlay) that the
+  // engine itself consults, so `/api/health/env-drift` compares render.yaml against
+  // what the process ACTUALLY resolves rather than against raw process.env (which
+  // would report every daemon-free operator flip as phantom drift).
+  effectiveEnv: () => demoFlagEnv(),
   internalToken: () => (process.env['DEMO_BOOK_INTERNAL_TOKEN'] ?? '').trim() || undefined,
   demoBooks: () =>
     getAllUserContexts()
