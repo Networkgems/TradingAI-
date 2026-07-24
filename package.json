@@ -17,6 +17,7 @@
     "check:stale-js": "node scripts/check-stale-js.mjs",
     "check:cycles": "node scripts/check-cycles.mjs",
     "check:push-auth": "node scripts/check-git-push-auth.mjs",
+    "check:deploy-drift": "node scripts/check-deploy-drift.mjs",
     "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },

@@ -203,6 +203,31 @@ fine — they cannot reach the running process. This keeps the drift bounded.
 Lifting the freeze (after go-live sign-off, TRA-1648): set `autoDeploy=yes` /
 `autoDeployTrigger=commit` on the service, then delete `launch-window-base`.
 
+#### The drift alarm (TRA-2229) — run it before you grade anything
+
+The pin's real cost is not the extra command, it is that **"merged" gets read as
+"deployed"** and nothing contradicts it. Render emits no event for a deploy that did
+not happen, and `/api/health/version` reports its SHA just as confidently eleven
+commits behind as at the tip. TRA-2214 sat undeployed while it was the named blocker
+on a regrade; the gap surfaced three merges later on TRA-2227, and only because that
+issue happened to re-derive the live SHA by hand. Make it one number instead:
+
+```bash
+pnpm check:deploy-drift
+#   DRIFT = 0  → CURRENT   live is exactly origin/main                  (exit 0)
+#   DRIFT = N  → STALE     N merged commits are NOT running — each named (exit 1)
+#              → DIVERGED  live is off origin/main entirely             (exit 1)
+#              → BLIND     a leg could not be read — never a pass       (exit 3)
+```
+
+BLIND is deliberate and it fails closed: an unreachable health route, a live SHA this
+checkout has never seen, or a failed `git fetch` all abort. A stale local `origin/main`
+matching an equally stale live build would otherwise *manufacture* a CURRENT verdict.
+
+**Before publishing any number measured against `tradingai-bqb1`, run this.** A DRIFT
+of N means the window you just measured ran on the previous build, and the result will
+look completely ordinary.
+
 ### RTH time-window freeze (TRA-1996) — no bqb1 deploy during market hours
 
 The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a
@@ -579,6 +604,11 @@ git push origin main              # drains any stranded commits
 curl -s https://.../api/health/version   # confirm the running SHA (see §2)
 ```
 
-⚠️ Pushing to `main` triggers Render autoDeploy on bqb1. A **deploy freeze may be
-in force** — read §2 "Launch-window deploy freeze" *before* draining the backlog,
-and confirm the pin is still respected.
+⚠️ Pushing to `main` does **not** deploy bqb1. `autoDeploy` is **off** (the pin —
+§2 "Launch-window deploy freeze"); the last commit-hook deploy was 2026-07-12.
+Draining the backlog therefore ships nothing, and `/api/health/version` will keep
+reporting the old SHA with no error anywhere. Confirm the gap explicitly:
+
+```bash
+pnpm check:deploy-drift    # DRIFT = commits between the running build and origin/main
+```

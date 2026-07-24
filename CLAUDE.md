@@ -44,3 +44,39 @@ It runs automatically in `pretest` and in CI ahead of build/test, so a poisoned 
 instead of passing quietly. `.gitignore` also covers `packages/*/src` and `apps/desktop/src`, but
 that only stops a stray `git add -A` from committing the emit — **it does not stop the shadowing**.
 The guard is the part that does.
+
+## Merging does not deploy. Deploying is a command you run.
+
+`tradingai-bqb1` has `autoDeploy=no` / `autoDeployTrigger=off` — **on purpose** (the launch-window
+pin, TRA-1653/TRA-1665; see `docs/runbook.md` §2). The last deploy Render fired from a commit hook
+was **2026-07-12** (`c495294`). Every deploy since has been an explicit REST trigger.
+
+So the manual trigger is **the deploy path, not a fallback**:
+
+```bash
+RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>   # RTH-gated, 13:30–20:00Z
+```
+
+Do not "fix" the pin by turning `autoDeploy` back on. It is what stops a mid-session merge from
+dumping bqb1's warm quote cache and resetting the go-live soak clock (TRA-1996), and lifting it is
+gated on go-live sign-off (TRA-1648).
+
+### What actually bites: a stale build reads identically to a current one
+
+Render emits **no event for a deploy that did not happen**, and `/api/health/version` reports its
+SHA with exactly as much confidence eleven commits behind as at the tip. Nothing anywhere says "you
+are N commits behind `origin/main`". So "merged, CI green" gets read as "deployed", and every
+verdict computed in that window quietly measures the **previous** code — producing numbers that
+look completely ordinary. TRA-2214 sat undeployed while it was the named blocker on a regrade; it
+surfaced three merges later on TRA-2227, and only because that issue re-derived the live SHA by hand.
+
+**Before publishing any number measured against bqb1:**
+
+```bash
+pnpm check:deploy-drift
+#   DRIFT = 0 → CURRENT · N → STALE (each missing commit named) · DIVERGED · BLIND
+```
+
+It fails closed: an unreachable health route, a live SHA unknown to this checkout, or a failed
+`git fetch` all exit BLIND (3), never 0 — because a stale local `origin/main` matching an equally
+stale live build would otherwise manufacture a CURRENT verdict. (TRA-2229)
