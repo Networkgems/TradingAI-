@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rm } from 'fs/promises';
+import { appendFile, mkdir, rm } from 'fs/promises';
 import type { BacktestGateMetrics } from '@trading-app/shared';
 import {
   makeHypothesis,
@@ -28,6 +28,7 @@ import {
   buildRatificationQueueMarkdown,
   RATIFICATION_ISSUE,
 } from './ratification-bridge.js';
+import { ANALYST_AGENT_FLAG } from './analyst-agent.js';
 
 function baseConfig(): ConfigSnapshot {
   return { RV_GATE: { minTrendConfluence: 0.55 } };
@@ -164,6 +165,86 @@ describe('buildHypothesisQueueHealth', () => {
     const on = await buildHypothesisQueueHealth({ [flag]: '1' } as NodeJS.ProcessEnv);
     expect(on.counts.activeOverrides).toBe(1);
     expect(on.demoOverrides.active[0].flag).toBe(flag);
+  });
+});
+
+// TRA-2223 — the board-ratification drain reads this surface (never the logs) and
+// closes a `pendingRatification: []` as a cheap no-op. Three different states emit
+// that same empty list; these pin the fields that SEPARATE them. Each negative case
+// asserts the discriminator actually FIRES, not merely that the field exists.
+describe('buildHypothesisQueueHealth — empty-queue discriminators', () => {
+  it('mirrors the producer arm flag, so an empty queue can be attributed', async () => {
+    const off = await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv);
+    expect(off.counts.pending).toBe(0);
+    expect(off.producer.flag).toBe(ANALYST_AGENT_FLAG);
+    // Producer disarmed ⇒ an empty queue is the expected steady state.
+    expect(off.producer.analystEnabled).toBe(false);
+
+    const on = await buildHypothesisQueueHealth({
+      [ANALYST_AGENT_FLAG]: '1',
+    } as NodeJS.ProcessEnv);
+    // Same empty list, DIFFERENT attribution — this is the separation.
+    expect(on.counts.pending).toBe(0);
+    expect(on.producer.analystEnabled).toBe(true);
+  });
+
+  it('reports a clean read when the store has never been written', async () => {
+    const health = await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv);
+    expect(health.queueRead).toEqual({ ok: true, storeExists: false, skippedLines: 0 });
+  });
+
+  it('counts corrupt lines instead of silently dropping them', async () => {
+    const h = hyp();
+    await runHypothesis(h, deps(PASS_METRICS), 1_700_000_100_000);
+
+    // Append two unparseable lines to the real store, then force a re-fold.
+    await appendFile(tmpFile, 'not json\n{"kind":"enqueue"\n', 'utf-8');
+    setHypothesisQueueFileForTests(tmpFile);
+
+    const health = await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv);
+    // The good item survives — the queue is not lost...
+    expect(health.counts.pending).toBe(1);
+    expect(health.pendingRatification[0].id).toBe(h.id);
+    // ...but the drops are now VISIBLE rather than reading as never-staged.
+    expect(health.queueRead.ok).toBe(true);
+    expect(health.queueRead.storeExists).toBe(true);
+    expect(health.queueRead.skippedLines).toBe(2);
+  });
+
+  it('flags a FAILED store read as a false zero, not a drained queue', async () => {
+    // A directory at the store path exists but cannot be read as a file
+    // (EISDIR) — the shape of a real read failure.
+    const dirPath = join(tmpdir(), `ratif-bridge-dir-${process.pid}-${seq}`);
+    await mkdir(dirPath, { recursive: true });
+    setHypothesisQueueFileForTests(dirPath);
+    try {
+      const health = await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv);
+      // Empty — exactly as a genuinely drained queue would read...
+      expect(health.counts.pending).toBe(0);
+      expect(health.pendingRatification).toEqual([]);
+      // ...but NOT trustworthy, and the readout now says so.
+      expect(health.queueRead.ok).toBe(false);
+      expect(health.queueRead.storeExists).toBe(true);
+      expect(health.queueRead.error).toBeTruthy();
+    } finally {
+      setHypothesisQueueFileForTests(null);
+      await rm(dirPath, { recursive: true, force: true });
+    }
+  });
+
+  it('does not leak a failed read onto the next load', async () => {
+    const dirPath = join(tmpdir(), `ratif-bridge-dir2-${process.pid}-${seq}`);
+    await mkdir(dirPath, { recursive: true });
+    setHypothesisQueueFileForTests(dirPath);
+    expect((await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv)).queueRead.ok).toBe(false);
+
+    // Re-point at a clean path: the stale verdict must not persist, or every
+    // later drain would read as degraded forever.
+    setHypothesisQueueFileForTests(tmpFile);
+    const health = await buildHypothesisQueueHealth({} as NodeJS.ProcessEnv);
+    expect(health.queueRead.ok).toBe(true);
+    expect(health.queueRead.error).toBeUndefined();
+    await rm(dirPath, { recursive: true, force: true });
   });
 });
 

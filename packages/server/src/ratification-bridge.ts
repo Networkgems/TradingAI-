@@ -27,11 +27,14 @@
 
 import {
   demoFlagFor,
+  hypothesisQueueReadHealth,
   listRatificationQueue,
   listDemoOverrides,
   type DemoConfigOverride,
   type PromotionItem,
+  type QueueReadHealth,
 } from './hypothesis-pipeline.js';
+import { ANALYST_AGENT_FLAG, isAnalystAgentEnabled } from './analyst-agent.js';
 
 /** The TRA-994 board-confirmation card is raised against the keystone epic issue. */
 export const RATIFICATION_ISSUE = 'TRA-994';
@@ -182,6 +185,22 @@ function viewOf(item: PromotionItem): StagedHypothesisView {
 export interface HypothesisQueueHealth {
   /** The TRA-994 keystone issue board cards are raised against. */
   issue: string;
+  /**
+   * Is the live `source:'reflection'` producer (TRA-1006) even armed? An empty
+   * queue under a DISARMED producer is the expected steady state; an empty
+   * queue under an ARMED one is a claim that wants checking. Without this the
+   * drain routine cannot tell the two apart from its own read (TRA-2223).
+   */
+  producer: {
+    analystEnabled: boolean;
+    flag: string;
+  };
+  /**
+   * Whether the fold behind `pendingRatification` is trustworthy. A failed
+   * store read starts empty, which is indistinguishable from a drained queue
+   * unless the readout says so (TRA-2223).
+   */
+  queueRead: QueueReadHealth;
   /** Gate-passing items awaiting a board decision, ranked by G0 score desc. */
   pendingRatification: StagedHypothesisView[];
   /** Ratified demo overrides — `active` are those whose flag is set in `env`. */
@@ -211,6 +230,13 @@ export async function buildHypothesisQueueHealth(
   ]);
   return {
     issue: RATIFICATION_ISSUE,
+    producer: {
+      analystEnabled: isAnalystAgentEnabled(env),
+      flag: ANALYST_AGENT_FLAG,
+    },
+    // Read AFTER the queue load above — `hypothesisQueueReadHealth` describes
+    // the fold that produced `pending`, and the load is what populates it.
+    queueRead: hypothesisQueueReadHealth(),
     pendingRatification: pending.map(viewOf),
     demoOverrides: overrides,
     counts: {

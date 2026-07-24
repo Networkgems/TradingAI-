@@ -346,6 +346,9 @@ let storeFileOverride: string | null = null;
 export function setHypothesisQueueFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
+  // Read health travels with the cache — never let a prior file's verdict leak
+  // onto the next load (TRA-2223).
+  readHealth = CLEAN_READ;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -353,6 +356,39 @@ function storeFile(): string {
 
 /** In-memory folded view: hypothesis id → latest item. */
 let cache: Map<string, PromotionItem> | null = null;
+
+/**
+ * Why the last load ended with the queue it did (TRA-2223).
+ *
+ * An empty `listRatificationQueue()` is emitted by THREE different states: the
+ * store was never written (nothing staged), the store read cleanly and holds no
+ * pending items, or the read FAILED and we started empty. The third is a false
+ * zero — `ensureLoaded` logs it and carries on — and the board-ratification
+ * drain routine reads the HTTP health surface, not the logs, so without this it
+ * closes a failed read as a "cheap no-op". Corrupt-line skips are the same
+ * hazard in miniature: items silently vanish from an otherwise-successful read.
+ */
+export interface QueueReadHealth {
+  /** The store was read end-to-end, or legitimately does not exist yet. */
+  ok: boolean;
+  /** Store file present on disk. `!storeExists && ok` ⇒ nothing ever staged. */
+  storeExists: boolean;
+  /** Corrupt JSONL lines skipped by the fold — items dropped from the queue. */
+  skippedLines: number;
+  /** Failure reason when `ok` is false. */
+  error?: string;
+}
+
+const CLEAN_READ: QueueReadHealth = { ok: true, storeExists: false, skippedLines: 0 };
+let readHealth: QueueReadHealth = CLEAN_READ;
+
+/**
+ * Read health of the currently-cached fold. Recomputed with the cache, so it
+ * always describes the load that produced the items callers are seeing.
+ */
+export function hypothesisQueueReadHealth(): QueueReadHealth {
+  return { ...readHealth };
+}
 
 function foldLine(map: Map<string, PromotionItem>, line: QueueLine): void {
   if (line.kind === 'enqueue') {
@@ -376,7 +412,9 @@ async function ensureLoaded(): Promise<Map<string, PromotionItem>> {
   if (cache) return cache;
   const map = new Map<string, PromotionItem>();
   const path = storeFile();
-  if (existsSync(path)) {
+  const storeExists = existsSync(path);
+  let health: QueueReadHealth = { ok: true, storeExists, skippedLines: 0 };
+  if (storeExists) {
     try {
       const raw = await readFile(path, 'utf-8');
       for (const rawLine of raw.split('\n')) {
@@ -385,15 +423,21 @@ async function ensureLoaded(): Promise<Map<string, PromotionItem>> {
         try {
           foldLine(map, JSON.parse(trimmed) as QueueLine);
         } catch {
-          // Skip a single corrupt line rather than losing the whole queue.
+          // Skip a single corrupt line rather than losing the whole queue —
+          // but COUNT it, so the drop is visible on the health surface instead
+          // of reading as an item that was never staged (TRA-2223).
+          health = { ...health, skippedLines: health.skippedLines + 1 };
         }
       }
     } catch (err) {
-      log.error('failed to read hypothesis queue, starting empty', {
-        reason: err instanceof Error ? err.message : String(err),
-      });
+      const reason = err instanceof Error ? err.message : String(err);
+      log.error('failed to read hypothesis queue, starting empty', { reason });
+      // Starting empty is a FALSE ZERO, not an empty queue. Record it so the
+      // readout can say so rather than presenting `[]` as a clean drain.
+      health = { ...health, ok: false, error: reason };
     }
   }
+  readHealth = health;
   cache = map;
   return cache;
 }
