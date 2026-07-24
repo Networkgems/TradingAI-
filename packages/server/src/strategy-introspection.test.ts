@@ -269,6 +269,44 @@ describe('edge-decay detector — false-positive rate under a shuffled null (TRA
   });
 });
 
+// TRA-2215 / TRA-2193b — the sleeve keying only separates rows that CARRY an
+// archetype, and `entryArchetype` is forward-only from TRA-1682: 2,142 of 2,322
+// closed rows on live (92.2%) have none and pool into `<structure>::unspecified`.
+// Measured on the live journal 2026-07-24 — `single_leg_rv::unspecified` alone
+// holds 1,069 closed rows against 128 for the one tagged sleeve. So for the bulk
+// of the book the dilution defect survives under a new label, and `unspecified`
+// must not read in the EOD as though it were one sleeve.
+describe('pooled `::unspecified` cohort carries its blast radius (TRA-2215)', () => {
+  const judgedFlag = (strategy: string, n: number) => {
+    const series = fatTailedRSeries(mulberry32(44), n, RV_LIKE);
+    const out = computeStrategyIntrospection(rowsFromR(series, strategy));
+    return out.edgeDecay.find((e) => e.strategy === strategy)!;
+  };
+
+  it('annotates a judged verdict on a pooled cohort', () => {
+    const flag = judgedFlag('single_leg_rv::unspecified', 400);
+    expect(flag.decayThresholdR).not.toBeNull();
+    expect(flag.reason).toContain('`unspecified` is NOT a sleeve');
+    expect(flag.reason).toContain('cannot be backfilled');
+  });
+
+  // The note must DISCRIMINATE. If it rode along on every verdict it would carry
+  // no information — a tagged sleeve is exactly the case where the keying worked.
+  it('does NOT annotate a genuinely-keyed sleeve', () => {
+    const flag = judgedFlag('single_leg_rv::directional', 400);
+    expect(flag.decayThresholdR).not.toBeNull();
+    expect(flag.reason).not.toContain('NOT a sleeve');
+  });
+
+  // An UNJUDGED entry has already declined to make a claim; there is no blast
+  // radius to report, and TRA-2218 made that state legible on its own.
+  it('does NOT annotate an unjudged cohort', () => {
+    const flag = judgedFlag('single_leg_rv::unspecified', 40);
+    expect(flag.decayThresholdR).toBeNull();
+    expect(flag.reason).not.toContain('NOT a sleeve');
+  });
+});
+
 describe('optionJournalToStrategyRows adapter', () => {
   it('keeps only closed rows and maps trend → regime', () => {
     const records: OptionTradeJournalRecord[] = [

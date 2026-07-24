@@ -246,6 +246,33 @@ function bootstrapWindowMeanQuantile(
  * 64.3% false-positive rate on shuffled live rows. See the shuffled-null
  * regression test, which fails on that rule and is the reason this one exists.
  */
+/**
+ * TRA-2215 / TRA-2193b — the blast-radius annotation for a POOLED cohort.
+ *
+ * Keying on `structure::entryArchetype` separates sleeves only for rows that
+ * carry an archetype, and `entryArchetype` is FORWARD-ONLY from TRA-1682: on
+ * live at 2026-07-24, 2,142 of 2,322 closed rows (92.2%) predate the tagging and
+ * carry none, so they all land in `<structure>::unspecified`. That cohort is
+ * therefore still a POOL of every sleeve that closed before tagging began — a
+ * flag on it throttles all of them at once, and a real decay in one of them is
+ * diluted by the rest. Exactly the defect the sleeve keying was meant to fix,
+ * surviving under a new label for the bulk of the journal.
+ *
+ * It cannot be backfilled: the archetype was never written for those rows. So
+ * the honest move is the one the issue asked for as its fallback — say it in the
+ * reason string, so `unspecified` cannot read in the EOD as if it were one
+ * sleeve. Appended to JUDGED verdicts only: an UNJUDGED entry has already
+ * declined to make a claim, and the note would just be noise there.
+ */
+const POOLED_COHORT_SUFFIX =
+  ' — NOTE: `unspecified` is NOT a sleeve. `entryArchetype` is forward-only from '
+  + 'TRA-1682, so this cohort pools every sleeve that closed before tagging began '
+  + '(92.2% of the live journal) and cannot be backfilled. This verdict covers all '
+  + 'of them at once; read the blast radius accordingly.';
+
+/** TRA-2215 — the pooled-cohort key that {@link POOLED_COHORT_SUFFIX} annotates. */
+const UNSPECIFIED_SLEEVE_SUFFIX = '::unspecified';
+
 export function detectEdgeDecay(
   strategy: string,
   sortedRows: StrategyTradeRow[],
@@ -293,6 +320,11 @@ export function detectEdgeDecay(
     } else {
       reason = `Baseline expectancy non-positive (${base.toFixed(4)}R) — nothing to decay from`;
     }
+  }
+
+  // Judged verdicts on a pooled `::unspecified` cohort carry the blast radius.
+  if (decayThresholdR !== null && strategy.endsWith(UNSPECIFIED_SLEEVE_SUFFIX)) {
+    reason += POOLED_COHORT_SUFFIX;
   }
 
   return {
