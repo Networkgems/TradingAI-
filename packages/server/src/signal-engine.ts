@@ -3803,7 +3803,9 @@ export class SignalEngine {
     // hold the event loop past the 4s watchdog budget. See {@link TickPacer}.
     const tickPacer = new TickPacer();
     if (Date.now() - this.lastNewsRefresh > NEWS_REFRESH_MS) {
-      const news = await fetchStocksNews(this.getActiveSymbols());
+      // TRA-2203 — named sink: whole-universe news fan-out on the 5-min cadence.
+      const news = await withPhase('signal.doTick.news-refresh', () =>
+        fetchStocksNews(this.getActiveSymbols()));
       // TRA-534 — attach deterministic lexicon-v1 sentiment to each article on
       // the 5-min refresh so getNews()/getSymbolSentiment() and the News tab
       // read scored items without re-scoring per request.
@@ -3831,7 +3833,9 @@ export class SignalEngine {
       this.marketReviewGatesEnabled
       && Date.now() - this.lastMarketReviewFetchAt > MARKET_REVIEW_REFRESH_MS
     ) {
-      this.cachedMarketReview = await getLatestMarketReview('premarket').catch(() => null);
+      // TRA-2203 — named sink: persisted market-review read on the gate cadence.
+      this.cachedMarketReview = await withPhase('signal.doTick.market-review-read', () =>
+        getLatestMarketReview('premarket').catch(() => null));
       this.lastMarketReviewFetchAt = Date.now();
     }
 
@@ -3842,7 +3846,11 @@ export class SignalEngine {
     if (Date.now() - this.lastAutopilotDecayRefreshAt > AUTOPILOT_DECAY_REFRESH_MS) {
       this.lastAutopilotDecayRefreshAt = Date.now();
       try {
-        const rows = await listOptionTradeJournal({ mode: 'demo' });
+        // TRA-2203 — named sink: the durable demo journal read, whose cost grows
+        // with the journal across a session. `async` (I/O), distinct from the
+        // `sync` introspection fold below — the two must not be conflated.
+        const rows = await withPhase('signal.doTick.autopilot-journal-read', () =>
+          listOptionTradeJournal({ mode: 'demo' }));
         // TRA-1905 — the introspection fold is a SYNCHRONOUS O(journal) CPU pass
         // whose cost grows with the durable demo journal across a session/days;
         // it is a prime suspect for the `signal.doTick` block trip. Name it at the
@@ -3877,7 +3885,12 @@ export class SignalEngine {
     }
 
     const activeSymbols = this.getActiveSymbols();
-    const quotes = await fetchQuotes(activeSymbols);
+    // TRA-2203 — named sink, and the one the phase-1/phase-2 tape was blindest to:
+    // an UNCONDITIONAL whole-universe quote fan-out on EVERY tick (~568 symbols),
+    // where every other named sink is throttled or mode-gated. It was the single
+    // largest unlabelled await in the body, so any "unattributed %" measured before
+    // this label existed was dominated by it.
+    const quotes = await withPhase('signal.doTick.quote-batch', () => fetchQuotes(activeSymbols));
     // TRA-1996 — stamp via the shared helper the decoupled quote refresher also
     // uses, so `symbolState.lastUpdated` is written the same way on both paths.
     const prices = this.applyQuotes(quotes, activeSymbols);
@@ -4114,7 +4127,14 @@ export class SignalEngine {
       // the sweep above has already dropped the off-universe names.
       const swingMode = this.equitySwingModeEnabled();
       // Run strategies and collect new signals
+      // TRA-2203 — named sink: the per-symbol evaluate+route loop over the whole
+      // evaluable universe. `equity-entry-sweep` above names only the CANDLE FETCH;
+      // this loop is the separate, unlabelled cost of evaluating every symbol and
+      // awaiting `routeEquitySignal` on each fire. Deliberately NOT nested inside
+      // the sweep label — the two are siblings, so the global Σsub/Σ doTick ratio
+      // stays free of double-counting.
       const evalYielder = new EvalYielder();
+      await withPhase('signal.doTick.equity-eval-loop', async () => {
       for (let symIdx = 0; symIdx < evaluable.length; symIdx++) {
         const { sym, candles } = evaluable[symIdx]!;
         // TRA-1082 / TRA-1905 — yield mid-tick so the per-symbol indicator math
@@ -4157,6 +4177,7 @@ export class SignalEngine {
           await this.routeEquitySignal(signal, prices.get(signal.symbol), 'deterministic');
         }
       }
+      }); // TRA-2203 — end signal.doTick.equity-eval-loop
       // TRA-954 — conviction-DCA scale-in pass. Hard no-op unless
       // CONVICTION_DCA.enabled (ships false; live promotion gated on the
       // TRA-958 sign-off). Shares this block's gates: deterministic
