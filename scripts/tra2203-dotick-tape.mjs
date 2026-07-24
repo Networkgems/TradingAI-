@@ -50,11 +50,19 @@
 //   --from / --to   window, ISO8601. Default: today's RTH (13:30–20:05Z).
 //   --json          emit the grade as JSON instead of a table.
 //   --allow-blind   grade anyway with the blindness caveat stamped on the output.
+//   --dump=FILE     write the raw {phase,durationMs,ts} records to FILE as JSON.
+//                   The tape pull is ~60 pages and rate-limits partway through, so
+//                   re-pulling the same closed window just to re-cut the numbers
+//                   costs minutes and burns quota. Dump once, re-analyse offline.
+//                   Records are pre-boot-exclusion; `boots` is dumped alongside so
+//                   a downstream cut can apply the SAME exclusion this script does.
 //
 // ── Exit codes ───────────────────────────────────────────────────────────────
 //   0  graded
 //   2  usage / auth / API error
 //   3  BLIND — the expected labels are absent from the tape; no verdict emitted
+
+import { writeFileSync } from 'node:fs';
 
 const API = 'https://api.render.com/v1';
 const OWNER_ID = 'tea-d7macfog4nts73ai6p40';
@@ -352,6 +360,19 @@ function grade(recs) {
   const warmRecs = boots && boots.length
     ? recs.filter(r => !inBootWindow(r.ts, boots))
     : recs;
+
+  // Dump BEFORE the blindness gate: a blind tape is exactly the one you want to
+  // inspect by hand, and re-pulling it costs another full paginated walk.
+  const dumpTo = valOf('--dump');
+  if (dumpTo) {
+    writeFileSync(dumpTo, JSON.stringify({
+      window: { from: FROM, to: TO },
+      bootTransientMs: BOOT_TRANSIENT_MS,
+      boots: boots ?? null,
+      records: recs,
+    }, null, 1));
+    process.stderr.write(`[tape] dumped ${recs.length} raw records -> ${dumpTo}\n`);
+  }
 
   const main = grade(recs);
   if (!main) {
