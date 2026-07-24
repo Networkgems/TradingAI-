@@ -136,6 +136,50 @@ async function pullTape(from, to) {
   return [...seen.values()];
 }
 
+// ── Restart contamination (TRA-2205) ─────────────────────────────────────────
+// Several doTick sinks are throttled off a `lastXAt` member that initialises to
+// 0, so `Date.now() - 0 >= INTERVAL` is TRUE on the first tick of every process
+// and they ALL fire at boot regardless of how wide their interval is. The worst
+// is `sma200-scan` (4 h interval): it emits 5 fires — one per engine — inside
+// ~35 s of every boot, up to 42.7 s each, then goes silent for four hours.
+//
+// A window that starts at a boot therefore measures the BOOT TRANSIENT and
+// reports it as if it were the steady state. That is not hypothetical: TRA-2205
+// opened on "sma200-scan is 72% of doTick", measured over 23 minutes that began
+// 31 s after a deploy. Boot-excluded, over a warm window on the same process,
+// sma200-scan's share is ZERO.
+//
+// So: find the boots, and always show the grade with them removed.
+const BOOT_TRANSIENT_MS = 120_000;
+
+async function pullBoots(from, to) {
+  // Widen the left edge: a deploy that finished shortly BEFORE the window still
+  // projects its transient INTO it.
+  const since = new Date(new Date(from).getTime() - BOOT_TRANSIENT_MS).toISOString();
+  const url = `${API}/services/${SERVICE_ID}/deploys?limit=50`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
+  });
+  if (!res.ok) {
+    console.error(`[tape] deploys API ${res.status} — cannot detect restarts; `
+      + 'grading WITHOUT boot exclusion. Treat a dominant sma200-scan with suspicion.');
+    return null;
+  }
+  const body = await res.json();
+  return body
+    .map(e => e.deploy ?? e)
+    // `finishedAt` is when the new process is serving — the boot instant.
+    .filter(d => d.finishedAt && d.finishedAt >= since && d.finishedAt <= to)
+    .map(d => ({ id: d.id, at: d.finishedAt, commit: (d.commit?.id ?? '').slice(0, 7),
+                 trigger: d.trigger ?? d.details?.trigger ?? '?' }))
+    .sort((a, b) => (a.at < b.at ? -1 : 1));
+}
+
+const inBootWindow = (ts, boots) => boots.some(b => {
+  const d = new Date(ts).getTime() - new Date(b.at).getTime();
+  return d >= 0 && d <= BOOT_TRANSIENT_MS;
+});
+
 const pct = (arr, p) => {
   if (!arr.length) return 0;
   const s = [...arr].sort((a, b) => a - b);
@@ -154,6 +198,29 @@ function stats(durs) {
   };
 }
 
+// Grade a record set by the GLOBAL ratio. Returns null when the set carries no
+// parent records (no denominator) — the caller decides whether that is fatal.
+function grade(recs) {
+  const byPhase = new Map();
+  for (const r of recs) {
+    if (!byPhase.has(r.phase)) byPhase.set(r.phase, []);
+    byPhase.get(r.phase).push(r.durationMs);
+  }
+  const parent = byPhase.get(PARENT) ?? [];
+  if (!parent.length) return null;
+  const parentSum = sum(parent);
+  const subs = [...byPhase.entries()]
+    .filter(([k]) => k !== PARENT && k.startsWith(`${PARENT}.`))
+    .map(([k, v]) => ({ phase: k, ...stats(v), share: (sum(v) / parentSum) * 100 }))
+    .sort((a, b) => b.sumS - a.sumS);
+  const namedSum = sum(subs.map(s => s.sumS));
+  return {
+    byPhase, subs,
+    p: stats(parent),
+    residual: 100 - (namedSum / (parentSum / 1000)) * 100,
+  };
+}
+
 (async () => {
   console.error(`[tape] window ${FROM} -> ${TO}`);
   const recs = await pullTape(FROM, TO);
@@ -162,18 +229,17 @@ function stats(durs) {
     process.exit(3);
   }
 
-  const byPhase = new Map();
-  for (const r of recs) {
-    if (!byPhase.has(r.phase)) byPhase.set(r.phase, []);
-    byPhase.get(r.phase).push(r.durationMs);
-  }
+  const boots = await pullBoots(FROM, TO);
+  const warmRecs = boots && boots.length
+    ? recs.filter(r => !inBootWindow(r.ts, boots))
+    : recs;
 
-  const parent = byPhase.get(PARENT) ?? [];
-  if (!parent.length) {
+  const main = grade(recs);
+  if (!main) {
     console.error(`BLIND: no '${PARENT}' records — cannot form a denominator.`);
     process.exit(3);
   }
-  const parentSum = sum(parent);
+  const { byPhase, subs, p, residual } = main;
 
   const blind = !byPhase.has(CANARY);
   if (blind && !has('--allow-blind')) {
@@ -186,15 +252,6 @@ function stats(durs) {
     process.exit(3);
   }
 
-  const subs = [...byPhase.entries()]
-    .filter(([k]) => k !== PARENT && k.startsWith(`${PARENT}.`))
-    .map(([k, v]) => ({ phase: k, ...stats(v), share: (sum(v) / parentSum) * 100 }))
-    .sort((a, b) => b.sumS - a.sumS);
-
-  const namedSum = sum(subs.map(s => s.sumS));
-  const residual = 100 - (namedSum / (parentSum / 1000)) * 100;
-  const p = stats(parent);
-
   // Hourly parent buckets — this IS the exit-latency curve.
   const hourly = new Map();
   for (const r of recs) {
@@ -204,11 +261,17 @@ function stats(durs) {
     hourly.get(h).push(r.durationMs);
   }
 
+  const warm = warmRecs.length === recs.length ? null : grade(warmRecs);
+
   if (has('--json')) {
     console.log(JSON.stringify({
       window: { from: FROM, to: TO }, blind,
       parent: { phase: PARENT, ...p }, residualPct: residual, subs,
       hourly: [...hourly.entries()].sort().map(([h, v]) => ({ hourUTC: h, ...stats(v) })),
+      restarts: boots ?? 'undetected',
+      bootExcluded: warm
+        ? { parent: { phase: PARENT, ...warm.p }, residualPct: warm.residual, subs: warm.subs }
+        : null,
     }, null, 2));
     return;
   }
@@ -240,6 +303,48 @@ function stats(durs) {
   for (const s of [...subs].sort((a, b) => b.max - a.max).slice(0, 3)) {
     console.log(`  ${s.phase}  max ${s.max.toFixed(1)}s  p90 ${s.p90.toFixed(1)}s  share ${s.share.toFixed(1)}%`);
   }
+  // ── Restart contamination (TRA-2205) ───────────────────────────────────────
+  console.log('');
+  if (boots === null) {
+    console.log('RESTARTS: could not be read — the grade above may contain boot transients.');
+  } else if (boots.length === 0) {
+    console.log('RESTARTS: none in this window — the grade above is steady-state. ✓');
+  } else {
+    console.log(`RESTARTS: ${boots.length} deploy(s) booted inside this window. Every throttled`);
+    console.log(`          sink fires on the first tick of a new process regardless of its`);
+    console.log(`          interval, so the ${BOOT_TRANSIENT_MS / 1000}s after each boot is a TRANSIENT, not steady state:`);
+    for (const b of boots) console.log(`            ${b.at}  ${b.commit || '???????'}  trigger=${b.trigger}`);
+    const dropped = recs.length - warmRecs.length;
+    console.log(`          ${dropped} of ${recs.length} phase records (${((dropped / recs.length) * 100).toFixed(1)}%) fall in a boot transient.`);
+    console.log('');
+    if (!warm) {
+      console.log('  BOOT-EXCLUDED GRADE: no doTick records survive — this window is ALL boot.');
+      console.log('  ⇒ it measures a restart, not a session. Do NOT quote its shares.');
+    } else {
+      console.log('  BOOT-EXCLUDED GRADE (the one to quote):');
+      console.log(`    ${PARENT.padEnd(38)} n=${String(warm.p.n).padStart(5)}  sum ${warm.p.sumS.toFixed(1)}s  `
+        + `p50 ${warm.p.p50.toFixed(1)}s  p90 ${warm.p.p90.toFixed(1)}s  max ${warm.p.max.toFixed(1)}s`);
+      for (const s of warm.subs.slice(0, 6)) {
+        console.log(`      ${s.phase.replace(`${PARENT}.`, '').padEnd(36)} `
+          + `${s.share.toFixed(1).padStart(6)}%  max ${s.max.toFixed(1).padStart(6)}s  p90 ${s.p90.toFixed(1).padStart(6)}s`);
+      }
+      console.log(`      ${'UNATTRIBUTED'.padEnd(36)} ${warm.residual.toFixed(1).padStart(6)}%`);
+      // Name the sinks whose share the boot transient inflated most.
+      const moved = subs.map(s => {
+        const w = warm.subs.find(x => x.phase === s.phase);
+        return { phase: s.phase, from: s.share, to: w ? w.share : 0 };
+      }).filter(m => m.from - m.to > 1).sort((a, b) => (b.from - b.to) - (a.from - a.to));
+      if (moved.length) {
+        console.log('');
+        console.log('    Shares INFLATED by the boot transient (all-window -> boot-excluded):');
+        for (const m of moved.slice(0, 4)) {
+          console.log(`      ${m.phase.replace(`${PARENT}.`, '').padEnd(36)} `
+            + `${m.from.toFixed(1)}%  ->  ${m.to.toFixed(1)}%`);
+        }
+      }
+    }
+  }
+
   console.log('');
   console.log('NOTE: shares are the GLOBAL ratio Sigma(sub)/Sigma(doTick). Per-tick containment');
   console.log('      is NOT computed and must not be — >=5 concurrent engines with no engine id');
