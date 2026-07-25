@@ -336,3 +336,135 @@ describe('TradierRelativeValueScannerService', () => {
     });
   });
 });
+
+// TRA-161 — `scanOtm` used to flatten EVERY failure of the snapshot path into a
+// single `reason: 'unavailable'`, because `getSelectorChain` returns a bare
+// `null` for all of them. That is enough for the in-process signal-engine
+// caller (it only asks "did I get rows?"), but it makes an empty scan
+// undiagnosable for a human: a missing credential, an open breaker and a symbol
+// with no listed chain are the same string. The desktop panel (this ticket)
+// has to tell the operator WHICH one happened.
+//
+// These tests pin the discrimination itself — one reason per precondition, each
+// asserting it is NOT the legacy catch-all — plus the invariant that matters
+// for safety: `getSelectorChain` still returns `null` in exactly the same
+// cases, so the shadow option selector in `signal-engine` is untouched by the
+// split.
+describe('TradierRelativeValueScannerService.scanOtm — discriminated reasons (TRA-161)', () => {
+  function otmRows(): OptionChainRow[] {
+    // Spot is 100 in `makeService`, so calls above it are the OTM side.
+    return [row(105, 'call', 0.30), row(110, 'call', 0.30), row(115, 'call', 0.30)];
+  }
+
+  it('returns candidates with reason ok on a healthy chain', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue(otmRows());
+
+    const result = await svc.scanOtm('TEST');
+    expect(result.reason).toBe('ok');
+    expect(result.spot).toBe(100);
+    expect(result.expiration).toBe(EXP);
+    expect(result.candidates.length).toBeGreaterThan(0);
+    // Ranked by |mispricingPct| descending — the panel slices a top-N off this.
+    const mags = result.candidates.map((c) => Math.abs(c.mispricingPct));
+    expect([...mags].sort((a, b) => b - a)).toEqual(mags);
+  });
+
+  it('reports no_credentials — not unavailable — when the client is absent', async () => {
+    const svc = new TradierRelativeValueScannerService({ fetchSpot: async () => 100 });
+    const result = await svc.scanOtm('TEST');
+    expect(result.reason).toBe('no_credentials');
+    expect(result.reason).not.toBe('unavailable');
+    expect(result.candidates).toHaveLength(0);
+    // Unchanged contract for the in-process caller.
+    expect(await svc.getSelectorChain('TEST')).toBeNull();
+  });
+
+  it('reports no_spot — not unavailable — when the quote feed has no price', async () => {
+    // NB: `makeService({ spot: null })` does NOT work — the helper's
+    // `overrides.spot ?? 100` collapses an explicit null back to 100, so a
+    // "no spot" fixture built that way silently scans a healthy chain and the
+    // test passes for the wrong reason. Drive the seam directly.
+    const { svc, client } = makeService({ fetchSpotImpl: async () => null });
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue(otmRows());
+
+    const result = await svc.scanOtm('TEST');
+    expect(result.reason).toBe('no_spot');
+    expect(result.candidates).toHaveLength(0);
+    expect(await svc.getSelectorChain('TEST')).toBeNull();
+  });
+
+  it('reports no_expirations — not unavailable — when nothing lists in the DTE window', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([]);
+
+    const result = await svc.scanOtm('TEST');
+    expect(result.reason).toBe('no_expirations');
+    expect(result.candidates).toHaveLength(0);
+    expect(await svc.getSelectorChain('TEST')).toBeNull();
+  });
+
+  it('reports no_chain — not unavailable — when the expiration returns zero rows', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockResolvedValue([]);
+
+    const result = await svc.scanOtm('TEST');
+    expect(result.reason).toBe('no_chain');
+    expect(result.candidates).toHaveLength(0);
+    expect(await svc.getSelectorChain('TEST')).toBeNull();
+  });
+
+  it('reports fetch_error with the upstream message, then breaker_open on the retry', async () => {
+    const { svc, client } = makeService();
+    client.getExpirations.mockResolvedValue([EXP]);
+    client.getChainSnapshot.mockRejectedValue(new Error('tradier exploded'));
+
+    const first = await svc.scanOtm('TEST');
+    expect(first.reason).toBe('fetch_error');
+    expect(first.errorMessage).toContain('tradier exploded');
+
+    // That failure tripped the breaker, so the very next scan short-circuits —
+    // and must say so, rather than repeating the upstream error it did not make.
+    expect(svc.diagnostics().breakerOpen).toBe(true);
+    const second = await svc.scanOtm('TEST');
+    expect(second.reason).toBe('breaker_open');
+    expect(second.candidates).toHaveLength(0);
+    expect(await svc.getSelectorChain('TEST')).toBeNull();
+  });
+
+  it('never emits the legacy unavailable catch-all from any precondition', async () => {
+    // The regression guard: if a new early-return is added to the resolver and
+    // left un-named, this is what catches it.
+    const cases: Array<() => Promise<{ reason?: string }>> = [
+      async () => {
+        const svc = new TradierRelativeValueScannerService({ fetchSpot: async () => 100 });
+        return svc.scanOtm('TEST');
+      },
+      async () => {
+        const { svc, client } = makeService({ fetchSpotImpl: async () => null });
+        client.getExpirations.mockResolvedValue([EXP]);
+        client.getChainSnapshot.mockResolvedValue(otmRows());
+        return svc.scanOtm('TEST');
+      },
+      async () => {
+        const { svc, client } = makeService();
+        client.getExpirations.mockResolvedValue([]);
+        return svc.scanOtm('TEST');
+      },
+      async () => {
+        const { svc, client } = makeService();
+        client.getExpirations.mockResolvedValue([EXP]);
+        client.getChainSnapshot.mockResolvedValue([]);
+        return svc.scanOtm('TEST');
+      },
+    ];
+    for (const run of cases) {
+      const result = await run();
+      expect(result.reason).not.toBe('unavailable');
+      expect(result.reason).toBeTruthy();
+    }
+  });
+});

@@ -115,7 +115,45 @@ export interface OtmMispricingScanResult {
   spot: number | null;
   expiration: string | null;
   candidates: OtmMispricingCandidate[];
-  reason?: 'ok' | 'unavailable';
+  /**
+   * TRA-161 — widened from `'ok' | 'unavailable'`. `scanOtm` used to flatten
+   * every distinct failure of the snapshot path into a single `'unavailable'`,
+   * because `getSelectorChain` returns a bare `null` for all of them. That is
+   * fine for the in-process signal-engine caller (which only asks "did I get
+   * rows?"), but it makes an empty scan UNDIAGNOSABLE for a human: a missing
+   * Tradier credential, an open breaker, and a symbol with no listed chain all
+   * render identically. The reason now survives the resolver so the desktop
+   * panel can say WHICH one happened. `'unavailable'` is retained in the union
+   * for callers that still switch on it, but the resolver no longer emits it.
+   */
+  reason?: OtmScanReason;
+  /** Upstream error text when `reason === 'fetch_error'`. */
+  errorMessage?: string;
+}
+
+/**
+ * TRA-161 — why a snapshot-backed scan produced no rows. Mirrors the reason set
+ * {@link RelativeValueScanResult} already discriminates, minus RV-only states.
+ */
+export type OtmScanReason =
+  | 'ok'
+  | 'no_credentials'
+  | 'breaker_open'
+  | 'no_spot'
+  | 'no_expirations'
+  | 'no_chain'
+  | 'fetch_error'
+  /** Legacy catch-all; no longer emitted, kept so existing switches still type. */
+  | 'unavailable';
+
+/**
+ * TRA-161 — the snapshot resolution outcome. Exactly one of `snapshot` (with
+ * `reason: 'ok'`) or a non-ok `reason` is meaningful.
+ */
+interface SelectorChainResolution {
+  snapshot: SelectorChainSnapshot | null;
+  reason: OtmScanReason;
+  errorMessage?: string;
 }
 
 export interface RelativeValueScannerDiagnostics {
@@ -171,9 +209,11 @@ export interface RelativeValueScannerService {
    * original TRA-158/TRA-159 options strategy the board re-enabled in place of
    * RV). Rides the same 60s chain snapshot cache + circuit breaker + DTE
    * auto-pick as {@link scan} / {@link getSelectorChain}, so it never adds
-   * Tradier load beyond what a same-symbol RV scan would. Returns
-   * `reason: 'unavailable'` (empty candidates) when uncredentialed, the breaker
-   * is open, or spot / expiration / chain can't be resolved. Never trades.
+   * Tradier load beyond what a same-symbol RV scan would. Returns empty
+   * candidates with a DISCRIMINATED {@link OtmScanReason} — `no_credentials`,
+   * `breaker_open`, `no_spot`, `no_expirations`, `no_chain` or `fetch_error`
+   * (TRA-161; it previously flattened all six into `'unavailable'`). Never
+   * trades.
    */
   scanOtm(
     symbol: string,
@@ -373,9 +413,16 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     const upper = symbol.trim().toUpperCase();
     // Reuse the hardened snapshot path (spot + DTE-picked expiration + full
     // cached chain, breaker-guarded) so OTM rides the same 60s cache as RV.
-    const snap = await this.getSelectorChain(upper, dtePrefs);
+    const { snapshot: snap, reason, errorMessage } = await this.resolveSelectorChain(upper, dtePrefs);
     if (!snap) {
-      return { symbol: upper, spot: null, expiration: null, candidates: [], reason: 'unavailable' };
+      return {
+        symbol: upper,
+        spot: null,
+        expiration: null,
+        candidates: [],
+        reason,
+        ...(errorMessage === undefined ? {} : { errorMessage }),
+      };
     }
     const candidates = findMispricedOtmContracts(snap.rows, snap.spot, { now: this.now(), ...opts });
     return { symbol: snap.symbol, spot: snap.spot, expiration: snap.expiration, candidates, reason: 'ok' };
@@ -385,36 +432,74 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     symbol: string,
     dtePrefs: DtePrefs = {},
   ): Promise<SelectorChainSnapshot | null> {
-    if (!this.client || this.isBreakerOpen()) return null;
+    // TRA-161 — thin wrapper over `resolveSelectorChain`. Signature and
+    // behaviour are unchanged (null on any failure); the discriminated reason
+    // is only consumed by `scanOtm` / the desktop panel.
+    return (await this.resolveSelectorChain(symbol, dtePrefs)).snapshot;
+  }
+
+  /**
+   * TRA-161 — the snapshot path with its failure reason preserved. Every early
+   * return that used to be a bare `null` now names WHICH precondition failed.
+   * The control flow, breaker trips and cache use are byte-for-byte the same as
+   * the pre-split `getSelectorChain`; only the return shape is richer.
+   */
+  private async resolveSelectorChain(
+    symbol: string,
+    dtePrefs: DtePrefs = {},
+  ): Promise<SelectorChainResolution> {
+    if (!this.client) return { snapshot: null, reason: 'no_credentials' };
+    if (this.isBreakerOpen()) return { snapshot: null, reason: 'breaker_open' };
     const upper = symbol.trim().toUpperCase();
 
     let spot: number | null;
     try {
       spot = await this.fetchSpot(upper);
-    } catch {
-      return null;
+    } catch (err) {
+      return {
+        snapshot: null,
+        reason: 'fetch_error',
+        errorMessage: err instanceof Error ? err.message : String(err),
+      };
     }
-    if (spot == null || !Number.isFinite(spot) || spot <= 0) return null;
+    if (spot == null || !Number.isFinite(spot) || spot <= 0) {
+      return { snapshot: null, reason: 'no_spot' };
+    }
 
     let expiration: string | null;
     try {
       expiration = await this.pickExpiration(upper, dtePrefs);
     } catch (err) {
       this.tripBreaker(`getExpirations(${upper}) failed`, err);
-      return null;
+      return {
+        snapshot: null,
+        reason: 'fetch_error',
+        errorMessage: err instanceof Error ? err.message : String(err),
+      };
     }
-    if (!expiration) return null;
+    if (!expiration) return { snapshot: null, reason: 'no_expirations' };
 
     let rows: OptionChainRow[];
     try {
       rows = await this.fetchChain(upper, expiration);
     } catch (err) {
       this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
-      return null;
+      return {
+        snapshot: null,
+        reason: 'fetch_error',
+        errorMessage: err instanceof Error ? err.message : String(err),
+      };
     }
-    if (rows.length === 0) return null;
+    // TRA-161 — `!rows` as well as the empty check. `getChainSnapshot` is TYPED
+    // to return an array, but a provider/client that hands back null or
+    // undefined would throw a TypeError on `.length` HERE, outside the try —
+    // i.e. out of `scanOtm` entirely. That was survivable while the only caller
+    // was the in-process signal engine; it is not now that this path is behind
+    // an async Express handler, where an unhandled rejection leaves the request
+    // hanging rather than answering. Fail closed to `no_chain` instead.
+    if (!rows || rows.length === 0) return { snapshot: null, reason: 'no_chain' };
 
-    return { symbol: upper, spot, expiration, rows };
+    return { snapshot: { symbol: upper, spot, expiration, rows }, reason: 'ok' };
   }
 
   async getOptionMark(

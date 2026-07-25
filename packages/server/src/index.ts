@@ -3883,6 +3883,45 @@ app.get('/api/options/relative-value', requireAuth, async (req, res) => {
   });
 });
 
+// TRA-161 — RESTORED. This route shipped with TRA-158 (`8ef0ed2`) and was
+// removed three months later by TRA-191 (`cf49fcf`), which swapped the standalone
+// OTM scanner service for the RV one and repointed the HTTP surface at
+// `/api/options/relative-value`. The OTM *engine* never went away — TRA-1207 put
+// `scanOtm()` back on the RV service, riding the same warm 60s chain cache — but
+// it was left with no HTTP surface at all, reachable only in-process from the
+// signal engine. TRA-161's desktop panel needs to read it, so the route is back:
+// a thin read-only projection of `scanOtm()` plus the diagnostics block.
+//
+// Read-only and requireAuth-gated. There is deliberately NO order-entry path
+// here — entry off this scan is TRA-159 and is not wired.
+app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
+  const symbol = typeof req.query['symbol'] === 'string' ? req.query['symbol'] : '';
+  if (!symbol) {
+    res.status(400).json({ error: 'symbol query parameter is required' });
+    return;
+  }
+  const limit = Math.max(1, Math.min(50, Number(req.query['limit'] ?? 10)));
+  // `minMispricing` is the |(mark − theo)/theo| band above which a contract is
+  // classified cheap/expensive rather than fair. Absent ⇒ the engine default.
+  const minRaw = req.query['minMispricing'];
+  const minMispricing =
+    typeof minRaw === 'string' && minRaw.length > 0 ? Number(minRaw) : undefined;
+  const deltaRaw = req.query['minDelta'];
+  const minAbsDelta =
+    typeof deltaRaw === 'string' && deltaRaw.length > 0 ? Number(deltaRaw) : undefined;
+
+  const result = await relativeValueScannerService.scanOtm(symbol, {
+    ...(Number.isFinite(minMispricing) ? { mispricingThresholdPct: Number(minMispricing) } : {}),
+    ...(Number.isFinite(minAbsDelta) ? { minAbsDelta: Number(minAbsDelta) } : {}),
+  });
+  res.json({
+    ...result,
+    // `scanOtm` ranks by |mispricingPct| descending, so a slice is the top N.
+    candidates: result.candidates.slice(0, limit),
+    diagnostics: relativeValueScannerService.diagnostics(),
+  });
+});
+
 app.get('/api/health/options-mispricing', (_req, res) => {
   res.json(relativeValueScannerService.diagnostics());
 });

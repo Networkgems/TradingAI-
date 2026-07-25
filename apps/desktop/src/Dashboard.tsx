@@ -25,6 +25,7 @@ import { PendingProposalsPanel } from './components/dashboard/PendingProposalsPa
 import { StockPositionsPanel } from './components/dashboard/StockPositionsPanel';
 import { StockOptionsPanel } from './components/dashboard/StockOptionsPanel';
 import { AiOptionsIdeasPanel } from './components/dashboard/AiOptionsIdeasPanel';
+import { OtmMispricingPanel } from './components/dashboard/OtmMispricingPanel';
 import { NewsPanel } from './components/dashboard/NewsPanel';
 import { LiveCredentialsBanner } from './components/dashboard/LiveCredentialsBanner';
 import { HaltBanner } from './components/dashboard/HaltBanner';
@@ -33,7 +34,10 @@ import { DashboardTour } from './components/onboarding/CoachMarkTour';
 import { useStockEngine } from './hooks/useStockEngine';
 
 // TRA-600 — 'ideas' is the new "AI Options Ideas" surface (Phase 3 of TRA-595).
-type StockTab = 'watchlist' | 'signals' | 'proposals' | 'positions' | 'options' | 'ideas' | 'news' | 'calendar' | 'health';
+// TRA-161 — 'otm' is the read-only Mispriced OTM scanner surface. It lives
+// under "More" rather than the primary bar: the primary row is the trading
+// workflow, and this is a research/diagnostic read with no action on it.
+type StockTab = 'watchlist' | 'signals' | 'proposals' | 'positions' | 'options' | 'ideas' | 'otm' | 'news' | 'calendar' | 'health';
 
 export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme, onToggleTheme }: { token: string; onLogout: () => void; onGoHome: () => void; onActivity?: () => void; theme: Theme; onToggleTheme: () => void }) {
   const [tab, setTab] = useState<StockTab>('watchlist');
@@ -167,6 +171,8 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
           { id: 'calendar', label: 'Calendar', dataTour: 'calendar', title: 'Daily P&L calendar and per-day EOD reports' },
         ]}
         more={[
+          // TRA-161 — read-only OTM mispricing scan (no order entry; TRA-159).
+          { id: 'otm', label: 'Mispriced OTM', title: 'Out-of-the-money contracts whose mark diverges most from Black-Scholes theo — research only, no order entry' },
           { id: 'news', label: `News (${news.length})` },
           // TRA-539 — live reliability dashboard (TRA-528 /api/health/live).
           { id: 'health', label: 'Health' },
@@ -226,6 +232,14 @@ export default function Dashboard({ token, onLogout, onGoHome, onActivity, theme
             until then, so it renders without waiting for the engine snapshot. */}
         {tab === 'ideas' && (
           <AiOptionsIdeasPanel token={token} />
+        )}
+
+        {/* TRA-161 — reads its own /api/options/otm-mispricing scan and the
+            /api/health/options-mispricing diagnostics, so (like Health) it
+            renders without waiting for the engine snapshot. `symbols` only
+            seeds the selector; an empty watchlist still allows a manual scan. */}
+        {tab === 'otm' && (
+          <OtmMispricingPanel token={token} symbols={symbols} />
         )}
 
         {tab === 'news' && (

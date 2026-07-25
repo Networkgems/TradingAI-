@@ -1,0 +1,568 @@
+// TRA-161 — "Mispriced OTM" panel. Read-only surface over the OTM mispricing
+// scanner: for one symbol's auto-picked in-window expiration, the contracts
+// whose mark diverges most from the Black-Scholes theo built on the market's
+// own vol surface.
+//
+// DATA CONTRACT
+//   GET /api/options/otm-mispricing?symbol=&limit=&minMispricing=&minDelta=
+//        -> OtmMispricingScanResponse   (requireAuth)
+//   GET /api/health/options-mispricing  -> ScannerDiagnostics   (unauthenticated)
+//
+// HISTORY WORTH KNOWING: the scan route in this ticket's description shipped
+// with TRA-158, was deleted by TRA-191 (which swapped in the relative-value
+// scanner), and was restored for THIS panel over the surviving `scanOtm()`
+// engine path. The health route kept its name throughout — it reports the
+// shared Tradier scanner's diagnostics, which is exactly what this panel needs
+// (same client, same breaker, same chain cache).
+//
+// STRICTLY INFORMATIONAL. There is no order-entry control here and there must
+// not be one until TRA-159 lands — the ticket is explicit about that, and the
+// server route has no entry path to call anyway.
+//
+// House pattern: the contract types are mirrored locally (as in HealthPanel /
+// AiOptionsIdeasPanel / VersionChip) rather than imported from
+// @trading-app/shared, which does not carry the scanner shapes.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { HTTP_URL } from '../../server-url';
+import { logger } from '../../lib/logger';
+import { fmt, fmtPrice } from '../../lib/format';
+
+// ── Contract ───────────────────────────────────────────────────────────────
+
+/**
+ * Why a scan produced no candidates. Mirrors the server's `OtmScanReason`.
+ * `unavailable` is the pre-TRA-161 catch-all: a server that predates the
+ * discriminated reasons still sends it, and it must render as "we don't know
+ * why" rather than being silently mapped onto one of the specific causes.
+ */
+type ScanReason =
+  | 'ok'
+  | 'no_credentials'
+  | 'breaker_open'
+  | 'no_spot'
+  | 'no_expirations'
+  | 'no_chain'
+  | 'fetch_error'
+  | 'unavailable';
+
+interface OtmCandidate {
+  optionSymbol: string;
+  underlying: string;
+  optionType: 'call' | 'put';
+  strike: number;
+  expiration: string;
+  daysToExpiration: number;
+  /** Mid of the two-sided book, per share. */
+  mark: number;
+  /** Black-Scholes price at the market's own σ (smvVol, else smoothed midIv). */
+  theo: number;
+  /**
+   * (mark − theo) / theo. A RATIO, not a percent — 0.18 means 18%. Multiply for
+   * display. Positive → the market is paying up vs. model (expensive);
+   * negative → cheap.
+   */
+  mispricingPct: number;
+  classification: 'expensive' | 'cheap' | 'fair';
+  bid: number;
+  ask: number;
+  /** (ask − bid) / mark. Also a RATIO. */
+  spreadPct: number;
+  openInterest: number;
+  volume: number;
+  ivUsed: number;
+  /** Sign-adjusted BS delta — negative for puts. */
+  delta: number;
+}
+
+interface ScannerDiagnostics {
+  configured: boolean;
+  breakerOpen: boolean;
+  breakerOpenedAtMs: number | null;
+  cacheSize: number;
+  expirationsCacheSize: number;
+}
+
+interface OtmMispricingScanResponse {
+  symbol: string;
+  spot: number | null;
+  expiration: string | null;
+  candidates: OtmCandidate[];
+  reason?: ScanReason;
+  errorMessage?: string;
+  diagnostics?: ScannerDiagnostics;
+}
+
+// ── Tuning ─────────────────────────────────────────────────────────────────
+
+const FETCH_TIMEOUT_MS = 20_000;
+/**
+ * The diagnostics chip polls; the SCAN does not. A scan is a Tradier chain
+ * fetch behind a 60s cache, so an idle panel left open on a desk would burn
+ * upstream budget on a symbol nobody is looking at. Scans are therefore driven
+ * by an explicit user action (symbol change / Refresh) only. Diagnostics are a
+ * pure in-process read with no upstream cost, so the breaker/credential chip
+ * stays live on its own cadence — which matters, because "the breaker just
+ * opened" is precisely the thing you want to see WITHOUT re-poking upstream.
+ */
+const DIAGNOSTICS_POLL_MS = 30_000;
+const DEFAULT_LIMIT = 15;
+
+/** Contracts whose |mispricing| clears this are labelled cheap/expensive. */
+const MISPRICING_BANDS = [0.1, 0.15, 0.2, 0.3] as const;
+
+// ── Empty-state copy ───────────────────────────────────────────────────────
+
+/**
+ * One friendly line per reason, so QA can read WHY a scan came back empty
+ * straight off the panel instead of going to the server logs — the explicit
+ * ask in TRA-161's notes. Keyed on the server's reason, never inferred from
+ * "candidates.length === 0", because a healthy scan of a quiet chain is also
+ * empty and must not read as a fault.
+ */
+const REASON_COPY: Record<Exclude<ScanReason, 'ok'>, { title: string; detail: string }> = {
+  no_credentials: {
+    title: 'Scanner not configured',
+    detail:
+      'No Tradier credentials on the server, so no option chain can be fetched. Set TRADIER_API_TOKEN and TRADIER_ACCOUNT_ID in the server environment and redeploy.',
+  },
+  breaker_open: {
+    title: 'Circuit breaker open',
+    detail:
+      'A recent Tradier request failed, so the scanner is in cooldown and is deliberately not retrying yet (~90s after a rate-limit, ~5min after other upstream errors). It reopens on its own — try again shortly.',
+  },
+  no_spot: {
+    title: 'No underlying price',
+    detail:
+      'The quote feed returned no usable spot price for this symbol, so there is nothing to price the chain against. Usually a rate-limited or unknown ticker.',
+  },
+  no_expirations: {
+    title: 'No expiration in the DTE window',
+    detail:
+      'This symbol lists no expiration inside the scanner window (21–60 days, targeting 35). Weeklies-only or non-optionable tickers land here.',
+  },
+  no_chain: {
+    title: 'Empty option chain',
+    detail:
+      'The expiration was picked but the chain came back with no rows. Typically a symbol with no listed options at that expiration.',
+  },
+  fetch_error: {
+    title: 'Upstream fetch failed',
+    detail:
+      'The scanner could not reach the market-data provider for this scan. The breaker may now be in cooldown.',
+  },
+  unavailable: {
+    title: 'Scan unavailable',
+    detail:
+      'The server reported a generic failure without saying which precondition failed. This is the legacy catch-all reason — a server build from before the reasons were split will always report it.',
+  },
+};
+
+// ── Small pieces ───────────────────────────────────────────────────────────
+
+function Chip({
+  tone,
+  label,
+  title,
+}: {
+  tone: 'good' | 'bad' | 'warn' | 'idle';
+  label: string;
+  title?: string;
+}) {
+  const colors: Record<typeof tone, { bg: string; fg: string }> = {
+    good: { bg: 'rgba(34,197,94,0.14)', fg: 'var(--green)' },
+    bad: { bg: 'rgba(239,68,68,0.14)', fg: 'var(--red)' },
+    warn: { bg: 'rgba(234,179,8,0.16)', fg: 'var(--orange)' },
+    idle: { bg: 'var(--bg-hover)', fg: 'var(--muted)' },
+  };
+  const c = colors[tone];
+  return (
+    <span
+      title={title}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '0.3rem',
+        background: c.bg,
+        color: c.fg,
+        borderRadius: '999px',
+        padding: '0.15rem 0.6rem',
+        fontSize: '0.75rem',
+        fontWeight: 600,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+/**
+ * The diagnostics chip row. `configured` and `breakerOpen` come straight off
+ * the health route; the cache counts are shown because a warm cache is the
+ * difference between a scan that costs an upstream call and one that doesn't.
+ */
+function DiagnosticsChips({ diag }: { diag: ScannerDiagnostics | null }) {
+  if (!diag) {
+    return <Chip tone="idle" label="diagnostics —" title="Scanner diagnostics not loaded yet." />;
+  }
+  return (
+    <>
+      <Chip
+        tone={diag.configured ? 'good' : 'bad'}
+        label={diag.configured ? '✓ configured' : '✗ not configured'}
+        title={
+          diag.configured
+            ? 'The server has Tradier credentials and can fetch option chains.'
+            : 'No Tradier credentials on the server — every scan will return no_credentials.'
+        }
+      />
+      <Chip
+        tone={diag.breakerOpen ? 'bad' : 'good'}
+        label={diag.breakerOpen ? '⚠ breaker OPEN' : '✓ breaker closed'}
+        title={
+          diag.breakerOpen
+            ? `Cooldown after an upstream failure${
+                diag.breakerOpenedAtMs
+                  ? ` — opened ${new Date(diag.breakerOpenedAtMs).toLocaleTimeString()}`
+                  : ''
+              }. Scans short-circuit until it closes.`
+            : 'No upstream failure cooldown in effect.'
+        }
+      />
+      <Chip
+        tone="idle"
+        label={`cache ${diag.cacheSize}/${diag.expirationsCacheSize}`}
+        title="Cached chain snapshots / cached expiration lists. A warm cache means a scan costs no upstream call."
+      />
+    </>
+  );
+}
+
+function classificationStyle(c: OtmCandidate['classification']): {
+  color: string;
+  label: string;
+} {
+  // Green = cheap (mark below model), red = expensive (mark above model), per
+  // the ticket's colour spec. Deliberately NOT the P&L convention — nothing
+  // here is a position, so green/red read as "cheap/rich vs. theo".
+  if (c === 'cheap') return { color: 'var(--green)', label: 'cheap' };
+  if (c === 'expensive') return { color: 'var(--red)', label: 'rich' };
+  return { color: 'var(--muted)', label: 'fair' };
+}
+
+// ── Panel ──────────────────────────────────────────────────────────────────
+
+export function OtmMispricingPanel({
+  token,
+  symbols,
+}: {
+  token: string;
+  /** The live watchlist rows — only `.symbol` is used. */
+  symbols: { symbol: string }[];
+}) {
+  const watchSymbols = useMemo(
+    () => symbols.map((s) => s.symbol).filter(Boolean),
+    [symbols],
+  );
+
+  const [selected, setSelected] = useState<string>('');
+  const [customSymbol, setCustomSymbol] = useState('');
+  const [minMispricing, setMinMispricing] = useState<number>(0.15);
+  const [scan, setScan] = useState<OtmMispricingScanResponse | null>(null);
+  const [diag, setDiag] = useState<ScannerDiagnostics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [scannedAt, setScannedAt] = useState<number | null>(null);
+
+  // Adopt the first watchlist symbol once one arrives, but never stomp a
+  // choice the user has already made (including a custom ticker).
+  const touchedRef = useRef(false);
+  useEffect(() => {
+    if (touchedRef.current) return;
+    if (!selected && watchSymbols.length > 0) setSelected(watchSymbols[0]!);
+  }, [watchSymbols, selected]);
+
+  // Diagnostics chip — independent of the scan, so the panel can tell you the
+  // scanner is unconfigured or breakered before you ask it for anything.
+  useEffect(() => {
+    let cancelled = false;
+    async function loadDiag() {
+      try {
+        const r = await fetch(`${HTTP_URL}/api/health/options-mispricing`);
+        if (!r.ok || cancelled) return;
+        const d = (await r.json()) as ScannerDiagnostics;
+        if (!cancelled) setDiag(d);
+      } catch (err) {
+        // A failed diagnostics poll is not worth a UI error — the chip simply
+        // stays on its last value (or "—"). The scan has its own error path.
+        logger.warn('otm-mispricing', 'diagnostics poll failed', err);
+      }
+    }
+    loadDiag();
+    const id = setInterval(loadDiag, DIAGNOSTICS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const runScan = useCallback(
+    async (symbol: string) => {
+      if (!symbol) return;
+      setLoading(true);
+      setError(null);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const qs = new URLSearchParams({
+          symbol,
+          limit: String(DEFAULT_LIMIT),
+          minMispricing: String(minMispricing),
+        });
+        const r = await fetch(`${HTTP_URL}/api/options/otm-mispricing?${qs.toString()}`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        if (!r.ok) {
+          // A 404 here means the server predates the restored route (TRA-161).
+          // Say so precisely — "endpoint missing" and "scan found nothing" are
+          // the two things this panel most needs to keep apart.
+          setError(
+            r.status === 404
+              ? 'This server build does not expose /api/options/otm-mispricing. It was restored in TRA-161 — the deployed build is older than that.'
+              : r.status === 401
+                ? 'Your session has expired. Sign in again to run a scan.'
+                : `The scanner returned an error (HTTP ${r.status}).`,
+          );
+          setScan(null);
+          return;
+        }
+        const data = (await r.json()) as OtmMispricingScanResponse;
+        setScan(data);
+        setScannedAt(Date.now());
+        if (data.diagnostics) setDiag(data.diagnostics);
+      } catch (err) {
+        const aborted = err instanceof DOMException && err.name === 'AbortError';
+        logger.warn('otm-mispricing', aborted ? 'scan timed out' : 'scan failed', err);
+        setError(
+          aborted
+            ? 'The scan took too long to respond. The chain fetch may be slow — try again.'
+            : 'Could not reach the scanner. Check your connection and try again.',
+        );
+        setScan(null);
+      } finally {
+        clearTimeout(timer);
+        setLoading(false);
+      }
+    },
+    [token, minMispricing],
+  );
+
+  // Scan when the chosen symbol (or band) changes. No interval — see
+  // DIAGNOSTICS_POLL_MS on why the scan is user-driven.
+  useEffect(() => {
+    if (selected) void runScan(selected);
+  }, [selected, runScan]);
+
+  function chooseSymbol(sym: string) {
+    touchedRef.current = true;
+    setSelected(sym.trim().toUpperCase());
+  }
+
+  function submitCustom(e: React.FormEvent) {
+    e.preventDefault();
+    const sym = customSymbol.trim().toUpperCase();
+    if (sym) {
+      chooseSymbol(sym);
+      setCustomSymbol('');
+    }
+  }
+
+  const reason: ScanReason | undefined = scan?.reason;
+  const candidates = scan?.candidates ?? [];
+  // A non-ok reason is a FAULT (explain it). An 'ok' scan with no rows is a
+  // legitimately quiet chain and gets its own, non-alarming copy.
+  const faultCopy = reason && reason !== 'ok' ? REASON_COPY[reason] : null;
+
+  return (
+    <div className="otm-mispricing-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.6rem', flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0 }}>Mispriced OTM</h3>
+        <span className="muted">
+          out-of-the-money contracts ranked by |mark − theo| ÷ theo · read-only research surface
+        </span>
+      </div>
+
+      {/* Diagnostics chips — GET /api/health/options-mispricing */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+        <DiagnosticsChips diag={diag} />
+        {scannedAt && (
+          <span className="muted">scanned {new Date(scannedAt).toLocaleTimeString()}</span>
+        )}
+      </div>
+
+      {/* Symbol selector — watchlist chips + a free-text box for anything else */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+        {watchSymbols.length === 0 ? (
+          <span className="muted">Watchlist empty — enter a symbol to scan.</span>
+        ) : (
+          watchSymbols.map((sym) => (
+            <button
+              key={sym}
+              type="button"
+              className={sym === selected ? 'btn-primary btn-sm' : 'btn-secondary btn-sm'}
+              onClick={() => chooseSymbol(sym)}
+              aria-pressed={sym === selected}
+            >
+              {sym}
+            </button>
+          ))
+        )}
+        <form onSubmit={submitCustom} style={{ display: 'flex', gap: '0.35rem' }}>
+          <input
+            type="text"
+            value={customSymbol}
+            onChange={(e) => setCustomSymbol(e.target.value)}
+            placeholder="Symbol…"
+            aria-label="Scan a custom symbol"
+            style={{ width: '6.5rem', textTransform: 'uppercase' }}
+          />
+          <button type="submit" className="btn-secondary btn-sm" disabled={!customSymbol.trim()}>
+            Scan
+          </button>
+        </form>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem' }}>
+          <span className="muted">Band</span>
+          <select
+            value={minMispricing}
+            onChange={(e) => setMinMispricing(Number(e.target.value))}
+            aria-label="Mispricing band"
+            title="|mark − theo| ÷ theo above which a contract is labelled cheap or rich. Does not filter rows — it moves the cheap/rich/fair cutoff."
+          >
+            {MISPRICING_BANDS.map((b) => (
+              <option key={b} value={b}>
+                ±{Math.round(b * 100)}%
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          className="btn-secondary btn-sm"
+          onClick={() => selected && void runScan(selected)}
+          disabled={!selected || loading}
+        >
+          {loading ? 'Scanning…' : 'Refresh'}
+        </button>
+      </div>
+
+      {/* Scan context line */}
+      {scan && reason === 'ok' && (
+        <div className="muted">
+          {scan.symbol} spot {fmtPrice(scan.spot)} · expiration {scan.expiration ?? '—'}
+          {candidates[0] ? ` · ${candidates[0].daysToExpiration}d to expiry` : ''}
+        </div>
+      )}
+
+      {error && (
+        <div className="empty" style={{ borderColor: 'var(--red)' }}>
+          <strong>{error}</strong>
+          <div style={{ marginTop: '0.5rem' }}>
+            <button type="button" className="btn-secondary btn-sm" onClick={() => selected && void runScan(selected)}>
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!error && loading && !scan && <div className="empty">Scanning {selected}…</div>}
+
+      {!error && !loading && !scan && !selected && (
+        <div className="empty">Pick a symbol above to scan its option chain.</div>
+      )}
+
+      {/* Reason-specific empty state — the TRA-161 ask: QA sees WHY, not just nothing. */}
+      {!error && faultCopy && (
+        <div className="empty">
+          <strong>{faultCopy.title}</strong>
+          <div style={{ marginTop: '0.35rem', maxWidth: '46rem', marginInline: 'auto' }}>
+            {faultCopy.detail}
+          </div>
+          <div className="muted" style={{ marginTop: '0.5rem' }}>
+            server reason: <code>{reason}</code>
+            {scan?.errorMessage ? ` — ${scan.errorMessage}` : ''}
+          </div>
+        </div>
+      )}
+
+      {!error && reason === 'ok' && candidates.length === 0 && (
+        <div className="empty">
+          No OTM contracts passed the liquidity filters for {scan?.symbol} at{' '}
+          {scan?.expiration ?? 'this expiration'}. The scanner drops contracts under 50 open
+          interest, wider than a 20% spread, or marked below $0.05 — a thin chain legitimately
+          yields nothing. This is a clean scan, not a fault.
+        </div>
+      )}
+
+      {!error && reason === 'ok' && candidates.length > 0 && (
+        <div className="options-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Contract</th>
+                <th>Type</th>
+                <th>Strike</th>
+                <th>Expiry</th>
+                <th>Mark</th>
+                <th>Theo</th>
+                <th>Mispricing</th>
+                <th>Delta</th>
+                <th>OI</th>
+                <th>Spread %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map((c) => {
+                const cls = classificationStyle(c.classification);
+                return (
+                  <tr key={c.optionSymbol}>
+                    <td className="symbol" title={c.optionSymbol}>
+                      {c.optionSymbol}
+                    </td>
+                    <td className={c.optionType === 'call' ? 'green' : 'red'}>
+                      {c.optionType.toUpperCase()}
+                    </td>
+                    <td>{fmtPrice(c.strike)}</td>
+                    <td className="muted">
+                      {c.expiration} <span className="muted">({c.daysToExpiration}d)</span>
+                    </td>
+                    <td title={`bid ${fmt(c.bid)} / ask ${fmt(c.ask)}`}>{fmtPrice(c.mark)}</td>
+                    <td title={`σ used: ${fmt(c.ivUsed * 100, 1)}%`}>{fmtPrice(c.theo)}</td>
+                    {/* mispricingPct is a RATIO — ×100 for display. */}
+                    <td style={{ color: cls.color, fontWeight: 600 }}>
+                      {c.mispricingPct >= 0 ? '+' : '−'}
+                      {fmt(Math.abs(c.mispricingPct) * 100, 1)}%{' '}
+                      <span style={{ fontWeight: 400, fontSize: '0.75rem' }}>{cls.label}</span>
+                    </td>
+                    <td>{fmt(c.delta, 3)}</td>
+                    <td>{c.openInterest.toLocaleString('en-US')}</td>
+                    {/* spreadPct is a RATIO too. */}
+                    <td className={c.spreadPct > 0.15 ? 'red' : ''}>
+                      {fmt(c.spreadPct * 100, 1)}%
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <p className="muted" style={{ margin: 0 }}>
+        Research only — no order entry from this panel. “Theo” is Black-Scholes at the market’s own
+        implied vol, so a divergence is a disagreement with the surface, not a free edge: it prices
+        in no skew, no event premium and no borrow. Entry off this scan is TRA-159 and is not wired.
+      </p>
+    </div>
+  );
+}
