@@ -89,9 +89,20 @@ export interface SandboxStrategyLeg {
   fillTs: number | null;
   /** Our internal decision→submit latency (the number TRA-2130 budgets at <500ms). */
   signalToSubmitMs: number;
-  /** Decision-quote mid we anchored slippage to; `null` on a one-sided quote. */
+  /** Decision-quote mid we anchored slippage to (the MARK); `null` on a one-sided quote. */
   requestedPx: number | null;
-  /** Broker avg fill price; `null` if the leg never filled. */
+  /**
+   * Decision-quote BID at submit time; `null` when the snap had no usable bid.
+   * TRA-2283 D2 — persisted so the marketable(bid) MTM gate can measure its half-spread
+   * off the QUOTED BOOK instead of off the fill. The quote is REAL even when the fill is
+   * broker-simulated (`SANDBOX_SIMULATED`), which is the only reason that gate is
+   * falsifiable on this venue at all: the sandbox fills at the decision mid, so a
+   * fill-derived half-spread is ~0 by construction whatever the true spread is.
+   */
+  bid: number | null;
+  /** Decision-quote ASK at submit time; `null` when the snap had no usable ask. TRA-2283 D2. */
+  ask: number | null;
+  /** Broker avg fill price; `null` if the leg never filled AT A USABLE PRICE (see mapLeg). */
   fillPx: number | null;
   /** `(fill − mid)/mid × 10_000`; `null` when either side is unprovable (NOT 0). */
   slippageBps: number | null;
@@ -118,10 +129,51 @@ export interface SandboxStrategyRecord {
 
 // ── pure mapping from the TRA-2130 orchestrator output ───────────────────────
 
+/**
+ * A broker `avg_fill_price` of `0` (or negative) is NOT a price — it is a MISSING price
+ * wearing a number's clothes, and it must be recorded as `null`.
+ *
+ * ── TRA-2283 D1: the decision, and why a `0` is never a legitimate record here ──
+ * The question raised was whether a genuine worthless expiry should be booked as
+ * `fillPx: 0`. It should not, and on this journal the case cannot even arise: every
+ * record is a same-session OPEN→CLOSE round-trip driven by
+ * `tradier-sandbox-options-smoke.ts` (entry leg then exit leg, minutes apart, TRA-2130 /
+ * TRA-2134) — there is no hold-to-expiry path that could write a leg here at all. So a `0`
+ * on this surface is always the broker failing to report a fill price on an order we
+ * nonetheless read as terminal.
+ *
+ * And a `0` is not a harmless placeholder, because downstream consumers divide by the
+ * mid: `actualH = (requestedPx − fillPx)/requestedPx` evaluates to EXACTLY ±1 — a 100%
+ * half-spread — from a contract that in fact traded near its mid. Four such rows (13% of a
+ * 30-record corpus) were enough to move each structure's mean `actualH` to ±0.13 and to
+ * manufacture a 2.8× tail under-charge in the marketable-MTM forward-validation gate, while
+ * pooling hid the whole thing at ~0.0026. The same false zero also produced the
+ * `meanSlippageBps ≈ −1262 / −1251 / −1418 / −1443` readings on this route's own summary
+ * (a single `0`-fill leg scores −10_000bps and drags the per-strategy mean).
+ *
+ * Even were an expiry ever recorded here, the honest record is an UNFILLED leg
+ * (`fillPx: null`, `fillTs: null`) — the position was never sold, so no fill price exists.
+ * `null` is exactly the "unprovable, therefore EXCLUDED" signal every reader of this
+ * journal already handles; `0` is a value they are obliged to believe.
+ *
+ * NOTE this repairs the WRITER, so it applies to records booked from here on. Records
+ * already on the `/data` disk keep their `0`s, which is why
+ * `marketable-mtm-forward-validation.ts` ALSO guards `fillPx <= 0` on the read side and
+ * reports the drop as `excludedZeroFill`.
+ */
+function usableFillPrice(avgFillPrice: number | null): number | null {
+  return avgFillPrice != null && Number.isFinite(avgFillPrice) && avgFillPrice > 0
+    ? avgFillPrice
+    : null;
+}
+
 function mapLeg(leg: SmokeLegResult): SandboxStrategyLeg {
   const { decisionQuote, timeline, metrics } = leg;
   const mid = decisionQuote.mid;
-  const fillMinusMid = metrics.slippage.fillMinusMid;
+  const fillPx = usableFillPrice(leg.avgFillPrice);
+  // Recompute slippage from the SANITIZED fill rather than trusting `metrics.slippage`:
+  // a false-zero fill would otherwise land here as a −10_000bps outlier (see above).
+  const fillMinusMid = fillPx != null && mid != null ? fillPx - mid : null;
   const slippageBps =
     fillMinusMid != null && mid != null && mid > 0 ? (fillMinusMid / mid) * 10_000 : null;
   const spreadAtSubmitPct =
@@ -133,10 +185,13 @@ function mapLeg(leg: SmokeLegResult): SandboxStrategyLeg {
     fillTs: timeline.tFill,
     signalToSubmitMs: metrics.latencyMs.signalToSubmit,
     requestedPx: mid,
-    fillPx: leg.avgFillPrice,
+    bid: decisionQuote.bid,
+    ask: decisionQuote.ask,
+    fillPx,
     slippageBps: slippageBps != null ? Math.round(slippageBps * 100) / 100 : null,
     spreadAtSubmitPct: spreadAtSubmitPct != null ? Math.round(spreadAtSubmitPct * 10000) / 10000 : null,
-    withinSpread: metrics.withinSpread,
+    // An unusable fill cannot be shown to be inside the quoted spread — `null`, not `false`.
+    withinSpread: fillPx != null ? metrics.withinSpread : null,
   };
 }
 

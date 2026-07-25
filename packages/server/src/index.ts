@@ -9528,12 +9528,26 @@ app.get('/api/health/parity-reconcile', (_req, res) => {
 // reads; unset ⇒ the exact gate. `fillRealism:'SANDBOX_SIMULATED'` rides the payload so no
 // reader mistakes a broker-simulated near-mid median for a live-execution number. Read-only;
 // SANDBOX only ($0 notional); gates/arms/graduates NOTHING under the TRA-1897 hold.
+//
+// TRA-2283 — the payload is now UNPOOLED and AUDITABLE, because the pooled fold was lying in
+// three directions at once: `excludedZeroFill` names the false-`fillPx:0` rows that folded to
+// `actualH` = ±1 exactly, `perStructure[]` carries a verdict per structure (the pooled tail
+// check read "covered" while long_call was under-charged 2.8×), `quotedH` measures the
+// half-spread off the two-sided QUOTED book — the only falsifiable measurement on a venue
+// that fills at the decision mid — and `diagnostics` echoes the dropped/outlier rows so the
+// diagnosis is a direct read rather than a reconstruction from published moments. Extra query
+// params: `samples=1` echoes per-row samples (capped), `requirePerStructureMinN=1` additionally
+// demands every structure clear `minN` (reportable switch — the pooled default is unchanged;
+// `minN` is QuantTrader's threshold to set). `actualHCaveat` rides the payload: the verdict's
+// measured-median string is NOT an instruction to retune h.
 app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
   const numParam = (v: unknown): number | undefined => {
     if (typeof v !== 'string' || v.trim() === '') return undefined;
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
   };
+  const boolParam = (v: unknown): boolean =>
+    typeof v === 'string' && (v === '1' || v.toLowerCase() === 'true');
   const strategyParam = typeof req.query.strategy === 'string' && req.query.strategy.trim() !== ''
     ? req.query.strategy
     : null;
@@ -9542,6 +9556,8 @@ app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
     tol: numParam(req.query.tol),
     minN: numParam(req.query.minN),
     strategy: strategyParam,
+    requirePerStructureMinN: boolParam(req.query.requirePerStructureMinN),
+    includeSamples: boolParam(req.query.samples),
   });
   res.status(200).json({
     ...result,

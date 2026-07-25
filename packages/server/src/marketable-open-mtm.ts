@@ -78,6 +78,35 @@ export function halfSpreadFracFromQuote(quote: {
   return clampHalfSpreadFrac(frac);
 }
 
+/**
+ * Side-aware half-spread fraction from a two-sided quote — the mid→**realizable-side**
+ * haircut. A long realizes at the BID (`(mark − bid)/mark`, i.e. exactly
+ * {@link halfSpreadFracFromQuote}); a short buys back at the ASK (`(ask − mark)/mark`).
+ *
+ * Why both branches (TRA-2283 D2): the DARK mark applies ONE `h` magnitude in two
+ * directions (`mid·(1−h)` long, `mid·(1+h)` short), so validating it against a quoted
+ * book has to measure the haircut on the side the position actually exits through. On a
+ * symmetric book (`mark = (bid+ask)/2`) the two branches are identical; on an asymmetric
+ * recorded mid they are not, and using the bid branch for a short exit would compare the
+ * model against the wrong half of the book. Guards (non-finite, `mark ≤ 0`, `bid < 0`,
+ * `ask ≤ 0`, crossed `ask < bid`) and the `[0, MAX]` clamp are shared with
+ * {@link halfSpreadFracFromQuote} so the two can never drift.
+ */
+export function halfSpreadFracFromQuoteForSide(
+  quote: { bid?: number; ask?: number; mark?: number },
+  side: MarketableSide,
+): number | null {
+  if (side === 'long') return halfSpreadFracFromQuote(quote);
+  const { bid, ask, mark } = quote;
+  if (![bid, ask, mark].every((v) => typeof v === 'number' && Number.isFinite(v))) return null;
+  const b = bid as number;
+  const a = ask as number;
+  const m = mark as number;
+  if (m <= 0 || b < 0 || a <= 0) return null;
+  if (a < b) return null; // crossed / corrupt book
+  return clampHalfSpreadFrac((a - m) / m);
+}
+
 /** Inputs for a single per-share marketable mark. */
 export interface MarketableMarkInput {
   /** The reference MID mark, per share (`currentPremium`). Must be > 0 to haircut. */

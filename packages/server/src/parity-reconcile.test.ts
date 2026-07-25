@@ -67,6 +67,8 @@ function leg(
     fillTs: fillPx == null ? null : NOW + 100,
     signalToSubmitMs: 40,
     requestedPx,
+    bid: null,
+    ask: null,
     fillPx,
     slippageBps: null,
     spreadAtSubmitPct: null,
