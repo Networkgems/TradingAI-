@@ -895,6 +895,25 @@ services:
       # value (or set the user's mode back to demo via Settings).
       - key: LIVE_EQUITY_BOOT_USER
         value: "admin"
+      # TRA-2336 — the SEPARATE carrier for the live-CRYPTO boot-arm (TRA-1340).
+      # Empty = OFF, and OFF is also the compiled default, so deleting this key
+      # disarms rather than defaulting-on (unlike LIVE_EQUITY_BOOT_USER above,
+      # where an absent key falls back to "admin" and stays ARMED — TRA-716).
+      #
+      # It exists because `LIVE_EQUITY_BOOT_USER` + `TRADIER_ENV=production` were
+      # ALREADY sufficient to arm live crypto: `createUserContext` force-persists
+      # `mode='live'` in the equity boot-arm and then runs the crypto boot-arm on
+      # that same object, one statement later. So the ratified go-live arming step
+      # (set TRADIER_ENV=production) armed real-money Coinbase auto-trading with no
+      # crypto decision taken — against the board's "Options+Stock, crypto OFF"
+      # ratification (TRA-1575) and TRA-314.
+      #
+      # Do NOT fold this into CRYPTO_ENGINE_ENABLED. That flag means "the crypto
+      # data sweep ticks" (TRA-1580) and is documented as the no-code-change way to
+      # bring crypto back post-launch; making it also arm real money would hand a
+      # funding switch to whoever just wants the charts.
+      - key: LIVE_CRYPTO_BOOT_ARM
+        value: ""
       # TRA-324 / TRA-325 / TRA-421 — process-wide forced strategy preset
       # override. When set, every CryptoSignalEngine instance pins to this
       # preset regardless of the user's saved `activeStrategyPreset` selection

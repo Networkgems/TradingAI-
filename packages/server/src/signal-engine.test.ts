@@ -4674,8 +4674,12 @@ describe('shouldBootArmLiveCrypto — TRA-1340 persistent live-crypto boot-arm',
     liveApiKeyCrypto: 'cb-key',
     liveApiSecretCrypto: 'cb-secret',
   });
+  // TRA-2336 — the boot-arm now needs a carrier of its own. Every pre-existing case
+  // below asserts a condition OTHER than the carrier, so the carrier is ON here and
+  // the cases keep testing what they were written to test.
   const env = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
     LIVE_EQUITY_BOOT_USER: PIN,
+    LIVE_CRYPTO_BOOT_ARM: '1',
     ...over,
   });
 
@@ -4711,6 +4715,62 @@ describe('shouldBootArmLiveCrypto — TRA-1340 persistent live-crypto boot-arm',
 
   it('TRA-716: explicitly empty pin ⇒ disarms (clear-this-value kill-switch)', () => {
     expect(shouldBootArmLiveCrypto(liveSettings(), PIN, env({ LIVE_EQUITY_BOOT_USER: '' }))).toBe(false);
+  });
+
+  // ── TRA-2336 — LIVE_CRYPTO_BOOT_ARM, the carrier that breaks the equity→crypto chain ──
+  describe('TRA-2336 LIVE_CRYPTO_BOOT_ARM carrier', () => {
+    // The scenario the carrier exists for, spelled out so it cannot be read as
+    // hypothetical: this is EXACTLY the state `createUserContext` hands the crypto
+    // boot-arm one statement after the equity boot-arm force-persists mode='live'
+    // because TRADIER_ENV==='production'. Every other condition is already true on
+    // bqb1 (pin = admin; the operator carries per-user Coinbase creds), so without
+    // the carrier this call returns TRUE and the go-live arming step arms crypto.
+    const goLiveBoot = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+      LIVE_EQUITY_BOOT_USER: PIN,
+      TRADIER_ENV: 'production',
+      ...over,
+    });
+
+    it('refuses when the carrier is absent — even in the exact post-equity-boot-arm state', () => {
+      expect(shouldBootArmLiveCrypto(liveSettings(), PIN, goLiveBoot())).toBe(false);
+    });
+
+    // POSITIVE CONTROL: the case above must fail for the CARRIER's sake and not
+    // because the fixture is unarmable. Same settings, same operator, same
+    // TRADIER_ENV=production — carrier on ⇒ true. If this ever goes false the test
+    // above stops proving anything.
+    it('arms in that same state once the carrier is set (the guard is not vacuous)', () => {
+      expect(shouldBootArmLiveCrypto(liveSettings(), PIN, goLiveBoot({ LIVE_CRYPTO_BOOT_ARM: '1' }))).toBe(true);
+    });
+
+    it('accepts 1/true/yes/on, case- and space-insensitively', () => {
+      for (const raw of ['1', 'true', 'TRUE', 'yes', 'on', ' On ']) {
+        expect(shouldBootArmLiveCrypto(liveSettings(), PIN, goLiveBoot({ LIVE_CRYPTO_BOOT_ARM: raw }))).toBe(true);
+      }
+    });
+
+    it('treats every other value as OFF — including "0", "" and a stray "off"', () => {
+      for (const raw of ['0', '', 'off', 'false', 'no', 'enabled', 'production']) {
+        expect(shouldBootArmLiveCrypto(liveSettings(), PIN, goLiveBoot({ LIVE_CRYPTO_BOOT_ARM: raw }))).toBe(false);
+      }
+    });
+
+    // The carrier is deliberately NOT CRYPTO_ENGINE_ENABLED: that flag means "the
+    // crypto data sweep ticks" (TRA-1580) and must never double as a funding switch.
+    it('is not satisfied by CRYPTO_ENGINE_ENABLED', () => {
+      expect(shouldBootArmLiveCrypto(liveSettings(), PIN, goLiveBoot({ CRYPTO_ENGINE_ENABLED: '1' }))).toBe(false);
+    });
+
+    // The carrier only removes the AUTOMATIC arm. It must not become a second
+    // condition that a non-operator or a demo account can ride past.
+    it('does not weaken any existing condition when set', () => {
+      const on = goLiveBoot({ LIVE_CRYPTO_BOOT_ARM: '1' });
+      expect(shouldBootArmLiveCrypto(liveSettings(), 'someone-else', on)).toBe(false);
+      expect(shouldBootArmLiveCrypto({ ...liveSettings(), mode: 'demo' as const }, PIN, on)).toBe(false);
+      expect(
+        shouldBootArmLiveCrypto({ ...liveSettings(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' }, PIN, on),
+      ).toBe(false);
+    });
   });
 });
 

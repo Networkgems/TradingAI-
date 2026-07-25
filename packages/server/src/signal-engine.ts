@@ -234,6 +234,9 @@ import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
+// TRA-2336 — the positive carrier the live-crypto boot-arm must clear. Compiled
+// default OFF, so no equity-side arming step can chain into a real-money crypto arm.
+import { isLiveCryptoBootArmEnabled } from './live-crypto-boot-arm-flag.js';
 // TRA-2233 — marketable(bid) open-position valuation, DARK behind
 // ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
 // mode==='demo'), so wiring it into both accounts can never change a live number.
@@ -14579,6 +14582,16 @@ export function resolveLiveBrokerArmDrift(
  * can flip, and neither is reachable by an agent on a redeploy-only deployment.
  *
  * REAL-money and deliberately SINGLE-USER scoped — every condition must hold:
+ *   • TRA-2336 — `LIVE_CRYPTO_BOOT_ARM` is positively set. The other three
+ *     conditions are NOT independent on bqb1: the pin is permanent, the operator
+ *     carries per-user Coinbase creds, and `mode` is force-persisted to `'live'`
+ *     by the equity boot-arm running immediately above this one in
+ *     `createUserContext` whenever `TRADIER_ENV==='production'`. Without a carrier
+ *     of its own, the ratified go-live arming step (set `TRADIER_ENV=production`)
+ *     silently armed live crypto too — against the board's "Options+Stock, crypto
+ *     OFF" ratification (TRA-1575) and TRA-314. Deliberately NOT
+ *     `CRYPTO_ENGINE_ENABLED`: that flag means "the crypto data sweep ticks"
+ *     (TRA-1580) and must not double as a real-money switch.
  *   • `LIVE_EQUITY_BOOT_USER` names THIS user (operator pin, default "admin" per
  *     render.yaml / TRA-716). A fleet-wide arm would let any user resolve the
  *     shared `COINBASE_*` env creds and trade the operator's Coinbase account
@@ -14601,6 +14614,9 @@ export function shouldBootArmLiveCrypto(
   username: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  // TRA-2336 — checked FIRST and independently of every account-derived field, so
+  // no amount of persisted state (or a boot-arm that writes it) can reach the arm.
+  if (!isLiveCryptoBootArmEnabled(env)) return false;
   if (!isLiveBrokerOperator(username, env)) return false;
   if ((settings.mode ?? 'demo') !== 'live') return false;
   const apiKey = (
