@@ -556,6 +556,16 @@ export interface AccountState {
   stockLongValue?: number;
   optionLongValue?: number;
   optionShortValue?: number;
+  /**
+   * TRA-2301 — provenance for the one-shot cash repair applied to a demo paper
+   * book whose `availableCash` had drifted from `totalEquity` under the
+   * short-open cash bug. Present only on a book that was actually repaired.
+   *
+   * This exists because a repaired book and a book that never drifted both
+   * report a gap of 0 — they read IDENTICALLY on every balance route — so
+   * without a durable trace the repair would be unverifiable after the fact.
+   */
+  cashRepair?: { appliedAt: number; delta: number; from: number; to: number };
 }
 
 export const DEFAULT_RISK_PER_TRADE = 0.01; // 1% of account equity

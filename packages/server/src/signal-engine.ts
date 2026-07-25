@@ -13071,10 +13071,17 @@ export class SignalEngine {
     // demo, so the card rendered '—' for ~$14k held in open stock positions.
     // Derive the breakdown from the paper book so the tiles reconcile with
     // TOTAL VALUE: Long Stock Value is the cost-basis capital held in open long
-    // equity positions — which is exactly `totalEquity − availableCash` for the
-    // demo PaperAccount (equity isn't marked to market; an open debits cash by
-    // cost and leaves equity unchanged), so Long Stock Value + Cash = Total
-    // Value. Option long/short value come from the demo options paper book.
+    // equity positions. Equity isn't marked to market (it only moves on a
+    // close), so for a book holding only longs this also equals
+    // `totalEquity − availableCash`, and Long Stock Value + Cash = Total Value.
+    //
+    // TRA-2301 — that second identity holds ONLY while the book is flat of
+    // shorts. A short *credits* cash at cost basis, so in general
+    // `totalEquity − availableCash = Σ long basis − Σ short basis`. The filter
+    // below is the correct definition of the tile; it is the equivalence that
+    // was over-claimed. (The comment previously asserted the two were the same
+    // thing, which made both halves wrong the moment the book held a short.)
+    // Option long/short value come from the demo options paper book.
     const demoAccount = this.buildAccountState();
     const stockLongValue = demoAccount.openPositions
       .filter(p => p.side === 'buy')

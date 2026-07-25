@@ -866,6 +866,11 @@ async function createUserContext(username: string): Promise<UserContext> {
           initialEquity: stocksSnap.account.initialEquity,
           dailyPnl: stocksSnap.account.dailyPnl,
           openPositions: stocksSnap.openPositions ?? [],
+          // TRA-2301 — this restore rebuilds the account snapshot field by
+          // field, so an omitted key is silently dropped. Carry the cash-repair
+          // trace through or a repaired book would look, on every subsequent
+          // boot, exactly like a book that never drifted.
+          cashRepair: stocksSnap.account.cashRepair ?? null,
         },
         // TRA-233 — `options` stays for back-compat (legacy single-bucket
         // snapshots route through it). New snapshots include `optionsByEnv`
@@ -1071,6 +1076,10 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
         equity: snap.account.equity,
         initialEquity: snap.account.initialEquity,
         dailyPnl: snap.account.dailyPnl,
+        // TRA-2301 — writer side of the cash-repair trace. This object is built
+        // key by key, so omitting it here would drop the record on the first
+        // persist and the repair would become unverifiable one save later.
+        cashRepair: snap.account.cashRepair ?? null,
       },
       // TRA-801 — persist the SupertrendConfluence paper forward-test book so a
       // redeploy doesn't abandon its open positions and stall Stage-2 accrual.

@@ -383,6 +383,21 @@ export interface DemoBookReport {
     availableCash: number;
     dailyPnl: number;
   };
+  /**
+   * TRA-2301 — the cash/equity reconciliation the short-open cash bug broke.
+   * `expectedCash` is `totalEquity − Σ(signed cost basis of the open book)`;
+   * `gap` is the unexplained residue, which has no legitimate source and must
+   * be 0. Reported ALONGSIDE the `repaired` provenance on purpose: a book the
+   * one-shot repair fixed and a book that never drifted both show `gap: 0`, so
+   * the gap alone cannot tell them apart. `repaired` is null on a book that was
+   * never touched.
+   */
+  cashInvariant: {
+    expectedCash: number;
+    gap: number;
+    ok: boolean;
+    repaired: { appliedAt: number; delta: number; from: number; to: number } | null;
+  };
   /** Currently-open demo paper positions. */
   openPositionCount: number;
   /**
@@ -424,6 +439,15 @@ export function summarizeDemoBook(
   const dayAgo = now - 24 * 60 * 60 * 1000;
   const realized = (p: { pnl?: number }): number => (Number.isFinite(p.pnl) ? (p.pnl as number) : 0);
   const last24h = closed.filter(p => typeof p.closedAt === 'number' && p.closedAt >= dayAgo);
+  // TRA-2301 — recompute the cash/equity bridge here rather than trusting a
+  // self-reported flag: a long has SPENT its cost basis, a short has RECEIVED
+  // it, and demo equity is not marked to market, so this is exact.
+  const committedCapital = state.account.openPositions.reduce(
+    (sum, p) => sum + (p.side === 'buy' ? 1 : -1) * p.entryPrice * p.quantity,
+    0,
+  );
+  const expectedCash = state.account.totalEquity - committedCapital;
+  const cashGap = state.account.availableCash - expectedCash;
   const recs = state.agentRecommendations;
   const byAction = { BUY: 0, SELL: 0, HOLD: 0 };
   let routableCount = 0;
@@ -448,6 +472,12 @@ export function summarizeDemoBook(
       totalEquity: state.account.totalEquity,
       availableCash: state.account.availableCash,
       dailyPnl: state.account.dailyPnl,
+    },
+    cashInvariant: {
+      expectedCash,
+      gap: cashGap,
+      ok: Math.abs(cashGap) < 0.01,
+      repaired: state.account.cashRepair ?? null,
     },
     openPositionCount: state.account.openPositions.length,
     closed: {

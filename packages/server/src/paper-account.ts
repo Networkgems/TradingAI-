@@ -32,6 +32,28 @@ const log = logger.child({ module: 'paper-account' });
 export const STOCK_SLIPPAGE_BPS = 5;
 const STOCK_SLIPPAGE_RATE = STOCK_SLIPPAGE_BPS / 10_000;
 
+/** TRA-2301 — record of the one-shot cash repair applied at restore. */
+export interface CashRepairRecord {
+  appliedAt: number;
+  delta: number;
+  from: number;
+  to: number;
+}
+
+/** Durable shape for {@link PaperAccount.exportSnapshot} / `importSnapshot` (TRA-140). */
+export interface PaperAccountSnapshot {
+  cash: number;
+  equity: number;
+  initialEquity: number;
+  dailyPnl: number;
+  openPositions: Position[];
+  /**
+   * TRA-2301 — audit trace of the cash repair. Optional: absent on every
+   * snapshot written before the fix, and on books that never drifted.
+   */
+  cashRepair?: CashRepairRecord | null;
+}
+
 interface PaperAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
@@ -50,6 +72,15 @@ export class PaperAccount {
   private cash: number;
   private positions: Map<string, Position> = new Map();
   private dailyPnl = 0;
+  /**
+   * TRA-2301 — audit trace of the one-shot cash repair applied at
+   * {@link importSnapshot}. `null` means the restored book already satisfied
+   * the cash invariant. Persisted through the snapshot so a repaired book stays
+   * distinguishable from a book that never drifted — without it, a repaired
+   * book and a healthy book read IDENTICALLY on `/api/health/demo-book-public`
+   * (gap 0 either way) and the repair would be unverifiable after the fact.
+   */
+  private cashRepair: CashRepairRecord | null = null;
   /**
    * TRA-1268 — per-position running state for the exit-risk rules, keyed by
    * position id: the favorable `extremeSinceEntry` (peak for longs / trough for
@@ -78,6 +109,7 @@ export class PaperAccount {
     this.positions.clear();
     this.exitRiskState.clear();
     this.dailyPnl = 0;
+    this.cashRepair = null;
   }
 
   updateConfig(config: PaperAccountConfig): void {
@@ -104,7 +136,45 @@ export class PaperAccount {
       availableCash: this.cash,
       openPositions: Array.from(this.positions.values()),
       dailyPnl: this.dailyPnl,
+      // TRA-2301 — omit the key entirely on a book that never drifted, so
+      // "repaired" and "never broken" are distinguishable downstream.
+      ...(this.cashRepair ? { cashRepair: this.cashRepair } : {}),
     };
+  }
+
+  /**
+   * TRA-2301 — signed capital committed to the open book at cost basis: a long
+   * has spent `entry × qty` of cash, a short has *received* it. Equity is not
+   * marked to market (it only moves on a close), so this is the exact bridge
+   * between the two ledgers.
+   */
+  private committedCapital(): number {
+    let committed = 0;
+    for (const pos of this.positions.values()) {
+      committed += (pos.side === 'buy' ? 1 : -1) * pos.entryPrice * pos.quantity;
+    }
+    return committed;
+  }
+
+  /**
+   * TRA-2301 — the cash balance this book *should* hold. Every open debits
+   * (long) or credits (short) cash by cost basis and leaves equity alone; every
+   * close moves cash by the exit notional and equity by the P&L, which
+   * telescopes the pair back together. So with a flat book this is exactly
+   * `equity`, and `cash − expectedCash()` is drift with no legitimate source.
+   */
+  private expectedCash(): number {
+    return this.equity - this.committedCapital();
+  }
+
+  /**
+   * TRA-2301 — the audit trace of the one-shot cash repair applied when this
+   * book was restored, or `null` if it was already consistent. Surfaced on
+   * `/api/health/demo-book-public` so "repaired" stays readable as something
+   * other than "never broken".
+   */
+  getCashRepair(): CashRepairRecord | null {
+    return this.cashRepair;
   }
 
   managedEquity(): number {
@@ -196,17 +266,43 @@ export class PaperAccount {
       }
     }
     const cost = currentPrice * qty;
-    if (cost > this.cash) {
-      log.warn('skip signal: cost exceeds cash (existing positions consuming cash)', {
+    // TRA-2301 (mirrors TRA-330 on the crypto book) — shorts collateralise
+    // against equity, not spot cash: opening a short *receives* proceeds rather
+    // than spending them, so the `cost > cash` gate never applied to them. The
+    // `maxQtyForManagedEquity` cap above is the short's margin floor. Longs keep
+    // the spot-cash gate, which is their real constraint.
+    if (signal.side === 'buy' && cost > this.cash) {
+      // TRA-2301 ask 4 — name the constraint that actually bound instead of
+      // asserting a cause. "existing positions consuming cash" was a hardcoded
+      // sentence that read the same whether the book held positions or not, and
+      // it named the wrong cause on every drifted flat book (bqb1 'Richard':
+      // $2,233.91 equity, $325.91 cash, nothing open). Attribute from the book.
+      const shortfall = cost - this.cash;
+      log.warn('skip signal: insufficient cash for long entry', {
         symbol: signal.symbol,
         signalType: signal.type,
         cost: cost.toFixed(2),
         cash: this.cash.toFixed(2),
+        shortfall: shortfall.toFixed(2),
+        equity: this.equity.toFixed(2),
+        openPositions: this.positions.size,
+        committedCapital: this.committedCapital().toFixed(2),
+        constraint: this.positions.size > 0
+          ? 'open_positions_consuming_cash'
+          : 'cash_below_equity_on_a_flat_book',
       });
       return null;
     }
 
-    this.cash -= cost;
+    if (signal.side === 'buy') {
+      this.cash -= cost;
+    } else {
+      // Short proceeds land in cash; the buyback at close subtracts the exit
+      // notional. Net cash change over open+close = (entry − exit) × qty, which
+      // is the short's P&L — the same figure equity accrues, so the two ledgers
+      // stay in lock-step instead of diverging by 2 × pnl per round trip.
+      this.cash += cost;
+    }
     // TRA-536 — stamp realized vs modeled entry slippage so the Stage-2
     // promotion gate can enforce its realized-≤-1.5×-modeled check. Realized =
     // how far the live fill (`currentPrice`) drifted from the price the
@@ -252,12 +348,17 @@ export class PaperAccount {
     if (!Number.isFinite(addQty) || addQty <= 0) return null;
     if (!Number.isFinite(addPrice) || addPrice <= 0) return null;
     const cost = addPrice * addQty;
-    if (cost > this.cash) {
-      log.warn('skip DCA add: cost exceeds cash', {
+    // TRA-2301 — same asymmetry as the open path: scaling into a short receives
+    // proceeds, so only a long add is gated on spot cash.
+    if (pos.side === 'buy' && cost > this.cash) {
+      log.warn('skip DCA add: insufficient cash for long add', {
         positionId,
         symbol: pos.symbol,
         cost: cost.toFixed(2),
         cash: this.cash.toFixed(2),
+        shortfall: (cost - this.cash).toFixed(2),
+        equity: this.equity.toFixed(2),
+        openPositions: this.positions.size,
       });
       return null;
     }
@@ -265,7 +366,8 @@ export class PaperAccount {
     // Blend the average entry; the protective stop is intentionally left as-is.
     pos.entryPrice = (pos.entryPrice * pos.quantity + addPrice * addQty) / newQty;
     pos.quantity = newQty;
-    this.cash -= cost;
+    if (pos.side === 'buy') this.cash -= cost;
+    else this.cash += cost;
     this.positions.set(positionId, pos);
     return pos;
   }
@@ -370,7 +472,9 @@ export class PaperAccount {
         pos.exitPrice = exitPrice;
         pos.exitReason = exitReason;
         pos.closedAt = Date.now();
-        this.cash += exitPrice * pos.quantity;
+        // TRA-2301 — a long sells out (cash in), a short buys to cover (cash
+        // out). Paired with the signed open above, cash moves by exactly `pnl`.
+        this.cash += multiplier * exitPrice * pos.quantity;
         this.equity += pnl;
         this.dailyPnl += pnl;
         this.positions.delete(id);
@@ -389,7 +493,8 @@ export class PaperAccount {
     pos.pnl = pnl;
     pos.exitPrice = currentPrice;
     pos.closedAt = Date.now();
-    this.cash += currentPrice * pos.quantity;
+    // TRA-2301 — see checkExits: signed by side so cash moves by exactly `pnl`.
+    this.cash += multiplier * currentPrice * pos.quantity;
     this.equity += pnl;
     this.dailyPnl += pnl;
     this.positions.delete(positionId);
@@ -412,30 +517,19 @@ export class PaperAccount {
   }
 
   /** Serialize current state for durable storage (TRA-140). */
-  exportSnapshot(): {
-    cash: number;
-    equity: number;
-    initialEquity: number;
-    dailyPnl: number;
-    openPositions: Position[];
-  } {
+  exportSnapshot(): PaperAccountSnapshot {
     return {
       cash: this.cash,
       equity: this.equity,
       initialEquity: this.initialEquity,
       dailyPnl: this.dailyPnl,
       openPositions: Array.from(this.positions.values()),
+      cashRepair: this.cashRepair,
     };
   }
 
   /** Restore state previously serialized via exportSnapshot (TRA-140). */
-  importSnapshot(snap: {
-    cash: number;
-    equity: number;
-    initialEquity: number;
-    dailyPnl: number;
-    openPositions: Position[];
-  }): void {
+  importSnapshot(snap: PaperAccountSnapshot): void {
     this.cash = snap.cash;
     this.equity = snap.equity;
     this.initialEquity = snap.initialEquity;
@@ -445,5 +539,47 @@ export class PaperAccount {
     for (const p of snap.openPositions) {
       this.positions.set(p.id, p);
     }
+    this.cashRepair = snap.cashRepair ?? null;
+    this.repairDriftedCash();
+  }
+
+  /**
+   * TRA-2301 — one-shot repair of books already drifted by the short-open cash
+   * bug. Runs on every restore and is idempotent: a consistent book is left
+   * untouched, so once the persisted snapshot has been rewritten post-fix this
+   * is a permanent no-op.
+   *
+   * **Equity is authoritative, cash is the corrupted side.** The two ledgers
+   * disagree because the *cash* leg carried the sign error — `equity += pnl`
+   * always used the correct `multiplier = -1` for shorts, so equity accrued the
+   * right number on every close while cash moved the opposite way. Nothing in
+   * this bug's mechanism can bias equity. (The parent TRA-2297 contests the
+   * demo equity figure for unrelated reasons — the `optionsDailyPnl` false
+   * zeros and the calendar-vs-book-event mismatch. That dispute is about which
+   * *events* equity should contain, not about this cash/equity gap, and
+   * whichever way it lands the repair below is still the right bridge.)
+   *
+   * An in-flight short opened under the buggy code is migrated correctly too:
+   * its cash was debited `E×Q` where the new model credits it, so the repair
+   * moves cash by `2×E×Q` and the subsequent cover settles to the right place.
+   */
+  private repairDriftedCash(): void {
+    const expected = this.expectedCash();
+    if (!Number.isFinite(expected)) return;
+    const delta = expected - this.cash;
+    // One cent — below this it is float residue from accumulated round trips,
+    // not the bug, and snapping it would emit a repair record every restart.
+    if (Math.abs(delta) < 0.01) return;
+    const from = this.cash;
+    this.cash = expected;
+    this.cashRepair = { appliedAt: Date.now(), delta, from, to: expected };
+    log.warn('repaired drifted cash on restore (TRA-2301 short-open cash bug)', {
+      from: from.toFixed(2),
+      to: expected.toFixed(2),
+      delta: delta.toFixed(2),
+      equity: this.equity.toFixed(2),
+      openPositions: this.positions.size,
+      committedCapital: this.committedCapital().toFixed(2),
+    });
   }
 }

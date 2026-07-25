@@ -124,6 +124,12 @@ export interface StocksTradeSnapshot {
     equity: number;
     initialEquity: number;
     dailyPnl: number;
+    /**
+     * TRA-2301 — audit trace of the one-shot cash repair. Absent on every
+     * snapshot written before the fix and on books that never drifted; a
+     * repaired book keeps it so it stays distinguishable from a clean one.
+     */
+    cashRepair?: { appliedAt: number; delta: number; from: number; to: number } | null;
   };
   /**
    * TRA-801 — the SupertrendConfluence PAPER forward-test book. Optional for
