@@ -1,0 +1,446 @@
+{
+  "source": "REAL Render API bytes for tradingai-bqb1 (srv-d7mb7rr7uimc73ev0chg), pulled 2026-07-25 for TRA-2261.",
+  "window": {
+    "from": "2026-07-24T13:30:00.000Z",
+    "to": "2026-07-24T20:10:00.000Z"
+  },
+  "coverageLineCount": 5,
+  "logs": [
+    {
+      "timestamp": "2026-07-24T15:59:44.143609439Z",
+      "message": "{\"ts\":\"2026-07-24T15:59:44.143Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":132,\"rssMB\":787,\"heapUsedMB\":504,\"lagMaxMs\":5788,\"detail\":\"single event-loop block: max lag 5788ms >= 4000ms in one 1000ms window (mean 171ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-07-24T16:15:25.052726446Z",
+      "message": "{\"ts\":\"2026-07-24T16:15:25.052Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":132,\"rssMB\":787,\"heapUsedMB\":504,\"lagMaxMs\":5788,\"detail\":\"single event-loop block: max lag 5788ms >= 4000ms in one 1000ms window (mean 171ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-07-24T19:56:36.569718992Z",
+      "message": "{\"ts\":\"2026-07-24T19:56:36.569Z\",\"level\":\"error\",\"msg\":\"WATCHDOG TRIP \u00e2\u20ac\u201d self-restarting to clear starved event loop\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"detail\":\"single event-loop block: max lag 14395ms >= 4000ms in one 1000ms window (mean 424ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\",\"heapUsedMB\":902,\"heapLimitMB\":1812,\"rssMB\":1932,\"lagMeanMs\":424,\"lagMaxMs\":14395}"
+    },
+    {
+      "timestamp": "2026-07-24T19:56:45.122072587Z",
+      "message": "{\"ts\":\"2026-07-24T19:56:45.121Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":13272,\"rssMB\":1932,\"heapUsedMB\":902,\"lagMaxMs\":14395,\"detail\":\"single event-loop block: max lag 14395ms >= 4000ms in one 1000ms window (mean 424ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-07-24T19:58:47.168177976Z",
+      "message": "{\"ts\":\"2026-07-24T19:58:47.168Z\",\"level\":\"error\",\"msg\":\"WATCHDOG TRIP \u00e2\u20ac\u201d self-restarting to clear starved event loop\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"detail\":\"single event-loop block: max lag 13531ms >= 4000ms in one 1000ms window (mean 867ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\",\"heapUsedMB\":656,\"heapLimitMB\":1812,\"rssMB\":1393,\"lagMeanMs\":867,\"lagMaxMs\":13531}"
+    },
+    {
+      "timestamp": "2026-07-24T19:59:04.083234966Z",
+      "message": "{\"ts\":\"2026-07-24T19:59:04.083Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":122,\"rssMB\":1393,\"heapUsedMB\":656,\"lagMaxMs\":13531,\"detail\":\"single event-loop block: max lag 13531ms >= 4000ms in one 1000ms window (mean 867ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-07-24T20:01:08.017550569Z",
+      "message": "{\"ts\":\"2026-07-24T20:01:08.017Z\",\"level\":\"error\",\"msg\":\"WATCHDOG TRIP \u00e2\u20ac\u201d self-restarting to clear starved event loop\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"detail\":\"single event-loop block: max lag 12801ms >= 4000ms in one 1000ms window (mean 417ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\",\"heapUsedMB\":620,\"heapLimitMB\":1812,\"rssMB\":1335,\"lagMeanMs\":417,\"lagMaxMs\":12801}"
+    },
+    {
+      "timestamp": "2026-07-24T20:01:38.335118008Z",
+      "message": "{\"ts\":\"2026-07-24T20:01:38.334Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":124,\"rssMB\":1335,\"heapUsedMB\":620,\"lagMaxMs\":12801,\"detail\":\"single event-loop block: max lag 12801ms >= 4000ms in one 1000ms window (mean 417ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-07-24T20:03:28.940677561Z",
+      "message": "{\"ts\":\"2026-07-24T20:03:28.940Z\",\"level\":\"warn\",\"msg\":\"watchdog trip suppressed during boot grace \u00e2\u20ac\u201d warmup loop block, not steady-state pathology\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"detail\":\"single event-loop block: max lag 12717ms >= 4000ms in one 1000ms window (mean 437ms) \u00e2\u20ac\u201d exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\",\"graceMsRemaining\":9394,\"var\":\"WATCHDOG_BOOT_GRACE_MS\"}"
+    }
+  ],
+  "deploys": [
+    {
+      "id": "dep-d9ieiasm0tmc73cmd950",
+      "finishedAt": "2026-07-25T16:51:27.04914Z",
+      "createdAt": "2026-07-25T16:49:47.337368Z",
+      "status": "live",
+      "trigger": "api",
+      "commit": "a21936b"
+    },
+    {
+      "id": "dep-d9ieconavr4c73amlo9g",
+      "finishedAt": "2026-07-25T16:39:32.170861Z",
+      "createdAt": "2026-07-25T16:37:54.475311Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "50506e6"
+    },
+    {
+      "id": "dep-d9ieb73rjlhs73erflc0",
+      "finishedAt": "2026-07-25T16:36:27.436257Z",
+      "createdAt": "2026-07-25T16:34:37.057762Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "50506e6"
+    },
+    {
+      "id": "dep-d9hsvlbeo5us73dkikr0",
+      "finishedAt": "2026-07-24T20:51:20.299533Z",
+      "createdAt": "2026-07-24T20:49:25.927862Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "50506e6"
+    },
+    {
+      "id": "dep-d9houan15fvs739jt6a0",
+      "finishedAt": "2026-07-24T16:15:33.925968Z",
+      "createdAt": "2026-07-24T16:13:30.979217Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "8a7ecf5"
+    },
+    {
+      "id": "dep-d9hon2upbkes738tkjh0",
+      "finishedAt": "2026-07-24T15:59:53.285364Z",
+      "createdAt": "2026-07-24T15:58:03.657806Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "8a7ecf5"
+    },
+    {
+      "id": "dep-d9hlv8mpbkes73abkjk0",
+      "finishedAt": "2026-07-24T12:52:27.402127Z",
+      "createdAt": "2026-07-24T12:50:42.126092Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "8a7ecf5"
+    },
+    {
+      "id": "dep-d9hcedflk1mc73dnv0k0",
+      "finishedAt": "2026-07-24T02:02:54.288109Z",
+      "createdAt": "2026-07-24T02:00:21.511919Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "ac6fc75"
+    },
+    {
+      "id": "dep-d9hbu6km0tmc73aiar50",
+      "finishedAt": "2026-07-24T01:27:42.50303Z",
+      "createdAt": "2026-07-24T01:25:46.140729Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "4f243d0"
+    },
+    {
+      "id": "dep-d9hbo0vavr4c73e9cgg0",
+      "finishedAt": "2026-07-24T01:14:28.341164Z",
+      "createdAt": "2026-07-24T01:12:35.597267Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "79dd34f"
+    },
+    {
+      "id": "dep-d9hbb2vlk1mc73dmfe5g",
+      "finishedAt": "2026-07-24T00:46:57.00223Z",
+      "createdAt": "2026-07-24T00:44:59.764857Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "5e57b9d"
+    },
+    {
+      "id": "dep-d9hb6rvlk1mc73dmakag",
+      "finishedAt": "2026-07-24T00:37:35.756658Z",
+      "createdAt": "2026-07-24T00:35:59.218803Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "230da93"
+    },
+    {
+      "id": "dep-d9hasecvikkc73fggvi0",
+      "finishedAt": "2026-07-24T00:15:18.996571Z",
+      "createdAt": "2026-07-24T00:13:45.514613Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "834f4e9"
+    },
+    {
+      "id": "dep-d9ha6658iqqc73detstg",
+      "finishedAt": "2026-07-23T23:29:29.043135Z",
+      "createdAt": "2026-07-23T23:26:17.058757Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "a0f64a5"
+    },
+    {
+      "id": "dep-d9ha5tvavr4c73e74gjg",
+      "finishedAt": "2026-07-23T23:27:34.907547Z",
+      "createdAt": "2026-07-23T23:25:43.791127Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "577acd7"
+    },
+    {
+      "id": "dep-d9ha0ukvikkc73ff1uu0",
+      "finishedAt": "2026-07-23T23:16:49.904776Z",
+      "createdAt": "2026-07-23T23:15:07.020819Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "577acd7"
+    },
+    {
+      "id": "dep-d9h1j5nlk1mc738s57qg",
+      "finishedAt": "2026-07-23T13:41:42.259951Z",
+      "createdAt": "2026-07-23T13:39:34.477529Z",
+      "status": "deactivated",
+      "trigger": "service_updated",
+      "commit": "1e5c488"
+    },
+    {
+      "id": "dep-d9h1bg3eo5us73d26qb0",
+      "finishedAt": "2026-07-23T13:25:03.769851Z",
+      "createdAt": "2026-07-23T13:23:13.015526Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "9493b4e"
+    },
+    {
+      "id": "dep-d9gme0kvikkc739noa90",
+      "finishedAt": "2026-07-23T00:59:37.161186Z",
+      "createdAt": "2026-07-23T00:57:38.132273Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "11dd913"
+    },
+    {
+      "id": "dep-d9glof3bc2fs738qklu0",
+      "finishedAt": "2026-07-23T00:13:19.817818Z",
+      "createdAt": "2026-07-23T00:11:40.789603Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "e5f43b4"
+    },
+    {
+      "id": "dep-d99vkl6q1p3s73d83ceg",
+      "finishedAt": "2026-07-12T20:36:31.067102Z",
+      "createdAt": "2026-07-12T20:34:28.213294Z",
+      "status": "deactivated",
+      "trigger": "new_commit",
+      "commit": "c495294"
+    },
+    {
+      "id": "dep-d99veebf53mc73ctjflg",
+      "finishedAt": "2026-07-12T20:25:25.866468Z",
+      "createdAt": "2026-07-12T20:21:14.395037Z",
+      "status": "deactivated",
+      "trigger": "api",
+      "commit": "4ba0cbb"
+    },
+    {
+      "id": "dep-d99veasvikkc73e0ee6g",
+      "finishedAt": "2026-07-12T20:23:11.031295Z",
+      "createdAt": "2026-07-12T20:20:59.406083Z",
+      "status": "deactivated",
+      "trigger": "new_commit",
+      "commit": "4ba0cbb"
+    },
+    {
+      "id": "dep-d99v4ceq1p3s73d7n5h0",
+      "finishedAt": "2026-07-12T20:02:04.809425Z",
+      "createdAt": "2026-07-12T19:59:45.086886Z",
+      "status": "deactivated",
+      "trigger": "new_commit",
+      "commit": "2160deb"
+    },
+    {
+      "id": "dep-d99q6058nd3s73cvg71g",
+      "finishedAt": "2026-07-12T14:24:02.346555Z",
+      "createdAt": "2026-07-12T14:21:53.080382Z",
+      "status": "deactivated",
+      "trigger": "new_commit",
+      "commit": "88a1add"
+    }
+  ],
+  "events": [
+    {
+      "id": "evt-d9ht0i1c0rfc738h66d0",
+      "type": "deploy_ended",
+      "timestamp": "2026-07-24T20:51:20.416775Z",
+      "details": {
+        "deployId": "dep-d9hsvlbeo5us73dkikr0",
+        "deployStatus": "succeeded",
+        "reason": {},
+        "status": 2
+      }
+    },
+    {
+      "id": "evt-d9ht0hrn8qjs73e2b4og",
+      "type": "server_available",
+      "timestamp": "2026-07-24T20:51:19.954914Z",
+      "details": {}
+    },
+    {
+      "id": "evt-d9hsvlhc0rfc738h5gkg",
+      "type": "deploy_started",
+      "timestamp": "2026-07-24T20:49:26.268392Z",
+      "details": {
+        "deployId": "dep-d9hsvlbeo5us73dkikr0",
+        "trigger": {
+          "clearCache": false,
+          "deployedByRender": false,
+          "envUpdated": false,
+          "firstBuild": false,
+          "manual": false,
+          "rollback": false,
+          "user": {
+            "email": "eetiennecg@gmail.com",
+            "id": "usr-d7macg0g4nts73ai6p5g"
+          }
+        }
+      }
+    },
+    {
+      "id": "evt-d9hs9hpoagis73b4eb10",
+      "type": "server_failed",
+      "timestamp": "2026-07-24T20:02:15.933221Z",
+      "details": {
+        "instanceID": "srv-d7mb7rr7uimc73ev0chg-bn86b",
+        "reason": {
+          "evicted": false,
+          "nonZeroExit": 1
+        }
+      }
+    },
+    {
+      "id": "evt-d9hs849oagis73b4cing",
+      "type": "server_available",
+      "timestamp": "2026-07-24T19:59:13.486357Z",
+      "details": {}
+    },
+    {
+      "id": "evt-d9hs7u1oagis73b4ceo0",
+      "type": "server_failed",
+      "timestamp": "2026-07-24T19:58:48.272377Z",
+      "details": {
+        "instanceID": "srv-d7mb7rr7uimc73ev0chg-bn86b",
+        "reason": {
+          "evicted": false,
+          "nonZeroExit": 1
+        }
+      }
+    },
+    {
+      "id": "evt-d9hs719oagis73b4bvag",
+      "type": "server_available",
+      "timestamp": "2026-07-24T19:56:53.522633Z",
+      "details": {}
+    },
+    {
+      "id": "evt-d9hs6t9oagis73b4btt0",
+      "type": "server_failed",
+      "timestamp": "2026-07-24T19:56:37.61527Z",
+      "details": {
+        "instanceID": "srv-d7mb7rr7uimc73ev0chg-bn86b",
+        "reason": {
+          "evicted": false,
+          "nonZeroExit": 1
+        }
+      }
+    },
+    {
+      "id": "evt-d9hov9j3huhc738t9bag",
+      "type": "deploy_ended",
+      "timestamp": "2026-07-24T16:15:34.055061Z",
+      "details": {
+        "deployId": "dep-d9houan15fvs739jt6a0",
+        "deployStatus": "succeeded",
+        "reason": {},
+        "status": 2
+      }
+    },
+    {
+      "id": "evt-d9houar3huhc738t8jt0",
+      "type": "deploy_started",
+      "timestamp": "2026-07-24T16:13:31.275603Z",
+      "details": {
+        "deployId": "dep-d9houan15fvs739jt6a0",
+        "trigger": {
+          "clearCache": false,
+          "deployedByRender": false,
+          "envUpdated": false,
+          "firstBuild": false,
+          "manual": false,
+          "rollback": false,
+          "user": {
+            "email": "eetiennecg@gmail.com",
+            "id": "usr-d7macg0g4nts73ai6p5g"
+          }
+        }
+      }
+    },
+    {
+      "id": "evt-d9honu9l1i4c73e4ic60",
+      "type": "deploy_ended",
+      "timestamp": "2026-07-24T15:59:53.50147Z",
+      "details": {
+        "deployId": "dep-d9hon2upbkes738tkjh0",
+        "deployStatus": "succeeded",
+        "reason": {},
+        "status": 2
+      }
+    },
+    {
+      "id": "evt-d9honu0o57mc738mch50",
+      "type": "server_available",
+      "timestamp": "2026-07-24T15:59:52.956447Z",
+      "details": {}
+    },
+    {
+      "id": "evt-d9hon2pfit4c73eg0eog",
+      "type": "deploy_started",
+      "timestamp": "2026-07-24T15:58:03.96796Z",
+      "details": {
+        "deployId": "dep-d9hon2upbkes738tkjh0",
+        "trigger": {
+          "clearCache": false,
+          "deployedByRender": false,
+          "envUpdated": false,
+          "firstBuild": false,
+          "manual": false,
+          "rollback": false,
+          "user": {
+            "email": "eetiennecg@gmail.com",
+            "id": "usr-d7macg0g4nts73ai6p5g"
+          }
+        }
+      }
+    },
+    {
+      "id": "evt-d9hm609oagis73avfrn0",
+      "type": "server_failed",
+      "timestamp": "2026-07-24T13:05:05.576713Z",
+      "details": {
+        "instanceID": "srv-d7mb7rr7uimc73ev0chg-npc6w",
+        "reason": {
+          "earlyExit": true,
+          "evicted": false
+        }
+      }
+    },
+    {
+      "id": "evt-d9hm02t8iqqc73do5rhg",
+      "type": "deploy_ended",
+      "timestamp": "2026-07-24T12:52:27.508293Z",
+      "details": {
+        "deployId": "dep-d9hlv8mpbkes73abkjk0",
+        "deployStatus": "succeeded",
+        "reason": {},
+        "status": 2
+      }
+    },
+    {
+      "id": "evt-d9hlv8g8vlas73b6f8pg",
+      "type": "deploy_started",
+      "timestamp": "2026-07-24T12:50:42.428478Z",
+      "details": {
+        "deployId": "dep-d9hlv8mpbkes73abkjk0",
+        "trigger": {
+          "clearCache": false,
+          "deployedByRender": false,
+          "envUpdated": false,
+          "firstBuild": false,
+          "manual": false,
+          "rollback": false,
+          "user": {
+            "email": "eetiennecg@gmail.com",
+            "id": "usr-d7macg0g4nts73ai6p5g"
+          }
+        }
+      }
+    }
+  ]
+}

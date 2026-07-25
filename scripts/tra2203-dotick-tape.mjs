@@ -63,6 +63,11 @@
 //   3  BLIND — the expected labels are absent from the tape; no verdict emitted
 
 import { writeFileSync } from 'node:fs';
+// TRA-2261 — the boot set is no longer this script's private business. The union
+// (deploys ∪ container deaths ∪ watchdog boot echoes), its fail-closed contract
+// and its line classifier live in ONE module so every "did the box restart?"
+// consumer answers from the same sources. See scripts/lib/render-boot-set.mjs.
+import { pullBootSet, formatBootSet } from './lib/render-boot-set.mjs';
 
 const API = 'https://api.render.com/v1';
 const OWNER_ID = 'tea-d7macfog4nts73ai6p40';
@@ -184,83 +189,20 @@ async function pullTape(from, to) {
 // So: find the boots, and always show the grade with them removed.
 const BOOT_TRANSIENT_MS = 120_000;
 
-async function pullBoots(from, to) {
-  // Widen the left edge: a deploy that finished shortly BEFORE the window still
-  // projects its transient INTO it.
-  const since = new Date(new Date(from).getTime() - BOOT_TRANSIENT_MS).toISOString();
-  const url = `${API}/services/${SERVICE_ID}/deploys?limit=50`;
-  const res = await fetchRetry(url, {
-    headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
-  }, 'deploys API');
-  if (!res.ok) {
-    console.error(`[tape] deploys API ${res.status} — cannot detect restarts; `
-      + 'grading WITHOUT boot exclusion. Treat a dominant sma200-scan with suspicion.');
-    return null;
-  }
-  const body = await res.json();
-  return body
-    .map(e => e.deploy ?? e)
-    // `finishedAt` is when the new process is serving — the boot instant.
-    .filter(d => d.finishedAt && d.finishedAt >= since && d.finishedAt <= to)
-    .map(d => ({ id: d.id, at: d.finishedAt, commit: (d.commit?.id ?? '').slice(0, 7),
-                 trigger: d.trigger ?? d.details?.trigger ?? '?' }))
-    .sort((a, b) => (a.at < b.at ? -1 : 1));
-}
-
-// ⛔ A DEPLOY IS NOT THE ONLY THING THAT BOOTS THIS PROCESS (TRA-2203, 07-24).
-// The memory watchdog self-restarts on a sustained event-loop block (pm2
-// relaunch, not a Render deploy), and `POST /api/admin/restart` does the same.
-// NEITHER writes a deploy record — so a deploys-only boot detector reports
-// "steady state ✓" over a window containing several boot transients.
-// MEASURED on 2026-07-24 RTH: FIVE watchdog trips (5.8s / 14.4s / 13.5s / 12.8s
-// / 12.7s event-loop blocks), of which only TWO left a deploy record. The other
-// three were invisible to the check that exists to see exactly this.
-// So pull the trip lines too, and union them into the boot set.
-async function pullWatchdogRestarts(from, to) {
-  const since = new Date(new Date(from).getTime() - BOOT_TRANSIENT_MS).toISOString();
-  const url = `${API}/logs?ownerId=${OWNER_ID}&resource=${SERVICE_ID}`
-    + `&text=${encodeURIComponent('self-restarting')}`
-    + `&startTime=${encodeURIComponent(since)}&endTime=${encodeURIComponent(to)}&limit=100`;
-  const res = await fetchRetry(url, {
-    headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
-  }, 'logs API (watchdog)');
-  if (!res.ok) {
-    console.error(`[tape] watchdog-trip probe ${res.status} — self-restarts NOT detected; `
-      + 'boot exclusion covers deploys only.');
-    return null;
-  }
-  const body = await res.json();
-  // ⚠️ Each trip surfaces on MORE THAN ONE line: the trip itself, and then the
-  // relaunched process re-reporting the DURABLE `lastTrip` at boot/shutdown. So
-  // the raw line count over-counts restarts, badly — 13 lines across 07-22→24
-  // all carry an identical `lag=5788ms rssMB=787` and describe ONE event.
-  //
-  // ⛔ If you are COUNTING TRIPS (an incident rate), dedupe on `(lag, rss)`:
-  // only distinct lag values are distinct events. Counting the replays reports
-  // "13 trips this week", which is a fabricated incident.
-  //
-  // Here we are building a BOOT SET, which is a different question, so cluster
-  // by TIME instead — lines within CLUSTER_MS are one boot. A replayed line
-  // that happens to land at a real boot instant is harmless: it is unioned with
-  // the deploy record for that same boot and collapses into it. Time-clustering
-  // is the robust choice for this use, not because lag values can't repeat.
-  const CLUSTER_MS = 90_000;
-  const lines = (body.logs ?? [])
-    .map(l => {
-      let rec;
-      try { rec = JSON.parse(l.message); } catch { rec = { detail: String(l.message) }; }
-      const detail = rec.detail ?? rec.msg ?? '';
-      return { id: l.id, at: l.timestamp, lag: /max lag (\d+)ms/.exec(detail)?.[1] ?? '?' };
-    })
-    .sort((a, b) => (a.at < b.at ? -1 : 1));
-  const out = [];
-  for (const l of lines) {
-    const last = out[out.length - 1];
-    if (last && new Date(l.at).getTime() - new Date(last.at).getTime() <= CLUSTER_MS) continue;
-    out.push({ id: l.id, at: l.at, commit: 'watchdog', trigger: `self-restart lag=${l.lag}ms` });
-  }
-  return out;
-}
+// ⛔ A DEPLOY IS NOT THE ONLY THING THAT BOOTS THIS PROCESS, AND THIS SCRIPT NO
+// LONGER OWNS THAT PROBLEM (TRA-2261). A watchdog self-restart is a pm2 relaunch
+// and writes NO deploy record; `POST /api/admin/restart` takes the same path. The
+// union of all three witnesses, the log-line classifier that separates a TRIP from
+// a BOOT ECHO from a SUPPRESSED non-event, and the fail-closed contract now live in
+// scripts/lib/render-boot-set.mjs, which is exercised by a discrimination suite
+// against the verbatim 2026-07-24 API bytes.
+//
+// TWO THINGS THIS SWAP FIXES IN THIS SCRIPT SPECIFICALLY:
+//   * the local version treated EVERY line matching `text=self-restarting` as a boot
+//     candidate, so the 20:03:28Z `watchdog trip SUPPRESSED during boot grace` line —
+//     which is the watchdog DECLINING to restart — was counted as a boot;
+//   * it kept a deploys-only fallback when the log probe failed, which is the exact
+//     fail-open the union exists to remove.
 
 // Is the checkExits hoist ARMED? Decides whether the parent-doTick hourly table
 // is an exit-latency curve or merely a tick-cost curve. Unauth route.
@@ -347,16 +289,21 @@ function grade(recs) {
   }
 
   const arm = await pullExitArm();
-  const deployBoots = await pullBoots(FROM, TO);
-  const selfRestarts = await pullWatchdogRestarts(FROM, TO);
-  // Union, then collapse anything within 90 s — a watchdog trip that ALSO
-  // produced a deploy record (two of five did on 07-24) must count once.
-  const boots = (deployBoots || selfRestarts)
-    ? [...(deployBoots ?? []), ...(selfRestarts ?? [])]
-        .sort((a, b) => (a.at < b.at ? -1 : 1))
-        .filter((b, i, all) => i === 0
-          || new Date(b.at).getTime() - new Date(all[i - 1].at).getTime() > 90_000)
-    : null;
+  // Widen the left edge by the transient width: a boot that lands just BEFORE the
+  // window still projects its transient INTO it, so `bootsWithPreWindow` — not the
+  // in-window count — is what the exclusion pass must use.
+  const bootSet = await pullBootSet({
+    from: FROM, to: TO, preWindowMs: BOOT_TRANSIENT_MS,
+    serviceId: SERVICE_ID, ownerId: OWNER_ID, apiKey: API_KEY, api: API,
+  });
+  // FAIL CLOSED: a blind boot set yields `null`, which prints "could not be read"
+  // below and NEVER a boot-excluded grade. There is deliberately no fallback to the
+  // deploy list — the fallback is the bug (TRA-2261).
+  const boots = bootSet.blind ? null : bootSet.bootsWithPreWindow.map(b => ({
+    at: b.at, commit: b.srcs.includes('DEPLOY') ? 'deploy' : 'watchdog',
+    trigger: b.labels.join(' + '),
+  }));
+  if (bootSet.blind) console.error(`[tape] boot set BLIND — ${bootSet.blindReasons.join('; ')}`);
   const warmRecs = boots && boots.length
     ? recs.filter(r => !inBootWindow(r.ts, boots))
     : recs;
@@ -410,6 +357,11 @@ function grade(recs) {
       parent: { phase: PARENT, ...p }, residualPct: residual, subs,
       hourly: [...hourly.entries()].sort().map(([h, v]) => ({ hourUTC: h, ...stats(v) })),
       restarts: boots ?? 'undetected',
+      bootSet: {
+        blind: bootSet.blind, blindReasons: bootSet.blindReasons,
+        bootCount: bootSet.bootCount, invisibleToDeploys: bootSet.invisibleToDeploys,
+        boots: bootSet.bootsWithPreWindow, trips: bootSet.trips, suppressed: bootSet.suppressed,
+      },
       bootExcluded: warm
         ? { parent: { phase: PARENT, ...warm.p }, residualPct: warm.residual, subs: warm.subs }
         : null,
@@ -471,16 +423,15 @@ function grade(recs) {
   }
   // ── Restart contamination (TRA-2205) ───────────────────────────────────────
   console.log('');
+  console.log(formatBootSet(bootSet));
   if (boots === null) {
-    console.log('RESTARTS: could not be read — the grade above may contain boot transients.');
+    console.log('  ⇒ the grade above may contain boot transients. Do NOT read this as steady state.');
   } else if (boots.length === 0) {
-    console.log('RESTARTS: none in this window — the grade above is steady-state. ✓');
+    console.log('  ⇒ the grade above is steady-state. ✓');
   } else {
-    console.log(`RESTARTS: ${boots.length} boot(s) inside this window (deploys UNION watchdog`);
-    console.log(`          self-restarts — a self-restart leaves NO deploy record). Every throttled`);
-    console.log(`          sink fires on the first tick of a new process regardless of its`);
-    console.log(`          interval, so the ${BOOT_TRANSIENT_MS / 1000}s after each boot is a TRANSIENT, not steady state:`);
-    for (const b of boots) console.log(`            ${b.at}  ${b.commit || '???????'}  trigger=${b.trigger}`);
+    console.log(`          Every throttled sink fires on the first tick of a new process regardless`);
+    console.log(`          of its interval, so the ${BOOT_TRANSIENT_MS / 1000}s after each boot is a TRANSIENT, not`);
+    console.log(`          steady state:`);
     const dropped = recs.length - warmRecs.length;
     console.log(`          ${dropped} of ${recs.length} phase records (${((dropped / recs.length) * 100).toFixed(1)}%) fall in a boot transient.`);
     console.log('');
