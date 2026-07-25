@@ -54,8 +54,19 @@ was **2026-07-12** (`c495294`). Every deploy since has been an explicit REST tri
 So the manual trigger is **the deploy path, not a fallback**:
 
 ```bash
-RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>   # RTH-gated, 13:30–20:00Z
+RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>
 ```
+
+That script is a **freeze**: it **REFUSES** inside 13:25–20:00Z Mon–Fri (RTH is 13:30–20:00Z; the
+freeze opens 5 min early because a deploy *created* at 13:29Z *boots* the box inside RTH), plus any
+dated embargo in its `EMBARGOES` table. It is **OPEN** pre-open, post-close and all weekend. Do not
+read "RTH-gated" as "only deployable during RTH" — two of us read the old annotation backwards and
+embargoed a commit against a slot that was open the whole time (TRA-2313).
+
+⚠️ It gates **deploys**. It cannot see an **env/settings write**, and one of those redeploys bqb1
+anyway (`trigger: service_updated`) *despite* `autoDeploy=no` (TRA-2186), nor the memory watchdog's
+own pm2 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the
+script is not evidence the host is safe to touch.**
 
 Do not "fix" the pin by turning `autoDeploy` back on. It is what stops a mid-session merge from
 dumping bqb1's warm quote cache and resetting the go-live soak clock (TRA-1996), and lifting it is
