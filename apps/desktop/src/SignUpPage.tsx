@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { HTTP_URL } from './server-url';
+import PasswordInput from './components/PasswordInput';
 
 interface Props {
   onSignUp: (token: string) => void;
@@ -80,11 +81,9 @@ export default function SignUpPage({ onSignUp, onBack }: Props) {
           </label>
           <label className="login-label">
             Password
-            <input
-              className="login-input"
-              type="password"
+            <PasswordInput
               value={password}
-              onChange={e => setPassword(e.target.value)}
+              onChange={setPassword}
               autoComplete="new-password"
               required
               disabled={loading}
@@ -92,11 +91,9 @@ export default function SignUpPage({ onSignUp, onBack }: Props) {
           </label>
           <label className="login-label">
             Confirm Password
-            <input
-              className="login-input"
-              type="password"
+            <PasswordInput
               value={confirmPassword}
-              onChange={e => setConfirmPassword(e.target.value)}
+              onChange={setConfirmPassword}
               autoComplete="new-password"
               required
               disabled={loading}

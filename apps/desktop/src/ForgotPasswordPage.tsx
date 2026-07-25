@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { HTTP_URL } from './server-url';
+import PasswordInput from './components/PasswordInput';
 
 function getUrlResetCode(): string {
   const params = new URLSearchParams(window.location.search);
@@ -137,11 +138,9 @@ export default function ForgotPasswordPage({ onBack }: Props) {
               </label>
               <label className="login-label">
                 New Password
-                <input
-                  className="login-input"
-                  type="password"
+                <PasswordInput
                   value={newPassword}
-                  onChange={e => setNewPassword(e.target.value)}
+                  onChange={setNewPassword}
                   autoComplete="new-password"
                   minLength={6}
                   required
@@ -150,11 +149,9 @@ export default function ForgotPasswordPage({ onBack }: Props) {
               </label>
               <label className="login-label">
                 Confirm Password
-                <input
-                  className="login-input"
-                  type="password"
+                <PasswordInput
                   value={confirmPassword}
-                  onChange={e => setConfirmPassword(e.target.value)}
+                  onChange={setConfirmPassword}
                   autoComplete="new-password"
                   minLength={6}
                   required

@@ -160,4 +160,42 @@ export function verifyChallenge(username: string, code: string): VerifyResult {
 export function resetTwoFactorStore(): void {
   challenges.clear();
   persist();
+  enrollmentCodes.clear();
+}
+
+// ── TRA-2293 — backup codes minted by an enrol-at-login opt-in ────────────────
+//
+// The login screen lets a user opt into 2FA at the moment they sign in. Enrolment
+// happens right after the password check, but the backup codes can only be shown
+// once the second factor is actually cleared — otherwise a caller who merely knows
+// a password would walk away with ten permanent bypass codes. So the codes wait
+// here between /api/auth/login and /api/auth/2fa/verify.
+//
+// Deliberately memory-only: these are show-once secrets, and a restart in that
+// ~10-minute window should drop them rather than leave them on disk. A user who
+// loses them re-mints from Settings, which is the same path as before.
+
+interface EnrollmentCodes {
+  codes: string[];
+  expiresAt: number;
+}
+
+const enrollmentCodes = new Map<string, EnrollmentCodes>();
+/** Matches the pending-auth token lifetime; a stale entry is unreachable anyway. */
+const ENROLLMENT_TTL_MS = 10 * 60 * 1000;
+
+export function stashEnrollmentBackupCodes(username: string, codes: string[]): void {
+  enrollmentCodes.set(username, { codes, expiresAt: Date.now() + ENROLLMENT_TTL_MS });
+}
+
+/**
+ * Hand back (and forget) the codes stashed for `username`. Returns null when the
+ * login did not enrol — the common case — so callers can spread the result.
+ */
+export function takeEnrollmentBackupCodes(username: string): string[] | null {
+  const entry = enrollmentCodes.get(username);
+  if (!entry) return null;
+  enrollmentCodes.delete(username);
+  if (entry.expiresAt <= Date.now()) return null;
+  return entry.codes;
 }

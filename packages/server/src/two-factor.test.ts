@@ -12,6 +12,8 @@ let issueChallenge: TF['issueChallenge'];
 let resendChallenge: TF['resendChallenge'];
 let verifyChallenge: TF['verifyChallenge'];
 let resetTwoFactorStore: TF['resetTwoFactorStore'];
+let stashEnrollmentBackupCodes: TF['stashEnrollmentBackupCodes'];
+let takeEnrollmentBackupCodes: TF['takeEnrollmentBackupCodes'];
 
 beforeAll(async () => {
   const mod = await import('./two-factor.js');
@@ -19,6 +21,8 @@ beforeAll(async () => {
   resendChallenge = mod.resendChallenge;
   verifyChallenge = mod.verifyChallenge;
   resetTwoFactorStore = mod.resetTwoFactorStore;
+  stashEnrollmentBackupCodes = mod.stashEnrollmentBackupCodes;
+  takeEnrollmentBackupCodes = mod.takeEnrollmentBackupCodes;
 });
 
 beforeEach(() => resetTwoFactorStore());
@@ -81,5 +85,33 @@ describe('resend', () => {
     expect(resendChallenge('alice').ok).toBe(true); // 2
     expect(resendChallenge('alice').ok).toBe(true); // 3 (OTP_MAX_SENDS)
     expect(resendChallenge('alice')).toEqual({ ok: false, reason: 'too_many_sends' });
+  });
+});
+
+// TRA-2293 — backup codes minted by a login-screen 2FA opt-in wait here between
+// the password step and the second factor.
+describe('enrollment backup-code stash', () => {
+  it('hands the codes back exactly once', () => {
+    stashEnrollmentBackupCodes('alice', ['AAAA-1111', 'BBBB-2222']);
+    expect(takeEnrollmentBackupCodes('alice')).toEqual(['AAAA-1111', 'BBBB-2222']);
+    // A second /2fa/verify must not re-issue permanent bypass codes.
+    expect(takeEnrollmentBackupCodes('alice')).toBeNull();
+  });
+
+  it('returns null for the ordinary sign-in that enrolled nothing', () => {
+    expect(takeEnrollmentBackupCodes('nobody')).toBeNull();
+  });
+
+  it('keeps stashes separate per user', () => {
+    stashEnrollmentBackupCodes('alice', ['AAAA-1111']);
+    stashEnrollmentBackupCodes('bob', ['BBBB-2222']);
+    expect(takeEnrollmentBackupCodes('bob')).toEqual(['BBBB-2222']);
+    expect(takeEnrollmentBackupCodes('alice')).toEqual(['AAAA-1111']);
+  });
+
+  it('is cleared by a store reset', () => {
+    stashEnrollmentBackupCodes('alice', ['AAAA-1111']);
+    resetTwoFactorStore();
+    expect(takeEnrollmentBackupCodes('alice')).toBeNull();
   });
 });

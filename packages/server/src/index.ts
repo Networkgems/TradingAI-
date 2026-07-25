@@ -177,7 +177,14 @@ import {
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
-import { initTwoFactorStore, issueChallenge, resendChallenge, verifyChallenge } from './two-factor.js';
+import {
+  initTwoFactorStore,
+  issueChallenge,
+  resendChallenge,
+  verifyChallenge,
+  stashEnrollmentBackupCodes,
+  takeEnrollmentBackupCodes,
+} from './two-factor.js';
 import { initStateDb, getStateDb, getStateDbStatus } from './sqlite.js'; // TRA-1052 — durable hot-state SQLite store
 import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; // TRA-1681 — fail CLOSED
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
@@ -4745,7 +4752,12 @@ function rejectIfThrottled(res: express.Response, keys: string[]): boolean {
 }
 
 app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body as { username?: string; password?: string };
+  const { username, password, enrollTwoFactor } = req.body as {
+    username?: string;
+    password?: string;
+    // TRA-2293 — the login screen's "turn on two-factor" opt-in.
+    enrollTwoFactor?: boolean;
+  };
   if (typeof username !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'username and password are required' });
     return;
@@ -4770,6 +4782,33 @@ app.post('/api/auth/login', async (req, res) => {
   recordSuccess(ipKey);
   recordSuccess(userKey);
 
+  // TRA-2293 — opt into two-factor straight from the login screen. Enrolling here
+  // (after the password check, before the response) means the very next thing the
+  // user sees is the code-entry step, so the control they just switched on is
+  // exercised immediately rather than taking effect on some later sign-in.
+  //
+  // The minted backup codes are NOT returned here: at this point the caller has
+  // only proven the password, and handing over ten permanent bypass codes on that
+  // basis would make the opt-in a downgrade. They are released by /2fa/verify,
+  // once the emailed code has actually been cleared.
+  //
+  // No email on file → no delivery channel, so enrolment is skipped and the
+  // `emailRequired` step below collects one first.
+  const enrollRequested = enrollTwoFactor === true;
+  let enrolledNow = false;
+  if (enrollRequested && !isTwoFactorEnabled(username) && getUser(username)?.email) {
+    const enrolled = await enableTwoFactor(username);
+    if (enrolled.ok) {
+      stashEnrollmentBackupCodes(username, enrolled.backupCodes);
+      enrolledNow = true;
+    } else {
+      log.warn('auth: login-screen 2FA opt-in failed to enrol', {
+        username,
+        reason: enrolled.error,
+      });
+    }
+  }
+
   // TRA-1505 — if the account has email 2FA enabled, the password step is only
   // the FIRST factor: issue a short-lived pending-auth token (NOT a session),
   // email a one-time code, and require /api/auth/2fa/verify to finish. The
@@ -4786,7 +4825,13 @@ app.post('/api/auth/login', async (req, res) => {
           reason: err instanceof Error ? err.message : String(err),
         });
       }
-      res.json({ twoFactorRequired: true, pendingToken: createPendingToken(username) });
+      res.json({
+        twoFactorRequired: true,
+        pendingToken: createPendingToken(username),
+        // TRA-2293 — tells the client this login is the one that turned 2FA on,
+        // so it knows to expect backup codes back from /2fa/verify.
+        ...(enrolledNow ? { twoFactorEnrolled: true } : {}),
+      });
       return;
     }
     // Enabled but no email on file (shouldn't happen — enrollment requires one).
@@ -4794,7 +4839,21 @@ app.post('/api/auth/login', async (req, res) => {
     log.warn('auth: 2FA enabled but no email on file; skipping second factor', { username });
   }
 
-  res.json({ token: createToken(username) });
+  // TRA-2293 — an account with no email on file can neither receive a sign-in
+  // code nor enrol in 2FA, and the `admin` seed account starts exactly that way.
+  // The password was correct, so the session is legitimate; the client uses this
+  // flag to collect an address before handing over the dashboard. It is collected
+  // HERE rather than on the logged-out screen on purpose — letting an
+  // unauthenticated caller attach an address to a username would turn "email me a
+  // code" into an account-takeover primitive.
+  const emailOnFile = getUser(username)?.email;
+  res.json({
+    token: createToken(username),
+    ...(emailOnFile ? {} : { emailRequired: true }),
+    // Opt-in that could not be honoured yet — the client re-tries it once an
+    // address is on file.
+    ...(enrollRequested && !emailOnFile ? { twoFactorPending: true } : {}),
+  });
 });
 
 // TRA-1505 — complete the second factor. Accepts either the emailed OTP or a
@@ -4810,6 +4869,13 @@ app.post('/api/auth/2fa/verify', async (req, res) => {
   const username = verifyPendingToken(pendingToken);
   if (!username) {
     res.status(401).json({ error: 'Your login session expired. Please sign in again.' });
+    return;
+  }
+  // TRA-2293 — re-check the lock here, not just at /api/auth/login. The
+  // email-code sign-in below mints a pending token without going through the
+  // password route at all, so this is the only lock check on that path.
+  if (isUserLocked(username)) {
+    res.status(423).json({ error: 'Account is locked. Contact an administrator.' });
     return;
   }
   const ipKey = `2fa:ip:${clientKey(req)}`;
@@ -4837,7 +4903,14 @@ app.post('/api/auth/2fa/verify', async (req, res) => {
   if (result === 'ok') {
     recordSuccess(ipKey);
     recordSuccess(userKey);
-    res.json({ token: createToken(username) });
+    // TRA-2293 — release the backup codes minted by a login-screen opt-in, now
+    // that the second factor has actually been cleared. Null for every ordinary
+    // sign-in.
+    const backupCodes = takeEnrollmentBackupCodes(username);
+    res.json({
+      token: createToken(username),
+      ...(backupCodes ? { backupCodes } : {}),
+    });
     return;
   }
   recordFailure(ipKey);
@@ -4892,6 +4965,54 @@ app.post('/api/auth/2fa/resend', async (req, res) => {
   res.json({ ok: true, message: 'A new code has been sent.' });
 });
 
+// TRA-2293 — sign in with an emailed code instead of a password. The account's
+// address is the only delivery target; there is no way for the caller to name one,
+// so this proves possession of an inbox already on file.
+//
+// Security floor: this is not weaker than what already exists. /api/auth/forgot
+// -password hands full account control to whoever reads that same inbox, so
+// treating an emailed code as sufficient to sign in grants strictly less (no
+// password change, and the code expires in ~10 minutes).
+//
+// The response is deliberately identical for every input — same shape, same
+// message, and a pendingToken minted even for a username that does not exist —
+// so this route cannot be used to enumerate accounts. A token with no challenge
+// behind it simply fails at /2fa/verify.
+app.post('/api/auth/login-code', async (req, res) => {
+  const { username } = req.body as { username?: string };
+  if (typeof username !== 'string' || !username.trim()) {
+    res.status(400).json({ error: 'username is required' });
+    return;
+  }
+  const name = username.trim();
+  const ipKey = `login-code:ip:${clientKey(req)}`;
+  const userKey = `login-code:user:${name.toLowerCase()}`;
+  if (rejectIfThrottled(res, [ipKey, userKey])) return;
+  // Every request counts toward the limit: the response is always ok, so there is
+  // no success to clear the counter with.
+  recordFailure(ipKey);
+  recordFailure(userKey);
+
+  const user = getUser(name);
+  // A locked account gets no code — /2fa/verify refuses it anyway, but there is
+  // no reason to mail one out.
+  if (user?.email && !isUserLocked(name)) {
+    const { code } = issueChallenge(name);
+    try {
+      await sendOtpEmail(user.email, name, code);
+    } catch (err) {
+      log.error('auth: failed to send sign-in code', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  res.json({
+    ok: true,
+    pendingToken: createPendingToken(name),
+    message: 'If that account exists and has an email on file, a sign-in code is on its way.',
+  });
+});
+
 // TRA-1505 — 2FA enrollment (authenticated). Enabling mints one-time backup
 // recovery codes returned exactly once; the client must show them to the user.
 app.get('/api/auth/2fa/status', requireAuth, (req, res) => {
@@ -4925,6 +5046,40 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
   }
   await disableTwoFactor(username);
   res.json({ ok: true });
+});
+
+// TRA-2293 — attach an email address to an account that has none. Required
+// before 2FA or emailed sign-in codes can work at all, and the `admin` seed
+// account is created with an empty address.
+//
+// Authenticated on purpose: the caller has already proven the password, so this
+// cannot be used to point someone else's account at an attacker's inbox. Adding
+// an address is allowed once; CHANGING an existing one stays in Settings, where
+// it sits behind the rest of the account-management surface.
+app.post('/api/auth/account/email', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const { email } = req.body as { email?: string };
+  if (typeof email !== 'string' || !email.includes('@') || !email.trim()) {
+    res.status(400).json({ error: 'A valid email address is required' });
+    return;
+  }
+  const trimmed = email.trim();
+  const current = getUser(username);
+  if (current?.email) {
+    res.status(409).json({ error: 'This account already has an email address. Change it in Settings.' });
+    return;
+  }
+  const existing = getUserByEmail(trimmed);
+  if (existing && existing.username !== username) {
+    res.status(409).json({ error: 'That email address is already in use.' });
+    return;
+  }
+  const result = await updateUser(username, { email: trimmed });
+  if (!result.ok) {
+    res.status(400).json({ error: result.error ?? 'Could not save that email address.' });
+    return;
+  }
+  res.json({ ok: true, email: trimmed });
 });
 
 app.post('/api/auth/signup', async (req, res) => {

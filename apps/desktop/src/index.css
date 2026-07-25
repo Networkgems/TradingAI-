@@ -754,6 +754,73 @@ tr:hover td { background: var(--bg-hover); }
 .login-input:focus { border-color: var(--blue); }
 .login-input:disabled { opacity: 0.6; }
 
+/* TRA-2293 — password reveal toggle. The wrapper is the positioning context and
+   the input reserves room on the right so a long password never runs under the
+   eye. */
+.login-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.login-input-wrap .login-input { flex: 1; }
+.login-input--with-toggle { padding-right: 2.25rem; }
+
+.login-reveal-btn {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 2.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.login-reveal-btn:hover:not(:disabled) { color: var(--text); }
+.login-reveal-btn:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+.login-reveal-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* TRA-2293 — inline opt-in checkbox (two-factor) on the sign-in form. */
+.login-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: pointer;
+}
+
+.login-check input { margin-top: 0.15rem; accent-color: var(--blue); }
+.login-check:has(input:disabled) { opacity: 0.6; cursor: not-allowed; }
+
+/* TRA-2293 — one-time backup codes shown after enrolling from the login screen. */
+.login-codes {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  padding: 0.6rem 0.75rem;
+  text-align: center;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .login-error {
   font-size: 0.75rem;
   color: var(--red);
