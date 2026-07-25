@@ -1,0 +1,243 @@
+import type { RequestHandler } from 'express';
+
+// TRA-2298 — HTTP response hardening: security headers + a CORS allowlist.
+//
+// Split out of `index.ts` so the two decisions that can BREAK A LIVE CONSUMER
+// (which origin gets an `Access-Control-Allow-Origin`, and whether HSTS goes
+// out) are pure functions with a test around each branch, rather than four
+// `res.setHeader` lines buried at line 1042 of a 10k-line file.
+//
+// ── Who actually talks to this server cross-origin ───────────────────────────
+//
+// TRA-2298's suggested fix said "allowlist `APP_URL` plus the Tauri desktop
+// origin". That list is INCOMPLETE, and shipping it would have taken the public
+// web app off the air. Measured 2026-07-25 against the live bytes:
+//
+//   $ curl -s https://networkgems.github.io/TradingAI-/assets/index-*.js \
+//       | grep -o 'wss\?://[a-zA-Z0-9.-]*'
+//   wss://tradingai-bqb1.onrender.com
+//
+// The GitHub Pages build (`deploy-pages.yml`, `VITE_BASE=/TradingAI-/`) is a
+// real, live, CROSS-ORIGIN browser consumer of this API — see `server-url.ts`
+// resolution step 4, which exists precisely because that site has no backend of
+// its own. It is the one consumer for which `*` was actually load-bearing.
+//
+// The packaged Tauri desktop app is the opposite case: `server-url.ts` step 2
+// resolves it to `ws://localhost:4242`, and the desktop release build does not
+// bake `VITE_SERVER_URL` (only the Pages workflow does), so it talks to a LOCAL
+// server — which runs this same middleware. Its webview origin still has to be
+// on the list, just for the local hop.
+//
+// ── Why a non-allowlisted origin is answered, not refused ────────────────────
+//
+// CORS is enforced by the BROWSER, not by us. So a disallowed origin simply
+// gets no `Access-Control-Allow-Origin` header and the browser drops the
+// response. We never reject the request itself, because a request with NO
+// `Origin` at all — curl, the ops scripts, `tra425_full_regression.mjs`, any
+// server-to-server caller — is indistinguishable at the wire from a hostile one
+// and is the overwhelming majority of non-browser traffic here. Refusing those
+// would break every operational tool on the box to buy nothing: a non-browser
+// client can forge any `Origin` it likes, so origin-based *rejection* is not a
+// security boundary. The auth check is the boundary; this is defence in depth.
+
+/** Tauri v2 webview origins. The scheme differs by platform, so all three ship. */
+export const TAURI_ORIGINS: readonly string[] = [
+  'tauri://localhost', // macOS, Linux, iOS
+  'http://tauri.localhost', // Windows, Android
+  'https://tauri.localhost', // Windows (older webview2 builds)
+];
+
+/** Loopback origins: Tauri dev (:1420), vite dev (:5173), server-hosted web (:4242). */
+export const LOCAL_ORIGINS: readonly string[] = [
+  'http://localhost:1420',
+  'http://127.0.0.1:1420',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4242',
+  'http://127.0.0.1:4242',
+];
+
+/** The public web build. Proven live cross-origin consumer — see header. */
+export const PAGES_ORIGIN = 'https://networkgems.github.io';
+
+/**
+ * Reduce a URL to its origin (`scheme://host[:port]`), or null if unparseable.
+ * `APP_URL` is a full app URL with a path in some deployments, and an `Origin`
+ * header never carries one, so comparing raw strings would silently never match.
+ */
+export function toOrigin(value: string | undefined | null): string | null {
+  const raw = (value ?? '').trim();
+  if (!raw) return null;
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The allowlist, built once at boot from the static set plus `APP_URL` and the
+ * comma-separated `CORS_ALLOWED_ORIGINS` escape hatch (so onboarding a new
+ * front end does not require a code change during a deploy freeze).
+ */
+export function buildAllowedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const origins = new Set<string>([PAGES_ORIGIN, ...TAURI_ORIGINS, ...LOCAL_ORIGINS]);
+
+  const appOrigin = toOrigin(env['APP_URL']);
+  if (appOrigin) origins.add(appOrigin);
+
+  for (const entry of (env['CORS_ALLOWED_ORIGINS'] ?? '').split(',')) {
+    // `tauri://localhost` parses to origin `null` in the WHATWG URL model
+    // (non-special scheme), so accept a verbatim match against the known set
+    // before falling back to normalisation.
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const normalised = toOrigin(trimmed);
+    origins.add(normalised && normalised !== 'null' ? normalised : trimmed);
+  }
+
+  return origins;
+}
+
+/**
+ * The value to echo in `Access-Control-Allow-Origin`, or null to send no such
+ * header at all. Null covers BOTH "no Origin header" (non-browser caller: fine,
+ * unaffected) and "origin not on the list" (browser: response blocked).
+ */
+export function resolveAllowedOrigin(
+  origin: string | string[] | undefined,
+  allowed: Set<string>,
+): string | null {
+  const value = Array.isArray(origin) ? origin[0] : origin;
+  if (!value) return null;
+  // `Origin: null` is what a sandboxed iframe / `file://` document sends. Never
+  // echo it — it is not an origin, and echoing it grants every such document.
+  if (value === 'null') return null;
+  return allowed.has(value) ? value : null;
+}
+
+export interface SecurityHeaderOptions {
+  /** True only when the request reached us over TLS (`req.secure`, with `trust proxy` on). */
+  secure: boolean;
+  /** `req.headers.host`, used to name this origin's WebSocket in the CSP. */
+  host?: string | undefined;
+}
+
+/**
+ * The enforced Content-Security-Policy. Deliberately ONLY `frame-ancestors`:
+ * that is the clickjacking fix TRA-2298 calls the sharpest edge, and it cannot
+ * break a page that is never framed (nothing in this repo embeds the app —
+ * grepped, zero `<iframe>`). Everything else ships Report-Only first.
+ */
+const ENFORCED_CSP = "frame-ancestors 'none'";
+
+/**
+ * The candidate full policy, shipped Report-Only so a violation is a console
+ * entry, never a broken panel. Promote to enforced on a separate ticket once a
+ * session's worth of reports is clean.
+ *
+ * `'unsafe-inline'` on style-src is expected to be permanent: React inline
+ * `style={{...}}` props and the chart components emit inline styles. `worker-src`
+ * covers the vite-plugin-pwa service worker.
+ */
+export function reportOnlyCsp(host?: string): string {
+  // A document served by this origin opens its dashboard socket back to the
+  // same host. CSP3 says `'self'` should cover ws/wss on the same origin, but
+  // that has been unevenly implemented, so name it explicitly when we know it.
+  const socket = host ? ` wss://${host} ws://${host}` : '';
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    `connect-src 'self'${socket}`,
+  ].join('; ');
+}
+
+/**
+ * Security headers for one response.
+ *
+ * HSTS is emitted ONLY over TLS. This is not cosmetic RFC-6797 compliance: the
+ * desktop app and every dev loop talk to this same server over plain
+ * `http://localhost:4242`. A browser that ever honoured an HSTS header from
+ * that origin would force-upgrade localhost to https for a YEAR, with no server
+ * on the other side and no way to clear it short of editing browser internals.
+ * Gate on transport, not on NODE_ENV.
+ */
+export function securityHeaders(opts: SecurityHeaderOptions): Record<string, string> {
+  const headers: Record<string, string> = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Content-Security-Policy': ENFORCED_CSP,
+    'Content-Security-Policy-Report-Only': reportOnlyCsp(opts.host),
+  };
+  if (opts.secure) {
+    headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
+  }
+  return headers;
+}
+
+// ── Middleware ───────────────────────────────────────────────────────────────
+//
+// These live here rather than inline in `index.ts` so the integration test
+// exercises the EXACT handlers the server mounts. A test that re-implemented
+// the wiring would keep passing after the wiring in `index.ts` drifted, which
+// is the failure mode that makes a green suite worse than no suite.
+
+/** Stamps the security headers on every response, including static and error paths. */
+export function securityHeadersMiddleware(): RequestHandler {
+  return (req, res, next) => {
+    // `req.secure` is only truthful because `app.set('trust proxy', true)` is
+    // set (TRA-404) — behind Render's proxy the TLS terminates upstream and the
+    // signal arrives as `X-Forwarded-Proto`. Without trust proxy this would be
+    // false on prod and HSTS would never ship.
+    const headers = securityHeaders({ secure: req.secure, host: req.headers.host });
+    for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+    next();
+  };
+}
+
+/**
+ * Emits CORS headers only for an allowlisted origin, and answers preflight with
+ * 204 either way. Never rejects a request — see the header of this file.
+ */
+export function corsMiddleware(allowed: Set<string>): RequestHandler {
+  return (req, res, next) => {
+    // Required whenever the response varies by request origin: Cloudflare sits
+    // in front of this service, and without `Vary` a response cached for an
+    // allowlisted origin can be replayed to a different one — which would hand
+    // the `*` behaviour straight back through the cache.
+    res.setHeader('Vary', 'Origin');
+
+    const allowOrigin = resolveAllowedOrigin(req.headers.origin, allowed);
+    if (allowOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', allowOrigin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+      // TRA-413 — allow the desktop client to send `X-Trace-Id` (not a CORS-
+      // safelisted header) so its requests correlate with the traces they
+      // produce, and expose the response header so a client can read the id the
+      // server filed under. `Max-Age` lets the browser cache the preflight so a
+      // polling client does not re-preflight every request.
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Trace-Id');
+      res.setHeader('Access-Control-Expose-Headers', 'X-Trace-Id');
+      res.setHeader('Access-Control-Max-Age', '86400');
+    }
+
+    if (req.method === 'OPTIONS') {
+      // Status stays 204 whether or not the origin is allowed: the browser gates
+      // on the ABSENCE of `Access-Control-Allow-Origin`, and a 4xx here would
+      // differ only for non-browser callers, who are not the threat.
+      res.status(204).end();
+      return;
+    }
+    next();
+  };
+}

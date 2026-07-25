@@ -7,6 +7,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
+import { buildAllowedOrigins, corsMiddleware, securityHeadersMiddleware } from './http-security.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import {
   reconcilePnl,
@@ -1047,25 +1048,26 @@ const app = express();
 // (used to key the auth-endpoint brute-force throttle).
 app.set('trust proxy', true);
 
+// ── Security headers ─────────────────────────────────────────────────────────
+
+// TRA-2298 — nothing on this box carried HSTS, CSP, X-Frame-Options or nosniff,
+// on an authenticated surface that exposes one-click kill-switch / stop-trading
+// / close-position controls to a browser. Mounted FIRST so it covers the static
+// SPA (`express.static` below) and every error path, not just the API routes.
+// `x-powered-by` is dropped outright — free stack fingerprinting.
+app.disable('x-powered-by');
+app.use(securityHeadersMiddleware());
+
 // ── CORS ─────────────────────────────────────────────────────────────────────
 
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  // TRA-413 — allow the desktop client to send `X-Trace-Id` (not a CORS-
-  // safelisted header) so its requests correlate with the traces they produce,
-  // and expose the response header so a client can read the id the server
-  // filed under. `Max-Age` lets the browser cache the preflight so a polling
-  // client does not re-preflight every request.
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Trace-Id');
-  res.setHeader('Access-Control-Expose-Headers', 'X-Trace-Id');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
+// TRA-2298 — was `Access-Control-Allow-Origin: *` on every route, which handed
+// any web origin a browser-sourced driver for `/api/auth/login`. Now an
+// allowlist; see `http-security.ts` for who is on it, why the GitHub Pages
+// origin is load-bearing, and why a non-allowlisted origin is
+// answered-without-the-header rather than refused.
+const ALLOWED_ORIGINS = buildAllowedOrigins();
+log.info('cors allowlist', { origins: [...ALLOWED_ORIGINS] });
+app.use(corsMiddleware(ALLOWED_ORIGINS));
 
 // TRA-406 — open a trace for every request so logs, captured errors and the
 // `X-Trace-Id` response header all correlate to the same request.
