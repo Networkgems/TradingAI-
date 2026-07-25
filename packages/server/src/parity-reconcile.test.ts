@@ -11,6 +11,8 @@ import {
   getParityReconcileSeries,
   parityReconcileDurability,
   parityReconcileLogPath,
+  isPostCloseEt,
+  RATIO_DENOM_FLOOR_USD,
 } from './parity-reconcile.js';
 import type {
   SandboxStrategyRecord,
@@ -21,10 +23,20 @@ import type {
 // (requestedPx = demo-book mid mark, fillPx = real fill) into a per-strategy demo-mark-vs-
 // sandbox-fill P&L gap / half-spread. Proves: signed-cost sign per side, the
 // gap == demoMark − sandboxFill identity, the uncomputable path (a null leg is EXCLUDED,
-// never folded as a 0 gap), gapPct 3-valued on a 0 denominator, percentile edge (n=1),
-// etDay vs cumulative bucketing, mutation (flip a fill across the mid → gap sign flips),
-// and the durable daily series (self-accrual idempotent per ET day, reboot hydrate,
-// retention compaction, torn-line tolerance, durability.ephemeral).
+// never folded as a 0 gap), percentile edge (n=1), etDay vs cumulative bucketing,
+// mutation (flip a fill across the mid → gap sign flips), and the durable daily series
+// (reboot hydrate, retention compaction, torn-line tolerance, durability.ephemeral).
+//
+// TRA-2279 adds the two instrument fixes:
+//   D1 — `gapPct` (a ratio under a percent's name, over a denominator that could vanish)
+//        is REMOVED in favour of `gapToDemoMarkRatio` + a materiality floor. Proven by:
+//        the old key is absent; the live 17× payload reads 0.17 not 17; a sub-floor
+//        denominator nulls rather than diverges; a one-tick mid change can no longer flip
+//        the ratio's sign; the two nulls are attributable; 4-place rounding.
+//   D2 — the daily point re-folds (last-write-wins per ET day) instead of freezing at the
+//        first read, stamps its window (`firstFoldTs`/`lastFoldTs`/`foldCount`/
+//        `sessionComplete`, DST-correct), records observed-and-empty days so ABSENT is
+//        distinguishable, and hydrates the LAST line per day off the append-only log.
 
 // NOW is inside RETENTION for the snapshot ts, and lands on a fixed ET day.
 const NOW = Date.parse('2026-07-24T18:00:00Z'); // 2026-07-24 14:00 ET
@@ -149,25 +161,124 @@ describe('summarizeParityReconcile', () => {
     expect(b.parityGapUsd.mean).toBeCloseTo(15, 6);
   });
 
-  it('gapPct is null (3-valued) when the demo-mark denominator is ~0', () => {
-    // buy mid 1.0 / sell mid 1.0 ⇒ demoMark = 0. Fills differ ⇒ nonzero gap, but pct undefined.
+  // ── TRA-2279 D1 — the units defect ─────────────────────────────────────────
+  //
+  // `gapPct` was a RATIO under a percent's name (live `gapPct: 17` meant 17× / 1700%,
+  // and the TRA-2277 handoff read it as "17.00%"), over a denominator so near zero that
+  // the ratio diverged and could flip sign. It is REMOVED — not rescaled under the same
+  // name — because a key whose value moves 100× while its name holds still is the exact
+  // instrument that reads identically right and wrong.
+
+  it('the misnamed `gapPct` key is GONE from the payload (a stale reader must fail loudly)', () => {
+    const s = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 3.0, 2.9)])],
+      NOW,
+    );
+    const b = s.strategies.long_call.cumulative;
+    // `in`, not `?? null` — an ABSENT key and a key present holding null are different
+    // facts, and only absence makes a stale reader throw instead of quoting 1700%.
+    expect('gapPct' in b).toBe(false);
+    expect('gapToDemoMarkRatio' in b).toBe(true);
+  });
+
+  it('reproduces the live 17x payload as a RATIO of 17, not a percent of 17', () => {
+    // The live long_call bucket: gap $17 over |demoMark| $1.00. Under the old field this
+    // surfaced as `gapPct: 17` and was quoted as 17%. It is 17x.
+    const s = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, 1.17)])], // demoMark −100, gap +17
+      NOW,
+    );
+    const b = s.strategies.long_call.cumulative;
+    expect(b.demoMarkPnlUsd).toBeCloseTo(-100, 6);
+    expect(b.parityGapUsd.sum).toBeCloseTo(17, 6);
+    // |denom| = 100 clears the floor ⇒ computed. 0.17 = 17%, which is the honest reading.
+    expect(b.gapToDemoMarkRatio).toBeCloseTo(0.17, 6);
+    expect(b.gapToDemoMarkRatioStatus).toBe('computed');
+    // Guard the thing that SEPARATES: the ratio must NOT be 17 (that was the units error).
+    expect(b.gapToDemoMarkRatio).not.toBeCloseTo(17, 6);
+  });
+
+  it('a denominator below the materiality floor nulls the ratio instead of diverging', () => {
+    // The ACTUAL live regime: |demoMark| = $1.00, gap $17 ⇒ old field said 17.
+    const s = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 0.01, 0.18)])], // demoMark −1.00, gap +17
+      NOW,
+    );
+    const b = s.strategies.long_call.cumulative;
+    expect(Math.abs(b.demoMarkPnlUsd)).toBeLessThan(RATIO_DENOM_FLOOR_USD);
+    expect(b.gapToDemoMarkRatio).toBeNull();
+    expect(b.gapToDemoMarkRatioStatus).toBe('denominator_below_materiality_floor');
+    // The gap and the half-spread are unit-correct at ANY denominator and MUST survive —
+    // suppressing the ratio must not blank the fields TRA-2277 actually grades on.
+    expect(b.parityGapUsd.sum).toBeCloseTo(17, 6);
+    expect(b.halfSpreadBps.mean).not.toBeNull();
+  });
+
+  it('nulls the ratio rather than letting a one-tick mid change flip its sign', () => {
+    // Prove the instability the floor exists to stop. Same gap, denominator moved by ONE
+    // penny of mid (±$1 after the x100 multiplier) straddling zero ⇒ under the old
+    // eps-only guard the ratio flips sign; under the floor both read null.
+    const justAbove = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 0.99, 1.15), leg('sell', 1.0, 1.0)])], // demoMark +1
+      NOW,
+    ).strategies.long_call.cumulative;
+    const justBelow = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.01, 1.17), leg('sell', 1.0, 1.0)])], // demoMark −1
+      NOW,
+    ).strategies.long_call.cumulative;
+    expect(Math.sign(justAbove.demoMarkPnlUsd)).toBe(-Math.sign(justBelow.demoMarkPnlUsd));
+    expect(justAbove.gapToDemoMarkRatio).toBeNull();
+    expect(justBelow.gapToDemoMarkRatio).toBeNull();
+  });
+
+  it('distinguishes the two nulls: no data vs an immaterial denominator', () => {
+    // n===0 (every round-trip unpriced) and a real-but-tiny denominator are different
+    // facts. A bare `null` for both leaves the reader unable to tell them apart.
+    const noData = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, null)])],
+      NOW,
+    ).strategies.long_call.cumulative;
+    expect(noData.n).toBe(0);
+    expect(noData.uncomputable).toBe(1);
+    expect(noData.gapToDemoMarkRatio).toBeNull();
+    expect(noData.gapToDemoMarkRatioStatus).toBe('no_computable_round_trips');
+
+    const immaterial = summarizeParityReconcile(
+      [record('long_put', [leg('buy', 0.01, 0.18)])],
+      NOW,
+    ).strategies.long_put.cumulative;
+    expect(immaterial.n).toBe(1);
+    expect(immaterial.gapToDemoMarkRatioStatus).toBe('denominator_below_materiality_floor');
+  });
+
+  it('an exactly-0 demo-mark denominator is the immaterial null, never a fabricated 0', () => {
+    // buy mid 1.0 / sell mid 1.0 ⇒ demoMark = 0. Fills differ ⇒ the gap is real.
     const s = summarizeParityReconcile(
       [record('long_call', [leg('buy', 1.0, 1.02), leg('sell', 1.0, 0.99)])],
       NOW,
     );
     const b = s.strategies.long_call.cumulative;
     expect(b.demoMarkPnlUsd).toBeCloseTo(0, 6);
-    expect(b.gapPct).toBeNull();
+    expect(b.gapToDemoMarkRatio).toBeNull();
+    expect(b.gapToDemoMarkRatioStatus).toBe('denominator_below_materiality_floor');
     expect(b.parityGapUsd.sum).not.toBe(0); // gap itself is real
   });
 
-  it('gapPct is a finite ratio when the denominator is nonzero', () => {
+  it('a small real ratio keeps 4 places instead of rounding to a false 0.00', () => {
+    // gap $2 over |demoMark| $5000 = 0.0004. round2 would have flattened this to 0.
     const s = summarizeParityReconcile(
-      [record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)])],
+      [record('long_call', [leg('buy', 50.0, 50.02)])],
       NOW,
     );
-    // gap 15 / |demoMark 100| = 0.15
-    expect(s.strategies.long_call.cumulative.gapPct).toBeCloseTo(0.15, 6);
+    const b = s.strategies.long_call.cumulative;
+    expect(b.gapToDemoMarkRatio).toBeCloseTo(0.0004, 8);
+    expect(b.gapToDemoMarkRatio).not.toBe(0);
+  });
+
+  it('publishes the floor and a units note so the reader need not infer either', () => {
+    const s = summarizeParityReconcile([record('long_call', [leg('buy', 1.0, 1.0)])], NOW);
+    expect(s.gapRatioDenomFloorUsd).toBe(RATIO_DENOM_FLOOR_USD);
+    expect(s.gapRatioNote).toMatch(/RATIO, not a percent/);
   });
 
   it('p90/median resolve with n=1 (single leg-sample)', () => {
@@ -208,36 +319,135 @@ describe('appendParitySnapshotForDay — self-accrual', () => {
     hydrateParityReconcileFromDisk(dir, NOW); // sets dataDir, empty series
   });
 
-  it('appends one snapshot for a new ET day, idempotent on a repeat call', () => {
+  it('records one point for a new ET day with the window stamped', () => {
     const recs = [record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)])];
     const first = appendParitySnapshotForDay(recs, NOW);
-    expect(first).not.toBeNull();
-    expect(first!.etDay).toBe(ET_DAY);
-    expect(first!.perStrategy.long_call.parityGapUsd).toBeCloseTo(15, 6);
-    expect(first!.perStrategy.long_call.n).toBe(1);
-    // second call same ET day ⇒ no-op
-    expect(appendParitySnapshotForDay(recs, NOW)).toBeNull();
+    expect(first.etDay).toBe(ET_DAY);
+    expect(first.perStrategy.long_call.parityGapUsd).toBeCloseTo(15, 6);
+    expect(first.perStrategy.long_call.n).toBe(1);
+    expect(first.foldCount).toBe(1);
+    expect(first.firstFoldTs).toBe(NOW);
+    expect(first.lastFoldTs).toBe(NOW);
+    expect(first.observedRecords).toBe(1);
+    expect(first.sessionComplete).toBe(false); // NOW is 14:00 ET — mid-session
     expect(getParityReconcileSeries()).toHaveLength(1);
-    // and the disk line was written exactly once
-    const lines = readFileSync(parityReconcileLogPath(dir), 'utf8').trim().split('\n');
-    expect(lines).toHaveLength(1);
   });
 
-  it('does NOT snapshot a day with no computable round-trips', () => {
+  // ── TRA-2279 D2 — the frozen-partial-fold defect ────────────────────────────
+  //
+  // Accrual used to be first-write-wins, so the day froze at whatever moment the runner
+  // first curled the route. Both of `d8ec9395`'s triggers are mid-session (15:00Z /
+  // 18:30Z vs a 20:00Z close) ⇒ every later fill landed in `cumulative` and in NO daily
+  // point, ever, and nothing on the payload said which window was covered.
+
+  it('RE-FOLDS the same ET day instead of freezing at the first read', () => {
+    const midSession = [record('long_call', [leg('buy', 1.0, 1.05)])]; // gap 5
+    const first = appendParitySnapshotForDay(midSession, NOW);
+    expect(first.perStrategy.long_call.n).toBe(1);
+    expect(first.perStrategy.long_call.parityGapUsd).toBeCloseTo(5, 6);
+
+    // A later fill the SAME ET day — under first-write-wins this was invisible forever.
+    const later = NOW + 3 * 3_600_000; // 17:00 ET, post-close
+    const withLateFill = [
+      ...midSession,
+      record('long_call', [leg('buy', 2.0, 2.2)], { ts: later }), // gap 20
+    ];
+    const refold = appendParitySnapshotForDay(withLateFill, later);
+
+    // The guard that SEPARATES: n and the gap must have MOVED, not held at the frozen read.
+    expect(refold.perStrategy.long_call.n).toBe(2);
+    expect(refold.perStrategy.long_call.parityGapUsd).toBeCloseTo(25, 6);
+    expect(refold.foldCount).toBe(2);
+    // The window's lower bound must not drift up as the upper bound advances.
+    expect(refold.firstFoldTs).toBe(NOW);
+    expect(refold.lastFoldTs).toBe(later);
+    // One point per ET day still — a re-fold UPDATES, it does not append a second point.
+    expect(getParityReconcileSeries()).toHaveLength(1);
+  });
+
+  it('sessionComplete flips only once the fold lands at/after the 16:00 ET close', () => {
+    const recs = [record('long_call', [leg('buy', 1.0, 1.05)])];
+    // 15:59 ET — one minute short of the close.
+    const preClose = Date.parse('2026-07-24T19:59:00Z');
+    expect(appendParitySnapshotForDay(recs, preClose).sessionComplete).toBe(false);
+    // 16:00 ET — the close itself.
+    const atClose = Date.parse('2026-07-24T20:00:00Z');
+    expect(appendParitySnapshotForDay(recs, atClose).sessionComplete).toBe(true);
+  });
+
+  it('sessionComplete is DST-correct, not pinned to 20:00Z', () => {
+    // The equity close is 20:00Z in EDT but 21:00Z in EST. A fixed-20:00Z rule would call
+    // a 20:05Z January fold "complete" when it is actually 15:05 ET — mid-session.
+    expect(isPostCloseEt(Date.parse('2026-07-24T20:05:00Z'))).toBe(true);  // EDT: 16:05 ET
+    expect(isPostCloseEt(Date.parse('2026-01-15T20:05:00Z'))).toBe(false); // EST: 15:05 ET
+    expect(isPostCloseEt(Date.parse('2026-01-15T21:05:00Z'))).toBe(true);  // EST: 16:05 ET
+  });
+
+  it('records an OBSERVED-AND-EMPTY day so it cannot read as ABSENT', () => {
+    // Every round-trip unpriced ⇒ nothing gradeable. Before this the day wrote NOTHING,
+    // which is byte-for-byte how a day nobody read looks.
     const recs = [record('long_call', [leg('buy', 1.0, null)])]; // uncomputable
-    expect(appendParitySnapshotForDay(recs, NOW)).toBeNull();
-    expect(getParityReconcileSeries()).toHaveLength(0);
+    const snap = appendParitySnapshotForDay(recs, NOW);
+    expect(snap.perStrategy).toEqual({});
+    expect(snap.foldCount).toBe(1);          // ⇒ somebody looked
+    expect(snap.observedRecords).toBe(1);    // ⇒ and the stream had produced a record
+    expect(snap.uncomputable).toBe(1);       // ⇒ which was excluded, NOT a 0 gap
+    expect(getParityReconcileSeries()).toHaveLength(1);
+    // ABSENT is the only remaining way to have no row: a day never folded at all.
+    expect(getParityReconcileSeries().some((s) => s.etDay === '2026-07-23')).toBe(false);
   });
 
-  it('a new ET day accrues a second snapshot', () => {
+  it('an observed-and-empty day is distinguishable from a genuine no-trade day', () => {
+    const quiet = appendParitySnapshotForDay([], NOW); // stream ran, produced nothing
+    expect(quiet.observedRecords).toBe(0);
+    expect(quiet.uncomputable).toBe(0);
+    clearParityReconcile();
+    hydrateParityReconcileFromDisk(dir, NOW);
+    const excluded = appendParitySnapshotForDay(
+      [record('long_call', [leg('buy', 1.0, null)])],
+      NOW,
+    );
+    // Same empty perStrategy, but the counters separate the two causes.
+    expect(excluded.perStrategy).toEqual({});
+    expect(excluded.uncomputable).toBe(1);
+    expect(excluded.uncomputable).not.toBe(quiet.uncomputable);
+  });
+
+  it('a new ET day accrues a second point', () => {
     const recs = [record('long_call', [leg('buy', 1.0, 1.05)])];
     appendParitySnapshotForDay(recs, NOW);
     const nextDay = NOW + 86_400_000;
     const recs2 = [record('long_call', [leg('buy', 1.0, 1.1)], { etDay: '2026-07-25', ts: nextDay })];
     const snap2 = appendParitySnapshotForDay(recs2, nextDay);
-    expect(snap2).not.toBeNull();
-    expect(snap2!.etDay).toBe('2026-07-25');
+    expect(snap2.etDay).toBe('2026-07-25');
+    expect(snap2.foldCount).toBe(1); // a fresh day starts its own fold count
     expect(getParityReconcileSeries()).toHaveLength(2);
+  });
+
+  it('re-folds append to the append-only log; hydration keeps the LAST line per day', () => {
+    const recs = [record('long_call', [leg('buy', 1.0, 1.05)])];
+    appendParitySnapshotForDay(recs, NOW);
+    const later = NOW + 3_600_000;
+    appendParitySnapshotForDay(
+      [...recs, record('long_call', [leg('buy', 2.0, 2.2)], { ts: later })],
+      later,
+    );
+    // Two lines on disk (append-only — a torn re-fold can't destroy the earlier good row).
+    const lines = readFileSync(parityReconcileLogPath(dir), 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(2);
+
+    // Fresh boot: one point, and it is the LATER (n=2) fold, not the first.
+    const h = hydrateParityReconcileFromDisk(dir, NOW);
+    expect(h.snapshots).toBe(1);
+    expect(h.days).toBe(1);
+    const [only] = getParityReconcileSeries();
+    expect(only.perStrategy.long_call.n).toBe(2);
+    expect(only.foldCount).toBe(2);
+    expect(only.lastFoldTs).toBe(later);
+    // and the file was COMPACTED to the winning line so re-folds don't grow it forever.
+    const after = readFileSync(parityReconcileLogPath(dir), 'utf8').trim().split('\n');
+    expect(after).toHaveLength(1);
+    expect(JSON.parse(after[0]).foldCount).toBe(2);
   });
 });
 
@@ -262,6 +472,22 @@ describe('hydrateParityReconcileFromDisk — durability', () => {
     const lines = readFileSync(parityReconcileLogPath(dir), 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
     expect(JSON.parse(lines[0]).etDay).toBe(ET_DAY);
+  });
+
+  it('normalizes a PRE-TRA-2279 row without inventing a window it cannot know', () => {
+    // A row written by the old first-write-wins code carries no window stamps. foldCount 1
+    // and firstFoldTs === lastFoldTs === ts are literally true of it; observedRecords is
+    // NOT, so it must read as an unknown sentinel rather than an observed zero.
+    const legacy = { etDay: ET_DAY, ts: NOW, perStrategy: { long_call: { parityGapUsd: 15, meanHalfSpreadBps: 500, n: 1 } } };
+    writeFileSync(parityReconcileLogPath(dir), JSON.stringify(legacy) + '\n', 'utf8');
+    hydrateParityReconcileFromDisk(dir, NOW);
+    const [row] = getParityReconcileSeries();
+    expect(row.foldCount).toBe(1);
+    expect(row.firstFoldTs).toBe(NOW);
+    expect(row.lastFoldTs).toBe(NOW);
+    expect(row.sessionComplete).toBe(false); // NOW = 14:00 ET — the mid-session cadence
+    expect(row.observedRecords).toBe(-1);    // unknown, and cannot be read as zero
+    expect(row.uncomputable).toBe(-1);
   });
 
   it('tolerates a torn trailing line', () => {

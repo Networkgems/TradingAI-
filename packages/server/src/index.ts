@@ -9477,8 +9477,10 @@ app.post('/api/health/tradier-sandbox/options-smoke-order', async (req, res) => 
 // in-bundle fallback that evaporates on redeploy. Observe-only; never places an order.
 app.get('/api/health/sandbox-strategy-journal', (_req, res) => {
   // TRA-2237 — the runner routine `d8ec9395` reads THIS route every weekday; piggy-back
-  // the parity-reconcile daily snapshot on that existing cadence (idempotent per ET day,
-  // best-effort) so the parity series self-accrues without a new cron.
+  // the parity-reconcile daily snapshot on that existing cadence (best-effort) so the
+  // parity series self-accrues without a new cron. TRA-2279 D2 — this RE-FOLDS today's
+  // point (last-write-wins per ET day) rather than freezing it at the first read; the
+  // durable post-close fold is the hourly scheduler tick, not this route.
   appendParitySnapshotForDay(getSandboxStrategyRecords());
   res.status(200).json({
     ...summarizeSandboxStrategyJournal(),
@@ -9491,9 +9493,17 @@ app.get('/api/health/sandbox-strategy-journal', (_req, res) => {
 
 // TRA-2237 — no-auth read of the parity-reconcile monitor: per-strategy demo-mark-vs-
 // sandbox-fill P&L gap folded from each sandbox round-trip's OWN mid-vs-fill (TRA-2134
-// legs), plus the durable daily series. The read SELF-ACCRUES today's snapshot the first
-// time it fires for a new ET day (the runner routine `d8ec9395` reads this every weekday,
-// so no new cron). Reads ONLY the sandbox journal — NEVER pooled with demo
+// legs), plus the durable daily series. The read SELF-ACCRUES today's snapshot, RE-FOLDING
+// it on every call (TRA-2279 D2 — last-write-wins per ET day; it used to freeze at the
+// first read, which left every post-first-read fill in no daily point at all). Each point
+// stamps `firstFoldTs`/`lastFoldTs`/`foldCount`/`sessionComplete` so a reader can tell a
+// full session from a mid-session slice without reading the cron.
+//
+// ⚠️ TRA-2279 D1 — `gapPct` is GONE. It was a ratio under a percent's name (a live
+// `gapPct: 17` meant 17×, and was duly read as "17.00%"). Its replacement is
+// `gapToDemoMarkRatio`, explicitly a ratio and null below a materiality floor on its
+// denominator. Grade on `parityGapUsd` / `halfSpreadBps` — those are unit-correct and
+// stable at any denominator. Reads ONLY the sandbox journal — NEVER pooled with demo
 // option-trade-journal rows. `fillRealism:'SANDBOX_SIMULATED'` rides the payload so no
 // reader mistakes a broker-simulated gap for a live-execution number; observe-only under
 // the TRA-1897 hold — gates/arms/graduates nothing.
@@ -10014,6 +10024,23 @@ scheduler.start({
   // open or the user is in demo mode. TRA-1216 — the same tick also drives the
   // observe-only perp funding-carry pass (flag-gated ⇒ zero cost/IO when off).
   onHourly: async () => {
+    // TRA-2279 D2 — re-fold the parity-reconcile daily point on every ET hour boundary.
+    // This is the DURABLE post-close read the series was missing: routine `d8ec9395`'s
+    // two triggers are both MID-session (15:00Z / 18:30Z vs a 20:00Z close), so nothing
+    // ever read the route after the close and every post-15:00Z fill landed in no daily
+    // point at all. Hooking the EXISTING hourly tick (rather than adding a cron, or
+    // editing a CTO-owned routine cross-boundary) means any top-of-hour at/after 16:00 ET
+    // completes the session — a ~7-hour window to survive one restart in, instead of the
+    // single 16:05 ET minute `onMarketClose` would have given.
+    //
+    // Runs FIRST, and synchronously, on purpose: every other callee here is awaited, so
+    // placing it later would let one unrelated crypto/funding rejection starve the day's
+    // post-close fold — the exact silent-gap failure this fix exists to close. Cost is a
+    // pure fold over the already-in-memory sandbox journal (no broker call, no order path,
+    // no flag read) and it is best-effort internally, so it cannot throw into this tick.
+    // Idempotent by construction (last-write-wins per ET day). Observe-only under the
+    // TRA-1897 hold — gates/arms/graduates nothing.
+    appendParitySnapshotForDay(getSandboxStrategyRecords());
     await runHourlyFundingForAllUsers();
     await runHourlyPerpFundingCarry();
     // TRA-1220 — observe-only crypto regime-overlay classification (flag-gated ⇒
