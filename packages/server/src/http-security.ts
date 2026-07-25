@@ -201,7 +201,67 @@ export function securityHeadersMiddleware(): RequestHandler {
     // false on prod and HSTS would never ship.
     const headers = securityHeaders({ secure: req.secure, host: req.headers.host });
     for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+
+    // TRA-2320 — A HEADER SET IN MIDDLEWARE IS NOT FINAL. Two of Express's own
+    // terminal paths call `res.setHeader('Content-Security-Policy',
+    // "default-src 'none'")` on their way out, CLOBBERING the line above:
+    //
+    //   finalhandler/index.js:295   — every generated 404/error body
+    //   serve-static/index.js:204   — the trailing-slash directory redirect
+    //
+    // and `frame-ancestors` has NO fallback to `default-src` (CSP L2/L3), so on
+    // those responses the clickjacking directive is not weakened, it is GONE.
+    // Measured live on bqb1 2026-07-25: `/api/<unknown>` 404, `POST /nope` 404,
+    // and `GET /assets` 301 all shipped `default-src 'none'`.
+    //
+    // The obvious remedy — mount a 404 handler we own — fixes the first two and
+    // does nothing for the third, which never reaches a 404 handler at all. So
+    // reassert at write time instead: this is the last point before the status
+    // line goes out, and it is indifferent to WHICH library rewrote the header,
+    // including one added after this comment. (`notFoundHandler` below is still
+    // worth mounting, for the JSON body — but it is no longer load-bearing.)
+    //
+    // Caveat, deliberately not handled: headers passed as an explicit object to
+    // `writeHead(status, headers)` are merged by Node AFTER this and would win.
+    // Nothing in this tree does that, and a caller that did would be stating an
+    // intent worth honouring — unlike these two, which are stating a default.
+    const writeHead = res.writeHead.bind(res);
+    res.writeHead = function reassertCsp(this: typeof res, ...args: unknown[]) {
+      try {
+        if (!res.headersSent) {
+          res.setHeader('Content-Security-Policy', headers['Content-Security-Policy'] ?? ENFORCED_CSP);
+        }
+      } catch {
+        // A hardening header must never be the reason a response fails to send.
+      }
+      return (writeHead as (...a: unknown[]) => unknown)(...args);
+    } as unknown as typeof res.writeHead;
+
     next();
+  };
+}
+
+/**
+ * Terminal 404. Mounted after the routes and the static/SPA block, before the
+ * error middleware.
+ *
+ * Express's built-in `finalhandler` would otherwise generate this response, and
+ * it answers an unknown `/api` path with an HTML body (`Cannot GET /api/x`) —
+ * which no API consumer can parse. A handler we own returns JSON there, and
+ * keeps the header rewrite described above out of the picture on the two 404
+ * classes that reach it: unknown `/api/*`, and any non-GET on a non-API path
+ * (the SPA fallback is registered with `app.get`, so `POST /whatever` falls
+ * through to here).
+ */
+export function notFoundHandler(): RequestHandler {
+  return (req, res) => {
+    if (req.path === '/api' || req.path.startsWith('/api/')) {
+      res.status(404).json({ error: 'not found', path: req.path });
+      return;
+    }
+    // Non-API: plain text, never an echo of the URL. `nosniff` is already set,
+    // so there is no content-type confusion to exploit here either.
+    res.status(404).type('txt').send('Not Found');
   };
 }
 

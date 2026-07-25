@@ -7,7 +7,12 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
-import { buildAllowedOrigins, corsMiddleware, securityHeadersMiddleware } from './http-security.js';
+import {
+  buildAllowedOrigins,
+  corsMiddleware,
+  notFoundHandler,
+  securityHeadersMiddleware,
+} from './http-security.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import {
   reconcilePnl,
@@ -10310,6 +10315,13 @@ if (existsSync(DIST_DIR)) {
     res.sendFile(join(DIST_DIR, 'index.html'));
   });
 }
+
+// TRA-2320 — terminal 404, mounted after the routes AND after the static/SPA
+// block so it only ever sees a path nothing else claimed. Express's built-in
+// `finalhandler` would otherwise answer an unknown `/api` path with an HTML
+// body no API consumer can parse. Must stay above `errorMiddleware`: a 4-arg
+// error handler is only reached via `next(err)`, so it never shadows this.
+app.use(notFoundHandler());
 
 // TRA-406 — error-handling middleware. Mounted last so it catches anything a
 // route handler threw; captures it against the request trace id and returns a
