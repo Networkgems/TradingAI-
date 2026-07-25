@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   reconcilePnl,
   resolvePnlBaselineDate,
+  foldJournalClosesByEtDay,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
 } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
@@ -125,6 +126,124 @@ describe('reconcilePnl', () => {
     });
     it('falls back to the default on an unparseable value', () => {
       expect(resolvePnlBaselineDate({ PNL_RECONCILE_BASELINE_DATE: 'garbage' })).toBe(PNL_RECONCILE_DEFAULT_BASELINE_DATE);
+    });
+  });
+
+  // ── TRA-2302 — the options false-zero detector ────────────────────────────
+  //
+  // `optionsDailyPnl` reported 0.00 on all 95 desk book-days while the durable
+  // option-trade journal held 110 CLOSED desk round trips (+$844.99). Those two
+  // states produced the identical number here, so the endpoint could not tell a
+  // book with no option activity from a book whose closes never reached the
+  // ledger. The census below is the count that separates them.
+  describe('foldJournalClosesByEtDay (TRA-2302)', () => {
+    const ET = (ts: number) =>
+      new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    // 2026-07-13 14:00Z = 10:00 ET, comfortably inside the ET day.
+    const T13 = Date.parse('2026-07-13T14:00:00Z');
+    const T15 = Date.parse('2026-07-15T14:00:00Z');
+
+    it('buckets closes by ET day and sums realized P&L', () => {
+      const m = foldJournalClosesByEtDay(
+        [
+          { closeTs: T13, realizedPnlUsd: 200 },
+          { closeTs: T13, realizedPnlUsd: 41.5 },
+          { closeTs: T15, realizedPnlUsd: 17 },
+        ],
+        ET,
+      );
+      expect(m.get('2026-07-13')).toEqual({ closes: 2, realizedPnlUsd: 241.5 });
+      expect(m.get('2026-07-15')).toEqual({ closes: 1, realizedPnlUsd: 17 });
+    });
+
+    it('ignores rows that never closed — an OPEN row is not a day of activity', () => {
+      const m = foldJournalClosesByEtDay(
+        [{ realizedPnlUsd: 999 }, { closeTs: undefined, realizedPnlUsd: 999 }],
+        ET,
+      );
+      expect(m.size).toBe(0);
+    });
+  });
+
+  describe('options false-zero detection (TRA-2302)', () => {
+    const census = (rows: Array<[string, number, number]>) =>
+      new Map(rows.map(([d, closes, pnl]) => [d, { closes, realizedPnlUsd: pnl }]));
+
+    it('FLAGS a 0.00 options day the journal says had closes', () => {
+      const snaps = [snap('2026-07-13', 0, 0)];
+      const eod = new Map([['2026-07-13', 0]]);
+      const r = reconcilePnl(snaps, eod, null, census([['2026-07-13', 4, 241.5]]));
+
+      expect(r.falseZeroDates).toEqual(['2026-07-13']);
+      expect(r.optionsFalseZeroOk).toBe(false);
+      expect(r.days[0]).toMatchObject({
+        optionsDaily: 0,
+        journalCloses: 4,
+        journalOptionsPnl: 241.5,
+        optionsFalseZero: true,
+      });
+      // The pre-existing drift verdict is untouched — this identity still holds.
+      expect(r.ok).toBe(true);
+    });
+
+    it('MUTATION: the same day with the P&L actually booked is NOT flagged', () => {
+      // Only `optionsDailyPnl` changes vs the case above. If the detector fired
+      // on this too it would be a threshold rule, not a detector.
+      const snaps = [snap('2026-07-13', 0, 241.5)];
+      const eod = new Map([['2026-07-13', 241.5]]);
+      const r = reconcilePnl(snaps, eod, null, census([['2026-07-13', 4, 241.5]]));
+
+      expect(r.falseZeroDates).toEqual([]);
+      expect(r.optionsFalseZeroOk).toBe(true);
+      expect(r.days[0].optionsFalseZero).toBe(false);
+    });
+
+    it('MUTATION: a genuinely option-less day is NOT flagged', () => {
+      const r = reconcilePnl(
+        [snap('2026-07-14', 0, 0)],
+        new Map([['2026-07-14', 0]]),
+        null,
+        census([]), // journal agrees: no closes that day
+      );
+      expect(r.falseZeroDates).toEqual([]);
+      expect(r.days[0]).toMatchObject({ journalCloses: 0, optionsFalseZero: false });
+    });
+
+    it('claims nothing when NO census was supplied — absent is not zero', () => {
+      // The default call shape (every existing caller). A missing journal must
+      // never manufacture a clean verdict OR a false-zero accusation.
+      const r = reconcilePnl([snap('2026-07-13', 0, 0)], new Map([['2026-07-13', 0]]));
+      expect(r.days[0].journalCloses).toBeNull();
+      expect(r.days[0].journalOptionsPnl).toBeNull();
+      expect(r.days[0].optionsFalseZero).toBe(false);
+      expect(r.optionsFalseZeroOk).toBe(true);
+      expect(r.falseZeroDates).toEqual([]);
+    });
+
+    it('sweeps BELOW the baseline too — a lost close is not pre-fix drift', () => {
+      // 2026-07-01 predates the 2026-07-12 TRA-1636 baseline. The drift verdict
+      // still excludes it; the false-zero sweep must not, or the history the
+      // parent TRA-2297 is arguing about stays invisible.
+      const r = reconcilePnl(
+        [snap('2026-07-01', 0, 0)],
+        new Map([['2026-07-01', 0]]),
+        '2026-07-12',
+        census([['2026-07-01', 3, 483.52]]),
+      );
+      expect(r.days[0].belowBaseline).toBe(true);
+      expect(r.belowBaselineCount).toBe(1);
+      expect(r.falseZeroDates).toEqual(['2026-07-01']);
+      expect(r.optionsFalseZeroOk).toBe(false);
+    });
+
+    it('separates an ABSENT optionsDailyPnl field from one written as 0', () => {
+      const r = reconcilePnl(
+        [snap('2026-07-13', 0, undefined), snap('2026-07-14', 0, 0)],
+        new Map(),
+      );
+      expect(r.days[0]).toMatchObject({ optionsDaily: 0, optionsFieldPresent: false });
+      expect(r.days[1]).toMatchObject({ optionsDaily: 0, optionsFieldPresent: true });
+      expect(r.optionsFieldMissingCount).toBe(1);
     });
   });
 });

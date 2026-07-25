@@ -8,7 +8,11 @@ import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
-import { reconcilePnl, resolvePnlBaselineDate } from './pnl-reconciliation.js';
+import {
+  reconcilePnl,
+  resolvePnlBaselineDate,
+  foldJournalClosesByEtDay,
+} from './pnl-reconciliation.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells } from './reports/desk-calendar.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
@@ -3444,6 +3448,24 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
     // TRA-1636 — only evaluate days on/after the baseline; earlier rows were
     // written by pre-fix code (TRA-1633) and would keep the guard red forever.
     const baselineDate = resolvePnlBaselineDate(process.env);
+    // TRA-2302 — load the DURABLE option-trade journal once and bucket each
+    // book's closes by ET day. This is the control that gives the day-only
+    // options ledger a failing state: `optionsDailyPnl` is summed from the
+    // engine's VOLATILE in-memory `closedOptions` bucket at 21:00 ET, so a day
+    // whose closes were archived/lost before that write books 0.00 — the exact
+    // number a day with no option activity books. The journal is append-only
+    // and per-trade, so it can separate the two. A journal read failure leaves
+    // the census null (⇒ `journalCloses: null`, never a manufactured zero).
+    let journalRows: Awaited<ReturnType<typeof listOptionTradeJournal>> | null = null;
+    if (isOptionTradeJournalEnabled()) {
+      try {
+        journalRows = await listOptionTradeJournal();
+      } catch (err) {
+        log.warn('pnl-reconciliation: option-journal census unavailable', {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     const engines = await Promise.all(
       getAllUserContexts().map(async ctx => {
         const mode = stockModeKey(getSettings(ctx.username));
@@ -3458,7 +3480,21 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
           } catch { /* skip unreadable report file */ }
         }
-        return { username: ctx.username, mode, ...reconcilePnl(snapshots, eodByDate, baselineDate) };
+        // Scope the census to THIS book — pooling another account's closes in
+        // would attribute them here (the TRA-2193 trap). Rows written before
+        // TRA-1475 carry no `account` and are unattributable, so they are left
+        // out rather than credited to whichever book is being read.
+        const journalByDate = journalRows == null
+          ? null
+          : foldJournalClosesByEtDay(
+            journalRows.filter(r => r.account === ctx.username),
+            (ts: number) => etDateString(new Date(ts)),
+          );
+        return {
+          username: ctx.username,
+          mode,
+          ...reconcilePnl(snapshots, eodByDate, baselineDate, journalByDate),
+        };
       }),
     );
     const maxDriftUsd = engines.reduce((m, e) => Math.max(m, e.maxDriftUsd), 0);
@@ -3467,6 +3503,10 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       ok: engines.every(e => e.ok),
       maxDriftUsd,
       baselineDate,
+      // TRA-2302 — reported BESIDE `ok`, not folded into it, so the existing
+      // drift verdict keeps its meaning for every consumer already reading it.
+      optionsFalseZeroOk: engines.every(e => e.optionsFalseZeroOk),
+      optionsJournalCensusAvailable: journalRows != null,
       engines,
     });
   } catch (err) {

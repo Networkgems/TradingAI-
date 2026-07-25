@@ -62,6 +62,24 @@ export function resolvePnlBaselineDate(
   return /^\d{4}-\d{2}-\d{2}$/.test(raw.trim()) ? raw.trim() : PNL_RECONCILE_DEFAULT_BASELINE_DATE;
 }
 
+/**
+ * TRA-2302 — one ET day's option-close census read off the DURABLE option-trade
+ * journal (`option-trade-journal.jsonl`), for the book being reconciled.
+ *
+ * This is the count that SEPARATES. `optionsDaily` is computed from the engine's
+ * VOLATILE in-memory `closedOptions` bucket at 21:00 ET; that bucket is emptied
+ * by the nightly archive and does not survive every restart, so a day whose
+ * closes were lost books `optionsDaily: 0.00` — the exact same number a day with
+ * no option activity books. The journal is append-only and per-trade, so it can
+ * tell those two states apart.
+ */
+export interface JournalDayCloses {
+  /** Option round trips the journal recorded closing on this ET day. */
+  closes: number;
+  /** Σ realized P&L over those closes, USD. */
+  realizedPnlUsd: number;
+}
+
 export interface PnlReconcileDay {
   date: string;
   /** EOD report `combinedPnl` for the day (null when no report file exists). */
@@ -70,6 +88,29 @@ export interface PnlReconcileDay {
   stockDaily: number;
   /** Day-only realized options P&L (0 on legacy snapshots without the field). */
   optionsDaily: number;
+  /**
+   * TRA-2302 — whether `optionsDailyPnl` was actually WRITTEN on this snapshot,
+   * as opposed to defaulted to 0 by the `?? 0` above. A legacy row (field never
+   * written) and a row genuinely booked at 0.00 are the same `optionsDaily`
+   * value and were previously indistinguishable from this endpoint.
+   */
+  optionsFieldPresent: boolean;
+  /**
+   * TRA-2302 — option closes the durable journal recorded for this ET day on
+   * this book. `null` when no journal census was supplied (the caller did not
+   * load it), which is NOT the same as zero.
+   */
+  journalCloses: number | null;
+  /** TRA-2302 — Σ realized options P&L the journal recorded for this ET day. */
+  journalOptionsPnl: number | null;
+  /**
+   * TRA-2302 — TRUE when this day's `optionsDailyPnl` is 0.00 while the journal
+   * recorded at least one option close on it. That combination cannot be a real
+   * zero: the round trips exist, the day-only ledger just did not receive them.
+   * Never true when no census was supplied (absence of evidence is not
+   * evidence — the flag stays false and `journalCloses` stays null).
+   */
+  optionsFalseZero: boolean;
   /** eodCombined − (stockDaily + optionsDaily); 0 when no EOD file to compare. */
   drift: number;
   /**
@@ -95,6 +136,55 @@ export interface PnlReconcileResult {
   baselineDate: string | null;
   /** Count of rows skipped because they predate `baselineDate`. */
   belowBaselineCount: number;
+  /**
+   * TRA-2302 — dates whose `optionsDailyPnl` is 0.00 while the durable journal
+   * recorded option closes on them. Empty when no census was supplied.
+   *
+   * DELIBERATELY NOT folded into `ok`. `ok` keeps meaning exactly what it has
+   * always meant (the `eodCombined == stockDaily + optionsDaily` identity), so
+   * this addition cannot move a number already under a consumer — the same
+   * additive discipline TRA-2193 applied to `byAccountClass`. Read
+   * `optionsFalseZeroOk` for this check's verdict.
+   */
+  falseZeroDates: string[];
+  /** TRA-2302 — false iff at least one `falseZeroDates` entry was found. */
+  optionsFalseZeroOk: boolean;
+  /**
+   * TRA-2302 — how many snapshots never had `optionsDailyPnl` written at all.
+   * A high count over days the book was trading options means the writer was
+   * not reaching the ledger, independent of any single day's value.
+   */
+  optionsFieldMissingCount: number;
+}
+
+/**
+ * TRA-2302 — fold durable option-trade-journal rows into a per-ET-day close
+ * census for ONE book.
+ *
+ * Only rows that actually CLOSED contribute (`closeTs` present): an OPEN row
+ * carries no realized P&L and must not make a day look like it had activity the
+ * day-only ledger missed. `account` scoping is the caller's job — pass only the
+ * rows belonging to the book being reconciled, or the census will attribute
+ * another book's closes to this one (the TRA-2193 pooling trap).
+ *
+ * `etDate` is injected so this stays pure and testable across timezones; the
+ * caller passes the same ET bucketing the EOD report uses.
+ */
+export function foldJournalClosesByEtDay(
+  rows: ReadonlyArray<{ closeTs?: number; realizedPnlUsd?: number }>,
+  etDate: (ts: number) => string,
+): Map<string, JournalDayCloses> {
+  const byDay = new Map<string, JournalDayCloses>();
+  for (const r of rows) {
+    if (typeof r.closeTs !== 'number' || !Number.isFinite(r.closeTs)) continue;
+    const day = etDate(r.closeTs);
+    const cur = byDay.get(day) ?? { closes: 0, realizedPnlUsd: 0 };
+    cur.closes += 1;
+    cur.realizedPnlUsd += r.realizedPnlUsd ?? 0;
+    byDay.set(day, cur);
+  }
+  for (const [day, v] of byDay) byDay.set(day, { ...v, realizedPnlUsd: round2(v.realizedPnlUsd) });
+  return byDay;
 }
 
 /**
@@ -114,18 +204,39 @@ export function reconcilePnl(
   snapshots: ReadonlyArray<DailySnapshot>,
   eodCombinedByDate: ReadonlyMap<string, number>,
   baselineDate: string | null = null,
+  journalClosesByDate: ReadonlyMap<string, JournalDayCloses> | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
     .map(s => {
       const stockDaily = round2(s.dailyPnl);
+      const optionsFieldPresent = s.optionsDailyPnl !== undefined && s.optionsDailyPnl !== null;
       const optionsDaily = round2(s.optionsDailyPnl ?? 0);
       const eodCombined = eodCombinedByDate.has(s.date)
         ? round2(eodCombinedByDate.get(s.date)!)
         : null;
       const drift = eodCombined == null ? 0 : round2(eodCombined - (stockDaily + optionsDaily));
       const belowBaseline = baselineDate != null && s.date < baselineDate;
-      return { date: s.date, eodCombined, stockDaily, optionsDaily, drift, belowBaseline };
+      // TRA-2302 — a day is only claimed as a FALSE zero when a census exists
+      // for this book AND it names closes the day-only ledger did not receive.
+      // No census ⇒ null / false, never an implied zero.
+      const census = journalClosesByDate?.get(s.date) ?? null;
+      const journalCloses = journalClosesByDate == null ? null : (census?.closes ?? 0);
+      const journalOptionsPnl =
+        journalClosesByDate == null ? null : round2(census?.realizedPnlUsd ?? 0);
+      const optionsFalseZero = (journalCloses ?? 0) > 0 && optionsDaily === 0;
+      return {
+        date: s.date,
+        eodCombined,
+        stockDaily,
+        optionsDaily,
+        optionsFieldPresent,
+        journalCloses,
+        journalOptionsPnl,
+        optionsFalseZero,
+        drift,
+        belowBaseline,
+      };
     });
 
   const evaluated = days.filter(d => !d.belowBaseline);
@@ -133,6 +244,11 @@ export function reconcilePnl(
     .filter(d => Math.abs(d.drift) > PNL_RECONCILE_TOLERANCE_USD)
     .map(d => d.date);
   const maxDriftUsd = evaluated.reduce((m, d) => Math.max(m, Math.abs(d.drift)), 0);
+  // TRA-2302 — the false-zero sweep is NOT baseline-gated. The baseline exists
+  // because pre-fix code wrote arithmetically un-reconcilable drift; a missing
+  // option close is a different defect, and silencing it before 2026-07-12
+  // would hide exactly the history the parent (TRA-2297) is arguing about.
+  const falseZeroDates = days.filter(d => d.optionsFalseZero).map(d => d.date);
 
   return {
     ok: offendingDates.length === 0,
@@ -142,6 +258,9 @@ export function reconcilePnl(
     caveats: PNL_RECONCILIATION_CAVEATS,
     baselineDate,
     belowBaselineCount: days.length - evaluated.length,
+    falseZeroDates,
+    optionsFalseZeroOk: falseZeroDates.length === 0,
+    optionsFieldMissingCount: days.filter(d => !d.optionsFieldPresent).length,
   };
 }
 
