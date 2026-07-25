@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   measureSpreadCross,
   summarizeSpreadCost,
+  summarizeSpreadCeilingCompliance,
   commissionR,
   SLEEVE_SPREAD_CEILINGS,
   STOP_DISTANCE_FRACTION_OF_MARK,
@@ -273,5 +274,182 @@ describe('isSpreadCeilingEnforceEnabled — default ON (TRA-2295)', () => {
     for (const off of ['0', 'false', 'no', 'off', ' OFF ']) {
       expect(isSpreadCeilingEnforceEnabled({ OPTION_SPREAD_CEILING_ENFORCE: off })).toBe(false);
     }
+  });
+});
+
+// ── TRA-2316 — the independent ceiling-compliance read ──────────────────────
+//
+// TRA-2306's read #2 could not be executed against any deployed route: the one
+// with the `account` axis carried no quotes (so `(undefined − undefined) / undefined`
+// is NaN, and `NaN > 0.10` is false — "0 rows above the ceiling" on EVERY input,
+// including a completely broken gate), and the one with the quotes pooled fixture
+// books and published only p90 (and `p90 <= ceiling` is consistent with 10% of rows
+// above it).
+//
+// So the first thing these tests must establish is that the new fold HAS A FAILING
+// STATE. A reject-counter-only assertion reproduces the original TRA-2295 bug — the
+// gate that never ran and the gate that never rejected read identically — so the
+// tests below assert the ADMITTED side too.
+
+describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
+  const cellOf = (
+    stats: ReturnType<typeof summarizeSpreadCeilingCompliance>,
+    structure: string,
+    accountClass: 'desk' | 'fixture' | 'unattributed' = 'desk',
+  ) => stats.find((s) => s.structure === structure && s.accountClass === accountClass)!;
+
+  it('FIRES: one desk row above the 0.10 directional ceiling is counted, and the max exceeds it', () => {
+    // The shape of the real defect: bid 0.01 / ask 0.59 against a 0.30 mark is
+    // spreadPct 1.933 — the worst contract TRA-2295 found admitted, 19x the
+    // ceiling. If this row does not move `countAboveCeiling`, the read is the same
+    // NaN-passes-everything instrument this ticket was filed about.
+    const stats = summarizeSpreadCeilingCompliance([
+      {
+        structure: 'single_leg_directional',
+        accountClass: 'desk',
+        quote: { bid: 0.01, ask: 0.59, mark: 0.3 },
+      },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.n).toBe(1);
+    expect(cell.countAboveCeiling).toBe(1);
+    expect(cell.maxSpreadPct).toBeCloseTo(1.9333, 4);
+    expect(cell.maxSpreadPct as number).toBeGreaterThan(
+      SLEEVE_SPREAD_CEILINGS.single_leg_directional!.maxSpreadPct,
+    );
+    // ...and the ADMITTED side. bid 0.01 is under the 0.10 quotability floor: an
+    // ABSENT market, not a wide one. A ratio test alone cannot see that.
+    expect(cell.countBelowMinBid).toBe(1);
+    expect(cell.minEntryBidUsd).toBe(0.01);
+  });
+
+  it('a clean desk book reads countAboveCeiling 0 WITH n > 0 — the PASS, distinct from no reading', () => {
+    // 0.10 spread on a 2.00 mark = 5%, inside the ceiling; bid 1.90+ clears the
+    // 0.10 floor. This is what a held ceiling looks like, and it must not be
+    // representable the same way as an empty book.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.9, ask: 2.0, mark: 2.0 } },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.n).toBe(2);
+    expect(cell.countAboveCeiling).toBe(0);
+    expect(cell.countBelowMinBid).toBe(0);
+    expect(cell.maxSpreadPct).toBeCloseTo(0.05, 10);
+  });
+
+  it('an EMPTY partition reads n:0 / null — NOT 0 — so it cannot be misread as a pass', () => {
+    // The TRA-2295 + TRA-2311 failure shape in one assertion: "nothing to check"
+    // and "checked, nothing over" must not be the same bytes.
+    const empty = summarizeSpreadCeilingCompliance([]);
+    const cell = cellOf(empty, 'single_leg_directional');
+    // The cell EXISTS at n=0 — an absent cell reads exactly like a passing one.
+    expect(cell).toBeDefined();
+    expect(cell.n).toBe(0);
+    expect(cell.maxSpreadPct).toBeNull();
+    expect(cell.countAboveCeiling).toBeNull();
+    expect(cell.minEntryBidUsd).toBeNull();
+    expect(cell.countBelowMinBid).toBeNull();
+
+    const populated = cellOf(
+      summarizeSpreadCeilingCompliance([
+        { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+      ]),
+      'single_leg_directional',
+    );
+    expect(populated.countAboveCeiling).toBe(0);
+    expect(populated.countAboveCeiling).not.toBe(cell.countAboveCeiling);
+  });
+
+  it('EXCLUDES fixture rows from the desk partition (TRA-2100 mirror trap)', () => {
+    // The mixed book: one clean desk fill, the same economic trade mirrored into
+    // two fixture books at a ceiling-breaching spread, and one pre-attribution row.
+    // Pooled, the desk cell would report 4 rows and a 1.933 max and falsely
+    // falsify the gate.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+      { structure: 'single_leg_directional', accountClass: 'fixture', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
+      { structure: 'single_leg_directional', accountClass: 'fixture', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
+      { structure: 'single_leg_directional', accountClass: 'unattributed', quote: { bid: 0.5, ask: 0.9, mark: 0.7 } },
+    ]);
+    const desk = cellOf(stats, 'single_leg_directional', 'desk');
+    const fixture = cellOf(stats, 'single_leg_directional', 'fixture');
+    const unattributed = cellOf(stats, 'single_leg_directional', 'unattributed');
+
+    expect(desk.n).toBe(1);
+    expect(desk.countAboveCeiling).toBe(0);
+    expect(desk.maxSpreadPct).toBeCloseTo(0.05, 10);
+
+    expect(fixture.n).toBe(2);
+    expect(fixture.countAboveCeiling).toBe(2);
+
+    // `unattributed` is pre-TRA-1475 rows with no `account`. It is NOT desk —
+    // folding it in would re-commit the pooling bug for exactly the historical
+    // rows a long-window grade leans on hardest.
+    expect(unattributed.n).toBe(1);
+    expect(unattributed.countAboveCeiling).toBe(1);
+    expect(desk.n + fixture.n + unattributed.n).toBe(4);
+  });
+
+  it('DROPS unmeasurable quotes out of the denominator and COUNTS the drop — never a zero spread', () => {
+    // The discipline `measureSpreadCross` and `cost-aware-gate-ledger.ts:481`
+    // already keep: a row with no fill-time quote is not a row with a zero-width
+    // spread. Zero-filling one would let a compaction publish a falsely-cheap max.
+    // The drop is counted so `n: 0` after discarding rows cannot read as a quiet,
+    // clean book.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: null },
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 0.5, ask: 0.4, mark: 1.0 } }, // crossed book
+      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 0 } }, // non-positive mark
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.n).toBe(0);
+    expect(cell.rowsDroppedNoQuote).toBe(3);
+    // NOT 0 — that is the whole point.
+    expect(cell.maxSpreadPct).toBeNull();
+    expect(cell.countAboveCeiling).toBeNull();
+  });
+
+  it('emits the full sleeve grid, and a structure with no configured ceiling reads null, not compliant', () => {
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'bull_put', accountClass: 'desk', quote: { bid: 0.2, ask: 1.8, mark: 1.0 } },
+    ]);
+    for (const sleeve of Object.keys(SLEEVE_SPREAD_CEILINGS)) {
+      for (const klass of ['desk', 'fixture', 'unattributed'] as const) {
+        expect(stats.find((s) => s.structure === sleeve && s.accountClass === klass)).toBeDefined();
+      }
+    }
+    const bp = cellOf(stats, 'bull_put');
+    expect(bp.n).toBe(1);
+    expect(bp.ceiling).toBeNull();
+    expect(bp.maxSpreadPct).toBeCloseTo(1.6, 10);
+    // No ceiling configured means there is no bound to breach. `null`, not `0`:
+    // reporting 0 would assert compliance with a threshold that does not exist.
+    expect(bp.countAboveCeiling).toBeNull();
+    expect(bp.countBelowMinBid).toBeNull();
+  });
+
+  it('uses the STRICT comparison the entry gate uses — exactly at the ceiling is admitted', () => {
+    // `spreadGateVerdict` rejects on `spreadPct > maxSpreadPct`. This read must not
+    // disagree with the gate at the boundary, or a clean book reads as a breach.
+    //
+    // ⚠ The quote is chosen so `ask − bid` and the quotient are EXACTLY
+    // representable: `2.1 − 1.9` is 0.20000000000000018, which divided by 2.0 lands
+    // a hair ABOVE 0.1 and is genuinely rejected by the gate. That is correct
+    // behaviour on both sides, but it makes a naive "exactly at the ceiling"
+    // fixture a test of float representation rather than of the comparison. 1.25 −
+    // 1.00 = 0.25 exactly, and 0.25 / 2.5 rounds to the same double as the `0.1`
+    // literal, so this pins the comparison itself.
+    const atCeiling = { bid: 1.0, ask: 1.25, mark: 2.5 }; // spreadPct exactly 0.10
+    expect(atCeiling.ask - atCeiling.bid).toBe(0.25);
+    expect(spreadGateVerdict('single_leg_directional', atCeiling).admitted).toBe(true);
+    const cell = cellOf(
+      summarizeSpreadCeilingCompliance([
+        { structure: 'single_leg_directional', accountClass: 'desk', quote: atCeiling },
+      ]),
+      'single_leg_directional',
+    );
+    expect(cell.countAboveCeiling).toBe(0);
+    expect(cell.maxSpreadPct).toBeCloseTo(0.1, 10);
   });
 });

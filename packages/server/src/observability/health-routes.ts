@@ -88,11 +88,18 @@ import {
 } from '../option-cost-gate.js';
 import {
   summarizeSpreadCost,
+  summarizeSpreadCeilingCompliance, // TRA-2316
+  SPREAD_CEILING_ACCOUNT_CLASSES, // TRA-2316
   SLEEVE_SPREAD_CEILINGS,
   isSpreadCeilingEnforceEnabled,
   OPTION_SPREAD_CEILING_ENFORCE_FLAG,
 } from '../option-spread-cost.js';
-import type { SpreadCostSample } from '../option-spread-cost.js';
+import type {
+  SpreadCostSample,
+  SpreadCeilingSample, // TRA-2316
+  SpreadCeilingStat, // TRA-2316
+  SpreadCeilingAccountClass, // TRA-2316
+} from '../option-spread-cost.js';
 import {
   isDirectionalQualityGateEnabled,
   resolveDirectionalQualityThresholds,
@@ -2291,25 +2298,58 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //     sleeve's ceiling is infeasible by construction, no data required.
   //
   // Observe-only: reading this never routes an order or moves a bar.
-  app.get('/api/health/option-spread-cost', async (_req, res) => {
+  app.get('/api/health/option-spread-cost', async (req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
     const config = resolveCostGateConfig(env);
 
-    const rows = await listOptionTradeJournal({ mode: 'demo' });
+    // TRA-2316 — optional `?sinceTs=` (epoch ms) cohort filter on the ENTRY
+    // timestamp, so the TRA-2306 read can be scoped to rows opened FORWARD of the
+    // TRA-2295 deploy rather than to the cumulative pool that contains the 59
+    // pre-fix breaches. Applied ONCE, above every block below, so the payload can
+    // never carry two differently-scoped populations under one 200 (TRA-2082).
+    // Absent or unparseable ⇒ no filter, byte-identical to the previous readout.
+    const rawSince = (req.query as Record<string, unknown> | undefined)?.sinceTs;
+    const parsedSince = typeof rawSince === 'string' ? Number(rawSince) : Number.NaN;
+    const sinceTs = Number.isFinite(parsedSince) ? parsedSince : undefined;
+
+    const allRows = await listOptionTradeJournal({ mode: 'demo' });
+    const rows = sinceTs === undefined ? allRows : allRows.filter((r) => r.openTs >= sinceTs);
     const samples: SpreadCostSample[] = [];
+    // TRA-2316 — the compliance fold sees EVERY row, including the ones with no
+    // fill-time quote (passed as `quote: null`), so it can report how many it had
+    // to discard. Pre-filtering here would hide the denominator.
+    const ceilingSamples: SpreadCeilingSample[] = [];
     for (const r of rows) {
+      const accountClass: SpreadCeilingAccountClass =
+        typeof r.account !== 'string' || r.account.trim().length === 0
+          ? 'unattributed'
+          : isTestAccount(r.account)
+            ? 'fixture'
+            : 'desk';
       if (
         typeof r.entryBid !== 'number'
         || typeof r.entryAsk !== 'number'
         || typeof r.entryMarkUsd !== 'number'
-      ) continue;
+      ) {
+        ceilingSamples.push({ structure: r.structure, accountClass, quote: null });
+        continue;
+      }
+      const quote = { bid: r.entryBid, ask: r.entryAsk, mark: r.entryMarkUsd };
+      ceilingSamples.push({ structure: r.structure, accountClass, quote });
       samples.push({
         structure: r.structure,
-        quote: { bid: r.entryBid, ask: r.entryAsk, mark: r.entryMarkUsd },
+        quote,
         ...(typeof r.contracts === 'number' ? { contracts: r.contracts } : {}),
       });
     }
+
+    // TRA-2316 — the independent read. Grouped by account class so the desk answer
+    // is reachable in ONE hop and can never be read off the fixture-polluted pool.
+    const ceilingGrid = summarizeSpreadCeilingCompliance(ceilingSamples);
+    const ceilingByAccountClass = Object.fromEntries(
+      SPREAD_CEILING_ACCOUNT_CLASSES.map((c) => [c, ceilingGrid.filter((s) => s.accountClass === c)]),
+    ) as Record<SpreadCeilingAccountClass, SpreadCeilingStat[]>;
 
     const byStructure = summarizeSpreadCost(samples, { safetyMarginR: config.safetyMarginR });
     const rowsWithQuote = samples.length;
@@ -2323,6 +2363,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       build: resolveBuildInfo(),
       demoOnly: true,
       liveCapitalReachable: false,
+
+      // TRA-2316 — the cohort filter ACTUALLY applied, always present so a consumer
+      // asserts what it got instead of assuming its query param took effect. `null`
+      // = no filter (cumulative pool); never `0`, which is a real epoch. `filterAxis`
+      // names the timestamp compared against — `openTs` (ENTRY), not `closeTs`. Every
+      // block in this payload is scoped by it, including `byStructure`/`retention`.
+      appliedSinceTs: sinceTs ?? null,
+      filterAxis: 'openTs' as const,
 
       // The gate input this probe exists to check. Key kept as `modeledInput` for
       // consumer stability; `source` states its real provenance, which as of
@@ -2339,6 +2387,43 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // (1) The measurement.
       n: rowsWithQuote,
       byStructure,
+
+      // (1b) TRA-2316 — THE INDEPENDENT CEILING-COMPLIANCE READ (TRA-2306 read #2).
+      //
+      // `byStructure` above publishes avg/median/p90 over a POOLED set. Neither half
+      // of that can answer "0 rows above the ceiling": `p90 <= ceiling` is perfectly
+      // consistent with 10% of rows above it, and the pool carries the `qa_*` /
+      // `ctoverify*` fixture mirror that inflates `n` and drags the distribution
+      // (TRA-2100). This block fixes both — a TRUE MAX and a strict breach COUNT,
+      // partitioned on `account`.
+      //
+      // Independence is the point. `/api/health/cost-aware-gate` →
+      // `maxAdmittedSpreadPct` is the only other true max in the system, and it is
+      // written BY THE GATE, from the gate's own view of what it admitted. A gate
+      // that records its own admissions cannot falsify itself. This number is
+      // re-derived from the journal's `entryBid`/`entryAsk`/`entryMarkUsd` — the
+      // quote that SET THE FILL — with no reference to any counter the gate wrote,
+      // so the two can be compared and a disagreement means something.
+      //
+      // READ IT LIKE THIS. For the TRA-2306 grade, the single cell that matters is
+      // `byAccountClass.desk` where `structure === 'single_leg_directional'`:
+      //   n: 0 (all null)            ⇒ NO READING. Not a pass. The desk book opened
+      //                                no directional entries in scope; check
+      //                                `rowsDroppedNoQuote` before concluding it was
+      //                                quiet rather than unmeasurable.
+      //   n > 0, countAboveCeiling 0 ⇒ the check RAN over n real rows and found none
+      //                                over 0.10. That is the PASS.
+      //   countAboveCeiling > 0      ⇒ falsification. The gate is not holding, and
+      //                                `maxSpreadPct` says by how much.
+      // Scope it to post-deploy entries with `?sinceTs=` — the cumulative pool still
+      // contains the 59 pre-TRA-2295 breaches and will never read 0.
+      ceilingCompliance: {
+        byAccountClass: ceilingByAccountClass,
+        note:
+          'TRA-2316. TRUE max + strict breach count per (structure × account class), re-derived from the journal fill-time quote independently of the gate\'s own counters. GRADE `byAccountClass.desk`; `fixture` is the qa_*/ctoverify* mirror (TRA-2100) and `unattributed` is pre-TRA-1475 rows with no `account` — it is NOT desk. Rows with no measurable two-sided quote DROP OUT of `n` and are counted in `rowsDroppedNoQuote`; they are never counted as zero-spread fills. `null` means NO ROWS TO CHECK and is NOT a pass — only `countAboveCeiling: 0` WITH `n > 0` is. Full grid: every sleeve × all three classes is emitted even at n=0, because an absent cell reads exactly like a passing one.',
+        comparisonBasis:
+          'Cross-check against /api/health/cost-aware-gate: byStructure[].maxAdmittedSpreadPct should track `desk` maxSpreadPct for the same cohort, and spreadCeilingEvaluated > 0 with the TRA-2311 `armed` bit true should accompany any n > 0 here. The gate counters are one-day and in-memory (durability.ephemeral); THIS read is over the durable journal and survives a restart — so a disagreement is more likely a lost counter than a lost fill, and the journal is the tiebreak.',
+      },
 
       // (2) The retention statement — the finding when n is short.
       retention: {

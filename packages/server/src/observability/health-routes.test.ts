@@ -1922,6 +1922,192 @@ describe('GET /api/health/option-spread-cost (TRA-1656)', () => {
   });
 });
 
+// TRA-2316 — the DESK-PARTITIONED per-row spread read (TRA-2306 read #2).
+//
+// Drives the real registered route against a real temp-file journal, because the
+// account classification (`isTestAccount` -> desk / fixture / unattributed) lives in
+// the ROUTE, not in the pure fold. `option-spread-cost.test.ts` pins the fold's
+// arithmetic; only reading the served body settles whether the desk partition
+// actually excludes the qa_* mirror.
+describe('GET /api/health/option-spread-cost — TRA-2316 ceilingCompliance', () => {
+  const JOURNAL = join(tmpdir(), `tra2316-ceiling-${Date.now()}.jsonl`);
+  const ARM_TS = NOW - 60_000;
+
+  beforeEach(() => {
+    process.env[OPTION_TRADE_JOURNAL_FLAG] = '1';
+    setOptionTradeJournalFileForTests(JOURNAL);
+  });
+  afterEach(async () => {
+    delete process.env[OPTION_TRADE_JOURNAL_FLAG];
+    setOptionTradeJournalFileForTests(null);
+    await rm(JOURNAL, { force: true });
+  });
+
+  const row = (
+    id: string,
+    account: string | undefined,
+    quote: { entryBid: number; entryAsk: number; entryMarkUsd: number } | null,
+    openTs = NOW,
+  ): OptionTradeJournalOpen => ({
+    id,
+    openTs,
+    symbol: 'AAPL',
+    structure: 'single_leg_directional',
+    mode: 'demo',
+    ivRank: 50,
+    trend: 'up',
+    sentiment: null,
+    sentimentIcBand: null,
+    entryDelta: 0.4,
+    entryDte: 30,
+    atRiskUsd: 200,
+    contracts: 1,
+    optionSymbol: 'AAPL260529C00200000',
+    ...(account === undefined ? {} : { account }),
+    ...(quote ?? {}),
+  });
+
+  type Cell = {
+    structure: string;
+    accountClass: string;
+    n: number;
+    rowsDroppedNoQuote: number;
+    maxSpreadPct: number | null;
+    countAboveCeiling: number | null;
+    minEntryBidUsd: number | null;
+    countBelowMinBid: number | null;
+  };
+  type Body = {
+    appliedSinceTs: number | null;
+    filterAxis: string;
+    ceilingCompliance: { byAccountClass: Record<string, Cell[]> };
+  };
+
+  async function body(query?: Record<string, string>): Promise<Body> {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    await routes.get('/api/health/option-spread-cost')![0]!(
+      query === undefined ? {} : { query },
+      res,
+    );
+    return res.body as Body;
+  }
+
+  const cell = (b: Body, klass: string): Cell =>
+    b.ceilingCompliance.byAccountClass[klass]!.find(
+      (c) => c.structure === 'single_leg_directional',
+    )!;
+
+  it('answers the TRA-2306 question in ONE request: desk n / maxSpreadPct / countAboveCeiling / countBelowMinBid', async () => {
+    // One clean desk fill: 0.10 spread on a 2.00 mark = 5%, inside the 0.10 ceiling.
+    await recordOptionTradeOpen(
+      row('desk-clean', 'admin', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    const desk = cell(await body(), 'desk');
+    expect(desk.n).toBe(1);
+    expect(desk.maxSpreadPct).toBeCloseTo(0.05, 10);
+    expect(desk.countAboveCeiling).toBe(0);
+    expect(desk.countBelowMinBid).toBe(0);
+  });
+
+  it('FIRES on a desk breach — the failing state the old read did not have', async () => {
+    // bid 0.01 / ask 0.59 on a 0.30 mark = spreadPct 1.933, the worst contract
+    // TRA-2295 found admitted. Under the previous route this row was invisible:
+    // the projection with the `account` axis carried no quotes, so the check
+    // computed NaN and reported "0 above the ceiling" for it.
+    await recordOptionTradeOpen(
+      row('desk-breach', 'Richard', { entryBid: 0.01, entryAsk: 0.59, entryMarkUsd: 0.3 }),
+    );
+    const desk = cell(await body(), 'desk');
+    expect(desk.n).toBe(1);
+    expect(desk.countAboveCeiling).toBe(1);
+    expect(desk.maxSpreadPct).toBeGreaterThan(0.1);
+    expect(desk.countBelowMinBid).toBe(1); // the ADMITTED side, not just a reject counter
+  });
+
+  it('EXCLUDES qa_*/ctoverify* fixture books from the desk partition (TRA-2100 mirror trap)', async () => {
+    await recordOptionTradeOpen(
+      row('desk-clean', 'admin', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    // The same economic trade mirrored into two fixture books at a breaching
+    // spread. Bit-identical but id-DISTINCT, so id-dedupe finds nothing; `account`
+    // is the only axis that separates them.
+    await recordOptionTradeOpen(
+      row('qa-mirror-1', 'qa_mirror_2316', { entryBid: 0.01, entryAsk: 0.59, entryMarkUsd: 0.3 }),
+    );
+    await recordOptionTradeOpen(
+      row('cto-mirror-1', 'ctoverify_2316', { entryBid: 0.01, entryAsk: 0.59, entryMarkUsd: 0.3 }),
+    );
+    // Pre-TRA-1475: no `account` at all. NOT desk.
+    await recordOptionTradeOpen(
+      row('legacy-1', undefined, { entryBid: 0.5, entryAsk: 0.9, entryMarkUsd: 0.7 }),
+    );
+
+    const b = await body();
+    const desk = cell(b, 'desk');
+    const fixture = cell(b, 'fixture');
+    const unattributed = cell(b, 'unattributed');
+
+    // Pooled, this book reads 4 rows and a 1.933 max and falsely falsifies the gate.
+    expect(desk.n).toBe(1);
+    expect(desk.countAboveCeiling).toBe(0);
+    expect(fixture.n).toBe(2);
+    expect(fixture.countAboveCeiling).toBe(2);
+    expect(unattributed.n).toBe(1);
+    expect(unattributed.countAboveCeiling).toBe(1);
+  });
+
+  it('an empty desk partition reads n:0 / null — NOT countAboveCeiling 0', async () => {
+    // Only a fixture row exists. The desk cell must still be PRESENT (an absent
+    // cell reads exactly like a passing one) and must say it has no reading.
+    await recordOptionTradeOpen(
+      row('qa-only', 'qa_reg_2316', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    const desk = cell(await body(), 'desk');
+    expect(desk).toBeDefined();
+    expect(desk.n).toBe(0);
+    expect(desk.maxSpreadPct).toBeNull();
+    expect(desk.countAboveCeiling).toBeNull();
+    expect(desk.countBelowMinBid).toBeNull();
+  });
+
+  it('counts a quote-less desk row as DROPPED, never as a zero-spread fill', async () => {
+    await recordOptionTradeOpen(row('desk-noquote', 'admin', null));
+    const desk = cell(await body(), 'desk');
+    expect(desk.n).toBe(0);
+    expect(desk.rowsDroppedNoQuote).toBe(1);
+    expect(desk.maxSpreadPct).toBeNull(); // NOT 0 — that is the whole point
+  });
+
+  it('?sinceTs= scopes the read to forward rows and ECHOES the filter it applied', async () => {
+    // The cumulative pool still holds the 59 pre-TRA-2295 breaches and will never
+    // read 0; the grade has to be scoped to entries opened after the deploy.
+    await recordOptionTradeOpen(
+      row('pre-fix', 'admin', { entryBid: 0.01, entryAsk: 0.59, entryMarkUsd: 0.3 }, ARM_TS - 1),
+    );
+    await recordOptionTradeOpen(
+      row('post-fix', 'admin', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }, ARM_TS + 1),
+    );
+
+    const unfiltered = await body();
+    expect(unfiltered.appliedSinceTs).toBeNull(); // null, never 0 — 0 is a real epoch
+    expect(cell(unfiltered, 'desk').countAboveCeiling).toBe(1);
+
+    const scoped = await body({ sinceTs: String(ARM_TS) });
+    expect(scoped.appliedSinceTs).toBe(ARM_TS);
+    expect(scoped.filterAxis).toBe('openTs'); // ENTRY time, not close time
+    const desk = cell(scoped, 'desk');
+    expect(desk.n).toBe(1);
+    expect(desk.countAboveCeiling).toBe(0);
+  });
+});
+
 // TRA-1729 — GET /api/health/scaleout-ladder must SERVE the observe-pass fields.
 //
 // This drives the real registrar and reads the response body, deliberately: the new

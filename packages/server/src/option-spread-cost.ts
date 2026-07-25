@@ -426,3 +426,170 @@ export function summarizeSpreadCost(
   }
   return out.sort((a, b) => a.structure.localeCompare(b.structure));
 }
+
+// ── TRA-2316 — the INDEPENDENT ceiling-compliance read ───────────────────────
+//
+// TRA-2306 verifies TRA-2295 with two reads. Read #1 is the gate's own counters
+// (`spreadCeilingEvaluated` / `maxAdmittedSpreadPct` / the TRA-2311 `armed` bit)
+// on `/api/health/cost-aware-gate`. That read is sound but it is NOT independent:
+// **a gate that records its own admissions cannot falsify itself.** Read #2 was
+// supposed to supply the independence by counting ceiling-breaching rows straight
+// out of the journal — and as of live SHA `8ff43a30` no deployed route could
+// execute it:
+//
+//   • `/api/health/option-journal?rows=demo` has the `account` axis but its row
+//     projection carries NO quote fields (`rowsCarryMarks: false`). Computing
+//     `(entryAsk − entryBid) / entryMarkUsd` off that projection yields `NaN`, and
+//     `NaN > 0.10` is `false` — so the check reported "0 rows above the ceiling"
+//     on EVERY possible input, including a completely broken gate. No failing state.
+//   • `/api/health/option-spread-cost` has the quotes but pooled `qa_*`/`ctoverify*`
+//     fixture books in with desk rows (the TRA-2100 mirror trap), and published only
+//     avg/median/p90 — and `p90 <= ceiling` is consistent with 10% of rows ABOVE it,
+//     so it structurally could not answer "0 rows above".
+//
+// This fold is the missing read: a TRUE MAX and a strict count of breaches, per
+// structure, PARTITIONED BY ACCOUNT CLASS, computed from the journal's own
+// fill-time quotes with no reference to anything the gate wrote.
+//
+// Two disciplines are load-bearing here, both inherited from the bugs above:
+//
+//  1. **An unmeasurable quote drops out of the denominator — it is never a zero.**
+//     Same rule as {@link measureSpreadCross} and `cost-aware-gate-ledger.ts:481`.
+//     A row with no fill-time quote is not a row with a zero-width spread, and
+//     zero-filling one would let a compaction publish a falsely-cheap max. Dropped
+//     rows are COUNTED (`rowsDroppedNoQuote`) rather than silently vanishing, so a
+//     partition reading `n: 0` after discarding forty rows cannot be misread as a
+//     clean, quiet book.
+//  2. **"No rows to check" is `null`, never `0`.** `countAboveCeiling: 0` means the
+//     check ran over real rows and found none over; an empty partition means it did
+//     not run at all. Conflating those two is the entire reason TRA-2295 (a ceiling
+//     nothing evaluated read identically to a ceiling nothing violated) and TRA-2311
+//     (`spreadCeilingEvaluated: 0` read identically whether QUIET or DISARMED) both
+//     had to exist. Mirrors `maxAdmittedSpreadPct` / `spreadCeilingRejectRate`.
+
+/**
+ * TRA-2193's three account classes. `unattributed` = rows written before TRA-1475
+ * added `account`; it is NOT desk, and folding it into desk would re-commit the
+ * pooling bug for exactly the historical rows a long-window grade leans on hardest.
+ */
+export type SpreadCeilingAccountClass = 'desk' | 'fixture' | 'unattributed';
+
+export const SPREAD_CEILING_ACCOUNT_CLASSES: readonly SpreadCeilingAccountClass[] = [
+  'desk',
+  'fixture',
+  'unattributed',
+];
+
+/**
+ * One journal row's entry economics for the compliance fold.
+ *
+ * `quote` is NULLABLE by design: the caller passes rows that carry no fill-time
+ * quote as `quote: null` instead of filtering them out, so the fold can report how
+ * many rows it had to discard. A caller that pre-filters hides the denominator.
+ */
+export interface SpreadCeilingSample {
+  structure: string;
+  accountClass: SpreadCeilingAccountClass;
+  quote: FillQuote | null;
+}
+
+/**
+ * The compliance readout for ONE (structure × accountClass) cell.
+ *
+ * Every numeric field is `null` when there is nothing to compute it from. Read
+ * `n: 0` + all-null as "this check did not run here", and `countAboveCeiling: 0`
+ * with `n > 0` as "it ran over `n` real rows and found none over the ceiling".
+ */
+export interface SpreadCeilingStat {
+  structure: string;
+  accountClass: SpreadCeilingAccountClass;
+  /** Rows in this cell carrying a MEASURABLE two-sided fill-time quote. The honest `n`. */
+  n: number;
+  /**
+   * Rows in this cell whose quote was absent or unusable. Dropped from every stat
+   * below — never zero-filled — but counted here so the drop is visible.
+   */
+  rowsDroppedNoQuote: number;
+  /** The thresholds applied. `null` ⇒ this structure has no configured ceiling. */
+  ceiling: SleeveSpreadCeiling | null;
+  /** TRUE max of `(ask − bid) / mark`, not a quantile. `null` when `n === 0`. */
+  maxSpreadPct: number | null;
+  /**
+   * Rows with `spreadPct > ceiling.maxSpreadPct` — the strict comparison the entry
+   * gate uses. `null` when `n === 0` OR the structure has no ceiling to breach.
+   */
+  countAboveCeiling: number | null;
+  /** Lowest per-share entry bid seen. `null` when `n === 0`. */
+  minEntryBidUsd: number | null;
+  /** Rows with `bid < ceiling.minBidUsd` — an ABSENT market, not merely a wide one. */
+  countBelowMinBid: number | null;
+}
+
+/**
+ * Fold journal entry quotes into the per-(structure × accountClass) ceiling
+ * compliance grid. Pure.
+ *
+ * Emits the FULL GRID — every sleeve in {@link SLEEVE_SPREAD_CEILINGS} (plus any
+ * structure actually observed) crossed with all three account classes — rather
+ * than only the cells that happen to have rows. A cell that is merely ABSENT from
+ * a response reads exactly like a cell that passed, which is the failure shape this
+ * whole ticket exists to remove: the consumer asking "is `single_leg_directional`
+ * clean on the desk book?" must get an answer object back even when the desk book
+ * is empty, and that answer must say `n: 0` / `null` rather than nothing at all.
+ */
+export function summarizeSpreadCeilingCompliance(
+  samples: readonly SpreadCeilingSample[],
+): SpreadCeilingStat[] {
+  const cellKey = (structure: string, accountClass: SpreadCeilingAccountClass): string =>
+    `${structure}\u0000${accountClass}`;
+
+  const measured = new Map<string, SpreadCrossMeasurement[]>();
+  const bids = new Map<string, number[]>();
+  const dropped = new Map<string, number>();
+
+  const structures = new Set<string>(Object.keys(SLEEVE_SPREAD_CEILINGS));
+  for (const s of samples) structures.add(s.structure);
+
+  for (const s of samples) {
+    const key = cellKey(s.structure, s.accountClass);
+    const m = s.quote === null ? null : measureSpreadCross(s.quote);
+    if (!m || s.quote === null) {
+      dropped.set(key, (dropped.get(key) ?? 0) + 1);
+      continue;
+    }
+    const bucket = measured.get(key) ?? [];
+    bucket.push(m);
+    measured.set(key, bucket);
+    const bidBucket = bids.get(key) ?? [];
+    bidBucket.push(s.quote.bid);
+    bids.set(key, bidBucket);
+  }
+
+  const out: SpreadCeilingStat[] = [];
+  for (const structure of [...structures].sort((a, b) => a.localeCompare(b))) {
+    const ceiling = SLEEVE_SPREAD_CEILINGS[structure] ?? null;
+    for (const accountClass of SPREAD_CEILING_ACCOUNT_CLASSES) {
+      const key = cellKey(structure, accountClass);
+      const rows = measured.get(key) ?? [];
+      const rowBids = bids.get(key) ?? [];
+      const n = rows.length;
+      out.push({
+        structure,
+        accountClass,
+        n,
+        rowsDroppedNoQuote: dropped.get(key) ?? 0,
+        ceiling: ceiling ? { ...ceiling } : null,
+        // `null`, not 0 — an empty cell must not read as a zero-spread book.
+        maxSpreadPct: n === 0 ? null : Math.max(...rows.map((m) => m.spreadPct)),
+        countAboveCeiling:
+          n === 0 || !ceiling
+            ? null
+            : rows.filter((m) => m.spreadPct > ceiling.maxSpreadPct).length,
+        minEntryBidUsd: n === 0 ? null : Math.min(...rowBids),
+        countBelowMinBid:
+          n === 0 || !ceiling ? null : rowBids.filter((b) => b < ceiling.minBidUsd).length,
+      });
+    }
+  }
+  return out;
+}
