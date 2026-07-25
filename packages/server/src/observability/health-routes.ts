@@ -1283,6 +1283,237 @@ export function givebackArmFloorNote(summary: GiveBackArmFloorSummary): string {
   return `RECOVERABLE: ${summary.sessionsObserved} session(s) durable on ${summary.durability.dataDir}, recorder ${r.state} through ${r.lastRecordedSessionDate ?? 'n/a'}. invalidations=${summary.invalidations} (sub-floor-peak give-back halts — a PRIMARY-AC breach if > 0), buckets total ${summary.verdictCountsTotal}/${summary.sessionsObserved}. A missed 21:40Z grade fire is recoverable by re-reading this route any time within ${summary.retentionDays} days.`;
 }
 
+/**
+ * TRA-2269 — the floor on the decoupled timer's share of the GRADED window.
+ *
+ * `gradeable` used to assert only that the subject RAN (TRA-2257:
+ * `decoupledPassCount > 0`). One pass anywhere in the process lifetime flipped
+ * it true. This asserts the complementary half — that the subject is what the
+ * denominator is MADE OF — so a window whose intervals were mostly closed by
+ * doTick cannot be published as a verdict on the hoist.
+ *
+ * Sized against the floor set by what is NOT being bounded, not picked for
+ * roundness: in a healthy armed RTH the timer fires every EXIT_REFRESH_MS (10s)
+ * while doTick completes on the order of once per 120-280s (TRA-2171), so the
+ * real share sits near 0.95+. A simple majority therefore has ~9x of headroom
+ * and only trips when doTick's inline pass has genuinely taken the cadence back
+ * — which is the case that must not be graded as the hoist.
+ */
+export const RTH_DECOUPLED_SHARE_FLOOR = 0.5;
+
+/**
+ * TRA-2269 — the fleet roll-up behind `GET /api/health/exit-cadence`, extracted
+ * from the route handler so the grade can be controlled in BOTH directions
+ * (it must be able to emit a PASS, a RED, and a refusal on demand) without
+ * standing up an Express app or waiting on a live tape.
+ *
+ * The headline change: `samples` / `atOrAbove30s` / `p99Under30s` / `verdict`
+ * are now scoped to the RTH window. They used to be computed over the whole
+ * process lifetime, which on any normal Monday mixes in hours of closed-market
+ * intervals that sit dead on the 30s bar — ~21.7 min of closed-market uptime was
+ * enough to force a FALSE however well the hoist performed. The lifetime numbers
+ * are still published, under `lifetime`, because they are the right population
+ * for "is the exit path evaluating at all" — just not for grading the hoist.
+ *
+ * `window: 'rth'` is a first-class marker so a reader can FAIL CLOSED on an old
+ * build: a payload without it is a lifetime-scoped grade and must not be read as
+ * TRA-2200's invalidation criterion.
+ */
+export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, unknown> {
+  const armed = engines.filter((e) => e.timerArmed);
+  const sumHistogram = (pick: (e: ExitCadenceHealth) => Record<ExitIntervalBucket, number>) =>
+    engines.reduce<Record<ExitIntervalBucket, number>>((acc, e) => {
+      const h = pick(e);
+      for (const b of EXIT_INTERVAL_BUCKETS) acc[b] += h[b];
+      return acc;
+    }, emptyExitIntervalHistogram());
+  const totalOf = (h: Record<ExitIntervalBucket, number>) =>
+    EXIT_INTERVAL_BUCKETS.reduce((n, b) => n + h[b], 0);
+  // The 30s bar sits on a bucket EDGE (`bucketExitInterval(30_000) === 'lt60s'`),
+  // so summing the four buckets at or past it IS the at-or-above-30s count.
+  const atOrAbove30sOf = (h: Record<ExitIntervalBucket, number>) =>
+    h.lt60s + h.lt120s + h.lt300s + h.gte300s;
+
+  // Fleet histograms. Summed across engines because the criterion is about the
+  // exit path as a whole; per-engine rows are published alongside so a single
+  // sick engine stays visible instead of being averaged away.
+  const lifetimeHistogram = sumHistogram((e) => e.intervalHistogram);
+  const lifetimeSamples = totalOf(lifetimeHistogram);
+  const lifetimeAtOrAbove30s = atOrAbove30sOf(lifetimeHistogram);
+
+  const histogram = sumHistogram((e) => e.rth.intervalHistogram);
+  const samples = totalOf(histogram);
+  const atOrAbove30s = atOrAbove30sOf(histogram);
+  // Null, not 0 or false, until there is a sample to judge. "No measurement
+  // yet" and "measured, and it passes" are different facts, and only the
+  // second one clears the gate.
+  const p99Under30s = samples > 0 ? atOrAbove30s / samples < 0.01 : null;
+
+  const maxExitIntervalMs = engines.reduce<number | null>(
+    (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
+    null,
+  );
+  // TRA-2257 — fleet roll-up of WHICH CADENCE stamped the intervals above, and
+  // of why the decoupled timer declined to. Without this split the histogram
+  // is ambiguous: a run in which the timer never once did work publishes the
+  // same shape as a run in which it worked and lost to contention. These stay
+  // LIFETIME-scoped: they are the terms of the `decoupledFireCount` invariant,
+  // which is a statement about every fire since boot.
+  const decoupledPassCount = engines.reduce((n, e) => n + e.decoupledPassCount, 0);
+  const tickPassCount = engines.reduce((n, e) => n + e.tickPassCount, 0);
+  const decoupledFireCount = engines.reduce((n, e) => n + e.decoupledFireCount, 0);
+  const decoupledSkips = engines.reduce<Record<DecoupledExitSkipReason, number>>((acc, e) => {
+    for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
+    return acc;
+  }, emptyDecoupledExitSkips());
+  const tickExitRegionMs = {
+    samples: engines.reduce((n, e) => n + e.tickExitRegionMs.samples, 0),
+    maxMs: engines.reduce<number | null>(
+      (acc, e) => (e.tickExitRegionMs.maxMs != null && (acc == null || e.tickExitRegionMs.maxMs > acc)
+        ? e.tickExitRegionMs.maxMs
+        : acc),
+      null,
+    ),
+    atOrAbove20s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove20s, 0),
+    atOrAbove30s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove30s, 0),
+  };
+
+  // TRA-2269 — the same split, restricted to the graded window: which cadence
+  // closed each RTH interval, and where the excluded lifetime intervals went.
+  const rthDecoupledPassCount = engines.reduce((n, e) => n + e.rth.decoupledPassCount, 0);
+  const rthTickPassCount = engines.reduce((n, e) => n + e.rth.tickPassCount, 0);
+  const rthBoundaryIntervals = engines.reduce((n, e) => n + e.rth.boundaryIntervals, 0);
+  const rthClosedIntervals = engines.reduce((n, e) => n + e.rth.closedIntervals, 0);
+  const gradedPasses = rthDecoupledPassCount + rthTickPassCount;
+  const rthDecoupledShare = gradedPasses > 0 ? rthDecoupledPassCount / gradedPasses : null;
+  // Every lifetime interval lands in exactly one of the three bins. Published so
+  // a reader can check it rather than trust it — same contract as
+  // `decoupledFireCount === sum(decoupledSkips) + decoupledPassCount`.
+  const partitionHolds = lifetimeSamples === samples + rthBoundaryIntervals + rthClosedIntervals;
+
+  // TRA-2257/TRA-2269 — THE GATE ON THE GRADE, now in two parts. `p99Under30s`
+  // is a statement about the hoist only if (a) the hoist ran during the window
+  // AND (b) the window is made of the hoist. TRA-2257 shipped (a): on 2026-07-24
+  // every fire refused on `marketClosed` post-16:00 ET and the resulting RED was
+  // read as a verdict on the fix. (b) is the same defect one level down — SOME
+  // decoupled passes flipped `gradeable` true while the denominator still
+  // carried hours of closed-market intervals. An instrument that cannot say
+  // "that was not my subject" hands out confident answers to questions it never
+  // asked. Refuse instead.
+  const gradeable = armed.length > 0
+    && samples > 0
+    && rthDecoupledPassCount > 0
+    && rthDecoupledShare != null && rthDecoupledShare > RTH_DECOUPLED_SHARE_FLOOR;
+  const notGradeableReason = armed.length === 0
+    ? 'no engine has an exit timer — the hoist is disarmed, nothing here grades it'
+    : samples === 0
+      ? (lifetimeSamples === 0
+        ? 'no exit interval measured yet'
+        : `${lifetimeSamples} exit interval(s) measured, but NONE with both endpoints inside `
+          + '09:30-16:00 ET, so none of them grades the hoist (the decoupled gate is RTH-only BY '
+          + 'DESIGN and refuses on `marketClosed` outside it). Read `lifetime` for what was '
+          + 'measured and `decoupledSkips` for the branch every timer fire refused on.')
+      : rthDecoupledPassCount === 0
+        ? 'ZERO decoupled passes closed an RTH interval in this window, so every graded interval '
+          + 'is doTick\'s own cadence and NONE of it grades the hoist. Read `decoupledSkips` for '
+          + 'the branch that refused: `tickExitRegion` means doTick\'s interlock held for the '
+          + 'whole window.'
+        : rthDecoupledShare != null && rthDecoupledShare <= RTH_DECOUPLED_SHARE_FLOOR
+          ? `the decoupled timer closed only ${rthDecoupledPassCount}/${gradedPasses} `
+            + `(${(rthDecoupledShare * 100).toFixed(1)}%) of the graded RTH intervals — at or below `
+            + `the ${RTH_DECOUPLED_SHARE_FLOOR * 100}% floor. doTick's inline pass, not the hoist, is `
+            + 'setting this cadence, so the ratio is not a verdict on the hoist.'
+          : null;
+
+  return {
+    // Fleet-level: is the hoist actually running anywhere.
+    enabled: armed.length > 0,
+    // TRA-2269 — which POPULATION the graded fields below are computed over.
+    // Assert this before reading `p99Under30s`: a payload without it is a
+    // pre-TRA-2269 build publishing a LIFETIME-scoped ratio under the same name.
+    window: 'rth',
+    verdict:
+      armed.length === 0
+        ? 'disarmed'
+        : samples === 0
+          // Distinguished on purpose: "nothing measured at all" and "measured,
+          // but all of it outside the window this grades" are different facts,
+          // and the second one is the normal state of a post-close read.
+          ? (lifetimeSamples === 0 ? 'armed_but_no_interval_measured' : 'armed_but_no_rth_interval')
+          // TRA-2257 — an armed timer that never ran is its own verdict, and it
+          // is NOT `over_bar`. Ranking it ahead of the p99 comparison is the
+          // whole point: `over_bar` invites a RED grade, and a RED grade on a
+          // window the hoist sat out is worse than no grade at all.
+          : rthDecoupledPassCount === 0
+            ? 'armed_but_no_decoupled_pass'
+            : rthDecoupledShare != null && rthDecoupledShare <= RTH_DECOUPLED_SHARE_FLOOR
+              ? 'tick_dominated_window'
+              : p99Under30s
+                ? 'bounded'
+                : 'over_bar',
+    gradeable,
+    notGradeableReason,
+    engineCount: engines.length,
+    armedEngineCount: armed.length,
+    // GRADED (RTH-only) terms.
+    samples,
+    atOrAbove30s,
+    p99Under30s,
+    intervalHistogram: histogram,
+    rthDecoupledPassCount,
+    rthTickPassCount,
+    rthDecoupledShare,
+    rthDecoupledShareFloor: RTH_DECOUPLED_SHARE_FLOOR,
+    rthBoundaryIntervals,
+    rthClosedIntervals,
+    partitionHolds,
+    // LIFETIME terms — unchanged semantics, kept for continuity and because
+    // "is the exit path evaluating at all" is a real question with a real
+    // answer. `maxExitIntervalMs` stays here: a high-water mark is not a ratio
+    // and does not dilute.
+    maxExitIntervalMs,
+    lifetime: {
+      samples: lifetimeSamples,
+      atOrAbove30s: lifetimeAtOrAbove30s,
+      p99Under30s: lifetimeSamples > 0 ? lifetimeAtOrAbove30s / lifetimeSamples < 0.01 : null,
+      intervalHistogram: lifetimeHistogram,
+    },
+    decoupledPassCount,
+    tickPassCount,
+    decoupledFireCount,
+    decoupledSkips,
+    tickExitRegionMs,
+    note:
+      'Grade `p99Under30s` (TRA-2200 invalidation criterion) — but ONLY when '
+      + '`gradeable` is true. TRA-2269: `window` names the population, and the graded '
+      + 'fields (`samples`, `atOrAbove30s`, `p99Under30s`, `intervalHistogram`) count ONLY '
+      + 'intervals with BOTH endpoints inside 09:30-16:00 ET. They used to be lifetime '
+      + 'accumulators since boot, which mixed in closed-market intervals that sit dead on '
+      + 'the 30s bar: ~21.7 min of closed-market uptime was enough to force `p99Under30s` '
+      + 'FALSE however well the hoist performed. Those numbers now live under `lifetime` '
+      + 'and must NOT be read as the criterion. Buckets put the 30s bar on an edge, so '
+      + '`atOrAbove30s / samples < 0.01` IS p99 < 30s. `samples` counts INTERVALS, which is '
+      + 'one fewer than passes per engine — the first pass after boot has no predecessor to '
+      + 'measure against. Excluded intervals are counted, not dropped: '
+      + '`lifetime.samples === samples + rthBoundaryIntervals + rthClosedIntervals` '
+      + '(`partitionHolds`), where boundary = one endpoint each side of the open/close. '
+      + 'TRA-2257: `decoupledPassCount` vs `tickPassCount` (LIFETIME) says which cadence '
+      + 'produced intervals, and `decoupledSkips` names the branch every non-working timer '
+      + 'fire refused on (they sum to `decoupledFireCount`, so a zero is a measurement, not '
+      + 'a dark branch). `rthDecoupledShare` is the same split INSIDE the graded window and '
+      + 'is the denominator-purity gate: at or below `rthDecoupledShareFloor` the verdict is '
+      + '`tick_dominated_window` and refuses rather than grading doTick as the hoist. All '
+      + 'counters are strictly monotonic within a process, so two same-process snapshots '
+      + '(assert identical `build.startedAt` AND `build.pid`) difference cleanly into any '
+      + 'sub-window. `tickExitRegionMs` is the suppression window doTick holds the '
+      + 'exit interlock for (news + social + market-review + journal + '
+      + 'tradier-balance + the 568-symbol quote-batch + 3 reconciles + '
+      + 'shadow-chases): worst-case exit interval is bounded by THAT plus the '
+      + 'timer period, never by the timer period alone, so a region at or above '
+      + '30s makes `p99Under30s` unreachable however well the timer behaves.',
+  };
+}
+
 export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): void {
   const now = deps.now ?? Date.now;
 
@@ -2824,117 +3055,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   if (exitCadence) {
     app.get('/api/health/exit-cadence', (_req, res) => {
       const engines = exitCadence();
-      const armed = engines.filter((e) => e.timerArmed);
-      // Fleet histogram. Summed across engines because the criterion is about the
-      // exit path as a whole; per-engine rows are published alongside so a single
-      // sick engine stays visible instead of being averaged away.
-      const histogram = engines.reduce<Record<ExitIntervalBucket, number>>((acc, e) => {
-        for (const b of EXIT_INTERVAL_BUCKETS) acc[b] += e.intervalHistogram[b];
-        return acc;
-      }, emptyExitIntervalHistogram());
-      const samples = EXIT_INTERVAL_BUCKETS.reduce((n, b) => n + histogram[b], 0);
-      const atOrAbove30s = histogram.lt60s + histogram.lt120s + histogram.lt300s + histogram.gte300s;
-      // Null, not 0 or false, until there is a sample to judge. "No measurement
-      // yet" and "measured, and it passes" are different facts, and only the
-      // second one clears the gate.
-      const p99Under30s = samples > 0 ? atOrAbove30s / samples < 0.01 : null;
-      const maxExitIntervalMs = engines.reduce<number | null>(
-        (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
-        null,
-      );
-      // TRA-2257 — fleet roll-up of WHICH CADENCE stamped the intervals above, and
-      // of why the decoupled timer declined to. Without this split the histogram
-      // is ambiguous: a run in which the timer never once did work publishes the
-      // same shape as a run in which it worked and lost to contention.
-      const decoupledPassCount = engines.reduce((n, e) => n + e.decoupledPassCount, 0);
-      const tickPassCount = engines.reduce((n, e) => n + e.tickPassCount, 0);
-      const decoupledFireCount = engines.reduce((n, e) => n + e.decoupledFireCount, 0);
-      const decoupledSkips = engines.reduce<Record<DecoupledExitSkipReason, number>>((acc, e) => {
-        for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
-        return acc;
-      }, emptyDecoupledExitSkips());
-      const regionSamples = engines.reduce((n, e) => n + e.tickExitRegionMs.samples, 0);
-      const tickExitRegionMs = {
-        samples: regionSamples,
-        maxMs: engines.reduce<number | null>(
-          (acc, e) => (e.tickExitRegionMs.maxMs != null && (acc == null || e.tickExitRegionMs.maxMs > acc)
-            ? e.tickExitRegionMs.maxMs
-            : acc),
-          null,
-        ),
-        atOrAbove20s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove20s, 0),
-        atOrAbove30s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove30s, 0),
-      };
-      // TRA-2257 — THE GATE ON THE GRADE. `p99Under30s` is only a statement about
-      // the hoist if the hoist actually ran during the window. On 2026-07-24 it
-      // did not (every fire refused on `marketClosed`, post-16:00 ET), and the
-      // resulting RED was read as a verdict on the fix. An instrument that cannot
-      // say "I was not measuring my subject" hands out confident answers to
-      // questions it never asked. Refuse instead.
-      const gradeable = armed.length > 0 && samples > 0 && decoupledPassCount > 0;
-      const notGradeableReason = armed.length === 0
-        ? 'no engine has an exit timer — the hoist is disarmed, nothing here grades it'
-        : samples === 0
-          ? 'no exit interval measured yet'
-          : decoupledPassCount === 0
-            ? 'ZERO decoupled passes ran in this window, so every interval here is doTick\'s '
-              + 'own cadence and NONE of it grades the hoist. Read `decoupledSkips` for the '
-              + 'branch that refused: `marketClosed` means the window was outside 09:30-16:00 ET '
-              + '(the gate is RTH-only BY DESIGN); `tickExitRegion` means doTick\'s interlock '
-              + 'held for the whole window.'
-            : null;
       res.json({
         ok: true,
         time: new Date(now()).toISOString(),
         build: resolveBuildInfo(),
-        // Fleet-level: is the hoist actually running anywhere.
-        enabled: armed.length > 0,
-        verdict:
-          armed.length === 0
-            ? 'disarmed'
-            : samples === 0
-              ? 'armed_but_no_interval_measured'
-              // TRA-2257 — an armed timer that never ran is its own verdict, and it
-              // is NOT `over_bar`. Ranking it ahead of the p99 comparison is the
-              // whole point: `over_bar` invites a RED grade, and a RED grade on a
-              // window the hoist sat out is worse than no grade at all.
-              : decoupledPassCount === 0
-                ? 'armed_but_no_decoupled_pass'
-                : p99Under30s
-                  ? 'bounded'
-                  : 'over_bar',
-        gradeable,
-        notGradeableReason,
         marketOpen: isStockMarketOpen(now()),
-        engineCount: engines.length,
-        armedEngineCount: armed.length,
-        samples,
-        atOrAbove30s,
-        p99Under30s,
-        maxExitIntervalMs,
-        intervalHistogram: histogram,
-        decoupledPassCount,
-        tickPassCount,
-        decoupledFireCount,
-        decoupledSkips,
-        tickExitRegionMs,
-        note:
-          'Grade `p99Under30s` (TRA-2200 invalidation criterion) — but ONLY when '
-          + '`gradeable` is true. Buckets put the 30s bar on an edge, so '
-          + '`atOrAbove30s / samples < 0.01` IS p99 < 30s. `samples` counts INTERVALS, '
-          + 'which is one fewer than passes per engine — the first pass after boot has '
-          + 'no predecessor to measure against. TRA-2257: `decoupledPassCount` vs '
-          + '`tickPassCount` says which cadence produced those intervals, and '
-          + '`decoupledSkips` names the branch every non-working timer fire refused on '
-          + '(the counters sum to `decoupledFireCount`, so a zero on one of them is a '
-          + 'measurement, not a dark branch). The gate is RTH-ONLY BY DESIGN, so a '
-          + 'window outside 09:30-16:00 ET scores 100% `marketClosed` and grades '
-          + 'NOTHING. `tickExitRegionMs` is the suppression window doTick holds the '
-          + 'exit interlock for (news + social + market-review + journal + '
-          + 'tradier-balance + the 568-symbol quote-batch + 3 reconciles + '
-          + 'shadow-chases): worst-case exit interval is bounded by THAT plus the '
-          + 'timer period, never by the timer period alone, so a region at or above '
-          + '30s makes `p99Under30s` unreachable however well the timer behaves.',
+        ...rollUpExitCadence(engines),
         engines,
       });
     });

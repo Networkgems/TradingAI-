@@ -832,6 +832,32 @@ export function bucketExitInterval(intervalMs: number): ExitIntervalBucket {
   return 'gte300s';
 }
 
+/**
+ * TRA-2269 — which population an exit-evaluation interval belongs to, from the
+ * market state at each of its two endpoints.
+ *
+ * Only `rth` is graded. The asymmetry is deliberate and fail-CLOSED: an interval
+ * is admitted only when BOTH endpoints were inside 09:30-16:00 ET, because the
+ * decoupled timer refuses on `marketClosed` by design, so any interval with a
+ * closed-market endpoint spent part of its length in a window the subject was
+ * forbidden to run in — it grades doTick, not the hoist. `boundary` (exactly one
+ * endpoint inside) is excluded but COUNTED, so the three bins partition the
+ * lifetime histogram exactly and the route can publish a checkable invariant
+ * instead of a silently lossy filter.
+ *
+ * `prevMarketOpen` is null only before the first pass, where there is no
+ * interval to classify at all; treating it as non-RTH is unreachable in practice
+ * and harmless if it were.
+ */
+export function classifyExitInterval(
+  prevMarketOpen: boolean | null,
+  marketOpen: boolean,
+): 'rth' | 'boundary' | 'closed' {
+  if (prevMarketOpen === null) return 'closed';
+  if (prevMarketOpen && marketOpen) return 'rth';
+  return prevMarketOpen === marketOpen ? 'closed' : 'boundary';
+}
+
 /** Zeroed histogram over {@link EXIT_INTERVAL_BUCKETS}. */
 export function emptyExitIntervalHistogram(): Record<ExitIntervalBucket, number> {
   return {
@@ -894,6 +920,52 @@ export interface ExitCadenceHealth {
     samples: number;
     atOrAbove20s: number;
     atOrAbove30s: number;
+  };
+  /**
+   * TRA-2269 — the SAME instrument, scoped to the window it is a statement about.
+   *
+   * `intervalHistogram` above is a lifetime accumulator since boot: it has no
+   * market-hours predicate and never resets, so on any normal session it mixes
+   * RTH intervals (which the decoupled timer owns) with closed-market intervals
+   * (which it refuses on `marketClosed` by design, leaving doTick's ~30s cadence
+   * to stamp them). Those closed-market intervals sit dead on the 30s bar, so
+   * they land in the numerator of `atOrAbove30s / samples` and inflate a ratio
+   * that is supposed to be a statement about a 10s timer. Measured 2026-07-24
+   * post-close: 57% of closed-market intervals at or above the bar, which puts
+   * the whole contamination budget at ~21.7 min of closed-market uptime before
+   * a perfect RTH grades FALSE.
+   *
+   * TRA-2257 gated on "did the subject run AT ALL" (`decoupledPassCount > 0`).
+   * This is the next level of the same defect: gate on whether the DENOMINATOR
+   * is made only of the subject. An interval qualifies only when BOTH of its
+   * endpoints were stamped inside RTH — the same `isStockMarketOpen` predicate
+   * the decoupled gate itself refuses on, so the population and the subject
+   * cannot disagree.
+   *
+   * INVARIANT the route can be read against, exactly like `decoupledFireCount`:
+   * `sum(intervalHistogram) === sum(rth.intervalHistogram) + rth.boundaryIntervals
+   * + rth.closedIntervals`. Every lifetime interval lands in exactly one of the
+   * three, so a zero on any of them is a measurement and no branch is dark.
+   */
+  rth: {
+    /** Intervals with BOTH endpoints inside RTH. This is the graded population. */
+    intervalHistogram: Record<ExitIntervalBucket, number>;
+    /**
+     * Which cadence stamped the CLOSING pass of each qualifying interval. Lets
+     * the route refuse a window whose intervals are nominally in RTH but were
+     * still produced by doTick rather than by the hoist.
+     */
+    decoupledPassCount: number;
+    tickPassCount: number;
+    /**
+     * Intervals with exactly ONE endpoint inside RTH — the open and close
+     * boundaries. Excluded from the graded ratio (half of such an interval lived
+     * in a window the timer was designed not to run in), but counted rather than
+     * dropped so the invariant above closes.
+     */
+    boundaryIntervals: number;
+    /** Intervals with NEITHER endpoint inside RTH — the contamination itself. */
+    closedIntervals: number;
   };
 }
 
@@ -2469,6 +2541,21 @@ export class SignalEngine {
   private exitPassCount = 0;
   private exitIntervalHistogram: Record<ExitIntervalBucket, number> = emptyExitIntervalHistogram();
   /**
+   * TRA-2269 — the RTH-scoped twin of `exitIntervalHistogram`, plus the two
+   * exclusion counters that make the partition auditable. See the `rth` block on
+   * {@link ExitCadenceHealth} for why the lifetime histogram cannot be graded.
+   *
+   * `lastExitPassMarketOpen` is the market state at the OPENING endpoint of the
+   * next interval. Null only before the first pass — it is written in the same
+   * breath as `lastExitPassAt`, so `lastExitPassAt > 0` implies it is set.
+   */
+  private rthExitIntervalHistogram: Record<ExitIntervalBucket, number> = emptyExitIntervalHistogram();
+  private lastExitPassMarketOpen: boolean | null = null;
+  private rthDecoupledPassCount = 0;
+  private rthTickPassCount = 0;
+  private rthBoundaryIntervals = 0;
+  private rthClosedIntervals = 0;
+  /**
    * TRA-2200 — decoupled passes skipped because NO symbol carried a stamp fresh
    * enough to price an exit against. Surfaced because "the hoist is armed and
    * evaluating nothing" and "the hoist is armed and healthy" are otherwise the
@@ -3618,6 +3705,11 @@ export class SignalEngine {
 
   private stampExitPass(source: 'tick' | 'decoupled'): void {
     const now = Date.now();
+    // TRA-2269 — read the predicate ONCE, and read the SAME predicate the
+    // decoupled gate refuses on (`refreshExitsOnly` -> `marketClosed`). If the
+    // population filter and the subject's own gate could disagree, an interval
+    // could be admitted to a window its producer was forbidden to run in.
+    const marketOpen = isStockMarketOpen(now);
     if (source === 'decoupled') this.decoupledPassCount += 1;
     else this.tickPassCount += 1;
     if (this.lastExitPassAt > 0) {
@@ -3625,6 +3717,20 @@ export class SignalEngine {
       this.lastExitIntervalMs = intervalMs;
       if (intervalMs > this.maxExitIntervalMs) this.maxExitIntervalMs = intervalMs;
       this.exitIntervalHistogram[bucketExitInterval(intervalMs)] += 1;
+      // TRA-2269 — partition the SAME interval into exactly one of three bins.
+      switch (classifyExitInterval(this.lastExitPassMarketOpen, marketOpen)) {
+        case 'rth':
+          this.rthExitIntervalHistogram[bucketExitInterval(intervalMs)] += 1;
+          if (source === 'decoupled') this.rthDecoupledPassCount += 1;
+          else this.rthTickPassCount += 1;
+          break;
+        case 'boundary':
+          this.rthBoundaryIntervals += 1;
+          break;
+        default:
+          this.rthClosedIntervals += 1;
+          break;
+      }
       // Tape breadcrumb for the tail only. One line per pass would be ~2,000
       // lines/session/engine of pure noise; the grade only needs the tail, and the
       // histogram + `exitPassCount` on the health route carry the full shape. The
@@ -3642,6 +3748,7 @@ export class SignalEngine {
       }
     }
     this.lastExitPassAt = now;
+    this.lastExitPassMarketOpen = marketOpen;
     this.exitPassCount += 1;
   }
 
@@ -3748,6 +3855,13 @@ export class SignalEngine {
         samples: this.tickExitRegionSamples,
         atOrAbove20s: this.tickExitRegionAtOrAbove20s,
         atOrAbove30s: this.tickExitRegionAtOrAbove30s,
+      },
+      rth: {
+        intervalHistogram: { ...this.rthExitIntervalHistogram },
+        decoupledPassCount: this.rthDecoupledPassCount,
+        tickPassCount: this.rthTickPassCount,
+        boundaryIntervals: this.rthBoundaryIntervals,
+        closedIntervals: this.rthClosedIntervals,
       },
     };
   }

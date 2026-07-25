@@ -22,6 +22,8 @@ import {
   summarizeSma200ForwardTestFills,
   summarizeOptionsPipeline,
   buildOptionJournalReport,
+  rollUpExitCadence,
+  RTH_DECOUPLED_SHARE_FLOOR,
   type HealthUserContext,
 } from './health-routes.js';
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
@@ -61,8 +63,8 @@ import { beginRvScan, __resetRvScanTelemetry } from '../rv-scan-telemetry.js'; /
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
-import type { EngineState, LiveEquityAcceptance } from '../signal-engine.js';
-import { categorizeLiveSkipReason, emptyLiveSkipBreakdown } from '../signal-engine.js';
+import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance } from '../signal-engine.js';
+import { categorizeLiveSkipReason, emptyLiveSkipBreakdown, emptyDecoupledExitSkips, emptyExitIntervalHistogram } from '../signal-engine.js';
 import type { AccountSettings } from '@trading-app/shared';
 
 const NOW = 2_000_000_000;
@@ -2494,5 +2496,229 @@ describe('TRA-2220 giveback-arm-floor route — darkness is a first-class verdic
     expect(body.ok).toBe(false);
     expect((body.recorder as Record<string, unknown>).staleTradingDays).toBe(2);
     expect(String(body.note)).toContain('STALE');
+  });
+});
+
+describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpExitCadence)', () => {
+  /**
+   * `bucketExitInterval(29_999) === 'lt30s'` and `bucketExitInterval(30_000) === 'lt60s'`
+   * — the 30s bar sits on a bucket EDGE, so `lt60s` is the first bucket AT the bar.
+   */
+  function exitHistogram(under30s: number, atOrAbove30s: number): Record<ExitIntervalBucket, number> {
+    const h = emptyExitIntervalHistogram();
+    h.lt15s = under30s;
+    h.lt60s = atOrAbove30s;
+    return h;
+  }
+
+  function exitEngine(o: {
+    engine?: string;
+    timerArmed?: boolean;
+    lifetime: { under: number; over: number };
+    rth: { under: number; over: number };
+    rthDecoupled?: number;
+    rthTick?: number;
+    boundaryIntervals?: number;
+    closedIntervals?: number;
+  }): ExitCadenceHealth {
+    return {
+      enabled: true,
+      timerArmed: o.timerArmed ?? true,
+      intervalMs: 10_000,
+      minGapMs: 3_000,
+      mode: 'demo',
+      engine: o.engine ?? 'admin',
+      lastExitPassAt: NOW,
+      exitPassCount: o.lifetime.under + o.lifetime.over + 1,
+      lastExitIntervalMs: 10_000,
+      maxExitIntervalMs: 30_001,
+      intervalHistogram: exitHistogram(o.lifetime.under, o.lifetime.over),
+      decoupledExitSkippedStalePrices: 0,
+      decoupledPassCount: o.rthDecoupled ?? 1,
+      tickPassCount: o.rthTick ?? 0,
+      decoupledSkips: emptyDecoupledExitSkips(),
+      decoupledFireCount: 0,
+      tickExitRegionMs: { lastMs: null, maxMs: null, samples: 0, atOrAbove20s: 0, atOrAbove30s: 0 },
+      rth: {
+        intervalHistogram: exitHistogram(o.rth.under, o.rth.over),
+        decoupledPassCount: o.rthDecoupled ?? 1,
+        tickPassCount: o.rthTick ?? 0,
+        boundaryIntervals: o.boundaryIntervals ?? 0,
+        closedIntervals: o.closedIntervals ?? 0,
+      },
+    };
+  }
+
+  // The exact scenario from the TRA-2269 filing, in the ticket's own numbers: a
+  // PERFECT 6.5h RTH (6.5h / 10s x 10 engines = 23,400 intervals, NONE at or
+  // above the bar) plus 22 minutes of closed-market uptime accruing at the
+  // rates measured post-close on 2026-07-24 (0.3216 intervals/s, of which
+  // 0.1833/s land at or above 30s) => 425 intervals, 242 of them over the bar.
+  const PERFECT_RTH_INTERVALS = 23_400;
+  const CONTAMINATION_SAMPLES = 425;
+  const CONTAMINATION_OVER = 242;
+  const contaminatedFleet = () => [exitEngine({
+    lifetime: {
+      under: PERFECT_RTH_INTERVALS + (CONTAMINATION_SAMPLES - CONTAMINATION_OVER),
+      over: CONTAMINATION_OVER,
+    },
+    rth: { under: PERFECT_RTH_INTERVALS, over: 0 },
+    rthDecoupled: 23_000,
+    rthTick: 400,
+    closedIntervals: CONTAMINATION_SAMPLES,
+  })];
+
+  it('REPRODUCES THE BUG, THEN KILLS IT: 22 min of closed-market uptime forces the LIFETIME ratio FALSE on a PERFECT RTH — and the graded ratio is TRUE', () => {
+    const body = rollUpExitCadence(contaminatedFleet());
+
+    // The old, lifetime-scoped number — the one this route used to publish
+    // under the name `p99Under30s`. 242 / 23,825 = 1.016% >= 1% => a confident
+    // RED on a session in which the hoist did not miss a single interval.
+    const lifetime = body.lifetime as Record<string, unknown>;
+    expect(lifetime.samples).toBe(23_825);
+    expect(lifetime.atOrAbove30s).toBe(CONTAMINATION_OVER);
+    expect(lifetime.p99Under30s).toBe(false);
+
+    // The graded number, scoped to the window it is a statement about.
+    expect(body.samples).toBe(PERFECT_RTH_INTERVALS);
+    expect(body.atOrAbove30s).toBe(0);
+    expect(body.p99Under30s).toBe(true);
+    expect(body.verdict).toBe('bounded');
+    expect(body.gradeable).toBe(true);
+    expect(body.notGradeableReason).toBeNull();
+  });
+
+  it('PARTITIONS rather than filters — every lifetime interval is still accounted for', () => {
+    const body = rollUpExitCadence(contaminatedFleet());
+    const lifetime = body.lifetime as Record<string, unknown>;
+    expect(body.rthClosedIntervals).toBe(CONTAMINATION_SAMPLES);
+    expect(body.rthBoundaryIntervals).toBe(0);
+    expect(lifetime.samples).toBe(
+      (body.samples as number) + (body.rthBoundaryIntervals as number) + (body.rthClosedIntervals as number),
+    );
+    expect(body.partitionHolds).toBe(true);
+  });
+
+  it('POSITIVE CONTROL — it can still emit a RED. A genuinely bad RTH window grades over_bar, gradeable', () => {
+    // Without this the fix would be a whitewash: an instrument that can only
+    // ever say PASS is not an instrument. 300 / 23,400 = 1.28% >= 1%, and
+    // every one of those intervals has BOTH endpoints inside RTH.
+    const body = rollUpExitCadence([exitEngine({
+      lifetime: { under: PERFECT_RTH_INTERVALS - 300, over: 300 },
+      rth: { under: PERFECT_RTH_INTERVALS - 300, over: 300 },
+      rthDecoupled: 23_000,
+      rthTick: 400,
+    })]);
+    expect(body.p99Under30s).toBe(false);
+    expect(body.verdict).toBe('over_bar');
+    expect(body.gradeable).toBe(true);
+    expect(body.notGradeableReason).toBeNull();
+  });
+
+  it('REFUSES the pure post-close read — the live 2026-07-24 state — and names the lifetime count it declined to grade', () => {
+    // 293 samples, 167 at or above the bar, ZERO with both endpoints in RTH.
+    // The pre-TRA-2269 route published 57% over the bar as a graded ratio.
+    const body = rollUpExitCadence([exitEngine({
+      lifetime: { under: 126, over: 167 },
+      rth: { under: 0, over: 0 },
+      rthDecoupled: 0,
+      rthTick: 0,
+      closedIntervals: 293,
+    })]);
+    expect(body.samples).toBe(0);
+    expect(body.p99Under30s).toBeNull();
+    expect(body.verdict).toBe('armed_but_no_rth_interval');
+    expect(body.gradeable).toBe(false);
+    expect(String(body.notGradeableReason)).toContain('293');
+    // And the lifetime figure is still published — it is a real fact about the
+    // exit path, just not a verdict on the hoist.
+    expect((body.lifetime as Record<string, unknown>).p99Under30s).toBe(false);
+  });
+
+  it('keeps armed_but_no_interval_measured for the genuinely empty case — "nothing measured" and "nothing IN WINDOW" are different facts', () => {
+    const body = rollUpExitCadence([exitEngine({
+      lifetime: { under: 0, over: 0 },
+      rth: { under: 0, over: 0 },
+      rthDecoupled: 0,
+    })]);
+    expect(body.verdict).toBe('armed_but_no_interval_measured');
+    expect(body.gradeable).toBe(false);
+    expect(String(body.notGradeableReason)).toBe('no exit interval measured yet');
+  });
+
+  it('DENOMINATOR PURITY: RTH intervals that doTick closed do not grade the hoist', () => {
+    // TRA-2257 gated on "did the subject run at all" — one decoupled pass
+    // anywhere flipped `gradeable` true. Here the timer ran 100 times and
+    // doTick closed 900 of the 1,000 graded intervals: nominally in-window,
+    // but the cadence on show is doTick's.
+    const body = rollUpExitCadence([exitEngine({
+      lifetime: { under: 1_000, over: 0 },
+      rth: { under: 1_000, over: 0 },
+      rthDecoupled: 100,
+      rthTick: 900,
+    })]);
+    expect(body.rthDecoupledShare).toBeCloseTo(0.1, 10);
+    expect(body.verdict).toBe('tick_dominated_window');
+    expect(body.gradeable).toBe(false);
+    expect(String(body.notGradeableReason)).toContain('100/1000');
+    // ...and it does NOT trip on a healthy armed session, where the 10s timer
+    // outruns doTick's 120-280s wall-clock by an order of magnitude.
+    const healthy = rollUpExitCadence(contaminatedFleet());
+    expect(healthy.rthDecoupledShare as number).toBeGreaterThan(RTH_DECOUPLED_SHARE_FLOOR);
+    expect(healthy.gradeable).toBe(true);
+  });
+
+  it('disarmed still outranks everything — a fleet with no timer grades nothing', () => {
+    const body = rollUpExitCadence([exitEngine({
+      timerArmed: false,
+      lifetime: { under: 1_000, over: 0 },
+      rth: { under: 1_000, over: 0 },
+      rthDecoupled: 900,
+    })]);
+    expect(body.verdict).toBe('disarmed');
+    expect(body.gradeable).toBe(false);
+    expect(body.enabled).toBe(false);
+  });
+
+  it('sums the RTH histogram across engines — one sick engine is not averaged away', () => {
+    const body = rollUpExitCadence([
+      exitEngine({ engine: 'a', lifetime: { under: 500, over: 0 }, rth: { under: 500, over: 0 }, rthDecoupled: 500 }),
+      exitEngine({ engine: 'b', lifetime: { under: 480, over: 20 }, rth: { under: 480, over: 20 }, rthDecoupled: 500 }),
+    ]);
+    expect(body.samples).toBe(1_000);
+    expect(body.atOrAbove30s).toBe(20);
+    // 20 / 1,000 = 2% — the healthy engine does not rescue the sick one.
+    expect(body.p99Under30s).toBe(false);
+    expect(body.verdict).toBe('over_bar');
+  });
+
+  it('publishes `window: "rth"` so a reader can FAIL CLOSED on a pre-TRA-2269 build', () => {
+    // The route is unauthenticated and read by scripts that cannot see which
+    // bytes answered them. Absence of this marker means the `p99Under30s` in
+    // hand is the contaminated lifetime ratio.
+    const body = rollUpExitCadence(contaminatedFleet());
+    expect(body.window).toBe('rth');
+    expect(String(body.note)).toContain('window');
+  });
+
+  it('the mounted route carries the graded fields and the marker through to the payload', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      exitCadence: () => contaminatedFleet(),
+    });
+    const handlers = routes.get('/api/health/exit-cadence')!;
+    expect(handlers).toHaveLength(1);  // unauthenticated, like the rest of /api/health/*
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.window).toBe('rth');
+    expect(body.p99Under30s).toBe(true);
+    expect((body.lifetime as Record<string, unknown>).p99Under30s).toBe(false);
+    expect((body.engines as unknown[]).length).toBe(1);
   });
 });

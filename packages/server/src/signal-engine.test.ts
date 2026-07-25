@@ -63,7 +63,7 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
 import { isStockMarketOpen } from '@trading-app/shared'; // TRA-2257
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
@@ -6891,5 +6891,150 @@ describe('TRA-2200 — exit-interval histogram (bucketExitInterval)', () => {
     const h = emptyExitIntervalHistogram();
     expect(Object.keys(h).sort()).toEqual([...EXIT_INTERVAL_BUCKETS].sort());
     expect(Object.values(h).every((n) => n === 0)).toBe(true);
+  });
+});
+
+describe('TRA-2269 — an interval belongs to the window BOTH its endpoints sat in (classifyExitInterval)', () => {
+  it('grades an interval only when BOTH endpoints were inside RTH', () => {
+    expect(classifyExitInterval(true, true)).toBe('rth');
+  });
+
+  it('EXCLUDES the pure closed-market interval — this is the contamination itself', () => {
+    // The measured 2026-07-24 post-close state: doTick keeps stamping at ~30s
+    // while the decoupled timer refuses on `marketClosed`, and 57% of those
+    // intervals land AT OR ABOVE the 30s bar. ~21.7 min of them was enough to
+    // force `p99Under30s` FALSE over a perfect 6.5h RTH.
+    expect(classifyExitInterval(false, false)).toBe('closed');
+  });
+
+  it('EXCLUDES both boundary straddles — half of such an interval lived in a window the timer may not run in', () => {
+    expect(classifyExitInterval(false, true)).toBe('boundary');  // the 09:30 open
+    expect(classifyExitInterval(true, false)).toBe('boundary');  // the 16:00 close
+  });
+
+  it('the three bins PARTITION: every (prev, now) pair lands in exactly one, so nothing is dropped in silence', () => {
+    const pairs: Array<[boolean | null, boolean]> = [
+      [true, true], [true, false], [false, true], [false, false], [null, true], [null, false],
+    ];
+    const seen = pairs.map(([p, n]) => classifyExitInterval(p, n));
+    expect(seen).toHaveLength(pairs.length);
+    expect(seen.every((c) => c === 'rth' || c === 'boundary' || c === 'closed')).toBe(true);
+    // Exactly one qualifying case out of the six. A filter that admitted more
+    // than this would be readmitting the contamination it was written to remove.
+    expect(seen.filter((c) => c === 'rth')).toHaveLength(1);
+  });
+});
+
+describe('TRA-2269 — the WIRING: stampExitPass routes each interval to the right histogram', () => {
+  // `classifyExitInterval` being correct proves nothing on its own — the number
+  // the route publishes comes from which accumulator `stampExitPass` actually
+  // increments. Drive the real method on a real engine over a real clock so the
+  // predicate under test is the shipped `isStockMarketOpen`, not a stub of it.
+  //
+  // 2026-07-27 is a Monday. EDT = UTC-4, so 13:30Z-20:00Z is the RTH session.
+  const RTH_A = Date.parse('2026-07-27T15:00:00Z');
+  const CLOSED_A = Date.parse('2026-07-27T21:00:00Z');
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** Stamp a pass at each instant, in order, and return the resulting readout. */
+  function stampAt(instants: Array<{ at: number; source: 'tick' | 'decoupled' }>) {
+    vi.useFakeTimers();
+    const engine = new SignalEngine();
+    const stamp = (engine as unknown as {
+      stampExitPass: (s: 'tick' | 'decoupled') => void;
+    }).stampExitPass.bind(engine);
+    for (const s of instants) {
+      vi.setSystemTime(new Date(s.at));
+      stamp(s.source);
+    }
+    return engine.getExitCadenceHealth();
+  }
+
+  const total = (h: Record<string, number>) => Object.values(h).reduce((n, v) => n + v, 0);
+
+  it('an interval between two RTH passes lands in the RTH histogram AND in the lifetime one', () => {
+    const h = stampAt([
+      { at: RTH_A, source: 'decoupled' },
+      { at: RTH_A + 10_000, source: 'decoupled' },
+    ]);
+    expect(total(h.intervalHistogram)).toBe(1);
+    expect(total(h.rth.intervalHistogram)).toBe(1);
+    expect(h.rth.intervalHistogram.lt15s).toBe(1);
+    expect(h.rth.decoupledPassCount).toBe(1);
+    expect(h.rth.tickPassCount).toBe(0);
+    expect(h.rth.boundaryIntervals).toBe(0);
+    expect(h.rth.closedIntervals).toBe(0);
+  });
+
+  it('THE CONTAMINATION: an interval between two CLOSED-market passes reaches the lifetime histogram and NOT the graded one', () => {
+    // This is the whole defect. Pre-TRA-2269 this 30s interval — doTick's
+    // closed-market cadence, sitting dead on the bar — was counted in the
+    // numerator of a ratio that is supposed to grade a 10s timer.
+    const h = stampAt([
+      { at: CLOSED_A, source: 'tick' },
+      { at: CLOSED_A + 30_000, source: 'tick' },
+    ]);
+    expect(total(h.intervalHistogram)).toBe(1);
+    expect(h.intervalHistogram.lt60s).toBe(1);          // AT the 30s bar
+    expect(total(h.rth.intervalHistogram)).toBe(0);     // ...and graded by nothing
+    expect(h.rth.closedIntervals).toBe(1);
+    expect(h.rth.decoupledPassCount).toBe(0);
+    expect(h.rth.tickPassCount).toBe(0);
+  });
+
+  it('an interval straddling the close is scored as a BOUNDARY, not silently dropped', () => {
+    const h = stampAt([
+      { at: Date.parse('2026-07-27T19:59:50Z'), source: 'decoupled' },  // inside RTH
+      { at: Date.parse('2026-07-27T20:00:10Z'), source: 'tick' },       // after the close
+    ]);
+    expect(total(h.intervalHistogram)).toBe(1);
+    expect(total(h.rth.intervalHistogram)).toBe(0);
+    expect(h.rth.boundaryIntervals).toBe(1);
+    expect(h.rth.closedIntervals).toBe(0);
+  });
+
+  it('a tick pass that closes an RTH interval is scored to rth.tickPassCount — that is what the purity gate reads', () => {
+    const h = stampAt([
+      { at: RTH_A, source: 'decoupled' },
+      { at: RTH_A + 12_000, source: 'tick' },
+    ]);
+    expect(h.rth.tickPassCount).toBe(1);
+    expect(h.rth.decoupledPassCount).toBe(0);
+  });
+
+  it('THE PUBLISHED INVARIANT HOLDS over a mixed session: lifetime === rth + boundary + closed', () => {
+    // A full arc: closed pre-open -> the open boundary -> RTH -> the close
+    // boundary -> closed. Seven passes, six intervals, and every one of them
+    // must land in exactly one bin or the route\'s `partitionHolds` is a lie.
+    const h = stampAt([
+      { at: Date.parse('2026-07-27T13:00:00Z'), source: 'tick' },
+      { at: Date.parse('2026-07-27T13:00:30Z'), source: 'tick' },       // closed
+      { at: Date.parse('2026-07-27T13:30:05Z'), source: 'decoupled' },  // boundary (open)
+      { at: Date.parse('2026-07-27T13:30:15Z'), source: 'decoupled' },  // rth
+      { at: Date.parse('2026-07-27T13:30:25Z'), source: 'decoupled' },  // rth
+      { at: Date.parse('2026-07-27T20:00:05Z'), source: 'tick' },       // boundary (close)
+      { at: Date.parse('2026-07-27T20:00:35Z'), source: 'tick' },       // closed
+    ]);
+    const lifetime = total(h.intervalHistogram);
+    expect(lifetime).toBe(6);
+    expect(total(h.rth.intervalHistogram)).toBe(2);
+    expect(h.rth.boundaryIntervals).toBe(2);
+    expect(h.rth.closedIntervals).toBe(2);
+    expect(lifetime).toBe(
+      total(h.rth.intervalHistogram) + h.rth.boundaryIntervals + h.rth.closedIntervals,
+    );
+    // And the graded population excludes both 30s closed-market intervals that
+    // the lifetime histogram is carrying.
+    expect(h.intervalHistogram.lt60s).toBe(2);
+    expect(h.rth.intervalHistogram.lt60s).toBe(0);
+  });
+
+  it('the FIRST pass creates no interval — there is no predecessor to measure against', () => {
+    const h = stampAt([{ at: RTH_A, source: 'decoupled' }]);
+    expect(total(h.intervalHistogram)).toBe(0);
+    expect(total(h.rth.intervalHistogram)).toBe(0);
+    expect(h.rth.boundaryIntervals).toBe(0);
+    expect(h.rth.closedIntervals).toBe(0);
   });
 });

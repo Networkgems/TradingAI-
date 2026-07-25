@@ -225,6 +225,14 @@ async function pullExitArm() {
       engineCount: b.engineCount ?? 0,
       armedEngineCount: b.armedEngineCount ?? 0,
       modes: modes.length ? `mode=${modes.join('+')}` : 'mode unknown',
+      // TRA-2269 — `p99Under30s` is meaningless without the population it was
+      // computed over and without the route's own refusal flag. `window` is
+      // absent on any build before TRA-2269, and there it is a LIFETIME-scoped
+      // ratio contaminated by closed-market intervals; carry it through
+      // explicitly rather than letting `undefined` read as "fine".
+      window: b.window ?? 'lifetime_pre_tra2269',
+      gradeable: b.gradeable ?? null,
+      notGradeableReason: b.notGradeableReason ?? null,
       p99Under30s: b.p99Under30s ?? null,
       maxExitIntervalMs: b.maxExitIntervalMs ?? null,
       // The instant this reading describes. Compared against the window below.
