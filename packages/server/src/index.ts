@@ -2501,6 +2501,14 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       addCount: h.addCount,
       breachCount: h.breachCount,
       lastAddAt: h.lastAddAt,
+      // TRA-2265 — name the per-class split at boot. The pooled pair above cannot
+      // distinguish "the equity R-cap held" from "the equity add path never ran";
+      // equityAddCount is the number that separates them.
+      equityAddCount: h.byClass.equity.addCount,
+      equityBreachCount: h.byClass.equity.breachCount,
+      optionAddCount: h.byClass.option.addCount,
+      optionBreachCount: h.byClass.option.breachCount,
+      unknownClassAddCount: h.byClass.unknown.addCount,
     });
   }
 }

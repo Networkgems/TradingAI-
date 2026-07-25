@@ -76,6 +76,96 @@ export interface ConvictionDcaFill {
   reason: string;
 }
 
+// ── Partitioned counters (TRA-2265) ──────────────────────────────────────────
+//
+// The pooled addCount/breachCount above fold the equity and option add legs into
+// ONE number — but the two legs are checked by DIFFERENT rules at the fill site:
+//   • equity (signal-engine `evaluateConvictionDcaAdds`)       → (blended−stop)·qty ≤ R
+//   • option (signal-engine `evaluateOptionConvictionDcaAdds`) → Σ premium ≤ R, stop null
+// The TRA-971 promotion gate reads these numbers as evidence about the EQUITY
+// R-cap. With 100/100 retained fills `assetClass:"option"`, a pooled
+// `breachCount: 0` reads byte-identical whether the equity cap held across
+// hundreds of fills or the equity add path never executed once — the pooled
+// counter has no failing state for the leg that never fires.
+//
+// These per-class / per-mode buckets are the separator. Every bucket key is
+// ALWAYS present, so an equity zero is a STATED zero (`addCount: 0`) rather than
+// an absent key a reader could mistake for "not partitioned yet".
+//
+// STRICTLY OBSERVE-ONLY: no entry/exit/scale-in path reads them.
+
+/** Per-partition counters — the same four fields the pooled summary reports. */
+export interface ConvictionDcaBucket {
+  addCount: number;
+  breachCount: number;
+  firstAddAt: number | null;
+  lastAddAt: number | null;
+}
+
+/**
+ * `unknown` is deliberate. A JSONL line predating (or violating) the assetClass
+ * contract must NOT be silently folded into `equity` — that would manufacture
+ * exactly the false positive this partition exists to kill. It lands in its own
+ * bucket instead, so `equity + option + unknown === addCount` always holds and a
+ * dropped/malformed class is VISIBLE rather than absorbed.
+ */
+export type ConvictionDcaClassKey = 'equity' | 'option' | 'unknown';
+export type ConvictionDcaModeKey = 'demo' | 'live' | 'unknown';
+
+export type ConvictionDcaClassBuckets = Record<ConvictionDcaClassKey, ConvictionDcaBucket>;
+export type ConvictionDcaModeBuckets = Record<ConvictionDcaModeKey, ConvictionDcaBucket>;
+
+function emptyBucket(): ConvictionDcaBucket {
+  return { addCount: 0, breachCount: 0, firstAddAt: null, lastAddAt: null };
+}
+
+function emptyClassBuckets(): ConvictionDcaClassBuckets {
+  return { equity: emptyBucket(), option: emptyBucket(), unknown: emptyBucket() };
+}
+
+function emptyModeBuckets(): ConvictionDcaModeBuckets {
+  return { demo: emptyBucket(), live: emptyBucket(), unknown: emptyBucket() };
+}
+
+function classKeyOf(fill: ConvictionDcaFill): ConvictionDcaClassKey {
+  return fill.assetClass === 'equity' || fill.assetClass === 'option' ? fill.assetClass : 'unknown';
+}
+
+function modeKeyOf(fill: ConvictionDcaFill): ConvictionDcaModeKey {
+  return fill.mode === 'demo' || fill.mode === 'live' ? fill.mode : 'unknown';
+}
+
+/** Fold one fill into one bucket — same arithmetic as the pooled counters. */
+function foldIntoBucket(bucket: ConvictionDcaBucket, fill: ConvictionDcaFill): void {
+  bucket.addCount += 1;
+  if (isBreach(fill)) bucket.breachCount += 1;
+  if (bucket.firstAddAt == null || fill.ts < bucket.firstAddAt) bucket.firstAddAt = fill.ts;
+  if (bucket.lastAddAt == null || fill.ts > bucket.lastAddAt) bucket.lastAddAt = fill.ts;
+}
+
+/** Copy the module buckets so a summary caller can never mutate ledger state. */
+function cloneBuckets<K extends string>(
+  buckets: Record<K, ConvictionDcaBucket>,
+): Record<K, ConvictionDcaBucket> {
+  const out = {} as Record<K, ConvictionDcaBucket>;
+  for (const key of Object.keys(buckets) as K[]) out[key] = { ...buckets[key] };
+  return out;
+}
+
+/** Re-derive both partitions over an explicit fill list (the anchored path). */
+function foldBuckets(fills: readonly ConvictionDcaFill[]): {
+  byClass: ConvictionDcaClassBuckets;
+  byMode: ConvictionDcaModeBuckets;
+} {
+  const cls = emptyClassBuckets();
+  const mode = emptyModeBuckets();
+  for (const f of fills) {
+    foldIntoBucket(cls[classKeyOf(f)], f);
+    foldIntoBucket(mode[modeKeyOf(f)], f);
+  }
+  return { byClass: cls, byMode: mode };
+}
+
 // ── In-memory store (backs GET /api/health/conviction-dca) ───────────────────
 //
 // Module-global + observe-only. `dataDir` is set once at boot by
@@ -89,6 +179,8 @@ let breachCount = 0;
 let firstAddAt: number | null = null;
 let lastAddAt: number | null = null;
 const recentFills: ConvictionDcaFill[] = [];
+let byClass = emptyClassBuckets();
+let byMode = emptyModeBuckets();
 
 export function convictionDcaLogPath(dir: string): string {
   return join(dir, CONVICTION_DCA_LOG_FILENAME);
@@ -102,6 +194,8 @@ export function clearConvictionDcaLedger(): void {
   firstAddAt = null;
   lastAddAt = null;
   recentFills.length = 0;
+  byClass = emptyClassBuckets();
+  byMode = emptyModeBuckets();
 }
 
 function isBreach(fill: ConvictionDcaFill): boolean {
@@ -114,6 +208,8 @@ function applyFill(fill: ConvictionDcaFill): void {
   if (isBreach(fill)) breachCount += 1;
   if (firstAddAt == null || fill.ts < firstAddAt) firstAddAt = fill.ts;
   if (lastAddAt == null || fill.ts > lastAddAt) lastAddAt = fill.ts;
+  foldIntoBucket(byClass[classKeyOf(fill)], fill);
+  foldIntoBucket(byMode[modeKeyOf(fill)], fill);
   recentFills.push(fill);
   while (recentFills.length > MAX_RECENT_FILLS) recentFills.shift();
 }
@@ -149,6 +245,9 @@ export interface ConvictionDcaHydration {
   breachCount: number;
   firstAddAt: number | null;
   lastAddAt: number | null;
+  /** TRA-2265 — the same counts partitioned, rebuilt from the FULL JSONL. */
+  byClass: ConvictionDcaClassBuckets;
+  byMode: ConvictionDcaModeBuckets;
 }
 
 /**
@@ -185,7 +284,14 @@ export function hydrateConvictionDcaFromDisk(dir: string): ConvictionDcaHydratio
       }
     }
 
-    return { addCount, breachCount, firstAddAt, lastAddAt };
+    return {
+      addCount,
+      breachCount,
+      firstAddAt,
+      lastAddAt,
+      byClass: cloneBuckets(byClass),
+      byMode: cloneBuckets(byMode),
+    };
   });
 }
 
@@ -219,6 +325,15 @@ export interface ConvictionDcaSummary {
   lastAddAt: number | null;
   /** The deploy anchor applied to the counts (ms epoch), or null for all-time. */
   deployAnchor: number | null;
+  /**
+   * TRA-2265 — the SAME counts partitioned by asset class / book mode. Every key
+   * is always present, so `byClass.equity.addCount: 0` is a stated zero. Sums
+   * reconcile against the pooled counts in both branches:
+   *   Σ byClass[*].addCount === addCount === Σ byMode[*].addCount
+   * Observe-only: no decision path reads these.
+   */
+  byClass: ConvictionDcaClassBuckets;
+  byMode: ConvictionDcaModeBuckets;
   /** Most-recent fills, oldest→newest (capped tail). */
   recent: ConvictionDcaFill[];
 }
@@ -232,12 +347,18 @@ export interface ConvictionDcaSummary {
  */
 export function summarizeConvictionDca(deployAnchor: number | null = null): ConvictionDcaSummary {
   if (deployAnchor == null) {
+    // Both the pooled counts AND the partitions come from the monotonic
+    // boot-hydrated counters here — i.e. the FULL JSONL, not the 50-fill tail.
+    // Re-deriving byClass from `recentFills` would reproduce the very blindness
+    // this partition exists to remove, at a new name.
     return {
       addCount,
       breachCount,
       firstAddAt,
       lastAddAt,
       deployAnchor: null,
+      byClass: cloneBuckets(byClass),
+      byMode: cloneBuckets(byMode),
       recent: recentFills.slice(-MAX_RECENT_FILLS),
     };
   }
@@ -254,12 +375,18 @@ export function summarizeConvictionDca(deployAnchor: number | null = null): Conv
     if (first == null || f.ts < first) first = f.ts;
     if (last == null || f.ts > last) last = f.ts;
   }
+  // Partitions re-derive over the SAME anchored tail the pooled counts above use,
+  // so the sum reconciliation holds in this branch too — and inherits exactly the
+  // tail-cap caveat already documented for the pooled anchored counts (no more).
+  const { byClass: anchoredByClass, byMode: anchoredByMode } = foldBuckets(anchored);
   return {
     addCount: anchored.length,
     breachCount: breaches,
     firstAddAt: first,
     lastAddAt: last,
     deployAnchor,
+    byClass: anchoredByClass,
+    byMode: anchoredByMode,
     recent: anchored.slice(-MAX_RECENT_FILLS),
   };
 }

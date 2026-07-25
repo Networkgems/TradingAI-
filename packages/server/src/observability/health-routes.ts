@@ -1542,6 +1542,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // reading a structural 0. `enabled` mirrors CONVICTION_DCA.enabled. Carries no
   // balances/PII beyond symbol + per-fill R math. Always read-only: pure accounting,
   // NO entry/exit/scale-in path is touched.
+  //
+  // TRA-2265 — the spread now also carries `byClass` (equity/option/unknown) and
+  // `byMode` (demo/live/unknown), the SAME counts partitioned and hydrated from the
+  // full JSONL. Grade the equity promotion gate off `byClass.equity`, NEVER the
+  // pooled pair: the equity and option add legs are checked by different rules
+  // (equity `(blended−stop)·qty ≤ R` vs option `Σ premium ≤ R`), so a pooled
+  // `breachCount: 0` reads byte-identical whether the equity cap held or the equity
+  // add path never executed. As of the TRA-2263 fire, 100/100 retained fills are
+  // `assetClass:"option"` — so `byClass.equity.addCount` is the count that separates.
   app.get('/api/health/conviction-dca', (_req, res) => {
     res.json({
       ok: true,
