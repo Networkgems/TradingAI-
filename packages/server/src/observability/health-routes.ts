@@ -1824,6 +1824,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // `breachCount: 0` reads byte-identical whether the equity cap held or the equity
   // add path never executed. As of the TRA-2263 fire, 100/100 retained fills are
   // `assetClass:"option"` — so `byClass.equity.addCount` is the count that separates.
+  //
+  // TRA-2303 — `countsBasis` / `countsExact` say where the counts came from. Setting
+  // CONVICTION_DCA_DEPLOY_ANCHOR used to flip every count onto the 50-fill display
+  // tail, silently zeroing `byClass.equity` (all 3 equity fills are on the ledger's
+  // first day, ~18 days behind the tail). Both branches are exact over the full
+  // ledger now. `recent` is a DISPLAY tail — never grade a count off it, and treat
+  // `countsExact: false` as un-gradeable rather than as a zero.
   app.get('/api/health/conviction-dca', (_req, res) => {
     res.json({
       ok: true,

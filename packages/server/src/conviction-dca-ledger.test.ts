@@ -326,6 +326,100 @@ describe('summarizeConvictionDca byClass / byMode (TRA-2265)', () => {
     expect(sumBuckets(anchored.byClass, 'breachCount')).toBe(anchored.breachCount);
   });
 
+  // ── TRA-2303 — the anchored branch must not re-derive over the display tail ──
+  //
+  // Live shape this reproduces (bqb1, 2026-07-25): 600 fills over 18.3 days
+  // (32.8/day), all 3 equity fills on day one, a 50-fill tail reaching back ~1.5
+  // days. Setting CONVICTION_DCA_DEPLOY_ANCHOR to ANY pre-ledger value therefore
+  // dropped byClass.equity.addCount from 3 to 0 — honestly (sums still reconciled),
+  // which is what made it undetectable.
+  //
+  // Prove-it-fires by mutation: restore `MAX_RETAINED_FILLS = 50` (or point the
+  // anchored filter back at a 50-fill tail) and this case goes red on the equity
+  // assertion — 3 → 0. The sum-reconciliation assertions below stay GREEN under
+  // that mutation, which is the whole point: reconciliation cannot detect this.
+  it('sees the early minority-class fills under an anchor, far outside the 50-fill tail', () => {
+    hydrateConvictionDcaFromDisk(dir);
+    // Day one: the 3 equity fills — the only evidence the TRA-971 gate can grade.
+    const dayOne = 1_783_348_961_134; // 2026-07-06T13:36Z, the live firstAddAt
+    for (let i = 0; i < 3; i += 1) {
+      recordConvictionDcaFill(fill({ ts: dayOne + i * 1_000, assetClass: 'equity' }));
+    }
+    // Then 597 option fills over the following ~18 days, burying them far past 50.
+    for (let i = 0; i < 597; i += 1) {
+      recordConvictionDcaFill(
+        fill({ ts: dayOne + 86_400_000 + i * 2_600_000, assetClass: 'option', stop: null, symbol: 'SPY' }),
+      );
+    }
+
+    const unanchored = summarizeConvictionDca();
+    expect(unanchored.addCount).toBe(600);
+    expect(unanchored.byClass.equity.addCount).toBe(3);
+    expect(unanchored.countsBasis).toBe('monotonic-full');
+
+    // An anchor set BEFORE the first fill must be a no-op on every count.
+    const anchored = summarizeConvictionDca(dayOne - 86_400_000);
+    expect(anchored.byClass.equity.addCount).toBe(3); // ← 0 under the old tail derivation
+    expect(anchored.byClass.equity.firstAddAt).toBe(dayOne);
+    expect(anchored.addCount).toBe(600);
+    expect(anchored.byClass.option.addCount).toBe(597);
+    expect(anchored.countsBasis).toBe('retained-full');
+    expect(anchored.countsExact).toBe(true);
+    expect(anchored.droppedFillCount).toBe(0);
+
+    // The pre-anchor branch and the anchored branch must agree exactly — the
+    // stronger statement, and the one a gate reader actually relies on.
+    expect(anchored.byClass).toEqual(unanchored.byClass);
+    expect(anchored.byMode).toEqual(unanchored.byMode);
+    expect(anchored.breachCount).toBe(unanchored.breachCount);
+
+    // Still reconciles (it always did — that is why this was invisible).
+    expect(sumBuckets(anchored.byClass, 'addCount')).toBe(anchored.addCount);
+
+    // `recent` stays a 50-fill DISPLAY tail; it is no longer the count basis.
+    expect(anchored.recent).toHaveLength(50);
+  });
+
+  it('survives a restart — the anchored partition rehydrates from the full JSONL', () => {
+    hydrateConvictionDcaFromDisk(dir);
+    const dayOne = 1_783_348_961_134;
+    recordConvictionDcaFill(fill({ ts: dayOne, assetClass: 'equity' }));
+    for (let i = 0; i < 120; i += 1) {
+      recordConvictionDcaFill(fill({ ts: dayOne + 86_400_000 + i * 1_000, assetClass: 'option', stop: null }));
+    }
+
+    hydrateConvictionDcaFromDisk(dir); // simulated reboot — re-reads the JSONL
+    const anchored = summarizeConvictionDca(dayOne - 1);
+    expect(anchored.addCount).toBe(121);
+    expect(anchored.byClass.equity.addCount).toBe(1);
+    expect(anchored.countsExact).toBe(true);
+  });
+
+  it('marks anchored counts INEXACT once retention truncates — no silent short count', () => {
+    clearConvictionDcaLedger(); // no dataDir: counters only, skip 25k sync appends
+    const base = 1_000_000;
+    // One equity fill first, then enough option fills to push past MAX_RETAINED_FILLS
+    // (25 000) and evict it. No dataDir writes are asserted here; this is the cap.
+    recordConvictionDcaFill(fill({ ts: base, assetClass: 'equity' }));
+    for (let i = 0; i < 25_000; i += 1) {
+      recordConvictionDcaFill(fill({ ts: base + 1_000 + i, assetClass: 'option', stop: null }));
+    }
+
+    const anchored = summarizeConvictionDca(base - 1);
+    expect(anchored.droppedFillCount).toBeGreaterThan(0);
+    expect(anchored.countsBasis).toBe('retained-truncated');
+    expect(anchored.countsExact).toBe(false);
+    // The count really IS short — which is exactly why it must be labelled.
+    expect(anchored.byClass.equity.addCount).toBe(0);
+
+    // The un-anchored branch is unaffected: monotonic counters stay exact and say so.
+    const unanchored = summarizeConvictionDca();
+    expect(unanchored.addCount).toBe(25_001);
+    expect(unanchored.byClass.equity.addCount).toBe(1);
+    expect(unanchored.countsExact).toBe(true);
+    expect(unanchored.countsBasis).toBe('monotonic-full');
+  });
+
   it('hands out a copy — a summary caller cannot mutate ledger state', () => {
     hydrateConvictionDcaFromDisk(dir);
     recordConvictionDcaFill(fill({ ts: 1_000, assetClass: 'equity' }));
