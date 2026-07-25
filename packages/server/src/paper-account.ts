@@ -52,6 +52,19 @@ export interface PaperAccountSnapshot {
    * snapshot written before the fix, and on books that never drifted.
    */
   cashRepair?: CashRepairRecord | null;
+  /**
+   * TRA-2323 — cumulative realized option P&L credited into this book by
+   * {@link PaperAccount.creditRealizedOptionsPnl}. Persisted so the figure
+   * telescopes correctly across restarts: the EOD snapshot writer recovers the
+   * STOCK-only leg of a day as `equityDelta − (credited_now − credited_at_open)`,
+   * and both endpoints of that subtraction have to survive a redeploy or the
+   * recovered leg silently absorbs the options leg.
+   *
+   * Absent on every snapshot written before this fix, which is exactly right:
+   * a pre-fix book's equity contains NO option P&L, so the counter genuinely
+   * starts at 0 and the first post-deploy window measures credits since boot.
+   */
+  optionsCredited?: number;
 }
 
 interface PaperAccountConfig {
@@ -82,6 +95,11 @@ export class PaperAccount {
    */
   private cashRepair: CashRepairRecord | null = null;
   /**
+   * TRA-2323 — cumulative realized option P&L credited into this book. See
+   * {@link creditRealizedOptionsPnl} and {@link PaperAccountSnapshot.optionsCredited}.
+   */
+  private optionsCredited = 0;
+  /**
    * TRA-1268 — per-position running state for the exit-risk rules, keyed by
    * position id: the favorable `extremeSinceEntry` (peak for longs / trough for
    * shorts) and the last chandelier `prevTrailStop` (so the trail only ratchets
@@ -110,6 +128,7 @@ export class PaperAccount {
     this.exitRiskState.clear();
     this.dailyPnl = 0;
     this.cashRepair = null;
+    this.optionsCredited = 0;
   }
 
   updateConfig(config: PaperAccountConfig): void {
@@ -128,6 +147,48 @@ export class PaperAccount {
     this.initialEquity = newInitialEquity;
     this.equity += delta;
     this.cash += delta;
+  }
+
+  /**
+   * TRA-2323 — book realized option P&L into the equity book.
+   *
+   * This is the bridge that did not exist. `PaperAccount` (the "Total Value"
+   * the dashboard shows, and the figure the engine sizes off) and
+   * `PaperOptionsAccount` were disjoint ledgers seeded from the same $2,000, so
+   * a profitable option round trip moved `optionsPnl` and left `totalEquity`
+   * exactly where it started — the whole of the parent's "we're using the same
+   * 2k everyday". Wired from {@link bindOptionsPnlToEquityBook}, which is the
+   * single place the sink is attached.
+   *
+   * **Equity and cash move together, by the same signed delta.** TRA-2301 is
+   * the standing lesson on what happens when those two disagree: the cash
+   * invariant is `cash == equity − committedCapital()`, and a realized option
+   * credit commits no equity capital, so moving both by `delta` leaves the
+   * invariant exactly as it found it (`gap` stays 0 on all 13 books). Moving
+   * equity alone would manufacture drift on every option close and hand
+   * {@link repairDriftedCash} a "repair" to make on a book that was never broken.
+   *
+   * **`dailyPnl` is deliberately NOT touched.** It is the STOCK-only realized
+   * leg (`pnl-reconciliation.ts` grades the identity `EOD.combinedPnl ==
+   * stock dailyPnl + day-only options realized`). Adding the options credit
+   * here would put the options leg on both sides of that sum and turn every
+   * option-trading day into a fresh reconciliation offender — the exact
+   * "the change moved a number it should not have" failure AC4 guards.
+   */
+  creditRealizedOptionsPnl(delta: number): void {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    this.equity += delta;
+    this.cash += delta;
+    this.optionsCredited += delta;
+  }
+
+  /**
+   * TRA-2323 — cumulative realized option P&L this book has absorbed. The EOD
+   * snapshot writer differences it across the day window to recover the
+   * stock-only leg from the equity delta.
+   */
+  getOptionsCredited(): number {
+    return this.optionsCredited;
   }
 
   getState(): AccountState {
@@ -525,6 +586,7 @@ export class PaperAccount {
       dailyPnl: this.dailyPnl,
       openPositions: Array.from(this.positions.values()),
       cashRepair: this.cashRepair,
+      optionsCredited: this.optionsCredited,
     };
   }
 
@@ -540,6 +602,10 @@ export class PaperAccount {
       this.positions.set(p.id, p);
     }
     this.cashRepair = snap.cashRepair ?? null;
+    // TRA-2323 — `?? 0` is the correct collapse here (contrast TRA-2302, where
+    // it hid a false zero): a snapshot written before this fix carries no
+    // option P&L in its equity, so its credited total genuinely IS 0.
+    this.optionsCredited = snap.optionsCredited ?? 0;
     this.repairDriftedCash();
   }
 

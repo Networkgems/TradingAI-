@@ -194,6 +194,7 @@ import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsA
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
 import { PaperOptionsAccount, type OptionTradeJournalSetup, type OptionExitRiskInput } from './options-account.js';
+import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   PENDING_CLOSE_REPRICE_STALENESS_MS,
@@ -2927,6 +2928,13 @@ export class SignalEngine {
         marketableOpenMtm,
       }),
     };
+    // TRA-2323 — route realized DEMO option P&L into the equity book. Both env
+    // buckets are bound: a demo-mode position can live in either (the sandbox
+    // bucket is the usual home, but `getStateForMode('demo')` folds both), and
+    // binding only one would leak P&L from whichever bucket was missed — the
+    // partially-routed book that reads identically to a correct one.
+    bindOptionsPnlToEquityBook(this.optionsAccounts.sandbox, this.account);
+    bindOptionsPnlToEquityBook(this.optionsAccounts.production, this.account);
     this.lastSettings = settings;
     if (settings) {
       // TRA-857 — username is unknown at construction (setAlertUsername runs
@@ -13541,6 +13549,11 @@ export class SignalEngine {
     return {
       equity: this.account.getState().totalEquity,
       optionsPnl: this.optionsAccount.getState().optionsPnl,
+      // TRA-2323 — cumulative realized option P&L absorbed into `equity` above.
+      // The EOD writer differences this across the day window to recover the
+      // STOCK-only leg, which is what `/api/health/pnl-reconciliation` grades.
+      // Without it the options leg lands on both sides of that identity.
+      optionsCreditedToEquity: this.account.getOptionsCredited(),
     };
   }
 

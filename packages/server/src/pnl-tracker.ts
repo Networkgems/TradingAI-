@@ -42,6 +42,23 @@ export interface DailySnapshot {
   optionsDailyPnlBucket?: number;
   /** TRA-2314 — option closes the durable journal recorded on this ET day for this book. */
   optionsDailyJournalCloses?: number;
+  /**
+   * TRA-2323 — `PaperAccount.getOptionsCredited()` as of this row: the CUMULATIVE
+   * realized option P&L absorbed into `closingEquity` since the fix went live.
+   *
+   * Exists so the stock-only leg stays recoverable. `dailyPnl` is written as the
+   * equity delta over the day window, and since TRA-2323 that delta contains the
+   * options leg too. Differencing this field against the previous row recovers
+   * exactly what was credited in the SAME window the delta spans — the two
+   * telescope, because `openingEquity` is the previous row's `closingEquity`.
+   * Deriving the subtraction from the journal or the daily bucket instead would
+   * re-introduce the TRA-2302/2314 disagreement between what was BOOKED and what
+   * was CREDITED; this measures the credit itself.
+   *
+   * Absent on rows written before this fix, treated as 0 — correct, because a
+   * pre-fix book's equity contains no option P&L at all.
+   */
+  optionsCreditedCumulative?: number;
   trades: number;
 }
 
@@ -290,6 +307,24 @@ export class PnlTracker {
 
   getSnapshots(): DailySnapshot[] {
     return [...this.snapshots];
+  }
+
+  /**
+   * TRA-2323 — the `optionsCreditedCumulative` baseline the next day's window
+   * differences against: the value on the most recent booked row, or 0 when no
+   * row carries one (a fresh book, or every row predating the fix).
+   *
+   * Reads the LAST row by date rather than "the row before today", to match how
+   * `openingEquity` telescopes — `saveSnapshot` sets `openingEquity` to the row
+   * it just closed, so the equity delta and this baseline span the same window
+   * even when a day is skipped (weekend, outage, a redeploy that ate a close).
+   */
+  getLastOptionsCreditedCumulative(): number {
+    for (let i = this.snapshots.length - 1; i >= 0; i--) {
+      const v = this.snapshots[i]?.optionsCreditedCumulative;
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+    }
+    return 0;
   }
 
   private persistState(): void {

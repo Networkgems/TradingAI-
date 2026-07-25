@@ -1442,12 +1442,29 @@ async function generateAndSaveReport(
   // live daily-P&L baseline.
   if (!backfill) {
     const equitySnap = ctx.engine.getEquitySnapshot();
+    // TRA-2323 — realized option P&L now lands in `PaperAccount` equity (that is
+    // the whole fix: "Total Value" has to compound). `dailyPnl` below is the
+    // equity delta, so WITHOUT this subtraction the options leg would be counted
+    // on both sides of the reconciliation identity
+    // (`EOD.combinedPnl == stock dailyPnl + day-only options realized`) and every
+    // option-trading day would become a fresh offender — the AC4 tripwire.
+    //
+    // The subtraction measures the CREDIT itself, differenced over the same
+    // window the equity delta spans, so it is exact by construction: it cannot
+    // drift from the journal-vs-bucket disagreement TRA-2302/2314 fought over.
+    // On a book with no option credits this is `- 0`, i.e. bit-identical to the
+    // pre-TRA-2323 line.
+    const optionsCreditedInWindow =
+      equitySnap.optionsCreditedToEquity - ctx.tracker.getLastOptionsCreditedCumulative();
+    const stockOnlyDailyPnl =
+      (equitySnap.equity - ctx.tracker.getOpeningEquity()) - optionsCreditedInWindow;
     ctx.tracker.saveSnapshot({
       date: finalReport.date,
       openingEquity: ctx.tracker.getOpeningEquity(),
       closingEquity: equitySnap.equity,
-      dailyPnl: equitySnap.equity - ctx.tracker.getOpeningEquity(),
+      dailyPnl: stockOnlyDailyPnl,
       optionsPnl: equitySnap.optionsPnl,
+      optionsCreditedCumulative: equitySnap.optionsCreditedToEquity,
       // TRA-1633 BUG 2 — persist the DAY-ONLY realized options figure (the same
       // `finalReport.optionsPnl` the calendar cell uses = Σ options closed this
       // ET day) so the weekly/monthly/yearly windows sum day-only, not the
@@ -1471,7 +1488,14 @@ async function generateAndSaveReport(
       // `dailyPnl + optionsDailyPnl`. Nothing reads it for the board's
       // weekly/monthly/yearly sums, and moving a second number in the same
       // change would make this correction unreadable as one.
-      combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
+      // TRA-2323 — uses the STOCK-only leg, which keeps this field numerically
+      // identical to what it held before option P&L reached equity. The raw
+      // equity delta would now carry the options leg, so leaving it alone would
+      // have silently changed a board-facing number under cover of a fix aimed
+      // at a different one. The cumulative-options wart TRA-1633 BUG 2 left
+      // standing is preserved deliberately: correcting it here would move a
+      // second number in the same change and make neither correction readable.
+      combinedPnl: stockOnlyDailyPnl + equitySnap.optionsPnl,
       trades: finalSnapshot.allClosedPositions.length,
     });
   }

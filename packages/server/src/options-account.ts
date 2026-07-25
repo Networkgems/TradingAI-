@@ -970,7 +970,7 @@ export class PaperOptionsAccount {
    * `Paper entry` for un-enterable ideas instead of dangling a click that 409s.
    */
   getEquity(): number {
-    return this.equity;
+    return this.sizingEquity();
   }
 
   /** Current options daily cap — exposed so the UI can render a count badge. */
@@ -1011,6 +1011,76 @@ export class PaperOptionsAccount {
     this.initialEquity = newInitialEquity;
     this.equity += delta;
     this.cash += delta;
+  }
+
+  /**
+   * TRA-2323 — notified on every realized options P&L accrual, with the mode
+   * the P&L was attributed to and the signed delta. Bound by
+   * {@link bindOptionsPnlToEquityBook} to credit the owning `PaperAccount`, so
+   * option profit actually reaches "Total Value" instead of accruing in a
+   * disjoint second book. Undefined for un-bound accounts (unit tests, the
+   * ambient engine), where the accrual behaves exactly as it did before.
+   */
+  private realizedPnlSink?: (mode: AccountMode, delta: number) => void;
+
+  /** TRA-2323 — bind the equity-book sink. See {@link bindOptionsPnlToEquityBook}. */
+  setRealizedPnlSink(sink: (mode: AccountMode, delta: number) => void): void {
+    this.realizedPnlSink = sink;
+  }
+
+  /**
+   * TRA-2323 — the owning equity book's total equity, when bound. See
+   * {@link sizingEquity} for why sizing must not read `this.equity`.
+   */
+  private equityBasisProvider?: () => number;
+
+  /** TRA-2323 — bind the sizing basis. See {@link bindOptionsPnlToEquityBook}. */
+  setEquityBasisProvider(provider: () => number): void {
+    this.equityBasisProvider = provider;
+  }
+
+  /**
+   * TRA-2323 — the equity every sizing decision measures against.
+   *
+   * This resolves the second half of the parent's bug. Routing realized P&L into
+   * `PaperAccount` (above) is only half the answer: the options bucket was ALSO
+   * constructed with `initialEquity: currentEquity` — the same $2,000 the stock
+   * book starts from — and compounded its own copy via `this.equity += pnl` on
+   * every close. Two books each claiming the same capital, and the one the
+   * options sizer read was the private copy, so growing "Total Value" would
+   * still not have grown a single position.
+   *
+   * Bound, this makes the equity book the SINGLE sizing authority, which is what
+   * makes the CEO's "moving forward you will use the bigger equity to trade"
+   * literally true. Note the two agree exactly on an options-only book (both are
+   * `2000 + realized`), so this is not a sizing step-change on day one — it only
+   * diverges as the stock leg contributes, which is the intent.
+   *
+   * Falls back to `this.equity` when un-bound so the standalone unit-test surface
+   * (and the ambient no-user engine) behaves exactly as before.
+   */
+  private sizingEquity(): number {
+    const bound = this.equityBasisProvider?.();
+    return typeof bound === 'number' && Number.isFinite(bound) ? bound : this.equity;
+  }
+
+  /**
+   * TRA-2323 — THE single mutation point for realized options P&L.
+   *
+   * Eleven call sites across the exit paths (full close, partial close, covered
+   * write settle, assignment, Tradier imported fills, reconcile) each did a
+   * bare `optionsPnlByMode[...] += ...`. Routing P&L to the equity book by
+   * patching them one at a time is the TRA-2210 "filter at SOME call sites"
+   * failure: the sites that got missed keep the old silent behaviour, and a
+   * partially-routed book is indistinguishable from a correctly-routed one by
+   * looking at any single close. Funnelling them all through here makes the
+   * conversion a greppable invariant instead of a review promise —
+   * `options-equity-bridge.test.ts` asserts no bare accrual survives outside
+   * this method.
+   */
+  private bookRealizedPnl(mode: AccountMode, delta: number): void {
+    this.optionsPnlByMode[mode] += delta;
+    if (delta !== 0) this.realizedPnlSink?.(mode, delta);
   }
 
   /** TRA-246 — total realized options P&L across both modes. */
@@ -1299,7 +1369,7 @@ export class PaperOptionsAccount {
    *     otherwise allow.
    */
   private sizingBudget(strategyBudgetRatio: number, equityOverride?: number): number {
-    const equity = equityOverride ?? this.equity;
+    const equity = equityOverride ?? this.sizingEquity();
     const ratio = equityOverride !== undefined ? this.riskPerTrade : strategyBudgetRatio;
     const pctBudget = equity * this.managedAccountRatio * ratio;
     const hardCap = perPositionCap(equity);
@@ -1910,7 +1980,7 @@ export class PaperOptionsAccount {
       typeof params.maxLossPctCap === 'number' && params.maxLossPctCap > 0
         ? params.maxLossPctCap
         : DEFAULT_MAX_LOSS_PCT_CAP;
-    const capUsd = maxLossCapUsd(this.equity, maxLossPctCap);
+    const capUsd = maxLossCapUsd(this.sizingEquity(), maxLossPctCap);
     const capLots = Math.floor(capUsd / maxLossPerLot);
     if (capLots >= 1 && contracts > capLots) contracts = capLots;
 
@@ -1933,7 +2003,7 @@ export class PaperOptionsAccount {
     // oversized orders (e.g. a single defined-risk lot whose max loss already
     // exceeds the per-trade governor ceiling of equity).
     const gate = evaluateMultiLegPreTrade({
-      accountEquity: this.equity,
+      accountEquity: this.sizingEquity(),
       optionBuyingPower: null,
       maxLossPerLot,
       contracts,
@@ -1951,7 +2021,7 @@ export class PaperOptionsAccount {
       // whose max loss already busts the per-trade governor ceiling. Surface the
       // exact figures so "Paper entry" no longer fails with a mystery 409.
       return this.rejectEntry(
-        `${gate.reason} — this defined-risk structure is too large for the per-trade risk budget on a $${this.equity.toFixed(0)} account`,
+        `${gate.reason} — this defined-risk structure is too large for the per-trade risk budget on a $${this.sizingEquity().toFixed(0)} account`,
       );
     }
 
@@ -2041,7 +2111,7 @@ export class PaperOptionsAccount {
    * never beyond it. Demo book sizes off `this.equity` (the paper equity).
    */
   riskBudgetPerPosition(): number {
-    return perPositionCap(this.equity);
+    return perPositionCap(this.sizingEquity());
   }
 
   /**
@@ -2050,7 +2120,7 @@ export class PaperOptionsAccount {
    * is allowed to deploy. Total open premium-at-risk above this blocks ALL adds.
    */
   managedEquity(): number {
-    return this.equity * this.managedAccountRatio;
+    return this.sizingEquity() * this.managedAccountRatio;
   }
 
   /**
@@ -2339,7 +2409,7 @@ export class PaperOptionsAccount {
     opt.currentPremium = closeMark;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
-    this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+    this.bookRealizedPnl(opt.mode ?? 'demo', pnl);
 
     // TRA-1978 — fold the realized outcome into the per-fill journal (no-op unless
     // the write was journaled at open). `expired` = kept the full credit; a
@@ -2381,7 +2451,7 @@ export class PaperOptionsAccount {
     // Keep the put credit as a realized gain; it returns to free cash.
     this.cash += credit;
     this.equity += credit;
-    this.optionsPnlByMode[mode] += credit;
+    this.bookRealizedPnl(mode, credit);
 
     // The reserved collateral becomes the assigned shares (held at cost = strike);
     // the effective basis nets out the credit for the guard floors.
@@ -2434,7 +2504,7 @@ export class PaperOptionsAccount {
     this.cash += proceeds + ccCredit;
     this.equity += stockPnl + ccCredit;
     const realized = r2(stockPnl + ccCredit);
-    this.optionsPnlByMode[mode] += realized;
+    this.bookRealizedPnl(mode, realized);
 
     // The shares are gone — drop the lot and close the call record.
     this.assignedShares.delete(lot.id);
@@ -2640,7 +2710,7 @@ export class PaperOptionsAccount {
         const ccPnl = r2(ccCredit - buybackPerShare * 100 * contracts);
         this.cash += ccPnl;
         this.equity += ccPnl;
-        this.optionsPnlByMode[cc.mode ?? mode] += ccPnl;
+        this.bookRealizedPnl(cc.mode ?? mode, ccPnl);
         cc.pnl = (cc.pnl ?? 0) + ccPnl;
         cc.currentPremium = buybackPerShare;
         cc.closedAt = Date.now();
@@ -2659,7 +2729,7 @@ export class PaperOptionsAccount {
     const stockPnl = (marketPrice - lot.assignmentStrike) * 100 * contracts;
     this.cash += proceeds;
     this.equity += stockPnl;
-    this.optionsPnlByMode[mode] += stockPnl;
+    this.bookRealizedPnl(mode, stockPnl);
 
     accountLog.info('assigned shares liquidated', {
       lotId,
@@ -3095,7 +3165,7 @@ export class PaperOptionsAccount {
             opt.contractsRemaining = 0;
             this.cash += effectiveExit * remainingContracts * 100 - exitFee;
             this.equity += pnl - exitFee;
-            this.optionsPnlByMode[positionMode] += pnl - exitFee;
+            this.bookRealizedPnl(positionMode, pnl - exitFee);
             if (positionMode === 'demo') {
               this.demoSlippageCost += (mark - effectiveExit) * remainingContracts * 100;
               this.demoFeeCost += exitFee;
@@ -3155,7 +3225,7 @@ export class PaperOptionsAccount {
           // TRA-374 — fees are a cost, not a market outcome, so they reduce
           // the P&L bucket too (otherwise dashboard P&L would diverge from
           // cash drawdown).
-          this.optionsPnlByMode[positionMode] += partialPnl - exitFee;
+          this.bookRealizedPnl(positionMode, partialPnl - exitFee);
           if (positionMode === 'demo') {
             this.demoSlippageCost += (mark - effectiveExit) * exitContracts * 100;
             this.demoFeeCost += exitFee;
@@ -3293,7 +3363,7 @@ export class PaperOptionsAccount {
         this.cash += effectiveExit * remainingContracts * 100 - exitFee;
         this.equity += pnl - exitFee;
         // TRA-246 — see partial-exit comment above; same per-mode attribution.
-        this.optionsPnlByMode[positionMode] += pnl - exitFee;
+        this.bookRealizedPnl(positionMode, pnl - exitFee);
         if (positionMode === 'demo') {
           this.demoSlippageCost += (exitPremium - effectiveExit) * remainingContracts * 100;
           this.demoFeeCost += exitFee;
@@ -3563,7 +3633,7 @@ export class PaperOptionsAccount {
     if (!opt.importedFromTradier) {
       this.cash += price * exitContracts * 100;
       this.equity += pnl;
-      this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+      this.bookRealizedPnl(opt.mode ?? 'demo', pnl);
     } else {
       this.applyRealtimeImportedPnl(pnl);
     }
@@ -3970,7 +4040,7 @@ export class PaperOptionsAccount {
     if (!opt.importedFromTradier) {
       this.cash += avgFillPrice * slice * 100;
       this.equity += pnl;
-      this.optionsPnlByMode[opt.mode ?? 'demo'] += pnl;
+      this.bookRealizedPnl(opt.mode ?? 'demo', pnl);
     } else {
       this.applyRealtimeImportedPnl(pnl);
     }
@@ -4185,7 +4255,7 @@ export class PaperOptionsAccount {
     this.cash += effectiveExit * remainingContracts * 100 - exitFee;
     this.equity += pnl - exitFee;
     // TRA-246 — same per-mode attribution as the auto-exit paths above.
-    this.optionsPnlByMode[positionMode] += pnl - exitFee;
+    this.bookRealizedPnl(positionMode, pnl - exitFee);
     if (positionMode === 'demo') {
       this.demoSlippageCost += (closePrice - effectiveExit) * remainingContracts * 100;
       this.demoFeeCost += exitFee;
