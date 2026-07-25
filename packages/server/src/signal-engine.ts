@@ -180,7 +180,8 @@ import {
 // RISK_THROTTLE_SIZING_ENABLED; tighten-only by construction).
 import {
   type RiskThrottleSizingPath,
-  isRiskThrottleSizingEnabled,
+  riskThrottleSizingScope,
+  isRiskThrottleSizingArmedForPath,
   riskThrottleSizeMultiplier,
   recordRiskThrottleSizing,
 } from './risk-throttle-sizing.js';
@@ -5346,6 +5347,8 @@ export class SignalEngine {
       : this.account.openPosition(signal, price, this.activeRiskSizingMultiplier('equity_demo') * correlatedCapScale);
     if (pos) {
       pos.mode = this.mode;
+      // TRA-2333 — make this fill's throttle trim attributable (always stamped).
+      this.stampRiskThrottleOnPosition(pos);
       // TRA-1289 — carry the demo forward-test marker onto the position so
       // TRA-1242 accrual can distinguish these from gate-passed fills.
       if (signal.forwardTestOnly) pos.forwardTestOnly = true;
@@ -6475,6 +6478,9 @@ export class SignalEngine {
                     ...(isOptionVolumeBreakoutEnabled()
                       ? { entryArchetype: 'volume-breakout' }
                       : {}),
+                    // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar,
+                    // so no throttle term was applied to this ticket.
+                    riskThrottleMultiplier: 1,
                   };
                   const opened = this.optionsAccount.openDefinedRiskSpread(
                     shadowSignalToSpreadParams(selectorResult.signal, snap.spot),
@@ -6701,6 +6707,9 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
+          // TRA-2333 — the throttle term ALONE for the chokepoint that sizes this
+          // open (the `sizeMultiplier` below also carries `optionCapScale`).
+          riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
           // TRA-1183 — tag ema-pullback (Trend-Pullback) single-leg fills so they
           // are countable distinctly from bare single_leg_rv in the journal
           // rollup. `emaPullbackReason` is non-null only when the EMA-pullback
@@ -7396,6 +7405,10 @@ export class SignalEngine {
             sentiment: null,
             sentimentIcBand: null,
             agentConviction: null,
+            // TRA-2333 — the bounded-live test passes an explicit 1-contract
+            // override, which bypasses the sized-contract path entirely, so no
+            // throttle term reaches this ticket.
+            riskThrottleMultiplier: 1,
           };
           // Open exactly 1 contract on the paper book (bounded-test override bypasses
           // the $5k OTM min-equity gate + the 15% cap the $268 account can't clear);
@@ -7472,6 +7485,8 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
+          // TRA-2333 — the throttle term alone for the OTM chokepoint.
+          riskThrottleMultiplier: this.riskThrottleTermFor('options_otm'),
         };
         const opened = this.optionsAccount.openOptionFromCandidate(
           signal,
@@ -8422,6 +8437,10 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
+          // TRA-2333 — the throttle term alone for the directional sleeve's
+          // chokepoint. This is the sleeve TRA-2331 grades, so the stamp here is
+          // the one the partition actually runs on.
+          riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
           // TRA-1682 — THE load-bearing tag. `openOptionFromRvCandidate` journals
           // `structure: 'single_leg_rv'` unconditionally for all three of its callers,
           // so this sleeve — the dominant demo churner, ungated by the |Δ|≥0.45
@@ -9091,6 +9110,10 @@ export class SignalEngine {
       sentimentIcBand: null,
       agentConviction: null,
       entryArchetype: archetype,
+      // TRA-2333 — the wheel's CSP / covered-call opens take no sizing scalar
+      // and are not among the risk-throttle chokepoints, so no throttle term was
+      // applied to these tickets.
+      riskThrottleMultiplier: 1,
     };
   }
 
@@ -9162,6 +9185,8 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
+      // TRA-2333 — the throttle term alone for the iv-rv mispricing sleeve.
+      riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
       // Attribution hook: separates these fills from the RV sleeve in the
       // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
       entryArchetype: 'iv-rv-buy-premium',
@@ -9537,6 +9562,9 @@ export class SignalEngine {
                 // when no grade is available; never blocks the open.
                 sentimentIcBand: this.sentimentIcBandFor(sym),
                 agentConviction: null,
+                // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no
+                // throttle term was applied to this ticket.
+                riskThrottleMultiplier: 1,
               },
             );
             if (opened) {
@@ -11061,6 +11089,8 @@ export class SignalEngine {
       // TRA-231 — same rationale as the signal stamp above; the closed-
       // positions list is filtered per-mode in getState().
       pos.mode = this.mode;
+      // TRA-2333 — make this fill's throttle trim attributable (always stamped).
+      this.stampRiskThrottleOnPosition(pos);
       this.positionSignalType.set(pos.id, signal.type);
       this.emitFillAlert(pos, signal.type); // TRA-563 fill alert
       this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
@@ -12029,6 +12059,9 @@ export class SignalEngine {
         sentiment: null,
         sentimentIcBand: null,
         agentConviction: null,
+        // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no throttle
+        // term was applied to this ticket.
+        riskThrottleMultiplier: 1,
       };
       const combo = acct.openDefinedRiskSpread(
         {
@@ -12101,6 +12134,8 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
+      // TRA-2333 — the throttle term alone for the AI-ideas single-leg open.
+      riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
       // TRA-2245 — an AI-Options-Ideas single-leg directional entry, not the True
       // RV engine. Stamp the directional structure label rather than inheriting
       // the reserved `single_leg_rv` default.
@@ -13622,16 +13657,65 @@ export class SignalEngine {
    * trimmed before the board flips it — and, once armed, whether it ever did.
    */
   private activeRiskSizingMultiplier(path: RiskThrottleSizingPath): number {
-    const armed = isRiskThrottleSizingEnabled();
+    const scope = riskThrottleSizingScope();
+    // TRA-2333 — the arm decision is now made FROM THE PATH. Under `demo` the
+    // two live-broker chokepoints resolve `armed: false` and size at 1 while the
+    // paper paths trim; the consult is still counted either way, so the dark
+    // observation TRA-2331 step 1 depends on keeps working on both sides.
+    const armed = isRiskThrottleSizingArmedForPath(path, scope);
     const throttle = this.riskGovernor.getRiskThrottle();
     const mult = riskThrottleSizeMultiplier(throttle, armed);
     recordRiskThrottleSizing(path, { armed, throttle, multiplier: mult });
     return this.activeSizingMultiplier() * mult;
   }
 
+  /**
+   * TRA-2333 — the risk-throttle term ALONE for `path`, for stamping on the
+   * fill. Deliberately NOT the value {@link activeRiskSizingMultiplier} returns:
+   * that one is composed with `activeSizingMultiplier()` and the caller then
+   * multiplies it by the correlated-exposure cap scale, so stamping it would
+   * bury the throttle inside two unrelated trims and a cap-trimmed ticket would
+   * read as throttle-trimmed. The grade QuantTrader runs is a plain partition on
+   * `riskThrottleMultiplier < 1`, which is only meaningful if the field is the
+   * throttle term and nothing else.
+   *
+   * Pure — it does NOT record a consult, because the sizing call for the same
+   * ticket already did and double-counting would corrupt `consults`/`trims`. It
+   * reads the same governor state in the same synchronous block, so it returns
+   * exactly the term that was applied.
+   */
+  private riskThrottleTermFor(path: RiskThrottleSizingPath): number {
+    const armed = isRiskThrottleSizingArmedForPath(path, riskThrottleSizingScope());
+    return riskThrottleSizeMultiplier(this.riskGovernor.getRiskThrottle(), armed);
+  }
+
+  /**
+   * TRA-2333 — stamp the applied throttle term + arming scope onto a freshly
+   * opened equity position, the durable equity twin of the option journal's
+   * `riskThrottleMultiplier`. Called UNCONDITIONALLY on every signal-driven
+   * equity open, including when the term is exactly 1: a field written only on a
+   * trim would collapse "un-trimmed" into "stamp regressed" (TRA-2302's `?? 0`
+   * lesson), and absent has to keep meaning only "opened by a pre-TRA-2333
+   * build".
+   *
+   * The path matches the chokepoint that actually sized the position: the live
+   * book returns the local mirror of the broker bracket, the demo book its own
+   * paper open.
+   */
+  private stampRiskThrottleOnPosition(pos: Position): void {
+    const path: RiskThrottleSizingPath = this.mode === 'live' ? 'equity_live_mirror' : 'equity_demo';
+    pos.riskThrottleMultiplier = this.riskThrottleTermFor(path);
+    pos.riskThrottleArmedScope = riskThrottleSizingScope();
+  }
+
   /** TRA-1001 — test seam: the composed sizing scalar for a given chokepoint. */
   _riskSizingMultiplierForTests(path: RiskThrottleSizingPath): number {
     return this.activeRiskSizingMultiplier(path);
+  }
+
+  /** TRA-2333 — test seam: the stamped throttle term for a given chokepoint. */
+  _riskThrottleTermForTests(path: RiskThrottleSizingPath): number {
+    return this.riskThrottleTermFor(path);
   }
 
   /**

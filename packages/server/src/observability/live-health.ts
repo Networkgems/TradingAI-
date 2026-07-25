@@ -100,10 +100,16 @@ export interface LiveHealthSummary {
     /**
      * TRA-1001 — whether the throttle is CONSUMED by per-trade sizing, and how
      * often it has actually trimmed a ticket since boot. `throttled: true` with
-     * `sizing.armed: false` is the honest "de-risk decided, sizing unchanged"
-     * state that shipped with TRA-995; `armed: true, totalTrims: 0` means the
-     * consuming path has never seen a sub-1 throttle at an entry — NOT that it
-     * works. Absent when the caller didn't measure it.
+     * `sizing.armedScope: 'off'` is the honest "de-risk decided, sizing
+     * unchanged" state that shipped with TRA-995; an armed scope with
+     * `totalTrims: 0` means the consuming path has never seen a sub-1 throttle
+     * at an entry — NOT that it works. Absent when the caller didn't measure it.
+     *
+     * TRA-2333 — read `armedScope` (`off` | `demo` | `all`), not the removed
+     * `armed` boolean, and `byPath[x].armed` for the per-chokepoint bit. Under
+     * `demo` the two live-broker paths report `armed: false` and are pinned to
+     * multiplier 1; a reader that only checks a top-level boolean cannot tell a
+     * demo arm from a live one.
      */
     sizing?: RiskThrottleSizingSnapshot;
   };
@@ -218,9 +224,22 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
     // TRA-1001 — say whether the throttle is actually CONSUMED by sizing. An
     // unarmed consumer means the de-risk is advisory: the reader must not infer
     // "the firm is trading smaller" from a throttle alone.
-    const consumed = input.throttleSizing
-      ? (input.throttleSizing.armed ? '' : ' (sizing consumer DARK — tickets still size at full risk)')
-      : '';
+    // TRA-2333 — name the SCOPE, not a boolean. A demo-scoped arm and an
+    // all-scoped arm both used to render as "consumed", so this line could not
+    // tell a correctly-scoped arm from an accidental live one — and under `demo`
+    // a LIVE ticket is still sizing at full risk, which is the opposite of what
+    // an unqualified "consumed" tells the reader.
+    const consumed = (() => {
+      if (!input.throttleSizing) return '';
+      switch (input.throttleSizing.armedScope) {
+        case 'off':
+          return ' (sizing consumer DARK — tickets still size at full risk)';
+        case 'demo':
+          return ' (sizing consumer armed for DEMO only — live-broker tickets still size at full risk)';
+        case 'all':
+          return ' (sizing consumer armed for ALL paths, including the live broker)';
+      }
+    })();
     issues.push(
       `Risk autopilot throttled to ${(riskThrottle * 100).toFixed(0)}%${lastThrottle ? ` — ${lastThrottle.reason}` : ''}${consumed}`,
     );

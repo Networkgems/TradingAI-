@@ -4,6 +4,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
+import type { RiskThrottleSizingScope } from './risk-throttle-sizing.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -169,6 +170,34 @@ export interface OptionTradeJournalOpen {
    * routing and never crosses into the `live` book's learning.
    */
   account?: string;
+  /**
+   * TRA-2333 (parent TRA-2331) — the risk-autopilot throttle multiplier ACTUALLY
+   * APPLIED to this ticket's size, and the arming scope in force when it was
+   * sized. Together they make a trimmed fill *attributable*: the trimmed sleeve
+   * becomes gradeable by a plain partition on `riskThrottleMultiplier < 1`
+   * against the contemporaneous `=== 1` rows, joined to this row's own R, P&L,
+   * structure and archetype. Before this the multiplier existed only in the
+   * since-boot `byPath` counters, which say how MANY tickets were trimmed and
+   * never WHICH — and which lose everything before the last bqb1 restart.
+   *
+   * ALWAYS written by this build, including when the multiplier is exactly `1`.
+   * If it were written only on a trim, ABSENT would collapse into "un-trimmed"
+   * and a build where the stamp regressed would read identically to a calm
+   * market (TRA-2302's `?? 0` lesson). Optional on the TYPE because absent is a
+   * real and meaningful state in the ledger — it means exactly one thing:
+   * **the row was written by a build older than TRA-2333.** Rows without it must
+   * be excluded from a throttle grade, never defaulted to 1.
+   *
+   * Scope note: `1` is the honest value both for a consulted-but-untrimmed
+   * ticket AND for a structure whose open path does not consult the throttle at
+   * all (defined-risk spreads, the wheel's CSP/covered-call). Either way no trim
+   * was applied to this fill, so the partition is never wrong; "did this
+   * chokepoint consult?" is a different question and is answered by
+   * `autopilot.sizing.byPath` on `/api/health/live`.
+   */
+  riskThrottleMultiplier?: number;
+  /** TRA-2333 — arming scope in force when this ticket was sized. */
+  riskThrottleArmedScope?: RiskThrottleSizingScope;
 }
 
 /** The realized outcome, appended when the position closes. */

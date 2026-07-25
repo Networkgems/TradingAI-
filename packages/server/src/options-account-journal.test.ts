@@ -28,6 +28,7 @@ const setup: OptionTradeJournalSetup = {
   sentimentIcBand: 'strong', // TRA-993 — sentiment-IC GRADE band (signal skill)
   agentConviction: 0.8,
   entryDelta: 0.22,
+  riskThrottleMultiplier: 1, // TRA-2333 — un-throttled fixture fill
 };
 
 const bullPutLegs = [
@@ -135,6 +136,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       ivRank: 18,
       trend: 'down',
       sentiment: null,
+      riskThrottleMultiplier: 1,
     });
     expect(pos).not.toBeNull();
     const atRisk = pos!.contracts * pos!.premiumPaid * 100;
@@ -167,6 +169,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       ivRank: 30,
       trend: 'up',
       sentiment: null,
+      riskThrottleMultiplier: 1,
     });
     expect(pos).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -242,7 +245,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback' },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback', riskThrottleMultiplier: 1 },
     );
     expect(tagged).not.toBeNull();
     // ...and a bare RV long on a different OCC (no archetype → unspecified).
@@ -251,7 +254,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35 },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, riskThrottleMultiplier: 1 },
     );
     expect(bare).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -418,6 +421,7 @@ describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
     sentimentIcBand: null,
     agentConviction: null,
     entryArchetype: archetype,
+    riskThrottleMultiplier: 1, // TRA-2333 — the wheel does not consult the throttle
   });
 
   it('journals a CSP open (cash_secured_put, at-risk = collateral) and folds the expired-worthless close', async () => {
@@ -525,5 +529,86 @@ describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
     noSetup.settleCoveredWrite(b.id, { kind: 'expired_worthless' });
     await noSetup.flushOptionTradeJournal();
     expect(await listOptionTradeJournal()).toHaveLength(0);
+  });
+});
+
+// TRA-2333 (parent TRA-2331) — the applied risk-throttle multiplier is STAMPED
+// on the fill. Before this the multiplier lived only in the since-boot `byPath`
+// counters, which say how MANY tickets were trimmed and never WHICH — so a trim
+// could not be joined to the trade's own R/P&L and "grade the trims" was not
+// computable. These pin the two properties the grade depends on: the stamp is
+// present on a trimmed fill, and it is present *as exactly 1* on an un-trimmed
+// one rather than absent.
+describe('risk-throttle stamp on the journal open row (TRA-2333)', () => {
+  const stampSetup = (riskThrottleMultiplier: number): OptionTradeJournalSetup => ({
+    ivRank: 30,
+    trend: 'up',
+    entryDelta: 0.35,
+    sentiment: null,
+    sentimentIcBand: null,
+    agentConviction: null,
+    riskThrottleMultiplier,
+  });
+
+  it('a fill sized under a sub-1 throttle carries riskThrottleMultiplier < 1', async () => {
+    process.env['RISK_THROTTLE_SIZING_ENABLED'] = 'demo';
+    try {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      const pos = acct.openOptionFromRvCandidate(
+        buildRvSignal(), 'demo', undefined, undefined, stampSetup(0.5), 0.5,
+      );
+      expect(pos).not.toBeNull();
+      await acct.flushOptionTradeJournal();
+
+      const row = (await listOptionTradeJournal())[0]!;
+      expect(row.riskThrottleMultiplier).toBe(0.5);
+      expect(row.riskThrottleMultiplier!).toBeLessThan(1);
+      expect(row.riskThrottleArmedScope).toBe('demo');
+    } finally {
+      delete process.env['RISK_THROTTLE_SIZING_ENABLED'];
+    }
+  });
+
+  it('a fill sized at FULL risk carries exactly 1 — present, not absent', async () => {
+    // The TRA-2302 `?? 0` lesson. If the stamp were written only on a trim,
+    // ABSENT would collapse into "un-trimmed" and a build where the stamp
+    // regressed would be indistinguishable from a calm market. Absent must keep
+    // meaning exactly one thing: written by a pre-TRA-2333 build.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromRvCandidate(
+      buildRvSignal(), 'demo', undefined, undefined, stampSetup(1),
+    );
+    expect(pos).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const row = (await listOptionTradeJournal())[0]!;
+    expect(row).toHaveProperty('riskThrottleMultiplier');
+    expect(row.riskThrottleMultiplier).toBe(1);
+    expect(row.riskThrottleArmedScope).toBe('off'); // dark ⇒ the scope says so
+  });
+
+  it('the trimmed and un-trimmed rows partition cleanly on `< 1`', async () => {
+    // Exactly the query TRA-2331 runs: trimmed fills vs the contemporaneous
+    // full-size ones, joined to each row's own outcome fields.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-trim', optionSymbol: 'MSFT240705C00400000' }),
+      'demo', undefined, undefined, stampSetup(0.25), 0.25,
+    );
+    acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-full', optionSymbol: 'MSFT240705C00410000', strike: 410 }),
+      'demo', undefined, undefined, stampSetup(1),
+    );
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+    const trimmed = rows.filter((r) => r.riskThrottleMultiplier! < 1);
+    const full = rows.filter((r) => r.riskThrottleMultiplier === 1);
+    expect(trimmed).toHaveLength(1);
+    expect(full).toHaveLength(1);
+    // Every row lands in exactly one side — no row is unattributable.
+    expect(trimmed.length + full.length).toBe(rows.length);
+    expect(trimmed[0]!.contracts!).toBeLessThan(full[0]!.contracts!);
   });
 });

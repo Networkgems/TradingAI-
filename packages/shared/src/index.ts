@@ -414,6 +414,29 @@ export interface Position {
    */
   forwardTestOnly?: boolean;
   /**
+   * TRA-2333 (parent TRA-2331) — the risk-autopilot throttle multiplier ACTUALLY
+   * APPLIED to this position's share count, and the arming scope in force when
+   * it was sized. The equity twin of the option journal's
+   * `riskThrottleMultiplier`/`riskThrottleArmedScope`: it makes a trimmed fill
+   * attributable, so a trimmed sleeve is gradeable by a plain partition on
+   * `riskThrottleMultiplier < 1` against the contemporaneous `=== 1` positions.
+   * Without it the only record of a trim is the since-boot `byPath` counter,
+   * which says how many tickets were trimmed and never which — and which loses
+   * everything before the last bqb1 restart.
+   *
+   * Written on every signal-driven equity open by this build, INCLUDING when the
+   * multiplier is exactly 1. Absent therefore means exactly one thing: the
+   * position was opened by a build older than TRA-2333 (or is a non-signal entry
+   * such as an imported wallet holding, which the engine never sized). Never
+   * default an absent value to 1 — exclude the row from a throttle grade.
+   *
+   * The value is the throttle term ALONE, not the composed sizing scalar the
+   * account received (which also carries the correlated-exposure cap scale).
+   */
+  riskThrottleMultiplier?: number;
+  /** TRA-2333 — arming scope (`off` | `demo` | `all`) in force at sizing time. */
+  riskThrottleArmedScope?: 'off' | 'demo' | 'all';
+  /**
    * TRA-249-C — instrument family the position was opened against. Spot
    * positions (the default and only kind pre-TRA-249) keep the field absent
    * so persisted snapshots and every non-crypto-live caller continue to

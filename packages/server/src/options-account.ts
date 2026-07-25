@@ -59,6 +59,8 @@ import {
   type OptionTradeJournalOpen,
   type SentimentIcBand,
 } from './option-trade-journal.js';
+// TRA-2333 — the arming scope stamped onto every journal open row.
+import { riskThrottleSizingScope } from './risk-throttle-sizing.js';
 
 // TRA-991 — the selector-computed setup the journal pairs with the realized
 // outcome. The account already knows the structure, entry delta, DTE, and
@@ -111,6 +113,23 @@ export interface OptionTradeJournalSetup {
    * byte-for-byte unchanged. Forward-only: historical rows keep their old label.
    */
   structureLabel?: string;
+  /**
+   * TRA-2333 (parent TRA-2331) — the risk-autopilot throttle multiplier that was
+   * ACTUALLY APPLIED to this ticket's size. Stamped verbatim onto the journal
+   * open row (see {@link OptionTradeJournalOpen.riskThrottleMultiplier}) so a
+   * trim becomes joinable to the trade's own R and P&L.
+   *
+   * REQUIRED, unlike every other field on this interface, and that is the point:
+   * it makes "did this open path stamp the throttle?" a compile-time question at
+   * all eight setup sites rather than something that can silently regress to
+   * `undefined` at one of them. Pass the throttle term ALONE — not the composed
+   * `sizeMultiplier` the account receives, which also carries the
+   * correlated-exposure cap scale and would make a cap-trimmed ticket read as
+   * throttle-trimmed. Open paths that do not consult the throttle at all
+   * (defined-risk spreads, wheel CSP/covered-call) pass `1`: no trim was
+   * applied, which is exactly what the field asserts.
+   */
+  riskThrottleMultiplier: number;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -741,6 +760,17 @@ export class PaperOptionsAccount {
       // TRA-1475 — stamp the owning book so the DESK fold can exclude QA/test
       // accounts. Only when bound (un-owned engines omit it → kept by the filter).
       ...(this.owner ? { account: this.owner } : {}),
+      // TRA-2333 — the applied risk-throttle multiplier + the scope in force,
+      // stamped UNCONDITIONALLY (no `? :`, no `?? 1`). This is the one field on
+      // the row that must never be omitted by this build: absent has to keep
+      // meaning "written before TRA-2333" and nothing else, or a regressed stamp
+      // becomes indistinguishable from a week with no trims. The scope is read
+      // here rather than threaded because it is process-level, so it is the same
+      // value the sizing call saw.
+      riskThrottleMultiplier: Number.isFinite(setup.riskThrottleMultiplier)
+        ? setup.riskThrottleMultiplier
+        : 1,
+      riskThrottleArmedScope: riskThrottleSizingScope(),
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))
