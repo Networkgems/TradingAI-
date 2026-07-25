@@ -58,6 +58,8 @@ vi.mock('./yahoo-feed.js', () => ({
   setTradierStocksFeedClient: vi.fn(),
 }));
 import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
+// TRA-2262 — the per-tick fan-out bound on the doTick sinks.
+import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-sweep-budget.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
@@ -483,6 +485,82 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     const engine = new SignalEngine(undefined, undefined, scanner);
     await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
     expect(engine.getState().options.openOptions).toHaveLength(0);
+  });
+
+  // ── TRA-2262 (parent TRA-2203) — the per-tick fan-out bound, END TO END ────
+  // The helper's own suite proves the sweep mechanics. These prove the bound is
+  // WIRED: that the engine's real sink truncates at the budget and resumes at
+  // the symbol it stopped on. Without them a green suite would only be saying
+  // "nothing broke on a 1-symbol universe", which is every existing scan test.
+  describe('runOtmScan is budgeted and cursored (TRA-2262)', () => {
+    /** One "symbol" of feed latency, charged against the sweep's wall clock. */
+    const chargeSeconds = (s: number) => vi.setSystemTime(new Date(Date.now() + s * 1000));
+
+    const slowScanner = (secondsPerSymbol: number): StubScanner => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockImplementation(async (sym: string) => {
+        chargeSeconds(secondsPerSymbol);
+        return { symbol: sym, spot: 195, expiration: '2024-07-05', candidates: [], reason: 'ok' };
+      });
+      return scanner;
+    };
+    const runScan = (engine: SignalEngine, symbols: string[]) =>
+      (engine as unknown as { runOtmScan: (s: string[]) => Promise<SweepPass | null> }).runOtmScan(symbols);
+
+    beforeEach(() => { resetSweepCursors(); });
+
+    it('stops at the wall-clock budget instead of walking the whole universe', async () => {
+      const engine = new SignalEngine(undefined, undefined, slowScanner(16));
+      const symbols = Array.from({ length: 20 }, (_, i) => `S${i}`);
+
+      const pass = await runScan(engine, symbols);
+
+      // 2 × 16s trips the 30s budget; the old loop ran all 20 (320s in one tick).
+      expect(pass!.processed).toEqual(['S0', 'S1']);
+      expect(pass!.budgetExhausted).toBe(true);
+      expect(pass!.complete).toBe(false);
+      expect(pass!.resumeAt).toBe('S2');
+    });
+
+    it('the NEXT pass resumes where the last stopped, and the rotation covers the universe', async () => {
+      const engine = new SignalEngine(undefined, undefined, slowScanner(16));
+      const symbols = Array.from({ length: 6 }, (_, i) => `S${i}`);
+
+      const seen: string[] = [];
+      const starts: number[] = [];
+      for (let n = 0; n < 3; n++) {
+        const pass = await runScan(engine, symbols);
+        starts.push(pass!.startIndex);
+        seen.push(...pass!.processed);
+      }
+
+      expect(starts).toEqual([0, 2, 4]);
+      expect(seen).toEqual(symbols); // every symbol exactly once, across 3 ticks
+    });
+
+    it('a cursor is per-ENGINE, so a second engine does not consume the first\'s rotation', async () => {
+      const symbols = Array.from({ length: 20 }, (_, i) => `S${i}`);
+      const demo = new SignalEngine(undefined, undefined, slowScanner(16));
+      const live = new SignalEngine(undefined, undefined, slowScanner(16));
+      (live as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+
+      await runScan(demo, symbols);
+      const livePass = await runScan(live, symbols);
+
+      expect(livePass!.startIndex).toBe(0);
+    });
+
+    it('a fast sweep completes in one pass and clears its cursor (no behaviour change below the budget)', async () => {
+      const engine = new SignalEngine(undefined, undefined, slowScanner(0));
+      const symbols = ['AAPL', 'MSFT', 'NVDA'];
+
+      const pass = await runScan(engine, symbols);
+
+      expect(pass!.complete).toBe(true);
+      expect(pass!.budgetExhausted).toBe(false);
+      expect(pass!.processed).toEqual(symbols);
+      expect(sweepCursorSnapshot()['demo:otm-scan']).toBeUndefined();
+    });
   });
 
   it('runRelativeValueScan opens an RV position from a `cheap` candidate and records a signal', async () => {

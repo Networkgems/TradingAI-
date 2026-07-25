@@ -85,6 +85,9 @@ import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-sl
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan } from './rv-scan-telemetry.js';
+// TRA-2262 (parent TRA-2203) — per-tick wall-clock budget + rotating cursor for
+// the three unbounded doTick fan-out sinks named by the Friday RTH tape.
+import { runBudgetedSweep, nextSweepDelayMs, type SweepPass } from './tick-sweep-budget.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
 import {
   DEFAULT_WHEEL_GUARDS,
@@ -1200,6 +1203,8 @@ function sma200BarDay(ts: number): number {
 // intraday history Yahoo's 1m feed serves (~7 sessions); 15m/1h indicators that
 // still lack history degrade to null reads (the daily TF carries SMA200).
 const TECHNICAL_SNAPSHOT_REFRESH_MS = 5 * 60_000;
+/** TRA-554 — every Nth technical-refresh CYCLE sweeps the full watchlist, not just active interest. */
+const TECHNICAL_COLD_SCAN_INTERVAL = 4;
 const MTF_MINUTE_BARS = 2000;
 const MTF_DAILY_BARS = 260;
 
@@ -2364,6 +2369,30 @@ export class SignalEngine {
   private technicalSnapshots: Map<string, TechnicalSignalSnapshot> = new Map();
   private lastTechnicalRefreshAt = 0;
   private technicalRefreshCycleCount = 0;
+
+  // TRA-2262 — the last budgeted pass each bounded doTick sink ran. `null` (or a
+  // `complete` pass) means the sink is idle and re-enters on its own throttle; an
+  // incomplete pass means a sweep is parked mid-universe and must re-enter on the
+  // NEXT tick, which is what keeps the bound from becoming a coverage cut.
+  private mtfSweep: SweepPass | null = null;
+  private otmSweep: SweepPass | null = null;
+  private shortPremiumSweep: SweepPass | null = null;
+  /**
+   * Whether the IN-FLIGHT mtf sweep is a full-watchlist cold pass. Latched when a
+   * sweep STARTS so the every-4th-cycle counter advances once per sweep, not once
+   * per resumed slice — otherwise slicing would silently quadruple the cold-scan
+   * rate.
+   */
+  private mtfSweepIsCold = false;
+  /**
+   * TRA-1977 scans accumulated across the budgeted slices of ONE short-premium
+   * sweep (TRA-2262). Drained into `runWheelCycle` when the sweep completes, so
+   * the wheel still sees a whole-universe map on its pre-bound cadence.
+   */
+  private pendingWheelScans: Map<
+    string,
+    { result: ShortPremiumScanResult; spot: number; ivPercentile: number | null; markKind: WheelIvMarkKind; atmIv: number | null }
+  > = new Map();
 
   private dailySignals: DailySignalRecord[] = [];
   private positionSignalType: Map<string, SignalType> = new Map();
@@ -4568,9 +4597,10 @@ export class SignalEngine {
       marketOpen: isStockMarketOpen(),
       skipOptionsForLiveEquityOnly,
     })) {
-      if (Date.now() - this.lastOtmScanAt >= OTM_SCAN_INTERVAL_MS) {
+      // TRA-2262 — budgeted + cursored; an unfinished sweep resumes next tick.
+      if (Date.now() - this.lastOtmScanAt >= nextSweepDelayMs(this.otmSweep, OTM_SCAN_INTERVAL_MS)) {
         this.lastOtmScanAt = Date.now();
-        await withPhase('signal.doTick.otm-scan', () => this.runOtmScan(activeSymbols));
+        this.otmSweep = await withPhase('signal.doTick.otm-scan', () => this.runOtmScan(activeSymbols));
       }
     }
 
@@ -4708,11 +4738,19 @@ export class SignalEngine {
       && isOptionShortPremiumScannerEnabled()
       && !!this.rvScanner
     ) {
-      if (Date.now() - this.lastShortPremiumScanAt >= RV_SCAN_INTERVAL_MS) {
+      // TRA-2262 — budgeted + cursored. Σ-leader of the tape (34.7%) and a fully
+      // sequential walk with up to two daily-candle round-trips per cold symbol;
+      // max 293.0s. An unfinished sweep resumes next tick (see mtf-refresh above).
+      if (Date.now() - this.lastShortPremiumScanAt
+          >= nextSweepDelayMs(this.shortPremiumSweep, RV_SCAN_INTERVAL_MS)) {
         this.lastShortPremiumScanAt = Date.now();
         try {
-          await withPhase('signal.doTick.short-premium-scan', () => this.evaluateShortPremiumScan(activeSymbols));
+          this.shortPremiumSweep = await withPhase(
+            'signal.doTick.short-premium-scan',
+            () => this.evaluateShortPremiumScan(activeSymbols),
+          );
         } catch (err: unknown) {
+          this.shortPremiumSweep = null;
           log.warn('short-premium scan pass threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
@@ -4779,7 +4817,13 @@ export class SignalEngine {
     // the TRA-529 analysts. Throttled (5 min) and batched so the deep
     // minute-bar pulls don't hammer Yahoo every tick; swallowed so a cold feed
     // can't take down the tick.
-    if (Date.now() - this.lastTechnicalRefreshAt >= TECHNICAL_SNAPSHOT_REFRESH_MS) {
+    // TRA-2262 — …and BUDGETED. This is the tail owner: 12.0% of doTick's Σ but
+    // 77% of the single worst tick (935.1s of 1,214.9s). An unfinished sweep
+    // re-enters on the NEXT tick instead of waiting out the 5-minute throttle,
+    // so the universe is still covered on today's schedule — see
+    // `tick-sweep-budget.ts` for the sizing that makes that true.
+    if (Date.now() - this.lastTechnicalRefreshAt
+        >= nextSweepDelayMs(this.mtfSweep, TECHNICAL_SNAPSHOT_REFRESH_MS)) {
       this.lastTechnicalRefreshAt = Date.now();
       // TRA-554: this refresh is a SECOND Tradier bar consumer, distinct from
       // the candle loop above — it pulls MTF_MINUTE_BARS (2000) bars per symbol,
@@ -4795,10 +4839,16 @@ export class SignalEngine {
       //    with a full-watchlist cold scan every 4th cycle (~20 min) so cold
       //    symbols stay warm for the analysts.
       if (isStockMarketOpen()) {
-        this.technicalRefreshCycleCount++;
-        const TECHNICAL_COLD_SCAN_INTERVAL = 4;
-        const isColdCycle = this.technicalRefreshCycleCount % TECHNICAL_COLD_SCAN_INTERVAL === 0;
-        const mtfSymbols = isColdCycle
+        // Advance the cold-scan counter ONLY when a new sweep starts. Bumping it
+        // per resumed slice would fire the full-watchlist pass every 4 TICKS
+        // instead of every 4 cycles — a 40× feed-rate regression hiding inside a
+        // latency fix (the TRA-1996 hazard, re-committed).
+        const resuming = this.mtfSweep != null && !this.mtfSweep.complete;
+        if (!resuming) {
+          this.technicalRefreshCycleCount++;
+          this.mtfSweepIsCold = this.technicalRefreshCycleCount % TECHNICAL_COLD_SCAN_INTERVAL === 0;
+        }
+        const mtfSymbols = this.mtfSweepIsCold
           ? activeSymbols
           : activeSymbols.filter(sym => activeInterest.has(sym));
         if (mtfSymbols.length > 0) {
@@ -4807,17 +4857,27 @@ export class SignalEngine {
             // MTF_MINUTE_BARS=2000 bars/symbol that the 80-bar candle cache can never
             // satisfy) as its own async sub-phase, distinct from the cold-bar scan, so
             // the tape resolves WHICH of the two feed consumers dominates the tick.
-            await withPhase(
+            this.mtfSweep = await withPhase(
               'signal.doTick.mtf-refresh',
               () => this.refreshTechnicalSnapshots(mtfSymbols),
             );
           } catch (err: unknown) {
+            // The cursor already advanced past the failing batch inside the sweep;
+            // drop the pass so the sink falls back to its normal throttle rather
+            // than re-entering every tick on a broken feed.
+            this.mtfSweep = null;
             log.warn('technical snapshot scan threw', {
               component: 'mtf',
               reason: err instanceof Error ? err.message : String(err),
             });
           }
+        } else {
+          this.mtfSweep = null;
         }
+      } else {
+        // Market closed — abandon any half-finished sweep so the next open starts
+        // a fresh rotation instead of resuming into a stale universe.
+        this.mtfSweep = null;
       }
     }
 
@@ -6878,19 +6938,19 @@ export class SignalEngine {
    * Errors per-symbol are swallowed so one Tradier hiccup can't take down the
    * whole tick.
    */
-  private async runOtmScan(activeSymbols: string[]): Promise<void> {
-    if (!this.rvScanner) return;
+  private async runOtmScan(activeSymbols: string[]): Promise<SweepPass | null> {
+    if (!this.rvScanner) return null;
 
     // Same options-sleeve breaker gate as RV — when exec is on and the sleeve
     // tripped its daily-drawdown / cumulative-R limit, open NO new tickets
     // (exits still run). No-op in the default prod config where exec is off.
-    if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return;
+    if (isOptionExecEnabled() && this.optionsBreaker.isHalted()) return null;
 
     // TRA-1267 (TRA-1250 Rule 3) — book-level give-back / session-stop halt,
     // gated explicitly here for the same reason as the RV scan: the options
     // paths consult the sleeve breaker, not the equity risk governor. Dark
     // until the rules flag is on.
-    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return;
+    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return null;
 
     // Per-user DTE window (TRA-373) flows through the shared scanner singleton
     // on every call, identical to the RV path.
@@ -6910,16 +6970,25 @@ export class SignalEngine {
         ? { minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
         : undefined;
 
-    for (const sym of activeSymbols) {
+    // TRA-2262 — budgeted + cursored (p90 110.5s, max 213.8s on the Friday tape).
+    // Unlike the old `for (const sym of activeSymbols)`, a pass that runs out of
+    // budget resumes at the symbol it stopped on instead of restarting at the head
+    // of the watchlist — so the tail of the universe stops being systematically
+    // under-scanned for entries, which the plain loop only avoided by never
+    // stopping.
+    return runBudgetedSweep({
+      key: `${this.mode}:otm-scan`,
+      symbols: activeSymbols,
+      run: async (batch) => { for (const sym of batch) {
       // TRA-1231 — same iv-rv cap reservation as the RV scan above. The OTM
       // scan also runs before the iv-rv routing pass and shares the cap.
       if (
         this.mode === 'demo'
         && isOptionIvRvRoutingEnabled()
         && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
-      ) break;
+      ) return false; // was `break` — stops the sweep AND parks the cursor here
       try {
-        const result = await this.rvScanner.scanOtm(sym, otmScanOpts, dtePrefs);
+        const result = await this.rvScanner!.scanOtm(sym, otmScanOpts, dtePrefs);
         if (result.reason !== 'ok' || result.candidates.length === 0) continue;
 
         // The scanner sorts by |mispricingPct|, so the first `cheap` candidate
@@ -7172,7 +7241,8 @@ export class SignalEngine {
       } catch (err: unknown) {
         log.warn('OTM scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
       }
-    }
+      } return undefined; },
+    });
   }
 
   /** Build account state augmented with cumulative P&L pulled from the tracker. */
@@ -8322,8 +8392,11 @@ export class SignalEngine {
    * the flag + demo mode + scanner so a direct unit-test call also no-ops with the
    * flag off. Live promotion stays gated on TRA-382 regardless.
    */
-  private async evaluateShortPremiumScan(symbols: string[]): Promise<void> {
-    if (!isOptionShortPremiumScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) return;
+  private async evaluateShortPremiumScan(symbols: string[]): Promise<SweepPass | null> {
+    if (!isOptionShortPremiumScannerEnabled() || this.mode !== 'demo' || !this.rvScanner) {
+      this.pendingWheelScans.clear();
+      return null;
+    }
 
     const asOf = Date.now();
     const dtePrefs = { min: this.rvDteMin, max: this.rvDteMax, target: this.rvDteTarget };
@@ -8332,15 +8405,24 @@ export class SignalEngine {
     // spot) so its entry/roll passes ride the SAME warm selector chain; keyed by
     // symbol so settlement (which iterates ALL open wheel state) can look up a
     // spot even for a symbol whose scan produced no candidate this pass.
+    //
+    // TRA-2262 — the map is now an INSTANCE field that accumulates across the
+    // budgeted slices of one sweep, and `runWheelCycle` fires only when the sweep
+    // COMPLETES. Handing the wheel a per-slice map instead would have been the
+    // subtle harm in this bound: settlement iterates all open wheel state and
+    // skips any symbol with no fresh spot ("settle on a later tick"), so a
+    // truncated map does not fail loudly — it silently defers expiry settlement
+    // and the tail guards on assigned lots, and it would run the ENTRY pass ~10×
+    // more often than today off a fraction of the candidates.
     const routeWheel = isOptionWheelRoutingEnabled();
-    const wheelScans = new Map<
-      string,
-      { result: ShortPremiumScanResult; spot: number; ivPercentile: number | null; markKind: WheelIvMarkKind; atmIv: number | null }
-    >();
+    const wheelScans = this.pendingWheelScans;
 
-    for (const sym of symbols) {
+    const pass = await runBudgetedSweep({
+      key: `${this.mode}:short-premium-scan`,
+      symbols,
+      run: async (batch) => { for (const sym of batch) {
       try {
-        const snap = await this.rvScanner.getSelectorChain(sym, dtePrefs);
+        const snap = await this.rvScanner!.getSelectorChain(sym, dtePrefs);
         if (!snap || !(snap.spot > 0) || snap.rows.length === 0) continue;
 
         // Same daily-close backfill as the IV-RV pass (TRA-1226/1230): the scan
@@ -8397,20 +8479,29 @@ export class SignalEngine {
           reason: err instanceof Error ? err.message : String(err),
         });
       }
-    }
+      } },
+    });
 
     // TRA-1977 — drive the wheel paper cycle off this tick's scans (demo/paper
     // only; caller already gated on `mode === 'demo'`). Guarded so a wheel bug
     // can never break the observe-only short-premium pass above.
-    if (routeWheel) {
-      try {
-        this.runWheelCycle(wheelScans, asOf);
-      } catch (err: unknown) {
-        log.warn('wheel cycle pass threw (TRA-1977)', {
-          reason: err instanceof Error ? err.message : String(err),
-        });
+    // TRA-2262 — once per COMPLETED sweep, not once per budgeted slice, so the
+    // wheel keeps exactly its pre-bound cadence and sees a whole-universe map.
+    if (pass.complete) {
+      if (routeWheel) {
+        try {
+          this.runWheelCycle(wheelScans, Date.now());
+        } catch (err: unknown) {
+          log.warn('wheel cycle pass threw (TRA-1977)', {
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
+      // Cleared unconditionally: a mid-sweep flag flip must not leave scans from
+      // a previous rotation to be read as "this tick's fresh marks".
+      wheelScans.clear();
     }
+    return pass;
   }
 
   /**
@@ -12943,12 +13034,28 @@ export class SignalEngine {
     }
   }
 
-  /** TRA-533 — batched snapshot refresh over the active watchlist. */
-  private async refreshTechnicalSnapshots(symbols: string[]): Promise<void> {
+  /**
+   * TRA-533 — batched snapshot refresh over the active watchlist.
+   *
+   * TRA-2262 — BOUNDED. The old shape was `for (i += 5) await Promise.all(...)`
+   * over the whole universe: 568 symbols ⇒ 114 sequential rounds ⇒ the 935.1s
+   * excursion that owns 77% of doTick's worst tick, and — because TRA-2200's exit
+   * hoist is still deferred on the real-money book — 77% of the worst-case LIVE
+   * exit latency. The rounds are unchanged; only how many of them run in one tick
+   * is now capped, with a cursor carrying the rotation to the next tick.
+   */
+  private async refreshTechnicalSnapshots(symbols: string[]): Promise<SweepPass> {
     const BATCH = 5;
-    for (let i = 0; i < symbols.length; i += BATCH) {
-      await Promise.all(symbols.slice(i, i + BATCH).map(sym => this.refreshTechnicalSnapshot(sym)));
-    }
+    return runBudgetedSweep({
+      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
+      // same watchlist do not consume each other's cursor.
+      key: `${this.mode}:mtf-refresh`,
+      symbols,
+      batchSize: BATCH,
+      run: async (batch) => {
+        await Promise.all(batch.map(sym => this.refreshTechnicalSnapshot(sym)));
+      },
+    });
   }
 
   /**
