@@ -20,6 +20,28 @@ export interface DailySnapshot {
    * 0, so an old row contributes stock-only to the windows, never a phantom).
    */
   optionsDailyPnl?: number;
+  /**
+   * TRA-2314 — which source booked `optionsDailyPnl` (see
+   * `options-daily-pnl-source.ts`). `'journal'` = the durable option-trade
+   * journal, `'journal-repair'` = rewritten from the journal by the historical
+   * repair, `'bucket-*'` = the legacy volatile in-memory bucket. Absent on rows
+   * written before this ticket, which were ALL bucket-sourced.
+   *
+   * This field is what gives the repair a failing state. Without it a repaired
+   * cell and a cell that was never broken read identically once both hold the
+   * right number — the TRA-2301 lesson, where a repair wrote into the very store
+   * its health route read and "repaired" and "never broken" both showed `gap:0`.
+   */
+  optionsDailyPnlSource?: string;
+  /**
+   * TRA-2314 — the volatile-bucket figure that WOULD have been booked before
+   * this ticket (0.00 on every repaired row). Preserved so the before/after of a
+   * board-facing correction stays readable on the row itself, not just in a
+   * closing comment.
+   */
+  optionsDailyPnlBucket?: number;
+  /** TRA-2314 — option closes the durable journal recorded on this ET day for this book. */
+  optionsDailyJournalCloses?: number;
   trades: number;
 }
 
@@ -164,6 +186,45 @@ export class PnlTracker {
     this.state.openingOptionsPnl = this.state.optionsPnl;
     this.state.openingDate = snapshot.date;
     this.persistState();
+  }
+
+  /**
+   * TRA-2314 — apply the historical `optionsDailyPnl` repair produced by
+   * `planOptionsDailyPnlRepair`. Rewrites only the days the plan names, stamps
+   * each with its provenance (`journal-repair`) and the ORIGINAL bucket figure,
+   * and persists. Returns the number of rows actually rewritten.
+   *
+   * Deliberately does NOT touch `openingEquity` / `openingDate` the way
+   * `saveSnapshot` does — this is a backfill of a past cell, not a day close, and
+   * rebasing the dashboard's opening equity off a historical row is the exact
+   * corruption `generateAndSaveReport` skips snapshots on a backfill to avoid.
+   *
+   * Idempotent: a second run finds no row whose `optionsDailyPnl` is still 0 on
+   * a day the journal names closes, so it writes nothing. bqb1 restarts several
+   * times an hour, so this MUST be a no-op after the first pass.
+   */
+  applyOptionsDailyPnlRepair(
+    deltas: ReadonlyArray<{ date: string; after: number; journalCloses: number }>,
+  ): number {
+    if (deltas.length === 0) return 0;
+    const byDate = new Map(deltas.map(d => [d.date, d]));
+    let repaired = 0;
+    this.snapshots = this.snapshots.map(s => {
+      const d = byDate.get(s.date);
+      if (!d) return s;
+      repaired += 1;
+      return {
+        ...s,
+        optionsDailyPnl: d.after,
+        optionsDailyPnlSource: 'journal-repair',
+        optionsDailyPnlBucket: s.optionsDailyPnl ?? 0,
+        optionsDailyJournalCloses: d.journalCloses,
+      };
+    });
+    if (repaired > 0) {
+      writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
+    }
+    return repaired;
   }
 
   getCumulativeStats(currentEquity: number): CumulativeStats {

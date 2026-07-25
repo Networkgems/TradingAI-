@@ -13,6 +13,16 @@ import {
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
 } from './pnl-reconciliation.js';
+// TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
+// so the report file and the daily snapshot can never be booked differently.
+import {
+  resolveDailyOptionsPnl,
+  journalRowsForBook,
+  patchEodReportOptionsPnl,
+  planOptionsDailyPnlRepair,
+  type OptionsDailyPnlDecision,
+  type PatchableEodReport,
+} from './options-daily-pnl-source.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells } from './reports/desk-calendar.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
@@ -1282,6 +1292,68 @@ async function generateAndSaveReport(
 
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 
+  // TRA-2314 (parent TRA-2297, split from TRA-2302) — re-source the day-only
+  // realized options P&L from the DURABLE option-trade journal.
+  //
+  // `generateEodReport` sums `ReportInput.closedOptions`, the engine's VOLATILE
+  // in-memory `PaperOptionsAccount.closedOptions` bucket. That bucket is emptied
+  // every night by `archiveClosedOptions()` and is not guaranteed across the
+  // restarts bqb1 takes several times an hour, so a day whose closes are not in
+  // it at 21:00 ET books exactly 0.00 — bit-identical to a day that traded no
+  // options. TRA-2302 proved that is what happened: 110 closed desk round trips
+  // worth +$844.99 across 15 ET days, every one of them booked 0.00.
+  //
+  // The patch is applied to `finalReport` — BEFORE the file write and before the
+  // snapshot — so the per-day report JSON, its markdown, `latest.json` and
+  // `DailySnapshot.optionsDailyPnl` are all booked from ONE source. Moving only
+  // the snapshot would have been worse than doing nothing: on the days where the
+  // report file also booked 0, it manufactures up to $217.50 of drift on the
+  // `/api/health/pnl-reconciliation` identity, which currently reads clean
+  // precisely because both surfaces are wrong in the same way.
+  //
+  // It runs BEFORE the TRA-359 Tradier override below on purpose: in live mode
+  // broker truth still wins on `combinedPnl`, and this must not clobber it.
+  let optionsDailyDecision: OptionsDailyPnlDecision = resolveDailyOptionsPnl({
+    bucketPnl: finalReport.optionsPnl,
+    census: null,
+    censusAvailable: false,
+  });
+  if (isOptionTradeJournalEnabled()) {
+    try {
+      // The journal was already flushed above for the EOD fold; flush again so a
+      // close booked between then and now is on disk before we read it.
+      await ctx.engine.flushOptionTradeJournal?.();
+      const census = foldJournalClosesByEtDay(
+        journalRowsForBook(await listOptionTradeJournal(), ctx.username),
+        (ts: number) => etDateString(new Date(ts)),
+      );
+      optionsDailyDecision = resolveDailyOptionsPnl({
+        bucketPnl: finalReport.optionsPnl,
+        census: census.get(finalReport.date) ?? null,
+        censusAvailable: true,
+      });
+    } catch (err) {
+      // A journal read failure leaves the decision at `bucket-no-census`, i.e.
+      // exactly the pre-TRA-2314 behaviour — and SAYS so on the row, so the
+      // degraded mode is visible instead of reverting silently to the defect.
+      log.warn('TRA-2314 options-daily journal census unavailable', {
+        username: ctx.username,
+        date: finalReport.date,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (optionsDailyDecision.changed) {
+    log.info('TRA-2314 re-sourced options day cell from the durable journal', {
+      username: ctx.username,
+      date: finalReport.date,
+      bucketPnl: optionsDailyDecision.bucketPnl,
+      journalPnl: optionsDailyDecision.journalPnl,
+      journalCloses: optionsDailyDecision.journalCloses,
+    });
+    finalReport = patchEodReportOptionsPnl(finalReport, optionsDailyDecision.value);
+  }
+
   // TRA-359 — in live mode, override the report's `combinedPnl` with the
   // Tradier-truth daily delta (today.balance − prev.balance − netCashFlow)
   // so the Live calendar mirrors what the user sees on the broker. The
@@ -1374,6 +1446,24 @@ async function generateAndSaveReport(
       // ET day) so the weekly/monthly/yearly windows sum day-only, not the
       // cumulative `equitySnap.optionsPnl` that inflated them.
       optionsDailyPnl: finalReport.optionsPnl,
+      // TRA-2314 — provenance for the figure above. `finalReport.optionsPnl` is
+      // now journal-sourced (patched in place further up) rather than summed
+      // from the volatile bucket, so record WHICH source booked it and what the
+      // bucket would have said. Without this a repaired cell and a cell that was
+      // never broken read identically once both hold the right number — the
+      // TRA-2301 lesson, where a repair wrote into the store its own health
+      // route read and both states showed `gap:0`.
+      optionsDailyPnlSource: optionsDailyDecision.source,
+      optionsDailyPnlBucket: optionsDailyDecision.bucketPnl,
+      ...(optionsDailyDecision.journalCloses != null
+        ? { optionsDailyJournalCloses: optionsDailyDecision.journalCloses }
+        : {}),
+      // TRA-2314 deliberately does NOT touch `combinedPnl` here. It carries the
+      // mode's ALL-TIME cumulative `equitySnap.optionsPnl` — a separate, known
+      // wart TRA-1633 BUG 2 left standing when it moved the windows onto
+      // `dailyPnl + optionsDailyPnl`. Nothing reads it for the board's
+      // weekly/monthly/yearly sums, and moving a second number in the same
+      // change would make this correction unreadable as one.
       combinedPnl: (equitySnap.equity - ctx.tracker.getOpeningEquity()) + equitySnap.optionsPnl,
       trades: finalSnapshot.allClosedPositions.length,
     });
@@ -1404,6 +1494,104 @@ async function generateAndSaveReport(
  * Safe to call repeatedly: `missedTradingDays` only returns days with no
  * report file, so an already-backfilled day is skipped.
  */
+/**
+ * TRA-2314 — one-shot historical repair of the `optionsDailyPnl` false zero.
+ *
+ * TRA-2302 proved 15 ET days across the two desk books booked `0.00` while the
+ * durable journal held 110 closed option round trips worth +$844.99 on those
+ * same days. Fixing the writer forward leaves that history reading as a firm
+ * that traded no options for a month — which is exactly the ledger the parent
+ * TRA-2297 ("we're using the same 2k everyday") is arguing about. So the
+ * historical rows ARE repaired, from the journal, and each repaired row keeps
+ * its original figure in `optionsDailyPnlBucket`.
+ *
+ * BOTH surfaces move together, deliberately. The reconciliation identity is
+ * `report.combinedPnl == snapshot.dailyPnl + snapshot.optionsDailyPnl`, so
+ * repairing the snapshot alone would push up to $217.50 of NEW drift onto a
+ * board-facing guard that currently reads clean only because both surfaces are
+ * wrong in the same way. Patching the report file's options leg in the same pass
+ * cancels the options term out of the identity entirely: residual drift stays
+ * exactly `report.realizedPnl − snapshot.dailyPnl`, the pre-existing stock-leg
+ * discrepancy, unchanged by this repair.
+ *
+ * Only PROVEN false zeros are touched — a day the journal names closes on whose
+ * `optionsDailyPnl` is exactly 0. A day already carrying a non-zero options
+ * figure is left alone even where it disagrees with the journal; rewriting a
+ * number that may be right is the unannounced correction TRA-2079 warns about.
+ *
+ * Idempotent and safe to run every boot (bqb1 restarts several times an hour):
+ * after the first pass no row matches the false-zero signature, so it writes
+ * nothing and logs nothing.
+ */
+async function runOptionsDailyPnlRepair(): Promise<void> {
+  if (!isOptionTradeJournalEnabled()) return;
+  const rows = await listOptionTradeJournal();
+  for (const ctx of getAllUserContexts()) {
+    try {
+      // Same scoping predicate the writer and the health route use. Rows with no
+      // `account` are unattributable (2,192 pre-TRA-1475 ones) and are never
+      // credited to whichever book is being repaired — the TRA-2193 trap.
+      const census = foldJournalClosesByEtDay(
+        journalRowsForBook(rows, ctx.username),
+        (ts: number) => etDateString(new Date(ts)),
+      );
+      if (census.size === 0) continue;
+      const plan = planOptionsDailyPnlRepair(ctx.tracker.getSnapshots(), census);
+      if (plan.deltas.length === 0) continue;
+
+      // Report files FIRST, snapshot second. A crash between the two leaves the
+      // options legs disagreeing, which shows up as drift on
+      // /api/health/pnl-reconciliation — visible, and healed by the next boot.
+      const mode = stockModeKey(getSettings(ctx.username));
+      const dir = stockReportsDirFor(ctx, mode);
+      let filesPatched = 0;
+      for (const d of plan.deltas) {
+        const datePath = join(dir, `${d.date}.json`);
+        if (!existsSync(datePath)) continue;
+        try {
+          const report = JSON.parse(await readFile(datePath, 'utf-8')) as PatchableEodReport;
+          const patched = patchEodReportOptionsPnl(report, d.after);
+          // No-op when the file already carried the journal figure — which is
+          // itself the answer to TRA-2302's open second pathway: on 2026-07-15
+          // and 2026-07-21 the file and the snapshot disagreed, so exactly one
+          // of the two needed moving.
+          if (patched === report) continue;
+          await writeFile(datePath, JSON.stringify(patched, null, 2), 'utf-8');
+          if (typeof patched.markdown === 'string') {
+            await writeFile(join(dir, `${d.date}.md`), patched.markdown, 'utf-8');
+          }
+          filesPatched += 1;
+        } catch (err) {
+          log.warn('TRA-2314 report-file repair failed', {
+            username: ctx.username,
+            date: d.date,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const repaired = ctx.tracker.applyOptionsDailyPnlRepair(plan.deltas);
+      // Logged at warn: a board-facing ledger moved, and an unannounced
+      // correction reads to a grader as a new defect (TRA-2079). The per-day
+      // before/after also rides /api/health/pnl-reconciliation on every row.
+      log.warn('TRA-2314 repaired optionsDailyPnl false zeros from the durable journal', {
+        username: ctx.username,
+        mode,
+        snapshotsRepaired: repaired,
+        filesPatched,
+        totalDeltaUsd: plan.totalDeltaUsd,
+        dates: plan.deltas.map(d => `${d.date}:${d.before.toFixed(2)}->${d.after.toFixed(2)}`),
+        leftAloneDates: plan.leftAloneDates,
+      });
+    } catch (err) {
+      log.warn('TRA-2314 optionsDailyPnl repair failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
 async function catchUpMissedEodReports(): Promise<void> {
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   for (const ctx of getAllUserContexts()) {
@@ -3472,28 +3660,44 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         const dir = stockReportsDirFor(ctx, mode);
         const snapshots = ctx.tracker.getSnapshots();
         const eodByDate = new Map<string, number>();
+        // TRA-2314 — also carry the report file's OPTIONS leg. Reading only
+        // `combinedPnl` is why TRA-2302 could not close its second pathway: on
+        // 2026-07-15 / 07-21 `eodCombined` matched the journal total exactly
+        // while the snapshot booked 0.00, and from `combinedPnl` alone there is
+        // no way to tell an options figure the snapshot missed from an equal
+        // amount of stock P&L.
+        const eodOptionsByDate = new Map<string, number>();
         for (const s of snapshots) {
           const filePath = join(dir, `${s.date}.json`);
           if (!existsSync(filePath)) continue;
           try {
-            const report = JSON.parse(await readFile(filePath, 'utf-8')) as { combinedPnl?: number };
+            const report = JSON.parse(await readFile(filePath, 'utf-8')) as {
+              combinedPnl?: number;
+              optionsPnl?: number;
+            };
             if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
+            if (typeof report.optionsPnl === 'number') eodOptionsByDate.set(s.date, report.optionsPnl);
           } catch { /* skip unreadable report file */ }
         }
         // Scope the census to THIS book — pooling another account's closes in
         // would attribute them here (the TRA-2193 trap). Rows written before
         // TRA-1475 carry no `account` and are unattributable, so they are left
         // out rather than credited to whichever book is being read.
+        //
+        // TRA-2314 — `journalRowsForBook` is now the ONE shared predicate: the
+        // 21:00 writer, the historical repair and this checker all scope the
+        // same way. A checker grading a population the writer never saw is a
+        // guard that can never go green no matter how correct the fix is.
         const journalByDate = journalRows == null
           ? null
           : foldJournalClosesByEtDay(
-            journalRows.filter(r => r.account === ctx.username),
+            journalRowsForBook(journalRows, ctx.username),
             (ts: number) => etDateString(new Date(ts)),
           );
         return {
           username: ctx.username,
           mode,
-          ...reconcilePnl(snapshots, eodByDate, baselineDate, journalByDate),
+          ...reconcilePnl(snapshots, eodByDate, baselineDate, journalByDate, eodOptionsByDate),
         };
       }),
     );
@@ -3507,6 +3711,10 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // drift verdict keeps its meaning for every consumer already reading it.
       optionsFalseZeroOk: engines.every(e => e.optionsFalseZeroOk),
       optionsJournalCensusAvailable: journalRows != null,
+      // TRA-2314 — the repair's separating evidence, firm-wide. A book that was
+      // never broken contributes no `journal-repair` rows; the desk books name
+      // the days they lost. Reported beside `ok`, never folded into it.
+      optionsDailyPnlRepairedCount: engines.reduce((n, e) => n + e.repairedDates.length, 0),
       engines,
     });
   } catch (err) {
@@ -10040,6 +10248,16 @@ for (const ctx of getAllUserContexts()) {
 // than waiting for — and depending on — that night's archive tick.
 void catchUpMissedEodReports().catch(err =>
   log.warn('reports startup catch-up failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
+// TRA-2314 — on startup, repair the `optionsDailyPnl` false zeros TRA-2302
+// proved (15 desk days, +$844.99 of realized option round trips booked as 0.00).
+// Idempotent and bounded to days the durable journal names closes on, so it is
+// safe to run on every boot; after the first pass it writes nothing.
+void runOptionsDailyPnlRepair().catch(err =>
+  log.warn('TRA-2314 optionsDailyPnl repair (startup) failed', {
     reason: err instanceof Error ? err.message : String(err),
   }),
 );

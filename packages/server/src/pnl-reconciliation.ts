@@ -111,6 +111,29 @@ export interface PnlReconcileDay {
    * evidence — the flag stays false and `journalCloses` stays null).
    */
   optionsFalseZero: boolean;
+  /**
+   * TRA-2314 — the OPTIONS leg of the settled EOD report file for this day, as
+   * distinct from its `combinedPnl`. TRA-2302 could not close its second
+   * pathway (2026-07-15 and 2026-07-21, where `eodCombined` equalled the journal
+   * total exactly while the snapshot carried 0.00) because this endpoint only
+   * read `combinedPnl` — so "the file booked the options figure and the snapshot
+   * did not" was indistinguishable from "the file booked that much STOCK".
+   * Null when no report file exists or it carries no `optionsPnl`.
+   */
+  eodOptionsPnl: number | null;
+  /**
+   * TRA-2314 — which source booked `optionsDaily` (`journal`, `journal-repair`,
+   * `bucket-no-census`, `bucket-journal-silent`). Null on rows written before
+   * the field existed, which were all volatile-bucket sourced.
+   */
+  optionsDailyPnlSource: string | null;
+  /**
+   * TRA-2314 — the volatile-bucket figure that WOULD have been booked. On a
+   * repaired row this is the original `0.00`, so a repaired cell stays
+   * distinguishable from one that was never broken — without it both read
+   * identically once the number is right (the TRA-2301 lesson).
+   */
+  optionsDailyPnlBucket: number | null;
   /** eodCombined − (stockDaily + optionsDaily); 0 when no EOD file to compare. */
   drift: number;
   /**
@@ -155,6 +178,16 @@ export interface PnlReconcileResult {
    * not reaching the ledger, independent of any single day's value.
    */
   optionsFieldMissingCount: number;
+  /**
+   * TRA-2314 — how many day cells each source booked. This is the repair's
+   * failing state: a book that was never broken shows no `journal-repair` rows,
+   * a repaired one names them. `bucket-no-census` appearing on a recent day
+   * means the journal went unreadable and the writer silently fell back to the
+   * volatile bucket this ticket exists to stop trusting.
+   */
+  optionsDailyPnlSourceCounts: Record<string, number>;
+  /** TRA-2314 — dates whose `optionsDailyPnl` was rewritten by the historical repair. */
+  repairedDates: string[];
 }
 
 /**
@@ -205,6 +238,7 @@ export function reconcilePnl(
   eodCombinedByDate: ReadonlyMap<string, number>,
   baselineDate: string | null = null,
   journalClosesByDate: ReadonlyMap<string, JournalDayCloses> | null = null,
+  eodOptionsByDate: ReadonlyMap<string, number> | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -234,6 +268,12 @@ export function reconcilePnl(
         journalCloses,
         journalOptionsPnl,
         optionsFalseZero,
+        eodOptionsPnl: eodOptionsByDate?.has(s.date) ? round2(eodOptionsByDate.get(s.date)!) : null,
+        optionsDailyPnlSource: s.optionsDailyPnlSource ?? null,
+        optionsDailyPnlBucket:
+          s.optionsDailyPnlBucket !== undefined && s.optionsDailyPnlBucket !== null
+            ? round2(s.optionsDailyPnlBucket)
+            : null,
         drift,
         belowBaseline,
       };
@@ -261,6 +301,12 @@ export function reconcilePnl(
     falseZeroDates,
     optionsFalseZeroOk: falseZeroDates.length === 0,
     optionsFieldMissingCount: days.filter(d => !d.optionsFieldPresent).length,
+    optionsDailyPnlSourceCounts: days.reduce<Record<string, number>>((acc, d) => {
+      const key = d.optionsDailyPnlSource ?? 'legacy-bucket';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {}),
+    repairedDates: days.filter(d => d.optionsDailyPnlSource === 'journal-repair').map(d => d.date),
   };
 }
 
