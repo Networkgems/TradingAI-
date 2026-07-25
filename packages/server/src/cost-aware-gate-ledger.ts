@@ -687,6 +687,23 @@ export interface CostAwareGateSummary {
    * count off a multi-session window; see {@link CostAwareGateDurability}.
    */
   durability: CostAwareGateDurability;
+  /**
+   * TRA-2295 — WHICH `byStructure` KEY CARRIES THE SPREAD GATE. Read this before
+   * concluding a sleeve is ungated.
+   *
+   * The demo directional sleeve appears under TWO keys, because its gates were built
+   * at different times against different naming conventions: the cost bar and the
+   * delta ceiling record it as `directional` (the engine's internal sleeve name),
+   * while the spread gate records it as `single_leg_directional` (the TRA-2245
+   * JOURNAL label — it has to, since that is the key `SLEEVE_SPREAD_CEILINGS` holds
+   * the ceiling under and the key the verification query groups journal rows by).
+   *
+   * So `byStructure['directional'].spreadCeilingEvaluated` is 0 *by construction*,
+   * on a sleeve whose spread gate is running perfectly — a false negative of exactly
+   * the shape this ticket exists to eliminate. This field names the right key rather
+   * than leaving a reader to discover the split.
+   */
+  spreadCeilingStructureKeys: Record<string, string>;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -836,6 +853,11 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
     decisionsRecorded: decisionsTotal,
     ...foldStructures(day ?? new Map()),
     retained: summarizeRetained(),
+    spreadCeilingStructureKeys: {
+      demo_directional:
+        'single_leg_directional — NOT the `directional` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).',
+      otm: 'single_leg_otm — gated in the OTM scanner chain filter, not by this counter; spreadCeilingEvaluated 0 there is expected.',
+    },
     durability: {
       dataDir,
       ephemeral: isEphemeralDataDir(dataDir),
