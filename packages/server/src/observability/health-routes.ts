@@ -119,6 +119,8 @@ import {
   resolveSessionEdgeBlackoutMinutes,
   SESSION_EDGE_BLACKOUT_FLAG,
 } from '../session-edge-blackout-flag.js'; // TRA-2049
+// TRA-1001 — since-boot counters for the risk-throttle sizing consumer.
+import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
@@ -1268,6 +1270,9 @@ function summarizeForContext(
     // TRA-995 — surface the risk-autopilot's tighten-only state in live health.
     riskThrottle: ctx.engine.getRiskThrottle?.(),
     autopilotActions: ctx.engine.getAutopilotActions?.(),
+    // TRA-1001 — and whether per-trade sizing actually CONSUMES that throttle,
+    // with since-boot trim counts so "armed" and "ever ran" stay separable.
+    throttleSizing: snapshotRiskThrottleSizing(),
   });
 }
 

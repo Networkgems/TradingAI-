@@ -176,6 +176,14 @@ import {
   evaluateRiskAutopilot,
   MIN_RISK_THROTTLE,
 } from './risk-autopilot.js';
+// TRA-1001 — the seam that CONSUMES that throttle in per-trade sizing (gated by
+// RISK_THROTTLE_SIZING_ENABLED; tighten-only by construction).
+import {
+  type RiskThrottleSizingPath,
+  isRiskThrottleSizingEnabled,
+  riskThrottleSizeMultiplier,
+  recordRiskThrottleSizing,
+} from './risk-throttle-sizing.js';
 import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient } from './yahoo-feed.js';
 import {
@@ -5333,7 +5341,9 @@ export class SignalEngine {
 
     const pos = this.mode === 'live'
       ? this.openLiveEquityMirror(signal, price, liveOrderId!, correlatedCapScale)
-      : this.account.openPosition(signal, price, this.activeSizingMultiplier() * correlatedCapScale);
+      // TRA-1001 — the demo book consumes the same tighten-only autopilot
+      // throttle as the live path (folded into the sizing scalar below).
+      : this.account.openPosition(signal, price, this.activeRiskSizingMultiplier('equity_demo') * correlatedCapScale);
     if (pos) {
       pos.mode = this.mode;
       // TRA-1289 — carry the demo forward-test marker onto the position so
@@ -6879,7 +6889,10 @@ export class SignalEngine {
           liveEquity,
           underlyingSpot,
           rvJournalSetup,
-          optionCapScale,
+          // TRA-1001 — the correlated-exposure cap scale AND the risk-autopilot
+          // throttle, composed into the one tighten-only size multiplier the
+          // account applies to the sized contract count.
+          this.activeRiskSizingMultiplier('options_single_leg') * optionCapScale,
         );
         if (!opened) continue;
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
@@ -7466,6 +7479,9 @@ export class SignalEngine {
           undefined,
           underlyingSpot,
           otmJournalSetup,
+          undefined, // no bounded-live contract override on this (demo) path
+          // TRA-1001 — tighten-only autopilot throttle on the OTM sleeve.
+          this.activeRiskSizingMultiplier('options_otm'),
         );
         if (!opened) continue;
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
@@ -8474,6 +8490,8 @@ export class SignalEngine {
           liveEquity,
           spot,
           directionalJournalSetup,
+          // TRA-1001 — tighten-only autopilot throttle on the directional sleeve.
+          this.activeRiskSizingMultiplier('options_single_leg'),
         );
         if (!opened) continue;
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
@@ -9159,6 +9177,8 @@ export class SignalEngine {
       undefined,
       spot,
       journalSetup,
+      // TRA-1001 — tighten-only autopilot throttle on the iv-rv mispricing sleeve.
+      this.activeRiskSizingMultiplier('options_single_leg'),
     );
     if (!opened) return;
 
@@ -10612,7 +10632,10 @@ export class SignalEngine {
   private applyEquityCorrelatedCap(signal: TradeSignal, price: number): number | null {
     if (!isCorrelatedExposureCapEnabled()) return 1;
     const dist = Math.abs(signal.entryPrice - signal.stopLoss);
-    const baseMult = this.activeSizingMultiplier();
+    // TRA-1001 — size the CANDIDATE the way the open path will actually size it
+    // (autopilot throttle folded in), so the cap consults the risk the entry
+    // would really carry rather than an un-throttled overstatement of it.
+    const baseMult = this.activeRiskSizingMultiplier('equity_cap_estimate');
     let sizedQty = 0;
     let managedEquity = 0;
     if (this.mode === 'live') {
@@ -11031,7 +11054,9 @@ export class SignalEngine {
     // TRA-1301 — also fold in the correlated-exposure cap scale (both modes).
     const pos = this.mode === 'live'
       ? this.openLiveEquityMirror(signal, price, liveOrderId!, correlatedCapScale)
-      : this.account.openPosition(signal, price, this.activeSizingMultiplier() * correlatedCapScale);
+      // TRA-1001 — the demo book consumes the same tighten-only autopilot
+      // throttle as the live path (folded into the sizing scalar below).
+      : this.account.openPosition(signal, price, this.activeRiskSizingMultiplier('equity_demo') * correlatedCapScale);
     if (pos) {
       // TRA-231 — same rationale as the signal stamp above; the closed-
       // positions list is filtered per-mode in getState().
@@ -11131,7 +11156,11 @@ export class SignalEngine {
     let qty = this.account.sizeFromStop(signal.entryPrice, signal.stopLoss);
     const maxQtyForEquity = Math.floor(this.account.managedEquity() / ref);
     qty = Math.min(qty, Math.max(0, maxQtyForEquity));
-    const mult = this.activeSizingMultiplier();
+    // TRA-1001 — fold the autopilot throttle in so a proposal's estimated
+    // notional stays a faithful upper bound on what the open path would route
+    // while the book is de-risked (the auto-confirm / daily-cap gates only ever
+    // shrink it further).
+    const mult = this.activeRiskSizingMultiplier('proposal_estimate');
     if (Number.isFinite(mult) && mult > 0 && mult < 1) qty = Math.floor(qty * mult);
     if (qty <= 0) return { size: 0, notional: 0 };
     return { size: qty, notional: qty * ref };
@@ -12083,6 +12112,8 @@ export class SignalEngine {
       undefined,
       intent.spot,
       singleLegJournalSetup,
+      // TRA-1001 — tighten-only autopilot throttle on the AI-ideas single-leg open.
+      this.activeRiskSizingMultiplier('options_single_leg'),
     );
     if (opened) {
       this.tracker?.saveEquity(
@@ -13570,6 +13601,40 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-1001 (parent TRA-995) — the per-trade sizing scalar every entry
+   * chokepoint composes into its `sizeMultiplier`:
+   *
+   *     activeSizingMultiplier()  ×  risk-autopilot throttle
+   *     (always 1 since TRA-474)     (tighten-only, (0,1])
+   *
+   * The autopilot's HALT has always been consumed live (`isHalted()` gates every
+   * entry); until this method existed its THROTTLE was surfaced-only, so a
+   * "de-risked to 50%" action in health + EOD still sized tickets at 100%.
+   *
+   * Tighten-only by construction: `riskThrottleSizeMultiplier` never returns
+   * > 1, and every consumer applies its `sizeMultiplier` argument only when it
+   * is < 1 — so this can shrink a sized quantity and can never raise one.
+   *
+   * DARK until `RISK_THROTTLE_SIZING_ENABLED` is armed (see
+   * {@link isRiskThrottleSizingEnabled}); unarmed the multiplier is exactly 1 and
+   * sizing is byte-for-byte the pre-TRA-1001 behaviour. Every consult is counted
+   * either way, so `/api/health/*` can show how often a throttle WOULD have
+   * trimmed before the board flips it — and, once armed, whether it ever did.
+   */
+  private activeRiskSizingMultiplier(path: RiskThrottleSizingPath): number {
+    const armed = isRiskThrottleSizingEnabled();
+    const throttle = this.riskGovernor.getRiskThrottle();
+    const mult = riskThrottleSizeMultiplier(throttle, armed);
+    recordRiskThrottleSizing(path, { armed, throttle, multiplier: mult });
+    return this.activeSizingMultiplier() * mult;
+  }
+
+  /** TRA-1001 — test seam: the composed sizing scalar for a given chokepoint. */
+  _riskSizingMultiplierForTests(path: RiskThrottleSizingPath): number {
+    return this.activeRiskSizingMultiplier(path);
+  }
+
+  /**
    * TRA-995 — run the standing risk autopilot for this tick. Feeds the governor
    * the three standing signals it can't see from its own trade counters:
    *   • feed staleness — during market hours, true when NO active symbol carries
@@ -13721,7 +13786,9 @@ export class SignalEngine {
       currentPrice,
       // TRA-389 — trim the live order by the regime position-size scalar.
       // TRA-1301 — and by the correlated-exposure cap scale (Rule 5).
-      sizeMultiplier: this.activeSizingMultiplier() * capScale,
+      // TRA-1001 — and by the risk-autopilot's tighten-only throttle, so a
+      // de-risk decision short of a halt actually shrinks the broker order.
+      sizeMultiplier: this.activeRiskSizingMultiplier('equity_live') * capScale,
     });
     if (qty <= 0) {
       return {
@@ -13911,7 +13978,10 @@ export class SignalEngine {
       // TRA-389 — keep the local mirror's qty in lockstep with the broker
       // order placed by `placeTradierEquityBracket` (same regime scalar).
       // TRA-1301 — and the same correlated-exposure cap scale.
-      sizeMultiplier: this.activeSizingMultiplier() * capScale,
+      // TRA-1001 — and the same autopilot throttle. The throttle only ratchets
+      // DOWN within a day and both calls happen on the same tick, so the mirror
+      // cannot size ABOVE the broker order it mirrors.
+      sizeMultiplier: this.activeRiskSizingMultiplier('equity_live_mirror') * capScale,
     });
     if (qty <= 0) return null;
     const position: Position = {

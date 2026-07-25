@@ -16,6 +16,7 @@
 import type { AccountMode, TradierEnv } from '@trading-app/shared';
 import { MAX_QUOTE_AGE_MS } from '../feed-freshness.js';
 import type { AutopilotAction } from '../risk-autopilot.js';
+import type { RiskThrottleSizingSnapshot } from '../risk-throttle-sizing.js';
 
 export type HealthStatus = 'green' | 'yellow' | 'red';
 
@@ -51,6 +52,13 @@ export interface LiveHealthInput {
   riskThrottle?: number;
   /** TRA-995 — the rolling autopilot action log (halts/throttles + reasons). */
   autopilotActions?: AutopilotAction[];
+  /**
+   * TRA-1001 — since-boot counters for the sizing paths that CONSUME the
+   * throttle. Optional: absent ⇒ the caller didn't supply it (the field is
+   * omitted from the summary rather than reported as a zeroed rollup, because
+   * "never consulted" and "not measured" are different states).
+   */
+  throttleSizing?: RiskThrottleSizingSnapshot;
 }
 
 export interface FeedHealth {
@@ -89,6 +97,15 @@ export interface LiveHealthSummary {
     /** True when the autopilot has tightened risk below full size. */
     throttled: boolean;
     actions: AutopilotAction[];
+    /**
+     * TRA-1001 — whether the throttle is CONSUMED by per-trade sizing, and how
+     * often it has actually trimmed a ticket since boot. `throttled: true` with
+     * `sizing.armed: false` is the honest "de-risk decided, sizing unchanged"
+     * state that shipped with TRA-995; `armed: true, totalTrims: 0` means the
+     * consuming path has never seen a sub-1 throttle at an entry — NOT that it
+     * works. Absent when the caller didn't measure it.
+     */
+    sizing?: RiskThrottleSizingSnapshot;
   };
 }
 
@@ -198,8 +215,14 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
   const throttled = riskThrottle < 1;
   if (throttled && !input.tradingHalted) {
     const lastThrottle = [...autopilotActions].reverse().find((a) => a.kind === 'throttle');
+    // TRA-1001 — say whether the throttle is actually CONSUMED by sizing. An
+    // unarmed consumer means the de-risk is advisory: the reader must not infer
+    // "the firm is trading smaller" from a throttle alone.
+    const consumed = input.throttleSizing
+      ? (input.throttleSizing.armed ? '' : ' (sizing consumer DARK — tickets still size at full risk)')
+      : '';
     issues.push(
-      `Risk autopilot throttled to ${(riskThrottle * 100).toFixed(0)}%${lastThrottle ? ` — ${lastThrottle.reason}` : ''}`,
+      `Risk autopilot throttled to ${(riskThrottle * 100).toFixed(0)}%${lastThrottle ? ` — ${lastThrottle.reason}` : ''}${consumed}`,
     );
     escalate('yellow');
   }
@@ -214,6 +237,12 @@ export function summarizeLiveHealth(input: LiveHealthInput): LiveHealthSummary {
     marketOpen: input.marketOpen,
     feed,
     issues,
-    autopilot: { riskThrottle, throttled, actions: autopilotActions },
+    autopilot: {
+      riskThrottle,
+      throttled,
+      actions: autopilotActions,
+      // TRA-1001 — omitted (not zeroed) when the caller didn't measure it.
+      ...(input.throttleSizing ? { sizing: input.throttleSizing } : {}),
+    },
   };
 }

@@ -1569,6 +1569,17 @@ export class PaperOptionsAccount {
      * the prior demo/live sizing behaviour.
      */
     boundedLiveContracts?: number,
+    /**
+     * TRA-1001 (parent TRA-995) — tighten-only position-size scalar in (0,1],
+     * today carrying the risk-autopilot's throttle. Applied to the sized
+     * contract count (floored); a scale that rounds the count below 1 refuses
+     * the entry rather than opening a token ticket, which is itself a
+     * tightening. Defaults to 1 (no trim) for callers that don't consume the
+     * throttle. Ignored when {@link boundedLiveContracts} is set — that path is
+     * a board-fixed exact contract count that deliberately bypasses sizing (a
+     * throttle can't halve one contract; the autopilot's HALT still gates it).
+     */
+    sizeMultiplier = 1,
   ): OptionPosition | null {
     this.resetDayIfNeeded();
 
@@ -1609,9 +1620,15 @@ export class PaperOptionsAccount {
     // TRA-378 — `sizeContracts` applies the forced 1-contract floor (live).
     // TRA-1929 — the bounded live test forces an exact contract count and skips the
     // % sizing entirely (the notional cap is enforced upstream against real cash).
-    const contracts = boundedLiveContracts !== undefined
+    // TRA-1001 — trim the sized count by the tighten-only size multiplier
+    // (risk-autopilot throttle). `>= 1` short-circuits to the untouched count so
+    // the unarmed/no-throttle case is byte-for-byte the prior behaviour.
+    const sizedContracts = boundedLiveContracts !== undefined
       ? boundedLiveContracts
       : this.sizeContracts(budget, costPerContract, equityOverride);
+    const contracts = boundedLiveContracts === undefined && sizeMultiplier < 1
+      ? Math.floor(sizedContracts * sizeMultiplier)
+      : sizedContracts;
     if (contracts <= 0) return null;
 
     const totalCost = contracts * costPerContract;
@@ -1707,6 +1724,10 @@ export class PaperOptionsAccount {
      * sized contract count (floored); a scale that rounds contracts below 1
      * rejects the entry rather than opening a sub-contract ticket. Defaults to 1
      * (no trim) for callers that don't apply the cap.
+     *
+     * TRA-1001 — callers now pass the PRODUCT of that cap scale and the
+     * risk-autopilot's tighten-only throttle. Both factors are ≤ 1, so the
+     * composed scalar can only ever shrink the contract count.
      */
     sizeMultiplier = 1,
   ): OptionPosition | null {
@@ -1741,12 +1762,15 @@ export class PaperOptionsAccount {
     // TRA-1301 (Rule 5) — trim the sized count by the correlated-exposure cap
     // scale (floored). A scale that rounds the count below 1 rejects the entry:
     // a token sub-contract correlated add is not worth the ticket.
+    // TRA-1001 — the same scalar now also carries the risk-autopilot throttle
+    // (the caller composes cap × throttle), so the reason names both sources
+    // rather than blaming the cap for a de-risk the autopilot ordered.
     const contracts = sizeMultiplier < 1
       ? Math.floor(sizedContracts * sizeMultiplier)
       : sizedContracts;
     if (sizedContracts > 0 && contracts <= 0)
       return this.rejectEntry(
-        `correlated-exposure cap (Rule 5) trimmed the size below one contract — token correlated add skipped`,
+        `position-size multiplier ${sizeMultiplier.toFixed(2)} (correlated-exposure cap Rule 5 × risk-autopilot throttle) trimmed the size below one contract — token add skipped`,
       );
     if (contracts <= 0)
       return this.rejectEntry(
