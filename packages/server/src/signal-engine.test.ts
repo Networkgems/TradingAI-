@@ -6023,6 +6023,78 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
       expect(row!.spreadCeilingRejected).toBe(1);
       expect(row!.maxAdmittedSpreadPct).toBeLessThanOrEqual(0.10);
     });
+
+    // ── TRA-2338 — the row on the surface TRA-2306 ACTUALLY GRADES ────────────
+    //
+    // Every assertion above reads the DAY view (`byStructure`). TRA-2306's verdict
+    // rule reads `retained.byStructure` — the multi-day roll — and after five armed
+    // RTH sessions prod had never shown a `single_leg_directional` row there at all
+    // (only `directional` and `single_leg_otm`), which is indistinguishable from
+    // "this key can never appear". It can: the roll folds through the same
+    // `foldStructures`, and the gate call site and the journal stamp both key off
+    // the ONE `DIRECTIONAL_STRUCTURE_LABEL` constant. Pinned here so the graded
+    // field is covered directly rather than by inference from the day view.
+    it('the RETAINED roll — the field TRA-2306 grades — carries the single_leg_directional row', async () => {
+      // Negative control FIRST: absent before the path runs, so the assertion
+      // below has a failing state and is not green by construction.
+      const before = summarizeCostAwareGate(etDateString(new Date()))
+        .retained.byStructure.find(s => s.structure === 'single_leg_directional');
+      expect(before).toBeUndefined();
+
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.02) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+
+      const retained = summarizeCostAwareGate(etDateString(new Date())).retained;
+      const row = retained.byStructure.find(s => s.structure === 'single_leg_directional');
+      expect(row).toBeDefined();
+      expect(row!.spreadCeilingEvaluated).toBeGreaterThanOrEqual(1);
+      expect(retained.spreadCeilingEvaluatedTotal).toBeGreaterThanOrEqual(1);
+      expect(row!.maxAdmittedSpreadPct).toBeLessThanOrEqual(0.10);
+    });
+
+    // TRA-2338 — the ORDERING invariant that makes the two rows cross-checkable.
+    //
+    // The spread gate runs at `evaluateDemoDirectional` BEFORE the cost bar's
+    // `recordCostAwareGateDecision('directional', …)`, with no `continue` between
+    // them other than the spread gate's own refusal. So a `directional` row cannot
+    // accrue a decision that the spread gate did not rule on first: on any armed
+    // day `single_leg_directional.spreadCeilingEvaluated >= directional.decisions`.
+    // A live read where the `directional` row moves and `single_leg_directional`
+    // does NOT is therefore not a quiet day — it is a broken gate.
+    it('the spread gate is UPSTREAM of the cost bar — directional decisions can never outrun spreadCeilingEvaluated', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      process.env['ENABLE_OPTION_COST_AWARE_GATE'] = '1'; // the `directional` row's only writer
+      try {
+        const svc = scannerFor({
+          UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.02) },
+          DWN: { symbol: 'DWN', spot: 300, expiration: '2024-07-19', rows: chainWithSpread('DWN', 300, 0.02) },
+        });
+        const engine = new SignalEngine(undefined, undefined, svc);
+        seedTrend(engine, 'UPP', sawUp(480));
+        seedTrend(engine, 'DWN', sawDown(480));
+
+        await run(engine, ['UPP', 'DWN']);
+
+        const retained = summarizeCostAwareGate(etDateString(new Date())).retained;
+        const dir = retained.byStructure.find(s => s.structure === 'directional');
+        const spread = retained.byStructure.find(s => s.structure === 'single_leg_directional');
+        // Both keys are populated by the SAME loop iteration — the split is naming,
+        // not routing. (This is the pair prod showed as `directional` present /
+        // `single_leg_directional` absent, on decisions recorded before the gate existed.)
+        expect(dir).toBeDefined();
+        expect(spread).toBeDefined();
+        expect(dir!.admitted + dir!.rejected).toBeGreaterThanOrEqual(1);
+        expect(spread!.spreadCeilingEvaluated).toBeGreaterThanOrEqual(dir!.admitted + dir!.rejected);
+        // And the cost bar's own counters stay OFF the spread axis (four disjoint axes).
+        expect(dir!.spreadCeilingEvaluated).toBe(0);
+      } finally {
+        delete process.env['ENABLE_OPTION_COST_AWARE_GATE'];
+      }
+    });
   });
 });
 
