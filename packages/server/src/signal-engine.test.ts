@@ -5805,6 +5805,165 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     expect(surfaced!.mode).toBe('live');
     expect(surfaced!.liveSkipReason).toMatch(/rejected|insufficient/i);
   });
+
+  // ── TRA-2295 (parent TRA-2291) — the spread ceiling, enforced at the ENTRY ────
+  //
+  // THE BUG: this sleeve's 0.10 `maxSpreadPct` lives at `relative-value.ts:396`,
+  // inside the RV scanner's `prepareChain` — reachable only from `scan()`. The
+  // directional path reads `getSelectorChain`, which returns RAW chain rows. So the
+  // ceiling was inherited from code that never ran, and 59 of 83 live desk entries
+  // crossed it (worst 1.933 = 19×, on a book quoted bid 0.01 / ask 0.59).
+  //
+  // These tests are built around the thing that made the bug survive 83 fills: a
+  // gate that never runs and a gate with nothing to reject produce the SAME reading.
+  // So every assertion below is paired with its opposite state — a wide chain that
+  // must be refused AND a tight chain that must fill, the counter in each case — and
+  // the kill-switch test is the mutation control proving the wide fixture is refused
+  // BY THIS GATE and not by some unrelated guard upstream.
+  describe('spread ceiling on the directional entry path (TRA-2295)', () => {
+    beforeEach(() => {
+      clearCostAwareGateLedger();
+      delete process.env['OPTION_SPREAD_CEILING_ENFORCE'];
+      delete process.env['OPTION_SPREAD_CEILING_MIN_BID_USD'];
+    });
+    afterEach(() => {
+      clearCostAwareGateLedger();
+      delete process.env['OPTION_SPREAD_CEILING_ENFORCE'];
+      delete process.env['OPTION_SPREAD_CEILING_MIN_BID_USD'];
+    });
+
+    /**
+     * A chain whose rows carry an EXPLICIT bid/ask, so the spread is the variable
+     * under test. `halfWidthPct` is each side's offset from the mid, i.e. the row's
+     * `spreadPct` is `2 * halfWidthPct`.
+     */
+    function chainWithSpread(sym: string, spot: number, halfWidthPct: number, midFloor = 2.0) {
+      const rows = [];
+      for (let k = spot - 5; k <= spot + 5; k += 1) {
+        const putMid = Math.max(k - spot, 0) + midFloor;
+        const callMid = Math.max(spot - k, 0) + midFloor;
+        rows.push({ optionSymbol: `${sym}P${k}`, underlying: sym, optionType: 'put' as const, strike: k, expiration: '2024-07-19', bid: putMid * (1 - halfWidthPct), ask: putMid * (1 + halfWidthPct), openInterest: 1000, smvVol: 0.45 });
+        rows.push({ optionSymbol: `${sym}C${k}`, underlying: sym, optionType: 'call' as const, strike: k, expiration: '2024-07-19', bid: callMid * (1 - halfWidthPct), ask: callMid * (1 + halfWidthPct), openInterest: 1000, smvVol: 0.45 });
+      }
+      return rows;
+    }
+
+    function directionalRow() {
+      return summarizeCostAwareGate(etDateString(new Date()))
+        .byStructure.find(s => s.structure === 'single_leg_directional');
+    }
+
+    // The regression itself: the exact shape of the worst live fill (SOXS at
+    // spreadPct 1.933) must not reach the book.
+    it('REFUSES a contract above the 0.10 ceiling — the 83-fill leak', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      // halfWidth 0.40 ⇒ spreadPct 0.80, 8× the ceiling. Comfortably inside the
+      // 1.933 the live journal actually admitted.
+      const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.40) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+
+      expect(engine.getState().options.openOptions).toHaveLength(0);
+      const row = directionalRow();
+      // NOT just `rejected > 0` — `evaluated` is the field that says the gate RAN.
+      expect(row!.spreadCeilingEvaluated).toBe(1);
+      expect(row!.spreadCeilingRejected).toBe(1);
+      expect(row!.spreadCeilingRejectsByCode).toEqual({ max_spread_pct: 1 });
+      // Nothing was admitted, so there is no admitted maximum to report. `null`,
+      // not 0 — a 0 here would read as "admitted something with no spread".
+      expect(row!.maxAdmittedSpreadPct).toBeNull();
+    });
+
+    // The POSITIVE CONTROL. Without this, "no opens" could just as well mean the
+    // fixture never produced a candidate — which is how an inert gate passes for
+    // an enforcing one.
+    it('ADMITS a contract inside the ceiling, and reports the max it let through', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      // halfWidth 0.02 ⇒ spreadPct 0.04, inside 0.10.
+      const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.02) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+      const row = directionalRow();
+      expect(row!.spreadCeilingEvaluated).toBe(1);
+      expect(row!.spreadCeilingRejected).toBe(0);
+      // THE INVARIANT the ticket's verification step asks for, readable off the
+      // health route instead of re-derived from the journal.
+      expect(row!.maxAdmittedSpreadPct).toBeLessThanOrEqual(0.10);
+      expect(row!.maxAdmittedSpreadPct).toBeCloseTo(0.04, 6);
+      // "Ran and rejected nothing" is a RATE of 0; "never ran" is not a rate at all.
+      expect(row!.spreadCeilingRejectRate).toBe(0);
+    });
+
+    // MUTATION CONTROL — disarm only the gate and the same fixture fills. This is
+    // what proves the refusal above is attributable to the spread ceiling rather
+    // than to the quality gate, the churn brake, sizing, or the trading window.
+    it('kill switch OFF — the SAME over-ceiling chain fills, and nothing is counted', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      process.env['OPTION_SPREAD_CEILING_ENFORCE'] = '0';
+      const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.40) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+      // And the telemetry reports the disarmed state HONESTLY: no structure row at
+      // all, so `spreadCeilingEvaluated` is absent rather than a reassuring 0
+      // sitting next to a book full of over-ceiling fills. That absence IS the
+      // pre-TRA-2295 production reading.
+      expect(directionalRow()).toBeUndefined();
+    });
+
+    // Requirement 2: the ceiling alone is not enough. This quote's spreadPct is
+    // 0.0952 — INSIDE 0.10 — on a book quoted 5¢ bid. `bid 0.05 / ask 2.75` was a
+    // real admitted contract (QTTB); a ratio test is the wrong instrument for it.
+    it('REFUSES a sub-dime bid that passes the ratio test — an absent market, not a wide one', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.0476, 0.0525) } });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+
+      await run(engine, ['UPP']);
+
+      expect(engine.getState().options.openOptions).toHaveLength(0);
+      const row = directionalRow();
+      expect(row!.spreadCeilingRejected).toBe(1);
+      // Attributed to the LEVEL, not the ratio — the ratio would have passed it.
+      expect(row!.spreadCeilingRejectsByCode).toEqual({ min_bid: 1 });
+      expect(row!.avgRejectedSpreadPct!).toBeLessThan(0.10);
+    });
+
+    // The journal-side check the ticket's verification step runs against live rows,
+    // executed here against a mixed chain: the sleeve must fill the tight name and
+    // refuse the wide one in the SAME pass, so a zero-open outcome cannot be
+    // mistaken for a dead scan.
+    it('mixed pass — fills the quotable name, refuses the wide one, 0 rows over ceiling', async () => {
+      process.env[OPTION_DEMO_DIRECTIONAL_FLAG] = 'true';
+      const svc = scannerFor({
+        UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainWithSpread('UPP', 100, 0.02) },
+        DWN: { symbol: 'DWN', spot: 300, expiration: '2024-07-19', rows: chainWithSpread('DWN', 300, 0.45) },
+      });
+      const engine = new SignalEngine(undefined, undefined, svc);
+      seedTrend(engine, 'UPP', sawUp(480));
+      seedTrend(engine, 'DWN', sawDown(480));
+
+      await run(engine, ['UPP', 'DWN']);
+
+      const open = engine.getState().options.openOptions;
+      expect(open).toHaveLength(1);
+      expect(open[0]!.symbol).toBe('UPP');
+      const row = directionalRow();
+      expect(row!.spreadCeilingEvaluated).toBe(2);
+      expect(row!.spreadCeilingRejected).toBe(1);
+      expect(row!.maxAdmittedSpreadPct).toBeLessThanOrEqual(0.10);
+    });
+  });
 });
 
 // TRA-327 — regression-lock the demo↔live daily-trade-limit isolation contract.

@@ -5,6 +5,8 @@ import {
   commissionR,
   SLEEVE_SPREAD_CEILINGS,
   STOP_DISTANCE_FRACTION_OF_MARK,
+  spreadGateVerdict,
+  isSpreadCeilingEnforceEnabled,
 } from './option-spread-cost.js';
 import { DEFAULT_COST_GATE_CONFIG } from './option-cost-gate.js';
 
@@ -159,5 +161,117 @@ describe('summarizeSpreadCost', () => {
   it('omits avgCommissionR when no row carries a contract count', () => {
     const [rv] = summarizeSpreadCost([{ structure: 'single_leg_rv', quote: q(1.94, 2.06, 2.0) }]);
     expect(rv!.avgCommissionR).toBeNull();
+  });
+});
+
+// ── TRA-2295 (parent TRA-2291) ───────────────────────────────────────────────
+//
+// The ceiling above is a NUMBER; until TRA-2295 the directional sleeve had no code
+// that applied it (its reject lived in the compile-time-OFF RV scanner), so 59 of 83
+// live desk entries crossed it — worst 1.933, 19×. `spreadGateVerdict` is the
+// predicate that closes that, evaluated on the same quote that prices the fill.
+
+describe('spreadGateVerdict — the entry-path ceiling (TRA-2295)', () => {
+  const q = (bid: number, ask: number) => ({ bid, ask, mark: (bid + ask) / 2 });
+
+  it('admits a quote inside both thresholds and reports the measured spreadPct', () => {
+    const v = spreadGateVerdict('single_leg_directional', q(1.96, 2.04));
+    expect(v.admitted).toBe(true);
+    expect(v.code).toBe('ok');
+    expect(v.reason).toBeNull();
+    expect(v.spreadPct).toBeCloseTo(0.04, 10);
+  });
+
+  it('refuses the worst contract the live journal actually admitted (SOXS, 19x)', () => {
+    // SOXS260821C00042000 — bid 0.01 / ask 0.59, spreadPct 1.933 against a 0.10
+    // ceiling. It filled. This assertion is the regression.
+    const v = spreadGateVerdict('single_leg_directional', q(0.01, 0.59));
+    expect(v.admitted).toBe(false);
+    expect(v.spreadPct!).toBeGreaterThan(1.9);
+    expect(v.thresholds!.maxSpreadPct).toBe(0.1);
+  });
+
+  it('is a `>` test, and resolves a quote within float noise of the ceiling CONSERVATIVELY', () => {
+    // Strictly inside admits, strictly outside rejects.
+    expect(spreadGateVerdict('single_leg_rv', { bid: 0.96, ask: 1.04, mark: 1.0 }).admitted).toBe(true);
+    const over = spreadGateVerdict('single_leg_rv', { bid: 0.949, ask: 1.051, mark: 1.0 });
+    expect(over.admitted).toBe(false);
+    expect(over.code).toBe('max_spread_pct');
+
+    // AT the ceiling, binary floating point decides: `1.05 - 0.95` is
+    // 0.10000000000000009, so a nominally-exactly-0.10 quote lands one ULP OVER
+    // and is refused. Pinned rather than papered over with an epsilon — the error
+    // is ~1e-17 of a ceiling quoted to two decimals, and it errs TIGHT. A
+    // tolerance here would be a real loosening of the gate to buy a cosmetic
+    // boundary, which is the wrong trade on the ticket that exists because this
+    // ceiling was not enforced at all.
+    expect(spreadGateVerdict('single_leg_rv', { bid: 0.95, ask: 1.05, mark: 1.0 }).admitted).toBe(false);
+  });
+
+  it('applies each sleeve its OWN ceiling — 0.15 passes OTM and fails directional', () => {
+    const quote = { bid: 0.925, ask: 1.075, mark: 1.0 }; // spreadPct 0.15
+    expect(spreadGateVerdict('single_leg_otm', quote).admitted).toBe(true);
+    expect(spreadGateVerdict('single_leg_directional', quote).admitted).toBe(false);
+  });
+
+  it('refuses a sub-floor BID that passes the ratio test (QTTB-shaped absent market)', () => {
+    // spreadPct 0.0952 — inside 0.10 — on a nickel bid. A ratio test alone admits
+    // this; requirement 2 of the ticket exists because it should not.
+    const v = spreadGateVerdict('single_leg_directional', q(0.05, 0.055));
+    expect(v.spreadPct!).toBeLessThan(0.1);
+    expect(v.admitted).toBe(false);
+    expect(v.code).toBe('min_bid');
+  });
+
+  it('FAILS CLOSED on an unmeasurable quote — never admits what it cannot bound', () => {
+    // A crossed book. Admitting it would reintroduce, at the gate, exactly the
+    // writer-side false zero `measureSpreadCross` refuses at the measurement: an
+    // entry whose spread cannot be computed is not an entry whose spread is zero.
+    for (const bad of [
+      { bid: 2.1, ask: 1.9, mark: 2.0 },
+      { bid: 1.0, ask: 2.0, mark: 0 },
+      { bid: Number.NaN, ask: 2.0, mark: 1.5 },
+    ]) {
+      const v = spreadGateVerdict('single_leg_directional', bad);
+      expect(v.admitted).toBe(false);
+      expect(v.code).toBe('no_quote');
+      expect(v.spreadPct).toBeNull();
+    }
+  });
+
+  it('says NO_CEILING out loud for an unconfigured sleeve rather than passing silently', () => {
+    // A caller that wires the wrong sleeve name must be legible. If this returned a
+    // plain `ok`, a typo'd label would produce a gate that admits everything and
+    // reads identically to one that is enforcing — the TRA-2295 failure, relocated.
+    const v = spreadGateVerdict('single_leg_typo', q(0.01, 0.59));
+    expect(v.admitted).toBe(true);
+    expect(v.code).toBe('no_ceiling');
+    expect(v.thresholds).toBeNull();
+  });
+
+  it('honours a minBid override and keeps crossR consistent with an overridden ceiling', () => {
+    expect(spreadGateVerdict('single_leg_directional', q(0.05, 0.055), { minBidUsd: 0.01 }).admitted).toBe(true);
+    const v = spreadGateVerdict('single_leg_directional', q(1.96, 2.04), { maxSpreadPct: 0.02 });
+    expect(v.admitted).toBe(false);
+    expect(v.thresholds!.maxSpreadCrossR).toBeCloseTo(0.08, 10); // 4 · 0.02, still the identity
+  });
+});
+
+describe('isSpreadCeilingEnforceEnabled — default ON (TRA-2295)', () => {
+  it('is ON when unset, and ON for anything that is not an explicit off value', () => {
+    // Opposite polarity from the dark demo gates on purpose: this restores a bound
+    // three call sites already documented as being in force, and an unset flag is
+    // indistinguishable from a WIPED one (TRA-2136 erased twelve Render vars and
+    // every dependent gate went silently inert).
+    expect(isSpreadCeilingEnforceEnabled({})).toBe(true);
+    expect(isSpreadCeilingEnforceEnabled({ OPTION_SPREAD_CEILING_ENFORCE: '' })).toBe(true);
+    expect(isSpreadCeilingEnforceEnabled({ OPTION_SPREAD_CEILING_ENFORCE: 'ture' })).toBe(true);
+    expect(isSpreadCeilingEnforceEnabled({ OPTION_SPREAD_CEILING_ENFORCE: '1' })).toBe(true);
+  });
+
+  it('disarms ONLY on an explicit off value', () => {
+    for (const off of ['0', 'false', 'no', 'off', ' OFF ']) {
+      expect(isSpreadCeilingEnforceEnabled({ OPTION_SPREAD_CEILING_ENFORCE: off })).toBe(false);
+    }
   });
 });

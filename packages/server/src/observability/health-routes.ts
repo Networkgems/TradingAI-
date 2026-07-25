@@ -2012,7 +2012,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         safetyMarginR: config.safetyMarginR,
         barR: admissionBarR('single_leg_otm', config),
         source:
-          'MEASURED (TRA-1656 → TRA-1661): shipped default 0.235R = the OTM-sleeve mean cross, applied blended across sleeves (conservative: it overcharges RV by ~0.075R). Overridable via OPTION_COST_GATE_SPREAD_CROSS_R.',
+          'MEASURED (TRA-1656 → TRA-1661): shipped default 0.235R = the OTM-sleeve mean cross, applied blended across sleeves. Overridable via OPTION_COST_GATE_SPREAD_CROSS_R. ⚠ TRA-2295 RETRACTS the "conservative — it overcharges RV by ~0.075R" rider that used to end this sentence: that rested on the 0.10 ceiling binding, and it did not bind on the directional sleeve. Pre-TRA-2295 directional fills reached spreadPct 1.933 = 7.73R of true cross, so this input UNDER-billed the worst of them ~33× and the 1.00R predecessor ~7.7×. The rider is expected to hold again forward of the TRA-2295 gate; re-measure `byStructure` on post-fix rows before restating it.',
       },
 
       // (1) The measurement.
@@ -2032,11 +2032,34 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             : `Measured over ${rowsWithQuote} of ${rowsTotal} demo journal rows that retain a fill-time quote. Rows without a quote DROP OUT (never counted as zero-cost fills), so this mean is not biased toward cheap.`,
       },
 
-      // (3) The selection-independent bound — valid at n = 0.
+      // (3) The ceiling — and, since TRA-2295, WHERE IT IS ACTUALLY ENFORCED.
+      //
+      // ⚠ This block used to publish: "the scanners reject spreadPct > maxSpreadPct
+      // BEFORE selection. So no contract these sleeves can buy crosses above its
+      // ceiling — independent of which contracts get picked." That sentence was
+      // false against the live journal at a 71% rate, and it was load-bearing for
+      // TRA-1647's claim that the gate's 1.00R charge is conservative. On the worst
+      // admitted contract (spreadPct 1.933) the true cross was 4 · 1.933 = 7.73R, so
+      // the gate UNDER-billed it ~7.7× — the opposite direction from the claim.
+      //
+      // A ceiling is a property of the ENTRY PATH, not of this table, so the table
+      // alone can no longer be read as evidence. `enforcedAt` says which paths apply
+      // it, and `/api/health/cost-aware-gate` → `byStructure[].spreadCeilingEvaluated`
+      // is the live proof for a given sleeve on a given day: 0 means the gate did not
+      // run, and `maxAdmittedSpreadPct` above a sleeve's `maxSpreadPct` is a
+      // falsification of enforcement that needs no journal query at all.
       ceilings: {
         ...SLEEVE_SPREAD_CEILINGS,
+        enforcedAt: {
+          single_leg_otm:
+            'otm-mispricing.ts:185, inside the OTM scanner chain filter. RUNS. Positive control: live desk journal max spreadPct 0.196 vs the 0.20 ceiling, 0/27 over.',
+          single_leg_rv:
+            'relative-value.ts:396, inside the RV scanner chain filter — which NEVER RUNS (RV_ENGINE_ENABLED is a compile-time false since TRA-1207/2026-06-30). No live sleeve is gated by this entry.',
+          single_leg_directional:
+            'signal-engine.ts `spreadCeilingRejectReason`, on the entry path itself, from TRA-2295. Applied to the same quote journaled as entryBid/entryAsk. Before TRA-2295 this sleeve ran NO spread gate: it read raw getSelectorChain rows and 59 of 83 desk entries crossed the 0.10 ceiling, worst 1.933 (19×).',
+        },
         note:
-          'spreadCrossR = (ask − bid) / (0.25 · mark) = 4 · spreadPct, and the scanners reject spreadPct > maxSpreadPct BEFORE selection. So no contract these sleeves can buy crosses above its ceiling — independent of which contracts get picked. The gate charges 1.00R, which is ABOVE both ceilings: it bills every candidate more than the worst contract the scanner is even allowed to admit.',
+          'spreadCrossR = (ask − bid) / (0.25 · mark) = 4 · spreadPct. A ceiling BOUNDS the cross only for a sleeve whose ENTRY PATH evaluates it — see `enforcedAt`, and verify per-day via /api/health/cost-aware-gate (spreadCeilingEvaluated > 0, maxAdmittedSpreadPct <= maxSpreadPct). Do NOT infer a bound from this table alone; that inference is exactly what TRA-2295 falsified.',
       },
 
       // (4) Why deliverable D's slippage ledger could never have supplied the number.

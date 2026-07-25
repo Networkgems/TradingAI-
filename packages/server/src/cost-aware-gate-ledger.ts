@@ -57,7 +57,18 @@ const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
 // because the two must never be summed: one is a trade that did not happen, the other is
 // a trade that DID. Conflating them would report a sleeve as cut while it was still
 // trading the tail (the TRA-1682 lesson, one gate over).
-type CostGateKind = 'cost_bar' | 'delta_ceiling' | 'delta_ceiling_observed';
+// `spread_ceiling` / `spread_ceiling_admitted` (TRA-2295) are the SPREAD gate's two
+// outcomes, and BOTH are recorded on purpose. A reject counter alone reproduces the
+// exact defect that ticket exists to fix: an unenforced gate and a gate with nothing
+// to reject both read `0`. Only `evaluated = admitted + rejected` separates them —
+// `evaluated === 0` is "this gate did not run", `evaluated > 0, rejected === 0` is
+// "it ran and everything was inside the ceiling".
+type CostGateKind =
+  | 'cost_bar'
+  | 'delta_ceiling'
+  | 'delta_ceiling_observed'
+  | 'spread_ceiling'
+  | 'spread_ceiling_admitted';
 
 /** One durable decision — a write-through of the verdict the gate just returned. */
 interface CostGateDecisionRecord {
@@ -77,6 +88,10 @@ interface CostGateDecisionRecord {
   gate?: CostGateKind;
   /** `delta_ceiling` records only: the |delta| that breached the ceiling. */
   absDelta?: number;
+  /** TRA-2295 `spread_ceiling*` records only: the measured `(ask − bid) / mark`. */
+  spreadPct?: number;
+  /** TRA-2295 `spread_ceiling` rejects only: which threshold bit (`max_spread_pct` / `min_bid` / `no_quote`). */
+  code?: string;
 }
 
 interface StructureTally {
@@ -98,6 +113,49 @@ interface StructureTally {
   deltaCeilingObserved: number;
   /** Sum of the |delta|s of the observed (admitted) breaches. */
   deltaCeilingObservedAbsDeltaSum: number;
+  /** TRA-2295 — candidates the SPREAD ceiling admitted (it ran and they were inside it). */
+  spreadCeilingAdmitted: number;
+  /** TRA-2295 — candidates the SPREAD ceiling refused. Disjoint from every counter above. */
+  spreadCeilingRejected: number;
+  /** Sum of the refused `spreadPct`s, for the mean in the health view. */
+  spreadCeilingRejectedSpreadPctSum: number;
+  /**
+   * TRA-2295 — the LARGEST `spreadPct` the gate let through, `null` when it has admitted
+   * nothing. THE invariant field: an enforcing gate can never publish a value above its
+   * own ceiling, so this is the live-telemetry twin of the journal check in the ticket's
+   * verification step, readable without re-deriving anything from the journal.
+   */
+  spreadCeilingMaxAdmittedSpreadPct: number | null;
+  /** TRA-2295 — refusals split by which threshold bit. */
+  spreadCeilingRejectsByCode: Map<string, number>;
+}
+
+/**
+ * One zeroed tally. Factored out because the shape is built in three places (live
+ * apply, retained fold, and any future roll) and a field added to one but not the
+ * others reads as a silent zero on whichever view missed it.
+ *
+ * `lastBarR` is NOT seeded from the creating record: see the TRA-1707 note in
+ * {@link apply}. `spreadCeilingMaxAdmittedSpreadPct` starts `null` for the same
+ * reason — 0 is a spread a reader would act on, "never measured" is not.
+ */
+function newTally(): StructureTally {
+  return {
+    admitted: 0,
+    rejected: 0,
+    admittedGrossRSum: 0,
+    rejectedGrossRSum: 0,
+    lastBarR: null,
+    deltaCeilingRejected: 0,
+    deltaCeilingAbsDeltaSum: 0,
+    deltaCeilingObserved: 0,
+    deltaCeilingObservedAbsDeltaSum: 0,
+    spreadCeilingAdmitted: 0,
+    spreadCeilingRejected: 0,
+    spreadCeilingRejectedSpreadPctSum: 0,
+    spreadCeilingMaxAdmittedSpreadPct: null,
+    spreadCeilingRejectsByCode: new Map(),
+  };
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -146,24 +204,33 @@ function apply(rec: CostGateDecisionRecord): void {
   }
   let tally = day.get(rec.structure);
   if (!tally) {
-    tally = {
-      admitted: 0,
-      rejected: 0,
-      admittedGrossRSum: 0,
-      rejectedGrossRSum: 0,
-      // NOT `rec.barR` — the record that CREATES this tally may be a ceiling record, which
-      // carries `barR: 0` and never writes the field again on its own branch. Seeding from it
-      // published `barR: 0.00` on a structure whose bar is live, and an absent bar and a live
-      // bar then read identically (TRA-1707). Only the cost-bar branches below may set it.
-      lastBarR: null,
-      deltaCeilingRejected: 0,
-      deltaCeilingAbsDeltaSum: 0,
-      deltaCeilingObserved: 0,
-      deltaCeilingObservedAbsDeltaSum: 0,
-    };
+    // NOT seeded from `rec` — the record that CREATES this tally may be a ceiling record,
+    // which carries `barR: 0` and never writes the field again on its own branch. Seeding
+    // from it published `barR: 0.00` on a structure whose bar is live, and an absent bar
+    // and a live bar then read identically (TRA-1707). Only the cost-bar branches below
+    // may set it.
+    tally = newTally();
     day.set(rec.structure, tally);
   }
-  if (rec.gate === 'delta_ceiling') {
+  if (rec.gate === 'spread_ceiling') {
+    // TRA-2295 — the spread gate REFUSED this candidate. Its own axis: it is neither a
+    // modeled-R verdict nor a delta breach, and folding it into `rejected` would move the
+    // cost bar's admit rate for a reason that has nothing to do with the cost bar.
+    tally.spreadCeilingRejected += 1;
+    tally.spreadCeilingRejectedSpreadPctSum += Number.isFinite(rec.spreadPct) ? (rec.spreadPct as number) : 0;
+    const code = typeof rec.code === 'string' && rec.code !== '' ? rec.code : 'unknown';
+    tally.spreadCeilingRejectsByCode.set(code, (tally.spreadCeilingRejectsByCode.get(code) ?? 0) + 1);
+  } else if (rec.gate === 'spread_ceiling_admitted') {
+    // TRA-2295 — the spread gate RAN and let this one through. Recorded because the
+    // absence of this counter is what made the unenforced ceiling invisible for 83 fills:
+    // without it, `spreadCeilingRejected: 0` cannot be told from a gate that never ran.
+    tally.spreadCeilingAdmitted += 1;
+    if (Number.isFinite(rec.spreadPct)) {
+      const p = rec.spreadPct as number;
+      const prev = tally.spreadCeilingMaxAdmittedSpreadPct;
+      tally.spreadCeilingMaxAdmittedSpreadPct = prev === null ? p : Math.max(prev, p);
+    }
+  } else if (rec.gate === 'delta_ceiling') {
     // A ceiling breach carries no modeled R and no bar — tallied on its own axis so
     // the cost bar's admit rate / gross-R means stay exactly what they were.
     tally.deltaCeilingRejected += 1;
@@ -274,6 +341,41 @@ export function recordEntryDeltaCeilingObserved(
   });
 }
 
+/**
+ * TRA-2295 — record ONE spread-ceiling verdict, admitted or rejected.
+ *
+ * BOTH outcomes are written, and that is the point of the ticket. The directional
+ * sleeve opened 83 positions against a 0.10 ceiling it never evaluated — 59 of them
+ * over it, worst 19× — and no counter anywhere moved, because the only thing anyone
+ * would have thought to count was rejections, and an unenforced gate rejects exactly
+ * as many candidates as a gate with nothing to reject. `spreadCeilingEvaluated` is
+ * the separator: it is 0 if and only if the gate did not run.
+ *
+ * `admit: rec.admit` mirrors what the engine ACTUALLY DID (the TRA-1689 rule), so a
+ * replay of the JSONL never invents a trade that did not happen. Same durability and
+ * best-effort IO as every other recorder here.
+ */
+export function recordSpreadCeilingDecision(
+  structure: string,
+  admit: boolean,
+  spreadPct: number | null,
+  code: string,
+  etDay: string,
+  now: number = Date.now(),
+): void {
+  applyAndAppend({
+    ts: now,
+    etDay,
+    structure,
+    admit,
+    grossR: 0,
+    barR: 0,
+    gate: admit ? 'spread_ceiling_admitted' : 'spread_ceiling',
+    ...(spreadPct !== null && Number.isFinite(spreadPct) ? { spreadPct } : {}),
+    code,
+  });
+}
+
 function applyAndAppend(rec: CostGateDecisionRecord): void {
   // NOTE the ordering, and that it is deliberate: the in-memory tally updates FIRST and
   // UNCONDITIONALLY, then the disk write is attempted best-effort. That keeps accounting
@@ -351,8 +453,17 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
     // the first boot after a breach DESTROYED the evidence on disk. An unlisted kind
     // must fall back to `cost_bar` (that is how pre-TRA-1670 lines, which carry no
     // `gate` at all, still hydrate) — but a kind we DO know must survive verbatim.
-    const gate: CostGateKind =
-      rec.gate === 'delta_ceiling' || rec.gate === 'delta_ceiling_observed' ? rec.gate : 'cost_bar';
+    const KNOWN_KINDS: readonly CostGateKind[] = [
+      'delta_ceiling',
+      'delta_ceiling_observed',
+      'spread_ceiling',
+      'spread_ceiling_admitted',
+    ];
+    const gate: CostGateKind = KNOWN_KINDS.includes(rec.gate as CostGateKind)
+      ? (rec.gate as CostGateKind)
+      : 'cost_bar';
+    const isSpread = gate === 'spread_ceiling' || gate === 'spread_ceiling_admitted';
+    const isDelta = gate === 'delta_ceiling' || gate === 'delta_ceiling_observed';
     const clean: CostGateDecisionRecord = {
       ts: rec.ts,
       etDay: rec.etDay,
@@ -362,9 +473,13 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       barR: Number.isFinite(rec.barR) ? rec.barR : 0,
       // Pre-TRA-1670 lines carry no `gate` — they are cost-bar verdicts by construction.
       gate,
-      ...(gate !== 'cost_bar'
-        ? { absDelta: Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0 }
-        : {}),
+      ...(isDelta ? { absDelta: Number.isFinite(rec.absDelta) ? (rec.absDelta as number) : 0 } : {}),
+      // TRA-2295 — `spreadPct` is OMITTED, not zero-filled, when unmeasurable. A
+      // `no_quote` reject has no spread by definition, and writing 0 would drag
+      // `avgRejectedSpreadPct` toward zero and, worse, let a compacted rewrite publish
+      // `maxAdmittedSpreadPct: 0` on a gate that admitted something wide.
+      ...(isSpread && Number.isFinite(rec.spreadPct) ? { spreadPct: rec.spreadPct as number } : {}),
+      ...(isSpread ? { code: typeof rec.code === 'string' && rec.code !== '' ? rec.code : 'unknown' } : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -437,6 +552,34 @@ export interface CostAwareGateStructureSummary {
   deltaCeilingObserved: number;
   /** Mean |delta| of the observed (admitted) breaches (null when none). */
   avgDeltaCeilingObservedAbsDelta: number | null;
+
+  // ── TRA-2295 — the SPREAD ceiling. Read `spreadCeilingEvaluated` FIRST. ─────
+  /**
+   * Candidates the spread gate RULED ON (admitted + rejected). **This is the field that
+   * separates the two zero states**, and it exists because their conflation is the whole
+   * bug: for 83 fills the directional sleeve's `spreadCeilingRejected` would have read 0
+   * because the gate never ran, which is indistinguishable from 0 because every contract
+   * was inside the ceiling.
+   *
+   *   `evaluated === 0`               ⇒ THE GATE DID NOT RUN on this structure/day.
+   *   `evaluated > 0, rejected === 0` ⇒ it ran; nothing was outside the ceiling.
+   *   `rejected > 0`                  ⇒ it ran and it is BITING.
+   */
+  spreadCeilingEvaluated: number;
+  /** Candidates the spread gate REFUSED. Disjoint from `rejected` and the delta counters. */
+  spreadCeilingRejected: number;
+  /** rejected / evaluated — `null` when the gate ruled on nothing (never 0; see above). */
+  spreadCeilingRejectRate: number | null;
+  /** Mean `spreadPct` of the refused candidates (null when none / all unmeasurable). */
+  avgRejectedSpreadPct: number | null;
+  /**
+   * THE INVARIANT: the widest `spreadPct` the gate ADMITTED, `null` when it admitted
+   * nothing. An enforcing gate cannot publish a value above its sleeve's `maxSpreadPct`
+   * — so this one number falsifies enforcement without touching the trade journal.
+   */
+  maxAdmittedSpreadPct: number | null;
+  /** Refusals split by threshold (`max_spread_pct` / `min_bid` / `no_quote`). */
+  spreadCeilingRejectsByCode: Record<string, number>;
 }
 
 /**
@@ -468,6 +611,13 @@ export interface CostAwareGateRetainedSummary {
   deltaCeilingRejectedTotal: number;
   /** The measurement: > 0 with `deltaCeilingRejectedTotal === 0` is a tail being observed, not cut. */
   deltaCeilingObservedTotal: number;
+  /**
+   * TRA-2295 — spread-gate verdicts across the window. `spreadCeilingEvaluatedTotal === 0`
+   * over a window in which the sleeve OPENED positions is the alarm: it means every one of
+   * those opens bypassed the ceiling, which is the state this ticket found in production.
+   */
+  spreadCeilingEvaluatedTotal: number;
+  spreadCeilingRejectedTotal: number;
 }
 
 /**
@@ -522,6 +672,10 @@ export interface CostAwareGateSummary {
   deltaCeilingRejectedTotal: number;
   /** TRA-1689 — observe-only ceiling breaches (COUNTED, then ADMITTED) across all structures. */
   deltaCeilingObservedTotal: number;
+  /** TRA-2295 — spread-gate verdicts on the requested ET day. 0 ⇒ the gate did not run. */
+  spreadCeilingEvaluatedTotal: number;
+  /** TRA-2295 — spread-gate refusals on the requested ET day. */
+  spreadCeilingRejectedTotal: number;
   /**
    * TRA-1703 — the multi-day roll. Every count above is scoped to ONE ET day; a ceiling
    * tripwire read off a one-day counter self-clears at midnight. Read THIS for the
@@ -552,6 +706,20 @@ function mergeTally(into: StructureTally, t: StructureTally): void {
   into.deltaCeilingAbsDeltaSum += t.deltaCeilingAbsDeltaSum;
   into.deltaCeilingObserved += t.deltaCeilingObserved;
   into.deltaCeilingObservedAbsDeltaSum += t.deltaCeilingObservedAbsDeltaSum;
+  into.spreadCeilingAdmitted += t.spreadCeilingAdmitted;
+  into.spreadCeilingRejected += t.spreadCeilingRejected;
+  into.spreadCeilingRejectedSpreadPctSum += t.spreadCeilingRejectedSpreadPctSum;
+  // A MAX, not a sum — and `null`-safe on both sides, so a day that admitted nothing
+  // cannot pull a real maximum down to 0 (the TRA-1707 shape, one field over).
+  if (t.spreadCeilingMaxAdmittedSpreadPct !== null) {
+    into.spreadCeilingMaxAdmittedSpreadPct =
+      into.spreadCeilingMaxAdmittedSpreadPct === null
+        ? t.spreadCeilingMaxAdmittedSpreadPct
+        : Math.max(into.spreadCeilingMaxAdmittedSpreadPct, t.spreadCeilingMaxAdmittedSpreadPct);
+  }
+  for (const [code, n] of t.spreadCeilingRejectsByCode.entries()) {
+    into.spreadCeilingRejectsByCode.set(code, (into.spreadCeilingRejectsByCode.get(code) ?? 0) + n);
+  }
   // `lastBarR` is a LAST, not a sum — a day with no cost-bar decision has no bar to
   // contribute and must not overwrite a real one. The sentinel is `null`, not 0: a day
   // whose only records were ceiling breaches now carries `null` (TRA-1707), so a genuine
@@ -566,18 +734,25 @@ function foldStructures(acc: Map<string, StructureTally>): {
   rejectedTotal: number;
   deltaCeilingRejectedTotal: number;
   deltaCeilingObservedTotal: number;
+  spreadCeilingEvaluatedTotal: number;
+  spreadCeilingRejectedTotal: number;
 } {
   const byStructure: CostAwareGateStructureSummary[] = [];
   let admittedTotal = 0;
   let rejectedTotal = 0;
   let deltaCeilingRejectedTotal = 0;
   let deltaCeilingObservedTotal = 0;
+  let spreadCeilingEvaluatedTotal = 0;
+  let spreadCeilingRejectedTotal = 0;
   for (const [structure, t] of acc.entries()) {
     const decisions = t.admitted + t.rejected;
+    const spreadEvaluated = t.spreadCeilingAdmitted + t.spreadCeilingRejected;
     admittedTotal += t.admitted;
     rejectedTotal += t.rejected;
     deltaCeilingRejectedTotal += t.deltaCeilingRejected;
     deltaCeilingObservedTotal += t.deltaCeilingObserved;
+    spreadCeilingEvaluatedTotal += spreadEvaluated;
+    spreadCeilingRejectedTotal += t.spreadCeilingRejected;
     byStructure.push({
       structure,
       admitted: t.admitted,
@@ -594,14 +769,35 @@ function foldStructures(acc: Map<string, StructureTally>): {
         t.deltaCeilingObserved > 0
           ? round(t.deltaCeilingObservedAbsDeltaSum / t.deltaCeilingObserved)
           : null,
+      spreadCeilingEvaluated: spreadEvaluated,
+      spreadCeilingRejected: t.spreadCeilingRejected,
+      // `null`, not 0, when the gate ruled on nothing — same rule as `admitRate`. A 0%
+      // reject rate is a real reading ("ran, nothing was wide"); "did not run" is not a
+      // rate at all, and rendering both as 0 is precisely the conflation TRA-2295 fixes.
+      spreadCeilingRejectRate: spreadEvaluated > 0 ? round(t.spreadCeilingRejected / spreadEvaluated) : null,
+      avgRejectedSpreadPct:
+        t.spreadCeilingRejected > 0
+          ? round(t.spreadCeilingRejectedSpreadPctSum / t.spreadCeilingRejected)
+          : null,
+      maxAdmittedSpreadPct:
+        t.spreadCeilingMaxAdmittedSpreadPct === null ? null : round(t.spreadCeilingMaxAdmittedSpreadPct),
+      spreadCeilingRejectsByCode: Object.fromEntries(t.spreadCeilingRejectsByCode),
     });
   }
   byStructure.sort(
     (a, b) =>
-      b.admitted + b.rejected + b.deltaCeilingRejected + b.deltaCeilingObserved
-      - (a.admitted + a.rejected + a.deltaCeilingRejected + a.deltaCeilingObserved),
+      b.admitted + b.rejected + b.deltaCeilingRejected + b.deltaCeilingObserved + b.spreadCeilingEvaluated
+      - (a.admitted + a.rejected + a.deltaCeilingRejected + a.deltaCeilingObserved + a.spreadCeilingEvaluated),
   );
-  return { byStructure, admittedTotal, rejectedTotal, deltaCeilingRejectedTotal, deltaCeilingObservedTotal };
+  return {
+    byStructure,
+    admittedTotal,
+    rejectedTotal,
+    deltaCeilingRejectedTotal,
+    deltaCeilingObservedTotal,
+    spreadCeilingEvaluatedTotal,
+    spreadCeilingRejectedTotal,
+  };
 }
 
 /** TRA-1703 — fold EVERY retained ET day. See {@link CostAwareGateRetainedSummary}. */
@@ -611,17 +807,7 @@ function summarizeRetained(): CostAwareGateRetainedSummary {
     for (const [structure, t] of day.entries()) {
       let into = acc.get(structure);
       if (!into) {
-        into = {
-          admitted: 0,
-          rejected: 0,
-          admittedGrossRSum: 0,
-          rejectedGrossRSum: 0,
-          lastBarR: null,
-          deltaCeilingRejected: 0,
-          deltaCeilingAbsDeltaSum: 0,
-          deltaCeilingObserved: 0,
-          deltaCeilingObservedAbsDeltaSum: 0,
-        };
+        into = newTally();
         acc.set(structure, into);
       }
       mergeTally(into, t);

@@ -129,7 +129,15 @@ import {
   recordDirectionalGateReject,
   type OpenSleeve,
 } from './directional-open-ledger.js';
-import { recordCostAwareGateDecision, recordEntryDeltaCeilingReject, recordEntryDeltaCeilingObserved } from './cost-aware-gate-ledger.js';
+import {
+  recordCostAwareGateDecision,
+  recordEntryDeltaCeilingReject,
+  recordEntryDeltaCeilingObserved,
+  recordSpreadCeilingDecision,
+} from './cost-aware-gate-ledger.js';
+// TRA-2295 — the entry-path spread ceiling reads its thresholds from the SAME table
+// the cost model quotes, so the two cannot drift apart again.
+import { spreadGateVerdict, isSpreadCeilingEnforceEnabled } from './option-spread-cost.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
@@ -1102,6 +1110,21 @@ const IV_RV_RESERVED_CAP_SLOTS = 2;
 // mode); the OTM-mispricing engine below is re-armed in its place. Existing RV
 // positions still get marks via refreshOptionMarks() and exit normally.
 const RV_ENGINE_ENABLED: boolean = false;
+
+/**
+ * TRA-2245 / TRA-2295 — the journal STRUCTURE label for the demo directional sleeve.
+ *
+ * One constant, shared by the journal write and by the TRA-2295 spread gate that
+ * admits the fill, because those two must agree. If the gate keyed its ceiling and
+ * its counters off a different string than the journal files the row under, the
+ * health route would report a sleeve enforcing while the journal accrued rows under
+ * a name nothing was gating — the same shape as the bug this fixes, just relocated.
+ *
+ * FORWARD-ONLY: rows written before 2026-07-24 still say `single_leg_rv`, so any
+ * check scoped to this label is a check on new rows (pair it with
+ * `entryArchetype: 'directional'` to catch the historical ones).
+ */
+const DIRECTIONAL_STRUCTURE_LABEL = 'single_leg_directional';
 
 /**
  * TRA-2193 — read the RV kill switch from outside this module.
@@ -5350,6 +5373,78 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-2295 (parent TRA-2291) — the SPREAD-CEILING / quotability gate on the
+   * option ENTRY path.
+   *
+   * The 0.10 ceiling this sleeve is documented to honour lives at
+   * `relative-value.ts:396`, inside the RV SCANNER's `prepareChain` — and
+   * `RV_ENGINE_ENABLED` has been a compile-time `false` since TRA-1207, while the
+   * directional caller reads `getSelectorChain`, which returns RAW chain rows and
+   * never touches that filter. So the sleeve inherited a ceiling from dead code:
+   * 59 of 83 desk entries crossed it, up to 1.933 (19×), on books quoted
+   * `bid 0.01 / ask 0.59`. `single_leg_otm`, whose scanner DOES run, sat at
+   * max 0.196 against 0.20 over the same window — the positive control that told
+   * us the formula was right and the enforcement was missing.
+   *
+   * Three properties, each fixing a specific way the old arrangement lied:
+   *
+   *  1. It runs where the position is OPENED, on the SAME quote that prices the
+   *     fill and is journaled as `entryBid`/`entryAsk` — so the gate and the fill
+   *     cannot describe different contracts.
+   *  2. Its thresholds come from {@link SLEEVE_SPREAD_CEILINGS}, the table the cost
+   *     model already reads. One source of truth ⇒ the cost model cannot quote a
+   *     ceiling the gate is not applying, which is exactly the drift that let
+   *     `option-spread-cost.ts` attribute a live 0.10 to a disabled scanner.
+   *  3. It records BOTH verdicts. A reject counter alone is not an instrument here:
+   *     an unenforced ceiling and an unviolated one both report zero rejections.
+   *     `spreadCeilingEvaluated` on `/api/health/cost-aware-gate` is what separates
+   *     them.
+   *
+   * ON BY DEFAULT, unlike the dark gates around it. This is not a new admission
+   * policy being trialled — it is the restoration of a bound three separate places
+   * in the codebase already asserted was in force. A dark default would leave the
+   * documented behaviour and the actual behaviour disagreeing for as long as the
+   * flag stayed unset, which is the state that produced the bug. The kill switch is
+   * `OPTION_SPREAD_CEILING_ENFORCE=0` (demo-flags file in demo, process env in
+   * live), and `OPTION_SPREAD_CEILING_MIN_BID_USD` retunes the quotability floor
+   * without a deploy.
+   *
+   * Returns a rejection reason to skip the open, or `null` to proceed.
+   */
+  private spreadCeilingRejectReason(
+    structure: string,
+    quote: { bid: number; ask: number; mark: number },
+  ): string | null {
+    const env = this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env;
+    if (!isSpreadCeilingEnforceEnabled(env)) return null;
+
+    const rawMinBid = Number(env.OPTION_SPREAD_CEILING_MIN_BID_USD);
+    const verdict = spreadGateVerdict(
+      structure,
+      quote,
+      Number.isFinite(rawMinBid) && rawMinBid >= 0 ? { minBidUsd: rawMinBid } : {},
+    );
+
+    // `no_ceiling` means this structure is not in the table — nothing was ruled on, so
+    // recording it would inflate `spreadCeilingEvaluated` and make an unconfigured
+    // sleeve read exactly like an enforced one. That is the bug, one level up.
+    if (verdict.code === 'no_ceiling') {
+      log.warn('spread ceiling gate has no configured ceiling for this structure (TRA-2295)', { structure });
+      return null;
+    }
+
+    recordSpreadCeilingDecision(
+      structure,
+      verdict.admitted,
+      verdict.spreadPct,
+      verdict.code,
+      etDateString(new Date()),
+    );
+    if (verdict.admitted) return null;
+    return verdict.reason;
+  }
+
+  /**
    * TRA-1662 — start a SHADOW maker chase for an option open. Observe-only: it
    * routes nothing, prices no fill, and cannot affect the position that was just
    * booked. The demo book fills at the mark and pays no spread, so this is the
@@ -6105,9 +6200,23 @@ export class SignalEngine {
         //               event lands on or before the candidate's expiry (vol
         //               crush / thesis-break risk).
         //
-        // OI ≥ 250 and spread ≤ 10 % are already enforced by the scanner's
-        // DEFAULTS.minOpenInterest / DEFAULTS.maxSpreadPct on every chain row
-        // before candidates are produced; no redundant re-check needed here.
+        // ⚠ TRA-2295 — this comment USED to read "OI ≥ 250 and spread ≤ 10% are
+        // already enforced by the scanner's DEFAULTS.minOpenInterest /
+        // DEFAULTS.maxSpreadPct on every chain row before candidates are produced;
+        // no redundant re-check needed here." It is true ONLY of candidates that
+        // came through `RelativeValueScanner.scan()`, whose `prepareChain` applies
+        // both filters. It is FALSE of anything read from `getSelectorChain`, which
+        // returns the RAW `fetchChain` rows — and false of this whole method while
+        // `RV_ENGINE_ENABLED` is `false`, since then no candidate is produced here
+        // at all.
+        //
+        // The sibling directional path (`evaluateDemoDirectional`) acted on that
+        // belief against raw rows and opened 83 positions on the 0.10 ceiling's
+        // wrong side, 59 of them over it. Its fix is the TRA-2295 entry-path gate
+        // (`spreadCeilingRejectReason`). If this path is ever re-armed, it must call
+        // that gate too — the candidates below reach the book through the same
+        // `openOptionFromRvCandidate` seam and carry no chain filter of their own
+        // unless `scan()` produced them.
         if (isOptionExecEnabled()) {
           const asOf = Date.now();
           // Full-chain snapshot — the scanner's 60 s warm cache makes this
@@ -8003,6 +8112,42 @@ export class SignalEngine {
           continue;
         }
 
+        // TRA-2295 (parent TRA-2291) — THE SPREAD CEILING, enforced where the
+        // position is actually opened.
+        //
+        // `best` was chosen for proximity to spot out of the RAW rows
+        // `getSelectorChain` returns; the only quote test applied so far is
+        // "two-sided and positive" (~40 lines up). That is how a contract quoted
+        // bid 0.01 / ask 0.59 — spreadPct 1.933, 19× this sleeve's own 0.10
+        // ceiling — became a fill. The ceiling was real; the code holding it
+        // (`relative-value.ts:396`) is inside the compile-time-OFF RV scanner, so
+        // this caller inherited it from dead code.
+        //
+        // NOTE the gate runs AFTER selection, not inside the loop above. Filtering
+        // during selection would silently change WHICH contract this sleeve picks
+        // (the nearest ADMISSIBLE strike instead of the nearest strike), and
+        // re-tuning the directional signal is explicitly out of scope here —
+        // TRA-1582's lesson is that the entry lever and the cost lever must be
+        // moved one at a time or neither can be attributed. Gate first, re-measure,
+        // then decide. The quote passed is exactly the one that prices the fill and
+        // is journaled as `entryBid`/`entryAsk`/`entryMarkUsd`.
+        const spreadReject = this.spreadCeilingRejectReason(DIRECTIONAL_STRUCTURE_LABEL, {
+          bid: best.row.bid ?? 0,
+          ask: best.row.ask ?? 0,
+          mark: best.mark,
+        });
+        if (spreadReject) {
+          log.info('demo directional rejected by spread ceiling (TRA-2295)', {
+            symbol: sym,
+            optionSymbol: best.row.optionSymbol,
+            bid: best.row.bid,
+            ask: best.row.ask,
+            reason: spreadReject,
+          });
+          scanRun.reject('spread_ceiling');
+          continue;
+        }
+
         // TRA-1153 — populate the option-journal IV regime from THIS path. The
         // chain (`snap`) is already in hand here, so deriving ATM IV + IV-rank is
         // free and does NOT re-introduce the per-tick per-symbol chain fetch the
@@ -8144,7 +8289,10 @@ export class SignalEngine {
           // trend-aligned sleeve no longer wears the `single_leg_rv` label of the
           // (compile-time-OFF, TRA-1207) True RV engine. Keeps the board's RV vs
           // directional read honest at the structure axis, not just the archetype.
-          structureLabel: 'single_leg_directional',
+          // TRA-2295 — the SAME constant the spread gate above keys its ceiling and
+          // its telemetry on: a journal row and the gate verdict that admitted it
+          // must never end up filed under two different sleeve names.
+          structureLabel: DIRECTIONAL_STRUCTURE_LABEL,
         };
         // TRA-1490 — surface a live directional signal whose broker mirror was
         // suppressed/voided instead of skipping silently (mirrors the RV path's

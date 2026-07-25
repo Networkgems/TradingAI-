@@ -30,38 +30,90 @@
 // basis (the gate's unit, the one TRA-1656 asks for); `spreadCrossRPremiumBasis`
 // is the journal's.
 //
-// ── Selection-independent ceiling ────────────────────────────────────────────
-// The scanners hard-reject any contract whose `spreadPct` exceeds `maxSpreadPct`
-// BEFORE it can ever be selected (OTM: 0.20, RV: 0.10 — see the engine scanner
-// option defaults). Via the identity above that is a hard upper bound on the
-// cross of ANY contract the sleeve is even allowed to buy:
+// ── The ceiling, and TRA-2295: where it is actually enforced ─────────────────
+// ⚠ CORRECTED BY TRA-2295 (raised from TRA-2291). This block used to assert that
+// the ceiling held for EVERY sleeve "independently of selection", on the grounds
+// that "the scanners hard-reject `spreadPct > maxSpreadPct` BEFORE selection".
+// That sentence was true of the scanners and FALSE of the book, and the gap
+// between the two is the whole bug:
 //
-//     OTM: spreadPct ≤ 0.20 ⇒ spreadCrossR ≤ 0.80
-//     RV : spreadPct ≤ 0.10 ⇒ spreadCrossR ≤ 0.40
+//   • `single_leg_otm` — enforced. `otm-mispricing.ts:185` runs on every chain
+//     row before a candidate exists. Live desk journal: max spreadPct 0.196
+//     against a 0.20 ceiling, 0/27 over. THAT is what an enforced ceiling reads
+//     like, and it is the positive control for the formula below.
+//   • `single_leg_rv` — the reject at `relative-value.ts:396` sits inside the RV
+//     SCANNER, and `RV_ENGINE_ENABLED = false` has been a compile-time constant
+//     since TRA-1207 (2026-06-30). The code path never executes.
+//   • the DIRECTIONAL sleeve (`evaluateDemoDirectional` → `openOptionFromRvCandidate`,
+//     journal label `single_leg_directional` since TRA-2245, `single_leg_rv`
+//     before it) reads `RelativeValueScanner.getSelectorChain`, which returns the
+//     RAW `fetchChain` rows — the `prepareChain` filter that carries the ceiling
+//     is only reached from `scan()`. So the sleeve wore the LABEL of a gate it
+//     never ran: 59 of 83 desk entries crossed the 0.10 ceiling, worst 1.933
+//     (19×), on contracts quoted bid 0.01 / ask 0.59.
 //
-// This bound does not depend on which contracts the sleeve actually picks, so it
-// holds no matter how the selection is distributed. The gate's 1.00R input sits
-// ABOVE both ceilings: it charges every candidate more than the worst contract
-// the scanner could possibly admit. See {@link SLEEVE_SPREAD_CEILINGS}.
+// A ceiling nothing evaluates and a ceiling nothing violates produce the IDENTICAL
+// reading of zero rejections, which is why this went 83 fills without surfacing.
+// TRA-2295 closes it at the entry path with {@link spreadGateVerdict} below —
+// evaluated on the SAME quote that is journaled as `entryBid`/`entryAsk` and sets
+// the fill, so the gate and the fill cannot disagree — and records BOTH admits and
+// rejects to `/api/health/cost-aware-gate` so "ran, rejected nothing" is legible
+// as something other than "never ran".
 //
-// Observe-only: nothing here routes an order or gates an admission. It measures.
+// Consequence for the cost model: the bound below is NOT selection-independent for
+// any sleeve whose gate does not run. On the worst admitted contract the true cross
+// was 4 · 1.933 = 7.73R, so the gate's 1.00R input UNDER-billed it ~7.7×, the
+// opposite direction from the "conservative" claim TRA-1647 leaned on. Forward of
+// the TRA-2295 enforcement the bound is real again — but only for sleeves listed in
+// {@link SLEEVE_SPREAD_CEILINGS} whose entry path actually calls the verdict.
+//
+// The MEASUREMENT half of this module remains observe-only: nothing below
+// `spreadGateVerdict` routes an order. `spreadGateVerdict` itself is a pure
+// predicate — the caller decides what to do with it.
 
 /** The at-risk stop distance as a fraction of the entry mark (stop = mark·0.75). */
 export const STOP_DISTANCE_FRACTION_OF_MARK = 0.25;
 
+/** Per-sleeve admission thresholds on the fill-time quote. */
+export interface SleeveSpreadCeiling {
+  /** `(ask − bid) / mark` may not exceed this. */
+  maxSpreadPct: number;
+  /** The same bound expressed in the gate's R unit: `4 · maxSpreadPct`. */
+  maxSpreadCrossR: number;
+  /**
+   * TRA-2295 — minimum per-share BID for the quote to count as a market at all.
+   *
+   * A spread ceiling alone is not enough. `bid 0.05 / ask 2.75` is not a wide
+   * market, it is an ABSENT one, and a ratio test can be passed by a book so thin
+   * that the mid it is measured against is fiction (`bid 0.01 / ask 0.012` crosses
+   * at 18% of mark on a contract nobody will fill). The ratio and the level have to
+   * be checked together.
+   */
+  minBidUsd: number;
+}
+
 /**
- * The scanner-enforced `maxSpreadPct` per sleeve, converted through
- * `spreadCrossR = 4 · spreadPct` into the hard ceiling on the round-trip cross
- * of any contract that sleeve can admit. Sourced from the engine scanner option
- * defaults (`otm-mispricing.ts` maxSpreadPct 0.20, `relative-value.ts` 0.10).
+ * The `maxSpreadPct` per sleeve, converted through `spreadCrossR = 4 · spreadPct`
+ * into the ceiling on the round-trip cross of any contract that sleeve may admit.
+ * Sourced from the engine scanner option defaults (`otm-mispricing.ts` 0.20,
+ * `relative-value.ts` 0.10).
  *
- * These are CEILINGS, not estimates — the measured means are far lower. They
- * exist so a reviewer can falsify a proposed cost input without any data at all:
- * any `makerAdjustedSpreadCrossR` above the ceiling is infeasible by construction.
+ * THE SINGLE SOURCE OF TRUTH for both the cost model and the entry gate
+ * ({@link spreadGateVerdict}), so the two cannot drift apart the way they did
+ * before TRA-2295 — when the cost model quoted a 0.10 ceiling attributed to a
+ * scanner the entry path never reached.
+ *
+ * `single_leg_directional` (TRA-2245 label) inherits RV's 0.10: it is the same
+ * near-ATM single-leg long the 0.10 was written for. Read
+ * {@link SLEEVE_SPREAD_CEILINGS} as "what this sleeve is allowed to buy" — whether
+ * anything ENFORCES it is a property of the entry path, not of this table, and the
+ * `spreadCeilingEvaluated` counter on `/api/health/cost-aware-gate` is what answers
+ * that question for a given sleeve on a given day.
  */
-export const SLEEVE_SPREAD_CEILINGS: Readonly<Record<string, { maxSpreadPct: number; maxSpreadCrossR: number }>> = {
-  single_leg_otm: { maxSpreadPct: 0.2, maxSpreadCrossR: 0.8 },
-  single_leg_rv: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4 },
+export const SLEEVE_SPREAD_CEILINGS: Readonly<Record<string, SleeveSpreadCeiling>> = {
+  single_leg_otm: { maxSpreadPct: 0.2, maxSpreadCrossR: 0.8, minBidUsd: 0.05 },
+  single_leg_rv: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
+  single_leg_directional: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
 };
 
 /** A two-sided quote captured at fill time. */
@@ -110,6 +162,141 @@ export function measureSpreadCross(quote: FillQuote): SpreadCrossMeasurement | n
     spreadCrossRPremiumBasis: spreadPct,
     entryMarkUsd: mark,
   };
+}
+
+// ── TRA-2295 — the ENTRY GATE ────────────────────────────────────────────────
+
+/** Kill switch for {@link isSpreadCeilingEnforceEnabled}. Set to `0`/`false`/`off` to disarm. */
+export const OPTION_SPREAD_CEILING_ENFORCE_FLAG = 'OPTION_SPREAD_CEILING_ENFORCE';
+
+/**
+ * TRA-2295 — is the entry-path spread ceiling ENFORCING? **Default TRUE.**
+ *
+ * Opt-OUT, not opt-in, and deliberately the opposite polarity from the dark demo
+ * gates around it (`ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE`, `ENABLE_OPTION_COST_AWARE_GATE`,
+ * …). Those arm a NEW admission policy that has to be forward-validated before it is
+ * trusted. This one restores a bound that `signal-engine.ts`, `option-spread-cost.ts`
+ * and `health-routes.ts` all already documented as being in force — the defect was
+ * that no code applied it. Shipping it dark would leave the documentation and the
+ * behaviour disagreeing until somebody remembered to set a variable, which is the
+ * failure mode, not the fix. (An unset flag is also indistinguishable from a wiped
+ * one — TRA-2136 erased twelve Render env vars and every dependent gate went silently
+ * inert; a default-ON gate survives that class of accident.)
+ *
+ * Only an EXPLICIT off value disarms it, so a typo'd or empty value keeps the ceiling
+ * on rather than quietly dropping it.
+ */
+export function isSpreadCeilingEnforceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[OPTION_SPREAD_CEILING_ENFORCE_FLAG];
+  if (typeof raw !== 'string') return true;
+  return !['0', 'false', 'no', 'off'].includes(raw.trim().toLowerCase());
+}
+
+/** Why {@link spreadGateVerdict} refused (or `ok` / `no_ceiling` when it did not). */
+export type SpreadGateCode =
+  /** Admitted: quote is usable and inside both thresholds. */
+  | 'ok'
+  /** Admitted: this sleeve has no entry in {@link SLEEVE_SPREAD_CEILINGS}. */
+  | 'no_ceiling'
+  /** REJECTED: the quote is not a measurable two-sided book. */
+  | 'no_quote'
+  /** REJECTED: `bid < minBidUsd` — an absent market, not a wide one. */
+  | 'min_bid'
+  /** REJECTED: `(ask − bid) / mark > maxSpreadPct`. */
+  | 'max_spread_pct';
+
+export interface SpreadGateVerdict {
+  /** False ⇒ the caller must NOT open. */
+  admitted: boolean;
+  code: SpreadGateCode;
+  /** Human-readable rejection reason, `null` when admitted. */
+  reason: string | null;
+  /** The measured `(ask − bid) / mark`, `null` when the quote was unmeasurable. */
+  spreadPct: number | null;
+  /** The thresholds applied, `null` when the sleeve has no ceiling configured. */
+  thresholds: SleeveSpreadCeiling | null;
+}
+
+/** Optional per-call overrides (env-tunable at the caller). Absent ⇒ table default. */
+export interface SpreadGateOverrides {
+  minBidUsd?: number;
+  maxSpreadPct?: number;
+}
+
+/**
+ * TRA-2295 — the admission predicate for the fill-time quote. Pure.
+ *
+ * Applied by the ENTRY path to the exact quote it is about to fill and journal
+ * (`entryBid`/`entryAsk`/`entryMarkUsd`), not to a scanner's pre-selection view of
+ * the chain. That is the fix: the previous ceiling lived in a chain filter that the
+ * directional caller never executed, so the gate and the fill were describing
+ * different contracts — and nothing anywhere compared them.
+ *
+ * FAILS CLOSED on an unmeasurable quote (`no_quote`). An entry whose spread cannot
+ * be computed is not an entry whose spread is zero; admitting it would restore, at
+ * the gate, the exact writer-side false-zero this module refuses at the measurement
+ * (see {@link measureSpreadCross}).
+ *
+ * A sleeve absent from {@link SLEEVE_SPREAD_CEILINGS} is ADMITTED with code
+ * `no_ceiling` rather than rejected against an invented bound — but the code says so
+ * out loud, so a caller that wired the wrong sleeve name reads `no_ceiling` on every
+ * candidate instead of a silent, uniformly-passing gate.
+ */
+export function spreadGateVerdict(
+  sleeve: string,
+  quote: FillQuote,
+  overrides: SpreadGateOverrides = {},
+): SpreadGateVerdict {
+  const base = SLEEVE_SPREAD_CEILINGS[sleeve];
+  if (!base) {
+    return { admitted: true, code: 'no_ceiling', reason: null, spreadPct: null, thresholds: null };
+  }
+  const maxSpreadPct = Number.isFinite(overrides.maxSpreadPct as number)
+    ? (overrides.maxSpreadPct as number)
+    : base.maxSpreadPct;
+  const minBidUsd = Number.isFinite(overrides.minBidUsd as number)
+    ? (overrides.minBidUsd as number)
+    : base.minBidUsd;
+  const thresholds: SleeveSpreadCeiling = {
+    maxSpreadPct,
+    maxSpreadCrossR: maxSpreadPct / STOP_DISTANCE_FRACTION_OF_MARK,
+    minBidUsd,
+  };
+
+  const m = measureSpreadCross(quote);
+  if (!m) {
+    return {
+      admitted: false,
+      code: 'no_quote',
+      reason: `no measurable two-sided quote (bid ${quote.bid}, ask ${quote.ask}, mark ${quote.mark}) — cannot bound the spread cross, refusing the entry`,
+      spreadPct: null,
+      thresholds,
+    };
+  }
+
+  // Level BEFORE ratio: on `bid 0.05 / ask 2.75` both fire, and `min_bid` is the
+  // more honest description of what is wrong with that book.
+  if (quote.bid < minBidUsd) {
+    return {
+      admitted: false,
+      code: 'min_bid',
+      reason: `bid $${quote.bid.toFixed(2)} is below the $${minBidUsd.toFixed(2)} quotability floor for ${sleeve} — an absent market, not a wide one`,
+      spreadPct: m.spreadPct,
+      thresholds,
+    };
+  }
+
+  if (m.spreadPct > maxSpreadPct) {
+    return {
+      admitted: false,
+      code: 'max_spread_pct',
+      reason: `spreadPct ${m.spreadPct.toFixed(4)} exceeds the ${maxSpreadPct.toFixed(2)} ceiling for ${sleeve} (round-trip cross ${m.spreadCrossR.toFixed(2)}R vs ${thresholds.maxSpreadCrossR.toFixed(2)}R)`,
+      spreadPct: m.spreadPct,
+      thresholds,
+    };
+  }
+
+  return { admitted: true, code: 'ok', reason: null, spreadPct: m.spreadPct, thresholds };
 }
 
 /** Commission in R (stop basis) for a round trip on `contracts` contracts. */
