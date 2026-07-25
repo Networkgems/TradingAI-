@@ -141,12 +141,23 @@ export function clusterBoots(candidates, clusterMs = BOOT_CLUSTER_MS) {
  * @param {boolean} a.deploysOk         that fetch succeeded
  * @param {object[]} a.events           /services/{id}/events entries (need `timestamp`, `type`)
  * @param {boolean} a.eventsOk          that fetch succeeded
+ * @param {string}  [a.eventsQueryFrom] if the events read was TIME-BOUNDED, the `startTime` it asked
+ *   for. Coverage of a bounded query cannot be judged by "how old is the oldest record I hold" — a
+ *   quiet service legitimately holds no event older than the window, and that reads IDENTICAL to a
+ *   page that stopped short. Supply this and coverage is judged on what was ASKED FOR + saturation.
+ * @param {boolean} [a.eventsTruncated] the bounded events read came back at its `limit` ⇒ there may
+ *   be older events inside the window that were never fetched.
+ * @param {boolean} [a.watchdogTruncated] the `text=self-restarting` read reported more pages ⇒ trips
+ *   inside the window were never fetched. A truncated trip page UNDER-counts, which is the direction
+ *   that reads as "clean".
  * @param {(d:object)=>string} [a.deployLabel]  optional attribution ("why did this deploy happen")
  */
 export function buildBootSet({
   from, to, preWindowMs = 0,
-  watchdogLines = [], watchdogOk = true, coverageLineCount = 0, coverageOk = true,
-  deploys = [], deploysOk = true, events = [], eventsOk = true,
+  watchdogLines = [], watchdogOk = true, watchdogTruncated = false,
+  coverageLineCount = 0, coverageOk = true,
+  deploys = [], deploysOk = true,
+  events = [], eventsOk = true, eventsQueryFrom = null, eventsTruncated = false,
   clusterMs = BOOT_CLUSTER_MS, deployLabel,
 }) {
   const fromMs = new Date(from).getTime();
@@ -204,6 +215,7 @@ export function buildBootSet({
 
   const blindReasons = [];
   if (!watchdogOk) blindReasons.push('watchdog log probe (text=self-restarting) FAILED');
+  else if (watchdogTruncated) blindReasons.push('the watchdog log page was TRUNCATED (more matching lines exist than were fetched) — the trip count and the echo-boot set are both lower bounds, and a lower bound reads as "clean"');
   if (!coverageOk) blindReasons.push('log coverage probe FAILED');
   // The existence control that makes a zero honest: a `text=self-restarting` query returning nothing
   // is the answer we most want to trust and can least afford to trust naively, so it is paired with an
@@ -213,7 +225,17 @@ export function buildBootSet({
   if (!deploysOk) blindReasons.push('deploys API FAILED');
   else if (!oldestDeploy || new Date(oldestDeploy).getTime() > fromMs) blindReasons.push('the deploys page did not reach back past the window open — deploys inside it may never have been fetched');
   if (!eventsOk) blindReasons.push('events API FAILED');
-  else if (!oldestEvent || new Date(oldestEvent).getTime() > fromMs) blindReasons.push('the events page did not reach back past the window open — container deaths inside it may never have been fetched');
+  // TWO coverage rules, because there are two ways to ask. An UNBOUNDED page (`?limit=N`, newest
+  // first) is only known to cover the window if the oldest record it returned predates the window
+  // open. A TIME-BOUNDED page (`?startTime=&endTime=`) is covered by construction — unless it came
+  // back saturated, in which case older matches inside the range were dropped. Applying the
+  // unbounded rule to a bounded read produces a FALSE BLIND on every quiet window (there is simply
+  // no event older than `from` to be found), and applying the bounded rule to an unbounded read
+  // would produce a FALSE CLEAN. The caller says which question it asked; it does not get inferred.
+  else if (eventsQueryFrom) {
+    if (new Date(eventsQueryFrom).getTime() > leftEdgeMs) blindReasons.push('the events query asked for a startTime AFTER the window open — it cannot have seen the whole window');
+    else if (eventsTruncated) blindReasons.push('the time-bounded events page came back SATURATED at its limit — older container deaths inside the window may never have been fetched');
+  } else if (!oldestEvent || new Date(oldestEvent).getTime() > fromMs) blindReasons.push('the events page did not reach back past the window open — container deaths inside it may never have been fetched');
 
   const bootsWithPreWindow = clusterBoots([...deployBoots, ...deathBoots, ...echoBoots], clusterMs)
     .map(b => ({ ...b, inWindow: new Date(b.at).getTime() >= fromMs }));
@@ -265,24 +287,46 @@ export async function pullBootSet({
   const logUrl = (extra) => `${api}/logs?ownerId=${owner}&resource=${serviceId}`
     + `&startTime=${encodeURIComponent(leftEdge)}&endTime=${encodeURIComponent(to)}${extra}`;
 
+  // ⛔ THE EVENTS READ MUST BE TIME-BOUNDED, NOT "the newest 100". `/events?limit=100` is ordered
+  // newest-first from NOW, so on a service that deploys a few times a day it stops reaching back
+  // after ~2 days — and the honest coverage check then blinds EVERY historical window. Measured
+  // 2026-07-25 (TRA-2294): the 07-20, 07-21 and 07-22 RTH sessions were all unreadable for this one
+  // reason, which is the whole week of prior sessions a recurrence question needs. `startTime`/
+  // `endTime` are supported on this route and were verified against 07-20 before this change.
+  const EVENTS_LIMIT = 100;
+  const WATCHDOG_LIMIT = 100;
+  const eventsUrl = `${api}/services/${serviceId}/events?limit=${EVENTS_LIMIT}`
+    + `&startTime=${encodeURIComponent(leftEdge)}&endTime=${encodeURIComponent(to)}`;
+
   const [wd, cov, dep, ev] = await Promise.all([
-    owner ? get(logUrl(`&text=${encodeURIComponent('self-restarting')}&limit=100`)) : { ok: false, body: null },
+    owner ? get(logUrl(`&text=${encodeURIComponent('self-restarting')}&limit=${WATCHDOG_LIMIT}`)) : { ok: false, body: null },
     owner ? get(logUrl('&limit=5')) : { ok: false, body: null },
     get(`${api}/services/${serviceId}/deploys?limit=50`),
-    get(`${api}/services/${serviceId}/events?limit=100`),
+    get(eventsUrl),
   ]);
 
   const arr = (b, k) => (Array.isArray(b) ? b : b?.[k] ?? []);
+  const events = arr(ev.body, 'events');
+  // ⚠️ `logs: null` on this route means NO MATCH, not "unreadable" — verified 2026-07-25 with a
+  // nonsense `text=` filter over a window that is provably readable (it also returns null), and with
+  // a `text=doTick` positive control over 07-22 (5 lines, hasMore) on a day whose self-restarting
+  // query returns null. The `?? []` below is therefore a correct coercion and not a fail-open; the
+  // thing that makes the zero honest is the UNFILTERED coverage probe next to it, which is why it
+  // exists. Do not "harden" this into a blind — it would blind every quiet session.
+  const wdLogs = wd.body?.logs ?? [];
   return buildBootSet({
     from, to, preWindowMs, deployLabel,
-    watchdogLines: (wd.body?.logs ?? []).map(l => ({ timestamp: l.timestamp, message: String(l.message ?? '') })),
+    watchdogLines: wdLogs.map(l => ({ timestamp: l.timestamp, message: String(l.message ?? '') })),
     watchdogOk: wd.ok,
+    watchdogTruncated: wd.ok && (wd.body?.hasMore === true || wdLogs.length >= WATCHDOG_LIMIT),
     coverageLineCount: (cov.body?.logs ?? []).length,
     coverageOk: cov.ok,
     deploys: arr(dep.body, 'deploys'),
     deploysOk: dep.ok,
-    events: arr(ev.body, 'events'),
+    events,
     eventsOk: ev.ok,
+    eventsQueryFrom: leftEdge,
+    eventsTruncated: events.length >= EVENTS_LIMIT,
   });
 }
 

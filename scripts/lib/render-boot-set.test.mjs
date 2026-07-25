@@ -207,6 +207,49 @@ test('F6 an events page that does not reach back past the window open is BLIND, 
   assert.match(r.blindReasons.join(' '), /events page did not reach back/);
 });
 
+// ── F7-F10 (TRA-2294): the events read is TIME-BOUNDED, so coverage is a different question ───────
+//
+// F6 above is the rule for an UNBOUNDED `?limit=N` read: "is the oldest thing I hold older than the
+// window?" That rule is wrong for a `?startTime=&endTime=` read, and wrong in the FAIL-CLOSED
+// direction, which is why it went unnoticed: it blinded three of the five prior RTH sessions on
+// 2026-07-25, i.e. exactly the historical sessions a recurrence question is made of. The two rules
+// are both correct and are selected by WHICH QUESTION THE CALLER ASKED — never inferred.
+
+test('F7 a bounded events read that covers the window is NOT blind, even with no event older than it', () => {
+  // The false blind, verbatim: a service quiet before the bell holds nothing older than `from`.
+  const quiet = FX.events.filter(e => e.timestamp > RTH.from);
+  const r = live(RTH, { events: quiet, eventsQueryFrom: RTH.from });
+  assert.equal(r.blind, false, r.blindReasons.join(' | '));
+  assert.equal(r.bootCount, 4);
+  assert.equal(r.invisibleToDeploys, 2);
+});
+
+test('F8 a bounded events read that STARTS after the window open is BLIND', () => {
+  const r = live(RTH, { events: FX.events, eventsQueryFrom: '2026-07-24T15:00:00.000Z' });
+  assert.equal(r.blind, true);
+  assert.match(r.blindReasons.join(' '), /startTime AFTER the window open/);
+});
+
+test('F9 a bounded events read that came back SATURATED is BLIND', () => {
+  const r = live(RTH, { events: FX.events, eventsQueryFrom: RTH.from, eventsTruncated: true });
+  assert.equal(r.blind, true);
+  assert.match(r.blindReasons.join(' '), /SATURATED/);
+});
+
+test('F10 a truncated watchdog page is BLIND — a lower-bound trip count reads as clean', () => {
+  const r = live(RTH, { watchdogTruncated: true });
+  assert.equal(r.blind, true);
+  assert.match(r.blindReasons.join(' '), /watchdog log page was TRUNCATED/);
+  assert.equal(r.bootCount, null);
+});
+
+test('F11 the pre-window edge, not `from`, is what a bounded events query must reach back to', () => {
+  // preWindowMs pushes the left edge earlier; a query that only reaches `from` no longer covers it.
+  const r = live({ ...RTH, preWindowMs: 120_000 }, { events: FX.events, eventsQueryFrom: RTH.from });
+  assert.equal(r.blind, true);
+  assert.match(r.blindReasons.join(' '), /startTime AFTER the window open/);
+});
+
 // ── L-OLD: regression controls. These assert the OLD expressions still get the WRONG answer. ─────
 
 test('L-OLD-a the naive /WATCHDOG TRIP/i DOES match the suppressed line — the bug is still visible', () => {
@@ -245,4 +288,22 @@ test('L-OLD-d the cluster is wider than a trip→echo gap and narrower than a de
     - new Date(FX.events.find(e => e.timestamp.startsWith('2026-07-24T15:58:03')).timestamp);
   assert.ok(tripToEcho < BOOT_CLUSTER_MS, 'a trip and its own boot echo must collapse');
   assert.ok(startedToEcho > BOOT_CLUSTER_MS, 'which is exactly why deploy_started cannot be the key');
+});
+
+test('L-OLD-e the unbounded coverage rule, applied to a bounded read, still FALSE-BLINDS a good window', () => {
+  // TRA-2294. The shipped detector judged a `?limit=100` newest-first page, so it asked "is the
+  // oldest event I hold older than the window open?". Keep asking that of a time-bounded read and a
+  // perfectly covered quiet session is BLIND — the answer that HOLDS a gate rather than passing it,
+  // which is why this cost three sessions of history and no alarm. Encode the wrong answer, not just
+  // the right one: a suite that only asserts the fix cannot tell you the fix is still load-bearing.
+  const quiet = FX.events.filter(e => e.timestamp > RTH.from);
+  const old = live(RTH, { events: quiet });                                // no eventsQueryFrom
+  assert.equal(old.blind, true);
+  assert.match(old.blindReasons.join(' '), /events page did not reach back/);
+  assert.equal(old.bootCount, null);
+
+  // …and the fix, on the same bytes, reads the window.
+  const fixed = live(RTH, { events: quiet, eventsQueryFrom: RTH.from });
+  assert.equal(fixed.blind, false);
+  assert.equal(fixed.bootCount, 4);
 });
