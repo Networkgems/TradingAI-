@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rm } from 'node:fs/promises';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import {
   makeHypothesis,
   runHypothesis,
@@ -1292,6 +1293,145 @@ describe('TRA-1602 cost-aware fire-bar health route', () => {
     } finally {
       delete process.env.ENABLE_OPTION_COST_AWARE_GATE;
     }
+  });
+});
+
+// TRA-2311 (parent TRA-2295) — the spread ceiling's ARM BIT.
+//
+// `spreadCeilingEvaluated: 0` has two causes — ARMED-but-no-entry-reached-the-gate
+// (verdict VOID) and DISARMED (verdict MEANINGLESS) — and before this block they
+// were indistinguishable on the wire. A field that reads `true` in both states is
+// not a fix, so every case below MUTATES the switch and asserts the bit MOVES.
+describe('TRA-2311 spreadCeiling arm bit on /api/health/cost-aware-gate', () => {
+  interface SpreadCeilingBlock {
+    flag: string;
+    armed: boolean;
+    defaultOn: boolean;
+    flagValue: string | null;
+    overlayCapable: boolean;
+    minBidUsdOverride: number | null;
+    structures: string[];
+    perStructure: { structure: string; maxSpreadPct: number; minBidUsd: number }[];
+    note: string;
+  }
+
+  const serveCostGate = (): { spreadCeiling: SpreadCeilingBlock; armed: boolean } => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/cost-aware-gate')![0]!({}, res);
+    return res.body as { spreadCeiling: SpreadCeilingBlock; armed: boolean };
+  };
+
+  const FLAG = 'OPTION_SPREAD_CEILING_ENFORCE';
+  const MIN_BID = 'OPTION_SPREAD_CEILING_MIN_BID_USD';
+  let tmp: string | null = null;
+
+  beforeEach(() => {
+    clearCostAwareGateLedger();
+    delete process.env[FLAG];
+    delete process.env[MIN_BID];
+  });
+  afterEach(() => {
+    clearCostAwareGateLedger();
+    delete process.env[FLAG];
+    delete process.env[MIN_BID];
+    delete process.env.DATA_DIR;
+    delete process.env.ENABLE_OPTION_COST_AWARE_GATE;
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = null;
+  });
+
+  it('ABSENT flag ⇒ armed TRUE — the opt-OUT default, opposite polarity to deltaCeiling', () => {
+    const { spreadCeiling } = serveCostGate();
+    expect(spreadCeiling.flag).toBe(FLAG);
+    expect(spreadCeiling.armed).toBe(true); // AC3: the default-ON half
+    expect(spreadCeiling.defaultOn).toBe(true);
+    expect(spreadCeiling.flagValue).toBeNull();
+    expect(spreadCeiling.structures).toContain('single_leg_directional');
+    // AC4 — the polarity has to be stated, not merely implemented: a reader who
+    // pattern-matches this block onto deltaCeiling's opt-IN wording concludes the
+    // exact opposite of the truth.
+    expect(spreadCeiling.note).toContain('opt-OUT');
+    expect(spreadCeiling.note).toMatch(/ABSENT .* is ARMED/);
+    expect(spreadCeiling.note).toContain('ARMED');
+  });
+
+  it('OPTION_SPREAD_CEILING_ENFORCE=0 ⇒ armed FALSE — the bit MOVES (prove-it-fires)', () => {
+    process.env[FLAG] = '0';
+    const { spreadCeiling } = serveCostGate();
+    expect(spreadCeiling.armed).toBe(false); // AC3: the disarmed half
+    expect(spreadCeiling.flagValue).toBe('0');
+    // The note must tell the Monday grader the verdict is void, not a pass.
+    expect(spreadCeiling.note).toContain('DISARMED');
+    expect(spreadCeiling.note).toContain('MEANINGLESS');
+  });
+
+  it.each(['false', 'no', 'off', 'OFF'])('an explicit %s also disarms', (value) => {
+    process.env[FLAG] = value;
+    expect(serveCostGate().spreadCeiling.armed).toBe(false);
+  });
+
+  it('a TYPO does NOT silently disarm — only an explicit off value does', () => {
+    process.env[FLAG] = 'flase';
+    expect(serveCostGate().spreadCeiling.armed).toBe(true);
+  });
+
+  it('resolves through resolveDemoFlagEnv (the engine path), NOT process.env directly', () => {
+    // Positive control FIRST: without it, a `spreadCeiling.armed` that ignores the
+    // overlay is indistinguishable from a route that never opened the file at all.
+    // ENABLE_OPTION_COST_AWARE_GATE *is* allowlisted, so if the top-level `armed`
+    // flips from the file, the route demonstrably read the overlay on this call.
+    tmp = mkdtempSync(join(tmpdir(), 'tra2311-'));
+    writeFileSync(
+      join(tmp, 'demo-flags.json'),
+      JSON.stringify({ ENABLE_OPTION_COST_AWARE_GATE: '1', [FLAG]: '0' }),
+      'utf8',
+    );
+    process.env.DATA_DIR = tmp;
+
+    const { armed, spreadCeiling } = serveCostGate();
+    expect(armed).toBe(true); // control: the overlay WAS read on this request
+
+    // ...and now the finding this test exists to pin. The kill switch documented as
+    // "demo-flags file in demo" is NOT on DEMO_FLAG_ALLOWLIST, so `loadDemoFlagFile`
+    // drops it and the overlay resolves it straight through to process.env. The
+    // route reports that rather than implying a file channel that does not exist —
+    // an operator who "disarmed" via the file would otherwise be reading a lie.
+    expect(spreadCeiling.overlayCapable).toBe(false);
+    expect(spreadCeiling.armed).toBe(true);
+    expect(spreadCeiling.note).toContain('NOT on DEMO_FLAG_ALLOWLIST');
+    expect(spreadCeiling.note).toContain('PROCESS env');
+
+    // The process env IS the live channel — same request shape, flag moved there.
+    process.env[FLAG] = '0';
+    expect(serveCostGate().spreadCeiling.armed).toBe(false);
+  });
+
+  it('reports the effective min-bid floor the engine applies, including the ""⇒0 edge', () => {
+    expect(serveCostGate().spreadCeiling.minBidUsdOverride).toBeNull();
+    const base = serveCostGate().spreadCeiling.perStructure.find(
+      (s) => s.structure === 'single_leg_directional',
+    )!;
+    expect(base.minBidUsd).toBeCloseTo(0.1, 6);
+
+    process.env[MIN_BID] = '0.25';
+    const tuned = serveCostGate().spreadCeiling;
+    expect(tuned.minBidUsdOverride).toBeCloseTo(0.25, 6);
+    expect(
+      tuned.perStructure.find((s) => s.structure === 'single_leg_directional')!.minBidUsd,
+    ).toBeCloseTo(0.25, 6);
+
+    // `Number('')` is 0 — finite and >= 0 — so an EMPTY value removes the floor in
+    // the engine. Mirrored here on purpose: telemetry that hid it would report a
+    // floor the entry path is not applying.
+    process.env[MIN_BID] = '';
+    expect(serveCostGate().spreadCeiling.minBidUsdOverride).toBe(0);
   });
 });
 

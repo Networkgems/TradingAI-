@@ -86,7 +86,12 @@ import {
   admissionBarR,
   OPTION_COST_AWARE_GATE_FLAG,
 } from '../option-cost-gate.js';
-import { summarizeSpreadCost, SLEEVE_SPREAD_CEILINGS } from '../option-spread-cost.js';
+import {
+  summarizeSpreadCost,
+  SLEEVE_SPREAD_CEILINGS,
+  isSpreadCeilingEnforceEnabled,
+  OPTION_SPREAD_CEILING_ENFORCE_FLAG,
+} from '../option-spread-cost.js';
 import type { SpreadCostSample } from '../option-spread-cost.js';
 import {
   isDirectionalQualityGateEnabled,
@@ -110,7 +115,7 @@ import {
 import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
-import { resolveDemoFlagEnv } from '../demo-flags.js';
+import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
 import {
   isSma200DemoForwardTestEnabled,
   SMA200_DEMO_FORWARD_TEST_FLAG,
@@ -2158,6 +2163,61 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           note: ceilingArmed
             ? `ARMED (demo-only). ENFORCING (rejects the open): ${enforcing.length > 0 ? enforcing.map(describe).join(', ') : 'none'}. OBSERVE-ONLY (counts the breach, ADMITS the open — TRA-1689): ${observeOnly.length > 0 ? perStructure.filter((s) => s.mode === 'observe').map(describe).join(', ') : 'none'}. deltaCeilingRejected>0 per structure is the evidence an ENFORCING ceiling is biting; deltaCeilingObserved>0 is a tail being MEASURED while it still trades. The two are never summed. READ THESE OFF \`retained\`, NOT off \`byStructure\` (TRA-1703): byStructure is scoped to ONE ET day, so a ceiling reject on day 3 of an observe window reads 0 from day 4 on — the tripwire self-clears at midnight. \`retained\` folds every retained ET day (horizon: retained.retentionDays). Ceilings are measured PER SLEEVE (OTM 0.55: n=14 tail, NET −1.813R) — do not extrapolate one sleeve's number onto another; give it its own via the name:value form.`
             : `DISARMED: set ${OPTION_ENTRY_DELTA_CEILING_FLAG}=1 (DATA_DIR/demo-flags.json) to arm on the demo book.`,
+        };
+      })(),
+      // TRA-2311 — the ARM BIT for the TRA-2295 entry spread ceiling. Without it
+      // `spreadCeilingEvaluatedTotal: 0` has two causes that read IDENTICALLY:
+      //   (a) ARMED but no entry reached the gate  ⇒ the grade is VOID, retry later;
+      //   (b) DISARMED via OPTION_SPREAD_CEILING_ENFORCE=0 ⇒ the ceiling is not in
+      //       force at all and TRA-2295 is unfixed in practice.
+      // A grader that reads (b) as "0 entries over the ceiling — PASS" is satisfied
+      // by ZERO ENTRIES, which is precisely the failure TRA-2295 exists to remove.
+      // Resolved through the SAME expression the entry path uses
+      // (`signal-engine.ts:spreadCeilingRejectReason` → `resolveDemoFlagEnv()` on the
+      // demo branch), never `process.env` directly — a bit computed off a different
+      // resolution path than the gate would be a second false instrument.
+      spreadCeiling: (() => {
+        const ceilingArmed = isSpreadCeilingEnforceEnabled(env);
+        // Mirror the engine's coercion EXACTLY (signal-engine.ts:5535) so the
+        // reported floor is the one actually applied — including the sharp edge
+        // that `''` coerces to 0 and thereby REMOVES the quotability floor.
+        const rawMinBid = env.OPTION_SPREAD_CEILING_MIN_BID_USD;
+        const minBid = Number(rawMinBid);
+        const minBidUsdOverride =
+          rawMinBid !== undefined && Number.isFinite(minBid) && minBid >= 0 ? minBid : null;
+        const structures = Object.keys(SLEEVE_SPREAD_CEILINGS);
+        const perStructure = structures.map((structure) => {
+          const base = SLEEVE_SPREAD_CEILINGS[structure]!;
+          return {
+            structure,
+            maxSpreadPct: base.maxSpreadPct,
+            maxSpreadCrossR: base.maxSpreadCrossR,
+            minBidUsd: minBidUsdOverride ?? base.minBidUsd,
+          };
+        });
+        // The kill switch is NOT on DEMO_FLAG_ALLOWLIST, so `demo-flags.json`
+        // CANNOT carry it (`loadDemoFlagFile` copies allowlisted keys only) — the
+        // overlay resolves it straight through to process.env. Reported rather
+        // than assumed: "which env can answer this flag" is exactly the question
+        // that made the arm state unobservable in the first place.
+        const overlayCapable = (DEMO_FLAG_ALLOWLIST as readonly string[]).includes(
+          OPTION_SPREAD_CEILING_ENFORCE_FLAG,
+        );
+        return {
+          flag: OPTION_SPREAD_CEILING_ENFORCE_FLAG,
+          armed: ceilingArmed,
+          /** OPPOSITE POLARITY to every other gate on this route: absent ⇒ ARMED. */
+          defaultOn: true,
+          /** The raw effective string, so a typo'd value is visible and not inferred. */
+          flagValue: env[OPTION_SPREAD_CEILING_ENFORCE_FLAG] ?? null,
+          /** false ⇒ demo-flags.json cannot set this key; process env is the ONLY channel. */
+          overlayCapable,
+          minBidUsdOverride,
+          structures,
+          perStructure,
+          note: ceilingArmed
+            ? `ARMED (default-ON, opt-OUT polarity — an ABSENT ${OPTION_SPREAD_CEILING_ENFORCE_FLAG} is ARMED, unlike every other gate on this route). The entry path rejects an option open whose (ask − bid)/mark exceeds its sleeve ceiling, or whose bid is under the quotability floor: ${perStructure.map((s) => `${s.structure} ≤${(s.maxSpreadPct * 100).toFixed(0)}% / bid ≥$${s.minBidUsd.toFixed(2)}`).join(', ')}. READ THIS BIT BEFORE GRADING spreadCeilingEvaluated: armed + evaluated=0 means NO ENTRY REACHED THE GATE (verdict VOID — do NOT read it as a pass); armed + evaluated>0 with maxAdmittedSpreadPct ≤ the sleeve ceiling is the actual pass. Only an EXPLICIT 0|false|no|off disarms, so a typo keeps the ceiling on.${overlayCapable ? '' : ` This flag is NOT on DEMO_FLAG_ALLOWLIST, so demo-flags.json cannot carry it — the only place a disarm can live is the PROCESS env (Render env var).`}`
+            : `DISARMED — ${OPTION_SPREAD_CEILING_ENFORCE_FLAG} is explicitly set to '${env[OPTION_SPREAD_CEILING_ENFORCE_FLAG] ?? ''}' (0|false|no|off). The TRA-2295 entry ceiling is NOT in force: no open is being rejected for spread, and spreadCeilingEvaluated stays 0 no matter how many entries fire. Any TRA-2295 verification computed in this state is MEANINGLESS — do not grade it, re-arm first by REMOVING the flag (absent ⇒ armed).`,
         };
       })(),
       ...summarizeCostAwareGate(etDay),

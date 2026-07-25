@@ -5519,9 +5519,19 @@ export class SignalEngine {
    * in the codebase already asserted was in force. A dark default would leave the
    * documented behaviour and the actual behaviour disagreeing for as long as the
    * flag stayed unset, which is the state that produced the bug. The kill switch is
-   * `OPTION_SPREAD_CEILING_ENFORCE=0` (demo-flags file in demo, process env in
-   * live), and `OPTION_SPREAD_CEILING_MIN_BID_USD` retunes the quotability floor
-   * without a deploy.
+   * `OPTION_SPREAD_CEILING_ENFORCE=0`, and `OPTION_SPREAD_CEILING_MIN_BID_USD`
+   * retunes the quotability floor.
+   *
+   * TRA-2311 — both keys resolve from the PROCESS env in both modes. The demo
+   * branch reads them through `resolveDemoFlagEnv()` for consistency with its
+   * neighbours, but NEITHER is on `DEMO_FLAG_ALLOWLIST`, so `loadDemoFlagFile`
+   * drops them and `demo-flags.json` cannot carry either one. That is deliberate:
+   * the file exists so a non-admin operator can arm DARK/tightening toggles
+   * daemon-free, and this switch only ever LOOSENS admission — a guardrail should
+   * not be disarmable through the unprivileged channel. (An earlier revision of
+   * this comment said "demo-flags file in demo"; it was never true. The arm state
+   * is now published at `/api/health/cost-aware-gate` → `spreadCeiling.armed`,
+   * with `overlayCapable:false` recording exactly this.)
    *
    * Returns a rejection reason to skip the open, or `null` to proceed.
    */
