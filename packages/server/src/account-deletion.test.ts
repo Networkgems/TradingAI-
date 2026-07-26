@@ -389,3 +389,72 @@ describe('TRA-2421 — the delete sequence', () => {
     expect(outcome).toMatchObject({ reason: 'residue' });
   });
 });
+
+describe('TRA-2421 — what the receipt is allowed to say on the wire', () => {
+  // `receipt.errors[]` is labelled with ABSOLUTE DATA_DIR paths (`primary:/srv/
+  // data/users/enock`, `backup:/srv/data/backups/<stamp>`). The residue branch
+  // returns the receipt to the CALLER, so the failure path — the one nobody
+  // exercises by hand — was handing a client the server's filesystem layout.
+  // The operator's copy is unaffected: `log.error` gets the full receipt.
+
+  /** A receipt shaped exactly as `wipeAccountData` builds a FAILING one. */
+  function residueReceipt(): import('./account-deletion.js').AccountWipeReceipt {
+    return {
+      username: 'enock',
+      deletedAt: T0,
+      primaryDirExisted: true,
+      primaryDirRemoved: false,
+      primaryDirReappeared: true,
+      backupGenerationsScanned: 24,
+      backupGenerationsWithData: 3,
+      backupGenerationsPurged: 2,
+      backupGenerationsRemaining: 1,
+      resetTokensRevoked: 1,
+      twoFactorStateCleared: 0,
+      errors: [
+        `primary:${userDir('enock')}: EPERM: operation not permitted`,
+        `backup:${generationDir(T0)}: EBUSY: resource busy or locked`,
+      ],
+      ok: false,
+    };
+  }
+
+  it('drops the error STRINGS and keeps the count', () => {
+    const receipt = residueReceipt();
+    const publicReceipt = accountDeletion.redactWipeReceipt(receipt);
+
+    expect(publicReceipt.errorCount).toBe(2);
+    expect(publicReceipt).not.toHaveProperty('errors');
+    // The verdict and every count the user is entitled to survive intact —
+    // redacting must not turn the residue report into a shrug.
+    expect(publicReceipt.ok).toBe(false);
+    expect(publicReceipt.backupGenerationsRemaining).toBe(1);
+    expect(publicReceipt.backupGenerationsWithData).toBe(3);
+    expect(publicReceipt.primaryDirReappeared).toBe(true);
+
+    // The original is NOT mutated — the operator log reads it after this call.
+    expect(receipt.errors).toHaveLength(2);
+  });
+
+  it('leaks no filesystem path anywhere in the serialised body', () => {
+    const body = JSON.stringify(accountDeletion.redactWipeReceipt(residueReceipt()));
+    expect(body).not.toContain(DATA_DIR);
+    expect(body).not.toContain('EPERM');
+    expect(body).not.toContain('primary:');
+    expect(body).not.toContain('backup:');
+  });
+
+  it('DRIFT GUARD: the only free-text field on the wire is the caller own username', () => {
+    // The redactor is a WHITELIST, so a new receipt field cannot leak by being
+    // added upstream. What it cannot stop is someone adding a field to the
+    // redactor itself. Any string value other than `username` is a new channel
+    // for a path, a stack or an internal label, and has to be argued for here.
+    const publicReceipt = accountDeletion.redactWipeReceipt(residueReceipt()) as unknown as Record<string, unknown>;
+    const stringKeys = Object.keys(publicReceipt).filter(k => typeof publicReceipt[k] === 'string');
+    expect(stringKeys).toEqual(['username']);
+    // And nothing nested, which would slip past the check above.
+    for (const [key, value] of Object.entries(publicReceipt)) {
+      expect(typeof value, `field ${key}`).not.toBe('object');
+    }
+  });
+});

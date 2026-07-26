@@ -93,10 +93,65 @@ export interface AccountWipeReceipt {
   backupGenerationsRemaining: number;
   resetTokensRevoked: number;
   twoFactorStateCleared: number;
-  /** Non-fatal failures (permission, locked file). Non-empty ⇒ `ok` is false. */
+  /**
+   * Non-fatal failures (permission, locked file). Non-empty ⇒ `ok` is false.
+   *
+   * ⚠️ These strings are labelled with ABSOLUTE `DATA_DIR` paths (`primary:…`,
+   * `backup:…`) and are for the operator log ONLY. Never put this array on the
+   * wire — send `redactWipeReceipt()` instead.
+   */
   errors: string[];
   /** The single verdict: nothing restorable is left anywhere. */
   ok: boolean;
+}
+
+/**
+ * The receipt as the CLIENT is allowed to see it — counts and verdicts, no
+ * server-side strings.
+ *
+ * This is a WHITELIST, and deliberately so. The tempting form is
+ * `{ ...receipt, errors: undefined }`, but that ships every field the receipt
+ * grows later, and the next one to carry a path would leak on the day it is
+ * added with nothing here to notice. Listing the safe fields means a new field
+ * is invisible to the client until someone decides it is safe.
+ *
+ * `errorCount` is kept because the user is being told "some data could not be
+ * removed" and a number is the difference between a report and a shrug; the
+ * strings behind it stay in `log.error`, which is where an operator reads them.
+ */
+export interface PublicAccountWipeReceipt {
+  username: string;
+  deletedAt: number;
+  primaryDirExisted: boolean;
+  primaryDirRemoved: boolean;
+  primaryDirReappeared: boolean;
+  backupGenerationsScanned: number;
+  backupGenerationsWithData: number;
+  backupGenerationsPurged: number;
+  backupGenerationsRemaining: number;
+  resetTokensRevoked: number;
+  twoFactorStateCleared: number;
+  errorCount: number;
+  ok: boolean;
+}
+
+/** Strip the operator-only strings out of a wipe receipt before it goes on the wire. */
+export function redactWipeReceipt(receipt: AccountWipeReceipt): PublicAccountWipeReceipt {
+  return {
+    username: receipt.username,
+    deletedAt: receipt.deletedAt,
+    primaryDirExisted: receipt.primaryDirExisted,
+    primaryDirRemoved: receipt.primaryDirRemoved,
+    primaryDirReappeared: receipt.primaryDirReappeared,
+    backupGenerationsScanned: receipt.backupGenerationsScanned,
+    backupGenerationsWithData: receipt.backupGenerationsWithData,
+    backupGenerationsPurged: receipt.backupGenerationsPurged,
+    backupGenerationsRemaining: receipt.backupGenerationsRemaining,
+    resetTokensRevoked: receipt.resetTokensRevoked,
+    twoFactorStateCleared: receipt.twoFactorStateCleared,
+    errorCount: receipt.errors.length,
+    ok: receipt.ok,
+  };
 }
 
 // ── The two decisions the route makes, lifted out so they are testable ────────

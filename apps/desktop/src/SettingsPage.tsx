@@ -411,6 +411,26 @@ export function ChangePasswordSection({ token, httpUrl }: { token: string; httpU
 }
 
 /**
+ * What is NOT deleted, stated once so the promise made BEFORE the delete and the
+ * receipt shown AFTER it cannot drift apart.
+ *
+ * ⚠️ This is not a hedge — it is the deliberate design. The option journal
+ * (`option-trade-journal.jsonl`) is shared, append-only, and firm-wide. Purging a
+ * departing user's rows would shrink board-graded sample sizes, and blanking
+ * their `account` field is worse: every desk/firm reader treats an `account`-less
+ * row as IN SCOPE, so "anonymising" would inject a deleted book into firm P&L.
+ * The rows stay and the TRA-2421 tombstone scopes them out of any future holder
+ * of the username instead.
+ *
+ * The earlier copy here said the calendar was deleted "from this server and from
+ * its backups". The calendar is DERIVED from these retained rows, so that
+ * sentence was false about the one axis the reporter cared about most.
+ */
+const RETENTION_NOTICE =
+  'They are no longer linked to your account, and are not visible to anyone who registers '
+  + 'this username later — including on the trading calendar.';
+
+/**
  * TRA-2421 — self-serve account deletion (board request on TRA-2406).
  *
  * Two confirmations, because this is irreversible and there is no undo anywhere
@@ -436,7 +456,12 @@ export function DeleteAccountSection({
   // Set once the account is actually gone. The form is replaced rather than
   // re-enabled: the token is dead from this point, so every other control on the
   // page would 401 and read as a connection problem.
-  const [destroyed, setDestroyed] = useState<null | { clean: boolean; message: string }>(null);
+  const [destroyed, setDestroyed] = useState<null | {
+    clean: boolean;
+    message: string;
+    /** Option-journal rows deliberately retained (see the retention note below). */
+    journalRowsRetained: number | null;
+  }>(null);
 
   useEffect(() => {
     fetch(`${httpUrl}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
@@ -465,9 +490,15 @@ export function DeleteAccountSection({
         ok?: boolean;
         error?: string;
         receipt?: { ok?: boolean };
+        journalRowsRetained?: number | null;
       };
+      const retained = typeof data.journalRowsRetained === 'number' ? data.journalRowsRetained : null;
       if (r.ok && data.ok) {
-        setDestroyed({ clean: true, message: 'Your account and all of its data have been deleted.' });
+        setDestroyed({
+          clean: true,
+          message: 'Your account and its trading data have been deleted.',
+          journalRowsRetained: retained,
+        });
         return;
       }
       // A `receipt` in the body means the identity WAS destroyed even though the
@@ -478,6 +509,7 @@ export function DeleteAccountSection({
           clean: false,
           message: data.error
             ?? 'Your account was deleted, but some stored data could not be removed. This has been reported.',
+          journalRowsRetained: retained,
         });
         return;
       }
@@ -496,6 +528,17 @@ export function DeleteAccountSection({
         <p className={destroyed.clean ? undefined : 'save-error'} data-testid="delete-account-done">
           {destroyed.message}
         </p>
+        {/* The server COMPUTES this count on every delete. Rendering it nowhere
+            would leave the one honest number about the retention on the floor,
+            after having promised it up front. `> 0` only: "0 records remain" is
+            noise on a book that never traded an option. */}
+        {destroyed.journalRowsRetained !== null && destroyed.journalRowsRetained > 0 && (
+          <p className="field-hint" data-testid="delete-account-retained">
+            {destroyed.journalRowsRetained.toLocaleString()} simulated option-trade{' '}
+            {destroyed.journalRowsRetained === 1 ? 'record remains' : 'records remain'} in the firm's
+            research ledger. {RETENTION_NOTICE}
+          </p>
+        )}
         <div className="settings-footer" style={{ marginTop: '1rem', paddingTop: 0, borderTop: 'none' }}>
           <button type="button" className="btn-primary" onClick={() => onLogout?.()}>
             Return to Sign In
@@ -509,8 +552,13 @@ export function DeleteAccountSection({
     <section className="settings-section">
       <h2 className="settings-section-title">Delete Account</h2>
       <p className="field-hint" data-testid="delete-account-warning">
-        This permanently deletes your trading history — positions, calendar, reports, watchlist and
-        settings — from this server and from its backups. <strong>This cannot be undone.</strong>
+        This permanently deletes your account and its trading data — open positions, reports,
+        watchlist, settings and saved trade history — from this server and from its backups.{' '}
+        <strong>This cannot be undone.</strong>
+      </p>
+      <p className="field-hint" data-testid="delete-account-retention">
+        <strong>One exception.</strong> Records of your simulated option trades remain in the firm's
+        research ledger, which is shared and append-only. {RETENTION_NOTICE}
       </p>
       <form onSubmit={handleDelete}>
         <div className="settings-grid">

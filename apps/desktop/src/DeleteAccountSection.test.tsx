@@ -50,6 +50,27 @@ describe('TRA-2421 — Delete Account section', () => {
     expect(warning.textContent).toMatch(/cannot be undone/i);
   });
 
+  it('discloses the option-journal retention BEFORE the delete, and does not claim the calendar is wiped', async () => {
+    // The calendar is DERIVED from `option-trade-journal.jsonl`, whose rows are
+    // deliberately retained (purging shrinks board-graded n; blanking `account`
+    // injects a deleted book into firm P&L, because every desk reader treats an
+    // account-less row as in scope). The old copy promised the calendar was
+    // deleted "from this server and from its backups" — true of everything else
+    // in that list and false of the one axis the reporter cared about.
+    mockRoutes(ME);
+    renderSection();
+    const retention = await screen.findByTestId('delete-account-retention');
+    expect(retention.textContent).toMatch(/simulated option trades remain/i);
+    expect(retention.textContent).toMatch(/no longer linked to your account/i);
+    expect(retention.textContent).toMatch(/registers this username later/i);
+    expect(retention.textContent).toMatch(/calendar/i);
+
+    // The overclaim must not come back by someone re-adding "calendar" to the
+    // list of things deleted from backups.
+    const warning = screen.getByTestId('delete-account-warning');
+    expect(warning.textContent).not.toMatch(/calendar/i);
+  });
+
   it('stays disabled until BOTH the password and the exact username are given', async () => {
     mockRoutes(ME);
     renderSection();
@@ -94,6 +115,46 @@ describe('TRA-2421 — Delete Account section', () => {
     expect(onLogout).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: /return to sign in/i }));
     expect(onLogout).toHaveBeenCalled();
+  });
+
+  it('renders the retained-row count the server returns, instead of dropping it', async () => {
+    // `DELETE /api/account` computes `journalRowsRetained` on every call. A
+    // receipt that exists and is rendered nowhere is the shape this repo keeps
+    // re-learning: the disclosure promised a retention, so the number that
+    // quantifies it has to reach the screen.
+    mockRoutes({
+      ...ME,
+      '/api/account': { body: { ok: true, receipt: { ok: true }, journalRowsRetained: 47 } },
+    });
+    renderSection();
+    await screen.findByText(/enock/);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText(/current password/i), 'pw');
+    await user.type(confirmField(), 'enock');
+    await user.click(deleteButton());
+
+    const retained = await screen.findByTestId('delete-account-retained');
+    expect(retained.textContent).toMatch(/47/);
+    expect(retained.textContent).toMatch(/records remain/i);
+    expect(retained.textContent).toMatch(/no longer linked to your account/i);
+  });
+
+  it('says nothing about retention when the server reports zero rows retained', async () => {
+    // "0 records remain" on a book that never traded an option is noise that
+    // reads like a caveat.
+    mockRoutes({
+      ...ME,
+      '/api/account': { body: { ok: true, receipt: { ok: true }, journalRowsRetained: 0 } },
+    });
+    renderSection();
+    await screen.findByText(/enock/);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText(/current password/i), 'pw');
+    await user.type(confirmField(), 'enock');
+    await user.click(deleteButton());
+
+    await screen.findByTestId('delete-account-done');
+    expect(screen.queryByTestId('delete-account-retained')).toBeNull();
   });
 
   it('a refused delete leaves the user signed in, with the server reason shown', async () => {
@@ -150,7 +211,9 @@ describe('TRA-2421 — Delete Account section', () => {
         body: {
           ok: false,
           error: 'Your account was deleted, but some stored data could not be removed.',
-          receipt: { ok: false },
+          // The redacted shape the route puts on the wire: counts, no strings.
+          receipt: { ok: false, errorCount: 2, backupGenerationsRemaining: 1 },
+          journalRowsRetained: 3,
         },
       },
     });
@@ -163,6 +226,9 @@ describe('TRA-2421 — Delete Account section', () => {
 
     const done = await screen.findByTestId('delete-account-done');
     expect(done.textContent).toMatch(/some stored data could not be removed/i);
+    // The retention disclosure is owed on the failure path too — the journal rows
+    // were never in scope for the wipe that partially failed.
+    expect((await screen.findByTestId('delete-account-retained')).textContent).toMatch(/3/);
     expect(screen.queryByRole('button', { name: /delete my account/i })).toBeNull();
     expect(screen.getByRole('button', { name: /return to sign in/i })).toBeEnabled();
   });

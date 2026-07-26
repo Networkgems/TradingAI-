@@ -41,7 +41,7 @@ import {
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
-import { wipeAccountData, refuseSelfDelete, performSelfDelete } from './account-deletion.js';
+import { wipeAccountData, refuseSelfDelete, performSelfDelete, redactWipeReceipt } from './account-deletion.js';
 import { accountDeletedAt } from './deleted-accounts.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
@@ -6004,6 +6004,12 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     journalRowsRetained = journalRowsForBook(await listOptionTradeJournal(), username).length;
   } catch { /* the journal is advisory here; never fail a completed delete on it */ }
 
+  // `receipt.errors[]` is labelled with absolute DATA_DIR paths — operator log
+  // only. The redaction is applied to BOTH branches, not just the failing one, so
+  // there is a single shape on the wire and no future field can leak by landing on
+  // the path nobody redacted. The full receipt still goes to `log`.
+  const publicReceipt = redactWipeReceipt(receipt);
+
   if (!receipt.ok) {
     // The identity IS gone and cannot authenticate — that half is done and is not
     // reversible. Say plainly that residue remains rather than returning a bare
@@ -6012,13 +6018,13 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     res.status(500).json({
       ok: false,
       error: 'Your account was deleted, but some stored data could not be removed. This has been logged for an operator.',
-      receipt,
+      receipt: publicReceipt,
       journalRowsRetained,
     });
     return;
   }
   log.info('TRA-2421: self-delete complete', { username, receipt });
-  res.json({ ok: true, receipt, journalRowsRetained });
+  res.json({ ok: true, receipt: publicReceipt, journalRowsRetained });
 });
 
 app.patch('/api/auth/me', requireAuth, async (req, res) => {
