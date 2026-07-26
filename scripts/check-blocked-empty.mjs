@@ -32,6 +32,50 @@
  * as readily as it under-reports. `blockerAttention` is printed here as
  * context and is NEVER allowed to suppress a finding.
  *
+ * ⛔⛔ AND NEVER LET IT NAME THE ANCHOR (TRA-2396). The same rollup exposes
+ * `sampleBlockerIdentifier`, and it is STRUCTURALLY INCAPABLE of yielding a
+ * legal one: it samples open DESCENDANTS, and a descendant can never be a valid
+ * `blockedByIssueIds` value for its own ancestor — that edge is a 2-cycle, which
+ * is strictly WORSE than the empty array it replaces (an empty `blockedBy`
+ * auto-flips and stays visible; a cycle is a permanent hold neither side can
+ * break). The first live routing this detector produced (TRA-2383) carried a
+ * copy-pasteable PATCH built on that field, alongside four lines of prose
+ * warning not to run it. Prose does not survive a copy-paste.
+ *
+ * So: this script emits NO repair PATCH, ever. What it emits instead is an
+ * ANCHOR VERDICT — every rollup candidate resolved against the parent chain and
+ * every descendant/self/ancestor/closed one struck out. When nothing survives,
+ * the true and actionable message is "no valid anchor: every unresolved blocker
+ * in the rollup is a descendant", and that is what it prints. The rollup COUNT
+ * is still printed: work really is parked downstream. Only the anchor
+ * suggestion had to go.
+ *
+ * ⛔ THE CAUSE IS A BRANCH, NOT A SENTENCE (TRA-2396). Two different writers
+ * produce `blocked` + empty, and they need OPPOSITE repairs:
+ *
+ *   RECOVERY-BLOCKED  Paperclip's terminal-run recovery wrote the status. There
+ *                     was never an intended anchor, so there is nothing to
+ *                     restore — re-derive what the issue waits on TODAY.
+ *   DROPPED-EDGE      an agent PATCHed `{"blockedBy":[…],"status":"blocked"}`;
+ *                     the `status` half landed and the blocker half was silently
+ *                     discarded (TRA-2365 / TRA-2304). Here an intended anchor
+ *                     DOES exist and is worth restoring.
+ *
+ * TRA-2383 asserted DROPPED-EDGE in the indicative on a case that was
+ * RECOVERY-BLOCKED — a confident sentence bolted onto a correctly detected
+ * number. The marker is cheap: `activeRecoveryAction`, or once discharged a
+ * SYSTEM-AUTHORED comment carrying `acpx_turn_failed` / `Recovery action:` /
+ * `Recovery owner:`. So we branch on it instead of guessing.
+ *
+ *   ⛔ The authorship gate is load-bearing, not decoration. Agents QUOTE
+ *   `acpx_turn_failed` in their own comments constantly (TRA-2396's own body
+ *   does), so a marker regex without `authorType === 'system'` brands every
+ *   thread that merely discusses recovery as RECOVERY-BLOCKED. Controlled.
+ *
+ *   ⛔ And an UNREAD comment thread is not an absent marker. A failed comment
+ *   GET yields cause UNKNOWN, never DROPPED-EDGE — otherwise the inference
+ *   would be strongest exactly where we read least.
+ *
  * THE TWO SILENT READS THIS SCRIPT EXISTS TO SURVIVE
  * --------------------------------------------------
  *   1. `GET /api/companies/{c}/issues` CAPS AT 1000 ROWS and `offset` DOES
@@ -156,6 +200,273 @@ export async function enumerateIssues(getIssuesPage, { limit = PAGE_LIMIT, maxPa
 }
 
 /* ------------------------------------------------------------------ *
+ * The parent graph — built from the SAME enumeration, zero extra reads
+ *
+ * The issue-LIST route omits `blockedBy` but it DOES carry `parentId`, so the
+ * whole ancestry of every issue in the company is already in hand by the time
+ * we grade anything. That is what makes descendant-filtering cheap enough to be
+ * unconditional.
+ * ------------------------------------------------------------------ */
+
+export function buildGraph(issues) {
+  const byId = new Map();
+  const byIdentifier = new Map();
+  const parentOf = new Map();
+  for (const row of Array.isArray(issues) ? issues : []) {
+    if (!row || !row.id) continue;
+    byId.set(row.id, row);
+    if (row.identifier) byIdentifier.set(row.identifier, row);
+    parentOf.set(row.id, row.parentId || null);
+  }
+  return { byId, byIdentifier, parentOf };
+}
+
+/**
+ * Walk `id` upwards. Returns the ancestor ids, nearest first.
+ *
+ * `parentOf.get()` returning `undefined` (id not in the enumeration) and `null`
+ * (a real root) are DIFFERENT facts, and the caller must not conflate them — an
+ * id we never enumerated has an UNKNOWN chain, not an empty one. Callers here
+ * check membership first. The `seen` guard is because a malformed parent cycle
+ * would otherwise spin forever.
+ */
+export function ancestorChain(graph, id, maxDepth = 64) {
+  const out = [];
+  const seen = new Set([id]);
+  let cur = graph.parentOf.get(id) || null;
+  while (cur && !seen.has(cur) && out.length < maxDepth) {
+    out.push(cur);
+    seen.add(cur);
+    cur = graph.parentOf.get(cur) || null;
+  }
+  return out;
+}
+
+export const ANCHOR = {
+  /** No graph was supplied — say so. An unanalysed candidate is NOT an eligible one. */
+  NO_GRAPH: 'NO_GRAPH',
+  /** The rollup named nobody. Nothing to strike out, nothing to propose. */
+  NO_CANDIDATES: 'NO_CANDIDATES',
+  /** Every candidate is a descendant. THE message: "no valid anchor". */
+  ALL_DESCENDANTS: 'ALL_DESCENDANTS',
+  /** Struck out for mixed reasons (descendant + closed + unresolvable). */
+  ALL_INELIGIBLE: 'ALL_INELIGIBLE',
+  /**
+   * Something survived the filter. Deliberately NOT called "ELIGIBLE": surviving
+   * the graph test proves only that the edge would not be a cycle. It says
+   * nothing about whether that issue is what the subject actually waits on, and
+   * on a RECOVERY-BLOCKED subject there was no intended anchor to be right about.
+   */
+  CANDIDATE_UNVERIFIED: 'CANDIDATE_UNVERIFIED',
+};
+
+const CLOSED_STATUSES = new Set(['done', 'cancelled']);
+
+/**
+ * Resolve and filter the rollup's anchor candidates for one subject.
+ *
+ * Pure. Returns { verdict, count, candidates[], message } — never a PATCH, never
+ * a command, and never a bare identifier the caller could mistake for one.
+ */
+export function classifyAnchor(item, graph) {
+  const att = item.blockerAttention || null;
+  const count = att && Number.isFinite(att.unresolvedBlockerCount) ? att.unresolvedBlockerCount : null;
+  const named = [att ? att.sampleBlockerIdentifier : null, att ? att.sampleStalledBlockerIdentifier : null].filter(
+    (v, i, a) => v && a.indexOf(v) === i,
+  );
+
+  if (!graph) {
+    return {
+      verdict: ANCHOR.NO_GRAPH,
+      count,
+      candidates: named.map((identifier) => ({ identifier, reason: 'UNANALYSED' })),
+      message:
+        'anchor NOT analysed — no parent graph was available, so no candidate could be tested for ' +
+        'descendancy. Unanalysed is not eligible; re-derive the dependency by hand.',
+    };
+  }
+
+  if (!named.length) {
+    return {
+      verdict: ANCHOR.NO_CANDIDATES,
+      count,
+      candidates: [],
+      message:
+        'no anchor candidate is even named by the rollup. Re-derive what this issue waits on today; ' +
+        'if the answer is nothing, `todo` is the correct disposition for a parked-ready leaf.',
+    };
+  }
+
+  const candidates = named.map((identifier) => {
+    const row = graph.byIdentifier.get(identifier) || null;
+    if (!row) {
+      return {
+        identifier,
+        id: null,
+        reason: 'UNRESOLVED_IDENTIFIER',
+        detail: 'not present in the enumeration — its ancestry cannot be tested, so it cannot be cleared',
+      };
+    }
+    if (row.id === item.id) {
+      return { identifier, id: row.id, reason: 'SELF', detail: 'is the subject itself' };
+    }
+    const candidateAncestors = ancestorChain(graph, row.id);
+    if (candidateAncestors.includes(item.id)) {
+      const parent = graph.byId.get(row.parentId || '');
+      return {
+        identifier,
+        id: row.id,
+        reason: 'DESCENDANT',
+        detail:
+          `is a DESCENDANT of the subject (parent ${parent ? parent.identifier || parent.id : row.parentId})` +
+          ' — that edge is a 2-cycle, worse than the empty array',
+      };
+    }
+    if (ancestorChain(graph, item.id).includes(row.id)) {
+      return {
+        identifier,
+        id: row.id,
+        reason: 'ANCESTOR',
+        detail: 'is an ANCESTOR of the subject — reported, not proposed; the open child already carries the wait',
+      };
+    }
+    if (CLOSED_STATUSES.has(String(row.status))) {
+      return {
+        identifier,
+        id: row.id,
+        reason: 'CLOSED',
+        detail: `is \`${row.status}\` — an inert blocker READS like a repair and resolves nothing`,
+      };
+    }
+    return { identifier, id: row.id, reason: 'SURVIVES', detail: `status \`${row.status}\`, not in the subject's subtree` };
+  });
+
+  const survivors = candidates.filter((c) => c.reason === 'SURVIVES');
+  if (survivors.length) {
+    return {
+      verdict: ANCHOR.CANDIDATE_UNVERIFIED,
+      count,
+      candidates,
+      message:
+        `${survivors.map((c) => c.identifier).join(', ')} would not be a cycle — that is ALL this proves. ` +
+        'It is not evidence the subject waits on it. Re-derive the dependency, then write the edge ' +
+        'yourself with the documented write field; this tool emits no repair command (TRA-2396).',
+    };
+  }
+
+  const allDescendants = candidates.every((c) => c.reason === 'DESCENDANT');
+  return {
+    verdict: allDescendants ? ANCHOR.ALL_DESCENDANTS : ANCHOR.ALL_INELIGIBLE,
+    count,
+    candidates,
+    message: allDescendants
+      ? 'NO VALID ANCHOR: every unresolved blocker in the rollup is a DESCENDANT of the subject. ' +
+        'There is nothing here to anchor onto — re-derive the dependency, or use `todo` (the open ' +
+        'children already carry the wait upstream).'
+      : 'NO VALID ANCHOR: every candidate the rollup named is struck out (see reasons above). ' +
+        're-derive the dependency from scratch.',
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Cause branch — RECOVERY-BLOCKED vs DROPPED-EDGE
+ * ------------------------------------------------------------------ */
+
+export const CAUSE = {
+  RECOVERY_BLOCKED: 'RECOVERY_BLOCKED',
+  DROPPED_EDGE_INFERRED: 'DROPPED_EDGE_INFERRED',
+  UNKNOWN: 'UNKNOWN',
+};
+
+const RECOVERY_MARKER = /acpx_turn_failed|Recovery action:|Recovery owner:|terminal run recovery/i;
+const MOVED_TO_BLOCKED = /moving it to\s*`?blocked`?/i;
+// The owner arrives as a markdown link: `Recovery owner: [CFO](/TRA/agents/<id>)`.
+// The id segment is matched as "whatever is left in the path", NOT as a uuid — a
+// uuid-shaped pattern silently captured nothing on a non-uuid id and the branch
+// lost its owner name while still reading as a clean RECOVERY-BLOCKED.
+const OWNER_LINK = /Recovery owner:\s*\[([^\]]+)\]\([^)]*agents\/([^)\/\s]+)\)/;
+
+/**
+ * ⛔ The authorship gate. `authorType === 'system'` is the real signal; the
+ * both-ids-null fallback covers a schema that stops sending the field. An
+ * AGENT-authored comment quoting the recovery text is NOT a marker — that is the
+ * whole trap (see header), and it is controlled.
+ */
+function isSystemAuthored(c) {
+  if (!c || typeof c !== 'object') return false;
+  if (typeof c.authorType === 'string') return c.authorType === 'system';
+  return !c.authorAgentId && !c.authorUserId;
+}
+
+/**
+ * Pure. `commentsError` is a REASON STRING — an unread thread must land on
+ * UNKNOWN, never on the dropped-edge inference.
+ */
+export function gradeCause({ item, comments, commentsError }) {
+  const recovery = item.activeRecoveryAction || null;
+  if (recovery) {
+    return {
+      cause: CAUSE.RECOVERY_BLOCKED,
+      via: 'activeRecoveryAction',
+      evidence:
+        `activeRecoveryAction ${recovery.kind || '?'}${recovery.cause ? `/${recovery.cause}` : ''}` +
+        `${recovery.status ? `:${recovery.status}` : ''}${recovery.createdAt ? ` @ ${recovery.createdAt}` : ''}`,
+      recoveryOwnerAgentId: recovery.ownerAgentId || recovery.returnOwnerAgentId || null,
+      recoveryOwnerName: null,
+    };
+  }
+
+  if (commentsError) {
+    return { cause: CAUSE.UNKNOWN, via: 'comment thread unreadable', evidence: commentsError };
+  }
+  if (!Array.isArray(comments)) {
+    return {
+      cause: CAUSE.UNKNOWN,
+      via: 'comment thread unreadable',
+      evidence: 'the comment route returned a non-array; absence of a marker was never established',
+    };
+  }
+
+  const live = comments.filter((c) => c && !c.deletedAt);
+  const marker = live
+    .filter((c) => isSystemAuthored(c) && RECOVERY_MARKER.test(String(c.body || '')))
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')))[0];
+
+  if (marker) {
+    const body = String(marker.body || '');
+    const owner = OWNER_LINK.exec(body);
+    return {
+      cause: CAUSE.RECOVERY_BLOCKED,
+      via: 'system-authored recovery comment',
+      evidence:
+        `system comment @ ${marker.createdAt || '?'}` +
+        `${MOVED_TO_BLOCKED.test(body) ? ' states it moved the issue to `blocked`' : ' carries the recovery markers'}`,
+      // Don't overclaim the branch we just fixed someone else for overclaiming.
+      // A live `activeRecoveryAction` is present tense; a DISCHARGED one leaves
+      // only a comment, and the item route carries no status-change audit — so an
+      // agent re-block after that comment is consistent with everything we can see.
+      hedge:
+        'read from the comment thread, not from a status audit trail: an agent re-block AFTER that ' +
+        'comment cannot be excluded. Re-deriving the dependency is the correct move either way.',
+      recoveryOwnerAgentId: owner ? owner[2] : null,
+      recoveryOwnerName: owner ? owner[1] : null,
+    };
+  }
+
+  return {
+    cause: CAUSE.DROPPED_EDGE_INFERRED,
+    via: `no marker in ${live.length} readable comment(s)`,
+    evidence:
+      'no activeRecoveryAction and no SYSTEM-authored recovery comment. A dropped-blocker PATCH ' +
+      '(the read-field / write-field blocker split — see TRA-2365 / TRA-2304 for the field names) ' +
+      'is a PLAUSIBLE cause — an INFERENCE, not a read. Hedge it or confirm it from the run trail ' +
+      'before asserting it.',
+    recoveryOwnerAgentId: null,
+    recoveryOwnerName: null,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Classification — pure, so it can be controlled in both directions
  * ------------------------------------------------------------------ */
 
@@ -171,7 +482,7 @@ export const SEVERITY = {
  * `null` means "not in the shape". A string reason on `.unreadable` means the
  * payload could not be graded at all — which is BLIND, not clean.
  */
-export function classifyIssue(item, roster) {
+export function classifyIssue(item, roster, { graph = null } = {}) {
   if (!item || typeof item !== 'object') {
     return { unreadable: 'item payload was not an object' };
   }
@@ -215,6 +526,23 @@ export function classifyIssue(item, roster) {
     // issues carrying nothing that stops the auto-flip.
     blockerAttentionState: item.blockerAttention ? item.blockerAttention.state : null,
     blockerAttentionReason: item.blockerAttention ? item.blockerAttention.reason : null,
+    // Genuine signal — work IS parked downstream — so it is printed. What it can
+    // never do is name the anchor (TRA-2396); that goes through classifyAnchor,
+    // which strikes every descendant out and emits no PATCH either way.
+    rollupUnresolvedCount:
+      item.blockerAttention && Number.isFinite(item.blockerAttention.unresolvedBlockerCount)
+        ? item.blockerAttention.unresolvedBlockerCount
+        : null,
+    parentId: item.parentId || null,
+    anchor: classifyAnchor(item, graph),
+    // Filled in by sweep() once the comment thread has been read — a finding that
+    // never got there keeps cause UNKNOWN rather than defaulting to an inference.
+    cause: CAUSE.UNKNOWN,
+    causeVia: 'comment thread not read',
+    causeEvidence: null,
+    causeHedge: null,
+    recoveryOwnerAgentId: null,
+    recoveryOwnerName: null,
     // The upstream tell: a batch sharing one stamp is ONE platform event, not
     // N owners forgetting to anchor. Check this before blaming anybody.
     //
@@ -256,7 +584,7 @@ export function verdictFor({ blind, findings }) {
  * either of the two silent reads above, because both live in the plumbing.
  * ------------------------------------------------------------------ */
 
-export async function sweep({ getIssuesPage, getIssue, listAgents }, opts = {}) {
+export async function sweep({ getIssuesPage, getIssue, listAgents, getComments }, opts = {}) {
   const agents = await listAgents();
   const roster = new Map((Array.isArray(agents) ? agents : []).map((a) => [a.id, a]));
 
@@ -265,9 +593,13 @@ export async function sweep({ getIssuesPage, getIssue, listAgents }, opts = {}) 
     return { verdict: 'BLIND', blind: enumBlind, pages, roster, scanned: 0, itemReads: 0, findings: [], unreadable: [] };
   }
 
+  // Free: the list route omits `blockedBy` but carries `parentId`, so the whole
+  // company's ancestry is already paid for by the enumeration above.
+  const graph = buildGraph(issues);
+
   const blockedRows = issues.filter((i) => i.status === 'blocked');
 
-  const findings = [];
+  const hits = [];
   const unreadable = [];
   const concurrency = Math.max(1, Number(opts.concurrency || CONCURRENCY));
   let cursor = 0;
@@ -282,12 +614,48 @@ export async function sweep({ getIssuesPage, getIssue, listAgents }, opts = {}) 
         unreadable.push(`${row.identifier || row.id}: item GET threw — ${err?.message || err}`);
         continue;
       }
-      const graded = classifyIssue(item, roster);
+      const graded = classifyIssue(item, roster, { graph });
       if (graded && graded.unreadable) unreadable.push(graded.unreadable);
-      else if (graded) findings.push(graded);
+      else if (graded) hits.push({ graded, item });
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, blockedRows.length || 1) }, worker));
+
+  // Cause branch. One comment GET per FINDING — not per blocked issue and not on
+  // a clean board — and only when `activeRecoveryAction` has already been
+  // discharged, since a live one settles the branch on its own.
+  //
+  // A thread we cannot read stays UNKNOWN. This is precisely the step where an
+  // inference would otherwise get promoted to an assertion (TRA-2383 asserted
+  // DROPPED-EDGE on a RECOVERY-BLOCKED issue, TRA-2396).
+  await Promise.all(
+    hits.map(async (entry) => {
+      let comments = null;
+      let commentsError = null;
+      if (entry.item.activeRecoveryAction) {
+        // settled without a read
+      } else if (typeof getComments !== 'function') {
+        commentsError = 'no comment transport was supplied — the recovery marker could not be checked';
+      } else {
+        try {
+          comments = await getComments(entry.graded.id);
+        } catch (err) {
+          commentsError = `comment GET threw — ${err?.message || err}`;
+        }
+      }
+      const c = gradeCause({ item: entry.item, comments, commentsError });
+      Object.assign(entry.graded, {
+        cause: c.cause,
+        causeVia: c.via,
+        causeEvidence: c.evidence,
+        causeHedge: c.hedge || null,
+        recoveryOwnerAgentId: c.recoveryOwnerAgentId || null,
+        recoveryOwnerName: c.recoveryOwnerName || null,
+      });
+    }),
+  );
+
+  const findings = hits.map((e) => e.graded);
 
   // An item read we could not grade is a hole in the population, exactly like
   // a dropped page. Fail closed.
@@ -316,6 +684,35 @@ export async function sweep({ getIssuesPage, getIssue, listAgents }, opts = {}) 
 /* ------------------------------------------------------------------ *
  * Reporting
  * ------------------------------------------------------------------ */
+
+/**
+ * The one sentence a filer should paste, per finding — generated, not improvised.
+ *
+ * This exists because the failure mode on TRA-2383 was not the detection. It was
+ * the PROSE an agent wrote around a correct number: an inferred cause stated in
+ * the indicative, in the body AND in the title. So the tool now writes that
+ * sentence itself, in the branch the data supports.
+ */
+export function causeSentence(f, roster) {
+  const owner = f.recoveryOwnerName
+    ? f.recoveryOwnerName
+    : f.recoveryOwnerAgentId
+      ? (roster && roster.get(f.recoveryOwnerAgentId) || {}).name || f.recoveryOwnerAgentId
+      : null;
+  if (f.cause === CAUSE.RECOVERY_BLOCKED) {
+    return (
+      'RECOVERY-BLOCKED: the `blocked` status was written by Paperclip\'s terminal-run recovery ' +
+      `(${f.causeEvidence}), not by an agent PATCH. NO anchor was ever intended, so there is nothing ` +
+      'to restore — re-derive what this issue waits on TODAY.' +
+      (owner ? ` Recovery owner: ${owner}.` : '') +
+      (f.causeHedge ? ` ⚠ ${f.causeHedge}` : '')
+    );
+  }
+  if (f.cause === CAUSE.DROPPED_EDGE_INFERRED) {
+    return `DROPPED-EDGE (INFERENCE, ${f.causeVia}): ${f.causeEvidence}`;
+  }
+  return `CAUSE UNKNOWN (${f.causeVia}): ${f.causeEvidence} — do NOT write the dropped-edge narrative; its absence was never established.`;
+}
 
 export function renderReport(result) {
   const L = [];
@@ -393,6 +790,20 @@ export function renderReport(result) {
           ? `     platform wake ALREADY ACTIVE -> ${wakeOwner}. Do NOT file a duplicate; the owner is being poked.`
           : `     no platform wake — nobody is coming for this one unless it is routed.`,
       );
+      // The cause branch and the anchor verdict. Both are here because both were
+      // getting improvised into filings (TRA-2396): the cause asserted from a
+      // guess, the anchor lifted from a rollup that only ever samples descendants.
+      L.push(`     cause: ${causeSentence(f, result.roster)}`);
+      const rollup =
+        f.rollupUnresolvedCount === null || f.rollupUnresolvedCount === undefined
+          ? 'n/a'
+          : String(f.rollupUnresolvedCount);
+      L.push(`     rollup unresolvedBlockerCount=${rollup} (real signal: work parked DOWNSTREAM — never an anchor source)`);
+      const anchor = f.anchor || { verdict: ANCHOR.NO_GRAPH, candidates: [], message: 'not analysed' };
+      L.push(`     anchor ${anchor.verdict}: ${anchor.message}`);
+      for (const c of anchor.candidates || []) {
+        L.push(`       - ${c.identifier} ${c.reason}${c.detail ? ` — ${c.detail}` : ''}`);
+      }
     }
     L.push('');
   }
@@ -445,6 +856,13 @@ export function renderReport(result) {
   L.push('          ⛔ Do NOT anchor a child onto its own parent to satisfy "blocked needs a');
   L.push('          blocker" — that is a 2-cycle neither side can break. `todo` is the correct');
   L.push('          disposition for a parked-ready leaf.');
+  L.push('');
+  L.push('no repair command is emitted, on purpose (TRA-2396). The rollup field that used to');
+  L.push('supply the anchor samples DESCENDANTS, so an edge built from it is a guaranteed');
+  L.push('2-cycle — worse than the empty array, because an empty blockedBy at least auto-flips');
+  L.push('and stays visible. A wrong repair command is worse output than none: routing is this');
+  L.push('detector\'s job, and the anchor is the assignee\'s to re-derive. Paste the `cause:` line');
+  L.push('as-is when you file — it is branched on the marker, not guessed.');
   return L;
 }
 
@@ -484,8 +902,11 @@ function fakeBoard(planted, { total = 2350 } = {}) {
   return { rows, items };
 }
 
-function transportFor(board, { ignoreOffset = false, stripBlockedByKey = false } = {}) {
-  return {
+function transportFor(
+  board,
+  { ignoreOffset = false, stripBlockedByKey = false, comments = {}, commentsThrow = false, noCommentTransport = false } = {},
+) {
+  const t = {
     listAgents: async () => ROSTER,
     getIssuesPage: async ({ limit, offset }) => {
       const start = ignoreOffset ? 0 : offset;
@@ -501,7 +922,44 @@ function transportFor(board, { ignoreOffset = false, stripBlockedByKey = false }
       return item;
     },
   };
+  if (!noCommentTransport) {
+    t.getComments = async (id) => {
+      if (commentsThrow) throw new Error('HTTP 403 on the comment route');
+      return comments[id] || [];
+    };
+  }
+  return t;
 }
+
+/** A system-authored recovery comment, verbatim in shape from TRA-2310 comment 6. */
+const sysRecoveryComment = (at = '2026-07-25T20:45:12.831Z', ownerName = 'CFO', ownerId = 'agent-cfo') => ({
+  id: `c-${at}`,
+  authorType: 'system',
+  authorAgentId: null,
+  authorUserId: null,
+  createdAt: at,
+  body:
+    'Paperclip automatically retried continuation for this assigned `in_progress` issue during terminal run ' +
+    "recovery, but it still has no live execution path. Latest retry failure: `acpx_turn_failed` - Internal " +
+    "error: You've hit your session limit. Moving it to `blocked` so it is visible for intervention.\n" +
+    `- Recovery action: \`1a8e6fee-4947-424e-9d45-2ac55db3e320\`\n- Recovery owner: [${ownerName}](/TRA/agents/${ownerId})`,
+});
+
+/**
+ * An AGENT comment that QUOTES the recovery text — the trap. Agents discuss
+ * `acpx_turn_failed` constantly (TRA-2396's own body does), so a marker regex
+ * without the authorship gate reads this as a system write.
+ */
+const agentQuotingRecovery = (at = '2026-07-26T06:01:26.217Z') => ({
+  id: `c-agent-${at}`,
+  authorType: 'agent',
+  authorAgentId: 'agent-cfo',
+  authorUserId: null,
+  createdAt: at,
+  body:
+    'CFO — triage. Note for the record: the cluster of `blocked` issues on 07-25 came from ' +
+    '`acpx_turn_failed` recovery writes. Recovery owner: CFO on those. This issue is NOT one of them.',
+});
 
 const held = (id, ident, assignee) => ({
   list: { id, identifier: ident, title: `held ${ident}`, status: 'blocked', assigneeAgentId: assignee },
@@ -527,6 +985,26 @@ const stranded = (id, ident, assignee, extra = {}) => ({
     assigneeAgentId: assignee,
     blockedBy: [],
     activeRecoveryAction: { kind: 'stranded_assigned_issue', createdAt: '2026-07-26T02:01:14.000Z' },
+    ...extra,
+  },
+});
+
+/**
+ * A non-blocked issue planted only so the parent GRAPH has something in it. It
+ * is never itself a finding (status !== 'blocked'), which is the point: the
+ * descendant test has to work off the enumeration, not off the findings.
+ */
+const relative = (id, ident, { parentId = null, status = 'todo', assignee = 'agent-cto' } = {}) => ({
+  list: { id, identifier: ident, title: `relative ${ident}`, status, assigneeAgentId: assignee, parentId },
+  item: { id, identifier: ident, title: `relative ${ident}`, status, assigneeAgentId: assignee, parentId, blockedBy: [] },
+});
+
+const rollup = (unresolvedBlockerCount, sampleBlockerIdentifier, extra = {}) => ({
+  blockerAttention: {
+    state: 'needs_attention',
+    reason: 'attention_required',
+    unresolvedBlockerCount,
+    sampleBlockerIdentifier,
     ...extra,
   },
 });
@@ -647,6 +1125,168 @@ const CASES = [
     assert: (r) => r.findings.length === 1 && r.findings[0].platformWakeOwnerAgentId === null,
   },
   {
+    // ⛔ THE TRA-2396 CASE, and the one that was previously a SILENT WRONG ANSWER:
+    // the rollup names a candidate, the candidate is a CHILD of the subject, and
+    // the old report had nothing to say about it — so the filer improvised a PATCH
+    // that would have created a 2-cycle. Per the standing rule, that failing state
+    // read identically to the passing one.
+    name: 'ANCHOR — every rollup blocker is a DESCENDANT => "no valid anchor", and NO PATCH is emitted',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8070', 'agent-cto', rollup(1, 'TRA-8071')),
+          relative('c1', 'TRA-8071', { parentId: 's1' }),
+        ]),
+      ),
+    assert: (r) => {
+      const f = r.findings.find((x) => x.identifier === 'TRA-8070');
+      const out = renderReport(r).join('\n');
+      return (
+        r.findings.length === 1 &&
+        f.anchor.verdict === ANCHOR.ALL_DESCENDANTS &&
+        f.anchor.candidates.length === 1 &&
+        f.anchor.candidates[0].reason === 'DESCENDANT' &&
+        f.rollupUnresolvedCount === 1 && // the COUNT still prints — it is real signal
+        /no valid anchor/i.test(out) &&
+        !/blockedByIssueIds/.test(out)
+      );
+    },
+  },
+  {
+    // A GRANDCHILD, so the test cannot pass by comparing `parentId` one hop.
+    name: 'ANCHOR — a GRANDCHILD is a descendant too (the chain is walked, not one hop)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8072', 'agent-cto', rollup(1, 'TRA-8074')),
+          relative('c1', 'TRA-8073', { parentId: 's1' }),
+          relative('c2', 'TRA-8074', { parentId: 'c1' }),
+        ]),
+      ),
+    assert: (r) => r.findings[0].anchor.verdict === ANCHOR.ALL_DESCENDANTS,
+  },
+  {
+    name: 'ANCHOR — a NON-descendant candidate survives, but is labelled UNVERIFIED and still gets no PATCH',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8075', 'agent-cto', rollup(1, 'TRA-8076')),
+          relative('p1', 'TRA-8076', { parentId: null }),
+        ]),
+      ),
+    assert: (r) => {
+      const f = r.findings[0];
+      const out = renderReport(r).join('\n');
+      return (
+        f.anchor.verdict === ANCHOR.CANDIDATE_UNVERIFIED &&
+        f.anchor.candidates[0].reason === 'SURVIVES' &&
+        !/blockedByIssueIds/.test(out) &&
+        /UNVERIFIED/.test(out)
+      );
+    },
+  },
+  {
+    name: 'ANCHOR — a `done` candidate is struck out (an inert blocker READS like a repair)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8077', 'agent-cto', rollup(1, 'TRA-8078')),
+          relative('p1', 'TRA-8078', { parentId: null, status: 'done' }),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings[0].anchor.verdict === ANCHOR.ALL_INELIGIBLE && r.findings[0].anchor.candidates[0].reason === 'CLOSED',
+  },
+  {
+    name: 'CAUSE — a live activeRecoveryAction => RECOVERY-BLOCKED, "no anchor was ever intended" (no comment read needed)',
+    expect: 'FINDINGS',
+    build: () => transportFor(fakeBoard([stranded('s1', 'TRA-8080', 'agent-cto')])),
+    assert: (r) => {
+      const f = r.findings[0];
+      return (
+        f.cause === CAUSE.RECOVERY_BLOCKED &&
+        f.causeVia === 'activeRecoveryAction' &&
+        /NO anchor was ever intended/.test(causeSentence(f, r.roster)) &&
+        // present tense, from the item route itself — this arm needs no hedge
+        f.causeHedge === null
+      );
+    },
+  },
+  {
+    // TRA-2310's actual history: the recovery action was discharged, and the only
+    // surviving evidence is the system comment it left behind.
+    name: 'CAUSE — a DISCHARGED recovery, evidenced only by the SYSTEM comment => RECOVERY-BLOCKED, owner named',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([stranded('s1', 'TRA-8081', 'agent-cto', { activeRecoveryAction: null })]), {
+        comments: { s1: [sysRecoveryComment('2026-07-25T20:45:12.831Z', 'CFO', 'agent-cfo')] },
+      }),
+    assert: (r) => {
+      const f = r.findings[0];
+      return (
+        f.cause === CAUSE.RECOVERY_BLOCKED &&
+        f.causeVia === 'system-authored recovery comment' &&
+        f.recoveryOwnerName === 'CFO' &&
+        /Recovery owner: CFO/.test(causeSentence(f, r.roster)) &&
+        // ...and THIS arm is a thread read, so it must carry the hedge the live
+        // arm does not. Same verdict, different confidence — say which.
+        /cannot be excluded/.test(causeSentence(f, r.roster))
+      );
+    },
+  },
+  {
+    // ⛔ The authorship gate. Without it the marker regex fires on any thread that
+    // merely TALKS about recovery, and the branch inverts.
+    name: 'CAUSE — an AGENT comment QUOTING `acpx_turn_failed` is NOT a marker => DROPPED-EDGE, and hedged',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([stranded('s1', 'TRA-8082', 'agent-cto', { activeRecoveryAction: null })]), {
+        comments: { s1: [agentQuotingRecovery()] },
+      }),
+    assert: (r) => {
+      const f = r.findings[0];
+      const s = causeSentence(f, r.roster);
+      return f.cause === CAUSE.DROPPED_EDGE_INFERRED && /INFERENCE/.test(s) && /PLAUSIBLE/.test(s);
+    },
+  },
+  {
+    name: 'CAUSE — a DELETED system marker does not count (deletedAt) => DROPPED-EDGE, hedged',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([stranded('s1', 'TRA-8083', 'agent-cto', { activeRecoveryAction: null })]), {
+        comments: { s1: [{ ...sysRecoveryComment(), deletedAt: '2026-07-26T00:00:00.000Z' }] },
+      }),
+    assert: (r) => r.findings[0].cause === CAUSE.DROPPED_EDGE_INFERRED,
+  },
+  {
+    // ⛔ An UNREAD thread is not an absent marker. Fail closed on the NARRATIVE:
+    // the inference must not be strongest exactly where we read least.
+    name: 'CAUSE — the comment GET throws (403) => CAUSE UNKNOWN, never the dropped-edge narrative',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([stranded('s1', 'TRA-8084', 'agent-cto', { activeRecoveryAction: null })]), {
+        commentsThrow: true,
+      }),
+    assert: (r) => {
+      const f = r.findings[0];
+      const s = causeSentence(f, r.roster);
+      return f.cause === CAUSE.UNKNOWN && /CAUSE UNKNOWN/.test(s) && !/DROPPED-EDGE/.test(s);
+    },
+  },
+  {
+    name: 'CAUSE — no comment transport at all => CAUSE UNKNOWN (an unchecked marker is not an absent one)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([stranded('s1', 'TRA-8085', 'agent-cto', { activeRecoveryAction: null })]), {
+        noCommentTransport: true,
+      }),
+    assert: (r) => r.findings[0].cause === CAUSE.UNKNOWN,
+  },
+  {
     name: 'TRAP 1c — truncating the enumeration at the page cap => BLIND, never a count off a partial board',
     expect: 'BLIND',
     build: () => transportFor(fakeBoard([stranded('s1', 'TRA-8010', 'agent-cto')])),
@@ -685,8 +1325,19 @@ async function naiveMissControl() {
   };
 }
 
+/**
+ * The invariant that outranks every individual case: NO rendering of ANY board
+ * may contain a copy-pasteable `blockedByIssueIds` write. TRA-2383 shipped one
+ * inside a report that also argued against running it — prose loses to
+ * copy-paste, so the string must simply never be emitted.
+ */
+function assertNoRepairCommand(rendered) {
+  return !/blockedByIssueIds/.test(rendered) && !/PATCH \/api\/issues/.test(rendered);
+}
+
 async function selftest() {
   let failed = 0;
+  let renderedAll = '';
   for (const c of CASES) {
     let got = 'THREW';
     let ok = false;
@@ -694,6 +1345,7 @@ async function selftest() {
     try {
       const r = await sweep(c.build(), c.opts || {});
       got = r.verdict;
+      renderedAll += `${renderReport(r).join('\n')}\n`;
       ok = got === c.expect && c.assert(r);
       if (got !== c.expect) detail = `verdict ${got} != ${c.expect}`;
       else if (!ok) detail = 'verdict matched but the assertion on the payload failed';
@@ -704,6 +1356,13 @@ async function selftest() {
     console.log(`${ok ? 'ok  ' : 'FAIL'}  ${c.name}${c.note ? `  [${c.note}]` : ''}${ok ? '' : `\n        ${detail}`}`);
   }
 
+  const noCmd = assertNoRepairCommand(renderedAll);
+  if (!noCmd) failed += 1;
+  console.log(
+    `${noCmd ? 'ok  ' : 'FAIL'}  GLOBAL — no rendering of ANY control board emits a copy-pasteable repair PATCH\n` +
+      `        (checked the concatenated report of every case above for 'blockedByIssueIds' / 'PATCH /api/issues')`,
+  );
+
   const miss = await naiveMissControl();
   if (!miss.ok) failed += 1;
   console.log(
@@ -713,14 +1372,48 @@ async function selftest() {
 
   // Reachability: a control set that cannot produce every verdict is not a
   // control set, it is a rubber stamp with an alarm attached.
+  //
+  // ⛔ Asserted as COVERAGE, never as a count. The number of controls only ever
+  // grows, so a pinned "8 controls pass" goes stale the next time someone adds
+  // one — pin the DIRECTIONS that must be reachable instead.
   const reachable = new Set(CASES.map((c) => c.expect));
   const need = ['CLEAN', 'FINDINGS', 'FINDINGS_UNREPAIRABLE', 'BLIND'];
   const missing = need.filter((v) => !reachable.has(v));
-  const total = CASES.length + 1; // + the naive-miss differential
+  const total = CASES.length + 2; // + the naive-miss differential + the global no-command invariant
   console.log(`\n${total - failed}/${total} controls pass; verdicts reachable: ${[...reachable].sort().join(', ')}`);
   if (missing.length) {
     console.log(`FAIL  no control exercises: ${missing.join(', ')}`);
     failed += 1;
+  }
+
+  // Same rule one level down: the cause branch and the anchor verdict each need
+  // every arm reachable, or a wired-shut branch passes as a working one.
+  const causeArms = new Set([CAUSE.RECOVERY_BLOCKED, CAUSE.DROPPED_EDGE_INFERRED, CAUSE.UNKNOWN]);
+  const anchorArms = new Set([ANCHOR.ALL_DESCENDANTS, ANCHOR.ALL_INELIGIBLE, ANCHOR.CANDIDATE_UNVERIFIED, ANCHOR.NO_CANDIDATES]);
+  const seenCause = new Set();
+  const seenAnchor = new Set();
+  for (const c of CASES) {
+    try {
+      const r = await sweep(c.build(), c.opts || {});
+      for (const f of r.findings) {
+        seenCause.add(f.cause);
+        if (f.anchor) seenAnchor.add(f.anchor.verdict);
+      }
+    } catch {
+      /* the case-level loop above already reported it */
+    }
+  }
+  for (const [label, needed, seen] of [
+    ['cause', causeArms, seenCause],
+    ['anchor', anchorArms, seenAnchor],
+  ]) {
+    const gaps = [...needed].filter((v) => !seen.has(v));
+    if (gaps.length) {
+      console.log(`FAIL  no control reaches these ${label} arms: ${gaps.join(', ')}`);
+      failed += 1;
+    } else {
+      console.log(`ok    every ${label} arm is reachable: ${[...seen].sort().join(', ')}`);
+    }
   }
   if (failed) console.log('\nThe detector is NOT trustworthy while a control is red.');
   return failed ? 1 : 0;
@@ -759,6 +1452,10 @@ function liveTransport() {
     getIssuesPage: async ({ limit, offset }) =>
       unwrap(await get(`${BASE}/api/companies/${CO}/issues?limit=${limit}&offset=${offset}`), 'issues'),
     getIssue: async (id) => get(`${BASE}/api/issues/${id}`),
+    // Read for FINDINGS only, and only once `activeRecoveryAction` has been
+    // discharged. A throw here lands on cause UNKNOWN, never on the dropped-edge
+    // inference — do not "helpfully" coerce a failure to [].
+    getComments: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/comments`), 'comments'),
   };
 }
 
@@ -772,7 +1469,7 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          issue: 'TRA-2364',
+          issue: 'TRA-2364 (detector) + TRA-2396 (cause branch / anchor filter)',
           checkedAt: new Date().toISOString(),
           verdict: result.verdict,
           blind: result.blind,

@@ -273,8 +273,11 @@ pnpm check:blocked-empty
 #   FINDINGS              (exit 1)  every hit has a roster assignee to route to
 #   FINDINGS_UNREPAIRABLE (exit 2)  a hit no agent can repair — needs a human/board write
 #   BLIND                 (exit 3)  the enumeration is untrustworthy — NOT a pass
-pnpm check:blocked-empty:controls   # 8 controls, both directions; run before trusting a green
+pnpm check:blocked-empty:controls   # both directions + every cause/anchor arm reachable
 ```
+
+The control run asserts **coverage, not a count** — it prints `N/N` but *fails* only on a red
+case or an unreachable arm, so adding a control never breaks it. Do not quote the number.
 
 Three things make it more than a one-liner, and each is a silent read it refuses:
 
@@ -290,6 +293,35 @@ Three things make it more than a one-liner, and each is a silent read it refuses
 - **`blockerAttention` is never allowed to suppress a finding.** That rollup counts open
   *children*, which the anchor does not, so it reads `covered` over an empty
   `blockedBy` (measured on TRA-2331). Grade the shape, not the rollup.
+
+**It emits no repair command, on purpose (TRA-2396).** The rollup's
+`sampleBlockerIdentifier` is *structurally incapable* of naming a legal anchor — it samples
+open **descendants**, and a descendant edge onto its own ancestor is a 2-cycle, which is
+strictly worse than the empty array it would replace (empty auto-flips and stays visible; a
+cycle is a permanent hold neither side can break). The first live routing this detector
+produced (TRA-2383) shipped a copy-pasteable `PATCH` built on that field *plus* four lines of
+prose saying not to run it. **Prose loses to copy-paste.** So instead the script resolves every
+candidate against the parent chain — free, because the list route carries `parentId` — strikes
+out descendants/self/ancestors/closed, and prints an **anchor verdict**: when nothing survives,
+`NO VALID ANCHOR: every unresolved blocker in the rollup is a DESCENDANT`. The rollup *count*
+still prints; work really is parked downstream. A control covers the descendant-only case, and
+an invariant fails the whole run if any rendering contains a pasteable blocker write.
+
+**The cause is a branch, not a sentence.** Two writers produce this shape and they need
+opposite repairs:
+
+| branch | marker | repair |
+|---|---|---|
+| `RECOVERY-BLOCKED` | `activeRecoveryAction`, or a **system-authored** comment carrying `acpx_turn_failed` / `Recovery action:` / `Recovery owner:` | **no anchor was ever intended** — re-derive what the issue waits on *today* |
+| `DROPPED-EDGE` | no marker | an intended anchor exists — the dropped-blocker PATCH split (TRA-2365 / TRA-2304). Stated as an **inference**, hedged |
+| `CAUSE UNKNOWN` | the comment thread could not be read | say so. Absence of a marker was never established |
+
+TRA-2383 asserted DROPPED-EDGE in the indicative — in the title too — on an issue that was
+RECOVERY-BLOCKED: a confident sentence bolted onto a correctly detected number. The `cause:`
+line in the report is now generated per branch; **paste it, don't improvise it.** Two traps are
+controlled: agents *quote* `acpx_turn_failed` in their own comments constantly, so the marker
+requires `authorType === 'system'`; and an unread thread lands on UNKNOWN, never on the
+inference — otherwise the guess would be strongest exactly where we read least.
 
 It only ever **routes**. Board repair is assignee-scoped — the CFO holds the top role
 and still got `403 "Issue is outside this actor's authorization boundary"` on a plain
