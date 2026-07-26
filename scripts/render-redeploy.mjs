@@ -10,10 +10,11 @@
 // soak clock, disqualifying the session as the required clean acceptance sample.
 //
 // This wrapper turns that convention into a TECHNICAL GATE: it REFUSES to deploy the
-// soak host during Regular Trading Hours (13:30–20:00 UTC, Mon–Fri) unless the caller
-// passes an explicit, reasoned override. Any agent that routes bqb1 deploys through
-// this script can no longer accidentally break the soak. Stage feed/host changes for
-// the pre-open (<13:30Z) or post-close (>20:00Z) window instead.
+// soak host across Regular Trading Hours (freeze window 13:25–20:00 UTC, Mon–Fri;
+// RTH proper is 13:30–20:00Z and the freeze opens DEPLOY_LEAD_MIN early — see below)
+// unless the caller passes an explicit, reasoned override. Any agent that routes bqb1
+// deploys through this script can no longer accidentally break the soak. Stage
+// feed/host changes for the pre-open (<13:25Z) or post-close (>20:00Z) window instead.
 //
 // DIRECTION, stated once so it cannot be read backwards (TRA-2313): this is a FREEZE.
 // It REFUSES *inside* the window and is OPEN pre-open, post-close, and all weekend.

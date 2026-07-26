@@ -228,7 +228,7 @@ matching an equally stale live build would otherwise *manufacture* a CURRENT ver
 of N means the window you just measured ran on the previous build, and the result will
 look completely ordinary.
 
-### RTH time-window freeze (TRA-1996) — no bqb1 deploy during market hours
+### RTH deploy FREEZE (TRA-1996) — bqb1 deploys are REFUSED 13:25–20:00Z Mon–Fri
 
 The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a
 correct-SHA deploy to `tradingai-bqb1` **during Regular Trading Hours dumps the warm
@@ -238,26 +238,60 @@ us repeatedly (07-20: 2 deploys, 07-21: 4) when the SANDBOX-options learning tre
 (TRA-2125 / TRA-2134) — which ships its adapter to the **same** Render service —
 deployed mid-session.
 
-**The rule: no `tradingai-bqb1` deploy during RTH 13:30–20:00Z, Mon–Fri.** Stage
-feed/host/adapter changes for pre-open (`<13:30Z`) or post-close (`>20:00Z`). This
-applies to **every** work stream, including sandbox-options — not just feed fixes.
+**The rule: no `tradingai-bqb1` deploy inside 13:25–20:00Z, Mon–Fri.** This applies to
+**every** work stream, including sandbox-options — not just feed fixes.
+
+**DIRECTION — stated so it cannot be read backwards (TRA-2313).** This is a **FREEZE**,
+not a permission window. The gate **REFUSES *inside* 13:25–20:00Z Mon–Fri** and is
+**OPEN pre-open (`<13:25Z`), post-close (`≥20:00Z`), and all weekend** — the market is
+closed then, so there is no live soak session to fragment. Do not read "RTH-gated" as
+"only deployable during RTH": two of us read that phrasing backwards and embargoed a
+commit against a slot that was open the whole time (TRA-2308/TRA-2313). **Post-close is
+the slot the script itself recommends**, not one it refuses.
+
+The freeze opens **5 min before the 13:30Z bell** (`DEPLOY_LEAD_MIN`) because what
+fragments the soak is the **boot, not the POST**: a deploy *created* at 13:29Z finishes
+and restarts the process ~2–3 min later, i.e. inside RTH (TRA-2325). It does **not**
+close late — a deploy created at 19:59Z boots after the bell. Post-close *reads* are
+protected by dated embargoes instead (below), not by a standing close-side buffer.
 
 **Route all bqb1 deploys through the wrapper**, which enforces this as a technical
-gate rather than a convention (it refuses in-window deploys unless overridden):
+gate rather than a convention:
 
 ```bash
-# refuses if it is 13:30–20:00Z Mon–Fri on the soak host; else triggers the deploy
+# REFUSES (exit 4) if it is 13:25–20:00Z Mon–Fri on the soak host; else triggers the deploy
 RENDER_API_KEY=… node scripts/render-redeploy.mjs --commit=<sha>
 node scripts/render-redeploy.mjs --dry-run            # print the gate decision only
 # genuine emergency only — the reason is recorded and the session is disqualified:
 node scripts/render-redeploy.mjs --commit=<sha> --force-rth-override="why this cannot wait"
 ```
 
-The gate window is matched to `tra1648_soak_check.mjs`, so the wrapper and the
-acceptance grader agree with no DST drift. A raw `POST /v1/services/…/deploys` curl
-still bypasses it — so the wrapper is the *documented, enforced* path; do not
-hand-roll the curl during the soak. This rule lifts together with the launch-window
-freeze at go-live sign-off (TRA-1648).
+**Three gates, three refusals, three separate overrides** — all of them scoped to the
+soak host only (every other Render service deploys with no time gate):
+
+| exit | gate | what it means | override |
+|---|---|---|---|
+| `4` | RTH freeze | it is 13:25–20:00Z on a weekday | `--force-rth-override="…"` |
+| `5` | dated embargo | a board-ratified hold in the `EMBARGOES` table covers this instant | `--force-embargo-override="…"` |
+| `6` | commit hold | the deploy carries — or cannot be proven clear of — a commit in `COMMIT_HOLDS` | `--force-commit-hold-override="…"` |
+
+The overrides are deliberately **not** interchangeable: 4 and 5 are about *when* you
+deploy, 6 is about *what* you deploy, and authorisation to break the routine daily
+freeze is not authorisation to break a named-day hold or to ship a held commit. Each
+requires a non-empty reason, which is echoed so the breach is on the record. **A clear
+calendar says nothing about the commit**, so check `--dry-run` before assuming an open
+window means "go".
+
+The RTH bound is matched to `tra1648_soak_check.mjs`, so the wrapper and the acceptance
+grader agree with no DST drift. This rule lifts together with the launch-window freeze
+at go-live sign-off (TRA-1648).
+
+⚠️ **A green run of the wrapper is not evidence the host is safe to touch.** It gates
+**deploys**. It cannot see an **env/settings write** — and one of those redeploys bqb1
+anyway (`trigger: service_updated`) *despite* `autoDeploy=no` (TRA-2186) — nor the memory
+watchdog's own pm2 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261).
+A raw `POST /v1/services/…/deploys` curl also bypasses it, so the wrapper is the
+*documented, enforced* path; do not hand-roll the curl during the soak.
 
 ### Standard deploy (self-hosted PM2)
 
