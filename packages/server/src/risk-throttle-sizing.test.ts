@@ -593,6 +593,104 @@ describe('SignalEngine.activeRiskSizingMultiplier — the wiring', () => {
     expect(snapshotRiskThrottleSizing().byPath.equity_live!.minWouldMultiplier).toBe(decided());
   });
 
+  // TRA-2375 (parent TRA-2331) — the CHOKEPOINT IDENTITY carried alongside the two
+  // terms. TRA-2339's pair answers "would this fill have been trimmed?"; it cannot
+  // answer "was this fill even eligible?", because the five non-consulting open
+  // paths stamp a hardcoded `1` that is byte-identical to a consulted-and-untrimmed
+  // one. These pin the engine half: the identity is derived from the same `path`
+  // argument the term is, so the label and the number cannot disagree.
+  describe('the chokepoint-identity stamp (TRA-2375)', () => {
+    const stamp = (
+      engine: SignalEngine,
+      p: RiskThrottleSizingPath,
+    ): { riskThrottleMultiplier: number; riskThrottleDecided: number; riskThrottleSizingPath: RiskThrottleSizingPath } =>
+      (engine as unknown as {
+        _riskThrottleStampForTests(p: RiskThrottleSizingPath): {
+          riskThrottleMultiplier: number;
+          riskThrottleDecided: number;
+          riskThrottleSizingPath: RiskThrottleSizingPath;
+        };
+      })._riskThrottleStampForTests(p);
+
+    it('stamps the identity of the path it was asked about, for every path', () => {
+      process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      throttleEngine(engine, 0.5);
+      for (const p of ['equity_live', 'equity_live_mirror', 'equity_demo', 'options_single_leg',
+        'options_otm', 'equity_cap_estimate', 'proposal_estimate'] as RiskThrottleSizingPath[]) {
+        expect(stamp(engine, p).riskThrottleSizingPath).toBe(p);
+      }
+    });
+
+    it('the stamped path is the path the applied term was computed for — they cannot drift', () => {
+      // The failure this makes unrepresentable: an OTM setup that stamps the OTM
+      // term next to a hand-typed `options_single_leg` label. Both would typecheck
+      // and the cohort would be mislabelled forever with nothing to notice it. One
+      // `path` argument feeds both, so the assertion below is structural.
+      process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      throttleEngine(engine, 0.5);
+      const term = (p: RiskThrottleSizingPath): number =>
+        (engine as unknown as { _riskThrottleTermForTests(p: RiskThrottleSizingPath): number })
+          ._riskThrottleTermForTests(p);
+
+      for (const p of ['equity_live', 'equity_demo', 'options_single_leg', 'options_otm'] as RiskThrottleSizingPath[]) {
+        const s = stamp(engine, p);
+        expect(s.riskThrottleSizingPath).toBe(p);
+        expect(s.riskThrottleMultiplier).toBe(term(p));
+      }
+      // …and the two are genuinely different numbers across paths under `demo`, so
+      // the equality above is a real constraint and not a tautology on constants.
+      expect(stamp(engine, 'equity_live').riskThrottleMultiplier).toBe(1);
+      expect(stamp(engine, 'options_single_leg').riskThrottleMultiplier).toBe(0.5);
+    });
+
+    it('stamping still records no consult (inherited from both terms it composes)', () => {
+      process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      throttleEngine(engine, 0.5);
+      stamp(engine, 'options_single_leg');
+      stamp(engine, 'options_otm');
+      expect(snapshotRiskThrottleSizing().totalConsults).toBe(0);
+    });
+
+    it('the shared out-of-cohort constant carries a NULL path next to its two honest 1s', () => {
+      // Read through the seam rather than re-asserting a literal: the five
+      // non-consulting sites spread THIS object, so a test that restated
+      // `{multiplier: 1, decided: 1, path: null}` inline would keep passing even if
+      // those sites stopped spreading it.
+      const nonChokepoint = (SignalEngine as unknown as {
+        _nonChokepointThrottleStampForTests(): {
+          riskThrottleMultiplier: number;
+          riskThrottleDecided: number;
+          riskThrottleSizingPath: null;
+        };
+      })._nonChokepointThrottleStampForTests();
+
+      expect(nonChokepoint.riskThrottleMultiplier).toBe(1);
+      expect(nonChokepoint.riskThrottleDecided).toBe(1);
+      // NULL, not absent: absent has to keep meaning "pre-TRA-2375 build" alone.
+      expect(nonChokepoint.riskThrottleSizingPath).toBeNull();
+      expect(Object.prototype.hasOwnProperty.call(nonChokepoint, 'riskThrottleSizingPath')).toBe(true);
+    });
+
+    it('a latched sub-1 throttle does NOT leak onto the out-of-cohort stamp', () => {
+      // The constant is not derived from the governor, and must not become so: a
+      // path that never consults would not have been trimmed at ANY scope, so
+      // stamping the governor's 0.5 would manufacture a would-have-been-trimmed row
+      // no arming decision could ever have trimmed (TRA-2339's own reasoning).
+      process.env[RISK_THROTTLE_SIZING_FLAG] = 'all';
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      throttleEngine(engine, 0.25);
+      expect(stamp(engine, 'options_single_leg').riskThrottleDecided).toBe(0.25); // the governor IS latched
+      const nonChokepoint = (SignalEngine as unknown as {
+        _nonChokepointThrottleStampForTests(): { riskThrottleDecided: number; riskThrottleSizingPath: null };
+      })._nonChokepointThrottleStampForTests();
+      expect(nonChokepoint.riskThrottleDecided).toBe(1); // …and it stays out of this row
+      expect(nonChokepoint.riskThrottleSizingPath).toBeNull();
+    });
+  });
+
 });
 
 describe('the since-boot registry', () => {

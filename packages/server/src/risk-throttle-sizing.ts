@@ -90,6 +90,15 @@
 // Per-fill, the same pair is stamped on the row (`riskThrottleDecided` next to
 // `riskThrottleMultiplier`), so `decided < 1 && multiplier === 1` is exactly the
 // would-have-been-trimmed cohort, joinable to that trade's own R.
+//
+// TRA-2375 — the pair alone is not a partition, because it cannot say whether a
+// row was ELIGIBLE. Five option open paths are not chokepoints at any scope and
+// stamp a hardcoded `1` for both terms, which is byte-identical to a consulted-
+// and-untrimmed fill. So the row also carries `riskThrottleSizingPath`: the
+// identity of the chokepoint that produced the pair, or an explicitly-written
+// `null` when there was none. Read cohort membership from THAT — presence first
+// (`hasOwnProperty` ⇒ this build stamps it), then `!= null` (⇒ this fill was
+// eligible) — never from `decided === 1`, which pools both populations.
 
 import { MIN_RISK_THROTTLE } from './risk-autopilot.js';
 

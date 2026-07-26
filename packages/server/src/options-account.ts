@@ -60,7 +60,7 @@ import {
   type SentimentIcBand,
 } from './option-trade-journal.js';
 // TRA-2333 — the arming scope stamped onto every journal open row.
-import { riskThrottleSizingScope } from './risk-throttle-sizing.js';
+import { riskThrottleSizingScope, type RiskThrottleSizingPath } from './risk-throttle-sizing.js';
 
 // TRA-991 — the selector-computed setup the journal pairs with the realized
 // outcome. The account already knows the structure, entry delta, DTE, and
@@ -142,6 +142,25 @@ export interface OptionTradeJournalSetup {
    * `riskThrottleMultiplier` — they would not have been trimmed at any scope.
    */
   riskThrottleDecided: number;
+  /**
+   * TRA-2375 (parent TRA-2331) — WHICH chokepoint produced the two terms above,
+   * or `null` when this open path is not a chokepoint at any scope. Stamped
+   * verbatim onto the journal open row (see
+   * {@link OptionTradeJournalOpen.riskThrottleSizingPath} for the full contract
+   * and the three-state meaning of absent / `null` / a path).
+   *
+   * REQUIRED like its two siblings, and `null` is a value you must pass rather
+   * than a field you may omit. That is the whole guard: the ONE way this fix can
+   * regress is a newly-added consulting open path that forgets the stamp, which
+   * would silently drop its fills into the control arm — precisely the bug being
+   * fixed. Optional-with-a-default would make that regression compile.
+   *
+   * Pass the SAME path literal the sizing call consulted. At the five consulting
+   * sites the engine supplies all three fields from one
+   * `riskThrottleStampFor(path)` helper, so the stamped path is by construction
+   * the path that was consulted and the two cannot drift apart.
+   */
+  riskThrottleSizingPath: RiskThrottleSizingPath | null;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -790,6 +809,21 @@ export class PaperOptionsAccount {
       riskThrottleDecided: Number.isFinite(setup.riskThrottleDecided)
         ? setup.riskThrottleDecided
         : 1,
+      // TRA-2375 — the chokepoint identity, stamped UNCONDITIONALLY including
+      // when it is `null`. Writing an explicit `null` for a non-chokepoint open
+      // rather than omitting the key is load-bearing in two ways:
+      //
+      //   • it keeps ABSENT meaning exactly "written before TRA-2375", so a
+      //     regressed writer cannot hide inside the out-of-cohort population;
+      //   • a reader tests `hasOwnProperty` for "does this build stamp it" and
+      //     THEN `!= null` for "was this fill eligible". If non-chokepoint rows
+      //     omitted the key, those rows would fail the first test and force the
+      //     whole grade back onto its structure-based proxy — the partition
+      //     would never reach the exact basis this ticket exists to provide.
+      //
+      // `?? null` cannot mask a caller bug: the setup field is REQUIRED, so a
+      // consulting path that forgets it is a compile error, not a quiet null.
+      riskThrottleSizingPath: setup.riskThrottleSizingPath ?? null,
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))

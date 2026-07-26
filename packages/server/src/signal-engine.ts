@@ -190,6 +190,34 @@ import {
   riskThrottleDecidedMultiplier,
   recordRiskThrottleSizing,
 } from './risk-throttle-sizing.js';
+
+/**
+ * TRA-2375 — the throttle stamp for an open path that is NOT a risk-throttle
+ * chokepoint at any scope: `openDefinedRiskSpread` (takes no sizing scalar), the
+ * wheel's CSP / covered-call opens, and the bounded-live 1-contract override
+ * (whose explicit count wins over the sized one regardless of arming).
+ *
+ * Both terms are `1` — correct, and unchanged from TRA-2333/TRA-2339: no trim was
+ * applied and none WOULD have been, so stamping the governor's raw reading here
+ * would manufacture a would-have-been-trimmed row that no arming decision could
+ * ever have trimmed.
+ *
+ * The `null` path is the new part, and it is what stops those honest `1`s from
+ * being *read* as control observations. It is a written `null`, never an omitted
+ * key: absent has to keep meaning "pre-TRA-2375 build" alone, and a reader that
+ * tests presence before value would otherwise be forced back to a structure proxy
+ * by exactly the rows this constant covers.
+ *
+ * One shared constant rather than a literal per site so that adding a sixth
+ * non-consulting open path is a one-token decision that reads the same as the
+ * other five — and so `grep NON_CHOKEPOINT_THROTTLE_STAMP` enumerates the
+ * out-of-cohort population exactly.
+ */
+const NON_CHOKEPOINT_THROTTLE_STAMP = {
+  riskThrottleMultiplier: 1,
+  riskThrottleDecided: 1,
+  riskThrottleSizingPath: null,
+} as const;
 import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient } from './yahoo-feed.js';
 import {
@@ -6498,8 +6526,9 @@ export class SignalEngine {
                     // decided term is 1 too. Stamping the governor's raw reading
                     // here would put a row that no arming decision could trim into
                     // the would-have-been-trimmed cohort.
-                    riskThrottleMultiplier: 1,
-                    riskThrottleDecided: 1,
+                    // TRA-2375 — and the `null` path says so on the row, so those
+                    // two honest 1s are not read back as a control observation.
+                    ...NON_CHOKEPOINT_THROTTLE_STAMP,
                   };
                   const opened = this.optionsAccount.openDefinedRiskSpread(
                     shadowSignalToSpreadParams(selectorResult.signal, snap.spot),
@@ -6726,13 +6755,10 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
-          // TRA-2333 — the throttle term ALONE for the chokepoint that sizes this
-          // open (the `sizeMultiplier` below also carries `optionCapScale`).
-          riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
-      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
-      // the two agree; the pair still has to be stamped, because a row where they
-      // agree is only meaningful next to rows where they do not.
-      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+          // TRA-2333 / TRA-2339 / TRA-2375 — applied term + counterfactual twin +
+          // the chokepoint identity that says both came from a real chokepoint,
+          // all derived from the one path literal so they cannot disagree.
+          ...this.riskThrottleStampFor('options_single_leg'),
           // TRA-1183 — tag ema-pullback (Trend-Pullback) single-leg fills so they
           // are countable distinctly from bare single_leg_rv in the journal
           // rollup. `emaPullbackReason` is non-null only when the EMA-pullback
@@ -7433,8 +7459,10 @@ export class SignalEngine {
             // throttle term reaches this ticket.
             // TRA-2339 — nor would one at any scope: the override wins over the
             // sized count regardless of arming, so the decided term is 1 as well.
-            riskThrottleMultiplier: 1,
-            riskThrottleDecided: 1,
+            // TRA-2375 — this is the one out-of-cohort path a structure-based
+            // proxy CANNOT see (it journals `single_leg_otm`, same as the real
+            // OTM chokepoint). The `null` path stamp is what closes that leak.
+            ...NON_CHOKEPOINT_THROTTLE_STAMP,
           };
           // Open exactly 1 contract on the paper book (bounded-test override bypasses
           // the $5k OTM min-equity gate + the 15% cap the $268 account can't clear);
@@ -7511,10 +7539,9 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
-          // TRA-2333 — the throttle term alone for the OTM chokepoint.
-          riskThrottleMultiplier: this.riskThrottleTermFor('options_otm'),
-          // TRA-2339 — the counterfactual twin (see the RV setup above).
-          riskThrottleDecided: this.riskThrottleDecidedTerm(),
+          // TRA-2333 / TRA-2339 / TRA-2375 — the full stamp for the OTM
+          // chokepoint (see the RV setup above).
+          ...this.riskThrottleStampFor('options_otm'),
         };
         const opened = this.optionsAccount.openOptionFromCandidate(
           signal,
@@ -8465,14 +8492,11 @@ export class SignalEngine {
           sentiment: null,
           sentimentIcBand: null,
           agentConviction: null,
-          // TRA-2333 — the throttle term alone for the directional sleeve's
-          // chokepoint. This is the sleeve TRA-2331 grades, so the stamp here is
-          // the one the partition actually runs on.
-          riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
-      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
-      // the two agree; the pair still has to be stamped, because a row where they
-      // agree is only meaningful next to rows where they do not.
-      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+          // TRA-2333 / TRA-2339 / TRA-2375 — the full stamp for the directional
+          // sleeve's chokepoint. This is the sleeve TRA-2331 grades, so the stamp
+          // here is the one the partition actually runs on — and the path field is
+          // what keeps its control arm free of spread/wheel rows.
+          ...this.riskThrottleStampFor('options_single_leg'),
           // TRA-1682 — THE load-bearing tag. `openOptionFromRvCandidate` journals
           // `structure: 'single_leg_rv'` unconditionally for all three of its callers,
           // so this sleeve — the dominant demo churner, ungated by the |Δ|≥0.45
@@ -9148,8 +9172,9 @@ export class SignalEngine {
       // TRA-2339 — not a chokepoint means not a chokepoint at ANY scope, so the
       // decided term is 1 too; these rows are outside the throttle cohort
       // entirely, not un-trimmed members of it.
-      riskThrottleMultiplier: 1,
-      riskThrottleDecided: 1,
+      // TRA-2375 — "outside the cohort entirely" is now stated ON the row rather
+      // than left for a reader to infer from the archetype.
+      ...NON_CHOKEPOINT_THROTTLE_STAMP,
     };
   }
 
@@ -9221,12 +9246,9 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
-      // TRA-2333 — the throttle term alone for the iv-rv mispricing sleeve.
-      riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
-      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
-      // the two agree; the pair still has to be stamped, because a row where they
-      // agree is only meaningful next to rows where they do not.
-      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+      // TRA-2333 / TRA-2339 / TRA-2375 — the full stamp for the iv-rv mispricing
+      // sleeve's chokepoint.
+      ...this.riskThrottleStampFor('options_single_leg'),
       // Attribution hook: separates these fills from the RV sleeve in the
       // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
       entryArchetype: 'iv-rv-buy-premium',
@@ -9605,8 +9627,8 @@ export class SignalEngine {
                 // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no
                 // throttle term was applied to this ticket.
                 // TRA-2339 — and none would have been at any scope ⇒ decided 1.
-                riskThrottleMultiplier: 1,
-                riskThrottleDecided: 1,
+                // TRA-2375 — ⇒ `null` path: out of cohort, not un-trimmed in it.
+                ...NON_CHOKEPOINT_THROTTLE_STAMP,
               },
             );
             if (opened) {
@@ -12104,8 +12126,8 @@ export class SignalEngine {
         // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no throttle
         // term was applied to this ticket.
         // TRA-2339 — and none would have been at any scope ⇒ decided 1.
-        riskThrottleMultiplier: 1,
-        riskThrottleDecided: 1,
+        // TRA-2375 — ⇒ `null` path: out of cohort, not un-trimmed in it.
+        ...NON_CHOKEPOINT_THROTTLE_STAMP,
       };
       const combo = acct.openDefinedRiskSpread(
         {
@@ -12178,12 +12200,9 @@ export class SignalEngine {
       sentiment: null,
       sentimentIcBand: null,
       agentConviction: null,
-      // TRA-2333 — the throttle term alone for the AI-ideas single-leg open.
-      riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
-      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
-      // the two agree; the pair still has to be stamped, because a row where they
-      // agree is only meaningful next to rows where they do not.
-      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+      // TRA-2333 / TRA-2339 / TRA-2375 — the full stamp for the AI-ideas
+      // single-leg open's chokepoint.
+      ...this.riskThrottleStampFor('options_single_leg'),
       // TRA-2245 — an AI-Options-Ideas single-leg directional entry, not the True
       // RV engine. Stamp the directional structure label rather than inheriting
       // the reserved `single_leg_rv` default.
@@ -13763,11 +13782,47 @@ export class SignalEngine {
    * double-counting would corrupt `consults`/`trims`/`wouldTrims` alike.
    *
    * Non-consulting open paths (defined-risk spreads, wheel CSP/covered-call) do
-   * NOT call this — they stamp a literal `1` for both terms, because no arming
+   * NOT call this — they spread {@link NON_CHOKEPOINT_THROTTLE_STAMP} instead,
+   * which is a literal `1` for both terms plus a `null` path, because no arming
    * scope would have trimmed them.
    */
   private riskThrottleDecidedTerm(): number {
     return riskThrottleDecidedMultiplier(this.riskGovernor.getRiskThrottle());
+  }
+
+  /**
+   * TRA-2375 — the COMPLETE throttle stamp for one option-journal setup: the
+   * applied term, its counterfactual twin, and the identity of the chokepoint
+   * both came from.
+   *
+   * Why all three come from one call rather than three adjacent lines: the value
+   * of the path stamp is that it certifies WHICH chokepoint produced the numbers
+   * next to it. Two independent literals at a call site — `riskThrottleTermFor
+   * ('options_otm')` beside `riskThrottleSizingPath: 'options_single_leg'` —
+   * would typecheck, run, and mislabel the cohort forever. Taking `path` once and
+   * using it for both makes that class of drift unrepresentable rather than
+   * merely discouraged, the same move TRA-2333 made when it derived `armed` from
+   * the path instead of re-deriving it per call site.
+   *
+   * Pure — it records no consult, inheriting that from both terms it composes.
+   * The sizing call for this same ticket already recorded one.
+   */
+  private riskThrottleStampFor(path: RiskThrottleSizingPath): {
+    riskThrottleMultiplier: number;
+    riskThrottleDecided: number;
+    riskThrottleSizingPath: RiskThrottleSizingPath;
+  } {
+    return {
+      // The throttle term ALONE for this chokepoint — NOT the composed sizing
+      // scalar, which also carries `optionCapScale` (see `riskThrottleTermFor`).
+      riskThrottleMultiplier: this.riskThrottleTermFor(path),
+      // The counterfactual twin. Under `demo` the option paths ARE armed, so the
+      // two agree; the pair still has to be stamped, because a row where they
+      // agree is only meaningful next to rows where they do not.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+      // …and the cohort key that says both numbers came from a real chokepoint.
+      riskThrottleSizingPath: path,
+    };
   }
 
   /**
@@ -13807,6 +13862,25 @@ export class SignalEngine {
   /** TRA-2339 — test seam: the stamped DECIDED throttle term. */
   _riskThrottleDecidedTermForTests(): number {
     return this.riskThrottleDecidedTerm();
+  }
+
+  /** TRA-2375 — test seam: the full three-field throttle stamp for a chokepoint. */
+  _riskThrottleStampForTests(path: RiskThrottleSizingPath): {
+    riskThrottleMultiplier: number;
+    riskThrottleDecided: number;
+    riskThrottleSizingPath: RiskThrottleSizingPath;
+  } {
+    return this.riskThrottleStampFor(path);
+  }
+
+  /**
+   * TRA-2375 — test seam: the shared out-of-cohort stamp the five non-consulting
+   * open paths spread. Exposed so a test can assert the constant those sites use
+   * is the one with the `null` path, rather than re-asserting a literal that
+   * would keep passing if the sites stopped spreading it.
+   */
+  static _nonChokepointThrottleStampForTests(): typeof NON_CHOKEPOINT_THROTTLE_STAMP {
+    return NON_CHOKEPOINT_THROTTLE_STAMP;
   }
 
   /**

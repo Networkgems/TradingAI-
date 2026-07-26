@@ -4,7 +4,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
-import type { RiskThrottleSizingScope } from './risk-throttle-sizing.js';
+import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -192,8 +192,10 @@ export interface OptionTradeJournalOpen {
    * ticket AND for a structure whose open path does not consult the throttle at
    * all (defined-risk spreads, the wheel's CSP/covered-call). Either way no trim
    * was applied to this fill, so the partition is never wrong; "did this
-   * chokepoint consult?" is a different question and is answered by
-   * `autopilot.sizing.byPath` on `/api/health/live`.
+   * chokepoint consult?" is a different question and is answered PER ROW by
+   * {@link riskThrottleSizingPath} (TRA-2375). It used to be answerable only
+   * from `autopilot.sizing.byPath` on `/api/health/live`, which is a since-boot
+   * counter and therefore not joinable to any individual fill.
    */
   riskThrottleMultiplier?: number;
   /** TRA-2333 — arming scope in force when this ticket was sized. */
@@ -227,8 +229,50 @@ export interface OptionTradeJournalOpen {
    * would-have-been-trimmed row that no arming decision could ever have trimmed.
    * The raw governor value is separately visible in `autopilot.sizing.byPath[…]
    * .lastThrottle` on `/api/health/live`.
+   *
+   * That decision is still right, and TRA-2375 is what makes it safe: the two
+   * populations that both stamp `1` here are told apart by
+   * {@link riskThrottleSizingPath}, NOT by this field. Read them together —
+   * `riskThrottleDecided` alone must never be used to define the control arm.
    */
   riskThrottleDecided?: number;
+  /**
+   * TRA-2375 (parent TRA-2331) — WHICH sizing chokepoint produced the two terms
+   * above, i.e. this fill's cohort membership for a throttle grade.
+   *
+   * The gap it closes: `riskThrottleDecided === 1` conflates two populations a
+   * throttle grade must keep apart —
+   *
+   *   • **in cohort, untrimmed** — the open path DID consult the throttle and the
+   *     autopilot was at full size. A true control observation.
+   *   • **out of cohort** — the open path is not a chokepoint at any scope
+   *     (defined-risk spreads, the wheel's CSP/covered-call, the bounded-live
+   *     1-contract override), so it stamps a hardcoded `1`.
+   *
+   * Partition naively on `decided === 1` and every out-of-cohort row lands in the
+   * CONTROL arm. Spreads and the wheel are a large share of the option book, so
+   * the control arm fills with trades the throttle could never have touched — and
+   * it fails silently, because a contaminated control arm just looks big and
+   * healthy. `riskThrottleArmedScope` cannot separate them either: it is stamped
+   * unconditionally at the account layer and reads the same on both.
+   *
+   * THREE distinguishable states, and the distinction is the whole point:
+   *   • **absent**  — row written by a build older than TRA-2375. Basis unknown;
+   *     a grade must fall back to a declared proxy or exclude the row. NEVER
+   *     default it.
+   *   • **`null`**  — WRITTEN by this build, and this open path is not a
+   *     chokepoint. Out of cohort. Explicitly written rather than omitted so that
+   *     "not a chokepoint" is a positive assertion by a known-good writer instead
+   *     of the absence of one.
+   *   • **a path**  — in cohort; this chokepoint consulted the throttle for this
+   *     fill.
+   *
+   * Cohort membership is therefore a PRESENCE test (`hasOwnProperty` for "does
+   * this build stamp it", then `!= null` for "was it eligible"). Deliberately not
+   * a bare `isThrottleChokepoint: boolean`: `false` and "old build" would collide
+   * under `?? false`, which is the exact defect class being fixed here.
+   */
+  riskThrottleSizingPath?: RiskThrottleSizingPath | null;
 }
 
 /** The realized outcome, appended when the position closes. */

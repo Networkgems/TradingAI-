@@ -5,6 +5,7 @@ import { rm } from 'fs/promises';
 import { PaperOptionsAccount, type OptionTradeJournalSetup } from './options-account.js';
 import {
   listOptionTradeJournal,
+  recordOptionTradeOpen,
   setOptionTradeJournalFileForTests,
   summarizeOptionTradeJournal,
   type OptionTradeJournalRecord,
@@ -30,6 +31,9 @@ const setup: OptionTradeJournalSetup = {
   entryDelta: 0.22,
   riskThrottleMultiplier: 1, // TRA-2333 — un-throttled fixture fill
   riskThrottleDecided: 1, // TRA-2339 — and the autopilot decided no trim either
+  // TRA-2375 — this fixture drives `openDefinedRiskSpread`, which takes no sizing
+  // scalar and is not a chokepoint at any scope ⇒ OUT of the throttle cohort.
+  riskThrottleSizingPath: null,
 };
 
 const bullPutLegs = [
@@ -139,6 +143,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       sentiment: null,
       riskThrottleMultiplier: 1,
       riskThrottleDecided: 1,
+      riskThrottleSizingPath: 'options_single_leg', // TRA-2375 — RV single-leg IS a chokepoint
     });
     expect(pos).not.toBeNull();
     const atRisk = pos!.contracts * pos!.premiumPaid * 100;
@@ -173,6 +178,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       sentiment: null,
       riskThrottleMultiplier: 1,
       riskThrottleDecided: 1,
+      riskThrottleSizingPath: 'options_single_leg', // TRA-2375 — RV single-leg IS a chokepoint
     });
     expect(pos).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -248,7 +254,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback', riskThrottleMultiplier: 1, riskThrottleDecided: 1 },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback', riskThrottleMultiplier: 1, riskThrottleDecided: 1, riskThrottleSizingPath: 'options_single_leg' },
     );
     expect(tagged).not.toBeNull();
     // ...and a bare RV long on a different OCC (no archetype → unspecified).
@@ -257,7 +263,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35, riskThrottleMultiplier: 1, riskThrottleDecided: 1 },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, riskThrottleMultiplier: 1, riskThrottleDecided: 1, riskThrottleSizingPath: 'options_single_leg' },
     );
     expect(bare).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -426,6 +432,7 @@ describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
     entryArchetype: archetype,
     riskThrottleMultiplier: 1, // TRA-2333 — the wheel does not consult the throttle
     riskThrottleDecided: 1, // TRA-2339 — nor would it at any scope
+    riskThrottleSizingPath: null, // TRA-2375 — ⇒ out of cohort, not un-trimmed in it
   });
 
   it('journals a CSP open (cash_secured_put, at-risk = collateral) and folds the expired-worthless close', async () => {
@@ -558,6 +565,9 @@ describe('risk-throttle stamp on the journal open row (TRA-2333)', () => {
     agentConviction: null,
     riskThrottleMultiplier,
     riskThrottleDecided,
+    // TRA-2375 — these fixtures model a fill that went through a real sizing
+    // chokepoint, which is what makes its `decided`/`applied` pair meaningful.
+    riskThrottleSizingPath: 'options_single_leg',
   });
 
   it('a fill sized under a sub-1 throttle carries riskThrottleMultiplier < 1', async () => {
@@ -648,6 +658,9 @@ describe('decided-vs-applied throttle stamp on the journal open row (TRA-2339)',
     agentConviction: null,
     riskThrottleMultiplier,
     riskThrottleDecided,
+    // TRA-2375 — these fixtures model a fill that went through a real sizing
+    // chokepoint, which is what makes its `decided`/`applied` pair meaningful.
+    riskThrottleSizingPath: 'options_single_leg',
   });
 
   it('a DARK fill records the throttle that was decided and not applied', async () => {
@@ -726,5 +739,184 @@ describe('decided-vs-applied throttle stamp on the journal open row (TRA-2339)',
     } finally {
       delete process.env['RISK_THROTTLE_SIZING_ENABLED'];
     }
+  });
+});
+
+// TRA-2375 — the NEXT layer of the TRA-2339 defect, not a regression of it.
+//
+// TRA-2339 made "would this fill have been trimmed?" countable per fill. It did
+// NOT make "was this fill even ELIGIBLE to be trimmed?" countable, and those are
+// different questions. `riskThrottleDecided === 1` is stamped by two populations:
+//
+//   (a) IN COHORT, untrimmed — the open path consulted the throttle and the
+//       autopilot happened to be at full size. A true control observation.
+//   (b) OUT OF COHORT — the open path is not a chokepoint at ANY scope (the three
+//       defined-risk-spread sites, the wheel's CSP/CC, the bounded-live 1-contract
+//       override), so it stamps a hardcoded 1.
+//
+// Partition on `decided === 1` and (b) lands in the CONTROL arm. Spreads and the
+// wheel are a large share of the option book, so the arm TRA-2331 compares
+// against fills with trades the throttle could never have touched — and it fails
+// SILENTLY, because a contaminated control arm just looks big and healthy.
+//
+// These pin the property that closes it: cohort membership is carried on the row
+// as an identity, and is read as a PRESENCE test in two steps — `hasOwnProperty`
+// for "does this build stamp it at all", then `!= null` for "was this fill
+// eligible". Three states, none of which can collapse into another.
+describe('throttle CHOKEPOINT identity on the journal open row (TRA-2375)', () => {
+  const chokepointSetup = (): OptionTradeJournalSetup => ({
+    ivRank: 30,
+    trend: 'up',
+    entryDelta: 0.35,
+    sentiment: null,
+    sentimentIcBand: null,
+    agentConviction: null,
+    riskThrottleMultiplier: 1,
+    riskThrottleDecided: 1,
+    riskThrottleSizingPath: 'options_single_leg',
+  });
+
+  // The partition the TRA-2331 grade runs (scripts/tra2331-throttle-grade.mjs
+  // `eligibility()`), restated here against rows the REAL writer produced. Stated
+  // as a two-step presence test on purpose — that is the property under test.
+  const stamps = (r: OptionTradeJournalRecord): boolean =>
+    Object.prototype.hasOwnProperty.call(r, 'riskThrottleSizingPath');
+  const eligible = (r: OptionTradeJournalRecord): boolean =>
+    stamps(r) && r.riskThrottleSizingPath != null;
+
+  it('stamps the consulting chokepoint identity on an in-cohort fill', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(
+      buildRvSignal(), 'demo', undefined, undefined, chokepointSetup(),
+    );
+    await acct.flushOptionTradeJournal();
+
+    const row = (await listOptionTradeJournal())[0]!;
+    expect(row.riskThrottleSizingPath).toBe('options_single_leg');
+    expect(eligible(row)).toBe(true);
+  });
+
+  it('stamps an explicit null — not an ABSENT key — on an out-of-cohort spread open', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openDefinedRiskSpread(spreadParams(), 'demo', undefined, setup)).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const row = (await listOptionTradeJournal())[0]!;
+    expect(row.riskThrottleSizingPath).toBeNull();
+    expect(eligible(row)).toBe(false);
+    // The load-bearing half: the KEY IS THERE. If a non-chokepoint open omitted
+    // it, these rows would fail the `hasOwnProperty` step and drag the whole
+    // grade back onto its structure-based proxy — the exact-basis partition this
+    // ticket exists to supply would never engage on a book that holds spreads.
+    expect(stamps(row)).toBe(true);
+  });
+
+  it('THE DEFECT: two rows identical on the TRA-2339 pair, only one of them a control observation', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    // A single-leg fill that DID consult the throttle and was not trimmed…
+    const consulted = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-consulted' }), 'demo', undefined, undefined, chokepointSetup(),
+    );
+    // …and a defined-risk spread, which consults nothing at any scope.
+    const spread = acct.openDefinedRiskSpread(spreadParams(), 'demo', undefined, setup);
+    expect(consulted).not.toBeNull();
+    expect(spread).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+
+    // Every field a pre-TRA-2375 grade could partition on reads IDENTICALLY.
+    // This is the whole bug: there is no failing state to notice.
+    expect(rows.every((r) => r.riskThrottleMultiplier === 1)).toBe(true);
+    expect(rows.every((r) => r.riskThrottleDecided === 1)).toBe(true);
+    expect(new Set(rows.map((r) => r.riskThrottleArmedScope)).size).toBe(1);
+
+    // So the naive control arm swallows both — one of them a trade the throttle
+    // could never have touched.
+    const naiveControl = rows.filter((r) => r.riskThrottleDecided === 1);
+    expect(naiveControl).toHaveLength(2);
+
+    // The path stamp is the only thing that separates them.
+    const trueControl = rows.filter((r) => eligible(r) && r.riskThrottleMultiplier === 1);
+    expect(trueControl).toHaveLength(1);
+    expect(trueControl[0]!.id).toBe(consulted!.id);
+  });
+
+  it('ABSENT (pre-TRA-2375 build) stays distinguishable from a written null', async () => {
+    // A row exactly as an older build wrote it: both throttle terms stamped, no
+    // chokepoint identity. It must NOT read as "out of cohort" — that would let a
+    // regressed or rolled-back writer hide inside the out-of-cohort population
+    // and silently shrink the eligible set with no tell.
+    await recordOptionTradeOpen({
+      id: 'pre-2375',
+      openTs: TRADING_TIME,
+      symbol: 'AAPL',
+      structure: 'single_leg_rv',
+      mode: 'demo',
+      ivRank: 30,
+      trend: 'up',
+      sentiment: null,
+      sentimentIcBand: null,
+      entryDelta: 0.35,
+      entryDte: 30,
+      atRiskUsd: 100,
+      agentConviction: null,
+      riskThrottleMultiplier: 1,
+      riskThrottleDecided: 1,
+    });
+
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-current' }), 'demo', undefined, undefined, chokepointSetup(),
+    );
+    expect(acct.openDefinedRiskSpread(spreadParams(), 'demo', undefined, setup)).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    const old = rows.find((r) => r.id === 'pre-2375')!;
+    const current = rows.find((r) => r.id !== 'pre-2375' && r.structure === 'single_leg_rv')!;
+    const outOfCohort = rows.find((r) => r.structure === 'bull_put')!;
+
+    // THREE states, and every pair of them is distinguishable.
+    expect(stamps(old)).toBe(false); // absent  ⇒ basis unknown
+    expect(stamps(outOfCohort)).toBe(true); // null ⇒ known: not a chokepoint
+    expect(outOfCohort.riskThrottleSizingPath).toBeNull();
+    expect(stamps(current)).toBe(true); // a path ⇒ known: in cohort
+    expect(current.riskThrottleSizingPath).toBe('options_single_leg');
+
+    // And the one collapse that must never happen: an old row is not eligible,
+    // but it is also NOT the same thing as a known-ineligible one.
+    expect(eligible(old)).toBe(false);
+    expect(eligible(outOfCohort)).toBe(false);
+    expect(stamps(old)).not.toBe(stamps(outOfCohort));
+
+    // A bare `isThrottleChokepoint: boolean` would have merged the first two
+    // under `?? false`. Reading the field as a boolean reproduces that collapse
+    // exactly — which is why the field is an identity, not a flag.
+    const asBoolean = (r: OptionTradeJournalRecord): boolean => Boolean(r.riskThrottleSizingPath);
+    expect(asBoolean(old)).toBe(asBoolean(outOfCohort)); // indistinguishable again
+  });
+
+  it('the null survives the JSONL round trip (it is a written value, not a dropped key)', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openDefinedRiskSpread(spreadParams(), 'demo', undefined, setup)).not.toBeNull();
+    acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-rt' }), 'demo', undefined, undefined, chokepointSetup(),
+    );
+    await acct.flushOptionTradeJournal();
+
+    // Drop the in-memory cache and re-read from disk. `undefined` would not have
+    // survived JSON.stringify — the key would come back ABSENT and every
+    // non-chokepoint row would silently rejoin the "old build" population after
+    // the next restart, with the in-process test still green.
+    setOptionTradeJournalFileForTests(tmpFile);
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+    const reread = rows.find((r) => r.structure === 'bull_put')!;
+    expect(stamps(reread)).toBe(true);
+    expect(reread.riskThrottleSizingPath).toBeNull();
+    expect(rows.find((r) => r.structure === 'single_leg_rv')!.riskThrottleSizingPath)
+      .toBe('options_single_leg');
   });
 });

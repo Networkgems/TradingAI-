@@ -42,7 +42,7 @@
  *                   `true` in JavaScript** and a nullable field would bucket
  *                   every never-consulting row as trimmed.
  *
- * ── ELIGIBILITY IS A PROXY UNTIL TRA-2375 LANDS ────────────────────────────
+ * ── ELIGIBILITY: EXACT ON POST-TRA-2375 ROWS, PROXY BELOW THE CLIFF ─────────
  *
  * Five open paths stamp a hardcoded `1` because they take no sizing scalar at
  * ANY scope (defined-risk spreads ×3, wheel CSP/CC, the bounded-live 1-contract
@@ -50,22 +50,34 @@
  * pooling them into U floods the control arm with never-eligible trades, and it
  * fails silently: the control arm just looks big and healthy.
  *
- * Nothing on the row separates them today (`riskThrottleArmedScope` is stamped
- * unconditionally at the account layer and reads `"demo"` on both). So this
- * script uses a STRUCTURE-based proxy and says so in every output. It is an
- * ALLOWLIST, not a denylist: an unrecognised structure is counted as
- * `unclassified` and excluded from BOTH arms rather than defaulting into one.
+ * TRA-2375 LANDED, so rows written by that build and later carry
+ * `riskThrottleSizingPath` and the partition is EXACT. Read it in two steps and
+ * in this order:
  *
- * When TRA-2375 lands, rows carry `riskThrottleSizingPath` (ABSENT = not a
- * chokepoint — a presence test, because `false` would collide with "old
- * build"). This script switches to it automatically and relabels the basis
- * `exact`. No edit required.
+ *   1. `hasOwnProperty('riskThrottleSizingPath')` — does this build stamp it?
+ *   2. `!= null`                                  — was this fill eligible?
  *
- * Residual leak of the proxy: the bounded-live OTM override (signal-engine.ts
- * :7436) journals `structure: 'single_leg_otm'` and is indistinguishable on the
- * row. It is structurally zero while `liveEngineCount: 0` under the TRA-1897
- * hold, and its bias runs toward the NULL (it dilutes a real contrast), so it
- * cannot manufacture a PASS.
+ * Both steps matter. The writer emits an explicit `null` for a non-chokepoint
+ * open rather than omitting the key, precisely so step 1 stays a clean build
+ * detector: ABSENT means "written before TRA-2375" and nothing else. That is
+ * also why a bare `isThrottleChokepoint: boolean` was rejected — `false` would
+ * have collided with "old build" under `?? false`.
+ *
+ * Below the TRA-2375 cliff the key is absent and this script falls back to a
+ * STRUCTURE-based proxy, saying so in every output. Note the fallback is
+ * per-row but the LABEL is per-run: one un-stamped row downgrades the whole
+ * report to PROXY, which is deliberate — a mixed-basis partition reported as
+ * `exact` would be the same silent-contamination shape this section exists to
+ * prevent. The proxy is an ALLOWLIST, not a denylist: an unrecognised structure
+ * is counted as `unclassified` and excluded from BOTH arms rather than
+ * defaulting into one.
+ *
+ * Residual leak of the PROXY path only (gone once rows are stamped): the
+ * bounded-live OTM override (signal-engine.ts :7436) journals
+ * `structure: 'single_leg_otm'` and is indistinguishable on an unstamped row. It
+ * is structurally zero while `liveEngineCount: 0` under the TRA-1897 hold, and
+ * its bias runs toward the NULL (it dilutes a real contrast), so it cannot
+ * manufacture a PASS.
  *
  * ── VERDICTS, in resolution order FAIL → VOID → NOT-GRADED → PASS ──────────
  *
@@ -205,9 +217,13 @@ const isNum = (x) => typeof x === 'number' && Number.isFinite(x);
 /**
  * Eligibility: did this row's open path consult a throttle chokepoint?
  *
- * `exact` when TRA-2375's `riskThrottleSizingPath` is on the row (PRESENCE
- * test — absent means "not a chokepoint", and a boolean `false` would have
- * collided with "old build"). `proxy` otherwise.
+ * `exact` when TRA-2375's `riskThrottleSizingPath` is on the row, `proxy`
+ * otherwise. TWO-STEP presence test, and the order matters: the KEY being
+ * present means "a TRA-2375+ build wrote this row"; its VALUE being non-null
+ * means "this fill went through a real chokepoint". A non-chokepoint open writes
+ * an explicit `null`, so ABSENT means "pre-TRA-2375 build" and nothing else —
+ * which is what keeps step 1 usable as a build detector. A boolean field would
+ * have collided "not a chokepoint" with "old build" under `?? false`.
  */
 export function eligibility(row) {
   if (Object.prototype.hasOwnProperty.call(row, 'riskThrottleSizingPath')) {
