@@ -873,6 +873,87 @@ export function presetAllowsStrategySymbol(
   return true;
 }
 
+/**
+ * TRA-2348 — the SYMBOL UNIVERSE a preset would let `strategy` trade, as one
+ * value the promotion gate can compare across a save.
+ *
+ * `null` means UNBOUNDED (⊤): no preset-level cap at all, so breadth is whatever
+ * the engine's live product catalog resolves — today ≈395 Coinbase USD pairs for
+ * `crypto_core`. It is deliberately NOT expanded into a list: the catalog is
+ * resolved at runtime and grows on its own, so materialising it here would
+ * produce a comparison that silently goes stale. ⊤ is the honest representation
+ * of "everything, including symbols that do not exist yet".
+ *
+ * Otherwise the universe is the INTERSECTION of the two gates
+ * {@link presetAllowsStrategySymbol} enforces — the preset-wide `symbolFilter`
+ * and the per-strategy `strategyUniverse` — because both must pass for a signal
+ * to emit. Reading only one of them understates the cap when a preset pins both
+ * (`crypto_core_live_majors` pins the same three majors in each; a future preset
+ * need not).
+ */
+export function resolveStrategySymbolUniverse(
+  preset: StrategyPreset,
+  strategy: CryptoStrategyType,
+): readonly string[] | null {
+  const wide = preset.symbolFilter;
+  const perStrategy = preset.strategyUniverse?.[strategy];
+  if (wide === null && perStrategy === undefined) return null;
+  if (wide === null) return perStrategy ?? null;
+  if (perStrategy === undefined) return wide;
+  return wide.filter(s => perStrategy.includes(s));
+}
+
+/**
+ * TRA-2348 — is universe `a` contained in universe `b`, with `null` read as ⊤?
+ *
+ * The three edge cases are the whole point, so they are spelled out rather than
+ * left to a clever one-liner:
+ *   • `b === null` (⊤ container) — everything is a subset. A save moving from
+ *     the full catalog to a pinned list is a NARROWING and must never be gated
+ *     (TRA-1590 de-escalation).
+ *   • `a === null`, `b` a list — ⊤ is NOT contained in any finite list. This is
+ *     the widening TRA-2348 exists to catch (canary BTC → `crypto_core`).
+ *   • both `null` — ⊤ ⊆ ⊤ is TRUE, so an unrelated edit that HOLDS an
+ *     already-unbounded live universe is not mistaken for a widening.
+ */
+export function isSymbolUniverseSubset(
+  a: readonly string[] | null,
+  b: readonly string[] | null,
+): boolean {
+  if (b === null) return true;
+  if (a === null) return false;
+  return a.every(s => b.includes(s));
+}
+
+/**
+ * TRA-2348 — the preset ids the board has ratified for REAL-MONEY crypto, and
+ * the universes they stand for.
+ *
+ * WHY THIS EXISTS IN CODE. TRA-532's promotion record is keyed by `strategyId`
+ * alone ('dca'), so it cannot express "signed off on BTC/ETH/SOL, NO-GO on the
+ * full catalog" — yet that is exactly the shape of the sign-off on record.
+ * QuantTrader's live-money adjudication (TRA-1304, quoted verbatim in the
+ * `crypto_core_live_majors` description above) is CONDITIONAL GO on the
+ * OOS-validated liquid majors and NO-GO on `crypto_core`'s ≈395-pair universe.
+ * With a universe-blind promotion record, a majors sign-off would grandfather a
+ * 395-pair roster the moment the preset is swapped — the roster delta is empty
+ * ({dca} → {dca}), so nothing else in the gate can see it.
+ *
+ * Until the promotion record itself carries the universe it was granted for
+ * (the durable fix; see the TRA-2348 thread), this list IS the record. Adding an
+ * id here is a real-money authorization and requires the same sign-off TRA-1304
+ * carried — it is intentionally a code change, not an env var, so it lands with
+ * a diff, a reviewer, and a commit message.
+ *
+ * NOT a list of "safe presets" in general: `no_trade` is absent because it needs
+ * no authorization (it trades nothing) and is reached only by paths this gate
+ * already treats as de-escalations.
+ */
+export const LIVE_RATIFIED_CRYPTO_PRESETS: readonly StrategyPresetId[] = [
+  'crypto_core_live_majors', // TRA-1304 CONDITIONAL GO — BTC-USD / ETH-USD / SOL-USD
+  'crypto_core_live_canary_btc', // TRA-1304 canary (comment 4436ec31) — a strict subset of the above
+];
+
 // ── Account Modes ─────────────────────────────────────────────────────────────
 
 export type AccountMode = 'demo' | 'live';

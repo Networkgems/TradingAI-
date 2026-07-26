@@ -10,8 +10,12 @@ import {
   computeAccumulationGateMetrics,
   computePaperGateMetrics,
   evaluatePromotion,
+  isSymbolUniverseSubset,
   promotionStrategyClass,
   resolveStrategyPreset,
+  resolveStrategySymbolUniverse,
+  LIVE_RATIFIED_CRYPTO_PRESETS,
+  type CryptoStrategyType,
   type PromotionTradeSample,
 } from '@trading-app/shared';
 import { loadCryptoTradeSnapshot, loadStocksTradeSnapshot } from './trade-store.js';
@@ -310,6 +314,95 @@ function guardedRosterByAxis(
   };
 }
 
+/**
+ * TRA-2348 — the strategies whose LIVE SYMBOL UNIVERSE this save WIDENS beyond
+ * what the board has ratified for real money, keyed by strategyId.
+ *
+ * THE DEFECT THIS EXISTS TO CLOSE. TRA-2343 moved the graded unit from the axis
+ * boolean to the strategy ROSTER, which closes "arm the axis under `no_trade`,
+ * then re-select the real preset". It does not close the same shape one level
+ * finer, because every shipped live crypto preset enables the SAME single
+ * strategy:
+ *
+ *   crypto_core_live_canary_btc → ['dca'], universe {BTC-USD}
+ *   crypto_core_live_majors     → ['dca'], universe {BTC-USD, ETH-USD, SOL-USD}
+ *   crypto_core                 → ['dca'], universe ⊤ (≈395 Coinbase pairs)
+ *
+ * So a save that swaps `crypto_core_live_canary_btc` → `crypto_core` while live
+ * crypto is already ON produces roster {dca} → {dca}: an EMPTY delta and no axis
+ * flip, so the gate is silent while the universe widens ≈130×. The promotion
+ * record is keyed by strategyId alone, so a canary/majors sign-off grandfathers
+ * a 395-pair roster — and QuantTrader's sign-off is explicitly NO-GO on exactly
+ * that universe (TRA-1304). The graded unit is (strategy, UNIVERSE).
+ *
+ * WHY A RE-GRADE IS NOT THE REMEDY. The obvious fix — "treat a widening as newly
+ * exposed and grade it" — is a NO-OP here. Reaching this state requires `dca` to
+ * be fully promoted already (that is how you got live), and `buildPromotionStatus`
+ * is universe-blind, so re-grading `dca` returns canGoLive:true and the widening
+ * sails through. The check has to be a REFUSAL against a universe the board named,
+ * not another lookup in a record that cannot answer the question.
+ *
+ * BOTH DIRECTIONS (TRA-1590). Only a WIDENING is refused, measured as a subset
+ * test on the effective universe:
+ *   • majors → canary, `crypto_core` → majors, anything → `no_trade` — NARROWING,
+ *     never gated.
+ *   • an unrelated edit that holds the same preset — ⊤ ⊆ ⊤ / list ⊆ itself, so no
+ *     widening, never gated. The TRA-1590 hold-exposure exemption survives.
+ *   • canary → majors — a widening, but `crypto_core_live_majors` IS ratified, so
+ *     it is allowed. That is the TRA-1304 step-up ("on canary PASS the step-up is
+ *     env-only, no code change and no re-gate"), preserved deliberately.
+ *   • crypto axis OFF in the result — no live universe at all, nothing to widen.
+ *
+ * With no `previous` snapshot (the crypto-start path) the previous universe is
+ * EMPTY, so any live universe reads as a widening and must be ratified — the same
+ * fail-closed posture the rest of the gate takes on that path.
+ */
+function widenedBeyondRatifiedUniverse(
+  updated: AccountSettings,
+  previous: AccountSettings | undefined,
+  next: { crypto: boolean },
+  prev: { crypto: boolean },
+): Map<string, string> {
+  const blocks = new Map<string, string>();
+  if (!next.crypto) return blocks;
+
+  const nextPreset = resolveStrategyPreset(updated.activeStrategyPreset);
+  // The previous LIVE universe is empty unless live crypto was already on: an
+  // axis that was OFF exposed nothing, so it grandfathers nothing. This is the
+  // same rule the roster delta uses, and the reason the crypto-start path (no
+  // `previous`) is fail-closed here too.
+  const prevPreset =
+    previous && prev.crypto ? resolveStrategyPreset(previous.activeStrategyPreset) : null;
+
+  for (const strategyId of nextPreset.enabledStrategies) {
+    const nextUniverse = resolveStrategySymbolUniverse(nextPreset, strategyId);
+    const prevUniverse = prevPreset
+      ? resolveStrategySymbolUniverse(prevPreset, strategyId as CryptoStrategyType)
+      : [];
+    if (isSymbolUniverseSubset(nextUniverse, prevUniverse)) continue;
+    if (LIVE_RATIFIED_CRYPTO_PRESETS.includes(nextPreset.id)) continue;
+
+    const describe = (u: readonly string[] | null): string =>
+      u === null
+        ? 'the FULL Coinbase-tradable USD universe (≈395 pairs, unbounded — it grows with the catalog)'
+        : u.length === 0
+          ? 'nothing'
+          : u.join(', ');
+    blocks.set(
+      strategyId,
+      `TRA-2348 — this save WIDENS the live symbol universe for '${strategyId}' from `
+        + `${describe(prevUniverse)} to ${describe(nextUniverse)} by selecting preset `
+        + `'${nextPreset.id}', which is not on the board-ratified live-crypto list `
+        + `(${LIVE_RATIFIED_CRYPTO_PRESETS.join(', ')}). A promotion sign-off is granted for a `
+        + 'UNIVERSE, not just a strategy id: QuantTrader\'s live-money sign-off is CONDITIONAL GO '
+        + 'on the OOS-validated majors and NO-GO on the full catalog (TRA-1304), so a majors or '
+        + 'canary sign-off does not carry over to a wider one. Narrowing back to a ratified preset '
+        + 'is never blocked, and turning live crypto OFF in this same save always succeeds.',
+    );
+  }
+  return blocks;
+}
+
 export interface LiveTransitionGateResult {
   /** True when the live transition is allowed (or irrelevant — not turning/keeping live). */
   allowed: boolean;
@@ -368,6 +461,12 @@ export interface LiveTransitionIntent {
  * TRA-2351 — `intent` lets a caller declare real-capital intent the snapshot does
  * not carry. See {@link LiveTransitionIntent}; the crypto-start path must use
  * {@link evaluateLiveCryptoStartGate} rather than composing this by hand.
+ *
+ * TRA-2348 — the roster delta is itself too coarse for crypto, where every live
+ * preset enables the same single strategy and only the SYMBOL UNIVERSE differs.
+ * A save that widens that universe past what the board ratified for real money is
+ * refused outright — see {@link widenedBeyondRatifiedUniverse}. Narrowing and
+ * holding stay unblocked.
  */
 export async function evaluateLiveTransitionGate(
   username: string,
@@ -471,6 +570,13 @@ export async function evaluateLiveTransitionGate(
     });
   }
 
+  // TRA-2348 — the roster delta above is STRATEGY-granular; this is the same
+  // comparison one level finer, on the (strategy, UNIVERSE) pair. It is computed
+  // BEFORE the `strategies.length === 0` early return on purpose: the defect it
+  // closes produces an EMPTY roster delta by construction ({dca} → {dca}), so a
+  // check placed after that return could never fire.
+  const universeBlocks = widenedBeyondRatifiedUniverse(updated, previous, next, prev);
+
   const blocked: Array<{ strategyId: string; reasons: string[] }> = emptyRosterAxes.map(e => ({
     strategyId: `(${e.axis})`,
     reasons: [
@@ -487,7 +593,9 @@ export async function evaluateLiveTransitionGate(
     ],
   }));
 
-  if (strategies.length === 0 && blocked.length === 0) return { allowed: true, blocked: [] };
+  if (strategies.length === 0 && blocked.length === 0 && universeBlocks.size === 0) {
+    return { allowed: true, blocked: [] };
+  }
 
   // TRA-1916 — each strategy is graded on ITS OWN promotion evidence. The prior
   // code always looped over the active *crypto* preset's roster, so an
@@ -509,6 +617,18 @@ export async function evaluateLiveTransitionGate(
     if (!status.canGoLive) blocked.push({ strategyId, reasons: status.blockedReasons });
   }
 
+  // TRA-2348 — merge the universe refusals into the per-strategy entries rather
+  // than appending a separate pseudo-strategy row. A universe widening IS a
+  // property of that strategy's exposure, so a caller reading
+  // `blocked.map(b => b.strategyId)` sees the strategy at fault either way, and
+  // a strategy that fails BOTH checks reports both reasons in one entry instead
+  // of appearing twice.
+  for (const [strategyId, reason] of universeBlocks) {
+    const existing = blocked.find(b => b.strategyId === strategyId);
+    if (existing) existing.reasons.push(reason);
+    else blocked.push({ strategyId, reasons: [reason] });
+  }
+
   if (blocked.length > 0) {
     log.warn('TRA-532 promotion gate blocked live transition', {
       username,
@@ -520,6 +640,10 @@ export async function evaluateLiveTransitionGate(
       newlyExposed: strategies,
       alreadyExposed: [...alreadyExposed],
       emptyRosterAxes: emptyRosterAxes.map(e => e.axis),
+      // TRA-2348 — named separately from `newlyExposed`: a universe widening has
+      // an EMPTY roster delta by construction, so without this key the log line
+      // for the defect reads as "nothing was newly exposed" while refusing.
+      universeWidened: [...universeBlocks.keys()],
       blocked: blocked.map(b => b.strategyId),
     });
     return { allowed: false, blocked };

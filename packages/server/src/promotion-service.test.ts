@@ -16,6 +16,9 @@ const USER = 'alice';
 let svc: typeof import('./promotion-service.js');
 let store: typeof import('./promotion-store.js');
 let tradeStore: typeof import('./trade-store.js');
+// TRA-2348 — the universe primitives under test live in shared. Pulled in the
+// same way as the units above purely for symmetry; shared reads no env.
+let shared: typeof import('@trading-app/shared');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -104,10 +107,22 @@ const liveSettings = {
   activeStrategyPreset: 'crypto_core', // enabledStrategies: ['dca']
 } as AccountSettings;
 
+// TRA-2348 — the same live crypto posture on the BOARD-RATIFIED live universe.
+// `crypto_core` above is the demo/full-catalog roster (≈395 pairs), which
+// QuantTrader's live-money sign-off is NO-GO on (TRA-1304); the majors preset is
+// what that sign-off was actually granted for. Both are `enabledStrategies:
+// ['dca']`, which is precisely why the roster delta cannot tell them apart.
+const liveMajorsSettings = {
+  mode: 'live',
+  cryptoAutoTradingEnabledLive: true,
+  activeStrategyPreset: 'crypto_core_live_majors',
+} as AccountSettings;
+
 beforeAll(async () => {
   svc = await import('./promotion-service.js');
   store = await import('./promotion-store.js');
   tradeStore = await import('./trade-store.js');
+  shared = await import('@trading-app/shared');
 
   // Seed 60 monitored dca paper trades (50 winners +1.5R, 10 losers -0.5R) — kept
   // so snapshotPaperMetrics still reflects a real ledger — PLUS the OPEN, held
@@ -170,8 +185,28 @@ describe('TRA-532 promotion gate — end-to-end enforcement', () => {
     expect(status.canGoLive).toBe(true);
     expect(status.blockedReasons).toHaveLength(0);
 
-    const gate = await svc.evaluateLiveTransitionGate(USER, liveSettings);
+    // TRA-2348 — the transition that opens is onto a BOARD-RATIFIED universe.
+    // This assertion used `liveSettings` (preset `crypto_core`, ≈395 pairs) until
+    // TRA-2348 found that a strategy-keyed sign-off cannot authorize a universe
+    // QuantTrader explicitly ruled NO-GO on (TRA-1304). Full promotion of `dca`
+    // is now necessary but not sufficient; the ratified majors preset is the
+    // universe the sign-off was granted for, and it still saves.
+    const gate = await svc.evaluateLiveTransitionGate(USER, liveMajorsSettings);
     expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('TRA-2348 — the SAME fully-promoted strategy is still refused on the un-ratified full universe', async () => {
+    // The other half of the assertion above, and the reason it had to move: the
+    // promotion record is keyed by strategyId alone, so without a universe check
+    // `dca`'s sign-off would grandfather `crypto_core`'s ≈395 pairs outright.
+    const status = await svc.buildPromotionStatus(USER, 'dca');
+    expect(status.canGoLive).toBe(true); // fully promoted — the gate is NOT closed on evidence
+
+    const gate = await svc.evaluateLiveTransitionGate(USER, liveSettings);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/WIDENS the live symbol universe/i);
   });
 
   it('never blocks a settings change that turns live OFF (Demo edits are unrestricted)', async () => {
@@ -457,10 +492,15 @@ describe('TRA-2343 promotion gate — the roster delta is gated, not just the ax
     // Both directions: the fix must not degenerate into "block every roster
     // change". USER has dca fully promoted (backtest + paper + sign-off) from
     // the end-to-end block above, so the same save is approved.
+    //
+    // TRA-2348 — the target preset moved from `crypto_core` to the ratified
+    // majors preset for the same reason as the end-to-end control: a
+    // strategy-keyed sign-off does not authorize the ≈395-pair universe. The
+    // roster delta being exercised here ({} → {dca}) is identical either way.
     delete process.env[FLAG];
     const gate = await svc.evaluateLiveTransitionGate(
       USER,
-      cryptoLiveOn('crypto_core'),
+      cryptoLiveOn('crypto_core_live_majors'),
       cryptoLiveOn('no_trade'),
     );
     expect(gate.allowed).toBe(true);
@@ -521,6 +561,249 @@ describe('TRA-2343 promotion gate — the roster delta is gated, not just the ax
     const updated = { ...previous, liveTradierEnvOptions: 'production' } as AccountSettings;
     const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
     expect(gate.allowed).toBe(true);
+  });
+});
+
+// TRA-2348 — the residual TRA-2343 leaves behind, one level finer.
+//
+// TRA-2343 moved the graded unit from the AXIS BOOLEAN to the STRATEGY ROSTER.
+// That closes "arm the axis under the empty `no_trade` roster, then re-select the
+// real preset". It does not close the same shape between two REAL presets,
+// because every shipped live crypto preset enables the same single strategy and
+// differs only in SYMBOL UNIVERSE:
+//
+//   crypto_core_live_canary_btc → ['dca'], {BTC-USD}
+//   crypto_core_live_majors     → ['dca'], {BTC-USD, ETH-USD, SOL-USD}
+//   crypto_core                 → ['dca'], ⊤  (≈395 Coinbase pairs, symbolFilter null)
+//
+// So canary → `crypto_core` while live crypto is already ON is roster {dca} →
+// {dca}: an EMPTY delta, no axis flip, gate silent — while the universe widens
+// ≈130×. And the sign-off it inherits is explicitly narrower than what it would
+// then trade: QuantTrader's live-money adjudication is CONDITIONAL GO on the
+// OOS-validated majors and NO-GO on the full `crypto_core` universe (TRA-1304,
+// quoted verbatim in that preset's description). A universe-blind promotion
+// record lets a majors/canary sign-off grandfather a 395-pair roster.
+//
+// WHY THE REMEDY IS A REFUSAL, NOT A RE-GRADE. The natural-looking fix — "count a
+// widening as newly-exposed and grade it" — is a NO-OP. Reaching this state
+// requires `dca` to be fully promoted already (that is how the operator got
+// live), and `buildPromotionStatus` is universe-blind, so the re-grade returns
+// canGoLive:true and the widening is allowed anyway. The check must refuse
+// against a universe the board named. Until the promotion RECORD carries the
+// universe it was granted for, `LIVE_RATIFIED_CRYPTO_PRESETS` is that record.
+describe('TRA-2348 promotion gate — the graded unit is (strategy, UNIVERSE)', () => {
+  const FLAG = 'PROMOTION_GATE_ENV_AWARE';
+  const ENV_USER = 'env-aware-user'; // no promoted strategies
+
+  // USER (alice) has `dca` fully promoted from the end-to-end block above, which
+  // is what isolates the universe rule: every refusal below is about the
+  // universe alone, never about missing evidence.
+  const cryptoLiveOn = (preset: string): AccountSettings =>
+    ({
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: true,
+      activeStrategyPreset: preset,
+      liveTradierEnvOptions: 'sandbox',
+    } as AccountSettings);
+
+  // ── Direction 1: what must now be REFUSED (these FAIL against f2f6360) ───────
+
+  it('THE DEFECT — canary BTC → crypto_core while live crypto is ON is REFUSED', async () => {
+    delete process.env[FLAG];
+    const previous = cryptoLiveOn('crypto_core_live_canary_btc');
+    const updated = cryptoLiveOn('crypto_core');
+    const gate = await svc.evaluateLiveTransitionGate(USER, updated, previous);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/WIDENS the live symbol universe/i);
+  });
+
+  it('the roster delta really is EMPTY on that save — the universe check is the only thing that can see it', async () => {
+    // The load-bearing premise. If the two presets ever stop sharing a roster,
+    // TRA-2343 would catch the swap on its own and this rule would be belt-and-
+    // braces; today it is the ONLY control, so pin the premise explicitly rather
+    // than trusting the prose above.
+    const canary = shared.resolveStrategyPreset('crypto_core_live_canary_btc');
+    const core = shared.resolveStrategyPreset('crypto_core');
+    expect([...canary.enabledStrategies]).toEqual([...core.enabledStrategies]);
+    expect([...core.enabledStrategies]).toEqual(['dca']);
+  });
+
+  it('majors → crypto_core is REFUSED for the same reason', async () => {
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      USER,
+      cryptoLiveOn('crypto_core'),
+      cryptoLiveOn('crypto_core_live_majors'),
+    );
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/not on the board-ratified live-crypto list/i);
+  });
+
+  it('the crypto-start path (no previous snapshot) refuses the un-ratified universe even for a promoted strategy', async () => {
+    // No `previous` ⇒ the previous live universe is EMPTY, so any live universe
+    // reads as a widening. Fail-closed, matching the rest of the gate on that
+    // path. Pre-TRA-2348 this returned ALLOWED for a promoted `dca`.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveCryptoStartGate(USER, {
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: 'crypto_core',
+    } as AccountSettings);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/WIDENS the live symbol universe/i);
+  });
+
+  // ── Direction 2: what must STAY allowed (these PASS against f2f6360 too) ─────
+
+  it('NARROWING — majors → canary BTC is ALLOWED', async () => {
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      USER,
+      cryptoLiveOn('crypto_core_live_canary_btc'),
+      cryptoLiveOn('crypto_core_live_majors'),
+    );
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('NARROWING — crypto_core → majors is ALLOWED even though the PREVIOUS universe was un-ratified', async () => {
+    // The de-escalation direction (TRA-1590). An operator standing exposure DOWN
+    // must never have to clear a gate first, even from a state that would not be
+    // granted today — otherwise the rule becomes a trap that pins them at the
+    // widest universe.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      USER,
+      cryptoLiveOn('crypto_core_live_majors'),
+      cryptoLiveOn('crypto_core'),
+    );
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('HOLD — an unrelated edit that keeps the SAME un-ratified universe still saves', async () => {
+    // ⊤ ⊆ ⊤. If `isSymbolUniverseSubset` treated the unbounded universe as
+    // "never a subset of anything", an operator already live on `crypto_core`
+    // could not save any setting at all — the exact TRA-1590 deadlock this
+    // family of rules exists to avoid.
+    delete process.env[FLAG];
+    const previous = cryptoLiveOn('crypto_core');
+    const updated = { ...previous, riskPerTrade: 1 } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('THE RATIFIED STEP-UP — canary BTC → majors is a widening but is ALLOWED', async () => {
+    // TRA-1304 adjudicated the canary INSIDE the existing majors sign-off:
+    // "on canary PASS the step-up is env-only, no code change and no re-gate".
+    // The rule must not re-gate the one widening the board already granted.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      USER,
+      cryptoLiveOn('crypto_core_live_majors'),
+      cryptoLiveOn('crypto_core_live_canary_btc'),
+    );
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('THE ESCAPE HATCH — widening the preset while turning live crypto OFF in the same save is ALLOWED', async () => {
+    // A refusal that cannot be cleared in one save is a deadlock. Reducing
+    // exposure is never blocked, so the refusal text can honestly say so.
+    delete process.env[FLAG];
+    const previous = cryptoLiveOn('crypto_core_live_canary_btc');
+    const updated = {
+      ...cryptoLiveOn('crypto_core'),
+      cryptoAutoTradingEnabledLive: false,
+    } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('a DEMO-mode snapshot on crypto_core is untouched (demo breadth is not a real-capital decision)', async () => {
+    // `crypto_core` IS the demo roster (TRA-693 board directive, DEMO_STRATEGY_PRESET
+    // on bqb1). The rule must not leak into paper money.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(USER, {
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: false,
+      cryptoAutoTradingEnabledDemo: true,
+      activeStrategyPreset: 'crypto_core',
+    } as AccountSettings);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('the universe rule does not REPLACE the promotion check on a ratified preset', async () => {
+    // Both gates are live: a ratified universe with no promotion evidence still
+    // blocks on evidence. Being on the allowlist is permission to be graded, not
+    // a bypass.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      ENV_USER,
+      cryptoLiveOn('crypto_core_live_majors'),
+      { mode: 'demo', cryptoAutoTradingEnabledLive: false } as AccountSettings,
+    );
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+    expect(gate.blocked[0]?.reasons.join(' ')).not.toMatch(/WIDENS the live symbol universe/i);
+  });
+
+  // ── The universe primitives themselves ──────────────────────────────────────
+
+  it('resolveStrategySymbolUniverse INTERSECTS both preset gates, and reports ⊤ as null', () => {
+    // `presetAllowsStrategySymbol` requires BOTH gates to pass, so reading only
+    // one of them would understate the cap for a preset that pins both to
+    // different sets. The shipped majors preset pins both to the same three, so
+    // the intersection is exercised on a synthetic preset too.
+    const majors = shared.resolveStrategyPreset('crypto_core_live_majors');
+    expect(shared.resolveStrategySymbolUniverse(majors, 'dca')).toEqual([
+      'BTC-USD',
+      'ETH-USD',
+      'SOL-USD',
+    ]);
+    expect(shared.resolveStrategySymbolUniverse(shared.resolveStrategyPreset('crypto_core'), 'dca')).toBeNull();
+    expect(shared.resolveStrategySymbolUniverse(shared.resolveStrategyPreset('no_trade'), 'dca')).toEqual([]);
+
+    const mixed = {
+      ...majors,
+      symbolFilter: ['BTC-USD', 'ETH-USD'],
+      strategyUniverse: { dca: ['ETH-USD', 'SOL-USD'] },
+    } as typeof majors;
+    expect(shared.resolveStrategySymbolUniverse(mixed, 'dca')).toEqual(['ETH-USD']);
+
+    const wideFilterOnly = { ...majors, symbolFilter: null } as typeof majors;
+    expect(shared.resolveStrategySymbolUniverse(wideFilterOnly, 'dca')).toEqual([
+      'BTC-USD',
+      'ETH-USD',
+      'SOL-USD',
+    ]);
+  });
+
+  it('isSymbolUniverseSubset reads null as ⊤ in BOTH positions', () => {
+    const { isSymbolUniverseSubset: sub } = shared;
+    expect(sub(['BTC-USD'], ['BTC-USD', 'ETH-USD'])).toBe(true); // narrowing
+    expect(sub(['BTC-USD', 'ETH-USD'], ['BTC-USD'])).toBe(false); // widening
+    expect(sub(null, ['BTC-USD'])).toBe(false); // ⊤ ⊄ a finite list — THE defect
+    expect(sub(['BTC-USD'], null)).toBe(true); // anything ⊆ ⊤
+    expect(sub(null, null)).toBe(true); // ⊤ ⊆ ⊤ — the HOLD case
+    expect(sub([], ['BTC-USD'])).toBe(true); // stand-down
+    expect(sub([], null)).toBe(true);
+  });
+
+  it('every ratified preset id resolves to a real preset (the allowlist cannot rot into a typo)', () => {
+    // A typo'd id would fall back to `no_trade` and silently make the allowlist
+    // entry meaningless — the allowlist would still "contain" it while the gate
+    // compared against the wrong universe.
+    for (const id of shared.LIVE_RATIFIED_CRYPTO_PRESETS) {
+      expect(shared.resolveStrategyPreset(id).id).toBe(id);
+    }
+    // …and the un-ratified full-catalog roster is NOT on it.
+    expect(shared.LIVE_RATIFIED_CRYPTO_PRESETS).not.toContain('crypto_core');
   });
 });
 
