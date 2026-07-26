@@ -13,6 +13,10 @@ import {
   parityReconcileLogPath,
   isPostCloseEt,
   RATIO_DENOM_FLOOR_USD,
+  classifyRoundTripParity,
+  parityRecordRows,
+  EXCLUSION_NOTE,
+  QTY_ASSUMPTION_NOTE,
 } from './parity-reconcile.js';
 import type {
   SandboxStrategyRecord,
@@ -505,5 +509,267 @@ describe('hydrateParityReconcileFromDisk — durability', () => {
     expect(d.dataDir).toBe(dir);
     // DATA_DIR env unset in the test env ⇒ ephemeral by the isEphemeralDataDir predicate
     expect(typeof d.ephemeral).toBe('boolean');
+  });
+});
+
+// ── TRA-2370 — the read-side `fillPx <= 0` guard the sibling module has had since ────
+//    TRA-2283, plus the counter / percentiles / route that make its absence detectable.
+//
+// The defect: `parityForRoundTrip` dropped a leg on `== null` only. TRA-2283 D1's false
+// zero (`avg_fill_price: 0` — a MISSING price wearing a number's clothes) therefore folded
+// as a real ±100·requestedPx term. With one such leg on EACH side of a round-trip the two
+// terms cancelled, and covered_call published an exact `parityGapUsd {sum: 0, mean: 0}`
+// with `uncomputable: 0` — arithmetic residue that reads exactly like a genuine zero cost.
+//
+// NEGATIVE CONTROL (the verification bar). `wouldBeParityGapUsd` on the raw-records
+// projection re-folds an excluded row with the guard OFF, using shipped code. The
+// reproduction test below asserts BOTH sides of the one fixture — the ±$665 the old fold
+// produced AND the exclusion the new one produces — so the guard cannot be reverted, nor
+// quietly turned into a no-op, without this block going red. That was also run for real:
+// reverting the guard to `== null` fails exactly these tests and nothing else.
+
+describe('TRA-2370 — a PRESENT-but-impossible price is nonPhysical, never folded', () => {
+  it('REPRODUCES the live covered_call $0.00: two 0-fill legs cancel to an exact zero', () => {
+    // The observed shape: a 0-filled ENTRY and a 0-filled EXIT at mid ≈ $6.65, opposite sides.
+    const rec = record('covered_call', [leg('sell', 6.65, 0), leg('buy', 6.65, 0)]);
+
+    // (a) What the OLD fold did — computed by shipped code, not asserted in prose. The two
+    //     ±$665 terms sum to exactly 0, which is why the bucket read `{sum: 0, mean: 0}`.
+    const [row] = parityRecordRows([rec]);
+    expect(row.wouldBeParityGapUsd).toBe(0);
+    expect(row.status).toBe('nonPhysical');
+
+    // (b) What the NEW fold does: the round-trip is EXCLUDED, into the bucket that names
+    //     WHY — not into `uncomputable`, and not as a zero gap.
+    const s = summarizeParityReconcile([rec], NOW).strategies.covered_call.cumulative;
+    expect(s.n).toBe(0);
+    expect(s.nonPhysical).toBe(1);
+    expect(s.uncomputable).toBe(0);
+    // The false $0.00 is GONE: at n=0 every central estimate is null, never a fabricated 0.
+    expect(s.parityGapUsd.mean).toBeNull();
+    expect(s.parityGapUsd.median).toBeNull();
+    expect(s.parityGapUsd.p90).toBeNull();
+    expect(s.halfSpreadBps.mean).toBeNull();
+  });
+
+  it('the ∓10_000 bps leg a 0-fill scores no longer reaches halfSpreadBps', () => {
+    const dirty = record('covered_call', [leg('sell', 6.65, 0)]);
+    expect(parityForRoundTrip(dirty)).toBeNull();
+    // Pool a clean 500bps round-trip with the dirty one: the mean must be the clean leg
+    // alone. Before the guard it would have been (500 + 10000)/2 = 5250.
+    const s = summarizeParityReconcile(
+      [dirty, record('covered_call', [leg('buy', 1.0, 1.05)])],
+      NOW,
+    ).strategies.covered_call.cumulative;
+    expect(s.halfSpreadBps.mean).toBeCloseTo(500, 6);
+  });
+
+  it.each([
+    ['a zero fillPx', leg('buy', 6.65, 0)],
+    ['a negative fillPx', leg('buy', 6.65, -1.2)],
+    ['a zero requestedPx', leg('buy', 0, 6.65)],
+    ['a negative requestedPx', leg('buy', -0.5, 6.65)],
+    ['a non-finite fillPx', leg('buy', 6.65, Number.NaN)],
+    ['a non-finite requestedPx', leg('buy', Number.POSITIVE_INFINITY, 6.65)],
+  ])('%s classifies nonPhysical', (_label, bad) => {
+    const c = classifyRoundTripParity(record('long_call', [bad as SandboxStrategyLeg, leg('sell', 2.0, 1.9)]));
+    expect(c.parity).toBeNull();
+    expect(c.exclusion).toBe('nonPhysical');
+  });
+
+  it.each([
+    ['a null requestedPx', leg('buy', null, 1.05)],
+    ['a null fillPx', leg('buy', 1.0, null)],
+  ])('%s still classifies uncomputable — the two facts stay APART', (_label, absent) => {
+    const c = classifyRoundTripParity(record('long_call', [absent as SandboxStrategyLeg, leg('sell', 2.0, 1.9)]));
+    expect(c.parity).toBeNull();
+    expect(c.exclusion).toBe('uncomputable');
+  });
+
+  it('a zero-leg record stays uncomputable (nothing to mark is not corrupt data)', () => {
+    expect(classifyRoundTripParity(record('long_call', [])).exclusion).toBe('uncomputable');
+  });
+
+  it('nonPhysical WINS over uncomputable, and the verdict is leg-ORDER independent', () => {
+    const absent = leg('buy', null, null);
+    const impossible = leg('sell', 6.65, 0);
+    // The same record, legs serialized both ways round. A first-bad-leg-wins implementation
+    // returns a DIFFERENT counter for these two, making the count a property of the array
+    // rather than of the record.
+    expect(classifyRoundTripParity(record('csp', [absent, impossible])).exclusion).toBe('nonPhysical');
+    expect(classifyRoundTripParity(record('csp', [impossible, absent])).exclusion).toBe('nonPhysical');
+  });
+
+  it('n + uncomputable + nonPhysical RECONCILES against the observed round-trips', () => {
+    const recs = [
+      record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]), // computable
+      record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]), // computable
+      record('long_call', [leg('buy', 1.0, null)]),                        // uncomputable
+      record('long_call', [leg('buy', 6.65, 0)]),                          // nonPhysical
+      record('long_call', [leg('sell', 6.65, 0)]),                         // nonPhysical
+    ];
+    const b = summarizeParityReconcile(recs, NOW).strategies.long_call.cumulative;
+    expect(b.n).toBe(2);
+    expect(b.uncomputable).toBe(1);
+    expect(b.nonPhysical).toBe(2);
+    expect(b.n + b.uncomputable + b.nonPhysical).toBe(recs.length);
+  });
+
+  it('a clean book reads nonPhysical: 0 — the counter has a FALSE state, not just a true one', () => {
+    const b = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)])],
+      NOW,
+    ).strategies.long_call.cumulative;
+    expect(b.nonPhysical).toBe(0);
+    expect(b.n).toBe(1);
+  });
+});
+
+describe('TRA-2370 — parityGapUsd gains median/p90 (defence in depth on the mean)', () => {
+  it('the median survives an outlier that moves the mean', () => {
+    const recs = Array.from({ length: 6 }, () =>
+      record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]), // gap = $15 each
+    );
+    // One big-but-PHYSICAL cross — the shape the ask-1 guard does NOT catch, which is
+    // exactly why the percentiles matter as defence in depth.
+    recs.push(record('long_call', [leg('buy', 10, 16.65)])); // gap = $665
+    const g = summarizeParityReconcile(recs, NOW).strategies.long_call.cumulative.parityGapUsd;
+    expect(g.median).toBeCloseTo(15, 6);      // unmoved by the $665 row
+    expect(g.mean).toBeGreaterThan(100);      // destroyed by it — the pre-TRA-2370 blind spot
+    expect(g.p90).toBeGreaterThan(g.median!); // and the tail still SHOWS the outlier
+  });
+
+  it('percentiles are over PER-ROUND-TRIP gaps and reconcile with sum/mean', () => {
+    const g = summarizeParityReconcile(
+      [
+        record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]), // 15
+        record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]), // 15
+      ],
+      NOW,
+    ).strategies.long_call.cumulative.parityGapUsd;
+    expect(g.sum).toBeCloseTo(30, 6);
+    expect(g.mean).toBeCloseTo(15, 6);
+    expect(g.median).toBeCloseTo(15, 6);
+    expect(g.p90).toBeCloseTo(15, 6);
+  });
+
+  it('n=1 yields that single gap for every percentile; n=0 yields null, never 0', () => {
+    const one = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, 1.05)])],
+      NOW,
+    ).strategies.long_call.cumulative.parityGapUsd;
+    expect(one.median).toBeCloseTo(5, 6);
+    expect(one.p90).toBeCloseTo(5, 6);
+
+    const none = summarizeParityReconcile(
+      [record('long_call', [leg('buy', 1.0, null)])],
+      NOW,
+    ).strategies.long_call.cumulative.parityGapUsd;
+    expect(none.sum).toBe(0); // a SUM over nothing is 0; the central estimates are not
+    expect(none.mean).toBeNull();
+    expect(none.median).toBeNull();
+    expect(none.p90).toBeNull();
+  });
+});
+
+describe('TRA-2370 — the raw-legs projection (attribution from outside the process)', () => {
+  it('echoes side/requestedPx/fillPx per leg and flags the offending leg', () => {
+    const rows = parityRecordRows([record('covered_call', [leg('sell', 6.65, 0), leg('buy', 6.65, 6.7)])]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].strategy).toBe('covered_call');
+    expect(rows[0].etDay).toBe(ET_DAY);
+    expect(rows[0].legs.map((l) => [l.side, l.requestedPx, l.fillPx, l.nonPhysical])).toEqual([
+      ['sell', 6.65, 0, true],
+      ['buy', 6.65, 6.7, false],
+    ]);
+  });
+
+  it('a computable row carries its real gap; an excluded row carries null, never 0', () => {
+    const rows = parityRecordRows([
+      record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]),
+      record('long_call', [leg('buy', 1.0, null)]),
+    ]);
+    expect(rows[0].status).toBe('computable');
+    expect(rows[0].parityGapUsd).toBeCloseTo(15, 6);
+    expect(rows[0].wouldBeParityGapUsd).toBeNull(); // nothing was suppressed
+    expect(rows[1].status).toBe('uncomputable');
+    expect(rows[1].parityGapUsd).toBeNull();
+    // An ABSENT price has no pre-guard arithmetic to show — that is only meaningful for the
+    // false-zero shape, where a number WAS folded.
+    expect(rows[1].wouldBeParityGapUsd).toBeNull();
+  });
+
+  it('wouldBeParityGapUsd exposes the ±$665 the guard removed', () => {
+    const [buyRow] = parityRecordRows([record('long_call', [leg('buy', 6.65, 0)])]);
+    expect(buyRow.wouldBeParityGapUsd).toBeCloseTo(-665, 6);
+    const [sellRow] = parityRecordRows([record('covered_call', [leg('sell', 6.65, 0)])]);
+    expect(sellRow.wouldBeParityGapUsd).toBeCloseTo(665, 6);
+  });
+
+  it('the projection is one row per record, in journal order, and folds nothing', () => {
+    const rows = parityRecordRows([
+      record('long_call', [leg('buy', 1.0, 1.05)], { etDay: '2026-07-23' }),
+      record('csp', [leg('sell', 2.0, 1.9)]),
+    ]);
+    expect(rows.map((r) => [r.strategy, r.etDay])).toEqual([
+      ['long_call', '2026-07-23'],
+      ['csp', ET_DAY],
+    ]);
+  });
+});
+
+describe('TRA-2370 — the counter reaches the durable daily point', () => {
+  it('the snapshot carries nonPhysical alongside uncomputable', () => {
+    hydrateParityReconcileFromDisk(dir, NOW);
+    const snap = appendParitySnapshotForDay(
+      [
+        record('long_call', [leg('buy', 1.0, 1.05), leg('sell', 2.0, 1.9)]),
+        record('covered_call', [leg('sell', 6.65, 0), leg('buy', 6.65, 0)]),
+        record('csp', [leg('buy', 1.0, null)]),
+      ],
+      NOW,
+    );
+    expect(snap.observedRecords).toBe(3);
+    expect(snap.nonPhysical).toBe(1);
+    expect(snap.uncomputable).toBe(1);
+    // The excluded covered_call contributes NO perStrategy entry — not a 0-gap one.
+    expect(Object.keys(snap.perStrategy)).toEqual(['long_call']);
+  });
+
+  it('a row persisted BEFORE this field hydrates as −1, not as an observed 0', () => {
+    // Mid-vintage: it HAS foldCount (post-TRA-2279) but predates the nonPhysical guard, so
+    // its bad rows were folded IN and the count is genuinely unknown. Riding foldCount's
+    // `legacy` probe would have handed this row a false `0`.
+    const midVintage = {
+      etDay: ET_DAY, ts: NOW, firstFoldTs: NOW, lastFoldTs: NOW, foldCount: 3,
+      sessionComplete: false, observedRecords: 4, uncomputable: 0,
+      perStrategy: { covered_call: { parityGapUsd: 0, meanHalfSpreadBps: -0.4, n: 7 } },
+    };
+    writeFileSync(parityReconcileLogPath(dir), JSON.stringify(midVintage) + '\n', 'utf8');
+    hydrateParityReconcileFromDisk(dir, NOW);
+    const [row] = getParityReconcileSeries();
+    expect(row.uncomputable).toBe(0);   // genuinely observed on this vintage
+    expect(row.nonPhysical).toBe(-1);   // genuinely UNKNOWN on this vintage
+  });
+});
+
+describe('TRA-2370 — the payload explains its own exclusions and its qty caveat', () => {
+  it('exclusionNote and qtyAssumedNote ride the summary', () => {
+    const s = summarizeParityReconcile([], NOW);
+    expect(s.exclusionNote).toBe(EXCLUSION_NOTE);
+    expect(s.qtyAssumedNote).toBe(QTY_ASSUMPTION_NOTE);
+    expect(s.qtyAssumed).toBe(1);
+  });
+
+  it('the qty note states the STRUCTURAL reason (the writer-side hard cap), not a bare claim', () => {
+    // TRA-2292 floated a size-blind fold as a candidate cause; it is refuted at the type
+    // level. The note must carry that refutation, since `qtyAssumed: 1` alone reads as an
+    // unverified modelling assumption.
+    expect(QTY_ASSUMPTION_NOTE).toContain('SMOKE_OPTION_QTY=1');
+    expect(QTY_ASSUMPTION_NOTE).toContain('NO qty field');
+  });
+
+  it('the exclusion note distinguishes the two buckets and states the reconciliation', () => {
+    expect(EXCLUSION_NOTE).toContain('n + uncomputable + nonPhysical == observed round-trips');
   });
 });

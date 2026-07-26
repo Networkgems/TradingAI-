@@ -37,6 +37,39 @@
 // when the demo-mark denominator is below the materiality floor, never a fabricated 0 —
 // and `gapToDemoMarkRatioStatus` says WHICH null it is, so no null is unattributable.
 //
+// ── TRA-2370 — NULL DISCIPLINE WAS ONLY HALF THE GUARD ───────────────────────
+// The clause above guarded `== null` and stopped there. It missed the OTHER shape of a
+// missing price: a broker `avg_fill_price` of **`0`** — "a MISSING price wearing a
+// number's clothes" (TRA-2283 D1). The writer (`sandbox-strategy-journal.ts`) was
+// repaired to persist those as `null`, but records already on the `/data` disk KEEP their
+// `0`s, and this module is the read side that never got the matching guard. Its sibling
+// reader of the same journal — `marketable-mtm-forward-validation.ts:397,403` — has
+// guarded `<= 0` since TRA-2283 and says so in a comment naming THIS file.
+//
+// What it cost: a leg with `fillPx: 0` and `requestedPx = p` folds as
+// `signedCostPerContract = ±p`, contributing `±100p` to `parityGapUsd` and `∓10_000` to
+// `legHalfSpreadBps`. At p ≈ $6.65 that is **±$665** on a book whose whole round-trip mid
+// P&L is about $1. `covered_call` held a 0-filled ENTRY leg and a 0-filled EXIT leg; their
+// opposite `side` signs made the two ±$665 terms CANCEL inside the round-trip fold, and the
+// bucket published an exact `parityGapUsd {sum: 0, mean: 0}` with `uncomputable: 0` —
+// arithmetic residue that reads EXACTLY like "covered calls genuinely cross at zero cost",
+// with the route's own `gapRatioNote` pointing the reader straight at it.
+//
+// The fix is three-part, because the guard alone would have backfilled a plausible number
+// into a bucket with no failing state:
+//   1. `requestedPx <= 0` / `fillPx <= 0` / non-finite ⇒ the round-trip is EXCLUDED.
+//   2. It is counted in its OWN `nonPhysical` bucket, NOT in `uncomputable`. "the broker
+//      never reported a fill" and "the broker reported an IMPOSSIBLE fill" are different
+//      facts with different remedies (one drains with age, the other is corrupt data), and
+//      a reader must be able to tell them apart. `n + uncomputable + nonPhysical` equals
+//      the observed record count exactly, so the three RECONCILE rather than infer.
+//   3. `parityGapUsd` gains `median`/`p90` beside `sum`/`mean`. At n=7-8 the mean is the
+//      one central estimate a single bad fill destroys, and it was the only one published.
+//      That is defence in depth: it survives the NEXT non-physical fill whatever shape it
+//      arrives in, even if the guard in (1) does not recognise it.
+// Plus `GET /api/health/parity-reconcile/records`, which echoes the raw legs so the next
+// outlier is ATTRIBUTED from outside the process instead of inferred from moments.
+//
 // ── TRA-2279 D1 — THE FIELD FORMERLY CALLED `gapPct` ─────────────────────────
 // `gapPct` was a RATIO wearing a percent's name: no `× 100`, so the live payload's
 // `gapPct: 17` meant 17× (1700%), and the TRA-2277 handoff duly read it as "17.00%".
@@ -107,6 +140,35 @@ export const GAP_RATIO_NOTE =
   + 'and can flip sign). `parityGapUsd` and `halfSpreadBps` are unit-correct and stable at '
   + 'any denominator — grade on those.';
 
+/**
+ * TRA-2370 ask 4 — WHY `qtyAssumed: 1` holds, stamped on the payload rather than asserted.
+ *
+ * TRA-2292 raised a size-blind fold as a candidate cause of the covered_call zero. It is
+ * REFUTED at the type level, not by inspection of today's rows: neither
+ * `SandboxStrategyRecord` nor `SandboxStrategyLeg` HAS a `qty` field, so there is no size
+ * for this fold to discard. The only writer path is the TRA-2130 smoke orchestrator, where
+ * `SMOKE_OPTION_QTY = 1` and any other value is REFUSED at the request boundary
+ * (`tradier-sandbox-options-smoke.ts:96-101`) rather than clamped. So `qtyAssumed: 1` is a
+ * correct caveat about a structural hard cap, not an unverified modelling assumption — and
+ * a multi-contract round-trip cannot reach this journal without that cap being lifted first.
+ */
+/** TRA-2370 — rides the payload so the two exclusion buckets cannot be pooled by a reader. */
+export const EXCLUSION_NOTE =
+  'uncomputable = a leg price was ABSENT (null): the journal never had the number. '
+  + 'nonPhysical = a leg price was PRESENT but impossible (<=0 or non-finite) — TRA-2283 D1\'s '
+  + 'avg_fill_price:0, which before TRA-2370 folded as a real +/-100*requestedPx term (+/-$665 '
+  + 'live) and, with one such leg on each side of a round-trip, CANCELLED covered_call to an '
+  + 'exact $0.00 gap with uncomputable:0. n + uncomputable + nonPhysical == observed round-trips. '
+  + 'A NON-ZERO nonPhysical means legacy /data rows are still being excluded (expected, drains '
+  + 'with age); a RISING one means the writer-side repair regressed.';
+
+export const QTY_ASSUMPTION_NOTE =
+  'qtyAssumed:1 is STRUCTURAL, not an estimate. SandboxStrategyRecord/SandboxStrategyLeg '
+  + 'carry NO qty field, and the sole writer (tradier-sandbox-options-smoke) hard-caps '
+  + 'SMOKE_OPTION_QTY=1 and REFUSES any other qty at the request boundary. A multi-contract '
+  + 'round-trip cannot reach this journal unless that cap is lifted — at which point this '
+  + 'fold, which multiplies by 100 only, would understate every gap and must be revisited.';
+
 export const PARITY_SCOPE =
   'SANDBOX ONLY (acct VA20296703), $0 real notional. Demo side is a COUNTERFACTUAL '
   + 'mid-mark of the sandbox round-trip itself — NEVER pooled with demo option-trade-journal '
@@ -125,20 +187,73 @@ export interface RoundTripParity {
 }
 
 /**
- * Fold one round-trip into its parity contribution. Returns `null` when ANY leg has a
- * null `requestedPx` or `fillPx` (⇒ the caller counts it `uncomputable` and drops it) —
- * a missing price is NEVER coerced to 0. A round-trip with zero legs is also
- * uncomputable (nothing to mark).
+ * TRA-2370 — WHY a round-trip was excluded from the fold. Mutually exclusive and
+ * exhaustive over excluded records, so `n + uncomputable + nonPhysical` == observed.
+ *
+ * - `uncomputable` — a leg price is ABSENT (`requestedPx == null` / `fillPx == null`), or
+ *                    the record has no legs at all. The journal is telling the truth: it
+ *                    never had the number. Benign in the sense that it announces itself.
+ * - `nonPhysical`  — a leg price is PRESENT but is not a price: `<= 0` or non-finite. This
+ *                    is TRA-2283 D1's false zero, and it is the dangerous one — it folds
+ *                    silently as a real ±100·requestedPx term instead of announcing itself.
  */
-export function parityForRoundTrip(rec: SandboxStrategyRecord): RoundTripParity | null {
-  if (rec.legs.length === 0) return null;
+export type ParityExclusion = 'uncomputable' | 'nonPhysical';
+
+/** {@link parityForRoundTrip} plus WHICH exclusion fired, for auditable counters. */
+export interface ClassifiedRoundTripParity {
+  parity: RoundTripParity | null;
+  /** `null` ⇔ `parity != null`. */
+  exclusion: ParityExclusion | null;
+}
+
+/** True ⇔ `px` is a price a contract could actually have traded at. */
+function isPhysicalPx(px: number): boolean {
+  return Number.isFinite(px) && px > 0;
+}
+
+/**
+ * Fold one round-trip into its parity contribution, naming the exclusion when it cannot be
+ * folded. Pure.
+ *
+ * A round-trip is dropped when ANY leg is unusable, and the two reasons are kept APART
+ * (see {@link ParityExclusion}). Precedence when a record carries both shapes at once:
+ * **`nonPhysical` wins.** A null leg is a self-announcing absence that this fold has
+ * always handled and that drains as legacy rows age out; a non-physical number is corrupt
+ * data that was actively contaminating the published moments, and it must not be able to
+ * hide inside the `uncomputable` bucket that a reader has already learned to discount.
+ *
+ * ⚠️ Both prices are checked on EVERY leg before any is folded. Returning at the first bad
+ * leg would make the classification depend on leg ORDER — a record whose entry leg is null
+ * and whose exit leg is `0` would count `uncomputable`, and the same record with its legs
+ * the other way round would count `nonPhysical`. The counter has to be a property of the
+ * record, not of the array it was serialized in.
+ */
+export function classifyRoundTripParity(rec: SandboxStrategyRecord): ClassifiedRoundTripParity {
+  if (rec.legs.length === 0) return { parity: null, exclusion: 'uncomputable' }; // nothing to mark
+
+  let sawAbsent = false;
+  let sawNonPhysical = false;
+  for (const leg of rec.legs) {
+    const { requestedPx, fillPx } = leg;
+    if (requestedPx == null || fillPx == null) sawAbsent = true;
+    // `!= null` first: `Number.isFinite(null as any)` is false, so folding the null check in
+    // here would misfile every unfilled leg as `nonPhysical` and erase the distinction the
+    // whole counter exists to draw.
+    if ((requestedPx != null && !isPhysicalPx(requestedPx))
+      || (fillPx != null && !isPhysicalPx(fillPx))) sawNonPhysical = true;
+  }
+  if (sawNonPhysical) return { parity: null, exclusion: 'nonPhysical' };
+  if (sawAbsent) return { parity: null, exclusion: 'uncomputable' };
+
   let demoMarkPnlUsd = 0;
   let sandboxFillPnlUsd = 0;
   let parityGapUsd = 0;
   const legHalfSpreadBps: number[] = [];
   for (const leg of rec.legs) {
-    const { requestedPx, fillPx, side } = leg;
-    if (requestedPx == null || fillPx == null) return null; // uncomputable — never fold as 0
+    const { side } = leg;
+    // Non-null and physical for every leg — established by the pass above.
+    const requestedPx = leg.requestedPx as number;
+    const fillPx = leg.fillPx as number;
     // A sell leg is a cash inflow (+px), a buy leg an outflow (−px). Marking every leg
     // at its mid gives the demo book's P&L; at its fill, the real sandbox P&L.
     const sign = side === 'sell' ? 1 : -1;
@@ -146,12 +261,24 @@ export function parityForRoundTrip(rec: SandboxStrategyRecord): RoundTripParity 
     sandboxFillPnlUsd += sign * fillPx * CONTRACT_MULTIPLIER;
     const signedCostPerContract = side === 'buy' ? fillPx - requestedPx : requestedPx - fillPx;
     parityGapUsd += signedCostPerContract * CONTRACT_MULTIPLIER;
-    if (requestedPx !== 0 && Number.isFinite(requestedPx)) {
-      const bps = (signedCostPerContract / requestedPx) * 1e4;
-      if (Number.isFinite(bps)) legHalfSpreadBps.push(bps);
-    }
+    // `requestedPx > 0` is now guaranteed, so this can no longer divide by zero; the check
+    // is kept as a belt-and-braces on the bps value itself.
+    const bps = (signedCostPerContract / requestedPx) * 1e4;
+    if (Number.isFinite(bps)) legHalfSpreadBps.push(bps);
   }
-  return { demoMarkPnlUsd, sandboxFillPnlUsd, parityGapUsd, legHalfSpreadBps };
+  return {
+    parity: { demoMarkPnlUsd, sandboxFillPnlUsd, parityGapUsd, legHalfSpreadBps },
+    exclusion: null,
+  };
+}
+
+/**
+ * Back-compatible accessor: the computable parity of one round-trip, or `null` when it is
+ * excluded for ANY reason. See {@link classifyRoundTripParity} for WHICH reason — a caller
+ * that only reads this cannot tell a missing price from an impossible one.
+ */
+export function parityForRoundTrip(rec: SandboxStrategyRecord): RoundTripParity | null {
+  return classifyRoundTripParity(rec).parity;
 }
 
 // ── per-strategy aggregate (pure) ────────────────────────────────────────────
@@ -161,9 +288,26 @@ export interface ParityBucket {
   n: number;
   /** Round-trips excluded because a leg had a null requested/fill price. NOT a 0-gap. */
   uncomputable: number;
+  /**
+   * TRA-2370 — round-trips excluded because a leg carried a price that is PRESENT but not
+   * physical (`<= 0` or non-finite): TRA-2283 D1's `avg_fill_price: 0`, a missing price
+   * wearing a number's clothes. Held apart from `uncomputable` because the remedies differ
+   * — an absent price drains as legacy rows age out, a non-physical one is corrupt data
+   * that was folding as a real ±100·requestedPx term.
+   *
+   * `n + uncomputable + nonPhysical` == the round-trips this bucket observed, exactly.
+   */
+  nonPhysical: number;
   demoMarkPnlUsd: number;
   sandboxFillPnlUsd: number;
-  parityGapUsd: { sum: number; mean: number | null };
+  /**
+   * TRA-2370 — given `median`/`p90` to match `halfSpreadBps`. `mean` is the statistic a
+   * single non-physical fill destroys (one ±$665 term at n=7), and until now it was the
+   * ONLY central estimate published. Percentiles are the defence in depth that survives the
+   * next bad fill even if the `nonPhysical` guard does not recognise its shape.
+   * Percentiles are over PER-ROUND-TRIP gaps; `null` at `n === 0` — never a fabricated 0.
+   */
+  parityGapUsd: { sum: number; mean: number | null; median: number | null; p90: number | null };
   /**
    * TRA-2279 D1 — `parityGapUsd.sum / |demoMarkPnlUsd|` as a **RATIO**, not a percent:
    * `0.15` means 15%, `17` would mean 1700%. (The old `gapPct` carried this exact value
@@ -202,6 +346,10 @@ export interface ParityReconcileSummary {
   fillRealism: typeof FILL_REALISM;
   fillRealismNote: string;
   qtyAssumed: 1;
+  /** TRA-2370 — WHY `qtyAssumed: 1` holds. See {@link QTY_ASSUMPTION_NOTE}. */
+  qtyAssumedNote: string;
+  /** TRA-2370 — how to read `uncomputable` vs `nonPhysical`. See {@link EXCLUSION_NOTE}. */
+  exclusionNote: string;
 }
 
 function round2(x: number): number {
@@ -232,20 +380,26 @@ function percentile(sortedAsc: number[], p: number): number | null {
 function foldBucket(recs: readonly SandboxStrategyRecord[]): ParityBucket {
   let n = 0;
   let uncomputable = 0;
+  let nonPhysical = 0;
   let demoMarkPnlUsd = 0;
   let sandboxFillPnlUsd = 0;
   let gapSum = 0;
   const halfSpreads: number[] = [];
+  const gaps: number[] = [];
   for (const rec of recs) {
-    const p = parityForRoundTrip(rec);
+    const { parity: p, exclusion } = classifyRoundTripParity(rec);
     if (p == null) {
-      uncomputable += 1;
+      // TRA-2370 — the two exclusions are counted SEPARATELY. Folding a non-physical fill
+      // into `uncomputable` would have kept the covered_call zero unattributable.
+      if (exclusion === 'nonPhysical') nonPhysical += 1;
+      else uncomputable += 1;
       continue;
     }
     n += 1;
     demoMarkPnlUsd += p.demoMarkPnlUsd;
     sandboxFillPnlUsd += p.sandboxFillPnlUsd;
     gapSum += p.parityGapUsd;
+    gaps.push(p.parityGapUsd);
     for (const bps of p.legHalfSpreadBps) halfSpreads.push(bps);
   }
   // TRA-2279 D1 — the ratio is withheld unless its denominator is MATERIAL, and the
@@ -260,18 +414,26 @@ function foldBucket(recs: readonly SandboxStrategyRecord[]): ParityBucket {
         : 'denominator_below_materiality_floor';
   const sorted = halfSpreads.slice().sort((a, b) => a - b);
   const hsMean = halfSpreads.length > 0 ? halfSpreads.reduce((a, b) => a + b, 0) / halfSpreads.length : null;
+  const sortedGaps = gaps.slice().sort((a, b) => a - b);
+  const round2OrNull = (x: number | null): number | null => (x != null ? round2(x) : null);
   return {
     n,
     uncomputable,
+    nonPhysical,
     demoMarkPnlUsd: round2(demoMarkPnlUsd),
     sandboxFillPnlUsd: round2(sandboxFillPnlUsd),
-    parityGapUsd: { sum: round2(gapSum), mean: n > 0 ? round2(gapSum / n) : null },
+    parityGapUsd: {
+      sum: round2(gapSum),
+      mean: n > 0 ? round2(gapSum / n) : null,
+      median: round2OrNull(percentile(sortedGaps, 0.5)),
+      p90: round2OrNull(percentile(sortedGaps, 0.9)),
+    },
     gapToDemoMarkRatio: ratioStatus === 'computed' ? round4(gapSum / denom) : null,
     gapToDemoMarkRatioStatus: ratioStatus,
     halfSpreadBps: {
-      mean: hsMean != null ? round2(hsMean) : null,
-      median: (() => { const m = percentile(sorted, 0.5); return m != null ? round2(m) : null; })(),
-      p90: (() => { const m = percentile(sorted, 0.9); return m != null ? round2(m) : null; })(),
+      mean: round2OrNull(hsMean),
+      median: round2OrNull(percentile(sorted, 0.5)),
+      p90: round2OrNull(percentile(sorted, 0.9)),
     },
   };
 }
@@ -281,7 +443,8 @@ function foldBucket(recs: readonly SandboxStrategyRecord[]): ParityBucket {
  * `now` fixes the reference ET day the `etDay` bucket is scoped to; `cumulative` spans
  * every retained record for the strategy. A strategy present with `n:0` but
  * `uncomputable>0` is the tell that it ran but every round-trip was unpriced — do NOT
- * read that as a 0 gap.
+ * read that as a 0 gap. TRA-2370: likewise `nonPhysical>0` means it ran but the broker
+ * reported impossible fills, which is a DIFFERENT fact with a different remedy.
  */
 export function summarizeParityReconcile(
   records: readonly SandboxStrategyRecord[],
@@ -314,7 +477,86 @@ export function summarizeParityReconcile(
     fillRealism: FILL_REALISM,
     fillRealismNote: FILL_REALISM_NOTE,
     qtyAssumed: 1,
+    qtyAssumedNote: QTY_ASSUMPTION_NOTE,
+    exclusionNote: EXCLUSION_NOTE,
   };
+}
+
+// ── TRA-2370 ask 4 — the raw legs, so an outlier is ATTRIBUTED not inferred ──
+
+/** One leg as echoed by the raw-records view. */
+export interface ParityRecordLegRow {
+  side: 'buy' | 'sell';
+  optionSymbol: string | null;
+  requestedPx: number | null;
+  fillPx: number | null;
+  /** True ⇔ THIS leg is what tripped the record's `nonPhysical` classification. */
+  nonPhysical: boolean;
+}
+
+/** One round-trip as echoed by the raw-records view, with the classification applied to it. */
+export interface ParityRecordRow {
+  ts: number;
+  etDay: string;
+  strategy: string;
+  underlying: string;
+  /** `'computable'`, or the exclusion that dropped it — the SAME call `foldBucket` makes. */
+  status: 'computable' | ParityExclusion;
+  /** The gap this round-trip contributed, or `null` when excluded. NEVER 0 for an exclusion. */
+  parityGapUsd: number | null;
+  /**
+   * For an EXCLUDED record, the gap it WOULD have contributed had the guard not caught it —
+   * the direct evidence, rather than a reconstruction from published moments. `null` when a
+   * leg price is absent (there is genuinely no arithmetic to do).
+   */
+  wouldBeParityGapUsd: number | null;
+  legs: ParityRecordLegRow[];
+}
+
+/**
+ * Project the journal records to their raw legs plus the parity classification of each.
+ * Pure. This is what lets the NEXT outlier be attributed from outside the process: with
+ * only the folded moments published, the covered_call `$0.00` took a source read plus an
+ * arithmetic reconstruction to explain.
+ *
+ * `wouldBeParityGapUsd` deliberately re-folds a NON-PHYSICAL record with the guard off, so
+ * the ±$665 term the guard removed is READABLE rather than merely asserted. It is a
+ * diagnostic on an excluded row and is never summed into anything.
+ */
+export function parityRecordRows(records: readonly SandboxStrategyRecord[]): ParityRecordRow[] {
+  return records.map((rec) => {
+    const { parity, exclusion } = classifyRoundTripParity(rec);
+    let wouldBe: number | null = null;
+    if (exclusion === 'nonPhysical') {
+      // Every leg price is non-null here (a null would have classified `uncomputable`), so
+      // the pre-guard arithmetic is reproducible exactly as the old code performed it.
+      let g = 0;
+      for (const leg of rec.legs) {
+        const req = leg.requestedPx as number;
+        const fill = leg.fillPx as number;
+        g += (leg.side === 'buy' ? fill - req : req - fill) * CONTRACT_MULTIPLIER;
+      }
+      wouldBe = round2(g);
+    }
+    return {
+      ts: rec.ts,
+      etDay: rec.etDay,
+      strategy: rec.strategy,
+      underlying: rec.underlying,
+      status: exclusion ?? 'computable',
+      parityGapUsd: parity != null ? round2(parity.parityGapUsd) : null,
+      wouldBeParityGapUsd: wouldBe,
+      legs: rec.legs.map((leg) => ({
+        side: leg.side,
+        optionSymbol: leg.optionSymbol,
+        requestedPx: leg.requestedPx,
+        fillPx: leg.fillPx,
+        nonPhysical:
+          (leg.requestedPx != null && !isPhysicalPx(leg.requestedPx))
+          || (leg.fillPx != null && !isPhysicalPx(leg.fillPx)),
+      })),
+    };
+  });
 }
 
 // ── durable daily series ─────────────────────────────────────────────────────
@@ -360,6 +602,13 @@ export interface ParityDailySnapshot {
   observedRecords: number;
   /** Round-trips this day EXCLUDED for a null leg price. Never folded as a 0 gap. */
   uncomputable: number;
+  /**
+   * TRA-2370 — round-trips this day EXCLUDED for a PRESENT-but-impossible leg price
+   * (`<= 0` / non-finite). `-1` on a row persisted before this field existed: those rows
+   * were folded WITH the bad legs in them, so their count is genuinely unknown and must not
+   * read as an observed zero.
+   */
+  nonPhysical: number;
   perStrategy: Record<string, ParitySnapshotStrategy>;
 }
 
@@ -444,6 +693,12 @@ function finiteNumberOr(v: unknown, fallback: number): number {
  * runner cadence correctly reads FALSE). `observedRecords` is genuinely unknown for a
  * legacy row, so it is stamped `-1` — a sentinel that cannot be mistaken for an observed
  * zero. `uncomputable` likewise.
+ *
+ * TRA-2370 — `nonPhysical` gets its OWN legacy probe rather than riding `foldCount`'s. A row
+ * written between TRA-2279 and TRA-2370 HAS `foldCount`, so the `legacy` flag above reads
+ * false for it — yet it predates the non-physical guard entirely and its count is just as
+ * unknown. Keying the sentinel off the presence of the field itself is what stops a
+ * mid-vintage row from claiming an observed `0`.
  */
 function normalizeSnapshot(s: Record<string, unknown>): ParityDailySnapshot {
   const ts = s.ts as number;
@@ -459,6 +714,7 @@ function normalizeSnapshot(s: Record<string, unknown>): ParityDailySnapshot {
       typeof s.sessionComplete === 'boolean' ? s.sessionComplete : isPostCloseEt(lastFoldTs),
     observedRecords: finiteNumberOr(s.observedRecords, legacy ? -1 : 0),
     uncomputable: finiteNumberOr(s.uncomputable, legacy ? -1 : 0),
+    nonPhysical: finiteNumberOr(s.nonPhysical, -1),
     perStrategy: s.perStrategy as Record<string, ParitySnapshotStrategy>,
   };
 }
@@ -570,8 +826,10 @@ export function appendParitySnapshotForDay(
 
   const perStrategy: Record<string, ParitySnapshotStrategy> = {};
   let uncomputable = 0;
+  let nonPhysical = 0;
   for (const [strategy, entry] of Object.entries(summary.strategies)) {
     uncomputable += entry.etDay.uncomputable;
+    nonPhysical += entry.etDay.nonPhysical;
     if (entry.etDay.n === 0) continue; // no computable round-trip for this strategy today
     perStrategy[strategy] = {
       parityGapUsd: entry.etDay.parityGapUsd.sum,
@@ -593,6 +851,7 @@ export function appendParitySnapshotForDay(
     sessionComplete: isPostCloseEt(now),
     observedRecords: records.filter((r) => r.etDay === etDay).length,
     uncomputable,
+    nonPhysical,
     perStrategy,
   };
 

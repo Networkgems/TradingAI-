@@ -524,7 +524,10 @@ import {
   appendParitySnapshotForDay,
   getParityReconcileSeries,
   parityReconcileDurability,
+  parityRecordRows,
   PARITY_SCOPE,
+  QTY_ASSUMPTION_NOTE,
+  EXCLUSION_NOTE,
 } from './parity-reconcile.js';
 import {
   foldMarketableMtmForwardValidation,
@@ -10328,6 +10331,16 @@ app.get('/api/health/sandbox-strategy-journal', (_req, res) => {
 // option-trade-journal rows. `fillRealism:'SANDBOX_SIMULATED'` rides the payload so no
 // reader mistakes a broker-simulated gap for a live-execution number; observe-only under
 // the TRA-1897 hold — gates/arms/graduates nothing.
+// ⚠️ TRA-2370 — `parityForRoundTrip` dropped a leg only on `== null`, never on `<= 0`, so
+// TRA-2283 D1's false-zero fills (`avg_fill_price: 0` — a MISSING price wearing a number's
+// clothes) folded as real ±100·requestedPx terms: ±$665 live, on a book whose whole
+// round-trip mid P&L is ~$1. With one such leg on each side, covered_call's two terms
+// CANCELLED and the bucket published `parityGapUsd {sum: 0, mean: 0}` with `uncomputable: 0`
+// — indistinguishable from "covered calls genuinely cross at zero cost". Those rows are now
+// EXCLUDED and counted in their own `nonPhysical` bucket (never pooled into `uncomputable`:
+// "no fill reported" and "an impossible fill reported" are different facts), and
+// `parityGapUsd` carries `median`/`p90` beside `sum`/`mean` so one bad row can no longer
+// destroy the only published central estimate.
 app.get('/api/health/parity-reconcile', (_req, res) => {
   const records = getSandboxStrategyRecords();
   appendParitySnapshotForDay(records); // idempotent per ET day — self-accrues the series
@@ -10335,6 +10348,35 @@ app.get('/api/health/parity-reconcile', (_req, res) => {
     ...summarizeParityReconcile(records),
     dailySeries: getParityReconcileSeries(),
     durability: parityReconcileDurability(),
+    scope: PARITY_SCOPE,
+    ts: new Date().toISOString(),
+  });
+});
+
+// TRA-2370 ask 4 — the RAW LEGS behind the fold above, read-only, no auth, SANDBOX only.
+// Per record: `strategy` / `etDay` / `status` (the same classification `foldBucket` makes)
+// and, per leg, `side` / `requestedPx` / `fillPx` / `nonPhysical`. For an EXCLUDED row,
+// `wouldBeParityGapUsd` re-folds it with the guard OFF, so the ±$665 term the guard removed
+// is directly readable rather than reconstructed from published moments — which is what the
+// covered_call `$0.00` diagnosis cost. 30 records today; the payload is trivial.
+// This route does NOT accrue the daily series (it is a pure projection, not a fold), so
+// reading it can never move a number the series grades. Observe-only under the TRA-1897
+// hold; gates/arms/graduates nothing.
+app.get('/api/health/parity-reconcile/records', (_req, res) => {
+  const rows = parityRecordRows(getSandboxStrategyRecords());
+  res.status(200).json({
+    totalRecords: rows.length,
+    counts: {
+      computable: rows.filter((r) => r.status === 'computable').length,
+      uncomputable: rows.filter((r) => r.status === 'uncomputable').length,
+      nonPhysical: rows.filter((r) => r.status === 'nonPhysical').length,
+    },
+    records: rows,
+    qtyAssumed: 1,
+    qtyAssumedNote: QTY_ASSUMPTION_NOTE,
+    exclusionNote: EXCLUSION_NOTE,
+    fillRealism: FILL_REALISM,
+    fillRealismNote: FILL_REALISM_NOTE,
     scope: PARITY_SCOPE,
     ts: new Date().toISOString(),
   });
