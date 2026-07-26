@@ -4387,13 +4387,35 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       summary: gate.summary,
       note: gate.note,
       thresholds: gateCriteria,
+      // ⚠️ TRA-2335 — this is a field-by-field WHITELIST, not a spread. Any new field
+      // on `GateCriterionResult` is SILENTLY DROPPED here: the module stays correct,
+      // the unit tests stay green, and the route an operator actually grades from
+      // shows no change at all. If you add a field there, add it here in the same
+      // commit. (`status`/`barR`/`ceilingR`/`feasibilityNote` are TRA-2335's.)
       criteria: gate.criteria.map((c) => ({
         name: c.name,
         description: c.description,
         required: c.required,
         actual: c.actual,
         pass: c.pass,
+        status: c.status,
+        barR: c.barR ?? null,
+        ceilingR: c.ceilingR ?? null,
+        feasibilityNote: c.feasibilityNote ?? null,
       })),
+      // TRA-2335 — the payoff-ceiling precondition on `minExpectancyR`. `verdict:
+      // 'infeasible'` means the bar cannot be cleared at ANY hit rate by this book —
+      // it is a HARDER stop than a failing criterion, never a "pending" one.
+      // `ceilingSources` is load-bearing, not decoration: a bare ceiling reads
+      // identically whether it came from real priced legs or a `long_call` 2×-debit
+      // sketch cap, and that indistinguishability is what hid this defect for weeks.
+      feasibility: {
+        ...gate.feasibility,
+        ceilingGrossR: report.totals.ceilingGrossR,
+        ceilingGrossRPriced: report.totals.ceilingGrossRPriced,
+        avgCostR: report.totals.avgCostR,
+        ceilingSources: report.totals.ceilingSourceCounts,
+      },
       evidence: {
         surfaced: report.totals.surfaced,
         resolved: report.totals.resolved,

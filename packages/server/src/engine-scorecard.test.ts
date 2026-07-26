@@ -41,6 +41,13 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
       excluded: 5,
       excludedCostUneconomic: 0,
       avgCostEfficiencyRatio: 0.05,
+      // TRA-2335 — feasibility inputs. This fixture is a healthy book, so the bar is
+      // comfortably reachable and the scorecard's behaviour is unchanged.
+      avgCostR: 0.05,
+      ceilingGrossR: 1.5,
+      ceilingNetR: 1.45,
+      ceilingGrossRPriced: 1.5,
+      ceilingSourceCounts: { priced_structure: 35, sketch_capped: 0, unusable: 0 },
       wins: 21,
       losses: 12,
       scratches: 2,

@@ -42,6 +42,14 @@ function reportWith(expectancyNetR: number): ForwardTestReport {
       resolved: 30,
       expectancyNetR,
       maxLossBreaches: 0,
+      // TRA-2335 — a healthy 2:1 book, so the payoff ceiling (1.95R cost-net) sits well
+      // above every bar exercised here and the feasibility precondition is satisfied.
+      // These tests are about the cost-aware BAR, so the ceiling must not interfere.
+      avgCostR: 0.05,
+      ceilingGrossR: 2.0,
+      ceilingNetR: 1.95,
+      ceilingGrossRPriced: 2.0,
+      ceilingSourceCounts: { priced_structure: 30, sketch_capped: 0, unusable: 0 },
     },
   } as unknown as ForwardTestReport;
 }

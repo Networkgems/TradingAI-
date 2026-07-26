@@ -134,6 +134,80 @@ Live-capital wiring may be **proposed** only when **all** of the following hold
 The verdict and per-criterion booleans (no PII, no per-symbol P&L) are exposed
 for acceptance verification at `GET /api/health/live-capital-gate`.
 
+### The feasibility precondition (TRA-2335) — `PASS` / `FAIL` / `INFEASIBLE`
+
+Criterion 3 is an **R-constant**, and until TRA-2335 nothing checked that the graded
+instrument could *produce* it.
+
+R is denominated in max loss everywhere in this program, so each trade's downside is
+pinned at **−1R** and its upside at `rewardR = maxProfitUsd ÷ maxLossUsd`. Realized
+`pnlR ≤ rewardR` therefore holds **pathwise**, trade by trade, which makes
+
+```
+mean(pnlR) ≤ mean(rewardR)     — an accounting identity, not an expectation
+```
+
+**A bar above that ceiling cannot be cleared at any hit rate, including 100%.**
+
+The live instance: a credit-vertical book at pooled credit/width `k = 0.0366` has a
+gross ceiling of `k ÷ (1 − k) =` **+0.0380R** and, after the measured **0.0389R** cost
+drag, a cost-net ceiling of **≈ 0.000R** — graded against a `minExpectancyR` of
+**+0.20R**, i.e. **5.3× the arithmetic maximum of the instrument**. `+0.20R` requires a
+hit rate of 1.19; `+0.05R` requires 1.05. It ran for four weeks emitting `FAIL`.
+
+So each criterion now carries a **`status`** alongside `pass`:
+
+| status | asserts | action |
+|---|---|---|
+| `PASS` | the criterion is met | — |
+| `FAIL` | **the book underperformed** a bar it could have cleared | more/better evidence may change it |
+| `INFEASIBLE` | **the bar cannot be tested with this instrument** | ⛔ re-derive the bar or change the instrument — **more sample can never resolve it** |
+
+Three rules that are easy to get wrong:
+
+1. **`INFEASIBLE` carries `pass: false`** and `passed` is still `criteria.every(c => c.pass)`.
+   It therefore blocks promotion *by construction*, not by each consumer remembering to
+   handle a third state. It is a **louder** stop than `FAIL`, never a softer one, and it
+   must never render as "pending".
+2. **Do not "fix" an `INFEASIBLE` by lowering the constant.** The shipped `0.0` fallback
+   is *also* unreachable for this book (cost-net ceiling −0.001R, which is zero to within
+   2-dp measurement precision). At the per-open site the `optionsMinGrossR = 0.3` floor
+   blocks the same escape independently. **The fix is the check, not a smaller number.**
+3. **Only a positive determination blocks.** When the ceiling cannot be established (an
+   early book) or rests partly on fabricated rewards, the verdict is `unknown` — which
+   does *not* block a book that empirically clears the bar. `expectancyNetR ≤ ceiling`
+   holds pathwise, so a measured pass is itself constructive proof of reachability.
+
+**Provenance travels with the ceiling.** Two feed paths fabricate `rewardR` and both
+inflate it — i.e. both fail toward a false "feasible":
+
+- **fallback pricing** — unpriceable legs get `maxProfit = maxLoss` ⇒ `rewardR ≡ 1.000`.
+  These are `priced: false` and already excluded, **but only if the ceiling is averaged
+  over the same `status === 'resolved' && !excluded` population the expectancy is.** The
+  looser `maxLossUsd > 0` predicate re-admits them and the check silently fails open.
+- **`long_call` / `long_put` sketch caps** — a call's upside is unbounded, so the feed
+  stamps `maxProfit = 2 × debit` ⇒ `rewardR ≡ 2.000` with `priced: **true**`, which sails
+  past the exclusion filter.
+
+`ceilingGrossR` deliberately **includes** sketch caps at their inflated value, making it
+an *upper bound* — which is what keeps `INFEASIBLE` sound (the true ceiling is lower
+still). `ceilingGrossRPriced` and the `ceilingSources` histogram are published alongside,
+because a bare ceiling reads identically whether it came from real prices or a 2.0 sketch
+cap, and that indistinguishability is what hid this defect.
+
+The same precondition guards the per-open `admissionBarR` in `option-cost-gate.ts`
+(**latent** — verticals do not route through it today). ⚠️ Its bar is
+`max(costModel + safetyMargin, optionsMinGrossR)` and is **cost-inclusive**, so the
+ceiling is compared **un-netted** there; netting cost off both sides double-counts it and
+manufactures spurious `INFEASIBLE`s. Always call `admissionBarR()` rather than recomputing
+`cost + margin` inline — today the sum wins by luck, and stops doing so once
+`safetyMarginR < 0.015`.
+
+The accumulation monitor (`GET /api/health/options-accumulation`) and the weekly News-tab
+roll-up **withhold the sample-size countdown** when the bar is unreachable. That countdown
+was not a passive omission: it published "N weeks to go" every Monday toward an event that
+could not occur, which reads as *on track, keep going*.
+
 ### Criterion 5 — POP post-calibration (TRA-2006, SHADOW-first)
 
 The stated POP is the LLM's free-form estimate (TRA-2000 diagnosis), which runs a

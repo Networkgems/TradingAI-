@@ -516,7 +516,9 @@ describe('evaluateLiveCapitalGate', () => {
 // ── TRA-1971 — accumulation monitor ──────────────────────────────────────────
 
 describe('buildAccumulationMonitor', () => {
-  const GATE = { minWeeksWithResolved: 8, minResolvedIdeas: 30 };
+  // TRA-2335 — the monitor now needs the expectancy bar too: without it there was no
+  // term that could express "the bar is unreachable", only a sample-size countdown.
+  const GATE = { minWeeksWithResolved: 8, minResolvedIdeas: 30, minExpectancyR: 0 };
 
   it('reports the clock NOT started and every blocker when nothing is wired', () => {
     // The current 0/6 reality: no creds, no chains, no journaled ideas.
@@ -680,7 +682,7 @@ describe('renderWeeklyRollupMarkdown', () => {
   const emptyMonitor = (_blockedOn: string[]) =>
     buildAccumulationMonitor({
       report: buildForwardTestReport([], { asOf: ET_NOON('2026-07-16') }),
-      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30 },
+      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30, minExpectancyR: 0 },
       chainOutDir: '/data/option-chains',
       chainDates: [],
       journalCount: 0,
@@ -739,7 +741,7 @@ describe('renderWeeklyRollupMarkdown', () => {
     const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-02-23') });
     const monitor = buildAccumulationMonitor({
       report,
-      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30 },
+      gate: { minWeeksWithResolved: 8, minResolvedIdeas: 30, minExpectancyR: 0 },
       chainOutDir: '/data/option-chains',
       chainDates: ['2026-01-05'],
       journalCount: 1,

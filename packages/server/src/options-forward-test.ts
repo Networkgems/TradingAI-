@@ -28,6 +28,14 @@ import {
   type ReconstructionMiss,
 } from './iv-rank-archive.js';
 import { MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
+// TRA-2335 — the payoff-ceiling feasibility precondition. Leaf module: pure, no I/O,
+// no env, and imported by BOTH gate sites, so it adds no cycle.
+import {
+  computeBookCeiling,
+  evaluateFeasibility,
+  type FeasibilityResult,
+  type RewardSourceCounts,
+} from './gate-feasibility.js';
 // TRA-2208 — the floor + its governed families, imported (not restated) so the
 // counterfactual this probe reports is measured against the exact bar the emission
 // gate enforces. See `CellCreditWidthFloor`.
@@ -231,6 +239,14 @@ function snapshotSpot(day: ChainDay, ticker: string): number | null {
 // ── per-idea valuation ─────────────────────────────────────────────────────────
 
 const r2 = (v: number): number => Math.round(v * 100) / 100;
+
+/**
+ * TRA-2335 — 4-dp rounding for the feasibility figures. The reporting figures round
+ * to 2 dp, which is far too coarse here: the live credit book's gross ceiling is
+ * `+0.0380R` and its cost-net ceiling `≈ −0.001R`, both of which 2-dp rounding
+ * collapses to `0.04` / `-0.00` and destroys the comparison the gate turns on.
+ */
+const r4 = (v: number): number => Math.round(v * 1e4) / 1e4;
 
 /** F3 — max trading days a settlement chain may lag expiry before it's quarantined. */
 const MAX_SETTLE_LAG_TRADING_DAYS = 1;
@@ -512,6 +528,35 @@ export interface ForwardTestReport {
      * Inspectable proxy for "how close to the cost floor is the surfaced slate".
      */
     avgCostEfficiencyRatio: number | null;
+    /**
+     * TRA-2335 — mean cost ÷ max-loss over the GRADED set only (the same
+     * `status === 'resolved' && !excluded` population every expectancy above is
+     * averaged over). The sibling of `avgCostEfficiencyRatio`, which spans ALL
+     * SURFACED outcomes — a different, larger population. The feasibility check
+     * nets cost off a ceiling computed on the graded set, so it must use THIS
+     * one: a ceiling from one population compared against a measurement from
+     * another is not a comparison. Cross-checks to `expectancyR − expectancyNetR`
+     * within ±0.01 (both sides are 2-dp rounded, so not to equality).
+     */
+    avgCostR: number | null;
+    /**
+     * TRA-2335 — the graded book's PAYOFF CEILING: `mean(maxProfitUsd ÷ maxLossUsd)`
+     * over the graded set. Because loss is pinned at −1R, realized `pnlR ≤ rewardR`
+     * holds pathwise, so this bounds `expectancyR` as an accounting identity. An
+     * UPPER bound (fabricated sketch-cap rewards are included at their inflated
+     * value), which is what makes an `INFEASIBLE` verdict derived from it sound.
+     */
+    ceilingGrossR: number | null;
+    /** TRA-2335 — cost-NET ceiling = `ceilingGrossR − avgCostR`; bounds `expectancyNetR`. */
+    ceilingNetR: number | null;
+    /** TRA-2335 — ceiling over the `priced_structure` subset only (no fabricated rewards). */
+    ceilingGrossRPriced: number | null;
+    /**
+     * TRA-2335 — reward-provenance histogram. A bare ceiling reads IDENTICALLY
+     * whether it came from real prices or a `long_call` 2×-debit sketch cap; that
+     * indistinguishability is what let a 5.3×-unreachable bar run for four weeks.
+     */
+    ceilingSourceCounts: RewardSourceCounts;
     wins: number;
     losses: number;
     scratches: number;
@@ -984,6 +1029,19 @@ export function buildForwardTestReport(
   const costRatios = outcomes.map((o) => o.costEfficiencyRatio).filter((x): x is number => x != null);
   const avgCostEfficiencyRatio = costRatios.length ? r2(mean(costRatios) ?? 0) : null;
 
+  // TRA-2335 — the feasibility precondition's inputs, computed from the SAME
+  // `resolved` array above. Deliberately NOT a parallel filter: the looser
+  // `maxLossUsd > 0` predicate re-admits the F2 `fallback_priced` entries whose
+  // fabricated `maxProfit = maxLoss` gives `rewardR ≡ 1.000` — 26× a real
+  // vertical's 0.0380 — which inflates the ceiling until an unreachable bar reads
+  // as reachable. That failure is silent and fails OPEN, i.e. it would make the
+  // check built to catch this defect report that there is nothing to catch.
+  const ceiling = computeBookCeiling(resolved);
+  const gradedCostRatios = resolved.map((o) => o.costEfficiencyRatio).filter((x): x is number => x != null);
+  const avgCostR = gradedCostRatios.length ? r4(mean(gradedCostRatios) ?? 0) : null;
+  const ceilingNetR =
+    ceiling.ceilingGrossR == null ? null : r4(ceiling.ceilingGrossR - (avgCostR ?? 0));
+
   // TRA-2006 — fit the POP post-calibration on the SAME resolved-and-included set
   // (refit on every report build → "refits weekly as the sample grows") and
   // surface raw-vs-calibrated POP. Pure measurement; the gate consumes the
@@ -1006,6 +1064,12 @@ export function buildForwardTestReport(
       excluded: outcomes.filter((o) => o.excluded).length,
       excludedCostUneconomic: outcomes.filter((o) => o.excludeReason === 'cost_uneconomic').length,
       avgCostEfficiencyRatio,
+      // TRA-2335 — feasibility inputs, all over the GRADED set (see above).
+      avgCostR,
+      ceilingGrossR: ceiling.ceilingGrossR,
+      ceilingNetR,
+      ceilingGrossRPriced: ceiling.ceilingGrossRPriced,
+      ceilingSourceCounts: ceiling.sourceCounts,
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,
@@ -1093,10 +1157,34 @@ export interface AccumulationMonitor {
   gate: {
     minWeeksWithResolved: number;
     minResolvedIdeas: number;
-    /** Weeks-with-resolved still needed to clear the gate's sample-window bar. */
-    weeksRemaining: number;
-    /** Resolved ideas still needed to clear the gate's sample-size floor. */
-    resolvedRemaining: number;
+    /**
+     * Weeks-with-resolved still needed to clear the gate's sample-window bar.
+     *
+     * TRA-2335 — **null when `feasible === false`.** A countdown is a claim that
+     * arriving at zero clears the gate. When the expectancy bar is above the book's
+     * payoff ceiling that claim is false at every sample size, and suppressing the
+     * number is the point: the countdown was not a passive omission, it was an
+     * ACTIVE weekly publication of "N weeks to go" — an artifact whose plain reading
+     * is *on track, keep going*. A gate that silently fails is bad; one that
+     * publishes a countdown to an event that cannot occur manufactures false
+     * confidence on a schedule.
+     */
+    weeksRemaining: number | null;
+    /** Resolved ideas still needed to clear the sample-size floor. Null when infeasible — see above. */
+    resolvedRemaining: number | null;
+    /** TRA-2335 — the cost-NET expectancy bar the gate grades against. */
+    minExpectancyR: number;
+    /** TRA-2335 — the book's cost-NET payoff ceiling; `expectancyNetR` cannot exceed it. */
+    ceilingNetR: number | null;
+    /**
+     * TRA-2335 — true only on a clean, fully-priced `feasible` verdict. NOT the flag
+     * the countdown keys off: `unknown` (early book, or a ceiling partly derived from
+     * sketch caps) leaves `feasible` false while the countdown still renders, because
+     * `unknown` is "we cannot tell", not "we have shown it is unreachable".
+     */
+    feasible: boolean;
+    /** TRA-2335 — `feasible` | `infeasible` | `unknown`, with the reason naming both numbers. */
+    feasibility: FeasibilityResult;
   };
   clock: {
     /** True once BOTH feeds have produced their first durable artifact. */
@@ -1104,6 +1192,40 @@ export interface AccumulationMonitor {
     /** Machine-readable reasons the clock hasn't started (empty once started). */
     blockedOn: string[];
   };
+}
+
+/**
+ * TRA-2335 — the book-level feasibility verdict: is `minExpectancyR` reachable at all
+ * by the graded book? THE single code path for that question. `live-capital-gate.ts`
+ * (criterion 3) and {@link buildAccumulationMonitor} both call this, so the health
+ * route's verdict and the weekly roll-up's countdown can never disagree.
+ *
+ * The gate grades `expectancyNetR` — a cost-NET figure — against a cost-FREE bar, so
+ * cost is netted off the CEILING here. (The per-open gate is the mirror image: its bar
+ * is cost-INCLUSIVE, so netting there too would double-count. See
+ * `evaluatePerOpenFeasibility`.)
+ *
+ * `provenanceKnown` is false whenever any graded outcome's reward was fabricated by a
+ * sketch cap — the verdict may then be `infeasible` (sound: the ceiling is an upper
+ * bound) or `unknown`, but never a clean `feasible`.
+ */
+export function evaluateBookFeasibility(
+  report: ForwardTestReport,
+  minExpectancyR: number,
+): FeasibilityResult {
+  const t = report.totals;
+  // Tolerate a report built before these fields existed (a persisted snapshot, or a
+  // partial hand-built one). Degrade to `unknown` — never throw. This function is on
+  // the `/api/health/live-capital-gate` path, and a gate probe that 500s is strictly
+  // worse than one that reports "ceiling not established": the 500 removes the whole
+  // readout, including the five criteria that are still perfectly measurable.
+  const sourceCounts = t.ceilingSourceCounts as RewardSourceCounts | undefined;
+  return evaluateFeasibility({
+    barR: minExpectancyR,
+    ceilingR: t.ceilingNetR ?? null,
+    provenanceKnown: sourceCounts != null && sourceCounts.sketch_capped === 0,
+    subject: `the graded book (n=${t.resolved})`,
+  });
 }
 
 /**
@@ -1116,8 +1238,12 @@ export interface AccumulationMonitor {
  */
 export function buildAccumulationMonitor(input: {
   report: ForwardTestReport;
-  /** Gate thresholds (subset) — passed in to avoid a live-capital-gate import cycle. */
-  gate: { minWeeksWithResolved: number; minResolvedIdeas: number };
+  /**
+   * Gate thresholds (subset) — passed in to avoid a live-capital-gate import cycle.
+   * TRA-2335 — `minExpectancyR` joins them: without it this monitor had no term that
+   * could express "the bar is unreachable", so it could only ever count sample.
+   */
+  gate: { minWeeksWithResolved: number; minResolvedIdeas: number; minExpectancyR: number };
   chainOutDir: string;
   /** Recorded chain partition dates, ascending. */
   chainDates: readonly string[];
@@ -1141,6 +1267,10 @@ export function buildAccumulationMonitor(input: {
   if (firstRecordedDate === null) blockedOn.push('no_chain_partitions');
   if (input.firstJournaledDate === null) blockedOn.push('no_journaled_ideas');
   const started = firstRecordedDate !== null && input.firstJournaledDate !== null;
+
+  // TRA-2335 — the same verdict criterion 3 publishes, via the same function.
+  const feasibility = evaluateBookFeasibility(input.report, input.gate.minExpectancyR);
+  const countdownWithheld = feasibility.verdict === 'infeasible';
 
   return {
     asOfDate: input.report.asOfDate,
@@ -1173,8 +1303,23 @@ export function buildAccumulationMonitor(input: {
     gate: {
       minWeeksWithResolved: input.gate.minWeeksWithResolved,
       minResolvedIdeas: input.gate.minResolvedIdeas,
-      weeksRemaining: Math.max(0, input.gate.minWeeksWithResolved - t.weeksWithResolved),
-      resolvedRemaining: Math.max(0, input.gate.minResolvedIdeas - t.resolved),
+      // TRA-2335 — a countdown asserts that reaching zero clears the gate. Withhold it
+      // ONLY on a POSITIVE determination of unreachability (`infeasible`), never on
+      // `unknown`. An empty/early book has no ceiling yet and is `unknown` by
+      // construction — that is the monitor's normal starting state and its entire
+      // reason to exist, so suppressing the countdown there would both destroy the
+      // instrument's primary function and fire the alarm every week from day one. A
+      // warning that is always on is a warning nobody reads.
+      weeksRemaining: countdownWithheld
+        ? null
+        : Math.max(0, input.gate.minWeeksWithResolved - t.weeksWithResolved),
+      resolvedRemaining: countdownWithheld
+        ? null
+        : Math.max(0, input.gate.minResolvedIdeas - t.resolved),
+      minExpectancyR: input.gate.minExpectancyR,
+      ceilingNetR: t.ceilingNetR,
+      feasible: feasibility.feasible,
+      feasibility,
     },
     clock: { started, blockedOn },
   };
@@ -1191,6 +1336,13 @@ export function buildAccumulationMonitor(input: {
 
 const fmtR = (v: number | null): string => (v == null ? 'n/a' : v.toFixed(2));
 const fmtPct = (v: number | null): string => (v == null ? 'n/a' : `${Math.round(v * 100)}%`);
+/** TRA-2335 — 4 dp: the live ceiling figures (+0.0380 / ≈−0.001) vanish at 2 dp. */
+const fmtR4 = (v: number | null): string => (v == null ? 'unknown' : v.toFixed(4));
+/**
+ * TRA-2335 — a withheld countdown must read as WITHHELD, never as `0` or `n/a`.
+ * `0` is the single worst rendering available: it says "you have arrived".
+ */
+const fmtRemaining = (v: number | null): string => (v == null ? '— (bar unreachable)' : String(v));
 
 /** Render the AI-Options-Ideas weekly forward-test roll-up as News-tab markdown. */
 export function renderWeeklyRollupMarkdown(input: {
@@ -1214,12 +1366,21 @@ export function renderWeeklyRollupMarkdown(input: {
   lines.push('');
   lines.push(`**Live-capital gate:** ${input.gatePassed ? '✅ PASS' : '⛔ HOLD'} — ${input.gateSummary}`);
   lines.push('');
+  // TRA-2335 — when the expectancy bar sits above the book's payoff ceiling, the
+  // accumulation countdown is a claim that cannot come true, so it is REPLACED (not
+  // annotated) by the reachability statement. Rendering both would let the reader keep
+  // the "N weeks to go" reading that four weeks of roll-ups already established.
+  if (m.gate.feasibility.verdict === 'infeasible') {
+    lines.push(`> ⛔ **Gate not reachable — this is NOT a sample-size problem.** The cost-net expectancy bar is **${m.gate.minExpectancyR.toFixed(2)}R**, but the graded book's cost-net payoff **ceiling is ${fmtR4(m.gate.ceilingNetR)}R** (loss is pinned at −1R; reward is capped at maxProfit ÷ maxLoss, so realized R can never exceed it). **No amount of additional sample can clear this bar** — the accumulation countdown below is withheld because reaching zero would not open the gate. ${m.gate.feasibility.reason}`);
+    lines.push('');
+  }
   lines.push(`### Accumulation progress`);
   lines.push('');
   lines.push(`| Metric | Current | Gate bar | Remaining |`);
   lines.push(`| --- | ---: | ---: | ---: |`);
-  lines.push(`| Weeks with resolved ideas | ${t.weeksWithResolved} | ${m.gate.minWeeksWithResolved} | ${m.gate.weeksRemaining} |`);
-  lines.push(`| Resolved ideas | ${t.resolved} | ${m.gate.minResolvedIdeas} | ${m.gate.resolvedRemaining} |`);
+  lines.push(`| Weeks with resolved ideas | ${t.weeksWithResolved} | ${m.gate.minWeeksWithResolved} | ${fmtRemaining(m.gate.weeksRemaining)} |`);
+  lines.push(`| Resolved ideas | ${t.resolved} | ${m.gate.minResolvedIdeas} | ${fmtRemaining(m.gate.resolvedRemaining)} |`);
+  lines.push(`| Cost-net expectancy (R) | ${fmtR(t.expectancyNetR)} | > ${m.gate.minExpectancyR.toFixed(2)} | ceiling ${fmtR4(m.gate.ceilingNetR)} |`);
   lines.push(`| Surfaced (journaled) | ${t.surfaced} | — | — |`);
   lines.push(`| Open / awaiting settle | ${t.open} | — | — |`);
   lines.push(`| Excluded (data hygiene) | ${t.excluded} | — | — |`);
