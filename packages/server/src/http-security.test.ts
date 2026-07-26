@@ -4,7 +4,9 @@ import {
   resolveAllowedOrigin,
   securityHeaders,
   reportOnlyCsp,
+  reportingEndpointsHeader,
   toOrigin,
+  CSP_REPORT_PATH,
   PAGES_ORIGIN,
   TAURI_ORIGINS,
   LOCAL_ORIGINS,
@@ -170,6 +172,66 @@ describe('securityHeaders', () => {
     expect(ro).toContain("default-src 'self'");
     expect(ro).toContain("object-src 'none'");
     expect(ro).toContain("worker-src 'self' blob:"); // vite-plugin-pwa service worker
+  });
+});
+
+describe('TRA-2344 — reporting wired to Report-Only, and ONLY Report-Only', () => {
+  // This is the ticket's positive control, and it is deliberately two-sided.
+  //
+  // Asserting only "the enforced header is still `frame-ancestors 'none'`" would
+  // also pass if TRA-2344 had wired up nothing at all — a control that cannot tell
+  // "promoted nothing" from "did nothing" proves neither. So each assertion below
+  // pairs the thing that must NOT have moved with the thing that must have
+  // arrived, in the slot it belongs in.
+
+  it('adds report-uri/report-to to Report-Only and NOTHING to the enforced slot', () => {
+    const h = securityHeaders({ secure: true, host: 'tradingai-bqb1.onrender.com' });
+    const enforced = h['Content-Security-Policy'] ?? '';
+    const ro = h['Content-Security-Policy-Report-Only'] ?? '';
+
+    // Detects: reporting directives leaking into the enforced policy.
+    expect(enforced).toBe("frame-ancestors 'none'");
+    expect(enforced).not.toContain('report-uri');
+    expect(enforced).not.toContain('report-to');
+    expect(enforced).not.toContain('default-src');
+
+    // Contains what it detects: the directives DO exist, one slot over. Without
+    // these three lines the block above is satisfied by an empty change.
+    expect(ro).toContain('report-uri /api/csp-report');
+    expect(ro).toContain('report-to csp-endpoint');
+    expect(ro).toContain("default-src 'self'");
+  });
+
+  it('binds the report-to group to a real URL via Reporting-Endpoints', () => {
+    // `report-to csp-endpoint` is inert on its own — the group name is just a
+    // label until this header maps it to a URL. Shipping the CSP directive without
+    // this header would collect zero reports from every modern Chrome, silently.
+    const h = securityHeaders({ secure: true, host: 'tradingai-bqb1.onrender.com' });
+    expect(h['Reporting-Endpoints']).toBe(
+      'csp-endpoint="https://tradingai-bqb1.onrender.com/api/csp-report"',
+    );
+  });
+
+  it('names the endpoint over http when the request was not TLS', () => {
+    // The desktop app and every dev loop are http://localhost:4242. A hardcoded
+    // `https://` here would point the browser at an endpoint that does not exist.
+    const h = securityHeaders({ secure: false, host: 'localhost:4242' });
+    expect(h['Reporting-Endpoints']).toBe('csp-endpoint="http://localhost:4242/api/csp-report"');
+  });
+
+  it('omits Reporting-Endpoints when the host is unknown, keeping report-uri', () => {
+    const h = securityHeaders({ secure: true, host: undefined });
+    expect(h['Reporting-Endpoints']).toBeUndefined();
+    // The legacy directive takes a relative URL unambiguously, so reports still
+    // flow from the browsers that implement it.
+    expect(h['Content-Security-Policy-Report-Only']).toContain('report-uri /api/csp-report');
+  });
+
+  it('keeps the collector path in the header identical to the mounted route', () => {
+    // One constant, two consumers. A drift here yields zero reports and no error
+    // on any surface — the exact silence this ticket exists to end.
+    expect(reportOnlyCsp('h')).toContain(`report-uri ${CSP_REPORT_PATH}`);
+    expect(reportingEndpointsHeader('h', true)).toContain(CSP_REPORT_PATH);
   });
 });
 

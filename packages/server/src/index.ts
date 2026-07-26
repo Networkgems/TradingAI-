@@ -13,6 +13,7 @@ import {
   notFoundHandler,
   securityHeadersMiddleware,
 } from './http-security.js';
+import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
 import {
   reconcilePnl,
@@ -1122,6 +1123,25 @@ app.use(corsMiddleware(ALLOWED_ORIGINS));
 // TRA-406 — open a trace for every request so logs, captured errors and the
 // `X-Trace-Id` response header all correlate to the same request.
 app.use(traceMiddleware);
+
+// ── CSP violation reports ────────────────────────────────────────────────────
+//
+// TRA-2344 — mounted HERE, above `express.json()`, and that position is
+// load-bearing rather than tidy. The collector brings its own 8 KB raw parser
+// because (a) the global parser's 100 KB default is far too generous for an
+// endpoint browsers post to unauthenticated, and (b) the global parser matches
+// `application/json`, while these arrive as `application/csp-report` and
+// `application/reports+json`. A body the global parser declined to read leaves
+// `req.body` as `{}` — no error, no log, just a permanent zero that reads exactly
+// like a clean policy. Both routes are deliberately unauthenticated; see the
+// header of `csp-report-collector.ts` for the bounds that makes that safe.
+//
+// Hydrated immediately before the mount rather than alongside the other boot
+// hydrates further down, so there is no window in which the route is live and the
+// store is still empty — a report landing in that window would be counted against
+// a zeroed baseline and then overwritten by the hydrate.
+initCspReportStore(DATA_DIR);
+app.use(cspReportRouter());
 
 // TRA-852 — stash the exact raw request bytes on the request during JSON
 // parsing. The Discord Interactions endpoint must verify the Ed25519 signature

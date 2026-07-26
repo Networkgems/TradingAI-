@@ -131,6 +131,39 @@ export interface SecurityHeaderOptions {
  */
 const ENFORCED_CSP = "frame-ancestors 'none'";
 
+// ── TRA-2344 — where violation reports go ────────────────────────────────────
+//
+// These two constants are declared HERE, in the module with no runtime imports,
+// because they appear in the CSP header, and `csp-report-collector.ts` imports them
+// to mount its route. One definition, two consumers: if the route and the URL the
+// browser is told to post to ever drifted apart, the result would be zero reports
+// and no error on any surface — the same silence this ticket exists to end.
+
+/** Path of the unauthenticated collector. See `csp-report-collector.ts`. */
+export const CSP_REPORT_PATH = '/api/csp-report';
+
+/** `Reporting-Endpoints` group name that the CSP's `report-to` refers to. */
+export const CSP_REPORT_GROUP = 'csp-endpoint';
+
+/**
+ * The `Reporting-Endpoints` header value, or null when the host is unknown.
+ *
+ * The Reporting API resolves this endpoint against the DOCUMENT, and browser
+ * implementations have been inconsistent about relative URLs here, so an absolute
+ * one is built whenever the host is known. The scheme has to follow the actual
+ * transport: hardcoding `https://` would name an endpoint that does not exist on
+ * `http://localhost:4242`, where the desktop app and every dev loop live.
+ *
+ * With no host there is nothing safe to name — a bare path may or may not be
+ * honoured — so the header is omitted, and only the legacy `report-uri` (which
+ * takes a relative URL unambiguously) carries reports in that case.
+ */
+export function reportingEndpointsHeader(host: string | undefined, secure: boolean): string | null {
+  if (!host) return null;
+  const scheme = secure ? 'https' : 'http';
+  return `${CSP_REPORT_GROUP}="${scheme}://${host}${CSP_REPORT_PATH}"`;
+}
+
 /**
  * The candidate full policy, shipped Report-Only so a violation is a console
  * entry, never a broken panel. Promote to enforced on a separate ticket once a
@@ -139,6 +172,13 @@ const ENFORCED_CSP = "frame-ancestors 'none'";
  * `'unsafe-inline'` on style-src is expected to be permanent: React inline
  * `style={{...}}` props and the chart components emit inline styles. `worker-src`
  * covers the vite-plugin-pwa service worker.
+ *
+ * TRA-2344 appends `report-uri` + `report-to` — to THIS header only. Both ship
+ * because they are not interchangeable: `report-uri` is deprecated but is what
+ * Safari and older Chrome/Firefox actually implement, and `report-to` is the only
+ * one current Chrome honours. Sending one alone silently loses a browser family,
+ * and a browser family reporting nothing looks exactly like a browser family with
+ * no violations — which is the reading error TRA-2321 must not make.
  */
 export function reportOnlyCsp(host?: string): string {
   // A document served by this origin opens its dashboard socket back to the
@@ -158,6 +198,11 @@ export function reportOnlyCsp(host?: string): string {
     "worker-src 'self' blob:",
     "manifest-src 'self'",
     `connect-src 'self'${socket}`,
+    // Relative URL on purpose: `report-uri` resolves against the document, this
+    // endpoint is same-origin, and naming an absolute host here would break the
+    // moment the app is served from a hostname this code did not predict.
+    `report-uri ${CSP_REPORT_PATH}`,
+    `report-to ${CSP_REPORT_GROUP}`,
   ].join('; ');
 }
 
@@ -176,9 +221,18 @@ export function securityHeaders(opts: SecurityHeaderOptions): Record<string, str
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
+    // TRA-2344 did NOT touch this line, and the control in the test suite exists
+    // to prove it: the enforced slot is still exactly `frame-ancestors 'none'`,
+    // with no `report-uri`/`report-to` and no `default-src`. Promotion is TRA-2321's
+    // deliberate edit, gated on a clean session of the reports the line below now
+    // actually collects.
     'Content-Security-Policy': ENFORCED_CSP,
     'Content-Security-Policy-Report-Only': reportOnlyCsp(opts.host),
   };
+  // TRA-2344 — `report-to` is inert without this header; the group name in the
+  // CSP is just a label until something binds it to a URL.
+  const reporting = reportingEndpointsHeader(opts.host, opts.secure);
+  if (reporting) headers['Reporting-Endpoints'] = reporting;
   if (opts.secure) {
     headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
   }
