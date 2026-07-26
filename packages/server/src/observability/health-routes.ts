@@ -2339,16 +2339,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           : isTestAccount(r.account)
             ? 'fixture'
             : 'desk';
+      // TRA-2350 — the archetype axis. `single_leg_directional` is written by THREE
+      // sleeves and only one of them evaluates the ceiling, so the structure key
+      // alone cannot name the gated cohort. Absent ⇒ `null`, which the fold buckets
+      // as `unspecified` and treats as UNGATED (the AI-ideas open at
+      // `signal-engine.ts:12180` stamps no archetype and is not gated).
+      const entryArchetype =
+        typeof r.entryArchetype === 'string' && r.entryArchetype.trim().length > 0
+          ? r.entryArchetype
+          : null;
       if (
         typeof r.entryBid !== 'number'
         || typeof r.entryAsk !== 'number'
         || typeof r.entryMarkUsd !== 'number'
       ) {
-        ceilingSamples.push({ structure: r.structure, accountClass, quote: null });
+        ceilingSamples.push({ structure: r.structure, accountClass, entryArchetype, quote: null });
         continue;
       }
       const quote = { bid: r.entryBid, ask: r.entryAsk, mark: r.entryMarkUsd };
-      ceilingSamples.push({ structure: r.structure, accountClass, quote });
+      ceilingSamples.push({ structure: r.structure, accountClass, entryArchetype, quote });
       samples.push({
         structure: r.structure,
         quote,
@@ -2418,23 +2427,51 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // so the two can be compared and a disagreement means something.
       //
       // READ IT LIKE THIS. For the TRA-2306 grade, the single cell that matters is
-      // `byAccountClass.desk` where `structure === 'single_leg_directional'`:
-      //   n: 0 (all null)            ⇒ NO READING. Not a pass. The desk book opened
-      //                                no directional entries in scope; check
-      //                                `rowsDroppedNoQuote` before concluding it was
-      //                                quiet rather than unmeasurable.
-      //   n > 0, countAboveCeiling 0 ⇒ the check RAN over n real rows and found none
-      //                                over 0.10. That is the PASS.
-      //   countAboveCeiling > 0      ⇒ falsification. The gate is not holding, and
-      //                                `maxSpreadPct` says by how much.
+      // `byAccountClass.desk` where `structure === 'single_leg_directional'` — and
+      // WITHIN that cell, the `gated` sub-object, NOT the pooled top level:
+      //   gated.n: 0 (all null)            ⇒ NO READING. Not a pass. The desk book
+      //                                      opened no GATED directional entries in
+      //                                      scope; check `rowsDroppedNoQuote` before
+      //                                      concluding it was quiet rather than
+      //                                      unmeasurable.
+      //   gated.n > 0, countAboveCeiling 0 ⇒ the check RAN over n real rows and found
+      //                                      none over 0.10. That is the PASS.
+      //   gated.countAboveCeiling > 0      ⇒ falsification. The gate is not holding,
+      //                                      and `gated.maxSpreadPct` says by how much.
       // Scope it to post-deploy entries with `?sinceTs=` — the cumulative pool still
       // contains the 59 pre-TRA-2295 breaches and will never read 0.
+      //
+      // ⚠ TRA-2350 — WHY `gated`, AND NOT THE POOLED CELL. This block used to say the
+      // three lines above about the cell's TOP-LEVEL numbers, and that instruction was
+      // wrong in the direction that costs the most: it assumed
+      // `single_leg_directional` == the gated sleeve. It does not. THREE call sites
+      // stamp that structure label — `signal-engine.ts:8484` (the directional sleeve,
+      // `entryArchetype: 'directional'`, the only one TRA-2295 gates), `:9226` (iv-rv
+      // mispricing) and `:12180` (AI-Options-Ideas, which stamps no archetype at all)
+      // — while `spreadCeilingRejectReason` has exactly ONE call site, `:8315`. So a
+      // wide-spread fill from either ungated sleeve landed in this cell and read as
+      // "TRA-2295 enforcement falsified", and the paragraph above told the grader to
+      // re-open a correct ticket. A FALSE FAIL, manufactured by the instrument.
+      //
+      // Note the asymmetry that kept it quiet: the TELEMETRY side
+      // (`/api/health/cost-aware-gate` → `spreadCeilingEvaluated`) is written only by
+      // `recordSpreadCeilingDecision` from that single gated site, so it counts the
+      // directional sleeve alone and is clean. Only THIS journal-derived side pooled.
+      // The two are published as independent confirmations of each other, which means
+      // that before the split a disagreement between them had two indistinguishable
+      // causes — a real enforcement failure, or an ungated sleeve trading wide.
+      // `gated`/`ungated`/`byArchetype` separate them; `gatedArchetypes` states the
+      // partition rule in the payload so a consumer asserts it instead of assuming it.
+      //
+      // Empirically the pooling had not bitten as of 2026-07-26 (iv-rv last fired
+      // 2026-07-02T16:37Z; AI-ideas has produced 0 rows under the label) — but that is
+      // an EMPIRICAL zero and it expires. The partition is the structural one.
       ceilingCompliance: {
         byAccountClass: ceilingByAccountClass,
         note:
-          'TRA-2316. TRUE max + strict breach count per (structure × account class), re-derived from the journal fill-time quote independently of the gate\'s own counters. GRADE `byAccountClass.desk`; `fixture` is the qa_*/ctoverify* mirror (TRA-2100) and `unattributed` is pre-TRA-1475 rows with no `account` — it is NOT desk. Rows with no measurable two-sided quote DROP OUT of `n` and are counted in `rowsDroppedNoQuote`; they are never counted as zero-spread fills. `null` means NO ROWS TO CHECK and is NOT a pass — only `countAboveCeiling: 0` WITH `n > 0` is. Full grid: every sleeve × all three classes is emitted even at n=0, because an absent cell reads exactly like a passing one.',
+          'TRA-2316, re-keyed by TRA-2350. TRUE max + strict breach count per (structure × account class × entryArchetype), re-derived from the journal fill-time quote independently of the gate\'s own counters. GRADE `byAccountClass.desk[...].gated` — NOT the pooled top-level numbers on the cell: a structure key is not a sleeve, and `single_leg_directional` is written by three sleeves of which only `entryArchetype: \'directional\'` evaluates the ceiling (`gatedArchetypes` names the set; `ungated` holds the rest; `byArchetype` is the detail). A breach in `ungated` falsifies NOTHING about TRA-2295 — it is a separate question about a sleeve that was never gated. `fixture` is the qa_*/ctoverify* mirror (TRA-2100) and `unattributed` is pre-TRA-1475 rows with no `account` — it is NOT desk. Rows with no measurable two-sided quote DROP OUT of `n` and are counted in `rowsDroppedNoQuote`; they are never counted as zero-spread fills. `null` means NO ROWS TO CHECK and is NOT a pass — only `countAboveCeiling: 0` WITH `n > 0` is. Full grid: every sleeve × all three classes is emitted even at n=0, and every DECLARED gated archetype gets a `byArchetype` row even at n=0, because an absent cell reads exactly like a passing one. `gated.n + ungated.n === n` holds by construction; assert it to catch a partition that dropped rows.',
         comparisonBasis:
-          'Cross-check against /api/health/cost-aware-gate: byStructure[].maxAdmittedSpreadPct should track `desk` maxSpreadPct for the same cohort, and spreadCeilingEvaluated > 0 with the TRA-2311 `armed` bit true should accompany any n > 0 here. The gate counters are one-day and in-memory (durability.ephemeral); THIS read is over the durable journal and survives a restart — so a disagreement is more likely a lost counter than a lost fill, and the journal is the tiebreak.',
+          'Cross-check against /api/health/cost-aware-gate: byStructure[].maxAdmittedSpreadPct should track `desk[...].gated.maxSpreadPct` — TRA-2350: the GATED cohort, because the gate counter only ever saw that cohort, so comparing it against the pooled cell compares two different populations and can disagree for a reason that is not a defect. spreadCeilingEvaluated > 0 with the TRA-2311 `armed` bit true should accompany any `gated.n > 0` here. The gate counters are one-day and in-memory (durability.ephemeral); THIS read is over the durable journal and survives a restart — so a disagreement is more likely a lost counter than a lost fill, and the journal is the tiebreak.',
       },
 
       // (2) The retention statement — the finding when n is short.

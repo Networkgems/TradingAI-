@@ -116,6 +116,73 @@ export const SLEEVE_SPREAD_CEILINGS: Readonly<Record<string, SleeveSpreadCeiling
   single_leg_directional: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
 };
 
+/**
+ * TRA-2350 — which entry archetypes under a structure key ACTUALLY evaluate that
+ * structure's ceiling.
+ *
+ * `'all'` = the gate sits in the scanner's chain filter, above archetype, so every
+ * row under the key passed it. `'none'` = no live path evaluates it. A LIST = the
+ * gate sits on ONE entry path and only rows stamped with those archetypes went
+ * through it.
+ *
+ * Why this table has to exist: a structure label is NOT a sleeve. Three call sites
+ * stamp `structureLabel: 'single_leg_directional'` on a journal row —
+ * `signal-engine.ts:8484` (the directional sleeve, `entryArchetype: 'directional'`),
+ * `:9226` (iv-rv mispricing, `entryArchetype: 'iv-rv-buy-premium'`) and `:12180`
+ * (AI-Options-Ideas single-leg, which stamps NO archetype at all) — and
+ * `spreadCeilingRejectReason` has exactly ONE call site, `:8315`, reached only by
+ * the first. So two of the three write into TRA-2295's structure key without ever
+ * having been gated by it.
+ *
+ * The failure that follows is silent and points the wrong way: a wide-spread fill
+ * from either ungated sleeve lands in the `single_leg_directional` compliance cell
+ * and reads as **TRA-2295 enforcement falsified** for a gate that was never on its
+ * path — a FALSE FAIL whose documented remedy is to re-open a correct ticket. The
+ * telemetry side (`spreadCeilingEvaluated`) does not have this problem: it is
+ * written only by `recordSpreadCeilingDecision` from the single gated site, so it
+ * counts the directional sleeve alone. Only the JOURNAL-derived side pools. The two
+ * are published as independent confirmations of each other, so before this table a
+ * disagreement between them had two indistinguishable causes.
+ *
+ * ⚠ An archetype absent from a sleeve's list is UNGATED — including `unspecified`
+ * (a row that stamped no archetype). That is the fail-closed direction on purpose:
+ * an unrecognised writer must never be admitted to the gated cohort silently. Add a
+ * new archetype here only when its entry path actually calls {@link spreadGateVerdict}.
+ */
+export type SleeveGatedArchetypes = 'all' | 'none' | readonly string[];
+
+export const SLEEVE_GATED_ARCHETYPES: Readonly<Record<string, SleeveGatedArchetypes>> = {
+  // `otm-mispricing.ts:185` — inside the scanner chain filter, so it runs before
+  // anything downstream can pick a contract, for every archetype under the key.
+  single_leg_otm: 'all',
+  // `relative-value.ts:396` — inside the RV scanner chain filter, which NEVER RUNS
+  // (`RV_ENGINE_ENABLED` is a compile-time false since TRA-1207/2026-06-30). No live
+  // sleeve is gated by this entry, so NOTHING under this key may be graded as gated.
+  single_leg_rv: 'none',
+  // TRA-2295, `signal-engine.ts:8315` — on the directional ENTRY PATH itself, not in
+  // a scanner. Only rows stamped `entryArchetype: 'directional'` (`:8476`, written in
+  // the SAME object literal as the `:8484` structure stamp) reached it.
+  single_leg_directional: ['directional'],
+};
+
+/**
+ * TRA-2350 — the archetype bucket for a row that stamped none. Matches the
+ * `r.entryArchetype ?? 'unspecified'` convention already used by the journal's own
+ * archetype rollups (`option-trade-journal.ts:1055`, `:1129`), so the two surfaces
+ * name the same cohort the same way.
+ */
+export const UNSPECIFIED_ENTRY_ARCHETYPE = 'unspecified';
+
+/** Is `archetype` gated under `structure`, per {@link SLEEVE_GATED_ARCHETYPES}? */
+export function isGatedArchetype(structure: string, archetype: string): boolean {
+  // A structure with no entry here is UNKNOWN, not gated — same fail-closed default
+  // as an archetype missing from a list.
+  const gated = SLEEVE_GATED_ARCHETYPES[structure] ?? 'none';
+  if (gated === 'all') return true;
+  if (gated === 'none') return false;
+  return gated.includes(archetype);
+}
+
 /** A two-sided quote captured at fill time. */
 export interface FillQuote {
   /** Per-share bid at fill. */
@@ -491,27 +558,31 @@ export interface SpreadCeilingSample {
   structure: string;
   accountClass: SpreadCeilingAccountClass;
   quote: FillQuote | null;
+  /**
+   * TRA-2350 — the row's `entryArchetype`, or `null` when it stamped none. This is
+   * the axis that separates the GATED sleeve from the other writers of the same
+   * structure key; see {@link SLEEVE_GATED_ARCHETYPES}. A `null` here buckets under
+   * {@link UNSPECIFIED_ENTRY_ARCHETYPE} and is treated as UNGATED.
+   */
+  entryArchetype: string | null;
 }
 
 /**
- * The compliance readout for ONE (structure × accountClass) cell.
+ * TRA-2350 — the ceiling statistics over ONE cohort of rows, with the module's null
+ * discipline intact: every number is `null` when there is nothing to compute it
+ * from, and `countAboveCeiling: 0` means the check RAN over `n` real rows.
  *
- * Every numeric field is `null` when there is nothing to compute it from. Read
- * `n: 0` + all-null as "this check did not run here", and `countAboveCeiling: 0`
- * with `n > 0` as "it ran over `n` real rows and found none over the ceiling".
+ * Shared by the pooled cell, by the gated/ungated partition and by each per-archetype
+ * row, so the three can never be folded on different rules.
  */
-export interface SpreadCeilingStat {
-  structure: string;
-  accountClass: SpreadCeilingAccountClass;
-  /** Rows in this cell carrying a MEASURABLE two-sided fill-time quote. The honest `n`. */
+export interface SpreadCeilingCohortStat {
+  /** Rows in this cohort carrying a MEASURABLE two-sided fill-time quote. The honest `n`. */
   n: number;
   /**
-   * Rows in this cell whose quote was absent or unusable. Dropped from every stat
+   * Rows in this cohort whose quote was absent or unusable. Dropped from every stat
    * below — never zero-filled — but counted here so the drop is visible.
    */
   rowsDroppedNoQuote: number;
-  /** The thresholds applied. `null` ⇒ this structure has no configured ceiling. */
-  ceiling: SleeveSpreadCeiling | null;
   /** TRUE max of `(ask − bid) / mark`, not a quantile. `null` when `n === 0`. */
   maxSpreadPct: number | null;
   /**
@@ -525,9 +596,63 @@ export interface SpreadCeilingStat {
   countBelowMinBid: number | null;
 }
 
+/** TRA-2350 — one archetype's slice of a (structure × accountClass) cell. */
+export interface SpreadCeilingArchetypeStat extends SpreadCeilingCohortStat {
+  /** `unspecified` when the rows stamped no archetype. */
+  entryArchetype: string;
+  /** Did this archetype's entry path evaluate the ceiling? Drives `gated`/`ungated`. */
+  gated: boolean;
+}
+
 /**
- * Fold journal entry quotes into the per-(structure × accountClass) ceiling
- * compliance grid. Pure.
+ * The compliance readout for ONE (structure × accountClass) cell.
+ *
+ * Every numeric field is `null` when there is nothing to compute it from. Read
+ * `n: 0` + all-null as "this check did not run here", and `countAboveCeiling: 0`
+ * with `n > 0` as "it ran over `n` real rows and found none over the ceiling".
+ *
+ * ⚠ TRA-2350 — the TOP-LEVEL numbers on this cell are POOLED over every archetype
+ * that wrote this structure label, INCLUDING sleeves that never evaluated the
+ * ceiling. They are kept at the top level for consumer stability and they remain the
+ * right read for "what did the book actually buy under this label" — but they are
+ * NOT a verdict on whether an enforcement is holding. **Grade {@link gated}.**
+ */
+export interface SpreadCeilingStat extends SpreadCeilingCohortStat {
+  structure: string;
+  accountClass: SpreadCeilingAccountClass;
+  /** The thresholds applied. `null` ⇒ this structure has no configured ceiling. */
+  ceiling: SleeveSpreadCeiling | null;
+  /**
+   * TRA-2350 — the declared gated archetype set for this structure, echoed into the
+   * payload so a consumer asserts the partition rule instead of assuming it.
+   */
+  gatedArchetypes: SleeveGatedArchetypes;
+  /**
+   * TRA-2350 — rows whose entry path ACTUALLY evaluated this ceiling. **This is the
+   * enforcement verdict cell.** `countAboveCeiling > 0` here falsifies the gate;
+   * `countAboveCeiling: 0` with `n > 0` is the pass; `n: 0` is NOT a pass.
+   */
+  gated: SpreadCeilingCohortStat;
+  /**
+   * TRA-2350 — rows under this structure key from sleeves that never called the
+   * gate. A breach here is EXPECTED and falsifies nothing: it is an ungated sleeve
+   * buying a wide contract, which is a separate finding (should that sleeve be
+   * gated?) and not evidence about TRA-2295. Before this split those rows landed in
+   * the graded cell.
+   */
+  ungated: SpreadCeilingCohortStat;
+  /**
+   * TRA-2350 — the per-archetype detail behind `gated`/`ungated`, so a disagreement
+   * between this instrument and the gate's own counters is diagnosable rather than
+   * merely visible. Always contains a row for every DECLARED gated archetype (at
+   * `n: 0` if it did not trade), because an absent row reads exactly like a clean one.
+   */
+  byArchetype: SpreadCeilingArchetypeStat[];
+}
+
+/**
+ * Fold journal entry quotes into the per-(structure × accountClass × entryArchetype)
+ * ceiling compliance grid. Pure.
  *
  * Emits the FULL GRID — every sleeve in {@link SLEEVE_SPREAD_CEILINGS} (plus any
  * structure actually observed) crossed with all three account classes — rather
@@ -536,12 +661,26 @@ export interface SpreadCeilingStat {
  * whole ticket exists to remove: the consumer asking "is `single_leg_directional`
  * clean on the desk book?" must get an answer object back even when the desk book
  * is empty, and that answer must say `n: 0` / `null` rather than nothing at all.
+ *
+ * TRA-2350 adds the THIRD axis, for the same reason at one level down. A structure
+ * key is NOT a sleeve: two ungated sleeves also stamp `single_leg_directional`, so
+ * the pooled cell could report a breach against a gate that was never on the
+ * breaching row's path — a false FAIL of a correct enforcement. Each cell therefore
+ * also carries a `gated` / `ungated` partition plus per-archetype detail.
+ * **`gated` is the enforcement verdict; the pooled top level is not.** See
+ * {@link SLEEVE_GATED_ARCHETYPES}.
  */
 export function summarizeSpreadCeilingCompliance(
   samples: readonly SpreadCeilingSample[],
 ): SpreadCeilingStat[] {
-  const cellKey = (structure: string, accountClass: SpreadCeilingAccountClass): string =>
-    `${structure}\u0000${accountClass}`;
+  // TRA-2350 — the cell key gains the archetype. NUL stays the separator: it cannot
+  // occur in a structure or archetype label, so no two distinct triples can collide
+  // into one bucket.
+  const cellKey = (
+    structure: string,
+    accountClass: SpreadCeilingAccountClass,
+    archetype: string,
+  ): string => `${structure}\u0000${accountClass}\u0000${archetype}`;
 
   const measured = new Map<string, SpreadCrossMeasurement[]>();
   const bids = new Map<string, number[]>();
@@ -550,8 +689,30 @@ export function summarizeSpreadCeilingCompliance(
   const structures = new Set<string>(Object.keys(SLEEVE_SPREAD_CEILINGS));
   for (const s of samples) structures.add(s.structure);
 
+  // Every archetype OBSERVED under a structure, plus every archetype DECLARED gated
+  // for it — so a gated sleeve that did not trade still emits a row saying `n: 0`
+  // instead of being absent, which would read exactly like a clean one.
+  const archetypesByStructure = new Map<string, Set<string>>();
+  const noteArchetype = (structure: string, archetype: string): void => {
+    const set = archetypesByStructure.get(structure) ?? new Set<string>();
+    set.add(archetype);
+    archetypesByStructure.set(structure, set);
+  };
+  for (const structure of structures) {
+    if (!archetypesByStructure.has(structure)) archetypesByStructure.set(structure, new Set());
+    const gated = SLEEVE_GATED_ARCHETYPES[structure];
+    if (Array.isArray(gated)) for (const a of gated) noteArchetype(structure, a);
+  }
+
+  const archetypeOf = (s: SpreadCeilingSample): string =>
+    typeof s.entryArchetype === 'string' && s.entryArchetype.trim().length > 0
+      ? s.entryArchetype
+      : UNSPECIFIED_ENTRY_ARCHETYPE;
+
   for (const s of samples) {
-    const key = cellKey(s.structure, s.accountClass);
+    const archetype = archetypeOf(s);
+    noteArchetype(s.structure, archetype);
+    const key = cellKey(s.structure, s.accountClass, archetype);
     const m = s.quote === null ? null : measureSpreadCross(s.quote);
     if (!m || s.quote === null) {
       dropped.set(key, (dropped.get(key) ?? 0) + 1);
@@ -565,29 +726,77 @@ export function summarizeSpreadCeilingCompliance(
     bids.set(key, bidBucket);
   }
 
+  /**
+   * Fold one already-selected set of rows into the shared cohort shape. The pooled
+   * cell, the gated/ungated partition and every per-archetype row all go through
+   * THIS function, so the three can never end up folded on different rules — which
+   * is the only reason a disagreement between them is readable as a finding.
+   */
+  const foldCohort = (
+    rows: readonly SpreadCrossMeasurement[],
+    rowBids: readonly number[],
+    rowsDroppedNoQuote: number,
+    ceiling: SleeveSpreadCeiling | null,
+  ): SpreadCeilingCohortStat => {
+    const n = rows.length;
+    return {
+      n,
+      rowsDroppedNoQuote,
+      // `null`, not 0 — an empty cohort must not read as a zero-spread book.
+      maxSpreadPct: n === 0 ? null : Math.max(...rows.map((m) => m.spreadPct)),
+      countAboveCeiling:
+        n === 0 || !ceiling ? null : rows.filter((m) => m.spreadPct > ceiling.maxSpreadPct).length,
+      minEntryBidUsd: n === 0 ? null : Math.min(...rowBids),
+      countBelowMinBid:
+        n === 0 || !ceiling ? null : rowBids.filter((b) => b < ceiling.minBidUsd).length,
+    };
+  };
+
   const out: SpreadCeilingStat[] = [];
   for (const structure of [...structures].sort((a, b) => a.localeCompare(b))) {
     const ceiling = SLEEVE_SPREAD_CEILINGS[structure] ?? null;
+    const archetypes = [...(archetypesByStructure.get(structure) ?? new Set<string>())].sort(
+      (a, b) => a.localeCompare(b),
+    );
     for (const accountClass of SPREAD_CEILING_ACCOUNT_CLASSES) {
-      const key = cellKey(structure, accountClass);
-      const rows = measured.get(key) ?? [];
-      const rowBids = bids.get(key) ?? [];
-      const n = rows.length;
+      const byArchetype: SpreadCeilingArchetypeStat[] = [];
+      // Three accumulators per cell. Each row contributes to `pooled` and to exactly
+      // one of `gatedAcc`/`ungatedAcc`, so `gated.n + ungated.n === n` by construction
+      // — a consumer can assert that identity to detect a partition that silently
+      // dropped rows.
+      const pooled = { rows: [] as SpreadCrossMeasurement[], bids: [] as number[], dropped: 0 };
+      const gatedAcc = { rows: [] as SpreadCrossMeasurement[], bids: [] as number[], dropped: 0 };
+      const ungatedAcc = { rows: [] as SpreadCrossMeasurement[], bids: [] as number[], dropped: 0 };
+
+      for (const archetype of archetypes) {
+        const key = cellKey(structure, accountClass, archetype);
+        const rows = measured.get(key) ?? [];
+        const rowBids = bids.get(key) ?? [];
+        const rowsDropped = dropped.get(key) ?? 0;
+        const gated = isGatedArchetype(structure, archetype);
+
+        byArchetype.push({
+          entryArchetype: archetype,
+          gated,
+          ...foldCohort(rows, rowBids, rowsDropped, ceiling),
+        });
+
+        for (const acc of [pooled, gated ? gatedAcc : ungatedAcc]) {
+          acc.rows.push(...rows);
+          acc.bids.push(...rowBids);
+          acc.dropped += rowsDropped;
+        }
+      }
+
       out.push({
         structure,
         accountClass,
-        n,
-        rowsDroppedNoQuote: dropped.get(key) ?? 0,
         ceiling: ceiling ? { ...ceiling } : null,
-        // `null`, not 0 — an empty cell must not read as a zero-spread book.
-        maxSpreadPct: n === 0 ? null : Math.max(...rows.map((m) => m.spreadPct)),
-        countAboveCeiling:
-          n === 0 || !ceiling
-            ? null
-            : rows.filter((m) => m.spreadPct > ceiling.maxSpreadPct).length,
-        minEntryBidUsd: n === 0 ? null : Math.min(...rowBids),
-        countBelowMinBid:
-          n === 0 || !ceiling ? null : rowBids.filter((b) => b < ceiling.minBidUsd).length,
+        gatedArchetypes: SLEEVE_GATED_ARCHETYPES[structure] ?? 'none',
+        ...foldCohort(pooled.rows, pooled.bids, pooled.dropped, ceiling),
+        gated: foldCohort(gatedAcc.rows, gatedAcc.bids, gatedAcc.dropped, ceiling),
+        ungated: foldCohort(ungatedAcc.rows, ungatedAcc.bids, ungatedAcc.dropped, ceiling),
+        byArchetype,
       });
     }
   }

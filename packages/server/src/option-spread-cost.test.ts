@@ -306,7 +306,7 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
     const stats = summarizeSpreadCeilingCompliance([
       {
         structure: 'single_leg_directional',
-        accountClass: 'desk',
+        accountClass: 'desk', entryArchetype: 'directional',
         quote: { bid: 0.01, ask: 0.59, mark: 0.3 },
       },
     ]);
@@ -328,8 +328,8 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
     // 0.10 floor. This is what a held ceiling looks like, and it must not be
     // representable the same way as an empty book.
     const stats = summarizeSpreadCeilingCompliance([
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.9, ask: 2.0, mark: 2.0 } },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 1.9, ask: 2.0, mark: 2.0 } },
     ]);
     const cell = cellOf(stats, 'single_leg_directional');
     expect(cell.n).toBe(2);
@@ -353,7 +353,7 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
 
     const populated = cellOf(
       summarizeSpreadCeilingCompliance([
-        { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+        { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
       ]),
       'single_leg_directional',
     );
@@ -367,10 +367,10 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
     // Pooled, the desk cell would report 4 rows and a 1.933 max and falsely
     // falsify the gate.
     const stats = summarizeSpreadCeilingCompliance([
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
-      { structure: 'single_leg_directional', accountClass: 'fixture', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
-      { structure: 'single_leg_directional', accountClass: 'fixture', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
-      { structure: 'single_leg_directional', accountClass: 'unattributed', quote: { bid: 0.5, ask: 0.9, mark: 0.7 } },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 1.95, ask: 2.05, mark: 2.0 } },
+      { structure: 'single_leg_directional', accountClass: 'fixture', entryArchetype: 'directional', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
+      { structure: 'single_leg_directional', accountClass: 'fixture', entryArchetype: 'directional', quote: { bid: 0.01, ask: 0.59, mark: 0.3 } },
+      { structure: 'single_leg_directional', accountClass: 'unattributed', entryArchetype: 'directional', quote: { bid: 0.5, ask: 0.9, mark: 0.7 } },
     ]);
     const desk = cellOf(stats, 'single_leg_directional', 'desk');
     const fixture = cellOf(stats, 'single_leg_directional', 'fixture');
@@ -398,9 +398,9 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
     // The drop is counted so `n: 0` after discarding rows cannot read as a quiet,
     // clean book.
     const stats = summarizeSpreadCeilingCompliance([
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: null },
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 0.5, ask: 0.4, mark: 1.0 } }, // crossed book
-      { structure: 'single_leg_directional', accountClass: 'desk', quote: { bid: 1.95, ask: 2.05, mark: 0 } }, // non-positive mark
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: null },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 0.5, ask: 0.4, mark: 1.0 } }, // crossed book
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 1.95, ask: 2.05, mark: 0 } }, // non-positive mark
     ]);
     const cell = cellOf(stats, 'single_leg_directional');
     expect(cell.n).toBe(0);
@@ -412,7 +412,7 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
 
   it('emits the full sleeve grid, and a structure with no configured ceiling reads null, not compliant', () => {
     const stats = summarizeSpreadCeilingCompliance([
-      { structure: 'bull_put', accountClass: 'desk', quote: { bid: 0.2, ask: 1.8, mark: 1.0 } },
+      { structure: 'bull_put', accountClass: 'desk', entryArchetype: 'directional', quote: { bid: 0.2, ask: 1.8, mark: 1.0 } },
     ]);
     for (const sleeve of Object.keys(SLEEVE_SPREAD_CEILINGS)) {
       for (const klass of ['desk', 'fixture', 'unattributed'] as const) {
@@ -445,11 +445,163 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
     expect(spreadGateVerdict('single_leg_directional', atCeiling).admitted).toBe(true);
     const cell = cellOf(
       summarizeSpreadCeilingCompliance([
-        { structure: 'single_leg_directional', accountClass: 'desk', quote: atCeiling },
+        { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: atCeiling },
       ]),
       'single_leg_directional',
     );
     expect(cell.countAboveCeiling).toBe(0);
     expect(cell.maxSpreadPct).toBeCloseTo(0.1, 10);
+  });
+});
+
+// ── TRA-2350 — the structure key is NOT a sleeve ─────────────────────────────
+//
+// `single_leg_directional` is stamped by THREE call sites and only ONE of them
+// evaluates the ceiling:
+//
+//   signal-engine.ts:8484  directional sleeve       entryArchetype 'directional'        GATED (:8315)
+//   signal-engine.ts:9226  iv-rv mispricing         entryArchetype 'iv-rv-buy-premium'  ungated
+//   signal-engine.ts:12180 AI-Options-Ideas single  (stamps NO archetype)               ungated
+//
+// `spreadCeilingRejectReason` has exactly one call site in the tree, `:8315`.
+//
+// Keyed on structure alone, a wide fill from either ungated sleeve lands in the
+// cell that `/api/health/option-spread-cost` bills as "the independent TRA-2306
+// read #2", and that block's own docstring told the grader `countAboveCeiling > 0`
+// there is falsification of TRA-2295. That is a FALSE FAIL manufactured by the
+// instrument, against a gate that was never on the breaching row's path — and the
+// documented remedy for it is to re-open a correct ticket.
+//
+// The tests below are written as the NEGATIVE CONTROL for that: each puts a
+// ceiling-breaching row from an UNGATED sleeve into the desk cell and demands the
+// graded cohort stay clean. Remove the archetype axis and they fail.
+describe('summarizeSpreadCeilingCompliance archetype partition (TRA-2350)', () => {
+  const cellOf = (
+    stats: ReturnType<typeof summarizeSpreadCeilingCompliance>,
+    structure: string,
+    accountClass: 'desk' | 'fixture' | 'unattributed' = 'desk',
+  ) => stats.find((s) => s.structure === structure && s.accountClass === accountClass)!;
+
+  // The worst contract TRA-2295 found admitted: bid 0.01 / ask 0.59 on a 0.30
+  // mark = spreadPct 1.933, 19x the 0.10 ceiling.
+  const BREACH = { bid: 0.01, ask: 0.59, mark: 0.3 };
+  // 0.10 wide on a 2.00 mark = 5%, and bid 1.95 clears the 0.10 quotability floor.
+  const CLEAN = { bid: 1.95, ask: 2.05, mark: 2.0 };
+
+  it('an iv-rv breach under the directional structure key does NOT falsify the gated cohort', () => {
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: CLEAN },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'iv-rv-buy-premium', quote: BREACH },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+
+    // The POOLED cell still sees both — that read stays honest about what the book
+    // bought under this label, and it is deliberately NOT the verdict.
+    expect(cell.n).toBe(2);
+    expect(cell.countAboveCeiling).toBe(1);
+
+    // The VERDICT cell. This is the assertion the old instrument could not make.
+    expect(cell.gated.n).toBe(1);
+    expect(cell.gated.countAboveCeiling).toBe(0);
+    expect(cell.gated.maxSpreadPct).toBeCloseTo(0.05, 10);
+
+    // ...and the breach is still REPORTED, just not as evidence about TRA-2295.
+    // Suppressing it would trade a false FAIL for a false PASS.
+    expect(cell.ungated.n).toBe(1);
+    expect(cell.ungated.countAboveCeiling).toBe(1);
+    expect(cell.ungated.maxSpreadPct).toBeCloseTo(1.9333, 4);
+  });
+
+  it('a row that stamps NO archetype is UNGATED — absent must not default into the graded cohort', () => {
+    // `signal-engine.ts:12180` (AI-Options-Ideas) stamps no `entryArchetype`. The
+    // fail-closed direction is that an unrecognised writer is excluded from the
+    // gated cohort, not silently admitted to it.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: null, quote: BREACH },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.ungated.countAboveCeiling).toBe(1);
+    // n:0, not 0-breaches — "nothing to check" and "checked, nothing over" stay
+    // distinct at the cohort level too.
+    expect(cell.gated.n).toBe(0);
+    expect(cell.gated.countAboveCeiling).toBeNull();
+    expect(cell.byArchetype.find((a) => a.entryArchetype === 'unspecified')?.gated).toBe(false);
+  });
+
+  it('a REAL breach by the gated sleeve still falsifies — the partition must keep a failing state', () => {
+    // The other half of the negative control. A partition that can only ever read
+    // clean is worth nothing; this is the state that must still FAIL.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: BREACH },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.gated.n).toBe(1);
+    expect(cell.gated.countAboveCeiling).toBe(1);
+    expect(cell.gated.maxSpreadPct).toBeCloseTo(1.9333, 4);
+    // The min-bid axis is a SECOND, independent falsification — bid 0.01 is an
+    // ABSENT market, which a ratio test alone cannot see.
+    expect(cell.gated.countBelowMinBid).toBe(1);
+  });
+
+  it('emits a byArchetype row for a DECLARED gated archetype that did not trade — absent reads like clean', () => {
+    const cell = cellOf(summarizeSpreadCeilingCompliance([]), 'single_leg_directional');
+    const directional = cell.byArchetype.find((a) => a.entryArchetype === 'directional');
+    expect(directional).toBeDefined();
+    expect(directional?.gated).toBe(true);
+    expect(directional?.n).toBe(0);
+    expect(directional?.countAboveCeiling).toBeNull();
+    expect(cell.gatedArchetypes).toEqual(['directional']);
+  });
+
+  it('single_leg_rv admits NOTHING to the gated cohort — its scanner filter is compile-time dead', () => {
+    // `relative-value.ts:396` sits inside the RV scanner and `RV_ENGINE_ENABLED` has
+    // been a compile-time false since TRA-1207. Nothing under this key was gated by
+    // anything, so no archetype may be graded as enforcement evidence — including
+    // the 87 pre-fix directional rows, which all carry `structure: 'single_leg_rv'`.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_rv', accountClass: 'desk', entryArchetype: 'directional', quote: BREACH },
+    ]);
+    const cell = cellOf(stats, 'single_leg_rv');
+    expect(cell.gatedArchetypes).toBe('none');
+    expect(cell.gated.n).toBe(0);
+    expect(cell.gated.countAboveCeiling).toBeNull();
+    expect(cell.ungated.countAboveCeiling).toBe(1);
+  });
+
+  it('single_leg_otm gates EVERY archetype — the filter is above archetype, in the chain scan', () => {
+    // `otm-mispricing.ts:185` runs on every chain row before a candidate exists, so
+    // the whole key is gated regardless of what stamped it. Grading OTM on `gated`
+    // must therefore agree with grading it pooled — the positive control that the
+    // partition did not quietly narrow a cohort that was already correct.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_otm', accountClass: 'desk', entryArchetype: 'otm-mispricing', quote: { bid: 0.5, ask: 0.55, mark: 0.5 } },
+      { structure: 'single_leg_otm', accountClass: 'desk', entryArchetype: null, quote: { bid: 0.5, ask: 0.55, mark: 0.5 } },
+    ]);
+    const cell = cellOf(stats, 'single_leg_otm');
+    expect(cell.gatedArchetypes).toBe('all');
+    expect(cell.gated.n).toBe(2);
+    expect(cell.gated.n).toBe(cell.n);
+    expect(cell.ungated.n).toBe(0);
+    expect(cell.gated.countAboveCeiling).toBe(0);
+  });
+
+  it('gated.n + ungated.n === n, and dropped rows partition the same way', () => {
+    // The identity a consumer can assert to catch a partition that lost rows.
+    const stats = summarizeSpreadCeilingCompliance([
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: CLEAN },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'directional', quote: null },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: 'iv-rv-buy-premium', quote: BREACH },
+      { structure: 'single_leg_directional', accountClass: 'desk', entryArchetype: null, quote: null },
+    ]);
+    const cell = cellOf(stats, 'single_leg_directional');
+    expect(cell.n).toBe(2);
+    expect(cell.gated.n + cell.ungated.n).toBe(cell.n);
+    expect(cell.rowsDroppedNoQuote).toBe(2);
+    expect(cell.gated.rowsDroppedNoQuote + cell.ungated.rowsDroppedNoQuote).toBe(
+      cell.rowsDroppedNoQuote,
+    );
+    // An unmeasurable row is never a zero-spread fill in EITHER cohort.
+    expect(cell.gated.n).toBe(1);
+    expect(cell.gated.countAboveCeiling).toBe(0);
   });
 });
