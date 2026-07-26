@@ -393,6 +393,137 @@ describe('TRA-1590 promotion gate — de-escalation saves are never blocked', ()
   });
 });
 
+// TRA-2343 — the gate fired on an AXIS flip, but graded a ROSTER, and the roster
+// can change while the axis stays latched ON. That made it bypassable in two
+// saves the gate itself approves. These tests are written as the bypass: each
+// `it` below FAILS on the pre-TRA-2343 gate (it returned allowed:true) except
+// the ones marked as TRA-1590 regressions, which must keep passing — the fix has
+// to be graded in BOTH directions or it re-creates the deadlock that exemption
+// was written for.
+describe('TRA-2343 promotion gate — the roster delta is gated, not just the axis', () => {
+  const FLAG = 'PROMOTION_GATE_ENV_AWARE';
+  const ENV_USER = 'env-aware-user'; // no promoted strategies
+
+  const demo = { mode: 'demo', cryptoAutoTradingEnabledLive: false } as AccountSettings;
+  const cryptoLiveOn = (preset: string): AccountSettings =>
+    ({
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: true,
+      activeStrategyPreset: preset,
+      liveTradierEnvOptions: 'sandbox',
+    } as AccountSettings);
+
+  it('SAVE A — arming live crypto under the EMPTY no_trade roster is REFUSED', async () => {
+    // The stepping stone. `no_trade` has enabledStrategies: [] ⇒ the pre-fix
+    // loop had nothing to iterate, blocked.length === 0, allowed:true. An empty
+    // enumeration must never sail through a fail-closed check.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, cryptoLiveOn('no_trade'), demo);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/EMPTY strategy roster/i);
+  });
+
+  it('SAVE A (unknown preset id) — the no_trade fallback is refused the same way', async () => {
+    // resolveStrategyPreset falls back to `no_trade` for an unknown id, so a
+    // typo'd/absent preset was the same empty-roster hole by another route.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, cryptoLiveOn('not_a_preset'), demo);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/EMPTY strategy roster/i);
+  });
+
+  it('SAVE A via /api/crypto/trading/start (no previous snapshot) is REFUSED too', async () => {
+    // The TRA-575 crypto-start path passes no `previous`. Pre-fix, a user whose
+    // saved preset was `no_trade` could start LIVE crypto auto-trading through
+    // that endpoint completely ungated.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, cryptoLiveOn('no_trade'));
+    expect(gate.allowed).toBe(false);
+  });
+
+  it('SAVE B — re-selecting a real preset while live crypto is already ON is GATED on the new roster', async () => {
+    // The core defect: axis on→on ⇒ `cryptoEscalates` false ⇒ the pre-fix gate
+    // never fired, and `dca` was never graded. This is live DCA across ~395
+    // Coinbase pairs with zero promotion evidence.
+    delete process.env[FLAG];
+    const previous = cryptoLiveOn('no_trade');
+    const updated = cryptoLiveOn('crypto_core');
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toContain('dca');
+  });
+
+  it('SAVE B is ALLOWED when the newly-exposed strategy IS promoted (the gate still opens)', async () => {
+    // Both directions: the fix must not degenerate into "block every roster
+    // change". USER has dca fully promoted (backtest + paper + sign-off) from
+    // the end-to-end block above, so the same save is approved.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      USER,
+      cryptoLiveOn('crypto_core'),
+      cryptoLiveOn('no_trade'),
+    );
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('TRA-1590 regression — NARROWING the roster to no_trade while live crypto stays ON is ALLOWED', async () => {
+    // A de-escalation lands on an empty roster too, but the axis is not
+    // escalating (on→on), so the empty-roster refusal must not trip: an
+    // operator standing the engine down must never be blocked.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(
+      ENV_USER,
+      cryptoLiveOn('no_trade'),
+      cryptoLiveOn('crypto_core'),
+    );
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('TRA-1590 regression — an unrelated edit that HOLDS an already-failing live roster still saves', async () => {
+    // The original deadlock: crypto live + unpromoted `dca`. Any edit that
+    // leaves the exposed roster unchanged must save, or the operator cannot
+    // move toward safety.
+    delete process.env[FLAG];
+    const previous = cryptoLiveOn('crypto_core');
+    const updated = { ...cryptoLiveOn('crypto_core'), riskPerTrade: 1 } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+  });
+
+  it('TRA-1590 regression — options production → sandbox while live crypto stays ON is ALLOWED', async () => {
+    process.env[FLAG] = '1';
+    try {
+      const previous = {
+        ...cryptoLiveOn('crypto_core'),
+        liveTradierEnvOptions: 'production',
+      } as AccountSettings;
+      const updated = cryptoLiveOn('crypto_core'); // sandbox
+      const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+      expect(gate.allowed).toBe(true);
+      expect(gate.blocked).toHaveLength(0);
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  it('the options axis is still ungated while the env-aware flag is OFF', async () => {
+    // The roster comparison must not arm the options axis behind the flag's
+    // back — with the flag off, an options → production switch stays allowed.
+    delete process.env[FLAG];
+    const previous = {
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: 'crypto_core',
+      liveTradierEnvOptions: 'sandbox',
+    } as AccountSettings;
+    const updated = { ...previous, liveTradierEnvOptions: 'production' } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+  });
+});
+
 // TRA-1461 — a hold-mode DCA accumulation clears Stage 2 with ZERO closed
 // trades, proving the old structural blocker (paper leg required closed demo
 // trades a hold-mode strategy never produces) is gone — while still requiring

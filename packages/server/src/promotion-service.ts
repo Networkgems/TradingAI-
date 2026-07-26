@@ -282,6 +282,29 @@ function realCapitalIntentAxes(s: AccountSettings): { crypto: boolean; optionsPr
   return { crypto: liveCryptoOn(s), optionsProduction: optionsProductionIntent(s) };
 }
 
+/**
+ * TRA-2343 — the strategies a settings snapshot would put on REAL CAPITAL,
+ * split by the axis that exposes them. This is the unit the gate must compare
+ * across a save; the axis boolean alone is too coarse (see
+ * {@link evaluateLiveTransitionGate}).
+ *
+ * Mirrors the axis rules exactly: a non-live mode exposes nothing, live crypto
+ * exposes the ACTIVE PRESET's roster (TRA-1916), and options-production exposes
+ * the board-named options sleeves — but only while the env-aware flag is armed,
+ * so the legacy crypto-only trigger stays behaviour-preserving with it off.
+ */
+function guardedRosterByAxis(
+  s: AccountSettings,
+  envAware: boolean,
+): { crypto: string[]; optionsProduction: string[] } {
+  const axes = realCapitalIntentAxes(s);
+  return {
+    crypto: axes.crypto ? [...resolveStrategyPreset(s.activeStrategyPreset).enabledStrategies] : [],
+    optionsProduction:
+      envAware && axes.optionsProduction ? [...OPTIONS_PRODUCTION_STRATEGIES] : [],
+  };
+}
+
 export interface LiveTransitionGateResult {
   /** True when the live transition is allowed (or irrelevant — not turning/keeping live). */
   allowed: boolean;
@@ -301,10 +324,16 @@ export interface LiveTransitionGateResult {
  * disable live or edit unrelated settings while in Demo.
  *
  * TRA-1590 — it also never blocks a de-escalation: when a `previous` snapshot is
- * supplied, only a real-capital axis the save NEWLY activates is gated. Holding
+ * supplied, only real-capital exposure the save NEWLY adds is gated. Holding
  * or reducing exposure (options production -> sandbox, or any edit that keeps an
  * already-live axis unchanged) always saves, so an operator can move toward
  * safety without first clearing a gate the current state already fails.
+ *
+ * TRA-2343 — "newly adds" is measured on the guarded STRATEGY ROSTER, not on the
+ * axis boolean. Firing only on an axis flip left the gate bypassable in two
+ * saves (arm the axis under the empty `no_trade` roster, then re-select the real
+ * preset — which is not an axis escalation). It also refuses an escalation onto
+ * an empty roster outright.
  */
 export async function evaluateLiveTransitionGate(
   username: string,
@@ -337,31 +366,93 @@ export async function evaluateLiveTransitionGate(
   // The legacy crypto-only trigger never considered the options axis; keep it
   // ungated there so the env-aware flag remains the only switch that arms it.
   const optionsEscalates = envAware && next.optionsProduction && !prev.optionsProduction;
-  const gateFires = cryptoEscalates || optionsEscalates;
-  if (!gateFires) return { allowed: true, blocked: [] };
 
-  // TRA-1916 — gate each escalating axis against ITS OWN strategy roster. The
-  // prior code always looped over the active *crypto* preset's roster, so an
+  // TRA-2343 — fire on the ROSTER DELTA, not on the axis boolean.
+  //
+  // Firing on `axisNewlyOn` alone was bypassable in two saves, each one allowed
+  // by the rules above:
+  //   A. preset `no_trade` (enabledStrategies: []) + mode live + live crypto ON.
+  //      The crypto axis escalates, so the gate fired — but onto an EMPTY
+  //      roster, the `for` loop below never ran, and it returned allowed.
+  //   B. preset `no_trade` → `crypto_core`. The axis is now on→on, so
+  //      `cryptoEscalates` is false, the gate never fired, and `dca` was never
+  //      graded. Net: live DCA across ~395 Coinbase pairs with zero promotion
+  //      evidence — the exact state TRA-532 exists to prevent.
+  // The axis is coarser than the risk it stands for: "live crypto is ON" is
+  // latched, but the roster it exposes can change afterwards, and a roster
+  // change is not an escalation of the axis.
+  //
+  // So we compare the guarded ROSTERS before/after and gate every strategy the
+  // save NEWLY exposes to real capital. This keeps the TRA-1590 de-escalation
+  // exemption intact by construction — anything already exposed under the
+  // previous snapshot is grandfathered exactly as before (that grandfathering
+  // IS the exemption), so holding or reducing exposure still never blocks,
+  // while ADDING a strategy to a live axis is graded even when no axis flips.
+  // Without a `previous` snapshot (the TRA-575 crypto-start path) the previous
+  // roster is empty ⇒ everything reads as newly-exposed, reproducing the
+  // pre-1590 fail-closed trigger verbatim.
+  //
+  // Scope: this guards the settings-write path only. The BOOT path that
+  // force-writes `mode:live` + the crypto arm from env (TRA-2336) does not
+  // route through here and is held by the TRA-2342 interlock instead — but a
+  // later preset change through the API is now graded, which is the point.
+  const nextRoster = guardedRosterByAxis(updated, envAware);
+  const prevRoster = previous
+    ? guardedRosterByAxis(previous, envAware)
+    : { crypto: [], optionsProduction: [] };
+  const alreadyExposed = new Set([...prevRoster.crypto, ...prevRoster.optionsProduction]);
+  const strategies = [...new Set([...nextRoster.crypto, ...nextRoster.optionsProduction])].filter(
+    id => !alreadyExposed.has(id),
+  );
+
+  // TRA-2343 hardening — an EMPTY enumeration must never sail through a
+  // fail-closed check. A save that newly activates a real-capital axis while
+  // its roster resolves to nothing (the `no_trade` stand-down preset, or an
+  // unknown preset id, which `resolveStrategyPreset` also falls back to
+  // `no_trade` for) is refused outright rather than silently approved. Nothing
+  // legitimate is lost: an empty roster trades nothing, so there is no reason
+  // to arm the axis for it — and arming it is precisely the stepping stone
+  // above. Scoped to an ESCALATING axis, so no de-escalation can trip it.
+  const emptyRosterAxes: Array<{ axis: string; detail: string }> = [];
+  if (cryptoEscalates && nextRoster.crypto.length === 0) {
+    emptyRosterAxes.push({
+      axis: 'live crypto auto-trading',
+      detail: `active preset '${resolveStrategyPreset(updated.activeStrategyPreset).id}' enables no strategies`,
+    });
+  }
+  if (optionsEscalates && nextRoster.optionsProduction.length === 0) {
+    emptyRosterAxes.push({
+      axis: 'options → Tradier Production',
+      detail: 'no options sleeve is named on the production roster',
+    });
+  }
+
+  const blocked: Array<{ strategyId: string; reasons: string[] }> = emptyRosterAxes.map(e => ({
+    strategyId: `(${e.axis})`,
+    reasons: [
+      `TRA-2343 — this save turns ON ${e.axis} with an EMPTY strategy roster (${e.detail}). `
+      + 'A real-capital axis is never armed against an empty roster: turn the axis on together '
+      + 'with the promoted strategies it should trade.',
+    ],
+  }));
+
+  if (strategies.length === 0 && blocked.length === 0) return { allowed: true, blocked: [] };
+
+  // TRA-1916 — each strategy is graded on ITS OWN promotion evidence. The prior
+  // code always looped over the active *crypto* preset's roster, so an
   // options → Tradier-Production switch was judged entirely against the crypto
   // `dca` strategy (every shipped preset is crypto-only). That was wrong twice:
   // it false-blocked options on a failing crypto strategy, AND it never checked
-  // any options sleeve's promotion at all. We now assemble the roster from the
-  // axes that actually escalate:
-  //   • crypto escalation  → the active crypto preset's enabledStrategies
-  //   • options production  → OPTIONS_PRODUCTION_STRATEGIES (the board named
+  // any options sleeve's promotion at all. The rosters are now assembled per
+  // axis by `guardedRosterByAxis`:
+  //   • live crypto        → the active crypto preset's enabledStrategies
+  //   • options production → OPTIONS_PRODUCTION_STRATEGIES (the board named
   //     Relative Value + OTM Mispricing on TRA-1916)
   // Fail-closed is preserved by construction: buildPromotionStatus →
   // evaluatePromotion returns canGoLive:false for any sleeve without a full
   // backtest+paper+signoff record, so an unpromoted options sleeve BLOCKS
   // (honoring the TRA-1897 HOLD) and the gate only opens once a named options
   // sleeve actually clears its net-of-fee promotion evidence.
-  const preset = resolveStrategyPreset(updated.activeStrategyPreset);
-  const rosterStrategies: string[] = [];
-  if (cryptoEscalates) rosterStrategies.push(...preset.enabledStrategies);
-  if (optionsEscalates) rosterStrategies.push(...OPTIONS_PRODUCTION_STRATEGIES);
-  const strategies = [...new Set(rosterStrategies)];
-  const blocked: Array<{ strategyId: string; reasons: string[] }> = [];
-
   for (const strategyId of strategies) {
     const status = await buildPromotionStatus(username, strategyId);
     if (!status.canGoLive) blocked.push({ strategyId, reasons: status.blockedReasons });
@@ -371,8 +462,13 @@ export async function evaluateLiveTransitionGate(
     log.warn('TRA-532 promotion gate blocked live transition', {
       username,
       escalatingAxes: { crypto: cryptoEscalates, optionsProduction: optionsEscalates },
-      preset: preset.id,
-      roster: strategies,
+      preset: resolveStrategyPreset(updated.activeStrategyPreset).id,
+      previousPreset: previous ? resolveStrategyPreset(previous.activeStrategyPreset).id : null,
+      // TRA-2343 — the newly-exposed set, not the whole roster: what the save
+      // ADDS to real capital is what was graded.
+      newlyExposed: strategies,
+      alreadyExposed: [...alreadyExposed],
+      emptyRosterAxes: emptyRosterAxes.map(e => e.axis),
       blocked: blocked.map(b => b.strategyId),
     });
     return { allowed: false, blocked };
