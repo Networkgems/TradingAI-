@@ -228,6 +228,53 @@ matching an equally stale live build would otherwise *manufacture* a CURRENT ver
 of N means the window you just measured ran on the previous build, and the result will
 look completely ordinary.
 
+#### The board alarm (TRA-2364) — `blocked` issues with an EMPTY `blockedBy`
+
+An issue at `status: blocked` whose `blockedBy` is `[]` carries no edge anything can
+resolve, so the board auto-flips it back to `in_progress`. The hold silently expires
+and the work resumes unattended.
+
+We cannot fix the cause: Paperclip's **terminal-run recovery** writes `status: blocked`
+onto whatever is `in_progress` when a run dies on `acpx_turn_failed` ("You've hit your
+session limit"), and **that write sets no blocker array**. It fired 2026-07-25T20:3xZ
+and 2026-07-26T02:0xZ (TRA-2360 / TRA-2362) and it will fire again. So this is the
+instrument, not the fix:
+
+```bash
+pnpm check:blocked-empty
+#   CLEAN                 (exit 0)  nothing in the shape — scoped to this instant only
+#   FINDINGS              (exit 1)  every hit has a roster assignee to route to
+#   FINDINGS_UNREPAIRABLE (exit 2)  a hit no agent can repair — needs a human/board write
+#   BLIND                 (exit 3)  the enumeration is untrustworthy — NOT a pass
+pnpm check:blocked-empty:controls   # 8 controls, both directions; run before trusting a green
+```
+
+Three things make it more than a one-liner, and each is a silent read it refuses:
+
+- **`GET /api/companies/{c}/issues` caps at 1000 rows and `offset` DOES paginate.** The
+  company has ~2370 issues, so one call reports 46 blocked where the full set is 82 — a
+  one-page sweep misses ~44% of the population and reports health on the half it never
+  read. ⛔ Do not probe paging by checking that page 2 is non-empty: an **ignored**
+  `offset` returns a full page too. The script asserts the de-duped union *grew*.
+- **The issue-LIST route carries no `blockedBy` key at all**, so a list-route sweep reads
+  "0 blockers" on every issue in the company. Every hit is re-read through
+  `GET /api/issues/{id}`, and the script asserts the key is *present* — `(x.blockedBy ||
+  []).length === 0` cannot tell "no blockers" from "wrong route".
+- **`blockerAttention` is never allowed to suppress a finding.** That rollup counts open
+  *children*, which the anchor does not, so it reads `covered` over an empty
+  `blockedBy` (measured on TRA-2331). Grade the shape, not the rollup.
+
+It only ever **routes**. Board repair is assignee-scoped — the CFO holds the top role
+and still got `403 "Issue is outside this actor's authorization boundary"` on a plain
+`{"status":…}` PATCH of two issues that were not theirs, and the 403 covers the comment
+route too. An issue whose assignee is off-roster or absent is unrepairable by *every*
+agent and is reported as its own severity class.
+
+⛔ When repairing a hit, do **not** anchor a child onto its own parent to satisfy
+"blocked needs a blocker" — that is a 2-cycle neither side can break. `todo` is the
+correct disposition for a parked-ready leaf; it still counts as an unresolved blocker
+upstream, so parking costs the parent nothing.
+
 ### RTH deploy FREEZE (TRA-1996) — bqb1 deploys are REFUSED 13:25–20:00Z Mon–Fri
 
 The "deploy by SHA" rule above bounds *what* ships; this rule bounds *when*. Even a

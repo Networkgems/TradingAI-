@@ -19,6 +19,8 @@
     "check:push-auth": "node scripts/check-git-push-auth.mjs",
     "check:deploy-drift": "node scripts/check-deploy-drift.mjs",
     "check:restarts": "node scripts/check-restarts.mjs",
+    "check:blocked-empty": "node scripts/check-blocked-empty.mjs",
+    "check:blocked-empty:controls": "node scripts/check-blocked-empty.mjs --selftest",
     "check:tra2361-prover": "node scripts/tra2372-monotonicity-prover-controls.mjs",
     "check:boot-set": "node --test scripts/lib/render-boot-set.test.mjs",
     "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
