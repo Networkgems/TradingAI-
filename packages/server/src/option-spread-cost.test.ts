@@ -115,7 +115,13 @@ describe('summarizeSpreadCost', () => {
     expect(rv!.medianSpreadCrossR).toBeCloseTo(0.24, 10);
     expect(rv!.avgSpreadCrossUsd).toBeCloseTo(0.12, 10);
     expect(rv!.avgEntryMarkUsd).toBeCloseTo(2.0, 10);
-    expect(rv!.maxSpreadCrossR).toBe(0.4);
+    // TRA-2382 — this line used to read `expect(rv!.maxSpreadCrossR).toBe(0.4)`, on a
+    // fixture whose true max is 0.32. The suite did not merely miss the defect, it
+    // DEMANDED it: 0.4 is the configured ceiling, and no sample here is anywhere near
+    // it. The constant now says it is one, and the max is measured off the samples.
+    expect(rv!.ceilingSpreadCrossR).toBe(0.4);
+    expect(rv!.observedMaxSpreadCrossR).toBeCloseTo(0.32, 10);
+    expect(rv!.observedMaxSpreadPct).toBeCloseTo(0.08, 10);
   });
 
   it('re-derives the implied bar from the MEASURED cross, well below the shipped 1.25R', () => {
@@ -152,8 +158,15 @@ describe('summarizeSpreadCost', () => {
     ]);
     expect(out.map((s) => s.structure)).toEqual(['directional', 'single_leg_otm', 'single_leg_rv']);
     expect(out.every((s) => s.n === 1)).toBe(true);
-    // `directional` has no scanner ceiling defined — reported as null, not faked.
-    expect(out.find((s) => s.structure === 'directional')!.maxSpreadCrossR).toBeNull();
+    const dir = out.find((s) => s.structure === 'directional')!;
+    // `directional` has no scanner ceiling defined — the CONSTANT is null, not faked.
+    expect(dir.ceilingSpreadCrossR).toBeNull();
+    // TRA-2382 — but the MEASUREMENT is not. Under the old single field this row
+    // published `max: null` while holding a real sample (4.9/5.1 on a 5.0 mark =>
+    // spreadPct 0.04 => 0.16R): defensible for "no ceiling defined", a false zero for
+    // anything named max. The observed max is unconditional whenever n > 0.
+    expect(dir.observedMaxSpreadCrossR).toBeCloseTo(0.16, 10);
+    expect(out.every((s) => s.observedMaxSpreadCrossR !== null)).toBe(true);
   });
 
   it('returns an empty rollup (not a zeroed one) when nothing is measurable', () => {
@@ -164,6 +177,72 @@ describe('summarizeSpreadCost', () => {
   it('omits avgCommissionR when no row carries a contract count', () => {
     const [rv] = summarizeSpreadCost([{ structure: 'single_leg_rv', quote: q(1.94, 2.06, 2.0) }]);
     expect(rv!.avgCommissionR).toBeNull();
+  });
+
+  // ── TRA-2382 — the max must be a MEASUREMENT ──────────────────────────────
+  //
+  // The rollup published `maxSpreadCrossR`, looked up from SLEEVE_SPREAD_CEILINGS and
+  // echoed, sitting between four fields that ARE measured. Live `408f06a5` therefore
+  // served `single_leg_rv` with max 0.400 and p90 3.1515 — a max 7.9× below its own
+  // p90, impossible for any real sample set. These two tests are what would have
+  // caught it: an ORDERING INVARIANT that today's live data violates, and a MUTATION
+  // check whose fixture straddles the ceiling so the constant and the measurement
+  // give different answers. The old fixture could not distinguish them: its true max
+  // (0.32) sat on the same side of the 0.40 ceiling as every other sample.
+
+  it('holds observedMax >= p90 >= median for EVERY structure (the invariant live data broke)', () => {
+    const out = summarizeSpreadCost([
+      // single_leg_rv, deliberately fat-tailed: 4%, 6%, 8%, and one 60% blowout.
+      { structure: 'single_leg_rv', quote: q(1.96, 2.04, 2.0) },
+      { structure: 'single_leg_rv', quote: q(1.94, 2.06, 2.0) },
+      { structure: 'single_leg_rv', quote: q(1.92, 2.08, 2.0) },
+      { structure: 'single_leg_rv', quote: q(0.01, 0.59, 0.3) },
+      { structure: 'single_leg_otm', quote: q(0.9, 1.1, 1.0) },
+      { structure: 'single_leg_otm', quote: q(0.6, 1.4, 1.0) },
+      { structure: 'directional', quote: q(4.9, 5.1, 5.0) },
+    ]);
+    expect(out.length).toBe(3);
+    for (const s of out) {
+      expect(
+        s.observedMaxSpreadCrossR,
+        `${s.structure}: max ${s.observedMaxSpreadCrossR} < p90 ${s.p90SpreadCrossR} — a "max" below its own p90 is arithmetically impossible, so this field is not measured from the samples`,
+      ).toBeGreaterThanOrEqual(s.p90SpreadCrossR);
+      expect(s.p90SpreadCrossR).toBeGreaterThanOrEqual(s.medianSpreadCrossR);
+      // …and it is the R/pct identity all the way through, not an independent number.
+      expect(s.observedMaxSpreadPct).toBeCloseTo(
+        s.observedMaxSpreadCrossR * STOP_DISTANCE_FRACTION_OF_MARK,
+        10,
+      );
+    }
+    // The RV row is the shape live serves: a tail far ABOVE the 0.4 ceiling. Under
+    // the old field this row published 0.4 and hid the 7.73R contract entirely.
+    const rv = out.find((s) => s.structure === 'single_leg_rv')!;
+    expect(rv.observedMaxSpreadCrossR).toBeCloseTo(4 * (0.58 / 0.3), 10); // ≈ 7.733R
+    expect(rv.observedMaxSpreadCrossR).toBeGreaterThan(rv.ceilingSpreadCrossR!);
+  });
+
+  it('reports a sample max ABOVE the sleeve ceiling as the max (mutation check)', () => {
+    // One RV fill at spreadPct 0.15 => crossR 0.60, against the 0.40 ceiling. If the
+    // field is still the constant it answers 0.40; only a measurement answers 0.60.
+    // This is the assertion that fails if the emit site is reverted to `ceiling`.
+    const [rv] = summarizeSpreadCost([{ structure: 'single_leg_rv', quote: q(0.925, 1.075, 1.0) }]);
+    expect(rv!.observedMaxSpreadCrossR).toBeCloseTo(0.6, 10);
+    expect(rv!.observedMaxSpreadPct).toBeCloseTo(0.15, 10);
+    expect(rv!.ceilingSpreadCrossR).toBe(0.4);
+    // The two must not be the same number, or this fixture proves nothing.
+    expect(rv!.observedMaxSpreadCrossR).not.toBe(rv!.ceilingSpreadCrossR);
+  });
+
+  it('DELETES the old maxSpreadCrossR key from the rollup (free deploy detector)', () => {
+    // Keeping both would make the fixed payload differ from the broken one only by an
+    // ADDITION — every stale reader keeps getting 0.4 under a name it already trusts,
+    // and no reader can prove from the payload which build answered. Absence of the
+    // old key is the evidence (same reasoning as TRA-2333).
+    const [rv] = summarizeSpreadCost([{ structure: 'single_leg_rv', quote: q(1.94, 2.06, 2.0) }]);
+    expect(Object.keys(rv!)).not.toContain('maxSpreadCrossR');
+    expect(rv as unknown as Record<string, unknown>).not.toHaveProperty('maxSpreadCrossR');
+    // The ceilings TABLE keeps the name — that one really is a ceiling.
+    expect(SLEEVE_SPREAD_CEILINGS['single_leg_rv']!.maxSpreadCrossR).toBe(0.4);
   });
 });
 

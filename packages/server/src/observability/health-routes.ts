@@ -2418,12 +2418,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
 
       // (1b) TRA-2316 — THE INDEPENDENT CEILING-COMPLIANCE READ (TRA-2306 read #2).
       //
-      // `byStructure` above publishes avg/median/p90 over a POOLED set. Neither half
-      // of that can answer "0 rows above the ceiling": `p90 <= ceiling` is perfectly
-      // consistent with 10% of rows above it, and the pool carries the `qa_*` /
-      // `ctoverify*` fixture mirror that inflates `n` and drags the distribution
-      // (TRA-2100). This block fixes both — a TRUE MAX and a strict breach COUNT,
-      // partitioned on `account`.
+      // `byStructure` above publishes avg/median/p90 over a POOLED set, and until
+      // TRA-2382 nothing there was a max at all (`maxSpreadCrossR` was the CONFIGURED
+      // ceiling echoed under a measured-sounding name — 0.400 next to a p90 of 3.15).
+      // Even with the real `observedMaxSpreadCrossR` TRA-2382 added, that rollup still
+      // cannot answer "0 rows above the ceiling": it carries the `qa_*` / `ctoverify*`
+      // fixture mirror that inflates `n` and drags the distribution (TRA-2100), it
+      // pools gated and ungated archetypes (TRA-2350), and a max alone is not a breach
+      // COUNT. This block is the one to grade — a true max AND a strict breach count,
+      // partitioned on `account` and on whether the row's entry path ran the gate.
       //
       // Independence is the point. `/api/health/cost-aware-gate` →
       // `maxAdmittedSpreadPct` is the only other true max in the system, and it is

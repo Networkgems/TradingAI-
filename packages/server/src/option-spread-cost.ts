@@ -445,8 +445,43 @@ export interface StructureSpreadCost {
   avgEntryMarkUsd: number;
   /** Measured round-trip commission in R — checks the gate's 0.05R input. */
   avgCommissionR: number | null;
-  /** The scanner-enforced ceiling, when the structure has one. */
-  maxSpreadCrossR: number | null;
+  /**
+   * TRA-2382 — the CONFIGURED bound from {@link SLEEVE_SPREAD_CEILINGS}, echoed. **Not
+   * an observation.** `null` when the structure has no entry in that table.
+   *
+   * It was called `maxSpreadCrossR` until TRA-2382 and it sat unmarked between four
+   * genuine measurements, so every reader took it for the sample max: live build
+   * `408f06a5` published `maxSpreadCrossR: 0.400` next to `p90SpreadCrossR: 3.1515`
+   * on `single_leg_rv` — a "max" 7.9× BELOW its own p90, arithmetically impossible
+   * and therefore self-falsifying on its face, for four builds. The name now says
+   * which of the two it is; {@link observedMaxSpreadCrossR} is the measurement.
+   *
+   * The old key is DELETED rather than kept alongside, so the pair (old absent / new
+   * present) is a free deploy detector — a reader can tell from the payload alone
+   * which build answered, instead of a stale reader quietly keeping 0.4 under a name
+   * it already trusts (same reasoning as TRA-2333).
+   */
+  ceilingSpreadCrossR: number | null;
+  /**
+   * TRA-2382 — the TRUE max of `spreadCrossR` over these `n` samples. Measured, from
+   * the same array that feeds `medianSpreadCrossR` / `p90SpreadCrossR`, so
+   * `observedMaxSpreadCrossR >= p90SpreadCrossR >= medianSpreadCrossR` holds by
+   * construction and is asserted in the suite. Always a number: a structure only
+   * appears in this rollup once at least one row measured, so `n >= 1` and there is
+   * never a state where this has to be null. (Under the old name a structure with
+   * real samples but no ceiling entry — `directional` — published `null` beside a
+   * populated median. Defensible for a constant; a false zero for a measurement.)
+   *
+   * ⚠ NOT the ceiling-compliance verdict. This rollup POOLS every account class
+   * (`qa_*`/`ctoverify*` fixture mirrors included — TRA-2100) and every entry
+   * archetype, gated or not (TRA-2350). For "did the TRA-2295 ceiling hold", read
+   * `ceilingCompliance.byAccountClass.desk[…].gated.maxSpreadPct` on
+   * `/api/health/option-spread-cost` — the partitioned fold below. This field
+   * answers only "what is the widest thing anything bought under this label".
+   */
+  observedMaxSpreadCrossR: number;
+  /** TRA-2382 — the same observed max in `(ask − bid) / mark`, i.e. `observedMaxSpreadCrossR · 0.25`. */
+  observedMaxSpreadPct: number;
   /**
    * Re-derived admission bar for this structure from the MEASURED cross:
    * `avgCommissionR + avgSpreadCrossR + safetyMargin`. Derived from the
@@ -514,6 +549,11 @@ export function summarizeSpreadCost(
     const avgSpreadCrossR = mean(crossR);
     const avgCommissionR = commissions.length > 0 ? mean(commissions) : null;
     const ceiling = SLEEVE_SPREAD_CEILINGS[structure]?.maxSpreadCrossR ?? null;
+    // TRA-2382 — the OBSERVED max, off the tail of the already-sorted sample array
+    // that median and p90 are read from. Same rows, same sort, so the
+    // max >= p90 >= median invariant cannot be broken by a divergent source. A
+    // bucket exists only because a row measured, so `crossR` is never empty here.
+    const observedMaxSpreadCrossR = crossR[crossR.length - 1] as number;
 
     out.push({
       structure,
@@ -525,7 +565,9 @@ export function summarizeSpreadCost(
       avgSpreadCrossUsd: mean(rows.map((r) => r.m.spreadCrossUsdPerShare)),
       avgEntryMarkUsd: mean(rows.map((r) => r.m.entryMarkUsd)),
       avgCommissionR,
-      maxSpreadCrossR: ceiling,
+      ceilingSpreadCrossR: ceiling,
+      observedMaxSpreadCrossR,
+      observedMaxSpreadPct: observedMaxSpreadCrossR * STOP_DISTANCE_FRACTION_OF_MARK,
       impliedBarR: (avgCommissionR ?? 0.05) + avgSpreadCrossR + safetyMarginR,
     });
   }
@@ -550,7 +592,10 @@ export function summarizeSpreadCost(
 //   • `/api/health/option-spread-cost` has the quotes but pooled `qa_*`/`ctoverify*`
 //     fixture books in with desk rows (the TRA-2100 mirror trap), and published only
 //     avg/median/p90 — and `p90 <= ceiling` is consistent with 10% of rows ABOVE it,
-//     so it structurally could not answer "0 rows above".
+//     so it structurally could not answer "0 rows above". (TRA-2382 has since added a
+//     real `observedMaxSpreadCrossR` to that rollup, which closes the p90 half of this
+//     — but NOT the pooling half: it still mixes fixture books and ungated archetypes
+//     in, so it is still not the compliance read. This fold is.)
 //
 // This fold is the missing read: a TRUE MAX and a strict count of breaches, per
 // structure, PARTITIONED BY ACCOUNT CLASS, computed from the journal's own
