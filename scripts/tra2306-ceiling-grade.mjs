@@ -78,7 +78,46 @@ function tra2355IsLive(liveSha) {
 
 // ── READ 1: /api/health/cost-aware-gate ──────────────────────────────────────
 export function read1(cag) {
-  const out = { armed: cag?.spreadCeiling?.armed, evaluated: null, maxAdmitted: undefined, present: false, instrumentChanged: false, accountAxis: false, notes: [] };
+  const out = { armed: cag?.spreadCeiling?.armed, evaluated: null, maxAdmitted: undefined, present: false, instrumentChanged: false, accountAxis: false, publishedKey: null, keyDiverged: false, keyUnverified: false, notes: [] };
+
+  // ── THE GRADER'S OWN COPY OF THE STRUCTURE KEY (TRA-2345, wired in 2026-07-26) ──
+  // `STRUCT` above is a THIRD copy of `DIRECTIONAL_STRUCTURE_LABEL`. TRA-2345 (`005980d`)
+  // de-duplicated the server's two copies — the recorder's key and the payload's doc field now
+  // interpolate ONE exported constant — but it could not reach this file, which is out-of-process
+  // and greps the key over HTTP. So the divergence TRA-2345 closed is still OPEN here, just
+  // relocated to the grader: rename the constant and the server stays perfectly coherent while
+  // THIS script looks up a key nobody writes, finds no row, and reports `absent -> VOID / the gate
+  // did not run` — a MISATTRIBUTED VOID that reads exactly like a quiet session. It cannot
+  // manufacture a false PASS, but a silently wrong VOID on the one session this ticket exists to
+  // grade costs a week.
+  //
+  // The fix is to ASSERT against the payload's now-authoritative key, not to ADOPT it: adopting
+  // would let a corrupt field silently redirect the grade onto the wrong row, and would decouple
+  // this read from READ 2/READ 3 and the pinned controls, which all key off `STRUCT` too. Pin the
+  // constant, detect the divergence. Same discipline as the build detector above.
+  //
+  // ⚠ EXACT TOKEN, never `startsWith`. The field is `<key> — <prose>`, so `startsWith(STRUCT)`
+  // returns TRUE for a SUFFIX rename (`single_leg_directional_v2`) — the detector would read
+  // identically in the matched and diverged state, which is this ticket's own defect family
+  // turned on its checker. Split on whitespace and compare the first token.
+  //
+  // Negative control: measured live 2026-07-26 06:31Z at SHA 408f06a5 (PRE-TRA-2345, i.e. the
+  // hardcoded literal), the field is PRESENT and its first token is exactly `single_leg_directional`.
+  // It reads the same after 005980d deploys, because that commit changed the plumbing and not the
+  // value — so this check is compatible with both builds and cannot fire spuriously on the deploy.
+  const published = cag?.spreadCeilingStructureKeys?.demo_directional;
+  if (typeof published !== 'string') {
+    // A doc field, so its ABSENCE is not itself proof the key moved — but it does mean the
+    // cross-check did not run. Suppress the PASS direction only; never invent a VOID or a FAIL.
+    out.keyUnverified = true;
+    out.notes.push(`spreadCeilingStructureKeys.demo_directional ABSENT — cannot cross-check the graded key \`${STRUCT}\` against the key the recorder writes under (TRA-2345). Suppresses the PASS direction only.`);
+  } else {
+    out.publishedKey = published.trim().split(/\s/)[0];
+    if (out.publishedKey !== STRUCT) {
+      out.keyDiverged = true;
+      out.notes.push(`STRUCTURE KEY DIVERGED — the payload names \`${out.publishedKey}\` as the directional ceiling row, this grade reads \`${STRUCT}\`. The recorder writes under the payload's key (TRA-2345), so every READ here is looking at a row nobody fills. NOT a quiet session.`);
+    }
+  }
 
   // TRA-2355 free deploy detector, widened 2026-07-26 from the two guessed key names to the
   // PROPERTY: does READ 1 carry an account axis at all? Pinned negative control — the substring
@@ -228,6 +267,9 @@ export function grade({ r1, r2, r3, build = readBuild() }) {
   // ── STEP 2: VOID — explicitly NOT a pass.
   if (r1.armed === false) voids.push('spreadCeiling.armed === false — DISARMED, grade meaningless, re-open');
   if (r1.instrumentChanged) voids.push('the instrument was re-keyed under the grade (TRA-2355 live — account axis present in the READ 1 payload)');
+  // A diverged structure key means every read above looked up a row nobody writes. That is an
+  // instrument change, not a quiet session — and it must NOT be reported as "the gate did not run".
+  if (r1.keyDiverged) voids.push(`the graded structure key DIVERGED from the one the recorder writes under: payload says \`${r1.publishedKey}\`, this grade read \`${STRUCT}\` (TRA-2345) — re-pin STRUCT and re-run, do NOT read the absent row as a quiet session`);
   if (build.tra2355 === true) voids.push(`the instrument was re-keyed under the grade (TRA-2355 ${TRA2355_COMMIT} is an ancestor of the live build)`);
   if (!r1.present) voids.push(`retained.byStructure[${STRUCT}] absent — the gate did not run`);
   else if (r1.evaluated === 0) voids.push('spreadCeilingEvaluated == 0 — the gate did not run');
@@ -239,6 +281,7 @@ export function grade({ r1, r2, r3, build = readBuild() }) {
   const deskN = r2.desk?.n ?? 0;
   // An UNANSWERED build question is not an answered one. Stops the PASS, never a FAIL or a VOID.
   if (build.tra2355 == null) defers.push(`build identity UNKNOWN — cannot confirm TRA-2355 (${TRA2355_COMMIT}) is ABSENT from the live build`);
+  if (r1.keyUnverified) defers.push(`cannot confirm the graded key \`${STRUCT}\` is the key the recorder writes under — spreadCeilingStructureKeys.demo_directional absent (TRA-2345)`);
   if (r3.n === 0) defers.push('journal N == 0 — NOT EVIDENCE');
   if (deskN === 0) {
     defers.push(`READ 2 desk[${STRUCT}].gated.n == 0`);
@@ -250,7 +293,14 @@ export function grade({ r1, r2, r3, build = readBuild() }) {
 }
 
 // ── self-test ────────────────────────────────────────────────────────────────
-const mkCag = (o = {}) => ({ spreadCeiling: { armed: o.armed ?? true }, retained: { byStructure: o.absent ? [{ structure: 'directional' }] : [{ structure: STRUCT, spreadCeilingEvaluated: o.evaluated ?? 5, maxAdmittedSpreadPct: 'maxAdmitted' in o ? o.maxAdmitted : 0.08 }] }, ...(o.extra ?? {}) });
+// NB the mock's `demo_directional` prose deliberately contains NO `account` substring — the live
+// field carries none, and the widened TRA-2355 detector greps the whole payload for one.
+const mkCag = (o = {}) => ({
+  spreadCeiling: { armed: o.armed ?? true },
+  retained: { byStructure: o.absent ? [{ structure: 'directional' }] : [{ structure: STRUCT, spreadCeilingEvaluated: o.evaluated ?? 5, maxAdmittedSpreadPct: 'maxAdmitted' in o ? o.maxAdmitted : 0.08 }] },
+  ...(o.noKeys ? {} : { spreadCeilingStructureKeys: { demo_directional: `${o.publishedKey ?? STRUCT} — NOT the \`directional\` row (TRA-2295).`, otm: 'single_leg_otm — gated in the OTM scanner chain filter.' } }),
+  ...(o.extra ?? {}),
+});
 const mkOsc = (o = {}) => ({ ceilingCompliance: { byAccountClass: {
   desk: [{ structure: STRUCT, n: (o.deskN ?? 3) + (o.deskUngatedN ?? 0), gatedArchetypes: [ARCHETYPE], gated: { n: o.deskN ?? 3, countAboveCeiling: o.deskOver ?? 0, maxSpreadPct: o.deskMax ?? 0.09, countBelowMinBid: o.deskThin ?? 0 }, ungated: { n: o.deskUngatedN ?? 0, countAboveCeiling: o.deskUngatedOver ?? 0 } },
          { structure: 'single_leg_rv', n: 87, gatedArchetypes: 'none', gated: { n: 0, countAboveCeiling: null, maxSpreadPct: null, countBelowMinBid: null }, ungated: { ...CONTROLS.negative } },
@@ -311,6 +361,30 @@ function selfTest() {
       const out = gr(mkCag({ extra: { accountClass: 'desk' } }), mkOsc(), mkJ([jrow()]));
       return out.report.some(m => m.startsWith('BASIS: READ 1 carries NO account axis')) ? 'LEAKED' : 'yes';
     }],
+
+    // ── the STRUCTURE-KEY axis (added 2026-07-26, TRA-2345) ─────────────────
+    // This script holds a THIRD copy of `DIRECTIONAL_STRUCTURE_LABEL`. TRA-2345 could not reach
+    // it, so the divergence it closed server-side is closed HERE by assertion instead.
+    ['structure key RENAMED under the grade -> VOID, not a quiet session',
+      'VOID', () => g(mkCag({ publishedKey: 'demo_directional_v2' }), mkOsc(), mkJ([jrow(), jrow(), jrow()]))],
+    // The whole reason the check parses a token instead of calling startsWith(): a SUFFIX rename
+    // satisfies startsWith(STRUCT) and would read IDENTICALLY to a matching key.
+    ['a SUFFIX rename is still caught (startsWith would read it as a match)',
+      'VOID', () => g(mkCag({ publishedKey: `${STRUCT}_v2` }), mkOsc(), mkJ([jrow(), jrow(), jrow()]))],
+    ['key divergence does NOT suppress a breach',
+      'FAIL', () => g(mkCag({ publishedKey: `${STRUCT}_v2`, maxAdmitted: 0.4 }), mkOsc(), mkJ([jrow()]))],
+    // Absence is a doc field going missing, NOT proof the key moved: PASS direction only.
+    ['published key ABSENT suppresses a PASS -> NOT_GRADED_YET',
+      'NOT_GRADED_YET', () => g(mkCag({ noKeys: true }), mkOsc(), mkJ([jrow(), jrow(), jrow()]))],
+    ['published key ABSENT does NOT suppress a FAIL',
+      'FAIL', () => g(mkCag({ noKeys: true, maxAdmitted: 0.4 }), mkOsc(), mkJ([jrow()]))],
+    ['published key ABSENT does NOT suppress a VOID',
+      'VOID', () => g(mkCag({ noKeys: true, armed: false }), mkOsc(), mkJ([jrow()]))],
+    // The live field is `<key> — <prose>`, so the parse must survive the trailing sentence.
+    ['the live-shaped `<key> — <prose>` value parses as a MATCH (no spurious VOID)', 'yes', () => {
+      const out = gr(mkCag({ extra: { spreadCeilingStructureKeys: { demo_directional: `${STRUCT} — NOT the \`directional\` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).` } } }), mkOsc(), mkJ([jrow(), jrow(), jrow()]));
+      return out.verdict === 'PASS' && !out.voids.length ? 'yes' : `${out.verdict}:${out.voids.join('|')}`;
+    }],
   ];
   let bad = 0;
   for (const [name, want, fn] of cases) {
@@ -356,6 +430,7 @@ try {
   const build = readBuild({ liveSha, isAncestor: tra2355IsLive(liveSha) });
   const r1 = read1(cag), r2 = read2(osc), r3 = read3(journal, sinceTs);
   console.log(`BUILD   liveSha=${build.liveSha ?? 'n/a'} TRA-2355(${TRA2355_COMMIT})=${build.tra2355 === null ? 'UNKNOWN' : build.tra2355 ? 'LIVE' : 'absent'} · READ 1 accountAxis=${r1.accountAxis ? 'PRESENT' : 'absent'}`);
+  console.log(`KEY     grading \`${STRUCT}\` · payload publishes \`${r1.publishedKey ?? '(field absent)'}\` -> ${r1.keyDiverged ? 'DIVERGED' : r1.keyUnverified ? 'UNVERIFIED' : 'MATCH'} (TRA-2345)`);
   console.log(`READ 1  armed=${r1.armed} present=${r1.present} evaluated=${r1.evaluated} maxAdmitted=${r1.maxAdmitted === null ? 'null' : r1.maxAdmitted}`);
   console.log(`READ 2  desk.gated n=${r2.desk?.n ?? 0} over=${r2.desk?.countAboveCeiling} max=${r2.desk?.maxSpreadPct} thin=${r2.desk?.countBelowMinBid} · fixture.gated n=${r2.fixture?.n ?? 0} · controls=${r2.controls}`);
   console.log(`READ 3  desk N=${r3.n} over=${r3.over} thinBid=${r3.thinBid} worst=${r3.worst} noQuote=${r3.noQuote}`);
