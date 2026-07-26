@@ -323,6 +323,33 @@ export const DEMO_FLAGS_FILENAME = 'demo-flags.json';
  * STRICT admission for an entry: (1) board-ratified `=1` in render.yaml, (2)
  * demo-only / structurally incapable of touching live capital, (3) pure
  * risk-reducing. Remove an entry the moment the board de-ratifies the flag.
+ *
+ * ⚠️ TRA-2402 — A KEY THIS MAP ACTUALLY SEEDS IS, BY CONSTRUCTION, ABSENT FROM THE
+ * RENDER ENV-VAR STORE, AND THAT IS THE PERMANENT, CORRECT STATE. The seed writes
+ * `process.env` at boot; it does not (and must not) write the store. Note the
+ * direction: absence from the store is the very CONDITION the seed fires on, so for
+ * a seeded key it can never be evidence of anything. The inference
+ *
+ *     declared as a literal in render.yaml + absent from `GET /v1/services/…/env-vars`
+ *       ⇒ the flag is DARK
+ *
+ * is therefore INVALID for these keys — and it is the one diff a careful reader
+ * naturally runs. TRA-2402 ran exactly it and got 9 of these 11 back as "declared but
+ * absent live", which reads identically to a genuine env wipe (TRA-2136/TRA-2193). It
+ * put `ENABLE_OPTION_COST_AWARE_GATE` in doubt, which TRA-2389's no-op verdict rests
+ * on; the gate was armed and biting the whole time (5,678 rejections over the 5
+ * retained days at the live 0.485R bar ⇒ an implied |Δ| floor of 0.495).
+ *
+ * The other 2 (`ENABLE_OPTION_DIRECTIONAL_QUALITY_GATE`,
+ * `ENABLE_NEWS_CATALYST_WATCHLIST`) were present in the store on that build, so the
+ * seed correctly skipped them and they are absent from `selfHealed[]`. Which entries
+ * fall in which group is OPERATOR STATE, not a property of this map — it changes the
+ * moment someone sets or clears a dashboard key. Do not hard-code the split.
+ *
+ * THE AUTHORITATIVE LIVE READ IS `GET /api/health/env-drift` → `selfHealed[]`, which
+ * reports each key with `matchesDeclared` against the SAME comparator the drift
+ * buckets use (TRA-2209/TRA-2224). It exists because a seeded key is byte-identical
+ * to a store-supplied one once applied. Do not re-derive from the env-var list.
  */
 export const RENDER_RATIFIED_DEMO_DEFAULTS: Readonly<Record<string, string>> = {
   // TRA-1408 / TRA-1481 — per-name churn + same-day-loss brake. render.yaml `=1`

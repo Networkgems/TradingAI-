@@ -651,6 +651,15 @@ const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
 // ON RENDER ONLY, and only when it's set by NEITHER process.env NOR demo-flags.json,
 // so a board disarm via `/api/admin/demo-flags` (the file layers OVER env) still
 // wins and the self-host is untouched. DEMO-only ⇒ zero real-capital risk.
+//
+// SCOPE: this loop is generic over ALL 11 entries of RENDER_RATIFIED_DEMO_DEFAULTS,
+// not just the churn brake. The brake is only the worked example above (it is the
+// flag that exposed the TRA-1289 gap), and the log line below names whichever key is
+// actually being seeded. How many get applied varies per boot: the resolver returns
+// only the entries unset in BOTH env and demo-flags.json, which is the whole point.
+// TRA-2402 read this block as churn-brake-only and filed
+// `ENABLE_OPTION_COST_AWARE_GATE` as unseeded/dark on that basis; it is in the map
+// (demo-flags.ts) and was armed. Read the map, not this comment's example.
 for (const [key, value] of Object.entries(renderRatifiedDemoDefaults(DATA_DIR))) {
   process.env[key] = value;
   // TRA-2209 — record the seed BEFORE it becomes indistinguishable from a
