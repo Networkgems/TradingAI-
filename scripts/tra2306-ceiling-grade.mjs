@@ -394,6 +394,27 @@ function selfTest() {
     console.log(`${ok ? 'ok  ' : 'FAIL'} ${String(got).padEnd(15)} (want ${String(want).padEnd(15)}) ${name}`);
   }
   console.log(`\n${cases.length - bad}/${cases.length} passed`);
+
+  // The case COUNT is pinned in prose in two places that this file cannot edit: the TRA-2306
+  // issue description and routine `0bb90f24` (the copy that FIRES). Both said `16/16` while this
+  // suite stood at 30 — and the routine's own rule is "if the checker and this routine DISAGREE,
+  // THAT DISAGREEMENT IS THE FINDING". So a grader who dutifully runs --self-test on Monday reads
+  // a number that does not match its pin and burns the grade window publishing a non-finding.
+  //
+  // Fix the direction, not the number. GROWTH is expected and is never a finding; a DECREASE means
+  // branches were deleted, and that is the one direction worth failing on. Assert the floor here so
+  // the guarantee lives in the code instead of in two prose copies that drift independently.
+  const FLOOR = 30; // raise only when adding cases; never lower to make a red suite green
+  if (cases.length < FLOOR) {
+    console.log(
+      `\nSELF-TEST FLOOR BREACHED: ${cases.length} cases < floor ${FLOOR} — branches were REMOVED. ` +
+      `A shrunken suite still prints "N/N passed" and reads exactly like a healthy one.`);
+    return 1;
+  }
+  console.log(
+    `case count ${cases.length} (floor ${FLOOR}) — the count is EXPECTED TO GROW. A number above ` +
+    `the floor is NOT an instrument change and NOT a checker/routine disagreement; only a ` +
+    `non-zero exit or a count BELOW the floor is a finding.`);
   return bad === 0 ? 0 : 1;
 }
 
