@@ -172,8 +172,29 @@ services:
         sync: false
       - key: SMTP_PASS
         sync: false
+      # TRA-2281 — `sync: false`, NOT a literal. This used to read
+      # `value: noreply@tradingai.app`, which a blueprint sync would have written
+      # straight over the live value (`TradingAI <networkgemstore@gmail.com>`,
+      # provisioned for TRA-2253). A literal `value:` is authoritative on every
+      # sync; `sync: false` means the dashboard owns the key.
+      #
+      # The revert would have been SILENT: Gmail does not reject a `From` it does
+      # not own, it REWRITES it to the authenticated account. A probe sent as
+      # `From: TradingAI <noreply@tradingai.app>` was delivered with
+      # `From: TradingAI <networkgemstore@gmail.com>`. So post-revert, mail keeps
+      # being delivered and `/api/health/alerting` still reads green — the only
+      # symptom is that config says one address and recipients see another. There
+      # is no failing state to trip on. Keep this key dashboard-owned.
+      #
+      # `ALERT_EMAIL` — the other key TRA-2281 opened against — needed NO change:
+      # it is ALREADY declared `sync: false`, far below in the observability block
+      # next to `ALERT_WEBHOOK_URL` (grep `- key: ALERT_EMAIL`; no line number here
+      # on purpose — the last five citations in this repo all drifted). This
+      # blueprint declares exactly ONE service, so that distant declaration is in
+      # the SAME `envVars` list as this one and does apply to tradingai-bqb1.
+      # The ticket's "undeclared" claim was simply wrong.
       - key: SMTP_FROM
-        value: noreply@tradingai.app
+        sync: false
       # Crypto quote fallback — when set, CoinMarketCap serves quotes whenever the
       # Yahoo Finance crypto path is rate-limited or returns no data.
       - key: CMC_API_KEY
