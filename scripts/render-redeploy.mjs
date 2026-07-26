@@ -259,6 +259,49 @@ export function commitHoldState(now, target, table = COMMIT_HOLDS) {
   return { verdict: 'CLEAR', hold: null, active, target, why: null };
 }
 
+// ── The env-write escape hatch underneath Gate 0 (TRA-2306) ───────────────────
+// Gate 0 (AUTH_SECRET, exit 7) runs BEFORE the commit-hold and embargo gates, and its
+// remediation — "set a real AUTH_SECRET on the service" — is an ENV WRITE. An env write
+// redeploys this service from its BRANCH TIP on the spot (trigger: service_updated, despite
+// autoDeploy: no — TRA-2186). So the gate that fires FIRST is the one whose printed FIX can
+// ship whatever the tip carries, and it exits before the caller has been shown either of the
+// gates that exist to refuse that tip. Gate 2's refusal text already carries this warning
+// ("hold those by hand"); a caller stopped at Gate 0 never reaches it.
+//
+// Two details that are easy to get backwards:
+//   • Evaluate the hold against the TIP, never against --commit. An env write does not
+//     honour --commit, so naming a hold-clear SHA does not make the write safe.
+//   • BLIND blocks too (authSecretBlocks), and BLIND means the secret could not be READ —
+//     not that it is wrong. On BLIND the printed FIX asks for a write that was never
+//     needed, which is exactly the case where this warning is load-bearing.
+export function envWriteHoldWarning({ holdCheck, embargo, isSoakHost }) {
+  if (!isSoakHost) return '';
+  const lines = [];
+  if (holdCheck && holdCheck.verdict !== 'CLEAR') {
+    const h = holdCheck.hold;
+    lines.push(
+      `  tip     : ${holdCheck.target?.sha?.slice(0, 12) ?? '(unresolved)'} ${
+        holdCheck.verdict === 'CARRIES' ? 'CARRIES' : 'CANNOT BE PROVEN CLEAR of'
+      } ${h.commit.slice(0, 12)} — ${h.ticket}, held until ${h.until}.`,
+    );
+    if (holdCheck.why) lines.push(`  blind   : ${holdCheck.why}`);
+    lines.push(`  ${h.why}`);
+  }
+  if (embargo) {
+    lines.push(`  embargo : ACTIVE ${embargo.from} → ${embargo.to} — ${embargo.ticket}.`);
+  }
+  if (lines.length === 0) return '';
+  return (
+    `\n  ⛔ DO NOT FIX THIS WITH AN ENV WRITE RIGHT NOW. An env/settings write redeploys this\n` +
+    `  service from its BRANCH TIP immediately and unguarded (trigger: service_updated,\n` +
+    `  TRA-2186). It does NOT honour --commit, and neither of the gates below can see it.\n` +
+    `  This refusal exits BEFORE both of them, so they are reported here instead:\n` +
+    lines.join('\n') +
+    `\n  Set the secret AFTER the hold/embargo lifts, or get the owner of the held work to\n` +
+    `  sign off first. Writing env now ships the tip regardless of what you passed.`
+  );
+}
+
 function git(args, timeout = 20000) {
   return spawnSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout });
 }
@@ -554,6 +597,10 @@ async function main() {
     '  runs healthy on an in-memory secret with a broken env until somebody deploys.';
 
   if (authBlocking && !HAS_AUTH_SECRET_OVERRIDE) {
+    // TRA-2306: resolve the hold/embargo picture HERE. This refusal exits before Gate 2 and
+    // Gate 3 ever run, and the FIX it prints is an env write — see envWriteHoldWarning().
+    // Deliberately resolves the TIP (no COMMIT): an env write ships the tip regardless.
+    const tipHold = commitHoldState(now, resolveTarget(service.branch ?? 'main', undefined));
     console.error(
       `[render-redeploy] REFUSED: ${service.name} (${service.id}) — its live AUTH_SECRET ${
         authGate.verdict === 'UNUSABLE'
@@ -568,7 +615,8 @@ async function main() {
         `  FIX: set a real AUTH_SECRET on the service, then re-run. Verify with\n` +
         `  RENDER_API_KEY=… node scripts/tra2296-auth-secret-check.mjs (TRA-2315 predicate).\n` +
         `  If you must ship anyway, re-run with --force-auth-secret-override="why" (recorded).\n` +
-        `  ${AUTH_ENV_WRITE_CAVEAT}`,
+        `  ${AUTH_ENV_WRITE_CAVEAT}` +
+        envWriteHoldWarning({ holdCheck: tipHold, embargo, isSoakHost }),
     );
     process.exit(7);
   }

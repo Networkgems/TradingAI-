@@ -18,6 +18,7 @@ import {
   freezeState,
   embargoState,
   commitHoldState,
+  envWriteHoldWarning,
   resolveTarget,
   EMBARGOES,
   COMMIT_HOLDS,
@@ -113,8 +114,55 @@ const HOLD_CASES = [
   ['2026-07-28T09:00:00Z', carrying(HELD), 'PROCEED', 'Tue — expired row is inert, left in place as a record'],
 ];
 
+// ── Gate 0's env-write warning (TRA-2306) ────────────────────────────────────
+// The AUTH_SECRET gate (exit 7) fires BEFORE both gates above and its printed FIX is an env
+// write, which redeploys from BRANCH TIP unguarded (TRA-2186). So the hold and the embargo
+// have to be REPORTED inside that refusal or they are never seen. These cases pin that the
+// warning is present exactly when there is something to warn about — a warner that is always
+// on is noise a deployer learns to skip, and one that is always off is the original defect.
+const warnVerdict = (now, target, isSoakHost = true) =>
+  envWriteHoldWarning({
+    holdCheck: commitHoldState(at(now), target),
+    embargo: embargoState(at(now)).active,
+    isSoakHost,
+  }) === ''
+    ? 'SILENT'
+    : 'WARNED';
+
+const WARN_CASES = [
+  // The Monday this ticket protects: exit 7 here, and the FIX would ship the held commit
+  // into the session whose 20:20Z read the hold exists to keep measurable.
+  ['2026-07-27T14:00:00Z', carrying(HELD), true, 'WARNED', 'Mon mid-RTH — embargo AND held tip: both must be named'],
+  ['2026-07-27T14:00:00Z', clean('408f06a'), true, 'WARNED', 'Mon mid-RTH, clean tip — the embargo alone still forbids the write'],
+  ['2026-07-26T04:45:00Z', carrying(HELD), true, 'WARNED', 'Sun 04:45Z — the ~33h hole: no embargo, but the tip IS the held commit'],
+
+  // Fails CLOSED, like the gate it speaks for: "cannot tell" is not "safe to write".
+  ['2026-07-26T04:45:00Z', unresolved, true, 'WARNED', 'tip unresolvable — BLIND must warn, not stay silent'],
+  ['2026-07-26T04:45:00Z', untestable('c0ffee'), true, 'WARNED', 'object missing from checkout — still BLIND, still warns'],
+
+  // The paired negatives. Without these the suite would pass a warning that is simply
+  // always printed, which tells a deployer nothing.
+  ['2026-07-26T04:45:00Z', clean('88a072e'), true, 'SILENT', 'SAME instant, clean tip, no embargo — nothing to warn about'],
+  ['2026-07-27T21:00:00Z', carrying(HELD), true, 'SILENT', 'Mon 21:00:00Z — hold and embargo both spent: self-expires with the tables'],
+  ['2026-07-27T14:00:00Z', carrying(HELD), false, 'SILENT', 'not the soak host — the hold/embargo are bqb1-scoped'],
+];
+
 let pass = 0;
 const failures = [];
+for (const [iso, target, isSoak, expected, why] of WARN_CASES) {
+  const got = warnVerdict(iso, target, isSoak);
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   ${iso}  ${got.padEnd(20)} ${why}`);
+  } else {
+    failures.push({ iso, expected, got, why });
+    console.log(`  FAIL ${iso}  expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const warnProduced = new Set(WARN_CASES.map(([iso, target, isSoak]) => warnVerdict(iso, target, isSoak)));
+const warnMissing = ['WARNED', 'SILENT'].filter(v => !warnProduced.has(v));
+
 for (const [iso, target, expected, why] of HOLD_CASES) {
   const got = holdVerdict(iso, target);
   if (got === expected) {
@@ -174,8 +222,8 @@ if (process.argv.includes('--live')) {
   }
 }
 
-const TOTAL = CASES.length + HOLD_CASES.length;
-const allMissing = [...missing, ...holdMissing];
+const TOTAL = CASES.length + HOLD_CASES.length + WARN_CASES.length;
+const allMissing = [...missing, ...holdMissing, ...warnMissing];
 
 console.log('');
 console.log(`freeze  : ${FREEZE_OPEN_MIN}–${FREEZE_CLOSE_MIN} UTC min-of-day (lead ${DEPLOY_LEAD_MIN} min)`);
@@ -184,7 +232,7 @@ console.log(
   `holds   : ${COMMIT_HOLDS.length} row(s) — ${COMMIT_HOLDS.map(h => `${h.commit.slice(0, 7)}→${h.until} (${h.ticket})`).join(', ')}`,
 );
 console.log(`cases   : ${pass}/${TOTAL} pass`);
-console.log(`verdicts: reached ${[...new Set([...produced, ...holdProduced])].sort().join(', ')}`);
+console.log(`verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced])].sort().join(', ')}`);
 
 if (allMissing.length) {
   console.error(`[tra2325] FAIL: verdict(s) never reached by any case: ${allMissing.join(', ')} — suite is one-sided.`);
