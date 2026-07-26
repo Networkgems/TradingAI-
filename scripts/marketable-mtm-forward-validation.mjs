@@ -67,8 +67,21 @@
 //        [--tol 0.03] [--strategy long_call|long_put|csp|covered_call]
 //        [--min-n 30] [--json] [--self-test]
 //
-// Exit code: 0 = PASS (or self-test ok), 2 = REVIEW (insufficient n or model off),
-// 1 = usage / IO error. Read-only: never writes any journal.
+// ── TRA-2300: THE GRADED BASIS IS `quotedH`; THE EXIT CODE FOLLOWS IT ────────
+// QuantTrader's call under TRA-2283 D2 is made: the gate grades the QUOTED-book half-spread,
+// not the fill-derived one. This CLI mirrors that, and it MUST — a CLI whose exit code graded
+// `actualH` while the route graded `quotedH` would be a second grader disagreeing with the
+// gate, which is exactly the silent drift the two-implementation note above warns about.
+// So `--json` now emits BOTH verdicts with a `basis` on each plus `gradedBasis`, the human
+// report prints both and labels which one grades, and **the process exit code is the QUOTED
+// verdict's**. Also mirrored: the quoted-basis tail check (per structure and pooled), the
+// ABSENT-vs-NULL quote-coverage split, quotedH min/max, and the per-structure floor, which now
+// ships ON at 10 (pooled min-n stays 30) — `--per-structure-min-n N` and
+// `--no-require-per-structure-min-n` override it.
+//
+// Exit code: 0 = PASS on the QUOTED basis (or self-test ok), 2 = REVIEW (insufficient quoted n
+// or model off), 1 = usage / IO error. Read-only: never writes any journal. Arms nothing:
+// `h` stays 0.134 and ENABLE_MARKETABLE_OPEN_MTM is untouched (TRA-1897 hold).
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -77,9 +90,15 @@ const DEFAULT_H = 0.134; // packages/server/src/marketable-open-mtm.ts DEFAULT_M
 const CONTRACT_MULTIPLIER = 100;
 // marketable-open-mtm.ts MAX_MARKETABLE_HALF_SPREAD_FRAC — also the |actualH| outlier threshold.
 const MAX_HALF_SPREAD_FRAC = 0.5;
+// TRA-2300 §5 — a FLOOR CHECK, not a tail estimate. Ten points do not estimate a p90; they
+// only establish the figure was not computed off a handful of rows.
+const DEFAULT_PER_STRUCTURE_MIN_N = 10;
 
 function parseArgs(argv) {
-  const a = { file: null, h: DEFAULT_H, tol: 0.03, strategy: null, minN: 30, json: false, selfTest: false, requirePerStructureMinN: false };
+  const a = {
+    file: null, h: DEFAULT_H, tol: 0.03, strategy: null, minN: 30, json: false, selfTest: false,
+    requirePerStructureMinN: true, perStructureMinN: DEFAULT_PER_STRUCTURE_MIN_N,
+  };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     if (t === '--file') a.file = argv[++i];
@@ -87,7 +106,9 @@ function parseArgs(argv) {
     else if (t === '--tol') a.tol = Number(argv[++i]);
     else if (t === '--strategy') a.strategy = argv[++i];
     else if (t === '--min-n') a.minN = Number(argv[++i]);
+    else if (t === '--per-structure-min-n') a.perStructureMinN = Number(argv[++i]);
     else if (t === '--require-per-structure-min-n') a.requirePerStructureMinN = true;
+    else if (t === '--no-require-per-structure-min-n') a.requirePerStructureMinN = false;
     else if (t === '--json') a.json = true;
     else if (t === '--self-test') a.selfTest = true;
     else if (t === '--help' || t === '-h') a.help = true;
@@ -195,6 +216,20 @@ function toSample(rec, strategyFilter, tally) {
     exit.side,
   );
 
+  // TRA-2300 §3 — WHY this row does or does not carry a quote. `== null` collapses ABSENT
+  // (record predates the 4871bbc writer — benign, drains with age) into PRESENT-BUT-NULL (the
+  // snap returned no book — the instrument is dead and can NEVER be graded). Same observable
+  // consequence, opposite diagnoses, so the probe is `in` on the KEY, not a value test.
+  const quoteKeysPresent = exit != null && typeof exit === 'object'
+    && ('bid' in exit || 'ask' in exit);
+  const quoteState = quotedH != null
+    ? 'quoted'
+    : !quoteKeysPresent
+      ? 'legacy_no_quote_field'
+      : (exit.bid == null || exit.ask == null)
+        ? 'quote_null_at_snap'
+        : 'quote_unusable';
+
   // Realized ENTRY-leg half-spread, as a reference, when the entry leg is priced. The entry
   // fill is guarded at `> 0` symmetrically with the exit (TRA-2283 D1): a zero-filled entry
   // leg yields hEntry = ∓1, which is what made entryH read as the negative of actualH.
@@ -209,6 +244,7 @@ function toSample(rec, strategyFilter, tally) {
 
   return {
     structure: rec.strategy ?? 'unknown',
+    etDay: rec.etDay ?? null,
     mode: 'sandbox',
     contracts,
     exitMidPerShare,
@@ -216,6 +252,8 @@ function toSample(rec, strategyFilter, tally) {
     actualH,                // realized exit half-spread fraction (signed)
     hEntry,                 // realized entry-leg half-spread (reference)
     quotedH,                // QUOTED-book half-spread on the exit side (TRA-2283 D2)
+    quoteState,             // TRA-2300 §3 — absent-key vs null-at-snap vs unusable vs quoted
+    quotedCrossUsd: quotedH != null ? quotedH * exitMidPerShare * per : null,
   };
 }
 
@@ -227,7 +265,17 @@ function summarize(samples, h) {
   const modeledCross = samples.map((s) => h * s.exitMidPerShare * s.contracts * CONTRACT_MULTIPLIER).sort((a, b) => a - b);
   const errUsd = samples.map((s) => h * s.exitMidPerShare * s.contracts * CONTRACT_MULTIPLIER - s.exitSlippageUsd);
   const withEntry = samples.filter((s) => s.hEntry != null);
-  const quoted = samples.map((s) => s.quotedH).filter((q) => q != null).sort((a, b) => a - b);
+  // TRA-2300 §2/§4 — keep the quote-bearing SUBSET as rows, so the quoted cross and the
+  // modeled cross it is compared against are folded over exactly the same corpus. A p90 over
+  // 26 rows against a p90 over 4 different rows is not a tail check.
+  const quotedRows = samples.filter((s) => s.quotedH != null);
+  const quoted = quotedRows.map((s) => s.quotedH).sort((a, b) => a - b);
+  const quotedCross = quotedRows.map((s) => s.quotedCrossUsd).sort((a, b) => a - b);
+  const modeledCrossOnQuoted = quotedRows
+    .map((s) => h * s.exitMidPerShare * s.contracts * CONTRACT_MULTIPLIER)
+    .sort((a, b) => a - b);
+  const quotedEtDays = quotedRows.map((s) => s.etDay).filter((d) => typeof d === 'string' && d !== '').sort();
+  const countState = (st) => samples.filter((s) => s.quoteState === st).length;
   return {
     n: samples.length,
     modeledH: h,
@@ -247,6 +295,31 @@ function summarize(samples, h) {
       mean: mean(quoted),
       median: quantile(quoted, 0.5),
       p90: quantile(quoted, 0.9),
+      // TRA-2300 §4 — dispersion. A live chain snapped at N decision times cannot produce
+      // min === max; if it does, the "quote" is a constant somebody wrote, not a book someone
+      // read — and the moments alone would look perfectly healthy. `null` (never 0) at n=0.
+      min: quoted.length ? quoted[0] : null,
+      max: quoted.length ? quoted[quoted.length - 1] : null,
+    },
+    // TRA-2300 §2 — the quoted-basis cross and its PAIRED modeled cross on the same rows.
+    quotedCrossUsd: {
+      mean: mean(quotedCross), median: quantile(quotedCross, 0.5), p90: quantile(quotedCross, 0.9),
+    },
+    modeledCrossUsdOnQuoted: {
+      mean: mean(modeledCrossOnQuoted),
+      median: quantile(modeledCrossOnQuoted, 0.5),
+      p90: quantile(modeledCrossOnQuoted, 0.9),
+    },
+    // TRA-2300 §3 — the census. Exhaustive: the four counts sum to n, so a reader reconciles
+    // rather than inferring a residual (which is where a fifth, unnamed state would hide).
+    quoteCoverage: {
+      retained: samples.length,
+      quoted: quoted.length,
+      legacy_no_quote_field: countState('legacy_no_quote_field'),
+      quote_null_at_snap: countState('quote_null_at_snap'),
+      quote_unusable: countState('quote_unusable'),
+      etDayMin: quotedEtDays.length ? quotedEtDays[0] : null,
+      etDayMax: quotedEtDays.length ? quotedEtDays[quotedEtDays.length - 1] : null,
     },
   };
 }
@@ -262,16 +335,96 @@ function underChargeRatio(summary) {
   return a / m;
 }
 
+/** TRA-2300 §2 — the QUOTED-basis tail check, over the quote-bearing rows only. Returns false
+ *  when either p90 is non-finite: NOT-MEASURABLE is not a tail failure, and the quotedH.n floor
+ *  is what stops an unmeasurable tail from reading as a covered one. */
+function isQuotedTailUnderCharged(summary) {
+  const m = summary.modeledCrossUsdOnQuoted.p90, q = summary.quotedCrossUsd.p90;
+  if (!Number.isFinite(m) || !Number.isFinite(q)) return false;
+  return !(m >= q);
+}
+
+function quotedUnderChargeRatio(summary) {
+  const m = summary.modeledCrossUsdOnQuoted.p90, q = summary.quotedCrossUsd.p90;
+  if (!Number.isFinite(m) || !Number.isFinite(q) || m <= 0 || q <= m) return null;
+  return q / m;
+}
+
+/**
+ * TRA-2300 §1 — **THE GATE.** Same shape and tolerance as `verdict`, but decided on
+ * `quotedH.median` and gated on **`quotedH.n`, not `summary.n`**: rows with a usable FILL are
+ * not rows with a usable QUOTE, and gating on `summary.n` would let quote-less rows clear the
+ * floor and hand back a verdict computed from NaN.
+ */
+function quotedVerdict(summary, tol, minN) {
+  const qn = summary.quotedH.n;
+  if (qn < minN) {
+    const c = summary.quoteCoverage;
+    return {
+      code: 'REVIEW',
+      basis: 'quotedH',
+      reason: `insufficient QUOTED-basis n (${qn} < ${minN}); of ${c.retained} retained rows `
+        + `${c.legacy_no_quote_field} predate the bid/ask writer (legacy_no_quote_field), `
+        + `${c.quote_null_at_snap} had a null quote AT SNAP (quote_null_at_snap), `
+        + `${c.quote_unusable} carried an unusable book. bid/ask persist only from 4871bbc `
+        + '(TRA-2283 D2) — the first count drains as legacy rows age out, the second means the '
+        + 'instrument is dead and the gate can never be graded.',
+    };
+  }
+  const withinTol = Math.abs(summary.quotedH.median - summary.modeledH) <= tol;
+  const tailOk = !isQuotedTailUnderCharged(summary);
+  if (withinTol && tailOk) {
+    return {
+      code: 'PASS',
+      basis: 'quotedH',
+      reason: `median QUOTED h ${summary.quotedH.median.toFixed(4)} within ±${tol} of modeled `
+        + `${summary.modeledH}; quoted tail covered (modeled p90 $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} `
+        + `≥ quoted p90 $${summary.quotedCrossUsd.p90.toFixed(2)} over the same ${qn} quote-bearing rows)`,
+    };
+  }
+  const bits = [];
+  if (!withinTol) bits.push(`median QUOTED h ${summary.quotedH.median.toFixed(4)} outside ±${tol} of modeled ${summary.modeledH}`);
+  if (!tailOk) {
+    const r = quotedUnderChargeRatio(summary);
+    bits.push(`modeled p90 cross $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} < quoted p90 `
+      + `$${summary.quotedCrossUsd.p90.toFixed(2)} (under-charges the tail${r != null ? ` — under-charged ${r.toFixed(1)}×` : ''})`);
+  }
+  return { code: 'REVIEW', basis: 'quotedH', reason: bits.join('; ') };
+}
+
+/** TRA-2300 §1+§2 — the pooled QUOTED gate: D3's "any structure under-charged forces REVIEW"
+ *  rule, carried onto the basis that actually grades. The per-structure floor is applied to
+ *  `quotedH.n` (a structure can hold 30 filled rows and ZERO quotes), and structures under it
+ *  are NAMED as ungradeable — "nothing was flagged" must not read like "nothing was checked". */
+function quotedPooledVerdict(summary, structures, tol, minN, requirePerStructureMinN, perStructureMinN) {
+  const base = quotedVerdict(summary, tol, minN);
+  const bits = [];
+  const under = structures.filter((s) => s.quotedTailUnderCharged);
+  if (under.length > 0) {
+    const named = [...under]
+      .sort((a, b) => (b.quotedTailUnderChargeRatio ?? Infinity) - (a.quotedTailUnderChargeRatio ?? Infinity))
+      .map((s) => `${s.structure} (quoted n=${s.quotedH.n}, quoted p90 $${s.quotedCrossUsd.p90.toFixed(2)} vs modeled $${s.modeledCrossUsdOnQuoted.p90.toFixed(2)} — under-charged ${s.quotedTailUnderChargeRatio != null ? `${s.quotedTailUnderChargeRatio.toFixed(1)}×` : 'modeled p90 ≤ 0'})`)
+      .join(', ');
+    bits.push(`per-structure QUOTED tail UNDER-CHARGED: ${named}`);
+  }
+  const below = structures.filter((s) => s.quotedH.n < perStructureMinN).map((s) => `${s.structure} (quoted n=${s.quotedH.n})`);
+  if (requirePerStructureMinN && below.length > 0) {
+    bits.push(`insufficient per-structure QUOTED n (< ${perStructureMinN}), NOT gradeable: ${below.join(', ')}`);
+  }
+  if (bits.length === 0) return base;
+  return { code: 'REVIEW', basis: 'quotedH', reason: `${base.code === 'REVIEW' ? `${base.reason}; ` : ''}${bits.join('; ')}` };
+}
+
 function verdict(summary, tol, minN) {
   if (summary.n < minN) {
-    return { code: 'REVIEW', reason: `insufficient n (${summary.n} < ${minN}); accrue more parity-true sandbox round-trips` };
+    return { code: 'REVIEW', basis: 'actualH', reason: `insufficient n (${summary.n} < ${minN}); accrue more parity-true sandbox round-trips` };
   }
   const withinTol = Math.abs(summary.actualH.median - summary.modeledH) <= tol;
   // The tail must not be UNDER-charged: a modeled mark that haircuts LESS than the
   // real fill re-inflates realizable P&L — the bias this ticket removes.
   const tailNotUnderCharged = !isTailUnderCharged(summary);
   if (withinTol && tailNotUnderCharged) {
-    return { code: 'PASS', reason: `median realized h ${summary.actualH.median.toFixed(4)} within ±${tol} of modeled ${summary.modeledH}; tail covered` };
+    return { code: 'PASS', basis: 'actualH', reason: `median realized h ${summary.actualH.median.toFixed(4)} within ±${tol} of modeled ${summary.modeledH}; tail covered` };
   }
   const bits = [];
   // TRA-2283 D2 — this is a DESCRIPTION of where the measured median sits, NOT an
@@ -279,13 +432,13 @@ function verdict(summary, tol, minN) {
   // by construction, so "retune h" off it would collapse the haircut to mid-marking.
   if (!withinTol) bits.push(`median realized h ${summary.actualH.median.toFixed(4)} outside ±${tol} of modeled ${summary.modeledH} (measured median ≈ ${summary.actualH.median.toFixed(3)} — do NOT retune --h off a SANDBOX_SIMULATED fill; grade on quotedH)`);
   if (!tailNotUnderCharged) bits.push(`modeled p90 cross $${summary.modeledCrossUsd.p90.toFixed(2)} < actual p90 $${summary.actualCrossUsd.p90.toFixed(2)} (under-charges the tail)`);
-  return { code: 'REVIEW', reason: bits.join('; ') };
+  return { code: 'REVIEW', basis: 'actualH', reason: bits.join('; ') };
 }
 
 /** TRA-2283 D3 — per-structure fold; the pooled verdict may not absolve a structure whose
  *  own tail is under-charged (pooled read "covered" at $61.14 ≥ $4.00 while long_call was
  *  under-charged 2.8× — signs that flip with structure direction cancel in the pool). */
-function perStructureBreakdown(samples, h, tol, minN) {
+function perStructureBreakdown(samples, h, tol, perStructureMinN) {
   const by = new Map();
   for (const s of samples) {
     const list = by.get(s.structure) ?? [];
@@ -300,13 +453,18 @@ function perStructureBreakdown(samples, h, tol, minN) {
         ...sub,
         tailUnderCharged: isTailUnderCharged(sub),
         tailUnderChargeRatio: underChargeRatio(sub),
-        verdict: verdict(sub, tol, minN),
+        quotedTailUnderCharged: isQuotedTailUnderCharged(sub),
+        quotedTailUnderChargeRatio: quotedUnderChargeRatio(sub),
+        // Graded at the PER-STRUCTURE floor, not the pooled one — otherwise every structure in
+        // a healthy 4-way split reads "insufficient n (20 < 30)".
+        verdict: verdict(sub, tol, perStructureMinN),
+        quotedVerdict: quotedVerdict(sub, tol, perStructureMinN),
       };
     })
     .sort((a, b) => b.n - a.n || a.structure.localeCompare(b.structure));
 }
 
-function pooledVerdict(summary, structures, tol, minN, requirePerStructureMinN) {
+function pooledVerdict(summary, structures, tol, minN, requirePerStructureMinN, perStructureMinN) {
   const base = verdict(summary, tol, minN);
   const bits = [];
   const under = structures.filter((s) => s.tailUnderCharged);
@@ -317,12 +475,12 @@ function pooledVerdict(summary, structures, tol, minN, requirePerStructureMinN) 
       .join(', ');
     bits.push(`per-structure tail UNDER-CHARGED: ${named}`);
   }
-  const below = structures.filter((s) => s.n < minN).map((s) => `${s.structure} (n=${s.n})`);
+  const below = structures.filter((s) => s.n < perStructureMinN).map((s) => `${s.structure} (n=${s.n})`);
   if (requirePerStructureMinN && below.length > 0) {
-    bits.push(`insufficient per-structure n (< ${minN}): ${below.join(', ')}`);
+    bits.push(`insufficient per-structure n (< ${perStructureMinN}): ${below.join(', ')}`);
   }
   if (bits.length === 0) return base;
-  return { code: 'REVIEW', reason: `${base.code === 'REVIEW' ? `${base.reason}; ` : ''}${bits.join('; ')}` };
+  return { code: 'REVIEW', basis: 'actualH', reason: `${base.code === 'REVIEW' ? `${base.reason}; ` : ''}${bits.join('; ')}` };
 }
 
 // Build a synthetic SANDBOX journal (one full record per line) whose EXIT-leg realized
@@ -364,19 +522,63 @@ function synthSandboxCorpus(halfSpread, n = 40) {
   return lines.join('\n');
 }
 
+/**
+ * TRA-2300 — a corpus on THIS VENUE'S ACTUAL SHAPE: every leg fills at the decision mid, so
+ * `actualH` is dead by construction (exactly as observed live), while the QUOTED book is real
+ * and two-sided at `quotedHs[i % len]`. The mid is CONSTANT so the modeled cross is constant
+ * and a quoted-tail under-charge can only come from the quoted half-spread — not from a mid
+ * that happens to be larger on the wide rows. Deterministic (no RNG).
+ */
+function synthQuotedCorpus(quotedHs, n = 40, mid = 2.0, etDay = '2026-07-26') {
+  const lines = [];
+  for (let i = 0; i < n; i++) {
+    const isLong = i % 2 === 0;
+    const qh = quotedHs[i % quotedHs.length];
+    const bid = mid * (1 - qh), ask = mid * (1 + qh);
+    const legOf = (side, submitTs) => ({
+      side, optionSymbol: 'AAPL', submitTs, fillTs: submitTs + 1, signalToSubmitMs: 40,
+      requestedPx: mid, bid, ask, fillPx: mid,
+      slippageBps: null, spreadAtSubmitPct: null, withinSpread: null,
+    });
+    lines.push(JSON.stringify({
+      ts: 1_700_000_000_000 + i,
+      etDay,
+      strategy: isLong ? 'long_call' : 'csp',
+      underlying: 'AAPL',
+      ok: true,
+      realizedRoundTripUsd: 0,
+      legs: [legOf(isLong ? 'buy' : 'sell', 1), legOf(isLong ? 'sell' : 'buy', 3)],
+    }));
+  }
+  return lines.join('\n');
+}
+
 function report(summary, v, args, extra = {}) {
-  const { perStructure = [], exclusions = null } = extra;
+  const { perStructure = [], exclusions = null, quotedV = null } = extra;
   if (args.json) {
     console.log(JSON.stringify({
       ...summary,
+      // TRA-2300 §1 — `verdict` keeps its name (an old-shaped consumer must not be handed a
+      // DIFFERENT number under a name it already trusts); `quotedVerdict` is the gate.
       verdict: v,
+      actualVerdict: v,
+      quotedVerdict: quotedV,
+      gradedBasis: 'quotedH',
+      verdictBasisNote: 'quotedVerdict (basis quotedH) IS THE GATE. verdict/actualVerdict '
+        + '(basis actualH) is ADVISORY ONLY: on a SANDBOX_SIMULATED venue that fills at the '
+        + 'decision mid it reads ~0 whether the true spread is 0 or the simulator ignores the '
+        + 'book, so it has no failing state. The process exit code follows quotedVerdict.',
       tol: args.tol,
       minN: args.minN,
+      perStructureMinN: args.perStructureMinN,
+      requirePerStructureMinN: args.requirePerStructureMinN,
+      perStructureMinNNote: 'a FLOOR CHECK, not an estimate — ten points do not estimate a p90',
       fillRealism: 'SANDBOX_SIMULATED',
       excludedZeroFill: exclusions?.zero_fill_exit ?? 0,
       exclusions,
       perStructure,
-      structuresBelowMinN: perStructure.filter((s) => s.n < args.minN).map((s) => s.structure),
+      structuresBelowMinN: perStructure.filter((s) => s.n < args.perStructureMinN).map((s) => s.structure),
+      structuresBelowQuotedMinN: perStructure.filter((s) => s.quotedH.n < args.perStructureMinN).map((s) => s.structure),
     }, null, 2));
     return;
   }
@@ -393,6 +595,18 @@ function report(summary, v, args, extra = {}) {
   console.log(summary.quotedH.n
     ? `QUOTED-book h (n=${summary.quotedH.n}) mean/median/p90:  ${summary.quotedH.mean.toFixed(4)} / ${summary.quotedH.median.toFixed(4)} / ${summary.quotedH.p90.toFixed(4)}`
     : 'QUOTED-book h:                          n=0 — no persisted bid/ask on these legs (pre-TRA-2283 D2 records)');
+  // TRA-2300 §4 — dispersion. min === max on a multi-day sample means a CONSTANT was written,
+  // not a book read; the moments above would look identical either way.
+  if (summary.quotedH.n) {
+    console.log(`QUOTED-book h min/max (dispersion):     ${summary.quotedH.min.toFixed(4)} / ${summary.quotedH.max.toFixed(4)}${summary.quotedH.min === summary.quotedH.max ? '  ⚠ min === max — a CONSTANT quote, not a book' : ''}`);
+    console.log(`quoted cross $ p90 vs modeled p90:      ${summary.quotedCrossUsd.p90.toFixed(2)} vs ${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} (same ${summary.quotedH.n} rows)`);
+  }
+  // TRA-2300 §3 — ABSENT vs NULL. Same observable zero, opposite diagnoses.
+  {
+    const c = summary.quoteCoverage;
+    console.log(`quote coverage (of ${String(c.retained).padStart(3)} retained):      quoted=${c.quoted}  legacy_no_quote_field=${c.legacy_no_quote_field}  quote_null_at_snap=${c.quote_null_at_snap}  quote_unusable=${c.quote_unusable}`);
+    console.log(`quote-bearing etDay range:              ${c.etDayMin ?? '—'} … ${c.etDayMax ?? '—'}${c.quote_null_at_snap > 0 ? '   ⚠ quote_null_at_snap > 0 — the snap returned no book; that count does NOT drain with age' : ''}`);
+  }
   console.log('fill realism:                           SANDBOX_SIMULATED (fills at the decision mid ⇒ actualH ~0 BY CONSTRUCTION; grade on quotedH)');
   if (exclusions != null) {
     const zf = exclusions.zero_fill_exit ?? 0;
@@ -407,11 +621,21 @@ function report(summary, v, args, extra = {}) {
       const flag = s.tailUnderCharged
         ? `  ⚠ TAIL UNDER-CHARGED ${s.tailUnderChargeRatio != null ? `${s.tailUnderChargeRatio.toFixed(1)}×` : ''}`
         : '';
+      const qflag = s.quotedTailUnderCharged
+        ? `  ⚠ QUOTED TAIL UNDER-CHARGED ${s.quotedTailUnderChargeRatio != null ? `${s.quotedTailUnderChargeRatio.toFixed(1)}×` : ''}`
+        : '';
       console.log(`  ${s.structure.padEnd(14)} n=${String(s.n).padStart(3)}  h med ${s.actualH.median.toFixed(4)}  actual p90 $${s.actualCrossUsd.p90.toFixed(2)}  modeled p90 $${s.modeledCrossUsd.p90.toFixed(2)}  ${s.verdict.code}${flag}`);
+      console.log(`  ${' '.repeat(14)} quoted n=${String(s.quotedH.n).padStart(3)}  q med ${Number.isFinite(s.quotedH.median) ? s.quotedH.median.toFixed(4) : '  n/a '}  quoted p90 $${Number.isFinite(s.quotedCrossUsd.p90) ? s.quotedCrossUsd.p90.toFixed(2) : 'n/a'}  modeled p90 $${Number.isFinite(s.modeledCrossUsdOnQuoted.p90) ? s.modeledCrossUsdOnQuoted.p90.toFixed(2) : 'n/a'}  ${s.quotedVerdict.code}${qflag}   ← GRADED`);
     }
   }
   console.log('─'.repeat(60));
-  console.log(`VERDICT (pooled): ${v.code} — ${v.reason}`);
+  // TRA-2300 §1 — print BOTH and label which one grades. Printing only one, or printing them
+  // unlabelled, is how a reader grades the wrong number.
+  console.log(`VERDICT (pooled, GRADED — basis quotedH): ${quotedV ? `${quotedV.code} — ${quotedV.reason}` : 'n/a'}`);
+  console.log(`verdict (pooled, ADVISORY — basis actualH, NOT the gate): ${v.code} — ${v.reason}`);
+  console.log('note: actualH is measured requestedPx-vs-fillPx on a venue that fills at the decision');
+  console.log('      mid, so it reads ~0 whether the true spread is 0 or the simulator ignores the');
+  console.log('      book. Do NOT retune --h off it. The exit code follows the GRADED verdict.');
 }
 
 /** Fold a parsed record list exactly as `main` does — samples + exclusion tally + unpooled verdict. */
@@ -422,9 +646,11 @@ function foldAll(records, args) {
   };
   const samples = records.map((r) => toSample(r, args.strategy, exclusions)).filter(Boolean);
   const summary = summarize(samples, args.h);
-  const perStructure = perStructureBreakdown(samples, args.h, args.tol, args.minN);
-  const v = pooledVerdict(summary, perStructure, args.tol, args.minN, args.requirePerStructureMinN);
-  return { samples, summary, perStructure, exclusions, v };
+  const perStructure = perStructureBreakdown(samples, args.h, args.tol, args.perStructureMinN);
+  const v = pooledVerdict(summary, perStructure, args.tol, args.minN, args.requirePerStructureMinN, args.perStructureMinN);
+  // TRA-2300 §1 — the GRADED verdict. `v` stays in the payload as ADVISORY.
+  const quotedV = quotedPooledVerdict(summary, perStructure, args.tol, args.minN, args.requirePerStructureMinN, args.perStructureMinN);
+  return { samples, summary, perStructure, exclusions, v, quotedV };
 }
 
 function runSelfTest(args) {
@@ -462,14 +688,70 @@ function runSelfTest(args) {
       process.exit(1);
     }
   }
-  console.log('self-test OK (PASS on 0.13 corpus; quotedH recovers 0.13; REVIEW on mid-booked corpus; fillPx=0 excluded)');
+  // ── TRA-2300: the GRADED (quotedH) basis must fire in BOTH directions ──────
+  // 4. A plausible quoted book near the modeled h must PASS on the graded basis — WHILE the
+  //    advisory basis REVIEWs, because every fill is at the mid. That divergence is the whole
+  //    ticket: grading actualH here would reject a model that is right.
+  {
+    const f = foldAll(parseSandboxJournal(synthQuotedCorpus([0.13])), args);
+    if (f.quotedV.code !== 'PASS') {
+      console.error(`SELF-TEST FAILED: quoted basis must PASS at quoted h=0.13 vs modeled 0.134 (got ${f.quotedV.code} — ${f.quotedV.reason})`);
+      process.exit(1);
+    }
+    if (f.v.code !== 'REVIEW') {
+      console.error('SELF-TEST FAILED: the ADVISORY basis must REVIEW on a mid-filled corpus (actualH ≈ 0)');
+      process.exit(1);
+    }
+  }
+  // 5. PROVE IT FIRES ON THE TAIL ALONE. 80% of rows quote at exactly the modeled 0.134 and
+  //    20% at 0.40, so the MEDIAN is exactly modeled — the tolerance check PASSES — and the
+  //    only thing that can produce a REVIEW is the quoted tail check. A self-test that only
+  //    exercised the passing direction is what let the actualH path look healthy for three
+  //    tickets; this is the failing direction, isolated.
+  {
+    const f = foldAll(parseSandboxJournal(synthQuotedCorpus([0.134, 0.134, 0.134, 0.134, 0.40])), args);
+    if (Math.abs(f.summary.quotedH.median - 0.134) > 1e-9) {
+      console.error(`SELF-TEST FAILED: the tail fixture must hold the median AT the modeled h (got ${f.summary.quotedH.median})`);
+      process.exit(1);
+    }
+    if (f.quotedV.code !== 'REVIEW' || !/under-charges the tail/.test(f.quotedV.reason)) {
+      console.error(`SELF-TEST FAILED: a wide quoted tail must force a quoted REVIEW (got ${f.quotedV.code} — ${f.quotedV.reason})`);
+      process.exit(1);
+    }
+    if (/outside ±/.test(f.quotedV.reason)) {
+      console.error('SELF-TEST FAILED: this fixture must fire on the TAIL, not the median');
+      process.exit(1);
+    }
+  }
+  // 6. TRA-2300 §3 — the two missing-quote states must be SEPARABLE. Same observable zero,
+  //    opposite diagnoses: absent keys drain as legacy rows age out; null-at-snap never does.
+  {
+    const recs = parseSandboxJournal(synthQuotedCorpus([0.13], 4));
+    const legacy = JSON.parse(JSON.stringify(recs[0]));
+    delete legacy.legs[1].bid; delete legacy.legs[1].ask;   // pre-4871bbc record
+    const nulled = JSON.parse(JSON.stringify(recs[1]));
+    nulled.legs[1].bid = null; nulled.legs[1].ask = null;    // snap returned no book
+    const f = foldAll([legacy, nulled, recs[2], recs[3]], args);
+    const c = f.summary.quoteCoverage;
+    if (c.legacy_no_quote_field !== 1 || c.quote_null_at_snap !== 1 || c.quoted !== 2) {
+      console.error(`SELF-TEST FAILED: quote states must separate (got ${JSON.stringify(c)})`);
+      process.exit(1);
+    }
+    if (c.legacy_no_quote_field + c.quote_null_at_snap + c.quote_unusable + c.quoted !== c.retained) {
+      console.error('SELF-TEST FAILED: quote-coverage counts must reconcile against n');
+      process.exit(1);
+    }
+  }
+  console.log('self-test OK (advisory: PASS on 0.13, REVIEW mid-booked, fillPx=0 excluded; '
+    + 'GRADED quotedH: PASS at 0.13, REVIEW on a wide tail at the SAME median, quote states separable)');
   process.exit(0);
 }
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    console.log('Usage: node scripts/marketable-mtm-forward-validation.mjs [--file PATH] [--h 0.134] [--tol 0.03] [--strategy NAME] [--min-n 30] [--require-per-structure-min-n] [--json] [--self-test]');
+    console.log('Usage: node scripts/marketable-mtm-forward-validation.mjs [--file PATH] [--h 0.134] [--tol 0.03] [--strategy NAME] [--min-n 30] [--per-structure-min-n 10] [--no-require-per-structure-min-n] [--json] [--self-test]');
+    console.log('The GRADED verdict is quotedVerdict (basis quotedH, TRA-2300); the actualH verdict is advisory and the exit code follows the graded one.');
     process.exit(0);
   }
   if (args.selfTest) { runSelfTest(args); return; }
@@ -493,7 +775,10 @@ function main() {
     process.exit(2);
   }
   report(f.summary, f.v, args, f);
-  process.exit(f.v.code === 'PASS' ? 0 : 2);
+  // TRA-2300 §1 — the exit code follows the GRADED (quotedH) verdict, not the advisory one.
+  // An automation that trusted the old code would otherwise be gated on a detector with no
+  // failing state on this venue.
+  process.exit(f.quotedV.code === 'PASS' ? 0 : 2);
 }
 
 main();

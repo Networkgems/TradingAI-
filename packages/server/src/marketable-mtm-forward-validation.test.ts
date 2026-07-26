@@ -4,10 +4,13 @@ import {
   classifyRecord,
   summarizeMarketableMtm,
   marketableMtmVerdict,
+  marketableMtmQuotedVerdict,
   foldMarketableMtmForwardValidation,
+  resolveMarketableMtmGateThresholds,
   MARKETABLE_MTM_DEFAULT_H,
   MARKETABLE_MTM_DEFAULT_TOL,
   MARKETABLE_MTM_DEFAULT_MIN_N,
+  MARKETABLE_MTM_DEFAULT_PER_STRUCTURE_MIN_N,
   MARKETABLE_MTM_OUTLIER_ABS_H,
 } from './marketable-mtm-forward-validation.js';
 import type { SandboxStrategyRecord, SandboxStrategyLeg } from './sandbox-strategy-journal.js';
@@ -41,8 +44,21 @@ function leg(over: Partial<SandboxStrategyLeg>): SandboxStrategyLeg {
   };
 }
 
-function record(strategy: string, entry: SandboxStrategyLeg, exit: SandboxStrategyLeg): SandboxStrategyRecord {
-  return { ts: 1, etDay: '2026-07-24', strategy, underlying: 'AAPL', ok: true, realizedRoundTripUsd: 0, legs: [entry, exit] };
+/**
+ * TRA-2300 §3 — a leg as records were serialized BEFORE `4871bbc`: the `bid`/`ask` keys are
+ * ABSENT, not null. `leg()` above always emits the keys (as null), which is the OTHER state.
+ * The distinction is invisible to `== null` and is the whole point of the coverage split, so
+ * the fixture has to be able to produce both.
+ */
+function legacyLeg(over: Partial<SandboxStrategyLeg>): SandboxStrategyLeg {
+  const l = leg(over) as Partial<SandboxStrategyLeg>;
+  delete l.bid;
+  delete l.ask;
+  return l as SandboxStrategyLeg;
+}
+
+function record(strategy: string, entry: SandboxStrategyLeg, exit: SandboxStrategyLeg, etDay = '2026-07-24'): SandboxStrategyRecord {
+  return { ts: 1, etDay, strategy, underlying: 'AAPL', ok: true, realizedRoundTripUsd: 0, legs: [entry, exit] };
 }
 
 // Byte-for-byte the harness's `synthSandboxCorpus`: alternating long_call (exit = SELL below
@@ -288,19 +304,75 @@ describe('unpooled verdict', () => {
     expect(csp.n).toBe(27);
     expect(csp.tailUnderCharged).toBe(false);
     expect(csp.tailUnderChargeRatio).toBeNull();
-    // Per-structure n is always REPORTED; enforcing minN per structure stays opt-in.
-    expect(result.structuresBelowMinN).toEqual(['csp', 'long_call']);
-    expect(result.requirePerStructureMinN).toBe(false);
+    // TRA-2300 §5 — `structuresBelowMinN` is now measured against the PER-STRUCTURE floor (10),
+    // not the pooled minN (30): csp (n=27) clears it, long_call (n=3) does not. The threshold
+    // is pinned WITH the number on the payload so the basis is never assumed.
+    expect(result.structuresBelowMinN).toEqual(['long_call']);
+    expect(result.perStructureMinN).toBe(MARKETABLE_MTM_DEFAULT_PER_STRUCTURE_MIN_N);
+    expect(result.perStructureMinN).toBe(10);
+    expect(result.requirePerStructureMinN).toBe(true);
   });
 
-  it('does not unilaterally tighten minN per structure, but the switch works when asked', () => {
-    // 40 rows split 20/20: pooled n clears minN=30, neither structure does.
-    const lenient = foldMarketableMtmForwardValidation(synthCorpus(0.13));
-    expect(lenient.verdict.code).toBe('PASS');
-    expect(lenient.structuresBelowMinN).toEqual(['csp', 'long_call']);
-    const strict = foldMarketableMtmForwardValidation(synthCorpus(0.13), { requirePerStructureMinN: true });
-    expect(strict.verdict.code).toBe('REVIEW');
-    expect(strict.verdict.reason).toMatch(/insufficient per-structure n/);
+  // ── TRA-2300 §5: the floor is ON at 10, and it is a FLOOR CHECK ─────────────
+  it('§5: the per-structure floor ships ON at 10 against an unchanged pooled 30', () => {
+    // 40 rows split 20/20: pooled n=40 clears 30 AND each structure clears the 10-row floor,
+    // so a genuinely healthy corpus is not punished by the tightening.
+    const healthy = foldMarketableMtmForwardValidation(synthCorpus(0.13));
+    expect(healthy.minN).toBe(MARKETABLE_MTM_DEFAULT_MIN_N);
+    expect(healthy.requirePerStructureMinN).toBe(true);
+    expect(healthy.structuresBelowMinN).toEqual([]);
+    expect(healthy.verdict.code).toBe('PASS');
+    // …and the floor is stated as a floor, not as precision.
+    expect(healthy.perStructureMinNNote).toMatch(/FLOOR CHECK, not an estimate/);
+    expect(healthy.perStructureMinNNote).toMatch(/do NOT estimate a 90th percentile/i);
+  });
+
+  it('§5: a structure under the floor forces REVIEW by DEFAULT — no flag needed', () => {
+    // 18 rows split 9/9: pooled n=18 already fails minN=30, so use a corpus that clears the
+    // pool and fails only the floor: 34 csp + 6 long_call = 40 pooled, long_call n=6 < 10.
+    // "A p90 off n=6 is not a tail estimate" — the ticket's own rationale, made executable.
+    const recs: SandboxStrategyRecord[] = [];
+    for (let i = 0; i < 34; i++) {
+      recs.push(record('csp', leg({ side: 'sell', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'buy', requestedPx: 2, bid: 2 * (1 - 0.13), ask: 2 * (1 + 0.13), fillPx: 2 * (1 + 0.13) })));
+    }
+    for (let i = 0; i < 6; i++) {
+      recs.push(record('long_call', leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: 2 * (1 - 0.13), ask: 2 * (1 + 0.13), fillPx: 2 * (1 - 0.13) })));
+    }
+    const shipped = foldMarketableMtmForwardValidation(recs);
+    expect(shipped.n).toBe(40);
+    expect(shipped.structuresBelowMinN).toEqual(['long_call']);
+    expect(shipped.verdict.code).toBe('REVIEW');
+    expect(shipped.verdict.reason).toMatch(/insufficient per-structure n \(< 10\): long_call \(n=6\)/);
+    // The NEGATIVE CONTROL: turn the floor off and the SAME corpus passes the advisory gate.
+    // Without this, "REVIEW" could be coming from anything else in the fold.
+    const off = foldMarketableMtmForwardValidation(recs, { requirePerStructureMinN: false });
+    expect(off.verdict.code).toBe('PASS');
+  });
+
+  it('§5: both thresholds are param- and env-overridable, and a junk override cannot DISARM the floor', () => {
+    const relaxed = foldMarketableMtmForwardValidation(synthCorpus(0.13), { perStructureMinN: 25 });
+    expect(relaxed.perStructureMinN).toBe(25);
+    expect(relaxed.structuresBelowMinN).toEqual(['csp', 'long_call']); // n=20 each, now below 25
+    expect(relaxed.verdict.code).toBe('REVIEW');
+
+    expect(resolveMarketableMtmGateThresholds({})).toEqual({
+      minN: 30, perStructureMinN: 10, requirePerStructureMinN: true,
+    });
+    expect(resolveMarketableMtmGateThresholds({
+      MARKETABLE_MTM_MIN_N: '50',
+      MARKETABLE_MTM_PER_STRUCTURE_MIN_N: '15',
+      MARKETABLE_MTM_REQUIRE_PER_STRUCTURE_MIN_N: 'off',
+    })).toEqual({ minN: 50, perStructureMinN: 15, requirePerStructureMinN: false });
+    // A junk value must fall back to the shipped floor, NOT to NaN: `n < NaN` is false, which
+    // would silently disable the check while the payload still claimed it was enforced.
+    const junk = resolveMarketableMtmGateThresholds({
+      MARKETABLE_MTM_PER_STRUCTURE_MIN_N: 'ten', MARKETABLE_MTM_MIN_N: '-4',
+    });
+    expect(junk.perStructureMinN).toBe(10);
+    expect(junk.minN).toBe(30);
+    expect(Number.isNaN(junk.perStructureMinN)).toBe(false);
   });
 });
 
@@ -420,6 +492,268 @@ describe('TRA-2283 acceptance — the live 30-record corpus shape', () => {
     expect(result.verdict.reason).toMatch(/outside/);
     expect(result.verdict.reason).not.toMatch(/\(retune h/);
     expect(result.verdict.reason).toMatch(/do NOT retune h/);
+  });
+});
+
+// ── TRA-2300: the gate grades quotedH; actualH is advisory ───────────────────
+describe('TRA-2300 — the graded basis is quotedH', () => {
+  /**
+   * A corpus on THIS VENUE'S ACTUAL SHAPE: every leg fills at the decision mid — so `actualH`
+   * is dead by construction, exactly as observed live — while the QUOTED book is real and
+   * two-sided at `quotedHs[i]`. Values are applied round-robin; with an odd-length array and
+   * the i%2 structure alternation, each structure receives each value equally, so a mixed book
+   * (most rows tight, a few very wide) isolates the TAIL check from the MEDIAN check.
+   *
+   * `mid` is constant on purpose: it makes the modeled cross constant, so a quoted-tail
+   * under-charge can only come from the quoted half-spread and not from a mid that happens to
+   * be larger on the wide rows.
+   */
+  function quotedCorpus(
+    quotedHs: readonly number[], n = 40, mid = 2.0, etDay = '2026-07-26',
+  ): SandboxStrategyRecord[] {
+    const recs: SandboxStrategyRecord[] = [];
+    for (let i = 0; i < n; i++) {
+      const isLong = i % 2 === 0;
+      const qh = quotedHs[i % quotedHs.length];
+      const book = { bid: mid * (1 - qh), ask: mid * (1 + qh) };
+      recs.push(record(
+        isLong ? 'long_call' : 'csp',
+        leg({ side: isLong ? 'buy' : 'sell', requestedPx: mid, ...book, fillPx: mid }),
+        leg({ side: isLong ? 'sell' : 'buy', requestedPx: mid, ...book, fillPx: mid }),
+        etDay,
+      ));
+    }
+    return recs;
+  }
+
+  // ── §1: the two verdicts, and which one grades ─────────────────────────────
+  it('§1: PASSES on the graded basis while the ADVISORY basis reads REVIEW on the same corpus', () => {
+    // This is the whole ticket in one assertion. Fills at the mid ⇒ actualH = 0 ⇒ the advisory
+    // verdict says "median 0.0000 outside ±0.03 of 0.134". The QUOTED book says 0.13, which is
+    // the model being right. Grading the advisory one would reject a correct model.
+    const result = foldMarketableMtmForwardValidation(quotedCorpus([0.13]));
+    expect(result.gradedBasis).toBe('quotedH');
+    expect(result.quotedH.n).toBe(40);
+    expect(result.quotedH.median).toBeCloseTo(0.13, 12);
+
+    expect(result.quotedVerdict.code).toBe('PASS');
+    expect(result.quotedVerdict.basis).toBe('quotedH');
+    expect(result.quotedVerdict.reason).toMatch(/median QUOTED h 0\.1300 within ±0\.03 of modeled 0\.134/);
+    expect(result.quotedVerdict.reason).toMatch(/quoted tail covered/);
+
+    expect(result.actualH.median).toBeCloseTo(0, 12);
+    expect(result.verdict.code).toBe('REVIEW');
+    expect(result.verdict.basis).toBe('actualH');
+    // `verdict` keeps its name AND its meaning; `actualVerdict` is the same object named plainly.
+    expect(result.actualVerdict).toBe(result.verdict);
+    expect(result.verdictBasisNote).toMatch(/quotedVerdict.*IS THE GATE/s);
+    expect(result.verdictBasisNote).toMatch(/ADVISORY ONLY/);
+  });
+
+  it('§1: the quoted verdict is gated on quotedH.n, NOT summary.n', () => {
+    // 40 rows with a usable FILL but no usable QUOTE. `summary.n` = 40 clears minN=30, so a
+    // quoted verdict gated on `summary.n` would sail past the floor and grade a median of NaN
+    // (`Math.abs(NaN - 0.134) <= 0.03` is false ⇒ it would emit a REVIEW with a NaN in the
+    // reason, i.e. a graded-looking verdict computed from nothing).
+    const noQuotes = quotedCorpus([0.13]).map((r) => ({
+      ...r, legs: r.legs.map((l) => ({ ...l, bid: null, ask: null })),
+    }));
+    const result = foldMarketableMtmForwardValidation(noQuotes);
+    expect(result.n).toBe(40);
+    expect(result.n).toBeGreaterThanOrEqual(MARKETABLE_MTM_DEFAULT_MIN_N);
+    expect(result.quotedH.n).toBe(0);
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/insufficient QUOTED-basis n \(0 < 30\)/);
+    expect(result.quotedVerdict.reason).not.toMatch(/NaN/);
+    // Moments stay NaN — never 0. A reader must not be able to grade "no measurement" as
+    // "zero spread", which at h=0.134 would read as the model being maximally wrong.
+    expect(Number.isNaN(result.quotedH.median)).toBe(true);
+    expect(Number.isNaN(result.quotedCrossUsd.p90)).toBe(true);
+  });
+
+  // ── §2: the quoted-basis tail check — the prove-it-fires case ──────────────
+  it('§2: a genuinely WIDE quoted book forces a quoted-basis REVIEW on the TAIL ALONE', () => {
+    // 80% of rows quote at exactly the modeled 0.134 and 20% at 0.40. The MEDIAN is therefore
+    // EXACTLY the modeled h — the tolerance check PASSES — so the only thing that can produce a
+    // REVIEW here is the tail check. A tail-blind gate would call this corpus healthy while the
+    // p90 book charges 3× what the mark haircuts.
+    const result = foldMarketableMtmForwardValidation(
+      quotedCorpus([0.134, 0.134, 0.134, 0.134, 0.40]),
+    );
+    expect(result.quotedH.n).toBe(40);
+    expect(result.quotedH.median).toBeCloseTo(MARKETABLE_MTM_DEFAULT_H, 12); // tolerance: PASS
+    expect(Math.abs(result.quotedH.median - MARKETABLE_MTM_DEFAULT_H))
+      .toBeLessThanOrEqual(MARKETABLE_MTM_DEFAULT_TOL);
+    expect(result.quotedH.p90).toBeCloseTo(0.40, 12);                        // tail: FAIL
+    expect(result.quotedCrossUsd.p90).toBeCloseTo(80, 9);                    // 0.40 · 2 · 100
+    expect(result.modeledCrossUsdOnQuoted.p90).toBeCloseTo(26.8, 9);         // 0.134 · 2 · 100
+
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/under-charges the tail/);
+    expect(result.quotedVerdict.reason).toMatch(/3\.0×/);
+    expect(result.quotedVerdict.reason).not.toMatch(/outside ±/); // NOT the median check
+  });
+
+  it('§2: D3\'s rule carries onto the quoted basis — one under-charged structure forces REVIEW', () => {
+    // D3's masking mechanism was MID SIZE, not row count. csp quotes tight (0.13) on 30 rows at
+    // a $10.00 mid; long_call quotes WIDE (0.45) on 10 rows at a $1.00 mid. Because the tail
+    // check is in DOLLARS, csp's 10×-larger mids dominate the pooled p90 on BOTH sides
+    // (modeled $134 ≥ quoted $130 ⇒ "covered"), and the pooled quotedH median is csp's 0.13,
+    // inside tol. Every pooled check reads healthy while long_call's book charges 3.4× what the
+    // mark haircuts. The per-structure rule is the only thing that can catch it.
+    const quoted = (mid: number, qh: number) => ({ bid: mid * (1 - qh), ask: mid * (1 + qh) });
+    const recs: SandboxStrategyRecord[] = [];
+    for (let i = 0; i < 30; i++) {
+      recs.push(record('csp',
+        leg({ side: 'sell', requestedPx: 10, ...quoted(10, 0.13), fillPx: 10 }),
+        leg({ side: 'buy', requestedPx: 10, ...quoted(10, 0.13), fillPx: 10 }), '2026-07-26'));
+    }
+    for (let i = 0; i < 10; i++) {
+      recs.push(record('long_call',
+        leg({ side: 'buy', requestedPx: 1, ...quoted(1, 0.45), fillPx: 1 }),
+        leg({ side: 'sell', requestedPx: 1, ...quoted(1, 0.45), fillPx: 1 }), '2026-07-26'));
+    }
+    const result = foldMarketableMtmForwardValidation(recs);
+    // The pooled tail literally reads "covered" — this is the masking, made explicit.
+    expect(result.modeledCrossUsdOnQuoted.p90).toBeGreaterThanOrEqual(result.quotedCrossUsd.p90);
+    expect(result.quotedH.median).toBeCloseTo(0.13, 12);
+    // The pooled quoted checks, in isolation, would PASS…
+    const pooledOnly = marketableMtmQuotedVerdict(result, MARKETABLE_MTM_DEFAULT_TOL, MARKETABLE_MTM_DEFAULT_MIN_N);
+    expect(pooledOnly.code).toBe('PASS');
+    // …and the shipped quoted verdict still REVIEWs, naming the structure and its multiple.
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/per-structure QUOTED tail UNDER-CHARGED/);
+    expect(result.quotedVerdict.reason).toMatch(/long_call/);
+    const lc = result.perStructure.find((s) => s.structure === 'long_call')!;
+    expect(lc.quotedTailUnderCharged).toBe(true);
+    expect(lc.quotedTailUnderChargeRatio).toBeCloseTo(0.45 / 0.134, 6);
+    expect(lc.quotedVerdict.code).toBe('REVIEW');
+    const csp = result.perStructure.find((s) => s.structure === 'csp')!;
+    expect(csp.quotedTailUnderCharged).toBe(false);
+    expect(csp.quotedTailUnderChargeRatio).toBeNull();
+  });
+
+  it('§2: an UNMEASURABLE quoted tail is not reported as a covered one', () => {
+    // No quotes at all ⇒ both p90s are NaN. That must NOT flag as under-charged (it is not a
+    // tail failure), and must NOT be absorbed as "covered" either — the n-floor is what speaks.
+    const noQuotes = quotedCorpus([0.13]).map((r) => ({
+      ...r, legs: r.legs.map((l) => ({ ...l, bid: null, ask: null })),
+    }));
+    const result = foldMarketableMtmForwardValidation(noQuotes);
+    expect(result.perStructure.every((s) => s.quotedTailUnderCharged)).toBe(false);
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    // Every structure is NAMED as ungradeable — "nothing was flagged" and "nothing could be
+    // checked" must not read identically.
+    expect(result.structuresBelowQuotedMinN.sort()).toEqual(['csp', 'long_call']);
+    expect(result.quotedVerdict.reason).toMatch(/NOT gradeable/);
+  });
+
+  // ── §3: the missing-quote zero, made separable ─────────────────────────────
+  it('§3: separates legacy_no_quote_field from quote_null_at_snap — same zero, opposite diagnoses', () => {
+    const recs: SandboxStrategyRecord[] = [
+      // 4 legacy rows: the bid/ask KEYS are absent (record predates 4871bbc). Benign.
+      ...Array.from({ length: 4 }, () => record('long_call',
+        legacyLeg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        legacyLeg({ side: 'sell', requestedPx: 2, fillPx: 2 }), '2026-07-20')),
+      // 3 post-writer rows whose snap returned NO BOOK: keys present, values null. NOT benign.
+      ...Array.from({ length: 3 }, () => record('long_call',
+        leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: null, ask: null, fillPx: 2 }), '2026-07-26')),
+      // 2 rows with a populated but CROSSED book — corrupt, and its own bucket so the counts
+      // reconcile instead of a corrupt book hiding inside one of the other two.
+      ...Array.from({ length: 2 }, () => record('long_call',
+        leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: 2.5, ask: 1.5, fillPx: 2 }), '2026-07-26')),
+      // 5 healthy quoted rows.
+      ...Array.from({ length: 5 }, () => record('long_call',
+        leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: 1.74, ask: 2.26, fillPx: 2 }), '2026-07-27')),
+    ];
+    const { quoteCoverage: cov, ...result } = foldMarketableMtmForwardValidation(recs);
+    expect(result.n).toBe(14);
+    expect(cov.legacy_no_quote_field).toBe(4);
+    expect(cov.quote_null_at_snap).toBe(3);
+    expect(cov.quote_unusable).toBe(2);
+    expect(cov.quoted).toBe(5);
+    expect(cov.quoted).toBe(result.quotedH.n);
+    // Exhaustive: the four buckets RECONCILE against n, so a reader never has to infer a
+    // residual (which is where a fifth, unnamed state would hide).
+    expect(cov.legacy_no_quote_field + cov.quote_null_at_snap + cov.quote_unusable + cov.quoted)
+      .toBe(cov.retained);
+    expect(cov.retained).toBe(result.n);
+    // The two states are INDISTINGUISHABLE through quotedH alone — that is why they are split.
+    const perRow = foldMarketableMtmForwardValidation(recs, { includeSamples: true }).samples!;
+    const legacyRow = perRow.find((s) => s.quoteState === 'legacy_no_quote_field')!;
+    const nullRow = perRow.find((s) => s.quoteState === 'quote_null_at_snap')!;
+    expect(legacyRow.quotedH).toBeNull();
+    expect(nullRow.quotedH).toBeNull();      // identical observable…
+    expect(legacyRow.quoteState).not.toBe(nullRow.quoteState); // …separable state
+  });
+
+  it('§3: carries the etDay bounds of the QUOTE-BEARING rows so coverage can be pinned to the deploy', () => {
+    // Only quote-bearing rows may set the bounds. A legacy row dated 2026-07-20 must NOT drag
+    // etDayMin below the 4871bbc boundary — if it could, "coverage starts at the deploy" would
+    // be unverifiable from this payload.
+    const recs: SandboxStrategyRecord[] = [
+      record('long_call', legacyLeg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        legacyLeg({ side: 'sell', requestedPx: 2, fillPx: 2 }), '2026-07-20'),
+      record('long_call', leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: 1.74, ask: 2.26, fillPx: 2 }), '2026-07-25'),
+      record('long_call', leg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        leg({ side: 'sell', requestedPx: 2, bid: 1.74, ask: 2.26, fillPx: 2 }), '2026-07-28'),
+    ];
+    const cov = foldMarketableMtmForwardValidation(recs).quoteCoverage;
+    expect(cov.etDayMin).toBe('2026-07-25');   // the deploy boundary, not the legacy row
+    expect(cov.etDayMax).toBe('2026-07-28');
+    expect(foldMarketableMtmForwardValidation([recs[0]]).quoteCoverage.etDayMin).toBeNull();
+  });
+
+  it('§3: the quoted REVIEW reason names the split, so "not yet" never reads as "dead"', () => {
+    const legacyOnly = foldMarketableMtmForwardValidation(
+      Array.from({ length: 8 }, () => record('long_call',
+        legacyLeg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        legacyLeg({ side: 'sell', requestedPx: 2, fillPx: 2 }), '2026-07-20')),
+    );
+    expect(legacyOnly.quotedVerdict.reason).toMatch(/8 predate the bid\/ask writer/);
+    expect(legacyOnly.quotedVerdict.reason).toMatch(/0 had a null quote AT SNAP/);
+    expect(legacyOnly.quotedVerdict.reason).toMatch(/4871bbc/);
+  });
+
+  // ── §4: dispersion rules out a synthesized constant quote ──────────────────
+  it('§4: quotedH.min/max expose dispersion — a constant book is visible as min === max', () => {
+    const varied = foldMarketableMtmForwardValidation(quotedCorpus([0.10, 0.134, 0.18, 0.22]));
+    expect(varied.quotedH.min).toBeCloseTo(0.10, 12);
+    expect(varied.quotedH.max).toBeCloseTo(0.22, 12);
+    expect(varied.quotedH.min).not.toBeCloseTo(varied.quotedH.max!, 6);
+    // A real chain snapped at 40 decision times cannot yield min === max. If it does, the
+    // "quote" is a constant somebody wrote — the moments alone would look perfectly healthy.
+    const constant = foldMarketableMtmForwardValidation(quotedCorpus([0.134]));
+    expect(constant.quotedH.min).toBeCloseTo(constant.quotedH.max!, 12);
+    expect(constant.quotedH.median).toBeCloseTo(MARKETABLE_MTM_DEFAULT_H, 12); // reads healthy…
+    expect(constant.quotedVerdict.code).toBe('PASS');                          // …and PASSES
+    // `clamped` survives alongside them (TRA-2283), and min/max are null — never 0 — at n=0.
+    expect(constant.quotedH.clamped).toBe(0);
+    const none = foldMarketableMtmForwardValidation(quotedCorpus([0.13]).map((r) => ({
+      ...r, legs: r.legs.map((l) => ({ ...l, bid: null, ask: null })),
+    })));
+    expect(none.quotedH.min).toBeNull();
+    expect(none.quotedH.max).toBeNull();
+  });
+
+  // ── the explicitly-NOT-wanted list, pinned so a later edit cannot drift into it ──
+  it('does NOT retune h off the dead actualH median, and arms nothing', () => {
+    const result = foldMarketableMtmForwardValidation(quotedCorpus([0.13]));
+    // h stays the modeled 0.134 even though actualH's median here is 0.0000. Retuning to that
+    // would collapse the marketable(bid) haircut to indistinguishable from mid-marking.
+    expect(result.modeledH).toBe(MARKETABLE_MTM_DEFAULT_H);
+    expect(result.modeledH).toBe(0.134);
+    expect(result.actualH.median).toBeCloseTo(0, 12);
+    expect(result.verdict.reason).toMatch(/do NOT retune h/);
+    expect(result.actualHCaveat).toMatch(/MUST NOT be actioned/);
+    // Read-only: the fold emits no enable/arm field of any kind.
+    const keys = Object.keys(result);
+    expect(keys).not.toContain('enabled');
+    expect(keys.filter((k) => /^(enable|arm)/i.test(k))).toEqual([]);
   });
 });
 

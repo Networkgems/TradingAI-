@@ -528,6 +528,7 @@ import {
 } from './parity-reconcile.js';
 import {
   foldMarketableMtmForwardValidation,
+  resolveMarketableMtmGateThresholds,
   MARKETABLE_MTM_SCOPE,
 } from './marketable-mtm-forward-validation.js';
 import type { TradierEnv } from '@trading-app/shared';
@@ -10356,10 +10357,22 @@ app.get('/api/health/parity-reconcile', (_req, res) => {
 // half-spread off the two-sided QUOTED book — the only falsifiable measurement on a venue
 // that fills at the decision mid — and `diagnostics` echoes the dropped/outlier rows so the
 // diagnosis is a direct read rather than a reconstruction from published moments. Extra query
-// params: `samples=1` echoes per-row samples (capped), `requirePerStructureMinN=1` additionally
-// demands every structure clear `minN` (reportable switch — the pooled default is unchanged;
-// `minN` is QuantTrader's threshold to set). `actualHCaveat` rides the payload: the verdict's
-// measured-median string is NOT an instruction to retune h.
+// params: `samples=1` echoes per-row samples (capped), `requirePerStructureMinN=0|1` overrides
+// the per-structure floor switch, `perStructureMinN` overrides its threshold.
+// `actualHCaveat` rides the payload: the verdict's measured-median string is NOT an instruction
+// to retune h.
+//
+// TRA-2300 — **the graded verdict on this route is now `quotedVerdict` (basis `quotedH`), not
+// `verdict`**. `verdict`/`actualVerdict` (basis `actualH`) stays for shape compatibility and is
+// ADVISORY ONLY: it is measured requestedPx-vs-fillPx on a venue that fills at the decision mid,
+// so it reads ~0 whether the true spread is 0 or the simulator ignores the book — it has no
+// failing state here. `gradedBasis` + a per-verdict `basis` field name the graded one so an
+// old-shaped reader cannot grade the wrong number. Also new: `quoteCoverage` separates a benign
+// legacy-record zero (`legacy_no_quote_field`) from a dead instrument (`quote_null_at_snap`),
+// `quotedH.min`/`max` give the dispersion that rules out a synthesized constant quote, and the
+// per-structure floor ships ON at 10 (pooled 30) — env-overridable via `MARKETABLE_MTM_MIN_N`,
+// `MARKETABLE_MTM_PER_STRUCTURE_MIN_N`, `MARKETABLE_MTM_REQUIRE_PER_STRUCTURE_MIN_N`. Still
+// read-only; arms NOTHING (h stays 0.134, ENABLE_MARKETABLE_OPEN_MTM untouched, TRA-1897 holds).
 app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
   const numParam = (v: unknown): number | undefined => {
     if (typeof v !== 'string' || v.trim() === '') return undefined;
@@ -10368,15 +10381,24 @@ app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
   };
   const boolParam = (v: unknown): boolean =>
     typeof v === 'string' && (v === '1' || v.toLowerCase() === 'true');
+  // A query param must be able to turn the floor OFF as well as on, so an ABSENT param falls
+  // back to the env-resolved default rather than to `false` — otherwise every unparameterized
+  // read would silently disarm the TRA-2300 §5 floor the route is supposed to ship with.
+  const optBoolParam = (v: unknown, fallback: boolean): boolean =>
+    typeof v === 'string' && v.trim() !== '' ? boolParam(v) : fallback;
   const strategyParam = typeof req.query.strategy === 'string' && req.query.strategy.trim() !== ''
     ? req.query.strategy
     : null;
+  const thresholds = resolveMarketableMtmGateThresholds(process.env);
   const result = foldMarketableMtmForwardValidation(getSandboxStrategyRecords(), {
     h: numParam(req.query.h),
     tol: numParam(req.query.tol),
-    minN: numParam(req.query.minN),
+    minN: numParam(req.query.minN) ?? thresholds.minN,
     strategy: strategyParam,
-    requirePerStructureMinN: boolParam(req.query.requirePerStructureMinN),
+    requirePerStructureMinN: optBoolParam(
+      req.query.requirePerStructureMinN, thresholds.requirePerStructureMinN,
+    ),
+    perStructureMinN: numParam(req.query.perStructureMinN) ?? thresholds.perStructureMinN,
     includeSamples: boolParam(req.query.samples),
   });
   res.status(200).json({
