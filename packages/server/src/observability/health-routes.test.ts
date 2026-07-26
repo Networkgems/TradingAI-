@@ -1362,6 +1362,37 @@ describe('TRA-2311 spreadCeiling arm bit on /api/health/cost-aware-gate', () => 
     expect(spreadCeiling.note).toContain('ARMED');
   });
 
+  // TRA-2319 — the ARMED note used to end "armed + evaluated>0 with
+  // maxAdmittedSpreadPct ≤ the sleeve ceiling is the actual pass", and a reader who
+  // followed it verbatim read PASS on a gate that ADMITTED NOTHING: the field is
+  // `number | null` and `null <= 0.10` is true in JS. The note had already earned a
+  // VOID branch for `evaluated == 0` (no entry reached the gate); the third state —
+  // the gate RAN and rejected everything — was missing, and it is the one the naive
+  // comparison silently converts into a pass. The instruction is what ships to the
+  // grader, so the instruction is what has to carry the warning.
+  it('the ARMED note states the maxAdmittedSpreadPct NULL branch, not just the evaluated=0 one', () => {
+    const { spreadCeiling } = serveCostGate();
+    expect(spreadCeiling.armed).toBe(true);
+    const note = spreadCeiling.note;
+    // Both VOID branches present and distinguishable.
+    expect(note).toContain('evaluated=0');
+    expect(note).toContain('maxAdmittedSpreadPct null');
+    expect(note).toContain('ADMITTED NOTHING');
+    // The mechanism, not just the conclusion — a bare "don't do that" rots into
+    // folklore, the coercion rule does not.
+    expect(note).toContain('null <= 0.10');
+    expect(note).toContain('maxAdmittedSpreadPct !== null');
+    expect(note).toContain('TRA-2319');
+
+    // And the hazard itself, asserted rather than assumed: this is the comparison the
+    // old sentence sanctioned, on the value the gate emits when it admits nothing.
+    const maxAdmittedWhenNothingAdmitted: number | null = null;
+    expect(maxAdmittedWhenNothingAdmitted! <= 0.1).toBe(true); // ← the false PASS
+    expect(
+      maxAdmittedWhenNothingAdmitted !== null && maxAdmittedWhenNothingAdmitted <= 0.1,
+    ).toBe(false); // ← the predicate the note now prescribes
+  });
+
   it('OPTION_SPREAD_CEILING_ENFORCE=0 ⇒ armed FALSE — the bit MOVES (prove-it-fires)', () => {
     process.env[FLAG] = '0';
     const { spreadCeiling } = serveCostGate();
@@ -2075,6 +2106,57 @@ describe('GET /api/health/option-spread-cost — TRA-2316 ceilingCompliance', ()
     expect(desk.maxSpreadPct).toBeNull();
     expect(desk.countAboveCeiling).toBeNull();
     expect(desk.countBelowMinBid).toBeNull();
+  });
+
+  // TRA-2319 — THE FALSE PASS THE `toBeNull()` ASSERT ABOVE DOES NOT CATCH.
+  //
+  // The test above pins the VALUE (`null`). It does not pin what a consumer DOES with
+  // it, and the obvious thing to do with a spread max is compare it to the ceiling —
+  // at which point JavaScript coerces `null` to 0 under relational comparison and
+  // `null <= 0.10` is **true**. So the empty-partition sentinel is swallowed by the
+  // one predicate every reader reaches for, and a desk book that opened NOTHING reads
+  // as a clean pass. (`undefined <= 0.10` is false, so the two absent-ish values do
+  // NOT behave alike — which is exactly why "it's nullish, the comparison will fail"
+  // is wrong here.) Same false-zero class as TRA-2295 and TRA-2302.
+  //
+  // This test asserts the hazard EXISTS rather than assuming it away, so that anyone
+  // who later "simplifies" a grader to a bare `<=` has a red test explaining why not,
+  // and it pins the safe predicate — gate on `n`, compare `countAboveCeiling` with
+  // `===` — as the contract.
+  it('the empty-partition null is SWALLOWED by `<= ceiling` — grade on n, not on the max', async () => {
+    await recordOptionTradeOpen(
+      row('qa-only', 'qa_reg_2319', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    const desk = cell(await body(), 'desk');
+    expect(desk.n).toBe(0);
+
+    // THE HAZARD, stated as an assertion. Both nullable fields read "compliant" under
+    // the naive comparison, on a cell that measured nothing at all.
+    expect(desk.maxSpreadPct! <= 0.1).toBe(true); // ← the false PASS
+    expect(desk.countAboveCeiling! <= 0).toBe(true); // ← and so does the breach count
+    // Not a general nullish quirk — `undefined` would have failed the same compare,
+    // so a reader cannot reason "absent values don't pass comparisons".
+    expect((undefined as unknown as number) <= 0.1).toBe(false);
+
+    // THE SAFE PREDICATE, which the route note instructs and the grader uses.
+    const passes = desk.n > 0 && desk.countAboveCeiling === 0;
+    expect(passes).toBe(false);
+
+    // And with real rows the same predicate still has both states, so it is a gate
+    // and not a constant `false`.
+    await recordOptionTradeOpen(
+      row('desk-clean', 'admin', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    const withRows = cell(await body(), 'desk');
+    expect(withRows.n > 0 && withRows.countAboveCeiling === 0).toBe(true);
+  });
+
+  it('the payload NOTE warns about the `<=` swallow — a rule that lives only in a ticket is not in the reader path', async () => {
+    const b = (await body()) as unknown as { ceilingCompliance: { note: string } };
+    const note = String(b.ceilingCompliance.note);
+    expect(note).toContain('null <= 0.10');
+    expect(note).toContain('gated.n > 0');
+    expect(note).toContain('TRA-2319');
   });
 
   it('counts a quote-less desk row as DROPPED, never as a zero-spread fill', async () => {
