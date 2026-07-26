@@ -220,8 +220,8 @@ export function grade({ r1, r2, r3, build = readBuild() }) {
       + `grade is READ 2 \`.gated\` + READ 3 — both account-scoped.`);
     // The route's own `comparisonBasis` tells the grader these two should "track" each other. On
     // this build they measure different populations (pooled vs desk), so a divergence is EXPECTED
-    // and is not evidence of a lost counter or a lost fill. TRA-2377.
-    report.push('BASIS: `ceilingCompliance.comparisonBasis` says READ 1 `maxAdmittedSpreadPct` should track `desk[...].gated.maxSpreadPct`. On a pre-TRA-2355 build those are POOLED vs DESK-ONLY — a divergence is expected and is NOT a finding. Do not resolve it via that note (TRA-2377).');
+    // and is not evidence of a lost counter or a lost fill. TRA-2306.
+    report.push('BASIS: `ceilingCompliance.comparisonBasis` says READ 1 `maxAdmittedSpreadPct` should track `desk[...].gated.maxSpreadPct`. On a pre-TRA-2355 build those are POOLED vs DESK-ONLY — a divergence is expected and is NOT a finding. Do not resolve it via that note (TRA-2306).');
   }
   report.push(...build.notes, ...r2.notes, ...r1.notes, ...r3.notes);
 

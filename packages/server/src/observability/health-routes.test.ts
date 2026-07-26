@@ -2159,7 +2159,7 @@ describe('GET /api/health/option-spread-cost — TRA-2316 ceilingCompliance', ()
     expect(note).toContain('TRA-2319');
   });
 
-  // TRA-2377 — the SIBLING string, one line below the note TRA-2319 just swept.
+  // TRA-2306 — the SIBLING string, one line below the note TRA-2319 just swept.
   //
   // `comparisonBasis` is the instruction the TRA-2306 grader executes at the Monday
   // 20:20Z read, and it carried three defects that all pushed the same way:
@@ -2198,7 +2198,7 @@ describe('GET /api/health/option-spread-cost — TRA-2316 ceilingCompliance', ()
     expect(basis).not.toContain('more likely a lost counter than a lost fill');
     expect(basis).not.toMatch(/counters are one-day and in-memory/);
     expect(basis).toContain('A lost FILL is the falsification');
-    expect(basis).toContain('TRA-2377');
+    expect(basis).toContain('TRA-2306');
   });
 
   // The hazard behind (2), asserted rather than assumed — pooled >= desk-only holds by
