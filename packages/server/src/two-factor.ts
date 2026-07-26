@@ -156,6 +156,27 @@ export function verifyChallenge(username: string, code: string): VerifyResult {
   return 'invalid';
 }
 
+/**
+ * TRA-2421 — forget every 2FA artefact for `username` on account deletion.
+ * Returns how many pieces of state were dropped (challenge + stashed enrollment
+ * codes), so a wipe receipt can distinguish "cleared something" from "there was
+ * nothing to clear".
+ *
+ * `otp-challenges.json` sits at the DATA_DIR root like `reset-tokens.json`, so a
+ * per-user directory wipe does not reach it. Usernames are recycled, and an
+ * in-flight challenge keyed on a name is redeemable by whoever holds that name
+ * next.
+ */
+export function forgetTwoFactorState(username: string): number {
+  let cleared = 0;
+  if (challenges.delete(username)) {
+    cleared += 1;
+    persist();
+  }
+  if (enrollmentCodes.delete(username)) cleared += 1;
+  return cleared;
+}
+
 /** Test-only: wipe all in-flight challenges. */
 export function resetTwoFactorStore(): void {
   challenges.clear();

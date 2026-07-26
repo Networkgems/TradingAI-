@@ -401,3 +401,63 @@ describe('TRA-2314 — the historical repair is bounded, attributable and idempo
     expect(recon.falseZeroDates).toEqual(['2026-07-15']);
   });
 });
+
+/**
+ * TRA-2421 — a username is not a book.
+ *
+ * Usernames are the only primary key in this app and they are RECYCLABLE, so
+ * `account === username` alone hands a re-registered name its predecessor's rows.
+ * The shared journal is append-only firm research data and is deliberately NOT
+ * rewritten on delete (purging shrinks board-graded `n`s; blanking `account` makes
+ * a row look pre-TRA-1475, which the DESK filter KEEPS — so anonymising would
+ * inject a deleted book into the firm's numbers). The rows are scoped out of the
+ * recycled book instead, by the identity epoch from `deleted-accounts.ts`.
+ */
+describe('TRA-2421 — identity-epoch scoping of the shared journal', () => {
+  const row = (account: string | undefined, openTs: number, realizedPnlUsd: number) =>
+    ({ account, openTs, closeTs: openTs + 3_600_000, realizedPnlUsd });
+
+  const DELETED_AT = Date.parse('2026-07-26T16:00:00Z');
+  const before = row('enock', Date.parse('2026-07-01T14:00:00Z'), 250.0);
+  const after = row('enock', Date.parse('2026-07-27T14:00:00Z'), 12.5);
+  const rows = [before, after, row('admin', Date.parse('2026-07-01T14:00:00Z'), 17.0)];
+
+  it('NO-OP without an epoch — every existing book is byte-for-byte unchanged', () => {
+    // The load-bearing property. `accountDeletedAt` returns null for every name
+    // nobody deleted, so this is the branch all 28 live books take.
+    expect(journalRowsForBook(rows, 'enock')).toEqual([before, after]);
+    expect(journalRowsForBook(rows, 'enock', null)).toEqual([before, after]);
+    expect(journalRowsForBook(rows, 'enock', undefined)).toEqual([before, after]);
+  });
+
+  it('a recycled name inherits NOTHING from the identity that held it before', () => {
+    expect(journalRowsForBook(rows, 'enock', DELETED_AT)).toEqual([after]);
+  });
+
+  it('MUTATION: without the epoch the SAME rows leak the predecessor P&L', () => {
+    // Pairs the fix with the bug on one input, so a future refactor that drops the
+    // third argument fails here instead of silently reopening TRA-2406's calendar.
+    const leaked = journalRowsForBook(rows, 'enock');
+    expect(leaked).toContain(before);
+    expect(journalRowsForBook(rows, 'enock', DELETED_AT)).not.toContain(before);
+  });
+
+  it('drops a row that cannot be placed in time rather than defaulting it in', () => {
+    // Same treatment, same reason, as an `account`-less row: unattributable is
+    // excluded, never credited. A `?? 0` here would admit every pre-TRA-1475 row
+    // into the recycled book — the exact TRA-2302 lesson.
+    const undated = { account: 'enock', closeTs: DELETED_AT, realizedPnlUsd: 99 };
+    expect(journalRowsForBook([undated], 'enock', DELETED_AT)).toEqual([]);
+    expect(journalRowsForBook([undated], 'enock')).toEqual([undated]);
+  });
+
+  it('a row opened exactly AT the epoch belongs to the new holder', () => {
+    const atEpoch = row('enock', DELETED_AT, 1.0);
+    expect(journalRowsForBook([atEpoch], 'enock', DELETED_AT)).toEqual([atEpoch]);
+  });
+
+  it('never widens the scope: another book stays out regardless of epoch', () => {
+    expect(journalRowsForBook(rows, 'admin', DELETED_AT)).toEqual([]);
+    expect(journalRowsForBook(rows, 'admin')).toHaveLength(1);
+  });
+});

@@ -78,12 +78,42 @@ export interface OptionsDailyPnlDecision {
  * Rows written before TRA-1475 carry no `account`. They are UNATTRIBUTABLE, so
  * they are left out rather than credited to whichever book is being written —
  * pooling them would re-commit the TRA-2193 trap (2,192 such rows exist).
+ *
+ * ── TRA-2421 — `identityEpochMs`, and why a username alone is not a book ──────
+ *
+ * `account` holds a raw username, and usernames are RECYCLABLE: they are the only
+ * primary key in this app, so deleting an account frees the string for the next
+ * signup (TRA-2406/TRA-2410, confirmed by hand 2026-07-26). The journal is shared,
+ * append-only and lives OUTSIDE `users/<username>/`, so no account wipe can reach
+ * it — which means that without this parameter a recycled name inherits its
+ * predecessor's rows through this exact function. Today that is masked by the
+ * unscoped demo-calendar fill; the moment TRA-2407 scopes the fold by book, it
+ * surfaces looking like a regression OF the TRA-2407 fix.
+ *
+ * The rows are deliberately NOT purged or anonymised (see `account-deletion.ts`
+ * for why both corrupt board-graded numbers). They are scoped out of the RECYCLED
+ * book instead.
+ *
+ * `identityEpochMs` is the ms-epoch the current holder of the name acquired it —
+ * i.e. `accountDeletedAt(username)`, which is `null` for every name nobody has
+ * ever deleted. `null`/`undefined` means NO time scoping at all, so every existing
+ * book's fold is byte-for-byte unchanged by this parameter; pass the tombstone,
+ * never `Date.now()` and never a `?? 0`.
+ *
+ * When an epoch IS given, a row with no usable `openTs` is DROPPED. It is
+ * unattributable in time exactly as an `account`-less row is unattributable by
+ * book, and the two get the same treatment for the same reason.
  */
-export function journalRowsForBook<T extends { account?: string }>(
+export function journalRowsForBook<T extends { account?: string; openTs?: number }>(
   rows: ReadonlyArray<T>,
   username: string,
+  identityEpochMs?: number | null,
 ): T[] {
-  return rows.filter(r => r.account === username);
+  const scoped = rows.filter(r => r.account === username);
+  if (identityEpochMs === undefined || identityEpochMs === null) return scoped;
+  return scoped.filter(r => typeof r.openTs === 'number'
+    && Number.isFinite(r.openTs)
+    && r.openTs >= identityEpochMs);
 }
 
 /**

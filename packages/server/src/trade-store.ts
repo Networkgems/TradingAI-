@@ -1,11 +1,11 @@
 import { readFile, writeFile, mkdir, readdir, rm, copyFile, access, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join, dirname, basename } from 'path';
+import { accountDeletedAt, DELETED_ACCOUNTS_FILENAME } from './deleted-accounts.js';
 import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
-import { isEphemeralDataDir } from './data-dir.js';
+import { isEphemeralDataDir, resolveDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'trade-store' });
@@ -18,39 +18,13 @@ const log = logger.child({ module: 'trade-store' });
 // (users.json, reset-tokens.json) stay at the root.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/**
- * TRA-522 — resolve the on-disk persistence root.
- *
- * Root cause of the silent demo-book swap on restart: this path was only ever
- * pinned to `process.env.DATA_DIR`, and the fallback anchors to the *module's*
- * location (`<repo>/packages/server/data`). On the self-hosted host two repos
- * exist (`_default/tradingai_repo` and a sibling `~/TradingAI`), each with its
- * own `packages/server/data`. A PM2 restart launched from a different repo /
- * ecosystem file therefore loaded a *different* book — that is how the demo
- * account flipped from $1,000 (live book) to $26,397 (stale sibling book).
- *
- * The contract this helper guarantees:
- *   1. When `DATA_DIR` is set, it wins verbatim — the canonical, launch-cwd /
- *      repo-independent location ops point every instance at (see
- *      `ops/bootstrap-trading-server.sh` and `docs/runbook.md` §1).
- *   2. The fallback is anchored to `moduleDir`, never to `process.cwd()`, so
- *      the resolved path does not move just because PM2 was started from a
- *      different working directory.
- *
- * `ecosystem.config.cjs` now sets `DATA_DIR` explicitly so the canonical
- * production launch path always takes branch (1); the fallback only applies to
- * ad-hoc / dev runs.
- */
-export function resolveDataDir(
-  env: NodeJS.ProcessEnv = process.env,
-  moduleDir: string = __dirname,
-): string {
-  const fromEnv = env.DATA_DIR;
-  if (fromEnv && fromEnv.trim()) return fromEnv;
-  return join(moduleDir, '..', 'data');
-}
+// TRA-2421 — `resolveDataDir` now lives in the leaf module `data-dir.ts` and is
+// re-exported here so every existing importer keeps working. It had to move:
+// `deleted-accounts.ts` needs the resolved root, and this module has to ask IT
+// whether an account was destroyed before restoring one from a backup — which
+// made the two a cycle, and `scripts/check-cycles.mjs` (TRA-1684) refuses cycles
+// on principle. One implementation, two doors.
+export { resolveDataDir };
 
 const DATA_DIR = resolveDataDir();
 const BACKUP_DIR = join(DATA_DIR, 'backups');
@@ -241,12 +215,54 @@ async function findLatestBackupDir(): Promise<string | null> {
 }
 
 /**
+ * TRA-2421 — parse a backup generation's directory name back to ms-epoch.
+ *
+ * `rotateBackups` stamps them with `new Date().toISOString().replace(/[:.]/g,'-')`,
+ * i.e. `2026-07-26T12-00-00-000Z`. This is the inverse, and it lives here because
+ * this module owns that naming. Returns `null` for anything that does not match
+ * exactly — callers must treat `null` as UNKNOWN and fail closed, never as 0.
+ */
+export function parseBackupGenerationStamp(name: string): number | null {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/.exec(name);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
  * Try to restore a per-user file from the latest backup. Backups mirror the
  * user-namespaced layout (backups/<ts>/users/<username>/<file>).
+ *
+ * TRA-2421 — this fallback is why `rm -rf DATA_DIR/users/<name>/` DOES NOT delete
+ * an account: the next read of a missing primary silently restores the whole book
+ * from a backup and writes it back to disk. `wipeAccountData` purges the user's
+ * subtree from every generation, and this guard is the second line of defence for
+ * when that purge cannot complete (a locked file, a `rotateBackups()` racing the
+ * delete, or a DATA_DIR rolled back from an external snapshot): a tombstoned name
+ * may never be restored from a generation older than its deletion.
+ *
+ * Fails CLOSED — a generation whose stamp cannot be parsed is refused rather than
+ * assumed recent, because the cost of a false negative is one lost restore and the
+ * cost of a false positive is resurrecting a book the user asked us to destroy.
+ * Names with no tombstone (every ordinary account) are unaffected.
  */
 async function tryRestoreFromBackup<T>(targetFile: string, username: string, fileName: string): Promise<T | null> {
   const latestBackup = await findLatestBackupDir();
   if (!latestBackup) return null;
+  const deletedAt = accountDeletedAt(username, DATA_DIR);
+  if (deletedAt !== null) {
+    const stamp = parseBackupGenerationStamp(basename(latestBackup));
+    if (stamp === null || stamp < deletedAt) {
+      log.warn('Refusing backup restore for a deleted account', {
+        targetFile,
+        latestBackup,
+        username,
+        deletedAt: new Date(deletedAt).toISOString(),
+        reason: stamp === null ? 'unparseable backup stamp' : 'backup predates deletion',
+      });
+      return null;
+    }
+  }
   const backupFile = join(latestBackup, 'users', username, fileName);
   if (!existsSync(backupFile)) return null;
   try {
@@ -304,7 +320,11 @@ export async function rotateBackups(): Promise<void> {
   await ensureDir(target);
 
   // Global files at the data-dir root.
-  const globalFiles = ['users.json', 'admin-reset-applied.json'];
+  // TRA-2421 — `deleted-accounts.json` MUST be here. It is the record of which
+  // identities were destroyed; if a DATA_DIR were ever rolled back from a backup
+  // without it, every tombstone would vanish while the per-user trees came back,
+  // and the username-recycling adoption bug would silently re-arm.
+  const globalFiles = ['users.json', 'admin-reset-applied.json', DELETED_ACCOUNTS_FILENAME];
   for (const name of globalFiles) {
     const src = join(DATA_DIR, name);
     if (!existsSync(src)) continue;

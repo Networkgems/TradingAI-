@@ -240,3 +240,25 @@ export function consumeResetToken(code: string): string | null {
   }
   return username;
 }
+
+/**
+ * TRA-2421 — drop every outstanding reset code for `username`. Returns how many
+ * were revoked.
+ *
+ * `reset-tokens.json` lives at the DATA_DIR ROOT, not under
+ * `users/<username>/`, so an account wipe that only removes the per-user
+ * directory leaves it untouched. Usernames are recycled here (they are the only
+ * primary key), so a code minted for the deleted account would otherwise stay
+ * redeemable for up to an hour against whoever next registers that name — a
+ * password-reset path onto someone else's book.
+ */
+export function revokeResetTokensFor(username: string): number {
+  let revoked = 0;
+  for (const [code, entry] of resetTokens) {
+    if (entry.username !== username) continue;
+    resetTokens.delete(code);
+    revoked += 1;
+  }
+  if (revoked > 0) persistResetTokens();
+  return revoked;
+}

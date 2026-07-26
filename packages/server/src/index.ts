@@ -38,6 +38,11 @@ import {
   shouldServeFirmWideDemoFold,
   isReservedOperatorBookName,
 } from './reports/demo-calendar-fill-scope.js';
+// TRA-2421 — self-serve account deletion: the wipe surface and the identity
+// tombstone that keeps a recycled username from inheriting the previous holder's
+// shared-journal rows.
+import { wipeAccountData } from './account-deletion.js';
+import { accountDeletedAt } from './deleted-accounts.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
@@ -1189,6 +1194,26 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
     res.status(401).json({ error: 'Invalid or expired token' });
     return;
   }
+  // TRA-2421 — the token must belong to an account that still EXISTS.
+  //
+  // Tokens are stateless HMACs with a 24h TTL (`auth.ts`) — there is no session
+  // store and no revocation list — so without this check a deleted user keeps
+  // full API access until their token ages out. That is not merely a stale
+  // session: the very next request would reach `userCtx()` → `ensureUserContext`
+  // → `createUserContext`, which mkdirs `users/<username>/` and rehydrates the
+  // book through `tryRestoreFromBackup`. The account would UN-DELETE ITSELF
+  // within one poll of the desktop client, with the delete route's 200 and an
+  // empty directory both still looking correct.
+  //
+  // Fails CLOSED on purpose: a corrupt `users.json` parses to `users = []`
+  // (`users.ts:110-111`), so every caller 401s and re-login fails loudly, rather
+  // than the whole fleet running on phantom identities that re-provision
+  // directories. This also ends an ADMIN-deleted user's session immediately,
+  // which was the same 24h hole.
+  if (!getUser(user)) {
+    res.status(401).json({ error: 'Account no longer exists' });
+    return;
+  }
   res.locals['authUser'] = user;
   // TRA-406 — stamp the authenticated user onto the request trace so every
   // subsequent log line and captured error carries it.
@@ -1411,7 +1436,13 @@ async function generateAndSaveReport(
       // close booked between then and now is on disk before we read it.
       await ctx.engine.flushOptionTradeJournal?.();
       const census = foldJournalClosesByEtDay(
-        journalRowsForBook(await listOptionTradeJournal(), ctx.username),
+        // TRA-2421 — third argument is the identity epoch (null for every name
+        // never deleted, so this is a no-op for every existing book). All THREE
+        // `journalRowsForBook` call sites pass it: TRA-2314's invariant is that
+        // the writer, the repair and the checker scope identically, and an epoch
+        // applied at only one of them would be a guard grading a population the
+        // writer never saw.
+        journalRowsForBook(await listOptionTradeJournal(), ctx.username, accountDeletedAt(ctx.username)),
         (ts: number) => etDateString(new Date(ts)),
       );
       optionsDailyDecision = resolveDailyOptionsPnl({
@@ -1643,7 +1674,8 @@ async function runOptionsDailyPnlRepair(): Promise<void> {
       // `account` are unattributable (2,192 pre-TRA-1475 ones) and are never
       // credited to whichever book is being repaired — the TRA-2193 trap.
       const census = foldJournalClosesByEtDay(
-        journalRowsForBook(rows, ctx.username),
+        // TRA-2421 — identity epoch; see the note at the 21:00 writer above.
+        journalRowsForBook(rows, ctx.username, accountDeletedAt(ctx.username)),
         (ts: number) => etDateString(new Date(ts)),
       );
       if (census.size === 0) continue;
@@ -3872,7 +3904,8 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         const journalByDate = journalRows == null
           ? null
           : foldJournalClosesByEtDay(
-            journalRowsForBook(journalRows, ctx.username),
+            // TRA-2421 — identity epoch; see the note at the 21:00 writer.
+            journalRowsForBook(journalRows, ctx.username, accountDeletedAt(ctx.username)),
             (ts: number) => etDateString(new Date(ts)),
           );
         return {
@@ -5870,6 +5903,102 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   const user = getUser(username);
   if (!user) { res.status(404).json({ error: 'User not found' }); return; }
   res.json(toSafeUser(user));
+});
+
+/**
+ * TRA-2421 — self-serve account deletion: wipe the data, destroy the identity.
+ *
+ * Board request on TRA-2406: "can you add a self account delete option in
+ * settings that wipe data and delete account?" This is the ONLY destructive
+ * delete path. The admin route below stays non-destructive on purpose (TRA-142:
+ * "on-disk state is left intact … so an admin can restore them"), so an operator
+ * mis-click is still recoverable while a user's explicit request is honoured.
+ *
+ * ⚠️ THE ORDER OF THESE STEPS IS THE FIX. Wiping first and de-authenticating
+ * afterwards restores the book: a debounced persist timer, a request on the
+ * still-valid token, or a WS reconnect all land on `ensureUserContext`, which
+ * re-mkdirs the directory and rehydrates it from a 30-min backup. Engines are
+ * stopped, then the credential row goes (which is what makes `requireAuth` start
+ * refusing the caller's token), then sockets are closed — and only then are the
+ * files destroyed.
+ */
+app.delete('/api/account', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const { password } = req.body as { password?: string };
+
+  // Irreversible ⇒ a bare token is not enough (a borrowed laptop must not be able
+  // to destroy the book). Throttled on the same counters as login so this cannot
+  // become an unmetered password oracle.
+  const ipKey = `delete-account:ip:${clientKey(req)}`;
+  const userKey = `delete-account:user:${username.toLowerCase()}`;
+  if (rejectIfThrottled(res, [ipKey, userKey])) return;
+  if (typeof password !== 'string' || password.length === 0) {
+    res.status(400).json({ error: 'Your current password is required to delete this account.' });
+    return;
+  }
+  if (!(await validateUserCredentials(username, password))) {
+    recordFailure(ipKey);
+    recordFailure(userKey);
+    res.status(401).json({ error: 'Password is incorrect' });
+    return;
+  }
+  recordSuccess(ipKey);
+  recordSuccess(userKey);
+
+  // TRA-2407 — operator books (`admin`, `Richard`, plus any env additions) carry
+  // the firm-wide demo calendar fill and are referenced by name across the
+  // reporting code. Reuse the SAME predicate the signup guard uses so the two
+  // cannot drift; a name that may not be registered must not be self-destructible
+  // either.
+  if (isReservedOperatorBookName(username)) {
+    res.status(403).json({ error: 'Operator accounts cannot be deleted from Settings. Contact an administrator.' });
+    return;
+  }
+  const me = getUser(username);
+  if (!me) { res.status(404).json({ error: 'User not found' }); return; }
+  if (me.role === 'admin' && getAllUsers().filter(u => u.role === 'admin').length <= 1) {
+    res.status(409).json({ error: 'This is the last administrator account. Promote another admin first.' });
+    return;
+  }
+
+  // 1. Stop the engines and clear the debounced persist timers BEFORE anything is
+  //    removed — a pending `scheduleStocksPersist` would otherwise rewrite
+  //    `trades-stocks.json` seconds after the wipe.
+  destroyUserContext(username);
+  // 2. Drop the credential row. From here the caller's token fails `requireAuth`,
+  //    so no in-flight request can rebuild the context underneath the wipe.
+  const removed = await deleteUser(username);
+  if (!removed) { res.status(404).json({ error: 'User not found' }); return; }
+  // 3. Close their live sockets; the WS upgrade path now refuses the token too.
+  closeUserSockets(username);
+  // 4. Destroy the files — primary tree, every backup generation, reset codes and
+  //    2FA state — and tombstone the identity.
+  const receipt = await wipeAccountData(username, { via: 'self' });
+
+  // The shared option journal is NOT rewritten (see `account-deletion.ts`); the
+  // tombstone scopes those rows out of any future holder of this name. Report the
+  // retained count so the answer to "what happened to my trades in the firm
+  // ledger?" is a number rather than silence.
+  let journalRowsRetained: number | null = null;
+  try {
+    journalRowsRetained = journalRowsForBook(await listOptionTradeJournal(), username).length;
+  } catch { /* the journal is advisory here; never fail a completed delete on it */ }
+
+  if (!receipt.ok) {
+    // The identity IS gone and cannot authenticate — that half is done and is not
+    // reversible. Say plainly that residue remains rather than returning a bare
+    // 200 that reads exactly like a clean wipe.
+    log.error('TRA-2421: self-delete completed with residue', { username, receipt });
+    res.status(500).json({
+      ok: false,
+      error: 'Your account was deleted, but some stored data could not be removed. This has been logged for an operator.',
+      receipt,
+      journalRowsRetained,
+    });
+    return;
+  }
+  log.info('TRA-2421: self-delete complete', { username, receipt });
+  res.json({ ok: true, receipt, journalRowsRetained });
 });
 
 app.patch('/api/auth/me', requireAuth, async (req, res) => {
@@ -10966,6 +11095,28 @@ function broadcastToUser(username: string, msg: string): void {
   }
 }
 
+/**
+ * TRA-2421 — hang up every live socket belonging to `username`.
+ *
+ * The upgrade handler refuses a deleted user's token, but an ALREADY-OPEN socket
+ * was authenticated before the delete and would otherwise keep streaming state
+ * from a book that no longer exists. Closes every socket regardless of
+ * `readyState` (unlike `broadcastToUser`, which only writes to OPEN ones) —
+ * a CONNECTING socket is exactly the one that would survive the sweep.
+ * `1000 Normal Closure` so the client treats it as a sign-out, not a dropped
+ * connection to retry.
+ */
+function closeUserSockets(username: string): number {
+  let closed = 0;
+  for (const client of wss.clients) {
+    const c = client as AuthedSocket;
+    if (c.username !== username) continue;
+    try { c.close(1000, 'Account deleted'); } catch { /* already gone */ }
+    closed += 1;
+  }
+  return closed;
+}
+
 function broadcastEngineState(ctx: UserContext): void {
   broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: ctx.engine.getState() }));
 }
@@ -10978,7 +11129,12 @@ httpServer.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', `http://${firstHeader(req.headers.host) ?? 'localhost'}`);
   const token = url.searchParams.get('token') ?? '';
   const username = verifyToken(token);
-  if (!username) {
+  // TRA-2421 — same existence check as `requireAuth`. The WS is a SECOND door to
+  // `ensureUserContext` (see the `connection` handler below), so a deleted user
+  // reconnecting a socket would re-create the data directory and restart the
+  // engines just as an HTTP request would. Gating only the HTTP side would leave
+  // the resurrection path fully open through the transport the UI actually uses.
+  if (!username || !getUser(username)) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
