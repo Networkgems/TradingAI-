@@ -292,6 +292,13 @@ so the constant cannot be tuned to a result afterwards. Mirrored here verbatim:
 **Do not substitute another threshold or add an exemption without going back to
 QuantTrader.** The `0.20` is `BLOCKING_SLEEVE_WEIGHT` in `gate-feasibility.ts`.
 
+⚠️ **R1 is merged but NOT LIVE on bqb1 as of 2026-07-26** (`b7fdbd8` is not in build
+`408f06a5`), so the operator-facing output changes on the **next deploy of `main` for any
+reason** — `positive_expectancy` goes `FAIL → INFEASIBLE` while `gate.passed` stays
+`false`. That transition is written up for deployers in `docs/runbook.md` §2, *"DEPLOY NOTE
+(TRA-2384, TRANSITORY)"*. **Delete both that note and this paragraph once `b7fdbd8` is
+live** (`pnpm check:deploy-drift` stops listing it).
+
 Why it is a stop rather than a warning: the book ceiling is a **mean over a mixed
 population**, and *a mean can satisfy a bound that no material sub-population satisfies*.
 On 2026-07-26 the book read `feasible` (net `0.2391R` vs the `0.20R` bar) while the 35-idea
