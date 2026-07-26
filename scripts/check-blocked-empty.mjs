@@ -217,8 +217,26 @@ export function classifyIssue(item, roster) {
     blockerAttentionReason: item.blockerAttention ? item.blockerAttention.reason : null,
     // The upstream tell: a batch sharing one stamp is ONE platform event, not
     // N owners forgetting to anchor. Check this before blaming anybody.
+    //
+    // ⚠️ There is more than one route into the shape, so this is REPORTED and
+    // never used as the predicate. Measured so far: `stranded_assigned_issue`
+    // (session limit, TRA-2360), `missing_disposition` /
+    // `successful_run_missing_state` (a run that SUCCEEDED but recorded no
+    // disposition, TRA-2377), and no recovery action at all (TRA-2331).
     recoveryKind: recovery ? recovery.kind : null,
+    recoveryCause: recovery ? recovery.cause || null : null,
+    recoveryStatus: recovery ? recovery.status || null : null,
     recoveryAt: recovery ? recovery.createdAt || recovery.updatedAt || null : null,
+    // Whether anyone is ALREADY being woken for this. An active recovery action
+    // with a `wake_owner` policy is a live continuation path; a finding with
+    // none has nobody coming for it. Both are findings — the shape is the
+    // defect either way — but only the second needs a fresh wake, and filing
+    // one against the first is a duplicate wake on an owner the platform is
+    // already poking. Do not remediate overload with a fan-out.
+    platformWakeOwnerAgentId:
+      recovery && recovery.status === 'active' && recovery.wakePolicy && recovery.wakePolicy.type === 'wake_owner'
+        ? recovery.wakePolicy.ownerAgentId || recovery.ownerAgentId || null
+        : null,
   };
 }
 
@@ -362,9 +380,18 @@ export function renderReport(result) {
             : 'UNASSIGNED';
       L.push(`   ${String(f.identifier || f.id).padEnd(10)} ${String(f.priority || '').padEnd(8)} ${who}`);
       L.push(`     ${String(f.title || '').slice(0, 120)}`);
+      const wakeOwner = f.platformWakeOwnerAgentId
+        ? (result.roster.get(f.platformWakeOwnerAgentId) || {}).name || f.platformWakeOwnerAgentId
+        : null;
       L.push(
         `     blockerAttention=${f.blockerAttentionState || 'null'}/${f.blockerAttentionReason || 'null'} (context only)` +
-          `  recovery=${f.recoveryKind || 'none'}${f.recoveryAt ? ` @ ${f.recoveryAt}` : ''}`,
+          `  recovery=${f.recoveryKind || 'none'}${f.recoveryCause ? `/${f.recoveryCause}` : ''}` +
+          `${f.recoveryStatus ? `:${f.recoveryStatus}` : ''}${f.recoveryAt ? ` @ ${f.recoveryAt}` : ''}`,
+      );
+      L.push(
+        wakeOwner
+          ? `     platform wake ALREADY ACTIVE -> ${wakeOwner}. Do NOT file a duplicate; the owner is being poked.`
+          : `     no platform wake — nobody is coming for this one unless it is routed.`,
       );
     }
     L.push('');
@@ -373,7 +400,8 @@ export function renderReport(result) {
   // Routing table. Repair is assignee-scoped, so the actionable unit is the
   // OWNER, not the issue — and one child issue per owner, never a fan-out of
   // N wakes (the failure mode that caused this shape is session-limit load).
-  const routable = bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || [];
+  const routable = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter((f) => !f.platformWakeOwnerAgentId);
+  const alreadyWoken = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter((f) => f.platformWakeOwnerAgentId);
   if (routable.length) {
     const byOwner = new Map();
     for (const f of routable) {
@@ -384,6 +412,16 @@ export function renderReport(result) {
     L.push('routing  one child issue per OWNER (not per issue — N simultaneous wakes is the');
     L.push('         same session-limit pressure that writes this shape in the first place):');
     for (const [owner, ids] of byOwner) L.push(`   ${owner}  ->  ${ids.join(', ')}`);
+    L.push('');
+  }
+  if (alreadyWoken.length) {
+    L.push('do NOT route  a live recovery action is already waking the owner on these. They are');
+    L.push('              still findings — the empty array is still an auto-flip risk — but a');
+    L.push('              fresh child issue here is a duplicate wake, not a remedy:');
+    for (const f of alreadyWoken) {
+      const w = (result.roster.get(f.platformWakeOwnerAgentId) || {}).name || f.platformWakeOwnerAgentId;
+      L.push(`   ${f.identifier || f.id}  (platform is waking ${w})`);
+    }
     L.push('');
   }
 
@@ -557,6 +595,56 @@ const CASES = [
         stripBlockedByKey: true,
       }),
     assert: (r) => r.unreadable.length > 0 && /blockedBy/.test(r.unreadable[0]) && r.findings.length === 0,
+  },
+  {
+    name: 'a THIRD route in (missing_disposition) with a live wake_owner recovery => STILL a finding, flagged do-not-route',
+    expect: 'FINDINGS',
+    // Measured live on TRA-2377, 2026-07-26T06:24Z: a run that SUCCEEDED but
+    // recorded no disposition. Keying the detector on the recovery KIND would
+    // have missed it, and the active wake must annotate the row without ever
+    // suppressing it — the empty array is an auto-flip risk regardless of who
+    // is being poked.
+    expectAnnotation: true,
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8050', 'agent-qt', {
+            activeRecoveryAction: {
+              kind: 'missing_disposition',
+              cause: 'successful_run_missing_state',
+              status: 'active',
+              ownerAgentId: 'agent-qt',
+              wakePolicy: { type: 'wake_owner', ownerAgentId: 'agent-qt' },
+              createdAt: '2026-07-26T06:24:12.346Z',
+            },
+          }),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings.length === 1 &&
+      r.findings[0].severity === SEVERITY.ROUTE_TO_ASSIGNEE &&
+      r.findings[0].recoveryKind === 'missing_disposition' &&
+      r.findings[0].platformWakeOwnerAgentId === 'agent-qt' &&
+      // and the annotation must NOT have removed it from the report
+      renderReport(r).join('\n').includes('TRA-8050'),
+  },
+  {
+    name: 'a RESOLVED recovery action does NOT count as a live wake (status must be active)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8060', 'agent-qt', {
+            activeRecoveryAction: {
+              kind: 'missing_disposition',
+              status: 'resolved',
+              wakePolicy: { type: 'wake_owner', ownerAgentId: 'agent-qt' },
+              createdAt: '2026-07-26T06:24:12.346Z',
+            },
+          }),
+        ]),
+      ),
+    assert: (r) => r.findings.length === 1 && r.findings[0].platformWakeOwnerAgentId === null,
   },
   {
     name: 'TRAP 1c — truncating the enumeration at the page cap => BLIND, never a count off a partial board',
