@@ -349,14 +349,14 @@ describe('cost-aware-gate-ledger', () => {
 
       // 2. Ran, rejected nothing. `rejected` is 0 here TOO — identical to (1) on
       //    that field alone. `evaluated` is what makes the two distinguishable.
-      recordSpreadCeilingDecision(S, true, 0.04, 'ok', DAY, 1_000);
-      recordSpreadCeilingDecision(S, true, 0.06, 'ok', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.04, 'ok', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.06, 'ok', DAY, 1_001);
       expect(row()!.spreadCeilingRejected).toBe(0);
       expect(row()!.spreadCeilingEvaluated).toBe(2);
       expect(row()!.spreadCeilingRejectRate).toBe(0);
 
       // 3. Biting.
-      recordSpreadCeilingDecision(S, false, 1.933, 'max_spread_pct', DAY, 1_002);
+      recordSpreadCeilingDecision(S, 'desk', false, 1.933, 'max_spread_pct', DAY, 1_002);
       expect(row()!.spreadCeilingEvaluated).toBe(3);
       expect(row()!.spreadCeilingRejected).toBe(1);
       expect(row()!.spreadCeilingRejectsByCode).toEqual({ max_spread_pct: 1 });
@@ -374,10 +374,10 @@ describe('cost-aware-gate-ledger', () => {
     });
 
     it('maxAdmittedSpreadPct is the invariant — it tracks the widest ADMITTED quote only', () => {
-      recordSpreadCeilingDecision(S, true, 0.04, 'ok', DAY, 1_000);
-      recordSpreadCeilingDecision(S, true, 0.098, 'ok', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.04, 'ok', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.098, 'ok', DAY, 1_001);
       // A REJECT of 1.933 must not touch it: the whole point is "what got through".
-      recordSpreadCeilingDecision(S, false, 1.933, 'max_spread_pct', DAY, 1_002);
+      recordSpreadCeilingDecision(S, 'desk', false, 1.933, 'max_spread_pct', DAY, 1_002);
       expect(row()!.maxAdmittedSpreadPct).toBeCloseTo(0.098, 6);
       // An enforcing gate can never publish a value above its own ceiling.
       expect(row()!.maxAdmittedSpreadPct!).toBeLessThanOrEqual(0.1);
@@ -387,7 +387,7 @@ describe('cost-aware-gate-ledger', () => {
       recordCostAwareGateDecision(S, true, 1.2, 0.4, DAY, 1_000);
       recordEntryDeltaCeilingReject(S, 0.62, DAY, 1_001);
       recordEntryDeltaCeilingObserved(S, 0.58, DAY, 1_002);
-      recordSpreadCeilingDecision(S, false, 0.8, 'max_spread_pct', DAY, 1_003);
+      recordSpreadCeilingDecision(S, 'desk', false, 0.8, 'max_spread_pct', DAY, 1_003);
 
       const r = row()!;
       expect(r.admitted).toBe(1);
@@ -403,7 +403,7 @@ describe('cost-aware-gate-ledger', () => {
       // Zero-filling would drag `avgRejectedSpreadPct` toward 0 and — via the
       // compaction rewrite — could publish `maxAdmittedSpreadPct: 0` on a gate that
       // admitted something wide.
-      recordSpreadCeilingDecision(S, false, null, 'no_quote', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'desk', false, null, 'no_quote', DAY, 1_000);
       expect(row()!.spreadCeilingRejected).toBe(1);
       expect(row()!.avgRejectedSpreadPct).toBe(0); // sum 0 over n 1 — but nothing was invented
       expect(row()!.spreadCeilingRejectsByCode).toEqual({ no_quote: 1 });
@@ -417,8 +417,8 @@ describe('cost-aware-gate-ledger', () => {
       // the evidence on disk at the first boot after a breach. New kinds have to be
       // in the preserved set or they inherit that bug.
       hydrateCostAwareGateFromDisk(dir, 1_000);
-      recordSpreadCeilingDecision(S, true, 0.04, 'ok', DAY, 1_001);
-      recordSpreadCeilingDecision(S, false, 1.933, 'max_spread_pct', DAY, 1_002);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.04, 'ok', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'desk', false, 1.933, 'max_spread_pct', DAY, 1_002);
 
       clearCostAwareGateLedger();
       hydrateCostAwareGateFromDisk(dir, 2_000);
@@ -438,13 +438,194 @@ describe('cost-aware-gate-ledger', () => {
     });
 
     it('the retained roll sums across days, so a reject on day 1 is still visible on day 3', () => {
-      recordSpreadCeilingDecision(S, false, 0.8, 'max_spread_pct', '2026-07-11', 1_000);
-      recordSpreadCeilingDecision(S, true, 0.05, 'ok', '2026-07-13', 1_001);
+      recordSpreadCeilingDecision(S, 'desk', false, 0.8, 'max_spread_pct', '2026-07-11', 1_000);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.05, 'ok', '2026-07-13', 1_001);
       // Read from day 3: the day view has forgotten day 1's reject...
       expect(row('2026-07-13')!.spreadCeilingRejected).toBe(0);
       // ...the retained roll has not.
       expect(summarizeCostAwareGate('2026-07-13').retained.spreadCeilingRejectedTotal).toBe(1);
       expect(summarizeCostAwareGate('2026-07-13').retained.spreadCeilingEvaluatedTotal).toBe(2);
+    });
+  });
+
+  // ── TRA-2355 — the ACCOUNT axis ────────────────────────────────────────────
+  //
+  // TRA-2295 gave the gate a counter that separates "did not run" from "ran clean".
+  // It did not give it an OWNER. The ledger is module-global while `SignalEngine` is
+  // constructed per username, so ~51 QA fixture books tallied into the same counters
+  // as the desk and `spreadCeilingEvaluated > 0` only ever meant SOME book's gate ran.
+  //
+  // Every test in this block is written so that it FAILS against the pooled-only
+  // ledger. A test that asserts the pooled total moved cannot tell this fix from its
+  // absence — that assertion passes identically either way, which is the same
+  // reads-the-same-in-both-states defect the counter itself was built to end.
+  describe('spread ceiling account-class partition (TRA-2355)', () => {
+    const S = 'single_leg_directional';
+    const row = (day = DAY) => summarizeCostAwareGate(day).byStructure.find(b => b.structure === S);
+    const cls = (klass: 'desk' | 'fixture' | 'unattributed', day = DAY) =>
+      row(day)!.spreadCeilingByAccountClass[klass];
+
+    it('THE FAILING STATE: a fixture-only session leaves desk.evaluated 0 while the pool reads clean', () => {
+      // The exact production scenario, reconstructed. The desk fires ZERO directional
+      // entries — a 2-in-5 event (12, 16, 0, 0, 13) — and the QA fleet fires four,
+      // all comfortably inside the 0.10 ceiling.
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.04, 'ok', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.06, 'ok', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.09, 'ok', DAY, 1_002);
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.05, 'ok', DAY, 1_003);
+
+      // What the POOLED fields say — and they are not lying, they are just not a desk
+      // verdict. Read alone, this is the shape a grader published as PASS: the gate
+      // evaluated four candidates and admitted nothing above the ceiling.
+      expect(row()!.spreadCeilingEvaluated).toBe(4);
+      expect(row()!.spreadCeilingRejected).toBe(0);
+      expect(row()!.maxAdmittedSpreadPct!).toBeLessThanOrEqual(0.1);
+
+      // What the DESK actually did: nothing. `0` here is NO READING, not a pass — and
+      // this is the assertion the pooled-only ledger cannot make at all.
+      expect(cls('desk').spreadCeilingEvaluated).toBe(0);
+      expect(cls('desk').spreadCeilingRejected).toBe(0);
+      // Null, never 0: "this book was quiet" must not render as "this book was clean".
+      expect(cls('desk').spreadCeilingRejectRate).toBeNull();
+      expect(cls('desk').maxAdmittedSpreadPct).toBeNull();
+
+      // And the fixture cell carries the whole pooled count, which is the proof that
+      // the pooled number was 100% fixture.
+      expect(cls('fixture').spreadCeilingEvaluated).toBe(4);
+      expect(cls('fixture').maxAdmittedSpreadPct).toBeCloseTo(0.09, 6);
+    });
+
+    it('a desk breach is not laundered by a clean fixture fleet — the max is PER CLASS', () => {
+      // The inverse failure, and the more dangerous one: the desk admits a 1.933
+      // (19x the ceiling) while the fixture books stay tight. A pooled max would show
+      // the breach — but a pooled max also shows a FIXTURE breach as if it were the
+      // desk's, so neither direction is attributable without the split.
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.04, 'ok', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'desk', true, 1.933, 'ok', DAY, 1_001);
+
+      expect(cls('desk').maxAdmittedSpreadPct).toBeCloseTo(1.933, 6);
+      expect(cls('desk').maxAdmittedSpreadPct!).toBeGreaterThan(0.1); // falsified, on the desk
+      // The fixture cell must NOT inherit the desk's breach.
+      expect(cls('fixture').maxAdmittedSpreadPct).toBeCloseTo(0.04, 6);
+      expect(cls('fixture').maxAdmittedSpreadPct!).toBeLessThanOrEqual(0.1);
+    });
+
+    it('rejects and their codes partition too, and the classes SUM to the pooled fields', () => {
+      recordSpreadCeilingDecision(S, 'desk', false, 0.8, 'max_spread_pct', DAY, 1_000);
+      recordSpreadCeilingDecision(S, 'fixture', false, 0.4, 'max_spread_pct', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'fixture', false, null, 'no_quote', DAY, 1_002);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.02, 'ok', DAY, 1_003);
+
+      expect(cls('desk').spreadCeilingEvaluated).toBe(2);
+      expect(cls('desk').spreadCeilingRejected).toBe(1);
+      expect(cls('desk').spreadCeilingRejectRate).toBe(0.5);
+      expect(cls('desk').avgRejectedSpreadPct).toBeCloseTo(0.8, 6);
+      expect(cls('desk').spreadCeilingRejectsByCode).toEqual({ max_spread_pct: 1 });
+
+      expect(cls('fixture').spreadCeilingEvaluated).toBe(2);
+      expect(cls('fixture').spreadCeilingRejected).toBe(2);
+      expect(cls('fixture').spreadCeilingRejectsByCode).toEqual({ max_spread_pct: 1, no_quote: 1 });
+
+      // BYTE-COMPATIBILITY: the pooled fields are exactly what they were before the
+      // split. A partition maintained in a separate pass can drift from the total it
+      // partitions, and a class breakdown that under-counts reads as a quiet desk.
+      const classes = (['desk', 'fixture', 'unattributed'] as const).map(k => cls(k));
+      expect(classes.reduce((n, c) => n + c.spreadCeilingEvaluated, 0)).toBe(
+        row()!.spreadCeilingEvaluated,
+      );
+      expect(classes.reduce((n, c) => n + c.spreadCeilingRejected, 0)).toBe(
+        row()!.spreadCeilingRejected,
+      );
+    });
+
+    it('emits the FULL three-class grid even at zero — an absent cell reads like a passing one', () => {
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.04, 'ok', DAY, 1_000);
+      const grid = row()!.spreadCeilingByAccountClass;
+      expect(Object.keys(grid).sort()).toEqual(['desk', 'fixture', 'unattributed']);
+      // The zero cells are PRESENT and explicitly zero — a consumer that has to check
+      // for the key's existence will eventually skip past its absence instead.
+      expect(grid.desk.accountClass).toBe('desk');
+      expect(grid.desk.spreadCeilingEvaluated).toBe(0);
+      expect(grid.unattributed.spreadCeilingEvaluated).toBe(0);
+    });
+
+    it('pre-TRA-2355 records hydrate as UNATTRIBUTED, never desk', () => {
+      // The laundering path this fix must not open: every line already on disk carries
+      // no class, and defaulting those to `desk` would manufacture desk evidence out of
+      // records whose owner is genuinely unknown — the pooling bug moved into the
+      // hydrate. `unattributed` is a third answer, not a softer `desk`.
+      const legacy = {
+        ts: 1_000,
+        etDay: DAY,
+        structure: S,
+        admit: true,
+        grossR: 0,
+        barR: 0,
+        gate: 'spread_ceiling_admitted',
+        spreadPct: 0.07,
+        code: 'ok',
+      };
+      writeFileSync(costAwareGateLogPath(dir), JSON.stringify(legacy) + '\n', 'utf8');
+      hydrateCostAwareGateFromDisk(dir, 2_000);
+
+      expect(row()!.spreadCeilingEvaluated).toBe(1); // pooled: unchanged by the fix
+      expect(cls('desk').spreadCeilingEvaluated).toBe(0); // and NOT attributed to the desk
+      expect(cls('desk').maxAdmittedSpreadPct).toBeNull();
+      expect(cls('unattributed').spreadCeilingEvaluated).toBe(1);
+      expect(cls('unattributed').maxAdmittedSpreadPct).toBeCloseTo(0.07, 6);
+    });
+
+    it('the class SURVIVES a reboot — compaction rewrites the file, so a dropped field is ERASED', () => {
+      // Same trap as TRA-1703 one field over: hydrate rewrites the log to its sanitized
+      // lines, so a field the sanitizer forgets is not merely missing from this boot's
+      // counters — it is gone from disk. Dropping `accountClass` here would silently
+      // re-pool every retained day into `unattributed` on the first restart, and the
+      // desk partition would read 0 across a week the desk actually traded.
+      hydrateCostAwareGateFromDisk(dir, 1_000);
+      recordSpreadCeilingDecision(S, 'desk', true, 0.08, 'ok', DAY, 1_001);
+      recordSpreadCeilingDecision(S, 'fixture', false, 0.9, 'max_spread_pct', DAY, 1_002);
+
+      clearCostAwareGateLedger();
+      hydrateCostAwareGateFromDisk(dir, 2_000);
+
+      expect(cls('desk').spreadCeilingEvaluated).toBe(1);
+      expect(cls('desk').maxAdmittedSpreadPct).toBeCloseTo(0.08, 6);
+      expect(cls('fixture').spreadCeilingRejected).toBe(1);
+      expect(cls('fixture').spreadCeilingRejectsByCode).toEqual({ max_spread_pct: 1 });
+
+      // Twice — the compacted file must still round-trip the axis, not just the first
+      // rewrite. A one-boot-only survival would decay to `unattributed` by day two.
+      clearCostAwareGateLedger();
+      hydrateCostAwareGateFromDisk(dir, 3_000);
+      expect(cls('desk').spreadCeilingEvaluated).toBe(1);
+      expect(cls('unattributed').spreadCeilingEvaluated).toBe(0);
+    });
+
+    it('the RETAINED multi-day roll carries the partition, not just the pooled totals', () => {
+      // A day-scoped class cell re-arms at midnight exactly like the pooled one
+      // (TRA-1703). If only the pooled fields rolled, the desk partition would be
+      // unreadable over precisely the multi-session window a grade uses.
+      recordSpreadCeilingDecision(S, 'desk', false, 0.8, 'max_spread_pct', '2026-07-11', 1_000);
+      recordSpreadCeilingDecision(S, 'fixture', true, 0.05, 'ok', '2026-07-13', 1_001);
+
+      // Day view on day 3 has forgotten the desk's day-1 reject...
+      expect(cls('desk', '2026-07-13').spreadCeilingEvaluated).toBe(0);
+      // ...the retained roll has not, and still attributes it to the DESK.
+      const retained = summarizeCostAwareGate('2026-07-13').retained.byStructure.find(
+        b => b.structure === S,
+      )!;
+      expect(retained.spreadCeilingByAccountClass.desk.spreadCeilingRejected).toBe(1);
+      expect(retained.spreadCeilingByAccountClass.desk.avgRejectedSpreadPct).toBeCloseTo(0.8, 6);
+      expect(retained.spreadCeilingByAccountClass.fixture.spreadCeilingEvaluated).toBe(1);
+      expect(retained.spreadCeilingByAccountClass.fixture.spreadCeilingRejected).toBe(0);
+    });
+
+    it('publishes a note saying the pooled fields are NOT a desk verdict', () => {
+      const note = summarizeCostAwareGate(DAY).spreadCeilingAccountClassNote;
+      expect(note).toContain('spreadCeilingByAccountClass.desk');
+      expect(note).toContain('NOT A DESK VERDICT');
+      // The reading that stops a grade has to be stated, not inferred.
+      expect(note).toContain('NO READING AT ALL');
     });
   });
 });

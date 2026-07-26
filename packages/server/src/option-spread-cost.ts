@@ -71,6 +71,11 @@
 // `spreadGateVerdict` routes an order. `spreadGateVerdict` itself is a pure
 // predicate — the caller decides what to do with it.
 
+// The module's only dependency, and deliberately a leaf one: `test-accounts.ts`
+// imports nothing, so {@link classifySpreadCeilingAccount} can be called from the
+// deep engine chokepoint without dragging a cycle through it.
+import { isTestAccount } from './test-accounts.js';
+
 /** The at-risk stop distance as a fraction of the entry mark (stop = mark·0.75). */
 export const STOP_DISTANCE_FRACTION_OF_MARK = 0.25;
 
@@ -546,6 +551,32 @@ export const SPREAD_CEILING_ACCOUNT_CLASSES: readonly SpreadCeilingAccountClass[
   'fixture',
   'unattributed',
 ];
+
+/**
+ * TRA-2355 — classify ONE owning account into its class. THE single implementation.
+ *
+ * Extracted so the two independent readouts of the same ceiling cannot drift on the
+ * partition rule: the journal-derived side (`/api/health/option-spread-cost` →
+ * `ceilingCompliance.byAccountClass`, which classifies a row's stored `account`) and
+ * the gate's own counters (`/api/health/cost-aware-gate`, which classifies the owning
+ * book at DECISION time). Those two are published as cross-checks of each other, so a
+ * second copy of this three-line rule would make a disagreement between them
+ * indistinguishable from a real enforcement failure — the same trap the structure-key
+ * split set in TRA-2350.
+ *
+ * Absent/blank ⇒ `unattributed`, NEVER `desk`. That is the load-bearing branch: the
+ * gate ledger hydrates pre-TRA-2355 JSONL lines that carry no class at all, and
+ * defaulting those to `desk` would manufacture desk evidence out of records whose
+ * owner is genuinely unknown — the exact pooling this ticket exists to end, laundered
+ * through the hydrate instead of through the counter.
+ */
+export function classifySpreadCeilingAccount(
+  account: string | undefined | null,
+  env: NodeJS.ProcessEnv = process.env,
+): SpreadCeilingAccountClass {
+  if (typeof account !== 'string' || account.trim().length === 0) return 'unattributed';
+  return isTestAccount(account, env) ? 'fixture' : 'desk';
+}
 
 /**
  * One journal row's entry economics for the compliance fold.

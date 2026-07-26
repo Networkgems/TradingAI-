@@ -93,6 +93,7 @@ import {
   SLEEVE_SPREAD_CEILINGS,
   isSpreadCeilingEnforceEnabled,
   OPTION_SPREAD_CEILING_ENFORCE_FLAG,
+  classifySpreadCeilingAccount, // TRA-2355 — the SINGLE partition rule, shared with the gate ledger
 } from '../option-spread-cost.js';
 import type {
   SpreadCostSample,
@@ -1120,8 +1121,14 @@ function partitionRowsByAccountClass(rows: OptionTradeJournalRecord[]): {
   const desk: OptionTradeJournalRecord[] = [];
   const unattributed: OptionTradeJournalRecord[] = [];
   for (const r of rows) {
-    if (typeof r.account !== 'string' || r.account.trim().length === 0) unattributed.push(r);
-    else if (isTestAccount(r.account)) fixture.push(r);
+    // TRA-2355 — routed through the SHARED predicate, which is now also what the gate
+    // ledger stamps at decision time. This block used to inline the three-way rule, and
+    // a second copy of it is precisely what would make this route and
+    // `/api/health/cost-aware-gate` — published as independent cross-checks of the same
+    // ceiling — disagree for a reason that is not a defect.
+    const klass = classifySpreadCeilingAccount(r.account);
+    if (klass === 'unattributed') unattributed.push(r);
+    else if (klass === 'fixture') fixture.push(r);
     else desk.push(r);
   }
   return { fixture, desk, unattributed };
@@ -2455,13 +2462,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       //
       // Note the asymmetry that kept it quiet: the TELEMETRY side
       // (`/api/health/cost-aware-gate` → `spreadCeilingEvaluated`) is written only by
-      // `recordSpreadCeilingDecision` from that single gated site, so it counts the
-      // directional sleeve alone and is clean. Only THIS journal-derived side pooled.
-      // The two are published as independent confirmations of each other, which means
-      // that before the split a disagreement between them had two indistinguishable
-      // causes — a real enforcement failure, or an ungated sleeve trading wide.
-      // `gated`/`ungated`/`byArchetype` separate them; `gatedArchetypes` states the
-      // partition rule in the payload so a consumer asserts it instead of assuming it.
+      // `recordSpreadCeilingDecision` from that single gated site, so on the SLEEVE axis
+      // it counts the directional sleeve alone and is clean. Only THIS journal-derived
+      // side pooled sleeves. The two are published as independent confirmations of each
+      // other, which means that before the split a disagreement between them had two
+      // indistinguishable causes — a real enforcement failure, or an ungated sleeve
+      // trading wide. `gated`/`ungated`/`byArchetype` separate them; `gatedArchetypes`
+      // states the partition rule in the payload so a consumer asserts it instead of
+      // assuming it.
+      //
+      // ⚠ TRA-2355 — "CLEAN ON THE SLEEVE AXIS" IS NOT "CLEAN". The sentence above was
+      // read as a general endorsement of the telemetry arm, and on the ACCOUNT axis the
+      // arm was blind: the ledger is module-global while `SignalEngine` is constructed
+      // per username, so ~51 QA fixture books tallied into the same counters as the desk
+      // and `spreadCeilingEvaluated > 0` never meant the DESK's gate ran. Same pooling
+      // defect as this route's, one axis over, discovered one ticket later.
+      // `spreadCeilingByAccountClass.desk` on that route is the fixed read, and it is the
+      // cross-check partner of `byAccountClass.desk[...].gated` here — compare LIKE
+      // COHORTS or the comparison manufactures its own disagreement.
       //
       // Empirically the pooling had not bitten as of 2026-07-26 (iv-rv last fired
       // 2026-07-02T16:37Z; AI-ideas has produced 0 rows under the label) — but that is

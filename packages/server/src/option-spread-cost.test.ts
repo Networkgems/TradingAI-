@@ -8,6 +8,8 @@ import {
   STOP_DISTANCE_FRACTION_OF_MARK,
   spreadGateVerdict,
   isSpreadCeilingEnforceEnabled,
+  classifySpreadCeilingAccount,
+  SPREAD_CEILING_ACCOUNT_CLASSES,
 } from './option-spread-cost.js';
 import { DEFAULT_COST_GATE_CONFIG } from './option-cost-gate.js';
 
@@ -603,5 +605,56 @@ describe('summarizeSpreadCeilingCompliance archetype partition (TRA-2350)', () =
     // An unmeasurable row is never a zero-spread fill in EITHER cohort.
     expect(cell.gated.n).toBe(1);
     expect(cell.gated.countAboveCeiling).toBe(0);
+  });
+});
+
+// ── TRA-2355 — the shared partition rule ───────────────────────────────────
+//
+// This predicate exists so the two independent readouts of the SAME ceiling
+// cannot drift: the journal-derived fold above (which classifies a row's stored
+// `account`) and the gate ledger's own counters (which classify the owning book
+// at DECISION time, because the ledger was account-blind and pooled ~51 QA
+// fixture books into the desk's numbers). They are published as cross-checks of
+// each other — so a second copy of this three-line rule would make a
+// disagreement between them indistinguishable from a real enforcement failure.
+describe('classifySpreadCeilingAccount (TRA-2355)', () => {
+  it('classifies the desk books', () => {
+    expect(classifySpreadCeilingAccount('admin')).toBe('desk');
+    expect(classifySpreadCeilingAccount('Richard')).toBe('desk');
+    // Anchored, not substring: a real book merely CONTAINING a pattern stays desk.
+    expect(classifySpreadCeilingAccount('aqua')).toBe('desk');
+    expect(classifySpreadCeilingAccount('monitorly')).toBe('desk');
+  });
+
+  it('classifies the live QA fixture fleet — the population that did the pooling', () => {
+    for (const name of ['qa_reg_881', 'qa_tra1475_x', 'QA_MIRROR_2', 'ctoverify', 'ctoverify_2', 'monitor_qa']) {
+      expect(classifySpreadCeilingAccount(name)).toBe('fixture');
+    }
+  });
+
+  it('ABSENT/BLANK is `unattributed`, NEVER `desk` — the laundering branch', () => {
+    // Load-bearing: the gate ledger hydrates pre-TRA-2355 JSONL lines that carry no
+    // class at all. Defaulting those to `desk` would manufacture desk evidence out of
+    // records whose owner is genuinely unknown — this ticket's pooling bug, moved into
+    // the hydrate. `unattributed` is a third answer, not a softer `desk`.
+    expect(classifySpreadCeilingAccount(undefined)).toBe('unattributed');
+    expect(classifySpreadCeilingAccount(null)).toBe('unattributed');
+    expect(classifySpreadCeilingAccount('')).toBe('unattributed');
+    expect(classifySpreadCeilingAccount('   ')).toBe('unattributed');
+  });
+
+  it('honours TEST_ACCOUNT_PREFIXES, which is WHY the class is frozen at decision time', () => {
+    // The env is readable at any moment, so classifying at READ time would let an env
+    // edit retroactively reclassify a week of history. The gate ledger stamps the class
+    // when the decision is made, precisely so this env is not a time machine.
+    const env = { TEST_ACCOUNT_PREFIXES: 'loadtest' } as unknown as NodeJS.ProcessEnv;
+    expect(classifySpreadCeilingAccount('loadtest_7', env)).toBe('fixture');
+    expect(classifySpreadCeilingAccount('loadtest_7')).toBe('desk'); // same name, default env
+  });
+
+  it('every answer is a member of the published class list', () => {
+    for (const name of ['admin', 'qa_1', '', 'monitor_qa']) {
+      expect(SPREAD_CEILING_ACCOUNT_CLASSES).toContain(classifySpreadCeilingAccount(name));
+    }
   });
 });

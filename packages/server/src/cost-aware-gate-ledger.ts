@@ -32,6 +32,10 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import {
+  SPREAD_CEILING_ACCOUNT_CLASSES,
+  type SpreadCeilingAccountClass,
+} from './option-spread-cost.js';
 
 const log = logger.child({ module: 'cost-aware-gate-ledger' });
 
@@ -92,6 +96,44 @@ interface CostGateDecisionRecord {
   spreadPct?: number;
   /** TRA-2295 `spread_ceiling` rejects only: which threshold bit (`max_spread_pct` / `min_bid` / `no_quote`). */
   code?: string;
+  /**
+   * TRA-2355 — WHICH BOOK the decision belongs to, as a class. `spread_ceiling*`
+   * records only; absent on every other kind and on every line written before this
+   * ticket (those hydrate as `unattributed`, never `desk`).
+   *
+   * The CLASS is stored, not the username. Two reasons, both load-bearing:
+   *   • This file's standing invariant is "no balances/PII" (see the header). A
+   *     username is the one identifying string the ledger would otherwise carry.
+   *   • Classification is frozen at DECISION time. `isTestAccount` reads
+   *     `TEST_ACCOUNT_PREFIXES` from the env, so classifying at READ time would let
+   *     an env edit retroactively reclassify a week of history — a partition that
+   *     silently changes under a grader is worse than no partition.
+   */
+  accountClass?: SpreadCeilingAccountClass;
+}
+
+/**
+ * TRA-2355 — the spread-ceiling counters for ONE account class within a
+ * (etDay × structure) cell. Only the spread-gate axis is partitioned: the cost bar
+ * and the delta ceiling are not what this ticket found pooled, and widening the
+ * split to them would add three empty sub-objects per structure for no reader.
+ */
+interface SpreadCeilingClassTally {
+  admitted: number;
+  rejected: number;
+  rejectedSpreadPctSum: number;
+  maxAdmittedSpreadPct: number | null;
+  rejectsByCode: Map<string, number>;
+}
+
+function newClassTally(): SpreadCeilingClassTally {
+  return {
+    admitted: 0,
+    rejected: 0,
+    rejectedSpreadPctSum: 0,
+    maxAdmittedSpreadPct: null,
+    rejectsByCode: new Map(),
+  };
 }
 
 interface StructureTally {
@@ -128,6 +170,30 @@ interface StructureTally {
   spreadCeilingMaxAdmittedSpreadPct: number | null;
   /** TRA-2295 — refusals split by which threshold bit. */
   spreadCeilingRejectsByCode: Map<string, number>;
+  /**
+   * TRA-2355 — the SAME spread-ceiling counters, partitioned by owning account class.
+   *
+   * Every field above this one is POOLED across every book in the process, and that is
+   * the defect: `SignalEngine` is constructed per username (`user-context.ts`), the
+   * tally is module-global, and ~51 QA fixture books scan into it alongside the desk.
+   * So `spreadCeilingEvaluated > 0` never meant "the desk sleeve ran" — only that SOME
+   * book did, and the fixture fleet is a live producer of this exact cohort (64 of 151
+   * pre-fix directional rows). On a session where the desk fires zero directional
+   * entries — a 2-in-5 event — the fixture fleet alone yields `evaluated > 0` plus a
+   * fixture `maxAdmittedSpreadPct` inside the ceiling, which reads exactly like a
+   * desk PASS. Read `byAccountClass.desk` before believing any of the pooled fields.
+   */
+  spreadCeilingByAccountClass: Map<SpreadCeilingAccountClass, SpreadCeilingClassTally>;
+}
+
+/** Fetch-or-create one class sub-tally. */
+function classTally(t: StructureTally, klass: SpreadCeilingAccountClass): SpreadCeilingClassTally {
+  let c = t.spreadCeilingByAccountClass.get(klass);
+  if (!c) {
+    c = newClassTally();
+    t.spreadCeilingByAccountClass.set(klass, c);
+  }
+  return c;
 }
 
 /**
@@ -155,6 +221,7 @@ function newTally(): StructureTally {
     spreadCeilingRejectedSpreadPctSum: 0,
     spreadCeilingMaxAdmittedSpreadPct: null,
     spreadCeilingRejectsByCode: new Map(),
+    spreadCeilingByAccountClass: new Map(),
   };
 }
 
@@ -195,6 +262,18 @@ export function clearCostAwareGateLedger(): void {
   lastAppendError = null;
 }
 
+/**
+ * TRA-2355 — a record's account class, fail-closed. An absent or unrecognised value
+ * is `unattributed`, NEVER `desk`: every pre-TRA-2355 JSONL line lacks the field, and
+ * hydrating those into `desk` would fabricate desk evidence from records whose owner
+ * is genuinely unknown. `unattributed` is a third answer, not a softer `desk`.
+ */
+function recAccountClass(rec: CostGateDecisionRecord): SpreadCeilingAccountClass {
+  return SPREAD_CEILING_ACCOUNT_CLASSES.includes(rec.accountClass as SpreadCeilingAccountClass)
+    ? (rec.accountClass as SpreadCeilingAccountClass)
+    : 'unattributed';
+}
+
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
 function apply(rec: CostGateDecisionRecord): void {
   let day = byDay.get(rec.etDay);
@@ -216,19 +295,32 @@ function apply(rec: CostGateDecisionRecord): void {
     // TRA-2295 — the spread gate REFUSED this candidate. Its own axis: it is neither a
     // modeled-R verdict nor a delta breach, and folding it into `rejected` would move the
     // cost bar's admit rate for a reason that has nothing to do with the cost bar.
-    tally.spreadCeilingRejected += 1;
-    tally.spreadCeilingRejectedSpreadPctSum += Number.isFinite(rec.spreadPct) ? (rec.spreadPct as number) : 0;
+    //
+    // TRA-2355 — the pooled field and the account-class field are written in the SAME
+    // branch, off the SAME record, deliberately. A partition maintained in a separate
+    // pass can fall out of step with the total it partitions, and a class breakdown that
+    // silently under-counts is worse than none: it reads as a quiet desk.
     const code = typeof rec.code === 'string' && rec.code !== '' ? rec.code : 'unknown';
+    const spreadPct = Number.isFinite(rec.spreadPct) ? (rec.spreadPct as number) : 0;
+    tally.spreadCeilingRejected += 1;
+    tally.spreadCeilingRejectedSpreadPctSum += spreadPct;
     tally.spreadCeilingRejectsByCode.set(code, (tally.spreadCeilingRejectsByCode.get(code) ?? 0) + 1);
+    const c = classTally(tally, recAccountClass(rec));
+    c.rejected += 1;
+    c.rejectedSpreadPctSum += spreadPct;
+    c.rejectsByCode.set(code, (c.rejectsByCode.get(code) ?? 0) + 1);
   } else if (rec.gate === 'spread_ceiling_admitted') {
     // TRA-2295 — the spread gate RAN and let this one through. Recorded because the
     // absence of this counter is what made the unenforced ceiling invisible for 83 fills:
     // without it, `spreadCeilingRejected: 0` cannot be told from a gate that never ran.
     tally.spreadCeilingAdmitted += 1;
+    const c = classTally(tally, recAccountClass(rec));
+    c.admitted += 1;
     if (Number.isFinite(rec.spreadPct)) {
       const p = rec.spreadPct as number;
       const prev = tally.spreadCeilingMaxAdmittedSpreadPct;
       tally.spreadCeilingMaxAdmittedSpreadPct = prev === null ? p : Math.max(prev, p);
+      c.maxAdmittedSpreadPct = c.maxAdmittedSpreadPct === null ? p : Math.max(c.maxAdmittedSpreadPct, p);
     }
   } else if (rec.gate === 'delta_ceiling') {
     // A ceiling breach carries no modeled R and no bar — tallied on its own axis so
@@ -354,9 +446,17 @@ export function recordEntryDeltaCeilingObserved(
  * `admit: rec.admit` mirrors what the engine ACTUALLY DID (the TRA-1689 rule), so a
  * replay of the JSONL never invents a trade that did not happen. Same durability and
  * best-effort IO as every other recorder here.
+ *
+ * ── TRA-2355 — `accountClass` IS REQUIRED, AND SECOND ────────────────────────
+ * It sits beside `structure` because the two together are the cohort key: a count is
+ * only evidence about a book once you know WHICH book produced it. It has no default
+ * for the same reason the parameter exists at all — a defaulted class would let a new
+ * call site compile into the pooled counter and reproduce this ticket in silence,
+ * whereas a required one makes the compiler name every site that has to decide.
  */
 export function recordSpreadCeilingDecision(
   structure: string,
+  accountClass: SpreadCeilingAccountClass,
   admit: boolean,
   spreadPct: number | null,
   code: string,
@@ -373,6 +473,7 @@ export function recordSpreadCeilingDecision(
     gate: admit ? 'spread_ceiling_admitted' : 'spread_ceiling',
     ...(spreadPct !== null && Number.isFinite(spreadPct) ? { spreadPct } : {}),
     code,
+    accountClass,
   });
 }
 
@@ -480,6 +581,13 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       // `maxAdmittedSpreadPct: 0` on a gate that admitted something wide.
       ...(isSpread && Number.isFinite(rec.spreadPct) ? { spreadPct: rec.spreadPct as number } : {}),
       ...(isSpread ? { code: typeof rec.code === 'string' && rec.code !== '' ? rec.code : 'unknown' } : {}),
+      // TRA-2355 — the account class must SURVIVE the rewrite below, for exactly the
+      // TRA-1703 reason one field over: compaction rewrites the file to these sanitized
+      // lines, so a field dropped here is not merely missing from this boot's counters —
+      // it is ERASED FROM DISK. Dropping it would silently re-pool every retained day
+      // into `unattributed` on the first reboot, and the desk partition would read `0`
+      // for a week of sessions the desk actually traded.
+      ...(isSpread ? { accountClass: recAccountClass(rec) } : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -579,6 +687,50 @@ export interface CostAwareGateStructureSummary {
    */
   maxAdmittedSpreadPct: number | null;
   /** Refusals split by threshold (`max_spread_pct` / `min_bid` / `no_quote`). */
+  spreadCeilingRejectsByCode: Record<string, number>;
+  /**
+   * TRA-2355 — THE SAME SPREAD COUNTERS, SPLIT BY OWNING BOOK. **Read `desk` before
+   * you believe any pooled field above.**
+   *
+   * Every spread field above this one pools ~51 QA fixture books with the desk, because
+   * the tally is module-global while `SignalEngine` is per-username. That makes
+   * `spreadCeilingEvaluated > 0` mean "SOME book's gate ran", never "the desk's did" —
+   * and the fixture fleet is a CURRENTLY-FIRING writer of this cohort, not a dormant
+   * one. A session where the desk opens zero directional entries still publishes a
+   * non-zero pooled `evaluated` and a fixture `maxAdmittedSpreadPct` inside the
+   * ceiling: an instrument that reads IDENTICALLY in the pass state and the never-ran
+   * state, which is the whole failure this partition removes.
+   *
+   * ALL THREE CLASSES ARE ALWAYS EMITTED, even at zero — an absent cell reads exactly
+   * like a passing one (the TRA-2350 rule). `unattributed` is pre-TRA-2355 records
+   * carrying no class; it is NOT desk.
+   *
+   *   `desk.spreadCeilingEvaluated === 0`  ⇒ NO DESK READING. Not a pass.
+   *   `> 0` with `desk.spreadCeilingRejected === 0` ⇒ the desk's gate ran, nothing wide.
+   *   `desk.maxAdmittedSpreadPct > ceiling` ⇒ falsification, on the desk book.
+   */
+  spreadCeilingByAccountClass: Record<SpreadCeilingAccountClass, CostAwareGateAccountClassSummary>;
+}
+
+/**
+ * TRA-2355 — one account class's slice of a structure's spread-ceiling counters.
+ *
+ * Deliberately carries the same null discipline as the pooled row it sits under:
+ * `spreadCeilingRejectRate` and `maxAdmittedSpreadPct` are `null` — never 0 — when
+ * this class's gate ruled on nothing, so "this book was quiet" cannot be misread as
+ * "this book was clean".
+ */
+export interface CostAwareGateAccountClassSummary {
+  accountClass: SpreadCeilingAccountClass;
+  /** admitted + rejected FOR THIS CLASS. 0 ⇒ this book's gate did not run. */
+  spreadCeilingEvaluated: number;
+  spreadCeilingRejected: number;
+  /** rejected / evaluated — `null` when this class ruled on nothing. */
+  spreadCeilingRejectRate: number | null;
+  /** Mean `spreadPct` of this class's refusals (null when none / all unmeasurable). */
+  avgRejectedSpreadPct: number | null;
+  /** The widest `spreadPct` THIS CLASS admitted. `null` when it admitted nothing. */
+  maxAdmittedSpreadPct: number | null;
   spreadCeilingRejectsByCode: Record<string, number>;
 }
 
@@ -704,6 +856,17 @@ export interface CostAwareGateSummary {
    * than leaving a reader to discover the split.
    */
   spreadCeilingStructureKeys: Record<string, string>;
+  /**
+   * TRA-2355 — states IN THE PAYLOAD that the pooled spread counters are not a desk
+   * verdict, so a consumer asserts the partition rule instead of assuming it (the
+   * wording TRA-2350 established on `/api/health/option-spread-cost`).
+   *
+   * A note is here rather than a redefinition of the pooled fields on purpose: moving
+   * a published number under every existing consumer mid-flight makes a grader read
+   * the CORRECTION as a new defect (TRA-2079). The pooled fields stay byte-compatible;
+   * the partition sits beside them and this sentence says which one to grade.
+   */
+  spreadCeilingAccountClassNote: string;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
 }
@@ -737,11 +900,58 @@ function mergeTally(into: StructureTally, t: StructureTally): void {
   for (const [code, n] of t.spreadCeilingRejectsByCode.entries()) {
     into.spreadCeilingRejectsByCode.set(code, (into.spreadCeilingRejectsByCode.get(code) ?? 0) + n);
   }
+  // TRA-2355 — roll the class partition across days on the SAME rules as the pooled
+  // fields above: sums add, `maxAdmittedSpreadPct` is a null-safe MAX. A retained
+  // (multi-day) view that folded only the pooled totals would leave the ceiling
+  // tripwire account-blind over exactly the window TRA-1703 built it to cover.
+  for (const [klass, ct] of t.spreadCeilingByAccountClass.entries()) {
+    const acc = classTally(into, klass);
+    acc.admitted += ct.admitted;
+    acc.rejected += ct.rejected;
+    acc.rejectedSpreadPctSum += ct.rejectedSpreadPctSum;
+    if (ct.maxAdmittedSpreadPct !== null) {
+      acc.maxAdmittedSpreadPct =
+        acc.maxAdmittedSpreadPct === null
+          ? ct.maxAdmittedSpreadPct
+          : Math.max(acc.maxAdmittedSpreadPct, ct.maxAdmittedSpreadPct);
+    }
+    for (const [code, n] of ct.rejectsByCode.entries()) {
+      acc.rejectsByCode.set(code, (acc.rejectsByCode.get(code) ?? 0) + n);
+    }
+  }
   // `lastBarR` is a LAST, not a sum — a day with no cost-bar decision has no bar to
   // contribute and must not overwrite a real one. The sentinel is `null`, not 0: a day
   // whose only records were ceiling breaches now carries `null` (TRA-1707), so a genuine
   // bar of 0 is no longer indistinguishable from "never measured".
   if (t.lastBarR !== null) into.lastBarR = t.lastBarR;
+}
+
+/**
+ * TRA-2355 — emit the FULL three-class grid for one structure, zeros included.
+ *
+ * Never sparse. A class omitted because it recorded nothing would be read as a class
+ * that recorded nothing WRONG — the absent-cell-reads-as-passing shape TRA-2350 had to
+ * fix on the journal side of this same ceiling. `desk` present and explicitly zero is
+ * the reading that stops a grade; `desk` missing is one a consumer skips past.
+ */
+function foldAccountClasses(
+  t: StructureTally,
+): Record<SpreadCeilingAccountClass, CostAwareGateAccountClassSummary> {
+  const out = {} as Record<SpreadCeilingAccountClass, CostAwareGateAccountClassSummary>;
+  for (const accountClass of SPREAD_CEILING_ACCOUNT_CLASSES) {
+    const c = t.spreadCeilingByAccountClass.get(accountClass) ?? newClassTally();
+    const evaluated = c.admitted + c.rejected;
+    out[accountClass] = {
+      accountClass,
+      spreadCeilingEvaluated: evaluated,
+      spreadCeilingRejected: c.rejected,
+      spreadCeilingRejectRate: evaluated > 0 ? round(c.rejected / evaluated) : null,
+      avgRejectedSpreadPct: c.rejected > 0 ? round(c.rejectedSpreadPctSum / c.rejected) : null,
+      maxAdmittedSpreadPct: c.maxAdmittedSpreadPct === null ? null : round(c.maxAdmittedSpreadPct),
+      spreadCeilingRejectsByCode: Object.fromEntries(c.rejectsByCode),
+    };
+  }
+  return out;
 }
 
 /** Fold a structure->tally map into the per-structure health rows, busiest first. */
@@ -799,6 +1009,7 @@ function foldStructures(acc: Map<string, StructureTally>): {
       maxAdmittedSpreadPct:
         t.spreadCeilingMaxAdmittedSpreadPct === null ? null : round(t.spreadCeilingMaxAdmittedSpreadPct),
       spreadCeilingRejectsByCode: Object.fromEntries(t.spreadCeilingRejectsByCode),
+      spreadCeilingByAccountClass: foldAccountClasses(t),
     });
   }
   byStructure.sort(
@@ -858,6 +1069,8 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
         'single_leg_directional — NOT the `directional` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).',
       otm: 'single_leg_otm — gated in the OTM scanner chain filter, not by this counter; spreadCeilingEvaluated 0 there is expected.',
     },
+    spreadCeilingAccountClassNote:
+      'TRA-2355. The pooled `spreadCeiling*` fields on each byStructure[] row are NOT A DESK VERDICT: this ledger is module-global while SignalEngine is constructed per username, so ~51 QA fixture books (qa*/ctoverify*/monitor_qa) tally into the same counters as the desk (admin/Richard). GRADE `byStructure[].spreadCeilingByAccountClass.desk` — a non-zero pooled `spreadCeilingEvaluated` can be 100% fixture, and the fixture fleet is a CURRENTLY-FIRING writer of the directional cohort (64 of 151 pre-fix rows), not an empirical zero that expires. `desk.spreadCeilingEvaluated === 0` is NO READING AT ALL, not a pass — the desk fires zero directional entries on roughly 2 sessions in 5. `unattributed` is records written before TRA-2355 (and any hydrated line carrying no class); it is NOT desk, and folding it into desk would re-pool exactly the retained history a multi-day grade leans on hardest. All three classes are emitted even at 0, because an absent cell reads like a passing one. Classification is frozen at DECISION time via classifySpreadCeilingAccount(), the same predicate /api/health/option-spread-cost applies to a row\'s stored `account`, so the two routes cannot drift on the partition rule. Cross-check: this desk cell should track ceilingCompliance.byAccountClass.desk[single_leg_directional].gated on that route.',
     durability: {
       dataDir,
       ephemeral: isEphemeralDataDir(dataDir),

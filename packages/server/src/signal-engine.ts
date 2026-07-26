@@ -137,7 +137,11 @@ import {
 } from './cost-aware-gate-ledger.js';
 // TRA-2295 — the entry-path spread ceiling reads its thresholds from the SAME table
 // the cost model quotes, so the two cannot drift apart again.
-import { spreadGateVerdict, isSpreadCeilingEnforceEnabled } from './option-spread-cost.js';
+import {
+  spreadGateVerdict,
+  isSpreadCeilingEnforceEnabled,
+  classifySpreadCeilingAccount, // TRA-2355
+} from './option-spread-cost.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
@@ -5582,8 +5586,14 @@ export class SignalEngine {
       return null;
     }
 
+    // TRA-2355 — stamp the OWNING BOOK's class. `alertUsername` is the same string the
+    // options account stamps as a journal row's `account` (`setAlertUsername` →
+    // `acct.setOwner`), so the gate counters and the journal-derived compliance fold
+    // partition the same population by the same predicate. Unbound (a bare engine in a
+    // unit test) classifies `unattributed`, never `desk`.
     recordSpreadCeilingDecision(
       structure,
+      classifySpreadCeilingAccount(this.alertUsername),
       verdict.admitted,
       verdict.spreadPct,
       verdict.code,
