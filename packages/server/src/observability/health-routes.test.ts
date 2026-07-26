@@ -2159,6 +2159,71 @@ describe('GET /api/health/option-spread-cost — TRA-2316 ceilingCompliance', ()
     expect(note).toContain('TRA-2319');
   });
 
+  // TRA-2377 — the SIBLING string, one line below the note TRA-2319 just swept.
+  //
+  // `comparisonBasis` is the instruction the TRA-2306 grader executes at the Monday
+  // 20:20Z read, and it carried three defects that all pushed the same way:
+  //
+  //   1. it named a BARE `byStructure[]`, and the cost-aware-gate payload has two
+  //      objects by that name — the top-level one is the current ET day only and is
+  //      `[]` on a quiet day, so the cross-check silently ran against nothing;
+  //   2. it asserted the two sides "should track" each other. TRA-2350 fixed the
+  //      ARCHETYPE half of that claim and left the ACCOUNT half: the gate tally is one
+  //      module-level counter per PROCESS with no account axis, so it pools the whole
+  //      demo fleet, while `desk[...].gated` is desk-only. Pooled vs desk-only cannot
+  //      track, and the pooled side is strictly the larger;
+  //   3. it pre-attributed any disagreement to "a lost counter rather than a lost
+  //      fill" on the premise that the gate counters are in-memory and one-day. That
+  //      premise is false here — `ephemeral` is false and the hydrate re-applies every
+  //      record inside the retention window with no exclude-today filter — and a LOST
+  //      FILL is precisely the falsification TRA-2306 exists to catch. A note that
+  //      talks the grader out of the failing reading is worse than a silent one.
+  it('comparisonBasis QUALIFIES byStructure, and does not claim pooled/desk-only track', async () => {
+    const b = (await body()) as unknown as { ceilingCompliance: { comparisonBasis: string } };
+    const basis = String(b.ceilingCompliance.comparisonBasis);
+
+    // (1) the qualifier is present, and the ambiguous bare form is gone.
+    expect(basis).toContain('retained.byStructure');
+    expect(basis).toContain('TWO objects named `byStructure`');
+    expect(basis).not.toMatch(/(?<!retained\.)\bbyStructure\[\]\.maxAdmittedSpreadPct/);
+
+    // (2) the account-axis mismatch is stated, with the direction of the inequality —
+    // a grader who knows only "they differ" still cannot tell benign from breach.
+    expect(basis).toContain('NO account axis');
+    expect(basis).toContain('maxAdmittedSpreadPct >= desk gated max');
+    expect(basis).toContain('TRA-2355');
+
+    // (3) the dead premise is GONE, not merely contradicted further down. Leaving it
+    // in and appending a correction is how the old rationale keeps getting cited.
+    expect(basis).not.toContain('more likely a lost counter than a lost fill');
+    expect(basis).not.toMatch(/counters are one-day and in-memory/);
+    expect(basis).toContain('A lost FILL is the falsification');
+    expect(basis).toContain('TRA-2377');
+  });
+
+  // The hazard behind (2), asserted rather than assumed — pooled >= desk-only holds by
+  // construction, so a grader treating "pooled max exceeds the desk max" as evidence of
+  // a breach is reading a guarantee as a defect.
+  it('the pooled gate counter cannot be compared like-for-like with a desk-only max', async () => {
+    // A desk row inside the ceiling, and a fixture row outside it. The gate tally sees
+    // both (no account axis); `desk[...].gated` sees only the first.
+    await recordOptionTradeOpen(
+      row('desk-inside', 'admin', { entryBid: 1.95, entryAsk: 2.05, entryMarkUsd: 2.0 }),
+    );
+    await recordOptionTradeOpen(
+      row('fixture-wide', 'qa_mirror_1', { entryBid: 0.2, entryAsk: 0.8, entryMarkUsd: 0.5 }),
+    );
+    const desk = cell(await body(), 'desk');
+    const fixture = cell(await body(), 'fixture');
+
+    // The desk side is clean...
+    expect(desk.n).toBeGreaterThan(0);
+    expect(desk.countAboveCeiling).toBe(0);
+    // ...while the population the POOLED gate counter tallies contains a breach that
+    // is not the desk's. Same structure key, different books.
+    expect(fixture.maxSpreadPct!).toBeGreaterThan(desk.maxSpreadPct!);
+  });
+
   it('counts a quote-less desk row as DROPPED, never as a zero-spread fill', async () => {
     await recordOptionTradeOpen(row('desk-noquote', 'admin', null));
     const desk = cell(await body(), 'desk');

@@ -18,6 +18,7 @@
 // Exit: 0 PASS · 1 FAIL · 2 VOID · 3 NOT_GRADED_YET · 4 BLIND (never conflate with PASS)
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const HOST = process.env.BQB1_HOST ?? 'https://tradingai-bqb1.onrender.com';
 const STRUCT = 'single_leg_directional'; // NOT `directional` — that row is cost-bar/delta only
@@ -44,17 +45,51 @@ export const CONTROLS = {
 const num = v => typeof v === 'number' && Number.isFinite(v);
 const row = (rows, structure) => (rows ?? []).find(r => r?.structure === structure);
 
+// ── BUILD IDENTITY: a SECOND, NAME-INDEPENDENT TRA-2355 detector ─────────────
+// The payload detector below tests for a KEY NAME I PREDICTED. TRA-2355 is unwritten and
+// undeployed; its author does not owe me `spreadCeilingByAccountClass`, and if the axis lands as
+// `byBook` / `accounts` / `deskAdmitted` the name-pinned detector reads NEGATIVE and the grade
+// proceeds against a re-keyed tally. So pin the BUILD, not the vocabulary: `204f298` either is or
+// is not an ancestor of the live SHA, whatever it named its fields.
+//
+// Direction matters. `true` VOIDs (an instrument change is real whatever produced it). `null` —
+// git could not answer, or `--dir=` mode has no live SHA — SUPPRESSES THE PASS DIRECTION ONLY and
+// never manufactures a verdict, the same direction-scoped stop rev 12 imposed on the prose.
+export const TRA2355_COMMIT = '204f298';
+export function readBuild({ liveSha = null, isAncestor = null } = {}) {
+  const out = { liveSha, tra2355: isAncestor, notes: [] };
+  if (isAncestor === true) out.notes.push(`TRA-2355 (${TRA2355_COMMIT}) IS AN ANCESTOR of live ${liveSha} — the tally was re-keyed under the grade, whatever the payload calls it`);
+  if (isAncestor === null) out.notes.push(`BUILD IDENTITY UNKNOWN — could not test whether TRA-2355 (${TRA2355_COMMIT}) is in live ${liveSha ?? '(no SHA read)'}; the second detector did NOT run. Suppresses the PASS direction only.`);
+  return out;
+}
+
+function tra2355IsLive(liveSha) {
+  if (!liveSha) return null;
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', TRA2355_COMMIT, liveSha], { stdio: 'ignore' });
+    return true;
+  } catch (e) {
+    // Exit 1 = a clean "not an ancestor". Anything else (unknown SHA, no git, not a repo) is an
+    // UNANSWERED question and must not be read as "absent" — that is the fail-open this whole
+    // ticket exists to prevent.
+    return e?.status === 1 ? false : null;
+  }
+}
+
 // ── READ 1: /api/health/cost-aware-gate ──────────────────────────────────────
 export function read1(cag) {
-  const out = { armed: cag?.spreadCeiling?.armed, evaluated: null, maxAdmitted: undefined, present: false, instrumentChanged: false, notes: [] };
+  const out = { armed: cag?.spreadCeiling?.armed, evaluated: null, maxAdmitted: undefined, present: false, instrumentChanged: false, accountAxis: false, notes: [] };
 
-  // TRA-2355 free deploy detector. The account axis is ABSENT from the build under test
-  // (verified live 2026-07-26: the substring `account` does not occur anywhere in this payload).
-  // If it appears, TRA-2355 shipped and re-keyed the tally MID-GRADE: pre-2355 records hydrate
-  // as `unattributed`, never `desk`. That is an instrument change, not a data change.
+  // TRA-2355 free deploy detector, widened 2026-07-26 from the two guessed key names to the
+  // PROPERTY: does READ 1 carry an account axis at all? Pinned negative control — the substring
+  // `account` occurs 0 times in 4,518 chars of this payload at SHA 408f06a5. So ANY occurrence is
+  // a change to this instrument, and fail-closed (VOID) is the right direction for a false
+  // positive. If it appears, the tally was re-keyed MID-GRADE: pre-2355 records hydrate as
+  // `unattributed`, never `desk`. That is an instrument change, not a data change.
   const blob = JSON.stringify(cag ?? {});
-  if (/accountClass|spreadCeilingByAccountClass/.test(blob)) {
+  if (/account/i.test(blob)) {
     out.instrumentChanged = true;
+    out.accountAxis = true;
     out.notes.push('TRA-2355 account axis is LIVE — the tally was re-keyed under the grade (deploy hold breached)');
   }
 
@@ -149,7 +184,7 @@ export function read3(journal, sinceTs) {
 // ── MASTER VERDICT ORDER: FAIL -> VOID -> NOT_GRADED_YET -> PASS ─────────────
 // Evaluated in THIS order, not the order the description's tables are printed in. Every "stop" in
 // that document is scoped to the PASS DIRECTION ONLY: nothing may suppress a breach.
-export function grade({ r1, r2, r3 }) {
+export function grade({ r1, r2, r3, build = readBuild() }) {
   const fails = [], voids = [], defers = [], report = [];
 
   // ── STEP 1: breach tests FIRST, before any denominator or attribution test.
@@ -170,11 +205,30 @@ export function grade({ r1, r2, r3 }) {
   // would trade the old false FAIL for a false PASS, which is worse.
   if ((r2.deskUngated?.countAboveCeiling ?? 0) > 0) report.push(`desk[${STRUCT}].UNGATED carries ${r2.deskUngated.countAboveCeiling}/${r2.deskUngated.n} over ${CEILING} — REPORT (ungated sleeve, not a TRA-2295 breach)`);
   if (r3.axisDisagreement > 0) report.push(`${r3.axisDisagreement} desk rows FORWARD OF THE CUTOVER where structure and entryArchetype DISAGREE — finding, not a tiebreak`);
-  report.push(...r2.notes, ...r1.notes, ...r3.notes);
+
+  // ── The ABSENT branch, SPOKEN. ──────────────────────────────────────────────
+  // The account axis being absent is the state Monday's grade runs in, and until now it produced
+  // NO OUTPUT AT ALL — the detector only spoke when the axis APPEARED. A silent absence reads
+  // exactly like "checked, fine", which is this ticket's own defect family turned on its checker.
+  // Say what the absence MEANS for the verdict, every run.
+  if (!r1.accountAxis && build.tra2355 !== true) {
+    report.push(`BASIS: READ 1 carries NO account axis (pre-TRA-2355) — `
+      + `\`spreadCeilingEvaluated\`/\`maxAdmittedSpreadPct\` are POOLED over every book in the process `
+      + `(one module-level tally keyed (etDay, structure); ~51 demo books + the qa_*/ctoverify* fleet). `
+      + `They are NOT a desk statement: a non-zero evaluated count does not mean the desk sleeve ran. `
+      + `READ 1 may VOID and may FAIL on its own; it can NEVER carry a PASS. The desk axis for this `
+      + `grade is READ 2 \`.gated\` + READ 3 — both account-scoped.`);
+    // The route's own `comparisonBasis` tells the grader these two should "track" each other. On
+    // this build they measure different populations (pooled vs desk), so a divergence is EXPECTED
+    // and is not evidence of a lost counter or a lost fill. TRA-2377.
+    report.push('BASIS: `ceilingCompliance.comparisonBasis` says READ 1 `maxAdmittedSpreadPct` should track `desk[...].gated.maxSpreadPct`. On a pre-TRA-2355 build those are POOLED vs DESK-ONLY — a divergence is expected and is NOT a finding. Do not resolve it via that note (TRA-2377).');
+  }
+  report.push(...build.notes, ...r2.notes, ...r1.notes, ...r3.notes);
 
   // ── STEP 2: VOID — explicitly NOT a pass.
   if (r1.armed === false) voids.push('spreadCeiling.armed === false — DISARMED, grade meaningless, re-open');
-  if (r1.instrumentChanged) voids.push('the instrument was re-keyed under the grade (TRA-2355 live)');
+  if (r1.instrumentChanged) voids.push('the instrument was re-keyed under the grade (TRA-2355 live — account axis present in the READ 1 payload)');
+  if (build.tra2355 === true) voids.push(`the instrument was re-keyed under the grade (TRA-2355 ${TRA2355_COMMIT} is an ancestor of the live build)`);
   if (!r1.present) voids.push(`retained.byStructure[${STRUCT}] absent — the gate did not run`);
   else if (r1.evaluated === 0) voids.push('spreadCeilingEvaluated == 0 — the gate did not run');
   else if (r1.maxAdmitted === null) voids.push('spreadCeilingEvaluated > 0 but admitted NOTHING (maxAdmittedSpreadPct null) — ENFORCED / NO ADMITS, row-level claim VOID, not PASS');
@@ -183,6 +237,8 @@ export function grade({ r1, r2, r3 }) {
   // ── STEP 3: NOT GRADED YET. READ 1 is ACCOUNT-BLIND, so it can VOID and can FAIL on its own,
   // but it can NEVER carry a PASS alone. No PASS is reachable while the desk row count is zero.
   const deskN = r2.desk?.n ?? 0;
+  // An UNANSWERED build question is not an answered one. Stops the PASS, never a FAIL or a VOID.
+  if (build.tra2355 == null) defers.push(`build identity UNKNOWN — cannot confirm TRA-2355 (${TRA2355_COMMIT}) is ABSENT from the live build`);
   if (r3.n === 0) defers.push('journal N == 0 — NOT EVIDENCE');
   if (deskN === 0) {
     defers.push(`READ 2 desk[${STRUCT}].gated.n == 0`);
@@ -203,8 +259,13 @@ const mkOsc = (o = {}) => ({ ceilingCompliance: { byAccountClass: {
 const mkJ = rows => ({ rows });
 const jrow = (o = {}) => ({ account: 'admin', structure: STRUCT, entryArchetype: ARCHETYPE, openTs: 2e12, entryBid: 0.65, entryAsk: 0.7, entryMarkUsd: 0.675, ...o });
 
+// Default the harness to the VERIFIED-ABSENT build so the pre-existing cases keep testing what
+// they were written to test; the build axis gets its own explicit cases below.
+const OK_BUILD = { liveSha: '408f06a5', isAncestor: false };
+
 function selfTest() {
-  const g = (cag, osc, j) => grade({ r1: read1(cag), r2: read2(osc), r3: read3(j) }).verdict;
+  const g = (cag, osc, j, b = OK_BUILD) => grade({ r1: read1(cag), r2: read2(osc), r3: read3(j), build: readBuild(b) }).verdict;
+  const gr = (cag, osc, j, b = OK_BUILD) => grade({ r1: read1(cag), r2: read2(osc), r3: read3(j), build: readBuild(b) });
   const cases = [
     ['clean: telemetry + desk rows + READ 2 all clean', 'PASS', () => g(mkCag(), mkOsc(), mkJ([jrow(), jrow(), jrow()]))],
     ['THE FALSE PASS: maxAdmittedSpreadPct null (null <= 0.10 is TRUE in JS)', 'VOID', () => g(mkCag({ maxAdmitted: null }), mkOsc({ deskN: 0 }), mkJ([]))],
@@ -225,6 +286,31 @@ function selfTest() {
     ['pre-cutover rows excluded by the 3-part AND (no false FAIL)', 'NOT_GRADED_YET', () => g(mkCag(), mkOsc({ deskN: 0 }), mkJ(Array.from({ length: 87 }, () => jrow({ structure: 'single_leg_rv', entryBid: 0.02, entryAsk: 0.5, entryMarkUsd: 0.26 }))))],
     ['fixture rows excluded from the desk basis', 'NOT_GRADED_YET', () => g(mkCag(), mkOsc(), mkJ([jrow({ account: 'qa_mirror_1578_38096', entryBid: 0.5, entryAsk: 0.7, entryMarkUsd: 0.6 })]))],
     ['a MOVED pinned control halts the grade', 'VOID', () => { const o = mkOsc(); o.ceilingCompliance.byAccountClass.desk[1].ungated.countAboveCeiling = 62; return g(mkCag(), o, mkJ([jrow(), jrow(), jrow()])); }],
+
+    // ── the build axis (added 2026-07-26) ───────────────────────────────────
+    // The payload detector tests a key name I guessed. These prove the grade does not depend on
+    // having guessed right.
+    ['TRA-2355 live under an UNGUESSED key name -> still VOID, via commit ancestry',
+      'VOID', () => g(mkCag(), mkOsc(), mkJ([jrow(), jrow(), jrow()]), { liveSha: 'deadbee', isAncestor: true })],
+    ['build identity UNKNOWN suppresses a PASS -> NOT_GRADED_YET',
+      'NOT_GRADED_YET', () => g(mkCag(), mkOsc(), mkJ([jrow(), jrow(), jrow()]), { liveSha: null, isAncestor: null })],
+    ['build identity UNKNOWN does NOT suppress a FAIL',
+      'FAIL', () => g(mkCag({ maxAdmitted: 0.4 }), mkOsc(), mkJ([jrow()]), { liveSha: null, isAncestor: null })],
+    ['build identity UNKNOWN does NOT suppress a VOID',
+      'VOID', () => g(mkCag({ armed: false }), mkOsc(), mkJ([jrow()]), { liveSha: null, isAncestor: null })],
+    // The widened payload detector: any `account` substring, not the two names I predicted.
+    ['account axis under an unpredicted payload key -> VOID (widened detector)',
+      'VOID', () => g(mkCag({ extra: { spreadCeilingPerAccount: {} } }), mkOsc(), mkJ([jrow(), jrow(), jrow()]))],
+    // The absent branch must SPEAK. A silent absence reads like "checked, fine".
+    ['the ABSENT account axis is stated in REPORT, not silent', 'yes', () => {
+      const out = gr(mkCag(), mkOsc(), mkJ([jrow(), jrow(), jrow()]));
+      return out.report.some(m => m.startsWith('BASIS: READ 1 carries NO account axis')) &&
+             out.report.some(m => m.includes('comparisonBasis')) ? 'yes' : 'MISSING';
+    }],
+    ['...and is NOT emitted once the axis is live (no contradictory basis)', 'yes', () => {
+      const out = gr(mkCag({ extra: { accountClass: 'desk' } }), mkOsc(), mkJ([jrow()]));
+      return out.report.some(m => m.startsWith('BASIS: READ 1 carries NO account axis')) ? 'LEAKED' : 'yes';
+    }],
   ];
   let bad = 0;
   for (const [name, want, fn] of cases) {
@@ -261,15 +347,19 @@ try {
         fetchJson('/api/health/option-spread-cost?rows=all', '.2306-osc-now.json'),
         fetchJson('/api/health/option-journal?rows=all', '.2306-journal-now.json'),
       ]);
+  let liveSha = null;
   if (!dir) {
     const v = await fetchJson('/api/health/version');
+    liveSha = v.commit ?? null;
     console.log(`live SHA ${v.commit} · startedAt ${v.startedAt}\n`);
   }
+  const build = readBuild({ liveSha, isAncestor: tra2355IsLive(liveSha) });
   const r1 = read1(cag), r2 = read2(osc), r3 = read3(journal, sinceTs);
+  console.log(`BUILD   liveSha=${build.liveSha ?? 'n/a'} TRA-2355(${TRA2355_COMMIT})=${build.tra2355 === null ? 'UNKNOWN' : build.tra2355 ? 'LIVE' : 'absent'} · READ 1 accountAxis=${r1.accountAxis ? 'PRESENT' : 'absent'}`);
   console.log(`READ 1  armed=${r1.armed} present=${r1.present} evaluated=${r1.evaluated} maxAdmitted=${r1.maxAdmitted === null ? 'null' : r1.maxAdmitted}`);
   console.log(`READ 2  desk.gated n=${r2.desk?.n ?? 0} over=${r2.desk?.countAboveCeiling} max=${r2.desk?.maxSpreadPct} thin=${r2.desk?.countBelowMinBid} · fixture.gated n=${r2.fixture?.n ?? 0} · controls=${r2.controls}`);
   console.log(`READ 3  desk N=${r3.n} over=${r3.over} thinBid=${r3.thinBid} worst=${r3.worst} noQuote=${r3.noQuote}`);
-  const g = grade({ r1, r2, r3 });
+  const g = grade({ r1, r2, r3, build });
   console.log(`\nVERDICT: ${g.verdict}`);
   for (const [label, list] of [['FAIL', g.fails], ['VOID', g.voids], ['DEFER', g.defers], ['REPORT', g.report]]) {
     for (const m of list) console.log(`  [${label}] ${m}`);
