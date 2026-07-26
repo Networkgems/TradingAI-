@@ -148,56 +148,18 @@ export const VERDICT_EXIT = {
 
 /* ------------------------------------------------------------------ *
  * Enumeration
+ *
+ * The paged, offset-proving enumerator now lives in
+ * `scripts/lib/paperclip-enumeration.mjs` so a second detector
+ * (`check-phantom-rest.mjs`, TRA-2422) could share the guard instead of
+ * re-implementing it. It could not simply `import` THIS file: `main()` runs at
+ * module scope here, so an import would perform a live sweep and exit the
+ * importer. Behaviour is unchanged and the selftest below still exercises it
+ * through this re-export.
  * ------------------------------------------------------------------ */
 
-/**
- * Page the issue-list route to exhaustion, proving as we go that `offset` is
- * actually honoured.
- *
- * Returns { issues, pages, blind } — `blind` is a REASON STRING, never a
- * boolean, so the caller can print why the population is untrustworthy.
- */
-export async function enumerateIssues(getIssuesPage, { limit = PAGE_LIMIT, maxPages = MAX_PAGES } = {}) {
-  const byId = new Map();
-  const pages = [];
-
-  for (let page = 0; page < maxPages; page += 1) {
-    const offset = page * limit;
-    const rows = await getIssuesPage({ limit, offset });
-    if (!Array.isArray(rows)) {
-      return { issues: [], pages, blind: `list route returned a non-array at offset=${offset}` };
-    }
-
-    const before = byId.size;
-    for (const row of rows) if (row && row.id) byId.set(row.id, row);
-    const added = byId.size - before;
-    pages.push({ offset, returned: rows.length, added });
-
-    // A short page is the honest terminator.
-    if (rows.length < limit) return { issues: [...byId.values()], pages, blind: null };
-
-    // A FULL page that adds nothing new means `offset` was ignored and we are
-    // re-reading page 0 forever. Emptiness would have been the safe failure;
-    // this one looks like data.
-    if (added === 0) {
-      return {
-        issues: [],
-        pages,
-        blind:
-          `list route ignored offset: offset=${offset} returned a full page of ${rows.length} ` +
-          `rows and added 0 new ids. The population cannot be enumerated through this route.`,
-      };
-    }
-  }
-
-  // Hit the page cap with full pages still coming. Say so — do not truncate in
-  // silence and report a count computed off a partial board.
-  return {
-    issues: [],
-    pages,
-    blind: `page cap (${maxPages}) reached with full pages still returning; enumeration is truncated`,
-  };
-}
+export { enumerateIssues } from './lib/paperclip-enumeration.mjs';
+import { enumerateIssues } from './lib/paperclip-enumeration.mjs';
 
 /* ------------------------------------------------------------------ *
  * The parent graph — built from the SAME enumeration, zero extra reads
