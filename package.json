@@ -18,6 +18,7 @@
     "check:cycles": "node scripts/check-cycles.mjs",
     "check:push-auth": "node scripts/check-git-push-auth.mjs",
     "check:deploy-drift": "node scripts/check-deploy-drift.mjs",
+    "check:csp-collector": "node scripts/check-csp-collector.mjs",
     "check:restarts": "node scripts/check-restarts.mjs",
     "check:blocked-empty": "node scripts/check-blocked-empty.mjs",
     "check:blocked-empty:controls": "node scripts/check-blocked-empty.mjs --selftest",
