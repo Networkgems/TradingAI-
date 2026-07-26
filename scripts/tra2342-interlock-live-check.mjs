@@ -20,6 +20,19 @@
 //                  `shouldBootArmLiveCrypto` before any account-derived condition.
 //   3. CARRIER   — `LIVE_CRYPTO_BOOT_ARM` is not positively set on the service.
 //                  (Only with RENDER_API_KEY; skipped, and reported as SKIPPED, without.)
+//   4. TRA-2351  — the two edges the QA grading of TRA-2343 found OPEN. This script
+//                  is the gate on `TRADIER_ENV=production`, so every precondition on
+//                  that step belongs here rather than in a second script nobody runs:
+//                    a. the crypto-start route gates through `evaluateLiveCryptoStartGate`.
+//                       It used to hand the general gate a snapshot carrying the
+//                       PERSISTED mode while authorizing a LIVE start from the request
+//                       body, so the gate graded DEMO, allowed it, and the route
+//                       persisted an UNGRADED live-crypto arm.
+//                    b. `createUserContext` calls `shouldBootDisarmLiveCrypto`. Check 2
+//                       above proves a boot cannot CREATE the arm — it does NOT prove a
+//                       boot cannot INHERIT one, because the caller short-circuits on
+//                       `cryptoAutoTradingEnabledLive !== true` and never reaches the
+//                       guard. (a) is a writer of exactly such an arm.
 //
 // `--post-arm=<iso>` additionally runs the TRA-2342 step-3 post-condition against
 // /api/health/crypto-live. See POST-ARM below.
@@ -39,6 +52,67 @@ const ENGINE_PATH = 'packages/server/src/signal-engine.ts';
 const FLAG_MODULE = 'packages/server/src/live-crypto-boot-arm-flag.ts';
 const GUARD_SYMBOL = 'isLiveCryptoBootArmEnabled';
 const CARRIER_KEY = 'LIVE_CRYPTO_BOOT_ARM';
+
+// TRA-2351 — the third path, and the inherited-arm gap in the check above.
+const THIRD_PATH_COMMIT = '86a5a05299b15727c5dff0eae87aef879ee6b1d7';
+const ROUTES_PATH = 'packages/server/src/index.ts';
+const USER_CONTEXT_PATH = 'packages/server/src/user-context.ts';
+const START_GATE_SYMBOL = 'evaluateLiveCryptoStartGate';
+const DISARM_SYMBOL = 'shouldBootDisarmLiveCrypto';
+
+/**
+ * The TRA-2351 edges, read out of an arbitrary tree so `--self-test` can run the
+ * same predicates against the pre-fix build. Returns one {name, ok, detail} per
+ * edge; `ok === false` on an unreadable file, never a silent pass.
+ */
+function tra2351Edges(tree) {
+  const read = path => {
+    try {
+      return git(['show', `${tree}:${path}`]);
+    } catch {
+      return '';
+    }
+  };
+
+  // (a) The ROUTE edge. Ancestry and ls-tree both survive a revert of the CALLER,
+  // which would leave `evaluateLiveCryptoStartGate` exported, live and unreachable
+  // while the route went back to composing its own snapshot — the TRA-2262 shape.
+  // So we require the call, and require it NOT to be the old hand-composed form.
+  const routes = read(ROUTES_PATH);
+  const startRoute = routes.match(/app\.post\(\s*'\/api\/crypto\/trading\/start'[\s\S]*?\n\}\);/);
+  const routeBody = startRoute ? startRoute[0] : '';
+  const usesNamedGate = routeBody.includes(`${START_GATE_SYMBOL}(`);
+  const composesOwn = /evaluateLiveTransitionGate\s*\(\s*username\s*,\s*updated/.test(routeBody);
+
+  // (b) The BOOT-DISARM edge, in the caller — the guard itself living in
+  // signal-engine.ts proves nothing if createUserContext stopped calling it.
+  const ctx = read(USER_CONTEXT_PATH);
+  const importsDisarm = new RegExp(`\\b${DISARM_SYMBOL}\\b`).test(ctx.split('\n').slice(0, 60).join('\n'));
+  const callsDisarm = new RegExp(`${DISARM_SYMBOL}\\s*\\(`).test(ctx);
+
+  return [
+    {
+      name: `TRA-2351 — crypto-start route gates through ${START_GATE_SYMBOL}`,
+      ok: !!routeBody && usesNamedGate && !composesOwn,
+      detail: !routeBody
+        ? `could not locate the POST /api/crypto/trading/start handler in ${ROUTES_PATH}`
+        : usesNamedGate && !composesOwn
+          ? `${START_GATE_SYMBOL}(username, settings) called in the handler`
+          : composesOwn
+            ? 'the handler hands its OWN snapshot to evaluateLiveTransitionGate — a live start from a demo-persisted operator is UNGATED.'
+            : `the handler does not call ${START_GATE_SYMBOL} — the live crypto start is UNGATED.`,
+    },
+    {
+      name: `TRA-2351 — createUserContext calls ${DISARM_SYMBOL}`,
+      ok: !!ctx && importsDisarm && callsDisarm,
+      detail: !ctx
+        ? `${USER_CONTEXT_PATH} is absent from the tree`
+        : importsDisarm && callsDisarm
+          ? `${DISARM_SYMBOL} imported and invoked — an INHERITED arm meets the carrier`
+          : 'the boot-disarm caller is missing — an arm already set short-circuits past the interlock and is INHERITED by this boot.',
+    },
+  ];
+}
 const SERVICE_ID = process.env['RENDER_SERVICE_ID'] || 'srv-d7mb7rr7uimc73ev0chg';
 
 const argv = process.argv.slice(2);
@@ -86,7 +160,8 @@ async function getJson(url) {
 const PRE_INTERLOCK_SHA = '29cbb9a0fe885614e7b59eb34613e8a466dd11e3';
 
 function selfTest() {
-  console.log(`[tra2342] --self-test: the predicates must FAIL on ${PRE_INTERLOCK_SHA.slice(0, 8)} (the real pre-interlock build)\n`);
+  console.log(`[tra2342] --self-test: every predicate must go NEGATIVE on the real build that PRECEDED the fix it checks`);
+  console.log(`[tra2342]              interlock predicates → ${PRE_INTERLOCK_SHA.slice(0, 8)} · TRA-2351 predicates → f2f6360\n`);
   try {
     git(['cat-file', '-e', `${PRE_INTERLOCK_SHA}^{commit}`]);
   } catch {
@@ -107,10 +182,25 @@ function selfTest() {
   const fn = engine.match(/export function shouldBootArmLiveCrypto\s*\([\s\S]*?\n\}/);
   const hasGuard = !!fn && fn[0].includes(`${GUARD_SYMBOL}(`);
 
+  // TRA-2351 — its own negative control, against its own real pre-fix build.
+  // `f2f6360` is the TRA-2343 roster-delta fix: the build QA graded, which
+  // CONTAINS the third path (the route composes its own snapshot; there is no
+  // boot-disarm). 29cbb9a0 would work too, but a control should sit as close to
+  // the fix as possible — an older build can go negative for unrelated reasons.
+  const PRE_THIRD_PATH_SHA = 'f2f63601522bdf0c9eaf4af323021fabb31db0d7';
+  let thirdPathEdges;
+  try {
+    git(['cat-file', '-e', `${PRE_THIRD_PATH_SHA}^{commit}`]);
+    thirdPathEdges = tra2351Edges(PRE_THIRD_PATH_SHA);
+  } catch {
+    bail(`${PRE_THIRD_PATH_SHA.slice(0, 8)} is not in this clone; cannot self-test the TRA-2351 predicates. Run \`git fetch origin\`.`);
+  }
+
   const checks = [
     ['ancestry reports NOT-an-ancestor', ancestry === false],
     ['import edge reports ABSENT', hasImport === false],
     ['guard call reports ABSENT (function exists but is unguarded)', hasGuard === false && !!fn],
+    ...thirdPathEdges.map(e => [`${e.name} reports ABSENT on ${PRE_THIRD_PATH_SHA.slice(0, 7)}`, e.ok === false]),
   ];
   let bad = 0;
   for (const [name, ok] of checks) {
@@ -213,6 +303,30 @@ async function main() {
       hasModule = git(['ls-tree', '-r', '--name-only', live, '--', FLAG_MODULE]).trim() === FLAG_MODULE;
     } catch { /* fall through as false */ }
     record('CALL SITE — flag module present in the LIVE tree', hasModule, hasModule ? FLAG_MODULE : `${FLAG_MODULE} missing from ${live.slice(0, 8)}`);
+  }
+
+  // ---- 4. TRA-2351 — the third path, and the inherited-arm gap ---------------
+  let thirdPathAncestry = false;
+  try {
+    git(['cat-file', '-e', `${THIRD_PATH_COMMIT}^{commit}`]);
+    try {
+      git(['merge-base', '--is-ancestor', THIRD_PATH_COMMIT, live]);
+      thirdPathAncestry = true;
+    } catch { /* not an ancestor */ }
+    record(
+      `TRA-2351 — ${THIRD_PATH_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
+      thirdPathAncestry,
+      thirdPathAncestry
+        ? `${THIRD_PATH_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
+        : `${live.slice(0, 8)} does NOT contain ${THIRD_PATH_COMMIT.slice(0, 7)}. The crypto-start bypass is OPEN. Deploy it before arming.`,
+    );
+    for (const e of tra2351Edges(live)) record(e.name, e.ok, e.detail);
+  } catch {
+    record(
+      `TRA-2351 — ${THIRD_PATH_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
+      false,
+      `${THIRD_PATH_COMMIT.slice(0, 8)} is not in this clone. Run \`git fetch origin\`. An absent object is NOT a pass.`,
+    );
   }
 
   // ---- 3. CARRIER not positively set ---------------------------------------
