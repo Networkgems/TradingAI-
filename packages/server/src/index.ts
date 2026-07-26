@@ -483,6 +483,7 @@ import {
 } from './export.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
+import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
   recordShortSqueezeCapture,
@@ -3965,9 +3966,18 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   const minRaw = req.query['minMispricing'];
   const minMispricing =
     typeof minRaw === 'string' && minRaw.length > 0 ? Number(minRaw) : undefined;
+  // TRA-2388 — |delta| floor (the TRA-2354 decision). Absent ⇒ the panel
+  // default; `?minDelta=0` restores the raw far tail. See `otm-delta-floor.ts`
+  // for why this is a route-layer filter over the RETURNED candidates and not a
+  // `minAbsDelta` forwarded into `scanOtm`: the engine filter `continue`s before
+  // the candidate exists, so it cannot report what it dropped, and the sleeve's
+  // own TRA-1407 floor must stay untouched. The two predicates are equivalent on
+  // the kept set, so this moves only the observability, never the rows.
   const deltaRaw = req.query['minDelta'];
-  const minAbsDelta =
-    typeof deltaRaw === 'string' && deltaRaw.length > 0 ? Number(deltaRaw) : undefined;
+  const minDelta =
+    typeof deltaRaw === 'string' && deltaRaw.length > 0 && Number.isFinite(Number(deltaRaw))
+      ? Number(deltaRaw)
+      : OTM_PANEL_DELTA_FLOOR;
   // TRA-2341 — dollar floor on the mispricing DENOMINATOR. Absent ⇒ the panel
   // default; `?minTheo=0` restores the raw pre-TRA-2341 projection. See
   // `otm-theo-floor.ts` for why this is a route-layer filter and not an engine
@@ -3979,23 +3989,34 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
       ? Number(theoRaw)
       : OTM_PANEL_THEO_FLOOR;
 
+  // NOTE: deliberately no `minAbsDelta` here — see the TRA-2388 note above.
+  // `packages/engine/` is byte-unchanged by this route.
   const result = await relativeValueScannerService.scanOtm(symbol, {
     ...(Number.isFinite(minMispricing) ? { mispricingThresholdPct: Number(minMispricing) } : {}),
-    ...(Number.isFinite(minAbsDelta) ? { minAbsDelta: Number(minAbsDelta) } : {}),
   });
   // Floor BEFORE the slice. Filtering after it would leave the underflow rows
   // occupying the top N and merely blank the table.
   const floored = applyTheoFloor(result.candidates, minTheo);
+  // TRA-2388 — then the |delta| floor, on what the theo floor kept. The counts
+  // are therefore SEQUENTIAL, not partitions of the same population:
+  // `deltaFloor.suppressed` is what the delta axis removed from the rows that
+  // already cleared the theo axis. Both run before the slice.
+  const deltaFloored = applyDeltaFloor(floored.kept, minDelta);
   res.json({
     ...result,
     // `scanOtm` ranks by |mispricingPct| descending, so a slice is the top N.
-    candidates: floored.kept.slice(0, limit),
+    candidates: deltaFloored.kept.slice(0, limit),
     // Never a silent drop: the panel footnotes this, and its presence is what
     // distinguishes a build carrying the guard from one that predates it.
     theoFloor: {
       applied: floored.floor,
       suppressed: floored.suppressed,
       maxSuppressedMispricingPct: floored.maxSuppressedMispricingPct,
+    },
+    deltaFloor: {
+      applied: deltaFloored.floor,
+      suppressed: deltaFloored.suppressed,
+      maxSuppressedMispricingPct: deltaFloored.maxSuppressedMispricingPct,
     },
     diagnostics: relativeValueScannerService.diagnostics(),
   });

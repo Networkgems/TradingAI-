@@ -439,6 +439,161 @@ describe('OtmMispricingPanel', () => {
     });
   });
 
+  // ── TRA-2388: |delta| floor (the TRA-2354 decision) ─────────────────────
+  //
+  // The theo floor killed the pathological rows; it did not change the fact that
+  // ranking by a RATIO returns the far tail. Live SPY still read 1510.9% with the
+  // theo floor deployed. The floor now lives on |delta| in the route, and the
+  // panel's job is the same as before: never let the removal be silent, and never
+  // fabricate a floor the server didn't report.
+  describe('delta-floor suppression (TRA-2388)', () => {
+    const scanCalls = (m: ReturnType<typeof stubFetch>) =>
+      m.mock.calls.filter((c) => String(c[0]).includes('/api/options/otm-mispricing'));
+
+    it('sends NO minDelta by default, so the server floor is the one in force', async () => {
+      // If the panel shipped its own literal, a desk on an older build would see
+      // a floor that isn't there — and the constant would live in two places.
+      const fetchMock = stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          deltaFloor: { applied: 0.02, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(String(scanCalls(fetchMock)[0]![0])).not.toContain('minDelta');
+    });
+
+    it('footnotes what the floor suppressed alongside the surviving rows', async () => {
+      stubFetch({
+        body: {
+          symbol: 'SPY', spot: 738.93, expiration: '2026-08-31',
+          candidates: [candidate()], reason: 'ok',
+          deltaFloor: { applied: 0.02, suppressed: 9, maxSuppressedMispricingPct: 15.109 },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={[{ symbol: 'SPY' }]} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.getByText(/9 higher-ranked contracts were hidden/i)).toBeInTheDocument();
+      // The live SPY number the decision was measured on: 15.109 -> 1,510.9%.
+      expect(screen.getByText(/1,510\.9%/)).toBeInTheDocument();
+    });
+
+    it('an ALL-suppressed delta scan does not read as a thin chain', async () => {
+      // The branch the theo-floor version does NOT cover: theo suppressed
+      // nothing, the delta floor took every remaining row. Falling through to
+      // "no OTM contracts passed the liquidity filters" would report a healthy
+      // scan of a liquid chain.
+      stubFetch({
+        body: {
+          symbol: 'SPY', spot: 738.93, expiration: '2026-08-31',
+          candidates: [], reason: 'ok',
+          theoFloor: { applied: 0.01, suppressed: 0, maxSuppressedMispricingPct: null },
+          deltaFloor: { applied: 0.02, suppressed: 15, maxSuppressedMispricingPct: 15.109 },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={[{ symbol: 'SPY' }]} />);
+
+      expect(await screen.findByText(/Every candidate was in the far tail/i)).toBeInTheDocument();
+      expect(screen.queryByText(READINGS.cleanEmpty)).not.toBeInTheDocument();
+      expect(screen.queryByText(READINGS.legacy)).not.toBeInTheDocument();
+    });
+
+    it('reports the floor as IN FORCE when it ran clean — the negative control', async () => {
+      // "the floor ran and had nothing to drop" (NVDA / QQQ / AAPL, the property
+      // that makes the constant credible) and "this build has no floor" render
+      // identically if the panel only ever shows suppressions.
+      stubFetch({
+        body: {
+          symbol: 'NVDA', spot: 182.5, expiration: '2026-08-21',
+          candidates: [candidate()], reason: 'ok',
+          deltaFloor: { applied: 0.02, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={[{ symbol: 'NVDA' }]} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.getByText(/floor 0\.020 in force/i)).toBeInTheDocument();
+      expect(screen.queryByText(/hidden/i)).not.toBeInTheDocument();
+    });
+
+    it('says the tail is RAW when the floor was escaped with 0', async () => {
+      stubFetch({
+        body: {
+          symbol: 'SPY', spot: 738.93, expiration: '2026-08-31',
+          candidates: [candidate({ mispricingPct: 15.109, delta: 0.004 })], reason: 'ok',
+          deltaFloor: { applied: 0, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={[{ symbol: 'SPY' }]} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.getByText(/floor disabled/i)).toBeInTheDocument();
+    });
+
+    it('a server predating the floor renders no note and no fabricated zero', async () => {
+      // `deltaFloor` absent is the deploy detector: it is how the panel — and the
+      // desk reading it — can tell TRA-2388 is not on the box yet.
+      stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          theoFloor: { applied: 0.01, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.queryByText(/in force/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/floor disabled/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/hidden/i)).not.toBeInTheDocument();
+    });
+
+    it('the override is sent on Enter, and typing it does NOT re-scan', async () => {
+      // Each scan is an upstream Tradier chain fetch. A dependency on the input
+      // would make "0.05" four of them.
+      const fetchMock = stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          deltaFloor: { applied: 0.02, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+      expect(scanCalls(fetchMock)).toHaveLength(1);
+
+      await userEvent.type(screen.getByLabelText('Minimum absolute delta'), '0');
+      expect(scanCalls(fetchMock)).toHaveLength(1); // still one — no keystroke scans
+
+      await userEvent.keyboard('{Enter}');
+      expect(scanCalls(fetchMock)).toHaveLength(2);
+      expect(String(scanCalls(fetchMock).at(-1)![0])).toContain('minDelta=0');
+    });
+
+    it('Refresh picks up what is currently in the box', async () => {
+      // Reading the ref at call time is what avoids a commit-on-blur race, where
+      // Refresh would scan with the previous value.
+      const fetchMock = stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          deltaFloor: { applied: 0.05, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      await userEvent.type(screen.getByLabelText('Minimum absolute delta'), '0.05');
+      await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+      expect(String(scanCalls(fetchMock).at(-1)![0])).toContain('minDelta=0.05');
+    });
+  });
+
   it('offers no order-entry control (TRA-159 is not wired)', async () => {
     stubFetch({
       body: {
