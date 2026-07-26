@@ -250,11 +250,25 @@ export interface OptionTradeJournalOpen {
    *     1-contract override), so it stamps a hardcoded `1`.
    *
    * Partition naively on `decided === 1` and every out-of-cohort row lands in the
-   * CONTROL arm. Spreads and the wheel are a large share of the option book, so
-   * the control arm fills with trades the throttle could never have touched — and
-   * it fails silently, because a contaminated control arm just looks big and
-   * healthy. `riskThrottleArmedScope` cannot separate them either: it is stamped
-   * unconditionally at the account layer and reads the same on both.
+   * CONTROL arm, where it is a trade the throttle could never have touched.
+   *
+   * How much of the book that is TODAY is small, and it is a *policy* variable,
+   * not a constant (TRA-2385 — the shipped TRA-2375 text claimed "a large share"
+   * and that magnitude was never counted). Measured 2026-07-26 against live
+   * `408f06a5`, `/api/health/option-journal?rows=all`, n=2,383: **0 of the 115
+   * demo desk rows** the TRA-2331 grade partitions on, 28 of 2,383 overall
+   * (1.17% — `iron_condor` 16, `bear_put_spread` 8, `bear_call` 2, `bull_put` 2,
+   * every one of them in the unattributed bucket the grade already drops), and
+   * **zero** wheel rows (`covered_call` / `cash_secured_put`) anywhere in the
+   * journal. So no live control arm is being distorted right now.
+   *
+   * The field exists for the moment that changes. The desk turning the wheel on,
+   * or routing spreads, needs no code change here — and a `decided === 1`
+   * partition would then pool those fills into the control arm SILENTLY, because
+   * a contaminated control arm just looks big and healthy. Nothing in the
+   * resulting numbers looks wrong. `riskThrottleArmedScope` cannot separate them
+   * either: it is stamped unconditionally at the account layer and reads the same
+   * on both.
    *
    * THREE distinguishable states, and the distinction is the whole point:
    *   • **absent**  — row written by a build older than TRA-2375. Basis unknown;

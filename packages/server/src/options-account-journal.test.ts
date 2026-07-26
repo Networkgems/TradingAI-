@@ -754,9 +754,15 @@ describe('decided-vs-applied throttle stamp on the journal open row (TRA-2339)',
 //       defined-risk-spread sites, the wheel's CSP/CC, the bounded-live 1-contract
 //       override), so it stamps a hardcoded 1.
 //
-// Partition on `decided === 1` and (b) lands in the CONTROL arm. Spreads and the
-// wheel are a large share of the option book, so the arm TRA-2331 compares
-// against fills with trades the throttle could never have touched — and it fails
+// Partition on `decided === 1` and (b) lands in the CONTROL arm — trades the
+// throttle could never have touched, in the arm TRA-2331 compares against.
+//
+// Today that share is small, and it is a POLICY variable, not a constant
+// (TRA-2385; TRA-2375 shipped saying "a large share" and never counted it).
+// Measured 2026-07-26 vs live 408f06a5, n=2,383: 0 of the 115 demo desk rows the
+// grade partitions on, 28 of 2,383 overall (all in the unattributed bucket the
+// grade already drops), 0 wheel rows anywhere. The day the desk turns the wheel
+// on or routes spreads that changes with no code change here — and it fails
 // SILENTLY, because a contaminated control arm just looks big and healthy.
 //
 // These pin the property that closes it: cohort membership is carried on the row
