@@ -94,15 +94,57 @@ export const FREEZE_CLOSE_MIN = RTH_CLOSE_MIN; // 20:00Z
 export const EMBARGOES = [
   {
     from: '2026-07-27T13:25:00Z',
-    to: '2026-07-27T20:20:00Z',
-    ticket: 'TRA-2322 (CTO-ratified) / TRA-2325',
+    // EXTENDED 20:20Z -> 21:00Z on 2026-07-26 (CTO, TRA-2306). See the note below the table:
+    // the old close opened the window at the exact instant three graded reads fire.
+    to: '2026-07-27T21:00:00Z',
+    ticket: 'TRA-2322 (CTO-ratified) / TRA-2325 / TRA-2306',
     why:
       'TRA-2213 leg 1 (exit-cadence p99), the TRA-1648 soak sign-off and TRA-2306 all need ONE ' +
-      'zero-restart RTH on bqb1. All three are graded off in-memory counters that reset on boot: ' +
-      'a mid-session restart does not degrade those reads, it destroys them. Runs to 20:20Z, past ' +
-      'the 20:00Z bell, because the post-close monitor reads land at 20:02Z and 20:15Z.',
+      'zero-restart RTH on bqb1, AND an undisturbed post-close read window. A boot resets the ' +
+      "doTick tape and the soak clock outright; for TRA-2306 the hazard is different and worse " +
+      '(see the rationale note below). Runs to 21:00Z because the graded post-close reads land ' +
+      'at 20:10Z / 20:20Z / 20:25Z / 20:30Z / 20:45Z and take minutes to execute.',
   },
 ];
+
+// ── Why the 2026-07-27 row closes at 21:00Z, not 20:20Z (TRA-2306, CTO 2026-07-26) ──
+//
+// TWO defects in the previous row, one of shape and one of rationale. Both are fixed above;
+// this note exists so neither gets "corrected" back by someone re-deriving the old reason.
+//
+// 1. SHAPE — the old 20:20Z close opened the deploy window at the exact instant the reads it
+//    exists to protect begin. Derived from the live routine table on 2026-07-26, the graded
+//    post-close reads on Mon 2026-07-27 are:
+//      20:10Z  d017b173  TRA-2277 parity-reconcile dailySeries
+//      20:20Z  0bb90f24  TRA-2306 spread-ceiling grade   <- the first session under the gate
+//      20:20Z  dcedeb43  TRA-2171/2213 doTick tape grade
+//      20:25Z  7d30dcfc  TRA-1648 soak check             <- named in this very embargo
+//      20:30Z  f97baf3b  TRA-2339 decided-throttle run check
+//      20:45Z  7c3af47e  TRA-2331 · e3e69d35 TRA-1585
+//    A deploy CREATED at 20:20:00Z BOOTS the box ~2-3 min later — i.e. inside all of them. That
+//    is the same created-vs-boots confusion DEPLOY_LEAD_MIN fixes on the open side (TRA-2325),
+//    left unfixed on the close side. The old row's stated derivation ("reads land at 20:02Z and
+//    20:15Z") matches no routine in the table.
+//
+// 2. RATIONALE — "TRA-2306 is graded off in-memory counters that reset on boot" is FALSE on this
+//    host. Do not cite it, and do not let its falseness be read as "the TRA-2306 hold is
+//    unfounded" (it is exactly the kind of dead premise that invites --force-embargo-override).
+//    hydrateCostAwareGateFromDisk re-apply()s every /data record inside the 7-day retention back
+//    into the same byDay map, with no exclude-today filter — so the CURRENT day's counters are
+//    rebuilt by the boot. What actually threatens the read:
+//      a. the hydrate COMPACTS — it rewrites the JSONL to only the lines it kept. A boot onto a
+//         wiped or repointed DATA_DIR hydrates empty and then rewrites the file to empty,
+//         destroying `retained` PERMANENTLY rather than zeroing a day view (TRA-2319, and the
+//         TRA-2136 env-wipe class is the live way to get there). Every health field reads like an
+//         ordinary deploy either way.
+//      b. a build swap mid-read: 502 on every route while it is in flight, and the grader cannot
+//         tell that from an outage.
+//      c. TRA-2355 changes the cost-aware-gate counters themselves — the instrument TRA-2306 is
+//         grading. Landing it on main is safe (autoDeploy: no); shipping it into the graded
+//         session is not.
+//
+// This row is spent at 21:00Z on 2026-07-27. Grades are published from the reads above, so if you
+// need a deploy that evening, take it after 21:00Z rather than overriding.
 
 const argv = process.argv.slice(2);
 const has = flag => argv.includes(flag);

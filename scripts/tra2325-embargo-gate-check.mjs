@@ -4,7 +4,8 @@
 // Discrimination suite for the two deploy gates in render-redeploy.mjs:
 //   1. the daily RTH freeze, now opened DEPLOY_LEAD_MIN early (13:25Z, not 13:30Z),
 //      because a deploy CREATED at 13:29Z BOOTS the box inside RTH;
-//   2. the dated EMBARGO table (Mon 2026-07-27 13:25Z–20:20Z for the bqb1 hold).
+//   2. the dated EMBARGO table (Mon 2026-07-27 13:25Z–21:00Z for the bqb1 hold; the close
+//      side was extended from 20:20Z on 2026-07-26 — TRA-2306, see render-redeploy.mjs).
 //
 // A gate that refuses everything is not a gate, so every REFUSE case here is paired
 // with a PROCEED case that differs by the one variable under test. A suite where the
@@ -40,8 +41,19 @@ const CASES = [
   ['2026-07-27T13:29:00Z', 'REFUSE_EMBARGO', 'Mon 13:29Z — the exact hole: old gate said exit 0, box boots in RTH'],
   ['2026-07-27T17:00:00Z', 'REFUSE_EMBARGO', 'Mon 17:00Z — mid-RTH, routine 0a9e7abc fires here'],
   ['2026-07-27T20:00:00Z', 'REFUSE_EMBARGO', 'Mon 20:00:00Z — the bell; old gate was FULLY OPEN from here'],
-  ['2026-07-27T20:19:59Z', 'REFUSE_EMBARGO', 'Mon 20:19:59Z — still held, the 20:15Z monitor read is upstream'],
-  ['2026-07-27T20:20:00Z', 'PROCEED', 'Mon 20:20:00Z sharp — embargo clear, routine dcedeb43 may ship'],
+  ['2026-07-27T20:19:59Z', 'REFUSE_EMBARGO', 'Mon 20:19:59Z — still held'],
+
+  // ── Close side, EXTENDED to 21:00Z on 2026-07-26 (CTO, TRA-2306) ─────────────
+  // The old row closed at 20:20Z — the exact instant 0bb90f24 (TRA-2306) and dcedeb43
+  // (TRA-2171) fire, and 5 min before the TRA-1648 soak check this embargo names. A deploy
+  // CREATED at 20:20:00Z BOOTS ~2-3 min later, inside all of them: the created-vs-boots gap
+  // DEPLOY_LEAD_MIN fixes on the open side, left unfixed on the close side.
+  ['2026-07-27T20:20:00Z', 'REFUSE_EMBARGO', 'Mon 20:20:00Z sharp — 0bb90f24 (TRA-2306) + dcedeb43 fire HERE; was PROCEED'],
+  ['2026-07-27T20:25:00Z', 'REFUSE_EMBARGO', 'Mon 20:25Z — 7d30dcfc TRA-1648 soak check, the read this embargo names'],
+  ['2026-07-27T20:30:00Z', 'REFUSE_EMBARGO', 'Mon 20:30Z — f97baf3b TRA-2339 run check'],
+  ['2026-07-27T20:45:00Z', 'REFUSE_EMBARGO', 'Mon 20:45Z — 7c3af47e TRA-2331 / e3e69d35 TRA-1585 grades'],
+  ['2026-07-27T20:59:59Z', 'REFUSE_EMBARGO', 'Mon 20:59:59Z — last held instant'],
+  ['2026-07-27T21:00:00Z', 'PROCEED', 'Mon 21:00:00Z sharp — embargo clear, half-open [from,to)'],
   ['2026-07-27T22:00:00Z', 'PROCEED', 'Mon 22:00Z — post-embargo, post-close'],
 
   // ── The daily freeze on an UN-embargoed weekday (the lead-time fix, isolated) ─
