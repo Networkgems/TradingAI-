@@ -208,6 +208,79 @@ roll-up **withhold the sample-size countdown** when the bar is unreachable. That
 was not a passive omission: it published "N weeks to go" every Monday toward an event that
 could not occur, which reads as *on track, keep going*.
 
+### Per-sleeve feasibility (TRA-2353) — the book verdict is a **composition artifact**
+
+The bound above is correct on any mix, but it is **one number for the whole book**, and on
+a **mixed** book that averages an infeasible sleeve into a `feasible` verdict. Measured
+live on 2026-07-26:
+
+| population | n | ceiling | vs the `0.20R` bar |
+|---|---|---|---|
+| **graded book** | 47 | gross `0.2882` → net `0.2391` | `feasible`, headroom `0.0391R` |
+| **credit sleeve** | 35 | ≈ `0.04` gross / `0.00` net | flatly **infeasible** |
+| **debit sleeve** | 12 | `rewardR ≈ 1.012` | carries the whole verdict |
+
+**74% of the graded book was being measured against a bar it provably cannot reach, and
+the instrument built to detect exactly that reported `feasible`** — because 12 debit
+verticals lift the mean. The credit read needs no model: `bull_put_spread` resolved n=31
+at a hit rate of **1.00** for `+0.04R` gross and `0.00R` net. Every trade a winner and the
+sleeve returns zero: it has **attained** its ceiling.
+
+`GET /api/health/live-capital-gate` therefore publishes `sleeveFeasibility`, partitioned
+on two axes over the **same** `resolved` array (a partition of the caller's array, never a
+second filter — the §2 rule, one level down):
+
+- **`byStructure`** — the key `IdeasDecomposition.byStructure` already groups on
+  (`strategy`), so a ceiling lines up against the realized `grossR`/`netR`/`hitRate` cells
+  on `/api/health/options-ideas-decomposition` with nothing re-derived.
+- **`byPremiumDirection`** — `credit` / `debit` / `unknown`, taken from the **sign of
+  `entryNetUsd`**. A per-row *measurement* of the entry, not a name list: a structure
+  nobody enumerated is bucketed correctly rather than silently mis-filed, and an
+  unformable entry lands in `unknown` instead of in the wrong sleeve. (*A structure key is
+  not a sleeve* — TRA-2350.)
+
+The per-sleeve verdict is **exactly as sound as the book one**: `pnlR ≤ rewardR` is an
+inequality on each individual trade, so it restricts to any subset —
+`mean_S(pnlR) ≤ mean_S(rewardR)` for every sleeve `S`.
+
+Four rules:
+
+1. **Nothing here changes what blocks.** `pass` / `passed` are byte-identical with or
+   without this block. Whether a material infeasible sleeve *should* block is a policy
+   decision and it is QuantTrader's, not the implementer's.
+2. **Non-blocking ≠ invisible.** The worst offender is named in `feasibilityNote` **and**
+   in the headline `summary`, at any weight. `MATERIAL_SLEEVE_WEIGHT` (10%) **labels**, it
+   never **filters** — a threshold that suppresses would be a new blind spot in an
+   instrument that exists because a true state was invisible.
+3. **Read `fragility` before quoting the book verdict.** Each sleeve is removed in turn and
+   the book ceiling recomputed; `flipsOnSingleSleeveRemoval` says whether the verdict
+   survives the mix moving. On the live book it does **not**: `ceilingGrossR ≤ 0.2491`
+   flips it to `INFEASIBLE`, and the margin is `0.039R` resting on 12 of 47 ideas. If
+   TRA-1965's cut fork removes the credit sleeve, or the debit sleeve simply stops
+   resolving, **the verdict changes with no code change at all.**
+   ⚠️ Note the leave-one-out sweep is deliberately **not** limited to the largest sleeve:
+   on this book the largest sleeve is the *credit* one, and removing it *raises* the
+   ceiling. A largest-sleeve-only guard reports "still feasible" and finds no fragility.
+4. **`unknown` renders as `unknown` in the headline.** Because the ceiling is an *upper*
+   bound, `unknown` is not the symmetric partner of `feasible` — it can conceal a genuinely
+   infeasible state. When it lands on a criterion reading a bare `FAIL`, the summary now
+   says `REACHABILITY UNKNOWN` rather than letting `FAIL` assert *"the book underperformed"*.
+
+⚠️ `index.ts` maps this payload **field by field**, not by spread. A new field on the gate
+result is **silently dropped** from the route: the module stays correct, the unit tests
+stay green, and the route you grade from shows no change. Extend the whitelist in the same
+commit.
+
+**`scripts/tra2335-feasibility-check.mjs` has two modes and only one of them is a monitor.**
+The default mode is a **mechanism prover over a hand-built reconstruction** — a unit test
+with a CLI, which will print `INFEASIBLE` forever regardless of the live book, because its
+input is a constant in the file. **Its green says nothing about the live gate.** Only
+`--live` reads the deployed route (and prints the build SHA beside the verdict, because a
+feasibility verdict is build-scoped and perishes on the next deploy). `--live` grades the
+*instrument*, never the *book*: a live `feasible` is not a pass and a live `infeasible` is
+not a failure — those are facts about the trading book. An unreachable route exits **3
+(BLIND)**, never 0.
+
 ### Criterion 5 — POP post-calibration (TRA-2006, SHADOW-first)
 
 The stated POP is the LLM's free-form estimate (TRA-2000 diagnosis), which runs a

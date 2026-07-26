@@ -1,4 +1,9 @@
-import { evaluateBookFeasibility, type ForwardTestReport } from './options-forward-test.js';
+import {
+  evaluateBookFeasibility,
+  evaluateBookSleeveFeasibility,
+  type BookSleeveFeasibility,
+  type ForwardTestReport,
+} from './options-forward-test.js';
 import { isOptionCostAwareGateEnabled, resolveCostGateConfig } from './option-cost-gate.js';
 import type { FeasibilityResult } from './gate-feasibility.js';
 
@@ -132,6 +137,17 @@ export interface LiveCapitalGateResult {
    * untestable with this instrument", NOT as "not yet".
    */
   feasibility: FeasibilityResult;
+  /**
+   * TRA-2353 — the SAME ceiling, partitioned by sleeve, with the composition-fragility
+   * sweep beside it. Purely additive: `passed` and every `pass` are byte-identical with
+   * or without this block, because a book that is `feasible` in aggregate while a sleeve
+   * inside it is not is a REPORTING defect, and whether it should also block is a policy
+   * question TRA-2353 reserves for QuantTrader.
+   *
+   * ⚠️ Read {@link feasibility} for what blocks and this for what it rests on. On
+   * 2026-07-26 those two disagreed about 74% of the graded book.
+   */
+  sleeveFeasibility: BookSleeveFeasibility;
   /** One-line plain-English disposition. */
   summary: string;
   /** Standing reminder that a pass is permission-to-propose, not auto-wiring. */
@@ -168,6 +184,17 @@ export function evaluateLiveCapitalGate(
   // is unreachable at a 100% hit rate. Computed by the SAME function the accumulation
   // monitor uses, so the health route and the weekly roll-up cannot disagree.
   const feasibility = evaluateBookFeasibility(report, criteria.minExpectancyR);
+
+  // TRA-2353 — the same ceiling, per sleeve. The book bound is correct on any mix, but on
+  // a MIXED book it averages an infeasible sleeve into a `feasible` verdict: measured
+  // live 2026-07-26, the book read `feasible` (cost-net ceiling 0.2391R vs a 0.20R bar)
+  // while the 35-idea credit sleeve inside it sat at ≈0.00R and could not reach the bar
+  // at a REALIZED 100% hit rate. Additive only — nothing below folds this into `pass`.
+  const sleeveFeasibility = evaluateBookSleeveFeasibility(
+    report,
+    criteria.minExpectancyR,
+    feasibility.verdict,
+  );
 
   // TRA-2335 — `pass` is computed ONCE and `status` is derived from it, so the two can
   // never drift apart for the criteria that have no feasibility precondition.
@@ -224,7 +251,14 @@ export function evaluateLiveCapitalGate(
       status: expectancyStatus,
       barR: criteria.minExpectancyR,
       ceilingR: feasibility.ceilingR,
-      feasibilityNote: feasibility.reason,
+      // TRA-2353 (AC2) — the sleeve sentence travels ON THE CRITERION, not only in a
+      // sibling block: this is the field a reader lands on when they ask why criterion 3
+      // reads the way it does, and a `feasible` book resting on 26% of its own
+      // population is part of that answer.
+      feasibilityNote:
+        sleeveFeasibility.note == null
+          ? feasibility.reason
+          : `${feasibility.reason} ⚠️ ${sleeveFeasibility.note}`,
     },
     {
       name: 'expectancy_durability',
@@ -261,17 +295,35 @@ export function evaluateLiveCapitalGate(
   // reads as a to-do, and "keep accruing" is the wrong action when the bar is
   // untestable. AC2 — the summary names BOTH the bar and the ceiling.
   const infeasible = criteriaResults.filter((c) => c.status === 'INFEASIBLE');
-  const summary = passed
+  const headline = passed
     ? 'PASS — forward-test track record clears every documented criterion; live-capital wiring may now be PROPOSED (not auto-enabled).'
     : infeasible.length > 0
       ? `INFEASIBLE — live capital stays gated, and ${infeasible.length === 1 ? 'one criterion CANNOT BE TESTED' : `${infeasible.length} criteria CANNOT BE TESTED`} against this book: ${infeasible.map((c) => `${c.name} (bar ${c.barR}R vs payoff ceiling ${c.ceilingR == null ? 'unknown' : `${c.ceilingR}R`})`).join('; ')}. This is NOT a shortfall of evidence and MORE SAMPLE CANNOT RESOLVE IT — re-derive the bar or change the instrument.${failed.filter((n) => !infeasible.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !infeasible.some((c) => c.name === n)).join(', ')}.` : ''}`
       : `HOLD — live capital stays gated. Unmet: ${failed.join(', ')}.`;
+
+  // TRA-2353 (AC4) — `unknown` MUST RENDER AS UNKNOWN IN THE HEADLINE, not only on the
+  // criterion. The ceiling is an UPPER bound, so `unknown` is not the symmetric partner
+  // of `feasible`: it can conceal a genuinely infeasible state. When it lands on a
+  // criterion reading a bare `FAIL`, the headline asserts "the book underperformed" —
+  // the exact conflation between a fact about the BOOK and a fact about the EXPERIMENT
+  // that this gate's third verdict state exists to prevent. Non-blocking is correct
+  // (`expectancyNetR ≤ ceiling` pathwise, so a measured pass is constructive proof of
+  // reachability); invisible is not.
+  const suffixes: string[] = [];
+  if (expectancyStatus === 'FAIL' && feasibility.verdict === 'unknown') {
+    suffixes.push(
+      `⚠️ REACHABILITY UNKNOWN — \`positive_expectancy\` reads FAIL, but no payoff ceiling could be established for this book, so that FAIL does NOT establish that the book underperformed a bar it could have cleared. The ${criteria.minExpectancyR}R bar is UNGRADED for reachability, not cleared. ${feasibility.reason}`,
+    );
+  }
+  if (sleeveFeasibility.note != null) suffixes.push(`⚠️ ${sleeveFeasibility.note}`);
+  const summary = suffixes.length ? `${headline} ${suffixes.join(' ')}` : headline;
 
   return {
     passed,
     asOfDate: report.asOfDate,
     criteria: criteriaResults,
     feasibility,
+    sleeveFeasibility,
     summary,
     note:
       'A passing gate is permission to PROPOSE live wiring to the board — it enables no orders. Live ' +
