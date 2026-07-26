@@ -2349,8 +2349,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // TRA-2350 — the archetype axis. `single_leg_directional` is written by THREE
       // sleeves and only one of them evaluates the ceiling, so the structure key
       // alone cannot name the gated cohort. Absent ⇒ `null`, which the fold buckets
-      // as `unspecified` and treats as UNGATED (the AI-ideas open at
-      // `signal-engine.ts:12180` stamps no archetype and is not gated).
+      // as `unspecified` and treats as UNGATED (the AI-Options-Ideas single-leg open
+      // in `signal-engine.ts` stamps no archetype and is not gated).
       const entryArchetype =
         typeof r.entryArchetype === 'string' && r.entryArchetype.trim().length > 0
           ? r.entryArchetype
@@ -2454,11 +2454,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // ⚠ TRA-2350 — WHY `gated`, AND NOT THE POOLED CELL. This block used to say the
       // three lines above about the cell's TOP-LEVEL numbers, and that instruction was
       // wrong in the direction that costs the most: it assumed
-      // `single_leg_directional` == the gated sleeve. It does not. THREE call sites
-      // stamp that structure label — `signal-engine.ts:8484` (the directional sleeve,
-      // `entryArchetype: 'directional'`, the only one TRA-2295 gates), `:9226` (iv-rv
-      // mispricing) and `:12180` (AI-Options-Ideas, which stamps no archetype at all)
-      // — while `spreadCeilingRejectReason` has exactly ONE call site, `:8315`. So a
+      // `single_leg_directional` == the gated sleeve. It does not. THREE call sites in
+      // `signal-engine.ts` stamp that structure label — the directional sleeve
+      // (`entryArchetype: 'directional'`, the only one TRA-2295 gates), the iv-rv
+      // mispricing open, and the AI-Options-Ideas single-leg open (which stamps no
+      // archetype at all) — while `spreadCeilingRejectReason` has exactly ONE call
+      // site. That census is asserted against the source, with a demonstrated failing
+      // state, by the TRA-2306 writer-census test in `option-spread-cost.test.ts`; the
+      // `file:line` form it used to be written in had drifted 47–56 lines and one of
+      // the citations had come to resolve onto a DIFFERENT gate carrying the same
+      // literal — a wrong citation that confirms itself. Grep the SYMBOL. So a
       // wide-spread fill from either ungated sleeve landed in this cell and read as
       // "TRA-2295 enforcement falsified", and the paragraph above told the grader to
       // re-open a correct ticket. A FALSE FAIL, manufactured by the instrument.

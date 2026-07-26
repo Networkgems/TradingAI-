@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   measureSpreadCross,
   summarizeSpreadCost,
@@ -540,11 +541,14 @@ describe('summarizeSpreadCeilingCompliance (TRA-2316)', () => {
 // `single_leg_directional` is stamped by THREE call sites and only ONE of them
 // evaluates the ceiling:
 //
-//   signal-engine.ts:8484  directional sleeve       entryArchetype 'directional'        GATED (:8315)
-//   signal-engine.ts:9226  iv-rv mispricing         entryArchetype 'iv-rv-buy-premium'  ungated
-//   signal-engine.ts:12180 AI-Options-Ideas single  (stamps NO archetype)               ungated
+//   signal-engine.ts  directional sleeve         entryArchetype 'directional'        GATED
+//   signal-engine.ts  iv-rv mispricing open      entryArchetype 'iv-rv-buy-premium'  ungated
+//   signal-engine.ts  AI-Options-Ideas single    (stamps NO archetype)               ungated
 //
-// `spreadCeilingRejectReason` has exactly one call site in the tree, `:8315`.
+// `spreadCeilingRejectReason` has exactly one call site in the tree. That census is
+// no longer prose alone — see "single_leg_directional writer census (TRA-2306)" at
+// the bottom of this file, which asserts it against the source and demonstrates its
+// failing state. Line numbers deliberately dropped: see that block for why.
 //
 // Keyed on structure alone, a wide fill from either ungated sleeve lands in the
 // cell that `/api/health/option-spread-cost` bills as "the independent TRA-2306
@@ -594,7 +598,7 @@ describe('summarizeSpreadCeilingCompliance archetype partition (TRA-2350)', () =
   });
 
   it('a row that stamps NO archetype is UNGATED — absent must not default into the graded cohort', () => {
-    // `signal-engine.ts:12180` (AI-Options-Ideas) stamps no `entryArchetype`. The
+    // The AI-Options-Ideas single-leg open stamps no `entryArchetype`. The
     // fail-closed direction is that an unrecognised writer is excluded from the
     // gated cohort, not silently admitted to it.
     const stats = summarizeSpreadCeilingCompliance([
@@ -735,5 +739,120 @@ describe('classifySpreadCeilingAccount (TRA-2355)', () => {
     for (const name of ['admin', 'qa_1', '', 'monitor_qa']) {
       expect(SPREAD_CEILING_ACCOUNT_CLASSES).toContain(classifySpreadCeilingAccount(name));
     }
+  });
+});
+
+
+// ── TRA-2306 — the THREE-WRITER CENSUS, given a failing state ────────────────
+//
+// The census in the block above ("three sleeves stamp the label, exactly one is
+// gated") is the entire justification for
+// `SLEEVE_GATED_ARCHETYPES[single_leg_directional] = ['directional']`, and through
+// it for the three-part AND that TRA-2306's Monday grade filters on. Until now it
+// existed ONLY as prose. A FOURTH writer stamping `entryArchetype: 'directional'`
+// would be admitted to the graded cohort in silence — every behavioural test above
+// keeps passing, because they feed the fold synthetic rows and never ask the source
+// who writes them. That is the reads-identically-in-both-states shape TRA-2306
+// exists to catch, sitting inside the instrument built to catch it.
+//
+// ⚠ DIRECTION MATTERS, and it is the OPPOSITE of the checker's self-test count
+// (`scripts/tra2306-ceiling-grade.mjs`, cf8a206). There, growth is benign and only a
+// SHRINKING suite is a finding, so the count is pinned as a FLOOR. Here growth IS
+// the hazard: a new writer under this structure key must be classified as gated or
+// ungated BEFORE the grade can be trusted. So these are EXACT counts, and a failure
+// is an instruction, not a number to bump.
+//
+// The regexes are proven to FIRE on an added writer (the synthetic-source cases
+// below), not merely to agree with today's tree — a matcher that silently stopped
+// matching would read as "still exactly three".
+//
+// No `file:line` citations, on purpose. `signal-engine.ts` is edited several times a
+// day; every line number this claim has ever been written with has since drifted
+// 47–56 lines, and one of them (`:8476`, cited as the `entryArchetype: 'directional'`
+// stamp) now lands on `entryDeltaCeilingRejectReason('directional', …)` — a DIFFERENT
+// gate that happens to contain the same literal. A citation that resolves to a
+// plausible wrong line is worse than one that dangles: it confirms itself.
+
+/** Counts the three census facts in a `signal-engine.ts` source text. */
+const directionalWriterCensus = (src: string) => ({
+  structureStamps: (src.match(/structureLabel:\s*(?:DIRECTIONAL_STRUCTURE_LABEL|'single_leg_directional')/g) ?? []).length,
+  gatedArchetypeStamps: (src.match(/entryArchetype:\s*'directional'/g) ?? []).length,
+  ceilingCallSites: (src.match(/this\.spreadCeilingRejectReason\(/g) ?? []).length,
+});
+
+describe('single_leg_directional writer census (TRA-2306)', () => {
+  const engineSrc = readFileSync(new URL('./signal-engine.ts', import.meta.url), 'utf8');
+  const census = directionalWriterCensus(engineSrc);
+
+  it('exactly THREE sites stamp the directional structure label on a journal row', () => {
+    expect(
+      census.structureStamps,
+      'A writer of `structureLabel: single_leg_directional` was added or removed. It lands in the '
+        + 'cell TRA-2306 grades. Classify it in SLEEVE_GATED_ARCHETYPES — gated ONLY if its entry '
+        + 'path calls spreadGateVerdict — and then update this count. Do not just bump the number.',
+    ).toBe(3);
+  });
+
+  it("exactly ONE of them is gated: `entryArchetype: 'directional'` has a single writer", () => {
+    // The load-bearing one. SLEEVE_GATED_ARCHETYPES admits rows by ARCHETYPE, so a
+    // second writer of this archetype enters the graded cohort whether or not it ever
+    // reached the ceiling — and the grade would then read PASS/FAIL over a cohort
+    // holding fills the gate never saw.
+    expect(
+      census.gatedArchetypeStamps,
+      'A second writer of `entryArchetype: directional` would be ADMITTED to the TRA-2295 graded '
+        + 'cohort. Either route it through spreadGateVerdict or give it its own archetype.',
+    ).toBe(1);
+  });
+
+  it('the ceiling is evaluated at exactly ONE call site', () => {
+    expect(
+      census.ceilingCallSites,
+      'TRA-2295 enforcement moved or forked. The single-call-site fact is what makes '
+        + '`spreadCeilingEvaluated` a statement about the directional sleeve alone.',
+    ).toBe(1);
+  });
+
+  it('the gated structure stamp and the gated archetype stamp are the SAME object literal', () => {
+    // TRA-2306's description leans on this: forward of the TRA-2245 cutover the two
+    // axes agree BY CONSTRUCTION on in-scope rows, which is why a disagreement between
+    // them on Monday is a FINDING rather than a tiebreak. Written as a proximity check
+    // because that is the durable form — adjacent keys in one literal, not a line number.
+    const lines = engineSrc.split('\n');
+    const structureLine = lines.findIndex((l) => /structureLabel:\s*DIRECTIONAL_STRUCTURE_LABEL/.test(l));
+    const archetypeLine = lines.findIndex((l) => /entryArchetype:\s*'directional'/.test(l));
+    expect(structureLine).toBeGreaterThan(-1);
+    expect(archetypeLine).toBeGreaterThan(-1);
+    expect(
+      Math.abs(structureLine - archetypeLine),
+      'The gated archetype stamp and the gated structure stamp are no longer in one object '
+        + 'literal. They can now disagree on a row, which breaks TRA-2306 read #2.',
+    ).toBeLessThanOrEqual(20);
+  });
+
+  // ── the failing state, demonstrated ───────────────────────────────────────
+  // A guard whose broken state was never observed is the bug this ticket exists to
+  // catch. These run the same matchers over a synthetic FOURTH writer.
+  it('DETECTS a fourth structure writer (the guard has a failing state)', () => {
+    const withFourth = `${engineSrc}\nconst _synthetic = { structureLabel: 'single_leg_directional' };\n`;
+    expect(directionalWriterCensus(withFourth).structureStamps).toBe(4);
+  });
+
+  it('DETECTS a second gated-archetype writer', () => {
+    const withSecond = `${engineSrc}\nconst _synthetic = { entryArchetype: 'directional' };\n`;
+    expect(directionalWriterCensus(withSecond).gatedArchetypeStamps).toBe(2);
+  });
+
+  it('DETECTS a forked ceiling call site', () => {
+    const forked = `${engineSrc}\nconst _synthetic = this.spreadCeilingRejectReason('x', {});\n`;
+    expect(directionalWriterCensus(forked).ceilingCallSites).toBe(2);
+  });
+
+  it('the constant-form and literal-form structure stamps are BOTH matched', () => {
+    // TRA-2345 moved the label to a constant and only the gated site interpolates it;
+    // the two ungated sleeves still write the literal. A matcher that saw one form
+    // would under-count the census and read as healthy.
+    expect(directionalWriterCensus("structureLabel: DIRECTIONAL_STRUCTURE_LABEL").structureStamps).toBe(1);
+    expect(directionalWriterCensus("structureLabel: 'single_leg_directional'").structureStamps).toBe(1);
   });
 });

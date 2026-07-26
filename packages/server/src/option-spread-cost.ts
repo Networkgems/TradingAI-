@@ -164,13 +164,22 @@ export const SLEEVE_SPREAD_CEILINGS: Readonly<Record<string, SleeveSpreadCeiling
  * through it.
  *
  * Why this table has to exist: a structure label is NOT a sleeve. Three call sites
- * stamp `structureLabel: 'single_leg_directional'` on a journal row —
- * `signal-engine.ts:8484` (the directional sleeve, `entryArchetype: 'directional'`),
- * `:9226` (iv-rv mispricing, `entryArchetype: 'iv-rv-buy-premium'`) and `:12180`
- * (AI-Options-Ideas single-leg, which stamps NO archetype at all) — and
- * `spreadCeilingRejectReason` has exactly ONE call site, `:8315`, reached only by
- * the first. So two of the three write into TRA-2295's structure key without ever
- * having been gated by it.
+ * in `signal-engine.ts` stamp `structureLabel: 'single_leg_directional'` on a
+ * journal row — the **directional sleeve** (stamps `entryArchetype: 'directional'`
+ * in the same object literal), the **iv-rv mispricing** open (stamps
+ * `entryArchetype: 'iv-rv-buy-premium'`) and the **AI-Options-Ideas** single-leg
+ * open (stamps NO archetype at all) — and `spreadCeilingRejectReason` has exactly
+ * ONE call site, reached only by the first. So two of the three write into
+ * TRA-2295's structure key without ever having been gated by it.
+ *
+ * ⚠ TRA-2306 — that census is asserted against the SOURCE in
+ * `option-spread-cost.test.ts` ("single_leg_directional writer census"), with its
+ * failing state demonstrated. Deliberately no `file:line` here: every line number
+ * this claim was written with has drifted 47–56 lines, and the one that cited the
+ * `entryArchetype: 'directional'` stamp now resolves to
+ * `entryDeltaCeilingRejectReason('directional', …)` — a DIFFERENT gate carrying the
+ * same literal, i.e. a citation that confirms itself while being wrong. Re-derive
+ * by grepping the SYMBOL, or let the test do it.
  *
  * The failure that follows is silent and points the wrong way: a wide-spread fill
  * from either ungated sleeve lands in the `single_leg_directional` compliance cell
@@ -197,9 +206,11 @@ export const SLEEVE_GATED_ARCHETYPES: Readonly<Record<string, SleeveGatedArchety
   // (`RV_ENGINE_ENABLED` is a compile-time false since TRA-1207/2026-06-30). No live
   // sleeve is gated by this entry, so NOTHING under this key may be graded as gated.
   single_leg_rv: 'none',
-  // TRA-2295, `signal-engine.ts:8315` — on the directional ENTRY PATH itself, not in
-  // a scanner. Only rows stamped `entryArchetype: 'directional'` (`:8476`, written in
-  // the SAME object literal as the `:8484` structure stamp) reached it.
+  // TRA-2295, `signal-engine.ts` `spreadCeilingRejectReason` — on the directional
+  // ENTRY PATH itself, not in a scanner. Only rows stamped
+  // `entryArchetype: 'directional'` reached it, and that archetype is written in the
+  // SAME object literal as the structure stamp (proximity asserted by the TRA-2306
+  // writer-census test, so it cannot drift silently).
   [DIRECTIONAL_STRUCTURE_LABEL]: ['directional'],
 };
 
