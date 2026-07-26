@@ -34,6 +34,33 @@
 // ⇒ A GREEN RUN OF THIS SCRIPT IS NOT EVIDENCE THAT THE HOST IS SAFE TO TOUCH.
 //   It is evidence about one of the three paths that can boot the box.
 //
+// ── The AUTH_SECRET value gate (TRA-2387, residual of TRA-2315) ───────────────
+// The three gates above answer "may I deploy NOW?" (freeze, embargo) and "may I deploy
+// THIS?" (commit hold). None of them asks the fourth question: "will the thing I deploy
+// still BOOT?" `resolveAuthSecret()` (packages/server/src/auth.ts:34) accepts AUTH_SECRET
+// only if `fromEnv.trim().length > 0`, and THROWS under NODE_ENV=production otherwise. So
+// a deploy onto a host whose AUTH_SECRET is empty or whitespace-only does not degrade the
+// service, it takes it DOWN.
+//
+// TRA-2315 fixed the PREDICATE that answers this (0f9e89e — the old guard tested
+// `.length === 0`, so `AUTH_SECRET=" "` was reported PASS on a host that would refuse to
+// boot). What it did not do is CALL it: `scripts/tra2296-auth-secret-check.mjs` only runs
+// when a human remembers to run it. This gate is the invocation.
+//
+// ⚠ WHY THIS IS NOT REDUNDANT WITH "an env write redeploys anyway". The obvious objection
+// is that you cannot blank AUTH_SECRET without triggering `service_updated`, so a broken
+// secret bricks the box before this script ever runs. That is wrong in the case that
+// matters: a deploy whose boot THROWS does not go live, and Render keeps the PREVIOUS
+// process serving. The result is a host that is up, healthy, and holding a good secret in
+// memory — while its env is broken and every future deploy is a landmine. That state ends
+// only when somebody deploys for an unrelated reason, and nothing else on the box reports
+// it. Same shape for the TRA-2296 P1 itself: the process that booted before the value was
+// cleared keeps working until the next restart.
+// ⇒ AND THE CONVERSE, WHICH THIS GATE CANNOT FIX: the write that BREAKS the secret is an
+//   env write, so it never passes through here. This gate cannot see its own most likely
+//   cause. It is printed in the normal output, not only in a refusal, so that a green
+//   `auth :` line is not read as "the secret is protected".
+//
 // ── Auth ──────────────────────────────────────────────────────────────────────
 //   RENDER_API_KEY=rnd_xxx node scripts/render-redeploy.mjs      (never commit the key)
 //
@@ -52,6 +79,12 @@
 //   --force-commit-hold-override="reason"  deploy a HELD COMMIT anyway. Separate again:
 //                       the other two gates are about WHEN you deploy, this one is about
 //                       WHAT you deploy, and a clear calendar says nothing about it.
+//   --force-auth-secret-override="reason"  deploy onto a host whose live AUTH_SECRET is
+//                       unusable (or unreadable) anyway. Separate for the fourth time, and
+//                       for the sharpest reason yet: the other three gates protect a
+//                       MEASUREMENT, this one protects the SERVICE STAYING UP. "The soak is
+//                       already broken, ship it" is a perfectly good reason to break the
+//                       freeze and no reason at all to boot a process that throws.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -60,9 +93,11 @@
 //   4  REFUSED — RTH freeze in effect on the soak host and no override given
 //   5  REFUSED — a dated embargo covers this instant and no override given
 //   6  REFUSED — the deploy would carry a HELD COMMIT, or it cannot be proven not to
+//   7  REFUSED — the host's live AUTH_SECRET is unusable, or it cannot be READ (BLIND)
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { classifyAuthSecret } from './lib/auth-secret-predicate.mjs';
 
 const API = 'https://api.render.com/v1';
 
@@ -270,6 +305,95 @@ export function resolveTarget(branch, requestedCommit) {
   return { sha, source: `origin/${branch} tip (no --commit given)`, carries: held => gitCarries(held, sha) };
 }
 
+// ── AUTH_SECRET value gate (TRA-2387) ─────────────────────────────────────────
+// Services whose BOOT reads AUTH_SECRET. render.yaml declares the key on exactly one
+// service (L76-77, `generateValue: true`, tradingai-bqb1), and that declaration is the
+// only mechanical statement anywhere of where the secret is load-bearing.
+//
+// This set exists to SCOPE THE SEVERITY, not to scope the check. The check runs on every
+// service; what the set decides is what an ABSENT key means:
+//   • in the set   → ABSENT is a REFUSAL. We know the server reads it here, so a missing
+//                    key is a host that will not boot.
+//   • not in the set → ABSENT is NOT_APPLICABLE. A worker or static site that never had an
+//                    AUTH_SECRET must not be false-blocked by a guard written for bqb1;
+//                    a new check whose severity is not scoped to reachability jams
+//                    somebody else's critical path (TRA-2348).
+// A key that is PRESENT-but-unusable REFUSES on ANY service, in the set or not: somebody
+// set that key on purpose and then blanked it, which is positive evidence it matters there.
+export const AUTH_SECRET_REQUIRED_ON = new Set([SOAK_HOST_ID, SOAK_HOST_NAME]);
+
+// The gate's decision, as a pure function of an injected probe so it is testable without
+// the network (same idiom as commitHoldState's injected `carries`).
+//
+// `probe` is what fetchEnvVarProbe returns:
+//   { rows: [{key, value}] | null, truncated: boolean, error?: string }
+//
+// FAILS CLOSED, and the reason is worth stating because it is the one behaviour the other
+// three gates got right and a fourth gate is most likely to get wrong: a guard that cannot
+// READ the value must refuse, never proceed. If an unreadable Render API returned CLEAR,
+// then the deploy this gate exists to stop would be permitted by the same outage that
+// hides the problem — i.e. the gate would be strictly worse than no gate, because it also
+// prints a green line while doing it. BLIND and UNUSABLE therefore share exit 7.
+export function authSecretGateState(probe, { keyRequired = false } = {}) {
+  const blind = why => ({ verdict: 'BLIND', shape: null, detail: null, why });
+
+  if (!probe) return blind('the env-var probe did not run');
+  if (probe.error) return blind(probe.error);
+  if (!Array.isArray(probe.rows)) return blind('the env-var list could not be read as an array');
+
+  const row = probe.rows.find(v => v && v.key === 'AUTH_SECRET') ?? null;
+
+  if (!row) {
+    // ⛔ A TRUNCATED ENUMERATION CANNOT PROVE AN ABSENCE. The env-vars route is a capped
+    // list, and a capped list is a fail-open read wearing a full-looking payload (TRA-2360,
+    // measured on the issues route: 1000 rows looked complete and hid 46% of the
+    // population). "AUTH_SECRET is not in the rows I managed to read" is a fact about the
+    // pagination, not about the service — so it is BLIND, never ABSENT.
+    if (probe.truncated) {
+      return blind(
+        `the env-var list could not be enumerated to the end (${probe.rows.length} rows read, more remain), ` +
+          "so AUTH_SECRET's absence from them is a fact about the pagination, not about the service",
+      );
+    }
+    if (!keyRequired) {
+      return {
+        verdict: 'NOT_APPLICABLE',
+        shape: 'ABSENT',
+        detail: 'absent, and this service is not one that reads it',
+        why: null,
+      };
+    }
+    const c = classifyAuthSecret(null);
+    return { verdict: 'UNUSABLE', shape: c.shape, detail: c.detail, why: null };
+  }
+
+  // ⛔ `'value' in row` — NOT `row.value ?? ''`. An absent field is a fact about the payload
+  // you asked for, never about the world: collapsing "the API did not return the value" into
+  // "the value is the empty string" manufactures a confident UNUSABLE out of a read failure.
+  // Both refuse, so the safety is identical — but only one of them is TRUE, and the operator
+  // acts on the message. (Residual noted on TRA-2387: tra2296-auth-secret-check.mjs still
+  // does the `?? ''` collapse at its check 1.)
+  if (!('value' in row)) {
+    return blind('the AUTH_SECRET row carries no `value` key at all, so its value was not read');
+  }
+  if (typeof row.value !== 'string') {
+    return blind(
+      `the AUTH_SECRET row's value is ${row.value === null ? 'null' : typeof row.value}, not a string — ` +
+        'the server predicate is defined over strings, so this cannot be graded',
+    );
+  }
+
+  const c = classifyAuthSecret(row.value);
+  return { verdict: c.usable ? 'CLEAR' : 'UNUSABLE', shape: c.shape, detail: c.detail, why: null };
+}
+
+// Which verdicts stop a deploy. Exported and used by main() rather than re-typed there, so
+// the control suite grades THE EXPRESSION MAIN ACTUALLY EVALUATES and not a second opinion
+// that can drift away from it. BLIND is in here on purpose: see the fail-closed note above.
+export function authSecretBlocks(verdict) {
+  return verdict === 'UNUSABLE' || verdict === 'BLIND';
+}
+
 const argv = process.argv.slice(2);
 const has = flag => argv.includes(flag);
 const valOf = name => {
@@ -289,6 +413,10 @@ const HAS_EMBARGO_OVERRIDE = argv.some(
 const COMMIT_HOLD_OVERRIDE_REASON = valOf('--force-commit-hold-override');
 const HAS_COMMIT_HOLD_OVERRIDE = argv.some(
   a => a === '--force-commit-hold-override' || a.startsWith('--force-commit-hold-override='),
+);
+const AUTH_SECRET_OVERRIDE_REASON = valOf('--force-auth-secret-override');
+const HAS_AUTH_SECRET_OVERRIDE = argv.some(
+  a => a === '--force-auth-secret-override' || a.startsWith('--force-auth-secret-override='),
 );
 
 function fail(code, msg) {
@@ -311,6 +439,56 @@ async function api(path, init) {
     fail(2, `${init?.method ?? 'GET'} ${path} → ${r.status} ${r.statusText} ${body}`.trim());
   }
   return r.json();
+}
+
+// Read the service's live env vars for the AUTH_SECRET gate.
+//
+// ⛔ DELIBERATELY NOT `api()`. That helper calls fail(2) on a non-2xx, which would report a
+// Render outage as a USAGE error — the operator's remedy for exit 2 is "check your key and
+// re-run", i.e. exactly the wrong reflex. An unreadable env-var list is not a usage problem,
+// it is the gate going BLIND, and it must say so under its own exit code.
+//
+// PAGES TO THE END. `?limit=100` on its own would let a service with >100 env vars return a
+// full-looking page that happens not to contain AUTH_SECRET, and the honest-looking
+// conclusion from that page is "the key is absent" — a refusal for the wrong reason on bqb1,
+// and a false NOT_APPLICABLE anywhere else. Anything short of a proven-complete enumeration
+// reports `truncated`, which the predicate turns into BLIND.
+const ENV_VAR_PAGE = 100;
+const ENV_VAR_MAX_PAGES = 20;
+
+async function fetchEnvVarProbe(serviceId) {
+  const rows = [];
+  let cursor;
+  for (let page = 0; page < ENV_VAR_MAX_PAGES; page += 1) {
+    const q = new URLSearchParams({ limit: String(ENV_VAR_PAGE) });
+    if (cursor) q.set('cursor', cursor);
+    const path = `/services/${serviceId}/env-vars?${q}`;
+    let r;
+    try {
+      r = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' } });
+    } catch (e) {
+      return { rows: null, truncated: false, error: `GET ${path} threw: ${e?.message ?? String(e)}` };
+    }
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      return { rows: null, truncated: false, error: `GET ${path} → ${r.status} ${r.statusText} ${body}`.trim() };
+    }
+    let json;
+    try {
+      json = await r.json();
+    } catch (e) {
+      return { rows: null, truncated: false, error: `GET ${path} returned unparseable JSON: ${e?.message ?? String(e)}` };
+    }
+    if (!Array.isArray(json)) {
+      return { rows: null, truncated: false, error: `GET ${path} returned ${typeof json}, expected an array` };
+    }
+    for (const entry of json) rows.push(entry?.envVar ?? entry);
+    if (json.length < ENV_VAR_PAGE) return { rows, truncated: false };
+    // A full page with no cursor to follow: we cannot prove we reached the end.
+    cursor = json[json.length - 1]?.cursor;
+    if (!cursor) return { rows, truncated: true };
+  }
+  return { rows, truncated: true };
 }
 
 async function resolveService() {
@@ -353,6 +531,63 @@ async function main() {
   const { frozen } = freezeState(now);
   const { active: embargo, upcoming, minsToUpcoming } = embargoState(now);
   const nowZ = now.toISOString().slice(11, 16) + 'Z';
+
+  // ── Gate 0: the host's live AUTH_SECRET (TRA-2387) ──────────────────────────
+  // FIRST of the four, on severity. The other three protect a measurement: breaking them
+  // costs a soak session, a graded read, or an instrument's continuity. This one protects
+  // the service being reachable at all — an unusable AUTH_SECRET under NODE_ENV=production
+  // makes resolveAuthSecret() THROW at boot, so the deploy does not degrade bqb1, it takes
+  // it down. Report the outage risk before the calendar.
+  const authProbe = await fetchEnvVarProbe(service.id);
+  const authGate = authSecretGateState(authProbe, {
+    keyRequired: AUTH_SECRET_REQUIRED_ON.has(service.id) || AUTH_SECRET_REQUIRED_ON.has(service.name),
+  });
+  const authBlocking = authSecretBlocks(authGate.verdict);
+
+  // The caveat this gate must repeat wherever it speaks, refusal or not (TRA-2186/TRA-2325).
+  const AUTH_ENV_WRITE_CAVEAT =
+    'NOTE: this gate reads the value; it cannot guard the WRITE. Blanking AUTH_SECRET in the\n' +
+    '  dashboard is itself an env write, and an env write redeploys this service on the spot\n' +
+    '  (trigger: service_updated, despite autoDeploy: no — TRA-2186). So the gate cannot see its\n' +
+    '  own most likely cause. What it DOES catch is the state that outlives that write: a boot\n' +
+    '  that throws never goes live, Render keeps the previous process serving, and the box then\n' +
+    '  runs healthy on an in-memory secret with a broken env until somebody deploys.';
+
+  if (authBlocking && !HAS_AUTH_SECRET_OVERRIDE) {
+    console.error(
+      `[render-redeploy] REFUSED: ${service.name} (${service.id}) — its live AUTH_SECRET ${
+        authGate.verdict === 'UNUSABLE'
+          ? `is ${authGate.detail} [${authGate.shape}]`
+          : 'COULD NOT BE READ, so this gate is BLIND and fails closed'
+      }.\n` +
+        (authGate.why ? `  blind   : ${authGate.why}\n` : '') +
+        `  resolveAuthSecret() (packages/server/src/auth.ts:34) accepts the value only if\n` +
+        `  fromEnv.trim().length > 0 and THROWS under NODE_ENV=production otherwise. Deploying now\n` +
+        `  would boot a process that refuses to start; if it did start, it would re-roll the HMAC\n` +
+        `  signing key on every boot and sign out every logged-in user (the TRA-2296 P1).\n` +
+        `  FIX: set a real AUTH_SECRET on the service, then re-run. Verify with\n` +
+        `  RENDER_API_KEY=… node scripts/tra2296-auth-secret-check.mjs (TRA-2315 predicate).\n` +
+        `  If you must ship anyway, re-run with --force-auth-secret-override="why" (recorded).\n` +
+        `  ${AUTH_ENV_WRITE_CAVEAT}`,
+    );
+    process.exit(7);
+  }
+
+  if (authBlocking && HAS_AUTH_SECRET_OVERRIDE) {
+    if (!AUTH_SECRET_OVERRIDE_REASON || !AUTH_SECRET_OVERRIDE_REASON.trim()) {
+      fail(
+        2,
+        '--force-auth-secret-override requires a non-empty reason, e.g. --force-auth-secret-override="NODE_ENV is not production on this host".',
+      );
+    }
+    console.error(
+      `[render-redeploy] WARNING: deploying ${service.name} with AUTH_SECRET ${
+        authGate.verdict === 'UNUSABLE' ? authGate.detail : 'UNREADABLE'
+      } at ${nowZ}. Reason: ${AUTH_SECRET_OVERRIDE_REASON}. If NODE_ENV=production on this host the ` +
+        `new process will THROW at boot and Render will keep the old one serving; if it does boot, ` +
+        `every existing session is invalidated. Have scripts/render-deploy-status.mjs open.`,
+    );
+  }
 
   // Content gate BEFORE the two time gates: it is the one that can fire while the calendar
   // is wide open, and its remedy is different — deploy a different COMMIT, not at a
@@ -444,10 +679,15 @@ async function main() {
 
   console.log(`service : ${service.name} (${service.id})`);
   console.log(`window  : ${nowZ} — ${isSoakHost ? (frozen ? 'RTH FREEZE (soak host)' : 'outside freeze') : 'not the soak host'}`);
+  // ⚠ RIDER (TRA-2387): "OVERRIDDEN" was printed for a non-soak host too, where the embargo
+  // and hold gates never ran at all (both are `isSoakHost && …`). Nothing was overridden
+  // there and nobody forced anything — but the word says an operator broke a board-ratified
+  // hold, which is the single most alarming thing this output can claim. Distinguish
+  // "gated and forced past" from "not gated on this host".
   console.log(
     `embargo : ${
       embargo
-        ? `ACTIVE ${embargo.from}→${embargo.to} (${embargo.ticket}) — OVERRIDDEN`
+        ? `ACTIVE ${embargo.from}→${embargo.to} (${embargo.ticket}) — ${isSoakHost ? 'OVERRIDDEN' : 'not gated on this host'}`
         : upcoming
           ? `none now; next ${upcoming.from}→${upcoming.to} (${upcoming.ticket}), in ${minsToUpcoming} min`
           : 'none scheduled'
@@ -470,8 +710,27 @@ async function main() {
         ? 'none active'
         : holdCheck.verdict === 'CLEAR'
           ? `${holdCheck.active.length} active (${holdCheck.active.map(h => h.ticket).join(', ')}) — target carries none of them`
-          : `${holdCheck.verdict} ${holdCheck.hold.ticket} — OVERRIDDEN`
+          : `${holdCheck.verdict} ${holdCheck.hold.ticket} — ${isSoakHost ? 'OVERRIDDEN' : 'not gated on this host'}`
     }`,
+  );
+  console.log(
+    `auth    : AUTH_SECRET ${
+      authGate.verdict === 'CLEAR'
+        ? `${authGate.detail} — usable, the host will boot`
+        : authGate.verdict === 'NOT_APPLICABLE'
+          ? `${authGate.detail} (gate N/A on this service)`
+          : authGate.verdict === 'UNUSABLE'
+            ? `${authGate.detail} [${authGate.shape}] — OVERRIDDEN`
+            : `UNREADABLE — BLIND, OVERRIDDEN (${authGate.why})`
+    }`,
+  );
+  // Say what the gate does NOT see in the NORMAL output, not only in a refusal. A green
+  // `auth :` line one line above is exactly the thing a reader turns into "the secret is
+  // protected", and the write that breaks it never comes through this script.
+  console.log(
+    `          ⚠ this gate reads the VALUE, it does not guard the WRITE: blanking AUTH_SECRET is\n` +
+      `            itself an env write, which redeploys this service unguarded (service_updated,\n` +
+      `            TRA-2186). A green line here means the value is usable RIGHT NOW, nothing more.`,
   );
   console.log('note    : this gate sees DEPLOYS only — env/settings writes redeploy the box unguarded (TRA-2186).');
 

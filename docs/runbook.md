@@ -340,21 +340,46 @@ node scripts/render-redeploy.mjs --dry-run            # print the gate decision 
 node scripts/render-redeploy.mjs --commit=<sha> --force-rth-override="why this cannot wait"
 ```
 
-**Three gates, three refusals, three separate overrides** — all of them scoped to the
-soak host only (every other Render service deploys with no time gate):
+**Four gates, four refusals, four separate overrides.** The first three are scoped to the
+soak host only (every other Render service deploys with no time gate); the fourth is not,
+because a host that will not boot is not a soak problem:
 
 | exit | gate | what it means | override |
 |---|---|---|---|
 | `4` | RTH freeze | it is 13:25–20:00Z on a weekday | `--force-rth-override="…"` |
 | `5` | dated embargo | a board-ratified hold in the `EMBARGOES` table covers this instant | `--force-embargo-override="…"` |
 | `6` | commit hold | the deploy carries — or cannot be proven clear of — a commit in `COMMIT_HOLDS` | `--force-commit-hold-override="…"` |
+| `7` | AUTH_SECRET value | the service's **live** `AUTH_SECRET` is empty/whitespace-only or absent — or **could not be read** | `--force-auth-secret-override="…"` |
 
 The overrides are deliberately **not** interchangeable: 4 and 5 are about *when* you
-deploy, 6 is about *what* you deploy, and authorisation to break the routine daily
-freeze is not authorisation to break a named-day hold or to ship a held commit. Each
-requires a non-empty reason, which is echoed so the breach is on the record. **A clear
-calendar says nothing about the commit**, so check `--dry-run` before assuming an open
-window means "go".
+deploy, 6 is about *what* you deploy, 7 is about *whether the thing you deploy will still
+boot* — and authorisation to break the routine daily freeze is not authorisation to break a
+named-day hold, to ship a held commit, or to boot a process that throws. Each requires a
+non-empty reason, which is echoed so the breach is on the record. **A clear calendar says
+nothing about the commit**, so check `--dry-run` before assuming an open window means "go".
+
+Notes on gate 7 (TRA-2387, the residual of TRA-2315):
+
+- It grades the value with `resolveAuthSecret()`'s own predicate, shared via
+  `scripts/lib/auth-secret-predicate.mjs`. `auth.ts:34` accepts the value only if
+  `fromEnv.trim().length > 0` and **throws** under `NODE_ENV=production` otherwise, so a
+  blank secret does not degrade bqb1 — it takes it down.
+- It **fails closed**: an unreadable env-var list, a truncated enumeration, or a row with no
+  `value` field all exit `7` as BLIND, never `0`. A Render outage must not permit the deploy
+  the gate exists to stop.
+- **An absent key refuses only where the key is reachable** (bqb1, per `render.yaml` L76-77).
+  On any other service an absent `AUTH_SECRET` prints `gate N/A` and does not block; a
+  *present-but-blank* one refuses everywhere.
+- It **cannot see its own most likely cause**: blanking the secret is an env write, and an env
+  write redeploys the service unguarded (`service_updated`). What it does catch is the state
+  that outlives that write — a boot that throws never goes live, Render keeps the previous
+  process serving, and the box then runs healthy on an in-memory secret with a broken env
+  until somebody deploys for an unrelated reason. That caveat prints in the **normal** output,
+  not only in a refusal.
+- Graded by `pnpm check:auth-secret-gate` (in `pretest`): 23 predicate cases, 10 end-to-end
+  cases through the real `main()` against a stubbed Render API, plus a direction control that
+  goes RED if the TRA-2315 predicate is reverted. Add `--live` to read bqb1's actual value
+  (length only; the value is never printed).
 
 The RTH bound is matched to `tra1648_soak_check.mjs`, so the wrapper and the acceptance
 grader agree with no DST drift. This rule lifts together with the launch-window freeze

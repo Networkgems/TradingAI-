@@ -63,6 +63,14 @@ dated embargo in its `EMBARGOES` table. It is **OPEN** pre-open, post-close and 
 read "RTH-gated" as "only deployable during RTH" — two of us read the old annotation backwards and
 embargoed a commit against a slot that was open the whole time (TRA-2313).
 
+It carries **four** gates with four separate exit codes and four separate overrides — `4` RTH
+freeze · `5` dated embargo · `6` held commit · `7` the host's **live `AUTH_SECRET`** is unusable or
+unreadable (TRA-2387; `auth.ts:34` throws under `NODE_ENV=production` on a blank value, so that
+deploy takes the box DOWN rather than degrading it). Gate 7 **fails closed** — an unreadable
+env-var list exits `7`, never `0` — and unlike the first three it is not scoped to bqb1. See
+`docs/runbook.md` §"Four gates". The overrides are not interchangeable: a reason that justifies
+deploying inside RTH is not a reason to boot a process that throws.
+
 ⚠️ It gates **deploys**. It cannot see an **env/settings write**, and one of those redeploys bqb1
 anyway (`trigger: service_updated`) *despite* `autoDeploy=no` (TRA-2186), nor the memory watchdog's
 own pm2 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the
