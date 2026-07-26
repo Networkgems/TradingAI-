@@ -33,6 +33,7 @@ import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 import {
+  DIRECTIONAL_STRUCTURE_LABEL, // TRA-2345 — interpolated, never re-typed as a literal.
   SPREAD_CEILING_ACCOUNT_CLASSES,
   type SpreadCeilingAccountClass,
 } from './option-spread-cost.js';
@@ -1065,8 +1066,11 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
     ...foldStructures(day ?? new Map()),
     retained: summarizeRetained(),
     spreadCeilingStructureKeys: {
-      demo_directional:
-        'single_leg_directional — NOT the `directional` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).',
+      // TRA-2345 — INTERPOLATED from the constant the recorder keys off, not a
+      // second copy of the string. A hardcoded literal here reads identically
+      // whether or not it still matches the recorder, and the divergence it hides
+      // costs a grader a misattributed VOID rather than a visible error.
+      demo_directional: `${DIRECTIONAL_STRUCTURE_LABEL} — NOT the \`directional\` row, which carries only the cost bar and the delta ceiling and will always show spreadCeilingEvaluated 0 (TRA-2295).`,
       otm: 'single_leg_otm — gated in the OTM scanner chain filter, not by this counter; spreadCeilingEvaluated 0 there is expected.',
     },
     spreadCeilingAccountClassNote:

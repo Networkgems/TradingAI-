@@ -79,6 +79,35 @@ import { isTestAccount } from './test-accounts.js';
 /** The at-risk stop distance as a fraction of the entry mark (stop = mark·0.75). */
 export const STOP_DISTANCE_FRACTION_OF_MARK = 0.25;
 
+/**
+ * TRA-2245 / TRA-2295 — the journal STRUCTURE label for the demo directional sleeve.
+ *
+ * One constant, shared by the journal write, by the TRA-2295 spread gate that admits
+ * the fill, and by the tables below, because those must agree. If the gate keyed its
+ * ceiling and its counters off a different string than the journal files the row
+ * under, the health route would report a sleeve enforcing while the journal accrued
+ * rows under a name nothing was gating — the same shape as the bug this fixes, just
+ * relocated.
+ *
+ * ── Why it lives HERE and not in `signal-engine.ts` (TRA-2345) ───────────────
+ * It was a module-local `const` in the engine, so nothing outside could reference it
+ * — and `spreadCeilingStructureKeys` on `/api/health/cost-aware-gate`, the field the
+ * TRA-2306 grading procedure reads to learn WHICH `byStructure` key carries the
+ * directional ceiling, published a hardcoded copy of the string instead. A rename
+ * would have moved the recorder's key while the payload kept naming the old one with
+ * full confidence, and a grader following the payload reads `absent row` as VOID /
+ * "the gate did not run" — a misattributed void with no failing state anywhere.
+ *
+ * This module is the right home because it is the leaf both sides already depend on
+ * (it imports only `test-accounts.ts`), so the engine, the ledger and the health
+ * route can all interpolate the ONE constant without a cycle.
+ *
+ * FORWARD-ONLY: rows written before 2026-07-24 still say `single_leg_rv`, so any
+ * check scoped to this label is a check on new rows (pair it with
+ * `entryArchetype: 'directional'` to catch the historical ones).
+ */
+export const DIRECTIONAL_STRUCTURE_LABEL = 'single_leg_directional';
+
 /** Per-sleeve admission thresholds on the fill-time quote. */
 export interface SleeveSpreadCeiling {
   /** `(ask − bid) / mark` may not exceed this. */
@@ -118,7 +147,11 @@ export interface SleeveSpreadCeiling {
 export const SLEEVE_SPREAD_CEILINGS: Readonly<Record<string, SleeveSpreadCeiling>> = {
   single_leg_otm: { maxSpreadPct: 0.2, maxSpreadCrossR: 0.8, minBidUsd: 0.05 },
   single_leg_rv: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
-  single_leg_directional: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
+  // Computed key (TRA-2345): the ceiling has to sit under the SAME string the
+  // recorder writes and the journal stamps, so a rename cannot leave the sleeve
+  // looked up against a table entry that no longer exists (a miss here ADMITS —
+  // see `spreadGateVerdict`'s absent-sleeve branch).
+  [DIRECTIONAL_STRUCTURE_LABEL]: { maxSpreadPct: 0.1, maxSpreadCrossR: 0.4, minBidUsd: 0.1 },
 };
 
 /**
@@ -167,7 +200,7 @@ export const SLEEVE_GATED_ARCHETYPES: Readonly<Record<string, SleeveGatedArchety
   // TRA-2295, `signal-engine.ts:8315` — on the directional ENTRY PATH itself, not in
   // a scanner. Only rows stamped `entryArchetype: 'directional'` (`:8476`, written in
   // the SAME object literal as the `:8484` structure stamp) reached it.
-  single_leg_directional: ['directional'],
+  [DIRECTIONAL_STRUCTURE_LABEL]: ['directional'],
 };
 
 /**

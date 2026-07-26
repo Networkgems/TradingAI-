@@ -1,5 +1,5 @@
 // TRA-1602 (TRA-1600C) — durable admit/reject telemetry for the cost-aware fire bar.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -13,6 +13,8 @@ import {
   clearCostAwareGateLedger,
   costAwareGateLogPath,
 } from './cost-aware-gate-ledger.js';
+import * as spreadCost from './option-spread-cost.js';
+import { DIRECTIONAL_STRUCTURE_LABEL } from './option-spread-cost.js';
 
 const DAY = '2026-07-13';
 
@@ -626,6 +628,53 @@ describe('cost-aware-gate-ledger', () => {
       expect(note).toContain('NOT A DESK VERDICT');
       // The reading that stops a grade has to be stated, not inferred.
       expect(note).toContain('NO READING AT ALL');
+    });
+  });
+
+  // ── TRA-2345 — the doc field must be DERIVED from the recorder's key ────────
+  //
+  // `spreadCeilingStructureKeys.demo_directional` is what the TRA-2306 grading
+  // procedure reads to learn WHICH `byStructure` key carries the directional
+  // spread ceiling. It used to be a hardcoded string literal in this module while
+  // the recorder keyed off a module-local const in `signal-engine.ts`. The two
+  // could diverge with no failing state anywhere: the payload keeps naming the old
+  // key with full confidence, the grader finds no such row, and reads
+  // `absent -> VOID / "the gate never ran"` — a MISATTRIBUTED void, not a visible
+  // error. (It cannot manufacture a false PASS, which is why this was a hardening.)
+  describe('spreadCeilingStructureKeys is interpolated, not re-typed (TRA-2345)', () => {
+    it('names the constant the recorder actually writes under', () => {
+      const keys = summarizeCostAwareGate(DAY).spreadCeilingStructureKeys;
+      // Not `toContain` on a substring of prose — the key must be the LEAD of the
+      // sentence, which is what a grader parses out of it.
+      expect(keys.demo_directional.startsWith(`${DIRECTIONAL_STRUCTURE_LABEL} `)).toBe(true);
+      expect(DIRECTIONAL_STRUCTURE_LABEL).toBe('single_leg_directional');
+    });
+
+    it('THE FAILING STATE: rename the constant and the published key follows it', async () => {
+      // The whole point of the fix, asserted the only way that has a failing state:
+      // rename the source constant and demand the payload moves with it. Against a
+      // hardcoded literal this fails; against the interpolation it passes. A test
+      // that merely asserted the string equals 'single_leg_directional' would pass
+      // identically in both worlds and prove nothing.
+      const RENAMED = 'tra2345_renamed_structure_key';
+      vi.resetModules();
+      // PLAIN factory (no `importActual` inside it) — the importActual shape mocks
+      // the test file's binding but not the module under test's (TRA-1677). The
+      // spread of the statically imported namespace keeps every other export real.
+      vi.doMock('./option-spread-cost.js', () => ({
+        ...spreadCost,
+        DIRECTIONAL_STRUCTURE_LABEL: RENAMED,
+      }));
+      try {
+        const fresh = await import('./cost-aware-gate-ledger.js');
+        const keys = fresh.summarizeCostAwareGate(DAY).spreadCeilingStructureKeys;
+        expect(keys.demo_directional.startsWith(`${RENAMED} `)).toBe(true);
+        // And the old literal must be GONE, not merely joined by the new one.
+        expect(keys.demo_directional).not.toContain('single_leg_directional');
+      } finally {
+        vi.doUnmock('./option-spread-cost.js');
+        vi.resetModules();
+      }
     });
   });
 });

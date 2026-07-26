@@ -141,6 +141,7 @@ import {
   spreadGateVerdict,
   isSpreadCeilingEnforceEnabled,
   classifySpreadCeilingAccount, // TRA-2355
+  DIRECTIONAL_STRUCTURE_LABEL, // TRA-2345 — moved here from this module; see below.
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
@@ -1229,20 +1230,13 @@ const IV_RV_RESERVED_CAP_SLOTS = 2;
 // positions still get marks via refreshOptionMarks() and exit normally.
 const RV_ENGINE_ENABLED: boolean = false;
 
-/**
- * TRA-2245 / TRA-2295 — the journal STRUCTURE label for the demo directional sleeve.
- *
- * One constant, shared by the journal write and by the TRA-2295 spread gate that
- * admits the fill, because those two must agree. If the gate keyed its ceiling and
- * its counters off a different string than the journal files the row under, the
- * health route would report a sleeve enforcing while the journal accrued rows under
- * a name nothing was gating — the same shape as the bug this fixes, just relocated.
- *
- * FORWARD-ONLY: rows written before 2026-07-24 still say `single_leg_rv`, so any
- * check scoped to this label is a check on new rows (pair it with
- * `entryArchetype: 'directional'` to catch the historical ones).
- */
-const DIRECTIONAL_STRUCTURE_LABEL = 'single_leg_directional';
+// TRA-2245 / TRA-2295 / TRA-2345 — `DIRECTIONAL_STRUCTURE_LABEL` used to be declared
+// here, module-local. It now lives in `option-spread-cost.ts` beside
+// `SLEEVE_SPREAD_CEILINGS` and is imported at the top of this file: the ledger's
+// `spreadCeilingStructureKeys` doc field has to name the key this engine records
+// under, and a module-local const left it publishing a hardcoded copy instead.
+// Declare a second one here and the two drift silently. Read the constant's own
+// docblock for why that divergence has no failing state.
 
 /**
  * TRA-2193 — read the RV kill switch from outside this module.
