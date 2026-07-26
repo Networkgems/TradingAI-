@@ -29,6 +29,7 @@ const setup: OptionTradeJournalSetup = {
   agentConviction: 0.8,
   entryDelta: 0.22,
   riskThrottleMultiplier: 1, // TRA-2333 — un-throttled fixture fill
+  riskThrottleDecided: 1, // TRA-2339 — and the autopilot decided no trim either
 };
 
 const bullPutLegs = [
@@ -137,6 +138,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       trend: 'down',
       sentiment: null,
       riskThrottleMultiplier: 1,
+      riskThrottleDecided: 1,
     });
     expect(pos).not.toBeNull();
     const atRisk = pos!.contracts * pos!.premiumPaid * 100;
@@ -170,6 +172,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       trend: 'up',
       sentiment: null,
       riskThrottleMultiplier: 1,
+      riskThrottleDecided: 1,
     });
     expect(pos).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -245,7 +248,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback', riskThrottleMultiplier: 1 },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, entryArchetype: 'ema-pullback', riskThrottleMultiplier: 1, riskThrottleDecided: 1 },
     );
     expect(tagged).not.toBeNull();
     // ...and a bare RV long on a different OCC (no archetype → unspecified).
@@ -254,7 +257,7 @@ describe('PaperOptionsAccount option-trade journal emit (TRA-991)', () => {
       'demo',
       undefined,
       undefined,
-      { ivRank: null, trend: 'up', entryDelta: 0.35, riskThrottleMultiplier: 1 },
+      { ivRank: null, trend: 'up', entryDelta: 0.35, riskThrottleMultiplier: 1, riskThrottleDecided: 1 },
     );
     expect(bare).not.toBeNull();
     await acct.flushOptionTradeJournal();
@@ -422,6 +425,7 @@ describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
     agentConviction: null,
     entryArchetype: archetype,
     riskThrottleMultiplier: 1, // TRA-2333 — the wheel does not consult the throttle
+    riskThrottleDecided: 1, // TRA-2339 — nor would it at any scope
   });
 
   it('journals a CSP open (cash_secured_put, at-risk = collateral) and folds the expired-worthless close', async () => {
@@ -540,7 +544,12 @@ describe('PaperOptionsAccount wheel covered-write journal (TRA-1978)', () => {
 // present on a trimmed fill, and it is present *as exactly 1* on an un-trimmed
 // one rather than absent.
 describe('risk-throttle stamp on the journal open row (TRA-2333)', () => {
-  const stampSetup = (riskThrottleMultiplier: number): OptionTradeJournalSetup => ({
+  const stampSetup = (
+    riskThrottleMultiplier: number,
+    // TRA-2339 — defaults to the applied term, i.e. the armed case where the two
+    // agree. The dark case passes them apart explicitly.
+    riskThrottleDecided: number = riskThrottleMultiplier,
+  ): OptionTradeJournalSetup => ({
     ivRank: 30,
     trend: 'up',
     entryDelta: 0.35,
@@ -548,6 +557,7 @@ describe('risk-throttle stamp on the journal open row (TRA-2333)', () => {
     sentimentIcBand: null,
     agentConviction: null,
     riskThrottleMultiplier,
+    riskThrottleDecided,
   });
 
   it('a fill sized under a sub-1 throttle carries riskThrottleMultiplier < 1', async () => {
@@ -610,5 +620,111 @@ describe('risk-throttle stamp on the journal open row (TRA-2333)', () => {
     // Every row lands in exactly one side — no row is unattributable.
     expect(trimmed.length + full.length).toBe(rows.length);
     expect(trimmed[0]!.contracts!).toBeLessThan(full[0]!.contracts!);
+  });
+});
+
+// TRA-2339 (parent TRA-2331) — the DECIDED term next to the applied one.
+//
+// The applied stamp above cannot answer the question the board's LIVE arm turns
+// on. Under `demo` the live chokepoints resolve `armed: false` by design, so
+// their `riskThrottleMultiplier` is pinned at 1 — and a fill taken while the
+// autopilot sat at 0.35 stamps EXACTLY the same `1` as a fill taken while it sat
+// at 1.0. There is no observation period that separates them, because arming live
+// to find out is the very decision the measurement is meant to inform.
+//
+// These pin the property that closes that: on a dark path the row still records
+// what WOULD have happened, so `decided < 1 && multiplier === 1` names the
+// would-have-been-trimmed cohort per fill, joined to that row's own outcome.
+describe('decided-vs-applied throttle stamp on the journal open row (TRA-2339)', () => {
+  const stampSetup = (
+    riskThrottleMultiplier: number,
+    riskThrottleDecided: number = riskThrottleMultiplier,
+  ): OptionTradeJournalSetup => ({
+    ivRank: 30,
+    trend: 'up',
+    entryDelta: 0.35,
+    sentiment: null,
+    sentimentIcBand: null,
+    agentConviction: null,
+    riskThrottleMultiplier,
+    riskThrottleDecided,
+  });
+
+  it('a DARK fill records the throttle that was decided and not applied', async () => {
+    // The defect in one assertion. Flag off ⇒ full size was taken (multiplier 1),
+    // but the autopilot had de-risked to 0.4 and the row says so. Pre-TRA-2339
+    // this fill was indistinguishable from one taken in a calm market.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(buildRvSignal(), 'demo', undefined, undefined, stampSetup(1, 0.4));
+    await acct.flushOptionTradeJournal();
+
+    const row = (await listOptionTradeJournal())[0]!;
+    expect(row.riskThrottleMultiplier).toBe(1); // nothing was trimmed…
+    expect(row.riskThrottleDecided).toBe(0.4); // …but something WOULD have been
+    expect(row.riskThrottleArmedScope).toBe('off');
+  });
+
+  it('is written as exactly 1 when the autopilot decided no trim — present, not absent', async () => {
+    // Same TRA-2302 `?? 0` rule the applied stamp follows. If `decided` were
+    // written only when sub-1, ABSENT would collapse into "the autopilot was
+    // calm" and a regressed stamp would read as a quiet week. Absent must keep
+    // meaning exactly one thing: written by a pre-TRA-2339 build.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromRvCandidate(buildRvSignal(), 'demo', undefined, undefined, stampSetup(1));
+    await acct.flushOptionTradeJournal();
+
+    const row = (await listOptionTradeJournal())[0]!;
+    expect(row).toHaveProperty('riskThrottleDecided');
+    expect(row.riskThrottleDecided).toBe(1);
+  });
+
+  it('separates the dark cohort from the calm one — which the applied term alone cannot', async () => {
+    // Two dark fills: one the autopilot would have trimmed, one it would not.
+    // Both carry the identical applied term, so a partition on
+    // `riskThrottleMultiplier` puts them in the same bucket. The decided term is
+    // the only field that tells them apart.
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const would = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-would', optionSymbol: 'MSFT240705C00400000' }),
+      'demo', undefined, undefined, stampSetup(1, 0.35),
+    );
+    const calm = acct.openOptionFromRvCandidate(
+      buildRvSignal({ id: 'rv-calm', optionSymbol: 'MSFT240705C00410000', strike: 410 }),
+      'demo', undefined, undefined, stampSetup(1, 1),
+    );
+    expect(would).not.toBeNull();
+    expect(calm).not.toBeNull();
+    await acct.flushOptionTradeJournal();
+
+    const rows = await listOptionTradeJournal();
+    expect(rows).toHaveLength(2);
+    // The applied term cannot see the difference…
+    expect(rows.every((r) => r.riskThrottleMultiplier === 1)).toBe(true);
+    // …the decided term can, and it is the per-fill dark cohort.
+    const wouldHave = rows.filter((r) => r.riskThrottleDecided! < 1 && r.riskThrottleMultiplier === 1);
+    expect(wouldHave).toHaveLength(1);
+    expect(wouldHave[0]!.id).toBe(would!.id);
+    // Same contracts on both: the dark cohort is a LABEL on an un-trimmed fill,
+    // not a differently-sized one. That is what makes it a clean counterfactual.
+    expect(rows[0]!.contracts).toBe(rows[1]!.contracts);
+  });
+
+  it('an ARMED trimmed fill has both terms sub-1 and agreeing', async () => {
+    process.env['RISK_THROTTLE_SIZING_ENABLED'] = 'demo';
+    try {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+      acct.openOptionFromRvCandidate(
+        buildRvSignal(), 'demo', undefined, undefined, stampSetup(0.5), 0.5,
+      );
+      await acct.flushOptionTradeJournal();
+
+      const row = (await listOptionTradeJournal())[0]!;
+      expect(row.riskThrottleMultiplier).toBe(0.5);
+      expect(row.riskThrottleDecided).toBe(0.5);
+      // Not in the dark cohort — it was decided AND consumed.
+      expect(row.riskThrottleDecided! < 1 && row.riskThrottleMultiplier === 1).toBe(false);
+    } finally {
+      delete process.env['RISK_THROTTLE_SIZING_ENABLED'];
+    }
   });
 });

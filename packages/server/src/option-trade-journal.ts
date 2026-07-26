@@ -198,6 +198,37 @@ export interface OptionTradeJournalOpen {
   riskThrottleMultiplier?: number;
   /** TRA-2333 — arming scope in force when this ticket was sized. */
   riskThrottleArmedScope?: RiskThrottleSizingScope;
+  /**
+   * TRA-2339 (parent TRA-2331) — the throttle multiplier the autopilot DECIDED
+   * for this ticket: what {@link riskThrottleMultiplier} would have been had this
+   * open path been armed. Same tighten-only clamp, evaluated with `armed: true`.
+   *
+   * `riskThrottleMultiplier` alone cannot answer the question the board's live-arm
+   * step turns on, because it is the APPLIED term and is correctly 1 on every
+   * unarmed path — so a de-risked week and a calm week stamp identically. The pair
+   * separates them per fill:
+   *
+   *   • `riskThrottleDecided < 1 && riskThrottleMultiplier === 1` — this fill
+   *     WOULD have been trimmed and was not. That is the dark cohort, and it is
+   *     joinable to this row's own realized R, P&L, structure and archetype, which
+   *     the since-boot `wouldTrims` counter can never be.
+   *   • both `< 1` — trimmed. `=== 1` decided — the autopilot was at full size.
+   *
+   * ALWAYS written by this build, including when it is exactly `1`; optional on the
+   * TYPE only because absent is a real ledger state meaning **written by a build
+   * older than TRA-2339**. Exclude such rows from a throttle grade; never default
+   * them to 1.
+   *
+   * Scope note, matching `riskThrottleMultiplier`: open paths that do not consult
+   * the throttle at all (defined-risk spreads, the wheel's CSP/covered-call) stamp
+   * `1` here too. The field is what THIS TICKET'S sizing path would have applied,
+   * not the governor's raw reading — a path that never consults would not have been
+   * trimmed at any scope, so putting the governor's 0.5 here would manufacture a
+   * would-have-been-trimmed row that no arming decision could ever have trimmed.
+   * The raw governor value is separately visible in `autopilot.sizing.byPath[…]
+   * .lastThrottle` on `/api/health/live`.
+   */
+  riskThrottleDecided?: number;
 }
 
 /** The realized outcome, appended when the position closes. */

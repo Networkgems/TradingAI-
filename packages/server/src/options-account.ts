@@ -130,6 +130,18 @@ export interface OptionTradeJournalSetup {
    * applied, which is exactly what the field asserts.
    */
   riskThrottleMultiplier: number;
+  /**
+   * TRA-2339 (parent TRA-2331) — the throttle multiplier the autopilot DECIDED
+   * for this ticket: what {@link riskThrottleMultiplier} would have been had this
+   * open path been armed (see
+   * {@link OptionTradeJournalOpen.riskThrottleDecided} for the full contract).
+   *
+   * REQUIRED for the same reason its applied sibling is: it makes "did this open
+   * path stamp the counterfactual?" a compile-time question at all ten setup
+   * sites. Paths that do not consult the throttle pass `1` here as well as for
+   * `riskThrottleMultiplier` — they would not have been trimmed at any scope.
+   */
+  riskThrottleDecided: number;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -771,6 +783,13 @@ export class PaperOptionsAccount {
         ? setup.riskThrottleMultiplier
         : 1,
       riskThrottleArmedScope: riskThrottleSizingScope(),
+      // TRA-2339 — the DECIDED term, stamped under the same unconditional rule.
+      // Absent must keep meaning "written before TRA-2339" and nothing else, or
+      // the would-have-been-trimmed cohort silently shrinks to the rows that
+      // happened to get the field.
+      riskThrottleDecided: Number.isFinite(setup.riskThrottleDecided)
+        ? setup.riskThrottleDecided
+        : 1,
     };
     this.journalWrites = this.journalWrites
       .then(() => recordOptionTradeOpen(open))

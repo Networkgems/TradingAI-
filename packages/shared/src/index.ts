@@ -437,6 +437,29 @@ export interface Position {
   /** TRA-2333 — arming scope (`off` | `demo` | `all`) in force at sizing time. */
   riskThrottleArmedScope?: 'off' | 'demo' | 'all';
   /**
+   * TRA-2339 (parent TRA-2331) — the throttle multiplier the autopilot DECIDED
+   * for this fill: what {@link riskThrottleMultiplier} would have been had this
+   * position's sizing path been armed. Same tighten-only clamp, evaluated with
+   * `armed: true`.
+   *
+   * The pair is the point. `riskThrottleMultiplier` is the APPLIED term and is
+   * correctly 1 on any unarmed path, so on its own it cannot distinguish "the
+   * autopilot was calm" from "the autopilot de-risked and this path was not
+   * consuming it". With both:
+   *
+   *   • `decided < 1 && multiplier === 1` — WOULD have been trimmed, wasn't. The
+   *     dark-observation cohort, per fill, joinable to this position's own R.
+   *   • `decided < 1 && multiplier < 1`   — was trimmed.
+   *   • `decided === 1`                   — the autopilot was at full size.
+   *
+   * Written UNCONDITIONALLY on every signal-driven equity open by this build,
+   * including when it is exactly 1 — written-only-on-a-trim would collapse ABSENT
+   * into "un-trimmed" (TRA-2302's `?? 0` lesson). Absent therefore keeps exactly
+   * one meaning: opened by a build older than TRA-2339. Never default it to 1;
+   * exclude the row.
+   */
+  riskThrottleDecided?: number;
+  /**
    * TRA-249-C — instrument family the position was opened against. Spot
    * positions (the default and only kind pre-TRA-249) keep the field absent
    * so persisted snapshots and every non-crypto-live caller continue to

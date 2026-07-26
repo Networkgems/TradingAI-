@@ -183,6 +183,7 @@ import {
   riskThrottleSizingScope,
   isRiskThrottleSizingArmedForPath,
   riskThrottleSizeMultiplier,
+  riskThrottleDecidedMultiplier,
   recordRiskThrottleSizing,
 } from './risk-throttle-sizing.js';
 import type { Regime } from '@trading-app/engine';
@@ -6483,7 +6484,12 @@ export class SignalEngine {
                       : {}),
                     // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar,
                     // so no throttle term was applied to this ticket.
+                    // TRA-2339 — and none WOULD have been at any scope, so the
+                    // decided term is 1 too. Stamping the governor's raw reading
+                    // here would put a row that no arming decision could trim into
+                    // the would-have-been-trimmed cohort.
                     riskThrottleMultiplier: 1,
+                    riskThrottleDecided: 1,
                   };
                   const opened = this.optionsAccount.openDefinedRiskSpread(
                     shadowSignalToSpreadParams(selectorResult.signal, snap.spot),
@@ -6713,6 +6719,10 @@ export class SignalEngine {
           // TRA-2333 — the throttle term ALONE for the chokepoint that sizes this
           // open (the `sizeMultiplier` below also carries `optionCapScale`).
           riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
+      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
+      // the two agree; the pair still has to be stamped, because a row where they
+      // agree is only meaningful next to rows where they do not.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(),
           // TRA-1183 — tag ema-pullback (Trend-Pullback) single-leg fills so they
           // are countable distinctly from bare single_leg_rv in the journal
           // rollup. `emaPullbackReason` is non-null only when the EMA-pullback
@@ -7411,7 +7421,10 @@ export class SignalEngine {
             // TRA-2333 — the bounded-live test passes an explicit 1-contract
             // override, which bypasses the sized-contract path entirely, so no
             // throttle term reaches this ticket.
+            // TRA-2339 — nor would one at any scope: the override wins over the
+            // sized count regardless of arming, so the decided term is 1 as well.
             riskThrottleMultiplier: 1,
+            riskThrottleDecided: 1,
           };
           // Open exactly 1 contract on the paper book (bounded-test override bypasses
           // the $5k OTM min-equity gate + the 15% cap the $268 account can't clear);
@@ -7490,6 +7503,8 @@ export class SignalEngine {
           agentConviction: null,
           // TRA-2333 — the throttle term alone for the OTM chokepoint.
           riskThrottleMultiplier: this.riskThrottleTermFor('options_otm'),
+          // TRA-2339 — the counterfactual twin (see the RV setup above).
+          riskThrottleDecided: this.riskThrottleDecidedTerm(),
         };
         const opened = this.optionsAccount.openOptionFromCandidate(
           signal,
@@ -8444,6 +8459,10 @@ export class SignalEngine {
           // chokepoint. This is the sleeve TRA-2331 grades, so the stamp here is
           // the one the partition actually runs on.
           riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
+      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
+      // the two agree; the pair still has to be stamped, because a row where they
+      // agree is only meaningful next to rows where they do not.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(),
           // TRA-1682 — THE load-bearing tag. `openOptionFromRvCandidate` journals
           // `structure: 'single_leg_rv'` unconditionally for all three of its callers,
           // so this sleeve — the dominant demo churner, ungated by the |Δ|≥0.45
@@ -9116,7 +9135,11 @@ export class SignalEngine {
       // TRA-2333 — the wheel's CSP / covered-call opens take no sizing scalar
       // and are not among the risk-throttle chokepoints, so no throttle term was
       // applied to these tickets.
+      // TRA-2339 — not a chokepoint means not a chokepoint at ANY scope, so the
+      // decided term is 1 too; these rows are outside the throttle cohort
+      // entirely, not un-trimmed members of it.
       riskThrottleMultiplier: 1,
+      riskThrottleDecided: 1,
     };
   }
 
@@ -9190,6 +9213,10 @@ export class SignalEngine {
       agentConviction: null,
       // TRA-2333 — the throttle term alone for the iv-rv mispricing sleeve.
       riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
+      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
+      // the two agree; the pair still has to be stamped, because a row where they
+      // agree is only meaningful next to rows where they do not.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(),
       // Attribution hook: separates these fills from the RV sleeve in the
       // TRA-1200 byArchetype rollup — how the board reads "mispriced vs RV".
       entryArchetype: 'iv-rv-buy-premium',
@@ -9567,7 +9594,9 @@ export class SignalEngine {
                 agentConviction: null,
                 // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no
                 // throttle term was applied to this ticket.
+                // TRA-2339 — and none would have been at any scope ⇒ decided 1.
                 riskThrottleMultiplier: 1,
+                riskThrottleDecided: 1,
               },
             );
             if (opened) {
@@ -12064,7 +12093,9 @@ export class SignalEngine {
         agentConviction: null,
         // TRA-2333 — `openDefinedRiskSpread` takes no sizing scalar; no throttle
         // term was applied to this ticket.
+        // TRA-2339 — and none would have been at any scope ⇒ decided 1.
         riskThrottleMultiplier: 1,
+        riskThrottleDecided: 1,
       };
       const combo = acct.openDefinedRiskSpread(
         {
@@ -12139,6 +12170,10 @@ export class SignalEngine {
       agentConviction: null,
       // TRA-2333 — the throttle term alone for the AI-ideas single-leg open.
       riskThrottleMultiplier: this.riskThrottleTermFor('options_single_leg'),
+      // TRA-2339 — the counterfactual twin. Under `demo` this path IS armed, so
+      // the two agree; the pair still has to be stamped, because a row where they
+      // agree is only meaningful next to rows where they do not.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(),
       // TRA-2245 — an AI-Options-Ideas single-leg directional entry, not the True
       // RV engine. Stamp the directional structure label rather than inheriting
       // the reserved `single_leg_rv` default.
@@ -13668,7 +13703,17 @@ export class SignalEngine {
     const armed = isRiskThrottleSizingArmedForPath(path, scope);
     const throttle = this.riskGovernor.getRiskThrottle();
     const mult = riskThrottleSizeMultiplier(throttle, armed);
-    recordRiskThrottleSizing(path, { armed, throttle, multiplier: mult });
+    // TRA-2339 — record the DECIDED term alongside the applied one. `mult` is 1
+    // whenever `armed` is false, so gating the counters on it made `trims`
+    // identically 0 on every unarmed path — which is still every LIVE path under
+    // the current `demo` scope. `decided` is the same clamp with `armed: true`,
+    // so `wouldTrims` moves while the path is dark.
+    recordRiskThrottleSizing(path, {
+      armed,
+      throttle,
+      multiplier: mult,
+      decided: riskThrottleDecidedMultiplier(throttle),
+    });
     return this.activeSizingMultiplier() * mult;
   }
 
@@ -13693,6 +13738,29 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-2339 — the DECIDED throttle term for stamping on the fill: the multiplier
+   * {@link riskThrottleTermFor} would have returned had the path been armed.
+   *
+   * Takes no `path`, and that is not an oversight. The arming scope is the ONLY
+   * thing that differs between paths here, and the counterfactual is precisely
+   * "what if this path were armed?" — so once `armed` is pinned true, every
+   * consulting chokepoint decides the same term off the same governor reading.
+   * A `path` parameter would imply a per-path decision that does not exist and
+   * would invite someone to re-derive `armed` inside it, which is the bug.
+   *
+   * Pure — like `riskThrottleTermFor`, it records no consult. The sizing call for
+   * this ticket already recorded one (carrying this same decided value), and
+   * double-counting would corrupt `consults`/`trims`/`wouldTrims` alike.
+   *
+   * Non-consulting open paths (defined-risk spreads, wheel CSP/covered-call) do
+   * NOT call this — they stamp a literal `1` for both terms, because no arming
+   * scope would have trimmed them.
+   */
+  private riskThrottleDecidedTerm(): number {
+    return riskThrottleDecidedMultiplier(this.riskGovernor.getRiskThrottle());
+  }
+
+  /**
    * TRA-2333 — stamp the applied throttle term + arming scope onto a freshly
    * opened equity position, the durable equity twin of the option journal's
    * `riskThrottleMultiplier`. Called UNCONDITIONALLY on every signal-driven
@@ -13709,6 +13777,11 @@ export class SignalEngine {
     const path: RiskThrottleSizingPath = this.mode === 'live' ? 'equity_live_mirror' : 'equity_demo';
     pos.riskThrottleMultiplier = this.riskThrottleTermFor(path);
     pos.riskThrottleArmedScope = riskThrottleSizingScope();
+    // TRA-2339 — the counterfactual twin, under the same unconditional rule. On
+    // the LIVE book this is the only field that carries any information: under
+    // `demo`, `equity_live_mirror` resolves `armed: false` by design, so its
+    // applied term is pinned at 1 no matter what the autopilot decided.
+    pos.riskThrottleDecided = this.riskThrottleDecidedTerm();
   }
 
   /** TRA-1001 — test seam: the composed sizing scalar for a given chokepoint. */
@@ -13719,6 +13792,22 @@ export class SignalEngine {
   /** TRA-2333 — test seam: the stamped throttle term for a given chokepoint. */
   _riskThrottleTermForTests(path: RiskThrottleSizingPath): number {
     return this.riskThrottleTermFor(path);
+  }
+
+  /** TRA-2339 — test seam: the stamped DECIDED throttle term. */
+  _riskThrottleDecidedTermForTests(): number {
+    return this.riskThrottleDecidedTerm();
+  }
+
+  /**
+   * TRA-2339 — test seam: run the real equity-`Position` stamp against a bare
+   * row. The two production call sites sit deep inside the signal-driven open
+   * flow (live broker bracket / demo paper open), so this is the only way to
+   * assert the stamp's own contract — both fields written unconditionally, and
+   * the applied/decided pair diverging on the live path under `demo`.
+   */
+  _stampRiskThrottleOnPositionForTests(pos: Position): void {
+    this.stampRiskThrottleOnPosition(pos);
   }
 
   /**

@@ -54,6 +54,42 @@
 //      indistinguishable from a calm market (the TRA-2302 `?? 0` lesson).
 //      Absent therefore means exactly one thing: written by a build older than
 //      TRA-2333.
+//
+// TRA-2339 (parent TRA-2331) — the DECIDED term, alongside the applied one.
+//
+// TRA-1001 claimed the registry could answer "how often WOULD a throttle have
+// trimmed?" before anyone armed the flag. It could not, and the reason was one
+// line: `trims` was gated on the APPLIED multiplier, and
+// `riskThrottleSizeMultiplier(throttle, false)` returns 1 before it ever looks at
+// `throttle`. So while the scope was `off`, `trims` was IDENTICALLY 0 and
+// `minMultiplier` IDENTICALLY null — whether the autopilot had held 1.0 all week
+// or 0.35 all week. `trims: 0` read exactly the same in "the throttle never
+// fired" and in "the throttle fired on every entry and we could not see it":
+// precisely the pass/fail-indistinguishable shape this counted registry was built
+// to prevent, reintroduced one level down in the gating predicate. The only
+// unconditional record was `lastThrottle` — last-write-wins, a point sample, not
+// a count.
+//
+// That is not a historical curiosity now that `demo` is armed. Under `demo` the
+// two live-broker paths resolve `armed: false` BY DESIGN, so THEIR `trims` stay
+// structurally 0 — and the board's live-arm step needs exactly the number that
+// gates on: how often, and how hard, would the live chokepoint have been trimmed?
+// No observation period can produce it, because arming live to measure it is the
+// very decision the measurement is meant to inform.
+//
+// So every consult now also carries the DECIDED term — what the multiplier would
+// have been under `armed: true` — and it is recorded regardless of `armed`:
+//
+//   • `wouldTrims` / `minWouldMultiplier` — the dark-observation counters. Both
+//     move while the path is unarmed.
+//   • `trims` / `minMultiplier` — UNCHANGED, still the applied terms. The point is
+//     to have both, not to redefine either: `trims` remains the answer to "did
+//     this build actually shrink a ticket?", which is a different question and the
+//     one the arm itself is graded on.
+//
+// Per-fill, the same pair is stamped on the row (`riskThrottleDecided` next to
+// `riskThrottleMultiplier`), so `decided < 1 && multiplier === 1` is exactly the
+// would-have-been-trimmed cohort, joinable to that trade's own R.
 
 import { MIN_RISK_THROTTLE } from './risk-autopilot.js';
 
@@ -151,6 +187,25 @@ export function riskThrottleSizeMultiplier(throttle: number | null | undefined, 
   return Math.min(1, Math.max(MIN_RISK_THROTTLE, throttle));
 }
 
+/**
+ * TRA-2339 — the DECIDED sizing multiplier: what {@link riskThrottleSizeMultiplier}
+ * would have returned for this throttle had the path been armed.
+ *
+ * Identical clamp, `armed` pinned to `true`. It exists as its own named function
+ * rather than as a bare `riskThrottleSizeMultiplier(t, true)` at four call sites
+ * so that "the counterfactual is computed through the SAME clamp as the applied
+ * term" is a property of one function instead of a convention. If the clamp ever
+ * changes, the decided/applied pair cannot drift apart — which matters, because
+ * the whole value of the pair is that `decided < 1 && applied === 1` isolates the
+ * arming decision and nothing else.
+ *
+ * Pure and side-effect free: it records nothing. Reading the counterfactual must
+ * never be able to move a counter.
+ */
+export function riskThrottleDecidedMultiplier(throttle: number | null | undefined): number {
+  return riskThrottleSizeMultiplier(throttle, true);
+}
+
 // ── Counted-reason telemetry ────────────────────────────────────────────────
 
 /** Which sizing chokepoint consulted the throttle. */
@@ -187,23 +242,60 @@ export interface RiskThrottleSizingPathStats {
   armed: boolean;
   /** How many times this path asked for the multiplier. */
   consults: number;
-  /** How many of those returned a multiplier < 1, i.e. actually trimmed size. */
+  /**
+   * How many of those returned an APPLIED multiplier < 1, i.e. actually trimmed
+   * size. Structurally 0 whenever this path is unarmed — that is correct and
+   * intended (nothing was trimmed), but it is NOT the dark-observation number.
+   * For that read {@link wouldTrims}.
+   */
   trims: number;
-  /** The smallest multiplier this path has applied since boot (null ⇒ never trimmed). */
+  /** The smallest multiplier this path has APPLIED since boot (null ⇒ never trimmed). */
   minMultiplier: number | null;
+  /**
+   * TRA-2339 — how many consults the autopilot's throttle WOULD have trimmed,
+   * counted from the decided term and therefore independent of `armed`.
+   *
+   * This is the counter TRA-2331 step 1 assumed `trims` already was. On an
+   * unarmed path `wouldTrims > 0` with `trims === 0` is the whole dark-observation
+   * signal: the throttle fired and we declined to consume it. On an armed path the
+   * two track each other, and a divergence would mean the gate and the clamp
+   * disagree.
+   */
+  wouldTrims: number;
+  /**
+   * TRA-2339 — the smallest DECIDED multiplier seen since boot (null ⇒ the
+   * throttle has never been below 1 while this path was sizing). Answers "and by
+   * how much?" for the unarmed case, where `minMultiplier` is identically null.
+   */
+  minWouldMultiplier: number | null;
   /** The throttle value seen on the most recent consult. */
   lastThrottle: number | null;
 }
 
 const pathStats = new Map<RiskThrottleSizingPath, RiskThrottleSizingPathStats>();
 
-/** Record one sizing consult for the since-boot rollup. */
+/**
+ * Record one sizing consult for the since-boot rollup.
+ *
+ * `decided` is REQUIRED (TRA-2339) rather than optional-with-a-default. An
+ * omitted-defaults-to-`multiplier` signature would let a call site that forgot it
+ * report `wouldTrims: 0` on an unarmed path — reinstating, silently, the exact
+ * false zero this field exists to remove. Required makes it a compile error at
+ * every call site instead.
+ */
 export function recordRiskThrottleSizing(
   path: RiskThrottleSizingPath,
-  detail: { armed: boolean; throttle: number; multiplier: number },
+  detail: { armed: boolean; throttle: number; multiplier: number; decided: number },
 ): void {
-  const cur = pathStats.get(path)
-    ?? { armed: false, consults: 0, trims: 0, minMultiplier: null, lastThrottle: null };
+  const cur = pathStats.get(path) ?? {
+    armed: false,
+    consults: 0,
+    trims: 0,
+    minMultiplier: null,
+    wouldTrims: 0,
+    minWouldMultiplier: null,
+    lastThrottle: null,
+  };
   cur.armed = detail.armed;
   cur.consults += 1;
   cur.lastThrottle = Number.isFinite(detail.throttle) ? detail.throttle : null;
@@ -212,6 +304,13 @@ export function recordRiskThrottleSizing(
     cur.minMultiplier = cur.minMultiplier === null
       ? detail.multiplier
       : Math.min(cur.minMultiplier, detail.multiplier);
+  }
+  // TRA-2339 — the counterfactual, gated on the DECIDED term and NOT on `armed`.
+  if (detail.decided < 1) {
+    cur.wouldTrims += 1;
+    cur.minWouldMultiplier = cur.minWouldMultiplier === null
+      ? detail.decided
+      : Math.min(cur.minWouldMultiplier, detail.decided);
   }
   pathStats.set(path, cur);
 }
@@ -240,6 +339,21 @@ export interface RiskThrottleSizingSnapshot {
    * never been below 1 while an entry was sized — not that the wiring works.
    */
   totalTrims: number;
+  /**
+   * TRA-2339 — total consults the throttle WOULD have trimmed since boot,
+   * regardless of arming. Compare against {@link totalTrims}:
+   *
+   *   • `totalWouldTrims: 0`             ⇒ the autopilot has genuinely held the
+   *                                        throttle at 1 for every sized entry.
+   *   • `> 0` with `totalTrims: 0`       ⇒ it fired and nothing consumed it —
+   *                                        the dark cohort, and under `demo` the
+   *                                        expected reading for the live paths.
+   *   • `totalTrims > totalWouldTrims`   ⇒ impossible; the clamp is shared, so
+   *                                        this would mean applied trims are
+   *                                        coming from somewhere other than the
+   *                                        governor.
+   */
+  totalWouldTrims: number;
   /** Per-chokepoint breakdown (only paths that were consulted appear). */
   byPath: Partial<Record<RiskThrottleSizingPath, RiskThrottleSizingPathStats>>;
 }
@@ -249,16 +363,19 @@ export function snapshotRiskThrottleSizing(env: NodeJS.ProcessEnv = process.env)
   const byPath: Partial<Record<RiskThrottleSizingPath, RiskThrottleSizingPathStats>> = {};
   let totalConsults = 0;
   let totalTrims = 0;
+  let totalWouldTrims = 0;
   for (const [path, stats] of pathStats) {
     byPath[path] = { ...stats };
     totalConsults += stats.consults;
     totalTrims += stats.trims;
+    totalWouldTrims += stats.wouldTrims;
   }
   return {
     flag: RISK_THROTTLE_SIZING_FLAG,
     armedScope: riskThrottleSizingScope(env),
     totalConsults,
     totalTrims,
+    totalWouldTrims,
     byPath,
   };
 }

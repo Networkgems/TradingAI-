@@ -20,6 +20,7 @@ import {
   riskThrottleSizingScope,
   isRiskThrottleSizingArmedForPath,
   riskThrottleSizeMultiplier,
+  riskThrottleDecidedMultiplier,
   recordRiskThrottleSizing,
   snapshotRiskThrottleSizing,
   resetRiskThrottleSizingForTests,
@@ -123,6 +124,39 @@ describe('riskThrottleSizeMultiplier — the tighten-only clamp', () => {
       const m = riskThrottleSizeMultiplier(t, true);
       expect(m).toBeGreaterThan(0);
       expect(m).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe('riskThrottleDecidedMultiplier — the counterfactual clamp (TRA-2339)', () => {
+  it('is the applied clamp with `armed` pinned true, over the whole sweep', () => {
+    // The property that matters is not any single value: it is that decided and
+    // applied can never DRIFT. `decided < 1 && applied === 1` is only "the arming
+    // decision, isolated" if the two sides run the identical clamp — otherwise a
+    // change to one silently reclassifies the dark cohort.
+    const sweep = [-1, 0, 0.01, 0.1, 0.33, 0.5, 0.999, 1, 1.0001, 42,
+      Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_VALUE];
+    for (const t of sweep) {
+      expect(riskThrottleDecidedMultiplier(t)).toBe(riskThrottleSizeMultiplier(t, true));
+    }
+    expect(riskThrottleDecidedMultiplier(undefined)).toBe(1);
+    expect(riskThrottleDecidedMultiplier(null)).toBe(1);
+  });
+
+  it('ignores `armed` entirely — it is a counterfactual, not a reading of the gate', () => {
+    // The bug this whole ticket is about, at the level of the function: the
+    // applied clamp returns 1 on `armed: false` BEFORE it looks at the throttle,
+    // so anything gated on it is structurally 0 while dark.
+    expect(riskThrottleSizeMultiplier(0.35, false)).toBe(1); // the old, blind term
+    expect(riskThrottleDecidedMultiplier(0.35)).toBe(0.35); // the one that can see
+  });
+
+  it('a non-finite or ≥1 throttle decides NO trim — never manufactures a dark cohort', () => {
+    // Same conservative rule as the applied clamp: no information ⇒ no trim. If
+    // NaN fell through as "would have trimmed", a broken governor read would
+    // inflate the very number the live arm is graded on.
+    for (const t of [Number.NaN, undefined, null, 1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(riskThrottleDecidedMultiplier(t)).toBe(1);
     }
   });
 });
@@ -406,11 +440,164 @@ describe('SignalEngine.activeRiskSizingMultiplier — the wiring', () => {
     expect(mult(engine, 'options_single_leg')).toBe(term('options_single_leg'));
     expect(snapshotRiskThrottleSizing().totalConsults).toBe(1);
   });
+
+  // ── TRA-2339 ──────────────────────────────────────────────────────────────
+  // The would-have-trimmed counters, and the reason they had to exist.
+  it('DARK — `wouldTrims` moves on the SAME throttle that leaves `trims` at 0', () => {
+    // The defect, as a test. Pre-TRA-2339 the ONLY count-shaped field in this
+    // snapshot was `trims`, gated on the APPLIED multiplier — which
+    // `riskThrottleSizeMultiplier(t, false)` pins at 1 before it ever reads `t`.
+    // So this exact scenario (autopilot hard down, flag off) produced a snapshot
+    // byte-identical to a calm week's.
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    throttleEngine(engine, 0.35);
+    mult(engine, 'equity_demo');
+
+    const snap = snapshotRiskThrottleSizing({});
+    expect(snap.armedScope).toBe('off');
+    expect(snap.totalTrims).toBe(0); // nothing was trimmed — still true, still correct
+    expect(snap.totalWouldTrims).toBe(1); // …and now we can SEE that something would have been
+    expect(snap.byPath.equity_demo).toMatchObject({
+      armed: false, consults: 1, trims: 0, minMultiplier: null,
+      wouldTrims: 1, minWouldMultiplier: 0.35,
+    });
+  });
+
+  it('DARK — a calm autopilot and a de-risked one no longer read identically', () => {
+    // The pass/fail-indistinguishable check stated directly: run the same dark
+    // path under two different governor states and require the snapshots to
+    // DIFFER. Under the old shape both sides produced `trims: 0` and this
+    // assertion could not have been written.
+    const snapFor = (throttle: number) => {
+      resetRiskThrottleSizingForTests();
+      const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+      throttleEngine(engine, throttle);
+      mult(engine, 'equity_demo');
+      return snapshotRiskThrottleSizing({});
+    };
+    const calm = snapFor(1);
+    const derisked = snapFor(0.35);
+
+    expect(calm.totalTrims).toBe(derisked.totalTrims); // the old field: identical
+    expect(calm.totalWouldTrims).toBe(0);
+    expect(derisked.totalWouldTrims).toBe(1);
+    expect(calm.byPath.equity_demo!.minWouldMultiplier).toBeNull();
+    expect(derisked.byPath.equity_demo!.minWouldMultiplier).toBe(0.35);
+  });
+
+  it('DEMO scope — the LIVE paths accrue `wouldTrims` while their `trims` stay 0', () => {
+    // The number the board's live-arm step needs and no observation period could
+    // previously produce: how often, and how hard, would the live chokepoint have
+    // been trimmed? `demo` pins the live paths at `armed: false` BY DESIGN, so
+    // `trims` there is structurally 0 for as long as the arm is scoped correctly.
+    process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    throttleEngine(engine, 0.5);
+    mult(engine, 'equity_demo');
+    mult(engine, 'equity_live');
+    mult(engine, 'equity_live_mirror');
+
+    const snap = snapshotRiskThrottleSizing();
+    expect(snap.byPath.equity_demo).toMatchObject({ armed: true, trims: 1, wouldTrims: 1 });
+    for (const p of ['equity_live', 'equity_live_mirror'] as const) {
+      expect(snap.byPath[p]).toMatchObject({
+        armed: false, consults: 1,
+        trims: 0, minMultiplier: null, // still untouched — the scope holds
+        wouldTrims: 1, minWouldMultiplier: 0.5, // …and now countable
+      });
+    }
+    expect(snap.totalTrims).toBe(1);
+    expect(snap.totalWouldTrims).toBe(3);
+  });
+
+  it('the equity Position stamp writes BOTH terms, and they diverge on the live book', () => {
+    // The equity twin of the journal-row stamp. In `live` mode the position is
+    // the mirror of the broker bracket, which `demo` scope deliberately does NOT
+    // arm — so its applied term is pinned at 1 and the decided term is the only
+    // record that the autopilot had de-risked at all.
+    process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+    const stamp = (engine: SignalEngine): Record<string, unknown> => {
+      const pos = {} as unknown as Parameters<
+        SignalEngine['_stampRiskThrottleOnPositionForTests']
+      >[0];
+      engine._stampRiskThrottleOnPositionForTests(pos);
+      return pos as unknown as Record<string, unknown>;
+    };
+
+    const demoEngine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    throttleEngine(demoEngine, 0.5);
+    expect(stamp(demoEngine)).toEqual({
+      riskThrottleMultiplier: 0.5, riskThrottleDecided: 0.5, riskThrottleArmedScope: 'demo',
+    });
+
+    const liveEngine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS, mode: 'live' });
+    throttleEngine(liveEngine, 0.5);
+    expect(stamp(liveEngine)).toEqual({
+      riskThrottleMultiplier: 1, // the mirror is NOT armed under `demo` — as designed
+      riskThrottleDecided: 0.5, // …and this is the only field that says so
+      riskThrottleArmedScope: 'demo',
+    });
+  });
+
+  it('the equity Position stamp writes the decided term even when it is 1', () => {
+    // Absent must keep meaning "pre-TRA-2339 build", not "the autopilot was calm".
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    const pos = {} as unknown as Parameters<
+      SignalEngine['_stampRiskThrottleOnPositionForTests']
+    >[0];
+    engine._stampRiskThrottleOnPositionForTests(pos);
+    expect(pos).toHaveProperty('riskThrottleDecided');
+    expect(pos.riskThrottleDecided).toBe(1);
+  });
+
+  it('ARMED — applied and decided counters agree, so a divergence is diagnostic', () => {
+    // Once a path is armed the clamp is the same on both sides, so the two must
+    // track exactly. A future `trims > wouldTrims` would mean an applied trim is
+    // coming from somewhere other than the governor.
+    process.env[RISK_THROTTLE_SIZING_FLAG] = 'all';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    throttleEngine(engine, 0.25);
+    mult(engine, 'equity_live');
+    mult(engine, 'options_single_leg');
+
+    const snap = snapshotRiskThrottleSizing();
+    expect(snap.totalTrims).toBe(snap.totalWouldTrims);
+    expect(snap.totalWouldTrims).toBe(2);
+    expect(snap.byPath.equity_live).toMatchObject({ minMultiplier: 0.25, minWouldMultiplier: 0.25 });
+  });
+
+  it('the DECIDED stamp is path-blind, records no consult, and matches the counter', () => {
+    // The stamp helper must not double-count (the sizing call already recorded
+    // this same decided value), and under `demo` it must report the trim the LIVE
+    // path declined to take — that is the whole per-fill dark cohort.
+    process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
+    const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
+    throttleEngine(engine, 0.5);
+    const decided = (): number =>
+      (engine as unknown as { _riskThrottleDecidedTermForTests(): number })
+        ._riskThrottleDecidedTermForTests();
+    const term = (p: RiskThrottleSizingPath): number =>
+      (engine as unknown as { _riskThrottleTermForTests(p: RiskThrottleSizingPath): number })
+        ._riskThrottleTermForTests(p);
+
+    expect(decided()).toBe(0.5);
+    expect(snapshotRiskThrottleSizing().totalConsults).toBe(0); // stamping is not a consult
+    // On the live path: applied 1, decided 0.5 ⇒ the would-have-been-trimmed row.
+    expect(term('equity_live')).toBe(1);
+    expect(decided() < 1 && term('equity_live') === 1).toBe(true);
+    // On the armed demo path the two agree ⇒ it is NOT in the dark cohort.
+    expect(term('equity_demo')).toBe(0.5);
+    expect(decided()).toBe(term('equity_demo'));
+    // And it tracks the counter the sizing call writes.
+    mult(engine, 'equity_live');
+    expect(snapshotRiskThrottleSizing().byPath.equity_live!.minWouldMultiplier).toBe(decided());
+  });
+
 });
 
 describe('the since-boot registry', () => {
   it('separates "never consulted" from "consulted, never trimmed"', () => {
-    recordRiskThrottleSizing('equity_live', { armed: true, throttle: 1, multiplier: 1 });
+    recordRiskThrottleSizing('equity_live', { armed: true, throttle: 1, multiplier: 1, decided: 1 });
     const snap = snapshotRiskThrottleSizing();
     expect(snap.byPath.equity_live).toMatchObject({ armed: true, consults: 1, trims: 0, minMultiplier: null });
     expect(snap.byPath.equity_demo).toBeUndefined();
@@ -419,10 +606,35 @@ describe('the since-boot registry', () => {
   });
 
   it('keeps the SMALLEST multiplier applied, not the latest', () => {
-    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.3, multiplier: 0.3 });
-    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.8, multiplier: 0.8 });
+    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.3, multiplier: 0.3, decided: 0.3 });
+    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.8, multiplier: 0.8, decided: 0.8 });
     expect(snapshotRiskThrottleSizing().byPath.equity_demo).toMatchObject({
       consults: 2, trims: 2, minMultiplier: 0.3, lastThrottle: 0.8,
+    });
+  });
+
+  // TRA-2339 — the same "keep the extreme, not the latest" rule on the DECIDED
+  // side. Driven through the recorder rather than the engine on purpose: the
+  // governor ratchets DOWN only, so it cannot produce a rising sequence, and the
+  // min-keeping this pins belongs to the recorder either way.
+  it('keeps the SMALLEST DECIDED multiplier while the path is DARK', () => {
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.3, multiplier: 1, decided: 0.3 });
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.8, multiplier: 1, decided: 0.8 });
+    expect(snapshotRiskThrottleSizing({}).byPath.equity_live).toMatchObject({
+      consults: 2,
+      trims: 0, minMultiplier: null, // applied: untouched, as the dark path must be
+      wouldTrims: 2, minWouldMultiplier: 0.3, // decided: the worst trim we declined
+      lastThrottle: 0.8,
+    });
+    expect(snapshotRiskThrottleSizing({}).totalWouldTrims).toBe(2);
+  });
+
+  it('a decided term of exactly 1 counts as no would-trim', () => {
+    // The boundary the whole cohort definition rests on: `< 1`, not `<= 1`. A
+    // calm autopilot must not land in the would-have-been-trimmed bucket.
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 1, multiplier: 1, decided: 1 });
+    expect(snapshotRiskThrottleSizing({}).byPath.equity_live).toMatchObject({
+      consults: 1, wouldTrims: 0, minWouldMultiplier: null,
     });
   });
 
