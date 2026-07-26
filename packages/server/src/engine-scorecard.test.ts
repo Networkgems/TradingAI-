@@ -4,6 +4,7 @@ import { join } from 'path';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import type { AgentScoreReport } from '@trading-app/backtest';
 import { buildIvRankCoverage, type ForwardTestReport } from './options-forward-test.js';
+import { emptyCeilingAxis } from './gate-feasibility.js';
 import {
   SCORECARD_MIN_SAMPLE,
   classifySample,
@@ -48,6 +49,12 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
       ceilingNetR: 1.45,
       ceilingGrossRPriced: 1.5,
       ceilingSourceCounts: { priced_structure: 35, sketch_capped: 0, unusable: 0 },
+      // TRA-2353 — the scorecard reads none of the sleeve decomposition; empty axes keep
+      // the fixture honest (no sleeves were partitioned) rather than inventing cells.
+      ceilingAxes: {
+        byStructure: emptyCeilingAxis('strategy'),
+        byPremiumDirection: emptyCeilingAxis('premium_direction'),
+      },
       wins: 21,
       losses: 12,
       scratches: 2,

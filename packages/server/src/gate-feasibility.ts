@@ -169,6 +169,191 @@ export function computeBookCeiling(graded: readonly CeilingInput[]): BookCeiling
   };
 }
 
+// ── TRA-2353 · the SLEEVE decomposition ─────────────────────────────────────
+//
+// `computeBookCeiling` returns ONE number for the whole graded book. That bound is
+// mathematically correct on any mix — the pathwise identity `mean(pnlR) ≤ mean(rewardR)`
+// needs no homogeneity assumption — but on a MIXED book it averages an infeasible sleeve
+// into a `feasible` verdict. Measured live on bqb1 (build `7161d2be3f2b`, 2026-07-26):
+//
+//   graded book     n=47  ceiling gross 0.2882 → net 0.2391   `feasible` vs the 0.20R bar
+//   credit sleeve   n=35  ceiling ≈0.04 gross / ≈0.00 net     flatly INFEASIBLE
+//   debit sleeve    n=12  rewardR ≈ 1.012                     carries the whole verdict
+//
+// 74% of the graded book was being measured against a bar it provably cannot reach, and
+// the instrument built to detect exactly that reported `feasible`. The credit read needs
+// no model: `bull_put_spread` resolved n=31 at a hit rate of 1.00 for +0.04R gross and
+// 0.00R net — every trade a winner and the sleeve returns zero. It has ATTAINED its
+// ceiling.
+//
+// ⚠️ THE PARTITION IS SOUND FOR THE SAME REASON THE BOOK IS. The pathwise bound restricts
+// to any subset: `mean_S(pnlR) ≤ mean_S(rewardR)` for every sleeve S, because it is an
+// inequality on each individual trade. A per-sleeve `infeasible` is therefore exactly as
+// sound as the book-level one — it is not a weaker heuristic read.
+//
+// ⚠️ AND THE SLEEVE VERDICT IS NOT THE BLOCKING ONE. `passed` semantics are untouched
+// (TRA-2353 "not in scope"): whether a sleeve verdict should block is a POLICY decision
+// and QuantTrader owns it. Everything here is additive reporting — but per the TRA-2335
+// sign-off, NON-BLOCKING ≠ INVISIBLE, so the worst offender is named in the headline.
+
+/** One graded outcome as the sleeve partition reads it: ceiling inputs + its cost drag. */
+export interface SleeveCeilingInput extends CeilingInput {
+  /**
+   * `cost ÷ maxLossUsd` for this outcome; null when it could not be priced. The SAME
+   * per-row field the book's `avgCostR` averages, so a sleeve's netting is the book's
+   * netting restricted to the sleeve rather than a differently-scoped approximation.
+   */
+  costEfficiencyRatio: number | null;
+}
+
+/** One partition's ceiling — `computeBookCeiling` over a subset, plus its weight. */
+export interface SleeveCeiling {
+  key: string;
+  /**
+   * ALL partition members, including `unusable` ones. This is the sleeve's WEIGHT in the
+   * book — deliberately not `nUsable`, because a sleeve whose rewards are underivable
+   * still occupies its share of the population the book verdict is averaged over.
+   */
+  n: number;
+  /** Of `n`, those contributing to {@link ceilingGrossR} (priced + sketch-capped). */
+  nUsable: number;
+  /** `n ÷ bookN`, 0–1 at 4dp. Null only when the book is empty. */
+  weight: number | null;
+  /** `mean(rewardR)` over the sleeve, sketch caps included at their inflated value. */
+  ceilingGrossR: number | null;
+  /** The same over the `priced_structure` subset only — no fabricated rewards. */
+  ceilingGrossRPriced: number | null;
+  /** `mean(costEfficiencyRatio)` over the sleeve's priced rows. */
+  avgCostR: number | null;
+  /** `ceilingGrossR − avgCostR` — what a cost-NET bar must sit below for this sleeve. */
+  ceilingNetR: number | null;
+  sourceCounts: RewardSourceCounts;
+}
+
+/**
+ * AC3 — the book ceiling recomputed with one whole sleeve removed.
+ *
+ * The live margin is `0.039R` resting on 12 of 47 ideas: `ceilingGrossR ≤ 0.2491` flips
+ * the book to INFEASIBLE. So the verdict can change **on composition alone, with no code
+ * change** — if TRA-1965's cut fork removes the credit sleeve, or if the debit sleeve
+ * simply stops resolving. A single book-level boolean cannot express that; this can.
+ */
+export interface LeaveOneOutCeiling {
+  excludedKey: string;
+  /** Rows removed. */
+  excludedN: number;
+  /** Rows remaining (the population the recomputed ceiling is averaged over). */
+  remainingN: number;
+  ceilingGrossR: number | null;
+  avgCostR: number | null;
+  ceilingNetR: number | null;
+  sourceCounts: RewardSourceCounts;
+}
+
+/** A whole partition of the graded book along one key, with its leave-one-out sweep. */
+export interface CeilingAxis {
+  /** What the key MEANS — e.g. `strategy`, `premium_direction`. Part of the number. */
+  axis: string;
+  /** The graded book size this partition covers. `sum(sleeves.n) === bookN` by construction. */
+  bookN: number;
+  /** Sleeves ordered by weight DESCENDING (ties alphabetical) — the offender reads first. */
+  sleeves: SleeveCeiling[];
+  /** One entry per sleeve. Empty when there is 0 or 1 sleeve (nothing to remove). */
+  leaveOneOut: LeaveOneOutCeiling[];
+  /** The sleeve carrying the most rows — AC3 names it explicitly. Null on an empty book. */
+  largestSleeveKey: string | null;
+}
+
+const meanOrNull = (xs: readonly number[]): number | null =>
+  xs.length ? round4(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
+
+/**
+ * The book's own netting rule, factored out so a sleeve, the whole book and a
+ * leave-one-out complement can never be computed three slightly different ways.
+ * `avgCostR` is the mean over rows that HAVE a cost ratio; unpriced rows drop out
+ * exactly as they do at book level.
+ */
+function nettedCeiling(rows: readonly SleeveCeilingInput[]): {
+  ceiling: BookCeiling;
+  avgCostR: number | null;
+  ceilingNetR: number | null;
+} {
+  const ceiling = computeBookCeiling(rows);
+  const avgCostR = meanOrNull(
+    rows.map((o) => o.costEfficiencyRatio).filter((x): x is number => x != null),
+  );
+  const ceilingNetR =
+    ceiling.ceilingGrossR == null ? null : round4(ceiling.ceilingGrossR - (avgCostR ?? 0));
+  return { ceiling, avgCostR, ceilingNetR };
+}
+
+/**
+ * Partition an ALREADY-FILTERED graded set and compute each sleeve's ceiling (AC1).
+ *
+ * ⚠️ This is a PARTITION OF THE CALLER'S ARRAY, never a second filter — the same §2 rule
+ * that governs `computeBookCeiling`, applied one level down. Re-deriving the graded
+ * population here would re-admit the fabricated `rewardR ≡ 1.000` fallback-priced rows,
+ * and it would do it silently and in the fail-open direction. Because every sleeve is a
+ * subset of the array the book ceiling is averaged over, `sum(sleeve.n) === bookN` holds
+ * by construction and is asserted in the tests.
+ */
+export function computeCeilingAxis<T extends SleeveCeilingInput>(
+  graded: readonly T[],
+  axis: string,
+  keyFn: (o: T) => string,
+): CeilingAxis {
+  const groups = new Map<string, T[]>();
+  for (const o of graded) {
+    const k = keyFn(o);
+    const arr = groups.get(k) ?? [];
+    arr.push(o);
+    groups.set(k, arr);
+  }
+  const bookN = graded.length;
+  const sleeves: SleeveCeiling[] = [...groups.entries()]
+    .map(([key, rows]) => {
+      const { ceiling, avgCostR, ceilingNetR } = nettedCeiling(rows);
+      return {
+        key,
+        n: rows.length,
+        nUsable: ceiling.n,
+        weight: bookN > 0 ? round4(rows.length / bookN) : null,
+        ceilingGrossR: ceiling.ceilingGrossR,
+        ceilingGrossRPriced: ceiling.ceilingGrossRPriced,
+        avgCostR,
+        ceilingNetR,
+        sourceCounts: ceiling.sourceCounts,
+      };
+    })
+    .sort((a, b) => b.n - a.n || a.key.localeCompare(b.key));
+
+  // Removing the only sleeve leaves an empty book, whose "ceiling" is null — a
+  // vacuous `unknown`, not a fragility signal. Emit nothing rather than noise.
+  const leaveOneOut: LeaveOneOutCeiling[] =
+    groups.size < 2
+      ? []
+      : sleeves.map((s) => {
+          const rest = graded.filter((o) => keyFn(o) !== s.key);
+          const { ceiling, avgCostR, ceilingNetR } = nettedCeiling(rest);
+          return {
+            excludedKey: s.key,
+            excludedN: s.n,
+            remainingN: rest.length,
+            ceilingGrossR: ceiling.ceilingGrossR,
+            avgCostR,
+            ceilingNetR,
+            sourceCounts: ceiling.sourceCounts,
+          };
+        });
+
+  return { axis, bookN, sleeves, leaveOneOut, largestSleeveKey: sleeves[0]?.key ?? null };
+}
+
+/** An axis with nothing in it — the degraded read for a legacy/partial report. */
+export function emptyCeilingAxis(axis: string): CeilingAxis {
+  return { axis, bookN: 0, sleeves: [], leaveOneOut: [], largestSleeveKey: null };
+}
+
 /** The three states a bar can be in against its instrument's ceiling. */
 export type FeasibilityVerdict =
   /** The bar is strictly below the ceiling — the comparison carries information. */
@@ -248,6 +433,169 @@ export function evaluateFeasibility(input: {
     ceilingR,
     feasible: true,
     reason: `feasible — the ${fmt(barR)}R bar is below the ${fmt(ceilingR)}R payoff ceiling of ${subject}, so the comparison carries information`,
+  };
+}
+
+// ── TRA-2353 · sleeve VERDICTS ──────────────────────────────────────────────
+
+/** AC2's payload shape: one sleeve's verdict against the book's bar. */
+export interface SleeveFeasibility {
+  key: string;
+  n: number;
+  /** Share of the graded book, 0–1. The number that makes "74% of the book" legible. */
+  weight: number | null;
+  ceilingNetR: number | null;
+  verdict: FeasibilityVerdict;
+  /** True when this sleeve is at or above {@link MATERIAL_SLEEVE_WEIGHT} of the book. */
+  material: boolean;
+  reason: string;
+}
+
+/** AC3 — one sleeve's removal, graded. */
+export interface LeaveOneOutVerdict extends LeaveOneOutCeiling {
+  verdict: FeasibilityVerdict;
+  /** True when removing this sleeve alone CHANGES the book's verdict. */
+  flipsBookVerdict: boolean;
+}
+
+export interface AxisFragility {
+  /** Repeated here so this block reads standalone in a payload dump. */
+  bookVerdict: FeasibilityVerdict;
+  largestSleeveKey: string | null;
+  /** AC3's stated minimum, named explicitly rather than left to be found in the list. */
+  largestSleeveExcluded: LeaveOneOutVerdict | null;
+  /** Every single-sleeve removal — a flip is legible wherever in the mix it lives. */
+  leaveOneOut: LeaveOneOutVerdict[];
+  /** True when ANY single sleeve's removal changes the book verdict. */
+  flipsOnSingleSleeveRemoval: boolean;
+  flippingSleeves: string[];
+}
+
+export interface AxisFeasibility {
+  axis: string;
+  barR: number;
+  bookN: number;
+  /** Every sleeve, weight-descending. Emitted whole — nothing is filtered out of here. */
+  sleeves: SleeveFeasibility[];
+  /** The `infeasible` sleeve carrying the most weight. Null when none is infeasible. */
+  worstSleeve: SleeveFeasibility | null;
+  /** Share of the graded book (0–1) sitting inside an `infeasible` sleeve. */
+  infeasibleWeight: number | null;
+  fragility: AxisFragility;
+  /** The sentence AC2 requires in the verdict, or null when there is nothing to say. */
+  note: string | null;
+}
+
+/**
+ * The weight at which an infeasible sleeve is flagged `material`.
+ *
+ * ⚠️ This is a LABEL, not a filter. Every sleeve verdict is emitted regardless, and the
+ * headline note names the worst offender at ANY weight — a threshold that SUPPRESSES is
+ * a new blind spot in an instrument that exists because a true state was invisible. The
+ * flag is here so a consumer that wants to triage can, without this module deciding for
+ * it. Whether a material infeasible sleeve should BLOCK is QuantTrader's call, not this
+ * module's (TRA-2353, "not in scope: changing what blocks").
+ */
+export const MATERIAL_SLEEVE_WEIGHT = 0.1;
+
+const pctOf = (w: number | null): string => (w == null ? 'unknown share' : `${Math.round(w * 100)}%`);
+
+/**
+ * Grade every sleeve of an axis against the book's bar, and sweep the composition
+ * fragility (AC2 + AC3).
+ *
+ * `bookVerdict` is passed in rather than re-derived: the book verdict is netted against
+ * the book's own `avgCostR` and carries the book's provenance, and re-deriving it from
+ * the axis would produce a second number that must agree with the first — the exact
+ * "two computations that must agree" shape the §2 rule exists to forbid.
+ */
+export function evaluateAxisFeasibility(
+  axis: CeilingAxis,
+  barR: number,
+  bookVerdict: FeasibilityVerdict,
+): AxisFeasibility {
+  const gradeSleeve = (s: SleeveCeiling): SleeveFeasibility => {
+    const f = evaluateFeasibility({
+      barR,
+      ceilingR: s.ceilingNetR,
+      // Same rule as the book: a fabricated reward can never certify reachability, but
+      // it CAN sustain an `infeasible` (the ceiling is an upper bound either way).
+      provenanceKnown: s.sourceCounts.sketch_capped === 0,
+      subject: `sleeve ${s.key} (n=${s.n}, ${pctOf(s.weight)} of the graded book)`,
+    });
+    return {
+      key: s.key,
+      n: s.n,
+      weight: s.weight,
+      ceilingNetR: s.ceilingNetR,
+      verdict: f.verdict,
+      material: s.weight != null && s.weight >= MATERIAL_SLEEVE_WEIGHT,
+      reason: f.reason,
+    };
+  };
+
+  const sleeves = axis.sleeves.map(gradeSleeve);
+  const infeasible = sleeves.filter((s) => s.verdict === 'infeasible');
+  const worstSleeve = infeasible[0] ?? null; // already weight-descending
+  const infeasibleWeight = axis.bookN
+    ? round4(infeasible.reduce((a, s) => a + s.n, 0) / axis.bookN)
+    : null;
+
+  const leaveOneOut: LeaveOneOutVerdict[] = axis.leaveOneOut.map((l) => {
+    const v = evaluateFeasibility({
+      barR,
+      ceilingR: l.ceilingNetR,
+      provenanceKnown: l.sourceCounts.sketch_capped === 0,
+      subject: `the graded book excluding ${l.excludedKey}`,
+    }).verdict;
+    return { ...l, verdict: v, flipsBookVerdict: v !== bookVerdict };
+  });
+  const flipping = leaveOneOut.filter((l) => l.flipsBookVerdict);
+
+  const fragility: AxisFragility = {
+    bookVerdict,
+    largestSleeveKey: axis.largestSleeveKey,
+    largestSleeveExcluded:
+      leaveOneOut.find((l) => l.excludedKey === axis.largestSleeveKey) ?? null,
+    leaveOneOut,
+    flipsOnSingleSleeveRemoval: flipping.length > 0,
+    flippingSleeves: flipping.map((l) => l.excludedKey),
+  };
+
+  // The note answers exactly AC2's question — "is a `feasible` book hiding an infeasible
+  // sleeve?" — so it is withheld in the two cases where it can only restate the headline:
+  //
+  //  • ONE sleeve. Its rows ARE the book's rows and the formula is identical, so its
+  //    verdict is the book's verdict by construction. "Sleeve X (100% of the book) is
+  //    infeasible" beside "the book is infeasible" is the same sentence twice.
+  //  • The book is ALREADY `infeasible`. The loudest available stop is published; adding
+  //    a non-blocking sleeve warning under it dilutes the one line that must be read.
+  //
+  // Neither case suppresses DATA: `sleeves`, `worstSleeve` and `infeasibleWeight` are
+  // populated regardless. Only the headline sentence is conditioned — the distinction
+  // that keeps "an alarm that is always on is one nobody reads" from becoming the fix.
+  const parts: string[] = [];
+  if (worstSleeve && axis.sleeves.length > 1 && bookVerdict !== 'infeasible') {
+    parts.push(
+      `SLEEVE INFEASIBLE (non-blocking, ${axis.axis}) — the book verdict is \`${bookVerdict}\` in aggregate, but sleeve \`${worstSleeve.key}\` (n=${worstSleeve.n}, ${pctOf(worstSleeve.weight)} of the graded book) has a cost-net payoff ceiling of ${worstSleeve.ceilingNetR == null ? 'unknown' : `${fmt(worstSleeve.ceilingNetR)}R`} against the ${fmt(barR)}R bar and CANNOT reach it at any hit rate. ${pctOf(infeasibleWeight)} of the graded book sits in an infeasible sleeve; the book verdict rests on the remainder.`,
+    );
+  }
+  if (fragility.flipsOnSingleSleeveRemoval) {
+    const worstFlip = flipping[0];
+    parts.push(
+      `COMPOSITION-FRAGILE (${axis.axis}) — removing ${flipping.length === 1 ? 'sleeve' : 'any one of the sleeves'} ${flipping.map((l) => `\`${l.excludedKey}\``).join(', ')} alone changes the book verdict (e.g. without \`${worstFlip.excludedKey}\` (n=${worstFlip.excludedN}) the cost-net ceiling is ${worstFlip.ceilingNetR == null ? 'unknown' : `${fmt(worstFlip.ceilingNetR)}R`} ⇒ \`${worstFlip.verdict}\`). This verdict can therefore change on COMPOSITION ALONE, with no code change.`,
+    );
+  }
+
+  return {
+    axis: axis.axis,
+    barR,
+    bookN: axis.bookN,
+    sleeves,
+    worstSleeve,
+    infeasibleWeight,
+    fragility,
+    note: parts.length ? parts.join(' ') : null,
   };
 }
 

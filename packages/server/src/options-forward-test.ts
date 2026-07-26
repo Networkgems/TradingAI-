@@ -32,8 +32,14 @@ import { MIN_IV_SAMPLES, type IvSample } from './iv-rank-store.js';
 // no env, and imported by BOTH gate sites, so it adds no cycle.
 import {
   computeBookCeiling,
+  computeCeilingAxis,
+  emptyCeilingAxis,
+  evaluateAxisFeasibility,
   evaluateFeasibility,
+  type AxisFeasibility,
+  type CeilingAxis,
   type FeasibilityResult,
+  type FeasibilityVerdict,
   type RewardSourceCounts,
 } from './gate-feasibility.js';
 // TRA-2208 — the floor + its governed families, imported (not restated) so the
@@ -557,6 +563,16 @@ export interface ForwardTestReport {
      * indistinguishability is what let a 5.3×-unreachable bar run for four weeks.
      */
     ceilingSourceCounts: RewardSourceCounts;
+    /**
+     * TRA-2353 — the SAME ceiling, partitioned. The book-level number above is a correct
+     * bound on any mix, but on a MIXED book it averages an infeasible sleeve into a
+     * `feasible` verdict: live on 2026-07-26 the graded book read `feasible` at a
+     * cost-net ceiling of 0.2391R while the 35-idea credit sleeve inside it sat at
+     * ≈0.00R against the same 0.20R bar — 74% of the population measured against a bar
+     * it provably cannot reach. Both axes are partitions of the SAME `resolved` array
+     * the totals above are computed from, never a re-derived population.
+     */
+    ceilingAxes: BookCeilingAxes;
     wins: number;
     losses: number;
     scratches: number;
@@ -997,6 +1013,40 @@ const METHODOLOGY =
   'POP calibration compares the model’s mean stated probability-of-profit to the realized hit-rate. No live ' +
   'capital is wired by this report; it is the evidence input to the documented live-capital gate.';
 
+/**
+ * TRA-2353 — the two axes the book ceiling is partitioned along.
+ *
+ * `byStructure` is AC1's axis: the SAME key `IdeasDecomposition.byStructure` groups on
+ * (`o.strategy`), so a reader can line the ceiling up against the realized `grossR` /
+ * `netR` / `hitRate` cells they already read on `/api/health/options-ideas-decomposition`
+ * without re-deriving anything.
+ *
+ * `byPremiumDirection` is the axis TRA-2353's own finding is STATED in — "the credit
+ * sleeve", "the debit sleeve" — and it is what makes "74% of the graded book" a number
+ * on the route rather than an arithmetic-by-difference claim in a comment. It is derived
+ * per-row from the sign of `entryNetUsd` (a MEASUREMENT of the entry) rather than from a
+ * name list, so a structure nobody enumerated is bucketed correctly instead of silently
+ * mis-filed, and an unformable entry lands in `unknown` rather than in a wrong sleeve.
+ * That distinction is the TRA-2350 lesson applied here: a structure key is not a sleeve.
+ */
+export interface BookCeilingAxes {
+  /** Keyed on `strategy` — bull_put_spread / bear_call_spread / bull_call_spread / … */
+  byStructure: CeilingAxis;
+  /** Keyed on the sign of `entryNetUsd` — `credit` / `debit` / `unknown`. */
+  byPremiumDirection: CeilingAxis;
+}
+
+/**
+ * Credit vs debit from the entry itself. `entryNetUsd` is signed (+ = net credit
+ * collected, − = net debit paid; see the P&L identity at the top of this file), so this
+ * is a per-row measurement, not a taxonomy that can fall out of date. A zero or
+ * non-finite entry is `unknown` — never silently folded into either sleeve.
+ */
+function premiumDirection(o: IdeaOutcome): string {
+  if (!Number.isFinite(o.entryNetUsd) || o.entryNetUsd === 0) return 'unknown';
+  return o.entryNetUsd > 0 ? 'credit' : 'debit';
+}
+
 /** Roll a set of idea outcomes into the weekly + overall forward-test report. */
 export function buildForwardTestReport(
   outcomes: readonly IdeaOutcome[],
@@ -1041,6 +1091,12 @@ export function buildForwardTestReport(
   const avgCostR = gradedCostRatios.length ? r4(mean(gradedCostRatios) ?? 0) : null;
   const ceilingNetR =
     ceiling.ceilingGrossR == null ? null : r4(ceiling.ceilingGrossR - (avgCostR ?? 0));
+  // TRA-2353 — the same ceiling partitioned, over the SAME `resolved` array (a partition,
+  // never a second filter). `sum(sleeve.n) === resolved.length` holds by construction.
+  const ceilingAxes: BookCeilingAxes = {
+    byStructure: computeCeilingAxis(resolved, 'strategy', (o) => o.strategy),
+    byPremiumDirection: computeCeilingAxis(resolved, 'premium_direction', premiumDirection),
+  };
 
   // TRA-2006 — fit the POP post-calibration on the SAME resolved-and-included set
   // (refit on every report build → "refits weekly as the sample grows") and
@@ -1070,6 +1126,7 @@ export function buildForwardTestReport(
       ceilingNetR,
       ceilingGrossRPriced: ceiling.ceilingGrossRPriced,
       ceilingSourceCounts: ceiling.sourceCounts,
+      ceilingAxes,
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,
@@ -1226,6 +1283,66 @@ export function evaluateBookFeasibility(
     provenanceKnown: sourceCounts != null && sourceCounts.sketch_capped === 0,
     subject: `the graded book (n=${t.resolved})`,
   });
+}
+
+/**
+ * TRA-2353 — the per-sleeve decomposition of the book verdict, both axes.
+ *
+ * Additive and NON-BLOCKING by construction: it returns only reporting, and no caller
+ * folds it into `pass`/`passed`. Whether an infeasible sleeve should block is a policy
+ * decision TRA-2353 explicitly reserves for QuantTrader.
+ *
+ * Degrades to empty axes on a report built before `ceilingAxes` existed (a persisted
+ * snapshot, or a hand-built partial) — never throws. This sits on the
+ * `/api/health/live-capital-gate` path, where a probe that throws removes the whole
+ * readout including the criteria that are still perfectly measurable.
+ */
+export interface BookSleeveFeasibility {
+  byStructure: AxisFeasibility;
+  byPremiumDirection: AxisFeasibility;
+  /**
+   * The one sentence the headline must carry, or null when there is nothing to say.
+   * Composed from both axes, structure first (AC1's axis), de-duplicated when the two
+   * axes are telling the same story about the same rows.
+   */
+  note: string | null;
+}
+
+export function evaluateBookSleeveFeasibility(
+  report: ForwardTestReport,
+  minExpectancyR: number,
+  bookVerdict: FeasibilityVerdict,
+): BookSleeveFeasibility {
+  const axes = report.totals?.ceilingAxes as BookCeilingAxes | undefined;
+  const byStructure = evaluateAxisFeasibility(
+    axes?.byStructure ?? emptyCeilingAxis('strategy'),
+    minExpectancyR,
+    bookVerdict,
+  );
+  const byPremiumDirection = evaluateAxisFeasibility(
+    axes?.byPremiumDirection ?? emptyCeilingAxis('premium_direction'),
+    minExpectancyR,
+    bookVerdict,
+  );
+  // The premium-direction axis is a COARSENING of the structure axis, so when both fire
+  // they usually describe the same rows. Lead with the structure note (it names the
+  // specific offender) and add the premium one only when it says something new — a
+  // headline that says the same thing twice trains readers to skip it.
+  const parts = [byStructure.note, byPremiumDirection.note].filter(
+    (x): x is string => x != null,
+  );
+  const note =
+    parts.length === 0
+      ? null
+      : parts.length === 1
+        ? parts[0]
+        : byPremiumDirection.worstSleeve != null &&
+            byStructure.worstSleeve != null &&
+            byPremiumDirection.infeasibleWeight === byStructure.infeasibleWeight &&
+            !byPremiumDirection.fragility.flipsOnSingleSleeveRemoval
+          ? parts[0]
+          : parts.join(' ');
+  return { byStructure, byPremiumDirection, note };
 }
 
 /**

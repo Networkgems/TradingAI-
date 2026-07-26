@@ -4491,6 +4491,18 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
         avgCostR: report.totals.avgCostR,
         ceilingSources: report.totals.ceilingSourceCounts,
       },
+      // TRA-2353 — the SAME ceiling, PER SLEEVE, plus the composition-fragility sweep.
+      // `feasibility` above is the BLOCKING verdict and its semantics are unchanged; this
+      // is what that verdict RESTS ON. On 2026-07-26 they disagreed about 74% of the
+      // graded book: the book read `feasible` (cost-net ceiling 0.2391R vs a 0.20R bar)
+      // while the 35-idea credit sleeve inside it sat at ≈0.00R — an infeasible sleeve
+      // averaged into a feasible verdict by 12 debit verticals.
+      //
+      // ⚠️ Grade `byStructure.worstSleeve` / `byPremiumDirection.worstSleeve`, and read
+      // `fragility.flipsOnSingleSleeveRemoval` BEFORE quoting the book verdict: when it
+      // is true the verdict can change on COMPOSITION ALONE, with no code change — so a
+      // dated "the book is feasible" claim expires the moment the mix moves.
+      sleeveFeasibility: gate.sleeveFeasibility,
       evidence: {
         surfaced: report.totals.surfaced,
         resolved: report.totals.resolved,
