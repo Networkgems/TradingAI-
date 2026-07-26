@@ -37,9 +37,33 @@ const MIN_BID = 0.1;
 // "none"` (its filter sits inside the compile-time-dead RV scanner, TRA-2193b), so its `.gated`
 // reads n=0/all-null. A grader applying "grade .gated" uniformly to the control reads n=0 and
 // HALTS — a false halt that looks exactly like due diligence. Encoded so it cannot recur.
+// ── AND THE TWO CONTROLS TAKE OPPOSITE DIRECTIONS (TRA-2306, 2026-07-26) ─────
+// An exact pin is right for a FROZEN population and WRONG for a GROWING one, and these two
+// controls are one of each. Pinning both exactly is what the self-test count and the routine `rev`
+// already taught: a number that grows, pinned, turns ordinary activity into a spurious finding —
+// and here it lands as `controls: MOVED` -> VOID, i.e. THE GRADE DOES NOT PUBLISH, at 20:20Z on the
+// one session this ticket exists to measure. It reads exactly like due diligence: "a pinned control
+// MOVED - the instrument changed, do not grade."
+//
+//   negative `single_leg_rv` = FROZEN -> EXACT. It can gain no new rows: the scanner that writes
+//   the label is compile-time dead (`RV_ENGINE_ENABLED=false`, TRA-2193b) and the TRA-2245 label
+//   split is forward-only, so every future directional row lands under `single_leg_directional`.
+//   For a frozen population a CHANGE is the hazard, so exact equality is the correct detector.
+//
+//   positive `single_leg_otm` = GROWING -> DIRECTION. Measured off the journal this beat, desk
+//   `single_leg_otm` opens by day: 07-15:4 07-17:3 07-20:3 07-21:1 07-22:11 07-23:1 07-24:5 = 28.
+//   SEVEN of seven recent trading days added rows (1-11/day) and the oldest is 11 days old, so no
+//   prune window trims it back. Monday 07-27 is a trading day => n >= 29. The pin was guaranteed
+//   to break, and it only reads stable now because it is the weekend.
+//
+// `maxSpreadPct` needs the same care for a different reason: it is a MAX over a growing set, so it
+// is monotone NON-DECREASING. It cannot fall unless rows vanished; it can rise within the sleeve's
+// own 0.20 ceiling. And `countAboveCeiling`/`countBelowMinBid` must stay NUMBERS (a `null` means
+// the instrument stopped folding) but a RISE is the OTM sleeve's business: reported, never a VOID
+// of the DIRECTIONAL grade. Coupling an unrelated sleeve's breach to this verdict is its own bug.
 export const CONTROLS = {
-  negative: { structure: 'single_leg_rv', arm: 'ungated', n: 87, countAboveCeiling: 63, maxSpreadPct: 1.9333333333333333, countBelowMinBid: 6 },
-  positive: { structure: 'single_leg_otm', arm: 'gated', n: 28, countAboveCeiling: 0, maxSpreadPct: 0.19607843137254907, countBelowMinBid: 0 },
+  negative: { structure: 'single_leg_rv', arm: 'ungated', frozen: true, n: 87, countAboveCeiling: 63, maxSpreadPct: 1.9333333333333333, countBelowMinBid: 6 },
+  positive: { structure: 'single_leg_otm', arm: 'gated', frozen: false, n: 28, countAboveCeiling: 0, maxSpreadPct: 0.19607843137254907, countBelowMinBid: 0, ceiling: 0.2 },
 };
 
 const num = v => typeof v === 'number' && Number.isFinite(v);
@@ -166,11 +190,31 @@ export function read2(osc) {
   // value check, so assert the value AT ITS ARM.
   for (const [kind, c] of Object.entries(CONTROLS)) {
     const live = arm('desk', c.structure, c.arm);
-    for (const f of ['n', 'countAboveCeiling', 'maxSpreadPct', 'countBelowMinBid']) {
-      if (live?.[f] !== c[f]) {
-        out.controls = 'MOVED';
-        out.notes.push(`CONTROL ${kind} desk[${c.structure}].${c.arm}.${f}: expected ${c[f]}, live ${live?.[f]}`);
+    const at = f => `CONTROL ${kind} desk[${c.structure}].${c.arm}.${f}`;
+    const moved = (f, why) => { out.controls = 'MOVED'; out.notes.push(`${at(f)}: ${why}`); };
+
+    // FROZEN population: a change of ANY kind is the instrument moving. Exact equality.
+    if (c.frozen) {
+      for (const f of ['n', 'countAboveCeiling', 'maxSpreadPct', 'countBelowMinBid']) {
+        if (live?.[f] !== c[f]) moved(f, `expected EXACTLY ${c[f]}, live ${live?.[f]} — this population is FROZEN (compile-time-dead writer, forward-only label split), so any change is an instrument change`);
       }
+      continue;
+    }
+
+    // GROWING population: assert the DIRECTION, never the value.
+    if (!num(live?.n) || live.n < c.n) {
+      moved('n', `expected a FLOOR of >= ${c.n}, live ${live?.n} — GROWTH IS EXPECTED and is NOT an instrument change; only a count BELOW the floor is (rows vanished, or the partition broke)`);
+    }
+    // A max over a growing set is monotone non-decreasing: it cannot fall unless rows vanished.
+    if (!num(live?.maxSpreadPct) || live.maxSpreadPct < c.maxSpreadPct) {
+      moved('maxSpreadPct', `expected a NUMBER >= ${c.maxSpreadPct}, live ${live?.maxSpreadPct} — a MAX over a growing set cannot fall; a drop (or a null) means the fold changed or rows vanished`);
+    } else if (live.maxSpreadPct > c.ceiling) {
+      out.notes.push(`${at('maxSpreadPct')} ${live.maxSpreadPct} exceeds the OTM sleeve's OWN ${c.ceiling} ceiling — REPORT: that is a finding about single_leg_otm. It falsifies nothing about TRA-2295 and must NOT void this grade.`);
+    }
+    // Must still be COMPUTED. A rise belongs to the OTM sleeve, not to this verdict.
+    for (const f of ['countAboveCeiling', 'countBelowMinBid']) {
+      if (!num(live?.[f])) moved(f, `expected a NUMBER, live ${live?.[f]} — a null means the instrument stopped folding this axis`);
+      else if (live[f] > c[f]) out.notes.push(`${at(f)} rose ${c[f]} -> ${live[f]} — REPORT: a breach in the single_leg_otm sleeve. It falsifies nothing about TRA-2295 and must NOT void this grade.`);
     }
   }
   return out;
@@ -301,10 +345,13 @@ const mkCag = (o = {}) => ({
   ...(o.noKeys ? {} : { spreadCeilingStructureKeys: { demo_directional: `${o.publishedKey ?? STRUCT} — NOT the \`directional\` row (TRA-2295).`, otm: 'single_leg_otm — gated in the OTM scanner chain filter.' } }),
   ...(o.extra ?? {}),
 });
+// Project a control down to the four fields the PAYLOAD actually carries — `frozen`/`ceiling`/
+// `structure`/`arm` are grader metadata and must not leak into a mock that stands in for live JSON.
+const ctl = c => ({ n: c.n, countAboveCeiling: c.countAboveCeiling, maxSpreadPct: c.maxSpreadPct, countBelowMinBid: c.countBelowMinBid });
 const mkOsc = (o = {}) => ({ ceilingCompliance: { byAccountClass: {
   desk: [{ structure: STRUCT, n: (o.deskN ?? 3) + (o.deskUngatedN ?? 0), gatedArchetypes: [ARCHETYPE], gated: { n: o.deskN ?? 3, countAboveCeiling: o.deskOver ?? 0, maxSpreadPct: o.deskMax ?? 0.09, countBelowMinBid: o.deskThin ?? 0 }, ungated: { n: o.deskUngatedN ?? 0, countAboveCeiling: o.deskUngatedOver ?? 0 } },
-         { structure: 'single_leg_rv', n: 87, gatedArchetypes: 'none', gated: { n: 0, countAboveCeiling: null, maxSpreadPct: null, countBelowMinBid: null }, ungated: { ...CONTROLS.negative } },
-         { structure: 'single_leg_otm', n: 28, gatedArchetypes: 'all', gated: { ...CONTROLS.positive }, ungated: { n: 0 } }],
+         { structure: 'single_leg_rv', n: 87, gatedArchetypes: 'none', gated: { n: 0, countAboveCeiling: null, maxSpreadPct: null, countBelowMinBid: null }, ungated: { ...ctl(CONTROLS.negative), ...(o.rv ?? {}) } },
+         { structure: 'single_leg_otm', n: 28, gatedArchetypes: 'all', gated: { ...ctl(CONTROLS.positive), ...(o.otm ?? {}) }, ungated: { n: 0 } }],
   fixture: [{ structure: STRUCT, n: o.fixN ?? 0, gatedArchetypes: [ARCHETYPE], gated: { n: o.fixN ?? 0 }, ungated: { n: 0 } }] } } });
 const mkJ = rows => ({ rows });
 const jrow = (o = {}) => ({ account: 'admin', structure: STRUCT, entryArchetype: ARCHETYPE, openTs: 2e12, entryBid: 0.65, entryAsk: 0.7, entryMarkUsd: 0.675, ...o });
@@ -336,6 +383,32 @@ function selfTest() {
     ['pre-cutover rows excluded by the 3-part AND (no false FAIL)', 'NOT_GRADED_YET', () => g(mkCag(), mkOsc({ deskN: 0 }), mkJ(Array.from({ length: 87 }, () => jrow({ structure: 'single_leg_rv', entryBid: 0.02, entryAsk: 0.5, entryMarkUsd: 0.26 }))))],
     ['fixture rows excluded from the desk basis', 'NOT_GRADED_YET', () => g(mkCag(), mkOsc(), mkJ([jrow({ account: 'qa_mirror_1578_38096', entryBid: 0.5, entryAsk: 0.7, entryMarkUsd: 0.6 })]))],
     ['a MOVED pinned control halts the grade', 'VOID', () => { const o = mkOsc(); o.ceilingCompliance.byAccountClass.desk[1].ungated.countAboveCeiling = 62; return g(mkCag(), o, mkJ([jrow(), jrow(), jrow()])); }],
+
+    // ── control DIRECTION (added 2026-07-26) ────────────────────────────────
+    // THE MONDAY CASE. The positive control's population grows every trading day (7/7 recent
+    // sessions, 1-11 rows each). Under the old exact pin this VOIDed the grade on any live
+    // activity — the grade would simply not publish, on the one session being measured.
+    ['positive control GREW (the Monday case) -> still grades, NOT a MOVED control',
+      'PASS', () => g(mkCag(), mkOsc({ otm: { n: 34 } }), mkJ([jrow(), jrow(), jrow()]))],
+    ['positive control n BELOW its floor -> VOID (rows vanished / partition broke)',
+      'VOID', () => g(mkCag(), mkOsc({ otm: { n: 27 } }), mkJ([jrow(), jrow(), jrow()]))],
+    // A max over a growing set is monotone non-decreasing.
+    ['positive control maxSpreadPct ROSE within its own ceiling -> still grades',
+      'PASS', () => g(mkCag(), mkOsc({ otm: { n: 31, maxSpreadPct: 0.199 } }), mkJ([jrow(), jrow(), jrow()]))],
+    ['positive control maxSpreadPct FELL below the pin -> VOID (a max cannot fall)',
+      'VOID', () => g(mkCag(), mkOsc({ otm: { maxSpreadPct: 0.18 } }), mkJ([jrow(), jrow(), jrow()]))],
+    ['positive control maxSpreadPct went NULL -> VOID (the fold stopped computing)',
+      'VOID', () => g(mkCag(), mkOsc({ otm: { maxSpreadPct: null } }), mkJ([jrow(), jrow(), jrow()]))],
+    // An OTM breach is a finding about single_leg_otm. It must not void the DIRECTIONAL grade.
+    ['an OTM-sleeve breach is REPORTED, not a VOID of the directional grade',
+      'PASS', () => g(mkCag(), mkOsc({ otm: { n: 30, countAboveCeiling: 2 } }), mkJ([jrow(), jrow(), jrow()]))],
+    ['positive control countAboveCeiling went NULL -> VOID (axis no longer folded)',
+      'VOID', () => g(mkCag(), mkOsc({ otm: { countAboveCeiling: null } }), mkJ([jrow(), jrow(), jrow()]))],
+    // The negative control keeps EXACT equality — its population cannot grow, so a change is real.
+    ['negative control is still EXACT: growth in a FROZEN population -> VOID',
+      'VOID', () => g(mkCag(), mkOsc({ rv: { n: 88 } }), mkJ([jrow(), jrow(), jrow()]))],
+    ['a breach still beats a grown control (direction is never suppressed)',
+      'FAIL', () => g(mkCag({ maxAdmitted: 0.4 }), mkOsc({ otm: { n: 34 } }), mkJ([jrow(), jrow(), jrow()]))],
 
     // ── the build axis (added 2026-07-26) ───────────────────────────────────
     // The payload detector tests a key name I guessed. These prove the grade does not depend on
@@ -404,7 +477,7 @@ function selfTest() {
   // Fix the direction, not the number. GROWTH is expected and is never a finding; a DECREASE means
   // branches were deleted, and that is the one direction worth failing on. Assert the floor here so
   // the guarantee lives in the code instead of in two prose copies that drift independently.
-  const FLOOR = 30; // raise only when adding cases; never lower to make a red suite green
+  const FLOOR = 39; // raise only when adding cases; never lower to make a red suite green
   if (cases.length < FLOOR) {
     console.log(
       `\nSELF-TEST FLOOR BREACHED: ${cases.length} cases < floor ${FLOOR} — branches were REMOVED. ` +
