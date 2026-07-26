@@ -608,6 +608,7 @@ import {
   buildPublicPromotionProbe,
   snapshotPaperMetrics,
   evaluateLiveTransitionGate,
+  evaluateLiveCryptoStartGate,
 } from './promotion-service.js';
 
 const log = logger.child({ module: 'index' });
@@ -9355,9 +9356,17 @@ app.post('/api/crypto/trading/start', requireAuth, async (req, res) => {
   // on — so it must enforce the same gate as PUT /api/account/settings, otherwise
   // it would be an ungated bypass. Demo starts are never gated; only a result that
   // runs live crypto auto-trading. Fail CLOSED if the gate can't be evaluated.
+  //
+  // TRA-2351 — gate through `evaluateLiveCryptoStartGate`, NOT by handing
+  // `updated` to the general gate. `mode` here comes from the REQUEST BODY, so
+  // `updated.mode` is still the PERSISTED mode — passing that snapshot asked the
+  // gate to authorize a LIVE start against a snapshot that read `demo`, which it
+  // correctly graded as "no real-capital axis active" and allowed. The route then
+  // persisted a durable live-crypto arm that was never graded. The named entry
+  // point declares the action, so the mismatch is not expressible here.
   if (mode === 'live') {
     try {
-      const gate = await evaluateLiveTransitionGate(username, updated);
+      const gate = await evaluateLiveCryptoStartGate(username, settings);
       if (!gate.allowed) {
         log.warn('TRA-575 refused live crypto start — promotion gate', {
           username,

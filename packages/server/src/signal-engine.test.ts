@@ -63,7 +63,7 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldBootDisarmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
 import { isStockMarketOpen } from '@trading-app/shared'; // TRA-2257
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
@@ -4770,6 +4770,77 @@ describe('shouldBootArmLiveCrypto — TRA-1340 persistent live-crypto boot-arm',
       expect(
         shouldBootArmLiveCrypto({ ...liveSettings(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' }, PIN, on),
       ).toBe(false);
+    });
+  });
+
+  // ── TRA-2351 — the carrier must govern the arm's PRESENCE, not just its creation ──
+  //
+  // QA grading of TRA-2343 found that `createUserContext` checks the arm as
+  // `settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(...)`,
+  // so an arm that is ALREADY `true` short-circuits on the first conjunct and the
+  // TRA-2336 carrier above is never evaluated. It stopped a boot from CREATING the
+  // arm; it did not stop a boot from INHERITING one — and the TRA-2351 crypto-start
+  // bypass persisted exactly such an arm, on the same operator that
+  // `TRADIER_ENV=production` force-writes to `mode:'live'`.
+  describe('TRA-2351 shouldBootDisarmLiveCrypto — an INHERITED arm meets the same carrier', () => {
+    const armed = (): AccountSettings => ({ ...liveSettings(), cryptoAutoTradingEnabledLive: true });
+    const goLiveBoot = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+      LIVE_EQUITY_BOOT_USER: PIN,
+      TRADIER_ENV: 'production',
+      ...over,
+    });
+
+    it('clears an inherited arm on the pinned Live operator when the carrier is absent', () => {
+      expect(shouldBootDisarmLiveCrypto(armed(), PIN, goLiveBoot())).toBe(true);
+    });
+
+    // POSITIVE CONTROL for the case above: it must be the CARRIER doing the work,
+    // not an unclearable fixture. Same settings, same operator, carrier on ⇒ false.
+    it('leaves the arm alone once the carrier IS set (the disarm is not unconditional)', () => {
+      expect(shouldBootDisarmLiveCrypto(armed(), PIN, goLiveBoot({ LIVE_CRYPTO_BOOT_ARM: '1' }))).toBe(false);
+    });
+
+    it('never clears a flag that is not set (no write on a clean boot)', () => {
+      expect(shouldBootDisarmLiveCrypto(liveSettings(), PIN, goLiveBoot())).toBe(false);
+      expect(
+        shouldBootDisarmLiveCrypto({ ...liveSettings(), cryptoAutoTradingEnabledLive: false }, PIN, goLiveBoot()),
+      ).toBe(false);
+    });
+
+    it('never touches a NON-operator account (their arm is not this box\'s business)', () => {
+      expect(shouldBootDisarmLiveCrypto(armed(), 'someone-else', goLiveBoot())).toBe(false);
+    });
+
+    // A demo-mode account is not the real-money box; leave it alone. (It also
+    // cannot fire the live tick — `doTick` gates on `this.mode === 'live'`.)
+    it('does not fire on a demo account', () => {
+      expect(shouldBootDisarmLiveCrypto({ ...armed(), mode: 'demo' as const }, PIN, goLiveBoot())).toBe(false);
+    });
+
+    // …but creds are NOT a condition, in either direction. `shouldBootArmLiveCrypto`
+    // checks them so it never arms with no broker attached; the disarm answers a
+    // different question — "may this box run real-money crypto AT ALL" — and the
+    // carrier is the whole of that answer. A cred-less boot that left the arm in
+    // place would re-arm silently the moment creds resolved again.
+    it('fires regardless of whether Coinbase creds resolve', () => {
+      expect(
+        shouldBootDisarmLiveCrypto(
+          { ...armed(), liveApiKeyCrypto: '', liveApiSecretCrypto: '' },
+          PIN,
+          goLiveBoot(),
+        ),
+      ).toBe(true);
+    });
+
+    // The two predicates must never both be true for the same boot — the caller
+    // runs them as if/else and a disagreement would make the branch order matter.
+    it('is mutually exclusive with shouldBootArmLiveCrypto across the carrier', () => {
+      for (const carrier of [{}, { LIVE_CRYPTO_BOOT_ARM: '1' }] as Record<string, string>[]) {
+        for (const s of [liveSettings(), armed()]) {
+          const e = goLiveBoot(carrier);
+          expect(shouldBootArmLiveCrypto(s, PIN, e) && shouldBootDisarmLiveCrypto(s, PIN, e)).toBe(false);
+        }
+      }
     });
   });
 });

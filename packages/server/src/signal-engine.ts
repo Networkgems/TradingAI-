@@ -14723,6 +14723,49 @@ export function shouldBootArmLiveCrypto(
   return apiKey.length > 0 && apiSecret.length > 0;
 }
 
+/**
+ * TRA-2351 — must this boot CLEAR an INHERITED live-crypto arm?
+ *
+ * `shouldBootArmLiveCrypto` above is checked as
+ * `settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(...)`,
+ * and a flag that is ALREADY `true` short-circuits on the first conjunct — so the
+ * TRA-2342 `LIVE_CRYPTO_BOOT_ARM` interlock is never evaluated at all. That
+ * interlock stops a boot from CREATING the arm; it did not stop a boot from
+ * INHERITING one. Any writer that lands `cryptoAutoTradingEnabledLive: true`
+ * without the board's carrier — a settings PUT, the TRA-2351 crypto-start bypass,
+ * a DATA_DIR restore predating the interlock — therefore survived every
+ * subsequent boot untouched, and `TRADIER_ENV=production` (the ratified go-live
+ * arming step) then force-writes `mode:'live'` around it.
+ *
+ * So the interlock is re-derived to govern the arm's PRESENCE, not just its
+ * creation: `LIVE_CRYPTO_BOOT_ARM` is the single carrier for "this box may run
+ * real-money crypto", and without it the pinned operator boots DISARMED however
+ * the flag got there. Deliberately narrow — it fires ONLY when the carrier itself
+ * is absent, and only for the pinned operator on a Live-mode account (the
+ * real-money box). It never touches a non-operator account.
+ *
+ * Note the condition set is NOT the negation of `shouldBootArmLiveCrypto`'s: that
+ * one checks resolvable Coinbase creds so it never arms with no broker attached,
+ * while this one answers "may this box run real-money crypto AT ALL", and the
+ * carrier is the whole of that answer. Leaving an arm in place through a cred-less
+ * boot would just re-arm silently the moment creds resolved again.
+ *
+ * Consequence worth stating plainly: with the carrier absent, arming live crypto
+ * through the API on the pinned operator no longer survives a redeploy. That is
+ * the control working — TRA-2336's finding was that the flag must be the carrier
+ * — not a bug. Set `LIVE_CRYPTO_BOOT_ARM=1` to make the arm durable again.
+ */
+export function shouldBootDisarmLiveCrypto(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (settings.cryptoAutoTradingEnabledLive !== true) return false;
+  if (isLiveCryptoBootArmEnabled(env)) return false;
+  if (!isLiveBrokerOperator(username, env)) return false;
+  return (settings.mode ?? 'demo') === 'live';
+}
+
 function buildTradierLiveEquityClient(
   settings: AccountSettings,
   username: string | undefined,

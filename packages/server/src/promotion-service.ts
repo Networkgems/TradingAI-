@@ -292,12 +292,17 @@ function realCapitalIntentAxes(s: AccountSettings): { crypto: boolean; optionsPr
  * exposes the ACTIVE PRESET's roster (TRA-1916), and options-production exposes
  * the board-named options sleeves — but only while the env-aware flag is armed,
  * so the legacy crypto-only trigger stays behaviour-preserving with it off.
+ *
+ * TRA-2351 — `axes` is injectable so a caller that is authorizing an action the
+ * snapshot does not yet describe (see {@link evaluateLiveCryptoStartGate}) grades
+ * the roster of the axis it is actually turning on. Defaults to the snapshot's
+ * own axes, so every existing caller is unchanged.
  */
 function guardedRosterByAxis(
   s: AccountSettings,
   envAware: boolean,
+  axes: { crypto: boolean; optionsProduction: boolean } = realCapitalIntentAxes(s),
 ): { crypto: string[]; optionsProduction: string[] } {
-  const axes = realCapitalIntentAxes(s);
   return {
     crypto: axes.crypto ? [...resolveStrategyPreset(s.activeStrategyPreset).enabledStrategies] : [],
     optionsProduction:
@@ -310,6 +315,31 @@ export interface LiveTransitionGateResult {
   allowed: boolean;
   /** Per-strategy block details when `allowed === false`. */
   blocked: Array<{ strategyId: string; reasons: string[] }>;
+}
+
+/**
+ * TRA-2351 — real-capital intent the CALLER is authorizing that the `updated`
+ * snapshot does not (yet) describe.
+ *
+ * The gate's contract is "grade this resulting state". A caller that hands it a
+ * state contradicting the action it is authorizing gets a correct answer to the
+ * wrong question — which is exactly how `POST /api/crypto/trading/start` stayed
+ * ungated: it resolves its mode from the REQUEST BODY, so an operator persisted
+ * as `demo` could start LIVE crypto while the snapshot still read `demo`, and
+ * every axis term collapsed to false. Declaring the intent here restores the
+ * contract WITHOUT rewriting the snapshot — so only the declared axis is lifted
+ * and no unrelated axis (e.g. options → Tradier Production) is dragged on with
+ * it.
+ *
+ * Prefer {@link evaluateLiveCryptoStartGate} over passing this by hand: a
+ * caller that must remember an optional argument is a caller that will forget.
+ */
+export interface LiveTransitionIntent {
+  /**
+   * The action turns ON live crypto auto-trading regardless of the snapshot's
+   * persisted `mode`. Lifts the crypto axis only.
+   */
+  liveCrypto?: boolean;
 }
 
 /**
@@ -334,11 +364,16 @@ export interface LiveTransitionGateResult {
  * saves (arm the axis under the empty `no_trade` roster, then re-select the real
  * preset — which is not an axis escalation). It also refuses an escalation onto
  * an empty roster outright.
+ *
+ * TRA-2351 — `intent` lets a caller declare real-capital intent the snapshot does
+ * not carry. See {@link LiveTransitionIntent}; the crypto-start path must use
+ * {@link evaluateLiveCryptoStartGate} rather than composing this by hand.
  */
 export async function evaluateLiveTransitionGate(
   username: string,
   updated: AccountSettings,
   previous?: AccountSettings,
+  intent?: LiveTransitionIntent,
 ): Promise<LiveTransitionGateResult> {
   // TRA-1436 — environment-aware trigger, behind PROMOTION_GATE_ENV_AWARE
   // (default OFF ⇒ legacy crypto-only trigger, behaviour-preserving). When
@@ -358,7 +393,16 @@ export async function evaluateLiveTransitionGate(
   // the save newly activates. Without a `previous` snapshot (e.g. the
   // TRA-575 crypto-start path) we treat every active axis as newly-on, which
   // reproduces the pre-1590 fail-closed trigger verbatim.
-  const next = realCapitalIntentAxes(updated);
+  //
+  // TRA-2351 — the declared intent is OR'd into the resulting axes. It can only
+  // ever turn an axis ON, never off, so it cannot loosen the gate; and it is
+  // scoped to the crypto axis so an unrelated options-production posture is not
+  // dragged into a crypto-start decision.
+  const snapshotAxes = realCapitalIntentAxes(updated);
+  const next = {
+    crypto: snapshotAxes.crypto || intent?.liveCrypto === true,
+    optionsProduction: snapshotAxes.optionsProduction,
+  };
   const prev = previous
     ? realCapitalIntentAxes(previous)
     : { crypto: false, optionsProduction: false };
@@ -396,7 +440,7 @@ export async function evaluateLiveTransitionGate(
   // force-writes `mode:live` + the crypto arm from env (TRA-2336) does not
   // route through here and is held by the TRA-2342 interlock instead — but a
   // later preset change through the API is now graded, which is the point.
-  const nextRoster = guardedRosterByAxis(updated, envAware);
+  const nextRoster = guardedRosterByAxis(updated, envAware, next);
   const prevRoster = previous
     ? guardedRosterByAxis(previous, envAware)
     : { crypto: [], optionsProduction: [] };
@@ -432,7 +476,14 @@ export async function evaluateLiveTransitionGate(
     reasons: [
       `TRA-2343 — this save turns ON ${e.axis} with an EMPTY strategy roster (${e.detail}). `
       + 'A real-capital axis is never armed against an empty roster: turn the axis on together '
-      + 'with the promoted strategies it should trade.',
+      + 'with the promoted strategies it should trade. '
+      // TRA-2351 — an operator on the Options+Stock go-live path (TRA-1575) hits
+      // this because a STALE live-crypto flag rides along with their mode flip;
+      // they do not want live crypto at all, and the sentence above names the
+      // wrong remedy for them. Turning the axis OFF is a de-escalation, so it
+      // saves in the SAME request — say so, or the refusal reads as a deadlock.
+      + `If you did not mean to arm ${e.axis} at all, turn it OFF in this same save — `
+      + 'reducing exposure is never blocked.',
     ],
   }));
 
@@ -474,4 +525,41 @@ export async function evaluateLiveTransitionGate(
     return { allowed: false, blocked };
   }
   return { allowed: true, blocked: [] };
+}
+
+/**
+ * TRA-2351 — the ONLY correct way to gate `POST /api/crypto/trading/start`.
+ *
+ * THE DEFECT THIS EXISTS TO MAKE UNREACHABLE. That route resolves its mode from
+ * the REQUEST BODY (`resolveTradingMode` — a body `mode` wins outright over
+ * `settings.mode`), but used to compose the snapshot it handed the gate as
+ * `{ ...settings, cryptoAutoTradingEnabledLive: true }` — carrying the PERSISTED
+ * mode. For an operator on `demo` sending `{"mode":"live"}` the gate was asked to
+ * authorize a LIVE start against a snapshot that read DEMO, so
+ * `realCapitalIntentAxes` short-circuited to all-false and every downstream term
+ * of the TRA-2343 roster delta collapsed: no escalating axis, both rosters empty,
+ * `emptyRosterAxes` empty ⇒ ALLOWED. Not "graded and passed" — never graded, with
+ * no TRA-532 refusal log. The route then PERSISTED `cryptoAutoTradingEnabledLive:
+ * true`, and that arm is durable: its one remaining condition is the go-live
+ * arming step itself (`TRADIER_ENV=production` force-writes `mode:'live'` in the
+ * equity boot-arm, user-context.ts). Live crypto on an ungraded roster.
+ *
+ * The remedy is a NAMED entry point rather than an optional argument on the
+ * general gate, because the failure was one of composition at the call site: a
+ * route that hands over a raw snapshot can hand over the wrong one, whereas a
+ * route that names the action cannot. Callers pass their CURRENT settings; the
+ * live arm and the live intent are applied here, together, once.
+ *
+ * Nothing is persisted by this function — the caller decides what to save.
+ */
+export async function evaluateLiveCryptoStartGate(
+  username: string,
+  settings: AccountSettings,
+): Promise<LiveTransitionGateResult> {
+  return evaluateLiveTransitionGate(
+    username,
+    { ...settings, cryptoAutoTradingEnabledLive: true },
+    undefined,
+    { liveCrypto: true },
+  );
 }

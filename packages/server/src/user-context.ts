@@ -3,7 +3,12 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-import { SignalEngine, shouldBootArmLiveCrypto, resolveLiveBrokerArmDrift } from './signal-engine.js';
+import {
+  SignalEngine,
+  shouldBootArmLiveCrypto,
+  shouldBootDisarmLiveCrypto,
+  resolveLiveBrokerArmDrift,
+} from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -808,6 +813,29 @@ async function createUserContext(username: string): Promise<UserContext> {
       });
     } catch (err: unknown) {
       log.warn('TRA-1340 boot-arm: failed to persist live crypto flag (engine still arms live in-memory)', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else if (shouldBootDisarmLiveCrypto(settings, username)) {
+    // TRA-2351 — the arm above short-circuits on `!== true`, so an arm that is
+    // ALREADY set never reaches `shouldBootArmLiveCrypto` and never meets the
+    // TRA-2342 `LIVE_CRYPTO_BOOT_ARM` interlock. The interlock stopped a boot
+    // from CREATING the arm; it did not stop a boot from INHERITING one — and
+    // an inherited arm is exactly what the TRA-2351 crypto-start bypass (and a
+    // pre-interlock DATA_DIR restore) leaves behind, on the same operator that
+    // `TRADIER_ENV=production` force-writes to `mode:'live'` one block above.
+    // With the board's carrier absent, the operator boots DISARMED however the
+    // flag got there. See `shouldBootDisarmLiveCrypto` for the exact scope.
+    settings.cryptoAutoTradingEnabledLive = false;
+    try {
+      await saveSettings(username, settings);
+      log.warn('TRA-2351 boot-disarm: cleared an INHERITED live-crypto arm — LIVE_CRYPTO_BOOT_ARM is not set', {
+        username,
+        mode: settings.mode,
+      });
+    } catch (err: unknown) {
+      log.warn('TRA-2351 boot-disarm: failed to persist the cleared live crypto flag (engine still boots disarmed in-memory)', {
         username,
         reason: err instanceof Error ? err.message : String(err),
       });

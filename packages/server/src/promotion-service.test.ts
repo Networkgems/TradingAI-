@@ -524,6 +524,208 @@ describe('TRA-2343 promotion gate — the roster delta is gated, not just the ax
   });
 });
 
+// TRA-2351 — THE THIRD PATH. Independent QA grading of the TRA-2343 fix found a
+// bypass that neither TRA-2343 nor TRA-2342 closes, because it defeats the two
+// controls in different places:
+//
+//   `POST /api/crypto/trading/start` takes its mode from the REQUEST BODY
+//   (`resolveTradingMode`, index.ts:8488-8495 — a body `mode` wins outright over
+//   `settings.mode`), but composes the snapshot it hands the gate as
+//   `{ ...settings, cryptoAutoTradingEnabledLive: true }` (index.ts:9346-9351),
+//   which carries the PERSISTED `mode`. So when the operator is on `demo` and the
+//   request says `{"mode":"live"}`, the gate is asked to authorize a LIVE action
+//   against a snapshot that says DEMO — and `realCapitalIntentAxes` short-circuits
+//   on `s.mode !== 'live'` and returns all-false. Every downstream term collapses:
+//   `cryptoEscalates` false, both rosters empty, `emptyRosterAxes` empty ⇒ the
+//   TRA-2343 roster delta is empty ⇒ ALLOWED. Not "graded and passed" — never
+//   graded, and it does not even emit the TRA-532 refusal log.
+//
+//   The route then runs `setAutoTrading(true, 'live')` and PERSISTS
+//   `cryptoAutoTradingEnabledLive: true` (index.ts:9389-9390).
+//
+// This does not trade on its own — `doTick` gates the live branch on
+// `this.mode === 'live' && this.liveAccount` (crypto-engine.ts:1803), so step 1
+// ARMS, it does not FIRE. The harm is that the arm is durable and its remaining
+// condition is the one step already on the go-live calendar:
+//
+//   Step 2. `TRADIER_ENV=production` (TRA-1648's ratified arming step). The equity
+//   boot-arm force-writes `settings.mode = 'live'` (user-context.ts:749), and the
+//   crypto boot-arm below it is guarded by
+//   `settings.cryptoAutoTradingEnabledLive !== true && shouldBootArmLiveCrypto(...)`
+//   (user-context.ts:801) — a flag ALREADY `true` short-circuits on the FIRST
+//   conjunct, so TRA-2342's `LIVE_CRYPTO_BOOT_ARM` interlock is never consulted.
+//   That interlock stops a boot from CREATING the arm; it does not stop a boot
+//   from INHERITING one. The engine is then constructed live + armed on the
+//   operator's `activeStrategyPreset` with zero promotion evidence.
+//
+// The tests below FAILED at f2f6360 and PASS from the fix, which is a NAMED entry
+// point — `evaluateLiveCryptoStartGate` — rather than a new rule inside the gate.
+//
+// WHY THE REMEDY IS AT THE CALL SITE, NOT IN `realCapitalIntentAxes`. The obvious
+// alternative is to make the crypto axis mode-blind (grade a persisted
+// `cryptoAutoTradingEnabledLive: true` even under `mode: 'demo'`, since the boot
+// path force-writes the mode anyway). That is WRONG, and dangerously so: it also
+// lifts the axis on the PREVIOUS snapshot, so bqb1's real shape — an arm CREATED
+// ungated by the TRA-1340 boot path, sitting under `mode: demo` — would read as
+// "already exposed", the TRA-1590 grandfathering would swallow it, and the
+// operator's demo → live PUT would go from REFUSED to ALLOWED. The mode-gated
+// axis is what makes that flip the graded moment. Grandfathering is only sound
+// over exposure that was itself graded; the boot path is ungated by design, so
+// the last line of defence must stay where it is. Do not "simplify" this by
+// deleting the intent argument.
+describe('TRA-2351 — a LIVE crypto start against a DEMO-mode snapshot must not be ungated', () => {
+  const FLAG = 'PROMOTION_GATE_ENV_AWARE';
+  const ENV_USER = 'env-aware-user'; // no promoted strategies
+
+  /**
+   * The operator's PERSISTED settings — what `POST /api/crypto/trading/start`
+   * reads via `getSettings(username)` before it composes anything. `mode` is
+   * `demo` and the live arm is OFF: this is the pre-request state, and the
+   * request body is what says `{"mode":"live"}`.
+   */
+  const persistedDemoOperator = (preset: string): AccountSettings =>
+    ({
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: false,
+      activeStrategyPreset: preset,
+      liveTradierEnvOptions: 'sandbox',
+    } as AccountSettings);
+
+  it('refuses the live crypto start that arms an UNGRADED roster (bqb1 preset crypto_core)', async () => {
+    // `crypto_core` is the operator's live preset on bqb1 (TRA-2336). `dca` has
+    // no promotion evidence for ENV_USER, so this must block — it is the same
+    // roster TRA-2343 SAVE B correctly refuses when the snapshot says `live`.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveCryptoStartGate(
+      ENV_USER,
+      persistedDemoOperator('crypto_core'),
+    );
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toContain('dca');
+  });
+
+  it('refuses the live crypto start onto the EMPTY no_trade roster too', async () => {
+    // The TRA-2343 empty-roster hardening is scoped to an ESCALATING axis, and
+    // no axis escalated when the snapshot read `demo` — so the stepping stone
+    // that hardening was written to remove was reachable again on this route.
+    // The declared intent makes the crypto axis escalate, so it fires.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveCryptoStartGate(
+      ENV_USER,
+      persistedDemoOperator('no_trade'),
+    );
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/EMPTY strategy roster/i);
+  });
+
+  it('still refuses when the operator is ALREADY persisted live (the pre-fix-safe case)', async () => {
+    // The one input the TRA-2343 suite pinned. It must keep working — the fix
+    // must not have moved the safe case, only added the unsafe one.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveCryptoStartGate(ENV_USER, {
+      ...persistedDemoOperator('crypto_core'),
+      mode: 'live',
+    } as AccountSettings);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blocked.map(b => b.strategyId)).toContain('dca');
+  });
+
+  it('THE REGRESSION GUARD — the raw snapshot the route USED to build is still allowed', async () => {
+    // This is the defect, reproduced exactly: `{ ...settings, cryptoAutoTradingEnabledLive: true }`
+    // carrying the PERSISTED `demo` mode. The general gate answers it correctly
+    // (nothing in that state puts capital at risk) — which is precisely why the
+    // route could not be fixed by "passing a better snapshot" and why the fix is
+    // a named entry point instead. If someone reverts the route to compose its
+    // own snapshot, THIS is the value they will get back.
+    delete process.env[FLAG];
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, {
+      ...persistedDemoOperator('crypto_core'),
+      cryptoAutoTradingEnabledLive: true,
+    } as AccountSettings);
+    expect(gate.allowed).toBe(true);
+  });
+
+  it('the declared intent lifts ONLY the crypto axis — options production is untouched', async () => {
+    // With PROMOTION_GATE_ENV_AWARE armed, a snapshot routing options to Tradier
+    // PRODUCTION would normally be graded on OPTIONS_PRODUCTION_STRATEGIES. A
+    // crypto start must not drag that axis in and refuse for an unrelated
+    // reason, so the blocked set names the crypto roster only. (Lifting the whole
+    // snapshot to `mode: 'live'` instead of the single axis would fail this.)
+    process.env[FLAG] = '1';
+    try {
+      const gate = await svc.evaluateLiveCryptoStartGate(ENV_USER, {
+        ...persistedDemoOperator('crypto_core'),
+        liveTradierEnvOptions: 'production',
+      } as AccountSettings);
+      expect(gate.allowed).toBe(false);
+      expect(gate.blocked.map(b => b.strategyId)).toEqual(['dca']);
+    } finally {
+      delete process.env[FLAG];
+    }
+  });
+
+  // ── Direction 2: what the TRA-2343 empty-roster hardening NEWLY refuses ──────
+  // These two PASS at f2f6360 and are pinned here as the other-direction record.
+  // The hardening does change one previously-allowed save: an operator carrying a
+  // stale `cryptoAutoTradingEnabledLive: true` with a `no_trade` preset who flips
+  // `mode` to live (the Options+Stock go-live step, TRA-1575) now gets a 422 where
+  // pre-fix they got a 200. That is the SAVE A hazard, so refusing it is correct —
+  // and it is NOT a TRA-1590 deadlock, because clearing the crypto flag in the
+  // same PUT is a de-escalation and still saves. It is not currently on bqb1's
+  // path (TRA-2336 disarmed the flag on 07-25 and the preset is `crypto_core`),
+  // but the refusal TEXT names the wrong remedy for this operator — see TRA-2351.
+  it('DIRECTION 2 — a live-mode flip carrying a STALE crypto arm + no_trade is newly REFUSED', async () => {
+    delete process.env[FLAG];
+    const previous = {
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: true, // stale arm, inert while mode is demo
+      activeStrategyPreset: 'no_trade',
+    } as AccountSettings;
+    const updated = { ...previous, mode: 'live' } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(false);
+    // The message tells them to arm the axis WITH promoted strategies — but an
+    // Options+Stock operator does not want live crypto at all; their remedy is
+    // the next test. The reason text does not mention it.
+    expect(gate.blocked[0]?.reasons.join(' ')).toMatch(/EMPTY strategy roster/i);
+  });
+
+  it('DIRECTION 2 — …and the escape hatch works: clearing the crypto arm in the same PUT saves', async () => {
+    // Proves the above is friction, not a deadlock: dropping the stale arm is a
+    // de-escalation, so the go-live mode flip still lands in one save.
+    delete process.env[FLAG];
+    const previous = {
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: true,
+      activeStrategyPreset: 'no_trade',
+    } as AccountSettings;
+    const updated = {
+      ...previous,
+      mode: 'live',
+      cryptoAutoTradingEnabledLive: false,
+    } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, updated, previous);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+
+  it('BOTH DIRECTIONS — a DEMO crypto start is still never gated', async () => {
+    // The remedy must not gate demo starts. `POST /api/crypto/trading/start`
+    // with mode `demo` never enters the gate branch at all (index.ts:9358), and
+    // a snapshot with live crypto OFF must stay allowed regardless.
+    delete process.env[FLAG];
+    const demoStart = {
+      mode: 'demo',
+      cryptoAutoTradingEnabledLive: false,
+      cryptoAutoTradingEnabledDemo: true,
+      activeStrategyPreset: 'crypto_core',
+    } as AccountSettings;
+    const gate = await svc.evaluateLiveTransitionGate(ENV_USER, demoStart);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blocked).toHaveLength(0);
+  });
+});
+
 // TRA-1461 — a hold-mode DCA accumulation clears Stage 2 with ZERO closed
 // trades, proving the old structural blocker (paper leg required closed demo
 // trades a hold-mode strategy never produces) is gone — while still requiring
