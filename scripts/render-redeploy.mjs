@@ -48,6 +48,9 @@
 //                       from --force-rth-override on purpose: an embargo is a specific
 //                       board-ratified hold on a named day, so authorisation to break
 //                       the routine freeze is not authorisation to break that hold.
+//   --force-commit-hold-override="reason"  deploy a HELD COMMIT anyway. Separate again:
+//                       the other two gates are about WHEN you deploy, this one is about
+//                       WHAT you deploy, and a clear calendar says nothing about it.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -55,10 +58,14 @@
 //   2  usage / auth / API error
 //   4  REFUSED — RTH freeze in effect on the soak host and no override given
 //   5  REFUSED — a dated embargo covers this instant and no override given
+//   6  REFUSED — the deploy would carry a HELD COMMIT, or it cannot be proven not to
 
-import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const API = 'https://api.render.com/v1';
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const API_KEY = process.env.RENDER_API_KEY;
 const SERVICE_ID_ENV = process.env.RENDER_SERVICE_ID;
@@ -146,6 +153,122 @@ export const EMBARGOES = [
 // This row is spent at 21:00Z on 2026-07-27. Grades are published from the reads above, so if you
 // need a deploy that evening, take it after 21:00Z rather than overriding.
 
+// ── Held commits ──────────────────────────────────────────────────────────────
+// The two gates above answer "may I deploy NOW?". Neither can answer "may I deploy THIS?" —
+// and some holds are on the CONTENT, not the calendar. A commit that changes an instrument
+// while a measurement is pending must not ship, and the window in which it must not ship
+// starts the moment it lands on main, not when the embargo opens.
+//
+// Before this table, such a hold was carried by a ⚠ line in the commit message and a
+// paragraph of comment in this file. Neither executes. `git push` is not a deploy here
+// (autoDeploy: no), so landing is safe — but the very next routine deploy takes the branch
+// TIP, and `--commit` is OPTIONAL, so a caller who never typed a sha ships whatever landed
+// last. The gate printed `commit : (service branch tip)` for that, which reads identically
+// whether the tip is benign or is the held commit.
+//
+// SELF-EXPIRING, like EMBARGOES: a row whose `until` is past is inert. Leave expired rows
+// in place as a record; delete them when the ticket closes.
+export const COMMIT_HOLDS = [
+  {
+    commit: '204f2984896d62447d6a480c7f7c346b5071a5f6',
+    until: '2026-07-27T21:00:00Z',
+    ticket: 'TRA-2355 (held for TRA-2306)',
+    why:
+      'TRA-2355 gives the cost-aware-gate spread counters an ACCOUNT axis — it re-keys the ' +
+      'very tally TRA-2306 grades at 20:20Z Mon 2026-07-27, the first session under the ' +
+      'TRA-2295 ceiling. Its own commit message says DO NOT DEPLOY before that grade ' +
+      'publishes. Shipping it early does not merely add a field: pre-TRA-2355 records ' +
+      'hydrate as `unattributed`, never `desk`, so the desk cell reads n=0 for the whole ' +
+      'retained history and the grade lands NOT GRADED YET / VOID on an instrument that ' +
+      'changed under it. Deploy any commit that does NOT carry it, or wait until 21:00Z.',
+  },
+];
+
+// Does a deploy of `target` carry a held commit? `target` is resolved by the caller (see
+// resolveTarget) and injected so this predicate stays pure and testable:
+//   { sha, source, error?, carries(heldSha) -> true | false | null }
+// `carries` returns null for "cannot tell", which is NOT the same as false.
+//
+// FAILS CLOSED on purpose, in the same spirit as check:deploy-drift's BLIND: an
+// unresolvable tip or an ungrepable object yields REFUSE, never PROCEED. A hold that
+// silently degrades to "allowed" the moment the network hiccups is not a hold.
+export function commitHoldState(now, target, table = COMMIT_HOLDS) {
+  const t = now.getTime();
+  const active = table.filter(h => t < Date.parse(h.until));
+  if (active.length === 0) return { verdict: 'CLEAR', hold: null, active, target, why: null };
+
+  if (!target || !target.sha) {
+    return {
+      verdict: 'BLIND',
+      hold: active[0],
+      active,
+      target,
+      why: target?.error ?? 'the target commit could not be resolved',
+    };
+  }
+
+  for (const hold of active) {
+    const carries = target.carries(hold.commit);
+    if (carries === null) {
+      return {
+        verdict: 'BLIND',
+        hold,
+        active,
+        target,
+        why: `cannot test whether ${target.sha.slice(0, 12)} carries ${hold.commit.slice(0, 12)} (object missing from this checkout, or git failed)`,
+      };
+    }
+    if (carries) return { verdict: 'CARRIES', hold, active, target, why: null };
+  }
+  return { verdict: 'CLEAR', hold: null, active, target, why: null };
+}
+
+function git(args, timeout = 20000) {
+  return spawnSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout });
+}
+
+function gitHasCommit(sha) {
+  return git(['cat-file', '-e', `${sha}^{commit}`]).status === 0;
+}
+
+// true = target carries held · false = it does not · null = cannot tell.
+// `merge-base --is-ancestor` exits 0/1 for the real answers and something else for an
+// error, so anything but 0/1 must NOT be collapsed into "not an ancestor".
+function gitCarries(heldSha, targetSha) {
+  if (!gitHasCommit(heldSha) || !gitHasCommit(targetSha)) return null;
+  const r = git(['merge-base', '--is-ancestor', heldSha, targetSha]);
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
+  return null;
+}
+
+// What Render will actually build. With --commit that is the sha given; without it Render
+// takes the tip of the service's branch, so the guard has to go and look — the whole point
+// is that the caller who omitted --commit is precisely the one who does not know what ships.
+export function resolveTarget(branch, requestedCommit) {
+  if (requestedCommit) {
+    return {
+      sha: requestedCommit,
+      source: '--commit',
+      carries: held => gitCarries(held, requestedCommit),
+    };
+  }
+  const ref = `refs/heads/${branch}`;
+  const r = git(['ls-remote', 'origin', ref], 30000);
+  const sha = r.status === 0 ? (r.stdout ?? '').trim().split(/\s+/)[0] : null;
+  if (!sha) {
+    return {
+      sha: null,
+      source: `origin/${branch} tip`,
+      error:
+        `git ls-remote origin ${ref} failed (status ${r.status}${r.error ? `, ${r.error.message}` : ''}) — ` +
+        'cannot tell what the branch tip is, so cannot tell whether it carries a held commit',
+      carries: () => null,
+    };
+  }
+  return { sha, source: `origin/${branch} tip (no --commit given)`, carries: held => gitCarries(held, sha) };
+}
+
 const argv = process.argv.slice(2);
 const has = flag => argv.includes(flag);
 const valOf = name => {
@@ -161,6 +284,10 @@ const HAS_OVERRIDE = argv.some(a => a === '--force-rth-override' || a.startsWith
 const EMBARGO_OVERRIDE_REASON = valOf('--force-embargo-override');
 const HAS_EMBARGO_OVERRIDE = argv.some(
   a => a === '--force-embargo-override' || a.startsWith('--force-embargo-override='),
+);
+const COMMIT_HOLD_OVERRIDE_REASON = valOf('--force-commit-hold-override');
+const HAS_COMMIT_HOLD_OVERRIDE = argv.some(
+  a => a === '--force-commit-hold-override' || a.startsWith('--force-commit-hold-override='),
 );
 
 function fail(code, msg) {
@@ -225,6 +352,44 @@ async function main() {
   const { frozen } = freezeState(now);
   const { active: embargo, upcoming, minsToUpcoming } = embargoState(now);
   const nowZ = now.toISOString().slice(11, 16) + 'Z';
+
+  // Content gate BEFORE the two time gates: it is the one that can fire while the calendar
+  // is wide open, and its remedy is different — deploy a different COMMIT, not at a
+  // different HOUR. Reporting "outside freeze, no embargo" first would answer a question
+  // the caller did not ask.
+  const target = resolveTarget(service.branch ?? 'main', COMMIT);
+  const holdCheck = commitHoldState(now, target);
+
+  if (isSoakHost && holdCheck.verdict !== 'CLEAR' && !HAS_COMMIT_HOLD_OVERRIDE) {
+    const h = holdCheck.hold;
+    console.error(
+      `[render-redeploy] REFUSED: this deploy ${
+        holdCheck.verdict === 'CARRIES' ? 'CARRIES A HELD COMMIT' : 'CANNOT BE PROVEN CLEAR of a held commit'
+      } — ${h.ticket}.\n` +
+        `  held    : ${h.commit}\n` +
+        `  target  : ${target.sha ?? '(unresolved)'}  [${target.source}]\n` +
+        (holdCheck.why ? `  blind   : ${holdCheck.why}\n` : '') +
+        `  ${h.why}\n` +
+        `  The hold expires ${h.until}. Deploy a commit that predates the held one\n` +
+        `  (--commit=<sha>), or wait. If it is truly urgent, re-run with\n` +
+        `  --force-commit-hold-override="why this cannot wait" (the reason is recorded).\n` +
+        `  NOTE: a commit hold, like the embargo, covers DEPLOYS ONLY. An env/settings write\n` +
+        `  redeploys the service from its branch tip unguarded (trigger: service_updated,\n` +
+        `  TRA-2186) and would ship the held commit anyway — hold those by hand.`,
+    );
+    process.exit(6);
+  }
+
+  if (isSoakHost && holdCheck.verdict !== 'CLEAR' && HAS_COMMIT_HOLD_OVERRIDE) {
+    if (!COMMIT_HOLD_OVERRIDE_REASON || !COMMIT_HOLD_OVERRIDE_REASON.trim()) {
+      fail(2, '--force-commit-hold-override requires a non-empty reason, e.g. --force-commit-hold-override="P0 hotfix".');
+    }
+    console.error(
+      `[render-redeploy] WARNING: shipping past the ${holdCheck.hold.ticket} commit hold at ${nowZ}. ` +
+        `Reason: ${COMMIT_HOLD_OVERRIDE_REASON}. The measurement that hold protects is now suspect — ` +
+        `tell the ticket owner BEFORE its grade publishes, not after.`,
+    );
+  }
 
   if (isSoakHost && embargo && !HAS_EMBARGO_OVERRIDE) {
     console.error(
@@ -293,7 +458,20 @@ async function main() {
         `~${DEPLOY_LEAD_MIN} min from now. If this can wait, wait for ${upcoming.to}.`,
     );
   }
-  console.log(`commit  : ${COMMIT ?? '(service branch tip)'}${CLEAR_CACHE ? ' + clear-cache' : ''}`);
+  // Name the RESOLVED sha, never just "(service branch tip)" — that string reads identically
+  // whether the tip is the commit you meant or the one somebody landed ten minutes ago.
+  console.log(
+    `commit  : ${target.sha ?? '(unresolved)'} [${target.source}]${CLEAR_CACHE ? ' + clear-cache' : ''}`,
+  );
+  console.log(
+    `holds   : ${
+      holdCheck.active.length === 0
+        ? 'none active'
+        : holdCheck.verdict === 'CLEAR'
+          ? `${holdCheck.active.length} active (${holdCheck.active.map(h => h.ticket).join(', ')}) — target carries none of them`
+          : `${holdCheck.verdict} ${holdCheck.hold.ticket} — OVERRIDDEN`
+    }`,
+  );
   console.log('note    : this gate sees DEPLOYS only — env/settings writes redeploy the box unguarded (TRA-2186).');
 
   if (DRY_RUN) {
