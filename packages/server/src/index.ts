@@ -247,7 +247,18 @@ import { scanStocksMarket, scanCryptoMarket } from './market-scanner.js';
 import { runPremarketForAllUsers } from './premarket-watchlist.js';
 import { runMorningBriefForAllUsers, buildBriefForUser, buildMacroSection } from './morning-brief.js';
 // TRA-2252 — scheduled P&L + trade-summary report emails.
-import { runScheduledReports, type ReportUser } from './scheduled-report.js';
+// TRA-2284 — the pure builders are also driven by the on-demand self-test route
+// below, which is the failing state the 21:00-ET-only path never had.
+import {
+  runScheduledReports,
+  buildPeriodReport,
+  isPeriodEnd,
+  periodStartFor,
+  aggregatePeriod,
+  periodLabel,
+  type ReportUser,
+  type ActiveReportCadence,
+} from './scheduled-report.js';
 // TRA-851 — user-configurable natural-language routines.
 import {
   loadRoutineStore,
@@ -450,6 +461,7 @@ import {
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
+  runAlertingSelfTest,
 } from './observability/index.js';
 // TRA-1684 — from the module, not the barrel: the barrel re-export dragged the crypto
 // route graph behind every logger import and manufactured the TRA-1674 cycle.
@@ -568,6 +580,8 @@ import {
   type AccountMode,
   ALERT_CHANNELS,
   resolveAlertPreferences,
+  REPORT_CADENCES,
+  type ReportCadence,
   type AlertChannel,
   type AlertPreferences,
   type PositionAdvisorReadout,
@@ -3784,6 +3798,45 @@ app.get('/api/health/alerting', (_req, res) => {
     errorCount15m: getErrorCountSince(),
     time: new Date().toISOString(),
   });
+});
+
+// TRA-2284 — prove the ops-alert PUSH path actually delivers.
+//
+// `/api/health/alerting` above reports `channels.email.configured: true` from
+// `isSmtpConfigured() && recipientCount > 0` — CREDENTIAL PRESENCE. It reads
+// identically on a box that has never dispatched an alert and on one that mails
+// reliably, and the real dispatch path (`void deliver(...)`) discards its own
+// send result by design so a mail outage cannot stall a monitor tick. So
+// `configured: true` was the only signal ops had, and it is not evidence.
+//
+// This route awaits the send and reports the transport verdict: 200 with
+// `emailDelivered: true`, or 502 carrying the SMTP error. The alert lands under
+// its own `self-test` key — never mistakable for an incident in the inbox, and
+// it does not consume a real key's throttle. Auth-gated (not admin: bqb1 has no
+// working admin auth) and throttled to one probe per 5 min, so a signed-up user
+// cannot flood ALERT_EMAIL.
+app.post('/api/health/alerting/self-test', requireAuth, async (_req, res) => {
+  const username = res.locals['authUser'] as string;
+  try {
+    const result = await runAlertingSelfTest(username);
+    if (!result.fired) {
+      res.status(429).json({ ok: false, code: 'throttled', ...result });
+      return;
+    }
+    if (!result.emailDelivered) {
+      res.status(502).json({ ok: false, code: 'send_failed', ...result });
+      return;
+    }
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    // Unreachable: runAlertingSelfTest never throws. Belt-and-suspenders so a
+    // probe of the alerting path can never itself become a captured exception.
+    log.error('alerting self-test failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'alerting self-test failed' });
+  }
 });
 
 // TRA-398 — client-side error sink. The desktop/mobile React error boundary
@@ -8054,6 +8107,213 @@ app.post('/api/notifications/test', requireAuth, async (req, res) => {
       code: 'send_failed',
       error: `Test send failed: ${err instanceof Error ? err.message : String(err)}`,
     });
+  }
+});
+
+// TRA-2284 — send the caller their OWN scheduled P&L report, on demand.
+//
+// The TRA-2252 report path only ever fires from the 21:00 ET archive hook, and
+// `reportCadence` defaults to `off`. On a fleet with nobody opted in the feature
+// emits nothing — which is BIT-IDENTICAL to a broken scheduler, a dead renderer
+// or a dead transport. There was no failing state to observe, so the path stayed
+// unverified after deploy. This route is that failing state.
+//
+// It reuses the real builders (`isPeriodEnd` / `aggregatePeriod` /
+// `buildPeriodReport`) over the caller's real booked snapshots, so a green here
+// exercises the same aggregation the scheduled run does. Two deliberate limits
+// keep it honest:
+//
+//   • It NEVER fabricates stats. An empty window still skips — reported as a 409
+//     `empty_period` naming the window and the in-range snapshot count, because
+//     `scheduled-report.ts` skips an idle book and that silence is exactly what
+//     a broken path looks like. Distinguishing the two is the point.
+//   • `force` relaxes ONLY the calendar boundary (`isPeriodEnd`), so an operator
+//     testing on a Tuesday doesn't have to wait for Sunday to test `weekly`.
+//
+// Unlike `POST /api/notifications/test` (one channel, sample event, routing
+// bypassed) this awaits a per-channel verdict for the REAL event through the
+// REAL routing matrix, and reports whether the scheduled path WOULD have
+// delivered — quiet hours included — separately from what this probe sent.
+app.post('/api/notifications/report/test', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const body = (req.body ?? {}) as {
+    cadence?: string;
+    asOfDate?: string;
+    force?: boolean;
+  };
+  try {
+    const settings = await loadSettings(username);
+    const prefs = resolveAlertPreferences(settings);
+
+    // Cadence: explicit override, else the user's stored opt-in. `off` with no
+    // override is a 409, not a silent no-op — the whole failure mode here is a
+    // path that returns "fine" while emitting nothing.
+    const requested = body.cadence ?? prefs.reportCadence;
+    if (requested === 'off') {
+      res.status(409).json({
+        ok: false,
+        code: 'cadence_off',
+        error:
+          'reportCadence is off — pass an explicit cadence to test, or opt in via PUT /api/account/notifications.',
+      });
+      return;
+    }
+    if (!REPORT_CADENCES.includes(requested as ReportCadence)) {
+      res.status(400).json({
+        ok: false,
+        error: `cadence must be one of ${REPORT_CADENCES.join(', ')}`,
+      });
+      return;
+    }
+    const cadence = requested as ActiveReportCadence;
+
+    const asOfDate = body.asOfDate ?? etDateString();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)) {
+      res.status(400).json({ ok: false, error: 'asOfDate must be YYYY-MM-DD' });
+      return;
+    }
+
+    const ctx = await userCtx(res);
+    const snapshots = [...ctx.tracker.getSnapshots(), ...ctx.cryptoTracker.getSnapshots()];
+    const periodStart = periodStartFor(cadence, asOfDate);
+    const snapshotsInWindow = snapshots.filter(
+      s => s.date >= periodStart && s.date <= asOfDate,
+    ).length;
+    const atPeriodEnd = isPeriodEnd(cadence, asOfDate);
+    const force = body.force === true;
+
+    // Diagnostics returned on EVERY outcome, so a skip is as legible as a send.
+    const window = {
+      cadence,
+      asOfDate,
+      periodStart,
+      periodLabel: periodLabel(cadence, periodStart, asOfDate),
+      atPeriodEnd,
+      forced: force,
+      snapshotsTotal: snapshots.length,
+      snapshotsInWindow,
+    };
+
+    if (!atPeriodEnd && !force) {
+      res.status(409).json({
+        ok: false,
+        code: 'not_period_end',
+        error: `${asOfDate} does not close the ${cadence} period — the scheduled run would emit nothing. Retry with {"force":true} to test anyway.`,
+        window,
+      });
+      return;
+    }
+
+    // Build through the real path when we're genuinely at a boundary; when
+    // forcing, assemble the same event around `aggregatePeriod` so the ONLY
+    // relaxed check is the calendar one. Stats are never synthesized.
+    const event = atPeriodEnd
+      ? buildPeriodReport(username, cadence, snapshots, asOfDate, Date.now())
+      : (() => {
+          const stats = aggregatePeriod(snapshots, periodStart, asOfDate);
+          if (!stats) return null;
+          return {
+            kind: 'report' as const,
+            username,
+            timestamp: Date.now(),
+            cadence,
+            periodStart,
+            periodEnd: asOfDate,
+            periodLabel: window.periodLabel,
+            stats,
+          };
+        })();
+
+    if (!event) {
+      res.status(409).json({
+        ok: false,
+        code: 'empty_period',
+        error:
+          snapshotsInWindow === 0
+            ? 'No booked daily snapshot in the window — nothing to report. Book a snapshot (POST /api/reports/generate) and retry.'
+            : 'Every snapshot in the window is flat with zero trades — the scheduled run skips an idle book by design.',
+        window,
+      });
+      return;
+    }
+
+    // Routing: the same three conditions `NotificationDispatcher.fanOut` applies.
+    const eligible = ALERT_CHANNELS.filter(ch => {
+      if (!prefs.events.report[ch]) return false;
+      if (!prefs.channels[ch]?.enabled) return false;
+      const adapter = channelAdapters[ch as keyof typeof channelAdapters];
+      return !!adapter && adapter.isConfigured(prefs);
+    });
+    // Quiet hours suppress the `report` class on the scheduled path. Report it
+    // rather than silently mirroring it: an operator testing at 23:00 needs to
+    // see the mail AND be told the 21:00 run would have been suppressed.
+    const quietHoursActive = notificationDispatcher.inQuietHours(prefs.quietHours, Date.now());
+
+    if (eligible.length === 0) {
+      res.status(409).json({
+        ok: false,
+        code: 'no_eligible_channel',
+        error:
+          'No channel is both routed for the report class and configured — the scheduled run would emit nothing.',
+        window,
+        routing: { eligible, quietHoursActive, wouldScheduledDeliver: false },
+      });
+      return;
+    }
+
+    const deliveries = await Promise.all(
+      eligible.map(async ch => {
+        const adapter = channelAdapters[ch as keyof typeof channelAdapters]!;
+        try {
+          await adapter.send(event, prefs);
+          return { channel: ch, ok: true as const };
+        } catch (err) {
+          return {
+            channel: ch,
+            ok: false as const,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }),
+    );
+    const delivered = deliveries.filter(d => d.ok).map(d => d.channel);
+
+    log.info('TRA-2284 on-demand report self-test', {
+      username,
+      cadence,
+      asOfDate,
+      forced: force,
+      delivered,
+      failed: deliveries.filter(d => !d.ok).map(d => d.channel),
+    });
+
+    const payload = {
+      window,
+      routing: {
+        eligible,
+        quietHoursActive,
+        // The scheduled 21:00 run also requires the real calendar boundary.
+        wouldScheduledDeliver: atPeriodEnd && !quietHoursActive && eligible.length > 0,
+      },
+      report: {
+        periodLabel: event.periodLabel,
+        totalPnl: event.stats.totalPnl,
+        totalTrades: event.stats.totalTrades,
+        tradingDays: event.stats.tradingDays,
+      },
+      deliveries,
+    };
+    if (delivered.length === 0) {
+      res.status(502).json({ ok: false, code: 'send_failed', ...payload });
+      return;
+    }
+    res.json({ ok: true, delivered, ...payload });
+  } catch (err) {
+    log.error('POST /api/notifications/report/test failed', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ ok: false, error: 'report self-test failed' });
   }
 });
 

@@ -37,9 +37,17 @@ export {
   checkTradeVolume,
   checkErrorSpike,
   checkStaleState,
+  runAlertingSelfTest,
   __resetAlertsForTest,
 } from './alerts.js';
-export type { Alert, AlertKey, AlertSeverity, DiskReading, AlertingPosture } from './alerts.js';
+export type {
+  Alert,
+  AlertKey,
+  AlertSeverity,
+  DiskReading,
+  AlertingPosture,
+  AlertSelfTestResult,
+} from './alerts.js';
 
 // TRA-528 — live reliability + observability dashboard.
 export { resolveBuildInfo, computeBuildInfo, interpretGitHead } from './build-info.js';

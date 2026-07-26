@@ -25,7 +25,11 @@ export type AlertKey =
   | 'restart-storm'
   | 'trade-volume-zero'
   | 'error-spike'
-  | 'stale-state';
+  | 'stale-state'
+  // TRA-2284 — operator-triggered end-to-end probe of the alert PUSH path. Its
+  // own key on purpose: it must never be mistaken for a real incident in the
+  // ring/inbox, and it must not consume a real key's throttle window.
+  | 'self-test';
 
 export type AlertSeverity = 'warning' | 'critical';
 
@@ -173,6 +177,134 @@ export function dispatchAlert(
     );
   }
   return true;
+}
+
+/**
+ * TRA-2284 — result of the operator-triggered alerting self-test.
+ *
+ * Every field exists to separate a state that `dispatchAlert` deliberately
+ * collapses. The real dispatch path is fire-and-forget (`void deliver(...)`) so
+ * that a mail outage can never stall a monitor tick — which also means a caller
+ * learns nothing about delivery. `/api/health/alerting` has the same blind spot
+ * in the other direction: it reports `channels.email.configured: true` from
+ * `isSmtpConfigured() && recipientCount > 0`, i.e. PRESENCE of credentials, and
+ * reads identically whether the transport has ever accepted a message or not.
+ * This is the missing failing state.
+ */
+export interface AlertSelfTestResult {
+  /** False ⇒ throttled by a recent self-test; nothing was recorded or sent. */
+  fired: boolean;
+  /** Ms until the next self-test is allowed (0 when `fired`). */
+  throttledForMs: number;
+  /** Addresses parsed out of `ALERT_EMAIL`. Zero ⇒ nothing could be mailed. */
+  recipientCount: number;
+  /** Whether the SMTP transport credentials exist at all. */
+  smtpConfigured: boolean;
+  /**
+   * True ONLY when the transport actually accepted the message. `false` with no
+   * `error` means the send was never attempted (no recipients / no SMTP) — the
+   * distinction `sendOpsAlertEmail`'s silent early return erases.
+   */
+  emailDelivered: boolean;
+  webhookConfigured: boolean;
+  error?: string;
+  /** The alert as recorded into the ring / `alerts.jsonl` (absent when throttled). */
+  alert?: Alert;
+}
+
+/**
+ * Self-test throttle. Deliberately shorter than `ALERT_THROTTLE_MS` (30 min):
+ * the abuse ceiling that matters is "one authenticated user cannot flood
+ * `ALERT_EMAIL`", and 5 minutes holds that while leaving the probe usable during
+ * an incident or a post-deploy check.
+ */
+const SELF_TEST_THROTTLE_MS = Number(process.env['ALERT_SELF_TEST_THROTTLE_MS'] ?? 5 * 60_000);
+
+/**
+ * TRA-2284 — fire a clearly-labelled alert through the REAL push path and AWAIT
+ * the result, so an operator can prove the ops-alert channel delivers rather
+ * than inferring it from configuration.
+ *
+ * Same recording as a real alert (error log + `alerts.jsonl` + the ring read by
+ * `/api/health/alerts` and counted by `/api/health/alerting`), so a successful
+ * probe also leaves a durable, no-auth-readable trace: `recent.newestKey`
+ * becomes `self-test`. Uses the `self-test` key, so it neither masquerades as an
+ * incident nor burns a real key's throttle window.
+ *
+ * Never throws — a transport failure comes back as `emailDelivered: false` plus
+ * `error`, which the caller surfaces as a 502.
+ */
+export async function runAlertingSelfTest(requestedBy: string): Promise<AlertSelfTestResult> {
+  const recipients = (process.env['ALERT_EMAIL'] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const smtpConfigured = isSmtpConfigured();
+  const webhookConfigured = Boolean(ALERT_WEBHOOK_URL);
+
+  const now = Date.now();
+  const last = lastFiredAt.get('self-test') ?? 0;
+  const elapsed = now - last;
+  if (elapsed < SELF_TEST_THROTTLE_MS) {
+    return {
+      fired: false,
+      throttledForMs: SELF_TEST_THROTTLE_MS - elapsed,
+      recipientCount: recipients.length,
+      smtpConfigured,
+      emailDelivered: false,
+      webhookConfigured,
+    };
+  }
+  lastFiredAt.set('self-test', now);
+
+  const alert: Alert = {
+    ts: new Date(now).toISOString(),
+    key: 'self-test',
+    severity: 'warning',
+    message: 'Alerting self-test — NOT an incident. Confirms the ops-alert push path delivers.',
+    detail: { requestedBy, recipientCount: recipients.length, smtpConfigured, webhookConfigured },
+  };
+
+  ring.push(alert);
+  if (ring.length > RING_SIZE) ring.shift();
+  logger.warn(`ALERT ${alert.key}: ${alert.message}`, {
+    module: 'alerts',
+    alertKey: alert.key,
+    severity: alert.severity,
+    requestedBy,
+  });
+  if (process.env['NODE_ENV'] !== 'test') {
+    void appendJsonLine(ALERTS_LOG_FILE, JSON.stringify(alert));
+  }
+
+  const base: AlertSelfTestResult = {
+    fired: true,
+    throttledForMs: 0,
+    recipientCount: recipients.length,
+    smtpConfigured,
+    emailDelivered: false,
+    webhookConfigured,
+    alert,
+  };
+
+  // `sendOpsAlertEmail` returns silently when there is nothing to send to, so
+  // check the preconditions HERE rather than reading a resolved promise as proof.
+  if (recipients.length === 0) {
+    return { ...base, error: 'ALERT_EMAIL is empty — no recipient to mail' };
+  }
+  if (!smtpConfigured) {
+    return { ...base, error: 'SMTP is not configured — alert email cannot be sent' };
+  }
+
+  try {
+    await sendOpsAlertEmail(
+      `[TradeAI SELF-TEST] alerting self-test (not an incident)`,
+      `${alert.message}\n\n${JSON.stringify(alert.detail, null, 2)}\n\nat ${alert.ts}`,
+    );
+    return { ...base, emailDelivered: true };
+  } catch (err) {
+    return { ...base, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 // ── individual checks ────────────────────────────────────────────────────────
