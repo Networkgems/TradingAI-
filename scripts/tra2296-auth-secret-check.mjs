@@ -31,6 +31,7 @@
 // prod been clean since the last time it booted").
 
 import { pullBootSet } from './lib/render-boot-set.mjs';
+import { classifyAuthSecret } from './lib/auth-secret-predicate.mjs';
 
 const SRV_DEFAULT = 'srv-d7mb7rr7uimc73ev0chg'; // tradingai-bqb1
 const EPHEMERAL_TEXT = 'ephemeral random secret';
@@ -68,15 +69,29 @@ async function api(path) {
 // ---------------------------------------------------------------- check 1
 // The env var itself. Graded by VALUE LENGTH, never by presence — presence is
 // exactly what was true while prod was broken.
+//
+// ⛔ THE PREDICATE HERE MUST BE THE SERVER'S PREDICATE, CHARACTER FOR CHARACTER.
+// `resolveAuthSecret()` (packages/server/src/auth.ts:34) accepts a value only if
+// `fromEnv.trim().length > 0` — it treats a WHITESPACE-ONLY value as unset and
+// throws in production. This check originally tested `.length === 0`, which is a
+// STRICTLY WEAKER test: AUTH_SECRET=" " has length 1, so the guard reported PASS
+// on a value that makes prod refuse to boot. A guard whose predicate is narrower
+// than the hazard's is not a guard — it is a green light with the failure still
+// live behind it (TRA-2315). Grade with `trim()`, and if auth.ts ever changes how
+// it normalises the value, change this line in the same commit.
 const varsRes = await api(`/services/${SRV}/env-vars?limit=100`);
 if (varsRes.__err) finish(3, `BLIND — cannot read env vars: ${varsRes.__err}`);
 const rows = varsRes.map((x) => x.envVar || x);
 const authVar = rows.find((v) => v.key === 'AUTH_SECRET');
-const authLen = authVar ? (authVar.value ?? '').length : -1;
+const auth = classifyAuthSecret(authVar ? (authVar.value ?? '') : null);
 
-say(`env AUTH_SECRET : ${authVar ? `present, length ${authLen}` : 'ABSENT'}`);
-if (!authVar || authLen === 0) {
-  finish(1, `FAIL — AUTH_SECRET is ${authVar ? 'present but EMPTY' : 'absent'}; prod will re-roll its signing key on every boot.`);
+say(`env AUTH_SECRET : ${auth.detail}${auth.shape === 'SET' ? '' : `  [${auth.shape}]`}`);
+if (!auth.usable) {
+  finish(
+    1,
+    `FAIL — AUTH_SECRET is ${auth.detail}; prod will refuse to boot (NODE_ENV=production) ` +
+      'or re-roll its signing key on every boot.',
+  );
 }
 
 // ---------------------------------------------------------------- window
@@ -137,7 +152,7 @@ const bootSet = await pullBootSet({
   from: since, to, serviceId: SRV, apiKey: API_KEY, ownerId,
 });
 if (bootSet.blind || bootSet.bootCount === null) {
-  finish(3, `BLIND — the boot detector could not read the window (${(bootSet.blindReasons || []).join('; ') || 'unknown'}), so "0 ephemeral warnings" cannot be graded against a known boot count.`, { authSecretLength: authLen, since, to, warnCount });
+  finish(3, `BLIND — the boot detector could not read the window (${(bootSet.blindReasons || []).join('; ') || 'unknown'}), so "0 ephemeral warnings" cannot be graded against a known boot count.`, { authSecretLength: auth.rawLength, since, to, warnCount });
 }
 const boots = bootSet.bootCount;
 say(`boots in window : ${boots}`);
@@ -148,7 +163,7 @@ if (ephem.__err) finish(3, `BLIND — ephemeral-warning query failed: ${ephem.__
 const hits = (ephem.logs || []).length;
 say(`"${EPHEMERAL_TEXT}" hits: ${hits}`);
 
-const common = { authSecretLength: authLen, since, to, warnCount, boots, ephemeralHits: hits };
+const common = { authSecretLength: auth.rawLength, since, to, warnCount, boots, ephemeralHits: hits };
 
 if (hits > 0) {
   const ts = (ephem.logs || []).map((l) => l.timestamp).sort();
@@ -164,4 +179,4 @@ if (warnCount === 0) {
   finish(3, `BLIND — 0 ephemeral warnings, but 0 warn-level lines of ANY kind in this window, so the query cannot be shown to retain level=warn here. The zero is a fact about the log level, not about the world.`, common);
 }
 
-finish(0, `PASS — AUTH_SECRET is ${authLen} chars, prod booted ${boots}× since ${since}, warn-level logging is demonstrably retained (${warnCount} lines), and ZERO ephemeral-secret warnings were emitted. The signing key is stable across restarts.`, common);
+finish(0, `PASS — AUTH_SECRET is ${auth.rawLength} chars, prod booted ${boots}× since ${since}, warn-level logging is demonstrably retained (${warnCount} lines), and ZERO ephemeral-secret warnings were emitted. The signing key is stable across restarts.`, common);
