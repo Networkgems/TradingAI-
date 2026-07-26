@@ -46,6 +46,13 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          # TRA-2372 — full history, NOT the default shallow clone. The monotonicity prover
+          # below is a differential against a PRE-R1 sha (`git show 88a072e:…`), which is
+          # unreachable at fetch-depth 1; the prover fails closed, so a shallow clone would
+          # make that step permanently BLIND rather than quietly wrong. Still: a step that
+          # is always red gets ignored, which is the same end state as no step at all.
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
         with:
@@ -74,6 +81,16 @@ jobs:
 
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
+
+      # TRA-2372 — controls for the TRA-2361 AC5 monotonicity prover. It runs the prover
+      # TWICE and requires exit 0 both times, and requires the temp PRE-R1 gate copy the
+      # prover checks out into `packages/server/src/` to be gone after a forced BLIND.
+      # Both defects it guards against were invisible to a single green run: one made the
+      # prover work exactly once, the other stranded a second copy of the capital gate in
+      # `src/` on the BLIND path — where `pnpm check:stale-js` cannot see it, because that
+      # guard looks for compiler OUTPUT and the strand is a `.ts`.
+      - name: Monotonicity prover controls (TRA-2361 AC5)
+        run: pnpm check:tra2361-prover
 
       - name: Type check
         run: pnpm typecheck

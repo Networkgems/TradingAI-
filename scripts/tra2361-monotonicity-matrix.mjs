@@ -18,15 +18,32 @@
 //     node scripts/tra2361-monotonicity-matrix.mjs
 //     node scripts/tra2361-monotonicity-matrix.mjs --pre-fix=<sha>
 //     node scripts/tra2361-monotonicity-matrix.mjs --keep      # leave the temp file
+//     node scripts/tra2361-monotonicity-matrix.mjs --simulate-blind=after-write|after-build
 //
 //   Exit codes (fails CLOSED — an unrunnable differential is never a pass):
 //     0 OK · 1 FAIL (the property does not hold) · 3 BLIND (could not run it; NOT a pass)
 //
 // ⚠️ THE TEMP FILE IS THE HAZARD THIS SCRIPT MANAGES FOR YOU. A stray `.ts`/`.js` sibling
 // in `packages/server/src/` shadows the real source and turns the suite GREEN AGAINST CODE
-// YOU ARE NOT SHIPPING (repo CLAUDE.md; `pnpm check:stale-js`). The checkout is written
-// under a `_tra2361_` prefix and removed in a `finally`, and the script re-verifies its
-// own cleanup before exiting — including on the failure and BLIND paths.
+// YOU ARE NOT SHIPPING (repo CLAUDE.md; `pnpm check:stale-js` — which only sees compiler
+// OUTPUT, so it is by construction blind to the `.ts` sibling this script creates). The
+// checkout is written under a `_tra2361_` prefix and removed in the `finally` below, which
+// runs on EVERY path — OK, FAIL and BLIND alike — because `blind()` THROWS a sentinel
+// rather than calling `process.exit()`. The only `process.exit()` reachable once the temp
+// file can exist is the LAST statement in this file — the one other exit is argument
+// validation, which runs before anything is written. (TRA-2372: it used to be inside
+// `blind()`, which is called from deep inside the `try`, and
+// `process.exit()` skips `finally`, so every BLIND run stranded a PRE-R1 copy of the
+// capital gate in `src/` — untracked but NOT gitignored, and compiled into `dist/` by the
+// next build. If you add an early exit anywhere above, you reintroduce that bug.)
+//
+// ⚠️ THE BUILD IS `tsc -b --force`, DELIBERATELY. `tsc -b` is incremental and records the
+// temp file in `packages/server/tsconfig.tsbuildinfo`; cleanup deletes the emit but not
+// that record, so the SECOND run and every run after it found the project "up to date",
+// skipped the emit, and exited BLIND. An instrument that works exactly once is a dated
+// green wearing a checker's clothes. `--force` costs ~20s and buys a repeatable answer.
+// The repeat-run and cleanup properties are themselves asserted, in both directions, by
+// `scripts/tra2372-monotonicity-prover-controls.mjs`.
 
 import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
@@ -38,6 +55,23 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..');
 const KEEP = argv.includes('--keep');
 const preFixArg = argv.find((a) => a.startsWith('--pre-fix='));
+
+// Test-only hook. The natural BLIND paths that strand the temp file are the ones that fire
+// AFTER it is written (a failed build, a missing emit), and none of them can be provoked on
+// demand from a clean tree — `--pre-fix=<sha with R1>` blinds on the sanity check BEFORE the
+// write, so it cannot see the cleanup bug at all. Without a hook here, the assertion "the
+// BLIND path cleans up" has no reachable subject and is vacuous. (TRA-2372.)
+const SIMULATE_BLIND_STAGES = ['after-write', 'after-build'];
+const simulateArg = argv.find((a) => a.startsWith('--simulate-blind='));
+const SIMULATE_BLIND = simulateArg ? simulateArg.slice('--simulate-blind='.length) : null;
+if (SIMULATE_BLIND !== null && !SIMULATE_BLIND_STAGES.includes(SIMULATE_BLIND)) {
+  // Fail LOUD, not silently-disabled: a typo'd stage that no-op'd would turn the control
+  // into an assertion about a run that never blinded.
+  console.error(
+    `--simulate-blind=${SIMULATE_BLIND} is not a stage. Use one of: ${SIMULATE_BLIND_STAGES.join(', ')}`,
+  );
+  process.exit(2);
+}
 
 // The commit `live-capital-gate.ts` was last at BEFORE R1 landed (TRA-2353's own commit).
 // Overridable, because the useful question after a few merges is "vs whatever is live",
@@ -56,9 +90,12 @@ const TEMP_ARTIFACTS = [
   join(DIST, '_tra2361_old_gate_TEMP.d.ts.map'),
 ];
 
+// ⚠️ THROWS. Do not "simplify" this back to `process.exit(3)` — that skips the `finally`
+// and strands the temp gate copy in `src/` (TRA-2372). Every call site below already
+// relies on `blind()` not returning, and a throw satisfies that just as well as an exit.
+class BlindError extends Error {}
 const blind = (msg) => {
-  console.error(`\n⚠️  BLIND — ${msg}\n   This is NOT a pass: the monotonicity property is UNPROVEN.`);
-  process.exit(3);
+  throw new BlindError(msg);
 };
 
 function cleanup() {
@@ -98,6 +135,13 @@ try {
   }
 
   if (!existsSync(SRC)) blind(`${SRC} does not exist — run this from the repo`);
+
+  // Clear any artifact a previously-stranded run left behind BEFORE the build. Otherwise a
+  // leftover `dist/_tra2361_old_gate_TEMP.js` from some earlier sha satisfies the emit check
+  // below and the differential silently compares the working tree against THAT, not against
+  // PRE_FIX. After this point, a TEMP artifact in `dist/` can only have come from this run.
+  cleanup();
+
   mkdirSync(dirname(TEMP_TS), { recursive: true });
   writeFileSync(
     TEMP_TS,
@@ -108,21 +152,29 @@ try {
       oldSource,
     'utf8',
   );
+  if (SIMULATE_BLIND === 'after-write') blind('--simulate-blind=after-write (test hook)');
 
   // ── 2. compile both, together, so they see the SAME dependency versions ────
   console.log(`── TRA-2361 · monotonicity differential ──────────────────────────`);
   console.log(`  pre-fix build : ${PRE_FIX}`);
-  console.log(`  building packages/server …`);
+  console.log(`  building packages/server (tsc -b --force) …`);
   try {
-    execFileSync('npx', ['tsc', '-b'], {
+    // `--force` is load-bearing, not belt-and-braces. See the header: incremental `tsc -b`
+    // remembers the temp file in tsconfig.tsbuildinfo, which cleanup does not (and should
+    // not) rewrite, so from the second run onward it declares the project up to date and
+    // never emits the artifact the differential needs. Composite builds key on CONTENT, so
+    // `touch` does not bust it either — `--force` is the only cheap deterministic option
+    // that does not leave a stale emit in the tree.
+    execFileSync('npx', ['tsc', '-b', '--force'], {
       cwd: join(repo, 'packages', 'server'),
       encoding: 'utf8',
       stdio: 'pipe',
       shell: process.platform === 'win32',
     });
   } catch (err) {
-    blind(`tsc -b failed:\n${err?.stdout ?? ''}${err?.stderr ?? err?.message ?? err}`);
+    blind(`tsc -b --force failed:\n${err?.stdout ?? ''}${err?.stderr ?? err?.message ?? err}`);
   }
+  if (SIMULATE_BLIND === 'after-build') blind('--simulate-blind=after-build (test hook)');
 
   const load = async (f) => {
     const p = join(DIST, f);
@@ -211,6 +263,19 @@ try {
         `\n   ⚠️ This is a statement about ${PRE_FIX} → the working tree. Re-run it after any rebase.`,
     );
   }
+} catch (err) {
+  // Both arms are BLIND (3), never FAIL (1): "the differential could not be run" and "the
+  // property does not hold" are different claims, and only the second one is a finding.
+  // An unexpected throw is squarely the first, so it must not be reported as the second.
+  if (err instanceof BlindError) {
+    console.error(`\n⚠️  BLIND — ${err.message}\n   This is NOT a pass: the monotonicity property is UNPROVEN.`);
+  } else {
+    console.error(
+      `\n⚠️  BLIND — the differential threw before it could conclude:\n${err?.stack ?? err}` +
+        `\n   This is NOT a pass: the monotonicity property is UNPROVEN.`,
+    );
+  }
+  exitCode = 3;
 } finally {
   if (KEEP) {
     console.error(`\n⚠️ --keep: ${TEMP_TS} was LEFT IN PLACE. Delete it before committing — a stray sibling in src/ shadows the source.`);

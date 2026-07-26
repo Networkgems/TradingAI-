@@ -336,6 +336,22 @@ cross-tabulates `old passed → new passed`, asserting **zero `false → true`**
 **at least one `true → false`** (otherwise the change is inert and the matrix proves
 nothing). Do **not** substitute a code read for that matrix.
 
+**That prover is itself under control (`pnpm check:tra2361-prover`, TRA-2372).** As first
+shipped it worked exactly once: it built with incremental `tsc -b`, which recorded its temp
+checkout in `tsconfig.tsbuildinfo`, so from the second run onward the emit was skipped and
+the prover exited **3 BLIND** — and its `blind()` called `process.exit()` from inside the
+`try`, which **skips `finally`**, so that same BLIND path stranded a *second, pre-R1 copy of
+the capital gate* in `packages/server/src/`. Untracked but **not** gitignored (`.gitignore`
+covers `packages/*/src/**/*.js` and `*.d.ts`, not a bare `.ts`), inside tsconfig's
+`include`, and **invisible to `pnpm check:stale-js`**, which by construction only detects
+compiler *output* shadowing a source. Neither defect could manufacture a false green — the
+prover fails closed — but an AC5 instrument that runs once is a dated green wearing a
+checker's clothes. The controls run the prover **twice** and require exit 0 both times, and
+require the temp file to be **absent** after a forced BLIND; `--keep` is the positive
+control that proves those absence checks have a preimage. The build is now
+`tsc -b --force` **deliberately** — do not "optimise" it back to incremental, and do not fix
+a future emit problem by leaving the compiled `.js` in place.
+
 **`scripts/tra2335-feasibility-check.mjs` has two modes and only one of them is a monitor.**
 The default mode is a **mechanism prover over a hand-built reconstruction** — a unit test
 with a CLI, which will print `INFEASIBLE` forever regardless of the live book, because its
