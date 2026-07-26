@@ -162,7 +162,39 @@ const argOf = (name, fallback) => {
 const JSON_OUT = argv.includes('--json');
 const SELFTEST = argv.includes('--selftest');
 const BASE = String(argOf('base', 'https://tradingai-bqb1.onrender.com')).replace(/\/+$/, '');
-const MIN_N = Number(argOf('min-n', 20));
+/**
+ * The power floor, DERIVED — not the round number it used to be.
+ *
+ * This gate shipped at 20 because 20 looks like enough. It is not, and the
+ * arithmetic says so from live tape. Measured 2026-07-26 on the 110 closed
+ * ELIGIBLE demo desk fills the grade actually consumes (`single_leg_rv` +
+ * `single_leg_otm`, fixture accounts excluded):
+ *
+ *     sd(R) = 0.2144        mean_R over the whole eligible sleeve = +0.0577
+ *
+ * At n(T)=20 with n(U)=4·n(T) the 80%-power MDE is **0.1502R — 2.6× the entire
+ * sleeve's mean R**. A gate that admits a verdict there is not measuring
+ * selection; it can only ever fire on an effect larger than the whole edge, and
+ * a "significant" result at that power is magnitude-inflated (Type M), not
+ * merely uncertain. That is the same shape as every instrument in this repo
+ * that reads identically in the pass and fail state.
+ *
+ * So the floor is set where the MDE equals ONE sleeve-mean (0.0577R), the
+ * smallest contrast that is economically material given
+ * Δ$ = (m−1)·mean_R(T)·risk·n(T):
+ *
+ *     n(T) = (1.96 + 0.8416)² · sd² · (1 + 1/4) / 0.0577²  ≈  135
+ *
+ * At ~13.8 eligible fills/session that is 4–10 weeks of tape depending on the
+ * governor's duty cycle (unmeasured until the counters accumulate — TRA-2339's
+ * `totalConsults` / `totalWouldTrims` give it directly on the first live
+ * session). Override with `--min-n` when grading a deliberately smaller slice;
+ * the achieved MDE is printed either way, so a lowered floor cannot hide.
+ */
+const DEFAULT_MIN_N = 135;
+const MIN_N = Number(argOf('min-n', DEFAULT_MIN_N));
+/** Contrast treated as materially large enough to act on (one sleeve-mean R). */
+const MATERIAL_EFFECT_R = 0.0577;
 const STAMP_SINCE = Number(argOf('stamp-since', DEFAULT_STAMP_SINCE));
 
 // ── statistics ─────────────────────────────────────────────────────────────
@@ -207,6 +239,10 @@ function welch(a, b) {
     crit,
     ci: [diff - crit * se, diff + crit * se],
     excludesZero: Math.abs(t) > crit,
+    // Minimum detectable effect at 80% power for THIS run's actual SE. Reported
+    // on every verdict because a CI alone does not say what the test could have
+    // seen — see MIN_N's derivation. 0.8416 = z(0.80).
+    mde: (crit + 0.8416) * se,
   };
 }
 
@@ -241,7 +277,7 @@ export function eligibility(row) {
  * grades has never been shown to go red, and an assertion that cannot fail is
  * decoration. `--selftest` drives this same function to every verdict.
  */
-export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT_STAMP_SINCE, minN = 20 }) {
+export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT_STAMP_SINCE, minN = DEFAULT_MIN_N }) {
   const lines = [];
   const dropped = { fixture: 0, unattributed: 0, open: 0, notDemo: 0, preCliff: 0, ineligible: 0, unclassified: 0, void: 0 };
 
@@ -385,19 +421,40 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
         `95% CI [${stats.ci[0].toFixed(4)}, ${stats.ci[1].toFixed(4)}]`,
     );
     lines.push('  ⚠ absolute means are MID-MARKED (TRA-2174, ~13% overstated) — publish the CONTRAST only; the convention cancels in the difference.');
+    lines.push(
+      `power      MDE(80%) = ${stats.mde.toFixed(4)}R — the SMALLEST contrast this run could have detected. ` +
+        `That is ${(stats.mde / MATERIAL_EFFECT_R).toFixed(1)}× the material effect (${MATERIAL_EFFECT_R}R = one sleeve-mean). ` +
+        `A null below this resolution is NOT evidence of no selection.`,
+    );
   }
 
   if (T.length < minN || !stats) {
     lines.push(
       `NOT-GRADED  UNDERPOWERED — n(T)=${T.length} < ${minN}${stats ? '' : ' (or a cohort too small for a variance)'}. ` +
+        `${stats ? `At this n the test resolves only ${stats.mde.toFixed(4)}R; the floor is where MDE reaches ${MATERIAL_EFFECT_R}R. ` : ''}` +
         `Keep the routine armed and re-run; do not read a small-n point estimate as a verdict.`,
     );
     return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, cohorts, stats };
   }
 
   if (!stats.excludesZero) {
-    lines.push('NOT-GRADED  UNDERPOWERED — the 95% CI on the contrast straddles 0. No selection effect is demonstrated in either direction.');
+    lines.push(
+      `NOT-GRADED  UNDERPOWERED — the 95% CI on the contrast straddles 0. No selection effect is demonstrated in either direction. ` +
+        `This run could only have resolved ${stats.mde.toFixed(4)}R, so it rules out effects LARGER than that and nothing smaller.`,
+    );
     return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, cohorts, stats };
+  }
+
+  // A significant result whose effect is SMALLER than the run's own 80%-power
+  // MDE was found by a test underpowered for it. Such estimates are inflated in
+  // magnitude (Type M) — the CI excludes 0, but the point estimate should not be
+  // carried into Δ$ arithmetic as if it were the true effect.
+  if (Math.abs(stats.diff) < stats.mde) {
+    lines.push(
+      `  ⚠ TYPE-M — |diff|=${Math.abs(stats.diff).toFixed(4)}R is BELOW this run's own MDE ${stats.mde.toFixed(4)}R. ` +
+        `Significant, but found by a test underpowered for an effect this size, so the MAGNITUDE is likely overstated. ` +
+        `Treat the SIGN as the finding and re-grade before sizing any Δ$ off the point estimate.`,
+    );
   }
 
   if (stats.diff > 0) {
@@ -518,6 +575,45 @@ function selftest() {
 
   const T_good = [...Array(30)].map((_, i) => trimmed({ realizedR: 1.5 + jitter(i) * 0.1 }));
   check('FAIL selection adverse', g([...T_good, ...U_flat]), 'SELECTION_ADVERSE');
+
+  // TYPE-M, controlled in BOTH directions. A branch that only ever fires — or
+  // only ever stays silent — is the instrument-with-no-failing-state shape.
+  const hasTypeM = (rows) =>
+    grade({ rows, buildCommit: 'deadbeef', stampsSupported: true, minN: 20 }).lines.some((l) =>
+      l.includes('TYPE-M'),
+    );
+  // Large, unambiguous effect: significant AND well above its own MDE ⇒ silent.
+  check('TYPE-M silent on a large effect', String(hasTypeM([...T_good, ...U_flat])), 'false');
+  // Tight variance makes a TINY contrast significant while still below the MDE.
+  // The window is narrow by construction — Type-M is exactly the band
+  // 1.96·se < |diff| < 2.80·se — so the offset is sized to it rather than
+  // guessed: sd≈0.00284 over n=120/arm gives se≈0.000367, hence a 0.0009
+  // contrast sits at 2.45·se, significant but under the run's own MDE.
+  const tiny = (i) => ((i % 5) - 2) * 0.002;
+  const U_tight = [...Array(120)].map((_, i) => row({ realizedR: tiny(i) }));
+  const T_tight = [...Array(120)].map((_, i) => trimmed({ realizedR: -0.0009 + tiny(i) }));
+  const tinyRes = grade({
+    rows: [...T_tight, ...U_tight],
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    minN: 20,
+  });
+  check('  small significant effect is a verdict', tinyRes.reason, 'SELECTION_CONFIRMED');
+  check('  and TYPE-M fires on it', String(tinyRes.lines.some((l) => l.includes('TYPE-M'))), 'true');
+  // The MDE line itself must appear on every run that reaches a contrast.
+  check(
+    'MDE reported alongside the verdict',
+    String(g([...T_bad, ...U_flat], {}) !== null && true),
+    'true',
+  );
+  check(
+    '  MDE line present',
+    String(
+      grade({ rows: [...T_bad, ...U_flat], buildCommit: 'x', stampsSupported: true, minN: 20 })
+        .lines.some((l) => l.startsWith('power')),
+    ),
+    'true',
+  );
 
   // Eligibility: a defined-risk row must not join U, and a wheel row must not either.
   const withSpreads = grade({
