@@ -37,6 +37,17 @@ export type { RenderedAlert } from './renderer.js';
 
 export { buildSampleAlertEvent } from './sample-event.js';
 
+// TRA-2416 — the report self-test's routing decision, pulled out of `index.ts`
+// so the third disposition (`suppressed`) is asserted by tests and not only by a
+// post-deploy probe.
+export { resolveReportRouting, REPORT_ROUTING_BLOCKED_MESSAGE } from './report-routing.js';
+export type {
+  ReportRouting,
+  ReportRoutingInput,
+  ReportRoutingVerdict,
+  SuppressedChannel,
+} from './report-routing.js';
+
 export {
   registerChannelAdapters,
   EmailChannelAdapter,

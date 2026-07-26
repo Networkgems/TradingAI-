@@ -236,6 +236,8 @@ import {
   DISCORD_EPHEMERAL_FLAG,
   renderAlert,
   channelSuppressionReason,
+  resolveReportRouting,
+  REPORT_ROUTING_BLOCKED_MESSAGE,
   type CommandContext,
   type ChannelAdapter,
   type RoutineSummary,
@@ -8481,71 +8483,40 @@ app.post('/api/notifications/report/test', requireAuth, async (req, res) => {
       return;
     }
 
-    // Routing: the same three conditions `NotificationDispatcher.fanOut` applies.
-    const eligible = ALERT_CHANNELS.filter(ch => {
-      if (!prefs.events.report[ch]) return false;
-      if (!prefs.channels[ch]?.enabled) return false;
-      const adapter = channelAdapters[ch as keyof typeof channelAdapters];
-      return !!adapter && adapter.isConfigured(prefs);
-    });
     // Quiet hours suppress the `report` class on the scheduled path. Report it
     // rather than silently mirroring it: an operator testing at 23:00 needs to
     // see the mail AND be told the 21:00 run would have been suppressed.
     const quietHoursActive = notificationDispatcher.inQuietHours(prefs.quietHours, Date.now());
 
-    if (eligible.length === 0) {
-      res.status(409).json({
-        ok: false,
-        code: 'no_eligible_channel',
-        error:
-          'No channel is both routed for the report class and configured — the scheduled run would emit nothing.',
-        window,
-        routing: {
-          eligible,
-          attempted: [],
-          suppressed: [],
-          quietHoursActive,
-          wouldScheduledDeliver: false,
-        },
-      });
-      return;
-    }
-
-    // TRA-2416 — the third disposition, applied with the SAME helper the
-    // dispatcher's fan-out uses so this probe cannot drift from the scheduled
-    // path it exists to predict. A suppressed channel is reported explicitly and
-    // excluded from `attempted`; it is neither `delivered` nor `failed`.
-    const suppressedChannels = eligible.flatMap(ch => {
-      const adapter = channelAdapters[ch as keyof typeof channelAdapters];
-      if (!adapter) return [];
-      const { reason } = channelSuppressionReason(adapter, event, prefs);
-      return reason ? [{ channel: ch, reason }] : [];
+    // Routing — the same three conditions `NotificationDispatcher.fanOut`
+    // applies, plus TRA-2416's suppression split. Computed in
+    // `notifications/report-routing.ts` rather than inline: `index.ts` has no
+    // route-test harness, and every one of these outcomes is a 409 with a JSON
+    // body, so a wiring bug here reads identically to a working route. The
+    // route below only maps a verdict onto a status code.
+    const { verdict, routing } = resolveReportRouting({
+      adapters: channelAdapters,
+      event,
+      prefs,
+      quietHoursActive,
+      atPeriodEnd,
     });
-    const attempted = eligible.filter(ch => !suppressedChannels.some(s => s.channel === ch));
 
-    if (attempted.length === 0) {
-      // Its own code, NOT `no_eligible_channel` (misconfiguration) and NOT the
-      // 502 `send_failed` below (transport broke). Everything routed here was
-      // refused by design, and a grader that cannot tell those three apart is
-      // measuring nothing.
+    if (verdict !== 'attempt') {
+      // `all_channels_suppressed` gets its own code — NOT `no_eligible_channel`
+      // (misconfiguration) and NOT the 502 `send_failed` below (transport
+      // broke). Everything routed there was refused by design, and a grader
+      // that cannot tell those three apart is measuring nothing.
       res.status(409).json({
         ok: false,
-        code: 'all_channels_suppressed',
-        error:
-          'Every routed channel is suppressed for this recipient — the scheduled run would emit ' +
-          'nothing, by design. This account cannot grade mail delivery; set a real address via ' +
-          'PUT /api/account/notifications {"channels":{"email":{"emailAddress":"..."}}} and retry.',
+        code: verdict,
+        error: REPORT_ROUTING_BLOCKED_MESSAGE[verdict],
         window,
-        routing: {
-          eligible,
-          attempted,
-          suppressed: suppressedChannels,
-          quietHoursActive,
-          wouldScheduledDeliver: false,
-        },
+        routing,
       });
       return;
     }
+    const { attempted, suppressed: suppressedChannels } = routing;
 
     const deliveries = await Promise.all(
       attempted.map(async ch => {
@@ -8576,17 +8547,9 @@ app.post('/api/notifications/report/test', requireAuth, async (req, res) => {
 
     const payload = {
       window,
-      routing: {
-        eligible,
-        attempted,
-        suppressed: suppressedChannels,
-        quietHoursActive,
-        // The scheduled 21:00 run also requires the real calendar boundary — and
-        // now also a channel that is not suppressed. TRA-2416: gating on
-        // `eligible` here would report "would deliver" for a recipient we refuse
-        // to mail, which is the false green this whole change exists to prevent.
-        wouldScheduledDeliver: atPeriodEnd && !quietHoursActive && attempted.length > 0,
-      },
+      // Same `routing` block on every outcome, including `wouldScheduledDeliver`
+      // — which gates on `attempted`, not `eligible`. See `report-routing.ts`.
+      routing,
       report: {
         periodLabel: event.periodLabel,
         totalPnl: event.stats.totalPnl,
