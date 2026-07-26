@@ -4,6 +4,11 @@ import nodemailer from 'nodemailer';
 // today and `logger.child()` on the next line runs at module scope inside it — the exact
 // shape that made TRA-1674 throw. Importing the leaf breaks it.
 import { logger } from './observability/logger.js';
+// TRA-2356 — the single source of truth for "is this a fixture address?"
+// (TRA-1949's `@qa.test` suffix rule). `test-accounts.ts` is a pure string
+// predicate with ZERO imports, so pulling it in here cannot re-open the
+// email -> barrel -> alerts -> email cycle the import above is dodging.
+import { isTestEmail } from './test-accounts.js';
 
 const log = logger.child({ module: 'email' });
 
@@ -31,6 +36,49 @@ function getTransport() {
  */
 export function isSmtpConfigured(): boolean {
   return Boolean(SMTP_HOST && SMTP_USER && SMTP_PASS);
+}
+
+/**
+ * TRA-2356 — refuse to hand a QA/fixture address to the transport.
+ *
+ * `qa.test` has no MX record, so every mail aimed at one of these hard-bounces
+ * back into `networkgemstore@gmail.com` — which is also `ALERT_EMAIL`. Eight
+ * bounces landed there on 2026-07-25 alone (one per fixture signup),
+ * interleaved with real ops alerts; TRA-2357, a genuine `disk-near-full`
+ * CRITICAL, sat unactioned in that noise. Burying live alerts is the
+ * first-order harm; Gmail sender reputation is the second.
+ *
+ * This sits at the TRANSPORT rather than at the signup call site on purpose.
+ * The welcome mail is the path that was OBSERVED bouncing, but it is not the
+ * only one aimed at a fixture inbox: `EmailChannelAdapter.resolveAddress`
+ * (notifications/channels/email.ts) falls back to the account LOGIN email, so
+ * password reset, 2FA OTP and the TRA-2252 scheduled reports all resolve to the
+ * same `@qa.test` address the moment a fixture touches them. Gating only the
+ * welcome call would kill the eight bounces we can see and leave the class
+ * alive — and the next one would arrive under a different subject line reading
+ * like a brand-new bug.
+ *
+ * Suppressing cannot regress a working flow: NXDOMAIN means none of these mails
+ * has ever been deliverable to a fixture. There is nothing to break.
+ *
+ * NOT applied to {@link sendOpsAlertEmail} (its recipients are `ALERT_EMAIL`,
+ * real operator addresses) nor to {@link sendNotificationEmail} — that one's
+ * throw/resolve is the dispatcher's success ledger, and quietly resolving a
+ * suppressed send would manufacture a false green in TRA-2284's in-flight
+ * grading. That semantics call is LeadDev's; see the TRA-2356 child issue.
+ */
+function isSuppressedRecipient(toEmail: string): boolean {
+  return isTestEmail(toEmail);
+}
+
+/** Structured trace so a suppression is COUNTABLE, never a silent no-op. */
+function logSuppressed(kind: string, toEmail: string): void {
+  log.info('suppressed transactional mail to test-account recipient', {
+    kind,
+    to: toEmail,
+    reason: 'test_account_recipient',
+    issue: 'TRA-2356',
+  });
 }
 
 /**
@@ -125,6 +173,14 @@ export async function sendPasswordResetEmail(
   username: string,
   resetCode: string,
 ): Promise<void> {
+  // TRA-2356 — checked BEFORE the transport probe so the suppression counter is
+  // accurate on a box with no SMTP too, and so the dev fallback below never
+  // prints a reset code for an address that could not receive one anyway.
+  if (isSuppressedRecipient(toEmail)) {
+    logSuppressed('password_reset', toEmail);
+    return;
+  }
+
   const transport = getTransport();
   const { subject, text, html } = buildResetEmail(username, resetCode);
 
@@ -201,6 +257,13 @@ export async function sendOtpEmail(
   username: string,
   code: string,
 ): Promise<void> {
+  // TRA-2356 — see sendPasswordResetEmail. Same reasoning, same secret-hygiene
+  // point: no OTP printed for a fixture address.
+  if (isSuppressedRecipient(toEmail)) {
+    logSuppressed('login_otp', toEmail);
+    return;
+  }
+
   const transport = getTransport();
   const { subject, text, html } = buildOtpEmail(username, code);
 
@@ -285,6 +348,13 @@ function buildWelcomeEmail(username: string): { subject: string; text: string; h
  * fire-and-forget so a mail failure never blocks account creation.
  */
 export async function sendWelcomeEmail(toEmail: string, username: string): Promise<void> {
+  // TRA-2356 — the observed bleed: 8 hard bounces into the ops mailbox on
+  // 2026-07-25, one per `@qa.test` fixture signup.
+  if (isSuppressedRecipient(toEmail)) {
+    logSuppressed('welcome', toEmail);
+    return;
+  }
+
   const transport = getTransport();
   const { subject, text, html } = buildWelcomeEmail(username);
 
