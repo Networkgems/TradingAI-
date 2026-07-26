@@ -99,6 +99,98 @@ export interface AccountWipeReceipt {
   ok: boolean;
 }
 
+// ── The two decisions the route makes, lifted out so they are testable ────────
+//
+// `packages/server` has no route-level test harness (see the note in
+// `reports/demo-calendar-fill-scope.ts`). Left inline in `index.ts`, the refusal
+// rules and — more importantly — the ORDER of the delete steps would be asserted
+// by nothing at all, and the order is the entire fix: reverse any two of them and
+// the book comes back while every other test in this file still passes.
+
+/** Why a self-delete was refused, or `null` when it may proceed. */
+export type SelfDeleteRefusal =
+  | { code: 'operator_book'; status: 403; message: string }
+  | { code: 'last_admin'; status: 409; message: string };
+
+/**
+ * TRA-2421 — may this account delete ITSELF?
+ *
+ * `isOperatorBook` is passed in rather than imported so this stays a pure
+ * decision, but the route MUST pass `isReservedOperatorBookName` — the same
+ * predicate that guards signup (TRA-2407). A name that may not be registered must
+ * not be self-destructible either, and two copies of that list would drift.
+ */
+export function refuseSelfDelete(args: {
+  username: string;
+  role: 'admin' | 'user';
+  adminCount: number;
+  isOperatorBook: (username: string) => boolean;
+}): SelfDeleteRefusal | null {
+  if (args.isOperatorBook(args.username)) {
+    return {
+      code: 'operator_book',
+      status: 403,
+      message: 'Operator accounts cannot be deleted from Settings. Contact an administrator.',
+    };
+  }
+  // Checked on the LAST admin only. An admin who is not the last one is an
+  // ordinary user as far as this route is concerned.
+  if (args.role === 'admin' && args.adminCount <= 1) {
+    return {
+      code: 'last_admin',
+      status: 409,
+      message: 'This is the last administrator account. Promote another admin first.',
+    };
+  }
+  return null;
+}
+
+/** The side effects the delete sequence needs, injected so the order is assertable. */
+export interface SelfDeletePorts {
+  /** Stop engines + clear debounced persist timers (`destroyUserContext`). */
+  destroyContext: (username: string) => void;
+  /** Remove the credential row (`deleteUser`). False ⇒ the user was already gone. */
+  deleteCredentialRow: (username: string) => Promise<boolean>;
+  /** Hang up live websockets. */
+  closeSockets: (username: string) => number;
+  /** Destroy the files (`wipeAccountData`). */
+  wipe: (username: string) => Promise<AccountWipeReceipt>;
+}
+
+export type SelfDeleteOutcome =
+  | { ok: true; receipt: AccountWipeReceipt; socketsClosed: number }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'residue'; receipt: AccountWipeReceipt; socketsClosed: number };
+
+/**
+ * TRA-2421 — run the delete in the ONE order that actually destroys the account.
+ *
+ *   1. `destroyContext` — a pending `scheduleStocksPersist` would otherwise
+ *      rewrite `trades-stocks.json` seconds after the wipe.
+ *   2. `deleteCredentialRow` — this is what makes `requireAuth` start refusing
+ *      the caller's still-valid token, so no in-flight request can rebuild the
+ *      context underneath the wipe. It must land BEFORE the files go.
+ *   3. `closeSockets` — the WS is a second door to `ensureUserContext`.
+ *   4. `wipe` — only now, with nothing left that can recreate the directory.
+ *
+ * A `deleteCredentialRow` that returns false stops the sequence: without step 2
+ * the token stays live, so wiping anyway would just hand the restore path a
+ * missing primary to heal from.
+ */
+export async function performSelfDelete(
+  username: string,
+  ports: SelfDeletePorts,
+): Promise<SelfDeleteOutcome> {
+  ports.destroyContext(username);
+  const removed = await ports.deleteCredentialRow(username);
+  if (!removed) return { ok: false, reason: 'not_found' };
+  const socketsClosed = ports.closeSockets(username);
+  const receipt = await ports.wipe(username);
+  return receipt.ok
+    ? { ok: true, receipt, socketsClosed }
+    : { ok: false, reason: 'residue', receipt, socketsClosed };
+}
+
 function userDirIn(root: string, username: string): string {
   return join(root, 'users', username);
 }

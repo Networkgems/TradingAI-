@@ -304,3 +304,88 @@ describe('TRA-2421 — the tombstone record', () => {
     expect(deletedAccounts.accountDeletedAt('anyone', dir)).toBeNull();
   });
 });
+
+describe('TRA-2421 — the refusal rules', () => {
+  const isOperator = (u: string) => u === 'admin' || u.toLowerCase() === 'richard';
+
+  it('refuses an operator book, by the SAME predicate that guards signup', () => {
+    const r = accountDeletion.refuseSelfDelete({
+      username: 'Richard', role: 'user', adminCount: 3, isOperatorBook: isOperator,
+    });
+    expect(r?.code).toBe('operator_book');
+    expect(r?.status).toBe(403);
+  });
+
+  it('refuses the LAST admin, and only the last one', () => {
+    const last = accountDeletion.refuseSelfDelete({
+      username: 'ops', role: 'admin', adminCount: 1, isOperatorBook: () => false,
+    });
+    expect(last?.code).toBe('last_admin');
+    expect(last?.status).toBe(409);
+
+    // One of several admins is an ordinary account for this route's purposes.
+    expect(accountDeletion.refuseSelfDelete({
+      username: 'ops', role: 'admin', adminCount: 2, isOperatorBook: () => false,
+    })).toBeNull();
+  });
+
+  it('lets an ordinary account through — the rule must not refuse everyone', () => {
+    // Without this the gate would "pass" its other two tests while blocking the
+    // whole feature.
+    expect(accountDeletion.refuseSelfDelete({
+      username: 'enock', role: 'user', adminCount: 2, isOperatorBook: isOperator,
+    })).toBeNull();
+  });
+});
+
+describe('TRA-2421 — the delete sequence', () => {
+  function spyPorts() {
+    const calls: string[] = [];
+    const receipt = { ok: true } as Awaited<ReturnType<AccountDeletion['wipeAccountData']>>;
+    return {
+      calls,
+      ports: {
+        destroyContext: (_u: string) => { calls.push('destroyContext'); },
+        deleteCredentialRow: async (_u: string) => { calls.push('deleteCredentialRow'); return true; },
+        closeSockets: (_u: string) => { calls.push('closeSockets'); return 2; },
+        wipe: async (_u: string) => { calls.push('wipe'); return receipt; },
+      },
+    };
+  }
+
+  it('stops engines and drops the credential row BEFORE touching the files', async () => {
+    // The whole fix. Wiping before the token is dead lets a debounced persist or a
+    // request on the still-valid token re-create the directory, and every other
+    // test in this file would still pass.
+    const { calls, ports } = spyPorts();
+    const outcome = await accountDeletion.performSelfDelete('enock', ports);
+    expect(calls).toEqual(['destroyContext', 'deleteCredentialRow', 'closeSockets', 'wipe']);
+    expect(calls.indexOf('deleteCredentialRow')).toBeLessThan(calls.indexOf('wipe'));
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('does NOT wipe when the credential row was not removed', async () => {
+    // Without step 2 the token stays live, so a wipe would only hand the restore
+    // path a missing primary to heal from.
+    const calls: string[] = [];
+    const outcome = await accountDeletion.performSelfDelete('ghost', {
+      destroyContext: () => { calls.push('destroyContext'); },
+      deleteCredentialRow: async () => { calls.push('deleteCredentialRow'); return false; },
+      closeSockets: () => { calls.push('closeSockets'); return 0; },
+      wipe: async () => { calls.push('wipe'); return { ok: true } as never; },
+    });
+    expect(calls).toEqual(['destroyContext', 'deleteCredentialRow']);
+    expect(outcome).toEqual({ ok: false, reason: 'not_found' });
+  });
+
+  it('surfaces residue as its own outcome, not as success', async () => {
+    const outcome = await accountDeletion.performSelfDelete('enock', {
+      destroyContext: () => {},
+      deleteCredentialRow: async () => true,
+      closeSockets: () => 0,
+      wipe: async () => ({ ok: false, errors: ['backup: EPERM'] } as never),
+    });
+    expect(outcome.ok).toBe(false);
+    expect(outcome).toMatchObject({ reason: 'residue' });
+  });
+});

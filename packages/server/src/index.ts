@@ -41,7 +41,7 @@ import {
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
-import { wipeAccountData } from './account-deletion.js';
+import { wipeAccountData, refuseSelfDelete, performSelfDelete } from './account-deletion.js';
 import { accountDeletedAt } from './deleted-accounts.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
@@ -5945,35 +5945,38 @@ app.delete('/api/account', requireAuth, async (req, res) => {
   recordSuccess(ipKey);
   recordSuccess(userKey);
 
-  // TRA-2407 — operator books (`admin`, `Richard`, plus any env additions) carry
-  // the firm-wide demo calendar fill and are referenced by name across the
-  // reporting code. Reuse the SAME predicate the signup guard uses so the two
-  // cannot drift; a name that may not be registered must not be self-destructible
-  // either.
-  if (isReservedOperatorBookName(username)) {
-    res.status(403).json({ error: 'Operator accounts cannot be deleted from Settings. Contact an administrator.' });
-    return;
-  }
   const me = getUser(username);
   if (!me) { res.status(404).json({ error: 'User not found' }); return; }
-  if (me.role === 'admin' && getAllUsers().filter(u => u.role === 'admin').length <= 1) {
-    res.status(409).json({ error: 'This is the last administrator account. Promote another admin first.' });
+  // Operator books and the last admin. Both rules live in `refuseSelfDelete` so
+  // they are covered by a test — there is no route-level harness in this package,
+  // so a rule left inline here would be asserted by nothing. The operator
+  // predicate is the SAME one that guards signup (TRA-2407): a name that may not
+  // be registered must not be self-destructible either.
+  const refusal = refuseSelfDelete({
+    username,
+    role: me.role,
+    adminCount: getAllUsers().filter(u => u.role === 'admin').length,
+    isOperatorBook: isReservedOperatorBookName,
+  });
+  if (refusal) {
+    res.status(refusal.status).json({ error: refusal.message });
     return;
   }
 
-  // 1. Stop the engines and clear the debounced persist timers BEFORE anything is
-  //    removed — a pending `scheduleStocksPersist` would otherwise rewrite
-  //    `trades-stocks.json` seconds after the wipe.
-  destroyUserContext(username);
-  // 2. Drop the credential row. From here the caller's token fails `requireAuth`,
-  //    so no in-flight request can rebuild the context underneath the wipe.
-  const removed = await deleteUser(username);
-  if (!removed) { res.status(404).json({ error: 'User not found' }); return; }
-  // 3. Close their live sockets; the WS upgrade path now refuses the token too.
-  closeUserSockets(username);
-  // 4. Destroy the files — primary tree, every backup generation, reset codes and
-  //    2FA state — and tombstone the identity.
-  const receipt = await wipeAccountData(username, { via: 'self' });
+  // The four steps, in the one order that actually destroys the account. The
+  // sequence lives in `performSelfDelete` because the ORDER is the fix and
+  // nothing here could test it.
+  const outcome = await performSelfDelete(username, {
+    destroyContext: destroyUserContext,
+    deleteCredentialRow: deleteUser,
+    closeSockets: closeUserSockets,
+    wipe: (u) => wipeAccountData(u, { via: 'self' }),
+  });
+  if (!outcome.ok && outcome.reason === 'not_found') {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+  const receipt = outcome.receipt;
 
   // The shared option journal is NOT rewritten (see `account-deletion.ts`); the
   // tombstone scopes those rows out of any future holder of this name. Report the
