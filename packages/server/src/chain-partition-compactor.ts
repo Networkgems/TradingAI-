@@ -10,7 +10,7 @@
  *
  * Why compaction rather than the retention prune TRA-2417 asked for first:
  * measured on the real 2026-07-24 partition, gzip -6 takes the per-symbol JSON
- * to **11.8%** of its bytes. Compacting all 48 partitions reclaims ~355 MB —
+ * to **11.3%** of its bytes. Compacting all 48 partitions reclaims ~355 MB —
  * *more* than pruning 48→30 partitions would (~209 MB) — and it does it
  * **without deleting anything**. A deleted partition is not recoverable; the
  * capture is the only copy. Compaction also flattens the slope, not just the
@@ -44,7 +44,7 @@ const gunzipAsync = promisify(gunzip);
 
 const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
 
-/** gzip level. 6 is the measured 11.8%; 9 buys <0.5% for ~3x the CPU. */
+/** gzip level. 6 is the measured 11.3%; 9 buys <0.5% for ~3x the CPU. */
 const GZIP_LEVEL = 6;
 
 /**

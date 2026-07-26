@@ -3194,7 +3194,7 @@ const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'op
 // `/data` is a 1 GB volume and the capture was adding ~8.4 MB/trading day with
 // nothing reclaiming it — 48 partitions, ~403 MB, against 153.7 MB free on
 // 2026-07-26 (~4 trading days from the 10% alert floor, ~13 from full). Gzip
-// takes an aged partition to 11.8% of its bytes, MEASURED on 2026-07-24's, so
+// takes an aged partition to 11.3% of its bytes, MEASURED on 2026-07-24's, so
 // compaction reclaims ~355 MB *without deleting a partition* — more than pruning
 // 48→30 would (~209 MB), and it drops the per-day slope to ~1 MB as well.
 //

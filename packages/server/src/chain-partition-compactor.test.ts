@@ -18,7 +18,7 @@ import { mkdtemp, mkdir, writeFile, readdir, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { gunzipSync } from 'zlib';
-import { loadChainDays } from '@trading-app/backtest';
+import { loadChainDays, readChainSnapshotFile } from '@trading-app/backtest';
 import { compactChainPartitions, chainPartitionStorageReport } from './chain-partition-compactor.js';
 
 function snapshot(symbol: string, date: string) {
@@ -154,6 +154,26 @@ describe('compactChainPartitions', () => {
     await compactChainPartitions({ outDir: root });
     const packed = await readFile(join(root, '2026-07-20', 'AAPL.json.gz'));
     expect(gunzipSync(packed)).toEqual(original);
+  });
+
+  it('a reader holding a pre-compaction file name still gets the snapshot', async () => {
+    // The race: `readdir` hands a caller `AAPL.json`, compaction renames it to
+    // `AAPL.json.gz` before the caller reads. Every caller skips on error, so
+    // without the ENOENT fallback this silently drops one symbol from the
+    // partition — a 1-of-2 export that looks exactly like a normal one.
+    await seed(['2026-07-20', '2026-07-21']);
+    const staleName = join(root, '2026-07-20', 'AAPL.json');
+    const expected = await readChainSnapshotFile(staleName);
+
+    await compactChainPartitions({ outDir: root });
+
+    const afterRename = await readChainSnapshotFile(staleName);
+    expect(afterRename).toEqual(expected);
+    // ...and the reverse direction, for a caller holding the compacted name
+    // against a partition that was never compacted.
+    expect(await readChainSnapshotFile(join(root, '2026-07-21', 'MSFT.json.gz'))).toEqual(
+      await readChainSnapshotFile(join(root, '2026-07-21', 'MSFT.json')),
+    );
   });
 
   it('an empty or missing outDir is a no-op, not a throw', async () => {

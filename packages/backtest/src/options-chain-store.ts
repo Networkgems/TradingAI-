@@ -13,7 +13,7 @@
  * TRA-2417 — aged partitions are stored gzipped. `/data` is a 1 GB volume and
  * the capture was adding ~8.4 MB of per-symbol JSON per trading day with nothing
  * reclaiming it; measured on the 2026-07-24 partition, gzip -6 takes that to
- * 11.8% of the bytes. The compactor
+ * 11.3% of the bytes. The compactor
  * (`packages/server/src/chain-partition-compactor.ts`) rewrites `<SYMBOL>.json`
  * as `<SYMBOL>.json.gz`, so **every reader must go through the helpers below** —
  * a bare `readFile(...,'utf-8')` on a compacted partition throws, and a bare
@@ -52,10 +52,25 @@ export function chainSnapshotSymbol(name: string): string {
 /**
  * Read one per-symbol snapshot, transparently gunzipping a `.json.gz`. Throws
  * on a missing/corrupt file — callers decide whether to skip or fail.
+ *
+ * A name read from `readdir` can be compacted out from under us between the
+ * listing and the read (compaction writes `X.json.gz` then unlinks `X.json`).
+ * Every caller wraps this in a skip-on-error, so that race would drop a symbol
+ * from a partition **silently** — a 24-of-25 export that looks like a normal
+ * one. On ENOENT we therefore retry the sibling form before giving up; the file
+ * is one rename away, not gone.
  */
 export async function readChainSnapshotFile(path: string): Promise<OptionChainSnapshotFile> {
-  const raw = await readFile(path);
-  const json = path.endsWith('.gz') ? (await gunzipAsync(raw)).toString('utf-8') : raw.toString('utf-8');
+  let target = path;
+  let raw: Buffer;
+  try {
+    raw = await readFile(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
+    target = path.endsWith('.gz') ? path.slice(0, -3) : `${path}.gz`;
+    raw = await readFile(target);
+  }
+  const json = target.endsWith('.gz') ? (await gunzipAsync(raw)).toString('utf-8') : raw.toString('utf-8');
   return JSON.parse(json) as OptionChainSnapshotFile;
 }
 
