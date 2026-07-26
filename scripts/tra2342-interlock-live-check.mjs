@@ -33,9 +33,23 @@
 //                       boot cannot INHERIT one, because the caller short-circuits on
 //                       `cryptoAutoTradingEnabledLive !== true` and never reaches the
 //                       guard. (a) is a writer of exactly such an arm.
+//   5. TRA-2348  — the universe rule. Everything above governs whether live crypto is
+//                  ARMED; this governs WHAT UNIVERSE it may trade once it is. Every
+//                  shipped live crypto preset enables the same single strategy (`dca`)
+//                  and differs only in symbol universe, so swapping the canary preset
+//                  for `crypto_core` is a ~130x widening with an EMPTY roster delta —
+//                  invisible to checks 1-4 and to TRA-2343. It belongs on the same
+//                  gate for the same reason (a) does: the arming step is the last
+//                  moment anyone looks.
 //
 // `--post-arm=<iso>` additionally runs the TRA-2342 step-3 post-condition against
 // /api/health/crypto-live. See POST-ARM below.
+//
+// `--crypto-arm` promotes the check-5 (TRA-2348) results from NOTICE to hard FAIL.
+// Pass it whenever the action being authorized is arming LIVE CRYPTO rather than
+// the equity `TRADIER_ENV=production` step. It is implied automatically whenever
+// the crypto arm is already reachable (carrier ON, or carrier unreadable). See the
+// severity note at check 5 — the scoping is deliberate.
 //
 // FAIL-CLOSED. Every unknown is a FAIL, never a pass: an unfetched SHA, an
 // unreachable host and a malformed payload all exit non-zero. A checker that goes
@@ -113,6 +127,76 @@ function tra2351Edges(tree) {
     },
   ];
 }
+// TRA-2348 — the universe rule, one level finer than the TRA-2343 roster delta.
+const UNIVERSE_COMMIT = '387e8516e832d06bd75aa734aa7ef114ef25eab8';
+const PROMOTION_SERVICE_PATH = 'packages/server/src/promotion-service.ts';
+const SHARED_INDEX_PATH = 'packages/shared/src/index.ts';
+const UNIVERSE_SYMBOL = 'widenedBeyondRatifiedUniverse';
+const ALLOWLIST_SYMBOL = 'LIVE_RATIFIED_CRYPTO_PRESETS';
+const UNRATIFIED_PRESET = 'crypto_core';
+
+/**
+ * TRA-2348 — read out of an arbitrary tree, same shape as {@link tra2351Edges}, so
+ * `--self-test` can run the identical predicates against the real pre-fix build.
+ */
+function tra2348Edges(tree) {
+  const read = path => {
+    try {
+      return git(['show', `${tree}:${path}`]);
+    } catch {
+      return '';
+    }
+  };
+
+  // (a) The CALL SITE inside the gate. The function being exported/defined proves
+  // nothing — ancestry and `ls-tree` both survive a revert of the CALLER (TRA-2262).
+  // And the ORDERING is load-bearing: the defect produces an EMPTY roster delta by
+  // construction, so a call placed after the `strategies.length === 0` early return
+  // could never fire. We require the call AND that the early return consults the
+  // universe result.
+  const svc = read(PROMOTION_SERVICE_PATH);
+  const fn = svc.match(/export async function evaluateLiveTransitionGate\s*\([\s\S]*?\n\}/);
+  const body = fn ? fn[0] : '';
+  const callsUniverse = body.includes(`${UNIVERSE_SYMBOL}(`);
+  const earlyReturn = body.match(/if\s*\(\s*strategies\.length === 0[\s\S]{0,160}?\)/);
+  const returnGuarded = !!earlyReturn && /universeBlocks\.size/.test(earlyReturn[0]);
+
+  // (b) The ALLOWLIST itself. A live tree that carries the call but an allowlist
+  // widened to include `crypto_core` has the rule present and inert — the same
+  // "orphaned but live" shape, one layer down. Compare QUOTED ENTRIES exactly:
+  // 'crypto_core_live_majors' CONTAINS the substring 'crypto_core', so a substring
+  // test would report the un-ratified preset present on a correct allowlist.
+  const shared = read(SHARED_INDEX_PATH);
+  const decl = shared.match(
+    new RegExp(`export const ${ALLOWLIST_SYMBOL}[^=]*=\\s*\\[([\\s\\S]*?)\\]`),
+  );
+  const entries = decl ? [...decl[1].matchAll(/'([^']+)'/g)].map(m => m[1]) : [];
+  const allowlistOk = entries.length > 0 && !entries.includes(UNRATIFIED_PRESET);
+
+  return [
+    {
+      name: `TRA-2348 — ${UNIVERSE_SYMBOL} is called inside evaluateLiveTransitionGate`,
+      ok: !!body && callsUniverse && returnGuarded,
+      detail: !body
+        ? `could not locate evaluateLiveTransitionGate in ${PROMOTION_SERVICE_PATH}`
+        : !callsUniverse
+          ? `the gate does not call ${UNIVERSE_SYMBOL} — a preset swap that widens the live universe is UNGATED (roster delta {dca} → {dca} is empty).`
+          : returnGuarded
+            ? `${UNIVERSE_SYMBOL}() called and consulted before the empty-delta early return`
+            : 'the call is present but the `strategies.length === 0` early return does not consult it — the check can never fire on the very save it exists for.',
+    },
+    {
+      name: `TRA-2348 — ${ALLOWLIST_SYMBOL} excludes '${UNRATIFIED_PRESET}'`,
+      ok: allowlistOk,
+      detail: !decl
+        ? `${ALLOWLIST_SYMBOL} is absent from ${SHARED_INDEX_PATH} — there is no ratified-universe record to compare against.`
+        : allowlistOk
+          ? `allowlist = [${entries.join(', ')}]`
+          : `'${UNRATIFIED_PRESET}' is ON the allowlist — the ~395-pair universe QuantTrader ruled NO-GO on (TRA-1304) would be authorized. Adding it needs a fresh live-money sign-off.`,
+    },
+  ];
+}
+
 const SERVICE_ID = process.env['RENDER_SERVICE_ID'] || 'srv-d7mb7rr7uimc73ev0chg';
 
 const argv = process.argv.slice(2);
@@ -161,7 +245,7 @@ const PRE_INTERLOCK_SHA = '29cbb9a0fe885614e7b59eb34613e8a466dd11e3';
 
 function selfTest() {
   console.log(`[tra2342] --self-test: every predicate must go NEGATIVE on the real build that PRECEDED the fix it checks`);
-  console.log(`[tra2342]              interlock predicates → ${PRE_INTERLOCK_SHA.slice(0, 8)} · TRA-2351 predicates → f2f6360\n`);
+  console.log(`[tra2342]              interlock predicates → ${PRE_INTERLOCK_SHA.slice(0, 8)} · TRA-2351 predicates → f2f6360 · TRA-2348 predicates → 832dc92\n`);
   try {
     git(['cat-file', '-e', `${PRE_INTERLOCK_SHA}^{commit}`]);
   } catch {
@@ -196,11 +280,26 @@ function selfTest() {
     bail(`${PRE_THIRD_PATH_SHA.slice(0, 8)} is not in this clone; cannot self-test the TRA-2351 predicates. Run \`git fetch origin\`.`);
   }
 
+  // TRA-2348 — its own negative control, against ITS own real pre-fix build:
+  // 832dc92, the commit immediately preceding the universe rule. It carries the
+  // TRA-2343 roster delta and the TRA-2351 named entry point, so it goes negative
+  // ONLY on the universe predicates — which is what makes it a control for this
+  // rule rather than for the whole chain.
+  const PRE_UNIVERSE_SHA = '832dc92428dd75ca24f789fac694bbed01fd5fd7';
+  let universeEdges;
+  try {
+    git(['cat-file', '-e', `${PRE_UNIVERSE_SHA}^{commit}`]);
+    universeEdges = tra2348Edges(PRE_UNIVERSE_SHA);
+  } catch {
+    bail(`${PRE_UNIVERSE_SHA.slice(0, 8)} is not in this clone; cannot self-test the TRA-2348 predicates. Run \`git fetch origin\`.`);
+  }
+
   const checks = [
     ['ancestry reports NOT-an-ancestor', ancestry === false],
     ['import edge reports ABSENT', hasImport === false],
     ['guard call reports ABSENT (function exists but is unguarded)', hasGuard === false && !!fn],
     ...thirdPathEdges.map(e => [`${e.name} reports ABSENT on ${PRE_THIRD_PATH_SHA.slice(0, 7)}`, e.ok === false]),
+    ...universeEdges.map(e => [`${e.name} reports ABSENT on ${PRE_UNIVERSE_SHA.slice(0, 7)}`, e.ok === false]),
   ];
   let bad = 0;
   for (const [name, ok] of checks) {
@@ -330,9 +429,13 @@ async function main() {
   }
 
   // ---- 3. CARRIER not positively set ---------------------------------------
+  let carrierOn = false;
   const renderKey = process.env['RENDER_API_KEY'];
   if (!renderKey) {
     record('CARRIER — LIVE_CRYPTO_BOOT_ARM not positively set', null, 'RENDER_API_KEY absent — carrier NOT verified. Check it by hand before arming.');
+    // An unread carrier is an unknown, and this script treats unknowns as hazards
+    // — so the TRA-2348 tier below escalates rather than softening.
+    carrierOn = true;
   } else {
     try {
       const r = await fetch(`https://api.render.com/v1/services/${SERVICE_ID}/env-vars?limit=100`, {
@@ -349,9 +452,60 @@ async function main() {
         !on,
         on ? `${CARRIER_KEY}=${JSON.stringify(raw)} — the arm is ENABLED. This is a real-money crypto arm.` : hit ? `${CARRIER_KEY}=${JSON.stringify(raw)} → OFF` : `${CARRIER_KEY} absent → OFF (compiled default)`,
       );
+      carrierOn = on;
     } catch (e) {
       record('CARRIER — LIVE_CRYPTO_BOOT_ARM not positively set', false, `could not read the service env: ${e.message}`);
+      carrierOn = true; // unread ⇒ treated as reachable, same as the no-key branch
     }
+  }
+
+  // ---- 5. TRA-2348 — the UNIVERSE the arm may trade -------------------------
+  //
+  // SEVERITY IS SCOPED ON PURPOSE, and this is the part to read before editing.
+  // Checks 1–4 all guard "live crypto must not be ARMED", which is a genuine
+  // precondition of `TRADIER_ENV=production` (that write force-writes mode:'live',
+  // which is what makes an arm reachable at all). TRA-2348 is different in kind:
+  // it bounds the UNIVERSE a crypto arm may trade ONCE ARMED. With the carrier OFF
+  // and checks 1–4 passing, no arm can be created or inherited, so failing the
+  // equity go-live step on a crypto-universe rule would be a FALSE BLOCKER on the
+  // critical path (TRA-1648/TRA-1575) — the shape that turns a safety control into
+  // something people route around.
+  //
+  // So it escalates with reachability rather than being softened: a HARD FAIL when
+  // the crypto arm is reachable (carrier ON, carrier UNREADABLE, or `--crypto-arm`
+  // passed by someone actually authorizing live crypto), and a loud NOTICE that is
+  // named in the verdict line otherwise. A NOTICE is not a pass, and it is not a
+  // SKIP either: the predicate RAN and came back negative. Do not "simplify" this
+  // into an unconditional check — read the paragraph above first.
+  const cryptoArmReachable = carrierOn || argv.includes('--crypto-arm');
+  const notices = [];
+  const recordUniverse = (name, ok, detail) => {
+    if (ok || cryptoArmReachable) return record(name, ok, detail);
+    notices.push({ name, detail });
+    console.log(`[NOTE] ${name}\n       ${detail}`);
+  };
+
+  let universeAncestry = false;
+  try {
+    git(['cat-file', '-e', `${UNIVERSE_COMMIT}^{commit}`]);
+    try {
+      git(['merge-base', '--is-ancestor', UNIVERSE_COMMIT, live]);
+      universeAncestry = true;
+    } catch { /* not an ancestor */ }
+    recordUniverse(
+      `TRA-2348 — ${UNIVERSE_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
+      universeAncestry,
+      universeAncestry
+        ? `${UNIVERSE_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
+        : `${live.slice(0, 8)} does NOT contain ${UNIVERSE_COMMIT.slice(0, 7)}. On this build a live preset swap to the ~395-pair universe is UNGATED (roster delta {dca} → {dca} is empty). LIVE CRYPTO MUST NOT BE ARMED until it is deployed.`,
+    );
+    for (const e of tra2348Edges(live)) recordUniverse(e.name, e.ok, e.detail);
+  } catch {
+    recordUniverse(
+      `TRA-2348 — ${UNIVERSE_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
+      false,
+      `${UNIVERSE_COMMIT.slice(0, 8)} is not in this clone. Run \`git fetch origin\`. An absent object is NOT a pass.`,
+    );
   }
 
   // ---- POST-ARM (TRA-2342 step 3) ------------------------------------------
@@ -388,12 +542,33 @@ async function main() {
   const skipped = results.filter(r => r.ok === null);
   console.log('');
   if (failed.length) {
-    console.error(`[tra2342] INTERLOCK NOT PROVEN — ${failed.length} check(s) FAILED. Do NOT set TRADIER_ENV=production.`);
-    for (const f of failed) console.error(`          - ${f.name}`);
+    // TRA-2348 — name the REMEDY that matches the failure. A universe failure does
+    // not mean "do not set TRADIER_ENV"; it means "do not arm live crypto on this
+    // build". Emitting the wrong remedy is how a refusal reads as a deadlock and
+    // gets routed around (TRA-2351 hit exactly this with the empty-roster text).
+    const universeFailed = failed.filter(f => f.name.startsWith('TRA-2348'));
+    const interlockFailed = failed.filter(f => !f.name.startsWith('TRA-2348'));
+    console.error(`[tra2342] NOT PROVEN — ${failed.length} check(s) FAILED.`);
+    if (interlockFailed.length) {
+      console.error('          INTERLOCK — do NOT set TRADIER_ENV=production:');
+      for (const f of interlockFailed) console.error(`          - ${f.name}`);
+    }
+    if (universeFailed.length) {
+      console.error(`          UNIVERSE (TRA-2348) — do NOT arm live crypto on this build; deploy ${UNIVERSE_COMMIT.slice(0, 7)} first:`);
+      for (const f of universeFailed) console.error(`          - ${f.name}`);
+      if (!interlockFailed.length) {
+        console.error('          (the equity TRADIER_ENV=production step is NOT blocked by these — every interlock check above passed.)');
+      }
+    }
     process.exit(1);
   }
   console.log(`[tra2342] INTERLOCK LIVE — ${results.length - skipped.length} check(s) passed${skipped.length ? `, ${skipped.length} SKIPPED (see above)` : ''}.`);
   if (skipped.length) console.log('[tra2342] a SKIPPED check is not a passed check.');
+  if (notices.length) {
+    console.log(`[tra2342] ${notices.length} NOTICE(s) — the equity arming step is clear, but LIVE CRYPTO MUST NOT BE ARMED on this build:`);
+    for (const n of notices) console.log(`          - ${n.name}`);
+    console.log('[tra2342] re-run with --crypto-arm before authorizing live crypto; these become hard FAILs there.');
+  }
   process.exit(0);
 }
 

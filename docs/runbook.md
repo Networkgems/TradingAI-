@@ -41,7 +41,34 @@ scaling and alert response.
 > the sole production live instance, PM2 is sandbox-only. The live pilot is
 > re-enabled but **gate-blocked** — the TRA-532 promotion gate still refuses to
 > arm live crypto auto-trading until a crypto strategy is fully promoted, and no
-> strategy currently is.) To hand live ownership to the PM2 self-host instead, you must
+> strategy currently is.)
+>
+> ⚠️ **A promotion is not a blank cheque on the UNIVERSE (TRA-2348).** Full
+> promotion of a strategy is **necessary but not sufficient** for live crypto. All
+> three live crypto presets enable the same single strategy (`dca`) and differ only
+> in symbol universe, so swapping `crypto_core_live_canary_btc` → `crypto_core`
+> (BTC-only → ≈395 pairs) is invisible to a strategy-keyed gate: the roster delta is
+> empty. The gate therefore also refuses any save that **widens** the live symbol
+> universe onto a preset outside `LIVE_RATIFIED_CRYPTO_PRESETS`
+> (`packages/shared/src/index.ts` — today the TRA-1304 majors + canary presets).
+> **Narrowing and holding are never blocked**, and turning live crypto off in the
+> same save always succeeds. Adding an id to that list is a real-money
+> authorization and needs a fresh live-money sign-off — QuantTrader's is NO-GO on
+> the full `crypto_core` universe.
+>
+> **Before arming live crypto** (not before the equity `TRADIER_ENV=production`
+> step — the two are scoped separately):
+>
+> ```bash
+> RENDER_API_KEY=… node scripts/tra2342-interlock-live-check.mjs --crypto-arm
+> ```
+>
+> Without `--crypto-arm` the TRA-2348 rows report as **NOTICE** and do not block the
+> equity go-live; with it (or whenever `LIVE_CRYPTO_BOOT_ARM` is on/unreadable) they
+> are hard FAILs. `--self-test` proves every predicate goes negative on the real
+> pre-fix builds. A NOTICE is not a pass.
+>
+> To hand live ownership to the PM2 self-host instead, you must
 > (1) clear `TRADIER_*` / set `TRADIER_ENV=sandbox` on Render bqb1, (2) drop the
 > `TRADIER_ENV: 'sandbox'` pin in `ecosystem.config.cjs`, and (3) update this
 > §1, the [`render.yaml`](../render.yaml) header, and the
