@@ -18,6 +18,9 @@ import {
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
+  checkDiskSpace,
+  readDiskSpace,
+  diskMinFreePct,
 } from './alerts.js';
 
 describe('trace context', () => {
@@ -200,5 +203,64 @@ describe('trade audit tracker', () => {
         closedPositions: [{ ...pos('p3'), exitPrice: 110, pnl: 10 }],
       }),
     ).not.toThrow();
+  });
+});
+
+// TRA-2357 — the 2026-07-25T20:33:34Z bqb1 CRITICAL was
+// `disk-near-full: Disk 16.3% free — below 99%`: a healthy disk (166.7 MB free of
+// 1020.7 MB) graded against a 99%-free threshold. The alert TEXT and the alert
+// DETAIL are the only records that survive a reboot — the in-memory ring does not —
+// so the threshold has to travel with the reading, and the read-only surface has to
+// be readable without firing anything.
+describe('disk-space reading (TRA-2357)', () => {
+  beforeEach(() => {
+    __resetAlertsForTest();
+    delete process.env['DISK_MIN_FREE_PCT'];
+  });
+
+  it('reads headroom on a real path WITHOUT dispatching — an anonymous poll must not burn the alert throttle', async () => {
+    // Threshold at 100% free: any real filesystem is "below" it, so a reader that
+    // shared checkDiskSpace's code path would fire here.
+    process.env['DISK_MIN_FREE_PCT'] = '100';
+    const reading = await readDiskSpace(process.cwd());
+    expect(reading).not.toBeNull();
+    expect(reading!.totalBytes).toBeGreaterThan(0);
+    expect(reading!.freePct).toBeGreaterThanOrEqual(0);
+    expect(getRecentAlerts()).toHaveLength(0);
+
+    // The same path through checkDiskSpace DOES alert — proving the assertion
+    // above measures purity and not simply a healthy disk.
+    await checkDiskSpace(process.cwd());
+    expect(getRecentAlerts()).toHaveLength(1);
+    expect(getRecentAlerts()[0]!.key).toBe('disk-near-full');
+  });
+
+  it('carries the effective threshold in the alert detail, so a bad threshold is distinguishable from a full disk', async () => {
+    process.env['DISK_MIN_FREE_PCT'] = '99';
+    await checkDiskSpace(process.cwd());
+    const alert = getRecentAlerts()[0]!;
+    expect(alert.detail?.['minFreePct']).toBe(99);
+    expect(alert.message).toContain('below 99%');
+  });
+
+  it('does not alert on a healthy disk at the default 10% threshold', async () => {
+    const reading = await readDiskSpace(process.cwd());
+    // Only meaningful when the test host actually has headroom.
+    if (reading && reading.freePct >= 10) {
+      await checkDiskSpace(process.cwd());
+      expect(getRecentAlerts()).toHaveLength(0);
+    }
+  });
+
+  it('defaults the threshold to 10 and honours the env override', () => {
+    expect(diskMinFreePct()).toBe(10);
+    process.env['DISK_MIN_FREE_PCT'] = '25';
+    expect(diskMinFreePct()).toBe(25);
+  });
+
+  it('returns null rather than throwing when the path does not exist', async () => {
+    expect(await readDiskSpace('/definitely/not/a/real/mount/tra2357')).toBeNull();
+    expect(await checkDiskSpace('/definitely/not/a/real/mount/tra2357')).toBeNull();
+    expect(getRecentAlerts()).toHaveLength(0);
   });
 });

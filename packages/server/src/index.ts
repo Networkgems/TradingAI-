@@ -471,6 +471,8 @@ import {
   getErrorCountSince,
   runHealthCheck,
   checkDiskSpace,
+  readDiskSpace,
+  diskMinFreePct,
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,
@@ -4796,6 +4798,12 @@ app.get('/api/health/engine-scorecard', async (_req, res) => {
   }
 });
 
+// TRA-2357 — heartbeat for the 60s observability monitor (`runObservabilityMonitor`),
+// surfaced in the `disk` block below. Module-level so the route can read it without
+// reaching into the scheduler.
+let observabilityMonitorRuns = 0;
+let observabilityMonitorLastRunAt: string | null = null;
+
 // TRA-141 — storage diagnostic so QA can verify from outside the box that the
 // Render persistent disk is actually mounted and that user/settings/trade files
 // are surviving redeploys. No PII is exposed (only paths, sizes, mtimes, count).
@@ -4828,10 +4836,49 @@ app.get('/api/health/storage', async (_req, res) => {
   } catch {
     backupsCount = 0;
   }
+  // TRA-2357 — free space on the volume backing DATA_DIR, plus the threshold the
+  // `disk-near-full` alert grades against and the liveness of the loop that grades
+  // it. Before this, the route reported file sizes but no headroom, so "is the disk
+  // near full?" was unanswerable between alerts — and the one alert we had
+  // (2026-07-25T20:33Z) turned out to be `16.3% free — below 99%`, a healthy disk
+  // against a bad threshold. Publishing `minFreePct` alongside `freePct` is what
+  // makes that case readable; publishing `belowThreshold` is what makes the route
+  // gradeable without re-deriving the comparison.
+  //
+  // `readDiskSpace` is the PURE reader on purpose — calling `checkDiskSpace` here
+  // would let any anonymous request fire a CRITICAL alert and burn the real one's
+  // throttle window.
+  const minFreePct = diskMinFreePct();
+  const diskReading = await readDiskSpace(DATA_DIR);
+  const monitorAgeSec = observabilityMonitorLastRunAt
+    ? Math.round((Date.now() - Date.parse(observabilityMonitorLastRunAt)) / 1000)
+    : null;
+  const disk = diskReading
+    ? {
+        path: diskReading.path,
+        totalBytes: diskReading.totalBytes,
+        freeBytes: diskReading.freeBytes,
+        usedBytes: diskReading.totalBytes - diskReading.freeBytes,
+        freePct: Number(diskReading.freePct.toFixed(3)),
+        usedPct: Number((100 - diskReading.freePct).toFixed(3)),
+        minFreePct,
+        belowThreshold: diskReading.freePct < minFreePct,
+        // The monitor that raises `disk-near-full`. `runs: 0` / a stale
+        // `lastRunAt` means a quiet alert ring proves nothing.
+        monitor: {
+          runs: observabilityMonitorRuns,
+          lastRunAt: observabilityMonitorLastRunAt,
+          ageSec: monitorAgeSec,
+          // Ticks every 60s; anything past 180s is a stalled loop, not a healthy one.
+          stalled: observabilityMonitorRuns === 0 || (monitorAgeSec !== null && monitorAgeSec > 180),
+        },
+      }
+    : { path: DATA_DIR, error: 'statfs failed', minFreePct };
   res.json({
     dataDir: DATA_DIR,
     dataDirEnv: process.env['DATA_DIR'] ?? null,
     dataDir_exists: existsSync(DATA_DIR),
+    disk,
     usersFile: await statFile(usersFile),
     settingsFile: await statFile(legacySettingsFile),
     tradesStocksFile: await statFile(legacyTradesStocksFile),
@@ -10942,6 +10989,13 @@ async function probeHealth(): Promise<boolean> {
 }
 
 async function runObservabilityMonitor(): Promise<void> {
+  // TRA-2357 — liveness of THIS loop, published on `/api/health/storage`. A
+  // 60s monitor that stopped ticking produces an empty alert ring, which reads
+  // identically to "every check passed". Without a heartbeat there is no way
+  // to tell those apart from outside the box, and the quiet ring gets read as
+  // an all-clear.
+  observabilityMonitorRuns += 1;
+  observabilityMonitorLastRunAt = new Date().toISOString();
   await runHealthCheck(probeHealth);
   await checkDiskSpace(DATA_DIR);
   checkErrorSpike(getErrorCountSince());

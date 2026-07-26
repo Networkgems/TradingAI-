@@ -33,6 +33,8 @@ export {
   getAlertingPosture,
   runHealthCheck,
   checkDiskSpace,
+  readDiskSpace,
+  diskMinFreePct,
   recordBootAndCheckRestarts,
   checkTradeVolume,
   checkErrorSpike,

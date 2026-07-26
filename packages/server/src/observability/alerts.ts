@@ -336,37 +336,64 @@ export interface DiskReading {
   freePct: number;
 }
 
+/** The `disk-near-full` threshold actually in force, in percent free. */
+export function diskMinFreePct(): number {
+  return Number(process.env['DISK_MIN_FREE_PCT'] ?? 10);
+}
+
 /**
- * Check free space on the disk backing `path`. Alerts when free space drops
- * below `minFreePct` (default 10%). Returns the reading for `/api/health`.
+ * TRA-2357 — read free space on the disk backing `path`. PURE: it never
+ * dispatches, so a polled read-only surface (`/api/health/storage`) can report
+ * headroom without emitting an alert or, worse, silently consuming the
+ * `disk-near-full` throttle window and suppressing the real one.
+ *
+ * `freeBytes` is `bavail` (space available to this non-root process), while
+ * `totalBytes` is the full filesystem size including reserved blocks — so
+ * `freePct` is deliberately the conservative figure the alert grades on, and
+ * runs ~1-2 points below `(capacity - usage)` as a hosting dashboard reports it.
  */
-export async function checkDiskSpace(
-  path: string,
-  minFreePct = Number(process.env['DISK_MIN_FREE_PCT'] ?? 10),
-): Promise<DiskReading | null> {
+export async function readDiskSpace(path: string): Promise<DiskReading | null> {
   try {
     const fs = await statfs(path);
     const totalBytes = fs.blocks * fs.bsize;
     const freeBytes = fs.bavail * fs.bsize;
     const freePct = totalBytes > 0 ? (freeBytes / totalBytes) * 100 : 100;
-    const reading: DiskReading = { path, freeBytes, totalBytes, freePct };
-    if (freePct < minFreePct) {
-      dispatchAlert('disk-near-full', 'critical', `Disk ${freePct.toFixed(1)}% free — below ${minFreePct}%`, {
-        path,
-        freeBytes,
-        totalBytes,
-        freePct,
-      });
-    }
-    return reading;
+    return { path, freeBytes, totalBytes, freePct };
   } catch (err) {
-    logger.warn('disk-space check failed', {
+    logger.warn('disk-space read failed', {
       module: 'alerts',
       path,
       reason: err instanceof Error ? err.message : String(err),
     });
     return null;
   }
+}
+
+/**
+ * Check free space on the disk backing `path`. Alerts when free space drops
+ * below `minFreePct` (default 10%). Returns the reading for `/api/health`.
+ */
+export async function checkDiskSpace(
+  path: string,
+  minFreePct = diskMinFreePct(),
+): Promise<DiskReading | null> {
+  const reading = await readDiskSpace(path);
+  if (!reading) return null;
+  const { freeBytes, totalBytes, freePct } = reading;
+  if (freePct < minFreePct) {
+    dispatchAlert('disk-near-full', 'critical', `Disk ${freePct.toFixed(1)}% free — below ${minFreePct}%`, {
+      path,
+      freeBytes,
+      totalBytes,
+      freePct,
+      // TRA-2357 — the threshold is part of the reading. The 2026-07-25T20:33Z
+      // CRITICAL was `16.3% free — below 99%`: a healthy disk against a bad
+      // threshold. Without `minFreePct` in the detail, that alert is
+      // indistinguishable from a genuine one.
+      minFreePct,
+    });
+  }
+  return reading;
 }
 
 /** Read prior boot timestamps from `boot-history.jsonl`. Missing file → []. */
