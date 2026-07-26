@@ -25,7 +25,10 @@
     "check:boot-set": "node --test scripts/lib/render-boot-set.test.mjs",
     "check:auth-secret-predicate": "node --test scripts/lib/auth-secret-predicate.test.mjs",
     "check:auth-secret-gate": "node scripts/tra2387-auth-secret-gate-check.mjs",
-    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
+    "check:tra2399-vacuity": "node --test scripts/lib/tra2399-live-instrument-grade.test.mjs",
+    "//check:tra2399-controls": "TRA-2399 AC3, END TO END: drives the real CLI over a real socket against a POPULATED book and an EMPTY one, and asserts exit 0 vs exit 4. Needs `pnpm build` first (it computes both payloads with the real gate out of dist/), which is why it is a named step and NOT in pretest — see the header of the script.",
+    "check:tra2399-controls": "node scripts/lib/tra2399-populated-gate-server.mjs --self-test",
+    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },
   "devDependencies": {

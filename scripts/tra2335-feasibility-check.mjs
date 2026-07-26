@@ -20,6 +20,14 @@
 //
 // Exit codes (both modes fail CLOSED — an unreadable input is never a pass):
 //   0 OK · 1 FAIL (the instrument is broken) · 3 BLIND (could not read; NOT a pass)
+//   4 UNGRADED — `--live` only (TRA-2399). The route read fine, but the sleeve partition
+//     was EMPTY, so every AC7 assertion was a no-op and this run is NOT evidence about R1.
+//
+//   ⚠️ 4 IS A STATEMENT ABOUT THE INSTRUMENT, NOT ABOUT THE BOOK. It means "this server
+//   cannot grade R1" — it does NOT mean the book is infeasible, and it is not a market
+//   observation. The separation TRA-2361 AC7 draws is unchanged: a live `infeasible` and
+//   a live R1 block still exit 0. 4 exists precisely so those three states stay apart.
+//   An empty book is a legitimate state of the world; a GREEN over one is not.
 //
 // Reconstruction inputs, with provenance — the live figures cited on TRA-2332:
 //   pooled credit/width k = 0.0366, n = 35 (31 bull_put_spread + 4 bear_call_spread)
@@ -31,6 +39,7 @@
 
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { gradeLiveSleeveInstrument, EXIT_CODE } from './lib/tra2399-live-instrument-grade.mjs';
 
 const argv = process.argv.slice(2);
 const LIVE = argv.includes('--live');
@@ -59,6 +68,15 @@ const BASE = (baseArg ? baseArg.slice('--base='.length) : 'https://tradingai-bqb
 //   not a failure, and A LIVE BLOCK IS NOT A FAILURE EITHER — those are facts about the
 //   trading book, not about this check. Wiring them to the exit code would turn a market
 //   observation into a red build.
+//
+//   TRA-2399 — AND IT REFUSES TO GRADE AN EMPTY ONE. All four of the assertions above are
+//   no-ops over `sleeves: []`, so this used to print the full ✅ banner, with a build SHA
+//   beside it, against a server that had never evaluated a single sleeve. The assertions
+//   now live in `scripts/lib/tra2399-live-instrument-grade.mjs` — which is also where the
+//   VACUITY RULE and the deliberate SINGLE-SLEEVE decision (AC4: one sleeve IS graded, and
+//   why that is a different call from the `length > 1` guard on the AC2 headline check)
+//   are written down. Controls: `pnpm check:tra2399-vacuity` (unit, both directions) and
+//   `pnpm check:tra2399-controls` (the same two directions end-to-end over a socket).
 if (LIVE) {
   const url = `${BASE}/api/health/live-capital-gate`;
   let gate;
@@ -88,166 +106,66 @@ if (LIVE) {
   console.log(`  gate.passed         : ${gate.passed}`);
   console.log('');
 
-  const f = gate.feasibility ?? {};
-  console.log(`  book verdict        : ${f.verdict}`);
-  console.log(`  book ceilingGrossR  : ${f.ceilingGrossR}`);
-  console.log(`  book avgCostR       : ${f.avgCostR}`);
-  console.log(`  book ceilingNetR    : ${f.ceilingR}   vs bar ${f.barR}R`);
-  console.log(`  reward provenance   : ${JSON.stringify(f.ceilingSources)}`);
-
-  const problems = [];
-  const sf = gate.sleeveFeasibility;
-  if (sf == null) {
-    // The exact TRA-2335 trap, one ticket later: `index.ts` maps this payload field by
-    // field. A new field that is not added there is dropped in silence.
-    problems.push(
-      'the route carries NO `sleeveFeasibility` block — either the build predates TRA-2353 or the field-by-field payload whitelist in index.ts dropped it',
-    );
-  } else {
-    for (const [name, axis] of Object.entries(sf).filter(([, a]) => a && a.sleeves)) {
-      console.log('');
-      console.log(`  ── ${name} (${axis.axis}, bookN=${axis.bookN}) ──`);
-      for (const s of axis.sleeves) {
-        const pct = s.weight == null ? '  ?' : `${String(Math.round(s.weight * 100)).padStart(3)}`;
-        const flags = [
-          s.blocking ? '⛔ BLOCKING' : null,
-          s.approachingBlockingThreshold ? '⚠️ approaching' : null,
-          s.material ? null : '(immaterial)',
-        ]
-          .filter(Boolean)
-          .join(' ');
-        console.log(
-          `     ${String(s.key).padEnd(20)} n=${String(s.n).padStart(3)}  ${pct}%  ceilingNetR=${String(s.ceilingNetR).padStart(9)}  → ${s.verdict}  ${flags}`,
-        );
-      }
-
-      // ── TRA-2361 AC7 — grade the R1 INSTRUMENT on this axis ────────────────
-      //
-      // ⚠️ Still grading the INSTRUMENT, never the BOOK: a live block is a fact about the
-      // trading book and must NOT red the exit code. What is graded here is whether the
-      // route can EXPRESS a block honestly — the fields present, the partition complete,
-      // and the axis summary agreeing with the per-sleeve flags.
-      const missingWeight = axis.sleeves.filter((s) => !('weight' in s));
-      const missingBlocking = axis.sleeves.filter((s) => !('blocking' in s));
-      if (missingWeight.length) {
-        problems.push(
-          `${name}: ${missingWeight.length} sleeve(s) carry no \`weight\` — R1 is graded on weight, so a sleeve without one cannot be graded at all`,
-        );
-      }
-      if (missingBlocking.length) {
-        problems.push(
-          `${name}: ${missingBlocking.length} sleeve(s) carry no \`blocking\` flag — the build predates TRA-2361, or the payload whitelist dropped it (the TRA-2335 field-map trap, third time)`,
-        );
-      }
-      // THE PARTITION CHECK — this is the one that proves NOTHING WAS FILTERED. A sleeve
-      // dropped BECAUSE it is infeasible is strictly worse than one that reads
-      // `infeasible`, and it is invisible in every other field on this payload.
-      const sumN = axis.sleeves.reduce((a, s) => a + (Number(s.n) || 0), 0);
-      if (axis.bookN != null && sumN !== axis.bookN) {
-        problems.push(
-          `${name}: sum(sleeve.n) = ${sumN} but bookN = ${axis.bookN} — ${axis.bookN - sumN} graded row(s) are in NO sleeve. Either the partition became a filter, or it is re-deriving its own population.`,
-        );
-      }
-      // `blockingSleeves` must be a DERIVED PROJECTION of the per-sleeve flags. Two
-      // computations that must agree is the shape that silently drifts; assert it against
-      // the deployed bytes rather than trusting the module's own docstring.
-      if (Array.isArray(axis.blockingSleeves)) {
-        const derived = axis.sleeves.filter((s) => s.blocking).map((s) => s.key);
-        if (JSON.stringify(axis.blockingSleeves) !== JSON.stringify(derived)) {
-          problems.push(
-            `${name}: \`blockingSleeves\` = [${axis.blockingSleeves.join(', ')}] disagrees with the per-sleeve \`blocking\` flags [${derived.join(', ')}] — the gate reads the former, an operator reads the latter`,
-          );
-        }
-        console.log(
-          `     R1 blockingSleeves: ${axis.blockingSleeves.length ? axis.blockingSleeves.map((k) => `⛔ ${k}`).join(', ') : '(none)'}`,
-        );
-      } else if (!missingBlocking.length) {
-        problems.push(
-          `${name}: sleeves carry \`blocking\` but the axis carries no \`blockingSleeves\` array — the gate's own predicate reads that array, so a consumer cannot reproduce the stop`,
-        );
-      }
-
-      if (axis.worstSleeve) {
-        console.log(
-          `     ⚠️ worst: ${axis.worstSleeve.key} — infeasible, carrying ${Math.round((axis.infeasibleWeight ?? 0) * 100)}% of the graded book`,
-        );
-      }
-      const fr = axis.fragility ?? {};
-      console.log(
-        `     fragility: flipsOnSingleSleeveRemoval=${fr.flipsOnSingleSleeveRemoval}${fr.flippingSleeves?.length ? ` via [${fr.flippingSleeves.join(', ')}]` : ''}`,
-      );
-      for (const l of fr.leaveOneOut ?? []) {
-        console.log(
-          `        without ${String(l.excludedKey).padEnd(20)} (n=${String(l.excludedN).padStart(3)}) → ceilingNetR=${String(l.ceilingNetR).padStart(9)}  ${l.verdict}${l.flipsBookVerdict ? '  ⚠️ FLIPS' : ''}`,
-        );
-      }
-
-      // AC2, graded against the LIVE bytes: a book that is feasible in aggregate while a
-      // sleeve inside it is infeasible MUST say so where an operator will see it.
-      if (f.verdict === 'feasible' && axis.worstSleeve && axis.sleeves.length > 1) {
-        if (!String(gate.summary ?? '').includes(axis.worstSleeve.key)) {
-          problems.push(
-            `the book reads \`feasible\` while sleeve \`${axis.worstSleeve.key}\` (${Math.round((axis.worstSleeve.weight ?? 0) * 100)}% of the book) is infeasible, and the headline summary does not name it`,
-          );
-        }
-      }
-    }
-  }
-
-  // TRA-2361 AC7, graded against the LIVE bytes — R1 END TO END.
-  //
-  // ⚠️ A LIVE BLOCK IS NOT A FAILURE OF THIS CHECK. What IS a failure is a block that the
-  // route reports in one field and contradicts in another: a payload where sleeves are
-  // flagged `blocking` while criterion 3 reads PASS/FAIL, or a headline that stops the
-  // capital path without naming what stopped it. Those are instrument defects and they
-  // are exactly what an operator would act on wrongly.
-  const c3 = (gate.criteria ?? []).find((c) => c.name === 'positive_expectancy');
-  const liveBlocking = sf == null ? [] : Object.values(sf).filter((a) => a && Array.isArray(a.blockingSleeves)).flatMap((a) => a.blockingSleeves);
-  if (liveBlocking.length > 0) {
-    console.log('');
-    console.log(`  ⛔ R1 IS BITING LIVE — blocking sleeve(s): ${[...new Set(liveBlocking)].join(', ')}`);
-    if (c3 && c3.status !== 'INFEASIBLE') {
-      problems.push(
-        `a sleeve is flagged \`blocking\` but criterion 3 reads ${c3.status}, not INFEASIBLE — the payload contradicts itself and the gate is not applying R1`,
-      );
-    }
-    if (c3 && c3.pass !== false) {
-      problems.push('a sleeve is flagged `blocking` and criterion 3 still reads pass:true');
-    }
-    const named = [...new Set(liveBlocking)].filter((k) => String(gate.summary ?? '').includes(k));
-    if (named.length === 0) {
-      problems.push(
-        `the gate is blocked by sleeve(s) [${[...new Set(liveBlocking)].join(', ')}] and the headline summary names NONE of them — a stop whose cause is not in the headline reads as an unexplained hold`,
-      );
-    }
-  }
-
-  // AC4, graded against the LIVE bytes.
-  if (c3 && c3.status === 'FAIL' && f.verdict === 'unknown') {
-    if (!String(gate.summary ?? '').includes('REACHABILITY UNKNOWN')) {
-      problems.push(
-        'criterion 3 reads a bare FAIL while the ceiling is `unknown`, and the headline does not say so — a FAIL there asserts "the book underperformed", which is exactly the conflation this gate exists to prevent',
-      );
-    }
-  }
-
+  // TRA-2399 — the whole grade now lives in a PURE FUNCTION so it can be driven from a
+  // test over a chosen payload. It used to be inlined here, downstream of the fetch above,
+  // which is why the one input that makes all four AC7 assertions no-ops (`sleeves: []`)
+  // was never run and greened with a build SHA beside it. See the module header.
+  const graded = gradeLiveSleeveInstrument(gate);
+  const { problems } = graded;
+  for (const l of graded.lines) console.log(l);
   console.log('');
   console.log(`  summary: ${gate.summary}`);
 
   if (problems.length > 0) {
     console.error(`\n❌ FAIL — ${problems.length} problem(s) with the LIVE instrument:`);
     for (const p of problems) console.error(`   · ${p}`);
-    process.exit(1);
+    process.exit(EXIT_CODE.fail);
   }
+
+  // TRA-2399 AC1 — AN EMPTY PARTITION IS UNGRADED, NEVER PASSED.
+  //
+  // This must come BEFORE the ✅ banner and it must not fall through to it. The banner
+  // stamps a build SHA, so `--live green on build <sha>` gets quoted as build-scoped proof
+  // of R1 — and before this branch existed it could be produced by a server that had never
+  // evaluated a single sleeve. The two states rendered byte-identically.
+  //
+  // ⚠️ Read the wording carefully: this reds the INSTRUMENT, not the BOOK. An empty book is
+  // a legitimate state of the world and this says nothing about it.
+  if (graded.verdict === 'ungraded') {
+    console.error(
+      `\n⛔ UNGRADED — this run is NOT evidence about R1.` +
+        `\n   ${graded.ungradedReason}` +
+        `\n   With no sleeves to read, all four AC7 assertions are VACUOUS: the two field-presence` +
+        `\n   checks filter an empty array, \`sum(sleeve.n) === bookN\` compares 0 to 0, and the` +
+        `\n   \`blockingSleeves\` projection compares [] to []. Nothing was tested.` +
+        `\n   ⚠️ THIS IS A STATEMENT ABOUT THE INSTRUMENT, NOT THE BOOK. It does NOT mean the book` +
+        `\n      is infeasible and it is not a market observation — it means R1 CANNOT BE GRADED on` +
+        `\n      ${BASE} at build ${version?.commit ?? '(unpinned)'}. Point \`--base=\` at a server` +
+        `\n      with a populated book, or wait for one, and run it again.`,
+    );
+    process.exit(EXIT_CODE.ungraded);
+  }
+
+  if (graded.vacuousAxes.length > 0) {
+    // Partial evidence, reported as partial. A run where SOME axis was genuinely graded did
+    // exercise the assertions, so it is not vacuous — but the green below must not be read as
+    // covering the axes that carried nothing. Named here rather than silently folded in.
+    console.log(
+      `\n⚠️  PARTIAL — graded on [${graded.gradedAxes.join(', ')}]; axis/axes [${graded.vacuousAxes.join(', ')}] were` +
+        `\n    EMPTY and contributed no evidence. The ✅ below covers the graded axes only.`,
+    );
+  }
+
   console.log(
     `\n✅ OK — the live gate publishes the sleeve decomposition WHOLE (sum(sleeve.n) === bookN on` +
       `\n   every axis), carries \`weight\` + \`blocking\` on every sleeve, and its headline matches` +
       `\n   its \`blockingSleeves\`.` +
+      `\n   Graded over ${graded.gradedAxes.length} non-empty axis/axes: ${graded.axes.map((a) => `${a.name}(n=${a.sumN})`).join(', ')}.` +
       `\n   ⚠️ This is a statement about build ${version?.commit ?? '(unpinned)'} at this instant, and it perishes on the next deploy.` +
       `\n   ⚠️ It says nothing about whether the BOOK is feasible, or whether R1 is currently` +
       `\n      biting — read the verdicts above for that. A live block is a market observation.`,
   );
-  process.exit(0);
+  process.exit(EXIT_CODE.ok);
 }
 
 // ── RECONSTRUCTION MODE — the mechanism, over a constant ─────────────────────
