@@ -10,6 +10,14 @@ import type { AlertEvent, ChannelAdapter } from '../dispatcher.js';
 import { renderAlert } from '../renderer.js';
 import { isSmtpConfigured, sendNotificationEmail } from '../../email.js';
 import { getUser } from '../../users.js';
+import { isTestEmail } from '../../test-accounts.js';
+
+/**
+ * TRA-2416 — machine-readable suppression reason, shared with the transport-side
+ * gate TRA-2356 put on the welcome / reset / OTP paths so the whole codebase
+ * reports one string for one cause.
+ */
+export const TEST_RECIPIENT_SUPPRESSION_REASON = 'test_account_recipient';
 
 export interface EmailAdapterDeps {
   /** SMTP availability probe. Defaults to the real transport check. */
@@ -50,6 +58,42 @@ export class EmailChannelAdapter implements ChannelAdapter {
   resolveAddress(username: string, prefs: AlertPreferences): string | undefined {
     const override = prefs.channels.email.emailAddress?.trim();
     return override || this.resolveLoginEmail(username);
+  }
+
+  /**
+   * TRA-2416 — refuse to hand a fixture address to the transport.
+   *
+   * `qa.test` has no MX record, so anything aimed at one hard-bounces into
+   * `networkgemstore@gmail.com` — which is also `ALERT_EMAIL`, the inbox we read
+   * real ops alerts out of. TRA-2356 closed the three user-addressed transport
+   * paths (welcome / reset / OTP); this closes the dispatcher path, which is the
+   * one that scales: `DEFAULT_ALERT_PREFERENCES` ships `channels.email.enabled:
+   * true` with `fill`/`exit`/`risk_halt`/`briefing` all `email: true`, so every
+   * fixture book is ALREADY opted in. The count is only ~8/day (one per signup)
+   * because the dispatch path has never executed — TRA-2284's finding. The
+   * moment it does, ~50 of the ~51 demo books are fixtures and `briefing` alone
+   * is daily. That empirical zero is held down by a dormant caller, and it
+   * expires the instant someone fixes the caller.
+   *
+   * ★ Keyed on the RESOLVED address, not on `isTestAccount(username)`. Two
+   * reasons, and the second is load-bearing:
+   *
+   *   1. The harm is a property of the ADDRESS (NXDOMAIN), not of the book.
+   *   2. It leaves a deliberate escape hatch. `resolveAddress` prefers the
+   *      per-channel override, so a fixture book with
+   *      `channels.email.emailAddress` pointed at a real, MX-backed inbox is NOT
+   *      suppressed and still proves the mail path end-to-end. That matters
+   *      because TRA-2284's grading routine probes `ctoverify_tra2284`, a
+   *      fixture — without this hatch, deploying the gate would make the mail
+   *      path ungradeable by the instrument that grades it.
+   *
+   * An unresolvable address is NOT suppressed — that is a genuine failure and
+   * belongs in the failed ledger, which is what `send()` below already does.
+   */
+  suppressionReason(event: AlertEvent, prefs: AlertPreferences): string | undefined {
+    const to = this.resolveAddress(event.username, prefs);
+    if (!to) return undefined;
+    return isTestEmail(to) ? TEST_RECIPIENT_SUPPRESSION_REASON : undefined;
   }
 
   async send(event: AlertEvent, prefs: AlertPreferences): Promise<void> {

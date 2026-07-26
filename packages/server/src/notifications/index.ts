@@ -9,6 +9,7 @@ export {
   initNotificationDispatcher,
   getNotificationDispatcher,
   emitAlert,
+  channelSuppressionReason,
   __resetNotificationDispatcherForTest,
 } from './dispatcher.js';
 export type {

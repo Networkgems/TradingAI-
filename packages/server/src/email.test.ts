@@ -53,8 +53,14 @@ process.env['SMTP_PORT'] = '587';
 process.env['SMTP_USER'] = 'user';
 process.env['SMTP_PASS'] = 'pass';
 
-const { sendWelcomeEmail, sendPasswordResetEmail, sendOtpEmail, isSmtpConfigured } =
-  await import('./email.js');
+const {
+  sendWelcomeEmail,
+  sendPasswordResetEmail,
+  sendOtpEmail,
+  sendNotificationEmail,
+  SuppressedRecipientError,
+  isSmtpConfigured,
+} = await import('./email.js');
 
 const FIXTURE = 'ctoverify_tra2331@qa.test';
 const REAL = 'trader@example.com';
@@ -154,6 +160,37 @@ describe('TRA-2356 — fixture-address suppression', () => {
       // as a bare `.endsWith("qa.test")` would silently swallow this one.
       await sendWelcomeEmail('someone@notqa.test', 'someone');
       expect(recipients()).toEqual(['someone@notqa.test']);
+    });
+  });
+
+  // TRA-2416 — the notification transport keeps its throw-means-failure contract,
+  // and gains a backstop.
+  describe('sendNotificationEmail backstop', () => {
+    it('THROWS a typed error rather than silently resolving for a fixture', async () => {
+      // Direction matters. A silent `return` here would resolve, and the
+      // dispatcher + `POST /api/notifications/report/test` both read a resolve as
+      // DELIVERED — a false green manufactured inside the surface TRA-2284
+      // grades. A throw can only ever manufacture a red, and only in a case that
+      // genuinely is a bug (a caller that bypassed the adapter's gate).
+      await expect(
+        sendNotificationEmail({ to: FIXTURE, subject: 's', text: 't' }),
+      ).rejects.toMatchObject({ name: 'SuppressedRecipientError' });
+      expect(sendMail).not.toHaveBeenCalled();
+    });
+
+    it('is distinguishable from a real transport failure by type, not by message', async () => {
+      const err = await sendNotificationEmail({ to: FIXTURE, subject: 's', text: 't' }).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(SuppressedRecipientError);
+      expect((err as { reason?: string }).reason).toBe('test_account_recipient');
+    });
+
+    it('CONTROL — a real address is still sent, not thrown', async () => {
+      // The over-wide gate check for this path: a backstop that refused everyone
+      // would satisfy the two assertions above identically.
+      await sendNotificationEmail({ to: REAL, subject: 's', text: 't' });
+      expect(recipients()).toEqual([REAL]);
     });
   });
 });

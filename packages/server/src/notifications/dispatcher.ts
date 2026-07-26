@@ -249,8 +249,58 @@ export interface ChannelAdapter {
    * even when enabled, so a user can flip a toggle on before linking.
    */
   isConfigured(prefs: AlertPreferences): boolean;
+  /**
+   * TRA-2416 — the THIRD disposition. Return a machine-readable reason when this
+   * specific recipient must not be attempted at all; `undefined` (or an absent
+   * implementation) means "deliverable, go ahead".
+   *
+   * This exists because neither of the two dispositions the dispatcher already
+   * had is correct for a recipient we deliberately refuse to mail:
+   *
+   *   • resolving from {@link send} records a SUCCESS for a mail that was never
+   *     sent — a false green, manufactured inside the very surface TRA-2284
+   *     grades the mail path on (`POST /api/notifications/report/test` reports a
+   *     channel as `delivered` precisely when `send` resolves).
+   *   • throwing from {@link send} records a transport FAILURE that did not
+   *     happen — a false red, which also feeds the alerting path.
+   *
+   * So suppression is decided BEFORE the send, and is reported as its own state
+   * that is neither `delivered` nor `failed`. Unlike {@link isConfigured} this
+   * takes the event, because the decision is per-RECIPIENT (whose address is
+   * resolved from `event.username` + prefs), not per-channel.
+   */
+  suppressionReason?(event: AlertEvent, prefs: AlertPreferences): string | undefined;
   /** Render + deliver. May reject / hang; the dispatcher bounds and isolates it. */
   send(event: AlertEvent, prefs: AlertPreferences): Promise<void>;
+}
+
+/**
+ * TRA-2416 — ask one adapter whether this recipient must be refused, shared by
+ * the dispatcher's fan-out and by the on-demand test routes so the two can never
+ * drift on what counts as suppressed.
+ *
+ * An adapter with no `suppressionReason` implementation is never suppressed.
+ *
+ * FAILURE DIRECTION, deliberately chosen: if the predicate itself throws we
+ * report `errored` and DO NOT suppress. Failing the other way — treating an
+ * error as "suppress" — would silently stop real users' mail on a transient
+ * lookup fault, which is precisely the too-wide gate that reads identically to a
+ * working one (TRA-2356). Attempting the send instead surfaces the same fault as
+ * a visible channel FAILURE, because `send()` re-resolves the address and hits it
+ * again. An error becomes a red, never a silent drop.
+ */
+export function channelSuppressionReason(
+  adapter: ChannelAdapter,
+  event: AlertEvent,
+  prefs: AlertPreferences,
+): { reason?: string; errored?: string } {
+  if (!adapter.suppressionReason) return {};
+  try {
+    const reason = adapter.suppressionReason(event, prefs);
+    return reason ? { reason } : {};
+  } catch (err) {
+    return { errored: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 // ── Dispatcher ───────────────────────────────────────────────────────────────
@@ -398,16 +448,73 @@ export class NotificationDispatcher {
       return;
     }
 
+    // TRA-2416 — split the routed targets into ATTEMPTED and SUPPRESSED before
+    // any send. A suppressed channel is deliberately not mailed, so it must land
+    // in neither ledger the dispatcher already keeps ("dispatching alert" ⇒
+    // delivered / "alert channel send failed" ⇒ failed).
+    const suppressed: Array<{ channel: AlertChannel; reason: string }> = [];
+    const attempted = targets.filter((ch) => {
+      const reason = this.suppressionReasonFor(this.adapters.get(ch)!, event, prefs);
+      if (!reason) return true;
+      suppressed.push({ channel: ch, reason });
+      return false;
+    });
+
+    if (suppressed.length > 0) {
+      // `info`, not `debug`: a suppression must be COUNTABLE in prod (bqb1 runs
+      // at LOG_LEVEL=error/warn/info, and a silent no-op is the failure mode this
+      // whole issue is about). One line per fan-out, carrying every reason.
+      this.log.info('alert channels suppressed', {
+        kind: event.kind,
+        username: event.username,
+        disposition: 'suppressed',
+        suppressed: suppressed.map((s) => `${s.channel}:${s.reason}`),
+        issue: 'TRA-2416',
+      });
+    }
+
+    if (attempted.length === 0) {
+      // Distinct from 'alert has no eligible channels' above on purpose: that one
+      // means MISCONFIGURED (nothing routed/enabled/ready), this one means every
+      // routed channel was refused by design. Same silence, different causes —
+      // and TRA-2356's whole lesson is that conflating them is how a too-wide
+      // gate reads exactly like a working one.
+      this.log.info('alert fully suppressed — no channel attempted', {
+        kind: event.kind,
+        username: event.username,
+        disposition: 'suppressed',
+      });
+      return;
+    }
+
     this.log.info('dispatching alert', {
       kind: event.kind,
       username: event.username,
-      channels: targets,
+      channels: attempted,
       ts,
     });
 
     await Promise.all(
-      targets.map((ch) => this.sendIsolated(this.adapters.get(ch)!, event, prefs)),
+      attempted.map((ch) => this.sendIsolated(this.adapters.get(ch)!, event, prefs)),
     );
+  }
+
+  /** Suppression verdict for one adapter. See {@link channelSuppressionReason}. */
+  private suppressionReasonFor(
+    adapter: ChannelAdapter,
+    event: AlertEvent,
+    prefs: AlertPreferences,
+  ): string | undefined {
+    const verdict = channelSuppressionReason(adapter, event, prefs);
+    if (verdict.errored) {
+      this.log.warn('suppression check errored — attempting the send', {
+        channel: adapter.channel,
+        kind: event.kind,
+        username: event.username,
+        reason: verdict.errored,
+      });
+    }
+    return verdict.reason;
   }
 
   /**

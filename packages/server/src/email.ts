@@ -62,13 +62,30 @@ export function isSmtpConfigured(): boolean {
  * has ever been deliverable to a fixture. There is nothing to break.
  *
  * NOT applied to {@link sendOpsAlertEmail} (its recipients are `ALERT_EMAIL`,
- * real operator addresses) nor to {@link sendNotificationEmail} — that one's
- * throw/resolve is the dispatcher's success ledger, and quietly resolving a
- * suppressed send would manufacture a false green in TRA-2284's in-flight
- * grading. That semantics call is LeadDev's; see the TRA-2356 child issue.
+ * real operator addresses).
+ *
+ * TRA-2416 resolved the {@link sendNotificationEmail} question: that path is
+ * gated one level UP, at `EmailChannelAdapter.suppressionReason`, so a suppressed
+ * dispatcher send is neither resolved (false green) nor thrown (false red) but
+ * recorded as its own third disposition. What remains here is a backstop —
+ * see {@link SuppressedRecipientError}.
  */
 function isSuppressedRecipient(toEmail: string): boolean {
   return isTestEmail(toEmail);
+}
+
+/**
+ * TRA-2416 — thrown by {@link sendNotificationEmail} when a suppressed address
+ * reaches the transport anyway. Distinguishable from a real transport error by
+ * `name`/`instanceof`, so a reader can tell "we refused" from "SMTP broke"
+ * without string-matching a message.
+ */
+export class SuppressedRecipientError extends Error {
+  readonly reason = 'test_account_recipient';
+  constructor(toEmail: string) {
+    super(`refusing to send to suppressed recipient ${toEmail} (TRA-2356/TRA-2416)`);
+    this.name = 'SuppressedRecipientError';
+  }
 }
 
 /** Structured trace so a suppression is COUNTABLE, never a silent no-op. */
@@ -94,6 +111,21 @@ export async function sendNotificationEmail(opts: {
   text: string;
   html?: string;
 }): Promise<void> {
+  // TRA-2416 backstop. UNREACHABLE while every caller goes through
+  // `EmailChannelAdapter`, which suppresses before it ever calls this. It exists
+  // so a FUTURE caller that bypasses the adapter fails LOUD instead of quietly
+  // mailing NXDOMAIN: this throw lands in the dispatcher's isolated catch as a
+  // visible channel failure, and no bounce is produced either way.
+  //
+  // Note the asymmetry that makes this safe to add: it can only ever manufacture
+  // a RED, and only in a case that genuinely IS a bug (a send path that skipped
+  // the suppression gate). It cannot manufacture a green. A silent `return` here
+  // would do the opposite, which is the exact false-green TRA-2284's grading
+  // reads `delivered` from.
+  if (isSuppressedRecipient(opts.to)) {
+    logSuppressed('notification_backstop', opts.to);
+    throw new SuppressedRecipientError(opts.to);
+  }
   const transport = getTransport();
   if (!transport) throw new Error('SMTP not configured');
   await transport.sendMail({
