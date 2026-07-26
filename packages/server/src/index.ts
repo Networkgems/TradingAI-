@@ -144,8 +144,15 @@ import {
   routeRegimeTsmomResults,
   hydrateRegimeTsmomDemoRouteFromDisk,
   summarizeRegimeTsmomDemoRoute,
-  getRegimeTsmomDemoRoutePositions,
 } from './crypto-regime-tsmom-demo-route.js';
+// TRA-2411 — that route book is a PROCESS-GLOBAL singleton with no user key. Both
+// of its per-user surfaces (the dashboard position injection below, and the EOD
+// report rollup line) go through this scope so the firm's paper book is not served
+// to every account as its own.
+import {
+  demoRoutePositionsFor,
+  mayViewFirmWideDemoRouteBook,
+} from './crypto-demo-route-scope.js';
 // TRA-1271 — observe-only crypto ignition scanner (strict RVOL>=6 Donchian
 // breakout + squeeze + EMA50 trend, bull-only). Flag-checked before any 4H fetch so
 // ENABLE_CRYPTO_IGNITION_SCANNER off => zero cost/IO. Read-only, ZERO capital:
@@ -2495,9 +2502,19 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   // whether paper routing is armed + the accrued open/fill/realized-R evidence. Kept
   // out of buildRegimeTsmomEodSection (scanner module) to avoid a scanner→route
   // import cycle. Read-only: folds the route ledger, places no order.
+  //
+  // TRA-2411 — the SECOND per-user reader of that process-global book, and the
+  // reason this fix is not just the dashboard provider: these are the FIRM's
+  // counters (open/fills/closed/realized-R across every routed symbol), and this
+  // report is written per user under their own reports directory. Same operator
+  // scope as the dashboard injection; an ordinary account's crypto EOD report
+  // simply omits the line rather than reporting the firm's ledger as its own.
+  const showDemoRoute = mayViewFirmWideDemoRouteBook(ctx.username, getUser(ctx.username)?.role);
   const demoRoute = summarizeRegimeTsmomDemoRoute();
   const demoRouteEnabled = isRegimeTsmomDemoRouteEnabled(demoFlagEnv());
-  const regimeTsmomDemoRouteLine = demoRouteEnabled
+  const regimeTsmomDemoRouteLine = !showDemoRoute
+    ? ''
+    : demoRouteEnabled
     ? `\n_DEMO paper routing **armed** — open ${demoRoute.openPositions} · fills ${demoRoute.fillCount} · closed ${demoRoute.closeCount} · realized ${demoRoute.realizedR}R (paper, zero real capital)._`
     : `\n_DEMO paper routing disarmed (CRYPTO_REGIME_TSMOM_DEMO_ROUTE_ENABLED off)._`;
   const report = {
@@ -11181,7 +11198,17 @@ function attachBroadcastHandlers(ctx: UserContext): void {
   // TRA-1317 — surface the process-global regime-gated TSMOM demo-route book's open
   // paper longs on this engine's Demo dashboard view. Consulted only in buildState's
   // demo branch, so a live-mode context never renders them (real capital untouched).
-  ctx.cryptoEngine.setExternalDemoPositionsProvider(getRegimeTsmomDemoRoutePositions);
+  //
+  // TRA-2411 — ...but SCOPED to the operator books. The route book is a module-level
+  // singleton with no user key, and binding it bare here handed the firm's paper
+  // positions to EVERY demo account as their own — the TRA-2407 fold leak on the
+  // crypto surface. The predicate is re-evaluated inside the closure on every
+  // getState() rather than decided once at attach time, so a role change cannot leave
+  // a demoted context still reading the book. A denied caller gets [], i.e. this
+  // engine's own book untouched.
+  ctx.cryptoEngine.setExternalDemoPositionsProvider(() =>
+    demoRoutePositionsFor(ctx.username, getUser(ctx.username)?.role),
+  );
   ctx.engine.onTick((state) => {
     try { equityAudit.observe(state as unknown as Parameters<typeof equityAudit.observe>[0]); } catch { /* audit must never break broadcast */ }
     broadcastToUser(ctx.username, JSON.stringify({ type: 'state', payload: state }));
