@@ -346,6 +346,99 @@ describe('OtmMispricingPanel', () => {
     expect(String(scanCalls.at(-1)![0])).toContain('symbol=TSLA');
   });
 
+  // ── TRA-2341: theo-underflow suppression ────────────────────────────────
+  //
+  // The server drops candidates whose theo is below one tick before slicing to
+  // the limit, because `(mark − theo)/theo` at theo=1.28e-4 reports the minimum
+  // tick, not a view on the surface. The panel's job is to never let that
+  // removal be silent — a hidden filter turns "15 artifacts" into "nothing
+  // found", which reads identically to a thin chain.
+  describe('theo-floor suppression (TRA-2341)', () => {
+    it('footnotes what the server suppressed alongside the surviving rows', async () => {
+      stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          theoFloor: { applied: 0.01, suppressed: 15, maxSuppressedMispricingPct: 742.157 },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.getByText(/15 higher-ranked contracts were hidden/i)).toBeInTheDocument();
+      // The worst discarded read is stated, scaled to a percent like every
+      // other ratio on this panel (742.157 -> 74,215.7%) — this is the live
+      // SPY260831P00420000 number from the ticket, rendered through `fmt`.
+      expect(screen.getByText(/74,215\.7%/)).toBeInTheDocument();
+    });
+
+    it('an ALL-suppressed scan does not read as a thin chain', async () => {
+      // The live SPY symptom: 15 of 15 rows were underflow artifacts. Falling
+      // through to "no OTM contracts passed the liquidity filters" would be a
+      // flat lie about a chain that is anything but thin — and it is the exact
+      // failure mode this file exists to prevent.
+      stubFetch({
+        body: {
+          symbol: 'SPY', spot: 738.93, expiration: '2026-08-31',
+          candidates: [], reason: 'ok',
+          theoFloor: { applied: 0.01, suppressed: 15, maxSuppressedMispricingPct: 742.157 },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={[{ symbol: 'SPY' }]} />);
+
+      expect(await screen.findByText(/All candidates were below the theo floor/i))
+        .toBeInTheDocument();
+      // Must NOT borrow the healthy-thin-chain copy.
+      expect(screen.queryByText(READINGS.cleanEmpty)).not.toBeInTheDocument();
+      // Nor any fault banner — this is a clean scan of a liquid chain.
+      expect(screen.queryByText(READINGS.legacy)).not.toBeInTheDocument();
+      expect(screen.queryByText(READINGS.noChain)).not.toBeInTheDocument();
+    });
+
+    it('says nothing when the guard removed nothing', async () => {
+      stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+          theoFloor: { applied: 0.01, suppressed: 0, maxSuppressedMispricingPct: null },
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.queryByText(/hidden/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/theo floor/i)).not.toBeInTheDocument();
+    });
+
+    it('a server predating the guard renders no footnote and no fabricated zero', async () => {
+      // `theoFloor` absent is how this panel can tell the guard is NOT deployed.
+      // It must degrade to the pre-TRA-2341 rendering, not invent "0 suppressed"
+      // — which would assert the guard ran clean when it never ran at all.
+      stubFetch({
+        body: {
+          symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18',
+          candidates: [candidate()], reason: 'ok',
+        },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+      await screen.findByText(READINGS.rows);
+
+      expect(screen.queryByText(/hidden/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/0 higher-ranked/i)).not.toBeInTheDocument();
+    });
+
+    it('an empty scan with no guard block still reads as a thin chain', async () => {
+      stubFetch({
+        body: { symbol: 'AAPL', spot: 243.1, expiration: '2026-09-18', candidates: [], reason: 'ok' },
+      });
+      render(<OtmMispricingPanel token="t" symbols={SYMBOLS} />);
+
+      expect(await screen.findByText(READINGS.cleanEmpty)).toBeInTheDocument();
+      expect(screen.queryByText(/All candidates were below the theo floor/i))
+        .not.toBeInTheDocument();
+    });
+  });
+
   it('offers no order-entry control (TRA-159 is not wired)', async () => {
     stubFetch({
       body: {

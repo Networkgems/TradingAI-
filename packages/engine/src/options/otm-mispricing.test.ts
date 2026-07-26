@@ -160,3 +160,76 @@ describe('findMispricedOtmContracts', () => {
     expect(Math.abs(result[0].mispricingPct)).toBeLessThan(0.001);
   });
 });
+
+/**
+ * TRA-2341 — theo underflow. NOT a bug in this file's arithmetic; a pin on the
+ * behaviour the route-layer guard exists to compensate for.
+ *
+ * Far OTM, `theo` decays toward zero much faster than the market's bid, which
+ * stays pinned near a penny by the minimum tick and lottery-ticket demand. The
+ * ratio `(mark − theo) / theo` then reports the TICK SIZE rather than any
+ * disagreement with the vol surface — live SPY on 2026-07-25 showed mark 0.095
+ * over theo 0.000128, rendering as +74215.7%. Since candidates are ranked by
+ * `|mispricingPct|` descending, those rows crowd every genuine read off a
+ * limit=15 panel: SPY's default panel was 15 of 15 artifacts.
+ *
+ * Note `liquidRow` reproduces the mechanism faithfully all on its own — its
+ * `Math.max(0.05, theo * (1 + markBias))` is exactly the minimum tick doing to
+ * the fixture what it does to the real book.
+ *
+ * These tests assert the CURRENT engine behaviour deliberately. The guard lives
+ * in `packages/server/src/otm-theo-floor.ts`, applied by the read-only
+ * `/api/options/otm-mispricing` route, because `findMispricedOtmContracts` is
+ * also reached in-process by the `single_leg_otm` sleeve via
+ * `rvScanner.scanOtm()` — changing DEFAULTS here would be a live trading-logic
+ * change. If the engine ever does grow a denominator floor (ticket option 2,
+ * needs the sleeve owner), these are the tests that should fail and be updated.
+ */
+describe('TRA-2341 — far-OTM theo underflow explodes the mispricing ratio', () => {
+  // 73-strike put at SPOT=100 is ~27% OTM with ~31 DTE: the same order of
+  // moneyness as SPY's 420 put against a 738.93 spot.
+  const UNDERFLOW_STRIKE = 73;
+
+  it('emits a sub-tick theo against a tick-floored mark', () => {
+    const row = liquidRow(UNDERFLOW_STRIKE, 'put', 0);
+    const result = findMispricedOtmContracts([row], SPOT, { now: NOW });
+
+    expect(result).toHaveLength(1);
+    const artifact = result[0];
+    // The denominator is below one minimum tick — the model says the contract
+    // is worth less than the smallest price at which it can trade.
+    expect(artifact.theo).toBeGreaterThan(0); // `theo <= 0` did NOT fire
+    expect(artifact.theo).toBeLessThan(0.01);
+    // ...while the numerator clears `minMark` comfortably. This is why a floor
+    // on the NUMERATOR (minMark 0.05, documented as guarding exactly this) does
+    // not catch it.
+    expect(artifact.mark).toBeGreaterThanOrEqual(0.05);
+    // Result: a ratio that is arithmetically correct and completely meaningless.
+    expect(artifact.mispricingPct).toBeGreaterThan(1); // >100%
+    expect(artifact.classification).toBe('expensive');
+  });
+
+  it('ranks the underflow artifact above a genuine 30% read', () => {
+    const chain: OptionChainRow[] = [
+      liquidRow(110, 'call', 0.3), // genuine +30% divergence
+      liquidRow(UNDERFLOW_STRIKE, 'put', 0), // artifact
+    ];
+    const result = findMispricedOtmContracts(chain, SPOT, { now: NOW });
+
+    // THE DEFECT: rank order puts the meaningless row first, so a limit=1 slice
+    // returns the artifact and discards the real read.
+    expect(result[0].strike).toBe(UNDERFLOW_STRIKE);
+    expect(Math.abs(result[0].mispricingPct)).toBeGreaterThan(
+      Math.abs(result[1].mispricingPct),
+    );
+  });
+
+  it('minAbsDelta would catch it, but is off by default', () => {
+    const chain = [liquidRow(UNDERFLOW_STRIKE, 'put', 0)];
+    // Every live SPY artifact row had |delta| < 0.001.
+    expect(Math.abs(findMispricedOtmContracts(chain, SPOT, { now: NOW })[0].delta)).toBeLessThan(
+      0.01,
+    );
+    expect(findMispricedOtmContracts(chain, SPOT, { now: NOW, minAbsDelta: 0.01 })).toHaveLength(0);
+  });
+});

@@ -470,6 +470,7 @@ import {
   type ExportMarket,
 } from './export.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
+import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
   recordShortSqueezeCapture,
@@ -3910,15 +3911,35 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   const deltaRaw = req.query['minDelta'];
   const minAbsDelta =
     typeof deltaRaw === 'string' && deltaRaw.length > 0 ? Number(deltaRaw) : undefined;
+  // TRA-2341 — dollar floor on the mispricing DENOMINATOR. Absent ⇒ the panel
+  // default; `?minTheo=0` restores the raw pre-TRA-2341 projection. See
+  // `otm-theo-floor.ts` for why this is a route-layer filter and not an engine
+  // default (the `single_leg_otm` sleeve calls `scanOtm` in-process, not over
+  // HTTP, so this cannot reach a trading decision).
+  const theoRaw = req.query['minTheo'];
+  const minTheo =
+    typeof theoRaw === 'string' && theoRaw.length > 0 && Number.isFinite(Number(theoRaw))
+      ? Number(theoRaw)
+      : OTM_PANEL_THEO_FLOOR;
 
   const result = await relativeValueScannerService.scanOtm(symbol, {
     ...(Number.isFinite(minMispricing) ? { mispricingThresholdPct: Number(minMispricing) } : {}),
     ...(Number.isFinite(minAbsDelta) ? { minAbsDelta: Number(minAbsDelta) } : {}),
   });
+  // Floor BEFORE the slice. Filtering after it would leave the underflow rows
+  // occupying the top N and merely blank the table.
+  const floored = applyTheoFloor(result.candidates, minTheo);
   res.json({
     ...result,
     // `scanOtm` ranks by |mispricingPct| descending, so a slice is the top N.
-    candidates: result.candidates.slice(0, limit),
+    candidates: floored.kept.slice(0, limit),
+    // Never a silent drop: the panel footnotes this, and its presence is what
+    // distinguishes a build carrying the guard from one that predates it.
+    theoFloor: {
+      applied: floored.floor,
+      suppressed: floored.suppressed,
+      maxSuppressedMispricingPct: floored.maxSuppressedMispricingPct,
+    },
     diagnostics: relativeValueScannerService.diagnostics(),
   });
 });

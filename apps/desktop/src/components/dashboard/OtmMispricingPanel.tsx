@@ -82,6 +82,30 @@ interface ScannerDiagnostics {
   expirationsCacheSize: number;
 }
 
+/**
+ * TRA-2341 — what the server's denominator guard removed from this scan.
+ *
+ * Far OTM, Black-Scholes theo decays toward zero much faster than the market's
+ * bid, which stays pinned near a penny by the minimum tick. `(mark − theo)/theo`
+ * then reports the TICK SIZE, not a disagreement with the vol surface — live
+ * SPY showed mark 0.095 over theo 0.000128 as +74215.7%, and because the
+ * scanner ranks by |mispricingPct| those rows filled the entire default panel.
+ * The route now drops candidates whose theo is below one tick BEFORE slicing to
+ * the limit, and reports what it dropped here.
+ *
+ * OPTIONAL on purpose: a server build predating TRA-2341 omits the block
+ * entirely, which is precisely how this panel can tell the guard is deployed
+ * rather than assuming it. Absent ⇒ render nothing, never a fabricated zero.
+ */
+interface TheoFloorReport {
+  /** The floor the server applied, in dollars. 0 ⇒ the guard was disabled. */
+  applied: number;
+  /** How many candidates it removed. */
+  suppressed: number;
+  /** Largest |mispricingPct| among the removed rows — a RATIO. Null if none. */
+  maxSuppressedMispricingPct: number | null;
+}
+
 interface OtmMispricingScanResponse {
   symbol: string;
   spot: number | null;
@@ -89,6 +113,7 @@ interface OtmMispricingScanResponse {
   candidates: OtmCandidate[];
   reason?: ScanReason;
   errorMessage?: string;
+  theoFloor?: TheoFloorReport;
   diagnostics?: ScannerDiagnostics;
 }
 
@@ -383,6 +408,11 @@ export function OtmMispricingPanel({
   // A non-ok reason is a FAULT (explain it). An 'ok' scan with no rows is a
   // legitimately quiet chain and gets its own, non-alarming copy.
   const faultCopy = reason && reason !== 'ok' ? REASON_COPY[reason] : null;
+  // TRA-2341 — only meaningful when the server actually removed something.
+  // `applied === 0` means the guard ran but was disabled (?minTheo=0), and an
+  // absent block means the server predates the guard: neither is a suppression.
+  const floorReport = scan?.theoFloor;
+  const suppressed = floorReport && floorReport.suppressed > 0 ? floorReport : null;
 
   return (
     <div className="otm-mispricing-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
@@ -495,7 +525,32 @@ export function OtmMispricingPanel({
         </div>
       )}
 
-      {!error && reason === 'ok' && candidates.length === 0 && (
+      {/*
+        TRA-2341 — an all-suppressed scan must NOT fall through to the "thin
+        chain" copy below. Live SPY produced 15 usable-looking rows that were
+        all theo underflow; telling the desk "nothing passed the liquidity
+        filters" would be a flat lie about a chain that is anything but thin.
+      */}
+      {!error && reason === 'ok' && candidates.length === 0 && suppressed && (
+        <div className="empty">
+          <strong>All candidates were below the theo floor</strong>
+          <div style={{ marginTop: '0.35rem', maxWidth: '46rem', marginInline: 'auto' }}>
+            {suppressed.suppressed} contract{suppressed.suppressed === 1 ? '' : 's'} cleared the
+            liquidity gates for {scan?.symbol}, but every one priced below{' '}
+            {fmtPrice(suppressed.applied)} on the model — so its mispricing ratio measures the
+            minimum tick, not a disagreement with the vol surface. This is a real chain with no
+            reliable read at this expiration, not an empty one.
+          </div>
+          <div className="muted" style={{ marginTop: '0.5rem' }}>
+            largest suppressed divergence:{' '}
+            {suppressed.maxSuppressedMispricingPct === null
+              ? '—'
+              : `${fmt(suppressed.maxSuppressedMispricingPct * 100, 1)}%`}
+          </div>
+        </div>
+      )}
+
+      {!error && reason === 'ok' && candidates.length === 0 && !suppressed && (
         <div className="empty">
           No OTM contracts passed the liquidity filters for {scan?.symbol} at{' '}
           {scan?.expiration ?? 'this expiration'}. The scanner drops contracts under 50 open
@@ -556,6 +611,24 @@ export function OtmMispricingPanel({
             </tbody>
           </table>
         </div>
+      )}
+
+      {/*
+        TRA-2341 — a filter that drops rows silently turns "15 artifacts" into
+        "nothing found", which reads exactly like a thin chain. Always say what
+        was removed, and only when something actually was.
+      */}
+      {!error && reason === 'ok' && candidates.length > 0 && suppressed && (
+        <p className="muted" style={{ margin: 0, fontSize: '0.8rem' }}>
+          {suppressed.suppressed} higher-ranked contract
+          {suppressed.suppressed === 1 ? ' was' : 's were'} hidden: model price below{' '}
+          {fmtPrice(suppressed.applied)} (under one tick), where (mark − theo) / theo measures the
+          minimum tick rather than a disagreement with the surface
+          {suppressed.maxSuppressedMispricingPct === null
+            ? ''
+            : ` — the worst read ${fmt(suppressed.maxSuppressedMispricingPct * 100, 1)}%`}
+          . Append <code>&amp;minTheo=0</code> to the scan URL to see them.
+        </p>
       )}
 
       <p className="muted" style={{ margin: 0 }}>
