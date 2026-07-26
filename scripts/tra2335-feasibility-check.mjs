@@ -49,9 +49,16 @@ const BASE = (baseArg ? baseArg.slice('--base='.length) : 'https://tradingai-bqb
 //   the route you grade from shows no change)? And when the book is `feasible` while a
 //   sleeve inside it is not, does the headline say so?
 //
-//   IT DOES NOT GRADE THE BOOK. A live `feasible` is not a pass and a live `infeasible`
-//   is not a failure — those are facts about the trading book, not about this check.
-//   Wiring them to the exit code would turn a market observation into a red build.
+//   TRA-2361 adds R1's instrument: is `weight` + `blocking` on every sleeve, does
+//   `sum(sleeve.n) === bookN` on each axis (the check that proves NOTHING WAS FILTERED —
+//   a sleeve dropped BECAUSE it is infeasible is invisible in every other field here),
+//   does `blockingSleeves` agree with the per-sleeve flags, and — when R1 is biting — does
+//   criterion 3 read INFEASIBLE with the offending sleeve named in the headline?
+//
+//   IT DOES NOT GRADE THE BOOK. A live `feasible` is not a pass, a live `infeasible` is
+//   not a failure, and A LIVE BLOCK IS NOT A FAILURE EITHER — those are facts about the
+//   trading book, not about this check. Wiring them to the exit code would turn a market
+//   observation into a red build.
 if (LIVE) {
   const url = `${BASE}/api/health/live-capital-gate`;
   let gate;
@@ -102,10 +109,64 @@ if (LIVE) {
       console.log(`  ── ${name} (${axis.axis}, bookN=${axis.bookN}) ──`);
       for (const s of axis.sleeves) {
         const pct = s.weight == null ? '  ?' : `${String(Math.round(s.weight * 100)).padStart(3)}`;
+        const flags = [
+          s.blocking ? '⛔ BLOCKING' : null,
+          s.approachingBlockingThreshold ? '⚠️ approaching' : null,
+          s.material ? null : '(immaterial)',
+        ]
+          .filter(Boolean)
+          .join(' ');
         console.log(
-          `     ${String(s.key).padEnd(20)} n=${String(s.n).padStart(3)}  ${pct}%  ceilingNetR=${String(s.ceilingNetR).padStart(9)}  → ${s.verdict}${s.material ? '' : '  (immaterial)'}`,
+          `     ${String(s.key).padEnd(20)} n=${String(s.n).padStart(3)}  ${pct}%  ceilingNetR=${String(s.ceilingNetR).padStart(9)}  → ${s.verdict}  ${flags}`,
         );
       }
+
+      // ── TRA-2361 AC7 — grade the R1 INSTRUMENT on this axis ────────────────
+      //
+      // ⚠️ Still grading the INSTRUMENT, never the BOOK: a live block is a fact about the
+      // trading book and must NOT red the exit code. What is graded here is whether the
+      // route can EXPRESS a block honestly — the fields present, the partition complete,
+      // and the axis summary agreeing with the per-sleeve flags.
+      const missingWeight = axis.sleeves.filter((s) => !('weight' in s));
+      const missingBlocking = axis.sleeves.filter((s) => !('blocking' in s));
+      if (missingWeight.length) {
+        problems.push(
+          `${name}: ${missingWeight.length} sleeve(s) carry no \`weight\` — R1 is graded on weight, so a sleeve without one cannot be graded at all`,
+        );
+      }
+      if (missingBlocking.length) {
+        problems.push(
+          `${name}: ${missingBlocking.length} sleeve(s) carry no \`blocking\` flag — the build predates TRA-2361, or the payload whitelist dropped it (the TRA-2335 field-map trap, third time)`,
+        );
+      }
+      // THE PARTITION CHECK — this is the one that proves NOTHING WAS FILTERED. A sleeve
+      // dropped BECAUSE it is infeasible is strictly worse than one that reads
+      // `infeasible`, and it is invisible in every other field on this payload.
+      const sumN = axis.sleeves.reduce((a, s) => a + (Number(s.n) || 0), 0);
+      if (axis.bookN != null && sumN !== axis.bookN) {
+        problems.push(
+          `${name}: sum(sleeve.n) = ${sumN} but bookN = ${axis.bookN} — ${axis.bookN - sumN} graded row(s) are in NO sleeve. Either the partition became a filter, or it is re-deriving its own population.`,
+        );
+      }
+      // `blockingSleeves` must be a DERIVED PROJECTION of the per-sleeve flags. Two
+      // computations that must agree is the shape that silently drifts; assert it against
+      // the deployed bytes rather than trusting the module's own docstring.
+      if (Array.isArray(axis.blockingSleeves)) {
+        const derived = axis.sleeves.filter((s) => s.blocking).map((s) => s.key);
+        if (JSON.stringify(axis.blockingSleeves) !== JSON.stringify(derived)) {
+          problems.push(
+            `${name}: \`blockingSleeves\` = [${axis.blockingSleeves.join(', ')}] disagrees with the per-sleeve \`blocking\` flags [${derived.join(', ')}] — the gate reads the former, an operator reads the latter`,
+          );
+        }
+        console.log(
+          `     R1 blockingSleeves: ${axis.blockingSleeves.length ? axis.blockingSleeves.map((k) => `⛔ ${k}`).join(', ') : '(none)'}`,
+        );
+      } else if (!missingBlocking.length) {
+        problems.push(
+          `${name}: sleeves carry \`blocking\` but the axis carries no \`blockingSleeves\` array — the gate's own predicate reads that array, so a consumer cannot reproduce the stop`,
+        );
+      }
+
       if (axis.worstSleeve) {
         console.log(
           `     ⚠️ worst: ${axis.worstSleeve.key} — infeasible, carrying ${Math.round((axis.infeasibleWeight ?? 0) * 100)}% of the graded book`,
@@ -133,8 +194,35 @@ if (LIVE) {
     }
   }
 
-  // AC4, graded against the LIVE bytes.
+  // TRA-2361 AC7, graded against the LIVE bytes — R1 END TO END.
+  //
+  // ⚠️ A LIVE BLOCK IS NOT A FAILURE OF THIS CHECK. What IS a failure is a block that the
+  // route reports in one field and contradicts in another: a payload where sleeves are
+  // flagged `blocking` while criterion 3 reads PASS/FAIL, or a headline that stops the
+  // capital path without naming what stopped it. Those are instrument defects and they
+  // are exactly what an operator would act on wrongly.
   const c3 = (gate.criteria ?? []).find((c) => c.name === 'positive_expectancy');
+  const liveBlocking = sf == null ? [] : Object.values(sf).filter((a) => a && Array.isArray(a.blockingSleeves)).flatMap((a) => a.blockingSleeves);
+  if (liveBlocking.length > 0) {
+    console.log('');
+    console.log(`  ⛔ R1 IS BITING LIVE — blocking sleeve(s): ${[...new Set(liveBlocking)].join(', ')}`);
+    if (c3 && c3.status !== 'INFEASIBLE') {
+      problems.push(
+        `a sleeve is flagged \`blocking\` but criterion 3 reads ${c3.status}, not INFEASIBLE — the payload contradicts itself and the gate is not applying R1`,
+      );
+    }
+    if (c3 && c3.pass !== false) {
+      problems.push('a sleeve is flagged `blocking` and criterion 3 still reads pass:true');
+    }
+    const named = [...new Set(liveBlocking)].filter((k) => String(gate.summary ?? '').includes(k));
+    if (named.length === 0) {
+      problems.push(
+        `the gate is blocked by sleeve(s) [${[...new Set(liveBlocking)].join(', ')}] and the headline summary names NONE of them — a stop whose cause is not in the headline reads as an unexplained hold`,
+      );
+    }
+  }
+
+  // AC4, graded against the LIVE bytes.
   if (c3 && c3.status === 'FAIL' && f.verdict === 'unknown') {
     if (!String(gate.summary ?? '').includes('REACHABILITY UNKNOWN')) {
       problems.push(
@@ -152,9 +240,12 @@ if (LIVE) {
     process.exit(1);
   }
   console.log(
-    `\n✅ OK — the live gate publishes the sleeve decomposition and its headline matches it.` +
+    `\n✅ OK — the live gate publishes the sleeve decomposition WHOLE (sum(sleeve.n) === bookN on` +
+      `\n   every axis), carries \`weight\` + \`blocking\` on every sleeve, and its headline matches` +
+      `\n   its \`blockingSleeves\`.` +
       `\n   ⚠️ This is a statement about build ${version?.commit ?? '(unpinned)'} at this instant, and it perishes on the next deploy.` +
-      `\n   ⚠️ It says nothing about whether the BOOK is feasible — read the verdicts above for that.`,
+      `\n   ⚠️ It says nothing about whether the BOOK is feasible, or whether R1 is currently` +
+      `\n      biting — read the verdicts above for that. A live block is a market observation.`,
   );
   process.exit(0);
 }

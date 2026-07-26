@@ -10,6 +10,12 @@ import { computeCeilingAxis, MATERIAL_SLEEVE_WEIGHT } from './gate-feasibility.j
 
 // TRA-2353 (parent TRA-2335 → TRA-2332) — PER-SLEEVE payoff-ceiling feasibility.
 //
+// ⚠️ TRA-2361 SUPERSEDES ONE DECISION IN HERE. TRA-2353 shipped this decomposition as
+// pure REPORTING and reserved "should an infeasible sleeve block?" for QuantTrader. It
+// now does block (rule R1) — see `gate-sleeve-blocking.test.ts`, which owns that rule.
+// This file keeps owning the DECOMPOSITION: the partition invariant, the credit/debit
+// derivation, the leave-one-out sweep and the `unknown` handling are all unchanged.
+//
 // ⚠️ AC6, and the whole reason this file is separate from `gate-feasibility.test.ts`:
 // A POSITIVE CONTROL MUST CONTAIN WHAT IT DETECTS. A mixed-book fixture in which every
 // sleeve happens to be feasible passes in BOTH worlds — the one where the partition
@@ -242,20 +248,28 @@ describe('TRA-2353 · AC2 — a `feasible` book hiding an `infeasible` sleeve MU
     expect(gate.summary).not.toContain('COMPOSITION-FRAGILE');
   });
 
-  it('NOT IN SCOPE: an infeasible sleeve changes NOTHING about what blocks', () => {
-    // TRA-2353 reserves the "should a sleeve verdict block?" policy call for QuantTrader.
-    // The block below is reporting; `pass`/`passed` must be byte-identical to the world
-    // in which it does not exist. Same book, graded against a bar the BOOK clears.
+  it('SUPERSEDED BY TRA-2361 (R1): a 74% infeasible sleeve now DOES block', () => {
+    // ⚠️ THIS TEST HAS CHANGED SIDES, DELIBERATELY. It used to be titled "NOT IN SCOPE: an
+    // infeasible sleeve changes NOTHING about what blocks" and asserted `c3.status ===
+    // 'FAIL'` — encoding TRA-2353's decision to ship the sleeve decomposition as pure
+    // reporting and reserve the policy call for QuantTrader. QuantTrader has since ruled
+    // (TRA-2361, rule R1, PRE-REGISTERED before the first per-sleeve read), so that
+    // assertion is now a pin on a retired policy. It is REWRITTEN rather than deleted: a
+    // deleted test leaves no trace that the semantics moved, and this one is the record.
     const report = reportFor(MIXED_BOOK());
     const gate = evaluateLiveCapitalGate(report, CRITERIA);
     const c3 = gate.criteria.find((c) => c.name === 'positive_expectancy')!;
 
-    // The book-level verdict is `feasible`, so criterion 3 grades the MEASURED value and
-    // reads a plain FAIL — never INFEASIBLE off the back of a sleeve.
-    expect(c3.status).toBe('FAIL');
-    expect(c3.pass).toBe(false);
+    // The BOOK-level verdict is still `feasible` and still means exactly what it meant —
+    // R1 did not change book semantics (TRA-2361 "not in scope").
     expect(gate.feasibility.feasible).toBe(true);
-    // `passed` still derives from `pass` alone.
+    // …but the credit sleeve carries 35/47 = 74% of the graded book at a cost-net ceiling
+    // of ≈0.00R, which is ≥ the 0.20 blocking weight and a POSITIVE `infeasible`.
+    expect(gate.sleeveFeasibility.byPremiumDirection.blockingSleeves).toEqual(['credit']);
+    expect(c3.status).toBe('INFEASIBLE');
+    expect(c3.pass).toBe(false);
+    // The one invariant that did NOT move: `passed` still derives from `pass` alone, so no
+    // downstream consumer has to learn a third state to stay correct.
     expect(gate.passed).toBe(gate.criteria.every((c) => c.pass));
   });
 

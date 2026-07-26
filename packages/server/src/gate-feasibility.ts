@@ -191,10 +191,17 @@ export function computeBookCeiling(graded: readonly CeilingInput[]): BookCeiling
 // inequality on each individual trade. A per-sleeve `infeasible` is therefore exactly as
 // sound as the book-level one — it is not a weaker heuristic read.
 //
-// ⚠️ AND THE SLEEVE VERDICT IS NOT THE BLOCKING ONE. `passed` semantics are untouched
-// (TRA-2353 "not in scope"): whether a sleeve verdict should block is a POLICY decision
-// and QuantTrader owns it. Everything here is additive reporting — but per the TRA-2335
-// sign-off, NON-BLOCKING ≠ INVISIBLE, so the worst offender is named in the headline.
+// ⚠️ TRA-2361 SUPERSEDES TRA-2353 ON WHETHER A SLEEVE BLOCKS. This block used to read
+// "the sleeve verdict is NOT the blocking one" — TRA-2353 deliberately shipped it as pure
+// reporting and reserved the policy call for QuantTrader. QuantTrader has since ruled, and
+// PRE-REGISTERED the rule before the first per-sleeve read: see {@link BLOCKING_SLEEVE_WEIGHT}
+// for R1 verbatim. A `blocking` sleeve now makes `positive_expectancy` INFEASIBLE.
+//
+// ⚠️ The safety argument is MONOTONICITY, and it is a claim about the relation between two
+// builds, so no green suite on this one can see it: adding a conjunct to a conjunction is
+// monotone non-increasing, therefore `passed′ ≤ passed` pointwise and this can only ever
+// CLOSE a capital path, never open one. Proven differentially against the pre-fix build by
+// `scripts/tra2361-monotonicity-matrix.mjs`, not by reading this paragraph.
 
 /** One graded outcome as the sleeve partition reads it: ceiling inputs + its cost drag. */
 export interface SleeveCeilingInput extends CeilingInput {
@@ -448,6 +455,31 @@ export interface SleeveFeasibility {
   verdict: FeasibilityVerdict;
   /** True when this sleeve is at or above {@link MATERIAL_SLEEVE_WEIGHT} of the book. */
   material: boolean;
+  /**
+   * TRA-2361 rule R1 — this sleeve BLOCKS the `positive_expectancy` criterion.
+   *
+   * Exactly `R1(1) ∧ R1(2)`:
+   *   1. `verdict === 'infeasible'` — a POSITIVE determination. `unknown` NEVER blocks.
+   *   2. `weight >= BLOCKING_SLEEVE_WEIGHT`, where `weight = n ÷ bookN` over ALL partition
+   *      members INCLUDING `unusable` ones.
+   * There is no sample-size floor and no exemption; see {@link BLOCKING_SLEEVE_WEIGHT}.
+   *
+   * ⚠️ This is a LABEL like {@link material}. It is emitted on every sleeve at every
+   * weight and it filters nothing — the gate reads it, it does not hide behind it.
+   */
+  blocking: boolean;
+  /**
+   * TRA-2361 AC4 — WEIGHT-ONLY and verdict-INDEPENDENT: this sleeve sits in
+   * `[APPROACHING_BLOCKING_SLEEVE_WEIGHT, BLOCKING_SLEEVE_WEIGHT)`, i.e. one or two
+   * resolutions from being able to block if its verdict is (or becomes) `infeasible`.
+   *
+   * Set on EVERY sleeve regardless of verdict, deliberately: "this verdict can change on
+   * COMPOSITION ALONE, with no code change" is a documented property of this instrument,
+   * and a gate that flips to `INFEASIBLE` with no prior warning is one nobody can plan
+   * around. Live 2026-07-26 `bull_call_spread` sat at 9/47 = 19.15%, 0.85pp under the
+   * threshold — one more resolution (10/48 = 20.83%) crosses it.
+   */
+  approachingBlockingThreshold: boolean;
   reason: string;
 }
 
@@ -477,6 +509,15 @@ export interface AxisFeasibility {
   bookN: number;
   /** Every sleeve, weight-descending. Emitted whole — nothing is filtered out of here. */
   sleeves: SleeveFeasibility[];
+  /**
+   * TRA-2361 — the keys of every sleeve with `blocking: true`, weight-descending.
+   *
+   * ⚠️ A DERIVED PROJECTION of {@link sleeves}, never an independent computation: it is
+   * `sleeves.filter(s => s.blocking).map(s => s.key)` and nothing else, so the axis
+   * summary and the per-sleeve flags cannot drift apart. The live prover asserts that
+   * agreement against the deployed bytes rather than trusting this sentence.
+   */
+  blockingSleeves: string[];
   /** The `infeasible` sleeve carrying the most weight. Null when none is infeasible. */
   worstSleeve: SleeveFeasibility | null;
   /** Share of the graded book (0–1) sitting inside an `infeasible` sleeve. */
@@ -493,10 +534,57 @@ export interface AxisFeasibility {
  * headline note names the worst offender at ANY weight — a threshold that SUPPRESSES is
  * a new blind spot in an instrument that exists because a true state was invisible. The
  * flag is here so a consumer that wants to triage can, without this module deciding for
- * it. Whether a material infeasible sleeve should BLOCK is QuantTrader's call, not this
- * module's (TRA-2353, "not in scope: changing what blocks").
+ * it.
+ *
+ * ⚠️ TRA-2361 — DO NOT raise this to 0.2 and reuse it as the blocking threshold. The two
+ * constants have two different jobs and collapsing them REDUCES VISIBILITY: a sleeve at
+ * 12% reads `material: true` today and would silently stop doing so. See
+ * {@link BLOCKING_SLEEVE_WEIGHT}.
  */
 export const MATERIAL_SLEEVE_WEIGHT = 0.1;
+
+/**
+ * TRA-2361 — the weight at which an `infeasible` sleeve BLOCKS the capital path.
+ *
+ * ── Rule R1, pre-registered by QuantTrader on TRA-2353 before the first read ──────────
+ *
+ *   A sleeve BLOCKS the `positive_expectancy` criterion of `live-capital-gate.ts` iff ALL
+ *   of:
+ *     1. `verdict === 'infeasible'` — a POSITIVE determination. `unknown` NEVER blocks.
+ *     2. `weight >= 0.20`, where `weight = sleeve.n / bookN` and `n` counts ALL partition
+ *        members INCLUDING `unusable` ones (the sleeve's share of the population the book
+ *        verdict is averaged over — NOT `nUsable`, which would shrink an offender's
+ *        apparent weight exactly when its rewards are underivable).
+ *     3. the condition holds on EITHER axis — `byStructure` OR `byPremiumDirection`.
+ *   The gate blocks iff ≥1 sleeve blocks. There is NO sample-size floor and NO exemption
+ *   — deliberately; the only available justification for one was a composition argument
+ *   that dies if `minResolvedIdeas` moves.
+ *
+ * ⚠️ 0.20 was PRE-REGISTERED before the first per-sleeve read precisely so it cannot be
+ * tuned to a result afterwards. Do not substitute another threshold or add an exemption
+ * without going back to QuantTrader — the pre-registration is the point.
+ *
+ * ⚠️ INVARIANT, asserted in `gate-sleeve-blocking.test.ts`:
+ *   `BLOCKING_SLEEVE_WEIGHT >= MATERIAL_SLEEVE_WEIGHT`
+ * The LABEL must fire no later than the BLOCK, so a sleeve is always SEEN before it BITES.
+ * Whoever moves either constant has to keep that ordering or the suite goes red.
+ */
+export const BLOCKING_SLEEVE_WEIGHT = 0.2;
+
+/**
+ * TRA-2361 AC4 — the weight at which a sleeve is flagged as APPROACHING the block.
+ *
+ * A pure early-warning band, `[this, BLOCKING_SLEEVE_WEIGHT)`, applied WEIGHT-ONLY to
+ * every sleeve regardless of verdict. It exists because a sleeve's weight moves on
+ * composition alone: live 2026-07-26 `bull_call_spread` sat at 9/47 = 19.15%, 0.85pp
+ * under the threshold, and ONE more resolution (10/48 = 20.83%) makes it blocking-eligible
+ * with no code change anywhere. A gate that flips to `INFEASIBLE` with no prior warning is
+ * one nobody can plan around.
+ *
+ * ⚠️ INVARIANT, asserted in the same test:
+ *   `MATERIAL_SLEEVE_WEIGHT <= APPROACHING_BLOCKING_SLEEVE_WEIGHT < BLOCKING_SLEEVE_WEIGHT`
+ */
+export const APPROACHING_BLOCKING_SLEEVE_WEIGHT = 0.15;
 
 const pctOf = (w: number | null): string => (w == null ? 'unknown share' : `${Math.round(w * 100)}%`);
 
@@ -530,11 +618,28 @@ export function evaluateAxisFeasibility(
       ceilingNetR: s.ceilingNetR,
       verdict: f.verdict,
       material: s.weight != null && s.weight >= MATERIAL_SLEEVE_WEIGHT,
+      // TRA-2361 R1(1) ∧ R1(2). Graded on the PUBLISHED (4dp-rounded) `weight`, not on a
+      // re-divided `n / bookN`: a reader who checks `0.1915 < 0.20` off the payload must
+      // get the same answer the gate got. Two computations that must agree is the shape
+      // the §2 rule forbids, and here the second one would live in the operator's head.
+      // ⚠️ `verdict === 'infeasible'` is the POSITIVE determination — `unknown` (an
+      // unestablished or fabricated-reward ceiling) never blocks.
+      blocking:
+        f.verdict === 'infeasible' && s.weight != null && s.weight >= BLOCKING_SLEEVE_WEIGHT,
+      // Weight-only, verdict-independent — AC4. A `feasible` sleeve crossing into the band
+      // is exactly as newsworthy: if its ceiling later drops it is already heavy enough.
+      approachingBlockingThreshold:
+        s.weight != null &&
+        s.weight >= APPROACHING_BLOCKING_SLEEVE_WEIGHT &&
+        s.weight < BLOCKING_SLEEVE_WEIGHT,
       reason: f.reason,
     };
   };
 
   const sleeves = axis.sleeves.map(gradeSleeve);
+  // A DERIVED PROJECTION — see AxisFeasibility.blockingSleeves. `sleeves` is already
+  // weight-descending, so the heaviest offender reads first here too.
+  const blockingSleeves = sleeves.filter((s) => s.blocking).map((s) => s.key);
   const infeasible = sleeves.filter((s) => s.verdict === 'infeasible');
   const worstSleeve = infeasible[0] ?? null; // already weight-descending
   const infeasibleWeight = axis.bookN
@@ -569,15 +674,53 @@ export function evaluateAxisFeasibility(
   //    verdict is the book's verdict by construction. "Sleeve X (100% of the book) is
   //    infeasible" beside "the book is infeasible" is the same sentence twice.
   //  • The book is ALREADY `infeasible`. The loudest available stop is published; adding
-  //    a non-blocking sleeve warning under it dilutes the one line that must be read.
+  //    a sleeve warning under it dilutes the one line that must be read.
   //
-  // Neither case suppresses DATA: `sleeves`, `worstSleeve` and `infeasibleWeight` are
-  // populated regardless. Only the headline sentence is conditioned — the distinction
-  // that keeps "an alarm that is always on is one nobody reads" from becoming the fix.
+  // ⚠️ TRA-2361 — BOTH SUPPRESSIONS SURVIVE R1, and that was re-derived rather than
+  // assumed. The question a blocking sleeve raises is "can this hide the REASON THE GATE
+  // STOPS?", and the answer is no, twice over:
+  //
+  //   • `bookVerdict === 'infeasible'` ⇒ the gate is ALREADY stopping on `barUnreachable`
+  //     and the headline prints the book pair. The sleeve adds no new cause.
+  //   • ONE sleeve ⇒ its rows ARE the book's rows and the netting/provenance rules are
+  //     identical, so its verdict IS the book's verdict — which puts it in the case above.
+  //
+  //   • and independently: `live-capital-gate.ts` builds its INFEASIBLE headline clause
+  //     from `sleeves.filter(s => s.blocking)` directly, never from this sentence. A
+  //     blocking sleeve is named in the headline whether or not this note is emitted.
+  //
+  // (The first draft overrode both suppressions "to be safe" and made a single-sleeve
+  // infeasible book print `sleeve X (100% of the graded book) … the book verdict rests on
+  // the remainder` directly under `the book is infeasible` — the same sentence twice, with
+  // a remainder that does not exist. Caught by running the reconstruction prover, not by
+  // reading the diff.)
+  //
+  // Neither case suppresses DATA: `sleeves`, `worstSleeve`, `blockingSleeves` and
+  // `infeasibleWeight` are populated regardless. Only the sentence is conditioned — the
+  // distinction that keeps "an alarm that is always on is one nobody reads" from
+  // becoming the fix.
   const parts: string[] = [];
+  const worstBlocks = worstSleeve?.blocking === true;
   if (worstSleeve && axis.sleeves.length > 1 && bookVerdict !== 'infeasible') {
     parts.push(
-      `SLEEVE INFEASIBLE (non-blocking, ${axis.axis}) — the book verdict is \`${bookVerdict}\` in aggregate, but sleeve \`${worstSleeve.key}\` (n=${worstSleeve.n}, ${pctOf(worstSleeve.weight)} of the graded book) has a cost-net payoff ceiling of ${worstSleeve.ceilingNetR == null ? 'unknown' : `${fmt(worstSleeve.ceilingNetR)}R`} against the ${fmt(barR)}R bar and CANNOT reach it at any hit rate. ${pctOf(infeasibleWeight)} of the graded book sits in an infeasible sleeve; the book verdict rests on the remainder.`,
+      // ⚠️ The word after "SLEEVE INFEASIBLE" is load-bearing and it used to be the
+      // constant "non-blocking". Under R1 that sentence would be FALSE exactly when it
+      // matters most — a stale summary is a false all-clear wearing the fix's clothes.
+      `SLEEVE INFEASIBLE (${worstBlocks ? `⛔ BLOCKING — TRA-2361 R1, weight ≥ ${BLOCKING_SLEEVE_WEIGHT}` : 'non-blocking'}, ${axis.axis}) — the book verdict is \`${bookVerdict}\` in aggregate, but sleeve \`${worstSleeve.key}\` (n=${worstSleeve.n}, ${pctOf(worstSleeve.weight)} of the graded book) has a cost-net payoff ceiling of ${worstSleeve.ceilingNetR == null ? 'unknown' : `${fmt(worstSleeve.ceilingNetR)}R`} against the ${fmt(barR)}R bar and CANNOT reach it at any hit rate. ${pctOf(infeasibleWeight)} of the graded book sits in an infeasible sleeve; the book verdict rests on the remainder.${blockingSleeves.length > 1 ? ` Blocking sleeves on this axis: ${blockingSleeves.map((k) => `\`${k}\``).join(', ')}.` : ''}`,
+    );
+  }
+  // TRA-2361 AC4 — the EARLY WARNING. Published for every sleeve in the band regardless
+  // of verdict, per R1's companion rule: weight moves on composition alone, so a sleeve
+  // that is merely heavy today is a sleeve that can block the day its ceiling drops.
+  const approaching = sleeves.filter((s) => s.approachingBlockingThreshold);
+  if (approaching.length > 0) {
+    parts.push(
+      `APPROACHING THE BLOCKING THRESHOLD (${axis.axis}) — ${approaching
+        .map(
+          (s) =>
+            `\`${s.key}\` (n=${s.n}, ${pctOf(s.weight)}, verdict \`${s.verdict}\`)`,
+        )
+        .join(', ')} ${approaching.length === 1 ? 'sits' : 'sit'} in [${APPROACHING_BLOCKING_SLEEVE_WEIGHT}, ${BLOCKING_SLEEVE_WEIGHT}) of the graded book. At weight ≥ ${BLOCKING_SLEEVE_WEIGHT} an \`infeasible\` verdict there BLOCKS the capital path (TRA-2361 R1) — and weight moves on COMPOSITION ALONE, with no code change.`,
     );
   }
   if (fragility.flipsOnSingleSleeveRemoval) {
@@ -592,6 +735,7 @@ export function evaluateAxisFeasibility(
     barR,
     bookN: axis.bookN,
     sleeves,
+    blockingSleeves,
     worstSleeve,
     infeasibleWeight,
     fragility,

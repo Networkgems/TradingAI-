@@ -126,7 +126,7 @@ Live-capital wiring may be **proposed** only when **all** of the following hold
 |---|-----------|-----------|-----|
 | 1 | **Weeks of evidence** — distinct ISO weeks with ≥1 settled idea | **≥ 8** | ~2 months of weekly forward data; one lucky week is not a track record. |
 | 2 | **Sample size** — total resolved (settled) ideas | **≥ 30** | A small-n floor so hit-rate / expectancy are not noise. |
-| 3 | **Positive expectancy** — overall **cost-net** R-expectancy (net P/L ÷ max-loss) | **> 0** | The edge must be positive *after* normalizing for risk taken **and net of modeled transaction costs** (F1). |
+| 3 | **Positive expectancy** — overall **cost-net** R-expectancy (net P/L ÷ max-loss) | **> 0**, **and** the bar must be *reachable* — see the feasibility precondition (TRA-2335) and **rule R1** (TRA-2361) | The edge must be positive *after* normalizing for risk taken **and net of modeled transaction costs** (F1) — and the bar must be one the instrument can produce, at the **book** level *and* in every sleeve carrying ≥ 20% of it. |
 | 4 | **Expectancy durability** — fraction of resolved-bearing weeks with positive **cost-net** R-expectancy | **≥ 60%** | The edge must persist across weeks (net of costs), not come from one outlier. |
 | 5 | **POP calibration** — \|realized hit-rate − mean stated POP\| | **≤ 10 pts** | The model's stated probabilities must be honest, not optimistic. |
 | 6 | **Defined-risk integrity** — realized losses that breached the stated max-loss | **= 0** | Defined-risk must actually be defined; any breach is disqualifying. |
@@ -245,9 +245,11 @@ inequality on each individual trade, so it restricts to any subset —
 
 Four rules:
 
-1. **Nothing here changes what blocks.** `pass` / `passed` are byte-identical with or
-   without this block. Whether a material infeasible sleeve *should* block is a policy
-   decision and it is QuantTrader's, not the implementer's.
+1. ~~**Nothing here changes what blocks.**~~ **SUPERSEDED by TRA-2361 — see *Rule R1*
+   below.** This rule was true of TRA-2353, which shipped the decomposition as pure
+   reporting and reserved the policy call for QuantTrader. QuantTrader has since ruled:
+   a **material** infeasible sleeve now **blocks**. `pass` / `passed` are **no longer**
+   byte-identical with and without this block.
 2. **Non-blocking ≠ invisible.** The worst offender is named in `feasibilityNote` **and**
    in the headline `summary`, at any weight. `MATERIAL_SLEEVE_WEIGHT` (10%) **labels**, it
    never **filters** — a threshold that suppresses would be a new blind spot in an
@@ -266,10 +268,73 @@ Four rules:
    infeasible state. When it lands on a criterion reading a bare `FAIL`, the summary now
    says `REACHABILITY UNKNOWN` rather than letting `FAIL` assert *"the book underperformed"*.
 
-⚠️ `index.ts` maps this payload **field by field**, not by spread. A new field on the gate
-result is **silently dropped** from the route: the module stays correct, the unit tests
-stay green, and the route you grade from shows no change. Extend the whitelist in the same
-commit.
+⚠️ `index.ts` maps `criteria` **field by field**, not by spread. A new field on
+`GateCriterionResult` is **silently dropped** from the route: the module stays correct, the
+unit tests stay green, and the route you grade from shows no change. Extend the whitelist
+in the same commit. (`sleeveFeasibility` itself is a **whole-object pass-through**, so new
+fields on `SleeveFeasibility` / `AxisFeasibility` *do* flow.)
+
+### Rule R1 (TRA-2361) — a **material** infeasible sleeve **BLOCKS** the capital path
+
+Pre-registered by QuantTrader on TRA-2353 **before the first per-sleeve read**, precisely
+so the constant cannot be tuned to a result afterwards. Mirrored here verbatim:
+
+> A sleeve **blocks** the `positive_expectancy` criterion of `live-capital-gate.ts` iff **all** of:
+> 1. `verdict === 'infeasible'` — a POSITIVE determination. **`unknown` never blocks.**
+> 2. `weight ≥ 0.20`, where `weight = sleeve.n / bookN` and `n` counts **ALL** partition members **including
+>    `unusable`** ones (the sleeve's share of the population the book verdict is averaged over — *not*
+>    `nUsable`, which would shrink an offender's apparent weight exactly when its rewards are underivable).
+> 3. the condition holds on **either** axis — `byStructure` **OR** `byPremiumDirection`.
+>
+> The gate blocks iff **≥1** sleeve blocks. There is **no sample-size floor and no exemption** — deliberately;
+> the only available justification for one was a composition argument that dies if `minResolvedIdeas` moves.
+
+**Do not substitute another threshold or add an exemption without going back to
+QuantTrader.** The `0.20` is `BLOCKING_SLEEVE_WEIGHT` in `gate-feasibility.ts`.
+
+Why it is a stop rather than a warning: the book ceiling is a **mean over a mixed
+population**, and *a mean can satisfy a bound that no material sub-population satisfies*.
+On 2026-07-26 the book read `feasible` (net `0.2391R` vs the `0.20R` bar) while the 35-idea
+credit sleeve inside it — **74% of the graded rows** — sat at ≈`0.00R` at a **realized 100%
+hit rate**. Promoting on that number is promoting on 26% of the evidence.
+
+**Two constants, two jobs.** `MATERIAL_SLEEVE_WEIGHT` stays at `0.10`; it was *not* raised
+to `0.20` and reused. Collapsing them would **reduce visibility** — a sleeve at 12% reads
+`material: true` today and would silently stop doing so. The invariant
+`BLOCKING_SLEEVE_WEIGHT >= MATERIAL_SLEEVE_WEIGHT` is asserted in the suite: **the label
+must fire no later than the block, so a sleeve is always *seen* before it *bites*.**
+
+**Label everything, filter nothing.** `sleeves` is emitted **whole, at every weight,
+blocking or not**. Each sleeve carries `blocking` (exactly R1(1)∧R1(2)) and each axis
+carries `blockingSleeves: string[]`, which is a **derived projection** of those flags and
+never a second predicate. *A sleeve filtered out because it is infeasible is strictly worse
+than one that reads `infeasible`.* The `--live` prover asserts `sum(sleeve.n) === bookN` on
+each axis — that is the check that proves nothing was dropped.
+
+**Early warning (`approachingBlockingThreshold`).** A **weight-only, verdict-independent**
+label for `0.15 ≤ weight < 0.20`, on every sleeve. Not decoration: on 2026-07-26
+`bull_call_spread` sat at **9/47 = 19.15%**, `0.85pp` under the threshold — one more
+resolution (`10/48 = 20.83%`) crosses it. *"This verdict can change on **composition
+alone**, with no code change"* is already a documented property of this instrument, and a
+gate that flips to `INFEASIBLE` with no prior warning is one nobody can plan around.
+
+**The headline names the binding constraint.** A sleeve-driven stop reuses the loud
+`INFEASIBLE` path (it is the same *kind* of stop — more sample cannot resolve it) rather
+than gaining a fourth state, **and it prints the offending sleeve, its weight and its
+ceiling.** The pre-existing headline printed the *book* pair, which on a sleeve-driven
+block contradicts itself: `bar 0.2R vs payoff ceiling 0.2391R` beside a sentence saying the
+criterion cannot be tested. Where the book pair still appears it is explicitly labelled as
+**not** the binding constraint.
+
+**The direction check.** `gate.passed` is `false` today and stays `false` under R1. Adding
+a conjunct to a conjunction is **monotone non-increasing**, so `passed′ ≤ passed`
+pointwise: this can only ever **CLOSE** a capital path, never open one. That is a claim
+about the *relation between two builds*, so a green suite on the new build cannot see it —
+it is proven **differentially** by `scripts/tra2361-monotonicity-matrix.mjs`, which checks
+the pre-fix `live-capital-gate.ts` out of git, runs both over the identical fixtures, and
+cross-tabulates `old passed → new passed`, asserting **zero `false → true`** cells and
+**at least one `true → false`** (otherwise the change is inert and the matrix proves
+nothing). Do **not** substitute a code read for that matrix.
 
 **`scripts/tra2335-feasibility-check.mjs` has two modes and only one of them is a monitor.**
 The default mode is a **mechanism prover over a hand-built reconstruction** — a unit test
@@ -277,9 +342,17 @@ with a CLI, which will print `INFEASIBLE` forever regardless of the live book, b
 input is a constant in the file. **Its green says nothing about the live gate.** Only
 `--live` reads the deployed route (and prints the build SHA beside the verdict, because a
 feasibility verdict is build-scoped and perishes on the next deploy). `--live` grades the
-*instrument*, never the *book*: a live `feasible` is not a pass and a live `infeasible` is
-not a failure — those are facts about the trading book. An unreachable route exits **3
-(BLIND)**, never 0.
+*instrument*, never the *book*: a live `feasible` is not a pass, a live `infeasible` is not
+a failure, and **a live R1 block is not a failure either** — those are facts about the
+trading book, and wiring them to an exit code turns a market observation into a red build.
+An unreachable route exits **3 (BLIND)**, never 0.
+
+Since TRA-2361 `--live` additionally asserts: `sleeveFeasibility` present · every sleeve
+carries `weight` **and** `blocking` · `sum(sleeve.n) === bookN` on **each** axis (the
+partition check — the one that proves nothing was filtered) · `blockingSleeves` agrees with
+the per-sleeve flags · and, **when R1 is biting**, criterion 3 reads `INFEASIBLE` with the
+offending sleeve **named in the headline**. Those are all coherence properties of the
+payload, not statements about the book.
 
 ### Criterion 5 — POP post-calibration (TRA-2006, SHADOW-first)
 

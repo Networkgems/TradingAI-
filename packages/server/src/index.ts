@@ -4492,16 +4492,31 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
         ceilingSources: report.totals.ceilingSourceCounts,
       },
       // TRA-2353 — the SAME ceiling, PER SLEEVE, plus the composition-fragility sweep.
-      // `feasibility` above is the BLOCKING verdict and its semantics are unchanged; this
-      // is what that verdict RESTS ON. On 2026-07-26 they disagreed about 74% of the
-      // graded book: the book read `feasible` (cost-net ceiling 0.2391R vs a 0.20R bar)
-      // while the 35-idea credit sleeve inside it sat at ≈0.00R — an infeasible sleeve
-      // averaged into a feasible verdict by 12 debit verticals.
+      // On 2026-07-26 it disagreed with the book verdict about 74% of the graded book:
+      // the book read `feasible` (cost-net ceiling 0.2391R vs a 0.20R bar) while the
+      // 35-idea credit sleeve inside it sat at ≈0.00R — an infeasible sleeve averaged
+      // into a feasible verdict by 12 debit verticals.
+      //
+      // ⚠️ TRA-2361 — THIS BLOCK IS NOW PART OF WHAT BLOCKS. The comment here used to say
+      // "`feasibility` above is the BLOCKING verdict … this is what that verdict RESTS
+      // ON"; under QuantTrader's rule R1 a sleeve that is POSITIVELY `infeasible` at ≥20%
+      // of the graded book makes `positive_expectancy` INFEASIBLE on its own. Read
+      // `byStructure.blockingSleeves` and `byPremiumDirection.blockingSleeves` — non-empty
+      // on EITHER axis is a stop, and `sleeves[].blocking` is the per-sleeve flag they are
+      // derived from. `sleeves` is emitted WHOLE at every weight; nothing is filtered.
       //
       // ⚠️ Grade `byStructure.worstSleeve` / `byPremiumDirection.worstSleeve`, and read
       // `fragility.flipsOnSingleSleeveRemoval` BEFORE quoting the book verdict: when it
       // is true the verdict can change on COMPOSITION ALONE, with no code change — so a
-      // dated "the book is feasible" claim expires the moment the mix moves.
+      // dated "the book is feasible" claim expires the moment the mix moves. Same reason
+      // `sleeves[].approachingBlockingThreshold` exists: a sleeve in [0.15, 0.20) is one
+      // or two resolutions from being able to block.
+      //
+      // ⚠️ This is a WHOLE-OBJECT pass-through, so new fields on `SleeveFeasibility` /
+      // `AxisFeasibility` DO flow. `criteria` above is a field-by-field whitelist and
+      // does NOT — TRA-2361 added no `GateCriterionResult` field for exactly that reason;
+      // the sleeve block is carried in the already-whitelisted `feasibilityNote` and in
+      // `summary`. If you add one there, add it to the whitelist in the same commit.
       sleeveFeasibility: gate.sleeveFeasibility,
       evidence: {
         surfaced: report.totals.surfaced,

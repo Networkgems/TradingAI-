@@ -1288,9 +1288,12 @@ export function evaluateBookFeasibility(
 /**
  * TRA-2353 — the per-sleeve decomposition of the book verdict, both axes.
  *
- * Additive and NON-BLOCKING by construction: it returns only reporting, and no caller
- * folds it into `pass`/`passed`. Whether an infeasible sleeve should block is a policy
- * decision TRA-2353 explicitly reserves for QuantTrader.
+ * ⚠️ TRA-2361 — THIS IS NO LONGER NON-BLOCKING. It used to read "Additive and NON-BLOCKING
+ * by construction: no caller folds it into `pass`/`passed`", which was true of TRA-2353
+ * and went false when QuantTrader's pre-registered rule R1 landed. `live-capital-gate.ts`
+ * now reads `AxisFeasibility.blockingSleeves` off both axes and a non-empty list on either
+ * one makes `positive_expectancy` INFEASIBLE. This function is still pure reporting; it is
+ * its OUTPUT that is now load-bearing.
  *
  * Degrades to empty axes on a report built before `ceilingAxes` existed (a persisted
  * snapshot, or a hand-built partial) — never throws. This sits on the

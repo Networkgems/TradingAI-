@@ -139,13 +139,18 @@ export interface LiveCapitalGateResult {
   feasibility: FeasibilityResult;
   /**
    * TRA-2353 — the SAME ceiling, partitioned by sleeve, with the composition-fragility
-   * sweep beside it. Purely additive: `passed` and every `pass` are byte-identical with
-   * or without this block, because a book that is `feasible` in aggregate while a sleeve
-   * inside it is not is a REPORTING defect, and whether it should also block is a policy
-   * question TRA-2353 reserves for QuantTrader.
+   * sweep beside it.
    *
-   * ⚠️ Read {@link feasibility} for what blocks and this for what it rests on. On
-   * 2026-07-26 those two disagreed about 74% of the graded book.
+   * ⚠️ TRA-2361 — THIS BLOCK IS NO LONGER PURELY ADDITIVE. It used to say "`passed` and
+   * every `pass` are byte-identical with or without this block"; that sentence was true
+   * of TRA-2353 and went false the instant R1 landed. A sleeve with `blocking: true` makes
+   * `positive_expectancy` INFEASIBLE and therefore `passed: false`. Read
+   * `byStructure.blockingSleeves` / `byPremiumDirection.blockingSleeves` — non-empty on
+   * EITHER axis is a stop.
+   *
+   * ⚠️ {@link feasibility} is the BOOK-level verdict and it still means exactly what it
+   * meant: it is not the whole of what blocks. On 2026-07-26 the two disagreed about 74%
+   * of the graded book, which is the reason R1 exists.
    */
   sleeveFeasibility: BookSleeveFeasibility;
   /** One-line plain-English disposition. */
@@ -189,7 +194,9 @@ export function evaluateLiveCapitalGate(
   // a MIXED book it averages an infeasible sleeve into a `feasible` verdict: measured
   // live 2026-07-26, the book read `feasible` (cost-net ceiling 0.2391R vs a 0.20R bar)
   // while the 35-idea credit sleeve inside it sat at ≈0.00R and could not reach the bar
-  // at a REALIZED 100% hit rate. Additive only — nothing below folds this into `pass`.
+  // at a REALIZED 100% hit rate.
+  // ⚠️ TRA-2361 — this line used to end "Additive only — nothing below folds this into
+  // `pass`." It does now: see `sleeveBlocking` below (rule R1).
   const sleeveFeasibility = evaluateBookSleeveFeasibility(
     report,
     criteria.minExpectancyR,
@@ -219,9 +226,66 @@ export function evaluateLiveCapitalGate(
   // not a fix. Note the two can never conflict: `expectancyNetR ≤ ceiling` holds
   // pathwise, so a measured pass is itself constructive proof of reachability.
   const barUnreachable = feasibility.verdict === 'infeasible';
-  const expectancyStatus: GateCriterionStatus = barUnreachable
-    ? 'INFEASIBLE'
-    : plain(expectancyMeasuredPass);
+
+  // TRA-2361 — rule R1, pre-registered by QuantTrader on TRA-2353 before the first
+  // per-sleeve read (verbatim in `gate-feasibility.ts` on BLOCKING_SLEEVE_WEIGHT and in
+  // `docs/live-capital-gate.md`). A sleeve blocks iff it is POSITIVELY `infeasible` AND
+  // carries ≥ 20% of the graded book; the gate blocks iff ≥1 sleeve blocks on EITHER axis.
+  //
+  // Why this is a stop and not a warning: the book ceiling is a MEAN over a mixed
+  // population, and a mean can satisfy a bound that no material sub-population satisfies.
+  // Live 2026-07-26 the book read `feasible` (net 0.2391R vs the 0.20R bar) while the
+  // 35-idea credit sleeve inside it — 74% of the graded rows — sat at ≈0.00R at a
+  // REALIZED 100% hit rate. Promoting on that number promotes on 26% of the evidence.
+  //
+  // ⚠️ Read off `blockingSleeves`, which is a derived projection of the per-sleeve
+  // `blocking` flags — never a second predicate evaluated here.
+  const sleeveBlocking =
+    sleeveFeasibility.byStructure.blockingSleeves.length > 0 ||
+    sleeveFeasibility.byPremiumDirection.blockingSleeves.length > 0;
+  // The offenders themselves, heaviest first, for the headline. The same sleeve key can
+  // appear on both axes (`credit` coarsens `bull_put_spread`); the axis label is carried
+  // so a reader can tell which partition is talking.
+  const blockingSleeveDetail = [
+    ...sleeveFeasibility.byStructure.sleeves
+      .filter((s) => s.blocking)
+      .map((s) => ({ axis: sleeveFeasibility.byStructure.axis, s })),
+    ...sleeveFeasibility.byPremiumDirection.sleeves
+      .filter((s) => s.blocking)
+      .map((s) => ({ axis: sleeveFeasibility.byPremiumDirection.axis, s })),
+  ].sort((a, b) => (b.s.weight ?? 0) - (a.s.weight ?? 0) || a.s.key.localeCompare(b.s.key));
+
+  // A sleeve block is the SAME KIND of stop as an unreachable book bar — more sample
+  // cannot resolve either — so it reuses the loud `INFEASIBLE` headline path rather than
+  // gaining a fourth state that every downstream consumer would have to learn.
+  const expectancyStatus: GateCriterionStatus =
+    barUnreachable || sleeveBlocking ? 'INFEASIBLE' : plain(expectancyMeasuredPass);
+
+  /**
+   * The clause the headline prints for an INFEASIBLE criterion.
+   *
+   * ⚠️ The book pair `(bar XR vs payoff ceiling YR)` is the ONLY thing this used to print,
+   * and on a sleeve-driven block it CONTRADICTS ITSELF: live today it would render
+   * `bar 0.2R vs payoff ceiling 0.2391R` — a headline saying the criterion cannot be
+   * tested, beside two numbers saying the bar is comfortably reachable. The binding
+   * constraint has to be the thing that gets named.
+   */
+  const infeasibleClause = (c: GateCriterionResult): string => {
+    const bookPair = `bar ${c.barR}R vs payoff ceiling ${c.ceilingR == null ? 'unknown' : `${c.ceilingR}R`}`;
+    if (c.name !== 'positive_expectancy' || blockingSleeveDetail.length === 0) {
+      return `${c.name} (${bookPair})`;
+    }
+    const offenders = blockingSleeveDetail
+      .map(
+        ({ axis, s }) =>
+          `\`${s.key}\` [${axis}] n=${s.n}, ${pct(s.weight)} of the graded book, cost-net payoff ceiling ${s.ceilingNetR == null ? 'unknown' : `${s.ceilingNetR}R`}`,
+      )
+      .join('; ');
+    const blocked = `BLOCKED BY ${blockingSleeveDetail.length === 1 ? 'SLEEVE' : 'SLEEVES'} ${offenders} — against the ${c.barR}R bar, unreachable at ANY hit rate`;
+    return barUnreachable
+      ? `${c.name} (${bookPair}; AND ${blocked})`
+      : `${c.name} (${blocked}. The BOOK aggregate reads ${bookPair} and is NOT the binding constraint: a mean over a mixed book can satisfy a bar that no material sleeve inside it can reach)`;
+  };
 
   const criteriaResults: GateCriterionResult[] = [
     {
@@ -247,18 +311,39 @@ export function evaluateLiveCapitalGate(
       actual: t.expectancyNetR,
       // An INFEASIBLE bar can never be "met", so it is never a pass regardless of the
       // measured value — but the measured comparison still governs the feasible case.
-      pass: !barUnreachable && expectancyMeasuredPass,
+      // TRA-2361 — `!sleeveBlocking` is a NEW CONJUNCT on an existing conjunction, which
+      // is monotone non-increasing: `pass′ ≤ pass` and therefore `passed′ ≤ passed`. This
+      // can only ever CLOSE the capital path, never open one.
+      pass: !barUnreachable && !sleeveBlocking && expectancyMeasuredPass,
       status: expectancyStatus,
       barR: criteria.minExpectancyR,
+      // ⚠️ Still the BOOK ceiling — the number the book verdict was derived from. On a
+      // sleeve-driven block it is NOT the binding constraint, which is why the note below
+      // and the headline both lead with the sleeve. (Deliberately not overwritten with the
+      // sleeve's ceiling: `ceilingR` has meant "the ceiling `feasibility` compared against"
+      // since TRA-2335 and silently changing its referent would break every reader of the
+      // route who pairs it with `feasibility.ceilingR`.)
       ceilingR: feasibility.ceilingR,
       // TRA-2353 (AC2) — the sleeve sentence travels ON THE CRITERION, not only in a
       // sibling block: this is the field a reader lands on when they ask why criterion 3
       // reads the way it does, and a `feasible` book resting on 26% of its own
-      // population is part of that answer.
-      feasibilityNote:
-        sleeveFeasibility.note == null
-          ? feasibility.reason
-          : `${feasibility.reason} ⚠️ ${sleeveFeasibility.note}`,
+      // population is part of that answer. TRA-2361 — when a sleeve BLOCKS, the block
+      // leads: this field is the criterion-level answer to "why is this INFEASIBLE?".
+      feasibilityNote: [
+        sleeveBlocking
+          ? `⛔ SLEEVE BLOCK (TRA-2361 R1) — ${infeasibleClause(
+              {
+                name: 'positive_expectancy',
+                barR: criteria.minExpectancyR,
+                ceilingR: feasibility.ceilingR,
+              } as GateCriterionResult,
+            )}`
+          : null,
+        feasibility.reason,
+        sleeveFeasibility.note == null ? null : `⚠️ ${sleeveFeasibility.note}`,
+      ]
+        .filter((x): x is string => x != null)
+        .join(' '),
     },
     {
       name: 'expectancy_durability',
@@ -298,7 +383,7 @@ export function evaluateLiveCapitalGate(
   const headline = passed
     ? 'PASS — forward-test track record clears every documented criterion; live-capital wiring may now be PROPOSED (not auto-enabled).'
     : infeasible.length > 0
-      ? `INFEASIBLE — live capital stays gated, and ${infeasible.length === 1 ? 'one criterion CANNOT BE TESTED' : `${infeasible.length} criteria CANNOT BE TESTED`} against this book: ${infeasible.map((c) => `${c.name} (bar ${c.barR}R vs payoff ceiling ${c.ceilingR == null ? 'unknown' : `${c.ceilingR}R`})`).join('; ')}. This is NOT a shortfall of evidence and MORE SAMPLE CANNOT RESOLVE IT — re-derive the bar or change the instrument.${failed.filter((n) => !infeasible.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !infeasible.some((c) => c.name === n)).join(', ')}.` : ''}`
+      ? `INFEASIBLE — live capital stays gated, and ${infeasible.length === 1 ? 'one criterion CANNOT BE TESTED' : `${infeasible.length} criteria CANNOT BE TESTED`} against this book: ${infeasible.map(infeasibleClause).join('; ')}. This is NOT a shortfall of evidence and MORE SAMPLE CANNOT RESOLVE IT — re-derive the bar or change the instrument.${failed.filter((n) => !infeasible.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !infeasible.some((c) => c.name === n)).join(', ')}.` : ''}`
       : `HOLD — live capital stays gated. Unmet: ${failed.join(', ')}.`;
 
   // TRA-2353 (AC4) — `unknown` MUST RENDER AS UNKNOWN IN THE HEADLINE, not only on the
