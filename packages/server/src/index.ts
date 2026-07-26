@@ -31,6 +31,12 @@ import {
 } from './options-daily-pnl-source.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells } from './reports/desk-calendar.js';
+// TRA-2407 — default-deny scope for the TRA-1572 firm-wide demo fold.
+import {
+  mayViewFirmWideDemoFold,
+  shouldServeFirmWideDemoFold,
+  isReservedOperatorBookName,
+} from './reports/demo-calendar-fill-scope.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
@@ -5571,6 +5577,17 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(400).json({ error: 'Password must be at least 6 characters' });
     return;
   }
+  // TRA-2407 — reserve the operator book names. The demo-calendar fill scope
+  // matches them case-INSENSITIVELY (it has to: the codebase spells the book both
+  // `Richard` and `richard`, and a case mismatch would silently blank the very
+  // calendar TRA-1572 built). But `users.ts` enforces uniqueness with a
+  // case-SENSITIVE `===`, so without this guard `RICHARD` would register as a
+  // distinct account and inherit the firm-wide fold — turning the fix into the
+  // escalation it closes. The two rules are a pair; do not relax one alone.
+  if (isReservedOperatorBookName(username.trim())) {
+    res.status(409).json({ error: 'Username is not available' });
+    return;
+  }
   const result = await createUser(username.trim(), email.trim(), password);
   if (result.error) {
     res.status(409).json({ error: result.error });
@@ -7500,7 +7517,13 @@ app.get('/api/reports', requireAuth, async (req, res) => {
   // TRA-1572 — union in the firm-wide demo journal's trading days so a demo day
   // the personal book never wrote a file for (07-03 / 07-08 / 07-09 on admin's
   // book) still appears; the per-date route below serves the journal cell for it.
-  if (mode === 'demo') {
+  //
+  // TRA-2407 — OPERATOR BOOKS ONLY. This union is why a brand-new account listed
+  // 25 dates, all but one predating it: the days came from the firm-wide journal,
+  // not from the account. Gated with the SAME predicate as the per-date fold
+  // below — a date list that advertises days the per-date route then refuses is
+  // its own defect, and the two must not be able to drift.
+  if (mode === 'demo' && mayViewFirmWideDemoFold(ctx.username, getUser(ctx.username)?.role)) {
     try {
       const cells = await demoJournalCalendarCells();
       for (const d of cells.keys()) dates.push(d);
@@ -7652,7 +7675,14 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
       return;
     }
   }
-  if (mode === 'demo' && isHollowReportCell(personal)) {
+  //
+  // TRA-2407 — and ONLY for the operator books this fill was built for. Without
+  // this scope the branch served the firm-wide Desk fold to any authenticated
+  // account whose personal book was hollow for the day — which a brand-new
+  // account is for EVERY past day. The same token that got 403 on
+  // `/api/reports/desk` (TRA-1604) was handed the desk numbers here, down to the
+  // 191 individual trades of other people's books in `trades[]`.
+  if (shouldServeFirmWideDemoFold(mode, isHollowReportCell(personal), ctx.username, getUser(ctx.username)?.role)) {
     try {
       const cell = (await demoJournalCalendarCells()).get(date);
       if (cell && cell.totalTrades > 0) {
