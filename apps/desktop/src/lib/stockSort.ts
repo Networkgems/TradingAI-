@@ -25,6 +25,12 @@ export type OptionClosedSortKey =
 
 export function getStockWatchSortValue(s: SymbolState, key: StockWatchSortKey): unknown {
   if (s.lastUpdated === 0 && key !== 'symbol' && key !== 'updated') return null;
+  // TRA-2379 — a `suspect` row has a live, sortable PRICE but an unbelievable
+  // published move, and CHANGE % is this table's DEFAULT sort key (desc). Return
+  // null for the two move columns so `compareSortValues` parks the row at the
+  // bottom in BOTH directions — the same mechanism the never-quoted rows use.
+  // The raw values are still rendered (degraded); this only refuses to RANK them.
+  if ((key === 'change' || key === 'changePct') && s.quoteStatus === 'suspect') return null;
   switch (key) {
     case 'symbol': return s.symbol;
     case 'price': return s.price;

@@ -2758,6 +2758,24 @@ tr:hover td { background: var(--bg-hover); }
   border-color: var(--blue);
 }
 
+/* TRA-2379 — the row's price is live, but its published session move is not
+   believable (unadjusted prev close). Amber, not red: this is a data-quality
+   warning about ONE field, not a dead quote. */
+.quote-suspect-badge {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: var(--yellow, #d29922);
+  background: rgba(210, 153, 34, 0.12);
+  border: 1px solid rgba(210, 153, 34, 0.35);
+  cursor: help;
+}
+
 .watchlist-remove-btn {
   background: none;
   border: none;

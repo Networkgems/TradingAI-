@@ -6,7 +6,7 @@ import type { CryptoSymbolState } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmt, fmtDollar, fmtPct, quoteStatusLabel } from '../../lib/format';
+import { fmt, fmtDollar, fmtPct, quoteStatusLabel, isQuoteMoveUnreliable } from '../../lib/format';
 import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getCryptoWatchSortValue } from '../../lib/cryptoSort';
 import type { CryptoWatchSortKey } from '../../lib/cryptoSort';
@@ -118,17 +118,24 @@ export function CryptoWatchlistPanel({ token, symbols }: { token: string; symbol
           </tr>
         </thead>
         <tbody>
-          {sortRows(symbols, watchlistSort.sort, getCryptoWatchSortValue).map(s => (
-            <tr key={s.symbol} className={s.lastUpdated === 0 ? '' : s.change >= 0 ? 'up' : 'down'}>
-              <td className="symbol">{s.symbol}</td>
+          {sortRows(symbols, watchlistSort.sort, getCryptoWatchSortValue).map(s => {
+            // TRA-2379 — mirrors the stock panel. See StockWatchlistPanel.
+            const moveUnreliable = isQuoteMoveUnreliable(s);
+            const moveTitle = moveUnreliable
+              ? `Reported ${fmtPct(s.changePct)} (${fmtDollar(s.change)}) — rejected: implied previous close is not believable. Raw value retained; see quoteStatus:'suspect'.`
+              : undefined;
+            return (
+            <tr key={s.symbol} className={s.lastUpdated === 0 || moveUnreliable ? '' : s.change >= 0 ? 'up' : 'down'}>
+              <td className="symbol">{s.symbol}{moveUnreliable && <span className="quote-suspect-badge" title={moveTitle}> ⚠ suspect</span>}</td>
               <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
-              <td className={s.lastUpdated === 0 ? 'muted' : s.change >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtDollar(s.change)}</td>
-              <td className={s.lastUpdated === 0 ? 'muted' : s.changePct >= 0 ? 'green' : 'red'}>{s.lastUpdated === 0 ? '—' : fmtPct(s.changePct)}</td>
+              <td className={s.lastUpdated === 0 || moveUnreliable ? 'muted' : s.change >= 0 ? 'green' : 'red'} title={moveTitle}>{s.lastUpdated === 0 || moveUnreliable ? '—' : fmtDollar(s.change)}</td>
+              <td className={s.lastUpdated === 0 || moveUnreliable ? 'muted' : s.changePct >= 0 ? 'green' : 'red'} title={moveTitle}>{s.lastUpdated === 0 || moveUnreliable ? '—' : fmtPct(s.changePct)}</td>
               <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
               <td className="muted">{quoteStatusLabel(s)}</td>
               <td><button className="watchlist-remove-btn" onClick={() => removeFromWatchlist(s.symbol)} title="Remove">&#xd7;</button></td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>

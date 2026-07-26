@@ -20,6 +20,12 @@ export type CryptoClosedPosSortKey =
 
 export function getCryptoWatchSortValue(s: CryptoSymbolState, key: CryptoWatchSortKey): unknown {
   if (s.lastUpdated === 0 && key !== 'symbol' && key !== 'updated') return null;
+  // TRA-2379 — mirrors the stock resolver: never RANK a move the server flagged as
+  // implausible. See getStockWatchSortValue. (The crypto feed does not currently
+  // stamp `'suspect'` — its 24h % is a provider field with no prev close to test —
+  // but the panel and this resolver are the same shared code, so the guard is here
+  // and correct the moment that path ever does.)
+  if ((key === 'change' || key === 'changePct') && s.quoteStatus === 'suspect') return null;
   switch (key) {
     case 'symbol': return s.symbol;
     case 'price': return s.price;

@@ -230,6 +230,15 @@ export function generateCryptoEodReport(snapshot: CryptoReportSnapshot): EodRepo
   const sessionOpenEquity = totalEquity - realizedPnl;
   const maxDrawdown = computeMaxDrawdown(todayClosed, Math.max(sessionOpenEquity, 1));
 
+  // TRA-2379 — the stock EOD report's top-movers table is filtered on
+  // `quoteStatus:'suspect'`; this one is NOT, and deliberately so. The crypto
+  // snapshot this reads (`{symbol, price, changePct}`, see the input type below)
+  // does not carry `quoteStatus` at all, and the crypto feed does not produce the
+  // flag anyway — its 24h % is a provider field with no implied prev close for the
+  // ratio test to read. Widening the snapshot to thread a flag that is never set
+  // would be a control in name only. If the crypto path ever starts flagging, this
+  // is the consumer to fix, and the sibling corporate-action ticket is where that
+  // belongs.
   const top5Movers: EodMover[] = [...snapshot.symbols]
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)

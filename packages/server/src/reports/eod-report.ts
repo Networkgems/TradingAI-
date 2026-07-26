@@ -12,6 +12,7 @@ import type {
 import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled slippage KPI per asset class.
 import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/shared';
+import { logger } from '../observability/index.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import type { EngineState, SymbolState } from '../signal-engine.js';
@@ -177,12 +178,27 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
   };
 }
 
+const log = logger.child({ module: 'eod-report' });
+
 function top5Movers(symbols: SymbolState[]): EodMover[] {
   // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
   // so the report shows "_No data._" rather than five rows of 0.00% when the feed
   // is failing on cold start.
+  // TRA-2379 — this is the THIRD ranking consumer of `changePct` (the ticket named
+  // only market-scanner and the watchlist; the enumeration off the deployed tree
+  // found this one). It ranks by |changePct|, so an unadjusted prev close puts a
+  // fabricated +8,951% at #1 in a document a human reads as the session summary.
+  // Exclude flagged rows here too — the raw value stays on /api/state, it just
+  // does not get to be the headline.
+  const excluded = symbols.filter(s => s.lastUpdated > 0 && s.price > 0 && s.quoteStatus === 'suspect');
+  if (excluded.length > 0) {
+    log.warn('top-movers EXCLUDED implausible moves', {
+      issue: 'TRA-2379',
+      symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%`),
+    });
+  }
   return [...symbols]
-    .filter(s => s.lastUpdated > 0 && s.price > 0)
+    .filter(s => s.lastUpdated > 0 && s.price > 0 && s.quoteStatus !== 'suspect')
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
     .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));

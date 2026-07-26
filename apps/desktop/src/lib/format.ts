@@ -55,14 +55,30 @@ export function timeAgo(ts: number) {
  * provider state so a rate-limited or down quote source shows actionable text
  * instead of a perpetual "Loading…" spinner.
  */
-export function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' }): string {
+export function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: QuoteStatus }): string {
   if (s.quoteStatus === 'rate_limited') return 'Quote unavailable — provider rate-limited';
   if (s.quoteStatus === 'unavailable') return 'Quote unavailable';
   // TRA-418 — `'stale'` marks a quote that aged past the freshness threshold
   // (feed down). Surface it distinctly from a healthy "x ago" timestamp.
   if (s.quoteStatus === 'stale') return 'Quote stale — feed delayed';
+  // TRA-2379 — the PRICE is live and current here; it is the published session
+  // move that is not believable. Say which, so nobody reads this as a dead feed.
+  if (s.quoteStatus === 'suspect') return `Change % unreliable — bad prev close (${timeAgo(s.lastUpdated)})`;
   if (s.lastUpdated === 0) return 'Loading…';
   return timeAgo(s.lastUpdated);
+}
+
+export type QuoteStatus = 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
+
+/**
+ * TRA-2379 — true when the server flagged this row's session move as implausible.
+ *
+ * The raw `change` / `changePct` are still present on the row (decision 1: flag,
+ * never clamp); callers use this to render them degraded and to keep them out of
+ * a CHANGE % sort, rather than to hide them.
+ */
+export function isQuoteMoveUnreliable(s: { quoteStatus?: QuoteStatus }): boolean {
+  return s.quoteStatus === 'suspect';
 }
 
 export function formatTime(ts: number) {

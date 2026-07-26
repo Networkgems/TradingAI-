@@ -26,7 +26,9 @@ export const MAX_TICK_AGE_MS = 5 * 60_000;
 export interface LiveHealthSymbol {
   /** ms epoch of the last successful quote; 0 / undefined ⇒ never quoted. */
   lastUpdated?: number;
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  // TRA-2379 — `'suspect'` is a LIVE quote with an unbelievable published move, so
+  // it must not be counted alongside the no-quote statuses in any freshness roll-up.
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'suspect';
 }
 
 export interface LiveHealthInput {

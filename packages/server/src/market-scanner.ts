@@ -1,9 +1,45 @@
 import YahooFinance from 'yahoo-finance2';
-import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked } from '@trading-app/shared';
+import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked, assessQuotePlausibility, describeQuoteSuspicion } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { isCoinbaseListed, refreshCoinbaseProductCatalog } from './crypto-feed.js';
 
 const log = logger.child({ module: 'market-scanner' });
+
+/**
+ * TRA-2379 — this module does NOT read `symbolState`; it makes its own Yahoo
+ * screener calls, so the `quoteStatus:'suspect'` that `signal-engine.applyQuotes`
+ * stamps is invisible here. The plausibility rule therefore has to be applied
+ * independently, against the screener's own price/change fields.
+ *
+ * `yahoo-finance2` types the screener rows loosely, so narrow only what we read.
+ */
+export interface ScreenerMoveFields {
+  regularMarketPrice?: number;
+  regularMarketChange?: number;
+  regularMarketChangePercent?: number;
+}
+
+/**
+ * True when a screener row's published move should not be ranked.
+ *
+ * Logs every exclusion: per TRA-2379 decision 2 a silent drop reads identically to
+ * "nothing was wrong", which is the failure this ticket exists to end.
+ */
+export function isScreenerMoveSuspect(symbol: string, q: ScreenerMoveFields, reason: ScanReason): boolean {
+  const input = {
+    price: q.regularMarketPrice ?? NaN,
+    change: q.regularMarketChange,
+    changePct: q.regularMarketChangePercent,
+  };
+  if (!assessQuotePlausibility(input).suspect) return false;
+  log.warn('scanner suggestion EXCLUDED — implausible published move', {
+    issue: 'TRA-2379',
+    symbol,
+    reason,
+    detail: describeQuoteSuspicion(symbol, input),
+  });
+  return true;
+}
 
 const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'], validation: { logErrors: true } });
 
@@ -37,6 +73,10 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
     const gainers = await yf.screener({ scrIds: 'day_gainers', count: 10 });
     for (const q of gainers.quotes) {
       if (q.symbol && q.quoteType === 'EQUITY') {
+        // TRA-2379 — a screener ranks by the same unbounded changePct the feed
+        // publishes, so an unadjusted prev close puts a fabricated +8,951% move at
+        // the top of the suggestion list. Refuse to rank it (and say so).
+        if (isScreenerMoveSuspect(q.symbol, q, 'gainer')) continue;
         collected.push({ symbol: q.symbol, reason: 'gainer', changePct: q.regularMarketChangePercent });
       }
     }
@@ -49,6 +89,10 @@ export async function scanStocksMarket(): Promise<ScanResult[]> {
     const losers = await yf.screener({ scrIds: 'day_losers', count: 10 });
     for (const q of losers.quotes) {
       if (q.symbol && q.quoteType === 'EQUITY') {
+        // TRA-2379 — same rule on the losing side. The ratio statistic is
+        // direction-free precisely so an unadjusted FORWARD split (which reads as
+        // a large negative, never a large positive) is caught here too.
+        if (isScreenerMoveSuspect(q.symbol, q, 'loser')) continue;
         collected.push({ symbol: q.symbol, reason: 'loser', changePct: q.regularMarketChangePercent });
       }
     }

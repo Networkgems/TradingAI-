@@ -33,6 +33,12 @@ export * from './conviction-dca.js';
 // shipped engine cores read-only.
 export * from './position-advisor.js';
 
+// TRA-2379 (parent TRA-2304) — feed-boundary plausibility check for a quote's
+// session move. Flags an implausible `changePct` (an unadjusted prev close across
+// a corporate action) so ranking consumers can refuse it; never rewrites the
+// published numbers.
+export * from './quote-plausibility.js';
+
 // TRA-950 — structured review block (leaders / invalidation / gapRisk / regime)
 // persisted with each pre/post-market review and wired into both decision paths.
 export * from './review-block.js';
@@ -3570,8 +3576,14 @@ export interface CryptoSymbolState {
    * TRA-418 — `'stale'` marks a symbol whose quote or backing candles aged past
    * the freshness threshold (feed down). A stale symbol is excluded from
    * strategy evaluation so a dead feed can never produce a new entry signal.
+   *
+   * TRA-2379 — `'suspect'` marks a quote whose PRICE is fine but whose published
+   * session move is not believable (an unadjusted prev close across a corporate
+   * action). `change` / `changePct` are still published RAW alongside it — the
+   * flag exists so ranking consumers can refuse the row, not so the number can be
+   * quietly rewritten. See `assessQuotePlausibility`.
    */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
 }
 
 export interface CryptoEngineState {

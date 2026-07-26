@@ -7,6 +7,8 @@ import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
+// TRA-2379 — feed-boundary plausibility check for a quote's published session move.
+import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '@trading-app/shared';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
 // WS state. P2 wires the REAL LlmClient-backed agents (Haiku analysts + Sonnet
@@ -350,8 +352,11 @@ export interface SymbolState {
    * Why this symbol's quote is missing/stale. The watchlist UI uses this to render
    * a useful state ("Quote unavailable — provider rate-limited") instead of a
    * permanent "Loading…" spinner when upstream providers are down.
+   *
+   * TRA-2379 — `'suspect'` marks a live price with an unbelievable published move
+   * (unadjusted prev close). Raw `change` / `changePct` are still published.
    */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'suspect';
   /**
    * TRA-1980 — L1 best bid/ask (+ displayed sizes) when the quote source carries a
    * book (Tradier only; the Yahoo/Stooq fallbacks leave these undefined). Consumed
@@ -3481,6 +3486,26 @@ export class SignalEngine {
     const prices = new Map<string, number>();
     for (const [sym, q] of quotes) {
       prices.set(sym, q.price);
+      // TRA-2379 — the ONE stamping boundary for the whole stock universe: this
+      // consumes the MERGED fetchQuotes result, so Tradier, the Yahoo quote, the
+      // Yahoo chart fallback and Stooq all pass through here. Flag an implausible
+      // published move (unadjusted prev close across a corporate action) WITHOUT
+      // touching `change` / `changePct` — decision 1 on that ticket is flag, never
+      // clamp, so the bad datum stays visible on /api/state.
+      const plausibility = assessQuotePlausibility(q);
+      if (plausibility.suspect) {
+        log.warn('quote move flagged suspect', {
+          issue: 'TRA-2379',
+          symbol: sym,
+          reason: plausibility.reason,
+          price: q.price,
+          change: q.change,
+          changePct: q.changePct,
+          impliedPrevClose: plausibility.impliedPrevClose,
+          ratio: plausibility.ratio,
+          threshold: SUSPECT_MOVE_RATIO,
+        });
+      }
       this.symbolState.set(sym, {
         symbol: sym,
         price: q.price,
@@ -3488,7 +3513,7 @@ export class SignalEngine {
         change: q.change,
         changePct: q.changePct,
         lastUpdated: Date.now(),
-        quoteStatus: 'ok',
+        quoteStatus: plausibility.suspect ? 'suspect' : 'ok',
         // TRA-1980 — carry the L1 book through when the source provided one
         // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
         // no-record rather than a bogus decision on a book it never saw.

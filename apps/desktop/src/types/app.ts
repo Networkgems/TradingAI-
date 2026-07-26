@@ -8,7 +8,12 @@ export interface SymbolState {
   change: number;
   changePct: number;
   lastUpdated: number;
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  // TRA-2379 — `'suspect'`: the price is live but the published session move is not
+  // believable (unadjusted prev close). `change` / `changePct` are still the RAW
+  // server values; the UI degrades the cells rather than trusting them.
+  // TRA-418 — `'stale'` was already emitted by the crypto path and was missing from
+  // this copy of the union; added while I was here.
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
 }
 
 export interface AppState {
