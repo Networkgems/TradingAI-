@@ -665,10 +665,47 @@ alert per window.
 | Alert | Meaning | First response |
 |---|---|---|
 | `health-check` | `GET /api/health` stopped returning `{ ok: true }`. | Check the PM2 process (`npx pm2 status`) and logs. If the process is down, `npx pm2 restart trading-server`. Confirm `/api/health` recovers. |
-| `disk-near-full` | Free space on the `DATA_DIR` disk below 10%. | `GET /api/health/storage` for sizes. Prune old option-chain caches and stale logs; if structurally full, attach a larger volume (§4). |
+| `disk-near-full` | Free space on the `DATA_DIR` disk below `DISK_MIN_FREE_PCT` (default 10%). | **Read the alert's own log line, not the email** — it carries `freePct=` *and* the threshold it was compared against. TRA-2357's 2026-07-25 CRITICAL was `16.3% free — below 99%`: a healthy disk against a mis-set threshold, which from the inbox is indistinguishable from a real capacity event. Then `GET /api/health/storage` for sizes and see "Option-chain archive" below; if structurally full, attach a larger volume (§4). |
 | `restart-storm` | >5 process boots in 10 min — instance is crash-looping. | Read `errors.jsonl` / PM2 logs for the crash cause (bad deploy, corrupt data, OOM). Roll back the deploy (§2) or restore data (§3). Note PM2 gives up after `max_restarts` (10). |
 | `trade-volume-zero` | No positions opened by 12:00 ET on a stock trading day. | Often benign (no qualifying signals). Confirm data feeds are fresh (`GET /api/health/quotes`) and auto-trading is enabled. Escalate only if feeds are stale. |
 | `error-spike` | >25 errors captured in 15 min. | Grep `errors.jsonl` for the dominant error; correlate by `traceId`. See `observability.md`. |
+
+### Option-chain archive — the biggest thing on `/data` (TRA-2417)
+
+`/data` on bqb1 is a **1 GB** volume and the TRA-779 capture is the dominant
+writer. Uncompacted it added **~8.4 MB per trading day and nothing reclaimed
+it**: by 2026-07-26 that was 48 partitions ≈ 403 MB of the 850 MB used, on a
+trajectory to cross the 10% floor ~2026-07-30 and fill ~2026-08-13.
+
+Aged partitions are now stored **gzipped** — `<DATE>/<SYMBOL>.json.gz`, measured
+at **11.3% of the plaintext bytes** on the real 2026-07-24 partition. Compaction
+runs at boot (after the IVR enrichment backfill) and again after each 3:55 PM ET
+capture. It is **non-destructive: no partition is ever deleted.** The plaintext is
+unlinked only after the `.gz` has been read back from disk and byte-compared to
+it. `_meta.json` is deliberately left plain.
+
+```bash
+curl -s https://tradingai-bqb1.onrender.com/api/health/chain-capture | jq '.storage'
+#   storage.totalMb                     archive size
+#   storage.compactedPartitions         aged partitions, all gz
+#   storage.plainPartitions             expect exactly 1 — the newest, left plain
+#                                       on purpose. 0 or >1 is the anomaly.
+#   storage.lastCompaction.at/.failures last run + files that KEPT their plaintext
+#   storage.retention.beyondWindowMb    what a 30-day prune WOULD reclaim
+#   storage.retention.enforced          always false — nothing here deletes
+```
+
+⚠️ `retention` is **reporting only**. The capture is the only copy of that data
+and a partition deleted is not recoverable; pruning is the capture owner's call
+and, once compacted, is not needed for capacity. `CHAINS_RETENTION_REPORT_DAYS`
+only moves the reported window.
+
+⚠️ Every reader of a per-symbol snapshot must go through
+`listChainSnapshotFiles` / `readChainSnapshotFile` (`@trading-app/backtest`). A
+bare `endsWith('.json')` filter silently skips a compacted partition —
+`AAPL.json.gz` does not end with `.json` — and an empty read is indistinguishable
+from an empty partition. `/api/health/chain-capture/partition/:date` serves the
+identical JSON either way, so `scripts/pull-recorded-chains.mjs` is unaffected.
 
 ### Triage workflow
 

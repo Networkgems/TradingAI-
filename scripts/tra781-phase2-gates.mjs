@@ -17,7 +17,7 @@
  * closed-trade array the canonical summarizer consumes — so the per-trade
  * vector is guaranteed identical to the canonical run-options-replay output.
  */
-import { readFile, readdir } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   loadChainDays,
@@ -25,6 +25,12 @@ import {
   runOptionsReplay,
   OptionsReplayAccount,
   DEFAULT_REPLAY_CONFIG,
+  // TRA-2417 — a mirrored partition may be gzipped (`.json.gz`); these read
+  // both forms. A bare `endsWith('.json')` here would silently index ZERO
+  // entry rows against a compacted mirror, which reads as "no G3 re-pricing
+  // available" rather than as a bug.
+  listChainSnapshotFiles,
+  readChainSnapshotFile,
 } from '../packages/backtest/dist/index.js';
 
 const DATA_DIR = process.env.DATA_DIR ?? './data/option-chains';
@@ -119,12 +125,10 @@ async function buildEntryRowIndex(dataDir) {
   const dates = (await readdir(dataDir)).filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e));
   for (const date of dates) {
     const dir = join(dataDir, date);
-    let files;
-    try { files = await readdir(dir); } catch { continue; }
+    const files = await listChainSnapshotFiles(dir);
     for (const f of files) {
-      if (!f.endsWith('.json') || f === '_meta.json') continue;
       try {
-        const snap = JSON.parse(await readFile(join(dir, f), 'utf-8'));
+        const snap = await readChainSnapshotFile(join(dir, f));
         if (snap && Array.isArray(snap.rows) && typeof snap.symbol === 'string') {
           index.set(`${date}|${snap.symbol.toUpperCase()}`, snap.rows);
         }

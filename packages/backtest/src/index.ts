@@ -184,6 +184,16 @@ export {
 export type { CacheEntry } from './fetch-tra266-data.js';
 // TRA-376 — historical option-chain replay backtest harness.
 export { loadChainDays, estimateSpotFromChain } from './options-chain-store.js';
+// TRA-2417 — aged partitions are stored gzipped; every reader of a per-symbol
+// snapshot must go through these rather than readFile/endsWith('.json').
+export {
+  CHAIN_META_FILE,
+  isChainSnapshotFile,
+  chainSnapshotSymbol,
+  readChainSnapshotFile,
+  writeChainSnapshotFile,
+  listChainSnapshotFiles,
+} from './options-chain-store.js';
 export type { ChainDay, OptionChainSnapshotFile } from './options-chain-store.js';
 export { OptionsReplayAccount } from './options-replay-account.js';
 export type {

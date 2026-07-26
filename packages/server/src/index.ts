@@ -296,7 +296,19 @@ import {
   runOptionsReplay,
   DEFAULT_REPLAY_CONFIG,
   estimateSpotFromChain,
+  CHAIN_META_FILE,
+  isChainSnapshotFile,
+  chainSnapshotSymbol,
+  readChainSnapshotFile,
+  writeChainSnapshotFile,
+  listChainSnapshotFiles,
 } from '@trading-app/backtest';
+// TRA-2417 — gzip compaction of aged chain partitions + the storage accounting
+// `/api/health/chain-capture` publishes.
+import {
+  compactChainPartitions,
+  chainPartitionStorageReport,
+} from './chain-partition-compactor.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import {
   isOptionsProposalRailEnabled,
@@ -3178,6 +3190,69 @@ function runScheduledReportsForAllUsers(now: Date = new Date()): void {
 // `recordOptionChains` and logged, never fatal.
 const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'option-chains');
 
+// ── TRA-2417: option-chain archive compaction ────────────────────────────────
+// `/data` is a 1 GB volume and the capture was adding ~8.4 MB/trading day with
+// nothing reclaiming it — 48 partitions, ~403 MB, against 153.7 MB free on
+// 2026-07-26 (~4 trading days from the 10% alert floor, ~13 from full). Gzip
+// takes an aged partition to 11.8% of its bytes, MEASURED on 2026-07-24's, so
+// compaction reclaims ~355 MB *without deleting a partition* — more than pruning
+// 48→30 would (~209 MB), and it drops the per-day slope to ~1 MB as well.
+//
+// Retention is deliberately REPORT-ONLY: nothing here deletes a partition. The
+// capture is the only copy, TRA-779's gate is `>= 30` days (48 is not out of
+// policy), and once compacted the disk no longer needs the deletion. The number
+// a prune WOULD reclaim is published on `/api/health/chain-capture` so the
+// capture owner can decide with it.
+const RETENTION_REPORT_TRADING_DAYS = Number(
+  (process.env['CHAINS_RETENTION_REPORT_DAYS'] ?? '30').trim(),
+) || 30;
+
+/** Last compaction outcome, published on `/api/health/chain-capture`. */
+let lastChainCompaction: {
+  at: string;
+  trigger: 'boot' | 'post-capture';
+  partitionsCompacted: number;
+  filesCompacted: number;
+  bytesReclaimed: number;
+  mbReclaimed: number;
+  failures: number;
+  durationMs: number;
+} | null = null;
+
+/**
+ * Compact everything but the newest partition. Never throws and never blocks a
+ * caller's critical path — a failure to reclaim space must not take down the
+ * capture that produced it.
+ *
+ * A run with `filesCompacted: 0` is the STEADY STATE, not a failure: every aged
+ * partition is already `.json.gz`. The field that distinguishes a healthy no-op
+ * from a broken one is `failures` (and `lastCompaction.at` advancing at all).
+ */
+async function runChainCompaction(trigger: 'boot' | 'post-capture'): Promise<void> {
+  try {
+    const result = await compactChainPartitions({ outDir: CHAIN_RECORD_OUT_DIR });
+    lastChainCompaction = {
+      at: new Date().toISOString(),
+      trigger,
+      partitionsCompacted: result.partitionsCompacted,
+      filesCompacted: result.filesCompacted,
+      bytesReclaimed: result.bytesReclaimed,
+      mbReclaimed: Math.round((result.bytesReclaimed / 1_048_576) * 100) / 100,
+      failures: result.failures.length,
+      durationMs: result.durationMs,
+    };
+    log.info('chain-compaction complete', { ...lastChainCompaction });
+    for (const f of result.failures.slice(0, 10)) {
+      log.warn('chain-compaction file failed — plaintext kept', f);
+    }
+  } catch (err) {
+    log.error('chain-compaction failed', {
+      trigger,
+      errorMessage: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function runChainRecord(): Promise<void> {
   const apiToken = (process.env['TRADIER_API_TOKEN'] ?? '').trim();
   if (!apiToken) {
@@ -3246,6 +3321,10 @@ async function runChainRecord(): Promise<void> {
   // options-replay-phasea `readIvRank`). Per-symbol failures are isolated and
   // never abort the capture.
   await enrichChainPartition(result.date);
+
+  // TRA-2417 — reclaim the day BEFORE this one. Runs after enrichment so the
+  // partition being compacted is already IVR-stamped and settled.
+  await runChainCompaction('post-capture');
 }
 
 // TRA-1049 — post-pass that stamps `spot` + `ivRank` onto each per-symbol file
@@ -3254,22 +3333,18 @@ async function runChainRecord(): Promise<void> {
 // is logged and skipped.
 async function enrichChainPartition(date: string): Promise<void> {
   const dir = join(CHAIN_RECORD_OUT_DIR, date);
-  let files: string[];
-  try {
-    files = (await readdir(dir)).filter((f) => f.endsWith('.json') && f !== '_meta.json');
-  } catch {
-    return;
-  }
+  // TRA-2417 — via `listChainSnapshotFiles`, so a compacted (`.json.gz`)
+  // partition is enriched rather than skipped. The old `endsWith('.json')`
+  // filter would have matched nothing there and logged `stamped 0 / total 0`,
+  // which reads exactly like an already-enriched partition.
+  const files = await listChainSnapshotFiles(dir);
+  if (files.length === 0) return;
   const recordedAt = Date.parse(`${date}T20:00:00Z`); // ~3:55 PM ET capture instant for ranking asOf.
   let stamped = 0;
   for (const f of files) {
     const path = join(dir, f);
     try {
-      const snap = JSON.parse(await readFile(path, 'utf-8')) as {
-        symbol: string;
-        spot: number | null;
-        recordedAt?: number;
-        rows: import('@trading-app/engine').OptionChainRow[];
+      const snap = (await readChainSnapshotFile(path)) as import('@trading-app/backtest').OptionChainSnapshotFile & {
         ivRank?: number | null;
       };
       if (!snap || !Array.isArray(snap.rows) || typeof snap.symbol !== 'string') continue;
@@ -3289,7 +3364,8 @@ async function enrichChainPartition(date: string): Promise<void> {
       const ivRank = atmIv != null ? ivRankSync(snap.symbol, atmIv, asOf) : null;
       snap.spot = spot ?? null;
       snap.ivRank = ivRank;
-      await writeFile(path, JSON.stringify(snap), 'utf-8');
+      // TRA-2417 — writes back in the form the path names; a `.json.gz` stays gzipped.
+      await writeChainSnapshotFile(path, snap);
       stamped += 1;
     } catch (err) {
       log.warn('chain-recorder enrich failed', {
@@ -3324,7 +3400,13 @@ async function backfillChainEnrichment(): Promise<void> {
   log.info('chain-recorder backfill enrich complete', { partitions: dates.length });
 }
 // Fire-and-forget at boot — never blocks startup; the IV store was warmed above.
-void backfillChainEnrichment();
+// TRA-2417 — compaction chains off the enrichment backfill rather than racing
+// it: the backfill rewrites any unstamped file, and doing that first means
+// compaction never has to rewrite a partition twice. Both are idempotent, so a
+// boot on an already-compacted archive is a directory walk. This is the path
+// that reclaims the ~355 MB on the first deploy carrying it — it does not wait
+// for the next 3:55 PM ET capture.
+void backfillChainEnrichment().then(() => runChainCompaction('boot'));
 
 // TRA-1971 (TRA-1965, item 5) — publish the AI-Options-Ideas weekly forward-test
 // roll-up. Reads the SAME report + gate the `/api/options/forward-test/report` and
@@ -4947,15 +5029,9 @@ app.get('/api/health/chain-capture', async (_req, res) => {
   if (dates.length > 0) {
     const last = dates[dates.length - 1];
     const dir = join(outDir, last);
-    let symbolsWritten: string[] = [];
-    try {
-      symbolsWritten = (await readdir(dir))
-        .filter((f) => f.endsWith('.json') && f !== '_meta.json')
-        .map((f) => f.replace(/\.json$/i, '').toUpperCase())
-        .sort();
-    } catch {
-      symbolsWritten = [];
-    }
+    // TRA-2417 — counts both storage forms. The newest partition is the one
+    // compaction leaves plain, but this must not depend on that.
+    const symbolsWritten = (await listChainSnapshotFiles(dir)).map(chainSnapshotSymbol).sort();
     let written: number | null = symbolsWritten.length;
     let recordedAt: number | null = null;
     let dteWindow: [number | null, number | null] = [null, null];
@@ -4979,6 +5055,16 @@ app.get('/api/health/chain-capture', async (_req, res) => {
     ? PHASE2_BASELINE.filter((s) => latest!.symbolsWritten.includes(s))
     : [];
 
+  // TRA-2417 — publish the archive's own byte accounting so "compaction ran"
+  // and "the archive is N MB" are gradeable HERE, instead of being re-derived
+  // from Render's disk metrics (the hole TRA-2357 closed for free space). Note
+  // `plainPartitions` is expected to be 1 in steady state — the newest partition
+  // is deliberately left uncompacted; 0 or >1 is the anomaly worth reading.
+  const storage = await chainPartitionStorageReport({
+    outDir,
+    retentionTradingDays: RETENTION_REPORT_TRADING_DAYS,
+  });
+
   res.json({
     issue: 'TRA-779',
     outDir,
@@ -4995,6 +5081,15 @@ app.get('/api/health/chain-capture', async (_req, res) => {
       required: PHASE2_BASELINE,
       covered: baselineCovered,
       missing: PHASE2_BASELINE.filter((s) => !baselineCovered.includes(s)),
+    },
+    storage: {
+      ...storage,
+      totalMb: Math.round((storage.totalBytes / 1_048_576) * 100) / 100,
+      retention: {
+        ...storage.retention,
+        beyondWindowMb: Math.round((storage.retention.beyondWindowBytes / 1_048_576) * 100) / 100,
+      },
+      lastCompaction: lastChainCompaction,
     },
   });
 });
@@ -5018,18 +5113,21 @@ app.get('/api/health/chain-capture/partition/:date', async (req, res) => {
   const dir = join(CHAIN_RECORD_OUT_DIR, date);
   let files: string[];
   try {
-    files = (await readdir(dir)).filter((f) => f.endsWith('.json'));
+    files = await readdir(dir);
   } catch {
     res.status(404).json({ error: 'partition not found', date });
     return;
   }
+  // TRA-2417 — a compacted partition is served IDENTICALLY: the snapshots are
+  // gunzipped here and the JSON response is byte-for-byte what it was before
+  // compaction, so `scripts/pull-recorded-chains.mjs` and the backtest box need
+  // no change. `_meta.json` is never compacted and is still read plain.
   const symbols: unknown[] = [];
   let meta: unknown = null;
-  for (const f of files) {
+  for (const f of files.filter((n) => isChainSnapshotFile(n) || n === CHAIN_META_FILE)) {
     try {
-      const parsed = JSON.parse(await readFile(join(dir, f), 'utf-8'));
-      if (f === '_meta.json') meta = parsed;
-      else symbols.push(parsed);
+      if (f === CHAIN_META_FILE) meta = JSON.parse(await readFile(join(dir, f), 'utf-8'));
+      else symbols.push(await readChainSnapshotFile(join(dir, f)));
     } catch {
       // Skip a corrupt file rather than failing the whole partition.
     }
