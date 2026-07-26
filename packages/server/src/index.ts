@@ -398,6 +398,13 @@ import { resolveMakerWalkConfig } from './option-maker-config.js';
 import { computeLearnedWeights } from './learned-signal-weights.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
 import {
+  recordDailyLearnedWeightsSnapshot,
+  listLearnedWeightsSnapshots,
+  learnedWeightsTrajectory,
+  isLearnedWeightsSnapshotEnabled,
+  type SnapshotDimension,
+} from './learned-weights-history.js';
+import {
   loadUserMemoryStore,
   getUserMemory,
   setUserMemory,
@@ -6853,6 +6860,65 @@ app.get('/api/health/learned-weights', async (req, res) => {
   }
 });
 
+// TRA-2352 (TRA-927 / TRA-920 A2) — the day-by-day TRAIL behind the live fold
+// above. Its sibling `/api/health/learned-weights` answers "what are the weights
+// NOW" (computed live, never stale); this answers "how did they GET here" from
+// the snapshot the 21:00 ET archive tick persists. Unauthenticated + read-only
+// like that sibling; write-only observer, no capital path.
+//
+// NOTE the window differs from the other shadow probes: rows here are DATE-keyed,
+// so `?from=`/`?to=` are inclusive `YYYY-MM-DD` strings, NOT the ms-epoch window
+// used by `/api/health/learned-weights` and the shadow-signal probes.
+//
+// Default: the full snapshots. With `?dimension=score|pattern|symbol&key=` it
+// returns the single-bucket trajectory (the actual ops ask). A date where the
+// bucket does not exist is OMITTED, and a day the tick never ran is simply ABSENT
+// (NO BACK-FILL) — render gaps as gaps, never interpolate across them.
+app.get('/api/health/learned-weights-history', async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const parseDate = (v: unknown): string | undefined =>
+    typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
+  const rawDimension = typeof q['dimension'] === 'string' ? q['dimension'] : undefined;
+  const key = typeof q['key'] === 'string' ? q['key'] : undefined;
+
+  if (rawDimension !== undefined && !['score', 'pattern', 'symbol'].includes(rawDimension)) {
+    res.status(400).json({ error: 'dimension must be one of: score, pattern, symbol' });
+    return;
+  }
+  if (rawDimension !== undefined && (key === undefined || key === '')) {
+    res.status(400).json({ error: 'key is required when dimension is set' });
+    return;
+  }
+
+  try {
+    const from = parseDate(q['from']);
+    const to = parseDate(q['to']);
+    const snapshots = await listLearnedWeightsSnapshots({
+      ...(from !== undefined ? { from } : {}),
+      ...(to !== undefined ? { to } : {}),
+    });
+    const flagEnabled = isLearnedWeightsSnapshotEnabled();
+
+    if (rawDimension !== undefined && key !== undefined) {
+      res.json({
+        issue: 'TRA-927',
+        flagEnabled,
+        dimension: rawDimension as SnapshotDimension,
+        key,
+        series: learnedWeightsTrajectory(snapshots, rawDimension as SnapshotDimension, key),
+      });
+      return;
+    }
+
+    res.json({ issue: 'TRA-927', flagEnabled, days: snapshots.length, snapshots });
+  } catch (err) {
+    log.error('learned-weights-history health probe failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ error: 'Failed to read learned weights history' });
+  }
+});
+
 // TRA-1046 (TRA-1041c L2) — on-demand hypothesis backtest. Validates a single
 // param-change hypothesis SYNCHRONOUSLY through the same apply→backtest→G0-grade
 // pipeline the analyst's EOD reflect routine uses, returning the graded result in
@@ -10994,6 +11060,18 @@ scheduler.start({
       log.error('analyst post-market tick failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
+    );
+    // TRA-2352 (TRA-927) — persist ONE learned-weights snapshot for this ET day,
+    // last in the chain so `runDailyCloseForAllUsers()` above has already labelled
+    // the day's resolutions into the reversal shadow ledger before the fold is
+    // taken. Zero-IO no-op while ENABLE_LEARNED_WEIGHTS_SNAPSHOT is off (the flag
+    // is checked before the ledger read). Write-only observer, no capital path.
+    // NO BACK-FILL: a missed day stays absent — see learned-weights-history.ts.
+    await recordDailyLearnedWeightsSnapshot({ readLedger: () => listReversalShadowSignals() }).catch(
+      err =>
+        log.error('learned-weights snapshot tick failed', {
+          reason: err instanceof Error ? err.message : String(err),
+        }),
     );
   },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
