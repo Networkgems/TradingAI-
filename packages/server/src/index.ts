@@ -206,6 +206,7 @@ import {
   scanTargetStop,
   diffChain,
   toAlertEvents,
+  type OptionsAlert,
 } from './reports/options-alert-engine.js';
 import {
   aggregateCashFlowByDate,
@@ -3238,6 +3239,10 @@ function runScheduledReportsForAllUsers(now: Date = new Date()): void {
 // trading is unaffected. Per-symbol errors are isolated inside
 // `recordOptionChains` and logged, never fatal.
 const CHAIN_RECORD_OUT_DIR = process.env['CHAINS_OUT_DIR'] ?? join(DATA_DIR, 'option-chains');
+// TRA-2476 — persistent "the 3:55 PM ET hook ran today" marker (ET date string).
+// Lives beside the partitions on the data disk so it survives the pm2
+// relaunches that reset the scheduler's in-memory dedup.
+const CHAIN_HOOK_MARKER_PATH = join(CHAIN_RECORD_OUT_DIR, '.chain-hook-last-run');
 
 // ── TRA-2417: option-chain archive compaction ────────────────────────────────
 // `/data` is a 1 GB volume and the capture was adding ~8.4 MB/trading day with
@@ -3302,11 +3307,13 @@ async function runChainCompaction(trigger: 'boot' | 'post-capture'): Promise<voi
   }
 }
 
-async function runChainRecord(): Promise<void> {
+/** Returns true iff a capture ran (so the caller can stamp the per-day marker
+ * — a token-less no-op must stay retryable within the day, see TRA-2476). */
+async function runChainRecord(): Promise<boolean> {
   const apiToken = (process.env['TRADIER_API_TOKEN'] ?? '').trim();
   if (!apiToken) {
     log.warn('chain-recorder TRADIER_API_TOKEN unset — skipping option-chain snapshot');
-    return;
+    return false;
   }
   const accountId = (process.env['TRADIER_ACCOUNT_ID'] ?? '').trim() || 'recorder-readonly';
   const client = new TradierOptionsClient(apiToken, accountId, 'production');
@@ -3374,6 +3381,7 @@ async function runChainRecord(): Promise<void> {
   // TRA-2417 — reclaim the day BEFORE this one. Runs after enrichment so the
   // partition being compacted is already IVR-stamped and settled.
   await runChainCompaction('post-capture');
+  return true;
 }
 
 // TRA-1049 — post-pass that stamps `spot` + `ivRank` onto each per-symbol file
@@ -3517,12 +3525,22 @@ async function runWeeklyOptionsRollup(): Promise<void> {
 // prefs (and the dedup window) decide who actually gets pinged. Kill switch:
 // `OPTIONS_ALERT_PUSH=off`. Fully isolated: a failure here never affects the
 // capture (the caller wraps it) and a single user's error never aborts the loop.
+// TRA-2476 — emit slice size. Each `emitAlert` is fire-and-forget, but its
+// synchronous prep plus the microtask continuations it spawns all drain before
+// the event loop can advance, so an unbounded emit loop runs as ONE macrotask.
+const ALERT_EMIT_SLICE = 100;
+const yieldToEventLoop = (): Promise<void> => new Promise((res) => setImmediate(res));
+
 async function runOptionsAlertPush(): Promise<void> {
   if ((process.env['OPTIONS_ALERT_PUSH'] ?? '').trim().toLowerCase() === 'off') {
     log.info('options-alert push disabled (OPTIONS_ALERT_PUSH=off)');
     return;
   }
-  const days = await loadChainDays(CHAIN_RECORD_OUT_DIR);
+  // TRA-2476: only the newest two non-empty partitions are diffed — loading
+  // every recorded partition (~45 dates of full chains) spiked RSS at 3:55 PM
+  // ET on the process's fattest heap of the day, the same instant the emit
+  // burst below lands.
+  const days = await loadChainDays(CHAIN_RECORD_OUT_DIR, { lastN: 2 });
   if (days.length < 2) {
     log.info('options-alert push skipped — need 2 chain partitions', { have: days.length });
     return;
@@ -3531,12 +3549,16 @@ async function runOptionsAlertPush(): Promise<void> {
   const todayDay = days[days.length - 1];
 
   // Global chain-diff + IV-move alerts: computed once, shared across users.
-  const chainAlerts = [...todayDay.bySymbol.entries()]
-    .sort()
-    .flatMap(([symbol, today]) => {
-      const prev = prevDay.bySymbol.get(symbol);
-      return prev ? diffChain(prev, today) : [];
-    });
+  // TRA-2476: yield between symbols — this pass and the per-user emit loop
+  // below used to run as one synchronous macrotask (2,408 alerts × 30 user
+  // contexts = 72,240 emits), a 40.6s event-loop block at 19:56:50Z that the
+  // watchdog killed 3 minutes before the close, burning the TRA-2213 session.
+  const chainAlerts: OptionsAlert[] = [];
+  for (const [symbol, today] of [...todayDay.bySymbol.entries()].sort()) {
+    const prev = prevDay.bySymbol.get(symbol);
+    if (prev) chainAlerts.push(...diffChain(prev, today));
+    await yieldToEventLoop();
+  }
 
   let pushed = 0;
   for (const ctx of getAllUserContexts()) {
@@ -3544,7 +3566,14 @@ async function runOptionsAlertPush(): Promise<void> {
       const openOptions = ctx.engine.getState().options.openOptions ?? [];
       const positionAlerts = scanTargetStop(openOptions);
       const events = toAlertEvents([...positionAlerts, ...chainAlerts], ctx.username);
-      for (const ev of events) emitAlert(ev);
+      for (let i = 0; i < events.length; i += ALERT_EMIT_SLICE) {
+        const end = Math.min(i + ALERT_EMIT_SLICE, events.length);
+        for (let j = i; j < end; j += 1) emitAlert(events[j]);
+        // Let the watchdog sampler, health checks and GC interleave between
+        // slices — the dispatcher's dedup/digest handling is unaffected by
+        // WHEN an event is emitted, only by its dedupKey.
+        await yieldToEventLoop();
+      }
       pushed += events.length;
     } catch (err) {
       log.warn('options-alert push failed for user', {
@@ -11548,8 +11577,36 @@ scheduler.start({
   // the sentiment + chain partitions co-accumulate per symbol-day for the
   // TRA-820 IC/flow study. Isolated so a StockTwits failure can't drop the
   // chain capture (or vice-versa).
+  // TRA-2476 — the scheduler's per-day dedup (`lastChainRecordDate`) is
+  // in-memory, and the 15:55–20:00 ET catch-up refires this hook on EVERY boot
+  // inside that window. On Mon 2026-07-27 that was a 73-boot crash loop
+  // (20:00:17Z → 00:05:34Z — it ended the minute the ET catch-up window
+  // closed): each boot re-ran capture + enrich + push on a cold process and
+  // died, destroying the frozen RTH counters 17s after the close. The marker
+  // below lives on the persistent disk so a reboot inside the window skips a
+  // capture that already succeeded today; it is stamped ONLY on a real capture
+  // (token-less no-ops stay retryable within the day).
   onChainRecord: async () => {
-    await runChainRecord();
+    const todayEt = etDateString(new Date());
+    try {
+      const marker = (await readFile(CHAIN_HOOK_MARKER_PATH, 'utf-8')).trim();
+      if (marker === todayEt) {
+        log.info('chain-record hook already ran today — skipping catch-up refire', {
+          date: todayEt,
+        });
+        return;
+      }
+    } catch {
+      // No marker yet (first run on this disk) — proceed.
+    }
+    const captured = await runChainRecord();
+    if (captured) {
+      await writeFile(CHAIN_HOOK_MARKER_PATH, todayEt, 'utf-8').catch((err) =>
+        log.warn('chain-record day marker write failed', {
+          reason: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
     await runSentimentSnapshot().catch((err) =>
       log.error('sentiment-recorder failed', {
         reason: err instanceof Error ? err.message : String(err),

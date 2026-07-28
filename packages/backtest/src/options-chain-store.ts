@@ -123,8 +123,17 @@ const DATE_DIR = /^\d{4}-\d{2}-\d{2}$/;
  * directory whose name isn't a YYYY-MM-DD date is skipped; `_meta.json` and
  * any file that is neither `.json` nor `.json.gz` is ignored. Compacted
  * (`.json.gz`) and plain partitions load identically.
+ *
+ * `lastN` loads only the newest N NON-EMPTY partitions (still ascending) and
+ * stops reading older ones. Empty/corrupt partitions don't count toward N, so
+ * `lastN: 2` yields the same two days a full load's `days.slice(-2)` would —
+ * a caller that only diffs today vs yesterday must not resident every recorded
+ * partition (~45 dates of full chains) to get them.
  */
-export async function loadChainDays(dataDir: string): Promise<ChainDay[]> {
+export async function loadChainDays(
+  dataDir: string,
+  opts: { lastN?: number } = {},
+): Promise<ChainDay[]> {
   let entries: string[];
   try {
     entries = await readdir(dataDir);
@@ -133,9 +142,11 @@ export async function loadChainDays(dataDir: string): Promise<ChainDay[]> {
   }
 
   const dateDirs = entries.filter((e) => DATE_DIR.test(e)).sort();
+  if (opts.lastN != null && opts.lastN >= 0) dateDirs.reverse();
   const days: ChainDay[] = [];
 
   for (const date of dateDirs) {
+    if (opts.lastN != null && days.length >= opts.lastN) break;
     const dir = join(dataDir, date);
     let files: string[];
     try {
@@ -158,6 +169,7 @@ export async function loadChainDays(dataDir: string): Promise<ChainDay[]> {
     if (bySymbol.size > 0) days.push({ date, bySymbol });
   }
 
+  if (opts.lastN != null && opts.lastN >= 0) days.reverse();
   return days;
 }
 
