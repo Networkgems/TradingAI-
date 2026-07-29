@@ -93,6 +93,11 @@ import {
   deleteSettingsRow,
   clearSettingsCache,
 } from './account-settings.js';
+import {
+  deleteIdentityRows,
+  identityRowsDeleted as sumIdentityRowsDeleted,
+  identityRowsRemaining as sumIdentityRowsRemaining,
+} from './sqlite-identity.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'account-deletion' });
@@ -150,6 +155,23 @@ export interface AccountWipeReceipt {
    */
   settingsCredentialFieldsCleared: number;
   /**
+   * TRA-2535 — identity-keyed `state.db` rows that EXISTED for this username
+   * across every table in `IDENTITY_TABLES` (today: `account_settings` and
+   * `agent_spend`). The "did this run have teeth" number, in the same spirit as
+   * `backupGenerationsWithData`.
+   *
+   * Usually 0 for `account_settings` specifically, because the block above has
+   * already dropped it by the time this sweep runs — this number is dominated by
+   * the tables that have no bespoke handling.
+   */
+  identityRowsDeleted: number;
+  /**
+   * Identity-keyed rows STILL present afterwards, summed across tables. The
+   * verdict, and it must be 0 — without it, `identityRowsDeleted: 0` reads as
+   * healthy on the day a DELETE silently stops matching.
+   */
+  identityRowsRemaining: number;
+  /**
    * Non-fatal failures (permission, locked file). Non-empty ⇒ `ok` is false.
    *
    * ⚠️ These strings are labelled with ABSOLUTE `DATA_DIR` paths (`primary:…`,
@@ -190,6 +212,8 @@ export interface PublicAccountWipeReceipt {
   settingsRowExisted: boolean;
   settingsRowRemoved: boolean;
   settingsCredentialFieldsCleared: number;
+  identityRowsDeleted: number;
+  identityRowsRemaining: number;
   errorCount: number;
   ok: boolean;
 }
@@ -211,6 +235,8 @@ export function redactWipeReceipt(receipt: AccountWipeReceipt): PublicAccountWip
     settingsRowExisted: receipt.settingsRowExisted,
     settingsRowRemoved: receipt.settingsRowRemoved,
     settingsCredentialFieldsCleared: receipt.settingsCredentialFieldsCleared,
+    identityRowsDeleted: receipt.identityRowsDeleted,
+    identityRowsRemaining: receipt.identityRowsRemaining,
     errorCount: receipt.errors.length,
     ok: receipt.ok,
   };
@@ -470,6 +496,43 @@ export async function wipeAccountData(
   }
   if (!settingsRowRemoved) errors.push('settings-row: present after wipe');
 
+  // 6. TRA-2535 — the REST of `state.db`. `account_settings` was never the only
+  //    username-keyed row: `agent_spend` (agent-spend-store.ts) is keyed by the
+  //    same recyclable name in a column called `user`, and no code path in this
+  //    repo had ever deleted a row from EITHER table.
+  //
+  //    Two consequences, both closed here. A recycled name landing on the
+  //    predecessor's running total arrives already at or over the daily LLM cap
+  //    (measured live on bqb1: `userCapUsd` is env-overridden to $0.50, so the
+  //    inherited quantum that fully halts a new account for the day is fifty
+  //    cents, not the $10 in source). And independently of any recycle, a
+  //    self-deleted user is told their data is gone while their per-user/day
+  //    spend history stays in `state.db` indefinitely.
+  //
+  //    Runs LAST, after the tree is destroyed, so a crash-restart loop cannot
+  //    lose the tombstone before the rows clear — the ordering constraint from
+  //    step 5, unchanged. `account_settings` is deliberately NOT excluded: the
+  //    delete is idempotent, and if step 5 threw this is a second attempt at it.
+  let identityRowsDeleted = 0;
+  let identityRowsRemaining = 0;
+  try {
+    const cleared = deleteIdentityRows(username);
+    identityRowsDeleted = sumIdentityRowsDeleted(cleared);
+    identityRowsRemaining = sumIdentityRowsRemaining(cleared);
+    for (const r of cleared) {
+      if (r.error) errors.push(`identity-rows:${r.table}: ${r.error}`);
+      else if (r.rowsRemaining > 0) errors.push(`identity-rows:${r.table}: ${r.rowsRemaining} present after wipe`);
+    }
+  } catch (err: unknown) {
+    // Unlike the retirement path this is NOT fail-soft: the user asked for
+    // destruction and "I could not clear it" is not a green answer.
+    errors.push(`identity-rows: ${err instanceof Error ? err.message : String(err)}`);
+    // -1, not 0: the sweep did not complete, so the count is UNKNOWN. A 0 here
+    // would be the exact "no-op reads as success" shape this field exists to
+    // prevent, and NaN would serialise to `null` on the wire.
+    identityRowsRemaining = -1;
+  }
+
   const receipt: AccountWipeReceipt = {
     username,
     deletedAt: tombstone.deletedAt,
@@ -485,6 +548,8 @@ export async function wipeAccountData(
     settingsRowExisted,
     settingsRowRemoved,
     settingsCredentialFieldsCleared,
+    identityRowsDeleted,
+    identityRowsRemaining,
     errors,
     ok: false,
   };
@@ -492,6 +557,9 @@ export async function wipeAccountData(
     receipt.primaryDirRemoved &&
     receipt.backupGenerationsRemaining === 0 &&
     receipt.settingsRowRemoved &&
+    // TRA-2535 — `=== 0` and not `<= 0`, so the -1 "sweep did not complete"
+    // sentinel fails the verdict rather than passing it.
+    receipt.identityRowsRemaining === 0 &&
     errors.length === 0;
 
   log[receipt.ok ? 'info' : 'error']('account-deletion: wipe complete', { ...receipt });

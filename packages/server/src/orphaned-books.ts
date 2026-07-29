@@ -80,6 +80,12 @@ import {
   clearSettingsCache,
   type PersistedSettingsRow,
 } from './account-settings.js';
+import {
+  deleteIdentityRows,
+  countIdentityRows,
+  identityRowsDeleted,
+  identityRowsRemaining,
+} from './sqlite-identity.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'orphaned-books' });
@@ -142,6 +148,18 @@ export interface OrphanRetirementReceipt {
   settingsCredentialFieldsCleared: number;
   /** Relative path of the archived row under DATA_DIR, or null. */
   settingsQuarantinedTo: string | null;
+  /**
+   * TRA-2535 — identity-keyed `state.db` rows that existed for this username in
+   * the tables with no bespoke handling above (today: `agent_spend`). The teeth
+   * number; see `identityRowsRemaining` for the verdict.
+   */
+  identityRowsDeleted: number;
+  /**
+   * Identity-keyed rows still present after the sweep. Must be 0, and it gates
+   * `ok` — an inherited `agent_spend` total lands the NEW holder of this name at
+   * or over the daily LLM cap for the rest of the UTC day.
+   */
+  identityRowsRemaining: number;
   /** Operator-only strings; may name absolute paths. Never put these on the wire. */
   errors: string[];
   /**
@@ -245,9 +263,16 @@ export async function retireOrphanedBook(
     log.error('orphaned-books: could not probe the account_settings row', { username, reason });
   }
 
+  // TRA-2535 — a leftover `agent_spend` row is an orphan signal on exactly the
+  // same footing as a leftover settings row, and strictly stronger evidence the
+  // name was really used: a row only exists because that identity spent money.
+  // Excludes `account_settings`, already counted by `settingsRow.found` above.
+  const strayIdentityRows = countIdentityRows(username, { exclude: ['account_settings'] });
+
   const receipt: OrphanRetirementReceipt = {
     username,
-    orphanFound: primaryDirExisted || backupGenerationsWithData > 0 || settingsRow.found,
+    orphanFound:
+      primaryDirExisted || backupGenerationsWithData > 0 || settingsRow.found || strayIdentityRows > 0,
     primaryDirExisted,
     backupGenerationsWithData,
     retiredAt: null,
@@ -258,6 +283,8 @@ export async function retireOrphanedBook(
     settingsRowRetired: false,
     settingsCredentialFieldsCleared: 0,
     settingsQuarantinedTo: null,
+    identityRowsDeleted: 0,
+    identityRowsRemaining: 0,
     errors,
     ok: true,
   };
@@ -378,6 +405,30 @@ export async function retireOrphanedBook(
   // The in-memory copy is a third channel and outlives both of the above.
   clearSettingsCache(username);
 
+  // TRA-2535 — the rest of `state.db`. `account_settings` is EXCLUDED here and
+  // that exclusion is load-bearing, not tidiness: its drop above is gated on
+  // `archived`, because this path retains before it destroys (TRA-142). A blanket
+  // delete would destroy the row on exactly the runs where the archive write
+  // FAILED — turning a retain-contract violation into permanent data loss. The
+  // self-delete path has no archive and so excludes nothing.
+  //
+  // `agent_spend` needs no archive: it is a per-day USD counter, not a credential,
+  // and there is no restore story that wants a predecessor's spend.
+  try {
+    const cleared = deleteIdentityRows(username, { exclude: ['account_settings'] });
+    receipt.identityRowsDeleted = identityRowsDeleted(cleared);
+    receipt.identityRowsRemaining = identityRowsRemaining(cleared);
+    for (const r of cleared) {
+      if (r.error) errors.push(`identity-rows:${r.table}: ${r.error}`);
+      else if (r.rowsRemaining > 0) {
+        errors.push(`identity-rows:${r.table}: ${r.rowsRemaining} present after retirement`);
+      }
+    }
+  } catch (err: unknown) {
+    errors.push(`identity-rows: ${err instanceof Error ? err.message : String(err)}`);
+    receipt.identityRowsRemaining = -1; // UNKNOWN, not clean — see the wipe receipt.
+  }
+
   // The verdict measures the WORLD, not the steps: the live key must be clear on
   // disk, and the epoch must come back through `accountDeletedAt` — the same
   // accessor `tryRestoreFromBackup` and `journalRowsForBook` read. Asserting the
@@ -400,7 +451,16 @@ export async function retireOrphanedBook(
     errors.push(`settings-verify: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!settingsChannelClear) errors.push('settings-row: present after retirement');
-  receipt.ok = liveKeyClear && epochArmed && settingsChannelClear && errors.length === 0;
+  // TRA-2535 — `=== 0` so the -1 "sweep did not complete" sentinel fails the
+  // verdict. `ok: false` here REFUSES the registration, which is the right trade:
+  // handing out a name whose identity rows we could not clear is the bug this
+  // module exists to prevent.
+  receipt.ok =
+    liveKeyClear &&
+    epochArmed &&
+    settingsChannelClear &&
+    receipt.identityRowsRemaining === 0 &&
+    errors.length === 0;
 
   log[receipt.ok ? 'info' : 'error']('orphaned-books: retirement complete', { ...receipt });
   return receipt;

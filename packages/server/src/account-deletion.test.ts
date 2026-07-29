@@ -414,6 +414,10 @@ describe('TRA-2421 — what the receipt is allowed to say on the wire', () => {
       settingsRowExisted: true,
       settingsRowRemoved: false,
       settingsCredentialFieldsCleared: 2,
+      // TRA-2535 — a FAILING receipt, so these carry residue too: one row was
+      // there and is still there.
+      identityRowsDeleted: 1,
+      identityRowsRemaining: 1,
       errors: [
         `primary:${userDir('enock')}: EPERM: operation not permitted`,
         `backup:${generationDir(T0)}: EBUSY: resource busy or locked`,

@@ -488,6 +488,39 @@ export function logAgentSpendDailyReadout(now = Date.now()): void {
   });
 }
 
+/**
+ * TRA-2535 — forget one user's spend from the LIVE in-memory bucket.
+ *
+ * The durable `agent_spend` row is only half of this channel. `bucket.perUser` is
+ * a process-global map keyed by the same raw username string, so within a single
+ * process lifetime it carries a deleted user's running total forward REGARDLESS
+ * of SQLite — nothing in `destroyUserContext` clears it. SQLite is what makes the
+ * inheritance survive a restart; this map is what makes it happen without one.
+ * Both layers are the same defect class ("identity-keyed state outside the tree,
+ * never cleared on delete") and clearing only the row would leave a recycled name
+ * still landing on its predecessor's total until the next redeploy or day-roll.
+ *
+ * Called via the `forgetInMemory` hook on the `agent_spend` entry in
+ * `IDENTITY_TABLES`, so both delete paths get it without either one knowing this
+ * function exists.
+ *
+ * The `reserved` entry is dropped too, and that is safe rather than sloppy: a
+ * reservation outliving this call settles through `dropReservation`, which
+ * computes `(reserved.get(user) ?? 0) - amount`, gets a negative, and takes the
+ * `delete` branch. No negative total can be written back.
+ *
+ * Returns whether anything was actually being carried — a teeth number, so a
+ * no-op cannot be read as a clear.
+ */
+export function forgetAgentSpendForUser(user: string | undefined): boolean {
+  if (!bucket) return false;
+  const u = userKey(user);
+  const had = bucket.perUser.delete(u);
+  const hadReserved = bucket.reserved.delete(u);
+  if (had || hadReserved) log.info('agent-spend: forgot in-memory totals for a deleted identity', { user: u });
+  return had || hadReserved;
+}
+
 /** Test seam — reset the in-memory accumulator. */
 export function resetAgentSpendForTests(): void {
   bucket = null;
