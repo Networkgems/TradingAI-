@@ -27,6 +27,7 @@ import {
   RTH_DECOUPLED_SHARE_FLOOR,
   type HealthUserContext,
 } from './health-routes.js';
+import { TEST_ACCOUNT_PREFIX_ENV } from '../test-accounts.js'; // TRA-2478
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
 import {
   OPTION_TRADE_JOURNAL_FLAG,
@@ -2789,6 +2790,126 @@ describe('TRA-2193 option-journal fixture-vs-desk partition', () => {
     const report = buildOptionJournalReport([desk], NOW, true);
     expect(report.summary.accountClassNote).toContain('byAccountClass.desk');
     expect(report.summary.accountClassNote).toContain('id-dedupe');
+  });
+
+  // ── TRA-2478 ──────────────────────────────────────────────────────────────
+  //
+  // The partition classed verification books by a matcher that covered only
+  // {`qa_*`, `ctoverify*`}, so `qtverify_1785048357` — a QuantTrader verification
+  // book — was folded into `byAccountClass.desk`, the gate basis for the TRA-1585
+  // OTM delta-floor forward grade. TRA-2488 fixed the SHARED predicate
+  // (`^qtverify` in `BUILTIN_TEST_PATTERNS`); these tests pin the fix AT THE
+  // PARTITION, which is a different claim and the one that was actually wrong.
+  //
+  // Why here and not only in `test-accounts.test.ts`: the unit tests on
+  // `isTestAccount` stay green if someone re-inlines a local prefix list into
+  // `partitionRowsByAccountClass`. That re-inlining IS the defect class — TRA-2355
+  // had already removed one such copy — and only a partition-level assertion can
+  // see it. The `routes through the shared predicate` test below is the tooth.
+  describe('TRA-2478 verification books never enter the desk fold', () => {
+    // The live contamination, reproduced to the digit from the 2026-07-28 wire
+    // read on `408f06a5` (post-arm OTM window, `openTs >= 1784089818067`):
+    //   36 genuine desk rows   avgR +0.149618   $789.69
+    // + 1  qtverify_1785048357 R    +0.0502     $12.54
+    // = 37 rows reported as desk, avgR +0.14693, $802.23.
+    const DESK_N = 36;
+    const DESK_R = 0.149618;
+    const DESK_USD = 789.69;
+    const QTVERIFY_R = 0.0502;
+    const QTVERIFY_USD = 12.54;
+    const CONTAMINATED_R = (DESK_N * DESK_R + QTVERIFY_R) / (DESK_N + 1);
+
+    // Three real desk books, round-robined — `Richard` capitalised as it is in
+    // prod, since the patterns are case-INsensitive and a careless widening
+    // (e.g. a bare `/verify/i`) has to be shown not to swallow them.
+    const deskBooks = ['admin', 'Richard', 'enock'];
+    const deskRows = Array.from({ length: DESK_N }, (_, i) =>
+      row(`desk-${i}`, deskBooks[i % deskBooks.length], DESK_USD / DESK_N, DESK_R),
+    );
+    const qtverifyRow = row('qtv1', 'qtverify_1785048357', QTVERIFY_USD, QTVERIFY_R);
+
+    it('keeps qtverify_* OUT of desk — the exact +$12.54 / avgR drift from the wire', () => {
+      const report = buildOptionJournalReport([...deskRows, qtverifyRow], NOW, true);
+
+      expect(report.deskRowCount).toBe(DESK_N);
+      expect(report.fixtureRowCount).toBe(1);
+      expect(report.summary.byAccountClass.desk.closed).toBe(DESK_N);
+      expect(report.summary.byAccountClass.desk.avgR).toBeCloseTo(DESK_R, 6);
+      expect(report.summary.byAccountClass.desk.realizedPnlUsd).toBeCloseTo(DESK_USD, 6);
+
+      // The fixture row is not dropped — it moves, and it must be findable.
+      expect(report.summary.byAccountClass.fixture.realizedPnlUsd).toBeCloseTo(QTVERIFY_USD, 6);
+
+      // …and the specific wrong numbers the route used to publish are now absent
+      // from desk. Asserting the negative directly: a future matcher regression
+      // reproduces exactly these, so naming them is what makes this test fail loud.
+      expect(report.summary.byAccountClass.desk.avgR).not.toBeCloseTo(CONTAMINATED_R, 6);
+      expect(report.summary.byAccountClass.desk.realizedPnlUsd)
+        .not.toBeCloseTo(DESK_USD + QTVERIFY_USD, 6);
+      expect(CONTAMINATED_R).toBeCloseTo(0.14693, 5); // the published desk avgR, for the record
+    });
+
+    // One case per KNOWN verification family, at the partition. Mirrors the
+    // family registry in `test-accounts.test.ts` deliberately: when a loop invents
+    // a new prefix, BOTH lists have to grow, and a fixture book whose name matches
+    // no family silently re-enters the desk number. There have now been three
+    // families (`qa_*`, `ctoverify_*`, `qtverify_*`) and they are already
+    // compounding — `ctoverify_qa_tra2406b` carries two of them.
+    it('classes every known verification family as fixture, real books as desk', () => {
+      const fixtures = [
+        row('f1', 'qa_reg_0710202220', 5, 0.02),
+        row('f2', 'qa_tra1475_1783821169', 5, 0.02),
+        row('f3', 'qa_mirror_1578_38096', 5, 0.02),
+        row('f4', 'ctoverify_qa_tra2406b', 5, 0.02),
+        row('f5', 'monitor_qa', 5, 0.02),
+        row('f6', 'qtverify_1785048357', 5, 0.02),
+      ];
+      const desks = deskBooks.map((b, i) => row(`r${i}`, b, 100, 0.5));
+      const report = buildOptionJournalReport([...fixtures, ...desks], NOW, true);
+
+      expect(report.fixtureRowCount).toBe(fixtures.length);
+      expect(report.deskRowCount).toBe(desks.length);
+      expect(report.summary.byAccountClass.desk.realizedPnlUsd).toBe(300);
+      expect(report.summary.accountClassCountsSumToRows).toBe(true);
+    });
+
+    // The anti-widening guard. The ticket floated a bare `/verify/i` substring as
+    // one option; it is the wrong shape, because it silently SHRINKS the desk
+    // number the moment a real book's name happens to contain "verify" — a
+    // false-negative desk row is far worse than the +$12.54 it would fix, and it
+    // reads identically to a quiet desk. The shipped rule stays ANCHORED.
+    it('does NOT swallow real books whose name merely contains a family substring', () => {
+      const realBooks = ['qtrader', 'my_qtverify', 'aqua', 'monitorly', 'my_qa_notes'];
+      const rows = realBooks.map((b, i) => row(`ok${i}`, b, 10, 0.1));
+      const report = buildOptionJournalReport(rows, NOW, true);
+
+      expect(report.deskRowCount).toBe(realBooks.length);
+      expect(report.fixtureRowCount).toBe(0);
+    });
+
+    // THE TOOTH. Proves the partition calls the shared classifier rather than a
+    // local copy of its pattern list: an env-configured prefix is known ONLY to
+    // `test-accounts.ts`, so a re-inlined regex list in this module cannot honour
+    // it and this test goes red. Without this, every other assertion here would
+    // still pass against a freshly-drifted second matcher.
+    it('routes through the SHARED predicate — an env-configured prefix reclassifies', () => {
+      const before = process.env[TEST_ACCOUNT_PREFIX_ENV];
+      try {
+        // Baseline: unknown to every built-in family, so it is desk.
+        expect(
+          buildOptionJournalReport([row('lt1', 'loadtest_9', 42, 0.3)], NOW, true).deskRowCount,
+        ).toBe(1);
+
+        process.env[TEST_ACCOUNT_PREFIX_ENV] = 'loadtest';
+        const report = buildOptionJournalReport([row('lt1', 'loadtest_9', 42, 0.3)], NOW, true);
+        expect(report.fixtureRowCount).toBe(1);
+        expect(report.deskRowCount).toBe(0);
+        expect(report.summary.byAccountClass.desk.realizedPnlUsd).toBe(0);
+      } finally {
+        if (before === undefined) delete process.env[TEST_ACCOUNT_PREFIX_ENV];
+        else process.env[TEST_ACCOUNT_PREFIX_ENV] = before;
+      }
+    });
   });
 });
 
