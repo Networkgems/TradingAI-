@@ -9,6 +9,7 @@ import {
   tripStockTwitsBreaker,
   resetStockTwitsProxy,
   probeStockTwits,
+  stockTwitsBreakerOpenUntil,
 } from './stocktwits-feed.js';
 
 function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
@@ -233,7 +234,10 @@ describe('probeStockTwits (TRA-1330)', () => {
     const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
     vi.stubGlobal('fetch', fetchMock);
     const out = await probeStockTwits('aapl');
-    expect(out).toEqual({ ok: true, status: 200, messageCount: 5, breakerOpen: false, reason: null });
+    expect(out).toEqual({
+      ok: true, status: 200, messageCount: 5, reason: null,
+      breakerOpen: false, breakerOpenUntil: null, breakerOpenForMs: null,
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining('/symbol/AAPL.json'),
       expect.objectContaining({ headers: expect.objectContaining({ 'User-Agent': expect.any(String) }) }),
@@ -250,12 +254,93 @@ describe('probeStockTwits (TRA-1330)', () => {
   });
 
   it('reports breakerOpen without hitting the network when the breaker is open', async () => {
-    tripStockTwitsBreaker(Date.parse('2099-01-01T00:00:00Z'));
+    const until = Date.parse('2099-01-01T00:00:00Z');
+    tripStockTwitsBreaker(until);
     const fetchMock = vi.fn(async () => jsonResponse(STREAM_FIXTURE));
     vi.stubGlobal('fetch', fetchMock);
     const out = await probeStockTwits('AAPL');
-    expect(out).toEqual({ ok: false, status: null, messageCount: null, breakerOpen: true, reason: 'rate-limit breaker open' });
+    expect(out).toMatchObject({
+      ok: false, status: null, messageCount: null,
+      breakerOpen: true, breakerOpenUntil: '2099-01-01T00:00:00.000Z',
+      reason: 'rate-limit breaker open',
+    });
+    expect(out.breakerOpenForMs).toBeGreaterThan(0);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // TRA-2519 — `breakerOpen: true` alone cannot separate a routine 5-minute
+  // cooldown from a breaker stuck open, which is precisely how the 07-27/07-28
+  // zero-days got read as "latched open" when the breaker was cycling normally.
+  // The probe must publish the deadline so the two are distinguishable.
+  it('publishes the reset deadline so a short cooldown is distinguishable from a stuck breaker', async () => {
+    const soon = Date.now() + 5 * 60_000;
+    tripStockTwitsBreaker(soon);
+    const out = await probeStockTwits('AAPL');
+    expect(out.breakerOpen).toBe(true);
+    expect(out.breakerOpenUntil).toBe(new Date(soon).toISOString());
+    expect(out.breakerOpenForMs).toBeLessThanOrEqual(5 * 60_000);
+    expect(out.breakerOpenForMs).toBeGreaterThan(4 * 60_000);
+  });
+
+  it('reports a closed breaker as null deadline, not a stale timestamp', async () => {
+    tripStockTwitsBreaker(Date.now() - 1_000); // already lapsed
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(STREAM_FIXTURE)));
+    const out = await probeStockTwits('AAPL');
+    expect(out.breakerOpen).toBe(false);
+    expect(out.breakerOpenUntil).toBeNull();
+    expect(out.breakerOpenForMs).toBeNull();
+  });
+});
+
+/**
+ * TRA-2519 — the breaker cooldown must stay bounded.
+ *
+ * `X-RateLimit-Reset` is epoch SECONDS and we multiply by 1000. A value already
+ * in milliseconds would put the deadline ~57,000 years out and latch the breaker
+ * for the whole process lifetime — and `breakerOpen: true` looks identical at 5
+ * minutes and at 5 millennia, so nothing would ever surface it. StockTwits' own
+ * window is hourly, so a 1h clamp costs at most one extra 429.
+ */
+describe('rate-limit breaker cooldown bounds (TRA-2519)', () => {
+  beforeEach(() => resetStockTwitsBreaker());
+  afterEach(() => { vi.unstubAllGlobals(); resetStockTwitsBreaker(); });
+
+  const rateLimited = (headers: Record<string, string>) =>
+    vi.fn(async () => new Response('{}', { status: 429, headers }));
+
+  it('honours a sane epoch-seconds reset header', async () => {
+    const resetSec = Math.floor((Date.now() + 10 * 60_000) / 1000);
+    vi.stubGlobal('fetch', rateLimited({ 'x-ratelimit-reset': String(resetSec) }));
+    await fetchStockTwitsStream('AAPL');
+    const until = stockTwitsBreakerOpenUntil()!;
+    expect(until).toBe(resetSec * 1000);
+  });
+
+  it('clamps a millisecond-valued reset header to the default cooldown', async () => {
+    const msValued = Date.now() + 10 * 60_000; // epoch MILLIS in a seconds field
+    vi.stubGlobal('fetch', rateLimited({ 'x-ratelimit-reset': String(msValued) }));
+    await fetchStockTwitsStream('AAPL');
+    const openFor = stockTwitsBreakerOpenUntil()! - Date.now();
+    expect(openFor).toBeGreaterThan(4 * 60_000);
+    expect(openFor).toBeLessThanOrEqual(5 * 60_000); // NOT the year 58,543
+  });
+
+  it('falls back to the default cooldown when the reset header is in the past', async () => {
+    const past = Math.floor((Date.now() - 60_000) / 1000);
+    vi.stubGlobal('fetch', rateLimited({ 'x-ratelimit-reset': String(past) }));
+    await fetchStockTwitsStream('AAPL');
+    // A past deadline would leave the breaker effectively closed and let the
+    // caller hammer straight back into the throttle.
+    expect(isStockTwitsBreakerOpen()).toBe(true);
+    expect(stockTwitsBreakerOpenUntil()! - Date.now()).toBeGreaterThan(4 * 60_000);
+  });
+
+  it('uses the default cooldown when no reset header arrives (the bqb1 case)', async () => {
+    vi.stubGlobal('fetch', rateLimited({}));
+    await fetchStockTwitsStream('AAPL');
+    const openFor = stockTwitsBreakerOpenUntil()! - Date.now();
+    expect(openFor).toBeGreaterThan(4 * 60_000);
+    expect(openFor).toBeLessThanOrEqual(5 * 60_000);
   });
 });
 

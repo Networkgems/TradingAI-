@@ -29,6 +29,24 @@ const log = logger.child({ module: 'stocktwits-feed' });
 const ST_CALL_TIMEOUT_MS = 6_000;
 /** Default breaker cooldown when a 429 arrives without a parseable reset. */
 const DEFAULT_COOLDOWN_MS = 5 * 60_000;
+/**
+ * TRA-2519 — hard ceiling on any breaker cooldown, including one derived from
+ * the response.
+ *
+ * `X-RateLimit-Reset` is epoch SECONDS, and we multiply by 1000. If StockTwits
+ * (or an intermediary) ever emits it in milliseconds instead, that multiply
+ * yields a deadline ~57,000 years out and the breaker latches for the entire
+ * process lifetime with no way to observe the difference — `breakerOpen: true`
+ * looks the same at 5 minutes and at 5 millennia. StockTwits' own window is
+ * hourly, so nothing legitimate needs longer than this; clamping costs us at
+ * most one extra 429 and removes the unbounded-latch failure mode outright.
+ *
+ * NOTE this is defence in depth, not the observed 07-27/07-28 cause: bqb1's 429s
+ * carried no parseable reset header at all (all 68 trips took the 5-minute
+ * default exactly). The real driver was a restart storm re-tripping it — see the
+ * module header and TRA-2476.
+ */
+const MAX_COOLDOWN_MS = 60 * 60_000;
 /** Cap the per-symbol message pull — the engine only needs a recent window. */
 const MAX_MESSAGES = 30;
 
@@ -139,6 +157,21 @@ export function isStockTwitsBreakerOpen(now = Date.now()): boolean {
   return now < breakerOpenUntil;
 }
 
+/**
+ * TRA-2519 — the breaker's current reset deadline (epoch ms), or null when
+ * closed. Two things need this that `isStockTwitsBreakerOpen` cannot serve:
+ *
+ *   - the TRA-822 recorder's half-open retry, so it waits exactly as long as the
+ *     cooldown actually has left instead of guessing at it, and
+ *   - `/api/health/sentiment-probe`, so an operator can tell a routine 5-minute
+ *     cooldown from a stuck breaker. A bare `breakerOpen: true` cannot: that is
+ *     what made the 07-27/07-28 zero-days read as "latched open" when the
+ *     breaker was in fact cycling normally 68 times over the two sessions.
+ */
+export function stockTwitsBreakerOpenUntil(now = Date.now()): number | null {
+  return now < breakerOpenUntil ? breakerOpenUntil : null;
+}
+
 /** Trip the breaker until `until` (epoch ms). Exported for tests. */
 export function tripStockTwitsBreaker(until: number): void {
   if (until > breakerOpenUntil) breakerOpenUntil = until;
@@ -149,12 +182,30 @@ export function resetStockTwitsBreaker(): void {
   breakerOpenUntil = 0;
 }
 
-/** Parse the `X-RateLimit-Reset` header (epoch seconds) into an epoch-ms deadline. */
-function resetDeadlineFrom(resp: Response, now: number): number {
+/**
+ * Parse the `X-RateLimit-Reset` header (epoch seconds) into an epoch-ms
+ * deadline, clamped to [now, now + {@link MAX_COOLDOWN_MS}].
+ *
+ * A header that resolves to the PAST is also treated as unusable: it would set a
+ * deadline behind `now`, leaving the breaker effectively closed and letting the
+ * caller hammer straight back into the throttle. Both out-of-range directions
+ * fall back to the default cooldown, and the caller logs which happened.
+ */
+function resetDeadlineFrom(resp: Response, now: number): { until: number; source: string; rawHeader: string | null } {
   const raw = resp.headers.get('x-ratelimit-reset');
   const epochSec = raw ? Number(raw) : NaN;
-  if (Number.isFinite(epochSec) && epochSec > 0) return epochSec * 1000;
-  return now + DEFAULT_COOLDOWN_MS;
+  if (Number.isFinite(epochSec) && epochSec > 0) {
+    const parsed = epochSec * 1000;
+    if (parsed > now && parsed <= now + MAX_COOLDOWN_MS) {
+      return { until: parsed, source: 'header', rawHeader: raw };
+    }
+    return {
+      until: now + DEFAULT_COOLDOWN_MS,
+      source: parsed > now ? 'default(header-beyond-max)' : 'default(header-in-past)',
+      rawHeader: raw,
+    };
+  }
+  return { until: now + DEFAULT_COOLDOWN_MS, source: 'default(no-header)', rawHeader: raw };
 }
 
 /** Raw StockTwits message shape — only the fields we read are typed. */
@@ -216,9 +267,19 @@ async function fetchStreamMessages(
   try {
     const resp = await withTimeout(fetch(withAccessToken(url), stockTwitsFetchInit()), ST_CALL_TIMEOUT_MS, label);
     if (resp.status === 429) {
-      const until = resetDeadlineFrom(resp, now);
+      const { until, source, rawHeader } = resetDeadlineFrom(resp, now);
       tripStockTwitsBreaker(until);
-      log.warn('rate-limited (429); breaker open', { label, until: new Date(until).toISOString() });
+      // TRA-2519 — log the cooldown SOURCE and the raw header. Reading the
+      // 07-27/07-28 tape, every trip showed `until = ts + 5min`, which is what
+      // established that no reset header was arriving at all; that mattered more
+      // than the deadline itself and was only inferable by hand until now.
+      log.warn('rate-limited (429); breaker open', {
+        label,
+        until: new Date(until).toISOString(),
+        cooldownMs: until - now,
+        source,
+        rawHeader,
+      });
       return null;
     }
     if (!resp.ok) {
@@ -314,6 +375,15 @@ export interface StockTwitsProbeResult {
   messageCount: number | null;
   /** Whether the process-wide rate-limit breaker was open when probed. */
   breakerOpen: boolean;
+  /**
+   * TRA-2519 — when the open breaker resets (ISO), or null when closed. Without
+   * this, `breakerOpen: true` is the same reading for a normal 5-minute cooldown
+   * and for a breaker stuck open, which is exactly the ambiguity that got the
+   * 07-27/07-28 zero-days diagnosed as "latched open".
+   */
+  breakerOpenUntil: string | null;
+  /** TRA-2519 — ms left on the open cooldown, or null when closed. */
+  breakerOpenForMs: number | null;
   /** Human-readable failure reason, or null on success. */
   reason: string | null;
 }
@@ -333,10 +403,16 @@ export interface StockTwitsProbeResult {
  */
 export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeResult> {
   const now = Date.now();
-  const breakerOpen = isStockTwitsBreakerOpen(now);
+  const openUntil = stockTwitsBreakerOpenUntil(now);
+  const breakerOpen = openUntil !== null;
+  const breaker = {
+    breakerOpen,
+    breakerOpenUntil: openUntil === null ? null : new Date(openUntil).toISOString(),
+    breakerOpenForMs: openUntil === null ? null : openUntil - now,
+  };
   const sym = symbol.toUpperCase();
   if (breakerOpen) {
-    return { ok: false, status: null, messageCount: null, breakerOpen, reason: 'rate-limit breaker open' };
+    return { ok: false, status: null, messageCount: null, ...breaker, reason: 'rate-limit breaker open' };
   }
   const url = `https://api.stocktwits.com/api/2/streams/symbol/${encodeURIComponent(sym)}.json`;
   try {
@@ -346,13 +422,13 @@ export async function probeStockTwits(symbol = 'AAPL'): Promise<StockTwitsProbeR
       `stocktwits-probe(${sym})`,
     );
     if (!resp.ok) {
-      return { ok: false, status: resp.status, messageCount: null, breakerOpen, reason: `non-OK status ${resp.status}` };
+      return { ok: false, status: resp.status, messageCount: null, ...breaker, reason: `non-OK status ${resp.status}` };
     }
     const body = (await resp.json()) as RawStockTwitsStream;
     const count = Array.isArray(body?.messages) ? body.messages.length : 0;
-    return { ok: true, status: resp.status, messageCount: count, breakerOpen, reason: null };
+    return { ok: true, status: resp.status, messageCount: count, ...breaker, reason: null };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, status: null, messageCount: null, breakerOpen, reason: msg };
+    return { ok: false, status: null, messageCount: null, ...breaker, reason: msg };
   }
 }

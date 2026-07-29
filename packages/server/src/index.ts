@@ -308,7 +308,9 @@ import {
   fetchStockTwitsStream,
   fetchStockTwitsUserStream,
   getCuratedStockTwitsAccounts,
+  isStockTwitsBreakerOpen,
   probeStockTwits,
+  stockTwitsBreakerOpenUntil,
 } from './stocktwits-feed.js';
 // TRA-779 — replay smoke endpoint proves the captured chains are consumable by
 // the run-options-replay pipe. Server already depends on @trading-app/backtest.
@@ -3611,6 +3613,15 @@ async function runOptionsAlertPush(): Promise<void> {
 const SENTIMENT_RECORD_OUT_DIR =
   process.env['SENTIMENT_OUT_DIR'] ?? join(DATA_DIR, 'sentiment-snapshots');
 
+/**
+ * TRA-2519 — half-open retry budget for one sentiment sweep. Two extra passes
+ * against a 5-minute default cooldown covers ~11 minutes of throttle, which is
+ * the shape of the bursts on the tape, while staying far inside the
+ * 15:55–20:00 ET capture window so a retrying sweep can never run past it.
+ */
+const SENTIMENT_RETRY_MAX_ATTEMPTS = 2;
+const SENTIMENT_RETRY_BUDGET_MS = 12 * 60_000;
+
 async function runSentimentSnapshot(): Promise<void> {
   const rawUniverse = (process.env['SENTIMENT_WATCHLIST'] ?? '').trim();
   const symbols = rawUniverse
@@ -3654,6 +3665,28 @@ async function runSentimentSnapshot(): Promise<void> {
       const messages = dedupeStockTwitsMessages([...curated, ...crowd]);
       return aggregateStockTwitsSentiment({ symbol, messages, now: Date.now() });
     },
+    // TRA-2519 — separate "the breaker short-circuited us, no request left the
+    // box" from "a request went out and was refused". Both wrote a bare
+    // `no_data` before, which is why two zeroed sessions could not be attributed
+    // from the artifact alone and needed a Render log dig.
+    describeUnavailable: () => (isStockTwitsBreakerOpen() ? 'breaker_open' : 'fetch_failed'),
+    // TRA-2519 (ask #2) — bounded half-open retry. A sweep that opens inside a
+    // cooldown is otherwise a ~3ms no-op that zeroes all 25 symbols and never
+    // looks again; bqb1's breaker cooldown is the 5-minute default (no reset
+    // header arrives), so two waits clear a typical burst. Budget is capped
+    // because the watchdog can kill this process at any moment (TRA-2476) —
+    // better to bank a partial day via the merge than to block for an hour.
+    retry: {
+      maxAttempts: SENTIMENT_RETRY_MAX_ATTEMPTS,
+      budgetMs: SENTIMENT_RETRY_BUDGET_MS,
+      nextDelayMs: () => {
+        const until = stockTwitsBreakerOpenUntil();
+        // Breaker already closed → retry immediately; the failure was per-request
+        // (Cloudflare 503 / timeout), not a cooldown we must sit out.
+        if (until === null) return 0;
+        return Math.max(0, until - Date.now()) + 1_000; // +1s so we land after the reset
+      },
+    },
   });
 
   const recorded = result.symbols.filter((s) => s.outcome === 'recorded').length;
@@ -3662,6 +3695,12 @@ async function runSentimentSnapshot(): Promise<void> {
     recorded,
     total: result.symbols.length,
     dir: result.outDir,
+    // TRA-2519 provenance: `sweptRecorded` < `recorded` means this run found
+    // less than a previous run of the same ET day and the merge protected it.
+    // Under the old blind overwrite that gap was the data we destroyed.
+    attempts: result.attempts,
+    sweptRecorded: result.swept.filter((s) => s.outcome === 'recorded').length,
+    preservedFromPrior: result.preservedFromPrior.length,
   });
 }
 
