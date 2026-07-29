@@ -67,8 +67,13 @@
 //      one central estimate a single bad fill destroys, and it was the only one published.
 //      That is defence in depth: it survives the NEXT non-physical fill whatever shape it
 //      arrives in, even if the guard in (1) does not recognise it.
-// Plus `GET /api/health/parity-reconcile/records`, which echoes the raw legs so the next
-// outlier is ATTRIBUTED from outside the process instead of inferred from moments.
+// Plus `GET /api/health/parity-reconcile/records`, so the next outlier is ATTRIBUTED from
+// outside the process instead of inferred from moments. It does NOT echo the raw legs: the
+// projection is an EXPLICIT allow-list built by `parityRecordRows`, and a journal field that
+// is not named there is silently absent from the payload. Read `ParityRecordLegRow` for the
+// exact set before specifying a monitor against this route — the "echoes the raw legs" claim
+// this comment used to make is what made TRA-2576's monitor specify an unexecutable read of
+// `spreadAtSubmitPct`, which was dropped here for 9 commits (TRA-2583).
 //
 // ── TRA-2279 D1 — THE FIELD FORMERLY CALLED `gapPct` ─────────────────────────
 // `gapPct` was a RATIO wearing a percent's name: no `× 100`, so the live payload's
@@ -492,6 +497,22 @@ export interface ParityRecordLegRow {
   fillPx: number | null;
   /** True ⇔ THIS leg is what tripped the record's `nonPhysical` classification. */
   nonPhysical: boolean;
+  /**
+   * TRA-2583 — the persisted DECISION-QUOTE fields, passed straight through from the journal
+   * leg. They were silently dropped by this projection from TRA-2370 until TRA-2583, so the
+   * only read path for them was a source read of the journal file.
+   *
+   * `null` is passed through AS `null` and is NEVER synthesized or backfilled: a missing
+   * quote must not read as a tight book. `bid`/`ask`/`slippageBps`/`withinSpread` are
+   * diagnostics; `spreadAtSubmitPct` is the one TRA-2242's advisory forecast reads, because
+   * on a symmetric mid (`mark = requestedPx = mid`) both exit sides reduce to the identity
+   * `quotedH == spreadAtSubmitPct / 200`, and it is populated on rows where `quotedH` is not.
+   */
+  bid: number | null;
+  ask: number | null;
+  slippageBps: number | null;
+  spreadAtSubmitPct: number | null;
+  withinSpread: boolean | null;
 }
 
 /** One round-trip as echoed by the raw-records view, with the classification applied to it. */
@@ -554,6 +575,12 @@ export function parityRecordRows(records: readonly SandboxStrategyRecord[]): Par
         nonPhysical:
           (leg.requestedPx != null && !isPhysicalPx(leg.requestedPx))
           || (leg.fillPx != null && !isPhysicalPx(leg.fillPx)),
+        // TRA-2583 — straight pass-through, `null` included. Do NOT coalesce.
+        bid: leg.bid,
+        ask: leg.ask,
+        slippageBps: leg.slippageBps,
+        spreadAtSubmitPct: leg.spreadAtSubmitPct,
+        withinSpread: leg.withinSpread,
       })),
     };
   });

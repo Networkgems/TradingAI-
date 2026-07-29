@@ -59,10 +59,21 @@ afterEach(() => {
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
+/**
+ * The decision-quote fields, defaulted to `null` as they were before TRA-2583. They are
+ * OVERRIDABLE because a fixture that can only produce `null` makes every assertion about
+ * these fields vacuous — a `toBeNull()` on a dropped field passes just as happily as on a
+ * projected one. See the TRA-2583 block for the non-null case that actually has a failing state.
+ */
+type LegQuote = Partial<
+  Pick<SandboxStrategyLeg, 'bid' | 'ask' | 'slippageBps' | 'spreadAtSubmitPct' | 'withinSpread'>
+>;
+
 function leg(
   side: 'buy' | 'sell',
   requestedPx: number | null,
   fillPx: number | null,
+  quote: LegQuote = {},
 ): SandboxStrategyLeg {
   return {
     side,
@@ -77,6 +88,7 @@ function leg(
     slippageBps: null,
     spreadAtSubmitPct: null,
     withinSpread: null,
+    ...quote,
   };
 }
 
@@ -714,6 +726,85 @@ describe('TRA-2370 — the raw-legs projection (attribution from outside the pro
     expect(rows.map((r) => [r.strategy, r.etDay])).toEqual([
       ['long_call', '2026-07-23'],
       ['csp', ET_DAY],
+    ]);
+  });
+});
+
+describe('TRA-2583 — the persisted decision-quote fields reach the records route', () => {
+  // The defect: `parityRecordRows` hand-built a 5-key leg and dropped every quote field, so
+  // `spreadAtSubmitPct` had NO read path outside a source read of the journal file. Each
+  // assertion below is written with a NON-NULL value, because the projection could drop the
+  // field entirely and a `toBeNull()` would still pass.
+  it('a NON-NULL spreadAtSubmitPct survives the projection', () => {
+    const [row] = parityRecordRows([
+      record('long_call', [leg('buy', 1.0, 1.05, { spreadAtSubmitPct: 0.6134 })]),
+    ]);
+    expect(row.legs[0].spreadAtSubmitPct).toBeCloseTo(0.6134, 6);
+  });
+
+  it('carries bid/ask/slippageBps/withinSpread through with their real values', () => {
+    const [row] = parityRecordRows([
+      record('covered_call', [
+        leg('sell', 2.0, 1.9, {
+          bid: 1.97,
+          ask: 2.03,
+          slippageBps: -50.0,
+          spreadAtSubmitPct: 3.0,
+          withinSpread: true,
+        }),
+      ]),
+    ]);
+    expect(row.legs[0]).toMatchObject({
+      bid: 1.97,
+      ask: 2.03,
+      slippageBps: -50.0,
+      spreadAtSubmitPct: 3.0,
+      withinSpread: true,
+    });
+  });
+
+  it('a null quote stays null — never coalesced to 0/false, which would read as a tight book', () => {
+    const [row] = parityRecordRows([record('long_call', [leg('buy', 1.0, 1.05)])]);
+    // Paired with the non-null cases above, this is not vacuous: those prove the keys are
+    // PROJECTED, so a null here can only mean the journal held a null.
+    expect(row.legs[0]).toMatchObject({
+      bid: null,
+      ask: null,
+      slippageBps: null,
+      spreadAtSubmitPct: null,
+      withinSpread: null,
+    });
+    expect(row.legs[0].withinSpread).not.toBe(false);
+    expect(row.legs[0].spreadAtSubmitPct).not.toBe(0);
+  });
+
+  it('the exposed field supports the TRA-2242 forecast identity quotedH == spreadAtSubmitPct/200', () => {
+    // On a symmetric mid the gate marks at `mark = requestedPx = mid`, so both exit sides
+    // reduce to that identity. This asserts the INPUT to the forecast is readable and exact
+    // to the journal's persisted 1e-4 rounding — it grades nothing and arms nothing.
+    const [row] = parityRecordRows([
+      record('long_call', [leg('buy', 1.0, 1.0, { spreadAtSubmitPct: 26.8 })]),
+    ]);
+    const spread = row.legs[0].spreadAtSubmitPct as number;
+    expect(spread / 200).toBeCloseTo(0.134, 6);
+  });
+
+  it('projects exactly the documented key set — a NEW journal field is absent until named here', () => {
+    // The route is an explicit allow-list, not an echo (the corrected comment at the head of
+    // parity-reconcile.ts). Pinning the set is what makes the next silent drop fail loudly
+    // instead of shipping a monitor that specifies an unexecutable read.
+    const [row] = parityRecordRows([record('long_call', [leg('buy', 1.0, 1.05)])]);
+    expect(Object.keys(row.legs[0]).sort()).toEqual([
+      'ask',
+      'bid',
+      'fillPx',
+      'nonPhysical',
+      'optionSymbol',
+      'requestedPx',
+      'side',
+      'slippageBps',
+      'spreadAtSubmitPct',
+      'withinSpread',
     ]);
   });
 });
