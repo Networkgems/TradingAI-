@@ -79,6 +79,18 @@
 // `getOrComputeTechnicalSnapshot` already computes on demand for any analyst
 // query that outruns it.
 //
+// ── Later callers of this helper ─────────────────────────────────────────────
+// TRA-2477 added a FOURTH sink, `supertrend-series` — n=168, share 2.3%, p90
+// 25.8s, max 381.1s on the boot-excluded 07-28 tape, i.e. the worst single stall
+// of that window on a 2.3% Σ share. It reuses {@link SWEEP_BUDGET_MS} unchanged,
+// and the justification is the p90 rather than new arithmetic: 25.8s < 30s, so
+// the modal rotation is never truncated and the cap bites only the tail.
+// ⚠️ It also needed something the three sinks above did not — the shadow pass
+// coordinates ACROSS ENGINES, so slicing a sink whose start stamps a fleet-wide
+// window means the window must advance once per ROTATION, not once per slice.
+// See `_sharedShadowRotationPending` in signal-engine.ts before budgeting any
+// further sink that has a fleet-wide claim in front of it.
+//
 // ── Why the cursor is persisted ──────────────────────────────────────────────
 // A zero-init cursor on a box that boots ~6× a session is TRA-2205's bug with
 // the sign flipped: instead of re-firing a sink on every boot it would restart

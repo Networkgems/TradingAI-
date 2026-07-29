@@ -708,6 +708,32 @@ let sharedShadowRefreshAt = 0;
 let sharedShadowEvalAt = 0;
 /** True while one engine is mid-refresh so concurrent ticks skip and don't double-fetch. */
 let sharedShadowRefreshInFlight = false;
+/**
+ * TRA-2477 — timestamp at which the CURRENT fleet-wide series rotation started,
+ * or 0 when no rotation is mid-universe.
+ *
+ * The refresh is now budgeted ({@link runBudgetedSweep}), so one rotation spans
+ * several ticks and `sharedShadowRefreshInFlight` — which is released at the end
+ * of every SLICE — no longer covers the gap between them. Without this latch a
+ * peer engine would see `now - sharedShadowRefreshAt >= 60_000` between the
+ * owner's slices and claim a SECOND rotation over the same universe: a
+ * double-fetch, i.e. the TRA-1996 feed-rate hazard re-committed inside a latency
+ * fix. It also holds the EVAL until the universe is actually covered, which is
+ * what the unsliced refresh did implicitly by being one long await.
+ *
+ * Stamped rather than boolean **on purpose**: a latch that can only be cleared by
+ * the engine that set it wedges the whole fleet's shadow pass if that engine stops
+ * ticking. This one expires ({@link SHARED_SHADOW_ROTATION_MAX_MS}) and therefore
+ * fails OPEN — the worst case is one delayed window, not a permanently dark sink.
+ */
+let sharedShadowRotationSince = 0;
+/**
+ * How long a mid-universe rotation may hold the fleet latch before it is treated
+ * as abandoned. 10 min is ~1.6x the worst rotation the 07-28 tape recorded for
+ * this sink (381.1s) — long enough never to expire under a rotation that is merely
+ * slow, short enough that a dead owner costs one window rather than the session.
+ */
+const SHARED_SHADOW_ROTATION_MAX_MS = 10 * 60_000;
 /** Window start (ms) of the last fleet-wide option-shadow selector pass. */
 let sharedOptionShadowAt = 0;
 
@@ -724,6 +750,7 @@ export function _resetSharedShadowForTests(): void {
   sharedShadowRefreshAt = 0;
   sharedShadowEvalAt = 0;
   sharedShadowRefreshInFlight = false;
+  sharedShadowRotationSince = 0;
   sharedOptionShadowAt = 0;
 }
 
@@ -736,22 +763,57 @@ export function _resetSharedShadowForTests(): void {
 // (not N-fold) so the TRA-1064 accrual trajectory QuantTrader is validating
 // (TRA-1062) is byte-identical to a single-engine run. The `_`-prefixed helpers
 // mutate module state and must only be used by `refresh()` and tests.
+/**
+ * TRA-2477 — a budgeted rotation is mid-universe and has not aged out. While this
+ * holds, no engine may claim a NEW refresh window and no engine may run the eval:
+ * the series the eval reads is only half-rotated. See
+ * {@link sharedShadowRotationSince} for why it expires.
+ */
+export function _sharedShadowRotationPending(nowMs: number): boolean {
+  return sharedShadowRotationSince !== 0
+    && nowMs - sharedShadowRotationSince < SHARED_SHADOW_ROTATION_MAX_MS;
+}
 /** A new fleet-wide 5m shadow-series refresh is due (and none is in flight). */
 export function _sharedShadowRefreshDue(nowMs: number): boolean {
-  return !sharedShadowRefreshInFlight && nowMs - sharedShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS;
+  return !sharedShadowRefreshInFlight
+    && !_sharedShadowRotationPending(nowMs)
+    && nowMs - sharedShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS;
 }
 /** Claim the refresh window BEFORE the await so a concurrent tick can't double-fetch. */
 export function _claimSharedShadowRefresh(nowMs: number): void {
   sharedShadowRefreshAt = nowMs;
   sharedShadowRefreshInFlight = true;
 }
+/**
+ * TRA-2477 — re-enter an ALREADY-CLAIMED window for the next budgeted slice.
+ * Deliberately does NOT advance `sharedShadowRefreshAt`: the window (and hence the
+ * eval gate, which keys on it) must tick once per ROTATION, not once per slice —
+ * otherwise the sliced refresh re-arms the full-universe eval every 30s and
+ * re-commits the TRA-1082 event-loop burn while claiming to have fixed latency.
+ */
+export function _resumeSharedShadowRefresh(): void {
+  sharedShadowRefreshInFlight = true;
+}
 /** Release the in-flight latch once the shared refresh settles (success or throw). */
 export function _endSharedShadowRefresh(): void {
   sharedShadowRefreshInFlight = false;
 }
+/**
+ * TRA-2477 — record whether the rotation this slice belonged to is still
+ * mid-universe. `incomplete` opens (or keeps) the latch; anything else clears it,
+ * including the abandon paths (throw, market close, flags off), so the fleet
+ * recovers on the next tick rather than waiting out the expiry.
+ */
+export function _noteSharedShadowRotation(nowMs: number, incomplete: boolean): void {
+  if (!incomplete) { sharedShadowRotationSince = 0; return; }
+  if (sharedShadowRotationSince === 0) sharedShadowRotationSince = nowMs;
+}
 /** The eval passes are due once per FRESH series (refresh advanced, none in flight). */
-export function _sharedShadowEvalDue(): boolean {
-  return sharedShadowRefreshAt !== 0 && sharedShadowRefreshAt !== sharedShadowEvalAt && !sharedShadowRefreshInFlight;
+export function _sharedShadowEvalDue(nowMs: number = Date.now()): boolean {
+  return sharedShadowRefreshAt !== 0
+    && sharedShadowRefreshAt !== sharedShadowEvalAt
+    && !sharedShadowRefreshInFlight
+    && !_sharedShadowRotationPending(nowMs);
 }
 /** Claim the eval window so subsequent engines in the SAME series skip the pass. */
 export function _claimSharedShadowEval(): void {
@@ -2411,6 +2473,15 @@ export class SignalEngine {
 
   /** TRA-787 — last successful shadow 5m-series refresh (gates the 60s cadence). */
   private lastSupertrendShadowRefreshAt = 0;
+  /**
+   * TRA-2477 — the last budgeted `supertrend-series` pass, or null when no
+   * rotation is in progress. `complete === false` means the cursor is parked
+   * mid-universe and this engine must re-enter on the NEXT TICK rather than wait
+   * out {@link SUPERTREND_SHADOW_REFRESH_MS} — otherwise the wall-clock cap would
+   * divide the sink's symbols-per-minute by the slice count, which is a coverage
+   * cut wearing a latency win.
+   */
+  private supertrendSeriesSweep: SweepPass | null = null;
   /**
    * TRA-1082 — the {@link lastSupertrendShadowRefreshAt} value at which the
    * shadow EVAL passes (Supertrend + reversal) last ran. The 5m shadow series
@@ -4708,23 +4779,49 @@ export class SignalEngine {
     const sharedShadow = isSharedShadowPassEnabled();
     if (isStockMarketOpen() && (supertrendShadowOn || reversalShadowOn)) {
       const nowMs = Date.now();
-      const refreshDue = sharedShadow
+      // TRA-2477 — a rotation the wall-clock budget cut short re-enters on the
+      // NEXT TICK, ahead of (and bypassing) the 60s window gate. Without this the
+      // cap would divide the sink's symbols-per-minute by the slice count: the
+      // universe would still be "covered", just 13x slower — a coverage cut
+      // wearing a latency win, which is the failure this bound must not commit.
+      const resumingSeries = this.supertrendSeriesSweep != null && !this.supertrendSeriesSweep.complete;
+      const refreshDue = resumingSeries || (sharedShadow
         ? _sharedShadowRefreshDue(nowMs)
-        : (nowMs - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS);
+        : (nowMs - this.lastSupertrendShadowRefreshAt >= SUPERTREND_SHADOW_REFRESH_MS));
       if (refreshDue) {
         // Claim the window BEFORE the await so a concurrent engine tick can't
         // also enter and double-fetch the full universe while this one is mid-
         // flight (the in-flight latch + advanced timestamp both gate it out).
-        if (sharedShadow) _claimSharedShadowRefresh(nowMs);
-        this.lastSupertrendShadowRefreshAt = nowMs;
+        // TRA-2477 — a RESUME re-takes the in-flight latch without advancing the
+        // window: the window stamp is what the eval gate keys on, so advancing it
+        // per slice would re-arm the full-universe eval every tick (the TRA-1082
+        // burn) instead of once per rotation.
+        if (sharedShadow) {
+          if (resumingSeries) _resumeSharedShadowRefresh();
+          else _claimSharedShadowRefresh(nowMs);
+        }
+        if (!resumingSeries) this.lastSupertrendShadowRefreshAt = nowMs;
         try {
-          await withPhase('signal.doTick.supertrend-series', () => this.refreshSupertrendShadowSeries(activeSymbols));
+          this.supertrendSeriesSweep = await withPhase(
+            'signal.doTick.supertrend-series',
+            () => this.refreshSupertrendShadowSeries(activeSymbols),
+          );
         } catch (err: unknown) {
+          // The cursor already advanced past the failing batch inside the sweep;
+          // drop the pass so the sink falls back to its 60s window rather than
+          // re-entering every tick on a broken feed.
+          this.supertrendSeriesSweep = null;
           supertrendShadowLog.warn('shadow 5m-series refresh threw', {
             reason: err instanceof Error ? err.message : String(err),
           });
         } finally {
-          if (sharedShadow) _endSharedShadowRefresh();
+          if (sharedShadow) {
+            _endSharedShadowRefresh();
+            _noteSharedShadowRotation(
+              nowMs,
+              this.supertrendSeriesSweep != null && !this.supertrendSeriesSweep.complete,
+            );
+          }
         }
       }
       // TRA-801 — close any touched SupertrendConfluence paper positions on the
@@ -4741,9 +4838,17 @@ export class SignalEngine {
       // TRA-1089 — under the shared pass the eval gate is fleet-wide (one eval
       // per refreshed series, not one per engine); the in-flight check stops a
       // late-arriving engine from eval'ing against a half-populated cache.
-      const evalDue = sharedShadow
-        ? _sharedShadowEvalDue()
-        : (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt);
+      // TRA-2477 — and hold the eval while a BUDGETED rotation is still
+      // mid-universe. The unsliced refresh gave this for free by being one long
+      // await; sliced, the engine-local check covers the rotation's owner and
+      // `_sharedShadowEvalDue`'s rotation latch covers its peers. Note the gate
+      // delays the eval, it never adds one: the window stamp the eval keys on
+      // advances once per rotation either way.
+      const seriesRotationPending =
+        this.supertrendSeriesSweep != null && !this.supertrendSeriesSweep.complete;
+      const evalDue = !seriesRotationPending && (sharedShadow
+        ? _sharedShadowEvalDue(nowMs)
+        : (this.lastSupertrendShadowRefreshAt !== this.lastShadowEvalRefreshAt));
       if (evalDue) {
         if (sharedShadow) _claimSharedShadowEval();
         this.lastShadowEvalRefreshAt = this.lastSupertrendShadowRefreshAt;
@@ -4760,6 +4865,23 @@ export class SignalEngine {
         // OFF unless ENABLE_REVERSAL_SHADOW is set; nothing here routes or opens.
         if (reversalShadowOn) await withPhase('signal.reversalShadowEval', () => this.evaluateReversalShadow(activeSymbols));
       }
+    } else if (this.supertrendSeriesSweep != null) {
+      // TRA-2477 — the market closed (or both shadow flags went off) mid-rotation.
+      // Drop the ENGINE-LOCAL pass so the next open re-enters through the 60s
+      // window instead of next-tick resume, and release the fleet latch
+      // immediately rather than letting it age out — an expiry is the backstop,
+      // not the normal path.
+      //
+      // Note what this does NOT do: the sweep CURSOR lives in
+      // `DATA_DIR/scan-cursors.json` and is deliberately left parked, so the next
+      // open continues the universe from where the close interrupted it rather
+      // than restarting at index 0. That is the TRA-2205 property (a cursor that
+      // zeroes on every interruption re-walks the same prefix forever and never
+      // reaches the tail), and it is self-correcting if the watchlist changed
+      // overnight — `runBudgetedSweep` restarts from 0 when the parked symbol is
+      // no longer in the universe.
+      this.supertrendSeriesSweep = null;
+      _noteSharedShadowRotation(Date.now(), false);
     }
     if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
@@ -7728,13 +7850,49 @@ export class SignalEngine {
    * batched: a per-symbol failure is swallowed so a cold feed can't take down
    * the shadow pass, and the last good 5m series stays cached for the next tick.
    * Leaves {@link candleCache} (the live strategies' input) untouched.
+   *
+   * ── TRA-2477 — BOUNDED (phase 2 of TRA-2171) ───────────────────────────────
+   * The old shape was `for (i += 5) await Promise.all(...)` over the whole
+   * universe — the same unbounded whole-universe walk TRA-2262 bounded on
+   * mtf-refresh / short-premium-scan / otm-scan, and on the boot-excluded
+   * 2026-07-28 tape it was the SINGLE WORST record of the window:
+   *
+   *     n=168   share 2.3%   p90 25.8s   max 381.1s
+   *
+   * ⭐ Σ share is 2.3% and it still owns the worst stall on the box: this is
+   * sized off max/p90, never Σ — the same lesson TRA-2262 wrote down.
+   *
+   * ── Why the default 30s budget is the right number here ───────────────────
+   * Unlike the TRA-2262 sinks this one needed no new arithmetic to justify, and
+   * the reason is the p90: **25.8s < 30s**, so the MODAL rotation finishes in a
+   * single pass and is never truncated. The cap is therefore free in the steady
+   * state and bites only the tail it was filed for. 381.1s / 568 symbols =
+   * 0.671 s/symbol (already amortised over the 5-wide rounds — do NOT re-divide
+   * by BATCH, the TRA-2262 double-count), so a 30s pass covers ~45 symbols and a
+   * worst-case rotation takes ~13 passes. At one pass per 30s tick that is ~390s
+   * of wall clock against today's 381.1s: coverage parity, because a sliced
+   * latency-bound walk cannot exceed the request rate of the unsliced one it
+   * replaces (so this cannot become a TRA-1996 feed-quota regression either).
+   *
+   * What changes is the per-TICK contribution — 381.1s → ~30s + one batch — and
+   * that is the quantity that matters, because with TRA-2200's exit hoist still
+   * deferred on the real-money book, `exit-evaluation interval ≡ doTick duration`.
+   *
+   * The caller must re-enter an UNFINISHED rotation on the next tick rather than
+   * on the 60s window (see `resumingSeries` at the call site), and must hold the
+   * shadow EVAL until the rotation completes — the unsliced version gave both of
+   * those for free by being one long await.
    */
-  private async refreshSupertrendShadowSeries(symbols: string[]): Promise<void> {
-    if (symbols.length === 0) return;
+  private async refreshSupertrendShadowSeries(symbols: string[]): Promise<SweepPass> {
     const BATCH = 5;
-    for (let i = 0; i < symbols.length; i += BATCH) {
-      await Promise.all(
-        symbols.slice(i, i + BATCH).map(async (sym) => {
+    return runBudgetedSweep({
+      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
+      // same watchlist do not consume each other's cursor.
+      key: `${this.mode}:supertrend-series`,
+      symbols,
+      batchSize: BATCH,
+      run: async (batch) => {
+        await Promise.all(batch.map(async (sym) => {
           let minuteBars: Candle[];
           try {
             minuteBars = await fetchMinuteBars(sym, SUPERTREND_SHADOW_MINUTE_BARS);
@@ -7747,9 +7905,9 @@ export class SignalEngine {
           if (minuteBars.length === 0) return;
           const fiveMin = resampleCandles(minuteBars, SUPERTREND_SHADOW_TF_MS);
           if (fiveMin.length > 0) this.shadowCandleCache.set(sym, fiveMin);
-        }),
-      );
-    }
+        }));
+      },
+    });
   }
 
   /**
