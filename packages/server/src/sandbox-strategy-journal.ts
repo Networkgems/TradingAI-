@@ -387,6 +387,131 @@ export interface SandboxStrategyJournalSummary {
     appendErrors: number;
     lastAppendError: string | null;
   };
+  caller: SandboxStrategyCallerLiveness;
+}
+
+// ── caller liveness (TRA-2481) ───────────────────────────────────────────────
+
+/**
+ * TRA-2481 — **this journal has no internal scheduler.** Every row is appended by an
+ * external POST to `/api/health/tradier-sandbox/options-smoke-order`, and the only caller
+ * is Paperclip routine `d8ec9395` (2 triggers × 4 strategies = the ~8 rows/day).
+ *
+ * That makes the writer-health fields structurally incapable of reporting the failure that
+ * actually happened: on Mon 2026-07-27 and Tue 2026-07-28 the routine fired zero times
+ * (a stale execution issue made every fire skip under `skip_if_active`), and this summary
+ * answered `appendErrors: 0`, `lastAppendError: null`, `lastOk: true` on all four
+ * strategies — every one of them TRUE, and every one of them computed over ZERO requests.
+ * A healthy journal and a dark caller render byte-identically; the only tape that
+ * discriminated was the routine's own run history, which nothing here reads.
+ *
+ * So the summary now carries the one thing it can honestly assert about the caller: how
+ * long it has been since anybody wrote. `dark` is the failing state that did not exist.
+ */
+export interface SandboxStrategyCallerLiveness {
+  /** ms epoch of the newest record; `null` when the journal is empty. */
+  lastAppendTs: number | null;
+  /** ET calendar day of the newest record; `null` when the journal is empty. */
+  lastAppendEtDay: string | null;
+  /** Rows recorded on the CURRENT ET day (0 before the first fire lands). */
+  rowsToday: number;
+  /**
+   * Whole ET weekdays strictly BETWEEN the last append's day and today — i.e. sessions
+   * that came and went with no write. Excludes today (its fires may not be due yet) and
+   * excludes the append day itself. `0` while the caller is keeping up.
+   */
+  weekdaysSinceLastAppend: number;
+  /**
+   * True ⇔ `weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS`, or the journal is empty.
+   *
+   * Fails CLOSED (empty ⇒ dark) — an absent caller and an absent disk both mean nobody is
+   * writing, and neither should read as healthy. The threshold is 2 rather than 1 because
+   * exactly one skipped weekday is also what a market holiday looks like from here, and a
+   * holiday is a legitimate zero-row day. Read `weekdaysSinceLastAppend` directly if you
+   * need to act on the ambiguous 1-day case.
+   */
+  dark: boolean;
+  /** Human-readable statement of what was measured — always populated. */
+  reason: string;
+}
+
+/** Skipped ET weekdays at which {@link SandboxStrategyCallerLiveness.dark} trips. */
+export const CALLER_DARK_WEEKDAYS = 2;
+
+/** ET calendar day (YYYY-MM-DD) of a ms epoch. */
+function toEtDay(ms: number): string {
+  return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
+
+/** Midday-UTC anchor for a `YYYY-MM-DD` key — DST-proof for day arithmetic. */
+function dayAnchorMs(etDay: string): number | null {
+  const m = etDay.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12);
+}
+
+/**
+ * Count Mon–Fri calendar days strictly between two ET day keys. Bounded so a corrupt key
+ * can never spin: beyond ~2 retention windows we stop counting and report the cap.
+ */
+function weekdaysBetween(fromEtDay: string, toEtDay_: string): number {
+  const from = dayAnchorMs(fromEtDay);
+  const to = dayAnchorMs(toEtDay_);
+  if (from == null || to == null || to <= from) return 0;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  let count = 0;
+  for (let t = from + DAY_MS, guard = 0; t < to && guard < 400; t += DAY_MS, guard += 1) {
+    const dow = new Date(t).getUTCDay();
+    if (dow !== 0 && dow !== 6) count += 1;
+  }
+  return count;
+}
+
+/**
+ * Fold caller liveness out of the durable series. Pure — `nowMs` is injected so the
+ * dark/not-dark contract can be pinned by tests without a clock.
+ */
+export function summarizeCallerLiveness(
+  recs: readonly SandboxStrategyRecord[],
+  nowMs: number,
+): SandboxStrategyCallerLiveness {
+  const todayEtDay = toEtDay(nowMs);
+  if (recs.length === 0) {
+    return {
+      lastAppendTs: null,
+      lastAppendEtDay: null,
+      rowsToday: 0,
+      weekdaysSinceLastAppend: 0,
+      dark: true,
+      reason:
+        'Journal is EMPTY — no round-trip has ever been recorded (or the durable series did '
+        + 'not hydrate). Nobody is calling the smoke route; check the runner routine\'s run tape.',
+    };
+  }
+  let last = recs[0];
+  let rowsToday = 0;
+  for (const rec of recs) {
+    if (rec.ts > last.ts) last = rec;
+    if (rec.etDay === todayEtDay) rowsToday += 1;
+  }
+  const lastAppendEtDay = last.etDay || toEtDay(last.ts);
+  const weekdaysSinceLastAppend = weekdaysBetween(lastAppendEtDay, todayEtDay);
+  const dark = weekdaysSinceLastAppend >= CALLER_DARK_WEEKDAYS;
+  return {
+    lastAppendTs: last.ts,
+    lastAppendEtDay,
+    rowsToday,
+    weekdaysSinceLastAppend,
+    dark,
+    reason: dark
+      ? `No append since ${lastAppendEtDay} — ${weekdaysSinceLastAppend} ET weekday(s) have `
+        + 'passed with zero rows. This journal has no internal scheduler, so that means the '
+        + 'CALLER stopped, not the writer: read the runner routine\'s run history '
+        + '(recentRuns + per-trigger lastResult), NOT appendErrors/lastOk — those are '
+        + 'computed over the requests that arrived and stay clean at zero requests.'
+      : `Last append ${lastAppendEtDay}; ${weekdaysSinceLastAppend} skipped ET weekday(s), `
+        + `${rowsToday} row(s) so far today (${todayEtDay}).`,
+  };
 }
 
 /** True ⇔ every leg of this round-trip cleared the signal→submit latency budget. */
@@ -457,5 +582,8 @@ export function summarizeSandboxStrategyJournal(): SandboxStrategyJournalSummary
       appendErrors,
       lastAppendError,
     },
+    // TRA-2481 — the ONLY field on this payload that can go false when the external
+    // caller stops. Everything above it stays clean at zero requests.
+    caller: summarizeCallerLiveness(records, Date.now()),
   };
 }

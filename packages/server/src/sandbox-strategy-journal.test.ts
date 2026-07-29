@@ -8,6 +8,7 @@ import {
   longStrategyFor,
   shortStrategyFor,
   summarizeSandboxStrategyJournal,
+  summarizeCallerLiveness,
   hydrateSandboxStrategyJournalFromDisk,
   clearSandboxStrategyJournal,
   sandboxStrategyLogPath,
@@ -321,5 +322,92 @@ describe('summarizeSandboxStrategyJournal', () => {
     } finally {
       if (prev !== undefined) process.env.DATA_DIR = prev;
     }
+  });
+});
+
+// ── caller liveness (TRA-2481) ───────────────────────────────────────────────
+
+// The journal has no internal scheduler: every row arrives from an external POST, so a
+// caller that stops writes NOTHING — and every writer-health field on this payload is
+// computed over the requests that DID arrive, which means all of them stay clean at zero
+// requests. On 2026-07-27/28 the runner routine fired zero times and this summary still
+// answered appendErrors:0 / lastAppendError:null / lastOk:true on all four strategies.
+// `caller` is the failing state that did not exist. `summarizeCallerLiveness` takes an
+// explicit `nowMs` so these assertions pin the contract without a clock.
+
+/** A minimal durable record — only the fields caller-liveness reads need be real. */
+function recAt(etDay: string, ts: number): SandboxStrategyRecord {
+  return {
+    ts,
+    etDay,
+    strategy: 'long_call',
+    underlying: 'SPY',
+    ok: true,
+    realizedRoundTripUsd: -2.3,
+    legs: [],
+  };
+}
+
+/** ms epoch at 13:00Z (= 09:00 ET, pre-open, before the 11:00 ET fire is due). */
+const at = (y: number, m: number, d: number) => Date.UTC(y, m - 1, d, 13);
+
+describe('summarizeCallerLiveness (TRA-2481)', () => {
+  it('flags the exact TRA-2481 tape dark: last append Fri 07-24, read Wed 07-29', () => {
+    const recs = [recAt('2026-07-23', at(2026, 7, 23)), recAt('2026-07-24', at(2026, 7, 24))];
+    const c = summarizeCallerLiveness(recs, at(2026, 7, 29));
+    // Mon 07-27 and Tue 07-28 came and went with zero rows.
+    expect(c.weekdaysSinceLastAppend).toBe(2);
+    expect(c.dark).toBe(true);
+    expect(c.lastAppendEtDay).toBe('2026-07-24');
+    expect(c.rowsToday).toBe(0);
+    // The reason must send the reader to the CALLER's tape, not the writer's.
+    expect(c.reason).toMatch(/runner routine/i);
+  });
+
+  it('goes dark on a journal whose writer fields are all clean — the pass≡fail case', () => {
+    // Record a textbook-healthy round-trip through the real writer, then read the whole
+    // summary: every pre-existing field says "healthy" and `caller.dark` says otherwise.
+    // NOW is a fixed 2025-07 epoch, so the append is permanently many weekdays stale.
+    recordSandboxStrategy(recordFromContractResult('long_call', makeResult('call'), ET_DAY, NOW)!);
+    const s = summarizeSandboxStrategyJournal();
+    expect(s.durability.appendErrors).toBe(0);
+    expect(s.durability.lastAppendError).toBeNull();
+    expect(s.strategies.long_call.lastOk).toBe(true);
+    expect(s.strategies.long_call.acceptanceMet).toBe(true);
+    // …and the one field that can tell you nobody has called since:
+    expect(s.caller.dark).toBe(true);
+  });
+
+  it('does not count the weekend: Fri append read on Monday is not skipped', () => {
+    const c = summarizeCallerLiveness([recAt('2026-07-24', at(2026, 7, 24))], at(2026, 7, 27));
+    expect(c.weekdaysSinceLastAppend).toBe(0);
+    expect(c.dark).toBe(false);
+  });
+
+  it('reports a single skipped weekday without tripping dark (holiday-shaped)', () => {
+    // Fri append read on Tuesday ⇒ Monday alone was skipped. Indistinguishable from a
+    // market holiday, so it is COUNTED but not called dark.
+    const c = summarizeCallerLiveness([recAt('2026-07-24', at(2026, 7, 24))], at(2026, 7, 28));
+    expect(c.weekdaysSinceLastAppend).toBe(1);
+    expect(c.dark).toBe(false);
+  });
+
+  it('counts today\'s rows and stays healthy once the caller resumes', () => {
+    const recs = [
+      recAt('2026-07-24', at(2026, 7, 24)),
+      recAt('2026-07-29', at(2026, 7, 29)),
+      recAt('2026-07-29', at(2026, 7, 29) + 1),
+    ];
+    const c = summarizeCallerLiveness(recs, at(2026, 7, 29));
+    expect(c.rowsToday).toBe(2);
+    expect(c.weekdaysSinceLastAppend).toBe(0);
+    expect(c.dark).toBe(false);
+  });
+
+  it('fails CLOSED on an empty journal', () => {
+    const c = summarizeCallerLiveness([], at(2026, 7, 29));
+    expect(c.dark).toBe(true);
+    expect(c.lastAppendTs).toBeNull();
+    expect(c.reason).toMatch(/EMPTY/);
   });
 });
