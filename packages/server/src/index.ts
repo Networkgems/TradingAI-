@@ -39,6 +39,10 @@ import {
   shouldServeFirmWideDemoFold,
   isReservedOperatorBookName,
 } from './reports/demo-calendar-fill-scope.js';
+// TRA-2508 — the shared precondition for every route that WRITES an account name
+// (signup + the two admin identity-writes). The reserve rule used to be an inline
+// `if` at signup only, which is how both admin routes came to skip it.
+import { refuseReservedIdentityWrite } from './identity-write-guard.js';
 // TRA-2421 — self-serve account deletion: the wipe surface and the identity
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
@@ -5851,8 +5855,14 @@ app.post('/api/auth/signup', async (req, res) => {
   // case-SENSITIVE `===`, so without this guard `RICHARD` would register as a
   // distinct account and inherit the firm-wide fold — turning the fix into the
   // escalation it closes. The two rules are a pair; do not relax one alone.
-  if (isReservedOperatorBookName(username.trim())) {
-    res.status(409).json({ error: 'Username is not available' });
+  //
+  // TRA-2508 — this used to be an inline `if` here and nowhere else, which is how
+  // both admin identity-writes came to skip it. It is now the shared precondition;
+  // `audience: 'public'` is what makes the admin carve-out unreachable from this
+  // anonymous body.
+  const reserved = refuseReservedIdentityWrite({ name: username, audience: 'public' });
+  if (reserved) {
+    res.status(reserved.status).json({ error: reserved.message });
     return;
   }
   // TRA-2410 — a username is a RECYCLABLE key. If the credential store says this
@@ -6113,12 +6123,13 @@ app.get('/api/admin/users', requireAuth, requireAdmin, (_req, res) => {
 });
 
 app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
-  const { username, email, password, role, adoptExistingBook } = req.body as {
+  const { username, email, password, role, adoptExistingBook, provisionOperatorBook } = req.body as {
     username?: string;
     email?: string;
     password?: string;
     role?: 'admin' | 'user';
     adoptExistingBook?: boolean;
+    provisionOperatorBook?: boolean;
   };
   if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'username, email, and password are required' });
@@ -6126,6 +6137,23 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   }
   if (password.length < 6) {
     res.status(400).json({ error: 'Password must be at least 6 characters' });
+    return;
+  }
+  // TRA-2508 — the operator-name reserve, which this route skipped entirely.
+  // `POST {username:'RICHARD'}` minted a `role: 'user'` book that was served the
+  // firm-wide demo fold on `/api/reports/<date>?mode=demo` while `/api/reports/desk`
+  // 403'd the same token — the front-door-403 / side-door-200 asymmetry TRA-2407
+  // exists to close, reached through an admin route instead of signup.
+  //
+  // It runs BEFORE `retireOrphanedBook` deliberately: a refused create must not
+  // have moved anyone's book aside on its way to the 409.
+  const reserved = refuseReservedIdentityWrite({
+    name: username,
+    audience: 'admin',
+    provisionOperatorBook,
+  });
+  if (reserved) {
+    res.status(reserved.status).json({ error: reserved.message });
     return;
   }
   // TRA-2410 — same guard as signup, with the ONE deliberate exception.
@@ -6172,6 +6200,20 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
 app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, res) => {
   const { username } = req.params as Record<string, string>;
   const { email, newUsername } = req.body as { email?: string; newUsername?: string };
+  // TRA-2508 — the sharper half of the report. This route had no reserve check
+  // anywhere on its path, so a plain book that 404'd on a seeded firm day served
+  // the firm's numbers after `PATCH {newUsername:'Richard'}` — on a RENAME ALONE,
+  // with its role untouched, so `/api/reports/desk` kept 403ing it.
+  //
+  // No `provisionOperatorBook` carve-out here: restoring an operator book is a
+  // CREATE (TRA-142 retains the files for exactly that), not a rename of some
+  // other account onto the name. A guard with no way to be waived is one fewer
+  // flag for the next route to forget to forward.
+  const reserved = refuseReservedIdentityWrite({ name: newUsername, audience: 'admin' });
+  if (reserved) {
+    res.status(reserved.status).json({ error: reserved.message });
+    return;
+  }
   const result = await updateUser(username, { email, username: newUsername });
   if (!result.ok) {
     res.status(result.error === 'User not found' ? 404 : 409).json({ error: result.error });
