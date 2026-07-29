@@ -43,7 +43,11 @@ process.env['LOG_NO_FILE'] = '1';
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 const FIXTURE = 'ctoverify_tra2284@qa.test';
-const REAL = 'trader@example.com';
+// TRA-2485 — the gate now suppresses ALL RFC 2606/6761 reserved domains, so
+// the deliverable control moved off `@example.com` onto a real MX-backed
+// domain. Re-pointing it at another reserved domain would make every "not too
+// wide" control below vacuous-but-green.
+const REAL = 'trader@gmail.com';
 
 const fillEvent: AlertEvent = {
   kind: 'fill',
@@ -112,10 +116,25 @@ describe('EmailChannelAdapter.suppressionReason', () => {
     expect(adapterFor(REAL).suppressionReason(fillEvent, p)).toBe('test_account_recipient');
   });
 
-  it('CONTROL — the rule is a SUFFIX, not a substring', () => {
-    expect(adapterFor('qa.test.user@example.com').suppressionReason(fillEvent, prefs())).toBe(
+  it('CONTROL — the rule is anchored on the domain, not a substring', () => {
+    expect(adapterFor('qa.test.user@gmail.com').suppressionReason(fillEvent, prefs())).toBe(
       undefined,
     );
+  });
+
+  it('TRA-2485 — suppresses the residual reserved domains, not just @qa.test', () => {
+    expect(adapterFor('qa_mirror_1578_38096@example.com').suppressionReason(fillEvent, prefs())).toBe(
+      'test_account_recipient',
+    );
+    expect(adapterFor('ctoverify_qa_tra2406b@qa.invalid').suppressionReason(fillEvent, prefs())).toBe(
+      'test_account_recipient',
+    );
+  });
+
+  it('TRA-2485 CONTROL — test.com is a REAL domain and is NOT suppressed', () => {
+    // TRA-2490's deliverable bounce control lives on `test.com`; a loosely
+    // anchored `.test` match would eat it and blind the mailbox instrument.
+    expect(adapterFor('qt-probe3@test.com').suppressionReason(fillEvent, prefs())).toBeUndefined();
   });
 
   it('CONTROL — an UNRESOLVABLE address is not suppressed (it is a genuine failure)', () => {

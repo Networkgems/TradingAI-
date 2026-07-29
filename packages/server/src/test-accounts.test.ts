@@ -43,6 +43,12 @@ describe('isTestAccount — TRA-1949 @qa.test email rule', () => {
   it('isTestEmail matches only the @qa.test suffix', () => {
     expect(isTestEmail('a@qa.test')).toBe(true);
     expect(isTestEmail('a@qa.test.evil.com')).toBe(false);
+    // ⚠ TRA-2485 pin — this stays FALSE on purpose. Mail suppression widened
+    // to all reserved domains via a SEPARATE predicate (`isUndeliverableEmail`,
+    // undeliverable-email.ts). Widening THIS one instead would silently move
+    // every `@example.com` book into the test population and out of the
+    // firm-wide desk fold (TRA-1949/TRA-1475) — a P&L-visible change. If this
+    // assertion is in your way, you are editing the wrong predicate.
     expect(isTestEmail('a@example.com')).toBe(false);
     expect(isTestEmail(undefined)).toBe(false);
   });

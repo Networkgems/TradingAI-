@@ -4,11 +4,12 @@ import nodemailer from 'nodemailer';
 // today and `logger.child()` on the next line runs at module scope inside it — the exact
 // shape that made TRA-1674 throw. Importing the leaf breaks it.
 import { logger } from './observability/logger.js';
-// TRA-2356 — the single source of truth for "is this a fixture address?"
-// (TRA-1949's `@qa.test` suffix rule). `test-accounts.ts` is a pure string
-// predicate with ZERO imports, so pulling it in here cannot re-open the
+// TRA-2485 — the single source of truth for "can this address ever receive
+// mail?" (RFC 2606/6761 reserved domains; supersedes TRA-2356's `@qa.test`
+// rule). Like `test-accounts.ts` it is a pure string predicate with ZERO
+// imports, so pulling it in here cannot re-open the
 // email -> barrel -> alerts -> email cycle the import above is dodging.
-import { isTestEmail } from './test-accounts.js';
+import { isUndeliverableEmail } from './undeliverable-email.js';
 
 const log = logger.child({ module: 'email' });
 
@@ -69,9 +70,18 @@ export function isSmtpConfigured(): boolean {
  * dispatcher send is neither resolved (false green) nor thrown (false red) but
  * recorded as its own third disposition. What remains here is a backstop —
  * see {@link SuppressedRecipientError}.
+ *
+ * TRA-2485 — widened from `isTestEmail` (`@qa.test` only) to the full RFC
+ * 2606/6761 reserved set: the residual fixture population on `@example.com` /
+ * `@qa.invalid` kept hard-bouncing (~15+/day) after the TRA-2356 deploy.
+ * Widened on the DOMAIN SET, not the KEY — still address-keyed, so the
+ * per-channel override escape hatch (a fixture pointing at a real MX-backed
+ * inbox, which TRA-2284's grading probe depends on) survives. NOT switched to
+ * `isTestEmail`-widening: that predicate is also the TRA-1949 desk-fold
+ * classifier, and widening it would move books between P&L populations.
  */
 function isSuppressedRecipient(toEmail: string): boolean {
-  return isTestEmail(toEmail);
+  return isUndeliverableEmail(toEmail);
 }
 
 /**
@@ -88,13 +98,17 @@ export class SuppressedRecipientError extends Error {
   }
 }
 
-/** Structured trace so a suppression is COUNTABLE, never a silent no-op. */
+/**
+ * Structured trace so a suppression is COUNTABLE, never a silent no-op.
+ * Message + `reason` are the DETECTOR external graders grep Render logs for
+ * (TRA-2482/TRA-2490) — kept verbatim across TRA-2485's widening on purpose.
+ */
 function logSuppressed(kind: string, toEmail: string): void {
   log.info('suppressed transactional mail to test-account recipient', {
     kind,
     to: toEmail,
     reason: 'test_account_recipient',
-    issue: 'TRA-2356',
+    issue: 'TRA-2356/TRA-2485',
   });
 }
 

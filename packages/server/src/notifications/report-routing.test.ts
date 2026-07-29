@@ -36,7 +36,10 @@ import { EmailChannelAdapter } from './channels/email.js';
 process.env['LOG_NO_FILE'] = '1';
 
 const FIXTURE = 'ctoverify_tra2284@qa.test';
-const REAL = 'trader@example.com';
+// TRA-2485 — `@example.com` is now inside the suppression gate; the
+// deliverable control must live on a real MX-backed domain or every "not too
+// wide" assertion in this file goes vacuous-but-green.
+const REAL = 'trader@gmail.com';
 
 const reportEvent: AlertEvent = {
   kind: 'report',

@@ -10,7 +10,7 @@ import type { AlertEvent, ChannelAdapter } from '../dispatcher.js';
 import { renderAlert } from '../renderer.js';
 import { isSmtpConfigured, sendNotificationEmail } from '../../email.js';
 import { getUser } from '../../users.js';
-import { isTestEmail } from '../../test-accounts.js';
+import { isUndeliverableEmail } from '../../undeliverable-email.js';
 
 /**
  * TRA-2416 — machine-readable suppression reason, shared with the transport-side
@@ -89,11 +89,17 @@ export class EmailChannelAdapter implements ChannelAdapter {
    *
    * An unresolvable address is NOT suppressed — that is a genuine failure and
    * belongs in the failed ledger, which is what `send()` below already does.
+   *
+   * TRA-2485 — the predicate is `isUndeliverableEmail` (full RFC 2606/6761
+   * reserved set), not `isTestEmail` (`@qa.test` only): the residual fixture
+   * population on `@example.com` / `@qa.invalid` kept bouncing after TRA-2356.
+   * Still keyed on the RESOLVED ADDRESS for both reasons above; the reason
+   * string is unchanged so the TRA-2416 ledger and its readers don't move.
    */
   suppressionReason(event: AlertEvent, prefs: AlertPreferences): string | undefined {
     const to = this.resolveAddress(event.username, prefs);
     if (!to) return undefined;
-    return isTestEmail(to) ? TEST_RECIPIENT_SUPPRESSION_REASON : undefined;
+    return isUndeliverableEmail(to) ? TEST_RECIPIENT_SUPPRESSION_REASON : undefined;
   }
 
   async send(event: AlertEvent, prefs: AlertPreferences): Promise<void> {

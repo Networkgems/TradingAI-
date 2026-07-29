@@ -11,8 +11,15 @@
 // satisfied just as well by "we stopped mailing everyone" as by "we stopped
 // mailing fixtures". So every suppression assertion below is paired with a
 // negative control on a real address through the SAME call, and the
-// `qa.test.user@example.com` case pins that the rule is a SUFFIX, not a
-// substring.
+// domain-anchoring cases pin that the rule matches DOMAIN LABELS, never
+// substrings of the address.
+//
+// TRA-2485 — the gate widened from `@qa.test` to the full RFC 2606/6761
+// reserved set (`@example.com` / `@qa.invalid` fixtures kept bouncing after
+// TRA-2356). The negative controls therefore moved OFF `@example.com`: they
+// now live on a GENUINELY deliverable domain (`gmail.com`), because a control
+// re-pointed at another reserved domain would go vacuous-but-green — the
+// exact reads-identically failure this file exists to kill.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
@@ -63,7 +70,10 @@ const {
 } = await import('./email.js');
 
 const FIXTURE = 'ctoverify_tra2331@qa.test';
-const REAL = 'trader@example.com';
+// TRA-2485 — must be a real, MX-backed, non-reserved domain whose labels don't
+// collide with the reserved set. NOT `@example.com` (now suppressed) and NOT
+// `@test.com`-shaped (that domain is TRA-2490's live bounce control).
+const REAL = 'trader@gmail.com';
 
 /** Recipients actually handed to the transport across all calls so far. */
 function recipients(): string[] {
@@ -137,7 +147,32 @@ describe('TRA-2356 — fixture-address suppression', () => {
     });
   });
 
-  describe('the predicate is a suffix rule, not a substring one', () => {
+  // TRA-2485 — the residual population TRA-2356 missed: fixture books on the
+  // OTHER reserved domains kept hard-bouncing (~15+/day) after that deploy.
+  describe('the residual reserved domains (TRA-2485)', () => {
+    it('suppresses an @example.com fixture through every user-addressed path', async () => {
+      await sendWelcomeEmail('qa_tra1475_1783821169@example.com', 'qa_tra1475');
+      await sendPasswordResetEmail('qa_tra1475_1783821169@example.com', 'qa_tra1475', '12345678');
+      await sendOtpEmail('qa_tra1475_1783821169@example.com', 'qa_tra1475', '424242');
+      expect(sendMail).not.toHaveBeenCalled();
+    });
+
+    it('suppresses an @qa.invalid fixture', async () => {
+      await sendWelcomeEmail('ctoverify_qa_tra2406b@qa.invalid', 'ctoverify_qa_tra2406b');
+      expect(sendMail).not.toHaveBeenCalled();
+    });
+
+    it('still emits the COUNTABLE log line (the TRA-2490 Render-log detector)', async () => {
+      await sendWelcomeEmail('qa_mirror_1578_38096@example.com', 'qa_mirror_1578');
+
+      expect(logInfo).toHaveBeenCalledTimes(1);
+      const [msg, fields] = logInfo.mock.calls[0]!;
+      expect(msg).toBe('suppressed transactional mail to test-account recipient');
+      expect(fields.reason).toBe('test_account_recipient');
+    });
+  });
+
+  describe('the predicate anchors on domain labels, not substrings', () => {
     it('matches case-insensitively', async () => {
       await sendWelcomeEmail('QA_MIRROR_9@QA.TEST', 'qa_mirror_9');
       expect(sendMail).not.toHaveBeenCalled();
@@ -149,17 +184,19 @@ describe('TRA-2356 — fixture-address suppression', () => {
     });
 
     it('does NOT suppress a real address that merely contains "qa.test"', async () => {
-      // The over-wide gate this file exists to catch: anchored at the end, so a
-      // genuine customer whose local-part happens to read `qa.test` still mails.
-      await sendWelcomeEmail('qa.test.user@example.com', 'qatestuser');
-      expect(recipients()).toEqual(['qa.test.user@example.com']);
+      // The over-wide gate this file exists to catch: anchored on the domain, so
+      // a genuine customer whose local-part happens to read `qa.test` still mails.
+      await sendWelcomeEmail('qa.test.user@gmail.com', 'qatestuser');
+      expect(recipients()).toEqual(['qa.test.user@gmail.com']);
     });
 
-    it('does NOT suppress a lookalike domain — the "@" is part of the anchor', async () => {
-      // Ends with the literal `qa.test` but NOT with `@qa.test`. A rule written
-      // as a bare `.endsWith("qa.test")` would silently swallow this one.
-      await sendWelcomeEmail('someone@notqa.test', 'someone');
-      expect(recipients()).toEqual(['someone@notqa.test']);
+    it('does NOT suppress test.com — a REAL registered domain (TRA-2490 control)', async () => {
+      // `test.com` is MX-backed and is the mailbox instrument's only deliverable
+      // bounce control. A predicate matching `test` as a substring, or `.test`
+      // against the whole address, would eat it and blind the instrument.
+      await sendWelcomeEmail('qt-probe3@test.com', 'qt_probe3');
+      await sendWelcomeEmail('someone@mytest.com', 'someone');
+      expect(recipients()).toEqual(['qt-probe3@test.com', 'someone@mytest.com']);
     });
   });
 

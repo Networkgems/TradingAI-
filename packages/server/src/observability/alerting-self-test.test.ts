@@ -40,7 +40,11 @@ describe('TRA-2284 alerting self-test', () => {
     sendOpsAlertEmail.mockResolvedValue(undefined);
     isSmtpConfigured.mockReset();
     isSmtpConfigured.mockReturnValue(true);
-    process.env['ALERT_EMAIL'] = 'ops@example.com';
+    // TRA-2485 — a real-shaped domain, not `@example.com`: the ops-alert path
+    // is deliberately ungated today, but if a suppression gate ever reaches it,
+    // a reserved-domain recipient here would turn these delivery assertions
+    // vacuous. (`sendOpsAlertEmail` is mocked; no mail moves either way.)
+    process.env['ALERT_EMAIL'] = 'ops@gmail.com';
   });
 
   it('delivers through the real transport and records the probe in the ring', async () => {
