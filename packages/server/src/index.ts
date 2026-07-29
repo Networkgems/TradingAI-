@@ -332,6 +332,8 @@ import {
   compactChainPartitions,
   chainPartitionStorageReport,
 } from './chain-partition-compactor.js';
+// TRA-2420 — per-subdirectory attribution of DATA_DIR for `/api/health/storage`.
+import { dataDirUsageCached } from './data-dir-usage.js';
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import {
   isOptionsProposalRailEnabled,
@@ -5105,11 +5107,40 @@ app.get('/api/health/storage', async (_req, res) => {
         },
       }
     : { path: DATA_DIR, error: 'statfs failed', minFreePct };
+  // TRA-2420 — name the writer. TRA-2417 attributed `/data`'s ~11.6 MB per
+  // trading day to the option-chain capture; the real 07-24 partition is 8.02 MB
+  // and the sentiment snapshots are 0.008, so ~3.6 MB/day had no owner. A total
+  // minus one measured component is not an attribution. There is no shell on
+  // bqb1, so the breakdown has to be published here.
+  //
+  // Read `createdBytesByDay` for growth and `modifiedBytesByDay` for activity —
+  // they are different questions, and a per-session file rewritten in place is
+  // enormous in the second and absent from the first. See `data-dir-usage.ts`.
+  const usage = await dataDirUsageCached(DATA_DIR);
+  const measuredBytes = usage.totalBytes;
+  const diskUsedBytes = 'usedBytes' in disk ? (disk.usedBytes ?? null) : null;
   res.json({
     dataDir: DATA_DIR,
     dataDirEnv: process.env['DATA_DIR'] ?? null,
     dataDir_exists: existsSync(DATA_DIR),
     disk,
+    usage: {
+      ...usage,
+      // The residual, published rather than left as a subtraction someone does
+      // in their head. Non-zero is expected and fine (filesystem overhead, and
+      // anything on the volume outside DATA_DIR); a LARGE non-zero means the
+      // breakdown below does not account for the disk and must not be read as
+      // if it does.
+      unaccounted: {
+        diskUsedBytes,
+        measuredBytes,
+        bytes: diskUsedBytes === null ? null : diskUsedBytes - measuredBytes,
+        pct:
+          diskUsedBytes === null || diskUsedBytes === 0
+            ? null
+            : Number((((diskUsedBytes - measuredBytes) / diskUsedBytes) * 100).toFixed(3)),
+      },
+    },
     usersFile: await statFile(usersFile),
     settingsFile: await statFile(legacySettingsFile),
     tradesStocksFile: await statFile(legacyTradesStocksFile),

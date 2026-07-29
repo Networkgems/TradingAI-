@@ -31,6 +31,9 @@
     "check:tra2399-vacuity": "node --test scripts/lib/tra2399-live-instrument-grade.test.mjs",
     "//check:tra2399-controls": "TRA-2399 AC3, END TO END: drives the real CLI over a real socket against a POPULATED book and an EMPTY one, and asserts exit 0 vs exit 4. Needs `pnpm build` first (it computes both payloads with the real gate out of dist/), which is why it is a named step and NOT in pretest — see the header of the script.",
     "check:tra2399-controls": "node scripts/lib/tra2399-populated-gate-server.mjs --self-test",
+    "//tra2420:attribute": "TRA-2420 — rank DATA_DIR's per-trading-day GROWTH by writer off /api/health/storage. Exits 2 NOT_DEPLOYED until the deploy carrying the `usage` block lands, which is the only answer live can give before then — hence the paired controls.",
+    "tra2420:attribute": "node scripts/tra2420-data-dir-attribution.mjs",
+    "check:tra2420-controls": "node scripts/tra2420-data-dir-attribution.mjs --self-test",
     "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },
