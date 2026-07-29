@@ -76,11 +76,26 @@ const PINNED_DAY = '2026-07-01';
 const PINNED_PNL = 10563.53;
 const PINNED_TRADES = 191;
 
-// How many of the journal's most recent trading days arm B will try before
-// concluding the fill never fires. More than one because an operator book that
-// DID trade on a given day is served its own cell by design (TRA-1572's rule),
-// which is not evidence either way.
-const ARM_B_MAX_DAYS = 8;
+// How many of the journal's trading days arm B will try before concluding the
+// fill never fires. More than one because an operator book that DID trade on a
+// given day is served its own cell by design (TRA-1572's rule), which is not
+// evidence either way.
+//
+// TRA-2503 — this was 8, and 8 was a SAMPLING BIAS, not just a small sample.
+// The fold only fires on a day the operator's own book is HOLLOW, and `dates`
+// is newest-first, so windowing to the most RECENT days selects exactly the
+// days an active operator book is LEAST likely to have left hollow. On bqb1 on
+// 2026-07-29 that made a perfectly healthy system exit 3 (BLIND): all 8 recent
+// days were traded, while 15 of the 18 older days in the same journal served
+// the fold. A healthy system must not read as ungradeable — see the self-test
+// case that pins this. Bounded (not unbounded) so the probe's HTTP cost stays
+// predictable as the journal grows; truncation is DISCLOSED, never silent.
+const ARM_B_MAX_DAYS = 60;
+
+/** Arm-B candidate days. Extracted so the self-test can pin the selection. */
+function armBCandidates(dates) {
+  return dates.slice(0, ARM_B_MAX_DAYS);
+}
 
 const say = (m) => console.log(`[tra2407] ${m}`);
 
@@ -150,7 +165,13 @@ async function armB(token) {
   const desk = await req('/api/reports/desk', { token });
 
   if (desk.http === 200 && Array.isArray(desk.json?.dates)) {
-    const candidates = desk.json.dates.slice(0, ARM_B_MAX_DAYS);
+    const candidates = armBCandidates(desk.json.dates);
+    if (desk.json.dates.length > candidates.length) {
+      // No silent caps: say what was dropped, or a truncated scan reads as a
+      // whole-journal one.
+      say(`arm B: scanning ${candidates.length} of ${desk.json.dates.length} desk days `
+        + `(capped at ARM_B_MAX_DAYS=${ARM_B_MAX_DAYS}); ${desk.json.dates.length - candidates.length} older day(s) NOT tried`);
+    }
     let examined = 0;
     const misses = [];
     for (const d of candidates) {
@@ -183,8 +204,9 @@ async function armB(token) {
     }
     return {
       verdict: 'BLIND',
-      why: `no day matched, but ${misses.length - blanked.length} of ${misses.length} returned a NON-hollow personal `
-        + 'cell — the operator book traded those days, so the fold is not expected to fire and this cannot be graded',
+      why: `no day matched over ${candidates.length} desk day(s) scanned, but ${misses.length - blanked.length} of ${misses.length} `
+        + 'returned a NON-hollow personal cell — the operator book traded those days, so the fold is not '
+        + 'expected to fire and this cannot be graded',
     };
   }
 
@@ -373,6 +395,19 @@ function selfTest() {
       const blanked = misses.filter((m) => m.http === 404 || isHollowCell(m.cell));
       return blanked.length === misses.length ? 5 : 3;
     }, 3],
+    // TRA-2503 — the regression that made a HEALTHY bqb1 exit 3. `dates` is
+    // newest-first; the operator traded the 8 most recent days and the fold
+    // fires on an older one. Under the old ARM_B_MAX_DAYS=8 window that day was
+    // never requested, so a passing system reported BLIND. Fails on the old cap.
+    ['a healthy operator who traded the recent days still PASSes via an older day', () => {
+      const dates = Array.from({ length: 26 }, (_, i) => i); // 0 = newest
+      const foldFiresOn = 8; // every more-recent day was traded by the operator
+      return armBCandidates(dates).includes(foldFiresOn) ? 0 : 3;
+    }, 0],
+    ['arm B still DISCLOSES truncation rather than silently capping', () => {
+      const dates = Array.from({ length: ARM_B_MAX_DAYS + 5 }, (_, i) => i);
+      return armBCandidates(dates).length < dates.length ? 0 : 3;
+    }, 0],
     ['a matching operator cell is the arm-B pass', () => (
       sameCell({ combinedPnl: 10563.527, totalTrades: 191 }, { combinedPnl: 10563.53, totalTrades: 191 }) ? 0 : 3
     ), 0],
