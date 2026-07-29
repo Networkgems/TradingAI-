@@ -92,9 +92,17 @@ async function main() {
     ]);
   }
 
+  // A partition with ZERO per-symbol files (e.g. 2026-06-02, which holds only
+  // its `_meta.json`) is counted in `partitions` but in NEITHER `compacted`
+  // nor `plain` — both buckets require `files > 0`. It has no bytes to
+  // reclaim, so it must not count against the compaction identity below.
+  const emptyPartitions = Array.isArray(s.perPartition)
+    ? s.perPartition.filter((p) => p.files === 0)
+    : [];
+
   const facts = [
     `partitions            ${s.partitions} (expected >= ${EXPECT_PARTITIONS})`,
-    `compacted / plain     ${s.compactedPartitions} / ${s.plainPartitions}`,
+    `compacted / plain     ${s.compactedPartitions} / ${s.plainPartitions}${emptyPartitions.length ? ` (+${emptyPartitions.length} EMPTY: ${emptyPartitions.map((p) => p.date).join(', ')})` : ''}`,
     `archive               ${s.totalMb} MB`,
     `lastCompaction        ${s.lastCompaction ? `${s.lastCompaction.at} trigger=${s.lastCompaction.trigger} files=${s.lastCompaction.filesCompacted} reclaimed=${s.lastCompaction.mbReclaimed} MB failures=${s.lastCompaction.failures}` : 'ABSENT — compaction never ran this boot'}`,
     `retention (report)    ${s.retention?.beyondWindow?.length ?? '?'} partitions beyond ${s.retention?.tradingDays}d = ${s.retention?.beyondWindowMb} MB, enforced=${s.retention?.enforced}`,
@@ -116,9 +124,10 @@ async function main() {
   if (s.plainPartitions > 1) {
     failures.push(`${s.plainPartitions} plain partitions — only the newest should be uncompacted`);
   }
-  if (s.compactedPartitions < s.partitions - 1) {
+  const compactablePartitions = s.partitions - s.plainPartitions - emptyPartitions.length;
+  if (s.compactedPartitions < compactablePartitions) {
     failures.push(
-      `${s.compactedPartitions}/${s.partitions - 1} aged partitions compacted — the reclaim is incomplete`,
+      `${s.compactedPartitions}/${compactablePartitions} aged non-empty partitions compacted — the reclaim is incomplete`,
     );
   }
   if (s.retention?.enforced !== false) {
