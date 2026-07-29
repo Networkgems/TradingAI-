@@ -35,6 +35,35 @@
 //    therefore INJECT a deleted book's rows into the firm-wide desk numbers: a
 //    privacy fix that corrupts the board's P&L.
 //
+// ── A FILE delete cannot reach a DATABASE row (TRA-2513) ──────────────────────
+//
+// Everything above is about files, and for two years everything this account owned
+// WAS a file. TRA-1052 moved `account-settings` into a SQLite table
+// (`DATA_DIR/state.db`, one blob row keyed by the raw username), and nothing in
+// this module — or anywhere else — ever deleted one. So `DELETE /api/account`,
+// the route whose entire promise is "wipe my data", returned a green receipt while
+// the row survived, carrying the saved BROKER CREDENTIALS (`liveApiKeyStocks`,
+// `liveApiSecretCrypto`, the per-env options pairs — see
+// `PERSISTED_CREDENTIAL_FIELDS`) and `GET /api/account/settings` serves that blob
+// UNREDACTED.
+//
+// This is the SAME defect TRA-2520 fixed on the ADOPTION side, at the other call
+// site. The two halves are not interchangeable and neither one covers the other:
+//
+//  • TRA-2520 / `retireOrphanedBook` runs at SIGNUP, so it only ever fires for a
+//    name that is being re-registered. It ARCHIVES the row (credentials blanked)
+//    before dropping it, because the admin-delete path it defends deliberately
+//    retains data (TRA-142).
+//  • This half runs at DELETE, on the one path where the user ASKED for
+//    destruction. So it DESTROYS: no archive, no quarantined copy. And it fires
+//    whether or not the name is ever reused — which is the case TRA-2520 can
+//    never reach, and the one that matters for "did my credentials actually go?"
+//
+// The channel is verified the same way the directory is: by asking the STORE
+// whether the row is servable afterwards, not by trusting the DELETE's own
+// `changes` count. A row dropped and immediately re-created by a racing
+// `saveSettings` reports `deleted: true` and is still a leak.
+//
 // ── Ordering is load-bearing ──────────────────────────────────────────────────
 //
 // The caller must stop the engines (`destroyUserContext`) and remove the
@@ -47,6 +76,10 @@
 // continue`, so once the primary is gone a racing rotation has nothing to copy.
 // The window is small, not zero — hence `resweep`, which re-runs both deletes
 // after the fact and REPORTS what it found rather than quietly cleaning up.
+//
+// The settings row goes LAST, after that re-sweep, for the same reason: it is the
+// step whose verification is a single point-in-time read, so it should run at the
+// point where anything that could still be writing has already been observed.
 
 import { readdir, rm, stat } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -55,6 +88,11 @@ import { resolveDataDir } from './data-dir.js';
 import { recordAccountTombstone, type TombstoneVia } from './deleted-accounts.js';
 import { revokeResetTokensFor } from './auth.js';
 import { forgetTwoFactorState } from './two-factor.js';
+import {
+  readSettingsRowForRetirement,
+  deleteSettingsRow,
+  clearSettingsCache,
+} from './account-settings.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'account-deletion' });
@@ -94,6 +132,24 @@ export interface AccountWipeReceipt {
   resetTokensRevoked: number;
   twoFactorStateCleared: number;
   /**
+   * TRA-2513 — a durable `account_settings` row existed under this username.
+   *
+   * `false` is ALSO the answer when the SQLite store is unavailable (TRA-1681
+   * fail-soft), and that is honest rather than a hole: in that mode settings live
+   * in `users/<name>/account-settings.json`, which the primary-directory delete
+   * above already destroyed. There is no third state where a row exists and this
+   * reads false.
+   */
+  settingsRowExisted: boolean;
+  /** The row is verified GONE from the store by a fresh read, not by a `changes` count. */
+  settingsRowRemoved: boolean;
+  /**
+   * How many credential fields held a non-blank value at the moment of the delete.
+   * A COUNT, never the names and never the values — this number is the difference
+   * between "your settings were removed" and "your saved broker keys were removed".
+   */
+  settingsCredentialFieldsCleared: number;
+  /**
    * Non-fatal failures (permission, locked file). Non-empty ⇒ `ok` is false.
    *
    * ⚠️ These strings are labelled with ABSOLUTE `DATA_DIR` paths (`primary:…`,
@@ -131,6 +187,9 @@ export interface PublicAccountWipeReceipt {
   backupGenerationsRemaining: number;
   resetTokensRevoked: number;
   twoFactorStateCleared: number;
+  settingsRowExisted: boolean;
+  settingsRowRemoved: boolean;
+  settingsCredentialFieldsCleared: number;
   errorCount: number;
   ok: boolean;
 }
@@ -149,6 +208,9 @@ export function redactWipeReceipt(receipt: AccountWipeReceipt): PublicAccountWip
     backupGenerationsRemaining: receipt.backupGenerationsRemaining,
     resetTokensRevoked: receipt.resetTokensRevoked,
     twoFactorStateCleared: receipt.twoFactorStateCleared,
+    settingsRowExisted: receipt.settingsRowExisted,
+    settingsRowRemoved: receipt.settingsRowRemoved,
+    settingsCredentialFieldsCleared: receipt.settingsCredentialFieldsCleared,
     errorCount: receipt.errors.length,
     ok: receipt.ok,
   };
@@ -365,6 +427,49 @@ export async function wipeAccountData(
     errors.push(`two-factor: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // 5. TRA-2513 — the `account_settings` SQLite row. A directory delete cannot
+  //    reach it, so every step above ran and left the saved broker credentials
+  //    exactly where they were.
+  //
+  //    Probe FIRST: the credential count has to be read while the row still
+  //    exists, and it is the number the user is told. Unlike TRA-2520's
+  //    retirement there is no archive — this is the destroy path, and writing the
+  //    blob to disk here would re-create the leak somewhere the wipe does not look.
+  let settingsRowExisted = false;
+  let settingsCredentialFieldsCleared = 0;
+  let settingsRowRemoved = false;
+  try {
+    const row = readSettingsRowForRetirement(username);
+    settingsRowExisted = row.found;
+    settingsCredentialFieldsCleared = row.credentialFieldsCleared.length;
+  } catch (err: unknown) {
+    // A destroy that cannot see the channel is NOT a clean destroy — this pushes
+    // an error and therefore fails `ok`, which is the opposite of the retirement
+    // path's fail-soft. The asymmetry is deliberate: there, a db fault must not
+    // 503 an innocent signup; here, the user asked for their credentials to be
+    // gone and "I could not check" is not an answer we should return as green.
+    errors.push(`settings-probe: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    // Runs unconditionally, even when the probe said `found: false` — it also
+    // drops the in-memory copy (`getSettings` serves that map directly), which is
+    // a third live channel that no row check can see.
+    deleteSettingsRow(username, { reason: 'deleted' });
+  } catch (err: unknown) {
+    errors.push(`settings-row: ${err instanceof Error ? err.message : String(err)}`);
+    clearSettingsCache(username);
+  }
+  // The verdict asks the STORE, not the statement. This is the exact read a future
+  // holder of the name would get from `loadSettings`, and it is the only thing that
+  // discriminates "dropped" from "dropped and re-created by a racing write".
+  try {
+    settingsRowRemoved = !readSettingsRowForRetirement(username).found;
+  } catch (err: unknown) {
+    settingsRowRemoved = false;
+    errors.push(`settings-verify: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!settingsRowRemoved) errors.push('settings-row: present after wipe');
+
   const receipt: AccountWipeReceipt = {
     username,
     deletedAt: tombstone.deletedAt,
@@ -377,10 +482,17 @@ export async function wipeAccountData(
     backupGenerationsRemaining: remaining,
     resetTokensRevoked,
     twoFactorStateCleared,
+    settingsRowExisted,
+    settingsRowRemoved,
+    settingsCredentialFieldsCleared,
     errors,
     ok: false,
   };
-  receipt.ok = receipt.primaryDirRemoved && receipt.backupGenerationsRemaining === 0 && errors.length === 0;
+  receipt.ok =
+    receipt.primaryDirRemoved &&
+    receipt.backupGenerationsRemaining === 0 &&
+    receipt.settingsRowRemoved &&
+    errors.length === 0;
 
   log[receipt.ok ? 'info' : 'error']('account-deletion: wipe complete', { ...receipt });
   return receipt;

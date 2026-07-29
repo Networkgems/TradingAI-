@@ -411,6 +411,9 @@ describe('TRA-2421 — what the receipt is allowed to say on the wire', () => {
       backupGenerationsRemaining: 1,
       resetTokensRevoked: 1,
       twoFactorStateCleared: 0,
+      settingsRowExisted: true,
+      settingsRowRemoved: false,
+      settingsCredentialFieldsCleared: 2,
       errors: [
         `primary:${userDir('enock')}: EPERM: operation not permitted`,
         `backup:${generationDir(T0)}: EBUSY: resource busy or locked`,
@@ -431,6 +434,13 @@ describe('TRA-2421 — what the receipt is allowed to say on the wire', () => {
     expect(publicReceipt.backupGenerationsRemaining).toBe(1);
     expect(publicReceipt.backupGenerationsWithData).toBe(3);
     expect(publicReceipt.primaryDirReappeared).toBe(true);
+    // TRA-2513 — the settings-row verdict is part of "some data could not be
+    // removed", and the field it reports on is the saved BROKER CREDENTIALS. A
+    // redactor that dropped it would turn the one residue the user most needs to
+    // know about into silence.
+    expect(publicReceipt.settingsRowExisted).toBe(true);
+    expect(publicReceipt.settingsRowRemoved).toBe(false);
+    expect(publicReceipt.settingsCredentialFieldsCleared).toBe(2);
 
     // The original is NOT mutated — the operator log reads it after this call.
     expect(receipt.errors).toHaveLength(2);

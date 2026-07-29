@@ -508,7 +508,10 @@ export function readSettingsRowForRetirement(username: string): PersistedSetting
  * in-memory map is a third copy of the same leak (`getSettings` serves it
  * directly), and dropping it can never destroy anything persisted.
  */
-export function deleteSettingsRow(username: string): { deleted: boolean; verified: boolean } {
+export function deleteSettingsRow(
+  username: string,
+  opts: { reason?: 'recycled' | 'deleted' } = {},
+): { deleted: boolean; verified: boolean } {
   const db = settingsDb();
   if (!db) {
     clearSettingsCache(username);
@@ -518,7 +521,14 @@ export function deleteSettingsRow(username: string): { deleted: boolean; verifie
     db.prepare('DELETE FROM account_settings WHERE username = ?').run(username);
     const still = db.prepare('SELECT 1 AS present FROM account_settings WHERE username = ?').get(username);
     const verified = still === undefined || still === null;
-    if (verified) log.info('TRA-2520: retired account_settings row for a recycled username', { username });
+    // The two callers are different EVENTS and an operator reading the log needs to
+    // tell them apart: `recycled` is TRA-2520's retirement at signup (the row was
+    // archived first), `deleted` is TRA-2513's destroy at `DELETE /api/account`
+    // (nothing was retained). Labelling both as a recycle — as this line did when
+    // it had only one caller — would make a self-delete look like an adoption.
+    if (verified) {
+      log.info('account_settings row dropped', { username, reason: opts.reason ?? 'recycled' });
+    }
     return { deleted: true, verified };
   } finally {
     clearSettingsCache(username);
