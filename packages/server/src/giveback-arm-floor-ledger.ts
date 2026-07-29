@@ -49,6 +49,7 @@ import { logger } from './observability/index.js';
 import { isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG } from './exit-risk-rules-flag.js'; // TRA-2220
 import { resolveDemoFlagEnv } from './demo-flags.js'; // TRA-2220
 import { etDateString, isMarketDayIso } from './scheduler.js'; // TRA-2220
+import { etHour } from './et-clock.js'; // TRA-2498
 
 const log = logger.child({ module: 'giveback-arm-floor-ledger' });
 
@@ -679,14 +680,12 @@ function addIsoDays(dateIso: string, n: number): string {
  */
 function lastCompletedTradingDay(now: number): string {
   const today = etDateString(new Date(now));
-  const etHour = Number(
-    new Date(now).toLocaleString('en-US', {
-      timeZone: 'America/New_York',
-      hour: '2-digit',
-      hour12: false,
-    }),
-  );
-  let cursor = isMarketDayIso(today) && etHour >= 16 ? today : addIsoDays(today, -1);
+  // TRA-2498 — via the shared ET helper. A bare `hour12: false` renders midnight
+  // as 24 on Node 20 (prod), clearing this `>= 16` cash-close test at
+  // 00:00–00:59 ET and returning TODAY as the last COMPLETED trading day before
+  // it had traded at all.
+  const hourET = etHour(new Date(now));
+  let cursor = isMarketDayIso(today) && hourET >= 16 ? today : addIsoDays(today, -1);
   // Bounded walk-back: 10 days covers the longest weekend + holiday cluster.
   for (let i = 0; i < 10 && !isMarketDayIso(cursor); i += 1) cursor = addIsoDays(cursor, -1);
   return cursor;

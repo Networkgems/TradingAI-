@@ -213,6 +213,52 @@ describe('MarketScheduler — TRA-193 onDaily / onMarketClose / onArchive', () =
     expect(onArchive).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * TRA-2498 — the archive must NOT fire in the 00:00–00:59 ET hour.
+   *
+   * On Node 20 (the prod runtime) a bare `hour12: false` renders midnight as
+   * `24:00`, so `hour >= 21` passed at 00:00 ET; that fire then stamped
+   * `lastArchiveDate` with the already-new ET date and dedup-suppressed the
+   * genuine 21:00 fire that evening. Net: one archive per day, at midnight,
+   * forever.
+   *
+   * HONEST SCOPE: CI runs Node 22 (h23), where this test also passes WITHOUT
+   * the fix — it only moves on Node 20. The version-independent lock for the
+   * midnight contract is `et-clock.test.ts`'s literal `'24:00'` parse arm. This
+   * pair pins the scheduler-level behaviour on the prod runtime.
+   */
+  it('does not fire onArchive during the 00:xx ET hour (TRA-2498 midnight hour-24)', () => {
+    // 00:00 ET on 2026-07-27 (EDT, UTC-4) = 04:00 UTC; back off 60 s so the
+    // first poll tick lands exactly on 00:00 ET.
+    vi.setSystemTime(new Date(Date.UTC(2026, 6, 27, 3, 59, 0)));
+    const onArchive = vi.fn();
+    scheduler.start({ onArchive });
+
+    vi.advanceTimersByTime(60_000); // → 00:00 ET
+    expect(onArchive).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(59 * 60_000); // → 00:59 ET, still inside the h24 window
+    expect(onArchive).not.toHaveBeenCalled();
+  });
+
+  it('still fires onArchive that same ET evening at 21:00 (TRA-2498 dedup not poisoned)', () => {
+    // The other half of the defect: the midnight fire consumed the ET day's
+    // dedup key, so the real 21:00 fire was suppressed. Run the midnight window
+    // and the 21:00 boundary against ONE scheduler and assert the evening fire
+    // still lands.
+    vi.setSystemTime(new Date(Date.UTC(2026, 6, 27, 3, 59, 0)));
+    const onArchive = vi.fn();
+    scheduler.start({ onArchive });
+
+    vi.advanceTimersByTime(60_000); // 00:00 ET — must not consume the day's key
+    expect(onArchive).not.toHaveBeenCalled();
+
+    // 21:00 ET the same ET day (2026-07-27) = 2026-07-28T01:00:00Z.
+    vi.setSystemTime(new Date(Date.UTC(2026, 6, 28, 0, 59, 0)));
+    vi.advanceTimersByTime(60_000);
+    expect(onArchive).toHaveBeenCalledTimes(1);
+  });
+
   it('does not double-fire onArchive within the same ET day', () => {
     vi.setSystemTime(at2100EDT(2026, 5, 2));
     const onArchive = vi.fn();

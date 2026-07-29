@@ -9,6 +9,7 @@
  */
 
 import { logger } from './observability/index.js';
+import { etClockParts } from './et-clock.js';
 
 const log = logger.child({ module: 'scheduler' });
 
@@ -134,18 +135,20 @@ export function etDayOfWeekIso(dateIso: string): number {
   return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
 }
 
-/** Returns the current hour and minute in ET. */
+/**
+ * Returns the current hour and minute in ET.
+ *
+ * TRA-2498 — this used to render with a bare `hour12: false` and regex-parse
+ * the hour inline. On Node 20 (the prod runtime) ICU renders the whole midnight
+ * hour as `24:MM`, so `hour` read **24** for all of 00:00–00:59 ET. Every
+ * `hour >= N` gate below then passed at midnight — most damagingly the 21:00 ET
+ * archive, which fired at 00:00, stamped `lastArchiveDate` with the already-new
+ * ET date, and thereby dedup-suppressed its own real 21:00 fire that evening.
+ * Delegates to `et-clock.ts`, which pins `hourCycle: 'h23'` and folds `% 24`.
+ */
 function nowET(): { hour: number; minute: number; date: Date } {
   const now = new Date();
-  // Get ET time parts
-  const etStr = now.toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit' });
-  // Parse "MM/DD/YYYY, HH:MM"
-  const match = etStr.match(/(\d+)\/(\d+)\/(\d+),\s+(\d+):(\d+)/);
-  if (!match) return { hour: 0, minute: 0, date: now };
-  const hour = parseInt(match[4], 10);
-  const minute = parseInt(match[5], 10);
+  const { hour, minute } = etClockParts(now);
   return { hour, minute, date: now };
 }
 

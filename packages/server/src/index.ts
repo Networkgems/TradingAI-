@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
+import { etHour } from './et-clock.js'; // TRA-2498
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import {
   buildAllowedOrigins,
@@ -8070,10 +8071,12 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   // calendar was reading the stale file). Prefer the live cell pre-archive; the
   // settled 9 PM file wins afterward (by then the in-memory closes are cleared,
   // so the live cell would under-report).
-  const etHour = Number(
-    new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
-  );
-  const archiveSettled = etHour >= 21; // matches the 21:00 ET EOD archive boundary
+  // TRA-2498 — route the ET hour through the shared helper. A bare
+  // `hour12: false` renders midnight as 24 on Node 20 (the prod runtime), which
+  // made `archiveSettled` true for all of 00:00–00:59 ET and served the stale
+  // settled file in place of the live cell — the very calendar-freeze
+  // divergence this block exists to prevent.
+  const archiveSettled = etHour() >= 21; // matches the 21:00 ET EOD archive boundary
   if (isToday && (!fileExists || !archiveSettled)) {
     try {
       const liveToday = await buildLiveTodayCellReport(ctx, mode);
@@ -11371,13 +11374,15 @@ async function runObservabilityMonitor(): Promise<void> {
   checkErrorSpike(getErrorCountSince());
 
   // Trade-volume-zero — only meaningful on a stock-market trading day.
+  // TRA-2498 — via the shared ET helper. A bare `hour12: false` renders
+  // midnight as 24 on Node 20 (prod), which cleared this check's
+  // `etHour >= thresholdHour (12)` gate at 00:00–00:59 ET while the new day's
+  // trade count was still legitimately 0 — a false `trade-volume-zero` warning
+  // every midnight on a market day.
   const now = new Date();
-  const etHour = Number(
-    now.toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false }),
-  );
   checkTradeVolume({
     tradeCountToday: getTradeOpenCount(),
-    etHour: Number.isFinite(etHour) ? etHour : 0,
+    etHour: etHour(now),
     isMarketDay: isMarketDay(now),
   });
 

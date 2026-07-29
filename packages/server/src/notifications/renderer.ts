@@ -85,10 +85,16 @@ function fmtTimestamp(ts: number): string {
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
-      hour12: false,
+      // TRA-2498 — `hourCycle: 'h23'`, not `hour12: false`: the latter renders
+      // midnight as "24:00" on Node 20 (the prod runtime), so an email sent in
+      // the 00:00–00:59 ET hour was stamped "24:32 ET". Cosmetic-only here (no
+      // gate reads this), but it is the same defect.
+      hourCycle: 'h23',
     }).formatToParts(new Date(ts));
     const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
-    return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')} ET`;
+    // Belt-and-braces for any ICU that still emits h24 despite the option.
+    const hour = get('hour') === '24' ? '00' : get('hour');
+    return `${get('year')}-${get('month')}-${get('day')} ${hour}:${get('minute')} ET`;
   } catch {
     return new Date(ts).toISOString();
   }
