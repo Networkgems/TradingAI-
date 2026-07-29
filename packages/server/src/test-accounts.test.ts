@@ -9,15 +9,37 @@ import {
 // TRA-1475 — the QA/test-account classifier drives the firm-wide DESK de-noise.
 
 describe('isTestAccount — built-in patterns', () => {
-  it('flags qa*, ctoverify*, monitor_qa (case-insensitive)', () => {
-    for (const name of ['qa', 'qa1', 'qaVerify', 'QA_bot', 'ctoverify', 'ctoverify_2', 'monitor_qa', 'MONITOR_QA']) {
+  it('flags qa*, ctoverify*, monitor_qa, qtverify* (case-insensitive)', () => {
+    for (const name of ['qa', 'qa1', 'qaVerify', 'QA_bot', 'ctoverify', 'ctoverify_2', 'monitor_qa', 'MONITOR_QA', 'qtverify', 'QtVerify_2']) {
       expect(isTestAccount(name), name).toBe(true);
+    }
+  });
+
+  // TRA-2488 — one case per KNOWN fixture-name family, each a real prod name.
+  // When a loop invents a new prefix, add its family here; a fixture book whose
+  // name matches no family silently enters the firm-wide DESK number (that is
+  // exactly how `qtverify_*` slipped in — `qt`, not `qa`, and signed up on
+  // `@example.com` so the TRA-1949 email rule missed it too).
+  it('covers every known fixture-name family', () => {
+    const families: Record<string, string> = {
+      qa_reg: 'qa_reg_1751234567',
+      qa_tra: 'qa_tra1475_1783821169',
+      qa_mirror: 'qa_mirror_1578_38096',
+      ctoverify: 'ctoverify_qa_tra2406b',
+      monitor_qa: 'monitor_qa',
+      qtverify: 'qtverify_1785048357', // TRA-2488 — QuantTrader verification fleet
+    };
+    for (const [family, name] of Object.entries(families)) {
+      expect(isTestAccount(name), `${family} → ${name}`).toBe(true);
+      // and the email must NOT be what saves it — classify on the username alone
+      expect(isTestAccount(name, {}, `${name}@example.com`), `${family} on @example.com`).toBe(true);
     }
   });
 
   it('keeps real books that merely CONTAIN a pattern substring', () => {
     // anchored at the start, so these are NOT test accounts
-    for (const name of ['aqua', 'monitorly', 'richard', 'enock', 'my_qa_notes', 'acme']) {
+    // `qtrader` — `^qtverify` must not swallow every `qt*` book (TRA-2488)
+    for (const name of ['aqua', 'monitorly', 'richard', 'enock', 'my_qa_notes', 'acme', 'qtrader', 'my_qtverify']) {
       expect(isTestAccount(name), name).toBe(false);
     }
   });

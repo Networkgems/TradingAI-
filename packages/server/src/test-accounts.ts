@@ -37,6 +37,9 @@ const BUILTIN_TEST_PATTERNS: readonly RegExp[] = [
   /^qa/i, // qa, qa1, qaverify, …
   /^ctoverify/i, // ctoverify, ctoverify_2, …
   /^monitor_qa/i, // the autonomous-loop monitor book
+  // TRA-2488 — the QuantTrader verification fleet (`qtverify_<epoch>`, signed up
+  // on `@example.com` so neither `^qa` nor the TRA-1949 email rule catches it).
+  /^qtverify/i,
 ];
 
 /** Parse the env prefix list into a lowercased, de-blanked array. */
