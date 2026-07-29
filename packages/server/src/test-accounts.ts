@@ -40,7 +40,62 @@ const BUILTIN_TEST_PATTERNS: readonly RegExp[] = [
   // TRA-2488 — the QuantTrader verification fleet (`qtverify_<epoch>`, signed up
   // on `@example.com` so neither `^qa` nor the TRA-1949 email rule catches it).
   /^qtverify/i,
+  // TRA-2524 — three more fixture books were measured INSIDE the board-facing
+  // desk fold (6 books visible, 3 of them throwaway verification accounts). Each
+  // named itself after the thing it was verifying rather than after a QA prefix,
+  // so nothing above reached it. Anchored, and each requires a DIGIT so a real
+  // book called `ceo`, `qt`, or `tra` is untouched.
+  /^tra\d/i, // ticket-numbered verification book — `tra2339v66f17374`
+  /^(ceo|cto|cfo|qt|leaddev)\d/i, // agent-role + ticket number — `ceo2251v130001`
+  /^qtprobe/i, // the QuantTrader probe fleet — `qtprobe3` (`qtprobe`, not `qtverify`)
 ];
+
+/**
+ * TRA-2524 — the ALLOWLIST half, and the reason this module now has one.
+ *
+ * {@link BUILTIN_TEST_PATTERNS} is a denylist of naming conventions, extended
+ * reactively one ticket at a time (TRA-1475 → TRA-1949 → TRA-2488 → TRA-2524).
+ * Every verification-book naming scheme nobody has seen yet is in the firm-wide
+ * DESK number BY DEFAULT, and the failure is silent: a fixture book contributes
+ * P&L that reads as ordinary desk P&L. Adding patterns fixes the instance; it
+ * does not make the NEXT one visible.
+ *
+ * These are the operator/live books on bqb1 — a short, stable, known set
+ * (measured 2026-07-29 against live `9e1b1123`, which reported exactly 6 books
+ * in the fold: these three plus the three fixtures the patterns above now
+ * catch). Compared trimmed + lowercased.
+ *
+ * This list does NOT gate the fold — widening the desk filter to an allowlist is
+ * a separate, larger change (TRA-2524 option 2, explicitly NOT taken here). It
+ * feeds {@link unrecognisedDeskBooks}, which only OBSERVES.
+ */
+export const KNOWN_DESK_BOOKS: readonly string[] = ['admin', 'richard', 'enock'];
+
+/**
+ * TRA-2524 — the missing instrument. Returns the usernames sitting in the
+ * board-facing DESK fold that are neither classified test books nor on
+ * {@link KNOWN_DESK_BOOKS}: i.e. books whose P&L is being counted as desk P&L
+ * and which NOBODY has vouched for. Empty is the healthy state; non-empty means
+ * a book joined the fold and wants classifying, one way or the other.
+ *
+ * ⚠ Classifies on USERNAME ONLY — deliberately, and not as an oversight. The
+ * TRA-1949 email arm participates in NO P&L path: every board-facing call site
+ * (`excludeTestAccountRows` here, `option-spread-cost.ts` fixture/desk
+ * partition, `health-routes.ts:2346`) passes username alone, and `email` is
+ * optional. A book the email arm would catch is therefore STILL in the desk
+ * number, so this instrument must report it. Classifying it here on the email
+ * would hide exactly the case the instrument exists to surface.
+ */
+export function unrecognisedDeskBooks(
+  usernames: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const known = new Set(KNOWN_DESK_BOOKS.map((n) => n.trim().toLowerCase()));
+  return usernames
+    .filter((u) => typeof u === 'string' && u.trim().length > 0)
+    .filter((u) => !isTestAccount(u, env))
+    .filter((u) => !known.has(u.trim().toLowerCase()));
+}
 
 /** Parse the env prefix list into a lowercased, de-blanked array. */
 function extraPrefixes(env: NodeJS.ProcessEnv): string[] {

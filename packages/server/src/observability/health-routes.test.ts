@@ -710,6 +710,106 @@ describe('TRA-898 demo-book summary', () => {
     expect(bodyAll.books.filter(b => b.role === 'test')).toHaveLength(2);
   });
 
+  // TRA-2524 — the fold instrument, pinned AT THE ROUTE. The unit test in
+  // `test-accounts.test.ts` proves the predicate; this proves the board-facing
+  // payload actually carries it, so re-inlining a local count here goes red.
+  it('TRA-2524 counts books in the DESK fold that are neither test nor vouched for', async () => {
+    const { app, routes } = fakeApp();
+    const prev = process.env['LIVE_EQUITY_BOOT_USER'];
+    process.env['LIVE_EQUITY_BOOT_USER'] = 'admin';
+    try {
+      registerLiveHealthRoutes(app, {
+        requireAuth: (() => undefined) as never,
+        userCtx: async () => {
+          throw new Error('userCtx must not run on the public path');
+        },
+        getSettings: () => settings(),
+        // The live 2026-07-29 fold on `9e1b1123` — 3 real books + the 3 fixtures
+        // this ticket found — plus one book using a scheme nobody has seen.
+        demoBooks: () => [
+          { username: 'admin', state: demoState(), mode: 'live' },
+          { username: 'Richard', state: demoState(), mode: 'demo' },
+          { username: 'enock', state: demoState(), mode: 'demo' },
+          { username: 'ceo2251v130001', state: demoState(), mode: 'demo' },
+          { username: 'qtprobe3', state: demoState(), mode: 'demo' },
+          { username: 'tra2339v66f17374', state: demoState(), mode: 'demo' },
+          { username: 'someNewFixtureScheme_42', state: demoState(), mode: 'demo' },
+        ],
+        now: () => NOW,
+      });
+      const handler = routes.get('/api/health/demo-book-public')![0]!;
+
+      const res = resWithLocals();
+      await handler({ query: {} }, res);
+      const body = res.body as {
+        demoEngineCount: number;
+        hiddenTestBookCount: number;
+        unrecognisedDeskBookCount: number;
+        deskRosterNote: string | null;
+      };
+      // THE POSITIVE MARK — a non-zero reading, asserted before any zero below
+      // is allowed to mean anything. The 3 fixtures are now CLASSIFIED (hidden),
+      // so the only book left unvouched is the unknown scheme.
+      expect(body.hiddenTestBookCount).toBe(3);
+      expect(body.demoEngineCount).toBe(4); // admin + 3 real/unknown
+      expect(body.unrecognisedDeskBookCount).toBe(1);
+      expect(body.deskRosterNote).toContain('1 book');
+      expect(body.deskRosterNote).toContain('TRA-2524');
+
+      // ?includeTest=1 is a DEBUGGING view; it must not be able to change the
+      // answer to "which books are in the desk fold?".
+      const resAll = resWithLocals();
+      await handler({ query: { includeTest: '1' } }, resAll);
+      expect((resAll.body as { unrecognisedDeskBookCount: number }).unrecognisedDeskBookCount).toBe(1);
+
+      // Names never reach this NO-AUTH surface — the count is the alarm.
+      expect(JSON.stringify(res.body)).not.toContain('someNewFixtureScheme_42');
+    } finally {
+      if (prev === undefined) delete process.env['LIVE_EQUITY_BOOT_USER'];
+      else process.env['LIVE_EQUITY_BOOT_USER'] = prev;
+    }
+  });
+
+  it('TRA-2524 reads 0 on the live fold once the three fixtures are classified', async () => {
+    const { app, routes } = fakeApp();
+    const prev = process.env['LIVE_EQUITY_BOOT_USER'];
+    process.env['LIVE_EQUITY_BOOT_USER'] = 'admin';
+    try {
+      registerLiveHealthRoutes(app, {
+        requireAuth: (() => undefined) as never,
+        userCtx: async () => {
+          throw new Error('userCtx must not run on the public path');
+        },
+        getSettings: () => settings(),
+        demoBooks: () => [
+          { username: 'admin', state: demoState(), mode: 'live' },
+          { username: 'Richard', state: demoState(), mode: 'demo' },
+          { username: 'enock', state: demoState(), mode: 'demo' },
+          { username: 'ceo2251v130001', state: demoState(), mode: 'demo' },
+          { username: 'qtprobe3', state: demoState(), mode: 'demo' },
+          { username: 'tra2339v66f17374', state: demoState(), mode: 'demo' },
+        ],
+        now: () => NOW,
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = res.body as {
+        demoEngineCount: number;
+        hiddenTestBookCount: number;
+        unrecognisedDeskBookCount: number;
+        deskRosterNote: string | null;
+      };
+      // The whole point of the ticket: 6 books in, 3 of them fixtures.
+      expect(body.hiddenTestBookCount).toBe(3);
+      expect(body.demoEngineCount).toBe(3);
+      expect(body.unrecognisedDeskBookCount).toBe(0);
+      expect(body.deskRosterNote).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env['LIVE_EQUITY_BOOT_USER'];
+      else process.env['LIVE_EQUITY_BOOT_USER'] = prev;
+    }
+  });
+
   it('TRA-1949 labels the LIVE_EQUITY_BOOT_USER operator book distinctly and never hides it', async () => {
     const { app, routes } = fakeApp();
     const prev = process.env['LIVE_EQUITY_BOOT_USER'];

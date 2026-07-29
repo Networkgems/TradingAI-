@@ -11,7 +11,7 @@ import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
-import { isTestAccount } from '../test-accounts.js'; // TRA-1949
+import { isTestAccount, unrecognisedDeskBooks } from '../test-accounts.js'; // TRA-1949, TRA-2524
 import {
   applyModelFacingBasis,
   MODEL_FACING_JOURNAL_BASIS,
@@ -567,6 +567,22 @@ export interface DemoBookPublicReport {
   /** Human note when test books were hidden, else null. */
   testBookNote: string | null;
   /**
+   * TRA-2524 — books sitting in the board-facing DESK fold that are neither
+   * classified test books nor on `KNOWN_DESK_BOOKS`. THE POINT of this field is
+   * that `BUILTIN_TEST_PATTERNS` is a denylist: an unrecognised fixture book
+   * contributes P&L that reads as ordinary desk P&L, and until now nothing
+   * anywhere said "a book you have never vouched for joined the fold". 0 is the
+   * healthy state. Non-zero ⇒ classify it (add a pattern, or add it to the
+   * roster) — do not let it accrue into a board number first.
+   *
+   * Count only, never names: this route is NO-AUTH and anonymizes identity by
+   * design (see the TRA-901 note above). The count is the alarm; the names come
+   * from the admin surface once you go looking.
+   */
+  unrecognisedDeskBookCount: number;
+  /** Human note when `unrecognisedDeskBookCount > 0`, else null. */
+  deskRosterNote: string | null;
+  /**
    * Each book carries a `role` so the board can tell the live/broker operator
    * book (`admin`, `LIVE_EQUITY_BOOT_USER`) apart from true demo peers, and —
    * when `?includeTest=1` — from QA/test books. Labels stay anonymized.
@@ -601,6 +617,16 @@ export function summarizeDemoBooksPublic(
     test: !isLiveBrokerOperator(e.username, env) && isTestAccount(e.username, env, e.email),
   }));
   const hiddenCount = includeTest ? 0 : classified.filter(c => c.test).length;
+  // TRA-2524 — computed over the SAME classification, and independently of
+  // `includeTest`: the question "which books are in the desk fold?" has one
+  // answer, and a debugging query string must not be able to change it.
+  // The operator book is exempt — it is named by `LIVE_EQUITY_BOOT_USER`, i.e.
+  // vouched for by an explicit deliberate config act, which is the opposite of
+  // the silent drift this counts.
+  const unrecognisedDesk = unrecognisedDeskBooks(
+    classified.filter(c => !c.operator && !c.test).map(c => c.e.username),
+    env,
+  );
   const visible = includeTest ? classified : classified.filter(c => !c.test);
   let demoIdx = 0;
   let opIdx = 0;
@@ -631,6 +657,13 @@ export function summarizeDemoBooksPublic(
     testBookNote: hiddenCount > 0
       ? `${hiddenCount} QA/test book${hiddenCount === 1 ? '' : 's'} hidden `
         + `(pass ?includeTest=1 to show)`
+      : null,
+    unrecognisedDeskBookCount: unrecognisedDesk.length,
+    deskRosterNote: unrecognisedDesk.length > 0
+      ? `${unrecognisedDesk.length} book${unrecognisedDesk.length === 1 ? '' : 's'} in the `
+        + `board-facing DESK fold ${unrecognisedDesk.length === 1 ? 'is' : 'are'} on neither the `
+        + `test-account patterns nor KNOWN_DESK_BOOKS — ${unrecognisedDesk.length === 1 ? 'its' : 'their'} `
+        + `P&L is being counted as desk P&L unvouched (TRA-2524)`
       : null,
     books,
   };
