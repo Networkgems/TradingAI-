@@ -25,6 +25,10 @@ const HOST = process.env.TRA2511_HOST ?? 'https://tradingai-bqb1.onrender.com';
 const USER = process.argv[2];
 const PASS = 'Qa2511pass!';
 const MARK_SYMBOL = 'ZVZZT';
+const MARK_EQUITY = 31337;
+const MARK_LIMIT = 7;
+const MARK_KEY = 'FAKE-KEY-tra2511-arm1-do-not-use';   // obvious sentinel, never a real secret
+const MARK_ACCT = 'FAKE-ACCT-tra2511-arm1';
 const BACKUP_INTERVAL_MS = 30 * 60_000;
 
 async function api(path, { method = 'GET', token, body } = {}) {
@@ -55,7 +59,13 @@ async function main() {
 
   // ── Wait for a rotation boundary to pass, so the fixture is actually in
   // `backups/`. Rotations run at boot + every 30 min.
-  if (Number.isFinite(bootedAt)) {
+  //
+  // TRA2511_NO_WAIT=1 skips the wait for a fixture that has ALREADY outlived a
+  // rotation (e.g. a re-run after a harness fault). This does not weaken the arm:
+  // the teeth are enforced downstream by the receipt's own
+  // `backupGenerationsWithData > 0`, which is measured, not assumed. The wait is
+  // only a convenience for getting a fresh fixture over that line.
+  if (Number.isFinite(bootedAt) && process.env.TRA2511_NO_WAIT !== '1') {
     const elapsed = Date.now() - bootedAt;
     const nextBoundary = bootedAt + Math.ceil(elapsed / BACKUP_INTERVAL_MS) * BACKUP_INTERVAL_MS;
     const waitMs = nextBoundary - Date.now() + 45_000; // +45s slack for the sweep to finish
@@ -73,19 +83,61 @@ async function main() {
   }
   const token = login.json.token;
 
-  // Mark the book so "clean afterwards" is a discriminating claim, not a tautology.
+  // ── Mark the book so "clean afterwards" is a discriminating claim, not a
+  // tautology. TWO INDEPENDENT CHANNELS, because they are cleared by different
+  // code and their DISAGREEMENT is the finding:
+  //
+  //   tree     — `users/<name>/`, what `wipeAccountData` removes.
+  //   settings — the `account_settings` SQLite row, keyed by the raw username.
+  //
+  // A single-channel version of this script asserted `equity === 25000` against a
+  // fixture still sitting at the 25000 DEFAULT — vacuous, since a fresh book and a
+  // fully-leaked one both read 25000. Both marks are read back and gated below.
   await api('/api/watchlist/stocks', { method: 'POST', token, body: { symbol: MARK_SYMBOL } });
   const wlBefore = await api('/api/watchlist/stocks', { token });
   const marked = (wlBefore.json?.added ?? []).includes(MARK_SYMBOL);
-  console.log(`\npredecessor marked: watchlist.added=${JSON.stringify(wlBefore.json?.added)}`);
-  if (!marked) { console.log('HARNESS FAULT: fingerprint did not take'); process.exit(2); }
+  console.log(`\npredecessor marked (tree): watchlist.added=${JSON.stringify(wlBefore.json?.added)}`);
+  if (!marked) { console.log('HARNESS FAULT: tree fingerprint did not take'); process.exit(2); }
+
+  // `demoEquityStocks` is set EXPLICITLY: the PUT handler defaults it to its own
+  // current value, and the engine seeds from `demoEquityStocks ?? demoEquity`
+  // (`signal-engine.ts:3246`), so marking `demoEquity` alone silently does nothing.
+  await api('/api/account/settings', {
+    method: 'PUT', token,
+    body: {
+      demoEquity: MARK_EQUITY, demoEquityStocks: MARK_EQUITY, dailyTradesLimit: MARK_LIMIT,
+      liveApiKeyStocks: MARK_KEY, liveAccountIdStocks: MARK_ACCT,
+    },
+  });
+  await api('/api/account/reset-demo', { method: 'POST', token, body: { market: 'stocks' } });
+  const setBefore = (await api('/api/account/settings', { token })).json;
+  const sB = setBefore?.settings ?? setBefore;
+  const eqBefore = (await api('/api/state', { token })).json?.account?.totalEquity;
+  console.log(`predecessor marked (settings): demoEquityStocks=${sB?.demoEquityStocks} dailyTradesLimit=${sB?.dailyTradesLimit} liveApiKeyStocks=${JSON.stringify(sB?.liveApiKeyStocks)} totalEquity=${eqBefore}`);
+  if (sB?.demoEquityStocks !== MARK_EQUITY || sB?.dailyTradesLimit !== MARK_LIMIT
+      || sB?.liveApiKeyStocks !== MARK_KEY || eqBefore !== MARK_EQUITY) {
+    console.log('HARNESS FAULT: settings fingerprint did not fully take — refusing to grade a channel whose teeth I cannot show');
+    process.exit(2);
+  }
 
   // ── Self-delete. The receipt is the instrument.
-  const del = await api('/api/account', { method: 'DELETE', token });
+  // `DELETE /api/account` is irreversible, so a bare token is NOT enough — the
+  // route re-checks the password (`index.ts:6033`) and 400s without one. Omitting
+  // it cost this arm a full 30-min rotation wait on the first run.
+  const del = await api('/api/account', { method: 'DELETE', token, body: { password: PASS } });
   console.log(`\nDELETE /api/account → http=${del.status}`);
   console.log(JSON.stringify(del.json, null, 1));
   const receipt = del.json?.receipt ?? del.json;
   const gens = receipt?.backupGenerationsWithData;
+
+  // A 400/401/429 here is the HARNESS failing to ask correctly — a missing or
+  // wrong password, or the shared login throttle — NOT the product failing to
+  // delete. Grading those as a product red would file a bug against working code.
+  if (del.status === 400 || del.status === 401 || del.status === 429) {
+    console.log(`\nHARNESS FAULT: the delete request was rejected before any wipe ran (http=${del.status}).`);
+    console.log('Nothing was destroyed and the fixture is still marked — fix the request and re-run.');
+    process.exit(2);
+  }
   if (del.status !== 200 || receipt?.ok !== true) { console.log('RED: self-delete did not succeed'); process.exit(1); }
 
   if (!(typeof gens === 'number' && gens > 0)) {
@@ -108,25 +160,43 @@ async function main() {
   const wl = await api('/api/watchlist/stocks', { token: t2 });
   const added = wl.json?.added ?? [];
 
-  const checks = [
+  const setAfter = (await api('/api/account/settings', { token: t2 })).json;
+  const sA = setAfter?.settings ?? setAfter;
+
+  // Reported as TWO channels. They are cleared by different code, so collapsing
+  // them into one number would hide exactly the asymmetry this arm exists to find.
+  const treeChecks = [
     ['token revoked on delete', afterTok.status === 401, `http=${afterTok.status}`],
-    ['equity is fresh 25000', st.json?.account?.totalEquity === 25000, `equity=${st.json?.account?.totalEquity}`],
     ['0 open positions', st.json?.account?.openPositions?.length === 0, `n=${st.json?.account?.openPositions?.length}`],
     ['0 closed positions', st.json?.closedPositions?.length === 0, `n=${st.json?.closedPositions?.length}`],
     ['0 open options', st.json?.options?.openOptions?.length === 0, `n=${st.json?.options?.openOptions?.length}`],
     [`predecessor ${MARK_SYMBOL} not adopted`, !added.includes(MARK_SYMBOL), `added=${JSON.stringify(added)}`],
   ];
-  console.log('');
-  let red = 0;
-  for (const [name, ok, detail] of checks) {
-    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name} — ${detail}`);
-    if (!ok) red++;
-  }
+  const settingsChecks = [
+    ['demoEquityStocks reset to default', sA?.demoEquityStocks !== MARK_EQUITY, `value=${sA?.demoEquityStocks} (mark=${MARK_EQUITY})`],
+    ['dailyTradesLimit reset to default', sA?.dailyTradesLimit !== MARK_LIMIT, `value=${sA?.dailyTradesLimit} (mark=${MARK_LIMIT})`],
+    ['liveApiKeyStocks not inherited', sA?.liveApiKeyStocks !== MARK_KEY, `value=${JSON.stringify(sA?.liveApiKeyStocks)}`],
+    ['liveAccountIdStocks not inherited', sA?.liveAccountIdStocks !== MARK_ACCT, `value=${JSON.stringify(sA?.liveAccountIdStocks)}`],
+    ['totalEquity is fresh 25000', st.json?.account?.totalEquity === 25000, `equity=${st.json?.account?.totalEquity} (mark=${MARK_EQUITY})`],
+  ];
+
+  const run = (label, checks) => {
+    console.log(`\n── ${label}`);
+    let bad = 0;
+    for (const [name, ok, detail] of checks) {
+      console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name} — ${detail}`);
+      if (!ok) bad++;
+    }
+    return bad;
+  };
+  const treeRed = run('TREE channel — users/<name>/, what wipeAccountData removes (TRA-2410/TRA-2421 scope)', treeChecks);
+  const setRed = run('SETTINGS channel — account_settings SQLite row, keyed by raw username (TRA-2520 scope)', settingsChecks);
 
   console.log('\n' + '='.repeat(68));
-  console.log(red ? `ARM 1 RED — ${red} failed` : 'ARM 1 GREEN — self-delete freed the name cleanly, with teeth.');
+  console.log(treeRed ? `TREE     RED — ${treeRed} failed` : 'TREE     GREEN — self-delete freed the name cleanly, with teeth.');
+  console.log(setRed ? `SETTINGS RED — ${setRed} failed — the row survived a self-delete` : 'SETTINGS GREEN — the settings row did not survive.');
   console.log(`fixture ${USER} left registered; delete it when done.`);
-  process.exit(red ? 1 : 0);
+  process.exit(treeRed + setRed ? 1 : 0);
 }
 
 main().catch((e) => { console.log(`HARNESS FAULT: ${e?.message ?? e}`); process.exit(2); });
