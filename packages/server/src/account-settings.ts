@@ -370,6 +370,161 @@ export function clearSettingsCache(username: string): void {
   cache.delete(username);
 }
 
+// ─── TRA-2520 — the settings row is a RECYCLABLE-KEY channel ────────────────
+//
+// `account_settings` is keyed by the RAW USERNAME (see the table DDL above), and
+// a username is a recyclable primary key (TRA-2410). Everything else that account
+// owns lives under `users/<username>/`, so `retireOrphanedBook` frees the name by
+// MOVING that directory — but a directory move cannot touch a database row. The
+// row therefore survives every path that frees a name, and the next holder of the
+// name loads it: `GET /api/account/settings` returns `loadSettings(username)`
+// UNREDACTED, so the successor reads the predecessor's saved broker keys in
+// cleartext. Measured live on bqb1 (TRA-2511 arm 2).
+//
+// Two exports, deliberately split, because the ordering is load-bearing in the
+// same way the tombstone's is: the caller ARCHIVES the row (redacted) into the
+// quarantined tree FIRST and only then drops it. Fusing them into one
+// "retireSettingsRow" would mean the destroy had already happened by the time the
+// archive write could fail — and this module's contract is retain, not destroy.
+
+/**
+ * Every persisted field that carries a BROKER CREDENTIAL.
+ *
+ * ⚠️ NOT `LiveCredentialField` (`@trading-app/shared`). That type is the set of
+ * creds the live-trading PREFLIGHT can report as *missing*, which excludes
+ * `liveApiKeyStocks` / `liveAccountIdStocks` entirely — and those are two of the
+ * four fields the TRA-2511 probe actually measured leaking. Redacting by that
+ * type would have shipped a fix that reads as complete and still hands over the
+ * stocks keys. This list is the PERSISTENCE view: anything a saved blob can hold.
+ *
+ * Includes the pre-split legacy fields (`liveApiKey` / `liveApiSecret` /
+ * `liveAccountId`, TRA-165) and the pre-env-split options pair
+ * (`liveApiKeyOptions` / `liveAccountIdOptions`) — a blob written before those
+ * migrations still has values in them, and a retiring account is exactly the kind
+ * of old blob that never got loaded (and so never got migrated) since.
+ *
+ * `account-settings.test.ts` pins this against the `AccountSettings` declaration
+ * itself, so a new credential field added to the shared type fails the suite
+ * rather than silently escaping retirement.
+ */
+export const PERSISTED_CREDENTIAL_FIELDS: ReadonlyArray<keyof AccountSettings> = [
+  // legacy, pre-market-split (TRA-165)
+  'liveApiKey',
+  'liveApiSecret',
+  'liveAccountId',
+  // stocks — NOT in LiveCredentialField, and the pair that leaked
+  'liveApiKeyStocks',
+  'liveAccountIdStocks',
+  // crypto
+  'liveApiKeyCrypto',
+  'liveApiSecretCrypto',
+  // options, pre-env-split
+  'liveApiKeyOptions',
+  'liveAccountIdOptions',
+  // options, per-env
+  'liveApiKeyOptionsSandbox',
+  'liveAccountIdOptionsSandbox',
+  'liveApiKeyOptionsProduction',
+  'liveAccountIdOptionsProduction',
+];
+
+/**
+ * Blank every credential field, reporting which ones actually held something.
+ *
+ * Blank (`''`) rather than `delete`: the archived blob keeps its shape, so an
+ * operator restoring it by hand gets a settings object the loader accepts, with
+ * the credentials visibly emptied rather than mysteriously absent.
+ *
+ * Returns NAMES only. The values are the thing we are here to contain.
+ */
+export function redactPersistedCredentials(input: Partial<AccountSettings>): {
+  settings: Partial<AccountSettings>;
+  cleared: string[];
+} {
+  const settings: Partial<AccountSettings> = { ...input };
+  const cleared: string[] = [];
+  for (const field of PERSISTED_CREDENTIAL_FIELDS) {
+    const raw = settings[field];
+    if (typeof raw === 'string' && raw.trim() !== '') cleared.push(String(field));
+    if (raw !== undefined) (settings as Record<string, unknown>)[String(field)] = '';
+  }
+  return { settings, cleared };
+}
+
+export interface PersistedSettingsRow {
+  /** A durable row exists under this exact username. */
+  found: boolean;
+  /**
+   * `'unavailable'` means the durable store is off (TRA-1681 fail-soft), NOT that
+   * the row is clean. In that mode settings live in
+   * `users/<name>/account-settings.json`, which the tree move already carries —
+   * so there is nothing extra to retire, and `found: false` is the honest answer.
+   */
+  storage: 'sqlite' | 'unavailable';
+  /** The persisted blob EXACTLY as stored, credentials blanked. Null when absent. */
+  redacted: Partial<AccountSettings> | null;
+  /** Names of the credential fields that held a non-blank value. Never the values. */
+  credentialFieldsCleared: string[];
+}
+
+/**
+ * Read the durable settings row for retirement WITHOUT mutating anything.
+ *
+ * Deliberately does NOT merge `DEFAULT_ACCOUNT_SETTINGS` — the archive should be
+ * what was actually persisted, not what the loader would have synthesised on top
+ * of it. Merging would also make an empty row indistinguishable from a full one
+ * in the archived file.
+ *
+ * Throws on a genuine db error so the caller can record it; a throw here is NOT a
+ * leak in itself, because the same SELECT is what `loadSettingsViaDb` runs — a db
+ * that cannot answer it cannot serve the row to the successor either, and
+ * `loadSettings` falls through to the JSON file that moved with the tree.
+ */
+export function readSettingsRowForRetirement(username: string): PersistedSettingsRow {
+  const db = settingsDb();
+  if (!db) {
+    return { found: false, storage: 'unavailable', redacted: null, credentialFieldsCleared: [] };
+  }
+  const row = db.prepare('SELECT settings_json FROM account_settings WHERE username = ?').get(username) as
+    | { settings_json: string }
+    | undefined;
+  if (!row) {
+    return { found: false, storage: 'sqlite', redacted: null, credentialFieldsCleared: [] };
+  }
+  const parsed = JSON.parse(row.settings_json) as Partial<AccountSettings>;
+  const { settings, cleared } = redactPersistedCredentials(parsed);
+  return { found: true, storage: 'sqlite', redacted: settings, credentialFieldsCleared: cleared };
+}
+
+/**
+ * Drop the durable settings row and the in-memory copy of it.
+ *
+ * `verified` is read back with a fresh SELECT rather than trusting the DELETE's
+ * own `changes` count, because the failure this closes is "the row is still
+ * servable" — which is a question about the STORE, not about the statement we
+ * just ran. The caller gates on `verified`.
+ *
+ * The cache drop is unconditional and happens even when the delete fails: the
+ * in-memory map is a third copy of the same leak (`getSettings` serves it
+ * directly), and dropping it can never destroy anything persisted.
+ */
+export function deleteSettingsRow(username: string): { deleted: boolean; verified: boolean } {
+  const db = settingsDb();
+  if (!db) {
+    clearSettingsCache(username);
+    return { deleted: false, verified: true };
+  }
+  try {
+    db.prepare('DELETE FROM account_settings WHERE username = ?').run(username);
+    const still = db.prepare('SELECT 1 AS present FROM account_settings WHERE username = ?').get(username);
+    const verified = still === undefined || still === null;
+    if (verified) log.info('TRA-2520: retired account_settings row for a recycled username', { username });
+    return { deleted: true, verified };
+  } finally {
+    clearSettingsCache(username);
+  }
+}
+
 /**
  * TRA-346 — clamp the Managed Account Ratio for one of the four scoped
  * (mode × dashboard) buckets. The route handler invokes this once per bucket

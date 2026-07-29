@@ -46,6 +46,13 @@
 //     per-user tree entirely (`account`-stamped rows), so no file move touches it.
 //  3. `reset-tokens.json` — an outstanding password-reset code for the old holder
 //     is a live route onto whoever holds the name next.
+//  4. TRA-2520 — the `account_settings` SQLITE ROW, keyed by the raw username. A
+//     DIRECTORY MOVE CANNOT TOUCH A DATABASE ROW. This is the channel that bit:
+//     the first run to exercise this guard against a REAL orphan (TRA-2511 arm 2,
+//     live on bqb1) found the successor inheriting the predecessor's row whole —
+//     `demoEquity`, `dailyTradesLimit`, and the saved BROKER CREDENTIALS, served
+//     back UNREDACTED by `GET /api/account/settings`. Nothing anywhere deleted a
+//     settings row; `clearSettingsCache` drops only the in-memory copy.
 //
 // (1) and (2) are closed by the TOMBSTONE, not by the move: `tryRestoreFromBackup`
 // refuses any generation stamped before the epoch, and `journalRowsForBook` scopes
@@ -53,14 +60,26 @@
 // recorded FIRST and why the epoch is the moment the orphan was FOUND — dying
 // half way through leaves the guards armed against the leftovers, which is the
 // failure direction that can only produce a red.
+//
+// (4) is closed by a DELETE, because there is no epoch a row read can consult —
+// so it follows the same retain-then-free order the tree does: the row is archived
+// into the quarantined book as `account-settings-row.json` (with the credential
+// fields BLANKED — see `PERSISTED_CREDENTIAL_FIELDS`) and only then dropped. A
+// failed archive REFUSES the retirement rather than proceeding to the delete.
 
-import { rename, cp, rm, readdir, stat } from 'fs/promises';
+import { rename, cp, rm, readdir, stat, mkdir, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { resolveDataDir } from './data-dir.js';
 import { recordAccountTombstone, accountDeletedAt } from './deleted-accounts.js';
 import { revokeResetTokensFor } from './auth.js';
 import { forgetTwoFactorState } from './two-factor.js';
+import {
+  readSettingsRowForRetirement,
+  deleteSettingsRow,
+  clearSettingsCache,
+  type PersistedSettingsRow,
+} from './account-settings.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'orphaned-books' });
@@ -72,6 +91,16 @@ const log = logger.child({ module: 'orphaned-books' });
  * restore path a copy under the live key.
  */
 export const ORPHANED_BOOKS_DIRNAME = 'orphaned-books';
+
+/**
+ * TRA-2520 — where the retired `account_settings` ROW is archived, inside the
+ * quarantined book.
+ *
+ * Deliberately NOT `account-settings.json`: that name is the LEGACY per-user file
+ * (`account-settings.ts`), which moves with the tree and would be overwritten
+ * here. This module destroys nothing, including the thing it is replacing.
+ */
+export const RETIRED_SETTINGS_FILENAME = 'account-settings-row.json';
 
 /**
  * What a retirement actually did.
@@ -100,6 +129,19 @@ export interface OrphanRetirementReceipt {
   quarantinedTo: string | null;
   resetTokensRevoked: number;
   twoFactorStateCleared: number;
+  /**
+   * TRA-2520 — a durable `account_settings` row existed under this username. It is
+   * an ORPHAN SIGNAL in its own right, not just a cleanup step: a book whose tree
+   * AND backups are gone (an operator's `rm -rf`) can still leave this row, and
+   * the credentials in it, for the next holder.
+   */
+  settingsRowFound: boolean;
+  /** The row was archived AND is verified gone from the store. */
+  settingsRowRetired: boolean;
+  /** How many credential fields held a non-blank value. Names go to the log only. */
+  settingsCredentialFieldsCleared: number;
+  /** Relative path of the archived row under DATA_DIR, or null. */
+  settingsQuarantinedTo: string | null;
   /** Operator-only strings; may name absolute paths. Never put these on the wire. */
   errors: string[];
   /**
@@ -160,9 +202,10 @@ function stampOf(ms: number): string {
  * between the two.
  *
  * Idempotent and cheap: for a name nobody has ever used it stats one directory,
- * lists the backup root, and returns `orphanFound: false` having written nothing.
- * It must stay that way — a tombstone recorded for an innocent name would scope
- * that account's own journal rows out of its own calendar.
+ * lists the backup root, runs one indexed SELECT, and returns `orphanFound: false`
+ * having written nothing to disk. It must stay that way — a tombstone recorded for
+ * an innocent name would scope that account's own journal rows out of its own
+ * calendar.
  */
 export async function retireOrphanedBook(
   username: string,
@@ -178,20 +221,55 @@ export async function retireOrphanedBook(
     if (await generationHasUser(generation, username)) backupGenerationsWithData += 1;
   }
 
+  // TRA-2520 — the fourth channel, probed BEFORE the receipt is shaped because it
+  // is one of the things that decides `orphanFound`.
+  //
+  // A throw here is recorded, not fatal, and does NOT force `orphanFound`. Failing
+  // closed on it would 503 every genuinely-new signup for the duration of a db
+  // fault, and it would buy nothing: the SELECT that throws here is the same one
+  // `loadSettingsViaDb` runs, so a store that cannot answer it cannot serve the row
+  // to the successor either — it falls through to the JSON file, which moved with
+  // the tree. The error still lands in `errors`, so if any OTHER channel finds an
+  // orphan this retirement refuses.
+  let settingsRow: PersistedSettingsRow = {
+    found: false,
+    storage: 'unavailable',
+    redacted: null,
+    credentialFieldsCleared: [],
+  };
+  try {
+    settingsRow = readSettingsRowForRetirement(username);
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    errors.push(`settings-probe: ${reason}`);
+    log.error('orphaned-books: could not probe the account_settings row', { username, reason });
+  }
+
   const receipt: OrphanRetirementReceipt = {
     username,
-    orphanFound: primaryDirExisted || backupGenerationsWithData > 0,
+    orphanFound: primaryDirExisted || backupGenerationsWithData > 0 || settingsRow.found,
     primaryDirExisted,
     backupGenerationsWithData,
     retiredAt: null,
     quarantinedTo: null,
     resetTokensRevoked: 0,
     twoFactorStateCleared: 0,
+    settingsRowFound: settingsRow.found,
+    settingsRowRetired: false,
+    settingsCredentialFieldsCleared: 0,
+    settingsQuarantinedTo: null,
     errors,
     ok: true,
   };
 
-  if (!receipt.orphanFound) return receipt;
+  if (!receipt.orphanFound) {
+    // Drop any in-memory settings copy even on the no-op path. `getSettings` serves
+    // that map directly, so a name someone merely LOADED once is a leak with no row
+    // and no directory behind it. A Map delete cannot destroy anything persisted,
+    // so this keeps the "a never-used name is left byte-for-byte alone" contract.
+    clearSettingsCache(username);
+    return receipt;
+  }
 
   // 1. Tombstone FIRST — this is what closes the backup-restore and journal
   //    channels, and it must survive a crash in step 2.
@@ -246,6 +324,60 @@ export async function retireOrphanedBook(
     errors.push(`two-factor: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // 4. TRA-2520 — the `account_settings` row. Archive, THEN drop; a failed archive
+  //    must not reach the delete, because retaining the book is this module's whole
+  //    contract. And a failed DROP must not pass: the row is the credential.
+  //
+  //    The archive lands inside the quarantined book directory even when there was
+  //    no primary tree to move (`primaryDirExisted: false`) — the row is data, and
+  //    it needs somewhere to be retained. `quarantinedTo` stays null in that case
+  //    because no TREE was quarantined; `settingsQuarantinedTo` is the honest field.
+  if (settingsRow.found) {
+    const bookDirRel = join(ORPHANED_BOOKS_DIRNAME, `${username}@${stampOf(retiredAt)}`);
+    const archiveRel = join(bookDirRel, RETIRED_SETTINGS_FILENAME);
+    let archived = false;
+    try {
+      await mkdir(join(dataDir, bookDirRel), { recursive: true });
+      await writeFile(
+        join(dataDir, archiveRel),
+        JSON.stringify(
+          {
+            note:
+              'TRA-2520 — the retired account_settings row for a recycled username. ' +
+              'Broker credential fields are BLANKED: a retired book\'s saved keys are a live ' +
+              'credential, not just state, so the restore path deliberately does not carry them.',
+            username,
+            retiredAt,
+            credentialFieldsCleared: settingsRow.credentialFieldsCleared,
+            settings: settingsRow.redacted,
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+      archived = true;
+      receipt.settingsQuarantinedTo = archiveRel;
+    } catch (err: unknown) {
+      errors.push(`settings-archive:${archiveRel}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (archived) {
+      try {
+        const dropped = deleteSettingsRow(username);
+        receipt.settingsRowRetired = dropped.deleted && dropped.verified;
+        receipt.settingsCredentialFieldsCleared = settingsRow.credentialFieldsCleared.length;
+        if (!receipt.settingsRowRetired) {
+          errors.push('settings-row: still readable back after DELETE');
+        }
+      } catch (err: unknown) {
+        errors.push(`settings-row: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+  // The in-memory copy is a third channel and outlives both of the above.
+  clearSettingsCache(username);
+
   // The verdict measures the WORLD, not the steps: the live key must be clear on
   // disk, and the epoch must come back through `accountDeletedAt` — the same
   // accessor `tryRestoreFromBackup` and `journalRowsForBook` read. Asserting the
@@ -254,7 +386,21 @@ export async function retireOrphanedBook(
   const liveKeyClear = !existsSync(primaryDir);
   const epochArmed = accountDeletedAt(username, dataDir) === retiredAt;
   if (!epochArmed) errors.push('tombstone: epoch not readable back after write');
-  receipt.ok = liveKeyClear && epochArmed && errors.length === 0;
+  // TRA-2520 — same rule for the fourth channel: ask the STORE whether the row is
+  // servable, not the delete statement whether it ran. A fresh probe is the only
+  // answer that discriminates "dropped" from "dropped and re-created by a racing
+  // `saveSettings`", and it is the exact read the successor's `loadSettings` does.
+  let settingsChannelClear = true;
+  try {
+    settingsChannelClear = !readSettingsRowForRetirement(username).found;
+  } catch (err: unknown) {
+    // Unreadable ⇒ NOT provably clear. This branch is reachable only after the
+    // probe above succeeded, so a db that just started failing is a real anomaly.
+    settingsChannelClear = false;
+    errors.push(`settings-verify: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!settingsChannelClear) errors.push('settings-row: present after retirement');
+  receipt.ok = liveKeyClear && epochArmed && settingsChannelClear && errors.length === 0;
 
   log[receipt.ok ? 'info' : 'error']('orphaned-books: retirement complete', { ...receipt });
   return receipt;

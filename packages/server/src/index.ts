@@ -5933,6 +5933,11 @@ app.post('/api/auth/signup', async (req, res) => {
         primaryDirExisted: retirement.primaryDirExisted,
         backupGenerationsWithData: retirement.backupGenerationsWithData,
         retiredAt: retirement.retiredAt,
+        // TRA-2520 — the fourth channel. A row found here with NO primary directory
+        // and NO backup generation is the case the other three cannot see at all.
+        settingsRowFound: retirement.settingsRowFound,
+        settingsRowRetired: retirement.settingsRowRetired,
+        settingsCredentialFieldsCleared: retirement.settingsCredentialFieldsCleared,
       });
     }
   }
@@ -6230,8 +6235,23 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     // TRA-2410 — say so when a predecessor's book was moved aside, and say WHERE.
     // The admin is the only party who can undo it, and a silent retirement reads
     // exactly like a name that was never used before.
+    // TRA-2520 — the settings ROW is reported alongside the tree, because it is the
+    // channel whose retirement is otherwise INVISIBLE: the tree can be inspected on
+    // the wire (the successor's watchlist/positions come back empty), but "the row
+    // was dropped" and "there was never a row" produce identical `GET
+    // /api/account/settings` output. This admin response is the only place a grader
+    // can tell a guard that fired from a disk that was already clean.
     ...(retiredOrphan?.orphanFound
-      ? { retiredOrphanedBook: { quarantinedTo: retiredOrphan.quarantinedTo, retiredAt: retiredOrphan.retiredAt } }
+      ? {
+          retiredOrphanedBook: {
+            quarantinedTo: retiredOrphan.quarantinedTo,
+            retiredAt: retiredOrphan.retiredAt,
+            settingsRowFound: retiredOrphan.settingsRowFound,
+            settingsRowRetired: retiredOrphan.settingsRowRetired,
+            settingsCredentialFieldsCleared: retiredOrphan.settingsCredentialFieldsCleared,
+            settingsQuarantinedTo: retiredOrphan.settingsQuarantinedTo,
+          },
+        }
       : {}),
   });
 });
