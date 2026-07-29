@@ -52,7 +52,7 @@ import { readdir, rm, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { resolveDataDir } from './data-dir.js';
-import { recordAccountTombstone } from './deleted-accounts.js';
+import { recordAccountTombstone, type TombstoneVia } from './deleted-accounts.js';
 import { revokeResetTokensFor } from './auth.js';
 import { forgetTwoFactorState } from './two-factor.js';
 import { logger } from './observability/index.js';
@@ -291,7 +291,7 @@ async function generationHasUser(generation: string, username: string): Promise<
  */
 export async function wipeAccountData(
   username: string,
-  opts: { dataDir?: string; now?: number; via?: 'self' | 'admin' } = {},
+  opts: { dataDir?: string; now?: number; via?: TombstoneVia } = {},
 ): Promise<AccountWipeReceipt> {
   const dataDir = opts.dataDir ?? resolveDataDir();
   const errors: string[] = [];

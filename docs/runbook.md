@@ -621,6 +621,44 @@ If automatic restore is not enough (e.g. you need an older point in time):
 > `$DATA_DIR` (or the latest `backups/<ts>/`) off-box periodically — currently a
 > manual step; an off-box backup is a known gap.
 
+### Restoring a **deleted** user (TRA-2410)
+
+A username is the primary key for every per-user store, so re-registering a name
+is an *adoption* unless something stops it. Two things now do:
+
+- `$DATA_DIR/deleted-accounts.json` — the tombstone file. It records, per
+  username, the ms-epoch at which that identity ended. `tryRestoreFromBackup`
+  refuses any generation stamped **before** that epoch, and the demo-calendar fold
+  scopes the shared option journal to rows opened at or after it. **Keep this file
+  with the data it describes**: restoring a `$DATA_DIR` *without* it brings back
+  the user trees and silently re-arms the adoption bug. It is mirrored into every
+  backup generation for exactly this reason.
+- `$DATA_DIR/orphaned-books/<username>@<stamp>/` — where a book is parked when
+  someone registers a name that still has data on disk. Nothing is deleted; the
+  tree is moved off the live key.
+
+So:
+
+- **Restoring a user's data to the SAME account** (the ordinary corruption case,
+  step 3 above) is unaffected — copying the primary files back works, because the
+  tombstone guard only governs the *automatic* restore of a **missing** primary.
+- **Re-creating a user that an admin deleted** (`DELETE /api/admin/users/:username`
+  retains the files by design, TRA-142) must say so explicitly:
+
+  ```bash
+  curl -X POST .../api/admin/users -H 'Authorization: Bearer <admin>' \
+    -d '{"username":"...","email":"...","password":"...","adoptExistingBook":true}'
+  ```
+
+  Without `adoptExistingBook`, the create succeeds with a **fresh** book and the
+  response carries `retiredOrphanedBook.quarantinedTo` naming where the old one
+  went. That is recoverable — move it back under `users/<username>/`, delete the
+  name's row from `deleted-accounts.json`, and restart.
+- `POST /api/auth/signup` never adopts. A `503 Could not prepare a clean account`
+  from signup means the retirement failed (permissions on `$DATA_DIR`); the
+  registration is refused rather than handing the caller someone else's positions.
+  Check the `orphaned-books: retirement complete` log line for `errors`.
+
 ## 4. Scaling guide
 
 ### Current limits

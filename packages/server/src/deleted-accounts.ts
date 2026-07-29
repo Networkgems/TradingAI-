@@ -45,13 +45,29 @@ const log = logger.child({ module: 'deleted-accounts' });
 /** Root-level file name. Also mirrored into every backup (see `rotateBackups`). */
 export const DELETED_ACCOUNTS_FILENAME = 'deleted-accounts.json';
 
+/**
+ * How the identity ended.
+ *
+ *  • `self`     — the user deleted their own account in Settings (TRA-2421).
+ *  • `admin`    — `DELETE /api/admin/users/:username`. The files are deliberately
+ *                 RETAINED (TRA-142), so the tombstone is the only thing standing
+ *                 between the leftovers and the next holder of the name.
+ *  • `recycled` — TRA-2410. Nobody recorded a deletion at all: a book was found
+ *                 sitting under a username that the credential store says is FREE,
+ *                 at the moment someone registered it. That is an orphan by
+ *                 definition, and the epoch is when we found it, not when it died —
+ *                 which is the honest value, and errs toward scoping MORE of the
+ *                 predecessor's data out of the new account, never less.
+ */
+export type TombstoneVia = 'self' | 'admin' | 'recycled';
+
 export interface AccountTombstone {
   /** The exact username string that was destroyed (case-sensitive, as stored). */
   username: string;
   /** ms-epoch the deletion was recorded. */
   deletedAt: number;
-  /** How the account went away — self-serve (TRA-2421) or an admin action. */
-  via: 'self' | 'admin';
+  /** How the account went away. */
+  via: TombstoneVia;
 }
 
 function tombstoneFile(dataDir: string): string {
@@ -131,7 +147,7 @@ export function readTombstones(dataDir: string = resolveDataDir()): AccountTombs
  */
 export function recordAccountTombstone(
   username: string,
-  opts: { deletedAt?: number; via?: 'self' | 'admin'; dataDir?: string } = {},
+  opts: { deletedAt?: number; via?: TombstoneVia; dataDir?: string } = {},
 ): AccountTombstone {
   const dataDir = opts.dataDir ?? resolveDataDir();
   const entry: AccountTombstone = {

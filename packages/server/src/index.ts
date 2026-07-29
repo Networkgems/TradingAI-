@@ -43,7 +43,10 @@ import {
 // tombstone that keeps a recycled username from inheriting the previous holder's
 // shared-journal rows.
 import { wipeAccountData, refuseSelfDelete, performSelfDelete, redactWipeReceipt } from './account-deletion.js';
-import { accountDeletedAt } from './deleted-accounts.js';
+import { accountDeletedAt, recordAccountTombstone } from './deleted-accounts.js';
+// TRA-2410 — the ADOPTION side of the same hazard: registering a name whose book
+// is still on disk hands the new account the previous holder's positions.
+import { retireOrphanedBook } from './orphaned-books.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
@@ -217,7 +220,7 @@ import {
   liveBackfillWriteWindow,
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
-import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore } from './auth.js';
+import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
 import {
   initTwoFactorStore,
   issueChallenge,
@@ -5852,13 +5855,50 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(409).json({ error: 'Username is not available' });
     return;
   }
+  // TRA-2410 — a username is a RECYCLABLE key. If the credential store says this
+  // name is free but a book is still sitting under it (an admin delete retains the
+  // files by design; so does an operator editing `users.json`; so does every book
+  // orphaned before TRA-2421 shipped), then `createUserContext` would adopt that
+  // directory and `loadStocksTradeSnapshot` would rehydrate the previous holder's
+  // positions into this account. Retire it FIRST — after `createUser` there is a
+  // window where a request on the brand-new token can build the context and adopt
+  // the book before we get here.
+  //
+  // This runs only when the name is genuinely free; a live collision is left to
+  // `createUser` to reject, so a failed signup can never disturb a live book.
+  if (!getUser(username.trim())) {
+    const retirement = await retireOrphanedBook(username.trim());
+    if (!retirement.ok) {
+      // Fail CLOSED. Creating the account anyway is exactly the reported bug:
+      // the user opens onto someone else's positions.
+      log.error('signup: refusing registration — could not retire an orphaned book', {
+        username: username.trim(),
+        errors: retirement.errors,
+      });
+      res.status(503).json({ error: 'Could not prepare a clean account. Please try again shortly.' });
+      return;
+    }
+    if (retirement.orphanFound) {
+      log.warn('signup: retired an orphaned book before registering the name', {
+        username: username.trim(),
+        primaryDirExisted: retirement.primaryDirExisted,
+        backupGenerationsWithData: retirement.backupGenerationsWithData,
+        retiredAt: retirement.retiredAt,
+      });
+    }
+  }
   const result = await createUser(username.trim(), email.trim(), password);
   if (result.error) {
     res.status(409).json({ error: result.error });
     return;
   }
-  // TRA-142 — spin up the new user's per-user context (fresh equity, empty
-  // trade history, default settings) so their engine starts ticking right away.
+  // TRA-142 — spin up the new user's per-user context (fresh equity, empty trade
+  // history, default settings) so their engine starts ticking right away.
+  //
+  // TRA-2410 — that promise is now ENFORCED rather than assumed: the guard above
+  // clears the live key and records the identity epoch, so the three channels that
+  // could refill this book (the directory, the 24 backup generations, the shared
+  // option journal) all resolve to empty for a name that was reused.
   await provisionUser(username.trim());
   // TRA-2251 — welcome email, best-effort. Fire-and-forget: a mail failure (or
   // unconfigured SMTP) must never block account creation, so we do not await it
@@ -6073,11 +6113,12 @@ app.get('/api/admin/users', requireAuth, requireAdmin, (_req, res) => {
 });
 
 app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
-  const { username, email, password, role } = req.body as {
+  const { username, email, password, role, adoptExistingBook } = req.body as {
     username?: string;
     email?: string;
     password?: string;
     role?: 'admin' | 'user';
+    adoptExistingBook?: boolean;
   };
   if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string') {
     res.status(400).json({ error: 'username, email, and password are required' });
@@ -6087,6 +6128,28 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     res.status(400).json({ error: 'Password must be at least 6 characters' });
     return;
   }
+  // TRA-2410 — same guard as signup, with the ONE deliberate exception.
+  //
+  // TRA-142 leaves an admin-deleted user's files on disk "so an admin can restore
+  // them", and the restore has always been implicit: re-create the name and the
+  // book comes back. That is the same mechanism as the reported bug — the only
+  // difference is intent — so intent is now stated instead of inferred.
+  // `adoptExistingBook: true` performs the TRA-142 restore; the default does not,
+  // because "create a user" reading as "hand them whatever was here before" is
+  // precisely what TRA-2406 escalated. Either way nothing is destroyed: a retired
+  // book is moved to `orphaned-books/`, so a mistaken default is recoverable.
+  let retiredOrphan: Awaited<ReturnType<typeof retireOrphanedBook>> | null = null;
+  if (adoptExistingBook !== true && !getUser(username)) {
+    retiredOrphan = await retireOrphanedBook(username);
+    if (!retiredOrphan.ok) {
+      log.error('admin: refusing to create user — could not retire an orphaned book', {
+        username,
+        errors: retiredOrphan.errors,
+      });
+      res.status(503).json({ error: 'Could not prepare a clean account. Please try again shortly.' });
+      return;
+    }
+  }
   const result = await createUser(username, email, password, role ?? 'user');
   if (result.error) {
     res.status(409).json({ error: result.error });
@@ -6094,7 +6157,16 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   }
   // TRA-142 — admin-created users also get an isolated context.
   await provisionUser(username);
-  res.status(201).json({ ok: true, user: result.user });
+  res.status(201).json({
+    ok: true,
+    user: result.user,
+    // TRA-2410 — say so when a predecessor's book was moved aside, and say WHERE.
+    // The admin is the only party who can undo it, and a silent retirement reads
+    // exactly like a name that was never used before.
+    ...(retiredOrphan?.orphanFound
+      ? { retiredOrphanedBook: { quarantinedTo: retiredOrphan.quarantinedTo, retiredAt: retiredOrphan.retiredAt } }
+      : {}),
+  });
 });
 
 app.patch('/api/admin/users/:username', requireAuth, requireAdmin, async (req, res) => {
@@ -6122,9 +6194,29 @@ app.delete('/api/admin/users/:username', requireAuth, requireAdmin, async (req, 
   }
   // TRA-142 — stop the deleted user's engines and forget their caches. Their
   // on-disk state is left intact under DATA_DIR/users/<username>/ so an admin
-  // can restore them if needed.
+  // can restore them if needed (re-create the name with `adoptExistingBook: true`).
   destroyUserContext(username);
-  res.json({ ok: true });
+  // TRA-2410 — record the identity epoch NOW, while we know it exactly. Retaining
+  // the files is the point of this route, so the tombstone is the only thing
+  // separating them from the next holder of the name: it is what makes
+  // `tryRestoreFromBackup` refuse the 24 retained generations and what scopes the
+  // shared option journal. The re-signup guard would derive an epoch later, but it
+  // would be the moment the orphan was FOUND — this one is the moment it was made.
+  //
+  // Best-effort: a tombstone that cannot be written must not fail the delete (the
+  // credential row is already gone), and the re-signup guard is the second line.
+  try {
+    recordAccountTombstone(username, { via: 'admin' });
+  } catch (err: unknown) {
+    log.error('admin: user deleted but tombstone not recorded', {
+      username,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // An outstanding reset code for a deleted name is a live route onto whoever
+  // registers it next — the same reasoning as `wipeAccountData` step 4.
+  const resetTokensRevoked = revokeResetTokensFor(username);
+  res.json({ ok: true, resetTokensRevoked });
 });
 
 // TRA-217 — admin sets a user's password directly (no current-password check).
