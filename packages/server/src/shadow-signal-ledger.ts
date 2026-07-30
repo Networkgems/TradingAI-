@@ -1,10 +1,10 @@
 import { appendFile, readFile, mkdir, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { Candle, Side } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-791 — durable SupertrendConfluence SHADOW signal -> outcome ledger.
 //
@@ -27,10 +27,8 @@ import { etDateKey } from './options-chain-recorder.js';
 
 const log = logger.child({ module: 'supertrend-shadow' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'shadow-signals.jsonl');
 }
 

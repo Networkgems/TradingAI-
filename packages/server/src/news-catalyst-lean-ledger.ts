@@ -1,11 +1,11 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { DirectionalLean, LeanBand, LeanStructure, LeanVerdict } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import type { NameLeanInput } from './news-catalyst-lean.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1632 (TRA-1623A, parent TRA-1630/TRA-1623) — durable, flag-gated SHADOW
 // ledger for the D2 calls-vs-puts directional lean.
@@ -29,8 +29,6 @@ import type { NameLeanInput } from './news-catalyst-lean.js';
 // exit: it is observe-only, $0 live — the same class as the D1 ledger it parallels.
 
 const log = logger.child({ module: 'news-catalyst-lean-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** The driver components that fed the resolved lean (persisted for attribution). */
 export interface CatalystLeanDrivers {
@@ -67,7 +65,7 @@ export interface CatalystLeanRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'news-catalyst-lean.jsonl');
 }
 

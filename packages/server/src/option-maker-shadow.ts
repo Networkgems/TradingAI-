@@ -1,10 +1,10 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
 import { buildWalkLimits, derivePricingPath } from './tradier-smart-open.js';
 import type { MakerWalkConfig } from './option-maker-config.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1662 (TRA-1600 A2) — SHADOW maker-chase measurement. Observe-only.
 //
@@ -73,8 +73,6 @@ import type { MakerWalkConfig } from './option-maker-config.js';
 // quotes and writes a ledger. No live capital is touched, no board gate applies.
 
 const log = logger.child({ module: 'option-maker-shadow' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** Kill switch — no shadow chase is opened or recorded unless this is truthy. OFF by default. */
 export const OPTION_MAKER_SHADOW_FLAG = 'ENABLE_OPTION_MAKER_SHADOW';
@@ -477,7 +475,7 @@ export function advanceShadowChase(
 // ─────────────────────────────────────────────────────────────────────────────
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'option-maker-shadow.jsonl');
 }
 

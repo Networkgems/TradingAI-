@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { Candle } from '@trading-app/shared';
 import type { CandlePattern, ReversalChecklist } from '@trading-app/engine';
 import { logger } from './observability/index.js';
@@ -11,6 +10,7 @@ import {
   type ShadowResolution,
   type ShadowSignalRecord,
 } from './shadow-signal-ledger.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-921 (TRA-920 B) — durable, OBSERVE-ONLY reversal-checklist signal->outcome
 // ledger.
@@ -35,8 +35,6 @@ import {
 
 const log = logger.child({ module: 'reversal-shadow' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 /**
  * Kill switch. The pipeline appends nothing unless this is truthy, so the shadow
  * capture is OFF by default and a deploy can't start writing without an explicit
@@ -51,7 +49,7 @@ export function isReversalShadowEnabled(env: NodeJS.ProcessEnv = process.env): b
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'reversal-shadow-signals.jsonl');
 }
 

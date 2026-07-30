@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   selectShadowOptionSignal,
   type ShadowOptionSignal,
@@ -11,6 +10,7 @@ import {
 } from '@trading-app/engine';
 import type { OptionLeg } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-911 (TRA-908 Phase A) — flag-gated SHADOW option-trade signal ledger.
 //
@@ -30,8 +30,6 @@ import { logger } from './observability/index.js';
 // dataset and its TRA-840 re-baseline.
 
 const log = logger.child({ module: 'option-shadow-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase-A kill switch. The selector emits nothing unless this is truthy, so the
@@ -190,7 +188,7 @@ export function shadowSignalToSpreadParams(
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'option-shadow-signals.jsonl');
 }
 

@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   settleWeeklyPcs,
   WEEKLY_PCS_DEFAULTS,
@@ -10,6 +9,7 @@ import {
 import type { PromotionTradeSample } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1618 (parent TRA-1614) — durable, flag-gated SHADOW ledger for the weekly
 // QQQ put-credit-spread forward test.
@@ -37,8 +37,6 @@ import { etDateKey } from './options-chain-recorder.js';
 // passed and freezes the realized R.
 
 const log = logger.child({ module: 'pcs-shadow-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase-1 kill switch. Off by default so a deploy can't start writing PCS shadow
@@ -137,7 +135,7 @@ export interface PcsShadowRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'pcs-shadow-signals.jsonl');
 }
 

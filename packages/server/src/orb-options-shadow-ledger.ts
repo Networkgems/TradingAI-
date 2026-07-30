@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   evaluateOrbOptions,
   DEFAULT_ORB_OPTIONS_PARAMS,
@@ -12,6 +11,7 @@ import {
 } from '@trading-app/engine';
 import { getEasternUtcOffset, type Candle, type OptionType } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-2173 (parent TRA-2172) — flag-gated SHADOW ledger for the ORB-for-options
 // engine core (`packages/engine/src/options/orb-options.ts`).
@@ -32,8 +32,6 @@ import { logger } from './observability/index.js';
 // clean.
 
 const log = logger.child({ module: 'orb-options-shadow-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Kill switch. The seam emits nothing unless this is truthy, so the shadow
@@ -86,7 +84,7 @@ export interface OrbOptionsShadowRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'orb-options-shadow-signals.jsonl');
 }
 

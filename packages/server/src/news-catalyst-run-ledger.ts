@@ -1,9 +1,9 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-2064 (parent TRA-1630, TRA-1623A) — durable RUN ledger for the
 // news-catalyst premarket writer.
@@ -35,8 +35,6 @@ import { etDateKey } from './options-chain-recorder.js';
 // exit — it records what the writer did and when.
 
 const log = logger.child({ module: 'news-catalyst-run-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** Terminal disposition of one `buildNewsCatalystPicks` invocation. */
 export type CatalystRunOutcome =
@@ -83,7 +81,7 @@ export interface CatalystRunRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'news-catalyst-runs.jsonl');
 }
 

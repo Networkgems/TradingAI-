@@ -1,8 +1,8 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1601 (TRA-1600 deliverable A/telemetry) — the maker-fill TELEMETRY ledger.
 //
@@ -24,8 +24,6 @@ import { logger } from './observability/index.js';
 // smart-open / smart-close walk already did.
 
 const log = logger.child({ module: 'option-maker-fill-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /** Kill switch — the ledger writes nothing unless this is truthy. OFF by default. */
 export const OPTION_MAKER_TELEMETRY_FLAG = 'ENABLE_OPTION_MAKER_TELEMETRY';
@@ -74,7 +72,7 @@ export interface MakerFillEvent {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'option-maker-fills.jsonl');
 }
 

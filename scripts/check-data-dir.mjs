@@ -103,9 +103,16 @@ const R = {
 };
 
 /**
- * FROZEN BASELINE — measured at bb7cdc4 + the TRA-2603 conversion.
+ * FROZEN BASELINE — ratcheting to zero under TRA-2428's migration child, TRA-2604.
  *
- * 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads.
+ * Now: 46 hits / 29 files = 23 unguarded copies + 6 comment-only + 17 report-reads.
+ * Was: 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads
+ *      (measured at bb7cdc4 + the TRA-2603 conversion).
+ *
+ * TRA-2604 batch 1 (`2823259`+) converted the 15 append-only shadow/signal ledgers.
+ * The comment-only and report-read counts are INVARIANT under that migration — only
+ * `copies` moves. If one of those two ever moves, something other than a conversion
+ * happened and the diff deserves a second look.
  *
  * `copies` is the number of UNGUARDED RESOLVER COPIES the file is known to still
  * carry. `exempt` names every non-defect hit by exact trimmed text.
@@ -124,30 +131,15 @@ const BASELINE = {
   'hypothesis-pipeline.ts': { copies: 1 },
   'iv-rank-store.ts': { copies: 1 },
   'learned-weights-history.ts': { copies: 1 },
-  'live-canary-ledger.ts': { copies: 1 },
   'macro-store.ts': { copies: 1 },
   'market-review-enrichment.ts': { copies: 1 },
   'market-review.ts': { copies: 1 },
-  'news-catalyst-lean-ledger.ts': { copies: 1 },
-  'news-catalyst-ledger.ts': { copies: 1 },
-  'news-catalyst-run-ledger.ts': { copies: 1 },
-  'oi-shadow-ledger.ts': { copies: 1 },
-  'option-maker-fill-ledger.ts': { copies: 1 },
-  'option-maker-shadow.ts': { copies: 1 },
-  'option-shadow-ledger.ts': { copies: 1 },
   'option-trade-journal.ts': { copies: 1 },
   'options-forward-test.ts': { copies: 1 },
   'options-idea-journal.ts': { copies: 1 },
-  'orb-options-shadow-ledger.ts': { copies: 1 },
-  'pcr-shadow-ledger.ts': { copies: 1 },
-  'pcs-shadow-ledger.ts': { copies: 1 },
-  'pre-trade-gate-ledger.ts': { copies: 1 },
-  'pre-trade-liquidity-ledger.ts': { copies: 1 },
   'promotion-store.ts': { copies: 1 },
   'research-store.ts': { copies: 1 },
-  'reversal-shadow-ledger.ts': { copies: 1 },
   'routines/routine-store.ts': { copies: 1 },
-  'shadow-signal-ledger.ts': { copies: 1 },
   'user-context.ts': { copies: 1 },
   'user-trading-memory-store.ts': { copies: 1 },
   'users.ts': { copies: 1 },
@@ -157,7 +149,10 @@ const BASELINE = {
   'index.ts': {
     copies: 1, // :694 — the main server bundle's own root
     exempt: [
-      { text: "dataDirEnv: process.env['DATA_DIR'] ?? null,", count: 1, reason: R.REPORT },
+      // TRA-2599 (`2823259`) turned this from a value into a thunk when the storage
+      // diagnostic moved behind `requireAdmin`. Still a report-read — the ratchet
+      // caught the reflow and demanded this hand edit, which is the design.
+      { text: "dataDirEnv: () => process.env['DATA_DIR'] ?? null,", count: 1, reason: R.REPORT },
     ],
   },
 

@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   evaluateLiquidityGate,
   DEFAULT_LIQUIDITY_GATE_CONFIG,
@@ -12,6 +11,7 @@ import {
   type LiquidityGateResult,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1967 — SHADOW-FIRST ledger for the pre-trade LIQUIDITY gate.
 //
@@ -39,8 +39,6 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'pre-trade-liquidity-ledger' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 /**
  * Kill switch. The pipeline appends nothing unless this is truthy, so the gate is
  * OFF by default and a deploy can't start writing (let alone downsizing a live
@@ -55,7 +53,7 @@ export function isPreTradeLiquidityEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'pre-trade-liquidity-decisions.jsonl');
 }
 

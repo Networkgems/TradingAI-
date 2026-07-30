@@ -1,10 +1,10 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { CatalystScoreComponents } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1629 (TRA-1623A, parent TRA-1623) — durable, flag-gated SHADOW ledger for
 // the news-catalyst watchlist source.
@@ -27,8 +27,6 @@ import { etDateKey } from './options-chain-recorder.js';
 // and PCR-shadow ledgers.
 
 const log = logger.child({ module: 'news-catalyst-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase-1 kill switch. OFF by default so a deploy can't start discovering /
@@ -90,7 +88,7 @@ export interface CatalystShadowRecord extends CatalystObservationInput {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'news-catalyst-signals.jsonl');
 }
 

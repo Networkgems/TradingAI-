@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   evaluateCanaryGuards,
   applyGuardEvaluation,
@@ -16,6 +15,7 @@ import {
 } from '@trading-app/engine';
 import { sizeFromStopViaRiskManager } from './account-sizing.js';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-2051 — server seam for the live-canary staging harness. The pure guard
 // logic + state machine live in the engine (packages/engine/src/live-canary.ts);
@@ -39,8 +39,6 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'live-canary-ledger' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 /**
  * Kill switch. Nothing here mutates state or writes unless this is truthy, so the
  * canary is OFF by default and a deploy cannot start a live canary without an
@@ -55,7 +53,7 @@ export function isLiveCanaryEnabled(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'live-canary-state.jsonl');
 }
 

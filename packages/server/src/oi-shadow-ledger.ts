@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   classifyOiQuadrant,
   type OiTotals,
@@ -12,6 +11,7 @@ import {
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import type { PcrTrioVerdict } from './pcr-shadow-ledger.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1610 (parent TRA-1607) — durable, flag-gated SHADOW Open-Interest-trend
 // ledger.
@@ -40,8 +40,6 @@ import type { PcrTrioVerdict } from './pcr-shadow-ledger.js';
 // value isn't over-weighted.
 
 const log = logger.child({ module: 'oi-shadow-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase-1 kill switch. Off by default so a deploy can't start writing OI shadow
@@ -119,7 +117,7 @@ export interface OiShadowRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'oi-shadow-signals.jsonl');
 }
 

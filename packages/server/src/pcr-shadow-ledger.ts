@@ -1,10 +1,10 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { pcrZScore, type PutCallRatio, type PcrRegime, type PcrContrarian } from '@trading-app/engine';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-1609 (parent TRA-1607) — durable, flag-gated SHADOW Put-Call-Ratio ledger.
 //
@@ -29,8 +29,6 @@ import { etDateKey } from './options-chain-recorder.js';
 // per-day dedup (TRA-911).
 
 const log = logger.child({ module: 'pcr-shadow-ledger' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase-1 kill switch. Off by default so a deploy can't start writing PCR shadow
@@ -119,7 +117,7 @@ export interface PcrShadowRecord {
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'pcr-shadow-signals.jsonl');
 }
 
