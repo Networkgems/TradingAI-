@@ -7241,3 +7241,97 @@ describe('TRA-2269 — the WIRING: stampExitPass routes each interval to the rig
     expect(h.rth.closedIntervals).toBe(0);
   });
 });
+
+/**
+ * TRA-2610 — the PRODUCER half of the fix, tested where the erasure happened.
+ *
+ * `applyQuotes` has two loops. The first stamps quoted symbols; the second stamps
+ * `'unavailable'` on every symbol that failed to quote, CARRYING THE PREVIOUS TICK'S
+ * price / change / changePct FORWARD. While plausibility and freshness shared one
+ * `quoteStatus` field, that second loop destroyed the `'suspect'` verdict while
+ * republishing the fabricated numbers that earned it — so the guard was least
+ * reliable on exactly the thin, sporadically-quoted names it existed to catch.
+ *
+ * FGMC on the live 2026-07-29 tape: `price 8.30`, `changePct +110.66`
+ * (`implausible_move_ratio`, ratio 2.107 vs a threshold of 2), last successful fetch
+ * 6,241 s earlier. Flagged on the tick it printed, demoted on the next, and #1 in the
+ * shipped EOD report.
+ */
+describe('SignalEngine — a suspect move survives a failed fetch (TRA-2610)', () => {
+  type QuoteRow = { price: number; volume: number; change: number; changePct: number };
+  const quotes = (rows: Record<string, QuoteRow>) => new Map(Object.entries(rows));
+  // `applyQuotes` is private; this is a deliberate white-box call, because the defect
+  // IS the interaction between its two loops and nothing public exposes that seam.
+  const applyQuotes = (engine: SignalEngine, q: Map<string, QuoteRow>, active: string[]) =>
+    (engine as unknown as { applyQuotes(qq: unknown, a: string[]): Map<string, number> })
+      .applyQuotes(q, active);
+  const rowFor = (engine: SignalEngine, symbol: string) =>
+    engine.getState().symbols.find(s => s.symbol === symbol);
+
+  // `change` derived from the published price/changePct (implied prev close 3.94)
+  // so the fixture reproduces the live ratio of 2.107, not a nearby invented one.
+  const FGMC_QUOTE = { price: 8.30, volume: 12_000, change: 4.36, changePct: 110.66 };
+  const AAPL_QUOTE = { price: 338.11, volume: 40_000_000, change: 5.71, changePct: 1.72 };
+
+  it('stamps the verdict on moveSuspect, NOT on quoteStatus', () => {
+    const engine = new SignalEngine();
+    applyQuotes(engine, quotes({ FGMC: FGMC_QUOTE }), ['FGMC']);
+    const row = rowFor(engine, 'FGMC');
+    expect(row?.moveSuspect).toBe(true);
+    // Freshness is a separate fact and this quote SUCCEEDED, so it is 'ok'. The old
+    // code wrote 'suspect' here, which is what made the two facts collide.
+    expect(row?.quoteStatus).toBe('ok');
+  });
+
+  it('KEEPS moveSuspect when the next fetch fails and re-stamps unavailable', () => {
+    // The regression. Tick 1 quotes FGMC; tick 2 fails to and carries its numbers
+    // forward. Pre-fix, the row came out of tick 2 as `quoteStatus:'unavailable'`
+    // with no surviving trace of the verdict.
+    const engine = new SignalEngine();
+    applyQuotes(engine, quotes({ FGMC: FGMC_QUOTE }), ['FGMC']);
+    applyQuotes(engine, quotes({}), ['FGMC']);
+
+    const row = rowFor(engine, 'FGMC');
+    expect(row?.quoteStatus).toBe('unavailable');
+    expect(row?.moveSuspect).toBe(true);
+    // …and it is still republishing the fabricated numbers, which is why the verdict
+    // has to survive rather than the row being quietly dropped (flag, never clamp).
+    expect(row?.changePct).toBe(110.66);
+    expect(row?.price).toBe(8.30);
+  });
+
+  it('KNOWN-GOOD control: a believable row that goes unavailable is NOT flagged', () => {
+    // Without this, "moveSuspect is true after a failed fetch" would also pass if the
+    // second loop stamped every stale row suspect — which would exclude 42% of the
+    // universe from the movers table on the tape this ticket was found on.
+    const engine = new SignalEngine();
+    applyQuotes(engine, quotes({ AAPL: AAPL_QUOTE }), ['AAPL']);
+    expect(rowFor(engine, 'AAPL')?.moveSuspect).toBe(false);
+    applyQuotes(engine, quotes({}), ['AAPL']);
+    const row = rowFor(engine, 'AAPL');
+    expect(row?.quoteStatus).toBe('unavailable');
+    expect(row?.moveSuspect).toBe(false);
+  });
+
+  it('clears the flag when a later quote is believable again', () => {
+    // A corporate-action artefact resolves once the provider adjusts its prev close.
+    // The verdict must not latch, or the row is condemned for the rest of the session.
+    const engine = new SignalEngine();
+    applyQuotes(engine, quotes({ FGMC: FGMC_QUOTE }), ['FGMC']);
+    applyQuotes(engine, quotes({ FGMC: { price: 8.30, volume: 12_000, change: 0.12, changePct: 1.47 } }), ['FGMC']);
+    const row = rowFor(engine, 'FGMC');
+    expect(row?.moveSuspect).toBe(false);
+    expect(row?.quoteStatus).toBe('ok');
+  });
+
+  it('flags a never-quoted symbol as neither suspect nor believable-by-omission', () => {
+    // A symbol with no prior state carries zeros; `price <= 0` is not the
+    // plausibility rule's jurisdiction (the no-quote statuses own it).
+    const engine = new SignalEngine();
+    applyQuotes(engine, quotes({}), ['NEVR']);
+    const row = rowFor(engine, 'NEVR');
+    expect(row?.quoteStatus).toBe('unavailable');
+    expect(row?.moveSuspect).toBe(false);
+    expect(row?.lastUpdated).toBe(0);
+  });
+});

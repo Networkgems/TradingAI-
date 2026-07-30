@@ -3,6 +3,7 @@
 // is typed against the shared `CryptoSymbolState` (its `quoteStatus` carries
 // the extra `'stale'` member from TRA-418) so the panels stay type-correct.
 import type { Position, CryptoSymbolState } from '@trading-app/shared';
+import { isCryptoMoveUnreliable } from './format';
 
 // TRA-339 — sortable column keys per Crypto dashboard table. Kept narrow
 // (string-literal unions) so the SortableTH component and the value resolver
@@ -22,10 +23,14 @@ export function getCryptoWatchSortValue(s: CryptoSymbolState, key: CryptoWatchSo
   if (s.lastUpdated === 0 && key !== 'symbol' && key !== 'updated') return null;
   // TRA-2379 — mirrors the stock resolver: never RANK a move the server flagged as
   // implausible. See getStockWatchSortValue. (The crypto feed does not currently
-  // stamp `'suspect'` — its 24h % is a provider field with no prev close to test —
+  // stamp the flag — its 24h % is a provider field with no prev close to test —
   // but the panel and this resolver are the same shared code, so the guard is here
   // and correct the moment that path ever does.)
-  if ((key === 'change' || key === 'changePct') && s.quoteStatus === 'suspect') return null;
+  // TRA-2610 — reads the dedicated `moveSuspect` field (a failed fetch stamping
+  // `quoteStatus:'unavailable'` used to erase the verdict) and, unlike the stock
+  // resolver, deliberately does NOT execute the ratio rule — see
+  // `isCryptoMoveUnreliable` for why that asymmetry is correct.
+  if ((key === 'change' || key === 'changePct') && isCryptoMoveUnreliable(s)) return null;
   switch (key) {
     case 'symbol': return s.symbol;
     case 'price': return s.price;

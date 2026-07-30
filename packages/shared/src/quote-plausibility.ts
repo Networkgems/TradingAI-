@@ -145,6 +145,56 @@ export function isQuoteMoveSuspect(q: QuotePlausibilityInput): boolean {
 }
 
 /**
+ * A published symbol row, as far as the plausibility question is concerned.
+ *
+ * TRA-2610 — `moveSuspect` is a field of its OWN, orthogonal to `quoteStatus`.
+ * That separation is the whole fix: `quoteStatus` answers *can we see this symbol*
+ * (`ok` / `rate_limited` / `unavailable` / `stale`) and `moveSuspect` answers *do we
+ * believe its session move*. They were one field, so a failed fetch stamping
+ * `'unavailable'` ERASED the `'suspect'` stamp written on the tick before.
+ */
+export interface QuoteMoveRow {
+  /** Absent / non-finite ⇒ not our jurisdiction; the no-quote statuses own it. */
+  price?: number;
+  change?: number;
+  changePct?: number;
+  /** TRA-2610 — the producer's verdict, stamped by `signal-engine.applyQuotes`. */
+  moveSuspect?: boolean;
+}
+
+/**
+ * THE consumer-side predicate: may this row's `change` / `changePct` be ranked,
+ * headlined or coloured?
+ *
+ * TRA-2610 — every ranking consumer used to key on `quoteStatus !== 'suspect'`,
+ * i.e. on the ABSENCE of a flag, and `'unavailable' !== 'suspect'` is `true`. FGMC
+ * (`price 8.30`, `changePct +110.66`, last quoted 104 min earlier) was flagged, then
+ * demoted to `'unavailable'` by the next failed fetch, then passed the exclusion and
+ * ranked #1 in the shipped EOD report on 2026-07-28 AND 2026-07-29.
+ *
+ * ⭐ It EXECUTES THE RULE as well as reading the flag, and that ordering is
+ * deliberate. Reading the flag alone makes every consumer's correctness depend on
+ * one producer never dropping a stamp — and the rows that drop it are exactly the
+ * thin, sporadically-quoted names most likely to carry a corporate-action artefact,
+ * so a flag-only guard is LEAST reliable on precisely the rows it exists to catch.
+ * The rule is a pure function of the numbers the row publishes, so it cannot be
+ * erased by a later write to a different field, and it fails CLOSED on any row
+ * reached by a write path that never assessed plausibility at all.
+ *
+ * The flag is still honoured first because it is the producer's verdict on the
+ * quote it actually saw (including inputs the row no longer carries), and because a
+ * consumer must not silently disagree with the stamp on `/api/state`.
+ */
+export function isMoveSuspect(row: QuoteMoveRow): boolean {
+  if (row.moveSuspect === true) return true;
+  return assessQuotePlausibility({
+    price: row.price ?? NaN,
+    change: row.change,
+    changePct: row.changePct,
+  }).suspect;
+}
+
+/**
  * One-line, log-ready explanation. Used by the market-scanner exclusion log so a
  * dropped row is never silent — per TRA-2379 decision 2, "a silent drop reads
  * identically to nothing was wrong."

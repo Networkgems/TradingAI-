@@ -3577,13 +3577,26 @@ export interface CryptoSymbolState {
    * the freshness threshold (feed down). A stale symbol is excluded from
    * strategy evaluation so a dead feed can never produce a new entry signal.
    *
-   * TRA-2379 — `'suspect'` marks a quote whose PRICE is fine but whose published
-   * session move is not believable (an unadjusted prev close across a corporate
-   * action). `change` / `changePct` are still published RAW alongside it — the
-   * flag exists so ranking consumers can refuse the row, not so the number can be
-   * quietly rewritten. See `assessQuotePlausibility`.
+   * TRA-2610 — this field is about FRESHNESS / AVAILABILITY ONLY. `'suspect'` used
+   * to live in this union (TRA-2379) and that was the defect: one field carrying two
+   * orthogonal facts, so a failed fetch stamping `'unavailable'` erased the
+   * plausibility verdict. Plausibility now lives on `moveSuspect` below. Do not
+   * re-add a plausibility member here.
    */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
+  /**
+   * TRA-2610 — true when this row's published session move is not believable (an
+   * unadjusted prev close across a corporate action). INDEPENDENT of `quoteStatus`:
+   * a row can be unavailable AND fabricated, which is the case that shipped a
+   * +110.66% FGMC at #1 in two consecutive EOD reports.
+   *
+   * `change` / `changePct` are still published RAW alongside it — TRA-2379 decision
+   * 1 is flag, never clamp. Consumers must call `isMoveSuspect()` rather than
+   * reading this field directly, so the rule is executed even on a row no producer
+   * stamped. NOTE: nothing on the crypto path sets this today, deliberately — see
+   * the top-movers comment in `crypto-eod-report.ts`.
+   */
+  moveSuspect?: boolean;
 }
 
 export interface CryptoEngineState {

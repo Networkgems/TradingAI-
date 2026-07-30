@@ -5,6 +5,8 @@ import {
   describeQuoteSuspicion,
   impliedPrevClose,
   isQuoteMoveSuspect,
+  isMoveSuspect,
+  type QuoteMoveRow,
 } from './quote-plausibility.js';
 
 /**
@@ -163,5 +165,65 @@ describe('TRA-2379 exclusion log line', () => {
 
   it('says "plausible" for a row it did not flag', () => {
     expect(describeQuoteSuspicion('AAPL', ORDINARY[0])).toContain('plausible');
+  });
+});
+
+/**
+ * TRA-2610 — `isMoveSuspect` is the CONSUMER-side predicate, and it exists because
+ * the old one keyed on the ABSENCE of a flag that a later write erased.
+ *
+ * The live row, verbatim from `/api/reports/2026-07-29` and the `/api/state` read
+ * behind it: FGMC printed `price 8.30`, `changePct +110.66` (`ratio 2.107` vs the
+ * threshold of 2), was flagged, and was then re-stamped `quoteStatus:'unavailable'`
+ * by the next failed fetch 104 minutes later — which erased the verdict and put the
+ * fabrication at #1 in the shipped EOD report two days running.
+ */
+const FGMC = { price: 8.30, changePct: 110.66 };
+
+describe('TRA-2610 isMoveSuspect — the flag and the rule, so neither can be erased', () => {
+  it('flags the live FGMC row from the RULE ALONE, with no flag present at all', () => {
+    // The load-bearing case. If the producer ever drops the stamp again — a new
+    // write path, a refactor, a persisted row from an older build — the consumer
+    // still refuses the row. A flag-only guard is least reliable on exactly the
+    // thin, badly-quoted names most likely to be fabricated.
+    expect(isMoveSuspect(FGMC)).toBe(true);
+    expect(assessQuotePlausibility(FGMC).ratio).toBeCloseTo(2.107, 3);
+  });
+
+  it('honours an explicit flag on numbers the rule would pass', () => {
+    // The producer saw inputs the row no longer carries. A consumer must not
+    // silently overrule the stamp published on /api/state.
+    expect(isMoveSuspect({ price: 100, changePct: 1, moveSuspect: true })).toBe(true);
+  });
+
+  it('is unchanged by a freshness stamp — the whole point of the split', () => {
+    // The two facts now live in two fields, so there is nothing for a
+    // `quoteStatus` write to overwrite. Passing one changes nothing.
+    // Typed as a real symbol row (which carries both fields) so the excess-property
+    // check does not hide the point: the predicate ignores `quoteStatus` entirely.
+    const row = (quoteStatus: string): QuoteMoveRow & { quoteStatus: string } =>
+      ({ ...FGMC, moveSuspect: true, quoteStatus });
+    expect(isMoveSuspect(row('unavailable'))).toBe(true);
+    expect(isMoveSuspect(row('rate_limited'))).toBe(true);
+    expect(isMoveSuspect(row('ok'))).toBe(true);
+  });
+
+  it('known-GOOD control: stays silent on a genuine mover, flagged or not', () => {
+    // The other half of the control. A predicate that flagged everything would
+    // pass every assertion above while discriminating nothing.
+    for (const row of GENUINE_MICROCAPS) {
+      expect(isMoveSuspect(row)).toBe(false);
+      expect(isMoveSuspect({ ...row, moveSuspect: false })).toBe(false);
+    }
+    for (const row of ORDINARY) expect(isMoveSuspect(row)).toBe(false);
+  });
+
+  it('does NOT treat a missing price or a missing move as suspect', () => {
+    // An unavailable row that never carried a fabricated move must stay rankable
+    // on its own merits — the fix must not degrade into "exclude everything stale",
+    // which would pass the FGMC test vacuously.
+    expect(isMoveSuspect({})).toBe(false);
+    expect(isMoveSuspect({ price: 0, change: 0, changePct: 0 })).toBe(false);
+    expect(isMoveSuspect({ price: 8.30 })).toBe(false);
   });
 });

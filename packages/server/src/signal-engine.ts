@@ -356,10 +356,26 @@ export interface SymbolState {
    * a useful state ("Quote unavailable — provider rate-limited") instead of a
    * permanent "Loading…" spinner when upstream providers are down.
    *
-   * TRA-2379 — `'suspect'` marks a live price with an unbelievable published move
-   * (unadjusted prev close). Raw `change` / `changePct` are still published.
+   * TRA-2610 — FRESHNESS / AVAILABILITY ONLY. `'suspect'` was removed from this
+   * union: it made one field carry two orthogonal facts, and the freshness half
+   * overwrote the plausibility half (see `moveSuspect`). Do not re-add it.
    */
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'suspect';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
+  /**
+   * TRA-2610 — true when this row's published session move is not believable
+   * (unadjusted prev close across a corporate action). Raw `change` / `changePct`
+   * are still published (TRA-2379 decision 1: flag, never clamp).
+   *
+   * Stamped on BOTH branches of `applyQuotes` — including the no-quote branch,
+   * which carries the previous tick's price/change/changePct forward and therefore
+   * carries its fabrication forward too. That branch is where the old single-field
+   * design lost the verdict.
+   *
+   * Consumers must call `isMoveSuspect()` (shared), never read this directly: it
+   * re-executes the rule so a row written by a path that never assessed
+   * plausibility still fails closed.
+   */
+  moveSuspect?: boolean;
   /**
    * TRA-1980 — L1 best bid/ask (+ displayed sizes) when the quote source carries a
    * book (Tradier only; the Yahoo/Stooq fallbacks leave these undefined). Consumed
@@ -3587,7 +3603,11 @@ export class SignalEngine {
         change: q.change,
         changePct: q.changePct,
         lastUpdated: Date.now(),
-        quoteStatus: plausibility.suspect ? 'suspect' : 'ok',
+        // TRA-2610 — two fields, two facts. `quoteStatus` is freshness only; the
+        // plausibility verdict rides on `moveSuspect` where a later `'unavailable'`
+        // stamp cannot reach it.
+        quoteStatus: 'ok',
+        moveSuspect: plausibility.suspect,
         // TRA-1980 — carry the L1 book through when the source provided one
         // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
         // no-record rather than a bogus decision on a book it never saw.
@@ -3603,14 +3623,25 @@ export class SignalEngine {
     for (const sym of activeSymbols) {
       if (quotes.has(sym)) continue;
       const prev = this.symbolState.get(sym);
-      this.symbolState.set(sym, {
-        symbol: sym,
+      // TRA-2610 — THIS is the loop that shipped a fabricated +110.66% FGMC to #1 in
+      // the EOD report two days running. It carries the previous tick's price,
+      // change and changePct FORWARD, so it carries the fabrication forward too —
+      // and it used to overwrite the one field that said so. The verdict now travels
+      // on `moveSuspect`, and it is RE-DERIVED from the numbers actually being
+      // republished rather than merely copied: a carry can go stale against the
+      // values beside it, an executed rule cannot.
+      const carried = {
         price: prev?.price ?? 0,
         volume: prev?.volume ?? 0,
         change: prev?.change ?? 0,
         changePct: prev?.changePct ?? 0,
+      };
+      this.symbolState.set(sym, {
+        symbol: sym,
+        ...carried,
         lastUpdated: prev?.lastUpdated ?? 0,
         quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
+        moveSuspect: prev?.moveSuspect === true || assessQuotePlausibility(carried).suspect,
       });
     }
     // TRA-1996 — record that a quote batch just stamped freshness, so a quote-only

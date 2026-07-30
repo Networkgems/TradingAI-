@@ -715,3 +715,91 @@ describe('generateEodReport — TRA-594 calendar aggregation', () => {
     expect(report.markdown).not.toContain('Risk Autopilot Actions');
   });
 });
+
+/**
+ * TRA-2610 — ACCEPTANCE. A symbol that is BOTH rule-suspect AND `'unavailable'` must
+ * not be in `top5Movers`.
+ *
+ * Every number below is the row that actually shipped: `GET /api/reports/2026-07-29`
+ * returned `#1 FGMC $8.30 +110.66%`, and `/2026-07-28` returned `#1 FGMC $8.30
+ * +69.04%` — a frozen price with a moving session change, i.e. a prev-close
+ * denominator re-derived against a different unadjusted reference each pass. On the
+ * live tape FGMC was the one and only rule-suspect row (`implausible_move_ratio`,
+ * ratio 2.107 vs SUSPECT_MOVE_RATIO 2) and carried `quoteStatus:'unavailable'` after
+ * a failed fetch 104 minutes earlier.
+ *
+ * Before the fix the exclusion read `quoteStatus !== 'suspect'`, and
+ * `'unavailable' !== 'suspect'` is `true`, so the row passed the guard written to
+ * stop it and won first place by |changePct|. These tests fail on the pre-fix code.
+ */
+describe('TRA-2610 top movers — a fabricated move cannot be laundered by a failed fetch', () => {
+  /** The shipped 07-29 headline row, verbatim. */
+  const FGMC = {
+    // `change` is DERIVED from the two fields the report actually published
+    // (price 8.30, changePct +110.66 => implied prev close 3.94), so the fixture's
+    // ratio is the live 2.107 rather than a number I made up beside it.
+    symbol: 'FGMC', price: 8.30, volume: 12_000, change: 4.36, changePct: 110.66,
+    lastUpdated: Date.now() - 6_241_000, quoteStatus: 'unavailable' as const, moveSuspect: true,
+  };
+  /** The four genuine movers it outranked, also verbatim from the 07-29 report. */
+  const GENUINE = [
+    { symbol: 'SOXL', price: 91.99, volume: 5_000_000, change: -17.55, changePct: -16.02, lastUpdated: Date.now(), quoteStatus: 'ok' as const, moveSuspect: false },
+    { symbol: 'IREN', price: 29.31, volume: 3_000_000, change: -4.62, changePct: -13.62, lastUpdated: Date.now(), quoteStatus: 'ok' as const, moveSuspect: false },
+    { symbol: 'AXTI', price: 36.97, volume: 1_000_000, change: -5.79, changePct: -13.54, lastUpdated: Date.now(), quoteStatus: 'ok' as const, moveSuspect: false },
+    { symbol: 'ONDS', price: 6.80, volume: 2_000_000, change: -1.06, changePct: -13.49, lastUpdated: Date.now(), quoteStatus: 'ok' as const, moveSuspect: false },
+  ];
+
+  const reportFor = (symbols: EngineState['symbols']) => generateEodReport({
+    state: makeEngineState({ symbols }),
+    allClosedPositions: [],
+    dailySignals: [],
+    signalTypeMap: new Map(),
+  });
+
+  it('excludes the flagged+unavailable row and promotes the real #1', () => {
+    const report = reportFor([FGMC, ...GENUINE]);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('FGMC');
+    expect(report.top5Movers[0].symbol).toBe('SOXL');
+    expect(report.markdown).not.toContain('FGMC');
+  });
+
+  it('excludes it even with the flag ERASED — the rule is re-executed', () => {
+    // The erasure this ticket is about was a LOST STAMP. A consumer that only reads
+    // the stamp is one refactor away from shipping the same headline again, so the
+    // guard must hold with `moveSuspect` absent entirely.
+    const { moveSuspect: _dropped, ...noFlag } = FGMC;
+    const report = reportFor([noFlag, ...GENUINE]);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('FGMC');
+    expect(report.top5Movers[0].symbol).toBe('SOXL');
+  });
+
+  it('POSITIVE CONTROL — the pre-fix predicate really does admit this row', () => {
+    // A test asserting only "FGMC is absent" would also pass against a fix that
+    // dropped every row, or against a tape that never contained the condition. Prove
+    // the fixture CONTAINS what the instrument detects: the old comparison passes it.
+    // The pre-fix guard, spelled out against the row exactly as it shipped. It has
+    // to take a WIDENED string because `'suspect'` is no longer a member of the
+    // `quoteStatus` union — which is itself the proof the field can no longer be
+    // asked to carry two facts at once.
+    const preFixWouldRank = (row: { quoteStatus?: string }) => row.quoteStatus !== 'suspect';
+    expect(preFixWouldRank(FGMC)).toBe(true);                   // the pre-fix guard's verdict: RANK IT
+    expect(Math.abs(FGMC.changePct)).toBeGreaterThan(Math.abs(GENUINE[0].changePct)); // and it wins #1
+  });
+
+  it('KNOWN-GOOD control — an unavailable row with a BELIEVABLE move is still ranked', () => {
+    // The over-broad fix ("exclude everything unavailable") would pass every
+    // assertion above while silently deleting most of the movers table on a
+    // 42%-stale tape. Staleness alone must not exclude a row.
+    const staleButPlausible = {
+      symbol: 'USO', price: 88.12, volume: 900_000, change: 6.01, changePct: 7.32,
+      lastUpdated: Date.now() - 6_241_000, quoteStatus: 'unavailable' as const, moveSuspect: false,
+    };
+    const report = reportFor([staleButPlausible, ...GENUINE]);
+    expect(report.top5Movers.map(m => m.symbol)).toContain('USO');
+  });
+
+  it('leaves an ordinary board untouched', () => {
+    const report = reportFor(GENUINE);
+    expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
+  });
+});

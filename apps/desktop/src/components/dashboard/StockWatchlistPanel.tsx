@@ -129,9 +129,12 @@ export function StockWatchlistPanel({ token, symbols }: { token: string; symbols
             // visibly degraded — an em-dash plus the raw value in the tooltip —
             // instead of a coloured number that reads as real. The PRICE is still
             // live and is shown normally; only the move is in doubt.
+            // TRA-2610 — `isQuoteMoveUnreliable` now reads the dedicated
+            // `moveSuspect` field (and re-executes the rule), so a row whose quote
+            // has since failed keeps its badge instead of silently losing it.
             const moveUnreliable = isQuoteMoveUnreliable(s);
             const moveTitle = moveUnreliable
-              ? `Reported ${fmtPct(s.changePct)} (${fmtDollar(s.change)}) — rejected: implied previous close is not believable. Raw value retained; see quoteStatus:'suspect'.`
+              ? `Reported ${fmtPct(s.changePct)} (${fmtDollar(s.change)}) — rejected: implied previous close is not believable. Raw value retained; see moveSuspect.`
               : undefined;
             return (
             <tr key={s.symbol} className={s.lastUpdated === 0 || moveUnreliable ? '' : s.change >= 0 ? 'up' : 'down'}>

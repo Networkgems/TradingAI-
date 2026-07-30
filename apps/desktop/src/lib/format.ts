@@ -1,5 +1,6 @@
 // TRA-419 — pure string/number utilities extracted from App.tsx.
 // No JSX or React imports allowed in this file.
+import { isMoveSuspect, type QuoteMoveRow } from '@trading-app/shared';
 
 // TRA-318 follow-up: defend against null/undefined/NaN/non-finite numeric
 // fields arriving from the API (e.g. `Number.POSITIVE_INFINITY` reconciled
@@ -55,30 +56,68 @@ export function timeAgo(ts: number) {
  * provider state so a rate-limited or down quote source shows actionable text
  * instead of a perpetual "Loading…" spinner.
  */
-export function quoteStatusLabel(s: { lastUpdated: number; quoteStatus?: QuoteStatus }): string {
-  if (s.quoteStatus === 'rate_limited') return 'Quote unavailable — provider rate-limited';
-  if (s.quoteStatus === 'unavailable') return 'Quote unavailable';
-  // TRA-418 — `'stale'` marks a quote that aged past the freshness threshold
-  // (feed down). Surface it distinctly from a healthy "x ago" timestamp.
-  if (s.quoteStatus === 'stale') return 'Quote stale — feed delayed';
-  // TRA-2379 — the PRICE is live and current here; it is the published session
-  // move that is not believable. Say which, so nobody reads this as a dead feed.
-  if (s.quoteStatus === 'suspect') return `Change % unreliable — bad prev close (${timeAgo(s.lastUpdated)})`;
-  if (s.lastUpdated === 0) return 'Loading…';
-  return timeAgo(s.lastUpdated);
+export function quoteStatusLabel(s: QuoteRow, moveUnreliable: boolean = isQuoteMoveUnreliable(s)): string {
+  // TRA-2610 — freshness and plausibility are two facts and this cell has to be
+  // able to say BOTH. Previously `'suspect'` and `'unavailable'` were values of one
+  // field, so the label could only ever report whichever write landed last — and on
+  // FGMC that was "Quote unavailable", with no hint that the +110.66% beside it was
+  // fabricated. Compose instead: freshness inside the parens, the move verdict in
+  // front of it.
+  const freshness = (): string => {
+    if (s.quoteStatus === 'rate_limited') return 'Quote unavailable — provider rate-limited';
+    if (s.quoteStatus === 'unavailable') return 'Quote unavailable';
+    // TRA-418 — `'stale'` marks a quote that aged past the freshness threshold
+    // (feed down). Surface it distinctly from a healthy "x ago" timestamp.
+    if (s.quoteStatus === 'stale') return 'Quote stale — feed delayed';
+    if (s.lastUpdated === 0) return 'Loading…';
+    return timeAgo(s.lastUpdated);
+  };
+  // TRA-2379/TRA-2610 — the published session move is not believable. Name that
+  // first, so nobody reads a fabricated move as merely a delayed feed. The caller
+  // may pass the verdict explicitly (the crypto panel does — its reading is
+  // flag-only; see `isCryptoMoveUnreliable`) so the badge and the label can never
+  // disagree with each other on the same row.
+  if (moveUnreliable) return `Change % unreliable — bad prev close (${freshness()})`;
+  return freshness();
 }
 
-export type QuoteStatus = 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
+export type QuoteStatus = 'ok' | 'rate_limited' | 'unavailable' | 'stale';
+
+/** The row fields the two quote-status helpers read. */
+type QuoteRow = { lastUpdated: number; quoteStatus?: QuoteStatus } & QuoteMoveRow;
 
 /**
- * TRA-2379 — true when the server flagged this row's session move as implausible.
+ * TRA-2379 — true when this row's session move is implausible.
  *
  * The raw `change` / `changePct` are still present on the row (decision 1: flag,
  * never clamp); callers use this to render them degraded and to keep them out of
  * a CHANGE % sort, rather than to hide them.
+ *
+ * TRA-2610 — delegates to the shared `isMoveSuspect`, which reads the dedicated
+ * `moveSuspect` field AND re-executes the plausibility rule on the numbers the row
+ * publishes. It used to test `quoteStatus === 'suspect'`, which a later failed fetch
+ * erased — so the UI stopped badging exactly the thin, badly-quoted rows most likely
+ * to be fabricated.
  */
-export function isQuoteMoveUnreliable(s: { quoteStatus?: QuoteStatus }): boolean {
-  return s.quoteStatus === 'suspect';
+export function isQuoteMoveUnreliable(s: QuoteMoveRow): boolean {
+  return isMoveSuspect(s);
+}
+
+/**
+ * TRA-2610 — the CRYPTO reading of the same question, and it is deliberately
+ * FLAG-ONLY: it reads `moveSuspect` and does NOT execute the ratio rule.
+ *
+ * Not an oversight and not laziness. TRA-2379 ruled the rule out for crypto with a
+ * reason that still holds (see the top-movers comment in `crypto-eod-report.ts`): a
+ * crypto row's `changePct` is a provider-supplied 24h figure with no implied prev
+ * close for the ratio test to recover, and a genuine +100% session in a thin coin is
+ * a real move, not a corporate-action artefact — there are no corporate actions here.
+ * Executing the rule on this path would manufacture false positives while fixing
+ * nothing. Nothing stamps `moveSuspect` on a crypto row today; if a crypto
+ * plausibility rule is ever written, this is the reader that picks it up for free.
+ */
+export function isCryptoMoveUnreliable(s: { moveSuspect?: boolean }): boolean {
+  return s.moveSuspect === true;
 }
 
 export function formatTime(ts: number) {

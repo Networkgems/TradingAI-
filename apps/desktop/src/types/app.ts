@@ -8,12 +8,17 @@ export interface SymbolState {
   change: number;
   changePct: number;
   lastUpdated: number;
-  // TRA-2379 — `'suspect'`: the price is live but the published session move is not
-  // believable (unadjusted prev close). `change` / `changePct` are still the RAW
-  // server values; the UI degrades the cells rather than trusting them.
+  // TRA-2610 — FRESHNESS / AVAILABILITY ONLY. `'suspect'` was removed from this
+  // union; plausibility is `moveSuspect` below. One field could not hold both facts
+  // — `'unavailable'` overwrote `'suspect'` and a fabricated move reached #1.
   // TRA-418 — `'stale'` was already emitted by the crypto path and was missing from
   // this copy of the union; added while I was here.
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale' | 'suspect';
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'stale';
+  // TRA-2610 — the price is live but the published session move is not believable
+  // (unadjusted prev close). `change` / `changePct` are still the RAW server values;
+  // the UI degrades the cells rather than trusting them. Read it through
+  // `isQuoteMoveUnreliable()`, which also re-executes the rule.
+  moveSuspect?: boolean;
 }
 
 export interface AppState {

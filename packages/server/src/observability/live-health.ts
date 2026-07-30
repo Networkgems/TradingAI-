@@ -26,9 +26,12 @@ export const MAX_TICK_AGE_MS = 5 * 60_000;
 export interface LiveHealthSymbol {
   /** ms epoch of the last successful quote; 0 / undefined ⇒ never quoted. */
   lastUpdated?: number;
-  // TRA-2379 — `'suspect'` is a LIVE quote with an unbelievable published move, so
-  // it must not be counted alongside the no-quote statuses in any freshness roll-up.
-  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable' | 'suspect';
+  // TRA-2610 — FRESHNESS / AVAILABILITY ONLY. The plausibility verdict moved off
+  // this field onto `SymbolState.moveSuspect`, which is exactly why this roll-up no
+  // longer has to carry it: a LIVE quote with an unbelievable published move is
+  // `quoteStatus:'ok'`, so it is already counted as fresh here — correctly — without
+  // a plausibility member having to be excluded by hand.
+  quoteStatus?: 'ok' | 'rate_limited' | 'unavailable';
 }
 
 export interface LiveHealthInput {

@@ -12,6 +12,9 @@ import type {
 import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT } from '@trading-app/shared';
 // TRA-1981 (parent TRA-1967 item 2) — realized-vs-modeled slippage KPI per asset class.
 import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/shared';
+// TRA-2610 — the consumer-side plausibility predicate. Reads `moveSuspect` AND
+// re-executes the rule, so a lost stamp cannot promote a fabrication.
+import { isMoveSuspect } from '@trading-app/shared';
 import { logger } from '../observability/index.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
@@ -190,15 +193,24 @@ function top5Movers(symbols: SymbolState[]): EodMover[] {
   // fabricated +8,951% at #1 in a document a human reads as the session summary.
   // Exclude flagged rows here too — the raw value stays on /api/state, it just
   // does not get to be the headline.
-  const excluded = symbols.filter(s => s.lastUpdated > 0 && s.price > 0 && s.quoteStatus === 'suspect');
+  // TRA-2610 — the exclusion above used to read `quoteStatus === 'suspect'`, which
+  // is a test for the PRESENCE OF A FLAG THAT A LATER FAILED FETCH OVERWRITES.
+  // FGMC (`$8.30`, `+110.66%`, last quoted 104 min earlier) was flagged, demoted to
+  // `'unavailable'`, and `'unavailable' !== 'suspect'` let it back in — at #1, in
+  // the document this comment says it must never be #1 in, on 07-28 and 07-29.
+  // `isMoveSuspect` reads the dedicated `moveSuspect` field AND re-executes the
+  // rule, so neither a lost stamp nor a stale one puts a fabrication in the
+  // headline. Freshness is a separate question and is still `lastUpdated > 0`.
+  const rankable = (s: SymbolState) => s.lastUpdated > 0 && s.price > 0 && !isMoveSuspect(s);
+  const excluded = symbols.filter(s => s.lastUpdated > 0 && s.price > 0 && isMoveSuspect(s));
   if (excluded.length > 0) {
     log.warn('top-movers EXCLUDED implausible moves', {
-      issue: 'TRA-2379',
-      symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%`),
+      issue: 'TRA-2610',
+      symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%:${s.quoteStatus ?? 'n/a'}`),
     });
   }
   return [...symbols]
-    .filter(s => s.lastUpdated > 0 && s.price > 0 && s.quoteStatus !== 'suspect')
+    .filter(rankable)
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
     .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));
