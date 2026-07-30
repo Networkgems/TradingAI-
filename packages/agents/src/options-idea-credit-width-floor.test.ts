@@ -14,6 +14,7 @@ import {
   evaluateIdeasCreditWidthFloor,
   resolveCreditWidthFloorConfig,
   DEFAULT_CREDIT_WIDTH_FLOOR,
+  DEFAULT_SHORT_DELTA_MIN,
   DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG,
   CREDIT_WIDTH_FLOOR_ENABLE_VAR,
 } from './options-idea-credit-width-floor.js';
@@ -222,6 +223,26 @@ describe('resolveCreditWidthFloorConfig', () => {
     // Malformed / out-of-range → reference default, never a thrown parse.
     const junk = resolveCreditWidthFloorConfig({ [FLAG]: '1', OPTIONS_IDEA_CREDIT_WIDTH_MIN: 'wat' });
     expect(junk!.minCreditWidth).toBe(DEFAULT_CREDIT_WIDTH_FLOOR);
+  });
+
+  // TRA-2217. The floor is not an independent number: `c = credit/(credit+maxLoss)`
+  // IS the short-leg delta by no-arbitrage, so the floor is the band's lower edge.
+  // Asserted against the band constant, never restated as a literal — a restated
+  // 0.2 here would pass while the two constants silently drifted apart.
+  it('derives the floor from the delta band rather than restating it', () => {
+    expect(DEFAULT_CREDIT_WIDTH_FLOOR).toBe(DEFAULT_SHORT_DELTA_MIN);
+  });
+
+  // …and the identity has to hold at RESOLVE time too. An operator who raises the
+  // band bottom and leaves the floor var unset must get the raised floor, not the
+  // stale module constant — that env path is where the drift would come back.
+  it('floors at the RESOLVED band bottom when only the band is overridden', () => {
+    const banded = resolveCreditWidthFloorConfig({
+      [FLAG]: '1',
+      OPTIONS_IDEA_SHORT_DELTA_MIN: '0.25',
+    });
+    expect(banded!.minCreditWidth).toBe(0.25);
+    expect(banded!.shortDeltaMin).toBe(0.25);
   });
 });
 

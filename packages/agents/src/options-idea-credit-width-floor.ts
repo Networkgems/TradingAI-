@@ -70,16 +70,6 @@ export const FLOORED_CREDIT_STRUCTURES: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
- * The floor itself: a credit vertical must collect at least this fraction of its
- * defined width. 0.20 sits at the calibrated-POP breakeven (1 − 0.79 = 0.21),
- * i.e. the bar below which the structure cannot pay for its own loss rate — NOT a
- * number reverse-engineered from what the current book happens to clear (it clears
- * 0.03). Deliberately BELOW the TRA-2005 admission bar of 0.28 so this is the
- * survival floor, not the edge bar.
- */
-export const DEFAULT_CREDIT_WIDTH_FLOOR = 0.2;
-
-/**
  * Short-strike delta band for credit verticals. Below ~0.20 delta the premium does
  * not clear costs at our fee base (~0.04R round-trip); above ~0.30 the structure
  * stops being a high-probability credit trade and becomes a directional bet. The
@@ -90,6 +80,36 @@ export const DEFAULT_CREDIT_WIDTH_FLOOR = 0.2;
  */
 export const DEFAULT_SHORT_DELTA_MIN = 0.2;
 export const DEFAULT_SHORT_DELTA_MAX = 0.3;
+
+/**
+ * The floor itself: a credit vertical must collect at least this fraction of its
+ * defined width. It is NOT an independent number — it is the bottom of the short-leg
+ * delta band, and the two constraints are one constraint.
+ *
+ * NO-ARBITRAGE IDENTITY. A vertical's credit is what the market charges for the
+ * short strike being breached, so `credit ≈ width × P_rn(breach)` and therefore
+ *
+ *     c = creditUsd / (creditUsd + maxLossUsd) ≈ Δ_short
+ *
+ * The credit/width ratio IS the short-leg delta. Stating a 0.20–0.30 delta band in
+ * the prompt mechanically produces `c ∈ [0.20, 0.30]`; the floor is that band's
+ * lower edge, expressed in the one dimension we can verify server-side from the
+ * emitted numbers (an idea record carries no strikes).
+ *
+ * Two second-order gaps, in opposite directions, both small at our widths:
+ *   - Strictly the ratio tracks the DUAL delta `N(−d₂)`, not delta `N(−d₁)`. For a
+ *     put `N(−d₂) > N(−d₁)`, so a 0.20-delta short strike pays slightly MORE than
+ *     0.20 of width — the floor errs loose, never tight.
+ *   - Over a finite width `c` is the dual delta AVERAGED across the two strikes, so
+ *     widening pulls `c` down. Holding R constant only needs ~21% more width
+ *     (R = width × (1 − c); 0.97 → 0.80), so this stays second-order.
+ *
+ * INVARIANT — IF THE DELTA BAND MOVES, THE FLOOR MOVES WITH IT. Do not restate 0.20
+ * here. Two independent constants will drift apart on the next retune and silently
+ * reopen the leak this floor exists to close. Deliberately still BELOW the TRA-2005
+ * admission bar of 0.28, so this is the survival floor, not the edge bar.
+ */
+export const DEFAULT_CREDIT_WIDTH_FLOOR = DEFAULT_SHORT_DELTA_MIN; // c ≈ Δ_short (no-arb)
 
 /** Resolved, fully-defaulted floor configuration. Pure — no env access. */
 export interface CreditWidthFloorConfig {
@@ -372,10 +392,15 @@ export function resolveCreditWidthFloorConfig(
   const shortDeltaMax =
     parseBoundedFloat(env[CREDIT_WIDTH_FLOOR_DELTA_MAX_VAR], 0, 1) ?? DEFAULT_SHORT_DELTA_MAX;
   const bandOk = shortDeltaMin <= shortDeltaMax;
+  const resolvedShortDeltaMin = bandOk ? shortDeltaMin : DEFAULT_SHORT_DELTA_MIN;
   return {
+    // The floor defaults to the RESOLVED band bottom, not the module constant: the
+    // c ≈ Δ_short identity has to survive an env-overridden band, or the two drift
+    // apart at runtime. An explicit OPTIONS_IDEA_CREDIT_WIDTH_MIN still wins — that
+    // is a deliberate operator override, not drift.
     minCreditWidth:
-      parseBoundedFloat(env[CREDIT_WIDTH_FLOOR_MIN_VAR], 0, 1) ?? DEFAULT_CREDIT_WIDTH_FLOOR,
-    shortDeltaMin: bandOk ? shortDeltaMin : DEFAULT_SHORT_DELTA_MIN,
+      parseBoundedFloat(env[CREDIT_WIDTH_FLOOR_MIN_VAR], 0, 1) ?? resolvedShortDeltaMin,
+    shortDeltaMin: resolvedShortDeltaMin,
     shortDeltaMax: bandOk ? shortDeltaMax : DEFAULT_SHORT_DELTA_MAX,
   };
 }
