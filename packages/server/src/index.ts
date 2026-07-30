@@ -3983,6 +3983,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         // no way to tell an options figure the snapshot missed from an equal
         // amount of stock P&L.
         const eodOptionsByDate = new Map<string, number>();
+        // TRA-2630 DEFECT A — also carry the report file's STOCK leg
+        // (`realizedPnl`). Without it `drift` pools a LOSSY stock figure (this
+        // list is summed from `allClosedPositions`, which the TRA-219 archive
+        // clears at the same 21:00 ET the report is written) against the DURABLE
+        // equity delta in `stockDaily`, and no consumer can tell which side
+        // moved. Measured on 2026-07-30: 40 of 40 post-baseline sessions with a
+        // non-zero `stockDaily` had this leg at exactly 0.00.
+        const eodStockByDate = new Map<string, number>();
         for (const s of snapshots) {
           const filePath = join(dir, `${s.date}.json`);
           if (!existsSync(filePath)) continue;
@@ -3990,9 +3998,11 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             const report = JSON.parse(await readFile(filePath, 'utf-8')) as {
               combinedPnl?: number;
               optionsPnl?: number;
+              realizedPnl?: number;
             };
             if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
             if (typeof report.optionsPnl === 'number') eodOptionsByDate.set(s.date, report.optionsPnl);
+            if (typeof report.realizedPnl === 'number') eodStockByDate.set(s.date, report.realizedPnl);
           } catch { /* skip unreadable report file */ }
         }
         // Scope the census to THIS book — pooling another account's closes in
@@ -4014,7 +4024,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         return {
           username: ctx.username,
           mode,
-          ...reconcilePnl(snapshots, eodByDate, baselineDate, journalByDate, eodOptionsByDate),
+          ...reconcilePnl(
+            snapshots,
+            eodByDate,
+            baselineDate,
+            journalByDate,
+            eodOptionsByDate,
+            eodStockByDate,
+          ),
         };
       }),
     );
@@ -4032,6 +4049,33 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // never broken contributes no `journal-repair` rows; the desk books name
       // the days they lost. Reported beside `ok`, never folded into it.
       optionsDailyPnlRepairedCount: engines.reduce((n, e) => n + e.repairedDates.length, 0),
+      // TRA-2630 DEFECT A — the per-leg verdicts that REPLACE `ok` for grading.
+      // `ok` / `maxDriftUsd` above are retained byte-identical for existing
+      // consumers but are NOT gradeable: they pool a lossy stock leg with a
+      // durable one, so they have no reachable green state and cannot attribute
+      // a mismatch. See `PNL_DRIFT_DECOMPOSITION_NOTE` in the caveats.
+      // Each engine's figure is already `round2`-ed, so the max needs no further
+      // rounding — same as `maxDriftUsd` above.
+      stockLegOk: engines.every(e => e.stockLegOk),
+      maxStockLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxStockLegDriftUsd), 0),
+      optionsLegOk: engines.every(e => e.optionsLegOk),
+      maxOptionsLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxOptionsLegDriftUsd), 0),
+      // TRA-2630 AC3 / TRA-2629 — the T+1 credit-lag tripwire, firm-wide.
+      priorOptionsLagOk: engines.every(e => e.priorOptionsLagOk),
+      priorOptionsLagBooks: engines
+        .filter(e => !e.priorOptionsLagOk)
+        .map(e => ({ username: e.username, mode: e.mode, dates: e.priorOptionsLagDates })),
+      // THE REAL-MONEY TRIPWIRE. The demo-only verdict on TRA-2630 Defect B (and
+      // with it the standing decision NOT to roll back TRA-2323) holds only while
+      // this stays empty. A `mode: live` book showing `stockDaily` == the prior
+      // session's `optionsDaily` to the cent is a NAV overstatement of one full
+      // session of realized options P&L, and is reported SEPARATELY from the
+      // demo books so a fixture book can never mask it — pooling the two is the
+      // TRA-2193 trap this endpoint has already been bitten by twice.
+      livePriorOptionsLagOk: engines.every(e => e.mode !== 'live' || e.priorOptionsLagOk),
+      livePriorOptionsLagBooks: engines
+        .filter(e => e.mode === 'live' && !e.priorOptionsLagOk)
+        .map(e => ({ username: e.username, dates: e.priorOptionsLagDates })),
       engines,
     });
   } catch (err) {
