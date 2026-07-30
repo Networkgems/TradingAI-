@@ -5100,6 +5100,10 @@ app.get('/api/health/storage', async (_req, res) => {
         totalBytes: diskReading.totalBytes,
         freeBytes: diskReading.freeBytes,
         usedBytes: diskReading.totalBytes - diskReading.freeBytes,
+        // TRA-2420 — `usedBytes` is derived from `bavail`, so it counts the root
+        // reserve as used. Publish the reserve so the residual can subtract bytes
+        // that no writer owns instead of hunting for the writer that put them there.
+        reservedBytes: diskReading.reservedBytes,
         freePct: Number(diskReading.freePct.toFixed(3)),
         usedPct: Number((100 - diskReading.freePct).toFixed(3)),
         minFreePct,
@@ -5126,7 +5130,11 @@ app.get('/api/health/storage', async (_req, res) => {
   // enormous in the second and absent from the first. See `data-dir-usage.ts`.
   const usage = await dataDirUsageCached(DATA_DIR);
   const measuredBytes = usage.totalBytes;
+  const allocatedBytes = usage.totalAllocatedBytes;
   const diskUsedBytes = 'usedBytes' in disk ? (disk.usedBytes ?? null) : null;
+  const reservedBytes = 'reservedBytes' in disk ? (disk.reservedBytes ?? null) : null;
+  const attributableUsedBytes =
+    diskUsedBytes === null || reservedBytes === null ? null : diskUsedBytes - reservedBytes;
   res.json({
     dataDir: DATA_DIR,
     dataDirEnv: process.env['DATA_DIR'] ?? null,
@@ -5135,18 +5143,44 @@ app.get('/api/health/storage', async (_req, res) => {
     usage: {
       ...usage,
       // The residual, published rather than left as a subtraction someone does
-      // in their head. Non-zero is expected and fine (filesystem overhead, and
-      // anything on the volume outside DATA_DIR); a LARGE non-zero means the
-      // breakdown below does not account for the disk and must not be read as
-      // if it does.
+      // in their head. Non-zero is expected and fine (anything on the volume
+      // outside DATA_DIR); a LARGE non-zero means the breakdown below does not
+      // account for the disk and must not be read as if it does.
+      //
+      // TRA-2420 — this subtraction was UNIT-MISMATCHED until 2026-07-30, and the
+      // mismatch had no failing state. `measuredBytes` is APPARENT bytes (a sum of
+      // `st_size`); `diskUsedBytes` is ALLOCATED blocks PLUS the root reserve. On
+      // bqb1 those differ structurally by ~150 MB — ~100 MB of 4 KiB block rounding
+      // across ~48k small files, plus ext4's ~49 MB 5% root reserve — so the residual
+      // sat at 35% and `tra2420:attribute` returned UNATTRIBUTED (exit 1) forever.
+      // There was NO value of the real disk that could have produced a pass: the
+      // guard was reading a constant, not a measurement. Compare like with like —
+      // allocated against allocated, with the reserve removed because no writer
+      // owns it — and keep the apparent figures as labelled contrast only.
       unaccounted: {
         diskUsedBytes,
-        measuredBytes,
-        bytes: diskUsedBytes === null ? null : diskUsedBytes - measuredBytes,
-        pct:
-          diskUsedBytes === null || diskUsedBytes === 0
+        reservedBytes,
+        /** `df` used, less the blocks reserved for root. The part a writer could own. */
+        attributableUsedBytes,
+        allocatedBytes,
+        bytes:
+          attributableUsedBytes === null || allocatedBytes === null
             ? null
-            : Number((((diskUsedBytes - measuredBytes) / diskUsedBytes) * 100).toFixed(3)),
+            : attributableUsedBytes - allocatedBytes,
+        pct:
+          attributableUsedBytes === null || allocatedBytes === null || attributableUsedBytes === 0
+            ? null
+            : Number((((attributableUsedBytes - allocatedBytes) / attributableUsedBytes) * 100).toFixed(3)),
+        // Contrast only. NOT the residual — subtracting apparent bytes from
+        // allocated+reserved counts block rounding as an unowned writer.
+        apparent: {
+          measuredBytes,
+          bytes: diskUsedBytes === null ? null : diskUsedBytes - measuredBytes,
+          pct:
+            diskUsedBytes === null || diskUsedBytes === 0
+              ? null
+              : Number((((diskUsedBytes - measuredBytes) / diskUsedBytes) * 100).toFixed(3)),
+        },
       },
     },
     usersFile: await statFile(usersFile),

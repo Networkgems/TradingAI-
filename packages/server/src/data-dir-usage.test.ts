@@ -26,6 +26,7 @@ import {
   dataDirUsageCached,
   resetDataDirUsageCache,
   filePattern,
+  allocationUsable,
 } from './data-dir-usage.js';
 
 const DAY = 86_400_000;
@@ -178,6 +179,83 @@ describe('measureDataDirUsage', () => {
     // error list tells them apart.
     expect(usage.errors).toHaveLength(1);
     expect(usage.birthtime.usable).toBe(false);
+    // TRA-2420 — an unmeasurable volume must not read as "nothing is allocated".
+    expect(usage.allocation.usable).toBe(false);
+    expect(usage.totalAllocatedBytes).toBeNull();
+  });
+
+  // ── TRA-2420: allocated vs apparent ──────────────────────────────────────
+  // `/api/health/storage` publishes a residual of `df`-used minus what the walk
+  // measured. That subtraction was unit-mismatched: the walk summed `st_size`
+  // (apparent) while `df` counts allocated blocks plus the root reserve. On bqb1
+  // — ~48k files averaging ~5 KiB — block rounding alone is worth ~100 MB, which
+  // pinned the residual at 35% and made `tra2420:attribute` exit UNATTRIBUTED for
+  // every possible state of the disk. These tests pin the unit, not the number.
+  it('reports allocated bytes above apparent bytes for many small files', async () => {
+    // 40 files of 5000 bytes: 195 KB apparent, but each rounds up to two 4 KiB
+    // blocks. 5000 is deliberate — it matches the real `backups/` mean of ~5.57 KiB
+    // AND clears NTFS's ~900-byte resident-file threshold, so the rounding this
+    // asserts is present on the CI/dev filesystem as well as on bqb1's ext4.
+    await mkdir(join(root, 'backups'), { recursive: true });
+    for (let i = 0; i < 40; i += 1) {
+      await writeFile(join(root, 'backups', `snap-${i}.json`), 'x'.repeat(5000));
+    }
+
+    const usage = await measureDataDirUsage(root);
+    expect(usage.allocation.usable).toBe(true);
+    expect(usage.allocation.answeredPaths).toBeGreaterThan(0);
+    expect(usage.totalBytes).toBe(200_000);
+
+    // The assertion that matters: allocated STRICTLY exceeds apparent here. If the
+    // walk ever goes back to summing `st_size` into this field, these collapse to
+    // equal and the residual silently becomes a phantom writer again.
+    expect(usage.totalAllocatedBytes).not.toBeNull();
+    expect(usage.totalAllocatedBytes!).toBeGreaterThan(usage.totalBytes);
+
+    // Directory inodes are counted too — `backups/` holds 37k files across
+    // hundreds of directories on the real volume, and leaving them out puts their
+    // blocks in the residual.
+    const backups = usage.entries.find((e) => e.name === 'backups');
+    expect(backups?.allocatedBytes).not.toBeNull();
+    expect(backups!.allocatedBytes!).toBeGreaterThan(backups!.bytes);
+    // Sampled paths exceed the file count precisely because the directory was stat'd.
+    expect(usage.allocation.sampledPaths).toBeGreaterThan(usage.totalFiles);
+  });
+
+  it('does not call a filesystem unmeasurable just because small files are resident', async () => {
+    // NTFS keeps files under ~900 bytes INSIDE the MFT record, so `st_blocks` is
+    // legitimately 0 for them; sparse files on ext4 do the same. An earlier cut of
+    // this fix judged "size > 0 with blocks === 0" a decline PER FILE, which made
+    // every Windows tree — and every dev/CI run — report allocation as unusable.
+    await writeFile(join(root, 'tiny.json'), 'x'.repeat(50));
+    await writeFile(join(root, 'empty.json'), '');
+    await writeFile(join(root, 'real.json'), 'x'.repeat(5000));
+
+    const usage = await measureDataDirUsage(root);
+    expect(usage.allocation.usable).toBe(true);
+    expect(usage.totalAllocatedBytes).not.toBeNull();
+    expect(usage.totalAllocatedBytes!).toBeGreaterThan(0);
+  });
+});
+
+describe('allocationUsable', () => {
+  // The wholesale-decline branch cannot be produced by writing to a real
+  // filesystem, so without these it has no failing state — and an instrument
+  // whose guard never fires is indistinguishable from one with no guard.
+  it('is false when every path reported zero blocks but non-empty files exist', () => {
+    expect(allocationUsable({ blocksSampled: 500, blocksPositive: 0, nonEmptySampled: 500 })).toBe(false);
+  });
+
+  it('is false when nothing was sampled — an empty scan proves nothing either way', () => {
+    expect(allocationUsable({ blocksSampled: 0, blocksPositive: 0, nonEmptySampled: 0 })).toBe(false);
+  });
+
+  it('is true for a tree of only empty files, whose zero allocation is real', () => {
+    expect(allocationUsable({ blocksSampled: 12, blocksPositive: 0, nonEmptySampled: 0 })).toBe(true);
+  });
+
+  it('is true once any path answers, even if most are resident zeros', () => {
+    expect(allocationUsable({ blocksSampled: 500, blocksPositive: 1, nonEmptySampled: 500 })).toBe(true);
   });
 });
 

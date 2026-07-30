@@ -334,6 +334,14 @@ export interface DiskReading {
   freeBytes: number;
   totalBytes: number;
   freePct: number;
+  /**
+   * TRA-2420 — blocks free but reserved for root (`bfree - bavail`). `df` counts
+   * these as USED, yet no writer put anything in them, so any "used minus what I
+   * measured" residual credits them to a phantom writer. On ext4 the default
+   * reserve is 5% of the filesystem, which is ~49 MB on bqb1's 1 GB volume.
+   * Zero on NTFS/APFS, where `bfree === bavail`.
+   */
+  reservedBytes: number;
 }
 
 /** The `disk-near-full` threshold actually in force, in percent free. */
@@ -358,7 +366,10 @@ export async function readDiskSpace(path: string): Promise<DiskReading | null> {
     const totalBytes = fs.blocks * fs.bsize;
     const freeBytes = fs.bavail * fs.bsize;
     const freePct = totalBytes > 0 ? (freeBytes / totalBytes) * 100 : 100;
-    return { path, freeBytes, totalBytes, freePct };
+    // Never negative: a filesystem that reports bavail > bfree is lying, and a
+    // negative reserve would inflate the attributable figure instead of the residual.
+    const reservedBytes = Math.max(0, (fs.bfree - fs.bavail) * fs.bsize);
+    return { path, freeBytes, totalBytes, freePct, reservedBytes };
   } catch (err) {
     logger.warn('disk-space read failed', {
       module: 'alerts',

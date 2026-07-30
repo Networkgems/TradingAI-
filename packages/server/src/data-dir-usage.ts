@@ -95,6 +95,12 @@ export interface DataDirEntryUsage {
   kind: 'dir' | 'file' | 'other';
   /** Apparent bytes, recursive. */
   bytes: number;
+  /**
+   * TRA-2420 — allocated bytes, recursive (`st_blocks * 512`, including this
+   * entry's directory inodes). This is the unit `df` reports, so it is the only
+   * one comparable against `disk.usedBytes`. `null` when the filesystem declined.
+   */
+  allocatedBytes: number | null;
   files: number;
   dirs: number;
   newestMtime: string | null;
@@ -112,6 +118,13 @@ export interface DataDirUsage {
   durationMs: number;
   /** Apparent bytes across every entry. A floor when `truncated`. */
   totalBytes: number;
+  /**
+   * TRA-2420 — allocated bytes across every entry, i.e. what `df` counts. Always
+   * >= `totalBytes` on a non-sparse tree; the gap is block rounding, which on a
+   * volume of ~48k small files is worth ~100 MB and used to land in the
+   * `unaccounted` residual as a phantom writer. `null` when unmeasurable.
+   */
+  totalAllocatedBytes: number | null;
   totalFiles: number;
   /** Heaviest first. */
   entries: DataDirEntryUsage[];
@@ -129,6 +142,24 @@ export interface DataDirUsage {
     missing: number;
     /** Files whose birthtime differs from their mtime; 0 across a big sample means birthtime is really ctime. */
     distinctFromMtime: number;
+  };
+  /**
+   * TRA-2420 — whether `allocatedBytes` means anything on this filesystem.
+   * `usable: false` is the reason those figures are `null` rather than 0.
+   */
+  allocation: {
+    usable: boolean;
+    /** Files, symlinks and directories we asked `st_blocks` of. */
+    sampledPaths: number;
+    /**
+     * Paths that reported a POSITIVE block count. Zero of these alongside
+     * `nonEmptyPaths > 0` is the wholesale decline that makes allocation
+     * unusable. A per-path zero is normal — NTFS keeps sub-KiB files resident in
+     * the MFT and a sparse file allocates less than its size.
+     */
+    answeredPaths: number;
+    /** Paths with `size > 0`. A tree of only-empty files allocating 0 is not a decline. */
+    nonEmptyPaths: number;
   };
   /** True if the walk hit `maxFiles`. Every byte figure is then a floor. */
   truncated: boolean;
@@ -160,6 +191,8 @@ interface WalkAcc {
   modified: Map<string, number>;
   created: Map<string, number>;
   patterns: Map<string, { files: number; bytes: number; createdBytes: number }>;
+  /** TRA-2420 — allocated bytes (`st_blocks * 512`), the unit `df` counts in. */
+  allocated: number;
 }
 
 function emptyAcc(): WalkAcc {
@@ -167,6 +200,7 @@ function emptyAcc(): WalkAcc {
     bytes: 0,
     files: 0,
     dirs: 0,
+    allocated: 0,
     newestMtimeMs: null,
     modified: new Map(),
     created: new Map(),
@@ -187,7 +221,49 @@ interface ScanState {
   birthSampled: number;
   birthMissing: number;
   birthDistinct: number;
+  /** TRA-2420 — paths we asked `st_blocks` of, and how many answered positively. */
+  blocksSampled: number;
+  blocksPositive: number;
+  /** Paths with `size > 0`; a tree of only-empty files allocating 0 is not a decline. */
+  nonEmptySampled: number;
   errors: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * TRA-2420 — allocated bytes for one stat, or `null` if the filesystem declined
+ * to say. A non-empty file reporting `blocks: 0` is a decline, not a real zero;
+ * an EMPTY file reporting 0 is a true zero. Getting that backwards makes an
+ * unmeasurable volume read as "nothing is allocated", which is the same
+ * false-zero class as the birthtime handling above.
+ */
+function countAllocated(acc: WalkAcc, state: ScanState, s: { size: number; blocks?: number }): void {
+  state.blocksSampled += 1;
+  if (s.size > 0) state.nonEmptySampled += 1;
+  if (typeof s.blocks !== 'number' || !Number.isFinite(s.blocks) || s.blocks <= 0) return;
+  state.blocksPositive += 1;
+  acc.allocated += s.blocks * 512;
+}
+
+/**
+ * TRA-2420 — whether `st_blocks` means anything on this filesystem.
+ *
+ * The failure this guards is WHOLESALE: a platform or filesystem that reports 0
+ * blocks for everything. `allocatedBytes` would then be 0 on a volume holding
+ * real data — a false zero that reads as "nothing is allocated" and makes the
+ * `/api/health/storage` residual equal the entire disk.
+ *
+ * Exported for direct test: a declining filesystem cannot be produced by writing
+ * files to a real one, so this branch would otherwise have no failing state.
+ */
+export function allocationUsable(s: {
+  blocksSampled: number;
+  blocksPositive: number;
+  nonEmptySampled: number;
+}): boolean {
+  if (s.blocksSampled === 0) return false; // nothing was proven either way
+  // Everything reported zero WHILE non-empty files exist ⇒ the filesystem declined.
+  if (s.blocksPositive === 0 && s.nonEmptySampled > 0) return false;
+  return true;
 }
 
 async function walk(dir: string, acc: WalkAcc, state: ScanState): Promise<void> {
@@ -213,6 +289,7 @@ async function walk(dir: string, acc: WalkAcc, state: ScanState): Promise<void> 
         const s = await lstat(full);
         acc.bytes += s.size;
         acc.files += 1;
+        countAllocated(acc, state, s);
       } catch {
         /* raced away between readdir and lstat — nothing to count */
       }
@@ -220,6 +297,15 @@ async function walk(dir: string, acc: WalkAcc, state: ScanState): Promise<void> 
     }
     if (item.isDirectory()) {
       acc.dirs += 1;
+      // A directory occupies blocks too, and `backups/` holds 37k files across
+      // hundreds of them. Counting only files leaves that mass in the residual,
+      // where it reads as an unattributed writer. Not counted as a file, and it
+      // does not consume the `maxFiles` budget, so truncation semantics are unchanged.
+      try {
+        countAllocated(acc, state, await stat(full));
+      } catch {
+        /* unreadable dir is already recorded by the walk below */
+      }
       await walk(full, acc, state);
       continue;
     }
@@ -235,6 +321,7 @@ async function walk(dir: string, acc: WalkAcc, state: ScanState): Promise<void> 
     }
     acc.bytes += s.size;
     acc.files += 1;
+    countAllocated(acc, state, s);
     if (acc.newestMtimeMs === null || s.mtimeMs > acc.newestMtimeMs) acc.newestMtimeMs = s.mtimeMs;
 
     const birthMs = s.birthtimeMs;
@@ -311,6 +398,9 @@ export async function measureDataDirUsage(
     birthSampled: 0,
     birthMissing: 0,
     birthDistinct: 0,
+    blocksSampled: 0,
+    blocksPositive: 0,
+    nonEmptySampled: 0,
     errors: [],
   };
 
@@ -327,6 +417,14 @@ export async function measureDataDirUsage(
     const acc = emptyAcc();
     const full = join(root, item.name);
     if (item.isDirectory() && !item.isSymbolicLink()) {
+      // The top-level entry's OWN inode blocks. `walk` does this for every nested
+      // directory it descends into, but the top level is a separate loop — missing
+      // it here left each entry's own blocks in the unaccounted residual.
+      try {
+        countAllocated(acc, state, await stat(full));
+      } catch {
+        /* unreadable dir is recorded by the walk below */
+      }
       await walk(full, acc, state);
       accs.push({ name: item.name, kind: 'dir', acc });
       continue;
@@ -338,6 +436,7 @@ export async function measureDataDirUsage(
       const s = await lstat(full);
       acc.bytes = s.size;
       acc.files = 1;
+      countAllocated(acc, state, s);
       acc.newestMtimeMs = s.mtimeMs;
       state.birthSampled += 1;
       if (!s.birthtimeMs || s.birthtimeMs <= 0) state.birthMissing += 1;
@@ -365,12 +464,14 @@ export async function measureDataDirUsage(
   // it cannot account for, and a histogram with an unknown hole in it is not an
   // attribution. An empty scan is `usable: false` too — nothing was proven.
   const birthUsable = opts.trustBirthtime ?? (state.birthSampled > 0 && state.birthMissing === 0);
+  const allocUsable = allocationUsable(state);
 
   const entries: DataDirEntryUsage[] = accs
     .map(({ name, kind, acc }) => ({
       name,
       kind,
       bytes: acc.bytes,
+      allocatedBytes: allocUsable ? acc.allocated : null,
       files: acc.files,
       dirs: acc.dirs,
       newestMtime: acc.newestMtimeMs === null ? null : new Date(acc.newestMtimeMs).toISOString(),
@@ -393,6 +494,7 @@ export async function measureDataDirUsage(
     scannedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,
     totalBytes: entries.reduce((n, e) => n + e.bytes, 0),
+    totalAllocatedBytes: allocUsable ? accs.reduce((n, a) => n + a.acc.allocated, 0) : null,
     totalFiles: entries.reduce((n, e) => n + e.files, 0),
     entries,
     days,
@@ -401,6 +503,12 @@ export async function measureDataDirUsage(
       sampledFiles: state.birthSampled,
       missing: state.birthMissing,
       distinctFromMtime: state.birthDistinct,
+    },
+    allocation: {
+      usable: allocUsable,
+      sampledPaths: state.blocksSampled,
+      answeredPaths: state.blocksPositive,
+      nonEmptyPaths: state.nonEmptySampled,
     },
     truncated: state.truncated,
     errors: state.errors,

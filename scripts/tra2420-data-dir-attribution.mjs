@@ -31,6 +31,16 @@
  *     zero total across every entry is NOT_GRADEABLE, never "nothing grew".
  *   - **A truncated or lossy scan.** `truncated` or a non-empty `errors` list
  *     makes every byte figure a floor. Floors do not get published as totals.
+ *   - **A unit-mismatched residual.** THIS ONE SHIPPED (fixed 2026-07-30). The
+ *     `unaccounted` guard below compared APPARENT bytes (`st_size`, what the walk
+ *     sums) against `df`-used, which is ALLOCATED blocks PLUS the root reserve.
+ *     On bqb1 those differ structurally by ~150 MB — ~100 MB of 4 KiB block
+ *     rounding across ~48k small files, plus ext4's ~49 MB 5% reserve — so the
+ *     residual read 35% and this script exited 1 UNATTRIBUTED on every run. No
+ *     state of the real disk could have produced a pass: the guard was reading a
+ *     constant. A working script and a broken one were byte-identical in output.
+ *     Both sides are now allocated bytes, with the reserve subtracted because no
+ *     writer owns it.
  *
  * Exit codes
  *   0  ATTRIBUTED     a complete weekday's growth, ranked by writer
@@ -38,15 +48,22 @@
  *                     for the disk (large `unaccounted.pct`)
  *   2  NOT_DEPLOYED   200 without the `usage` key — the old build
  *   3  BLIND          unreachable / non-200 / unparseable / truncated / errors
- *   4  PARTIAL        deployed, but the growth histogram is unmeasurable or the
+ *   4  PARTIAL        deployed, but the growth histogram is unmeasurable, the
+ *                     residual is ungradeable (allocation unusable / null), or the
  *                     window holds no complete weekday with any growth
  *
  * ## Controls
  *
- * `--self-test` drives this same script over a real socket against four crafted
- * payloads and asserts the four exit codes. Without it, a script that exits 2 on
- * everything is indistinguishable from a working one, because 2 is the only
- * answer the live host can give until the deploy carrying `usage` lands.
+ * `--self-test` drives this same script over a real socket against seven crafted
+ * payloads and asserts every one of the five exit codes is REACHABLE. Without it, a
+ * script that exits 2 on everything is indistinguishable from a working one, because
+ * 2 is the only answer the live host can give until the deploy carrying `usage` lands.
+ *
+ * One control is the regression above: bqb1's real shape, where the apparent-basis
+ * residual is 35% and the allocated-basis residual is ~9%. It must exit 0. Asserting
+ * only that the codes DIFFER is not enough — two controls may legitimately share a
+ * code, and the pre-fix script passed a distinctness check while being unable to
+ * return 0 for any real disk.
  *
  * Usage
  *   node scripts/tra2420-data-dir-attribution.mjs [--host=…] [--day=YYYY-MM-DD]
@@ -105,8 +122,12 @@ async function main() {
     `host        ${HOST}`,
     `dataDir     ${usage.root}`,
     `scannedAt   ${usage.scannedAt} (${usage.durationMs} ms, ${usage.totalFiles} files)`,
-    `measured    ${MB(usage.totalBytes)} across ${usage.entries.length} top-level entries`,
-    `disk        ${MB(body?.disk?.usedBytes ?? 0)} used, ${body?.disk?.freePct ?? '?'}% free`,
+    `measured    ${MB(usage.totalBytes)} apparent / ${
+      typeof usage.totalAllocatedBytes === 'number' ? MB(usage.totalAllocatedBytes) : 'unmeasurable'
+    } allocated across ${usage.entries.length} top-level entries`,
+    `disk        ${MB(body?.disk?.usedBytes ?? 0)} used (${MB(
+      body?.disk?.reservedBytes ?? 0,
+    )} root-reserved), ${body?.disk?.freePct ?? '?'}% free`,
   ];
 
   if (usage.truncated) {
@@ -119,11 +140,36 @@ async function main() {
     ]);
   }
 
+  // TRA-2420 — the residual is only meaningful if BOTH sides are allocated bytes.
+  // `allocation.usable: false` means the filesystem declined to report `st_blocks`,
+  // which makes the residual unknown — NOT small, and not a licence to fall back to
+  // the apparent figure, whose gap on this volume is ~150 MB of block rounding plus
+  // root reserve. That fallback is what made this script exit 1 unconditionally.
+  if (!usage.allocation?.usable || typeof usage.totalAllocatedBytes !== 'number') {
+    done(EXIT.PARTIAL, 'PARTIAL — allocated bytes are unmeasurable, so the residual cannot be graded', [
+      ...ctx,
+      `allocation  sampled ${usage.allocation?.sampledPaths ?? 0}, answered ${
+        usage.allocation?.answeredPaths ?? 0
+      }, non-empty ${usage.allocation?.nonEmptyPaths ?? 0}`,
+      'Only apparent (st_size) bytes are available. Grading the residual on those',
+      'counts block rounding and the root reserve as an unowned writer.',
+    ]);
+  }
+
   const unaccountedPct = usage.unaccounted?.pct;
-  if (typeof unaccountedPct === 'number' && unaccountedPct > MAX_UNACCOUNTED_PCT) {
+  if (typeof unaccountedPct !== 'number') {
+    done(EXIT.PARTIAL, 'PARTIAL — the residual is null, so the breakdown cannot be checked against the disk', [
+      ...ctx,
+      `unaccounted ${JSON.stringify(usage.unaccounted ?? null)}`,
+      'statfs did not answer, or the reserve is unknown. A null residual is not a small one.',
+    ]);
+  }
+  if (unaccountedPct > MAX_UNACCOUNTED_PCT) {
     done(EXIT.UNATTRIBUTED, `UNATTRIBUTED — ${unaccountedPct}% of the used disk is outside this breakdown`, [
       ...ctx,
+      `attributable ${MB(usage.unaccounted.attributableUsedBytes)} used less root reserve`,
       `unaccounted ${MB(usage.unaccounted.bytes)} (${unaccountedPct}%, limit ${MAX_UNACCOUNTED_PCT}%)`,
+      `contrast    apparent-basis residual would read ${usage.unaccounted.apparent?.pct ?? '?'}% — unit-mismatched, do not grade on it`,
       'Something on the volume is not under DATA_DIR. Ranking the entries below would',
       'name a writer for the wrong bytes.',
     ]);
@@ -224,18 +270,28 @@ async function selfTest() {
     byFile,
   });
   const base = (over = {}) => ({
-    disk: { usedBytes: 20 * 1048576, freePct: 42.6 },
+    disk: { usedBytes: 20 * 1048576, reservedBytes: 1048576, freePct: 42.6 },
     usage: {
       root: '/data',
       scannedAt: `${days[0]}T13:00:00.000Z`,
       durationMs: 12,
       totalBytes: 18 * 1048576,
+      totalAllocatedBytes: 19 * 1048576,
       totalFiles: 4,
       days,
       truncated: false,
       errors: [],
       birthtime: { usable: true, sampledFiles: 4, missing: 0, distinctFromMtime: 2 },
-      unaccounted: { diskUsedBytes: 20 * 1048576, measuredBytes: 18 * 1048576, bytes: 2 * 1048576, pct: 10 },
+      allocation: { usable: true, sampledPaths: 6, answeredPaths: 6, nonEmptyPaths: 4 },
+      unaccounted: {
+        diskUsedBytes: 20 * 1048576,
+        reservedBytes: 1048576,
+        attributableUsedBytes: 19 * 1048576,
+        allocatedBytes: 19 * 1048576,
+        bytes: 0,
+        pct: 0,
+        apparent: { measuredBytes: 18 * 1048576, bytes: 2 * 1048576, pct: 10 },
+      },
       entries: [
         entry('option-chains', 12 * 1048576, { '2026-07-28': 1048576 }, { '2026-07-28': 1048576 }, [
           { pattern: 'AAPL.json.gz', files: 1, bytes: 1048576, createdBytesInWindow: 1048576 },
@@ -263,10 +319,61 @@ async function selfTest() {
     ],
     [
       'UNATTRIBUTED (the breakdown does not account for the disk)',
-      base({ unaccounted: { diskUsedBytes: 20 * 1048576, measuredBytes: 2 * 1048576, bytes: 18 * 1048576, pct: 90 } }),
+      base({
+        unaccounted: {
+          diskUsedBytes: 20 * 1048576,
+          reservedBytes: 1048576,
+          attributableUsedBytes: 19 * 1048576,
+          allocatedBytes: 2 * 1048576,
+          bytes: 17 * 1048576,
+          pct: 89.474,
+          apparent: { measuredBytes: 2 * 1048576, bytes: 18 * 1048576, pct: 90 },
+        },
+      }),
       EXIT.UNATTRIBUTED,
     ],
     ['BLIND (truncated scan — every figure is a floor)', base({ truncated: true }), EXIT.BLIND],
+    // ── The TRA-2420 regression control ──────────────────────────────────────
+    // bqb1's real shape as measured 2026-07-30: 373.8 MB apparent under /data,
+    // 575 MB `df`-used, of which ~49 MB is ext4 root reserve and ~100 MB is 4 KiB
+    // block rounding across ~48k small files. On the APPARENT basis the residual is
+    // 35% and this script exits 1 UNATTRIBUTED; on the correct ALLOCATED basis it is
+    // ~9% and the ranking is publishable. The pre-fix script had NO input that could
+    // exit 0 on this host, so a working script and a broken one read identically.
+    [
+      'ATTRIBUTED despite a 35% APPARENT residual (bqb1 shape — the unit-mismatch regression)',
+      base({
+        totalBytes: 373 * 1048576,
+        totalAllocatedBytes: 478 * 1048576,
+        unaccounted: {
+          diskUsedBytes: 575 * 1048576,
+          reservedBytes: 49 * 1048576,
+          attributableUsedBytes: 526 * 1048576,
+          allocatedBytes: 478 * 1048576,
+          bytes: 48 * 1048576,
+          pct: 9.125,
+          apparent: { measuredBytes: 373 * 1048576, bytes: 202 * 1048576, pct: 35.13 },
+        },
+      }),
+      EXIT.ATTRIBUTED,
+    ],
+    [
+      'PARTIAL (st_blocks unavailable — residual UNKNOWN, must not fall back to apparent)',
+      base({
+        totalAllocatedBytes: null,
+        allocation: { usable: false, sampledPaths: 6, answeredPaths: 0, nonEmptyPaths: 4 },
+        unaccounted: {
+          diskUsedBytes: 20 * 1048576,
+          reservedBytes: 1048576,
+          attributableUsedBytes: 19 * 1048576,
+          allocatedBytes: null,
+          bytes: null,
+          pct: null,
+          apparent: { measuredBytes: 18 * 1048576, bytes: 2 * 1048576, pct: 10 },
+        },
+      }),
+      EXIT.PARTIAL,
+    ],
   ];
 
   let payload = null;
@@ -308,9 +415,19 @@ async function selfTest() {
   } else {
     console.log(`  ok    ranked by GROWTH not activity: ${order.join(' > ')}`);
   }
-  if (new Set(seen).size !== seen.length) {
+  // A grader whose branches all return the same thing is not a grader. The check
+  // is that every one of the five codes is REACHABLE — not that each case is
+  // unique, since two cases may legitimately share a code (the bqb1-shape control
+  // shares 0 with the positive mark, which is the entire point of it).
+  const reached = new Set(seen);
+  const missing = Object.entries(EXIT)
+    .filter(([, code]) => !reached.has(code))
+    .map(([name, code]) => `${name}(${code})`);
+  if (missing.length > 0) {
     failures += 1;
-    console.log(`  FAIL  branches collapsed onto the same exit code: ${seen.join(',')}`);
+    console.log(`  FAIL  exit codes never reached by any control: ${missing.join(', ')}`);
+  } else {
+    console.log(`  ok    all ${reached.size} exit codes reachable across ${seen.length} controls`);
   }
   server.close();
   console.log(`\n[TRA-2420 self-test] ${failures === 0 ? 'PASS' : `${failures} FAILED`}`);
