@@ -944,6 +944,31 @@ async function main(argv) {
 }
 
 /**
+ * TRA-2630 AC2 — this instrument's own provenance, printed ABOVE the verdict on
+ * EVERY arm.
+ *
+ * The AC2 grade fires ONCE (routine `89f86715`, 21:30 ET). Its worst failure mode
+ * is not a wrong verdict — it is a real-looking verdict produced by a STALE copy
+ * of this script. A checkout predating `f7a8cb0` prints no AC2 section at all; one
+ * predating `09f3821` prints the verdict with NO cohort pin, so a denominator that
+ * shrank from 15 books to 1 reads as a clean PASS — the exact defect `09f3821`
+ * exists to kill. Both are live risks: the grader runs from whatever checkout the
+ * harness hands the run, and on 2026-07-30T11:3xZ the handed `PAPERCLIP_WORKSPACE_CWD`
+ * was not a git repository at all while `$AGENT_HOME/trading-app` sat 3 commits stale.
+ *
+ * A stale script cannot warn you that it is stale. So this line is written to state
+ * what its OWN ABSENCE means, and the routine requires it: absence becomes a
+ * positive stale signal instead of something a reader must notice is missing.
+ */
+const AC2_INSTRUMENT_REV = 'pin era (09f3821+)';
+
+function printAc2Provenance() {
+  console.log(`  instrument: check-pnl-options-lag.mjs — AC2 ${AC2_INSTRUMENT_REV}.`);
+  console.log('  If this line is ABSENT from your output you are running a STALE checkout:');
+  console.log('  that reading is BLIND, not a verdict. `git pull origin main`, then re-run.');
+}
+
+/**
  * TRA-2630 AC2 — print the DELTA verdict. Always runs before the early returns,
  * because the exit code is owned by whichever axis outranks (a live credit
  * shortfall beats demo lag) and AC2 must stay readable underneath it.
@@ -951,6 +976,7 @@ async function main(argv) {
 function printAc2(ac2) {
   if (!ac2) return;
   console.log(`TRA-2630 AC2 — NEW lag sessions dated >= ${ac2.since} (the fix-deploy boundary):`);
+  printAc2Provenance();
   if (ac2.verdict === 'BLIND') {
     console.log(
       `  BLIND — NOT MEASURED. 0 books carry a gradeable session on/after ${ac2.since}`
@@ -1838,6 +1864,52 @@ function selftest() {
       return { verdict: g.verdict, gradeable: g.gradeableBookCount, cohort: g.cohort.verdict };
     })(),
     { verdict: 'PASS', gradeable: 1, cohort: 'SHRANK' },
+  );
+
+  // PROVENANCE: a one-shot grade read off a stale checkout is the failure mode
+  // `printAc2Provenance` exists to make detectable. These controls drive the real
+  // printer and capture stdout, because the property under test IS the printed
+  // text — asserting on a returned object would prove nothing about what a grader
+  // actually reads. The line must appear on ALL THREE arms: the arm most likely to
+  // be misread (BLIND) is the one a stale script would render as a bare PASS.
+  const capturePrintAc2 = (ac2) => {
+    const lines = [];
+    const real = console.log;
+    console.log = (...a) => lines.push(a.join(' '));
+    try {
+      printAc2(ac2);
+    } finally {
+      console.log = real;
+    }
+    return lines.join('\n');
+  };
+  const day = (date, sd, od) => ({ date, stockDaily: sd, optionsDaily: od });
+  const graded = (days) => gradeAc2Delta(
+    [{ username: 'Richard', mode: 'demo', days }],
+    AC2_FIX_DEPLOY_DATE,
+  );
+  const arms = {
+    BLIND: graded([day('2026-07-29', 0, -5.11)]),
+    PASS: graded([day('2026-07-29', 0, -5.11), day('2026-07-30', 3.25, 0)]),
+    FAIL: graded([day('2026-07-29', 0, -5.11), day('2026-07-30', -5.11, 0)]),
+  };
+  for (const [arm, g] of Object.entries(arms)) {
+    const out = capturePrintAc2(g);
+    check(
+      `PROVENANCE: the ${arm} arm carries the instrument-revision line`,
+      { verdict: g.verdict, hasRev: out.includes(AC2_INSTRUMENT_REV), saysStaleIsBlind: /ABSENT[\s\S]*STALE[\s\S]*BLIND/.test(out) },
+      { verdict: arm, hasRev: true, saysStaleIsBlind: true },
+    );
+  }
+  check(
+    'PROVENANCE: the line sits ABOVE the verdict, so a truncated read still shows it',
+    (() => {
+      const out = capturePrintAc2(arms.PASS).split('\n');
+      const revAt = out.findIndex((l) => l.includes(AC2_INSTRUMENT_REV));
+      const verdictAt = out.findIndex((l) => l.includes('PASS —'));
+      return { revBeforeVerdict: revAt >= 0 && verdictAt >= 0 && revAt < verdictAt };
+    })(),
+    { revBeforeVerdict: true },
   );
 
   let failed = 0;
