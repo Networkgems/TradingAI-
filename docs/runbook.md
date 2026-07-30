@@ -424,68 +424,6 @@ watchdog's own pm2 self-restart, which writes no deploy record at all (TRA-2203/
 A raw `POST /v1/services/…/deploys` curl also bypasses it, so the wrapper is the
 *documented, enforced* path; do not hand-roll the curl during the soak.
 
-### ⚠️ DEPLOY NOTE (TRA-2384, TRANSITORY) — the next bqb1 deploy changes the capital-gate headline
-
-**Read this if you are about to deploy `main` to bqb1 for *any* reason.** The change below
-is **not yours**, it is **expected**, and it needs **no revert and no escalation**. It will
-land inside whatever deploy goes first, including one for a completely unrelated ticket —
-the "unattributed rider" shape we already paid for on TRA-2313.
-
-`b7fdbd8` (TRA-2361 rule R1) and `88a072e` (TRA-2353 per-sleeve axis) are **merged to
-`origin/main` but not running**: bqb1 is on `408f06a5` and
-`GET /api/health/live-capital-gate` carries **no `sleeveFeasibility` key at all**. So the
-gate output an operator reads changes on the **DEPLOY, not on the merge**.
-
-| | live today (measured 2026-07-26, build `408f06a5`) | first deploy carrying `b7fdbd8` |
-|---|---|---|
-| `gate.passed` | `false` | `false` — **unchanged; this is the safety property** |
-| `positive_expectancy.status` | `FAIL` | **`INFEASIBLE`** |
-| headline | book pair — *"the 0.200R bar is below the 0.239R payoff ceiling of the graded book (n=47)"* | names the offending **sleeve**, its **weight** and its **ceiling** |
-
-Why it is near-certain rather than merely possible: R1 blocks when a sleeve is positively
-`infeasible` **and** carries weight ≥ `BLOCKING_SLEEVE_WEIGHT` (0.20). The live credit
-sleeve is **35/47 = 74.5%** of the graded book and `docs/live-capital-gate.md` already
-records it as *flatly infeasible*, so both conjuncts are satisfied at today's composition.
-(The composition is measured, not fixed — but the `gate.passed` direction below is
-unconditional either way.)
-
-**1. `FAIL → INFEASIBLE` is not a regression.** The two statuses are deliberately
-distinguishable: `FAIL` asserts a fact about the **book**, `INFEASIBLE` asserts a fact
-about the **bar** — that no hit rate can reach it. `gate.passed` is `false` on both sides.
-Nothing that was open closes and nothing that was closed opens.
-
-**2. The direction is proven differentially, not by reading the code.** R1 adds a conjunct
-to a conjunction, which is monotone non-increasing. Do not re-derive that from
-`live-capital-gate.ts` — run the prover:
-
-```bash
-node scripts/tra2361-monotonicity-matrix.mjs
-# ✅ OK — passed′ ≤ passed pointwise over 10 fixtures: ZERO false→true, 3 true→false.
-```
-
-**3. `scripts/tra2335-feasibility-check.mjs --live` reads FAIL right now — do not "fix" it.**
-
-```bash
-node scripts/tra2335-feasibility-check.mjs --live
-# ❌ FAIL — the route carries NO `sleeveFeasibility` block
-```
-
-That is the **honest pre-deploy state**, not a defect in the prover: the field genuinely is
-not on the live build. It flips to OK on the same deploy that ships `b7fdbd8`. The prover is
-correctly reporting a stale host; patching it would only blind it.
-
-**4. Full rule:** TRA-2361, and `docs/live-capital-gate.md` §"Rule R1".
-
-> 🗑️ **DELETE THIS NOTE once a build carrying `b7fdbd8` is live** — it is a transition
-> notice, not a standing rule, and it becomes a false statement the moment the deploy
-> happens. The removal condition is mechanical, so check it rather than guessing:
->
-> ```bash
-> pnpm check:deploy-drift          # `b7fdbd8` no longer listed as MERGED BUT NOT RUNNING
-> ```
->
-> If you are the one whose deploy ships it, delete this section in your follow-up commit.
-
 ### Standard deploy (self-hosted PM2)
 
 1. On the production machine, sync the target commit — deploys track `main`:
@@ -513,6 +451,13 @@ curl -s http://<host>/api/health/storage    # confirm dataDir_exists + backupsCo
 
 Then log into the dashboard and confirm a `state` snapshot arrives over the
 WebSocket (the UI populates).
+
+If you are reading `GET /api/health/live-capital-gate` after a deploy, the rule that
+decides what a per-sleeve `infeasible` does to `gate.passed` — and the difference between
+a `FAIL` and an `INFEASIBLE` `positive_expectancy` — lives in
+[`docs/live-capital-gate.md`](live-capital-gate.md) §"Rule R1" (TRA-2361). Grade the route
+with `node scripts/tra2335-feasibility-check.mjs --live`; it grades the **instrument**, not
+the book, so a live `infeasible` sleeve is a market observation, never a broken deploy.
 
 ### Render deploy status & failed-build logs (TRA-893)
 
