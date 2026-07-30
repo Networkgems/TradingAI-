@@ -135,6 +135,64 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_ABSENT_EOD_ROW_NOTE,
 ];
 
+/**
+ * TRA-2630 DEFECT A, AC1 — the fields a gate must NOT key on, published as DATA.
+ *
+ * AC1 offered two closes: make `drift` mean what its name says, or keep it
+ * options-only and DOCUMENT it "so no future gate mistakes it for a
+ * reconciliation error". The documented close shipped — and then the
+ * documentation landed one level BELOW the fields it documents. `caveats` is
+ * returned by {@link reconcilePnl}, so on the wire it lives at
+ * `engines[i].caveats`, while `ok` and `maxDriftUsd` — the two fields TRA-2624's
+ * C5 actually keyed on — sit at the TOP level with nothing beside them. A gate
+ * author reading the response head sees `"ok": false, "maxDriftUsd": 765` and no
+ * hint that neither is a verdict. That is the same mistake this AC exists to
+ * prevent, committed by its own fix.
+ *
+ * Two things follow, and the second matters more:
+ *
+ *   1. `caveats` is hoisted to the top level, beside the fields it disclaims.
+ *   2. The disclaimer is also emitted MACHINE-READABLY. A prose sentence inside
+ *      a string array cannot be asserted by a checker; `driftGradeable: false`
+ *      can. A gate that wants to fail closed on ungradeable inputs can read one
+ *      boolean instead of grepping English.
+ *
+ * `driftGradeable` is a constant, deliberately. It is not a verdict about
+ * today's data — it is a STRUCTURAL property of how `drift` is computed: the
+ * stock leg is summed from `allClosedPositions`, which the TRA-219 21:00 ET
+ * archive clears at the same moment the report is written, so it is lossy by
+ * construction while `stockDaily` (an equity delta) is durable. Pooling those
+ * two can never have a reachable green state. It flips to `true` only when a
+ * writer change makes both operands durable — at which point this constant is
+ * the thing that must be edited, on purpose, with evidence.
+ */
+export const PNL_DRIFT_GRADEABLE = false;
+
+/**
+ * Top-level response fields that are RETAINED for existing consumers but are not
+ * gradeable verdicts, plus the per-row field they are folded from. Published so
+ * a checker can enumerate them rather than hard-code its own copy of the list.
+ */
+export const PNL_UNGRADEABLE_FIELDS = ['ok', 'maxDriftUsd', 'engines[].drift'];
+
+/**
+ * TRA-2630 AC1 — the gradeability disclaimer, hoisted to the top of the payload.
+ *
+ * Spread into `/api/health/pnl-reconciliation` beside `ok` / `maxDriftUsd`. See
+ * {@link PNL_DRIFT_GRADEABLE} for why this is a constant and not a measurement.
+ */
+export function summarizeDriftGradeability(): {
+  driftGradeable: boolean;
+  ungradeableFields: string[];
+  caveats: string[];
+} {
+  return {
+    driftGradeable: PNL_DRIFT_GRADEABLE,
+    ungradeableFields: [...PNL_UNGRADEABLE_FIELDS],
+    caveats: PNL_RECONCILIATION_CAVEATS,
+  };
+}
+
 /** Penny tolerance — a drift at or below this is treated as clean (rounding). */
 export const PNL_RECONCILE_TOLERANCE_USD = 0.01;
 

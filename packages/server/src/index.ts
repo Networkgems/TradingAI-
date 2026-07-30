@@ -23,6 +23,7 @@ import {
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
+  summarizeDriftGradeability,
 } from './pnl-reconciliation.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
@@ -4109,6 +4110,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       time: new Date().toISOString(),
       ok: engines.every(e => e.ok),
       maxDriftUsd,
+      // TRA-2630 AC1 — the disclaimer for the TWO fields immediately above,
+      // placed where those fields are actually read. It was already written, but
+      // only inside `reconcilePnl`'s result, i.e. at `engines[i].caveats` — one
+      // level BELOW `ok` / `maxDriftUsd`, and 59 copies deep. TRA-2624's C5 keyed
+      // on the response head; a gate author looking there saw `ok: false` and
+      // nothing else. `driftGradeable: false` is the machine-readable half: a
+      // checker can assert a boolean, it cannot assert a prose caveat.
+      ...summarizeDriftGradeability(),
       baselineDate,
       // TRA-2302 — reported BESIDE `ok`, not folded into it, so the existing
       // drift verdict keeps its meaning for every consumer already reading it.

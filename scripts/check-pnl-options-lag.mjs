@@ -440,6 +440,65 @@ export function gradeCreditObservation(payload) {
 }
 
 /**
+ * TRA-2630 AC1 — grade the DISCLAIMER, not the metric.
+ *
+ * AC1's close was "keep `drift` options-only but document it so no future gate
+ * mistakes it for a reconciliation error". The prose shipped inside
+ * `reconcilePnl`'s result, so on the wire it sat at `engines[i].caveats` while
+ * `ok` / `maxDriftUsd` sat at the top. TRA-2624's C5 keyed on the top level. A
+ * disclaimer a gate author never scrolls to has not closed anything, so the hoist
+ * needs its own guard or the next refactor drops it in silence.
+ *
+ * Three distinguishable states, and the middle one is the point:
+ *
+ *   - `PRESENT`     — top-level `driftGradeable: false` AND a top-level `caveats`
+ *                     array carrying the decomposition note.
+ *   - `PARTIAL`     — one of the two is there. Someone edited the response shape
+ *                     and took half the disclaimer with them.
+ *   - `ABSENT`      — neither. Either a build predating this fix, or a regression.
+ *                     Those two are NOT distinguishable from the payload alone,
+ *                     which is why this never touches the exit code — compare
+ *                     `/api/health/version` against the fix commit to tell them
+ *                     apart.
+ *
+ * A `driftGradeable: true` is loud on purpose: it is a positive claim that the
+ * pooled metric became gradeable, which only a writer change can justify.
+ */
+function describeGradeabilityDisclaimer(payload) {
+  const flag = payload?.driftGradeable;
+  const caveats = Array.isArray(payload?.caveats) ? payload.caveats : null;
+  const hasNote = caveats != null && caveats.some((c) => typeof c === 'string' && c.includes('TRA-2630'));
+  const fields = Array.isArray(payload?.ungradeableFields) ? payload.ungradeableFields : [];
+  if (flag === true) {
+    return {
+      verdict: 'CLAIMS GRADEABLE',
+      detail: 'payload asserts `driftGradeable: true` — a pooled lossy/durable metric cannot'
+        + ' become gradeable without a writer change. Verify before grading anything off `ok`.',
+    };
+  }
+  if (flag === false && hasNote) {
+    return {
+      verdict: 'PRESENT',
+      detail: `\`driftGradeable: false\` + ${caveats.length} top-level caveat(s); `
+        + `ungradeableFields=[${fields.join(', ')}]`,
+    };
+  }
+  if (flag === false || hasNote) {
+    return {
+      verdict: 'PARTIAL',
+      detail: `driftGradeable=${JSON.stringify(flag)}, top-level TRA-2630 caveat=${hasNote}`
+        + ' — half the disclaimer is missing from the response head.',
+    };
+  }
+  return {
+    verdict: 'ABSENT',
+    detail: 'no top-level `driftGradeable` and no top-level `caveats` — the disclaimer for'
+      + ' `ok`/`maxDriftUsd` is not where they are read. Pre-fix build, or a regression;'
+      + ' check /api/health/version to tell which.',
+  };
+}
+
+/**
  * Per-leg drift roll-up, reported alongside the tripwire.
  *
  * ONLY `optionsLeg` IS GRADEABLE (TRA-2633). This function used to present both
@@ -620,6 +679,15 @@ async function main(argv) {
     }
   }
   console.log(`  NOT gradeable, shown for continuity: ok=${payload.ok} maxDriftUsd=${payload.maxDriftUsd}`);
+  // TRA-2630 AC1 — does the SERVED payload disclaim those two fields where they
+  // are read? The prose caveat has always been in `engines[i].caveats`, one level
+  // below the head of the response, which is where a gate author looks. This line
+  // grades the hoist itself so a future refactor cannot silently un-document it.
+  // Reported, never folded into the exit code: an OLD build legitimately lacks
+  // the field, and turning that into a failure would make this guard unrunnable
+  // against any pinned deploy.
+  const gradeability = describeGradeabilityDisclaimer(payload);
+  console.log(`  top-level disclaimer: ${gradeability.verdict} — ${gradeability.detail}`);
   console.log('');
 
   // TRA-2635 — the credit axis, printed BEFORE the lag axis because it is the
@@ -1507,6 +1575,44 @@ function selftest() {
       creditCredited: 'CREDIT_OK',
       creditUncredited: 'LIVE_CREDIT_UNSHIPPED',
     },
+  );
+
+  // TRA-2630 AC1 — controls for the DISCLAIMER guard. Both directions, because
+  // "the disclaimer is present" and "this build predates the disclaimer" are the
+  // two readings that must never collapse into one another.
+  const TRA2630_NOTE = 'TRA-2630: `drift` pools a LOSSY stock leg …';
+  check(
+    'DISCLAIMER: both halves at the top level grade PRESENT',
+    describeGradeabilityDisclaimer({
+      ok: false, maxDriftUsd: 765, driftGradeable: false,
+      ungradeableFields: ['ok', 'maxDriftUsd', 'engines[].drift'],
+      caveats: ['unrelated caveat', TRA2630_NOTE],
+    }).verdict,
+    'PRESENT',
+  );
+  check(
+    'DISCLAIMER: a pre-fix payload grades ABSENT, not PRESENT',
+    // The exact shape bqb1 served before this fix: the note existed, but only
+    // inside each engine. A guard that searched `engines[i].caveats` would have
+    // called this closed.
+    describeGradeabilityDisclaimer({
+      ok: false, maxDriftUsd: 765,
+      engines: [{ username: 'admin', caveats: [TRA2630_NOTE] }],
+    }).verdict,
+    'ABSENT',
+  );
+  check(
+    'DISCLAIMER: flag without caveats, and caveats without flag, are both PARTIAL',
+    {
+      flagOnly: describeGradeabilityDisclaimer({ driftGradeable: false }).verdict,
+      caveatsOnly: describeGradeabilityDisclaimer({ caveats: [TRA2630_NOTE] }).verdict,
+    },
+    { flagOnly: 'PARTIAL', caveatsOnly: 'PARTIAL' },
+  );
+  check(
+    'DISCLAIMER: a payload CLAIMING the pooled metric is gradeable is called out',
+    describeGradeabilityDisclaimer({ driftGradeable: true, caveats: [TRA2630_NOTE] }).verdict,
+    'CLAIMS GRADEABLE',
   );
 
   let failed = 0;

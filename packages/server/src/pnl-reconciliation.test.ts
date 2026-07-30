@@ -6,7 +6,11 @@ import {
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
+  summarizeDriftGradeability,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
+  PNL_RECONCILIATION_CAVEATS,
+  PNL_DRIFT_DECOMPOSITION_NOTE,
+  PNL_ABSENT_EOD_ROW_NOTE,
 } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
 
@@ -1137,5 +1141,38 @@ describe('TRA-2637 — summarizeLiveEodRowPresence', () => {
     const r = summarizeLiveEodRowPresence([book('admin', 'live', null, [], 0)]);
     expect(r.liveEodRowBookCount).toBe(1);
     expect(r.liveEodRowsPresentOk).toBeNull();
+  });
+});
+
+// TRA-2630 AC1 — the documented close is only closed if the documentation is
+// reachable from where the disclaimed field is read. `caveats` shipped inside
+// `reconcilePnl`'s result, i.e. at `engines[i].caveats`; `ok` / `maxDriftUsd` are
+// top-level. This helper is what puts the disclaimer beside the fields.
+describe('TRA-2630 AC1 — summarizeDriftGradeability', () => {
+  it('names every ungradeable field, including the per-row one they fold from', () => {
+    const r = summarizeDriftGradeability();
+    // `drift` is the per-row operand; omitting it would leave a consumer free to
+    // grade `engines[i].days[j].drift` directly, which is the ORIGINAL defect.
+    expect(r.ungradeableFields).toEqual(['ok', 'maxDriftUsd', 'engines[].drift']);
+  });
+
+  it('emits the disclaimer machine-readably, not only as prose', () => {
+    // A checker cannot assert an English sentence in a string array. This is the
+    // half of the close that a gate can actually fail closed on.
+    expect(summarizeDriftGradeability().driftGradeable).toBe(false);
+  });
+
+  it('carries the decomposition and absent-row notes so the hoist loses nothing', () => {
+    const r = summarizeDriftGradeability();
+    expect(r.caveats).toContain(PNL_DRIFT_DECOMPOSITION_NOTE);
+    expect(r.caveats).toContain(PNL_ABSENT_EOD_ROW_NOTE);
+    expect(r.caveats).toEqual(PNL_RECONCILIATION_CAVEATS);
+  });
+
+  it('hands out a COPY of the field list — a caller cannot mutate the constant', () => {
+    // The route spreads this into a JSON response once per request; a consumer
+    // (or a test) pushing onto the returned array must not poison the next call.
+    summarizeDriftGradeability().ungradeableFields.push('injected');
+    expect(summarizeDriftGradeability().ungradeableFields).not.toContain('injected');
   });
 });
