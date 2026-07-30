@@ -224,19 +224,78 @@ export function gradeCreditObservation(payload) {
     const gradeable = written.filter(
       (d) => !d?.belowBaseline && Math.abs(Number(d?.optionsDaily)) > TOLERANCE_USD,
     );
-    const absorbed =
-      gradeable.length === 0
+    // TRA-2635 SECOND PASS — A ZERO COUNTER IS NOT EVIDENCE OF ABSENCE unless the
+    // counter is DURABLE, and on the live fleet it is not. `Richard` wrote 0 on
+    // three consecutive sessions while `closingEquity` moved +67.50 then +22.50 —
+    // exactly the two prior sessions' `optionsDaily`. The money arrived; the
+    // counter did not survive the boot. Two row-level signatures prove the reset,
+    // and either forces NOT MEASURED rather than a manufactured red:
+    //   - a `lagsPriorOptionsDaily` session (the TRA-2629 signature — and its
+    //     presence PROVES a credit reached equity);
+    //   - a negative credit window (a cumulative counter cannot decrease).
+    const lagDates = findPriorOptionsLagDates(days).map((h) => h.date);
+    let negativeWindow = false;
+    for (let i = 1; i < written.length; i++) {
+      const delta =
+        Number(written[i].optionsCreditedCumulative)
+        - Number(written[i - 1].optionsCreditedCumulative);
+      if (delta < -TOLERANCE_USD) negativeWindow = true;
+    }
+    const counterDurable = written.length === 0 ? null : lagDates.length === 0 && !negativeWindow;
+    // Asymmetric on purpose: a counter that MOVED is positive evidence regardless
+    // of durability — money that was recorded was recorded.
+    const absorbed = gradeable.some((d) => Number(d.optionsCreditedCumulative) !== 0)
+      ? true
+      : gradeable.length === 0 || counterDurable !== true
         ? null
-        : gradeable.some((d) => Number(d.optionsCreditedCumulative) !== 0);
+        : false;
     const realized = days
       .filter((d) => !d?.belowBaseline && Number.isFinite(Number(d?.optionsDaily)))
       .reduce((sum, d) => sum + Number(d.optionsDaily), 0);
+    // Reported for context; the SHORTFALL arithmetic below uses the telescoping
+    // `spanned` slice instead (see the comment there).
     const latest = written.length > 0 ? written[written.length - 1] : null;
     const equityRows = days.filter((d) => Number.isFinite(Number(d?.closingEquity)));
     const latestEquity = equityRows.length > 0 ? equityRows[equityRows.length - 1] : null;
+    // TRA-2635 — THE COUNTER-FREE STATE MEASUREMENT, which is what carries the
+    // finding when the boolean is NOT MEASURED. Equity either grew or it did not.
+    // UPPER BOUND when `counterDurable === false`: the lagged credit is already
+    // inside `stockDaily` there, so that leg double-counts it.
+    // THE OPERANDS MUST TELESCOPE. `closingEquity[last] − closingEquity[first]`
+    // spans the windows of rows 1..N, so the P&L sums skip row 0 — its session's
+    // P&L landed in a delta whose left endpoint is outside the series. Summing
+    // 0..N against a 1..N delta fabricates a shortfall equal to row 0's P&L.
+    const evaluatedEquity = days.filter(
+      (d) => !d?.belowBaseline && Number.isFinite(Number(d?.closingEquity)),
+    );
+    const equityGrowth =
+      evaluatedEquity.length < 2
+        ? null
+        : Math.round(
+          (Number(evaluatedEquity[evaluatedEquity.length - 1].closingEquity)
+            - Number(evaluatedEquity[0].closingEquity)) * 100,
+        ) / 100;
+    const spanned = evaluatedEquity.slice(1);
+    const spannedOptions = spanned.reduce(
+      (s, d) => s + (Number.isFinite(Number(d?.optionsDaily)) ? Number(d.optionsDaily) : 0),
+      0,
+    );
+    const stockSum = spanned.reduce(
+      (s, d) => s + (Number.isFinite(Number(d?.stockDaily)) ? Number(d.stockDaily) : 0),
+      0,
+    );
+    const uncredited =
+      equityGrowth === null
+        ? null
+        : Math.round((spannedOptions + stockSum - equityGrowth) * 100) / 100;
     return {
       username: e.username ?? '(unnamed)',
       absorbed,
+      counterDurable,
+      counterResetDates: lagDates,
+      equityGrowth,
+      stockSum: Math.round(stockSum * 100) / 100,
+      uncredited,
       measuredSessions: gradeable.length,
       writtenSessions: written.length,
       optionsRealizedUsd: Math.round(realized * 100) / 100,
@@ -246,17 +305,22 @@ export function gradeCreditObservation(payload) {
       closingEquityLatestDate: latestEquity?.date ?? null,
     };
   });
+  // TRA-2635 — the STATE measurement escalates on its own. It needs no counter, so
+  // it is the path that still reports a real-money NAV shortfall when the counter
+  // axis is NOT MEASURED. $1.00 materiality floor so penny rounding cannot trip it.
+  const SHORTFALL_FLOOR_USD = 1;
+  const shortfall = books.filter((b) => b.uncredited != null && b.uncredited > SHORTFALL_FLOOR_USD);
   const verdict =
     liveEngines.length === 0
       ? 'NO_LIVE_BOOK'
-      : fieldPresentRows === 0
-        ? 'FIELD_ABSENT'
-        : books.some((b) => b.absorbed === false)
-          ? 'LIVE_CREDIT_UNSHIPPED'
+      : books.some((b) => b.absorbed === false) || shortfall.length > 0
+        ? 'LIVE_CREDIT_UNSHIPPED'
+        : fieldPresentRows === 0
+          ? 'FIELD_ABSENT'
           : books.some((b) => b.absorbed === true)
             ? 'CREDIT_OK'
             : 'UNMEASURABLE';
-  return { verdict, liveBookCount: liveEngines.length, fieldPresentRows, books };
+  return { verdict, liveBookCount: liveEngines.length, fieldPresentRows, books, shortfall };
 }
 
 /**
@@ -520,17 +584,26 @@ async function main(argv) {
 
 /** TRA-2635 — the real-money escalation, in one place so both call sites agree. */
 function reportCreditUnshipped(credit) {
-  const bad = credit.books.filter((b) => b.absorbed === false);
+  const bad = credit.books.filter(
+    (b) => b.absorbed === false || (b.uncredited != null && b.uncredited > 1),
+  );
   console.error('');
   console.error(
-    `LIVE CREDIT UNSHIPPED — ${bad.length} mode:live book(s) realized option P&L and`,
+    `LIVE CREDIT SHORTFALL — ${bad.length} mode:live book(s) hold realized option P&L`,
   );
-  console.error('absorbed NONE of it into equity. ESCALATE.');
+  console.error('that never reached NAV. ESCALATE.');
   for (const b of bad) {
     console.error(
-      `  ${b.username}: $${b.optionsRealizedUsd.toFixed(2)} realized over `
-      + `${b.measuredSessions} gradeable session(s), optionsCreditedCumulative still `
-      + `$${(b.creditedLatest ?? 0).toFixed(2)}.`,
+      `  ${b.username}: $${b.optionsRealizedUsd.toFixed(2)} realized, equity grew `
+      + `$${(b.equityGrowth ?? 0).toFixed(2)} on a $${b.stockSum.toFixed(2)} stock leg`,
+    );
+    console.error(
+      `      => $${(b.uncredited ?? 0).toFixed(2)} ABSENT FROM NAV`
+      + `${b.counterDurable === false ? ' (UPPER BOUND — counter non-durable, so the lagged credit double-counts in the stock leg)' : ''}`,
+    );
+    console.error(
+      `      counter: optionsCreditedCumulative $${(b.creditedLatest ?? 0).toFixed(2)}`
+      + ` over ${b.measuredSessions} gradeable session(s), durable=${JSON.stringify(b.counterDurable)}`,
     );
   }
   console.error('TRA-2323 scope item 1 is UNSHIPPED on real capital. The book value every');
@@ -806,6 +879,9 @@ function selftest() {
 
   // ── TRA-2635 — the CREDIT axis. Both directions, plus all three NOT-MEASURED
   // states, because each of them would have been rendered green by a boolean.
+  // `closingEquity` defaults to 2_000 (FLAT). On a session that realized option
+  // P&L, flat equity is itself a shortfall — which is the point of the state axis —
+  // so any fixture meant to read CREDIT_OK must pass a growing `closingEquity`.
   const liveDay = (date, optionsDaily, optionsCreditedCumulative, extra = {}) => ({
     date, stockDaily: 0, optionsDaily, closingEquity: 2_000, ...extra,
     ...(optionsCreditedCumulative === undefined ? {} : { optionsCreditedCumulative }),
@@ -828,8 +904,8 @@ function selftest() {
     'CREDIT: the SAME sessions with a moving counter grade CREDIT_OK',
     gradeCreditObservation({
       engines: [{ username: 'admin', mode: 'live', days: [
-        liveDay('2026-07-28', 450, 450),
-        liveDay('2026-07-29', 537.6, 987.6),
+        liveDay('2026-07-28', 450, 450, { closingEquity: 2_450 }),
+        liveDay('2026-07-29', 537.6, 987.6, { closingEquity: 2_987.6 }),
       ] }],
     }).verdict,
     'CREDIT_OK',
@@ -847,8 +923,8 @@ function selftest() {
     'CREDIT: a build serving no counter is FIELD_ABSENT, never CREDIT_OK',
     gradeCreditObservation({
       engines: [{ username: 'admin', mode: 'live', days: [
-        liveDay('2026-07-28', 450, undefined),
-        liveDay('2026-07-29', 537.6, undefined),
+        liveDay('2026-07-28', 450, undefined, { closingEquity: 2_450 }),
+        liveDay('2026-07-29', 537.6, undefined, { closingEquity: 2_987.6 }),
       ] }],
     }).verdict,
     'FIELD_ABSENT',
@@ -885,19 +961,69 @@ function selftest() {
 
   // THE WHOLE POINT — identical delta rows, identical lag verdict, opposite
   // credit verdict. This is the pair the retracted grade could not tell apart.
+  // THE CORRECTION, found on the first live pull of the new field (07:48Z).
+  check(
+    'CREDIT: a zero counter on a NON-DURABLE book is NOT a red on the counter axis',
+    (() => {
+      // Richard's live shape, promoted to mode:live so the cohort is non-empty.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 67.5, optionsCreditedCumulative: 0, closingEquity: 2233.91 },
+        { date: '2026-07-28', stockDaily: 67.5, optionsDaily: 22.5, optionsCreditedCumulative: 0, closingEquity: 2301.41 },
+        { date: '2026-07-29', stockDaily: 22.5, optionsDaily: -5.11, optionsCreditedCumulative: 0, closingEquity: 2323.91 },
+      ] }] };
+      const c = gradeCreditObservation(p);
+      return { counterDurable: c.books[0].counterDurable, absorbed: c.books[0].absorbed };
+    })(),
+    { counterDurable: false, absorbed: null },
+  );
+
+  check(
+    'CREDIT: the STATE measurement escalates even when the counter axis is NOT MEASURED',
+    (() => {
+      // The LIVE admin numbers: equity +235.19, options +987.60, stock -18.81.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-13', stockDaily: 0, optionsDaily: 0, closingEquity: 2008.29 },
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 737.6, optionsCreditedCumulative: 0, closingEquity: 2008.29 },
+        { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2147.35 },
+        { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250, optionsCreditedCumulative: 0, closingEquity: 2243.48 },
+      ] }] };
+      const c = gradeCreditObservation(p);
+      return { verdict: c.verdict, uncredited: c.books[0].uncredited, growth: c.books[0].equityGrowth };
+    })(),
+    { verdict: 'LIVE_CREDIT_UNSHIPPED', uncredited: 733.6, growth: 235.19 },
+  );
+
+  // POSITIVE CONTROL — a book whose credit fully reached NAV must read ~0 shortfall
+  // and CREDIT_OK. Without this the shortfall path could be permanently red.
+  check(
+    'CREDIT: a fully-credited book has no shortfall and grades CREDIT_OK',
+    (() => {
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-07-28', stockDaily: -10, optionsDaily: 100, optionsCreditedCumulative: 100, closingEquity: 2090 },
+      ] }] };
+      const c = gradeCreditObservation(p);
+      return { verdict: c.verdict, uncredited: c.books[0].uncredited };
+    })(),
+    { verdict: 'CREDIT_OK', uncredited: 0 },
+  );
+
   check(
     'THE DISCRIMINATOR: same lag verdict (CLEAN) on both, opposite credit verdict',
     (() => {
-      const days = (cum1, cum2) => [
-        liveDay('2026-07-28', 450, cum1),
-        liveDay('2026-07-29', 537.6, cum2),
-      ];
-      const mk = (c1, c2) => ({ engines: [{ username: 'admin', mode: 'live', days: days(c1, c2) }] });
+      // Same DELTA rows on both. Only the STATE differs: the credited book's
+      // equity grew by the credit, the uncredited book's did not.
+      const mk = (c1, c2, eq1, eq2) => ({ engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-28', 450, c1, { closingEquity: eq1 }),
+        liveDay('2026-07-29', 537.6, c2, { closingEquity: eq2 }),
+      ] }] });
+      const credited = mk(450, 987.6, 2_450, 2_987.6);
+      const uncredited = mk(0, 0, 2_000, 2_000);
       return {
-        lagCredited: gradePayload(mk(450, 987.6)).verdict,
-        lagUncredited: gradePayload(mk(0, 0)).verdict,
-        creditCredited: gradeCreditObservation(mk(450, 987.6)).verdict,
-        creditUncredited: gradeCreditObservation(mk(0, 0)).verdict,
+        lagCredited: gradePayload(credited).verdict,
+        lagUncredited: gradePayload(uncredited).verdict,
+        creditCredited: gradeCreditObservation(credited).verdict,
+        creditUncredited: gradeCreditObservation(uncredited).verdict,
       };
     })(),
     {

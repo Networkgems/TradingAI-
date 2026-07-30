@@ -426,8 +426,44 @@ export interface PnlReconcileResult {
    * TRA-2625 C5 read green off two books that both had `stockDaily === 0`.
    * `optionsCreditedMeasuredCount` publishes that cohort's size so the two
    * causes of `null` (nothing written / nothing to absorb) stay tellable apart.
+   *
+   * A ZERO COUNTER IS NOT A `false`. The counter is only admissible as evidence
+   * of ABSENCE against a book whose counter is DURABLE — see
+   * {@link PnlReconcileResult.counterDurable}, which is `false` on the live fleet
+   * today. `true` (a counter that moved) never needs that guard: money that was
+   * recorded was recorded. So this is asymmetric on purpose.
    */
   equityAbsorbedOptionsOk: boolean | null;
+  /**
+   * TRA-2635 — is `optionsCreditedCumulative` trustworthy as evidence of absence
+   * on this book? `false` when the row itself proves the counter was zeroed
+   * between two writes: a `lagsPriorOptionsDaily` session (the TRA-2629 reset
+   * signature — and its presence PROVES a credit arrived) or a negative
+   * `optionsCreditedInWindow` (a cumulative cannot decrease). `null` when the
+   * counter was never written at all.
+   *
+   * Measured 2026-07-30T07:48Z: `false` on `Richard`, which wrote 0 on three
+   * consecutive sessions while its `closingEquity` moved +67.50 then +22.50 —
+   * exactly the two prior sessions' `optionsDaily`.
+   */
+  counterDurable: boolean | null;
+  /** TRA-2635 — the sessions that prove the reset. Empty is the passing state. */
+  counterResetDates: string[];
+  /**
+   * TRA-2635 — THE STATE MEASUREMENT. Needs no counter, so it survives the defect
+   * above: `(Σ optionsDaily + Σ stockDaily) − Δ closingEquity` over evaluated
+   * sessions, i.e. how much of the realized book P&L never reached NAV.
+   *
+   * UPPER BOUND when `counterDurable === false`: the lagged credit is already
+   * inside `stockDaily` there, so that leg double-counts it (Richard: 400.29
+   * nominal vs ~310.29 net of its $90.00 of double-counted credit — the same
+   * double-count that must not be denominated into an equity backfill).
+   */
+  uncreditedOptionsUsd: number | null;
+  /** TRA-2635 — the three operands, published so the subtraction is checkable. */
+  postBaselineEquityGrowth: number | null;
+  postBaselineOptionsRealized: number;
+  postBaselineStockDaily: number;
   /**
    * TRA-2635 — how many evaluated sessions could actually have graded the
    * bridge (`optionsCreditedCumulative` present AND `optionsDaily` non-zero).
@@ -538,26 +574,25 @@ export function summarizeLiveCreditObservation(
     username: string;
     mode: string;
     equityAbsorbedOptionsOk: boolean | null;
+    counterDurable: boolean | null;
     optionsCreditedMeasuredCount: number;
     optionsCreditedLatest: number | null;
     optionsCreditedDates: string[];
     closingEquityLatest: number | null;
     closingEquityLatestDate: string | null;
+    uncreditedOptionsUsd: number | null;
+    postBaselineEquityGrowth: number | null;
+    postBaselineOptionsRealized: number;
+    postBaselineStockDaily: number;
   }>,
 ): {
   liveCreditBookCount: number;
   liveEquityAbsorbedOptionsOk: boolean | null;
-  liveCreditBooks: Array<{
-    username: string;
-    equityAbsorbedOptionsOk: boolean | null;
-    optionsCreditedMeasuredCount: number;
-    optionsCreditedLatest: number | null;
-    optionsCreditedDates: string[];
-    closingEquityLatest: number | null;
-    closingEquityLatestDate: string | null;
-  }>;
+  liveUncreditedOptionsUsd: number | null;
+  liveCreditBooks: Array<Record<string, unknown>>;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
+  const measurable = liveBooks.filter(e => e.uncreditedOptionsUsd != null);
   return {
     liveCreditBookCount: liveBooks.length,
     liveEquityAbsorbedOptionsOk: liveBooks.some(e => e.equityAbsorbedOptionsOk === false)
@@ -565,17 +600,28 @@ export function summarizeLiveCreditObservation(
       : liveBooks.some(e => e.equityAbsorbedOptionsOk === true)
         ? true
         : null,
+    // TRA-2635 — THE DOLLAR FIGURE, and it is what carries the finding when the
+    // boolean above is NOT MEASURED. Null (not 0) when no live book could be
+    // measured: a zero here must never be reachable by absence.
+    liveUncreditedOptionsUsd: measurable.length === 0
+      ? null
+      : round2(measurable.reduce((s, e) => s + (e.uncreditedOptionsUsd ?? 0), 0)),
     // Named, not anonymized: this endpoint already publishes each book's full
     // per-session P&L series under its username, and an unnamed red verdict on
     // real capital is not actionable.
     liveCreditBooks: liveBooks.map(e => ({
       username: e.username,
       equityAbsorbedOptionsOk: e.equityAbsorbedOptionsOk,
+      counterDurable: e.counterDurable,
       optionsCreditedMeasuredCount: e.optionsCreditedMeasuredCount,
       optionsCreditedLatest: e.optionsCreditedLatest,
       optionsCreditedDates: e.optionsCreditedDates,
       closingEquityLatest: e.closingEquityLatest,
       closingEquityLatestDate: e.closingEquityLatestDate,
+      uncreditedOptionsUsd: e.uncreditedOptionsUsd,
+      postBaselineEquityGrowth: e.postBaselineEquityGrowth,
+      postBaselineOptionsRealized: e.postBaselineOptionsRealized,
+      postBaselineStockDaily: e.postBaselineStockDaily,
     })),
   };
 }
@@ -788,6 +834,7 @@ export function reconcilePnl(
   // term the "offender cohort" and the "gradeable cohort" diverge — 7 of the 13
   // lag books on 2026-07-29 had a zero prior and could never have verified the
   // fix no matter what shipped.
+  const creditWrittenDays = days.filter(d => d.optionsCreditedCumulative != null);
   const creditMeasurableDays = evaluated.filter(
     d =>
       d.optionsCreditedCumulative != null
@@ -800,12 +847,68 @@ export function reconcilePnl(
         && Math.abs(d.optionsCreditedInWindow) > PNL_RECONCILE_TOLERANCE_USD,
     )
     .map(d => d.date);
+  // TRA-2635 SECOND PASS (found on the FIRST live pull of this field, 07:48Z) —
+  // A ZERO COUNTER IS NOT EVIDENCE THAT NO CREDIT REACHED EQUITY. The counter is
+  // only admissible against a book whose counter is DURABLE, and on the live
+  // fleet it is not: `Richard` wrote `optionsCreditedCumulative: 0` on three
+  // consecutive sessions while its `closingEquity` moved 2233.91 -> 2301.41
+  // (+67.50, exactly 07-27's `optionsDaily`) -> 2323.91 (+22.50, exactly 07-28's).
+  // The money demonstrably arrived; the counter that records it did not survive.
+  //
+  // So the FIRST cut of this verdict read `false` on a book where equity had
+  // absorbed every cent — a manufactured red, and the same class of error as the
+  // manufactured green it was shipped to fix. Two signatures prove non-durability
+  // from the row itself, and either one forces NOT MEASURED:
+  //
+  //   lagsPriorOptionsDaily  the T+1 mis-bucket IS the reset signature (TRA-2629):
+  //                          the writer lost the left endpoint of its subtraction,
+  //                          so the credit landed in equity and was re-booked into
+  //                          the stock leg. Its presence PROVES a credit arrived.
+  //   a NEGATIVE window      a cumulative counter cannot decrease. It only can if
+  //                          it was zeroed between two writes.
+  const counterResetDates = days
+    .filter(d => d.lagsPriorOptionsDaily || (d.optionsCreditedInWindow ?? 0) < -PNL_RECONCILE_TOLERANCE_USD)
+    .map(d => d.date);
+  const counterDurable: boolean | null =
+    creditWrittenDays.length === 0 ? null : counterResetDates.length === 0;
   const equityAbsorbedOptionsOk: boolean | null =
-    creditMeasurableDays.length === 0
-      ? null
-      : creditMeasurableDays.some(d => d.optionsCreditedCumulative !== 0);
-  const creditWritten = days.filter(d => d.optionsCreditedCumulative != null);
+    creditMeasurableDays.some(d => d.optionsCreditedCumulative !== 0)
+      ? true
+      : creditMeasurableDays.length === 0 || counterDurable !== true
+        ? null
+        : false;
+  const creditWritten = creditWrittenDays;
   const equityWritten = days.filter(d => Number.isFinite(d.closingEquity));
+  // TRA-2635 — THE STATE MEASUREMENT, which needs no counter at all and is the
+  // only rigorous handle on "how much of the realized options leg is in NAV?".
+  // Equity either grew or it did not.
+  //
+  //     uncreditedOptionsUsd = (Σ optionsDaily + Σ stockDaily) − Δ closingEquity
+  //
+  // On the live `admin` book at 2026-07-30T07:48Z: 987.60 + (−18.81) − 235.19 =
+  // **+733.60 absent from NAV**, against CEO's TRA-2635 predictions of 2977.08
+  // (bridge works) and 1989.48 (never fired) — observed 2243.48, i.e. NEITHER.
+  //
+  // CAVEAT, and it is why this is published as a number and not as a verdict: on
+  // a book where `counterDurable === false` the lagged credit is ALREADY inside
+  // `stockDaily`, so that leg double-counts it and this figure is an UPPER BOUND
+  // (Richard: 400.29 nominal, ~310.29 once its $90.00 of double-counted credit is
+  // removed — the same $90 double-count CEO flagged against a naive backfill).
+  // THE OPERANDS MUST TELESCOPE. `closingEquity[last] − closingEquity[first]` spans
+  // the windows of rows 1..N, NOT 0..N, so the P&L sums must skip the first row —
+  // its own session's P&L landed in an equity delta whose left endpoint is outside
+  // the series. Summing 0..N against a 1..N delta overstates the shortfall by
+  // exactly the first row's P&L, which is a fabricated finding whenever the series
+  // happens to start on an active session.
+  const evaluatedEquity = evaluated.filter(d => Number.isFinite(d.closingEquity));
+  const spanned = evaluatedEquity.slice(1);
+  const postBaselineEquityGrowth = evaluatedEquity.length < 2
+    ? null
+    : round2(
+      evaluatedEquity[evaluatedEquity.length - 1]!.closingEquity - evaluatedEquity[0]!.closingEquity,
+    );
+  const postBaselineOptionsRealized = round2(spanned.reduce((s, d) => s + d.optionsDaily, 0));
+  const postBaselineStockDaily = round2(spanned.reduce((s, d) => s + d.stockDaily, 0));
 
   return {
     ok: offendingDates.length === 0,
@@ -838,6 +941,14 @@ export function reconcilePnl(
     priorOptionsLagDates,
     priorOptionsLagOk: priorOptionsLagDates.length === 0,
     equityAbsorbedOptionsOk,
+    counterDurable,
+    counterResetDates,
+    postBaselineEquityGrowth,
+    postBaselineOptionsRealized,
+    postBaselineStockDaily,
+    uncreditedOptionsUsd: postBaselineEquityGrowth == null
+      ? null
+      : round2(postBaselineOptionsRealized + postBaselineStockDaily - postBaselineEquityGrowth),
     optionsCreditedMeasuredCount: creditMeasurableDays.length,
     optionsCreditedDates,
     optionsCreditedLatest: creditWritten.length === 0

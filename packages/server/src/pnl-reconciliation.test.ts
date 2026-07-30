@@ -614,8 +614,66 @@ describe('TRA-2635 — equityAbsorbedOptionsOk (did the credit reach equity?)', 
       new Map(),
     );
     expect(r.equityAbsorbedOptionsOk).toBe(false);
+    expect(r.counterDurable).toBe(true);
     expect(r.optionsCreditedMeasuredCount).toBe(2);
     expect(r.optionsCreditedDates).toEqual([]);
+  });
+
+  // ── The correction found on the FIRST live pull of this field (07:48Z). ──
+  it('a ZERO counter on a NON-DURABLE book is NOT MEASURED, not RED', () => {
+    // The live `Richard` shape: counter 0 on both sessions while equity moved by
+    // exactly the prior session's optionsDaily. The money arrived; the counter
+    // that records it did not survive the boot. Calling that `false` is a
+    // manufactured red — the same error class as the manufactured green.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 67.5, 0, 2_233.91),
+        creditSnap('2026-07-28', 67.5, 22.5, 0, 2_301.41),
+        creditSnap('2026-07-29', 22.5, -5.11, 0, 2_323.91),
+      ],
+      new Map(),
+    );
+    expect(r.priorOptionsLagDates).toEqual(['2026-07-28', '2026-07-29']);
+    expect(r.counterDurable).toBe(false);
+    expect(r.counterResetDates).toEqual(['2026-07-28', '2026-07-29']);
+    expect(r.equityAbsorbedOptionsOk).toBeNull();
+  });
+
+  it('a NEGATIVE credit window also proves the reset (a cumulative cannot decrease)', () => {
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 67.5, 90), creditSnap('2026-07-29', 0, 22.5, 22.5)],
+      new Map(),
+    );
+    expect(r.counterDurable).toBe(false);
+    expect(r.counterResetDates).toEqual(['2026-07-29']);
+    // A counter that MOVED is still positive evidence — money recorded is
+    // recorded, so the guard is asymmetric on purpose.
+    expect(r.equityAbsorbedOptionsOk).toBe(true);
+  });
+
+  it('publishes the counter-free STATE measurement — the live admin numbers', () => {
+    // Equity flat at 2008.29 while the options leg earned, then +235.19 total.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-13', 0, 0, undefined, 2_008.29),
+        creditSnap('2026-07-17', 0, 217.5, undefined, 2_008.29),
+        creditSnap('2026-07-27', 0, 140, 0, 2_008.29),
+        creditSnap('2026-07-28', -0.94, 68, 0, 2_147.35),
+        creditSnap('2026-07-29', -17.87, 250.01, 0, 2_243.48),
+      ],
+      new Map(),
+    );
+    expect(r.postBaselineEquityGrowth).toBeCloseTo(235.19, 2);
+    expect(r.postBaselineOptionsRealized).toBeCloseTo(675.51, 2);
+    expect(r.postBaselineStockDaily).toBeCloseTo(-18.81, 2);
+    // (675.51 + -18.81) - 235.19
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(421.51, 2);
+  });
+
+  it('leaves the state measurement NULL on a single-session book (no delta to take)', () => {
+    const r = reconcilePnl([creditSnap('2026-07-28', 0, 450, 0)], new Map());
+    expect(r.postBaselineEquityGrowth).toBeNull();
+    expect(r.uncreditedOptionsUsd).toBeNull();
   });
 
   it('is GREEN when a session that realized option P&L shows a non-zero credited cumulative', () => {
@@ -684,11 +742,16 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     username,
     mode,
     equityAbsorbedOptionsOk,
+    counterDurable: true,
     optionsCreditedMeasuredCount,
     optionsCreditedLatest: 0,
     optionsCreditedDates: [] as string[],
     closingEquityLatest: 2_000,
     closingEquityLatestDate: '2026-07-29',
+    uncreditedOptionsUsd: equityAbsorbedOptionsOk === false ? 733.6 : 0,
+    postBaselineEquityGrowth: 235.19,
+    postBaselineOptionsRealized: 987.6,
+    postBaselineStockDaily: -18.81,
   });
 
   it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
@@ -733,5 +796,14 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     const r = summarizeLiveCreditObservation([book('admin', 'sandbox', false)]);
     expect(r.liveCreditBookCount).toBe(0);
     expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
+    // A zero dollar figure must never be reachable by absence.
+    expect(r.liveUncreditedOptionsUsd).toBeNull();
+  });
+
+  it('carries the DOLLAR figure, which holds the finding when the boolean is NOT MEASURED', () => {
+    const notMeasured = { ...book('admin', 'live', null, 0), uncreditedOptionsUsd: 733.6 };
+    const r = summarizeLiveCreditObservation([notMeasured]);
+    expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
+    expect(r.liveUncreditedOptionsUsd).toBeCloseTo(733.6, 2);
   });
 });
