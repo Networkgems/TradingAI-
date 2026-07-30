@@ -150,7 +150,10 @@ import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } fr
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
-import { recordConvictionDcaFill } from './conviction-dca-ledger.js';
+import {
+  recordConvictionDcaFill,
+  recordConvictionDcaGuardEvaluation, // TRA-2598 — the brake's denominator
+} from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
 import { isDecoupledExitCadenceEnabled } from './exit-cadence-flag.js';
 import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
@@ -6013,6 +6016,45 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-2598 — write one same-day-loss-brake candidate to the durable guard ledger.
+   *
+   * `guardEnabled=false` means the flag was OFF, so the rule did NOT run: the candidate
+   * counts toward `addsPresented` but not `addsEvaluated`, which is precisely the
+   * distinction that stops a DARK brake from reading as a clean one.
+   *
+   * The book is `alertUsername` — the SAME string the options account stamps as a
+   * journal row's `account` (`setAlertUsername` → `acct.setOwner`), so a reader
+   * partitions the guard ledger, the fill ledger and the trade journal by one
+   * predicate instead of rebuilding it through a `positionId` join. An unbound engine
+   * (a bare unit test) leaves it undefined and lands in `unattributed`, never in a
+   * named book.
+   *
+   * Observe-only and non-throwing by construction: the ledger swallows its own IO
+   * errors, so this can never fail a trade pass.
+   */
+  private recordDcaGuardCandidate(
+    symbol: string,
+    positionId: string,
+    assetClass: 'equity' | 'option',
+    guardEnabled: boolean,
+    halted: boolean,
+    netEtDay: number | null,
+    now: number,
+  ): void {
+    recordConvictionDcaGuardEvaluation({
+      ts: now,
+      ...(this.alertUsername ? { account: this.alertUsername } : {}),
+      mode: this.mode === 'live' ? 'live' : 'demo',
+      assetClass,
+      symbol,
+      positionId,
+      guardEnabled,
+      halted,
+      netEtDay,
+    });
+  }
+
+  /**
    * TRA-1408 — the same-day-loss DCA brake test: is `symbol` net-negative on the
    * ET day across REALIZED (today's closed demo trades) + UNREALIZED (open demo
    * marks)? Consulted by the demo conviction-DCA add loops before an add fires;
@@ -10342,7 +10384,13 @@ export class SignalEngine {
       // BRAKE (this branch is already demo-only; the live add path shadow-logs
       // above). Net = today's REALIZED closes for the name + the open UNREALIZED
       // mark across every open position on that name. On a net loss, skip the add.
-      if (isChurnLossBrakeEnabled(this.resolveDemoFlagEnv())) {
+      // TRA-2598 — record the candidate on EVERY branch below (dark / passed / halted).
+      // This is the guard's DENOMINATOR: without it `breachCount: 0` and `dcaAddsHalted:
+      // 0` read identically whether the brake held across hundreds of adds or never ran,
+      // which is a false-pass channel on a safety brake. Observe-only — nothing here
+      // changes the verdict.
+      const guardEnabled = isChurnLossBrakeEnabled(this.resolveDemoFlagEnv());
+      if (guardEnabled) {
         const brakeEtDay = etDateString(new Date(now));
         const realizedToday = this.realizedEquityPnlToday(pos.symbol, brakeEtDay);
         let unrealized = 0;
@@ -10351,8 +10399,10 @@ export class SignalEngine {
           const mult = q.side === 'buy' ? 1 : -1;
           unrealized += (price - q.entryPrice) * q.quantity * mult;
         }
-        if (this.isSameDayLoser(realizedToday, unrealized)) {
-          const netEtDay = Number((realizedToday + unrealized).toFixed(2));
+        const netEtDay = Number((realizedToday + unrealized).toFixed(2));
+        const halted = this.isSameDayLoser(realizedToday, unrealized);
+        this.recordDcaGuardCandidate(pos.symbol, pos.id, 'equity', true, halted, netEtDay, now);
+        if (halted) {
           log.info('TRA-1408 conviction-DCA add halted — same-day net-negative name (demo)', {
             symbol: pos.symbol, positionId: pos.id,
             realizedToday: Number(realizedToday.toFixed(2)),
@@ -10363,6 +10413,8 @@ export class SignalEngine {
           recordChurnBrakeDcaHalt(pos.symbol, 'equity', netEtDay, now); // TRA-1481 telemetry
           continue;
         }
+      } else {
+        this.recordDcaGuardCandidate(pos.symbol, pos.id, 'equity', false, false, null, now);
       }
 
       const updated = this.account.addToPosition(pos.id, verdict.qty, price);
@@ -10385,6 +10437,8 @@ export class SignalEngine {
       // TRA-971 gate can pull it across restarts (observe-only; nothing above changes).
       recordConvictionDcaFill({
         ts: now, mode: this.mode, assetClass: 'equity',
+        // TRA-2598 — the owning book, same string as a journal row's `account`.
+        ...(this.alertUsername ? { account: this.alertUsername } : {}),
         symbol: pos.symbol, positionId: pos.id, action: verdict.action,
         addQty: verdict.qty, addPrice: price,
         blendedAvg: Number(blended.toFixed(4)), stop: updated.stopLoss, totalQty: updated.quantity,
@@ -10554,6 +10608,8 @@ export class SignalEngine {
       // stamped mode:'live' so the TRA-1305 acceptance readout counts live fills.
       recordConvictionDcaFill({
         ts: now, mode: 'live', assetClass: 'equity',
+        // TRA-2598 — the owning book, same string as a journal row's `account`.
+        ...(this.alertUsername ? { account: this.alertUsername } : {}),
         symbol: pos.symbol, positionId: pos.id, action: verdict.action,
         addQty: cappedQty, addPrice: price,
         blendedAvg: Number(blended.toFixed(4)), stop: pos.stopLoss, totalQty: totalQ,
@@ -10731,7 +10787,9 @@ export class SignalEngine {
       // today's REALIZED option closes for the name + the open UNREALIZED premium
       // mark ((currentPremium − premiumPaid)·100·contractsRemaining) across every
       // open demo option on that underlier. On a net loss, skip the add.
-      if (isChurnLossBrakeEnabled(this.resolveDemoFlagEnv())) {
+      // TRA-2598 — same denominator on the options leg (see the equity site).
+      const optionGuardEnabled = isChurnLossBrakeEnabled(this.resolveDemoFlagEnv());
+      if (optionGuardEnabled) {
         const brakeEtDay = etDateString(new Date(now));
         const realizedToday = this.realizedOptionPnlToday(o.symbol, brakeEtDay);
         let unrealized = 0;
@@ -10739,8 +10797,10 @@ export class SignalEngine {
           if (q.symbol !== o.symbol) continue;
           unrealized += (q.currentPremium - q.premiumPaid) * 100 * q.contractsRemaining;
         }
-        if (this.isSameDayLoser(realizedToday, unrealized)) {
-          const netEtDay = Number((realizedToday + unrealized).toFixed(2));
+        const netEtDay = Number((realizedToday + unrealized).toFixed(2));
+        const halted = this.isSameDayLoser(realizedToday, unrealized);
+        this.recordDcaGuardCandidate(o.symbol, o.id, 'option', true, halted, netEtDay, now);
+        if (halted) {
           log.info('TRA-1408 options conviction-DCA add halted — same-day net-negative name (demo)', {
             symbol: o.symbol, optionId: o.id, optionSymbol: o.optionSymbol,
             realizedToday: Number(realizedToday.toFixed(2)),
@@ -10751,6 +10811,8 @@ export class SignalEngine {
           recordChurnBrakeDcaHalt(o.symbol, 'option', netEtDay, now); // TRA-1481 telemetry
           continue;
         }
+      } else {
+        this.recordDcaGuardCandidate(o.symbol, o.id, 'option', false, false, null, now);
       }
 
       const updated = acct.addToOptionPosition(o.id, verdict.qty, addDebitPerContract);
@@ -10772,6 +10834,8 @@ export class SignalEngine {
       // blended basis is the per-contract premium. Observe-only.
       recordConvictionDcaFill({
         ts: now, mode: this.mode, assetClass: 'option',
+        // TRA-2598 — the owning book, same string as a journal row's `account`.
+        ...(this.alertUsername ? { account: this.alertUsername } : {}),
         symbol: o.symbol, positionId: o.id, action: verdict.action,
         addQty: verdict.qty, addPrice: Number(addDebitPerContract.toFixed(2)),
         blendedAvg: updated.contracts > 0 ? Number((premiumAtRisk / updated.contracts).toFixed(2)) : 0,

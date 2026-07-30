@@ -29,6 +29,11 @@ import { appendFileSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { logger } from './observability/index.js';
 import { timeSyncPhase } from './phase-timing.js';
+// TRA-2598 — the single ET-correct day helper (scheduler.ts imports only
+// observability + et-clock, so there is no cycle back through the signal engine).
+// A local `toISOString().slice(0,10)` would roll the session 4-5h early and split one
+// ET session across two rows in the per-session rollup.
+import { etDateString } from './scheduler.js';
 
 const log = logger.child({ module: 'conviction-dca-ledger' });
 
@@ -77,6 +82,19 @@ export interface ConvictionDcaFill {
   symbol: string;
   /** Engine position/option id the tranche was added to. */
   positionId: string;
+  /**
+   * TRA-2598 — the OWNING BOOK. Same string an options-account journal row stamps
+   * as its `account` (`setAlertUsername` → `acct.setOwner`), so a reader partitions
+   * the ledger and the journal by the same predicate instead of reconstructing the
+   * mapping through a `positionId` → journal-row join.
+   *
+   * OPTIONAL because the JSONL predates this field: every line written before this
+   * commit carries no `account`, and inventing one would be worse than admitting the
+   * gap. Unstamped lines land in the {@link UNATTRIBUTED_ACCOUNT_KEY} bucket — never
+   * folded into a named book — so a pooled legacy tail is VISIBLE as a count rather
+   * than silently attributed to whichever book happens to be reading.
+   */
+  account?: string;
   /** DCA core verdict — 'add' | 'shrink'. */
   action: string;
   /** Shares (equity) or contracts (option) added this fill. */
@@ -138,6 +156,23 @@ export type ConvictionDcaModeKey = 'demo' | 'live' | 'unknown';
 export type ConvictionDcaClassBuckets = Record<ConvictionDcaClassKey, ConvictionDcaBucket>;
 export type ConvictionDcaModeBuckets = Record<ConvictionDcaModeKey, ConvictionDcaBucket>;
 
+/**
+ * TRA-2598 — bucket for a fill carrying no `account` (every line written before the
+ * field existed, plus a bare engine in a unit test). A DISTINCT key on purpose: the
+ * defect this partition closes is a POOLED read manufacturing a false breach, and
+ * quietly merging unstamped rows into a named book would reintroduce it under a new
+ * name. The key is ALWAYS present, so "no legacy rows" is a stated zero.
+ */
+export const UNATTRIBUTED_ACCOUNT_KEY = 'unattributed';
+
+/**
+ * TRA-2598 — per-book buckets. Unlike byClass/byMode the key set is DYNAMIC (books
+ * are discovered from the data), so only {@link UNATTRIBUTED_ACCOUNT_KEY} is
+ * guaranteed present. An absent book key therefore means "no adds recorded for that
+ * book in this window", which is why the summary also reports `accountCount`.
+ */
+export type ConvictionDcaAccountBuckets = Record<string, ConvictionDcaBucket>;
+
 function emptyBucket(): ConvictionDcaBucket {
   return { addCount: 0, breachCount: 0, firstAddAt: null, lastAddAt: null };
 }
@@ -148,6 +183,20 @@ function emptyClassBuckets(): ConvictionDcaClassBuckets {
 
 function emptyModeBuckets(): ConvictionDcaModeBuckets {
   return { demo: emptyBucket(), live: emptyBucket(), unknown: emptyBucket() };
+}
+
+function emptyAccountBuckets(): ConvictionDcaAccountBuckets {
+  return { [UNATTRIBUTED_ACCOUNT_KEY]: emptyBucket() };
+}
+
+/**
+ * TRA-2598 — resolve a fill's book key. A blank/whitespace `account` is treated the
+ * same as an absent one: an empty string is not a book, and letting `''` become its
+ * own key would split one population across two indistinguishable buckets.
+ */
+export function convictionDcaAccountKey(account: string | undefined | null): string {
+  const raw = typeof account === 'string' ? account.trim() : '';
+  return raw === '' ? UNATTRIBUTED_ACCOUNT_KEY : raw;
 }
 
 function classKeyOf(fill: ConvictionDcaFill): ConvictionDcaClassKey {
@@ -175,18 +224,23 @@ function cloneBuckets<K extends string>(
   return out;
 }
 
-/** Re-derive both partitions over an explicit fill list (the anchored path). */
+/** Re-derive every partition over an explicit fill list (the anchored path). */
 function foldBuckets(fills: readonly ConvictionDcaFill[]): {
   byClass: ConvictionDcaClassBuckets;
   byMode: ConvictionDcaModeBuckets;
+  byAccount: ConvictionDcaAccountBuckets;
 } {
   const cls = emptyClassBuckets();
   const mode = emptyModeBuckets();
+  const acct = emptyAccountBuckets();
   for (const f of fills) {
     foldIntoBucket(cls[classKeyOf(f)], f);
     foldIntoBucket(mode[modeKeyOf(f)], f);
+    const key = convictionDcaAccountKey(f.account);
+    (acct[key] ??= emptyBucket());
+    foldIntoBucket(acct[key]!, f);
   }
-  return { byClass: cls, byMode: mode };
+  return { byClass: cls, byMode: mode, byAccount: acct };
 }
 
 // ── In-memory store (backs GET /api/health/conviction-dca) ───────────────────
@@ -211,6 +265,7 @@ const retainedFills: ConvictionDcaFill[] = [];
 let droppedFills = 0;
 let byClass = emptyClassBuckets();
 let byMode = emptyModeBuckets();
+let byAccount = emptyAccountBuckets();
 
 export function convictionDcaLogPath(dir: string): string {
   return join(dir, CONVICTION_DCA_LOG_FILENAME);
@@ -227,6 +282,8 @@ export function clearConvictionDcaLedger(): void {
   droppedFills = 0;
   byClass = emptyClassBuckets();
   byMode = emptyModeBuckets();
+  byAccount = emptyAccountBuckets();
+  clearConvictionDcaGuardLedger();
 }
 
 function isBreach(fill: ConvictionDcaFill): boolean {
@@ -241,6 +298,9 @@ function applyFill(fill: ConvictionDcaFill): void {
   if (lastAddAt == null || fill.ts > lastAddAt) lastAddAt = fill.ts;
   foldIntoBucket(byClass[classKeyOf(fill)], fill);
   foldIntoBucket(byMode[modeKeyOf(fill)], fill);
+  const acctKey = convictionDcaAccountKey(fill.account);
+  (byAccount[acctKey] ??= emptyBucket());
+  foldIntoBucket(byAccount[acctKey]!, fill);
   retainedFills.push(fill);
   while (retainedFills.length > MAX_RETAINED_FILLS) {
     retainedFills.shift();
@@ -281,6 +341,228 @@ export function recordConvictionDcaFill(fill: ConvictionDcaFill): void {
   }
 }
 
+// ── TRA-2598: the same-day-loss GUARD's own denominator ──────────────────────
+//
+// `breachCount: 0` reads byte-identical whether the TRA-1408 same-day-loss brake
+// held across hundreds of adds or never ran at all — a false-pass channel on a
+// SAFETY BRAKE. (It is also a different invariant: `breachCount` counts R-CAP
+// breaches, `realizedRiskDollars > riskBudget`; the same-day-loss rule halts an add
+// BEFORE any fill exists, so a halt can never appear in the fill ledger at all. A
+// working brake and a dark one produce the same fill file.)
+//
+// The fix is a denominator. Every add candidate that reaches the brake chokepoint is
+// recorded — whether the flag was on, and whether the rule halted it — so the three
+// states that previously shared one zero are separable:
+//
+//   presented 0                          → the DCA add path never produced a candidate
+//   presented N, evaluated 0             → the guard is DARK (ENABLE_CHURN_LOSS_BRAKE off)
+//   presented N, evaluated N, halted 0   → the guard RAN N times and nothing tripped
+//   halted > 0                           → the guard is actively refusing adds
+//
+// DURABLE, not since-boot. `/api/health/churn-brake` already reports a halt count,
+// but it is in-memory-monotonic and bqb1 reboots ~daily, so it cannot support the
+// multi-session "N clean sessions" grade this instrument exists for — and mixing a
+// since-boot halt count with an all-time `addCount` on one payload invites exactly
+// the false "mostly dark" read. Same append + full-read-hydrate pattern as the fills.
+//
+// STRICTLY OBSERVE-ONLY: recording a candidate never changes the brake's verdict.
+
+export const CONVICTION_DCA_GUARD_LOG_FILENAME = 'conviction-dca-guard.jsonl';
+
+/** Retention for guard events. Same backstop contract as {@link MAX_RETAINED_FILLS}. */
+const MAX_RETAINED_GUARD_EVENTS = 25_000;
+
+/** Size of the guard `recent` tail (a DISPLAY cap only). */
+const MAX_RECENT_GUARD_EVENTS = 50;
+
+/**
+ * One conviction-DCA add candidate as seen by the TRA-1408 same-day-loss brake.
+ * Written at the brake chokepoint on EVERY branch — dark, passed and halted — so the
+ * counts derived from it are a true denominator rather than a record of hits only.
+ */
+export interface ConvictionDcaGuardEvent {
+  /** Evaluation time, ms epoch. */
+  ts: number;
+  /** Owning book — see {@link ConvictionDcaFill.account}. Absent ⇒ unattributed. */
+  account?: string;
+  mode: 'demo' | 'live';
+  assetClass: 'equity' | 'option';
+  symbol: string;
+  positionId: string;
+  /**
+   * Was `ENABLE_CHURN_LOSS_BRAKE` on for this candidate? `false` ⇒ the rule did NOT
+   * run, so this candidate counts toward `addsPresented` but NOT `addsEvaluated`.
+   * This is the field that turns "0 halts" from ambiguous into diagnosable.
+   */
+  guardEnabled: boolean;
+  /** Did the same-day-loss rule halt the add? Only ever true when `guardEnabled`. */
+  halted: boolean;
+  /** The name's ET-day realized+unrealized net at evaluation; null when dark. */
+  netEtDay: number | null;
+}
+
+/** Per-partition guard counters. `addsHalted ≤ addsEvaluated ≤ addsPresented` always. */
+export interface ConvictionDcaGuardBucket {
+  /** Add candidates that reached the brake chokepoint. */
+  addsPresented: number;
+  /** Candidates the rule actually ran on (`guardEnabled`). */
+  addsEvaluated: number;
+  /** Candidates the rule refused. */
+  addsHalted: number;
+  firstAt: number | null;
+  lastAt: number | null;
+}
+
+/**
+ * The named verdict a bare zero could not express. Derived, never stored — so it can
+ * never disagree with the counters beside it.
+ */
+export type ConvictionDcaGuardState =
+  /** No add candidate has ever reached the brake — nothing to say about the brake. */
+  | 'no_candidates'
+  /** Candidates presented but the flag was off for all of them: the brake is DARK. */
+  | 'dark'
+  /** The rule ran on every candidate and refused none. */
+  | 'live_clean'
+  /** The rule refused at least one add. */
+  | 'live_firing'
+  /** Some candidates were evaluated and some were not (the flag flipped mid-window). */
+  | 'mixed';
+
+function emptyGuardBucket(): ConvictionDcaGuardBucket {
+  return { addsPresented: 0, addsEvaluated: 0, addsHalted: 0, firstAt: null, lastAt: null };
+}
+
+function foldIntoGuardBucket(bucket: ConvictionDcaGuardBucket, ev: ConvictionDcaGuardEvent): void {
+  bucket.addsPresented += 1;
+  if (ev.guardEnabled) bucket.addsEvaluated += 1;
+  // Guard against a malformed line claiming a halt while dark: a halt is only
+  // meaningful as a subset of the evaluated population, and letting an impossible
+  // combination through would break `addsHalted ≤ addsEvaluated`.
+  if (ev.guardEnabled && ev.halted) bucket.addsHalted += 1;
+  if (bucket.firstAt == null || ev.ts < bucket.firstAt) bucket.firstAt = ev.ts;
+  if (bucket.lastAt == null || ev.ts > bucket.lastAt) bucket.lastAt = ev.ts;
+}
+
+function guardStateOf(bucket: ConvictionDcaGuardBucket): ConvictionDcaGuardState {
+  if (bucket.addsPresented === 0) return 'no_candidates';
+  if (bucket.addsEvaluated === 0) return 'dark';
+  if (bucket.addsHalted > 0) return 'live_firing';
+  if (bucket.addsEvaluated < bucket.addsPresented) return 'mixed';
+  return 'live_clean';
+}
+
+let guardEvents: ConvictionDcaGuardEvent[] = [];
+let droppedGuardEvents = 0;
+
+export function convictionDcaGuardLogPath(dir: string): string {
+  return join(dir, CONVICTION_DCA_GUARD_LOG_FILENAME);
+}
+
+/** Test seam — drop every guard event. Called by {@link clearConvictionDcaLedger}. */
+export function clearConvictionDcaGuardLedger(): void {
+  guardEvents = [];
+  droppedGuardEvents = 0;
+}
+
+function applyGuardEvent(ev: ConvictionDcaGuardEvent): void {
+  guardEvents.push(ev);
+  while (guardEvents.length > MAX_RETAINED_GUARD_EVENTS) {
+    guardEvents.shift();
+    droppedGuardEvents += 1;
+    if (droppedGuardEvents === 1) {
+      log.warn('conviction-dca guard retention cap reached — guard counts now inexact', {
+        cap: MAX_RETAINED_GUARD_EVENTS,
+      });
+    }
+  }
+}
+
+/**
+ * Record one add candidate the same-day-loss brake saw. Best-effort on IO, exactly
+ * like {@link recordConvictionDcaFill}: a write failure logs and is swallowed so this
+ * accounting can never break the trade pass. With no dataDir configured the in-memory
+ * counters still update.
+ */
+export function recordConvictionDcaGuardEvaluation(ev: ConvictionDcaGuardEvent): void {
+  applyGuardEvent(ev);
+  if (dataDir == null) return;
+  const path = convictionDcaGuardLogPath(dataDir);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // exists / unwritable — the append below surfaces the error
+  }
+  try {
+    appendFileSync(path, JSON.stringify(ev) + '\n', 'utf8');
+  } catch (err) {
+    log.warn('conviction-dca guard event append failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+export interface ConvictionDcaGuardSummary extends ConvictionDcaGuardBucket {
+  /** The named verdict — what the counters above MEAN. */
+  state: ConvictionDcaGuardState;
+  /** Same counts per book, and per asset-class leg. */
+  byAccount: Record<string, ConvictionDcaGuardBucket>;
+  byClass: Record<ConvictionDcaClassKey, ConvictionDcaGuardBucket>;
+  /** Per-book named verdicts, so one dark book cannot hide behind a busy one. */
+  stateByAccount: Record<string, ConvictionDcaGuardState>;
+  /** Distinct books with ≥1 presented candidate. */
+  accountCount: number;
+  retainedEventCount: number;
+  droppedEventCount: number;
+  /** `false` ⇒ retention evicted events, so every count above is a LOWER BOUND. */
+  countsExact: boolean;
+  /** Display tail, oldest→newest. Never a count basis. */
+  recent: ConvictionDcaGuardEvent[];
+}
+
+/**
+ * Fold the guard store into the read-only diagnostics. When `deployAnchor` is given,
+ * only events at/after it are counted — the same window the fill summary applies, so
+ * the two halves of the payload describe one population.
+ */
+export function summarizeConvictionDcaGuard(
+  deployAnchor: number | null = null,
+): ConvictionDcaGuardSummary {
+  const scoped =
+    deployAnchor == null ? guardEvents : guardEvents.filter((e) => e.ts >= deployAnchor);
+  const pooled = emptyGuardBucket();
+  const byAcct: Record<string, ConvictionDcaGuardBucket> = {
+    [UNATTRIBUTED_ACCOUNT_KEY]: emptyGuardBucket(),
+  };
+  const byCls: Record<ConvictionDcaClassKey, ConvictionDcaGuardBucket> = {
+    equity: emptyGuardBucket(),
+    option: emptyGuardBucket(),
+    unknown: emptyGuardBucket(),
+  };
+  for (const ev of scoped) {
+    foldIntoGuardBucket(pooled, ev);
+    const key = convictionDcaAccountKey(ev.account);
+    foldIntoGuardBucket((byAcct[key] ??= emptyGuardBucket()), ev);
+    const cls: ConvictionDcaClassKey =
+      ev.assetClass === 'equity' || ev.assetClass === 'option' ? ev.assetClass : 'unknown';
+    foldIntoGuardBucket(byCls[cls], ev);
+  }
+  const stateByAccount: Record<string, ConvictionDcaGuardState> = {};
+  for (const [key, bucket] of Object.entries(byAcct)) stateByAccount[key] = guardStateOf(bucket);
+  return {
+    ...pooled,
+    state: guardStateOf(pooled),
+    byAccount: byAcct,
+    byClass: byCls,
+    stateByAccount,
+    accountCount: Object.values(byAcct).filter((b) => b.addsPresented > 0).length,
+    retainedEventCount: guardEvents.length,
+    droppedEventCount: droppedGuardEvents,
+    countsExact: droppedGuardEvents === 0,
+    recent: scoped.slice(-MAX_RECENT_GUARD_EVENTS),
+  };
+}
+
 /** What {@link hydrateConvictionDcaFromDisk} recovered (for the boot log line). */
 export interface ConvictionDcaHydration {
   addCount: number;
@@ -290,6 +572,10 @@ export interface ConvictionDcaHydration {
   /** TRA-2265 — the same counts partitioned, rebuilt from the FULL JSONL. */
   byClass: ConvictionDcaClassBuckets;
   byMode: ConvictionDcaModeBuckets;
+  /** TRA-2598 — the same counts per owning book. */
+  byAccount: ConvictionDcaAccountBuckets;
+  /** TRA-2598 — guard candidates recovered from the companion guard JSONL. */
+  guardEventCount: number;
 }
 
 /**
@@ -326,6 +612,28 @@ export function hydrateConvictionDcaFromDisk(dir: string): ConvictionDcaHydratio
       }
     }
 
+    // TRA-2598 — the companion guard log. Same best-effort contract: a missing file
+    // (every host before this commit) hydrates to zero events, which the summary
+    // reports as `state: 'no_candidates'` rather than as a clean brake.
+    let guardRaw = '';
+    try {
+      guardRaw = readFileSync(convictionDcaGuardLogPath(dir), 'utf8');
+    } catch {
+      guardRaw = '';
+    }
+    for (const line of guardRaw.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed === '') continue;
+      try {
+        const ev = JSON.parse(trimmed) as ConvictionDcaGuardEvent;
+        if (typeof ev.ts === 'number' && typeof ev.guardEnabled === 'boolean') {
+          applyGuardEvent(ev);
+        }
+      } catch {
+        // skip a torn/partial trailing line rather than abort the hydrate
+      }
+    }
+
     return {
       addCount,
       breachCount,
@@ -333,6 +641,8 @@ export function hydrateConvictionDcaFromDisk(dir: string): ConvictionDcaHydratio
       lastAddAt,
       byClass: cloneBuckets(byClass),
       byMode: cloneBuckets(byMode),
+      byAccount: cloneBuckets(byAccount),
+      guardEventCount: guardEvents.length,
     };
   });
 }
@@ -387,6 +697,21 @@ export interface ConvictionDcaSummary {
    */
   byClass: ConvictionDcaClassBuckets;
   byMode: ConvictionDcaModeBuckets;
+  /**
+   * TRA-2598 — the SAME counts per OWNING BOOK, and the reason this route exists.
+   * The demo journal is one firm-wide JSONL: a union of every demo book including the
+   * QA probe books (`qa_*`, `ctoverify_*`, `qtverify_*`). Pooled, "did this add land on
+   * a name already net-negative today?" is unanswerable and wrong in BOTH directions —
+   * a loss realised in an unrelated book reads as a breach in the adding book (the
+   * false FIRY violation of 2026-07-28), and a real breach can hide behind a third
+   * book's win. Only a per-book read grades the brake.
+   *
+   * Keys are DYNAMIC; only {@link UNATTRIBUTED_ACCOUNT_KEY} is guaranteed. The sum
+   * reconciles in both branches: Σ byAccount[*].addCount === addCount.
+   */
+  byAccount: ConvictionDcaAccountBuckets;
+  /** Distinct books with ≥1 add in this window (`unattributed` counts as one). */
+  accountCount: number;
   /** TRA-2303 — what these counts were derived from. */
   countsBasis: ConvictionDcaCountBasis;
   /**
@@ -400,8 +725,173 @@ export interface ConvictionDcaSummary {
   retainedFillCount: number;
   /** Fills evicted by the retention cap — non-zero is what makes counts inexact. */
   droppedFillCount: number;
-  /** Most-recent fills, oldest→newest — a DISPLAY tail, never a count basis. */
+  /**
+   * A WINDOW of fills, oldest→newest. Historically a fixed 50-fill tail, which is
+   * what made this route uninspectable: 50 of 658 adds is 7.6% coverage spanning 3 of
+   * 15 post-arm sessions, so any "N clean sessions" verdict read off it was bounded by
+   * the window and not by the data. Now pageable — see {@link recentWindow}.
+   *
+   * Still a DISPLAY projection: never derive a count from it. Use the buckets (exact
+   * over the full ledger) or {@link bySession} (exact over retention).
+   */
   recent: ConvictionDcaFill[];
+  /**
+   * TRA-2598 — what `recent` actually covers, so a partial page can never be mistaken
+   * for the whole corpus. `returned < matched` ⇒ there are more pages.
+   */
+  recentWindow: {
+    /** Fills in the anchored window, i.e. the size of the pageable corpus. */
+    matched: number;
+    /** Offset from the OLDEST matched fill. */
+    offset: number;
+    limit: number;
+    returned: number;
+    /** `true` ⇒ this page is the whole window. */
+    complete: boolean;
+  };
+  /**
+   * TRA-2598 — per-ET-session rollup over the FULL retained window, not the page. This
+   * is what lets an acceptance check see its own corpus: the sessions a verdict claims
+   * to cover are enumerated here with their own counts, so "15 clean sessions" is
+   * checkable against 15 named rows instead of asserted off a 3-session tail.
+   *
+   * Newest session first. ET days (not UTC) — a UTC day rolls 4-5h early and would
+   * split one session in two.
+   */
+  bySession: ConvictionDcaSessionRollup[];
+}
+
+/** One ET trading session's adds — see {@link ConvictionDcaSummary.bySession}. */
+export interface ConvictionDcaSessionRollup {
+  /** ET calendar day, `YYYY-MM-DD`. */
+  etDay: string;
+  addCount: number;
+  breachCount: number;
+  /** Books that added on this session, sorted — the per-session partition. */
+  accounts: string[];
+  /** Add candidates the same-day-loss brake saw / ran on / refused this session. */
+  addsPresented: number;
+  addsEvaluated: number;
+  addsHalted: number;
+  /** The brake's named verdict FOR THIS SESSION. */
+  guardState: ConvictionDcaGuardState;
+}
+
+/** TRA-2598 — paging controls for the `recent` window. */
+export interface ConvictionDcaRecentPaging {
+  /** Page size. Clamped to [1, {@link MAX_RECENT_PAGE_SIZE}]; default {@link MAX_RECENT_FILLS}. */
+  limit?: number;
+  /** Offset from the OLDEST fill in the window. Negative is clamped to 0. */
+  offset?: number;
+}
+
+/**
+ * Hard ceiling on one page. Bounded because the payload is serialized in one shot on
+ * an unauthenticated route; `bySession` (a rollup, not rows) is the surface for
+ * whole-corpus questions, and `offset` walks the rows for anything finer.
+ */
+export const MAX_RECENT_PAGE_SIZE = 1_000;
+
+/**
+ * TRA-2598 — parse `?limit=` / `?offset=` off an Express query bag into paging opts.
+ *
+ * Lives here rather than in the route so the parsing has a unit test that does not
+ * require standing up the 69-field health-route deps object. Express hands back
+ * `string | string[] | ParsedQs`; anything that is not a finite numeric string is
+ * DROPPED (not coerced to 0), so a junk `?limit=abc` falls back to the default page
+ * instead of silently returning an empty one that reads like "no adds".
+ */
+export function parseConvictionDcaPaging(
+  query: Record<string, unknown> | undefined,
+): ConvictionDcaRecentPaging {
+  const asCount = (raw: unknown): number | undefined => {
+    if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const limit = asCount(query?.['limit']);
+  const offset = asCount(query?.['offset']);
+  return {
+    ...(limit !== undefined ? { limit } : {}),
+    ...(offset !== undefined ? { offset } : {}),
+  };
+}
+
+function resolvePaging(paging: ConvictionDcaRecentPaging | undefined): {
+  limit: number;
+  offset: number;
+} {
+  const rawLimit = paging?.limit;
+  const limit =
+    typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit >= 1
+      ? Math.min(Math.floor(rawLimit), MAX_RECENT_PAGE_SIZE)
+      : MAX_RECENT_FILLS;
+  const rawOffset = paging?.offset;
+  const offset =
+    typeof rawOffset === 'number' && Number.isFinite(rawOffset) && rawOffset > 0
+      ? Math.floor(rawOffset)
+      : 0;
+  return { limit, offset };
+}
+
+/**
+ * Page the window oldest→newest. Note the DEFAULT (offset 0, limit 50) deliberately
+ * still yields the NEWEST 50 — the shape every existing reader depends on — and only
+ * an explicit `offset` walks backwards from the oldest end. A page that silently
+ * changed which end it served would break the tail readers this route already has.
+ */
+function pageFills(
+  window: readonly ConvictionDcaFill[],
+  limit: number,
+  offset: number,
+): ConvictionDcaFill[] {
+  if (offset === 0) return window.slice(-limit);
+  return window.slice(offset, offset + limit);
+}
+
+/** Fold the retained window into per-ET-session rows, newest session first. */
+function rollupSessions(
+  fills: readonly ConvictionDcaFill[],
+  events: readonly ConvictionDcaGuardEvent[],
+): ConvictionDcaSessionRollup[] {
+  const rows = new Map<
+    string,
+    {
+      addCount: number;
+      breachCount: number;
+      accounts: Set<string>;
+      guard: ConvictionDcaGuardBucket;
+    }
+  >();
+  const rowFor = (etDay: string) => {
+    let row = rows.get(etDay);
+    if (!row) {
+      row = { addCount: 0, breachCount: 0, accounts: new Set(), guard: emptyGuardBucket() };
+      rows.set(etDay, row);
+    }
+    return row;
+  };
+  for (const f of fills) {
+    const row = rowFor(etDateString(new Date(f.ts)));
+    row.addCount += 1;
+    if (isBreach(f)) row.breachCount += 1;
+    row.accounts.add(convictionDcaAccountKey(f.account));
+  }
+  for (const ev of events) {
+    foldIntoGuardBucket(rowFor(etDateString(new Date(ev.ts))).guard, ev);
+  }
+  return [...rows.entries()]
+    .sort((a, b) => (a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0))
+    .map(([etDay, row]) => ({
+      etDay,
+      addCount: row.addCount,
+      breachCount: row.breachCount,
+      accounts: [...row.accounts].sort(),
+      addsPresented: row.guard.addsPresented,
+      addsEvaluated: row.guard.addsEvaluated,
+      addsHalted: row.guard.addsHalted,
+      guardState: guardStateOf(row.guard),
+    }));
 }
 
 /**
@@ -414,8 +904,20 @@ export interface ConvictionDcaSummary {
  * TRA-2303 — BOTH branches are exact over the full ledger. Check `countsExact`
  * before grading anything off an anchored result.
  */
-export function summarizeConvictionDca(deployAnchor: number | null = null): ConvictionDcaSummary {
+export function summarizeConvictionDca(
+  deployAnchor: number | null = null,
+  paging?: ConvictionDcaRecentPaging,
+): ConvictionDcaSummary {
+  const { limit, offset } = resolvePaging(paging);
   if (deployAnchor == null) {
+    // `bySession` and the pageable window derive from `retainedFills` even here, where
+    // the pooled counts come from the monotonic counters. That is deliberate and the
+    // two are NOT interchangeable: the monotonic counts are exact over the whole file,
+    // the session rows are exact over retention. `droppedFillCount > 0` is the flag
+    // that says the session rows no longer reach the oldest sessions — do not read an
+    // absent session row as a session with no adds when it is non-zero.
+    const window = retainedFills;
+    const page = pageFills(window, limit, offset);
     // Both the pooled counts AND the partitions come from the monotonic
     // boot-hydrated counters here — i.e. the FULL JSONL, not the 50-fill tail.
     // Re-deriving byClass from `recentFills` would reproduce the very blindness
@@ -428,11 +930,21 @@ export function summarizeConvictionDca(deployAnchor: number | null = null): Conv
       deployAnchor: null,
       byClass: cloneBuckets(byClass),
       byMode: cloneBuckets(byMode),
+      byAccount: cloneBuckets(byAccount),
+      accountCount: Object.values(byAccount).filter((b) => b.addCount > 0).length,
       countsBasis: 'monotonic-full',
       countsExact: true,
       retainedFillCount: retainedFills.length,
       droppedFillCount: droppedFills,
-      recent: retainedFills.slice(-MAX_RECENT_FILLS),
+      recent: page,
+      recentWindow: {
+        matched: window.length,
+        offset,
+        limit,
+        returned: page.length,
+        complete: page.length === window.length,
+      },
+      bySession: rollupSessions(window, guardEvents),
     };
   }
   // TRA-2303 — the monotonic counters can't be re-filtered by ts, so the anchored
@@ -453,7 +965,12 @@ export function summarizeConvictionDca(deployAnchor: number | null = null): Conv
   }
   // Partitions re-derive over the SAME anchored population the pooled counts above
   // use, so the sum reconciliation holds in this branch too.
-  const { byClass: anchoredByClass, byMode: anchoredByMode } = foldBuckets(anchored);
+  const {
+    byClass: anchoredByClass,
+    byMode: anchoredByMode,
+    byAccount: anchoredByAccount,
+  } = foldBuckets(anchored);
+  const anchoredPage = pageFills(anchored, limit, offset);
   return {
     addCount: anchored.length,
     breachCount: breaches,
@@ -462,6 +979,8 @@ export function summarizeConvictionDca(deployAnchor: number | null = null): Conv
     deployAnchor,
     byClass: anchoredByClass,
     byMode: anchoredByMode,
+    byAccount: anchoredByAccount,
+    accountCount: Object.values(anchoredByAccount).filter((b) => b.addCount > 0).length,
     countsBasis: droppedFills === 0 ? 'retained-full' : 'retained-truncated',
     // Deliberately conservative: ANY eviction marks the anchored counts inexact,
     // even though an anchor after the eviction boundary would still be exact.
@@ -470,6 +989,17 @@ export function summarizeConvictionDca(deployAnchor: number | null = null): Conv
     countsExact: droppedFills === 0,
     retainedFillCount: retainedFills.length,
     droppedFillCount: droppedFills,
-    recent: anchored.slice(-MAX_RECENT_FILLS),
+    recent: anchoredPage,
+    recentWindow: {
+      matched: anchored.length,
+      offset,
+      limit,
+      returned: anchoredPage.length,
+      complete: anchoredPage.length === anchored.length,
+    },
+    bySession: rollupSessions(
+      anchored,
+      guardEvents.filter((e) => e.ts >= deployAnchor),
+    ),
   };
 }

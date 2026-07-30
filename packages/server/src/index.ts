@@ -2861,6 +2861,14 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 // of CONVICTION_DCA.enabled — reading one small file at boot is cheap.
 {
   const h = hydrateConvictionDcaFromDisk(DATA_DIR);
+  // TRA-2598 — the guard log hydrates on its own axis: a host can have thousands of
+  // fills and ZERO guard events (every line written before this commit), so gate this
+  // line separately or a fresh guard ledger is invisible at boot.
+  if (h.guardEventCount > 0) {
+    log.info('conviction-DCA same-day-loss guard ledger hydrated (TRA-2598)', {
+      guardEventCount: h.guardEventCount,
+    });
+  }
   if (h.addCount > 0) {
     log.info('conviction-DCA add ledger hydrated (TRA-1278)', {
       addCount: h.addCount,

@@ -67,7 +67,12 @@ import { summarizeRegimeTsmomScans } from '../crypto-regime-tsmom-scanner.js';
 import { summarizeRegimeTsmomDemoRoute } from '../crypto-regime-tsmom-demo-route.js';
 import { isCryptoIgnitionEnabled, resolveIgnitionWatchlist } from '../crypto-ignition-flag.js';
 import { summarizeIgnitionScans } from '../crypto-ignition-scanner.js';
-import { summarizeConvictionDca, resolveConvictionDcaDeployAnchor } from '../conviction-dca-ledger.js';
+import {
+  summarizeConvictionDca,
+  summarizeConvictionDcaGuard,
+  resolveConvictionDcaDeployAnchor,
+  parseConvictionDcaPaging,
+} from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake } from '../churn-brake-ledger.js';
 import { summarizeDirectionalGate } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
@@ -1876,13 +1881,36 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // first day, ~18 days behind the tail). Both branches are exact over the full
   // ledger now. `recent` is a DISPLAY tail — never grade a count off it, and treat
   // `countsExact: false` as un-gradeable rather than as a zero.
-  app.get('/api/health/conviction-dca', (_req, res) => {
+  //
+  // TRA-2598 — three additions, all read-only:
+  //   • `byAccount` / `bySession[].accounts` — the OWNING BOOK. The demo journal is one
+  //     firm-wide union including the QA probe books, so a POOLED read of "did this add
+  //     land on a name already net-negative today?" is wrong in both directions. It
+  //     manufactured a false `high` regression against a WORKING brake on 2026-07-28
+  //     (three books traded FIRY; the −$47.00 loss was a THIRD book's).
+  //   • `guard` — the brake's own denominator (`addsPresented`/`addsEvaluated`/
+  //     `addsHalted` + a named `state`). `breachCount: 0` alone has no failing state,
+  //     and it is a DIFFERENT invariant besides: it counts R-cap breaches, while a
+  //     same-day-loss halt happens BEFORE any fill exists and so can never appear in
+  //     the fill ledger at all. Read `guard.state`, not the zero.
+  //   • `?limit=` / `?offset=` — `recent` was a fixed 50 against 658 adds (7.6%, 3 of
+  //     15 post-arm sessions). `recentWindow` states what the page covers; `bySession`
+  //     is the whole-corpus surface.
+  app.get('/api/health/conviction-dca', (req, res) => {
+    const anchor = resolveConvictionDcaDeployAnchor();
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       enabled: CONVICTION_DCA.enabled,
-      ...summarizeConvictionDca(resolveConvictionDcaDeployAnchor()),
+      ...summarizeConvictionDca(
+        anchor,
+        parseConvictionDcaPaging(req.query as Record<string, unknown> | undefined),
+      ),
+      // Both halves take the SAME anchor, so the fill counts and the guard denominator
+      // always describe one window. An anchor applied to only one of them would make
+      // `addsEvaluated` look short against `addCount` for purely windowing reasons.
+      guard: summarizeConvictionDcaGuard(anchor),
     });
   });
 
