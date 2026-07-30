@@ -223,6 +223,36 @@ const WHEEL_ARCHETYPES = new Set(['wheel-csp', 'wheel-cc']);
 const isFixtureAccount = (a) =>
   typeof a === 'string' && (/^qa[_-]/i.test(a) || /^ctoverify/i.test(a));
 
+/**
+ * The scope probe's identity — DELIBERATELY DETERMINISTIC, and deliberately
+ * inside `isFixtureAccount` above.
+ *
+ * `armedScope` is the one field that separates the two readings of this grade's
+ * dominant outcome: `n(T)=0` with the consumer ARMED is a measured no-op, and
+ * `n(T)=0` with it OFF is a tautology (`riskThrottleSizeMultiplier` returns 1 on
+ * its first line before it ever reads the throttle). Those printed identically
+ * on every fire through 2026-07-30 — TRA-2449, TRA-2574 and the TRA-2653 run all
+ * carried `armedScope UNKNOWN` — because the route is `requireAuth` and the run
+ * had no token. So the probe mints its own rather than leaving the discriminator
+ * to whoever remembers to do it by hand.
+ *
+ * Two properties are load-bearing:
+ *
+ * 1. **Deterministic username.** A per-fire unique name would create a new demo
+ *    book every weekday (~250/yr) on a box whose fleet size is itself an
+ *    instrument elsewhere. This signs up ONCE and logs in on every fire after.
+ * 2. **`ctoverify`-prefixed**, so the population filter drops its rows. A probe
+ *    account that joined the graded cohort would be this script contaminating
+ *    its own tape. `selftest` asserts the two agree — a rename that breaks the
+ *    prefix fails there rather than silently entering the population.
+ *
+ * `@qa.invalid` is required, not cosmetic: `.test` addresses are deliverable
+ * enough to become a permanent bounce source (the TRA-2523 mail-bounce arm).
+ */
+const SCOPE_PROBE_USER = 'ctoverify_tra2331_scope_probe';
+const SCOPE_PROBE_PASS = process.env.TRA2331_PROBE_PASSWORD || 'Ctoverify-2331-Scope!7';
+const SCOPE_PROBE_EMAIL = `${SCOPE_PROBE_USER}@qa.invalid`;
+
 const EXIT_FOR = { PASS: 0, FAIL: 1, 'NOT-GRADED': 2, VOID: 3 };
 
 // ── argv ───────────────────────────────────────────────────────────────────
@@ -237,6 +267,12 @@ const argOf = (name, fallback) => {
 };
 const JSON_OUT = argv.includes('--json');
 const SELFTEST = argv.includes('--selftest');
+/**
+ * Suppresses the self-service token mint. The mint is the only WRITE this
+ * otherwise read-only checker performs, so an operator who must not write to the
+ * box keeps a usable (if scope-blind) run instead of having to skip the grade.
+ */
+const NO_SIGNUP = argv.includes('--no-signup');
 const BASE = String(argOf('base', 'https://tradingai-bqb1.onrender.com')).replace(/\/+$/, '');
 /**
  * The power floor, DERIVED — not the round number it used to be.
@@ -658,7 +694,7 @@ function reachability(scopeRead) {
     // The whole point of this ticket is that a field reading the same in the
     // pass and fail state proves nothing. An unread `armedScope` is UNKNOWN and
     // must never be rendered as `off` — those are the two states that matter.
-    out.push(`⚠ armedScope UNKNOWN — /api/health/live is auth-gated and the unauthenticated read did not return it. This is NOT evidence the flag is off. Read it with a token (a non-admin signup reaches the route; bqb1 admin auth is dead) or pass --scope=<off|demo|all> once verified.`);
+    out.push(`⚠ armedScope UNKNOWN — this is NOT evidence the flag is off. The route is requireAuth and the run could not authenticate. Since TRA-2331 the checker mints its own credential (login then signup as ${SCOPE_PROBE_USER}), so UNKNOWN now means that ladder ALSO failed — i.e. the box's own self-serve auth is down, which is a finding in its own right, not a missing operator step. Re-run with TRADING_ADMIN_TOKEN, or pass --scope=<off|demo|all> once verified by hand.`);
   } else if (!armed) {
     out.push(`⚠ scope=${JSON.stringify(scope)} — with the flag off, riskThrottleMultiplier is pinned to 1 at every path, so n(T) is STRUCTURALLY 0 and PASS/FAIL:SELECTION_ADVERSE cannot be entered. A NOT-GRADED here is a tautology, not a calm session.`);
   }
@@ -934,6 +970,48 @@ function selftest() {
   check('directional joins the cohort', String(directional.cohorts?.U), '4');
   check('  and is not unclassified', String(directional.dropped.unclassified), '0');
 
+  // ── The scope probe must never enter its own population.
+  //    `resolveArmedScope` signs an account up on the box being graded. If that
+  //    account's rows were gradeable, the checker would be measuring tape it
+  //    created. This ties the probe identity to the SAME predicate the
+  //    population filter uses, so a rename that drops the `ctoverify` prefix
+  //    fails here instead of silently contaminating the cohort months later.
+  check(
+    'scope probe is fixture-excluded',
+    String(isFixtureAccount(SCOPE_PROBE_USER)),
+    'true',
+  );
+  // Non-vacuous: the filter must still admit the real book it exists to grade.
+  check(
+    '  ...and a real account is not',
+    String(isFixtureAccount('admin')),
+    'false',
+  );
+  // A deliverable probe address becomes a permanent bounce source (TRA-2523).
+  check(
+    '  probe email is undeliverable',
+    String(SCOPE_PROBE_EMAIL.endsWith('@qa.invalid')),
+    'true',
+  );
+  // UNKNOWN must never render as `off` — those drive opposite conclusions
+  // about an n(T)=0 fire, which is this grade's dominant outcome.
+  const unknownReach = reachability({ known: false, scope: null, source: 'unread' });
+  check(
+    'UNKNOWN scope warns, does not read off',
+    String(unknownReach.some((l) => l.includes('armedScope UNKNOWN') && l.includes('NOT evidence the flag is off'))),
+    'true',
+  );
+  check(
+    '  and scope=off is called a TAUTOLOGY',
+    String(reachability({ known: true, scope: 'off', source: 't' }).some((l) => l.includes('tautology'))),
+    'true',
+  );
+  check(
+    '  while scope=demo is REACHABLE',
+    String(reachability({ known: true, scope: 'demo', source: 't' })[0].includes('REACHABLE')),
+    'true',
+  );
+
   console.log(`\n${fails.length === 0 ? 'SELFTEST PASS' : `SELFTEST FAIL (${fails.length}): ${fails.join(', ')}`}`);
   console.log('\nNOTE: fixture reachability is NOT box reachability. The live run prints the on-box reachability of each verdict.');
   return fails.length === 0 ? 0 : 1;
@@ -956,6 +1034,99 @@ function buildCarries(ancestor, commit) {
     if (err && err.status === 1) return false;
     return null;
   }
+}
+
+/**
+ * Reads `autopilot.sizing.armedScope` out of the RUNNING PROCESS, minting its
+ * own credential if it has to.
+ *
+ * `armedScope` is computed from `process.env` at snapshot time, so this is an
+ * end-to-end read of what the box actually parsed — NOT a stored Render value.
+ * That distinction is load-bearing on this host: the single-key env-var PUT
+ * returns 200 and reads back correctly WITHOUT restarting the process, so the
+ * flag reached `stored-but-dark` once already (2026-07-25) and the env row read
+ * identically in both worlds.
+ *
+ * Token ladder, most-authoritative first. Every rung reports its own `source`
+ * so a reader can tell which one answered:
+ *   1. `TRADING_ADMIN_TOKEN` if the operator supplied one.
+ *   2. `POST /api/auth/login` as the deterministic probe (the steady state —
+ *      the account exists after the first run ever made).
+ *   3. `POST /api/auth/signup` (first run only, or after a box reset wipes the
+ *      user store). 409 `Username already taken` is EXPECTED and not an error.
+ *
+ * Returns `{known:false}` only when the whole ladder fails. `known:false` is
+ * NOT `off`, and callers must keep those separate: `off` makes `n(T)=0` a
+ * tautology, whereas UNKNOWN means the grade simply cannot say which it is.
+ */
+async function resolveArmedScope() {
+  const unknown = (source) => ({ known: false, scope: null, source });
+
+  const scopeFrom = async (token, source) => {
+    try {
+      const res = await fetch(`${BASE}/api/health/live`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) return null;
+      const body = await res.json();
+      // Walk rather than hard-code `autopilot.sizing`: the field has already
+      // moved once (TRA-2333 replaced `sizing.armed` with `armedScope`), and a
+      // hard path that silently misses reads exactly like an unarmed box.
+      const stack = [body];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (!cur || typeof cur !== 'object') continue;
+        if (Object.prototype.hasOwnProperty.call(cur, 'armedScope')) {
+          return { known: true, scope: cur.armedScope, source };
+        }
+        for (const v of Object.values(cur)) if (v && typeof v === 'object') stack.push(v);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const envToken = process.env.TRADING_ADMIN_TOKEN || '';
+  if (envToken) {
+    const hit = await scopeFrom(envToken, '/api/health/live (TRADING_ADMIN_TOKEN)');
+    if (hit) return hit;
+  }
+
+  if (NO_SIGNUP) {
+    const hit = await scopeFrom('', '/api/health/live unauthenticated');
+    return hit ?? unknown('unread (--no-signup, and the unauthenticated read is 401)');
+  }
+
+  const tokenFrom = async (path) => {
+    try {
+      const res = await fetch(`${BASE}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: SCOPE_PROBE_USER,
+          password: SCOPE_PROBE_PASS,
+          email: SCOPE_PROBE_EMAIL,
+        }),
+      });
+      if (!res.ok) return null;
+      const body = await res.json();
+      return typeof body?.token === 'string' && body.token ? body.token : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // Login BEFORE signup: in the steady state the account exists, and trying
+  // signup first would burn a guaranteed 409 on every fire.
+  for (const [path, label] of [['/api/auth/login', 'login'], ['/api/auth/signup', 'signup']]) {
+    const token = await tokenFrom(path);
+    if (!token) continue;
+    const hit = await scopeFrom(token, `/api/health/live (${SCOPE_PROBE_USER} ${label})`);
+    if (hit) return hit;
+  }
+
+  return unknown('unread (admin token absent; probe login AND signup both failed)');
 }
 
 const stampsSupportedFor = (commit) => buildCarries(STAMP_DECIDED_COMMIT, commit);
@@ -988,30 +1159,7 @@ async function main() {
     return EXIT_FOR.VOID;
   }
 
-  // Best effort: the sizing snapshot is auth-gated and bqb1 admin auth is dead.
-  // It is used ONLY to label reachability — never to gate the verdict, so its
-  // absence degrades the commentary, not the grade.
-  if (!scopeOverride) {
-    try {
-      const token = process.env.TRADING_ADMIN_TOKEN || '';
-      const res = await fetch(`${BASE}/api/health/live`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
-      if (res.ok) {
-        const body = await res.json();
-        const stack = [body];
-        while (stack.length) {
-          const cur = stack.pop();
-          if (!cur || typeof cur !== 'object') continue;
-          if (Object.prototype.hasOwnProperty.call(cur, 'armedScope')) {
-            scopeRead = { known: true, scope: cur.armedScope, source: '/api/health/live' };
-            break;
-          }
-          for (const v of Object.values(cur)) if (v && typeof v === 'object') stack.push(v);
-        }
-      }
-    } catch { /* 401/network — stays UNKNOWN, which is a different fact from `off` */ }
-  }
+  if (!scopeOverride) scopeRead = await resolveArmedScope();
 
   const commit = journal?.build?.commit ?? null;
   const result = grade({
