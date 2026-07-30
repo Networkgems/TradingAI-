@@ -715,6 +715,44 @@ describe('classifySpreadCeilingAccount (TRA-2355)', () => {
     }
   });
 
+  // TRA-2650 — THE POSITIVE CONTROL FOR THE ROW-MIGRATION INSTRUMENT.
+  //
+  // TRA-2650 was filed claiming the TRA-2524 desk-fold delta is "structurally
+  // zero — the instrument cannot move", on the evidence that the paired live
+  // read across `e74b4cf` (9e1b1123 pre → 1b803bd8 post, ancestry verified both
+  // ways) came back byte-identical: desk 133/128/5, realizedPnlUsd
+  // 1403.3888175569411, fixture 120/119.
+  //
+  // The observation is right; the inference is not, and the difference decides
+  // whether TRA-2553 has a measurement or a tautology. There are TWO folds:
+  //
+  //   - a BOOK-level fold (username roster / PATCH …/users/:username {email})
+  //     edits the USER RECORD, and genuinely cannot move an already-written row;
+  //   - a CLASSIFIER change edits these very patterns, and DOES move rows
+  //     retroactively, because the SAME frozen `account` string classifies
+  //     differently on the new build.
+  //
+  // `e74b4cf` was the second kind. This test pins that the three books it named
+  // really do migrate, so the byte-identical live read means what it actually
+  // means: those books wrote ZERO rows into the option journal, and their
+  // historical desk-dollar contamination is genuinely $0.00 — a finding, not a
+  // dead gauge. Delete the TRA-2524 patterns and this goes red, which is the
+  // whole point: a zero you have never seen move is not a zero you may publish.
+  it('TRA-2650 the three TRA-2524 books migrate desk→fixture on the SAME frozen string', () => {
+    const PRE_TRA2524_PATTERNS = [/^qa/i, /^ctoverify/i, /^monitor_qa/i, /^qtverify/i];
+    for (const account of ['ceo2251v130001', 'qtprobe3', 'tra2339v66f17374']) {
+      // Pre-`e74b4cf` nothing reached them — they were counted as DESK P&L.
+      expect(PRE_TRA2524_PATTERNS.some(re => re.test(account)), account).toBe(false);
+      // Post-`e74b4cf` the identical string classifies as fixture. THE MOVE.
+      expect(classifySpreadCeilingAccount(account), account).toBe('fixture');
+    }
+    // …and the real desk books do NOT move, so the migration is scoped and the
+    // assertion above is not just "the classifier flags everything".
+    for (const account of ['admin', 'Richard', 'enock']) {
+      expect(classifySpreadCeilingAccount(account), account).toBe('desk');
+    }
+  });
+
   it('ABSENT/BLANK is `unattributed`, NEVER `desk` — the laundering branch', () => {
     // Load-bearing: the gate ledger hydrates pre-TRA-2355 JSONL lines that carry no
     // class at all. Defaulting those to `desk` would manufacture desk evidence out of

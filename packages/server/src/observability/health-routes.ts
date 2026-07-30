@@ -1155,14 +1155,17 @@ export interface OptionJournalReport {
     /** TRA-2590 — why the cross-tab is per-class and not on the pooled fold. */
     structureExitNote: string;
     /**
-     * TRA-2650 — the partition's BASIS. Row class is frozen at write time, so a
-     * book-level fold moves NO row and any before/after dollar delta measured
-     * here is zero by construction. See {@link partitionByAccountClass}.
+     * TRA-2650 — the partition's BASIS. The `account` string is frozen at write
+     * time but its CLASS is recomputed at read time, so a BOOK-level fold moves
+     * no row (delta zero by construction ⇒ do not grade a fold on it) while a
+     * CLASSIFIER change moves rows retroactively (delta is a real measurement).
+     * See {@link partitionByAccountClass}.
      */
     accountAttribution: {
-      basis: 'account-string-frozen-at-write';
+      basis: 'account-string-frozen-at-write, class-recomputed-at-read';
       emailAware: false;
       bookFoldRestatesRows: false;
+      classifierChangeRestatesRows: true;
       note: string;
     };
   };
@@ -1647,38 +1650,52 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
    */
   structureExitNote: string;
   /**
-   * TRA-2650 — THE BASIS OF THE PARTITION, STATED SO `Δ = 0` CANNOT BE MISREAD.
+   * TRA-2650 — THE BASIS OF THE PARTITION. TWO AXES, AND THEY BEHAVE OPPOSITELY.
    *
-   * Every row here is classified from the `account` STRING frozen into it at
-   * write time, by `classifySpreadCeilingAccount(r.account)` → `isTestAccount`
-   * with NO email argument. Two consequences, and they are the whole reason
-   * this field exists:
+   * A row's `account` STRING is frozen at write time, but its CLASS is computed
+   * at READ time by `classifySpreadCeilingAccount(r.account)` → `isTestAccount`
+   * (username patterns only — no email argument). Whether a "fold" moves a row
+   * therefore depends entirely on WHICH fold you mean, and conflating the two
+   * is how TRA-2650 was filed against a working instrument:
    *
-   *  - RE-CLASSIFYING A BOOK CANNOT MOVE AN ALREADY-WRITTEN ROW. The desk fold
-   *    (a username-roster change, or the documented
-   *    `PATCH /api/admin/users/:username {email}` move) operates on the USER
-   *    RECORD. The row partition operates on a string copied at write time.
-   *    They are different predicates over different data.
-   *  - THEREFORE `M = desk.total_control − desk.total_post` AND
-   *    `Δ desk.realizedPnlUsd` ARE ZERO BY CONSTRUCTION ACROSS ANY FOLD —
-   *    on a fold that worked AND on one that did nothing. A `$0.00`
-   *    contamination headline read off this route is NOT evidence the fold was
-   *    clean; it is an instrument that cannot move. TRA-2524 measured exactly
-   *    this and got byte-identical figures either side of `e74b4cf`.
+   *  - A **BOOK-LEVEL FOLD** — editing the USER RECORD (username roster, or the
+   *    documented `PATCH /api/admin/users/:username {email}`) — moves NOTHING
+   *    here. The row keeps its frozen string, and the classifier never sees an
+   *    email. `Δ` across such a fold IS zero by construction, on a fold that
+   *    worked and one that did nothing alike. Grade a book-level fold on the
+   *    BOOK axis (`/api/health/demo-book-public`), never on a dollar delta here.
    *
-   * This is DELIBERATE, not a defect to fix: the stored `account` is what makes
-   * a historical desk number stable. Retroactive re-attribution would silently
-   * restate every previously published board figure. If a restatement is ever
-   * genuinely wanted it needs an explicit row-rewrite step with a real
-   * before/after — it must never fall out of a roster edit as a side effect.
+   *  - A **CLASSIFIER CHANGE** — editing `BUILTIN_TEST_PATTERNS` or
+   *    `TEST_ACCOUNT_PREFIXES` — DOES move already-written rows, retroactively,
+   *    because the same frozen string classifies differently on the new build.
+   *    This axis has a real pass AND a real fail state, so a zero delta across
+   *    it IS a measurement.
+   *
+   * WORKED EXAMPLE, and the reason both bullets are spelled out. TRA-2524's
+   * `e74b4cf` was a CLASSIFIER change: it added `/^tra\d/i`,
+   * `/^(ceo|cto|cfo|qt|leaddev)\d/i` and `/^qtprobe/i`, under which
+   * `ceo2251v130001`, `qtprobe3` and `tra2339v66f17374` all move desk→fixture.
+   * The paired live read across it (`9e1b1123` pre → `1b803bd8` post, ancestry
+   * verified both ways) came back byte-identical — desk 133/128/5,
+   * `realizedPnlUsd` 1403.3888175569411, fixture 120/119. Read as axis 1 that
+   * looks like a dead instrument; read correctly as axis 2 it is a FINDING:
+   * those three books wrote ZERO rows into this journal, so the historical
+   * desk-dollar contamination from them is genuinely $0.00.
+   *
+   * ⚠ The retroactivity in axis 2 cuts both ways: adding a pattern SILENTLY
+   * RESTATES every previously published desk number. That is why
+   * `test-accounts.test.ts` pins the migration with a positive control — an
+   * instrument nobody has seen move is not one you may read a zero off.
    */
   accountAttribution: {
-    /** How a row's class is decided. */
-    basis: 'account-string-frozen-at-write';
+    /** The string is frozen; the CLASS is recomputed per build from it. */
+    basis: 'account-string-frozen-at-write, class-recomputed-at-read';
     /** `classifySpreadCeilingAccount` takes no email ⇒ an email fold is invisible here. */
     emailAware: false;
-    /** A book-level fold does NOT restate historical rows. Hence Δ ≡ 0. */
+    /** Editing the user record does NOT restate historical rows. */
     bookFoldRestatesRows: false;
+    /** Editing the test-account patterns DOES restate them, retroactively. */
+    classifierChangeRestatesRows: true;
     note: string;
   };
 } {
@@ -1713,22 +1730,26 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
       + 'grade. For TRA-2202 read byAccountClass.desk.byStructureExit and find the cell with '
       + 'structure=single_leg_otm, exitReason=sl.',
     accountAttribution: {
-      basis: 'account-string-frozen-at-write',
+      basis: 'account-string-frozen-at-write, class-recomputed-at-read',
       emailAware: false,
       bookFoldRestatesRows: false,
+      classifierChangeRestatesRows: true,
       note:
-        'Rows are classified from the `account` string frozen in at WRITE time '
-        + '(classifySpreadCeilingAccount -> isTestAccount, no email argument). A desk fold '
-        + 'edits the USER RECORD (username roster, or PATCH /api/admin/users/:username '
-        + '{email}) and therefore CANNOT move an already-written row. Consequence: '
-        + '`desk.total` and `desk.realizedPnlUsd` are UNCHANGED across any fold, on a fold '
-        + 'that worked and on one that did nothing alike, so a $0.00 contamination delta '
-        + 'measured here is VACUOUS — it is not evidence the fold was clean (TRA-2650; '
-        + 'TRA-2524 read byte-identical figures either side of e74b4cf). This is by design: '
-        + 'the stored account string is what keeps historical desk numbers stable. Any real '
-        + 'restatement needs an explicit row-rewrite step with its own before/after, never a '
-        + 'side effect of a roster edit. Grade the fold on the BOOK axis '
-        + '(/api/health/demo-book-public), not on a dollar delta here.',
+        'A row\'s `account` string is frozen at WRITE time; its CLASS is recomputed at READ '
+        + 'time by classifySpreadCeilingAccount -> isTestAccount (username patterns only, no '
+        + 'email). So TWO different "folds" behave OPPOSITELY here, and conflating them is a '
+        + 'known trap (TRA-2650). (1) A BOOK-LEVEL fold — editing the user record, i.e. a '
+        + 'username-roster change or PATCH /api/admin/users/:username {email} — moves NO row: '
+        + 'delta is zero by construction, on a fold that worked and one that did nothing '
+        + 'alike, so grade it on the BOOK axis (/api/health/demo-book-public), never on a '
+        + 'dollar delta here. (2) A CLASSIFIER change — editing BUILTIN_TEST_PATTERNS or '
+        + 'TEST_ACCOUNT_PREFIXES — DOES move already-written rows RETROACTIVELY, because the '
+        + 'same frozen string classifies differently on the new build; that axis has a real '
+        + 'pass and fail state and a zero across it IS a measurement. Worked example: '
+        + 'TRA-2524\'s e74b4cf was axis (2) and the paired read 9e1b1123 -> 1b803bd8 came '
+        + 'back byte-identical, which means the three fixture books wrote ZERO rows here and '
+        + 'their desk-dollar contamination is genuinely $0.00. NOTE the retroactivity: '
+        + 'adding a pattern silently restates every previously published desk number.',
     },
   };
 }
