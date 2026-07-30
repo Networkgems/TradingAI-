@@ -185,7 +185,7 @@ describe('measureDataDirUsage', () => {
   });
 
   // ── TRA-2420: allocated vs apparent ──────────────────────────────────────
-  // `/api/health/storage` publishes a residual of `df`-used minus what the walk
+  // `/api/health/storage/detail` publishes a residual of `df`-used minus what the walk
   // measured. That subtraction was unit-mismatched: the walk summed `st_size`
   // (apparent) while `df` counts allocated blocks plus the root reserve. On bqb1
   // — ~48k files averaging ~5 KiB — block rounding alone is worth ~100 MB, which

@@ -12,7 +12,8 @@
  * unnamed residual is the shape of thing that gets rediscovered as an incident.
  *
  * There is no shell on bqb1, so the number has to be published by a route. This
- * module is the measurement behind `GET /api/health/storage`.
+ * module is the measurement behind `GET /api/health/storage/detail` (admin-only
+ * since TRA-2599; it was `GET /api/health/storage` when this was written).
  *
  * ## The part that is easy to get wrong
  *
@@ -49,14 +50,28 @@
  * precisely so one such day can be recognised and stepped over rather than
  * mistaken for the daily slope.
  *
- * ## No new PII on an unauthenticated route
+ * ## No PII in the breakdown — and do NOT relax this
  *
- * `/api/health/storage` is open, like the other health probes. Per-user files
- * live at `DATA_DIR/users/<username>/…`, so a naive one-level-deeper breakdown
- * would publish the user list. Instead each top-level entry reports its heaviest
- * **basename patterns** (digits and dates normalised: `eod-2026-07-24.json` →
- * `eod-<date>.json`), which names the WRITER — the thing being hunted — and
- * never the user.
+ * ⚠️ The original justification here has EXPIRED and is kept only so the next
+ * reader does not re-derive it. It read: "`/api/health/storage` is open, like the
+ * other health probes." That was true when written and is now false —
+ * **TRA-2599** moved this block to `GET /api/health/storage/detail` behind
+ * `requireAuth, requireAdmin`, because TRA-2414 found the route publishing
+ * `dataDir`, the account count and `users.json`'s mtime to anonymous callers.
+ *
+ * The design below is retained anyway, and the gate is not a licence to widen it:
+ *
+ *  - Per-user files live at `DATA_DIR/users/<username>/…`, so a naive
+ *    one-level-deeper breakdown would publish the user list. Instead each
+ *    top-level entry reports its heaviest **basename patterns** (digits and dates
+ *    normalised: `eod-2026-07-24.json` → `eod-<date>.json`), which names the
+ *    WRITER — the thing being hunted — and never the user.
+ *  - "It is admin-only now" is a weaker guarantee than it sounds: this same
+ *    object is the input to `projectStorageLiveness`, an admin token is a 24h
+ *    stateless HMAC, and the route is one middleware argument away from open.
+ *    A breakdown that never holds a username cannot leak one through any of those.
+ *
+ * So: patterns, not paths, regardless of who can read the route.
  */
 
 import { readdir, stat, lstat } from 'fs/promises';
@@ -250,7 +265,7 @@ function countAllocated(acc: WalkAcc, state: ScanState, s: { size: number; block
  * The failure this guards is WHOLESALE: a platform or filesystem that reports 0
  * blocks for everything. `allocatedBytes` would then be 0 on a volume holding
  * real data — a false zero that reads as "nothing is allocated" and makes the
- * `/api/health/storage` residual equal the entire disk.
+ * `/api/health/storage/detail` residual equal the entire disk.
  *
  * Exported for direct test: a declining filesystem cannot be produced by writing
  * files to a real one, so this branch would otherwise have no failing state.

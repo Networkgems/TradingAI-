@@ -351,9 +351,13 @@ export function diskMinFreePct(): number {
 
 /**
  * TRA-2357 — read free space on the disk backing `path`. PURE: it never
- * dispatches, so a polled read-only surface (`/api/health/storage`) can report
- * headroom without emitting an alert or, worse, silently consuming the
- * `disk-near-full` throttle window and suppressing the real one.
+ * dispatches, so a polled read-only surface can report headroom without emitting
+ * an alert or, worse, silently consuming the `disk-near-full` throttle window and
+ * suppressing the real one. Two surfaces call it: the OPEN
+ * `/api/health/storage` (which publishes only `disk.belowThreshold` against this
+ * threshold) and the admin `/api/health/storage/detail` (the byte figures) —
+ * TRA-2599. Purity matters MORE now, not less: the open one is reachable by
+ * anyone, so a dispatching reader there would let a stranger burn the throttle.
  *
  * `freeBytes` is `bavail` (space available to this non-root process), while
  * `totalBytes` is the full filesystem size including reserved blocks — so

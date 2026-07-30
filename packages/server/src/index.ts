@@ -1,7 +1,8 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { writeFile, readFile, readdir, stat } from 'fs/promises';
+// TRA-2599 — `stat` left with the storage diagnostic; see `storage-health.ts`.
+import { writeFile, readFile, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -338,8 +339,10 @@ import {
   compactChainPartitions,
   chainPartitionStorageReport,
 } from './chain-partition-compactor.js';
-// TRA-2420 — per-subdirectory attribution of DATA_DIR for `/api/health/storage`.
+// TRA-2420 — per-subdirectory attribution of DATA_DIR for the admin
+// `/api/health/storage/detail` (TRA-2599 moved it off the open route).
 import { dataDirUsageCached } from './data-dir-usage.js';
+import { registerStorageHealthRoutes } from './storage-health.js'; // TRA-2599
 import { buildIdeasFeed, getEntryIntent } from './options-ideas-service.js';
 import {
   isOptionsProposalRailEnabled,
@@ -5293,158 +5296,31 @@ app.get('/api/health/engine-scorecard', async (_req, res) => {
 let observabilityMonitorRuns = 0;
 let observabilityMonitorLastRunAt: string | null = null;
 
-// TRA-141 — storage diagnostic so QA can verify from outside the box that the
-// Render persistent disk is actually mounted and that user/settings/trade files
-// are surviving redeploys. No PII is exposed (only paths, sizes, mtimes, count).
-app.get('/api/health/storage', async (_req, res) => {
-  async function statFile(p: string): Promise<{ exists: boolean; size?: number; mtime?: string }> {
-    try {
-      const s = await stat(p);
-      return { exists: true, size: s.size, mtime: s.mtime.toISOString() };
-    } catch {
-      return { exists: false };
-    }
-  }
-  const usersFile = join(DATA_DIR, 'users.json');
-  const backupsDir = join(DATA_DIR, 'backups');
-  // TRA-142 — per-user files now live under DATA_DIR/users/<username>/. The
-  // legacy DATA_DIR/account-settings.json etc. are migrated into the admin
-  // namespace on first boot, so we report admin's path so QA sees the
-  // post-migration location while the legacy fields show migration ran.
-  const legacySettingsFile = join(DATA_DIR, 'account-settings.json');
-  const legacyTradesStocksFile = join(DATA_DIR, 'trades-stocks.json');
-  const legacyTradesCryptoFile = join(DATA_DIR, 'trades-crypto.json');
-  const adminDir = join(DATA_DIR, 'users', 'admin');
-  const adminSettingsFile = join(adminDir, 'account-settings.json');
-  const adminTradesStocksFile = join(adminDir, 'trades-stocks.json');
-  const adminTradesCryptoFile = join(adminDir, 'trades-crypto.json');
-  const migrationMarker = join(DATA_DIR, '.tra-142-migrated');
-  let backupsCount = 0;
-  try {
-    backupsCount = (await readdir(backupsDir)).length;
-  } catch {
-    backupsCount = 0;
-  }
-  // TRA-2357 — free space on the volume backing DATA_DIR, plus the threshold the
-  // `disk-near-full` alert grades against and the liveness of the loop that grades
-  // it. Before this, the route reported file sizes but no headroom, so "is the disk
-  // near full?" was unanswerable between alerts — and the one alert we had
-  // (2026-07-25T20:33Z) turned out to be `16.3% free — below 99%`, a healthy disk
-  // against a bad threshold. Publishing `minFreePct` alongside `freePct` is what
-  // makes that case readable; publishing `belowThreshold` is what makes the route
-  // gradeable without re-deriving the comparison.
-  //
-  // `readDiskSpace` is the PURE reader on purpose — calling `checkDiskSpace` here
-  // would let any anonymous request fire a CRITICAL alert and burn the real one's
-  // throttle window.
-  const minFreePct = diskMinFreePct();
-  const diskReading = await readDiskSpace(DATA_DIR);
-  const monitorAgeSec = observabilityMonitorLastRunAt
-    ? Math.round((Date.now() - Date.parse(observabilityMonitorLastRunAt)) / 1000)
-    : null;
-  const disk = diskReading
-    ? {
-        path: diskReading.path,
-        totalBytes: diskReading.totalBytes,
-        freeBytes: diskReading.freeBytes,
-        usedBytes: diskReading.totalBytes - diskReading.freeBytes,
-        // TRA-2420 — `usedBytes` is derived from `bavail`, so it counts the root
-        // reserve as used. Publish the reserve so the residual can subtract bytes
-        // that no writer owns instead of hunting for the writer that put them there.
-        reservedBytes: diskReading.reservedBytes,
-        freePct: Number(diskReading.freePct.toFixed(3)),
-        usedPct: Number((100 - diskReading.freePct).toFixed(3)),
-        minFreePct,
-        belowThreshold: diskReading.freePct < minFreePct,
-        // The monitor that raises `disk-near-full`. `runs: 0` / a stale
-        // `lastRunAt` means a quiet alert ring proves nothing.
-        monitor: {
-          runs: observabilityMonitorRuns,
-          lastRunAt: observabilityMonitorLastRunAt,
-          ageSec: monitorAgeSec,
-          // Ticks every 60s; anything past 180s is a stalled loop, not a healthy one.
-          stalled: observabilityMonitorRuns === 0 || (monitorAgeSec !== null && monitorAgeSec > 180),
-        },
-      }
-    : { path: DATA_DIR, error: 'statfs failed', minFreePct };
-  // TRA-2420 — name the writer. TRA-2417 attributed `/data`'s ~11.6 MB per
-  // trading day to the option-chain capture; the real 07-24 partition is 8.02 MB
-  // and the sentiment snapshots are 0.008, so ~3.6 MB/day had no owner. A total
-  // minus one measured component is not an attribution. There is no shell on
-  // bqb1, so the breakdown has to be published here.
-  //
-  // Read `createdBytesByDay` for growth and `modifiedBytesByDay` for activity —
-  // they are different questions, and a per-session file rewritten in place is
-  // enormous in the second and absent from the first. See `data-dir-usage.ts`.
-  const usage = await dataDirUsageCached(DATA_DIR);
-  const measuredBytes = usage.totalBytes;
-  const allocatedBytes = usage.totalAllocatedBytes;
-  const diskUsedBytes = 'usedBytes' in disk ? (disk.usedBytes ?? null) : null;
-  const reservedBytes = 'reservedBytes' in disk ? (disk.reservedBytes ?? null) : null;
-  const attributableUsedBytes =
-    diskUsedBytes === null || reservedBytes === null ? null : diskUsedBytes - reservedBytes;
-  res.json({
-    dataDir: DATA_DIR,
-    dataDirEnv: process.env['DATA_DIR'] ?? null,
-    dataDir_exists: existsSync(DATA_DIR),
-    disk,
-    usage: {
-      ...usage,
-      // The residual, published rather than left as a subtraction someone does
-      // in their head. Non-zero is expected and fine (anything on the volume
-      // outside DATA_DIR); a LARGE non-zero means the breakdown below does not
-      // account for the disk and must not be read as if it does.
-      //
-      // TRA-2420 — this subtraction was UNIT-MISMATCHED until 2026-07-30, and the
-      // mismatch had no failing state. `measuredBytes` is APPARENT bytes (a sum of
-      // `st_size`); `diskUsedBytes` is ALLOCATED blocks PLUS the root reserve. On
-      // bqb1 those differ structurally by ~150 MB — ~100 MB of 4 KiB block rounding
-      // across ~48k small files, plus ext4's ~49 MB 5% root reserve — so the residual
-      // sat at 35% and `tra2420:attribute` returned UNATTRIBUTED (exit 1) forever.
-      // There was NO value of the real disk that could have produced a pass: the
-      // guard was reading a constant, not a measurement. Compare like with like —
-      // allocated against allocated, with the reserve removed because no writer
-      // owns it — and keep the apparent figures as labelled contrast only.
-      unaccounted: {
-        diskUsedBytes,
-        reservedBytes,
-        /** `df` used, less the blocks reserved for root. The part a writer could own. */
-        attributableUsedBytes,
-        allocatedBytes,
-        bytes:
-          attributableUsedBytes === null || allocatedBytes === null
-            ? null
-            : attributableUsedBytes - allocatedBytes,
-        pct:
-          attributableUsedBytes === null || allocatedBytes === null || attributableUsedBytes === 0
-            ? null
-            : Number((((attributableUsedBytes - allocatedBytes) / attributableUsedBytes) * 100).toFixed(3)),
-        // Contrast only. NOT the residual — subtracting apparent bytes from
-        // allocated+reserved counts block rounding as an unowned writer.
-        apparent: {
-          measuredBytes,
-          bytes: diskUsedBytes === null ? null : diskUsedBytes - measuredBytes,
-          pct:
-            diskUsedBytes === null || diskUsedBytes === 0
-              ? null
-              : Number((((diskUsedBytes - measuredBytes) / diskUsedBytes) * 100).toFixed(3)),
-        },
-      },
-    },
-    usersFile: await statFile(usersFile),
-    settingsFile: await statFile(legacySettingsFile),
-    tradesStocksFile: await statFile(legacyTradesStocksFile),
-    tradesCryptoFile: await statFile(legacyTradesCryptoFile),
-    adminSettingsFile: await statFile(adminSettingsFile),
-    adminTradesStocksFile: await statFile(adminTradesStocksFile),
-    adminTradesCryptoFile: await statFile(adminTradesCryptoFile),
-    tra142Migrated: existsSync(migrationMarker),
-    backupsDir_exists: existsSync(backupsDir),
-    backupsCount,
-    userCount: getAllUsers().length,
-    userContextCount: getAllUserContexts().length,
-    processStart: new Date(Date.now() - process.uptime() * 1000).toISOString(),
-  });
+// TRA-141 / TRA-2599 — storage diagnostic, now SPLIT: `/api/health/storage`
+// stays open with a liveness subset (booleans + a staleness age), and the full
+// body — `dataDir`, account counts, every `*File` size/mtime, `backupsCount`,
+// `processStart`, byte-level `disk.*` and the TRA-2420 `usage` block — moved to
+// `/api/health/storage/detail` behind `requireAuth, requireAdmin`.
+//
+// Both routes serve ONE object built by `buildStorageDiagnostic`; the open one
+// publishes an allowlist projection of it, so a field added later is gated by
+// default. Rationale, the three unauthenticated consumers this had to not break,
+// and the `disk.readable` fix are all in `storage-health.ts`.
+registerStorageHealthRoutes(app, {
+  requireAuth,
+  requireAdmin,
+  dataDir: DATA_DIR,
+  dataDirEnv: () => process.env['DATA_DIR'] ?? null,
+  getUserCount: () => getAllUsers().length,
+  getUserContextCount: () => getAllUserContexts().length,
+  diskMinFreePct,
+  readDiskSpace,
+  dataDirUsage: (root) => dataDirUsageCached(root),
+  observabilityMonitor: () => ({
+    runs: observabilityMonitorRuns,
+    lastRunAt: observabilityMonitorLastRunAt,
+  }),
+  processStart: () => new Date(Date.now() - process.uptime() * 1000).toISOString(),
 });
 
 // TRA-779 — option-chain capture liveness. Open (no auth, like the other
@@ -11881,7 +11757,8 @@ async function probeHealth(): Promise<boolean> {
 }
 
 async function runObservabilityMonitor(): Promise<void> {
-  // TRA-2357 — liveness of THIS loop, published on `/api/health/storage`. A
+  // TRA-2357 — liveness of THIS loop. `stalled`/`ageSec` are published on the
+  // OPEN `/api/health/storage`; the raw `runs` count is admin-only (TRA-2599). A
   // 60s monitor that stopped ticking produces an empty alert ring, which reads
   // identically to "every check passed". Without a heartbeat there is no way
   // to tell those apart from outside the box, and the quiet ring gets read as

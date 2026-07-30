@@ -446,8 +446,19 @@ A raw `POST /v1/services/…/deploys` curl also bypasses it, so the wrapper is t
 
 ```bash
 curl -s http://<host>/api/health            # { "ok": true, "time": "..." }
-curl -s http://<host>/api/health/storage    # confirm dataDir_exists + backupsCount > 0
+curl -s http://<host>/api/health/storage    # confirm dataDir_exists + backupsDir_exists
 ```
+
+**TRA-2599 — this route is now a liveness SUBSET.** It answers unauthenticated with
+booleans only: `dataDir_exists`, `tra142Migrated`, `backupsDir_exists`, and
+`disk.{readable,belowThreshold}` + `disk.monitor.{stalled,ageSec}`. The sizes, mtimes,
+account counts, `backupsCount`, `dataDir` itself and the TRA-2420 `usage` block moved to
+`GET /api/health/storage/detail`, which needs an **admin** token. `backupsCount > 0` is
+therefore a *detail*-route check now; `backupsDir_exists` is the ungated stand-in.
+
+⚠️ Read `disk.readable` before `disk.belowThreshold`. `belowThreshold` is `null` — not
+`false` — when `statfs` could not be read, so `if (!belowThreshold)` treats an
+unmeasurable disk as a healthy one.
 
 Then log into the dashboard and confirm a `state` snapshot arrives over the
 WebSocket (the UI populates).
@@ -559,7 +570,9 @@ If automatic restore is not enough (e.g. you need an older point in time):
    cp -r $DATA_DIR/backups/<timestamp>/users/<username> $DATA_DIR/users/
    ```
 4. Restart the service (`npx pm2 restart trading-server`).
-5. Verify with `GET /api/health/storage` and a dashboard login.
+5. Verify with `GET /api/health/storage/detail` (admin token — it carries the file
+   sizes/mtimes and `userCount` you need to confirm the restore) and a dashboard login.
+   The ungated `GET /api/health/storage` only tells you the paths EXIST.
 
 > **Backups are on the same disk.** The 30-min snapshots protect against file
 > corruption and bad writes, **not** disk loss. For disaster recovery, copy
@@ -624,7 +637,7 @@ watch:
 
 | Symptom | Action |
 |---|---|
-| `disk-near-full` alert; `health/storage` shows low free space | Prune old option-chain caches; attach a larger volume / raise free space on the `DATA_DIR` disk. |
+| `disk-near-full` alert; `health/storage` shows `disk.belowThreshold: true` (byte figures on `health/storage/detail`, admin) | Prune old option-chain caches; attach a larger volume / raise free space on the `DATA_DIR` disk. |
 | Tick loop lagging / high memory under user growth | Move the process to a larger machine — vertical scale only. |
 | Need true HA / horizontal scale | Larger effort: extract engine state to shared storage and add a message bus. Not supported today; scope as a project. |
 
@@ -633,7 +646,8 @@ watch:
 1. Provision a larger machine / bigger volume.
 2. Deploy the process there per §2 and migrate `$DATA_DIR` (copy the data dir,
    then start the new instance — never run both at once).
-3. Confirm via `GET /api/health/storage`.
+3. Confirm via `GET /api/health/storage` (mount liveness) and
+   `GET /api/health/storage/detail` (admin — sizes/counts survived the migration).
 
 (On Render, vertical scale is a `plan` / `disk.sizeGB` bump in `render.yaml`.)
 
@@ -648,7 +662,7 @@ alert per window.
 | Alert | Meaning | First response |
 |---|---|---|
 | `health-check` | `GET /api/health` stopped returning `{ ok: true }`. | Check the PM2 process (`npx pm2 status`) and logs. If the process is down, `npx pm2 restart trading-server`. Confirm `/api/health` recovers. |
-| `disk-near-full` | Free space on the `DATA_DIR` disk below `DISK_MIN_FREE_PCT` (default 10%). | **Read the alert's own log line, not the email** — it carries `freePct=` *and* the threshold it was compared against. TRA-2357's 2026-07-25 CRITICAL was `16.3% free — below 99%`: a healthy disk against a mis-set threshold, which from the inbox is indistinguishable from a real capacity event. Then `GET /api/health/storage` for sizes and see "Option-chain archive" below; if structurally full, attach a larger volume (§4). |
+| `disk-near-full` | Free space on the `DATA_DIR` disk below `DISK_MIN_FREE_PCT` (default 10%). | **Read the alert's own log line, not the email** — it carries `freePct=` *and* the threshold it was compared against. TRA-2357's 2026-07-25 CRITICAL was `16.3% free — below 99%`: a healthy disk against a mis-set threshold, which from the inbox is indistinguishable from a real capacity event. Then `GET /api/health/storage/detail` (admin token — TRA-2599 moved the byte figures there; the ungated route gives you `disk.belowThreshold` but no sizes) for sizes and see "Option-chain archive" below; if structurally full, attach a larger volume (§4). |
 | `restart-storm` | >5 process boots in 10 min — instance is crash-looping. | Read `errors.jsonl` / PM2 logs for the crash cause (bad deploy, corrupt data, OOM). Roll back the deploy (§2) or restore data (§3). Note PM2 gives up after `max_restarts` (10). |
 | `trade-volume-zero` | No positions opened by 12:00 ET on a stock trading day. | Often benign (no qualifying signals). Confirm data feeds are fresh (`GET /api/health/quotes`) and auto-trading is enabled. Escalate only if feeds are stale. |
 | `error-spike` | >25 errors captured in 15 min. | Grep `errors.jsonl` for the dominant error; correlate by `traceId`. See `observability.md`. |
@@ -696,7 +710,9 @@ identical JSON either way, so `scripts/pull-recorded-chains.mjs` is unaffected.
    count, without shelling into the box.
 2. **Logs** — `$DATA_DIR/logs/` (and `npx pm2 logs trading-server`). `app.jsonl`,
    `errors.jsonl` are JSON-lines; pipe through `jq`. Query by `traceId`.
-3. **Storage** — `GET /api/health/storage` for disk / data-file state.
+3. **Storage** — `GET /api/health/storage` (open) for mount/threshold liveness;
+   `GET /api/health/storage/detail` (**admin**) for the byte-level disk figures, file
+   sizes/mtimes, account counts and the TRA-2420 `usage` breakdown.
 4. **Feeds** — `GET /api/health/quotes` for market-data freshness.
 
 ## 6. Routine operations
@@ -706,7 +722,8 @@ identical JSON either way, so `scripts/pull-recorded-chains.mjs` is unaffected.
 | Tail logs | `npx pm2 logs trading-server`, or `$DATA_DIR/logs/*.jsonl` (on Render: dashboard → **Logs**) |
 | Restart | `npx pm2 restart trading-server` (on Render: dashboard → **Manual Deploy / Restart**) |
 | Check health | `curl http://<host>/api/health` |
-| Inspect storage | `curl -H 'Authorization: Bearer <token>' http://<host>/api/health/storage` |
+| Inspect storage (liveness) | `curl http://<host>/api/health/storage` — no token; booleans only |
+| Inspect storage (full) | `curl -H 'Authorization: Bearer <admin-token>' http://<host>/api/health/storage/detail` |
 | Lock / unlock a user | `POST /api/admin/users/:username/lock` (admin token) |
 | Reset a user's password | `POST /api/admin/users/:username/reset-password` (admin token) |
 | Reseed reboot autostart | `npx pm2 save` after any change to the running process set (see §1 "Autostart on reboot"). The `PM2 Resurrect` scheduled task restores exactly what was last saved. |

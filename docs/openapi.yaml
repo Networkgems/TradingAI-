@@ -171,16 +171,57 @@ paths:
   /api/health/storage:
     get:
       tags: [Health]
-      summary: Data-disk diagnostic — confirms the persistent volume is mounted.
+      summary: Data-disk LIVENESS — confirms the persistent volume is mounted. Booleans only.
+      description: >-
+        TRA-2599 — open on purpose (runbook triage and the deploy-carrier probes read it
+        without a token), so it carries no path, count, size or mtime. `belowThreshold` is
+        `null`, not `false`, when `statfs` could not be read; check `readable` first. The
+        full diagnostic moved to `/api/health/storage/detail` (admin).
       security: []
       responses:
         "200":
-          description: Storage state.
+          description: Storage liveness subset.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [dataDir_exists, tra142Migrated, backupsDir_exists, disk]
+                properties:
+                  dataDir_exists: { type: boolean }
+                  tra142Migrated: { type: boolean }
+                  backupsDir_exists: { type: boolean }
+                  disk:
+                    type: object
+                    additionalProperties: false
+                    required: [readable, belowThreshold, monitor]
+                    properties:
+                      readable: { type: boolean }
+                      belowThreshold: { type: boolean, nullable: true }
+                      monitor:
+                        type: object
+                        additionalProperties: false
+                        required: [stalled, ageSec]
+                        properties:
+                          stalled: { type: boolean }
+                          ageSec: { type: integer, nullable: true }
+  /api/health/storage/detail:
+    get:
+      tags: [Health]
+      summary: Full data-disk diagnostic — paths, sizes, mtimes, account counts, DATA_DIR usage.
+      description: >-
+        TRA-2599 — the body `/api/health/storage` used to serve anonymously (TRA-2414).
+        Admin only. `scripts/tra2420-data-dir-attribution.mjs` reads the `usage` block here.
+      responses:
+        "200":
+          description: Full storage state.
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
   /api/health/quotes:
     get:
       tags: [Health]

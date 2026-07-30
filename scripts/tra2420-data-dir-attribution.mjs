@@ -13,9 +13,14 @@
  *
  * Every failure mode here reads like an answer:
  *
- *   - **Not deployed.** `/api/health/storage` 200s on the old build too — it
- *     just has no `usage` key. `jq '.usage.entries[0].bytes'` prints `null`,
- *     which compares false-y exactly like a real zero. Exit 2, never a verdict.
+ *   - **Not deployed.** The route 200s on the old build too — it just has no
+ *     `usage` key. `jq '.usage.entries[0].bytes'` prints `null`, which compares
+ *     false-y exactly like a real zero. Exit 2, never a verdict.
+ *   - **No token / a rejected token.** TRA-2599 moved `usage` to the admin-gated
+ *     `/api/health/storage/detail`, so this script now sends a Bearer token. A
+ *     missing or rejected one is exit 5 NO_TOKEN, deliberately NOT folded into
+ *     BLIND: BLIND reads as "the box would not answer" and would have sent an
+ *     operator who simply forgot to export a token off to look at Render.
  *   - **The wrong histogram.** `modifiedBytesByDay` is the obvious one to read
  *     and it is the wrong one. A per-user snapshot rewritten in place every
  *     session contributes its ENTIRE size there every day while adding nothing
@@ -51,13 +56,20 @@
  *   4  PARTIAL        deployed, but the growth histogram is unmeasurable, the
  *                     residual is ungradeable (allocation unusable / null), or the
  *                     window holds no complete weekday with any growth
+ *   5  NO_TOKEN       no admin token supplied, or the host rejected it (401/403)
  *
  * ## Controls
  *
- * `--self-test` drives this same script over a real socket against seven crafted
- * payloads and asserts every one of the five exit codes is REACHABLE. Without it, a
- * script that exits 2 on everything is indistinguishable from a working one, because
- * 2 is the only answer the live host can give until the deploy carrying `usage` lands.
+ * `--self-test` drives this same script over a real socket against crafted payloads
+ * and asserts every one of the six exit codes is REACHABLE. Without it, a script that
+ * exits 2 on everything is indistinguishable from a working one, because 2 is the only
+ * answer the live host can give until the deploy carrying `usage` lands.
+ *
+ * TRA-2599 — the stand-in host ENFORCES the gate: it 404s any path other than
+ * `/api/health/storage/detail` and 401s a request without the expected Bearer token.
+ * So the token path is load-bearing in the controls, not decorative — drop the header
+ * and every control collapses to BLIND. Two further controls assert a missing token
+ * and a rejected token both land on 5 rather than 3.
  *
  * One control is the regression above: bqb1's real shape, where the apparent-basis
  * residual is 35% and the allocated-basis residual is ~9%. It must exit 0. Asserting
@@ -66,9 +78,11 @@
  * return 0 for any real disk.
  *
  * Usage
- *   node scripts/tra2420-data-dir-attribution.mjs [--host=…] [--day=YYYY-MM-DD]
+ *   TRADINGAI_ADMIN_TOKEN=… node scripts/tra2420-data-dir-attribution.mjs
+ *                                                 [--host=…] [--day=YYYY-MM-DD]
  *                                                 [--max-unaccounted-pct=25]
- *   node scripts/tra2420-data-dir-attribution.mjs --self-test
+ *                                                 [--token=<admin JWT>]
+ *   node scripts/tra2420-data-dir-attribution.mjs --self-test   # no token needed
  */
 
 const arg = (name) => process.argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
@@ -77,7 +91,16 @@ const HOST = arg('host') ?? 'https://tradingai-bqb1.onrender.com';
 const FORCE_DAY = arg('day') ?? null;
 const MAX_UNACCOUNTED_PCT = Number(arg('max-unaccounted-pct') ?? '25');
 
-const EXIT = { ATTRIBUTED: 0, UNATTRIBUTED: 1, NOT_DEPLOYED: 2, BLIND: 3, PARTIAL: 4 };
+// TRA-2599 — the `usage` block moved to the ADMIN-GATED detail route, so this
+// script now needs a token. An admin JWT, from `--token=` or either env name.
+const TOKEN = (
+  arg('token') ??
+  process.env['TRADINGAI_ADMIN_TOKEN'] ??
+  process.env['ADMIN_TOKEN'] ??
+  ''
+).trim();
+
+const EXIT = { ATTRIBUTED: 0, UNATTRIBUTED: 1, NOT_DEPLOYED: 2, BLIND: 3, PARTIAL: 4, NO_TOKEN: 5 };
 const MB = (b) => `${(b / 1048576).toFixed(3)} MB`;
 
 function done(code, label, lines) {
@@ -92,26 +115,57 @@ function isWeekend(day) {
   return d === 0 || d === 6;
 }
 
+const ROUTE = '/api/health/storage/detail'; // TRA-2599 — was `/api/health/storage`
+
 async function main() {
+  // TRA-2599 — fail on a MISSING token with its own code, before any request.
+  // Folding this into BLIND would have been the cheap move and the wrong one:
+  // BLIND already means "the host would not tell me", and an operator who forgot
+  // to export a token would have read that as an unreachable box and gone
+  // looking at Render. Exit 5 names the thing they can actually fix.
+  if (!TOKEN) {
+    done(EXIT.NO_TOKEN, 'NO_TOKEN — no admin token supplied', [
+      `host      ${HOST}`,
+      `route     ${ROUTE} (admin-gated since TRA-2599)`,
+      'Pass --token=<admin JWT>, or export TRADINGAI_ADMIN_TOKEN / ADMIN_TOKEN.',
+      'Get one with: POST /api/auth/login as an admin, then read `.token`.',
+    ]);
+  }
+
   let res;
   try {
-    res = await fetch(`${HOST}/api/health/storage`, { signal: AbortSignal.timeout(45_000) });
+    res = await fetch(`${HOST}${ROUTE}`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      signal: AbortSignal.timeout(45_000),
+    });
   } catch (err) {
-    done(EXIT.BLIND, 'BLIND — /api/health/storage unreachable', [String(err?.message ?? err)]);
+    done(EXIT.BLIND, `BLIND — ${ROUTE} unreachable`, [String(err?.message ?? err)]);
   }
-  if (!res.ok) done(EXIT.BLIND, `BLIND — /api/health/storage returned ${res.status}`, []);
+  // A REJECTED token is also not BLIND — same reasoning as above, and the two
+  // are the difference between "re-login" and "the box is down".
+  if (res.status === 401 || res.status === 403) {
+    done(EXIT.NO_TOKEN, `NO_TOKEN — ${ROUTE} returned ${res.status}`, [
+      `host      ${HOST}`,
+      res.status === 401
+        ? 'Token missing, malformed, expired (24h TTL) or its account no longer exists.'
+        : 'Token is valid but the account is not an admin. This route needs requireAdmin.',
+    ]);
+  }
+  if (!res.ok) done(EXIT.BLIND, `BLIND — ${ROUTE} returned ${res.status}`, []);
 
   let body;
   try {
     body = await res.json();
   } catch (err) {
-    done(EXIT.BLIND, 'BLIND — /api/health/storage body did not parse', [String(err?.message ?? err)]);
+    done(EXIT.BLIND, `BLIND — ${ROUTE} body did not parse`, [String(err?.message ?? err)]);
   }
 
   const usage = body?.usage;
-  // Key-in-body deploy detector: the old build answers 200 on this same route.
+  // Key-in-body deploy detector: a build predating TRA-2599 answers 404 on this
+  // route (→ BLIND above), and a build predating TRA-2420 answers 200 here with
+  // no `usage` key. Both are "not the build I need", distinguishable.
   if (!usage || !Array.isArray(usage.entries)) {
-    done(EXIT.NOT_DEPLOYED, 'NOT_DEPLOYED — 200 but no `usage` block on /api/health/storage', [
+    done(EXIT.NOT_DEPLOYED, `NOT_DEPLOYED — 200 but no \`usage\` block on ${ROUTE}`, [
       `host      ${HOST}`,
       `disk      ${body?.disk?.freePct ?? '?'}% free`,
       'The TRA-2420 breakdown is not on this build. Deploy, then re-run.',
@@ -377,7 +431,27 @@ async function selfTest() {
   ];
 
   let payload = null;
+  // TRA-2599 — the stand-in host now ENFORCES the gate, and only on the detail
+  // route. That is what makes the token path load-bearing instead of decorative:
+  // if this script ever stops sending the header, or goes back to requesting
+  // `/api/health/storage`, every control below 401s/404s into BLIND and the whole
+  // self-test goes red. A server that answered 200 to anything would let the
+  // header silently rot while the suite stayed green.
+  const GOOD_TOKEN = 'tra2599-self-test-admin-token';
+  let sawAuthorizedDetailRequest = false;
   const server = createServer((req, res) => {
+    const url = (req.url ?? '').split('?')[0];
+    if (url !== '/api/health/storage/detail') {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+    if (req.headers['authorization'] !== `Bearer ${GOOD_TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    sawAuthorizedDetailRequest = true;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(payload));
   });
@@ -391,7 +465,11 @@ async function selfTest() {
     let code = 0;
     let out = '';
     try {
-      const r = await execFileAsync(process.execPath, [process.argv[1], `--host=${host}`]);
+      const r = await execFileAsync(process.execPath, [
+        process.argv[1],
+        `--host=${host}`,
+        `--token=${GOOD_TOKEN}`,
+      ]);
       out = r.stdout;
     } catch (err) {
       code = err.code ?? -1;
@@ -407,7 +485,11 @@ async function selfTest() {
   // option-chains (1 MB created) sorts below users (3 MB created) even though
   // users' modified figure is twice as large.
   payload = base();
-  const r = await execFileAsync(process.execPath, [process.argv[1], `--host=${host}`]);
+  const r = await execFileAsync(process.execPath, [
+    process.argv[1],
+    `--host=${host}`,
+    `--token=${GOOD_TOKEN}`,
+  ]);
   const order = [...r.stdout.matchAll(/^\s+\d+\s+(\S+)/gm)].map((m) => m[1]);
   if (order[0] !== 'users' || order[1] !== 'option-chains') {
     failures += 1;
@@ -415,8 +497,51 @@ async function selfTest() {
   } else {
     console.log(`  ok    ranked by GROWTH not activity: ${order.join(' > ')}`);
   }
+  // TRA-2599 — the token path, graded in both directions.
+  //
+  // The positive direction is already covered: every control above ran WITH the
+  // header against a server that 401s without it, so a green run above is proof
+  // the header went out. `sawAuthorizedDetailRequest` states that as a fact
+  // rather than leaving it inferred from exit codes.
+  if (!sawAuthorizedDetailRequest) {
+    failures += 1;
+    console.log('  FAIL  no control ever reached the gated route with a valid token');
+  } else {
+    console.log('  ok    gated route reached WITH a Bearer token (server 401s without one)');
+  }
+
+  // The negative direction: a missing token and a REJECTED token must both land
+  // on NO_TOKEN, not BLIND. Scrub both env names so a token in the operator's
+  // shell cannot make this control pass by accident.
+  const scrubbedEnv = { ...process.env };
+  delete scrubbedEnv['TRADINGAI_ADMIN_TOKEN'];
+  delete scrubbedEnv['ADMIN_TOKEN'];
+  const tokenCases = [
+    ['no token at all → NO_TOKEN (not BLIND)', [`--host=${host}`]],
+    ['token rejected 401 → NO_TOKEN (not BLIND)', [`--host=${host}`, '--token=wrong-token']],
+  ];
+  payload = base();
+  for (const [label, argv] of tokenCases) {
+    let code = 0;
+    let out = '';
+    try {
+      const rr = await execFileAsync(process.execPath, [process.argv[1], ...argv], {
+        env: scrubbedEnv,
+      });
+      out = rr.stdout;
+    } catch (err) {
+      code = err.code ?? -1;
+      out = err.stdout ?? '';
+    }
+    seen.push(code);
+    const ok = code === EXIT.NO_TOKEN;
+    if (!ok) failures += 1;
+    console.log(`  ${ok ? 'ok  ' : 'FAIL'}  exit ${code} (want ${EXIT.NO_TOKEN})  ${label}`);
+    if (!ok) console.log(out);
+  }
+
   // A grader whose branches all return the same thing is not a grader. The check
-  // is that every one of the five codes is REACHABLE — not that each case is
+  // is that every one of the six codes is REACHABLE — not that each case is
   // unique, since two cases may legitimately share a code (the bqb1-shape control
   // shares 0 with the positive mark, which is the entire point of it).
   const reached = new Set(seen);
