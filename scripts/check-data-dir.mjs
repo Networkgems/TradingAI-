@@ -26,13 +26,23 @@
 // 38 files. A review that catches copy #40 is not a guard — 39 got in past reviews.
 // TRA-2603 converted `tick-sweep-budget.ts` (copy #39 -> 38 remain) and shipped this.
 //
-// The 38 survivors are a FROZEN BASELINE, checked in below with per-file counts. The
-// migration of those 38 is TRA-2428's other child, deliberately sequenced AFTER this
-// guard so it runs with a failing state instead of without one.
+// The 38 survivors were a FROZEN BASELINE, checked in below with per-file counts.
+// TRA-2604 — TRA-2428's other child, deliberately sequenced AFTER this guard so it
+// ran with a failing state instead of without one — has since MIGRATED ALL 38. Every
+// baseline entry is now exempt-only, so the guard's job has shifted from "hold a
+// known backlog steady" to "keep it at zero": any non-zero `copies` is a regression.
 //
 // FIVE WAYS THIS GUARD COULD READ GREEN WHILE BROKEN — each is handled and each has a
 // control in `--selftest`. (The ticket named four; the fifth, `--untracked`, was found
 // by CONTROL 2 reading CLEAN against a real planted file.)
+//
+// A SIXTH, learned from TRA-2604 rather than designed in: TWO CONTROLS WERE ANCHORED
+// TO THE DEFECT THEY GRADED and died as it was fixed. CONTROL 4 keyed off the NUL byte
+// in `external-intel.ts` — a file that was itself in the backlog — and CONTROL 7 keyed
+// off there existing at least one copy to remove. The first failed loudly; the second
+// would have passed VACUOUSLY at zero copies, which is worse. Both now carry their own
+// fixtures (a planted NUL file, a synthetic baseline). When adding a control, ask what
+// it reads once the thing it grades is gone.
 //
 //   1. `-a` / `--text` IS MANDATORY. A source file containing a NUL byte is classified
 //      by git as binary: plain `git grep -n` prints `Binary file ... matches` with NO
@@ -109,34 +119,36 @@ const R = {
 };
 
 /**
- * FROZEN BASELINE — ratcheting to zero under TRA-2428's migration child, TRA-2604.
+ * FROZEN BASELINE — RATCHETED TO ZERO by TRA-2604 (TRA-2428's migration child).
  *
- * Now: 27 hits / 12 files = 4 unguarded copies + 6 comment-only + 17 report-reads.
+ * Now: 23 hits / 11 files = 0 unguarded copies + 6 comment-only + 17 report-reads.
  * Was: 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads
  *      (measured at bb7cdc4 + the TRA-2603 conversion).
  *
- * TRA-2604 batch 1 converted the 15 append-only shadow/signal ledgers (38 -> 23);
- * batch 2 the 12 JSON snapshot stores (23 -> 11); batch 3 the 7 journal/pipeline
- * sites in 6 files, including both copies in the NUL-byte file (11 -> 4).
- * The comment-only and report-read counts are INVARIANT under that migration — only
- * `copies` moves. If one of those two ever moves, something other than a conversion
- * happened and the diff deserves a second look.
+ * TRA-2604 landed in four batches: 15 append-only shadow/signal ledgers (38 -> 23),
+ * 12 JSON snapshot stores (23 -> 11), 7 journal/pipeline sites in 6 files including
+ * both copies in the NUL-byte file (11 -> 4), and finally index.ts + users.ts +
+ * user-context.ts + watchlist-store.ts (4 -> 0).
+ *
+ * The comment-only and report-read counts were INVARIANT across all four batches —
+ * only `copies` moved. If either of those two ever moves, something other than a
+ * conversion happened and the diff deserves a second look.
  *
  * `copies` is the number of UNGUARDED RESOLVER COPIES the file is known to still
- * carry. `exempt` names every non-defect hit by exact trimmed text.
+ * carry, and it is now 0 everywhere: there is no remaining known defect, so ANY
+ * non-zero count is a regression rather than backlog. `exempt` names every
+ * non-defect hit by exact trimmed text.
  *
  * DO NOT REGENERATE THIS FROM THE TREE. Edit it by hand, in the same commit as the
  * change that moves a number, so the diff shows a human agreed.
  */
 const BASELINE = {
-  // ── Files carrying ONLY unguarded copies (the TRA-2428 migration backlog) ──
-  'user-context.ts': { copies: 1 },
-  'users.ts': { copies: 1 },
-  'watchlist-store.ts': { copies: 1 },
-
-  // ── Mixed: a real copy PLUS an exempt hit in the same file ──
+  // ── The migration backlog is EMPTY. Every entry below is exempt-only (copies: 0),
+  //    kept so the FILE SET is still asserted in both directions. A new file that
+  //    reads DATA_DIR is a NEW_FILE finding; a new copy in one of these is a
+  //    NEW_COPY finding. Nothing here is a known defect any more. ──
   'index.ts': {
-    copies: 1, // :694 — the main server bundle's own root
+    copies: 0, // TRA-2604 batch 4 — the main server bundle now calls resolveDataDir()
     exempt: [
       // TRA-2599 (`2823259`) turned this from a value into a thunk when the storage
       // diagnostic moved behind `requireAdmin`. Still a report-read — the ratchet
@@ -296,7 +308,7 @@ function sweep({ pattern = PATTERN, textFlag = true } = {}) {
  * Pure — takes records, returns a verdict. The selftest drives it with synthetic
  * record sets so every failure branch is reachable without mutating the tree.
  */
-function classify(records) {
+function classify(records, baseline = BASELINE) {
   const findings = [];
   const byFile = new Map();
   for (const r of records) {
@@ -322,7 +334,7 @@ function classify(records) {
 
   // (1) FILE SET, asserted in both directions — not just the line list.
   const seenFiles = new Set(byFile.keys());
-  const baseFiles = new Set(Object.keys(BASELINE));
+  const baseFiles = new Set(Object.keys(baseline));
   for (const f of [...seenFiles].sort()) {
     if (!baseFiles.has(f)) {
       findings.push({
@@ -350,7 +362,7 @@ function classify(records) {
   // (4) + (2) Per-file: exempt by explicit text+count, everything else is a copy.
   let copyTotal = 0;
   for (const [file, hits] of [...byFile.entries()].sort()) {
-    const entry = BASELINE[file];
+    const entry = baseline[file];
     if (!entry) {
       copyTotal += hits.length;
       continue; // already reported as NEW_FILE
@@ -415,7 +427,10 @@ function report(res, { binaryFiles = [], records = [] } = {}) {
   if (res.verdict === 'CLEAN') {
     lines.push(
       `[check:data-dir] CLEAN — ${res.copies} known unguarded copies, matching the frozen baseline ` +
-        `(${baselineCopyTotal()}). Migration backlog: TRA-2428.`,
+        `(${baselineCopyTotal()}).` +
+        (baselineCopyTotal() === 0
+          ? ' Backlog is EMPTY (TRA-2604 migrated all 38); any copy is a regression.'
+          : ' Migration backlog: TRA-2428.'),
     );
   } else {
     lines.push(`[check:data-dir] ${res.verdict} — ${res.findings.length} finding(s)`);
@@ -428,10 +443,10 @@ function report(res, { binaryFiles = [], records = [] } = {}) {
 /* ================================================================== */
 
 /** A synthetic record set that exactly satisfies the baseline. */
-function baselineRecords() {
+function baselineRecords(baseline = BASELINE) {
   const out = [];
   let n = 1;
-  for (const [file, e] of Object.entries(BASELINE)) {
+  for (const [file, e] of Object.entries(baseline)) {
     for (let i = 0; i < e.copies; i += 1) {
       out.push({ file, line: n++, text: "const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');" });
     }
@@ -455,7 +470,7 @@ const NUL_PLANT_ABS = join(REPO_ROOT, SCOPE, NUL_PLANT_REL);
 
 async function selftest() {
   let pass = 0;
-  const total = 10; // 8 numbered controls + the 2b and 4b cleanup assertions
+  const total = 11; // 9 numbered controls + the 2b and 4b cleanup assertions
   const seen = new Set();
   const ok = (name) => {
     console.log(`ok    ${name}`);
@@ -597,14 +612,46 @@ async function selftest() {
   }
 
   // ── CONTROL 7 — one-way ratchet: a REMOVED copy must also FAIL. ──
-  const base = baselineRecords();
-  const dropIdx = base.findIndex((r) => r.file === 'watchlist-store.ts');
-  const removed = base.filter((_, i) => i !== dropIdx);
-  const r7 = classify(removed);
-  if (r7.verdict === 'DRIFT' && r7.findings.some((f) => f.cls === 'FILE_GONE' || f.cls === 'COPY_REMOVED')) {
+  // Driven against a SYNTHETIC baseline, not the real one. It used to drop
+  // `watchlist-store.ts` from `baselineRecords()`, which worked only while the real
+  // baseline still had a copy to drop. TRA-2604 ratcheted `copies` to 0 everywhere,
+  // `findIndex` started returning -1, the filter removed nothing, and the control
+  // read CLEAN — i.e. it PASSED VACUOUSLY at exactly the moment it had nothing to
+  // measure. Same failure shape as CONTROL 4's: a control anchored to the defect it
+  // grades dies when the defect is fixed. A synthetic baseline keeps the
+  // copy-removal branch reachable no matter what the real tree contains.
+  const SYNTH = { 'synthetic-carrier.ts': { copies: 1 } };
+  const r7 = classify([], SYNTH);
+  const removedCopy = classify(
+    [{ file: 'other.ts', line: 1, text: "const x = process.env['DATA_DIR'];" }],
+    { ...SYNTH, 'other.ts': { copies: 1 } },
+  );
+  if (
+    r7.verdict === 'BROKEN' && // an emptied sweep is vacuity, checked separately
+    removedCopy.verdict === 'DRIFT' &&
+    removedCopy.findings.some((f) => f.cls === 'FILE_GONE')
+  ) {
     ok('CONTROL 7 a REMOVED copy also FAILS until the baseline is edited by hand (one-way ratchet)');
   } else {
-    fail('CONTROL 7 a REMOVED copy also FAILS', `verdict ${r7.verdict}`);
+    fail(
+      'CONTROL 7 a REMOVED copy also FAILS',
+      `emptied=${r7.verdict}, removed-copy=${removedCopy.verdict} ` +
+        `[${removedCopy.findings.map((f) => f.cls).join(',')}]`,
+    );
+  }
+
+  // ── CONTROL 9 — the ratchet still bites on the REAL baseline at zero copies. ──
+  // With the migration complete, every real entry is exempt-only, so the live
+  // one-way-ratchet property is now carried by exemptions rather than copies:
+  // deleting an exempt line must FAIL until someone edits the baseline by hand.
+  // Without this, CONTROL 7's move to a synthetic baseline would leave NO control
+  // asserting the ratchet against the actual checked-in numbers.
+  const realBase = baselineRecords();
+  const r9 = classify(realBase.slice(1));
+  if (r9.verdict === 'DRIFT' && r9.findings.some((f) => f.cls === 'STALE_EXEMPTION' || f.cls === 'FILE_GONE')) {
+    ok('CONTROL 9 dropping a REAL exempt hit FAILS against the checked-in baseline');
+  } else {
+    fail('CONTROL 9 dropping a REAL exempt hit FAILS', `verdict ${r9.verdict}`);
   }
 
   // ── CONTROL 8 — NOT a self-rewriting recorder. ──

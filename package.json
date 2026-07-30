@@ -26,7 +26,7 @@
     "check:strands:controls": "node scripts/check-blocked-empty.mjs --selftest",
     "check:phantom-rest": "node scripts/check-phantom-rest.mjs",
     "check:phantom-rest:controls": "node scripts/check-phantom-rest.mjs --selftest",
-    "//check:data-dir": "TRA-2603 — frozen-baseline ratchet on the unguarded `process.env.DATA_DIR ?? join(__dirname,'..','data')` literal. `??` does not guard a present-but-BLANK value; resolveDataDir() adds the .trim(). Baseline is 38 known copies (the TRA-2428 migration backlog) and is HAND-EDITED ONLY — never regenerate it from the tree. Exit 1 drift / 2 instrument broken / 3 blind.",
+    "//check:data-dir": "TRA-2603 — frozen-baseline ratchet on the unguarded `process.env.DATA_DIR ?? join(__dirname,'..','data')` literal. `??` does not guard a present-but-BLANK value; resolveDataDir() adds the .trim(). Baseline is now ZERO known copies — TRA-2604 migrated all 38 — so any non-zero count is a REGRESSION, not backlog. HAND-EDITED ONLY; never regenerate it from the tree. Exit 1 drift / 2 instrument broken / 3 blind.",
     "check:data-dir": "node scripts/check-data-dir.mjs",
     "check:data-dir:controls": "node scripts/check-data-dir.mjs --selftest",
     "//check:continuity": "TRA-2634 — grade the level-continuity detector against the REAL stored report archive (both directions, every run) and cross-tab it against the deployed r>=2 session-move rule. Control rows are SCOPED PER BOX and only this HOST's are graded, so run BOTH: `pnpm check:continuity` (bqb1) and `HOST=http://localhost:4242 pnpm check:continuity`. Build @trading-app/shared first — it imports dist. Exit 0 pass / 1 control failed / 3 BLIND, and 3 IS A HOLD.",

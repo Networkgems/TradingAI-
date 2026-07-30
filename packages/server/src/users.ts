@@ -2,16 +2,15 @@ import { scrypt, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { hashSecretValue, verifySecretHash } from './auth.js';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'users' });
 
 const scryptAsync = promisify(scrypt);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 const USERS_FILE = join(DATA_DIR, 'users.json');
 // Tracks which ADMIN_PASSWORD value has already been applied so restarts don't
 // overwrite a password the admin deliberately changed via the UI.

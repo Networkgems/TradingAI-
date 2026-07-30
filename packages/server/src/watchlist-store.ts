@@ -1,11 +1,10 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import { WATCHLIST, CRYPTO_WATCHLIST, isCryptoSymbolBlocked, type ReviewBlock } from '@trading-app/shared';
+import { resolveDataDir } from './data-dir.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 
 // TRA-142 — watchlists are now per-user. Each user has their own
 // DATA_DIR/users/<username>/watchlist.json. The legacy global watchlist file

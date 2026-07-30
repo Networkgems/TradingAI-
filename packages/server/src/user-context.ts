@@ -1,7 +1,6 @@
 import { mkdir, rename, copyFile, rm, writeFile, readdir, unlink, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 
 import {
   SignalEngine,
@@ -40,6 +39,7 @@ import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
 import { scrubStaleOptionsPnlCells } from './reports/stale-cell-cleanup.js';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'user-context' });
 
@@ -55,8 +55,7 @@ const log = logger.child({ module: 'user-context' });
 // the admin namespace so the existing single-tenant install is preserved.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 const PERSIST_DEBOUNCE_MS = 1000;
 
 // TRA-1084 — boot-herd mitigation. Each per-user engine creates its OWN

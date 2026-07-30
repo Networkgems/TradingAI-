@@ -701,12 +701,13 @@ import {
   evaluateLiveTransitionGate,
   evaluateLiveCryptoStartGate,
 } from './promotion-service.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'index' });
 
 const PORT = Number(process.env.PORT ?? 4242);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 
 // TRA-1481 — self-heal the Render blueprint env-sync gap for board-ratified DEMO
 // brakes. On bqb1/Render an autoDeploy ships code but does NOT re-sync env from
