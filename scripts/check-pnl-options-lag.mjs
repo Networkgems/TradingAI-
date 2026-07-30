@@ -144,6 +144,34 @@ export function findPriorOptionsLagDates(days) {
   return hits;
 }
 
+/**
+ * TRA-2630 AC2 — THE DENOMINATOR for {@link findPriorOptionsLagDates}. Returns
+ * the dates on which that predicate COULD have fired for one book.
+ *
+ * A session is gradeable iff its PRIOR session carried a non-zero `optionsDaily`.
+ * The lag hypothesis names one exact value for `stockDaily` in that case, so any
+ * other observation — `0.00` included — refutes it. When the prior is `0.00` the
+ * hypothesis predicts `stockDaily == 0.00`, indistinguishable from a quiet day:
+ * no failing state, therefore no evidence either way.
+ *
+ * This is the denominator the script was missing. `0 hits` over 0 gradeable
+ * sessions and `0 hits` over 40 gradeable sessions were the same output, which is
+ * the identical confusion `liveBookCount` was added to resolve one level out.
+ * Measured on bqb1 2026-07-30T08:02Z: 7 of the 13 books CURRENTLY carrying a lag
+ * date have a zero prior on their latest session, so they cannot verify the fix
+ * on the next session whatever it writes.
+ */
+export function findPriorOptionsLagGradeableDates(days) {
+  const sorted = [...days].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const gradeable = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const priorOd = Number(sorted[i - 1]?.optionsDaily);
+    if (!Number.isFinite(priorOd)) continue;
+    if (Math.abs(priorOd) > TOLERANCE_USD) gradeable.push(sorted[i].date);
+  }
+  return gradeable;
+}
+
 /** Grade a whole payload. Pure — no I/O, so `--selftest` can drive it. */
 export function gradePayload(payload) {
   const engines = Array.isArray(payload?.engines) ? payload.engines : null;
@@ -169,15 +197,41 @@ export function gradePayload(payload) {
   // three hours earlier. Reporting "0 live books" as reassurance in that state is
   // the same manufactured green as scoring an absent EOD row `drift 0` (TRA-2637).
   const liveBookCount = engines.filter((e) => e?.mode === 'live').length;
+  // TRA-2630 AC2 — THE SECOND EMPTY COHORT, one level in from the one above.
+  // `liveBookCount >= 1` proves a live book was LOOKED AT. It does NOT prove the
+  // predicate could have fired on it: a live book whose every session follows a
+  // zero-`optionsDaily` prior is graded by a predicate with no failing state, and
+  // reporting that as CLEAN is the same manufactured green with a non-empty
+  // filter in front of it. So the cohort test is gradeable sessions, not books.
+  const liveGradeableBookCount = engines.filter(
+    (e) => e?.mode === 'live' && findPriorOptionsLagGradeableDates(Array.isArray(e?.days) ? e.days : []).length > 0,
+  ).length;
   const verdict =
     live.length > 0
       ? 'LIVE_LAG'
-      : liveBookCount === 0
+      : liveBookCount === 0 || liveGradeableBookCount === 0
         ? 'LIVE_UNMEASURABLE'
         : demo.length > 0
           ? 'DEMO_LAG'
           : 'CLEAN';
-  return { verdict, live, demo, engineCount: engines.length, liveBookCount };
+  return {
+    verdict,
+    live,
+    demo,
+    engineCount: engines.length,
+    liveBookCount,
+    liveGradeableBookCount,
+    // Named so the BLIND message can say WHICH of the two empty cohorts fired;
+    // they need different fixes (boot-arm convergence vs. wait for a real close).
+    unmeasurableReason:
+      live.length > 0
+        ? null
+        : liveBookCount === 0
+          ? 'no book resolved mode:live'
+          : liveGradeableBookCount === 0
+            ? 'live book(s) present but no session follows a non-zero optionsDaily'
+            : null,
+  };
 }
 
 /**
@@ -514,7 +568,10 @@ async function main(argv) {
   console.log('TRA-2630 AC3 — T+1 options-credit lag (stockDaily == prior session optionsDaily):');
 
   if (g.verdict === 'CLEAN') {
-    console.log(`  CLEAN — 0 books show the lag, on either mode (${g.liveBookCount} live book(s) graded).`);
+    console.log(
+      `  CLEAN — 0 books show the lag, on either mode (${g.liveBookCount} live book(s) graded,`
+      + ` ${g.liveGradeableBookCount} with a gradeable session).`,
+    );
     // TRA-2635 — and a clean lag verdict is NOT sufficient on its own. This early
     // `return EXIT_CLEAN` is the exact shape CEO retracted: it passes the fleet on
     // an axis that cannot fire on a book the credit path never reached.
@@ -548,7 +605,9 @@ async function main(argv) {
   // it is the absence of one, and it must not be printed as reassurance.
   if (g.verdict === 'LIVE_UNMEASURABLE') {
     console.error(
-      `BLIND — the real-money tripwire graded NOTHING: 0 of ${g.engineCount} books resolved \`mode: live\`.`,
+      `BLIND — the real-money tripwire graded NOTHING: ${g.unmeasurableReason}`
+      + ` (${g.liveBookCount} of ${g.engineCount} books resolved \`mode: live\`,`
+      + ` ${g.liveGradeableBookCount} with a session whose prior carried non-zero optionsDaily).`,
     );
     console.error('"No live book was affected" and "there was no live book" are the same reading');
     console.error('here, so this is NOT a pass and NOT evidence for the demo-only verdict.');
@@ -721,6 +780,69 @@ function selftest() {
       ],
     }).verdict,
     'DEMO_LAG',
+  );
+
+  // TRA-2630 AC2 — THE GRADEABLE COHORT (the denominator). These four are the
+  // controls the CLEAN path was missing: a live book present but never gradeable
+  // used to read CLEAN, which is "0 hits over 0 chances to hit".
+  check(
+    'gradeable dates require a NON-ZERO prior optionsDaily',
+    findPriorOptionsLagGradeableDates([
+      { date: '2026-07-27', stockDaily: 0, optionsDaily: 0 },
+      { date: '2026-07-28', stockDaily: 25, optionsDaily: 68 },
+      { date: '2026-07-29', stockDaily: 0, optionsDaily: 0 },
+    ]),
+    // 07-28's prior is 0.00 -> not gradeable; 07-29's prior is 68 -> gradeable.
+    ['2026-07-29'],
+  );
+  check(
+    'a session whose prior had options P&L is gradeable even when it PASSES (stockDaily 0)',
+    findPriorOptionsLagGradeableDates([
+      { date: '2026-07-28', stockDaily: 0, optionsDaily: 250.01 },
+      { date: '2026-07-29', stockDaily: 0, optionsDaily: 0 },
+    ]),
+    ['2026-07-29'],
+  );
+  check(
+    'a live book with NO gradeable session is LIVE_UNMEASURABLE, not CLEAN',
+    gradePayload({
+      engines: [
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 0 },
+          { date: '2026-07-28', stockDaily: 0, optionsDaily: 0 },
+        ] },
+      ],
+    }).verdict,
+    'LIVE_UNMEASURABLE',
+  );
+  check(
+    'a live book WITH a gradeable session that passes is CLEAN',
+    gradePayload({
+      engines: [
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-28', stockDaily: 0, optionsDaily: 250.01 },
+          { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 0 },
+        ] },
+      ],
+    }).verdict,
+    'CLEAN',
+  );
+  // A red live book must still outrank an ungradeable cohort — red beats unmeasured.
+  check(
+    'a LIVE hit still outranks an ungradeable second live book',
+    gradePayload({
+      engines: [
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 68 },
+          { date: '2026-07-28', stockDaily: 68, optionsDaily: 0 },
+        ] },
+        { username: 'admin2', mode: 'live', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 0 },
+          { date: '2026-07-28', stockDaily: 0, optionsDaily: 0 },
+        ] },
+      ],
+    }).verdict,
+    'LIVE_LAG',
   );
 
   // FAILS CLOSED — AN EMPTY LIVE COHORT IS BLIND, NEVER CLEAN OR DEMO_LAG.

@@ -253,6 +253,28 @@ export interface PnlReconcileDay {
    */
   lagsPriorOptionsDaily: boolean;
   /**
+   * TRA-2630 AC2/AC3 — **could {@link lagsPriorOptionsDaily} have fired on this
+   * session at all?** True iff the PRIOR session carried a non-zero
+   * `optionsDaily`.
+   *
+   * WHY THIS FIELD EXISTS. The lag hypothesis is "the writer posts the prior
+   * session's realized option P&L into this session's equity line", so it
+   * PREDICTS `stockDaily == prev.optionsDaily`. When `prev.optionsDaily` is
+   * non-zero that prediction is sharp, and any other value — INCLUDING `0.00` —
+   * refutes it, so the session is genuine evidence. When `prev.optionsDaily` is
+   * `0.00` the hypothesis predicts `stockDaily == 0.00`, which is
+   * INDISTINGUISHABLE from an ordinary quiet day. Such a session has no failing
+   * state, so scoring it as a pass manufactures confidence.
+   *
+   * Measured on bqb1 2026-07-30T08:02Z: of the 13 books currently carrying a lag
+   * date, **SEVEN have `optionsDaily 0.00` on their latest session** — they
+   * cannot verify the fix on the next session no matter what it writes. The
+   * OFFENDER cohort is not the GRADEABLE cohort, and deriving the verification
+   * set from "who was broken" instead of from the tripwire's own trigger
+   * condition is what makes an AC2-style before/after read unfalsifiable.
+   */
+  priorOptionsLagEligible: boolean;
+  /**
    * TRA-2635 (CEO) — the DURABLE equity STATE at this session's close, i.e.
    * `PaperAccount.totalEquity` as the 21:00 ET writer saw it.
    *
@@ -401,8 +423,26 @@ export interface PnlReconcileResult {
    * Not baseline-gated (see that field). Empty is the passing state.
    */
   priorOptionsLagDates: string[];
-  /** TRA-2630 AC3 — false iff at least one `priorOptionsLagDates` entry was found. */
-  priorOptionsLagOk: boolean;
+  /**
+   * TRA-2630 AC3 — the tripwire verdict for this book.
+   *
+   * TRI-STATE as of TRA-2630 AC2 hardening: `false` = a lag date was found;
+   * `true` = at least one {@link PnlReconcileDay.priorOptionsLagEligible}
+   * session was graded and none lagged; **`null` = NOT MEASURED** — this book
+   * has no session whose prior carried a non-zero `optionsDaily`, so the
+   * tripwire had no failing state available and its silence means nothing.
+   *
+   * It was `priorOptionsLagDates.length === 0` before, i.e. `true` on a book the
+   * tripwire could not have flagged. That is `Array.every`-on-the-empty-set
+   * wearing different clothes, and it is the same defect this very module
+   * documents at {@link summarizeLiveLagTripwire} one layer up.
+   */
+  priorOptionsLagOk: boolean | null;
+  /**
+   * TRA-2630 AC2 — sessions where the tripwire COULD have fired, i.e. the
+   * gradeable cohort. See {@link PnlReconcileDay.priorOptionsLagEligible}.
+   */
+  priorOptionsLagEligibleDates: string[];
   /**
    * TRA-2635 (CEO) — **did realized option P&L actually reach this book's equity?**
    * TRI-STATE: `true` = yes, some gradeable session shows a non-zero credited
@@ -521,22 +561,34 @@ export function summarizeLiveLagTripwire(
   engines: ReadonlyArray<{
     username: string;
     mode: string;
-    priorOptionsLagOk: boolean;
+    priorOptionsLagOk: boolean | null;
     priorOptionsLagDates: string[];
+    priorOptionsLagEligibleDates: string[];
   }>,
 ): {
   liveBookCount: number;
+  liveGradeableBookCount: number;
   livePriorOptionsLagOk: boolean | null;
   livePriorOptionsLagBooks: Array<{ username: string; dates: string[] }>;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
   const offenders = liveBooks
-    .filter(e => !e.priorOptionsLagOk)
+    .filter(e => e.priorOptionsLagOk === false)
     .map(e => ({ username: e.username, dates: e.priorOptionsLagDates }));
+  // TRA-2630 AC2 — the SECOND empty cohort, one level in from the one this
+  // function was written to close. `liveBookCount: 1` proves a live book was
+  // LOOKED AT; it does not prove the tripwire could have fired on it. A live book
+  // whose every session follows a zero-`optionsDaily` prior is graded by a
+  // predicate with no failing state, and folding it as green rebuilds the exact
+  // manufactured-green this doc comment is about — just with a non-empty filter.
+  const gradeable = liveBooks.filter(e => e.priorOptionsLagEligibleDates.length > 0);
   return {
     liveBookCount: liveBooks.length,
-    // NOT MEASURED, not OK — see the note above.
-    livePriorOptionsLagOk: liveBooks.length === 0 ? null : offenders.length === 0,
+    liveGradeableBookCount: gradeable.length,
+    // NOT MEASURED, not OK — see the note above. Red wins over unmeasured, so a
+    // flagged book is still reported even if some other live book is ungradeable.
+    livePriorOptionsLagOk:
+      offenders.length > 0 ? false : gradeable.length === 0 ? null : true,
     livePriorOptionsLagBooks: offenders,
   };
 }
@@ -733,6 +785,9 @@ export function reconcilePnl(
         // Filled in by the second pass below — it needs the PRIOR row, which is
         // not available inside this per-row map.
         lagsPriorOptionsDaily: false,
+        // TRA-2630 AC2 — both are filled in by the second pass below; it needs
+        // the PRIOR row. Session 0 has no prior, so it stays ineligible.
+        priorOptionsLagEligible: false,
         optionsFieldPresent,
         journalCloses,
         journalOptionsPnl,
@@ -761,9 +816,19 @@ export function reconcilePnl(
   // `optionsDaily 0.00`) matches "equal to the cent" and the tripwire fires on
   // 127 of 167 clean sessions — a flag that is true in the passing state has no
   // failing state, the TRA-2301/TRA-2642 lesson.
+  // TRA-2630 AC2 — `priorOptionsLagEligible` is stamped BEFORE the `stockDaily`
+  // guard below, and deliberately does not depend on `cur` at all. Eligibility
+  // asks "was the prediction sharp on this session", which is a property of the
+  // PRIOR row only: given a non-zero `prev.optionsDaily`, the lag hypothesis
+  // names one exact value for `cur.stockDaily`, so observing `0.00` refutes it
+  // just as hard as observing some third number. Folding the `stockDaily` guard
+  // into eligibility would throw away precisely the sessions that PASS, leaving
+  // a cohort of offenders only.
   for (let i = 1; i < days.length; i++) {
     const cur = days[i]!;
     const prev = days[i - 1]!;
+    cur.priorOptionsLagEligible =
+      Math.abs(prev.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD;
     if (Math.abs(cur.stockDaily) <= PNL_RECONCILE_TOLERANCE_USD) continue;
     if (Math.abs(cur.stockDaily - prev.optionsDaily) <= PNL_RECONCILE_TOLERANCE_USD) {
       cur.lagsPriorOptionsDaily = true;
@@ -820,6 +885,9 @@ export function reconcilePnl(
       ? null
       : stockLegOffendingDates.length === 0;
   const priorOptionsLagDates = days.filter(d => d.lagsPriorOptionsDaily).map(d => d.date);
+  const priorOptionsLagEligibleDates = days
+    .filter(d => d.priorOptionsLagEligible)
+    .map(d => d.date);
   // TRA-2302 — the false-zero sweep is NOT baseline-gated. The baseline exists
   // because pre-fix code wrote arithmetically un-reconcilable drift; a missing
   // option close is a different defect, and silencing it before 2026-07-12
@@ -939,7 +1007,15 @@ export function reconcilePnl(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.optionsLegDrift)), 0),
     ),
     priorOptionsLagDates,
-    priorOptionsLagOk: priorOptionsLagDates.length === 0,
+    priorOptionsLagEligibleDates,
+    // TRA-2630 AC2 — a red book wins outright; otherwise green REQUIRES at least
+    // one gradeable session, and an ungradeable book reads NOT MEASURED.
+    priorOptionsLagOk:
+      priorOptionsLagDates.length > 0
+        ? false
+        : priorOptionsLagEligibleDates.length > 0
+          ? true
+          : null,
     equityAbsorbedOptionsOk,
     counterDurable,
     counterResetDates,

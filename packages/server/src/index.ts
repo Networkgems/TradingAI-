@@ -4135,10 +4135,29 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       optionsLegOk: engines.every(e => e.optionsLegOk),
       maxOptionsLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxOptionsLegDriftUsd), 0),
       // TRA-2630 AC3 / TRA-2629 — the T+1 credit-lag tripwire, firm-wide.
-      priorOptionsLagOk: engines.every(e => e.priorOptionsLagOk),
+      //
+      // TRA-2630 AC2 — TRI-STATE fold, and for the same reason `stockLegOk`
+      // above is one. This was `engines.every(e => e.priorOptionsLagOk)`; with
+      // the per-book verdict now `boolean | null`, `every` COERCES NOT-MEASURED
+      // TO FALSE and would report a firm-wide T+1 lag REGRESSION sourced entirely
+      // from books whose tripwire never had a failing state. 32 of the 58 books
+      // on bqb1 are in that state right now, so this is not a corner case — it
+      // would have turned tomorrow's AC2 grade red on arrival.
+      priorOptionsLagOk: engines.some(e => e.priorOptionsLagOk === false)
+        ? false
+        : engines.some(e => e.priorOptionsLagOk === true)
+          ? true
+          : null,
       priorOptionsLagBooks: engines
-        .filter(e => !e.priorOptionsLagOk)
+        .filter(e => e.priorOptionsLagOk === false)
         .map(e => ({ username: e.username, mode: e.mode, dates: e.priorOptionsLagDates })),
+      // TRA-2630 AC2 — how many books the tripwire could actually have fired on.
+      // Publishing the denominator is the whole lesson: `priorOptionsLagOk: true`
+      // over 0 gradeable books and over 26 gradeable books are different claims,
+      // and without this field they are the same reading.
+      priorOptionsLagGradeableBookCount: engines.filter(
+        e => e.priorOptionsLagEligibleDates.length > 0,
+      ).length,
       // THE REAL-MONEY TRIPWIRE. The demo-only verdict on TRA-2630 Defect B (and
       // with it the standing decision NOT to roll back TRA-2323) holds only while
       // this stays empty. A `mode: live` book showing `stockDaily` == the prior

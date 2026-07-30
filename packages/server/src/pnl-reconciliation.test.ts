@@ -456,7 +456,57 @@ describe('reconcilePnl', () => {
         '2026-07-12',
       );
       expect(r.days.map(d => d.lagsPriorOptionsDaily)).toEqual([false, false, false]);
+      // TRA-2630 AC2 — and the BOOK verdict here is `null`, NOT `true`. Every
+      // session in this fixture follows a zero-`optionsDaily` prior, so the
+      // tripwire had no failing state available on any of them. It used to read
+      // `true`, which asserted a clean bill of health over zero observations —
+      // the same manufactured green as `livePriorOptionsLagOk` over an empty live
+      // cohort, reproduced inside this very test file.
+      expect(r.priorOptionsLagEligibleDates).toEqual([]);
+      expect(r.priorOptionsLagOk).toBeNull();
+    });
+
+    it('TRI-STATE: the SAME quiet book reads true once ONE session has a gradeable prior', () => {
+      // The discriminator for the field above. Only difference from the fixture
+      // in the previous test: 07-28 carries a non-zero `optionsDaily`, so 07-29
+      // becomes gradeable and its clean reading is now worth something.
+      const r = reconcilePnl(
+        [snap('2026-07-27', 0, 0), snap('2026-07-28', 0, 140), snap('2026-07-29', 0, 0)],
+        new Map(),
+        '2026-07-12',
+      );
+      expect(r.days.map(d => d.lagsPriorOptionsDaily)).toEqual([false, false, false]);
+      expect(r.priorOptionsLagEligibleDates).toEqual(['2026-07-29']);
       expect(r.priorOptionsLagOk).toBe(true);
+    });
+
+    it('a session that PASSES on a gradeable prior counts as evidence', () => {
+      // `stockDaily 0.00` after a 250.01 options session is not a quiet day — the
+      // lag hypothesis predicted exactly 250.01 there and got 0.00. Eligibility
+      // must therefore NOT depend on the current row, or the gradeable cohort
+      // collapses to the offenders and the fix can never be verified.
+      const r = reconcilePnl(
+        [snap('2026-07-28', 0, 250.01), snap('2026-07-29', 0, 0)],
+        new Map(),
+        '2026-07-12',
+      );
+      expect(r.priorOptionsLagEligibleDates).toEqual(['2026-07-29']);
+      expect(r.priorOptionsLagOk).toBe(true);
+    });
+
+    it('a lag date is ALWAYS also a gradeable date — red implies measured', () => {
+      // Invariant: the flag can only fire when `stockDaily` is non-zero AND
+      // equals the prior `optionsDaily`, which forces that prior non-zero too. If
+      // this ever broke, a book could read `false` while claiming 0 observations.
+      const r = reconcilePnl(
+        [snap('2026-07-27', 0, 67.5), snap('2026-07-28', 67.5, 22.5), snap('2026-07-29', 22.5, -5.11)],
+        new Map(),
+        '2026-07-12',
+      );
+      for (const d of r.priorOptionsLagDates) {
+        expect(r.priorOptionsLagEligibleDates).toContain(d);
+      }
+      expect(r.priorOptionsLagOk).toBe(false);
     });
 
     it('MUTATION: real stock P&L that merely RESEMBLES the prior options figure', () => {
@@ -503,8 +553,21 @@ describe('reconcilePnl', () => {
 // true on the empty set, so an all-demo fleet manufactured a green over real
 // money it never inspected. bqb1 served exactly that at 2026-07-30T05:16Z.
 describe('summarizeLiveLagTripwire — an empty live cohort is NOT MEASURED, never OK', () => {
-  const book = (username: string, mode: string, ok: boolean, dates: string[] = []) => ({
-    username, mode, priorOptionsLagOk: ok, priorOptionsLagDates: dates,
+  // `eligible` defaults to a non-empty cohort so the pre-existing controls below
+  // keep asserting what they were written to assert (the mode partition), and the
+  // gradeable-cohort axis is exercised explicitly in its own block.
+  const book = (
+    username: string,
+    mode: string,
+    ok: boolean | null,
+    dates: string[] = [],
+    eligible: string[] = ['2026-07-29'],
+  ) => ({
+    username,
+    mode,
+    priorOptionsLagOk: ok,
+    priorOptionsLagDates: dates,
+    priorOptionsLagEligibleDates: eligible,
   });
 
   it('reports null (NOT MEASURED) when no book resolves mode:live', () => {
@@ -549,6 +612,49 @@ describe('summarizeLiveLagTripwire — an empty live cohort is NOT MEASURED, nev
 
   it('is NOT MEASURED on an empty fleet', () => {
     expect(summarizeLiveLagTripwire([]).livePriorOptionsLagOk).toBeNull();
+  });
+
+  // TRA-2630 AC2 — THE SECOND EMPTY COHORT. `liveBookCount: 1` closed the "was a
+  // live book looked at" hole. It does NOT close "could the tripwire have fired
+  // on it": a live book whose every session follows a zero-`optionsDaily` prior is
+  // graded by a predicate with no failing state. Same manufactured green, one
+  // level in, and it survives a non-empty `liveBookCount`.
+  it('reports null when a live book EXISTS but has no gradeable session', () => {
+    const r = summarizeLiveLagTripwire([book('admin', 'live', null, [], [])]);
+    expect(r.liveBookCount).toBe(1);
+    expect(r.liveGradeableBookCount).toBe(0);
+    expect(r.livePriorOptionsLagOk).toBeNull();
+    // The regression this pins: a non-empty live cohort is not sufficient.
+    expect(r.livePriorOptionsLagOk).not.toBe(true);
+  });
+
+  it('MUTATION: the same live book reads true once it has one gradeable session', () => {
+    const r = summarizeLiveLagTripwire([book('admin', 'live', true, [], ['2026-07-30'])]);
+    expect(r.liveBookCount).toBe(1);
+    expect(r.liveGradeableBookCount).toBe(1);
+    expect(r.livePriorOptionsLagOk).toBe(true);
+  });
+
+  it('RED WINS over an ungradeable live book — never masked by NOT MEASURED', () => {
+    const r = summarizeLiveLagTripwire([
+      book('admin', 'live', false, ['2026-07-30'], ['2026-07-30']),
+      book('admin2', 'live', null, [], []),
+    ]);
+    expect(r.liveGradeableBookCount).toBe(1);
+    expect(r.livePriorOptionsLagOk).toBe(false);
+    expect(r.livePriorOptionsLagBooks).toEqual([{ username: 'admin', dates: ['2026-07-30'] }]);
+  });
+
+  it('a NOT-MEASURED live book is not reported as an offender', () => {
+    // `!e.priorOptionsLagOk` was the old offender filter and it coerces `null` to
+    // truthy-negative, which would name an unmeasured book in the escalation list
+    // and fire the real-money alarm on the absence of data.
+    const r = summarizeLiveLagTripwire([
+      book('admin', 'live', null, [], []),
+      book('admin2', 'live', true, [], ['2026-07-30']),
+    ]);
+    expect(r.livePriorOptionsLagBooks).toEqual([]);
+    expect(r.livePriorOptionsLagOk).toBe(true);
   });
 });
 
