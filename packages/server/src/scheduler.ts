@@ -76,6 +76,32 @@ export function isMarketDayIso(dateIso: string): boolean {
 }
 
 /**
+ * TRA-2634 — the NYSE session immediately before `dateIso`, or `null` if none is
+ * found inside the lookback.
+ *
+ * Exists so the cross-artifact level-continuity check can insist on ADJACENCY.
+ * Yesterday's published close is today's previous close only when "yesterday" is
+ * the previous SESSION; over a weekend-plus-holiday gap the comparison silently
+ * becomes a multi-day move and the residual stops meaning anything. The caller
+ * must abstain rather than reach for the nearest report file it can find.
+ *
+ * The 10-day lookback covers the longest run of consecutive non-sessions the
+ * `MARKET_HOLIDAYS` table can produce (a Thu/Fri holiday pair around a weekend
+ * is 4; 10 leaves margin) and bounds the loop so a malformed date cannot spin.
+ */
+export function previousMarketDayIso(dateIso: string, maxLookbackDays = 10): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return null;
+  const [y, m, d] = dateIso.split('-').map(Number);
+  let t = Date.UTC(y, m - 1, d);
+  for (let i = 0; i < maxLookbackDays; i++) {
+    t -= 86400000;
+    const iso = new Date(t).toISOString().slice(0, 10);
+    if (isMarketDayIso(iso)) return iso;
+  }
+  return null;
+}
+
+/**
  * TRA-388 — compute the trading days that should have an EOD report on disk
  * but don't, so a startup / pre-archive catch-up can backfill them.
  *

@@ -5,7 +5,7 @@ import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, etDateString, isMarketOpen } from './scheduler.js';
+import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, previousMarketDayIso, etDateString, isMarketOpen } from './scheduler.js';
 import { etHour } from './et-clock.js'; // TRA-2498
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import {
@@ -636,6 +636,7 @@ import {
   type NewsItem,
   type ResearchReport,
   type EodReport,
+  type EodMover,
   type StrategyPresetId,
   type Position,
   type OptionPosition,
@@ -1422,6 +1423,61 @@ async function generateAndSaveReport(
       reason: err instanceof Error ? err.message : String(err),
     });
   }
+
+  // TRA-2634 — hand the report generator the PRIOR SESSION's published movers so
+  // its level-continuity check has a second dated observation to be continuous
+  // with. Yesterday's published close IS today's previous close, so a row whose
+  // implied prev close does not reproduce it had its denominator re-derived —
+  // the FGMC `$8.30 / +69.04% -> +110.66%` shape, which no session-move ratio
+  // test can express.
+  //
+  // Deliberately reads only what is ALREADY on disk in this same bucket: no new
+  // durable state, no network, and it therefore works against the existing
+  // archive (which is what let TRA-2634 grade the threshold on 260 real
+  // adjacent-session pairs before shipping it).
+  //
+  // ⛔ ADJACENCY IS THE PRECONDITION, NOT A NICETY. Only the immediately
+  // preceding session is loaded; if that file is absent we pass NOTHING and the
+  // check abstains on every row. Substituting "the most recent report we have"
+  // would turn every Monday into a 3-day comparison and manufacture breaks.
+  //
+  // ⚠️ COVERAGE, stated because a per-row abstain is a fail-open: the stored
+  // report carries only `top5Movers`, so this can grade a symbol only if it was
+  // in YESTERDAY's top five. That covers the hazard the check exists for — a
+  // fabricated denominator re-derives every session, so a row about to take #1
+  // was usually #1 yesterday too (both of TRA-2634's positive controls are this
+  // shape) — but it does NOT cover a symbol that was clean yesterday, and it
+  // cannot cover a symbol's first appearance at all. The census logged inside
+  // `top5Movers` prints how much of the table was ungradeable each run.
+  let priorSessionMovers: EodMover[] | undefined;
+  let priorSessionDate: string | undefined;
+  {
+    const reportDate = opts.asOfDate ?? etDateString();
+    const prevSession = previousMarketDayIso(reportDate);
+    if (prevSession) {
+      const priorPath = join(targetDir, `${prevSession}.json`);
+      try {
+        if (existsSync(priorPath)) {
+          const prior = JSON.parse(await readFile(priorPath, 'utf-8')) as EodReport;
+          if (Array.isArray(prior?.top5Movers) && prior.top5Movers.length > 0) {
+            priorSessionMovers = prior.top5Movers;
+            priorSessionDate = prevSession;
+          }
+        }
+      } catch (err) {
+        // An unreadable prior artifact must abstain, never grade against a
+        // partial parse — a continuity verdict built on half a table is worse
+        // than no verdict.
+        log.warn('TRA-2634 prior-session report unreadable — continuity check abstains', {
+          username: ctx.username,
+          priorPath,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+  finalSnapshot.priorSessionMovers = priorSessionMovers;
+  finalSnapshot.priorSessionDate = priorSessionDate;
 
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 

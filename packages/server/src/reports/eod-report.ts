@@ -14,7 +14,7 @@ import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE
 import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/shared';
 // TRA-2610 — the consumer-side plausibility predicate. Reads `moveSuspect` AND
 // re-executes the rule, so a lost stamp cannot promote a fabrication.
-import { isMoveSuspect } from '@trading-app/shared';
+import { isMoveSuspect, assessLevelContinuity, describeLevelContinuity } from '@trading-app/shared';
 import { logger } from '../observability/index.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
@@ -183,7 +183,11 @@ function toTradeEntry(pos: Position, signalType: SignalType): EodTradeEntry {
 
 const log = logger.child({ module: 'eod-report' });
 
-function top5Movers(symbols: SymbolState[]): EodMover[] {
+function top5Movers(
+  symbols: SymbolState[],
+  priorSessionMovers?: EodMover[],
+  priorSessionDate?: string,
+): EodMover[] {
   // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
   // so the report shows "_No data._" rather than five rows of 0.00% when the feed
   // is failing on cold start.
@@ -201,14 +205,82 @@ function top5Movers(symbols: SymbolState[]): EodMover[] {
   // `isMoveSuspect` reads the dedicated `moveSuspect` field AND re-executes the
   // rule, so neither a lost stamp nor a stale one puts a fabrication in the
   // headline. Freshness is a separate question and is still `lastUpdated > 0`.
-  const rankable = (s: SymbolState) => s.lastUpdated > 0 && s.price > 0 && !isMoveSuspect(s);
-  const excluded = symbols.filter(s => s.lastUpdated > 0 && s.price > 0 && isMoveSuspect(s));
+  // TRA-2634 — a SECOND, independent instrument, because the one above is a
+  // session-move ratio test and the strongest evidence on TRA-2610 was a FROZEN
+  // PRICE with a MOVING `changePct` (FGMC `$8.30` on 07-28 AND 07-29, +69.04% ->
+  // +110.66%). A ratio test cannot express that at any threshold — the price did
+  // not move, only the denominator did — which is why the deployed r >= 2 rule
+  // catches the 07-29 row and passes the 07-28 one. This one diffs today's
+  // implied prev close against the close we PUBLISHED for the prior session; see
+  // `assessLevelContinuity` for the derivation and the measured band.
+  //
+  // The two are deliberately ORed, not merged, and neither threshold moved.
+  // They disagree in both directions on real archived rows and each is right in
+  // its own direction: FLYYQ `0.01/-50%` -> `0.02/+100%` is r = 2.000 (the
+  // session rule flags it) yet perfectly continuous with our own prior close
+  // (this rule passes it), while TDIC `7.60` -> `6.13/-21.31%` is r = 1.271 (the
+  // session rule passes it) against an implied prev close of `7.79` (this rule
+  // flags it).
+  const priorRows = new Map<string, EodMover>();
+  for (const m of priorSessionMovers ?? []) {
+    priorRows.set(String(m.symbol).toUpperCase(), m);
+  }
+  const continuity = (s: SymbolState) =>
+    assessLevelContinuity(priorRows.get(s.symbol.toUpperCase()) ?? null, s);
+
+  const rankable = (s: SymbolState) =>
+    s.lastUpdated > 0 && s.price > 0
+    && !isMoveSuspect(s)
+    && continuity(s).verdict !== 'suspect';
+  const candidates = symbols.filter(s => s.lastUpdated > 0 && s.price > 0);
+  const excluded = candidates.filter(s => isMoveSuspect(s));
   if (excluded.length > 0) {
     log.warn('top-movers EXCLUDED implausible moves', {
       issue: 'TRA-2610',
       symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%:${s.quoteStatus ?? 'n/a'}`),
     });
   }
+  // A row the session rule already dropped is not re-reported here — the point
+  // of this census is what the SECOND instrument adds.
+  const discontinuous = candidates.filter(s => !isMoveSuspect(s) && continuity(s).verdict === 'suspect');
+  if (discontinuous.length > 0) {
+    log.warn('top-movers EXCLUDED level discontinuities vs the prior session artifact', {
+      issue: 'TRA-2634',
+      priorSessionDate: priorSessionDate ?? 'n/a',
+      detail: discontinuous.map(s =>
+        describeLevelContinuity(s.symbol, priorSessionDate ?? 'n/a',
+          priorRows.get(s.symbol.toUpperCase()) ?? null, s)),
+    });
+  }
+  // ⭐ The census is the control, not decoration. This check ABSTAINS whenever the
+  // symbol has no adjacent prior observation (its first appearance — which is
+  // exactly why FGMC's 07-28 row is still not recoverable here), when the prior
+  // file is missing, and on a stale republication. An abstain is NOT a clean
+  // read, and a per-row fail-open is only defensible while its size is visible:
+  // "excluded 0" over a table that was 100% ungradeable must never read like
+  // "nothing was wrong". Logged every run, at info, reachability included.
+  const census = { graded: 0, consistent: 0, suspect: 0, abstained: 0 } as Record<string, number>;
+  const abstainReasons: Record<string, number> = {};
+  for (const s of candidates) {
+    const v = continuity(s);
+    if (v.verdict === 'abstain') {
+      census.abstained++;
+      const key = v.reason ?? 'unknown';
+      abstainReasons[key] = (abstainReasons[key] ?? 0) + 1;
+    } else {
+      census.graded++;
+      if (v.verdict === 'suspect') census.suspect++; else census.consistent++;
+    }
+  }
+  log.info('top-movers level-continuity census', {
+    issue: 'TRA-2634',
+    priorSessionDate: priorSessionDate ?? 'n/a',
+    priorRowsAvailable: priorRows.size,
+    candidates: candidates.length,
+    ...census,
+    abstainReasons,
+  });
+
   return [...symbols]
     .filter(rankable)
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
@@ -752,6 +824,24 @@ export interface ReportInput {
    * judge the liquidity gate's modeled cost before arming a live veto.
    */
   executionQuality?: ExecutionQualityKpi;
+  /**
+   * TRA-2634 — the IMMEDIATELY PRECEDING trading session's published movers
+   * table, read off that day's stored report file by the caller. Feeds the
+   * cross-artifact level-continuity check in `top5Movers`: yesterday's published
+   * close IS today's previous close, so a row whose `impliedPrevClose` does not
+   * reproduce it had its denominator re-derived and must not be the headline.
+   *
+   * ⛔ MUST be the adjacent session (`previousMarketDayIso`), or absent. A gap of
+   * even one session turns the comparison into a multi-day move and the residual
+   * stops meaning anything — the caller passes nothing and the check abstains
+   * rather than grading against the nearest row it happens to have.
+   *
+   * Optional ↔ the check abstains on every row (day 1, a missing prior file, a
+   * crypto/test caller). `priorSessionDate` rides along so the exclusion log
+   * names the artifact it graded against instead of asserting one.
+   */
+  priorSessionMovers?: EodMover[];
+  priorSessionDate?: string;
 }
 
 /**
@@ -770,7 +860,8 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
           optionJournal, optionLearnedWeights, introspection, autopilotActions,
           sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
           hypothesisQueue, executionQuality,
-          journalBasis, journalBasisCounts } = input;
+          journalBasis, journalBasisCounts,
+          priorSessionMovers, priorSessionDate } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -838,7 +929,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const maxDrawdown = computeMaxDrawdown(todayClosed, Math.max(sessionOpenEquity, 1));
 
   // Top 5 movers
-  const movers = top5Movers(state.symbols);
+  const movers = top5Movers(state.symbols, priorSessionMovers, priorSessionDate);
 
   // TRA-844 — portfolio Greeks + theta-$ bleed + allocation rollup over the
   // open options book. Spot is resolved off the same symbol tape the report

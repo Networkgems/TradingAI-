@@ -194,6 +194,214 @@ export function isMoveSuspect(row: QuoteMoveRow): boolean {
   }).suspect;
 }
 
+// ── TRA-2634 — LEVEL CONTINUITY ACROSS TWO DATED ARTIFACTS ────────────────────
+//
+// `assessQuotePlausibility` above is a SESSION-MOVE test: it asks whether one
+// row's own `price` and `changePct` are mutually believable. It cannot express
+// the strongest evidence TRA-2610 was actually filed on — FGMC sitting at a
+// FROZEN $8.30 on two consecutive days while `changePct` moved +69.04% ->
+// +110.66%. A session-move ratio test cannot reach that at ANY threshold,
+// because the whole point is that the PRICE DID NOT MOVE; only the denominator
+// did. TRA-2634 measured the cost: the deployed r >= 2 rule catches the 07-29
+// row (r = 2.1066) and passes the 07-28 one (r = 1.6904), so the guard misses
+// day 1 of the exact fabrication it is named after.
+//
+// The invariant this expresses instead is an identity, not a heuristic:
+//
+//     YESTERDAY'S PUBLISHED CLOSE *IS* TODAY'S PREVIOUS CLOSE.
+//
+// So `impliedPrevClose(today)` must reproduce the close we ourselves published
+// for the prior session. When it does not, the denominator today was re-derived
+// against a reference that is not our own prior artifact — which is exactly
+// what an unadjusted prev close across a corporate action looks like.
+//
+// MEASURED, 2026-07-30, over every adjacent-session pair in the stored archive
+// on BOTH boxes (bqb1 2026-05-03 -> 07-30 all three folds, 223 pairs; the
+// localhost archive, 37 pairs). The healthy population agrees with our own
+// prior published close to 3-4 significant figures, and the offenders are an
+// order of magnitude away — a genuinely bimodal separation:
+//
+//   healthy (59 pairs)   residual 1.000000 .. 1.005543   (worst: NVTS 06-04)
+//   ---- empty band ----
+//   offenders (11 pairs) residual 1.025008 .. 2.106599
+//
+// Six of those offenders are INVISIBLE to the deployed r >= 2 rule and were
+// ranked anyway: TDIC 1.0250, 000660.KS 1.0369, ABTC 1.3021, FLYYQ 1.3334,
+// VEEE 1.4483, CRNX 1.9874. FLYYQ (`$0.02` frozen, `+100.00%` -> `+33.34%`,
+// r = 1.3334) is TRA-2634's second positive control and is caught here.
+//
+// ⛔ WHAT THIS DOES *NOT* RECOVER, stated because the ticket's own rule is to
+// re-run its evidence row by row: FGMC's **07-28** row still passes. It is the
+// symbol's FIRST appearance in the archive, so there is no prior observation to
+// be continuous with, and the verdict is `abstain` — not `consistent`. A
+// cross-artifact test is structurally blind to day 1 by construction. See the
+// boundary note on TRA-2634 and the follow-up filed for the feed boundary,
+// which holds the previous tick and can see a within-session denominator flip
+// that this cannot.
+
+/**
+ * Residual at or above which the level break is treated as real.
+ *
+ * DERIVED from the published grid, not fitted to the tape — the measured band
+ * above is empty from 1.0056 to 1.0250, so the archive cannot choose a number
+ * inside it (the same situation `SUSPECT_MOVE_RATIO` faced on the 07-26 tape).
+ * The two legitimate sources of divergence bound it:
+ *
+ *  - `changePct` ROUNDING. The Tradier path publishes 2 dp, so the half-grid is
+ *    0.005 pct points and `d(impliedPrev)/impliedPrev = dpct / (100 + pct)`.
+ *    That is 0.005% at a flat session, 0.01% at -50%, and 0.05% at -90%. A 1%
+ *    tolerance covers every `changePct` above about -99.5% — and a row at
+ *    -99.5% is already at r = 200, i.e. long since caught by the session-move
+ *    rule.
+ *  - PRICE rounding. The feed passes the provider's value through verbatim (the
+ *    archive carries `0.0216`, `0.5412`, `0.9497`), so 4 significant figures is
+ *    the floor: 0.005% relative. 1% leaves ~200x of headroom.
+ *
+ * Controls on both sides, from the measurement above: 1.8x above the worst
+ * healthy pair (NVTS, 1.0056) and 2.5x below the tightest real offender (TDIC,
+ * 1.0250). And 1% is far below the SMALLEST corporate action that produces the
+ * artefact (a factor of 2 = 100%), so it cannot mask the class it exists to
+ * catch.
+ *
+ * ⚠️ THE HEADROOM AGAINST *ONE* CONFOUND IS THIN AND MEASURED, NOT PROVEN. Our
+ * published close is the last quote standing at 21:00 ET, not the official
+ * close — FGMC's was 104 minutes stale. A prior row that was itself a stale
+ * intraday quote will read as a continuity break here. NVTS at 1.0056 is most
+ * likely exactly that (our $30.84 vs an implied $30.67). Zero of 59 healthy
+ * pairs crossed 1.01, but `EodMover` does not persist `lastUpdated`, so that is
+ * an empirical zero on a population whose staleness I could not read — not a
+ * proof. It is why every fire is logged with its full arithmetic.
+ */
+export const CONTINUITY_RESIDUAL_TOLERANCE = 1.01;
+
+/**
+ * `|Δ changePct|` (in percentage points) at or below which two published rows
+ * are treated as ONE observation re-served rather than two.
+ *
+ * This is the load-bearing exclusion, and it is why a tight residual threshold
+ * is not a rubber stamp. 189 of 223 adjacent-session pairs on bqb1 are
+ * REPUBLICATIONS — byte-identical `price` AND `changePct` under a different
+ * `generatedAt`, i.e. a report generated for date D off a tape that never
+ * advanced past D-1. Their residual is 1.22 .. 14.17 purely because a stale
+ * table's `changePct` is compared to its own price, so grading them would fire
+ * on 87% of everything and discriminate nothing. There is no second data point
+ * in a republication, so there is nothing to be continuous WITH: `abstain`.
+ * (Stale republication is a real defect — it is just a DIFFERENT one, and the
+ * `lastUpdated > 0` freshness leg is what owns it.)
+ *
+ * ⛔ THE COMPARISON MUST BE A TOLERANCE, NOT EQUALITY. Measured: SNDK
+ * `2184.75/11.5351` -> `2184.75/11.535121` and LEGN `27.93/-16.6766` ->
+ * `27.93/-16.67661` are plainly the same observation re-serialised at a
+ * different precision, and an exact `===` on `changePct` classes them as two
+ * observations and fires (residual 1.1154 and 1.2001). 0.01 pct points is well
+ * under the 2-dp publication grid and 4,000x under the smallest real offender's
+ * 41.6-point move (FGMC).
+ */
+export const REPUBLICATION_CHANGE_PCT_EPSILON = 0.01;
+
+/** Why a continuity verdict could not be reached. NEVER read one of these as clean. */
+export type LevelContinuityAbstainReason =
+  /** No prior-session observation of this symbol at all (its first appearance). */
+  | 'no_prior_observation'
+  /** The prior row's price is absent / non-finite / <= 0. */
+  | 'prior_unusable'
+  /** Today's numbers do not imply a usable prev close — the session-move rule owns this. */
+  | 'current_unusable'
+  /** Prior and current are the SAME observation re-served: no second data point. */
+  | 'republished_prior_row';
+
+export interface LevelContinuityVerdict {
+  /**
+   * Three-valued ON PURPOSE. `'abstain'` is not `'consistent'`: it says the
+   * instrument was blind on this row. A caller that collapses the two has built
+   * a gate that is satisfied by the absence of the thing it grades.
+   */
+  verdict: 'suspect' | 'consistent' | 'abstain';
+  reason?: 'level_discontinuity' | LevelContinuityAbstainReason;
+  /** `max(priorClose/impliedPrev, impliedPrev/priorClose)`. `null` unless computed. */
+  residual: number | null;
+  /** The prev close TODAY's published numbers imply. */
+  impliedPrevClose: number | null;
+  /** The close we ourselves published for the prior session. */
+  priorClose: number | null;
+}
+
+/**
+ * Is today's published session move continuous with the close we published for
+ * the prior session?
+ *
+ * `prior` must be the IMMEDIATELY PRECEDING trading session's row for the same
+ * symbol. Adjacency is the caller's job — a gap of even one session makes the
+ * comparison a multi-day move and the residual meaningless, so pass `null`
+ * rather than the nearest row you happen to have and take the `abstain`.
+ */
+export function assessLevelContinuity(
+  prior: QuotePlausibilityInput | null | undefined,
+  current: QuotePlausibilityInput,
+): LevelContinuityVerdict {
+  const blank = { residual: null, impliedPrevClose: null, priorClose: null };
+  if (prior == null) return { verdict: 'abstain', reason: 'no_prior_observation', ...blank };
+
+  const priorClose = prior.price;
+  if (!Number.isFinite(priorClose) || priorClose <= 0) {
+    return { verdict: 'abstain', reason: 'prior_unusable', ...blank };
+  }
+
+  // A republication carries no new information about the level. Compare the
+  // PRICE exactly (it is the same stored number) and the PERCENTAGE within the
+  // publication grid, because that is the field that gets re-serialised.
+  const priorPct = prior.changePct;
+  const curPct = current.changePct;
+  if (
+    current.price === priorClose &&
+    typeof priorPct === 'number' && typeof curPct === 'number' &&
+    Number.isFinite(priorPct) && Number.isFinite(curPct) &&
+    Math.abs(curPct - priorPct) <= REPUBLICATION_CHANGE_PCT_EPSILON
+  ) {
+    return { verdict: 'abstain', reason: 'republished_prior_row', ...blank, priorClose };
+  }
+
+  const implied = impliedPrevClose(current);
+  if (implied === null || !Number.isFinite(implied) || implied <= 0) {
+    return { verdict: 'abstain', reason: 'current_unusable', ...blank, priorClose };
+  }
+
+  const residual = Math.max(priorClose / implied, implied / priorClose);
+  if (!Number.isFinite(residual)) {
+    return { verdict: 'abstain', reason: 'current_unusable', residual: null, impliedPrevClose: implied, priorClose };
+  }
+  if (residual >= CONTINUITY_RESIDUAL_TOLERANCE) {
+    return { verdict: 'suspect', reason: 'level_discontinuity', residual, impliedPrevClose: implied, priorClose };
+  }
+  return { verdict: 'consistent', residual, impliedPrevClose: implied, priorClose };
+}
+
+/**
+ * One-line, log-ready explanation of a continuity verdict — the arithmetic, not
+ * a label, so a false positive is auditable rather than asserted. Per TRA-2379
+ * decision 2 a silent drop reads identically to nothing being wrong, and this
+ * threshold's headroom against a stale prior snapshot is thin enough that a
+ * reader needs the residual itself.
+ */
+export function describeLevelContinuity(
+  symbol: string,
+  priorDate: string,
+  prior: QuotePlausibilityInput | null | undefined,
+  current: QuotePlausibilityInput,
+): string {
+  const v = assessLevelContinuity(prior, current);
+  const n = (x: number | null | undefined) =>
+    x === null || x === undefined || !Number.isFinite(x) ? 'n/a' : String(x);
+  const head = `${symbol}: ${v.verdict}`
+    + `${v.reason ? ` (${v.reason})` : ''}`
+    + ` today=${n(current.price)}/${n(current.changePct)}%`
+    + ` prior[${priorDate}]=${n(prior?.price)}/${n(prior?.changePct)}%`;
+  if (v.residual === null) return head;
+  return `${head} impliedPrevClose=${v.impliedPrevClose === null ? 'n/a' : v.impliedPrevClose.toFixed(4)}`
+    + ` publishedPriorClose=${v.priorClose === null ? 'n/a' : v.priorClose.toFixed(4)}`
+    + ` residual=${v.residual.toFixed(6)} tolerance=${CONTINUITY_RESIDUAL_TOLERANCE}`;
+}
+
 /**
  * One-line, log-ready explanation. Used by the market-scanner exclusion log so a
  * dropped row is never silent — per TRA-2379 decision 2, "a silent drop reads

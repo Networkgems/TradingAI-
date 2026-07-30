@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { generateEodReport } from './eod-report.js';
 import type { EngineState } from '../signal-engine.js';
-import type { OptionPosition, Position } from '@trading-app/shared';
+import { isMoveSuspect, type OptionPosition, type Position } from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -800,6 +800,148 @@ describe('TRA-2610 top movers — a fabricated move cannot be laundered by a fai
 
   it('leaves an ordinary board untouched', () => {
     const report = reportFor(GENUINE);
+    expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
+  });
+});
+
+/**
+ * TRA-2634 — ACCEPTANCE at the REPORT BOUNDARY. The check above is a session-move
+ * ratio test and therefore misses every fabrication below 2x, including day 1 of
+ * the FGMC series it is named after (`$8.30 / +69.04%`, r = 1.6904). This one
+ * diffs today's implied prev close against the close we PUBLISHED for the prior
+ * session, which is a level-continuity test and reaches rows no ratio can.
+ *
+ * Rows are verbatim archived `top5Movers` entries (2026-07-30 read, full JSON
+ * precision). FLYYQ `$0.02` frozen with `changePct` `+100.00% -> +33.34%` is the
+ * ticket's second positive control and is invisible to r >= 2 at r = 1.3334.
+ */
+describe('TRA-2634 top movers — a re-derived denominator cannot be the headline', () => {
+  const now = Date.now();
+  const row = (symbol: string, price: number, changePct: number) => ({
+    symbol, price, volume: 100_000, change: price - price / (1 + changePct / 100),
+    changePct, lastUpdated: now, quoteStatus: 'ok' as const, moveSuspect: false,
+  });
+
+  /** The four genuine movers from the 07-29 table, all continuous with their own prior closes. */
+  const GENUINE = [
+    row('SOXL', 91.99, -16.02), row('IREN', 29.31, -13.62),
+    row('AXTI', 36.97, -13.54), row('ONDS', 6.80, -13.49),
+  ];
+
+  const reportFor = (
+    symbols: EngineState['symbols'],
+    priorSessionMovers?: { symbol: string; price: number; changePct: number }[],
+  ) => generateEodReport({
+    state: makeEngineState({ symbols }),
+    allClosedPositions: [],
+    dailySignals: [],
+    signalTypeMap: new Map(),
+    priorSessionMovers,
+    priorSessionDate: priorSessionMovers ? '2026-07-16' : undefined,
+  });
+
+  it('excludes FLYYQ +33.34%, which the deployed r>=2 rule ranks', () => {
+    // Frozen at $0.02 while changePct fell +100.00% -> +33.34%. The implied prev
+    // close is $0.0150 against a published prior close of $0.0200.
+    const flyyq = row('FLYYQ', 0.02, 33.34);
+    const prior = [{ symbol: 'FLYYQ', price: 0.02, changePct: 100 }];
+
+    // POSITIVE CONTROL — the fixture CONTAINS what the instrument detects, and
+    // the OTHER instrument genuinely does not see it. Without this the test could
+    // pass on a row TRA-2610 already excluded.
+    expect(reportFor([flyyq, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('FLYYQ');
+
+    const report = reportFor([flyyq, ...GENUINE], prior);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('FLYYQ');
+    expect(report.top5Movers[0].symbol).toBe('SOXL');
+    expect(report.markdown).not.toContain('FLYYQ');
+  });
+
+  it('excludes VEEE — a row where ONLY the continuity leg can be doing the work', () => {
+    // ⭐ The FGMC 07-29 row is a bad test for this leg: `isMoveSuspect` re-executes
+    // the ratio rule and r = 2.1066, so TRA-2610 excludes it whatever this check
+    // does. Asserting "FGMC is absent" here would pass with the continuity leg
+    // deleted — a rubber stamp. VEEE is the honest fixture: verbatim from the live
+    // fold (07-15 -> 07-16), the price genuinely MOVED 38.51 -> 36.18, r = 1.3607
+    // passes the ratio rule, and it was ranked #4 in the shipped table. Its implied
+    // prev close is 26.59 against a published prior close of 38.51.
+    const veee = row('VEEE', 36.18, 36.07);
+    expect(isMoveSuspect(veee)).toBe(false);   // the other instrument is genuinely blind here
+
+    // POSITIVE CONTROL — without the prior artifact this row RANKS, so the fixture
+    // contains what the instrument detects.
+    expect(reportFor([veee, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('VEEE');
+
+    const report = reportFor([veee, ...GENUINE], [{ symbol: 'VEEE', price: 38.51, changePct: 54.91 }]);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('VEEE');
+    expect(report.markdown).not.toContain('VEEE');
+  });
+
+  it('and the FGMC 07-29 row is rejected by BOTH legs independently', () => {
+    // Stated as an OR rather than as a continuity-only claim, because that is what
+    // is true: r = 2.1066 already excludes it. What continuity adds on this series
+    // is that the verdict no longer depends on the fabrication happening to exceed
+    // 2x — see the FLYYQ case above, which is the same shape at r = 1.3334.
+    const fgmc = row('FGMC', 8.30, 110.66);
+    expect(isMoveSuspect(fgmc)).toBe(true);
+    const prior = [{ symbol: 'FGMC', price: 8.30, changePct: 69.04276985743381 }];
+    expect(reportFor([fgmc, ...GENUINE], prior).top5Movers.map(m => m.symbol)).not.toContain('FGMC');
+  });
+
+  it('⛔ does NOT recover FGMC day 1 — and the census SAYS the row was ungradeable', () => {
+    // The honest scope of the report boundary, asserted rather than described. On
+    // 07-28 FGMC has no prior observation, so the continuity check abstains and
+    // the r = 1.6904 row is still ranked. A test suite that quietly omitted this
+    // would let a future reader believe the ticket's headline row is now covered.
+    const day1 = row('FGMC', 8.30, 69.04276985743381);
+    const report = reportFor([day1, ...GENUINE], [{ symbol: 'SOXL', price: 109.54, changePct: -3.1 }]);
+    expect(report.top5Movers[0].symbol).toBe('FGMC');
+  });
+
+  it('KNOWN-GOOD — a quiet name printing the same close twice is still ranked', () => {
+    // THE control the ticket named. An identical close means the true session
+    // change is ~0, and a row publishing ~0 is continuous with it. Note this row
+    // would be condemned by "price identical AND changePct materially different".
+    const quiet = row('KMX', 53.66, 0);
+    const report = reportFor([quiet, ...GENUINE], [{ symbol: 'KMX', price: 53.66, changePct: 13.1351 }]);
+    expect(report.top5Movers.map(m => m.symbol)).toContain('KMX');
+  });
+
+  it('KNOWN-GOOD — a genuine mover continuous with our own prior close is still ranked', () => {
+    // VRAX 07-13, verbatim: -35.85% off a published prior close of $6.36, which is
+    // exactly what the implied prev close reproduces. A big move is not a defect.
+    const vrax = row('VRAX', 4.08, -35.85);
+    const report = reportFor([vrax, ...GENUINE], [{ symbol: 'VRAX', price: 6.36, changePct: 100 }]);
+    expect(report.top5Movers.map(m => m.symbol)).toContain('VRAX');
+    expect(report.top5Movers[0].symbol).toBe('VRAX');
+  });
+
+  it('KNOWN-GOOD — a republished (stale) prior row abstains instead of emptying the table', () => {
+    // 189 of 223 archived adjacent-session pairs are republications. Grading them
+    // would fire on 87% of everything — a rubber stamp with an alarm attached, and
+    // the same over-broad failure "exclude everything stale" would have been.
+    const soxl = row('SOXL', 91.99, -16.0215);
+    const report = reportFor([soxl, ...GENUINE.slice(1)],
+      [{ symbol: 'SOXL', price: 91.99, changePct: -16.0215 }]);
+    expect(report.top5Movers.map(m => m.symbol)).toContain('SOXL');
+  });
+
+  it('an absent prior artifact changes nothing — no prior file, no exclusions', () => {
+    // Day 1 of a bucket, a missed 21:00 tick, a weekend gap the caller refused to
+    // bridge: all must degrade to exactly the pre-TRA-2634 behaviour.
+    const flyyq = row('FLYYQ', 0.02, 33.34);
+    expect(reportFor([flyyq, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('FLYYQ');
+    expect(reportFor([flyyq, ...GENUINE], []).top5Movers.map(m => m.symbol)).toContain('FLYYQ');
+  });
+
+  it('leaves an ordinary board untouched even with a full prior table', () => {
+    const prior = [
+      { symbol: 'SOXL', price: 109.54, changePct: -3.1 },
+      { symbol: 'IREN', price: 33.93, changePct: 2.0 },
+      { symbol: 'AXTI', price: 42.76, changePct: -1.0 },
+      { symbol: 'ONDS', price: 7.86, changePct: 4.0 },
+    ];
+    const report = reportFor(GENUINE, prior);
     expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
   });
 });
