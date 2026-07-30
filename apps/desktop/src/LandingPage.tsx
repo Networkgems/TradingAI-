@@ -113,7 +113,7 @@ export default function LandingPage({ onStart, onFeatures, onSignIn }: Props) {
               'Bollinger-Band Fade',
               'Ichimoku Cloud Breakout',
               'SMA-200 Trend Pullback',
-              'Crypto Mean-Reversion',
+              'Crypto DCA (demo)',
             ].map((name) => (
               <span key={name} className="lp-chip">{name}</span>
             ))}

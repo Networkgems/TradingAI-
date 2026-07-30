@@ -3983,6 +3983,34 @@ tr:hover td { background: var(--bg-hover); }
   max-width: 48rem;
 }
 
+/* Crypto demo-evaluation block (TRA-2038 / TRA-2037 §D). Deliberately
+ * SUBORDINATE to the live-strategy table above it: derived from .lp-ft-note,
+ * no accent color and no badge, so it can never read as a live capability.
+ * The "not live" status is carried by the words in the heading, never by color
+ * alone. Both text colors clear WCAG AA on --lp-surface-2 — measured
+ * soft 11.7:1, muted 7.5:1 (AA body text needs 4.5:1). */
+.lp-ft-demo {
+  margin-top: 1.5rem;
+  max-width: 48rem;
+  padding: 0.9rem 1.1rem;
+  border-left: 3px solid var(--lp-border);
+  border-radius: 0 6px 6px 0;
+  background: var(--lp-surface-2);
+}
+.lp-ft-demo-h {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--lp-soft);
+}
+.lp-ft-demo-body {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--lp-muted);
+}
+
 /* ── Responsive ────────────────────────────────────────────────────────── */
 @media (max-width: 860px) {
   .lp-hero { grid-template-columns: 1fr; gap: 2rem; padding-top: 2.5rem; }

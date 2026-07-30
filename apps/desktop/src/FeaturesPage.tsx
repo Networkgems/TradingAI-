@@ -42,16 +42,6 @@ const STRATEGIES: StrategyRow[] = [
     what: 'Buys pullbacks in line with the longer-term 200-day trend.',
     markets: 'Equities',
   },
-  {
-    name: 'Crypto Mean-Reversion',
-    what: 'RSI + Bollinger mean-reversion on crypto in ranging conditions.',
-    markets: 'Crypto',
-  },
-  {
-    name: 'Crypto Perpetual Shorts',
-    what: 'Systematic short exposure on major crypto perpetuals.',
-    markets: 'Coinbase INTX perps · leveraged, real-money',
-  },
 ];
 
 /**
@@ -99,8 +89,9 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
           </h1>
           <p className="lp-subhead">
             A complete, honest rundown of the strategies that trade your account
-            and the controls that keep them in check. If it's listed here, it's
-            live in the product.
+            and the controls that keep them in check. If it's in the live list
+            below, it's running in the product today; anything in demo
+            evaluation is labeled as such.
           </p>
         </section>
 
@@ -108,8 +99,9 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
         <section className="lp-section" aria-labelledby="fp-a">
           <h2 id="fp-a" className="lp-section-h">Trading strategies (live)</h2>
           <p className="lp-section-intro">
-            Seven rules-based strategies run live across equities and crypto.
-            Each one defines its own entries, exits, and risk.
+            Five rules-based strategies run across US equities and stock options.
+            Each one defines its own entries, exits, and risk. Crypto runs a
+            separate demo-evaluation track — see below.
           </p>
           <div className="lp-feature-table" role="table" aria-label="Trading strategies that run live">
             <div className="lp-ft-head" role="row">
@@ -129,6 +121,16 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
             Note on SMA-200: only the pullback variant trades live; the "reclaim"
             signal is informational only.
           </p>
+          <div className="lp-ft-demo">
+            <h3 className="lp-ft-demo-h">Crypto (demo evaluation — not live)</h3>
+            <p className="lp-ft-demo-body">
+              On crypto, TradeAI currently runs a dollar-cost-averaging (DCA)
+              accumulation approach in demo evaluation only — live crypto
+              trading is not currently enabled. Other crypto approaches we have
+              researched (mean-reversion, perpetual shorts) are research-stage
+              and are not running in the product.
+            </p>
+          </div>
         </section>
 
         {/* ── Section B — Risk, sizing & auto-trading ────────────────────── */}
@@ -174,8 +176,9 @@ export default function FeaturesPage({ onStart, onHome, onSignIn }: Props) {
               orders — paper sandbox by default.
             </li>
             <li>
-              <strong>Crypto via Coinbase.</strong> Spot and perpetuals —
-              real-money only, no paper mode.
+              <strong>Crypto via Coinbase.</strong> Runs in demo evaluation
+              today — live crypto trading is not currently enabled; if enabled
+              it is real-money with no paper sandbox.
             </li>
             <li>
               <strong>Live entry &amp; exit signals.</strong> The engine tells
@@ -262,7 +265,9 @@ function FeaturesRiskDisclaimer() {
           credentials.
         </li>
         <li className="lp-risk-item">
-          <strong>Crypto is real-money only</strong> — no paper mode.
+          <strong>Crypto runs in demo evaluation only today</strong>; live crypto
+          trading is not currently enabled (and would be real-money, with no
+          paper sandbox).
         </li>
         <li className="lp-risk-item">
           <strong>Auto-trading is opt-in</strong> and bounded by the daily risk
