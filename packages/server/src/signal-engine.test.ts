@@ -63,7 +63,7 @@ import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-s
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
-import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldBootDisarmLiveCrypto, resolveLiveBrokerArmDrift, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
+import { SignalEngine, sizeLiveEquityFromStop, shortBlockedOnCashAccount, isOccOptionSymbol, liveEquityDcaAddEnvAllowed, gateSignalOnReview, describeGatedStrategies, shouldBootArmLiveEquity, shouldBootArmLiveCrypto, shouldBootDisarmLiveCrypto, resolveLiveBrokerArmDrift, applyLiveBrokerArm, shouldRunRelativeValueScan, shouldRunOtmScan, isLiveBrokerOperator, resolveLiveBrokerOperator, activeOptionsDailyLimit, activeEquityDailyLimit, _resetSharedShadowForTests, _sharedShadowRefreshDue, _claimSharedShadowRefresh, _endSharedShadowRefresh, _sharedShadowEvalDue, _claimSharedShadowEval, shouldRunDecoupledQuoteRefresh, shouldRunDecoupledExitPass, decoupledExitPassDecision, emptyDecoupledExitSkips, DECOUPLED_EXIT_SKIP_REASONS, bucketExitInterval, emptyExitIntervalHistogram, EXIT_INTERVAL_BUCKETS, classifyExitInterval } from './signal-engine.js';
 import { isStockMarketOpen } from '@trading-app/shared'; // TRA-2257
 import { setShadowLedgerFileForTests } from './shadow-signal-ledger.js';
 import { clearDirectionalOpenLedger } from './directional-open-ledger.js';
@@ -4706,6 +4706,86 @@ describe('resolveLiveBrokerArmDrift — TRA-1652 self-healing boot-arm convergen
     delete env['TRADIER_API_TOKEN'];
     delete env['TRADIER_ACCOUNT_ID'];
     expect(resolveLiveBrokerArmDrift(drifted, PIN, env)).toEqual([]);
+  });
+
+  // ── TRA-2649 — the same repair, now runnable on the settings WRITE path ──────
+  //
+  // The defect: TRA-1652's convergence loop only ever ran inside `createUserContext`,
+  // i.e. once per boot. Between boots a settings write carrying `mode:'demo'` demoted
+  // the pinned operator and NOTHING repaired it until the next redeploy. Measured on
+  // bqb1 2026-07-30: the boot-arm converged at 05:38:26Z (persist logged OK) and
+  // request-scoped writes demoted `mode` at 04:49:18Z and 12:36:25Z, leaving
+  // `bootArmEligible:true` + `bootArmDrift:["mode"]` + `optionsBrokerConfigured:false`.
+  describe('applyLiveBrokerArm — TRA-2649 write-path enforcement', () => {
+    it('repairs a post-boot demotion of `mode` — the exact bqb1 regression', () => {
+      const demoted: AccountSettings = { ...armedSettings(), mode: 'demo' };
+      expect(applyLiveBrokerArm(demoted, PIN, prodEnv())).toEqual(['mode']);
+      expect(demoted.mode).toBe('live');
+    });
+
+    it('repairs all three fields together and reports every one it touched', () => {
+      const cold: AccountSettings = {
+        ...DEFAULT_ACCOUNT_SETTINGS,
+        mode: 'demo',
+        liveTradierEnvOptions: 'sandbox',
+        liveTradeEquitiesTradier: false,
+      };
+      expect(applyLiveBrokerArm(cold, PIN, prodEnv()))
+        .toEqual(['mode', 'liveTradierEnvOptions', 'liveTradeEquitiesTradier']);
+      expect(cold.mode).toBe('live');
+      expect(cold.liveTradierEnvOptions).toBe('production');
+      expect(cold.liveTradeEquitiesTradier).toBe(true);
+    });
+
+    it('is a NO-OP on an already-converged operator (idempotent — never rewrites a clean row)', () => {
+      const armed = armedSettings();
+      expect(applyLiveBrokerArm(armed, PIN, prodEnv())).toEqual([]);
+      expect(armed).toEqual(armedSettings());
+    });
+
+    // The scope guards. These are what keep the write-path repair from being a
+    // fleet-wide real-money arm: it must leave every non-operator settings write,
+    // every sandbox service, and the documented kill-switch completely untouched.
+    it('leaves a NON-OPERATOR settings write completely alone (no fleet-wide arm)', () => {
+      const demoted: AccountSettings = { ...armedSettings(), mode: 'demo' };
+      expect(applyLiveBrokerArm(demoted, 'someone-else', prodEnv())).toEqual([]);
+      expect(demoted.mode).toBe('demo');
+    });
+
+    it('leaves a SANDBOX service alone (TRADIER_ENV must be production)', () => {
+      const demoted: AccountSettings = { ...armedSettings(), mode: 'demo' };
+      expect(applyLiveBrokerArm(demoted, PIN, prodEnv({ TRADIER_ENV: 'sandbox' }))).toEqual([]);
+      expect(demoted.mode).toBe('demo');
+    });
+
+    it('the empty-pin kill-switch still wins — it stays the supported de-escalation path', () => {
+      const demoted: AccountSettings = { ...armedSettings(), mode: 'demo' };
+      expect(applyLiveBrokerArm(demoted, PIN, prodEnv({ LIVE_EQUITY_BOOT_USER: '' }))).toEqual([]);
+      expect(demoted.mode).toBe('demo');
+    });
+
+    it('never arms with no broker attached (no resolvable production creds)', () => {
+      const demoted: AccountSettings = { ...armedSettings(), mode: 'demo' };
+      const env = prodEnv();
+      delete env['TRADIER_API_TOKEN'];
+      delete env['TRADIER_ACCOUNT_ID'];
+      expect(applyLiveBrokerArm(demoted, PIN, env)).toEqual([]);
+      expect(demoted.mode).toBe('demo');
+    });
+
+    it('agrees with resolveLiveBrokerArmDrift on every input (one predicate, two callers)', () => {
+      for (const over of [
+        { mode: 'demo' as const },
+        { liveTradierEnvOptions: 'sandbox' as const },
+        { liveTradeEquitiesTradier: false },
+        {},
+      ]) {
+        const a: AccountSettings = { ...armedSettings(), ...over };
+        const b: AccountSettings = { ...armedSettings(), ...over };
+        expect(applyLiveBrokerArm(a, PIN, prodEnv()))
+          .toEqual(resolveLiveBrokerArmDrift(b, PIN, prodEnv()));
+      }
+    });
   });
 });
 

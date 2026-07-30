@@ -6,8 +6,10 @@ import {
   SignalEngine,
   shouldBootArmLiveCrypto,
   shouldBootDisarmLiveCrypto,
-  resolveLiveBrokerArmDrift,
+  shouldBootArmLiveEquity,
+  applyLiveBrokerArm,
 } from './signal-engine.js';
+import type { LiveBrokerArmField } from './signal-engine.js';
 import { CryptoSignalEngine } from './crypto-engine.js';
 import { PnlTracker } from './pnl-tracker.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
@@ -110,6 +112,35 @@ export function setRvScanner(svc: RelativeValueScannerService | undefined): void
 
 export function getAllUserContexts(): UserContext[] {
   return Array.from(contexts.values());
+}
+
+/**
+ * TRA-2649 — what the live-broker boot-arm actually DID for the pinned operator on
+ * this boot. `null` ⇔ the arm never ran for an eligible operator this process, which
+ * on a service where `/api/health/options-live` reports `bootArmEligible:true` means
+ * the context was materialised without `createUserContext` (or has not been built yet).
+ *
+ * This exists because "the arm could not run", "the arm ran but could not persist",
+ * and "the arm ran clean and something rewrote the operator afterwards" all produce
+ * the SAME non-empty `bootArmDrift` on the health route. Telling them apart used to
+ * require Render log access; TRA-2649 was diagnosed exactly that way, and the
+ * distinguishing evidence (a request `traceId` on the demoting write, absent on the
+ * boot write) is not something a probe can see.
+ */
+export interface LiveBrokerBootArmOutcome {
+  username: string;
+  /** ISO timestamp of the boot-arm evaluation for this operator. */
+  ranAt: string;
+  /** Fields the arm repaired this boot ([] ⇔ already converged — a healthy no-op). */
+  repaired: LiveBrokerArmField[];
+  /** Non-null ⇔ the force-persist threw; the engine is Live but disk is not. */
+  persistError: string | null;
+}
+
+let bootArmOutcome: LiveBrokerBootArmOutcome | null = null;
+
+export function getLiveBrokerBootArmOutcome(): LiveBrokerBootArmOutcome | null {
+  return bootArmOutcome;
 }
 
 export function tryGetUserContext(username: string): UserContext | undefined {
@@ -753,26 +784,36 @@ async function createUserContext(username: string): Promise<UserContext> {
   // Re-deriving the drift set every boot means a plain redeploy always restores the
   // ratified arm. Scope is unchanged (operator pin + TRADIER_ENV=production +
   // resolvable prod creds, all inside `shouldBootArmLiveEquity`).
-  const armDrift = resolveLiveBrokerArmDrift(settings, username);
+  // TRA-1411 — the repair also persists the production Tradier env so
+  // `buildTradierLiveEquityClient` constructs the PRODUCTION order client (not sandbox);
+  // that setting is only otherwise reachable via an admin-authed settings PUT, so forcing
+  // it is what lets a plain `git push` actually configure the live-equity broker (board
+  // approval 411c0c5a, previously inert as `liveEquityClientConfigured:false` / 62 signals
+  // / 0 fills). TRA-1482 — and forces `liveTradeEquitiesTradier` ON, since
+  // `buildTradierLiveEquityClient` gates on it independently and a persisted `false`
+  // opt-out left the engine unarmed even in Live (the aabcfc8a regression: 132 skipped
+  // live signals). Both stay inside the unchanged `shouldBootArmLiveEquity` scope.
+  //
+  // TRA-2649 — the three field writes moved into `applyLiveBrokerArm` so the settings
+  // WRITE path can enforce the IDENTICAL repair. Boot-only convergence was not enough:
+  // a post-boot `PUT /api/account/settings` carrying `mode:'demo'` silently demoted the
+  // operator and the arm then stayed inert until the next redeploy. See
+  // `applyLiveBrokerArm` for the Render-log evidence.
+  const armEligible = shouldBootArmLiveEquity(settings, username);
+  const armDrift = applyLiveBrokerArm(settings, username);
+  // TRA-2649 — record the boot outcome so `/api/health/options-live` can distinguish
+  // "the arm could not run / could not persist" from "the arm ran clean and something
+  // rewrote the operator afterwards". Those two produce an IDENTICAL `bootArmDrift`,
+  // and telling them apart previously required a Render log dig.
+  if (armEligible) {
+    bootArmOutcome = {
+      username,
+      ranAt: new Date().toISOString(),
+      repaired: [...armDrift],
+      persistError: null,
+    };
+  }
   if (armDrift.length > 0) {
-    settings.mode = 'live';
-    // TRA-1411 — also persist production Tradier env so buildTradierLiveEquityClient
-    // constructs the PRODUCTION order client (not sandbox). The persisted setting is
-    // only reachable via an admin-authed settings PUT (unreachable on redeploy-only
-    // bqb1), so forcing it here is what lets a plain `git push` actually configure the
-    // live-equity broker — resolving the board-approved arm (411c0c5a) that was inert
-    // as `liveEquityClientConfigured:false` / 62 signals / 0 fills. Scope is unchanged:
-    // shouldBootArmLiveEquity already restricts this to the pinned operator on the prod
-    // (TRADIER_ENV=production) service, so no non-operator / sandbox engine is affected.
-    settings.liveTradierEnvOptions = 'production';
-    // TRA-1482 — also force the live-equity toggle ON. `buildTradierLiveEquityClient`
-    // independently gates on `resolveLiveTradeEquitiesTradier(settings)`, so a persisted
-    // `liveTradeEquitiesTradier:false` opt-out (unreachable to un-set on redeploy-only
-    // bqb1) left the engine unarmed even after this block flipped it to Live — the exact
-    // aabcfc8a regression (liveEquityClientConfigured:false / 132 skipped live signals).
-    // Persisting it true here makes the operator's durable state self-consistent so the
-    // arm survives every redeploy. Same operator/prod-env scope as above.
-    settings.liveTradeEquitiesTradier = true;
     try {
       await saveSettings(username, settings);
       log.info('TRA-713/TRA-1411/TRA-1482/TRA-1652 boot-arm: converged production stocks engine onto the ratified live arm', {
@@ -786,10 +827,20 @@ async function createUserContext(username: string): Promise<UserContext> {
         liveTradeEquitiesTradier: settings.liveTradeEquitiesTradier,
       });
     } catch (err: unknown) {
-      log.warn('TRA-713 boot-arm: failed to persist forced live mode (engine still boots Live in-memory)', {
+      // TRA-2649 — ERROR, not warn. This is a REAL-MONEY arm silently failing to
+      // become durable: the engine boots Live in memory but the persisted operator
+      // stays demoted, so every settings-derived gate (including
+      // `/api/health/options-live`'s `optionsBrokerConfigured`) reads disarmed while
+      // the engine believes otherwise. A `warn` put that divergence in the same bucket
+      // as routine feed noise, which is how it went unnoticed. Also surfaced on the
+      // health route via `bootArmPersistError` so it is readable without log access.
+      const reason = err instanceof Error ? err.message : String(err);
+      log.error('TRA-713/TRA-2649 boot-arm: FAILED to persist the forced live arm (engine boots Live in-memory, persisted state stays demoted)', {
         username,
-        reason: err instanceof Error ? err.message : String(err),
+        repaired: armDrift,
+        reason,
       });
+      if (bootArmOutcome && bootArmOutcome.username === username) bootArmOutcome.persistError = reason;
     }
   }
 

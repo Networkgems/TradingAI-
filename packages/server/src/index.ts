@@ -244,7 +244,7 @@ import { initStateDb, getStateDb, getStateDbStatus } from './sqlite.js'; // TRA-
 import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; // TRA-1681 — fail CLOSED
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
-import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift } from './signal-engine.js';
+import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm } from './signal-engine.js';
 import {
   initNotificationDispatcher,
   emitAlert,
@@ -621,6 +621,7 @@ import {
   destroyUserContext,
   getAllUserContexts,
   tryGetUserContext,
+  getLiveBrokerBootArmOutcome,
   persistStocksNow,
   persistCryptoNow,
   setRvScanner,
@@ -7895,6 +7896,30 @@ app.get('/api/health/options-live', async (_req, res) => {
       serviceTradierEnvRecognized: isRecognizedTradierEnvLabel(process.env['TRADIER_ENV']),
       bootArmEligible: shouldBootArmLiveEquity(settings, operator),
       bootArmDrift: resolveLiveBrokerArmDrift(settings, operator),
+      // TRA-2649 — WHY a non-empty `bootArmDrift` happened. Three very different
+      // failures used to render identically here, and separating them required
+      // Render log access that the board/desk does not have:
+      //
+      //   bootArmRanAt: null            → the arm never evaluated this boot (the
+      //                                   context was materialised without
+      //                                   `createUserContext`, or not built yet).
+      //   bootArmPersistError: non-null → the arm ran and the force-persist THREW.
+      //                                   The engine is Live in memory while disk
+      //                                   stays demoted. Logged at ERROR since TRA-2649.
+      //   both clean + drift non-empty  → the arm ran and CONVERGED, and something
+      //                                   REWROTE the operator afterwards. This is
+      //                                   what bqb1 was actually doing: a request-scoped
+      //                                   `saveSettings` (carrying a `traceId` the boot
+      //                                   write does not) demoted `mode` to `demo` at
+      //                                   04:49:18Z and again at 12:36:25Z on 2026-07-30.
+      //
+      // `bootArmWriteRepairs` counts settings writes re-converged since boot — a
+      // non-zero value names a recurring rewriter directly, with no log dig.
+      bootArmRanAt: getLiveBrokerBootArmOutcome()?.ranAt ?? null,
+      bootArmRepairedAtBoot: getLiveBrokerBootArmOutcome()?.repaired ?? null,
+      bootArmPersistError: getLiveBrokerBootArmOutcome()?.persistError ?? null,
+      bootArmWriteRepairs: liveBrokerArmWriteRepairs,
+      bootArmLastWriteRepairAt: liveBrokerArmLastWriteRepairAt,
       // TRA-1490 / TRA-1491 — DARK strategy arm-flag states so the board/QA can
       // confirm (secrets-free) that the live single-leg option order paths are
       // still OFF. Both default false; arming either is a SEPARATE board approval.
@@ -8674,6 +8699,13 @@ app.put('/api/account/trading-memory', requireAuth, async (req, res, next) => {
   }
 });
 
+// TRA-2649 — how many settings writes have been re-converged onto the ratified
+// live-broker arm since boot, and the last one. Surfaced on
+// `/api/health/options-live` so a recurring rewriter is visible from the probe
+// instead of only from a Render log dig (which is how TRA-2649 had to be found).
+let liveBrokerArmWriteRepairs = 0;
+let liveBrokerArmLastWriteRepairAt: string | null = null;
+
 app.put('/api/account/settings', requireAuth, async (req, res) => {
   const username = res.locals['authUser'] as string;
   const ctx = await userCtx(res);
@@ -8768,6 +8800,37 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   // non-blocking `missingLiveCredentials` warning on the 200 response. A
   // market with its creds filled (Tradier) goes live; markets still missing
   // creds stay dormant and keep nagging through the banner.
+  // TRA-2649 — re-converge the pinned operator onto the board-ratified live-broker
+  // arm BEFORE the promotion gate and the persist, so a settings write can no longer
+  // durably demote it. TRA-1652 already made the arm a convergence loop, but the loop
+  // only ran inside `createUserContext` — once per boot — so between boots a single
+  // PUT carrying `mode:'demo'` disarmed it and nothing repaired that until the next
+  // redeploy. On bqb1 that left `bootArmEligible:true` + `bootArmDrift:["mode"]` +
+  // `optionsBrokerConfigured:false`: the ratified options arm INERT, which is the
+  // exact TRA-1411 / TRA-1482 end-state those tickets each shipped a fix for.
+  //
+  // This introduces NO new end-state. `shouldBootArmLiveEquity` is unchanged, so the
+  // repair is still bounded to the pinned operator on a `TRADIER_ENV=production`
+  // service with resolvable prod creds — and that operator was already being forced
+  // to this exact state on every boot. Only the convergence WINDOW changes (next
+  // redeploy → immediately). The documented kill-switch still wins and is still the
+  // supported de-escalation path: an explicitly empty `LIVE_EQUITY_BOOT_USER=""`
+  // makes the arm ineligible, `repaired` is empty, and this clamps nothing. A
+  // settings PUT was never a durable de-escalation (a redeploy always undid it), so
+  // no working safety lever is removed here — an illusory one is.
+  const armRepaired = applyLiveBrokerArm(updated, username);
+  if (armRepaired.length > 0) {
+    liveBrokerArmWriteRepairs += 1;
+    liveBrokerArmLastWriteRepairAt = new Date().toISOString();
+    log.warn('TRA-2649 live-broker arm: settings write would have DEMOTED the pinned operator off the ratified arm — re-converged', {
+      username,
+      repaired: armRepaired,
+      // Which fields the caller actually sent, so a recurring rewriter can be
+      // identified from its payload shape without logging the payload itself.
+      bodyFields: Object.keys(body ?? {}),
+      writeRepairsSinceBoot: liveBrokerArmWriteRepairs,
+    });
+  }
   const missingLiveCredentials = Array.from(new Set([
     ...validateLiveCredentials(updated).missing,
     ...validateProductionTradierKeys(updated).missing,

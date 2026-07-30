@@ -15094,6 +15094,62 @@ export function resolveLiveBrokerArmDrift(
 }
 
 /**
+ * TRA-2649 — force `settings` onto the ratified live-broker arm IN PLACE, returning
+ * the fields that had drifted (empty ⇔ nothing to do, and `settings` is untouched).
+ *
+ * This is the single writer of the three armed fields, extracted from the boot-arm
+ * block in `user-context.createUserContext` so the SAME repair can run on the
+ * settings WRITE path as well as at boot.
+ *
+ * ── Why the boot-only convergence was not enough (the TRA-2649 defect) ──────────
+ *
+ * TRA-1652 made the arm a convergence loop rather than a one-shot initializer, but
+ * the loop only ever ran inside `createUserContext`, i.e. ONCE PER BOOT. Between
+ * boots there was no enforcement at all, so a single `PUT /api/account/settings`
+ * carrying `mode:'demo'` silently demoted the pinned operator and the arm stayed
+ * inert until the next redeploy. Measured on bqb1 2026-07-30 (Render logs, all
+ * three lines saved on the issue):
+ *
+ *     04:49:18Z  saveSettings: persisted  mode=demo   traceId=34c6bcc4…  ← request
+ *     05:38:26Z  boot-arm: converged …    mode=live   (no traceId)       ← boot
+ *     12:36:25Z  saveSettings: persisted  mode=demo   traceId=b99b8aba…  ← request
+ *
+ * The boot write carries no `traceId`; both demo writes do, which is what proves
+ * they are request-scoped rewrites and NOT a failed boot persist. The 05:38:26Z
+ * line also proves the persist SUCCEEDED, falsifying the "swallowed saveSettings"
+ * hypothesis the issue opened with. Net effect: `bootArmEligible:true` +
+ * `bootArmDrift:["mode"]` + `optionsBrokerConfigured:false` — the board-ratified
+ * options arm inert, which is exactly the TRA-1411 / TRA-1482 end-state.
+ *
+ * ── Scope: NO new end-state, only a faster convergence to the ratified one ──────
+ *
+ * This does not arm anything a redeploy would not already arm. `shouldBootArmLiveEquity`
+ * is unchanged and still bounds every repair to the pinned operator on a service with
+ * `TRADIER_ENV=production` and resolvable prod creds, so the steady state after any
+ * boot is identical to today's. The ONLY thing that changes is the window between a
+ * rewrite and the next boot, which used to leave the arm disarmed indefinitely.
+ *
+ * The documented kill-switch is likewise unchanged and still wins: an explicitly
+ * empty `LIVE_EQUITY_BOOT_USER=""` makes `shouldBootArmLiveEquity` false, this
+ * returns [], and nothing is forced. That remains the supported way to de-escalate
+ * the operator — a settings PUT is not, and never durably was (a redeploy always
+ * undid it), which is why enforcing it at the write path is the honest posture
+ * rather than a new one.
+ */
+export function applyLiveBrokerArm(
+  settings: AccountSettings,
+  username: string,
+  env: NodeJS.ProcessEnv = process.env,
+): LiveBrokerArmField[] {
+  const drift = resolveLiveBrokerArmDrift(settings, username, env);
+  if (drift.length === 0) return drift;
+  settings.mode = 'live';
+  settings.liveTradierEnvOptions = 'production';
+  settings.liveTradeEquitiesTradier = true;
+  return drift;
+}
+
+/**
  * TRA-1340 — decide whether the production crypto engine should boot with LIVE
  * Coinbase auto-trading armed for the pinned operator, so a plain redeploy
  * activates the board-approved live crypto DCA arm WITHOUT an ADMIN_PASSWORD API
