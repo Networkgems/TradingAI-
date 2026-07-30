@@ -332,6 +332,7 @@ export function gradeAc2Delta(engines, since) {
   const cutoff = String(since);
   let rowBookCount = 0;
   const newLag = [];
+  const newFrozen = [];
   // Named, not just counted — a bare count cannot be checked against the pinned
   // cohort, and "N books could have shown one" is exactly the claim that silently
   // gets smaller when a book drops out (see AC2_EXPECTED_GRADEABLE_BOOKS).
@@ -353,22 +354,117 @@ export function gradeAc2Delta(engines, since) {
     if (hits.length > 0) {
       newLag.push({ username: e.username ?? '(unnamed)', mode: e.mode ?? '(unknown)', hits });
     }
+    // TRA-2658 — the FROZEN axis, gated on the SAME delta boundary and for exactly
+    // the same reason the lag axis is. `counterFrozenDates` is an absolute over the
+    // book's whole history, and admin's 07-28/07-29 rows were both written before
+    // `ec05639` landed (2026-07-30T04:10:50Z), so an absolute `counterDurable ===
+    // true` can NEVER go green on that book no matter what ships. A permanently-red
+    // gate is exactly as uninformative as the permanently-green one this ticket was
+    // filed about — the pre-fix rows are the baseline and do not clear
+    // retroactively. Wired here rather than as a separate arm so a single `--since`
+    // moves both axes together and they can never disagree about the boundary.
+    const frozenHits = frozenSessionsForBook(sorted).filter((h) => String(h.date) >= cutoff);
+    if (frozenHits.length > 0) {
+      newFrozen.push({
+        username: e.username ?? '(unnamed)',
+        mode: e.mode ?? '(unknown)',
+        hits: frozenHits,
+      });
+    }
   }
   const gradeableBookCount = gradeableBooks.length;
   const rows = newLag.reduce((n, r) => n + r.hits.length, 0);
   const liveRows = newLag.filter((r) => r.mode === 'live').reduce((n, r) => n + r.hits.length, 0);
-  const verdict = rows > 0 ? 'FAIL' : gradeableBookCount === 0 ? 'BLIND' : 'PASS';
+  const frozenRows = newFrozen.reduce((n, r) => n + r.hits.length, 0);
+  const liveFrozenRows = newFrozen
+    .filter((r) => r.mode === 'live')
+    .reduce((n, r) => n + r.hits.length, 0);
+  // A NEW frozen session is a FAIL on the same footing as a new lag session: both
+  // mean the post-fix writer produced a row whose credit accounting is broken.
+  const verdict =
+    rows > 0 || frozenRows > 0 ? 'FAIL' : gradeableBookCount === 0 ? 'BLIND' : 'PASS';
   return {
     since: cutoff,
     verdict,
     rows,
     liveRows,
+    frozenRows,
+    liveFrozenRows,
+    frozenBooks: newFrozen,
     books: newLag,
     gradeableBookCount,
     gradeableBooks,
     rowBookCount,
     cohort: compareAc2Cohort(gradeableBooks, cutoff),
   };
+}
+
+/**
+ * TRA-2658 — the frozen-counter sessions for ONE book's day list, ascending.
+ *
+ * Extracted so the delta grade and {@link gradeCreditObservation} apply the SAME
+ * predicate. Two copies of an attribution this fiddly is the TRA-2210 "filter at
+ * SOME call sites" shape, and a per-axis disagreement would be invisible: the
+ * credit axis would escalate a book the delta axis passed.
+ *
+ * See {@link gradeCreditObservation} for the pool arithmetic and why both weaker
+ * predicates that preceded it failed a control.
+ */
+/**
+ * TRA-2658 — every material un-booked equity move, INCLUDING the ones no lost
+ * credit can explain. Reported without an accusation so a starting-balance edit
+ * (`PaperAccount.applyEquity`) stays visible rather than being either silently
+ * dropped or wrongly folded into a durability verdict. On the live `admin` book
+ * this is 14 pre-baseline rebases up to $24,000 — none of them counter defects.
+ */
+export function unbookedMovesForBook(days) {
+  const out = [];
+  for (let i = 1; i < days.length; i++) {
+    const cur = days[i];
+    const prev = days[i - 1];
+    if (!Number.isFinite(Number(cur?.closingEquity))) continue;
+    if (!Number.isFinite(Number(prev?.closingEquity))) continue;
+    const curCredit = Number(cur?.optionsCreditedCumulative);
+    const prevCredit = Number(prev?.optionsCreditedCumulative);
+    const creditWindow =
+      Number.isFinite(curCredit) && Number.isFinite(prevCredit) ? curCredit - prevCredit : 0;
+    const stockDaily = Number.isFinite(Number(cur?.stockDaily)) ? Number(cur.stockDaily) : 0;
+    const move =
+      Math.round(
+        ((Number(cur.closingEquity) - Number(prev.closingEquity)) - stockDaily - creditWindow) * 100,
+      ) / 100;
+    if (Math.abs(move) > TOLERANCE_USD) out.push({ date: cur.date, move });
+  }
+  return out;
+}
+
+export function frozenSessionsForBook(days) {
+  const out = [];
+  let pool = 0;
+  for (let i = 0; i < days.length; i++) {
+    const cur = days[i];
+    if (!cur?.belowBaseline) pool += Math.abs(Number(cur?.optionsDaily) || 0);
+    if (i === 0) continue;
+    const prev = days[i - 1];
+    if (!Number.isFinite(Number(cur?.closingEquity))) continue;
+    if (!Number.isFinite(Number(prev?.closingEquity))) continue;
+    const curCredit = Number(cur?.optionsCreditedCumulative);
+    const prevCredit = Number(prev?.optionsCreditedCumulative);
+    const creditWindow =
+      Number.isFinite(curCredit) && Number.isFinite(prevCredit) ? curCredit - prevCredit : 0;
+    const stockDaily = Number.isFinite(Number(cur?.stockDaily)) ? Number(cur.stockDaily) : 0;
+    const move =
+      Math.round(
+        ((Number(cur.closingEquity) - Number(prev.closingEquity)) - stockDaily - creditWindow) * 100,
+      ) / 100;
+    pool -= Math.abs(creditWindow);
+    if (Math.abs(move) <= TOLERANCE_USD) continue;
+    if (Math.abs(creditWindow) > TOLERANCE_USD) continue;
+    if (Math.abs(move) > pool + TOLERANCE_USD) continue;
+    out.push({ date: cur.date, move });
+    pool -= Math.abs(move);
+  }
+  return out;
 }
 
 /**
@@ -750,8 +846,6 @@ export function gradeCreditObservation(payload) {
     // ATTRIBUTION: a starting-balance edit (`PaperAccount.applyEquity`) is also an
     // un-booked move and is NOT a counter defect, so an un-attributable move is
     // reported without an accusation and never folded into the verdict.
-    const frozenDates = [];
-    const unbookedMoveDates = [];
     // THE ATTRIBUTION POOL: realized option P&L that nothing has accounted for.
     //
     //     pool = Σ |optionsDaily| − Σ |recorded credit window| − Σ attributed moves
@@ -764,33 +858,12 @@ export function gradeCreditObservation(payload) {
     // edit on a book that had realized $1,000 and been fully credited. Subtracting
     // what the counter already recorded closes the second: a fully credited book
     // has an EMPTY pool and cannot produce a frozen-counter claim at all.
-    let pool = 0;
-    for (let i = 0; i < days.length; i++) {
-      const cur = days[i];
-      // Pre-baseline P&L was never creditable (no bridge), so it funds nothing.
-      if (!cur?.belowBaseline) pool += Math.abs(Number(cur?.optionsDaily) || 0);
-      if (i === 0) continue;
-      const prev = days[i - 1];
-      if (!Number.isFinite(Number(cur?.closingEquity))) continue;
-      if (!Number.isFinite(Number(prev?.closingEquity))) continue;
-      const curCredit = Number(cur?.optionsCreditedCumulative);
-      const prevCredit = Number(prev?.optionsCreditedCumulative);
-      const creditWindow =
-        Number.isFinite(curCredit) && Number.isFinite(prevCredit) ? curCredit - prevCredit : 0;
-      const stockDaily = Number.isFinite(Number(cur?.stockDaily)) ? Number(cur.stockDaily) : 0;
-      const move =
-        Math.round(
-          ((Number(cur.closingEquity) - Number(prev.closingEquity)) - stockDaily - creditWindow)
-          * 100,
-        ) / 100;
-      pool -= Math.abs(creditWindow);
-      if (Math.abs(move) <= TOLERANCE_USD) continue;
-      unbookedMoveDates.push({ date: cur.date, move });
-      if (Math.abs(creditWindow) > TOLERANCE_USD) continue;
-      if (Math.abs(move) > pool + TOLERANCE_USD) continue;
-      frozenDates.push({ date: cur.date, move });
-      pool -= Math.abs(move);
-    }
+    //
+    // ONE predicate, shared with the AC2 delta grade — see the note on
+    // {@link frozenSessionsForBook}. Two copies of this arithmetic would let the
+    // credit axis escalate a book the delta axis passed, invisibly.
+    const frozenDates = frozenSessionsForBook(days);
+    const unbookedMoveDates = unbookedMovesForBook(days);
     const counterDurable =
       written.length === 0
         ? null
@@ -1486,15 +1559,16 @@ function printAc2(ac2) {
   }
   if (ac2.verdict === 'PASS') {
     console.log(
-      `  PASS — 0 new lag sessions across ${ac2.gradeableBookCount} book(s) that COULD have shown one.`,
+      `  PASS — 0 new lag sessions AND 0 new frozen-counter sessions across`
+      + ` ${ac2.gradeableBookCount} book(s) that COULD have shown one.`,
     );
     console.log('  The pre-fix rows listed above are the baseline and do not clear retroactively.');
     printAc2Cohort(ac2.cohort);
     return;
   }
   console.log(
-    `  FAIL — ${ac2.rows} NEW lag session(s) written under the deployed fix,`
-    + ` over ${ac2.gradeableBookCount} gradeable book(s).`,
+    `  FAIL — ${ac2.rows} NEW lag session(s) and ${ac2.frozenRows ?? 0} NEW frozen-counter`
+    + ` session(s) written under the deployed fix, over ${ac2.gradeableBookCount} gradeable book(s).`,
   );
   for (const row of ac2.books) {
     for (const h of row.hits) {
@@ -1504,7 +1578,19 @@ function printAc2(ac2) {
       );
     }
   }
-  if (ac2.liveRows > 0) {
+  // TRA-2658 — the frozen arm, named the same way. A FAIL that does not say WHICH
+  // axis failed sends the reader to the wrong fix: a lag session means the credit
+  // was re-booked into the stock leg, a frozen session means it was never recorded
+  // at all.
+  for (const row of ac2.frozenBooks ?? []) {
+    for (const h of row.hits) {
+      console.log(
+        `      ${row.mode === 'live' ? 'LIVE ' : 'demo '} ${row.username} ${h.date}`
+        + ` FROZEN counter — $${h.move.toFixed(2)} of equity moved with no credit recorded`,
+      );
+    }
+  }
+  if (ac2.liveRows > 0 || (ac2.liveFrozenRows ?? 0) > 0) {
     console.log('  A mode:live book is among them — TRA-2630\'s demo-only verdict is FALSIFIED.');
   }
   printAc2Cohort(ac2.cohort);
@@ -2327,6 +2413,69 @@ function selftest() {
       return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates };
     })(),
     { counterDurable: false, frozen: [{ date: '2026-07-29', move: 500 }] },
+  );
+
+  // The DELTA boundary on the frozen axis. Without it AC2 can never go green:
+  // admin's frozen sessions are 07-28/07-29, both written before `ec05639` landed
+  // (2026-07-30T04:10:50Z), and `counterFrozenDates` is an absolute over history.
+  // A permanently-red gate is exactly as uninformative as the permanently-green
+  // one this ticket was filed about.
+  const ADMIN_FROZEN_DAYS = [
+    { date: '2026-07-27', stockDaily: 0, optionsDaily: 140, optionsCreditedCumulative: 0, closingEquity: 2008.29 },
+    { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68, optionsCreditedCumulative: 0, closingEquity: 2147.35 },
+    { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01, optionsCreditedCumulative: 0, closingEquity: 2243.48 },
+  ];
+
+  check(
+    'AC2/TRA-2658: the PRE-FIX frozen rows are the baseline and do NOT fail the delta',
+    (() => {
+      const a = gradeAc2Delta(
+        [{ username: 'admin', mode: 'live', days: ADMIN_FROZEN_DAYS }],
+        '2026-07-30',
+      );
+      return { verdict: a.verdict, frozenRows: a.frozenRows };
+    })(),
+    // BLIND, not PASS: no gradeable session on/after the cutoff yet. Absence is
+    // never a pass here — but crucially it is not a FAIL off history either.
+    { verdict: 'BLIND', frozenRows: 0 },
+  );
+
+  check(
+    'AC2/TRA-2658: a NEW frozen session written under the deployed fix is a FAIL',
+    (() => {
+      const a = gradeAc2Delta(
+        [{ username: 'admin', mode: 'live', days: [
+          ...ADMIN_FROZEN_DAYS,
+          // 07-30 closes with equity up 204.01 and the counter still recording 0.
+          // 204.01 is what the pool can actually fund: of the 458.01 realized
+          // 07-27..07-29, 254.00 was already attributed to the 07-28/07-29 freezes,
+          // leaving 204.01 of 07-29's 250.01 still uncredited. A larger figure would
+          // be an arithmetically impossible credit and the pool correctly refuses it.
+          { date: '2026-07-30', stockDaily: 0, optionsDaily: 10, optionsCreditedCumulative: 0, closingEquity: 2447.49 },
+        ] }],
+        '2026-07-30',
+      );
+      return { verdict: a.verdict, frozenRows: a.frozenRows, liveFrozenRows: a.liveFrozenRows };
+    })(),
+    { verdict: 'FAIL', frozenRows: 1, liveFrozenRows: 1 },
+  );
+
+  check(
+    'AC2/TRA-2658: a post-fix session that RECORDS its credit passes the delta',
+    (() => {
+      const a = gradeAc2Delta(
+        [{ username: 'admin', mode: 'live', days: [
+          ...ADMIN_FROZEN_DAYS,
+          // The fixed writer: the SAME +204.01 of equity as the FAIL arm above, and
+          // the counter records exactly it. Identical money, opposite verdict — that
+          // is the discrimination this axis exists to make.
+          { date: '2026-07-30', stockDaily: 0, optionsDaily: 10, optionsCreditedCumulative: 204.01, closingEquity: 2447.49 },
+        ] }],
+        '2026-07-30',
+      );
+      return { verdict: a.verdict, frozenRows: a.frozenRows };
+    })(),
+    { verdict: 'PASS', frozenRows: 0 },
   );
 
   check(
