@@ -26,6 +26,9 @@
     "check:strands:controls": "node scripts/check-blocked-empty.mjs --selftest",
     "check:phantom-rest": "node scripts/check-phantom-rest.mjs",
     "check:phantom-rest:controls": "node scripts/check-phantom-rest.mjs --selftest",
+    "//check:data-dir": "TRA-2603 — frozen-baseline ratchet on the unguarded `process.env.DATA_DIR ?? join(__dirname,'..','data')` literal. `??` does not guard a present-but-BLANK value; resolveDataDir() adds the .trim(). Baseline is 38 known copies (the TRA-2428 migration backlog) and is HAND-EDITED ONLY — never regenerate it from the tree. Exit 1 drift / 2 instrument broken / 3 blind.",
+    "check:data-dir": "node scripts/check-data-dir.mjs",
+    "check:data-dir:controls": "node scripts/check-data-dir.mjs --selftest",
     "check:tra2361-prover": "node scripts/tra2372-monotonicity-prover-controls.mjs",
     "check:boot-set": "node --test scripts/lib/render-boot-set.test.mjs",
     "check:auth-secret-predicate": "node --test scripts/lib/auth-secret-predicate.test.mjs",
@@ -39,7 +42,7 @@
     "//check:pnl-lag": "TRA-2630 AC3 — the T+1 options-credit lag regression guard (TRA-2629). Live-pull only: the defect is a DURABILITY seam, so an in-memory round trip passes while prod is broken. Partitions mode:live (exit 1, escalate) from demo (exit 2) and fails CLOSED to BLIND (exit 3) rather than reporting a green it could not measure.",
     "check:pnl-lag": "node scripts/check-pnl-options-lag.mjs",
     "check:pnl-lag:controls": "node scripts/check-pnl-options-lag.mjs --selftest",
-    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
+    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-data-dir.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },
   "devDependencies": {

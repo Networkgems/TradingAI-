@@ -1,0 +1,653 @@
+#!/usr/bin/env node
+// TRA-2603 — fail loudly when a new copy of the unguarded DATA_DIR resolver appears.
+//
+// THE HAZARD
+// ----------
+// The canonical way to resolve the persistence root is `resolveDataDir()` in
+// `packages/server/src/data-dir.ts` (TRA-522 / TRA-1681). The hazard is the inlined
+// literal it replaced:
+//
+//     process.env.DATA_DIR ?? join(__dirname, '..', 'data')
+//
+// `??` only guards null/undefined. A present-but-BLANK `DATA_DIR` (`''`, `' '`) is
+// truthy, so the literal takes the env branch and resolves to a path relative to the
+// launch cwd — often a directory literally named `" "`. `resolveDataDir()` additionally
+// requires `.trim()`, which is the entire difference.
+//
+// Blank-but-present is not hypothetical: bqb1 has reached it twice
+// (TRA-2136 / TRA-2193 / TRA-2195). And it fails SILENTLY — `mkdirSync` succeeds,
+// `writeFileSync` succeeds, the read-back succeeds, and the data evaporates on the
+// next redeploy. There is no error to catch; the only way to know is to look at the
+// PATH. That is why this is a guard and not a review item.
+//
+// WHY A GUARD AND NOT A REVIEW
+// ----------------------------
+// TRA-2428 asked for "the third copy" to be fixed. The measured count was 39, across
+// 38 files. A review that catches copy #40 is not a guard — 39 got in past reviews.
+// TRA-2603 converted `tick-sweep-budget.ts` (copy #39 -> 38 remain) and shipped this.
+//
+// The 38 survivors are a FROZEN BASELINE, checked in below with per-file counts. The
+// migration of those 38 is TRA-2428's other child, deliberately sequenced AFTER this
+// guard so it runs with a failing state instead of without one.
+//
+// FIVE WAYS THIS GUARD COULD READ GREEN WHILE BROKEN — each is handled and each has a
+// control in `--selftest`. (The ticket named four; the fifth, `--untracked`, was found
+// by CONTROL 2 reading CLEAN against a real planted file.)
+//
+//   1. `-a` / `--text` IS MANDATORY. `external-intel.ts` contains a NUL byte, so git
+//      classifies it as binary: plain `git grep -n` prints `Binary file ... matches`
+//      with NO line numbers, and `rg` skips it by default. A line-oriented parse
+//      therefore drops 2 of the 38 SILENTLY. (The parent ticket's own prescribed
+//      `rg 'process\.env(\.|\[.)DATA_DIR'` undercounts for exactly this reason.) This
+//      script passes `-a`, asserts the FILE SET as well as the line list, and exits
+//      non-zero if any `Binary file` line survives into the parse.
+//
+//   2. FROZEN BASELINE, ONE-WAY RATCHET. A new copy fails. A REMOVED copy also fails,
+//      until the baseline is edited down by hand. The baseline is NEVER regenerated
+//      from the current tree — a self-rewriting recorder lets the worst run win
+//      (TRA-2519). There is deliberately no `--fix` / `--update` flag.
+//
+//   3. VACUITY GUARD. If the pattern matches ZERO sites repo-wide, exit non-zero. A
+//      renamed env var or a regex typo must not read as "all clean".
+//
+//   4. COMMENT vs CODE vs REPORT-READ. Three kinds of hit are NOT defects:
+//      comment-only mentions, and "report-style" bare reads that answer *what did the
+//      operator set* (a legitimately different question from *resolve a root*). These
+//      are exempted by EXPLICIT NAMED ENTRY — exact source text, an expected count,
+//      and a one-line reason — never by a broad regex that would also hide a real
+//      copy. Exempting by text+count means a NEW line that happens to look like an
+//      existing exempt line still fails, because it pushes the count over.
+//
+//   5. `git grep` IS INDEX-SCOPED. Without `--untracked` a new, not-yet-staged file is
+//      invisible — so the developer who just wrote copy #39 gets a green check. This is
+//      the single most likely way this guard would have failed in practice, and it was
+//      not in the ticket's list of four.
+//
+// Exempt entries are matched on exact trimmed source text, NOT line number: the parent
+// ticket cited `tick-sweep-budget.ts:99` when the line was actually `:111`, so line
+// numbers are known to drift. A reflowed comment will therefore fail this check and
+// require a hand edit to the baseline — that is the ratchet working, not a bug.
+//
+// Usage:
+//   node scripts/check-data-dir.mjs             # report + exit non-zero on drift
+//   node scripts/check-data-dir.mjs --selftest  # both-direction controls
+//
+// Exit codes:
+//   0  CLEAN     — sweep matches the frozen baseline exactly
+//   1  DRIFT     — a new copy, a removed copy, a new file, or a stale exemption
+//   2  BROKEN    — the instrument itself is untrustworthy (vacuous pattern, or a
+//                  binary-classified file whose lines were dropped)
+//   3  BLIND     — `git grep` could not be run at all
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SCOPE = 'packages/server/src';
+
+/**
+ * The three spellings of the env read. Kept as one alternation so a hit is a hit
+ * regardless of dot- vs bracket-access and quote style.
+ */
+const PATTERN = "process\\.env(\\.DATA_DIR|\\['DATA_DIR'\\]|\\[\"DATA_DIR\"\\])";
+
+const EXIT = { CLEAN: 0, DRIFT: 1, BROKEN: 2, BLIND: 3 };
+
+/** Reasons, spelled once so the baseline stays readable. */
+const R = {
+  COMMENT: 'comment-only mention of the literal; no code path',
+  REPORT:
+    'report-style bare read — answers "what did the operator SET", not "resolve a root"; ' +
+    'substituting resolveDataDir() here would change the meaning',
+};
+
+/**
+ * FROZEN BASELINE — measured at bb7cdc4 + the TRA-2603 conversion.
+ *
+ * 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads.
+ *
+ * `copies` is the number of UNGUARDED RESOLVER COPIES the file is known to still
+ * carry. `exempt` names every non-defect hit by exact trimmed text.
+ *
+ * DO NOT REGENERATE THIS FROM THE TREE. Edit it by hand, in the same commit as the
+ * change that moves a number, so the diff shows a human agreed.
+ */
+const BASELINE = {
+  // ── Files carrying ONLY unguarded copies (the TRA-2428 migration backlog) ──
+  'account-settings.ts': { copies: 1 },
+  'analyst-agent.ts': { copies: 1 },
+  'anthropic-cred-store.ts': { copies: 1 },
+  'earnings-store.ts': { copies: 1 },
+  // The NUL-byte file. Two copies, and the reason `-a` is mandatory.
+  'external-intel.ts': { copies: 2 },
+  'hypothesis-pipeline.ts': { copies: 1 },
+  'iv-rank-store.ts': { copies: 1 },
+  'learned-weights-history.ts': { copies: 1 },
+  'live-canary-ledger.ts': { copies: 1 },
+  'macro-store.ts': { copies: 1 },
+  'market-review-enrichment.ts': { copies: 1 },
+  'market-review.ts': { copies: 1 },
+  'news-catalyst-lean-ledger.ts': { copies: 1 },
+  'news-catalyst-ledger.ts': { copies: 1 },
+  'news-catalyst-run-ledger.ts': { copies: 1 },
+  'oi-shadow-ledger.ts': { copies: 1 },
+  'option-maker-fill-ledger.ts': { copies: 1 },
+  'option-maker-shadow.ts': { copies: 1 },
+  'option-shadow-ledger.ts': { copies: 1 },
+  'option-trade-journal.ts': { copies: 1 },
+  'options-forward-test.ts': { copies: 1 },
+  'options-idea-journal.ts': { copies: 1 },
+  'orb-options-shadow-ledger.ts': { copies: 1 },
+  'pcr-shadow-ledger.ts': { copies: 1 },
+  'pcs-shadow-ledger.ts': { copies: 1 },
+  'pre-trade-gate-ledger.ts': { copies: 1 },
+  'pre-trade-liquidity-ledger.ts': { copies: 1 },
+  'promotion-store.ts': { copies: 1 },
+  'research-store.ts': { copies: 1 },
+  'reversal-shadow-ledger.ts': { copies: 1 },
+  'routines/routine-store.ts': { copies: 1 },
+  'shadow-signal-ledger.ts': { copies: 1 },
+  'user-context.ts': { copies: 1 },
+  'user-trading-memory-store.ts': { copies: 1 },
+  'users.ts': { copies: 1 },
+  'watchlist-store.ts': { copies: 1 },
+
+  // ── Mixed: a real copy PLUS an exempt hit in the same file ──
+  'index.ts': {
+    copies: 1, // :694 — the main server bundle's own root
+    exempt: [
+      { text: "dataDirEnv: process.env['DATA_DIR'] ?? null,", count: 1, reason: R.REPORT },
+    ],
+  },
+
+  // ── Exempt-only: 0 copies. Present in the baseline so the FILE SET is asserted. ──
+  'data-dir.ts': {
+    copies: 0,
+    exempt: [
+      {
+        text: "* pinned to `process.env.DATA_DIR`, and the fallback anchors to the *module's*",
+        count: 1,
+        reason: `${R.COMMENT} (the TRA-522 root-cause narrative)`,
+      },
+      {
+        text: "* `process.env.DATA_DIR ?? join(__dirname, '..', 'data')`). That fallback is a real,",
+        count: 1,
+        reason: `${R.COMMENT} (documents the very literal this guard bans)`,
+      },
+    ],
+  },
+  'engine-scorecard.ts': {
+    copies: 0,
+    exempt: [{ text: "const dataDir = process.env['DATA_DIR'];", count: 1, reason: R.REPORT }],
+  },
+  'giveback-arm-floor-ledger.ts': {
+    copies: 0,
+    exempt: [
+      {
+        text: "// build bundle (`index.ts`: `process.env.DATA_DIR ?? join(__dirname,'..','data')`) —",
+        count: 1,
+        reason: R.COMMENT,
+      },
+      {
+        text: '* Mirrors `SignalEngine.resolveDemoFlagEnv()` EXACTLY (`process.env.DATA_DIR` — not this',
+        count: 1,
+        reason: R.COMMENT,
+      },
+      {
+        text: 'const dir = process.env.DATA_DIR;',
+        count: 1,
+        reason: `${R.REPORT} — deliberately mirrors resolveDemoFlagEnv(), see the comment above it`,
+      },
+    ],
+  },
+  'live-options-fee-slippage-ledger.ts': {
+    copies: 0,
+    exempt: [
+      {
+        text: "// build bundle (`index.ts`: `process.env.DATA_DIR ?? join(__dirname,'..','data')`)",
+        count: 1,
+        reason: R.COMMENT,
+      },
+    ],
+  },
+  'observability/health-routes.ts': {
+    copies: 0,
+    exempt: [
+      // 12 report-reads. The health surfaces exist to tell an operator what the box
+      // actually has set — resolving a root here would hide the very drift they report.
+      { text: 'const dir = process.env.DATA_DIR;', count: 10, reason: R.REPORT },
+      { text: 'const dataDir = process.env.DATA_DIR ?? null;', count: 1, reason: R.REPORT },
+      { text: 'const sebDir = process.env.DATA_DIR;', count: 1, reason: R.REPORT },
+      {
+        text: '// actually appended to. `process.env.DATA_DIR` is what the operator *set*, and on a',
+        count: 1,
+        reason: R.COMMENT,
+      },
+    ],
+  },
+  'observability/logger.ts': {
+    copies: 0,
+    exempt: [
+      {
+        text: "process.env['LOG_DIR'] ?? join(process.env['DATA_DIR'] ?? process.cwd(), 'logs');",
+        count: 1,
+        reason: `${R.REPORT} — falls back to cwd, not an in-bundle path; a different predicate`,
+      },
+    ],
+  },
+  'signal-engine.ts': {
+    copies: 0,
+    exempt: [{ text: 'const dir = process.env.DATA_DIR;', count: 1, reason: R.REPORT }],
+  },
+};
+
+/** Sum of `copies` across the baseline — the number the ticket records. */
+function baselineCopyTotal() {
+  return Object.values(BASELINE).reduce((n, e) => n + e.copies, 0);
+}
+
+/* ================================================================== */
+/*  Sweep                                                              */
+/* ================================================================== */
+
+/**
+ * Run the real sweep. `-a` is not optional — see hazard (1).
+ *
+ * Returns `{ records, binaryFiles, ok }`. `records` is `{file, line, text}[]` with
+ * `file` relative to SCOPE. `binaryFiles` is what a NON-`-a` run classified as binary,
+ * carried through only so the selftest can prove `-a` is load-bearing.
+ */
+function sweep({ pattern = PATTERN, textFlag = true } = {}) {
+  // `--untracked` is hazard (5): git grep is INDEX-scoped by default, so a brand-new
+  // unstaged file carrying a fresh copy is invisible to it. That is exactly the moment
+  // this guard exists for — the developer who just wrote copy #39. Found by CONTROL 2,
+  // which read CLEAN against a planted file until this flag was added.
+  const args = [
+    'grep',
+    '-n',
+    '--untracked',
+    ...(textFlag ? ['-a'] : []),
+    '-E',
+    pattern,
+    '--',
+    SCOPE,
+    ':!*.test.ts',
+  ];
+  let out;
+  try {
+    out = execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+  } catch (err) {
+    // git grep exits 1 on "no matches". That is the VACUITY case, not a failure to run.
+    if (err && err.status === 1 && typeof err.stdout === 'string') out = err.stdout;
+    else return { ok: false, reason: err?.message ?? String(err), records: [], binaryFiles: [] };
+  }
+
+  const records = [];
+  const binaryFiles = [];
+  const prefix = `${SCOPE}/`;
+  for (const raw of out.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.trim()) continue;
+    const bin = /^Binary file (.+) matches$/.exec(line);
+    if (bin) {
+      binaryFiles.push(bin[1].startsWith(prefix) ? bin[1].slice(prefix.length) : bin[1]);
+      continue;
+    }
+    const m = /^(.*?):(\d+):(.*)$/.exec(line);
+    if (!m) continue;
+    const file = m[1].startsWith(prefix) ? m[1].slice(prefix.length) : m[1];
+    records.push({ file, line: Number(m[2]), text: m[3].trim() });
+  }
+  return { ok: true, records, binaryFiles };
+}
+
+/* ================================================================== */
+/*  Classify + compare                                                 */
+/* ================================================================== */
+
+/**
+ * Compare a record set against the frozen baseline.
+ *
+ * Pure — takes records, returns a verdict. The selftest drives it with synthetic
+ * record sets so every failure branch is reachable without mutating the tree.
+ */
+function classify(records) {
+  const findings = [];
+  const byFile = new Map();
+  for (const r of records) {
+    if (!byFile.has(r.file)) byFile.set(r.file, []);
+    byFile.get(r.file).push(r);
+  }
+
+  // (3) VACUITY — zero hits repo-wide means the instrument, not the tree, is clean.
+  if (records.length === 0) {
+    return {
+      verdict: 'BROKEN',
+      findings: [
+        {
+          cls: 'VACUOUS',
+          msg:
+            'the pattern matched ZERO sites repo-wide. A renamed env var or a regex typo reads ' +
+            'exactly like "all clean" — refusing to report green.',
+        },
+      ],
+      copies: 0,
+    };
+  }
+
+  // (1) FILE SET, asserted in both directions — not just the line list.
+  const seenFiles = new Set(byFile.keys());
+  const baseFiles = new Set(Object.keys(BASELINE));
+  for (const f of [...seenFiles].sort()) {
+    if (!baseFiles.has(f)) {
+      findings.push({
+        cls: 'NEW_FILE',
+        file: f,
+        msg:
+          `${f} reads DATA_DIR but is not in the baseline. If this is a new unguarded copy, ` +
+          'use resolveDataDir() from ./data-dir.js instead. If it is a legitimate report-read ' +
+          'or a comment, add an explicit exempt entry with a reason.',
+      });
+    }
+  }
+  for (const f of [...baseFiles].sort()) {
+    if (!seenFiles.has(f)) {
+      findings.push({
+        cls: 'FILE_GONE',
+        file: f,
+        msg:
+          `${f} is in the baseline but no longer matches. If you removed its copy, edit the ` +
+          'baseline down BY HAND in this commit (the ratchet is one-way on purpose).',
+      });
+    }
+  }
+
+  // (4) + (2) Per-file: exempt by explicit text+count, everything else is a copy.
+  let copyTotal = 0;
+  for (const [file, hits] of [...byFile.entries()].sort()) {
+    const entry = BASELINE[file];
+    if (!entry) {
+      copyTotal += hits.length;
+      continue; // already reported as NEW_FILE
+    }
+    const budget = (entry.exempt ?? []).map((e) => ({ ...e, left: e.count }));
+    const copies = [];
+    for (const h of hits) {
+      const slot = budget.find((b) => b.text === h.text && b.left > 0);
+      if (slot) slot.left -= 1;
+      else copies.push(h);
+    }
+
+    for (const b of budget) {
+      if (b.left > 0) {
+        findings.push({
+          cls: 'STALE_EXEMPTION',
+          file,
+          msg:
+            `${file}: exempt entry is stale — expected ${b.count}x but found ${b.count - b.left}x ` +
+            `of: ${b.text}`,
+        });
+      }
+    }
+
+    copyTotal += copies.length;
+    if (copies.length !== entry.copies) {
+      const dir = copies.length > entry.copies ? 'NEW_COPY' : 'COPY_REMOVED';
+      findings.push({
+        cls: dir,
+        file,
+        msg:
+          `${file}: expected ${entry.copies} unguarded cop${entry.copies === 1 ? 'y' : 'ies'}, ` +
+          `found ${copies.length}` +
+          (dir === 'NEW_COPY'
+            ? ' — a new copy of the unguarded resolver. Use resolveDataDir() from ./data-dir.js.'
+            : ' — a copy was removed; edit the baseline down BY HAND in this commit.'),
+        lines: copies.map((c) => `${c.line}: ${c.text}`),
+      });
+    }
+  }
+
+  return { verdict: findings.length ? 'DRIFT' : 'CLEAN', findings, copies: copyTotal };
+}
+
+/* ================================================================== */
+/*  Report                                                             */
+/* ================================================================== */
+
+function report(res, { binaryFiles = [], records = [] } = {}) {
+  const lines = [];
+  lines.push(`[check:data-dir] scope ${SCOPE}  hits ${records.length}  copies ${res.copies}`);
+  if (binaryFiles.length) {
+    lines.push(
+      `[check:data-dir] -a is load-bearing: ${binaryFiles.join(', ')} ` +
+        'is binary-classified (NUL byte); a non-`-a` run drops its lines with no line numbers.',
+    );
+  }
+  for (const f of res.findings) {
+    lines.push(`  ${f.cls.padEnd(16)} ${f.msg}`);
+    for (const l of f.lines ?? []) lines.push(`                   ${l}`);
+  }
+  if (res.verdict === 'CLEAN') {
+    lines.push(
+      `[check:data-dir] CLEAN — ${res.copies} known unguarded copies, matching the frozen baseline ` +
+        `(${baselineCopyTotal()}). Migration backlog: TRA-2428.`,
+    );
+  } else {
+    lines.push(`[check:data-dir] ${res.verdict} — ${res.findings.length} finding(s)`);
+  }
+  return lines;
+}
+
+/* ================================================================== */
+/*  Selftest — controls in BOTH directions                             */
+/* ================================================================== */
+
+/** A synthetic record set that exactly satisfies the baseline. */
+function baselineRecords() {
+  const out = [];
+  let n = 1;
+  for (const [file, e] of Object.entries(BASELINE)) {
+    for (let i = 0; i < e.copies; i += 1) {
+      out.push({ file, line: n++, text: "const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');" });
+    }
+    for (const ex of e.exempt ?? []) {
+      for (let i = 0; i < ex.count; i += 1) out.push({ file, line: n++, text: ex.text });
+    }
+  }
+  return out;
+}
+
+const PLANT_REL = '__tra2603-planted-copy.ts';
+const PLANT_ABS = join(REPO_ROOT, SCOPE, PLANT_REL);
+
+async function selftest() {
+  let pass = 0;
+  const total = 9; // 8 numbered controls + the 2b cleanup assertion
+  const seen = new Set();
+  const ok = (name) => {
+    console.log(`ok    ${name}`);
+    pass += 1;
+  };
+  const fail = (name, detail) => console.log(`FAIL  ${name}\n        ${detail}`);
+
+  // ── CONTROL 1 — the real tree, real git grep, must be CLEAN. ──
+  const live = sweep();
+  if (!live.ok) {
+    fail('CONTROL 1 baseline is CLEAN on the real tree', `git grep failed: ${live.reason}`);
+  } else {
+    const r = classify(live.records);
+    seen.add(r.verdict);
+    if (r.verdict === 'CLEAN' && r.copies === baselineCopyTotal()) {
+      ok(`CONTROL 1 baseline is CLEAN on the real tree (${r.copies} copies, ${live.records.length} hits)`);
+    } else {
+      fail(
+        'CONTROL 1 baseline is CLEAN on the real tree',
+        `${r.verdict}, copies ${r.copies} vs baseline ${baselineCopyTotal()}\n        ` +
+          r.findings.map((f) => f.msg).join('\n        '),
+      );
+    }
+  }
+
+  // ── CONTROL 2 — a REAL planted copy on disk must FAIL, end to end. ──
+  // The strongest control available: the actual git grep, over an actual new file.
+  if (existsSync(PLANT_ABS)) {
+    fail('CONTROL 2 planted copy on disk FAILS', `${PLANT_REL} already exists; refusing to clobber`);
+  } else {
+    try {
+      writeFileSync(
+        PLANT_ABS,
+        '// TRA-2603 selftest scratch file. If this is committed, the guard control leaked.\n' +
+          "import { join } from 'node:path';\n" +
+          "const root = process.env.DATA_DIR ?? join(__dirname, '..', 'data');\n" +
+          'export const planted = root;\n',
+        'utf8',
+      );
+      const planted = sweep();
+      const r = planted.ok ? classify(planted.records) : { verdict: 'BLIND', findings: [] };
+      seen.add(r.verdict);
+      const hit = r.findings.find((f) => f.cls === 'NEW_FILE' && f.file === PLANT_REL);
+      if (r.verdict === 'DRIFT' && hit) ok('CONTROL 2 planted copy on disk FAILS (real git grep, NEW_FILE)');
+      else fail('CONTROL 2 planted copy on disk FAILS', `verdict ${r.verdict}, no NEW_FILE for ${PLANT_REL}`);
+    } finally {
+      rmSync(PLANT_ABS, { force: true });
+    }
+  }
+  if (existsSync(PLANT_ABS)) {
+    fail('CONTROL 2b plant is cleaned up', `${PLANT_REL} survived — DELETE IT BY HAND`);
+  } else {
+    ok('CONTROL 2b plant is cleaned up');
+  }
+
+  // ── CONTROL 3 — a zeroed pattern must be BROKEN, never CLEAN. ──
+  const zeroed = sweep({ pattern: 'ZZ_NO_SUCH_ENV_VAR_TRA2603_ZZ' });
+  const rz = zeroed.ok ? classify(zeroed.records) : { verdict: 'BLIND', findings: [] };
+  seen.add(rz.verdict);
+  if (rz.verdict === 'BROKEN' && rz.findings.some((f) => f.cls === 'VACUOUS')) {
+    ok('CONTROL 3 zeroed pattern is BROKEN, not CLEAN (vacuity guard)');
+  } else {
+    fail('CONTROL 3 zeroed pattern is BROKEN, not CLEAN', `verdict ${rz.verdict}`);
+  }
+
+  // ── CONTROL 4 — `-a` is load-bearing: prove the non-`-a` run undercounts. ──
+  const noText = sweep({ textFlag: false });
+  const aHits = (live.records ?? []).filter((r) => r.file === 'external-intel.ts').length;
+  const bHits = (noText.records ?? []).filter((r) => r.file === 'external-intel.ts').length;
+  if (aHits === 2 && bHits === 0 && noText.binaryFiles.includes('external-intel.ts')) {
+    ok(`CONTROL 4 -a is load-bearing (external-intel.ts: ${aHits} lines with -a, ${bHits} without)`);
+  } else {
+    fail(
+      'CONTROL 4 -a is load-bearing',
+      `with -a ${aHits} lines, without ${bHits}, binaryFiles=[${noText.binaryFiles.join(',')}] ` +
+        '(if the NUL byte was removed from external-intel.ts, this control needs a new carrier)',
+    );
+  }
+
+  // ── CONTROL 5 — a NEW copy inside an ALREADY-EXEMPTED file must FAIL. ──
+  // Hazard (4): exemptions must not blanket a file.
+  const inExempt = [
+    ...baselineRecords(),
+    {
+      file: 'observability/health-routes.ts',
+      line: 99999,
+      text: "const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');",
+    },
+  ];
+  const r5 = classify(inExempt);
+  if (r5.verdict === 'DRIFT' && r5.findings.some((f) => f.cls === 'NEW_COPY')) {
+    ok('CONTROL 5 a new copy inside an already-exempted file FAILS (exemptions do not blanket)');
+  } else {
+    fail('CONTROL 5 a new copy inside an already-exempted file FAILS', `verdict ${r5.verdict}`);
+  }
+
+  // ── CONTROL 6 — an extra line matching an EXEMPT text must FAIL on count. ──
+  const overBudget = [
+    ...baselineRecords(),
+    { file: 'observability/health-routes.ts', line: 99998, text: 'const dir = process.env.DATA_DIR;' },
+  ];
+  const r6 = classify(overBudget);
+  if (r6.verdict === 'DRIFT' && r6.findings.some((f) => f.cls === 'NEW_COPY')) {
+    ok('CONTROL 6 an 11th `const dir = process.env.DATA_DIR;` exceeds its exempt count and FAILS');
+  } else {
+    fail('CONTROL 6 an extra exempt-shaped line FAILS on count', `verdict ${r6.verdict}`);
+  }
+
+  // ── CONTROL 7 — one-way ratchet: a REMOVED copy must also FAIL. ──
+  const base = baselineRecords();
+  const dropIdx = base.findIndex((r) => r.file === 'watchlist-store.ts');
+  const removed = base.filter((_, i) => i !== dropIdx);
+  const r7 = classify(removed);
+  if (r7.verdict === 'DRIFT' && r7.findings.some((f) => f.cls === 'FILE_GONE' || f.cls === 'COPY_REMOVED')) {
+    ok('CONTROL 7 a REMOVED copy also FAILS until the baseline is edited by hand (one-way ratchet)');
+  } else {
+    fail('CONTROL 7 a REMOVED copy also FAILS', `verdict ${r7.verdict}`);
+  }
+
+  // ── CONTROL 8 — NOT a self-rewriting recorder. ──
+  // Hazard (2), tested behaviourally rather than asserted in prose: plant a copy, run
+  // the REAL sweep twice, and require DRIFT BOTH times with this script unchanged on
+  // disk. A recorder that regenerated its baseline would go green on the second run
+  // (TRA-2519 — a rewriting recorder lets the worst run win).
+  const selfPath = fileURLToPath(import.meta.url);
+  const before = readFileSync(selfPath, 'utf8');
+  let verdicts = [];
+  if (existsSync(PLANT_ABS)) {
+    fail('CONTROL 8 not a self-rewriting recorder', `${PLANT_REL} already exists; refusing to clobber`);
+  } else {
+    try {
+      writeFileSync(PLANT_ABS, "const root = process.env.DATA_DIR ?? join(__dirname, '..', 'data');\n", 'utf8');
+      for (let i = 0; i < 2; i += 1) {
+        const s = sweep();
+        verdicts.push(s.ok ? classify(s.records).verdict : 'BLIND');
+      }
+    } finally {
+      rmSync(PLANT_ABS, { force: true });
+    }
+    const after = readFileSync(selfPath, 'utf8');
+    if (verdicts.join(',') === 'DRIFT,DRIFT' && after === before) {
+      ok('CONTROL 8 not a self-rewriting recorder (DRIFT on run 1 AND run 2; script unchanged on disk)');
+    } else {
+      fail(
+        'CONTROL 8 not a self-rewriting recorder',
+        `verdicts [${verdicts.join(', ')}], script ${after === before ? 'unchanged' : 'REWROTE ITSELF'}`,
+      );
+    }
+  }
+
+  console.log('');
+  console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
+  for (const v of ['CLEAN', 'DRIFT', 'BROKEN']) {
+    if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
+  }
+  return pass === total ? EXIT.CLEAN : EXIT.DRIFT;
+}
+
+/* ================================================================== */
+
+async function main() {
+  if (process.argv.includes('--selftest')) return selftest();
+
+  const live = sweep();
+  if (!live.ok) {
+    console.log(`[check:data-dir] BLIND — could not run git grep: ${live.reason}`);
+    return EXIT.BLIND;
+  }
+  if (live.binaryFiles.length) {
+    // With `-a` this should be impossible. If it happens the parse dropped lines.
+    console.log(
+      `[check:data-dir] BROKEN — a \`Binary file\` line survived an \`-a\` run ` +
+        `(${live.binaryFiles.join(', ')}); line numbers were dropped and the count is not trustworthy.`,
+    );
+    return EXIT.BROKEN;
+  }
+  const res = classify(live.records);
+  for (const l of report(res, live)) console.log(l);
+  return EXIT[res.verdict] ?? EXIT.DRIFT;
+}
+
+main()
+  .then((code) => process.exit(code))
+  .catch((err) => {
+    console.error(`[check:data-dir] BLIND — ${err?.stack ?? err}`);
+    process.exit(EXIT.BLIND);
+  });

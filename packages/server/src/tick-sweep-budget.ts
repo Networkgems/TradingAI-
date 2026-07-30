@@ -101,14 +101,29 @@
 // zero-init behaviour rather than failing the tick.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'tick-sweep-budget' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+// TRA-2603 — resolve through the one predicate (TRA-1681), NOT the inlined
+// `env.DATA_DIR ?? join(__dirname, '..', 'data')` literal this line used to hold.
+// (Deliberately not quoted verbatim: `check:data-dir` greps for that shape, and a
+// copy of it in a comment is a phantom hit — the fixed file should drop out of the
+// sweep, not need an exemption.) That literal takes the env branch for a
+// present-but-blank value, because `' '` is truthy and `??` only guards
+// null/undefined; `resolveDataDir` also requires `.trim()`. Blank-but-
+// present is a state bqb1 has reached twice (TRA-2136 / TRA-2193 / TRA-2195), and
+// it fails SILENTLY here: the mirror lands in a directory literally named `" "`
+// relative to the launch cwd, `mkdirSync`/`writeFileSync` both succeed, and
+// `flushCursors` swallows errors by design — so every cursor silently resets to
+// zero-init on the next boot, which is precisely the tail-starvation bias this
+// module exists to prevent.
+//
+// `data-dir.ts` imports only `path` and `url`, so it stays a leaf and this cannot
+// recreate the barrel/cycle shape of TRA-1684.
+const DATA_DIR = resolveDataDir();
 const CURSOR_PATH = join(DATA_DIR, 'scan-cursors.json');
 
 /**

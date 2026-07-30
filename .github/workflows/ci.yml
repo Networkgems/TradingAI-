@@ -72,6 +72,21 @@ jobs:
       - name: Check for stale compiled output shadowing TS sources
         run: pnpm check:stale-js
 
+      # TRA-2603 — beside check:stale-js, and before build/test. Ratchets the count of
+      # unguarded `process.env.DATA_DIR ?? join(__dirname,'..','data')` copies against a
+      # frozen, hand-edited baseline (38 today; the migration is TRA-2428). `??` does not
+      # guard a present-but-BLANK env value — bqb1 has reached that state twice
+      # (TRA-2193/TRA-2195) and it fails SILENTLY: every write succeeds and the data
+      # evaporates on redeploy. The controls are `pnpm check:data-dir:controls`.
+      - name: Check for unguarded DATA_DIR resolver copies
+        run: pnpm check:data-dir
+
+      # TRA-2603 — the guard's own both-direction controls: a real planted copy must FAIL,
+      # a zeroed pattern must read BROKEN not CLEAN, `-a` must be provably load-bearing
+      # against the NUL-byte file, and the baseline must not regenerate itself.
+      - name: DATA_DIR guard controls (TRA-2603)
+        run: pnpm check:data-dir:controls
+
       # TRA-1684 — also before build/test. A circular import only throws from SOME
       # entry points, so prod and the suite can enter the same graph through different
       # doors and only one of them crashes (TRA-1674). A green suite below is not
