@@ -1684,72 +1684,204 @@ export function givebackArmFloorNote(summary: GiveBackArmFloorSummary): string {
  */
 export const RTH_DECOUPLED_SHARE_FLOOR = 0.5;
 
+/** TRA-2645 — the two books `/api/health/exit-cadence` grades SEPARATELY. */
+export type ExitCadenceBook = 'live' | 'demo';
+
 /**
- * TRA-2269 — the fleet roll-up behind `GET /api/health/exit-cadence`, extracted
- * from the route handler so the grade can be controlled in BOTH directions
- * (it must be able to emit a PASS, a RED, and a refusal on demand) without
- * standing up an Express app or waiting on a live tape.
+ * TRA-2645 — one book's verdict.
  *
- * The headline change: `samples` / `atOrAbove30s` / `p99Under30s` / `verdict`
- * are now scoped to the RTH window. They used to be computed over the whole
- * process lifetime, which on any normal Monday mixes in hours of closed-market
- * intervals that sit dead on the 30s bar — ~21.7 min of closed-market uptime was
- * enough to force a FALSE however well the hoist performed. The lifetime numbers
- * are still published, under `lifetime`, because they are the right population
- * for "is the exit path evaluating at all" — just not for grading the hoist.
- *
- * `window: 'rth'` is a first-class marker so a reader can FAIL CLOSED on an old
- * build: a payload without it is a lifetime-scoped grade and must not be read as
- * TRA-2200's invalidation criterion.
+ * The first three are BLIND states, and blind is NEVER a pass: they say "this
+ * payload cannot answer the question for this book", which is a different fact
+ * from every verdict below them. `no_engine_in_book` is the load-bearing one —
+ * an assertion about the live book is satisfied FOR FREE by a fleet that
+ * contains no live book, and that free pass is exactly the defect TRA-2607 was
+ * filed on.
  */
-export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, unknown> {
-  const armed = engines.filter((e) => e.timerArmed);
-  const sumHistogram = (pick: (e: ExitCadenceHealth) => Record<ExitIntervalBucket, number>) =>
-    engines.reduce<Record<ExitIntervalBucket, number>>((acc, e) => {
-      const h = pick(e);
-      for (const b of EXIT_INTERVAL_BUCKETS) acc[b] += h[b];
-      return acc;
-    }, emptyExitIntervalHistogram());
-  const totalOf = (h: Record<ExitIntervalBucket, number>) =>
-    EXIT_INTERVAL_BUCKETS.reduce((n, b) => n + h[b], 0);
-  // The 30s bar sits on a bucket EDGE (`bucketExitInterval(30_000) === 'lt60s'`),
-  // so summing the four buckets at or past it IS the at-or-above-30s count.
-  const atOrAbove30sOf = (h: Record<ExitIntervalBucket, number>) =>
-    h.lt60s + h.lt120s + h.lt300s + h.gte300s;
+export type ExitCadenceBookVerdict =
+  | 'no_engine_in_book'
+  | 'unreadable_partition'
+  | 'unreadable_arm_state'
+  | 'disarmed'
+  | 'armed_but_no_interval_measured'
+  | 'armed_but_no_rth_interval'
+  | 'armed_but_no_decoupled_pass'
+  | 'tick_dominated_window'
+  | 'bounded'
+  | 'over_bar';
 
-  // Fleet histograms. Summed across engines because the criterion is about the
-  // exit path as a whole; per-engine rows are published alongside so a single
-  // sick engine stays visible instead of being averaged away.
-  const lifetimeHistogram = sumHistogram((e) => e.intervalHistogram);
-  const lifetimeSamples = totalOf(lifetimeHistogram);
-  const lifetimeAtOrAbove30s = atOrAbove30sOf(lifetimeHistogram);
+/** TRA-2269's histogram terms, per book. */
+export interface ExitCadenceLifetimeTerms {
+  samples: number;
+  atOrAbove30s: number;
+  p99Under30s: boolean | null;
+  intervalHistogram: Record<ExitIntervalBucket, number>;
+}
 
-  const histogram = sumHistogram((e) => e.rth.intervalHistogram);
-  const samples = totalOf(histogram);
-  const atOrAbove30s = atOrAbove30sOf(histogram);
-  // Null, not 0 or false, until there is a sample to judge. "No measurement
-  // yet" and "measured, and it passes" are different facts, and only the
-  // second one clears the gate.
-  const p99Under30s = samples > 0 ? atOrAbove30s / samples < 0.01 : null;
+/** TRA-2257's suppression-window terms, per book (and fleet-summed at the top level). */
+export interface ExitCadenceTickRegionTerms {
+  samples: number;
+  maxMs: number | null;
+  atOrAbove20s: number;
+  atOrAbove30s: number;
+}
 
-  const maxExitIntervalMs = engines.reduce<number | null>(
-    (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
-    null,
-  );
-  // TRA-2257 — fleet roll-up of WHICH CADENCE stamped the intervals above, and
-  // of why the decoupled timer declined to. Without this split the histogram
-  // is ambiguous: a run in which the timer never once did work publishes the
-  // same shape as a run in which it worked and lost to contention. These stay
-  // LIFETIME-scoped: they are the terms of the `decoupledFireCount` invariant,
-  // which is a statement about every fire since boot.
-  const decoupledPassCount = engines.reduce((n, e) => n + e.decoupledPassCount, 0);
-  const tickPassCount = engines.reduce((n, e) => n + e.tickPassCount, 0);
-  const decoupledFireCount = engines.reduce((n, e) => n + e.decoupledFireCount, 0);
-  const decoupledSkips = engines.reduce<Record<DecoupledExitSkipReason, number>>((acc, e) => {
-    for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
+/**
+ * TRA-2645 — ONE BOOK's exit-cadence rollup. This is the unit that can be
+ * graded: `mode=live` engines share a broker, capital and flag source with each
+ * other and with NOTHING in the demo fleet (`signal-engine.ts` resolves
+ * `ENABLE_DECOUPLED_EXIT_CADENCE` through a deliberate per-book split), so a
+ * ratio pooled across the two is a statement about no population that exists.
+ *
+ * Every graded field is nullable and is NULL exactly when `blind` is true. A
+ * blind book publishes counts it can still stand behind and nulls the rest —
+ * it never publishes a zero that reads like a measurement.
+ */
+export interface ExitCadenceBookRollup {
+  book: ExitCadenceBook;
+  /** TRUE when this payload cannot answer the question for this book. Never a pass. */
+  blind: boolean;
+  /** Why, when blind. Null otherwise. */
+  blindReason: string | null;
+  /** At least one engine IN THIS BOOK has a live exit timer. NULL when blind. */
+  enabled: boolean | null;
+  engineCount: number;
+  armedEngineCount: number | null;
+  verdict: ExitCadenceBookVerdict;
+  gradeable: boolean;
+  notGradeableReason: string | null;
+  /** GRADED (RTH-only) terms — TRA-2200's invalidation criterion, scoped to THIS book. */
+  samples: number | null;
+  atOrAbove30s: number | null;
+  p99Under30s: boolean | null;
+  intervalHistogram: Record<ExitIntervalBucket, number> | null;
+  rthDecoupledPassCount: number | null;
+  rthTickPassCount: number | null;
+  rthDecoupledShare: number | null;
+  rthBoundaryIntervals: number | null;
+  rthClosedIntervals: number | null;
+  partitionHolds: boolean | null;
+  maxExitIntervalMs: number | null;
+  lifetime: ExitCadenceLifetimeTerms | null;
+  decoupledPassCount: number | null;
+  tickPassCount: number | null;
+  decoupledFireCount: number | null;
+  decoupledSkips: Record<DecoupledExitSkipReason, number> | null;
+  tickExitRegionMs: ExitCadenceTickRegionTerms | null;
+}
+
+/**
+ * TRA-2645 — the payload `GET /api/health/exit-cadence` publishes above the
+ * per-engine `engines` array.
+ *
+ * A CONCRETE type on purpose. This used to be `Record<string, unknown>`, which
+ * is why removing `enabled` could not be checked: `tsc` enumerates the
+ * consumers of a named field and enumerates nothing at all on an index
+ * signature.
+ */
+export interface ExitCadenceRollup {
+  /** TRA-2269 — which WINDOW the graded fields are computed over. */
+  window: 'rth';
+  /**
+   * TRA-2645 — which AXIS the population is partitioned on. Absent on any build
+   * before TRA-2645, where every graded field was pooled across books; a reader
+   * that wants a per-book number must FAIL CLOSED on its absence rather than
+   * read the pooled one.
+   */
+  partitionedBy: 'mode';
+  books: Record<ExitCadenceBook, ExitCadenceBookRollup>;
+  /**
+   * TRA-2645 — what used to be the bare `enabled`, split and SCOPED. The old
+   * field was `armed.length > 0` over every engine, so 57 armed demo engines
+   * published `enabled: true` over an unhoisted live book. There is no
+   * unscoped spelling any more, deliberately: the name now carries the
+   * population, so a reader who greps one cannot get the other's answer.
+   * NULL when that book is blind — absent an answer, not a false one.
+   */
+  liveEnabled: boolean | null;
+  demoEnabled: boolean | null;
+  liveArmedEngineCount: number | null;
+  demoArmedEngineCount: number | null;
+  engineCount: number;
+  liveEngineCount: number;
+  demoEngineCount: number;
+  /**
+   * Engines whose `mode` is not a usable string. NOT filed as demo: an engine
+   * of unknown book might BE the live one, so a non-zero count here blinds
+   * BOTH books rather than silently shrinking either population.
+   */
+  unknownModeEngineCount: number;
+  /**
+   * TRA-2645 — the AGGREGATE REFUSES. There is no fleet-wide grade because
+   * there is no fleet-wide population: `p99Under30s` is TRA-2200's REAL-MONEY
+   * invalidation criterion and a demo engine cannot contribute evidence to it.
+   * Constant by construction so it cannot drift into looking like a verdict.
+   */
+  verdict: 'partitioned_by_book';
+  gradeable: false;
+  notGradeableReason: string;
+  /** Fleet high-water mark. A max is not a ratio and does not dilute; per-book copies sit in `books`. */
+  maxExitIntervalMs: number | null;
+  /**
+   * TRA-2257 — LIFETIME cadence counters, fleet-summed. Descriptive totals, not
+   * a graded ratio: they answer "is the exit path evaluating at all". The
+   * per-book copies in `books` are the ones to quote about a book.
+   */
+  decoupledPassCount: number;
+  tickPassCount: number;
+  decoupledFireCount: number;
+  decoupledSkips: Record<DecoupledExitSkipReason, number>;
+  /**
+   * doTick's exit-interlock suppression window, FLEET-SUMMED over every engine
+   * with no RTH predicate and no boot guard. Left fleet-scoped deliberately —
+   * TRA-2305/TRA-2268 grade this exact accumulator and moving it would silently
+   * change someone else's subject. Per-book copies are in `books`.
+   */
+  tickExitRegionMs: ExitCadenceTickRegionTerms;
+  rthDecoupledShareFloor: number;
+  note: string;
+}
+
+/**
+ * Read an engine's book DEFENSIVELY. `ExitCadenceHealth['mode']` is typed
+ * `'demo' | 'live'`, but this route is unauthenticated and read by scripts that
+ * cannot see which bytes answered them, and the value crosses a JSON boundary
+ * on the way out. `'mode' in e` passes on an explicit `null`, so a presence
+ * check would file an engine of UNKNOWN book as demo — this ticket's own defect
+ * re-entered one field down. Demand a non-empty STRING; anything else is `null`
+ * and blinds both books.
+ */
+function bookOf(e: ExitCadenceHealth): ExitCadenceBook | null {
+  const mode: unknown = (e as { mode?: unknown }).mode;
+  if (mode === 'live') return 'live';
+  return typeof mode === 'string' && mode.length > 0 ? 'demo' : null;
+}
+
+/** Likewise: a null/absent `timerArmed` is "I cannot see it", never "not armed". */
+function armedOf(e: ExitCadenceHealth): boolean | null {
+  const armed: unknown = (e as { timerArmed?: unknown }).timerArmed;
+  return typeof armed === 'boolean' ? armed : null;
+}
+
+const sumExitHistogram = (
+  engines: ExitCadenceHealth[],
+  pick: (e: ExitCadenceHealth) => Record<ExitIntervalBucket, number>,
+) =>
+  engines.reduce<Record<ExitIntervalBucket, number>>((acc, e) => {
+    const h = pick(e);
+    for (const b of EXIT_INTERVAL_BUCKETS) acc[b] += h[b];
     return acc;
-  }, emptyDecoupledExitSkips());
-  const tickExitRegionMs = {
+  }, emptyExitIntervalHistogram());
+
+const totalOfExitHistogram = (h: Record<ExitIntervalBucket, number>) =>
+  EXIT_INTERVAL_BUCKETS.reduce((n, b) => n + h[b], 0);
+
+// The 30s bar sits on a bucket EDGE (`bucketExitInterval(30_000) === 'lt60s'`),
+// so summing the four buckets at or past it IS the at-or-above-30s count.
+const atOrAbove30sOfExitHistogram = (h: Record<ExitIntervalBucket, number>) =>
+  h.lt60s + h.lt120s + h.lt300s + h.gte300s;
+
+function sumTickExitRegion(engines: ExitCadenceHealth[]): ExitCadenceTickRegionTerms {
+  return {
     samples: engines.reduce((n, e) => n + e.tickExitRegionMs.samples, 0),
     maxMs: engines.reduce<number | null>(
       (acc, e) => (e.tickExitRegionMs.maxMs != null && (acc == null || e.tickExitRegionMs.maxMs > acc)
@@ -1760,6 +1892,137 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
     atOrAbove20s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove20s, 0),
     atOrAbove30s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove30s, 0),
   };
+}
+
+/** A book that cannot be graded. Every graded term is NULL, never 0 — a zero reads like a measurement. */
+function blindBook(
+  book: ExitCadenceBook,
+  engineCount: number,
+  verdict: 'no_engine_in_book' | 'unreadable_partition' | 'unreadable_arm_state',
+  reason: string,
+): ExitCadenceBookRollup {
+  return {
+    book,
+    blind: true,
+    blindReason: reason,
+    enabled: null,
+    engineCount,
+    armedEngineCount: null,
+    verdict,
+    gradeable: false,
+    notGradeableReason: reason,
+    samples: null,
+    atOrAbove30s: null,
+    p99Under30s: null,
+    intervalHistogram: null,
+    rthDecoupledPassCount: null,
+    rthTickPassCount: null,
+    rthDecoupledShare: null,
+    rthBoundaryIntervals: null,
+    rthClosedIntervals: null,
+    partitionHolds: null,
+    maxExitIntervalMs: null,
+    lifetime: null,
+    decoupledPassCount: null,
+    tickPassCount: null,
+    decoupledFireCount: null,
+    decoupledSkips: null,
+    tickExitRegionMs: null,
+  };
+}
+
+/**
+ * TRA-2269 + TRA-2645 — grade ONE book.
+ *
+ * TRA-2269 scoped `samples` / `atOrAbove30s` / `p99Under30s` / `verdict` to the
+ * RTH WINDOW: they used to be computed over the whole process lifetime, which
+ * on any normal Monday mixes in hours of closed-market intervals that sit dead
+ * on the 30s bar — ~21.7 min of closed-market uptime was enough to force a
+ * FALSE however well the hoist performed. The lifetime numbers are still
+ * published, under `lifetime`, because they are the right population for "is
+ * the exit path evaluating at all" — just not for grading the hoist.
+ *
+ * TRA-2645 scopes the same terms to the BOOK, which is the other axis the
+ * denominator was wrong on. Both are the same defect: an instrument that cannot
+ * say "that was not my subject" hands out confident answers to questions it
+ * never asked.
+ */
+export function gradeExitCadenceBook(
+  book: ExitCadenceBook,
+  engines: ExitCadenceHealth[],
+  unknownModeEngineCount = 0,
+): ExitCadenceBookRollup {
+  // Blind ladder, most-general first. An unreadable partition is a fact about
+  // the WHOLE payload, so it outranks anything about this book's members.
+  if (unknownModeEngineCount > 0) {
+    return blindBook(
+      book,
+      engines.length,
+      'unreadable_partition',
+      `${unknownModeEngineCount} engine(s) carry no usable \`mode\` string, so the fleet cannot be `
+      + 'partitioned by book. An engine of unknown book might BE the live one, and filing it as demo '
+      + 'would silently shrink the graded population — refusing to grade a partition I cannot compute.',
+    );
+  }
+  if (engines.length === 0) {
+    return blindBook(
+      book,
+      0,
+      'no_engine_in_book',
+      `no \`mode=${book}\` engine is resident, so this book has nothing to grade. An assertion about `
+      + `the ${book} book is satisfied FOR FREE by a fleet that contains no ${book} book, and that free `
+      + 'pass is the exact defect TRA-2607 was filed on. HELD, never a pass. If the '
+      + `${book} engine is EXPECTED to be absent, that is a finding about the box, not a grade.`,
+    );
+  }
+  const unreadableArm = engines.filter((e) => armedOf(e) === null).length;
+  if (unreadableArm > 0) {
+    return blindBook(
+      book,
+      engines.length,
+      'unreadable_arm_state',
+      `${unreadableArm} of ${engines.length} \`mode=${book}\` engine(s) carry no boolean \`timerArmed\`. `
+      + '"I cannot see the arm state" must never be published as "the hoist is disarmed" — right '
+      + 'verdict, wrong cause. Note `enabled` is NOT a substitute: the flag is resolved ONCE at '
+      + 'start(), so a mid-session flip reads `enabled` without a timer existing.',
+    );
+  }
+
+  const armedEngineCount = engines.filter((e) => armedOf(e) === true).length;
+
+  // Book histograms. Summed across the book's engines because the criterion is
+  // about that book's exit path as a whole; per-engine rows are published
+  // alongside so a single sick engine stays visible instead of being averaged
+  // away.
+  const lifetimeHistogram = sumExitHistogram(engines, (e) => e.intervalHistogram);
+  const lifetimeSamples = totalOfExitHistogram(lifetimeHistogram);
+  const lifetimeAtOrAbove30s = atOrAbove30sOfExitHistogram(lifetimeHistogram);
+
+  const histogram = sumExitHistogram(engines, (e) => e.rth.intervalHistogram);
+  const samples = totalOfExitHistogram(histogram);
+  const atOrAbove30s = atOrAbove30sOfExitHistogram(histogram);
+  // Null, not 0 or false, until there is a sample to judge. "No measurement
+  // yet" and "measured, and it passes" are different facts, and only the
+  // second one clears the gate.
+  const p99Under30s = samples > 0 ? atOrAbove30s / samples < 0.01 : null;
+
+  const maxExitIntervalMs = engines.reduce<number | null>(
+    (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
+    null,
+  );
+  // TRA-2257 — roll-up of WHICH CADENCE stamped the intervals above, and of why
+  // the decoupled timer declined to. Without this split the histogram is
+  // ambiguous: a run in which the timer never once did work publishes the same
+  // shape as a run in which it worked and lost to contention. These stay
+  // LIFETIME-scoped: they are the terms of the `decoupledFireCount` invariant,
+  // which is a statement about every fire since boot.
+  const decoupledPassCount = engines.reduce((n, e) => n + e.decoupledPassCount, 0);
+  const tickPassCount = engines.reduce((n, e) => n + e.tickPassCount, 0);
+  const decoupledFireCount = engines.reduce((n, e) => n + e.decoupledFireCount, 0);
+  const decoupledSkips = engines.reduce<Record<DecoupledExitSkipReason, number>>((acc, e) => {
+    for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
+    return acc;
+  }, emptyDecoupledExitSkips());
 
   // TRA-2269 — the same split, restricted to the graded window: which cadence
   // closed each RTH interval, and where the excluded lifetime intervals went.
@@ -1774,21 +2037,20 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
   // `decoupledFireCount === sum(decoupledSkips) + decoupledPassCount`.
   const partitionHolds = lifetimeSamples === samples + rthBoundaryIntervals + rthClosedIntervals;
 
-  // TRA-2257/TRA-2269 — THE GATE ON THE GRADE, now in two parts. `p99Under30s`
-  // is a statement about the hoist only if (a) the hoist ran during the window
-  // AND (b) the window is made of the hoist. TRA-2257 shipped (a): on 2026-07-24
+  // TRA-2257/TRA-2269 — THE GATE ON THE GRADE, in two parts. `p99Under30s` is a
+  // statement about the hoist only if (a) the hoist ran during the window AND
+  // (b) the window is made of the hoist. TRA-2257 shipped (a): on 2026-07-24
   // every fire refused on `marketClosed` post-16:00 ET and the resulting RED was
   // read as a verdict on the fix. (b) is the same defect one level down — SOME
   // decoupled passes flipped `gradeable` true while the denominator still
-  // carried hours of closed-market intervals. An instrument that cannot say
-  // "that was not my subject" hands out confident answers to questions it never
-  // asked. Refuse instead.
-  const gradeable = armed.length > 0
+  // carried hours of closed-market intervals.
+  const gradeable = armedEngineCount > 0
     && samples > 0
     && rthDecoupledPassCount > 0
     && rthDecoupledShare != null && rthDecoupledShare > RTH_DECOUPLED_SHARE_FLOOR;
-  const notGradeableReason = armed.length === 0
-    ? 'no engine has an exit timer — the hoist is disarmed, nothing here grades it'
+  const notGradeableReason = armedEngineCount === 0
+    ? `no \`mode=${book}\` engine has an exit timer — the hoist is disarmed on this book, nothing here `
+      + 'grades it'
     : samples === 0
       ? (lifetimeSamples === 0
         ? 'no exit interval measured yet'
@@ -1809,14 +2071,15 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
           : null;
 
   return {
-    // Fleet-level: is the hoist actually running anywhere.
-    enabled: armed.length > 0,
-    // TRA-2269 — which POPULATION the graded fields below are computed over.
-    // Assert this before reading `p99Under30s`: a payload without it is a
-    // pre-TRA-2269 build publishing a LIFETIME-scoped ratio under the same name.
-    window: 'rth',
+    book,
+    blind: false,
+    blindReason: null,
+    // Is the hoist actually running anywhere IN THIS BOOK.
+    enabled: armedEngineCount > 0,
+    engineCount: engines.length,
+    armedEngineCount,
     verdict:
-      armed.length === 0
+      armedEngineCount === 0
         ? 'disarmed'
         : samples === 0
           // Distinguished on purpose: "nothing measured at all" and "measured,
@@ -1836,8 +2099,6 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
                 : 'over_bar',
     gradeable,
     notGradeableReason,
-    engineCount: engines.length,
-    armedEngineCount: armed.length,
     // GRADED (RTH-only) terms.
     samples,
     atOrAbove30s,
@@ -1846,7 +2107,6 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
     rthDecoupledPassCount,
     rthTickPassCount,
     rthDecoupledShare,
-    rthDecoupledShareFloor: RTH_DECOUPLED_SHARE_FLOOR,
     rthBoundaryIntervals,
     rthClosedIntervals,
     partitionHolds,
@@ -1865,19 +2125,120 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
     tickPassCount,
     decoupledFireCount,
     decoupledSkips,
-    tickExitRegionMs,
+    tickExitRegionMs: sumTickExitRegion(engines),
+  };
+}
+
+/**
+ * TRA-2269/TRA-2645 — the roll-up behind `GET /api/health/exit-cadence`,
+ * extracted from the route handler so the grade can be controlled in BOTH
+ * directions (it must be able to emit a PASS, a RED, and a refusal on demand)
+ * without standing up an Express app or waiting on a live tape.
+ *
+ * TRA-2645 — THE HEADLINE CHANGE: THIS NO LONGER ROLLS A MIXED-MODE FLEET INTO
+ * ONE ANSWER.
+ *
+ * It used to publish `enabled: armed.length > 0` over EVERY engine. bqb1 runs
+ * 57 demo engines plus the one `mode=live` book routed to production Tradier
+ * ***0154, so on 2026-07-30T04:19:56Z this route said `enabled: true,
+ * armedEngineCount: 57, engineCount: 58` while the only engine that carries
+ * money read `mode=live, enabled=false, timerArmed=false`. Three things
+ * followed, and all three are fixed here:
+ *
+ *  1. `enabled: true` published over an unhoisted live book. There is no
+ *     unscoped `enabled` any more — `liveEnabled` / `demoEnabled` /
+ *     `books.{live,demo}.enabled` are the only spellings, so the name carries
+ *     the population and a reader cannot get the other book's answer.
+ *  2. The `disarmed` verdict was STRUCTURALLY UNREACHABLE: while any demo
+ *     engine was armed, `armed.length === 0` could not hold — including in the
+ *     world where every live engine is disarmed, which was the world we were
+ *     in. `books.live.verdict` reaches `disarmed` on exactly that world.
+ *  3. The graded ratio pooled the books. `samples` / `atOrAbove30s` /
+ *     `p99Under30s` / `intervalHistogram` were summed across all 58 engines and
+ *     then read against TRA-2200's REAL-MONEY invalidation criterion, diluting
+ *     the live engine 1-in-58 with a fleet that shares no broker, no capital
+ *     and no flag source (`signal-engine.ts` splits the env per book on
+ *     purpose). Those terms now exist ONLY per book, and the aggregate REFUSES:
+ *     top-level `verdict` is the constant `partitioned_by_book` and `gradeable`
+ *     is the constant `false`.
+ *
+ *     A REMEDY SCOPED TO THE DEMO BOOK PASSES AN INSTRUMENT SCOPED TO THE DEMO
+ *     BOOK — AND THE AGGREGATE IS WHAT MAKES IT INVISIBLE. `58/58` and `57/58`
+ *     both read as coverage, because nobody reads a denominator.
+ *
+ * `window: 'rth'` (TRA-2269) and `partitionedBy: 'mode'` (TRA-2645) are
+ * first-class markers so a reader can FAIL CLOSED on an old build: a payload
+ * without `window` is a lifetime-scoped grade, and one without `partitionedBy`
+ * is a book-pooled grade. Neither may be read as TRA-2200's criterion.
+ */
+export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRollup {
+  const liveEngines = engines.filter((e) => bookOf(e) === 'live');
+  const demoEngines = engines.filter((e) => bookOf(e) === 'demo');
+  // NOT filed as demo. An engine of unknown book might BE the live one; filing
+  // it as demo would shrink the graded live population in silence, which is
+  // this ticket's own defect one field down.
+  const unknownModeEngineCount = engines.length - liveEngines.length - demoEngines.length;
+
+  const live = gradeExitCadenceBook('live', liveEngines, unknownModeEngineCount);
+  const demo = gradeExitCadenceBook('demo', demoEngines, unknownModeEngineCount);
+
+  const maxExitIntervalMs = engines.reduce<number | null>(
+    (acc, e) => (e.maxExitIntervalMs != null && (acc == null || e.maxExitIntervalMs > acc) ? e.maxExitIntervalMs : acc),
+    null,
+  );
+
+  return {
+    window: 'rth',
+    partitionedBy: 'mode',
+    books: { live, demo },
+    liveEnabled: live.enabled,
+    demoEnabled: demo.enabled,
+    liveArmedEngineCount: live.armedEngineCount,
+    demoArmedEngineCount: demo.armedEngineCount,
+    engineCount: engines.length,
+    liveEngineCount: liveEngines.length,
+    demoEngineCount: demoEngines.length,
+    unknownModeEngineCount,
+    verdict: 'partitioned_by_book',
+    gradeable: false,
+    notGradeableReason:
+      'THE AGGREGATE DOES NOT GRADE, BY CONSTRUCTION (TRA-2645). `p99Under30s` is TRA-2200\'s '
+      + 'REAL-MONEY invalidation criterion and a demo engine cannot contribute evidence to it, so '
+      + 'there is no fleet-wide population to compute it over. Read `books.live` for the money book '
+      + 'and `books.demo` for the paper fleet; each carries its own `enabled`, `armedEngineCount`, '
+      + '`engineCount`, `samples`, `atOrAbove30s`, `p99Under30s`, `intervalHistogram`, `verdict`, '
+      + '`gradeable` and `notGradeableReason`. A book with NO engine in it is `blind` with verdict '
+      + '`no_engine_in_book` and every graded term NULL — it is never a pass.',
+    maxExitIntervalMs,
+    decoupledPassCount: engines.reduce((n, e) => n + e.decoupledPassCount, 0),
+    tickPassCount: engines.reduce((n, e) => n + e.tickPassCount, 0),
+    decoupledFireCount: engines.reduce((n, e) => n + e.decoupledFireCount, 0),
+    decoupledSkips: engines.reduce<Record<DecoupledExitSkipReason, number>>((acc, e) => {
+      for (const r of DECOUPLED_EXIT_SKIP_REASONS) acc[r] += e.decoupledSkips[r];
+      return acc;
+    }, emptyDecoupledExitSkips()),
+    tickExitRegionMs: sumTickExitRegion(engines),
+    rthDecoupledShareFloor: RTH_DECOUPLED_SHARE_FLOOR,
     note:
-      'Grade `p99Under30s` (TRA-2200 invalidation criterion) — but ONLY when '
-      + '`gradeable` is true. TRA-2269: `window` names the population, and the graded '
-      + 'fields (`samples`, `atOrAbove30s`, `p99Under30s`, `intervalHistogram`) count ONLY '
-      + 'intervals with BOTH endpoints inside 09:30-16:00 ET. They used to be lifetime '
-      + 'accumulators since boot, which mixed in closed-market intervals that sit dead on '
-      + 'the 30s bar: ~21.7 min of closed-market uptime was enough to force `p99Under30s` '
-      + 'FALSE however well the hoist performed. Those numbers now live under `lifetime` '
-      + 'and must NOT be read as the criterion. Buckets put the 30s bar on an edge, so '
-      + '`atOrAbove30s / samples < 0.01` IS p99 < 30s. `samples` counts INTERVALS, which is '
-      + 'one fewer than passes per engine — the first pass after boot has no predecessor to '
-      + 'measure against. Excluded intervals are counted, not dropped: '
+      'TRA-2645: THERE IS NO FLEET-WIDE GRADE HERE. `partitionedBy: "mode"` marks that the graded '
+      + 'terms live per book under `books.live` / `books.demo`; a payload WITHOUT that marker is a '
+      + 'pre-TRA-2645 build whose `enabled` is an OR and whose `p99Under30s` is a sum over both '
+      + 'books, and must not be read as either book\'s answer. Grade `books.<book>.p99Under30s` '
+      + '(TRA-2200 invalidation criterion) — but ONLY when that book\'s `gradeable` is true, and '
+      + 'only ever quote `books.live` about real money. A book with `blind: true` cannot answer: '
+      + '`no_engine_in_book` means that book is not resident (HELD, never a pass — an assertion '
+      + 'about a book no engine belongs to is satisfied for free), `unreadable_partition` means '
+      + 'some engine carries no usable `mode` string so it could be EITHER book, and '
+      + '`unreadable_arm_state` means `timerArmed` was not a boolean. '
+      + 'TRA-2269: `window` names the window, and the graded fields (`samples`, `atOrAbove30s`, '
+      + '`p99Under30s`, `intervalHistogram`) count ONLY intervals with BOTH endpoints inside '
+      + '09:30-16:00 ET. They used to be lifetime accumulators since boot, which mixed in '
+      + 'closed-market intervals that sit dead on the 30s bar: ~21.7 min of closed-market uptime '
+      + 'was enough to force `p99Under30s` FALSE however well the hoist performed. Those numbers '
+      + 'live under each book\'s `lifetime` and must NOT be read as the criterion. Buckets put the '
+      + '30s bar on an edge, so `atOrAbove30s / samples < 0.01` IS p99 < 30s. `samples` counts '
+      + 'INTERVALS, which is one fewer than passes per engine — the first pass after boot has no '
+      + 'predecessor to measure against. Excluded intervals are counted, not dropped: '
       + '`lifetime.samples === samples + rthBoundaryIntervals + rthClosedIntervals` '
       + '(`partitionHolds`), where boundary = one endpoint each side of the open/close. '
       + 'TRA-2257: `decoupledPassCount` vs `tickPassCount` (LIFETIME) says which cadence '
@@ -1888,8 +2249,10 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): Record<string, 
       + '`tick_dominated_window` and refuses rather than grading doTick as the hoist. All '
       + 'counters are strictly monotonic within a process, so two same-process snapshots '
       + '(assert identical `build.startedAt` AND `build.pid`) difference cleanly into any '
-      + 'sub-window. `tickExitRegionMs` is the suppression window doTick holds the '
-      + 'exit interlock for (news + social + market-review + journal + '
+      + 'sub-window. The TOP-LEVEL `tickExitRegionMs` is FLEET-SUMMED with no RTH predicate and '
+      + 'no boot guard (TRA-2305/TRA-2268 grade that exact accumulator, so it is deliberately '
+      + 'left fleet-scoped; per-book copies are in `books`). It is the suppression window doTick '
+      + 'holds the exit interlock for (news + social + market-review + journal + '
       + 'tradier-balance + the 568-symbol quote-batch + 3 reconciles + '
       + 'shadow-chases): worst-case exit interval is bounded by THAT plus the '
       + 'timer period, never by the timer period alone, so a region at or above '

@@ -26,6 +26,7 @@ import {
   rollUpExitCadence,
   RTH_DECOUPLED_SHARE_FLOOR,
   type HealthUserContext,
+  type ExitCadenceRollup,
 } from './health-routes.js';
 import { TEST_ACCOUNT_PREFIX_ENV } from '../test-accounts.js'; // TRA-2478
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
@@ -3207,7 +3208,10 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
 
   function exitEngine(o: {
     engine?: string;
-    timerArmed?: boolean;
+    /** TRA-2645 — `unknown` so a control can drive the `mode: null` / absent-key shapes. */
+    mode?: unknown;
+    /** TRA-2645 — `unknown` so a control can drive the non-boolean `timerArmed` shape. */
+    timerArmed?: unknown;
     lifetime: { under: number; over: number };
     rth: { under: number; over: number };
     rthDecoupled?: number;
@@ -3217,10 +3221,10 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
   }): ExitCadenceHealth {
     return {
       enabled: true,
-      timerArmed: o.timerArmed ?? true,
+      timerArmed: ('timerArmed' in o ? o.timerArmed : true) as boolean,
       intervalMs: 10_000,
       minGapMs: 3_000,
-      mode: 'demo',
+      mode: ('mode' in o ? o.mode : 'demo') as ExitCadenceHealth['mode'],
       engine: o.engine ?? 'admin',
       lastExitPassAt: NOW,
       exitPassCount: o.lifetime.under + o.lifetime.over + 1,
@@ -3262,82 +3266,87 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     closedIntervals: CONTAMINATION_SAMPLES,
   })];
 
+  /**
+   * TRA-2645 — every fixture in this block is `mode: 'demo'`, so the graded
+   * terms these tests are about now live on the DEMO book. There is no
+   * top-level graded ratio any more, by construction.
+   */
+  const demoBook = (body: ExitCadenceRollup) => body.books.demo;
+
   it('REPRODUCES THE BUG, THEN KILLS IT: 22 min of closed-market uptime forces the LIFETIME ratio FALSE on a PERFECT RTH — and the graded ratio is TRUE', () => {
-    const body = rollUpExitCadence(contaminatedFleet());
+    const book = demoBook(rollUpExitCadence(contaminatedFleet()));
 
     // The old, lifetime-scoped number — the one this route used to publish
     // under the name `p99Under30s`. 242 / 23,825 = 1.016% >= 1% => a confident
     // RED on a session in which the hoist did not miss a single interval.
-    const lifetime = body.lifetime as Record<string, unknown>;
-    expect(lifetime.samples).toBe(23_825);
-    expect(lifetime.atOrAbove30s).toBe(CONTAMINATION_OVER);
-    expect(lifetime.p99Under30s).toBe(false);
+    expect(book.lifetime!.samples).toBe(23_825);
+    expect(book.lifetime!.atOrAbove30s).toBe(CONTAMINATION_OVER);
+    expect(book.lifetime!.p99Under30s).toBe(false);
 
     // The graded number, scoped to the window it is a statement about.
-    expect(body.samples).toBe(PERFECT_RTH_INTERVALS);
-    expect(body.atOrAbove30s).toBe(0);
-    expect(body.p99Under30s).toBe(true);
-    expect(body.verdict).toBe('bounded');
-    expect(body.gradeable).toBe(true);
-    expect(body.notGradeableReason).toBeNull();
+    expect(book.samples).toBe(PERFECT_RTH_INTERVALS);
+    expect(book.atOrAbove30s).toBe(0);
+    expect(book.p99Under30s).toBe(true);
+    expect(book.verdict).toBe('bounded');
+    expect(book.gradeable).toBe(true);
+    expect(book.notGradeableReason).toBeNull();
   });
 
   it('PARTITIONS rather than filters — every lifetime interval is still accounted for', () => {
-    const body = rollUpExitCadence(contaminatedFleet());
-    const lifetime = body.lifetime as Record<string, unknown>;
-    expect(body.rthClosedIntervals).toBe(CONTAMINATION_SAMPLES);
-    expect(body.rthBoundaryIntervals).toBe(0);
-    expect(lifetime.samples).toBe(
-      (body.samples as number) + (body.rthBoundaryIntervals as number) + (body.rthClosedIntervals as number),
+    const book = demoBook(rollUpExitCadence(contaminatedFleet()));
+    expect(book.rthClosedIntervals).toBe(CONTAMINATION_SAMPLES);
+    expect(book.rthBoundaryIntervals).toBe(0);
+    expect(book.lifetime!.samples).toBe(
+      book.samples! + book.rthBoundaryIntervals! + book.rthClosedIntervals!,
     );
-    expect(body.partitionHolds).toBe(true);
+    expect(book.partitionHolds).toBe(true);
   });
 
   it('POSITIVE CONTROL — it can still emit a RED. A genuinely bad RTH window grades over_bar, gradeable', () => {
     // Without this the fix would be a whitewash: an instrument that can only
     // ever say PASS is not an instrument. 300 / 23,400 = 1.28% >= 1%, and
     // every one of those intervals has BOTH endpoints inside RTH.
-    const body = rollUpExitCadence([exitEngine({
+    const book = demoBook(rollUpExitCadence([exitEngine({
       lifetime: { under: PERFECT_RTH_INTERVALS - 300, over: 300 },
       rth: { under: PERFECT_RTH_INTERVALS - 300, over: 300 },
       rthDecoupled: 23_000,
       rthTick: 400,
-    })]);
-    expect(body.p99Under30s).toBe(false);
-    expect(body.verdict).toBe('over_bar');
-    expect(body.gradeable).toBe(true);
-    expect(body.notGradeableReason).toBeNull();
+    })]));
+    expect(book.p99Under30s).toBe(false);
+    expect(book.verdict).toBe('over_bar');
+    expect(book.gradeable).toBe(true);
+    expect(book.notGradeableReason).toBeNull();
   });
 
   it('REFUSES the pure post-close read — the live 2026-07-24 state — and names the lifetime count it declined to grade', () => {
     // 293 samples, 167 at or above the bar, ZERO with both endpoints in RTH.
     // The pre-TRA-2269 route published 57% over the bar as a graded ratio.
-    const body = rollUpExitCadence([exitEngine({
+    const book = demoBook(rollUpExitCadence([exitEngine({
       lifetime: { under: 126, over: 167 },
       rth: { under: 0, over: 0 },
       rthDecoupled: 0,
       rthTick: 0,
       closedIntervals: 293,
-    })]);
-    expect(body.samples).toBe(0);
-    expect(body.p99Under30s).toBeNull();
-    expect(body.verdict).toBe('armed_but_no_rth_interval');
-    expect(body.gradeable).toBe(false);
-    expect(String(body.notGradeableReason)).toContain('293');
+    })]));
+    expect(book.samples).toBe(0);
+    expect(book.p99Under30s).toBeNull();
+    expect(book.verdict).toBe('armed_but_no_rth_interval');
+    expect(book.gradeable).toBe(false);
+    expect(String(book.notGradeableReason)).toContain('293');
     // And the lifetime figure is still published — it is a real fact about the
     // exit path, just not a verdict on the hoist.
-    expect((body.lifetime as Record<string, unknown>).p99Under30s).toBe(false);
+    expect(book.lifetime!.p99Under30s).toBe(false);
   });
 
   it('keeps armed_but_no_interval_measured for the genuinely empty case — "nothing measured" and "nothing IN WINDOW" are different facts', () => {
-    const body = rollUpExitCadence([exitEngine({
+    const book = demoBook(rollUpExitCadence([exitEngine({
       lifetime: { under: 0, over: 0 },
       rth: { under: 0, over: 0 },
       rthDecoupled: 0,
-    })]);
-    expect(body.verdict).toBe('armed_but_no_interval_measured');
-    expect(body.gradeable).toBe(false);
-    expect(String(body.notGradeableReason)).toBe('no exit interval measured yet');
+    })]));
+    expect(book.verdict).toBe('armed_but_no_interval_measured');
+    expect(book.gradeable).toBe(false);
+    expect(String(book.notGradeableReason)).toBe('no exit interval measured yet');
   });
 
   it('DENOMINATOR PURITY: RTH intervals that doTick closed do not grade the hoist', () => {
@@ -3345,45 +3354,45 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     // anywhere flipped `gradeable` true. Here the timer ran 100 times and
     // doTick closed 900 of the 1,000 graded intervals: nominally in-window,
     // but the cadence on show is doTick's.
-    const body = rollUpExitCadence([exitEngine({
+    const book = demoBook(rollUpExitCadence([exitEngine({
       lifetime: { under: 1_000, over: 0 },
       rth: { under: 1_000, over: 0 },
       rthDecoupled: 100,
       rthTick: 900,
-    })]);
-    expect(body.rthDecoupledShare).toBeCloseTo(0.1, 10);
-    expect(body.verdict).toBe('tick_dominated_window');
-    expect(body.gradeable).toBe(false);
-    expect(String(body.notGradeableReason)).toContain('100/1000');
+    })]));
+    expect(book.rthDecoupledShare).toBeCloseTo(0.1, 10);
+    expect(book.verdict).toBe('tick_dominated_window');
+    expect(book.gradeable).toBe(false);
+    expect(String(book.notGradeableReason)).toContain('100/1000');
     // ...and it does NOT trip on a healthy armed session, where the 10s timer
     // outruns doTick's 120-280s wall-clock by an order of magnitude.
-    const healthy = rollUpExitCadence(contaminatedFleet());
-    expect(healthy.rthDecoupledShare as number).toBeGreaterThan(RTH_DECOUPLED_SHARE_FLOOR);
+    const healthy = demoBook(rollUpExitCadence(contaminatedFleet()));
+    expect(healthy.rthDecoupledShare!).toBeGreaterThan(RTH_DECOUPLED_SHARE_FLOOR);
     expect(healthy.gradeable).toBe(true);
   });
 
   it('disarmed still outranks everything — a fleet with no timer grades nothing', () => {
-    const body = rollUpExitCadence([exitEngine({
+    const book = demoBook(rollUpExitCadence([exitEngine({
       timerArmed: false,
       lifetime: { under: 1_000, over: 0 },
       rth: { under: 1_000, over: 0 },
       rthDecoupled: 900,
-    })]);
-    expect(body.verdict).toBe('disarmed');
-    expect(body.gradeable).toBe(false);
-    expect(body.enabled).toBe(false);
+    })]));
+    expect(book.verdict).toBe('disarmed');
+    expect(book.gradeable).toBe(false);
+    expect(book.enabled).toBe(false);
   });
 
   it('sums the RTH histogram across engines — one sick engine is not averaged away', () => {
-    const body = rollUpExitCadence([
+    const book = demoBook(rollUpExitCadence([
       exitEngine({ engine: 'a', lifetime: { under: 500, over: 0 }, rth: { under: 500, over: 0 }, rthDecoupled: 500 }),
       exitEngine({ engine: 'b', lifetime: { under: 480, over: 20 }, rth: { under: 480, over: 20 }, rthDecoupled: 500 }),
-    ]);
-    expect(body.samples).toBe(1_000);
-    expect(body.atOrAbove30s).toBe(20);
+    ]));
+    expect(book.samples).toBe(1_000);
+    expect(book.atOrAbove30s).toBe(20);
     // 20 / 1,000 = 2% — the healthy engine does not rescue the sick one.
-    expect(body.p99Under30s).toBe(false);
-    expect(body.verdict).toBe('over_bar');
+    expect(book.p99Under30s).toBe(false);
+    expect(book.verdict).toBe('over_bar');
   });
 
   it('publishes `window: "rth"` so a reader can FAIL CLOSED on a pre-TRA-2269 build', () => {
@@ -3408,12 +3417,235 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     expect(handlers).toHaveLength(1);  // unauthenticated, like the rest of /api/health/*
     const res = fakeRes();
     handlers[0]!({}, res);
-    const body = res.body as Record<string, unknown>;
+    const body = res.body as ExitCadenceRollup & { ok: boolean; engines: unknown[] };
     expect(body.ok).toBe(true);
     expect(body.window).toBe('rth');
-    expect(body.p99Under30s).toBe(true);
-    expect((body.lifetime as Record<string, unknown>).p99Under30s).toBe(false);
-    expect((body.engines as unknown[]).length).toBe(1);
+    expect(body.partitionedBy).toBe('mode');
+    expect(body.books.demo.p99Under30s).toBe(true);
+    expect(body.books.demo.lifetime!.p99Under30s).toBe(false);
+    expect(body.engines.length).toBe(1);
+  });
+
+  // ── TRA-2645 ───────────────────────────────────────────────────────────────
+  //
+  // The instrument was scoped to the wrong POPULATION, which is the axis one out
+  // from TRA-2269's window. `enabled: armed.length > 0` was an OR over a
+  // mixed-mode fleet, so 57 armed demo engines published `enabled: true` over an
+  // unhoisted live book; `disarmed` could not be emitted while any demo engine
+  // was armed; and the graded ratio pooled two books that share no broker, no
+  // capital and no flag source.
+  //
+  // CONTROLS IN BOTH DIRECTIONS, per the standing rule. The known-bad must fire
+  // (a live book that disagrees is visible) AND the known-good must stay quiet
+  // (a healthy live book grades clean) AND — the one that matters here — the
+  // VACUOUS case must be BLIND rather than a free pass. The fixtures are the two
+  // shapes from `tra1648_live_exit_arm_controls.mjs`: the verbatim 58-demo/0-live
+  // payload TRA-2607 was filed on, and the 57-demo/1-live shape measured live on
+  // bqb1 at 2026-07-30T04:19:56Z.
+  describe('TRA-2645 — the readout is partitioned by book, and the aggregate refuses', () => {
+    const demoFleet = (n: number, armed = true) =>
+      Array.from({ length: n }, (_, i) => exitEngine({
+        engine: `engine-${i + 2}`,
+        timerArmed: armed,
+        lifetime: { under: 1_000, over: 0 },
+        rth: { under: 1_000, over: 0 },
+        rthDecoupled: 990,
+        rthTick: 10,
+      }));
+
+    const liveEngine = (o: {
+      timerArmed?: unknown;
+      mode?: unknown;
+      lifetime?: { under: number; over: number };
+      rth?: { under: number; over: number };
+      rthDecoupled?: number;
+      rthTick?: number;
+      closedIntervals?: number;
+    } = {}) => exitEngine({
+      engine: 'engine-1',
+      mode: 'mode' in o ? o.mode : 'live',
+      timerArmed: 'timerArmed' in o ? o.timerArmed : false,
+      lifetime: o.lifetime ?? { under: 0, over: 0 },
+      rth: o.rth ?? { under: 0, over: 0 },
+      rthDecoupled: o.rthDecoupled ?? 0,
+      rthTick: o.rthTick ?? 0,
+      closedIntervals: o.closedIntervals ?? 0,
+    });
+
+    /** The real 2026-07-30T04:19:56Z bqb1 shape: 1 live UNARMED + 57 demo ARMED. */
+    const TODAY = () => [liveEngine(), ...demoFleet(57, true)];
+    /** The payload TRA-2607 was filed on: 58 engines, ALL demo, all armed, ZERO live. */
+    const FILED_ON = () => demoFleet(58, true);
+
+    it('REPRODUCES THE BUG, THEN KILLS IT — the live book is a first-class line, not a member of a sum', () => {
+      const body = rollUpExitCadence(TODAY());
+
+      // What the OLD readout published on this exact fleet, and why it was a lie:
+      // `enabled: armed.length > 0` = true, `armedEngineCount: 57`,
+      // `engineCount: 58` — while the only engine carrying money was the ONE
+      // unarmed engine in it. There is no unscoped `enabled` left to read.
+      expect(body).not.toHaveProperty('enabled');
+      expect(body).not.toHaveProperty('armedEngineCount');
+
+      // The live book, scoped and named.
+      expect(body.liveEnabled).toBe(false);
+      expect(body.liveArmedEngineCount).toBe(0);
+      expect(body.liveEngineCount).toBe(1);
+      expect(body.books.live.blind).toBe(false);
+      expect(body.books.live.enabled).toBe(false);
+
+      // The demo book, scoped and named, and its 57 armed engines no longer
+      // vote on the live book's answer.
+      expect(body.demoEnabled).toBe(true);
+      expect(body.demoArmedEngineCount).toBe(57);
+      expect(body.demoEngineCount).toBe(57);
+      expect(body.engineCount).toBe(58);
+    });
+
+    it('AC3 — `disarmed` is REACHABLE per book: an unarmed live engine beside 57 armed demo engines grades the live book disarmed', () => {
+      // Structurally unreachable before: `armed.length === 0` could not hold
+      // while any demo engine was armed, INCLUDING in the world where every
+      // live engine is disarmed — which was the world we were actually in.
+      const body = rollUpExitCadence(TODAY());
+      expect(body.books.live.verdict).toBe('disarmed');
+      expect(body.books.live.gradeable).toBe(false);
+      expect(String(body.books.live.notGradeableReason)).toContain('mode=live');
+      // ...and the demo book is untouched by that verdict, in the same payload.
+      expect(body.books.demo.verdict).toBe('bounded');
+      expect(body.books.demo.gradeable).toBe(true);
+    });
+
+    it('AC4 — an EMPTY live population is BLIND, never a free pass (the verbatim payload TRA-2607 was filed on)', () => {
+      const body = rollUpExitCadence(FILED_ON());
+      expect(body.liveEngineCount).toBe(0);
+      expect(body.books.live.blind).toBe(true);
+      expect(body.books.live.verdict).toBe('no_engine_in_book');
+      expect(body.books.live.gradeable).toBe(false);
+      // Every graded term NULL, not 0 — a zero reads like a measurement.
+      expect(body.books.live.enabled).toBeNull();
+      expect(body.books.live.armedEngineCount).toBeNull();
+      expect(body.books.live.samples).toBeNull();
+      expect(body.books.live.p99Under30s).toBeNull();
+      expect(body.books.live.intervalHistogram).toBeNull();
+      expect(body.liveEnabled).toBeNull();
+      expect(String(body.books.live.blindReason)).toContain('FOR FREE');
+      // The demo book still grades — a blind live book does not blind the fleet.
+      expect(body.books.demo.blind).toBe(false);
+      expect(body.books.demo.armedEngineCount).toBe(58);
+    });
+
+    it('AC4 — `mode: null` blinds BOTH books rather than being filed as demo (`\'mode\' in e` passes on an explicit null)', () => {
+      const body = rollUpExitCadence([liveEngine(), { ...liveEngine(), engine: 'engine-x', mode: null as never }, ...demoFleet(3)]);
+      expect(body.unknownModeEngineCount).toBe(1);
+      expect(body.books.live.verdict).toBe('unreadable_partition');
+      expect(body.books.demo.verdict).toBe('unreadable_partition');
+      expect(body.books.live.blind).toBe(true);
+      expect(body.books.demo.blind).toBe(true);
+      expect(body.liveEnabled).toBeNull();
+      expect(body.demoEnabled).toBeNull();
+      // The engine of unknown book is NOT counted into either population.
+      expect(body.liveEngineCount).toBe(1);
+      expect(body.demoEngineCount).toBe(3);
+      expect(body.engineCount).toBe(5);
+    });
+
+    it('AC4 — an ABSENT `mode` key blinds too, and a non-boolean `timerArmed` blinds only that book', () => {
+      const noMode = rollUpExitCadence([liveEngine(), exitEngine({ engine: 'engine-x', mode: undefined, lifetime: { under: 0, over: 0 }, rth: { under: 0, over: 0 } })]);
+      expect(noMode.unknownModeEngineCount).toBe(1);
+      expect(noMode.books.live.verdict).toBe('unreadable_partition');
+
+      // "I cannot see the arm state" must never be published as "the hoist is
+      // disarmed" — right verdict, wrong cause, wrong human paged.
+      const noArm = rollUpExitCadence([liveEngine({ timerArmed: null }), ...demoFleet(2)]);
+      expect(noArm.books.live.verdict).toBe('unreadable_arm_state');
+      expect(noArm.books.live.blind).toBe(true);
+      expect(noArm.liveEnabled).toBeNull();
+      expect(noArm.books.demo.blind).toBe(false);
+      expect(noArm.books.demo.verdict).toBe('bounded');
+    });
+
+    it('KNOWN-GOOD, the other direction — a healthy ARMED live book grades clean and is NOT diluted by a sick demo fleet', () => {
+      // The instrument must be able to say PASS about the live book, or it is
+      // a rubber stamp with an alarm attached. 0 / 1,000 at or above the bar on
+      // the live engine, 400 / 1,000 (40%, a hard RED) on the demo fleet.
+      const body = rollUpExitCadence([
+        liveEngine({
+          timerArmed: true,
+          lifetime: { under: 1_000, over: 0 },
+          rth: { under: 1_000, over: 0 },
+          rthDecoupled: 990,
+          rthTick: 10,
+        }),
+        exitEngine({ engine: 'engine-2', lifetime: { under: 600, over: 400 }, rth: { under: 600, over: 400 }, rthDecoupled: 990, rthTick: 10 }),
+      ]);
+      expect(body.books.live.verdict).toBe('bounded');
+      expect(body.books.live.p99Under30s).toBe(true);
+      expect(body.books.live.gradeable).toBe(true);
+      expect(body.books.live.samples).toBe(1_000);
+      expect(body.books.live.atOrAbove30s).toBe(0);
+      // ...and the demo book's 40% does NOT leak into it. Pooled, the fleet
+      // would have read 400 / 2,000 = 20% and condemned the live book.
+      expect(body.books.demo.verdict).toBe('over_bar');
+      expect(body.books.demo.p99Under30s).toBe(false);
+    });
+
+    it('KNOWN-BAD, the other direction — a live book OVER the bar is visible even while the demo fleet is clean', () => {
+      // The mirror of the case above, and the one the pooled ratio hid: a live
+      // engine 1-in-58 cannot move a fleet-wide denominator.
+      const body = rollUpExitCadence([
+        liveEngine({
+          timerArmed: true,
+          lifetime: { under: 900, over: 100 },
+          rth: { under: 900, over: 100 },
+          rthDecoupled: 990,
+          rthTick: 10,
+        }),
+        ...demoFleet(57, true),
+      ]);
+      expect(body.books.live.p99Under30s).toBe(false);
+      expect(body.books.live.verdict).toBe('over_bar');
+      expect(body.books.live.gradeable).toBe(true);
+      expect(body.books.demo.verdict).toBe('bounded');
+      // Pooled — the OLD behaviour — 100 at-or-above out of 58,000 samples is
+      // 0.17%, comfortably UNDER the 1% bar. The defect, in one number.
+      const pooledSamples = body.books.live.samples! + body.books.demo.samples!;
+      const pooledOver = body.books.live.atOrAbove30s! + body.books.demo.atOrAbove30s!;
+      expect(pooledOver / pooledSamples).toBeLessThan(0.01);
+    });
+
+    it('AC2 — the AGGREGATE REFUSES: no pooled graded term survives, and the refusal names where to read instead', () => {
+      const body = rollUpExitCadence(TODAY());
+      expect(body.verdict).toBe('partitioned_by_book');
+      expect(body.gradeable).toBe(false);
+      expect(body.notGradeableReason).toContain('books.live');
+      expect(body.notGradeableReason).toContain('books.demo');
+      for (const pooled of [
+        'enabled', 'armedEngineCount', 'samples', 'atOrAbove30s', 'p99Under30s',
+        'intervalHistogram', 'lifetime', 'rthDecoupledPassCount', 'rthTickPassCount',
+        'rthDecoupledShare', 'rthBoundaryIntervals', 'rthClosedIntervals', 'partitionHolds',
+      ]) {
+        expect(body).not.toHaveProperty(pooled);
+      }
+    });
+
+    it('publishes `partitionedBy: "mode"` so a reader can FAIL CLOSED on a pre-TRA-2645 build', () => {
+      // Same contract as `window` (TRA-2269). The route is unauthenticated and
+      // read by scripts that cannot see which bytes answered them; absence of
+      // this marker means the payload in hand is the book-pooled one.
+      const body = rollUpExitCadence(TODAY());
+      expect(body.partitionedBy).toBe('mode');
+      expect(body.note).toContain('partitionedBy');
+      expect(body.note).toContain('no_engine_in_book');
+    });
+
+    it('leaves the fleet-summed `tickExitRegionMs` alone — TRA-2305/TRA-2268 grade that exact accumulator', () => {
+      // Moving it per-book would silently change someone else's subject. It is
+      // published fleet-scoped at the top level AND per book, additively.
+      const body = rollUpExitCadence(TODAY());
+      expect(body.tickExitRegionMs.samples).toBe(0);
+      expect(body.books.live.tickExitRegionMs).not.toBeNull();
+      expect(body.decoupledFireCount).toBe(0);
+    });
   });
 });
 

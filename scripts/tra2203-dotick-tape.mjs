@@ -213,6 +213,20 @@ const BOOT_TRANSIENT_MS = 120_000;
 // regression control: grading the 07-23 tape stamped it "hoist ARMED", which is
 // flatly false — the arm landed 07-24 12:39Z. So carry `startedAt` and refuse to
 // apply the arm state to a window the running process did not live through.
+//
+// ⛔⛔ TRA-2645 — AND IT USED TO READ THE *WRONG POPULATION*. This function read
+// `b.enabled` / `b.armedEngineCount`, which were an OR and a SUM over a
+// MIXED-MODE fleet: 57 armed demo engines plus the one `mode=live` book routed
+// to production Tradier ***0154 published `enabled: true, armedEngineCount: 57`
+// while the only engine that carries money read `timerArmed: false`. The branch
+// below then printed "the exit hoist is ARMED" — fleet-wide arming reported as
+// coverage — about a live book with no exit timer at all.
+//
+// The route is now partitioned by book (`partitionedBy: 'mode'`, `books.live` /
+// `books.demo`) and there is no unscoped `enabled` left. This reads BOTH books
+// and FAILS CLOSED on the marker's absence: a pre-TRA-2645 payload cannot answer
+// the per-book question, and its pooled `enabled` must not be substituted for
+// one.
 async function pullExitArm() {
   try {
     const res = await fetch('https://tradingai-bqb1.onrender.com/api/health/exit-cadence',
@@ -220,10 +234,34 @@ async function pullExitArm() {
     if (!res.ok) return null;
     const b = await res.json();
     const modes = [...new Set((b.engines ?? []).map(e => e.mode))].sort();
+    // FAIL CLOSED on a pre-TRA-2645 build. `partitionedBy` is absent there, and
+    // so is `books`; the fields that DO exist are pooled across books and are
+    // not this question's answer. `undefined` must not read as "fine".
+    const partitioned = b.partitionedBy === 'mode' && b.books && typeof b.books === 'object';
+    const live = partitioned ? b.books.live : null;
+    const demo = partitioned ? b.books.demo : null;
     return {
-      enabled: !!b.enabled,
+      partitioned,
+      // Per book, and NULL when that book is blind (not resident / unreadable
+      // `mode` / non-boolean `timerArmed`). Null is "I cannot see it", which is
+      // a different fact from `false` and must never be printed as one.
+      liveEnabled: live ? live.enabled : null,
+      liveVerdict: live ? live.verdict : null,
+      liveBlind: live ? !!live.blind : null,
+      liveBlindReason: live ? live.blindReason : null,
+      liveArmedEngineCount: live ? live.armedEngineCount : null,
+      liveEngineCount: b.liveEngineCount ?? null,
+      liveGradeable: live ? live.gradeable : null,
+      liveP99Under30s: live ? live.p99Under30s : null,
+      demoEnabled: demo ? demo.enabled : null,
+      demoVerdict: demo ? demo.verdict : null,
+      demoBlind: demo ? !!demo.blind : null,
+      demoArmedEngineCount: demo ? demo.armedEngineCount : null,
+      demoEngineCount: b.demoEngineCount ?? null,
+      demoGradeable: demo ? demo.gradeable : null,
+      demoP99Under30s: demo ? demo.p99Under30s : null,
+      unknownModeEngineCount: b.unknownModeEngineCount ?? null,
       engineCount: b.engineCount ?? 0,
-      armedEngineCount: b.armedEngineCount ?? 0,
       modes: modes.length ? `mode=${modes.join('+')}` : 'mode unknown',
       // TRA-2269 — `p99Under30s` is meaningless without the population it was
       // computed over and without the route's own refusal flag. `window` is
@@ -231,15 +269,50 @@ async function pullExitArm() {
       // ratio contaminated by closed-market intervals; carry it through
       // explicitly rather than letting `undefined` read as "fine".
       window: b.window ?? 'lifetime_pre_tra2269',
-      gradeable: b.gradeable ?? null,
-      notGradeableReason: b.notGradeableReason ?? null,
-      p99Under30s: b.p99Under30s ?? null,
+      partitionedBy: b.partitionedBy ?? 'pooled_pre_tra2645',
       maxExitIntervalMs: b.maxExitIntervalMs ?? null,
       // The instant this reading describes. Compared against the window below.
       readAt: b.time ?? null,
       startedAt: b.build?.startedAt ?? null,
     };
   } catch { return null; }
+}
+
+/** TRA-2645 — one book's arm state as a printable clause. Blind is never "disarmed". */
+function armClause(book, enabled, armedCount, engineCount, verdict) {
+  if (enabled === null || enabled === undefined) {
+    return `${book}: UNREADABLE (verdict=${verdict ?? 'n/a'}) — NOT "disarmed"`;
+  }
+  return `${book}: ${enabled ? 'ARMED' : 'DISARMED'} (${armedCount}/${engineCount} engines, verdict=${verdict})`;
+}
+
+/**
+ * TRA-2645 — WHICH CURVE IS THE hourly doTick table? Pure, exported and
+ * controlled (`--selftest`) rather than inline, for the reason the whole ticket
+ * exists: the branch it replaces (`arm.enabled && arm.armedEngineCount > 0`)
+ * was ALSO one line of unexercised inline logic, and it spent days printing
+ * "the exit hoist is ARMED" about a live book that had no exit timer.
+ *
+ * Tags, in evaluation order — the first four are all REFUSALS and none of them
+ * may be reported as "disarmed":
+ *   unreadable      — the route did not answer at all.
+ *   pooled_build    — pre-TRA-2645 payload: `enabled` is an OR over both books.
+ *   window_mismatch — the answering process booted AFTER the graded window.
+ *   book_unreadable — a book is blind (not resident / bad `mode` / bad `timerArmed`).
+ *   armed           — at least one book has a live timer ⇒ tick-cost curve for it.
+ *   disarmed        — BOTH books readable and neither armed ⇒ exit-latency curve.
+ */
+export function classifyExitArmCurve(arm, to) {
+  if (arm === null || arm === undefined) return 'unreadable';
+  if (!arm.partitioned) return 'pooled_build';
+  if (!(arm.startedAt && arm.startedAt <= to)) return 'window_mismatch';
+  if (arm.liveEnabled === true || arm.demoEnabled === true) return 'armed';
+  // Ordered AFTER `armed` on purpose: a readable ARMED book is a fact worth
+  // printing even when the other book is blind, and the printed clause names
+  // the blind one anyway. A blind book only decides the verdict when nothing
+  // is armed — where the alternative would be to call it "disarmed".
+  if (arm.liveEnabled == null || arm.demoEnabled == null) return 'book_unreadable';
+  return 'disarmed';
 }
 
 const inBootWindow = (ts, boots) => boots.some(b => {
@@ -288,7 +361,86 @@ function grade(recs) {
   };
 }
 
+/**
+ * TRA-2645 — `--selftest`: control the curve classifier in BOTH directions.
+ *
+ * The branch this replaces was one inline line, and the reason it published
+ * "the exit hoist is ARMED" over an unhoisted live book for days is that
+ * nothing ever ran it against a fleet where the two books disagreed. The
+ * known-bad here CONTAINS what the instrument detects (a 57-demo-armed /
+ * 1-live-unarmed fleet — the verbatim 2026-07-30T04:19:56Z bqb1 shape), and the
+ * known-good is a genuinely all-disarmed fleet that must NOT be reported as
+ * armed. Exit 0 = every control holds, 1 = the suite failed.
+ */
+function runSelfTest() {
+  const WINDOW_TO = '2026-07-30T20:00:00Z';
+  const BOOTED_BEFORE = '2026-07-30T13:00:00Z';
+  const BOOTED_AFTER = '2026-07-30T21:00:00Z';
+  const base = {
+    partitioned: true, startedAt: BOOTED_BEFORE,
+    liveEnabled: false, demoEnabled: false,
+    liveArmedEngineCount: 0, demoArmedEngineCount: 0,
+    liveEngineCount: 1, demoEngineCount: 57,
+    liveVerdict: 'disarmed', demoVerdict: 'disarmed',
+  };
+  const cases = [
+    // ── The defect itself. Pre-fix this returned "armed" via the pooled OR and
+    //    printed fleet-wide arming as coverage over a live book with no timer.
+    ['THE BUG: 57 demo ARMED + 1 live UNARMED must not be a single "armed" verdict',
+      { ...base, demoEnabled: true, demoArmedEngineCount: 57, demoVerdict: 'bounded' }, 'armed'],
+    // ...and the printed clause must say the live book is DISARMED, not inherit
+    // the fleet's answer. This is the assertion the old code could not make.
+    ['...and the live clause reads DISARMED',
+      null, null,
+      () => armClause('live', false, 0, 1, 'disarmed').includes('DISARMED')],
+    ['KNOWN-GOOD: both books disarmed => disarmed (the instrument can still say so)',
+      base, 'disarmed'],
+    ['KNOWN-GOOD: live armed => armed', { ...base, liveEnabled: true, liveArmedEngineCount: 1, liveVerdict: 'bounded' }, 'armed'],
+    // ── The four refusals. None of these may be reported as "disarmed".
+    ['REFUSAL: route unreadable', null, 'unreadable'],
+    ['REFUSAL: pre-TRA-2645 pooled build (no `partitionedBy`)', { ...base, partitioned: false }, 'pooled_build'],
+    ['REFUSAL: answering process booted AFTER the window', { ...base, startedAt: BOOTED_AFTER }, 'window_mismatch'],
+    ['REFUSAL: no `startedAt` at all', { ...base, startedAt: null }, 'window_mismatch'],
+    ['REFUSAL: live book BLIND (no mode=live engine) is NOT "disarmed"',
+      { ...base, liveEnabled: null, liveArmedEngineCount: null, liveEngineCount: 0, liveVerdict: 'no_engine_in_book' },
+      'book_unreadable'],
+    ['REFUSAL: live book BLIND on unreadable `timerArmed` is NOT "disarmed"',
+      { ...base, liveEnabled: null, liveVerdict: 'unreadable_arm_state' }, 'book_unreadable'],
+    ['REFUSAL: unreadable `mode` blinds both books', { ...base, liveEnabled: null, demoEnabled: null, liveVerdict: 'unreadable_partition', demoVerdict: 'unreadable_partition' }, 'book_unreadable'],
+    // A blind book must not SUPPRESS a readable armed one — the printed clause
+    // names the blind book, so refusing here would lose a real fact.
+    ['a BLIND demo book beside an ARMED live book still reads armed',
+      { ...base, liveEnabled: true, liveArmedEngineCount: 1, liveVerdict: 'bounded', demoEnabled: null, demoVerdict: 'no_engine_in_book' },
+      'armed'],
+    // And the clause never launders a null into "DISARMED".
+    ['a null `enabled` prints UNREADABLE, never DISARMED', null, null,
+      () => {
+        const s = armClause('live', null, null, 0, 'no_engine_in_book');
+        return s.includes('UNREADABLE') && !s.includes('DISARMED');
+      }],
+  ];
+  let failed = 0;
+  for (const [name, arm, want, predicate] of cases) {
+    const ok = predicate ? predicate() : classifyExitArmCurve(arm, WINDOW_TO) === want;
+    if (!ok) {
+      failed += 1;
+      const got = predicate ? 'predicate false' : classifyExitArmCurve(arm, WINDOW_TO);
+      console.log(`  FAIL  ${name}\n        wanted ${want ?? 'true'}, got ${got}`);
+    } else {
+      console.log(`  ok    ${name}`);
+    }
+  }
+  console.log('');
+  console.log(failed === 0
+    ? `TRA-2645 curve-classifier controls: ${cases.length}/${cases.length} hold.`
+    : `TRA-2645 curve-classifier controls: ${failed} of ${cases.length} FAILED.`);
+  return failed === 0 ? 0 : 1;
+}
+
 (async () => {
+  if (has('--selftest')) {
+    process.exit(runSelfTest());
+  }
   console.error(`[tape] window ${FROM} -> ${TO}`);
   const recs = await pullTape(FROM, TO);
   if (!recs.length) {
@@ -403,21 +555,44 @@ function grade(recs) {
   // The live read only describes THIS window if the process answering it was
   // already running when the window closed. Otherwise it is a fact about a
   // later process and must not be applied backwards.
-  const armCoversWindow = arm && arm.startedAt && arm.startedAt <= TO;
-  if (arm === null) {
+  //
+  // TRA-2645 — AND IT IS ANSWERED PER BOOK. The old branch here was
+  // `arm.enabled && arm.armedEngineCount > 0`, an OR/SUM over a mixed-mode
+  // fleet, so 57 armed demo engines made this print "the exit hoist is ARMED"
+  // over a live book that had no exit timer. The live book gets its own line
+  // because it is the only one that carries money, and a book we cannot read is
+  // reported as UNREADABLE, never as DISARMED.
+  const curve = classifyExitArmCurve(arm, TO);
+  const bookLines = () => {
+    console.log(`    ${armClause('live', arm.liveEnabled, arm.liveArmedEngineCount, arm.liveEngineCount, arm.liveVerdict)}`);
+    console.log(`    ${armClause('demo', arm.demoEnabled, arm.demoArmedEngineCount, arm.demoEngineCount, arm.demoVerdict)}`);
+    if (arm.liveBlindReason) console.log(`    live: ${arm.liveBlindReason}`);
+  };
+  if (curve === 'unreadable') {
     console.log('doTick by UTC hour  [arm state UNREADABLE — do NOT quote this as exit latency]:');
-  } else if (!armCoversWindow) {
+  } else if (curve === 'pooled_build') {
+    console.log(`doTick by UTC hour  [PRE-TRA-2645 BUILD — the exit-cadence route answering this probe`);
+    console.log(`  has no \`partitionedBy: "mode"\` marker, so its \`enabled\`/\`armedEngineCount\` are an OR`);
+    console.log(`  and a SUM over a MIXED-MODE fleet (57 demo + 1 live on bqb1). That cannot say whether`);
+    console.log(`  the LIVE book's hoist was armed, and substituting the pooled value is the defect`);
+    console.log(`  TRA-2645 fixed. Establish the per-book arm state another way before quoting this.]`);
+  } else if (curve === 'window_mismatch') {
     console.log(`doTick by UTC hour  [WHICH CURVE THIS IS, IS UNKNOWN. The live exit-cadence read`);
     console.log(`  describes a process that booted ${arm.startedAt} — AFTER this window closed, so it`);
     console.log(`  says nothing about whether the hoist was armed then. Establish the arm state for the`);
     console.log(`  window from that session's own evidence before calling this exit latency.]`);
-  } else if (arm.enabled && arm.armedEngineCount > 0) {
-    console.log(`doTick by UTC hour — TICK-COST curve ONLY. The exit hoist is ARMED `
-      + `(${arm.armedEngineCount}/${arm.engineCount} engines,`);
-    console.log(`  ${arm.modes}), so exit latency for those engines is NOT this table — read it off`);
-    console.log(`  /api/health/exit-cadence. It REMAINS the exit-latency curve for any UNARMED engine.`);
+  } else if (curve === 'armed') {
+    console.log(`doTick by UTC hour — TICK-COST curve for any ARMED engine, exit-latency curve for any`);
+    console.log(`  UNARMED one. Arm state BY BOOK (${arm.modes}):`);
+    bookLines();
+    console.log(`  Exit latency for an ARMED book is NOT this table — read books.<book> off`);
+    console.log(`  /api/health/exit-cadence. ⛔ Never quote the demo book's number about the live one.`);
+  } else if (curve === 'book_unreadable') {
+    console.log(`doTick by UTC hour  [AT LEAST ONE BOOK IS UNREADABLE — do NOT quote this as exit latency]:`);
+    bookLines();
   } else {
-    console.log('Exit-latency curve (parent doTick by UTC hour) — hoist DISARMED, so interval == tick duration:');
+    console.log('Exit-latency curve (parent doTick by UTC hour) — hoist DISARMED on BOTH books, so interval == tick duration:');
+    bookLines();
   }
   for (const [h, v] of [...hourly.entries()].sort()) {
     const s = stats(v);
