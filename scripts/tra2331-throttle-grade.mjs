@@ -64,13 +64,43 @@
  * have collided with "old build" under `?? false`.
  *
  * Below the TRA-2375 cliff the key is absent and this script falls back to a
- * STRUCTURE-based proxy, saying so in every output. Note the fallback is
- * per-row but the LABEL is per-run: one un-stamped row downgrades the whole
- * report to PROXY, which is deliberate — a mixed-basis partition reported as
- * `exact` would be the same silent-contamination shape this section exists to
- * prevent. The proxy is an ALLOWLIST, not a denylist: an unrecognised structure
- * is counted as `unclassified` and excluded from BOTH arms rather than
- * defaulting into one.
+ * STRUCTURE-based proxy, saying so in every output. The proxy is an ALLOWLIST,
+ * not a denylist: an unrecognised structure is counted as `unclassified` and
+ * excluded from BOTH arms rather than defaulting into one.
+ *
+ * ── WHY THE BASIS IS A SPLIT, NOT ONE DEGRADED LABEL (TRA-2653 D1) ─────────
+ *
+ * This used to collapse to a single per-run label: one un-stamped row and the
+ * whole report read `basis=PROXY`. That made `basis=EXACT` A SUCCESS CONDITION
+ * WITH NO REACHABLE STATE. The population cliff below is the TRA-2339 one
+ * (2026-07-26T00:08Z); the first Render boot carrying TRA-2375 was 2.9 days
+ * LATER (2026-07-28T23:10:53Z — the fix sat merged-but-undeployed for 2d16h).
+ * The 11 demo rows opened inside that gap are permanently in the population —
+ * the cliff is a fixed constant, so they never age out — and they permanently
+ * lack the key, CORRECTLY, because a pre-TRA-2375 build wrote them. So no
+ * future state of the book could ever print EXACT.
+ *
+ * That is worse than inert: TRA-2570's grading step told the reader to treat
+ * PROXY as a writer regression and escalate, which would have filed a false
+ * `high` against a fix working perfectly. The absence had TWO possible causes
+ * and the label named neither.
+ *
+ * So the run now reports exact/proxy COUNTS and ATTRIBUTES EVERY PROXY ROW to a
+ * reason, because the two reasons are not the same fact:
+ *
+ *   PRE_PATH_BUILD   openTs < the TRA-2375 boot cliff ⇒ the build that wrote
+ *                    the row could not stamp it. EXPECTED. Never a defect.
+ *   POST_CLIFF_UNSTAMPED  openTs ≥ the cliff on a build that DOES carry
+ *                    TRA-2375 ⇒ the writer broke. This is a FAIL, and it is
+ *                    checked as its own WRITER_REGRESSED arm below.
+ *   UNATTRIBUTABLE   git could not resolve whether the running build carries
+ *                    TRA-2375. Reported, never silently folded into the first.
+ *
+ * Attribution is ASSERTED to be total: any residue prints as UNACCOUNTED rather
+ * than vanishing. Raising the population cliff to the TRA-2375 boot would have
+ * produced a cosmetic EXACT by DISCARDING those 11 rows from an already
+ * underpowered cohort (n(T)=0, n(U)=18, MIN_N=135) — the scoping is right; it
+ * was the reporting that was wrong.
  *
  * Residual leak of the PROXY path only (gone once rows are stamped): the
  * bounded-live OTM override (signal-engine.ts :7436) journals
@@ -84,7 +114,13 @@
  *   FAIL       WRITER_REGRESSED     post-cliff rows on a stamping build lack
  *                                   the stamp ⇒ the writer broke, and the
  *                                   since-boot counters would render that as a
- *                                   quiet week.
+ *                                   quiet week. TWO arms, each with its own
+ *                                   cliff: `riskThrottleMultiplier` above the
+ *                                   TRA-2339 cliff, and `riskThrottleSizingPath`
+ *                                   above the TRA-2375 BOOT cliff. The second
+ *                                   arm is what keeps D1's attribution honest —
+ *                                   softening pre-cliff absence must not soften
+ *                                   a genuine post-cliff regression.
  *   FAIL       INVARIANT_VIOLATED   applied > 1, decided > 1, or applied <
  *                                   decided (the clamp is tighten-only and the
  *                                   applied term can never beat the decided one).
@@ -136,11 +172,51 @@ const STAMP_DECIDED_COMMIT = '1926abf';
  */
 const DEFAULT_STAMP_SINCE = Date.parse('2026-07-26T00:08:00Z');
 
+/** TRA-2375 — the commit that added `riskThrottleSizingPath` to the journal row. */
+const STAMP_PATH_COMMIT = '4364063';
+/**
+ * The TRA-2375 BOOT cliff — deliberately NOT the merge time and NOT the live
+ * process `startedAt`.
+ *
+ * `4364063` merged 2026-07-26T06:18:42Z but bqb1 is `autoDeploy=no`, so the
+ * first boot that could write the field was deploy `4df4e418`, finished
+ * **2026-07-28T23:10:53.456Z** — derived by walking every deploy in
+ * `GET /v1/services/srv-d7mb7rr7uimc73ev0chg/deploys` and testing
+ * `git merge-base --is-ancestor 4364063 <commit>` on each. Merge time would
+ * mis-attribute the 2d16h undeployed gap to the writer; the live `startedAt`
+ * would discard every already-stamped row and manufacture a NO-TAPE.
+ *
+ * Re-verified against live tape 2026-07-30 (2445 rows served): 0 of 2421
+ * pre-cliff rows carry the key, 24 of 24 post-cliff rows do. The absence set is
+ * byte-for-byte the pre-cliff set — so this constant is the exact discriminator
+ * between "old build" and "broken writer", which is D1's whole point.
+ */
+const DEFAULT_PATH_STAMP_SINCE = Date.parse('2026-07-28T23:10:53.456Z');
+
 /**
  * Structures whose open path DOES consult a risk-throttle chokepoint
  * (`options_single_leg`, `options_otm`). Allowlist on purpose — see above.
+ *
+ * `single_leg_directional` was MISSING here until TRA-2653, and the live stamp
+ * is what refuted the omission rather than a re-read of the signal engine:
+ * 13 of 13 post-TRA-2375-cliff `single_leg_directional` rows carry
+ * `riskThrottleSizingPath: 'options_single_leg'` (verified 2026-07-30 on the
+ * full `?rows=all` tape; the other 11 post-cliff rows are `single_leg_otm` →
+ * `options_otm`). The omission made the SAME structure read `ineligible` when a
+ * pre-cliff row was classified by proxy and `eligible` when a post-cliff row
+ * was classified by stamp, so every historical PROXY-basis grade under-counted
+ * the cohort and shrank the n it exists to accumulate.
+ *
+ * ⚠ `single_leg_rv` remains an allowlist member REASONED FROM SOURCE, not
+ * proven by stamp: it does not appear anywhere in the post-cliff tape, so no
+ * live row has yet confirmed it consults a chokepoint. Do not read this set as
+ * fully stamp-verified — only `single_leg_directional` and `single_leg_otm` are.
  */
-const CHOKEPOINT_STRUCTURES = new Set(['single_leg_rv', 'single_leg_otm']);
+const CHOKEPOINT_STRUCTURES = new Set([
+  'single_leg_rv',
+  'single_leg_directional',
+  'single_leg_otm',
+]);
 /** Wheel opens take no sizing scalar (signal-engine.ts :9151). */
 const WHEEL_ARCHETYPES = new Set(['wheel-csp', 'wheel-cc']);
 /** TRA-1475 / QA-fixture mirror trap — mirrors are bit-identical but id-distinct. */
@@ -196,6 +272,7 @@ const MIN_N = Number(argOf('min-n', DEFAULT_MIN_N));
 /** Contrast treated as materially large enough to act on (one sleeve-mean R). */
 const MATERIAL_EFFECT_R = 0.0577;
 const STAMP_SINCE = Number(argOf('stamp-since', DEFAULT_STAMP_SINCE));
+const PATH_STAMP_SINCE = Number(argOf('path-stamp-since', DEFAULT_PATH_STAMP_SINCE));
 
 // ── statistics ─────────────────────────────────────────────────────────────
 
@@ -277,12 +354,28 @@ export function eligibility(row) {
  * grades has never been shown to go red, and an assertion that cannot fail is
  * decoration. `--selftest` drives this same function to every verdict.
  */
-export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT_STAMP_SINCE, minN = DEFAULT_MIN_N }) {
+export function grade({
+  rows,
+  buildCommit,
+  stampsSupported,
+  // Does the RUNNING build carry TRA-2375? `null` = git could not resolve it.
+  // Defaulting to null rather than to `stampsSupported` on purpose: the two are
+  // different commits with different deploy dates, and inheriting one for the
+  // other is exactly the conflation D1 is about. A null never claims a
+  // regression and never quietly reads as "expected" — it prints
+  // UNATTRIBUTABLE.
+  pathStampsSupported = null,
+  stampSince = DEFAULT_STAMP_SINCE,
+  pathStampSince = DEFAULT_PATH_STAMP_SINCE,
+  minN = DEFAULT_MIN_N,
+}) {
   const lines = [];
   const dropped = { fixture: 0, unattributed: 0, open: 0, notDemo: 0, preCliff: 0, ineligible: 0, unclassified: 0, void: 0 };
+  const hasKey = (r, k) => Object.prototype.hasOwnProperty.call(r, k);
 
-  lines.push(`build      ${buildCommit ?? 'UNKNOWN'}  stampsSupported=${stampsSupported}`);
+  lines.push(`build      ${buildCommit ?? 'UNKNOWN'}  stampsSupported=${stampsSupported}  pathStampsSupported=${pathStampsSupported}`);
   lines.push(`cliff      openTs >= ${new Date(stampSince).toISOString()}  (TRA-2333 ${STAMP_APPLIED_COMMIT} / TRA-2339 ${STAMP_DECIDED_COMMIT})`);
+  lines.push(`path cliff openTs >= ${new Date(pathStampSince).toISOString()}  (TRA-2375 ${STAMP_PATH_COMMIT}, FIRST CARRYING BOOT — attribution only, does NOT scope the population)`);
 
   // ── VOID gates. Fail closed: a blind read must never resolve to 0. ───────
   if (stampsSupported == null) {
@@ -333,8 +426,41 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
       dropped,
       cohorts: null,
       stats: null,
+      regressedField: 'riskThrottleMultiplier',
       unstampedIds: unstamped.slice(0, 20).map((r) => r.id),
     };
+  }
+
+  // ── WRITER REGRESSION, arm 2: the TRA-2375 path stamp.
+  //
+  //    D1 stops attributing PRE-cliff absence to the writer. It must NOT stop
+  //    attributing POST-cliff absence, or the softening would swallow the very
+  //    regression the split exists to isolate. This arm has its OWN cliff (the
+  //    first boot carrying 4364063) and its OWN build gate: it can only fire on
+  //    a build proven to carry TRA-2375, so an un-resolvable build reports
+  //    UNATTRIBUTABLE below instead of a FAIL it cannot justify.
+  if (pathStampsSupported === true) {
+    const pathUnstamped = desk.filter(
+      (r) => r.openTs >= pathStampSince && !hasKey(r, 'riskThrottleSizingPath'),
+    );
+    if (pathUnstamped.length > 0) {
+      lines.push(
+        `FAIL  WRITER_REGRESSED — ${pathUnstamped.length}/${desk.length} rows opened after the TRA-2375 boot cliff ` +
+          `(${new Date(pathStampSince).toISOString()}) carry no riskThrottleSizingPath on a build that writes it. ` +
+          `Structures: ${[...new Set(pathUnstamped.map((r) => r.structure))].join(', ')}. ` +
+          `This is NOT the pre-cliff build-age case — those rows are attributed PRE_PATH_BUILD and are expected.`,
+      );
+      return {
+        verdict: 'FAIL',
+        reason: 'WRITER_REGRESSED',
+        lines,
+        dropped,
+        cohorts: null,
+        stats: null,
+        regressedField: 'riskThrottleSizingPath',
+        unstampedIds: pathUnstamped.slice(0, 20).map((r) => r.id),
+      };
+    }
   }
 
   if (desk.length === 0) {
@@ -343,20 +469,53 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
   }
 
   // ── eligibility ─────────────────────────────────────────────────────────
-  let basis = 'exact';
+  //
+  // The basis is a SPLIT, not one degraded label (TRA-2653 D1). Every proxy row
+  // is attributed to a named reason, and the attribution is asserted total.
   const eligible = [];
+  const basisCount = { exact: 0, proxy: 0 };
+  const proxyReason = { PRE_PATH_BUILD: 0, POST_CLIFF_UNSTAMPED: 0, UNATTRIBUTABLE: 0 };
   for (const r of desk) {
     const e = eligibility(r);
-    if (e.basis === 'proxy') basis = 'proxy';
+    basisCount[e.basis] += 1;
+    if (e.basis === 'proxy') {
+      if (r.openTs < pathStampSince) proxyReason.PRE_PATH_BUILD += 1;
+      else if (pathStampsSupported === true) proxyReason.POST_CLIFF_UNSTAMPED += 1;
+      else proxyReason.UNATTRIBUTABLE += 1;
+    }
     if (e.unclassified) dropped.unclassified += 1;
     if (!e.eligible) { dropped.ineligible += 1; continue; }
     eligible.push(r);
   }
+  const basis =
+    basisCount.proxy === 0 ? 'exact' : basisCount.exact === 0 ? 'proxy' : 'mixed';
+  const basisReport = { basis, exact: basisCount.exact, proxy: basisCount.proxy, proxyReason };
   lines.push(
-    `eligibility basis=${basis.toUpperCase()}  eligible=${eligible.length}  ineligible(out-of-cohort)=${dropped.ineligible}  unclassified-structure=${dropped.unclassified}`,
+    `eligibility basis=${basis.toUpperCase()}  exact=${basisCount.exact}  proxy=${basisCount.proxy}  ` +
+      `eligible=${eligible.length}  ineligible(out-of-cohort)=${dropped.ineligible}  unclassified-structure=${dropped.unclassified}`,
   );
-  if (basis === 'proxy') {
-    lines.push('  ⚠ PROXY partition — TRA-2375 (riskThrottleSizingPath) not on these rows. Residual leak: bounded-live OTM 1-ct override, biases toward the NULL.');
+  if (basisCount.proxy > 0) {
+    // Name a reason for EVERY proxy row. A residue prints as UNACCOUNTED rather
+    // than disappearing — an attribution that silently loses rows is the same
+    // shape as the single label it replaced.
+    const accounted = proxyReason.PRE_PATH_BUILD + proxyReason.POST_CLIFF_UNSTAMPED + proxyReason.UNATTRIBUTABLE;
+    const parts = [
+      `PRE_PATH_BUILD=${proxyReason.PRE_PATH_BUILD} (opened before the TRA-2375 boot cliff — EXPECTED, never a writer defect)`,
+    ];
+    if (proxyReason.POST_CLIFF_UNSTAMPED > 0) {
+      parts.push(`POST_CLIFF_UNSTAMPED=${proxyReason.POST_CLIFF_UNSTAMPED} (⚠ a writer defect — should have failed above)`);
+    }
+    if (proxyReason.UNATTRIBUTABLE > 0) {
+      parts.push(`UNATTRIBUTABLE=${proxyReason.UNATTRIBUTABLE} (git could not confirm the running build carries ${STAMP_PATH_COMMIT}; NOT evidence the writer is fine)`);
+    }
+    if (accounted !== basisCount.proxy) {
+      parts.push(`UNACCOUNTED=${basisCount.proxy - accounted} (⚠ attribution is not total — this is a bug in the grader, not in the writer)`);
+    }
+    lines.push(`  proxy attribution: ${parts.join(' · ')}`);
+    lines.push('  ⚠ proxy rows are partitioned by STRUCTURE, not by stamp. Residual leak: bounded-live OTM 1-ct override, biases toward the NULL.');
+  }
+  if (basis === 'exact') {
+    lines.push('  ✓ EXACT — every row in the population carries riskThrottleSizingPath. Note this is UNREACHABLE while the population cliff (TRA-2339) sits below the TRA-2375 boot cliff and those 11 gap rows survive; see the header.');
   }
 
   // ── invariants ──────────────────────────────────────────────────────────
@@ -379,7 +538,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
       `FAIL  INVARIANT_VIOLATED — ${bad.length} row(s) with applied>1, decided>1, non-positive, or applied<decided. ` +
         `The clamp is tighten-only and applied ≤ 1 always; applied < decided is impossible at any scope.`,
     );
-    return { verdict: 'FAIL', reason: 'INVARIANT_VIOLATED', lines, dropped, cohorts: null, stats: null, badIds: bad.slice(0, 20).map((r) => r.id) };
+    return { verdict: 'FAIL', reason: 'INVARIANT_VIOLATED', lines, dropped, basisReport, cohorts: null, stats: null, badIds: bad.slice(0, 20).map((r) => r.id) };
   }
 
   // ── cohorts ─────────────────────────────────────────────────────────────
@@ -408,7 +567,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
         `This is a MEASURED NO-OP: arming changed nothing, which is neither evidence it works nor that it is safe. ` +
         `n(W)=${W.length} says how often it WOULD have trimmed on an unarmed path.`,
     );
-    return { verdict: 'NOT-GRADED', reason: 'NO_THROTTLED_FILLS', lines, dropped, cohorts, stats: null };
+    return { verdict: 'NOT-GRADED', reason: 'NO_THROTTLED_FILLS', lines, dropped, basisReport, cohorts, stats: null };
   }
 
   const rT = T.map((r) => r.realizedR);
@@ -434,7 +593,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
         `${stats ? `At this n the test resolves only ${stats.mde.toFixed(4)}R; the floor is where MDE reaches ${MATERIAL_EFFECT_R}R. ` : ''}` +
         `Keep the routine armed and re-run; do not read a small-n point estimate as a verdict.`,
     );
-    return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, cohorts, stats };
+    return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, basisReport, cohorts, stats };
   }
 
   if (!stats.excludesZero) {
@@ -442,7 +601,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
       `NOT-GRADED  UNDERPOWERED — the 95% CI on the contrast straddles 0. No selection effect is demonstrated in either direction. ` +
         `This run could only have resolved ${stats.mde.toFixed(4)}R, so it rules out effects LARGER than that and nothing smaller.`,
     );
-    return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, cohorts, stats };
+    return { verdict: 'NOT-GRADED', reason: 'UNDERPOWERED', lines, dropped, basisReport, cohorts, stats };
   }
 
   // A significant result whose effect is SMALLER than the run's own 80%-power
@@ -462,7 +621,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
       `FAIL  SELECTION_ADVERSE — throttled fills realise HIGHER R than un-throttled ones (diff=${stats.diff.toFixed(4)}, CI excludes 0). ` +
         `The trigger is trimming the better trades: Δ$ = (m−1)·mean_R(T)·risk·n < 0. DISARM (set RISK_THROTTLE_SIZING_ENABLED=off).`,
     );
-    return { verdict: 'FAIL', reason: 'SELECTION_ADVERSE', lines, dropped, cohorts, stats };
+    return { verdict: 'FAIL', reason: 'SELECTION_ADVERSE', lines, dropped, basisReport, cohorts, stats };
   }
 
   lines.push(
@@ -470,7 +629,7 @@ export function grade({ rows, buildCommit, stampsSupported, stampSince = DEFAULT
       `The de-risk trigger selects worse trades, so trimming them is money-positive on the mean. ` +
       `This grades the DEMO sleeve only; the live arm remains a separate board call under the TRA-1897 hold.`,
   );
-  return { verdict: 'PASS', reason: 'SELECTION_CONFIRMED', lines, dropped, cohorts, stats };
+  return { verdict: 'PASS', reason: 'SELECTION_CONFIRMED', lines, dropped, basisReport, cohorts, stats };
 }
 
 // ── reachability ───────────────────────────────────────────────────────────
@@ -492,7 +651,8 @@ function reachability(scopeRead) {
   const label = !known ? 'UNKNOWN' : armed ? 'REACHABLE' : 'UNREACHABLE';
   out.push(`PASS / FAIL:SELECTION_ADVERSE  ${label} — needs n(T)≥${MIN_N} eligible demo fills opened while the governor read < 1. The demo option paths ARE armed at scope=demo, so T is populated by ordinary tape.`);
   out.push(`NOT-GRADED:NO_THROTTLED_FILLS  REACHABLE and EXPECTED — the autopilot sits at 1.0 most sessions.`);
-  out.push(`FAIL:WRITER_REGRESSED         REACHABLE — any post-cliff desk row missing the stamp.`);
+  out.push(`FAIL:WRITER_REGRESSED         REACHABLE — any post-cliff desk row missing riskThrottleMultiplier, OR any row opened after the TRA-2375 boot cliff missing riskThrottleSizingPath on a build that carries ${STAMP_PATH_COMMIT}.`);
+  out.push(`eligibility basis=EXACT       UNREACHABLE on live tape — the 11 rows opened in the TRA-2375 merge-to-deploy gap sit permanently inside the population cliff and permanently lack the key. MIXED with PRE_PATH_BUILD attribution is the healthy state; do NOT read a non-EXACT basis as a regression (TRA-2653 D1).`);
   out.push(`VOID                          REACHABLE — a redeploy to a pre-${STAMP_DECIDED_COMMIT} build, or a blind read.`);
   if (!known) {
     // The whole point of this ticket is that a field reading the same in the
@@ -649,6 +809,131 @@ function selftest() {
   check('exact basis excludes null path', String(exact.dropped.ineligible), '9');
   check('exact basis reaches a verdict', exact.reason, 'SELECTION_CONFIRMED');
 
+  // ── TRA-2653 D1 — the basis is a SPLIT, and pre-cliff absence is NOT a
+  //    regression while post-cliff absence still is. Every case below fails if
+  //    the fix is mutated out.
+  const POST_PATH_TS = DEFAULT_PATH_STAMP_SINCE + 60_000;
+  const PRE_PATH_TS = DEFAULT_PATH_STAMP_SINCE - 60_000;
+
+  // A population that STRADDLES the TRA-2375 boot cliff: 11 pre-cliff rows with
+  // the key absent (the real shape of the merge-to-deploy gap) and 8 post-cliff
+  // rows carrying it. Every row IS stamped for riskThrottleMultiplier, so the
+  // only thing under test is how absence of the PATH key is attributed.
+  const straddle = grade({
+    rows: [
+      ...[...Array(11)].map((_, i) => row({ id: `pre${i}`, openTs: PRE_PATH_TS, structure: 'single_leg_otm' })),
+      ...[...Array(8)].map((_, i) =>
+        row({ id: `post${i}`, openTs: POST_PATH_TS, structure: 'single_leg_otm', riskThrottleSizingPath: 'options_otm' }),
+      ),
+    ],
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    pathStampsSupported: true,
+    minN: 20,
+  });
+  // The headline: a straddling population is NOT a writer regression. Before the
+  // fix this population reported `basis=PROXY`, which TRA-2570's step 3 told the
+  // reader to escalate as exactly that.
+  check('straddle is NOT a regression', String(straddle.reason === 'WRITER_REGRESSED'), 'false');
+  check('  straddle basis is MIXED', straddle.basisReport?.basis, 'mixed');
+  check('  split counts exact', String(straddle.basisReport?.exact), '8');
+  check('  split counts proxy', String(straddle.basisReport?.proxy), '11');
+  check(
+    '  every proxy row attributed',
+    String(straddle.basisReport?.proxyReason.PRE_PATH_BUILD), '11',
+  );
+  check(
+    '  none blamed on the writer',
+    String(straddle.basisReport?.proxyReason.POST_CLIFF_UNSTAMPED), '0',
+  );
+  check(
+    '  basis LINE reports the split',
+    String(straddle.lines.some((l) => l.includes('basis=MIXED') && l.includes('exact=8') && l.includes('proxy=11'))),
+    'true',
+  );
+  check(
+    '  and NAMES the reason',
+    String(straddle.lines.some((l) => l.includes('proxy attribution:') && l.includes('PRE_PATH_BUILD=11'))),
+    'true',
+  );
+
+  // A GENUINE regression must still fail. D1 softens pre-cliff absence ONLY.
+  const pathRegressed = grade({
+    rows: [
+      ...[...Array(5)].map((_, i) => row({ id: `ok${i}`, openTs: POST_PATH_TS, riskThrottleSizingPath: 'options_single_leg' })),
+      ...[...Array(3)].map((_, i) => row({ id: `broke${i}`, openTs: POST_PATH_TS })), // key ABSENT above the cliff
+    ],
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    pathStampsSupported: true,
+    minN: 20,
+  });
+  check('post-cliff absence STILL regresses', pathRegressed.reason, 'WRITER_REGRESSED');
+  check('  and names which field broke', pathRegressed.regressedField, 'riskThrottleSizingPath');
+  // Negative control on the same arm: identical rows BELOW the cliff must not.
+  const pathBelowCliff = grade({
+    rows: [...Array(3)].map((_, i) => row({ id: `old${i}`, openTs: PRE_PATH_TS })),
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    pathStampsSupported: true,
+    minN: 20,
+  });
+  check('  same rows BELOW the cliff do not', String(pathBelowCliff.reason === 'WRITER_REGRESSED'), 'false');
+  // ...and an unresolvable build never claims the FAIL, nor calls it expected.
+  const pathUnknownBuild = grade({
+    rows: [...Array(3)].map((_, i) => row({ id: `unk${i}`, openTs: POST_PATH_TS })),
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    pathStampsSupported: null,
+    minN: 20,
+  });
+  check('  unresolvable build => no FAIL', String(pathUnknownBuild.reason === 'WRITER_REGRESSED'), 'false');
+  check('  ...but UNATTRIBUTABLE, not expected', String(pathUnknownBuild.basisReport?.proxyReason.UNATTRIBUTABLE), '3');
+  check('  ...and NOT counted as build-age', String(pathUnknownBuild.basisReport?.proxyReason.PRE_PATH_BUILD), '0');
+
+  // ── TRA-2653 D2 — `single_leg_directional` DOES consult a chokepoint.
+  //    13/13 post-cliff live rows carry riskThrottleSizingPath 'options_single_leg'.
+  check(
+    'proxy: single_leg_directional eligible',
+    String(eligibility({ structure: 'single_leg_directional' }).eligible),
+    'true',
+  );
+  // Non-vacuous: the allowlist must still REJECT something, or the assertion
+  // above would pass under `eligible: true` for every input.
+  check(
+    '  allowlist still rejects an unknown',
+    String(eligibility({ structure: 'single_leg_frobnicate' }).eligible),
+    'false',
+  );
+  check(
+    '  ...and still rejects a spread',
+    String(eligibility({ structure: 'iron_condor' }).eligible),
+    'false',
+  );
+  check(
+    '  ...and still rejects the wheel',
+    String(eligibility({ structure: 'single_leg_otm', entryArchetype: 'wheel-csp' }).eligible),
+    'false',
+  );
+  // The stamp must still win over the allowlist in BOTH directions: a stamped
+  // single_leg_directional with a null path is out of cohort regardless of D2.
+  check(
+    '  stamp beats allowlist (null path)',
+    String(eligibility({ structure: 'single_leg_directional', riskThrottleSizingPath: null }).eligible),
+    'false',
+  );
+  // At grade level: the same structure now reaches the cohort instead of being
+  // silently dropped as unclassified, which is what shrank n on every prior run.
+  const directional = grade({
+    rows: [...Array(4)].map((_, i) => row({ id: `dir${i}`, openTs: PRE_PATH_TS, structure: 'single_leg_directional' })),
+    buildCommit: 'deadbeef',
+    stampsSupported: true,
+    pathStampsSupported: true,
+    minN: 20,
+  });
+  check('directional joins the cohort', String(directional.cohorts?.U), '4');
+  check('  and is not unclassified', String(directional.dropped.unclassified), '0');
+
   console.log(`\n${fails.length === 0 ? 'SELFTEST PASS' : `SELFTEST FAIL (${fails.length}): ${fails.join(', ')}`}`);
   console.log('\nNOTE: fixture reachability is NOT box reachability. The live run prints the on-box reachability of each verdict.');
   return fails.length === 0 ? 0 : 1;
@@ -656,10 +941,10 @@ function selftest() {
 
 // ── live run ───────────────────────────────────────────────────────────────
 
-function stampsSupportedFor(commit) {
+function buildCarries(ancestor, commit) {
   if (!commit) return null;
   try {
-    execFileSync('git', ['merge-base', '--is-ancestor', STAMP_DECIDED_COMMIT, commit], {
+    execFileSync('git', ['merge-base', '--is-ancestor', ancestor, commit], {
       cwd: REPO,
       stdio: 'ignore',
     });
@@ -672,6 +957,17 @@ function stampsSupportedFor(commit) {
     return null;
   }
 }
+
+const stampsSupportedFor = (commit) => buildCarries(STAMP_DECIDED_COMMIT, commit);
+/**
+ * Resolved SEPARATELY from `stampsSupportedFor`, never inherited from it.
+ * TRA-2339 and TRA-2375 are different commits that reached the box 2.9 days
+ * apart, and treating one as a proxy for the other is the conflation D1 is
+ * about. `null` (unresolvable) attributes proxy rows as UNATTRIBUTABLE and
+ * suppresses the path-regression arm — it never claims a FAIL it cannot prove,
+ * and never reads as "expected" either.
+ */
+const pathStampsSupportedFor = (commit) => buildCarries(STAMP_PATH_COMMIT, commit);
 
 async function main() {
   if (SELFTEST) return selftest();
@@ -722,7 +1018,9 @@ async function main() {
     rows: Array.isArray(journal?.rows) ? journal.rows : [],
     buildCommit: commit,
     stampsSupported: stampsSupportedFor(commit),
+    pathStampsSupported: pathStampsSupportedFor(commit),
     stampSince: STAMP_SINCE,
+    pathStampSince: PATH_STAMP_SINCE,
     minN: MIN_N,
   });
 
