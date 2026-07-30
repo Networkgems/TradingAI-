@@ -1256,28 +1256,151 @@ function printWriterProvenance(w) {
   console.log('    would make the guard unrunnable where it actually runs.');
 }
 
+/**
+ * TRA-2630 — THE LIVE COHORT IS NOT STABLE WITHIN A SINGLE BUILD.
+ *
+ * Every empty-live-cohort defect on this ticket (the `Array.every` green in
+ * `1b803bd`, the tri-state fold in `32dac46`) assumed the cohort it read was the
+ * cohort that existed. Measured on bqb1 2026-07-30, that assumption is false at
+ * the TRANSPORT layer, not the predicate layer:
+ *
+ *     14:57:45Z   admin mode: demo    liveBookCount 0    sha 9e7f1c72
+ *     14:58:44Z   admin mode: live    liveBookCount 1    sha 9e7f1c72
+ *     ... 21 consecutive pulls, all live, SAME sha ...
+ *
+ * Same build, ~60s apart, opposite live cohorts. The endpoint's own note at
+ * `liveBookCount` names the mechanism: when the TRA-713/TRA-1652 boot arm fails
+ * to converge (`bootArmDrift: ['mode']`) the serving instance resolves `admin` as
+ * `demo`. So a point-in-time pull samples WHICH INSTANCE ANSWERED, not the fleet.
+ *
+ * This matters because AC2's real-money arm is a ONE-SHOT read of a perishable
+ * row. A transient `demo` resolution does not fabricate a green — the tri-state
+ * correctly reports NOT MEASURED — but it silently spends the only chance to
+ * grade real money, and "not measured" is indistinguishable in the output from
+ * "there is genuinely no live book".
+ *
+ * So: re-sample ONLY when the first pull resolves an empty live cohort (the rare
+ * and dangerous direction), and adopt any sample that resolves a live book. The
+ * bias is deliberately toward real money — one instance claiming a live book is
+ * enough to grade it as live. The common path costs exactly one request.
+ */
+const LIVE_COHORT_SAMPLES = 5;
+const LIVE_COHORT_SAMPLE_GAP_MS = 2_000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function countLiveBooks(payload) {
+  const engines = Array.isArray(payload?.engines) ? payload.engines : [];
+  return engines.filter((e) => e?.mode === 'live').length;
+}
+
+/**
+ * Pure. Given the samples taken, choose which one grades and say why. Never
+ * throws on a short or malformed sample list — an unusable set is reported as
+ * such rather than silently becoming "no live books".
+ */
+function pickLiveCohortSample(samples) {
+  const usable = (Array.isArray(samples) ? samples : []).filter(
+    (s) => s && Array.isArray(s.engines),
+  );
+  if (usable.length === 0) {
+    return { payload: null, adoptedIndex: -1, counts: [], flapped: false, confirmedEmpty: false };
+  }
+  const counts = usable.map(countLiveBooks);
+  const firstLive = counts.findIndex((n) => n > 0);
+  if (firstLive === -1) {
+    // Every sample agreed the live cohort is empty. That is now a CONFIRMED
+    // reading rather than a single-sample artifact — but only if we actually
+    // took more than one sample.
+    return {
+      payload: usable[0],
+      adoptedIndex: 0,
+      counts,
+      flapped: false,
+      confirmedEmpty: usable.length > 1,
+    };
+  }
+  return {
+    payload: usable[firstLive],
+    adoptedIndex: firstLive,
+    counts,
+    flapped: firstLive > 0,
+    confirmedEmpty: false,
+  };
+}
+
 async function loadPayload(argv) {
   const fileArg = argv.find((a) => a.startsWith('--file='));
   if (fileArg) {
     const path = fileArg.slice('--file='.length);
-    return JSON.parse(await readFile(path, 'utf-8'));
+    // A fixture is deterministic by construction; re-sampling it would only
+    // repeat the same bytes.
+    return { payload: JSON.parse(await readFile(path, 'utf-8')), sampling: null };
   }
   const urlArg = argv.find((a) => a.startsWith('--url='));
   const url = urlArg ? urlArg.slice('--url='.length) : DEFAULT_URL;
-  const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
-  return res.json();
+  const samples = [];
+  for (let i = 0; i < LIVE_COHORT_SAMPLES; i += 1) {
+    const res = await fetch(url, { signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+    samples.push(await res.json());
+    // The live cohort is non-empty, so there is nothing to disambiguate.
+    if (countLiveBooks(samples[i]) > 0) break;
+    if (i < LIVE_COHORT_SAMPLES - 1) await sleep(LIVE_COHORT_SAMPLE_GAP_MS);
+  }
+  const picked = pickLiveCohortSample(samples);
+  return {
+    payload: picked.payload,
+    sampling: { ...picked, sampleCount: samples.length, url },
+  };
+}
+
+/**
+ * Disclose the sampling whenever it did anything. Silence here would recreate
+ * the defect: a reader cannot tell a confirmed-empty live cohort from a single
+ * unlucky pull unless the instrument says which one it got.
+ */
+function reportLiveCohortSampling(sampling) {
+  if (!sampling || sampling.sampleCount <= 1) return;
+  console.log('');
+  if (sampling.flapped) {
+    console.log(
+      `  LIVE COHORT FLAP — sample 1 of ${sampling.sampleCount} resolved 0 live book(s); `
+        + `sample ${sampling.adoptedIndex + 1} resolved ${sampling.counts[sampling.adoptedIndex]}.`,
+    );
+    console.log(`    per-sample live book counts: [${sampling.counts.join(', ')}]`);
+    console.log('    Adopted the live-resolving sample. The bias is deliberate: one instance');
+    console.log('    claiming a live book is enough to grade it as real money. Had this run');
+    console.log('    taken only the first pull, the real-money arm would have read NOT');
+    console.log('    MEASURED and the one-shot chance to grade it would have been spent.');
+  } else if (sampling.confirmedEmpty) {
+    console.log(
+      `  live cohort empty — CONFIRMED across ${sampling.sampleCount} samples `
+        + `(counts [${sampling.counts.join(', ')}]).`,
+    );
+    console.log('    Still NOT a pass. This says the cohort is genuinely empty rather than');
+    console.log('    unluckily sampled; it does not say real money was graded.');
+  }
 }
 
 async function main(argv) {
   let payload;
+  let sampling = null;
   try {
-    payload = await loadPayload(argv);
+    const loaded = await loadPayload(argv);
+    payload = loaded.payload;
+    sampling = loaded.sampling;
   } catch (err) {
     console.error(`BLIND — could not read the reconciliation payload: ${err.message}`);
     console.error('Exiting 3. This is NOT a pass: an unreadable endpoint grades nothing.');
     return EXIT_BLIND;
   }
+  if (!payload) {
+    console.error('BLIND — no usable reconciliation payload after sampling the endpoint.');
+    console.error('Exiting 3. This is NOT a pass.');
+    return EXIT_BLIND;
+  }
+  reportLiveCohortSampling(sampling);
 
   // `--since=YYYY-MM-DD` moves the AC2 delta boundary. Defaults to the TRA-2629
   // fix-deploy date; a later fix gets its own boundary rather than inheriting a
@@ -2918,6 +3041,106 @@ function selftest() {
       return { downgraded: out.includes('DOWNGRADED from PASS'), noStaleRerun: !out.includes('has not produced a gradeable row yet') };
     })(),
     { downgraded: true, noStaleRerun: true },
+  );
+
+  // TRA-2630 — LIVE COHORT SAMPLING. The measured bqb1 flap: same sha, one pull
+  // resolves `admin` demo and the next resolves it live. These controls pin the
+  // fail-safe direction, because the tempting "majority wins" reading would
+  // discard the single live sample that is the whole point.
+  const eng = (...modes) => ({ engines: modes.map((m, i) => ({ username: `b${i}`, mode: m })) });
+
+  check(
+    'COHORT: a live book in the FIRST sample is adopted with no re-sampling',
+    (() => {
+      const p = pickLiveCohortSample([eng('live', 'demo')]);
+      return { idx: p.adoptedIndex, flapped: p.flapped, confirmedEmpty: p.confirmedEmpty };
+    })(),
+    { idx: 0, flapped: false, confirmedEmpty: false },
+  );
+
+  check(
+    'COHORT: the measured flap — sample 1 demo-only, sample 2 live => adopt sample 2',
+    (() => {
+      const p = pickLiveCohortSample([eng('demo', 'demo'), eng('live', 'demo')]);
+      return { idx: p.adoptedIndex, flapped: p.flapped, live: countLiveBooks(p.payload) };
+    })(),
+    { idx: 1, flapped: true, live: 1 },
+  );
+
+  check(
+    'COHORT: MUTATION — a LONE live sample beats four demo samples (never majority-wins)',
+    (() => {
+      const p = pickLiveCohortSample([
+        eng('demo'), eng('demo'), eng('demo'), eng('demo'), eng('live'),
+      ]);
+      return { idx: p.adoptedIndex, flapped: p.flapped, live: countLiveBooks(p.payload) };
+    })(),
+    { idx: 4, flapped: true, live: 1 },
+  );
+
+  check(
+    'COHORT: all samples empty => confirmedEmpty, and NOT reported as a flap',
+    (() => {
+      const p = pickLiveCohortSample([eng('demo'), eng('demo'), eng('demo')]);
+      return { flapped: p.flapped, confirmedEmpty: p.confirmedEmpty, live: countLiveBooks(p.payload) };
+    })(),
+    { flapped: false, confirmedEmpty: true, live: 0 },
+  );
+
+  check(
+    'COHORT: a SINGLE empty sample is not "confirmed" empty (one pull proves nothing)',
+    pickLiveCohortSample([eng('demo')]).confirmedEmpty,
+    false,
+  );
+
+  check(
+    'COHORT: no usable sample => null payload, never a silent zero-live reading',
+    (() => {
+      const p = pickLiveCohortSample([null, { notEngines: true }]);
+      return { payload: p.payload, idx: p.adoptedIndex, confirmedEmpty: p.confirmedEmpty };
+    })(),
+    { payload: null, idx: -1, confirmedEmpty: false },
+  );
+
+  check(
+    'COHORT: the flap disclosure names both counts and says the first pull would have missed it',
+    (() => {
+      const out = [];
+      const orig = console.log;
+      console.log = (...a) => out.push(a.join(' '));
+      try {
+        reportLiveCohortSampling({
+          ...pickLiveCohortSample([eng('demo'), eng('live')]),
+          sampleCount: 2,
+        });
+      } finally {
+        console.log = orig;
+      }
+      const t = out.join('\n');
+      return {
+        saysFlap: t.includes('LIVE COHORT FLAP'),
+        saysCounts: t.includes('[0, 1]'),
+        saysMissed: t.includes('NOT'),
+      };
+    })(),
+    { saysFlap: true, saysCounts: true, saysMissed: true },
+  );
+
+  check(
+    'COHORT: a single pull discloses NOTHING (no noise on the common path)',
+    (() => {
+      const out = [];
+      const orig = console.log;
+      console.log = (...a) => out.push(a.join(' '));
+      try {
+        reportLiveCohortSampling({ ...pickLiveCohortSample([eng('live')]), sampleCount: 1 });
+        reportLiveCohortSampling(null);
+      } finally {
+        console.log = orig;
+      }
+      return out.length;
+    })(),
+    0,
   );
 
   let failed = 0;
