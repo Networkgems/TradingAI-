@@ -1,3 +1,6 @@
+import { writeFile, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { join, basename } from 'path';
 import type { DailySnapshot } from './pnl-tracker.js';
 import type { JournalDayCloses } from './pnl-reconciliation.js';
 
@@ -267,6 +270,152 @@ export function planOptionsDailyPnlRepair(
     examined: snapshots.length,
     leftAloneDates,
   };
+}
+
+/** One dated report file whose options leg must be brought onto the journal figure. */
+export interface EodReportOptionsSyncTarget {
+  date: string;
+  /** The journal-sourced figure the day cell books, which the file must match. */
+  value: number;
+}
+
+/**
+ * TRA-2641 (found grading TRA-2625) — the report-file half of the day cell, on
+ * its OWN convergence criterion.
+ *
+ * ── The semantic this ticket picks, stated once, here ────────────────────────
+ *
+ * The day-cell options ledger is **per-BOOK and MODE-BLIND**. That is not a
+ * preference, it is what `PnlTracker` already is: one instance per user
+ * `dataDir` (`user-context.ts`), whose STOCK leg has always pooled every mode
+ * the book ever traded in. `journalRowsForBook` scopes by `account` only, which
+ * matches it exactly.
+ *
+ * Scoping the journal fold by `mode` as well (the third candidate on TRA-2641)
+ * is REJECTED: it would make the options leg mode-scoped while the stock leg
+ * beside it stays mode-blind, and — worse — it would retroactively DELETE a
+ * book's historical option P&L the moment somebody flips a settings toggle. A
+ * ledger whose past changes when you change a setting is a worse defect than the
+ * false zero this ticket exists to fix, and it would silently unwind the
+ * +$844.99 restoration on the one book that flipped.
+ *
+ * The report FILE, by contrast, IS mode-scoped: `reports/<mode>/<date>.json`.
+ * So the two surfaces live in different populations, and the file must be
+ * reconciled wherever the book actually holds one for that date — across every
+ * mode dir, not only the one the book happens to sit in right now.
+ *
+ * ── Why this is a separate plan from `planOptionsDailyPnlRepair` ─────────────
+ *
+ * The file patch used to be slaved to that plan's `deltas`, i.e. it only ever
+ * ran in the same pass that MOVED a snapshot row. So it had no convergence
+ * criterion of its own: once a row was repaired, the plan was empty forever, and
+ * any report file appearing AFTERWARDS was never reconciled. Two ways that
+ * happens, both observed:
+ *
+ *  - the book's mode flips, so the reader and the repair both start reading a
+ *    report dir the repair never patched (`admin` flipped to `live` during
+ *    2026-07-29 → 7 rows split, `maxDriftUsd` $82.50, including the exact
+ *    $217.50 on 07-17 that this file's own header predicted);
+ *  - `catchUpMissedEodReports` backfills a fresh 0.00-options report for a
+ *    historical date (it wrote `reports/live/2026-07-24.json` at
+ *    2026-07-30T01:12:16Z). That happens WITHIN one mode too — the mode flip is
+ *    how this surfaced, not the whole of what is broken.
+ *
+ * Driving the sync off the PERSISTED ROWS instead makes it convergent: a file
+ * that disagrees is patched on the next boot however it came to disagree.
+ *
+ * Only rows the journal is the AUTHORITY for are eligible — `journal` and
+ * `journal-repair`. `bucket-no-census` (no journal to ask) and
+ * `bucket-journal-silent` (journal behind the bucket) are deliberately excluded:
+ * on those the file is the better record and moving it would destroy a real
+ * figure. Rows with no provenance at all are pre-fix legacy and are left alone
+ * for the same reason `planOptionsDailyPnlRepair` leaves them alone.
+ */
+export function planEodReportOptionsSync(
+  snapshots: ReadonlyArray<DailySnapshot>,
+): EodReportOptionsSyncTarget[] {
+  const targets: EodReportOptionsSyncTarget[] = [];
+  for (const s of snapshots) {
+    if (s.optionsDailyPnlSource !== 'journal' && s.optionsDailyPnlSource !== 'journal-repair') continue;
+    targets.push({ date: s.date, value: round2(s.optionsDailyPnl ?? 0) });
+  }
+  targets.sort((a, b) => a.date.localeCompare(b.date));
+  return targets;
+}
+
+export interface EodReportOptionsSyncResult {
+  /** Dated report files whose options leg was actually rewritten this pass. */
+  filesPatched: number;
+  /** `<modeDir>/<date>:<value>` for each rewrite — the audit trail for the warn log. */
+  patchedDates: string[];
+  /**
+   * Dates whose cell books a NON-ZERO journal figure but which have no report
+   * file in ANY of `dirs`. An absent file is NOT agreement: it reads as
+   * `eodOptionsPnl: null` and scores drift `0` on /api/health/pnl-reconciliation
+   * (the TRA-2637 hazard), so the one state that looks identical to a clean one
+   * gets named instead of skipped.
+   */
+  missingReportDates: string[];
+  /** Per-file failures; a bad file must not abort the other dates. */
+  failures: { dir: string; date: string; reason: string }[];
+}
+
+/**
+ * Bring every dated report file's options leg onto the day cell's journal figure,
+ * across EVERY mode dir the book has (TRA-2641).
+ *
+ * `dirs` is the full per-mode report-dir list for one book, not the dir the book
+ * currently sits in — see {@link planEodReportOptionsSync} for why. A date is
+ * patched in every dir that holds a file for it; a dir that does not is simply
+ * not that book's record of the day.
+ *
+ * Writes NOTHING when everything already agrees: `patchEodReportOptionsPnl`
+ * returns its input unchanged when the leg already matches, and that identity
+ * check is what keeps this quiet on the steady state now that it runs on every
+ * boot rather than only when a snapshot moved (the TRA-2642 lesson — a repair
+ * that "moves" 0.00 -> 0.00 on 34 consecutive boots is a defect, not diligence).
+ */
+export async function syncEodReportOptionsLegs(
+  dirs: ReadonlyArray<string>,
+  targets: ReadonlyArray<EodReportOptionsSyncTarget>,
+): Promise<EodReportOptionsSyncResult> {
+  const out: EodReportOptionsSyncResult = {
+    filesPatched: 0,
+    patchedDates: [],
+    missingReportDates: [],
+    failures: [],
+  };
+  for (const t of targets) {
+    let found = false;
+    for (const dir of dirs) {
+      const datePath = join(dir, `${t.date}.json`);
+      if (!existsSync(datePath)) continue;
+      found = true;
+      try {
+        const report = JSON.parse(await readFile(datePath, 'utf-8')) as PatchableEodReport;
+        const patched = patchEodReportOptionsPnl(report, t.value);
+        // No-op when the file already carried the journal figure — which is
+        // itself the answer to TRA-2302's open second pathway: on 2026-07-15 and
+        // 2026-07-21 the file and the snapshot disagreed, so exactly one of the
+        // two needed moving.
+        if (patched === report) continue;
+        await writeFile(datePath, JSON.stringify(patched, null, 2), 'utf-8');
+        if (typeof patched.markdown === 'string') {
+          await writeFile(join(dir, `${t.date}.md`), patched.markdown, 'utf-8');
+        }
+        out.filesPatched += 1;
+        out.patchedDates.push(`${basename(dir)}/${t.date}:${t.value.toFixed(2)}`);
+      } catch (err) {
+        out.failures.push({
+          dir: basename(dir),
+          date: t.date,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (!found && t.value !== 0) out.missingReportDates.push(t.date);
+  }
+  return out;
 }
 
 /**

@@ -31,6 +31,8 @@ import {
   journalRowsForBook,
   patchEodReportOptionsPnl,
   planOptionsDailyPnlRepair,
+  planEodReportOptionsSync,
+  syncEodReportOptionsLegs,
   type OptionsDailyPnlDecision,
   type PatchableEodReport,
 } from './options-daily-pnl-source.js';
@@ -1748,6 +1750,14 @@ async function generateAndSaveReport(
  * Idempotent and safe to run every boot (bqb1 restarts several times an hour):
  * after the first pass no row matches the false-zero signature, so it writes
  * nothing and logs nothing.
+ *
+ * TRA-2641 — the two halves converge SEPARATELY. The snapshot half stops when no
+ * row still shows the false-zero signature; the report-file half stops when every
+ * file agrees with the cell, checked against the persisted rows on every boot
+ * rather than only in the pass that moved one. Slaving the file half to the
+ * snapshot delta is what let `admin`'s mode flip (and a catch-up backfill of a
+ * fresh 0.00 report) leave 7 rows split at up to $82.50 of drift with no path
+ * back — the plan was empty forever, so nothing ever revisited the files.
  */
 async function runOptionsDailyPnlRepair(): Promise<void> {
   if (!isOptionTradeJournalEnabled()) return;
@@ -1764,40 +1774,33 @@ async function runOptionsDailyPnlRepair(): Promise<void> {
       );
       if (census.size === 0) continue;
       const plan = planOptionsDailyPnlRepair(ctx.tracker.getSnapshots(), census);
-      if (plan.deltas.length === 0) continue;
 
-      // Report files FIRST, snapshot second. A crash between the two leaves the
-      // options legs disagreeing, which shows up as drift on
-      // /api/health/pnl-reconciliation — visible, and healed by the next boot.
+      // Snapshot first, then the files — the file pass is driven off the
+      // PERSISTED rows (TRA-2641), so it must see this boot's repair. A crash
+      // between the two leaves the options legs disagreeing, which shows up as
+      // drift on /api/health/pnl-reconciliation: visible, and healed by the very
+      // next boot precisely BECAUSE the file pass no longer depends on a delta
+      // being produced in the same pass.
+      const repaired = ctx.tracker.applyOptionsDailyPnlRepair(plan.deltas);
+
+      // TRA-2641 — reconcile the report files across EVERY mode dir, not just
+      // the one this book currently sits in. The day cell is mode-blind (that is
+      // what `PnlTracker` is); the report file is mode-scoped. See
+      // `planEodReportOptionsSync` for the semantic and why the alternative —
+      // scoping the journal fold by mode — was rejected.
       const mode = stockModeKey(getSettings(ctx.username));
-      const dir = stockReportsDirFor(ctx, mode);
-      let filesPatched = 0;
-      for (const d of plan.deltas) {
-        const datePath = join(dir, `${d.date}.json`);
-        if (!existsSync(datePath)) continue;
-        try {
-          const report = JSON.parse(await readFile(datePath, 'utf-8')) as PatchableEodReport;
-          const patched = patchEodReportOptionsPnl(report, d.after);
-          // No-op when the file already carried the journal figure — which is
-          // itself the answer to TRA-2302's open second pathway: on 2026-07-15
-          // and 2026-07-21 the file and the snapshot disagreed, so exactly one
-          // of the two needed moving.
-          if (patched === report) continue;
-          await writeFile(datePath, JSON.stringify(patched, null, 2), 'utf-8');
-          if (typeof patched.markdown === 'string') {
-            await writeFile(join(dir, `${d.date}.md`), patched.markdown, 'utf-8');
-          }
-          filesPatched += 1;
-        } catch (err) {
-          log.warn('TRA-2314 report-file repair failed', {
-            username: ctx.username,
-            date: d.date,
-            reason: err instanceof Error ? err.message : String(err),
-          });
-        }
+      const sync = await syncEodReportOptionsLegs(
+        (['demo', 'live', 'sandbox'] as const).map(m => stockReportsDirFor(ctx, m)),
+        planEodReportOptionsSync(ctx.tracker.getSnapshots()),
+      );
+      for (const f of sync.failures) {
+        log.warn('TRA-2314 report-file repair failed', { username: ctx.username, ...f });
       }
 
-      const repaired = ctx.tracker.applyOptionsDailyPnlRepair(plan.deltas);
+      // Silent unless something actually moved. This pass now runs on every boot
+      // (bqb1 restarts several times an hour) and a warn that fires on a no-op is
+      // exactly the "a ledger moved" noise TRA-2642 removed.
+      if (repaired === 0 && sync.filesPatched === 0 && sync.missingReportDates.length === 0) continue;
       // Logged at warn: a board-facing ledger moved, and an unannounced
       // correction reads to a grader as a new defect (TRA-2079). The per-day
       // before/after also rides /api/health/pnl-reconciliation on every row.
@@ -1805,7 +1808,9 @@ async function runOptionsDailyPnlRepair(): Promise<void> {
         username: ctx.username,
         mode,
         snapshotsRepaired: repaired,
-        filesPatched,
+        filesPatched: sync.filesPatched,
+        patchedDates: sync.patchedDates,
+        missingReportDates: sync.missingReportDates,
         totalDeltaUsd: plan.totalDeltaUsd,
         dates: plan.deltas.map(d => `${d.date}:${d.before.toFixed(2)}->${d.after.toFixed(2)}`),
         leftAloneDates: plan.leftAloneDates,

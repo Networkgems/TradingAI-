@@ -1,17 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { OptionPosition } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { SignalEngine } from './signal-engine.js';
-import { PnlTracker } from './pnl-tracker.js';
+import { PnlTracker, type DailySnapshot } from './pnl-tracker.js';
 import { generateEodReport } from './reports/eod-report.js';
 import { reconcilePnl, foldJournalClosesByEtDay } from './pnl-reconciliation.js';
 import {
   resolveDailyOptionsPnl,
   journalRowsForBook,
   planOptionsDailyPnlRepair,
+  planEodReportOptionsSync,
+  syncEodReportOptionsLegs,
   patchEodReportOptionsPnl,
   pnlSign,
 } from './options-daily-pnl-source.js';
@@ -441,6 +443,169 @@ describe('TRA-2314 — the historical repair is bounded, attributable and idempo
     const red = reconcilePnl([day('2026-07-15', 0)], new Map(), null, census);
     expect(red.falseZeroDates).toEqual(['2026-07-15']);
     expect(red.optionsFalseZeroOk).toBe(false);
+  });
+
+  // ── TRA-2641 — the report-file half needs its OWN convergence criterion ────
+  //
+  // Live on bqb1 2026-07-30T03:04:52Z: `admin` carried 7 repaired rows whose
+  // `optionsDaily` held the journal figure while `eodOptionsPnl` read 0.00 —
+  // `maxDriftUsd` $82.50, including the exact $217.50 on 07-17 that the module
+  // header predicted. `Richard`, same repair and same journal but still
+  // `mode: demo`, was clean on every one of those days.
+  //
+  // Root cause is NOT the mode flip per se: the file patch was slaved to
+  // `planOptionsDailyPnlRepair`'s deltas, so it only ever ran in the pass that
+  // MOVED a snapshot row. After the first repair the plan is empty forever, so
+  // any file appearing later — a new mode dir, or a `catchUpMissedEodReports`
+  // backfill of a fresh 0.00-options report — was never revisited.
+  describe('TRA-2641 — report files reconcile across every mode dir, on their own criterion', () => {
+    const sourced = (
+      date: string,
+      optionsDailyPnl: number,
+      optionsDailyPnlSource?: DailySnapshot['optionsDailyPnlSource'],
+    ): DailySnapshot => ({
+      ...day(date, optionsDailyPnl),
+      ...(optionsDailyPnlSource ? { optionsDailyPnlSource } : {}),
+    });
+
+    const reportFile = (optionsPnl: number, realizedPnl = 0) => JSON.stringify({
+      optionsPnl,
+      realizedPnl,
+      combinedPnl: realizedPnl + optionsPnl,
+      markdown: [
+        '| Options P&L | ' + pnlSign(optionsPnl) + ' |',
+        '| **Combined P&L** | **' + pnlSign(realizedPnl + optionsPnl) + '** |',
+      ].join('\n'),
+    }, null, 2);
+
+    const dirsFor = (root: string) => ['demo', 'live', 'sandbox'].map(m => join(root, m));
+
+    function book(): string {
+      const root = join(TMP_ROOT, `book-${Math.random().toString(36).slice(2)}`);
+      for (const d of dirsFor(root)) mkdirSync(d, { recursive: true });
+      return root;
+    }
+
+    const optionsPnlOf = (path: string) =>
+      (JSON.parse(readFileSync(path, 'utf-8')) as { optionsPnl: number }).optionsPnl;
+
+    it('only rows the JOURNAL is the authority for are eligible', () => {
+      const targets = planEodReportOptionsSync([
+        sourced('2026-07-15', 17.0, 'journal-repair'),   // repaired → eligible
+        sourced('2026-07-17', 217.5, 'journal'),         // 21:00 writer → eligible
+        sourced('2026-07-18', 44.0, 'bucket-no-census'), // no journal to ask → NOT
+        sourced('2026-07-19', 12.0, 'bucket-journal-silent'), // journal behind → NOT
+        sourced('2026-07-20', 9.0),                      // pre-fix legacy → NOT
+      ]);
+      // The two exclusions are the load-bearing half: on those rows the FILE is
+      // the better record, and moving it would destroy a real figure.
+      expect(targets).toEqual([
+        { date: '2026-07-15', value: 17.0 },
+        { date: '2026-07-17', value: 217.5 },
+      ]);
+    });
+
+    it('ACCEPTANCE: repair -> mode flip -> re-boot leaves the file agreeing with the cell', async () => {
+      // The live shape. The book traded in demo, was repaired there, then flipped
+      // to live — where a catch-up backfill planted a fresh 0.00-options report
+      // for the same historical date. That backfilled file is what the health
+      // route reads, and what read `eodOptionsPnl: 0.00` against `optionsDaily`.
+      const root = book();
+      writeFileSync(join(root, 'demo', '2026-07-17.json'), reportFile(217.5, 82.5));
+      writeFileSync(join(root, 'live', '2026-07-17.json'), reportFile(0, 82.5));
+
+      const snapshots = [sourced('2026-07-17', 217.5, 'journal-repair')];
+      const res = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync(snapshots));
+
+      expect(res.filesPatched).toBe(1);
+      expect(res.patchedDates).toEqual(['live/2026-07-17:217.50']);
+      expect(res.missingReportDates).toEqual([]);
+      // BOTH dirs now agree with the mode-blind cell — whichever one the book's
+      // current mode makes the health route read, `eodOptionsPnl == optionsDaily`.
+      expect(optionsPnlOf(join(root, 'live', '2026-07-17.json'))).toBeCloseTo(217.5, 5);
+      expect(optionsPnlOf(join(root, 'demo', '2026-07-17.json'))).toBeCloseTo(217.5, 5);
+      // The combined leg moves with it, or the identity
+      // `combined == stock + options` breaks on the file itself.
+      const live = JSON.parse(readFileSync(join(root, 'live', '2026-07-17.json'), 'utf-8'));
+      expect(live.combinedPnl).toBeCloseTo(300.0, 5);
+      expect(live.markdown).toContain('| Options P&L | +217.50 |');
+    });
+
+    it('MUTATION: the CURRENT-mode-dir-only walk leaves that same file split', async () => {
+      // Pairs the fix with the bug on one input. This is what the pre-TRA-2641
+      // code did — it resolved ONE dir from `stockModeKey(settings)`. Had the
+      // book still been in demo it would have read clean, which is exactly why
+      // `Richard` looked healthy while `admin` did not.
+      const root = book();
+      writeFileSync(join(root, 'demo', '2026-07-17.json'), reportFile(217.5, 82.5));
+      writeFileSync(join(root, 'live', '2026-07-17.json'), reportFile(0, 82.5));
+
+      const snapshots = [sourced('2026-07-17', 217.5, 'journal-repair')];
+      const onlyDemo = await syncEodReportOptionsLegs([join(root, 'demo')], planEodReportOptionsSync(snapshots));
+
+      expect(onlyDemo.filesPatched).toBe(0);
+      expect(optionsPnlOf(join(root, 'live', '2026-07-17.json'))).toBe(0); // the $217.50 split
+    });
+
+    it('converges on a file planted AFTER the snapshot repair — no delta required', async () => {
+      // The generalisation, and the reason this is not just a mode bug. Within a
+      // SINGLE mode: repair runs, plan empties, then a backfill regenerates the
+      // day at 0.00 options. The old code had no path back — `plan.deltas` was
+      // empty forever, so the file loop never ran again.
+      const root = book();
+      const snapshots = [sourced('2026-07-15', 17.0, 'journal-repair')];
+
+      const first = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync(snapshots));
+      expect(first.filesPatched).toBe(0);
+      expect(first.missingReportDates).toEqual(['2026-07-15']); // absent != agreeing
+
+      writeFileSync(join(root, 'demo', '2026-07-15.json'), reportFile(0));
+      const second = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync(snapshots));
+      expect(second.filesPatched).toBe(1);
+      expect(optionsPnlOf(join(root, 'demo', '2026-07-15.json'))).toBeCloseTo(17.0, 5);
+    });
+
+    it('is a NO-OP across repeated boots once the legs agree (TRA-2642 idempotence)', async () => {
+      // This pass now runs on EVERY boot, and bqb1 restarts several times an
+      // hour. A pass that rewrites an unchanged file is the "a ledger moved"
+      // warn TRA-2642 removed, wearing a different hat.
+      const root = book();
+      writeFileSync(join(root, 'demo', '2026-07-15.json'), reportFile(17.0));
+      const snapshots = [sourced('2026-07-15', 17.0, 'journal-repair')];
+
+      for (const pass of [1, 2, 3]) {
+        const res = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync(snapshots));
+        expect(res.filesPatched, `boot ${pass}`).toBe(0);
+        expect(res.patchedDates, `boot ${pass}`).toEqual([]);
+        expect(res.missingReportDates, `boot ${pass}`).toEqual([]);
+      }
+    });
+
+    it('a journal-sourced ZERO cell with no file is NOT reported missing', async () => {
+      // The 21:00 writer books a `journal`-sourced 0.00 on every book with no
+      // closes that day — 20 non-desk books carried exactly that row on
+      // 2026-07-27. Those must not flood `missingReportDates`, or the one signal
+      // that names a genuinely unbacked figure becomes unreadable.
+      const root = book();
+      const res = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync([
+        sourced('2026-07-27', 0, 'journal'),
+        sourced('2026-07-28', 140.0, 'journal'),
+      ]));
+      expect(res.missingReportDates).toEqual(['2026-07-28']);
+    });
+
+    it('an unreadable file is named and does not abort the other dates', async () => {
+      const root = book();
+      writeFileSync(join(root, 'demo', '2026-07-15.json'), '{ not json');
+      writeFileSync(join(root, 'demo', '2026-07-16.json'), reportFile(0));
+      const res = await syncEodReportOptionsLegs(dirsFor(root), planEodReportOptionsSync([
+        sourced('2026-07-15', 17.0, 'journal-repair'),
+        sourced('2026-07-16', -4.5, 'journal-repair'),
+      ]));
+      expect(res.failures.map(f => f.date)).toEqual(['2026-07-15']);
+      expect(res.filesPatched).toBe(1);
+      expect(optionsPnlOf(join(root, 'demo', '2026-07-16.json'))).toBeCloseTo(-4.5, 5);
+    });
   });
 });
 
