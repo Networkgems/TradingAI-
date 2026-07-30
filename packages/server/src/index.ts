@@ -542,6 +542,11 @@ import {
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
+import {
+  rebaseOnMark,
+  OTM_MISPRICING_BASIS,
+  OTM_PANEL_MISPRICING_THRESHOLD,
+} from './otm-mark-basis.js';
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
 import {
   recordShortSqueezeCapture,
@@ -4354,8 +4359,11 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
     return;
   }
   const limit = Math.max(1, Math.min(50, Number(req.query['limit'] ?? 10)));
-  // `minMispricing` is the |(mark − theo)/theo| band above which a contract is
-  // classified cheap/expensive rather than fair. Absent ⇒ the engine default.
+  // `minMispricing` is the |(mark − theo)/MARK| band above which a contract is
+  // classified cheap/expensive rather than fair. Absent ⇒ the panel default,
+  // which mirrors the engine's. TRA-2564 moved the DENOMINATOR from theo to
+  // mark, so the param keeps its name and its mechanics (a classification
+  // cutoff, not a row filter) and only the values it corresponds to shift.
   const minRaw = req.query['minMispricing'];
   const minMispricing =
     typeof minRaw === 'string' && minRaw.length > 0 ? Number(minRaw) : undefined;
@@ -4387,9 +4395,21 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   const result = await relativeValueScannerService.scanOtm(symbol, {
     ...(Number.isFinite(minMispricing) ? { mispricingThresholdPct: Number(minMispricing) } : {}),
   });
+  // TRA-2564 (TRA-2562 decision) — re-base the ratio on `mark` FIRST, before
+  // either floor. Both floors report `maxSuppressedMispricingPct`, so re-basing
+  // after them would footnote the panel with theo-basis numbers under a
+  // mark-basis label. The transform also RE-SORTS: `r ↦ r/(1+r)` preserves order
+  // within a sign but not across signs, and the panel ranks on |ratio|. See
+  // `otm-mark-basis.ts` for why this is a route-layer transform and the engine
+  // is untouched — the shared `classification` gates a live `single_leg_otm`
+  // entry, so changing the engine formula would widen that gate ~2.3%.
+  const rebased = rebaseOnMark(
+    result.candidates,
+    Number.isFinite(minMispricing) ? Number(minMispricing) : OTM_PANEL_MISPRICING_THRESHOLD,
+  );
   // Floor BEFORE the slice. Filtering after it would leave the underflow rows
   // occupying the top N and merely blank the table.
-  const floored = applyTheoFloor(result.candidates, minTheo);
+  const floored = applyTheoFloor(rebased.candidates, minTheo);
   // TRA-2388 — then the |delta| floor, on what the theo floor kept. The counts
   // are therefore SEQUENTIAL, not partitions of the same population:
   // `deltaFloor.suppressed` is what the delta axis removed from the rows that
@@ -4397,8 +4417,23 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   const deltaFloored = applyDeltaFloor(floored.kept, minDelta);
   res.json({
     ...result,
-    // `scanOtm` ranks by |mispricingPct| descending, so a slice is the top N.
+    // Ranked by |mispricingPct| descending — by `rebaseOnMark`, not by
+    // `scanOtm`, whose theo-basis order this deliberately supersedes. A slice is
+    // therefore still the top N.
     candidates: deltaFloored.kept.slice(0, limit),
+    // TRA-2564 — the DENOMINATOR every `mispricingPct` on this response is
+    // normalised by. A build predating TRA-2564 omits the key entirely, so its
+    // presence (not a SHA, not a commit subject) is what proves the formula
+    // swapped. ⚠️ It is bounded by +100% on the EXPENSIVE side only; the cheap
+    // side is unbounded below. See `otm-mark-basis.ts`.
+    mispricingBasis: OTM_MISPRICING_BASIS,
+    // Never silent: rows with an unusable `mark` have no mark-basis ratio and
+    // were neutralised to 0/`fair` rather than emitted with a theo-basis number
+    // under a mark-basis label. Normally 0.
+    markBasis: {
+      threshold: rebased.threshold,
+      unbasisable: rebased.unbasisable,
+    },
     // Never a silent drop: the panel footnotes this, and its presence is what
     // distinguishes a build carrying the guard from one that predates it.
     theoFloor: {

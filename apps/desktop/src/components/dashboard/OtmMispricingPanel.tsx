@@ -57,9 +57,14 @@ interface OtmCandidate {
   /** Black-Scholes price at the market's own σ (smvVol, else smoothed midIv). */
   theo: number;
   /**
-   * (mark − theo) / theo. A RATIO, not a percent — 0.18 means 18%. Multiply for
-   * display. Positive → the market is paying up vs. model (expensive);
-   * negative → cheap.
+   * TRA-2564 — (mark − theo) / MARK. The denominator moved from theo to mark;
+   * `mispricingBasis` on the response says which basis the build actually sent,
+   * and a build predating TRA-2564 omits that key entirely. A RATIO, not a
+   * percent — 0.18 means 18%. Multiply for display. Positive → the market is
+   * paying up vs. model (expensive); negative → cheap.
+   *
+   * Bounded by +100% on the EXPENSIVE side only (as theo → 0). The CHEAP side
+   * is unbounded below — do not render it as a two-sided percentage.
    */
   mispricingPct: number;
   classification: 'expensive' | 'cheap' | 'fair';
@@ -143,6 +148,8 @@ interface OtmMispricingScanResponse {
   candidates: OtmCandidate[];
   reason?: ScanReason;
   errorMessage?: string;
+  /** TRA-2564 - denominator every `mispricingPct` above is normalised by. */
+  mispricingBasis?: 'mark' | 'theo';
   theoFloor?: TheoFloorReport;
   deltaFloor?: DeltaFloorReport;
   diagnostics?: ScannerDiagnostics;
@@ -487,7 +494,7 @@ export function OtmMispricingPanel({
       <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.6rem', flexWrap: 'wrap' }}>
         <h3 style={{ margin: 0 }}>Mispriced OTM</h3>
         <span className="muted">
-          out-of-the-money contracts ranked by |mark − theo| ÷ theo · read-only research surface
+          out-of-the-money contracts ranked by |mark − theo| ÷ mark · read-only research surface
         </span>
       </div>
 
@@ -535,7 +542,7 @@ export function OtmMispricingPanel({
             value={minMispricing}
             onChange={(e) => setMinMispricing(Number(e.target.value))}
             aria-label="Mispricing band"
-            title="|mark − theo| ÷ theo above which a contract is labelled cheap or rich. Does not filter rows — it moves the cheap/rich/fair cutoff."
+            title="|mark − theo| ÷ MARK above which a contract is labelled cheap or rich. Does not filter rows — it moves the cheap/rich/fair cutoff. TRA-2564 moved the denominator from theo to mark, so a given number now corresponds to a slightly wider band than it used to."
           >
             {MISPRICING_BANDS.map((b) => (
               <option key={b} value={b}>
@@ -570,7 +577,7 @@ export function OtmMispricingPanel({
             }}
             placeholder="server"
             aria-label="Minimum absolute delta"
-            title="Drops contracts whose |delta| is below this before the top-N slice — ranking by a ratio otherwise returns the far tail, where (mark − theo) / theo measures the minimum tick. Blank uses the server's floor; 0 shows the raw tail. Press Enter to apply."
+            title="Drops contracts whose |delta| is below this before the top-N slice — ranking by a ratio otherwise returns the far tail, where (mark − theo) / theo (the pre-TRA-2564 basis) measures the minimum tick. Blank uses the server's floor; 0 shows the raw tail. Press Enter to apply."
             style={{ width: '4.5rem' }}
           />
         </label>
@@ -665,7 +672,7 @@ export function OtmMispricingPanel({
           <div style={{ marginTop: '0.35rem', maxWidth: '46rem', marginInline: 'auto' }}>
             {deltaSuppressed.suppressed} contract{deltaSuppressed.suppressed === 1 ? '' : 's'}{' '}
             cleared the liquidity gates for {scan?.symbol}, but every one sits below |delta|{' '}
-            {fmt(deltaSuppressed.applied, 3)} — far enough out that (mark − theo) / theo measures
+            {fmt(deltaSuppressed.applied, 3)} — far enough out that (mark − theo) / theo (the pre-TRA-2564 basis) measures
             the minimum tick rather than a disagreement with the vol surface. This is a real chain
             with no near-money read at this expiration, not an empty one.
           </div>
@@ -751,7 +758,7 @@ export function OtmMispricingPanel({
         <p className="muted" style={{ margin: 0, fontSize: '0.8rem' }}>
           {suppressed.suppressed} higher-ranked contract
           {suppressed.suppressed === 1 ? ' was' : 's were'} hidden: model price below{' '}
-          {fmtPrice(suppressed.applied)} (under one tick), where (mark − theo) / theo measures the
+          {fmtPrice(suppressed.applied)} (under one tick), where (mark − theo) / theo (the pre-TRA-2564 basis) measures the
           minimum tick rather than a disagreement with the surface
           {suppressed.maxSuppressedMispricingPct === null
             ? ''
@@ -769,7 +776,7 @@ export function OtmMispricingPanel({
         <p className="muted" style={{ margin: 0, fontSize: '0.8rem' }}>
           {deltaSuppressed.suppressed} higher-ranked contract
           {deltaSuppressed.suppressed === 1 ? ' was' : 's were'} hidden: |delta| below{' '}
-          {fmt(deltaSuppressed.applied, 3)}, the far tail where ranking by (mark − theo) / theo
+          {fmt(deltaSuppressed.applied, 3)}, the far tail where ranking by (mark − theo) / theo (the pre-TRA-2564 basis)
           returns the minimum tick rather than a view on the surface
           {deltaSuppressed.maxSuppressedMispricingPct === null
             ? ''
