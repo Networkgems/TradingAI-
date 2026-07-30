@@ -20,6 +20,7 @@ import {
   reconcilePnl,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
+  summarizeLiveLagTripwire,
 } from './pnl-reconciliation.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
@@ -4072,10 +4073,17 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // session of realized options P&L, and is reported SEPARATELY from the
       // demo books so a fixture book can never mask it — pooling the two is the
       // TRA-2193 trap this endpoint has already been bitten by twice.
-      livePriorOptionsLagOk: engines.every(e => e.mode !== 'live' || e.priorOptionsLagOk),
-      livePriorOptionsLagBooks: engines
-        .filter(e => e.mode === 'live' && !e.priorOptionsLagOk)
-        .map(e => ({ username: e.username, dates: e.priorOptionsLagDates })),
+      //
+      // TRA-2630 follow-up — this used to be `engines.every(e => e.mode !== 'live'
+      // || e.priorOptionsLagOk)`. `every` is TRUE ON THE EMPTY SET, so with no
+      // live book in the fleet the real-money tripwire reported OK over a cohort
+      // it never looked at. On 2026-07-30T05:16Z that is exactly what bqb1 served:
+      // 58/58 books `mode: demo`, `livePriorOptionsLagOk: true`, because the
+      // TRA-713/TRA-1652 boot-arm did not converge (`bootArmEligible: true` +
+      // `bootArmDrift: ['mode']` on /api/health/options-live) — admin had been
+      // `mode: live` in the 02:08Z and 03:52Z pulls. `liveBookCount` is what makes
+      // the two states distinguishable; `null` means NOT MEASURED, never a pass.
+      ...summarizeLiveLagTripwire(engines),
       engines,
     });
   } catch (err) {

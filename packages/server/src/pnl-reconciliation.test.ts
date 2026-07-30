@@ -3,6 +3,7 @@ import {
   reconcilePnl,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
+  summarizeLiveLagTripwire,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
 } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
@@ -439,5 +440,60 @@ describe('reconcilePnl', () => {
       expect(r.priorOptionsLagDates).toEqual(['2026-07-02']);
       expect(r.priorOptionsLagOk).toBe(false);
     });
+  });
+});
+
+// TRA-2630 follow-up — the real-money tripwire must distinguish "every live book
+// passed" from "there was no live book". The shipped spelling was
+// `engines.every(e => e.mode !== 'live' || e.priorOptionsLagOk)`, and `every` is
+// true on the empty set, so an all-demo fleet manufactured a green over real
+// money it never inspected. bqb1 served exactly that at 2026-07-30T05:16Z.
+describe('summarizeLiveLagTripwire — an empty live cohort is NOT MEASURED, never OK', () => {
+  const book = (username: string, mode: string, ok: boolean, dates: string[] = []) => ({
+    username, mode, priorOptionsLagOk: ok, priorOptionsLagDates: dates,
+  });
+
+  it('reports null (NOT MEASURED) when no book resolves mode:live', () => {
+    // The live bqb1 shape: 58 demo books, 0 live, boot-arm drifted on `mode`.
+    const r = summarizeLiveLagTripwire([
+      book('admin', 'demo', true),
+      book('Richard', 'demo', false, ['2026-07-28', '2026-07-29']),
+    ]);
+    expect(r.liveBookCount).toBe(0);
+    expect(r.livePriorOptionsLagOk).toBeNull();
+    expect(r.livePriorOptionsLagBooks).toEqual([]);
+    // The regression this pins: it must NOT read as a pass.
+    expect(r.livePriorOptionsLagOk).not.toBe(true);
+  });
+
+  it('reports true only when a live book was actually graded and is clean', () => {
+    const r = summarizeLiveLagTripwire([
+      book('Richard', 'demo', false, ['2026-07-28']),
+      book('admin', 'live', true),
+    ]);
+    expect(r.liveBookCount).toBe(1);
+    expect(r.livePriorOptionsLagOk).toBe(true);
+    expect(r.livePriorOptionsLagBooks).toEqual([]);
+  });
+
+  it('reports false and names the book when a live book shows the lag', () => {
+    const r = summarizeLiveLagTripwire([
+      book('admin', 'live', false, ['2026-07-29']),
+    ]);
+    expect(r.liveBookCount).toBe(1);
+    expect(r.livePriorOptionsLagOk).toBe(false);
+    expect(r.livePriorOptionsLagBooks).toEqual([{ username: 'admin', dates: ['2026-07-29'] }]);
+  });
+
+  it('does not count a sandbox-mode book as live coverage', () => {
+    // stockModeKey returns 'sandbox' for live-armed-but-paper-routed. Correctly
+    // outside a REAL-MONEY tripwire, and equally not evidence that one ran.
+    const r = summarizeLiveLagTripwire([book('admin', 'sandbox', true)]);
+    expect(r.liveBookCount).toBe(0);
+    expect(r.livePriorOptionsLagOk).toBeNull();
+  });
+
+  it('is NOT MEASURED on an empty fleet', () => {
+    expect(summarizeLiveLagTripwire([]).livePriorOptionsLagOk).toBeNull();
   });
 });

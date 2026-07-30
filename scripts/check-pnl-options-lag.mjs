@@ -55,10 +55,15 @@
  * EXIT CODES
  * ----------
  *   0  CLEAN     — no book shows the lag; per-leg verdicts reported for info.
+ *                  Requires at least one `mode: live` book to have been graded.
  *   1  LIVE LAG  — a `mode: live` book shows it. ESCALATE. Stop netting the
  *                  credit path and re-open the TRA-2323 rollback question.
- *   2  DEMO LAG  — demo books only. Real, $0 live capital at risk.
- *   3  BLIND     — could not grade. Never conflated with a pass.
+ *   2  DEMO LAG  — demo books only, live cohort NON-EMPTY and clean. Real,
+ *                  $0 live capital at risk.
+ *   3  BLIND     — could not grade. Never conflated with a pass. Includes the
+ *                  EMPTY LIVE COHORT case: with 0 `mode: live` books the
+ *                  real-money tripwire looked at nothing, so "0 live books
+ *                  affected" is an absence, not a clean bill of health.
  *
  * USAGE
  * -----
@@ -125,8 +130,24 @@ export function gradePayload(payload) {
     if (e.mode === 'live') live.push(row);
     else demo.push(row);
   }
-  const verdict = live.length > 0 ? 'LIVE_LAG' : demo.length > 0 ? 'DEMO_LAG' : 'CLEAN';
-  return { verdict, live, demo, engineCount: engines.length };
+  // TRA-2630 follow-up — THE COHORT MUST BE NON-EMPTY BEFORE "no live hit" MEANS
+  // ANYTHING. `live.length === 0` has two causes that are indistinguishable from
+  // the hit list alone: every live book passed, or there was no live book to
+  // grade. Only the second one was true on bqb1 at 2026-07-30T05:16Z — 58/58
+  // books resolved `mode: demo` after the TRA-713/TRA-1652 boot-arm failed to
+  // converge (`bootArmDrift: ['mode']`), having carried `admin` as `mode: live`
+  // three hours earlier. Reporting "0 live books" as reassurance in that state is
+  // the same manufactured green as scoring an absent EOD row `drift 0` (TRA-2637).
+  const liveBookCount = engines.filter((e) => e?.mode === 'live').length;
+  const verdict =
+    live.length > 0
+      ? 'LIVE_LAG'
+      : liveBookCount === 0
+        ? 'LIVE_UNMEASURABLE'
+        : demo.length > 0
+          ? 'DEMO_LAG'
+          : 'CLEAN';
+  return { verdict, live, demo, engineCount: engines.length, liveBookCount };
 }
 
 /**
@@ -224,7 +245,7 @@ async function main(argv) {
   console.log('TRA-2630 AC3 — T+1 options-credit lag (stockDaily == prior session optionsDaily):');
 
   if (g.verdict === 'CLEAN') {
-    console.log('  CLEAN — 0 books show the lag, on either mode.');
+    console.log(`  CLEAN — 0 books show the lag, on either mode (${g.liveBookCount} live book(s) graded).`);
     return EXIT_CLEAN;
   }
 
@@ -246,7 +267,29 @@ async function main(argv) {
     console.error('TRA-2323 rollback question — TRA-2630\'s demo-only verdict is now falsified.');
     return EXIT_LIVE_LAG;
   }
-  console.error(`DEMO LAG — ${g.demo.length} demo book(s), ${lagRows} lag session(s). 0 live books.`);
+  // Ordered ABOVE the demo verdict deliberately. With no live book in the fleet
+  // the sentence "0 live books, so $0 live capital is at risk" is not a finding —
+  // it is the absence of one, and it must not be printed as reassurance.
+  if (g.verdict === 'LIVE_UNMEASURABLE') {
+    console.error(
+      `BLIND — the real-money tripwire graded NOTHING: 0 of ${g.engineCount} books resolved \`mode: live\`.`,
+    );
+    console.error('"No live book was affected" and "there was no live book" are the same reading');
+    console.error('here, so this is NOT a pass and NOT evidence for the demo-only verdict.');
+    if (g.demo.length > 0) {
+      console.error(`(${g.demo.length} demo book(s) / ${lagRows} lag session(s) listed above still stand.)`);
+    }
+    console.error('');
+    console.error('DIAGNOSE FIRST — the cohort is usually empty because the operator boot-arm');
+    console.error('did not converge, not because the fleet is genuinely all-demo:');
+    console.error('  curl -s https://tradingai-bqb1.onrender.com/api/health/options-live');
+    console.error('  -> bootArmEligible:true + bootArmDrift:["mode"] means admin SHOULD be live');
+    console.error('     and is not (TRA-713 / TRA-1652). Re-arm, then re-run this check.');
+    return EXIT_BLIND;
+  }
+  console.error(
+    `DEMO LAG — ${g.demo.length} demo book(s), ${lagRows} lag session(s). ${g.liveBookCount} live book(s) graded, 0 affected.`,
+  );
   console.error('Real, but $0 live trading capital at risk. TRA-2630 Defect B / TRA-2629.');
   console.error('Note: ctoverify_* / qa_* are clone fixtures, so book COUNT overstates breadth.');
   return EXIT_DEMO_LAG;
@@ -351,6 +394,84 @@ function selftest() {
       ],
     }).verdict,
     'DEMO_LAG',
+  );
+
+  // FAILS CLOSED — AN EMPTY LIVE COHORT IS BLIND, NEVER CLEAN OR DEMO_LAG.
+  // This is the bqb1 2026-07-30T05:16Z state: 58 demo books, 0 live, because the
+  // boot-arm left `bootArmDrift: ['mode']`. The pre-fix code read `true` here.
+  check(
+    'an all-demo fleet with NO lag is LIVE_UNMEASURABLE, not CLEAN',
+    gradePayload({
+      engines: [
+        { username: 'qa_x', mode: 'demo', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 140 },
+          { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68 },
+        ] },
+      ],
+    }).verdict,
+    'LIVE_UNMEASURABLE',
+  );
+
+  check(
+    'an all-demo fleet WITH demo lag is LIVE_UNMEASURABLE, not DEMO_LAG',
+    gradePayload({
+      engines: [
+        { username: 'Richard', mode: 'demo', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 67.5 },
+          { date: '2026-07-28', stockDaily: 67.5, optionsDaily: 22.5 },
+        ] },
+      ],
+    }).verdict,
+    'LIVE_UNMEASURABLE',
+  );
+
+  // POSITIVE CONTROL for the same predicate — the ONLY difference from the case
+  // above is that a live book exists and is clean. Without this pair the new
+  // verdict could be hardwired on and nothing would notice.
+  check(
+    'the SAME demo lag grades DEMO_LAG once one clean live book is present',
+    gradePayload({
+      engines: [
+        { username: 'Richard', mode: 'demo', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 67.5 },
+          { date: '2026-07-28', stockDaily: 67.5, optionsDaily: 22.5 },
+        ] },
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 140 },
+          { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68 },
+        ] },
+      ],
+    }).verdict,
+    'DEMO_LAG',
+  );
+
+  // `sandbox` is a THIRD mode (stockModeKey: 'demo' | 'live' | 'sandbox'). A book
+  // armed live but pointed at the Tradier sandbox routes paper fills, so it is
+  // correctly OUTSIDE the real-money tripwire — and it must not be mistaken for
+  // live coverage either.
+  check(
+    'a sandbox-mode book does NOT satisfy the live cohort',
+    gradePayload({
+      engines: [
+        { username: 'admin', mode: 'sandbox', days: [
+          { date: '2026-07-27', stockDaily: 0, optionsDaily: 140 },
+          { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68 },
+        ] },
+      ],
+    }).verdict,
+    'LIVE_UNMEASURABLE',
+  );
+
+  check(
+    'liveBookCount counts only mode:live',
+    gradePayload({
+      engines: [
+        { username: 'a', mode: 'demo', days: [] },
+        { username: 'b', mode: 'sandbox', days: [] },
+        { username: 'c', mode: 'live', days: [] },
+      ],
+    }).liveBookCount,
+    1,
   );
 
   // FAILS CLOSED — an empty payload is BLIND, never CLEAN.

@@ -326,6 +326,63 @@ export interface PnlReconcileResult {
 }
 
 /**
+ * TRA-2630 AC3 — the REAL-MONEY tripwire, folded over the fleet.
+ *
+ * WHY THIS IS NOT A ONE-LINER. The obvious spelling is
+ *
+ *     livePriorOptionsLagOk: engines.every(e => e.mode !== 'live' || e.priorOptionsLagOk)
+ *
+ * and that is what shipped in `2b198109`. `Array.every` is TRUE ON THE EMPTY SET,
+ * so when the fleet contains no `mode: 'live'` book at all the tripwire reports a
+ * clean bill of health for real money it never looked at. "No live book was
+ * affected" and "there was no live book" are then the SAME reading — the exact
+ * confusion CEO filed as TRA-2635, one layer down.
+ *
+ * That is not hypothetical, and it is not a rare state. Measured on bqb1
+ * 2026-07-30T05:16Z: all 58 books resolved `mode: 'demo'` and
+ * `livePriorOptionsLagOk` read `true`. The live cohort was empty because the
+ * TRA-713/TRA-1652 boot-arm failed to converge that boot —
+ * `/api/health/options-live` reported `bootArmEligible: true` with
+ * `bootArmDrift: ['mode']`, i.e. the operator SHOULD have been armed live and was
+ * not. Two pulls 3h earlier (02:08Z, 03:52Z) both carried `admin` as `mode: live`.
+ * So the cohort empties on a boot-arm miss, and the tripwire's answer flips from
+ * "graded and clean" to "manufactured green" with no change in the field's value.
+ *
+ * The mode axis is `stockModeKey`, which is 'demo' | 'live' | 'sandbox' — a book
+ * armed live but pointed at the Tradier SANDBOX resolves 'sandbox', routes paper
+ * fills, and is CORRECTLY outside a real-money tripwire. It still empties the
+ * cohort, so it must still read NOT MEASURED rather than OK.
+ *
+ * Hence the tri-state: `null` means NOT MEASURED and is never a pass. Callers
+ * must fail closed on it (`scripts/check-pnl-options-lag.mjs` exits BLIND/3),
+ * which is the same "ABSENCE IS NOT A PASS" discipline this module already
+ * applies to absent per-leg fields (TRA-2637).
+ */
+export function summarizeLiveLagTripwire(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    priorOptionsLagOk: boolean;
+    priorOptionsLagDates: string[];
+  }>,
+): {
+  liveBookCount: number;
+  livePriorOptionsLagOk: boolean | null;
+  livePriorOptionsLagBooks: Array<{ username: string; dates: string[] }>;
+} {
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  const offenders = liveBooks
+    .filter(e => !e.priorOptionsLagOk)
+    .map(e => ({ username: e.username, dates: e.priorOptionsLagDates }));
+  return {
+    liveBookCount: liveBooks.length,
+    // NOT MEASURED, not OK — see the note above.
+    livePriorOptionsLagOk: liveBooks.length === 0 ? null : offenders.length === 0,
+    livePriorOptionsLagBooks: offenders,
+  };
+}
+
+/**
  * TRA-2302 — fold durable option-trade-journal rows into a per-ET-day close
  * census for ONE book.
  *
