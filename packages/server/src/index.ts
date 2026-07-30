@@ -4233,6 +4233,29 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // `optionsCreditedCumulative`) rather than off a delta. Tri-state; `null`
       // is NOT MEASURED and is never a pass.
       ...summarizeLiveCreditObservation(engines),
+      // TRA-2658 — the FROZEN-counter axis, folded firm-wide. Same tri-state
+      // precedence as every other fold here. This is the axis that gives AC2's
+      // `counterDurable` a failing state: on 2026-07-30T14:08Z the pre-fix fold
+      // would have reported a clean durability grade over `admin`'s three
+      // consecutive zero-counter sessions.
+      counterDurableOk: engines.some(e => e.counterDurable === false)
+        ? false
+        : engines.some(e => e.counterDurable === true)
+          ? true
+          : null,
+      counterFrozenBooks: engines
+        .filter(e => e.counterFrozenDates.length > 0)
+        .map(e => ({
+          username: e.username,
+          mode: e.mode,
+          dates: e.counterFrozenDates,
+          maxUnbookedEquityMoveUsd: e.maxUnbookedEquityMoveUsd,
+          uncreditedOptionsUsd: e.uncreditedOptionsUsd,
+        })),
+      // The DENOMINATOR for the fold above. `counterDurableOk: true` over 0 books
+      // that ever wrote the counter and over 20 that did are different claims, and
+      // without this they are the same reading.
+      counterGradeableBookCount: engines.filter(e => e.counterDurable !== null).length,
       // TRA-2637 (QuantTrader) — THE ABSENCE AXIS. Every verdict above grades a
       // VALUE; none of them can see a session that has no row at all, and the
       // live book served exactly that on 2026-07-29 while reporting `drift: 0`.

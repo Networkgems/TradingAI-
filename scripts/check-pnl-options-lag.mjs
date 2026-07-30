@@ -723,7 +723,78 @@ export function gradeCreditObservation(payload) {
         - Number(written[i - 1].optionsCreditedCumulative);
       if (delta < -TOLERANCE_USD) negativeWindow = true;
     }
-    const counterDurable = written.length === 0 ? null : lagDates.length === 0 && !negativeWindow;
+    // TRA-2658 — THE THIRD SIGNATURE, and the one both terms above are blind to.
+    //
+    // `lagDates` and `negativeWindow` are both MOTION detectors. A counter frozen
+    // at exactly 0 never decreases, and never pushes a credit into the stock leg
+    // either — because `openingEquity` absorbed the credit across a boot before
+    // the 21:00 close ran, leaving `stockDaily` as the true stock leg. So the
+    // pre-TRA-2658 predicate reported `counterDurable: true` on `admin` while
+    // $254.00 of option credit that had demonstrably reached equity was recorded
+    // as nothing. Live bqb1 2026-07-30T14:08Z: `counterResetDates: []`,
+    // `optionsCreditedCumulative: 0` on 07-27/07-28/07-29, `closingEquity`
+    // 2008.29 -> 2147.35 -> 2243.48 against stock legs of -0.94 and -17.87.
+    //
+    // COMPUTED HERE FROM THE RAW DAY FIELDS, not read off a new endpoint field, on
+    // purpose. Deriving it locally is what lets this checker grade a build that
+    // predates the endpoint-side fix — `closingEquity`, `stockDaily`,
+    // `optionsDaily` and `optionsCreditedCumulative` have all shipped since
+    // TRA-2635, so the frozen signature is recoverable from any current pull. A
+    // checker that could only see the defect after the fix deployed could never
+    // have found it.
+    //
+    //   unbookedMove = (closingEquity - prevClosingEquity) - stockDaily - creditWindow
+    //
+    // which is algebraically `openingEquity - prevClosingEquity`, i.e. equity that
+    // moved with no daily row explaining it. The `optionsDaily` term is the
+    // ATTRIBUTION: a starting-balance edit (`PaperAccount.applyEquity`) is also an
+    // un-booked move and is NOT a counter defect, so an un-attributable move is
+    // reported without an accusation and never folded into the verdict.
+    const frozenDates = [];
+    const unbookedMoveDates = [];
+    // THE ATTRIBUTION POOL: realized option P&L that nothing has accounted for.
+    //
+    //     pool = Σ |optionsDaily| − Σ |recorded credit window| − Σ attributed moves
+    //
+    // A move is charged to a lost credit only if the pool can pay for it. Two
+    // weaker predicates each failed a control on the way here: "option P&L in the
+    // ADJACENT sessions" cleared exactly the longest freezes (a week-long freeze
+    // delivers several sessions' credit into one window whose neighbours are both
+    // quiet), and "≤ cumulative realized" alone accused a $50 starting-balance
+    // edit on a book that had realized $1,000 and been fully credited. Subtracting
+    // what the counter already recorded closes the second: a fully credited book
+    // has an EMPTY pool and cannot produce a frozen-counter claim at all.
+    let pool = 0;
+    for (let i = 0; i < days.length; i++) {
+      const cur = days[i];
+      // Pre-baseline P&L was never creditable (no bridge), so it funds nothing.
+      if (!cur?.belowBaseline) pool += Math.abs(Number(cur?.optionsDaily) || 0);
+      if (i === 0) continue;
+      const prev = days[i - 1];
+      if (!Number.isFinite(Number(cur?.closingEquity))) continue;
+      if (!Number.isFinite(Number(prev?.closingEquity))) continue;
+      const curCredit = Number(cur?.optionsCreditedCumulative);
+      const prevCredit = Number(prev?.optionsCreditedCumulative);
+      const creditWindow =
+        Number.isFinite(curCredit) && Number.isFinite(prevCredit) ? curCredit - prevCredit : 0;
+      const stockDaily = Number.isFinite(Number(cur?.stockDaily)) ? Number(cur.stockDaily) : 0;
+      const move =
+        Math.round(
+          ((Number(cur.closingEquity) - Number(prev.closingEquity)) - stockDaily - creditWindow)
+          * 100,
+        ) / 100;
+      pool -= Math.abs(creditWindow);
+      if (Math.abs(move) <= TOLERANCE_USD) continue;
+      unbookedMoveDates.push({ date: cur.date, move });
+      if (Math.abs(creditWindow) > TOLERANCE_USD) continue;
+      if (Math.abs(move) > pool + TOLERANCE_USD) continue;
+      frozenDates.push({ date: cur.date, move });
+      pool -= Math.abs(move);
+    }
+    const counterDurable =
+      written.length === 0
+        ? null
+        : lagDates.length === 0 && !negativeWindow && frozenDates.length === 0;
     // Asymmetric on purpose: a counter that MOVED is positive evidence regardless
     // of durability — money that was recorded was recorded.
     const absorbed = gradeable.some((d) => Number(d.optionsCreditedCumulative) !== 0)
@@ -775,6 +846,14 @@ export function gradeCreditObservation(payload) {
       absorbed,
       counterDurable,
       counterResetDates: lagDates,
+      // TRA-2658 — the ATTRIBUTION for a non-durable counter. A ZEROED counter and
+      // a FROZEN one need opposite remediations: a reset has already double-booked
+      // the credit into `stockDaily` (so `uncredited` is an upper bound), while a
+      // freeze leaves the stock leg exact and the credit present in `closingEquity`
+      // but absent from every daily row. Reporting only the boolean loses that.
+      counterFrozenDates: frozenDates,
+      unbookedMoveDates,
+      maxUnbookedMoveUsd: unbookedMoveDates.reduce((m, r) => Math.max(m, Math.abs(r.move)), 0),
       equityGrowth,
       stockSum: Math.round(stockSum * 100) / 100,
       uncredited,
@@ -1484,14 +1563,54 @@ function reportCreditUnshipped(credit) {
       `  ${b.username}: $${b.optionsRealizedUsd.toFixed(2)} realized, equity grew `
       + `$${(b.equityGrowth ?? 0).toFixed(2)} on a $${b.stockSum.toFixed(2)} stock leg`,
     );
+    // TRA-2658 — the upper-bound caveat belongs to a RESET counter ONLY, not to
+    // every `counterDurable: false`. A reset re-books the lagged credit INTO
+    // `stockDaily`, so that leg double-counts and the shortfall overstates. A
+    // FROZEN counter does the opposite: `openingEquity` absorbed the credit before
+    // the close, so `stockDaily` is the exact stock leg and the figure is EXACT.
+    // Keying the caveat on the boolean printed both claims at once — the previous
+    // spelling called admin's $733.60 an upper bound directly above the line
+    // proving its stock leg was exact.
+    const resetBound = (b.counterResetDates ?? []).length > 0;
+    const frozenOnly = !resetBound && (b.counterFrozenDates ?? []).length > 0;
     console.error(
       `      => $${(b.uncredited ?? 0).toFixed(2)} ABSENT FROM NAV`
-      + `${b.counterDurable === false ? ' (UPPER BOUND — counter non-durable, so the lagged credit double-counts in the stock leg)' : ''}`,
+      + (resetBound
+        ? ' (UPPER BOUND — counter RESET, so the lagged credit double-counts in the stock leg)'
+        : frozenOnly
+          ? ' (EXACT — counter FROZEN, not reset: the stock leg was never re-booked)'
+          : ''),
     );
     console.error(
       `      counter: optionsCreditedCumulative $${(b.creditedLatest ?? 0).toFixed(2)}`
       + ` over ${b.measuredSessions} gradeable session(s), durable=${JSON.stringify(b.counterDurable)}`,
     );
+    // TRA-2658 — WHY the counter is not durable, which decides the remediation.
+    if ((b.counterFrozenDates ?? []).length > 0) {
+      console.error(
+        `      counter FROZEN (TRA-2658) on ${b.counterFrozenDates.length} session(s):`
+        + ` ${b.counterFrozenDates.map((r) => `${r.date} $${r.move.toFixed(2)}`).join(', ')}`,
+      );
+      console.error(
+        '      => that credit DID reach closingEquity and was recorded as nothing. The stock'
+        + ' leg is exact; the money is in NAV but in no daily row. Contrast a RESET counter,'
+        + ' where the credit was re-booked INTO stockDaily and double-counts.',
+      );
+    }
+    if ((b.counterResetDates ?? []).length > 0) {
+      console.error(
+        `      counter RESET (TRA-2629) on: ${b.counterResetDates.join(', ')}`,
+      );
+    }
+    const unattributed = (b.unbookedMoveDates ?? []).filter(
+      (r) => !(b.counterFrozenDates ?? []).some((f) => f.date === r.date),
+    );
+    if (unattributed.length > 0) {
+      console.error(
+        `      un-booked equity moves NOT attributed to a lost credit (a starting-balance edit`
+        + ` is the benign cause): ${unattributed.map((r) => `${r.date} $${r.move.toFixed(2)}`).join(', ')}`,
+      );
+    }
   }
   console.error('TRA-2323 scope item 1 is UNSHIPPED on real capital. The book value every');
   console.error('sizing decision reads is understated by the whole realized options leg, and');
@@ -2124,6 +2243,124 @@ function selftest() {
       return { counterDurable: c.books[0].counterDurable, absorbed: c.books[0].absorbed };
     })(),
     { counterDurable: false, absorbed: null },
+  );
+
+  // ── TRA-2658: the FROZEN counter ────────────────────────────────────────────
+  // Both directions, because the failing arm is the whole finding: the pre-fix
+  // predicate reported a CLEAN durability grade on this exact live shape.
+  check(
+    'CREDIT/TRA-2658: a counter FROZEN at 0 is NOT durable (the pre-fix predicate said it was)',
+    (() => {
+      // `admin` off bqb1 2026-07-30T14:08:29Z, promoted to mode:live so the cohort
+      // is non-empty (it resolved `demo` on that boot — the TRA-2649 boot-arm flap).
+      // Neither reset signature fires here: no lag session, no negative window.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 140, optionsCreditedCumulative: 0, closingEquity: 2008.29 },
+        { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68, optionsCreditedCumulative: 0, closingEquity: 2147.35 },
+        { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01, optionsCreditedCumulative: 0, closingEquity: 2243.48 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return {
+        counterDurable: b.counterDurable,
+        resets: b.counterResetDates,
+        frozen: b.counterFrozenDates,
+        maxMove: b.maxUnbookedMoveUsd,
+      };
+    })(),
+    {
+      counterDurable: false,
+      resets: [],
+      frozen: [{ date: '2026-07-28', move: 140 }, { date: '2026-07-29', move: 114 }],
+      maxMove: 140,
+    },
+  );
+
+  check(
+    'CREDIT/TRA-2658: a continuously-run book is DURABLE — the passing state is reachable',
+    (() => {
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 10, optionsDaily: 40, optionsCreditedCumulative: 100, closingEquity: 2100 },
+        { date: '2026-07-29', stockDaily: 10, optionsDaily: 40, optionsCreditedCumulative: 150, closingEquity: 2160 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates, absorbed: b.absorbed };
+    })(),
+    { counterDurable: true, frozen: [], absorbed: true },
+  );
+
+  check(
+    'CREDIT/TRA-2658: a starting-balance edit is an un-booked move but NOT a frozen counter',
+    (() => {
+      // No option P&L in the window, so nothing attributes the move to a lost
+      // credit. Visible on `unbookedMoveDates`, absent from the verdict.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 0, optionsDaily: 40, optionsCreditedCumulative: 100, closingEquity: 2000 },
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 100, closingEquity: 3000 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return {
+        counterDurable: b.counterDurable,
+        frozen: b.counterFrozenDates,
+        unbooked: b.unbookedMoveDates,
+      };
+    })(),
+    {
+      counterDurable: true,
+      frozen: [],
+      unbooked: [{ date: '2026-07-29', move: 1000 }],
+    },
+  );
+
+  check(
+    'CREDIT/TRA-2658: a freeze spanning MANY sessions stays inside the cumulative ceiling',
+    (() => {
+      // The ceiling must be cumulative, not per-window. Here 07-27 realized 500
+      // and the whole 500 arrives as one un-booked move two sessions later; a
+      // per-window bound (prev 0 + cur 0) would clear it — clearing exactly the
+      // longest freezes, which are the worst ones.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 500, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-07-28', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2500 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates };
+    })(),
+    { counterDurable: false, frozen: [{ date: '2026-07-29', move: 500 }] },
+  );
+
+  check(
+    'CREDIT/TRA-2658: a FULLY CREDITED book cannot produce a frozen claim — the pool is empty',
+    (() => {
+      // 1,000 realized and 1,000 recorded, then a +50 starting-balance edit. Under
+      // a bare "<= cumulative realized" ceiling the 50 fits and gets accused; the
+      // pool is 0 because the counter already accounted for every cent.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-27', stockDaily: 0, optionsDaily: 1000, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-07-28', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 1000, closingEquity: 3000 },
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 1000, closingEquity: 3050 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return {
+        counterDurable: b.counterDurable,
+        frozen: b.counterFrozenDates,
+        unbooked: b.unbookedMoveDates,
+      };
+    })(),
+    { counterDurable: true, frozen: [], unbooked: [{ date: '2026-07-29', move: 50 }] },
+  );
+
+  check(
+    'CREDIT/TRA-2658: the frozen signature does not manufacture a verdict on a book with no counter',
+    (() => {
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 0, optionsDaily: 60, closingEquity: 2000 },
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, closingEquity: 2060 },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates.map((r) => r.date) };
+    })(),
+    { counterDurable: null, frozen: ['2026-07-29'] },
   );
 
   check(

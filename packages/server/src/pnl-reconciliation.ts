@@ -127,12 +127,16 @@ export const PNL_DRIFT_DECOMPOSITION_NOTE =
 export const PNL_ABSENT_EOD_ROW_NOTE =
   'TRA-2637: an ABSENT EOD row is NOT a pass. `drift` is now `null` (was 0) on any session whose `eodCombined` is null, and the absence is graded on its own axis — per-row `eodRowMissing`, per-book `eodRowsPresentOk` / `eodRowMissingDates` / `eodRowGradeableCount`, fleet-level `liveEodRowsPresentOk` / `liveEodRowMissingBooks`. Live proof: `admin` 2026-07-29 served `drift: 0` with `eodCombined: null` over 6 journal closes worth +$250.01. The presence verdicts are TRI-STATE; `null` = NOT MEASURED (empty cohort) and must never be read as green.';
 
+export const PNL_FROZEN_COUNTER_NOTE =
+  'TRA-2658: a FROZEN `optionsCreditedCumulative` is invisible to the reset signatures. `counterDurable` graded non-durability off `lagsPriorOptionsDaily` and a NEGATIVE window, and both are MOTION detectors — a counter stuck at exactly 0 never decreases and never pushes a credit into the stock leg, because `openingEquity` absorbed the credit across a boot before the 21:00 close ran. Live bqb1 2026-07-30T14:08Z: `admin` served `counterDurable: true` with `counterResetDates: []` and `optionsCreditedCumulative: 0` on 07-27, 07-28 AND 07-29, while $254.00 of option credit had demonstrably reached its equity ($2,008.29 -> $2,243.48 against a -$18.81 stock leg). So the predicate TRA-2658 AC2 grades had NO FAILING STATE on the one book that mattered. The third signature is `unbookedEquityMoveUsd` = (closingEquity - prevClosingEquity) - stockDaily - optionsCreditedInWindow, which is algebraically `openingEquity - prevClosingEquity` and is 0 on a continuously-run book; it read +140.00 on 07-28 (= 07-27 `optionsDaily` to the cent) and +114.00 on 07-29. Its operands are three durable snapshot fields that NO writer joins, so it cannot go self-confirming the way TRA-2641 `optionsLegDrift` did. It now folds into `counterDurable` via `counterFrozenDates`; read `counterNonDurableDates` for the union and `counterResetDates` for the original narrower meaning — a ZEROED counter and a FROZEN one need OPPOSITE remediations, because a zeroed counter has already double-booked the credit into `stockDaily` (making `uncreditedOptionsUsd` an upper bound) while a frozen one leaves the stock leg exact and the credit present in `closingEquity` but absent from every daily row. `unbookedEquityMoveDates` additionally publishes un-attributed moves (a starting-balance edit via `PaperAccount.applyEquity` is the benign cause) WITHOUT folding them into the verdict.';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
   '/api/health/option-journal folds ALL modes; the Desk calendar filters mode:\'demo\'. Comparing the two mixes live rows into one side.',
   PNL_DRIFT_DECOMPOSITION_NOTE,
   PNL_ABSENT_EOD_ROW_NOTE,
+  PNL_FROZEN_COUNTER_NOTE,
 ];
 
 /**
@@ -406,6 +410,62 @@ export interface PnlReconcileDay {
    */
   optionsCreditedInWindow: number | null;
   /**
+   * TRA-2658 — **equity that moved between the previous booked close and this
+   * session's opening, explained by NOTHING in the ledger.**
+   *
+   *     unbookedEquityMoveUsd
+   *       = (closingEquity − prevClosingEquity) − stockDaily − optionsCreditedInWindow
+   *
+   * Algebraically this is `openingEquity − prevClosingEquity`, because the writer
+   * builds `stockDaily` as `(equity − openingEquity) − optionsCreditedInWindow`
+   * (see `generateAndSaveReport` in `index.ts`). On a continuously-run book
+   * `saveSnapshot` sets `openingEquity` to the row it just closed, so the two
+   * telescope and this is exactly 0. It is non-zero only when
+   * `advanceDayIfNeeded()` / `syncOpeningEquity()` rolled `openingEquity` forward
+   * across a boot WITHOUT booking a snapshot — the TRA-1557 un-booked equity
+   * re-anchor — so real equity movement entered no daily row at all.
+   *
+   * ## Why this axis exists: it is the ONLY signal that can see a FROZEN counter
+   *
+   * {@link PnlReconcileResult.counterDurable} grades non-durability off two
+   * signatures, and BOTH are motion detectors: `lagsPriorOptionsDaily` (the T+1
+   * mis-bucket) and a NEGATIVE window. A counter that is stuck at exactly 0
+   * across every session produces neither — it never decreases and it never
+   * pushes a credit into the stock leg, because the credit was absorbed by
+   * `openingEquity` before the close ran. So the reset-only predicate reports
+   * `counterDurable: true` on a book whose counter demonstrably lost every cent
+   * it was supposed to record. That is not hypothetical: live on bqb1
+   * 2026-07-30T14:08Z, `admin` served `counterDurable: true` with
+   * `optionsCreditedCumulative: 0` on 07-27, 07-28 AND 07-29 while this figure
+   * read **+140.00** on 07-28 (= 07-27's `optionsDaily` to the cent) and
+   * **+114.00** on 07-29 — $254.00 of credit that reached equity and that the
+   * counter recorded as nothing. "Clean" and "never fired" were the same reading,
+   * one layer in from TRA-2635.
+   *
+   * Its three operands (`closingEquity` on two rows, `stockDaily` on this one)
+   * are all durable snapshot fields and NO writer joins them — `stockDaily` is
+   * subtracted against `openingEquity`, never against the previous row — so this
+   * cannot become self-confirming the way TRA-2641's `optionsLegDrift` did.
+   *
+   * `null` when there is no previous row with a finite `closingEquity`; a
+   * subtraction with an absent endpoint is not a zero (TRA-2637).
+   */
+  unbookedEquityMoveUsd: number | null;
+  /**
+   * TRA-2658 — this session carries a material {@link unbookedEquityMoveUsd}
+   * that is ATTRIBUTABLE to a lost option credit: the window spans a session
+   * which realized option P&L, and the recorded `optionsCreditedInWindow` is
+   * nonetheless zero (or absent).
+   *
+   * The attribution term is load-bearing. `PaperAccount.applyEquity()` rebases
+   * equity on a starting-balance edit, which is also an un-booked move and is
+   * NOT a counter defect. Flagging every un-booked move as a frozen counter
+   * would manufacture a red on any book whose operator edited demo equity —
+   * the TRA-2193 pooling trap. Un-attributable moves stay visible on
+   * {@link PnlReconcileResult.unbookedEquityMoveDates} without an accusation.
+   */
+  counterFrozen: boolean;
+  /**
    * eodCombined − (stockDaily + optionsDaily).
    *
    * TRA-2637 (QuantTrader) — **`null` when `eodCombined` is null, NEVER 0.** This
@@ -658,10 +718,35 @@ export interface PnlReconcileResult {
    * Measured 2026-07-30T07:48Z: `false` on `Richard`, which wrote 0 on three
    * consecutive sessions while its `closingEquity` moved +67.50 then +22.50 —
    * exactly the two prior sessions' `optionsDaily`.
+   *
+   * TRA-2658 — a THIRD signature now folds in: {@link counterFrozenDates}. Both
+   * signatures above are motion detectors and neither can see a counter stuck at
+   * exactly 0, which is what `admin` served while $254.00 of credit reached its
+   * equity. Read {@link counterNonDurableDates} for the union that drives this
+   * verdict; `counterResetDates` keeps its original, narrower meaning so a reader
+   * can still tell a zeroed counter from a frozen one.
    */
   counterDurable: boolean | null;
-  /** TRA-2635 — the sessions that prove the reset. Empty is the passing state. */
+  /** TRA-2635 — the sessions that prove the counter was RESET (zeroed between two writes). */
   counterResetDates: string[];
+  /**
+   * TRA-2658 — the sessions that prove the counter was FROZEN: material
+   * {@link PnlReconcileDay.unbookedEquityMoveUsd}, zero/absent recorded credit,
+   * and option P&L realized in the window. Empty is the passing state.
+   */
+  counterFrozenDates: string[];
+  /** TRA-2658 — the union that drives {@link counterDurable}. Empty is the passing state. */
+  counterNonDurableDates: string[];
+  /**
+   * TRA-2658 — every session with a material un-booked equity move, INCLUDING the
+   * ones not attributable to a lost option credit (a starting-balance edit via
+   * `PaperAccount.applyEquity` is the common benign cause). Published without an
+   * accusation so an un-attributed move stays visible rather than being either
+   * silently dropped or wrongly folded into `counterDurable`.
+   */
+  unbookedEquityMoveDates: string[];
+  /** TRA-2658 — largest absolute un-booked equity move on this book, in USD. */
+  maxUnbookedEquityMoveUsd: number;
   /**
    * TRA-2635 — THE STATE MEASUREMENT. Needs no counter, so it survives the defect
    * above: `(Σ optionsDaily + Σ stockDaily) − Δ closingEquity` over evaluated
@@ -800,6 +885,9 @@ export function summarizeLiveCreditObservation(
     mode: string;
     equityAbsorbedOptionsOk: boolean | null;
     counterDurable: boolean | null;
+    counterFrozenDates: string[];
+    counterNonDurableDates: string[];
+    maxUnbookedEquityMoveUsd: number;
     optionsCreditedMeasuredCount: number;
     optionsCreditedLatest: number | null;
     optionsCreditedDates: string[];
@@ -814,6 +902,7 @@ export function summarizeLiveCreditObservation(
   liveCreditBookCount: number;
   liveEquityAbsorbedOptionsOk: boolean | null;
   liveUncreditedOptionsUsd: number | null;
+  liveCounterDurableOk: boolean | null;
   liveCreditBooks: Array<Record<string, unknown>>;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
@@ -831,6 +920,16 @@ export function summarizeLiveCreditObservation(
     liveUncreditedOptionsUsd: measurable.length === 0
       ? null
       : round2(measurable.reduce((s, e) => s + (e.uncreditedOptionsUsd ?? 0), 0)),
+    // TRA-2658 AC2, folded so a checker can assert it without walking the array.
+    // Same tri-state precedence as every other fold in this module — RED beats
+    // NOT MEASURED beats GREEN — and `null` requires `liveCreditBookCount` to
+    // interpret: an empty live cohort must never read as a passing durability
+    // grade, which is the failure mode `summarizeLiveLagTripwire` documents.
+    liveCounterDurableOk: liveBooks.some(e => e.counterDurable === false)
+      ? false
+      : liveBooks.some(e => e.counterDurable === true)
+        ? true
+        : null,
     // Named, not anonymized: this endpoint already publishes each book's full
     // per-session P&L series under its username, and an unnamed red verdict on
     // real capital is not actionable.
@@ -838,6 +937,14 @@ export function summarizeLiveCreditObservation(
       username: e.username,
       equityAbsorbedOptionsOk: e.equityAbsorbedOptionsOk,
       counterDurable: e.counterDurable,
+      // TRA-2658 — the ATTRIBUTION for a `counterDurable: false`. Without these a
+      // reader cannot tell a zeroed counter (money already double-booked into the
+      // stock leg, so `uncreditedOptionsUsd` is an upper bound) from a frozen one
+      // (stock leg is exact, and the credit is missing from every daily row while
+      // still present in `closingEquity`). The two need opposite remediations.
+      counterFrozenDates: e.counterFrozenDates,
+      counterNonDurableDates: e.counterNonDurableDates,
+      maxUnbookedEquityMoveUsd: e.maxUnbookedEquityMoveUsd,
       optionsCreditedMeasuredCount: e.optionsCreditedMeasuredCount,
       optionsCreditedLatest: e.optionsCreditedLatest,
       optionsCreditedDates: e.optionsCreditedDates,
@@ -1046,6 +1153,9 @@ export function reconcilePnl(
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
         optionsCreditedInWindow: null,
+        // TRA-2658 — both filled in by the same pass, for the same reason.
+        unbookedEquityMoveUsd: null,
+        counterFrozen: false,
         drift,
         eodRowMissing: eodCombined == null,
         belowBaseline,
@@ -1091,6 +1201,61 @@ export function reconcilePnl(
     cur.optionsCreditedInWindow = round2(
       cur.optionsCreditedCumulative - prev.optionsCreditedCumulative,
     );
+  }
+
+  // TRA-2658 — the UN-BOOKED EQUITY MOVE pass, and the frozen-counter
+  // attribution built on it. See {@link PnlReconcileDay.unbookedEquityMoveUsd}
+  // for why this axis is the only one that can see a counter stuck at 0.
+  //
+  // Deliberately a THIRD pass rather than folded into either loop above. The
+  // credit-window loop `continue`s whenever an endpoint of the counter is absent
+  // — which is precisely the state a frozen counter produces on its first
+  // session — so computing this there would blind it on exactly the rows it
+  // exists to grade. `optionsCreditedInWindow` is read as `?? 0` here (NOT
+  // skipped on absent) on purpose: an absent counter contributes no explanation
+  // for the equity move, which is the same thing a recorded 0 contributes. The
+  // ambiguity TRA-2635 preserved matters when the counter is the ANSWER; here it
+  // is the SUBTRAHEND, and both spellings of "explains nothing" are one value.
+  // THE ATTRIBUTION POOL: realized option P&L that nothing has accounted for yet.
+  //
+  //     pool = Σ |optionsDaily|  −  Σ |recorded credit window|  −  Σ attributed moves
+  //
+  // A move is charged to a lost credit only if the pool can pay for it. This one
+  // running figure replaces two weaker terms that each failed a control:
+  //
+  //  - "option P&L realized in the ADJACENT sessions" is too NARROW. A counter
+  //    frozen for a week delivers several sessions' credit in one window whose two
+  //    adjacent sessions may both be quiet, so it cleared exactly the longest
+  //    freezes — the worst ones.
+  //  - "≤ cumulative realized" alone is too WIDE. On a book that realized $1,000
+  //    and had every cent properly credited, a later $50 starting-balance edit
+  //    (`PaperAccount.applyEquity`) still fits under $1,000 and would be accused.
+  //    Subtracting what the counter already recorded is what closes that: a fully
+  //    credited book has an empty pool and cannot produce a frozen-counter claim.
+  //
+  // `Math.abs` throughout because the sink takes a SIGNED delta — a realized loss
+  // is credited too, so a losing session still supplies explanatory room.
+  // Pre-baseline sessions do not contribute: the bridge did not exist then, so
+  // their P&L was never creditable and counting it would fund a false accusation.
+  let pool = 0;
+  for (let i = 0; i < days.length; i++) {
+    const cur = days[i]!;
+    if (!cur.belowBaseline) pool += Math.abs(cur.optionsDaily);
+    if (i === 0) continue;
+    const prev = days[i - 1]!;
+    if (!Number.isFinite(cur.closingEquity) || !Number.isFinite(prev.closingEquity)) continue;
+    const recorded = cur.optionsCreditedInWindow ?? 0;
+    const move = round2((cur.closingEquity - prev.closingEquity) - cur.stockDaily - recorded);
+    cur.unbookedEquityMoveUsd = move;
+    pool -= Math.abs(recorded);
+    if (Math.abs(move) <= PNL_RECONCILE_TOLERANCE_USD) continue;
+    // Recorded nothing for it — an ABSENT counter says "recorded nothing" just as
+    // a written 0 does, and here the counter is the subtrahend rather than the
+    // answer, so the TRA-2635 null/0 distinction does not apply.
+    if (Math.abs(recorded) > PNL_RECONCILE_TOLERANCE_USD) continue;
+    if (Math.abs(move) > pool + PNL_RECONCILE_TOLERANCE_USD) continue;
+    cur.counterFrozen = true;
+    pool -= Math.abs(move);
   }
 
   const evaluated = days.filter(d => !d.belowBaseline);
@@ -1229,8 +1394,38 @@ export function reconcilePnl(
   const counterResetDates = days
     .filter(d => d.lagsPriorOptionsDaily || (d.optionsCreditedInWindow ?? 0) < -PNL_RECONCILE_TOLERANCE_USD)
     .map(d => d.date);
+  // TRA-2658 — THE THIRD NON-DURABILITY SIGNATURE, and the one both signatures
+  // above are structurally blind to.
+  //
+  // Both `counterResetDates` terms are MOTION detectors: a T+1 mis-bucket, or a
+  // decrease. A counter frozen at exactly 0 produces neither. It never decreases,
+  // and it never pushes a credit into the stock leg, because `openingEquity`
+  // absorbed the credit across a boot before the close ran — so `stockDaily`
+  // stays the true stock leg and the lag signature never fires.
+  //
+  // `counterDurable` therefore had NO FAILING STATE on the most important book on
+  // the fleet. Live bqb1 2026-07-30T14:08Z, `admin`: `counterDurable: true`,
+  // `counterResetDates: []`, `optionsCreditedCumulative: 0` on 07-27/07-28/07-29
+  // — while `unbookedEquityMoveUsd` read +140.00 then +114.00, i.e. $254.00 of
+  // credit that reached equity and was recorded as nothing. TRA-2658 AC2 asks for
+  // `counterDurable === true` as the proof Defect A is fixed at the durable seam;
+  // graded against the reset-only predicate that acceptance was ALREADY green on
+  // the broken book, which is the `every`-is-true-on-the-empty-cohort failure this
+  // module has now shipped four times, wearing a non-empty filter.
+  //
+  // Folded INTO `counterDurable` rather than published beside it, deliberately.
+  // The field's documented meaning — "is `optionsCreditedCumulative` trustworthy
+  // as evidence of absence?" — is exactly right; a counter frozen at 0 is the
+  // least trustworthy state it can be in. A parallel field would have left AC2
+  // vacuously green and pushed the discrimination onto every future reader.
+  const counterFrozenDates = days.filter(d => d.counterFrozen).map(d => d.date);
+  const counterNonDurableDates = [...new Set([...counterResetDates, ...counterFrozenDates])].sort();
+  const unbookedEquityMoveDates = days
+    .filter(d => d.unbookedEquityMoveUsd != null
+      && Math.abs(d.unbookedEquityMoveUsd) > PNL_RECONCILE_TOLERANCE_USD)
+    .map(d => d.date);
   const counterDurable: boolean | null =
-    creditWrittenDays.length === 0 ? null : counterResetDates.length === 0;
+    creditWrittenDays.length === 0 ? null : counterNonDurableDates.length === 0;
   const equityAbsorbedOptionsOk: boolean | null =
     creditMeasurableDays.some(d => d.optionsCreditedCumulative !== 0)
       ? true
@@ -1316,6 +1511,12 @@ export function reconcilePnl(
     equityAbsorbedOptionsOk,
     counterDurable,
     counterResetDates,
+    counterFrozenDates,
+    counterNonDurableDates,
+    unbookedEquityMoveDates,
+    maxUnbookedEquityMoveUsd: round2(
+      days.reduce((m, d) => Math.max(m, Math.abs(d.unbookedEquityMoveUsd ?? 0)), 0),
+    ),
     postBaselineEquityGrowth,
     postBaselineOptionsRealized,
     postBaselineStockDaily,

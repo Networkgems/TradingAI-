@@ -925,6 +925,280 @@ describe('TRA-2635 — equityAbsorbedOptionsOk (did the credit reach equity?)', 
   });
 });
 
+describe('TRA-2658 — the FROZEN counter (the signature counterDurable could not see)', () => {
+  // THE PINNED LIVE OBSERVATION. Every number here was read off bqb1
+  // `/api/health/pnl-reconciliation` at 2026-07-30T14:08:29Z for `admin`, BEFORE
+  // this axis existed — the counters are in-memory and bqb1 restarts several
+  // times an hour, so a test written against a later pull would be grading a
+  // different book. `openingEquity` is set to the value the row's own arithmetic
+  // implies (`closingEquity − dailyPnl − creditInWindow`), which is how the real
+  // rows were written; it is not read by `reconcilePnl` and is here for the
+  // reader.
+  const adminLive = (): DailySnapshot[] => [
+    // 07-13: the first evaluated session. Counter not yet written (pre-TRA-2323
+    // rows carry no field at all), so it serves `null`, never 0.
+    { date: '2026-07-13', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 0, combinedPnl: 0, trades: 0 },
+    // 07-14 .. 07-24: the PRE-BRIDGE sessions (`ec09e42` went live 07-25T22:34Z).
+    // Equity does not move a cent across all 11 of them while the options leg
+    // books +$529.59. The full series is carried, not abridged: `uncreditedOptionsUsd`
+    // sums Σ optionsDaily over the SPANNED rows, so dropping a session silently
+    // shrinks the very figure this test pins.
+    { date: '2026-07-14', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 0, combinedPnl: 0, trades: 0 },
+    { date: '2026-07-15', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 17, combinedPnl: 17, trades: 0 },
+    { date: '2026-07-16', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: -4.5, combinedPnl: -4.5, trades: 0 },
+    { date: '2026-07-17', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 217.5, combinedPnl: 217.5, trades: 0 },
+    { date: '2026-07-20', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 75.3, combinedPnl: 75.3, trades: 0 },
+    { date: '2026-07-21', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 80.5, combinedPnl: 80.5, trades: 0 },
+    { date: '2026-07-22', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 54.4, combinedPnl: 54.4, trades: 0 },
+    { date: '2026-07-23', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 29.89, combinedPnl: 29.89, trades: 0 },
+    { date: '2026-07-24', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 59.5, combinedPnl: 59.5, trades: 0 },
+    // 07-27: first row that carries the counter — and it carries 0.
+    { date: '2026-07-27', openingEquity: 2_008.29, closingEquity: 2_008.29, dailyPnl: 0, optionsPnl: 0, optionsDailyPnl: 140, optionsCreditedCumulative: 0, combinedPnl: 140, trades: 0 },
+    // 07-28: equity +139.06 against a −0.94 stock leg ⇒ +140.00 arrived and was
+    // absorbed by `openingEquity` across a boot. Counter still 0.
+    { date: '2026-07-28', openingEquity: 2_148.29, closingEquity: 2_147.35, dailyPnl: -0.94, optionsPnl: 0, optionsDailyPnl: 68, optionsCreditedCumulative: 0, combinedPnl: 67.06, trades: 0 },
+    // 07-29: equity +96.13 against a −17.87 stock leg ⇒ +114.00 arrived. Still 0.
+    { date: '2026-07-29', openingEquity: 2_261.35, closingEquity: 2_243.48, dailyPnl: -17.87, optionsPnl: 0, optionsDailyPnl: 250.01, optionsCreditedCumulative: 0, combinedPnl: 232.14, trades: 0 },
+  ];
+
+  it('reproduces the live admin book: counterDurable was TRUE over $254.00 of lost credit', () => {
+    const r = reconcilePnl(adminLive(), new Map(), '2026-07-12');
+    // The reset-only predicate is still empty — that is the whole finding. Neither
+    // original signature fires, so the PRE-TRA-2658 verdict was `true`.
+    expect(r.counterResetDates).toEqual([]);
+    expect(r.priorOptionsLagOk).toBe(true);
+    // And the counter is nonetheless recording nothing at all.
+    const byDate = new Map(r.days.map(d => [d.date, d]));
+    expect(byDate.get('2026-07-28')!.optionsCreditedInWindow).toBe(0);
+    expect(byDate.get('2026-07-29')!.optionsCreditedInWindow).toBe(0);
+    // The third signature, to the cent, against the pinned live figures.
+    expect(byDate.get('2026-07-28')!.unbookedEquityMoveUsd).toBeCloseTo(140, 2);
+    expect(byDate.get('2026-07-29')!.unbookedEquityMoveUsd).toBeCloseTo(114, 2);
+    expect(r.counterFrozenDates).toEqual(['2026-07-28', '2026-07-29']);
+    expect(r.maxUnbookedEquityMoveUsd).toBeCloseTo(140, 2);
+    // AC2 now has a failing state on this book.
+    expect(r.counterDurable).toBe(false);
+    expect(r.counterNonDurableDates).toEqual(['2026-07-28', '2026-07-29']);
+    // 140.00 + 114.00 = the $254.00 that reached equity.
+    const credited = (byDate.get('2026-07-28')!.unbookedEquityMoveUsd ?? 0)
+      + (byDate.get('2026-07-29')!.unbookedEquityMoveUsd ?? 0);
+    expect(credited).toBeCloseTo(254, 2);
+    // And the state measurement is unchanged by any of this — it needs no counter.
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(733.6, 2);
+    expect(r.postBaselineEquityGrowth).toBeCloseTo(235.19, 2);
+    expect(r.postBaselineOptionsRealized).toBeCloseTo(987.6, 2);
+    expect(r.postBaselineStockDaily).toBeCloseTo(-18.81, 2);
+    // The residue decomposes with NO remainder: 529.59 pre-bridge (07-14..07-24,
+    // never credited, no bridge existed) + 204.01 of 07-29's 250.01 still pending
+    // (46.00 of it was credited inside 07-29's own window, which is what made the
+    // 114.00 exceed 07-28's realized 68.00 — a settle-vs-21:00-close boundary, not
+    // an unattributed credit).
+    expect(529.59 + (250.01 - 46)).toBeCloseTo(733.6, 2);
+  });
+
+  it('the equityAbsorbedOptionsOk verdict retreats to NOT MEASURED, not a manufactured red', () => {
+    const r = reconcilePnl(adminLive(), new Map(), '2026-07-12');
+    // Pre-TRA-2658 this served `false` — "equity absorbed none of it" — off a
+    // counter that was provably not recording. $254.00 HAD been absorbed. A
+    // counter this untrustworthy must not produce a verdict in either direction.
+    expect(r.equityAbsorbedOptionsOk).toBeNull();
+  });
+
+  it('a continuously-run book has NO un-booked move — the passing state is reachable', () => {
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 10, 40, 100, 2_100),
+        // Counter moved +50, equity moved +60, stock leg +10. Fully explained.
+        creditSnap('2026-07-28', 10, 40, 150, 2_160),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[1]!.unbookedEquityMoveUsd).toBeCloseTo(0, 2);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(true);
+    expect(r.equityAbsorbedOptionsOk).toBe(true);
+  });
+
+  it('does NOT accuse a starting-balance edit: an un-booked move with no option P&L in the window', () => {
+    // `PaperAccount.applyEquity()` rebases equity on a settings save. That is an
+    // un-booked move and is NOT a counter defect. Flagging it would manufacture a
+    // red on every book whose operator edited demo equity.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 0, 100, 2_000),
+        creditSnap('2026-07-28', 0, 0, 100, 3_000),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[1]!.unbookedEquityMoveUsd).toBeCloseTo(1_000, 2);
+    // Visible, but unattributed — no accusation, and the verdict stays green.
+    expect(r.unbookedEquityMoveDates).toEqual(['2026-07-28']);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(true);
+  });
+
+  it('does NOT accuse a starting-balance edit on a book that DID trade options', () => {
+    // The harder arm, and the one a control caught: option P&L in the window is
+    // not enough to attribute an arbitrary move. A $1,000 rebase on a book that
+    // realized $40 of options is not a lost $1,000 credit — a credit cannot exceed
+    // what was realized, which is the ceiling term.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 40, 100, 2_000),
+        creditSnap('2026-07-28', 0, 0, 100, 3_000),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[1]!.unbookedEquityMoveUsd).toBeCloseTo(1_000, 2);
+    expect(r.unbookedEquityMoveDates).toEqual(['2026-07-28']);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(true);
+  });
+
+  it('a FULLY CREDITED book cannot produce a frozen claim — the pool is empty', () => {
+    // 1,000 realized and 1,000 recorded, then a +50 starting-balance edit. A bare
+    // "≤ cumulative realized" ceiling would let the 50 through and accuse it;
+    // subtracting what the counter already recorded is what closes that arm.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 1_000, 0, 2_000),
+        creditSnap('2026-07-28', 0, 0, 1_000, 3_000),
+        creditSnap('2026-07-29', 0, 0, 1_000, 3_050),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[2]!.unbookedEquityMoveUsd).toBeCloseTo(50, 2);
+    expect(r.unbookedEquityMoveDates).toEqual(['2026-07-29']);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(true);
+  });
+
+  it('the pool is CUMULATIVE, so a freeze spanning many sessions is still caught', () => {
+    // A per-window ceiling (prev 0 + cur 0) would clear this, i.e. clear exactly
+    // the longest freezes — the worst ones.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 500, 0, 2_000),
+        creditSnap('2026-07-28', 0, 0, 0, 2_000),
+        creditSnap('2026-07-29', 0, 0, 0, 2_500),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[2]!.unbookedEquityMoveUsd).toBeCloseTo(500, 2);
+    expect(r.counterFrozenDates).toEqual(['2026-07-29']);
+    expect(r.counterDurable).toBe(false);
+  });
+
+  it('flags a frozen counter off the CURRENT session\'s option P&L too, not just the prior', () => {
+    // A credit can settle and be absorbed inside the same session that realized
+    // it (the $46.00 on admin's 07-29). Requiring the PRIOR session to be the
+    // only trigger would miss it.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 0, 0, 2_000),
+        creditSnap('2026-07-28', 0, 75, 0, 2_075),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[1]!.unbookedEquityMoveUsd).toBeCloseTo(75, 2);
+    expect(r.counterFrozenDates).toEqual(['2026-07-28']);
+    expect(r.counterDurable).toBe(false);
+  });
+
+  it('is null on the first row and on an absent closingEquity endpoint — never a zero', () => {
+    const r = reconcilePnl([creditSnap('2026-07-28', 10, 40, 100, 2_100)], new Map(), '2026-07-12');
+    expect(r.days[0]!.unbookedEquityMoveUsd).toBeNull();
+    expect(r.counterFrozenDates).toEqual([]);
+  });
+
+  it('counterDurable stays NOT MEASURED when the counter was never written at all', () => {
+    // The frozen signature must not manufacture a durability verdict on a book
+    // that predates the counter entirely — `creditWrittenDays` still gates it.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 60, undefined, 2_000),
+        creditSnap('2026-07-28', 0, 0, undefined, 2_060),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.days[1]!.unbookedEquityMoveUsd).toBeCloseTo(60, 2);
+    expect(r.counterFrozenDates).toEqual(['2026-07-28']);
+    expect(r.counterDurable).toBeNull();
+  });
+
+  it('a RESET counter is still reported as a reset, distinctly from a freeze', () => {
+    // The two need opposite remediations, so the narrower field keeps its meaning.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-27', 0, 40, 200, 2_000),
+        creditSnap('2026-07-28', 0, 0, 0, 2_000),
+      ],
+      new Map(),
+      '2026-07-12',
+    );
+    expect(r.counterResetDates).toEqual(['2026-07-28']);
+    expect(r.counterDurable).toBe(false);
+  });
+});
+
+describe('TRA-2658 — liveCounterDurableOk', () => {
+  const cbook = (username: string, mode: string, counterDurable: boolean | null) => ({
+    username,
+    mode,
+    equityAbsorbedOptionsOk: null as boolean | null,
+    counterDurable,
+    counterFrozenDates: counterDurable === false ? ['2026-07-28'] : [],
+    counterNonDurableDates: counterDurable === false ? ['2026-07-28'] : [],
+    maxUnbookedEquityMoveUsd: counterDurable === false ? 140 : 0,
+    optionsCreditedMeasuredCount: 1,
+    optionsCreditedLatest: 0,
+    optionsCreditedDates: [] as string[],
+    closingEquityLatest: 2_243.48,
+    closingEquityLatestDate: '2026-07-29',
+    uncreditedOptionsUsd: 733.6,
+    postBaselineEquityGrowth: 235.19,
+    postBaselineOptionsRealized: 987.6,
+    postBaselineStockDaily: -18.81,
+  });
+
+  it('is NOT MEASURED on an empty live cohort — never a passing durability grade', () => {
+    // bqb1 serves this state intermittently on a boot-arm miss: 2026-07-30T14:08Z
+    // had liveBookCount 0 with `admin` resolved `demo`.
+    const r = summarizeLiveCreditObservation([cbook('admin', 'demo', false)]);
+    expect(r.liveCreditBookCount).toBe(0);
+    expect(r.liveCounterDurableOk).toBeNull();
+  });
+
+  it('goes RED on a live book with a non-durable counter', () => {
+    const r = summarizeLiveCreditObservation([cbook('admin', 'live', false)]);
+    expect(r.liveCounterDurableOk).toBe(false);
+    expect(r.liveCreditBooks[0]!.counterFrozenDates).toEqual(['2026-07-28']);
+    expect(r.liveCreditBooks[0]!.maxUnbookedEquityMoveUsd).toBe(140);
+  });
+
+  it('claims green only off a live book that actually wrote the counter', () => {
+    expect(summarizeLiveCreditObservation([cbook('admin', 'live', null)]).liveCounterDurableOk)
+      .toBeNull();
+    expect(summarizeLiveCreditObservation([cbook('admin', 'live', true)]).liveCounterDurableOk)
+      .toBe(true);
+  });
+
+  it('a RED live book wins over a green one', () => {
+    const r = summarizeLiveCreditObservation([
+      cbook('admin', 'live', true),
+      cbook('operator2', 'live', false),
+    ]);
+    expect(r.liveCounterDurableOk).toBe(false);
+  });
+});
+
 describe('TRA-2635 — summarizeLiveCreditObservation', () => {
   const book = (
     username: string,
@@ -935,7 +1209,10 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     username,
     mode,
     equityAbsorbedOptionsOk,
-    counterDurable: true,
+    counterDurable: true as boolean | null,
+    counterFrozenDates: [] as string[],
+    counterNonDurableDates: [] as string[],
+    maxUnbookedEquityMoveUsd: 0,
     optionsCreditedMeasuredCount,
     optionsCreditedLatest: 0,
     optionsCreditedDates: [] as string[],
