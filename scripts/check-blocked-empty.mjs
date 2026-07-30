@@ -1,14 +1,48 @@
 #!/usr/bin/env node
 /**
- * TRA-2364 — detector for the `blocked` + EMPTY `blockedBy` board shape.
+ * TRA-2364 / TRA-2617 — detector for the two `blocked`-leaf STRAND shapes.
  *
- * WHAT THE SHAPE IS
- * -----------------
+ * There are TWO ways a `blocked` issue can be holding an edge that nothing will
+ * ever resolve, and they need OPPOSITE amounts of noise to find.
+ *
+ * SHAPE 1 — `blocked` + EMPTY `blockedBy`  (TRA-2364, the original)
+ * ----------------------------------------------------------------
  * An issue at `status: "blocked"` whose `blockedBy` array is empty carries no
  * edge that anything can ever resolve. The board treats it as a leaf with no
  * unmet dependency and auto-flips it back to `in_progress` — so the "hold" is
  * a hold that silently expires, and whatever the issue was parked for resumes
  * unattended.
+ *
+ * SHAPE 2 — `blocked` + EVERY `blockedBy` entry CLOSED  (TRA-2617, added later)
+ * ----------------------------------------------------------------------------
+ * When an issue closes, every issue in its `blocks` array that was `blocked`
+ * STAYS `blocked` — now with a blocker list in which every entry is `done` or
+ * `cancelled`. `blocked` does NOT auto-flip when a blocker closes; somebody has
+ * to move it by hand, and nobody is told to.
+ *
+ * ⛔ THE ASYMMETRY IS THE WHOLE POINT, and it is why this shape went unreported
+ * for so long by BOTH the CTO fire and the CFO sweep:
+ *
+ *     SHAPE 1 is LOUD.   An empty `blockedBy` raises `stranded_assigned_issue`;
+ *                        the platform wakes somebody. It also auto-flips, so the
+ *                        issue stays visible even if nobody acts.
+ *     SHAPE 2 is SILENT. NO recovery wake. NO monitor. NO auto-flip. And it was
+ *                        invisible to THIS detector, because the old predicate
+ *                        was `blockedBy.length === 0` and shape 2's array is not
+ *                        empty — it is full of tombstones.
+ *
+ * The quiet failure is the one that needs the instrument. A green run of the
+ * empty-only predicate was a 100%-confident all-clear on a board carrying three
+ * live shape-2 strands (measured 2026-07-30T01:1xZ, CEO; two survived to
+ * 02:5xZ). That is precisely the "a failing state that renders identically to a
+ * passing one" case this file exists to refuse, so the differential control
+ * `strandClassMissControl()` below pins it: the OLD predicate must report ZERO
+ * on a board where the new one reports the planted strand.
+ *
+ * Shape 2 is graded from the `status` the item route inlines on each `blockedBy`
+ * entry (measured on TRA-2305: entries carry id/identifier/title/status/
+ * priority/assignee). An entry with NO `status` key is UNREADABLE, never
+ * "closed" — absent is not closed, exactly as absent is not empty.
  *
  * WHY IT KEEPS COMING BACK (TRA-2360 / TRA-2362, measured twice)
  * -------------------------------------------------------------
@@ -95,6 +129,42 @@
  *      and we assert the key is PRESENT on the payload (`'blockedBy' in item`)
  *      rather than trusting `(item.blockedBy || []).length === 0`, which cannot
  *      tell "no blockers" from "you asked the wrong route".
+ *
+ * THE RESTORE TARGET — a VALUE with provenance, never a command (TRA-2617)
+ * ------------------------------------------------------------------------
+ * Every finding now carries the status it should be moved to, and WHY that
+ * value was arrived at, so each owner is not left reconstructing intent alone.
+ * Four provenances, in strict precedence:
+ *
+ *   FROM_EVIDENCE   `activeRecoveryAction.evidence.previousStatus` — the status
+ *                   the leaf held before the run died. This makes shape 1 a
+ *                   RESTORE rather than a judgement call (CFO, TRA-2617).
+ *   GATE_SATISFIED  shape 2, every blocker `done` ⇒ `todo`. The gate really was
+ *                   met; the work is actionable now.
+ *   GATE_VOID       shape 2, but ≥1 blocker was `cancelled`. A cancelled gate did
+ *                   NOT deliver what the dependent was waiting for, so the
+ *                   dependent's own premise may be void. NO target is emitted —
+ *                   this one needs a human read, and quietly saying `todo` here
+ *                   would resurrect work whose reason was withdrawn.
+ *   NONE            nothing supports a target. Re-derive.
+ *
+ * ⛔ AND ONE OVERRIDE THAT OUTRANKS ALL FOUR: a leaf holding a LIVE PENDING
+ * INTERACTION rests at `in_review`, never `todo`. Measured the hard way on
+ * TRA-2598 during this very issue: it was routed to me as "PATCH it to `todo`"
+ * off an accurate 01:1xZ read, but by 02:4xZ the work had shipped (13968e8) and
+ * the leaf was `in_review` behind a pending `request_confirmation`. Demoting it
+ * to `todo` would have re-opened finished work AND buried a live decision
+ * request that a human was expected to answer. So: pending card ⇒ `in_review`,
+ * and the report prints the value that was overridden.
+ *
+ * ⛔ Fail closed on this override. If the interaction route cannot be read we do
+ * NOT get to assume there is no card — an unreadable thread suppresses any
+ * DEMOTING target and says so. The guard must not be weakest exactly where we
+ * read least (same rule as the cause branch above).
+ *
+ * ⛔ The target is rendered as `restore target: <status>` — a value and a
+ * reason. It is NEVER rendered as a PATCH, and the global control still asserts
+ * that no report anywhere emits a copy-pasteable write (TRA-2396).
  *
  * WHY IT ROUTES INSTEAD OF REPAIRING
  * ----------------------------------
@@ -438,6 +508,159 @@ export const SEVERITY = {
   ROUTE_TO_ASSIGNEE: 'ROUTE_TO_ASSIGNEE',
 };
 
+/* ------------------------------------------------------------------ *
+ * The two strand shapes (TRA-2617)
+ * ------------------------------------------------------------------ */
+
+export const SHAPE = {
+  /** `blocked`, `blockedBy: []`. Loud: raises a recovery wake, auto-flips. */
+  EMPTY_BLOCKED_BY: 'EMPTY_BLOCKED_BY',
+  /** `blocked`, blockers present, every one of them closed. SILENT: no wake, no flip. */
+  ALL_BLOCKERS_CLOSED: 'ALL_BLOCKERS_CLOSED',
+};
+
+/**
+ * Grade one `blockedBy` array. Pure.
+ *
+ * Three outcomes, and the third is the one that keeps this honest:
+ *   { shape: EMPTY_BLOCKED_BY }        nothing in the array
+ *   { shape: ALL_BLOCKERS_CLOSED }     every entry `done`/`cancelled`
+ *   { shape: null }                    ≥1 entry still open — a LEGAL rest, stay silent
+ *   { unreadable: '…' }                an entry carries no `status` key
+ *
+ * ⛔ The unreadable arm is load-bearing. If entries ever stop carrying `status`,
+ * `b.status in CLOSED` is false for every entry, every board reads as a legal
+ * rest, and this whole class silently stops being detected — the exact failure
+ * that shipped the empty-only predicate. Absent is not closed.
+ */
+export function gradeBlockerSet(blockedBy, label = 'issue') {
+  const list = Array.isArray(blockedBy) ? blockedBy : [];
+  if (list.length === 0) {
+    return { shape: SHAPE.EMPTY_BLOCKED_BY, closed: [], open: [], cancelled: [] };
+  }
+
+  const missing = list.filter((b) => !b || !Object.prototype.hasOwnProperty.call(b, 'status'));
+  if (missing.length) {
+    return {
+      unreadable:
+        `${label}: ${missing.length} of ${list.length} blockedBy entr(ies) carry no 'status' key — the ` +
+        `all-blockers-closed class cannot be graded. Absent is not closed.`,
+    };
+  }
+
+  const closed = list.filter((b) => CLOSED_STATUSES.has(String(b.status)));
+  const open = list.filter((b) => !CLOSED_STATUSES.has(String(b.status)));
+  const cancelled = list.filter((b) => String(b.status) === 'cancelled');
+
+  if (open.length > 0) return { shape: null, closed, open, cancelled };
+  return { shape: SHAPE.ALL_BLOCKERS_CLOSED, closed, open, cancelled };
+}
+
+/* ------------------------------------------------------------------ *
+ * Restore target — a value + provenance. Never a command.
+ * ------------------------------------------------------------------ */
+
+export const RESTORE = {
+  FROM_EVIDENCE: 'FROM_EVIDENCE',
+  GATE_SATISFIED: 'GATE_SATISFIED',
+  GATE_VOID: 'GATE_VOID',
+  HOLD_FOR_CARD: 'HOLD_FOR_CARD',
+  NONE: 'NONE',
+};
+
+/** Statuses that would DEMOTE a leaf, i.e. the ones the pending-card guard must veto. */
+const DEMOTING = new Set(['todo', 'backlog']);
+
+/**
+ * Where the CFO's deterministic restore lives. Read defensively through both
+ * the documented path and a couple of neighbours: this is reported from the
+ * CFO's sweep rather than measured here (no blocked issue on the board carried
+ * a live `activeRecoveryAction` at the time this was written, 2026-07-30T02:5xZ),
+ * so a wrong single path would silently degrade to "no evidence" forever.
+ */
+export function previousStatusFrom(item) {
+  const ra = (item && item.activeRecoveryAction) || null;
+  if (!ra) return null;
+  const ev = ra.evidence || ra.details || null;
+  const v = (ev && (ev.previousStatus || ev.priorStatus)) || ra.previousStatus || null;
+  return typeof v === 'string' && v ? v : null;
+}
+
+/**
+ * Decide the status this leaf should be moved to. Pure.
+ *
+ * `pendingInteractions` is a COUNT, or `null` meaning "the route could not be
+ * read". null is NOT zero — it suppresses any demoting target rather than
+ * asserting there is no card.
+ */
+export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
+  const previousStatus = previousStatusFrom(item);
+
+  let target = null;
+  let provenance = RESTORE.NONE;
+  let why = '';
+
+  if (previousStatus) {
+    target = previousStatus;
+    provenance = RESTORE.FROM_EVIDENCE;
+    why =
+      `activeRecoveryAction.evidence.previousStatus = \`${previousStatus}\` — the status this leaf held ` +
+      'before the run died. This is a RESTORE, not a judgement call.';
+  } else if (blockers.shape === SHAPE.ALL_BLOCKERS_CLOSED && blockers.cancelled.length > 0) {
+    provenance = RESTORE.GATE_VOID;
+    why =
+      `NO target emitted: ${blockers.cancelled.length} blocker(s) were CANCELLED ` +
+      `(${blockers.cancelled.map((b) => b.identifier || b.id).join(', ')}), not completed. A cancelled gate ` +
+      'never delivered what this issue was waiting for, so its own premise may be void — parking it to ' +
+      '`todo` would resurrect work whose reason was withdrawn. Read it and decide.';
+  } else if (blockers.shape === SHAPE.ALL_BLOCKERS_CLOSED) {
+    target = 'todo';
+    provenance = RESTORE.GATE_SATISFIED;
+    why =
+      `every blocker is \`done\` (${blockers.closed.map((b) => b.identifier || b.id).join(', ')}) — the gate ` +
+      'was genuinely satisfied, so this is actionable work, not a per-fire spawn. `todo` keeps it counting ' +
+      'as an unresolved blocker for anything upstream, so nothing is lost by parking it.';
+  } else {
+    why =
+      'no `evidence.previousStatus` and no satisfied gate to derive from — re-derive what this issue ' +
+      'waits on today, or `todo` if the answer is nothing.';
+  }
+
+  // ⛔ The override. A pending card outranks every derivation above.
+  if (pendingInteractions === null) {
+    if (target && DEMOTING.has(target)) {
+      return {
+        target: null,
+        provenance: RESTORE.NONE,
+        overrode: { target, provenance },
+        why:
+          `target \`${target}\` SUPPRESSED: the interaction route could not be read, so the absence of a live ` +
+          'pending card was never established. An unreadable thread is not an empty one — check ' +
+          '/interactions by hand before demoting this leaf. ' +
+          `(suppressed derivation: ${why})`,
+      };
+    }
+    return { target, provenance, overrode: null, why: `${why} (pending-card check unavailable — verify before demoting)` };
+  }
+
+  if (pendingInteractions > 0) {
+    return {
+      target: 'in_review',
+      provenance: RESTORE.HOLD_FOR_CARD,
+      overrode: target ? { target, provenance } : null,
+      why:
+        `${pendingInteractions} LIVE PENDING interaction(s) on this issue. A leaf holding a card rests at ` +
+        '`in_review` — it has a real continuation path. ' +
+        (target && DEMOTING.has(target)
+          ? `This OVERRIDES the derived \`${target}\`, which would have re-opened the work AND buried a decision ` +
+            'a human is expected to answer (measured on TRA-2598, TRA-2617).'
+          : 'Derivation agreed or was empty; the card settles it either way.'),
+    };
+  }
+
+  return { target, provenance, overrode: null, why };
+}
+
 /**
  * Grade ONE item-route payload.
  *
@@ -460,7 +683,12 @@ export function classifyIssue(item, roster, { graph = null } = {}) {
   if (item.status !== 'blocked') return null;
 
   const blockedBy = Array.isArray(item.blockedBy) ? item.blockedBy : [];
-  if (blockedBy.length > 0) return null; // legitimately held — stay silent.
+  // TWO shapes, not one. The old predicate here was `blockedBy.length > 0 =>
+  // return null`, which made shape 2 (every blocker closed) structurally
+  // undetectable — the array is not empty, it is full of tombstones.
+  const blockers = gradeBlockerSet(blockedBy, item.identifier || item.id);
+  if (blockers.unreadable) return { unreadable: blockers.unreadable };
+  if (!blockers.shape) return null; // ≥1 open blocker — legitimately held, stay silent.
 
   const assigneeAgentId = item.assigneeAgentId || null;
   const agent = assigneeAgentId ? roster.get(assigneeAgentId) : null;
@@ -478,6 +706,28 @@ export function classifyIssue(item, roster, { graph = null } = {}) {
     title: item.title || null,
     priority: item.priority || null,
     severity,
+    // WHICH strand shape. Shape 2 is the silent one — no recovery wake, no
+    // monitor, no auto-flip — so it is reported first in the render.
+    shape: blockers.shape,
+    // The gate(s) that buried a shape-2 leaf, with the identifier of the issue
+    // whose close stranded it. This is the feedback loop: the closer is the one
+    // who needs to start sweeping `blocks` on close.
+    closedBlockers: blockers.closed.map((b) => ({
+      identifier: b.identifier || b.id || null,
+      status: b.status || null,
+      assigneeAgentId: b.assigneeAgentId || null,
+    })),
+    cancelledBlockerCount: blockers.cancelled.length,
+    // What this leaf itself gates. A shape-2 strand that blocks something else
+    // is not one stalled issue, it is a stalled subtree (TRA-2305 -> TRA-2268).
+    blocksIdentifiers: Array.isArray(item.blocks)
+      ? item.blocks.map((b) => `${b.identifier || b.id}${b.status ? `:${b.status}` : ''}`)
+      : [],
+    // Filled in by sweep() once the interaction route has been read. A finding
+    // that never got there keeps `null` (= unknown), which SUPPRESSES any
+    // demoting target rather than asserting there is no card.
+    pendingInteractions: null,
+    restoreTarget: null,
     assigneeAgentId,
     assigneeUserId: item.assigneeUserId || null,
     assigneeName: agent ? agent.name : null,
@@ -546,7 +796,7 @@ export function verdictFor({ blind, findings }) {
  * either of the two silent reads above, because both live in the plumbing.
  * ------------------------------------------------------------------ */
 
-export async function sweep({ getIssuesPage, getIssue, listAgents, getComments }, opts = {}) {
+export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, getInteractions }, opts = {}) {
   const agents = await listAgents();
   const roster = new Map((Array.isArray(agents) ? agents : []).map((a) => [a.id, a]));
 
@@ -617,6 +867,34 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments }
     }),
   );
 
+  // Restore target. One interaction GET per FINDING (not per blocked issue, not
+  // on a clean board) — because a leaf holding a live card rests at `in_review`
+  // and must never be handed a `todo` target (TRA-2598).
+  //
+  // ⛔ Fail closed: a route that throws, or no transport at all, leaves
+  // `pendingInteractions: null` — UNKNOWN, which suppresses a demoting target.
+  // It must not read as "no card".
+  await Promise.all(
+    hits.map(async (entry) => {
+      let pending = null;
+      if (typeof getInteractions === 'function') {
+        try {
+          const list = await getInteractions(entry.graded.id);
+          if (Array.isArray(list)) pending = list.filter((x) => x && x.status === 'pending').length;
+        } catch {
+          pending = null; // stays UNKNOWN on purpose
+        }
+      }
+      const blockers = gradeBlockerSet(entry.item.blockedBy, entry.graded.identifier || entry.graded.id);
+      entry.graded.pendingInteractions = pending;
+      entry.graded.restoreTarget = deriveRestoreTarget({
+        item: entry.item,
+        blockers,
+        pendingInteractions: pending,
+      });
+    }),
+  );
+
   const findings = hits.map((e) => e.graded);
 
   // An item read we could not grade is a hole in the population, exactly like
@@ -625,9 +903,13 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments }
     ? `${unreadable.length} of ${blockedRows.length} blocked issue(s) could not be graded through the item route`
     : null;
 
+  // Shape 2 first WITHIN each severity: it is the silent one, so it is the one a
+  // reader skimming a long report must not miss.
+  const shapeRank = (f) => (f.shape === SHAPE.ALL_BLOCKERS_CLOSED ? 0 : 1);
   findings.sort(
     (a, b) =>
       String(a.severity).localeCompare(String(b.severity)) ||
+      shapeRank(a) - shapeRank(b) ||
       String(a.identifier).localeCompare(String(b.identifier), undefined, { numeric: true }),
   );
 
@@ -700,9 +982,11 @@ export function renderReport(result) {
   L.push('');
 
   if (result.findings.length === 0) {
-    L.push('CLEAN  no issue is `blocked` with an empty blockedBy.');
-    L.push('       Scoped to this instant only — the recovery path re-creates the shape on');
-    L.push('       whatever is `in_progress` at the next session-limit event. Re-run; do not');
+    L.push('CLEAN  no issue is `blocked` with an empty blockedBy, and none is `blocked` behind');
+    L.push('       a blocker set in which every entry is already closed.');
+    L.push('       Scoped to this instant only. BOTH shapes re-appear on their own: shape 1 on');
+    L.push('       whatever is `in_progress` at the next session-limit event, shape 2 the next');
+    L.push('       time anybody closes a gate without sweeping its `blocks`. Re-run; do not');
     L.push('       cite this run.');
     return L;
   }
@@ -721,7 +1005,11 @@ export function renderReport(result) {
     [SEVERITY.ROUTE_TO_ASSIGNEE]: 'ROUTE — only the assignee can repair this. Route it to them; do not try to fix it yourself (403).',
   };
 
-  L.push(`${result.verdict}  ${result.findings.length} issue(s) are \`blocked\` with an EMPTY blockedBy.`);
+  const nEmpty = result.findings.filter((f) => f.shape === SHAPE.EMPTY_BLOCKED_BY).length;
+  const nClosed = result.findings.filter((f) => f.shape === SHAPE.ALL_BLOCKERS_CLOSED).length;
+  L.push(`${result.verdict}  ${result.findings.length} stranded \`blocked\` leaf/leaves.`);
+  L.push(`   ${String(nEmpty).padStart(3)}  shape 1  EMPTY blockedBy       (LOUD — raises a recovery wake, auto-flips)`);
+  L.push(`   ${String(nClosed).padStart(3)}  shape 2  ALL blockers CLOSED  (SILENT — no wake, no monitor, no auto-flip)`);
   L.push('');
 
   for (const sev of order) {
@@ -737,8 +1025,32 @@ export function renderReport(result) {
           : f.assigneeAgentId
             ? `OFF-ROSTER agent ${f.assigneeAgentId}`
             : 'UNASSIGNED';
-      L.push(`   ${String(f.identifier || f.id).padEnd(10)} ${String(f.priority || '').padEnd(8)} ${who}`);
+      const shapeLabel =
+        f.shape === SHAPE.ALL_BLOCKERS_CLOSED ? 'shape 2 ALL-BLOCKERS-CLOSED (SILENT)' : 'shape 1 EMPTY-blockedBy (loud)';
+      L.push(`   ${String(f.identifier || f.id).padEnd(10)} ${String(f.priority || '').padEnd(8)} ${who}   [${shapeLabel}]`);
       L.push(`     ${String(f.title || '').slice(0, 120)}`);
+      if (f.shape === SHAPE.ALL_BLOCKERS_CLOSED) {
+        const gates = (f.closedBlockers || [])
+          .map((b) => `${b.identifier}:${b.status}`)
+          .join(', ');
+        L.push(`     buried by  ${gates || '(none listed)'}  — closing that gate is what stranded this leaf`);
+        if (f.blocksIdentifiers && f.blocksIdentifiers.length) {
+          L.push(
+            `     ⚠ this leaf itself BLOCKS ${f.blocksIdentifiers.join(', ')} — a stalled SUBTREE, not one issue`,
+          );
+        }
+      }
+      const rt = f.restoreTarget || { target: null, provenance: RESTORE.NONE, why: 'not computed' };
+      L.push(
+        `     restore target: ${rt.target ? `\`${rt.target}\`` : 'NONE'}  (${rt.provenance})` +
+          (rt.overrode ? `  [overrides \`${rt.overrode.target}\` from ${rt.overrode.provenance}]` : ''),
+      );
+      L.push(`       ${rt.why}`);
+      L.push(
+        `     pending interactions: ${
+          f.pendingInteractions === null ? 'UNKNOWN (route unread — do not assume none)' : f.pendingInteractions
+        }`,
+      );
       const wakeOwner = f.platformWakeOwnerAgentId
         ? (result.roster.get(f.platformWakeOwnerAgentId) || {}).name || f.platformWakeOwnerAgentId
         : null;
@@ -812,6 +1124,34 @@ export function renderReport(result) {
     L.push('');
   }
 
+  // The prevention half. Shape 2 has a named, cheap, upstream cause — somebody
+  // closed a gate — so the report says whose habit produces it, not just who has
+  // to clean it up.
+  if (nClosed) {
+    const closers = new Map();
+    for (const f of result.findings) {
+      for (const b of f.closedBlockers || []) {
+        if (!b.identifier) continue;
+        const k = b.assigneeAgentId ? (result.roster.get(b.assigneeAgentId) || {}).name || b.assigneeAgentId : 'unknown';
+        if (!closers.has(k)) closers.set(k, new Set());
+        closers.get(k).add(b.identifier);
+      }
+    }
+    L.push('PREVENTION  shape 2 is created by a CLOSE, and only ever by a close. The gates that');
+    L.push('            buried the leaves above, by whoever closed them:');
+    for (const [who, ids] of closers) L.push(`   ${who}  ->  ${[...ids].join(', ')}`);
+    L.push('');
+    L.push('            The discipline, as the LAST step of every close:');
+    L.push('              1. read the issue\'s `blocks` array BEFORE you PATCH it to done/cancelled;');
+    L.push('              2. for each entry still `blocked`, re-read that dependent\'s `blockedBy`;');
+    L.push('              3. if yours was its last open blocker, park the dependent in the same');
+    L.push('                 breath — `todo` if your issue completed, a READ if it was cancelled.');
+    L.push('            A `todo` leaf still counts as an unresolved blocker upstream, so parking');
+    L.push('            it costs nothing. Leaving it `blocked` costs everything: no wake, no');
+    L.push('            monitor, no auto-flip, and this detector is the only thing that sees it.');
+    L.push('');
+  }
+
   L.push('reminder  repair is ASSIGNEE-SCOPED: a plain {"status":…} PATCH from outside the');
   L.push('          boundary is 403, and so is POST /comments. Route via a child issue');
   L.push('          (POST /api/issues/{parent}/children with assigneeAgentId).');
@@ -866,7 +1206,16 @@ function fakeBoard(planted, { total = 2350 } = {}) {
 
 function transportFor(
   board,
-  { ignoreOffset = false, stripBlockedByKey = false, comments = {}, commentsThrow = false, noCommentTransport = false } = {},
+  {
+    ignoreOffset = false,
+    stripBlockedByKey = false,
+    comments = {},
+    commentsThrow = false,
+    noCommentTransport = false,
+    interactions = {},
+    interactionsThrow = false,
+    noInteractionTransport = false,
+  } = {},
 ) {
   const t = {
     listAgents: async () => ROSTER,
@@ -890,8 +1239,38 @@ function transportFor(
       return comments[id] || [];
     };
   }
+  if (!noInteractionTransport) {
+    t.getInteractions = async (id) => {
+      if (interactionsThrow) throw new Error('HTTP 403 on the interaction route');
+      return interactions[id] || [];
+    };
+  }
   return t;
 }
+
+/**
+ * A shape-2 strand: `blocked`, blockers PRESENT, every one of them closed.
+ * `gate` is the list of [identifier, status, closerAgentId] tuples that buried it.
+ */
+const buried = (id, ident, assignee, gate = [['TRA-7001', 'done', 'agent-cto']], extra = {}) => ({
+  list: { id, identifier: ident, title: `buried ${ident}`, status: 'blocked', assigneeAgentId: assignee },
+  item: {
+    id,
+    identifier: ident,
+    title: `buried ${ident}`,
+    status: 'blocked',
+    priority: 'high',
+    assigneeAgentId: assignee,
+    blockedBy: gate.map(([identifier, status, closer]) => ({
+      id: `blk-${identifier}`,
+      identifier,
+      status,
+      assigneeAgentId: closer || 'agent-cto',
+    })),
+    blocks: [],
+    ...extra,
+  },
+});
 
 /** A system-authored recovery comment, verbatim in shape from TRA-2310 comment 6. */
 const sysRecoveryComment = (at = '2026-07-25T20:45:12.831Z', ownerName = 'CFO', ownerId = 'agent-cfo') => ({
@@ -1255,6 +1634,192 @@ const CASES = [
     opts: { maxPages: 1 },
     assert: (r) => /page cap/.test(r.blind) && r.findings.length === 0,
   },
+
+  /* ---------------- SHAPE 2 — the silent strand (TRA-2617) ---------------- */
+
+  {
+    // The headline case. Measured live: TRA-2476 closed 23:05Z -> stranded
+    // TRA-2305; TRA-2552 closed 01:08Z -> stranded TRA-2420 and TRA-2598.
+    name: 'SHAPE 2 — `blocked` behind a blocker set where EVERY entry is `done` => FINDINGS (this is the class the old predicate could not see)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          held('h1', 'TRA-8100', 'agent-cto'), // a legal rest must stay silent alongside it
+          buried('b1', 'TRA-8101', 'agent-cto', [['TRA-8199', 'done', 'agent-qt']]),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings.length === 1 &&
+      r.findings[0].identifier === 'TRA-8101' &&
+      r.findings[0].shape === SHAPE.ALL_BLOCKERS_CLOSED &&
+      r.findings[0].closedBlockers[0].identifier === 'TRA-8199',
+  },
+  {
+    // The negative half of the same predicate. One open blocker among closed ones
+    // is a LEGAL rest — if this fired, the detector would flag 78 of the 81
+    // blocked issues on the real board.
+    name: 'SHAPE 2 negative — one OPEN blocker among two closed => silent (a legal rest is not a strand)',
+    expect: 'CLEAN',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          buried('b1', 'TRA-8102', 'agent-cto', [
+            ['TRA-8198', 'done', 'agent-cto'],
+            ['TRA-8199', 'cancelled', 'agent-cto'],
+            ['TRA-8197', 'in_progress', 'agent-cto'],
+          ]),
+        ]),
+      ),
+    assert: (r) => r.findings.length === 0,
+  },
+  {
+    // ⛔ Absent is not closed. If entries ever stop carrying `status`, the naive
+    // `status in CLOSED` test is false everywhere and the whole class silently
+    // stops being detected. That must be BLIND, not CLEAN.
+    name: 'SHAPE 2 — a blockedBy entry carrying NO `status` key => BLIND, never a silent all-clear',
+    expect: 'BLIND',
+    build: () => {
+      const b = buried('b1', 'TRA-8103', 'agent-cto');
+      delete b.item.blockedBy[0].status;
+      return transportFor(fakeBoard([b]));
+    },
+    assert: (r) => r.unreadable.length === 1 && /Absent is not closed/.test(r.unreadable[0]) && r.findings.length === 0,
+  },
+  {
+    name: 'SHAPE 2 — a strand that itself BLOCKS something is reported as a stalled SUBTREE (TRA-2305 -> TRA-2268)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          buried('b1', 'TRA-8104', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']], {
+            blocks: [{ id: 'd1', identifier: 'TRA-8105', status: 'blocked' }],
+          }),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings[0].blocksIdentifiers.join() === 'TRA-8105:blocked' && /stalled SUBTREE/.test(renderReport(r).join('\n')),
+  },
+
+  /* ---------------- RESTORE TARGET (TRA-2617) ---------------- */
+
+  {
+    name: 'RESTORE — a satisfied gate (all blockers `done`) => target `todo`, provenance GATE_SATISFIED',
+    expect: 'FINDINGS',
+    build: () => transportFor(fakeBoard([buried('b1', 'TRA-8110', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']])])),
+    assert: (r) => r.findings[0].restoreTarget.target === 'todo' && r.findings[0].restoreTarget.provenance === RESTORE.GATE_SATISFIED,
+  },
+  {
+    // A CANCELLED gate never delivered what the dependent waited for, so `todo`
+    // would resurrect work whose reason was withdrawn. Emit NO target.
+    name: 'RESTORE — a CANCELLED blocker => GATE_VOID, and NO target is emitted (do not resurrect withdrawn work)',
+    expect: 'FINDINGS',
+    build: () => transportFor(fakeBoard([buried('b1', 'TRA-8111', 'agent-cto', [['TRA-8199', 'cancelled', 'agent-cto']])])),
+    assert: (r) =>
+      r.findings[0].restoreTarget.target === null &&
+      r.findings[0].restoreTarget.provenance === RESTORE.GATE_VOID &&
+      /premise may be void/.test(r.findings[0].restoreTarget.why),
+  },
+  {
+    // The CFO's deterministic repair: the restore target is READ, not guessed.
+    name: 'RESTORE — activeRecoveryAction.evidence.previousStatus => target is a RESTORE, provenance FROM_EVIDENCE',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8112', 'agent-cto', {
+            activeRecoveryAction: {
+              kind: 'stranded_assigned_issue',
+              evidence: { previousStatus: 'in_progress' },
+              createdAt: '2026-07-26T02:01:14.000Z',
+            },
+          }),
+        ]),
+      ),
+    assert: (r) =>
+      r.findings[0].restoreTarget.target === 'in_progress' &&
+      r.findings[0].restoreTarget.provenance === RESTORE.FROM_EVIDENCE &&
+      /RESTORE, not a judgement call/.test(r.findings[0].restoreTarget.why),
+  },
+  {
+    // ⛔ THE TRA-2598 CASE. This issue (TRA-2617) was routed to me with a
+    // correct 01:1xZ read and the instruction "PATCH it to `todo`". By the time
+    // I ran it, the work had shipped and the leaf sat `in_review` behind a
+    // pending request_confirmation. `todo` would have re-opened finished work
+    // AND buried a live decision a human was expected to answer.
+    name: 'RESTORE — a LIVE PENDING interaction OVERRIDES a `todo` target with `in_review` (the TRA-2598 trap)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([buried('b1', 'TRA-8113', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']])]), {
+        interactions: { b1: [{ id: 'x1', kind: 'request_confirmation', status: 'pending' }] },
+      }),
+    assert: (r) => {
+      const rt = r.findings[0].restoreTarget;
+      return (
+        rt.target === 'in_review' &&
+        rt.provenance === RESTORE.HOLD_FOR_CARD &&
+        rt.overrode &&
+        rt.overrode.target === 'todo' &&
+        /overrides `todo`/.test(renderReport(r).join('\n'))
+      );
+    },
+  },
+  {
+    // A RESOLVED card is not a live continuation path — the override must key on
+    // `pending`, or every issue that ever held a card becomes un-parkable.
+    name: 'RESTORE — a RESOLVED (non-pending) interaction does NOT override => target stays `todo`',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([buried('b1', 'TRA-8114', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']])]), {
+        interactions: { b1: [{ id: 'x1', kind: 'request_confirmation', status: 'accepted' }] },
+      }),
+    assert: (r) => r.findings[0].pendingInteractions === 0 && r.findings[0].restoreTarget.target === 'todo',
+  },
+  {
+    // ⛔ Fail closed. An unread interaction route is not an empty one — the guard
+    // must not be weakest exactly where we read least.
+    name: 'RESTORE — the interaction GET throws => the DEMOTING target is SUPPRESSED, not silently kept',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([buried('b1', 'TRA-8115', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']])]), {
+        interactionsThrow: true,
+      }),
+    assert: (r) => {
+      const f = r.findings[0];
+      return (
+        f.pendingInteractions === null &&
+        f.restoreTarget.target === null &&
+        f.restoreTarget.overrode.target === 'todo' &&
+        /never established/.test(f.restoreTarget.why)
+      );
+    },
+  },
+  {
+    name: 'RESTORE — no interaction transport at all => same suppression (an unchecked card is not an absent one)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(fakeBoard([buried('b1', 'TRA-8116', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']])]), {
+        noInteractionTransport: true,
+      }),
+    assert: (r) => r.findings[0].pendingInteractions === null && r.findings[0].restoreTarget.target === null,
+  },
+  {
+    // A NON-demoting target survives an unreadable interaction route: restoring
+    // `in_progress` does not bury a card, so suppressing it would be pointless
+    // strictness that leaves the owner with nothing.
+    name: 'RESTORE — an unreadable card route does NOT suppress a non-demoting target (`in_progress` buries nothing)',
+    expect: 'FINDINGS',
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8117', 'agent-cto', {
+            activeRecoveryAction: { kind: 'stranded_assigned_issue', evidence: { previousStatus: 'in_progress' } },
+          }),
+        ]),
+        { interactionsThrow: true },
+      ),
+    assert: (r) => r.findings[0].restoreTarget.target === 'in_progress' && r.findings[0].restoreTarget.overrode === null,
+  },
 ];
 
 /**
@@ -1284,6 +1849,56 @@ async function naiveMissControl() {
   return {
     ok,
     detail: `naive one-page sweep found ${naive.length} (rows seen: ${onePage.length}); paged sweep found ${paged.findings.length} of ${paged.scanned}`,
+  };
+}
+
+/**
+ * The TRA-2617 differential — the one that makes the second class load-bearing
+ * rather than decorative.
+ *
+ * `naiveMissControl` above proves PAGING matters by running the sweep everyone
+ * actually writes. This proves the PREDICATE matters the same way: it runs the
+ * OLD predicate (`blockedBy.length === 0`, verbatim, reimplemented here so it
+ * cannot drift with the file) against a board carrying a shape-2 strand, and
+ * shows it reports a clean bill of health.
+ *
+ * Without this, "the new detector found 1" is unfalsifiable — it never
+ * demonstrates that the shipped detector would have found 0. That is exactly
+ * what happened on the real board: an empty-only sweep returned CLEAN at
+ * 2026-07-30T01:1xZ while three live strands sat in the population.
+ */
+async function strandClassMissControl() {
+  const board = fakeBoard([
+    held('h1', 'TRA-8100', 'agent-cto'),
+    buried('b1', 'TRA-8190', 'agent-cto', [['TRA-8199', 'done', 'agent-cto']]),
+  ]);
+  const t = transportFor(board);
+  const roster = new Map(ROSTER.map((a) => [a.id, a]));
+
+  // The OLD predicate, frozen in place.
+  const oldPredicate = (item) =>
+    item &&
+    Object.prototype.hasOwnProperty.call(item, 'blockedBy') &&
+    item.status === 'blocked' &&
+    (Array.isArray(item.blockedBy) ? item.blockedBy : []).length === 0;
+
+  const allRows = board.rows.filter((r) => r.status === 'blocked');
+  const oldHits = [];
+  for (const row of allRows) if (oldPredicate(await t.getIssue(row.id))) oldHits.push(row.identifier);
+
+  const now = await sweep(t);
+  const newHits = now.findings.map((f) => f.identifier);
+  const ok =
+    oldHits.length === 0 &&
+    now.verdict === 'FINDINGS' &&
+    newHits.length === 1 &&
+    newHits[0] === 'TRA-8190' &&
+    roster.size > 0;
+  return {
+    ok,
+    detail:
+      `old empty-only predicate found ${oldHits.length} across all ${allRows.length} blocked row(s); ` +
+      `two-class detector found ${newHits.length} (${newHits.join(', ') || 'none'})`,
   };
 }
 
@@ -1332,6 +1947,13 @@ async function selftest() {
       `        ${miss.detail}`,
   );
 
+  const classMiss = await strandClassMissControl();
+  if (!classMiss.ok) failed += 1;
+  console.log(
+    `${classMiss.ok ? 'ok  ' : 'FAIL'}  TRA-2617 — the OLD empty-only predicate MISSES the shape-2 strand (the second class is load-bearing)\n` +
+      `        ${classMiss.detail}`,
+  );
+
   // Reachability: a control set that cannot produce every verdict is not a
   // control set, it is a rubber stamp with an alarm attached.
   //
@@ -1341,7 +1963,7 @@ async function selftest() {
   const reachable = new Set(CASES.map((c) => c.expect));
   const need = ['CLEAN', 'FINDINGS', 'FINDINGS_UNREPAIRABLE', 'BLIND'];
   const missing = need.filter((v) => !reachable.has(v));
-  const total = CASES.length + 2; // + the naive-miss differential + the global no-command invariant
+  const total = CASES.length + 3; // + naive-miss + strand-class-miss differentials + the global no-command invariant
   console.log(`\n${total - failed}/${total} controls pass; verdicts reachable: ${[...reachable].sort().join(', ')}`);
   if (missing.length) {
     console.log(`FAIL  no control exercises: ${missing.join(', ')}`);
@@ -1352,14 +1974,30 @@ async function selftest() {
   // every arm reachable, or a wired-shut branch passes as a working one.
   const causeArms = new Set([CAUSE.RECOVERY_BLOCKED, CAUSE.DROPPED_EDGE_INFERRED, CAUSE.UNKNOWN]);
   const anchorArms = new Set([ANCHOR.ALL_DESCENDANTS, ANCHOR.ALL_INELIGIBLE, ANCHOR.CANDIDATE_UNVERIFIED, ANCHOR.NO_CANDIDATES]);
+  // Both strand shapes and every restore provenance must be reachable, for the
+  // same reason: a class nothing exercises is a class that can be wired shut
+  // without a single control going red. Shape 2 spent its whole life in that
+  // state — undetectable, and no control could tell.
+  const shapeArms = new Set([SHAPE.EMPTY_BLOCKED_BY, SHAPE.ALL_BLOCKERS_CLOSED]);
+  const restoreArms = new Set([
+    RESTORE.FROM_EVIDENCE,
+    RESTORE.GATE_SATISFIED,
+    RESTORE.GATE_VOID,
+    RESTORE.HOLD_FOR_CARD,
+    RESTORE.NONE,
+  ]);
   const seenCause = new Set();
   const seenAnchor = new Set();
+  const seenShape = new Set();
+  const seenRestore = new Set();
   for (const c of CASES) {
     try {
       const r = await sweep(c.build(), c.opts || {});
       for (const f of r.findings) {
         seenCause.add(f.cause);
         if (f.anchor) seenAnchor.add(f.anchor.verdict);
+        if (f.shape) seenShape.add(f.shape);
+        if (f.restoreTarget) seenRestore.add(f.restoreTarget.provenance);
       }
     } catch {
       /* the case-level loop above already reported it */
@@ -1368,6 +2006,8 @@ async function selftest() {
   for (const [label, needed, seen] of [
     ['cause', causeArms, seenCause],
     ['anchor', anchorArms, seenAnchor],
+    ['shape', shapeArms, seenShape],
+    ['restore', restoreArms, seenRestore],
   ]) {
     const gaps = [...needed].filter((v) => !seen.has(v));
     if (gaps.length) {
@@ -1418,6 +2058,9 @@ function liveTransport() {
     // discharged. A throw here lands on cause UNKNOWN, never on the dropped-edge
     // inference — do not "helpfully" coerce a failure to [].
     getComments: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/comments`), 'comments'),
+    // FINDINGS only. A throw leaves pendingInteractions UNKNOWN, which suppresses
+    // a demoting restore target — do not "helpfully" coerce a failure to [].
+    getInteractions: async (id) => unwrap(await get(`${BASE}/api/issues/${id}/interactions`), 'interactions'),
   };
 }
 
