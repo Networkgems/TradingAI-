@@ -110,11 +110,64 @@
  * `|r| < 1` identically, for every chain, with no floor required. It reads 76.9%
  * on the same SPY chain — the only one of the four that clears <100%.
  *
- * Choosing between them is QuantTrader's call on TRA-2562, not this module's, so
- * the DEFAULT REMAINS `mark` exactly as ordered. `?basis=` exists so the RTH
- * re-measure can grade all three in ONE pass instead of waiting on a deploy per
- * candidate — the alternative is three deploy cycles against a box that is
- * already rebooting several times a day.
+ * `?basis=` exists so the re-measure could grade all three in ONE pass instead
+ * of waiting on a deploy per candidate. It did, and it decided — see below.
+ */
+
+/**
+ * ## ✅ DECIDED 2026-07-30 (TRA-2659, executed here as TRA-2661) — THE DEFAULT IS `max`
+ *
+ * QuantTrader graded all three bases over 15 live cells, each gated on
+ * `http == 200 AND reason == "ok"` AND the `mispricingBasis` echo matching what
+ * was asked for, and chose `max`. The default moved `mark` → `max`. `?basis=`
+ * still reaches all three, and the echo still reports what was APPLIED.
+ *
+ * The reason `max` won is not that it is smaller. It is that it is not a NEW
+ * statistic at all — it is the piecewise selection of whichever EXISTING basis
+ * is bounded on that row's side:
+ *
+ *   `max(m,t) == t` when `m < t` (cheap)     ⇒ the `max` basis IS the theo basis
+ *   `max(m,t) == m` when `m > t` (expensive) ⇒ the `max` basis IS the mark basis
+ *
+ * Verified live on 153 rows: cheap side 69 rows, `max |max − theo| = 0.000e+00`;
+ * expensive side 84 rows, `max |max − mark| = 0.000e+00`.
+ *
+ * The consequence that decided it: the ENGINE emits the theo basis
+ * (`otm-mispricing.ts:252`), so on the cheap side — the ONLY side the live
+ * `single_leg_otm` sleeve gates on (`candidates.find(c => c.classification ===
+ * 'cheap')`) — the panel's numbers become bit-identical to the engine's. The
+ * `mark` default this replaces labelled 5 of 153 rows differently from the
+ * engine, 4 of them `fair` → `cheap`. `max` labels 1 of 153 differently, and that
+ * one is `expensive` → `fair`, a band the sleeve does not gate on.
+ *
+ * ## ⛔ THE PERCENTAGE ACCEPTANCE BAR IS RETIRED, NOT RE-TUNED
+ *
+ * Do NOT re-introduce "max |mispricingPct| < 100%" (or `< 75%`) as an acceptance
+ * criterion on this module. Under `max`, `|(m−t)/max(m,t)| < 1` holds
+ * ALGEBRAICALLY for every finite positive pair — so that predicate passes on
+ * every chain forever, INCLUDING one whose `theo` is garbage. It reads identically
+ * in the pass and the fail state: a statistic bounded by construction has no fail
+ * state, which is the same defect as the unbounded tail with the sign flipped.
+ * For the record `max` read 76.9% on the deciding chain, which MISSES the `< 75%`
+ * bar TRA-2564 set — the bar was retired rather than tuned by 2pp to fit.
+ *
+ * `|r| < 1` survives below only as a TAUTOLOGY CHECK ON THE IMPLEMENTATION — if
+ * it ever fails, this code is wrong, not the tape. It is not evidence about the
+ * market and must never be published as a finding.
+ *
+ * What replaces it as the load-bearing property is CHEAP-SIDE ENGINE PARITY:
+ * every row with `mark < theo` must carry exactly `(mark − theo)/theo`. That is
+ * what makes the flip safe for the sleeve, and it is the thing that breaks if
+ * someone later "improves" the formula. It is pinned in
+ * `otm-mark-basis.wire.test.ts` against the REAL engine, in both directions.
+ *
+ * ## ⚠️ What this does NOT fix
+ *
+ * The `theo` surface itself is arbitrage-incoherent: 11 of 143 adjacent strike
+ * pairs violate vertical-spread monotonicity, while `mark` violates 0 of 143. No
+ * choice of DENOMINATOR repairs a corrupt NUMERATOR. Root cause is TRA-2662
+ * (LeadDev). A green acceptance here means the headline is bounded and
+ * engine-consistent — NOT that the OTM panel is correct.
  */
 
 /** Classification band — structurally identical to the engine's `Mispricing`. */
@@ -123,20 +176,33 @@ export type MarkBasisClassification = 'expensive' | 'cheap' | 'fair';
 /**
  * Denominators `/api/options/otm-mispricing?basis=` accepts.
  *
- *  - `mark` — `(mark − theo)/mark`. THE SHIPPED DEFAULT (TRA-2562). Bounded on
- *    the expensive side only.
- *  - `theo` — `(mark − theo)/theo`. The pre-TRA-2564 basis, kept reachable so a
- *    re-measure can quote both from one build rather than inferring the old
- *    number from an older deploy. Bounded on the cheap side only.
- *  - `max`  — `(mark − theo)/max(mark, theo)`. Bounded on BOTH sides, |r| < 1
- *    identically. Offered for measurement; NOT the default, because switching
- *    the panel's headline statistic is a TRA-2562 decision.
+ *  - `max`  — `(mark − theo)/max(mark, theo)`. **THE DEFAULT (TRA-2659).** The
+ *    piecewise selection of whichever of the other two is bounded on that row's
+ *    side, so |r| < 1 identically AND the cheap side is bit-identical to what the
+ *    engine emits.
+ *  - `mark` — `(mark − theo)/mark`. The TRA-2562 default, superseded by TRA-2659
+ *    but kept reachable. Bounded on the expensive side only.
+ *  - `theo` — `(mark − theo)/theo`. The pre-TRA-2564 basis, and what the engine
+ *    itself emits. Kept reachable so a re-measure can quote every basis from ONE
+ *    build rather than inferring an old number from an older deploy. Bounded on
+ *    the cheap side only.
+ *
+ * All three stay reachable on purpose: grading a basis change in one pass, off
+ * one deploy, is what made TRA-2659 decidable against a box that reboots several
+ * times a day.
  */
 export const OTM_MISPRICING_BASES = ['mark', 'theo', 'max'] as const;
 export type MispricingBasis = (typeof OTM_MISPRICING_BASES)[number];
 
-/** The basis the route applies when the caller sends no `?basis=`. */
-export const OTM_DEFAULT_MISPRICING_BASIS: MispricingBasis = 'mark';
+/**
+ * The basis the route applies when the caller sends no `?basis=`, and the
+ * fallback an unrecognised `?basis=` degrades to.
+ *
+ * TRA-2659: `mark` → `max`. THE ONLY COPY — a second `as const` spelling of this
+ * value used to sit further down this file and was deleted with the flip, because
+ * a stale second copy of a default reads exactly like a live one.
+ */
+export const OTM_DEFAULT_MISPRICING_BASIS: MispricingBasis = 'max';
 
 /** Narrow an untrusted query value, falling back to the shipped default. */
 export function parseMispricingBasis(raw: unknown): MispricingBasis {
@@ -169,9 +235,6 @@ function denominatorFor(mark: number, theo: number, basis: MispricingBasis): num
  * one its own UI advertises.
  */
 export const OTM_PANEL_MISPRICING_THRESHOLD = 0.15;
-
-/** The basis this module normalises on. Echoed on the wire as `mispricingBasis`. */
-export const OTM_MISPRICING_BASIS = 'mark' as const;
 
 /** The subset of `OtmMispricingCandidate` this transform reads and rewrites. */
 export interface MarkBasisCandidate {
@@ -213,13 +276,17 @@ function classify(pct: number, threshold: number): MarkBasisClassification {
  * Re-base each candidate's `mispricingPct` onto `basis`'s denominator (the
  * engine always emits the theo basis), re-classify, and re-rank.
  *
- * **The re-sort is load-bearing, not cosmetic.** Writing `r` for the theo-basis
- * ratio, the mark basis is `r / (1 + r)`, which is strictly increasing in `r` —
- * so the order is preserved WITHIN each sign, but NOT across signs, which is
+ * **The re-sort is load-bearing, not cosmetic**, and it stays load-bearing under
+ * every basis including the TRA-2659 default. Writing `r` for the theo-basis
+ * ratio the engine hands us, the mark basis is `r / (1 + r)`, strictly increasing
+ * in `r` — so order is preserved WITHIN each sign but NOT across signs, which is
  * what the panel actually ranks on (`|mispricingPct|` descending). A row at
  * `r = +2.0` re-bases to +0.667 while one at `r = −0.5` re-bases to −1.00: the
- * old ranking puts the expensive row first, the new one puts the cheap row
- * first. Re-basing without re-sorting would emit new numbers in the old order
+ * old ranking puts the expensive row first, the new one puts the cheap row first.
+ *
+ * `max` does not escape this — it COMPRESSES the expensive side (to `r/(1+r)`)
+ * and leaves the cheap side at `r`, so it too re-orders across signs, just less
+ * violently. Re-basing without re-sorting would emit new numbers in the old order
  * and the top-N slice would drop the wrong rows — a defect invisible in any
  * single row's value, which is why the caller must slice only after this runs.
  *
@@ -255,17 +322,17 @@ export function rebaseMispricing<T extends MarkBasisCandidate>(
   return { candidates: rebased, basis, threshold: effective, unbasisable };
 }
 
-/**
- * `rebaseMispricing(candidates, 'mark', threshold)`.
+/*
+ * TRA-2659 — `rebaseOnMark(candidates, threshold)`, the
+ * `rebaseMispricing(candidates, 'mark', threshold)` convenience wrapper, was
+ * DELETED here.
  *
- * Retained because `mark` is the SHIPPED default and the overwhelming majority
- * of call sites want exactly it — spelling the basis at every one of them would
- * make the default look like a per-caller choice rather than the TRA-2562
- * decision it is.
+ * It was justified as "`mark` is the shipped default and the overwhelming
+ * majority of call sites want exactly it". Both halves are now false: `mark` is
+ * not the default, and it had ZERO non-test call sites even while it was. What it
+ * actually left behind was a second, hardcoded spelling of the default under a
+ * name that reads like the standard entry point — so a caller reaching for it
+ * after the flip would silently have got the SUPERSEDED basis while the route got
+ * the new one. Call `rebaseMispricing` and spell the basis, or omit it to take
+ * {@link OTM_DEFAULT_MISPRICING_BASIS}.
  */
-export function rebaseOnMark<T extends MarkBasisCandidate>(
-  candidates: readonly T[],
-  threshold: number = OTM_PANEL_MISPRICING_THRESHOLD,
-): MarkBasisResult<T> {
-  return rebaseMispricing(candidates, 'mark', threshold);
-}

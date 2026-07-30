@@ -6,10 +6,8 @@ import {
   type OptionChainRow,
 } from '@trading-app/engine';
 import {
-  rebaseOnMark,
   rebaseMispricing,
   parseMispricingBasis,
-  OTM_MISPRICING_BASIS,
   OTM_DEFAULT_MISPRICING_BASIS,
   OTM_PANEL_MISPRICING_THRESHOLD,
   type MarkBasisCandidate,
@@ -46,27 +44,29 @@ function c(mark: number, theo: number): MarkBasisCandidate & { id: string } {
   };
 }
 
-describe('rebaseOnMark — the formula', () => {
+describe('the mark basis — the formula', () => {
   it('normalises by mark, not theo', () => {
     // mark 1.20 vs theo 1.00: theo-basis +20%, mark-basis +16.67%.
-    const [row] = rebaseOnMark([c(1.2, 1.0)]).candidates;
+    const [row] = rebaseMispricing([c(1.2, 1.0)], 'mark').candidates;
     expect(row.mispricingPct).toBeCloseTo(0.2 / 1.2, 12);
     expect(row.mispricingPct).not.toBeCloseTo(0.2, 6);
   });
 
   it('preserves the sign convention: positive is still expensive', () => {
-    const { candidates } = rebaseOnMark([c(2.0, 1.0), c(0.5, 1.0)]);
+    const { candidates } = rebaseMispricing([c(2.0, 1.0), c(0.5, 1.0)], 'mark');
     expect(candidates.find((r) => r.mark === 2.0)!.mispricingPct).toBeGreaterThan(0);
     expect(candidates.find((r) => r.mark === 0.5)!.mispricingPct).toBeLessThan(0);
   });
 
   it('reports the basis it applied', () => {
-    expect(rebaseOnMark([]).basis).toBe('mark');
-    expect(OTM_MISPRICING_BASIS).toBe('mark');
+    expect(rebaseMispricing([], 'mark').basis).toBe('mark');
+    // NOT the default any more (TRA-2659) — asking for it explicitly is the only
+    // way to get it, which is exactly why every call in this file spells it out.
+    expect(rebaseMispricing([], 'mark').basis).not.toBe(OTM_DEFAULT_MISPRICING_BASIS);
   });
 });
 
-describe('rebaseOnMark — the re-sort is load-bearing', () => {
+describe('the mark basis — the re-sort is load-bearing', () => {
   /**
    * The defect this exists to catch: `r ↦ r/(1+r)` is strictly increasing, so
    * re-basing preserves rank WITHIN a sign and inverts it ACROSS signs. The
@@ -81,7 +81,7 @@ describe('rebaseOnMark — the re-sort is load-bearing', () => {
     // Precondition: the ENGINE's order puts expensive first.
     expect(Math.abs(expensive.mispricingPct)).toBeGreaterThan(Math.abs(cheap.mispricingPct));
 
-    const { candidates } = rebaseOnMark([expensive, cheap]);
+    const { candidates } = rebaseMispricing([expensive, cheap], 'mark');
     // Postcondition: the mark basis inverts it.
     expect(candidates.map((r) => r.id)).toEqual([cheap.id, expensive.id]);
   });
@@ -91,12 +91,12 @@ describe('rebaseOnMark — the re-sort is load-bearing', () => {
     const unsorted = input.map((r) => ({ ...r, mispricingPct: (r.mark - r.theo) / r.mark }));
     // Same numbers, original order — this is the broken implementation.
     expect(unsorted.map((r) => r.id)).not.toEqual(
-      rebaseOnMark(input).candidates.map((r) => r.id),
+      rebaseMispricing(input, 'mark').candidates.map((r) => r.id),
     );
   });
 });
 
-describe('rebaseOnMark — why packages/engine is not touched', () => {
+describe('the mark basis — why packages/engine is not touched', () => {
   /**
    * The containment argument in `otm-mark-basis.ts`. The live `single_leg_otm`
    * sleeve gates entry on `classification === 'cheap'`, so if this transform
@@ -122,11 +122,11 @@ describe('rebaseOnMark — why packages/engine is not touched', () => {
     // A row inside the widened sliver: `fair` on theo basis, `cheap` on mark basis.
     const sliver = c(0.86, 1.0);
     expect(sliver.mispricingPct).toBeGreaterThan(-t); // engine says fair
-    expect(rebaseOnMark([sliver]).candidates[0].classification).toBe('cheap');
+    expect(rebaseMispricing([sliver], 'mark').candidates[0].classification).toBe('cheap');
   });
 });
 
-describe('rebaseOnMark — the threshold', () => {
+describe('the mark basis — the threshold', () => {
   const NOW = Date.parse('2024-01-15T15:00:00Z');
   const EXP = '2024-02-15';
   const T = daysToExpiration(EXP, NOW) / 365;
@@ -179,20 +179,20 @@ describe('rebaseOnMark — the threshold', () => {
 
   it('an explicit threshold moves the cutoff', () => {
     const row0 = c(1.3, 1.0); // mark basis +23.1%
-    expect(rebaseOnMark([row0], 0.15).candidates[0].classification).toBe('expensive');
-    expect(rebaseOnMark([row0], 0.30).candidates[0].classification).toBe('fair');
+    expect(rebaseMispricing([row0], 'mark', 0.15).candidates[0].classification).toBe('expensive');
+    expect(rebaseMispricing([row0], 'mark', 0.30).candidates[0].classification).toBe('fair');
   });
 
   it('a garbage threshold degrades to the panel default, never to all-expensive', () => {
     for (const bad of [NaN, -1, Infinity]) {
-      const out = rebaseOnMark([c(1.05, 1.0)], bad); // mark basis +4.8%
+      const out = rebaseMispricing([c(1.05, 1.0)], 'mark', bad); // mark basis +4.8%
       expect(out.threshold).toBe(OTM_PANEL_MISPRICING_THRESHOLD);
       expect(out.candidates[0].classification).toBe('fair');
     }
   });
 });
 
-describe('rebaseOnMark — never silent', () => {
+describe('the mark basis — never silent', () => {
   it('neutralises and COUNTS a row whose mark cannot be a denominator', () => {
     // The broken rows must arrive carrying a LOUD theo-basis value, otherwise
     // "neutralised" and "passed straight through" are the same bytes and this
@@ -205,7 +205,7 @@ describe('rebaseOnMark — never silent', () => {
       true,
     );
 
-    const out = rebaseOnMark([c(1.5, 1.0), ...broken]); // healthy row re-bases to +0.333
+    const out = rebaseMispricing([c(1.5, 1.0), ...broken], 'mark'); // healthy row re-bases to +0.333
     expect(out.unbasisable).toBe(2);
     const neutralised = out.candidates.filter((x) => !Number.isFinite(x.mark) || x.mark <= 0);
     expect(neutralised).toHaveLength(2);
@@ -219,18 +219,18 @@ describe('rebaseOnMark — never silent', () => {
   });
 
   it('reports 0 unbasisable on a clean chain', () => {
-    expect(rebaseOnMark([c(1.2, 1.0), c(0.8, 1.0)]).unbasisable).toBe(0);
+    expect(rebaseMispricing([c(1.2, 1.0), c(0.8, 1.0)], 'mark').unbasisable).toBe(0);
   });
 
   it('does not mutate its input', () => {
     const input = [c(1.2, 1.0)];
     const before = input[0].mispricingPct;
-    rebaseOnMark(input);
+    rebaseMispricing(input, 'mark');
     expect(input[0].mispricingPct).toBe(before);
   });
 });
 
-describe('rebaseOnMark — the bound is ONE-SIDED', () => {
+describe('the mark basis — the bound is ONE-SIDED', () => {
   /**
    * TRA-2564's acceptance calls the mark basis "bounded by construction". It is
    * bounded at +100% on the EXPENSIVE side only. This test exists so that a
@@ -241,14 +241,14 @@ describe('rebaseOnMark — the bound is ONE-SIDED', () => {
     // theo must be BELOW mark (0.1) for the row to be expensive at all — this
     // is the SPY artifact regime, where theo collapses and the bid holds a tick.
     for (const theo of [0.09, 0.01, 1e-6, 1e-12]) {
-      const [r] = rebaseOnMark([c(0.1, theo)]).candidates;
+      const [r] = rebaseMispricing([c(0.1, theo)], 'mark').candidates;
       expect(r.mispricingPct).toBeLessThan(1);
       expect(r.mispricingPct).toBeGreaterThan(0);
     }
   });
 
   it('cheap is UNBOUNDED below — |pct| well past 100% is a legitimate read', () => {
-    const [r] = rebaseOnMark([c(0.05, 0.5)]).candidates;
+    const [r] = rebaseMispricing([c(0.05, 0.5)], 'mark').candidates;
     expect(r.mispricingPct).toBeCloseTo(-9, 12); // −900%
     expect(Math.abs(r.mispricingPct)).toBeGreaterThan(1);
     expect(r.classification).toBe('cheap');
@@ -262,13 +262,38 @@ describe('?basis= — the selector, and the DUALITY it exists to measure', () =>
    * tail is currently CHEAP. These pin the algebra behind that, so the finding
    * cannot quietly rot back into "mark fixed it".
    */
-  it('the default is `mark` — the TRA-2562 decision, unchanged by the selector', () => {
-    expect(OTM_DEFAULT_MISPRICING_BASIS).toBe('mark');
-    expect(rebaseMispricing([c(1.2, 1.0)]).basis).toBe('mark');
-    // The alias and the general form must not drift apart.
-    expect(rebaseOnMark([c(1.2, 1.0)]).candidates[0].mispricingPct).toBe(
-      rebaseMispricing([c(1.2, 1.0)], 'mark').candidates[0].mispricingPct,
-    );
+  /**
+   * TRA-2659 — the default moved `mark` → `max`.
+   *
+   * Asserted on BOTH the constant and the behaviour of the no-basis call, because
+   * they are separately breakable: the constant could move while
+   * `rebaseMispricing`'s parameter default is re-pointed at a literal, or vice
+   * versa. Mutating either alone must fail this.
+   */
+  it('the default is `max` — the TRA-2659 decision', () => {
+    expect(OTM_DEFAULT_MISPRICING_BASIS).toBe('max');
+    expect(rebaseMispricing([c(1.2, 1.0)]).basis).toBe('max');
+    expect(rebaseMispricing([c(1.2, 1.0)]).basis).toBe(OTM_DEFAULT_MISPRICING_BASIS);
+
+    // …and the no-basis call really COMPUTES the max formula, not merely LABELS
+    // itself `max`. A default that echoes right while computing the old ratio is
+    // the whole class of bug this file exists for.
+    const expensive = rebaseMispricing([c(1.2, 1.0)]).candidates[0];
+    expect(expensive.mispricingPct).toBeCloseTo(0.2 / 1.2, 12); // max == mark here
+    const cheap = rebaseMispricing([c(0.8, 1.0)]).candidates[0];
+    expect(cheap.mispricingPct).toBeCloseTo(-0.2 / 1.0, 12); // max == theo here
+    expect(cheap.mispricingPct).not.toBeCloseTo(-0.2 / 0.8, 6); // NOT the mark basis
+  });
+
+  /**
+   * The fallback for a garbage `?basis=` must land on the NEW default. Before the
+   * flip the same input returned `mark`, so a fallback left pointing at a
+   * hardcoded `'mark'` would be invisible in every happy-path assertion.
+   */
+  it('the fallback for a garbage ?basis= is `max`, not the retired `mark`', () => {
+    expect(parseMispricingBasis('BOGUS')).toBe('max');
+    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('BOGUS')).basis).toBe('max');
+    expect(parseMispricingBasis('BOGUS')).not.toBe('mark');
   });
 
   it('each basis uses its own denominator', () => {
@@ -280,11 +305,59 @@ describe('?basis= — the selector, and the DUALITY it exists to measure', () =>
     expect(pct('max')).toBeCloseTo(0.2 / 1.2, 12); // expensive -> max is mark
   });
 
-  it('`max` picks the BOUNDED branch on each side: theo when cheap, mark when expensive', () => {
-    const cheap = rebaseMispricing([c(0.5, 1.0)], 'max').candidates[0];
-    expect(cheap.mispricingPct).toBeCloseTo(-0.5 / 1.0, 12); // = theo basis
-    const exp = rebaseMispricing([c(2.0, 1.0)], 'max').candidates[0];
-    expect(exp.mispricingPct).toBeCloseTo(1.0 / 2.0, 12); // = mark basis
+  /**
+   * TRA-2659's LOAD-BEARING PROPERTY, pinned in both directions.
+   *
+   * `max` is not a new statistic — it is the piecewise selection of an EXISTING
+   * one: the theo basis on every cheap row, the mark basis on every expensive row.
+   * The cheap half is what makes the flip safe for the live `single_leg_otm`
+   * sleeve, because the engine emits the theo basis and gates on
+   * `classification === 'cheap'`; if this identity ever broke, the panel and the
+   * engine would disagree about which contracts are cheap.
+   *
+   * Asserted against the FORMULAS, not against `rebaseMispricing(_, 'theo')`, so
+   * that a bug planted in `denominatorFor` cannot satisfy both sides of the
+   * comparison at once.
+   */
+  it('THE IDENTITY: `max` IS the theo basis when cheap and the mark basis when expensive', () => {
+    for (const [mark, theo] of [
+      [0.5, 1.0],
+      [0.11, 0.47701], // the live SPY row
+      [0.05, 0.5],
+      [0.999, 1.0],
+    ] as const) {
+      const [r] = rebaseMispricing([c(mark, theo)], 'max').candidates;
+      expect(r.mispricingPct).toBeCloseTo((mark - theo) / theo, 12); // theo basis
+      expect(r.mispricingPct).not.toBeCloseTo((mark - theo) / mark, 6); // NOT mark
+    }
+    for (const [mark, theo] of [
+      [2.0, 1.0],
+      [0.1, 1e-6],
+      [1.001, 1.0],
+    ] as const) {
+      const [r] = rebaseMispricing([c(mark, theo)], 'max').candidates;
+      expect(r.mispricingPct).toBeCloseTo((mark - theo) / mark, 12); // mark basis
+      expect(r.mispricingPct).not.toBeCloseTo((mark - theo) / theo, 6); // NOT theo
+    }
+  });
+
+  it('the identity holds through the DEFAULT path, with no ?basis= at all', () => {
+    // The route's real code path, entered the way a caller that sends no query
+    // string enters it. Same two directions.
+    const cheap = rebaseMispricing([c(0.11, 0.47701)]).candidates[0];
+    expect(cheap.mispricingPct).toBeCloseTo((0.11 - 0.47701) / 0.47701, 12);
+    const exp = rebaseMispricing([c(2.0, 1.0)]).candidates[0];
+    expect(exp.mispricingPct).toBeCloseTo((2.0 - 1.0) / 2.0, 12);
+  });
+
+  it('`mark == theo` is degenerate-safe: 0 under every basis, no division blow-up', () => {
+    // The seam of the piecewise definition. Both branches must agree here or the
+    // identity above has a discontinuity at the crossover.
+    for (const b of ['mark', 'theo', 'max'] as const) {
+      const [r] = rebaseMispricing([c(1.0, 1.0)], b).candidates;
+      expect(r.mispricingPct).toBe(0);
+      expect(r.classification).toBe('fair');
+    }
   });
 
   it('THE DUALITY: `theo` blows up on the expensive tail, `mark` on the cheap tail', () => {
@@ -308,7 +381,17 @@ describe('?basis= — the selector, and the DUALITY it exists to measure', () =>
     }
   });
 
-  it('`max` is bounded below 100% for every ratio, both signs', () => {
+  /**
+   * ⛔ A TAUTOLOGY CHECK ON THE IMPLEMENTATION — NOT AN ACCEPTANCE CRITERION.
+   *
+   * TRA-2659 RETIRED "max |mispricingPct| < 100%" as acceptance. Under `max` the
+   * predicate is an algebraic identity, so it passes on every chain forever,
+   * including one whose `theo` is garbage — it reads identically in the pass and
+   * the fail state. Its only remaining job is to catch a botched `denominatorFor`
+   * here in CI. If it ever fails, the CODE is wrong, not the tape, and it must
+   * never be quoted as a finding about the market.
+   */
+  it('`max` is bounded below 100% for every ratio, both signs (TAUTOLOGY, not evidence)', () => {
     for (const x of [1e-9, 0.01, 0.5, 0.99, 1, 1.01, 2, 100, 1e9]) {
       const [r] = rebaseMispricing([c(x, 1.0)], 'max').candidates;
       expect(Math.abs(r.mispricingPct)).toBeLessThan(1);
@@ -325,7 +408,11 @@ describe('?basis= — the selector, and the DUALITY it exists to measure', () =>
   });
 
   it('the result echoes the APPLIED basis, so a typo reads as the fallback it got', () => {
-    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('MARK')).basis).toBe('mark');
+    // `MARK` is a typo, not a request for `mark` — it degrades to the TRA-2659
+    // default and says so. A caller reading its own query string instead of this
+    // echo would believe it got the mark basis.
+    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('MARK')).basis).toBe('max');
+    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('mark')).basis).toBe('mark');
     expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('max')).basis).toBe('max');
   });
 
@@ -339,7 +426,7 @@ describe('?basis= — the selector, and the DUALITY it exists to measure', () =>
   });
 });
 
-describe('rebaseOnMark — composition with the two floors', () => {
+describe('the mark basis — composition with the two floors', () => {
   /**
    * Order matters: the route re-bases BEFORE flooring, so both floors'
    * `maxSuppressedMispricingPct` footnotes are quoted in the basis the response
@@ -350,7 +437,7 @@ describe('rebaseOnMark — composition with the two floors', () => {
     const artifact = { ...c(0.1, 0.005), delta: 0.001 }; // theo-basis +1900%
     const healthy = { ...c(1.2, 1.0), delta: 0.5 };
 
-    const rebased = rebaseOnMark([artifact, healthy]);
+    const rebased = rebaseMispricing([artifact, healthy], 'mark');
     const floored = applyTheoFloor(rebased.candidates, 0.01);
     expect(floored.suppressed).toBe(1);
     // Mark basis: (0.1 − 0.005)/0.1 = 0.95, NOT the theo-basis 19.0.
@@ -359,10 +446,10 @@ describe('rebaseOnMark — composition with the two floors', () => {
   });
 
   it('the delta floor still reads the untouched delta', () => {
-    const rebased = rebaseOnMark([
+    const rebased = rebaseMispricing([
       { ...c(0.1, 0.005), delta: 0.001 },
       { ...c(1.2, 1.0), delta: 0.5 },
-    ]);
+    ], 'mark');
     const out = applyDeltaFloor(rebased.candidates, 0.02);
     expect(out.suppressed).toBe(1);
     expect(out.kept).toHaveLength(1);

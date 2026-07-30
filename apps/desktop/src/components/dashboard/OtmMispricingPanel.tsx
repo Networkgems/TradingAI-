@@ -57,14 +57,17 @@ interface OtmCandidate {
   /** Black-Scholes price at the market's own σ (smvVol, else smoothed midIv). */
   theo: number;
   /**
-   * TRA-2564 — (mark − theo) / MARK. The denominator moved from theo to mark;
-   * `mispricingBasis` on the response says which basis the build actually sent,
-   * and a build predating TRA-2564 omits that key entirely. A RATIO, not a
-   * percent — 0.18 means 18%. Multiply for display. Positive → the market is
-   * paying up vs. model (expensive); negative → cheap.
+   * TRA-2659 — (mark − theo) / MAX(mark, theo) by default. Read `mispricingBasis`
+   * on the response for what the build actually sent rather than assuming; a
+   * build predating TRA-2564 omits that key entirely. A RATIO, not a percent —
+   * 0.18 means 18%. Multiply for display. Positive → the market is paying up vs.
+   * model (expensive); negative → cheap.
    *
-   * Bounded by +100% on the EXPENSIVE side only (as theo → 0). The CHEAP side
-   * is unbounded below — do not render it as a two-sided percentage.
+   * Under the `max` default |value| < 1 on BOTH sides, so it is safe to render as
+   * a two-sided percentage. That bound is an algebraic IDENTITY, not a health
+   * signal — it holds just as well on a garbage `theo`, so never present "under
+   * 100%" as evidence the surface is sound (TRA-2662). Under `basis=mark` the
+   * cheap side is unbounded below, and under `basis=theo` the expensive side is.
    */
   mispricingPct: number;
   classification: 'expensive' | 'cheap' | 'fair';
@@ -148,8 +151,13 @@ interface OtmMispricingScanResponse {
   candidates: OtmCandidate[];
   reason?: ScanReason;
   errorMessage?: string;
-  /** TRA-2564 - denominator every `mispricingPct` above is normalised by. */
-  mispricingBasis?: 'mark' | 'theo';
+  /**
+   * TRA-2564 - denominator every `mispricingPct` above is normalised by, as
+   * APPLIED (not as requested). TRA-2659 flipped the server default `mark` ->
+   * `max` and added `max` to this union; a build predating TRA-2564 omits the key
+   * entirely, which is what proves the formula swapped.
+   */
+  mispricingBasis?: 'mark' | 'theo' | 'max';
   theoFloor?: TheoFloorReport;
   deltaFloor?: DeltaFloorReport;
   diagnostics?: ScannerDiagnostics;

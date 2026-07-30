@@ -4468,11 +4468,18 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
     // omits the key entirely, so its presence — not a SHA, not a commit subject
     // — is what proves the formula swapped.
     //
-    // ⚠️ `mark` is bounded at +100% on the EXPENSIVE side ONLY; the cheap side is
-    // unbounded. Measured live 2026-07-30: SPY read 333.6% on `mark` vs 94.1% on
-    // `theo`, because SPY's tail is currently CHEAP. The two bases are exact
-    // duals and neither bounds both tails — `basis=max` does. See
-    // `otm-mark-basis.ts`; the choice is TRA-2562's, so the default stays `mark`.
+    // TRA-2659 (executed as TRA-2661) — the default is now `max`, not `mark`.
+    // `mark` bounds the EXPENSIVE tail only and the cheap side is unbounded:
+    // measured live 2026-07-30, SPY read 333.6% on `mark` vs 94.1% on `theo`,
+    // because SPY's tail is currently CHEAP. The two are exact duals and neither
+    // bounds both tails. `max` takes the bounded branch on each side, which also
+    // makes the CHEAP side bit-identical to what the engine emits — the side the
+    // live `single_leg_otm` sleeve gates on.
+    //
+    // ⛔ Do NOT accept a change to this route on "max |mispricingPct| < 100%".
+    // Under `max` that predicate is an algebraic identity: it passes on every
+    // chain forever, including one whose `theo` is garbage. See the retirement
+    // note in `otm-mark-basis.ts`.
     mispricingBasis: rebased.basis,
     // Never silent: rows whose denominator was unusable under the applied basis
     // have no ratio and were neutralised to 0/`fair` rather than emitted with a
