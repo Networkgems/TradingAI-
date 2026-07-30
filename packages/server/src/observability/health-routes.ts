@@ -10,7 +10,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
-import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
+import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
 import { isTestAccount, unrecognisedDeskBooks } from '../test-accounts.js'; // TRA-1949, TRA-2524
 import {
   applyModelFacingBasis,
@@ -248,7 +248,27 @@ export interface LiveHealthDeps {
    * Only mounted behind a valid internal token, so it never widens the
    * unauthenticated surface.
    */
-  demoBooks?: () => Array<{ username: string; state: EngineState; mode: string }>;
+  /**
+   * ⚠ TRA-2650 — RENAMED FROM `demoBooks`, AND THE FILTER MOVED IN HERE.
+   *
+   * This provider MUST return EVERY engine in the fleet, in EVERY mode, with
+   * `email` populated. It used to be `demoBooks`, and the caller in `index.ts`
+   * applied `.filter(b => b.mode === 'demo')` and mapped only
+   * `{username, state, mode}`. Two live defects fell out of that:
+   *
+   *  1. the moment the operator armed to `mode:'live'` it was dropped upstream,
+   *     so {@link summarizeDemoBooksPublic}'s `role:'operator'` branch became
+   *     dead code and the route could not answer "did the operator book
+   *     survive?" — while its own doc claimed the operator is never hidden;
+   *  2. `email` was never populated, so `isTestAccount(username, env, email)`'s
+   *     email branch was dead in production and the documented desk-fold
+   *     mechanism (`PATCH /api/admin/users/:username {email}`) moved nothing.
+   *
+   * Each consumer below narrows to what it actually wants — see
+   * {@link demoModeBooks}. Build it with {@link projectFleetBooks} so the
+   * production wiring and the regression test share one implementation.
+   */
+  fleetBooks?: () => Array<{ username: string; state: EngineState; mode: string; email?: string }>;
   /**
    * TRA-895 — inputs for the UNAUTHENTICATED `GET /api/health/options-pipeline`
    * probe. The 3-day demo test repeatedly reported "no option signals"; the
@@ -554,6 +574,57 @@ export function summarizeDemoBooks(
   };
 }
 
+/** TRA-2650 — one fleet book as the health routes consume it. */
+export interface FleetBookInput {
+  username: string;
+  state: EngineState;
+  mode: string;
+  email?: string;
+}
+
+/**
+ * TRA-2650 — THE production projection from user contexts to {@link FleetBookInput}.
+ *
+ * This exists so the wiring in `index.ts` is a single call with no logic of its
+ * own, and so the regression test exercises the SAME code the server runs. The
+ * defect this closes lived entirely in the caller: a unit test that called
+ * {@link summarizeDemoBooksPublic} with a hand-built armed-operator fleet
+ * passed while production was broken, because production never handed it one.
+ *
+ * Two invariants, both load-bearing:
+ *  - NO mode filter. Every engine crosses this seam. Consumers narrow.
+ *  - `email` IS populated. `isTestAccount`'s email branch is only reachable
+ *    from here, and the desk fold is documented as an email move.
+ */
+export function projectFleetBooks<C extends { username: string; engine: { getState(): EngineState } }>(
+  contexts: readonly C[],
+  getMode: (username: string) => string,
+  getEmail: (username: string) => string | undefined,
+): FleetBookInput[] {
+  return contexts.map(ctx => {
+    const email = getEmail(ctx.username);
+    return {
+      username: ctx.username,
+      state: ctx.engine.getState(),
+      mode: getMode(ctx.username),
+      // Omit rather than carry `undefined`: `'email' in book` then means what it
+      // says on a serialized row (see the `optional?`-field trap, TRA-2598).
+      ...(email ? { email } : {}),
+    };
+  });
+}
+
+/**
+ * TRA-2650 — narrow the fleet to demo-mode books. The two consumers that are
+ * genuinely demo-only ({@link summarizeDemoBooks}'s token-gated fleet read and
+ * the sma200 forward-test fill count) call this EXPLICITLY, at the point where
+ * the restriction is meaningful, instead of inheriting it invisibly from a
+ * provider three files away.
+ */
+export function demoModeBooks<T extends { mode: string }>(books: readonly T[]): T[] {
+  return books.filter(b => b.mode === 'demo');
+}
+
 /**
  * TRA-901 — the NO-AUTH fleet demo-book view for the unattended TRA-898 daily
  * watch. The token-gated `/api/health/demo-book` path is unreachable for an
@@ -596,9 +667,57 @@ export interface DemoBookPublicReport {
   /** Human note when `unrecognisedDeskBookCount > 0`, else null. */
   deskRosterNote: string | null;
   /**
+   * TRA-2650 — the MODE-BLIND operator-survival probe.
+   *
+   * `books[]` below is, and stays, DEMO-ONLY: this route is NO-AUTH, and a book
+   * entry carries real equity/cash figures, so the moment the operator arms to
+   * `mode:'live'` its book contents must NOT appear here. That is a deliberate
+   * bound, not an oversight — but it used to make the operator INVISIBLE rather
+   * than REDACTED, and `operator = 0` then read identically for "the armed
+   * operator is healthy" and "the operator book is gone". Routine `e8938953`
+   * had `operator = 0` wired as a ROLL BACK / file-`critical` trigger, so a
+   * healthy armed box scored RED.
+   *
+   * This block answers "did the operator book survive?" for ANY mode, using
+   * counts and mode labels only — never balances.
+   */
+  operator: {
+    /**
+     * The ENABLING PRECONDITION, on the wire next to the reading it governs.
+     * `resolveLiveBrokerOperator(env)` is non-empty — i.e. some username CAN be
+     * the operator. When this is `false` the pin is explicitly cleared (the
+     * documented kill-switch) and `engineCount: 0` is a TAUTOLOGY, not a
+     * finding: no user can match, so no alarm may be raised off it.
+     */
+    pinConfigured: boolean;
+    /**
+     * Operator engines seen in the WHOLE fleet, regardless of mode. This is the
+     * survival signal: `pinConfigured && engineCount === 0` is the real
+     * "the operator book is gone" state and the only one worth a rollback.
+     */
+    engineCount: number;
+    /**
+     * Modes of those engines (e.g. `['live']` for the board-ratified boot-arm,
+     * `['demo']` before it arms). Sorted + de-duplicated. Never balances.
+     */
+    modes: string[];
+    /**
+     * True when the operator book is also present in `books[]` — i.e. it is in
+     * `demo` mode, so publishing its paper figures is safe. False for an armed
+     * live operator: present in the fleet, redacted from the list.
+     */
+    inBooks: boolean;
+    /** Human note when the operator is present but redacted, or missing. Else null. */
+    note: string | null;
+  };
+  /**
    * Each book carries a `role` so the board can tell the live/broker operator
    * book (`admin`, `LIVE_EQUITY_BOOT_USER`) apart from true demo peers, and —
    * when `?includeTest=1` — from QA/test books. Labels stay anonymized.
+   *
+   * DEMO-MODE ONLY (TRA-2650). A live-armed operator is reported in `operator`
+   * above, not here; read `operator.inBooks` before concluding anything from
+   * the absence of a `role:'operator'` entry.
    */
   books: Array<{ label: string; role: 'demo' | 'operator' | 'test'; book: DemoBookReport }>;
 }
@@ -609,9 +728,23 @@ export interface DemoBookPublicReport {
  * email — see {@link isTestAccount}) are excluded and the operator/live book is
  * labelled distinctly from demo peers (mirrors the desk-calendar `?includeTest`
  * gate). Pass `includeTest: true` to keep every book (test books surface with
- * `role: 'test'`). The operator book is NEVER hidden — it is the live/broker
- * engine, not a demo peer — only re-labelled. Usernames stay anonymized to
- * `demo-N` / `operator (live)` / `test-N`; identity is never leaked.
+ * `role: 'test'`). Usernames stay anonymized to `demo-N` / `operator (live)` /
+ * `test-N`; identity is never leaked.
+ *
+ * ⚠ TRA-2650 — THE CALLER USED TO BREAK THIS FUNCTION'S CONTRACT. This doc
+ * previously claimed "the operator book is NEVER hidden — only re-labelled".
+ * That was false in the deployed system: `index.ts`'s provider filtered to
+ * `mode === 'demo'` BEFORE calling here, so the moment the operator armed to
+ * `mode:'live'` the `role:'operator'` branch below became dead code and the
+ * book vanished from the route entirely. Every unit test that called this
+ * function directly still passed, because the defect was upstream of it.
+ *
+ * The contract now: `engines` is the WHOLE fleet (every mode, `email`
+ * populated). This function owns the demo filter. `books[]` stays demo-only —
+ * the route is NO-AUTH and a book carries real equity, which must not leak for
+ * a live-armed operator — but {@link DemoBookPublicReport.operator} reports the
+ * operator's survival MODE-BLIND, in counts and mode labels only. "Operator
+ * absent" and "operator armed live" are now distinct readings.
  */
 export function summarizeDemoBooksPublic(
   engines: Array<{ username: string; state: EngineState; mode: string; email?: string }>,
@@ -620,9 +753,17 @@ export function summarizeDemoBooksPublic(
 ): DemoBookPublicReport {
   const env = opts.env ?? process.env;
   const includeTest = opts.includeTest === true;
+  // TRA-2650 — the operator survival read runs over the FULL fleet, before the
+  // demo filter, so arming the operator to `live` cannot zero it.
+  const operatorEngines = engines.filter(e => isLiveBrokerOperator(e.username, env));
+  const operatorModes = [...new Set(operatorEngines.map(e => e.mode))].sort();
+  const operatorPinConfigured = resolveLiveBrokerOperator(env).length > 0;
+  const operatorInBooks = operatorEngines.some(e => e.mode === 'demo');
+  // Everything below is the board-facing DEMO view. A live book never enters it.
+  const demoEngines = engines.filter(e => e.mode === 'demo');
   // Classify BEFORE anonymization — the operator flag and test flag both need
   // the real username/email, which the public shape strips.
-  const classified = engines.map(e => ({
+  const classified = demoEngines.map(e => ({
     e,
     operator: isLiveBrokerOperator(e.username, env),
     // An operator book is never a "test" book even if its name matched a
@@ -678,6 +819,23 @@ export function summarizeDemoBooksPublic(
         + `test-account patterns nor KNOWN_DESK_BOOKS — ${unrecognisedDesk.length === 1 ? 'its' : 'their'} `
         + `P&L is being counted as desk P&L unvouched (TRA-2524)`
       : null,
+    operator: {
+      pinConfigured: operatorPinConfigured,
+      engineCount: operatorEngines.length,
+      modes: operatorModes,
+      inBooks: operatorInBooks,
+      note: !operatorPinConfigured
+        ? 'LIVE_EQUITY_BOOT_USER resolves empty — the operator pin is cleared, so no user '
+          + 'can be the operator and engineCount:0 is a tautology, not a finding (TRA-2650)'
+        : operatorEngines.length === 0
+          ? 'operator pin is set but NO engine matches it — the operator book is genuinely '
+            + 'absent from the fleet (TRA-2650)'
+          : !operatorInBooks
+            ? `operator book present (mode ${operatorModes.join('/')}) but redacted from `
+              + `books[] — this route is NO-AUTH and only demo/paper figures may appear `
+              + `here (TRA-2650)`
+            : null,
+    },
     books,
   };
 }
@@ -996,6 +1154,17 @@ export interface OptionJournalReport {
     accountClassNote: string;
     /** TRA-2590 — why the cross-tab is per-class and not on the pooled fold. */
     structureExitNote: string;
+    /**
+     * TRA-2650 — the partition's BASIS. Row class is frozen at write time, so a
+     * book-level fold moves NO row and any before/after dollar delta measured
+     * here is zero by construction. See {@link partitionByAccountClass}.
+     */
+    accountAttribution: {
+      basis: 'account-string-frozen-at-write';
+      emailAware: false;
+      bookFoldRestatesRows: false;
+      note: string;
+    };
   };
   /**
    * TRA-2193 — row counts per account class, hoisted so a consumer reading
@@ -1477,6 +1646,41 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
    * Said out loud so a reader can tell a bounded emission from a missing field.
    */
   structureExitNote: string;
+  /**
+   * TRA-2650 — THE BASIS OF THE PARTITION, STATED SO `Δ = 0` CANNOT BE MISREAD.
+   *
+   * Every row here is classified from the `account` STRING frozen into it at
+   * write time, by `classifySpreadCeilingAccount(r.account)` → `isTestAccount`
+   * with NO email argument. Two consequences, and they are the whole reason
+   * this field exists:
+   *
+   *  - RE-CLASSIFYING A BOOK CANNOT MOVE AN ALREADY-WRITTEN ROW. The desk fold
+   *    (a username-roster change, or the documented
+   *    `PATCH /api/admin/users/:username {email}` move) operates on the USER
+   *    RECORD. The row partition operates on a string copied at write time.
+   *    They are different predicates over different data.
+   *  - THEREFORE `M = desk.total_control − desk.total_post` AND
+   *    `Δ desk.realizedPnlUsd` ARE ZERO BY CONSTRUCTION ACROSS ANY FOLD —
+   *    on a fold that worked AND on one that did nothing. A `$0.00`
+   *    contamination headline read off this route is NOT evidence the fold was
+   *    clean; it is an instrument that cannot move. TRA-2524 measured exactly
+   *    this and got byte-identical figures either side of `e74b4cf`.
+   *
+   * This is DELIBERATE, not a defect to fix: the stored `account` is what makes
+   * a historical desk number stable. Retroactive re-attribution would silently
+   * restate every previously published board figure. If a restatement is ever
+   * genuinely wanted it needs an explicit row-rewrite step with a real
+   * before/after — it must never fall out of a roster edit as a side effect.
+   */
+  accountAttribution: {
+    /** How a row's class is decided. */
+    basis: 'account-string-frozen-at-write';
+    /** `classifySpreadCeilingAccount` takes no email ⇒ an email fold is invisible here. */
+    emailAware: false;
+    /** A book-level fold does NOT restate historical rows. Hence Δ ≡ 0. */
+    bookFoldRestatesRows: false;
+    note: string;
+  };
 } {
   const p = partitionRowsByAccountClass(rows);
   return {
@@ -1508,6 +1712,24 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
       + 'summary — by design, because the pooled fold is the one accountClassNote says not to '
       + 'grade. For TRA-2202 read byAccountClass.desk.byStructureExit and find the cell with '
       + 'structure=single_leg_otm, exitReason=sl.',
+    accountAttribution: {
+      basis: 'account-string-frozen-at-write',
+      emailAware: false,
+      bookFoldRestatesRows: false,
+      note:
+        'Rows are classified from the `account` string frozen in at WRITE time '
+        + '(classifySpreadCeilingAccount -> isTestAccount, no email argument). A desk fold '
+        + 'edits the USER RECORD (username roster, or PATCH /api/admin/users/:username '
+        + '{email}) and therefore CANNOT move an already-written row. Consequence: '
+        + '`desk.total` and `desk.realizedPnlUsd` are UNCHANGED across any fold, on a fold '
+        + 'that worked and on one that did nothing alike, so a $0.00 contamination delta '
+        + 'measured here is VACUOUS — it is not evidence the fold was clean (TRA-2650; '
+        + 'TRA-2524 read byte-identical figures either side of e74b4cf). This is by design: '
+        + 'the stored account string is what keeps historical desk numbers stable. Any real '
+        + 'restatement needs an explicit row-rewrite step with its own before/after, never a '
+        + 'side effect of a roster edit. Grade the fold on the BOOK axis '
+        + '(/api/health/demo-book-public), not on a dollar delta here.',
+    },
   };
 }
 
@@ -2303,7 +2525,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //    unattended routine has no engine of its own to scope to.
   app.get('/api/health/demo-book', internalOrAuth, async (_req, res) => {
     if (res.locals['internalDemoAccess']) {
-      res.json(summarizeDemoBooks(deps.demoBooks?.() ?? [], now()));
+      // TRA-2650 — demo-only, stated HERE: this route names usernames AND
+      // balances, so a live book must never enter it.
+      res.json(summarizeDemoBooks(demoModeBooks(deps.fleetBooks?.() ?? []), now()));
       return;
     }
     const ctx = await deps.userCtx(res);
@@ -2323,7 +2547,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   app.get('/api/health/demo-book-public', (req, res) => {
     const includeTest =
       (req as { query?: Record<string, unknown> }).query?.['includeTest'] === '1';
-    res.json(summarizeDemoBooksPublic(deps.demoBooks?.() ?? [], now(), { includeTest }));
+    // TRA-2650 — the WHOLE fleet crosses here on purpose; the demo filter and
+    // the operator-survival read both live inside the summarizer now.
+    res.json(summarizeDemoBooksPublic(deps.fleetBooks?.() ?? [], now(), { includeTest }));
   });
 
   const liveEquityAcceptance = deps.liveEquityAcceptance;
@@ -3590,7 +3816,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // landed", so the monitor could never close on first fill. Sourced from the
     // demo fleet's paper books (forwardTestOnly marker = this path's unique
     // fingerprint); demo-money only, no secrets, no live capital.
-    const fills = summarizeSma200ForwardTestFills(deps.demoBooks?.() ?? []);
+    const fills = summarizeSma200ForwardTestFills(demoModeBooks(deps.fleetBooks?.() ?? []));
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),

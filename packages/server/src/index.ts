@@ -530,7 +530,7 @@ import {
 } from './observability/index.js';
 // TRA-1684 — from the module, not the barrel: the barrel re-export dragged the crypto
 // route graph behind every logger import and manufactured the TRA-1674 cycle.
-import { registerLiveHealthRoutes, runStaleStateCheck } from './observability/health-routes.js';
+import { registerLiveHealthRoutes, runStaleStateCheck, projectFleetBooks } from './observability/health-routes.js';
 import {
   rotateBackups,
   checkDataDirHealth,
@@ -3949,8 +3949,10 @@ app.get('/api/health', (_req, res) => {
 // TRA-901 — also grant the unattended TRA-898 daily-watch routine token-gated
 // access to the (otherwise user-JWT-only) demo-book surface. `internalToken`
 // is the shared secret from env (rotation-tracking, empty disables internal
-// access); `demoBooks` enumerates the fleet's demo-mode engines so the routine
-// can read the $25k paper book without authenticating as that account.
+// access); `fleetBooks` enumerates the fleet's engines so the routine can read
+// the $25k paper book without authenticating as that account. TRA-2650 — that
+// provider is fleet-WIDE and email-bearing; the demo narrowing lives in the
+// routes that need it.
 registerLiveHealthRoutes(app, {
   requireAuth,
   userCtx,
@@ -3967,10 +3969,20 @@ registerLiveHealthRoutes(app, {
   // would report every daemon-free operator flip as phantom drift).
   effectiveEnv: () => demoFlagEnv(),
   internalToken: () => (process.env['DEMO_BOOK_INTERNAL_TOKEN'] ?? '').trim() || undefined,
-  demoBooks: () =>
-    getAllUserContexts()
-      .map(ctx => ({ username: ctx.username, state: ctx.engine.getState(), mode: getSettings(ctx.username).mode }))
-      .filter(b => b.mode === 'demo'),
+  // TRA-2650 — ⚠ DO NOT re-introduce a `.filter(b => b.mode === 'demo')` here,
+  // and do not drop `email`. This provider hands over the WHOLE fleet; each
+  // health route narrows it itself (`demoModeBooks`). The previous demo-only,
+  // email-less version made `role:'operator'` unreachable for an armed operator
+  // and left `isTestAccount`'s email branch dead in production — both invisible
+  // to every unit test, because the defect was here in the caller and not in
+  // the functions under test. `projectFleetBooks` is the shared seam that
+  // `health-routes.wiring.test.ts` grades.
+  fleetBooks: () =>
+    projectFleetBooks(
+      getAllUserContexts(),
+      username => getSettings(username).mode,
+      username => getUser(username)?.email,
+    ),
   // TRA-895 — unauth options-signal pipeline probe. Enumerates demo-mode engines
   // + the shared RV scanner status so "no option signals" is diagnosable without
   // a login or the internal demo-book token. Secrets-free (booleans/counts only).

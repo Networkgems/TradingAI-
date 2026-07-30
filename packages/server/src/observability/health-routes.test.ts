@@ -552,7 +552,7 @@ describe('TRA-898 demo-book summary', () => {
       },
       getSettings: () => settings(),
       internalToken: () => 'watch-secret',
-      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      fleetBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
       now: () => NOW,
     });
     const [gate, handler] = routes.get('/api/health/demo-book')!;
@@ -581,7 +581,7 @@ describe('TRA-898 demo-book summary', () => {
       userCtx: async () => ctx('admin', demoState()),
       getSettings: () => settings(),
       internalToken: () => 'watch-secret',
-      demoBooks: () => [],
+      fleetBooks: () => [],
       now: () => NOW,
     });
     const [gate] = routes.get('/api/health/demo-book')!;
@@ -602,7 +602,7 @@ describe('TRA-898 demo-book summary', () => {
       userCtx: async () => ctx('admin', demoState()),
       getSettings: () => settings(),
       internalToken: () => undefined, // disabled
-      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      fleetBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
       now: () => NOW,
     });
     const [gate] = routes.get('/api/health/demo-book')!;
@@ -641,7 +641,7 @@ describe('TRA-898 demo-book summary', () => {
         throw new Error('userCtx must not run on the public path');
       },
       getSettings: () => settings(),
-      demoBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
+      fleetBooks: () => [{ username: 'demo-trader', state: demoState(), mode: 'demo' }],
       now: () => NOW,
     });
     const handlers = routes.get('/api/health/demo-book-public')!;
@@ -673,7 +673,7 @@ describe('TRA-898 demo-book summary', () => {
         throw new Error('userCtx must not run on the public path');
       },
       getSettings: () => settings(),
-      demoBooks: () => [
+      fleetBooks: () => [
         { username: 'richard', state: demoState(), mode: 'demo' },
         { username: 'qa_reg_1', state: demoState(), mode: 'demo' },
         { username: 'qa_mirror_2', state: demoState(), mode: 'demo' },
@@ -727,7 +727,7 @@ describe('TRA-898 demo-book summary', () => {
         getSettings: () => settings(),
         // The live 2026-07-29 fold on `9e1b1123` — 3 real books + the 3 fixtures
         // this ticket found — plus one book using a scheme nobody has seen.
-        demoBooks: () => [
+        fleetBooks: () => [
           { username: 'admin', state: demoState(), mode: 'live' },
           { username: 'Richard', state: demoState(), mode: 'demo' },
           { username: 'enock', state: demoState(), mode: 'demo' },
@@ -747,12 +747,24 @@ describe('TRA-898 demo-book summary', () => {
         hiddenTestBookCount: number;
         unrecognisedDeskBookCount: number;
         deskRosterNote: string | null;
+        operator: { pinConfigured: boolean; engineCount: number; modes: string[]; inBooks: boolean };
       };
       // THE POSITIVE MARK — a non-zero reading, asserted before any zero below
       // is allowed to mean anything. The 3 fixtures are now CLASSIFIED (hidden),
       // so the only book left unvouched is the unknown scheme.
       expect(body.hiddenTestBookCount).toBe(3);
-      expect(body.demoEngineCount).toBe(4); // admin + 3 real/unknown
+      // TRA-2650 — `admin` is `mode:'live'` here, so it is NOT in books[]: this
+      // route is NO-AUTH and a book entry carries real equity. It was never in
+      // books[] in production either — the provider dropped it upstream — this
+      // assertion just used to claim otherwise off a fixture production could
+      // not produce. Its survival is reported in `operator` instead.
+      expect(body.demoEngineCount).toBe(3); // Richard + enock + unknown scheme
+      expect(body.operator).toMatchObject({
+        pinConfigured: true,
+        engineCount: 1,
+        modes: ['live'],
+        inBooks: false,
+      });
       expect(body.unrecognisedDeskBookCount).toBe(1);
       expect(body.deskRosterNote).toContain('1 book');
       expect(body.deskRosterNote).toContain('TRA-2524');
@@ -782,7 +794,7 @@ describe('TRA-898 demo-book summary', () => {
           throw new Error('userCtx must not run on the public path');
         },
         getSettings: () => settings(),
-        demoBooks: () => [
+        fleetBooks: () => [
           { username: 'admin', state: demoState(), mode: 'live' },
           { username: 'Richard', state: demoState(), mode: 'demo' },
           { username: 'enock', state: demoState(), mode: 'demo' },
@@ -799,10 +811,14 @@ describe('TRA-898 demo-book summary', () => {
         hiddenTestBookCount: number;
         unrecognisedDeskBookCount: number;
         deskRosterNote: string | null;
+        operator: { pinConfigured: boolean; engineCount: number; modes: string[]; inBooks: boolean };
       };
-      // The whole point of the ticket: 6 books in, 3 of them fixtures.
+      // The whole point of the ticket: 5 DEMO books in, 3 of them fixtures.
+      // (`admin` is the 6th, `mode:'live'` — see the TRA-2650 note above; it is
+      // reported in `operator`, not counted in the demo fold.)
       expect(body.hiddenTestBookCount).toBe(3);
-      expect(body.demoEngineCount).toBe(3);
+      expect(body.demoEngineCount).toBe(2); // Richard + enock
+      expect(body.operator).toMatchObject({ pinConfigured: true, engineCount: 1, inBooks: false });
       expect(body.unrecognisedDeskBookCount).toBe(0);
       expect(body.deskRosterNote).toBeNull();
     } finally {
@@ -822,7 +838,7 @@ describe('TRA-898 demo-book summary', () => {
           throw new Error('userCtx must not run on the public path');
         },
         getSettings: () => settings(),
-        demoBooks: () => [
+        fleetBooks: () => [
           { username: 'admin', state: demoState(), mode: 'demo' },
           { username: 'richard', state: demoState(), mode: 'demo' },
           { username: 'qa_reg_1', state: demoState(), mode: 'demo' },
