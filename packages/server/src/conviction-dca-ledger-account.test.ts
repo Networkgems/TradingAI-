@@ -397,6 +397,42 @@ describe('recent window paging', () => {
     });
   });
 
+  it('states `account` on EVERY projected row, so absence can never mean "unpatched"', () => {
+    // Read live off bqb1 at 997d59e1: all 657 rows omitted the key, because the
+    // stored field is optional and `undefined` does not survive JSON.stringify.
+    // A reader asking `'account' in row` — the obvious probe for "does this host
+    // have the fix?" — therefore read a fully-patched route as UNPATCHED. That is
+    // this issue's own defect (one state, two readings) one level down.
+    recordConvictionDcaFill(fill({ ts: 1_000, positionId: 'legacy' })); // no account
+    recordConvictionDcaFill(fill({ ts: 2_000, positionId: 'named', account: 'qtverify_1785048357' }));
+
+    const rows = summarizeConvictionDca().recent;
+    // The KEY is unconditional...
+    expect(rows.every((r) => 'account' in r)).toBe(true);
+    expect(rows.every((r) => typeof r.account === 'string' && r.account.length > 0)).toBe(true);
+    // ...and it survives the wire, which is where the original bug actually bit.
+    const wire = JSON.parse(JSON.stringify(rows)) as Array<Record<string, unknown>>;
+    expect(wire.every((r) => 'account' in r)).toBe(true);
+
+    // The VALUE, not the key's existence, carries the attribution verdict.
+    expect(rows.find((r) => r.positionId === 'legacy')?.account).toBe(UNATTRIBUTED_ACCOUNT_KEY);
+    expect(rows.find((r) => r.positionId === 'named')?.account).toBe('qtverify_1785048357');
+  });
+
+  it('projects the sentinel WITHOUT rewriting storage or the byAccount partition', () => {
+    // The projection must not become a back door that invents attribution: the
+    // legacy row still reads as unattributed on disk and in the buckets.
+    hydrateConvictionDcaFromDisk(dir);
+    recordConvictionDcaFill(fill({ ts: 1_000, positionId: 'legacy' }));
+    expect(summarizeConvictionDca().recent[0]?.account).toBe(UNATTRIBUTED_ACCOUNT_KEY);
+
+    const onDisk = JSON.parse(
+      readFileSync(join(dir, 'conviction-dca-fills.jsonl'), 'utf8').trim(),
+    ) as Record<string, unknown>;
+    expect('account' in onDisk).toBe(false);
+    expect(Object.keys(summarizeConvictionDca().byAccount)).toEqual([UNATTRIBUTED_ACCOUNT_KEY]);
+  });
+
   it('can return more than 50 adds — the coverage acceptance', () => {
     // 50 of 658 was 7.6% coverage across 3 of 15 sessions. One page now spans it.
     seed(700);

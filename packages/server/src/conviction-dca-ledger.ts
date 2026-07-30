@@ -734,7 +734,7 @@ export interface ConvictionDcaSummary {
    * Still a DISPLAY projection: never derive a count from it. Use the buckets (exact
    * over the full ledger) or {@link bySession} (exact over retention).
    */
-  recent: ConvictionDcaFill[];
+  recent: ConvictionDcaRecentFill[];
   /**
    * TRA-2598 — what `recent` actually covers, so a partial page can never be mistaken
    * for the whole corpus. `returned < matched` ⇒ there are more pages.
@@ -776,6 +776,25 @@ export interface ConvictionDcaSessionRollup {
   /** The brake's named verdict FOR THIS SESSION. */
   guardState: ConvictionDcaGuardState;
 }
+
+/**
+ * TRA-2598 — a fill as PROJECTED into `recent`, where `account` is always present.
+ *
+ * On the stored {@link ConvictionDcaFill} the field is optional, because the JSONL
+ * predates it and rewriting history would invent attribution. But `undefined` does
+ * not survive `JSON.stringify`, so an optional field made the wire row omit the key
+ * entirely — and a reader that tests for the key (the obvious way to ask "does this
+ * host have the account fix?") then reads a fully-patched route as UNPATCHED. That
+ * is the same defect this issue exists to remove — an instrument that reads
+ * identically in two different states — reintroduced one level down.
+ *
+ * So the projection states the answer instead of omitting it: a legacy row reports
+ * the {@link UNATTRIBUTED_ACCOUNT_KEY} sentinel, exactly the bucket it is already
+ * counted in by `byAccount`. Presence now means "this route attributes fills";
+ * the VALUE, never the key's existence, is what says whether this row is attributed.
+ * Storage is untouched — this is a read-side projection only.
+ */
+export type ConvictionDcaRecentFill = ConvictionDcaFill & { account: string };
 
 /** TRA-2598 — paging controls for the `recent` window. */
 export interface ConvictionDcaRecentPaging {
@@ -844,9 +863,11 @@ function pageFills(
   window: readonly ConvictionDcaFill[],
   limit: number,
   offset: number,
-): ConvictionDcaFill[] {
-  if (offset === 0) return window.slice(-limit);
-  return window.slice(offset, offset + limit);
+): ConvictionDcaRecentFill[] {
+  const page = offset === 0 ? window.slice(-limit) : window.slice(offset, offset + limit);
+  // State the book on every row — see {@link ConvictionDcaRecentFill} for why an
+  // omitted key is not an acceptable way to say "unattributed".
+  return page.map((fill) => ({ ...fill, account: convictionDcaAccountKey(fill.account) }));
 }
 
 /** Fold the retained window into per-ET-session rows, newest session first. */
