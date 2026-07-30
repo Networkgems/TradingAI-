@@ -3416,3 +3416,297 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     expect((body.engines as unknown[]).length).toBe(1);
   });
 });
+
+// ── TRA-2590 — the (structure × exitReason) cross-tab + left-tail R histogram ──
+//
+// TRA-2213 leg 2 has to grade TRA-2202's invalidation criterion:
+//
+//   `single_leg_otm` `sl` exits show ZERO closes below -0.50R across >=117 stop exits.
+//
+// The deployed route published `byStructure` and `byExitReason` as SEPARATE
+// marginals plus `avgR`, and NEITHER can answer that. These tests are the
+// two-directional control on the new instrument: each one pins a book where the
+// OLD readout gives a specific WRONG answer and asserts the new cell gives the
+// right one — and, in the other direction, that a CLEAN book still reads clean.
+describe('TRA-2590 option-journal structure x exitReason cross-tab', () => {
+  function jrow(
+    over: Partial<OptionTradeJournalRecord> & { id: string },
+  ): OptionTradeJournalRecord {
+    return {
+      openTs: NOW - 3_600_000,
+      symbol: 'JACK',
+      structure: 'single_leg_otm',
+      mode: 'demo',
+      ivRank: null,
+      trend: 'up',
+      sentiment: null,
+      entryDelta: 0.45,
+      entryDte: 30,
+      atRiskUsd: 200,
+      agentConviction: null,
+      outcome: 'LOSS',
+      closeTs: NOW,
+      realizedPnlUsd: -100,
+      realizedR: -0.5,
+      exitReason: 'sl',
+      holdDays: 1,
+      account: 'admin',
+      ...over,
+    } as OptionTradeJournalRecord;
+  }
+
+  function deskCell(rows: OptionTradeJournalRecord[], structure: string, exitReason: string) {
+    const tab = buildOptionJournalReport(rows, NOW, true).summary.byAccountClass.desk
+      .byStructureExit;
+    return {
+      tab,
+      cell: tab.cells.find((c) => c.structure === structure && c.exitReason === exitReason),
+    };
+  }
+
+  // ── Direction 1: the marginals give a WRONG number and the cell gives the right one ──
+
+  it('the cell is NOT recoverable from the marginals — multiplying them gives 2, the truth is 4', () => {
+    // 8 desk closes. The single_leg_otm x sl cell holds 4 of them, but the
+    // marginals only say "4 otm rows" and "4 sl rows" out of 8, whose product
+    // under an independence assumption is 4*4/8 = 2. The estimate is off by 2x
+    // and nothing in the old payload says so. An estimate cannot certify.
+    const rows = [
+      jrow({ id: 'a1', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 'a2', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 'a3', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 'a4', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 'b1', structure: 'single_leg_rv', exitReason: 'time_stop' }),
+      jrow({ id: 'b2', structure: 'single_leg_rv', exitReason: 'time_stop' }),
+      jrow({ id: 'b3', structure: 'single_leg_rv', exitReason: 'time_stop' }),
+      jrow({ id: 'b4', structure: 'single_leg_rv', exitReason: 'time_stop' }),
+    ];
+    const report = buildOptionJournalReport(rows, NOW, true);
+    const desk = report.summary.byAccountClass.desk;
+
+    const otmMarginal = desk.byStructure.find((s) => s.structure === 'single_leg_otm')!.closed;
+    const slMarginal = desk.byExitReason.find((e) => e.exitReason === 'sl')!.closed;
+    expect((otmMarginal * slMarginal) / desk.closed).toBe(2); // the ESTIMATE
+
+    const { cell } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(cell!.closed).toBe(4); // the MEASUREMENT
+  });
+
+  it('a MEAN cannot see the left tail — two books with the SAME avgR differ 0 vs 2 violations', () => {
+    // This is the amber flag from the live desk read (avgR = -0.4991 over n=5):
+    // exactly on the threshold, which is where a mean is least informative.
+    const clean = [
+      jrow({ id: 'c1', realizedR: -0.5 }),
+      jrow({ id: 'c2', realizedR: -0.5 }),
+      jrow({ id: 'c3', realizedR: -0.5 }),
+      jrow({ id: 'c4', realizedR: -0.5 }),
+    ];
+    // Same mean (-0.5), same n, same cell — but half the closes blew through.
+    const dirty = [
+      jrow({ id: 'd1', realizedR: 0 }),
+      jrow({ id: 'd2', realizedR: 0 }),
+      jrow({ id: 'd3', realizedR: -1.0 }),
+      jrow({ id: 'd4', realizedR: -1.0 }),
+    ];
+
+    const a = deskCell(clean, 'single_leg_otm', 'sl');
+    const b = deskCell(dirty, 'single_leg_otm', 'sl');
+
+    // The mean is IDENTICAL. This is the assertion that makes the histogram
+    // necessary rather than merely nice: without it the two books are the same
+    // number, and one of them invalidates TRA-2202 while the other confirms it.
+    expect(a.cell!.avgR).toBe(-0.5);
+    expect(b.cell!.avgR).toBe(-0.5);
+
+    expect(a.cell!.closesBelowMinus050R).toBe(0);
+    expect(b.cell!.closesBelowMinus050R).toBe(2);
+    expect(a.cell!.minR).toBe(-0.5);
+    expect(b.cell!.minR).toBe(-1.0);
+  });
+
+  // ── Direction 2: the clean book reads CLEAN (the control the other half needs) ──
+
+  it('a clean book reads ZERO violations and minR settles it with no epsilon question', () => {
+    const rows = [
+      jrow({ id: 'e1', realizedR: -0.5 }),
+      jrow({ id: 'e2', realizedR: -0.4999 }),
+      jrow({ id: 'e3', realizedR: -0.25 }),
+      jrow({ id: 'e4', realizedR: 0.8, outcome: 'WIN', realizedPnlUsd: 160 }),
+    ];
+    const { cell } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(cell!.closesBelowMinus050R).toBe(0);
+    expect(cell!.closesBelowMinus100R).toBe(0);
+    expect(cell!.minR).toBe(-0.5);
+    // minR >= -0.50 is the whole certification in one field.
+    expect(cell!.minR!).toBeGreaterThanOrEqual(-0.5);
+  });
+
+  // ── The edges land ON the thresholds, and the comparison is STRICT ──
+
+  it('a close exactly ON -0.50R is NOT below it; -0.5000001R is', () => {
+    // TRA-2202 says "below -0.50R". A stop that fills exactly at its stop price
+    // lands on the edge, and counting it as a violation would invalidate a
+    // criterion the book actually satisfies.
+    const onEdge = deskCell([jrow({ id: 'x1', realizedR: -0.5 })], 'single_leg_otm', 'sl');
+    expect(onEdge.cell!.closesBelowMinus050R).toBe(0);
+    expect(onEdge.cell!.rHistogram.find((b) => b.label === '[-0.50,0.00)')!.count).toBe(1);
+
+    const past = deskCell([jrow({ id: 'x2', realizedR: -0.5000001 })], 'single_leg_otm', 'sl');
+    expect(past.cell!.closesBelowMinus050R).toBe(1);
+    expect(past.cell!.rHistogram.find((b) => b.label === '[-1.00,-0.50)')!.count).toBe(1);
+  });
+
+  it('a close exactly ON -1.0R is not an OVERSHOOT; -1.0000001R is (TRA-2202 s2 discriminator)', () => {
+    // The -1.0R edge is what separates "batch tick sweep latency" from "a genuine
+    // gap in a thin name". A clean full-stop close sits ON -1.0R and must not be
+    // read as a gap; anything strictly past it is the population that belongs to
+    // stop placement / spread guard, NOT to TRA-2200.
+    const onEdge = deskCell([jrow({ id: 'y1', realizedR: -1.0 })], 'single_leg_otm', 'sl');
+    expect(onEdge.cell!.closesBelowMinus100R).toBe(0);
+    expect(onEdge.cell!.closesBelowMinus050R).toBe(1); // still below -0.50R
+    expect(onEdge.cell!.rHistogram.find((b) => b.label === '[-1.00,-0.50)')!.count).toBe(1);
+
+    const past = deskCell([jrow({ id: 'y2', realizedR: -1.0000001 })], 'single_leg_otm', 'sl');
+    expect(past.cell!.closesBelowMinus100R).toBe(1);
+    expect(past.cell!.rHistogram.find((b) => b.label === '(-inf,-1.00)')!.count).toBe(1);
+  });
+
+  // ── Count, do not drop (the TRA-2269 partitionHolds pattern) ──
+
+  it('a close with NO realizedR is counted in rUnknown, never bucketed as a NON-violation', () => {
+    // The surrounding avgR folds coerce a missing R with `?? 0`. Doing that here
+    // would file an unmeasured close in [0.00,+inf) — i.e. silently as "fine" —
+    // which is exactly the fail-open a left-tail count exists to close.
+    const rows = [
+      jrow({ id: 'u1', realizedR: undefined }),
+      jrow({ id: 'u2', realizedR: -0.5 }),
+    ];
+    const { cell } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(cell!.closed).toBe(2);
+    expect(cell!.rUnknown).toBe(1);
+    expect(cell!.rHistogram.find((b) => b.label === '[0.00,+inf)')!.count).toBe(0);
+    expect(cell!.rHistogram.reduce((a, b) => a + b.count, 0)).toBe(1);
+    expect(cell!.histogramSumsToClosed).toBe(true);
+  });
+
+  it('an unlabelled exitReason folds under `unknown` rather than vanishing from the cross-tab', () => {
+    const rows = [jrow({ id: 'n1', exitReason: undefined }), jrow({ id: 'n2' })];
+    const { tab } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(tab.cells.map((c) => c.exitReason).sort()).toEqual(['sl', 'unknown']);
+    expect(tab.cellsSumToClosed).toBe(true);
+    expect(tab.residual).toBe(0);
+  });
+
+  it('cells sum to the group `closed`, and the residual is PUBLISHED not asserted away', () => {
+    const rows = [
+      jrow({ id: 's1', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 's2', structure: 'single_leg_rv', exitReason: 'time_stop' }),
+      jrow({ id: 's3', structure: 'single_leg_rv', exitReason: 'sl' }),
+      jrow({ id: 's4', outcome: 'OPEN', closeTs: undefined, realizedR: undefined }),
+    ];
+    const { tab } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(tab.closed).toBe(3); // the OPEN row is not a close
+    expect(tab.cells.reduce((a, c) => a + c.closed, 0)).toBe(3);
+    expect(tab.cellsSumToClosed).toBe(true);
+    expect(tab.residual).toBe(0);
+    expect(tab.histogramMismatchCells).toEqual([]);
+  });
+
+  // ── Scope: the cross-tab is per account class, folded off that class's own rows ──
+
+  it('fixture rows do NOT leak into the desk cell — the criterion is desk-scoped', () => {
+    const rows = [
+      jrow({ id: 'k1', account: 'admin', realizedR: -0.5 }),
+      jrow({ id: 'k2', account: 'qa_mirror_1578_38096', realizedR: -2.0 }),
+      jrow({ id: 'k3', account: undefined, realizedR: -3.0 }), // pre-TRA-1475
+    ];
+    const report = buildOptionJournalReport(rows, NOW, true);
+    const cellOf = (k: 'desk' | 'fixture' | 'unattributed') =>
+      report.summary.byAccountClass[k].byStructureExit.cells.find(
+        (c) => c.structure === 'single_leg_otm' && c.exitReason === 'sl',
+      )!;
+
+    // The fixture and unattributed violations are real rows and are published —
+    // just not against the population TRA-2202 grades.
+    expect(cellOf('desk').closed).toBe(1);
+    expect(cellOf('desk').closesBelowMinus050R).toBe(0);
+    expect(cellOf('fixture').closesBelowMinus100R).toBe(1);
+    expect(cellOf('unattributed').closesBelowMinus100R).toBe(1);
+  });
+
+  it('is emitted per account class and says so, rather than leaving the pooled fold ambiguous', () => {
+    const report = buildOptionJournalReport([jrow({ id: 'p1' })], NOW, true);
+    expect(report.summary.structureExitNote).toContain('byAccountClass.desk.byStructureExit');
+    expect(report.summary.structureExitNote).toContain('single_leg_otm');
+    expect(report.summary.byAccountClass.desk.byStructureExit.rBasis).toBe('premium');
+  });
+
+  // ── The two R bases, stated on the wire ──
+
+  it('labels the premium->gate R conversion where it is valid and NULLs it where it is not', () => {
+    // The journal's R divides by the FULL PREMIUM; the cost-aware gate's R is the
+    // stop distance = 0.25 x premium. Publishing one number unlabelled is how the
+    // phantom 1.00R cost input happened (TRA-1656 finding #5). Credit structures
+    // have no `mark*0.75` stop at all, so there is no factor to publish.
+    const rows = [
+      jrow({ id: 'g1', structure: 'single_leg_otm' }),
+      jrow({ id: 'g2', structure: 'iron_condor' }),
+    ];
+    const { tab } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(tab.cells.find((c) => c.structure === 'single_leg_otm')!.gateRPerPremiumR).toBe(4);
+    expect(tab.cells.find((c) => c.structure === 'iron_condor')!.gateRPerPremiumR).toBeNull();
+  });
+
+  // ── leftTailR: the count is auditable from the payload, not merely asserted ──
+
+  it('publishes the most-negative closes ascending, negatives only, capped', () => {
+    const rows: OptionTradeJournalRecord[] = Array.from({ length: 20 }, (_, i) =>
+      jrow({ id: `t${i}`, realizedR: -(i + 1) / 10 }),
+    ).concat([jrow({ id: 'win', realizedR: 1.5, outcome: 'WIN', realizedPnlUsd: 300 })]);
+    const { cell } = deskCell(rows, 'single_leg_otm', 'sl');
+    expect(cell!.leftTailR.length).toBe(12);
+    expect(cell!.leftTailR[0]).toBe(-2.0);
+    expect([...cell!.leftTailR].sort((a, b) => a - b)).toEqual(cell!.leftTailR);
+    expect(cell!.leftTailR.every((v) => v < 0)).toBe(true);
+    // The cap is on the SAMPLE, never on the COUNT — the count stays exact.
+    expect(cell!.closesBelowMinus050R).toBe(15); // -0.6 .. -2.0
+  });
+
+  it('a label containing the key separator cannot collapse two cells into one', () => {
+    // The cell key carries its two parts structurally rather than being re-split
+    // out of a joined string. A relabelled cell is the one error this whole
+    // cross-tab exists to make impossible.
+    const rows = [
+      jrow({ id: 'z1', structure: 'single_leg_otm', exitReason: 'sl force' }),
+      jrow({ id: 'z2', structure: 'single_leg_otm sl', exitReason: 'force' }),
+    ];
+    const { tab } = deskCell(rows, 'single_leg_otm', 'sl force');
+    expect(tab.cells.length).toBe(2);
+    expect(tab.cells.map((c) => `${c.structure}|${c.exitReason}`).sort()).toEqual([
+      'single_leg_otm sl|force',
+      'single_leg_otm|sl force',
+    ]);
+  });
+
+  it('reconciles with the marginals it sits beside — a cell can never exceed either', () => {
+    const rows = [
+      jrow({ id: 'r1', structure: 'single_leg_otm', exitReason: 'sl' }),
+      jrow({ id: 'r2', structure: 'single_leg_otm', exitReason: 'time_stop' }),
+      jrow({ id: 'r3', structure: 'single_leg_rv', exitReason: 'sl' }),
+    ];
+    const desk = buildOptionJournalReport(rows, NOW, true).summary.byAccountClass.desk;
+    for (const c of desk.byStructureExit.cells) {
+      const s = desk.byStructure.find((x) => x.structure === c.structure)!;
+      const e = desk.byExitReason.find((x) => x.exitReason === c.exitReason)!;
+      expect(c.closed).toBeLessThanOrEqual(s.closed);
+      expect(c.closed).toBeLessThanOrEqual(e.closed);
+    }
+    // And the cells partition each marginal exactly.
+    for (const s of desk.byStructure) {
+      const sum = desk.byStructureExit.cells
+        .filter((c) => c.structure === s.structure)
+        .reduce((a, c) => a + c.closed, 0);
+      expect(sum).toBe(s.closed);
+    }
+  });
+});

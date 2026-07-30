@@ -105,6 +105,7 @@ import {
   isSpreadCeilingEnforceEnabled,
   OPTION_SPREAD_CEILING_ENFORCE_FLAG,
   classifySpreadCeilingAccount, // TRA-2355 — the SINGLE partition rule, shared with the gate ledger
+  STOP_DISTANCE_FRACTION_OF_MARK, // TRA-2590 — premium R → gate R is 1/this
 } from '../option-spread-cost.js';
 import type {
   SpreadCostSample,
@@ -147,6 +148,7 @@ import {
   summarizeOptionTradeJournal,
   isOptionTradeJournalEnabled,
   getOptionTradeJournalIntegrity,
+  GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
   type OptionTradeJournalRecord,
@@ -976,13 +978,24 @@ export interface OptionJournalReport {
    * {@link partitionByAccountClass}.
    */
   summary: OptionTradeJournalSummary & {
+    /**
+     * TRA-2590 — each class now also carries `byStructureExit`, the
+     * (structure × exitReason) cross-tab with a left-tail R histogram whose edges
+     * sit exactly on −1.0R and −0.50R. `byStructure` and `byExitReason` are
+     * MARGINALS and cannot answer a cell-scoped criterion; `avgR` is a mean and
+     * cannot answer a tail COUNT. See {@link OptionJournalStructureExitCrossTab}.
+     */
     byAccountClass: {
-      fixture: OptionTradeJournalSummary;
-      desk: OptionTradeJournalSummary;
-      unattributed: OptionTradeJournalSummary;
+      fixture: OptionTradeJournalSummary & { byStructureExit: OptionJournalStructureExitCrossTab };
+      desk: OptionTradeJournalSummary & { byStructureExit: OptionJournalStructureExitCrossTab };
+      unattributed: OptionTradeJournalSummary & {
+        byStructureExit: OptionJournalStructureExitCrossTab;
+      };
     };
     accountClassCountsSumToRows: boolean;
     accountClassNote: string;
+    /** TRA-2590 — why the cross-tab is per-class and not on the pooled fold. */
+    structureExitNote: string;
   };
   /**
    * TRA-2193 — row counts per account class, hoisted so a consumer reading
@@ -1178,6 +1191,249 @@ function partitionRowsByAccountClass(rows: OptionTradeJournalRecord[]): {
   return { fixture, desk, unattributed };
 }
 
+// ── TRA-2590 — the (structure × exitReason) cross-tab with a left-tail R histogram ──
+//
+// WHY A MARGINAL IS NOT ENOUGH. `byStructure` and `byExitReason` are SEPARATE
+// marginals. TRA-2202's invalidation criterion is about a CELL — "`single_leg_otm`
+// `sl` exits show zero closes below −0.50R across ≥117 stop exits" — and there is
+// no way back to a cell from two marginals. Multiplying them
+// (`578 × 1101/2411 ≈ 264` on the 2026-07-30 pool) is an ESTIMATE under an
+// independence assumption nobody has tested, and an estimate cannot carry a
+// certification. The number was not small, it was UNOBTAINABLE.
+//
+// WHY A MEAN IS NOT ENOUGH. "Zero closes below −0.50R" is a COUNT IN THE LEFT
+// TAIL, and `avgR` cannot answer it at any sample size. The desk `sl` cell read
+// `avgR = −0.4991` over n=5 on 2026-07-30 — sitting essentially exactly on the
+// threshold, which is precisely the region where the mean is least informative:
+// it is equally consistent with "every close at −0.50R" (zero violations) and
+// with "half at 0R, half at −1.0R" (many). So the histogram, not another mean.
+//
+// WHY THE EDGES SIT ON THE THRESHOLDS. Bucket boundaries land EXACTLY on −0.50R
+// and −1.0R, the two constants this criterion and TRA-2202 §2's confound test are
+// written against, so the counts are exact and need no interpolation — the same
+// design that made TRA-2269's `atOrAbove30s` bar readable. `−1.0R` is the
+// discriminator TRA-2202 §2 could not run: with the checkExits hoist certified at
+// a ≤60s RTH worst case (TRA-2213 leg 1), a post-arm overshoot below −1.0R that
+// PERSISTS is a GAP in a thin name, not exit latency — a stop-placement /
+// spread-guard problem, and a DIFFERENT fix from TRA-2200.
+//
+// ⚠ ONE BASIS, STATED ON THE WIRE. These edges are in the journal's own
+// PREMIUM R (`realizedPnlUsd / atRiskUsd`, atRisk = full premium). The cost-aware
+// gate's R is the STOP DISTANCE = 0.25 × premium, so the two differ by 4×
+// (TRA-1656 finding #5). At premium basis −0.50R is TWICE the modeled stop
+// distance and −1.0R is a total premium wipeout; read on the gate's basis the
+// same edges would mean "half a stop", which is a nonsense invalidation bar. The
+// container states `rBasis` and each cell carries `gateRPerPremiumR` (null where
+// the structure has no valid conversion — credit spreads and condors do not use
+// the `mark·0.75` stop), so nobody can compare the wrong pair.
+
+/** TRA-2590 — one bucket of the left-tail R histogram. Half-open `[fromR, toR)`. */
+export interface OptionJournalRBucket {
+  /** Printable interval, e.g. `[-1.00,-0.50)`. The label IS the edge convention. */
+  label: string;
+  /** INCLUSIVE lower edge in premium R; `null` = unbounded below. */
+  fromR: number | null;
+  /** EXCLUSIVE upper edge in premium R; `null` = unbounded above. */
+  toR: number | null;
+  count: number;
+}
+
+/**
+ * TRA-2590 — one (structure × exitReason) cell over RESOLVED rows.
+ *
+ * `closesBelowMinus050R` is the TRA-2202 criterion's own number: closes with
+ * `realizedR < −0.50` (STRICT — a close landing exactly ON −0.50R is compliant,
+ * because the criterion says *below*). `closesBelowMinus100R` is likewise strict
+ * and is the §2 gap-vs-latency discriminator.
+ *
+ * `minR` and `leftTailR` exist so the count is AUDITABLE rather than asserted.
+ * A stop that fills exactly at its stop price lands on −0.50R to within IEEE
+ * rounding, so a reader who cares whether a "violation" is a real overshoot or a
+ * float hair can settle it FROM THIS PAYLOAD instead of asking for another
+ * deploy. When `minR >= −0.50` the criterion is satisfied with no epsilon
+ * question at all — that is the cheapest certification handle here, and it is why
+ * `minR` is published even though it is derivable from `leftTailR`.
+ *
+ * `rUnknown` counts closes carrying NO finite `realizedR`. They are COUNTED, NOT
+ * DROPPED (the TRA-2269 `partitionHolds` pattern) and they are deliberately NOT
+ * coerced to 0 — the surrounding `avgR` folds do `?? 0`, which would silently
+ * file an unmeasured close in the `[0,+inf)` bucket, i.e. as a NON-violation. A
+ * left-tail count that quietly rounds unknowns toward "fine" is the exact
+ * fail-open this cell exists to close.
+ */
+export interface OptionJournalStructureExitCell {
+  structure: string;
+  exitReason: string;
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  scratchRate: number | null;
+  winRate: number | null;
+  avgR: number | null;
+  realizedPnlUsd: number;
+  /** Buckets in ascending R order; edges exactly on −1.0 and −0.50. */
+  rHistogram: OptionJournalRBucket[];
+  /** Closes with `realizedR < −0.50` (strict). The TRA-2202 criterion's count. */
+  closesBelowMinus050R: number;
+  /** Closes with `realizedR < −1.0` (strict). The TRA-2202 §2 discriminator. */
+  closesBelowMinus100R: number;
+  /** Closes with no finite `realizedR` — counted, never dropped, never zeroed. */
+  rUnknown: number;
+  /** `Σ rHistogram.count + rUnknown === closed`. False ⇒ the fold lost a row. */
+  histogramSumsToClosed: boolean;
+  /** Most negative finite `realizedR` in the cell; null when none measurable. */
+  minR: number | null;
+  /** Up to 12 most-negative finite `realizedR` values (< 0), ascending. */
+  leftTailR: number[];
+  /** premium→gate R factor (4) where valid; `null` where no conversion exists. */
+  gateRPerPremiumR: number | null;
+}
+
+/** TRA-2590 — the cross-tab plus its own residual check. */
+export interface OptionJournalStructureExitCrossTab {
+  /** Non-empty cells, descending by closed count then |P&L|. */
+  cells: OptionJournalStructureExitCell[];
+  /** The group's RESOLVED row count, restated so the check is self-contained. */
+  closed: number;
+  cellsSumToClosed: boolean;
+  /** `closed − Σ cells.closed`. Published, not asserted away: a nonzero residual
+   *  tells a reader a FILTER dropped rows rather than leaving them to guess
+   *  whether they are looking at a filter or a bug. */
+  residual: number;
+  /** Every cell whose `histogramSumsToClosed` is false, by `structure|exitReason`. */
+  histogramMismatchCells: string[];
+  rBasis: 'premium';
+  note: string;
+}
+
+/** Bucket edges in premium R. `null` = unbounded. Ascending, contiguous, total. */
+const R_TAIL_BUCKET_EDGES: ReadonlyArray<{ label: string; fromR: number | null; toR: number | null }> = [
+  { label: '(-inf,-1.00)', fromR: null, toR: -1.0 },
+  { label: '[-1.00,-0.50)', fromR: -1.0, toR: -0.5 },
+  { label: '[-0.50,0.00)', fromR: -0.5, toR: 0 },
+  { label: '[0.00,+inf)', fromR: 0, toR: null },
+];
+
+const LEFT_TAIL_SAMPLE_CAP = 12;
+
+/**
+ * TRA-2590 — fold RESOLVED rows into the (structure × exitReason) cross-tab.
+ *
+ * Keyed the same way the marginals are, so the cells reconcile to them by
+ * construction: `structure` verbatim, `exitReason ?? 'unknown'` (an unlabelled
+ * close folds under `unknown` rather than being dropped — same rule
+ * `byExitReason` already uses, which is what makes the residual meaningful).
+ */
+function crossTabStructureExit(
+  rows: OptionTradeJournalRecord[],
+): OptionJournalStructureExitCrossTab {
+  const closedRows = rows.filter((r) => r.outcome !== 'OPEN');
+  // The two key parts are carried BESIDE the rows, never parsed back out of a
+  // joined string. A label containing the separator would otherwise re-split into
+  // the wrong pair and silently RELABEL a cell — and a mislabelled cell is the one
+  // error this whole cross-tab exists to make impossible.
+  const byCell = new Map<
+    string,
+    { structure: string; exitReason: string; rows: OptionTradeJournalRecord[] }
+  >();
+  for (const r of closedRows) {
+    const structure = r.structure;
+    const exitReason = r.exitReason ?? 'unknown';
+    const key = JSON.stringify([structure, exitReason]);
+    const cell = byCell.get(key) ?? { structure, exitReason, rows: [] };
+    cell.rows.push(r);
+    byCell.set(key, cell);
+  }
+
+  const cells: OptionJournalStructureExitCell[] = [...byCell.values()]
+    .map(({ structure, exitReason, rows: list }) => {
+      const finiteR = list
+        .map((r) => r.realizedR)
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+      const rUnknown = list.length - finiteR.length;
+      const rHistogram: OptionJournalRBucket[] = R_TAIL_BUCKET_EDGES.map((b) => ({
+        label: b.label,
+        fromR: b.fromR,
+        toR: b.toR,
+        count: finiteR.filter((v) => (b.fromR === null || v >= b.fromR) && (b.toR === null || v < b.toR)).length,
+      }));
+      const bucketed = rHistogram.reduce((a, b) => a + b.count, 0);
+      const ascending = [...finiteR].sort((a, b) => a - b);
+      return {
+        structure,
+        exitReason,
+        ...rollupResolvedForCell(list),
+        rHistogram,
+        // Derived from the SAME finite set the buckets are, so the headline
+        // counts and the histogram can never disagree.
+        closesBelowMinus050R: finiteR.filter((v) => v < -0.5).length,
+        closesBelowMinus100R: finiteR.filter((v) => v < -1.0).length,
+        rUnknown,
+        histogramSumsToClosed: bucketed + rUnknown === list.length,
+        minR: ascending.length > 0 ? (ascending[0] as number) : null,
+        leftTailR: ascending.filter((v) => v < 0).slice(0, LEFT_TAIL_SAMPLE_CAP),
+        gateRPerPremiumR: GATE_R_BASIS_STRUCTURES.has(structure)
+          ? 1 / STOP_DISTANCE_FRACTION_OF_MARK
+          : null,
+      };
+    })
+    .sort((a, b) => b.closed - a.closed || Math.abs(b.realizedPnlUsd) - Math.abs(a.realizedPnlUsd));
+
+  const summed = cells.reduce((a, c) => a + c.closed, 0);
+  return {
+    cells,
+    closed: closedRows.length,
+    cellsSumToClosed: summed === closedRows.length,
+    residual: closedRows.length - summed,
+    histogramMismatchCells: cells
+      .filter((c) => !c.histogramSumsToClosed)
+      .map((c) => `${c.structure}|${c.exitReason}`),
+    rBasis: 'premium',
+    note:
+      'Cells are (structure × exitReason) over RESOLVED rows. R is PREMIUM R '
+      + '(realizedPnlUsd / atRiskUsd, atRisk = full premium) — the cost-aware gate\'s R is the '
+      + 'STOP DISTANCE = 0.25 × premium, so gateR = 4 × the numbers here wherever '
+      + 'gateRPerPremiumR is non-null. Histogram edges sit EXACTLY on -1.00R and -0.50R; '
+      + 'closesBelowMinus050R / closesBelowMinus100R are STRICT (< edge), so a close landing ON '
+      + '-0.50R is NOT a violation of TRA-2202\'s "zero closes below -0.50R". minR >= -0.50 '
+      + 'settles the criterion for this cell with no float-epsilon question at all.',
+  };
+}
+
+/** TRA-2590 — the WIN/LOSS/SCRATCH/avgR/P&L columns for one cross-tab cell.
+ *  Deliberately mirrors `rollupResolved` in option-trade-journal.ts rather than
+ *  re-deriving them, so a cell and its marginals cannot drift on how a scratch
+ *  rate or an avg-R is computed. `avgR` keeps the surrounding folds' `?? 0`
+ *  treatment of a missing R **on purpose** — this column has to stay comparable
+ *  to `byExitReason.avgR`; the histogram is where unknowns are handled honestly,
+ *  via `rUnknown`. */
+function rollupResolvedForCell(resolved: OptionTradeJournalRecord[]): {
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  scratchRate: number | null;
+  winRate: number | null;
+  avgR: number | null;
+  realizedPnlUsd: number;
+} {
+  const c = resolved.length;
+  const win = resolved.filter((r) => r.outcome === 'WIN').length;
+  const loss = resolved.filter((r) => r.outcome === 'LOSS').length;
+  const scratch = resolved.filter((r) => r.outcome === 'SCRATCH').length;
+  return {
+    closed: c,
+    win,
+    loss,
+    scratch,
+    scratchRate: c > 0 ? scratch / c : null,
+    winRate: c > 0 ? win / c : null,
+    avgR: c > 0 ? resolved.reduce((a, r) => a + (r.realizedR ?? 0), 0) / c : null,
+    realizedPnlUsd: resolved.reduce((a, r) => a + (r.realizedPnlUsd ?? 0), 0),
+  };
+}
+
 /** TRA-2193 — top-level row counts per account class, plus the sum check. */
 function accountClassRowCounts(rows: OptionTradeJournalRecord[]): {
   fixtureRowCount: number;
@@ -1195,9 +1451,15 @@ function accountClassRowCounts(rows: OptionTradeJournalRecord[]): {
 /** TRA-2193 — the same fold, run separately over each account class. */
 function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
   byAccountClass: {
-    fixture: ReturnType<typeof summarizeOptionTradeJournal>;
-    desk: ReturnType<typeof summarizeOptionTradeJournal>;
-    unattributed: ReturnType<typeof summarizeOptionTradeJournal>;
+    fixture: ReturnType<typeof summarizeOptionTradeJournal> & {
+      byStructureExit: OptionJournalStructureExitCrossTab;
+    };
+    desk: ReturnType<typeof summarizeOptionTradeJournal> & {
+      byStructureExit: OptionJournalStructureExitCrossTab;
+    };
+    unattributed: ReturnType<typeof summarizeOptionTradeJournal> & {
+      byStructureExit: OptionJournalStructureExitCrossTab;
+    };
   };
   /**
    * The buckets must account for every row. Overshoot means a row landed in two
@@ -1206,13 +1468,30 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
    */
   accountClassCountsSumToRows: boolean;
   accountClassNote: string;
+  /**
+   * TRA-2590 — states on the wire that the (structure × exitReason) cross-tab is
+   * emitted PER ACCOUNT CLASS and deliberately NOT on the pooled `summary`. That
+   * is a scoping decision, not an omission: the pooled fold is the one this
+   * route's own `accountClassNote` says never to grade, and a fourth copy over
+   * the largest population would add the most bytes for the least usable number.
+   * Said out loud so a reader can tell a bounded emission from a missing field.
+   */
+  structureExitNote: string;
 } {
   const p = partitionRowsByAccountClass(rows);
   return {
     byAccountClass: {
-      fixture: summarizeOptionTradeJournal(p.fixture),
-      desk: summarizeOptionTradeJournal(p.desk),
-      unattributed: summarizeOptionTradeJournal(p.unattributed),
+      // TRA-2590 — the cross-tab is folded PER CLASS off the same row list its
+      // marginals are, so `byAccountClass.desk.byStructureExit` is scoped to the
+      // population the route's own note says to grade. Folding it once over the
+      // pool and slicing later is what produced the marginals problem in the
+      // first place.
+      fixture: { ...summarizeOptionTradeJournal(p.fixture), byStructureExit: crossTabStructureExit(p.fixture) },
+      desk: { ...summarizeOptionTradeJournal(p.desk), byStructureExit: crossTabStructureExit(p.desk) },
+      unattributed: {
+        ...summarizeOptionTradeJournal(p.unattributed),
+        byStructureExit: crossTabStructureExit(p.unattributed),
+      },
     },
     accountClassCountsSumToRows:
       p.fixture.length + p.desk.length + p.unattributed.length === rows.length,
@@ -1223,6 +1502,12 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
       + 'pooled realized $ and avgR are inflated (2026-07-22: pooled +$4,919.50/+2.7129R '
       + 'vs desk +$119.50/+0.1079R). `unattributed` = rows written before TRA-1475 added '
       + '`account`; it is NOT desk.',
+    structureExitNote:
+      'byStructureExit (the structure × exitReason cross-tab + left-tail R histogram, TRA-2590) '
+      + 'is emitted under byAccountClass.{fixture,desk,unattributed} and NOT on the pooled '
+      + 'summary — by design, because the pooled fold is the one accountClassNote says not to '
+      + 'grade. For TRA-2202 read byAccountClass.desk.byStructureExit and find the cell with '
+      + 'structure=single_leg_otm, exitReason=sl.',
   };
 }
 
