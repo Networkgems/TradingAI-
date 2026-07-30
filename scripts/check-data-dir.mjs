@@ -34,13 +34,19 @@
 // control in `--selftest`. (The ticket named four; the fifth, `--untracked`, was found
 // by CONTROL 2 reading CLEAN against a real planted file.)
 //
-//   1. `-a` / `--text` IS MANDATORY. `external-intel.ts` contains a NUL byte, so git
-//      classifies it as binary: plain `git grep -n` prints `Binary file ... matches`
-//      with NO line numbers, and `rg` skips it by default. A line-oriented parse
-//      therefore drops 2 of the 38 SILENTLY. (The parent ticket's own prescribed
+//   1. `-a` / `--text` IS MANDATORY. A source file containing a NUL byte is classified
+//      by git as binary: plain `git grep -n` prints `Binary file ... matches` with NO
+//      line numbers, and `rg` skips it by default. A line-oriented parse therefore
+//      drops those hits SILENTLY. (The parent ticket's own prescribed
 //      `rg 'process\.env(\.|\[.)DATA_DIR'` undercounts for exactly this reason.) This
 //      script passes `-a`, asserts the FILE SET as well as the line list, and exits
 //      non-zero if any `Binary file` line survives into the parse.
+//
+//      The carrier used to be real: `external-intel.ts` held a NUL byte AND 2 of the
+//      38 copies, and CONTROL 4 asserted the undercount against it. TRA-2604 converted
+//      that file and the control went red the same commit — a control anchored to the
+//      defect it grades dies the moment the defect is fixed. CONTROL 4 now PLANTS its
+//      own NUL-byte carrier, so it is independent of what the tree happens to contain.
 //
 //   2. FROZEN BASELINE, ONE-WAY RATCHET. A new copy fails. A REMOVED copy also fails,
 //      until the baseline is edited down by hand. The baseline is NEVER regenerated
@@ -105,12 +111,13 @@ const R = {
 /**
  * FROZEN BASELINE — ratcheting to zero under TRA-2428's migration child, TRA-2604.
  *
- * Now: 34 hits / 17 files = 11 unguarded copies + 6 comment-only + 17 report-reads.
+ * Now: 27 hits / 12 files = 4 unguarded copies + 6 comment-only + 17 report-reads.
  * Was: 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads
  *      (measured at bb7cdc4 + the TRA-2603 conversion).
  *
  * TRA-2604 batch 1 converted the 15 append-only shadow/signal ledgers (38 -> 23);
- * batch 2 the 12 JSON snapshot stores (23 -> 11).
+ * batch 2 the 12 JSON snapshot stores (23 -> 11); batch 3 the 7 journal/pipeline
+ * sites in 6 files, including both copies in the NUL-byte file (11 -> 4).
  * The comment-only and report-read counts are INVARIANT under that migration — only
  * `copies` moves. If one of those two ever moves, something other than a conversion
  * happened and the diff deserves a second look.
@@ -123,13 +130,6 @@ const R = {
  */
 const BASELINE = {
   // ── Files carrying ONLY unguarded copies (the TRA-2428 migration backlog) ──
-  'analyst-agent.ts': { copies: 1 },
-  // The NUL-byte file. Two copies, and the reason `-a` is mandatory.
-  'external-intel.ts': { copies: 2 },
-  'hypothesis-pipeline.ts': { copies: 1 },
-  'market-review-enrichment.ts': { copies: 1 },
-  'option-trade-journal.ts': { copies: 1 },
-  'options-forward-test.ts': { copies: 1 },
   'user-context.ts': { copies: 1 },
   'users.ts': { copies: 1 },
   'watchlist-store.ts': { copies: 1 },
@@ -445,9 +445,17 @@ function baselineRecords() {
 const PLANT_REL = '__tra2603-planted-copy.ts';
 const PLANT_ABS = join(REPO_ROOT, SCOPE, PLANT_REL);
 
+// CONTROL 4's carrier. It used to be `external-intel.ts`, which happened to hold a NUL
+// byte AND two copies of the literal — so the control was only ever alive while that
+// file stayed unconverted. TRA-2604 converted it, and the control went red the moment
+// it did: a control anchored to the defect it is grading dies when the defect is fixed.
+// This plants its own NUL byte instead, so the control is independent of the tree.
+const NUL_PLANT_REL = '__tra2604-nul-carrier.ts';
+const NUL_PLANT_ABS = join(REPO_ROOT, SCOPE, NUL_PLANT_REL);
+
 async function selftest() {
   let pass = 0;
-  const total = 9; // 8 numbered controls + the 2b cleanup assertion
+  const total = 10; // 8 numbered controls + the 2b and 4b cleanup assertions
   const seen = new Set();
   const ok = (name) => {
     console.log(`ok    ${name}`);
@@ -514,17 +522,49 @@ async function selftest() {
   }
 
   // ── CONTROL 4 — `-a` is load-bearing: prove the non-`-a` run undercounts. ──
-  const noText = sweep({ textFlag: false });
-  const aHits = (live.records ?? []).filter((r) => r.file === 'external-intel.ts').length;
-  const bHits = (noText.records ?? []).filter((r) => r.file === 'external-intel.ts').length;
-  if (aHits === 2 && bHits === 0 && noText.binaryFiles.includes('external-intel.ts')) {
-    ok(`CONTROL 4 -a is load-bearing (external-intel.ts: ${aHits} lines with -a, ${bHits} without)`);
+  // Plants its own NUL byte (see NUL_PLANT_REL). A copy hidden inside a
+  // binary-classified file must be VISIBLE with `-a` and INVISIBLE without it — if
+  // both runs agree, `-a` has stopped mattering and hazard (1) is unguarded.
+  if (existsSync(NUL_PLANT_ABS)) {
+    fail('CONTROL 4 -a is load-bearing', `${NUL_PLANT_REL} already exists; refusing to clobber`);
   } else {
-    fail(
-      'CONTROL 4 -a is load-bearing',
-      `with -a ${aHits} lines, without ${bHits}, binaryFiles=[${noText.binaryFiles.join(',')}] ` +
-        '(if the NUL byte was removed from external-intel.ts, this control needs a new carrier)',
-    );
+    try {
+      writeFileSync(
+        NUL_PLANT_ABS,
+        '// TRA-2604 selftest scratch file. If this is committed, the guard control leaked.\n' +
+          // The `\u0000` ESCAPE is mandatory here, never a raw 0x00 byte.
+          // A literal NUL would make git classify THIS file as binary, and then the
+          // hand-edited baseline below stops rendering in `git diff` -- the one
+          // property the whole ratchet rests on. (Binary classification also turns
+          // off CRLF normalisation, so the file additionally reads as fully
+          // rewritten.) As an escape the source stays ASCII and the WRITTEN file
+          // still receives a real NUL, which is what git must see to call it binary.
+          `const sep = '\u0000'; // a real NUL byte in the planted file\n` +
+          "const root = process.env.DATA_DIR ?? join(__dirname, '..', 'data');\n" +
+          'export const planted = [sep, root];\n',
+        'utf8',
+      );
+      const withA = sweep();
+      const noText = sweep({ textFlag: false });
+      const aHits = (withA.records ?? []).filter((r) => r.file === NUL_PLANT_REL).length;
+      const bHits = (noText.records ?? []).filter((r) => r.file === NUL_PLANT_REL).length;
+      if (aHits === 1 && bHits === 0 && noText.binaryFiles.includes(NUL_PLANT_REL)) {
+        ok(`CONTROL 4 -a is load-bearing (planted NUL carrier: ${aHits} line with -a, ${bHits} without)`);
+      } else {
+        fail(
+          'CONTROL 4 -a is load-bearing',
+          `with -a ${aHits} lines, without ${bHits}, binaryFiles=[${noText.binaryFiles.join(',')}] ` +
+            '(expected 1/0 and the carrier listed as binary)',
+        );
+      }
+    } finally {
+      rmSync(NUL_PLANT_ABS, { force: true });
+    }
+  }
+  if (existsSync(NUL_PLANT_ABS)) {
+    fail('CONTROL 4b NUL carrier is cleaned up', `${NUL_PLANT_REL} survived — DELETE IT BY HAND`);
+  } else {
+    ok('CONTROL 4b NUL carrier is cleaned up');
   }
 
   // ── CONTROL 5 — a NEW copy inside an ALREADY-EXEMPTED file must FAIL. ──

@@ -28,17 +28,15 @@
 import { existsSync } from 'fs';
 import { readFile, appendFile, mkdir } from 'fs/promises';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   DEFAULT_PROMOTION_THRESHOLDS,
   type BacktestGateMetrics,
   type PromotionThresholds,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'hypothesis-pipeline' });
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 // ── 1. Hypothesis schema ─────────────────────────────────────────────────────
 
 /** What a hypothesis proposes to change. One queue, many producers. */
@@ -337,7 +335,7 @@ type QueueLine =
     };
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'hypothesis-queue.jsonl');
 }
 

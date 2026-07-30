@@ -1,10 +1,10 @@
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
 import { STOP_DISTANCE_FRACTION_OF_MARK } from './option-spread-cost.js';
 import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-throttle-sizing.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-990 (Learning A) — the option-trade JOURNAL: a durable, observe-only
 // setup -> outcome ledger for option positions (calls/puts, spreads and
@@ -33,8 +33,6 @@ import type { RiskThrottleSizingPath, RiskThrottleSizingScope } from './risk-thr
 // an explicit opt-in (mirrors `ENABLE_OPTION_SHADOW_SELECTOR`).
 
 const log = logger.child({ module: 'option-trade-journal' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Kill switch. The journal appends nothing unless this is truthy, so capture is
@@ -340,7 +338,7 @@ type AmendEntrySlippageLine = { kind: 'amend_entry_slippage'; id: string; entryS
 type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine;
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'option-trade-journal.jsonl');
 }
 

@@ -23,14 +23,12 @@
 
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import type { AnalystPlan } from './analyst-agent.js';
 import type { SentimentSnapshotFile } from './sentiment-snapshot-recorder.js';
 import type { NameLean } from './news-catalyst-lean.js';
 import { renderLeanMarkdown } from './news-catalyst-lean.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { resolveDataDir } from './data-dir.js';
 
 /** Format a price level for the card, or `—` when it is missing/non-finite. */
 function fmtLevel(v: number | null | undefined): string {
@@ -180,7 +178,7 @@ export function renderCallPutLeanSection(
 
 /** Root the sentiment-snapshot recorder writes into — mirrors `index.ts`. */
 function sentimentOutDir(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return process.env['SENTIMENT_OUT_DIR'] ?? join(root, 'sentiment-snapshots');
 }
 

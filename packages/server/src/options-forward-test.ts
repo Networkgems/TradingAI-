@@ -1,6 +1,4 @@
 import { join } from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import { loadChainDays, estimateSpotFromChain, type ChainDay } from '@trading-app/backtest';
 import type { OptionChainRow } from '@trading-app/engine';
 import { logger } from './observability/index.js';
@@ -46,6 +44,7 @@ import {
 // counterfactual this probe reports is measured against the exact bar the emission
 // gate enforces. See `CellCreditWidthFloor`.
 import { DEFAULT_CREDIT_WIDTH_FLOOR, FLOORED_CREDIT_STRUCTURES } from '@trading-app/agents';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-678 (F1) + TRA-1991 — the cost model + cost-efficiency threshold live in a
 // leaf module (`options-cost-model.ts`) to keep them a single source of truth
@@ -75,12 +74,11 @@ export type { CostModel };
 
 const log = logger.child({ module: 'options-forward-test' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONTRACT = 100;
 
 /** Default chain-recorder output root — mirrors `index.ts` CHAIN_RECORD_OUT_DIR. */
 export function defaultChainsDir(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return process.env['CHAINS_OUT_DIR'] ?? join(root, 'option-chains');
 }
 

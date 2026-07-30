@@ -37,6 +37,7 @@ import {
   type PipelineDeps,
 } from './hypothesis-pipeline.js';
 import type { OptionTradeJournalRecord } from './option-trade-journal.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'analyst-agent' });
 
@@ -595,8 +596,16 @@ let dataDirOverride: string | null = null;
 export function setAnalystDataDirForTests(dir: string | null): void {
   dataDirOverride = dir;
 }
+// TRA-2604 — this copy did not merely mis-handle a blank DATA_DIR, it could not run
+// its own fallback at all. `__dirname` was never declared in this module, and this
+// package is ESM (`"type": "module"`), so `join(__dirname, ...)` throws
+// `ReferenceError: __dirname is not defined`. It typechecked because @types/node
+// declares `__dirname` globally for CJS consumers. The branch is only reached when
+// BOTH the test override is null AND DATA_DIR is nullish, which is why no suite and
+// no deploy ever hit it — bqb1 always has DATA_DIR set. `resolveDataDir()` supplies a
+// real anchor, so the fallback now works instead of throwing.
 function dataDir(): string {
-  return dataDirOverride ?? process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  return dataDirOverride ?? resolveDataDir();
 }
 function planPath(date: string): string {
   return join(dataDir(), `analyst-plan-${date}.json`);
