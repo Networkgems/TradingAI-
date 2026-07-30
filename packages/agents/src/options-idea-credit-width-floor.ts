@@ -371,22 +371,27 @@ function parseBoundedFloat(raw: string | undefined, min: number, max: number): n
 }
 
 /**
- * Resolve the floor config from env, field-by-field falling back to
- * {@link DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG}. Returns `null` when
- * {@link CREDIT_WIDTH_FLOOR_ENABLE_VAR} is not truthy — the caller then leaves the
- * prompt, the guardrail and the emitted idea shape untouched, so a disabled floor
- * is byte-for-byte the old behaviour.
+ * TRA-2680 — resolve the floor config from env **ignoring the enable flag**: the
+ * config the next scored slate WOULD be built from, whether or not the floor is
+ * currently armed. Always returns a config; never null.
+ *
+ * WHY THIS EXISTS SEPARATELY. TRA-2217 made the floor DERIVED (it falls back to the
+ * resolved band bottom, below), so the live floor is now a function of
+ * `OPTIONS_IDEA_SHORT_DELTA_MIN`. Neither that var nor `OPTIONS_IDEA_CREDIT_WIDTH_MIN`
+ * is declared in the Render blueprint, so `/api/health/env-drift` — which compares
+ * DECLARED keys only — cannot rule out a hand-set override moving the band and
+ * carrying the floor with it. Before this split the resolved config was observable
+ * ONLY through a scored slate, i.e. only once the flag was on and had already gated
+ * ideas under whatever value was live. That made the pre-arm audit impossible by
+ * construction. This is the flag-independent read the probe publishes.
  *
  * A delta band whose resolved min exceeds its max is discarded wholesale in favour
  * of the reference band: a nonsensical band would otherwise be stated to the model
  * as a contract it cannot satisfy.
  */
-export function resolveCreditWidthFloorConfig(
+export function resolveCreditWidthFloorConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
-): CreditWidthFloorConfig | null {
-  const flag = (env[CREDIT_WIDTH_FLOOR_ENABLE_VAR] ?? '').trim().toLowerCase();
-  const enabled = flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on';
-  if (!enabled) return null;
+): CreditWidthFloorConfig {
   const shortDeltaMin =
     parseBoundedFloat(env[CREDIT_WIDTH_FLOOR_DELTA_MIN_VAR], 0, 1) ?? DEFAULT_SHORT_DELTA_MIN;
   const shortDeltaMax =
@@ -403,4 +408,25 @@ export function resolveCreditWidthFloorConfig(
     shortDeltaMin: resolvedShortDeltaMin,
     shortDeltaMax: bandOk ? shortDeltaMax : DEFAULT_SHORT_DELTA_MAX,
   };
+}
+
+/**
+ * Resolve the floor config for the EMISSION PATH. Returns `null` when
+ * {@link CREDIT_WIDTH_FLOOR_ENABLE_VAR} is not truthy — the caller then leaves the
+ * prompt, the guardrail and the emitted idea shape untouched, so a disabled floor
+ * is byte-for-byte the old behaviour.
+ *
+ * Flag ON is NOT a shadow/recorder mode: it changes the system prompt, the batch
+ * cache key, and it DROPS below-floor credit verticals from the surfaced slate
+ * (`options-research.ts`). Anything that only wants to READ the configured floor
+ * must call {@link resolveCreditWidthFloorConfigFromEnv} instead — reading must
+ * never require arming.
+ */
+export function resolveCreditWidthFloorConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): CreditWidthFloorConfig | null {
+  const flag = (env[CREDIT_WIDTH_FLOOR_ENABLE_VAR] ?? '').trim().toLowerCase();
+  const enabled = flag === '1' || flag === 'true' || flag === 'yes' || flag === 'on';
+  if (!enabled) return null;
+  return resolveCreditWidthFloorConfigFromEnv(env);
 }

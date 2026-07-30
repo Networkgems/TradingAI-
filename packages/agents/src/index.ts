@@ -124,6 +124,7 @@ export {
 // enforced bar and the graded bar can never drift apart.
 export {
   resolveCreditWidthFloorConfig,
+  resolveCreditWidthFloorConfigFromEnv,
   evaluateCreditWidthFloor,
   evaluateIdeasCreditWidthFloor,
   creditWidthRatioOf,

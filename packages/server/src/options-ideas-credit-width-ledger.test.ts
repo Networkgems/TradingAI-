@@ -98,6 +98,42 @@ describe('summarizeOptionsIdeasCreditWidth', () => {
     expect(s.config!.minCreditWidth).toBe(0.2);
   });
 
+  // TRA-2680 — the arming check. `config` is null until a slate has been scored, and
+  // a slate cannot be scored until the floor is armed, which is the same beat it
+  // starts dropping ideas. So the resolved floor was only ever observable one beat
+  // too late. `pendingConfig` is the same numbers, published unconditionally.
+  it('publishes the resolvable floor with the flag OFF and zero slates recorded', () => {
+    const s = summarizeOptionsIdeasCreditWidth(NOW, {});
+    expect(s.enabled).toBe(false);
+    expect(s.slates).toBe(0);
+    expect(s.config).toBeNull();
+    // Readable anyway — this is the whole point.
+    expect(s.pendingConfig).toEqual(DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG);
+    expect(s.pendingConfig.minCreditWidth).toBe(0.2);
+  });
+
+  it('reflects an undeclared env override that env-drift cannot see', () => {
+    // `OPTIONS_IDEA_SHORT_DELTA_MIN` is not in the blueprint, so /api/health/env-drift
+    // (declared keys only) reports driftCount 0 while the floor has moved 0.20 → 0.25.
+    const s = summarizeOptionsIdeasCreditWidth(NOW, { OPTIONS_IDEA_SHORT_DELTA_MIN: '0.25' });
+    expect(s.enabled).toBe(false);
+    expect(s.pendingConfig.minCreditWidth).toBe(0.25);
+    expect(s.pendingConfig).not.toEqual(DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG);
+  });
+
+  // With the floor armed the two coexist and mean different things: `config` is what
+  // the last slate WAS scored under, `pendingConfig` what the next one WOULD be. A
+  // divergence is an env change mid-window, which is exactly the event worth seeing.
+  it('diverges from config when env moves after a slate was scored', () => {
+    recordCreditWidthSlate(shadow(), NOW);
+    const s = summarizeOptionsIdeasCreditWidth(NOW, {
+      [CREDIT_WIDTH_FLOOR_ENABLE_VAR]: '1',
+      OPTIONS_IDEA_SHORT_DELTA_MIN: '0.25',
+    });
+    expect(s.config!.minCreditWidth).toBe(0.2);
+    expect(s.pendingConfig.minCreditWidth).toBe(0.25);
+  });
+
   it('drops slates older than the rolling window', () => {
     recordCreditWidthSlate(shadow(), NOW - 31 * 24 * 60 * 60 * 1000);
     recordCreditWidthSlate(shadow(), NOW);

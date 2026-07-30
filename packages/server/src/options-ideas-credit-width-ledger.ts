@@ -37,6 +37,7 @@ import { appendFileSync, mkdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import {
   resolveCreditWidthFloorConfig,
+  resolveCreditWidthFloorConfigFromEnv,
   CREDIT_WIDTH_FLOOR_ENABLE_VAR,
   type CreditWidthFloorConfig,
   type CreditWidthFloorShadow,
@@ -271,6 +272,33 @@ export interface OptionsIdeasCreditWidthSummary {
   byStrategy: Record<string, CreditWidthCounts>;
   /** Config the most recent slate was scored under, or null when none recorded. */
   config: CreditWidthFloorConfig | null;
+  /**
+   * TRA-2680 — the config the NEXT slate would be scored under, resolved from env
+   * on every read and INDEPENDENT of {@link enabled}. Never null.
+   *
+   * `config` above is a HISTORICAL record: it is `null` until a slate has actually
+   * been scored, which cannot happen until the floor is armed — and by then it has
+   * already gated ideas under whatever value was live. That left the one thing worth
+   * auditing (has an undeclared env override moved the floor?) checkable only on the
+   * single beat it stopped mattering. This field is the same numbers, readable
+   * BEFORE anything is gated, so the audit is a precondition rather than a postmortem.
+   *
+   * TRA-2217 is why it matters: the floor is DERIVED from the resolved band bottom,
+   * so `OPTIONS_IDEA_SHORT_DELTA_MIN` silently moves it. That var is not declared in
+   * the blueprint, so `/api/health/env-drift` (declared keys only) cannot see it.
+   *
+   * READING IT: on stock config this is `{0.20, 0.20, 0.30}`. Any other value means
+   * an undeclared override is live. Compare against the module defaults, NOT against
+   * `pendingConfig.shortDeltaMin` — `minCreditWidth === shortDeltaMin` is merely
+   * today's DEFAULTING RULE, so an equality check passes just as happily when an
+   * override has moved BOTH, and would have to be retracted the moment the derivation
+   * is corrected (TRA-2681). Equality proves the fallback fired; it proves nothing
+   * about the value.
+   *
+   * When `enabled` is true, a `pendingConfig` that differs from `config` means env
+   * changed after the last slate was scored.
+   */
+  pendingConfig: CreditWidthFloorConfig;
   /** Per-slate tail, oldest→newest (bounded). */
   recent: CreditWidthSlateRecord[];
   /** TRA-1681 — a wiped DATA_DIR must never read as a quiet floor. */
@@ -345,6 +373,7 @@ export function summarizeOptionsIdeasCreditWidth(
     },
     byStrategy,
     config: inWindow[inWindow.length - 1]?.config ?? null,
+    pendingConfig: resolveCreditWidthFloorConfigFromEnv(env),
     recent: inWindow.slice(-MAX_RECENT_SLATES),
     durability: { dataDir, ephemeral: isEphemeralDataDir(dataDir) },
   };

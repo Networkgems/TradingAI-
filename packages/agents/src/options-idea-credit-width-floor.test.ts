@@ -13,6 +13,7 @@ import {
   evaluateCreditWidthFloor,
   evaluateIdeasCreditWidthFloor,
   resolveCreditWidthFloorConfig,
+  resolveCreditWidthFloorConfigFromEnv,
   DEFAULT_CREDIT_WIDTH_FLOOR,
   DEFAULT_SHORT_DELTA_MIN,
   DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG,
@@ -243,6 +244,46 @@ describe('resolveCreditWidthFloorConfig', () => {
     });
     expect(banded!.minCreditWidth).toBe(0.25);
     expect(banded!.shortDeltaMin).toBe(0.25);
+  });
+});
+
+// TRA-2680. The floor became DERIVED in TRA-2217, so an undeclared override of
+// `OPTIONS_IDEA_SHORT_DELTA_MIN` moves it silently — and `/api/health/env-drift`
+// compares DECLARED keys only, so it cannot see that. The audit therefore has to
+// read the resolved config directly; the point of this resolver is that reading it
+// must not require ARMING the floor, because arming is the same beat it starts
+// dropping ideas.
+describe('resolveCreditWidthFloorConfigFromEnv — readable without arming', () => {
+  it('returns the config with the flag off, absent, or explicitly disabled', () => {
+    for (const env of [{}, { [FLAG]: '0' }, { [FLAG]: 'false' }]) {
+      expect(resolveCreditWidthFloorConfig(env)).toBeNull();
+      expect(resolveCreditWidthFloorConfigFromEnv(env)).toEqual(DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG);
+    }
+  });
+
+  // The whole reason the pre-arm read exists: an undeclared band override has to be
+  // VISIBLE before it has gated anything.
+  it('surfaces an undeclared band override that carries the floor with it', () => {
+    const shifted = resolveCreditWidthFloorConfigFromEnv({ OPTIONS_IDEA_SHORT_DELTA_MIN: '0.25' });
+    expect(shifted.minCreditWidth).toBe(0.25);
+    expect(shifted.shortDeltaMin).toBe(0.25);
+    // …and it is caught by comparing against the DEFAULT, not by `minCreditWidth ===
+    // shortDeltaMin`, which an override satisfies just as happily as stock config.
+    expect(shifted.minCreditWidth).toBe(shifted.shortDeltaMin);
+    expect(shifted).not.toEqual(DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG);
+  });
+
+  // Flag state must change NOTHING about the resolved numbers — otherwise the
+  // pre-arm read would not predict the armed one, and the audit would be worthless.
+  it('resolves identically whether or not the flag is on', () => {
+    const overrides = {
+      OPTIONS_IDEA_CREDIT_WIDTH_MIN: '0.28',
+      OPTIONS_IDEA_SHORT_DELTA_MIN: '0.15',
+      OPTIONS_IDEA_SHORT_DELTA_MAX: '0.35',
+    };
+    expect(resolveCreditWidthFloorConfigFromEnv(overrides)).toEqual(
+      resolveCreditWidthFloorConfig({ ...overrides, [FLAG]: '1' }),
+    );
   });
 });
 
