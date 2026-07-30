@@ -258,7 +258,17 @@ export function reconcilePnl(
       const journalCloses = journalClosesByDate == null ? null : (census?.closes ?? 0);
       const journalOptionsPnl =
         journalClosesByDate == null ? null : round2(census?.realizedPnlUsd ?? 0);
-      const optionsFalseZero = (journalCloses ?? 0) > 0 && optionsDaily === 0;
+      // TRA-2642 (found grading TRA-2625) — a day whose closes net EXACTLY $0.00
+      // books 0.00 correctly: the snapshot and the journal AGREE, and agreement at
+      // zero is not a false zero. Without the `journalOptionsPnl !== 0` term such a
+      // day is flagged forever — the repair cannot clear it either, because moving
+      // 0 → 0 is not a move (`planOptionsDailyPnlRepair`) — so `optionsFalseZeroOk`
+      // has no passing state at all. Live proof: `ctoverify_tra2227` /
+      // `ctoverify_tra2329` held `falseZeroDates:['2026-07-27']` while the repair
+      // re-ran `0.00->0.00` on 34 consecutive boots. The day stays fully visible via
+      // `journalCloses` / `journalOptionsPnl` on the row; only the accusation goes.
+      const optionsFalseZero =
+        (journalCloses ?? 0) > 0 && optionsDaily === 0 && (journalOptionsPnl ?? 0) !== 0;
       return {
         date: s.date,
         eodCombined,

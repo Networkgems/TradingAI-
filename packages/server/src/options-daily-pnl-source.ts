@@ -208,8 +208,10 @@ export interface OptionsDailyPnlRepairPlan {
   /** Snapshot rows considered. */
   examined: number;
   /**
-   * Days the census names closes on where the snapshot ALREADY carries a
-   * non-zero figure. Deliberately left alone — see {@link planOptionsDailyPnlRepair}.
+   * Days the census names closes on that the repair deliberately did NOT move —
+   * either the snapshot already carries a non-zero figure, or (TRA-2642) the
+   * census nets exactly the figure already booked, so there is nothing to move.
+   * See {@link planOptionsDailyPnlRepair}.
    */
   leftAloneDates: string[];
 }
@@ -218,7 +220,10 @@ export interface OptionsDailyPnlRepairPlan {
  * Plan the historical repair for one book. Pure — the caller persists.
  *
  * Repairs ONLY the proven defect: a day the journal names closes on whose
- * `optionsDailyPnl` is exactly 0. A day that already booked a NON-ZERO options
+ * `optionsDailyPnl` is exactly 0 AND whose census P&L is something other than 0
+ * (TRA-2642 — a zero-net day is already booked correctly, and "repairing" it to
+ * the same value on every boot is what broke idempotence). A day that already
+ * booked a NON-ZERO options
  * figure is left alone even when it disagrees with the journal, because that
  * number may be right and silently rewriting it is precisely the unannounced
  * correction the ticket forbids (TRA-2079). Those days are still NAMED, in
@@ -240,6 +245,19 @@ export function planOptionsDailyPnlRepair(
       continue;
     }
     const after = round2(census.realizedPnlUsd);
+    // TRA-2642 (found grading TRA-2625) — nothing to move. A day whose closes net
+    // exactly $0.00 already books the right figure, so emitting a zero delta made
+    // this function NON-IDEMPOTENT against its own docstring: the next boot found
+    // the same row still at 0, "repaired" it again, rewrote `snapshots.json` and
+    // logged a board-facing "a ledger moved" warn that moved nothing. Live tape:
+    // `ctoverify_tra2227` / `ctoverify_tra2329` each logged
+    // `dates:["2026-07-27:0.00->0.00"], totalDeltaUsd:0` on 34 consecutive boots.
+    // Named in `leftAloneDates` rather than dropped, so a zero-net day stays
+    // readable instead of silently vanishing from the plan.
+    if (after === before) {
+      leftAloneDates.push(s.date);
+      continue;
+    }
     deltas.push({ date: s.date, before, after, delta: round2(after - before), journalCloses: census.closes });
   }
   deltas.sort((a, b) => a.date.localeCompare(b.date));

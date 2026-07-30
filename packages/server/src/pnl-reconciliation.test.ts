@@ -198,6 +198,28 @@ describe('reconcilePnl', () => {
       expect(r.days[0].optionsFalseZero).toBe(false);
     });
 
+    it('TRA-2642: closes that net EXACTLY $0.00 are agreement, not a false zero', () => {
+      // Found grading TRA-2625. `optionsDaily === 0` is the CORRECT booking for a
+      // scratch-only options day, and the repair cannot clear the accusation
+      // (moving 0 → 0 is not a move), so the old predicate left
+      // `optionsFalseZeroOk` with no passing state — two fixture books held
+      // `falseZeroDates:['2026-07-27']` while the repair re-ran on 34 boots.
+      const r = reconcilePnl(
+        [snap('2026-07-27', 0, 0)],
+        new Map([['2026-07-27', 0]]),
+        null,
+        census([['2026-07-27', 2, 0]]),
+      );
+      expect(r.falseZeroDates).toEqual([]);
+      expect(r.optionsFalseZeroOk).toBe(true);
+      // The day stays fully visible — only the accusation is withdrawn.
+      expect(r.days[0]).toMatchObject({
+        journalCloses: 2,
+        journalOptionsPnl: 0,
+        optionsFalseZero: false,
+      });
+    });
+
     it('MUTATION: a genuinely option-less day is NOT flagged', () => {
       const r = reconcilePnl(
         [snap('2026-07-14', 0, 0)],

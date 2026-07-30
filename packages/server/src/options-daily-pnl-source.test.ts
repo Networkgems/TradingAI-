@@ -400,6 +400,48 @@ describe('TRA-2314 — the historical repair is bounded, attributable and idempo
     expect(recon.optionsFalseZeroOk).toBe(false);
     expect(recon.falseZeroDates).toEqual(['2026-07-15']);
   });
+
+  // ── TRA-2642 — the $0.00-net census day ───────────────────────────────────
+  // Found grading TRA-2625: `ctoverify_tra2227` / `ctoverify_tra2329` each logged
+  // `dates:["2026-07-27:0.00->0.00"], totalDeltaUsd:0` on 34 consecutive boots,
+  // and their `falseZeroDates` never cleared — so firm-wide `optionsFalseZeroOk`
+  // had NO PASSING STATE. Both arms below fail on the pre-TRA-2642 code.
+  const zeroNetCensus = new Map([['2026-07-27', { closes: 2, realizedPnlUsd: 0 }]]);
+
+  it('TRA-2642: a day whose closes net exactly $0.00 yields NO delta and is named, not moved', () => {
+    const plan = planOptionsDailyPnlRepair([day('2026-07-27', 0)], zeroNetCensus);
+    expect(plan.deltas).toEqual([]);
+    expect(plan.totalDeltaUsd).toBe(0);
+    // Named rather than silently dropped — a zero-net day stays readable.
+    expect(plan.leftAloneDates).toEqual(['2026-07-27']);
+  });
+
+  it('TRA-2642: the repair stays a NO-OP on a zero-net day across repeated boots', () => {
+    const tracker = new PnlTracker(TMP_ROOT, 2_000);
+    tracker.saveSnapshot(day('2026-07-27', 0));
+
+    for (const pass of [1, 2, 3]) {
+      const plan = planOptionsDailyPnlRepair(tracker.getSnapshots(), zeroNetCensus);
+      expect(plan.deltas, `boot ${pass}`).toEqual([]);
+      expect(tracker.applyOptionsDailyPnlRepair(plan.deltas), `boot ${pass}`).toBe(0);
+    }
+    // The row is left exactly as the writer booked it — no phantom provenance.
+    const row = tracker.getSnapshots().find(s => s.date === '2026-07-27')!;
+    expect(row.optionsDailyPnl).toBe(0);
+    expect(row.optionsDailyPnlSource).toBeUndefined();
+  });
+
+  it('TRA-2642: a zero-net day is NOT a false zero, while a non-zero one still is', () => {
+    // The pair is the point: the detector was narrowed, not disabled.
+    const clean = reconcilePnl([day('2026-07-27', 0)], new Map(), null, zeroNetCensus);
+    expect(clean.falseZeroDates).toEqual([]);
+    expect(clean.optionsFalseZeroOk).toBe(true);
+    expect(clean.days[0]).toMatchObject({ journalCloses: 2, journalOptionsPnl: 0, optionsFalseZero: false });
+
+    const red = reconcilePnl([day('2026-07-15', 0)], new Map(), null, census);
+    expect(red.falseZeroDates).toEqual(['2026-07-15']);
+    expect(red.optionsFalseZeroOk).toBe(false);
+  });
 });
 
 /**
