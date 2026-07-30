@@ -77,12 +77,35 @@ export interface OtmScannerOptions {
   ivSmoothingWindow?: number;
   /**
    * TRA-1407 — reject candidates whose |Black-Scholes delta| is below this floor
-   * (default 0 = no floor, preserving legacy far-OTM behaviour). The demo option
-   * journal showed the single_leg_otm sleeve bleeds entirely in low delta
-   * (Δ<0.15 avgR −0.075) while Δ≥0.45 makes avgR +0.55 — a floor drops the
-   * lottery-ticket tail without touching near-money reads. Applied post-greeks,
-   * so it filters the same `delta` that lands on each candidate. Callers pass the
-   * board-tuned floor (recommend 0.40) only when the OTM delta-floor flag is on.
+   * (default 0 = no floor, preserving legacy far-OTM behaviour). Applied
+   * post-greeks, so it filters the same `delta` that lands on each candidate.
+   *
+   * Rationale, re-measured against the live option journal on 2026-07-30
+   * (`GET /api/health/option-journal?rows=all`, bqb1 @ `d12d19a`, n=1,101 closed
+   * `single_leg_otm`). This supersedes the two figures TRA-1407 originally cited
+   * here — the journal refutes both (TRA-2397, working in TRA-2389):
+   *
+   *   - Δ<0.15 → avgR −0.0335 (n=644, 95% CI [−0.045, −0.022]). The low-delta
+   *     bleed is real, but the old "−0.075" overstated it ~2.2×. All 644 rows
+   *     are pre-floor legacy fills.
+   *   - Δ≥0.45 → the old "+0.55" is a QA-fixture artifact. Pooled avgR is +0.409
+   *     (n=197); excluding the `qa_*` / `*verify_*` mirror books it is +0.257
+   *     (n=161); on desk books only it is +0.195 (n=40). TRA-2100 is the
+   *     authority for the account-partitioned figure — read it there rather than
+   *     re-quoting a number from this comment, which will age.
+   *   - Every R above is MID-MARKED and gross: `summary.slippage.exitSampled` is
+   *     0, and TRA-2174 puts the mid-vs-fill overstatement near 13%. These
+   *     numbers are the floor's rationale, not sleeve-gate evidence.
+   *
+   * Callers pass the board-tuned floor (recommend 0.40) only when the OTM
+   * delta-floor flag is on — but carry this caveat with the recommendation: on
+   * the present configuration 0.40 is a NO-OP. The TRA-1602 cost-aware entry
+   * gate is live (0.485R bar for `single_leg_otm`) and is algebraically a
+   * |Δ| ≳ 0.495 floor, which strictly dominates 0.40. Of the 78 post-cliff
+   * entries (opens from ET 2026-07-15; last sub-0.45 open 2026-07-10), zero sit
+   * in [0.40, 0.495) and min|Δ| = 0.4956. See TRA-2389. Arming at 0.40 changes
+   * no entries today; it only binds if the cost gate is loosened. Changing the
+   * recommended value is TRA-1407 / board territory.
    */
   minAbsDelta?: number;
   /** Override of `Date.now()` — test seam. */
