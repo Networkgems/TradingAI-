@@ -93,6 +93,19 @@
  *                  is unshipped on real capital, and every sizing decision on
  *                  that book is being made off an understated NAV.
  *
+ * THE COHORT IS PINNED, NOT LEARNED AT READ TIME (TRA-2630 AC2)
+ * -------------------------------------------------------------
+ * The AC2 delta reports `N book(s) that COULD have shown one`. N is discovered
+ * from the same payload it grades, so a book that was eligible and then produced
+ * no row does not fail anything — it shrinks N, and the verdict still prints
+ * PASS. `AC2_EXPECTED_GRADEABLE_BOOKS` therefore fixes the 15 books eligible for
+ * the 2026-07-30 read off the already-written, immutable 2026-07-29 rows, pulled
+ * BEFORE the graded session existed. Every arm prints observed-vs-pinned and
+ * names any book that dropped out. It is deliberately NOT wired to the exit code:
+ * thin evidence is a reading to widen, not a build to fail — but it is never
+ * silent, because silence is the defect. The pin refuses to apply to any other
+ * `--since` rather than decay into the shrinkage it detects.
+ *
  * USAGE
  * -----
  *   node scripts/check-pnl-options-lag.mjs
@@ -184,6 +197,95 @@ export function findPriorOptionsLagGradeableDates(days) {
 export const AC2_FIX_DEPLOY_DATE = '2026-07-30';
 
 /**
+ * TRA-2630 AC2 — THE COHORT, PINNED BEFORE THE OBSERVATION.
+ *
+ * `gradeableBookCount` is a denominator the grader learns AT READ TIME, which
+ * means it can only ever report the cohort that showed up. A book that was
+ * eligible and then silently failed to produce a row shrinks the denominator
+ * instead of failing anything, and the verdict still prints `PASS — 0 new lag
+ * sessions across N book(s) that COULD have shown one`. N just gets smaller.
+ * That is the same manufactured green the BLIND arm exists to stop, one notch
+ * in: not "nobody looked" but "fewer looked than we knew were eligible", and it
+ * is invisible from the read alone because nothing records what N should be.
+ *
+ * So the expected cohort is pinned HERE, measured off live prod BEFORE the
+ * session it grades exists. Eligibility for the 2026-07-30 read is fixed by the
+ * 2026-07-29 rows, which were already written and immutable when this was
+ * measured — every book below carries a non-zero `optionsDaily` on 07-29, so
+ * each one names an exact `stockDaily` that the 07-30 row can refute.
+ *
+ *   source: GET https://tradingai-bqb1.onrender.com/api/health/pnl-reconciliation
+ *   pulled: 2026-07-30T11:11:29Z, live SHA 6153420, 59 engine books / 47 with rows
+ *
+ * The pin is keyed to ONE read and does NOT decay silently: {@link compareAc2Cohort}
+ * refuses to compare unless `since` is exactly {@link AC2_FIX_DEPLOY_DATE}, because
+ * on any later date eligibility is fixed by a different prior session and this list
+ * is simply the wrong question. A pin that quietly kept applying would manufacture
+ * the shrinkage it exists to detect.
+ */
+export const AC2_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
+  { username: 'admin', mode: 'live', priorOptionsDaily: 250.01 },
+  { username: 'Richard', mode: 'demo', priorOptionsDaily: -5.11 },
+  { username: 'ctoverify_2225_1784856407', mode: 'demo', priorOptionsDaily: 73.05 },
+  { username: 'ctoverify_2225b_1784856491', mode: 'demo', priorOptionsDaily: 42 },
+  { username: 'ctoverify_qa2407v1785284396', mode: 'demo', priorOptionsDaily: 42 },
+  { username: 'ctoverify_tra2227', mode: 'demo', priorOptionsDaily: -61 },
+  { username: 'ctoverify_tra2284', mode: 'demo', priorOptionsDaily: 12 },
+  { username: 'ctoverify_tra2331b', mode: 'demo', priorOptionsDaily: 10 },
+  { username: 'ctoverify_tra2333', mode: 'demo', priorOptionsDaily: 73.05 },
+  { username: 'enock', mode: 'demo', priorOptionsDaily: -4 },
+  { username: 'qa_mirror_1578_38096', mode: 'demo', priorOptionsDaily: -39 },
+  { username: 'qa_reg_0710202220', mode: 'demo', priorOptionsDaily: -7.5 },
+  { username: 'qa_tra1475_1783821169', mode: 'demo', priorOptionsDaily: -342 },
+  { username: 'qa_tra2251_7b0483ee', mode: 'demo', priorOptionsDaily: 73.05 },
+  { username: 'qa_tra2282_5beed8b8', mode: 'demo', priorOptionsDaily: 36.16 },
+]);
+
+/**
+ * TRA-2630 AC2 — grade the OBSERVED cohort against the PINNED one.
+ *
+ * Three states, and the middle one is the whole point:
+ *
+ *  - `NOT_APPLICABLE` — `since` is not the pinned read date. Says so; compares nothing.
+ *  - `SHRANK`         — an expected book produced no gradeable post-fix session. The
+ *                       pass, if any, covers less ground than it claims and names which.
+ *  - `INTACT`         — every pinned book presented. `extra` books are reported but are
+ *                       NOT a defect: a book that was quiet on 07-29 and traded on 07-30
+ *                       legitimately joins the cohort.
+ *
+ * Deliberately NOT wired to the exit code. A shrunken cohort does not mean the fix
+ * regressed — it means the evidence is thinner than planned, which is a reading to
+ * widen, not a build to fail. Silence is the failure mode being fixed, so it prints
+ * loudly on every arm including BLIND.
+ */
+export function compareAc2Cohort(gradeableBooks, since) {
+  if (String(since) !== AC2_FIX_DEPLOY_DATE) {
+    return {
+      verdict: 'NOT_APPLICABLE',
+      reason:
+        `the pinned cohort fixes eligibility from the 2026-07-29 rows and grades the`
+        + ` ${AC2_FIX_DEPLOY_DATE} read only; --since=${since} asks a different question`,
+      expectedCount: AC2_EXPECTED_GRADEABLE_BOOKS.length,
+      observedCount: gradeableBooks.length,
+      missing: [],
+      extra: [],
+    };
+  }
+  const observed = new Set(gradeableBooks.map((b) => b.username));
+  const expected = new Set(AC2_EXPECTED_GRADEABLE_BOOKS.map((b) => b.username));
+  const missing = AC2_EXPECTED_GRADEABLE_BOOKS.filter((b) => !observed.has(b.username));
+  const extra = gradeableBooks.filter((b) => !expected.has(b.username));
+  return {
+    verdict: missing.length > 0 ? 'SHRANK' : 'INTACT',
+    reason: null,
+    expectedCount: AC2_EXPECTED_GRADEABLE_BOOKS.length,
+    observedCount: gradeableBooks.length,
+    missing,
+    extra,
+  };
+}
+
+/**
  * TRA-2630 AC2 — THE DELTA, WITH ITS OWN DENOMINATOR.
  *
  * Splits lag hits into the pre-fix baseline and sessions written under the fix,
@@ -209,25 +311,45 @@ export const AC2_FIX_DEPLOY_DATE = '2026-07-30';
  */
 export function gradeAc2Delta(engines, since) {
   const cutoff = String(since);
-  let gradeableBookCount = 0;
   let rowBookCount = 0;
   const newLag = [];
+  // Named, not just counted — a bare count cannot be checked against the pinned
+  // cohort, and "N books could have shown one" is exactly the claim that silently
+  // gets smaller when a book drops out (see AC2_EXPECTED_GRADEABLE_BOOKS).
+  const gradeableBooks = [];
   for (const e of engines) {
     const days = Array.isArray(e?.days) ? e.days : [];
     const sorted = [...days].sort((a, b) => String(a.date).localeCompare(String(b.date)));
     if (sorted.some((d) => String(d.date) >= cutoff)) rowBookCount++;
     // The denominator: a post-fix session whose PRIOR carried non-zero optionsDaily.
     const gradeableDates = findPriorOptionsLagGradeableDates(sorted).filter((d) => String(d) >= cutoff);
-    if (gradeableDates.length > 0) gradeableBookCount++;
+    if (gradeableDates.length > 0) {
+      gradeableBooks.push({
+        username: e.username ?? '(unnamed)',
+        mode: e.mode ?? '(unknown)',
+        dates: gradeableDates,
+      });
+    }
     const hits = findPriorOptionsLagDates(sorted).filter((h) => String(h.date) >= cutoff);
     if (hits.length > 0) {
       newLag.push({ username: e.username ?? '(unnamed)', mode: e.mode ?? '(unknown)', hits });
     }
   }
+  const gradeableBookCount = gradeableBooks.length;
   const rows = newLag.reduce((n, r) => n + r.hits.length, 0);
   const liveRows = newLag.filter((r) => r.mode === 'live').reduce((n, r) => n + r.hits.length, 0);
   const verdict = rows > 0 ? 'FAIL' : gradeableBookCount === 0 ? 'BLIND' : 'PASS';
-  return { since: cutoff, verdict, rows, liveRows, books: newLag, gradeableBookCount, rowBookCount };
+  return {
+    since: cutoff,
+    verdict,
+    rows,
+    liveRows,
+    books: newLag,
+    gradeableBookCount,
+    gradeableBooks,
+    rowBookCount,
+    cohort: compareAc2Cohort(gradeableBooks, cutoff),
+  };
 }
 
 /** Grade a whole payload. Pure — no I/O, so `--selftest` can drive it. */
@@ -837,6 +959,7 @@ function printAc2(ac2) {
     console.log('  This is NOT a pass. "No new lag session" and "no session to grade" are the');
     console.log('  same output here — the TRA-2637 shape, where an absent EOD row scored drift 0.');
     console.log('  The 21:00 ET writer has not produced a gradeable row yet; re-run, do not grade.');
+    printAc2Cohort(ac2.cohort);
     return;
   }
   if (ac2.verdict === 'PASS') {
@@ -844,6 +967,7 @@ function printAc2(ac2) {
       `  PASS — 0 new lag sessions across ${ac2.gradeableBookCount} book(s) that COULD have shown one.`,
     );
     console.log('  The pre-fix rows listed above are the baseline and do not clear retroactively.');
+    printAc2Cohort(ac2.cohort);
     return;
   }
   console.log(
@@ -860,6 +984,45 @@ function printAc2(ac2) {
   }
   if (ac2.liveRows > 0) {
     console.log('  A mode:live book is among them — TRA-2630\'s demo-only verdict is FALSIFIED.');
+  }
+  printAc2Cohort(ac2.cohort);
+}
+
+/**
+ * TRA-2630 AC2 — observed cohort vs the cohort pinned before the observation.
+ * Printed on EVERY arm: a shrunken cohort changes what a PASS covers, changes
+ * which books a FAIL failed to check, and is the difference between "the writer
+ * ran and nothing was eligible" and "the writer skipped 15 eligible books".
+ */
+function printAc2Cohort(cohort) {
+  if (!cohort) return;
+  if (cohort.verdict === 'NOT_APPLICABLE') {
+    console.log(`  cohort pin: NOT APPLICABLE — ${cohort.reason}.`);
+    return;
+  }
+  if (cohort.verdict === 'INTACT') {
+    console.log(
+      `  cohort pin: INTACT — all ${cohort.expectedCount} book(s) eligible off the 2026-07-29`
+      + ` rows presented a gradeable session${
+        cohort.extra.length > 0 ? `, plus ${cohort.extra.length} that newly became eligible` : ''
+      }.`,
+    );
+    return;
+  }
+  console.log(
+    `  cohort pin: SHRANK — ${cohort.missing.length} of ${cohort.expectedCount} pinned book(s)`
+    + ` produced NO gradeable session; ${cohort.observedCount} observed.`,
+  );
+  console.log('  The verdict above covers only the books that presented. This is not a regression');
+  console.log('  in the fix — it is missing evidence, and it is the reason the count is smaller.');
+  for (const b of cohort.missing) {
+    console.log(
+      `      ${b.mode === 'live' ? 'LIVE ' : 'demo '} ${b.username}`
+      + ` — 2026-07-29 optionsDaily ${b.priorOptionsDaily.toFixed(2)}, no ${AC2_FIX_DEPLOY_DATE} row to refute it`,
+    );
+  }
+  if (cohort.missing.some((b) => b.mode === 'live')) {
+    console.log('  The LIVE book is among the missing — the real-money arm of AC2 did NOT grade.');
   }
 }
 
@@ -1613,6 +1776,68 @@ function selftest() {
     'DISCLAIMER: a payload CLAIMING the pooled metric is gradeable is called out',
     describeGradeabilityDisclaimer({ driftGradeable: true, caveats: [TRA2630_NOTE] }).verdict,
     'CLAIMS GRADEABLE',
+  );
+
+  // TRA-2630 AC2 COHORT PIN — the failure this exists to catch is a PASS whose
+  // denominator quietly shrank, so the controls have to drive the pass path.
+  const cohortBooks = (names) => names.map((u) => ({ username: u, mode: u === 'admin' ? 'live' : 'demo', dates: [AC2_FIX_DEPLOY_DATE] }));
+  const ALL_PINNED = AC2_EXPECTED_GRADEABLE_BOOKS.map((b) => b.username);
+  check(
+    'COHORT: every pinned book present reads INTACT',
+    compareAc2Cohort(cohortBooks(ALL_PINNED), AC2_FIX_DEPLOY_DATE).verdict,
+    'INTACT',
+  );
+  check(
+    'COHORT: a book that newly became eligible is `extra`, not a defect',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks([...ALL_PINNED, 'qa_brand_new_book']), AC2_FIX_DEPLOY_DATE);
+      return { verdict: c.verdict, extra: c.extra.map((b) => b.username) };
+    })(),
+    { verdict: 'INTACT', extra: ['qa_brand_new_book'] },
+  );
+  check(
+    'COHORT: one pinned book missing reads SHRANK and NAMES it',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(ALL_PINNED.filter((u) => u !== 'enock')), AC2_FIX_DEPLOY_DATE);
+      return { verdict: c.verdict, missing: c.missing.map((b) => b.username), observed: c.observedCount };
+    })(),
+    { verdict: 'SHRANK', missing: ['enock'], observed: 14 },
+  );
+  check(
+    'COHORT: the LIVE book dropping out is SHRANK even with 14 demo books present',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(ALL_PINNED.filter((u) => u !== 'admin')), AC2_FIX_DEPLOY_DATE);
+      return { verdict: c.verdict, missingLive: c.missing.filter((b) => b.mode === 'live').map((b) => b.username) };
+    })(),
+    { verdict: 'SHRANK', missingLive: ['admin'] },
+  );
+  check(
+    'COHORT: a PASS over ONE surviving book is SHRANK, not a clean 15-book pass',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(['Richard']), AC2_FIX_DEPLOY_DATE);
+      return { verdict: c.verdict, missing: c.missing.length, observed: c.observedCount };
+    })(),
+    { verdict: 'SHRANK', missing: 14, observed: 1 },
+  );
+  check(
+    'COHORT: the pin does NOT decay — a later --since compares nothing',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(['Richard']), '2026-08-14');
+      return { verdict: c.verdict, missing: c.missing.length };
+    })(),
+    { verdict: 'NOT_APPLICABLE', missing: 0 },
+  );
+  check(
+    'COHORT: gradeAc2Delta carries the pin, and a shrunken PASS reports BOTH',
+    (() => {
+      const day = (date, sd, od) => ({ date, stockDaily: sd, optionsDaily: od });
+      const g = gradeAc2Delta(
+        [{ username: 'Richard', mode: 'demo', days: [day('2026-07-29', 0, -5.11), day('2026-07-30', 3.25, 0)] }],
+        AC2_FIX_DEPLOY_DATE,
+      );
+      return { verdict: g.verdict, gradeable: g.gradeableBookCount, cohort: g.cohort.verdict };
+    })(),
+    { verdict: 'PASS', gradeable: 1, cohort: 'SHRANK' },
   );
 
   let failed = 0;
