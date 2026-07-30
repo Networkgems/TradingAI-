@@ -145,6 +145,11 @@ const EXIT_DEMO_LAG = 2;
 const EXIT_BLIND = 3;
 /** TRA-2635 — a live book realized option P&L and equity absorbed none of it. */
 const EXIT_LIVE_CREDIT_UNSHIPPED = 4;
+/**
+ * TRA-2630 AC3 — a live book's counter is FROZEN: the credit reached NAV but no
+ * daily row records it. Distinct from exit 4, where the money never arrived.
+ */
+const EXIT_LIVE_COUNTER_FROZEN = 5;
 
 /**
  * THE PREDICATE. Returns the lag dates for one book's day list.
@@ -1541,6 +1546,9 @@ async function main(argv) {
       console.log('    Guard and endpoint disagree — treat BOTH as unread.');
     }
   }
+  // Graded here and printed unconditionally below, so no early return can hide it.
+  const freeze = gradeLiveCounterFreeze(credit);
+  printCounterFreezeAxis(freeze);
   console.log('');
   console.log('TRA-2630 AC3 — T+1 options-credit lag (stockDaily == prior session optionsDaily):');
 
@@ -1554,9 +1562,14 @@ async function main(argv) {
     // `return EXIT_CLEAN` is the exact shape CEO retracted: it passes the fleet on
     // an axis that cannot fire on a book the credit path never reached.
     if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
+    // Ranked ABOVE the credit BLIND: a freeze is a concrete real-money finding and
+    // reporting it as "graded nothing" loses it. `admin`'s real shape lands here
+    // once its shortfall clears — `absorbed` goes null on a frozen counter, which
+    // is UNMEASURABLE, which is BLIND.
+    if (freeze.verdict === 'FROZEN') return reportCounterFrozen(freeze);
     if (credit.verdict !== 'CREDIT_OK') return reportCreditBlind(credit);
     console.log('');
-    console.log(`CLEAN — both axes graded on ${credit.liveBookCount} live book(s).`);
+    console.log(`CLEAN — all three axes graded on ${credit.liveBookCount} live book(s).`);
     return EXIT_CLEAN;
   }
 
@@ -1582,6 +1595,13 @@ async function main(argv) {
     console.error('TRA-2323 rollback question — TRA-2630\'s demo-only verdict is now falsified.');
     return EXIT_LIVE_LAG;
   }
+  // TRA-2630 AC3 — real money, and it outranks both the BLIND below and the demo
+  // verdict: a freeze is a finding, and "$0 live capital at risk" is misleading
+  // while a live book's daily rows are understated by a credit sitting in NAV.
+  // Ranked below LIVE LAG (a NAV overstatement is worse than a mis-attribution)
+  // and below the exit-4 shortfall (money absent beats money mislabelled).
+  if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
+  if (freeze.verdict === 'FROZEN') return reportCounterFrozen(freeze);
   // Ordered ABOVE the demo verdict deliberately. With no live book in the fleet
   // the sentence "0 live books, so $0 live capital is at risk" is not a finding —
   // it is the absence of one, and it must not be printed as reassurance.
@@ -1605,8 +1625,9 @@ async function main(argv) {
     return EXIT_BLIND;
   }
   // TRA-2635 — a live credit failure outranks demo lag: it is real money, and the
-  // "$0 live capital at risk" sentence below is FALSE while it is true.
-  if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
+  // "$0 live capital at risk" sentence below is FALSE while it is true. Both this
+  // and the frozen axis are now checked ABOVE the LIVE_UNMEASURABLE BLIND as well
+  // — a real-money finding must not be reported as "graded nothing".
   console.error(
     `DEMO LAG — ${g.demo.length} demo book(s), ${lagRows} lag session(s). ${g.liveBookCount} live book(s) graded, 0 affected.`,
   );
@@ -1825,6 +1846,107 @@ function reportCreditUnshipped(credit) {
   console.error('sizing decision reads is understated by the whole realized options leg, and');
   console.error('a "clean" lag verdict is exactly what that state looks like (TRA-2635).');
   return EXIT_LIVE_CREDIT_UNSHIPPED;
+}
+
+/**
+ * TRA-2630 AC3 — THE FROZEN AXIS AS A FIRST-CLASS VERDICT.
+ *
+ * AC3 says "assert `stockDaily != prior session optionsDaily` for every book, and
+ * fail loudly for any `mode: live` book". That predicate is STRUCTURALLY BLIND to
+ * the live book's actual failure. Measured on bqb1 2026-07-30T17:29:48Z, `admin`:
+ *
+ *     2026-07-27  optionsDaily 140.00                         closingEquity 2008.29
+ *     2026-07-28  stockDaily -0.94   optionsDaily  68.00      closingEquity 2147.35
+ *
+ * `stockDaily -0.94` is nowhere near the prior `optionsDaily 140.00`, so AC3 reads
+ * `priorOptionsLagOk: true` and the book is reported CLEAN — while the un-booked
+ * equity move on that same session is +$140.00, EQUAL TO THE CENT to the prior
+ * session's realized options P&L. Same T+1 mechanism, different landing site:
+ * `openingEquity` absorbed the credit across a boot before the 21:00 close ran, so
+ * the money is in NAV and in no daily row. AC3 only watches `stockDaily`.
+ *
+ * The axis existed (`counterFrozenDates`) but was printed ONLY from inside
+ * {@link reportCreditUnshipped} — i.e. only while the credit axis was ALREADY
+ * failing. That coupling is the trap, and it opens exactly when the repair lands:
+ * a FROZEN counter puts the money in `closingEquity`, so `uncredited` falls to ~0
+ * and the shortfall clears, while `absorbed` reads `true` off any session where
+ * the counter did move. Verdict becomes `CREDIT_OK`, the frozen print is behind a
+ * branch that no longer fires, and the run returns EXIT_CLEAN. Reproduced against
+ * this script before the fix (`--file=` fixture, live book, $60 frozen):
+ *
+ *     CLEAN — both axes graded on 1 live book(s).        exit 0
+ *
+ * So this grades independently of the credit verdict and blocks EXIT_CLEAN.
+ * Tri-state, like every other axis here: `null` is NOT MEASURED and never a pass.
+ */
+function gradeLiveCounterFreeze(credit) {
+  const books = (credit?.books ?? []).filter((b) => (b.counterFrozenDates ?? []).length > 0);
+  if (books.length > 0) return { verdict: 'FROZEN', books, gradeableBookCount: null };
+  // The DENOMINATOR. A book with no written counter session cannot exhibit a
+  // freeze OR refute one, so "0 frozen" over 0 gradeable books is NOT MEASURED —
+  // the same empty-cohort green this whole ticket was filed about.
+  const gradeable = (credit?.books ?? []).filter((b) => b.counterDurable !== null);
+  if ((credit?.liveBookCount ?? 0) === 0 || gradeable.length === 0) {
+    return { verdict: 'NOT_MEASURED', books: [], gradeableBookCount: gradeable.length };
+  }
+  return { verdict: 'CLEAN', books: [], gradeableBookCount: gradeable.length };
+}
+
+/**
+ * Printed on EVERY path, before any early return. A higher-ranked axis
+ * short-circuiting must not be able to suppress this verdict — that is the exact
+ * shape that let the frozen axis go unread for a whole ticket.
+ */
+function printCounterFreezeAxis(freeze) {
+  console.log('');
+  console.log('TRA-2630 AC3 (second landing site) — is the LIVE counter FROZEN? (credit in NAV,');
+  console.log('recorded in no daily row — invisible to the `stockDaily` predicate above):');
+  if (freeze.verdict === 'NOT_MEASURED') {
+    console.log(
+      `  NOT MEASURED — ${freeze.gradeableBookCount} live book(s) carry a written counter session.`,
+    );
+    console.log('    Not a pass. "No freeze" and "nothing to freeze" are the same reading here.');
+    return;
+  }
+  if (freeze.verdict === 'CLEAN') {
+    console.log(`  CLEAN — 0 of ${freeze.gradeableBookCount} gradeable live book(s) show a freeze.`);
+    return;
+  }
+  for (const b of freeze.books) {
+    console.log(
+      `  LIVE  ${b.username} — FROZEN on ${b.counterFrozenDates.length} session(s): `
+      + b.counterFrozenDates.map((r) => `${r.date} $${r.move.toFixed(2)}`).join(', '),
+    );
+  }
+}
+
+/** TRA-2630 AC3 — the frozen axis fired on real money and nothing else would say so. */
+function reportCounterFrozen(freeze) {
+  console.error('');
+  console.error(
+    `LIVE COUNTER FROZEN — ${freeze.books.length} mode:live book(s) hold realized option P&L`,
+  );
+  console.error('that reached NAV and was recorded in NO daily row. The `stockDaily == prior');
+  console.error('optionsDaily` tripwire CANNOT see this: `openingEquity` absorbed the credit, so');
+  console.error('the stock leg stays exact and AC3 reads clean. Every daily row understates.');
+  for (const b of freeze.books) {
+    const total = b.counterFrozenDates.reduce((s, r) => s + r.move, 0);
+    console.error(
+      `  ${b.username}: $${Math.round(total * 100) / 100} across `
+      + `${b.counterFrozenDates.length} session(s) — `
+      + b.counterFrozenDates.map((r) => `${r.date} $${r.move.toFixed(2)}`).join(', '),
+    );
+    console.error(
+      `      counter: optionsCreditedCumulative $${(b.creditedLatest ?? 0).toFixed(2)}`
+      + ` over ${b.measuredSessions} gradeable session(s), durable=${JSON.stringify(b.counterDurable)}`,
+    );
+  }
+  console.error('NOT a NAV overstatement and NOT the TRA-2630 escalation trigger — the money is');
+  console.error('present and correct in `closingEquity`. It is an ATTRIBUTION defect: sizing and');
+  console.error('reporting that read the daily rows are understated by the frozen amount.');
+  console.error('Remediation differs from a RESET counter — a reset re-books the credit INTO');
+  console.error('`stockDaily` and double-counts; a freeze leaves the stock leg exact (TRA-2658).');
+  return EXIT_LIVE_COUNTER_FROZEN;
 }
 
 /** TRA-2635 — the credit axis graded nothing; a clean lag verdict cannot cover for it. */
@@ -2536,6 +2658,71 @@ function selftest() {
       return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates };
     })(),
     { counterDurable: false, frozen: [{ date: '2026-07-29', move: 500 }] },
+  );
+
+  // ── TRA-2630 AC3: the frozen axis as its own VERDICT ────────────────────────
+  // THE HOLE, pinned. `counterFrozenDates` existed but was printed only from
+  // inside `reportCreditUnshipped`, so it was readable only while the credit axis
+  // was already failing. This fixture is the state the credit REPAIR produces: the
+  // counter moved once (so `absorbed: true`), the money is all in `closingEquity`
+  // (so `uncredited: 0`, no shortfall) — and $60 of it is recorded in no row.
+  const FROZEN_BUT_CREDIT_OK = { engines: [{ username: 'admin', mode: 'live', days: [
+    { date: '2026-07-27', stockDaily: 0, optionsDaily: 100, optionsCreditedCumulative: 100, closingEquity: 2000 },
+    { date: '2026-07-28', stockDaily: 0, optionsDaily: 60, optionsCreditedCumulative: 100, closingEquity: 2000 },
+    { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 100, closingEquity: 2060 },
+  ] }] };
+
+  check(
+    'AC3/FROZEN: the credit axis reads CREDIT_OK on a book whose counter is frozen',
+    (() => {
+      const c = gradeCreditObservation(FROZEN_BUT_CREDIT_OK);
+      return {
+        verdict: c.verdict,
+        shortfall: c.shortfall.length,
+        frozen: c.books[0].counterFrozenDates.map((r) => r.date),
+      };
+    })(),
+    { verdict: 'CREDIT_OK', shortfall: 0, frozen: ['2026-07-29'] },
+  );
+
+  check(
+    'AC3/FROZEN: the frozen axis fires anyway — it no longer rides on the credit verdict',
+    gradeLiveCounterFreeze(gradeCreditObservation(FROZEN_BUT_CREDIT_OK)).verdict,
+    'FROZEN',
+  );
+
+  check(
+    'AC3/FROZEN: the lag predicate is BLIND to it — stockDaily never equals prior optionsDaily',
+    findPriorOptionsLagDates(FROZEN_BUT_CREDIT_OK.engines[0].days).length,
+    0,
+  );
+
+  // The PASSING state must be reachable, or this is just another permanent red.
+  check(
+    'AC3/FROZEN: a continuously-run live book grades CLEAN, with a published denominator',
+    (() => {
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 10, optionsDaily: 40, optionsCreditedCumulative: 100, closingEquity: 2100 },
+        { date: '2026-07-29', stockDaily: 10, optionsDaily: 40, optionsCreditedCumulative: 150, closingEquity: 2160 },
+      ] }] };
+      const f = gradeLiveCounterFreeze(gradeCreditObservation(p));
+      return { verdict: f.verdict, denom: f.gradeableBookCount };
+    })(),
+    { verdict: 'CLEAN', denom: 1 },
+  );
+
+  // ...and the empty cohort must NOT read as that CLEAN. Same `every`-on-empty
+  // trap the whole ticket is about, one axis further in.
+  check(
+    'AC3/FROZEN: 0 live books is NOT MEASURED, not CLEAN',
+    (() => {
+      const p = { engines: [{ username: 'Richard', mode: 'demo', days: [
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 40, optionsCreditedCumulative: 0, closingEquity: 2000 },
+      ] }] };
+      const f = gradeLiveCounterFreeze(gradeCreditObservation(p));
+      return { verdict: f.verdict, denom: f.gradeableBookCount };
+    })(),
+    { verdict: 'NOT_MEASURED', denom: 0 },
   );
 
   // The DELTA boundary on the frozen axis. Without it AC2 can never go green:
