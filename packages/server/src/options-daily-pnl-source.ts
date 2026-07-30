@@ -331,12 +331,28 @@ export interface EodReportOptionsSyncTarget {
  * figure. Rows with no provenance at all are pre-fix legacy and are left alone
  * for the same reason `planOptionsDailyPnlRepair` leaves them alone.
  */
+/**
+ * Is the JOURNAL the authority for this row's options figure — i.e. will
+ * {@link syncEodReportOptionsLegs} overwrite the report file's options leg from
+ * the day cell on this row?
+ *
+ * Exported and shared deliberately. `pnl-reconciliation` must exclude exactly
+ * these rows from the `optionsLegOk` denominator, because on them
+ * `eodOptionsPnl − optionsDaily` is 0 BY CONSTRUCTION — the file leg IS the day
+ * cell. If this predicate and the sync's eligibility rule ever drifted apart,
+ * the reconciler would either grade a tautology as evidence or discard a row that
+ * really was independent. One definition, two consumers (TRA-2641/TRA-2630).
+ */
+export function isJournalAuthoritativeSource(source: string | null | undefined): boolean {
+  return source === 'journal' || source === 'journal-repair';
+}
+
 export function planEodReportOptionsSync(
   snapshots: ReadonlyArray<DailySnapshot>,
 ): EodReportOptionsSyncTarget[] {
   const targets: EodReportOptionsSyncTarget[] = [];
   for (const s of snapshots) {
-    if (s.optionsDailyPnlSource !== 'journal' && s.optionsDailyPnlSource !== 'journal-repair') continue;
+    if (!isJournalAuthoritativeSource(s.optionsDailyPnlSource)) continue;
     targets.push({ date: s.date, value: round2(s.optionsDailyPnl ?? 0) });
   }
   targets.sort((a, b) => a.date.localeCompare(b.date));

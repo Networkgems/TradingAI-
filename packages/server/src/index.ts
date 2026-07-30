@@ -4138,7 +4138,24 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           : null,
       stockLegMeasuredCount: engines.reduce((n, e) => n + e.stockLegMeasuredCount, 0),
       maxStockLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxStockLegDriftUsd), 0),
-      optionsLegOk: engines.every(e => e.optionsLegOk),
+      // TRA-2641 — this was `engines.every(e => e.optionsLegOk)`, which is the
+      // THIRD place the same fold bug shipped. Two independent failures ride on
+      // it now: `every` is true on the empty fleet, AND with the per-book verdict
+      // now `boolean | null` it coerces NOT-MEASURED to `false`. Same precedence
+      // as the two folds above — a red book wins, one genuinely-measured green is
+      // required to claim green, all-null stays null.
+      optionsLegOk: engines.some(e => e.optionsLegOk === false)
+        ? false
+        : engines.some(e => e.optionsLegOk === true)
+          ? true
+          : null,
+      // The DENOMINATORS, published beside the verdict. `optionsLegMeasuredCount:
+      // 0` with a large `optionsLegSlavedCount` is the signature of the TRA-2641
+      // state: the report leg is written FROM the day cell, so the comparison is
+      // one source against a copy of itself and cannot fail. Live 2026-07-30:
+      // 0 measured / 147 slaved over 167 post-baseline rows.
+      optionsLegMeasuredCount: engines.reduce((n, e) => n + e.optionsLegMeasuredCount, 0),
+      optionsLegSlavedCount: engines.reduce((n, e) => n + e.optionsLegSlavedCount, 0),
       maxOptionsLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxOptionsLegDriftUsd), 0),
       // TRA-2630 AC3 / TRA-2629 — the T+1 credit-lag tripwire, firm-wide.
       //

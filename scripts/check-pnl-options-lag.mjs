@@ -476,6 +476,8 @@ function summarizeLegs(payload) {
   let graded = 0;
   let present = 0;
   let stockMeasurable = 0;
+  let optionsMeasurable = 0;
+  let optionsSlaved = 0;
   for (const e of engines) {
     for (const d of e?.days ?? []) {
       if (d?.belowBaseline) continue;
@@ -491,6 +493,22 @@ function summarizeLegs(payload) {
       // the leg reconciled. Only a non-zero `eodStockPnl` is evidence either way.
       const esp = Number(d?.eodStockPnl);
       if (Number.isFinite(esp) && esp !== 0) stockMeasurable++;
+      // TRA-2641 — the options leg is only INDEPENDENT evidence where the report
+      // file's leg was not written FROM the day cell. `syncEodReportOptionsLegs`
+      // overwrites it on every `journal`/`journal-repair` row, so on those
+      // `optionsLegDrift` is 0 by construction: one source vs a copy of itself.
+      // Recomputed here rather than trusting the endpoint's own count, because
+      // this guard exists to disagree with the endpoint when one of them is wrong.
+      const slaved = d?.optionsDailyPnlSource === 'journal'
+        || d?.optionsDailyPnlSource === 'journal-repair';
+      const eop = Number(d?.eodOptionsPnl);
+      const od = Number(d?.optionsDaily);
+      if (slaved) {
+        optionsSlaved++;
+      } else if (d?.eodOptionsPnl != null && Number.isFinite(eop) && (eop !== 0 || od !== 0)) {
+        // 0.00 vs 0.00 is the same vacuous pass that made `stockLegOk` dead.
+        optionsMeasurable++;
+      }
       if (Math.abs(sl) > TOLERANCE_USD) {
         stockBad++;
         maxStock = Math.max(maxStock, Math.abs(sl));
@@ -506,10 +524,18 @@ function summarizeLegs(payload) {
   const stockLegOk = present === 0 || stockMeasurable === 0
     ? null
     : stockBad === 0;
+  // TRA-2641 — tri-state, and RED outranks NOT MEASURED. A slaved row that still
+  // disagrees means the sync writer failed; that red must never be masked by the
+  // empty-denominator null.
+  const optionsLegOk = optionsBad > 0
+    ? false
+    : present === 0 || optionsMeasurable === 0
+      ? null
+      : true;
   return {
     graded, present, stockBad, optionsBad, maxStock, maxOptions,
     stockMeasurable, stockLegOk,
-    optionsLegOk: present === 0 ? null : optionsBad === 0,
+    optionsMeasurable, optionsSlaved, optionsLegOk,
   };
 }
 
@@ -550,7 +576,8 @@ async function main(argv) {
   const legs = summarizeLegs(payload);
   console.log(`pulled ${payload.time ?? '(no timestamp)'} — ${g.engineCount} engine books`);
   console.log('');
-  console.log('TRA-2630 Defect A — per-leg drift. GRADE `optionsLeg` ONLY (TRA-2633):');
+  console.log('TRA-2630 Defect A — per-leg drift. NEITHER leg is gradeable (TRA-2641 retracts');
+  console.log('the TRA-2633 "grade optionsLeg only" guidance). Both are EVIDENCE, not verdicts:');
   console.log(`  graded sessions (post-baseline) : ${legs.graded}`);
   if (legs.present === 0) {
     console.log('  per-leg drift              : NOT MEASURED — this build serves no');
@@ -560,7 +587,20 @@ async function main(argv) {
     if (legs.present < legs.graded) {
       console.log(`  WARNING: only ${legs.present}/${legs.graded} graded sessions carry the per-leg fields.`);
     }
-    console.log(`  optionsLeg  GRADEABLE           : ${legs.optionsLegOk ? 'OK' : 'RED'} — ${legs.optionsBad}/${legs.present} offending (max |drift| $${legs.maxOptions.toFixed(2)})`);
+    const optionsVerdict = legs.optionsLegOk === null
+      ? 'NOT MEASURED'
+      : legs.optionsLegOk ? 'OK' : 'RED';
+    console.log(`  optionsLeg  NOT gradeable       : ${optionsVerdict} — ${legs.optionsBad}/${legs.present} offending (max |drift| $${legs.maxOptions.toFixed(2)}),`);
+    console.log(`    only ${legs.optionsMeasurable}/${legs.present} rows are INDEPENDENT (${legs.optionsSlaved} journal-slaved).`);
+    if (legs.optionsLegOk === null) {
+      console.log('    NOT MEASURED is NOT a pass. TRA-2641\'s `syncEodReportOptionsLegs` writes the');
+      console.log('    day cell\'s `optionsDailyPnl` INTO the report file\'s options leg on every');
+      console.log('    `journal`/`journal-repair` row, so `optionsLegDrift` = `eodOptionsPnl` -');
+      console.log('    `optionsDaily` compares one source against a copy of itself and is 0 by');
+      console.log('    construction. This leg was the TRA-2633 recommended gate; that is RETRACTED.');
+      console.log('    Grade the CREDIT axis below (`equityAbsorbedOptionsOk` / uncredited USD) —');
+      console.log('    its operands are the journal and the equity ledger, which no writer joins.');
+    }
     const stockVerdict = legs.stockLegOk === null
       ? 'NOT MEASURED'
       : legs.stockLegOk ? 'OK' : 'RED';
@@ -1156,7 +1196,8 @@ function selftest() {
     }),
     {
       graded: 1, present: 0, stockBad: 0, optionsBad: 0, maxStock: 0, maxOptions: 0,
-      stockMeasurable: 0, stockLegOk: null, optionsLegOk: null,
+      stockMeasurable: 0, stockLegOk: null,
+      optionsMeasurable: 0, optionsSlaved: 0, optionsLegOk: null,
     },
   );
 
@@ -1172,7 +1213,10 @@ function selftest() {
     }),
     {
       graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 22.5, maxOptions: 0,
-      stockMeasurable: 0, stockLegOk: null, optionsLegOk: true,
+      stockMeasurable: 0, stockLegOk: null,
+      // TRA-2641 — was `optionsLegOk: true`. This row carries NO `eodOptionsPnl`,
+      // so there was never a second operand: the old green graded nothing.
+      optionsMeasurable: 0, optionsSlaved: 0, optionsLegOk: null,
     },
   );
 
@@ -1187,13 +1231,14 @@ function selftest() {
     }),
     {
       graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 12.5, maxOptions: 0,
-      stockMeasurable: 1, stockLegOk: false, optionsLegOk: true,
+      stockMeasurable: 1, stockLegOk: false,
+      optionsMeasurable: 0, optionsSlaved: 0, optionsLegOk: null,
     },
   );
 
   // The gradeable leg must stay falsifiable in BOTH directions.
   check(
-    'options leg over tolerance ⇒ optionsLegOk false (the one gradeable signal)',
+    'options leg over tolerance ⇒ optionsLegOk false, even with an EMPTY denominator',
     summarizeLegs({
       engines: [{ username: 'admin', mode: 'live', days: [
         { date: '2026-07-17', stockDaily: 0, eodStockPnl: 0, stockLegDrift: 0, optionsLegDrift: 217.5 },
@@ -1201,8 +1246,98 @@ function selftest() {
     }),
     {
       graded: 1, present: 1, stockBad: 0, optionsBad: 1, maxStock: 0, maxOptions: 217.5,
-      stockMeasurable: 0, stockLegOk: null, optionsLegOk: false,
+      stockMeasurable: 0, stockLegOk: null,
+      // RED outranks NOT MEASURED. `optionsMeasurable` is 0 here, and the verdict
+      // is STILL false — an offending row is a real defect (the sync writer failed)
+      // and must never be swallowed by the empty-denominator null.
+      optionsMeasurable: 0, optionsSlaved: 0, optionsLegOk: false,
     },
+  );
+
+  // ── TRA-2641 — the options leg is SELF-CONFIRMING on journal-slaved rows.
+  // This is the live shape: `syncEodReportOptionsLegs` wrote the day cell into
+  // the report file, so the two legs agree BY CONSTRUCTION. A boolean rendered
+  // this as a green, and it flipped false→true across the TRA-2641 deploy, which
+  // reads as "the defect was fixed".
+  check(
+    'TRA-2641: a journal-slaved row is NOT independent evidence ⇒ NOT MEASURED, not green',
+    summarizeLegs({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        {
+          date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01,
+          eodStockPnl: 0, eodOptionsPnl: 250.01,
+          optionsDailyPnlSource: 'journal-repair',
+          stockLegDrift: 17.87, optionsLegDrift: 0,
+        },
+      ] }],
+    }),
+    {
+      graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 17.87, maxOptions: 0,
+      stockMeasurable: 0, stockLegOk: null,
+      optionsMeasurable: 0, optionsSlaved: 1, optionsLegOk: null,
+    },
+  );
+
+  // MUTATION — the SAME agreeing legs on a row the journal is NOT authority for.
+  // Nothing overwrote the file there, so agreement is real evidence and the
+  // verdict must return to a hard boolean. Guards against "always null".
+  check(
+    'MUTATION: an UNSLAVED row with agreeing legs is real evidence ⇒ true',
+    summarizeLegs({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        {
+          date: '2026-07-29', stockDaily: 0, optionsDaily: 250.01,
+          eodStockPnl: 0, eodOptionsPnl: 250.01,
+          optionsDailyPnlSource: 'bucket-journal-silent',
+          stockLegDrift: 0, optionsLegDrift: 0,
+        },
+      ] }],
+    }),
+    {
+      graded: 1, present: 1, stockBad: 0, optionsBad: 0, maxStock: 0, maxOptions: 0,
+      stockMeasurable: 0, stockLegOk: null,
+      optionsMeasurable: 1, optionsSlaved: 0, optionsLegOk: true,
+    },
+  );
+
+  // The OTHER vacuous-pass arm: unslaved, both legs present, both 0.00. Agreement
+  // between two zeroes is not evidence the reconciliation works — the same rule
+  // that killed `stockLegOk`. 20 of the 167 live post-baseline rows are this shape.
+  check(
+    'TRA-2641: an UNSLAVED row with 0.00 on BOTH legs is vacuous ⇒ NOT MEASURED',
+    summarizeLegs({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        {
+          date: '2026-07-13', stockDaily: 0, optionsDaily: 0,
+          eodStockPnl: 0, eodOptionsPnl: 0,
+          optionsDailyPnlSource: null,
+          stockLegDrift: 0, optionsLegDrift: 0,
+        },
+      ] }],
+    }),
+    {
+      graded: 1, present: 1, stockBad: 0, optionsBad: 0, maxStock: 0, maxOptions: 0,
+      stockMeasurable: 0, stockLegOk: null,
+      optionsMeasurable: 0, optionsSlaved: 0, optionsLegOk: null,
+    },
+  );
+
+  // THE DISCRIMINATOR for this defect: the two states that a boolean rendered
+  // IDENTICALLY. Same agreeing legs, same 0.00 drift, opposite verdicts — and the
+  // only difference is whether a writer joined the operands.
+  check(
+    'THE DISCRIMINATOR: slaved vs unslaved agreement give OPPOSITE verdicts',
+    [
+      summarizeLegs({ engines: [{ username: 'a', mode: 'demo', days: [{
+        date: '2026-07-29', stockDaily: 0, optionsDaily: 42, eodOptionsPnl: 42,
+        optionsDailyPnlSource: 'journal', stockLegDrift: 0, optionsLegDrift: 0,
+      }] }] }).optionsLegOk,
+      summarizeLegs({ engines: [{ username: 'a', mode: 'demo', days: [{
+        date: '2026-07-29', stockDaily: 0, optionsDaily: 42, eodOptionsPnl: 42,
+        optionsDailyPnlSource: 'bucket-no-census', stockLegDrift: 0, optionsLegDrift: 0,
+      }] }] }).optionsLegOk,
+    ],
+    [null, true],
   );
 
   // A book with no lag at all contributes nothing.

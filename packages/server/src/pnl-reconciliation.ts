@@ -1,4 +1,5 @@
 import type { DailySnapshot } from './pnl-tracker.js';
+import { isJournalAuthoritativeSource } from './options-daily-pnl-source.js';
 
 /**
  * TRA-1633 FIX 3 — cross-surface P&L reconciliation guard.
@@ -78,10 +79,8 @@ export const PNL_LEG_COVERAGE_NOTE =
  * its own axis and each has a reachable green state. Grade THOSE." Only HALF of
  * that survived contact with the live fleet:
  *
- *   `optionsLegOk`  — TRUE. Options-vs-options, identity exact on 167/167 live
- *                     rows, 70 rows carry a non-zero `eodOptionsPnl` so it can
- *                     move, and 0 of its 7 offenders are explained by
- *                     `stockDaily`. This is the gradeable one.
+ *   `optionsLegOk`  — TRUE **at the time that was written**. See the TRA-2641
+ *                     correction below: it no longer holds.
  *   `stockLegOk`    — FALSE. `eodStockPnl` is the report's `realizedPnl`, which
  *                     the TRA-219 archive zeroes at the same 21:00 ET the report
  *                     is written: 167/167 live rows read exactly 0.00, including
@@ -89,11 +88,41 @@ export const PNL_LEG_COVERAGE_NOTE =
  *                     rescue this leg — it only made its ONE cause legible. It is
  *                     now TRI-STATE and reports `null` = NOT MEASURED.
  *
- * So: grade `optionsLegOk`. Read `stockLegDrift` as EVIDENCE (it correctly
- * attributes where the pooled error lives) but never as a VERDICT.
+ * ── TRA-2641 CORRECTION: the options leg became SELF-CONFIRMING ──────────────
+ *
+ * TRA-2641 shipped `syncEodReportOptionsLegs`, which writes the day cell's
+ * `optionsDailyPnl` INTO the report file's options leg for every row the journal
+ * is authority for (`optionsDailyPnlSource` of `journal` / `journal-repair`).
+ * That fix is CORRECT — the file should converge on the journal. But
+ * `optionsLegDrift` is `eodOptionsPnl − optionsDaily`, so on exactly those rows
+ * both operands now trace to ONE source and the difference is 0 BY CONSTRUCTION.
+ *
+ * Measured on live prod 2026-07-30T09:40Z, build `239f2b5`, 167 post-baseline rows:
+ *
+ *     journal / journal-repair (file leg written FROM the day cell)  147  (88.0%)
+ *       └─ rows among those with a non-zero `optionsLegDrift`          0
+ *     no provenance (legs genuinely independent)                      20  (12.0%)
+ *       └─ rows among those where EITHER leg is non-zero               0
+ *     ⇒ rows that could produce a non-zero `optionsLegDrift`           0 / 167
+ *
+ * So `optionsLegOk` flipped false→true across the TRA-2641 deploy
+ * (`maxOptionsLegDriftUsd` 217.50 → 0.00) and that flip reads as "the defect was
+ * fixed" when what actually happened is that the last independence between the
+ * two operands was removed. A tautological comparison cannot fail, which is
+ * Defect A's own shape — one level further down, in its own fix.
+ *
+ * `optionsLegOk` is therefore TRI-STATE too, and the verdict order is
+ * RED > NOT MEASURED > GREEN: a slaved row that STILL disagrees means the writer
+ * failed, which is a genuine red and must never be masked by the `null`.
+ *
+ * So: grade neither leg as a reconciliation verdict. The independent signal is
+ * the CREDIT axis — `equityAbsorbedOptionsOk` / `uncreditedOptionsUsd` — whose
+ * two operands are the journal and the EQUITY ledger, which no writer joins.
+ * Read both `*LegDrift` values as EVIDENCE (they attribute where a pooled error
+ * lives) but never as a VERDICT.
  */
 export const PNL_DRIFT_DECOMPOSITION_NOTE =
-  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2633 CORRECTION: this note previously said to grade `stockLegOk` / `optionsLegOk`. Grade **`optionsLegOk` only** — it is options-vs-options and verified Defect-A-immune (identity exact on 167/167 live rows, 0 of 7 offenders explained by `stockDaily`). `stockLegOk` inherits the SAME lossy source `drift` does and is now TRI-STATE: `null` = NOT MEASURED, which is what the live fleet returns today. Treating that `null` as a pass is the bug this correction exists to stop.';
+  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2641 CORRECTION — this note previously said to grade `optionsLegOk` only; that is now WRONG and is retracted. NEITHER leg is a gradeable reconciliation verdict. `stockLegOk` inherits the same lossy source `drift` does. And `optionsLegOk` became SELF-CONFIRMING: TRA-2641\'s `syncEodReportOptionsLegs` writes the day cell\'s `optionsDailyPnl` into the report file\'s options leg on every `journal`/`journal-repair` row, so `optionsLegDrift` = `eodOptionsPnl` - `optionsDaily` compares one source against a copy of itself. Live 2026-07-30, build 239f2b5: 147/167 post-baseline rows are journal-slaved (0 with non-zero drift) and the other 20 carry 0.00 on BOTH legs, so 0 of 167 rows can produce a non-zero drift. The false->true flip across that deploy (max 217.50 -> 0.00) reads as "fixed" but is the operands losing independence. BOTH legs are now TRI-STATE with `null` = NOT MEASURED; read `optionsLegMeasuredCount` / `optionsLegSlavedCount` for the denominator, and never read a `null` as green. The INDEPENDENT signal to grade instead is the CREDIT axis — `equityAbsorbedOptionsOk` / `uncreditedOptionsUsd` — whose operands are the journal and the equity ledger, which no writer joins. Verdict order on both legs is RED > NOT MEASURED > GREEN: a slaved row that still disagrees means the sync writer failed, and that red is never masked.';
 
 export const PNL_ABSENT_EOD_ROW_NOTE =
   'TRA-2637: an ABSENT EOD row is NOT a pass. `drift` is now `null` (was 0) on any session whose `eodCombined` is null, and the absence is graded on its own axis — per-row `eodRowMissing`, per-book `eodRowsPresentOk` / `eodRowMissingDates` / `eodRowGradeableCount`, fleet-level `liveEodRowsPresentOk` / `liveEodRowMissingBooks`. Live proof: `admin` 2026-07-29 served `drift: 0` with `eodCombined: null` over 6 journal closes worth +$250.01. The presence verdicts are TRI-STATE; `null` = NOT MEASURED (empty cohort) and must never be read as green.';
@@ -464,12 +493,42 @@ export interface PnlReconcileResult {
   /** TRA-2630 — max |`stockLegDrift`| over evaluated days, USD. */
   maxStockLegDriftUsd: number;
   /**
-   * TRA-2630 — the OPTIONS-leg verdict, baseline-gated exactly like `ok`. False
-   * iff some evaluated day's |`optionsLegDrift`| exceeds the tolerance. This is
-   * the criterion CEO's TRA-2633 redirected the TRA-2625 grade onto, now
-   * computed on the row rather than by hand off the raw day list.
+   * TRA-2630 — the OPTIONS-leg verdict, baseline-gated exactly like `ok`.
+   * TRI-STATE as of TRA-2641, and the order is RED > NOT MEASURED > GREEN:
+   *
+   *   `false` — some evaluated day's |`optionsLegDrift`| exceeds the tolerance.
+   *             This is checked FIRST and is never masked by the `null` branch: a
+   *             journal-slaved row that still disagrees means
+   *             `syncEodReportOptionsLegs` failed to write, which is a real
+   *             defect in the writer.
+   *   `null`  — NOT MEASURED. No offender AND no row whose two operands are
+   *             INDEPENDENT and non-zero, so a green here would grade nothing.
+   *   `true`  — no offender over a non-empty independent cohort.
+   *
+   * Why the independence test is needed at all: TRA-2641 writes the day cell's
+   * `optionsDailyPnl` into the report file's options leg for every `journal` /
+   * `journal-repair` row, so on those rows `eodOptionsPnl − optionsDaily` is 0 by
+   * construction. That is 147 of 167 live post-baseline rows; the remaining 20
+   * carry 0.00 on both legs. See the TRA-2641 block in this file's header and
+   * {@link PnlReconcileResult.optionsLegSlavedCount}.
    */
-  optionsLegOk: boolean;
+  optionsLegOk: boolean | null;
+  /**
+   * TRA-2641 — how many evaluated rows could actually have shown an options-leg
+   * disagreement: `eodOptionsPnl` present, the row NOT journal-slaved, and at
+   * least one of the two legs non-zero. `0` means the verdict above is `null`
+   * because there was no independent cohort to grade. This is the DENOMINATOR;
+   * publishing it is what stops the next grader from reading a green off it.
+   */
+  optionsLegMeasuredCount: number;
+  /**
+   * TRA-2641 — how many evaluated rows were excluded from
+   * {@link PnlReconcileResult.optionsLegMeasuredCount} because the report file's
+   * options leg is WRITTEN FROM the day cell (`optionsDailyPnlSource` of
+   * `journal` or `journal-repair`). Names WHY the denominator is empty, so an
+   * empty one reads as "the operands are joined" rather than "no data".
+   */
+  optionsLegSlavedCount: number;
   /** TRA-2630 — dates whose |`optionsLegDrift`| exceeds the tolerance (evaluated days only). */
   optionsLegOffendingDates: string[];
   /** TRA-2630 — max |`optionsLegDrift`| over evaluated days, USD. */
@@ -1033,6 +1092,32 @@ export function reconcilePnl(
     stockLegMeasurableDays.length === 0 || !stockLegSourceLive
       ? null
       : stockLegOffendingDates.length === 0;
+  // TRA-2641 — the options leg needs the SAME denominator discipline, for a
+  // different reason. `syncEodReportOptionsLegs` writes the day cell's
+  // `optionsDailyPnl` into the report file's options leg on every row the journal
+  // is authority for, so on those rows `eodOptionsPnl - optionsDaily` is 0 BY
+  // CONSTRUCTION — one source compared against a copy of itself. A row is
+  // independent evidence only when all three hold:
+  //   1. the report leg is present at all (a null one is forced to drift 0 above,
+  //      which is the TRA-2637 absent-row hazard);
+  //   2. the row is NOT journal-slaved;
+  //   3. at least one leg is non-zero — 0.00 vs 0.00 is the same vacuous pass
+  //      that made `stockLegOk` unfalsifiable.
+  const optionsLegSlavedDays = evaluated.filter(d => isJournalAuthoritativeSource(d.optionsDailyPnlSource));
+  const optionsLegMeasurableDays = evaluated.filter(
+    d =>
+      d.eodOptionsPnl != null
+      && !isJournalAuthoritativeSource(d.optionsDailyPnlSource)
+      && (d.eodOptionsPnl !== 0 || d.optionsDaily !== 0),
+  );
+  // RED outranks NOT MEASURED: a slaved row that still disagrees means the sync
+  // writer failed, and that is a genuine defect the `null` must never swallow.
+  const optionsLegOk: boolean | null =
+    optionsLegOffendingDates.length > 0
+      ? false
+      : optionsLegMeasurableDays.length === 0
+        ? null
+        : true;
   const priorOptionsLagDates = days.filter(d => d.lagsPriorOptionsDaily).map(d => d.date);
   const priorOptionsLagEligibleDates = days
     .filter(d => d.priorOptionsLagEligible)
@@ -1153,7 +1238,9 @@ export function reconcilePnl(
     maxStockLegDriftUsd: round2(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.stockLegDrift)), 0),
     ),
-    optionsLegOk: optionsLegOffendingDates.length === 0,
+    optionsLegOk,
+    optionsLegMeasuredCount: optionsLegMeasurableDays.length,
+    optionsLegSlavedCount: optionsLegSlavedDays.length,
     optionsLegOffendingDates,
     maxOptionsLegDriftUsd: round2(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.optionsLegDrift)), 0),

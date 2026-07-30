@@ -371,7 +371,86 @@ describe('reconcilePnl', () => {
       expect(r.stockLegOk).toBeNull();
       expect(r.stockLegMeasuredCount).toBe(0);
       expect(r.stockLegOffendingDates).toEqual([]);
+      // TRA-2641 — this asserted `true` and that was the SAME trap one leg over.
+      // With no report file there is no second operand on the options leg either,
+      // so a green graded nothing. `null` = NOT MEASURED.
+      expect(r.optionsLegOk).toBeNull();
+      expect(r.optionsLegMeasuredCount).toBe(0);
+      expect(r.optionsLegSlavedCount).toBe(0);
+    });
+
+    it('TRA-2641 — a JOURNAL-SLAVED row is not independent evidence: the file leg IS the day cell', () => {
+      // THE LIVE SHAPE, `admin` 2026-07-29 under build 239f2b5. TRA-2641's
+      // `syncEodReportOptionsLegs` writes the day cell's `optionsDailyPnl` into
+      // the report file's options leg on every `journal`/`journal-repair` row, so
+      // `optionsLegDrift` is 0 BY CONSTRUCTION — one source vs a copy of itself.
+      // A boolean rendered this as a green, and it flipped false→true across that
+      // deploy (`maxOptionsLegDriftUsd` 217.50 → 0.00), which reads as "fixed".
+      const r = reconcilePnl(
+        [{ ...snap('2026-07-29', -17.87, 250.01), optionsDailyPnlSource: 'journal-repair' }],
+        new Map([['2026-07-29', 250.01]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01]]), // written FROM the day cell above
+        new Map([['2026-07-29', 0]]),
+      );
+      expect(r.days[0]).toMatchObject({ optionsLegDrift: 0, optionsDailyPnlSource: 'journal-repair' });
+      expect(r.optionsLegOk).toBeNull();
+      expect(r.optionsLegMeasuredCount).toBe(0);
+      expect(r.optionsLegSlavedCount).toBe(1);
+      // The numbers stay fully visible — `null` suppresses the VERDICT, not evidence.
+      expect(r.maxOptionsLegDriftUsd).toBe(0);
+    });
+
+    it('TRA-2641 — MUTATION: the same agreeing legs on an UNSLAVED row ARE evidence ⇒ true', () => {
+      // The discriminator. Identical numbers, identical 0.00 drift; the ONLY
+      // difference is whether a writer joined the operands. Without this the fix
+      // could be "always null", which grades exactly as much as always-true did.
+      const r = reconcilePnl(
+        [{ ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' }],
+        new Map([['2026-07-29', 250.01]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01]]),
+        new Map([['2026-07-29', 0]]),
+      );
       expect(r.optionsLegOk).toBe(true);
+      expect(r.optionsLegMeasuredCount).toBe(1);
+      expect(r.optionsLegSlavedCount).toBe(0);
+    });
+
+    it('TRA-2641 — RED outranks NOT MEASURED: a slaved row that STILL disagrees is a real defect', () => {
+      // If the sync writer failed to persist, a journal-slaved row can genuinely
+      // disagree. The empty-denominator `null` must never swallow that — it is
+      // evidence `syncEodReportOptionsLegs` did not run, not evidence of nothing.
+      const r = reconcilePnl(
+        [{ ...snap('2026-07-17', 0, 0), optionsDailyPnlSource: 'journal-repair' }],
+        new Map([['2026-07-17', 217.5]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-17', 217.5]]), // file never got rewritten to 0
+        new Map([['2026-07-17', 0]]),
+      );
+      expect(r.days[0]).toMatchObject({ optionsLegDrift: 217.5 });
+      expect(r.optionsLegMeasuredCount).toBe(0); // no independent cohort...
+      expect(r.optionsLegOk).toBe(false);        // ...and STILL red, not null
+      expect(r.optionsLegOffendingDates).toEqual(['2026-07-17']);
+    });
+
+    it('TRA-2641 — an UNSLAVED row with 0.00 on BOTH legs is vacuous, not a pass', () => {
+      // The other 20 of the 167 live post-baseline rows. Two zeroes agreeing is
+      // the same non-evidence that killed `stockLegOk`.
+      const r = reconcilePnl(
+        [snap('2026-07-13', 0, 0)],
+        new Map([['2026-07-13', 0]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-13', 0]]),
+        new Map([['2026-07-13', 0]]),
+      );
+      expect(r.days[0]).toMatchObject({ optionsLegDrift: 0 });
+      expect(r.optionsLegMeasuredCount).toBe(0);
+      expect(r.optionsLegOk).toBeNull();
     });
 
     it('TRA-2633 — a row with stockDaily 0 is NOT evidence, so it cannot vacuously pass', () => {
