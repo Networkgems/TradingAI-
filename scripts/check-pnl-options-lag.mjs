@@ -172,8 +172,66 @@ export function findPriorOptionsLagGradeableDates(days) {
   return gradeable;
 }
 
+/**
+ * TRA-2630 AC2 — the first session date written UNDER the deployed Defect-B fix.
+ *
+ * TRA-2629 shipped in `ec05639`, deployed to bqb1 2026-07-30T04:36:04Z. Every EOD
+ * row before that was written by the broken writer, so the 18 historical lag
+ * sessions on 13 demo books CANNOT clear and are NOT a regression. AC2 is a
+ * DELTA — "no NEW lag session dated on/after this date" — and grading it as an
+ * absolute reports a red on a fix that works.
+ */
+export const AC2_FIX_DEPLOY_DATE = '2026-07-30';
+
+/**
+ * TRA-2630 AC2 — THE DELTA, WITH ITS OWN DENOMINATOR.
+ *
+ * Splits lag hits into the pre-fix baseline and sessions written under the fix,
+ * and — this is the load-bearing half — counts how many books could have
+ * produced a post-fix hit at all. Three states, not two:
+ *
+ *  - PASS  — at least one book carries a gradeable post-fix session, none lagged;
+ *  - FAIL  — a post-fix session lagged;
+ *  - BLIND — NO book carries a gradeable post-fix session, so "0 new lag" is the
+ *            absence of a measurement, not a pass.
+ *
+ * The BLIND arm is the one that matters on a scheduled read. This guard's grader
+ * fires at 21:30 ET, 30 minutes after the 21:00 ET EOD writer. If that writer is
+ * late, skipped, or the row is absent for any other reason, every book reports
+ * zero new lag sessions and a two-state verdict calls that a green — the exact
+ * shape of TRA-2637, where an ABSENT EOD row scored `drift: 0`.
+ *
+ * "Gradeable" carries the same meaning as {@link findPriorOptionsLagGradeableDates}:
+ * the session's PRIOR row must carry a non-zero `optionsDaily`, because only then
+ * does the lag hypothesis name one exact `stockDaily` that an observation can
+ * refute. A post-fix session whose prior was `0.00` reads clean either way, so it
+ * is not evidence — 7 of the 13 currently-lagging books are in exactly that state.
+ */
+export function gradeAc2Delta(engines, since) {
+  const cutoff = String(since);
+  let gradeableBookCount = 0;
+  let rowBookCount = 0;
+  const newLag = [];
+  for (const e of engines) {
+    const days = Array.isArray(e?.days) ? e.days : [];
+    const sorted = [...days].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    if (sorted.some((d) => String(d.date) >= cutoff)) rowBookCount++;
+    // The denominator: a post-fix session whose PRIOR carried non-zero optionsDaily.
+    const gradeableDates = findPriorOptionsLagGradeableDates(sorted).filter((d) => String(d) >= cutoff);
+    if (gradeableDates.length > 0) gradeableBookCount++;
+    const hits = findPriorOptionsLagDates(sorted).filter((h) => String(h.date) >= cutoff);
+    if (hits.length > 0) {
+      newLag.push({ username: e.username ?? '(unnamed)', mode: e.mode ?? '(unknown)', hits });
+    }
+  }
+  const rows = newLag.reduce((n, r) => n + r.hits.length, 0);
+  const liveRows = newLag.filter((r) => r.mode === 'live').reduce((n, r) => n + r.hits.length, 0);
+  const verdict = rows > 0 ? 'FAIL' : gradeableBookCount === 0 ? 'BLIND' : 'PASS';
+  return { since: cutoff, verdict, rows, liveRows, books: newLag, gradeableBookCount, rowBookCount };
+}
+
 /** Grade a whole payload. Pure — no I/O, so `--selftest` can drive it. */
-export function gradePayload(payload) {
+export function gradePayload(payload, opts = {}) {
   const engines = Array.isArray(payload?.engines) ? payload.engines : null;
   if (engines == null || engines.length === 0) {
     return { verdict: 'BLIND', reason: 'payload carried no engines[] array', live: [], demo: [] };
@@ -218,6 +276,10 @@ export function gradePayload(payload) {
     verdict,
     live,
     demo,
+    // TRA-2630 AC2 — the delta verdict, reported ALONGSIDE the absolute one above.
+    // The absolute verdict stays DEMO_LAG for as long as the 18 pre-fix rows exist,
+    // so it can never answer "did the fix work"; this field is what AC2 grades.
+    ac2: gradeAc2Delta(engines, opts.since ?? AC2_FIX_DEPLOY_DATE),
     engineCount: engines.length,
     liveBookCount,
     liveGradeableBookCount,
@@ -474,7 +536,12 @@ async function main(argv) {
     return EXIT_BLIND;
   }
 
-  const g = gradePayload(payload);
+  // `--since=YYYY-MM-DD` moves the AC2 delta boundary. Defaults to the TRA-2629
+  // fix-deploy date; a later fix gets its own boundary rather than inheriting a
+  // baseline that was never written under it.
+  const sinceArg = argv.find((a) => a.startsWith('--since='));
+  const since = sinceArg ? sinceArg.slice('--since='.length) : AC2_FIX_DEPLOY_DATE;
+  const g = gradePayload(payload, { since });
   if (g.verdict === 'BLIND') {
     console.error(`BLIND — ${g.reason}. Exiting 3; this is NOT a pass.`);
     return EXIT_BLIND;
@@ -572,6 +639,7 @@ async function main(argv) {
       `  CLEAN — 0 books show the lag, on either mode (${g.liveBookCount} live book(s) graded,`
       + ` ${g.liveGradeableBookCount} with a gradeable session).`,
     );
+    printAc2(g.ac2);
     // TRA-2635 — and a clean lag verdict is NOT sufficient on its own. This early
     // `return EXIT_CLEAN` is the exact shape CEO retracted: it passes the fleet on
     // an axis that cannot fire on a book the credit path never reached.
@@ -592,6 +660,10 @@ async function main(argv) {
   }
   const lagRows = [...g.live, ...g.demo].reduce((n, r) => n + r.hits.length, 0);
   console.log('');
+  // Printed BEFORE every early return below — including the exit-4 credit
+  // short-circuit, which outranks demo lag on the EXIT CODE but must not
+  // suppress the one verdict AC2 is graded on.
+  printAc2(g.ac2);
 
   if (g.live.length > 0) {
     console.error(`LIVE LAG — ${g.live.length} mode:live book(s), ${lagRows} lag session(s) total.`);
@@ -639,6 +711,48 @@ async function main(argv) {
     console.error('never reached. The demo-only severity verdict is NOT confirmed by this run.');
   }
   return EXIT_DEMO_LAG;
+}
+
+/**
+ * TRA-2630 AC2 — print the DELTA verdict. Always runs before the early returns,
+ * because the exit code is owned by whichever axis outranks (a live credit
+ * shortfall beats demo lag) and AC2 must stay readable underneath it.
+ */
+function printAc2(ac2) {
+  if (!ac2) return;
+  console.log(`TRA-2630 AC2 — NEW lag sessions dated >= ${ac2.since} (the fix-deploy boundary):`);
+  if (ac2.verdict === 'BLIND') {
+    console.log(
+      `  BLIND — NOT MEASURED. 0 books carry a gradeable session on/after ${ac2.since}`
+      + ` (${ac2.rowBookCount} book(s) have a row at all).`,
+    );
+    console.log('  This is NOT a pass. "No new lag session" and "no session to grade" are the');
+    console.log('  same output here — the TRA-2637 shape, where an absent EOD row scored drift 0.');
+    console.log('  The 21:00 ET writer has not produced a gradeable row yet; re-run, do not grade.');
+    return;
+  }
+  if (ac2.verdict === 'PASS') {
+    console.log(
+      `  PASS — 0 new lag sessions across ${ac2.gradeableBookCount} book(s) that COULD have shown one.`,
+    );
+    console.log('  The pre-fix rows listed above are the baseline and do not clear retroactively.');
+    return;
+  }
+  console.log(
+    `  FAIL — ${ac2.rows} NEW lag session(s) written under the deployed fix,`
+    + ` over ${ac2.gradeableBookCount} gradeable book(s).`,
+  );
+  for (const row of ac2.books) {
+    for (const h of row.hits) {
+      console.log(
+        `      ${row.mode === 'live' ? 'LIVE ' : 'demo '} ${row.username} ${h.date}`
+        + ` stockDaily ${h.stockDaily.toFixed(2)} == ${h.priorDate} optionsDaily ${h.priorOptionsDaily.toFixed(2)}`,
+      );
+    }
+  }
+  if (ac2.liveRows > 0) {
+    console.log('  A mode:live book is among them — TRA-2630\'s demo-only verdict is FALSIFIED.');
+  }
 }
 
 /** TRA-2635 — the real-money escalation, in one place so both call sites agree. */
@@ -763,6 +877,110 @@ function selftest() {
       ],
     }).verdict,
     'LIVE_LAG',
+  );
+
+  // ── TRA-2630 AC2 DELTA ────────────────────────────────────────────────────
+  // The pre-fix baseline: 18 rows on 07-28/07-29 that CANNOT clear. Grading AC2
+  // as an absolute reports these as a red on a fix that works.
+  const PREFIX_BASELINE = [
+    { username: 'Richard', mode: 'demo', days: [
+      { date: '2026-07-27', stockDaily: 0, optionsDaily: 67.5 },
+      { date: '2026-07-28', stockDaily: 67.5, optionsDaily: 22.5 },
+      { date: '2026-07-29', stockDaily: 22.5, optionsDaily: -5.11 },
+    ] },
+  ];
+
+  check(
+    'AC2: pre-fix lag rows are EXCLUDED from the delta',
+    gradeAc2Delta(PREFIX_BASELINE, '2026-07-30').rows,
+    0,
+  );
+
+  // THE ONE THAT MATTERS. 0 new lag rows, but no session on/after the cutoff —
+  // the 21:30 ET grader firing before the 21:00 ET writer landed a row. A
+  // two-state verdict calls this a pass; it measured nothing.
+  check(
+    'AC2: no post-fix session at all => BLIND, never PASS',
+    gradeAc2Delta(PREFIX_BASELINE, '2026-07-30').verdict,
+    'BLIND',
+  );
+
+  // A post-fix row EXISTS but its prior optionsDaily is 0.00 — the predicate has
+  // no failing state on it, so it is still not evidence. 7 of the 13 lagging
+  // books are in exactly this state.
+  check(
+    'AC2: post-fix row with a ZERO prior is still BLIND, not PASS',
+    gradeAc2Delta([
+      { username: 'qa_zero', mode: 'demo', days: [
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0 },
+        { date: '2026-07-30', stockDaily: 0, optionsDaily: 0 },
+      ] },
+    ], '2026-07-30').verdict,
+    'BLIND',
+  );
+
+  // A genuine pass: the prior carried 250.01, so the hypothesis predicted
+  // stockDaily == 250.01 and the observation refuted it.
+  check(
+    'AC2: post-fix row with a non-zero prior that does NOT lag => PASS',
+    gradeAc2Delta([
+      { username: 'admin', mode: 'live', days: [
+        { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01 },
+        { date: '2026-07-30', stockDaily: -3.4, optionsDaily: 12 },
+      ] },
+    ], '2026-07-30').verdict,
+    'PASS',
+  );
+
+  // The real-money falsifier, spelled exactly as the routine pins it.
+  check(
+    'AC2: admin 07-30 stockDaily == 250.01 => FAIL with a live row',
+    (() => {
+      const r = gradeAc2Delta([
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01 },
+          { date: '2026-07-30', stockDaily: 250.01, optionsDaily: 0 },
+        ] },
+      ], '2026-07-30');
+      return [r.verdict, r.rows, r.liveRows];
+    })(),
+    ['FAIL', 1, 1],
+  );
+
+  // A NEW demo lag must fail the delta even while the baseline rows sit above it.
+  check(
+    'AC2: a new demo lag on 07-30 => FAIL, and is not masked by the baseline',
+    (() => {
+      const r = gradeAc2Delta([
+        ...PREFIX_BASELINE,
+        { username: 'qa_new', mode: 'demo', days: [
+          { date: '2026-07-29', stockDaily: 0, optionsDaily: 42 },
+          { date: '2026-07-30', stockDaily: 42, optionsDaily: 0 },
+        ] },
+      ], '2026-07-30');
+      return [r.verdict, r.rows, r.liveRows];
+    })(),
+    ['FAIL', 1, 0],
+  );
+
+  // The gradeable count is a DENOMINATOR, not a book count: a book with a
+  // post-fix row but a zero prior must not inflate it.
+  check(
+    'AC2: gradeableBookCount counts only books whose post-fix prior is non-zero',
+    (() => {
+      const r = gradeAc2Delta([
+        { username: 'qa_zero', mode: 'demo', days: [
+          { date: '2026-07-29', stockDaily: 0, optionsDaily: 0 },
+          { date: '2026-07-30', stockDaily: 0, optionsDaily: 0 },
+        ] },
+        { username: 'admin', mode: 'live', days: [
+          { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 250.01 },
+          { date: '2026-07-30', stockDaily: -3.4, optionsDaily: 12 },
+        ] },
+      ], '2026-07-30');
+      return [r.rowBookCount, r.gradeableBookCount];
+    })(),
+    [2, 1],
   );
 
   check(
