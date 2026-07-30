@@ -95,11 +95,15 @@ export const PNL_LEG_COVERAGE_NOTE =
 export const PNL_DRIFT_DECOMPOSITION_NOTE =
   'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2633 CORRECTION: this note previously said to grade `stockLegOk` / `optionsLegOk`. Grade **`optionsLegOk` only** — it is options-vs-options and verified Defect-A-immune (identity exact on 167/167 live rows, 0 of 7 offenders explained by `stockDaily`). `stockLegOk` inherits the SAME lossy source `drift` does and is now TRI-STATE: `null` = NOT MEASURED, which is what the live fleet returns today. Treating that `null` as a pass is the bug this correction exists to stop.';
 
+export const PNL_ABSENT_EOD_ROW_NOTE =
+  'TRA-2637: an ABSENT EOD row is NOT a pass. `drift` is now `null` (was 0) on any session whose `eodCombined` is null, and the absence is graded on its own axis — per-row `eodRowMissing`, per-book `eodRowsPresentOk` / `eodRowMissingDates` / `eodRowGradeableCount`, fleet-level `liveEodRowsPresentOk` / `liveEodRowMissingBooks`. Live proof: `admin` 2026-07-29 served `drift: 0` with `eodCombined: null` over 6 journal closes worth +$250.01. The presence verdicts are TRI-STATE; `null` = NOT MEASURED (empty cohort) and must never be read as green.';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
   '/api/health/option-journal folds ALL modes; the Desk calendar filters mode:\'demo\'. Comparing the two mixes live rows into one side.',
   PNL_DRIFT_DECOMPOSITION_NOTE,
+  PNL_ABSENT_EOD_ROW_NOTE,
 ];
 
 /** Penny tolerance — a drift at or below this is treated as clean (rounding). */
@@ -314,8 +318,35 @@ export interface PnlReconcileDay {
    * neither is silently clamped.
    */
   optionsCreditedInWindow: number | null;
-  /** eodCombined − (stockDaily + optionsDaily); 0 when no EOD file to compare. */
-  drift: number;
+  /**
+   * eodCombined − (stockDaily + optionsDaily).
+   *
+   * TRA-2637 (QuantTrader) — **`null` when `eodCombined` is null, NEVER 0.** This
+   * used to score `0` on a row whose EOD report file does not exist, with the
+   * rationale "absence is not a mismatch". True, but a `0` here is the SAME value
+   * a perfectly reconciled session writes, so every gate that counts matches read
+   * a MISSING session as a pass. Live proof, `admin` (the only `mode: live` book)
+   * on 2026-07-29 at 02:17:30Z: `eodCombined: null`, `eodOptionsPnl: null`,
+   * `journalOptionsPnl: 250.01` over 6 real closes — and `drift: 0`.
+   * `optionsFalseZero` was `false` too, so the false-zero tripwire could not see
+   * it either: the value was not a wrong zero, it was absent.
+   *
+   * Absence now has its own state on three axes — this `null`, the per-row
+   * {@link PnlReconcileDay.eodRowMissing} flag, and the cohort verdict
+   * {@link PnlReconcileResult.eodRowsPresentOk}. `offendingDates` / `maxDriftUsd`
+   * skip null rows exactly as they always effectively did, so no existing number
+   * moves; what changes is that a consumer can no longer mistake "nothing to
+   * reconcile" for "reconciled".
+   */
+  drift: number | null;
+  /**
+   * TRA-2637 — TRUE when this session has NO EOD report file (`eodCombined` is
+   * null), i.e. there is nothing to reconcile against. Published as its own
+   * boolean so a gate does not have to reason about a nullable number to see the
+   * state. See {@link PnlReconcileResult.eodRowMissingDates} for the graded
+   * subset (sessions that actually had activity).
+   */
+  eodRowMissing: boolean;
   /**
    * TRA-1636 — true when `date` predates the reconciliation baseline, i.e. the
    * snapshot was written by pre-fix (buggy) code. The row is still returned for
@@ -352,6 +383,31 @@ export interface PnlReconcileResult {
   falseZeroDates: string[];
   /** TRA-2302 — false iff at least one `falseZeroDates` entry was found. */
   optionsFalseZeroOk: boolean;
+  /**
+   * TRA-2637 — evaluated sessions that HAD activity (a journal close, or a
+   * non-zero P&L leg) and yet have **no EOD report row at all**. This is the
+   * absence `drift: 0` used to render as a clean reconciliation.
+   *
+   * Not folded into `ok` — same additive discipline as `falseZeroDates`. Read
+   * `eodRowsPresentOk` for the verdict.
+   */
+  eodRowMissingDates: string[];
+  /**
+   * TRA-2637 — TRI-STATE verdict on EOD-row presence over the sessions that had
+   * something to reconcile:
+   *
+   *   - `false` — an active session has no EOD report row. Nothing downstream
+   *     reconciles that session, and it previously read GREEN everywhere.
+   *   - `true`  — every active evaluated session wrote its row.
+   *   - `null`  — NOT MEASURED: no evaluated session had any activity, so the
+   *     check never looked at anything. Never a pass; callers must fail closed.
+   *
+   * `eodRowGradeableCount` is the denominator that makes the empty cohort
+   * distinguishable from a graded one.
+   */
+  eodRowsPresentOk: boolean | null;
+  /** TRA-2637 — size of the cohort `eodRowsPresentOk` was graded over. */
+  eodRowGradeableCount: number;
   /**
    * TRA-2302 — how many snapshots never had `optionsDailyPnl` written at all.
    * A high count over days the book was trading options means the writer was
@@ -679,6 +735,75 @@ export function summarizeLiveCreditObservation(
 }
 
 /**
+ * TRA-2637 (QuantTrader) — **EOD-row presence, folded over the live cohort.**
+ *
+ * The finding this exists for: on 2026-07-30T02:17:30Z the only `mode: live`
+ * book on bqb1 had NO EOD row for 2026-07-29 while its durable journal recorded
+ * 6 closes worth +$250.01 — and the endpoint served `drift: 0` for that session.
+ * 1 of 47 books was in that state and it was the real-money one, so no firm-wide
+ * average could surface it either.
+ *
+ * ROOT CAUSE, from the prod tape (see TRA-2637 for the full log excerpts): the
+ * 21:00-ET archive never ran for 2026-07-29 on ANY book — the pre-TRA-2498 build
+ * had already misfired it at **00:00 ET** that morning (`archive trigger fired
+ * … etTime:"24:00 ET"`) and persisted `lastArchiveDate: 2026-07-29`, which
+ * dedup-suppressed the real evening fire. The live book differs from the 46 demo
+ * books only because the report directory is MODE-KEYED: that midnight misfire
+ * wrote admin's row to `…/reports/demo/2026-07-29.json` (admin resolved as
+ * `mode: demo` on that boot — the TRA-2649 boot-arm instability), while this
+ * endpoint reads `…/reports/live/`. So the writer and the reader disagreed about
+ * which book they were looking at, and the demo books' misfire write landed in
+ * the same directory their reader uses.
+ *
+ * That makes a mode-scoped presence verdict load-bearing rather than cosmetic: a
+ * book whose mode flips between the write and the read loses its row on exactly
+ * this axis, and on no other axis this endpoint publishes.
+ *
+ * TRI-STATE and folded like {@link PnlReconcileResult.stockLegOk} — a red book
+ * wins, otherwise one genuinely-measured green is required, all-NOT-MEASURED
+ * stays `null`. `liveEodRowBookCount` is the denominator; bqb1 serves an EMPTY
+ * live cohort intermittently (TRA-2649), and without the count a `null` there is
+ * indistinguishable from a graded pass.
+ */
+export function summarizeLiveEodRowPresence(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    eodRowsPresentOk: boolean | null;
+    eodRowMissingDates: string[];
+    eodRowGradeableCount: number;
+  }>,
+): {
+  liveEodRowBookCount: number;
+  liveEodRowsPresentOk: boolean | null;
+  liveEodRowMissingBooks: Array<{
+    username: string;
+    dates: string[];
+    gradeableCount: number;
+  }>;
+} {
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  return {
+    liveEodRowBookCount: liveBooks.length,
+    liveEodRowsPresentOk: liveBooks.some(e => e.eodRowsPresentOk === false)
+      ? false
+      : liveBooks.some(e => e.eodRowsPresentOk === true)
+        ? true
+        : null,
+    // Named, not counted: "one live book is missing a row" is not actionable
+    // without the dates, and this endpoint already publishes each book's full
+    // per-session series under its username.
+    liveEodRowMissingBooks: liveBooks
+      .filter(e => e.eodRowMissingDates.length > 0)
+      .map(e => ({
+        username: e.username,
+        dates: e.eodRowMissingDates,
+        gradeableCount: e.eodRowGradeableCount,
+      })),
+  };
+}
+
+/**
  * TRA-2302 — fold durable option-trade-journal rows into a per-ET-day close
  * census for ONE book.
  *
@@ -738,7 +863,9 @@ export function reconcilePnl(
       const eodCombined = eodCombinedByDate.has(s.date)
         ? round2(eodCombinedByDate.get(s.date)!)
         : null;
-      const drift = eodCombined == null ? 0 : round2(eodCombined - (stockDaily + optionsDaily));
+      // TRA-2637 — ABSENT stays null. `0` here made a session with no EOD report
+      // read bit-identical to a session that reconciled to the cent.
+      const drift = eodCombined == null ? null : round2(eodCombined - (stockDaily + optionsDaily));
       const belowBaseline = baselineDate != null && s.date < baselineDate;
       // TRA-2302 — a day is only claimed as a FALSE zero when a census exists
       // for this book AND it names closes the day-only ledger did not receive.
@@ -803,6 +930,7 @@ export function reconcilePnl(
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
         optionsCreditedInWindow: null,
         drift,
+        eodRowMissing: eodCombined == null,
         belowBaseline,
       };
     });
@@ -849,10 +977,31 @@ export function reconcilePnl(
   }
 
   const evaluated = days.filter(d => !d.belowBaseline);
+  // TRA-2637 — `drift` is now `null` on a row with no EOD report. The explicit
+  // null guard is not a behaviour change (an absent row scored 0 before and so
+  // passed both filters); it keeps `ok` / `maxDriftUsd` byte-identical for every
+  // existing consumer while the absence itself moves onto its own axis below.
   const offendingDates = evaluated
-    .filter(d => Math.abs(d.drift) > PNL_RECONCILE_TOLERANCE_USD)
+    .filter(d => d.drift != null && Math.abs(d.drift) > PNL_RECONCILE_TOLERANCE_USD)
     .map(d => d.date);
-  const maxDriftUsd = evaluated.reduce((m, d) => Math.max(m, Math.abs(d.drift)), 0);
+  const maxDriftUsd = evaluated.reduce((m, d) => Math.max(m, Math.abs(d.drift ?? 0)), 0);
+  // TRA-2637 — THE ABSENCE AXIS. Cohort = evaluated sessions that had something
+  // to reconcile: a real option close per the durable journal, or a non-zero P&L
+  // leg. The activity term is what gives this a failing state AND keeps it from
+  // manufacturing one: a genuinely quiet session with no report file has nothing
+  // to reconcile, so it is not an offender — but its `drift` is `null`, not 0, so
+  // it is not a pass either. The journal term is disjunctive (not required)
+  // because the census can be unavailable, and an unreadable journal must not
+  // silently empty the cohort — the `every`-on-the-empty-set trap.
+  const eodRowGradeable = evaluated.filter(
+    d =>
+      (d.journalCloses ?? 0) > 0
+      || Math.abs(d.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD
+      || Math.abs(d.stockDaily) > PNL_RECONCILE_TOLERANCE_USD,
+  );
+  const eodRowMissingDates = eodRowGradeable.filter(d => d.eodRowMissing).map(d => d.date);
+  const eodRowsPresentOk: boolean | null =
+    eodRowGradeable.length === 0 ? null : eodRowMissingDates.length === 0;
   // TRA-2630 — the per-leg verdicts. Baseline-gated exactly like `ok`: a
   // pre-fix row's stock leg is un-reconcilable for the same reason its `drift`
   // is, so grading it would hand these new fields the same dead state `ok` has.
@@ -988,6 +1137,9 @@ export function reconcilePnl(
     belowBaselineCount: days.length - evaluated.length,
     falseZeroDates,
     optionsFalseZeroOk: falseZeroDates.length === 0,
+    eodRowMissingDates,
+    eodRowsPresentOk,
+    eodRowGradeableCount: eodRowGradeable.length,
     optionsFieldMissingCount: days.filter(d => !d.optionsFieldPresent).length,
     optionsDailyPnlSourceCounts: days.reduce<Record<string, number>>((acc, d) => {
       const key = d.optionsDailyPnlSource ?? 'legacy-bucket';

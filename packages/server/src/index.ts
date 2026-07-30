@@ -22,6 +22,7 @@ import {
   foldJournalClosesByEtDay,
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
+  summarizeLiveEodRowPresence,
 } from './pnl-reconciliation.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
@@ -4184,6 +4185,20 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // `optionsCreditedCumulative`) rather than off a delta. Tri-state; `null`
       // is NOT MEASURED and is never a pass.
       ...summarizeLiveCreditObservation(engines),
+      // TRA-2637 (QuantTrader) — THE ABSENCE AXIS. Every verdict above grades a
+      // VALUE; none of them can see a session that has no row at all, and the
+      // live book served exactly that on 2026-07-29 while reporting `drift: 0`.
+      // Tri-state, and `liveEodRowBookCount` is the denominator that keeps a
+      // `null` from being read as a pass when the live cohort is empty.
+      eodRowsPresentOk: engines.some(e => e.eodRowsPresentOk === false)
+        ? false
+        : engines.some(e => e.eodRowsPresentOk === true)
+          ? true
+          : null,
+      eodRowMissingBooks: engines
+        .filter(e => e.eodRowMissingDates.length > 0)
+        .map(e => ({ username: e.username, mode: e.mode, dates: e.eodRowMissingDates })),
+      ...summarizeLiveEodRowPresence(engines),
       engines,
     });
   } catch (err) {

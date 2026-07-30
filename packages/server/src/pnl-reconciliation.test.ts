@@ -5,6 +5,7 @@ import {
   foldJournalClosesByEtDay,
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
+  summarizeLiveEodRowPresence,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
 } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
@@ -63,7 +64,10 @@ describe('reconcilePnl', () => {
     const r = reconcilePnl(snaps, new Map());
     expect(r.ok).toBe(true);
     expect(r.days[0].eodCombined).toBeNull();
-    expect(r.days[0].drift).toBe(0);
+    // TRA-2637 — was `0`, which is the same value a reconciled day writes. Absence
+    // is still not a MISMATCH (`ok` stays true) but it is no longer a PASS.
+    expect(r.days[0].drift).toBeNull();
+    expect(r.days[0].eodRowMissing).toBe(true);
   });
 
   it('treats a legacy snapshot without optionsDailyPnl as 0 options', () => {
@@ -91,7 +95,7 @@ describe('reconcilePnl', () => {
       // the dirty legacy row is still surfaced, just flagged + excluded
       const legacy = r.days.find(d => d.date === '2026-05-18')!;
       expect(legacy.belowBaseline).toBe(true);
-      expect(Math.abs(legacy.drift)).toBeGreaterThan(1000);
+      expect(Math.abs(legacy.drift!)).toBeGreaterThan(1000);
     });
 
     it('still flags a post-baseline day that genuinely drifts', () => {
@@ -911,5 +915,148 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     const r = summarizeLiveCreditObservation([notMeasured]);
     expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
     expect(r.liveUncreditedOptionsUsd).toBeCloseTo(733.6, 2);
+  });
+});
+
+// TRA-2637 (QuantTrader) — AN ABSENT EOD ROW IS NOT A PASS.
+//
+// The live tape this locks: on 2026-07-30T02:17:30Z `admin` (the only mode:live
+// book on bqb1) served 2026-07-29 as `eodCombined: null`, `eodOptionsPnl: null`,
+// `journalOptionsPnl: 250.01` over 6 real closes — and `drift: 0`. Every gate
+// that counts matches read that session GREEN, and `optionsFalseZero` was false
+// too because the value was not a wrong zero, it was missing.
+describe('TRA-2637 — absent EOD row is its own state, not a reconciled 0', () => {
+  const closes = (date: string, n: number, pnl: number) =>
+    new Map([[date, { closes: n, realizedPnlUsd: pnl }]]);
+
+  it('reproduces the live admin 2026-07-29 row: null drift, not 0', () => {
+    const snaps = [snap('2026-07-29', -17.87, 250.01)];
+    const r = reconcilePnl(
+      snaps,
+      new Map(), // no EOD report file for the session — the defect
+      '2026-07-12',
+      closes('2026-07-29', 6, 250.01),
+      new Map(),
+      new Map(),
+    );
+    expect(r.days[0].eodCombined).toBeNull();
+    expect(r.days[0].drift).toBeNull();
+    expect(r.days[0].eodRowMissing).toBe(true);
+    // The pre-existing tripwires are all blind to it, which is why a new axis
+    // was needed rather than a tweak to one of them.
+    expect(r.days[0].optionsFalseZero).toBe(false);
+    expect(r.ok).toBe(true);
+    expect(r.optionsFalseZeroOk).toBe(true);
+    // ...and the new axis is what actually catches it.
+    expect(r.eodRowsPresentOk).toBe(false);
+    expect(r.eodRowMissingDates).toEqual(['2026-07-29']);
+    expect(r.eodRowGradeableCount).toBe(1);
+  });
+
+  it('is GREEN when every active session wrote its row', () => {
+    const snaps = [snap('2026-07-28', -0.94, 68), snap('2026-07-29', -17.87, 250.01)];
+    const eod = new Map([['2026-07-28', 67.06], ['2026-07-29', 232.14]]);
+    const r = reconcilePnl(snaps, eod, '2026-07-12');
+    expect(r.eodRowsPresentOk).toBe(true);
+    expect(r.eodRowMissingDates).toEqual([]);
+    expect(r.eodRowGradeableCount).toBe(2);
+  });
+
+  it('is NOT MEASURED (null) — never green — when no evaluated session had activity', () => {
+    const snaps = [snap('2026-07-29', 0, 0)];
+    const r = reconcilePnl(snaps, new Map(), '2026-07-12');
+    expect(r.eodRowGradeableCount).toBe(0);
+    expect(r.eodRowsPresentOk).toBeNull();
+    // The row is still absent-flagged; only the VERDICT abstains.
+    expect(r.days[0].eodRowMissing).toBe(true);
+    expect(r.days[0].drift).toBeNull();
+  });
+
+  it('does not accuse a genuinely quiet session that has no report file', () => {
+    const snaps = [snap('2026-07-28', 0, 0), snap('2026-07-29', -17.87, 250.01)];
+    const eod = new Map([['2026-07-29', 232.14]]);
+    const r = reconcilePnl(snaps, eod, '2026-07-12');
+    expect(r.eodRowMissingDates).toEqual([]);
+    expect(r.eodRowsPresentOk).toBe(true);
+    expect(r.eodRowGradeableCount).toBe(1);
+  });
+
+  it('grades off a non-zero P&L leg even when the journal census is unavailable', () => {
+    // An unreadable journal must not silently empty the cohort — that is the
+    // `every`-is-true-on-the-empty-set trap this module has shipped twice.
+    const snaps = [snap('2026-07-29', -17.87, 250.01)];
+    const r = reconcilePnl(snaps, new Map(), '2026-07-12', null);
+    expect(r.days[0].journalCloses).toBeNull();
+    expect(r.eodRowGradeableCount).toBe(1);
+    expect(r.eodRowsPresentOk).toBe(false);
+  });
+
+  it('leaves `ok` / `maxDriftUsd` / `offendingDates` byte-identical', () => {
+    const snaps = [snap('2026-07-28', 100, 30), snap('2026-07-29', -17.87, 250.01)];
+    const eod = new Map([['2026-07-28', 175]]); // 07-28 drifts +45, 07-29 absent
+    const r = reconcilePnl(snaps, eod, '2026-07-12');
+    expect(r.ok).toBe(false);
+    expect(r.offendingDates).toEqual(['2026-07-28']);
+    expect(r.maxDriftUsd).toBeCloseTo(45, 2);
+  });
+
+  it('excludes a below-baseline absent row from the verdict', () => {
+    const snaps = [snap('2026-05-18', 277.38, 0), snap('2026-07-29', -17.87, 250.01)];
+    const eod = new Map([['2026-07-29', 232.14]]);
+    const r = reconcilePnl(snaps, eod, '2026-07-12');
+    expect(r.eodRowMissingDates).toEqual([]);
+    expect(r.eodRowsPresentOk).toBe(true);
+  });
+});
+
+describe('TRA-2637 — summarizeLiveEodRowPresence', () => {
+  const book = (
+    username: string,
+    mode: string,
+    eodRowsPresentOk: boolean | null,
+    eodRowMissingDates: string[] = [],
+    eodRowGradeableCount = 3,
+  ) => ({ username, mode, eodRowsPresentOk, eodRowMissingDates, eodRowGradeableCount });
+
+  it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
+    // bqb1 serves this state intermittently (TRA-2649 boot-arm miss), and it is
+    // the same instability that split the write path in the first place.
+    const r = summarizeLiveEodRowPresence([book('Richard', 'demo', false, ['2026-07-29'])]);
+    expect(r.liveEodRowBookCount).toBe(0);
+    expect(r.liveEodRowsPresentOk).toBeNull();
+    expect(r.liveEodRowMissingBooks).toEqual([]);
+  });
+
+  it('goes RED on the live book and names the dates', () => {
+    const r = summarizeLiveEodRowPresence([
+      book('admin', 'live', false, ['2026-07-29'], 12),
+      book('Richard', 'demo', true),
+    ]);
+    expect(r.liveEodRowsPresentOk).toBe(false);
+    expect(r.liveEodRowMissingBooks).toEqual([
+      { username: 'admin', dates: ['2026-07-29'], gradeableCount: 12 },
+    ]);
+  });
+
+  it('a RED live book wins over a green one', () => {
+    const r = summarizeLiveEodRowPresence([
+      book('admin', 'live', true),
+      book('operator2', 'live', false, ['2026-07-29']),
+    ]);
+    expect(r.liveEodRowsPresentOk).toBe(false);
+  });
+
+  it('claims green only off a genuinely measured live book', () => {
+    const r = summarizeLiveEodRowPresence([
+      book('admin', 'live', true),
+      book('operator2', 'live', null, [], 0),
+    ]);
+    expect(r.liveEodRowsPresentOk).toBe(true);
+  });
+
+  it('all-NOT-MEASURED live books stay null', () => {
+    const r = summarizeLiveEodRowPresence([book('admin', 'live', null, [], 0)]);
+    expect(r.liveEodRowBookCount).toBe(1);
+    expect(r.liveEodRowsPresentOk).toBeNull();
   });
 });
