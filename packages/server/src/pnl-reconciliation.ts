@@ -252,6 +252,46 @@ export interface PnlReconcileDay {
    * pre-baseline rows anyway, so un-gating costs no noise.
    */
   lagsPriorOptionsDaily: boolean;
+  /**
+   * TRA-2635 (CEO) — the DURABLE equity STATE at this session's close, i.e.
+   * `PaperAccount.totalEquity` as the 21:00 ET writer saw it.
+   *
+   * Every other figure on this row is a DELTA, and CEO's TRA-2635 is the lesson
+   * about what a delta cannot answer: on a book where realized option P&L has
+   * been earned but never credited to equity, `stockDaily` / `optionsDaily` read
+   * IDENTICALLY to a book where the credit landed correctly and the stock leg
+   * simply excludes it. "Clean" and "the credit path never fired here" are the
+   * same reading. State is what separates them — equity either absorbed the
+   * money or it did not — which is why this is published on the row.
+   *
+   * Not baseline-gated and not folded into any verdict: it is a measurement,
+   * and rounding is the only transformation applied.
+   */
+  closingEquity: number;
+  /**
+   * TRA-2635 — `PaperAccount.getOptionsCredited()` as of this row: cumulative
+   * realized option P&L this book's EQUITY has absorbed (see
+   * {@link DailySnapshot.optionsCreditedCumulative}).
+   *
+   * **`null` when the field was never written — NEVER 0.** That distinction is
+   * the entire point of the field here. A pre-TRA-2323 row and a row on a book
+   * whose credit path has genuinely never fired both carry "no credit", and
+   * defaulting the absent case to 0 would make the two indistinguishable — the
+   * same `?? 0` collapse TRA-2629 shipped one layer down in the durable
+   * snapshot type.
+   */
+  optionsCreditedCumulative: number | null;
+  /**
+   * TRA-2635 — credit that landed in THIS session's window: this row's
+   * cumulative minus the PRIOR row's. `null` unless BOTH endpoints are present,
+   * because a subtraction with an absent endpoint is not a zero.
+   *
+   * A NEGATIVE value is not a debit — the cumulative is an in-memory counter, so
+   * a negative window is the counter having been reset by a boot (the TRA-2629
+   * durability defect) between the two writes. Both cases are informative and
+   * neither is silently clamped.
+   */
+  optionsCreditedInWindow: number | null;
   /** eodCombined − (stockDaily + optionsDaily); 0 when no EOD file to compare. */
   drift: number;
   /**
@@ -363,6 +403,49 @@ export interface PnlReconcileResult {
   priorOptionsLagDates: string[];
   /** TRA-2630 AC3 — false iff at least one `priorOptionsLagDates` entry was found. */
   priorOptionsLagOk: boolean;
+  /**
+   * TRA-2635 (CEO) — **did realized option P&L actually reach this book's equity?**
+   * TRI-STATE: `true` = yes, some gradeable session shows a non-zero credited
+   * cumulative; `false` = option P&L was realized and NOTHING was ever credited;
+   * **`null` = NOT MEASURED**, never a pass.
+   *
+   * This is the criterion CEO's TRA-2635 filed against, and it exists because no
+   * delta on this row can answer it. Both `stockDaily` and `optionsDaily` are the
+   * same on a book that credits correctly and on a book whose credit path has
+   * never fired — the live `admin` book showed ZERO T+1-lag rows while its
+   * options leg had earned +$987.60, and that "clean" reading was equally
+   * consistent with (1) the credit path working and `stockDaily` correctly
+   * excluding it, and (2) the credit path never having fired on live at all,
+   * where "clean" is what a completely unshipped bridge looks like.
+   *
+   * THE GRADEABLE COHORT IS DERIVED FROM THE TRIGGER, not from the fleet. A
+   * session only grades this if (a) `optionsCreditedCumulative` was actually
+   * written on it, and (b) it realized non-zero `optionsDaily` — i.e. there WAS
+   * option P&L for equity to absorb. A book that never traded an option cannot
+   * verify the bridge, and counting it would be the vacuous pass that made
+   * TRA-2625 C5 read green off two books that both had `stockDaily === 0`.
+   * `optionsCreditedMeasuredCount` publishes that cohort's size so the two
+   * causes of `null` (nothing written / nothing to absorb) stay tellable apart.
+   */
+  equityAbsorbedOptionsOk: boolean | null;
+  /**
+   * TRA-2635 — how many evaluated sessions could actually have graded the
+   * bridge (`optionsCreditedCumulative` present AND `optionsDaily` non-zero).
+   * `0` means the verdict above is `null` for want of a cohort, not because
+   * anything failed.
+   */
+  optionsCreditedMeasuredCount: number;
+  /**
+   * TRA-2635 — sessions whose `optionsCreditedInWindow` is non-zero: the dates
+   * on which a credit demonstrably MOVED. Positive evidence, and the direct
+   * answer to "when did the bridge last fire on this book?".
+   */
+  optionsCreditedDates: string[];
+  /** TRA-2635 — latest written `optionsCreditedCumulative`; null if never written. */
+  optionsCreditedLatest: number | null;
+  /** TRA-2635 — latest durable `closingEquity`, and the session it was written on. */
+  closingEquityLatest: number | null;
+  closingEquityLatestDate: string | null;
 }
 
 /**
@@ -419,6 +502,81 @@ export function summarizeLiveLagTripwire(
     // NOT MEASURED, not OK — see the note above.
     livePriorOptionsLagOk: liveBooks.length === 0 ? null : offenders.length === 0,
     livePriorOptionsLagBooks: offenders,
+  };
+}
+
+/**
+ * TRA-2635 (CEO) — **the money question, folded over the live cohort.** Did
+ * realized option P&L reach the equity of the book that carries real capital?
+ *
+ * `livePriorOptionsLagOk` (above) can only report the T+1 MIS-BUCKET signature.
+ * It reads clean on a book where the credit never fired at all, because there is
+ * no lag when there is no credit. CEO's TRA-2635 retraction is exactly that:
+ * grading the live book off the lag signature alone graded it with an instrument
+ * that cannot resolve the question, and a "clean" live book is what BOTH a
+ * working bridge and a completely unshipped one look like on that axis.
+ *
+ * TRI-STATE, and folded the same way as {@link PnlReconcileResult.stockLegOk} —
+ * a red book wins, otherwise one genuinely-measured green is required to claim
+ * green, all-NOT-MEASURED stays `null`:
+ *
+ *   - `false` — a live book realized option P&L and equity absorbed NONE of it.
+ *     That is a NAV UNDERSTATEMENT on real capital: the bridge is unshipped
+ *     there and every sizing decision is being made off the wrong book value.
+ *   - `true`  — some live book's equity demonstrably absorbed a credit.
+ *   - `null`  — NOT MEASURED. Either the live cohort is EMPTY (which bqb1 serves
+ *     intermittently on a boot-arm miss — see the note on
+ *     `summarizeLiveLagTripwire`) or no live session both wrote the counter and
+ *     realized option P&L. Never a pass; callers must fail closed.
+ *
+ * `liveCreditBookCount` is what makes the empty cohort distinguishable from a
+ * graded one — publishing the verdict without it reproduces the `every`-is-true-
+ * on-the-empty-set defect this module has already shipped twice.
+ */
+export function summarizeLiveCreditObservation(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    equityAbsorbedOptionsOk: boolean | null;
+    optionsCreditedMeasuredCount: number;
+    optionsCreditedLatest: number | null;
+    optionsCreditedDates: string[];
+    closingEquityLatest: number | null;
+    closingEquityLatestDate: string | null;
+  }>,
+): {
+  liveCreditBookCount: number;
+  liveEquityAbsorbedOptionsOk: boolean | null;
+  liveCreditBooks: Array<{
+    username: string;
+    equityAbsorbedOptionsOk: boolean | null;
+    optionsCreditedMeasuredCount: number;
+    optionsCreditedLatest: number | null;
+    optionsCreditedDates: string[];
+    closingEquityLatest: number | null;
+    closingEquityLatestDate: string | null;
+  }>;
+} {
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  return {
+    liveCreditBookCount: liveBooks.length,
+    liveEquityAbsorbedOptionsOk: liveBooks.some(e => e.equityAbsorbedOptionsOk === false)
+      ? false
+      : liveBooks.some(e => e.equityAbsorbedOptionsOk === true)
+        ? true
+        : null,
+    // Named, not anonymized: this endpoint already publishes each book's full
+    // per-session P&L series under its username, and an unnamed red verdict on
+    // real capital is not actionable.
+    liveCreditBooks: liveBooks.map(e => ({
+      username: e.username,
+      equityAbsorbedOptionsOk: e.equityAbsorbedOptionsOk,
+      optionsCreditedMeasuredCount: e.optionsCreditedMeasuredCount,
+      optionsCreditedLatest: e.optionsCreditedLatest,
+      optionsCreditedDates: e.optionsCreditedDates,
+      closingEquityLatest: e.closingEquityLatest,
+      closingEquityLatestDate: e.closingEquityLatestDate,
+    })),
   };
 }
 
@@ -511,6 +669,13 @@ export function reconcilePnl(
       const eodOptionsPnl = eodOptionsByDate?.has(s.date)
         ? round2(eodOptionsByDate.get(s.date)!)
         : null;
+      // TRA-2635 — ABSENT stays null. `?? 0` here would make "the writer never
+      // recorded a credit" and "the credit was 0" the same value, which is the
+      // exact ambiguity this field is being added to resolve.
+      const optionsCreditedCumulative =
+        s.optionsCreditedCumulative !== undefined && s.optionsCreditedCumulative !== null
+          ? round2(s.optionsCreditedCumulative)
+          : null;
       return {
         date: s.date,
         eodCombined,
@@ -532,6 +697,10 @@ export function reconcilePnl(
           s.optionsDailyPnlBucket !== undefined && s.optionsDailyPnlBucket !== null
             ? round2(s.optionsDailyPnlBucket)
             : null,
+        closingEquity: round2(s.closingEquity),
+        optionsCreditedCumulative,
+        // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
+        optionsCreditedInWindow: null,
         drift,
         belowBaseline,
       };
@@ -553,6 +722,19 @@ export function reconcilePnl(
     if (Math.abs(cur.stockDaily - prev.optionsDaily) <= PNL_RECONCILE_TOLERANCE_USD) {
       cur.lagsPriorOptionsDaily = true;
     }
+  }
+
+  // TRA-2635 — separate pass for the per-session credit window. It must NOT be
+  // folded into the loop above: that one `continue`s on every quiet session, and
+  // a credit landing on a day with no stock P&L is precisely the session this
+  // needs to see.
+  for (let i = 1; i < days.length; i++) {
+    const cur = days[i]!;
+    const prev = days[i - 1]!;
+    if (cur.optionsCreditedCumulative == null || prev.optionsCreditedCumulative == null) continue;
+    cur.optionsCreditedInWindow = round2(
+      cur.optionsCreditedCumulative - prev.optionsCreditedCumulative,
+    );
   }
 
   const evaluated = days.filter(d => !d.belowBaseline);
@@ -597,6 +779,33 @@ export function reconcilePnl(
   // option close is a different defect, and silencing it before 2026-07-12
   // would hide exactly the history the parent (TRA-2297) is arguing about.
   const falseZeroDates = days.filter(d => d.optionsFalseZero).map(d => d.date);
+  // TRA-2635 — the CREDIT-REACHED-EQUITY cohort and verdict. Baseline-gated
+  // (`evaluated`) because the bridge did not exist pre-baseline, so a pre-fix row
+  // carrying no credit is correct behaviour, not a failure.
+  //
+  // The cohort is the TRIGGER condition: the session must have written the
+  // counter AND realized option P&L for equity to absorb. Without the second
+  // term the "offender cohort" and the "gradeable cohort" diverge — 7 of the 13
+  // lag books on 2026-07-29 had a zero prior and could never have verified the
+  // fix no matter what shipped.
+  const creditMeasurableDays = evaluated.filter(
+    d =>
+      d.optionsCreditedCumulative != null
+      && Math.abs(d.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD,
+  );
+  const optionsCreditedDates = days
+    .filter(
+      d =>
+        d.optionsCreditedInWindow != null
+        && Math.abs(d.optionsCreditedInWindow) > PNL_RECONCILE_TOLERANCE_USD,
+    )
+    .map(d => d.date);
+  const equityAbsorbedOptionsOk: boolean | null =
+    creditMeasurableDays.length === 0
+      ? null
+      : creditMeasurableDays.some(d => d.optionsCreditedCumulative !== 0);
+  const creditWritten = days.filter(d => d.optionsCreditedCumulative != null);
+  const equityWritten = days.filter(d => Number.isFinite(d.closingEquity));
 
   return {
     ok: offendingDates.length === 0,
@@ -628,6 +837,18 @@ export function reconcilePnl(
     ),
     priorOptionsLagDates,
     priorOptionsLagOk: priorOptionsLagDates.length === 0,
+    equityAbsorbedOptionsOk,
+    optionsCreditedMeasuredCount: creditMeasurableDays.length,
+    optionsCreditedDates,
+    optionsCreditedLatest: creditWritten.length === 0
+      ? null
+      : creditWritten[creditWritten.length - 1]!.optionsCreditedCumulative,
+    closingEquityLatest: equityWritten.length === 0
+      ? null
+      : equityWritten[equityWritten.length - 1]!.closingEquity,
+    closingEquityLatestDate: equityWritten.length === 0
+      ? null
+      : equityWritten[equityWritten.length - 1]!.date,
   };
 }
 

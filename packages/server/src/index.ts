@@ -21,6 +21,7 @@ import {
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
   summarizeLiveLagTripwire,
+  summarizeLiveCreditObservation,
 } from './pnl-reconciliation.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
@@ -4151,6 +4152,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // `mode: live` in the 02:08Z and 03:52Z pulls. `liveBookCount` is what makes
       // the two states distinguishable; `null` means NOT MEASURED, never a pass.
       ...summarizeLiveLagTripwire(engines),
+      // TRA-2635 (CEO) — THE MONEY QUESTION, and it is a different question from
+      // the tripwire above. The lag signature reads CLEAN on a book where the
+      // credit path never fired, so grading the live book off it alone graded it
+      // with an instrument that cannot resolve the reading. This fold answers
+      // "did equity absorb the option P&L?" off durable STATE (`closingEquity`,
+      // `optionsCreditedCumulative`) rather than off a delta. Tri-state; `null`
+      // is NOT MEASURED and is never a pass.
+      ...summarizeLiveCreditObservation(engines),
       engines,
     });
   } catch (err) {

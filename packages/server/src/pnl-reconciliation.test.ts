@@ -4,6 +4,7 @@ import {
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
   summarizeLiveLagTripwire,
+  summarizeLiveCreditObservation,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
 } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
@@ -548,5 +549,189 @@ describe('summarizeLiveLagTripwire — an empty live cohort is NOT MEASURED, nev
 
   it('is NOT MEASURED on an empty fleet', () => {
     expect(summarizeLiveLagTripwire([]).livePriorOptionsLagOk).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-2635 (CEO) — "clean" and "the credit path never fired here" are the SAME
+// reading on a delta metric. The live `admin` book showed ZERO T+1-lag rows while
+// its options leg had earned +$987.60, and that reading was equally consistent
+// with a working bridge and a completely unshipped one. These tests pin the
+// STATE-based discriminator that separates them.
+// ---------------------------------------------------------------------------
+
+const creditSnap = (
+  date: string,
+  dailyPnl: number,
+  optionsDailyPnl: number | undefined,
+  optionsCreditedCumulative: number | undefined,
+  closingEquity = 2_000 + dailyPnl,
+): DailySnapshot => ({
+  date,
+  openingEquity: 2_000,
+  closingEquity,
+  dailyPnl,
+  optionsPnl: 0,
+  optionsDailyPnl,
+  optionsCreditedCumulative,
+  combinedPnl: dailyPnl + (optionsDailyPnl ?? 0),
+  trades: 1,
+});
+
+describe('TRA-2635 — equityAbsorbedOptionsOk (did the credit reach equity?)', () => {
+  it('publishes the durable closingEquity STATE on every row', () => {
+    const r = reconcilePnl([creditSnap('2026-07-28', 10, 0, 0, 2_517.5)], new Map());
+    expect(r.days[0]!.closingEquity).toBe(2_517.5);
+    expect(r.closingEquityLatest).toBe(2_517.5);
+    expect(r.closingEquityLatestDate).toBe('2026-07-28');
+  });
+
+  it('leaves optionsCreditedCumulative NULL when the writer never wrote it (never 0)', () => {
+    const r = reconcilePnl([creditSnap('2026-07-28', 10, 25, undefined)], new Map());
+    expect(r.days[0]!.optionsCreditedCumulative).toBeNull();
+    expect(r.optionsCreditedLatest).toBeNull();
+    // No counter => nothing to grade, and NOT MEASURED is never a pass.
+    expect(r.equityAbsorbedOptionsOk).toBeNull();
+    expect(r.optionsCreditedMeasuredCount).toBe(0);
+  });
+
+  it('is NOT MEASURED on a book that realized no option P&L, even with the counter written', () => {
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 10, 0, 0), creditSnap('2026-07-29', -4, 0, 0)],
+      new Map(),
+    );
+    // A book that never traded an option cannot verify the bridge — counting it
+    // green is the vacuous pass TRA-2625 C5 shipped.
+    expect(r.equityAbsorbedOptionsOk).toBeNull();
+    expect(r.optionsCreditedMeasuredCount).toBe(0);
+  });
+
+  it('is RED when option P&L was realized and equity absorbed none of it', () => {
+    // The `admin` shape CEO described: options leg earning, credit counter flat
+    // at 0 on every session that realized P&L.
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 450, 0), creditSnap('2026-07-29', 0, 537.6, 0)],
+      new Map(),
+    );
+    expect(r.equityAbsorbedOptionsOk).toBe(false);
+    expect(r.optionsCreditedMeasuredCount).toBe(2);
+    expect(r.optionsCreditedDates).toEqual([]);
+  });
+
+  it('is GREEN when a session that realized option P&L shows a non-zero credited cumulative', () => {
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 67.5, 67.5), creditSnap('2026-07-29', 0, 22.5, 90)],
+      new Map(),
+    );
+    expect(r.equityAbsorbedOptionsOk).toBe(true);
+    expect(r.optionsCreditedMeasuredCount).toBe(2);
+    // The window delta names the session the credit actually landed in.
+    expect(r.days[1]!.optionsCreditedInWindow).toBeCloseTo(22.5, 2);
+    expect(r.optionsCreditedDates).toEqual(['2026-07-29']);
+    expect(r.optionsCreditedLatest).toBe(90);
+  });
+
+  it('leaves the window NULL when either endpoint is absent (an absent endpoint is not a zero)', () => {
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 67.5, undefined), creditSnap('2026-07-29', 0, 22.5, 90)],
+      new Map(),
+    );
+    expect(r.days[1]!.optionsCreditedInWindow).toBeNull();
+  });
+
+  it('reports a NEGATIVE window rather than clamping it — that is the TRA-2629 boot reset', () => {
+    const r = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 67.5, 90), creditSnap('2026-07-29', 0, 22.5, 22.5)],
+      new Map(),
+    );
+    expect(r.days[1]!.optionsCreditedInWindow).toBeCloseTo(-67.5, 2);
+  });
+
+  it('THE DISCRIMINATOR: identical delta rows, identical lag verdict, OPPOSITE credit verdict', () => {
+    // Both books realized the same option P&L on the same sessions and neither
+    // shows the T+1 mis-bucket. `priorOptionsLagOk` cannot tell them apart —
+    // which is exactly why grading the live book off it alone was wrong.
+    const credited = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 450, 450), creditSnap('2026-07-29', 0, 537.6, 987.6)],
+      new Map(),
+    );
+    const uncredited = reconcilePnl(
+      [creditSnap('2026-07-28', 0, 450, 0), creditSnap('2026-07-29', 0, 537.6, 0)],
+      new Map(),
+    );
+    expect(credited.priorOptionsLagOk).toBe(true);
+    expect(uncredited.priorOptionsLagOk).toBe(true);
+    expect(credited.days.map(d => d.optionsDaily))
+      .toEqual(uncredited.days.map(d => d.optionsDaily));
+    expect(credited.equityAbsorbedOptionsOk).toBe(true);
+    expect(uncredited.equityAbsorbedOptionsOk).toBe(false);
+  });
+
+  it('does not grade pre-baseline sessions (the bridge did not exist then)', () => {
+    const r = reconcilePnl([creditSnap('2026-07-01', 0, 450, 0)], new Map(), '2026-07-12');
+    expect(r.equityAbsorbedOptionsOk).toBeNull();
+    expect(r.optionsCreditedMeasuredCount).toBe(0);
+  });
+});
+
+describe('TRA-2635 — summarizeLiveCreditObservation', () => {
+  const book = (
+    username: string,
+    mode: string,
+    equityAbsorbedOptionsOk: boolean | null,
+    optionsCreditedMeasuredCount = 1,
+  ) => ({
+    username,
+    mode,
+    equityAbsorbedOptionsOk,
+    optionsCreditedMeasuredCount,
+    optionsCreditedLatest: 0,
+    optionsCreditedDates: [] as string[],
+    closingEquityLatest: 2_000,
+    closingEquityLatestDate: '2026-07-29',
+  });
+
+  it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
+    const r = summarizeLiveCreditObservation([book('Richard', 'demo', false)]);
+    expect(r.liveCreditBookCount).toBe(0);
+    expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
+    expect(r.liveCreditBooks).toEqual([]);
+  });
+
+  it('is NOT MEASURED when the live book itself was never gradeable', () => {
+    const r = summarizeLiveCreditObservation([book('admin', 'live', null, 0)]);
+    expect(r.liveCreditBookCount).toBe(1);
+    expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
+  });
+
+  it('goes RED on a live book whose equity absorbed nothing, and names it', () => {
+    const r = summarizeLiveCreditObservation([
+      book('admin', 'live', false),
+      book('Richard', 'demo', true),
+    ]);
+    expect(r.liveEquityAbsorbedOptionsOk).toBe(false);
+    expect(r.liveCreditBooks.map(b => b.username)).toEqual(['admin']);
+  });
+
+  it('a RED live book wins over a green one', () => {
+    const r = summarizeLiveCreditObservation([
+      book('admin', 'live', true),
+      book('operator2', 'live', false),
+    ]);
+    expect(r.liveEquityAbsorbedOptionsOk).toBe(false);
+  });
+
+  it('claims green only off a genuinely measured live book', () => {
+    const r = summarizeLiveCreditObservation([
+      book('admin', 'live', true),
+      book('operator2', 'live', null, 0),
+    ]);
+    expect(r.liveEquityAbsorbedOptionsOk).toBe(true);
+  });
+
+  it('a SANDBOX-armed book is outside the live cohort and still empties it', () => {
+    const r = summarizeLiveCreditObservation([book('admin', 'sandbox', false)]);
+    expect(r.liveCreditBookCount).toBe(0);
+    expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
   });
 });
