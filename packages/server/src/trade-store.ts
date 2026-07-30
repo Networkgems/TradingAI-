@@ -5,6 +5,7 @@ import { join, dirname, basename } from 'path';
 import { accountDeletedAt, DELETED_ACCOUNTS_FILENAME } from './deleted-accounts.js';
 import type { AccountMode, Position, TradeSignal, OptionPosition, SignalType, TradierEnv } from '@trading-app/shared';
 import type { DailySignalRecord } from './reports/eod-report.js';
+import type { PaperAccountSnapshot } from './paper-account.js';
 import { isEphemeralDataDir, resolveDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
@@ -104,6 +105,23 @@ export interface StocksTradeSnapshot {
      * repaired book keeps it so it stays distinguishable from a clean one.
      */
     cashRepair?: { appliedAt: number; delta: number; from: number; to: number } | null;
+    /**
+     * TRA-2629 — cumulative realized option P&L credited into this book
+     * (`PaperAccount.optionsCredited`). TRA-2323 added the field to
+     * `PaperAccountSnapshot` but NOT to this durable type, so it was dropped on
+     * both the write and the read and reset to 0 on every restart — while
+     * `equity` (which contains those credits) survived. The EOD writer recovers
+     * the stock-only leg as `equityDelta − (credited_now − credited_on_last_row)`;
+     * zeroing only the left endpoint makes the two stop telescoping and re-adds
+     * the prior session's option credit into `dailyPnl`. That is the
+     * `stockDaily == prior session optionsDaily` lag observed on 13 books.
+     *
+     * Absent on every snapshot written before this fix. Do NOT collapse a missing
+     * value to 0 at the restore site: seed it from the last EOD row's
+     * `optionsCreditedCumulative`, which is the exact baseline the writer
+     * differences against.
+     */
+    optionsCredited?: number;
   };
   /**
    * TRA-801 — the SupertrendConfluence PAPER forward-test book. Optional for
@@ -279,6 +297,71 @@ async function tryRestoreFromBackup<T>(targetFile: string, username: string, fil
     });
     return null;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-2629 — the ONE place `PaperAccountSnapshot` crosses the durability seam.
+//
+// It used to be two hand-written object literals in `user-context.ts` (one in
+// the boot restore, one in `persistStocksNow`), each rebuilding the account
+// field by field. That shape has now silently dropped a field TWICE: TRA-2301's
+// `cashRepair` (caught during the change) and TRA-2323's `optionsCredited`
+// (NOT caught — it reset to 0 on every restart for 5 days while `equity` kept
+// the credits it was supposed to cancel, pushing the previous session's option
+// P&L into the stock leg on 13 books).
+//
+// Two literals that must agree with each other and with a third declaration —
+// the type — is the TRA-2210 "filter at SOME call sites" failure, and a
+// partially-routed field reads identically to a correct one from any single
+// boot. One choke point, exercised by both directions in the tests, is the only
+// shape where adding a field to `PaperAccountSnapshot` cannot silently fail to
+// persist.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Project the in-memory account snapshot onto the durable shape.
+ *
+ * `openPositions` is deliberately NOT carried here: `StocksTradeSnapshot` stores
+ * it at the TOP level (`snap.openPositions`), not nested under `account`, and
+ * that layout predates this seam. {@link restoreDurableAccountSnapshot} takes it
+ * as a separate argument for the same reason.
+ */
+export function toDurableAccountSnapshot(snap: PaperAccountSnapshot): StocksTradeSnapshot['account'] {
+  return {
+    cash: snap.cash,
+    equity: snap.equity,
+    initialEquity: snap.initialEquity,
+    dailyPnl: snap.dailyPnl,
+    cashRepair: snap.cashRepair ?? null,
+    optionsCredited: snap.optionsCredited ?? 0,
+  };
+}
+
+/**
+ * Rehydrate the in-memory account snapshot from the durable shape.
+ *
+ * `fallbackOptionsCredited` is the migration seam for snapshots written before
+ * TRA-2629 added the field. It must be the last EOD row's
+ * `optionsCreditedCumulative` (`PnlTracker.getLastOptionsCreditedCumulative()`),
+ * NOT 0: the restored `equity` already contains every historical option credit,
+ * and the EOD writer only ever uses this counter as a DELTA against that same
+ * row. Seeding from the row makes the first post-fix window exact even though
+ * the row's absolute value was itself written during the buggy era.
+ */
+export function restoreDurableAccountSnapshot(
+  durable: StocksTradeSnapshot['account'],
+  openPositions: Position[],
+  fallbackOptionsCredited: number,
+): PaperAccountSnapshot {
+  return {
+    cash: durable.cash,
+    equity: durable.equity,
+    initialEquity: durable.initialEquity,
+    dailyPnl: durable.dailyPnl,
+    openPositions,
+    cashRepair: durable.cashRepair ?? null,
+    optionsCredited: durable.optionsCredited ?? fallbackOptionsCredited,
+  };
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

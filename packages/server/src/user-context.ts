@@ -29,6 +29,11 @@ import {
   loadCryptoTradeSnapshot,
   saveStocksTradeSnapshot,
   saveCryptoTradeSnapshot,
+  // TRA-2629 — the single seam `PaperAccountSnapshot` crosses on the way to and
+  // from disk. Both directions must go through these or a field added to the
+  // in-memory snapshot silently stops persisting.
+  toDurableAccountSnapshot,
+  restoreDurableAccountSnapshot,
 } from './trade-store.js';
 import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
@@ -888,18 +893,23 @@ async function createUserContext(username: string): Promise<UserContext> {
         recentSignals: stocksSnap.recentSignals ?? [],
         dailySignals: stocksSnap.dailySignals ?? [],
         positionSignalType: stocksSnap.positionSignalType ?? [],
-        account: {
-          cash: stocksSnap.account.cash,
-          equity: stocksSnap.account.equity,
-          initialEquity: stocksSnap.account.initialEquity,
-          dailyPnl: stocksSnap.account.dailyPnl,
-          openPositions: stocksSnap.openPositions ?? [],
-          // TRA-2301 — this restore rebuilds the account snapshot field by
-          // field, so an omitted key is silently dropped. Carry the cash-repair
-          // trace through or a repaired book would look, on every subsequent
-          // boot, exactly like a book that never drifted.
-          cashRepair: stocksSnap.account.cashRepair ?? null,
-        },
+        // TRA-2629 — routed through the single durability seam in `trade-store`.
+        // This used to be a hand-written literal, and rebuilding the account
+        // field by field has now dropped a field twice: TRA-2301's `cashRepair`
+        // (caught) and TRA-2323's `optionsCredited` (not caught — it reset to 0
+        // on every boot while `equity` kept the credits it exists to cancel, so
+        // the EOD writer re-added the previous session's option P&L into the
+        // STOCK leg on 13 books / 18 sessions).
+        //
+        // The fallback is the last EOD row's cumulative, NOT 0: a pre-TRA-2629
+        // snapshot has no stored value but its `equity` already contains the
+        // historical credits, and the writer only ever uses the counter as a
+        // delta against that same row. See `restoreDurableAccountSnapshot`.
+        account: restoreDurableAccountSnapshot(
+          stocksSnap.account,
+          stocksSnap.openPositions ?? [],
+          tracker.getLastOptionsCreditedCumulative(),
+        ),
         // TRA-233 — `options` stays for back-compat (legacy single-bucket
         // snapshots route through it). New snapshots include `optionsByEnv`
         // so both Tradier envs survive a restart.
@@ -1099,16 +1109,12 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       // sandbox and production state independently. The legacy single
       // `options` field remains so older readers can still parse the file.
       optionsByEnv: snap.optionsByEnv,
-      account: {
-        cash: snap.account.cash,
-        equity: snap.account.equity,
-        initialEquity: snap.account.initialEquity,
-        dailyPnl: snap.account.dailyPnl,
-        // TRA-2301 — writer side of the cash-repair trace. This object is built
-        // key by key, so omitting it here would drop the record on the first
-        // persist and the repair would become unverifiable one save later.
-        cashRepair: snap.account.cashRepair ?? null,
-      },
+      // TRA-2629 — writer side of the same seam the boot restore reads through.
+      // Was a hand-written literal; it dropped `cashRepair` (TRA-2301, caught)
+      // and then `optionsCredited` (TRA-2323, not caught). One choke point means
+      // a field added to `PaperAccountSnapshot` cannot be persisted by one side
+      // and dropped by the other.
+      account: toDurableAccountSnapshot(snap.account),
       // TRA-801 — persist the SupertrendConfluence paper forward-test book so a
       // redeploy doesn't abandon its open positions and stall Stage-2 accrual.
       supertrendPaper: snap.supertrendPaper,
