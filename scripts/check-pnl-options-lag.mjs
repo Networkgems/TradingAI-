@@ -111,10 +111,29 @@
  *   node scripts/check-pnl-options-lag.mjs
  *   node scripts/check-pnl-options-lag.mjs --url=https://host/api/health/pnl-reconciliation
  *   node scripts/check-pnl-options-lag.mjs --file=./recon.json   # grade a saved pull
+ *   node scripts/check-pnl-options-lag.mjs --since=YYYY-MM-DD    # move the AC2 delta boundary
+ *   node scripts/check-pnl-options-lag.mjs --no-writer-check     # skip writer attribution
  *   node scripts/check-pnl-options-lag.mjs --selftest            # both-direction controls
+ *
+ * `--no-writer-check` suppresses the Render/git calls in {@link gradeWriterProvenance}
+ * and reports `writer: NOT CHECKED`. It does NOT make the grade cleaner — a PASS
+ * under it is unattributed to the writer, which is what that line says.
+ *
+ * THE VERDICT IS THE PRINTED TEXT, NOT THE EXIT CODE
+ * --------------------------------------------------
+ * Five axes are reported and only the lag/credit pair reaches `process.exit`. The
+ * AC2 delta, the cohort pin, the top-level disclaimer and the writer attribution
+ * are print-only by design (each one's reason is on its own doc block), so a
+ * grader must read stdout. Every arm prints its verdict BEFORE any early return.
  */
 
 import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** This script's own repo, so the ancestry probe reads the checkout it shipped in. */
+const REPO_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const DEFAULT_URL = 'https://tradingai-bqb1.onrender.com/api/health/pnl-reconciliation';
 /** Same penny tolerance the reconciler uses — "to the cent" is the signature. */
@@ -350,6 +369,231 @@ export function gradeAc2Delta(engines, since) {
     rowBookCount,
     cohort: compareAc2Cohort(gradeableBooks, cutoff),
   };
+}
+
+/**
+ * TRA-2630 AC2 — the commit whose PRESENCE IN THE WRITER is what a PASS claims.
+ *
+ * `ec05639` is the TRA-2629 durability fix. AC2's whole assertion is "the row
+ * written under the deployed fix carries no lag", so the commit has to have been
+ * in the build that WROTE the row — not merely in the build that happens to be
+ * serving when the grader reads it.
+ */
+export const AC2_WRITER_FIX_COMMIT = 'ec05639';
+
+/**
+ * TRA-2630 AC2 — WHICH BUILD WROTE THE ROW BEING GRADED.
+ *
+ * The hole this closes. `gradeAc2Delta` grades the VALUE in the 07-30 row; the
+ * only provenance the instrument had was `/api/health/version`, and that is a
+ * POINT-IN-TIME read taken ~30 minutes AFTER the write. It cannot see what was
+ * serving during the write window, so it cannot tell these two apart:
+ *
+ *   1. the fixed writer wrote a clean row  -> PASS means the fix works;
+ *   2. a rollback was serving at 21:00 ET, the broken writer wrote the row, and a
+ *      descendant build was redeployed before 21:30 -> the same PASS text, over a
+ *      row the fix never touched.
+ *
+ * That is not a hypothetical on this service. bqb1 took EIGHT deploys between
+ * 08:33Z and 12:10Z on 2026-07-30 alone (~1 per 30 min), and a redeploy pinned to
+ * a stale `--commit=` is a known event class here — it silently discards every
+ * commit main has taken since the pin. So the build serving at 01:00Z tomorrow is
+ * genuinely unknown today, and a one-shot grade that cannot name its own writer is
+ * exactly the "grade the WRITER, not the value" failure.
+ *
+ * A build serves from its own `finishedAt` until the next SERVED deploy finishes.
+ * Deploys that never served (`build_failed`, `canceled`, `pre_deploy_failed`) are
+ * dropped: they occupy a timestamp but no traffic. `live` and `deactivated` both
+ * served — `deactivated` only means something later replaced it.
+ *
+ * Returns the builds whose serving interval INTERSECTS [startIso, endIso),
+ * ascending. Intersection, not point sampling: if a rollback served for ten
+ * minutes across the writer's window that is the build under suspicion even though
+ * neither endpoint of the window lands inside it.
+ */
+export function buildsServingDuring(deploys, startIso, endIso) {
+  const served = (Array.isArray(deploys) ? deploys : [])
+    .map((d) => (d?.deploy && typeof d.deploy === 'object' ? d.deploy : d))
+    .filter((d) => d?.finishedAt && (d?.commit?.id || d?.sha))
+    .filter((d) => d?.status === 'live' || d?.status === 'deactivated')
+    .map((d) => ({
+      id: d.id ?? null,
+      sha: String(d.commit?.id ?? d.sha),
+      finishedAt: String(d.finishedAt),
+      status: d.status,
+    }))
+    .sort((a, b) => a.finishedAt.localeCompare(b.finishedAt));
+  const start = String(startIso);
+  const end = String(endIso);
+  const hits = [];
+  for (let i = 0; i < served.length; i++) {
+    const from = served[i].finishedAt;
+    // The newest served build has no successor, so it is still serving: open-ended.
+    const until = i + 1 < served.length ? served[i + 1].finishedAt : null;
+    const startsBeforeEnd = from < end;
+    const endsAfterStart = until === null || until > start;
+    if (startsBeforeEnd && endsAfterStart) hits.push({ ...served[i], servedUntil: until });
+  }
+  return { serving: hits, earliestRecordAt: served.length > 0 ? served[0].finishedAt : null };
+}
+
+/**
+ * TRA-2630 AC2 — the EOD write instant for a graded session date.
+ *
+ * The writer runs at 21:00 ET. Expressed with an explicit `-04:00` (EDT) rather
+ * than a timezone library, and the DST question is answered by the WINDOW rather
+ * than by getting the offset exactly right: a whole hour of error still lands
+ * inside the lookback below, and anything ambiguous resolves to NOT MEASURED
+ * instead of to a guess.
+ */
+export function eodWriteInstant(gradedDate) {
+  return new Date(`${gradedDate}T21:00:00-04:00`).toISOString();
+}
+
+/**
+ * TRA-2630 AC2 — GRADE THE WRITER. Pure: every input is injected, so `--selftest`
+ * drives both directions without touching the network or a git checkout.
+ *
+ * The window is ASYMMETRIC on purpose. Builds deployed AFTER the row was written
+ * cannot have written it, so a post-write rollback must not invalidate an honest
+ * PASS — that would hand the fleet's deploy cadence a veto over this gate and make
+ * it unreachable, which is its own defect class. The lookback absorbs DST error
+ * and an early writer; the short forward margin absorbs a writer delayed by a
+ * restart.
+ *
+ * Four verdicts, and the two middle ones are the point:
+ *
+ *   CONFIRMED       — every build serving the write window descends from
+ *                     {@link AC2_WRITER_FIX_COMMIT}. A PASS here means the fix.
+ *   PRE_FIX_WRITER  — a build serving that window provably does NOT. The row was
+ *                     written by the broken writer, so NEITHER a pass nor a fail
+ *                     is attributable to the fix. This is the one arm wired to
+ *                     downgrade the AC2 verdict.
+ *   NOT_YET_WRITTEN — the graded session's EOD row is not due yet. A pre-check run
+ *                     must not report the build serving TODAY as the writer of a
+ *                     row due tomorrow.
+ *   UNATTRIBUTABLE  — no deploy history, history that does not reach back to the
+ *                     window, or ancestry that could not be resolved (no git
+ *                     checkout, shallow clone, missing object). NOT a pass and NOT
+ *                     a red. Deliberately NOT wired: on a non-git harness checkout
+ *                     this is the normal reading, and failing on it would make the
+ *                     guard unrunnable exactly where it runs (the AC2 grader's
+ *                     workspace was not a git repository on 2026-07-30T11:3xZ).
+ *   NOT_APPLICABLE  — nothing was graded, so there is no writer to attribute.
+ *
+ * `isDescendant(sha)` must return `true` / `false` / `null`, where `null` means
+ * "could not determine" — never a boolean guess, because a false negative here
+ * accuses a working fix of never having shipped.
+ */
+export function gradeWriterProvenance({
+  deploys,
+  isDescendant,
+  gradedDate,
+  liveCommit = null,
+  now = new Date().toISOString(),
+  lookbackMinutes = 60,
+  forwardMinutes = 45,
+} = {}) {
+  if (!gradedDate) {
+    return {
+      verdict: 'NOT_APPLICABLE',
+      reason: 'no graded session date — there is no row, so there is no writer to attribute',
+      gradedDate: null, writeInstant: null, windowStart: null, windowEnd: null,
+      serving: [], liveCommit, fixCommit: AC2_WRITER_FIX_COMMIT,
+    };
+  }
+  const writeInstant = eodWriteInstant(gradedDate);
+  const t = new Date(writeInstant).getTime();
+  const windowStart = new Date(t - lookbackMinutes * 60_000).toISOString();
+  const windowEnd = new Date(t + forwardMinutes * 60_000).toISOString();
+  const base = {
+    gradedDate: String(gradedDate), writeInstant, windowStart, windowEnd,
+    liveCommit, fixCommit: AC2_WRITER_FIX_COMMIT,
+  };
+  // A WRITE THAT HAS NOT HAPPENED CANNOT BE ATTRIBUTED. The newest served build is
+  // open-ended by construction ("still serving"), so it intersects any future
+  // window and a pre-check run would print CONFIRMED about a row nobody has written
+  // — a prediction wearing a verdict's clothes. On this service that prediction is
+  // worth little: 8 deploys landed in the 3.5h before this arm was written, so the
+  // build serving at 21:00 ET is genuinely not knowable in advance.
+  if (String(now) < writeInstant) {
+    return {
+      ...base, verdict: 'NOT_YET_WRITTEN', serving: [],
+      reason: `the ${gradedDate} EOD row is written at ${writeInstant}, which is still in the`
+        + ` future at ${now} — the build currently serving is a forecast, not the writer`,
+    };
+  }
+  if (deploys == null) {
+    return {
+      ...base, verdict: 'UNATTRIBUTABLE', serving: [],
+      reason: 'no Render deploy history (RENDER_API_KEY / RENDER_SERVICE_ID absent, or the'
+        + ' API call failed) — the build serving the write window cannot be named',
+    };
+  }
+  const { serving, earliestRecordAt } = buildsServingDuring(deploys, windowStart, windowEnd);
+  if (serving.length === 0) {
+    return {
+      ...base, verdict: 'UNATTRIBUTABLE', serving: [],
+      reason: earliestRecordAt == null
+        ? 'the deploy history carried no build that ever served'
+        : `the deploy history only reaches back to ${earliestRecordAt}, after the write`
+          + ` window opened at ${windowStart} — page further back before grading`,
+    };
+  }
+  // INTERSECTING THE WINDOW IS NOT ENOUGH — the history has to name the build that
+  // was serving at the WRITE INSTANT itself. A page that begins 40 minutes after
+  // 21:00 ET intersects the forward margin while omitting the actual writer, and
+  // the arm above cannot see that because it only tests for emptiness. Caught by
+  // its own control; a build serving the margin was being reported as CONFIRMED
+  // for a row it demonstrably did not write.
+  const atInstant = buildsServingDuring(deploys, writeInstant, new Date(t + 1).toISOString()).serving;
+  if (atInstant.length === 0) {
+    return {
+      ...base, verdict: 'UNATTRIBUTABLE', serving,
+      reason: `no build in the deploy history was serving at the write instant ${writeInstant}`
+        + ` (earliest served record ${earliestRecordAt}) — ${serving.length} build(s) touch the`
+        + ' margin around it, but none of them wrote the row; page further back before grading',
+    };
+  }
+  const resolved = serving.map((b) => ({ ...b, descendsFromFix: isDescendant ? isDescendant(b.sha) : null }));
+  const preFix = resolved.filter((b) => b.descendsFromFix === false);
+  const unknown = resolved.filter((b) => b.descendsFromFix == null);
+  if (preFix.length > 0) {
+    return {
+      ...base, verdict: 'PRE_FIX_WRITER', serving: resolved,
+      reason: `${preFix.length} build(s) serving the write window do NOT descend from`
+        + ` ${AC2_WRITER_FIX_COMMIT}: ${preFix.map((b) => b.sha.slice(0, 9)).join(', ')}`,
+    };
+  }
+  if (unknown.length > 0) {
+    return {
+      ...base, verdict: 'UNATTRIBUTABLE', serving: resolved,
+      reason: `ancestry unresolved for ${unknown.length} of ${resolved.length} serving build(s)`
+        + ` (${unknown.map((b) => b.sha.slice(0, 9)).join(', ')}) — no git checkout, a shallow`
+        + ` clone, or the fix object is absent locally`,
+    };
+  }
+  return {
+    ...base, verdict: 'CONFIRMED', serving: resolved,
+    reason: `all ${resolved.length} build(s) serving the write window descend from ${AC2_WRITER_FIX_COMMIT}`,
+  };
+}
+
+/**
+ * TRA-2630 AC2 — apply the writer verdict to the value verdict.
+ *
+ * ONE arm is wired: a row written by a pre-fix build cannot grade the fix in
+ * either direction, so both PASS and FAIL become BLIND and the original verdict is
+ * preserved in `downgradedFrom` rather than erased. A FAIL matters here — reported
+ * bare it reads "the fix regressed" when the truthful reading is "the fix was not
+ * running". Every other writer verdict passes the value verdict through untouched
+ * and is reported alongside it; UNATTRIBUTABLE must not veto a grade, or the
+ * guard's normal (non-git) reading would permanently withhold the AC2 pass.
+ */
+export function applyWriterProvenanceToAc2(ac2, provenance) {
+  if (!ac2) return ac2;
+  if (provenance?.verdict !== 'PRE_FIX_WRITER') return { ...ac2, writer: provenance ?? null };
+  return { ...ac2, verdict: 'BLIND', downgradedFrom: ac2.verdict, writer: provenance };
 }
 
 /** Grade a whole payload. Pure — no I/O, so `--selftest` can drive it. */
@@ -720,6 +964,146 @@ function summarizeLegs(payload) {
   };
 }
 
+/**
+ * TRA-2630 AC2 — the SESSION DATE the AC2 verdict actually rests on: the newest
+ * gradeable post-cutoff session any book presented. That is the row whose writer
+ * has to be attributed. Falls back to the cutoff itself so a BLIND read still
+ * reports which window it looked at, and `null` only when nothing was graded.
+ */
+export function latestGradedDate(ac2) {
+  const dates = (ac2?.gradeableBooks ?? []).flatMap((b) => b.dates ?? []).map(String);
+  if (dates.length > 0) return dates.sort().at(-1);
+  return ac2?.since ?? null;
+}
+
+/**
+ * Render deploy history. Fails SOFT to `null` — never to `[]`, which
+ * {@link gradeWriterProvenance} would read as "history exists and named nobody"
+ * and report as a history-coverage gap rather than as an absent credential.
+ *
+ * `limit=50` because the window graded is ~22h behind the read and this service
+ * takes up to a deploy every 30 minutes; a short page would routinely fail to
+ * reach back to the write window and report UNATTRIBUTABLE for the wrong reason.
+ */
+async function fetchDeployHistory(env = process.env) {
+  const key = env.RENDER_API_KEY;
+  const service = env.RENDER_SERVICE_ID;
+  if (!key || !service) return null;
+  try {
+    const res = await fetch(
+      `https://api.render.com/v1/services/${service}/deploys?limit=50`,
+      { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal: AbortSignal.timeout(60_000) },
+    );
+    if (!res.ok) return null;
+    const body = await res.json();
+    return Array.isArray(body) ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `/api/health/version`, for the point-in-time SHA. Soft-fails to `null`. */
+async function fetchLiveVersion(reconUrl) {
+  try {
+    const url = new URL(reconUrl);
+    url.pathname = '/api/health/version';
+    url.search = '';
+    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ancestry resolver: is `sha` a descendant of the fix commit?
+ *
+ * Returns `null` — never `false` — when the question cannot be answered locally.
+ * `false` is an accusation ("the fix was not in that build"), and a non-git
+ * checkout, a shallow clone, or an unfetched object are all states in which we
+ * simply do not know. This distinction is the whole reason UNATTRIBUTABLE exists
+ * as a separate verdict from PRE_FIX_WRITER.
+ */
+function makeAncestryResolver(repoDir) {
+  const cache = new Map();
+  return (sha) => {
+    if (cache.has(sha)) return cache.get(sha);
+    let out = null;
+    try {
+      // Both objects must be present locally; `cat-file -e` distinguishes "absent"
+      // from "not an ancestor", which `merge-base` alone conflates into exit 1.
+      for (const rev of [AC2_WRITER_FIX_COMMIT, sha]) {
+        const probe = spawnSync('git', ['cat-file', '-e', `${rev}^{commit}`], { cwd: repoDir, encoding: 'utf-8' });
+        if (probe.error || probe.status !== 0) { cache.set(sha, null); return null; }
+      }
+      const r = spawnSync(
+        'git', ['merge-base', '--is-ancestor', AC2_WRITER_FIX_COMMIT, sha],
+        { cwd: repoDir, encoding: 'utf-8' },
+      );
+      if (r.error || (r.status !== 0 && r.status !== 1)) out = null;
+      else out = r.status === 0;
+    } catch {
+      out = null;
+    }
+    cache.set(sha, out);
+    return out;
+  };
+}
+
+/**
+ * TRA-2630 AC2 — print the writer attribution. Called from {@link printAc2} so it
+ * appears on EVERY arm, above the verdict, for the same reason the instrument
+ * revision does: the reading a stale or credential-less run produces must announce
+ * its own limits rather than leave a grader to notice an absence.
+ */
+function printWriterProvenance(w) {
+  if (!w) {
+    console.log('  writer: NOT CHECKED — this run graded the row value without attributing the');
+    console.log('    build that wrote it. Treat a PASS as unattributed (TRA-2630 AC2).');
+    return;
+  }
+  if (w.verdict === 'CONFIRMED') {
+    console.log(
+      `  writer: CONFIRMED — ${w.serving.length} build(s) served the ${w.gradedDate} write window`
+      + ` (${w.windowStart} .. ${w.windowEnd}), all descend from ${w.fixCommit}:`,
+    );
+    for (const b of w.serving) {
+      console.log(`      ${b.sha.slice(0, 9)} served from ${b.finishedAt}${b.servedUntil ? ` until ${b.servedUntil}` : ' (still serving)'}`);
+    }
+    return;
+  }
+  if (w.verdict === 'PRE_FIX_WRITER') {
+    console.log(`  writer: PRE-FIX BUILD — ${w.reason}.`);
+    for (const b of w.serving) {
+      console.log(
+        `      ${b.sha.slice(0, 9)} descendsFromFix=${JSON.stringify(b.descendsFromFix)}`
+        + ` served from ${b.finishedAt}${b.servedUntil ? ` until ${b.servedUntil}` : ' (still serving)'}`,
+      );
+    }
+    console.log('    The graded row was written by a build without the TRA-2629 fix, so NEITHER a');
+    console.log('    pass nor a fail is attributable to it. The verdict above is DOWNGRADED to');
+    console.log('    BLIND for that reason. Redeploy a descendant build and grade the NEXT session.');
+    return;
+  }
+  if (w.verdict === 'NOT_APPLICABLE') {
+    console.log(`  writer: NOT APPLICABLE — ${w.reason}.`);
+    return;
+  }
+  if (w.verdict === 'NOT_YET_WRITTEN') {
+    console.log(`  writer: NOT YET WRITTEN — ${w.reason}.`);
+    console.log('    This is a PRE-CHECK, not the grade. Re-run after the EOD write to attribute');
+    console.log('    the row; any PASS/FAIL printed below is about earlier sessions only.');
+    return;
+  }
+  console.log(`  writer: UNATTRIBUTED — ${w.reason}.`);
+  console.log('    A point-in-time `/api/health/version` read cannot see a rollback that served');
+  console.log('    the write window and was replaced before this grade ran, so the PASS/FAIL');
+  console.log('    above is a statement about the ROW, not about the fix. Not wired to the exit');
+  console.log('    code: on a non-git checkout this is the normal reading, and failing on it');
+  console.log('    would make the guard unrunnable where it actually runs.');
+}
+
 async function loadPayload(argv) {
   const fileArg = argv.find((a) => a.startsWith('--file='));
   if (fileArg) {
@@ -753,6 +1137,27 @@ async function main(argv) {
     console.error(`BLIND — ${g.reason}. Exiting 3; this is NOT a pass.`);
     return EXIT_BLIND;
   }
+
+  // TRA-2630 AC2 — attribute the WRITER before reporting the value. Every input
+  // soft-fails to a NOT-MEASURED reading rather than to an assumption: no Render
+  // credential, no git checkout, or a history page that does not reach the write
+  // window all land on UNATTRIBUTED, which prints loudly and changes no verdict.
+  // Only a build provably lacking the fix downgrades the grade.
+  const urlArg = argv.find((a) => a.startsWith('--url='));
+  const reconUrl = urlArg ? urlArg.slice('--url='.length) : DEFAULT_URL;
+  const [deploys, version] = await Promise.all([
+    argv.includes('--no-writer-check') ? Promise.resolve(null) : fetchDeployHistory(),
+    argv.includes('--no-writer-check') ? Promise.resolve(null) : fetchLiveVersion(reconUrl),
+  ]);
+  g.ac2 = applyWriterProvenanceToAc2(
+    g.ac2,
+    gradeWriterProvenance({
+      deploys,
+      isDescendant: makeAncestryResolver(REPO_DIR),
+      gradedDate: latestGradedDate(g.ac2),
+      liveCommit: version?.commit ?? null,
+    }),
+  );
 
   const legs = summarizeLegs(payload);
   console.log(`pulled ${payload.time ?? '(no timestamp)'} — ${g.engineCount} engine books`);
@@ -960,12 +1365,14 @@ async function main(argv) {
  * what its OWN ABSENCE means, and the routine requires it: absence becomes a
  * positive stale signal instead of something a reader must notice is missing.
  */
-const AC2_INSTRUMENT_REV = 'pin era (09f3821+)';
+const AC2_INSTRUMENT_REV = 'pin + writer-attribution era (09f3821+, writer arm)';
 
 function printAc2Provenance() {
   console.log(`  instrument: check-pnl-options-lag.mjs — AC2 ${AC2_INSTRUMENT_REV}.`);
   console.log('  If this line is ABSENT from your output you are running a STALE checkout:');
   console.log('  that reading is BLIND, not a verdict. `git pull origin main`, then re-run.');
+  console.log('  The same applies to the `writer:` line below — a copy that prints no writer');
+  console.log('  attribution cannot tell a fixed writer from a rolled-back one.');
 }
 
 /**
@@ -977,6 +1384,16 @@ function printAc2(ac2) {
   if (!ac2) return;
   console.log(`TRA-2630 AC2 — NEW lag sessions dated >= ${ac2.since} (the fix-deploy boundary):`);
   printAc2Provenance();
+  printWriterProvenance(ac2.writer);
+  if (ac2.verdict === 'BLIND' && ac2.downgradedFrom) {
+    console.log(
+      `  BLIND — DOWNGRADED from ${ac2.downgradedFrom}. The row value was ${ac2.rows} new lag`
+      + ` session(s) over ${ac2.gradeableBookCount} gradeable book(s), but the writer above is a`
+      + ' pre-fix build, so that number grades the ROW and not the FIX. NOT a pass.',
+    );
+    printAc2Cohort(ac2.cohort);
+    return;
+  }
   if (ac2.verdict === 'BLIND') {
     console.log(
       `  BLIND — NOT MEASURED. 0 books carry a gradeable session on/after ${ac2.since}`
@@ -1910,6 +2327,211 @@ function selftest() {
       return { revBeforeVerdict: revAt >= 0 && verdictAt >= 0 && revAt < verdictAt };
     })(),
     { revBeforeVerdict: true },
+  );
+
+  // ── TRA-2630 AC2 WRITER ATTRIBUTION ───────────────────────────────────────
+  // The failure this arm exists for: a rollback serves the 21:00 ET write window,
+  // the broken writer writes the row, a descendant build is redeployed before the
+  // 21:30 grade, and `/api/health/version` reports the good SHA. Every control
+  // below is driven in BOTH directions, because an attribution that can only ever
+  // say CONFIRMED is decoration.
+  const dep = (sha, finishedAt, status = 'deactivated') => ({ id: `dep-${sha}`, status, finishedAt, commit: { id: sha } });
+  // 2026-07-30 21:00 ET == 2026-07-31T01:00Z, so the window is 00:00Z..01:45Z.
+  const GOOD = 'fffffff000';
+  const BAD = 'aaaaaaa000';
+  // The routine grades at 21:30 ET == 01:30Z, half an hour after the write.
+  const GRADE_AT = '2026-07-31T01:30:00Z';
+  const descendantOnly = (sha) => (sha === GOOD ? true : sha === BAD ? false : null);
+
+  check(
+    'WRITER: the write instant for a graded date is 21:00 ET, i.e. 01:00Z next day',
+    eodWriteInstant('2026-07-30'),
+    '2026-07-31T01:00:00.000Z',
+  );
+  check(
+    'WRITER: a build serving the whole window and descended from the fix => CONFIRMED',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-30T12:10:24Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'CONFIRMED',
+  );
+  // THE ONE THAT MATTERS. The rollback served 00:30Z-01:20Z, i.e. across the write,
+  // and the good build was back before the grade ran. Point-in-time SHA: clean.
+  check(
+    'WRITER: a rollback across the write window, replaced before the grade => PRE_FIX_WRITER',
+    (() => {
+      const w = gradeWriterProvenance({
+        deploys: [
+          dep(GOOD, '2026-07-30T12:10:24Z'),
+          dep(BAD, '2026-07-31T00:30:00Z'),
+          dep(GOOD, '2026-07-31T01:20:00Z', 'live'),
+        ],
+        isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT, liveCommit: GOOD,
+      });
+      return { verdict: w.verdict, serving: w.serving.length };
+    })(),
+    { verdict: 'PRE_FIX_WRITER', serving: 3 },
+  );
+  // ... and that verdict must reach the AC2 grade, in BOTH directions.
+  check(
+    'WRITER: PRE_FIX_WRITER downgrades a PASS to BLIND and preserves the original',
+    (() => {
+      const a = applyWriterProvenanceToAc2({ verdict: 'PASS', rows: 0, gradeableBookCount: 3 }, { verdict: 'PRE_FIX_WRITER' });
+      return { verdict: a.verdict, from: a.downgradedFrom };
+    })(),
+    { verdict: 'BLIND', from: 'PASS' },
+  );
+  check(
+    'WRITER: PRE_FIX_WRITER also downgrades a FAIL — "not running" is not "regressed"',
+    applyWriterProvenanceToAc2({ verdict: 'FAIL', rows: 2 }, { verdict: 'PRE_FIX_WRITER' }).downgradedFrom,
+    'FAIL',
+  );
+  check(
+    'WRITER: MUTATION — UNATTRIBUTABLE must NOT veto the grade (else the gate is unreachable)',
+    applyWriterProvenanceToAc2({ verdict: 'PASS', rows: 0 }, { verdict: 'UNATTRIBUTABLE' }).verdict,
+    'PASS',
+  );
+  check(
+    'WRITER: CONFIRMED passes the verdict through untouched',
+    applyWriterProvenanceToAc2({ verdict: 'PASS', rows: 0 }, { verdict: 'CONFIRMED' }).verdict,
+    'PASS',
+  );
+  // A post-write rollback did NOT write the row. Failing on it would hand the
+  // fleet's deploy cadence a veto over this gate.
+  check(
+    'WRITER: a rollback deployed AFTER the window does not invalidate the grade',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-30T12:10:24Z'), dep(BAD, '2026-07-31T02:30:00Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'CONFIRMED',
+  );
+  // ABSENCE IS NOT A PASS, three ways — and none of them may read CONFIRMED.
+  check(
+    'WRITER: no credential => UNATTRIBUTABLE, never CONFIRMED',
+    gradeWriterProvenance({ deploys: null, isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT }).verdict,
+    'UNATTRIBUTABLE',
+  );
+  check(
+    'WRITER: unresolvable ancestry (no git checkout) => UNATTRIBUTABLE, never PRE_FIX_WRITER',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-30T12:10:24Z', 'live')],
+      isDescendant: () => null, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'UNATTRIBUTABLE',
+  );
+  check(
+    'WRITER: history that starts AFTER the window opened => UNATTRIBUTABLE',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-31T01:40:00Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'UNATTRIBUTABLE',
+  );
+  // A build that never served occupies a timestamp but no traffic. Counting it
+  // would report a PRE_FIX_WRITER on a rollback attempt that failed to deploy.
+  check(
+    'WRITER: a build_failed rollback never served, so it cannot be the writer',
+    gradeWriterProvenance({
+      deploys: [
+        dep(GOOD, '2026-07-30T12:10:24Z', 'live'),
+        dep(BAD, '2026-07-31T00:30:00Z', 'build_failed'),
+      ],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'CONFIRMED',
+  );
+  check(
+    'WRITER: RED outranks UNKNOWN — a proven pre-fix build is not masked by an unresolved one',
+    gradeWriterProvenance({
+      deploys: [dep(BAD, '2026-07-31T00:30:00Z'), dep('unknown123', '2026-07-31T01:20:00Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: GRADE_AT,
+    }).verdict,
+    'PRE_FIX_WRITER',
+  );
+  // A PRE-CHECK MUST NOT LOOK LIKE THE GRADE. The newest served build is
+  // open-ended, so before the EOD write it intersects the window and would print
+  // CONFIRMED about a row nobody has written yet — and the same inputs must flip to
+  // a real verdict once the write instant has passed.
+  check(
+    'WRITER: before the EOD write => NOT_YET_WRITTEN, never CONFIRMED',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-30T12:10:24Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: '2026-07-30T14:30:00Z',
+    }).verdict,
+    'NOT_YET_WRITTEN',
+  );
+  check(
+    'WRITER: the SAME inputs attribute the writer once the write instant has passed',
+    gradeWriterProvenance({
+      deploys: [dep(GOOD, '2026-07-30T12:10:24Z', 'live')],
+      isDescendant: descendantOnly, gradedDate: '2026-07-30', now: '2026-07-31T01:30:00Z',
+    }).verdict,
+    'CONFIRMED',
+  );
+  check(
+    'WRITER: the NOT_YET_WRITTEN arm says PRE-CHECK in the printed output',
+    (() => {
+      const lines = [];
+      const real = console.log;
+      console.log = (...a) => lines.push(a.join(' '));
+      try { printWriterProvenance({ verdict: 'NOT_YET_WRITTEN', reason: 'r', serving: [] }); } finally { console.log = real; }
+      return lines.join('\n').includes('PRE-CHECK, not the grade');
+    })(),
+    true,
+  );
+  check(
+    'WRITER: NOT_YET_WRITTEN does not veto the grade either',
+    applyWriterProvenanceToAc2({ verdict: 'BLIND', rows: 0 }, { verdict: 'NOT_YET_WRITTEN' }).verdict,
+    'BLIND',
+  );
+  check(
+    'WRITER: nothing graded => NOT_APPLICABLE, not a silent CONFIRMED',
+    gradeWriterProvenance({ deploys: [], isDescendant: descendantOnly, gradedDate: null }).verdict,
+    'NOT_APPLICABLE',
+  );
+  // The date AC2 rests on is the newest gradeable session, not the cutoff.
+  check(
+    'WRITER: the attributed date is the newest GRADEABLE session, falling back to the cutoff',
+    [
+      latestGradedDate({ since: '2026-07-30', gradeableBooks: [{ dates: ['2026-07-30'] }, { dates: ['2026-07-31', '2026-07-30'] }] }),
+      latestGradedDate({ since: '2026-07-30', gradeableBooks: [] }),
+      latestGradedDate(null),
+    ],
+    ['2026-07-31', '2026-07-30', null],
+  );
+  // The printed text is the deliverable: the grader reads stdout, not an object.
+  for (const [label, w, needle] of [
+    ['PRE_FIX_WRITER', { verdict: 'PRE_FIX_WRITER', reason: 'r', serving: [] }, 'PRE-FIX BUILD'],
+    ['UNATTRIBUTABLE', { verdict: 'UNATTRIBUTABLE', reason: 'r', serving: [] }, 'UNATTRIBUTED'],
+    ['absent', null, 'NOT CHECKED'],
+  ]) {
+    check(
+      `WRITER: the ${label} arm says so in the printed output`,
+      (() => {
+        const lines = [];
+        const real = console.log;
+        console.log = (...a) => lines.push(a.join(' '));
+        try { printWriterProvenance(w); } finally { console.log = real; }
+        return lines.join('\n').includes(needle);
+      })(),
+      true,
+    );
+  }
+  // And the downgraded BLIND arm must not print the "writer has not produced a row
+  // yet, re-run" text — that names the wrong cause and invites a pointless re-read.
+  check(
+    'WRITER: a downgraded BLIND names the pre-fix writer, not a missing row',
+    (() => {
+      const a = applyWriterProvenanceToAc2(
+        graded([day('2026-07-29', 0, -5.11), day('2026-07-30', 3.25, 0)]),
+        { verdict: 'PRE_FIX_WRITER', reason: 'rolled back', serving: [], gradedDate: '2026-07-30' },
+      );
+      const out = capturePrintAc2(a);
+      return { downgraded: out.includes('DOWNGRADED from PASS'), noStaleRerun: !out.includes('has not produced a gradeable row yet') };
+    })(),
+    { downgraded: true, noStaleRerun: true },
   );
 
   let failed = 0;
