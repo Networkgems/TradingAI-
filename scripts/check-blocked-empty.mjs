@@ -62,9 +62,24 @@
  *
  * ⛔ And never grade it off `blockerAttention`. That rollup counts open
  * CHILDREN, which the anchor does not, so it reads `unresolvedBlockerCount: 1`
- * on an issue whose `blockedBy` is `[]` (measured on TRA-2331). It over-reports
- * as readily as it under-reports. `blockerAttention` is printed here as
- * context and is NEVER allowed to suppress a finding.
+ * on an issue whose `blockedBy` is `[]` (measured on TRA-2331). `blockerAttention`
+ * is printed here as context and is NEVER allowed to suppress a finding.
+ *
+ *   ⛔⛔ This includes the cheap-and-strictly-better substitute
+ *   `unresolvedBlockerCount == 0`, routed in on TRA-2622 as catching BOTH shapes
+ *   with zero misses over the whole `blocked` population. It DOES agree on
+ *   today's board — I reproduced that: 81 blocked of 2625 issues, both
+ *   predicates return exactly TRA-2305/TRA-2420/TRA-382. But the same sweep
+ *   measures the rollup EXCEEDING the open-`blockedBy` count on 11 of 81 rows
+ *   and falling below it on 0, so it is `#open blockedBy + #open descendants`
+ *   with a one-directional inflation term. The three strands agreed only
+ *   because they happened to carry no open descendants at that instant. TRA-1648
+ *   is the live counterexample in waiting: rollup `4` over 3 `done` + 2 open
+ *   blockers, so the moment those two close it is a shape-2 strand reading `2`
+ *   and the substitute goes silent — on a stalled SUBTREE, the most expensive
+ *   kind. `rollupMaskControl()` below pins this as a differential, because the
+ *   prose warning that was already here did not prevent the substitution from
+ *   being routed in as validated.
  *
  * ⛔⛔ AND NEVER LET IT NAME THE ANCHOR (TRA-2396). The same rollup exposes
  * `sampleBlockerIdentifier`, and it is STRUCTURALLY INCAPABLE of yielding a
@@ -1903,6 +1918,78 @@ async function strandClassMissControl() {
 }
 
 /**
+ * The TRA-2622 differential — why this file grades the SHAPE and not
+ * `blockerAttention.unresolvedBlockerCount == 0`.
+ *
+ * That one-predicate substitute was routed in as strictly better and cheaper:
+ * measured over all 82 `blocked` issues it returned exactly the 4 known
+ * strands, "zero false positives, zero misses". I re-measured the whole
+ * population (81 `blocked` of 2625 issues, deep-GET each) and reproduced the
+ * agreement — both predicates return exactly TRA-2305, TRA-2420, TRA-382.
+ *
+ * The agreement is a COINCIDENCE OF THE BOARD, not a property of the predicate,
+ * and the same measurement shows why:
+ *
+ *     count == #open blockedBy   70 / 81
+ *     count  >  #open blockedBy  11 / 81   <- rollup counts NON-blockedBy work
+ *     count  <  #open blockedBy   0 / 81   <- never under-counts
+ *
+ * So `unresolvedBlockerCount` is `#open blockedBy + #open descendants`, and the
+ * inflation term is one-directional. On 11 live issues it is already >= 1. The
+ * strands agreed only because all three happened to carry zero open
+ * descendants at that instant — the predicate was UNFALSIFIED by that board,
+ * not validated by it.
+ *
+ * The counterexample is live and one close away. TRA-1648 reads
+ * `unresolvedBlockerCount: 4` over `blockedBy` = 3 `done` + 2 open, i.e. an
+ * inflation term of +2 sitting alongside already-closed blockers. When those
+ * two blockers close it becomes a textbook shape-2 strand whose rollup reads
+ * `2`, and the substitute predicate goes silent on it. That is the worst
+ * available failure mode: a strand with open descendants is precisely a stalled
+ * SUBTREE (the TRA-2305 -> TRA-2268 shape), so the masking is strongest exactly
+ * where the strand is most expensive.
+ *
+ * This control freezes the substitute predicate in place and shows it reporting
+ * a clean board over two planted strands the shape detector finds. Prose saying
+ * "never grade it off the rollup" is what this file already had; it did not stop
+ * the substitution from being routed in as validated.
+ */
+async function rollupMaskControl() {
+  const board = fakeBoard([
+    // Shape 2 with a descendant term: every blocker `done`, rollup still 2.
+    buried('m1', 'TRA-8290', 'agent-cto', [['TRA-8299', 'done', 'agent-cto']], rollup(2, 'TRA-8295')),
+    // Shape 1 with a descendant term — the read measured on TRA-2331:
+    // `blockedBy: []` and `unresolvedBlockerCount: 1`.
+    stranded('m2', 'TRA-8291', 'agent-cfo', rollup(1, 'TRA-8296')),
+  ]);
+  const t = transportFor(board);
+
+  // The substitute predicate, frozen here so it cannot drift with the file.
+  const rollupPredicate = (item) =>
+    item &&
+    item.status === 'blocked' &&
+    (item.blockerAttention || {}).unresolvedBlockerCount === 0;
+
+  const allRows = board.rows.filter((r) => r.status === 'blocked');
+  const rollupHits = [];
+  for (const row of allRows) if (rollupPredicate(await t.getIssue(row.id))) rollupHits.push(row.identifier);
+
+  const now = await sweep(t);
+  const shapeHits = now.findings.map((f) => f.identifier).sort();
+  const ok =
+    rollupHits.length === 0 &&
+    now.verdict === 'FINDINGS' &&
+    shapeHits.join(',') === 'TRA-8290,TRA-8291';
+  return {
+    ok,
+    detail:
+      `substitute rollup predicate (unresolvedBlockerCount === 0) found ${rollupHits.length} across all ` +
+      `${allRows.length} blocked row(s); shape detector found ${shapeHits.length} (${shapeHits.join(', ') || 'none'}) ` +
+      '— one shape-1 and one shape-2 strand, each masked by a descendant term of the kind measured on 11/81 live rows',
+  };
+}
+
+/**
  * The invariant that outranks every individual case: NO rendering of ANY board
  * may contain a copy-pasteable `blockedByIssueIds` write. TRA-2383 shipped one
  * inside a report that also argued against running it — prose loses to
@@ -1954,6 +2041,13 @@ async function selftest() {
       `        ${classMiss.detail}`,
   );
 
+  const rollupMask = await rollupMaskControl();
+  if (!rollupMask.ok) failed += 1;
+  console.log(
+    `${rollupMask.ok ? 'ok  ' : 'FAIL'}  TRA-2622 — the ROLLUP substitute (unresolvedBlockerCount === 0) MISSES both strand shapes when a descendant inflates the count\n` +
+      `        ${rollupMask.detail}`,
+  );
+
   // Reachability: a control set that cannot produce every verdict is not a
   // control set, it is a rubber stamp with an alarm attached.
   //
@@ -1963,7 +2057,9 @@ async function selftest() {
   const reachable = new Set(CASES.map((c) => c.expect));
   const need = ['CLEAN', 'FINDINGS', 'FINDINGS_UNREPAIRABLE', 'BLIND'];
   const missing = need.filter((v) => !reachable.has(v));
-  const total = CASES.length + 3; // + naive-miss + strand-class-miss differentials + the global no-command invariant
+  // + naive-miss, strand-class-miss and rollup-mask differentials + the global
+  // no-command invariant.
+  const total = CASES.length + 4;
   console.log(`\n${total - failed}/${total} controls pass; verdicts reachable: ${[...reachable].sort().join(', ')}`);
   if (missing.length) {
     console.log(`FAIL  no control exercises: ${missing.join(', ')}`);
