@@ -13,6 +13,7 @@ import {
   getFeedDegradationState,
   tradierBreakerGate,
   barPullThrottleGate,
+  secondaryFanoutCeiling,
 } from './yahoo-feed.js';
 
 const Q = (price: number) => ({ price, volume: 0, change: 0, changePct: 0 });
@@ -495,5 +496,65 @@ describe('getFeedDegradationState (TRA-1940 observability)', () => {
     // `tradierBarBlockedUntil` epoch, so on a QUOTE-side quota trip it printed
     // `barPathOpen:false` while `tradier.open` was true — the contradiction this locks.
     expect(s.tradier.barPathOpen).toBe(s.tradier.open);
+  });
+});
+
+/**
+ * TRA-2627 — the secondary fan-out's coverage ceiling.
+ *
+ * Provenance: on 2026-07-29 the report tape showed 42.5% of the stock universe on
+ * `quoteStatus:'unavailable'` in two discrete staleness buckets. The feed logs
+ * (bqb1, `resource=srv-d7mb7rr7uimc73ev0chg`) attribute it to a Tradier **HTTP 503**
+ * — `messaging.adaptors.http.flow.ServiceUnavailable`, NOT a quota violation — at
+ * 19:10:21.876Z, tripping the quote breaker for 90s and dumping the whole universe
+ * onto the secondary chain, which then reported `288/614`, `280/614` and `105/361`
+ * twice, all `(feed budget exhausted)`.
+ *
+ * The budget is spent on SLEEPS, not on work, so the coverage ceiling is a pure
+ * function of three constants and is reached before any network time is counted.
+ */
+describe('secondaryFanoutCeiling (TRA-2627 fan-out coverage bound)', () => {
+  it('caps at floor(budget/sleep) * batch — the shipped default is 200 symbols', () => {
+    // floor(8000/200) = 40 batches, 5 symbols each.
+    expect(secondaryFanoutCeiling(8_000, 200, 5)).toBe(200);
+  });
+
+  it('MEASURED CONTROL — predicts the 2026-07-29T00:30:10Z observation', () => {
+    // That line read `395/597 symbols failed (feed budget exhausted)` with Tradier
+    // dark, i.e. 597 - 395 = 202 symbols actually covered, against a predicted
+    // ceiling of 200. This asserts the bound is a bound (covered <= ceiling + one
+    // in-flight batch), not merely a number that happens to look close.
+    const ceiling = secondaryFanoutCeiling(8_000, 200, 5);
+    const covered = 597 - 395;
+    expect(covered).toBeLessThanOrEqual(ceiling + 5);
+    expect(covered).toBeGreaterThan(ceiling - 5);
+  });
+
+  it('is BELOW the live bqb1 universe — the shortfall is arithmetic, not transient', () => {
+    // 614 symbols on 2026-07-29. This test is the reason the ticket exists: the
+    // constant was sized against the comment above it ("comfortably covers the
+    // 25-symbol watchlist") and the universe grew 24x underneath it.
+    const LIVE_UNIVERSE = 614;
+    const ceiling = secondaryFanoutCeiling(8_000, 200, 5);
+    expect(ceiling).toBeLessThan(LIVE_UNIVERSE);
+    expect(LIVE_UNIVERSE - ceiling).toBe(414);
+  });
+
+  it('KNOWN-GOOD control — a budget that DOES cover the universe reports no shortfall', () => {
+    // A test that only ever asserts "the ceiling is too small" would also pass
+    // against a function hard-coded to return 0. Prove it moves with its inputs and
+    // can clear the universe, so the failing assertions above mean something.
+    expect(secondaryFanoutCeiling(30_000, 200, 5)).toBeGreaterThan(614);
+    expect(secondaryFanoutCeiling(8_000, 50, 5)).toBe(800);
+    expect(secondaryFanoutCeiling(8_000, 200, 20)).toBe(800);
+  });
+
+  it('degenerate inputs return 0 rather than Infinity/NaN', () => {
+    // A zero sleep would otherwise divide to Infinity and silently report the
+    // universe as fully covered — a fail-open on the very number this guards.
+    expect(secondaryFanoutCeiling(8_000, 0, 5)).toBe(0);
+    expect(secondaryFanoutCeiling(0, 200, 5)).toBe(0);
+    expect(secondaryFanoutCeiling(8_000, 200, 0)).toBe(0);
+    expect(secondaryFanoutCeiling(Number.NaN, 200, 5)).toBe(0);
   });
 });

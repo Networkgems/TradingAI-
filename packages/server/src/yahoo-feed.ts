@@ -240,6 +240,37 @@ const FEED_FANOUT_BUDGET_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 8_000;
 })();
 
+// TRA-2627 — hoisted out of fetchQuotes so the coverage ceiling below can be
+// computed (and unit-tested) from the same constants the loop actually uses.
+const QUOTE_BATCH = 5;
+const FANOUT_SLEEP_MS = 200;
+
+/**
+ * TRA-2627 — the largest number of symbols the secondary fan-out can EVER price in
+ * one `fetchQuotes` call, **before a single millisecond of network time is
+ * counted**.
+ *
+ * The fan-out is sequential batches of `QUOTE_BATCH` with a `FANOUT_SLEEP_MS`
+ * politeness sleep between them, and the deadline is re-checked before each batch.
+ * So the budget is spent on *sleeps*, not on work: at the 8s default that is
+ * `floor(8000/200) * 5` = **200 symbols**. `FEED_FANOUT_BUDGET_MS` was sized when
+ * the comment above it said "comfortably covers the 25-symbol watchlist"; bqb1's
+ * universe is now 614, so whenever Tradier is dark ≥414 symbols (67%) are unpriced
+ * by arithmetic alone — measured 2026-07-29T00:30:10Z as `395/597 failed`, i.e. 202
+ * covered against a predicted ceiling of 200.
+ *
+ * This is exported so the ceiling is a readable number rather than a property you
+ * have to re-derive from three constants in two scopes.
+ */
+export function secondaryFanoutCeiling(
+  budgetMs: number = FEED_FANOUT_BUDGET_MS,
+  sleepMs: number = FANOUT_SLEEP_MS,
+  batch: number = QUOTE_BATCH,
+): number {
+  if (!(budgetMs > 0) || !(sleepMs > 0) || !(batch > 0)) return 0;
+  return Math.floor(budgetMs / sleepMs) * batch;
+}
+
 // ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
 // TRA-505: the live app writes each user's Tradier creds into per-user account
 // settings (Settings page), NOT env — so on a normal deployment `TRADIER_API_TOKEN`
@@ -1561,8 +1592,32 @@ export async function fetchQuotes(
   // withRetry already returns null for every symbol when isRateLimited() is true,
   // so the existing loop just burns N Promise.all() round-trips with zero data
   // gain and queues unnecessary microtask callbacks during the boot window.
-  if (remaining.length > 0 && isRateLimited()) return results;
-  const QUOTE_BATCH = 5;
+  //
+  // TRA-2627 — ...but COUNT THE DROP BEFORE YOU RETURN. This used to `return
+  // results` unconditionally, several lines ABOVE the point where `failures` is even
+  // declared, so every symbol in `remaining` vanished with no counter and no log
+  // line at all. `applyQuotes` then stamped each of them `quoteStatus:'unavailable'`
+  // — and the feed log said nothing whatsoever about why. That made the obvious
+  // diagnosis wrong in the reassuring direction: a `fetchQuotes: 1/614 symbols
+  // failed` line on the next tick reads as "only one symbol failed", when the whole
+  // `remaining` set may have been dropped on the line above the counter. A silent
+  // drop is the one failure a log-based investigation structurally cannot reach.
+  // The distinct `pre-fanout` suffix separates this from the in-loop breaker trip,
+  // which is a different event with a different remedy.
+  if (remaining.length > 0 && isRateLimited()) {
+    console.warn(`[yahoo-feed] fetchQuotes: ${remaining.length}/${symbols.length} symbols failed (Yahoo breaker open, pre-fanout short-circuit)`);
+    return results;
+  }
+  // TRA-2627 — say out loud when the budget CANNOT cover this universe. A line
+  // reading "288/614 symbols failed (feed budget exhausted)" reads as a transient
+  // that a retry would clear; at 614 symbols it is arithmetic, and it recurs on
+  // every tick where Tradier is dark. Naming the ceiling and the three constants
+  // that set it turns the next reader toward the sizing decision instead of toward
+  // the provider.
+  const fanoutCeiling = secondaryFanoutCeiling();
+  if (remaining.length > fanoutCeiling) {
+    console.warn(`[yahoo-feed] fetchQuotes: fan-out budget CANNOT cover this universe — ${remaining.length} symbols need a secondary quote, ceiling is ${fanoutCeiling} (FEED_FANOUT_BUDGET_MS=${FEED_FANOUT_BUDGET_MS} / ${FANOUT_SLEEP_MS}ms sleep x ${QUOTE_BATCH} per batch); >=${remaining.length - fanoutCeiling} will be left unpriced before any network time is counted`);
+  }
   // TRA-1940 — cap total wall-time spent on the secondary fan-out per call. The
   // start-of-loop short-circuit above can't catch either (a) a Yahoo breaker that
   // trips PARTWAY through the loop — the remaining batches then each burn a 200ms
@@ -1587,7 +1642,7 @@ export async function fetchQuotes(
       if (q) results.set(sym, q);
       else failures++;
     }
-    if (i + QUOTE_BATCH < remaining.length) await sleep(200);
+    if (i + QUOTE_BATCH < remaining.length) await sleep(FANOUT_SLEEP_MS);
   }
   if (failures > 0) {
     const reason = isRateLimited() ? ' (Yahoo breaker open)' : budgetHit ? ' (feed budget exhausted)' : '';
