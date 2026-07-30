@@ -111,13 +111,48 @@ describe('TRA-2564 acceptance — off-host', () => {
     expect(Object.keys(route())).toContain('mispricingBasis');
   });
 
-  it('max |mispricingPct| reads below 100% at minDelta=0 — the headline number', () => {
+  it('max |mispricingPct| < 100% at minDelta=0 — ON AN EXPENSIVE-TAILED CHAIN ONLY', () => {
     const body = route({ minDelta: 0 });
     expect(body.candidates.length).toBeGreaterThan(0); // not vacuously true
     const worst = Math.max(...body.candidates.map((c) => Math.abs(c.mispricingPct)));
     expect(worst).toBeLessThan(1.0);
-    // The ticket's re-measure bar is 75%; this fixture should clear it too.
-    expect(worst).toBeLessThan(0.75);
+    expect(worst).toBeLessThan(0.75); // the re-measure bar
+
+    // ⚠️ READ THE NEXT TEST BEFORE QUOTING THIS ONE. This fixture is
+    // EXPENSIVE-TAILED (mark pinned at a tick, theo collapsing) — the regime
+    // TRA-2388 measured, and the only regime in which the mark basis is bounded.
+    // It is NOT evidence that the acceptance holds on an arbitrary chain, and on
+    // 2026-07-30 it did not hold live.
+    expect(body.candidates.every((c) => c.mark >= c.theo)).toBe(true);
+  });
+
+  /**
+   * THE LIVE COUNTER-EXAMPLE, pinned as a test so it cannot rot back into
+   * folklore. Measured on bqb1 @17f9eae, 2026-07-30 07:48Z, SPY spot 729.46,
+   * exp 2026-09-04, `limit=50&minDelta=0`: 25 of 50 rows were CHEAP and the
+   * worst read −333.6% on the shipped `mark` basis against −76.9% on `theo`.
+   *
+   * This test asserts the acceptance criterion FAILS on that row. If someone
+   * later "fixes" the basis so it passes, this test fails and forces them to
+   * come read why — which is the point.
+   */
+  it('REFUTES "bounded by construction": the live SPY cheap tail reads 333.6% on `mark`', () => {
+    // SPY260904C00807000 exactly as the live route returned it.
+    const mark = 0.11;
+    const theo = 0.47701;
+    const markBasis = Math.abs((mark - theo) / mark);
+    const theoBasis = Math.abs((mark - theo) / theo);
+    const maxBasis = Math.abs((mark - theo) / Math.max(mark, theo));
+
+    expect(markBasis).toBeCloseTo(3.336, 2); // 333.6% — MISSES <100% and <75%
+    expect(theoBasis).toBeCloseTo(0.769, 2); // 76.9%  — the basis it replaced
+    expect(maxBasis).toBeCloseTo(0.769, 2); // 76.9%  — max == theo when cheap
+
+    // The direction that matters: on this chain the shipped fix made the graded
+    // headline WORSE, not better.
+    expect(markBasis).toBeGreaterThan(theoBasis);
+    expect(markBasis).toBeGreaterThan(1.0);
+    expect(maxBasis).toBeLessThan(1.0);
   });
 
   it('the suppressed footnotes are quoted in the mark basis, not the theo basis', () => {

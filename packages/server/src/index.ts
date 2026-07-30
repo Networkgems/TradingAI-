@@ -543,8 +543,8 @@ import { TradierRelativeValueScannerService } from './relative-value-scanner.js'
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
 import {
-  rebaseOnMark,
-  OTM_MISPRICING_BASIS,
+  rebaseMispricing,
+  parseMispricingBasis,
   OTM_PANEL_MISPRICING_THRESHOLD,
 } from './otm-mark-basis.js';
 import { ShortSqueezeScannerService } from './short-squeeze-scanner.js';
@@ -4389,6 +4389,13 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
     typeof theoRaw === 'string' && theoRaw.length > 0 && Number.isFinite(Number(theoRaw))
       ? Number(theoRaw)
       : OTM_PANEL_THEO_FLOOR;
+  // TRA-2564 — which DENOMINATOR the ratio is normalised by. Defaults to `mark`,
+  // the TRA-2562 decision; `?basis=theo` (the pre-TRA-2564 formula) and
+  // `?basis=max` (bounded on BOTH sides) exist so a re-measure can grade all
+  // three from ONE build. An unrecognised value falls back to the default rather
+  // than 400ing, and `mispricingBasis` on the response echoes what was APPLIED —
+  // so a typo'd basis reads as the fallback it got, not the one it asked for.
+  const basis = parseMispricingBasis(req.query['basis']);
 
   // NOTE: deliberately no `minAbsDelta` here — see the TRA-2388 note above.
   // `packages/engine/` is byte-unchanged by this route.
@@ -4403,8 +4410,9 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   // `otm-mark-basis.ts` for why this is a route-layer transform and the engine
   // is untouched — the shared `classification` gates a live `single_leg_otm`
   // entry, so changing the engine formula would widen that gate ~2.3%.
-  const rebased = rebaseOnMark(
+  const rebased = rebaseMispricing(
     result.candidates,
+    basis,
     Number.isFinite(minMispricing) ? Number(minMispricing) : OTM_PANEL_MISPRICING_THRESHOLD,
   );
   // Floor BEFORE the slice. Filtering after it would leave the underflow rows
@@ -4417,19 +4425,24 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   const deltaFloored = applyDeltaFloor(floored.kept, minDelta);
   res.json({
     ...result,
-    // Ranked by |mispricingPct| descending — by `rebaseOnMark`, not by
+    // Ranked by |mispricingPct| descending — by `rebaseMispricing`, not by
     // `scanOtm`, whose theo-basis order this deliberately supersedes. A slice is
     // therefore still the top N.
     candidates: deltaFloored.kept.slice(0, limit),
     // TRA-2564 — the DENOMINATOR every `mispricingPct` on this response is
-    // normalised by. A build predating TRA-2564 omits the key entirely, so its
-    // presence (not a SHA, not a commit subject) is what proves the formula
-    // swapped. ⚠️ It is bounded by +100% on the EXPENSIVE side only; the cheap
-    // side is unbounded below. See `otm-mark-basis.ts`.
-    mispricingBasis: OTM_MISPRICING_BASIS,
-    // Never silent: rows with an unusable `mark` have no mark-basis ratio and
-    // were neutralised to 0/`fair` rather than emitted with a theo-basis number
-    // under a mark-basis label. Normally 0.
+    // normalised by, as APPLIED (not as requested). A build predating TRA-2564
+    // omits the key entirely, so its presence — not a SHA, not a commit subject
+    // — is what proves the formula swapped.
+    //
+    // ⚠️ `mark` is bounded at +100% on the EXPENSIVE side ONLY; the cheap side is
+    // unbounded. Measured live 2026-07-30: SPY read 333.6% on `mark` vs 94.1% on
+    // `theo`, because SPY's tail is currently CHEAP. The two bases are exact
+    // duals and neither bounds both tails — `basis=max` does. See
+    // `otm-mark-basis.ts`; the choice is TRA-2562's, so the default stays `mark`.
+    mispricingBasis: rebased.basis,
+    // Never silent: rows whose denominator was unusable under the applied basis
+    // have no ratio and were neutralised to 0/`fair` rather than emitted with a
+    // stale number under a fresh label. Normally 0.
     markBasis: {
       threshold: rebased.threshold,
       unbasisable: rebased.unbasisable,

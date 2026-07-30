@@ -7,7 +7,10 @@ import {
 } from '@trading-app/engine';
 import {
   rebaseOnMark,
+  rebaseMispricing,
+  parseMispricingBasis,
   OTM_MISPRICING_BASIS,
+  OTM_DEFAULT_MISPRICING_BASIS,
   OTM_PANEL_MISPRICING_THRESHOLD,
   type MarkBasisCandidate,
 } from './otm-mark-basis.js';
@@ -249,6 +252,90 @@ describe('rebaseOnMark — the bound is ONE-SIDED', () => {
     expect(r.mispricingPct).toBeCloseTo(-9, 12); // −900%
     expect(Math.abs(r.mispricingPct)).toBeGreaterThan(1);
     expect(r.classification).toBe('cheap');
+  });
+});
+
+describe('?basis= — the selector, and the DUALITY it exists to measure', () => {
+  /**
+   * The live 2026-07-30 re-measure refuted TRA-2564's "bounded by construction"
+   * premise: SPY read 333.6% on `mark` against 94.1% on `theo`, because SPY's
+   * tail is currently CHEAP. These pin the algebra behind that, so the finding
+   * cannot quietly rot back into "mark fixed it".
+   */
+  it('the default is `mark` — the TRA-2562 decision, unchanged by the selector', () => {
+    expect(OTM_DEFAULT_MISPRICING_BASIS).toBe('mark');
+    expect(rebaseMispricing([c(1.2, 1.0)]).basis).toBe('mark');
+    // The alias and the general form must not drift apart.
+    expect(rebaseOnMark([c(1.2, 1.0)]).candidates[0].mispricingPct).toBe(
+      rebaseMispricing([c(1.2, 1.0)], 'mark').candidates[0].mispricingPct,
+    );
+  });
+
+  it('each basis uses its own denominator', () => {
+    const row = c(1.2, 1.0); // mark 1.2, theo 1.0, diff +0.2
+    const pct = (b: 'mark' | 'theo' | 'max') =>
+      rebaseMispricing([row], b).candidates[0].mispricingPct;
+    expect(pct('mark')).toBeCloseTo(0.2 / 1.2, 12);
+    expect(pct('theo')).toBeCloseTo(0.2 / 1.0, 12);
+    expect(pct('max')).toBeCloseTo(0.2 / 1.2, 12); // expensive -> max is mark
+  });
+
+  it('`max` picks the BOUNDED branch on each side: theo when cheap, mark when expensive', () => {
+    const cheap = rebaseMispricing([c(0.5, 1.0)], 'max').candidates[0];
+    expect(cheap.mispricingPct).toBeCloseTo(-0.5 / 1.0, 12); // = theo basis
+    const exp = rebaseMispricing([c(2.0, 1.0)], 'max').candidates[0];
+    expect(exp.mispricingPct).toBeCloseTo(1.0 / 2.0, 12); // = mark basis
+  });
+
+  it('THE DUALITY: `theo` blows up on the expensive tail, `mark` on the cheap tail', () => {
+    // Expensive tail — the TRA-2388 artifact regime (theo collapses).
+    const expensive = c(0.1, 1e-6);
+    expect(rebaseMispricing([expensive], 'theo').candidates[0].mispricingPct).toBeGreaterThan(100);
+    expect(
+      Math.abs(rebaseMispricing([expensive], 'mark').candidates[0].mispricingPct),
+    ).toBeLessThan(1);
+
+    // Cheap tail — what SPY actually showed live on 2026-07-30.
+    const cheap = c(0.11, 0.477);
+    expect(Math.abs(rebaseMispricing([cheap], 'theo').candidates[0].mispricingPct)).toBeLessThan(1);
+    expect(
+      Math.abs(rebaseMispricing([cheap], 'mark').candidates[0].mispricingPct),
+    ).toBeGreaterThan(3); // the live 333.6%
+
+    // ...and `max` is under 100% on BOTH.
+    for (const row of [expensive, cheap]) {
+      expect(Math.abs(rebaseMispricing([row], 'max').candidates[0].mispricingPct)).toBeLessThan(1);
+    }
+  });
+
+  it('`max` is bounded below 100% for every ratio, both signs', () => {
+    for (const x of [1e-9, 0.01, 0.5, 0.99, 1, 1.01, 2, 100, 1e9]) {
+      const [r] = rebaseMispricing([c(x, 1.0)], 'max').candidates;
+      expect(Math.abs(r.mispricingPct)).toBeLessThan(1);
+    }
+  });
+
+  it('an unrecognised ?basis= falls back to the default rather than erroring', () => {
+    for (const bad of ['MARK', 'midpoint', '', 'theo ', null, undefined, 42, ['mark']]) {
+      expect(parseMispricingBasis(bad)).toBe(OTM_DEFAULT_MISPRICING_BASIS);
+    }
+    for (const good of ['mark', 'theo', 'max']) {
+      expect(parseMispricingBasis(good)).toBe(good);
+    }
+  });
+
+  it('the result echoes the APPLIED basis, so a typo reads as the fallback it got', () => {
+    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('MARK')).basis).toBe('mark');
+    expect(rebaseMispricing([c(1.2, 1)], parseMispricingBasis('max')).basis).toBe('max');
+  });
+
+  it('a zero/negative denominator is neutralised under EVERY basis', () => {
+    // theo <= 0 cannot happen out of the engine, but the guard must not assume it.
+    for (const b of ['mark', 'theo', 'max'] as const) {
+      const out = rebaseMispricing([{ ...c(2, 1), mark: 0, theo: 0 }], b);
+      expect(out.unbasisable).toBe(1);
+      expect(out.candidates[0].mispricingPct).toBe(0);
+    }
   });
 });
 

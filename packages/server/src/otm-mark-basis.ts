@@ -73,8 +73,89 @@
  * and COUNTED, and the route renders the count.
  */
 
+/**
+ * ## ⚠️ MEASURED 2026-07-30 07:48Z — THE ACCEPTANCE PREMISE IS REFUTED
+ *
+ * The live re-measure at `17f9eae` (pre-open, SPY spot 729.46, exp 2026-09-04,
+ * `limit=50&minDelta=0`) turned the caveat above from theoretical into the
+ * governing fact. SPY's tail is currently on the CHEAP side — 25 of 50 rows have
+ * `mark < theo`, worst row `SPY260904C00807000` at mark 0.1100 vs theo 0.47701:
+ *
+ * | symbol | theo basis | **mark basis** | mid basis | max(m,t) basis |
+ * |--------|-----------:|---------------:|----------:|---------------:|
+ * | SPY    |  **94.1%** |   **333.6%**   |    125.0% |      **76.9%** |
+ * | TSLA   |      30.5% |         28.6%  |     26.5% |          23.4% |
+ * | NVDA   |      15.0% |         13.1%  |     14.0% |          13.1% |
+ * | QQQ    |       5.8% |          5.5%  |      5.7% |           5.5% |
+ * | AAPL   |      13.8% |         12.1%  |     12.9% |          12.1% |
+ *
+ * On this tape the mark basis is **3.5× WORSE** than the theo basis it replaced
+ * (333.6% vs 94.1%), and it MISSES both acceptance bars (<100%, <75%). The
+ * reason is not a bug in this module — every row is self-consistent and the
+ * transform is doing exactly what TRA-2562 ordered. It is that the two bases are
+ * exact DUALS, and neither bounds both tails:
+ *
+ *   `(mark − theo)/theo` — cheap (m<t): r ∈ (−1, 0) **BOUNDED**
+ *                        — expensive (m>t): r ∈ (0, ∞) UNBOUNDED
+ *   `(mark − theo)/mark` — cheap (m<t): r ∈ (−∞, 0) UNBOUNDED
+ *                        — expensive (m>t): r ∈ (0, 1) **BOUNDED**
+ *
+ * TRA-2388/TRA-2354 measured a chain whose tail was EXPENSIVE (mark pinned at a
+ * tick, theo → 0), so normalising by mark bounds precisely that tail. TRA-2562
+ * therefore did not remove the >100% tail — it SWAPPED WHICH TAIL EXPLODES. Any
+ * ratio of the two prices has an unbounded side; the only question is which one.
+ *
+ * `(mark − theo)/max(mark, theo)` takes the BOUNDED branch on both sides (it IS
+ * the theo basis on cheap rows and the mark basis on expensive rows), so
+ * `|r| < 1` identically, for every chain, with no floor required. It reads 76.9%
+ * on the same SPY chain — the only one of the four that clears <100%.
+ *
+ * Choosing between them is QuantTrader's call on TRA-2562, not this module's, so
+ * the DEFAULT REMAINS `mark` exactly as ordered. `?basis=` exists so the RTH
+ * re-measure can grade all three in ONE pass instead of waiting on a deploy per
+ * candidate — the alternative is three deploy cycles against a box that is
+ * already rebooting several times a day.
+ */
+
 /** Classification band — structurally identical to the engine's `Mispricing`. */
 export type MarkBasisClassification = 'expensive' | 'cheap' | 'fair';
+
+/**
+ * Denominators `/api/options/otm-mispricing?basis=` accepts.
+ *
+ *  - `mark` — `(mark − theo)/mark`. THE SHIPPED DEFAULT (TRA-2562). Bounded on
+ *    the expensive side only.
+ *  - `theo` — `(mark − theo)/theo`. The pre-TRA-2564 basis, kept reachable so a
+ *    re-measure can quote both from one build rather than inferring the old
+ *    number from an older deploy. Bounded on the cheap side only.
+ *  - `max`  — `(mark − theo)/max(mark, theo)`. Bounded on BOTH sides, |r| < 1
+ *    identically. Offered for measurement; NOT the default, because switching
+ *    the panel's headline statistic is a TRA-2562 decision.
+ */
+export const OTM_MISPRICING_BASES = ['mark', 'theo', 'max'] as const;
+export type MispricingBasis = (typeof OTM_MISPRICING_BASES)[number];
+
+/** The basis the route applies when the caller sends no `?basis=`. */
+export const OTM_DEFAULT_MISPRICING_BASIS: MispricingBasis = 'mark';
+
+/** Narrow an untrusted query value, falling back to the shipped default. */
+export function parseMispricingBasis(raw: unknown): MispricingBasis {
+  return typeof raw === 'string' && (OTM_MISPRICING_BASES as readonly string[]).includes(raw)
+    ? (raw as MispricingBasis)
+    : OTM_DEFAULT_MISPRICING_BASIS;
+}
+
+/** The denominator for one row under `basis`. */
+function denominatorFor(mark: number, theo: number, basis: MispricingBasis): number {
+  switch (basis) {
+    case 'mark':
+      return mark;
+    case 'theo':
+      return theo;
+    case 'max':
+      return Math.max(mark, theo);
+  }
+}
 
 /**
  * Threshold above which |mispricingPct| is labelled cheap/expensive when the
@@ -102,18 +183,22 @@ export interface MarkBasisCandidate {
 
 export interface MarkBasisResult<T extends MarkBasisCandidate> {
   /**
-   * Every input candidate, ratio re-based on `mark`, re-classified against
-   * `threshold`, and RE-SORTED by |mispricingPct| descending.
+   * Every input candidate, ratio re-based, re-classified against `threshold`,
+   * and RE-SORTED by |mispricingPct| descending.
    */
   candidates: T[];
-  /** The basis actually applied — a constant, but echoed so the wire self-describes. */
-  basis: typeof OTM_MISPRICING_BASIS;
+  /**
+   * The basis actually APPLIED — echoed rather than assumed, so a caller that
+   * sent a typo'd `?basis=` reads the fallback it really got instead of the one
+   * it asked for. That distinction is the whole point of the key.
+   */
+  basis: MispricingBasis;
   /** The classification threshold applied (a ratio, 0.15 = 15%). */
   threshold: number;
   /**
-   * Rows whose `mark` was non-finite or non-positive, so no mark-basis ratio
-   * exists. Neutralised to 0 / `fair` rather than left carrying a theo-basis
-   * number under a mark-basis label. Rendered, never swallowed.
+   * Rows whose DENOMINATOR under the applied basis was non-finite or
+   * non-positive, so no ratio exists. Neutralised to 0 / `fair` rather than left
+   * carrying a stale number under a fresh label. Rendered, never swallowed.
    */
   unbasisable: number;
 }
@@ -125,8 +210,8 @@ function classify(pct: number, threshold: number): MarkBasisClassification {
 }
 
 /**
- * Re-base each candidate's `mispricingPct` from `(mark − theo)/theo` to
- * `(mark − theo)/mark`, re-classify, and re-rank.
+ * Re-base each candidate's `mispricingPct` onto `basis`'s denominator (the
+ * engine always emits the theo basis), re-classify, and re-rank.
  *
  * **The re-sort is load-bearing, not cosmetic.** Writing `r` for the theo-basis
  * ratio, the mark basis is `r / (1 + r)`, which is strictly increasing in `r` —
@@ -146,8 +231,9 @@ function classify(pct: number, threshold: number): MarkBasisClassification {
  *
  * Pure: inputs are not mutated, shallow copies are returned.
  */
-export function rebaseOnMark<T extends MarkBasisCandidate>(
+export function rebaseMispricing<T extends MarkBasisCandidate>(
   candidates: readonly T[],
+  basis: MispricingBasis = OTM_DEFAULT_MISPRICING_BASIS,
   threshold: number = OTM_PANEL_MISPRICING_THRESHOLD,
 ): MarkBasisResult<T> {
   const effective =
@@ -155,20 +241,31 @@ export function rebaseOnMark<T extends MarkBasisCandidate>(
 
   let unbasisable = 0;
   const rebased = candidates.map((c) => {
-    if (!Number.isFinite(c.mark) || c.mark <= 0 || !Number.isFinite(c.theo)) {
+    const denom = denominatorFor(c.mark, c.theo, basis);
+    if (!Number.isFinite(denom) || denom <= 0 || !Number.isFinite(c.mark - c.theo)) {
       unbasisable += 1;
       return { ...c, mispricingPct: 0, classification: 'fair' as const };
     }
-    const pct = (c.mark - c.theo) / c.mark;
+    const pct = (c.mark - c.theo) / denom;
     return { ...c, mispricingPct: pct, classification: classify(pct, effective) };
   });
 
   rebased.sort((a, b) => Math.abs(b.mispricingPct) - Math.abs(a.mispricingPct));
 
-  return {
-    candidates: rebased,
-    basis: OTM_MISPRICING_BASIS,
-    threshold: effective,
-    unbasisable,
-  };
+  return { candidates: rebased, basis, threshold: effective, unbasisable };
+}
+
+/**
+ * `rebaseMispricing(candidates, 'mark', threshold)`.
+ *
+ * Retained because `mark` is the SHIPPED default and the overwhelming majority
+ * of call sites want exactly it — spelling the basis at every one of them would
+ * make the default look like a per-caller choice rather than the TRA-2562
+ * decision it is.
+ */
+export function rebaseOnMark<T extends MarkBasisCandidate>(
+  candidates: readonly T[],
+  threshold: number = OTM_PANEL_MISPRICING_THRESHOLD,
+): MarkBasisResult<T> {
+  return rebaseMispricing(candidates, 'mark', threshold);
 }
