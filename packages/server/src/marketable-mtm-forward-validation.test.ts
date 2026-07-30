@@ -14,6 +14,11 @@ import {
   MARKETABLE_MTM_OUTLIER_ABS_H,
 } from './marketable-mtm-forward-validation.js';
 import type { SandboxStrategyRecord, SandboxStrategyLeg } from './sandbox-strategy-journal.js';
+// TRA-2600 — the REAL writer, imported so the dead-snap fixture below cannot decouple
+// `requestedPx` from the quote snap the way a hand-authored leg literal can.
+import { recordFromContractResult } from './sandbox-strategy-journal.js';
+import { buildDecisionQuote } from './tradier-sandbox-options-smoke.js';
+import type { SmokeLegResult } from './tradier-sandbox-options-smoke.js';
 
 // TRA-2247 — the server-side fold that the no-auth /api/health/marketable-mtm-forward-validation
 // route emits, mirroring the CLI harness (scripts/marketable-mtm-forward-validation.mjs, TRA-2243).
@@ -681,6 +686,11 @@ describe('TRA-2300 — the graded basis is quotedH', () => {
     expect(cov.legacy_no_quote_field + cov.quote_null_at_snap + cov.quote_unusable + cov.quoted)
       .toBe(cov.retained);
     expect(cov.retained).toBe(result.n);
+    // TRA-2600 — the dead-snap cross-reference is OUTSIDE that sum (a dropped record is never
+    // retained), and this corpus drops nothing, so it is a MEASURED zero. ⚠️ The 3 asserted
+    // above are reachable ONLY because this fixture hand-authors `bid: null, ask: null` next to
+    // `requestedPx: 2`; the real writer cannot emit that leg. See the TRA-2600 describe block.
+    expect(cov.unpricedExitQuoteDropped).toBe(0);
     // The two states are INDISTINGUISHABLE through quotedH alone — that is why they are split.
     const perRow = foldMarketableMtmForwardValidation(recs, { includeSamples: true }).samples!;
     const legacyRow = perRow.find((s) => s.quoteState === 'legacy_no_quote_field')!;
@@ -754,6 +764,211 @@ describe('TRA-2300 — the graded basis is quotedH', () => {
     const keys = Object.keys(result);
     expect(keys).not.toContain('enabled');
     expect(keys.filter((k) => /^(enable|arm)/i.test(k))).toEqual([]);
+  });
+});
+
+// ── TRA-2600: the dead-snap state, built THROUGH the writer ──────────────────
+//
+// Every fixture in this block goes `buildDecisionQuote` → `recordFromContractResult`. That is
+// the point of the block, not a stylistic choice. The pre-existing green test at "§3: separates
+// legacy_no_quote_field from quote_null_at_snap" asserts `cov.quote_null_at_snap === 3` off a
+// hand-authored `leg({ requestedPx: 2, bid: null, ask: null })` — a leg shape the writer CANNOT
+// emit, because `mapLeg` takes `requestedPx`, `bid` and `ask` off one `DecisionQuote` and
+// `buildDecisionQuote` nulls the mid unless both sides are > 0. That test proves the branch
+// COMPUTES; it proves nothing about REACHABILITY, and reading its green as coverage is what
+// kept this defect latent. These tests are built the other way round on purpose.
+
+/** One leg through the real `buildDecisionQuote`. `raw` is the venue's snap, verbatim. */
+function writerLeg(
+  side: 'buy' | 'sell',
+  raw: { bid?: number; ask?: number },
+  fill: number | null,
+): SmokeLegResult {
+  const q = buildDecisionQuote(raw, 1_000);
+  return {
+    side,
+    orderId: 1,
+    status: fill != null ? 'filled' : 'pending',
+    reason: null,
+    avgFillPrice: fill,
+    execQuantity: fill != null ? 1 : null,
+    decisionQuote: q,
+    timeline: { tSignal: q.tSignal, tSubmit: q.tSignal + 40, tAck: q.tSignal + 60, tFill: fill != null ? q.tSignal + 560 : null },
+    metrics: {
+      latencyMs: { signalToSubmit: 40, submitToAck: 20, ackToFill: fill != null ? 500 : null },
+      slippage: { fillMinusMid: null, fillMinusFarTouch: null },
+      withinSpread: null,
+    },
+  };
+}
+
+/** A journal record through the real `recordFromContractResult`. */
+function writerRecord(
+  strategy: string,
+  entry: SmokeLegResult,
+  exit: SmokeLegResult,
+  etDay = '2026-07-29',
+): SandboxStrategyRecord {
+  const rec = recordFromContractResult(
+    strategy,
+    {
+      ok: true,
+      optionType: 'call',
+      underlying: 'SPY',
+      realizedRoundTripUsd: 0,
+      modeledCommissionUsd: 1.3,
+      contract: { optionSymbol: 'SPY260729C00500000', strike: 500, expiration: '2026-07-29', dte: 0, underlyingRefPrice: 500 },
+      entry,
+      exit,
+    },
+    etDay,
+    1,
+  );
+  expect(rec).not.toBeNull();
+  return rec!;
+}
+
+/** A healthy two-sided round-trip through the writer: exit mid 2.0, book 1.74/2.26. */
+const healthyWriterRecord = (strategy = 'long_call', etDay = '2026-07-29'): SandboxStrategyRecord =>
+  writerRecord(strategy, writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { bid: 1.74, ask: 2.26 }, 2), etDay);
+
+describe('TRA-2600: quote_null_at_snap is writer-unreachable; the dead-venue signal is a drop count', () => {
+  // The coupling itself, stated as a test rather than as a comment. If a future writer
+  // decouples `requestedPx` from the snap, THIS is the test that goes red first — and
+  // `quote_null_at_snap` becomes reachable, which is exactly when its doc stops being true.
+  it.each([
+    ['an EMPTY book (no bid at all)', { ask: 5 } as { bid?: number; ask?: number }],
+    ['a ZERO bid (no buyers)', { bid: 0, ask: 5 }],
+    ['a ZERO ask', { bid: 5, ask: 0 }],
+  ])('the writer couples requestedPx to the snap: %s yields requestedPx null WITH the keys present', (_label, raw) => {
+    const rec = writerRecord('long_call', writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', raw, 2));
+    const exit = rec.legs[1];
+    expect(exit.requestedPx).toBeNull();          // no mid ⇒ the row can never be classified…
+    expect('bid' in exit && 'ask' in exit).toBe(true); // …even though the KEYS are present.
+    // The state the fold WOULD have assigned is never reached: the row is dropped first.
+    expect(classifyRecord(rec).drop).toBe('unpriced_exit_quote');
+    expect(classifyRecord(rec).sample).toBeNull();
+  });
+
+  it('a DEAD venue leaves quote_null_at_snap at 0 — it is the drop counter that moves', () => {
+    const recs = [
+      ...Array.from({ length: 6 }, () => healthyWriterRecord()),
+      // 4 dead snaps, built through the writer. A hand-authored leg would have put these in
+      // `quote_null_at_snap`; the real writer cannot.
+      ...Array.from({ length: 4 }, () => writerRecord('long_call',
+        writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { ask: 5 }, 2))),
+    ];
+    const f = foldMarketableMtmForwardValidation(recs);
+    // ⚠️ The whole defect in one assertion pair: the bucket documented as the dead-instrument
+    // signal reads ZERO on a venue that was dead for 40% of its snaps…
+    expect(f.quoteCoverage.quote_null_at_snap).toBe(0);
+    // …while the counter that actually carries the signal is now visible IN quoteCoverage,
+    // instead of only in a different section of the payload.
+    expect(f.quoteCoverage.unpricedExitQuoteDropped).toBe(4);
+    expect(f.exclusions.unpriced_exit_quote).toBe(4);
+    expect(f.n).toBe(6);
+  });
+
+  it('the new field sits OUTSIDE the four-state reconcile sum', () => {
+    const recs = [
+      ...Array.from({ length: 6 }, () => healthyWriterRecord()),
+      ...Array.from({ length: 4 }, () => writerRecord('long_call',
+        writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { bid: 0, ask: 5 }, 2))),
+    ];
+    const cov = foldMarketableMtmForwardValidation(recs).quoteCoverage;
+    // The TRA-2300 invariant is UNCHANGED: the four STATES still sum to retained.
+    expect(cov.quoted + cov.legacy_no_quote_field + cov.quote_null_at_snap + cov.quote_unusable)
+      .toBe(cov.retained);
+    // And the cross-reference is deliberately not in it — a dropped record is never retained.
+    expect(cov.unpricedExitQuoteDropped).toBe(4);
+    expect(cov.retained).toBe(6);
+  });
+
+  it('the quoted REVIEW reason for a DEAD venue differs from the one for a pure legacy drain', () => {
+    // Same shortfall, same `quotedH.n`, opposite diagnoses. Before TRA-2600 these two strings
+    // were IDENTICAL — both rendered "0 had a null quote AT SNAP" and nothing else moved.
+    const legacyDrain = foldMarketableMtmForwardValidation(
+      Array.from({ length: 8 }, () => record('long_call',
+        legacyLeg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        legacyLeg({ side: 'sell', requestedPx: 2, fillPx: 2 }), '2026-07-20')),
+    );
+    const deadVenue = foldMarketableMtmForwardValidation([
+      ...Array.from({ length: 8 }, () => record('long_call',
+        legacyLeg({ side: 'buy', requestedPx: 2, fillPx: 2 }),
+        legacyLeg({ side: 'sell', requestedPx: 2, fillPx: 2 }), '2026-07-20')),
+      ...Array.from({ length: 5 }, () => writerRecord('long_call',
+        writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { ask: 5 }, 2))),
+    ]);
+
+    // Identical on every pre-existing observable the reason string was built from…
+    expect(deadVenue.quotedH.n).toBe(legacyDrain.quotedH.n);
+    expect(deadVenue.quoteCoverage.retained).toBe(legacyDrain.quoteCoverage.retained);
+    expect(deadVenue.quoteCoverage.quote_null_at_snap)
+      .toBe(legacyDrain.quoteCoverage.quote_null_at_snap);
+
+    // …and now SEPARABLE in the sentence a reader acts on. This inequality is the assertion
+    // that kills the bug; the two `toMatch`es below only say WHICH way it separated.
+    expect(deadVenue.quotedVerdict.reason).not.toBe(legacyDrain.quotedVerdict.reason);
+    expect(deadVenue.quotedVerdict.reason).toMatch(/DEAD VENUE: a further 5 record\(s\) were DROPPED/);
+    expect(legacyDrain.quotedVerdict.reason).toMatch(/No record was dropped for a missing exit quote/);
+    expect(legacyDrain.quotedVerdict.reason).not.toMatch(/DEAD VENUE/);
+    // Both still REVIEW — the split is diagnostic, it does not change the gate.
+    expect(deadVenue.quotedVerdict.code).toBe('REVIEW');
+    expect(legacyDrain.quotedVerdict.code).toBe('REVIEW');
+  });
+
+  it('per-structure drops are ATTRIBUTED, not defaulted to 0', () => {
+    const recs = [
+      ...Array.from({ length: 4 }, () => healthyWriterRecord('long_call')),
+      ...Array.from({ length: 4 }, () => healthyWriterRecord('csp')),
+      // Dead snaps on csp ONLY. A per-structure field defaulted to 0 would report both
+      // structures clean; attribution has to put all 3 on csp and leave long_call at a
+      // MEASURED zero.
+      ...Array.from({ length: 3 }, () => writerRecord('csp',
+        writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { ask: 5 }, 2))),
+    ];
+    const f = foldMarketableMtmForwardValidation(recs);
+    const csp = f.perStructure.find((s) => s.structure === 'csp')!;
+    const longCall = f.perStructure.find((s) => s.structure === 'long_call')!;
+    expect(csp.quoteCoverage.unpricedExitQuoteDropped).toBe(3);
+    expect(longCall.quoteCoverage.unpricedExitQuoteDropped).toBe(0);
+    // Pooled is the total, and the per-structure counts reconcile against it.
+    expect(f.quoteCoverage.unpricedExitQuoteDropped).toBe(3);
+    expect(f.perStructure.reduce((a, s) => a + (s.quoteCoverage.unpricedExitQuoteDropped ?? 0), 0)).toBe(3);
+    // The per-structure REVIEW reason names the dead structure and NOT the clean one.
+    expect(csp.quotedVerdict.reason).toMatch(/DEAD VENUE/);
+    expect(longCall.quotedVerdict.reason).not.toMatch(/DEAD VENUE/);
+    expect(f.structuresFullyDeadSnapped).toEqual([]);
+  });
+
+  it('a structure with NO retained row is named, not silently absent', () => {
+    // `covered_call` dead on every snap ⇒ it has no perStructure[] entry to carry a count.
+    // Absence reads as "not traded", which is worse than a 0, so the fold names it.
+    const f = foldMarketableMtmForwardValidation([
+      ...Array.from({ length: 4 }, () => healthyWriterRecord('long_call')),
+      ...Array.from({ length: 2 }, () => writerRecord('covered_call',
+        writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { ask: 5 }, 2))),
+    ]);
+    expect(f.perStructure.map((s) => s.structure)).toEqual(['long_call']);
+    expect(f.structuresFullyDeadSnapped).toEqual(['covered_call']);
+    // Pooled MINUS the sum of per-structure counts is exactly the fully-dead structures' drops.
+    const attributed = f.perStructure.reduce((a, s) => a + (s.quoteCoverage.unpricedExitQuoteDropped ?? 0), 0);
+    expect((f.quoteCoverage.unpricedExitQuoteDropped ?? 0) - attributed).toBe(2);
+  });
+
+  it('a bare summarize reports null (not attributed), never a false 0', () => {
+    // `summarizeMarketableMtm` folds retained samples and structurally cannot see a drop. A 0
+    // here would be the same no-failing-state bug one level down, so the type admits null.
+    const samples = [healthyWriterRecord()]
+      .map((r) => sampleFromRecord(r))
+      .filter((s): s is NonNullable<typeof s> => s != null);
+    const summary = summarizeMarketableMtm(samples, MARKETABLE_MTM_DEFAULT_H);
+    expect(summary.quoteCoverage.unpricedExitQuoteDropped).toBeNull();
+    // …and the verdict built off it says so, rather than claiming the venue was quoting.
+    const v = marketableMtmQuotedVerdict(summary, MARKETABLE_MTM_DEFAULT_TOL, MARKETABLE_MTM_DEFAULT_MIN_N);
+    expect(v.reason).toMatch(/NOT ATTRIBUTED at this level/);
+    expect(v.reason).not.toMatch(/DEAD VENUE/);
+    expect(v.reason).not.toMatch(/No record was dropped/);
   });
 });
 

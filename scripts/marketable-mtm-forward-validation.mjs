@@ -310,18 +310,58 @@ function summarize(samples, h) {
       median: quantile(modeledCrossOnQuoted, 0.5),
       p90: quantile(modeledCrossOnQuoted, 0.9),
     },
-    // TRA-2300 §3 — the census. Exhaustive: the four counts sum to n, so a reader reconciles
-    // rather than inferring a residual (which is where a fifth, unnamed state would hide).
+    // TRA-2300 §3 — the census. Exhaustive: the four STATE counts sum to n, so a reader
+    // reconciles rather than inferring a residual (which is where a fifth, unnamed state
+    // would hide).
+    //
+    // TRA-2600 — `quote_null_at_snap` is WRITER-UNREACHABLE and always 0: mapLeg takes
+    // requestedPx, bid and ask off ONE DecisionQuote and buildDecisionQuote nulls the mid
+    // unless both sides are > 0, so a dead snap is DROPPED as `unpriced_exit_quote` before it
+    // can be classified. The dead-venue signal is `unpricedExitQuoteDropped` below — a
+    // cross-reference into `exclusions`, deliberately OUTSIDE the four-state sum (a dropped
+    // record is never a retained sample). `null` here = NOT ATTRIBUTED: this function folds
+    // retained samples and cannot see a drop; `foldAll` patches in the real count.
     quoteCoverage: {
       retained: samples.length,
       quoted: quoted.length,
       legacy_no_quote_field: countState('legacy_no_quote_field'),
       quote_null_at_snap: countState('quote_null_at_snap'),
       quote_unusable: countState('quote_unusable'),
+      unpricedExitQuoteDropped: null,
       etDayMin: quotedEtDays.length ? quotedEtDays[0] : null,
       etDayMax: quotedEtDays.length ? quotedEtDays[quotedEtDays.length - 1] : null,
     },
   };
+}
+
+/**
+ * TRA-2600 — the DEAD-VENUE sentence. MIRRORS `deadSnapClause` in
+ * packages/server/src/marketable-mtm-forward-validation.ts; keep the two in step.
+ *
+ * Exists so a dead venue and a draining legacy backlog render DIFFERENT strings. Before this
+ * they were byte-identical — both said "0 had a null quote AT SNAP", because the only counter
+ * that moves for a dead venue lives in `exclusions`, which this reason never referenced.
+ */
+function deadSnapClause(c) {
+  const dropped = c.unpricedExitQuoteDropped;
+  if (dropped == null) {
+    return ' Dead-snap drops (exclusions.unpriced_exit_quote) are NOT ATTRIBUTED at this level'
+      + ' — this census covers retained rows only; read the pooled quoteCoverage.';
+  }
+  if (dropped > 0) {
+    return ` DEAD VENUE: a further ${dropped} record(s) were DROPPED BEFORE retention with no`
+      + ` usable exit quote at all (exclusions.unpriced_exit_quote), OVER AND ABOVE the`
+      + ` ${c.retained} retained rows above. This is NOT a draining legacy backlog — those rows`
+      + ' will never age into a gradeable quotedH, and the count does not shrink on its own.';
+  }
+  return ' No record was dropped for a missing exit quote (exclusions.unpriced_exit_quote = 0),'
+    + ' so the venue returned a two-sided book on every snap: the shortfall above is a LEGACY'
+    + ' DRAIN, which does resolve as post-4871bbc round-trips accrue.';
+}
+
+/** TRA-2600 — patch the dead-venue cross-reference onto a summary's coverage census. */
+function withUnpricedDrops(summary, dropped) {
+  return { ...summary, quoteCoverage: { ...summary.quoteCoverage, unpricedExitQuoteDropped: dropped } };
 }
 
 /** True when the modeled p90 cross fails to cover the actual p90 cross. */
@@ -365,10 +405,11 @@ function quotedVerdict(summary, tol, minN) {
       basis: 'quotedH',
       reason: `insufficient QUOTED-basis n (${qn} < ${minN}); of ${c.retained} retained rows `
         + `${c.legacy_no_quote_field} predate the bid/ask writer (legacy_no_quote_field), `
-        + `${c.quote_null_at_snap} had a null quote AT SNAP (quote_null_at_snap), `
-        + `${c.quote_unusable} carried an unusable book. bid/ask persist only from 4871bbc `
-        + '(TRA-2283 D2) — the first count drains as legacy rows age out, the second means the '
-        + 'instrument is dead and the gate can never be graded.',
+        + `${c.quote_null_at_snap} had a null quote AT SNAP (quote_null_at_snap — `
+        + 'WRITER-UNREACHABLE, always 0; not the dead-venue signal), '
+        + `${c.quote_unusable} carried an unusable book.${deadSnapClause(c)} bid/ask persist `
+        + 'only from 4871bbc (TRA-2283 D2) — the legacy count drains as those rows age out; '
+        + 'the DROP count does not drain and means the gate can never be graded.',
     };
   }
   const withinTol = Math.abs(summary.quotedH.median - summary.modeledH) <= tol;
@@ -438,7 +479,7 @@ function verdict(summary, tol, minN) {
 /** TRA-2283 D3 — per-structure fold; the pooled verdict may not absolve a structure whose
  *  own tail is under-charged (pooled read "covered" at $61.14 ≥ $4.00 while long_call was
  *  under-charged 2.8× — signs that flip with structure direction cancel in the pool). */
-function perStructureBreakdown(samples, h, tol, perStructureMinN) {
+function perStructureBreakdown(samples, h, tol, perStructureMinN, unpricedByStructure = new Map()) {
   const by = new Map();
   for (const s of samples) {
     const list = by.get(s.structure) ?? [];
@@ -447,7 +488,10 @@ function perStructureBreakdown(samples, h, tol, perStructureMinN) {
   }
   return [...by.entries()]
     .map(([structure, list]) => {
-      const sub = summarize(list, h);
+      // TRA-2600 — GENUINELY attributed, and patched BEFORE the verdicts below so the
+      // per-structure quoted REVIEW reason carries this structure's own count. Defaulting to 0
+      // here would make every structure report "no dead snaps" regardless of truth.
+      const sub = withUnpricedDrops(summarize(list, h), unpricedByStructure.get(structure) ?? 0);
       return {
         structure,
         ...sub,
@@ -554,7 +598,7 @@ function synthQuotedCorpus(quotedHs, n = 40, mid = 2.0, etDay = '2026-07-26') {
 }
 
 function report(summary, v, args, extra = {}) {
-  const { perStructure = [], exclusions = null, quotedV = null } = extra;
+  const { perStructure = [], exclusions = null, quotedV = null, structuresFullyDeadSnapped = [] } = extra;
   if (args.json) {
     console.log(JSON.stringify({
       ...summary,
@@ -579,6 +623,8 @@ function report(summary, v, args, extra = {}) {
       perStructure,
       structuresBelowMinN: perStructure.filter((s) => s.n < args.perStructureMinN).map((s) => s.structure),
       structuresBelowQuotedMinN: perStructure.filter((s) => s.quotedH.n < args.perStructureMinN).map((s) => s.structure),
+      // TRA-2600 — structures dead on EVERY snap have no perStructure entry to carry a count.
+      structuresFullyDeadSnapped,
     }, null, 2));
     return;
   }
@@ -604,8 +650,22 @@ function report(summary, v, args, extra = {}) {
   // TRA-2300 §3 — ABSENT vs NULL. Same observable zero, opposite diagnoses.
   {
     const c = summary.quoteCoverage;
-    console.log(`quote coverage (of ${String(c.retained).padStart(3)} retained):      quoted=${c.quoted}  legacy_no_quote_field=${c.legacy_no_quote_field}  quote_null_at_snap=${c.quote_null_at_snap}  quote_unusable=${c.quote_unusable}`);
-    console.log(`quote-bearing etDay range:              ${c.etDayMin ?? '—'} … ${c.etDayMax ?? '—'}${c.quote_null_at_snap > 0 ? '   ⚠ quote_null_at_snap > 0 — the snap returned no book; that count does NOT drain with age' : ''}`);
+    console.log(`quote coverage (of ${String(c.retained).padStart(3)} retained):      quoted=${c.quoted}  legacy_no_quote_field=${c.legacy_no_quote_field}  quote_null_at_snap=${c.quote_null_at_snap}(unreachable)  quote_unusable=${c.quote_unusable}`);
+    console.log(`quote-bearing etDay range:              ${c.etDayMin ?? '—'} … ${c.etDayMax ?? '—'}`);
+    // TRA-2600 — THE dead-venue line. `quote_null_at_snap` is writer-unreachable and always 0,
+    // so the old "⚠ quote_null_at_snap > 0" warning here could never fire. This one can.
+    {
+      const d = c.unpricedExitQuoteDropped;
+      const dead = d == null
+        ? 'NOT ATTRIBUTED (retained-only census)'
+        : d > 0
+          ? `${d}   ⚠ DEAD VENUE — no usable exit quote at snap; these rows are OUTSIDE the ${c.retained} retained above and do NOT drain with age`
+          : '0   (venue quoted two-sided on every snap ⇒ any shortfall above is a LEGACY DRAIN)';
+      console.log(`dead snaps DROPPED (unpriced_exit_quote): ${dead}`);
+      if (structuresFullyDeadSnapped.length) {
+        console.log(`  ⚠ dead on EVERY snap (no retained row, so absent from perStructure): ${structuresFullyDeadSnapped.join(', ')}`);
+      }
+    }
   }
   console.log('fill realism:                           SANDBOX_SIMULATED (fills at the decision mid ⇒ actualH ~0 BY CONSTRUCTION; grade on quotedH)');
   if (exclusions != null) {
@@ -644,13 +704,30 @@ function foldAll(records, args) {
     too_few_legs: 0, strategy_filter: 0, unpriced_exit_quote: 0,
     unfilled_exit: 0, zero_fill_exit: 0, bad_exit_side: 0,
   };
-  const samples = records.map((r) => toSample(r, args.strategy, exclusions)).filter(Boolean);
-  const summary = summarize(samples, args.h);
-  const perStructure = perStructureBreakdown(samples, args.h, args.tol, args.perStructureMinN);
+  // TRA-2600 — dead-snap drops attributed by structure, keyed the same way a sample's
+  // `structure` is (`rec.strategy ?? 'unknown'`) so the two join. Re-classifying per record is
+  // what lets the count be attributed at all: `toSample` returns null and loses the record.
+  const unpricedByStructure = new Map();
+  const samples = records.map((r) => {
+    const before = exclusions.unpriced_exit_quote;
+    const s = toSample(r, args.strategy, exclusions);
+    if (exclusions.unpriced_exit_quote > before) {
+      const key = r.strategy ?? 'unknown';
+      unpricedByStructure.set(key, (unpricedByStructure.get(key) ?? 0) + 1);
+    }
+    return s;
+  }).filter(Boolean);
+  const summary = withUnpricedDrops(summarize(samples, args.h), exclusions.unpriced_exit_quote);
+  const perStructure = perStructureBreakdown(samples, args.h, args.tol, args.perStructureMinN, unpricedByStructure);
+  // Structures whose every row was dead-snapped have NO perStructure entry to carry a count;
+  // absence reads as "not traded", which is worse than a 0. Name them.
+  const structuresFullyDeadSnapped = [...unpricedByStructure.keys()]
+    .filter((s) => !perStructure.some((p) => p.structure === s))
+    .sort();
   const v = pooledVerdict(summary, perStructure, args.tol, args.minN, args.requirePerStructureMinN, args.perStructureMinN);
   // TRA-2300 §1 — the GRADED verdict. `v` stays in the payload as ADVISORY.
   const quotedV = quotedPooledVerdict(summary, perStructure, args.tol, args.minN, args.requirePerStructureMinN, args.perStructureMinN);
-  return { samples, summary, perStructure, exclusions, v, quotedV };
+  return { samples, summary, perStructure, exclusions, v, quotedV, structuresFullyDeadSnapped };
 }
 
 function runSelfTest(args) {
@@ -741,9 +818,68 @@ function runSelfTest(args) {
       console.error('SELF-TEST FAILED: quote-coverage counts must reconcile against n');
       process.exit(1);
     }
+    // TRA-2600 — the cross-reference is OUTSIDE that sum, and this corpus drops nothing, so it
+    // must be a MEASURED 0 (never null: `foldAll` attributes it).
+    if (c.unpricedExitQuoteDropped !== 0) {
+      console.error(`SELF-TEST FAILED: unpricedExitQuoteDropped must be a measured 0 here (got ${c.unpricedExitQuoteDropped})`);
+      process.exit(1);
+    }
+  }
+  // 7. TRA-2600 — A DEAD VENUE MUST NOT READ LIKE A LEGACY DRAIN.
+  //    `quote_null_at_snap` is WRITER-UNREACHABLE: mapLeg takes requestedPx/bid/ask off ONE
+  //    DecisionQuote and buildDecisionQuote nulls the mid unless both sides are > 0, so a dead
+  //    snap is DROPPED as `unpriced_exit_quote` before it can be classified. That made the two
+  //    diagnoses render BYTE-IDENTICAL reason strings. This arm is the failing direction: it
+  //    asserts the strings DIFFER, which is the only assertion that actually kills the bug.
+  {
+    const base = parseSandboxJournal(synthQuotedCorpus([0.13], 4));
+    const legacyDrain = base.map((r) => {
+      const c = JSON.parse(JSON.stringify(r));
+      delete c.legs[1].bid; delete c.legs[1].ask;
+      return c;
+    });
+    // A dead snap AS THE WRITER PRODUCES IT: no mid, so no requestedPx — the keys are still
+    // there. Hand-authoring `bid:null, ask:null` NEXT TO a live requestedPx would decouple
+    // exactly what the writer couples, and is what let this sit latent behind a green test.
+    const deadVenue = [...legacyDrain, ...base.slice(0, 3).map((r) => {
+      const c = JSON.parse(JSON.stringify(r));
+      c.legs[1].bid = null; c.legs[1].ask = 5; c.legs[1].requestedPx = null;
+      return c;
+    })];
+
+    const fLegacy = foldAll(legacyDrain, args);
+    const fDead = foldAll(deadVenue, args);
+
+    if (fDead.summary.quoteCoverage.quote_null_at_snap !== 0) {
+      console.error('SELF-TEST FAILED: quote_null_at_snap is writer-unreachable and must stay 0 — '
+        + 'if this fires, a writer now decouples requestedPx from the snap and the docs are stale');
+      process.exit(1);
+    }
+    if (fDead.summary.quoteCoverage.unpricedExitQuoteDropped !== 3) {
+      console.error(`SELF-TEST FAILED: the dead-venue drops must surface in quoteCoverage (got ${fDead.summary.quoteCoverage.unpricedExitQuoteDropped})`);
+      process.exit(1);
+    }
+    // The two corpora are indistinguishable on every observable the reason string used to
+    // carry — same quotedH.n, same retained, same (zero) quote_null_at_snap…
+    if (fDead.summary.quotedH.n !== fLegacy.summary.quotedH.n
+      || fDead.summary.quoteCoverage.retained !== fLegacy.summary.quoteCoverage.retained) {
+      console.error('SELF-TEST FAILED: the two corpora must be matched on n/retained, else the string check is not a controlled comparison');
+      process.exit(1);
+    }
+    // …and must now be SEPARABLE in the sentence a reader acts on.
+    if (fDead.quotedV.reason === fLegacy.quotedV.reason) {
+      console.error('SELF-TEST FAILED: a DEAD venue and a LEGACY DRAIN produced the SAME reason string — the dead-snap state is unobservable');
+      process.exit(1);
+    }
+    if (!/DEAD VENUE/.test(fDead.quotedV.reason) || /DEAD VENUE/.test(fLegacy.quotedV.reason)) {
+      console.error(`SELF-TEST FAILED: the DEAD VENUE marker must appear on the dead corpus ONLY (dead=${fDead.quotedV.reason} | legacy=${fLegacy.quotedV.reason})`);
+      process.exit(1);
+    }
   }
   console.log('self-test OK (advisory: PASS on 0.13, REVIEW mid-booked, fillPx=0 excluded; '
-    + 'GRADED quotedH: PASS at 0.13, REVIEW on a wide tail at the SAME median, quote states separable)');
+    + 'GRADED quotedH: PASS at 0.13, REVIEW on a wide tail at the SAME median, quote states separable; '
+    + 'TRA-2600: quote_null_at_snap writer-unreachable, dead-venue drops surfaced in quoteCoverage '
+    + 'and the DEAD-vs-LEGACY reason strings DIFFER)');
   process.exit(0);
 }
 

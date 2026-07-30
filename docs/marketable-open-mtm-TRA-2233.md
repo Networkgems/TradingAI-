@@ -145,7 +145,9 @@ otherwise.** The verdict string's "measured median ≈ …" parenthetical is a
 | `verdict` / `actualVerdict` (`basis: 'actualH'`) | Advisory. Keeps its name so an old-shaped consumer is not handed a different number under a name it trusts. |
 | `gradedBasis` | Always `'quotedH'`. Read this, not field position. |
 | `quotedH.min`/`max` | Dispersion. A live chain snapped at N times **cannot** yield `min === max`; if it does, the "quote" is a written constant, not a read book. |
-| `quoteCoverage` | The ABSENT-vs-NULL split (below). Counts sum to `n`. |
+| `quoteCoverage` | The ABSENT-vs-NULL split (below). The four **state** counts sum to `n`; `unpricedExitQuoteDropped` is a cross-reference and sits **outside** that sum. |
+| `quoteCoverage.unpricedExitQuoteDropped` | **The dead-venue counter (TRA-2600).** Read this, *not* `quote_null_at_snap`. |
+| `structuresFullyDeadSnapped` | Structures dead on **every** snap — they have no `perStructure[]` entry, so absence would otherwise read as "not traded". |
 | `quotedCrossUsd` / `modeledCrossUsdOnQuoted` | The quoted tail check, over the **same** quote-bearing rows. |
 
 **Accept/reject (quoted basis).** PASS iff the median **quoted** half-spread is
@@ -161,15 +163,54 @@ no quote. That benign drain must never read like a dead instrument, so
 
 - `legacy_no_quote_field` — the leg has **no `bid`/`ask` key at all**. Benign;
   drains as legacy rows age out.
-- `quote_null_at_snap` — the keys **are** present and one/both are `null`: the
-  Tradier snap returned a one-sided or empty book. **Not benign** — a persistent
-  count here means the instrument is dead and the gate can never be graded.
+- `quote_null_at_snap` — the keys **are** present and one/both are `null`.
+  ⚠️ **WRITER-UNREACHABLE — always `0` (TRA-2600).** This bucket reads zero whether
+  the venue is healthy or stone dead, so a `0` here is a tautology and **must not**
+  be quoted as evidence of a live book. See below.
 - `quote_unusable` — populated but crossed/corrupt. Its own bucket so the counts
-  reconcile instead of a corrupt book hiding in one of the other two.
+  reconcile instead of a corrupt book hiding in one of the other two. This one *is*
+  writer-reachable: a crossed book still yields a mid.
 
 `== null` collapses the first two, so the probe is `in` on the key.
 `etDayMin`/`etDayMax` bound the **quote-bearing** rows, so coverage can be
 confirmed to start at the deploy boundary.
+
+### ⚠️ The dead-venue counter is `unpricedExitQuoteDropped`, not `quote_null_at_snap` (TRA-2600)
+
+`quote_null_at_snap` was specified as the dead-instrument signal but **no row this
+writer produces can ever be assigned it**:
+
+1. `sandbox-strategy-journal.ts` `mapLeg` takes `requestedPx`, `bid` and `ask` off
+   the **same** `DecisionQuote`.
+2. `tradier-sandbox-options-smoke.ts` `buildDecisionQuote` sets `mid` non-null
+   **iff** `bid` and `ask` are both non-null and both `> 0`.
+3. ⇒ `requestedPx != null` **⟺** neither side is null ⇒ `anyNull === false`.
+4. A row with `requestedPx == null` is dropped as `unpriced_exit_quote` in
+   `classifyRecord` ~50 lines **before** the `quoteState` branch runs.
+
+So a dead venue produced a `quoteCoverage` **identical** to a healthy legacy drain,
+while the only counter that moved (`exclusions.unpriced_exit_quote`) sat in a
+different section of the payload the coverage reader never reaches.
+
+`quoteCoverage.unpricedExitQuoteDropped` closes that. It is:
+
+- **the** dead-venue signal — those rows will never age into a gradeable `quotedH`,
+  and unlike a legacy drain the count does not shrink on its own;
+- **outside** the four-state reconcile sum (a dropped record is never retained);
+- `null` ⇒ **not attributed at this level**, which is *not* zero. A bare
+  `summarizeMarketableMtm` cannot see drops and yields `null`; the fold fills in the
+  pooled total and genuinely attributes per-structure counts by `rec.strategy`, so a
+  `0` from the fold is a measured zero rather than a default.
+
+The quoted REVIEW **reason string** now renders differently for the two cases
+(`DEAD VENUE: …` vs `No record was dropped …`) — that string inequality is pinned by
+test and by the CLI `--self-test`, because it is the sentence a reader acts on.
+
+The bucket is **kept, not deleted**: it goes live the moment a writer decouples
+`requestedPx` from the snap (e.g. persists a `last`-derived or carried-forward mid
+beside a one-sided book). The test
+`the writer couples requestedPx to the snap` goes red on exactly that change, which
+is when this section stops being true.
 
 **Per-structure floor (TRA-2300 §5).** Pooled `minN` stays **30**; the
 per-structure floor is **10** and is **enforced by default**

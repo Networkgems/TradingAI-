@@ -11433,7 +11433,12 @@ app.get('/api/health/parity-reconcile/records', (_req, res) => {
 // so it reads ~0 whether the true spread is 0 or the simulator ignores the book — it has no
 // failing state here. `gradedBasis` + a per-verdict `basis` field name the graded one so an
 // old-shaped reader cannot grade the wrong number. Also new: `quoteCoverage` separates a benign
-// legacy-record zero (`legacy_no_quote_field`) from a dead instrument (`quote_null_at_snap`),
+// legacy-record zero (`legacy_no_quote_field`) from a dead instrument — but read the dead-venue
+// count off `quoteCoverage.unpricedExitQuoteDropped`, NOT `quote_null_at_snap`: TRA-2600 showed
+// the latter is WRITER-UNREACHABLE and reads 0 on a dead venue exactly as it does on a healthy
+// one (mapLeg takes requestedPx/bid/ask off one DecisionQuote, so a dead snap is DROPPED as
+// `unpriced_exit_quote` before it can be classified). `structuresFullyDeadSnapped` names any
+// structure dead on EVERY snap, which has no `perStructure[]` entry to carry a count.
 // `quotedH.min`/`max` give the dispersion that rules out a synthesized constant quote, and the
 // per-structure floor ships ON at 10 (pooled 30) — env-overridable via `MARKETABLE_MTM_MIN_N`,
 // `MARKETABLE_MTM_PER_STRUCTURE_MIN_N`, `MARKETABLE_MTM_REQUIRE_PER_STRUCTURE_MIN_N`. Still

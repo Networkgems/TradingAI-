@@ -207,9 +207,12 @@ export const MARKETABLE_MTM_QUOTED_COVERAGE_NOTE =
   'bid/ask persist on sandbox legs only from `4871bbc` (TRA-2283 D2, deployed '
   + '2026-07-25T17:37Z). Records written earlier carry NO quote key at all, so quotedH.n '
   + 'stays 0 until post-deploy round-trips accrue. `quoteCoverage` separates that benign '
-  + 'drain (`legacy_no_quote_field`) from a DEAD instrument (`quote_null_at_snap`: the leg '
-  + 'HAS the keys and the Tradier snap returned a one-sided/empty book) — the two have the '
-  + 'same observable consequence and opposite diagnoses.';
+  + 'drain (`legacy_no_quote_field`) from a DEAD instrument — but read the dead-venue count '
+  + 'off `quoteCoverage.unpricedExitQuoteDropped`, NOT off `quote_null_at_snap`: TRA-2600 '
+  + 'established that `quote_null_at_snap` is WRITER-UNREACHABLE (mapLeg takes requestedPx, '
+  + 'bid and ask off one DecisionQuote, and mid is non-null iff both sides are > 0), so a '
+  + 'dead snap is DROPPED as `unpriced_exit_quote` before it can ever be classified and '
+  + '`quote_null_at_snap` reads 0 whether the venue is healthy or dead.';
 
 /** Percentile by linear interpolation on a sorted-ascending sample; `NaN` on empty.
  *  p=0.5 ⇒ median, p=0.9 ⇒ p90. n=1 returns that value for any p. Matches the harness. */
@@ -284,14 +287,29 @@ export interface MarketableMtmSample {
  * - `quoted`                — a usable two-sided book; this row IS in `quotedH`.
  * - `legacy_no_quote_field` — the exit leg has neither `bid` nor `ask` KEY. The record
  *                             predates `4871bbc`. Benign: drains as legacy rows age out.
- * - `quote_null_at_snap`    — the keys ARE present and one/both are `null`. The Tradier snap
- *                             returned a one-sided or empty book at decision time. NOT benign:
- *                             a persistently high count means the instrument is dead and no
- *                             amount of further accrual will ever produce a gradeable quotedH.
+ * - `quote_null_at_snap`    — the keys ARE present and one/both are `null`.
+ *                             ⚠️ **WRITER-UNREACHABLE (TRA-2600).** No row this codebase
+ *                             writes can carry this state, so a `0` here is a TAUTOLOGY, not
+ *                             evidence of a healthy venue. `mapLeg`
+ *                             (`sandbox-strategy-journal.ts`) takes `requestedPx`, `bid` and
+ *                             `ask` off the SAME `DecisionQuote`, and `buildDecisionQuote`
+ *                             (`tradier-sandbox-options-smoke.ts`) sets `mid` non-null **iff**
+ *                             bid and ask are both non-null and both `> 0`. Therefore
+ *                             `requestedPx != null` ⟺ `anyNull === false`, and a row with a
+ *                             dead snap is dropped as `unpriced_exit_quote` at
+ *                             {@link classifyRecord} ~50 lines BEFORE this branch is reached.
+ *                             The dead-venue signal lives in
+ *                             {@link MarketableMtmQuoteCoverage.unpricedExitQuoteDropped}
+ *                             instead — read THAT, not this.
+ *                             The bucket is retained (not deleted) because it becomes live the
+ *                             moment a writer DECOUPLES `requestedPx` from the quote snap —
+ *                             e.g. persists a `last`-derived or carried-forward mid alongside
+ *                             a one-sided book. Until such a writer exists, expect exactly `0`.
  * - `quote_unusable`        — keys present and non-null, but the book fails the shared guards
  *                             (crossed `ask < bid`, `ask <= 0`, negative bid, non-finite).
  *                             Kept as its own bucket so the three counts RECONCILE against `n`
  *                             instead of a corrupt book hiding inside one of the other two.
+ *                             This IS writer-reachable: a crossed book still yields a mid.
  */
 export type MarketableMtmQuoteState =
   | 'quoted'
@@ -503,10 +521,36 @@ export interface MarketableMtmQuoteCoverage {
   quoted: number;
   /** Exit leg has NO `bid`/`ask` key: record predates `4871bbc`. Benign; drains with age. */
   legacy_no_quote_field: number;
-  /** Keys present, one/both `null`: the snap returned a one-sided/empty book. NOT benign. */
+  /**
+   * Keys present, one/both `null`.
+   *
+   * ⚠️ **WRITER-UNREACHABLE — always `0` today (TRA-2600).** This is NOT the dead-venue
+   * counter and must not be read as one; see {@link MarketableMtmQuoteState} for the
+   * `requestedPx`/`bid`/`ask` coupling that makes it unassignable, and read
+   * {@link unpricedExitQuoteDropped} for the signal this bucket LOOKS like it carries.
+   */
   quote_null_at_snap: number;
   /** Keys present and populated but the book fails the shared guards (crossed / non-finite). */
   quote_unusable: number;
+  /**
+   * TRA-2600 — **THE DEAD-VENUE COUNTER.** Records dropped as
+   * `exclusions.unpriced_exit_quote`: the exit leg had no usable `requestedPx`, which on this
+   * writer means the Tradier snap returned a one-sided or empty book at decision time. This is
+   * the observable `quote_null_at_snap` was supposed to be.
+   *
+   * ⚠️ **OUTSIDE the four-state sum.** A dropped record never becomes a retained sample, so
+   * this is deliberately NOT part of `quoted + legacy_no_quote_field + quote_null_at_snap +
+   * quote_unusable === retained`. It is a CROSS-REFERENCE into `exclusions`, surfaced here
+   * because a coverage reader never looks at the exclusions block.
+   *
+   * `null` ⇒ **not attributed at this level**, which is not the same as zero. A bare
+   * {@link summarizeMarketableMtm} has no access to drop counts and always yields `null`;
+   * {@link foldMarketableMtmForwardValidation} fills in the pooled total and genuinely
+   * attributes the per-structure counts by `rec.strategy`. A `0` from the fold is a measured
+   * zero; a `0` defaulted at a level that cannot see drops would be the same
+   * no-failing-state bug one level down, which is why the type admits `null`.
+   */
+  unpricedExitQuoteDropped: number | null;
   /** ET day bounds of the QUOTE-BEARING samples; `null` when none carry a quote. */
   etDayMin: string | null;
   etDayMax: string | null;
@@ -551,7 +595,11 @@ export interface MarketableMtmSummary {
    * would be a tail check against a different corpus, which is how a tail under-charge hides.
    */
   modeledCrossUsdOnQuoted: MarketableMtmMoments;
-  /** TRA-2300 §3 — the ABSENT-vs-NULL census; counts sum to `n`. */
+  /**
+   * TRA-2300 §3 — the ABSENT-vs-NULL census; the FOUR STATE counts sum to `n`.
+   * TRA-2600 added `unpricedExitQuoteDropped`, which is a cross-reference into `exclusions`
+   * and sits deliberately OUTSIDE that sum (a dropped record is never a retained sample).
+   */
   quoteCoverage: MarketableMtmQuoteCoverage;
 }
 
@@ -616,6 +664,10 @@ export function summarizeMarketableMtm(
       legacy_no_quote_field: countState('legacy_no_quote_field'),
       quote_null_at_snap: countState('quote_null_at_snap'),
       quote_unusable: countState('quote_unusable'),
+      // TRA-2600 — this function folds RETAINED samples and structurally cannot see a dropped
+      // record, so it reports `null` (= not attributed here), NEVER `0`. The fold patches in
+      // the real count; see `withUnpricedDrops`.
+      unpricedExitQuoteDropped: null,
       etDayMin: quotedEtDays.length ? quotedEtDays[0] : null,
       etDayMax: quotedEtDays.length ? quotedEtDays[quotedEtDays.length - 1] : null,
     },
@@ -706,6 +758,45 @@ export function marketableMtmVerdict(
 }
 
 /**
+ * TRA-2600 — the DEAD-VENUE sentence, spliced into the quoted REVIEW reason.
+ *
+ * This exists so that a dead venue and a draining legacy backlog produce **different strings**.
+ * Before this, both rendered `0 had a null quote AT SNAP` and were textually identical, because
+ * the only counter that actually moves for a dead venue (`exclusions.unpriced_exit_quote`) lives
+ * in a different section of the payload that the coverage reader never reaches. Three distinct
+ * renderings — attributed-and-dead, attributed-and-healthy, not-attributed — and never a
+ * silent omission, because an omitted clause reads exactly like a zero.
+ */
+function deadSnapClause(cov: MarketableMtmQuoteCoverage): string {
+  const dropped = cov.unpricedExitQuoteDropped;
+  if (dropped == null) {
+    return ' Dead-snap drops (exclusions.unpriced_exit_quote) are NOT ATTRIBUTED at this level'
+      + ' — this census covers retained rows only; read the pooled quoteCoverage.';
+  }
+  if (dropped > 0) {
+    return ` DEAD VENUE: a further ${dropped} record(s) were DROPPED BEFORE retention with no`
+      + ` usable exit quote at all (exclusions.unpriced_exit_quote), OVER AND ABOVE the`
+      + ` ${cov.retained} retained rows above. This is NOT a draining legacy backlog — those`
+      + ' rows will never age into a gradeable quotedH, and the count does not shrink on its own.';
+  }
+  return ' No record was dropped for a missing exit quote (exclusions.unpriced_exit_quote = 0),'
+    + ' so the venue returned a two-sided book on every snap: the shortfall above is a LEGACY'
+    + ' DRAIN, which does resolve as post-4871bbc round-trips accrue.';
+}
+
+/**
+ * TRA-2600 — patch the dead-venue cross-reference onto a summary's coverage census.
+ *
+ * {@link summarizeMarketableMtm} folds retained samples and cannot see a dropped record, so it
+ * emits `null`. Only the fold knows the drop counts, and it must apply them BEFORE the verdicts
+ * are computed — a verdict built off the unpatched summary would render the "not attributed"
+ * branch into the very string a reader acts on.
+ */
+function withUnpricedDrops<T extends MarketableMtmSummary>(summary: T, dropped: number): T {
+  return { ...summary, quoteCoverage: { ...summary.quoteCoverage, unpricedExitQuoteDropped: dropped } };
+}
+
+/**
  * TRA-2300 §1 — **THE GATE.** PASS iff the median QUOTED-book half-spread is within `±tol` of
  * modeled `h` AND the modeled p90 cross covers the quoted p90 cross on the same rows.
  *
@@ -733,8 +824,10 @@ export function marketableMtmQuotedVerdict(
       basis: 'quotedH',
       reason: `insufficient QUOTED-basis n (${qn} < ${minN}); of ${cov.retained} retained rows `
         + `${cov.legacy_no_quote_field} predate the bid/ask writer (legacy_no_quote_field), `
-        + `${cov.quote_null_at_snap} had a null quote AT SNAP (quote_null_at_snap), `
-        + `${cov.quote_unusable} carried an unusable book. ${MARKETABLE_MTM_QUOTED_COVERAGE_NOTE}`,
+        + `${cov.quote_null_at_snap} had a null quote AT SNAP (quote_null_at_snap — `
+        + 'WRITER-UNREACHABLE, always 0; not the dead-venue signal), '
+        + `${cov.quote_unusable} carried an unusable book.${deadSnapClause(cov)} `
+        + `${MARKETABLE_MTM_QUOTED_COVERAGE_NOTE}`,
     };
   }
   const withinTol = Math.abs(summary.quotedH.median - summary.modeledH) <= tol;
@@ -944,6 +1037,17 @@ export interface MarketableMtmForwardValidation extends MarketableMtmSummary {
   structuresBelowMinN: string[];
   /** Structures below the per-structure floor on QUOTED n — i.e. not gradeable on the graded basis. */
   structuresBelowQuotedMinN: string[];
+  /**
+   * TRA-2600 — structures that produced dead-snap drops but **no retained sample at all**, so
+   * they have NO `perStructure[]` entry to carry a count.
+   *
+   * Without this list a wholly-dead structure does not read as `0` dead snaps — it does not
+   * appear anywhere in `perStructure[]`, which is strictly worse: absence looks like "that
+   * structure was not traded". Naming it here is what lets a reader reconcile
+   * `quoteCoverage.unpricedExitQuoteDropped` (pooled) against the sum of the per-structure
+   * counts — pooled MINUS that sum is exactly the drops belonging to these structures.
+   */
+  structuresFullyDeadSnapped: string[];
   /** Whether the pooled verdicts enforced the per-structure floor this call (default true since TRA-2300). */
   requirePerStructureMinN: boolean;
   /** The per-structure floor applied this call. A FLOOR CHECK, not a tail estimate — see the constant. */
@@ -1052,6 +1156,11 @@ export function foldMarketableMtmForwardValidation(
   const samples: MarketableMtmSample[] = [];
   const exclusions = emptyExclusions();
   const zeroFillRows: MarketableMtmZeroFillRow[] = [];
+  // TRA-2600 — dead-snap drops attributed by structure. GENUINELY attributed, not defaulted:
+  // a per-structure block that hard-coded `0` here would report "no dead snaps" for every
+  // structure regardless of truth, which is the same no-failing-state bug one level down.
+  // Key matches the sample's `structure` (`rec.strategy ?? 'unknown'`) so the two join.
+  const unpricedByStructure = new Map<string, number>();
   for (const rec of records) {
     const c = classifyRecord(rec, strategy);
     if (c.sample != null) {
@@ -1059,10 +1168,17 @@ export function foldMarketableMtmForwardValidation(
       continue;
     }
     if (c.drop != null) exclusions[c.drop] += 1;
+    if (c.drop === 'unpriced_exit_quote') {
+      const key = rec.strategy ?? 'unknown';
+      unpricedByStructure.set(key, (unpricedByStructure.get(key) ?? 0) + 1);
+    }
     if (c.zeroFill != null) zeroFillRows.push(c.zeroFill);
   }
 
-  const summary = summarizeMarketableMtm(samples, h);
+  const summary = withUnpricedDrops(
+    summarizeMarketableMtm(samples, h),
+    exclusions.unpriced_exit_quote,
+  );
 
   // ── D3: unpool ────────────────────────────────────────────────────────────
   const byStructure = new Map<string, MarketableMtmSample[]>();
@@ -1073,7 +1189,12 @@ export function foldMarketableMtmForwardValidation(
   }
   const perStructure: MarketableMtmStructureBreakdown[] = [...byStructure.entries()]
     .map(([structure, list]) => {
-      const sub = summarizeMarketableMtm(list, h);
+      // TRA-2600 — patched BEFORE the verdicts below, so the per-structure quoted REVIEW
+      // reason carries this structure's own dead-snap count rather than "not attributed".
+      const sub = withUnpricedDrops(
+        summarizeMarketableMtm(list, h),
+        unpricedByStructure.get(structure) ?? 0,
+      );
       return {
         structure,
         ...sub,
@@ -1130,6 +1251,9 @@ export function foldMarketableMtmForwardValidation(
     structuresBelowQuotedMinN: perStructure
       .filter((s) => s.quotedH.n < perStructureMinN)
       .map((s) => s.structure),
+    structuresFullyDeadSnapped: [...unpricedByStructure.keys()]
+      .filter((s) => !byStructure.has(s))
+      .sort(),
     requirePerStructureMinN,
     perStructureMinN,
     perStructureMinNNote: MARKETABLE_MTM_PER_STRUCTURE_MIN_N_NOTE,
