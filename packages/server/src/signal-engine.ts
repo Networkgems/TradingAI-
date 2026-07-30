@@ -310,6 +310,16 @@ import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
 import { randomUUID } from 'crypto';
 import { logger } from './observability/index.js';
+// TRA-2689 (leg 2 of TRA-2654) — WRITE-ONLY candidate tape at the feed boundary.
+// Nothing on any decision path imports these; see the module header for why this
+// is a tape and not a detector.
+import {
+  DenominatorFlipTape,
+  buildDenominatorFlipCandidate,
+  isDenominatorFlipCandidate,
+  type DenominatorFlipCandidate,
+  type DenominatorFlipTapeDump,
+} from './denominator-flip-tape.js';
 // TRA-563 (TRA-410 A1) — fire-and-forget user-facing alerts. `emitAlert` is a
 // no-op until the dispatcher is installed at boot and can NEVER throw, so these
 // hooks are safe to call inline on the trade paths.
@@ -317,6 +327,11 @@ import { emitAlert } from './notifications/index.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
+// TRA-2689 — min spacing between denominator-flip candidate INFO lines. The ring
+// holds up to 2,000 rows a session and the flushed tape is the artifact; the log
+// line exists only so a live operator can see the recorder is alive and whether
+// it has saturated, so once a minute is plenty and cannot storm the log budget.
+const DENOM_FLIP_LOG_MIN_GAP_MS = 60_000;
 // TRA-787 — dedicated structured-logging child for the SupertrendConfluence
 // SHADOW channel. Every emitted shadow signal is logged here with its full
 // confluence read so QuantTrader can validate signal quality against the live
@@ -2264,6 +2279,16 @@ export class SignalEngine {
   private rvDteTarget: number = DEFAULT_RV_DTE_TARGET;
 
   private symbolState: Map<string, SymbolState> = new Map();
+  /**
+   * TRA-2689 (leg 2 of TRA-2654) — bounded, in-process, WRITE-ONLY tape of
+   * intra-session denominator-flip candidates seen at the feed boundary. Never
+   * read by any decision path; drained once per session by the EOD archive.
+   * See `denominator-flip-tape.ts` for the admission rule and the reason this
+   * is a tape rather than a detector.
+   */
+  private denominatorFlipTape = new DenominatorFlipTape();
+  /** Wall-clock of the last `denominator-flip candidate` info line (rate limit). */
+  private lastDenominatorFlipLogAt = 0;
   private candleCache: Map<string, Candle[]> = new Map();
   private recentSignals: TradeSignal[] = [];
   /**
@@ -3586,6 +3611,30 @@ export class SignalEngine {
     const prices = new Map<string, number>();
     for (const [sym, q] of quotes) {
       prices.set(sym, q.price);
+      // TRA-2689 (leg 2 of TRA-2654) — WRITE-ONLY TAPE, NOT A DETECTOR.
+      //
+      // Read the row we are about to overwrite and, when the price is EXACTLY
+      // unchanged while `changePct` moved, append a candidate to a bounded
+      // in-process ring. That pair is the day-1 signature of a denominator flip
+      // (the implied prev close moved underneath a frozen numerator) — the FGMC
+      // 07-28 shape — and the feed boundary is the only place it is visible
+      // live, because TRA-2634 deliberately created no prior-session state.
+      //
+      // It emits NO verdict: no exclusion, no ranking change, no `moveSuspect`
+      // write, no `quoteStatus` write, no warn. Nothing below this block reads
+      // it. If a consumer's behaviour changes because of it, that is a defect
+      // against TRA-2689's boundary, not a feature.
+      //
+      // Hot path: the only work in the common (no-candidate) case is the
+      // `symbolState.get` the tape shares with nothing else plus three numeric
+      // comparisons — no allocation. The row object and its `Intl` date keys are
+      // built only once the predicate has fired.
+      const priorRow = this.symbolState.get(sym);
+      if (priorRow && isDenominatorFlipCandidate(priorRow, q)) {
+        this.recordDenominatorFlipCandidate(
+          buildDenominatorFlipCandidate({ symbol: sym, prev: priorRow, next: q, now: Date.now() }),
+        );
+      }
       // TRA-2379 — the ONE stamping boundary for the whole stock universe: this
       // consumes the MERGED fetchQuotes result, so Tradier, the Yahoo quote, the
       // Yahoo chart fallback and Stooq all pass through here. Flag an implausible
@@ -3658,6 +3707,44 @@ export class SignalEngine {
     // refresh landing right after a doTick (or vice-versa) is skipped.
     this.lastQuoteStampAt = Date.now();
     return prices;
+  }
+
+  /**
+   * TRA-2689 — append one candidate to the ring and, at most once a minute, emit
+   * an INFO line. Info, never warn: a warn is a verdict, and this ticket is
+   * explicitly not authorized to emit one. The line carries the running counts
+   * so a session's saturation is visible in the log tape as well as in the
+   * flushed file — a reader must never be able to compute a rate over a
+   * truncated tape and report it as complete coverage.
+   */
+  private recordDenominatorFlipCandidate(row: DenominatorFlipCandidate): void {
+    this.denominatorFlipTape.record(row);
+    const now = row.ts;
+    if (now - this.lastDenominatorFlipLogAt < DENOM_FLIP_LOG_MIN_GAP_MS) return;
+    this.lastDenominatorFlipLogAt = now;
+    log.info('denominator-flip candidate recorded', {
+      issue: 'TRA-2689',
+      symbol: row.symbol,
+      price: row.price,
+      prevChangePct: row.prevChangePct,
+      changePct: row.changePct,
+      changePctDelta: row.changePctDelta,
+      prevStalenessMs: row.prevStalenessMs,
+      straddlesSessionRollover: row.straddlesSessionRollover,
+      held: this.denominatorFlipTape.length,
+      droppedCandidates: this.denominatorFlipTape.droppedCandidates,
+      saturated: this.denominatorFlipTape.saturated,
+      note: 'write-only tape; emits no verdict',
+    });
+  }
+
+  /**
+   * TRA-2689 — drain the tape for the once-per-session EOD flush. Resets the
+   * ring. Called ONLY by the archive path in `index.ts`; the feed never writes
+   * to disk.
+   */
+  drainDenominatorFlipTape(): DenominatorFlipTapeDump {
+    return this.denominatorFlipTape.drain();
   }
 
   /**

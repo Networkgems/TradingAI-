@@ -101,3 +101,22 @@ export function etClockParts(date: Date = new Date()): EtClockParts {
 export function etHour(date: Date = new Date()): number {
   return etClockParts(date).hour;
 }
+
+/**
+ * TRA-2689 — ET calendar date of an epoch-ms instant as `YYYY-MM-DD`.
+ *
+ * Lives here rather than being re-derived at the call site for the reason
+ * `csp-report-collector.ts` already gives: an inline
+ * `toLocaleDateString('en-CA', …)` forks the house ET helper, and the fork is
+ * invisible until the two disagree. `en-CA` is the house idiom for this format
+ * (`scheduler.ts`, `options-chain-recorder.ts`, `pnl-tracker.ts`); unlike the
+ * hour, the *date* rendering carries no h23/h24 hazard, because the midnight
+ * ambiguity is in the hour field only.
+ *
+ * NOTE this is a CALENDAR date, not a trading session: a Saturday instant
+ * returns Saturday, and 20:00 ET on a trading day returns that day even though
+ * the session has closed. Callers that need session semantics must say so.
+ */
+export function etDateKey(ms: number): string {
+  return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}

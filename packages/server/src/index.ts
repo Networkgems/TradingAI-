@@ -8,6 +8,10 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { MarketScheduler, isMarketDay, isMarketDayIso, missedTradingDays, previousMarketDayIso, etDateString, isMarketOpen } from './scheduler.js';
 import { etHour } from './et-clock.js'; // TRA-2498
+// TRA-2689 (leg 2 of TRA-2654) — once-per-session drain of the WRITE-ONLY
+// denominator-flip candidate tape. Nothing on any decision path reads it.
+import { flushDenominatorFlipTape } from './denominator-flip-tape-writer.js';
+import { DENOM_FLIP_CHANGEPCT_DELTA_PP } from './denominator-flip-tape.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import {
   buildAllowedOrigins,
@@ -1638,6 +1642,46 @@ async function generateAndSaveReport(
     );
   }
   await Promise.all(writes);
+
+  // TRA-2689 (leg 2 of TRA-2654) — flush the WRITE-ONLY denominator-flip
+  // candidate tape. The feed records into a bounded in-process ring and never
+  // touches disk; this is the once-per-session drain.
+  //
+  // Ordered AFTER the report writes and wrapped so it can never throw into
+  // report generation: the EOD report is a human-read money artifact and this is
+  // go-live week. `flushDenominatorFlipTape` already swallows its own errors;
+  // the try/catch is the second layer, because a tape is worth zero of that
+  // report.
+  //
+  // Skipped on a backfill: the ring holds candidates recorded since the last
+  // drain, i.e. TODAY's, so stamping them with a past `asOfDate` would file
+  // today's observations under a day they did not happen on — and a tape whose
+  // dates lie is worse than no tape.
+  if (!backfill) {
+    try {
+      const dump = ctx.engine.drainDenominatorFlipTape();
+      // Skip the write entirely on an empty session — a `tape/<date>.json` with
+      // zero rows and a file that was never written are the same fact, and not
+      // writing it keeps the retention budget for sessions that carry data.
+      if (dump.rows.length > 0 || dump.droppedCandidates > 0) {
+        await flushDenominatorFlipTape({
+          targetDir,
+          date: finalReport.date,
+          dump,
+          admissionRule: {
+            changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP,
+            capacity: dump.capacity,
+          },
+          log,
+        });
+      }
+    } catch (err) {
+      log.warn('TRA-2689 denominator-flip tape flush threw', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Persist daily equity snapshot for cumulative tracking. Skipped on a
   // backfill: `saveSnapshot` rebases the dashboard's opening equity to the
