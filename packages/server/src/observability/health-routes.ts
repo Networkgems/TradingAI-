@@ -43,6 +43,12 @@ import {
   isOptionLiveRvLongArmed,
   parseOptionLiveTestUntil,
   LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+  LIVE_OPTION_TEST_NOTIONAL_CEILING_USD,
+  LIVE_OPTION_TEST_NOTIONAL_CAP_VAR,
+  LIVE_OPTION_TEST_MAX_CONTRACTS_VAR,
+  LIVE_OPTION_TEST_CONTRACTS_HARD_MAX,
+  resolveLiveOptionTestNotionalCapUsd,
+  resolveLiveOptionTestMaxContracts,
   isOptionCostGateLiveEnforceEnabled,
   isOptionLiquidityLiveEnforceEnabled,
   OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
@@ -2161,7 +2167,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       otmFlag: 'ENABLE_OPTION_LIVE_OTM',
       rvFlag: 'ENABLE_OPTION_LIVE_RV_LONG',
       windowVar: 'OPTION_LIVE_TEST_UNTIL',
-      notionalCapUsd: LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+      // TRA-2536 — the RESOLVED per-entry size the order site will actually use, not
+      // the compiled default. Reporting the constant here would read identically on a
+      // box running a different cap/size, which is the whole failure class: a size
+      // parameter with no read path cannot be verified after arming.
+      notionalCapUsd: resolveLiveOptionTestNotionalCapUsd(liveEnv),
+      notionalCapDefaultUsd: LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+      notionalCapCeilingUsd: LIVE_OPTION_TEST_NOTIONAL_CEILING_USD,
+      notionalCapVar: LIVE_OPTION_TEST_NOTIONAL_CAP_VAR,
+      maxContracts: resolveLiveOptionTestMaxContracts(liveEnv),
+      maxContractsVar: LIVE_OPTION_TEST_MAX_CONTRACTS_VAR,
+      maxContractsHardMax: LIVE_OPTION_TEST_CONTRACTS_HARD_MAX,
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {

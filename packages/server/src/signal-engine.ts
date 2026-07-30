@@ -82,7 +82,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
@@ -7595,9 +7595,9 @@ export class SignalEngine {
           }
 
           // ARMED — bounded real-money OTM test. Hard guardrails IN CODE (not config
-          // trust): entry limit at the ASK, notional ≤ min(available cash, $268.58),
-          // max 1 contract. On any guard miss we skip with a visible reason and never
-          // partial/oversize.
+          // trust): entry limit at the ASK, notional ≤ min(available cash, resolved
+          // test cap), contracts ≤ the code-clamped ceiling. On any guard miss we skip
+          // with a visible reason and never partial/oversize.
           const askLimit = Number.isFinite(cheap.ask) && (cheap.ask ?? 0) > 0 ? (cheap.ask as number) : null;
           if (askLimit === null) {
             surfaceOtmLiveSkip('OTM live test skipped — no usable ask to submit an ask-limit entry (never a market cross)');
@@ -7615,18 +7615,28 @@ export class SignalEngine {
             continue;
           }
           const availableCash = Math.min(...availCandidates);
-          const notionalCap = Math.min(availableCash, LIVE_OPTION_TEST_NOTIONAL_CAP_USD);
-          const oneContractNotional = askLimit * 100; // max 1 contract for the test
-          if (oneContractNotional > notionalCap) {
+          // TRA-2536 — the cap and the contract CEILING are both ops-settable but
+          // clamped in code (see option-exec-flag.ts). `min(available cash, cap)`
+          // means each open shrinks the next entry's headroom, so the window's
+          // aggregate exposure is bounded by the real balance, not just per-entry.
+          const testCapUsd = resolveLiveOptionTestNotionalCapUsd(process.env);
+          const maxContracts = resolveLiveOptionTestMaxContracts(process.env);
+          const notionalCap = Math.min(availableCash, testCapUsd);
+          // Largest count in [1, maxContracts] whose ASK notional fits the cap; 0 ⇒
+          // even one contract breaches it, so we skip rather than round up.
+          const testContracts = resolveLiveOptionTestContracts(askLimit, notionalCap, maxContracts);
+          if (testContracts < 1) {
+            const oneContractNotional = askLimit * 100;
             surfaceOtmLiveSkip(
               `OTM live test skipped — 1-contract ask notional $${oneContractNotional.toFixed(2)} exceeds the test cap `
-                + `$${notionalCap.toFixed(2)} (min of available cash $${availableCash.toFixed(2)} and $${LIVE_OPTION_TEST_NOTIONAL_CAP_USD})`,
+                + `$${notionalCap.toFixed(2)} (min of available cash $${availableCash.toFixed(2)} and $${testCapUsd.toFixed(2)})`,
             );
             log.info('live OTM bounded test: over cap, skipped', {
-              sym, optionSymbol: cheap.optionSymbol, oneContractNotional, notionalCap,
+              sym, optionSymbol: cheap.optionSymbol, oneContractNotional, notionalCap, maxContracts,
             });
             continue;
           }
+          const testNotional = askLimit * 100 * testContracts;
 
           const underlyingSpotLive =
             typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;
@@ -7637,26 +7647,31 @@ export class SignalEngine {
             sentiment: null,
             sentimentIcBand: null,
             agentConviction: null,
-            // TRA-2333 — the bounded-live test passes an explicit 1-contract
+            // TRA-2333 — the bounded-live test passes an explicit contract-count
             // override, which bypasses the sized-contract path entirely, so no
             // throttle term reaches this ticket.
             // TRA-2339 — nor would one at any scope: the override wins over the
-            // sized count regardless of arming, so the decided term is 1 as well.
+            // sized count regardless of arming, so the decided term is the
+            // cap-fitted `testContracts` as well.
+            // TRA-2536 — that override is no longer always 1 (the board authorized
+            // 2-4), but it is still an EXPLICIT count clamped in code, so the
+            // throttle-bypass reasoning above is unchanged.
             // TRA-2375 — this is the one out-of-cohort path a structure-based
             // proxy CANNOT see (it journals `single_leg_otm`, same as the real
             // OTM chokepoint). The `null` path stamp is what closes that leak.
             ...NON_CHOKEPOINT_THROTTLE_STAMP,
           };
-          // Open exactly 1 contract on the paper book (bounded-test override bypasses
-          // the $5k OTM min-equity gate + the 15% cap the $268 account can't clear);
-          // the mirror books the real broker order and voids this on reject.
+          // Open exactly `testContracts` on the paper book (bounded-test override
+          // bypasses the $5k OTM min-equity gate + the 15% cap the small live account
+          // can't clear); the mirror books the real broker order and voids this on
+          // reject.
           const openedLive = this.optionsAccount.openOptionFromCandidate(
             signal,
             this.mode,
             undefined,
             underlyingSpotLive,
             otmLiveJournalSetup,
-            1,
+            testContracts,
           );
           if (!openedLive) {
             surfaceOtmLiveSkip('OTM live test skipped — paper open returned null (window/daily-cap/dedup/DTE guard)');
@@ -7683,8 +7698,14 @@ export class SignalEngine {
           this.dailySignals.push({
             id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
           });
-          log.info('live OTM bounded-test entry opened (TRA-1929)', {
-            sym, optionSymbol: cheap.optionSymbol, askLimit, notionalCap,
+          log.info('live OTM bounded-test entry opened (TRA-1929/TRA-2536)', {
+            sym,
+            optionSymbol: cheap.optionSymbol,
+            askLimit,
+            notionalCap,
+            contracts: testContracts,
+            maxContracts,
+            testNotional,
           });
           continue;
         }

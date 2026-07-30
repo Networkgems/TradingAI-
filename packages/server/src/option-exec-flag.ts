@@ -577,12 +577,117 @@ export function isOptionLiveOtmEnabled(env: NodeJS.ProcessEnv = process.env): bo
 export const OPTION_LIVE_TEST_UNTIL_VAR = 'OPTION_LIVE_TEST_UNTIL';
 
 /**
- * The bounded-test hard cap on a single live entry's notional, in USD. The board
- * (TRA-1916) sized the test off the live Tradier Production account's ~$268.58
- * tradeable cash. The per-entry cap the guardrail enforces is
- * `min(available cash, LIVE_OPTION_TEST_NOTIONAL_CAP_USD)`.
+ * The bounded-test DEFAULT cap on a single live entry's notional, in USD. The board
+ * (TRA-1916) sized the original test off the live Tradier Production account's
+ * ~$268.58 tradeable cash. The per-entry cap the guardrail enforces is
+ * `min(available cash, resolveLiveOptionTestNotionalCapUsd(env))`.
+ *
+ * This stays the COMPILED DEFAULT rather than being bumped in place, so a box
+ * running an older build (or a rollback) sizes DOWN to the July number instead of
+ * inheriting a larger cap it was never reviewed for (TRA-2536).
  */
 export const LIVE_OPTION_TEST_NOTIONAL_CAP_USD = 268.58;
+
+// --------------------------------------------------------------------------
+// TRA-2536 — the board authorized a SECOND bounded live-production window on the
+// OTM sleeve, sized "2-4 contracts/trade, limit-at-ask, swing-only, hard 5-day
+// auto-disable", against the $468.58 now funded on the live Tradier Production
+// account (admin book).
+//
+// The TRA-1929 window hard-coded BOTH the size (exactly 1 contract) and the cap
+// ($268.58), so neither of the board's two size parameters was expressible without
+// a deploy. These two resolvers make them ops-settable — but BOUNDED IN CODE, so a
+// typo or a stale env cannot authorize more than the board did:
+//
+//   • the notional cap clamps to `LIVE_OPTION_TEST_NOTIONAL_CEILING_USD` — the
+//     board-stated account balance. A larger value clamps DOWN, it never widens.
+//   • the contract count clamps to `LIVE_OPTION_TEST_CONTRACTS_HARD_MAX` (4 — the
+//     top of the board's "2-4" range).
+//
+// Both FAIL SAFE: absent / malformed / non-positive reads fall back to the COMPILED
+// conservative default (the July cap, 1 contract), never to the ceiling. So the
+// shipped state with no env set is byte-equivalent in risk to the TRA-1929 window,
+// and an env wipe (TRA-2193) shrinks the arm rather than widening it.
+// --------------------------------------------------------------------------
+
+/**
+ * Hard ceiling on the per-entry notional cap, USD. The board funded $468.58 on the
+ * live Tradier Production account for TRA-2536; no env value may authorize a single
+ * entry larger than that. Combined with the `min(available cash, cap)` rule at the
+ * order site, aggregate exposure across the window is bounded by the real balance —
+ * each open reduces buying power, so successive entries self-limit.
+ */
+export const LIVE_OPTION_TEST_NOTIONAL_CEILING_USD = 468.58;
+
+export const LIVE_OPTION_TEST_NOTIONAL_CAP_VAR = 'LIVE_OPTION_TEST_NOTIONAL_CAP_USD';
+
+/**
+ * Resolve the per-entry notional cap (USD) for the bounded live-options test.
+ * Clamped to `(0, LIVE_OPTION_TEST_NOTIONAL_CEILING_USD]`. Absent, malformed or
+ * non-positive ⇒ the compiled {@link LIVE_OPTION_TEST_NOTIONAL_CAP_USD} default
+ * (fail-safe: never the ceiling).
+ */
+export function resolveLiveOptionTestNotionalCapUsd(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[LIVE_OPTION_TEST_NOTIONAL_CAP_VAR];
+  if (typeof raw !== 'string') return LIVE_OPTION_TEST_NOTIONAL_CAP_USD;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n <= 0) return LIVE_OPTION_TEST_NOTIONAL_CAP_USD;
+  return Math.min(n, LIVE_OPTION_TEST_NOTIONAL_CEILING_USD);
+}
+
+/**
+ * Top of the board's authorized "2-4 contracts/trade" range (TRA-2536). No env
+ * value may size a bounded-test entry above this.
+ */
+export const LIVE_OPTION_TEST_CONTRACTS_HARD_MAX = 4;
+
+/**
+ * Compiled default contract count — the conservative TRA-1929 size. An unset or
+ * malformed env var sizes here, NOT at the hard max.
+ */
+export const LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT = 1;
+
+export const LIVE_OPTION_TEST_MAX_CONTRACTS_VAR = 'LIVE_OPTION_TEST_MAX_CONTRACTS';
+
+/**
+ * Resolve the MAXIMUM contracts a single bounded-test live entry may open. Integer,
+ * clamped to `[1, LIVE_OPTION_TEST_CONTRACTS_HARD_MAX]`. Absent / malformed /
+ * non-integer / non-positive ⇒ {@link LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT}.
+ *
+ * This is a CEILING, not a target: the order site steps the count DOWN until the
+ * ask-notional fits the cap, so a rich contract opens fewer (or is skipped) rather
+ * than breaching the cap.
+ */
+export function resolveLiveOptionTestMaxContracts(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[LIVE_OPTION_TEST_MAX_CONTRACTS_VAR];
+  if (typeof raw !== 'string') return LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT;
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n < 1) return LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT;
+  return Math.min(n, LIVE_OPTION_TEST_CONTRACTS_HARD_MAX);
+}
+
+/**
+ * The contract count a bounded-test entry should open: the largest integer in
+ * `[1, maxContracts]` whose ask notional (`ask * 100 * contracts`) fits `capUsd`.
+ * Returns `0` when even ONE contract breaches the cap — the caller must SKIP, never
+ * partial-fill or round up.
+ */
+export function resolveLiveOptionTestContracts(
+  askLimit: number,
+  capUsd: number,
+  maxContracts: number,
+): number {
+  if (!Number.isFinite(askLimit) || askLimit <= 0) return 0;
+  if (!Number.isFinite(capUsd) || capUsd <= 0) return 0;
+  const perContract = askLimit * 100;
+  const fits = Math.floor(capUsd / perContract);
+  if (!Number.isFinite(fits) || fits < 1) return 0;
+  return Math.min(fits, Math.max(1, Math.floor(maxContracts)));
+}
 
 /**
  * Parse `OPTION_LIVE_TEST_UNTIL` (the bounded-test window end, epoch-ms). Returns

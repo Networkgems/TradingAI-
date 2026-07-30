@@ -37,6 +37,15 @@ import {
   OPTION_IV_RV_ROUTING_FLAG,
   OPTION_IV_RV_BUY_RATIO_VAR,
   OPTION_IV_RV_MISPRICING_PCT_VAR,
+  LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
+  LIVE_OPTION_TEST_NOTIONAL_CEILING_USD,
+  LIVE_OPTION_TEST_NOTIONAL_CAP_VAR,
+  LIVE_OPTION_TEST_MAX_CONTRACTS_VAR,
+  LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT,
+  LIVE_OPTION_TEST_CONTRACTS_HARD_MAX,
+  resolveLiveOptionTestNotionalCapUsd,
+  resolveLiveOptionTestMaxContracts,
+  resolveLiveOptionTestContracts,
 } from './option-exec-flag.js';
 
 const ON = '1';
@@ -287,5 +296,78 @@ describe('resolveIvRvRoutingOverride (TRA-1203)', () => {
     expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_BUY_RATIO_VAR]: '1.4' }).buyIvRvRatio).toBeUndefined();
     expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_MISPRICING_PCT_VAR]: '0' }).mispricingThresholdPct).toBeUndefined();
     expect(resolveIvRvRoutingOverride({ [OPTION_IV_RV_MISPRICING_PCT_VAR]: 'abc' }).mispricingThresholdPct).toBeUndefined();
+  });
+});
+
+// TRA-2536 — the board's second bounded live window sized "2-4 contracts/trade"
+// against a $468.58 account. Both size parameters are ops-settable but clamped in
+// code; the tests that matter are the FAILING states (malformed / oversized /
+// doesn't-fit), because a fail-OPEN default here spends real money.
+describe('resolveLiveOptionTestNotionalCapUsd (TRA-2536)', () => {
+  it('falls back to the COMPILED July default when unset or malformed — never the ceiling', () => {
+    expect(resolveLiveOptionTestNotionalCapUsd({})).toBe(LIVE_OPTION_TEST_NOTIONAL_CAP_USD);
+    for (const bad of ['', '   ', 'abc', '0', '-100', 'NaN', 'Infinity']) {
+      expect(resolveLiveOptionTestNotionalCapUsd({ [LIVE_OPTION_TEST_NOTIONAL_CAP_VAR]: bad }))
+        .toBe(LIVE_OPTION_TEST_NOTIONAL_CAP_USD);
+    }
+  });
+
+  it('honours a value inside the ceiling and CLAMPS DOWN above it', () => {
+    expect(resolveLiveOptionTestNotionalCapUsd({ [LIVE_OPTION_TEST_NOTIONAL_CAP_VAR]: '468.58' }))
+      .toBe(468.58);
+    expect(resolveLiveOptionTestNotionalCapUsd({ [LIVE_OPTION_TEST_NOTIONAL_CAP_VAR]: '150' }))
+      .toBe(150);
+    // a fat-finger cannot authorize more than the funded balance
+    expect(resolveLiveOptionTestNotionalCapUsd({ [LIVE_OPTION_TEST_NOTIONAL_CAP_VAR]: '46858' }))
+      .toBe(LIVE_OPTION_TEST_NOTIONAL_CEILING_USD);
+  });
+});
+
+describe('resolveLiveOptionTestMaxContracts (TRA-2536)', () => {
+  it('defaults to the conservative compiled 1 when unset or malformed', () => {
+    expect(resolveLiveOptionTestMaxContracts({})).toBe(LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT);
+    for (const bad of ['', 'abc', '0', '-3', '2.5', 'Infinity']) {
+      expect(resolveLiveOptionTestMaxContracts({ [LIVE_OPTION_TEST_MAX_CONTRACTS_VAR]: bad }))
+        .toBe(LIVE_OPTION_TEST_MAX_CONTRACTS_DEFAULT);
+    }
+  });
+
+  it('accepts the board range and clamps above the hard max of 4', () => {
+    expect(resolveLiveOptionTestMaxContracts({ [LIVE_OPTION_TEST_MAX_CONTRACTS_VAR]: '2' })).toBe(2);
+    expect(resolveLiveOptionTestMaxContracts({ [LIVE_OPTION_TEST_MAX_CONTRACTS_VAR]: '4' })).toBe(4);
+    expect(resolveLiveOptionTestMaxContracts({ [LIVE_OPTION_TEST_MAX_CONTRACTS_VAR]: '40' }))
+      .toBe(LIVE_OPTION_TEST_CONTRACTS_HARD_MAX);
+  });
+});
+
+describe('resolveLiveOptionTestContracts (TRA-2536)', () => {
+  it('opens the board ceiling when the ask notional fits', () => {
+    // $0.40 ask ⇒ $40/contract; 4 fit inside $468.58
+    expect(resolveLiveOptionTestContracts(0.4, 468.58, 4)).toBe(4);
+  });
+
+  it('steps DOWN to what the cap affords rather than breaching it', () => {
+    // $1.00 ask ⇒ $100/contract; $268.58 affords 2, not 4
+    expect(resolveLiveOptionTestContracts(1.0, 268.58, 4)).toBe(2);
+    // $1.50 ⇒ $150/contract; $468.58 affords 3
+    expect(resolveLiveOptionTestContracts(1.5, 468.58, 4)).toBe(3);
+  });
+
+  it('returns 0 — SKIP, never round up — when even one contract breaches the cap', () => {
+    expect(resolveLiveOptionTestContracts(5.0, 468.58, 4)).toBe(0);
+    expect(resolveLiveOptionTestContracts(2.7, 268.58, 4)).toBe(0);
+  });
+
+  it('never exceeds the requested max even with unlimited headroom', () => {
+    expect(resolveLiveOptionTestContracts(0.05, 468.58, 1)).toBe(1);
+    expect(resolveLiveOptionTestContracts(0.05, 468.58, 2)).toBe(2);
+  });
+
+  it('fails closed on a non-positive or non-finite ask / cap', () => {
+    expect(resolveLiveOptionTestContracts(0, 468.58, 4)).toBe(0);
+    expect(resolveLiveOptionTestContracts(-1, 468.58, 4)).toBe(0);
+    expect(resolveLiveOptionTestContracts(Number.NaN, 468.58, 4)).toBe(0);
+    expect(resolveLiveOptionTestContracts(0.4, 0, 4)).toBe(0);
+    expect(resolveLiveOptionTestContracts(0.4, Number.NaN, 4)).toBe(0);
   });
 });
