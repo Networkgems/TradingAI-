@@ -295,7 +295,15 @@ describe('reconcilePnl', () => {
         stockLegDrift: -22.5,  // the entire error lands here...
         optionsLegDrift: 0,    // ...and the options leg reconciles exactly
       });
-      expect(r.stockLegOk).toBe(false);
+      // TRA-2633 — this used to assert `false`, i.e. "the stock legs DISAGREE".
+      // That was the bug: the report leg is not disagreeing, it is ABSENT-as-zero
+      // (the archive cleared it), so `stockLegDrift` is just `-stockDaily`.
+      // Claiming a regression here is how the pooled-`drift` defect survived the
+      // decomposition. NOT MEASURED is the honest verdict.
+      expect(r.stockLegOk).toBeNull();
+      expect(r.stockLegMeasuredCount).toBe(1); // a row COULD have disagreed...
+      // ...and the raw evidence stays fully visible on the row and in the
+      // aggregates. `null` suppresses the VERDICT, never the numbers.
       expect(r.stockLegOffendingDates).toEqual(['2026-07-29']);
       expect(r.maxStockLegDriftUsd).toBe(22.5);
       // The working signal survives the decomposition — this is what pooling
@@ -352,8 +360,50 @@ describe('reconcilePnl', () => {
         stockLegDrift: 0,
         optionsLegDrift: 0,
       });
-      expect(r.stockLegOk).toBe(true);
+      // TRA-2633 — absence is still not a MISMATCH (no offending date, drift 0),
+      // but it is not a PASS either: there was no cohort to grade. `true` here
+      // was the empty-set trap that shipped live as `livePriorOptionsLagOk`.
+      expect(r.stockLegOk).toBeNull();
+      expect(r.stockLegMeasuredCount).toBe(0);
+      expect(r.stockLegOffendingDates).toEqual([]);
       expect(r.optionsLegOk).toBe(true);
+    });
+
+    it('TRA-2633 — a row with stockDaily 0 is NOT evidence, so it cannot vacuously pass', () => {
+      // The exact shape that made C5 of TRA-2625 read green off two books: both
+      // legs are 0, so they "agree" no matter how broken the source is. This is
+      // the vacuous pass the measured-cohort rule exists to refuse.
+      const r = reconcilePnl(
+        [snap('2026-07-27', 0, 140)],
+        new Map([['2026-07-27', 140]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-27', 140]]),
+        new Map([['2026-07-27', 0]]), // agrees only because both sides are 0
+      );
+      expect(r.days[0]).toMatchObject({ stockLegDrift: 0, drift: 0 });
+      expect(r.stockLegMeasuredCount).toBe(0);
+      expect(r.stockLegOk).toBeNull();
+      // The options leg on that same row IS real evidence and does pass.
+      expect(r.optionsLegOk).toBe(true);
+    });
+
+    it('TRA-2633 — AUTO-HEALS: one real report figure hands the verdict back to a boolean', () => {
+      // The `null` must not be a one-way latch. The moment the EOD report carries
+      // a genuine stock figure on any row that could disagree, the leg is
+      // gradeable again — no code change, no flag, no ticket. Here 07-28 is still
+      // zeroed but 07-29 is live and AGREES, so the verdict is a true green.
+      const r = reconcilePnl(
+        [snap('2026-07-28', 22.5, 0), snap('2026-07-29', 40, 0)],
+        new Map([['2026-07-28', 0], ['2026-07-29', 40]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-28', 0], ['2026-07-29', 0]]),
+        new Map([['2026-07-28', 0], ['2026-07-29', 40]]), // 07-29 leg is REAL
+      );
+      expect(r.stockLegMeasuredCount).toBe(2);
+      expect(r.stockLegOk).toBe(false); // 07-28 is now a genuine, gradeable miss
+      expect(r.stockLegOffendingDates).toEqual(['2026-07-28']);
     });
 
     it('baseline-gates both leg verdicts, exactly like ok', () => {
@@ -367,7 +417,10 @@ describe('reconcilePnl', () => {
       );
       expect(r.days[0].belowBaseline).toBe(true);
       expect(r.days[0].stockLegDrift).toBeCloseTo(-643.66, 2); // still visible on the row
-      expect(r.stockLegOk).toBe(true);                          // but never graded
+      // TRA-2633 — every row is below baseline, so the measured cohort is empty
+      // and the verdict is NOT MEASURED rather than a green earned by exclusion.
+      expect(r.stockLegOk).toBeNull();
+      expect(r.stockLegMeasuredCount).toBe(0);
       expect(r.stockLegOffendingDates).toEqual([]);
       expect(r.maxStockLegDriftUsd).toBe(0);
     });

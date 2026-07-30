@@ -4057,7 +4057,18 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // a mismatch. See `PNL_DRIFT_DECOMPOSITION_NOTE` in the caveats.
       // Each engine's figure is already `round2`-ed, so the max needs no further
       // rounding — same as `maxDriftUsd` above.
-      stockLegOk: engines.every(e => e.stockLegOk),
+      // TRA-2633 — TRI-STATE fold, and it must NOT be `engines.every(...)`. That
+      // was the shipped spelling, and with the per-engine verdict now `boolean |
+      // null` it would coerce every NOT-MEASURED book to `false` — inventing a
+      // firm-wide stock-leg REGRESSION out of "nobody looked". A red book still
+      // wins; otherwise one genuinely-measured green is required to claim green;
+      // all-null stays null.
+      stockLegOk: engines.some(e => e.stockLegOk === false)
+        ? false
+        : engines.some(e => e.stockLegOk === true)
+          ? true
+          : null,
+      stockLegMeasuredCount: engines.reduce((n, e) => n + e.stockLegMeasuredCount, 0),
       maxStockLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxStockLegDriftUsd), 0),
       optionsLegOk: engines.every(e => e.optionsLegOk),
       maxOptionsLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxOptionsLegDriftUsd), 0),

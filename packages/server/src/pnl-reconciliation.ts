@@ -74,11 +74,26 @@ export const PNL_LEG_COVERAGE_NOTE =
  *     stockLegDrift    = eodStockPnl   − stockDaily     → stockLegOk
  *     optionsLegDrift  = eodOptionsPnl − optionsDaily   → optionsLegOk
  *
- * Each is falsifiable on its own axis and each has a reachable green state.
- * Grade THOSE. `drift` is now documented as their sum, not a single error.
+ * TRA-2633 (CEO) — the line that used to sit here said "Each is falsifiable on
+ * its own axis and each has a reachable green state. Grade THOSE." Only HALF of
+ * that survived contact with the live fleet:
+ *
+ *   `optionsLegOk`  — TRUE. Options-vs-options, identity exact on 167/167 live
+ *                     rows, 70 rows carry a non-zero `eodOptionsPnl` so it can
+ *                     move, and 0 of its 7 offenders are explained by
+ *                     `stockDaily`. This is the gradeable one.
+ *   `stockLegOk`    — FALSE. `eodStockPnl` is the report's `realizedPnl`, which
+ *                     the TRA-219 archive zeroes at the same 21:00 ET the report
+ *                     is written: 167/167 live rows read exactly 0.00, including
+ *                     all 40 with a non-zero `stockDaily`. Decomposing did not
+ *                     rescue this leg — it only made its ONE cause legible. It is
+ *                     now TRI-STATE and reports `null` = NOT MEASURED.
+ *
+ * So: grade `optionsLegOk`. Read `stockLegDrift` as EVIDENCE (it correctly
+ * attributes where the pooled error lives) but never as a VERDICT.
  */
 export const PNL_DRIFT_DECOMPOSITION_NOTE =
-  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. Grade `stockLegOk` / `optionsLegOk` instead — `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable.';
+  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2633 CORRECTION: this note previously said to grade `stockLegOk` / `optionsLegOk`. Grade **`optionsLegOk` only** — it is options-vs-options and verified Defect-A-immune (identity exact on 167/167 live rows, 0 of 7 offenders explained by `stockDaily`). `stockLegOk` inherits the SAME lossy source `drift` does and is now TRI-STATE: `null` = NOT MEASURED, which is what the live fleet returns today. Treating that `null` as a pass is the bug this correction exists to stop.';
 
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
@@ -292,15 +307,40 @@ export interface PnlReconcileResult {
   /** TRA-2314 — dates whose `optionsDailyPnl` was rewritten by the historical repair. */
   repairedDates: string[];
   /**
-   * TRA-2630 — the STOCK-leg verdict, baseline-gated exactly like `ok`. False
-   * iff some evaluated day's |`stockLegDrift`| exceeds the tolerance.
+   * TRA-2630 — the STOCK-leg verdict, baseline-gated exactly like `ok`.
+   * TRI-STATE: `false` iff some evaluated day's |`stockLegDrift`| exceeds the
+   * tolerance, `true` if none does, and **`null` = NOT MEASURED**.
    *
-   * THIS is what a gate should read instead of `ok` when it means "the equity
-   * book and the EOD report agree about stock P&L". It has a reachable green
-   * state (a day with no stock activity scores 0 on both sides) and exactly one
-   * cause, so a fix moves it.
+   * TRA-2633 (CEO) — the previous doc here claimed this leg "has a reachable
+   * green state and exactly one cause, so a fix moves it". That is FALSE, and
+   * shipping it as a plain boolean reproduced Defect A one level down. Measured
+   * on the live fleet 2026-07-30T05:52Z, build `1b803bd`:
+   *
+   *     eodStockPnl === 0             167/167 evaluated rows
+   *     stockLegDrift === -stockDaily 167/167 evaluated rows
+   *     rows with stockDaily !== 0     40  — every one of them eodStockPnl 0.00
+   *
+   * `eodStockPnl` comes from the EOD report's `realizedPnl`, which is summed
+   * from `allClosedPositions` — the list the TRA-219 archive clears at the SAME
+   * 21:00 ET the report is written. So the source is structurally zero: this leg
+   * is red iff `stockDaily !== 0`, which is a restatement of the equity delta,
+   * not a defect signal. No fix to stock reconciliation can move it.
+   *
+   * The `null` branch is therefore not cosmetic — it is the difference between
+   * "the legs agree" and "nothing looked". It is data-driven, not hardcoded: the
+   * moment the report carries a real stock figure on any row that could
+   * disagree, this returns to a boolean on its own. See {@link
+   * PnlReconcileResult.stockLegMeasuredCount}.
    */
-  stockLegOk: boolean;
+  stockLegOk: boolean | null;
+  /**
+   * TRA-2633 — how many evaluated rows could actually have shown a stock-leg
+   * disagreement (`eodStockPnl` present AND `stockDaily !== 0`). `0` means the
+   * verdict above is `null` because there was no cohort to grade — the same
+   * empty-set trap that made `livePriorOptionsLagOk` report green over zero live
+   * books. Published so a consumer can tell the two `null` causes apart.
+   */
+  stockLegMeasuredCount: number;
   /** TRA-2630 — dates whose |`stockLegDrift`| exceeds the tolerance (evaluated days only). */
   stockLegOffendingDates: string[];
   /** TRA-2630 — max |`stockLegDrift`| over evaluated days, USD. */
@@ -529,6 +569,28 @@ export function reconcilePnl(
   const optionsLegOffendingDates = evaluated
     .filter(d => Math.abs(d.optionsLegDrift) > PNL_RECONCILE_TOLERANCE_USD)
     .map(d => d.date);
+  // TRA-2633 — the stock leg is only GRADEABLE where it could have disagreed:
+  // the report leg must be present, and the snapshot leg must be non-zero. A row
+  // with `stockDaily === 0` scores 0 on both sides no matter how broken the
+  // source is, so counting it as evidence is the same vacuous pass that made C5
+  // of TRA-2625 read green off two books that both had `stockDaily === 0`.
+  const stockLegMeasurableDays = evaluated.filter(
+    d => d.eodStockPnl != null && d.stockDaily !== 0,
+  );
+  // NOT MEASURED (`null`) in two distinct situations, both of which a plain
+  // boolean would have rendered as a green:
+  //   1. no measurable row at all  — the empty-cohort trap (`every` is true on
+  //      the empty set), which shipped live as `livePriorOptionsLagOk`;
+  //   2. every measurable row has `eodStockPnl === 0` — the source is zeroed by
+  //      the TRA-219 archive, so `stockLegDrift` is just `-stockDaily`.
+  // Case 2 is deliberately a `some`, not a threshold: ONE row carrying a real
+  // non-zero report figure proves the source is live again and hands the verdict
+  // straight back to the boolean, with no code change and no flag to remember.
+  const stockLegSourceLive = stockLegMeasurableDays.some(d => d.eodStockPnl !== 0);
+  const stockLegOk: boolean | null =
+    stockLegMeasurableDays.length === 0 || !stockLegSourceLive
+      ? null
+      : stockLegOffendingDates.length === 0;
   const priorOptionsLagDates = days.filter(d => d.lagsPriorOptionsDaily).map(d => d.date);
   // TRA-2302 — the false-zero sweep is NOT baseline-gated. The baseline exists
   // because pre-fix code wrote arithmetically un-reconcilable drift; a missing
@@ -553,7 +615,8 @@ export function reconcilePnl(
       return acc;
     }, {}),
     repairedDates: days.filter(d => d.optionsDailyPnlSource === 'journal-repair').map(d => d.date),
-    stockLegOk: stockLegOffendingDates.length === 0,
+    stockLegOk,
+    stockLegMeasuredCount: stockLegMeasurableDays.length,
     stockLegOffendingDates,
     maxStockLegDriftUsd: round2(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.stockLegDrift)), 0),
