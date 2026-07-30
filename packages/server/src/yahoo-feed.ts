@@ -271,6 +271,39 @@ export function secondaryFanoutCeiling(
   return Math.floor(budgetMs / sleepMs) * batch;
 }
 
+/**
+ * How many dropped symbols the truncation warning names before it elides. A
+ * degraded tick drops ~414 of 614; dumping all of them would push the useful
+ * part of the line past most log viewers' truncation and make the whole thing
+ * unreadable, which is how you get a "loud" log nobody reads.
+ */
+const DROPPED_SYMBOL_SAMPLE = 20;
+
+/**
+ * TRA-2643 — render the head of the dropped set for the truncation warning.
+ *
+ * `5d73aab` (TRA-2627) made the shortfall loud but only in the aggregate: it
+ * logs the count and the ceiling. "395/597 symbols failed" does not tell you
+ * whether the session lost its risk gate or 395 discovery names nobody trades,
+ * and those are different incidents with different remedies. On 2026-07-29 it
+ * was the former — `^VIX` sat at index 510 of 614 — and nothing in the log said
+ * so; the loss had to be reconstructed by hand afterwards.
+ *
+ * Callers order `symbols` most-important-first (TRA-2643), so the head of the
+ * dropped suffix is the marginal set — what the budget *just* failed to buy.
+ * Returns `''` for an empty drop so the existing line is byte-identical when
+ * the failures came from per-symbol provider misses rather than the deadline.
+ */
+export function formatDroppedSymbols(
+  dropped: readonly string[],
+  sample: number = DROPPED_SYMBOL_SAMPLE,
+): string {
+  if (dropped.length === 0) return '';
+  const head = dropped.slice(0, Math.max(0, sample));
+  const rest = dropped.length - head.length;
+  return ` — dropped ${head.join(',')}${rest > 0 ? ` (+${rest} more)` : ''}`;
+}
+
 // ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
 // TRA-505: the live app writes each user's Tradier creds into per-user account
 // settings (Settings page), NOT env — so on a normal deployment `TRADIER_API_TOKEN`
@@ -1605,7 +1638,9 @@ export async function fetchQuotes(
   // The distinct `pre-fanout` suffix separates this from the in-loop breaker trip,
   // which is a different event with a different remedy.
   if (remaining.length > 0 && isRateLimited()) {
-    console.warn(`[yahoo-feed] fetchQuotes: ${remaining.length}/${symbols.length} symbols failed (Yahoo breaker open, pre-fanout short-circuit)`);
+    // TRA-2643 — name the head of the drop here too. This path loses the WHOLE
+    // remainder, so it is the one most likely to take the risk gate with it.
+    console.warn(`[yahoo-feed] fetchQuotes: ${remaining.length}/${symbols.length} symbols failed (Yahoo breaker open, pre-fanout short-circuit)${formatDroppedSymbols(remaining)}`);
     return results;
   }
   // TRA-2627 — say out loud when the budget CANNOT cover this universe. A line
@@ -1630,10 +1665,18 @@ export async function fetchQuotes(
   const fanoutDeadline = Date.now() + FEED_FANOUT_BUDGET_MS;
   let failures = 0;
   let budgetHit = false;
+  // TRA-2643 — the truncation must say WHAT it dropped, not just how many.
+  // TRA-2627 landed the count; "we dropped 414 symbols" is not actionable while
+  // "we dropped ^VIX" is. `remaining` is now ordered most-important-first by the
+  // caller (`SignalEngine.getQuoteFetchOrder`), so the FIRST names in the
+  // dropped suffix are the marginal ones sitting just past the ceiling — the
+  // rows a budget change would have bought back, and the ones worth naming.
+  let dropped: readonly string[] = [];
   for (let i = 0; i < remaining.length; i += QUOTE_BATCH) {
     if (isRateLimited() || Date.now() >= fanoutDeadline) {
       budgetHit = true;
       failures += remaining.length - i;
+      dropped = remaining.slice(i);
       break;
     }
     const slice = remaining.slice(i, i + QUOTE_BATCH);
@@ -1646,7 +1689,7 @@ export async function fetchQuotes(
   }
   if (failures > 0) {
     const reason = isRateLimited() ? ' (Yahoo breaker open)' : budgetHit ? ' (feed budget exhausted)' : '';
-    console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${reason}`);
+    console.warn(`[yahoo-feed] fetchQuotes: ${failures}/${symbols.length} symbols failed${reason}${formatDroppedSymbols(dropped)}`);
   }
 
   // TRA-552 — cache the freshly resolved (stale-set) quotes so overlapping

@@ -226,6 +226,16 @@ const NON_CHOKEPOINT_THROTTLE_STAMP = {
 } as const;
 import type { Regime } from '@trading-app/engine';
 import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient } from './yahoo-feed.js';
+import { prioritizeQuoteUniverse } from './quote-priority.js';
+
+/**
+ * TRA-154 — how recently a signal must have fired for its symbol to count as
+ * "active interest". Hoisted to module scope by TRA-2643 so the quote-fan-out
+ * priority order (`getQuoteFetchOrder`) and the Twelve Data budget gate
+ * (`setActiveInterestSymbols`) share ONE definition of "live right now" rather
+ * than drifting apart as two 30-minute literals in different scopes.
+ */
+const ACTIVE_SIGNAL_WINDOW_MS = 30 * 60_000;
 import {
   resolveOrderQuoteGuardConfig,
   computeMarketableLimit,
@@ -3672,7 +3682,9 @@ export class SignalEngine {
     this.quoteRefreshRunning = true;
     try {
       const activeSymbols = this.getActiveSymbols();
-      const quotes = await fetchQuotes(activeSymbols);
+      // TRA-2643 — fetch in importance order (the fan-out truncates by array
+      // position); stamp in universe order (that is the watchlist render order).
+      const quotes = await fetchQuotes(this.getQuoteFetchOrder(activeSymbols));
       this.applyQuotes(quotes, activeSymbols);
     } catch (err: unknown) {
       log.warn('quote-only refresh threw', {
@@ -4482,7 +4494,10 @@ export class SignalEngine {
     // where every other named sink is throttled or mode-gated. It was the single
     // largest unlabelled await in the body, so any "unattributed %" measured before
     // this label existed was dominated by it.
-    const quotes = await withPhase('signal.doTick.quote-batch', () => fetchQuotes(activeSymbols));
+    // TRA-2643 — fetch in importance order (the fan-out truncates by array
+    // position, so the last ~414 of 614 go unpriced whenever Tradier is dark);
+    // stamp in universe order, which is what the watchlist renders from.
+    const quotes = await withPhase('signal.doTick.quote-batch', () => fetchQuotes(this.getQuoteFetchOrder(activeSymbols)));
     // TRA-1996 — stamp via the shared helper the decoupled quote refresher also
     // uses, so `symbolState.lastUpdated` is written the same way on both paths.
     const prices = this.applyQuotes(quotes, activeSymbols);
@@ -4608,7 +4623,6 @@ export class SignalEngine {
     // to this set so we don't burn the daily budget on watchlist-wide refreshes.
     // Other symbols still get Tiingo (1,000/day) — sufficient for indicator math
     // even though IEX-only volume is partial.
-    const ACTIVE_SIGNAL_WINDOW_MS = 30 * 60_000;
     const recentSignalCutoff = Date.now() - ACTIVE_SIGNAL_WINDOW_MS;
     const activeInterest = new Set<string>();
     for (const p of this.account.getState().openPositions) activeInterest.add(p.symbol);
@@ -10009,6 +10023,49 @@ export class SignalEngine {
       }
     }
     return merged;
+  }
+
+  /**
+   * TRA-2643 — the SAME set as {@link getActiveSymbols}, reordered
+   * most-important-first for the quote fan-out.
+   *
+   * `fetchQuotes`' secondary fan-out truncates at `floor(FEED_FANOUT_BUDGET_MS
+   * / FANOUT_SLEEP_MS) * QUOTE_BATCH` = **200 symbols** against a **614**-symbol
+   * universe (measured on bqb1, 2026-07-30), and it truncates by *array
+   * position*. So on any tick where Tradier is dark, whichever ~414 symbols the
+   * universe happens to put last go unpriced. On 2026-07-29 that included
+   * `^VIX` — measured at index **510 of 614** — and the whole energy complex on
+   * a +7.32% crude day.
+   *
+   * Only the fan-out is reordered. {@link getActiveSymbols} keeps its historical
+   * order because `applyQuotes` seeds `symbolState` from it, which is the order
+   * the dashboard watchlist renders in — reordering that would be a visible UI
+   * change this ticket has no business making. The quote fetch is the only
+   * consumer that truncates, so it is the only one that needs the ordering.
+   *
+   * ⚠️ This must stay a PERMUTATION of `getActiveSymbols()`. If it ever filters,
+   * symbols silently stop being quoted with no log line — the exact failure mode
+   * TRA-2627 spent an incident diagnosing. `prioritizeQuoteUniverse` never drops,
+   * and `quote-priority.test.ts` asserts the multiset identity.
+   */
+  private getQuoteFetchOrder(activeSymbols: readonly string[]): string[] {
+    // Same 30-minute window `setActiveInterestSymbols` uses below for the Twelve
+    // Data budget gate — one definition of "this symbol is live right now".
+    const signalCutoff = Date.now() - ACTIVE_SIGNAL_WINDOW_MS;
+    const held = new Set<string>(this.openOptionUnderlyings());
+    for (const p of this.account.getState().openPositions) {
+      held.add(aliasWatchlistSymbol(p.symbol.toUpperCase()));
+    }
+    const signalled = new Set<string>();
+    for (const s of this.recentSignals) {
+      if (s.timestamp >= signalCutoff) signalled.add(s.symbol);
+    }
+    return prioritizeQuoteUniverse({
+      universe: activeSymbols,
+      held: [...held],
+      signalled: [...signalled],
+      base: (WATCHLIST as readonly string[]).map(aliasWatchlistSymbol),
+    });
   }
 
   /**

@@ -910,6 +910,50 @@ describe('SignalEngine — mode-scoped dashboard state (TRA-231)', () => {
     expect(active.filter(s => s === 'SPCX')).toHaveLength(1);
   });
 
+  it('TRA-2643: getQuoteFetchOrder() puts held risk FIRST and stays a permutation of the universe', () => {
+    // TRA-931 got the underlying INTO the universe but appended it LAST, after
+    // the entire discovery tail. The secondary fan-out truncates at ~200 of 614
+    // by array position, so an off-watchlist underlying — by construction the
+    // very last element — was unpriced on every degraded tick. That is TRA-931's
+    // guarantee being silently undone for exactly the symbols it exists to
+    // cover: the Greeks gate and the stale-mark exit backstop both read blind.
+    const engine = new SignalEngine(
+      { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo', liveTradierEnvOptions: 'sandbox' },
+    );
+    const spcxOpt = {
+      id: 'rv-1', symbol: 'SPCX', optionType: 'call' as const, contracts: 1, contractsRemaining: 1,
+      premiumPaid: 1.38, currentPremium: 1.38, tp1Premium: 1.7, tp1Hit: false, stopLossPremium: 1.0,
+      peakPremium: 1.38, trailingActive: false, trailingStopPremium: 1.2, underlyingEntryPrice: 370,
+      openedAt: Date.now(), signalId: 'sig-rv', signalType: 'relative_value' as const, mode: 'demo' as const,
+    };
+    const priv = engine as unknown as {
+      optionsAccounts: Record<TradierEnv, { openOptions: Map<string, typeof spcxOpt> }>;
+      dynamicSymbols: Set<string>;
+      getQuoteFetchOrder(symbols: readonly string[]): string[];
+    };
+    priv.optionsAccounts.sandbox.openOptions.set('rv-1', spcxOpt);
+    // A discovery tail big enough that position matters — bqb1's is ~589.
+    for (let i = 0; i < 600; i++) priv.dynamicSymbols.add(`TAIL${i}`);
+    priv.dynamicSymbols.add('^VIX');
+
+    const active = engine.getActiveSymbols();
+    // The defect, restated: both the held underlying and the risk gate sit
+    // outside the 200-symbol ceiling in the universe's natural order.
+    expect(active.slice(0, 200)).not.toContain('SPCX');
+    expect(active.slice(0, 200)).not.toContain('^VIX');
+
+    const ordered = priv.getQuoteFetchOrder(active);
+    expect(ordered[0]).toBe('SPCX');           // held risk first
+    expect(ordered.slice(0, 200)).toContain('^VIX');
+
+    // PERMUTATION, not a filter. If this ever reorders into a subset, symbols
+    // stop being quoted with no log line at all — the silent-drop failure mode
+    // TRA-2627 spent an incident diagnosing. `applyQuotes` is still fed the
+    // ORIGINAL order, so the watchlist render order is untouched.
+    expect(ordered).toHaveLength(active.length);
+    expect([...ordered].sort()).toEqual([...active].sort());
+  });
+
   it('scopes recentSignals to the active mode so a flip back to demo hides live signals', () => {
     const engine = new SignalEngine(
       { ...DEFAULT_ACCOUNT_SETTINGS, mode: 'demo' },
