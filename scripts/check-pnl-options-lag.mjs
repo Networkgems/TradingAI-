@@ -151,9 +151,24 @@ export function gradePayload(payload) {
 }
 
 /**
- * Per-leg drift roll-up, reported alongside the tripwire. These are the fields
- * TRA-2630 Defect A added so a gate has something falsifiable to key on; `ok` /
- * `maxDriftUsd` are printed too, but flagged as NOT gradeable.
+ * Per-leg drift roll-up, reported alongside the tripwire.
+ *
+ * ONLY `optionsLeg` IS GRADEABLE (TRA-2633). This function used to present both
+ * legs as "the gradeable fields that replace `drift`", which is the instruction
+ * TRA-2633 retracted from the endpoint caveat in `32dac46` — that commit touched
+ * `pnl-reconciliation.ts` only, so the retracted sentence survived HERE, in the
+ * tool the AC2 grader is told to run. Fixed in TRA-2630.
+ *
+ * The stock leg is options-vs-nothing: `eodStockPnl` is the EOD report's
+ * `realizedPnl`, summed from `allClosedPositions` — the list the TRA-219 archive
+ * clears at the SAME 21:00 ET the report is written. Measured live on 167/167
+ * post-baseline rows, `eodStockPnl == 0`, so `stockLegDrift == -stockDaily` and
+ * `stockBad` is a restatement of "the equity delta moved". No fix to stock
+ * reconciliation can move it, so a red there is NOT a defect signal.
+ *
+ * Hence `stockMeasurable`: the count of present rows whose report figure is
+ * actually non-zero. When it is 0 the stock leg graded NOTHING and the verdict is
+ * tri-state `null` = NOT MEASURED, matching the endpoint's own `stockLegOk`.
  *
  * ABSENCE IS NOT A PASS. `present` counts the rows that actually CARRY
  * `stockLegDrift` / `optionsLegDrift`. A build predating TRA-2630 serves neither
@@ -171,6 +186,7 @@ function summarizeLegs(payload) {
   let maxOptions = 0;
   let graded = 0;
   let present = 0;
+  let stockMeasurable = 0;
   for (const e of engines) {
     for (const d of e?.days ?? []) {
       if (d?.belowBaseline) continue;
@@ -182,6 +198,10 @@ function summarizeLegs(payload) {
         && Number.isFinite(sl) && Number.isFinite(ol);
       if (!hasLegs) continue;
       present++;
+      // A zeroed report figure means the archive race ate the operand, not that
+      // the leg reconciled. Only a non-zero `eodStockPnl` is evidence either way.
+      const esp = Number(d?.eodStockPnl);
+      if (Number.isFinite(esp) && esp !== 0) stockMeasurable++;
       if (Math.abs(sl) > TOLERANCE_USD) {
         stockBad++;
         maxStock = Math.max(maxStock, Math.abs(sl));
@@ -192,7 +212,16 @@ function summarizeLegs(payload) {
       }
     }
   }
-  return { graded, present, stockBad, optionsBad, maxStock, maxOptions };
+  // Tri-state, deliberately NOT a boolean: `null` = NOT MEASURED. Treating that
+  // null as a pass is the bug TRA-2633 exists to stop.
+  const stockLegOk = present === 0 || stockMeasurable === 0
+    ? null
+    : stockBad === 0;
+  return {
+    graded, present, stockBad, optionsBad, maxStock, maxOptions,
+    stockMeasurable, stockLegOk,
+    optionsLegOk: present === 0 ? null : optionsBad === 0,
+  };
 }
 
 async function loadPayload(argv) {
@@ -227,7 +256,7 @@ async function main(argv) {
   const legs = summarizeLegs(payload);
   console.log(`pulled ${payload.time ?? '(no timestamp)'} — ${g.engineCount} engine books`);
   console.log('');
-  console.log('TRA-2630 Defect A — per-leg drift (these are the gradeable fields):');
+  console.log('TRA-2630 Defect A — per-leg drift. GRADE `optionsLeg` ONLY (TRA-2633):');
   console.log(`  graded sessions (post-baseline) : ${legs.graded}`);
   if (legs.present === 0) {
     console.log('  per-leg drift              : NOT MEASURED — this build serves no');
@@ -237,8 +266,24 @@ async function main(argv) {
     if (legs.present < legs.graded) {
       console.log(`  WARNING: only ${legs.present}/${legs.graded} graded sessions carry the per-leg fields.`);
     }
-    console.log(`  stockLeg   offending sessions   : ${legs.stockBad}/${legs.present}  (max |drift| $${legs.maxStock.toFixed(2)})`);
-    console.log(`  optionsLeg offending sessions   : ${legs.optionsBad}/${legs.present}  (max |drift| $${legs.maxOptions.toFixed(2)})`);
+    console.log(`  optionsLeg  GRADEABLE           : ${legs.optionsLegOk ? 'OK' : 'RED'} — ${legs.optionsBad}/${legs.present} offending (max |drift| $${legs.maxOptions.toFixed(2)})`);
+    const stockVerdict = legs.stockLegOk === null
+      ? 'NOT MEASURED'
+      : legs.stockLegOk ? 'OK' : 'RED';
+    console.log(`  stockLeg    NOT gradeable       : ${stockVerdict} — ${legs.stockBad}/${legs.present} offending (max |drift| $${legs.maxStock.toFixed(2)}),`);
+    console.log(`    only ${legs.stockMeasurable}/${legs.present} rows carry a non-zero \`eodStockPnl\`.`);
+    if (legs.stockLegOk === null) {
+      console.log('    NOT MEASURED is NOT a pass and NOT a defect. `eodStockPnl` is zeroed by the');
+      console.log('    TRA-219 21:00 ET archive race, so `stockLegDrift` == -`stockDaily` and the red');
+      console.log('    count above just restates "the equity delta moved". No stock-reconciliation');
+      console.log('    fix can move it. Do not open a regression off this line (TRA-2633).');
+    }
+    // The endpoint computes its own `stockLegOk`; if we disagree, one of us is
+    // stale and the grader must not silently pick a side.
+    if (payload?.stockLegOk !== undefined && payload.stockLegOk !== legs.stockLegOk) {
+      console.log(`  WARNING: endpoint stockLegOk=${JSON.stringify(payload.stockLegOk)} but this guard computed`);
+      console.log(`    ${JSON.stringify(legs.stockLegOk)} from the same rows. Guard and endpoint disagree — treat BOTH as unread.`);
+    }
   }
   console.log(`  NOT gradeable, shown for continuity: ok=${payload.ok} maxDriftUsd=${payload.maxDriftUsd}`);
   console.log('');
@@ -487,16 +532,55 @@ function selftest() {
         { date: '2026-07-28', stockDaily: -0.94, optionsDaily: 68, drift: 0.94 },
       ] }],
     }),
-    { graded: 1, present: 0, stockBad: 0, optionsBad: 0, maxStock: 0, maxOptions: 0 },
+    {
+      graded: 1, present: 0, stockBad: 0, optionsBad: 0, maxStock: 0, maxOptions: 0,
+      stockMeasurable: 0, stockLegOk: null, optionsLegOk: null,
+    },
   );
+
+  // TRA-2633 — the stock leg is structurally zero, so a red count there is a
+  // restatement of `stockDaily`, not a defect. This is the LIVE shape: the row
+  // carries a non-zero equity delta and an `eodStockPnl` the archive race zeroed.
   check(
-    'per-leg fields present ⇒ counted',
+    'stock leg with a ZEROED eodStockPnl ⇒ stockLegOk null (NOT MEASURED), not false',
     summarizeLegs({
       engines: [{ username: 'admin', mode: 'live', days: [
-        { date: '2026-07-28', stockDaily: 22.5, stockLegDrift: -22.5, optionsLegDrift: 0 },
+        { date: '2026-07-28', stockDaily: 22.5, eodStockPnl: 0, stockLegDrift: -22.5, optionsLegDrift: 0 },
       ] }],
     }),
-    { graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 22.5, maxOptions: 0 },
+    {
+      graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 22.5, maxOptions: 0,
+      stockMeasurable: 0, stockLegOk: null, optionsLegOk: true,
+    },
+  );
+
+  // MUTATION — if `eodStockPnl` is ever genuinely reported, the leg becomes
+  // measurable and MUST go back to a hard boolean. Guards against "always null".
+  check(
+    'MUTATION: a non-zero eodStockPnl makes the stock leg measurable again ⇒ false',
+    summarizeLegs({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 22.5, eodStockPnl: 10, stockLegDrift: -12.5, optionsLegDrift: 0 },
+      ] }],
+    }),
+    {
+      graded: 1, present: 1, stockBad: 1, optionsBad: 0, maxStock: 12.5, maxOptions: 0,
+      stockMeasurable: 1, stockLegOk: false, optionsLegOk: true,
+    },
+  );
+
+  // The gradeable leg must stay falsifiable in BOTH directions.
+  check(
+    'options leg over tolerance ⇒ optionsLegOk false (the one gradeable signal)',
+    summarizeLegs({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-17', stockDaily: 0, eodStockPnl: 0, stockLegDrift: 0, optionsLegDrift: 217.5 },
+      ] }],
+    }),
+    {
+      graded: 1, present: 1, stockBad: 0, optionsBad: 1, maxStock: 0, maxOptions: 217.5,
+      stockMeasurable: 0, stockLegOk: null, optionsLegOk: false,
+    },
   );
 
   // A book with no lag at all contributes nothing.
