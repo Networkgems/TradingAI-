@@ -12,16 +12,23 @@
 import { readFile, writeFile, mkdir, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from '../observability/index.js';
 import type { ParsedRoutine, RoutineAction, RoutineFilter } from './routine-spec.js';
+import { resolveDataDir } from '../data-dir.js';
 
 const log = logger.child({ module: 'routine-store' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
+// TRA-2604 — this is the ONE file in the 38-copy migration whose UNSET-DATA_DIR
+// branch actually moves, and it moves because the old copy was wrong. The literal
+// anchored `join(__dirname, '..', 'data')` to THIS file's directory, and this file
+// lives one level down in `routines/` — so it resolved to `<bundle>/routines/../data`
+// = `<bundle>/data`, while `index.ts` and every sibling store resolved to
+// `<pkg>/data`. Two roots, one of which nobody intended. `resolveDataDir()` anchors
+// to the canonical one, which is the whole point of the one-predicate rule (TRA-1681).
+// Both of those paths are in-bundle and evaporate on redeploy, so nothing durable
+// moves; when DATA_DIR is set (the bqb1 config) the old and new roots are identical.
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'user-routines.json');
 }
 

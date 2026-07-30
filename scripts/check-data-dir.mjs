@@ -105,11 +105,12 @@ const R = {
 /**
  * FROZEN BASELINE — ratcheting to zero under TRA-2428's migration child, TRA-2604.
  *
- * Now: 46 hits / 29 files = 23 unguarded copies + 6 comment-only + 17 report-reads.
+ * Now: 34 hits / 17 files = 11 unguarded copies + 6 comment-only + 17 report-reads.
  * Was: 61 hits / 44 files = 38 unguarded copies + 6 comment-only + 17 report-reads
  *      (measured at bb7cdc4 + the TRA-2603 conversion).
  *
- * TRA-2604 batch 1 (`2823259`+) converted the 15 append-only shadow/signal ledgers.
+ * TRA-2604 batch 1 converted the 15 append-only shadow/signal ledgers (38 -> 23);
+ * batch 2 the 12 JSON snapshot stores (23 -> 11).
  * The comment-only and report-read counts are INVARIANT under that migration — only
  * `copies` moves. If one of those two ever moves, something other than a conversion
  * happened and the diff deserves a second look.
@@ -122,26 +123,14 @@ const R = {
  */
 const BASELINE = {
   // ── Files carrying ONLY unguarded copies (the TRA-2428 migration backlog) ──
-  'account-settings.ts': { copies: 1 },
   'analyst-agent.ts': { copies: 1 },
-  'anthropic-cred-store.ts': { copies: 1 },
-  'earnings-store.ts': { copies: 1 },
   // The NUL-byte file. Two copies, and the reason `-a` is mandatory.
   'external-intel.ts': { copies: 2 },
   'hypothesis-pipeline.ts': { copies: 1 },
-  'iv-rank-store.ts': { copies: 1 },
-  'learned-weights-history.ts': { copies: 1 },
-  'macro-store.ts': { copies: 1 },
   'market-review-enrichment.ts': { copies: 1 },
-  'market-review.ts': { copies: 1 },
   'option-trade-journal.ts': { copies: 1 },
   'options-forward-test.ts': { copies: 1 },
-  'options-idea-journal.ts': { copies: 1 },
-  'promotion-store.ts': { copies: 1 },
-  'research-store.ts': { copies: 1 },
-  'routines/routine-store.ts': { copies: 1 },
   'user-context.ts': { copies: 1 },
-  'user-trading-memory-store.ts': { copies: 1 },
   'users.ts': { copies: 1 },
   'watchlist-store.ts': { copies: 1 },
 

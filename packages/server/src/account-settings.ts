@@ -1,16 +1,15 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import type { AccountSettings } from '@trading-app/shared';
 import { DEFAULT_ACCOUNT_SETTINGS } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { getStateDb, type StateDb } from './sqlite.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'account-settings' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 
 // ─── TRA-1052 (TRA-1045 R1) durable settings store ──────────────────────────
 // Per-user settings persist as a single JSON blob row keyed by username, so the

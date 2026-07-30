@@ -1,7 +1,6 @@
 import { appendFile, readFile, mkdir, rename, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { getEasternUtcOffset, WATCHLIST } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 import { isLearnedShrinkageEnabled } from './learned-shrinkage-flag.js';
@@ -12,6 +11,7 @@ import {
   type LearnedWeightsParams,
 } from './learned-signal-weights.js';
 import type { ReversalShadowRecord } from './reversal-shadow-ledger.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-2352 (parent TRA-927 → TRA-920 A2) — the daily learned-weights TRAIL.
 //
@@ -53,8 +53,6 @@ import type { ReversalShadowRecord } from './reversal-shadow-ledger.js';
 // With the trim a row is ~10-15 KB and 400 rows bounds the file at ~4-6 MB.
 
 const log = logger.child({ module: 'learned-weights-history' });
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
  * Kill switch. The post-market tick is a hard no-op unless this is truthy, and
@@ -176,7 +174,7 @@ export function buildLearnedWeightsSnapshot(
 }
 
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, LEARNED_WEIGHTS_HISTORY_FILENAME);
 }
 

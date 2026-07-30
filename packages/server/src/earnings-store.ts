@@ -1,9 +1,9 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { EarningsCalendarClient, daysUntil } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-596 (TRA-595 C1) — file-backed upcoming-earnings calendar.
 //
@@ -20,10 +20,8 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'earnings-store' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'earnings-calendar.json');
 }
 

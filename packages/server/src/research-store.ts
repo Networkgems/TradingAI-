@@ -1,11 +1,11 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import type { ResearchReport, ResearchReportKind, ReviewBlock } from '@trading-app/shared';
 import { validateReviewBlock, coerceReviewBlock } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'research-store' });
 
@@ -13,10 +13,8 @@ const log = logger.child({ module: 'research-store' });
 // the Stocks News tab. Reports are global (not per-user) — the routine
 // produces market-wide pre/post-market reviews that all dashboards share.
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'research-reports.json');
 }
 

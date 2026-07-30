@@ -1,9 +1,9 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { OptionChainRow } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-604 (TRA-595 C4b) — the trailing-IV store + IV-rank source.
 //
@@ -21,10 +21,8 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'iv-rank-store' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'iv-history.json');
 }
 

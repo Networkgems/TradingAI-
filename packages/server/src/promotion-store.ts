@@ -1,7 +1,6 @@
 import { readFile, writeFile, mkdir, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import type {
   AccumulationBacktestGateMetrics,
@@ -15,6 +14,7 @@ import type {
 import { DEFAULT_PROMOTION_THRESHOLDS, computePaperGateMetrics, promotionStrategyClass } from '@trading-app/shared';
 import type { BacktestResult, OptimizationVerdict } from '@trading-app/backtest';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'promotion-store' });
 
@@ -27,10 +27,8 @@ const log = logger.child({ module: 'promotion-store' });
 // from the live paper ledger on every read so the gate can't be gamed by
 // persisting stale numbers.
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'promotion-gate.json');
 }
 

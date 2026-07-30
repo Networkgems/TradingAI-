@@ -36,7 +36,6 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type {
   Candle,
   MarketRegimeLabel,
@@ -64,6 +63,7 @@ import {
   loadLatestSentimentSnapshot,
 } from './market-review-enrichment.js';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'market-review' });
 
@@ -140,10 +140,8 @@ const MAX_REVIEWS = 60;
 
 // ── Store file ───────────────────────────────────────────────────────────────
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'market-review.json');
 }
 

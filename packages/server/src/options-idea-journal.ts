@@ -1,12 +1,12 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import type { DefinedRiskStrategy } from '@trading-app/agents';
 import { logger } from './observability/index.js';
 import { etDateKey } from './options-chain-recorder.js';
 import { costEfficiencyRatio } from './options-cost-model.js';
 import type { OptionsIdeaView, IdeaLeg } from './options-ideas-feed.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-601 (TRA-595 C6) — the forward-test idea journal.
 //
@@ -31,10 +31,8 @@ import type { OptionsIdeaView, IdeaLeg } from './options-ideas-feed.js';
 
 const log = logger.child({ module: 'options-idea-journal' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'options-idea-journal.json');
 }
 

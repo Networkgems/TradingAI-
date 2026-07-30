@@ -16,13 +16,12 @@
 // never read or clobber the board's credential.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 const log = logger.child({ module: 'anthropic-cred-store' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR ?? join(__dirname, '..', 'data');
+const DATA_DIR = resolveDataDir();
 
 /** Per-user persisted store: `DATA_DIR/users/<username>/anthropic-cred.json`. */
 function credFile(username: string): string {

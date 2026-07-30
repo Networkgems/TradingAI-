@@ -1,7 +1,6 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
 import {
   EconomicCalendarClient,
   eventsNearDate as eventsNearDatePure,
@@ -12,6 +11,7 @@ import {
   type MacroEventType,
 } from '@trading-app/engine';
 import { logger } from './observability/index.js';
+import { resolveDataDir } from './data-dir.js';
 
 // TRA-597 (TRA-595 C2) — file-backed macro / Fed economic-event calendar.
 //
@@ -29,10 +29,8 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'macro-store' });
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
 function defaultStoreFile(): string {
-  const root = process.env['DATA_DIR'] ?? join(__dirname, '..', 'data');
+  const root = resolveDataDir();
   return join(root, 'economic-calendar.json');
 }
 
