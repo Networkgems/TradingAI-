@@ -52,10 +52,31 @@
  * A PASS" failure this endpoint produced when `admin 2026-07-29` wrote a null
  * EOD row and scored `drift 0` (TRA-2637).
  *
+ * THE LAG AXIS CANNOT GRADE THE MONEY ON ITS OWN (TRA-2635)
+ * ---------------------------------------------------------
+ * CEO's TRA-2635 retracts the part of the TRA-2633 grade that closed TRA-2629 on
+ * lag evidence alone. The lag signature is a MIS-BUCKET detector: it fires when a
+ * credit lands in the wrong leg. It reads perfectly CLEAN when the credit never
+ * landed AT ALL, because there is no mis-bucket without a credit. On the live
+ * `admin` book that is exactly the state: 0 lag rows while its options leg had
+ * earned +$987.60. Two mutually exclusive readings fit those rows equally well —
+ *
+ *   1. the credit path IS writing to `PaperAccount` and `stockDaily` correctly
+ *      excludes it (admin genuinely clean), or
+ *   2. the credit path has NEVER FIRED on the live book, so its equity has never
+ *      received a cent of that +987.60 (admin is the BROKEN one).
+ *
+ * No delta on the row separates those. `stockDaily` / `optionsDaily` /
+ * `priorOptionsLagDates` are identical under both. So this script now grades a
+ * SECOND, independent axis off durable STATE (`closingEquity`,
+ * `optionsCreditedCumulative`), and a CLEAN lag verdict no longer licenses a pass
+ * on its own.
+ *
  * EXIT CODES
  * ----------
- *   0  CLEAN     — no book shows the lag; per-leg verdicts reported for info.
- *                  Requires at least one `mode: live` book to have been graded.
+ *   0  CLEAN     — no book shows the lag AND the live book's equity is confirmed
+ *                  to have absorbed realized option P&L. Requires at least one
+ *                  `mode: live` book to have been graded on BOTH axes.
  *   1  LIVE LAG  — a `mode: live` book shows it. ESCALATE. Stop netting the
  *                  credit path and re-open the TRA-2323 rollback question.
  *   2  DEMO LAG  — demo books only, live cohort NON-EMPTY and clean. Real,
@@ -63,7 +84,14 @@
  *   3  BLIND     — could not grade. Never conflated with a pass. Includes the
  *                  EMPTY LIVE COHORT case: with 0 `mode: live` books the
  *                  real-money tripwire looked at nothing, so "0 live books
- *                  affected" is an absence, not a clean bill of health.
+ *                  affected" is an absence, not a clean bill of health. Also
+ *                  covers a build that serves no `optionsCreditedCumulative`
+ *                  (predates TRA-2635) and a live book that realized no option
+ *                  P&L to absorb.
+ *   4  LIVE CREDIT UNSHIPPED — a `mode: live` book realized option P&L and its
+ *                  equity absorbed NONE of it. ESCALATE: TRA-2323 scope item 1
+ *                  is unshipped on real capital, and every sizing decision on
+ *                  that book is being made off an understated NAV.
  *
  * USAGE
  * -----
@@ -83,6 +111,8 @@ const EXIT_CLEAN = 0;
 const EXIT_LIVE_LAG = 1;
 const EXIT_DEMO_LAG = 2;
 const EXIT_BLIND = 3;
+/** TRA-2635 — a live book realized option P&L and equity absorbed none of it. */
+const EXIT_LIVE_CREDIT_UNSHIPPED = 4;
 
 /**
  * THE PREDICATE. Returns the lag dates for one book's day list.
@@ -148,6 +178,85 @@ export function gradePayload(payload) {
           ? 'DEMO_LAG'
           : 'CLEAN';
   return { verdict, live, demo, engineCount: engines.length, liveBookCount };
+}
+
+/**
+ * TRA-2635 — THE SECOND AXIS: did realized option P&L actually reach the live
+ * book's EQUITY? Pure, so `--selftest` and `--file=` can drive it.
+ *
+ * Graded off durable STATE, not a delta. `optionsCreditedCumulative` is
+ * `PaperAccount.getOptionsCredited()` as the 21:00 ET writer saw it, and the
+ * ONLY reading that answers the question is whether it ever moved off zero on a
+ * session where option P&L was realized.
+ *
+ * THREE separate NOT-MEASURED states, all of which a boolean would render green:
+ *
+ *   NO_LIVE_BOOK  — the cohort is empty (bqb1 serves this intermittently on a
+ *                   boot-arm miss; see the LIVE_UNMEASURABLE note above).
+ *   FIELD_ABSENT  — the build predates TRA-2635 and serves no such field.
+ *                   Counting `undefined` as "0 credited" would ACCUSE a working
+ *                   bridge; counting it as "graded" would clear a broken one.
+ *   UNMEASURABLE  — the live book realized no option P&L, so there was nothing
+ *                   for equity to absorb and nothing to conclude.
+ *
+ * The gradeable cohort is derived from the TRIGGER (`optionsDaily` non-zero AND
+ * the counter written), never from the fleet: a book that never traded an option
+ * cannot verify the bridge, and 7 of the 13 lag books on 2026-07-29 had a zero
+ * prior and could never have verified the fix no matter what shipped.
+ */
+export function gradeCreditObservation(payload) {
+  const engines = Array.isArray(payload?.engines) ? payload.engines : [];
+  const liveEngines = engines.filter((e) => e?.mode === 'live');
+  let fieldPresentRows = 0;
+  const books = liveEngines.map((e) => {
+    const days = [...(e?.days ?? [])].sort((a, b) =>
+      String(a?.date).localeCompare(String(b?.date)),
+    );
+    const written = days.filter(
+      (d) =>
+        d?.optionsCreditedCumulative !== undefined
+        && d?.optionsCreditedCumulative !== null
+        && Number.isFinite(Number(d.optionsCreditedCumulative)),
+    );
+    fieldPresentRows += written.length;
+    // Baseline-gated exactly like the endpoint: the bridge did not exist before
+    // the baseline, so a pre-fix row carrying no credit is correct behaviour.
+    const gradeable = written.filter(
+      (d) => !d?.belowBaseline && Math.abs(Number(d?.optionsDaily)) > TOLERANCE_USD,
+    );
+    const absorbed =
+      gradeable.length === 0
+        ? null
+        : gradeable.some((d) => Number(d.optionsCreditedCumulative) !== 0);
+    const realized = days
+      .filter((d) => !d?.belowBaseline && Number.isFinite(Number(d?.optionsDaily)))
+      .reduce((sum, d) => sum + Number(d.optionsDaily), 0);
+    const latest = written.length > 0 ? written[written.length - 1] : null;
+    const equityRows = days.filter((d) => Number.isFinite(Number(d?.closingEquity)));
+    const latestEquity = equityRows.length > 0 ? equityRows[equityRows.length - 1] : null;
+    return {
+      username: e.username ?? '(unnamed)',
+      absorbed,
+      measuredSessions: gradeable.length,
+      writtenSessions: written.length,
+      optionsRealizedUsd: Math.round(realized * 100) / 100,
+      creditedLatest: latest == null ? null : Number(latest.optionsCreditedCumulative),
+      creditedLatestDate: latest?.date ?? null,
+      closingEquityLatest: latestEquity == null ? null : Number(latestEquity.closingEquity),
+      closingEquityLatestDate: latestEquity?.date ?? null,
+    };
+  });
+  const verdict =
+    liveEngines.length === 0
+      ? 'NO_LIVE_BOOK'
+      : fieldPresentRows === 0
+        ? 'FIELD_ABSENT'
+        : books.some((b) => b.absorbed === false)
+          ? 'LIVE_CREDIT_UNSHIPPED'
+          : books.some((b) => b.absorbed === true)
+            ? 'CREDIT_OK'
+            : 'UNMEASURABLE';
+  return { verdict, liveBookCount: liveEngines.length, fieldPresentRows, books };
 }
 
 /**
@@ -287,10 +396,68 @@ async function main(argv) {
   }
   console.log(`  NOT gradeable, shown for continuity: ok=${payload.ok} maxDriftUsd=${payload.maxDriftUsd}`);
   console.log('');
+
+  // TRA-2635 — the credit axis, printed BEFORE the lag axis because it is the
+  // more fundamental question: the lag detector cannot fire at all on a book the
+  // credit path never reached, so a clean lag verdict means nothing until this
+  // one is graded.
+  const credit = gradeCreditObservation(payload);
+  console.log('TRA-2635 — did realized option P&L reach the LIVE book\'s equity? (durable STATE):');
+  for (const b of credit.books) {
+    const label =
+      b.absorbed === true ? 'ABSORBED' : b.absorbed === false ? 'ABSORBED NOTHING' : 'NOT MEASURED';
+    console.log(
+      `  LIVE  ${b.username}: ${label} — ${b.measuredSessions} gradeable session(s), `
+      + `post-baseline options P&L $${b.optionsRealizedUsd.toFixed(2)}`,
+    );
+    console.log(
+      `        optionsCreditedCumulative ${b.creditedLatest === null ? 'ABSENT' : `$${b.creditedLatest.toFixed(2)}`}`
+      + `${b.creditedLatestDate ? ` @ ${b.creditedLatestDate}` : ''}`
+      + `  |  closingEquity ${b.closingEquityLatest === null ? 'ABSENT' : `$${b.closingEquityLatest.toFixed(2)}`}`
+      + `${b.closingEquityLatestDate ? ` @ ${b.closingEquityLatestDate}` : ''}`,
+    );
+  }
+  if (credit.verdict === 'NO_LIVE_BOOK') {
+    console.log(`  NOT MEASURED — 0 of ${g.engineCount} books resolved \`mode: live\`.`);
+  } else if (credit.verdict === 'FIELD_ABSENT') {
+    console.log('  NOT MEASURED — this build serves no `optionsCreditedCumulative`, i.e. it');
+    console.log('    predates TRA-2635. Reading `undefined` as "0 credited" would ACCUSE a');
+    console.log('    working bridge; reading it as graded would CLEAR a broken one. Deploy first.');
+  } else if (credit.verdict === 'UNMEASURABLE') {
+    console.log('  NOT MEASURED — the live book realized no post-baseline option P&L, so there');
+    console.log('    was nothing for equity to absorb. Not a pass and not a defect.');
+  }
+  // The endpoint computes its own fold; a disagreement means one side is stale.
+  if (
+    payload?.liveEquityAbsorbedOptionsOk !== undefined
+    && credit.verdict !== 'FIELD_ABSENT'
+  ) {
+    const mine =
+      credit.verdict === 'LIVE_CREDIT_UNSHIPPED'
+        ? false
+        : credit.verdict === 'CREDIT_OK'
+          ? true
+          : null;
+    if (payload.liveEquityAbsorbedOptionsOk !== mine) {
+      console.log(
+        `  WARNING: endpoint liveEquityAbsorbedOptionsOk=${JSON.stringify(payload.liveEquityAbsorbedOptionsOk)}`
+        + ` but this guard computed ${JSON.stringify(mine)} from the same rows.`,
+      );
+      console.log('    Guard and endpoint disagree — treat BOTH as unread.');
+    }
+  }
+  console.log('');
   console.log('TRA-2630 AC3 — T+1 options-credit lag (stockDaily == prior session optionsDaily):');
 
   if (g.verdict === 'CLEAN') {
     console.log(`  CLEAN — 0 books show the lag, on either mode (${g.liveBookCount} live book(s) graded).`);
+    // TRA-2635 — and a clean lag verdict is NOT sufficient on its own. This early
+    // `return EXIT_CLEAN` is the exact shape CEO retracted: it passes the fleet on
+    // an axis that cannot fire on a book the credit path never reached.
+    if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
+    if (credit.verdict !== 'CREDIT_OK') return reportCreditBlind(credit);
+    console.log('');
+    console.log(`CLEAN — both axes graded on ${credit.liveBookCount} live book(s).`);
     return EXIT_CLEAN;
   }
 
@@ -332,12 +499,54 @@ async function main(argv) {
     console.error('     and is not (TRA-713 / TRA-1652). Re-arm, then re-run this check.');
     return EXIT_BLIND;
   }
+  // TRA-2635 — a live credit failure outranks demo lag: it is real money, and the
+  // "$0 live capital at risk" sentence below is FALSE while it is true.
+  if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
   console.error(
     `DEMO LAG — ${g.demo.length} demo book(s), ${lagRows} lag session(s). ${g.liveBookCount} live book(s) graded, 0 affected.`,
   );
   console.error('Real, but $0 live trading capital at risk. TRA-2630 Defect B / TRA-2629.');
   console.error('Note: ctoverify_* / qa_* are clone fixtures, so book COUNT overstates breadth.');
+  // The demo-only severity verdict rests on the live book being CLEAN, and the lag
+  // axis alone cannot establish that (TRA-2635). Say so rather than implying it.
+  if (credit.verdict !== 'CREDIT_OK') {
+    console.error('');
+    console.error('CAVEAT: the credit axis above is NOT MEASURED, so "0 live books affected" is');
+    console.error('carried by the lag axis alone — which reads clean on a book the credit path');
+    console.error('never reached. The demo-only severity verdict is NOT confirmed by this run.');
+  }
   return EXIT_DEMO_LAG;
+}
+
+/** TRA-2635 — the real-money escalation, in one place so both call sites agree. */
+function reportCreditUnshipped(credit) {
+  const bad = credit.books.filter((b) => b.absorbed === false);
+  console.error('');
+  console.error(
+    `LIVE CREDIT UNSHIPPED — ${bad.length} mode:live book(s) realized option P&L and`,
+  );
+  console.error('absorbed NONE of it into equity. ESCALATE.');
+  for (const b of bad) {
+    console.error(
+      `  ${b.username}: $${b.optionsRealizedUsd.toFixed(2)} realized over `
+      + `${b.measuredSessions} gradeable session(s), optionsCreditedCumulative still `
+      + `$${(b.creditedLatest ?? 0).toFixed(2)}.`,
+    );
+  }
+  console.error('TRA-2323 scope item 1 is UNSHIPPED on real capital. The book value every');
+  console.error('sizing decision reads is understated by the whole realized options leg, and');
+  console.error('a "clean" lag verdict is exactly what that state looks like (TRA-2635).');
+  return EXIT_LIVE_CREDIT_UNSHIPPED;
+}
+
+/** TRA-2635 — the credit axis graded nothing; a clean lag verdict cannot cover for it. */
+function reportCreditBlind(credit) {
+  console.error('');
+  console.error(`BLIND — the lag axis is clean but the CREDIT axis graded NOTHING (${credit.verdict}).`);
+  console.error('These are different questions: the lag detector fires when a credit lands in');
+  console.error('the wrong leg, and cannot fire at all when no credit ever landed. Passing on');
+  console.error('the lag axis alone is the grade CEO retracted in TRA-2635.');
+  return EXIT_BLIND;
 }
 
 /**
@@ -593,6 +802,110 @@ function selftest() {
       ] }],
     }).verdict,
     'CLEAN',
+  );
+
+  // ── TRA-2635 — the CREDIT axis. Both directions, plus all three NOT-MEASURED
+  // states, because each of them would have been rendered green by a boolean.
+  const liveDay = (date, optionsDaily, optionsCreditedCumulative, extra = {}) => ({
+    date, stockDaily: 0, optionsDaily, closingEquity: 2_000, ...extra,
+    ...(optionsCreditedCumulative === undefined ? {} : { optionsCreditedCumulative }),
+  });
+
+  check(
+    'CREDIT: a live book whose counter never moved off zero is LIVE_CREDIT_UNSHIPPED',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-28', 450, 0),
+        liveDay('2026-07-29', 537.6, 0),
+      ] }],
+    }).verdict,
+    'LIVE_CREDIT_UNSHIPPED',
+  );
+
+  // POSITIVE CONTROL for the SAME rows — only the counter differs. Without this
+  // pair the verdict could be hardwired red and nothing would notice.
+  check(
+    'CREDIT: the SAME sessions with a moving counter grade CREDIT_OK',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-28', 450, 450),
+        liveDay('2026-07-29', 537.6, 987.6),
+      ] }],
+    }).verdict,
+    'CREDIT_OK',
+  );
+
+  check(
+    'CREDIT: an EMPTY live cohort is NO_LIVE_BOOK, never CREDIT_OK',
+    gradeCreditObservation({
+      engines: [{ username: 'Richard', mode: 'demo', days: [liveDay('2026-07-28', 450, 0)] }],
+    }).verdict,
+    'NO_LIVE_BOOK',
+  );
+
+  check(
+    'CREDIT: a build serving no counter is FIELD_ABSENT, never CREDIT_OK',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-28', 450, undefined),
+        liveDay('2026-07-29', 537.6, undefined),
+      ] }],
+    }).verdict,
+    'FIELD_ABSENT',
+  );
+
+  check(
+    'CREDIT: a live book that realized no option P&L is UNMEASURABLE, never CREDIT_OK',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-28', 0, 0),
+        liveDay('2026-07-29', 0, 0),
+      ] }],
+    }).verdict,
+    'UNMEASURABLE',
+  );
+
+  check(
+    'CREDIT: pre-baseline sessions do not grade the bridge (it did not exist)',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'live', days: [
+        liveDay('2026-07-01', 450, 0, { belowBaseline: true }),
+      ] }],
+    }).verdict,
+    'UNMEASURABLE',
+  );
+
+  check(
+    'CREDIT: a sandbox-armed book does NOT satisfy the live cohort',
+    gradeCreditObservation({
+      engines: [{ username: 'admin', mode: 'sandbox', days: [liveDay('2026-07-28', 450, 0)] }],
+    }).verdict,
+    'NO_LIVE_BOOK',
+  );
+
+  // THE WHOLE POINT — identical delta rows, identical lag verdict, opposite
+  // credit verdict. This is the pair the retracted grade could not tell apart.
+  check(
+    'THE DISCRIMINATOR: same lag verdict (CLEAN) on both, opposite credit verdict',
+    (() => {
+      const days = (cum1, cum2) => [
+        liveDay('2026-07-28', 450, cum1),
+        liveDay('2026-07-29', 537.6, cum2),
+      ];
+      const mk = (c1, c2) => ({ engines: [{ username: 'admin', mode: 'live', days: days(c1, c2) }] });
+      return {
+        lagCredited: gradePayload(mk(450, 987.6)).verdict,
+        lagUncredited: gradePayload(mk(0, 0)).verdict,
+        creditCredited: gradeCreditObservation(mk(450, 987.6)).verdict,
+        creditUncredited: gradeCreditObservation(mk(0, 0)).verdict,
+      };
+    })(),
+    {
+      lagCredited: 'CLEAN',
+      lagUncredited: 'CLEAN',
+      creditCredited: 'CREDIT_OK',
+      creditUncredited: 'LIVE_CREDIT_UNSHIPPED',
+    },
   );
 
   let failed = 0;
