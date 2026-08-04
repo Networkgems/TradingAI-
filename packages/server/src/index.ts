@@ -206,6 +206,7 @@ import {
   backfillLiveOptionFees,
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
+import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -3246,6 +3247,24 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     log.info('live-options fee/slippage ledger hydrated (TRA-1929)', { records: h.records });
   }
 }
+
+// TRA-2810 — the fee back-fill pass resolves the live operator's PRODUCTION options
+// client exactly like the TRA-1954 admin reconcile route. Null when no production
+// creds resolve (the pass records 'no-client' and stays quiet).
+async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | null> {
+  const operator = resolveLiveBrokerOperator();
+  const settings = await loadSettings(operator);
+  return buildTradierOptionsClientForEnv(settings, 'production');
+}
+
+// TRA-2810 — kick ONE fee reconcile shortly after boot (the hourly tick also runs it).
+// Two real-money windows ended feesMeasured 0/n because the join only existed behind
+// an admin POST nobody can auth against on bqb1; this makes the back-fill self-driving.
+// 90s so boot IO settles first; .unref() so the timer can never hold the process open;
+// the pass itself never throws and makes no broker call when nothing is unmeasured.
+setTimeout(() => {
+  void runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
+}, 90_000).unref();
 
 // TRA-2048 (parent TRA-2044) — rebuild the durable LIVE gate-enforcement ledger
 // (cost-bar + spread veto promoted from shadow to enforcing) and remember DATA_DIR
@@ -12230,6 +12249,10 @@ scheduler.start({
     // TRA-1271 — observe-only crypto ignition scan (flag-gated ⇒ zero cost/IO when
     // off). Read-only, ZERO capital: would-be forward records + fill instrument only.
     await runHourlyCryptoIgnition();
+    // TRA-2810 — join Tradier account-history commission onto any live fee/slippage
+    // ledger row still fees:null. Self-quenching (zero IO once nothing is unmeasured)
+    // and internally best-effort — it cannot throw into this tick.
+    await runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes

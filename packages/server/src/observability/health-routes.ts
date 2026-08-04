@@ -59,6 +59,7 @@ import {
   OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
+import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeRvScanPath, RV_SCAN_PATH_STRUCTURE_LABEL } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
@@ -3098,9 +3099,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       durability: summary.durability,
       lastRecordAt: summary.lastRecordAt,
       records: summary.records,
+      // TRA-2810 — provenance of the AUTOMATIC fee back-fill (boot kick + hourly
+      // tick). `ticks: 0` ⇒ the pass never ran on this boot — the one state the
+      // TRA-1954 admin-POST era could not distinguish from healthy-quiescent.
+      autoReconcile: getLiveOptionsFeeReconcileState(),
       note: summary.durability.ephemeral
         ? `NOT DURABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}); these ${summary.n} fill(s) die at the next reboot and the calibration is not captured. Fix = DATA_DIR=/data on bqb1 (TRA-1719). Read durability.ephemeral before trusting any count.`
-        : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees back-fill is a TRA-1929 follow-up (${summary.feesMeasured}/${summary.n} measured) — the fill-time order payload carries no commission; slippage-vs-ask/mid IS captured on every measured leg.`,
+        : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees auto-back-fill from Tradier account-history rides the boot kick + ET hourly tick (TRA-2810; ${summary.feesMeasured}/${summary.n} measured — see autoReconcile) — the fill-time order payload carries no commission; slippage-vs-ask/mid IS captured on every measured leg.`,
     });
   });
 
