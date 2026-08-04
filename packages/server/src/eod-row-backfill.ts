@@ -72,6 +72,25 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/**
+ * Env flag that ARMS the writer. Default OFF, and deliberately so.
+ *
+ * The CFO ruling makes the back-fill conditional on a measurement that can only
+ * be taken after the next 21:00 ET archive: if the live book's stale-session
+ * count GREW across that archive, the EOD write path is still broken and
+ * back-filling would paper over a live defect while reading as a repair. There
+ * is no way to evaluate that condition from inside the process at boot, so the
+ * decision is a human one and the flag is where it is recorded.
+ *
+ * The plan is computed and published regardless — the measurement must be
+ * readable off prod before anyone can decide whether to set this.
+ */
+export const EOD_ROW_BACKFILL_FLAG = 'ENABLE_EOD_ROW_BACKFILL';
+
+export function isEodRowBackfillArmed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[EOD_ROW_BACKFILL_FLAG] === 'true';
+}
+
 /** One session the writer declined to reconstruct, and why. */
 export interface EodBackfillSkip {
   date: string;

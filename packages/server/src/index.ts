@@ -43,6 +43,12 @@ import {
   type OptionsDailyPnlDecision,
   type PatchableEodReport,
 } from './options-daily-pnl-source.js';
+// TRA-2829 — the EOD row back-fill: planner (always), writer (flag-gated).
+import {
+  planLiveEodRowBackfill,
+  isEodRowBackfillArmed,
+  EOD_BACKFILL_ROW_SOURCE,
+} from './eod-row-backfill.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells } from './reports/desk-calendar.js';
 // TRA-2407 — default-deny scope for the TRA-1572 firm-wide demo fold.
@@ -1840,6 +1846,114 @@ async function generateAndSaveReport(
  * fresh 0.00 report) leave 7 rows split at up to $82.50 of drift with no path
  * back — the plan was empty forever, so nothing ever revisited the files.
  */
+/**
+ * TRA-2817/TRA-2829 — the exchange calendar the EOD tail axis grades against,
+ * and that the back-fill writer scopes against.
+ *
+ * ONE construction, deliberately. The health route and the writer must agree
+ * about what has settled, or the writer reconstructs a session set the grader
+ * never graded (or skips one it did) while both read correct. That is the same
+ * failure this ticket's `staleTailSessions` sharing exists to prevent, one level
+ * up.
+ *
+ * `lastSettledSession` is the newest session whose 21:00 ET archive is already
+ * PAST, NOT simply the last market day. Today only counts once its own archive
+ * has run — otherwise every read between the 16:00 bell and 21:00 ET would
+ * accuse a healthy ledger of missing today, and an axis that is red every
+ * weekday afternoon is one nobody believes on the afternoon it is right. Same
+ * `etHour() >= 21` boundary the archive tick itself fires on, so the two cannot
+ * disagree.
+ */
+function currentEodTailCalendar(): { lastSettledSession: string | null; isMarketDay: (d: string) => boolean } {
+  const todayEt = etDateString(new Date());
+  return {
+    lastSettledSession:
+      isMarketDayIso(todayEt) && etHour() >= 21 ? todayEt : previousMarketDayIso(todayEt),
+    isMarketDay: isMarketDayIso,
+  };
+}
+
+/**
+ * TRA-2829 (parent TRA-2827) — write the EOD ledger rows the 21:00 ET archive
+ * never produced for the LIVE book, from the durable option-trade journal.
+ *
+ * **Disarmed by default.** Runs only when `ENABLE_EOD_ROW_BACKFILL=true`. The
+ * plan is computed and published on /api/health/pnl-reconciliation either way,
+ * because the CFO ruling requires the reach of the broker equity series be
+ * reported before anything is written — and because if the stale-session count
+ * GREW across the archive that gates this, the write path is still broken and
+ * back-filling would paper over a live defect while reading as a repair.
+ *
+ * Idempotent, and it has to be: bqb1 restarts several times an hour. After the
+ * first pass the rows exist, so `staleTailSessions` returns `[]`, the plan is
+ * empty and this writes and logs nothing.
+ */
+async function runEodRowBackfill(): Promise<void> {
+  if (!isEodRowBackfillArmed()) return;
+  if (!isOptionTradeJournalEnabled()) return;
+  const rows = await listOptionTradeJournal();
+  const calendar = currentEodTailCalendar();
+  for (const ctx of getAllUserContexts()) {
+    try {
+      // Live books only — this reconstructs against `tradier-eod-balance.*`, and
+      // the hole it exists for is the live options record. `loadSettings`, not
+      // `getSettings`: the latter serves a demo default on a cache miss, which
+      // silently reclassified the live book once already (TRA-2761).
+      if (stockModeKey(await loadSettings(ctx.username)) !== 'live') continue;
+      const census = foldJournalClosesByEtDay(
+        journalRowsForBook(rows, ctx.username, accountDeletedAt(ctx.username)),
+        (ts: number) => etDateString(new Date(ts)),
+      );
+      // An EMPTY census on a LIVE book is not a quiet book, it is a scoping
+      // failure — the live program's whole record lives in this journal. Writing
+      // through it would book 0.00 options on every reconstructed session, i.e.
+      // carve the TRA-2314 false zero into rows that then read as
+      // journal-sourced. Refuse and say so; the plan stays published either way.
+      if (census.size === 0) {
+        log.warn('TRA-2829 EOD row back-fill skipped: live book has an EMPTY journal census', {
+          username: ctx.username,
+        });
+        continue;
+      }
+      const plan = planLiveEodRowBackfill({
+        snapshots: ctx.tracker.getSnapshots(),
+        censusByDate: census,
+        balanceByDate: await loadTradierBalanceSnapshots(ctx, 'production'),
+        calendar,
+      });
+      if (plan.notMeasuredReason !== null) {
+        log.warn('TRA-2829 EOD row back-fill NOT MEASURED', {
+          username: ctx.username,
+          reason: plan.notMeasuredReason,
+        });
+        continue;
+      }
+      const written = ctx.tracker.applyEodRowBackfill(plan.rows);
+      if (written.length === 0) continue;
+      // Logged at warn: a board-facing ledger gained rows, and an unannounced
+      // correction reads to a grader as a new defect (TRA-2079). Every figure
+      // needed to audit the write is here, including what could NOT be measured.
+      log.warn('TRA-2829 back-filled absent EOD ledger rows from the durable journal', {
+        username: ctx.username,
+        rowSource: EOD_BACKFILL_ROW_SOURCE,
+        written,
+        anchorRowDate: plan.anchorRowDate,
+        settledSession: plan.settledSession,
+        optionsBackfilledUsd: plan.optionsBackfilledUsd,
+        unmeasuredEquityRowCount: plan.unmeasuredEquityRowCount,
+        stockLegProbeDisagreeCount: plan.stockLegProbeDisagreeCount,
+        balanceWindow: plan.balanceWindow,
+        skipped: plan.skipped,
+      });
+    } catch (err) {
+      log.warn('TRA-2829 EOD row back-fill failed', {
+        username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
 async function runOptionsDailyPnlRepair(): Promise<void> {
   if (!isOptionTradeJournalEnabled()) return;
   const rows = await listOptionTradeJournal();
@@ -4162,14 +4276,7 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
     // axis that is red every weekday afternoon is one nobody believes on the
     // afternoon it is right. The same `etHour() >= 21` boundary the archive tick
     // itself fires on, so the two cannot disagree about what has settled.
-    const tailTodayEt = etDateString(new Date());
-    const tailCalendar = {
-      lastSettledSession:
-        isMarketDayIso(tailTodayEt) && etHour() >= 21
-          ? tailTodayEt
-          : previousMarketDayIso(tailTodayEt),
-      isMarketDay: isMarketDayIso,
-    };
+    const tailCalendar = currentEodTailCalendar();
     const engines = await Promise.all(
       getAllUserContexts().map(async ctx => {
         // TRA-2761 — classify off `loadSettings`, NOT `getSettings`. `getSettings`
@@ -4237,9 +4344,36 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         const openLiveRows = bookRows == null
           ? null
           : bookRows.filter(r => r.mode === 'live' && typeof r.closeTs !== 'number');
+        // TRA-2829 — the EOD back-fill plan for this book, computed READ-ONLY.
+        //
+        // Published rather than acted on. The CFO ruling on TRA-2827 requires the
+        // reach of the broker equity series be reported BEFORE anything is
+        // written, because that measurement is what decides whether a session's
+        // `closingEquity` can be a number at all or must be an honest `null`.
+        // Publishing it here makes it readable off prod without writing a byte,
+        // and it stays published afterwards as the writer's own audit surface.
+        //
+        // Live books only: this reconstructs from `tradier-eod-balance.*`, which
+        // demo books do not have, and the hole this exists for is the live
+        // options record.
+        //
+        // A NULL census disqualifies the plan entirely. Without a journal to
+        // ask, every absent session would plan an options leg of exactly 0.00 —
+        // which is not "no trades", it is the false zero TRA-2314 exists to
+        // fix, and back-filling it would carve the defect into rows that then
+        // read as reconstructed-from-the-journal. No census, no plan.
+        const eodBackfillPlan = mode === 'live' && journalByDate != null
+          ? planLiveEodRowBackfill({
+            snapshots,
+            censusByDate: journalByDate,
+            balanceByDate: await loadTradierBalanceSnapshots(ctx, 'production'),
+            calendar: tailCalendar,
+          })
+          : null;
         return {
           username: ctx.username,
           mode,
+          eodBackfillPlan,
           openLiveJournalRowCount: openLiveRows == null ? null : openLiveRows.length,
           openLiveJournalAtRiskUsd: openLiveRows == null
             ? null
@@ -4433,6 +4567,49 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         return measured.length === 0 ? null : Math.max(...measured);
       })(),
       ...summarizeLiveEodRowPresence(engines),
+      // TRA-2829 — the back-fill's PLAN, per live book, read-only.
+      //
+      // Sits beside the tail axis deliberately: `liveEodTailStaleBooks` says a
+      // book is N sessions behind, and this says what a reconstruction of those
+      // exact N sessions would contain and how much of it can be measured at all.
+      // The two are guaranteed to describe the same session set — both derive it
+      // from `staleTailSessions`, which is why that enumeration is shared rather
+      // than reimplemented here.
+      //
+      // `balanceWindow` is the deliverable the ruling asked for before any write:
+      // how far the broker equity series actually reaches. `absentSessionsUncovered`
+      // is the count of rows that would carry `closingEquity: null`.
+      liveEodBackfillPlans: engines
+        .filter(e => e.eodBackfillPlan != null)
+        .map(e => ({
+          username: e.username,
+          anchorRowDate: e.eodBackfillPlan!.anchorRowDate,
+          settledSession: e.eodBackfillPlan!.settledSession,
+          absentSessions: e.eodBackfillPlan!.absentSessions,
+          balanceWindow: e.eodBackfillPlan!.balanceWindow,
+          optionsBackfilledUsd: e.eodBackfillPlan!.optionsBackfilledUsd,
+          unmeasuredEquityRowCount: e.eodBackfillPlan!.unmeasuredEquityRowCount,
+          stockLegProbeDisagreeCount: e.eodBackfillPlan!.stockLegProbeDisagreeCount,
+          notMeasuredReason: e.eodBackfillPlan!.notMeasuredReason,
+          // The rows themselves, so the plan is auditable before it is armed
+          // rather than only after it has written.
+          rows: e.eodBackfillPlan!.rows.map(r => ({
+            date: r.date,
+            openingEquity: r.openingEquity,
+            closingEquity: r.closingEquity,
+            closingEquityBasis: r.closingEquityBasis,
+            optionsDailyPnl: r.optionsDailyPnl,
+            optionsDailyJournalCloses: r.optionsDailyJournalCloses,
+            dailyPnl: r.dailyPnl,
+            stockLegBasis: r.stockLegBasis,
+            stockLegProbeUsd: r.stockLegProbeUsd,
+            rowSource: r.rowSource,
+          })),
+        })),
+      // Is the writer allowed to act on the plans above? Published so a reader
+      // can never mistake "planned" for "written" — the state this ticket sat in
+      // between the measurement and the CFO's go-ahead.
+      liveEodBackfillArmed: isEodRowBackfillArmed(),
       // TRA-2761 — cohort-membership integrity. Every `live*` fold above filters
       // on the read-time classifier; this one cross-checks that classifier
       // against the journal's durable open `mode:'live'` rows, so a cohort that
@@ -11989,6 +12166,16 @@ void catchUpMissedEodReports().catch(err =>
 // safe to run on every boot; after the first pass it writes nothing.
 void runOptionsDailyPnlRepair().catch(err =>
   log.warn('TRA-2314 optionsDailyPnl repair (startup) failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
+// TRA-2829 — on startup, INSERT the EOD ledger rows the 21:00 ET archive never
+// wrote for the live book (TRA-2817's inode outage). Disarmed by default; the
+// plan is published on /api/health/pnl-reconciliation either way. Runs AFTER the
+// false-zero repair above so it never races that pass over the same file.
+void runEodRowBackfill().catch(err =>
+  log.warn('TRA-2829 EOD row back-fill (startup) failed', {
     reason: err instanceof Error ? err.message : String(err),
   }),
 );
