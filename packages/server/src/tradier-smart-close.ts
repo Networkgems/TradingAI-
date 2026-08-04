@@ -392,6 +392,38 @@ export function derivePricingPath(quote: TradierOptionQuote | null): MidPath | L
 }
 
 /**
+ * TRA-2811 — maximum discount vs the quote midpoint a live `sell_to_close`
+ * limit is allowed to carry. On 2026-08-03 an SL exit priced "on the bid" met
+ * a pathologically wide book (`bid 0.17 / ask 2.49`, mid 1.33) and submitted a
+ * $0.17 limit — ~87% below mid, effectively a market order with no floor — on
+ * the production account (filled $0.89, −33% vs mid, ≈$44 donated on one
+ * contract). The bid is only a sane price when the book is sane.
+ *
+ * 0.4 discriminates cleanly on the live tape: the sane same-day exits sat at
+ * 6–14% below mid, the degenerate one at 87%. The floor is deliberately a
+ * backstop against donation, not a cost optimizer — floored SL/trail orders
+ * still want a fill, so the floor must stay near fillable territory. A tighter
+ * floor turns a stop into a resting order that no longer protects.
+ */
+export const MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID = 0.4;
+
+/** TRA-2811 — a floored live sell limit plus the provenance the caller logs. */
+export interface LiveSellLimitResult {
+  /** The per-share limit to submit (already floored + cent-rounded). */
+  limit: number;
+  /** The pre-floor price the level selected (bid / mid / last). */
+  raw: number;
+  /** Quote midpoint the floor was computed against; null on a single-sided book. */
+  mid: number | null;
+  /**
+   * TRUE when `raw` sat below `mid × (1 − MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)`
+   * and the limit was lifted to the floor. The caller must surface this loudly —
+   * it means the live book was too wide to trust the bid.
+   */
+  floored: boolean;
+}
+
+/**
  * TRA-450 — derive a LIVE per-share limit for an engine-staged
  * `sell_to_close` from a fresh Tradier option quote. The engine's staged-exit
  * path previously submitted at the position's entry-time trigger price
@@ -406,23 +438,42 @@ export function derivePricingPath(quote: TradierOptionQuote | null): MidPath | L
  *  - `'mid'` → a TP1 / manual exit should not give away the spread, so
  *    price at the midpoint.
  *
+ * TRA-2811 — the bid level is FLOORED at
+ * `mid × (1 − MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)`: when the book is so wide
+ * that the bid is an implausible price (the defect case was a bid 87% below
+ * mid), the limit rests at the floor instead of donating the spread. The mid
+ * level is ≥ the floor by construction, and single-sided (`last`) quotes have
+ * no mid to floor against, so only degenerate bid-level prices are lifted.
+ *
  * Single-sided quotes (no bid) fall back to `last` for either level — the
  * best live price we have. Returns `null` when the quote yields nothing
  * usable; the caller then falls back to the staged trigger price.
  */
+export function liveSellLimitDetailed(
+  quote: TradierOptionQuote | null,
+  level: 'mid' | 'bid',
+): LiveSellLimitResult | null {
+  const path = derivePricingPath(quote);
+  if (path.kind === 'none') return null;
+  if (path.kind === 'last') {
+    const limit = roundToCent(path.last);
+    if (!Number.isFinite(limit) || limit <= 0) return null;
+    return { limit, raw: limit, mid: null, floored: false };
+  }
+  const mid = (path.bid + path.ask) / 2;
+  const raw = roundToCent(level === 'bid' ? path.bid : mid);
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  const floor = roundToCent(mid * (1 - MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID));
+  const floored = raw < floor;
+  return { limit: floored ? floor : raw, raw, mid: roundToCent(mid), floored };
+}
+
+/** Back-compat shape of {@link liveSellLimitDetailed} — just the (floored) limit. */
 export function liveSellLimit(
   quote: TradierOptionQuote | null,
   level: 'mid' | 'bid',
 ): number | null {
-  const path = derivePricingPath(quote);
-  if (path.kind === 'none') return null;
-  const raw =
-    path.kind === 'mid'
-      ? (level === 'bid' ? path.bid : (path.bid + path.ask) / 2)
-      : path.last;
-  const limit = roundToCent(raw);
-  if (!Number.isFinite(limit) || limit <= 0) return null;
-  return limit;
+  return liveSellLimitDetailed(quote, level)?.limit ?? null;
 }
 
 /**

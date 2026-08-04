@@ -83,7 +83,7 @@ import {
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
 import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts } from './option-exec-flag.js';
-import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
+import { lastRecordedOpenSleeve, recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan } from './rv-scan-telemetry.js';
@@ -256,7 +256,7 @@ import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   PENDING_CLOSE_REPRICE_STALENESS_MS,
-  liveSellLimit,
+  liveSellLimitDetailed,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
   submitSmartSellToClose,
@@ -6599,8 +6599,26 @@ export class SignalEngine {
           const quote = await this.tradierLiveClient.getOptionQuote(snapshot.optionSymbol);
           exitQuoteForLedger = { bid: quote?.bid ?? null, ask: quote?.ask ?? null };
           const level = intent.kind === 'sl' || intent.kind === 'trail' ? 'bid' : 'mid';
-          const live = liveSellLimit(quote, level);
-          if (live !== null) submitLimit = live;
+          const live = liveSellLimitDetailed(quote, level);
+          if (live !== null) {
+            submitLimit = live.limit;
+            // TRA-2811 — the bid was implausibly far below mid (pathologically wide
+            // book) and the limit was lifted to the floor. Surface it loudly: this
+            // is the exact shape that submitted a $0.17 limit against a $1.33 mid
+            // on the production account on 2026-08-03 (order 139775135, −33% vs mid).
+            if (live.floored) {
+              log.warn('sell_to_close limit FLOORED — bid implausible vs mid, refusing to donate the spread', {
+                component: 'live-exit-floor',
+                optionSymbol: snapshot.optionSymbol,
+                kind: intent.kind,
+                bid: quote?.bid ?? null,
+                ask: quote?.ask ?? null,
+                mid: live.mid,
+                rawLimit: live.raw,
+                flooredLimit: live.limit,
+              });
+            }
+          }
         } catch (err: unknown) {
           log.warn('staged-exit quote lookup failed — using staged trigger price', {
             optionSymbol: snapshot.optionSymbol,
@@ -7646,16 +7664,21 @@ export class SignalEngine {
     quote?: { bid?: number | null; ask?: number | null } | null,
   ): void {
     if (!position.optionSymbol) return;
-    // TRA-2245 — a non-OTM single-leg live fill is the DIRECTIONAL sleeve, not the
-    // True RV engine: the RV scan is compile-time OFF (TRA-1207) and its live arm is
-    // separately dark, so every live non-OTM single-leg fill that reaches here is a
-    // directional open (its open-side mirror already tags `single_leg_directional`).
-    // `single_leg_rv` stays reserved for the genuine RV path if it is ever re-armed —
-    // which would require the position to carry its own sleeve provenance, out of scope
-    // while RV is compile-time off. Keeps this ledger's label consistent with the trade
-    // journal (TRA-2245) and with the open side of this same ledger.
+    // TRA-2811 — the close INHERITS its sleeve from the ledger's own open row for
+    // this contract. Re-deriving from `position.signalType` (the pre-2811 behaviour,
+    // kept below as the fallback) broke the open↔close join on 2026-08-03: three
+    // positions opened `single_leg_otm` closed `single_leg_directional` because the
+    // position object at close time no longer carried `otm_mispricing` (a Tradier
+    // re-import after a reboot stamps `tradier_import`). Per-sleeve round-trip cost
+    // attribution needs the two legs to agree, and the open row is the authority.
+    //
+    // TRA-2245 (fallback rationale) — a non-OTM single-leg live fill is the
+    // DIRECTIONAL sleeve, not the True RV engine: the RV scan is compile-time OFF
+    // (TRA-1207) and its live arm is separately dark. `single_leg_rv` stays reserved
+    // for the genuine RV path if it is ever re-armed.
     const sleeve: LiveFillSleeve =
-      position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_directional';
+      lastRecordedOpenSleeve(position.optionSymbol) ??
+      (position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_directional');
     const ask =
       quote && typeof quote.ask === 'number' && Number.isFinite(quote.ask) ? quote.ask : null;
     const bid =

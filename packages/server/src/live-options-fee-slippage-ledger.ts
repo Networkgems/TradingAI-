@@ -214,6 +214,27 @@ export function recordLiveOptionFill(input: LiveOptionFillInput): void {
   }
 }
 
+/**
+ * TRA-2811 — the sleeve the most recent `buy_to_open` row recorded for this
+ * contract, or null when the ledger holds no open for it. The close-side
+ * recorder MUST prefer this over re-deriving from the position object: on
+ * 2026-08-03 three positions opened as `single_leg_otm` closed as
+ * `single_leg_directional` because the close re-derived the sleeve from
+ * `position.signalType` — a field that does not survive every path a position
+ * can take between open and close (a Tradier re-import after a reboot stamps
+ * `tradier_import`). The open row in THIS ledger is the authoritative
+ * provenance: it was written by the code that chose the sleeve. Rows hydrate
+ * from disk on boot (30-day retention), so the join survives reboots wherever
+ * the ledger itself does.
+ */
+export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | null {
+  for (let i = fills.length - 1; i >= 0; i--) {
+    const f = fills[i]!;
+    if (f.side === 'buy_to_open' && f.optionSymbol === optionSymbol) return f.sleeve;
+  }
+  return null;
+}
+
 /** What {@link hydrateLiveOptionsFeeSlippageFromDisk} recovered (for the boot log line). */
 export interface LiveOptionsFeeSlippageHydration {
   records: number;

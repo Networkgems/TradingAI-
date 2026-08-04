@@ -3,6 +3,7 @@ import {
   computeRepriceLimit,
   derivePricingPath,
   liveSellLimit,
+  liveSellLimitDetailed,
   PENDING_CLOSE_MAX_REPRICE_STEPS,
   reconcilePendingCloseOrder,
   repricePendingCloseOrder,
@@ -59,8 +60,9 @@ describe('derivePricingPath', () => {
 });
 
 describe('liveSellLimit (TRA-450)', () => {
-  it('prices a stop exit on the bid (immediately marketable)', () => {
-    expect(liveSellLimit({ symbol: 'X', bid: 0.05, ask: 0.17 }, 'bid')).toBe(0.05);
+  it('prices a stop exit on the bid (immediately marketable) when the book is sane', () => {
+    // mid 0.12, floor 0.6 × 0.12 = 0.072 — a bid at 0.10 clears it untouched.
+    expect(liveSellLimit({ symbol: 'X', bid: 0.10, ask: 0.14 }, 'bid')).toBe(0.10);
   });
 
   it('prices a profit / manual exit at the midpoint', () => {
@@ -81,6 +83,51 @@ describe('liveSellLimit (TRA-450)', () => {
   it('rounds the midpoint to the nearest cent', () => {
     // (0.05 + 0.18) / 2 = 0.115 → 0.12 (round half up via roundToCent).
     expect(liveSellLimit({ symbol: 'X', bid: 0.05, ask: 0.18 }, 'mid')).toBe(0.12);
+  });
+});
+
+describe('liveSellLimitDetailed floor (TRA-2811)', () => {
+  it('floors the exact 2026-08-03 production defect: bid 0.17 / ask 2.49 (mid 1.33)', () => {
+    // The live SL exit submitted the raw bid — $0.17 against a $1.33 mid, −87%
+    // vs mid, filled at $0.89 (−33% vs mid). Floor = 0.6 × 1.33 = 0.798 → 0.80.
+    expect(liveSellLimitDetailed({ symbol: 'X', bid: 0.17, ask: 2.49 }, 'bid')).toEqual({
+      limit: 0.8,
+      raw: 0.17,
+      mid: 1.33,
+      floored: true,
+    });
+  });
+
+  it('leaves a sane bid untouched and reports floored: false', () => {
+    expect(liveSellLimitDetailed({ symbol: 'X', bid: 0.16, ask: 0.21 }, 'bid')).toEqual({
+      limit: 0.16,
+      raw: 0.16,
+      mid: 0.19,
+      floored: false,
+    });
+  });
+
+  it('never floors the mid level — mid is above the floor by construction', () => {
+    expect(liveSellLimitDetailed({ symbol: 'X', bid: 0.17, ask: 2.49 }, 'mid')).toEqual({
+      limit: 1.33,
+      raw: 1.33,
+      mid: 1.33,
+      floored: false,
+    });
+  });
+
+  it('cannot floor a single-sided (last-path) quote — no mid to floor against', () => {
+    expect(liveSellLimitDetailed({ symbol: 'X', ask: 0.30, last: 0.25 }, 'bid')).toEqual({
+      limit: 0.25,
+      raw: 0.25,
+      mid: null,
+      floored: false,
+    });
+  });
+
+  it('returns null when the quote yields no usable price', () => {
+    expect(liveSellLimitDetailed(null, 'bid')).toBeNull();
+    expect(liveSellLimitDetailed({ symbol: 'X', bid: 0, ask: 0, last: 0 }, 'bid')).toBeNull();
   });
 });
 

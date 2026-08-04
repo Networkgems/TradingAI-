@@ -10,6 +10,7 @@ import {
   liveOptionsFeeSlippageLogPath,
   reconcileLedgerFees,
   backfillLiveOptionFees,
+  lastRecordedOpenSleeve,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import type { TradierTradeHistoryFill } from '@trading-app/engine';
@@ -89,6 +90,44 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     const s = summarizeLiveOptionsFeeSlippage();
     expect(s.feesMeasured).toBe(0);
     expect(s.totalFees).toBeNull();
+  });
+
+  it('lastRecordedOpenSleeve returns the open row sleeve so a close can inherit it (TRA-2811)', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    // No open row yet — nothing to inherit.
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBeNull();
+    recordLiveOptionFill({
+      ts: 1000,
+      etDay: '2026-07-31',
+      sleeve: 'single_leg_otm',
+      optionSymbol: 'AMZN260904P00245000',
+      side: 'buy_to_open',
+      contracts: 1,
+      submittedLimit: 2.0,
+      askAtSubmit: 2.0,
+      midAtSubmit: 1.9,
+      filledPrice: 2.0,
+      fees: null,
+      orderId: 1,
+    });
+    // A close row for the same contract must NOT satisfy the lookup (side filter).
+    recordLiveOptionFill({
+      ts: 2000,
+      etDay: '2026-08-03',
+      sleeve: 'single_leg_directional', // the mislabeled pre-2811 close shape
+      optionSymbol: 'AMZN260904P00245000',
+      side: 'sell_to_close',
+      contracts: 1,
+      submittedLimit: 0.17,
+      askAtSubmit: 2.49,
+      midAtSubmit: 1.33,
+      filledPrice: 0.89,
+      fees: null,
+      orderId: 139775135,
+    });
+    expect(lastRecordedOpenSleeve('AMZN260904P00245000')).toBe('single_leg_otm');
+    // A different contract's open does not leak across symbols.
+    expect(lastRecordedOpenSleeve('QQQ260904C00797000')).toBeNull();
   });
 
   it('hydrates prior fills from disk on boot (survives a reboot on a persistent dir)', () => {
