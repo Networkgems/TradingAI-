@@ -140,8 +140,8 @@ describe('live-options fee auto-reconcile (TRA-2810)', () => {
   it('a fetched history with no join leaves rows null (never 0) and reads no-match', async () => {
     clearLiveOptionsFeeSlippageLedger();
     seedOpenFill();
-    // wrong orderId — neither orderId nor composite key matches the ledger row
-    const { client } = fakeClient([histFill({ orderId: 999999999 })]);
+    // wrong orderId AND wrong symbol — neither orderId nor composite key matches
+    const { client } = fakeClient([histFill({ orderId: 999999999, symbol: 'ZZZZZ260101C00001000' })]);
     const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
     expect(s.lastOutcome).toBe('no-match');
     expect(s.lastUpdated).toBe(0);

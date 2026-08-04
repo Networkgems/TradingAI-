@@ -385,15 +385,16 @@ export function reconcileLedgerFees(
   records: readonly LiveOptionFillRecord[],
   historyFills: readonly TradierTradeHistoryFill[],
 ): FeeBackfillResult {
-  // Primary join: orderId (production fills carry it; sandbox/legacy don't).
-  // Fallback: composite key (symbol + etDay + side + qty) for fills without orderId.
-  // A fill consumed by the orderId path is marked so the composite path can't
-  // double-assign it.
+  // Two-path join. orderId (when both sides carry it) is the primary; composite
+  // key (symbol + etDay + side + qty) is the fallback that handles the current
+  // production state where Tradier account-history does NOT return order_id.
+  // A fill is tracked in `consumed` once assigned so it can never back-fill
+  // two ledger rows, regardless of which path matched it.
   const consumed = new Set<TradierTradeHistoryFill>();
 
-  // Build orderId → fill map (production path).
+  // Group ALL eligible history fills by composite key so the composite path
+  // can find any fill (even those whose orderId already matched another row).
   const historyByOrderId = new Map<number, TradierTradeHistoryFill>();
-  // Build composite key → queue (legacy/sandbox fallback path).
   const historyByKey = new Map<string, TradierTradeHistoryFill[]>();
   for (const f of historyFills) {
     if (f.tradeType !== 'option') continue;
@@ -401,15 +402,11 @@ export function reconcileLedgerFees(
     if (side === null) continue;
     if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
     if (typeof f.commission !== 'number' || !Number.isFinite(f.commission)) continue;
-    if (f.orderId != null) {
-      // orderId is the unambiguous key — last write wins on the rare duplicate.
-      historyByOrderId.set(f.orderId, f);
-    } else {
-      const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
-      const q = historyByKey.get(key);
-      if (q) q.push(f);
-      else historyByKey.set(key, [f]);
-    }
+    if (f.orderId != null) historyByOrderId.set(f.orderId, f);
+    const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
+    const q = historyByKey.get(key);
+    if (q) q.push(f);
+    else historyByKey.set(key, [f]);
   }
   for (const q of historyByKey.values()) {
     q.sort((a, b) =>
@@ -426,24 +423,34 @@ export function reconcileLedgerFees(
   const cursor = new Map<string, number>(); // composite key → next unconsumed fill index
   const feeByIndex = new Map<number, number>(); // original record index → back-filled commission
   for (const { r, i } of order) {
-    // orderId path — unambiguous 1-to-1 match.
+    let matched: TradierTradeHistoryFill | undefined;
+
+    // orderId path — unambiguous when Tradier includes order_id in history.
     if (r.orderId != null) {
       const f = historyByOrderId.get(r.orderId);
-      if (f && !consumed.has(f)) {
-        consumed.add(f);
-        if (r.fees === null) feeByIndex.set(i, f.commission);
-      }
-      continue;
+      if (f && !consumed.has(f)) matched = f;
     }
-    // Composite-key path — used when the ledger row has no orderId.
-    const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, r.contracts);
-    const q = historyByKey.get(key);
-    if (!q) continue;
-    const c = cursor.get(key) ?? 0;
-    if (c >= q.length) continue;
-    cursor.set(key, c + 1);
-    if (r.fees !== null) continue;
-    feeByIndex.set(i, q[c]!.commission);
+
+    // Composite-key path — fallback for fills without orderId (current production)
+    // and for ledger rows whose orderId didn't resolve above.
+    if (!matched) {
+      const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, r.contracts);
+      const q = historyByKey.get(key);
+      if (q) {
+        let c = cursor.get(key) ?? 0;
+        while (c < q.length && consumed.has(q[c]!)) c++; // skip already-consumed fills
+        cursor.set(key, c);
+        if (c < q.length) {
+          matched = q[c]!;
+          cursor.set(key, c + 1);
+        }
+      }
+    }
+
+    if (matched) {
+      consumed.add(matched);
+      if (r.fees === null) feeByIndex.set(i, matched.commission);
+    }
   }
 
   let updated = 0;
