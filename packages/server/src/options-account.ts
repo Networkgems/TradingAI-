@@ -4155,7 +4155,51 @@ export class PaperOptionsAccount {
     // intent so `closeOption` archives a clean row rather than one that looks
     // like it still has an exit working at the broker.
     delete opt.pendingExit;
-    return this.closeOption(optionId, estimatedFill);
+    // TRA-2799 (follow-up) — register the estimate for EOD dedupe.
+    //
+    // The docblock above promises this estimate is "restated to broker truth,
+    // exactly as it does for the imported branch's `recordImportedFill`
+    // estimate". That restatement is NOT automatic: it works for the imported
+    // branch only because `recordImportedFill` goes through
+    // `applyRealtimeImportedPnl`, which records the amount into
+    // `realtimeImportedPnlByDate`. The EOD reconcile then computes
+    // `netAdded = brokerTruth − consumeRealtimeImportedPnl()` (index.ts,
+    // TRA-367) and adds only the difference.
+    //
+    // `closeOption` books an engine row through `bookRealizedPnl`, which never
+    // touches that map — so before this, the estimate had nothing subtracting
+    // it and the promise did not hold:
+    //   • broker closed the contract out-of-band → the full broker total landed
+    //     ON TOP of our estimate (the $74 SPY 820C row became $144, not $70);
+    //   • the open never really filled → the estimate stood forever as realized
+    //     profit on a contract that never existed.
+    // Across the three rows on this ticket that was ~$630 of realized P&L
+    // attributed to the LIVE book, which is also the book whose OTM numbers are
+    // under review — precisely where a phantom gain does the most damage.
+    //
+    // The delta is measured around `closeOption` rather than recomputed from
+    // `estimatedFill` so it stays exact regardless of the fee / slippage
+    // adjustments that path applies.
+    const liveBefore = this.optionsPnlByMode.live;
+    const closed = this.closeOption(optionId, estimatedFill);
+    if (closed) this.registerReconcileEstimateForDedupe(this.optionsPnlByMode.live - liveBefore);
+    return closed;
+  }
+
+  /**
+   * TRA-2799 (follow-up) — record an already-booked reconcile estimate into the
+   * per-date dedupe map WITHOUT re-adding it to the live bucket.
+   *
+   * Deliberately not {@link applyRealtimeImportedPnl}: that helper both adds to
+   * `optionsPnlByMode.live` and records the date entry, which is right for the
+   * imported branch (whose close path adds nothing itself) but would
+   * double-book here, since `closeOption` has already moved the bucket.
+   */
+  private registerReconcileEstimateForDedupe(pnl: number): void {
+    if (!Number.isFinite(pnl) || pnl === 0) return;
+    const dateKey = toDateKey(Date.now());
+    const prev = this.realtimeImportedPnlByDate.get(dateKey) ?? 0;
+    this.realtimeImportedPnlByDate.set(dateKey, prev + pnl);
   }
 
   dropImportedPosition(optionId: string): OptionPosition | null {
