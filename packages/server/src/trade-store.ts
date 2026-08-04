@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir, readdir, rm, copyFile, access, stat } from 'fs/promises';
+import type { Dirent } from 'fs';
 import { existsSync } from 'fs';
 import { constants as FS } from 'fs';
 import { join, dirname, basename } from 'path';
@@ -32,6 +33,69 @@ const BACKUP_DIR = join(DATA_DIR, 'backups');
 
 /** Maximum number of timestamped backup folders to keep. */
 const MAX_BACKUPS = 24; // 12 hours of 30-min snapshots
+
+/**
+ * TRA-2817 — the INODE budget for the whole `backups/` tree, and the reason
+ * `MAX_BACKUPS` alone is not a retention policy.
+ *
+ * On 2026-07-30T23:40:19Z `/data` on bqb1 began returning `ENOSPC` on every
+ * write and did not stop for five days. It was not out of BYTES — 383 MB of
+ * 1 GB were free, `freePct 37.6`, and `disk.belowThreshold` read a clean
+ * `false` throughout. It was out of INODES: `usage.allocation.sampledPaths`
+ * measured **65524** against the 65536-entry inode table an ext4 filesystem
+ * gets on a 1 GB volume, and `backups` held **39590** of the 50668 files.
+ *
+ * `MAX_BACKUPS` bounds the number of GENERATIONS. But a generation mirrors six
+ * files per user plus a crypto subdir, so its inode cost scales LINEARLY with
+ * the book count — 39590 / 25 generations = ~1584 files each at 61 users. The
+ * backup code never changed; the fleet grew into the table (28 -> 56 -> 61
+ * accounts over three weeks, measured by TRA-2414). A retention policy
+ * denominated in the wrong unit has no failing state: it was doing exactly what
+ * it said, at 24 generations, while consuming 60% of the filesystem's capacity
+ * to hold a file at all.
+ *
+ * So retention is now bounded by BOTH: at most `MAX_BACKUPS` generations AND at
+ * most `BACKUP_MAX_FILES` inodes across the tree. Whichever binds first wins,
+ * and the depth in generations therefore FALLS as the fleet grows instead of
+ * the cost rising. The resulting depth is published on the health route so a
+ * shrinking retention window is visible rather than inferred.
+ *
+ * The budget is deliberately a small fraction of a 1 GB volume's table: backups
+ * are a convenience (a corrupt primary auto-restores from the newest one), and
+ * they must never again be able to starve the primary writes they exist to
+ * protect. Env-tunable because the right number depends on the volume, and a
+ * constant compiled into the bundle is one that cannot be moved during an
+ * incident.
+ */
+export function backupMaxFiles(): number {
+  const raw = Number(process.env['BACKUP_MAX_FILES']);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 8_000;
+}
+
+/**
+ * TRA-2817 — how many generations fit in the inode budget, given the measured
+ * per-generation cost.
+ *
+ * `filesPerGeneration` is measured off the NEWEST generation on disk rather
+ * than assumed from the user count: the mirror skips files that do not exist,
+ * so a computed `userCount * 7` overstates it for a fleet of mostly-empty demo
+ * books, and an overstatement here silently collapses retention to the floor.
+ *
+ * Floors at 2. One generation is not a backup — the newest one is written
+ * DURING the window in which the primary can be corrupted, so a policy that
+ * keeps only the newest can hand back the corruption it was meant to undo.
+ * Returns `MAX_BACKUPS` when the cost cannot be measured (an empty tree, a
+ * first boot): an unmeasurable cost must not manufacture an aggressive prune.
+ */
+export function backupGenerationsWithinBudget(
+  filesPerGeneration: number,
+  maxFiles: number = backupMaxFiles(),
+  maxGenerations: number = MAX_BACKUPS,
+): number {
+  if (!Number.isFinite(filesPerGeneration) || filesPerGeneration <= 0) return maxGenerations;
+  const fit = Math.floor(maxFiles / filesPerGeneration);
+  return Math.max(2, Math.min(maxGenerations, fit));
+}
 
 function userDir(username: string): string {
   return join(DATA_DIR, 'users', username);
@@ -388,6 +452,80 @@ export async function saveCryptoTradeSnapshot(username: string, snap: CryptoTrad
   await atomicWriteJson(cryptoTradesFile(username), { ...snap, savedAt: new Date().toISOString() });
 }
 
+/** TRA-2817 — recursive file count under `dir`. Directories are not counted. */
+async function countFiles(dir: string): Promise<number> {
+  let n = 0;
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    if (e.isDirectory()) n += await countFiles(join(dir, e.name));
+    else n += 1;
+  }
+  return n;
+}
+
+/** TRA-2817 — the timestamped generations under `backups/`, oldest first. */
+async function backupGenerations(): Promise<string[]> {
+  try {
+    return (await readdir(BACKUP_DIR)).filter(n => /^\d{4}-\d{2}-\d{2}T/.test(n)).sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * TRA-2817 — prune generations until BOTH bounds hold: at most `MAX_BACKUPS`
+ * generations, and at most `backupMaxFiles()` inodes across the tree.
+ *
+ * Runs BEFORE the new generation is written, which is the half of this fix that
+ * actually ends an incident rather than preventing the next one. The old order
+ * was copy-then-prune, and under `ENOSPC` that is a stable deadlock: every
+ * `copyFile` fails and is swallowed as a warn, the prune then finds exactly
+ * `MAX_BACKUPS` generations and removes nothing, and the tree sits at its
+ * high-water inode mark forever. Nothing in the loop can ever release the
+ * inodes it needs to make progress. Pruning first needs no new inode — `rm`
+ * only frees them — so the very first rotation after this deploys reclaims
+ * space on a filesystem that is already full.
+ *
+ * Returns what it did so the caller can log a retention window that SHRANK,
+ * which is the observable a "backups are fine, there are 24 of them" reading
+ * cannot produce.
+ */
+async function pruneBackupsToBudget(): Promise<{
+  removed: number;
+  kept: number;
+  filesPerGeneration: number | null;
+  budgetGenerations: number;
+}> {
+  const entries = await backupGenerations();
+  // Measure the per-generation cost off the NEWEST generation: it reflects the
+  // current fleet, and the oldest may pre-date half the accounts.
+  const newest = entries[entries.length - 1];
+  const filesPerGeneration = newest == null ? null : await countFiles(join(BACKUP_DIR, newest));
+  const budgetGenerations = backupGenerationsWithinBudget(filesPerGeneration ?? 0);
+  // Leave room for the generation about to be written, so the budget bounds the
+  // tree at its PEAK rather than at the trough right after a prune.
+  const keep = Math.max(1, budgetGenerations - 1);
+  const excess = Math.max(0, entries.length - keep);
+  let removed = 0;
+  for (let i = 0; i < excess; i++) {
+    try {
+      await rm(join(BACKUP_DIR, entries[i]), { recursive: true, force: true });
+      removed += 1;
+    } catch (err: unknown) {
+      log.warn('backup prune failed', {
+        generation: entries[i],
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return { removed, kept: entries.length - removed, filesPerGeneration, budgetGenerations };
+}
+
 /**
  * Snapshot every persisted file under DATA_DIR into a timestamped backup folder
  * and prune old folders. Backs up global files (users.json) at the root and
@@ -395,9 +533,26 @@ export async function saveCryptoTradeSnapshot(username: string, snap: CryptoTrad
  *
  * If a primary file is wiped or corrupted, the next startup automatically
  * restores from the most recent backup.
+ *
+ * TRA-2817 — the prune runs FIRST and is bounded by an inode budget, not just a
+ * generation count. See `backupMaxFiles` for why a generation count is not a
+ * retention policy and how it took `/data` down for five days.
  */
 export async function rotateBackups(): Promise<void> {
   await ensureDir(BACKUP_DIR);
+  const pruned = await pruneBackupsToBudget();
+  if (pruned.removed > 0) {
+    // Logged at warn, not info: a retention window that shrank is a capacity
+    // signal, and the last time this tree's cost went unread it exhausted the
+    // filesystem's inode table.
+    log.warn('backup retention pruned to inode budget (TRA-2817)', {
+      removed: pruned.removed,
+      kept: pruned.kept,
+      filesPerGeneration: pruned.filesPerGeneration,
+      budgetGenerations: pruned.budgetGenerations,
+      maxFiles: backupMaxFiles(),
+    });
+  }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const target = join(BACKUP_DIR, stamp);
   await ensureDir(target);
@@ -473,20 +628,9 @@ export async function rotateBackups(): Promise<void> {
     }
   }
 
-  // Prune old backups.
-  try {
-    const entries = (await readdir(BACKUP_DIR))
-      .filter(n => /^\d{4}-\d{2}-\d{2}T/.test(n))
-      .sort();
-    const excess = entries.length - MAX_BACKUPS;
-    for (let i = 0; i < excess; i++) {
-      await rm(join(BACKUP_DIR, entries[i]), { recursive: true, force: true });
-    }
-  } catch (err: unknown) {
-    log.warn('backup prune failed', {
-      reason: err instanceof Error ? err.message : String(err),
-    });
-  }
+  // TRA-2817 — the prune moved to the TOP of this function. Pruning after the
+  // copy cannot recover a filesystem that is already out of inodes, because the
+  // copy it runs behind is the step that failed.
 }
 
 /**

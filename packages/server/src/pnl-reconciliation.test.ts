@@ -7,6 +7,7 @@ import {
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
   summarizeLiveCohortIntegrity,
+  countStaleTailSessions,
   summarizeDriftGradeability,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
   PNL_RECONCILIATION_CAVEATS,
@@ -1538,5 +1539,155 @@ describe('TRA-2630 AC1 — summarizeDriftGradeability', () => {
     // (or a test) pushing onto the returned array must not poison the next call.
     summarizeDriftGradeability().ungradeableFields.push('injected');
     expect(summarizeDriftGradeability().ungradeableFields).not.toContain('injected');
+  });
+});
+
+/**
+ * TRA-2817 — THE TAIL AXIS.
+ *
+ * TRA-2637 gave the INTERIOR a failing state: an absent `eodCombined` inside the
+ * measured range is no longer scored `drift: 0`. It could not give the TAIL one,
+ * and the reason is structural. The presence check walks the dates already in
+ * `days[]`, and `days[]` is built from the persisted snapshots — so a session
+ * with no snapshot is never walked and can never be counted missing. When the
+ * writer stops entirely the axis goes GREEN, and the more completely it has
+ * stopped the greener it looks.
+ *
+ * Live proof this is not hypothetical: on 2026-08-04 all 47 books with a ledger
+ * carried `closingEquityLatestDate: "2026-07-29"` — three completed, overdue
+ * sessions unwritten fleet-wide, because `/data` had been returning `ENOSPC` on
+ * every write since 2026-07-30T23:40:19Z — while `liveEodRowsPresentOk` served
+ * `true` and `liveEodRowMissingBooks` served `[]`.
+ */
+describe('TRA-2817 EOD tail staleness', () => {
+  // Weekday calendar: 2026-07-27 Mon .. 2026-07-31 Fri, 2026-08-03 Mon.
+  const isMarketDay = (iso: string): boolean => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dow = new Date(Date.UTC(y!, m! - 1, d!)).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const cal = (lastSettledSession: string | null) => ({ lastSettledSession, isMarketDay });
+
+  describe('countStaleTailSessions', () => {
+    it('counts SESSIONS, not elapsed days: 2026-07-29 -> 2026-08-03 is 3', () => {
+      // 07-30 Thu, 07-31 Fri, 08-03 Mon. Five calendar days, three sessions.
+      // 08-03 is a MONDAY, not a weekend (the TRA-2764 correction).
+      expect(countStaleTailSessions('2026-07-29', '2026-08-03', isMarketDay)).toBe(3);
+    });
+
+    it('is 0 when the newest row IS the last settled session', () => {
+      expect(countStaleTailSessions('2026-08-03', '2026-08-03', isMarketDay)).toBe(0);
+    });
+
+    it('is 0 across a weekend: a Friday row read on a Sunday is current', () => {
+      expect(countStaleTailSessions('2026-07-31', '2026-07-31', isMarketDay)).toBe(0);
+    });
+
+    it('is 0, not negative, when the row is AHEAD of the settled session', () => {
+      // The normal weekday-afternoon read: today's row exists (a backfill, an
+      // intraday write) but today's 21:00 ET archive has not settled yet.
+      expect(countStaleTailSessions('2026-08-04', '2026-08-03', isMarketDay)).toBe(0);
+    });
+
+    it('is null, NOT 0, when either endpoint is absent', () => {
+      // A book with no rows has no anchor. Inventing 0 for it would hand the
+      // EMPTIEST ledger the cleanest reading on the endpoint.
+      expect(countStaleTailSessions(null, '2026-08-03', isMarketDay)).toBeNull();
+      expect(countStaleTailSessions('2026-07-29', null, isMarketDay)).toBeNull();
+    });
+  });
+
+  describe('reconcilePnl tail verdict', () => {
+    // The live shape: a book that reconciled cleanly through 07-29, then stopped.
+    const snaps = [snap('2026-07-28', 100, 0), snap('2026-07-29', 50, 0)];
+    const eod = new Map([['2026-07-28', 100], ['2026-07-29', 50]]);
+
+    it('reports eodRowsPresentOk FALSE on a dead tail whose interior is spotless', () => {
+      const r = reconcilePnl(snaps, eod, '2026-07-12', null, null, null, cal('2026-08-03'));
+      expect(r.eodTailStaleSessions).toBe(3);
+      expect(r.eodTailLatestRowDate).toBe('2026-07-29');
+      expect(r.eodTailSettledSession).toBe('2026-08-03');
+      // The interior really is clean — that is the whole point. Before this
+      // ticket those two lines were the entire verdict and it read `true`.
+      expect(r.eodRowMissingDates).toEqual([]);
+      expect(r.eodRowsPresentOk).toBe(false);
+    });
+
+    it('stays green when the tail is current', () => {
+      const r = reconcilePnl(snaps, eod, '2026-07-12', null, null, null, cal('2026-07-29'));
+      expect(r.eodTailStaleSessions).toBe(0);
+      expect(r.eodRowsPresentOk).toBe(true);
+    });
+
+    it('a stale tail outranks an interior that is NOT MEASURED', () => {
+      // A quiet book: no activity, so the interior cohort is empty and the
+      // interior verdict is `null`. `null` reads as "nothing to check" when the
+      // truth here is "nothing was written" — the tail must still win.
+      const quiet = [snap('2026-07-29', 0, 0)];
+      const r = reconcilePnl(quiet, new Map(), '2026-07-12', null, null, null, cal('2026-08-03'));
+      expect(r.eodRowGradeableCount).toBe(0);
+      expect(r.eodRowsPresentOk).toBe(false);
+    });
+
+    it('reports NOT MEASURED, never a fabricated 0, when no calendar is supplied', () => {
+      const r = reconcilePnl(snaps, eod, '2026-07-12');
+      expect(r.eodTailStaleSessions).toBeNull();
+      expect(r.eodTailSettledSession).toBeNull();
+      // The pre-TRA-2817 verdict is preserved exactly for a caller that has not
+      // wired the calendar: this must not become a silent fleet-wide red.
+      expect(r.eodRowsPresentOk).toBe(true);
+    });
+
+    it('anchors on the newest row INCLUDING below-baseline ones', () => {
+      // The baseline is a data-integrity cutoff for grading drift, not evidence
+      // the writer was dead. Anchoring on `evaluated` would score a book whose
+      // whole history predates the baseline as maximally stale while its writer
+      // is working perfectly.
+      const r = reconcilePnl(snaps, eod, '2027-01-01', null, null, null, cal('2026-07-29'));
+      expect(r.eodTailLatestRowDate).toBe('2026-07-29');
+      expect(r.eodTailStaleSessions).toBe(0);
+    });
+  });
+
+  describe('summarizeLiveEodRowPresence tail list', () => {
+    const book = (over: Record<string, unknown> = {}) => ({
+      username: 'admin',
+      mode: 'live',
+      eodRowsPresentOk: false as boolean | null,
+      eodRowMissingDates: [] as string[],
+      eodRowGradeableCount: 12,
+      eodTailStaleSessions: 3 as number | null,
+      eodTailLatestRowDate: '2026-07-29' as string | null,
+      ...over,
+    });
+
+    it('enumerates a tail gap that contributes NO missing dates', () => {
+      // This is the reading the live endpoint served for five days:
+      // `liveEodRowMissingBooks: []`. Empty is now a legitimate answer meaning
+      // "the tail, not the interior" — and it needs its own list, or the gap is
+      // only reachable by re-deriving `days[]` by hand.
+      const s = summarizeLiveEodRowPresence([book()]);
+      expect(s.liveEodRowMissingBooks).toEqual([]);
+      expect(s.liveEodRowsPresentOk).toBe(false);
+      expect(s.liveEodTailStaleBooks).toEqual([
+        { username: 'admin', latestRowDate: '2026-07-29', staleSessions: 3 },
+      ]);
+      expect(s.liveEodTailMaxStaleSessions).toBe(3);
+    });
+
+    it('reports max stale as null, not 0, on a wholly unmeasured cohort', () => {
+      const s = summarizeLiveEodRowPresence([
+        book({ eodTailStaleSessions: null, eodRowsPresentOk: true }),
+      ]);
+      expect(s.liveEodTailStaleBooks).toEqual([]);
+      expect(s.liveEodTailMaxStaleSessions).toBeNull();
+    });
+
+    it('ignores non-live books: the tail list is live-scoped like the rest', () => {
+      const s = summarizeLiveEodRowPresence([book({ mode: 'demo' })]);
+      expect(s.liveEodRowBookCount).toBe(0);
+      expect(s.liveEodTailStaleBooks).toEqual([]);
+      expect(s.liveEodTailMaxStaleSessions).toBeNull();
+    });
   });
 });

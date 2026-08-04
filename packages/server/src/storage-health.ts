@@ -85,10 +85,33 @@ export interface StorageDiskBlock {
   reservedBytes: number | null;
   freePct: number | null;
   usedPct: number | null;
+  /**
+   * TRA-2817 — the inode table. `null` on a filesystem that does not report one
+   * (NOT MEASURED, never a synthesised 100%). See `DiskReading.inodesTotal`.
+   */
+  inodesTotal: number | null;
+  inodesFree: number | null;
+  inodeFreePct: number | null;
   /** The threshold `disk-near-full` grades against. Always known. */
   minFreePct: number;
-  /** `null` when unreadable — NOT `false`. See the module header. */
+  /**
+   * `null` when unreadable — NOT `false`. See the module header.
+   *
+   * TRA-2817 — this is now the verdict over BOTH exhaustible resources: it is
+   * `true` when blocks OR inodes are below `minFreePct`. It is the only disk
+   * verdict the ungated route publishes, and for five days it answered `false`
+   * on a filesystem where every write returned `ENOSPC` — 383 MB of bytes free
+   * and 65524 of 65536 inodes consumed. A field whose whole job is "can this
+   * disk be written to" cannot grade one of the two ways the answer is no.
+   */
   belowThreshold: boolean | null;
+  /**
+   * TRA-2817 — WHICH resource is exhausted: `'blocks'`, `'inodes'`,
+   * `'blocks+inodes'`, or `null` when neither is (or nothing was measured).
+   * `belowThreshold` alone sends a responder to the byte figures, which is the
+   * wrong place to look during an inode exhaustion and reads reassuring there.
+   */
+  exhausted: 'blocks' | 'inodes' | 'blocks+inodes' | null;
   error: string | null;
   monitor: {
     runs: number;
@@ -182,9 +205,36 @@ export const STORAGE_GATED_DISK_KEYS = [
   'reservedBytes',
   'freePct',
   'usedPct',
+  // TRA-2817 — the inode axis is GATED, like every other byte/count figure on
+  // this block. The ungated route keeps publishing only the `belowThreshold`
+  // verdict, which now folds inodes in — so the blind spot closes on the open
+  // surface without widening it by a single field.
+  'inodesTotal',
+  'inodesFree',
+  'inodeFreePct',
+  'exhausted',
   'minFreePct',
   'error',
 ] as const;
+
+/**
+ * TRA-2817 — name the exhausted resource. Pure, so the polarity is testable
+ * without a filesystem. `null` inode reading contributes nothing (NOT MEASURED
+ * is not an exhaustion), which keeps a blocks-only filesystem grading exactly
+ * as it did before this axis existed.
+ */
+export function diskExhaustedAxis(
+  freePct: number,
+  inodeFreePct: number | null,
+  minFreePct: number,
+): 'blocks' | 'inodes' | 'blocks+inodes' | null {
+  const blocks = freePct < minFreePct;
+  const inodes = inodeFreePct != null && inodeFreePct < minFreePct;
+  if (blocks && inodes) return 'blocks+inodes';
+  if (inodes) return 'inodes';
+  if (blocks) return 'blocks';
+  return null;
+}
 
 export type StorageLivenessResponse = {
   dataDir_exists: boolean;
@@ -322,8 +372,18 @@ export async function buildStorageDiagnostic(
         reservedBytes: reading.reservedBytes,
         freePct: Number(reading.freePct.toFixed(3)),
         usedPct: Number((100 - reading.freePct).toFixed(3)),
+        inodesTotal: reading.inodesTotal,
+        inodesFree: reading.inodesFree,
+        inodeFreePct:
+          reading.inodeFreePct == null ? null : Number(reading.inodeFreePct.toFixed(3)),
         minFreePct,
-        belowThreshold: reading.freePct < minFreePct,
+        // TRA-2817 — OR, not just blocks. `inodeFreePct == null` (no inode table
+        // reported) contributes nothing, so a blocks-only filesystem grades
+        // exactly as it did before.
+        belowThreshold:
+          reading.freePct < minFreePct
+          || (reading.inodeFreePct != null && reading.inodeFreePct < minFreePct),
+        exhausted: diskExhaustedAxis(reading.freePct, reading.inodeFreePct, minFreePct),
         error: null,
         monitor,
       }
@@ -336,9 +396,13 @@ export async function buildStorageDiagnostic(
         reservedBytes: null,
         freePct: null,
         usedPct: null,
+        inodesTotal: null,
+        inodesFree: null,
+        inodeFreePct: null,
         minFreePct,
         // Unknown, not fine. See the module header.
         belowThreshold: null,
+        exhausted: null,
         error: 'statfs failed',
         monitor,
       };

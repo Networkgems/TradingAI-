@@ -4102,6 +4102,26 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         });
       }
     }
+    // TRA-2817 — the exchange calendar the TAIL axis grades against. Built ONCE
+    // per request so all 61 books are held to the same settled session; deriving
+    // it per book would let a read that straddles 21:00 ET grade half the fleet
+    // against one date and half against another.
+    //
+    // `lastSettledSession` is the newest session whose 21:00 ET archive is
+    // already PAST, NOT simply the last market day. Today only counts once its
+    // own archive has run — otherwise every read between the 16:00 bell and
+    // 21:00 ET would accuse a perfectly healthy ledger of missing today, and an
+    // axis that is red every weekday afternoon is one nobody believes on the
+    // afternoon it is right. The same `etHour() >= 21` boundary the archive tick
+    // itself fires on, so the two cannot disagree about what has settled.
+    const tailTodayEt = etDateString(new Date());
+    const tailCalendar = {
+      lastSettledSession:
+        isMarketDayIso(tailTodayEt) && etHour() >= 21
+          ? tailTodayEt
+          : previousMarketDayIso(tailTodayEt),
+      isMarketDay: isMarketDayIso,
+    };
     const engines = await Promise.all(
       getAllUserContexts().map(async ctx => {
         // TRA-2761 — classify off `loadSettings`, NOT `getSettings`. `getSettings`
@@ -4186,6 +4206,7 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             journalByDate,
             eodOptionsByDate,
             eodStockByDate,
+            tailCalendar,
           ),
         };
       }),
@@ -4337,6 +4358,32 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       eodRowMissingBooks: engines
         .filter(e => e.eodRowMissingDates.length > 0)
         .map(e => ({ username: e.username, mode: e.mode, dates: e.eodRowMissingDates })),
+      // TRA-2817 — THE TAIL AXIS, at the head of the response where a reader
+      // asking "is the book being recorded?" actually looks. `eodRowsPresentOk`
+      // above now folds it in, but the verdict alone does not say WHICH failure
+      // it is: a tail gap contributes no missing dates (the rows were never
+      // written, so nothing walks them), so `eodRowMissingBooks: []` next to
+      // `eodRowsPresentOk: false` is a legitimate reading meaning "the writer
+      // stopped", and these three fields are how it is told apart from a clean
+      // interior. This is the reachability AC2 asked for: a tail gap must be
+      // legible from the top-level scalars, because re-deriving `days[]` by hand
+      // is the only reason the 2026-07-30 stop ran three sessions unseen.
+      eodTailSettledSession: tailCalendar.lastSettledSession,
+      eodTailStaleBooks: engines
+        .filter(e => (e.eodTailStaleSessions ?? 0) > 0)
+        .map(e => ({
+          username: e.username,
+          mode: e.mode,
+          latestRowDate: e.eodTailLatestRowDate,
+          staleSessions: e.eodTailStaleSessions,
+        })),
+      eodTailMaxStaleSessions: (() => {
+        const measured = engines
+          .map(e => e.eodTailStaleSessions)
+          .filter((n): n is number => typeof n === 'number');
+        // `null`, not 0, on a wholly unmeasured fleet — the empty-cohort pass.
+        return measured.length === 0 ? null : Math.max(...measured);
+      })(),
       ...summarizeLiveEodRowPresence(engines),
       // TRA-2761 — cohort-membership integrity. Every `live*` fold above filters
       // on the read-time classifier; this one cross-checks that classifier

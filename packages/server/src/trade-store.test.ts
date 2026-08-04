@@ -15,6 +15,8 @@ let saveStocksTradeSnapshot: TradeStoreModule['saveStocksTradeSnapshot'];
 let loadCryptoTradeSnapshot: TradeStoreModule['loadCryptoTradeSnapshot'];
 let saveCryptoTradeSnapshot: TradeStoreModule['saveCryptoTradeSnapshot'];
 let rotateBackups: TradeStoreModule['rotateBackups'];
+// TRA-2817 — the inode-budget retention math.
+let backupGenerationsWithinBudget: TradeStoreModule['backupGenerationsWithinBudget'];
 
 beforeAll(async () => {
   const mod = await import('./trade-store.js');
@@ -23,6 +25,7 @@ beforeAll(async () => {
   loadCryptoTradeSnapshot = mod.loadCryptoTradeSnapshot;
   saveCryptoTradeSnapshot = mod.saveCryptoTradeSnapshot;
   rotateBackups = mod.rotateBackups;
+  backupGenerationsWithinBudget = mod.backupGenerationsWithinBudget;
 });
 
 beforeEach(() => {
@@ -180,5 +183,72 @@ describe('loadCryptoTradeSnapshot — mirror coverage', () => {
   it('no-backup: returns null safely when there is neither primary nor any backup', async () => {
     const loaded = await loadCryptoTradeSnapshot(USER);
     expect(loaded).toBeNull();
+  });
+});
+
+/**
+ * TRA-2817 — backup retention denominated in INODES, not generations.
+ *
+ * `/data` on bqb1 returned `ENOSPC` on every write from 2026-07-30T23:40:19Z
+ * for five days; the EOD ledger stopped dead across 47 books. It was not out of
+ * bytes — 383 MB of 1 GB were free. It was out of inodes: 65524 of the 65536
+ * entries an ext4 volume of that size gets, with `backups/` holding 39590 of
+ * the 50668 files.
+ *
+ * `MAX_BACKUPS = 24` was doing exactly what it said. That is the defect: it
+ * bounds GENERATIONS, and a generation costs six files per user plus a crypto
+ * subdir, so its inode cost scales linearly with the book count. The fleet grew
+ * 28 -> 56 -> 61 accounts and walked into the inode table. A retention policy
+ * denominated in the wrong unit has no failing state.
+ */
+describe('TRA-2817 backup retention inode budget', () => {
+  const MAX_FILES = 8_000;
+  const MAX_GENERATIONS = 24;
+
+  const fit = (filesPerGeneration: number) =>
+    backupGenerationsWithinBudget(filesPerGeneration, MAX_FILES, MAX_GENERATIONS);
+
+  it('collapses retention as the fleet grows — the live 61-book cost', () => {
+    // 39590 files / 25 generations = ~1584 per generation at 61 users.
+    // 8000 / 1584 = 5 generations, not 24. Depth FALLS, cost does not RISE.
+    expect(fit(1584)).toBe(5);
+  });
+
+  it('keeps the full window while a generation is cheap', () => {
+    // A small fleet is unaffected: the generation cap still binds first, so
+    // this change is not a silent retention cut for every install.
+    expect(fit(100)).toBe(MAX_GENERATIONS);
+    expect(fit(1)).toBe(MAX_GENERATIONS);
+  });
+
+  it('never floors below 2, even at an absurd per-generation cost', () => {
+    // One generation is not a backup: the newest is written DURING the window
+    // in which the primary can be corrupted, so a keep-1 policy can hand back
+    // the corruption it exists to undo.
+    expect(fit(1_000_000)).toBe(2);
+  });
+
+  it('returns the full cap when the cost cannot be measured', () => {
+    // An empty tree / first boot. An unmeasurable cost must not manufacture an
+    // aggressive prune — the failure direction has to be conservative.
+    expect(fit(0)).toBe(MAX_GENERATIONS);
+    expect(fit(Number.NaN)).toBe(MAX_GENERATIONS);
+    expect(fit(-5)).toBe(MAX_GENERATIONS);
+  });
+
+  it('prunes BEFORE it copies, so a full filesystem can recover', () => {
+    // The half of this fix that ends an incident rather than preventing the
+    // next one. Copy-then-prune is a stable deadlock under ENOSPC: every
+    // copyFile fails and is swallowed as a warn, the prune then finds exactly
+    // MAX_BACKUPS generations and removes nothing, and the tree sits at its
+    // high-water inode mark forever. Nothing in that loop can release the
+    // inodes it needs to make progress.
+    const src = readFileSync(new URL('./trade-store.ts', import.meta.url), 'utf8');
+    const fn = src.slice(src.indexOf('export async function rotateBackups'));
+    const pruneAt = fn.indexOf('pruneBackupsToBudget()');
+    const copyAt = fn.indexOf('copyFile(');
+    expect(pruneAt).toBeGreaterThan(-1);
+    expect(copyAt).toBeGreaterThan(-1);
+    expect(pruneAt).toBeLessThan(copyAt);
   });
 });

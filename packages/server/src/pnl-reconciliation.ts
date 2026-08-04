@@ -551,10 +551,57 @@ export interface PnlReconcileResult {
    *
    * `eodRowGradeableCount` is the denominator that makes the empty cohort
    * distinguishable from a graded one.
+   *
+   * TRA-2817 — the verdict is now over the INTERIOR **and** the TAIL. It is
+   * `false` whenever `eodTailStaleSessions > 0`, regardless of how clean the
+   * interior is. See `eodTailStaleSessions` for why the interior check alone
+   * has no failing state on a writer that stopped.
    */
   eodRowsPresentOk: boolean | null;
   /** TRA-2637 — size of the cohort `eodRowsPresentOk` was graded over. */
   eodRowGradeableCount: number;
+  /**
+   * TRA-2817 — THE TAIL AXIS. Completed NYSE sessions strictly after this book's
+   * newest ledger row, through the last session whose 21:00 ET archive is past.
+   * `0` = the ledger is current. `null` = NOT MEASURED (no rows at all, or no
+   * calendar supplied) — never read as a pass.
+   *
+   * TRA-2637 fixed the INTERIOR case: an absent `eodCombined` inside the
+   * measured range no longer scores `drift: 0`. It could not fix the TAIL case,
+   * and the reason is structural rather than an oversight. The presence check
+   * walks the dates that are already in `days[]`, and `days[]` is built from the
+   * persisted snapshots. A session with no snapshot is not in `days[]`, so it is
+   * never walked, so it can never be counted missing. **When the writer stops
+   * entirely, the axis goes green** — and the greener it looks, the more
+   * completely it has stopped.
+   *
+   * Live proof, and the reason this exists: on 2026-08-04 all 47 books with a
+   * ledger carried `closingEquityLatestDate: "2026-07-29"` — three completed,
+   * overdue sessions unwritten across the entire fleet — while
+   * `liveEodRowsPresentOk` served `true` and `liveEodRowMissingBooks` served
+   * `[]`. `/data` had been returning `ENOSPC` on every write since
+   * 2026-07-30T23:40:19Z (the disk was out of INODES, not bytes — TRA-2817).
+   * Every downstream figure computed over that window, including TRA-2658's
+   * $733.60, was measured against a ledger that had stopped, and read as stable
+   * precisely BECAUSE it had stopped.
+   *
+   * Graded against the exchange calendar, not elapsed days: a Monday row is
+   * current on a Saturday, and a Tuesday-afternoon read is current with
+   * Monday's row because today's 21:00 ET archive is not yet due.
+   */
+  eodTailStaleSessions: number | null;
+  /**
+   * TRA-2817 — the anchor `eodTailStaleSessions` was measured from: this book's
+   * newest ledger row date, or `null` when it has none. Published so a stale
+   * tail is legible without re-deriving `days[]` by hand — the omission that let
+   * this run three sessions unseen.
+   */
+  eodTailLatestRowDate: string | null;
+  /**
+   * TRA-2817 — the last session whose 21:00 ET archive is past, i.e. the date
+   * this book's tail is being held to. `null` when no calendar was supplied.
+   */
+  eodTailSettledSession: string | null;
   /**
    * TRA-2302 — how many snapshots never had `optionsDailyPnl` written at all.
    * A high count over days the book was trading options means the writer was
@@ -996,6 +1043,10 @@ export function summarizeLiveEodRowPresence(
     eodRowsPresentOk: boolean | null;
     eodRowMissingDates: string[];
     eodRowGradeableCount: number;
+    // TRA-2817 — optional so a caller that has not wired the tail calendar yet
+    // still type-checks; absent reads as NOT MEASURED, never as current.
+    eodTailStaleSessions?: number | null;
+    eodTailLatestRowDate?: string | null;
   }>,
 ): {
   liveEodRowBookCount: number;
@@ -1005,8 +1056,28 @@ export function summarizeLiveEodRowPresence(
     dates: string[];
     gradeableCount: number;
   }>;
+  liveEodTailStaleBooks: Array<{
+    username: string;
+    latestRowDate: string | null;
+    staleSessions: number;
+  }>;
+  liveEodTailMaxStaleSessions: number | null;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
+  // TRA-2817 — a tail gap produces NO missing dates (the dates were never
+  // written, so nothing walks them), so it has to be enumerated on its own list.
+  // `liveEodRowMissingBooks: []` alongside `liveEodRowsPresentOk: false` is a
+  // legitimate reading now, and it means "the tail, not the interior".
+  const tailStale = liveBooks
+    .filter(e => (e.eodTailStaleSessions ?? 0) > 0)
+    .map(e => ({
+      username: e.username,
+      latestRowDate: e.eodTailLatestRowDate ?? null,
+      staleSessions: e.eodTailStaleSessions!,
+    }));
+  const measuredTails = liveBooks
+    .map(e => e.eodTailStaleSessions)
+    .filter((n): n is number => typeof n === 'number');
   return {
     liveEodRowBookCount: liveBooks.length,
     liveEodRowsPresentOk: liveBooks.some(e => e.eodRowsPresentOk === false)
@@ -1024,6 +1095,10 @@ export function summarizeLiveEodRowPresence(
         dates: e.eodRowMissingDates,
         gradeableCount: e.eodRowGradeableCount,
       })),
+    liveEodTailStaleBooks: tailStale,
+    // `null` on an empty or wholly unmeasured cohort — `0` there is the
+    // `every`-on-the-empty-set pass this codebase keeps rediscovering.
+    liveEodTailMaxStaleSessions: measuredTails.length === 0 ? null : Math.max(...measuredTails),
   };
 }
 
@@ -1139,6 +1214,69 @@ export function summarizeLiveCohortIntegrity(
  * `etDate` is injected so this stays pure and testable across timezones; the
  * caller passes the same ET bucketing the EOD report uses.
  */
+/**
+ * TRA-2817 — the exchange-calendar context the TAIL axis is graded against.
+ *
+ * Injected rather than imported so this module stays pure and testable, the
+ * same discipline `foldJournalClosesByEtDay`'s `etDate` follows. The caller
+ * passes the same NYSE calendar the 21:00 ET archive itself runs on, so the two
+ * cannot drift into disagreeing about what a session is.
+ */
+export interface EodTailCalendar {
+  /**
+   * The most recent NYSE session whose 21:00 ET archive is already PAST — i.e.
+   * the newest date a healthy ledger is required to hold a row for.
+   *
+   * This is deliberately not "the last market day". A read at 16:45 ET on a
+   * Tuesday must not accuse the ledger of missing Tuesday: that session's
+   * archive is hours away. Grading against the last SETTLED session is what
+   * keeps this axis free of a false red every single afternoon — and an axis
+   * that cries wolf daily is one nobody reads on the day it is right.
+   */
+  lastSettledSession: string | null;
+  /** Is `YYYY-MM-DD` an NYSE trading day? */
+  isMarketDay: (dateIso: string) => boolean;
+}
+
+/**
+ * TRA-2817 — completed NYSE sessions strictly after `anchor`, through
+ * `lastSettledSession` inclusive. `0` means the ledger is current.
+ *
+ * Counts SESSIONS, not elapsed days, which is the whole point: a Friday row
+ * read on a Sunday is current (0), and a Friday row read on the following
+ * Wednesday afternoon is 2 sessions stale (Mon + Tue), not 5 days stale. The
+ * 2026-08-03 Monday in this incident is a session; the TRA-2764 correction
+ * exists because it was once mistaken for a weekend.
+ *
+ * Returns `null` when either endpoint is absent — NOT MEASURED. A book with no
+ * rows at all has no anchor, and inventing `0` for it would hand the empty
+ * ledger the cleanest reading on the endpoint.
+ */
+export function countStaleTailSessions(
+  anchor: string | null,
+  lastSettledSession: string | null,
+  isMarketDay: (dateIso: string) => boolean,
+  maxLookaheadDays = 400,
+): number | null {
+  if (anchor == null || lastSettledSession == null) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(anchor) || !/^\d{4}-\d{2}-\d{2}$/.test(lastSettledSession)) {
+    return null;
+  }
+  if (anchor >= lastSettledSession) return 0;
+  let t = Date.parse(`${anchor}T00:00:00Z`);
+  const end = Date.parse(`${lastSettledSession}T00:00:00Z`);
+  if (!Number.isFinite(t) || !Number.isFinite(end)) return null;
+  let n = 0;
+  // Bounded so a malformed pair cannot spin. A ledger more than `maxLookahead`
+  // days behind is already maximally red; the exact count stops mattering.
+  for (let i = 0; i < maxLookaheadDays && t < end; i++) {
+    t += 86_400_000;
+    const iso = new Date(t).toISOString().slice(0, 10);
+    if (isMarketDay(iso)) n += 1;
+  }
+  return n;
+}
+
 export function foldJournalClosesByEtDay(
   rows: ReadonlyArray<{ closeTs?: number; realizedPnlUsd?: number }>,
   etDate: (ts: number) => string,
@@ -1176,6 +1314,10 @@ export function reconcilePnl(
   journalClosesByDate: ReadonlyMap<string, JournalDayCloses> | null = null,
   eodOptionsByDate: ReadonlyMap<string, number> | null = null,
   eodStockByDate: ReadonlyMap<string, number> | null = null,
+  // TRA-2817 — the TAIL axis. Optional and defaulting to `null` so every
+  // existing caller keeps compiling; a caller that passes nothing gets
+  // `eodTailStaleSessions: null` (NOT MEASURED), never a fabricated `0`.
+  tailCalendar: EodTailCalendar | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -1381,8 +1523,27 @@ export function reconcilePnl(
       || Math.abs(d.stockDaily) > PNL_RECONCILE_TOLERANCE_USD,
   );
   const eodRowMissingDates = eodRowGradeable.filter(d => d.eodRowMissing).map(d => d.date);
+  // TRA-2817 — THE TAIL. Anchored on the newest row in `days`, INCLUDING
+  // below-baseline ones: the baseline is a data-integrity cutoff for grading
+  // drift, not evidence that the writer was dead. Anchoring on `evaluated`
+  // instead would score a book whose whole history predates the baseline as
+  // maximally stale for a writer that is working fine.
+  const eodTailLatestRowDate = days.length === 0 ? null : days[days.length - 1]!.date;
+  const eodTailSettledSession = tailCalendar?.lastSettledSession ?? null;
+  const eodTailStaleSessions = tailCalendar
+    ? countStaleTailSessions(eodTailLatestRowDate, eodTailSettledSession, tailCalendar.isMarketDay)
+    : null;
+  // A stale tail is a HARD false, and it outranks the interior cohort entirely.
+  // Both of the interior's non-false states are wrong here: `true` is the
+  // clean-pass-over-a-dead-writer this ticket was filed about, and `null` reads
+  // as "nothing to check" when the truth is "nothing was written". The interior
+  // verdict is only consulted once the tail is known to be current.
   const eodRowsPresentOk: boolean | null =
-    eodRowGradeable.length === 0 ? null : eodRowMissingDates.length === 0;
+    eodTailStaleSessions != null && eodTailStaleSessions > 0
+      ? false
+      : eodRowGradeable.length === 0
+        ? null
+        : eodRowMissingDates.length === 0;
   // TRA-2630 — the per-leg verdicts. Baseline-gated exactly like `ok`: a
   // pre-fix row's stock leg is un-reconcilable for the same reason its `drift`
   // is, so grading it would hand these new fields the same dead state `ok` has.
@@ -1577,6 +1738,9 @@ export function reconcilePnl(
     eodRowMissingDates,
     eodRowsPresentOk,
     eodRowGradeableCount: eodRowGradeable.length,
+    eodTailStaleSessions,
+    eodTailLatestRowDate,
+    eodTailSettledSession,
     optionsFieldMissingCount: days.filter(d => !d.optionsFieldPresent).length,
     optionsDailyPnlSourceCounts: days.reduce<Record<string, number>>((acc, d) => {
       const key = d.optionsDailyPnlSource ?? 'legacy-bucket';

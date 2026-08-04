@@ -38,6 +38,7 @@ import {
   STORAGE_LIVENESS_DISK_MONITOR_KEYS,
   STORAGE_GATED_KEYS,
   STORAGE_GATED_DISK_KEYS,
+  diskExhaustedAxis,
   STORAGE_LIVENESS_ROUTE,
   STORAGE_DETAIL_ROUTE,
   type StorageDiagnostic,
@@ -76,6 +77,12 @@ const HEALTHY_DISK: DiskReading = {
   freeBytes: 425_000_000,
   freePct: 42.5,
   reservedBytes: 49_000_000,
+  // TRA-2817 — inodes healthy too, so this fixture stays a clean pass on BOTH
+  // axes. Distinct from every byte figure above so a field crossed with another
+  // is visible rather than coincidentally equal.
+  inodesTotal: 65_536,
+  inodesFree: 40_000,
+  inodeFreePct: 61.03515625,
 };
 
 const USAGE: DataDirUsage = {
@@ -411,5 +418,52 @@ describe('index.ts call site', () => {
   it('leaves /api/health/version ungated — deploy-SHA verification depends on it', () => {
     const src = readFileSync(new URL('./observability/health-routes.ts', import.meta.url), 'utf8');
     expect(src).toContain("app.get('/api/health/version', (_req, res) => {");
+  });
+});
+
+/**
+ * TRA-2817 — the INODE axis.
+ *
+ * A filesystem has two exhaustible resources and `ENOSPC` is what both of them
+ * raise. `/data` on bqb1 returned `ENOSPC` on every write from
+ * 2026-07-30T23:40:19Z for five days — the EOD ledger stopped dead across 47
+ * books — while this route served `freePct 37.566` and `belowThreshold: false`.
+ * It was never out of bytes: 65524 of 65536 inodes were consumed, 39590 of them
+ * by `backups/`. These fix the POLARITY, which is the only thing that was
+ * wrong; every byte figure it published was correct and irrelevant.
+ */
+describe('TRA-2817 disk exhaustion axis', () => {
+  const MIN = 10;
+
+  it('names inodes when bytes are healthy — the exact reading that went unseen for five days', () => {
+    // The live 2026-08-04 figures, rounded: 37.6% of bytes free, 0.018% of
+    // inodes. A blocks-only grader calls this disk fine.
+    expect(diskExhaustedAxis(37.566, 0.018, MIN)).toBe('inodes');
+  });
+
+  it('still names blocks when only bytes are exhausted', () => {
+    expect(diskExhaustedAxis(2.5, 80, MIN)).toBe('blocks');
+  });
+
+  it('names both when both are exhausted', () => {
+    expect(diskExhaustedAxis(2.5, 1, MIN)).toBe('blocks+inodes');
+  });
+
+  it('is null when neither is exhausted', () => {
+    expect(diskExhaustedAxis(90, 90, MIN)).toBeNull();
+  });
+
+  it('does not manufacture an exhaustion from an UNMEASURED inode table', () => {
+    // `files === 0` (tmpfs, NTFS, several network filesystems) reads as null,
+    // not as zero free. A blocks-only filesystem must grade exactly as it did
+    // before this axis existed — otherwise the fix is a permanent false alarm
+    // on every host that is not ext4.
+    expect(diskExhaustedAxis(90, null, MIN)).toBeNull();
+    expect(diskExhaustedAxis(2.5, null, MIN)).toBe('blocks');
+  });
+
+  it('grades the boundary as free, not exhausted', () => {
+    // Strictly below, matching the blocks term this was modelled on.
+    expect(diskExhaustedAxis(MIN, MIN, MIN)).toBeNull();
   });
 });

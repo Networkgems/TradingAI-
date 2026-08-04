@@ -342,6 +342,30 @@ export interface DiskReading {
    * Zero on NTFS/APFS, where `bfree === bavail`.
    */
   reservedBytes: number;
+  /**
+   * TRA-2817 — THE INODE AXIS. Total / free entries in the filesystem's inode
+   * table (`statfs.files` / `statfs.ffree`), and free as a percentage.
+   *
+   * A filesystem has TWO exhaustible resources and `ENOSPC` is what both of
+   * them raise. Grading only blocks gives the near-full alarm a shape with no
+   * failing state on half of its own failure surface — and on 2026-07-30 that
+   * half is the one that fired. `/data` on bqb1 returned `ENOSPC` on every
+   * write for five days (the EOD ledger stopped dead across 47 books, TRA-2817)
+   * while this reading served `freeBytes 383434752`, `freePct 37.6` and a clean
+   * `belowThreshold: false`. It was never out of bytes. It was out of inodes:
+   * 65524 of the 65536 entries an ext4 volume of this size gets, 39590 of them
+   * held by `backups/`.
+   *
+   * `null` — never a fabricated 100% — on a filesystem that does not report an
+   * inode table. Some do not (`files === 0` on several virtual and network
+   * filesystems), and a synthesised "plenty free" there would rebuild exactly
+   * the blind spot this field exists to remove: unmeasurable and healthy have
+   * to stay distinguishable. `checkDiskSpace` therefore cannot fire on a `null`
+   * axis, which is correct — it also cannot report one as a pass.
+   */
+  inodesTotal: number | null;
+  inodesFree: number | null;
+  inodeFreePct: number | null;
 }
 
 /** The `disk-near-full` threshold actually in force, in percent free. */
@@ -373,7 +397,26 @@ export async function readDiskSpace(path: string): Promise<DiskReading | null> {
     // Never negative: a filesystem that reports bavail > bfree is lying, and a
     // negative reserve would inflate the attributable figure instead of the residual.
     const reservedBytes = Math.max(0, (fs.bfree - fs.bavail) * fs.bsize);
-    return { path, freeBytes, totalBytes, freePct, reservedBytes };
+    // TRA-2817 — `files === 0` means "this filesystem has no inode table to
+    // report", not "zero inodes exist". Treating it as a real reading would
+    // publish `inodeFreePct: 0` on every tmpfs/NTFS mount and make the new axis
+    // a permanent false alarm; fabricating 100 would make it a permanent green.
+    // Neither. It is `null`, and `null` is NOT MEASURED.
+    const hasInodes = Number.isFinite(fs.files) && fs.files > 0;
+    const inodesTotal = hasInodes ? fs.files : null;
+    const inodesFree = hasInodes && Number.isFinite(fs.ffree) ? Math.max(0, fs.ffree) : null;
+    const inodeFreePct =
+      inodesTotal != null && inodesFree != null ? (inodesFree / inodesTotal) * 100 : null;
+    return {
+      path,
+      freeBytes,
+      totalBytes,
+      freePct,
+      reservedBytes,
+      inodesTotal,
+      inodesFree,
+      inodeFreePct,
+    };
   } catch (err) {
     logger.warn('disk-space read failed', {
       module: 'alerts',
@@ -394,9 +437,22 @@ export async function checkDiskSpace(
 ): Promise<DiskReading | null> {
   const reading = await readDiskSpace(path);
   if (!reading) return null;
-  const { freeBytes, totalBytes, freePct } = reading;
-  if (freePct < minFreePct) {
-    dispatchAlert('disk-near-full', 'critical', `Disk ${freePct.toFixed(1)}% free — below ${minFreePct}%`, {
+  const { freeBytes, totalBytes, freePct, inodesTotal, inodesFree, inodeFreePct } = reading;
+  // TRA-2817 — EITHER resource being exhausted means the disk cannot be written
+  // to, and `ENOSPC` is what both of them raise. The blocks term alone let a
+  // filesystem with 383 MB free and zero writable inodes alert nobody for five
+  // days. The two are ORed, not chained: a blocks-only alarm must keep firing
+  // exactly as before on a filesystem that reports no inode table at all.
+  const blocksLow = freePct < minFreePct;
+  const inodesLow = inodeFreePct != null && inodeFreePct < minFreePct;
+  if (blocksLow || inodesLow) {
+    // Name the resource that actually ran out. "Disk 37.6% free" as the subject
+    // line of an inode exhaustion is the alert that gets closed as a false
+    // positive — the number in it looks fine, because it is fine.
+    const subject = inodesLow
+      ? `Disk inodes ${inodeFreePct!.toFixed(1)}% free — below ${minFreePct}% (${freePct.toFixed(1)}% of BYTES still free; writes will fail with ENOSPC)`
+      : `Disk ${freePct.toFixed(1)}% free — below ${minFreePct}%`;
+    dispatchAlert('disk-near-full', 'critical', subject, {
       path,
       freeBytes,
       totalBytes,
@@ -406,6 +462,12 @@ export async function checkDiskSpace(
       // threshold. Without `minFreePct` in the detail, that alert is
       // indistinguishable from a genuine one.
       minFreePct,
+      // TRA-2817 — which axis tripped, and both readings, so a responder is
+      // never left inferring the resource from a byte figure that reads healthy.
+      exhausted: inodesLow ? (blocksLow ? 'blocks+inodes' : 'inodes') : 'blocks',
+      inodesTotal,
+      inodesFree,
+      inodeFreePct,
     });
   }
   return reading;
