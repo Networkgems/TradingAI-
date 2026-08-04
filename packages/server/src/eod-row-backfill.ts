@@ -49,11 +49,21 @@ export const CLOSING_EQUITY_BASIS_BROKER = 'broker-eod-balance';
 /** The broker balance series has no entry for that session — equity anchors are null. */
 export const CLOSING_EQUITY_BASIS_NOT_MEASURED = 'not-measured';
 
-/**
- * The stock leg was booked `0` and the equity probe agrees it is inert (or could
- * not be run because the equity anchors are unmeasured).
- */
+/** The stock leg was booked `0` and the equity probe RAN and agreed it is inert. */
 export const STOCK_LEG_BASIS_INERT = 'zero-probe-agrees';
+/**
+ * The stock leg was booked `0` and the probe COULD NOT RUN — at least one equity
+ * anchor is unmeasured, so there is nothing to difference.
+ *
+ * A third state, not folded into either of the others, and the live plan is why.
+ * The first cut labelled this case `zero-probe-agrees`, and all three
+ * reconstructed sessions came back reading "the probe agrees" when in fact the
+ * probe had not run on a single one of them — `stockLegProbeUsd: null` on every
+ * row. That is the recurring trap in this codebase: a clean reading and a
+ * never-measured one rendering identically (TRA-2635, TRA-2637). A probe that
+ * cannot run is not a probe that agrees.
+ */
+export const STOCK_LEG_BASIS_NOT_MEASURED = 'zero-probe-not-measured';
 /**
  * The stock leg was booked `0` but the equity probe found a material residual.
  * Named rather than silently absorbed — this is the trigger condition the ruling
@@ -125,8 +135,15 @@ export interface LiveEodRowBackfillPlan {
   optionsBackfilledUsd: number;
   /** Rows that would carry `closingEquity: null`. */
   unmeasuredEquityRowCount: number;
-  /** Rows whose equity probe disagrees with the booked zero stock leg. */
+  /** Rows whose equity probe RAN and disagreed with the booked zero stock leg. */
   stockLegProbeDisagreeCount: number;
+  /**
+   * Rows where the probe could not run at all. Published beside the disagree
+   * count, never folded into it: `stockLegProbeDisagreeCount: 0` alone reads as
+   * "the stock leg checks out" when it may mean "nothing was checked". On the
+   * live plan at first publication this was 3 of 3.
+   */
+  stockLegProbeNotMeasuredCount: number;
   /** Non-null when no plan could be produced at all (NOT the same as an empty plan). */
   notMeasuredReason: string | null;
 }
@@ -193,6 +210,7 @@ export function planLiveEodRowBackfill(args: {
       optionsBackfilledUsd: 0,
       unmeasuredEquityRowCount: 0,
       stockLegProbeDisagreeCount: 0,
+      stockLegProbeNotMeasuredCount: 0,
       notMeasuredReason: 'book has no ledger rows at all — no tail anchor to back-fill from',
     };
   }
@@ -211,6 +229,7 @@ export function planLiveEodRowBackfill(args: {
       optionsBackfilledUsd: 0,
       unmeasuredEquityRowCount: 0,
       stockLegProbeDisagreeCount: 0,
+      stockLegProbeNotMeasuredCount: 0,
       notMeasuredReason: 'no settled session available — the exchange calendar could not be resolved',
     };
   }
@@ -221,6 +240,7 @@ export function planLiveEodRowBackfill(args: {
   let optionsBackfilledUsd = 0;
   let unmeasuredEquityRowCount = 0;
   let stockLegProbeDisagreeCount = 0;
+  let stockLegProbeNotMeasuredCount = 0;
 
   // `openingEquity` telescopes: a session's open is the PRIOR session's close.
   // Seed from the anchor row's own close so the first back-filled row joins the
@@ -270,6 +290,7 @@ export function planLiveEodRowBackfill(args: {
     const probeDisagrees =
       stockLegProbeUsd !== null && Math.abs(stockLegProbeUsd) > STOCK_LEG_PROBE_TOLERANCE_USD;
     if (probeDisagrees) stockLegProbeDisagreeCount += 1;
+    if (stockLegProbeUsd === null) stockLegProbeNotMeasuredCount += 1;
 
     optionsBackfilledUsd += optionsDailyPnl;
     prevClose = closingEquity;
@@ -305,7 +326,11 @@ export function planLiveEodRowBackfill(args: {
       rowSource: EOD_BACKFILL_ROW_SOURCE,
       closingEquityBasis:
         closingEquity === null ? CLOSING_EQUITY_BASIS_NOT_MEASURED : CLOSING_EQUITY_BASIS_BROKER,
-      stockLegBasis: probeDisagrees ? STOCK_LEG_BASIS_PROBE_DISAGREES : STOCK_LEG_BASIS_INERT,
+      stockLegBasis: stockLegProbeUsd === null
+        ? STOCK_LEG_BASIS_NOT_MEASURED
+        : probeDisagrees
+          ? STOCK_LEG_BASIS_PROBE_DISAGREES
+          : STOCK_LEG_BASIS_INERT,
       stockLegProbeUsd,
     });
   }
@@ -320,6 +345,7 @@ export function planLiveEodRowBackfill(args: {
     optionsBackfilledUsd: round2(optionsBackfilledUsd),
     unmeasuredEquityRowCount,
     stockLegProbeDisagreeCount,
+    stockLegProbeNotMeasuredCount,
     notMeasuredReason: null,
   };
 }

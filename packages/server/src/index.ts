@@ -4590,6 +4590,11 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           optionsBackfilledUsd: e.eodBackfillPlan!.optionsBackfilledUsd,
           unmeasuredEquityRowCount: e.eodBackfillPlan!.unmeasuredEquityRowCount,
           stockLegProbeDisagreeCount: e.eodBackfillPlan!.stockLegProbeDisagreeCount,
+          // Published beside the disagree count, never folded into it. A lone
+          // `stockLegProbeDisagreeCount: 0` reads as "the stock leg checks out"
+          // when it can equally mean "nothing was checked" — and on the first
+          // live publication of this plan it meant the latter, on 3 rows of 3.
+          stockLegProbeNotMeasuredCount: e.eodBackfillPlan!.stockLegProbeNotMeasuredCount,
           notMeasuredReason: e.eodBackfillPlan!.notMeasuredReason,
           // The rows themselves, so the plan is auditable before it is armed
           // rather than only after it has written.

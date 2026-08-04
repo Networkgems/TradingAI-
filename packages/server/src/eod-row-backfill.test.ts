@@ -17,6 +17,7 @@ import {
   CLOSING_EQUITY_BASIS_NOT_MEASURED,
   STOCK_LEG_BASIS_INERT,
   STOCK_LEG_BASIS_PROBE_DISAGREES,
+  STOCK_LEG_BASIS_NOT_MEASURED,
 } from './eod-row-backfill.js';
 
 // TRA-2829 — the back-fill's contract, which is mostly about what it REFUSES to
@@ -296,6 +297,30 @@ describe('planLiveEodRowBackfill — the stock leg is shown inert, not assumed',
       calendar: { lastSettledSession: '2026-07-31', isMarketDay: isWeekdayIso },
     });
     expect(plan.rows[0]!.stockLegProbeUsd).toBeNull();
+  });
+
+  it('labels an unrunnable probe NOT MEASURED, distinctly from agreeing', () => {
+    // Regression: the first cut labelled this `zero-probe-agrees`, and the live
+    // plan came back claiming the probe agreed on all 3 sessions when it had run
+    // on none of them. `stockLegProbeDisagreeCount: 0` must not be readable as
+    // "the stock leg checks out" — hence the separate NOT-MEASURED counter.
+    const plan = planLiveEodRowBackfill({
+      snapshots: [row('2026-07-29', { closingEquity: 2243.48 })],
+      censusByDate: census({ '2026-07-31': { closes: 3, realizedPnlUsd: 739 } }),
+      balanceByDate: { '2026-08-03': 1547.15 },
+      calendar: CAL,
+    });
+    expect(plan.rows.map(r => r.stockLegBasis)).toEqual([
+      // 07-30: opens measured (from the anchor) but does not close -> unrunnable.
+      STOCK_LEG_BASIS_NOT_MEASURED,
+      STOCK_LEG_BASIS_NOT_MEASURED,
+      STOCK_LEG_BASIS_NOT_MEASURED,
+    ]);
+    expect(plan.stockLegProbeNotMeasuredCount).toBe(3);
+    expect(plan.stockLegProbeDisagreeCount).toBe(0);
+    // The two counters must be independently readable — a zero disagree count
+    // beside a full not-measured count is the honest reading of this plan.
+    expect(plan.rows.every(r => r.stockLegProbeUsd === null)).toBe(true);
   });
 });
 
