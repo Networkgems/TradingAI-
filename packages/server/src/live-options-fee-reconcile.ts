@@ -36,6 +36,7 @@ import type { TradierTradeHistoryFill } from '@trading-app/engine';
 import {
   backfillLiveOptionFees,
   summarizeLiveOptionsFeeSlippage,
+  historyFillSide,
 } from './live-options-fee-slippage-ledger.js';
 import { etDateString } from './scheduler.js';
 import { logger } from './observability/index.js';
@@ -93,7 +94,7 @@ export interface LiveOptionsFeeReconcileState {
   lastError: string | null;
   /**
    * Up to 5 history fills from the last fetch — diagnostic for key-mismatch
-   * investigation. Shows symbol, date, side (from description), orderId, and
+   * investigation. Shows symbol, date, description (truncated), orderId, and
    * commission so caller can verify the join is seeing the right account fills.
    */
   lastHistorySample: Array<{
@@ -103,6 +104,8 @@ export interface LiveOptionsFeeReconcileState {
     orderId: number | null;
     commission: number;
   }> | null;
+  /** How many history fills entered the composite key map (passed all join filters). */
+  lastJoinableCount: number | null;
 }
 
 let state: LiveOptionsFeeReconcileState = emptyState();
@@ -120,6 +123,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     totalUpdated: 0,
     lastError: null,
     lastHistorySample: null,
+    lastJoinableCount: null,
   };
 }
 
@@ -133,7 +137,7 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
   return {
     ...state,
     lastWindow: state.lastWindow === null ? null : { ...state.lastWindow },
-    lastHistorySample: state.lastHistorySample === null ? null : [...state.lastHistorySample],
+    lastHistorySample: state.lastHistorySample === null ? null : state.lastHistorySample.map((s) => ({ ...s })),
   };
 }
 
@@ -203,10 +207,19 @@ export async function runLiveOptionsFeeReconcile(
   const { updated } = backfillLiveOptionFees(historyFills);
   state.lastHistoryFills = historyFills.length;
   state.lastUpdated = updated;
+  // Count fills that pass the join filters (tradeType=option, recognizable side, qty>0, finite commission).
+  state.lastJoinableCount = historyFills.filter(
+    (f) => f.tradeType === 'option'
+      && historyFillSide(f.description) !== null
+      && typeof f.quantity === 'number' && Number.isFinite(f.quantity) && f.quantity > 0
+      && typeof f.commission === 'number' && Number.isFinite(f.commission),
+  ).length;
+  // Take up to 5 fills from the raw array BEFORE reconcileLedgerFees filters them —
+  // include fills regardless of tradeType/side so we can diagnose filter drops.
   state.lastHistorySample = historyFills.slice(0, 5).map((f) => ({
     symbol: f.symbol,
     date: f.date,
-    description: f.description,
+    description: f.description.slice(0, 80), // truncate long descriptions
     orderId: f.orderId,
     commission: f.commission,
   }));

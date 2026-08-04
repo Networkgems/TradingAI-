@@ -343,7 +343,7 @@ export interface FeeBackfillResult {
 }
 
 /** Map a history fill's `description` to the ledger side it can back-fill, or null. */
-function historyFillSide(description: string): LiveFillSide | null {
+export function historyFillSide(description: string): LiveFillSide | null {
   const s = description.toLowerCase();
   if (s.includes('buy to open')) return 'buy_to_open';
   if (s.includes('sell to close')) return 'sell_to_close';
