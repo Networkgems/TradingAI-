@@ -502,10 +502,23 @@ async function pruneBackupsToBudget(): Promise<{
   budgetGenerations: number;
 }> {
   const entries = await backupGenerations();
-  // Measure the per-generation cost off the NEWEST generation: it reflects the
-  // current fleet, and the oldest may pre-date half the accounts.
-  const newest = entries[entries.length - 1];
-  const filesPerGeneration = newest == null ? null : await countFiles(join(BACKUP_DIR, newest));
+  // Measure the per-generation cost off the NEWEST generations — they reflect
+  // the current fleet, where the oldest may pre-date half the accounts — and
+  // take the MAX of a small sample rather than the newest one alone.
+  //
+  // The sample is what makes this work during the incident it was written for.
+  // The newest generation on a full filesystem is a PARTIAL one: `ensureDir`
+  // and every `copyFile` inside it failed on ENOSPC, so it holds far fewer
+  // files than a healthy generation. Measuring that one alone reports a tiny
+  // per-generation cost, which inflates the budget into allowing MORE
+  // generations, which prunes less — the estimator is biased in exactly the
+  // direction that keeps the disk full. The max over three is conservative
+  // (over-estimating cost only prunes harder, which is the safe error here) and
+  // survives one truncated generation.
+  const sample = entries.slice(-3);
+  const counts: number[] = [];
+  for (const gen of sample) counts.push(await countFiles(join(BACKUP_DIR, gen)));
+  const filesPerGeneration = counts.length === 0 ? null : Math.max(...counts);
   const budgetGenerations = backupGenerationsWithinBudget(filesPerGeneration ?? 0);
   // Leave room for the generation about to be written, so the budget bounds the
   // tree at its PEAK rather than at the trough right after a prune.
@@ -539,7 +552,11 @@ async function pruneBackupsToBudget(): Promise<{
  * retention policy and how it took `/data` down for five days.
  */
 export async function rotateBackups(): Promise<void> {
-  await ensureDir(BACKUP_DIR);
+  // TRA-2817 — the prune runs before `ensureDir`, not just before the copies.
+  // `mkdir` needs an inode too, so on a full filesystem `ensureDir` THROWS and
+  // takes the whole function with it — which is how the old copy-then-prune
+  // order managed to never reach its prune at all. `backupGenerations` answers
+  // `[]` on a missing directory, so pruning first is safe on a first boot.
   const pruned = await pruneBackupsToBudget();
   if (pruned.removed > 0) {
     // Logged at warn, not info: a retention window that shrank is a capacity
@@ -553,6 +570,7 @@ export async function rotateBackups(): Promise<void> {
       maxFiles: backupMaxFiles(),
     });
   }
+  await ensureDir(BACKUP_DIR);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const target = join(BACKUP_DIR, stamp);
   await ensureDir(target);
