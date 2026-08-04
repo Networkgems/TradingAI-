@@ -383,8 +383,14 @@ export interface PnlReconcileDay {
    *
    * Not baseline-gated and not folded into any verdict: it is a measurement,
    * and rounding is the only transformation applied.
+   *
+   * TRA-2829 — `null` also when the row itself is a BACK-FILL whose broker
+   * equity anchor could not be measured. Every arithmetic consumer below already
+   * guards with `Number.isFinite`, which rejects `null`, so such a row drops out
+   * of the equity population instead of poisoning it — see
+   * {@link DailySnapshot.closingEquity} for why an interpolation was refused.
    */
-  closingEquity: number;
+  closingEquity: number | null;
   /**
    * TRA-2635 — `PaperAccount.getOptionsCredited()` as of this row: cumulative
    * realized option P&L this book's EQUITY has absorbed (see
@@ -1258,23 +1264,48 @@ export function countStaleTailSessions(
   isMarketDay: (dateIso: string) => boolean,
   maxLookaheadDays = 400,
 ): number | null {
+  return staleTailSessions(anchor, lastSettledSession, isMarketDay, maxLookaheadDays)?.length ?? null;
+}
+
+/**
+ * TRA-2829 — the tail sessions themselves, not just how many there are.
+ *
+ * {@link countStaleTailSessions} is now `this.length`, deliberately. The
+ * back-fill writer needs the DATES and the health axis needs the COUNT, and the
+ * two describing different sets is the failure mode that matters here: the
+ * ticket that spawned this work framed the hole as "the constant 3", and a
+ * writer carrying its own private notion of which sessions are absent would
+ * back-fill a set the axis never graded (or vice versa) while both read
+ * correct. One enumeration, two consumers — the same shape as
+ * `isJournalAuthoritativeSource` (TRA-2641).
+ *
+ * Returns `null` on the same NOT-MEASURED inputs the count does: a book with no
+ * anchor row has no tail, and `[]` there would hand the empty ledger the
+ * cleanest reading on the endpoint. `[]` means genuinely current.
+ */
+export function staleTailSessions(
+  anchor: string | null,
+  lastSettledSession: string | null,
+  isMarketDay: (dateIso: string) => boolean,
+  maxLookaheadDays = 400,
+): string[] | null {
   if (anchor == null || lastSettledSession == null) return null;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(anchor) || !/^\d{4}-\d{2}-\d{2}$/.test(lastSettledSession)) {
     return null;
   }
-  if (anchor >= lastSettledSession) return 0;
+  if (anchor >= lastSettledSession) return [];
   let t = Date.parse(`${anchor}T00:00:00Z`);
   const end = Date.parse(`${lastSettledSession}T00:00:00Z`);
   if (!Number.isFinite(t) || !Number.isFinite(end)) return null;
-  let n = 0;
+  const out: string[] = [];
   // Bounded so a malformed pair cannot spin. A ledger more than `maxLookahead`
   // days behind is already maximally red; the exact count stops mattering.
   for (let i = 0; i < maxLookaheadDays && t < end; i++) {
     t += 86_400_000;
     const iso = new Date(t).toISOString().slice(0, 10);
-    if (isMarketDay(iso)) n += 1;
+    if (isMarketDay(iso)) out.push(iso);
   }
-  return n;
+  return out;
 }
 
 export function foldJournalClosesByEtDay(
@@ -1390,7 +1421,12 @@ export function reconcilePnl(
           s.optionsDailyPnlBucket !== undefined && s.optionsDailyPnlBucket !== null
             ? round2(s.optionsDailyPnlBucket)
             : null,
-        closingEquity: round2(s.closingEquity),
+        // TRA-2829 — pass an unmeasured anchor through as `null`. `round2(null)`
+        // is 0, and a $0 closing equity on a live book reads as a total wipeout.
+        closingEquity:
+          s.closingEquity !== null && Number.isFinite(s.closingEquity)
+            ? round2(s.closingEquity)
+            : null,
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
         optionsCreditedInWindow: null,
@@ -1484,9 +1520,16 @@ export function reconcilePnl(
     if (!cur.belowBaseline) pool += Math.abs(cur.optionsDaily);
     if (i === 0) continue;
     const prev = days[i - 1]!;
-    if (!Number.isFinite(cur.closingEquity) || !Number.isFinite(prev.closingEquity)) continue;
+    // TRA-2829 — same guard, hoisted into locals so it NARROWS. `Number.isFinite`
+    // rejects `null` at runtime but does not tell the compiler so, and an
+    // unmeasured back-fill anchor must drop out of this pair rather than
+    // subtract as 0.
+    const curEquity = cur.closingEquity;
+    const prevEquity = prev.closingEquity;
+    if (curEquity === null || prevEquity === null) continue;
+    if (!Number.isFinite(curEquity) || !Number.isFinite(prevEquity)) continue;
     const recorded = cur.optionsCreditedInWindow ?? 0;
-    const move = round2((cur.closingEquity - prev.closingEquity) - cur.stockDaily - recorded);
+    const move = round2((curEquity - prevEquity) - cur.stockDaily - recorded);
     cur.unbookedEquityMoveUsd = move;
     pool -= Math.abs(recorded);
     if (Math.abs(move) <= PNL_RECONCILE_TOLERANCE_USD) continue;
@@ -1717,11 +1760,16 @@ export function reconcilePnl(
   // happens to start on an active session.
   const evaluatedEquity = evaluated.filter(d => Number.isFinite(d.closingEquity));
   const spanned = evaluatedEquity.slice(1);
-  const postBaselineEquityGrowth = evaluatedEquity.length < 2
-    ? null
-    : round2(
-      evaluatedEquity[evaluatedEquity.length - 1]!.closingEquity - evaluatedEquity[0]!.closingEquity,
-    );
+  // TRA-2829 — the filter above already drops an unmeasured anchor (`null` is not
+  // finite); these locals just prove it to the compiler. Kept as an explicit
+  // null test rather than a `!`, so that widening `closingEquity` can never
+  // silently become a `null - null === 0` growth reading.
+  const firstEquity = evaluatedEquity[0]?.closingEquity ?? null;
+  const lastEquity = evaluatedEquity[evaluatedEquity.length - 1]?.closingEquity ?? null;
+  const postBaselineEquityGrowth =
+    evaluatedEquity.length < 2 || firstEquity === null || lastEquity === null
+      ? null
+      : round2(lastEquity - firstEquity);
   const postBaselineOptionsRealized = round2(spanned.reduce((s, d) => s + d.optionsDaily, 0));
   const postBaselineStockDaily = round2(spanned.reduce((s, d) => s + d.stockDaily, 0));
 

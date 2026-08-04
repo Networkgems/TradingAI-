@@ -3,8 +3,32 @@ import { join } from 'path';
 
 export interface DailySnapshot {
   date: string;
-  openingEquity: number;
-  closingEquity: number;
+  /**
+   * TRA-2829 — `null` on a BACK-FILLED row whose broker equity anchor could not
+   * be measured. See {@link DailySnapshot.closingEquity}; the two are widened
+   * together because a row's opening equity is the prior session's close, so
+   * whatever makes one unmeasurable makes the other so too.
+   */
+  openingEquity: number | null;
+  /**
+   * **`null` means NOT MEASURED, and it is load-bearing.**
+   *
+   * TRA-2829 — a day close always writes a real number here. A row inserted by
+   * the EOD back-fill writer (`rowSource: 'backfill-TRA-2827'`) may not be able
+   * to: the options leg is reconstructable from the durable per-trade journal at
+   * exact cents, but the equity anchor is only as good as
+   * `tradier-eod-balance.<env>.json`, and that file has holes wherever the EOD
+   * write failed. Interpolating across such a hole would produce a row that
+   * reads exactly like a recorded one while carrying a number nobody measured —
+   * the TRA-2079 unannounced-correction trap, and the specific thing the CFO
+   * ruling on this back-fill forbids.
+   *
+   * So: honest `null`, never an interpolation. Every consumer that arithmetics
+   * on this field guards with `Number.isFinite` (which rejects `null`), so an
+   * unmeasured row drops OUT of the population rather than poisoning it with
+   * `NaN` or, worse, with a plausible zero.
+   */
+  closingEquity: number | null;
   dailyPnl: number;
   optionsPnl: number;
   combinedPnl: number;
@@ -59,6 +83,46 @@ export interface DailySnapshot {
    * pre-fix book's equity contains no option P&L at all.
    */
   optionsCreditedCumulative?: number;
+  /**
+   * TRA-2829 — **provenance marker. Absent on every RECORDED row.**
+   *
+   * Set to `EOD_BACKFILL_ROW_SOURCE` on rows the back-fill writer INSERTED for a
+   * session the ledger never wrote. Distinct from `optionsDailyPnlSource`, which
+   * says where one FIELD's number came from on a row that already existed; this
+   * says the whole row is a reconstruction.
+   *
+   * Mandatory per the CFO ruling: a back-filled row that reads like a recorded
+   * one is a defect even when every number in it is right. Undefined here means
+   * "the 21:00 ET archive wrote this", and nothing else may set it.
+   */
+  rowSource?: string;
+  /**
+   * TRA-2829 — how `closingEquity` on a back-filled row was established.
+   * `'broker-eod-balance'` = read from `tradier-eod-balance.<env>.json` for that
+   * exact session. `'not-measured'` = the balance series has no entry, so
+   * `closingEquity`/`openingEquity` are `null`. Absent on recorded rows.
+   */
+  closingEquityBasis?: string;
+  /**
+   * TRA-2829 — how `dailyPnl` (the STOCK leg) was established on a back-filled
+   * row, and the evidence for it. The CFO ruling requires the stock leg be shown
+   * inert before any Tradier stock reconstruction is built, so the writer books
+   * `0` and publishes both the basis and {@link DailySnapshot.stockLegProbeUsd}
+   * — a falsifiable measurement of that `0`, not an assertion of it.
+   */
+  stockLegBasis?: string;
+  /**
+   * TRA-2829 — `(closingEquity − openingEquity) − optionsDailyPnl` on a
+   * back-filled row, when BOTH equity anchors were measured; `null` otherwise.
+   *
+   * This is the residual the stock leg would have to explain. It is published as
+   * a MEASUREMENT and is deliberately NOT booked into `dailyPnl`: it also
+   * absorbs any broker cash flow, so it is an upper bound on stock activity, not
+   * stock activity. Its job is to make the booked `0` falsifiable — a materially
+   * non-zero probe is the trigger the ruling names for building stock
+   * reconstruction, and without it "the stock leg was inert" is unfalsifiable.
+   */
+  stockLegProbeUsd?: number | null;
   trades: number;
 }
 
@@ -199,10 +263,17 @@ export class PnlTracker {
     this.snapshots.sort((a, b) => a.date.localeCompare(b.date));
     writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
 
-    this.state.openingEquity = snapshot.closingEquity;
-    this.state.openingOptionsPnl = this.state.optionsPnl;
-    this.state.openingDate = snapshot.date;
-    this.persistState();
+    // TRA-2829 — a real day close always carries a measured `closingEquity`, so
+    // this guard should never fire from `generateAndSaveReport`. It exists so
+    // that if some future caller ever hands `saveSnapshot` an unmeasured row,
+    // the dashboard's opening equity is LEFT ALONE rather than rebased to
+    // `null` — which would read as $0 and manufacture a book-sized phantom P&L.
+    if (snapshot.closingEquity !== null && Number.isFinite(snapshot.closingEquity)) {
+      this.state.openingEquity = snapshot.closingEquity;
+      this.state.openingOptionsPnl = this.state.optionsPnl;
+      this.state.openingDate = snapshot.date;
+      this.persistState();
+    }
   }
 
   /**
@@ -244,6 +315,46 @@ export class PnlTracker {
     return repaired;
   }
 
+  /**
+   * TRA-2829 (parent TRA-2827) — INSERT ledger rows for sessions the 21:00 ET
+   * archive never wrote, from the durable option-trade journal.
+   *
+   * Sibling of {@link applyOptionsDailyPnlRepair} and held to the same
+   * discipline, but the opposite operation: that one REWRITES a field on a row
+   * that exists, this one CREATES a row that is absent. Both are back-fills of a
+   * past cell, so neither may call `saveSnapshot` — doing so would rebase
+   * `openingEquity`/`openingDate` off a historical row and hand the live
+   * dashboard a days-old anchor, which is exactly the corruption
+   * `generateAndSaveReport` skips snapshots on a backfill to avoid.
+   *
+   * **Append-only against existing rows.** A date that already has a row is
+   * skipped outright — never merged, never overwritten. The recorded ledger is
+   * the authority wherever it spoke at all; this writer only fills silence. That
+   * is also what makes it idempotent, which is not optional: bqb1 restarts
+   * several times an hour, so the second pass MUST write nothing.
+   *
+   * Returns the dates actually inserted.
+   */
+  applyEodRowBackfill(rows: ReadonlyArray<DailySnapshot>): string[] {
+    if (rows.length === 0) return [];
+    const existing = new Set(this.snapshots.map(s => s.date));
+    const inserted: DailySnapshot[] = [];
+    for (const r of rows) {
+      if (existing.has(r.date)) continue;
+      // Refuse to write an unmarked row. The provenance marker is the whole
+      // point of this path per the CFO ruling, so a caller that forgets it gets
+      // nothing written rather than a row that reads as recorded — a defect that
+      // would be undetectable after the fact.
+      if (!r.rowSource) continue;
+      existing.add(r.date);
+      inserted.push(r);
+    }
+    if (inserted.length === 0) return [];
+    this.snapshots = [...this.snapshots, ...inserted].sort((a, b) => a.date.localeCompare(b.date));
+    writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
+    return inserted.map(r => r.date).sort();
+  }
+
   getCumulativeStats(currentEquity: number): CumulativeStats {
     const today = todayKey();
     const weekStart = startOfWeek();
@@ -265,10 +376,16 @@ export class PnlTracker {
         .filter(s => s.date >= from)
         .reduce((acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
 
+    // TRA-2829 — an unmeasured `closingEquity` (`null` on a back-filled row) is
+    // dropped, not coerced. `Math.max(..., null)` is 0, which would not merely
+    // be wrong here — it would silently CAP `peakEquity` at 0 and turn every
+    // drawdown reading on the book into a fiction.
     const peakEquity = Math.max(
       this.initialEquity,
       currentEquity,
-      ...this.snapshots.map(s => s.closingEquity),
+      ...this.snapshots
+        .map(s => s.closingEquity)
+        .filter((v): v is number => v !== null && Number.isFinite(v)),
     );
 
     // TRA-1557 — all-time P&L must reconcile with the booked daily-snapshot
