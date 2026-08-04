@@ -1642,7 +1642,36 @@ async function generateAndSaveReport(
       writeFile(join(targetDir, 'latest.md'), finalReport.markdown, 'utf-8'),
     );
   }
-  await Promise.all(writes);
+  // TRA-2817 — the durable ledger row must NOT be hostage to the report FILE.
+  //
+  // These four writes each CREATE a file, and a create needs a free inode. The
+  // snapshot persist below writes `daily-snapshots.json` IN PLACE, with no temp
+  // file, so it needs only free blocks. When `/data` ran out of inodes on
+  // 2026-07-30 those are opposite fates — and because the throw from here
+  // aborted the function ~50 lines above `saveSnapshot`, the write that WOULD
+  // have succeeded never ran. Three sessions, 47 books, a ledger writer killed
+  // by a failure in a different writer with a different failure mode.
+  //
+  // The durable evidence for the asymmetry: `option-trade-journal.jsonl` uses
+  // `appendFile` on an existing path (no new inode) and recorded all 41 option
+  // closes across 2026-07-30 / 07-31 / 08-03 with `corruptLines: 0`, straight
+  // through the outage, while every dated report file failed to be created.
+  //
+  // So a report-file failure is now LOUD but not FATAL. The resulting state is
+  // a ledger row whose `eodCombined` is null, which TRA-2637 already grades as
+  // `eodRowMissing: true` — a visible, self-healing interior gap that
+  // `catchUpMissedEodReports` fills on the next boot. That is strictly better
+  // than the silent green a missing row produced, which is this whole ticket.
+  try {
+    await Promise.all(writes);
+  } catch (err) {
+    log.error('EOD report file write failed — booking the ledger row anyway (TRA-2817)', {
+      username: ctx.username,
+      date: finalReport.date,
+      datePath,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // TRA-2689 (leg 2 of TRA-2654) — flush the WRITE-ONLY denominator-flip
   // candidate tape. The feed records into a bounded in-process ring and never
