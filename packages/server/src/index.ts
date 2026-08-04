@@ -26,6 +26,7 @@ import {
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
   summarizeLiveLagTripwire,
+  summarizeLiveCohortIntegrity,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
   summarizeDriftGradeability,
@@ -4103,7 +4104,17 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
     }
     const engines = await Promise.all(
       getAllUserContexts().map(async ctx => {
-        const mode = stockModeKey(getSettings(ctx.username));
+        // TRA-2761 — classify off `loadSettings`, NOT `getSettings`. `getSettings`
+        // serves `DEFAULT_ACCOUNT_SETTINGS` (mode: demo) on a cache miss, so any
+        // eviction of the operator's cache entry silently reclassified the live
+        // book as demo, emptied the live cohort, and flipped every `live*` verdict
+        // FALSE → null with the defect unchanged (observed live 2026-08-02T00:47Z:
+        // 61/61 `mode:"demo"` while the journal held 10 open+closed `mode:"live"`
+        // rows; the same process had served `admin` as live 33h earlier).
+        // `loadSettings` returns the cached reference when present, so the cost is
+        // identical on the hot path and a miss re-reads the durable store instead
+        // of manufacturing a demo classification.
+        const mode = stockModeKey(await loadSettings(ctx.username));
         const dir = stockReportsDirFor(ctx, mode);
         const snapshots = ctx.tracker.getSnapshots();
         const eodByDate = new Map<string, number>();
@@ -4145,16 +4156,29 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         // 21:00 writer, the historical repair and this checker all scope the
         // same way. A checker grading a population the writer never saw is a
         // guard that can never go green no matter how correct the fix is.
-        const journalByDate = journalRows == null
+        const bookRows = journalRows == null
           ? null
-          : foldJournalClosesByEtDay(
-            // TRA-2421 — identity epoch; see the note at the 21:00 writer.
-            journalRowsForBook(journalRows, ctx.username, accountDeletedAt(ctx.username)),
-            (ts: number) => etDateString(new Date(ts)),
-          );
+          // TRA-2421 — identity epoch; see the note at the 21:00 writer.
+          : journalRowsForBook(journalRows, ctx.username, accountDeletedAt(ctx.username));
+        const journalByDate = bookRows == null
+          ? null
+          : foldJournalClosesByEtDay(bookRows, (ts: number) => etDateString(new Date(ts)));
+        // TRA-2761 — this book's OPEN live-mode journal rows: the durable evidence
+        // that live notional exists regardless of what the read-time classifier
+        // says. Consumed by `summarizeLiveCohortIntegrity` below.
+        const openLiveRows = bookRows == null
+          ? null
+          : bookRows.filter(r => r.mode === 'live' && typeof r.closeTs !== 'number');
         return {
           username: ctx.username,
           mode,
+          openLiveJournalRowCount: openLiveRows == null ? null : openLiveRows.length,
+          openLiveJournalAtRiskUsd: openLiveRows == null
+            ? null
+            : openLiveRows.reduce(
+              (s, r) => s + (Number.isFinite(r.atRiskUsd) ? r.atRiskUsd : 0),
+              0,
+            ),
           ...reconcilePnl(
             snapshots,
             eodByDate,
@@ -4314,6 +4338,42 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         .filter(e => e.eodRowMissingDates.length > 0)
         .map(e => ({ username: e.username, mode: e.mode, dates: e.eodRowMissingDates })),
       ...summarizeLiveEodRowPresence(engines),
+      // TRA-2761 — cohort-membership integrity. Every `live*` fold above filters
+      // on the read-time classifier; this one cross-checks that classifier
+      // against the journal's durable open `mode:'live'` rows, so a cohort that
+      // empties while open live notional persists reads RED (`false`) instead of
+      // flipping every live verdict to NOT MEASURED with the money unobserved.
+      ...summarizeLiveCohortIntegrity(engines, (() => {
+        if (journalRows == null) {
+          return {
+            journalCensusAvailable: false,
+            unattributedOpenLiveRowCount: 0,
+            unattributedOpenLiveAtRiskUsd: 0,
+          };
+        }
+        const openLiveTotal = journalRows.filter(
+          r => r.mode === 'live' && typeof r.closeTs !== 'number',
+        );
+        const attributedCount = engines.reduce(
+          (n, e) => n + (e.openLiveJournalRowCount ?? 0),
+          0,
+        );
+        const attributedAtRisk = engines.reduce(
+          (s, e) => s + (e.openLiveJournalAtRiskUsd ?? 0),
+          0,
+        );
+        const totalAtRisk = openLiveTotal.reduce(
+          (s, r) => s + (Number.isFinite(r.atRiskUsd) ? r.atRiskUsd : 0),
+          0,
+        );
+        return {
+          journalCensusAvailable: true,
+          // Open live rows no current book claims (identity-retired epoch, or a
+          // pre-TRA-1475 row with no `account`) — orphaned notional, RED.
+          unattributedOpenLiveRowCount: Math.max(0, openLiveTotal.length - attributedCount),
+          unattributedOpenLiveAtRiskUsd: Math.max(0, totalAtRisk - attributedAtRisk),
+        };
+      })()),
       engines,
     });
   } catch (err) {

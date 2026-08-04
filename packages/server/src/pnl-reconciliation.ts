@@ -1028,6 +1028,105 @@ export function summarizeLiveEodRowPresence(
 }
 
 /**
+ * TRA-2761 — **cohort-membership integrity: is every open live-mode position
+ * still inside the live cohort that grades it?**
+ *
+ * Every `live*` fold above filters `engines` on the READ-TIME mode classifier
+ * (`stockModeKey(settings)`), while the option journal's `mode: 'live'` is a
+ * WRITE-TIME stamp by the engine that opened the position. Those are two
+ * different ledgers, and on 2026-08-02T00:47Z they disagreed in one process:
+ * `pnl-reconciliation` resolved all 61 books `mode: 'demo'` while the journal
+ * held 10 `mode: 'live'` rows against `admin` — 7 of them OPEN, $1,401.50 at
+ * risk. The live cohort emptied, every `live*` verdict above went FALSE → null
+ * (NOT MEASURED), and the open real-money positions were outside every
+ * live-axis gate with nothing anywhere reading RED.
+ *
+ * `null` is the correct reading for "no live book exists" — but it is a
+ * catastrophically wrong reading for "the live book was reclassified out from
+ * under a still-open live position". This fold is what separates them: the
+ * journal's open `mode: 'live'` rows are durable evidence that live-mode
+ * notional EXISTS, independent of what the read-time classifier serves, so a
+ * cohort that empties while such rows persist must be RED, not unmeasured.
+ *
+ * Tri-state, same precedence discipline as every fold above:
+ *   - `false` — some account holds OPEN live-mode journal rows while its engine
+ *     is NOT classified `mode: 'live'` (reclassified out — the observer is
+ *     blind to real open notional), or open live-mode rows exist that no
+ *     current book claims at all (orphaned by identity retirement — worse).
+ *   - `true`  — open live-mode rows exist and every holding account is inside
+ *     the live cohort. The observer can see everything it must.
+ *   - `null`  — the journal census is unavailable (NOT MEASURED), or there are
+ *     no open live-mode rows anywhere (nothing to protect; the published
+ *     count `0` is what distinguishes this from unmeasured).
+ *
+ * Sandbox nuance: a book the classifier resolves `'sandbox'` (armed live,
+ * Tradier sandbox env) journals `mode: 'demo'` rows in practice (measured
+ * 2026-08-04: every journal `mode:'live'` row belongs to the production-armed
+ * operator). If a book ever DOES hold open `mode:'live'` rows while resolving
+ * `'sandbox'`, that still reads RED here — an open production-era position
+ * under a book that has since been pointed at the sandbox is exactly as
+ * unobserved as one under a demo reclassification.
+ */
+export function summarizeLiveCohortIntegrity(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    openLiveJournalRowCount: number | null;
+    openLiveJournalAtRiskUsd: number | null;
+  }>,
+  opts: {
+    journalCensusAvailable: boolean;
+    unattributedOpenLiveRowCount: number;
+    unattributedOpenLiveAtRiskUsd: number;
+  },
+): {
+  liveOpenJournalRowCount: number | null;
+  liveOpenJournalAtRiskUsd: number | null;
+  liveOpenJournalUnattributedRowCount: number | null;
+  liveCohortReclassifiedBooks: Array<{
+    username: string;
+    mode: string;
+    openLiveJournalRowCount: number;
+    openLiveJournalAtRiskUsd: number;
+  }> | null;
+  liveCohortIntegrityOk: boolean | null;
+} {
+  if (!opts.journalCensusAvailable) {
+    return {
+      liveOpenJournalRowCount: null,
+      liveOpenJournalAtRiskUsd: null,
+      liveOpenJournalUnattributedRowCount: null,
+      liveCohortReclassifiedBooks: null,
+      liveCohortIntegrityOk: null,
+    };
+  }
+  const holders = engines.filter(e => (e.openLiveJournalRowCount ?? 0) > 0);
+  const reclassified = holders
+    .filter(e => e.mode !== 'live')
+    .map(e => ({
+      username: e.username,
+      mode: e.mode,
+      openLiveJournalRowCount: e.openLiveJournalRowCount ?? 0,
+      openLiveJournalAtRiskUsd: round2(e.openLiveJournalAtRiskUsd ?? 0),
+    }));
+  const attributedCount = holders.reduce((n, e) => n + (e.openLiveJournalRowCount ?? 0), 0);
+  const attributedAtRisk = holders.reduce((s, e) => s + (e.openLiveJournalAtRiskUsd ?? 0), 0);
+  const totalCount = attributedCount + opts.unattributedOpenLiveRowCount;
+  return {
+    liveOpenJournalRowCount: totalCount,
+    liveOpenJournalAtRiskUsd: round2(attributedAtRisk + opts.unattributedOpenLiveAtRiskUsd),
+    liveOpenJournalUnattributedRowCount: opts.unattributedOpenLiveRowCount,
+    liveCohortReclassifiedBooks: reclassified,
+    liveCohortIntegrityOk:
+      reclassified.length > 0 || opts.unattributedOpenLiveRowCount > 0
+        ? false
+        : totalCount === 0
+          ? null
+          : true,
+  };
+}
+
+/**
  * TRA-2302 — fold durable option-trade-journal rows into a per-ET-day close
  * census for ONE book.
  *

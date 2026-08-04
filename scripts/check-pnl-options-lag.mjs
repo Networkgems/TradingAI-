@@ -92,6 +92,12 @@
  *                  equity absorbed NONE of it. ESCALATE: TRA-2323 scope item 1
  *                  is unshipped on real capital, and every sizing decision on
  *                  that book is being made off an understated NAV.
+ *   6  LIVE COHORT RECLASSIFIED (TRA-2761) — open `mode:'live'` journal rows
+ *                  exist whose holder is no longer classified `mode: live` (or
+ *                  that no current book claims). The live cohort emptied out
+ *                  from under open real-money notional; every live axis above
+ *                  reads NOT MEASURED while the money is unobserved. Outranks
+ *                  the BLIND it would otherwise land on.
  *
  * THE COHORT IS PINNED, NOT LEARNED AT READ TIME (TRA-2630 AC2)
  * -------------------------------------------------------------
@@ -150,6 +156,15 @@ const EXIT_LIVE_CREDIT_UNSHIPPED = 4;
  * daily row records it. Distinct from exit 4, where the money never arrived.
  */
 const EXIT_LIVE_COUNTER_FROZEN = 5;
+/**
+ * TRA-2761 — open `mode:'live'` journal rows exist whose account the read-time
+ * classifier no longer resolves as `mode: live` (or that no current book claims
+ * at all). The live cohort emptied OUT FROM UNDER open real-money notional, so
+ * every `live*` verdict above reads NOT MEASURED while the money is unobserved.
+ * Distinct from EXIT_BLIND: BLIND is "nothing to grade", this is "there is
+ * something to grade and the observer was reclassified away from it".
+ */
+const EXIT_LIVE_COHORT_RECLASSIFIED = 6;
 
 /**
  * THE PREDICATE. Returns the lag dates for one book's day list.
@@ -1549,6 +1564,11 @@ async function main(argv) {
   // Graded here and printed unconditionally below, so no early return can hide it.
   const freeze = gradeLiveCounterFreeze(credit);
   printCounterFreezeAxis(freeze);
+  // TRA-2761 — likewise printed unconditionally: the reclassified state is the one
+  // where every OTHER live axis reads NOT MEASURED, so any early return that could
+  // hide this line would hide the only red left.
+  const integrity = gradeLiveCohortIntegrity(payload);
+  printCohortIntegrityAxis(integrity);
   console.log('');
   console.log('TRA-2630 AC3 — T+1 options-credit lag (stockDaily == prior session optionsDaily):');
 
@@ -1567,6 +1587,9 @@ async function main(argv) {
     // once its shortfall clears — `absorbed` goes null on a frozen counter, which
     // is UNMEASURABLE, which is BLIND.
     if (freeze.verdict === 'FROZEN') return reportCounterFrozen(freeze);
+    // TRA-2761 — same rule: reclassified-under-open-notional is a finding, and the
+    // BLIND both it and the credit axis would otherwise land on loses it.
+    if (integrity.verdict === 'RECLASSIFIED') return reportCohortReclassified(integrity);
     if (credit.verdict !== 'CREDIT_OK') return reportCreditBlind(credit);
     console.log('');
     console.log(`CLEAN — all three axes graded on ${credit.liveBookCount} live book(s).`);
@@ -1602,6 +1625,11 @@ async function main(argv) {
   // and below the exit-4 shortfall (money absent beats money mislabelled).
   if (credit.verdict === 'LIVE_CREDIT_UNSHIPPED') return reportCreditUnshipped(credit);
   if (freeze.verdict === 'FROZEN') return reportCounterFrozen(freeze);
+  // TRA-2761 — checked ABOVE the LIVE_UNMEASURABLE BLIND: when the cohort empties
+  // under open live notional, LIVE_UNMEASURABLE is exactly the arm that fires, and
+  // exiting BLIND there reports "graded nothing" over what is actually a
+  // loss-of-observer on real open money. The specific verdict must win.
+  if (integrity.verdict === 'RECLASSIFIED') return reportCohortReclassified(integrity);
   // Ordered ABOVE the demo verdict deliberately. With no live book in the fleet
   // the sentence "0 live books, so $0 live capital is at risk" is not a finding —
   // it is the absence of one, and it must not be printed as reassurance.
@@ -1947,6 +1975,96 @@ function reportCounterFrozen(freeze) {
   console.error('Remediation differs from a RESET counter — a reset re-books the credit INTO');
   console.error('`stockDaily` and double-counts; a freeze leaves the stock leg exact (TRA-2658).');
   return EXIT_LIVE_COUNTER_FROZEN;
+}
+
+/**
+ * TRA-2761 — cohort-membership integrity, read from the endpoint's own fold.
+ * Pure, so `--selftest` and `--file=` can drive it.
+ *
+ * The state this exists for: 2026-08-02T00:47Z, all 61 books resolved
+ * `mode:"demo"` while the option journal held 7 OPEN `mode:"live"` rows against
+ * `admin`, $1,401.50 at risk. Every `live*` verdict went FALSE → null and this
+ * script's honest answer was BLIND — which is true but toothless: BLIND says
+ * "graded nothing", not "there is open real money nothing is grading". The
+ * endpoint's `liveCohortIntegrityOk` cross-checks the read-time classifier
+ * against the journal's durable open live rows; this arm consumes it.
+ *
+ * FIELD_ABSENT handling mirrors the credit axis: a build that predates the fold
+ * serves `undefined`, and reading that as either verdict would grade an absent
+ * field. Print NOT MEASURED and change nothing.
+ */
+function gradeLiveCohortIntegrity(payload) {
+  if (payload?.liveCohortIntegrityOk === undefined) {
+    return { verdict: 'FIELD_ABSENT', books: [], openRowCount: null, atRiskUsd: null, unattributed: null };
+  }
+  const books = payload.liveCohortReclassifiedBooks ?? [];
+  const base = {
+    books,
+    openRowCount: payload.liveOpenJournalRowCount ?? null,
+    atRiskUsd: payload.liveOpenJournalAtRiskUsd ?? null,
+    unattributed: payload.liveOpenJournalUnattributedRowCount ?? null,
+  };
+  if (payload.liveCohortIntegrityOk === false) return { verdict: 'RECLASSIFIED', ...base };
+  if (payload.liveCohortIntegrityOk === true) return { verdict: 'INTACT', ...base };
+  // null — either the journal census was unavailable (counts null) or there are
+  // genuinely no open live rows (count 0). Different sentences, same non-verdict.
+  return {
+    verdict: base.openRowCount === null ? 'NOT_MEASURED' : 'NO_OPEN_LIVE_ROWS',
+    ...base,
+  };
+}
+
+/** Printed on EVERY path, before any early return — same rule as the freeze axis. */
+function printCohortIntegrityAxis(integrity) {
+  console.log('');
+  console.log('TRA-2761 — is every OPEN live-mode journal row inside the live cohort that');
+  console.log('grades it? (durable journal stamp vs read-time classifier):');
+  if (integrity.verdict === 'FIELD_ABSENT') {
+    console.log('  NOT MEASURED — this build serves no `liveCohortIntegrityOk`, i.e. it predates');
+    console.log('    TRA-2761. A cohort that empties under open live notional is INVISIBLE to');
+    console.log('    every axis above on such a build. Deploy first.');
+    return;
+  }
+  if (integrity.verdict === 'NOT_MEASURED') {
+    console.log('  NOT MEASURED — the journal census was unavailable on this pull. Not a pass.');
+    return;
+  }
+  if (integrity.verdict === 'NO_OPEN_LIVE_ROWS') {
+    console.log('  NOTHING TO PROTECT — 0 open live-mode journal rows anywhere. (This is the');
+    console.log('    published-count 0, not an unmeasured absence.)');
+    return;
+  }
+  if (integrity.verdict === 'INTACT') {
+    console.log(
+      `  INTACT — ${integrity.openRowCount} open live row(s), $${(integrity.atRiskUsd ?? 0).toFixed(2)} at risk,`
+      + ' every holder classified mode:live.',
+    );
+    return;
+  }
+  for (const b of integrity.books) {
+    console.log(
+      `  LIVE-ROW HOLDER ${b.username} — classified mode:${b.mode} with `
+      + `${b.openLiveJournalRowCount} open live row(s), $${b.openLiveJournalAtRiskUsd.toFixed(2)} at risk`,
+    );
+  }
+  if ((integrity.unattributed ?? 0) > 0) {
+    console.log(`  ORPHANED — ${integrity.unattributed} open live row(s) no current book claims at all.`);
+  }
+}
+
+/** TRA-2761 — the observer was reclassified away from open real money. */
+function reportCohortReclassified(integrity) {
+  console.error('');
+  console.error(
+    `LIVE COHORT RECLASSIFIED — ${integrity.openRowCount} open mode:live journal row(s),`
+    + ` $${(integrity.atRiskUsd ?? 0).toFixed(2)} at risk, are OUTSIDE the live cohort every`,
+  );
+  console.error('live-axis verdict above is folded over. Those verdicts reading null/green is a');
+  console.error('verdict-masking flip (TRA-2630/TRA-2709 class), not a repair. ESCALATE: either');
+  console.error('the operator book was genuinely de-armed with positions still open, or the');
+  console.error('classifier is mis-labelling a live engine — check /api/health/options-live');
+  console.error('(`bootArmEligible`/`bootArmDrift`, TRA-713/TRA-1652) and re-arm, then re-run.');
+  return EXIT_LIVE_COHORT_RECLASSIFIED;
 }
 
 /** TRA-2635 — the credit axis graded nothing; a clean lag verdict cannot cover for it. */
@@ -3328,6 +3446,46 @@ function selftest() {
       return out.length;
     })(),
     0,
+  );
+
+  // TRA-2761 — the reclassified-cohort arm, both directions plus the two
+  // non-verdict states that must not be conflated with either.
+  check(
+    'TRA-2761: cohort emptied under open live rows → RECLASSIFIED',
+    gradeLiveCohortIntegrity({
+      liveCohortIntegrityOk: false,
+      liveOpenJournalRowCount: 7,
+      liveOpenJournalAtRiskUsd: 1401.5,
+      liveOpenJournalUnattributedRowCount: 0,
+      liveCohortReclassifiedBooks: [
+        { username: 'admin', mode: 'demo', openLiveJournalRowCount: 7, openLiveJournalAtRiskUsd: 1401.5 },
+      ],
+    }).verdict,
+    'RECLASSIFIED',
+  );
+  check(
+    'TRA-2761: every holder classified live → INTACT',
+    gradeLiveCohortIntegrity({
+      liveCohortIntegrityOk: true,
+      liveOpenJournalRowCount: 12,
+      liveOpenJournalAtRiskUsd: 2455.5,
+      liveOpenJournalUnattributedRowCount: 0,
+      liveCohortReclassifiedBooks: [],
+    }).verdict,
+    'INTACT',
+  );
+  check(
+    'TRA-2761: a build without the fold is FIELD_ABSENT, never a verdict',
+    gradeLiveCohortIntegrity({ liveBookCount: 1 }).verdict,
+    'FIELD_ABSENT',
+  );
+  check(
+    'TRA-2761: null with a published count 0 is NO_OPEN_LIVE_ROWS, null counts are NOT_MEASURED',
+    [
+      gradeLiveCohortIntegrity({ liveCohortIntegrityOk: null, liveOpenJournalRowCount: 0 }).verdict,
+      gradeLiveCohortIntegrity({ liveCohortIntegrityOk: null, liveOpenJournalRowCount: null }).verdict,
+    ],
+    ['NO_OPEN_LIVE_ROWS', 'NOT_MEASURED'],
   );
 
   let failed = 0;

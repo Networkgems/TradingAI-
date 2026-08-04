@@ -6,6 +6,7 @@ import {
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
+  summarizeLiveCohortIntegrity,
   summarizeDriftGradeability,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
   PNL_RECONCILIATION_CAVEATS,
@@ -1418,6 +1419,92 @@ describe('TRA-2637 — summarizeLiveEodRowPresence', () => {
     const r = summarizeLiveEodRowPresence([book('admin', 'live', null, [], 0)]);
     expect(r.liveEodRowBookCount).toBe(1);
     expect(r.liveEodRowsPresentOk).toBeNull();
+  });
+});
+
+describe('TRA-2761 — summarizeLiveCohortIntegrity', () => {
+  const book = (
+    username: string,
+    mode: string,
+    openLiveJournalRowCount: number | null,
+    openLiveJournalAtRiskUsd: number | null = 0,
+  ) => ({ username, mode, openLiveJournalRowCount, openLiveJournalAtRiskUsd });
+  const opts = (
+    unattributedOpenLiveRowCount = 0,
+    unattributedOpenLiveAtRiskUsd = 0,
+  ) => ({ journalCensusAvailable: true, unattributedOpenLiveRowCount, unattributedOpenLiveAtRiskUsd });
+
+  it('goes RED when the cohort empties out from under open live rows — the TRA-2761 shape', () => {
+    // 2026-08-02T00:47Z live: 61/61 books resolved demo while admin held 7 open
+    // mode:'live' rows, $1,401.50 at risk. Every live* verdict read null; this
+    // fold is the one that must carry the RED.
+    const r = summarizeLiveCohortIntegrity(
+      [book('admin', 'demo', 7, 1401.5), book('Richard', 'sandbox', 0)],
+      opts(),
+    );
+    expect(r.liveCohortIntegrityOk).toBe(false);
+    expect(r.liveCohortReclassifiedBooks).toEqual([
+      { username: 'admin', mode: 'demo', openLiveJournalRowCount: 7, openLiveJournalAtRiskUsd: 1401.5 },
+    ]);
+    expect(r.liveOpenJournalRowCount).toBe(7);
+    expect(r.liveOpenJournalAtRiskUsd).toBe(1401.5);
+  });
+
+  it('a sandbox reclassification is just as RED as a demo one', () => {
+    const r = summarizeLiveCohortIntegrity([book('admin', 'sandbox', 3, 500)], opts());
+    expect(r.liveCohortIntegrityOk).toBe(false);
+  });
+
+  it('is GREEN when every holder of open live rows is inside the live cohort', () => {
+    const r = summarizeLiveCohortIntegrity(
+      [book('admin', 'live', 12, 2455.5), book('Richard', 'sandbox', 0)],
+      opts(),
+    );
+    expect(r.liveCohortIntegrityOk).toBe(true);
+    expect(r.liveCohortReclassifiedBooks).toEqual([]);
+    expect(r.liveOpenJournalRowCount).toBe(12);
+  });
+
+  it('no open live rows anywhere is null (nothing to protect) with a published 0, not a manufactured green', () => {
+    const r = summarizeLiveCohortIntegrity(
+      [book('admin', 'demo', 0), book('Richard', 'demo', 0)],
+      opts(),
+    );
+    expect(r.liveCohortIntegrityOk).toBeNull();
+    expect(r.liveOpenJournalRowCount).toBe(0);
+    expect(r.liveOpenJournalAtRiskUsd).toBe(0);
+  });
+
+  it('an unavailable journal census is NOT MEASURED on every field — never a pass, never a zero', () => {
+    const r = summarizeLiveCohortIntegrity(
+      [book('admin', 'live', null, null)],
+      { journalCensusAvailable: false, unattributedOpenLiveRowCount: 0, unattributedOpenLiveAtRiskUsd: 0 },
+    );
+    expect(r.liveCohortIntegrityOk).toBeNull();
+    expect(r.liveOpenJournalRowCount).toBeNull();
+    expect(r.liveOpenJournalAtRiskUsd).toBeNull();
+    expect(r.liveCohortReclassifiedBooks).toBeNull();
+  });
+
+  it('orphaned open live rows no book claims are RED even with a healthy cohort', () => {
+    // Identity retirement moves the account epoch out from under the rows; a
+    // pre-TRA-1475 row carries no account at all. Either way the notional is
+    // outside every live-axis gate.
+    const r = summarizeLiveCohortIntegrity(
+      [book('admin', 'live', 2, 400)],
+      opts(3, 750),
+    );
+    expect(r.liveCohortIntegrityOk).toBe(false);
+    expect(r.liveOpenJournalUnattributedRowCount).toBe(3);
+    expect(r.liveOpenJournalRowCount).toBe(5);
+    expect(r.liveOpenJournalAtRiskUsd).toBe(1150);
+  });
+
+  it('closed live rows do not trip anything — only OPEN notional is protected', () => {
+    // The caller only feeds OPEN rows into the per-book counts; a book whose
+    // live rows all closed contributes 0 and the verdict stays null.
+    const r = summarizeLiveCohortIntegrity([book('admin', 'demo', 0)], opts());
+    expect(r.liveCohortIntegrityOk).toBeNull();
   });
 });
 
