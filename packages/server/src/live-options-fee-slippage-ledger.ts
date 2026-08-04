@@ -385,8 +385,15 @@ export function reconcileLedgerFees(
   records: readonly LiveOptionFillRecord[],
   historyFills: readonly TradierTradeHistoryFill[],
 ): FeeBackfillResult {
-  // Group history option fills by composite key; each group a queue sorted ascending
-  // by transactionId so collision pairing is stable across runs.
+  // Primary join: orderId (production fills carry it; sandbox/legacy don't).
+  // Fallback: composite key (symbol + etDay + side + qty) for fills without orderId.
+  // A fill consumed by the orderId path is marked so the composite path can't
+  // double-assign it.
+  const consumed = new Set<TradierTradeHistoryFill>();
+
+  // Build orderId → fill map (production path).
+  const historyByOrderId = new Map<number, TradierTradeHistoryFill>();
+  // Build composite key → queue (legacy/sandbox fallback path).
   const historyByKey = new Map<string, TradierTradeHistoryFill[]>();
   for (const f of historyFills) {
     if (f.tradeType !== 'option') continue;
@@ -394,10 +401,15 @@ export function reconcileLedgerFees(
     if (side === null) continue;
     if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
     if (typeof f.commission !== 'number' || !Number.isFinite(f.commission)) continue;
-    const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
-    const q = historyByKey.get(key);
-    if (q) q.push(f);
-    else historyByKey.set(key, [f]);
+    if (f.orderId != null) {
+      // orderId is the unambiguous key — last write wins on the rare duplicate.
+      historyByOrderId.set(f.orderId, f);
+    } else {
+      const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
+      const q = historyByKey.get(key);
+      if (q) q.push(f);
+      else historyByKey.set(key, [f]);
+    }
   }
   for (const q of historyByKey.values()) {
     q.sort((a, b) =>
@@ -411,16 +423,26 @@ export function reconcileLedgerFees(
     .map((r, i) => ({ r, i }))
     .sort((a, b) => a.r.ts - b.r.ts || a.i - b.i);
 
-  const cursor = new Map<string, number>(); // key → next unconsumed history-fill index
+  const cursor = new Map<string, number>(); // composite key → next unconsumed fill index
   const feeByIndex = new Map<number, number>(); // original record index → back-filled commission
   for (const { r, i } of order) {
+    // orderId path — unambiguous 1-to-1 match.
+    if (r.orderId != null) {
+      const f = historyByOrderId.get(r.orderId);
+      if (f && !consumed.has(f)) {
+        consumed.add(f);
+        if (r.fees === null) feeByIndex.set(i, f.commission);
+      }
+      continue;
+    }
+    // Composite-key path — used when the ledger row has no orderId.
     const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, r.contracts);
     const q = historyByKey.get(key);
     if (!q) continue;
     const c = cursor.get(key) ?? 0;
-    if (c >= q.length) continue; // no unconsumed history fill for this row
-    cursor.set(key, c + 1); // consume — never double-assign, even to an already-filled row
-    if (r.fees !== null) continue; // already back-filled; slot consumed, count nothing
+    if (c >= q.length) continue;
+    cursor.set(key, c + 1);
+    if (r.fees !== null) continue;
     feeByIndex.set(i, q[c]!.commission);
   }
 

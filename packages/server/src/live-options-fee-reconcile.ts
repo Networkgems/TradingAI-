@@ -91,6 +91,18 @@ export interface LiveOptionsFeeReconcileState {
   totalUpdated: number;
   /** Message from the most recent failure (cleared on the next clean attempt). */
   lastError: string | null;
+  /**
+   * Up to 5 history fills from the last fetch — diagnostic for key-mismatch
+   * investigation. Shows symbol, date, side (from description), orderId, and
+   * commission so caller can verify the join is seeing the right account fills.
+   */
+  lastHistorySample: Array<{
+    symbol: string;
+    date: string;
+    description: string;
+    orderId: number | null;
+    commission: number;
+  }> | null;
 }
 
 let state: LiveOptionsFeeReconcileState = emptyState();
@@ -107,6 +119,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastUpdated: null,
     totalUpdated: 0,
     lastError: null,
+    lastHistorySample: null,
   };
 }
 
@@ -117,7 +130,11 @@ export function clearLiveOptionsFeeReconcileState(): void {
 
 /** Snapshot for the health payload (a copy — callers cannot mutate the pass). */
 export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState {
-  return { ...state, lastWindow: state.lastWindow === null ? null : { ...state.lastWindow } };
+  return {
+    ...state,
+    lastWindow: state.lastWindow === null ? null : { ...state.lastWindow },
+    lastHistorySample: state.lastHistorySample === null ? null : [...state.lastHistorySample],
+  };
 }
 
 /**
@@ -186,6 +203,13 @@ export async function runLiveOptionsFeeReconcile(
   const { updated } = backfillLiveOptionFees(historyFills);
   state.lastHistoryFills = historyFills.length;
   state.lastUpdated = updated;
+  state.lastHistorySample = historyFills.slice(0, 5).map((f) => ({
+    symbol: f.symbol,
+    date: f.date,
+    description: f.description,
+    orderId: f.orderId,
+    commission: f.commission,
+  }));
   state.totalUpdated += updated;
   state.lastOutcome = updated > 0 ? 'backfilled' : 'no-match';
   state.lastError = null;

@@ -22,6 +22,7 @@ function fill(overrides: Partial<TradierTradeHistoryFill> = {}): TradierTradeHis
     amount: 370,
     commission: 0,
     transactionId: 'tx-1',
+    orderId: null,
     ...overrides,
   };
 }

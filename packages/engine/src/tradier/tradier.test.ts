@@ -1212,6 +1212,48 @@ describe('parseTradierHistory', () => {
     expect(parseTradierHistory({ history: null })).toEqual([]);
     expect(parseTradierHistory(null)).toEqual([]);
   });
+
+  it('extracts order_id from the trade object into orderId (TRA-2810)', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: {
+          date: '2026-07-30',
+          type: 'trade',
+          trade: {
+            commission: 1.4,
+            description: 'Buy to Open 4 AAPL260904P00280000',
+            price: 1.04,
+            quantity: 4,
+            symbol: 'AAPL260904P00280000',
+            trade_type: 'option',
+            order_id: 139283844,
+          },
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.orderId).toBe(139283844);
+  });
+
+  it('sets orderId to null when order_id is absent (sandbox fills)', () => {
+    const out = parseTradierHistory({
+      history: {
+        event: {
+          date: '2026-05-08',
+          type: 'trade',
+          trade: {
+            description: 'Sell to Close 2 SPY ...',
+            price: 1.85,
+            quantity: 2,
+            symbol: 'SPY260515C00450000',
+            trade_type: 'option',
+          },
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.orderId).toBeNull();
+  });
 });
 
 describe('TradierOptionsClient.listAccountHistory', () => {

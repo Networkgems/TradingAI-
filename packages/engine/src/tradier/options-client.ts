@@ -288,6 +288,8 @@ interface TradierRawHistoryEvent {
     symbol?: string;
     /** `option`/`Option` for option legs, `equity`/`Equity` for stock legs. */
     trade_type?: string;
+    /** Tradier order id — present on production history fills; absent on sandbox. */
+    order_id?: number;
   };
 }
 
@@ -348,6 +350,12 @@ export interface TradierTradeHistoryFill {
    * doesn't surface an id for the event type.
    */
   transactionId: string;
+  /**
+   * Tradier order id from `trade.order_id`. Present on production fills;
+   * absent (null) on sandbox or when Tradier omits it. Use as the
+   * primary join key for commission back-fill when available (TRA-2810).
+   */
+  orderId: number | null;
 }
 
 export class TradierOptionsClient extends TradierOrderClient {
@@ -1023,6 +1031,9 @@ export function parseTradierHistory(
     const transactionId =
       raw.id != null ? String(raw.id)
       : `${date}|${symbol}|${tradeType}|${quantity}|${price}|${description}`;
+    const orderId = typeof trade.order_id === 'number' && Number.isFinite(trade.order_id)
+      ? trade.order_id
+      : null;
     out.push({
       date,
       symbol,
@@ -1033,6 +1044,7 @@ export function parseTradierHistory(
       amount,
       commission,
       transactionId,
+      orderId,
     });
   }
   return out;

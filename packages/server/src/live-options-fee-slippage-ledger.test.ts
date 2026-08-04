@@ -132,7 +132,8 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       mode: 'live', ts: 1000, etDay: '2026-07-16', sleeve: 'single_leg_otm',
       optionSymbol: 'AAPL240705C00210000', side: 'buy_to_open', contracts: 1,
       submittedLimit: 0.82, askAtSubmit: 0.82, midAtSubmit: 0.80, filledPrice: 0.83,
-      fees: null, slippageVsAsk: 0.01, slippageVsMid: 0.03, orderId: 42,
+      fees: null, slippageVsAsk: 0.01, slippageVsMid: 0.03,
+      orderId: null, // composite-path tests; orderId path tested separately below
       ...over,
     };
   }
@@ -142,6 +143,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       date: '2026-07-16', symbol: 'AAPL240705C00210000', tradeType: 'option',
       description: 'Buy to Open 1 AAPL240705C00210000 @ 0.83', price: 0.83, quantity: 1,
       amount: -83, commission: 0.35, transactionId: 't1',
+      orderId: null, // composite path; set to a real number to test orderId join
       ...over,
     };
   }
@@ -172,11 +174,11 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
   });
 
   it('pairs duplicate (identical symbol/day/side/qty) fills by ascending ts and never double-assigns', () => {
-    // Two identical ledger rows, but only ONE history fill: the earlier-ts row wins,
-    // the other stays honest-null (never a fabricated 0).
+    // Two identical ledger rows (orderId null = composite path), only ONE history fill:
+    // the earlier-ts row wins, the other stays honest-null (never a fabricated 0).
     const rows = [
-      ledgerRow({ ts: 3000, orderId: 2 }),
-      ledgerRow({ ts: 1000, orderId: 1 }),
+      ledgerRow({ ts: 3000 }),
+      ledgerRow({ ts: 1000 }),
     ];
     const { updated, records } = reconcileLedgerFees(rows, [histFill({ commission: 0.35 })]);
     expect(updated).toBe(1);
@@ -223,7 +225,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       ts: 1000, etDay: '2026-07-16', sleeve: 'single_leg_otm',
       optionSymbol: 'AAPL240705C00210000', side: 'buy_to_open', contracts: 1,
       submittedLimit: 0.82, askAtSubmit: 0.82, midAtSubmit: 0.80, filledPrice: 0.83,
-      fees: null, orderId: 42,
+      fees: null, orderId: null, // composite path; matches histFill default
     });
     // back-fill from history, which rewrites the durable JSONL
     const { updated } = backfillLiveOptionFees([histFill({ commission: 0.35 })]);
@@ -238,6 +240,27 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     expect(s.records[0]!.fees).toBe(0.35); // fee survived the reboot
     expect(s.feesMeasured).toBe(1);
     expect(s.totalFees).toBeCloseTo(0.35, 6);
+  });
+
+  it('joins via orderId (primary path) — ignores composite key when orderId matches', () => {
+    // Ledger row has orderId 139283844; history fill has same orderId but different qty
+    // (which would prevent a composite match). orderId path must still match.
+    const row = ledgerRow({ orderId: 139283844, contracts: 4 });
+    const fill = histFill({ orderId: 139283844, quantity: 2 }); // qty mismatch — composite would fail
+    const { updated, records } = reconcileLedgerFees([row], [fill]);
+    expect(updated).toBe(1);
+    expect(records[0]!.fees).toBe(0.35);
+  });
+
+  it('orderId path never double-assigns — two rows same orderId only the first gets the fee', () => {
+    const row1 = ledgerRow({ ts: 1000, orderId: 139283844 });
+    const row2 = ledgerRow({ ts: 2000, orderId: 139283844 }); // duplicate orderId
+    const fill = histFill({ orderId: 139283844 });
+    const { updated, records } = reconcileLedgerFees([row1, row2], [fill]);
+    expect(updated).toBe(1);
+    const sorted = [...records].sort((a, b) => a.ts - b.ts);
+    expect(sorted[0]!.fees).toBe(0.35);
+    expect(sorted[1]!.fees).toBeNull();
   });
 
   it('reports durability.ephemeral so a reader knows if the calibration survives a reboot', () => {

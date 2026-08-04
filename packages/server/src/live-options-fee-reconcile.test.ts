@@ -73,6 +73,7 @@ function histFill(over: Partial<TradierTradeHistoryFill> = {}): TradierTradeHist
     amount: -416,
     commission: 1.4,
     transactionId: 't1',
+    orderId: 139283844, // matches seedOpenFill — production history carries order_id
     ...over,
   };
 }
@@ -139,8 +140,8 @@ describe('live-options fee auto-reconcile (TRA-2810)', () => {
   it('a fetched history with no join leaves rows null (never 0) and reads no-match', async () => {
     clearLiveOptionsFeeSlippageLedger();
     seedOpenFill();
-    // wrong quantity — the composite key cannot match
-    const { client } = fakeClient([histFill({ quantity: 2 })]);
+    // wrong orderId — neither orderId nor composite key matches the ledger row
+    const { client } = fakeClient([histFill({ orderId: 999999999 })]);
     const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
     expect(s.lastOutcome).toBe('no-match');
     expect(s.lastUpdated).toBe(0);
