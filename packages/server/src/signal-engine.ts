@@ -6385,13 +6385,88 @@ export class SignalEngine {
    * Errors per-position are logged and swallowed so one Tradier hiccup
    * doesn't take down the whole tick.
    */
+  /**
+   * TRA-2799 — self-heal an engine-opened live row whose `sell_to_close` was
+   * rejected because Tradier holds nothing to sell.
+   *
+   * Tradier's message for that case is:
+   *   "Sell order cannot be placed unless you are closing a long position,
+   *    please check open orders."
+   * When the broker really is flat this rejection is unrecoverable by
+   * construction — every retry earns the same refusal — so before TRA-2799 the
+   * row burned its `MAX_CONSECUTIVE_CLOSE_REJECTS` budget, parked itself with
+   * "auto-close paused", and stayed on the Open Options table forever with a
+   * live trailing stop attached to a position that no longer existed.
+   *
+   * The message is NOT sufficient evidence on its own: read the second clause.
+   * Tradier sends the identical text when the contract IS held but its quantity
+   * is already reserved by a working sell order, and closing locally there
+   * would erase a real position. So the rejection only *triggers* the check —
+   * the authority is `/positions`. We re-read the broker's holdings and close
+   * locally only when the OCC symbol is genuinely absent. Any doubt (fetch
+   * threw, symbol still listed) leaves the row alone for the normal reject
+   * path to handle.
+   *
+   * Returns true when the position was closed locally, in which case the
+   * caller must NOT also call `clearPendingExit` — the row is already gone.
+   */
+  private async reconcileFlatBrokerRejection(
+    env: TradierEnv,
+    acct: PaperOptionsAccount,
+    opt: import('@trading-app/shared').OptionPosition,
+    reason: string,
+  ): Promise<boolean> {
+    if (!/closing a long position/i.test(reason)) return false;
+    if (opt.importedFromTradier) return false;
+    if ((opt.mode ?? 'demo') !== 'live') return false;
+    const optionSymbol = opt.optionSymbol;
+    if (!optionSymbol) return false;
+    const client = this.tradierOptionsClientByEnv[env];
+    if (!client) return false;
+
+    let positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[];
+    try {
+      positions = await client.listOpenOptionPositions();
+    } catch (err: unknown) {
+      log.warn('flat-broker rejection check could not read positions — leaving row open', {
+        component: 'tradier-flat-reconcile',
+        optionSymbol,
+        env,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+    if (positions.some(p => p.optionSymbol === optionSymbol)) {
+      // Broker still holds it — the rejection was the "check open orders"
+      // variant (quantity reserved by a working order), not a flat account.
+      return false;
+    }
+
+    const closed = acct.closeBrokerFlatPosition(
+      opt.id,
+      `Closed by Tradier reconcile: the broker rejected the close because it ` +
+        `holds no long position in ${optionSymbol}, and /positions confirms it ` +
+        `is flat. Closed here at the last known mark; realized P&L is an ` +
+        `estimate until the end-of-day Tradier history reconcile.`,
+    );
+    if (!closed) return false;
+    log.info('closed stranded live option — broker reports flat', {
+      component: 'tradier-flat-reconcile',
+      optionSymbol,
+      env,
+      contracts: closed.contractsRemaining,
+      estimatedFill: closed.currentPremium,
+    });
+    return true;
+  }
+
   private async resolvePendingOptionExits(): Promise<void> {
     if (!this.tradierLiveClient) return;
     const buckets: { env: TradierEnv; acct: PaperOptionsAccount }[] = [
       { env: 'sandbox', acct: this.optionsAccounts.sandbox },
       { env: 'production', acct: this.optionsAccounts.production },
     ];
-    for (const { acct } of buckets) {
+    for (const { env, acct } of buckets) {
       const pending = acct.listPendingExits();
       for (const opt of pending) {
         const pendingExit = opt.pendingExit;
@@ -6423,6 +6498,10 @@ export class SignalEngine {
           } else if (TRADIER_REJECTED_STATUSES.has(status)) {
             const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
             const reason = `Tradier sell_to_close ${status}${reasonSuffix}`;
+            // TRA-2799 — a "not closing a long position" refusal can mean the
+            // broker is flat, in which case retrying forever is pointless and
+            // the row must be closed locally instead of left open.
+            if (await this.reconcileFlatBrokerRejection(env, acct, opt, reason)) continue;
             acct.clearPendingExit(opt.id, reason);
             log.warn('tradier sell_to_close not filled — leaving paper position open', {
               optionSymbol: opt.optionSymbol,
@@ -6541,7 +6620,12 @@ export class SignalEngine {
           );
         } else if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
-          acct.clearPendingExit(snapshot.id, `Tradier sell_to_close ${detail.status}${reasonSuffix}`);
+          const reason = `Tradier sell_to_close ${detail.status}${reasonSuffix}`;
+          // TRA-2799 — see `reconcileFlatBrokerRejection`: when the refusal is
+          // "not closing a long position" AND /positions confirms the broker is
+          // flat, the row is stranded and closing it locally is the only exit.
+          if (await this.reconcileFlatBrokerRejection(this.tradierEnv, acct, snapshot, reason)) continue;
+          acct.clearPendingExit(snapshot.id, reason);
         }
       } catch (err: unknown) {
         log.warn('waitForOrderTerminalStatus failed — leaving pendingExit for next tick poll', {
@@ -12811,6 +12895,11 @@ export class SignalEngine {
    *    wait window). The paper book has the pending intent cleared with
    *    `exitErrorReason` set so the dashboard can surface the reason. HTTP
    *    returns 502.
+   *  - `reconciled` — TRA-2799: Tradier refused because it holds no long
+   *    position, and a `/positions` re-read confirmed the broker is flat. The
+   *    row was closed locally at its last mark rather than left stranded, so
+   *    the user's Close click DID resolve the position. HTTP returns 200 with
+   *    the broker's reason attached for transparency.
    *  - `no_client` — no Tradier creds saved for the position's env. The
    *    paper book is unchanged; HTTP returns 409 with a saving-credentials
    *    hint.
@@ -12827,6 +12916,7 @@ export class SignalEngine {
     | { status: 'filled'; orderId: number; fillPrice: number }
     | { status: 'pending'; orderId: number }
     | { status: 'rejected'; reason: string; orderId?: number }
+    | { status: 'reconciled'; reason: string; orderId?: number }
     | { status: 'no_client'; env: TradierEnv }
     | { status: 'not_found'; reason: string }
   > {
@@ -12858,6 +12948,13 @@ export class SignalEngine {
       resp = await client.sellContractsLimit(optionSymbol, intent.qty, intent.limitPrice, intent.duration ?? 'day');
     } catch (err: unknown) {
       const reason = `Tradier sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
+      // TRA-2799 — Tradier surfaces the flat-account refusal on the submit call
+      // itself (HTTP 400) as often as it does on a terminal order status, so the
+      // throw branch needs the same self-heal as the rejected branch below.
+      if (await this.reconcileFlatBrokerRejection(env, acct, located.position, reason)) {
+        log.warn('manual-close', { optionSymbol, env, reason });
+        return { status: 'reconciled', reason };
+      }
       acct.clearPendingExit(optionId, reason);
       log.warn('manual-close', { optionSymbol, env, reason });
       return { status: 'rejected', reason };
@@ -12899,6 +12996,15 @@ export class SignalEngine {
         if (TRADIER_REJECTED_STATUSES.has(detail.status)) {
           const reasonSuffix = detail.reason_description ? `: ${detail.reason_description}` : '';
           const reason = `Tradier sell_to_close ${detail.status}${reasonSuffix}`;
+          // TRA-2799 — the user clicked Close on a row the broker no longer
+          // holds. Returning `rejected` here is what left the position
+          // unclosable: the Close button was the documented remedy for a
+          // breaker-tripped row, and it could only ever re-earn the same
+          // refusal. When /positions confirms the broker is flat, resolve the
+          // row instead of bouncing the user back to a dead end.
+          if (await this.reconcileFlatBrokerRejection(env, acct, located.position, reason)) {
+            return { status: 'reconciled', reason, orderId: resp.id };
+          }
           acct.clearPendingExit(optionId, reason);
           return { status: 'rejected', reason, orderId: resp.id };
         }

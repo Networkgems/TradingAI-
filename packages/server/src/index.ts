@@ -10249,6 +10249,25 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       res.status(409).json({ error: outcome.reason });
       return;
     }
+    if (outcome.status === 'reconciled') {
+      // TRA-2799 — Tradier refused because it is flat on the contract, and a
+      // `/positions` re-read confirmed it. The stale row has been closed
+      // locally, so this is a success for the user even though no order
+      // filled: the position they were trying to get rid of is gone. 200 (not
+      // 502) so the dashboard drops the row instead of rendering another
+      // "close failed" notice on a position that no longer exists.
+      broadcastEngineState(ctx);
+      res.json({
+        ok: true,
+        status: 'reconciled',
+        reason: outcome.reason,
+        message:
+          'Tradier no longer holds this position, so it was closed here at the last known mark. ' +
+          'Realized P&L is an estimate until the end-of-day Tradier history reconcile.',
+        ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}),
+      });
+      return;
+    }
     if (outcome.status === 'rejected') {
       res.status(502).json({ error: `Tradier rejected the close: ${outcome.reason}`, ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}) });
       broadcastEngineState(ctx);

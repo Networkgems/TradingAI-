@@ -3322,3 +3322,159 @@ describe('PaperOptionsAccount.openCashSecuredPut', () => {
     expect(restored.openCoveredCall(ccParams())).not.toBeNull();
   });
 });
+
+// ─── TRA-2799: engine-opened live rows the broker no longer holds ────────────
+//
+// Reported symptom: three engine-opened LIVE rows (2x SPY calls, 1x AAPL put)
+// sat on the Open Options table with an armed trailing stop, but Tradier had
+// already closed them. Every `sell_to_close` — the engine's and the user's
+// Close button alike — came back "Sell order cannot be placed unless you are
+// closing a long position", so the rows burned their reject budget, parked at
+// "auto-close paused", and could never be cleared from the UI.
+//
+// Root cause: `reconcileTradierPositions` only swept rows flagged
+// `importedFromTradier`. An engine-opened row absent from `/positions` was
+// left untouched, forever.
+
+describe('PaperOptionsAccount.reconcileTradierPositions — stranded engine rows (TRA-2799)', () => {
+  /** Engine-opened LIVE row, aged past the min-age guard, with a fresh mark. */
+  function openStrandedLive(mark = 1.5) {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    expect(pos).not.toBeNull();
+    const row = acct.getStateForMode('live').openOptions[0];
+    row.currentPremium = mark;
+    // Past BROKER_MISSING_MIN_AGE_MS so a still-working open order can no
+    // longer explain the contract's absence from `/positions`.
+    vi.setSystemTime(TRADING_TIME + 10 * 60_000);
+    return { acct, contracts: pos!.contracts };
+  }
+
+  it('closes an engine-opened live row after two consecutive sweeps miss it, booking P&L at the last mark', () => {
+    const { acct, contracts } = openStrandedLive(1.5);
+
+    // First miss only arms the counter — one blank snapshot is not proof.
+    const first = acct.reconcileTradierPositions([], 'live');
+    expect(first).toEqual({ added: 0, updated: 0, removed: 0, total: 0 });
+    expect(acct.getStateForMode('live').openOptions).toHaveLength(1);
+
+    const second = acct.reconcileTradierPositions([], 'live');
+    expect(second).toEqual({ added: 0, updated: 0, removed: 1, total: 0 });
+
+    const state = acct.getStateForMode('live');
+    expect(state.openOptions).toHaveLength(0);
+    expect(state.closedOptions).toHaveLength(1);
+    const closed = state.closedOptions[0];
+    expect(closed.optionSymbol).toBe('AAPL240705C00200000');
+    // Closed at the last known mark, not at break-even.
+    expect(closed.currentPremium).toBeCloseTo(1.5, 5);
+    expect(closed.pnl).toBeCloseTo((1.5 - 1.0) * contracts * 100, 5);
+    // The archived row explains itself rather than silently vanishing.
+    expect(closed.exitErrorReason).toMatch(/broker no longer reports this position/i);
+    // Live mode books no demo slippage/fee haircut.
+    expect(state.optionsPnl).toBeCloseTo((1.5 - 1.0) * contracts * 100, 5);
+  });
+
+  it('resets the miss counter when the broker reports the contract again', () => {
+    const { acct } = openStrandedLive(1.5);
+
+    acct.reconcileTradierPositions([], 'live');
+    // Broker lists it again — the earlier blank sweep was a blip, so the two
+    // misses must not be allowed to accumulate across it.
+    acct.reconcileTradierPositions(
+      [buildTradierPosition({ optionSymbol: 'AAPL240705C00200000', underlying: 'AAPL' })],
+      'live',
+    );
+    const afterBlip = acct.reconcileTradierPositions([], 'live');
+
+    expect(afterBlip.removed).toBe(0);
+    expect(acct.getStateForMode('live').openOptions).toHaveLength(1);
+  });
+
+  it('never sweeps the demo book — a demo row is absent from every broker payload', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo')).not.toBeNull();
+    vi.setSystemTime(TRADING_TIME + 10 * 60_000);
+
+    acct.reconcileTradierPositions([], 'live');
+    const summary = acct.reconcileTradierPositions([], 'live');
+
+    expect(summary.removed).toBe(0);
+    expect(acct.getStateForMode('demo').openOptions).toHaveLength(1);
+    expect(acct.getStateForMode('demo').closedOptions).toHaveLength(0);
+  });
+
+  it('leaves a freshly opened live row alone — a working open order is legitimately absent', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    expect(acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live')).not.toBeNull();
+    // No clock advance: the row is seconds old. Two rapid manual syncs (which
+    // bypass the reconcile cadence) must not be able to close it.
+    acct.reconcileTradierPositions([], 'live');
+    const summary = acct.reconcileTradierPositions([], 'live');
+
+    expect(summary.removed).toBe(0);
+    expect(acct.getStateForMode('live').openOptions).toHaveLength(1);
+  });
+
+  it('leaves a row with an in-flight exit to the pending-exit poller', () => {
+    const { acct } = openStrandedLive(1.5);
+    const row = acct.getStateForMode('live').openOptions[0];
+    expect(acct.stageManualPendingExit(row.id, row.contractsRemaining, 1.4)).not.toBeNull();
+
+    acct.reconcileTradierPositions([], 'live');
+    const summary = acct.reconcileTradierPositions([], 'live');
+
+    // The exit poller resolves this against the broker's ORDER status and
+    // books the real fill price — strictly better than our mark estimate.
+    expect(summary.removed).toBe(0);
+    expect(acct.getStateForMode('live').openOptions).toHaveLength(1);
+  });
+});
+
+describe('PaperOptionsAccount.closeBrokerFlatPosition (TRA-2799)', () => {
+  it('closes an engine-opened live row at its last mark and stamps the reason', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    const row = acct.getStateForMode('live').openOptions[0];
+    row.currentPremium = 2.0;
+    row.closeRejectCount = 3; // breaker already tripped, as in the report
+
+    const closed = acct.closeBrokerFlatPosition(row.id, 'broker is flat');
+
+    expect(closed).not.toBeNull();
+    expect(closed!.pnl).toBeCloseTo((2.0 - 1.0) * pos!.contracts * 100, 5);
+    expect(closed!.exitErrorReason).toBe('broker is flat');
+    expect(closed!.closeRejectCount).toBeUndefined();
+    expect(acct.getStateForMode('live').openOptions).toHaveLength(0);
+  });
+
+  it('falls back to break-even when no mark ever landed', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
+    const row = acct.getStateForMode('live').openOptions[0];
+    row.currentPremium = 0;
+
+    const closed = acct.closeBrokerFlatPosition(row.id, 'broker is flat');
+
+    expect(closed).not.toBeNull();
+    expect(closed!.pnl).toBeCloseTo(0, 5);
+  });
+
+  it('refuses a demo row — the demo book has no broker counterpart to be flat on', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    const row = acct.getStateForMode('demo').openOptions[0];
+
+    expect(acct.closeBrokerFlatPosition(row.id, 'broker is flat')).toBeNull();
+    expect(acct.getStateForMode('demo').openOptions).toHaveLength(1);
+  });
+
+  it('refuses an imported row — those drop through the imported close path', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([buildTradierPosition()]);
+    const row = acct.getState().openOptions[0];
+
+    expect(acct.closeBrokerFlatPosition(row.id, 'broker is flat')).toBeNull();
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+});

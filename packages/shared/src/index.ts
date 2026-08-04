@@ -2666,6 +2666,19 @@ export interface OptionPosition {
    */
   closeRejectCount?: number;
   /**
+   * TRA-2799 — consecutive Tradier portfolio reconciles in which this
+   * ENGINE-OPENED live row's OCC symbol was absent from the broker's
+   * `/positions` payload. Bumped by `reconcileTradierPositions`, reset to
+   * absent the moment the broker reports the contract again. Once it reaches
+   * `BROKER_MISSING_SWEEPS_TO_CLOSE` (and the row is old enough that a working
+   * open order can't explain the absence) the reconcile closes the row locally
+   * at its last mark: the broker is flat, so the position no longer exists and
+   * every `sell_to_close` against it is rejected with "Sell order cannot be
+   * placed unless you are closing a long position". Absent ↔ the broker
+   * currently reports the contract / legacy snapshot.
+   */
+  brokerMissingSweeps?: number;
+  /**
    * TRA-384 — sign-adjusted Black-Scholes delta captured from the OTM / RV
    * scanner at entry. Used by `checkExits` as the extrapolation slope when the
    * live mark feed has stalled, so the stop-loss backstop tracks an OTM strike

@@ -341,6 +341,35 @@ export interface OptionExitRiskInput {
  */
 const MAX_CONSECUTIVE_CLOSE_REJECTS = 3;
 
+/**
+ * TRA-2799 — consecutive Tradier portfolio reconciles an ENGINE-OPENED live
+ * row must be missing from the broker's `/positions` payload before
+ * {@link OptionsAccount.reconcileTradierPositions} closes it locally.
+ *
+ * Two, not one: `/positions` is a snapshot, and a single sweep can miss a
+ * contract for reasons that are not "the position is gone" (a reconcile that
+ * lands mid-fill on a partial close, a Tradier read replica lagging its own
+ * write). Requiring the absence to repeat costs one cadence window and makes a
+ * one-off blip unable to book a phantom close on a position the user still
+ * holds.
+ */
+const BROKER_MISSING_SWEEPS_TO_CLOSE = 2;
+
+/**
+ * TRA-2799 — minimum age an ENGINE-OPENED live row must reach before the
+ * broker-missing sweep is allowed to consider it at all.
+ *
+ * The engine's mirror path records the local row when it submits the opening
+ * order, not when the broker fills it (`voidOpenOption` is the undo when the
+ * open is rejected). A *working* buy order does not appear in `/positions`, so
+ * a freshly opened row is legitimately absent from the payload — sweeping it
+ * would delete a position that is in the middle of being opened. The cadence
+ * gate alone is not enough because the manual `POST /api/tradier/positions/sync`
+ * endpoint bypasses the cadence, so two quick clicks could otherwise satisfy
+ * the miss counter within seconds of an open.
+ */
+const BROKER_MISSING_MIN_AGE_MS = 5 * 60_000;
+
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
@@ -3887,13 +3916,19 @@ export class PaperOptionsAccount {
    *     the contract count or per-share premium changed (partial fill /
    *     adjustment), update the in-place row rather than orphaning the
    *     old one.
-   *   • Engine-opened positions (not flagged `importedFromTradier`) are
-   *     left untouched even when they share an OCC symbol with a Tradier
-   *     row — the engine's mirror path already tracks those, and we don't
-   *     want to double-count.
+   *   • Engine-opened positions (not flagged `importedFromTradier`) are not
+   *     *updated* from a Tradier row even when they share an OCC symbol —
+   *     the engine's mirror path already tracks those, and we don't want to
+   *     double-count.
    *   • Imported positions whose OCC symbol no longer appears in Tradier's
    *     payload are dropped (the user closed them on Tradier — there's
    *     nothing left for TradeAI to close locally).
+   *   • TRA-2799 — engine-opened LIVE positions whose OCC symbol is missing
+   *     from the payload for {@link BROKER_MISSING_SWEEPS_TO_CLOSE}
+   *     consecutive sweeps are closed locally at their last mark. The broker
+   *     is flat on them, so they can never be closed through Tradier; leaving
+   *     them open stranded the row permanently. See the loop for the full set
+   *     of guards that keep this from firing on a live position.
    *   • No cash is debited / credited: the imported position lives on
    *     Tradier's books, not the local paper bucket. The daily counter is
    *     not bumped either — imports aren't "today's trades".
@@ -3943,6 +3978,58 @@ export class PaperOptionsAccount {
           : opt.premiumPaid;
       this.recordImportedFill(id, estimatedFill);
       removed += 1;
+    }
+
+    // TRA-2799 — the same sweep for ENGINE-OPENED live rows. Until now the
+    // removal pass above skipped anything without `importedFromTradier`, so a
+    // mirrored position that left the broker's book behind our back (closed on
+    // the Tradier web UI, expired/assigned, or a mirror that never really
+    // filled) stayed open in TradeAI forever. Nothing could clear it: the Close
+    // button submits a `sell_to_close`, and Tradier rejects that with "Sell
+    // order cannot be placed unless you are closing a long position" precisely
+    // because it is already flat, so the row also burned through
+    // `MAX_CONSECUTIVE_CLOSE_REJECTS` and parked itself with auto-close paused.
+    // The broker's payload is the authority on what is actually held, so treat
+    // a repeated absence the way the imported branch does — book the close
+    // locally at our best-known mark and let the EOD Tradier-history reconcile
+    // restate it to broker truth.
+    //
+    // Deliberately narrow, because a false positive here books a phantom close
+    // on a real position:
+    //   • live rows only — the demo book has no broker counterpart, so every
+    //     demo row is "missing" from every payload;
+    //   • single-leg long rows only — a combo (`legs`) is not one OCC row in
+    //     `/positions`, and a covered write is short (`closeOption` refuses it;
+    //     writes settle through `settleCoveredWrite`);
+    //   • nothing in flight — a `pendingExit` / `pendingCloseOrderId` row is
+    //     owned by the exit + close pollers, which resolve it against the
+    //     broker's ORDER status and book the real fill price. That is strictly
+    //     better attribution than our mark estimate, so we stay out of the way;
+    //   • two consecutive misses, and only once the row is old enough that a
+    //     still-working open order cannot explain the absence.
+    for (const [id, opt] of Array.from(this.openOptions)) {
+      if (opt.importedFromTradier) continue;
+      if ((opt.mode ?? 'demo') !== 'live') continue;
+      if (!opt.optionSymbol) continue;
+      if (opt.legs && opt.legs.length > 0) continue;
+      if (opt.coveredWrite) continue;
+      if (opt.pendingExit || opt.pendingCloseOrderId !== undefined) continue;
+      if (tradierBySymbol.has(opt.optionSymbol)) {
+        // Broker still reports it — any earlier miss was a blip, not a close.
+        delete opt.brokerMissingSweeps;
+        continue;
+      }
+      if (Date.now() - opt.openedAt < BROKER_MISSING_MIN_AGE_MS) continue;
+      const misses = (opt.brokerMissingSweeps ?? 0) + 1;
+      opt.brokerMissingSweeps = misses;
+      if (misses < BROKER_MISSING_SWEEPS_TO_CLOSE) continue;
+      const closed = this.closeBrokerFlatPosition(
+        id,
+        'Closed by Tradier reconcile: the broker no longer reports this ' +
+          'position, so it was closed here at the last known mark. Realized ' +
+          'P&L is an estimate until the end-of-day Tradier history reconcile.',
+      );
+      if (closed) removed += 1;
     }
 
     for (const incoming of positions) {
@@ -4020,6 +4107,57 @@ export class PaperOptionsAccount {
    * reconcile sweep. Returns the dropped position (or `null` when the id
    * didn't match an imported row), so the caller can log the close.
    */
+  /**
+   * TRA-2799 — close an ENGINE-OPENED live row that the broker no longer
+   * holds, at the row's last known mark, and stamp `reason` on the archived
+   * snapshot so the close is self-explaining in Recent Closed Options.
+   *
+   * Two callers, one accounting path:
+   *   • the broker-missing sweep in {@link reconcileTradierPositions}, after
+   *     the contract has been absent from `/positions` for
+   *     {@link BROKER_MISSING_SWEEPS_TO_CLOSE} consecutive reconciles; and
+   *   • the manual close handler, when Tradier rejects the `sell_to_close`
+   *     with its flat-account signature ("Sell order cannot be placed unless
+   *     you are closing a long position"). That rejection IS the broker
+   *     asserting it holds nothing, so the user's Close click resolves the row
+   *     instead of incrementing a reject counter that can never clear.
+   *
+   * Refuses (returns `null`) anything the sweep also refuses: imported rows,
+   * demo rows, combos, and covered writes. `closeOption` re-checks the last
+   * two, so the guards here are about refusing to *guess* on a position whose
+   * absence from the broker is not evidence of anything.
+   *
+   * The realized P&L booked here is an ESTIMATE off `currentPremium` (falling
+   * back to `premiumPaid` — i.e. break-even — when no mark ever landed). The
+   * EOD Tradier-history reconcile restates it to broker truth, exactly as it
+   * does for the imported branch's `recordImportedFill` estimate.
+   */
+  closeBrokerFlatPosition(optionId: string, reason: string): OptionPosition | null {
+    const opt = this.openOptions.get(optionId);
+    if (!opt) return null;
+    if (opt.importedFromTradier) return null;
+    if ((opt.mode ?? 'demo') !== 'live') return null;
+    if (opt.legs && opt.legs.length > 0) return null;
+    if (opt.coveredWrite) return null;
+    const estimatedFill =
+      Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
+        ? opt.currentPremium
+        : opt.premiumPaid;
+    // Stamp BEFORE closing so the reason rides the snapshot `closeOption`
+    // pushes onto `closedOptions` — otherwise the row just disappears and the
+    // user cannot tell a reconcile close apart from an exit the engine fired.
+    opt.exitErrorReason = reason;
+    // The row is leaving the open book; a tripped auto-close breaker and a
+    // half-counted miss streak would only be noise in the archive.
+    delete opt.closeRejectCount;
+    delete opt.brokerMissingSweeps;
+    // A rejected close leaves no live order behind, but clear the staged
+    // intent so `closeOption` archives a clean row rather than one that looks
+    // like it still has an exit working at the broker.
+    delete opt.pendingExit;
+    return this.closeOption(optionId, estimatedFill);
+  }
+
   dropImportedPosition(optionId: string): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;

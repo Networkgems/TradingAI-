@@ -84,7 +84,14 @@ export function useStockOptionClose(token: string, tradierEnv: 'sandbox' | 'prod
       toast.error('Close failed — network error');
       return { ok: false as const, error: 'Network error' };
     }
-    const data = await r.json().catch(() => ({} as { error?: string; status?: string; orderId?: number | string; fillPrice?: number }));
+    const data = await r.json().catch(() => ({} as {
+      error?: string;
+      status?: string;
+      orderId?: number | string;
+      fillPrice?: number;
+      reason?: string;
+      message?: string;
+    }));
     if (r.status === 202 && data?.status === 'pending') {
       setSyncStatus(`Tradier close pending #${data.orderId ?? '?'} — row will drop once Tradier fills`, 8000);
       toast.info(`Tradier close pending #${data.orderId ?? '?'}`);
@@ -96,6 +103,21 @@ export function useStockOptionClose(token: string, tradierEnv: 'sandbox' | 'prod
       setSyncStatus(`Close failed: ${message}`, 6000);
       toast.error(`Close failed: ${message}`);
       return { ok: false as const, error: message };
+    }
+    // TRA-2799 — Tradier was flat on this contract, so no order filled, but the
+    // stale row IS gone. "Option close submitted" would be a lie (nothing was
+    // submitted) and an error toast would be wrong too (the user got exactly
+    // what they clicked for), so this outcome gets its own message.
+    if (data?.status === 'reconciled') {
+      const message = data.message
+        ?? 'Tradier no longer holds this position — closed here at the last known mark.';
+      logger.info('stock-close', 'stale option row reconciled against a flat broker', {
+        optionId,
+        reason: data.reason,
+      });
+      setSyncStatus(message, 10000);
+      toast.success('Position cleared — Tradier no longer holds it');
+      return { ok: true as const, status: 'reconciled' as const, orderId: data?.orderId };
     }
     toast.success('Option close submitted');
     return { ok: true as const, status: data?.status ?? 'filled', orderId: data?.orderId, fillPrice: data?.fillPrice };
