@@ -206,12 +206,15 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     expect(twice.records[0]!.fees).toBe(0.35);
   });
 
-  it('ignores equity and non-open/close history rows', () => {
+  it('ignores equity and side-mismatched history rows', () => {
+    // equity fills → filtered by tradeType check
+    // sell_to_close fill → doesn't match the buy_to_open ledger row
     const { updated, records } = reconcileLedgerFees(
-      [ledgerRow({})],
+      [ledgerRow({})], // buy_to_open, qty 1
       [
         histFill({ tradeType: 'equity', commission: 0.35 }),
-        histFill({ description: 'Sell to Open 1 ...', commission: 0.35 }),
+        // positive amount → sell_to_close via amount fallback; side mismatch vs buy_to_open row
+        histFill({ description: 'CALL AAPL240705C00210000', amount: 83, commission: 0.35 }),
       ],
     );
     expect(updated).toBe(0);
@@ -240,6 +243,17 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
     expect(s.records[0]!.fees).toBe(0.35); // fee survived the reboot
     expect(s.feesMeasured).toBe(1);
     expect(s.totalFees).toBeCloseTo(0.35, 6);
+  });
+
+  it('instrument-only description falls back to amount sign for side (TRA-2810 Tradier production format)', () => {
+    // Tradier production returns "CALL AMZN   09/04/26   295" not "Buy to Open 4 AMZN..."
+    // negative amount → buy/open; positive → sell/close
+    const { updated, records } = reconcileLedgerFees(
+      [ledgerRow({})], // buy_to_open
+      [histFill({ description: 'CALL AAPL240705C00210000', amount: -83, commission: 0.35 })],
+    );
+    expect(updated).toBe(1);
+    expect(records[0]!.fees).toBe(0.35);
   });
 
   it('joins via orderId (primary path) — ignores composite key when orderId matches', () => {

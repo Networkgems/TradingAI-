@@ -342,11 +342,23 @@ export interface FeeBackfillResult {
   records: LiveOptionFillRecord[];
 }
 
-/** Map a history fill's `description` to the ledger side it can back-fill, or null. */
-export function historyFillSide(description: string): LiveFillSide | null {
+/**
+ * Map a history fill's `description` to the ledger side it can back-fill, or null.
+ * When the description contains action keywords ("Buy to Open" / "Sell to Close"),
+ * those are authoritative. When the description is instrument-only (e.g. Tradier
+ * production returns "CALL AMZN   09/04/26   295" without an action prefix), we
+ * fall back to the `amount` sign: negative = cash outflow = buy_to_open,
+ * positive = cash inflow = sell_to_close. `amount` of exactly 0 is ambiguous
+ * and returns null.
+ */
+export function historyFillSide(description: string, amount?: number): LiveFillSide | null {
   const s = description.toLowerCase();
   if (s.includes('buy to open')) return 'buy_to_open';
   if (s.includes('sell to close')) return 'sell_to_close';
+  // amount-based fallback for instrument-only descriptions (production Tradier format)
+  if (typeof amount === 'number' && Number.isFinite(amount) && amount !== 0) {
+    return amount < 0 ? 'buy_to_open' : 'sell_to_close';
+  }
   return null; // Buy-to-Close / Sell-to-Open short legs aren't in the live sleeves.
 }
 
@@ -398,7 +410,7 @@ export function reconcileLedgerFees(
   const historyByKey = new Map<string, TradierTradeHistoryFill[]>();
   for (const f of historyFills) {
     if (f.tradeType !== 'option') continue;
-    const side = historyFillSide(f.description);
+    const side = historyFillSide(f.description, f.amount);
     if (side === null) continue;
     if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
     if (typeof f.commission !== 'number' || !Number.isFinite(f.commission)) continue;

@@ -210,7 +210,7 @@ export async function runLiveOptionsFeeReconcile(
   // Count fills that pass the join filters (tradeType=option, recognizable side, qty>0, finite commission).
   state.lastJoinableCount = historyFills.filter(
     (f) => f.tradeType === 'option'
-      && historyFillSide(f.description) !== null
+      && historyFillSide(f.description, f.amount) !== null
       && typeof f.quantity === 'number' && Number.isFinite(f.quantity) && f.quantity > 0
       && typeof f.commission === 'number' && Number.isFinite(f.commission),
   ).length;
