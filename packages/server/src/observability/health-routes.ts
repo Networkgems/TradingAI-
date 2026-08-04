@@ -53,6 +53,10 @@ import {
   isOptionLiquidityLiveEnforceEnabled,
   OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
   OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG,
+  isOptionOtmDeltaFloorLiveEnforceEnabled, // TRA-2763
+  resolveOptionOtmDeltaFloorLive,
+  OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+  OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
@@ -3239,7 +3243,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const etDay = etDateString(new Date(nowMs));
     const costArmed = isOptionCostGateLiveEnforceEnabled(liveEnv);
     const spreadArmed = isOptionLiquidityLiveEnforceEnabled(liveEnv);
+    // TRA-2763 — the LIVE arm of the TRA-1407 OTM entry |delta| floor (gate key
+    // `otm_delta_floor`). Same tightening-only / process-env-only contract.
+    const otmFloorArmed = isOptionOtmDeltaFloorLiveEnforceEnabled(liveEnv);
     const summary = summarizeLiveEnforceGate(etDay);
+    const anyArmed = costArmed || spreadArmed || otmFloorArmed;
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -3249,14 +3257,22 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       arm: {
         costBar: { flag: OPTION_COST_GATE_LIVE_ENFORCE_FLAG, armed: costArmed },
         spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
+        otmDeltaFloor: {
+          flag: OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+          armed: otmFloorArmed,
+          /** The |delta| floor the armed gate enforces (resolver output — what the engine actually uses). */
+          floor: resolveOptionOtmDeltaFloorLive(liveEnv),
+          /** The RAW env value, so a typo'd `OPTION_OTM_DELTA_FLOOR_LIVE` (which falls back to the default) is visible, not inferred. */
+          floorValueRaw: liveEnv[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] ?? null,
+        },
       },
       tighteningOnly: true,
-      // Both gates can ONLY add rejections (TRA-1897-HOLD-safe); neither loosens.
+      // Every gate here can ONLY add rejections (TRA-1897-HOLD-safe); none loosens.
       ...summary,
       note:
-        !costArmed && !spreadArmed
-          ? `SHADOW-ONLY: both live enforcement flags OFF — the live options path is byte-for-byte the pre-TRA-2048 behaviour (no rejection). Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 on bqb1 (process env, never demo-flags).`
-          : `ENFORCING (live): cost_bar=${costArmed ? 'ARMED' : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
+        !anyArmed
+          ? `SHADOW-ONLY: all live enforcement flags OFF — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection). Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags).`
+          : `ENFORCING (live): cost_bar=${costArmed ? 'ARMED' : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
     });
   });
 

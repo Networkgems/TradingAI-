@@ -96,7 +96,13 @@ import {
   OPTION_LIVE_RV_LONG_FLAG,
   OPTION_LIVE_OTM_FLAG,
   OPTION_LIVE_TEST_UNTIL_VAR,
+  OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+  OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
 } from './option-exec-flag.js';
+import {
+  clearLiveEnforceGateLedger,
+  summarizeLiveEnforceGate,
+} from './live-enforce-gate-ledger.js'; // TRA-2763
 import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
 import {
   clearLiveOptionsFeeSlippageLedger,
@@ -6787,6 +6793,158 @@ describe('SignalEngine — TRA-1929 live OTM bounded-test buy-to-open mirror', (
     expect(rec.askAtSubmit).toBe(0.82);
     expect(rec.slippageVsAsk).toBeCloseTo(0, 6); // filled exactly at the ask
     expect(rec.fees).toBeNull();                 // unmeasured at fill time (never 0)
+  });
+});
+
+// ─── TRA-2763 (parent TRA-2760) — LIVE arm of the OTM entry delta floor ────────
+// The TRA-1407 floor is demo-scoped (`otmScanOpts` reads the demo-flags env only),
+// so real money ran with NO delta floor and filled at |delta| 0.03-0.07. These
+// tests pin the live containment: OFF by default the live path is byte-for-byte
+// unchanged (the flag-OFF test opens the SAME |delta| 0.12 candidate the blocked
+// test rejects); armed, a below-floor live candidate places NO broker order and an
+// above-floor one DOES; BOTH armed verdicts land on the `otm_delta_floor` ledger
+// axis (a counter wired only to rejects cannot tell armed-and-biting from
+// armed-and-never-evaluated); and the demo book never consults the live flag.
+describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
+  const FLOOR_ENV = [
+    OPTION_LIVE_OTM_FLAG,
+    OPTION_LIVE_TEST_UNTIL_VAR,
+    OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+    OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
+  ] as const;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of FLOOR_ENV) savedEnv[k] = process.env[k];
+    clearLiveOptionsFeeSlippageLedger();
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const k of FLOOR_ENV) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    clearLiveOptionsFeeSlippageLedger();
+    clearLiveEnforceGateLedger();
+  });
+
+  interface FloorLiveStub {
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    buyContractsLimit: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+  }
+
+  function fillStub(): FloorLiveStub {
+    return {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'AAPL240705C00210000', bid: 0.78, ask: 0.82 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 42, status: 'filled', avg_fill_price: 0.82 })),
+    };
+  }
+
+  function otmScanner(candidate = makeOtmCandidate()): StubScanner {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05', candidates: [candidate], reason: 'ok',
+    });
+    return scanner;
+  }
+
+  function setupLiveEngine(stub: FloorLiveStub, scanner: StubScanner): SignalEngine {
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+      totalEquity: 268.58, totalCash: 268.58, optionBuyingPower: 268.58, dayTradeBuyingPower: 268.58,
+    };
+    return engine;
+  }
+
+  const runOtm = (engine: SignalEngine, syms: string[]) =>
+    (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(syms);
+
+  /** The `otm_delta_floor` fold across every retained ET day (avoids re-deriving the fake-timer etDay). */
+  function otmFloorGate() {
+    return summarizeLiveEnforceGate('1970-01-01').retained.byGate.find((g) => g.gate === 'otm_delta_floor')!;
+  }
+
+  function armLiveOtmWindow(): void {
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
+  }
+
+  it('flag OFF: the armed live path is unchanged — the |delta| 0.12 candidate still opens and the floor axis records NOTHING', async () => {
+    armLiveOtmWindow();
+    delete process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG];
+    const stub = fillStub();
+    const engine = setupLiveEngine(stub, otmScanner()); // fixture delta 0.12 — below any plausible floor
+    await runOtm(engine, ['AAPL']);
+
+    // Same open the TRA-1929 ARMED test proves: one ask-limit contract.
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+    // Disarmed ⇒ the gate never evaluates: 0 rows, not "evaluated and passed".
+    expect(otmFloorGate()).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(0);
+  });
+
+  it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
+    armLiveOtmWindow();
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] = '0.25';
+    const stub = fillStub();
+    const engine = setupLiveEngine(stub, otmScanner(makeOtmCandidate({ delta: 0.12 })));
+    await runOtm(engine, ['AAPL']);
+
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.signals[0]!.liveSkipReason).toMatch(/entry delta floor/);
+    expect(otmFloorGate()).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
+  });
+
+  it('flag ON + above-floor live candidate: the order DOES open and the ledger counts the ADMIT side too', async () => {
+    armLiveOtmWindow();
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] = '0.25';
+    const stub = fillStub();
+    const engine = setupLiveEngine(stub, otmScanner(makeOtmCandidate({ delta: 0.30 })));
+    await runOtm(engine, ['AAPL']);
+
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+    // The admit is RECORDED — evaluated ticks with blocked 0, so an armed gate
+    // that saw candidates and passed them cannot read as armed-but-inert.
+    expect(otmFloorGate()).toMatchObject({ evaluated: 1, blocked: 0, blockRate: 0 });
+  });
+
+  it('flag ON + a candidate with no usable delta (NaN) fails CLOSED when armed — no order', async () => {
+    armLiveOtmWindow();
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] = '0.25';
+    const stub = fillStub();
+    const engine = setupLiveEngine(stub, otmScanner(makeOtmCandidate({ delta: Number.NaN })));
+    await runOtm(engine, ['AAPL']);
+
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+    expect(engine.getState().signals[0]!.liveSkipReason).toMatch(/fail-closed/);
+    expect(otmFloorGate()).toMatchObject({ evaluated: 1, blocked: 1 });
+  });
+
+  it('demo book never consults the live flag: armed live floor + below-floor demo candidate still opens, 0 ledger rows', async () => {
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
+    process.env[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR] = '0.25';
+    const scanner = otmScanner(makeOtmCandidate({ delta: 0.12 }));
+    const engine = new SignalEngine(undefined, undefined, scanner); // default demo mode
+    await runOtm(engine, ['AAPL']);
+
+    const state = engine.getState();
+    expect(state.options.openOptions).toHaveLength(1);
+    expect(state.options.openOptions[0]!.signalType).toBe('otm_mispricing');
+    expect(otmFloorGate()).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
   });
 });
 

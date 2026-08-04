@@ -82,7 +82,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts } from './option-exec-flag.js';
 import { recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
@@ -5820,6 +5820,49 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-2763 (parent TRA-2760) — the LIVE arm of the TRA-1407 OTM entry |delta|
+   * FLOOR. The demo floor is applied at the scanner (`otmScanOpts.minAbsDelta`,
+   * demo-flags env) and is structurally incapable of touching a live open — so
+   * the live real-money OTM sleeve ran with NO floor at all and filled at
+   * |delta| 0.03-0.07, the measured bleed cohort.
+   *
+   * Same containment as `costAwareGateReject`'s live branch: early-returns
+   * unless `mode === 'live'` AND the SECRET-ADJACENT
+   * `ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE` is armed in the PROCESS env (never the
+   * demo-flags file). OFF by default ⇒ the live path is byte-for-byte
+   * unchanged. TIGHTENING-ONLY: it can only REJECT an open, never admit one
+   * (TRA-1897-HOLD-safe). Enforced HERE, per-candidate, rather than via the
+   * scanner's `minAbsDelta` — a scanner-level filter drops below-floor
+   * candidates invisibly, and an armed gate whose rejects are unobservable
+   * cannot be told apart from an inert one, so every ARMED verdict (admitted
+   * AND rejected) is recorded to `/api/health/live-enforce-gates` under gate
+   * `otm_delta_floor` (the TRA-1486 lesson). A candidate with NO usable delta
+   * fails CLOSED when armed — it cannot prove it clears the floor.
+   *
+   * Returns the rejection reason, or `null` when admitted OR when disarmed.
+   */
+  private otmDeltaFloorLiveRejectReason(delta: number | null | undefined): string | null {
+    if (this.mode !== 'live') return null;
+    if (!isOptionOtmDeltaFloorLiveEnforceEnabled(process.env)) return null;
+    const floor = resolveOptionOtmDeltaFloorLive(process.env);
+    const absDelta = typeof delta === 'number' && Number.isFinite(delta) ? Math.abs(delta) : null;
+    const blocked = absDelta === null || absDelta < floor;
+    const reason = !blocked
+      ? null
+      : absDelta === null
+        ? `OTM entry delta floor (live, TRA-2763): candidate carries no usable delta to prove it clears the |delta| >= ${floor} floor (fail-closed)`
+        : `OTM entry delta floor (live, TRA-2763): |delta| ${absDelta.toFixed(4)} < ${floor}`;
+    recordLiveEnforceDecision(
+      'otm_delta_floor',
+      'single_leg_otm',
+      blocked,
+      etDateString(new Date()),
+      reason ?? undefined,
+    );
+    return reason;
+  }
+
+  /**
    * TRA-2295 (parent TRA-2291) — the SPREAD-CEILING / quotability gate on the
    * option ENTRY path.
    *
@@ -7778,6 +7821,29 @@ export class SignalEngine {
           });
           log.info('OTM open rejected by entry-delta ceiling (TRA-1670)', {
             sym, delta: cheap.delta, reason: otmDeltaCeiling,
+          });
+          continue;
+        }
+
+        // TRA-2763 — LIVE arm of the OTM entry delta floor. No-op unless
+        // mode==='live' AND ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE is armed in the
+        // process env (the method is the gate; demo and disarmed-live fall
+        // straight through). Placed before the live-suppression bail so the
+        // reject is surfaced with a visible reason, mirroring the ceiling's
+        // churn-brake pattern, and every armed verdict — this reject AND the
+        // admit of a candidate that clears it — lands on the
+        // `/api/health/live-enforce-gates` `otm_delta_floor` axis.
+        const otmLiveFloorReject = this.otmDeltaFloorLiveRejectReason(cheap.delta);
+        if (otmLiveFloorReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmLiveFloorReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
+            sym, delta: cheap.delta, reason: otmLiveFloorReject,
           });
           continue;
         }

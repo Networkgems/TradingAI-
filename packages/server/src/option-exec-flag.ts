@@ -794,3 +794,64 @@ export function isOptionCostGateLiveEnforceEnabled(env: NodeJS.ProcessEnv = proc
 export function isOptionLiquidityLiveEnforceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return flagOn(env[OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]);
 }
+
+// --------------------------------------------------------------------------
+// TRA-2763 (parent TRA-2760, board interaction `257df809` = "file it with
+// LeadDev now") — the LIVE arm of the TRA-1407 OTM entry |delta| FLOOR.
+//
+// The demo floor (`OTM_DELTA_FLOOR_ENABLED` / `OTM_DELTA_FLOOR`,
+// exit-risk-rules-flag.ts) is consulted ONLY on the `mode === 'demo'` OTM
+// branch, so the live real-money OTM sleeve ran with NO delta floor at all —
+// last week's live fills landed at |delta| 0.03-0.07, the measured bleed
+// cohort. This flag pair is the live containment, following the exact
+// TRA-2048 cost-bar pattern: SECRET-ADJACENT (it changes what real orders
+// do), read from the PROCESS env ONLY — never the demo-flags file, and NOT on
+// the demo-flag allowlist. TIGHTENING-ONLY (it can only REMOVE live opens,
+// never add one — TRA-1897-HOLD-safe) and OFF by default, so merging this
+// changes nothing until an operator arms it. Every ARMED live verdict
+// (admitted AND rejected) is recorded to `live-enforce-gate-ledger.ts` under
+// gate `otm_delta_floor` and surfaced at `/api/health/live-enforce-gates`, so
+// an armed-but-inert flip cannot read as armed-and-biting (TRA-1407/TRA-1486
+// were both "shipped, believed armed, silently inert").
+// --------------------------------------------------------------------------
+
+export const OPTION_OTM_DELTA_FLOOR_LIVE_FLAG = 'ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE';
+/** Numeric |delta| floor the LIVE arm enforces (a (0,1) magnitude). */
+export const OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR = 'OPTION_OTM_DELTA_FLOOR_LIVE';
+/**
+ * Malformed/absent-value containment ONLY — not an operational recommendation.
+ * QuantTrader picks the real number from the live tape once the cost bar has
+ * been armed for a few sessions (TRA-2763); operators MUST set
+ * `OPTION_OTM_DELTA_FLOOR_LIVE` explicitly when arming. This default exists so
+ * a typo'd value tightens at the long-standing demo default rather than
+ * silently disarming the gate (the same fail-direction the demo resolver
+ * chose), and the health route exposes the RAW value so the typo is visible.
+ */
+export const OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT = 0.4;
+
+/**
+ * True iff the LIVE OTM entry delta floor is armed to REJECT real option opens
+ * below the resolved |delta| floor (accepts 1/true/yes/on). Default OFF ⇒ the
+ * live OTM entry path is byte-for-byte unchanged (no floor, exactly the
+ * pre-TRA-2763 behaviour). Read from the process env only — this is a
+ * live-order toggle, never sourced from the demo-flags file override.
+ */
+export function isOptionOtmDeltaFloorLiveEnforceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG]);
+}
+
+/**
+ * Resolve the LIVE |delta| floor. Reads `OPTION_OTM_DELTA_FLOOR_LIVE`; a
+ * missing, malformed or out-of-range value (≤0 or ≥1 — a delta magnitude) falls
+ * back to {@link OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT} rather than silently
+ * disabling an armed gate. Deliberately does NOT read the demo `OTM_DELTA_FLOOR`
+ * env var: the live number is chosen from the live tape, not inherited.
+ */
+export function resolveOptionOtmDeltaFloorLive(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed < 1) return parsed;
+  }
+  return OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT;
+}

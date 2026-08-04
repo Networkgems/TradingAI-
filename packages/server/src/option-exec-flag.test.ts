@@ -46,6 +46,11 @@ import {
   resolveLiveOptionTestNotionalCapUsd,
   resolveLiveOptionTestMaxContracts,
   resolveLiveOptionTestContracts,
+  isOptionOtmDeltaFloorLiveEnforceEnabled,
+  resolveOptionOtmDeltaFloorLive,
+  OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+  OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
+  OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT,
 } from './option-exec-flag.js';
 
 const ON = '1';
@@ -271,6 +276,47 @@ describe('live enforcement flags (TRA-2048)', () => {
   it('treats a non-truthy value as off (fail-safe: a fat-finger env never arms)', () => {
     expect(isOptionCostGateLiveEnforceEnabled({ [OPTION_COST_GATE_LIVE_ENFORCE_FLAG]: '0' })).toBe(false);
     expect(isOptionLiquidityLiveEnforceEnabled({ [OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG]: 'maybe' })).toBe(false);
+  });
+});
+
+describe('live OTM entry delta floor flag (TRA-2763)', () => {
+  const ON = '1';
+
+  it('defaults OFF — merging changes nothing until an operator arms it', () => {
+    expect(isOptionOtmDeltaFloorLiveEnforceEnabled({})).toBe(false);
+    // Setting only the VALUE does not arm the gate.
+    expect(
+      isOptionOtmDeltaFloorLiveEnforceEnabled({ [OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR]: '0.30' }),
+    ).toBe(false);
+  });
+
+  it('arms on the usual truthy spellings, independently of the other live-enforce flags', () => {
+    for (const v of ['1', 'true', 'yes', 'on', 'ON', ' True ']) {
+      expect(isOptionOtmDeltaFloorLiveEnforceEnabled({ [OPTION_OTM_DELTA_FLOOR_LIVE_FLAG]: v })).toBe(true);
+    }
+    expect(isOptionOtmDeltaFloorLiveEnforceEnabled({ [OPTION_COST_GATE_LIVE_ENFORCE_FLAG]: ON })).toBe(false);
+    expect(isOptionCostGateLiveEnforceEnabled({ [OPTION_OTM_DELTA_FLOOR_LIVE_FLAG]: ON })).toBe(false);
+    // The demo flag pair never arms the live one (separate env channels by design).
+    expect(isOptionOtmDeltaFloorLiveEnforceEnabled({ OTM_DELTA_FLOOR_ENABLED: ON })).toBe(false);
+  });
+
+  it('resolves the floor from OPTION_OTM_DELTA_FLOOR_LIVE, (0,1) exclusive', () => {
+    expect(resolveOptionOtmDeltaFloorLive({ [OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR]: '0.25' })).toBe(0.25);
+    expect(resolveOptionOtmDeltaFloorLive({ [OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR]: '0.07' })).toBe(0.07);
+  });
+
+  it('falls back to the containment default on a missing/malformed/out-of-range value (never silently disarms)', () => {
+    expect(resolveOptionOtmDeltaFloorLive({})).toBe(OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT);
+    for (const bad of ['0', '1', '-0.2', '1.4', 'abc', ' ', 'NaN']) {
+      expect(resolveOptionOtmDeltaFloorLive({ [OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR]: bad })).toBe(
+        OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT,
+      );
+    }
+    // The live resolver never reads the DEMO value var — the number is chosen
+    // from the live tape, not inherited (the ticket's explicit instruction).
+    expect(resolveOptionOtmDeltaFloorLive({ OTM_DELTA_FLOOR: '0.11' })).toBe(
+      OPTION_OTM_DELTA_FLOOR_LIVE_DEFAULT,
+    );
   });
 });
 

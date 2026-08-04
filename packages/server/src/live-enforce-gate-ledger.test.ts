@@ -14,7 +14,7 @@ import {
 const DAY = '2026-07-18';
 
 /** Convenience: pull one gate's fold out of the day view. */
-function gate(day: string, g: 'cost_bar' | 'spread') {
+function gate(day: string, g: 'cost_bar' | 'spread' | 'otm_delta_floor') {
   return summarizeLiveEnforceGate(day).byGate.find((x) => x.gate === g)!;
 }
 
@@ -35,8 +35,8 @@ describe('live-enforce-gate-ledger', () => {
     const s = summarizeLiveEnforceGate(DAY);
     expect(s.decisionsRecorded).toBe(0);
     expect(s.lastDecisionAt).toBeNull();
-    // Both gates are always present so a reader never mistakes "gate absent" for "gate armed, nothing seen".
-    expect(s.byGate.map((g) => g.gate).sort()).toEqual(['cost_bar', 'spread']);
+    // Every gate is always present so a reader never mistakes "gate absent" for "gate armed, nothing seen".
+    expect(s.byGate.map((g) => g.gate).sort()).toEqual(['cost_bar', 'otm_delta_floor', 'spread']);
     for (const g of s.byGate) {
       expect(g).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
     }
@@ -121,6 +121,24 @@ describe('live-enforce-gate-ledger', () => {
     expect(retained.etDays).toEqual(['2026-07-17', '2026-07-18']);
     const spread = retained.byGate.find((g) => g.gate === 'spread')!;
     expect(spread).toMatchObject({ evaluated: 2, blocked: 1 });
+  });
+
+  // TRA-2763 — the OTM entry delta floor's live arm records on its own axis and
+  // survives a reboot like the first two gates (the hydrate validator must accept
+  // the new key, or every floor verdict silently vanishes on the next boot).
+  it('records otm_delta_floor decisions on both sides and re-hydrates them (TRA-2763)', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('otm_delta_floor', 'single_leg_otm', true, DAY, '|delta| 0.1200 < 0.25', 1_001);
+    recordLiveEnforceDecision('otm_delta_floor', 'single_leg_otm', false, DAY, undefined, 1_002);
+
+    expect(gate(DAY, 'otm_delta_floor')).toMatchObject({ evaluated: 2, blocked: 1, blockRate: 0.5 });
+    // The other axes are untouched — the floor cannot masquerade as the cost bar.
+    expect(gate(DAY, 'cost_bar')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+
+    clearLiveEnforceGateLedger();
+    const h = hydrateLiveEnforceGateFromDisk(dir, 2_000);
+    expect(h.records).toBe(2);
+    expect(gate(DAY, 'otm_delta_floor')).toMatchObject({ evaluated: 2, blocked: 1 });
   });
 
   it('drops records older than the retention horizon on hydrate', () => {

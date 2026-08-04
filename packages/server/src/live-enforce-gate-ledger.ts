@@ -57,9 +57,11 @@ const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
  * Which live gate produced the record. `cost_bar` is the TRA-1602 modeled-gross-R
  * admission bar promoted to live enforcement; `spread` is the TRA-1967 liquidity /
  * spread veto (`SPREAD_TOO_WIDE` / thin-book / unusable-quote) enforced at the
- * live-options broker seam.
+ * live-options broker seam; `otm_delta_floor` is the TRA-2763 live arm of the
+ * TRA-1407 OTM entry |delta| floor (the demo-only guard that left real money
+ * running unfiltered at |delta| 0.03-0.07).
  */
-export type LiveEnforceGate = 'cost_bar' | 'spread';
+export type LiveEnforceGate = 'cost_bar' | 'spread' | 'otm_delta_floor';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -116,7 +118,7 @@ export function clearLiveEnforceGateLedger(): void {
   lastAppendError = null;
 }
 
-const GATES: LiveEnforceGate[] = ['cost_bar', 'spread'];
+const GATES: LiveEnforceGate[] = ['cost_bar', 'spread', 'otm_delta_floor'];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
 function apply(rec: LiveEnforceRecord): void {
@@ -227,7 +229,7 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
     }
     if (typeof rec.ts !== 'number' || !Number.isFinite(rec.ts) || rec.ts < cutoff) continue;
     if (typeof rec.etDay !== 'string' || rec.etDay === '') continue;
-    if (rec.gate !== 'cost_bar' && rec.gate !== 'spread') continue;
+    if (!GATES.includes(rec.gate)) continue;
     if (typeof rec.scope !== 'string' || rec.scope === '') continue;
     if (typeof rec.blocked !== 'boolean') continue;
     const clean: LiveEnforceRecord = {
