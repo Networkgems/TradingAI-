@@ -130,6 +130,9 @@ export const PNL_ABSENT_EOD_ROW_NOTE =
 export const PNL_FROZEN_COUNTER_NOTE =
   'TRA-2658: a FROZEN `optionsCreditedCumulative` is invisible to the reset signatures. `counterDurable` graded non-durability off `lagsPriorOptionsDaily` and a NEGATIVE window, and both are MOTION detectors — a counter stuck at exactly 0 never decreases and never pushes a credit into the stock leg, because `openingEquity` absorbed the credit across a boot before the 21:00 close ran. Live bqb1 2026-07-30T14:08Z: `admin` served `counterDurable: true` with `counterResetDates: []` and `optionsCreditedCumulative: 0` on 07-27, 07-28 AND 07-29, while $254.00 of option credit had demonstrably reached its equity ($2,008.29 -> $2,243.48 against a -$18.81 stock leg). So the predicate TRA-2658 AC2 grades had NO FAILING STATE on the one book that mattered. The third signature is `unbookedEquityMoveUsd` = (closingEquity - prevClosingEquity) - stockDaily - optionsCreditedInWindow, which is algebraically `openingEquity - prevClosingEquity` and is 0 on a continuously-run book; it read +140.00 on 07-28 (= 07-27 `optionsDaily` to the cent) and +114.00 on 07-29. Its operands are three durable snapshot fields that NO writer joins, so it cannot go self-confirming the way TRA-2641 `optionsLegDrift` did. It now folds into `counterDurable` via `counterFrozenDates`; read `counterNonDurableDates` for the union and `counterResetDates` for the original narrower meaning — a ZEROED counter and a FROZEN one need OPPOSITE remediations, because a zeroed counter has already double-booked the credit into `stockDaily` (making `uncreditedOptionsUsd` an upper bound) while a frozen one leaves the stock leg exact and the credit present in `closingEquity` but absent from every daily row. `unbookedEquityMoveDates` additionally publishes un-attributed moves (a starting-balance edit via `PaperAccount.applyEquity` is the benign cause) WITHOUT folding them into the verdict.';
 
+export const PNL_LIVE_MODE_SPAN_NOTE =
+  'TRA-2831: the live COHORT is keyed on the book\'s mode TODAY (`stockModeKey(loadSettings(username))`, read per request) while the day-cell options ledger under it is per-BOOK and MODE-BLIND for all time. On any book that flipped demo -> live mid-series those compose into a silent attribution defect: the whole pre-flip DEMO history folds into every `live*` credit metric. Live bqb1 2026-08-04T22:22Z: `liveUncreditedOptionsUsd` published 733.60 as a live-money shortfall, whose numerator `postBaselineOptionsRealized` 987.60 is the sum of eleven `journal-repair` cells dated 2026-07-15..2026-07-29 — a window in which the live book (`admin`) held ZERO live options, its first having opened 2026-07-30 09:36 ET. Those 987.60 are admin\'s own DEMO option P&L: summing every book\'s `journal-repair` cells fleet-wide reproduces the demo-mode fleet total to the cent (07-15 301.30, 07-17 102.00, 07-22 4919.50), with admin contributing 17.00 / 217.50 / 54.40. The equality to `eodCombined` on those rows is NOT independent corroboration — it is the TRA-2641 slaving (`syncEodReportOptionsLegs` writes the day cell into the report file\'s options leg on every `journal`/`journal-repair` row) plus a 0.00 stock leg on 9 of the 11. `liveUncreditedOptionsUsd` is now null (NOT MEASURED) whenever any contributing book carries pre-onset options money; read `liveUncreditedOptionsUsdUnscoped` for the arithmetic, `liveUncreditedOptionsGradeable` for the denominator, and `liveModeSpanContaminatedBooks` for the attribution. Completing TRA-2827\'s 07-30/07-31/08-03 back-fill does NOT discharge this: those rows are post-onset and add a live term without removing the 987.60 pre-onset term. NOTE also that `optionsDailyPnl` is not a field on the published day rows at all — the durable snapshot field of that name surfaces as `optionsDaily`, and querying the published shape for `optionsDailyPnl` returns null on all 67 admin cells (and on every cell of every book) as a NAME MISS, not as a TRA-2629-style dropped field; the values are present and journal-sourced (`optionsDaily === journalOptionsPnl` on all 11 repaired cells, where `journalOptionsPnl` is recomputed per request straight from the journal).';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
@@ -137,6 +140,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_DRIFT_DECOMPOSITION_NOTE,
   PNL_ABSENT_EOD_ROW_NOTE,
   PNL_FROZEN_COUNTER_NOTE,
+  PNL_LIVE_MODE_SPAN_NOTE,
 ];
 
 /**
@@ -816,6 +820,27 @@ export interface PnlReconcileResult {
   postBaselineOptionsRealized: number;
   postBaselineStockDaily: number;
   /**
+   * TRA-2831 — the ET date this book first opened a LIVE option, or `null` if it
+   * never has. See {@link liveOptionsOnsetEtDate}. `null` on every demo book,
+   * and on a live book that has not yet traded an option in live mode.
+   */
+  liveOptionsOnsetDate: string | null;
+  /**
+   * TRA-2831 — how much of `postBaselineOptionsRealized` is booked to sessions
+   * that predate {@link liveOptionsOnsetDate}, i.e. how much of the numerator is
+   * NOT live money. Equals `postBaselineOptionsRealized` exactly when the onset
+   * is `null` (nothing in the window can be live), which is the honest reading
+   * and not a manufactured zero.
+   *
+   * On a demo book this is simply "all of it" and carries no accusation — the
+   * field only becomes a verdict input inside the live cohort, where
+   * {@link summarizeLiveCreditObservation} uses it to disqualify a contaminated
+   * `liveUncreditedOptionsUsd`.
+   */
+  optionsRealizedBeforeLiveOnsetUsd: number;
+  /** TRA-2831 — the pre-onset sessions carrying a non-zero options figure. */
+  preLiveOnsetOptionsDates: string[];
+  /**
    * TRA-2635 — how many evaluated sessions could actually have graded the
    * bridge (`optionsCreditedCumulative` present AND `optionsDaily` non-zero).
    * `0` means the verdict above is `null` for want of a cohort, not because
@@ -950,16 +975,29 @@ export function summarizeLiveCreditObservation(
     postBaselineEquityGrowth: number | null;
     postBaselineOptionsRealized: number;
     postBaselineStockDaily: number;
+    liveOptionsOnsetDate: string | null;
+    optionsRealizedBeforeLiveOnsetUsd: number;
+    preLiveOnsetOptionsDates: string[];
   }>,
 ): {
   liveCreditBookCount: number;
   liveEquityAbsorbedOptionsOk: boolean | null;
   liveUncreditedOptionsUsd: number | null;
+  liveUncreditedOptionsUsdUnscoped: number | null;
+  liveUncreditedOptionsGradeable: boolean;
+  liveModeSpanContaminatedBooks: Array<Record<string, unknown>>;
   liveCounterDurableOk: boolean | null;
   liveCreditBooks: Array<Record<string, unknown>>;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
   const measurable = liveBooks.filter(e => e.uncreditedOptionsUsd != null);
+  // TRA-2831 — a measurable book whose numerator is (partly) demo money. The
+  // dollar figure is arithmetically fine; what is wrong is calling it LIVE.
+  const contaminated = measurable.filter(e =>
+    Math.abs(e.optionsRealizedBeforeLiveOnsetUsd) > PNL_RECONCILE_TOLERANCE_USD);
+  const unscoped = measurable.length === 0
+    ? null
+    : round2(measurable.reduce((s, e) => s + (e.uncreditedOptionsUsd ?? 0), 0));
   return {
     liveCreditBookCount: liveBooks.length,
     liveEquityAbsorbedOptionsOk: liveBooks.some(e => e.equityAbsorbedOptionsOk === false)
@@ -970,9 +1008,39 @@ export function summarizeLiveCreditObservation(
     // TRA-2635 — THE DOLLAR FIGURE, and it is what carries the finding when the
     // boolean above is NOT MEASURED. Null (not 0) when no live book could be
     // measured: a zero here must never be reachable by absence.
-    liveUncreditedOptionsUsd: measurable.length === 0
-      ? null
-      : round2(measurable.reduce((s, e) => s + (e.uncreditedOptionsUsd ?? 0), 0)),
+    //
+    // TRA-2831 — now ALSO null when any contributing book's numerator predates
+    // its live-options onset. The published 733.60 was built entirely out of
+    // `admin`'s 2026-07-15 … 07-29 DEMO-mode option P&L (987.60), booked into the
+    // live cohort because the cohort is keyed on the book's mode TODAY while the
+    // ledger under it is mode-blind for all time. This field's contract is "live
+    // money not in NAV"; a demo-sourced number cannot satisfy it at any value,
+    // so it reads NOT MEASURED rather than being silently rescaled.
+    //
+    // Note what this does NOT do: it does not wait on TRA-2827's back-fill of
+    // 07-30 / 07-31 / 08-03. Those rows are post-onset, so writing them adds a
+    // genuinely live term WITHOUT removing the 987.60 pre-onset term — the
+    // window would look unbroken while the numerator stayed exactly as
+    // un-attributable, which is strictly worse than the visible hole. The gate
+    // is on provenance, not on completeness.
+    liveUncreditedOptionsUsd: contaminated.length > 0 ? null : unscoped,
+    // The arithmetic, retained verbatim as a MEASUREMENT. CFO's TRA-2831 ruling
+    // suspends 733.60 as a live-money figure but keeps it published — deleting it
+    // would destroy the evidence the suspension rests on, and a reader comparing
+    // this to `liveUncreditedOptionsUsd` can see the disqualification directly.
+    liveUncreditedOptionsUsdUnscoped: unscoped,
+    liveUncreditedOptionsGradeable: measurable.length > 0 && contaminated.length === 0,
+    // The attribution for the null above. Empty array + `gradeable: false` means
+    // "no measurable live book at all"; non-empty means "measured, and the money
+    // is not live" — two different states that must not collapse.
+    liveModeSpanContaminatedBooks: contaminated.map(e => ({
+      username: e.username,
+      liveOptionsOnsetDate: e.liveOptionsOnsetDate,
+      optionsRealizedBeforeLiveOnsetUsd: e.optionsRealizedBeforeLiveOnsetUsd,
+      preLiveOnsetOptionsDates: e.preLiveOnsetOptionsDates,
+      postBaselineOptionsRealized: e.postBaselineOptionsRealized,
+      uncreditedOptionsUsd: e.uncreditedOptionsUsd,
+    })),
     // TRA-2658 AC2, folded so a checker can assert it without walking the array.
     // Same tri-state precedence as every other fold in this module — RED beats
     // NOT MEASURED beats GREEN — and `null` requires `liveCreditBookCount` to
@@ -1007,6 +1075,13 @@ export function summarizeLiveCreditObservation(
       postBaselineEquityGrowth: e.postBaselineEquityGrowth,
       postBaselineOptionsRealized: e.postBaselineOptionsRealized,
       postBaselineStockDaily: e.postBaselineStockDaily,
+      // TRA-2831 — the provenance of the numerator, on every live book and not
+      // only the contaminated ones. A reader must be able to see that a book's
+      // figure IS attributable, not just infer it from absence from the
+      // contaminated list.
+      liveOptionsOnsetDate: e.liveOptionsOnsetDate,
+      optionsRealizedBeforeLiveOnsetUsd: e.optionsRealizedBeforeLiveOnsetUsd,
+      preLiveOnsetOptionsDates: e.preLiveOnsetOptionsDates,
     })),
   };
 }
@@ -1326,6 +1401,64 @@ export function foldJournalClosesByEtDay(
 }
 
 /**
+ * TRA-2831 — the ET date this book first opened an option in **live** mode, or
+ * `null` if it never has.
+ *
+ * ── Why a mode-blind ledger needs this ───────────────────────────────────────
+ *
+ * The day-cell options ledger is per-BOOK and MODE-BLIND, deliberately and for
+ * good reasons (see `options-daily-pnl-source.ts` — scoping the fold by mode
+ * would retroactively DELETE a book's history the moment somebody flips a
+ * settings toggle). The live COHORT, by contrast, is defined by the book's
+ * CURRENT mode: `engines.filter(e => e.mode === 'live')`, where `mode` is
+ * `stockModeKey(await loadSettings(username))` read at request time.
+ *
+ * Those two facts compose into a silent attribution defect on any book that
+ * flipped demo → live mid-series: its ENTIRE pre-flip demo history is folded
+ * into every `live*` credit metric, because the fold asks what the book is
+ * today and the ledger answers with everything it has ever done.
+ *
+ * Measured live on bqb1 2026-08-04T22:22Z, book `admin` (the fleet's only live
+ * book): `liveUncreditedOptionsUsd` published **733.60** as a live-money
+ * shortfall. Its numerator `postBaselineOptionsRealized` = 987.60 is the sum of
+ * eleven `journal-repair` day cells dated 2026-07-15 … 2026-07-29 — a window in
+ * which admin held no live options at all (its first live position opened
+ * 2026-07-30 09:36 ET). Every one of those 987.60 is admin's own DEMO-mode
+ * realized options P&L. Proof that the population is demo, straight off the
+ * published surface: summing each book's `journal-repair` cells across the whole
+ * fleet reproduces the demo-mode fleet total to the cent on every test date —
+ * 07-15 → 301.30, 07-17 → 102.00, 07-22 → 4,919.50 — with admin contributing
+ * 17.00 / 217.50 / 54.40 of those. The partitions ARE the demo population.
+ *
+ * ── What this measures, and what it deliberately does not ────────────────────
+ *
+ * This is the first LIVE OPTION, not the mode flip. The flip timestamp is not
+ * persisted anywhere durable, and the option journal is; a book that flipped to
+ * live on the 20th and first traded an option on the 30th therefore reads onset
+ * 07-30 here. That error is one-directional — it can only mark genuinely-live
+ * sessions as pre-onset, i.e. push the verdict toward NOT MEASURED, never toward
+ * a false green or a fabricated red. Named `liveOptionsOnsetDate` rather than
+ * anything suggesting a mode-change date so no reader mistakes it for one.
+ *
+ * Keyed on `openTs`, not `closeTs`: the position that PROVES the book was live
+ * is the one it opened, and a live position opened on the 30th and closed on the
+ * 31st must not date the onset to the 31st.
+ */
+export function liveOptionsOnsetEtDate(
+  rows: ReadonlyArray<{ mode?: string; openTs?: number }>,
+  etDate: (ts: number) => string,
+): string | null {
+  let earliest: string | null = null;
+  for (const r of rows) {
+    if (r.mode !== 'live') continue;
+    if (typeof r.openTs !== 'number' || !Number.isFinite(r.openTs)) continue;
+    const day = etDate(r.openTs);
+    if (earliest === null || day < earliest) earliest = day;
+  }
+  return earliest;
+}
+
+/**
  * Reconcile the EOD combined P&L against the stock-only + day-only-options
  * decomposition for every day that has a persisted snapshot. A snapshot with no
  * matching EOD report file contributes a row with `eodCombined: null` and a
@@ -1349,6 +1482,12 @@ export function reconcilePnl(
   // existing caller keeps compiling; a caller that passes nothing gets
   // `eodTailStaleSessions: null` (NOT MEASURED), never a fabricated `0`.
   tailCalendar: EodTailCalendar | null = null,
+  // TRA-2831 — the book's live-options onset (see `liveOptionsOnsetEtDate`).
+  // Optional and defaulting to `null` so every existing caller keeps compiling.
+  // A caller that passes nothing gets `optionsRealizedBeforeLiveOnsetUsd` equal
+  // to the whole numerator, which reads as "none of this is provably live" —
+  // the safe direction. There is no default that fabricates a clean attribution.
+  liveOptionsOnsetDate: string | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -1772,6 +1911,18 @@ export function reconcilePnl(
       : round2(lastEquity - firstEquity);
   const postBaselineOptionsRealized = round2(spanned.reduce((s, d) => s + d.optionsDaily, 0));
   const postBaselineStockDaily = round2(spanned.reduce((s, d) => s + d.stockDaily, 0));
+  // TRA-2831 — decompose the numerator by whether the book was demonstrably live
+  // on the session. Computed over `spanned`, the SAME rows the numerator sums, so
+  // `optionsRealizedBeforeLiveOnsetUsd` is a true partition of
+  // `postBaselineOptionsRealized` and a reader can subtract the two. Folding over
+  // `evaluated` instead would let the contamination figure exceed the numerator
+  // it is supposed to qualify, on exactly the books whose first row is active.
+  const preLiveOnsetRows = spanned.filter(d =>
+    (liveOptionsOnsetDate === null || d.date < liveOptionsOnsetDate)
+    && Math.abs(d.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD);
+  const optionsRealizedBeforeLiveOnsetUsd = round2(
+    preLiveOnsetRows.reduce((s, d) => s + d.optionsDaily, 0),
+  );
 
   return {
     ok: offendingDates.length === 0,
@@ -1831,6 +1982,9 @@ export function reconcilePnl(
     postBaselineEquityGrowth,
     postBaselineOptionsRealized,
     postBaselineStockDaily,
+    liveOptionsOnsetDate,
+    optionsRealizedBeforeLiveOnsetUsd,
+    preLiveOnsetOptionsDates: preLiveOnsetRows.map(d => d.date),
     uncreditedOptionsUsd: postBaselineEquityGrowth == null
       ? null
       : round2(postBaselineOptionsRealized + postBaselineStockDaily - postBaselineEquityGrowth),

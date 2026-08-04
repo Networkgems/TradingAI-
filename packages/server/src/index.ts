@@ -25,6 +25,7 @@ import {
   reconcilePnl,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
+  liveOptionsOnsetEtDate,
   summarizeLiveLagTripwire,
   summarizeLiveCohortIntegrity,
   summarizeLiveCreditObservation,
@@ -4344,6 +4345,19 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         const openLiveRows = bookRows == null
           ? null
           : bookRows.filter(r => r.mode === 'live' && typeof r.closeTs !== 'number');
+        // TRA-2831 — the ET date this book first opened a LIVE option, from the
+        // same `bookRows` population everything else on this endpoint is scoped
+        // to. Without it the live credit axis folds a demo→live book's entire
+        // pre-flip demo P&L into `liveUncreditedOptionsUsd` and publishes the
+        // total as a live-money shortfall (733.60 on `admin`, 100% demo-sourced).
+        //
+        // A null census leaves this null, which reads as "nothing in the window
+        // is provably live" — the numerator is disqualified rather than being
+        // credited by default. That is the only safe direction: the failure mode
+        // this exists to stop is a demo figure wearing a live label.
+        const liveOptionsOnsetDate = bookRows == null
+          ? null
+          : liveOptionsOnsetEtDate(bookRows, (ts: number) => etDateString(new Date(ts)));
         // TRA-2829 — the EOD back-fill plan for this book, computed READ-ONLY.
         //
         // Published rather than acted on. The CFO ruling on TRA-2827 requires the
@@ -4389,6 +4403,7 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             eodOptionsByDate,
             eodStockByDate,
             tailCalendar,
+            liveOptionsOnsetDate,
           ),
         };
       }),

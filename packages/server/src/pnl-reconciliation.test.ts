@@ -3,6 +3,7 @@ import {
   reconcilePnl,
   resolvePnlBaselineDate,
   foldJournalClosesByEtDay,
+  liveOptionsOnsetEtDate,
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
@@ -1168,6 +1169,11 @@ describe('TRA-2658 — liveCounterDurableOk', () => {
     postBaselineEquityGrowth: 235.19,
     postBaselineOptionsRealized: 987.6,
     postBaselineStockDaily: -18.81,
+    // TRA-2831 — attributable by default so the assertions in this block keep
+    // grading what they were written to grade. Contamination has its own block.
+    liveOptionsOnsetDate: '2026-07-13' as string | null,
+    optionsRealizedBeforeLiveOnsetUsd: 0,
+    preLiveOnsetOptionsDates: [] as string[],
   });
 
   it('is NOT MEASURED on an empty live cohort — never a passing durability grade', () => {
@@ -1224,6 +1230,11 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     postBaselineEquityGrowth: 235.19,
     postBaselineOptionsRealized: 987.6,
     postBaselineStockDaily: -18.81,
+    // TRA-2831 — attributable by default so the assertions in this block keep
+    // grading what they were written to grade. Contamination has its own block.
+    liveOptionsOnsetDate: '2026-07-13' as string | null,
+    optionsRealizedBeforeLiveOnsetUsd: 0,
+    preLiveOnsetOptionsDates: [] as string[],
   });
 
   it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
@@ -1277,6 +1288,207 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     const r = summarizeLiveCreditObservation([notMeasured]);
     expect(r.liveEquityAbsorbedOptionsOk).toBeNull();
     expect(r.liveUncreditedOptionsUsd).toBeCloseTo(733.6, 2);
+  });
+
+  // TRA-2831 (CFO) — THE 733.60 IS DEMO MONEY WEARING A LIVE LABEL.
+  //
+  // Live bqb1 2026-08-04T22:22Z, book `admin`, the fleet's ONLY live book:
+  //
+  //   liveUncreditedOptionsUsd 733.60
+  //     = postBaselineOptionsRealized 987.60
+  //     − (postBaselineEquityGrowth 235.19 − postBaselineStockDaily −18.81)
+  //
+  // and the 987.60 is Σ of eleven `journal-repair` day cells dated 2026-07-15 …
+  // 2026-07-29 — a window in which admin held ZERO live options. Its first live
+  // position opened 2026-07-30 09:36 ET; its only live closes are 3 rows on
+  // 07-31 worth +739.00, which are in NO period at all because 07-30/07-31/08-03
+  // have no snapshot rows (TRA-2827).
+  //
+  // The population the repair read is admin's OWN journal rows scoped by
+  // `account` and MODE-BLIND (`journalRowsForBook`) — i.e. its demo history. The
+  // proof off the published surface: summing every book's `journal-repair` cells
+  // fleet-wide reproduces the demo-mode fleet total to the cent on every test
+  // date the CFO checked — 07-15 → 301.30, 07-17 → 102.00, 07-22 → 4,919.50 —
+  // with admin contributing 17.00 / 217.50 / 54.40. The partitions ARE the demo
+  // population; comparing an unpartitioned fleet total against one book's share
+  // is what made it look like a third, unidentifiable population.
+  describe('TRA-2831 — a demo→live book must not fold its demo P&L into the live figure', () => {
+    const flipped = (username: string, preOnsetUsd: number) => ({
+      ...book(username, 'live', false),
+      liveOptionsOnsetDate: '2026-07-30' as string | null,
+      optionsRealizedBeforeLiveOnsetUsd: preOnsetUsd,
+      preLiveOnsetOptionsDates: preOnsetUsd === 0 ? [] : ['2026-07-15', '2026-07-29'],
+    });
+
+    it('reads NOT MEASURED — not 733.60 — when the numerator predates live onset', () => {
+      const r = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
+      expect(r.liveCreditBookCount).toBe(1);
+      expect(r.liveUncreditedOptionsUsd).toBeNull();
+      expect(r.liveUncreditedOptionsGradeable).toBe(false);
+    });
+
+    it('keeps the arithmetic published as a MEASUREMENT, so the evidence survives', () => {
+      // CFO suspended 733.60 as a live-money figure but explicitly kept it
+      // published. Deleting it would destroy the evidence the suspension rests
+      // on, and a reader must be able to see the disqualification directly by
+      // comparing these two fields.
+      const r = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
+      expect(r.liveUncreditedOptionsUsdUnscoped).toBeCloseTo(733.6, 2);
+      expect(r.liveModeSpanContaminatedBooks).toEqual([{
+        username: 'admin',
+        liveOptionsOnsetDate: '2026-07-30',
+        optionsRealizedBeforeLiveOnsetUsd: 987.6,
+        preLiveOnsetOptionsDates: ['2026-07-15', '2026-07-29'],
+        postBaselineOptionsRealized: 987.6,
+        uncreditedOptionsUsd: 733.6,
+      }]);
+    });
+
+    it('separates "no measurable live book" from "measured, and the money is not live"', () => {
+      // Both states publish `liveUncreditedOptionsUsd: null`. They need OPPOSITE
+      // remediations — one waits for a live book, the other waits for a
+      // mode-scoped ledger — so collapsing them is the whole defect repeating.
+      const empty = summarizeLiveCreditObservation([book('Richard', 'demo', false)]);
+      expect(empty.liveUncreditedOptionsUsd).toBeNull();
+      expect(empty.liveModeSpanContaminatedBooks).toEqual([]);
+      expect(empty.liveUncreditedOptionsGradeable).toBe(false);
+
+      const dirty = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
+      expect(dirty.liveUncreditedOptionsUsd).toBeNull();
+      expect(dirty.liveModeSpanContaminatedBooks).toHaveLength(1);
+    });
+
+    it('still grades a live book whose whole window IS post-onset', () => {
+      // The gate must not be a permanent null — a book that only ever traded
+      // live keeps its figure, or this "fix" is just a mute button.
+      const r = summarizeLiveCreditObservation([flipped('admin', 0)]);
+      expect(r.liveUncreditedOptionsGradeable).toBe(true);
+      expect(r.liveUncreditedOptionsUsd).toBeCloseTo(733.6, 2);
+      expect(r.liveModeSpanContaminatedBooks).toEqual([]);
+    });
+
+    it('ONE contaminated book disqualifies the fold — a clean book cannot mask it', () => {
+      const r = summarizeLiveCreditObservation([
+        flipped('operator2', 0),
+        flipped('admin', 987.6),
+      ]);
+      expect(r.liveUncreditedOptionsUsd).toBeNull();
+      expect(r.liveModeSpanContaminatedBooks.map(b => b.username)).toEqual(['admin']);
+      // The unscoped sum still adds BOTH, so it stays a checkable arithmetic
+      // total rather than quietly becoming the clean subset.
+      expect(r.liveUncreditedOptionsUsdUnscoped).toBeCloseTo(1_467.2, 2);
+    });
+
+    it('publishes provenance on EVERY live book, not only the contaminated ones', () => {
+      // A reader must be able to SEE that a book's figure is attributable, not
+      // infer it from absence from the contaminated list.
+      const r = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
+      expect(r.liveCreditBooks[0]!.liveOptionsOnsetDate).toBe('2026-07-30');
+      expect(r.liveCreditBooks[0]!.optionsRealizedBeforeLiveOnsetUsd).toBeCloseTo(987.6, 2);
+    });
+
+    it('a book that never traded a live option is contaminated in FULL, not credited', () => {
+      // `liveOptionsOnsetDate: null` means nothing in the window is provably
+      // live. The safe reading is "none of it", never "all of it".
+      const never = {
+        ...book('admin', 'live', false),
+        liveOptionsOnsetDate: null,
+        optionsRealizedBeforeLiveOnsetUsd: 987.6,
+        preLiveOnsetOptionsDates: ['2026-07-15'],
+      };
+      const r = summarizeLiveCreditObservation([never]);
+      expect(r.liveUncreditedOptionsUsd).toBeNull();
+      expect(r.liveUncreditedOptionsGradeable).toBe(false);
+    });
+  });
+});
+
+describe('TRA-2831 — reconcilePnl partitions the numerator by live onset', () => {
+  // Shape of the live tape: an anchor row, then options money booked BEFORE the
+  // book ever traded a live option, then one post-onset session.
+  const snaps = [
+    snap('2026-07-14', 0, 0),      // anchor — outside the telescoped window
+    snap('2026-07-15', 0, 17),
+    snap('2026-07-29', -17.87, 250.01),
+    snap('2026-07-31', 0, 739),
+  ];
+
+  it('splits `postBaselineOptionsRealized` into pre- and post-onset money', () => {
+    const r = reconcilePnl(snaps, new Map(), '2026-07-12', null, null, null, null, '2026-07-30');
+    // The numerator sums the SPANNED rows (1..N), so the anchor is excluded from
+    // both sides and the two figures remain subtractable.
+    expect(r.postBaselineOptionsRealized).toBeCloseTo(1_006.01, 2);
+    expect(r.optionsRealizedBeforeLiveOnsetUsd).toBeCloseTo(267.01, 2);
+    expect(r.preLiveOnsetOptionsDates).toEqual(['2026-07-15', '2026-07-29']);
+    expect(r.liveOptionsOnsetDate).toBe('2026-07-30');
+    // Post-onset remainder is the genuinely live money: 1006.01 − 267.01 = 739.
+    expect(r.postBaselineOptionsRealized - r.optionsRealizedBeforeLiveOnsetUsd)
+      .toBeCloseTo(739, 2);
+  });
+
+  it('treats a NULL onset as "none of this is provably live"', () => {
+    // The default for every existing caller, and for a book with no live rows.
+    // It must disqualify the whole numerator, never credit it.
+    const r = reconcilePnl(snaps, new Map(), '2026-07-12');
+    expect(r.liveOptionsOnsetDate).toBeNull();
+    expect(r.optionsRealizedBeforeLiveOnsetUsd)
+      .toBeCloseTo(r.postBaselineOptionsRealized, 2);
+  });
+
+  it('never reports more contamination than the numerator it qualifies', () => {
+    // Folding over `evaluated` rather than `spanned` would count the anchor row's
+    // options money on one side only — a contamination figure exceeding the
+    // numerator, on exactly the books whose first row is active.
+    const active = [
+      snap('2026-07-14', 0, 500),    // anchor, and NOT quiet
+      snap('2026-07-15', 0, 17),
+    ];
+    const r = reconcilePnl(active, new Map(), '2026-07-12', null, null, null, null, '2026-07-30');
+    expect(r.postBaselineOptionsRealized).toBeCloseTo(17, 2);
+    expect(r.optionsRealizedBeforeLiveOnsetUsd).toBeCloseTo(17, 2);
+    expect(r.preLiveOnsetOptionsDates).toEqual(['2026-07-15']);
+  });
+});
+
+describe('TRA-2831 — liveOptionsOnsetEtDate', () => {
+  const etDate = (ts: number) => new Date(ts).toISOString().slice(0, 10);
+  const D = (iso: string) => Date.parse(`${iso}T15:00:00Z`);
+
+  it('is the EARLIEST live-mode open, ignoring demo rows entirely', () => {
+    expect(liveOptionsOnsetEtDate([
+      { mode: 'demo', openTs: D('2026-07-15') },
+      { mode: 'live', openTs: D('2026-07-31') },
+      { mode: 'live', openTs: D('2026-07-30') },
+      { mode: 'demo', openTs: D('2026-07-29') },
+    ], etDate)).toBe('2026-07-30');
+  });
+
+  it('is null when the book has never opened a live option', () => {
+    // Demo books, and live books that have not yet traded one. Both must read
+    // "nothing here is provably live" rather than a date that credits the window.
+    expect(liveOptionsOnsetEtDate([{ mode: 'demo', openTs: D('2026-07-15') }], etDate)).toBeNull();
+    expect(liveOptionsOnsetEtDate([], etDate)).toBeNull();
+  });
+
+  it('keys on openTs, not closeTs', () => {
+    // A live position OPENED on the 30th and closed on the 31st proves the book
+    // was live on the 30th. Dating onset off the close would wrongly mark the
+    // 30th pre-onset and discard a genuinely live session.
+    expect(liveOptionsOnsetEtDate(
+      [{ mode: 'live', openTs: D('2026-07-30'), closeTs: D('2026-07-31') }] as Array<
+        { mode: string; openTs: number; closeTs: number }
+      >,
+      etDate,
+    )).toBe('2026-07-30');
+  });
+
+  it('skips a live row with no usable openTs rather than dating onset to the epoch', () => {
+    expect(liveOptionsOnsetEtDate([
+      { mode: 'live' },
+      { mode: 'live', openTs: Number.NaN },
+      { mode: 'live', openTs: D('2026-07-30') },
+    ], etDate)).toBe('2026-07-30');
+    expect(liveOptionsOnsetEtDate([{ mode: 'live' }], etDate)).toBeNull();
   });
 });
 
