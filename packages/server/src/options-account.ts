@@ -39,6 +39,7 @@ import {
   checkEntryDte,
   checkDiscretionaryClose,
   dteFromExpiration,
+  tradingDaysBetween,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 // TRA-2820 — provenance oracle for the Tradier reconcile (TRA-2811's ledger join).
@@ -3834,8 +3835,22 @@ export class PaperOptionsAccount {
       if (!opt.legs && opt.signalType === 'relative_value' && structuralExitStates) {
         const exitState = structuralExitStates.get(opt.id);
         if (exitState) {
+          // TRA-2949 — swing-held rows (live under the PDT overnight hold;
+          // demo under `swingHoldOptions`) release from the hold with the
+          // 5-bar time stop trivially exceeded, so `evaluateExit` counts
+          // TRADING days for them instead of bars (and requires a confirmed
+          // trend-against read) — see `ExitParams.timeStopTradingDays`. The
+          // account owns both predicates, so the state is stamped here rather
+          // than in the engine's per-tick state build.
+          const swingHeld = (opt.mode ?? 'demo') === 'live' || this.swingHoldOptions;
           const reason = evaluateExit(
-            { ...exitState, currentPremium: mark, entryPremium: opt.premiumPaid },
+            {
+              ...exitState,
+              currentPremium: mark,
+              entryPremium: opt.premiumPaid,
+              swingHeld,
+              tradingDaysHeld: tradingDaysBetween(opt.openedAt, Date.now()),
+            },
             rvExitParams ?? DEFAULT_EXIT_PARAMS,
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {

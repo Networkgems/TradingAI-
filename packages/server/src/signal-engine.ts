@@ -5,7 +5,7 @@ import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide
 import type { TradierAccountBalance, TradierEquityQuote } from '@trading-app/engine';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
-import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan } from '@trading-app/shared';
+import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
 import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '@trading-app/shared';
@@ -109,7 +109,7 @@ import {
 } from './wheel-iv-entry-filter.js';
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -2387,8 +2387,11 @@ export class SignalEngine {
     // override — so the board's demo rollout (interaction `73ef18b0`) arms the
     // profit mirror on the demo book with ZERO change to the live options path
     // (bqb1 is the single production instance). See {@link isTakeProfitEarlyEnabled}.
+    // TRA-2949 — extended to the live book behind TAKE_PROFIT_EARLY_LIVE_ENABLED
+    // (process.env only, never the demo-flags overlay).
     const takeProfitEarlyCaptureFrac =
-      this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv())
+      (this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv()))
+      || (this.mode === 'live' && isTakeProfitEarlyLiveEnabled())
         ? TAKE_PROFIT_EARLY_CAPTURE_PCT
         : undefined;
     if (underlyingAtrBySymbol.size === 0 && takeProfitEarlyCaptureFrac === undefined) return undefined;
@@ -2962,6 +2965,15 @@ export class SignalEngine {
   private churnOpensToday: Map<string, { etDay: string; count: number }> = new Map();
   /** TRA-335 — Tradier order id (entry leg) → local Position id, used for reconcile. */
   private liveEquityOrderIds: Map<string, number | string> = new Map();
+
+  /**
+   * TRA-2949 — consecutive reconcile sweeps in which an ENGINE-OPENED live
+   * equity row's symbol was absent from Tradier's open-positions payload
+   * (keyed by position id). One transiently short payload must not synthesize
+   * a close for a still-open position, so the broker-side-close path only
+   * fires on the second consecutive miss; any sighting resets the counter.
+   */
+  private liveEquityBrokerAbsentStrikes: Map<string, number> = new Map();
   /**
    * TRA-1269 (TRA-1250 Rule 1, live path) — per-live-equity-position running
    * state for the broker-side chandelier trail. Keyed by Position.id. Holds the
@@ -4327,6 +4339,19 @@ export class SignalEngine {
           const lastCandle = series[series.length - 1];
           const ma20Window = series.slice(-20);
           const ma20 = ma20Window.reduce((s, c) => s + c.close, 0) / ma20Window.length;
+          // TRA-2949 — the last few bars' MA20 close-through states
+          // (most-recent-last, rolling MA20 ending at each bar) so the exit
+          // re-tune can require a CONFIRMED N-bar close-through, mirroring
+          // `recentSupertrendDirections` above. RV is always long here, so
+          // "through" = close below that bar's MA20. Its final element is this
+          // bar's through-state; only consulted when `ma20ConfirmBars` > 1.
+          const recentMa20Through: boolean[] = [];
+          for (let back = Math.min(4, series.length); back >= 1; back -= 1) {
+            const idx = series.length - back;
+            const win = series.slice(Math.max(0, idx - 19), idx + 1);
+            const winMa = win.reduce((s, c) => s + c.close, 0) / win.length;
+            recentMa20Through.push(series[idx].close < winMa);
+          }
           // 5-minute bars — approximate bar count from elapsed wall-clock time.
           const barsHeld = Math.floor((Date.now() - opt.openedAt) / (5 * 60_000));
           // Had follow-through if the premium has peaked >5% above entry.
@@ -4335,6 +4360,7 @@ export class SignalEngine {
             side: 'buy',
             supertrendDirection: lastSt.direction,
             recentSupertrendDirections,
+            recentMa20Through,
             underlyingClose: lastCandle.close,
             ma20,
             entryPremium: opt.premiumPaid,
@@ -4360,22 +4386,49 @@ export class SignalEngine {
     // (`supertrendFlipMinLossPctToExit`, from RV_EXIT_FLIP_MIN_LOSS_PCT) so a
     // confirmed flip only exits a LOSING RV position; flat-or-green positions run
     // to ma20/trail. Absent override → undefined → v1 (confirm-bars only).
+    // TRA-2949 — the swing trading-day time stop (see `ExitParams.
+    // timeStopTradingDays`) is BASELINE behaviour via DEFAULT_EXIT_PARAMS, so it
+    // rides every branch below including the `undefined` fall-through; only a
+    // non-default env override forces an explicit params object. Live resolves
+    // the override from process.env ONLY (live containment).
+    const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(
+      this.mode === 'live' ? process.env : this.resolveDemoFlagEnv(),
+    );
     const rvExitParams: ExitParams | undefined =
       this.mode === 'demo' && isRvExitRetuneEnabled(this.resolveDemoFlagEnv())
         ? {
             ...DEFAULT_EXIT_PARAMS,
             supertrendFlipConfirmBars: resolveRvExitConfirmBars(this.resolveDemoFlagEnv()),
             supertrendFlipMinLossPctToExit: resolveRvExitFlipMinLossPct(this.resolveDemoFlagEnv()),
+            timeStopTradingDays: swingTimeStopTradingDays,
           }
-        : undefined;
+        : // TRA-2949 — LIVE port of the exit re-tune: confirmed 2-bar flip +
+          // winner-protect gate (a flip only closes a position down ≥20%) + the
+          // same confirm-bars gate on ma20_close_through. Spec-fixed values, no
+          // env tuning; armed by RV_EXIT_RETUNE_LIVE_ENABLED via process.env
+          // only (never demo-flags.json). OFF → legacy live single-bar flip.
+          this.mode === 'live' && isRvExitRetuneLiveEnabled()
+          ? {
+              ...DEFAULT_EXIT_PARAMS,
+              supertrendFlipConfirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
+              supertrendFlipMinLossPctToExit: RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT,
+              ma20ConfirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
+              timeStopTradingDays: swingTimeStopTradingDays,
+            }
+          : swingTimeStopTradingDays !== OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT
+            ? { ...DEFAULT_EXIT_PARAMS, timeStopTradingDays: swingTimeStopTradingDays }
+            : undefined;
 
     // TRA-1268 (TRA-1250 Rules 1-2) — underlying ATR(14) on 5m bars for the
     // options ATR chandelier trail + premium-R profit-lock. Dark unless
     // `EXIT_RISK_RULES_ENABLED` is on. TRA-1294 — also build it when the
     // standalone demo-only take-profit-early flag is armed on the demo book, so
     // its capture-fraction can ride the same input without the loss-side master.
+    // TRA-2949 — the live book arms via TAKE_PROFIT_EARLY_LIVE_ENABLED, read
+    // from process.env only (live containment; ships dark, board arms by env flip).
     const takeProfitEarlyArmed =
-      this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv());
+      (this.mode === 'demo' && isTakeProfitEarlyEnabled(this.resolveDemoFlagEnv()))
+      || (this.mode === 'live' && isTakeProfitEarlyLiveEnabled());
     const optionExitRisk = isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) || takeProfitEarlyArmed
       ? this.buildOptionExitRisk()
       : undefined;
@@ -12630,6 +12683,9 @@ export class SignalEngine {
         exitPrice: currentPrice,
         closedAt: Date.now(),
         pnl,
+        // TRA-2949 — stamp the lifecycle path on every live equity close so
+        // exit attribution is readable (mirror of the TRA-2940 options fix).
+        exitReason: 'manual',
       };
       this.liveEquityPositions.delete(positionId);
       this.liveEquityOrderIds.delete(positionId);
@@ -13721,7 +13777,7 @@ export class SignalEngine {
     }
 
     this.lastTradierEquityReconcileAt = now;
-    const summary = this.mergeLiveEquityPositions(positions);
+    const { brokerClosed, ...summary } = this.mergeLiveEquityPositions(positions);
     if (summary.added + summary.updated + summary.removed > 0) {
       log.info('equity reconcile summary', {
         component: 'tradier-equity-reconcile',
@@ -13729,7 +13785,13 @@ export class SignalEngine {
         updated: summary.updated,
         removed: summary.removed,
         total: summary.total,
+        brokerClosed: brokerClosed.length,
       });
+    }
+    // TRA-2949 — book each engine-opened row whose broker-side OCO filled
+    // (fill-price lookup is async, so it happens here rather than in the merge).
+    for (const candidate of brokerClosed) {
+      await this.finalizeBrokerSideEquityClose(candidate.pos, candidate.orderId);
     }
     return { skipped: null, ...summary };
   }
@@ -13752,7 +13814,7 @@ export class SignalEngine {
    */
   private mergeLiveEquityPositions(
     positions: readonly import('@trading-app/engine').TradierOpenEquityPosition[],
-  ): { added: number; updated: number; removed: number; total: number } {
+  ): { added: number; updated: number; removed: number; total: number; brokerClosed: { pos: Position; orderId: number | string | undefined }[] } {
     const tradierBySymbol = new Map<string, import('@trading-app/engine').TradierOpenEquityPosition>();
     for (const p of positions) tradierBySymbol.set(p.symbol, p);
 
@@ -13768,6 +13830,32 @@ export class SignalEngine {
         this.liveEquityOrderIds.delete(id);
         removed += 1;
       }
+    }
+
+    // TRA-2949 — an ENGINE-OPENED row whose symbol vanished from the broker
+    // payload means its resting GTC OCO stop/target filled (or the position was
+    // closed broker-side). Before this pass such a row was never removed and no
+    // closed row / exitReason / P&L was ever recorded — the loop above only
+    // handles imports. Detection needs two consecutive absent sweeps (see
+    // `liveEquityBrokerAbsentStrikes`); the async fill-price lookup and
+    // bookkeeping happen in the caller via `finalizeBrokerSideEquityClose`.
+    const brokerClosed: { pos: Position; orderId: number | string | undefined }[] = [];
+    for (const [id, pos] of this.liveEquityPositions) {
+      if (pos.importedFromTradier) continue;
+      if (tradierBySymbol.has(pos.symbol)) {
+        this.liveEquityBrokerAbsentStrikes.delete(id);
+        continue;
+      }
+      const strikes = (this.liveEquityBrokerAbsentStrikes.get(id) ?? 0) + 1;
+      if (strikes < 2) {
+        this.liveEquityBrokerAbsentStrikes.set(id, strikes);
+        continue;
+      }
+      this.liveEquityBrokerAbsentStrikes.delete(id);
+      this.liveEquityPositions.delete(id);
+      brokerClosed.push({ pos, orderId: this.liveEquityOrderIds.get(id) });
+      this.liveEquityOrderIds.delete(id);
+      removed += 1;
     }
 
     for (const incoming of positions) {
@@ -13812,7 +13900,72 @@ export class SignalEngine {
       added += 1;
     }
 
-    return { added, updated, removed, total: positions.length };
+    return { added, updated, removed, total: positions.length, brokerClosed };
+  }
+
+  /**
+   * TRA-2949 — book the close of an engine-opened live equity row whose
+   * broker-side OCO stop/target filled (detected by two consecutive reconcile
+   * sweeps without the symbol — see {@link mergeLiveEquityPositions}). Resolves
+   * WHICH leg filled and its fill price from the parent order's legs
+   * (best-effort): a filled `stop`/`stop_limit` close-side leg books as `stop`,
+   * a filled `limit` books as `target`; anything else (broker-side manual
+   * close, failed lookup) books at entry as `broker_reconcile` rather than
+   * fabricating a price. Mirrors `manualClosePosition`'s live bookkeeping:
+   * closed-row history, risk-governor feed, exit alert, balance refresh.
+   */
+  private async finalizeBrokerSideEquityClose(
+    pos: Position,
+    orderId: number | string | undefined,
+  ): Promise<void> {
+    const client = this.tradierLiveEquityClient;
+    let exitReason: ExitReason = 'broker_reconcile';
+    let exitPrice = pos.entryPrice;
+    if (client && orderId !== undefined) {
+      try {
+        const legs = await client.getOrderLegs(orderId);
+        const closingLeg = legs.find(
+          l => l.status === 'filled' && l.side !== undefined && l.side !== pos.side,
+        );
+        if (closingLeg && (closingLeg.type.startsWith('stop') || closingLeg.type === 'limit')) {
+          exitReason = closingLeg.type.startsWith('stop') ? 'stop' : 'target';
+          const detail = await client.getOrderStatus(closingLeg.id);
+          const fill = detail?.avg_fill_price;
+          if (typeof fill === 'number' && Number.isFinite(fill) && fill > 0) {
+            exitPrice = fill;
+          } else {
+            // No fill price on the leg detail — the resting trigger price is
+            // the closest honest stand-in for a filled stop/target leg.
+            exitPrice = exitReason === 'stop' ? (closingLeg.stopPrice ?? pos.stopLoss) : pos.takeProfit;
+          }
+        }
+      } catch {
+        // Lookup failed — keep the conservative entry-price/broker_reconcile
+        // fallback; the row still closes with a durable reason.
+      }
+    }
+    const multiplier = pos.side === 'buy' ? 1 : -1;
+    const pnl = (exitPrice - pos.entryPrice) * pos.quantity * multiplier;
+    const closed: Position = {
+      ...pos,
+      exitPrice,
+      closedAt: Date.now(),
+      pnl,
+      exitReason,
+    };
+    this.allClosedPositions.push(closed);
+    const liveEquity = this.liveTradierBalance?.totalEquity ?? 0;
+    this.riskGovernor.recordTrade(pnl, liveEquity * this.managedAccountRatio);
+    this.emitExitAlert(closed);
+    log.info('live equity broker-side close booked', {
+      component: 'tradier-equity-reconcile',
+      symbol: pos.symbol,
+      positionId: pos.id,
+      exitReason,
+      exitPrice,
+      pnl,
+    });
+    this.refreshTradierBalance().catch(() => {});
   }
 
   /**

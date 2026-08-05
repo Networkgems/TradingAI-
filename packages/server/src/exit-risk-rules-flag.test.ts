@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, entryDeltaCeilingReject, entryDeltaCeilingVerdict, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, OTM_DELTA_FLOOR_DEFAULT, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, entryDeltaCeilingReject, entryDeltaCeilingVerdict, OPTION_ENTRY_DELTA_CEILING_DEFAULT, isRvExitRetuneEnabled, resolveRvExitConfirmBars, RV_EXIT_RETUNE_CONFIRM_BARS_DEFAULT, resolveRvExitFlipMinLossPct, isBookGiveBackArmFloorEnabled, isRvExitRetuneLiveEnabled, isTakeProfitEarlyLiveEnabled, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT } from './exit-risk-rules-flag.js';
 
 // TRA-1250 / TRA-1269 / TRA-1294 / TRA-1295 — master switch + the isolated sub-flags.
 
@@ -303,5 +303,38 @@ describe('isBookGiveBackArmFloorEnabled (TRA-1435)', () => {
     expect(
       isBookGiveBackArmFloorEnabled({ EXIT_RISK_RULES_ENABLED: 'off', BOOK_GIVEBACK_ARM_FLOOR_ENABLED: '1' }),
     ).toBe(false);
+  });
+});
+
+describe('TRA-2949 live swing-exit flags', () => {
+  it('RV_EXIT_RETUNE_LIVE_ENABLED defaults off and accepts truthy spellings', () => {
+    expect(isRvExitRetuneLiveEnabled({})).toBe(false);
+    for (const v of ['1', 'true', 'yes', 'on']) {
+      expect(isRvExitRetuneLiveEnabled({ RV_EXIT_RETUNE_LIVE_ENABLED: v })).toBe(true);
+    }
+    expect(isRvExitRetuneLiveEnabled({ RV_EXIT_RETUNE_LIVE_ENABLED: 'off' })).toBe(false);
+  });
+  it('the demo re-tune flag does NOT arm the live port (and vice versa)', () => {
+    expect(isRvExitRetuneLiveEnabled({ RV_EXIT_RETUNE_ENABLED: '1' })).toBe(false);
+    expect(isRvExitRetuneEnabled({ RV_EXIT_RETUNE_LIVE_ENABLED: '1' })).toBe(false);
+  });
+  it('TAKE_PROFIT_EARLY_LIVE_ENABLED defaults off, is standalone, and never rides the demo flag', () => {
+    expect(isTakeProfitEarlyLiveEnabled({})).toBe(false);
+    expect(isTakeProfitEarlyLiveEnabled({ TAKE_PROFIT_EARLY_LIVE_ENABLED: 'true' })).toBe(true);
+    expect(isTakeProfitEarlyLiveEnabled({ TAKE_PROFIT_EARLY_ENABLED: '1' })).toBe(false);
+    expect(isTakeProfitEarlyEnabled({ TAKE_PROFIT_EARLY_LIVE_ENABLED: '1' })).toBe(false);
+  });
+  it('resolveSwingTimeStopTradingDays defaults to 4 and honors a sane override', () => {
+    expect(resolveSwingTimeStopTradingDays({})).toBe(OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT);
+    expect(resolveSwingTimeStopTradingDays({ OPTION_SWING_TIME_STOP_TRADING_DAYS: '6' })).toBe(6);
+    // 0 is a deliberate "disable the swing time stop" setting.
+    expect(resolveSwingTimeStopTradingDays({ OPTION_SWING_TIME_STOP_TRADING_DAYS: '0' })).toBe(0);
+  });
+  it('resolveSwingTimeStopTradingDays falls back on malformed/out-of-range values', () => {
+    for (const v of ['abc', '-1', '99', '2.5', '']) {
+      expect(resolveSwingTimeStopTradingDays({ OPTION_SWING_TIME_STOP_TRADING_DAYS: v })).toBe(
+        OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT,
+      );
+    }
   });
 });

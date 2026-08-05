@@ -147,7 +147,7 @@ import {
 } from '../session-edge-blackout-flag.js'; // TRA-2049
 // TRA-1001 — since-boot counters for the risk-throttle sizing consumer.
 import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
@@ -4313,6 +4313,49 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note: enabled
         ? 'ACTIVE: equity entries restricted to the curated liquid swing universe; intraday churners (ORB + 1h BbFade) disabled; discretionary closes honor the ≥2-trading-day floor (hard stops bypass).'
         : 'OPTED OUT: EQUITY_SWING_MODE is off — legacy intraday day-trading behavior is in force. Unset the env (or set true) to restore the swing conversion.',
+    });
+  });
+
+  // TRA-2949 (parent TRA-2946) — unauthenticated, secrets-free readout of the
+  // direction-aware swing-exit arms for LIVE options, so an env flip on bqb1 is
+  // verifiable without dashboard access. Both live flags resolve from
+  // process.env ONLY (live containment — a demo-flags.json write can never arm
+  // them); the trading-day time stop itself is baseline engine behaviour for
+  // swing-held rows and is published here with its effective override.
+  // Read-only, no order path, no balances/PII.
+  app.get('/api/health/option-swing-exits', (_req, res) => {
+    const rvRetuneLive = isRvExitRetuneLiveEnabled(process.env);
+    const tpEarlyLive = isTakeProfitEarlyLiveEnabled(process.env);
+    const swingTimeStopTradingDays = resolveSwingTimeStopTradingDays(process.env);
+    res.json({
+      ok: true,
+      time: new Date(now()).toISOString(),
+      build: resolveBuildInfo(),
+      // Trading-day time stop for swing-held rows (live PDT-held rows; demo
+      // rows under swingHoldOptions). Always on; fires only with no
+      // follow-through AND a confirmed trend-against read. 0 = disabled.
+      swingTimeStop: {
+        env: OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE,
+        tradingDays: swingTimeStopTradingDays,
+        default: OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT,
+        overridden: swingTimeStopTradingDays !== OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT,
+      },
+      // LIVE port of the RV exit re-tune: confirmed 2-bar Supertrend flip that
+      // only closes a position down ≥20% (winners ride to trail/give-back/TP),
+      // plus the same confirm-bars gate on ma20_close_through.
+      rvExitRetuneLive: {
+        flag: RV_EXIT_RETUNE_LIVE_FLAG,
+        enabled: rvRetuneLive,
+        confirmBars: RV_EXIT_RETUNE_LIVE_CONFIRM_BARS,
+        flipMinLossPctToExit: RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT,
+      },
+      // LIVE arm of the take-profit-early capture exit (demo cohort: 43/43
+      // wins, avgR +1.03). Ships dark; the board arms it by env flip.
+      takeProfitEarlyLive: {
+        flag: TAKE_PROFIT_EARLY_LIVE_FLAG,
+        enabled: tpEarlyLive,
+      },
+      note: 'Hard exits (premium stop, trail, give-back cap, session stop, take-profit) are unaffected by all of the above and keep firing through the swing hold.',
     });
   });
 

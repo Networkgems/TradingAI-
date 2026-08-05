@@ -367,6 +367,8 @@ export type ExitReason =
   | 'tsmom_band_exit' // TRA-821: tsmom_majors long-or-flat exit when trailing L-day return crosses below -exitBandPct
   | 'chandelier'  // TRA-1268: ATR chandelier trailing-stop ratchet exit (Rule 1)
   | 'profit_lock' // TRA-1268: trade-level profit-lock give-back-cap exit (Rule 2)
+  | 'manual'      // TRA-2949: user-initiated discretionary close (live equity manual close path)
+  | 'broker_reconcile' // TRA-2949: position vanished from the broker's open list; synthesized close whose true trigger leg could not be identified
   | 'invalid_bracket';
 
 export interface Position {

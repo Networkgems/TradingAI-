@@ -430,3 +430,59 @@ export const BOOK_GIVEBACK_ARM_FLOOR_FLAG = 'BOOK_GIVEBACK_ARM_FLOOR_ENABLED';
 export function isBookGiveBackArmFloorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return isExitRiskRulesEnabled(env) && flagOn(env[BOOK_GIVEBACK_ARM_FLOOR_FLAG]);
 }
+
+// TRA-2949 — LIVE port of the RV exit re-tune (TRA-1409/TRA-1480). When armed,
+// the live options book gets the same CONFIRMED N-bar Supertrend flip +
+// winner-protect P&L gate the demo book validated (and the same confirm-bars
+// gate on `ma20_close_through`), instead of the legacy single-bar flip. LIVE
+// containment: read from `process.env` ONLY — never through the
+// `demo-flags.json` overlay — matching the other live-enforce gates, so a demo
+// file write can never arm live behaviour. OFF by default; arming is an ops env
+// flip on bqb1 recorded per the usual live-enforce pattern. Accepts 1/true/yes/on.
+export const RV_EXIT_RETUNE_LIVE_FLAG = 'RV_EXIT_RETUNE_LIVE_ENABLED';
+/** TRA-2949 — live re-tune confirm bars (fixed by spec, not env-tunable). */
+export const RV_EXIT_RETUNE_LIVE_CONFIRM_BARS = 2;
+/** TRA-2949 — live winner-protect flip gate: only exit a position down ≥20%. */
+export const RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT = -0.2;
+
+/** True iff the LIVE RV exit re-tune (TRA-2949) is armed. process.env only. */
+export function isRvExitRetuneLiveEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[RV_EXIT_RETUNE_LIVE_FLAG]);
+}
+
+// TRA-2949 — LIVE arm of the take-profit-early capture exit (TRA-1294). The
+// demo cohort banked 43/43 wins at avgR +1.03; this flag extends the same
+// premium-space capture exit to the live book. Same live containment as the
+// re-tune flag above: process.env ONLY, never demo-flags.json. OFF by default —
+// ships dark; the board arms it by env flip after review. Accepts 1/true/yes/on.
+export const TAKE_PROFIT_EARLY_LIVE_FLAG = 'TAKE_PROFIT_EARLY_LIVE_ENABLED';
+
+/** True iff take-profit-early is armed for the LIVE book (TRA-2949). */
+export function isTakeProfitEarlyLiveEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return flagOn(env[TAKE_PROFIT_EARLY_LIVE_FLAG]);
+}
+
+// TRA-2949 — trading-day time stop for swing-held option rows (parent
+// TRA-2946). Swing-held rows (live under the PDT hold; demo under
+// `swingHoldOptions`) release from the hold with the 5-bar time stop trivially
+// exceeded, so they were mechanically closed at the next open. The engine now
+// counts TRADING days for those rows (see `ExitParams.timeStopTradingDays`);
+// this value overrides the default 4.
+export const OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE = 'OPTION_SWING_TIME_STOP_TRADING_DAYS';
+export const OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT = 4;
+
+/**
+ * Resolve the effective swing trading-day time stop (TRA-2949). Reads the
+ * optional integer `OPTION_SWING_TIME_STOP_TRADING_DAYS` override (clamped to a
+ * sane [0,30]; 0 disables the time stop for swing-held rows), falling back to
+ * {@link OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT}. Malformed/out-of-range
+ * values fall back to the default rather than silently disabling the stop.
+ */
+export function resolveSwingTimeStopTradingDays(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE];
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 30) return parsed;
+  }
+  return OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT;
+}

@@ -15,6 +15,7 @@ import {
   DEFAULT_EXIT_PARAMS,
   type ExpiryCandidate,
   type ExitState,
+  type ExitParams,
 } from './supertrend-options.js';
 
 describe('selectStructureByIv (IV gate)', () => {
@@ -376,5 +377,161 @@ describe('sizeOptionContracts (risk manager + caps)', () => {
     expect(
       sizeOptionContracts(rm, { entryPremium: 0, premiumStopPct: -0.5, nameRiskUsed: 0, sectorRiskUsed: 0 }).contracts,
     ).toBe(0);
+  });
+});
+
+describe('evaluateExit — TRA-2949 swing-held trading-day time stop', () => {
+  // A long call just released from the PDT/swing overnight hold: `barsHeld` is
+  // wall-clock/5min so it is trivially past the 5-bar stop at the next open —
+  // exactly the mechanical next-open close the board rejected (TRA-2946).
+  // `swingHeld` must switch the stop to trading days.
+  const base: ExitState = {
+    side: 'buy',
+    supertrendDirection: 'green',
+    underlyingClose: 105,
+    ma20: 100,
+    entryPremium: 2,
+    currentPremium: 2,
+    barsHeld: 80,
+    hadFollowThrough: false,
+    swingHeld: true,
+  };
+  // The live re-tune parameter set (RV_EXIT_RETUNE_LIVE_ENABLED): confirmed
+  // 2-bar flip, winner-protect at -20%, confirmed 2-bar MA20 through.
+  const liveRetune: ExitParams = {
+    ...DEFAULT_EXIT_PARAMS,
+    supertrendFlipConfirmBars: 2,
+    supertrendFlipMinLossPctToExit: -0.2,
+    ma20ConfirmBars: 2,
+  };
+
+  it('does NOT close at next-open while the trend is with the position', () => {
+    expect(evaluateExit({ ...base, tradingDaysHeld: 1 })).toBeNull();
+  });
+  it('control: the same state WITHOUT swingHeld is the rejected next-open close', () => {
+    expect(evaluateExit({ ...base, swingHeld: false, tradingDaysHeld: 1 })).toBe('time_stop');
+  });
+  it('closes on day timeStopTradingDays when trend-against is confirmed', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['red', 'red'],
+          currentPremium: 1.9, // -5%: winner-protect keeps the flip exit shut
+          tradingDaysHeld: 4,
+        },
+        liveRetune,
+      ),
+    ).toBe('time_stop');
+  });
+  it('holds before day timeStopTradingDays even with trend-against confirmed', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['red', 'red'],
+          currentPremium: 1.9,
+          tradingDaysHeld: 3,
+        },
+        liveRetune,
+      ),
+    ).toBeNull();
+  });
+  it('holds on day timeStopTradingDays when the trend-against read is a single unconfirmed bar', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['green', 'red'],
+          currentPremium: 1.9,
+          tradingDaysHeld: 4,
+        },
+        liveRetune,
+      ),
+    ).toBeNull();
+  });
+  it('never time-stops a swing row that followed through', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          hadFollowThrough: true,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['red', 'red'],
+          currentPremium: 1.9,
+          tradingDaysHeld: 9,
+        },
+        liveRetune,
+      ),
+    ).toBeNull();
+  });
+  it('timeStopTradingDays: 0 disables the time stop for swing-held rows', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['red', 'red'],
+          currentPremium: 1.9,
+          tradingDaysHeld: 9,
+        },
+        { ...liveRetune, timeStopTradingDays: 0 },
+      ),
+    ).toBeNull();
+  });
+  it('a row down less than 20% does not close on a single flip bar', () => {
+    expect(
+      evaluateExit(
+        {
+          ...base,
+          supertrendDirection: 'red',
+          recentSupertrendDirections: ['green', 'red'],
+          currentPremium: 1.7, // -15%: above the -20% winner-protect threshold
+          tradingDaysHeld: 1,
+        },
+        liveRetune,
+      ),
+    ).toBeNull();
+  });
+  it('the hard premium stop still bypasses everything on a swing-held row', () => {
+    expect(
+      evaluateExit({ ...base, currentPremium: 1.0, tradingDaysHeld: 0 }, liveRetune),
+    ).toBe('premium_stop');
+  });
+});
+
+describe('evaluateExit — TRA-2949 confirmed N-bar MA20 close-through', () => {
+  // Underlying through MA20 against a long; trend still green and premium flat
+  // so ONLY the ma20 exit can trigger (isolates the confirm-bars behaviour).
+  const base: ExitState = {
+    side: 'buy',
+    supertrendDirection: 'green',
+    underlyingClose: 99,
+    ma20: 100,
+    entryPremium: 2,
+    currentPremium: 2,
+    barsHeld: 1,
+    hadFollowThrough: true,
+  };
+  const confirm2: ExitParams = { ...DEFAULT_EXIT_PARAMS, ma20ConfirmBars: 2 };
+
+  it('N=2 holds a single-bar close-through', () => {
+    expect(evaluateExit({ ...base, recentMa20Through: [false, true] }, confirm2)).toBeNull();
+  });
+  it('N=2 exits when the close-through persists for 2 consecutive bars', () => {
+    expect(evaluateExit({ ...base, recentMa20Through: [true, true] }, confirm2)).toBe(
+      'ma20_close_through',
+    );
+  });
+  it('N=2 holds conservatively when no through-history is supplied', () => {
+    expect(evaluateExit(base, confirm2)).toBeNull();
+  });
+  it('N=1 (default) keeps the legacy single-bar close-through exit', () => {
+    expect(evaluateExit({ ...base, recentMa20Through: [false, true] })).toBe(
+      'ma20_close_through',
+    );
   });
 });

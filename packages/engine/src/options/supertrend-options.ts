@@ -304,12 +304,35 @@ export interface ExitParams {
   supertrendFlipMinLossPctToExit?: number;
   /** Exit when the underlying closes through its MA20. Default true. */
   ma20CloseThroughExit: boolean;
+  /**
+   * TRA-2949 — number of CONSECUTIVE bars the underlying must close through its
+   * MA20 against the position before `ma20_close_through` fires (the same
+   * confirm-bars idea as {@link ExitParams.supertrendFlipConfirmBars}). Default
+   * 1 (legacy single-bar through). Only tightens when
+   * {@link ExitState.recentMa20Through} is supplied; absent/short history holds
+   * the exit (conservative) rather than firing on one bar.
+   */
+  ma20ConfirmBars?: number;
   /** Premium stop as a fraction of entry premium (default -0.50 = -50%). */
   premiumStopPct: number;
   /** Premium take-profit as a fraction of entry premium (default +1.00 = +100%). */
   premiumTakeProfitPct: number;
   /** Time stop in bars with no follow-through (default 5). Set 0 to disable. */
   timeStopBars: number;
+  /**
+   * TRA-2949 — trading-day time stop for SWING-HELD rows (live rows and demo
+   * rows under `swingHoldOptions`). Those rows are suppressed by the PDT /
+   * swing-hold gates on entry day, so by the time the hold releases at the next
+   * open the bar-count stop ({@link ExitParams.timeStopBars}) is trivially
+   * exceeded and mechanically closes the row at the open — the exact behaviour
+   * the board rejected (TRA-2946). When {@link ExitState.swingHeld} is set,
+   * this REPLACES the bar-count stop: the time stop fires only once the row has
+   * been held ≥ this many TRADING days with no follow-through AND the
+   * Supertrend is confirmed against the position (per
+   * {@link ExitParams.supertrendFlipConfirmBars}). Default 4. Set 0 to disable
+   * the time stop entirely for swing-held rows.
+   */
+  timeStopTradingDays?: number;
 }
 
 export const DEFAULT_EXIT_PARAMS: ExitParams = {
@@ -319,6 +342,10 @@ export const DEFAULT_EXIT_PARAMS: ExitParams = {
   premiumStopPct: -0.5,
   premiumTakeProfitPct: 1.0,
   timeStopBars: 5,
+  // TRA-2949 — in the default set so the swing-held trading-day stop is the
+  // baseline behaviour (it only activates when the caller marks the state
+  // `swingHeld`; bar-driven callers are unaffected).
+  timeStopTradingDays: 4,
 };
 
 export type ExitReason =
@@ -356,6 +383,24 @@ export interface ExitState {
    * extreme). The time stop only fires when this is false.
    */
   hadFollowThrough: boolean;
+  /**
+   * TRA-2949 — whether this row is swing-held (a live row under the PDT
+   * overnight hold, or a demo row under `swingHoldOptions`). When true and
+   * {@link ExitParams.timeStopTradingDays} is set, the time stop counts
+   * TRADING days ({@link ExitState.tradingDaysHeld}) instead of bars, and
+   * additionally requires the Supertrend to be confirmed against the position.
+   * Absent/false keeps the legacy bar-count stop.
+   */
+  swingHeld?: boolean;
+  /** TRA-2949 — whole trading days (Mon–Fri) held since entry. */
+  tradingDaysHeld?: number;
+  /**
+   * TRA-2949 — most-recent-last history of whether each recent bar's
+   * underlying close was through the MA20 AGAINST the position. Consulted only
+   * when {@link ExitParams.ma20ConfirmBars} > 1; its final element is this
+   * bar's through-state.
+   */
+  recentMa20Through?: boolean[];
 }
 
 /**
@@ -371,45 +416,76 @@ export function evaluateExit(state: ExitState, params: ExitParams = DEFAULT_EXIT
   if (pnlPct <= params.premiumStopPct) return 'premium_stop';
   if (pnlPct >= params.premiumTakeProfitPct) return 'premium_take_profit';
 
+  // TRA-1409 — optional N-bar confirmation of a Supertrend flip against the
+  // position. With supertrendFlipConfirmBars>1 the flip must persist for that
+  // many consecutive bars before it counts (cuts single-bar whipsaw scratches
+  // on the RV sleeve). N<=1 (the global default) keeps the legacy single-bar
+  // read. When N>1 but no `recentSupertrendDirections` history is available, we
+  // treat the flip as UNCONFIRMED rather than fire on one bar — the other
+  // structural/time exits below still apply, and the risk-side stops are
+  // unaffected. TRA-2949 — hoisted out of the flip-exit branch because the
+  // swing-held trading-day time stop also requires a confirmed trend-against
+  // read before it may close the row.
+  const flippedDir = state.side === 'buy' ? 'red' : 'green';
+  const flipped = state.supertrendDirection === flippedDir;
+  const confirmBars = params.supertrendFlipConfirmBars ?? 1;
+  const recent = state.recentSupertrendDirections;
+  const flipConfirmed =
+    flipped &&
+    (confirmBars <= 1 ||
+      (recent !== undefined &&
+        recent.length >= confirmBars &&
+        recent.slice(-confirmBars).every(d => d === flippedDir)));
+
   // Structure-based exits.
-  if (params.supertrendFlipExit) {
-    const flippedDir = state.side === 'buy' ? 'red' : 'green';
-    const flipped = state.supertrendDirection === flippedDir;
-    if (flipped) {
-      // TRA-1409 — optional N-bar confirmation. With supertrendFlipConfirmBars>1
-      // the flip must persist for that many consecutive bars against the position
-      // before it exits (cuts single-bar whipsaw scratches on the RV sleeve).
-      // N<=1 (the global default) keeps the legacy single-bar exit. When N>1 but
-      // no `recentSupertrendDirections` history is available, we HOLD the flip
-      // exit rather than fire on one bar — the other structural/time exits below
-      // still apply, and the risk-side stops are unaffected.
-      const confirmBars = params.supertrendFlipConfirmBars ?? 1;
-      const recent = state.recentSupertrendDirections;
-      const confirmed =
-        confirmBars <= 1 ||
-        (recent !== undefined &&
-          recent.length >= confirmBars &&
-          recent.slice(-confirmBars).every(d => d === flippedDir));
-      // TRA-1480 (v2) — winner-protect P&L gate. When
-      // `supertrendFlipMinLossPctToExit` is set, the confirmed flip only exits a
-      // position that is at/below that loss threshold; a flat-or-winning RV
-      // position ignores the flip and runs to `ma20_close_through` / `trail` /
-      // take-profit (the winner exits). Undefined = legacy (fires at any P&L).
-      // The flip stays PROTECTIVE on real losers; the hard premium stop already
-      // fired above so this never loosens a risk-side exit.
-      const pnlGateOpen =
-        params.supertrendFlipMinLossPctToExit === undefined ||
-        pnlPct <= params.supertrendFlipMinLossPctToExit;
-      if (confirmed && pnlGateOpen) return 'supertrend_flip';
-    }
+  if (params.supertrendFlipExit && flipConfirmed) {
+    // TRA-1480 (v2) — winner-protect P&L gate. When
+    // `supertrendFlipMinLossPctToExit` is set, the confirmed flip only exits a
+    // position that is at/below that loss threshold; a flat-or-winning RV
+    // position ignores the flip and runs to `ma20_close_through` / `trail` /
+    // take-profit (the winner exits). Undefined = legacy (fires at any P&L).
+    // The flip stays PROTECTIVE on real losers; the hard premium stop already
+    // fired above so this never loosens a risk-side exit.
+    const pnlGateOpen =
+      params.supertrendFlipMinLossPctToExit === undefined ||
+      pnlPct <= params.supertrendFlipMinLossPctToExit;
+    if (pnlGateOpen) return 'supertrend_flip';
   }
   if (params.ma20CloseThroughExit) {
     const through = state.side === 'buy' ? state.underlyingClose < state.ma20 : state.underlyingClose > state.ma20;
-    if (through) return 'ma20_close_through';
+    if (through) {
+      // TRA-2949 — same confirm-bars idea as the flip: with ma20ConfirmBars>1
+      // the close-through must persist for N consecutive bars (per
+      // `recentMa20Through`) before the exit fires; absent/short history holds.
+      const maConfirmBars = params.ma20ConfirmBars ?? 1;
+      const maRecent = state.recentMa20Through;
+      const maConfirmed =
+        maConfirmBars <= 1 ||
+        (maRecent !== undefined &&
+          maRecent.length >= maConfirmBars &&
+          maRecent.slice(-maConfirmBars).every(Boolean));
+      if (maConfirmed) return 'ma20_close_through';
+    }
   }
 
   // Time stop only when the move has not followed through.
-  if (params.timeStopBars > 0 && state.barsHeld >= params.timeStopBars && !state.hadFollowThrough) {
+  // TRA-2949 — swing-held rows (PDT overnight hold / `swingHoldOptions`) count
+  // TRADING days instead of bars: the hold releases at the next open with the
+  // bar count already far past `timeStopBars`, so the bar stop would
+  // mechanically close every swing row at the open (the behaviour the board
+  // rejected in TRA-2946). The trading-day stop additionally requires the
+  // Supertrend confirmed AGAINST the position — a stale row whose trend is
+  // still with it keeps riding to the risk-side exits.
+  if (state.swingHeld && params.timeStopTradingDays !== undefined) {
+    if (
+      params.timeStopTradingDays > 0 &&
+      (state.tradingDaysHeld ?? 0) >= params.timeStopTradingDays &&
+      !state.hadFollowThrough &&
+      flipConfirmed
+    ) {
+      return 'time_stop';
+    }
+  } else if (params.timeStopBars > 0 && state.barsHeld >= params.timeStopBars && !state.hadFollowThrough) {
     return 'time_stop';
   }
 
