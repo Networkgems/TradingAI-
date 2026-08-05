@@ -90,6 +90,7 @@ import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
+import { summarizeEodArchiveParticipation } from '../eod-archive-participation.js'; // TRA-2930
 import {
   summarizeGiveBackArmFloor,
   type GiveBackArmFloorSummary,
@@ -3663,6 +3664,57 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         !anyArmed
           ? `SHADOW-ONLY: all live enforcement flags OFF — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection). Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags).`
           : `ENFORCING (live): cost_bar=${costArmed ? 'ARMED' : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
+    });
+  });
+
+  // TRA-2930 (from the TRA-2928 ruling, D1) — DURABLE per-book EOD
+  // archive-participation record. Unauthenticated + secrets-free (usernames only, no
+  // balances, same basis as the other health probes).
+  //
+  // The question this answers, which nothing else could: when a book has no EOD ledger
+  // row for a session, WHY. TRA-2903 found `enock` missing 28 consecutive sessions and
+  // the cause could not be recovered, because the two candidates are swallowed and
+  // leave an identical signature — a boot-time `initUserContext` throw that drops the
+  // book out of `getAllUserContexts()` for the life of the process (candidate a), and
+  // `generateAndSaveReport` throwing inside the archive loop (candidate b). Render log
+  // retention did not reach the onset. This route makes the next one attributable at
+  // the moment it happens:
+  //
+  //   `absent_from_context_map` -> candidate (a). The book is in users.json but the
+  //                                archive loop never reached it. Look at boot.
+  //   `report_threw`            -> candidate (b), with the message. Look at the report.
+  //   `archive_threw`           -> the per-book body died before the report was reached.
+  //   `participated`            -> the row was written. Not a miss.
+  //   `skipped_not_market_day`  -> weekend/holiday, no stock row expected. Not a miss,
+  //                                and excluded from the participation denominator.
+  //
+  // Read in this order:
+  //  1. `durability.ephemeral` — TRUE ⇒ every row dies on the next redeploy and this
+  //     is a since-boot counter wearing a ledger's clothes (fix = DATA_DIR=/data).
+  //  2. `verdict` — TRI-STATE. `null` is BLIND, not clean: a recorder that has never
+  //     seen an archive pass and a perfect record are the same reading on every count
+  //     in this payload, so they are given different values. `blindReason` says which.
+  //  3. `anomalies` — the books with at least one miss, worst first.
+  //     `consecutiveMisses` is the TRA-2903 shape; it read 28 there.
+  //
+  // Per-book `participationRate` is `null` on an empty cohort, never 0 and never 1 — a
+  // book observed on no market day must not read like one that participated in all.
+  // Observe-only: reading this never routes an order or changes an archive.
+  app.get('/api/health/eod-archive-participation', (_req, res) => {
+    const nowMs = now();
+    const summary = summarizeEodArchiveParticipation();
+    res.json({
+      ok: true,
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      etDay: etDateString(new Date(nowMs)),
+      ...summary,
+      note:
+        summary.verdict === null
+          ? `BLIND — no gradeable archive pass on record. ${summary.blindReason ?? ''} This is NOT a clean bill of health.`
+          : summary.verdict === 'clean'
+            ? `CLEAN over ${summary.marketDayRuns} market-day archive pass(es) (${summary.firstDay ?? '-'}..${summary.lastDay ?? '-'}): every roster book produced an EOD row on every one. The denominator is published because "clean" and "never observed" are otherwise the same reading.`
+            : `MISSES: ${summary.anomalies.length} book(s) missed at least one market-day archive pass over ${summary.marketDayRuns} pass(es). Read each anomaly's lastOutcome — absent_from_context_map is a BOOT failure (candidate a, look at initUserContext / initAllUserContexts), report_threw is a REPORT failure (candidate b, lastReason carries the message). That discrimination is the whole reason this record exists (TRA-2930).`,
     });
   });
 

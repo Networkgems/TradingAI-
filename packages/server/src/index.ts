@@ -213,6 +213,13 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
+// TRA-2930 — durable per-book EOD archive-participation record.
+import {
+  hydrateEodArchiveParticipationFromDisk,
+  openEodArchiveParticipationRun,
+  recordEodParticipation,
+  type EodParticipationOutcome,
+} from './eod-archive-participation.js';
 import {
   hydrateLiveOptionsFeeSlippageFromDisk,
   backfillLiveOptionFees,
@@ -3545,6 +3552,22 @@ setTimeout(() => {
   }
 }
 
+// TRA-2930 — rebuild the per-book EOD archive-participation record from disk and pin
+// the append target. MUST run before the first 21:00 ET archive pass; the hydrate is
+// what makes `/api/health/eod-archive-participation` a multi-week record rather than
+// a since-boot counter (a deploy eats an in-memory counter — constraint 1 of the
+// TRA-2928 ruling). Durable only when DATA_DIR is a mounted disk; the payload
+// publishes `durability.ephemeral` so a reader never has to assume.
+{
+  const h = hydrateEodArchiveParticipationFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('EOD archive-participation record hydrated (TRA-2930)', {
+      records: h.records,
+      days: h.days,
+    });
+  }
+}
+
 // TRA-1271 — observe-only crypto ignition pass, fired off the SAME hourly hook as
 // the funding-carry / regime-overlay / regime-TSMOM passes above. When
 // ENABLE_CRYPTO_IGNITION_SCANNER is OFF it returns before ANY fetch => provably
@@ -3588,18 +3611,52 @@ async function runDailyCloseForAllUsers(): Promise<void> {
   // closed trades are still retained until that point, so a pre-archive
   // catch-up can reconstruct the day's report accurately.
   await catchUpMissedEodReports();
-  for (const ctx of getAllUserContexts()) {
+
+  // TRA-2930 — open the durable participation record for this pass BEFORE the loop.
+  //
+  // The roster comes from `getAllUsers()` (users.json) and the iteration set from
+  // `getAllUserContexts()`. Those are two INDEPENDENT sources, and that independence
+  // is the entire mechanism: a book that threw in `initUserContext` at boot is missing
+  // from the context map for the life of the process, so the loop below can never
+  // reach it and can never write a row about it. Diffing the two here is the only
+  // place candidate (a) is observable at the time it happens — six weeks later it is
+  // just an absence, indistinguishable from a report throw (TRA-2903 / TRA-2928).
+  //
+  // `openEodArchiveParticipationRun` writes the run row and every
+  // `absent_from_context_map` row immediately, so a crash partway through the loop
+  // still leaves candidate (a) on disk. Never re-source `roster` from the contexts.
+  const contexts = getAllUserContexts();
+  const participationRun = openEodArchiveParticipationRun({
+    etDay: etDateString(),
+    marketDay: stocksMarketDay,
+    roster: getAllUsers().map((u) => u.username),
+    contextUsernames: contexts.map((c) => c.username),
+  });
+
+  for (const ctx of contexts) {
+    // One row per book per pass, written in `finally` so a throw anywhere in the body
+    // still lands an attributable outcome instead of an absence.
+    let outcome: EodParticipationOutcome | null = null;
+    let outcomeReason: string | undefined;
     try {
       // 1a. Stocks EOD — only on trading days (Mon–Fri, non-holiday).
       if (stocksMarketDay) {
         try {
           await generateAndSaveReport(ctx);
+          outcome = 'participated';
         } catch (err) {
+          outcomeReason = err instanceof Error ? err.message : String(err);
+          outcome = 'report_threw'; // TRA-2930 candidate (b)
           log.error('EOD report failed', {
             username: ctx.username,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: outcomeReason,
           });
         }
+      } else {
+        // Not a miss: the hook fires every calendar day for crypto, but no stock EOD
+        // row is expected on a weekend/holiday. Recorded explicitly so it is excluded
+        // from the participation denominator rather than buried in it.
+        outcome = 'skipped_not_market_day';
       }
       // 1b. Crypto EOD — every calendar day (24/7 market).
       try {
@@ -3636,10 +3693,28 @@ async function runDailyCloseForAllUsers(): Promise<void> {
         closedCryptoPositions: crypto,
       });
     } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      // Only claim `archive_threw` when the report outcome was never determined. A
+      // throw AFTER a successful report (persist/broadcast) leaves the row at
+      // `participated` — the EOD row DID get written, and conflating the two would
+      // manufacture a phantom miss on an axis whose only job is to be trusted.
+      if (outcome === null) {
+        outcome = 'archive_threw';
+        outcomeReason = reason;
+      }
       log.error('archive failed', {
         username: ctx.username,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
       });
+    } finally {
+      // TRA-2930 — best-effort and swallowed inside the recorder; it can never break
+      // the archive it observes (failures land in `durability.appendErrors`).
+      recordEodParticipation(
+        participationRun,
+        ctx.username,
+        outcome ?? 'archive_threw',
+        outcomeReason,
+      );
     }
   }
 }
