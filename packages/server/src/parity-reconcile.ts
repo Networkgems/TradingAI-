@@ -507,6 +507,30 @@ export interface ParityRecordLegRow {
    * diagnostics; `spreadAtSubmitPct` is the one TRA-2242's advisory forecast reads, because
    * on a symmetric mid (`mark = requestedPx = mid`) both exit sides reduce to the identity
    * `quotedH == spreadAtSubmitPct / 200`, and it is populated on rows where `quotedH` is not.
+   *
+   * TRA-2846 — all five keys are ALWAYS PRESENT, `null` when the journal leg carries no
+   * quote. They are declared non-optional and the projection normalises `undefined -> null`,
+   * so the key set on the wire is uniform across legacy and current rows. (Before that fix a
+   * legacy leg — one written before the TRA-2283 D2 writer persisted these fields, 60 of 76
+   * live legs — left the value `undefined`, `JSON.stringify` dropped the key, and this
+   * declaration was violated on 79% of the corpus.)
+   *
+   * THE DISCRIMINATOR SURVIVES, IN A NEW FORM. "No quote was persisted" used to be readable
+   * as key-ABSENCE; it is now readable as `bid === null && ask === null`. No information is
+   * lost on the live corpus — there are ZERO explicit `null`s in either key across all 76
+   * legs — but any consumer keyed on `'bid' in leg` must move to the `=== null` form, or it
+   * will now classify every legacy leg as quoted.
+   *
+   * `spreadAtSubmitPct: 0` IS STILL AMBIGUOUS AND THIS FIX DOES NOT TOUCH IT. The writer does
+   * not coalesce (`sandbox-strategy-journal.ts:179-180`), so a `0` on the wire means a `0` was
+   * recorded — the same legacy-row root cause surfacing on a field no DTO widening can repair.
+   * The cheap discriminator is in the payload: a zero-spread leg that ALSO lacks a quote is
+   * unauditable; one carrying `bid == ask` is real. Both legs of record `1784732451516`
+   * (`SPY260727P00747000`) read `0` with no quote behind them; `SPY260803C00734000` reads `0`
+   * with a genuine `bid == ask == 6.75`. Consumers of the TRA-2242 advisory
+   * `quotedH = spreadAtSubmitPct / 200` should therefore report an AUDITABLE FRACTION (74/76)
+   * rather than a bare median: those two zeros are the minimum of the distribution and bias it
+   * LOW, i.e. toward a book that looks tighter than provable.
    */
   bid: number | null;
   ask: number | null;
@@ -575,12 +599,18 @@ export function parityRecordRows(records: readonly SandboxStrategyRecord[]): Par
         nonPhysical:
           (leg.requestedPx != null && !isPhysicalPx(leg.requestedPx))
           || (leg.fillPx != null && !isPhysicalPx(leg.fillPx)),
-        // TRA-2583 — straight pass-through, `null` included. Do NOT coalesce.
-        bid: leg.bid,
-        ask: leg.ask,
-        slippageBps: leg.slippageBps,
-        spreadAtSubmitPct: leg.spreadAtSubmitPct,
-        withinSpread: leg.withinSpread,
+        // TRA-2583/TRA-2846 — pass-through with absence NORMALISED to `null`. The ban is on
+        // `?? 0` / `?? false` (a missing quote must never read as a tight book); `?? null`
+        // maps only `undefined -> null` and leaves a real `0`/`false`/`null` untouched, so
+        // that invariant still holds exactly. Do NOT "simplify" this back to a bare
+        // `leg.bid`: on a LEGACY journal leg (written before the TRA-2283 D2 writer persisted
+        // these) the value is `undefined`, `JSON.stringify` DROPS the key, and the
+        // non-optional `ParityRecordLegRow` contract is violated on the wire.
+        bid: leg.bid ?? null,
+        ask: leg.ask ?? null,
+        slippageBps: leg.slippageBps ?? null,
+        spreadAtSubmitPct: leg.spreadAtSubmitPct ?? null,
+        withinSpread: leg.withinSpread ?? null,
       })),
     };
   });

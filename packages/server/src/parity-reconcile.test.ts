@@ -92,6 +92,30 @@ function leg(
   };
 }
 
+/**
+ * TRA-2846 — a LEGACY journal leg: the five quote keys are DELETED, not nulled, exactly as a
+ * row written before the TRA-2283 D2 writer persisted them deserializes (79% of the live
+ * corpus, 60 of 76 legs). `leg()` above cannot express this case — it hard-codes `null` — so
+ * every assertion built on it is blind to the absence defect this fixture exists to expose.
+ */
+function legacyLeg(
+  side: 'buy' | 'sell',
+  requestedPx: number | null,
+  fillPx: number | null,
+): SandboxStrategyLeg {
+  const l = leg(side, requestedPx, fillPx) as unknown as Record<string, unknown>;
+  for (const k of QUOTE_KEYS) delete l[k];
+  return l as unknown as SandboxStrategyLeg;
+}
+
+const QUOTE_KEYS = [
+  'bid',
+  'ask',
+  'slippageBps',
+  'spreadAtSubmitPct',
+  'withinSpread',
+] as const;
+
 /** A single-contract long round-trip: buy entry then sell exit. */
 function record(
   strategy: string,
@@ -806,6 +830,59 @@ describe('TRA-2583 — the persisted decision-quote fields reach the records rou
       'spreadAtSubmitPct',
       'withinSpread',
     ]);
+  });
+});
+
+describe('TRA-2846 — a LEGACY leg projects the quote keys as null, never absent', () => {
+  // The gap TRA-2583's key-set pin could not reach: it runs on `leg()`, which hard-codes
+  // `bid: null`, so `leg.bid` is never `undefined` under it and the 79%-of-corpus legacy row
+  // has no arm at all. `legacyLeg()` DELETES the keys, which is what a pre-TRA-2283-writer
+  // journal row actually deserializes to.
+  //
+  // ⚠ The discriminator is the WIRE, not the in-process object. A literal `{ bid: leg.bid }`
+  // with `leg.bid === undefined` still OWNS the key, so `hasOwnProperty` alone reads TRUE in
+  // both the broken and the fixed state — it is not the failing arm. `JSON.stringify` is what
+  // drops an `undefined` value, so the round-trip below is what actually separates them.
+  it('the projected leg OWNS all five quote keys with value null', () => {
+    const [row] = parityRecordRows([record('long_call', [legacyLeg('buy', 1.0, 1.05)])]);
+    for (const k of QUOTE_KEYS) {
+      expect(Object.prototype.hasOwnProperty.call(row.legs[0], k)).toBe(true);
+      expect((row.legs[0] as unknown as Record<string, unknown>)[k]).toBeNull();
+    }
+  });
+
+  it('the SERIALIZED payload keeps all five keys — the contract the route ships', () => {
+    // This is the assertion that fails pre-fix: `undefined` is dropped by JSON.stringify, so
+    // the declared-non-optional key is simply missing from the bytes the monitor reads.
+    const [row] = parityRecordRows([record('long_call', [legacyLeg('buy', 1.0, 1.05)])]);
+    const wire = JSON.parse(JSON.stringify(row)) as { legs: Record<string, unknown>[] };
+    expect(Object.keys(wire.legs[0]).sort()).toEqual([
+      'ask',
+      'bid',
+      'fillPx',
+      'nonPhysical',
+      'optionSymbol',
+      'requestedPx',
+      'side',
+      'slippageBps',
+      'spreadAtSubmitPct',
+      'withinSpread',
+    ]);
+    for (const k of QUOTE_KEYS) expect(wire.legs[0][k]).toBeNull();
+  });
+
+  it('a REAL quote is untouched by the normalisation — `?? null` is not a coalesce', () => {
+    // The guard on D1: `?? null` must not reach a persisted 0/false and turn it into null,
+    // and must not turn an absence into a number. Both tails on one corpus.
+    const [row] = parityRecordRows([
+      record('long_call', [
+        leg('buy', 1.0, 1.05, { bid: 0, ask: 6.75, spreadAtSubmitPct: 0, withinSpread: false }),
+      ]),
+    ]);
+    expect(row.legs[0].bid).toBe(0);
+    expect(row.legs[0].ask).toBe(6.75);
+    expect(row.legs[0].spreadAtSubmitPct).toBe(0);
+    expect(row.legs[0].withinSpread).toBe(false);
   });
 });
 
