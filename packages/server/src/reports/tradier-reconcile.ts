@@ -10,9 +10,35 @@ import type { TradierCashEvent, TradierTradeHistoryFill } from '@trading-app/eng
  * out of scope for this issue (the live equity manual-close path lives
  * behind a separate ticket).
  */
-export function isOptionCloseDescription(description: string): boolean {
+/**
+ * TRA-2864 — `amount` is now part of the signature because on the LIVE
+ * production account the description alone cannot answer the question.
+ *
+ * Tradier's production history endpoint returns an INSTRUMENT-ONLY description
+ * — `"AMZN Sep 4, 2026 $295.00 Call"` — with no action prefix at all. Across the
+ * board's uploaded live-production activity export (89 trade events, 38 of them
+ * real option closes) the keyword test below matched **zero** rows. Every
+ * consumer that gated on it therefore saw an empty tape and could not tell that
+ * apart from "the account did not trade" — the failure is silent and reads
+ * exactly like a quiet book.
+ *
+ * This is the same defect TRA-2810 already fixed one layer over, in
+ * `historyFillSide`; the rule is copied from there deliberately so the two
+ * cannot drift: keywords are authoritative when present, otherwise the sign of
+ * the net cash flow decides (a long open debits, a long close credits). An
+ * `amount` of exactly 0 is ambiguous and stays `false`.
+ *
+ * Called with one argument the behaviour is unchanged (keyword-only), so the
+ * sandbox/legacy descriptions that DO carry "Sell to Close" still work.
+ */
+export function isOptionCloseDescription(description: string, amount?: number): boolean {
   const s = description.toLowerCase();
-  return s.includes('sell to close') || s.includes('buy to close');
+  if (s.includes('sell to close') || s.includes('buy to close')) return true;
+  if (s.includes('buy to open') || s.includes('sell to open')) return false;
+  if (typeof amount === 'number' && Number.isFinite(amount) && amount !== 0) {
+    return amount > 0; // cash IN = a close
+  }
+  return false;
 }
 
 export interface TradierDailyOptionsTotals {
@@ -46,7 +72,10 @@ export function aggregateOptionCloses(
   const seenTransactionIds = new Set<string>();
   for (const fill of fills) {
     if (fill.tradeType !== 'option') continue;
-    if (!isOptionCloseDescription(fill.description)) continue;
+    // TRA-2864 — pass `amount` so a production instrument-only description
+    // still resolves a side. Without it this filter matches nothing on the
+    // live account and the empty result reads as "no trading".
+    if (!isOptionCloseDescription(fill.description, fill.amount)) continue;
     if (knownIds.has(fill.transactionId)) continue;
     seenTransactionIds.add(fill.transactionId);
     const realized = fill.amount; // Tradier's `amount` already nets commission.
@@ -92,8 +121,67 @@ export interface RealizedBackfillTotals {
 export function realizedOptionsPnlByCloseDate(
   fills: readonly TradierTradeHistoryFill[],
 ): RealizedBackfillTotals {
+  const { realizedByDate, closeCountByDate } = fifoRealizedOptionCloses(fills);
+  return { realizedByDate, closeCountByDate };
+}
+
+/** Outcome of one FIFO pass over a window of option fills. */
+interface FifoRealizedResult {
+  /** `YYYY-MM-DD` (close date) → realized P&L ATTRIBUTED this pass. */
+  realizedByDate: Map<string, number>;
+  /** `YYYY-MM-DD` (close date) → number of closing fills attributed this pass. */
+  closeCountByDate: Map<string, number>;
+  /** Transaction ids of the closes actually attributed (matched, not skipped). */
+  attributedCloseIds: Set<string>;
+}
+
+/**
+ * TRA-2864 — the ONE FIFO matcher, shared by the historical backfill
+ * ({@link realizedOptionsPnlByCloseDate}) and the go-forward live reconcile
+ * ({@link aggregateRealizedOptionsPnl}).
+ *
+ * These two used to be separate implementations of the same idea, and they
+ * disagreed by $746.75 over the board's uploaded live-production tape — the
+ * backfill matched Tradier's own gain/loss report to the cent while the
+ * reconcile path was off by −$448.84 on a single day (2026-07-31: real
+ * +$713.73, computed +$264.89). Two implementations of one rule is the defect;
+ * one implementation with two entry points is the fix.
+ *
+ * Rules, in the order they bite:
+ *
+ *  • **Side comes from the sign of `amount`, never the description.** Tradier
+ *    production descriptions are instrument-only (see
+ *    {@link isOptionCloseDescription}). A long open debits cash, a long close
+ *    credits it. These live sleeves are long calls/puts only, so the sign is
+ *    unambiguous.
+ *  • **Per-contract FIFO, not per-symbol netting.** The old reconcile summed
+ *    EVERY open of a symbol into one bucket and subtracted that whole bucket
+ *    from EACH close of it, so a position opened once and closed in two fills
+ *    paid its cost basis twice. Real case on the tape:
+ *    `SPY260904C00816000` opened 4 @ −$32.42, closed 3 (+$35.66) then 1
+ *    (+$11.87) — truth +$15.11, old code −$17.31.
+ *  • **No gross-proceeds fallback.** A close whose open is outside the window
+ *    is SKIPPED, not booked at its full proceeds. That fallback is what
+ *    manufactured the original phantom-green June calendar (TRA-359's own
+ *    docblock calls it "structurally wrong"), and it is still doing it: on this
+ *    tape it invents +$165.75 on 2026-05-27 and +$16.35 on 2026-05-20, two days
+ *    whose opens simply predate the export. Under-reporting an
+ *    un-reconstructable day as flat is the lesser error, and — because an
+ *    unattributed close is never added to `attributedCloseIds` — it stays
+ *    retryable on a later, wider pass instead of being cursored away wrong.
+ *
+ * `skipCloseIds` is the dedup cursor. A close already in it is NOT attributed
+ * again, but it still CONSUMES its lots: the lot book has to reflect every
+ * close that really happened or the next close would be matched against a
+ * basis that was already sold.
+ */
+function fifoRealizedOptionCloses(
+  fills: readonly TradierTradeHistoryFill[],
+  skipCloseIds: ReadonlySet<string> = new Set<string>(),
+): FifoRealizedResult {
   const realizedByDate = new Map<string, number>();
   const closeCountByDate = new Map<string, number>();
+  const attributedCloseIds = new Set<string>();
 
   // Process opens before closes within the same date so a same-day round
   // trip matches; otherwise sort by date ascending (Tradier returns newest
@@ -114,6 +202,8 @@ export function realizedOptionsPnlByCloseDate(
     if (fill.quantity <= 0 || fill.amount === 0) continue;
     if (fill.amount < 0) {
       // Long open: `amount` is negative — store cost as a positive number.
+      // NOTE: opens are cost basis, not output, so the dedup cursor must NOT
+      // filter them. Dropping a "seen" open would strand its close unmatched.
       const costPerContract = Math.abs(fill.amount) / fill.quantity;
       const queue = openLots.get(fill.symbol) ?? [];
       queue.push({ qty: fill.quantity, costPerContract });
@@ -139,11 +229,15 @@ export function realizedOptionsPnlByCloseDate(
     // Unmatched portion (open outside the window): skip rather than book
     // gross proceeds. If nothing matched at all, the day stays flat.
     if (!matchedAny) continue;
+    // Lots are consumed above whether or not we attribute — a close that
+    // already went into the cursor still really sold that basis.
+    if (skipCloseIds.has(fill.transactionId)) continue;
+    attributedCloseIds.add(fill.transactionId);
     realizedByDate.set(fill.date, (realizedByDate.get(fill.date) ?? 0) + realized);
     closeCountByDate.set(fill.date, (closeCountByDate.get(fill.date) ?? 0) + 1);
   }
 
-  return { realizedByDate, closeCountByDate };
+  return { realizedByDate, closeCountByDate, attributedCloseIds };
 }
 
 /**
@@ -267,51 +361,70 @@ export function computeBalanceDailyPnl(
 }
 
 /**
- * TRA-348 — Tradier `Sell to Close` proceeds aren't truly "P&L" in the
- * accounting sense — the proceeds minus the open cost is. But Tradier's
- * history endpoint reports cash flow per fill, not gain/loss. To
- * approximate realized P&L without requiring a second API call, we
- * pair opening Buy-to-Open events with closing Sell-to-Close events
- * within the same fetch window: same option `symbol`, sum of opens =
- * sum of closes ⇒ realized = (closes − opens). For unmatched closes
- * (open lived outside the fetch window), we fall back to the raw
- * close-fill `amount` so the calendar at least shows a non-zero $
- * value (which is the user's stated acceptance criterion). The net
- * effect is closer to Tradier's own gainloss endpoint without a
- * second round trip.
+ * TRA-2801 RESIDUAL B — what the EOD reconcile is allowed to do this pass.
+ *
+ * `reconcileTradierOptionsHistory` used to early-return on `fills.length === 0`
+ * and again on `seenTransactionIds.size === 0`, both BEFORE draining the realtime
+ * estimate map via `consumeRealtimeImportedPnl()`. So the drain could not run in
+ * exactly the case where a booked estimate is most wrong: the contract never
+ * really filled at the broker, so the history window is empty and there is no
+ * row to restate against. A drain gated on there being something to reconcile
+ * cannot correct an estimate whose whole problem is that there is nothing to
+ * reconcile against.
+ *
+ * Splitting the decision in two makes the rule explicit and testable:
+ *   • `drainRealtime` — drain and apply `netAdded = added − offset` on EVERY
+ *     SUCCESSFUL FETCH, empty window included. With `added = 0` that is
+ *     `−offset`: an unmatched estimate goes back to $0, which is the correct
+ *     resting value. If the fill is merely late, the next pass sees it with an
+ *     empty offset and adds broker truth on top of $0 — same landing place.
+ *   • `persistFills` — the sidecar and cursor writes, which genuinely have no
+ *     work when no NEW transaction id was seen.
+ *
+ * A FAILED fetch drains NOTHING. It is BLIND, not empty, and the drain is
+ * destructive (it clears the map). That distinction is the whole reason this is a
+ * function and not a pair of `if`s: `fetchSucceeded === false` is the one input
+ * for which `drainRealtime` is false.
+ */
+export interface TradierReconcilePlan {
+  drainRealtime: boolean;
+  persistFills: boolean;
+}
+
+export function planTradierReconcile(input: {
+  fetchSucceeded: boolean;
+  fillsInWindow: number;
+  newTransactionIds: number;
+}): TradierReconcilePlan {
+  if (!input.fetchSucceeded) return { drainRealtime: false, persistFills: false };
+  return { drainRealtime: true, persistFills: input.newTransactionIds > 0 };
+}
+
+/**
+ * TRA-348 / TRA-2864 — realized options P&L per day for the go-forward live
+ * reconcile pass, FIFO-matched against the opens in the same fetch window.
+ *
+ * This is now a thin wrapper over {@link fifoRealizedOptionCloses}, the same
+ * matcher the historical backfill uses. Read that docblock for why: the two
+ * paths previously implemented the same rule twice and disagreed, and the
+ * reconcile copy was the wrong one on all three counts (description-gated side
+ * detection that matches nothing in production, per-symbol netting that
+ * double-charges a partial close, and a gross-proceeds fallback that invents
+ * green days). Measured against the board's uploaded live-production tape it
+ * booked −$1,018.94 where Tradier's own gain/loss report says −$272.19.
+ *
+ * `knownIds` remains the dedup cursor over CLOSES — a close already merged on a
+ * previous pass is not counted again. Opens are never cursored: they are cost
+ * basis, and the caller's rolling window re-reads them every pass.
+ *
+ * A close that cannot be matched to an open is deliberately NOT emitted, so it
+ * also does not enter `seenTransactionIds` — the caller will not cursor it, and
+ * a later pass whose window does reach the open will pick it up.
  */
 export function aggregateRealizedOptionsPnl(
   fills: readonly TradierTradeHistoryFill[],
   knownIds: ReadonlySet<string>,
 ): TradierDailyOptionsTotals {
-  const realizedByDate = new Map<string, number>();
-  const seenTransactionIds = new Set<string>();
-
-  // Sum opens per OCC symbol so we can compute realized for paired closes.
-  const openCostBySymbol = new Map<string, number>();
-  for (const fill of fills) {
-    if (fill.tradeType !== 'option') continue;
-    if (knownIds.has(fill.transactionId)) continue;
-    const desc = fill.description.toLowerCase();
-    if (desc.includes('buy to open')) {
-      const prev = openCostBySymbol.get(fill.symbol) ?? 0;
-      // `amount` is negative for buys (cash leaving the account).
-      openCostBySymbol.set(fill.symbol, prev + fill.amount);
-    }
-  }
-
-  for (const fill of fills) {
-    if (fill.tradeType !== 'option') continue;
-    if (knownIds.has(fill.transactionId)) continue;
-    if (!isOptionCloseDescription(fill.description)) continue;
-    seenTransactionIds.add(fill.transactionId);
-    const matchingOpen = openCostBySymbol.get(fill.symbol);
-    // realized = close proceeds + open cost (open cost is negative).
-    // When no matching open is in the window, fall back to close
-    // proceeds alone — at minimum the calendar shows a non-zero $.
-    const realized = matchingOpen != null ? fill.amount + matchingOpen : fill.amount;
-    const prev = realizedByDate.get(fill.date) ?? 0;
-    realizedByDate.set(fill.date, prev + realized);
-  }
-  return { realizedByDate, seenTransactionIds };
+  const { realizedByDate, attributedCloseIds } = fifoRealizedOptionCloses(fills, knownIds);
+  return { realizedByDate, seenTransactionIds: attributedCloseIds };
 }

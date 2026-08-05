@@ -115,7 +115,14 @@ describe('aggregateRealizedOptionsPnl', () => {
     expect(totals.seenTransactionIds.has('close')).toBe(true);
   });
 
-  it('falls back to close proceeds when the open lives outside the window', () => {
+  // TRA-2864 — this used to assert the OPPOSITE: that an unmatched close falls
+  // back to its raw proceeds. That fallback is the mechanism behind the phantom
+  // green Live calendar that TRA-359's own docblock calls "structurally wrong",
+  // and on the board's live-production tape it was still inventing +$165.75 on
+  // 2026-05-27 and +$16.35 on 2026-05-20 out of closes whose opens simply
+  // predate the fetch window. Skipping is now the contract, matching the
+  // backfill path — see `tra2864-live-calendar-tape.test.ts`.
+  it('skips a close whose open lives outside the window (never gross proceeds)', () => {
     const totals = aggregateRealizedOptionsPnl(
       [
         fill({
@@ -126,8 +133,9 @@ describe('aggregateRealizedOptionsPnl', () => {
       ],
       new Set<string>(),
     );
-    // No matching open in the window → fall back to raw close proceeds.
-    expect(totals.realizedByDate.get('2026-05-08')).toBe(370);
+    expect(totals.realizedByDate.size).toBe(0);
+    // Not cursored either, so a later pass that DOES reach the open can book it.
+    expect(totals.seenTransactionIds.has('close')).toBe(false);
   });
 
   it('respects the dedup cursor', () => {
