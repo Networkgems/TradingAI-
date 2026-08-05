@@ -2834,6 +2834,10 @@ export class PaperOptionsAccount {
     this.equity += pnl;
     opt.pnl = (opt.pnl ?? 0) + pnl;
     opt.currentPremium = closeMark;
+    // TRA-2940 — stamp the durable exit attribution alongside `closedAt`; the
+    // journal receives the identical value below.
+    const exitReason = outcome.kind === 'bought_back' ? 'bought_back' : 'expired';
+    opt.exitReason = exitReason;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
     this.bookRealizedPnl(opt.mode ?? 'demo', pnl);
@@ -2841,7 +2845,7 @@ export class PaperOptionsAccount {
     // TRA-1978 — fold the realized outcome into the per-fill journal (no-op unless
     // the write was journaled at open). `expired` = kept the full credit; a
     // bought-back roll/TP books credit − debit.
-    this.queueJournalClose(opt, outcome.kind === 'bought_back' ? 'bought_back' : 'expired');
+    this.queueJournalClose(opt, exitReason);
 
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
@@ -2898,6 +2902,7 @@ export class PaperOptionsAccount {
     // Close the short-put record (credit realized; the stock leg lives in the lot).
     opt.pnl = (opt.pnl ?? 0) + credit;
     opt.currentPremium = 0;
+    opt.exitReason = 'assigned'; // TRA-2940 — same value the journal receives below
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
     // TRA-1978 — the CSP leg resolves here: assignment keeps the credit and hands
@@ -2937,6 +2942,7 @@ export class PaperOptionsAccount {
     this.assignedShares.delete(lot.id);
     opt.pnl = (opt.pnl ?? 0) + realized;
     opt.currentPremium = 0;
+    opt.exitReason = 'called_away'; // TRA-2940 — same value the journal receives below
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
     // TRA-1978 — the covered call resolves called-away: realized = stock P&L vs
@@ -3140,6 +3146,7 @@ export class PaperOptionsAccount {
         this.bookRealizedPnl(cc.mode ?? mode, ccPnl);
         cc.pnl = (cc.pnl ?? 0) + ccPnl;
         cc.currentPremium = buybackPerShare;
+        cc.exitReason = reason; // TRA-2940 — same value the journal receives below
         cc.closedAt = Date.now();
         cc.contractsRemaining = 0;
         // TRA-1978 — fold the covered call's realized leg P&L (credit − buyback)
@@ -3640,6 +3647,9 @@ export class PaperOptionsAccount {
                 submittedAt: Date.now(),
                 pricing: 'limit',
                 kind: 'sl',
+                // TRA-2940 — preserve the structural reason across the broker
+                // round-trip; `kind: 'sl'` is only the order-pricing bucket.
+                journalReason: reason,
               };
               delete opt.exitErrorReason;
               closed.push({ ...opt });
@@ -3652,6 +3662,7 @@ export class PaperOptionsAccount {
             const exitFee = positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
             const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
             opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
+            opt.exitReason = reason; // TRA-2940 — same value the journal receives below
             opt.closedAt = Date.now();
             opt.currentPremium = effectiveExit;
             opt.contractsRemaining = 0;
@@ -3695,6 +3706,7 @@ export class PaperOptionsAccount {
               submittedAt: Date.now(),
               kind: 'tp1',
               pricing: 'limit',
+              journalReason: 'tp1', // TRA-2940
             };
             delete opt.exitErrorReason;
             closed.push({ ...opt });
@@ -3846,6 +3858,11 @@ export class PaperOptionsAccount {
             submittedAt: Date.now(),
             pricing: deepUnderwaterSL ? 'market' : 'limit',
             kind: exitKind,
+            // TRA-2940 — preserve the TRUE reason (chandelier / profit_lock /
+            // take_profit_early) across the broker round-trip. Before this,
+            // every give-back exit on the live path finalised as `sl`/`trail`
+            // and the closed row could not say which rule fired.
+            journalReason: exitJournalReason ?? exitKind,
           };
           delete opt.exitErrorReason;
           closed.push({ ...opt });
@@ -3861,6 +3878,8 @@ export class PaperOptionsAccount {
           positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
         const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
         opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
+        // TRA-2940 — same value the journal receives below.
+        opt.exitReason = exitJournalReason ?? exitKind;
         opt.closedAt = Date.now();
         opt.currentPremium = effectiveExit;
         opt.contractsRemaining = 0;
@@ -4037,6 +4056,7 @@ export class PaperOptionsAccount {
     // band-clamped realized P&L against the reserved capital.
     const closeMark = opt.premiumPaid + realized / (remainingContracts * 100);
     opt.pnl = (opt.pnl ?? 0) + realized;
+    opt.exitReason = decision.reason; // TRA-2940 — same value the journal receives below
     opt.closedAt = now;
     opt.currentPremium = closeMark;
     opt.contractsRemaining = 0;
@@ -4176,6 +4196,11 @@ export class PaperOptionsAccount {
 
     // Full close (SL / trail / manual that sold the last contracts —
     // or TP1 that sold the last contracts).
+    // TRA-2940 — the staged intent carries the TRUE rule (`journalReason`,
+    // e.g. `chandelier`) while `kind` is only the broker-facing bucket; stamp
+    // the truth on the row and hand the journal the identical value.
+    const exitReason = pending.journalReason ?? pending.kind;
+    opt.exitReason = exitReason;
     opt.closedAt = Date.now();
     opt.contractsRemaining = 0;
     delete opt.pendingExit;
@@ -4183,7 +4208,7 @@ export class PaperOptionsAccount {
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     // TRA-991 — fold the realized outcome onto this trade's journal row.
-    this.queueJournalClose(opt, pending.kind);
+    this.queueJournalClose(opt, exitReason);
     return { ...opt };
   }
 
@@ -4225,6 +4250,7 @@ export class PaperOptionsAccount {
       submittedAt: Date.now(),
       kind: 'manual',
       duration,
+      journalReason: 'manual', // TRA-2940
     };
     delete opt.exitErrorReason;
     // TRA-450 — the user explicitly re-staged this close, so clear any
@@ -4352,7 +4378,9 @@ export class PaperOptionsAccount {
         Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
           ? opt.currentPremium
           : opt.premiumPaid;
-      this.recordImportedFill(id, estimatedFill);
+      // TRA-2940 — this is the broker telling us the position is gone, not a
+      // user action; attribute it as a reconcile close.
+      this.recordImportedFill(id, estimatedFill, 'broker_reconcile');
       removed += 1;
     }
 
@@ -4691,7 +4719,9 @@ export class PaperOptionsAccount {
     // estimate rather than deduping it; 4ffbe10's mechanism is superseded on this
     // path, not wrong.
     const liveBefore = this.optionsPnlByMode.live;
-    const closed = this.closeOption(optionId, breakEvenFill);
+    // TRA-2940 — attribute as a reconcile close, not `manual`: nobody clicked
+    // anything, the broker's book simply no longer carries the position.
+    const closed = this.closeOption(optionId, breakEvenFill, 'broker_reconcile');
     if (closed) this.registerReconcileEstimateForDedupe(this.optionsPnlByMode.live - liveBefore);
     return closed;
   }
@@ -4759,7 +4789,17 @@ export class PaperOptionsAccount {
    * same convention as `closeOption`: `(fill − premiumPaid) × contracts ×
    * 100`.
    */
-  recordImportedFill(optionId: string, avgFillPrice: number): OptionPosition | null {
+  recordImportedFill(
+    optionId: string,
+    avgFillPrice: number,
+    /**
+     * TRA-2940 — why the imported row is leaving the book: `manual` (the user
+     * closed it through TradeAI and the order filled — every caller's default)
+     * vs `broker_reconcile` (Tradier no longer reports the OCC symbol, so the
+     * reconcile sweep books the close locally at its best-known mark).
+     */
+    exitReason: string = 'manual',
+  ): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
     if (!opt.importedFromTradier) return null;
@@ -4769,6 +4809,7 @@ export class PaperOptionsAccount {
     const remainingContracts = opt.contractsRemaining;
     const pnl = (avgFillPrice - opt.premiumPaid) * remainingContracts * 100;
     opt.pnl = (opt.pnl ?? 0) + pnl;
+    opt.exitReason = exitReason; // TRA-2940 — same value the journal receives below
     opt.closedAt = Date.now();
     opt.currentPremium = avgFillPrice;
     opt.contractsRemaining = 0;
@@ -4779,7 +4820,7 @@ export class PaperOptionsAccount {
     this.closedOptions.push({ ...opt });
     // TRA-991 — fold the realized outcome onto this trade's journal row. Imported
     // rows are never journalled at open, so this no-ops for them in practice.
-    this.queueJournalClose(opt, 'imported_fill');
+    this.queueJournalClose(opt, exitReason);
     // TRA-367 — surface realised P&L immediately on the Live pill instead
     // of waiting for the EOD Tradier-history reconcile. The reconciler
     // drains `realtimeImportedPnlByDate` so the same close isn't counted
@@ -4858,6 +4899,7 @@ export class PaperOptionsAccount {
       // The "partial" actually drained the position (broker filled the whole
       // remainder before terminating) — retire it like a full close.
       opt.contractsRemaining = 0;
+      opt.exitReason = 'partial_drain'; // TRA-2940 — same value the journal receives below
       opt.closedAt = Date.now();
       this.openOptions.delete(optionId);
       this.closedOptions.push({ ...opt });
@@ -5016,7 +5058,18 @@ export class PaperOptionsAccount {
    * the close price unless `overrideFillPrice` is provided — see
    * {@link closeOption} for the optional argument's rationale (TRA-352).
    */
-  closeOption(optionId: string, overrideFillPrice?: number): OptionPosition | null {
+  closeOption(
+    optionId: string,
+    overrideFillPrice?: number,
+    /**
+     * TRA-2940 — attribution for the closed row + journal. Defaults to
+     * `manual` (the user-initiated close route, this method's historical sole
+     * caller intent). `closeBrokerFlatPosition` routes through here with
+     * `broker_reconcile`; the book give-back halt flatten passes
+     * `book_halt_flat`.
+     */
+    exitReason: string = 'manual',
+  ): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
     if (!opt) return null;
     // TRA-323 — imported Tradier positions don't share the paper cash
@@ -5057,6 +5110,7 @@ export class PaperOptionsAccount {
       positionMode === 'demo' ? remainingContracts * this.demoFeePerContract : 0;
     const pnl = (effectiveExit - opt.premiumPaid) * remainingContracts * 100;
     opt.pnl = (opt.pnl ?? 0) + pnl - exitFee;
+    opt.exitReason = exitReason; // TRA-2940 — same value the journal receives below
     opt.closedAt = Date.now();
     opt.currentPremium = effectiveExit;
     opt.contractsRemaining = 0;
@@ -5074,7 +5128,7 @@ export class PaperOptionsAccount {
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
     // TRA-991 — fold the realized outcome onto this trade's journal row.
-    this.queueJournalClose(opt, 'manual');
+    this.queueJournalClose(opt, exitReason);
     return { ...opt };
   }
 

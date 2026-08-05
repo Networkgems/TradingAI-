@@ -8227,7 +8227,9 @@ export class SignalEngine {
     // own resting exit legs (or are broker-mirrored) — untouched.
     const sleeveEquity = this.account.getState().totalEquity;
     for (const opt of [...this.optionsAccount.getStateForMode('demo').openOptions]) {
-      const closed = this.optionsAccount.closeOption(opt.id);
+      // TRA-2940 — attribute the halt flatten as its own exit reason rather
+      // than `manual`; nobody clicked anything.
+      const closed = this.optionsAccount.closeOption(opt.id, undefined, 'book_halt_flat');
       if (!closed) continue;
       const riskUsd =
         typeof closed.maxLossUsd === 'number' && closed.maxLossUsd > 0

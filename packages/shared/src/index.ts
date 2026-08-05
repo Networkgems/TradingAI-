@@ -2528,6 +2528,17 @@ export interface OptionPendingExit {
    * (Tradier's default and the engine's previous hardcoded value).
    */
   duration?: TradierOrderDuration;
+  /**
+   * TRA-2940 — the TRUE exit rule that staged this intent (`chandelier` /
+   * `profit_lock` / `take_profit_early` / `supertrend_flip` / …). `kind` stays
+   * a broker-valid pendingExit kind because the Tradier order pricing and the
+   * deep-underwater escalation only distinguish sl vs trail — which meant
+   * every give-back exit on the LIVE (wait-and-hold) path collapsed to
+   * `sl`/`trail` by the time the fill finalised, and the closed row could not
+   * say which rule actually fired. The finalise path reads this field first
+   * and falls back to `kind` for staged intents persisted before it existed.
+   */
+  journalReason?: string;
 }
 
 /**
@@ -2564,6 +2575,27 @@ export interface OptionPosition {
   openedAt: number;
   closedAt?: number;
   pnl?: number;
+  /**
+   * TRA-2940 — durable exit attribution: which rule actually closed this
+   * position. Stamped in the same breath as `closedAt` on every close path,
+   * and always the SAME value that close hands the option trade journal, so
+   * the published closed row and the journal row can be cross-tabbed without
+   * a vocabulary join. Values in use: `sl` (hard premium stop) · `trail`
+   * (trailing stop) · `tp1` (the TP1 order sold the last contracts) ·
+   * `chandelier` · `profit_lock` · `take_profit_early` · `supertrend_flip` ·
+   * `ma20_close_through` · `time_stop` · demo combo policy reasons
+   * (`tp_capture` / `sl_credit` / `sl_debit` / `dte_time_stop` /
+   * `expiry_settle`) · `manual` (user-initiated close) · `partial_drain`
+   * (a close order partially filled, then the terminal slice drained the
+   * remainder) · `broker_reconcile` (the broker reports flat / the position
+   * left the broker's book, so it was closed locally at the last known mark)
+   * · `book_halt_flat` (the book give-back halt flattened the demo book) ·
+   * covered-write settlements (`expired` / `bought_back` / `assigned` /
+   * `called_away` / `stock_stop` / `max_window_liquidation`). Absent ↔ the
+   * row closed before this field shipped (attribution unknowable after the
+   * fact), or the position is still open.
+   */
+  exitReason?: string;
   signalId: string;
   signalType: SignalType;
   /**
