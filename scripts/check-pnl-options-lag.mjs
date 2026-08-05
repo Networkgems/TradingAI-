@@ -281,6 +281,60 @@ export const AC2_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
 ]);
 
 /**
+ * TRA-2847 — the first session date written under the deployed RE-fix.
+ *
+ * TRA-2630 AC2's verdict on `ec05639` is FAIL, conclusive (2026-08-04:
+ * `ctoverify_tra2333`, a pinned CLEAN CONTROL, wrote `stockDaily 73.05 == 07-29
+ * optionsDaily` across the 3-settled-session gap — exact equality across a gap
+ * cannot be coincidence, TRA-2835 point 4). The re-fix `6cb3cc0` reseeds the
+ * counter at boot restore for credits the restored equity absorbed that neither
+ * the durable counter nor any EOD row recorded; it deployed 2026-08-05, so
+ * 2026-08-05 is the first session whose EOD row it can have written.
+ *
+ * This is also the DEFAULT `--since`: the 08-04 lag row is dated after
+ * 2026-07-30, so the old boundary would report FAIL on the already-diagnosed
+ * row every night forever and bury a real 08-05+ regression under it. The
+ * pre-re-fix question stays askable with an explicit `--since=2026-07-30`.
+ */
+export const TRA2847_REFIX_DEPLOY_DATE = '2026-08-05';
+
+/**
+ * TRA-2847 — THE FRESH COHORT, pinned before the first post-re-fix observation
+ * (TRA-2835 point 3 forbids reusing the 2026-07-30 pin: eligibility for the
+ * 08-05 read is fixed by the 2026-08-04 rows, not the 07-29 ones).
+ *
+ *   source: GET https://tradingai-bqb1.onrender.com/api/health/pnl-reconciliation
+ *   pulled: 2026-08-05T01:45Z — after the 2026-08-04 EOD write (01:00Z) made the
+ *           rows immutable, before any 2026-08-05 session row exists.
+ *
+ * Every book below carries a non-zero `optionsDaily` on 2026-08-04, so each
+ * names one exact `stockDaily` the 08-05 row can refute. The live book (admin,
+ * -2.00) is IN the cohort this time — the 07-30 pin's live arm never graded.
+ */
+export const TRA2847_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
+  { username: 'admin', mode: 'live', priorOptionsDaily: -2 },
+  { username: 'ctoverify_tra2329', mode: 'demo', priorOptionsDaily: -2 },
+  { username: 'qa_mirror_1578_38096', mode: 'demo', priorOptionsDaily: 22.5 },
+  { username: 'qa_reg_0710202220', mode: 'demo', priorOptionsDaily: 62.5 },
+  { username: 'qa_tra1475_1783821169', mode: 'demo', priorOptionsDaily: 62.5 },
+  { username: 'qa_tra2492_del_1785285374', mode: 'demo', priorOptionsDaily: 44.47 },
+  { username: 'qa_tra2511_114524', mode: 'demo', priorOptionsDaily: 54.94 },
+  { username: 'qtverify_1785371190', mode: 'demo', priorOptionsDaily: -187.01 },
+  { username: 'tra2339v66f17374', mode: 'demo', priorOptionsDaily: -2 },
+]);
+
+/**
+ * Every pinned cohort, keyed by the ONE `--since` it grades, each carrying the
+ * immutable prior-session rows that fixed its eligibility. A `--since` outside
+ * this table compares nothing (NOT_APPLICABLE) — a pin that quietly kept
+ * applying to later dates would manufacture the shrinkage it exists to detect.
+ */
+const PINNED_COHORTS_BY_SINCE = Object.freeze({
+  [AC2_FIX_DEPLOY_DATE]: { priorRowsDate: '2026-07-29', books: AC2_EXPECTED_GRADEABLE_BOOKS },
+  [TRA2847_REFIX_DEPLOY_DATE]: { priorRowsDate: '2026-08-04', books: TRA2847_EXPECTED_GRADEABLE_BOOKS },
+});
+
+/**
  * TRA-2630 AC2 — grade the OBSERVED cohort against the PINNED one.
  *
  * Three states, and the middle one is the whole point:
@@ -298,26 +352,30 @@ export const AC2_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
  * loudly on every arm including BLIND.
  */
 export function compareAc2Cohort(gradeableBooks, since) {
-  if (String(since) !== AC2_FIX_DEPLOY_DATE) {
+  const pin = PINNED_COHORTS_BY_SINCE[String(since)];
+  if (!pin) {
     return {
       verdict: 'NOT_APPLICABLE',
       reason:
-        `the pinned cohort fixes eligibility from the 2026-07-29 rows and grades the`
-        + ` ${AC2_FIX_DEPLOY_DATE} read only; --since=${since} asks a different question`,
-      expectedCount: AC2_EXPECTED_GRADEABLE_BOOKS.length,
+        `each pinned cohort fixes eligibility from one immutable prior-session read and grades`
+        + ` exactly one boundary (${Object.keys(PINNED_COHORTS_BY_SINCE).join(', ')});`
+        + ` --since=${since} asks a different question`,
+      priorRowsDate: null,
+      expectedCount: 0,
       observedCount: gradeableBooks.length,
       missing: [],
       extra: [],
     };
   }
   const observed = new Set(gradeableBooks.map((b) => b.username));
-  const expected = new Set(AC2_EXPECTED_GRADEABLE_BOOKS.map((b) => b.username));
-  const missing = AC2_EXPECTED_GRADEABLE_BOOKS.filter((b) => !observed.has(b.username));
+  const expected = new Set(pin.books.map((b) => b.username));
+  const missing = pin.books.filter((b) => !observed.has(b.username));
   const extra = gradeableBooks.filter((b) => !expected.has(b.username));
   return {
     verdict: missing.length > 0 ? 'SHRANK' : 'INTACT',
     reason: null,
-    expectedCount: AC2_EXPECTED_GRADEABLE_BOOKS.length,
+    priorRowsDate: pin.priorRowsDate,
+    expectedCount: pin.books.length,
     observedCount: gradeableBooks.length,
     missing,
     extra,
@@ -498,6 +556,21 @@ export function frozenSessionsForBook(days) {
 export const AC2_WRITER_FIX_COMMIT = 'ec05639';
 
 /**
+ * TRA-2847 — the RE-fix commit whose presence in the writer a post-08-05 PASS
+ * claims. `ec05639` is a proper ancestor of `6cb3cc0`, so attesting the re-fix
+ * subsumes the original; the historical `--since=2026-07-30` question keeps
+ * attesting `ec05639` alone, because that is all its PASS ever claimed.
+ */
+export const TRA2847_WRITER_REFIX_COMMIT = '6cb3cc0';
+
+/** The commit a given `--since` boundary's writer attestation must carry. */
+export function writerFixCommitForSince(since) {
+  return String(since) >= TRA2847_REFIX_DEPLOY_DATE
+    ? TRA2847_WRITER_REFIX_COMMIT
+    : AC2_WRITER_FIX_COMMIT;
+}
+
+/**
  * TRA-2630 AC2 — WHICH BUILD WROTE THE ROW BEING GRADED.
  *
  * The hole this closes. `gradeAc2Delta` grades the VALUE in the 07-30 row; the
@@ -609,13 +682,17 @@ export function gradeWriterProvenance({
   now = new Date().toISOString(),
   lookbackMinutes = 60,
   forwardMinutes = 45,
+  // TRA-2847 — which commit the attestation claims. Callers grading the re-fix
+  // boundary pass `writerFixCommitForSince(since)`; the default keeps every
+  // pre-existing caller (and the 07-30 selftest controls) byte-for-byte.
+  fixCommit = AC2_WRITER_FIX_COMMIT,
 } = {}) {
   if (!gradedDate) {
     return {
       verdict: 'NOT_APPLICABLE',
       reason: 'no graded session date — there is no row, so there is no writer to attribute',
       gradedDate: null, writeInstant: null, windowStart: null, windowEnd: null,
-      serving: [], liveCommit, fixCommit: AC2_WRITER_FIX_COMMIT,
+      serving: [], liveCommit, fixCommit,
     };
   }
   const writeInstant = eodWriteInstant(gradedDate);
@@ -624,7 +701,7 @@ export function gradeWriterProvenance({
   const windowEnd = new Date(t + forwardMinutes * 60_000).toISOString();
   const base = {
     gradedDate: String(gradedDate), writeInstant, windowStart, windowEnd,
-    liveCommit, fixCommit: AC2_WRITER_FIX_COMMIT,
+    liveCommit, fixCommit,
   };
   // A WRITE THAT HAS NOT HAPPENED CANNOT BE ATTRIBUTED. The newest served build is
   // open-ended by construction ("still serving"), so it intersects any future
@@ -678,7 +755,7 @@ export function gradeWriterProvenance({
     return {
       ...base, verdict: 'PRE_FIX_WRITER', serving: resolved,
       reason: `${preFix.length} build(s) serving the write window do NOT descend from`
-        + ` ${AC2_WRITER_FIX_COMMIT}: ${preFix.map((b) => b.sha.slice(0, 9)).join(', ')}`,
+        + ` ${fixCommit}: ${preFix.map((b) => b.sha.slice(0, 9)).join(', ')}`,
     };
   }
   if (unknown.length > 0) {
@@ -691,7 +768,7 @@ export function gradeWriterProvenance({
   }
   return {
     ...base, verdict: 'CONFIRMED', serving: resolved,
-    reason: `all ${resolved.length} build(s) serving the write window descend from ${AC2_WRITER_FIX_COMMIT}`,
+    reason: `all ${resolved.length} build(s) serving the write window descend from ${fixCommit}`,
   };
 }
 
@@ -761,7 +838,10 @@ export function gradePayload(payload, opts = {}) {
     // TRA-2630 AC2 — the delta verdict, reported ALONGSIDE the absolute one above.
     // The absolute verdict stays DEMO_LAG for as long as the 18 pre-fix rows exist,
     // so it can never answer "did the fix work"; this field is what AC2 grades.
-    ac2: gradeAc2Delta(engines, opts.since ?? AC2_FIX_DEPLOY_DATE),
+    // TRA-2847 — the default boundary is the RE-fix deploy date: the 08-04 lag
+    // row is dated after 2026-07-30, so the old default would FAIL forever on
+    // the already-diagnosed row and bury a fresh regression under it.
+    ac2: gradeAc2Delta(engines, opts.since ?? TRA2847_REFIX_DEPLOY_DATE),
     engineCount: engines.length,
     liveBookCount,
     liveGradeableBookCount,
@@ -1197,7 +1277,7 @@ async function fetchLiveVersion(reconUrl) {
  * simply do not know. This distinction is the whole reason UNATTRIBUTABLE exists
  * as a separate verdict from PRE_FIX_WRITER.
  */
-function makeAncestryResolver(repoDir) {
+function makeAncestryResolver(repoDir, fixCommit = AC2_WRITER_FIX_COMMIT) {
   const cache = new Map();
   return (sha) => {
     if (cache.has(sha)) return cache.get(sha);
@@ -1205,12 +1285,12 @@ function makeAncestryResolver(repoDir) {
     try {
       // Both objects must be present locally; `cat-file -e` distinguishes "absent"
       // from "not an ancestor", which `merge-base` alone conflates into exit 1.
-      for (const rev of [AC2_WRITER_FIX_COMMIT, sha]) {
+      for (const rev of [fixCommit, sha]) {
         const probe = spawnSync('git', ['cat-file', '-e', `${rev}^{commit}`], { cwd: repoDir, encoding: 'utf-8' });
         if (probe.error || probe.status !== 0) { cache.set(sha, null); return null; }
       }
       const r = spawnSync(
-        'git', ['merge-base', '--is-ancestor', AC2_WRITER_FIX_COMMIT, sha],
+        'git', ['merge-base', '--is-ancestor', fixCommit, sha],
         { cwd: repoDir, encoding: 'utf-8' },
       );
       if (r.error || (r.status !== 0 && r.status !== 1)) out = null;
@@ -1422,11 +1502,14 @@ async function main(argv) {
   }
   reportLiveCohortSampling(sampling);
 
-  // `--since=YYYY-MM-DD` moves the AC2 delta boundary. Defaults to the TRA-2629
-  // fix-deploy date; a later fix gets its own boundary rather than inheriting a
-  // baseline that was never written under it.
+  // `--since=YYYY-MM-DD` moves the AC2 delta boundary. Defaults to the TRA-2847
+  // RE-fix deploy date — a later fix gets its own boundary rather than
+  // inheriting a baseline that was never written under it, and that cuts both
+  // ways: `ec05639`'s boundary now contains the conclusively-diagnosed 08-04
+  // lag row, so defaulting to it would FAIL every future read on old news.
+  // `--since=2026-07-30` still asks the historical TRA-2630 AC2 question.
   const sinceArg = argv.find((a) => a.startsWith('--since='));
-  const since = sinceArg ? sinceArg.slice('--since='.length) : AC2_FIX_DEPLOY_DATE;
+  const since = sinceArg ? sinceArg.slice('--since='.length) : TRA2847_REFIX_DEPLOY_DATE;
   const g = gradePayload(payload, { since });
   if (g.verdict === 'BLIND') {
     console.error(`BLIND — ${g.reason}. Exiting 3; this is NOT a pass.`);
@@ -1444,13 +1527,17 @@ async function main(argv) {
     argv.includes('--no-writer-check') ? Promise.resolve(null) : fetchDeployHistory(),
     argv.includes('--no-writer-check') ? Promise.resolve(null) : fetchLiveVersion(reconUrl),
   ]);
+  // TRA-2847 — attest the commit the ACTIVE boundary claims: the re-fix for the
+  // default 2026-08-05 boundary, `ec05639` alone for the historical 07-30 one.
+  const writerFixCommit = writerFixCommitForSince(since);
   g.ac2 = applyWriterProvenanceToAc2(
     g.ac2,
     gradeWriterProvenance({
       deploys,
-      isDescendant: makeAncestryResolver(REPO_DIR),
+      isDescendant: makeAncestryResolver(REPO_DIR, writerFixCommit),
       gradedDate: latestGradedDate(g.ac2),
       liveCommit: version?.commit ?? null,
+      fixCommit: writerFixCommit,
     }),
   );
 
@@ -1782,7 +1869,7 @@ function printAc2Cohort(cohort) {
   }
   if (cohort.verdict === 'INTACT') {
     console.log(
-      `  cohort pin: INTACT — all ${cohort.expectedCount} book(s) eligible off the 2026-07-29`
+      `  cohort pin: INTACT — all ${cohort.expectedCount} book(s) eligible off the ${cohort.priorRowsDate}`
       + ` rows presented a gradeable session${
         cohort.extra.length > 0 ? `, plus ${cohort.extra.length} that newly became eligible` : ''
       }.`,
@@ -1798,7 +1885,7 @@ function printAc2Cohort(cohort) {
   for (const b of cohort.missing) {
     console.log(
       `      ${b.mode === 'live' ? 'LIVE ' : 'demo '} ${b.username}`
-      + ` — 2026-07-29 optionsDaily ${b.priorOptionsDaily.toFixed(2)}, no ${AC2_FIX_DEPLOY_DATE} row to refute it`,
+      + ` — ${cohort.priorRowsDate} optionsDaily ${b.priorOptionsDaily.toFixed(2)}, no post-boundary row to refute it`,
     );
   }
   if (cohort.missing.some((b) => b.mode === 'live')) {
@@ -3083,6 +3170,37 @@ function selftest() {
       return { verdict: c.verdict, missing: c.missing.length };
     })(),
     { verdict: 'NOT_APPLICABLE', missing: 0 },
+  );
+  // TRA-2847 — the RE-fix pin: same discipline, its own boundary and prior rows.
+  const REFIX_PINNED = TRA2847_EXPECTED_GRADEABLE_BOOKS.map((b) => b.username);
+  check(
+    'COHORT (TRA-2847): every re-fix-pinned book present reads INTACT off the 08-04 rows',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(REFIX_PINNED), TRA2847_REFIX_DEPLOY_DATE);
+      return { verdict: c.verdict, priorRows: c.priorRowsDate, expected: c.expectedCount };
+    })(),
+    { verdict: 'INTACT', priorRows: '2026-08-04', expected: 9 },
+  );
+  check(
+    'COHORT (TRA-2847): the LIVE book dropping out of the re-fix pin reads SHRANK and names it',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(REFIX_PINNED.filter((u) => u !== 'admin')), TRA2847_REFIX_DEPLOY_DATE);
+      return { verdict: c.verdict, missingLive: c.missing.filter((b) => b.mode === 'live').map((b) => b.username) };
+    })(),
+    { verdict: 'SHRANK', missingLive: ['admin'] },
+  );
+  check(
+    'WRITER (TRA-2847): the attested commit follows the boundary — re-fix on/after 2026-08-05, ec05639 before',
+    {
+      refix: writerFixCommitForSince(TRA2847_REFIX_DEPLOY_DATE),
+      historical: writerFixCommitForSince(AC2_FIX_DEPLOY_DATE),
+      later: writerFixCommitForSince('2026-09-01'),
+    },
+    {
+      refix: TRA2847_WRITER_REFIX_COMMIT,
+      historical: AC2_WRITER_FIX_COMMIT,
+      later: TRA2847_WRITER_REFIX_COMMIT,
+    },
   );
   check(
     'COHORT: gradeAc2Delta carries the pin, and a shrunken PASS reports BOTH',
