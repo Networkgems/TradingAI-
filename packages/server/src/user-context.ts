@@ -35,7 +35,11 @@ import {
   // in-memory snapshot silently stops persisting.
   toDurableAccountSnapshot,
   restoreDurableAccountSnapshot,
+  unrecordedAbsorbedOptionsCredit,
 } from './trade-store.js';
+import { listOptionTradeJournal } from './option-trade-journal.js';
+import { journalRowsForBook } from './options-daily-pnl-source.js';
+import { accountDeletedAt } from './deleted-accounts.js';
 import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
@@ -938,6 +942,57 @@ async function createUserContext(username: string): Promise<UserContext> {
         equity: b?.equity ?? stocksSnap.account.equity,
         tradierEnv: b?.tradierEnv,
       });
+      const restoredStocksAccount = restoreDurableAccountSnapshot(
+        stocksSnap.account,
+        stocksSnap.openPositions ?? [],
+        tracker.getLastOptionsCreditedCumulative(),
+      );
+      // TRA-2847 — reseed the counter for credits the restored equity absorbed
+      // that neither the durable counter nor any EOD row ever recorded (the
+      // Defect B path `ec05639` does not cover; see
+      // `unrecordedAbsorbedOptionsCredit`). Demo books only: the sink never
+      // credits live P&L into `PaperAccount`, so a live book's counter has
+      // nothing journal-vouched to recover. The journal read is best-effort —
+      // an unreadable journal means no adjustment, never a crash, and the
+      // restore then behaves byte-for-byte as before this fix.
+      if (settings.mode !== 'live') {
+        try {
+          const demoRows = journalRowsForBook(
+            await listOptionTradeJournal({ mode: 'demo' }),
+            username,
+            accountDeletedAt(username),
+          );
+          let journalDemoRealizedCumUsd = 0;
+          for (const r of demoRows) {
+            if (typeof r.closeTs !== 'number' || !Number.isFinite(r.closeTs)) continue;
+            if (typeof r.realizedPnlUsd !== 'number' || !Number.isFinite(r.realizedPnlUsd)) continue;
+            journalDemoRealizedCumUsd += r.realizedPnlUsd;
+          }
+          const reseed = unrecordedAbsorbedOptionsCredit({
+            restoredEquity: restoredStocksAccount.equity,
+            restoredOptionsCredited: restoredStocksAccount.optionsCredited ?? 0,
+            trackerOpeningEquity: tracker.getOpeningEquity(),
+            journalDemoRealizedCumUsd,
+          });
+          if (reseed > 0) {
+            restoredStocksAccount.optionsCredited =
+              (restoredStocksAccount.optionsCredited ?? 0) + reseed;
+            log.warn('TRA-2847: reseeded optionsCredited for a credit equity absorbed but nothing recorded', {
+              username,
+              reseedUsd: reseed,
+              restoredEquity: restoredStocksAccount.equity,
+              trackerOpeningEquity: tracker.getOpeningEquity(),
+              journalDemoRealizedCumUsd,
+              durableCounter: stocksSnap.account.optionsCredited ?? null,
+            });
+          }
+        } catch (err: unknown) {
+          log.warn('TRA-2847: journal read for the counter reseed failed — restoring unadjusted', {
+            username,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       engine.importTradeSnapshot({
         closedPositions: stocksSnap.closedPositions ?? [],
         recentSignals: stocksSnap.recentSignals ?? [],
@@ -955,11 +1010,13 @@ async function createUserContext(username: string): Promise<UserContext> {
         // snapshot has no stored value but its `equity` already contains the
         // historical credits, and the writer only ever uses the counter as a
         // delta against that same row. See `restoreDurableAccountSnapshot`.
-        account: restoreDurableAccountSnapshot(
-          stocksSnap.account,
-          stocksSnap.openPositions ?? [],
-          tracker.getLastOptionsCreditedCumulative(),
-        ),
+        //
+        // TRA-2847 — that fallback is exact only while SOME row recorded the
+        // credit. A file whose equity absorbed a credit that no row and no
+        // counter ever recorded restores poisoned, and the next written row
+        // books the credit as stock; `restoredStocksAccount` above carries the
+        // journal-bounded reseed that closes that state.
+        account: restoredStocksAccount,
         // TRA-233 — `options` stays for back-compat (legacy single-bucket
         // snapshots route through it). New snapshots include `optionsByEnv`
         // so both Tradier envs survive a restart.

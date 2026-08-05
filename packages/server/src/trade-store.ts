@@ -428,6 +428,59 @@ export function restoreDurableAccountSnapshot(
   };
 }
 
+/**
+ * TRA-2847 — the counter credit the restored EQUITY absorbed that neither the
+ * durable counter nor any EOD row ever recorded.
+ *
+ * TRA-2629's restore seam assumes the counter it rehydrates accounts for every
+ * option credit sitting inside the restored `equity`. That invariant has a
+ * failing state the fix never covered: a book whose durable file absorbed a
+ * credit while the counter was dead (`ctoverify_tra2333` — its 07-29 close's
+ * +73.05 reached the file's `equity` under the pre-fix writer, minutes before
+ * the TRA-2817 inode outage froze `trades-stocks.json` for five days) restores
+ * `equity` WITH the credit and a counter of 0, from a file whose every EOD row
+ * also carries 0. The next written row's stock leg then books the whole credit:
+ * `(equity − openingEquity) − (0 − 0)` — the Defect B signature, written by a
+ * build that descends from `ec05639`.
+ *
+ * The unrecorded credit is recoverable because two independent ledgers bound it:
+ *
+ *  - the JOURNAL (append-only, survived the outage) knows the cumulative demo
+ *    realized options P&L the sink SHOULD have credited over the book's life:
+ *    `journalSurplus = journalDemoRealizedCumUsd − restoredOptionsCredited`;
+ *  - the EQUITY WINDOW knows how much unexplained value actually sits between
+ *    the restored equity and the anchor the EOD writer will difference against:
+ *    `windowSurplus = restoredEquity − trackerOpeningEquity`.
+ *
+ * `min` of the two, floored at 0. Each surplus alone over-corrects a real
+ * state: seeding from the journal alone re-breaks the FROZEN-counter book
+ * (admin, TRA-2658 — $254 realized that never reached equity; its window
+ * surplus is 0, so the min is 0 and the counter honestly stays put), and the
+ * window alone would attribute a post-row STOCK gain to options (its journal
+ * surplus is 0, so the min is 0 again). Only when the journal names missing
+ * credits AND the equity window shows unexplained value does this move, and
+ * then by no more than either ledger can vouch for.
+ *
+ * Returns 0 — never a repair — when any operand is unavailable or non-finite:
+ * a probe that cannot run is not a probe that agrees (TRA-2829).
+ */
+export function unrecordedAbsorbedOptionsCredit(args: {
+  restoredEquity: number;
+  restoredOptionsCredited: number;
+  trackerOpeningEquity: number | null;
+  journalDemoRealizedCumUsd: number | null;
+}): number {
+  const { restoredEquity, restoredOptionsCredited, trackerOpeningEquity, journalDemoRealizedCumUsd } = args;
+  if (!Number.isFinite(restoredEquity) || !Number.isFinite(restoredOptionsCredited)) return 0;
+  if (trackerOpeningEquity === null || !Number.isFinite(trackerOpeningEquity)) return 0;
+  if (journalDemoRealizedCumUsd === null || !Number.isFinite(journalDemoRealizedCumUsd)) return 0;
+  const journalSurplus = journalDemoRealizedCumUsd - restoredOptionsCredited;
+  const windowSurplus = restoredEquity - trackerOpeningEquity;
+  const adj = Math.min(journalSurplus, windowSurplus);
+  if (!(adj > 0)) return 0;
+  return Math.round(adj * 100) / 100;
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 export async function loadStocksTradeSnapshot(username: string): Promise<StocksTradeSnapshot | null> {
