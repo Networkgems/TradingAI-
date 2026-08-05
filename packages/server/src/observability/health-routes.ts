@@ -11,7 +11,7 @@ import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
-import { isTestAccount, unrecognisedDeskBooks } from '../test-accounts.js'; // TRA-1949, TRA-2524
+import { isTestAccount, unrecognisedDeskBooks, KNOWN_DESK_BOOKS } from '../test-accounts.js'; // TRA-1949, TRA-2524, TRA-2660
 import {
   applyModelFacingBasis,
   MODEL_FACING_JOURNAL_BASIS,
@@ -274,6 +274,29 @@ export interface LiveHealthDeps {
    * production wiring and the regression test share one implementation.
    */
   fleetBooks?: () => Array<{ username: string; state: EngineState; mode: string; email?: string }>;
+  /**
+   * TRA-2660 — the JOURNAL-ACCOUNT domain: every Option-Trade-Journal row,
+   * UNFILTERED BY MODE, so the desk-roster observer reads the population the
+   * fold actually partitions instead of the resident in-memory engine map.
+   *
+   * ⚠ Wire it to a bare `listOptionTradeJournal()`. Adding `{ mode: 'demo' }`
+   * here re-creates the narrowing this ticket removed, and would do it
+   * invisibly — every unit test below passes either way, because the defect
+   * would be in the caller.
+   *
+   * Optional: when absent both new fields report the `null` sentinel and say so
+   * in `deskAccountRosterNote`. They never report `0`.
+   */
+  journalAccountRows?: () => Promise<
+    ReadonlyArray<{ account?: string; openTs?: number; mode?: string }>
+  >;
+  /**
+   * TRA-2660 — admin gate for `GET /api/admin/desk-roster`, which is the only
+   * surface that names the unrecognised accounts. Optional; the route is only
+   * mounted when this is provided, so no caller gains an unauthenticated
+   * identity leak by upgrading.
+   */
+  requireAdmin?: RequestHandler;
   /**
    * TRA-895 — inputs for the UNAUTHENTICATED `GET /api/health/options-pipeline`
    * probe. The 3-day demo test repeatedly reported "no option signals"; the
@@ -727,6 +750,44 @@ export interface DemoBookPublicReport {
   /** Human note when `unrecognisedDeskBookCount > 0`, else null. */
   deskRosterNote: string | null;
   /**
+   * TRA-2660 — THE SAME QUESTION OVER THE POPULATION THAT ACTUALLY GETS FOLDED.
+   *
+   * `unrecognisedDeskBookCount` above is computed over `getAllUserContexts()` —
+   * RESIDENT user contexts, an in-memory map wiped on every boot (bqb1 reboots
+   * several times a day), narrowed again to `mode === 'demo'`. Live on
+   * 2026-07-30 that population held exactly 2 usernames against a journal
+   * carrying 2445 rows. The desk fold does not partition user contexts; it
+   * partitions journal-row `account` (`health-routes.ts` fixture/desk split,
+   * `excludeTestAccountRows`, `option-spread-cost.ts`) — a DURABLE cumulative
+   * domain containing every account that ever traded, resident or not,
+   * demo-mode or not. So the resident reading was byte-identical in pass and
+   * fail state: a throwaway book whose engine is no longer resident scores 0.
+   *
+   * This field is that count over the journal-account domain. Both fields ship
+   * side by side ON PURPOSE — `unrecognisedDeskBookCount` keeps its original
+   * meaning (a field whose meaning changes under a stable name is worse than a
+   * new field), and the two populations stay visibly different rather than
+   * conflated.
+   *
+   * `null` is the SENTINEL for "the journal could not be read" (provider absent
+   * or threw) and is deliberately distinguishable from a genuine `0` — a read
+   * failure that reported 0 would be the same silent-healthy defect again.
+   * Always projected, never `optional?`: an `undefined` field is dropped by
+   * `JSON.stringify`, which reads a fully-patched route as unpatched (TRA-2598).
+   *
+   * Count only, never names — this route is NO-AUTH. The names live behind
+   * `GET /api/admin/desk-roster` (admin auth, GET only).
+   */
+  unrecognisedDeskAccountCount: number | null;
+  /**
+   * TRA-2660 — distinct non-blank `account` values in the whole journal domain,
+   * the denominator that makes the two populations comparable at a glance
+   * (`demoEngineCount` vs this). `null` when the journal could not be read.
+   */
+  journalAccountCount: number | null;
+  /** Human note when `unrecognisedDeskAccountCount > 0` or unreadable, else null. */
+  deskAccountRosterNote: string | null;
+  /**
    * TRA-2650 — the MODE-BLIND operator-survival probe.
    *
    * `books[]` below is, and stays, DEMO-ONLY: this route is NO-AUTH, and a book
@@ -806,10 +867,122 @@ export interface DemoBookPublicReport {
  * operator's survival MODE-BLIND, in counts and mode labels only. "Operator
  * absent" and "operator armed live" are now distinct readings.
  */
+/**
+ * TRA-2660 — one unrecognised journal account, NAMED. Admin surface only; the
+ * no-auth route publishes counts off {@link DeskAccountRosterFold} and nothing
+ * from here.
+ *
+ * `rowCount` + `firstOpenTs`/`lastOpenTs` are the fields that tell a live desk
+ * book from a fixture that traded three weeks ago and went away — which is the
+ * judgement `KNOWN_DESK_BOOKS` has to be designed on (TRA-2554). A bare list of
+ * names cannot support it.
+ */
+export interface UnrecognisedDeskAccount {
+  /** As first seen in the journal (original case preserved). */
+  account: string;
+  rowCount: number;
+  /** ms-epoch of the earliest/latest `openTs` for this account; null if none parsed. */
+  firstOpenTs: number | null;
+  lastOpenTs: number | null;
+  /** Journal `mode` values seen for this account, sorted + de-duplicated. */
+  modes: string[];
+}
+
+/** TRA-2660 — the journal-account-domain reading behind both new surfaces. */
+export interface DeskAccountRosterFold {
+  /** Journal rows scanned (the whole domain — never mode-filtered, see below). */
+  rowsScanned: number;
+  /** Rows carrying no usable `account` (pre-TRA-1475 / un-owned opens). */
+  rowsWithoutAccount: number;
+  /** Distinct non-blank `account` values, case-insensitively de-duplicated. */
+  journalAccountCount: number;
+  /** Of those, the ones neither `isTestAccount(...)` nor on `KNOWN_DESK_BOOKS`. */
+  unrecognised: UnrecognisedDeskAccount[];
+}
+
+/**
+ * TRA-2660 — the reading, or the reason there isn't one. A failed journal read
+ * must NOT collapse to `0`; the whole ticket exists because a zero that means
+ * "nothing to see" and a zero that means "I looked at the wrong thing" were
+ * indistinguishable on the wire.
+ */
+export type DeskAccountRosterReading =
+  | { ok: true; fold: DeskAccountRosterFold }
+  | { ok: false; reason: string };
+
+/**
+ * TRA-2660 — fold the JOURNAL-ACCOUNT domain into the desk-roster reading.
+ *
+ * OBSERVE-ONLY, by explicit ticket boundary: this changes no predicate. It
+ * reuses {@link unrecognisedDeskBooks} verbatim (`BUILTIN_TEST_PATTERNS` and
+ * `KNOWN_DESK_BOOKS` are untouched), so this is a POPULATION change, not a
+ * logic change, and no board-facing number moves in either direction.
+ *
+ * ⚠ Feed this `listOptionTradeJournal()` UNFILTERED BY MODE — it is the superset
+ * of every fold above it. A `{ mode: 'demo' }` read here would re-create the
+ * exact narrowing this ticket was filed to remove.
+ *
+ * Accounts are de-duplicated case-insensitively (matching `unrecognisedDeskBooks`,
+ * which compares trimmed + lowercased) but reported in first-seen case.
+ */
+export function foldDeskAccountRoster(
+  rows: ReadonlyArray<{ account?: string; openTs?: number; mode?: string }>,
+  env: NodeJS.ProcessEnv = process.env,
+): DeskAccountRosterFold {
+  const byKey = new Map<string, UnrecognisedDeskAccount>();
+  let rowsWithoutAccount = 0;
+  for (const row of rows) {
+    const raw = typeof row.account === 'string' ? row.account.trim() : '';
+    if (raw.length === 0) {
+      rowsWithoutAccount += 1;
+      continue;
+    }
+    const key = raw.toLowerCase();
+    let entry = byKey.get(key);
+    if (!entry) {
+      entry = { account: raw, rowCount: 0, firstOpenTs: null, lastOpenTs: null, modes: [] };
+      byKey.set(key, entry);
+    }
+    entry.rowCount += 1;
+    if (typeof row.openTs === 'number' && Number.isFinite(row.openTs)) {
+      entry.firstOpenTs = entry.firstOpenTs === null
+        ? row.openTs
+        : Math.min(entry.firstOpenTs, row.openTs);
+      entry.lastOpenTs = entry.lastOpenTs === null
+        ? row.openTs
+        : Math.max(entry.lastOpenTs, row.openTs);
+    }
+    if (typeof row.mode === 'string' && row.mode.length > 0 && !entry.modes.includes(row.mode)) {
+      entry.modes.push(row.mode);
+      entry.modes.sort();
+    }
+  }
+  // THE predicate, reused unchanged — same denylist, same roster allowlist.
+  const unrecognisedNames = new Set(
+    unrecognisedDeskBooks([...byKey.values()].map(a => a.account), env).map(n => n.toLowerCase()),
+  );
+  return {
+    rowsScanned: rows.length,
+    rowsWithoutAccount,
+    journalAccountCount: byKey.size,
+    unrecognised: [...byKey.values()]
+      .filter(a => unrecognisedNames.has(a.account.toLowerCase()))
+      .sort((a, b) => b.rowCount - a.rowCount || a.account.localeCompare(b.account)),
+  };
+}
+
 export function summarizeDemoBooksPublic(
   engines: Array<{ username: string; state: EngineState; mode: string; email?: string }>,
   now: number,
-  opts: { includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    includeTest?: boolean;
+    env?: NodeJS.ProcessEnv;
+    /**
+     * TRA-2660 — the journal-account-domain reading. Absent is treated as "not
+     * wired on this deployment" and reports the `null` sentinel, NOT `0`.
+     */
+    deskAccounts?: DeskAccountRosterReading;
+  } = {},
 ): DemoBookPublicReport {
   const env = opts.env ?? process.env;
   const includeTest = opts.includeTest === true;
@@ -841,6 +1014,16 @@ export function summarizeDemoBooksPublic(
     classified.filter(c => !c.operator && !c.test).map(c => c.e.username),
     env,
   );
+  // TRA-2660 — the journal-account-domain reading, computed from the SAME
+  // predicate and, like the resident one above, entirely independent of
+  // `includeTest`: a debugging query string must not change the answer to
+  // "which accounts are in the fold?".
+  const deskAccounts: DeskAccountRosterReading = opts.deskAccounts ?? {
+    ok: false,
+    reason: 'no journal-account provider is wired on this deployment',
+  };
+  const deskAccountFold = deskAccounts.ok ? deskAccounts.fold : null;
+  const unrecognisedAccountCount = deskAccountFold ? deskAccountFold.unrecognised.length : null;
   const visible = includeTest ? classified : classified.filter(c => !c.test);
   let demoIdx = 0;
   let opIdx = 0;
@@ -879,6 +1062,21 @@ export function summarizeDemoBooksPublic(
         + `test-account patterns nor KNOWN_DESK_BOOKS — ${unrecognisedDesk.length === 1 ? 'its' : 'their'} `
         + `P&L is being counted as desk P&L unvouched (TRA-2524)`
       : null,
+    // TRA-2660 — projected UNCONDITIONALLY (never `optional?`): `0` must reach
+    // the wire as `0`, and an unreadable journal as `null`, never as a missing
+    // key that a reader cannot tell from an unpatched build (TRA-2598).
+    unrecognisedDeskAccountCount: unrecognisedAccountCount,
+    journalAccountCount: deskAccountFold ? deskAccountFold.journalAccountCount : null,
+    deskAccountRosterNote: !deskAccounts.ok
+      ? `journal-account desk roster UNREAD (${deskAccounts.reason}) — `
+        + `unrecognisedDeskAccountCount is null, NOT 0: nothing was measured (TRA-2660)`
+      : unrecognisedAccountCount && unrecognisedAccountCount > 0
+        ? `${unrecognisedAccountCount} of ${deskAccountFold?.journalAccountCount ?? 0} distinct `
+          + `journal-row account${unrecognisedAccountCount === 1 ? '' : 's'} `
+          + `${unrecognisedAccountCount === 1 ? 'is' : 'are'} on neither the test-account `
+          + `patterns nor KNOWN_DESK_BOOKS — names are behind GET /api/admin/desk-roster `
+          + `(this route is NO-AUTH and never carries identity) (TRA-2660)`
+        : null,
     operator: {
       pinConfigured: operatorPinConfigured,
       engineCount: operatorEngines.length,
@@ -2625,13 +2823,76 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // TRA-1949 — de-noise the board-facing view: QA/test books hidden by default
   // (with a "N hidden" note, never a silent drop), operator/live book labelled;
   // `?includeTest=1` restores the full fleet, mirroring the desk-calendar gate.
-  app.get('/api/health/demo-book-public', (req, res) => {
+  // TRA-2660 — read the journal-account domain, or say WHY there is no reading.
+  // Shared by the no-auth count surface and the admin names surface so the two
+  // can never disagree about the population.
+  const readDeskAccountRoster = async (): Promise<DeskAccountRosterReading> => {
+    const provider = deps.journalAccountRows;
+    if (!provider) {
+      return { ok: false, reason: 'no journal-account provider is wired on this deployment' };
+    }
+    try {
+      return { ok: true, fold: foldDeskAccountRoster(await provider()) };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `journal read failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  };
+
+  app.get('/api/health/demo-book-public', async (req, res) => {
     const includeTest =
       (req as { query?: Record<string, unknown> }).query?.['includeTest'] === '1';
     // TRA-2650 — the WHOLE fleet crosses here on purpose; the demo filter and
     // the operator-survival read both live inside the summarizer now.
-    res.json(summarizeDemoBooksPublic(deps.fleetBooks?.() ?? [], now(), { includeTest }));
+    // TRA-2660 — `deskAccounts` is the durable journal-account domain, read
+    // independently of `includeTest`.
+    const deskAccounts = await readDeskAccountRoster();
+    res.json(
+      summarizeDemoBooksPublic(deps.fleetBooks?.() ?? [], now(), { includeTest, deskAccounts }),
+    );
   });
+
+  // TRA-2660 — the NAMES, behind admin auth. The no-auth route above can only
+  // ever publish a count (it anonymizes identity by design), and a roster
+  // cannot be designed from a count: TRA-2554 needs to know WHICH accounts are
+  // unvouched, how many rows each owns, and whether the last one landed
+  // yesterday or three weeks ago.
+  //
+  // GET ONLY, deliberately. A WRITE against the admin surface on bqb1 fires a
+  // `trigger: service_updated` redeploy despite `autoDeploy=no` (TRA-2186), so
+  // this diagnostic must never gain a mutating verb.
+  //
+  // OBSERVE-ONLY: nothing here gates a fold. `KNOWN_DESK_BOOKS` is echoed so the
+  // reader can see the allowlist the answer was computed against, not to
+  // suggest the list is being applied to any board number.
+  const requireAdmin = deps.requireAdmin;
+  if (requireAdmin) {
+    app.get('/api/admin/desk-roster', deps.requireAuth, requireAdmin, async (_req, res) => {
+      const reading = await readDeskAccountRoster();
+      if (!reading.ok) {
+        // 503, not an empty 200: "could not read" must never be served as "clean".
+        res.status(503).json({ ok: false, time: new Date(now()).toISOString(), reason: reading.reason });
+        return;
+      }
+      const { fold } = reading;
+      res.json({
+        ok: true,
+        time: new Date(now()).toISOString(),
+        rowsScanned: fold.rowsScanned,
+        rowsWithoutAccount: fold.rowsWithoutAccount,
+        journalAccountCount: fold.journalAccountCount,
+        knownDeskBooks: [...KNOWN_DESK_BOOKS],
+        unrecognisedDeskAccountCount: fold.unrecognised.length,
+        unrecognisedDeskAccounts: fold.unrecognised.map(a => ({
+          ...a,
+          firstOpen: a.firstOpenTs === null ? null : new Date(a.firstOpenTs).toISOString(),
+          lastOpen: a.lastOpenTs === null ? null : new Date(a.lastOpenTs).toISOString(),
+        })),
+      });
+    });
+  }
 
   const liveEquityAcceptance = deps.liveEquityAcceptance;
   if (liveEquityAcceptance) {

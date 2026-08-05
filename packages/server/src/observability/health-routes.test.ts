@@ -906,6 +906,256 @@ describe('TRA-898 demo-book summary', () => {
     }
   });
 
+  // ── TRA-2660 — the desk-roster observer over the JOURNAL-ACCOUNT domain ─────
+  //
+  // The defect these pin: `unrecognisedDeskBookCount` is computed over the
+  // RESIDENT engine map (wiped every boot, then narrowed to `mode:'demo'`), not
+  // over the durable journal-row `account` domain the desk fold partitions. A
+  // throwaway book whose engine is gone scores 0 there. Every test below keeps
+  // the resident fleet CLEAN so the old field's 0 is real — if both fields move
+  // together the fixture is not exercising the defect.
+  describe('TRA-2660 journal-account desk roster', () => {
+    /** Resident fleet with nothing unvouched in it: the old field must read 0. */
+    const CLEAN_RESIDENT_FLEET = () => [
+      { username: 'Richard', state: demoState(), mode: 'demo' },
+      { username: 'enock', state: demoState(), mode: 'demo' },
+    ];
+
+    function journalRow(account: string, over: Partial<{ openTs: number; mode: string }> = {}) {
+      return { account, openTs: NOW - 86_400_000, mode: 'demo', ...over };
+    }
+
+    function register(
+      opts: {
+        journalAccountRows?: () => Promise<
+          ReadonlyArray<{ account?: string; openTs?: number; mode?: string }>
+        >;
+        requireAdmin?: FakeHandler;
+      } = {},
+    ) {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n?: () => void) => n?.()) as never,
+        userCtx: async () => {
+          throw new Error('userCtx must not run on these paths');
+        },
+        getSettings: () => settings(),
+        fleetBooks: CLEAN_RESIDENT_FLEET,
+        now: () => NOW,
+        ...opts,
+      } as never);
+      return routes;
+    }
+
+    /** Serialize exactly as express would, so `undefined` keys disappear. */
+    function onWire(body: unknown): Record<string, unknown> {
+      return JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
+    }
+
+    // ACCEPTANCE 1 — the negative control. One read, two populations, and they
+    // MUST disagree: the journal carries a book the resident map never saw.
+    it('counts an unrecognised JOURNAL account the resident-engine field cannot see', async () => {
+      const routes = register({
+        journalAccountRows: async () => [
+          journalRow('Richard'),
+          journalRow('mysterybook7'),
+          journalRow('mysterybook7', { openTs: NOW - 3 * 86_400_000 }),
+        ],
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+
+      // THE DISCRIMINATOR. Same read, same instant.
+      expect(body['unrecognisedDeskAccountCount']).toBe(1);
+      expect(body['unrecognisedDeskBookCount']).toBe(0);
+      expect(body['journalAccountCount']).toBe(2);
+      expect(body['deskAccountRosterNote']).toContain('TRA-2660');
+      expect(body['deskAccountRosterNote']).toContain('/api/admin/desk-roster');
+      // Still NO-AUTH: the count is the alarm, the name never crosses here.
+      expect(JSON.stringify(res.body)).not.toContain('mysterybook7');
+    });
+
+    // ACCEPTANCE 2 — a test-classified account is not a finding.
+    it('does not count a test-classified journal account (`tra9999vfake` → /^tra\\d/i)', async () => {
+      const routes = register({
+        journalAccountRows: async () => [journalRow('Richard'), journalRow('tra9999vfake')],
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect(body['unrecognisedDeskAccountCount']).toBe(0);
+      expect(body['unrecognisedDeskBookCount']).toBe(0);
+      // A genuine zero carries no note; only a finding or an unread does.
+      expect(body['deskAccountRosterNote']).toBeNull();
+      expect(body['journalAccountCount']).toBe(2);
+    });
+
+    // ACCEPTANCE 3 — assert on the WIRE. `0` must SURVIVE serialization as `0`,
+    // and the key must be present unconditionally: an `optional?` field left
+    // `undefined` is dropped by `JSON.stringify`, which reads a fully-patched
+    // route as unpatched (TRA-2598).
+    it('projects the new keys unconditionally — a clean read serializes 0, not a missing key', async () => {
+      const routes = register({ journalAccountRows: async () => [journalRow('Richard')] });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect('unrecognisedDeskAccountCount' in body).toBe(true);
+      expect('journalAccountCount' in body).toBe(true);
+      expect('deskAccountRosterNote' in body).toBe(true);
+      expect(body['unrecognisedDeskAccountCount']).toBe(0);
+      expect(body['unrecognisedDeskAccountCount']).not.toBeNull();
+    });
+
+    // ACCEPTANCE 3 (second half) — "could not read the journal" is a SENTINEL,
+    // never another 0. This is the whole reason the ticket exists: a zero that
+    // means "nothing to see" and a zero that means "I measured nothing" must not
+    // be the same bytes.
+    it('reports null — not 0 — when the journal read throws', async () => {
+      const routes = register({
+        journalAccountRows: async () => {
+          throw new Error('journal file unreadable');
+        },
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect(body['unrecognisedDeskAccountCount']).toBeNull();
+      expect(body['journalAccountCount']).toBeNull();
+      expect(body['deskAccountRosterNote']).toContain('UNREAD');
+      expect(body['deskAccountRosterNote']).toContain('journal file unreadable');
+      // The key still has to be THERE — a dropped key reads as an old build.
+      expect('unrecognisedDeskAccountCount' in body).toBe(true);
+    });
+
+    it('reports null when no journal provider is wired at all', async () => {
+      const routes = register();
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect(body['unrecognisedDeskAccountCount']).toBeNull();
+      expect(body['deskAccountRosterNote']).toContain('no journal-account provider');
+    });
+
+    // ACCEPTANCE 5 — independence from `?includeTest`. A debugging query string
+    // must not change the answer to "which accounts are in the fold?".
+    it('gives the same account answer with and without ?includeTest=1', async () => {
+      const rows = async () => [
+        journalRow('Richard'),
+        journalRow('mysterybook7'),
+        journalRow('qa_throwaway'),
+      ];
+      const routes = register({ journalAccountRows: rows });
+      const handler = routes.get('/api/health/demo-book-public')![0]!;
+      const resDefault = resWithLocals();
+      await handler({ query: {} }, resDefault);
+      const resAll = resWithLocals();
+      await handler({ query: { includeTest: '1' } }, resAll);
+      expect(onWire(resDefault.body)['unrecognisedDeskAccountCount']).toBe(1);
+      expect(onWire(resAll.body)['unrecognisedDeskAccountCount']).toBe(1);
+      expect(onWire(resAll.body)['journalAccountCount']).toBe(3);
+    });
+
+    // The journal domain is MODE-BLIND on purpose — it is the superset of every
+    // fold above it. A `live`-mode row owned by an unvouched account is exactly
+    // the case the resident `mode:'demo'` narrowing dropped.
+    it('sees a live-mode journal account the demo-only resident read would drop', async () => {
+      const routes = register({
+        journalAccountRows: async () => [journalRow('mysterybook7', { mode: 'live' })],
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      expect(onWire(res.body)['unrecognisedDeskAccountCount']).toBe(1);
+      expect(onWire(res.body)['unrecognisedDeskBookCount']).toBe(0);
+    });
+
+    // Rows with no `account` (pre-TRA-1475 opens) are unclassifiable, not
+    // findings — counting them would manufacture a permanent false alarm.
+    it('does not count blank/absent account rows as unrecognised', async () => {
+      const routes = register({
+        journalAccountRows: async () => [
+          { openTs: NOW, mode: 'demo' },
+          journalRow('   '),
+          journalRow('Richard'),
+        ],
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect(body['unrecognisedDeskAccountCount']).toBe(0);
+      expect(body['journalAccountCount']).toBe(1);
+    });
+
+    // ── The admin NAMES surface ──────────────────────────────────────────────
+    it('names the unrecognised accounts (with row counts and first/last open) behind admin auth', async () => {
+      const routes = register({
+        journalAccountRows: async () => [
+          journalRow('Richard'),
+          journalRow('mysterybook7', { openTs: 1_000 }),
+          journalRow('mysterybook7', { openTs: 9_000 }),
+          journalRow('mysterybook7', { openTs: 5_000, mode: 'live' }),
+          journalRow('otherbook', { openTs: 4_000 }),
+          journalRow('qa_throwaway'),
+        ],
+        requireAdmin: ((_q: unknown, _s: unknown, n?: () => void) => n?.()) as never,
+      });
+      const handlers = routes.get('/api/admin/desk-roster')!;
+      // GET only, and gated: auth + admin both sit in front of the handler.
+      expect(handlers).toHaveLength(3);
+      const res = resWithLocals();
+      await handlers[2]!({ query: {} }, res);
+      const body = onWire(res.body) as {
+        unrecognisedDeskAccountCount: number;
+        journalAccountCount: number;
+        rowsScanned: number;
+        knownDeskBooks: string[];
+        unrecognisedDeskAccounts: Array<{
+          account: string;
+          rowCount: number;
+          firstOpen: string | null;
+          lastOpen: string | null;
+          modes: string[];
+        }>;
+      };
+      expect(body.unrecognisedDeskAccountCount).toBe(2);
+      expect(body.journalAccountCount).toBe(4);
+      expect(body.rowsScanned).toBe(6);
+      expect(body.knownDeskBooks).toContain('admin');
+      // Sorted by row count, so the busiest unvouched book leads.
+      expect(body.unrecognisedDeskAccounts.map(a => a.account)).toEqual([
+        'mysterybook7',
+        'otherbook',
+      ]);
+      const mystery = body.unrecognisedDeskAccounts[0]!;
+      expect(mystery.rowCount).toBe(3);
+      expect(mystery.firstOpen).toBe(new Date(1_000).toISOString());
+      expect(mystery.lastOpen).toBe(new Date(9_000).toISOString());
+      expect(mystery.modes).toEqual(['demo', 'live']);
+      // Roster books and test books are NOT named.
+      expect(JSON.stringify(res.body)).not.toContain('Richard');
+      expect(JSON.stringify(res.body)).not.toContain('qa_throwaway');
+    });
+
+    it('serves 503 — never an empty clean 200 — when the admin read cannot see the journal', async () => {
+      const routes = register({
+        journalAccountRows: async () => {
+          throw new Error('journal file unreadable');
+        },
+        requireAdmin: ((_q: unknown, _s: unknown, n?: () => void) => n?.()) as never,
+      });
+      const res = resWithLocals();
+      await routes.get('/api/admin/desk-roster')![2]!({ query: {} }, res);
+      expect(res.statusCode).toBe(503);
+      expect((onWire(res.body) as { ok: boolean }).ok).toBe(false);
+      expect(JSON.stringify(res.body)).toContain('journal file unreadable');
+    });
+
+    it('does not mount the names route at all when no admin gate is supplied', () => {
+      const routes = register({ journalAccountRows: async () => [journalRow('mysterybook7')] });
+      expect(routes.has('/api/admin/desk-roster')).toBe(false);
+    });
+  });
+
   it('TRA-1949 labels the LIVE_EQUITY_BOOT_USER operator book distinctly and never hides it', async () => {
     const { app, routes } = fakeApp();
     const prev = process.env['LIVE_EQUITY_BOOT_USER'];

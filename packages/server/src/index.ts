@@ -4310,6 +4310,17 @@ registerLiveHealthRoutes(app, {
       username => getSettings(username).mode,
       username => getUser(username)?.email,
     ),
+  // TRA-2660 — the JOURNAL-ACCOUNT domain for the desk-roster observer. This is
+  // the population the desk fold actually partitions (durable, cumulative,
+  // every account that ever traded), as opposed to `fleetBooks` above, which is
+  // the RESIDENT in-memory engine map and is wiped on every boot.
+  // ⚠ NO `{ mode: 'demo' }` HERE. Unfiltered is the superset of every fold
+  // above it; narrowing it here would re-create the exact defect TRA-2660 was
+  // filed for, and would do it in the caller where no unit test can see it
+  // (the TRA-2650 `fleetBooks` lesson, same file, twelve lines up).
+  journalAccountRows: () => listOptionTradeJournal(),
+  // TRA-2660 — mounts GET /api/admin/desk-roster (names, admin-gated, GET only).
+  requireAdmin,
   // TRA-895 — unauth options-signal pipeline probe. Enumerates demo-mode engines
   // + the shared RV scanner status so "no option signals" is diagnosable without
   // a login or the internal demo-book token. Secrets-free (booleans/counts only).
