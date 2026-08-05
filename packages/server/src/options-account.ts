@@ -431,6 +431,56 @@ function normalizeNonNegative(value: number | undefined, fallback: number): numb
 }
 
 /**
+ * TRA-2957 — is this premium threshold an ARMED trigger, or a sentinel meaning
+ * "this rule does not apply to this row"?
+ *
+ * The unmanaged schedule (TRA-323/TRA-462, {@link applyImportedRiskThresholds})
+ * encodes "never" as `tp1Premium = +Infinity` and `stopLossPremium = 0`. Both
+ * work in memory. Neither survives the snapshot: the book is persisted with
+ * `JSON.stringify` and **`JSON.stringify(Infinity)` is `null`**. One round-trip
+ * later `mark >= opt.tp1Premium` reads `mark >= null`, ToNumber-coerces the
+ * `null` to `0`, and the take-profit target every positive mark clears fires
+ * immediately. The sentinel does not degrade to a no-op — it INVERTS, from
+ * *never* to *always*.
+ *
+ * On 2026-08-05 that staged a 2-contract TP1 on `TSLA260911C00555000` at
+ * 09:30:25 ET — 25 seconds after the bell, the first tick with a mark — on a
+ * position trading at 0.265 against a 0.27 entry. A *profit* target, taken at a
+ * loss. The `null` limit was repriced to 0.36 on submission, above the 0.355
+ * high-water mark the row ever printed, so Tradier held it `open` and
+ * `if (opt.pendingExit) continue` detached every other exit rule for 5h09m
+ * (TRA-2956).
+ *
+ * So the comparison is no longer allowed to interpret the value: a threshold is
+ * live only when it is a finite positive number. Every other shape — `Infinity`,
+ * `null`, `undefined`, `NaN`, `0`, negative — is "not armed", which is what both
+ * sentinels meant in the first place. `reports/options-alert-engine.ts` already
+ * guarded exactly this way; the exit engine did not, and only the exit engine
+ * places orders.
+ */
+function isArmedThreshold(value: number | undefined | null): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * TRA-2957 — restore the in-memory sentinel on a row whose thresholds came back
+ * from disk flattened. Applied on snapshot import so the healing is retroactive:
+ * rows persisted by the pre-fix code are sitting in production snapshots with
+ * `tp1Premium: null` TODAY, and a fix that only holds for newly-written rows
+ * would leave those live positions on the inverted comparison.
+ *
+ * `+Infinity` is kept as the in-memory representation — every reader treats it
+ * correctly and the existing tests pin it — but it is now re-established at the
+ * durable boundary rather than assumed to have crossed it.
+ */
+function healPersistedThresholds(opt: OptionPosition): void {
+  if (!Number.isFinite(opt.tp1Premium)) opt.tp1Premium = Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(opt.stopLossPremium)) opt.stopLossPremium = 0;
+  if (!Number.isFinite(opt.trailingStopPremium)) opt.trailingStopPremium = 0;
+  if (!Number.isFinite(opt.peakPremium)) opt.peakPremium = opt.premiumPaid;
+}
+
+/**
  * TRA-361 — write SL/TP1/trailing thresholds onto an imported (Tradier) row
  * based on the current auto-management policy. When auto-management is on we
  * size SL/TP off the user's `premiumPaid` using the RV defaults; when off we
@@ -677,6 +727,13 @@ function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): v
   //     imported row has no other source; here it would corrupt the mark.
   opt.peakPremium = Math.max(opt.peakPremium, brokerPremium);
 
+  // TRA-2957 — the "sentinels rescale to themselves" identity above
+  // (`Infinity × r = Infinity`, `0 × r = 0`) holds only for the IN-MEMORY
+  // sentinel. A row that has been through a snapshot carries `null`, and
+  // `null × r` is **0** — so the multiply is a second, independent route from
+  // "no take-profit" to a target of 0. Heal first, then rescale, so this path
+  // operates on the sentinel the identity was reasoned about.
+  healPersistedThresholds(opt);
   opt.tp1Premium *= ratio;
   opt.stopLossPremium *= ratio;
   // Before activation, `trailingStopPremium` holds the ACTIVATION level, which
@@ -3988,7 +4045,11 @@ export class PaperOptionsAccount {
       }
 
       // Partial exit at TP1: sell `partialExitRatio` of contracts, trail the rest
-      if (!opt.tp1Hit && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
+      // TRA-2957 — `isArmedThreshold` FIRST. `mark >= opt.tp1Premium` alone reads
+      // `mark >= 0` on a row whose `+Infinity` sentinel was flattened to `null`
+      // by the snapshot's `JSON.stringify`, which fires a take-profit on every
+      // position with a positive mark — including losers, 25s after the open.
+      if (!opt.tp1Hit && isArmedThreshold(opt.tp1Premium) && mark >= opt.tp1Premium && opt.contractsRemaining > 1) {
         const exitContracts = Math.floor(opt.contractsRemaining * partialExitRatio);
         if (exitContracts > 0) {
           if (waitAndHold) {
@@ -3997,6 +4058,14 @@ export class PaperOptionsAccount {
             // TRA-361 — imports always reach this branch (the `!waitAndHold`
             // guard up-top short-circuits them otherwise); LIMIT is correct
             // for TP1 since the position is well in profit by definition.
+            // TRA-2957 — `limitPrice` below is `opt.tp1Premium`, and the branch
+            // guard has already established it is finite and positive, so this
+            // site cannot stage an untradeable LIMIT. That matters: a `null`
+            // limit reached Tradier once, got repriced to 0.36 on submission,
+            // and hung `open` forever because no fill was possible — and an
+            // unresolvable `pendingExit` detaches every exit rule on the row
+            // (TRA-2956). The SL/trailing staging site below draws `exitPremium`
+            // from several sources, so it re-checks there rather than here.
             opt.pendingExit = {
               tradierOrderId: '',
               qty: exitContracts,
@@ -4119,11 +4188,18 @@ export class PaperOptionsAccount {
       }
 
       if (exitPremium === null) {
-        if (mark <= opt.stopLossPremium) {
+        // TRA-2957 — the stop carries the same sentinel ambiguity as TP1, in the
+        // other direction: `stopLossPremium: 0` means "no stop", and `mark <= 0`
+        // is false for every real mark, so the unmanaged row was already inert
+        // here by accident rather than by statement. Say it explicitly, so the
+        // rule reads the same way at both trigger sites and a future non-finite
+        // value (a `null` from disk ToNumber-coerces to 0 in `mark <= null`
+        // too) cannot quietly change which way this branch falls.
+        if (isArmedThreshold(opt.stopLossPremium) && mark <= opt.stopLossPremium) {
           exitPremium = opt.stopLossPremium;
           exitKind = 'sl';
           exitJournalReason = 'sl';
-        } else if (opt.trailingActive && mark <= opt.trailingStopPremium) {
+        } else if (opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
           exitPremium = opt.trailingStopPremium;
           exitKind = 'trail';
           exitJournalReason = 'trail';
@@ -4149,6 +4225,13 @@ export class PaperOptionsAccount {
             && exitKind === 'sl'
             && slPct > 0
             && mark < opt.stopLossPremium * (1 - slPct / 2);
+          // TRA-2957 — same refusal as the TP1 staging site. A MARKET escalation
+          // carries no price so it stays tradable, but a LIMIT at a non-finite
+          // or non-positive `exitPremium` is an order that can never fill, and
+          // an unfillable staged exit is strictly worse than no staged exit: it
+          // latches `pendingExit` and detaches the rules that would have closed
+          // the row. Fail to the next tick, which still sees the position.
+          if (!deepUnderwaterSL && !isArmedThreshold(exitPremium)) continue;
           opt.pendingExit = {
             tradierOrderId: '',
             qty: opt.contractsRemaining,
@@ -5722,7 +5805,17 @@ export class PaperOptionsAccount {
     assignedShares?: AssignedShareLot[];
   }): void {
     this.openOptions.clear();
-    for (const o of snap.openOptions) this.openOptions.set(o.id, o);
+    // TRA-2957 — re-establish the in-memory sentinels at the durable boundary.
+    // `JSON.stringify(Infinity)` is `null`, so every unmanaged row that has ever
+    // been through a snapshot arrives here with its "never take profit" target
+    // flattened into a value the TP1 comparison reads as `0`. Healing on the way
+    // IN makes the fix retroactive to rows already sitting in production
+    // snapshots, which is the population that matters — they are open positions
+    // carrying real premium right now.
+    for (const o of snap.openOptions) {
+      healPersistedThresholds(o);
+      this.openOptions.set(o.id, o);
+    }
     this.closedOptions = [...snap.closedOptions];
     // TRA-1976 — restore assigned-share inventory (empty for legacy snapshots).
     this.assignedShares.clear();
