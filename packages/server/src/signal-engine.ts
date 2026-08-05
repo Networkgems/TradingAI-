@@ -324,6 +324,10 @@ import {
 // no-op until the dispatcher is installed at boot and can NEVER throw, so these
 // hooks are safe to call inline on the trade paths.
 import { emitAlert } from './notifications/index.js';
+// TRA-2693 — operator/ops alert channel (email + webhook + the `/api/health/alerts`
+// ring). Separate from `emitAlert` above, which is the in-app user feed: an
+// unmanaged real-money position is an OPS incident, not a trade notification.
+import { dispatchAlert } from './observability/alerts.js';
 
 const balanceLog = logger.child({ module: 'signal-engine' });
 const log = logger.child({ module: 'signal-engine' });
@@ -4397,6 +4401,11 @@ export class SignalEngine {
           multiLegExitParams,
         )
       : [];
+    // TRA-2693 — the compensating control for the live OTM arm. Consulted ONLY
+    // when a pass actually ran: with `optionsExitsActive` false the array is a
+    // stale reading from an earlier tick, and in live mode outside RTH the skip
+    // is TRA-726's deliberate no-day-trading hold, not a strand.
+    if (optionsExitsActive) this.alertUnmanagedLiveOptions();
     if (liveOptionsMirroring && optsClosed.length > 0) {
       // TRA-354 — submit the staged Tradier sell_to_close LIMIT orders.
       // `checkExits` returned position snapshots already carrying the
@@ -6501,6 +6510,59 @@ export class SignalEngine {
       estimatedFill: closed.currentPremium,
     });
     return true;
+  }
+
+  /**
+   * TRA-2693 — raise an ops alert when the `checkExits` pass that just ran
+   * dropped one or more REAL (`mode: live`) option positions on its
+   * per-position mode filter, i.e. when real money is open with SL / TP1 /
+   * trail / ATR chandelier / profit-lock not being evaluated at all.
+   *
+   * Why this predicate and not the one the issue proposed. QA asked for
+   * `bootArmEligible && bootArmDrift.length > 0 && a live position is open`.
+   * That names the CAUSE observed at the time (boot-arm non-convergence,
+   * TRA-2649, since fixed) and is wrong at both ends: drift with no live
+   * position open is not an incident and would page for nothing, while a manual
+   * mode flip or an operator rewrite strands positions with an EMPTY
+   * `bootArmDrift` and would page for nothing at all. The skip itself is the
+   * outcome; every cause reaches it, and it is only ever true while real money
+   * is genuinely exposed.
+   *
+   * The three gates the issue enumerated all fail silent — `checkExits`'s
+   * `continue`, `submitStagedOptionExits`'s `if (!this.tradierLiveClient)
+   * return`, and `resolvePendingOptionExits`'s `liveOptionsMirroring` guard —
+   * and the first one is upstream of the other two: nothing reaches them once
+   * the position is filtered out. So one detector on the filter covers all
+   * three, and it sits on the line that does the dropping rather than on a
+   * health field that has to be kept in sync with it.
+   *
+   * `dispatchAlert` throttles per key (30 min default) and never throws, so a
+   * persistent strand pages once a window rather than every 30s tick, and a mail
+   * outage cannot stall doTick. When no push channel is configured, alerting
+   * degrades to log + `alerts.jsonl` + the `/api/health/alerts` ring, which is
+   * the poll path a monitor can read.
+   */
+  private alertUnmanagedLiveOptions(): void {
+    const skipped = this.optionsAccount.getModeSkippedLiveOptionSymbols();
+    if (skipped.length === 0) return;
+    dispatchAlert(
+      'unmanaged-live-options',
+      'critical',
+      `${skipped.length} REAL (mode: live) option position(s) are open but the engine `
+        + `is in ${this.mode} mode, so their exits are not being evaluated: `
+        + `${skipped.join(', ')}. Risk controls (SL / TP1 / trail / chandelier / `
+        + `profit-lock) are detached until the engine returns to live mode.`,
+      {
+        issue: 'TRA-2693',
+        engineMode: this.mode,
+        unmanagedCount: skipped.length,
+        optionSymbols: [...skipped],
+        // Named, not read: the usual cause is boot-arm non-convergence, and this
+        // is where the responder looks next. Kept out of the predicate on
+        // purpose (see the doc above).
+        checkNext: 'GET /api/health/options-live → bootArmEligible / bootArmDrift',
+      },
+    );
   }
 
   private async resolvePendingOptionExits(): Promise<void> {

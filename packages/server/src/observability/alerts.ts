@@ -29,7 +29,14 @@ export type AlertKey =
   // TRA-2284 — operator-triggered end-to-end probe of the alert PUSH path. Its
   // own key on purpose: it must never be mistaken for a real incident in the
   // ring/inbox, and it must not consume a real key's throttle window.
-  | 'self-test';
+  | 'self-test'
+  // TRA-2693 — one or more REAL (`mode: live`) option positions are open while
+  // the engine is in demo mode, so `checkExits`'s per-position mode filter drops
+  // them and none of their risk controls (SL / TP1 / trail / ATR chandelier /
+  // profit-lock) are evaluated. The skip is a bare `continue` by design
+  // (TRA-231: a demo tick must not close a real position out from under the
+  // user) — this is the detector that state previously had none of.
+  | 'unmanaged-live-options';
 
 export type AlertSeverity = 'warning' | 'critical';
 

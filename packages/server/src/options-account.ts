@@ -715,6 +715,29 @@ export class PaperOptionsAccount {
   private demoSlippageCost = 0;
   private demoFeeCost = 0;
   /**
+   * TRA-2693 — the `mode: live` positions that {@link checkExits}'s per-position
+   * mode filter (TRA-231) DROPPED on its most recent pass, by option symbol.
+   *
+   * The filter is correct and stays: a demo-mode engine must not close a real
+   * broker position out from under the user. But its skip is a bare `continue`
+   * with no log line, so when the engine is in demo while real `mode: live`
+   * options are open, every risk control on those positions — SL, TP1, trailing
+   * stop, ATR chandelier, profit-lock — silently stops being evaluated and
+   * NOTHING says so. That is the state TRA-2693 has no detector for.
+   *
+   * This records the OUTCOME (which real positions actually went un-evaluated on
+   * this pass), not the cause. The known cause is boot-arm non-convergence
+   * (TRA-2649, fixed 2026-08-05), but a manual mode flip or an operator rewrite
+   * produces the identical strand, and drift with no live position open is not
+   * an incident at all. Alerting on the skip covers every cause and only fires
+   * when real money is actually exposed.
+   *
+   * Written on EVERY `checkExits` call (cleared first), so it is only meaningful
+   * to a reader who knows a pass just ran — see the caller in `signal-engine.ts`,
+   * which consults it only when `optionsExitsActive` was true.
+   */
+  private modeSkippedLiveOptionSymbols: string[] = [];
+  /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
    * the round trip doesn't count as a day trade. Demo always evaluates
@@ -3153,8 +3176,22 @@ export class PaperOptionsAccount {
     // the close lands, so the daily pill reconciles with the Closed-Today total.
     this.resetDayIfNeeded();
 
+    // TRA-2693 — cleared on every pass so the reading can never be a fossil from
+    // an earlier tick. An empty array after a pass that RAN means "no live
+    // position was dropped"; the same empty array when no pass ran means nothing.
+    this.modeSkippedLiveOptionSymbols = [];
+
     for (const [id, opt] of this.openOptions) {
-      if (mode !== undefined && (opt.mode ?? 'demo') !== mode) continue;
+      if (mode !== undefined && (opt.mode ?? 'demo') !== mode) {
+        // TRA-2693 — record only the LIVE drops. The mirror case (a live engine
+        // skipping demo rows) is the paper book being left alone, which is
+        // normal and constant; folding it in here would make the alert fire on
+        // every live tick and train the operator to ignore it.
+        if ((opt.mode ?? 'demo') === 'live') {
+          this.modeSkippedLiveOptionSymbols.push(opt.optionSymbol ?? id);
+        }
+        continue;
+      }
       // TRA-613 — defined-risk MULTI-LEG spread combos have no single-contract
       // mark to drive the per-leg SL / TP1 / trailing schedule, and their
       // downside is already capped at entry (max-loss reserved from cash). They
@@ -4908,6 +4945,18 @@ export class PaperOptionsAccount {
    */
   getClosedOptionsForMode(mode: AccountMode): OptionPosition[] {
     return this.closedOptions.filter(p => (p.mode ?? 'demo') === mode);
+  }
+
+  /**
+   * TRA-2693 — the real (`mode: live`) option positions that the most recent
+   * {@link checkExits} pass dropped on its per-position mode filter, i.e. the
+   * ones whose SL / TP1 / trail / chandelier / profit-lock were NOT evaluated.
+   *
+   * Non-empty ⇒ real money is open with its risk controls detached. Only
+   * meaningful immediately after a pass that actually ran; see the field doc.
+   */
+  getModeSkippedLiveOptionSymbols(): readonly string[] {
+    return this.modeSkippedLiveOptionSymbols;
   }
 
   /** Serialize current state for durable storage (TRA-140). */
