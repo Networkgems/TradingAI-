@@ -148,6 +148,16 @@ export const RUN_SUCCESS = new Set(['completed', 'issue_created']);
 export const RUN_FAILURE = new Set(['failed']);
 /** In-flight states — a dispatch that is still running is not yet a verdict. */
 export const RUN_PENDING = new Set(['pending', 'queued', 'running', 'in_progress', 'dispatched']);
+/**
+ * A concurrency gate refused this fire. ⛔ NOT automatically a failure and NOT
+ * automatically a pass — it depends on `coalescedIntoRunId` (TRA-2587):
+ *   - set    => this fire MERGED into a run that did the work. Covered.
+ *   - null   => `skip_if_active` DELETED the fire. For a producer whose fires
+ *               are independent samples, that is a lost sample, not a no-op.
+ * Left unhandled it would fall through to the unknown-status branch and exit
+ * BLIND, which is safe but noisy enough to get the whole check ignored.
+ */
+export const RUN_SKIPPED = new Set(['skipped']);
 
 /* ------------------------------------------------------------------ *
  * Predicate
@@ -218,6 +228,24 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
   if (RUN_PENDING.has(status)) {
     return { state: 'IN_FLIGHT', detail: `newest dispatch is still ${status}`, triggeredAt };
   }
+  if (RUN_SKIPPED.has(status)) {
+    // `coalescedIntoRunId` is the durable proof of which of the two it was, and
+    // it survives the `lastResult` overwrite that hides everything else.
+    if (lastRun.coalescedIntoRunId) {
+      return {
+        state: 'COALESCED',
+        detail: `newest dispatch merged into run ${lastRun.coalescedIntoRunId}`,
+        triggeredAt,
+      };
+    }
+    return {
+      state: 'DISPATCH_SKIPPED',
+      detail:
+        'a concurrency gate refused this fire and it merged into NOTHING (`coalescedIntoRunId` is null) — ' +
+        'the fire was deleted, not deferred',
+      triggeredAt,
+    };
+  }
   if (!RUN_SUCCESS.has(status)) {
     return {
       state: 'BLIND',
@@ -241,7 +269,7 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
   return { state: 'HEALTHY', detail: `newest dispatch ${status} at ${triggeredAt}`, triggeredAt };
 }
 
-const FINDING_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN']);
+const FINDING_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DISPATCH_SKIPPED']);
 
 /* ------------------------------------------------------------------ *
  * The sweep — transport injected so the controls drive the whole pipeline,
@@ -573,6 +601,38 @@ const CASES = [
     expect: (r) => {
       assert(r.verdict === 'BLIND', `expected BLIND, got ${r.verdict}`);
       assert(/triggers/.test(r.blind), r.blind);
+    },
+  },
+  {
+    name: 'COALESCED — skipped WITH a coalescedIntoRunId => covered by the run it merged into, not a finding',
+    rows: boardOf([
+      routineRow('r-coal', {
+        lastRun: {
+          status: 'skipped',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          coalescedIntoRunId: 'run-that-won',
+        },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.tally.COALESCED === 1, JSON.stringify(r.tally));
+    },
+  },
+  {
+    name: '⛔ DISPATCH_SKIPPED — skipped with a NULL coalescedIntoRunId => the fire was DELETED => finding',
+    rows: boardOf([
+      routineRow('r-dropped', {
+        lastRun: {
+          status: 'skipped',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          coalescedIntoRunId: null,
+        },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
     },
   },
   {
