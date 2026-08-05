@@ -4615,6 +4615,20 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       priorOptionsLagGradeableBookCount: engines.filter(
         e => e.priorOptionsLagEligibleDates.length > 0,
       ).length,
+      // TRA-2835 — books carrying a session that WOULD have been gradeable under
+      // the old array-adjacent pairing but is suppressed because its predecessor
+      // row is not the preceding exchange session. Published for the same reason
+      // the denominator above is: a cohort that silently shrank reads exactly
+      // like one that was always this size. After the permanent TRA-2888 hole
+      // (2026-07-30/07-31/08-03) this is where the 2026-08-04 rows went, and
+      // grading AC2 on them would have been a PASS the tripwire could not fail.
+      priorOptionsLagGapSuppressedBooks: engines
+        .filter(e => e.priorOptionsLagGapSuppressedDates.length > 0)
+        .map(e => ({
+          username: e.username,
+          mode: e.mode,
+          dates: e.priorOptionsLagGapSuppressedDates,
+        })),
       // THE REAL-MONEY TRIPWIRE. The demo-only verdict on TRA-2630 Defect B (and
       // with it the standing decision NOT to roll back TRA-2323) holds only while
       // this stays empty. A `mode: live` book showing `stockDaily` == the prior

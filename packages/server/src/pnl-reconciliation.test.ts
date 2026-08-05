@@ -1907,3 +1907,94 @@ describe('TRA-2817 EOD tail staleness', () => {
     });
   });
 });
+
+/**
+ * TRA-2835 — the T+1 credit-lag detector pairs `days[i]` with `days[i-1]`, which
+ * is ARRAY-adjacent, not CALENDAR-adjacent. A gap in `days[]` did not suppress
+ * eligibility, so the first row landing after the permanent TRA-2888 hole
+ * (2026-07-30 / 07-31 / 08-03, fleet-wide) was graded against 2026-07-29 as if
+ * it were T+1.
+ *
+ * The hazard is a FALSE PASS, which is the dangerous direction: a clean reading
+ * across a three-session hole is not evidence the writer was fixed, it is the
+ * tripwire's trigger condition never having been met and being scored anyway.
+ */
+describe('TRA-2835 — lag eligibility requires CALENDAR adjacency, not array adjacency', () => {
+  // 2026-07-29 Wed .. 2026-08-05 Wed. Weekends only; 07-30/07-31/08-03 are real
+  // sessions the exchange held and the ledger missed — that is the whole point.
+  const isMarketDay = (iso: string): boolean => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dow = new Date(Date.UTC(y!, m! - 1, d!)).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const cal = (lastSettledSession: string) => ({ lastSettledSession, isMarketDay });
+
+  it('suppresses the 2026-08-04 row: its predecessor row is 07-29, three sessions back', () => {
+    // The exact live shape. `admin` on bqb1 at 2026-08-05T09:12Z:
+    //   07-29 optionsDaily 250.01  ->  08-04 optionsDaily -2.00
+    // with 07-30 / 07-31 / 08-03 absent from days[] entirely.
+    const r = reconcilePnl(
+      [snap('2026-07-28', 0, 68), snap('2026-07-29', 0, 250.01), snap('2026-08-04', 0, -2)],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+
+    const byDate = new Map(r.days.map(d => [d.date, d]));
+    expect(byDate.get('2026-07-29')!.priorSessionAdjacent).toBe(true);
+    expect(byDate.get('2026-08-04')!.priorSessionAdjacent).toBe(false);
+
+    // 08-04 is NOT gradeable. Pre-fix it was, because prev.optionsDaily = 250.01
+    // is non-zero and nothing checked the distance.
+    expect(r.priorOptionsLagEligibleDates).toEqual(['2026-07-29']);
+    expect(r.priorOptionsLagEligibleDates).not.toContain('2026-08-04');
+    // ...and the drop is PUBLISHED, not silent.
+    expect(r.priorOptionsLagGapSuppressedDates).toEqual(['2026-08-04']);
+  });
+
+  it('does not let a lag FIRE across the gap either', () => {
+    // stockDaily on 08-04 exactly equals 07-29's optionsDaily. Pre-fix this is a
+    // red flag; it is not one, because the two sessions are not T and T+1.
+    const r = reconcilePnl(
+      [snap('2026-07-29', 0, 250.01), snap('2026-08-04', 250.01, 0)],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    expect(r.days.map(d => d.lagsPriorOptionsDaily)).toEqual([false, false]);
+    expect(r.priorOptionsLagDates).toEqual([]);
+  });
+
+  it('still pairs across a WEEKEND — Monday against Friday is genuinely T+1', () => {
+    // The pre-existing behaviour that must NOT regress: 07-31 Fri -> 08-03 Mon
+    // is three calendar days but ONE session apart.
+    const r = reconcilePnl(
+      [snap('2026-07-31', 0, 140), snap('2026-08-03', 0, 0)],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-03'),
+    );
+    const byDate = new Map(r.days.map(d => [d.date, d]));
+    expect(byDate.get('2026-08-03')!.priorSessionAdjacent).toBe(true);
+    expect(r.priorOptionsLagEligibleDates).toEqual(['2026-08-03']);
+    expect(r.priorOptionsLagGapSuppressedDates).toEqual([]);
+  });
+
+  it('reads NOT MEASURED and changes nothing when no calendar is supplied', () => {
+    // Fail-open is wrong here and fail-closed is also wrong: without a calendar
+    // we cannot prove a gap, so behaviour is unchanged and the field says so.
+    const r = reconcilePnl(
+      [snap('2026-07-29', 0, 250.01), snap('2026-08-04', 0, -2)],
+      new Map(), '2026-07-12',
+    );
+    expect(r.days.map(d => d.priorSessionAdjacent)).toEqual([null, null]);
+    expect(r.priorOptionsLagEligibleDates).toEqual(['2026-08-04']);
+    expect(r.priorOptionsLagGapSuppressedDates).toEqual([]);
+  });
+
+  it('the whole-book verdict goes NOT MEASURED rather than green when the gap is the only cohort', () => {
+    // The false PASS in its purest form: 08-04 was the ONLY eligible session, so
+    // pre-fix the book reported priorOptionsLagOk = true over one observation
+    // that could never have failed. It must now read null.
+    const r = reconcilePnl(
+      [snap('2026-07-29', 0, 250.01), snap('2026-08-04', 0, -2)],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    expect(r.priorOptionsLagEligibleDates).toEqual([]);
+    expect(r.priorOptionsLagOk).toBeNull();
+  });
+});

@@ -3,7 +3,7 @@ import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
 // compile time, so this is not a runtime cycle.
-import { PNL_EOD_DOCUMENTED_GAP_NOTE } from './eod-ledger-gap.js';
+import { PNL_EOD_DOCUMENTED_GAP_NOTE, sessionsInRange } from './eod-ledger-gap.js';
 
 /**
  * TRA-1633 FIX 3 — cross-surface P&L reconciliation guard.
@@ -405,6 +405,35 @@ export interface PnlReconcileDay {
    */
   priorOptionsLagEligible: boolean;
   /**
+   * TRA-2835 — is `days[i-1]` the session that ACTUALLY precedes this one on the
+   * exchange calendar, or merely the previous row we happen to hold?
+   *
+   * `null` = NOT MEASURED (no calendar supplied), never an implied `true`.
+   *
+   * WHY THIS FIELD EXISTS. The T+1 credit-lag hypothesis is a statement about
+   * ADJACENT sessions: "the writer posts the PRIOR session's realized option P&L
+   * into THIS session's equity line". The detector, however, pairs `days[i]`
+   * with `days[i-1]` — array-adjacent, not calendar-adjacent — and a gap in
+   * `days[]` does not suppress it. Proven on live `admin` before this fix:
+   * 2026-07-20 (Mon) was graded against 2026-07-17 (Fri), three calendar days
+   * back, and read `priorOptionsLagEligible: true`.
+   *
+   * That was harmless while the only gaps were weekends. It stopped being
+   * harmless when the TRA-2888 gap (2026-07-30/07-31/08-03, permanent and
+   * fleet-wide) put a THREE-SETTLED-SESSION hole in every book: the 2026-08-04
+   * row's predecessor in `days[]` is 2026-07-29, and the pair was graded as if
+   * it were T+1. A "lag" measured across a hole is not the lag the tripwire
+   * names, and — the part that matters — a PASS across that hole is not
+   * evidence the writer was fixed. It is the tripwire's own trigger condition
+   * never having been met, scored as a pass. Same failure class as TRA-2301 /
+   * TRA-2642: a flag with no reachable failing state.
+   *
+   * When this reads `false` the session is excluded from eligibility outright,
+   * because there is no repair to the arithmetic that makes a non-adjacent pair
+   * informative about a T+1 property.
+   */
+  priorSessionAdjacent: boolean | null;
+  /**
    * TRA-2635 (CEO) — the DURABLE equity STATE at this session's close, i.e.
    * `PaperAccount.totalEquity` as the 21:00 ET writer saw it.
    *
@@ -764,6 +793,14 @@ export interface PnlReconcileResult {
    * gradeable cohort. See {@link PnlReconcileDay.priorOptionsLagEligible}.
    */
   priorOptionsLagEligibleDates: string[];
+  /**
+   * TRA-2835 — sessions dropped from the gradeable cohort because their
+   * predecessor row is not the preceding exchange session (see
+   * {@link PnlReconcileDay.priorSessionAdjacent}). Empty when a calendar was
+   * supplied and no gaps exist; also empty when no calendar was supplied, which
+   * is why `priorSessionAdjacent` carries the tri-state and this does not.
+   */
+  priorOptionsLagGapSuppressedDates: string[];
   /**
    * TRA-2635 (CEO) — **did realized option P&L actually reach this book's equity?**
    * TRI-STATE: `true` = yes, some gradeable session shows a non-zero credited
@@ -1651,6 +1688,8 @@ export function reconcilePnl(
         // TRA-2630 AC2 — both are filled in by the second pass below; it needs
         // the PRIOR row. Session 0 has no prior, so it stays ineligible.
         priorOptionsLagEligible: false,
+        // TRA-2835 — null until the pairing pass runs; days[0] has no predecessor.
+        priorSessionAdjacent: null,
         optionsFieldPresent,
         journalCloses,
         journalPartialCloses,
@@ -1697,9 +1736,26 @@ export function reconcilePnl(
   // just as hard as observing some third number. Folding the `stockDaily` guard
   // into eligibility would throw away precisely the sessions that PASS, leaving
   // a cohort of offenders only.
+  // TRA-2835 — the pair must be CALENDAR-adjacent, not merely array-adjacent.
+  // `sessionsInRange(prev, cur)` enumerates the exchange sessions in
+  // `[prev, cur]` inclusive, so exactly 2 means nothing sits between them. Any
+  // other count (a hole, or a `prev` that is not itself a session) is
+  // non-adjacent, and non-adjacent suppresses BOTH the eligibility stamp and
+  // the tripwire — a T+1 property cannot be graded across a gap in either
+  // direction. Without a calendar we cannot PROVE a gap, so the field reads
+  // `null` and behaviour is unchanged: this fix removes false passes it can
+  // demonstrate, and never invents one it cannot.
   for (let i = 1; i < days.length; i++) {
     const cur = days[i]!;
     const prev = days[i - 1]!;
+    const adjacent = tailCalendar
+      ? sessionsInRange(prev.date, cur.date, tailCalendar.isMarketDay).length === 2
+      : null;
+    cur.priorSessionAdjacent = adjacent;
+    if (adjacent === false) {
+      cur.priorOptionsLagEligible = false;
+      continue;
+    }
     cur.priorOptionsLagEligible =
       Math.abs(prev.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD;
     if (Math.abs(cur.stockDaily) <= PNL_RECONCILE_TOLERANCE_USD) continue;
@@ -1889,6 +1945,14 @@ export function reconcilePnl(
   const priorOptionsLagEligibleDates = days
     .filter(d => d.priorOptionsLagEligible)
     .map(d => d.date);
+  // TRA-2835 — sessions that WOULD have been eligible on the old array-adjacent
+  // pairing but are suppressed because their predecessor row is not the
+  // preceding exchange session. Published rather than silently dropped: a
+  // cohort that quietly shrinks is indistinguishable from one that was never
+  // there, and this is exactly the set that would have produced a false PASS.
+  const priorOptionsLagGapSuppressedDates = days
+    .filter(d => d.priorSessionAdjacent === false)
+    .map(d => d.date);
   // TRA-2302 — the false-zero sweep is NOT baseline-gated. The baseline exists
   // because pre-fix code wrote arithmetically un-reconcilable drift; a missing
   // option close is a different defect, and silencing it before 2026-07-12
@@ -2064,6 +2128,7 @@ export function reconcilePnl(
     ),
     priorOptionsLagDates,
     priorOptionsLagEligibleDates,
+    priorOptionsLagGapSuppressedDates,
     // TRA-2630 AC2 — a red book wins outright; otherwise green REQUIRES at least
     // one gradeable session, and an ungradeable book reads NOT MEASURED.
     priorOptionsLagOk:
