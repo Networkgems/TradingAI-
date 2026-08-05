@@ -1836,6 +1836,36 @@ async function generateAndSaveReport(
  *
  * Safe to call repeatedly: `missedTradingDays` only returns days with no
  * report file, so an already-backfilled day is skipped.
+ *
+ * ── TRA-2903: this is a REPORT-FILE healer, never a LEDGER healer ────────────
+ *
+ * Two limits are load-bearing and neither is visible from the call site, so the
+ * `eodInteriorAbsentOk` incident on `enock` was triaged twice against a remedy
+ * that does not exist:
+ *
+ *  1. It passes `asOfDate`, and `generateAndSaveReport` derives
+ *     `backfill = opts.asOfDate != null`. The `ctx.tracker.saveSnapshot(...)`
+ *     block is gated `if (!backfill)` — deliberately, because `saveSnapshot`
+ *     rebases `openingEquity` to the row it just closed, so writing a stale past
+ *     row would corrupt the live daily-P&L baseline. So this fills the dated
+ *     report FILE and never creates the ledger row.
+ *
+ *     ⇒ For the TRA-2817 shape (row booked, file create failed) that is a real
+ *     heal: the row already exists and this supplies the `eodCombined` it reads.
+ *     For an ABSENT session — no row was ever written, because the book had no
+ *     `UserContext` in `getAllUserContexts()` that night — nothing here brings
+ *     the row back, on this boot or any later one. Absence is terminal.
+ *
+ *  2. `missedTradingDays` caps at `maxLookbackDays = 14`. A book that stops
+ *     archiving for longer than a fortnight is out of reach permanently, even
+ *     for the report-file half.
+ *
+ * The two together produce a shape worth expecting rather than re-discovering:
+ * a run of sessions carrying a report file but NO ledger row, bounded to the 14
+ * days before the boot that healed them. The Calendar reads files and shows
+ * those days; `daily-snapshots.json` has nothing, so every ledger axis reads the
+ * book as absent there. Do not treat a populated Calendar as evidence the ledger
+ * recovered.
  */
 /**
  * TRA-2314 — one-shot historical repair of the `optionsDailyPnl` false zero.
