@@ -21,7 +21,7 @@ cannot fail. A reviewer counting rows sees a healthy cohort.
 
 | Route | Verdict | Operand A / last writer | Operand B / last writer | Joined? | Disposition |
 |---|---|---|---|---|---|
-| `pnl-reconciliation` | `optionsLegOk` (`eodOptionsPnl − optionsDaily`) | report-file options leg — **`syncEodReportOptionsLegs`** (TRA-2641) | day-cell `optionsDailyPnl` — journal | **YES** | Tri-stated + `optionsLegMeasuredCount` / `optionsLegSlavedCount` (`602c276`). See coverage note below. |
+| `pnl-reconciliation` | `optionsLegOk` (`eodOptionsPnl − optionsDaily`) | report-file options leg — **`syncEodReportOptionsLegs`** (TRA-2641) | day-cell `optionsDailyPnl` — journal | **YES** | Tri-stated + `optionsLegMeasuredCount` / `optionsLegSlavedCount` (`602c276`); coverage-gated on `optionsLegScope` (TRA-2924). |
 | `demo-book`, `demo-book-public` | `cashInvariant.ok` (`availableCash − expectedCash`) | `PaperAccount.cash` — **`repairDriftedCash()`** | `equity − committedCapital()` — `PaperAccount.equity` | **YES** | **Fixed this ticket** — tri-stated + `repairSlaved`. |
 | `pnl-reconciliation` | `stockLegOk` (`eodStockPnl − stockDaily`) | report `realizedPnl` — EOD report writer, **zeroed** by the TRA-219 21:00 ET archive | snapshot `dailyPnl` — `PaperAccount` equity delta | no | Tri-stated for a *different* reason (lossy operand, TRA-2633). Live `null`, measured 71. |
 | `pnl-reconciliation` | `drift` / `ok` / `maxDriftUsd` | pooled stock leg (lossy) | pooled options leg (durable) | no | **Not gradeable** — pools a lossy leg with a durable one, cannot attribute. Retained for existing consumers only. |
@@ -38,8 +38,9 @@ cannot fail. A reviewer counting rows sees a healthy cohort.
 
 Three pairs are joined by a writer. None is left silently self-confirming:
 
-1. **`optionsLegOk`** — tri-stated with published denominators (`602c276`, TRA-2641). *Residual
-   coverage defect, see below.*
+1. **`optionsLegOk`** — tri-stated with published denominators (`602c276`, TRA-2641), and since
+   TRA-2924 a green additionally requires full coverage (`optionsLegScope === 'fleet'`). Live
+   `partial` ⇒ `null`; see the coverage section below.
 2. **`cashInvariant.ok`** — **fixed in this ticket.** Was a flat boolean; the docstring already
    described the trap in prose (*"a book the one-shot repair fixed and a book that never drifted both
    show `gap: 0`"*) and the verdict never consumed it. Now tri-state + `repairSlaved`.
@@ -80,18 +81,50 @@ degraded to `true`**. `null` said "not measured"; `true` says "passed", and any 
 reading the boolean now consumes a fleet-wide green asserted off **one** row against 207 slaved ones.
 The counts sit right there and a naive reader steps past them.
 
-This is a distinct axis from the join and is **not** closed by this ticket: it needs a coverage rule,
-not an independence fix. Tracked as **TRA-2924**, which also carries the post-deploy live re-measure
-of both this cohort and the `cashInvariant` fix below.
+This is a distinct axis from the join and was **not** closed by this ticket: it needs a coverage rule,
+not an independence fix. **Fixed on TRA-2924** (below); this ticket also handed it the post-deploy
+live re-measure of both this cohort and the `cashInvariant` fix.
 
 It is the **third** failure mode of this family, and the standing rule at the end of this document
-only covers the first two:
+now covers all three:
 
 | # | Shape | Ticket | Covered by the rule? |
 |---|---|---|---|
 | 1 | cohort **empty**, `every` scores green | TRA-2635 | yes — clause 2 |
 | 2 | cohort non-empty but **tautological** | TRA-2671 | yes — clause 1 |
-| 3 | cohort non-empty, non-tautological, but **negligible** | TRA-2924 | **no** |
+| 3 | cohort non-empty, non-tautological, but **negligible** | TRA-2924 | yes — **clause 5** |
+
+### TRA-2924 — the coverage fix
+
+`optionsLegOk` is now gated on `optionsLegScope`, a `'fleet' | 'partial' | 'not-measured'` label
+computed from one identity: **`optionsLegSilencedDates` — evaluated rows carrying a non-zero figure
+on at least one leg that were nonetheless kept out of the denominator — must be EMPTY** for a green.
+No row count and no share threshold appears anywhere in the branch. `partial` reports `null` and
+keeps the residual evidence in `optionsLegCoveredDates`; `optionsLegCoverageShare` is published as
+description only and nothing branches on it. The route-level fold is gated on the same identity, not
+on the per-book labels — a book can be `not-measured` and still be silencing rows, and folding labels
+would let that silence hide behind another book's `fleet`.
+
+**Live verdict, 2026-08-05T23:42Z, build `237c147e`** (all 228 post-baseline rows replayed through
+the new rule):
+
+```
+optionsLegOk            true  ->  null        (the deployed value, and what it becomes)
+optionsLegScope                   partial
+optionsLegMeasuredCount 1         admin 2026-08-04 — the only independently-graded row on the fleet
+optionsLegSilencedDates 85        all 85 journal-slaved; 0 from an absent report leg
+optionsLegCoverageShare           0.0116
+```
+
+Note the honest denominator is **86, not 208**: of the 207 slaved rows, 122 carry 0.00 on both legs
+and could not have disagreed under any writer, so they silence nothing. The gate was claiming the
+fleet off **1.16%** of the rows that had something to say.
+
+**The fleet green is currently unreachable, and that is the finding rather than a defect in the
+gate.** While `syncEodReportOptionsLegs` slaves every journal row, no build can produce an empty
+silenced set. The instrument now says so instead of reporting a green. The independent signal to
+grade in the meantime is the credit axis (`equityAbsorbedOptionsOk` / `uncreditedOptionsUsd`), item
+1 of AC4 below.
 
 ## AC3 — regression controls
 
@@ -100,7 +133,8 @@ template: *a slaved row and an unslaved row with IDENTICAL numbers must grade di
 
 | Pair | Control | Verified to fail on the tautology? |
 |---|---|---|
-| `optionsLegOk` | `pnl-reconciliation.test.ts` — slaved/unslaved rows, measured/slaved counts, RED-outranks-NOT-MEASURED | yes (`602c276`) |
+| `optionsLegOk` (independence) | `pnl-reconciliation.test.ts` — slaved/unslaved rows, measured/slaved counts, RED-outranks-NOT-MEASURED | yes (`602c276`) |
+| `optionsLegOk` (coverage) | `pnl-reconciliation.test.ts` → 6 `TRA-2924` arms — identical drift, identical MEASURED count, coverage the only difference | **yes** — reverting the green branch to `measurable.length === 0 ? null : true` reds 4 of 6 with `expected true to be null` |
 | `cashInvariant.ok` | `health-routes.test.ts` → `TRA-2671 cashInvariant is not self-confirming` (3 arms) | **yes** — reverting `ok` to `Math.abs(cashGap) < 0.01` reds 2 of 3 arms with `expected true to be null` |
 
 The `cashInvariant` control pins all three edges deliberately:
@@ -132,8 +166,9 @@ with its denominator.
    point of the fix.
 
 **Not gradeable, whatever they read:** `drift` / `ok` / `maxDriftUsd` on `pnl-reconciliation`
-(pooled lossy + durable); `stockLegOk` (lossy operand); `optionsLegOk` while
-`optionsLegMeasuredCount` is negligible against `optionsLegSlavedCount`.
+(pooled lossy + durable); `stockLegOk` (lossy operand); `optionsLegOk` whenever `optionsLegScope`
+is not `'fleet'` — which is every build while `syncEodReportOptionsLegs` slaves the journal rows.
+Read the SCOPE, never the bare boolean.
 
 ## The standing rule
 
@@ -152,6 +187,29 @@ Proposed by CFO on this ticket and adopted here, because an inventory decays and
 > **4. When you ship a repair/sync/backfill writer, grep for the gates that read its operands.**
 > Converging two ledgers is the right fix for the data and destroys every instrument comparing them.
 > Fixing the disagreement and reading the gate are the same two ledgers from opposite ends.
+>
+> **5. A verdict may claim the cohort it MEASURED and nothing else** (TRA-2924). Publishing the
+> denominator is not enough — clause 1 shipped on `optionsLegOk` and it still graded a fleet-wide
+> green off 1 row against 207. A green is quotable fleet-wide only when the set of rows that *had
+> something to say and were not asked* is EMPTY. Publish that set; excluding a row for a good reason
+> (joined operands, absent operand) is still excluding it. Otherwise the verdict is `partial`, which
+> reads as `null`, and the rows that did pass are named separately so the finding survives.
+>
+> **The coverage rule takes no constant.** Not a minimum cohort size, not a share threshold. A
+> constant decays exactly the way a dollar-denominated board card does: it needs re-tuning every time
+> the fleet changes shape, and re-tuning is how a threshold quietly stops binding. The branch is
+> `silenced.length === 0`, which holds identically at n=1 and at n=200. Publish a share if you like
+> — as a *description*, with nothing branching on it.
+>
+> Corollary: **a rows-with-substance test, not a rows-excluded test.** A row that scores 0.00 on both
+> legs could not have disagreed under any writer, so excluding it costs no coverage. Without that
+> qualifier the scope reads `partial` on any book with a quiet day and the green becomes unreachable
+> — a gate with no green state grades nothing, which is the dead end TRA-2630 found on `ok`.
+>
+> Corollary: **apply the rule at every level the verdict is folded at.** The live 2026-08-05 read did
+> not come out of the per-book gate at all; it came out of `engines.some(e => e.optionsLegOk === true)`
+> in the route, which let one book speak for 62. A coverage rule enforced one level down is not
+> enforced.
 
 ### Reviewer checklist for a new comparison gate
 

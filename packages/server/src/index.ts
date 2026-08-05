@@ -4705,9 +4705,16 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // now `boolean | null` it coerces NOT-MEASURED to `false`. Same precedence
       // as the two folds above — a red book wins, one genuinely-measured green is
       // required to claim green, all-null stays null.
+      // TRA-2924 — the fold needs the COVERAGE rule too, and this is the level it
+      // actually shipped broken at: `some(=== true)` let ONE book's green speak
+      // for the whole fleet while every other book was `null`. That is the same
+      // 1-vs-207 shape one aggregation up, and the live 2026-08-05 read came out
+      // of exactly this expression. A red book still wins outright; a fleet green
+      // now requires at least one measured book AND no book with a silenced row.
       optionsLegOk: engines.some(e => e.optionsLegOk === false)
         ? false
         : engines.some(e => e.optionsLegOk === true)
+          && engines.every(e => e.optionsLegSilencedDates.length === 0)
           ? true
           : null,
       // The DENOMINATORS, published beside the verdict. `optionsLegMeasuredCount:
@@ -4717,6 +4724,28 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // 0 measured / 147 slaved over 167 post-baseline rows.
       optionsLegMeasuredCount: engines.reduce((n, e) => n + e.optionsLegMeasuredCount, 0),
       optionsLegSlavedCount: engines.reduce((n, e) => n + e.optionsLegSlavedCount, 0),
+      // TRA-2924 — the coverage triple, firm-wide. `optionsLegScope` is the field
+      // an acceptance criterion reads instead of the bare boolean; it degrades to
+      // the WEAKEST scope present, because a fleet claim is only as wide as its
+      // thinnest constituent. `optionsLegSilencedCount` is the count of evaluated
+      // rows across all books that had a non-zero leg and were excluded anyway.
+      // Computed from the SAME identity the per-book scope uses, not folded from
+      // the per-book labels: a book can be `not-measured` and still be silencing
+      // rows, and folding labels would let that book's silence disappear behind
+      // another book's `fleet`. Scope and the boolean must never disagree.
+      optionsLegScope: (() => {
+        const measured = engines.reduce((n, e) => n + e.optionsLegMeasuredCount, 0);
+        const silenced = engines.reduce((n, e) => n + e.optionsLegSilencedDates.length, 0);
+        return measured === 0 ? 'not-measured' : silenced === 0 ? 'fleet' : 'partial';
+      })(),
+      optionsLegSilencedCount: engines.reduce((n, e) => n + e.optionsLegSilencedDates.length, 0),
+      // Descriptive only — NOT the gate, and nothing branches on it. See the
+      // field docs on `PnlReconcileResult.optionsLegCoverageShare`.
+      optionsLegCoverageShare: (() => {
+        const measured = engines.reduce((n, e) => n + e.optionsLegMeasuredCount, 0);
+        const silenced = engines.reduce((n, e) => n + e.optionsLegSilencedDates.length, 0);
+        return measured + silenced === 0 ? null : Math.round((measured / (measured + silenced)) * 10000) / 10000;
+      })(),
       maxOptionsLegDriftUsd: engines.reduce((m, e) => Math.max(m, e.maxOptionsLegDriftUsd), 0),
       // TRA-2630 AC3 / TRA-2629 — the T+1 credit-lag tripwire, firm-wide.
       //

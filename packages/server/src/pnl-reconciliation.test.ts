@@ -464,6 +464,202 @@ describe('reconcilePnl', () => {
       expect(r.optionsLegOk).toBeNull();
     });
 
+    // -------------------------------------------------------------------------
+    // TRA-2924 — the COVERAGE axis. 602c276 published the denominator and the
+    // gate STILL graded a fleet-wide green off it: live 2026-08-05 (build
+    // 237c147e) read `optionsLegOk: true` on 1 measured row against 207 slaved.
+    // These controls are built to the 602c276 template — identical numbers,
+    // identical verdict under the old code, must grade differently now.
+    // -------------------------------------------------------------------------
+    it('TRA-2924 AC2 — MUTATION: identical drift, identical MEASURED count, different COVERAGE ⇒ different verdicts', () => {
+      // The discriminator, and it is deliberately sharper than "different share".
+      // Both arms measure EXACTLY ONE row, that row is byte-identical, every
+      // drift is 0 and neither arm has an offender. The only difference is
+      // whether other rows that had something to say were excluded. If the fix
+      // were keyed on the denominator (which 602c276 already published) both
+      // arms would grade the same — which is precisely how the live `true` got
+      // asserted off n=1.
+      const measuredRow = { ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' as const };
+
+      // ARM A — that row is the WHOLE cohort. Nothing was silenced.
+      const a = reconcilePnl(
+        [measuredRow],
+        new Map([['2026-07-29', 250.01]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01]]),
+        new Map([['2026-07-29', 0]]),
+      );
+
+      // ARM B — the SAME row plus three journal-slaved rows carrying real
+      // figures. Their operands are joined, so they are excluded from the
+      // denominator (TRA-2641, correctly) — but they had something to say and
+      // were never asked. This is the live shape at 1-vs-207, scaled down.
+      const b = reconcilePnl(
+        [
+          measuredRow,
+          { ...snap('2026-07-27', 0, 140), optionsDailyPnlSource: 'journal-repair' as const },
+          { ...snap('2026-07-28', 0, 114), optionsDailyPnlSource: 'journal' as const },
+          { ...snap('2026-07-30', 0, 33.5), optionsDailyPnlSource: 'journal-repair' as const },
+        ],
+        new Map([
+          ['2026-07-27', 140], ['2026-07-28', 114], ['2026-07-29', 250.01], ['2026-07-30', 33.5],
+        ]),
+        '2026-07-12',
+        null,
+        new Map([
+          ['2026-07-27', 140], ['2026-07-28', 114], ['2026-07-29', 250.01], ['2026-07-30', 33.5],
+        ]),
+        new Map([
+          ['2026-07-27', 0], ['2026-07-28', 0], ['2026-07-29', 0], ['2026-07-30', 0],
+        ]),
+      );
+
+      // The arithmetic is provably identical on both arms — the verdicts cannot
+      // be resting on a number that differs.
+      expect(a.maxOptionsLegDriftUsd).toBe(0);
+      expect(b.maxOptionsLegDriftUsd).toBe(0);
+      expect(a.optionsLegOffendingDates).toEqual([]);
+      expect(b.optionsLegOffendingDates).toEqual([]);
+      // ...and so is the DENOMINATOR 602c276 shipped. One row measured, both arms.
+      expect(a.optionsLegMeasuredCount).toBe(1);
+      expect(b.optionsLegMeasuredCount).toBe(1);
+      expect(a.optionsLegCoveredDates).toEqual(['2026-07-29']);
+      expect(b.optionsLegCoveredDates).toEqual(['2026-07-29']);
+
+      // THE SEPARATION. Under the pre-TRA-2924 code both of these were `true`.
+      expect(a.optionsLegScope).toBe('fleet');
+      expect(a.optionsLegOk).toBe(true);
+      expect(a.optionsLegSilencedDates).toEqual([]);
+
+      expect(b.optionsLegScope).toBe('partial');
+      expect(b.optionsLegOk).toBeNull();
+      expect(b.optionsLegSilencedDates).toEqual(['2026-07-27', '2026-07-28', '2026-07-30']);
+      // Descriptive only — nothing branches on it, but it must report the thinness.
+      expect(b.optionsLegCoverageShare).toBe(0.25);
+      expect(a.optionsLegCoverageShare).toBe(1);
+    });
+
+    it('TRA-2924 — the LIVE 1-vs-207 shape: a lone independent row cannot speak for a slaved fleet', () => {
+      // The exact degradation the ticket was filed on, at n=1 measured against a
+      // slaved majority. On 07-30 this read `null` (nothing independent existed);
+      // one independent row appeared and it flipped to `true`. The green must not
+      // be purchasable that cheaply.
+      const days = [
+        { ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' as const },
+        ...Array.from({ length: 20 }, (_, i) => ({
+          ...snap(`2026-08-${String(i + 1).padStart(2, '0')}`, 0, 12.5),
+          optionsDailyPnlSource: 'journal' as const,
+        })),
+      ];
+      const eod = new Map(days.map(d => [d.date, d.optionsDailyPnl ?? 0]));
+      const r = reconcilePnl(
+        days, eod, '2026-07-12', null, eod,
+        new Map(days.map(d => [d.date, 0])),
+      );
+      expect(r.optionsLegMeasuredCount).toBe(1);
+      expect(r.optionsLegSlavedCount).toBe(20);
+      expect(r.optionsLegSilencedDates).toHaveLength(20);
+      expect(r.optionsLegScope).toBe('partial');
+      expect(r.optionsLegOk).toBeNull();
+      // `null` suppresses the CLAIM, never the finding: the row that DID have
+      // independent operands and DID agree is still named.
+      expect(r.optionsLegCoveredDates).toEqual(['2026-07-29']);
+    });
+
+    it('TRA-2924 — RED still outranks a PARTIAL scope: a thin cohort never hides a live defect', () => {
+      // The `null` branch is now reachable two ways, so it is twice as attractive
+      // a hiding place. A disagreeing row wins over both of them.
+      const r = reconcilePnl(
+        [
+          { ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' as const },
+          { ...snap('2026-07-17', 0, 0), optionsDailyPnlSource: 'journal-repair' as const },
+        ],
+        new Map([['2026-07-29', 250.01], ['2026-07-17', 217.5]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01], ['2026-07-17', 217.5]]),
+        new Map([['2026-07-29', 0], ['2026-07-17', 0]]),
+      );
+      expect(r.optionsLegScope).toBe('partial'); // coverage is still thin...
+      expect(r.optionsLegOk).toBe(false);        // ...and the verdict is still RED
+      expect(r.optionsLegOffendingDates).toEqual(['2026-07-17']);
+    });
+
+    it('TRA-2924 — a VACUOUS excluded row silences nothing, so the fleet green survives', () => {
+      // The rule must key on rows that HAD SOMETHING TO SAY, not on every row it
+      // failed to measure. A slaved row carrying 0.00 on both legs could not have
+      // disagreed under any writer, so excluding it costs the verdict no
+      // coverage. Without this the scope would read `partial` forever on any book
+      // with a quiet day, and a gate that can never be green grades nothing —
+      // the same dead state TRA-2630 found on `ok`.
+      const r = reconcilePnl(
+        [
+          { ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' as const },
+          { ...snap('2026-07-13', 0, 0), optionsDailyPnlSource: 'journal' as const },
+        ],
+        new Map([['2026-07-29', 250.01], ['2026-07-13', 0]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01], ['2026-07-13', 0]]),
+        new Map([['2026-07-29', 0], ['2026-07-13', 0]]),
+      );
+      expect(r.optionsLegSlavedCount).toBe(1);   // it WAS excluded...
+      expect(r.optionsLegSilencedDates).toEqual([]); // ...and it had nothing to say
+      expect(r.optionsLegScope).toBe('fleet');
+      expect(r.optionsLegOk).toBe(true);
+    });
+
+    it('TRA-2924 — an ABSENT report leg over a non-zero day cell is SILENCED, not vacuous', () => {
+      // The TRA-2637 absent-row hazard, seen from the coverage side. The row is
+      // forced to drift 0 because `eodOptionsPnl` is null, so it contributes no
+      // offender and drops out of the denominator — but the journal booked
+      // $140.00 that day and the report never answered. That is an unasked
+      // question, not a quiet day.
+      const r = reconcilePnl(
+        [
+          { ...snap('2026-07-29', 0, 250.01), optionsDailyPnlSource: 'bucket-journal-silent' as const },
+          { ...snap('2026-07-27', 0, 140), optionsDailyPnlSource: 'bucket-journal-silent' as const },
+        ],
+        new Map([['2026-07-29', 250.01]]),
+        '2026-07-12',
+        null,
+        new Map([['2026-07-29', 250.01]]), // 07-27 has NO report options leg
+        new Map([['2026-07-29', 0]]),
+      );
+      expect(r.days.find(d => d.date === '2026-07-27')).toMatchObject({
+        eodOptionsPnl: null,
+        optionsLegDrift: 0,
+      });
+      expect(r.optionsLegSilencedDates).toEqual(['2026-07-27']);
+      expect(r.optionsLegScope).toBe('partial');
+      expect(r.optionsLegOk).toBeNull();
+    });
+
+    it('TRA-2924 — the coverage rule holds no constant: 200 measured with ONE silenced row is still partial', () => {
+      // The anti-threshold control. A minimum-cohort-size rule ("n >= 20") or a
+      // share rule ("share >= 0.9") would pass this at 200-vs-1 and would have to
+      // be re-tuned every time the fleet changes shape. The identity does not
+      // move: one unasked row means the verdict does not cover the cohort.
+      const dayAfterBaseline = (i: number) =>
+        new Date(Date.UTC(2026, 6, 13 + i)).toISOString().slice(0, 10);
+      const measured = Array.from({ length: 200 }, (_, i) => ({
+        ...snap(dayAfterBaseline(i), 0, 10),
+        optionsDailyPnlSource: 'bucket-journal-silent' as const,
+      }));
+      const days = [
+        ...measured,
+        { ...snap(dayAfterBaseline(500), 0, 99), optionsDailyPnlSource: 'journal' as const },
+      ];
+      const eod = new Map(days.map(d => [d.date, d.optionsDailyPnl ?? 0]));
+      const r = reconcilePnl(days, eod, '2026-07-12', null, eod, new Map(days.map(d => [d.date, 0])));
+      expect(r.optionsLegMeasuredCount).toBe(200);
+      expect(r.optionsLegSilencedDates).toEqual([dayAfterBaseline(500)]);
+      expect(r.optionsLegCoverageShare).toBe(0.995);
+      expect(r.optionsLegScope).toBe('partial');
+      expect(r.optionsLegOk).toBeNull();
+    });
+
     it('TRA-2633 — a row with stockDaily 0 is NOT evidence, so it cannot vacuously pass', () => {
       // The exact shape that made C5 of TRA-2625 read green off two books: both
       // legs are 0, so they "agree" no matter how broken the source is. This is

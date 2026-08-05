@@ -130,7 +130,7 @@ export const PNL_LEG_COVERAGE_NOTE =
  * lives) but never as a VERDICT.
  */
 export const PNL_DRIFT_DECOMPOSITION_NOTE =
-  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2641 CORRECTION — this note previously said to grade `optionsLegOk` only; that is now WRONG and is retracted. NEITHER leg is a gradeable reconciliation verdict. `stockLegOk` inherits the same lossy source `drift` does. And `optionsLegOk` became SELF-CONFIRMING: TRA-2641\'s `syncEodReportOptionsLegs` writes the day cell\'s `optionsDailyPnl` into the report file\'s options leg on every `journal`/`journal-repair` row, so `optionsLegDrift` = `eodOptionsPnl` - `optionsDaily` compares one source against a copy of itself. Live 2026-07-30, build 239f2b5: 147/167 post-baseline rows are journal-slaved (0 with non-zero drift) and the other 20 carry 0.00 on BOTH legs, so 0 of 167 rows can produce a non-zero drift. The false->true flip across that deploy (max 217.50 -> 0.00) reads as "fixed" but is the operands losing independence. BOTH legs are now TRI-STATE with `null` = NOT MEASURED; read `optionsLegMeasuredCount` / `optionsLegSlavedCount` for the denominator, and never read a `null` as green. The INDEPENDENT signal to grade instead is the CREDIT axis — `equityAbsorbedOptionsOk` / `uncreditedOptionsUsd` — whose operands are the journal and the equity ledger, which no writer joins. Verdict order on both legs is RED > NOT MEASURED > GREEN: a slaved row that still disagrees means the sync writer failed, and that red is never masked.';
+  'TRA-2630: `drift` pools a LOSSY stock leg (EOD `realizedPnl`, cleared by the TRA-219 21:00 ET archive) against a DURABLE one (snapshot `dailyPnl`, an equity delta), so it cannot attribute a mismatch. `drift`, `ok` and `maxDriftUsd` are retained unchanged for existing consumers but are NOT gradeable. TRA-2641 CORRECTION — this note previously said to grade `optionsLegOk` only; that is now WRONG and is retracted. NEITHER leg is a gradeable reconciliation verdict. `stockLegOk` inherits the same lossy source `drift` does. And `optionsLegOk` became SELF-CONFIRMING: TRA-2641\'s `syncEodReportOptionsLegs` writes the day cell\'s `optionsDailyPnl` into the report file\'s options leg on every `journal`/`journal-repair` row, so `optionsLegDrift` = `eodOptionsPnl` - `optionsDaily` compares one source against a copy of itself. Live 2026-07-30, build 239f2b5: 147/167 post-baseline rows are journal-slaved (0 with non-zero drift) and the other 20 carry 0.00 on BOTH legs, so 0 of 167 rows can produce a non-zero drift. The false->true flip across that deploy (max 217.50 -> 0.00) reads as "fixed" but is the operands losing independence. BOTH legs are now TRI-STATE with `null` = NOT MEASURED; read `optionsLegMeasuredCount` / `optionsLegSlavedCount` for the denominator, and never read a `null` as green. The INDEPENDENT signal to grade instead is the CREDIT axis — `equityAbsorbedOptionsOk` / `uncreditedOptionsUsd` — whose operands are the journal and the equity ledger, which no writer joins. Verdict order on both legs is RED > NOT MEASURED > GREEN: a slaved row that still disagrees means the sync writer failed, and that red is never masked. TRA-2924 COVERAGE — publishing the denominator was not enough: on 2026-08-05 (build 237c147e) the live cohort was 1 measured against 207 slaved and `optionsLegOk` had DEGRADED from `null` to `true`, a fleet-wide green asserted off 0.5% of the rows that had something to say. A green now additionally requires `optionsLegScope === \'fleet\'`, i.e. `optionsLegSilencedDates` (evaluated rows with a non-zero leg that were excluded from the denominator) is EMPTY. That is an identity, not a minimum cohort size or a share threshold - a constant would decay the way a dollar-denominated one does. `partial` reports `null` and keeps the residual evidence in `optionsLegCoveredDates`; `optionsLegCoverageShare` is descriptive only and nothing branches on it. While `syncEodReportOptionsLegs` slaves every journal row the fleet green is UNREACHABLE by construction, and that is the finding rather than a bug in the gate: grade the CREDIT axis instead.';
 
 export const PNL_ABSENT_EOD_ROW_NOTE =
   'TRA-2637: an ABSENT EOD row is NOT a pass. `drift` is now `null` (was 0) on any session whose `eodCombined` is null, and the absence is graded on its own axis — per-row `eodRowMissing`, per-book `eodRowsPresentOk` / `eodRowMissingDates` / `eodRowGradeableCount`, fleet-level `liveEodRowsPresentOk` / `liveEodRowMissingBooks`. Live proof: `admin` 2026-07-29 served `drift: 0` with `eodCombined: null` over 6 journal closes worth +$250.01. The presence verdicts are TRI-STATE; `null` = NOT MEASURED (empty cohort) and must never be read as green.';
@@ -611,6 +611,16 @@ export interface PnlReconcileDay {
   belowBaseline: boolean;
 }
 
+/**
+ * TRA-2924 — how far an options-leg verdict may be quoted. A boolean cannot
+ * carry its own coverage, so the coverage travels beside it as a label rather
+ * than as a row count a reader has to interpret.
+ *
+ * See {@link PnlReconcileResult.optionsLegScope} for the branch definitions and
+ * `docs/self-confirming-health-gates-TRA-2671.md` clause 5 for the standing rule.
+ */
+export type PnlOptionsLegScope = 'fleet' | 'partial' | 'not-measured';
+
 export interface PnlReconcileResult {
   ok: boolean;
   days: PnlReconcileDay[];
@@ -775,9 +785,13 @@ export interface PnlReconcileResult {
    *             journal-slaved row that still disagrees means
    *             `syncEodReportOptionsLegs` failed to write, which is a real
    *             defect in the writer.
-   *   `null`  — NOT MEASURED. No offender AND no row whose two operands are
-   *             INDEPENDENT and non-zero, so a green here would grade nothing.
-   *   `true`  — no offender over a non-empty independent cohort.
+   *   `null`  — NOT MEASURED **as a fleet verdict**. No offender AND either no
+   *             independent non-zero row at all, or (TRA-2924) an independent
+   *             cohort that does not COVER the rows which had something to say.
+   *             Read {@link PnlReconcileResult.optionsLegScope} to tell the two
+   *             apart, and `optionsLegCoveredDates` for what did pass.
+   *   `true`  — no offender, and `optionsLegScope === 'fleet'`: every row with a
+   *             non-zero leg was measured. Nothing was silently excluded.
    *
    * Why the independence test is needed at all: TRA-2641 writes the day cell's
    * `optionsDailyPnl` into the report file's options leg for every `journal` /
@@ -803,6 +817,48 @@ export interface PnlReconcileResult {
    * empty one reads as "the operands are joined" rather than "no data".
    */
   optionsLegSlavedCount: number;
+  /**
+   * TRA-2924 — the SCOPE the verdict above may be quoted at. This is the field
+   * an acceptance criterion should read; the bare boolean cannot carry its own
+   * coverage.
+   *
+   *   `'fleet'`        — every evaluated row with a non-zero leg was measured.
+   *                      `optionsLegOk` covers the whole cohort.
+   *   `'partial'`      — the cohort is non-empty and non-tautological, but rows
+   *                      that could have disagreed were excluded (joined
+   *                      operands, or an absent report leg). `optionsLegOk` is
+   *                      `null`; what passed is in `optionsLegCoveredDates`.
+   *   `'not-measured'` — no independent non-zero row at all (TRA-2641 shape).
+   *
+   * There is deliberately no minimum row count and no share threshold anywhere
+   * in this: the branch is `optionsLegSilencedDates.length === 0`. A constant
+   * would need re-tuning as the fleet changes shape, and re-tuning is how a
+   * threshold quietly stops binding.
+   */
+  optionsLegScope: PnlOptionsLegScope;
+  /**
+   * TRA-2924 — evaluated rows that had something to say (a non-zero figure on at
+   * least one leg) and were nonetheless kept OUT of
+   * {@link PnlReconcileResult.optionsLegMeasuredCount}. Non-empty is exactly
+   * what demotes a green to `partial`. Published as a SET, not a count: a count
+   * invites a threshold, and the identity being asserted is emptiness.
+   */
+  optionsLegSilencedDates: string[];
+  /**
+   * TRA-2924 — the rows the verdict actually covers. On a `partial` scope this
+   * is the residual evidence: `optionsLegOk` is `null`, but these dates did have
+   * independent operands and did agree. Suppressing the CLAIM must not suppress
+   * the finding.
+   */
+  optionsLegCoveredDates: string[];
+  /**
+   * TRA-2924 — `measured / (measured + silenced)`, rounded to 4 dp; `null` when
+   * that denominator is 0. DESCRIPTIVE ONLY — published so a reader can see how
+   * thin a `partial` is at a glance. It is **not** the gate and nothing branches
+   * on it; the gate is `optionsLegSilencedDates` being empty. Do not write an
+   * acceptance criterion against a share constant.
+   */
+  optionsLegCoverageShare: number | null;
   /** TRA-2630 — dates whose |`optionsLegDrift`| exceeds the tolerance (evaluated days only). */
   optionsLegOffendingDates: string[];
   /** TRA-2630 — max |`optionsLegDrift`| over evaluated days, USD. */
@@ -2009,20 +2065,63 @@ export function reconcilePnl(
   //   3. at least one leg is non-zero — 0.00 vs 0.00 is the same vacuous pass
   //      that made `stockLegOk` unfalsifiable.
   const optionsLegSlavedDays = evaluated.filter(d => isJournalAuthoritativeSource(d.optionsDailyPnlSource));
+  // A row HAS SUBSTANCE when at least one of its two legs is non-zero, i.e. a
+  // disagreement was arithmetically possible on it. `eodOptionsPnl == null` is an
+  // ABSENT report leg, which is forced to drift 0 above — that row still has
+  // substance whenever the day cell is non-zero, because the journal said
+  // something and the report did not answer.
+  const optionsLegRowHasSubstance = (d: PnlReconcileDay): boolean =>
+    (d.eodOptionsPnl ?? 0) !== 0 || d.optionsDaily !== 0;
   const optionsLegMeasurableDays = evaluated.filter(
     d =>
       d.eodOptionsPnl != null
       && !isJournalAuthoritativeSource(d.optionsDailyPnlSource)
-      && (d.eodOptionsPnl !== 0 || d.optionsDaily !== 0),
+      && optionsLegRowHasSubstance(d),
   );
+  // TRA-2924 — the COVERAGE axis. TRA-2641 fixed independence: a slaved row is
+  // no longer counted as evidence. What it did not fix is that the verdict kept
+  // claiming the WHOLE cohort off whatever survived the exclusion. Live
+  // 2026-08-05, build 237c147e: 1 measured against 207 slaved, and the gate read
+  // `true` — a fleet-wide green asserted off 0.5% of the rows that had something
+  // to say. `null` on 07-30 was the honest read; it DEGRADED into `true` purely
+  // because one independent row appeared.
+  //
+  // The rule is deliberately NOT a minimum cohort size. A constant ("at least 20
+  // rows", "at least 30%") decays exactly the way a dollar-denominated threshold
+  // does and would have to be re-tuned every time the fleet changes shape. The
+  // rule is an IDENTITY: a verdict may claim the cohort it MEASURED and nothing
+  // else, so a fleet-wide green requires that no row with something to say was
+  // excluded. `optionsLegSilencedDates` is that set — rows that carried a real
+  // figure on at least one leg and were nonetheless kept out of the denominator,
+  // because a writer joined their operands or the report leg is absent.
+  //
+  // Empty silenced set ⇒ the measured cohort IS the cohort; the green covers
+  // everything and `fleet` is the truthful scope. Non-empty ⇒ `partial`: rows
+  // that could have falsified this verdict were never asked, however many rows
+  // did answer. Note this holds at n=1 AND at n=200 — it is share-free.
+  const optionsLegMeasurableDates = new Set(optionsLegMeasurableDays.map(d => d.date));
+  const optionsLegSilencedDates = evaluated
+    .filter(d => !optionsLegMeasurableDates.has(d.date) && optionsLegRowHasSubstance(d))
+    .map(d => d.date);
+  const optionsLegCoveredDates = optionsLegMeasurableDays.map(d => d.date);
+  const optionsLegScope: PnlOptionsLegScope =
+    optionsLegMeasurableDays.length === 0
+      ? 'not-measured'
+      : optionsLegSilencedDates.length === 0
+        ? 'fleet'
+        : 'partial';
   // RED outranks NOT MEASURED: a slaved row that still disagrees means the sync
   // writer failed, and that is a genuine defect the `null` must never swallow.
+  // TRA-2924 — the GREEN branch now additionally requires `scope === 'fleet'`.
+  // A `partial` cohort reports `null`: the evidence is not discarded (it is in
+  // `optionsLegCoveredDates`, `optionsLegOffendingDates` and
+  // `maxOptionsLegDriftUsd`), only the fleet-wide CLAIM is withheld.
   const optionsLegOk: boolean | null =
     optionsLegOffendingDates.length > 0
       ? false
-      : optionsLegMeasurableDays.length === 0
-        ? null
-        : true;
+      : optionsLegScope === 'fleet'
+        ? true
+        : null;
   const priorOptionsLagDates = days.filter(d => d.lagsPriorOptionsDaily).map(d => d.date);
   const priorOptionsLagEligibleDates = days
     .filter(d => d.priorOptionsLagEligible)
@@ -2228,6 +2327,17 @@ export function reconcilePnl(
     optionsLegOk,
     optionsLegMeasuredCount: optionsLegMeasurableDays.length,
     optionsLegSlavedCount: optionsLegSlavedDays.length,
+    optionsLegScope,
+    optionsLegSilencedDates,
+    optionsLegCoveredDates,
+    optionsLegCoverageShare:
+      optionsLegMeasurableDays.length + optionsLegSilencedDates.length === 0
+        ? null
+        : Math.round(
+            (optionsLegMeasurableDays.length
+              / (optionsLegMeasurableDays.length + optionsLegSilencedDates.length))
+              * 10000,
+          ) / 10000,
     optionsLegOffendingDates,
     maxOptionsLegDriftUsd: round2(
       evaluated.reduce((m, d) => Math.max(m, Math.abs(d.optionsLegDrift)), 0),
