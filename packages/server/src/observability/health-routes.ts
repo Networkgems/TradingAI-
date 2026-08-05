@@ -3248,15 +3248,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
     const armed = isChurnLossBrakeEnabled(env);
     const cap = resolveSameSessionOpenCap(env);
+    const build = resolveBuildInfo();
     res.json({
       ok: true,
       time: new Date(now()).toISOString(),
-      build: resolveBuildInfo(),
+      build,
       flag: CHURN_LOSS_BRAKE_FLAG,
       armed,
       cap,
       demoOnly: true,
       liveCapitalReachable: false,
+      // TRA-2813 — every counter below is in-memory and resets to ZERO at
+      // `countersSince` (each reboot/deploy), while the /api/health/conviction-dca
+      // guard counters are DURABLE across reboots. Cross-checking the two is only
+      // valid for halts at/after `countersSince`; across a reboot the durable side
+      // retains halts these counters have dropped — and one leg can still match
+      // exactly by composition (all of that leg's halts post-boot) while the other
+      // diverges, so a partial match is not evidence of a shared window.
+      counterWindow: 'since_boot',
+      countersSince: build.startedAt,
       note: armed
         ? `ARMED (demo-only): rejects the ${cap + 1}th same-session open per name and halts a conviction-DCA add into a same-day net-negative name; live path unchanged.`
         : `DISARMED: set ${CHURN_LOSS_BRAKE_FLAG}=1 (render.yaml env or DATA_DIR/demo-flags.json) to arm on the demo book.`,

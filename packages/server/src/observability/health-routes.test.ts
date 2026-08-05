@@ -1581,6 +1581,8 @@ describe('TRA-1481 churn-brake health route', () => {
       liveCapitalReachable: boolean;
       opensRejected: number;
       dcaAddsHalted: number;
+      counterWindow: string;
+      countersSince: string | null;
     };
     expect(body.ok).toBe(true);
     expect(body.flag).toBe('ENABLE_CHURN_LOSS_BRAKE');
@@ -1590,6 +1592,11 @@ describe('TRA-1481 churn-brake health route', () => {
     expect(body.liveCapitalReachable).toBe(false);
     expect(body.opensRejected).toBe(0);
     expect(body.dcaAddsHalted).toBe(0);
+    // TRA-2813 — the payload must state its own persistence contract: these counters
+    // reset at boot, unlike the durable conviction-dca guard counters. A reader
+    // cross-checking the two endpoints needs the window boundary ON the payload.
+    expect(body.counterWindow).toBe('since_boot');
+    expect(typeof body.countersSince).toBe('string');
   });
 
   it('reports armed + cap from env and folds the ledger counters', () => {
