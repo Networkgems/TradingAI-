@@ -1861,7 +1861,16 @@ describe('TRA-2630 AC1 — summarizeDriftGradeability', () => {
     const r = summarizeDriftGradeability();
     // `drift` is the per-row operand; omitting it would leave a consumer free to
     // grade `engines[i].days[j].drift` directly, which is the ORIGINAL defect.
-    expect(r.ungradeableFields).toEqual(['ok', 'maxDriftUsd', 'engines[].drift']);
+    // TRA-2943 added `eodInteriorAbsentOk` — retained for existing consumers but
+    // PINNED FALSE by an adjudicated absence, so a gate keying on this list now
+    // fails closed on it too. `liveEodInteriorAbsentOk` is deliberately NOT here.
+    expect(r.ungradeableFields).toEqual([
+      'ok',
+      'maxDriftUsd',
+      'engines[].drift',
+      'eodInteriorAbsentOk',
+    ]);
+    expect(r.ungradeableFields).not.toContain('liveEodInteriorAbsentOk');
   });
 
   it('emits the disclaimer machine-readably, not only as prose', () => {

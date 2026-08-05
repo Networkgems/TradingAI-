@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   EOD_DOCUMENTED_GAP,
   EOD_DOCUMENTED_GAP_DATES,
+  EOD_INTERIOR_ABSENT_OK_RETIREMENT,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
+  PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   detectEodInteriorAbsence,
   sessionsInRange,
   summarizeEodInteriorAbsence,
@@ -298,5 +300,122 @@ describe('AC1 — the gap is recorded permanently and surfaces where the ledger 
   it('does NOT claim the provenance ceiling is discharged', () => {
     expect(PNL_EOD_DOCUMENTED_GAP_NOTE).toContain('journal-repair');
     expect(PNL_EOD_DOCUMENTED_GAP_NOTE).toContain('does NOT discharge');
+  });
+
+  it('no longer points a grader at the boolean TRA-2943 retired', () => {
+    // The TRA-2888 replacement pointer named `eodInteriorAbsentOk`. That pointer
+    // is now stale in the one way that matters: it sends a grader to a field
+    // pinned false. Both the structured `why` and the prose note must name the
+    // ARRAY. This is the "a routed repair instruction can be stale" shape.
+    const retired = EOD_DOCUMENTED_GAP.retiredAcceptanceLines.find(r => r.ticket === 'TRA-2829');
+    expect(retired?.why).toContain('eodInteriorAbsentBooks');
+    expect(retired?.why).toContain('TRA-2943');
+    expect(PNL_EOD_DOCUMENTED_GAP_NOTE).toContain('`eodInteriorAbsentBooks`');
+    expect(PNL_EOD_DOCUMENTED_GAP_NOTE).not.toContain('Grade `eodInteriorAbsentOk` instead');
+  });
+});
+
+// TRA-2943 (CFO ruling, adjudicating TRA-2942) — disposition C: accept the
+// standing red, record the retirement IN BAND beside the field, and record the
+// incident as an IDENTITY rather than as the clamped date list.
+describe('TRA-2943 — the in-band retirement of eodInteriorAbsentOk', () => {
+  const book = (username: string, mode: string, rows: string[]) => ({
+    username,
+    mode,
+    interior: detectEodInteriorAbsence(rows, calendar, '2026-07-12'),
+  });
+
+  it('publishes the retirement beside the field, not only in a ticket', () => {
+    // The failure this exists to prevent: a reader six weeks out pulls the route,
+    // sees `eodInteriorAbsentOk: false`, and reads a dead pin as a live signal.
+    const published = summarizeEodInteriorAbsence([]);
+    expect(published.eodInteriorAbsentOkRetirement.field).toBe('eodInteriorAbsentOk');
+    expect(published.eodInteriorAbsentOkRetirement.ticket).toBe('TRA-2943');
+    expect(published.eodInteriorAbsentOkRetirement.state).toContain('PINNED FALSE');
+    expect(PNL_RECONCILIATION_CAVEATS).toContain(PNL_EOD_INTERIOR_RETIREMENT_NOTE);
+  });
+
+  it('names the ARRAY as the discriminator, and rules out a count as well', () => {
+    // The ruling is explicit that a count is exactly as dead as the boolean once
+    // one book permanently occupies slot one, so "publish a count instead" is not
+    // an escape hatch and must not read as one.
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.discriminatorOfRecord)
+      .toContain('eodInteriorAbsentBooks');
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.discriminatorOfRecord).toContain('SET OF USERNAMES');
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.discriminatorOfRecord).toContain('not a count');
+    expect(PNL_EOD_INTERIOR_RETIREMENT_NOTE).toContain('COUNT');
+  });
+
+  it('scopes the retirement to the FLEET fold and leaves the live axis gradeable', () => {
+    // Over-reading the retirement would retire a field that still discriminates:
+    // `enock` is demo, so the live cohort is a different cohort with a reachable
+    // red — and it is green today, which is the whole reason this closes under
+    // owner authority.
+    const s = summarizeEodInteriorAbsence([
+      book('admin', 'live', PARTICIPANT_ROWS),
+      book('enock', 'demo', ['2026-05-04', ...PARTICIPANT_ROWS]),
+    ]);
+    expect(s.eodInteriorAbsentOk).toBe(false);
+    expect(s.liveEodInteriorAbsentOk).toBe(true);
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.stillGradeable.join(' '))
+      .toContain('liveEodInteriorAbsentOk');
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.selfHeals).toBe(false);
+  });
+
+  it('EXCLUDES NOTHING — enock stays named in the raw array with its dates', () => {
+    // This is the entire difference between the adopted disposition C and the
+    // rejected option A. If a future change makes the adjudicated book vanish
+    // from `eodInteriorAbsentBooks`, it has become a suppression primitive and
+    // this assertion is what catches it.
+    const s = summarizeEodInteriorAbsence([
+      book('enock', 'demo', ['2026-05-04', ...PARTICIPANT_ROWS]),
+    ]);
+    expect(s.eodInteriorAbsentBooks.map(b => b.username)).toEqual(['enock']);
+    expect(s.eodInteriorAbsentBooks[0]!.dates.length).toBeGreaterThan(0);
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.adjudicated.excludedFromVerdict).toBe(false);
+    expect(EOD_DOCUMENTED_GAP_DATES).not.toContain('2026-07-13');
+  });
+
+  it('records the incident as an IDENTITY, thirty sessions, not the ten on the wire', () => {
+    const a = EOD_INTERIOR_ABSENT_OK_RETIREMENT.adjudicated;
+    expect(a.identity).toContain('2026-06-15..2026-07-24');
+    expect(a.identity).toContain('never written');
+    expect(a.sessionCount).toBe(30);
+    expect(a.isolatedLegacySessions).toEqual(['2026-05-08', '2026-05-15']);
+    expect(a.publishedDatesAreClamped).toContain('max(firstRow, baselineDate)');
+    // The arithmetic of the record, checked against the calendar rather than
+    // trusted as prose: 28 contiguous sessions + 2 isolated legacy = 30.
+    const contiguous = sessionsInRange('2026-06-15', '2026-07-24', isMarketDay);
+    expect(contiguous.length).toBe(a.contiguousSessionCount);
+    expect(a.contiguousSessionCount + a.isolatedLegacySessions.length).toBe(a.sessionCount);
+  });
+
+  it('keeps the cause NOT MEASURED and the capture NEVER CAPTURED', () => {
+    const a = EOD_INTERIOR_ABSENT_OK_RETIREMENT.adjudicated;
+    expect(a.capture).toContain('NEVER CAPTURED');
+    expect(a.cause).toContain('NOT MEASURED');
+    // The 07-27 resumption is suggestive, not evidence — the ruling refuses the
+    // upgrade explicitly, so the record must not quietly perform it.
+    expect(a.cause).toContain('NOT evidence');
+    expect(a.backfillAuthorised).toBe(false);
+  });
+
+  it('carries the four closed remedies so none is re-proposed from scratch', () => {
+    const all = EOD_INTERIOR_ABSENT_OK_RETIREMENT.forbiddenRemedies.join(' ');
+    expect(all).toContain('EOD_DOCUMENTED_GAP_DATES');
+    expect(all).toContain('per-book exclusion');
+    expect(all).toContain('ENABLE_EOD_ROW_BACKFILL');
+    expect(all).toContain('baselineDate');
+    expect(EOD_INTERIOR_ABSENT_OK_RETIREMENT.forbiddenRemedies.length).toBe(4);
+  });
+
+  it('only names fields that actually exist on the published shape', () => {
+    // Same NAME-MISS guard the AC1 note carries: a note pointing at a field the
+    // payload does not have reads as `undefined`, which a reader takes for clean.
+    const published = Object.keys(summarizeEodInteriorAbsence([]));
+    for (const named of PNL_EOD_INTERIOR_RETIREMENT_NOTE.match(/`eodInterior[A-Za-z]+`/g) ?? []) {
+      expect(published).toContain(named.replace(/`/g, ''));
+    }
+    expect(published).toContain('eodInteriorAbsentOkRetirement');
   });
 });

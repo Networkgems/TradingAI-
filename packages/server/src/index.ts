@@ -4870,8 +4870,13 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // deliberately: it counts books whose interior is absent BEFORE the
       // documented-gap exclusion. If it ever drops to 0 while the fleet still
       // steps 2026-07-29 -> 2026-08-04, the detector has been blinded and that is
-      // a regression, not a repair. `eodInteriorAbsentOk` is the graded verdict
-      // (post-exclusion) and is TRI-STATE: `null` = NOT MEASURED, never green.
+      // a regression, not a repair.
+      //
+      // `eodInteriorAbsentOk` is the post-exclusion TRI-STATE fold (`null` = NOT
+      // MEASURED, never green) and TRA-2943 RETIRED it: it is pinned false by the
+      // adjudicated `enock` absence and would not move if a second book went
+      // interior-absent. Grade the SET OF USERNAMES in `eodInteriorAbsentBooks`;
+      // the ruling travels on the payload as `eodInteriorAbsentOkRetirement`.
       ...summarizeEodInteriorAbsence(
         engines.map(e => ({ username: e.username, mode: e.mode, interior: e.eodInterior })),
       ),

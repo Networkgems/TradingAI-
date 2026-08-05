@@ -3,7 +3,11 @@ import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
 // compile time, so this is not a runtime cycle.
-import { PNL_EOD_DOCUMENTED_GAP_NOTE, sessionsInRange } from './eod-ledger-gap.js';
+import {
+  PNL_EOD_DOCUMENTED_GAP_NOTE,
+  PNL_EOD_INTERIOR_RETIREMENT_NOTE,
+  sessionsInRange,
+} from './eod-ledger-gap.js';
 
 /**
  * TRA-1633 FIX 3 — cross-surface P&L reconciliation guard.
@@ -146,6 +150,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_FROZEN_COUNTER_NOTE,
   PNL_LIVE_MODE_SPAN_NOTE,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
+  PNL_EOD_INTERIOR_RETIREMENT_NOTE,
 ];
 
 /**
@@ -185,8 +190,25 @@ export const PNL_DRIFT_GRADEABLE = false;
  * Top-level response fields that are RETAINED for existing consumers but are not
  * gradeable verdicts, plus the per-row field they are folded from. Published so
  * a checker can enumerate them rather than hard-code its own copy of the list.
+ *
+ * The first three are TRA-2630's: `ok` / `maxDriftUsd` / `drift` pool a lossy
+ * stock leg with a durable one and have no reachable green state.
+ *
+ * `eodInteriorAbsentOk` joins them under TRA-2943 for a different reason and it
+ * is worth keeping the two reasons distinct: it is not structurally ungradeable,
+ * it is PINNED FALSE by an adjudicated absence (`enock`, thirty never-written
+ * sessions) that does not self-heal while `baselineDate` stays 2026-07-12. A
+ * second interior-absent book would not move it. Grade the SET OF USERNAMES in
+ * `eodInteriorAbsentBooks`; see `EOD_INTERIOR_ABSENT_OK_RETIREMENT`, published on
+ * the payload as `eodInteriorAbsentOkRetirement`. `liveEodInteriorAbsentOk` is a
+ * DIFFERENT cohort and is deliberately absent from this list — it stays gradeable.
  */
-export const PNL_UNGRADEABLE_FIELDS = ['ok', 'maxDriftUsd', 'engines[].drift'];
+export const PNL_UNGRADEABLE_FIELDS = [
+  'ok',
+  'maxDriftUsd',
+  'engines[].drift',
+  'eodInteriorAbsentOk',
+];
 
 /**
  * TRA-2630 AC1 — the gradeability disclaimer, hoisted to the top of the payload.
@@ -1267,8 +1289,12 @@ export function summarizeLiveEodRowPresence(
   // list went empty by EVICTION, not by repair, and now reads identically on a
   // healthy ledger and on one missing three fleet-wide sessions. Any tail-shaped
   // predicate inherits this — the emptiness is structural, not evidential.
-  // Grade `eodInteriorAbsentOk` (`eod-ledger-gap.ts`) instead: it enumerates
-  // expected sessions FROM the exchange calendar, so a later row cannot empty it.
+  // Grade the SET OF USERNAMES in `eodInteriorAbsentBooks` (`eod-ledger-gap.ts`)
+  // instead: that cohort is enumerated FROM the exchange calendar, so a later row
+  // cannot empty it. NOT the fleet boolean `eodInteriorAbsentOk` — TRA-2943
+  // retired it as pinned-false (see `EOD_INTERIOR_ABSENT_OK_RETIREMENT`), and not
+  // a count either: a count is as dead as the boolean once one book permanently
+  // occupies slot one.
   const tailStale = liveBooks
     .filter(e => (e.eodTailStaleSessions ?? 0) > 0)
     .map(e => ({

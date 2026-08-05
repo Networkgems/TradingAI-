@@ -72,7 +72,15 @@ identically on a healthy ledger and on one missing three fleet-wide sessions.
 Any tail-shaped predicate inherits this; the emptiness is structural, not
 evidential.
 
-Grade **`eodInteriorAbsentOk`** instead.
+Grade the **set of usernames in `eodInteriorAbsentBooks`** instead.
+
+> **2026-08-05, TRA-2943 — this pointer used to name `eodInteriorAbsentOk` and
+> that is now wrong.** The fleet boolean is **RETIRED — PINNED FALSE** by the
+> adjudicated `enock` absence and would not move if a second book went interior
+> absent; a *count* is exactly as dead the moment one book permanently occupies
+> slot one. Grade the **SET**. See
+> [The retirement of `eodInteriorAbsentOk`](#the-retirement-of-eodinteriorabsentok-tra-2943)
+> below. `liveEodInteriorAbsentOk` is a different cohort and stays gradeable.
 
 ## The replacement detector (TRA-2888 AC2)
 
@@ -86,8 +94,9 @@ Published on `/api/health/pnl-reconciliation`:
 
 | Field | Meaning |
 |---|---|
-| `eodInteriorAbsentOk` | **The graded verdict.** Tri-state; `null` = NOT MEASURED, never green |
-| `eodInteriorAbsentBooks` | New interior holes, named, with dates |
+| `eodInteriorAbsentBooks` | **The discriminator of record** (TRA-2943) — new interior holes, named, with dates |
+| `eodInteriorAbsentOk` | Tri-state fleet fold; `null` = NOT MEASURED, never green. **RETIRED — pinned false, TRA-2943. Do not grade** |
+| `eodInteriorAbsentOkRetirement` | That retirement, machine-readable: the ruling, the identity it is pinned by, and the four closed remedies |
 | `eodInteriorAbsentRawBookCount` | **The acceptance arm** — books absent *before* the documented-gap exclusion |
 | `eodInteriorDocumentedGapBooks` | Books carrying this documented gap |
 | `eodDocumentedGap` | This ruling, machine-readable, incl. `backfillAuthorised: false` |
@@ -109,6 +118,56 @@ range encounters the gap on that book's own object. The exclusion is a
 not a date range, not a `>=` bound, not a suppression window. A range would
 swallow the next incident and a bound would swallow every incident after it. A
 fourth absent session is a **new incident** and goes red.
+
+## The retirement of `eodInteriorAbsentOk` (TRA-2943)
+
+**CFO ruling 2026-08-05, adjudicating TRA-2942, disposition C: accept the standing
+red.** The fleet boolean is now permanently `false` for an adjudicated reason, so
+it discriminates exactly as little as a predicate pinned `true`.
+
+**The incident, recorded as an IDENTITY and not as a date list:**
+
+> `enock` has no EOD ledger row for **any NYSE session in 2026-06-15..2026-07-24**;
+> the rows were **never written**. Plus two isolated legacy absences, **2026-05-08**
+> and **2026-05-15** (the TRA-388 blank-calendar incident). **Thirty absent
+> sessions** — 28 contiguous + 2 isolated.
+
+The ten dates the route publishes for `enock` (2026-07-13..07-24) are the
+post-baseline **remainder**, a clamp artifact of
+`spanStart = max(firstRow, baselineDate)` with `baselineDate` env-pinned at
+2026-07-12 by `resolvePnlBaselineDate(process.env)`. They under-size the incident
+by **64%**, and they would change if that env ever moved without one ledger row
+changing. A dates-list record decays; an identity does not. This is also why the
+red **does not self-heal**.
+
+**Cause: NOT MEASURED**, ratified. The two candidates — the book had no
+`UserContext` in `getAllUserContexts()` those nights, or `generateAndSaveReport`
+threw inside `runDailyCloseForAllUsers` — are both swallowed to a single
+`log.warn`, neither leaves a durable artifact, and Render retention does not reach
+2026-06-15. The 2026-07-27 resumption is suggestive and is **not** evidence.
+
+**Nothing is excluded.** `enock` stays inside `eodInteriorAbsentBooks` with its
+dates and the verdict stays red. That is the entire difference between this record
+and a suppression: misuse of an annotation stays visible in the raw array, misuse
+of an exclusion does not.
+
+**Closed remedies** (all four refused by the ruling; see
+`eodInteriorAbsentOkRetirement.forbiddenRemedies`):
+
+1. Adding `enock`'s dates to `EOD_DOCUMENTED_GAP_DATES` — that constant is
+   fleet-wide and cannot scope per book; it would suppress 28 sessions across 61
+   books to green one demo book.
+2. Building a per-book exclusion primitive — the cost is a permanent blinding
+   primitive plus the raw audit arm needed to keep it honest.
+3. Arming `ENABLE_EOD_ROW_BACKFILL` — these rows were never captured; TRA-2888
+   stands verbatim and is not reopened.
+4. Advancing the `baselineDate` env past 2026-07-24 — it greens the field by
+   moving a data-integrity cutoff and changes what every other post-baseline
+   verdict measures.
+
+Exposure: **zero live capital.** `enock` is `mode: demo`;
+`liveEodInteriorAbsentOk` is `true` with `liveEodInteriorAbsentBooks` empty across
+both live books, and `liveEodBackfillArmed` is `false`.
 
 ### Acceptance arms (pre-registered before the detector was built)
 

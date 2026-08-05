@@ -118,14 +118,160 @@ export const EOD_DOCUMENTED_GAP: EodDocumentedGap = Object.freeze({
     Object.freeze({
       ticket: 'TRA-2829',
       line: 'liveEodTailStaleBooks is empty',
-      why: 'Already true, and true for the WRONG reason. The tail cohort is (newestRow, lastSettledSession]; when the 2026-08-04 rows landed the anchor advanced 07-29 -> 08-04 and the three absent sessions left the cohort entirely. The predicate went green by eviction, not by repair, and now discriminates nothing -- it reads identically on a healthy ledger and on this one. Retired. Grade eodInteriorAbsentOk instead, which enumerates from the calendar and therefore cannot be emptied by a later row.',
+      why: 'Already true, and true for the WRONG reason. The tail cohort is (newestRow, lastSettledSession]; when the 2026-08-04 rows landed the anchor advanced 07-29 -> 08-04 and the three absent sessions left the cohort entirely. The predicate went green by eviction, not by repair, and now discriminates nothing -- it reads identically on a healthy ledger and on this one. Retired. Grade the SET OF USERNAMES in eodInteriorAbsentBooks instead: that cohort is enumerated from the calendar and therefore cannot be emptied by a later row. Do NOT grade the fleet boolean eodInteriorAbsentOk -- it was this ticket\'s original replacement pointer and TRA-2943 has since retired it as pinned-false; see EOD_INTERIOR_ABSENT_OK_RETIREMENT, published as eodInteriorAbsentOkRetirement.',
     }),
   ]),
 });
 
 /** Prose form of the ruling, spread into the endpoint's top-level `caveats`. */
 export const PNL_EOD_DOCUMENTED_GAP_NOTE =
-  'TRA-2888: 2026-07-30, 2026-07-31 and 2026-08-03 are a PERMANENT, UNRECOVERABLE gap in the EOD ledger, FLEET-WIDE. These sessions were NEVER CAPTURED -- not lost in transit. /data was at ENOSPC (out of INODES, not bytes -- appends survived, file creates failed, every disk axis read green) from 2026-07-30 through 2026-08-04T21:20Z; the 21:00 ET archive fired on time and every EOD report/snapshot write died with ENOSPC across 47 books on both nights. No source holds these figures. Re-measured on bqb1 2026-08-05T03:17Z build 237c147e: of 47 books whose history spans the window, 47 of 47 miss all three dates, zero partials -- every book steps 2026-07-29 -> 2026-08-04. Back-fill is NOT authorised and ENABLE_EOD_ROW_BACKFILL stays false; if anyone proposes arming it, this ruling is the answer. RETIRED by this ruling: the TRA-2829 acceptance line "liveEodTailStaleBooks is empty" -- it is already true and discriminates nothing, because the tail cohort is (newestRow, lastSettledSession] and the three absent sessions left it when the 2026-08-04 rows advanced the anchor. It went green by EVICTION, not repair. Grade `eodInteriorAbsentOk` instead: it enumerates expected sessions FROM the exchange calendar and diffs against rows present, so it cannot be emptied by a later row. NOTE the three dates are excluded from that verdict as this documented gap and are published separately -- fleet-level under `eodInteriorDocumentedGapBooks`, per book under `engines[].eodInterior.interiorAbsentDocumented`; the exclusion is a three-element allow-list, never a range or a cutoff, so a NEW interior hole still goes red -- one already does (`enock`, 10 absent post-baseline sessions 2026-07-13..07-24, invisible to every field published before this ticket). This ruling does NOT discharge the TRA-2829 provenance ceiling: the live book\'s post-baseline `optionsDailyPnlSource` is `journal-repair`, not `journal`. A resumed ledger confirms the ledger resumed, nothing more.';
+  'TRA-2888: 2026-07-30, 2026-07-31 and 2026-08-03 are a PERMANENT, UNRECOVERABLE gap in the EOD ledger, FLEET-WIDE. These sessions were NEVER CAPTURED -- not lost in transit. /data was at ENOSPC (out of INODES, not bytes -- appends survived, file creates failed, every disk axis read green) from 2026-07-30 through 2026-08-04T21:20Z; the 21:00 ET archive fired on time and every EOD report/snapshot write died with ENOSPC across 47 books on both nights. No source holds these figures. Re-measured on bqb1 2026-08-05T03:17Z build 237c147e: of 47 books whose history spans the window, 47 of 47 miss all three dates, zero partials -- every book steps 2026-07-29 -> 2026-08-04. Back-fill is NOT authorised and ENABLE_EOD_ROW_BACKFILL stays false; if anyone proposes arming it, this ruling is the answer. RETIRED by this ruling: the TRA-2829 acceptance line "liveEodTailStaleBooks is empty" -- it is already true and discriminates nothing, because the tail cohort is (newestRow, lastSettledSession] and the three absent sessions left it when the 2026-08-04 rows advanced the anchor. It went green by EVICTION, not repair. Grade the SET OF USERNAMES in `eodInteriorAbsentBooks` instead: that cohort is enumerated from the exchange calendar and diffed against rows present, so it cannot be emptied by a later row. Do NOT grade the fleet boolean `eodInteriorAbsentOk` -- this ticket originally pointed there and TRA-2943 has since RETIRED it as pinned-false; read `eodInteriorAbsentOkRetirement` for the ruling and the identity it is pinned by. NOTE the three dates are excluded from that verdict as this documented gap and are published separately -- fleet-level under `eodInteriorDocumentedGapBooks`, per book under `engines[].eodInterior.interiorAbsentDocumented`; the exclusion is a three-element allow-list, never a range or a cutoff, so a NEW interior hole still goes red -- one already does (`enock`; the route shows 10 clamped post-baseline dates, but the INCIDENT is thirty absent sessions -- see `eodInteriorAbsentOkRetirement.adjudicated` -- and was invisible to every field published before this ticket). This ruling does NOT discharge the TRA-2829 provenance ceiling: the live book\'s post-baseline `optionsDailyPnlSource` is `journal-repair`, not `journal`. A resumed ledger confirms the ledger resumed, nothing more.';
+
+/**
+ * TRA-2943 (CFO ruling 2026-08-05, adjudicating TRA-2942) — the adjudicated
+ * interior absence that pins `eodInteriorAbsentOk` false, recorded as an
+ * IDENTITY rather than as a date list.
+ *
+ * ── Why an identity and not the ten dates on the wire ────────────────────────
+ *
+ * The published route names ten dates (2026-07-13..07-24). Those ten are a CLAMP
+ * ARTIFACT, not the incident: `spanStart = max(firstRow, baselineDate)` and
+ * `baselineDate` comes from `resolvePnlBaselineDate(process.env)`, which is
+ * env-pinned at 2026-07-12 and does not roll. Move that env and the list changes
+ * without a single ledger row changing. A dates-list record therefore DECAYS; an
+ * identity does not. The incident is thirty absent sessions, and the ten on the
+ * wire under-size it by 64%.
+ *
+ * ── Why this record is not an exclusion ──────────────────────────────────────
+ *
+ * Nothing here is subtracted from any verdict. `enock` stays inside
+ * `eodInteriorAbsentBooks` with its dates, `interiorAbsentNet` keeps them, and
+ * `eodInteriorAbsentOk` stays `false`. That is the whole difference between this
+ * and the rejected option A: misuse of an annotation stays visible in the raw
+ * array, misuse of an exclusion does not. If a future change makes a mistake
+ * here invisible in `eodInteriorAbsentBooks`, that change has drifted into A.
+ */
+export interface EodInteriorAdjudicatedAbsence {
+  /** The ruling that adjudicated it. */
+  ticket: string;
+  /** The incident ticket that carries the finding. */
+  incidentTicket: string;
+  book: string;
+  mode: string;
+  /** THE RECORD. Scope-stable across any `baselineDate` move. */
+  identity: string;
+  /** Thirty: 28 contiguous NYSE sessions plus two isolated legacy absences. */
+  sessionCount: number;
+  contiguousSpan: string;
+  contiguousSessionCount: number;
+  isolatedLegacySessions: readonly string[];
+  legacyIncidentTicket: string;
+  /** Why the wire shows ten and the incident is thirty. */
+  publishedDatesAreClamped: string;
+  /** Were these rows written and then lost, or never written at all? */
+  capture: string;
+  /** Ratified NOT MEASURED — no durable artifact survives to decide it. */
+  cause: string;
+  /** Is this book excluded from the verdict? Permanently no. */
+  excludedFromVerdict: false;
+  /** Is reconstructing these rows authorised? Permanently no. */
+  backfillAuthorised: false;
+  /** Live capital exposed by this absence. */
+  exposure: string;
+}
+
+export const EOD_INTERIOR_ADJUDICATED_ABSENCE: EodInteriorAdjudicatedAbsence = Object.freeze({
+  ticket: 'TRA-2943',
+  incidentTicket: 'TRA-2903',
+  book: 'enock',
+  mode: 'demo',
+  identity:
+    'enock has no EOD ledger row for any NYSE session in 2026-06-15..2026-07-24; the rows were never written. Plus two isolated legacy absences, 2026-05-08 and 2026-05-15 (the TRA-388 blank-calendar incident). Thirty absent sessions in total.',
+  sessionCount: 30,
+  contiguousSpan: '2026-06-15..2026-07-24',
+  contiguousSessionCount: 28,
+  isolatedLegacySessions: Object.freeze(['2026-05-08', '2026-05-15']),
+  legacyIncidentTicket: 'TRA-388',
+  publishedDatesAreClamped:
+    'The ten dates on the wire (2026-07-13..07-24) are the post-baseline REMAINDER of this absence, not its size. spanStart = max(firstRow, baselineDate) and baselineDate is env-pinned at 2026-07-12 via resolvePnlBaselineDate(process.env) -- it does not roll, so this red does not self-heal, and moving that env would change the published list without changing one ledger row. Record and grade the identity above, never the ten dates.',
+  capture:
+    'NEVER CAPTURED. No row was written for these sessions on any night; nothing was written-then-lost and no upstream store holds them. catchUpMissedEodReports cannot recover them either -- it fills the dated report FILE and is gated `if (!backfill)` out of saveSnapshot, so it never creates the ledger row (and it caps at maxLookbackDays 14 regardless).',
+  cause:
+    'NOT MEASURED, and ratified as such by the TRA-2943 ruling. The two candidates -- (a) the book had no UserContext in getAllUserContexts() those nights, (b) generateAndSaveReport threw inside runDailyCloseForAllUsers -- are both swallowed to a single log.warn, neither leaves a durable artifact, and Render log retention does not reach 2026-06-15. The 2026-07-27 resumption is suggestive and is explicitly NOT evidence. Making the swallowed warn durable so the NEXT occurrence is measurable is separate work (TRA-2930 is its front edge), not a re-forensics of this one.',
+  excludedFromVerdict: false,
+  backfillAuthorised: false,
+  exposure:
+    'ZERO LIVE CAPITAL. enock is mode `demo`. The live cohort is clean and separately published: liveEodInteriorAbsentOk true, liveEodInteriorAbsentBooks empty across both live books, liveEodBackfillArmed false (re-read off bqb1 2026-08-05T15:58Z).',
+});
+
+/**
+ * TRA-2943 — the IN-BAND retirement of `eodInteriorAbsentOk`, published beside
+ * the field it retires.
+ *
+ * ── Why this ships as data next to the field ─────────────────────────────────
+ *
+ * `eodInteriorAbsentOk` is now permanently `false` for an adjudicated reason. A
+ * boolean pinned false discriminates exactly as little as one pinned true: if a
+ * SECOND book went interior-absent tomorrow it would not move. Without this
+ * record a reader six weeks from now sees a red field and reads it as a live
+ * signal — which is the failure TRA-2886 left behind and the ruling explicitly
+ * refuses to repeat.
+ *
+ * A count is NOT the escape hatch. `eodInteriorAbsentBooks.length` and every
+ * gradeable-book count are exactly as dead as the boolean the moment `enock`
+ * permanently occupies slot one. The discriminator of record is the SET OF
+ * USERNAMES in `eodInteriorAbsentBooks`: a new offender changes the set even
+ * though it changes neither the boolean nor (usefully) the count.
+ *
+ * Scope: the FLEET fold only. `liveEodInteriorAbsentOk` is unaffected and stays
+ * gradeable — `enock` is demo, so it is not in that cohort, and the live axis has
+ * a reachable green state today (it is green).
+ */
+export interface EodInteriorAbsentOkRetirement {
+  ticket: string;
+  field: string;
+  state: string;
+  since: string;
+  /** What to grade instead. A SET, not a boolean and not a count. */
+  discriminatorOfRecord: string;
+  why: string;
+  /** Explicitly still gradeable, so the retirement is not over-read. */
+  stillGradeable: readonly string[];
+  /** Does the red clear on its own? No — the clamp is env-pinned. */
+  selfHeals: false;
+  /** Remedies the ruling closed, so a future reader does not re-propose them. */
+  forbiddenRemedies: readonly string[];
+  adjudicated: EodInteriorAdjudicatedAbsence;
+}
+
+export const EOD_INTERIOR_ABSENT_OK_RETIREMENT: EodInteriorAbsentOkRetirement = Object.freeze({
+  ticket: 'TRA-2943',
+  field: 'eodInteriorAbsentOk',
+  state: 'RETIRED -- PINNED FALSE. Not a live signal.',
+  since: '2026-08-05',
+  discriminatorOfRecord:
+    'eodInteriorAbsentBooks -- the SET OF USERNAMES. Not this boolean, and not a count: a count is as dead as the boolean once one book permanently occupies slot one. A new offender is a new username in that set.',
+  why:
+    'TRA-2943 (CFO, adjudicating TRA-2942) adopted disposition C: accept the standing red rather than suppress it. The fleet fold is false for as long as the adjudicated absence below stands, which is for as long as baselineDate stays 2026-07-12 -- i.e. indefinitely. A second book going interior-absent would not move this field, because it is already false.',
+  stillGradeable: Object.freeze([
+    'liveEodInteriorAbsentOk -- the live cohort is a different cohort; enock is demo and not in it, and it is green today with a reachable red.',
+    'eodInteriorAbsentBooks -- the set of usernames, the discriminator of record.',
+    'engines[].eodInterior.interiorAbsentNet -- per book, still exact.',
+    'eodInteriorAbsentRawBookCount -- the pre-exclusion acceptance arm; a drop to 0 while the fleet still steps 2026-07-29 -> 2026-08-04 is a REGRESSION, not a repair.',
+  ]),
+  selfHeals: false,
+  forbiddenRemedies: Object.freeze([
+    'Adding enock\'s dates to EOD_DOCUMENTED_GAP_DATES in any form. That constant is fleet-wide and cannot scope per book: 28 sessions across 61 books that have nothing wrong with them would be suppressed to green one demo book. REJECTED by TRA-2943.',
+    'Building a per-book exclusion or allow-list primitive. The cost is not one keyed entry -- it is a permanent blinding primitive plus the raw audit arm needed to keep it honest, bought to green a demo book while the live axis is already green. REJECTED by TRA-2943.',
+    'Arming ENABLE_EOD_ROW_BACKFILL. These rows were NEVER CAPTURED; a writer that manufactures them fabricates a ledger, and saveSnapshot rebases openingEquity to the row it closes, so a back-filled row would rewrite the telescoped opening chain that is currently the evidence the hole is clean. TRA-2888 stands verbatim and is NOT reopened.',
+    'Advancing the baselineDate env past 2026-07-24 to clamp the absence out of the span. That greens the field by moving a data-integrity cutoff and changes what every other post-baseline verdict is measuring. Worse than either rejected option.',
+  ]),
+  adjudicated: EOD_INTERIOR_ADJUDICATED_ABSENCE,
+});
+
+/** Prose form of the retirement, spread into the endpoint's top-level `caveats`. */
+export const PNL_EOD_INTERIOR_RETIREMENT_NOTE =
+  'TRA-2943: `eodInteriorAbsentOk` is RETIRED -- PINNED FALSE, and is NOT a live signal. It is false because the `enock` book carries an adjudicated interior absence, and it will stay false for as long as `baselineDate` is env-pinned at 2026-07-12; it does not self-heal and a SECOND book going interior-absent would not move it. GRADE `eodInteriorAbsentBooks` -- the SET OF USERNAMES -- instead. Do not grade this boolean and do not substitute a COUNT: a count is exactly as dead as the boolean once one book permanently occupies slot one. `liveEodInteriorAbsentOk` is a different cohort and stays gradeable (enock is demo; the live axis is green today with a reachable red). THE RECORD IS AN IDENTITY, NOT A DATE LIST: enock has no EOD ledger row for any NYSE session in 2026-06-15..2026-07-24 -- the rows were NEVER WRITTEN -- plus two isolated legacy absences 2026-05-08 and 2026-05-15 (TRA-388). Thirty absent sessions. The ten dates published under `eodInteriorAbsentBooks` for enock are the post-baseline remainder only, a clamp artifact of `spanStart = max(firstRow, baselineDate)`, and they under-size the incident by 64%. CAUSE: NOT MEASURED -- the two candidates (contextless book / generateAndSaveReport threw) are both swallowed to one log.warn and Render retention does not reach 2026-06-15. NOTHING IS EXCLUDED BY THIS RECORD: enock stays in `eodInteriorAbsentBooks` with its dates and the verdict stays red. Adding enock to `EOD_DOCUMENTED_GAP_DATES`, building a per-book exclusion, arming `ENABLE_EOD_ROW_BACKFILL`, and advancing the baseline env are all REFUSED by this ruling -- see `eodInteriorAbsentOkRetirement.forbiddenRemedies`. Zero live capital: enock is `mode: demo`.';
 
 /**
  * Every NYSE session in `[start, end]` inclusive, per the supplied calendar.
@@ -316,6 +462,7 @@ export interface EodInteriorAbsenceBook {
  */
 export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbsenceBook>): {
   eodDocumentedGap: EodDocumentedGap;
+  eodInteriorAbsentOkRetirement: EodInteriorAbsentOkRetirement;
   eodInteriorBookCount: number;
   eodInteriorGradeableBookCount: number;
   eodInteriorAbsentOk: boolean | null;
@@ -346,6 +493,11 @@ export function summarizeEodInteriorAbsence(books: ReadonlyArray<EodInteriorAbse
 
   return {
     eodDocumentedGap: EOD_DOCUMENTED_GAP,
+    // TRA-2943 — the retirement travels WITH the field it retires. A reader who
+    // pulls this payload and finds `eodInteriorAbsentOk: false` finds the ruling,
+    // the identity it is pinned by, and what to grade instead in the same object.
+    // It excludes nothing: `enock` is still named below with its dates.
+    eodInteriorAbsentOkRetirement: EOD_INTERIOR_ABSENT_OK_RETIREMENT,
     eodInteriorBookCount: books.length,
     eodInteriorGradeableBookCount: books.filter(b => b.interior.interiorAbsentOk != null).length,
     eodInteriorAbsentOk: fold(books),
