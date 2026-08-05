@@ -578,6 +578,7 @@ import {
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
+import { findVerticalArbitrage, toArbitrageDiagnostic } from './otm-theo-arbitrage.js';
 import {
   rebaseMispricing,
   parseMispricingBasis,
@@ -5083,6 +5084,14 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
   // `deltaFloor.suppressed` is what the delta axis removed from the rows that
   // already cleared the theo axis. Both run before the slice.
   const deltaFloored = applyDeltaFloor(floored.kept, minDelta);
+  // TRA-2662 — static no-arbitrage check on the surface, measured on the FULL
+  // engine output: before both floors and before the slice. Those filters remove
+  // strikes, and every removed strike is an adjacent pair that can no longer be
+  // tested, so grading the projected rows would under-count the defect by
+  // construction. `theo`/`mark` are untouched by `rebaseMispricing` (it moves
+  // only `mispricingPct`), so this is basis-independent and safe to read off
+  // `result.candidates`.
+  const arbitrage = toArbitrageDiagnostic(findVerticalArbitrage(result.candidates));
   res.json({
     ...result,
     // Ranked by |mispricingPct| descending — by `rebaseMispricing`, not by
@@ -5126,6 +5135,18 @@ app.get('/api/options/otm-mispricing', requireAuth, async (req, res) => {
       suppressed: deltaFloored.suppressed,
       maxSuppressedMispricingPct: deltaFloored.maxSuppressedMispricingPct,
     },
+    // TRA-2662 — vertical-spread monotonicity, the model-free no-arbitrage
+    // condition. `theoViolations` grades OUR MODEL; `markViolations` is the
+    // NEGATIVE CONTROL and grades the tape, which is coherent in every capture
+    // taken so far. A theo violation is a labelled diagnostic here rather than a
+    // silent filter: the rows stay on the panel, and the incoherence is stated.
+    //
+    // ⛔ `theoViolations: 0` is NOT a pass on its own. Read it with
+    // `pairsTested` (0 pairs cannot violate) and with `markViolations` (if the
+    // control ever goes non-zero the detector is wrong, not the market). And it
+    // can be bought by flattening the vol surface, which would destroy the
+    // panel's signal — see the acceptance trap in `otm-theo-arbitrage.ts`.
+    noArbitrage: arbitrage,
     diagnostics: relativeValueScannerService.diagnostics(),
   });
 });
