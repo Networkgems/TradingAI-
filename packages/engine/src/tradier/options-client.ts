@@ -358,6 +358,94 @@ export interface TradierTradeHistoryFill {
   orderId: number | null;
 }
 
+/**
+ * TRA-2850 — `/accounts/{id}/gainloss` envelope. Same normalisation quirks as
+ * history/positions: `gainloss: 'null'`/empty when the account has no closed
+ * lots in the window, a single `closed_position` object when there's one, or
+ * an array.
+ */
+interface TradierGainLossEnvelope {
+  gainloss?: { closed_position?: TradierRawClosedPosition | TradierRawClosedPosition[] } | string | null;
+}
+
+interface TradierRawClosedPosition {
+  symbol?: string;
+  quantity?: number;
+  cost?: number;
+  proceeds?: number;
+  gain_loss?: number;
+  open_date?: string;
+  close_date?: string;
+  term?: number;
+}
+
+/**
+ * TRA-2850 — one settled closed lot from Tradier's gain/loss report. This is
+ * the ONLY payload where Tradier's real per-trade fees are observable:
+ * account-history rows carry `commission: 0` on every production fill (the
+ * exchange/regulatory fees are baked into cost/proceeds, not itemised), so
+ * `cost − grossOpen` and `grossClose − proceeds` are the fees themselves.
+ * `cost` and `proceeds` are lot totals in USD (fees included); `quantity` is
+ * contracts for options, shares for equities, always positive.
+ */
+export interface TradierGainLossLot {
+  /** OCC option symbol for option lots; underlying ticker for equities. */
+  symbol: string;
+  /** Contracts (options) or shares (equities). Always positive. */
+  quantity: number;
+  /** Total cost basis of the lot, USD, INCLUDING open-side fees. */
+  cost: number;
+  /** Total net proceeds of the lot, USD, NET of close-side fees. */
+  proceeds: number;
+  /** `proceeds − cost` as Tradier reports it. */
+  gainLoss: number;
+  /** `YYYY-MM-DD` the lot was opened. */
+  openDate: string;
+  /** `YYYY-MM-DD` the lot was closed. */
+  closeDate: string;
+}
+
+/**
+ * TRA-2850 — normalise the Tradier `/accounts/{id}/gainloss` envelope into a
+ * list of settled closed lots. Exported so the fee back-fill reconcile can be
+ * unit-tested without mocking `fetch`. Rows missing a coercible symbol /
+ * quantity / cost / proceeds / dates are dropped — we'd rather omit a lot
+ * than derive a garbage fee from it.
+ */
+export function parseTradierGainLoss(
+  envelope: TradierGainLossEnvelope | null,
+): TradierGainLossLot[] {
+  if (!envelope || typeof envelope.gainloss !== 'object' || envelope.gainloss == null) {
+    return [];
+  }
+  const out: TradierGainLossLot[] = [];
+  for (const raw of asArray(envelope.gainloss.closed_position)) {
+    const symbol = typeof raw.symbol === 'string' ? raw.symbol : '';
+    const openDate = typeof raw.open_date === 'string' ? raw.open_date.slice(0, 10) : '';
+    const closeDate = typeof raw.close_date === 'string' ? raw.close_date.slice(0, 10) : '';
+    if (!symbol || !openDate || !closeDate) continue;
+    const quantity = typeof raw.quantity === 'number' && Number.isFinite(raw.quantity)
+      ? Math.abs(raw.quantity)
+      : NaN;
+    if (!Number.isFinite(quantity) || quantity <= 0) continue;
+    if (typeof raw.cost !== 'number' || !Number.isFinite(raw.cost)) continue;
+    if (typeof raw.proceeds !== 'number' || !Number.isFinite(raw.proceeds)) continue;
+    const gainLoss = typeof raw.gain_loss === 'number' && Number.isFinite(raw.gain_loss)
+      ? raw.gain_loss
+      : raw.proceeds - raw.cost;
+    out.push({
+      symbol,
+      quantity,
+      cost: raw.cost,
+      proceeds: raw.proceeds,
+      gainLoss,
+      openDate,
+      closeDate,
+    });
+  }
+  return out;
+}
+
 export class TradierOptionsClient extends TradierOrderClient {
   constructor(apiToken: string, accountId: string, env: TradierEnv = 'sandbox') {
     super(apiToken, accountId, env);
@@ -680,6 +768,30 @@ export class TradierOptionsClient extends TradierOrderClient {
       `/accounts/${encodeURIComponent(this.accountId)}/history?${params}`,
     );
     return parseTradierCashEvents(data);
+  }
+
+  /**
+   * TRA-2850 — list SETTLED closed lots from `/accounts/{id}/gainloss`
+   * between `start` and `end` (`YYYY-MM-DD`, inclusive; Tradier filters on
+   * the close date). This report is where real per-trade fees live: history
+   * fills report `commission: 0` on every production row, while a lot's
+   * `cost`/`proceeds` are stated fees-INCLUDED — so the fee back-fill
+   * derives `fee = cost − price×100×qty` (open leg) and
+   * `fee = price×100×qty − proceeds` (close leg). Returns `[]` on auth /
+   * network failures so a caller can treat it as "nothing settled" rather
+   * than throw into a scheduler tick.
+   */
+  async listGainLoss(
+    options: { start: string; end: string; limit?: number } = { start: '', end: '' },
+  ): Promise<TradierGainLossLot[]> {
+    const params = new URLSearchParams();
+    if (options.start) params.set('start', options.start);
+    if (options.end) params.set('end', options.end);
+    params.set('limit', String(options.limit ?? 250));
+    const data = await this.getJson<TradierGainLossEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/gainloss?${params}`,
+    );
+    return parseTradierGainLoss(data);
   }
 
   /** Submit a market order to buy option contracts (open). */

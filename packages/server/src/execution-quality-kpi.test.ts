@@ -21,6 +21,7 @@ function optRec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     midAtSubmit: null,
     filledPrice: null,
     fees: null,
+    feeSource: null,
     slippageVsAsk: null,
     slippageVsMid: null,
     orderId: null,

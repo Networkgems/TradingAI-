@@ -3095,6 +3095,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       slippage: summary.slippage,
       totalFees: summary.totalFees,
       feesMeasured: summary.feesMeasured,
+      // TRA-2850 — who measured each counted fee (history commission join vs
+      // gainloss derivation). Sums to feesMeasured; a fee with no provenance no
+      // longer counts (the pre-2850 `fees: 0` poison reads unmeasured again).
+      feesBySource: summary.feesBySource,
       retentionDays: summary.retentionDays,
       durability: summary.durability,
       lastRecordAt: summary.lastRecordAt,
@@ -3102,10 +3106,12 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // TRA-2810 — provenance of the AUTOMATIC fee back-fill (boot kick + hourly
       // tick). `ticks: 0` ⇒ the pass never ran on this boot — the one state the
       // TRA-1954 admin-POST era could not distinguish from healthy-quiescent.
+      // TRA-2850 — `stalled: true` is the NON-GREEN state: repeated no-match with
+      // nothing ever written; do not read `lastError: null` as health.
       autoReconcile: getLiveOptionsFeeReconcileState(),
       note: summary.durability.ephemeral
         ? `NOT DURABLE — DATA_DIR is ephemeral (${summary.durability.dataDir ?? 'memory-only'}); these ${summary.n} fill(s) die at the next reboot and the calibration is not captured. Fix = DATA_DIR=/data on bqb1 (TRA-1719). Read durability.ephemeral before trusting any count.`
-        : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees auto-back-fill from Tradier account-history rides the boot kick + ET hourly tick (TRA-2810; ${summary.feesMeasured}/${summary.n} measured — see autoReconcile) — the fill-time order payload carries no commission; slippage-vs-ask/mid IS captured on every measured leg.`,
+        : `DURABLE: ${summary.n} fill(s) on ${summary.durability.dataDir}. fees auto-back-fill on the boot kick + ET hourly tick (TRA-2810/TRA-2850; ${summary.feesMeasured}/${summary.n} measured — see autoReconcile, and autoReconcile.stalled for the non-green state): real production fees derive from settled /gainloss cost/proceeds (history commission is 0 on every production row and only joins when positive); slippage-vs-ask/mid IS captured on every measured leg.`,
     });
   });
 

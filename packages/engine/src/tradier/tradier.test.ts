@@ -7,6 +7,7 @@ import {
   parseTradierPositions,
   parseTradierHistory,
   parseTradierCashEvents,
+  parseTradierGainLoss,
 } from './options-client.js';
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -1647,5 +1648,96 @@ describe('TradierOrderClient.changeStopPrice (TRA-1269)', () => {
     fetchMock.mockResolvedValueOnce(textResponse('boom', 400));
     const client = new TradierOrderClient('tok', 'A1');
     await expect(client.changeStopPrice(102, 96)).rejects.toThrow(/stop-modify failed \(400\)/);
+  });
+});
+
+
+// ─── parseTradierGainLoss / listGainLoss (TRA-2850) ─────────────────────────
+//
+// The gain/loss report is where real per-trade fees live: production history
+// rows carry `commission: 0` on every fill, while a settled lot's `cost` is
+// fees-INCLUDED and `proceeds` fees-NET. Same envelope quirks as history:
+// 'null' string / single object / array.
+
+describe('parseTradierGainLoss (TRA-2850)', () => {
+  const rawLot = {
+    symbol: 'AAPL260904P00280000',
+    quantity: 1,
+    cost: 104.11,
+    proceeds: 277.87,
+    gain_loss: 173.76,
+    gain_loss_percent: 166.9,
+    open_date: '2026-07-31T00:00:00.000Z',
+    close_date: '2026-08-03T00:00:00.000Z',
+    term: 3,
+  };
+
+  it('normalises a single closed_position object and slices dates to YYYY-MM-DD', () => {
+    const lots = parseTradierGainLoss({ gainloss: { closed_position: rawLot } });
+    expect(lots).toHaveLength(1);
+    expect(lots[0]).toEqual({
+      symbol: 'AAPL260904P00280000',
+      quantity: 1,
+      cost: 104.11,
+      proceeds: 277.87,
+      gainLoss: 173.76,
+      openDate: '2026-07-31',
+      closeDate: '2026-08-03',
+    });
+  });
+
+  it("returns [] on the 'null' string envelope, a null payload, and an empty object", () => {
+    expect(parseTradierGainLoss({ gainloss: 'null' })).toEqual([]);
+    expect(parseTradierGainLoss(null)).toEqual([]);
+    expect(parseTradierGainLoss({})).toEqual([]);
+  });
+
+  it('drops rows missing a coercible cost/proceeds/date rather than deriving a garbage fee', () => {
+    const lots = parseTradierGainLoss({
+      gainloss: {
+        closed_position: [
+          rawLot,
+          { ...rawLot, cost: undefined },
+          { ...rawLot, proceeds: 'n/a' },
+          { ...rawLot, open_date: undefined },
+          { ...rawLot, quantity: 0 },
+        ] as never,
+      },
+    });
+    expect(lots).toHaveLength(1);
+  });
+
+  it('falls back to proceeds − cost when gain_loss is absent, and abs()es a negative quantity', () => {
+    const lots = parseTradierGainLoss({
+      gainloss: { closed_position: { ...rawLot, gain_loss: undefined, quantity: -3 } as never },
+    });
+    expect(lots[0]!.gainLoss).toBeCloseTo(173.76, 6);
+    expect(lots[0]!.quantity).toBe(3);
+  });
+});
+
+describe('TradierOptionsClient.listGainLoss (TRA-2850)', () => {
+  it('hits /accounts/{id}/gainloss with the window params and parses the envelope', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      gainloss: {
+        closed_position: [{
+          symbol: 'SPY260904C00816000', quantity: 3, cost: 24.31, proceeds: 100,
+          gain_loss: 75.69, open_date: '2026-07-31T00:00:00.000Z', close_date: '2026-08-03T00:00:00.000Z',
+        }],
+      },
+    }));
+    const client = new TradierOptionsClient('tok', 'A1', 'production');
+    const lots = await client.listGainLoss({ start: '2026-07-31', end: '2026-08-04' });
+    expect(callUrl(0)).toContain('/accounts/A1/gainloss?');
+    expect(callUrl(0)).toContain('start=2026-07-31');
+    expect(callUrl(0)).toContain('end=2026-08-04');
+    expect(lots).toHaveLength(1);
+    expect(lots[0]!.cost).toBeCloseTo(24.31, 6);
+  });
+
+  it('returns [] on a non-OK response instead of throwing into a scheduler tick', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('nope', 401));
+    const client = new TradierOptionsClient('tok', 'A1', 'production');
+    expect(await client.listGainLoss({ start: '2026-07-31', end: '2026-08-04' })).toEqual([]);
   });
 });

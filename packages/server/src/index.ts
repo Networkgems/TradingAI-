@@ -211,9 +211,10 @@ import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 import {
   hydrateLiveOptionsFeeSlippageFromDisk,
   backfillLiveOptionFees,
+  backfillLiveOptionFeesFromGainLoss,
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
-import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810
+import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
 // TRA-1006 — automated pre/post-market analyst agent. Tick fns are flag-checked
@@ -3411,7 +3412,11 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 {
   const h = hydrateLiveOptionsFeeSlippageFromDisk(DATA_DIR);
   if (h.records > 0) {
-    log.info('live-options fee/slippage ledger hydrated (TRA-1929)', { records: h.records });
+    // `migrated` — TRA-2850: pre-2850 `fees: 0` rows (no provenance) reset to honest-null.
+    log.info('live-options fee/slippage ledger hydrated (TRA-1929)', {
+      records: h.records,
+      migrated: h.migrated,
+    });
   }
 }
 
@@ -8472,7 +8477,22 @@ app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, require
     res.status(502).json({ ok: false, error: 'Tradier account-history fetch failed' });
     return;
   }
-  const { updated } = backfillLiveOptionFees(fills);
+  // TRA-2850 — the gainloss derivation is where real production fees come from
+  // (history commission is 0 on every production row); run it in the same POST.
+  let lots;
+  try {
+    lots = await client.listGainLoss({ start, end, limit: 2000 });
+  } catch (err) {
+    log.warn('live-options fee reconcile: gainloss fetch failed', {
+      operator,
+      start,
+      end,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    res.status(502).json({ ok: false, error: 'Tradier gainloss fetch failed' });
+    return;
+  }
+  const updated = backfillLiveOptionFees(fills).updated + backfillLiveOptionFeesFromGainLoss(lots).updated;
   const summary = summarizeLiveOptionsFeeSlippage();
   res.json({
     ok: true,
@@ -8480,18 +8500,20 @@ app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, require
     build: resolveBuildInfo(),
     window: { start, end },
     historyFills: fills.length,
+    gainLossLots: lots.length,
     updated,
     // The read route reports these too; echo so a single POST proves the back-fill.
     n: summary.n,
     feesMeasured: summary.feesMeasured,
+    feesBySource: summary.feesBySource,
     totalFees: summary.totalFees,
     // Read durability.ephemeral FIRST — a back-fill on an ephemeral dir dies at the
     // next redeploy exactly like the fill-time rows (fix = DATA_DIR=/data, TRA-1719).
     durability: summary.durability,
     note:
       updated > 0
-        ? `Back-filled ${updated} fee(s) from ${fills.length} history fill(s); feesMeasured now ${summary.feesMeasured}/${summary.n}. ${summary.durability.ephemeral ? 'NOT DURABLE — DATA_DIR ephemeral; re-run after DATA_DIR=/data (TRA-1719).' : `Durable on ${summary.durability.dataDir}.`}`
-        : `No rows back-filled — ${fills.length} history fill(s) in window, none matched an unmeasured ledger row (or all already reconciled). Unmatched rows stay fees:null (never 0, TRA-1707).`,
+        ? `Back-filled ${updated} fee(s) from ${fills.length} history fill(s) + ${lots.length} settled lot(s); feesMeasured now ${summary.feesMeasured}/${summary.n}. ${summary.durability.ephemeral ? 'NOT DURABLE — DATA_DIR ephemeral; re-run after DATA_DIR=/data (TRA-1719).' : `Durable on ${summary.durability.dataDir}.`}`
+        : `No rows back-filled — ${fills.length} history fill(s) + ${lots.length} settled lot(s) in window, none matched an unmeasured ledger row (or all already reconciled). Unmatched rows stay fees:null (never 0, TRA-1707).`,
   });
 });
 

@@ -15,7 +15,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
   clearLiveOptionsFeeSlippageLedger,
 } from './live-options-fee-slippage-ledger.js';
-import type { TradierTradeHistoryFill } from '@trading-app/engine';
+import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
 
 // TRA-2810 (parents TRA-2536 / TRA-1929) — the AUTOMATIC fee back-fill pass.
 // Two real-money windows ended feesMeasured 0/n because the TRA-1954 join only
@@ -78,17 +78,24 @@ function histFill(over: Partial<TradierTradeHistoryFill> = {}): TradierTradeHist
   };
 }
 
-function fakeClient(fills: TradierTradeHistoryFill[]): {
+function fakeClient(fills: TradierTradeHistoryFill[], lots: TradierGainLossLot[] = []): {
   client: FeeReconcileHistoryClient;
   calls: { start: string; end: string; limit?: number; type?: string }[];
+  gainLossCalls: { start: string; end: string; limit?: number }[];
 } {
   const calls: { start: string; end: string; limit?: number; type?: string }[] = [];
+  const gainLossCalls: { start: string; end: string; limit?: number }[] = [];
   return {
     calls,
+    gainLossCalls,
     client: {
       listAccountHistory: async (options) => {
         calls.push(options);
         return fills;
+      },
+      listGainLoss: async (options) => {
+        gainLossCalls.push(options);
+        return lots;
       },
     },
   };
@@ -169,18 +176,98 @@ describe('live-options fee auto-reconcile (TRA-2810)', () => {
     expect(s.lastError).toBe('settings store unreachable');
   });
 
-  it('captures a history-fetch throw as fetch-failed and never throws into the tick', async () => {
+  it('captures a both-fetches throw as fetch-failed and never throws into the tick', async () => {
     clearLiveOptionsFeeSlippageLedger();
     seedOpenFill();
     const client: FeeReconcileHistoryClient = {
       listAccountHistory: async () => {
         throw new Error('502 from Tradier');
       },
+      listGainLoss: async () => {
+        throw new Error('503 from Tradier');
+      },
     };
     const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
     expect(s.lastOutcome).toBe('fetch-failed');
-    expect(s.lastError).toBe('502 from Tradier');
+    expect(s.lastError).toContain('502 from Tradier');
+    expect(s.lastError).toContain('503 from Tradier');
     expect(summarizeLiveOptionsFeeSlippage().records[0]!.fees).toBeNull();
+  });
+
+  it('a history outage does not stop the gainloss derivation — and the error is still recorded (TRA-2850)', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill(); // 4 contracts @ 1.04 = 416.00 gross
+    const client: FeeReconcileHistoryClient = {
+      listAccountHistory: async () => {
+        throw new Error('502 from Tradier');
+      },
+      listGainLoss: async () => [
+        {
+          symbol: 'AAPL260904P00280000',
+          quantity: 4,
+          cost: 416.44, // 416.00 gross + 0.44 open-side fees
+          proceeds: 500,
+          gainLoss: 83.56,
+          openDate: '2026-07-30',
+          closeDate: '2026-07-30',
+        },
+      ],
+    };
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastGainLossUpdated).toBe(1);
+    // partial failure must not self-report clean
+    expect(s.lastError).toBe('502 from Tradier');
+    const rec = summarizeLiveOptionsFeeSlippage().records[0]!;
+    expect(rec.fees).toBeCloseTo(0.44, 6);
+    expect(rec.feeSource).toBe('gainloss_derived');
+  });
+
+  it('derives real fees from settled gainloss lots when history commission is 0 — the TRA-2850 production shape', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill(); // buy_to_open 4 @ 1.04
+    // Production history: orderId null, commission 0 — the join must NOT write a false $0.
+    const { client } = fakeClient(
+      [histFill({ orderId: null, commission: 0, description: 'PUT AAPL   09/04/26   280', amount: -416 })],
+      [{
+        symbol: 'AAPL260904P00280000',
+        quantity: 4,
+        cost: 416.42,
+        proceeds: 900,
+        gainLoss: 483.58,
+        openDate: '2026-07-30',
+        closeDate: '2026-07-30',
+      }],
+    );
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastUpdated).toBe(1);
+    // the commission join saw the zero-commission fill and correctly counted it un-joinable
+    expect(s.lastJoinableCount).toBe(0);
+    const summary = summarizeLiveOptionsFeeSlippage();
+    expect(summary.feesMeasured).toBe(1);
+    expect(summary.feesBySource.gainlossDerived).toBe(1);
+    expect(summary.records[0]!.fees).toBeCloseTo(0.42, 6);
+  });
+
+  it('flips stalled after three consecutive no-match attempts — the non-green state (TRA-2850)', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    const { client } = fakeClient([], []); // fetches succeed, nothing ever joins
+    const s1 = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s1.lastOutcome).toBe('no-match');
+    expect(s1.consecutiveNoMatch).toBe(1);
+    expect(s1.stalled).toBe(false);
+    await runLiveOptionsFeeReconcile(async () => client, NOW + 3_600_000);
+    const s3 = await runLiveOptionsFeeReconcile(async () => client, NOW + 7_200_000);
+    expect(s3.consecutiveNoMatch).toBe(3);
+    expect(s3.stalled).toBe(true);
+    // a successful back-fill clears it
+    const { client: good } = fakeClient([histFill()]);
+    const s4 = await runLiveOptionsFeeReconcile(async () => good, NOW + 10_800_000);
+    expect(s4.lastOutcome).toBe('backfilled');
+    expect(s4.consecutiveNoMatch).toBe(0);
+    expect(s4.stalled).toBe(false);
   });
 
   it('self-quenches: after a full back-fill the next tick makes no broker call', async () => {

@@ -31,7 +31,7 @@
 
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
-import type { TradierTradeHistoryFill } from '@trading-app/engine';
+import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
 
@@ -64,6 +64,21 @@ export type LiveFillSleeve =
 
 /** Order side of the fill. */
 export type LiveFillSide = 'buy_to_open' | 'sell_to_close';
+
+/**
+ * TRA-2850 — provenance of a measured `fees` value:
+ * - 'history_commission' — joined from `TradierTradeHistoryFill.commission`.
+ *   Only written when the commission is > 0: production history reports 0 on
+ *   EVERY row (fees are baked into cost/proceeds, not itemised), so a zero
+ *   commission is "unmeasured", not "free".
+ * - 'gainloss_derived'   — derived from the settled `/gainloss` lot totals:
+ *   `cost − price×100×qty` (open leg) / `price×100×qty − proceeds` (close leg).
+ */
+export type LiveFeeSource = 'history_commission' | 'gainloss_derived';
+
+function isFeeSource(v: unknown): v is LiveFeeSource {
+  return v === 'history_commission' || v === 'gainloss_derived';
+}
 
 /**
  * One real Tradier fill, open or close. Every price is per-contract (per-share ×
@@ -102,6 +117,13 @@ export interface LiveOptionFillRecord {
    * pass back-fills it; until then it is honestly UNMEASURED (never 0). (TRA-1929)
    */
   fees: number | null;
+  /**
+   * TRA-2850 — WHO measured `fees`. `null` whenever `fees` is null. A fee value
+   * with no source is the pre-2850 poison shape (the commission join wrote a
+   * broker field that is 0 on every production row, turning honest-null into a
+   * confident $0) — hydrate resets `fees: 0` rows without a source back to null.
+   */
+  feeSource: LiveFeeSource | null;
   /** `filledPrice − askAtSubmit` (per contract), null when either side is null. */
   slippageVsAsk: number | null;
   /** `filledPrice − midAtSubmit` (per contract), null when either side is null. */
@@ -123,6 +145,7 @@ export interface LiveOptionFillInput {
   midAtSubmit?: number | null;
   filledPrice?: number | null;
   fees?: number | null;
+  feeSource?: LiveFeeSource | null;
   orderId?: number | null;
 }
 
@@ -164,6 +187,7 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
   const filledPrice = finiteOrNull(input.filledPrice);
   const askAtSubmit = finiteOrNull(input.askAtSubmit);
   const midAtSubmit = finiteOrNull(input.midAtSubmit);
+  const fees = finiteOrNull(input.fees);
   return {
     mode: 'live',
     ts: input.ts,
@@ -176,7 +200,9 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     askAtSubmit,
     midAtSubmit,
     filledPrice,
-    fees: finiteOrNull(input.fees),
+    fees,
+    // Provenance travels with the value; a null fee can carry no source.
+    feeSource: fees !== null && isFeeSource(input.feeSource) ? input.feeSource : null,
     // Derived slippage — null unless BOTH legs are measured (TRA-1707: never 0-as-unknown).
     slippageVsAsk: filledPrice !== null && askAtSubmit !== null ? filledPrice - askAtSubmit : null,
     slippageVsMid: filledPrice !== null && midAtSubmit !== null ? filledPrice - midAtSubmit : null,
@@ -238,6 +264,8 @@ export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | n
 /** What {@link hydrateLiveOptionsFeeSlippageFromDisk} recovered (for the boot log line). */
 export interface LiveOptionsFeeSlippageHydration {
   records: number;
+  /** TRA-2850 — pre-2850 `fees: 0` rows (no feeSource) reset to honest-null this boot. */
+  migrated: number;
 }
 
 function isSleeve(v: unknown): v is LiveFillSleeve {
@@ -278,6 +306,7 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
 
   const cutoff = now - RETAIN_MS;
   const kept: string[] = [];
+  let migrated = 0; // TRA-2850 — `fees: 0` rows with no feeSource reset to null
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -291,6 +320,16 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
     if (typeof rec.etDay !== 'string' || rec.etDay === '') continue;
     if (!isSleeve(rec.sleeve) || !isSide(rec.side)) continue;
     if (typeof rec.optionSymbol !== 'string' || rec.optionSymbol === '') continue;
+    // TRA-2850 — repair the pre-2850 poison: the commission join back-filled
+    // `fees: 0` from a broker field that is 0 on EVERY production history row,
+    // converting honest-null ("unmeasured") into a confident $0 ("measured, and
+    // it was free"). Those rows carry no `feeSource`. Reset them to null so
+    // `feesMeasured` stops counting fees nobody measured; the gainloss-derived
+    // reconcile re-measures them with real numbers. A `fees: 0` WITH a source
+    // is a genuine measured zero and is kept.
+    const sourced = isFeeSource(rec.feeSource);
+    const fees = rec.fees === 0 && !sourced ? null : rec.fees;
+    if (fees === null && rec.fees === 0) migrated += 1;
     // Re-derive through toRecord so the disk copy and a live record are byte-identical
     // in shape and the slippage invariants hold even if an old line was hand-edited.
     const clean = toRecord({
@@ -304,7 +343,8 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       askAtSubmit: rec.askAtSubmit,
       midAtSubmit: rec.midAtSubmit,
       filledPrice: rec.filledPrice,
-      fees: rec.fees,
+      fees,
+      feeSource: sourced ? rec.feeSource : null,
       orderId: rec.orderId,
     });
     fills.push(clean);
@@ -313,9 +353,12 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
   }
 
   // Compact: rewrite the file to the retained lines only (best-effort). Skipped when
-  // there is nothing to drop, to avoid a needless rewrite on every clean boot.
+  // there is nothing to drop AND nothing was migrated, to avoid a needless rewrite on
+  // every clean boot. A TRA-2850 poison repair (fees:0 → null) changes content without
+  // changing the count, so it forces the rewrite too — otherwise the poison would sit
+  // on disk and be re-migrated every boot.
   const nonEmptyLines = raw.split('\n').filter((l) => l.trim() !== '').length;
-  if (kept.length < nonEmptyLines) {
+  if (kept.length < nonEmptyLines || migrated > 0) {
     const path = liveOptionsFeeSlippageLogPath(dir);
     try {
       mkdirSync(dirname(path), { recursive: true });
@@ -328,7 +371,12 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
   }
 
   hydratedRecords = kept.length;
-  return { records: kept.length };
+  if (migrated > 0) {
+    log.info('live-options-fee-slippage hydrate reset unsourced fees:0 rows to null (TRA-2850)', {
+      migrated,
+    });
+  }
+  return { records: kept.length, migrated };
 }
 
 // ── TRA-1954: fee back-fill reconcile ────────────────────────────────────────
@@ -388,8 +436,12 @@ function feeMatchKey(symbol: string, day: string, side: LiveFillSide, qty: numbe
   return `${symbol} ${day} ${side} ${qty}`;
 }
 
-/** Reverse a record into the input shape {@link toRecord} consumes (optionally overriding fees). */
-function recordToInput(rec: LiveOptionFillRecord, feesOverride?: number | null): LiveOptionFillInput {
+/** Reverse a record into the input shape {@link toRecord} consumes (optionally overriding fees + source). */
+function recordToInput(
+  rec: LiveOptionFillRecord,
+  feesOverride?: number | null,
+  feeSourceOverride?: LiveFeeSource | null,
+): LiveOptionFillInput {
   return {
     ts: rec.ts,
     etDay: rec.etDay,
@@ -402,6 +454,7 @@ function recordToInput(rec: LiveOptionFillRecord, feesOverride?: number | null):
     midAtSubmit: rec.midAtSubmit,
     filledPrice: rec.filledPrice,
     fees: feesOverride !== undefined ? feesOverride : rec.fees,
+    feeSource: feesOverride !== undefined ? feeSourceOverride ?? null : rec.feeSource,
     orderId: rec.orderId,
   };
 }
@@ -434,7 +487,12 @@ export function reconcileLedgerFees(
     const side = historyFillSide(f.description, f.amount);
     if (side === null) continue;
     if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
-    if (typeof f.commission !== 'number' || !Number.isFinite(f.commission)) continue;
+    // TRA-2850 — commission must be POSITIVE, not merely finite. Production Tradier
+    // history reports `commission: 0` on every row (fees are baked into the event
+    // amount, not itemised), so back-filling a 0 converts honest-null ("unmeasured")
+    // into a false "measured, and it was free". A zero-commission fill is simply not
+    // a fee measurement; the gainloss-derived pass measures those rows instead.
+    if (typeof f.commission !== 'number' || !Number.isFinite(f.commission) || f.commission <= 0) continue;
     if (f.orderId != null) historyByOrderId.set(f.orderId, f);
     const key = feeMatchKey(f.symbol, f.date, side, f.quantity);
     const q = historyByKey.get(key);
@@ -490,26 +548,129 @@ export function reconcileLedgerFees(
   const out = records.map((r, i) => {
     if (feeByIndex.has(i)) {
       updated += 1;
-      return toRecord(recordToInput(r, feeByIndex.get(i)!));
+      return toRecord(recordToInput(r, feeByIndex.get(i)!, 'history_commission'));
     }
     return toRecord(recordToInput(r));
   });
   return { updated, records: out };
 }
 
+// ── TRA-2850: gainloss-derived fee back-fill ─────────────────────────────────
+//
+// TRA-2810's commission join shipped, changed the reported number, and measured
+// nothing: production Tradier account-history reports `orderId: null` AND
+// `commission: 0` on EVERY row, so the join either never matched or — worse —
+// back-filled a confident $0 onto rows whose fee was real. The fees ARE
+// observable, one endpoint over: a settled `/gainloss` lot states `cost`
+// (fees-included) and `proceeds` (fees-net), so against the ledger's own fill
+// prices:   openFee  = cost     − filledPrice×100×qty
+//           closeFee = filledPrice×100×qty − proceeds
+// (measured 2026-08-05 on the live ***0154 account: ~$0.10–0.13/contract/leg).
+//
+// THE JOIN: lots and ledger rows are grouped by (symbol, ET day, side) — a
+// lot's open leg keys on `openDate` against `buy_to_open` rows, its close leg
+// on `closeDate` against `sell_to_close` rows. Tradier splits lots FIFO, so a
+// single 4-contract fill can settle as 1+3 lots (and vice versa); requiring a
+// per-lot qty==contracts match would silently skip those. Instead the group's
+// LOT total must equal the group's ROW total; the group fee is then derived on
+// the totals and apportioned pro-rata by contracts (fees are per-contract to
+// first order). Totals that don't reconcile ⇒ the whole group stays null —
+// honest-unmeasured, never a guess.
+//
+// SANITY BOUND: a derived fee is only written when 0 ≤ fee ≤ $0.90/contract.
+// Tradier's published equity-option fee stack (≤$0.35 commission + ORF/OCC/
+// SEC/TAF pennies) tops out well under $0.60/contract, while the smallest
+// possible mis-pairing artifact — a 1-cent price mismatch — is $1.00/contract.
+// The bound sits between the two populations, so it admits every plausible fee
+// and rejects every join artifact. Negative ⇒ the lot didn't come from these
+// fills ⇒ skip (null), never clamp.
+
+/** Per-contract ceiling a gainloss-derived fee must clear to be written (see above). */
+const GAINLOSS_FEE_MAX_PER_CONTRACT_USD = 0.9;
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
 /**
- * Apply {@link reconcileLedgerFees} against the module's in-memory store, replace it
- * with the reconciled records, and REWRITE the durable JSONL so a redeploy keeps the
- * back-filled fees. The rewrite reuses the compaction write shape and is best-effort +
- * COUNTED (a failure logs, bumps `appendErrors`, and is swallowed so the reconcile can
- * never throw). Only rewrites when at least one row changed. When no dataDir is
- * configured (unit tests / CLI without boot) only the in-memory store updates.
+ * PURE gainloss-derived back-fill: populate `fees` on unmeasured ledger rows from
+ * settled Tradier `/gainloss` lots (see the section header for the join + bound).
+ * Idempotent: rows already measured keep their value and their group still
+ * reconciles around them. No IO — fully fixture-testable.
  */
-export function backfillLiveOptionFees(
-  historyFills: readonly TradierTradeHistoryFill[],
+export function reconcileLedgerFeesFromGainLoss(
+  records: readonly LiveOptionFillRecord[],
+  lots: readonly TradierGainLossLot[],
 ): FeeBackfillResult {
-  const result = reconcileLedgerFees(fills, historyFills);
-  // Swap in the reconciled (re-derived) records.
+  // Lot totals per (symbol, day, side): the basis is fees-INCLUSIVE cost for the
+  // open leg and fees-NET proceeds for the close leg.
+  const lotTotals = new Map<string, { qty: number; basis: number }>();
+  const addLot = (key: string, qty: number, basis: number): void => {
+    const t = lotTotals.get(key);
+    if (t) {
+      t.qty += qty;
+      t.basis += basis;
+    } else lotTotals.set(key, { qty, basis });
+  };
+  for (const lot of lots) {
+    addLot(feeMatchKey(lot.symbol, lot.openDate, 'buy_to_open', 0), lot.quantity, lot.cost);
+    addLot(feeMatchKey(lot.symbol, lot.closeDate, 'sell_to_close', 0), lot.quantity, lot.proceeds);
+  }
+
+  // ALL ledger rows per group — measured rows participate in the totals (their
+  // contracts are inside the lot totals too); only null rows are written.
+  const rowGroups = new Map<string, number[]>();
+  records.forEach((r, i) => {
+    const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, 0);
+    const g = rowGroups.get(key);
+    if (g) g.push(i);
+    else rowGroups.set(key, [i]);
+  });
+
+  const feeByIndex = new Map<number, number>();
+  for (const [key, indices] of rowGroups) {
+    if (!indices.some((i) => records[i]!.fees === null)) continue; // nothing to measure
+    const lotTotal = lotTotals.get(key);
+    if (!lotTotal) continue; // not settled yet (or not in the fetched window)
+
+    let rowQty = 0;
+    let rowGross = 0;
+    let derivable = true;
+    for (const i of indices) {
+      const r = records[i]!;
+      if (r.filledPrice === null || !(r.contracts > 0)) {
+        derivable = false; // a priceless row poisons the group's gross — stay null
+        break;
+      }
+      rowQty += r.contracts;
+      rowGross += r.filledPrice * 100 * r.contracts;
+    }
+    if (!derivable || rowQty !== lotTotal.qty) continue; // totals must reconcile exactly
+
+    const side = records[indices[0]!]!.side;
+    const groupFee = round2(side === 'buy_to_open' ? lotTotal.basis - rowGross : rowGross - lotTotal.basis);
+    if (groupFee < 0 || groupFee > GAINLOSS_FEE_MAX_PER_CONTRACT_USD * rowQty) continue;
+
+    for (const i of indices) {
+      const r = records[i]!;
+      if (r.fees !== null) continue; // keep an existing measurement
+      feeByIndex.set(i, round2((groupFee * r.contracts) / rowQty));
+    }
+  }
+
+  let updated = 0;
+  const out = records.map((r, i) => {
+    if (feeByIndex.has(i)) {
+      updated += 1;
+      return toRecord(recordToInput(r, feeByIndex.get(i)!, 'gainloss_derived'));
+    }
+    return toRecord(recordToInput(r));
+  });
+  return { updated, records: out };
+}
+
+/** Swap a reconcile result into the store and, when rows changed, REWRITE the durable JSONL. */
+function applyBackfillResult(result: FeeBackfillResult): void {
   fills.length = 0;
   for (const r of result.records) fills.push(r);
 
@@ -529,6 +690,33 @@ export function backfillLiveOptionFees(
       log.warn('live-options-fee-slippage back-fill rewrite failed', { reason: lastAppendError });
     }
   }
+}
+
+/**
+ * Apply {@link reconcileLedgerFees} against the module's in-memory store, replace it
+ * with the reconciled records, and REWRITE the durable JSONL so a redeploy keeps the
+ * back-filled fees. The rewrite reuses the compaction write shape and is best-effort +
+ * COUNTED (a failure logs, bumps `appendErrors`, and is swallowed so the reconcile can
+ * never throw). Only rewrites when at least one row changed. When no dataDir is
+ * configured (unit tests / CLI without boot) only the in-memory store updates.
+ */
+export function backfillLiveOptionFees(
+  historyFills: readonly TradierTradeHistoryFill[],
+): FeeBackfillResult {
+  const result = reconcileLedgerFees(fills, historyFills);
+  applyBackfillResult(result);
+  return result;
+}
+
+/**
+ * TRA-2850 — apply {@link reconcileLedgerFeesFromGainLoss} against the in-memory
+ * store with the same durable-rewrite semantics as {@link backfillLiveOptionFees}.
+ */
+export function backfillLiveOptionFeesFromGainLoss(
+  lots: readonly TradierGainLossLot[],
+): FeeBackfillResult {
+  const result = reconcileLedgerFeesFromGainLoss(fills, lots);
+  applyBackfillResult(result);
   return result;
 }
 
@@ -591,6 +779,13 @@ export interface LiveOptionsFeeSlippageSummary {
    */
   totalFees: number | null;
   feesMeasured: number;
+  /**
+   * TRA-2850 — `feesMeasured` split by WHO measured it. A pre-2850 build counted
+   * rows whose fee "happened to equal 0" as measured; every counted row now has
+   * a provenance (`history_commission` join or `gainloss_derived`), so the sum
+   * of this object always equals `feesMeasured`.
+   */
+  feesBySource: { historyCommission: number; gainlossDerived: number };
   /** How many days back the ledger retains. */
   retentionDays: number;
   /** TRA-1681 — whether ANY of the above survives a reboot. Check BEFORE trusting a count. */
@@ -613,12 +808,18 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
   const feeValues: number[] = [];
   let opens = 0;
   let closes = 0;
+  let feesFromCommission = 0;
+  let feesFromGainLoss = 0;
   for (const f of fills) {
     if (f.side === 'buy_to_open') opens += 1;
     else closes += 1;
     if (f.slippageVsAsk !== null) vsAsk.push(f.slippageVsAsk);
     if (f.slippageVsMid !== null) vsMid.push(f.slippageVsMid);
-    if (f.fees !== null) feeValues.push(f.fees);
+    if (f.fees !== null) {
+      feeValues.push(f.fees);
+      if (f.feeSource === 'gainloss_derived') feesFromGainLoss += 1;
+      else feesFromCommission += 1;
+    }
   }
   const askStats = stats(vsAsk);
   const midStats = stats(vsMid);
@@ -636,6 +837,7 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     },
     totalFees: feeValues.length > 0 ? round(feeValues.reduce((s, v) => s + v, 0), 2) : null,
     feesMeasured: feeValues.length,
+    feesBySource: { historyCommission: feesFromCommission, gainlossDerived: feesFromGainLoss },
     retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
     durability: {
       dataDir,
