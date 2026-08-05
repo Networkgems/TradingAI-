@@ -501,6 +501,85 @@ describe('TRA-898 demo-book summary', () => {
     });
   });
 
+  // TRA-2671 — regression control for the joined-operand family. Built to the
+  // 602c276 template: a REPAIR-SLAVED book and an INDEPENDENT book carrying
+  // BYTE-IDENTICAL equity/cash/position numbers must grade DIFFERENTLY. If a
+  // future edit collapses `cashInvariant.ok` back to a plain
+  // `Math.abs(gap) < 0.01`, both arms below produce `true` and the first
+  // assertion fails — which is the whole point of the control.
+  describe('TRA-2671 cashInvariant is not self-confirming', () => {
+    // 0 open positions ⇒ committedCapital 0 ⇒ expectedCash === totalEquity.
+    // Cash is set EQUAL to equity, i.e. exactly what `repairDriftedCash()`
+    // assigns. Both arms therefore compute gap === 0; the ONLY difference
+    // between them is the provenance record.
+    const joinedNumbers = {
+      account: { totalEquity: 2_276.18, availableCash: 2_276.18, dailyPnl: 0, openPositions: [] },
+    };
+
+    it('grades a repair-slaved book NOT MEASURED and an independent book GREEN on identical numbers', () => {
+      const slaved = summarizeDemoBook(
+        demoState({
+          account: {
+            ...joinedNumbers.account,
+            cashRepair: { appliedAt: NOW - 1_000, delta: 3_243.54, from: 207.14, to: 3_450.67 },
+          },
+        } as never),
+        'demo',
+        NOW,
+      );
+      const independent = summarizeDemoBook(demoState(joinedNumbers as never), 'demo', NOW);
+
+      // Identical arithmetic on both arms — the comparison itself cannot tell
+      // them apart, which is precisely why the verdict must not rest on it.
+      expect(slaved.cashInvariant.gap).toBe(independent.cashInvariant.gap);
+      expect(slaved.cashInvariant.expectedCash).toBe(independent.cashInvariant.expectedCash);
+
+      // ...and yet they grade differently.
+      expect(slaved.cashInvariant.ok).toBeNull(); // NOT MEASURED, never `true`
+      expect(slaved.cashInvariant.repairSlaved).toBe(true);
+      expect(independent.cashInvariant.ok).toBe(true); // genuinely falsifiable
+      expect(independent.cashInvariant.repairSlaved).toBe(false);
+    });
+
+    it('RED outranks NOT MEASURED: drift re-opened AFTER the repair is never masked', () => {
+      // The `null` branch must not become a place for live defects to hide.
+      // Same repair record, but cash has since drifted off equity again — that
+      // means the underlying writer is still wrong and must read RED.
+      const report = summarizeDemoBook(
+        demoState({
+          account: {
+            totalEquity: 2_276.18,
+            availableCash: 2_100.0,
+            dailyPnl: 0,
+            openPositions: [],
+            cashRepair: { appliedAt: NOW - 1_000, delta: 3_243.54, from: 207.14, to: 3_450.67 },
+          },
+        } as never),
+        'demo',
+        NOW,
+      );
+      expect(report.cashInvariant.repairSlaved).toBe(true);
+      expect(report.cashInvariant.ok).toBe(false);
+    });
+
+    it('a green is reserved for books no writer has touched', () => {
+      // Guards the other direction: `repairSlaved` must key on the RECORD, not
+      // on the gap being non-zero, or a zero-delta repair would still score a
+      // pass off operands the writer had already joined.
+      const report = summarizeDemoBook(
+        demoState({
+          account: {
+            ...joinedNumbers.account,
+            cashRepair: { appliedAt: NOW - 1_000, delta: 0.5, from: 2_275.68, to: 2_276.18 },
+          },
+        } as never),
+        'demo',
+        NOW,
+      );
+      expect(report.cashInvariant.ok).not.toBe(true);
+    });
+  });
+
   it('flags the closed buffer as capped at the 20-row getState() ceiling', () => {
     const twenty = Array.from({ length: 20 }, () => ({ pnl: 10, closedAt: NOW }));
     const report = summarizeDemoBook(demoState({ closedPositions: twenty as never }), 'demo', NOW);

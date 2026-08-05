@@ -444,11 +444,52 @@ export interface DemoBookReport {
    * one-shot repair fixed and a book that never drifted both show `gap: 0`, so
    * the gap alone cannot tell them apart. `repaired` is null on a book that was
    * never touched.
+   *
+   * TRA-2671 — that last paragraph described the defect correctly and then left
+   * `ok` a flat boolean, so the disclosure was never consumed by the verdict.
+   * The two operands of this comparison are JOINED by a repair writer:
+   * `PaperAccount.repairDriftedCash()` runs on every restore and executes
+   * `this.cash = this.expectedCash()`, which is byte-for-byte the right-hand
+   * side of the `gap` this gate grades. After it fires, `gap` is 0 BY
+   * CONSTRUCTION for everything up to `repaired.appliedAt` — one operand is a
+   * copy of the other.
+   *
+   * Measured live on bqb1 2026-08-05T10:48Z, build 9fbc9077, book `demo-1`:
+   *
+   *     cashInvariant.ok        true
+   *     cashInvariant.gap       -9.09e-13      ← float residue of an ASSIGNMENT
+   *     cashInvariant.repaired  { delta: 3243.54, from: 207.14, to: 3450.67 }
+   *
+   * A green verdict sitting beside a record that the invariant was off by
+   * $3,243.54 and was snapped shut. `gap: -9e-13` is not "this book is
+   * consistent", it is the floating-point signature of `cash := expectedCash`.
+   *
+   * `ok` is therefore TRI-STATE, folded RED > NOT MEASURED > GREEN:
+   *
+   *   `false` — |gap| over tolerance. New drift accumulated SINCE the repair is
+   *             still fully visible, and this red is never masked by the
+   *             `null` branch below.
+   *   `null`  — NOT MEASURED. A `repaired` record stands, so the writer joined
+   *             the operands at `repairedAt` and every disagreement older than
+   *             that instant was absorbed rather than reported.
+   *   `true`  — genuinely falsifiable: no repair has ever touched this book and
+   *             the two independently-maintained ledgers agree.
+   *
+   * `repairSlaved` is the published denominator — the field an acceptance
+   * criterion must read before it consumes a green. Never read a `null` here as
+   * a pass.
    */
   cashInvariant: {
     expectedCash: number;
     gap: number;
-    ok: boolean;
+    ok: boolean | null;
+    /**
+     * TRA-2671 — true when `repairDriftedCash()` has assigned this book's cash
+     * FROM its equity, which is what makes `gap` unfalsifiable for the window
+     * ending at `repaired.appliedAt`. This is the denominator for `ok`: a
+     * `null` verdict with `repairSlaved: true` means NOT MEASURED, not passed.
+     */
+    repairSlaved: boolean;
     repaired: { appliedAt: number; delta: number; from: number; to: number } | null;
   };
   /** Currently-open demo paper positions. */
@@ -501,6 +542,15 @@ export function summarizeDemoBook(
   );
   const expectedCash = state.account.totalEquity - committedCapital;
   const cashGap = state.account.availableCash - expectedCash;
+  // TRA-2671 — the operands are JOINED once `repairDriftedCash()` has fired:
+  // that writer sets `cash = expectedCash()`, which is the same quantity
+  // `expectedCash` above recomputes, so `cashGap` is 0 by construction for
+  // every event at or before `appliedAt`. Presence of the record — not its
+  // sign, not its magnitude — is what destroys the measurement, so any record
+  // slaves the gate. `cashRepair` is persisted in the snapshot and restored
+  // (`PaperAccount.restore`), so this survives a reboot exactly as the joined
+  // cash figure does.
+  const cashRepairSlaved = (state.account.cashRepair ?? null) !== null;
   const recs = state.agentRecommendations;
   const byAction = { BUY: 0, SELL: 0, HOLD: 0 };
   let routableCount = 0;
@@ -529,7 +579,12 @@ export function summarizeDemoBook(
     cashInvariant: {
       expectedCash,
       gap: cashGap,
-      ok: Math.abs(cashGap) < 0.01,
+      // TRA-2671 — RED outranks NOT MEASURED outranks GREEN. The `false` branch
+      // is evaluated FIRST and is deliberately blind to `repairSlaved`: drift
+      // that re-opened after the repair means the underlying bug is still
+      // writing, and that is the one signal this gate must never swallow.
+      ok: Math.abs(cashGap) >= 0.01 ? false : cashRepairSlaved ? null : true,
+      repairSlaved: cashRepairSlaved,
       repaired: state.account.cashRepair ?? null,
     },
     openPositionCount: state.account.openPositions.length,
