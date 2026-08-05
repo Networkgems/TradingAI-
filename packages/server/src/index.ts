@@ -32,6 +32,11 @@ import {
   summarizeLiveEodRowPresence,
   summarizeDriftGradeability,
 } from './pnl-reconciliation.js';
+// TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling and the
+// exchange-calendar interior-absence detector that makes a NEVER-WRITTEN
+// session visible. See `eod-ledger-gap.ts` for why no presence axis before it
+// could fire on one.
+import { detectEodInteriorAbsence, summarizeEodInteriorAbsence } from './eod-ledger-gap.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
 import {
@@ -4441,10 +4446,22 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             calendar: tailCalendar,
           })
           : null;
+        // TRA-2888 — THE INTERIOR-ABSENCE AXIS. Enumerated from `tailCalendar`
+        // (the same NYSE calendar the 21:00 ET archive runs on) and diffed
+        // against the rows this book actually has, rather than iterating the
+        // rows — which is the only construction that can see a session that was
+        // never written. Fed the raw snapshot dates, NOT `days[]`, so it stays
+        // independent of the reconciliation row-builder it is auditing.
+        const eodInterior = detectEodInteriorAbsence(
+          snapshots.map(s => s.date),
+          tailCalendar,
+          baselineDate,
+        );
         return {
           username: ctx.username,
           mode,
           eodBackfillPlan,
+          eodInterior,
           openLiveJournalRowCount: openLiveRows == null ? null : openLiveRows.length,
           openLiveJournalAtRiskUsd: openLiveRows == null
             ? null
@@ -4639,6 +4656,21 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         return measured.length === 0 ? null : Math.max(...measured);
       })(),
       ...summarizeLiveEodRowPresence(engines),
+      // TRA-2888 — THE INTERIOR-ABSENCE AXIS, at the head beside the tail axis
+      // it completes. The tail answers "has the writer stopped?"; this answers
+      // "is the recorded history complete?" — and on 2026-08-05 the first read
+      // green while three fleet-wide sessions were permanently gone, because a
+      // tail cohort is emptied by the next row that lands.
+      //
+      // `eodInteriorAbsentRawBookCount` is the ACCEPTANCE arm and is published
+      // deliberately: it counts books whose interior is absent BEFORE the
+      // documented-gap exclusion. If it ever drops to 0 while the fleet still
+      // steps 2026-07-29 -> 2026-08-04, the detector has been blinded and that is
+      // a regression, not a repair. `eodInteriorAbsentOk` is the graded verdict
+      // (post-exclusion) and is TRI-STATE: `null` = NOT MEASURED, never green.
+      ...summarizeEodInteriorAbsence(
+        engines.map(e => ({ username: e.username, mode: e.mode, interior: e.eodInterior })),
+      ),
       // TRA-2829 — the back-fill's PLAN, per live book, read-only.
       //
       // Sits beside the tail axis deliberately: `liveEodTailStaleBooks` says a

@@ -1,5 +1,9 @@
 import type { DailySnapshot } from './pnl-tracker.js';
 import { isJournalAuthoritativeSource } from './options-daily-pnl-source.js';
+// TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
+// imports only a TYPE back from this module (`EodTailCalendar`), which erases at
+// compile time, so this is not a runtime cycle.
+import { PNL_EOD_DOCUMENTED_GAP_NOTE } from './eod-ledger-gap.js';
 
 /**
  * TRA-1633 FIX 3 — cross-surface P&L reconciliation guard.
@@ -141,6 +145,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_ABSENT_EOD_ROW_NOTE,
   PNL_FROZEN_COUNTER_NOTE,
   PNL_LIVE_MODE_SPAN_NOTE,
+  PNL_EOD_DOCUMENTED_GAP_NOTE,
 ];
 
 /**
@@ -1149,6 +1154,17 @@ export function summarizeLiveEodRowPresence(
   // written, so nothing walks them), so it has to be enumerated on its own list.
   // `liveEodRowMissingBooks: []` alongside `liveEodRowsPresentOk: false` is a
   // legitimate reading now, and it means "the tail, not the interior".
+  //
+  // TRA-2888 — RETIRED AS AN ACCEPTANCE PREDICATE. The TRA-2829 line
+  // "`liveEodTailStaleBooks` is empty" must NOT be graded. It is already true on
+  // live and it discriminates nothing: this cohort is `(newestRow,
+  // lastSettledSession]`, so when the fleet wrote its 2026-08-04 rows the anchor
+  // advanced 07-29 -> 08-04 and the three absent sessions left the cohort. The
+  // list went empty by EVICTION, not by repair, and now reads identically on a
+  // healthy ledger and on one missing three fleet-wide sessions. Any tail-shaped
+  // predicate inherits this — the emptiness is structural, not evidential.
+  // Grade `eodInteriorAbsentOk` (`eod-ledger-gap.ts`) instead: it enumerates
+  // expected sessions FROM the exchange calendar, so a later row cannot empty it.
   const tailStale = liveBooks
     .filter(e => (e.eodTailStaleSessions ?? 0) > 0)
     .map(e => ({
