@@ -1155,6 +1155,133 @@ describe('TRA-2658 — the FROZEN counter (the signature counterDurable could no
   });
 });
 
+/**
+ * TRA-2926 — `counterFrozen` / the `unbookedEquityMoveUsd` accusation carry the
+ * IDENTICAL prior-row dependency the lag detector does, and TRA-2888's gate was
+ * not applied to them. On 2026-08-04 (the first session after the permanent
+ * 07-30/07-31/08-03 hole) every row's `prevClosingEquity` was 07-29 — a
+ * six-day span graded as one window — so 36/36 unbooked rows and 12/12 frozen
+ * rows sat on a non-adjacent prior: the mirror image of TRA-2664's vacuous
+ * GREEN on the lag axis, a spurious RED on this one. The fix is a GATE, not a
+ * recomputation: the gap stays permanent, the denominator gets smaller and
+ * honest.
+ */
+describe('TRA-2926 — the frozen accusation is gated on calendar adjacency', () => {
+  const isMarketDay = (iso: string): boolean => {
+    const [y, m, d] = iso.split('-').map(Number);
+    const dow = new Date(Date.UTC(y!, m! - 1, d!)).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const cal = (lastSettledSession: string) => ({ lastSettledSession, isMarketDay });
+
+  it('AC2: the post-gap row reads NOT MEASURED (null) on the counter axis, not false — and never true', () => {
+    // The exact live shape: 07-29 realized options the counter never recorded,
+    // 08-04's equity window spans the gap and carries that money.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-29', 0, 100, 0, 2_000),
+        creditSnap('2026-08-04', 0, 0, 0, 2_100),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    const row = r.days.find(d => d.date === '2026-08-04')!;
+    expect(row.priorSessionAdjacent).toBe(false);
+    expect(row.counterFrozen).toBeNull();
+    // AC1: the suppressed row contributes to NO verdict...
+    expect(r.counterFrozenDates).toEqual([]);
+    // ...but the raw arithmetic is fenced, not deleted — it is still the only
+    // non-motion detector of the frozen signature (issue point 4).
+    expect(row.unbookedEquityMoveUsd).toBeCloseTo(100, 2);
+    expect(r.unbookedEquityMoveDates).toEqual(['2026-08-04']);
+    // AC3: the suppression is enumerable, never silent.
+    expect(r.counterGapSuppressedDates).toEqual(['2026-08-04']);
+    expect(r.counterFrozenGradeableDates).toEqual([]);
+  });
+
+  it('an ALL-suppressed cohort reads NOT MEASURED, not vacuously green', () => {
+    // The other wrong answer the gate could introduce: with every measurable
+    // row suppressed, `counterNonDurableDates` is empty and the pre-fix fold
+    // would claim `counterDurable: true` off a detector that graded nothing.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-29', 0, 100, 0, 2_000),
+        creditSnap('2026-08-04', 0, 0, 0, 2_100),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    expect(r.counterDurable).toBeNull();
+  });
+
+  it('AC4: an ADJACENT prior with a genuinely frozen counter still goes RED', () => {
+    // Identical arithmetic to the gap fixture, adjacent pair (Tue -> Wed). If
+    // this stops firing the gate silenced the true positives too, which is a
+    // regression, not a fix.
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-28', 0, 100, 0, 2_000),
+        creditSnap('2026-07-29', 0, 0, 0, 2_100),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-07-29'),
+    );
+    expect(r.days.find(d => d.date === '2026-07-29')!.priorSessionAdjacent).toBe(true);
+    expect(r.days.find(d => d.date === '2026-07-29')!.counterFrozen).toBe(true);
+    expect(r.counterFrozenDates).toEqual(['2026-07-29']);
+    expect(r.counterDurable).toBe(false);
+    // AC4 asks for the surviving cohort size explicitly: an all-suppressed
+    // cohort would make this test vacuous in the other direction.
+    console.log(`TRA-2926 AC4 surviving gradeable cohort: ${r.counterFrozenGradeableDates.length} session(s)`);
+    expect(r.counterFrozenGradeableDates.length).toBeGreaterThan(0);
+    expect(r.counterGapSuppressedDates).toEqual([]);
+  });
+
+  it('a clean adjacent history keeps its green — the gap row alone is fenced', () => {
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-28', 0, 50, 0, 2_000),
+        // Window +50, equity +50: fully explained, graded clean.
+        creditSnap('2026-07-29', 0, 0, 50, 2_050),
+        // Across the gap: +100 of raw un-booked move, suppressed.
+        creditSnap('2026-08-04', 0, 0, 50, 2_150),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    expect(r.counterFrozenGradeableDates).toEqual(['2026-07-29']);
+    expect(r.counterGapSuppressedDates).toEqual(['2026-08-04']);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(true);
+    expect(r.days.find(d => d.date === '2026-08-04')!.unbookedEquityMoveUsd).toBeCloseTo(100, 2);
+  });
+
+  it('a NEGATIVE window across the gap is still a RESET red — that signature is gap-robust', () => {
+    // A cumulative counter cannot decrease over ANY span, so the reset
+    // signature needs no adjacency and a red from it beats NOT MEASURED (the
+    // standing TRA-2641 verdict order).
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-29', 0, 40, 200, 2_000),
+        creditSnap('2026-08-04', 0, 0, 0, 2_000),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-04'),
+    );
+    expect(r.counterResetDates).toEqual(['2026-08-04']);
+    expect(r.counterFrozenDates).toEqual([]);
+    expect(r.counterDurable).toBe(false);
+  });
+
+  it('changes nothing when no calendar is supplied — a gap cannot be proven, so behaviour is unchanged', () => {
+    const r = reconcilePnl(
+      [
+        creditSnap('2026-07-29', 0, 100, 0, 2_000),
+        creditSnap('2026-08-04', 0, 0, 0, 2_100),
+      ],
+      new Map(), '2026-07-12',
+    );
+    expect(r.days.find(d => d.date === '2026-08-04')!.counterFrozen).toBe(true);
+    expect(r.counterFrozenDates).toEqual(['2026-08-04']);
+    expect(r.counterGapSuppressedDates).toEqual([]);
+  });
+});
+
 describe('TRA-2658 — liveCounterDurableOk', () => {
   const cbook = (username: string, mode: string, counterDurable: boolean | null) => ({
     username,

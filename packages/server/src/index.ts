@@ -4683,9 +4683,24 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           maxUnbookedEquityMoveUsd: e.maxUnbookedEquityMoveUsd,
           uncreditedOptionsUsd: e.uncreditedOptionsUsd,
         })),
+      // TRA-2926 — books carrying a session whose frozen-counter accusation was
+      // suppressed because its prior ROW sits across a session gap (the TRA-2888
+      // hole). Published for the same reason `priorOptionsLagGapSuppressedBooks`
+      // is: on 2026-08-04 this is where 12 spurious `counterFrozen` books and 36
+      // "unbooked" rows went, and a silently shrunken cohort reads exactly like
+      // one that was always this size.
+      counterGapSuppressedBooks: engines
+        .filter(e => e.counterGapSuppressedDates.length > 0)
+        .map(e => ({
+          username: e.username,
+          mode: e.mode,
+          dates: e.counterGapSuppressedDates,
+        })),
       // The DENOMINATOR for the fold above. `counterDurableOk: true` over 0 books
       // that ever wrote the counter and over 20 that did are different claims, and
-      // without this they are the same reading.
+      // without this they are the same reading. TRA-2926 — `counterDurable` now
+      // reads `null` on a book whose frozen detector graded no session, so this
+      // count no longer includes books measurable only across the gap.
       counterGradeableBookCount: engines.filter(e => e.counterDurable !== null).length,
       // TRA-2637 (QuantTrader) — THE ABSENCE AXIS. Every verdict above grades a
       // VALUE; none of them can see a session that has no row at all, and the

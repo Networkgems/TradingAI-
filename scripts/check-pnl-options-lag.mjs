@@ -536,6 +536,12 @@ export function frozenSessionsForBook(days) {
         ((Number(cur.closingEquity) - Number(prev.closingEquity)) - stockDaily - creditWindow) * 100,
       ) / 100;
     pool -= Math.abs(creditWindow);
+    // TRA-2926 — the same gap gate the server now applies: across the permanent
+    // TRA-2888 hole `prev` is not the preceding exchange session, so `move`
+    // spans several settled sessions and real gap-session P&L lands as
+    // "unbooked". A non-adjacent pair cannot be accused; absent field (old
+    // build, synthetic control rows) grades as before.
+    if (cur?.priorSessionAdjacent === false) continue;
     if (Math.abs(move) <= TOLERANCE_USD) continue;
     if (Math.abs(creditWindow) > TOLERANCE_USD) continue;
     if (Math.abs(move) > pool + TOLERANCE_USD) continue;
@@ -2863,6 +2869,40 @@ function selftest() {
       return { counterDurable: b.counterDurable, frozen: b.counterFrozenDates };
     })(),
     { counterDurable: false, frozen: [{ date: '2026-07-29', move: 500 }] },
+  );
+
+  // ── TRA-2926: the frozen accusation is GAP-GATED ────────────────────────────
+  check(
+    'CREDIT/TRA-2926: a frozen-shaped row across the TRA-2888 gap is NOT accused',
+    (() => {
+      // The exact 2026-08-04 shape: the prior ROW is 07-29, three settled
+      // sessions back, so the equity window spans the gap and the "unbooked"
+      // money is the gap sessions' real P&L. `priorSessionAdjacent: false` is
+      // what the server row carries there.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 500, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-08-04', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2360, priorSessionAdjacent: false },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return { frozen: b.counterFrozenDates };
+    })(),
+    { frozen: [] },
+  );
+
+  check(
+    'CREDIT/TRA-2926: the SAME rows with an ADJACENT prior are still accused — the gate keeps the true positive',
+    (() => {
+      // The regression arm the gate must not introduce: identical arithmetic,
+      // adjacent pair. If this stops firing, the gate silenced the detector
+      // rather than fencing the gap.
+      const p = { engines: [{ username: 'admin', mode: 'live', days: [
+        { date: '2026-07-28', stockDaily: 0, optionsDaily: 500, optionsCreditedCumulative: 0, closingEquity: 2000 },
+        { date: '2026-07-29', stockDaily: 0, optionsDaily: 0, optionsCreditedCumulative: 0, closingEquity: 2360, priorSessionAdjacent: true },
+      ] }] };
+      const b = gradeCreditObservation(p).books[0];
+      return { frozen: b.counterFrozenDates };
+    })(),
+    { frozen: [{ date: '2026-07-29', move: 360 }] },
   );
 
   // ── TRA-2630 AC3: the frozen axis as its own VERDICT ────────────────────────
