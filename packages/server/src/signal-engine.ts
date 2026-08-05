@@ -147,6 +147,7 @@ import {
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
+import { recordMarkObservation } from './option-mark-sanity.js'; // TRA-2927
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
 import { isMultiLegExitEnabled } from './multileg-exit-flag.js';
@@ -6391,7 +6392,25 @@ export class SignalEngine {
         for (const o of group) {
           try {
             const mark = await this.rvScanner!.getOptionMark(o.symbol, o.expiration!, o.optionSymbol!);
-            if (mark != null && mark > 0) marks.set(o.optionSymbol!, mark);
+            if (mark != null && mark > 0) {
+              // TRA-2927 — observe the mark HERE, at the one seam where the tick's map
+              // is built, so the tape covers BOTH consumers (`checkExits` for
+              // engine-opened rows, `refreshImportedMarks` for Tradier-mirrored ones).
+              // The live OTM sleeve's rows are engine-opened, so an imports-only
+              // observer would read a clean 0 against the very book that produced the
+              // 2026-08-03 phantom peak. Observe-only: the mark is set either way.
+              recordMarkObservation({
+                optionSymbol: o.optionSymbol!,
+                symbol: o.symbol,
+                mode: o.mode === 'live' ? 'live' : 'demo',
+                mark,
+                priorMark: o.currentPremium,
+                entryPremium: o.premiumPaid,
+                contracts: o.contractsRemaining ?? o.contracts,
+                now: Date.now(),
+              });
+              marks.set(o.optionSymbol!, mark);
+            }
           } catch (err: unknown) {
             log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
           }

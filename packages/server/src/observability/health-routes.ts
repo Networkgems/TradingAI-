@@ -95,6 +95,7 @@ import {
   summarizeGiveBackArmFloor,
   type GiveBackArmFloorSummary,
 } from '../giveback-arm-floor-ledger.js'; // TRA-1892 / TRA-2220
+import { summarizeMarkSanity } from '../option-mark-sanity.js'; // TRA-2927
 import { evaluateDurability } from '../durability.js'; // TRA-1681
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
@@ -3421,6 +3422,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       sessions: summary.sessions,
       lastRecordAt: summary.lastRecordAt,
       note: givebackArmFloorNote(summary),
+      // TRA-2927 — leg-level attribution for an out-of-family `peakPnl`, co-located
+      // with the sessions above ON PURPOSE: the row that shows the phantom peak and
+      // the marks that could have produced it must be readable in ONE payload, or
+      // the next occurrence gets triaged from the fold alone again. Read
+      // `markSanity.observed` FIRST — `flagged: 0` on `observed: 0` is an ABSENCE.
+      // Observe-only: nothing below was rejected, every one of these marks reached
+      // `peakOpenGain`. Since-boot and NOT durable (bqb1 restarts several times a
+      // day) — unlike `sessions`, which is hydrated from /data.
+      markSanity: summarizeMarkSanity(),
     });
   });
 
