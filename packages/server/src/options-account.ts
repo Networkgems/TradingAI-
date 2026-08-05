@@ -4832,8 +4832,9 @@ export class PaperOptionsAccount {
       const closed = this.closeBrokerFlatPosition(
         id,
         'Closed by Tradier reconcile: the broker no longer reports this ' +
-          'position, so it was closed here at the last known mark. Realized ' +
-          'P&L is an estimate until the end-of-day Tradier history reconcile.',
+          'position, so it was closed here at BREAK-EVEN (the premium the ' +
+          'open debited) and books $0 realized. The real P&L of the broker-' +
+          'side exit lands via the end-of-day Tradier history reconcile.',
       );
       if (closed) removed += 1;
     }
@@ -5005,8 +5006,10 @@ export class PaperOptionsAccount {
    */
   /**
    * TRA-2799 — close an ENGINE-OPENED live row that the broker no longer
-   * holds, at the row's last known mark, and stamp `reason` on the archived
-   * snapshot so the close is self-explaining in Recent Closed Options.
+   * holds, and stamp `reason` on the archived snapshot so the close is
+   * self-explaining in Recent Closed Options. Booked at BREAK-EVEN — see the
+   * TRA-2801 note below, which is the authority on the price and which this
+   * header used to contradict (TRA-2819).
    *
    * Two callers, one accounting path:
    *   • the broker-missing sweep in {@link reconcileTradierPositions}, after

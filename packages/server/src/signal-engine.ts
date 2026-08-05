@@ -6604,8 +6604,9 @@ export class SignalEngine {
       opt.id,
       `Closed by Tradier reconcile: the broker rejected the close because it ` +
         `holds no long position in ${optionSymbol}, and /positions confirms it ` +
-        `is flat. Closed here at the last known mark; realized P&L is an ` +
-        `estimate until the end-of-day Tradier history reconcile.`,
+        `is flat. Closed here at BREAK-EVEN, booking $0 realized; the real ` +
+        `P&L of the broker-side exit lands via the end-of-day Tradier ` +
+        `history reconcile.`,
     );
     if (!closed) return false;
     log.info('closed stranded live option — broker reports flat', {

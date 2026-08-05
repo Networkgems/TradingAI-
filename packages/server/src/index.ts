@@ -10993,8 +10993,8 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
         status: 'reconciled',
         reason: outcome.reason,
         message:
-          'Tradier no longer holds this position, so it was closed here at the last known mark. ' +
-          'Realized P&L is an estimate until the end-of-day Tradier history reconcile.',
+          'Tradier no longer holds this position, so it was closed here at break-even, booking $0 realized. ' +
+          'The real P&L of the broker-side exit lands via the end-of-day Tradier history reconcile.',
         ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}),
       });
       return;

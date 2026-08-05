@@ -110,7 +110,7 @@ export function useStockOptionClose(token: string, tradierEnv: 'sandbox' | 'prod
     // what they clicked for), so this outcome gets its own message.
     if (data?.status === 'reconciled') {
       const message = data.message
-        ?? 'Tradier no longer holds this position — closed here at the last known mark.';
+        ?? 'Tradier no longer holds this position — closed here at break-even, booking $0 realized.';
       logger.info('stock-close', 'stale option row reconciled against a flat broker', {
         optionId,
         reason: data.reason,
