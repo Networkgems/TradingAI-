@@ -2594,6 +2594,46 @@ export interface OptionPosition {
    */
   importedFromTradier?: boolean;
   /**
+   * TRA-2820 — why this row carries the UNMANAGED sentinel schedule
+   * (`stopLossPremium: 0`, `tp1Premium: Infinity`). Set by
+   * `applyImportedRiskThresholds` whenever it takes the sentinel path, cleared
+   * whenever it installs a real schedule.
+   *
+   * A bare `stopLossPremium: 0` is indistinguishable from "no stop wanted", and
+   * on the live book those two readings differ by the whole position. QA read
+   * 8 live contracts / $216 of real premium as unstopped on 2026-08-04 and
+   * could not tell from the payload whether that was a policy decision or a
+   * dropped schedule. This field is that discriminator, and it is what
+   * `/api/health/options-live` counts so a zero stop is never silent.
+   *
+   *   • `auto_manage_off`    — the user turned auto-manage off; the row is
+   *                            deliberately the user's to close.
+   *   • `sub_floor_premium`  — TRA-462: premium is below `RV_MIN_MARK_FLOOR`,
+   *                            so the RV import schedule cannot place a stop
+   *                            that quote microstructure will not book out.
+   *                            NOTE this reason cannot apply to a row we can
+   *                            prove the engine opened — see
+   *                            {@link engineOriginSleeve}.
+   */
+  riskUnmanagedReason?: 'auto_manage_off' | 'sub_floor_premium';
+  /**
+   * TRA-2820 — the sleeve that ACTUALLY placed this contract, recovered from
+   * the live fee/slippage ledger's `buy_to_open` row (the same TRA-2811
+   * provenance join the close-side recorder uses).
+   *
+   * Set only on rows the Tradier reconcile RECONSTRUCTED (`importedFromTradier`)
+   * but which the app itself had opened — the engine placed the order, the
+   * position row was never created (or was lost across a boot), and the
+   * reconcile then re-adopted our own inventory as if it were unknown
+   * broker-side holdings. Absent ⇔ genuinely foreign inventory.
+   *
+   * Its job is to keep such a row on ITS OWN sleeve's risk schedule instead of
+   * the RV import schedule: the OTM sleeve legitimately buys contracts below
+   * `RV_MIN_MARK_FLOOR`, so applying the RV sub-floor sentinel to an OTM row
+   * silently disarms a position we opened with real money.
+   */
+  engineOriginSleeve?: 'single_leg_rv' | 'single_leg_otm' | 'single_leg_directional';
+  /**
    * TRA-348 — Tradier order id for an in-flight `sell_to_close` against an
    * imported position. Set when the close order was accepted but did not
    * reach a terminal `filled` state inside the wait window (after-hours,

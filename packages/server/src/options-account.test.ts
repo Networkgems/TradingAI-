@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PaperOptionsAccount } from './options-account.js';
-import type { OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
+import { PaperOptionsAccount, summarizeLiveUnmanagedRisk } from './options-account.js';
+import type { OptionPosition, OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
+import { OTM_RISK_PARAMS, OPTIONS_SL_PCT } from '@trading-app/shared';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
 // TRA-2893 — the chandelier primitives, so the pre-fix expression can be
 // replayed against the SAME code the account calls (not a re-implementation).
@@ -1447,6 +1448,233 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(acct.getState().openOptions).toHaveLength(0);
     // Cash untouched — imported positions never lived on the paper bucket.
     expect(acct.getState().optionsCash).toBe(cashBefore);
+  });
+});
+
+// ─── TRA-2820: engine-opened rows re-adopted as imports keep their stops ─────
+//
+// The 2026-08-04 live case, reproduced exactly. `TSLA260911C00555000` and
+// `TSLA260911C00560000` were placed by the app (`single_leg_otm`, 4 contracts
+// each, filled 0.27) but the position rows never landed, so the next Tradier
+// reconcile adopted our own inventory as foreign. 0.27 is below
+// `RV_MIN_MARK_FLOOR` (0.40), so the import path took TRA-462's sub-floor
+// sentinel and left 8 live contracts with `stopLossPremium: 0` and
+// `tp1Premium: Infinity` — no stop, no take-profit, for a whole session.
+
+/** Minimal `OptionPosition` for exercising the summariser directly. */
+function buildBarePosition(): OptionPosition {
+  return {
+    id: 'p-1',
+    symbol: 'TSLA',
+    optionSymbol: 'TSLA260911C00555000',
+    optionType: 'call',
+    contracts: 4,
+    contractsRemaining: 4,
+    premiumPaid: 0.27,
+    currentPremium: 0.27,
+    tp1Premium: Number.POSITIVE_INFINITY,
+    tp1Hit: false,
+    stopLossPremium: 0,
+    peakPremium: 0.27,
+    trailingActive: false,
+    trailingStopPremium: 0,
+    underlyingEntryPrice: 0,
+    openedAt: TRADING_TIME,
+    signalId: 'tradier-import-TSLA260911C00555000',
+    signalType: 'tradier_import',
+  };
+}
+
+/** The 08-04 TSLA contract, as Tradier reported it back to the reconcile. */
+function buildTslaImport(overrides: Partial<TradierOpenOptionPosition> = {}): TradierOpenOptionPosition {
+  return {
+    optionSymbol: 'TSLA260911C00555000',
+    underlying: 'TSLA',
+    optionType: 'call',
+    strike: 555,
+    expiration: '2026-09-11',
+    contracts: 4,
+    premiumPaid: 0.27,
+    acquiredAt: TRADING_TIME,
+    ...overrides,
+  };
+}
+
+describe('PaperOptionsAccount reconcile — engine-origin risk schedule (TRA-2820)', () => {
+  it('PRE-FIX SHAPE: with no ledger provenance a sub-floor live import is left unmanaged — and now SAYS SO', () => {
+    // The oracle answers null ⇒ genuinely foreign inventory ⇒ TRA-462 stands.
+    // What changed is that the zero is no longer silent.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      resolveLiveOpenSleeve: () => null,
+    });
+
+    acct.reconcileTradierPositions([buildTslaImport()], 'live');
+
+    const opt = acct.getState().openOptions[0]!;
+    expect(opt.stopLossPremium).toBe(0);
+    expect(opt.tp1Premium).toBe(Number.POSITIVE_INFINITY);
+    expect(opt.riskUnmanagedReason).toBe('sub_floor_premium');
+    expect(opt.engineOriginSleeve).toBeUndefined();
+
+    // Countable from outside without a credential, and NOT "unexplained".
+    expect(acct.liveUnmanagedRiskSummary()).toEqual({
+      total: 1,
+      byReason: { sub_floor_premium: 1 },
+      unexplained: 0,
+    });
+  });
+
+  it('an OTM contract the app itself opened keeps the OTM schedule, not the RV sub-floor sentinel', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      resolveLiveOpenSleeve: sym => (sym === 'TSLA260911C00555000' ? 'single_leg_otm' : null),
+    });
+
+    acct.reconcileTradierPositions([buildTslaImport()], 'live');
+
+    const opt = acct.getState().openOptions[0]!;
+    // The exact arithmetic `openOtmMispricingPosition` would have installed —
+    // the row lands where it would have been had it never been lost.
+    expect(opt.stopLossPremium).toBeCloseTo(0.27 * (1 - OTM_RISK_PARAMS.slPct), 10);
+    expect(opt.tp1Premium).toBeCloseTo(0.27 * (1 + OTM_RISK_PARAMS.tp1Pct), 10);
+    expect(opt.trailingStopPremium).toBeCloseTo(0.27 * (1 + OTM_RISK_PARAMS.trailActivatePct), 10);
+    expect(opt.trailingActive).toBe(false);
+    expect(opt.tp1Hit).toBe(false);
+    // The stop is a real one, five ticks wide — not the sub-tick stop TRA-462
+    // exists to refuse.
+    expect(opt.stopLossPremium).toBeGreaterThan(0);
+    expect(0.27 - opt.stopLossPremium).toBeGreaterThan(0.02);
+
+    // Provenance is recorded, and the row is NOT counted as unmanaged.
+    expect(opt.engineOriginSleeve).toBe('single_leg_otm');
+    expect(opt.riskUnmanagedReason).toBeUndefined();
+    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0 });
+  });
+
+  it('an RV-origin row gets the dollar-floored RV stop; a directional one gets the ATM defaults', () => {
+    const rv = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      resolveLiveOpenSleeve: () => 'single_leg_rv',
+    });
+    rv.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.60 })], 'live');
+    const rvOpt = rv.getState().openOptions[0]!;
+    // TRA-461 dollar floor binds at 0.60: max(0.60×0.25, 0.10) = 0.15 ⇒ 0.45.
+    expect(rvOpt.stopLossPremium).toBeCloseTo(0.45, 10);
+    expect(rvOpt.engineOriginSleeve).toBe('single_leg_rv');
+
+    const dir = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      // TRA-2245's legacy alias must normalise to the current spelling.
+      resolveLiveOpenSleeve: () => 'directional',
+    });
+    dir.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.60 })], 'live');
+    const dirOpt = dir.getState().openOptions[0]!;
+    expect(dirOpt.stopLossPremium).toBeCloseTo(0.60 * (1 - OPTIONS_SL_PCT), 10);
+    expect(dirOpt.engineOriginSleeve).toBe('single_leg_directional');
+  });
+
+  it('the DEMO book never takes the engine-origin path — the ledger records live fills only', () => {
+    // If it did, an OCC collision between a demo row and a live ledger entry
+    // would silently rewrite the demo row's schedule.
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'sandbox',
+      resolveLiveOpenSleeve: () => 'single_leg_otm',
+    });
+
+    acct.reconcileTradierPositions([buildTslaImport()], 'demo');
+
+    const opt = acct.getState().openOptions[0]!;
+    expect(opt.engineOriginSleeve).toBeUndefined();
+    expect(opt.stopLossPremium).toBe(0);
+    expect(opt.riskUnmanagedReason).toBe('sub_floor_premium');
+    // Demo rows are out of scope for the live counter entirely.
+    expect(acct.liveUnmanagedRiskSummary()).toEqual({ total: 0, byReason: {}, unexplained: 0 });
+  });
+
+  it('a premium restatement on an engine-origin row re-derives its OWN schedule, not the import one', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      resolveLiveOpenSleeve: () => 'single_leg_otm',
+    });
+    acct.reconcileTradierPositions([buildTslaImport()], 'live');
+
+    // Broker restates the basis upward (partial fill / adjustment).
+    acct.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.31 })], 'live');
+
+    const opt = acct.getState().openOptions[0]!;
+    expect(opt.premiumPaid).toBeCloseTo(0.31, 10);
+    expect(opt.stopLossPremium).toBeCloseTo(0.31 * (1 - OTM_RISK_PARAMS.slPct), 10);
+    expect(opt.riskUnmanagedReason).toBeUndefined();
+  });
+
+  it('turning auto-manage OFF does not disarm an engine-origin row — it is not the user’s foreign inventory', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 25_000,
+      tradierEnv: 'production',
+      autoManageImportedTradierOptions: true,
+      resolveLiveOpenSleeve: sym => (sym === 'TSLA260911C00555000' ? 'single_leg_otm' : null),
+    });
+    acct.reconcileTradierPositions([
+      buildTslaImport(),
+      // Genuinely foreign, above the floor: the toggle DOES govern this one.
+      buildTradierPosition({ premiumPaid: 1.60 }),
+    ], 'live');
+
+    acct.updateConfig({ autoManageImportedTradierOptions: false });
+
+    const state = acct.getState();
+    const ours = state.openOptions.find(o => o.optionSymbol === 'TSLA260911C00555000')!;
+    const theirs = state.openOptions.find(o => o.optionSymbol === 'SPY260515C00450000')!;
+
+    expect(ours.stopLossPremium).toBeCloseTo(0.27 * (1 - OTM_RISK_PARAMS.slPct), 10);
+    expect(ours.riskUnmanagedReason).toBeUndefined();
+
+    expect(theirs.stopLossPremium).toBe(0);
+    expect(theirs.riskUnmanagedReason).toBe('auto_manage_off');
+  });
+
+  it('an ENGINE-OPENED row that still exists is never re-typed as an import (TRA-2820 ask 3)', () => {
+    // The half of the seam that was already correct, locked in: a reconcile
+    // over a row we DO hold restates the basis (TRA-2889) and leaves
+    // provenance and the risk block alone.
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'production' });
+    vi.setSystemTime(TRADING_TIME);
+    const opened = acct.openOptionFromCandidate(
+      buildSignal({ optionSymbol: 'TSLA260911C00555000', symbol: 'TSLA', mark: 0.27, entryPrice: 300 }),
+      'live',
+    );
+    expect(opened).not.toBeNull();
+
+    acct.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.30 })], 'live');
+
+    const opt = acct.getState().openOptions[0]!;
+    expect(opt.signalType).toBe('otm_mispricing');
+    expect(opt.importedFromTradier).toBeUndefined();
+    expect(opt.premiumPaid).toBeCloseTo(0.30, 10); // basis restated to broker truth
+    expect(opt.stopLossPremium).toBeGreaterThan(0);
+    expect(opt.riskUnmanagedReason).toBeUndefined();
+    expect(acct.liveUnmanagedRiskSummary().unexplained).toBe(0);
+  });
+
+  it('summarizeLiveUnmanagedRisk flags an UNEXPLAINED zero stop — a legacy/dropped schedule', () => {
+    // A row persisted before `riskUnmanagedReason` existed, or one whose
+    // schedule went missing by some path not yet found. This is the number
+    // that must stay 0 on the live book.
+    expect(
+      summarizeLiveUnmanagedRisk([
+        { ...buildBarePosition(), mode: 'live', stopLossPremium: 0 },
+        { ...buildBarePosition(), mode: 'live', stopLossPremium: 0.2 },
+        { ...buildBarePosition(), mode: 'demo', stopLossPremium: 0 },
+        { ...buildBarePosition(), mode: 'live', stopLossPremium: 0, closedAt: TRADING_TIME },
+      ]),
+    ).toEqual({ total: 0, byReason: {}, unexplained: 1 });
   });
 });
 

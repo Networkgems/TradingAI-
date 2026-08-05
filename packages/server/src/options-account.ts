@@ -41,6 +41,8 @@ import {
   dteFromExpiration,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
+// TRA-2820 — provenance oracle for the Tradier reconcile (TRA-2811's ledger join).
+import { lastRecordedOpenSleeve, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import {
   type MarketableOpenMtmConfig,
   DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
@@ -418,6 +420,10 @@ function applyImportedRiskThresholds(
     opt.stopLossPremium = 0;
     opt.trailingActive = false;
     opt.trailingStopPremium = 0;
+    // TRA-2820 — stamp WHY, so a zero stop is never a silent zero. `0` and
+    // "deliberately unmanaged" are the same bytes in the payload; only this
+    // field separates them, and `/api/health/options-live` counts it.
+    opt.riskUnmanagedReason = !autoManage ? 'auto_manage_off' : 'sub_floor_premium';
     return;
   }
   opt.stopLossPremium = rvStopLossPremium(opt.premiumPaid, rvRiskParams);
@@ -426,6 +432,131 @@ function applyImportedRiskThresholds(
   // once `mark >= premium * (1 + trailActivatePct)` activates trailing.
   opt.trailingStopPremium = opt.premiumPaid * (1 + rvRiskParams.trailActivatePct);
   opt.trailingActive = false;
+  delete opt.riskUnmanagedReason;
+}
+
+/**
+ * TRA-2820 — install the risk schedule of the sleeve that ACTUALLY opened this
+ * contract, on a row the Tradier reconcile reconstructed as an import.
+ *
+ * ── The seam ────────────────────────────────────────────────────────────────
+ * `reconcileTradierPositions` decides "ours vs foreign" by asking whether an
+ * `openOptions` row already exists for the OCC symbol. That is a question about
+ * OUR bookkeeping, not about who placed the order — so when the engine places a
+ * live order and the position row never lands (the fill poll does not terminate
+ * inside the wait window, or the row is lost across a boot), the very next
+ * reconcile re-adopts our own inventory as unknown broker inventory and hands
+ * it the RV IMPORT schedule.
+ *
+ * On 2026-08-04 that cost two real positions their stops. `TSLA260911C00555000`
+ * and `TSLA260911C00560000` were placed by the app (`single_leg_otm`, orders
+ * `140022786` / `140028461`, filled 0.27 × 4 each) and came back typed
+ * `tradier_import` with `stopLossPremium: 0` and `tp1Premium: null` — because
+ * 0.27 is below `RV_MIN_MARK_FLOOR` (0.40) and the import path took TRA-462's
+ * sub-floor sentinel. 8 live contracts / $216 of real premium with no stop and
+ * no take-profit, for a whole session.
+ *
+ * ── Why the sub-floor bail is WRONG here specifically ───────────────────────
+ * TRA-462 refuses to risk-manage a sub-floor import because the RV schedule's
+ * stop would be sub-tick and quote microstructure books the position out — the
+ * TRA-361/461 failure. That reasoning is about applying the RV schedule to a
+ * contract the RV SCANNER would never have selected. It does not transfer to a
+ * contract the OTM sleeve deliberately bought: OTM tickets are cheap far-tail
+ * options by design (`OTM_OPTIONS_SL_PCT` 0.20 on a 0.27 premium is a 5.4¢ stop
+ * distance, five ticks, not sub-tick), and the sleeve's own sweep-calibrated
+ * schedule is what the engine would have installed had the row survived.
+ *
+ * So this reproduces the ORIGINATING sleeve's arithmetic exactly, rather than
+ * inventing a third schedule — the row ends up where it would have been if it
+ * had never been lost. It deliberately does NOT re-apply a dollar floor the
+ * originating sleeve does not have; that would be a different (tighter) stop
+ * than the engine's, silently, on a real-money position.
+ *
+ * ── Provenance oracle ───────────────────────────────────────────────────────
+ * The live fee/slippage ledger's `buy_to_open` row, via
+ * `lastRecordedOpenSleeve` — the same join TRA-2811 already established as
+ * authoritative for the close-side sleeve, and for the same reason:
+ * `signalType` does not survive every path a position takes between open and
+ * close, but the ledger row was written by the code that CHOSE the sleeve.
+ * It hydrates from disk on boot (30-day retention), so the join survives the
+ * reboot that loses the position row — wherever the ledger itself is durable
+ * (`DATA_DIR`; see TRA-1719). No ledger row ⇒ genuinely foreign inventory ⇒
+ * the import schedule, unchanged.
+ */
+/** TRA-2820 — see {@link summarizeLiveUnmanagedRisk}. */
+export interface LiveUnmanagedRiskSummary {
+  /** Live open rows carrying the unmanaged sentinel. */
+  total: number;
+  /** That total split by `riskUnmanagedReason`. */
+  byReason: Record<string, number>;
+  /**
+   * Live open rows whose `stopLossPremium` is not > 0 but which carry NO
+   * reason — i.e. an unexplained zero stop. This is the number that should
+   * always be 0: a zero stop with a reason is a decision, a zero stop without
+   * one is a dropped schedule (the TRA-2820 defect itself). Rows persisted
+   * before this field existed also land here, which is correct — they are
+   * exactly as unexplained.
+   */
+  unexplained: number;
+}
+
+/**
+ * TRA-2820 — count live open rows that are not actually under management.
+ *
+ * Counts and reasons only, never OCC symbols: this feeds the no-auth
+ * `/api/health/options-live`, and TRA-2163 is the standing reason not to widen
+ * what that route discloses about the real-money book. A non-zero `unexplained`
+ * is the signal to go read the authenticated `/api/state`.
+ */
+export function summarizeLiveUnmanagedRisk(
+  positions: Iterable<OptionPosition>,
+): LiveUnmanagedRiskSummary {
+  const byReason: Record<string, number> = {};
+  let total = 0;
+  let unexplained = 0;
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    if (opt.riskUnmanagedReason) {
+      total += 1;
+      byReason[opt.riskUnmanagedReason] = (byReason[opt.riskUnmanagedReason] ?? 0) + 1;
+      continue;
+    }
+    if (!Number.isFinite(opt.stopLossPremium) || opt.stopLossPremium <= 0) unexplained += 1;
+  }
+  return { total, byReason, unexplained };
+}
+
+function applyEngineOriginRiskThresholds(
+  opt: OptionPosition,
+  sleeve: LiveFillSleeve,
+  otmRiskParams: OtmRiskParams,
+  rvRiskParams: RvRiskParams,
+): void {
+  opt.tp1Hit = false;
+  opt.trailingActive = false;
+  // `directional` is TRA-2245's legacy alias for the same sleeve; normalise so
+  // the persisted field has one spelling.
+  const normalized = sleeve === 'directional' ? 'single_leg_directional' : sleeve;
+  opt.engineOriginSleeve = normalized;
+
+  if (normalized === 'single_leg_rv') {
+    // Matches `openRelativeValuePosition` (dollar-floored stop, TRA-461).
+    opt.stopLossPremium = rvStopLossPremium(opt.premiumPaid, rvRiskParams);
+    opt.tp1Premium = opt.premiumPaid * (1 + rvRiskParams.tp1Pct);
+    opt.trailingStopPremium = opt.premiumPaid * (1 + rvRiskParams.trailActivatePct);
+  } else if (normalized === 'single_leg_otm') {
+    // Matches `openOtmMispricingPosition`.
+    opt.stopLossPremium = opt.premiumPaid * (1 - otmRiskParams.slPct);
+    opt.tp1Premium = opt.premiumPaid * (1 + otmRiskParams.tp1Pct);
+    opt.trailingStopPremium = opt.premiumPaid * (1 + otmRiskParams.trailActivatePct);
+  } else {
+    // ATM / directional single-leg — the account-wide defaults.
+    opt.stopLossPremium = opt.premiumPaid * (1 - OPTIONS_SL_PCT);
+    opt.tp1Premium = opt.premiumPaid * (1 + OPTIONS_TP1_PCT);
+    opt.trailingStopPremium = opt.premiumPaid * (1 + OPTIONS_TRAIL_ACTIVATE_PCT);
+  }
+  delete opt.riskUnmanagedReason;
 }
 
 /**
@@ -528,6 +659,16 @@ interface OptionsAccountConfig {
    * uses `RV_RISK_PARAMS` from `@trading-app/shared`.
    */
   rvRiskParams?: RvRiskParams;
+  /**
+   * TRA-2820 — provenance oracle for the Tradier reconcile: given an OCC
+   * symbol, the sleeve whose `buy_to_open` opened it on the LIVE book, or
+   * `null` when we have no record of opening it (⇒ foreign inventory).
+   *
+   * Defaults to `lastRecordedOpenSleeve` (the live fee/slippage ledger).
+   * Injected in tests so the ledger's module-level state and its on-disk
+   * append are not a test dependency.
+   */
+  resolveLiveOpenSleeve?: (optionSymbol: string) => LiveFillSleeve | null;
   /**
    * TRA-361 — auto-manage Tradier-imported option positions (run them through
    * the engine SL / TP1-partial / trailing pipeline and mirror exits to
@@ -678,6 +819,8 @@ export class PaperOptionsAccount {
   /** TRA-191 — relative-value scanner tickets, counted into the total. */
   private dailyRvCount = 0;
   private rvRiskParams: RvRiskParams;
+  /** TRA-2820 — see `OptionsAccountConfig.resolveLiveOpenSleeve`. */
+  private resolveLiveOpenSleeve: (optionSymbol: string) => LiveFillSleeve | null;
   private tradierEnv: TradierEnv | null;
   /**
    * TRA-361 — when true, Tradier-imported positions run through the engine
@@ -778,6 +921,7 @@ export class PaperOptionsAccount {
     this.optionsDailyTradesLimit = config.optionsDailyTradesLimit ?? DEFAULT_ACCOUNT_SETTINGS.optionsDailyTradesLimit;
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
+    this.resolveLiveOpenSleeve = config.resolveLiveOpenSleeve ?? lastRecordedOpenSleeve;
     this.tradierEnv = config.tradierEnv ?? null;
     this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions ?? true;
     // TRA-374 — start at 0/0 by default so the cost model is opt-in until
@@ -1113,6 +1257,14 @@ export class PaperOptionsAccount {
       if (prev !== next) {
         for (const opt of this.openOptions.values()) {
           if (!opt.importedFromTradier) continue;
+          // TRA-2820 — an engine-origin row is NOT the user's foreign inventory,
+          // so the auto-manage toggle (which governs whether we manage holdings
+          // the user brought to the account) must not disarm it. Re-derive its
+          // own sleeve's schedule off the current `premiumPaid` instead.
+          if (opt.engineOriginSleeve) {
+            applyEngineOriginRiskThresholds(opt, opt.engineOriginSleeve, this.otmRiskParams, this.rvRiskParams);
+            continue;
+          }
           applyImportedRiskThresholds(opt, this.rvRiskParams, next);
         }
       }
@@ -4307,7 +4459,7 @@ export class PaperOptionsAccount {
           // re-derive SL/TP1/trailing thresholds off the new entry price.
           // Without this the SL fires off a stale `premiumPaid` snapshot.
           if (premiumChanged) {
-            applyImportedRiskThresholds(existing, this.rvRiskParams, this.autoManageImportedTradierOptions);
+            this.installReconcileRiskThresholds(existing, mode);
           }
           updated += 1;
         }
@@ -4342,12 +4494,69 @@ export class PaperOptionsAccount {
         importedFromTradier: true,
         ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       };
-      applyImportedRiskThresholds(position, this.rvRiskParams, this.autoManageImportedTradierOptions);
+      this.installReconcileRiskThresholds(position, mode);
       this.openOptions.set(position.id, position);
       added += 1;
     }
 
     return { added, updated, removed, total: positions.length };
+  }
+
+  /**
+   * TRA-2820 — install the risk schedule on a row the Tradier reconcile is
+   * adopting, choosing between the ENGINE-ORIGIN schedule and the IMPORT
+   * schedule on evidence rather than on the absence of our own bookkeeping.
+   *
+   * Only the LIVE book is eligible for the engine-origin path: the fee/slippage
+   * ledger records live fills only (a demo row pays a MODELLED cost and writes
+   * nothing there), so on a demo reconcile the oracle would answer `null` for
+   * every symbol and the branch would be dead weight that could only ever
+   * mis-fire on an OCC collision.
+   *
+   * Fails LOUD in the one direction that matters: a live row left with a zero
+   * stop is logged at warn with the reason it carries, because that row is real
+   * money with nothing evaluating against it.
+   */
+  private installReconcileRiskThresholds(opt: OptionPosition, mode: AccountMode): void {
+    if (mode === 'live' && opt.optionSymbol) {
+      const sleeve = this.resolveLiveOpenSleeve(opt.optionSymbol);
+      if (sleeve) {
+        applyEngineOriginRiskThresholds(opt, sleeve, this.otmRiskParams, this.rvRiskParams);
+        accountLog.info('reconcile adopted an ENGINE-OPENED live option as an import', {
+          issue: 'TRA-2820',
+          optionSymbol: opt.optionSymbol,
+          sleeve: opt.engineOriginSleeve,
+          premiumPaid: opt.premiumPaid,
+          stopLossPremium: opt.stopLossPremium,
+          note: 'kept on its originating sleeve schedule, not the RV import sentinel',
+        });
+        return;
+      }
+    }
+    applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions);
+    if (mode === 'live' && opt.riskUnmanagedReason) {
+      accountLog.warn('live imported option is UNMANAGED — zero stop, no take-profit', {
+        issue: 'TRA-2820',
+        optionSymbol: opt.optionSymbol,
+        reason: opt.riskUnmanagedReason,
+        contracts: opt.contracts,
+        premiumPaid: opt.premiumPaid,
+      });
+    }
+  }
+
+  /**
+   * TRA-2820 — live open rows carrying the UNMANAGED sentinel (zero stop,
+   * infinite TP1), grouped by the reason they carry it. Published on
+   * `/api/health/options-live` so a zero stop on the real-money book is
+   * countable from outside without a credential.
+   *
+   * Counts and reasons only — no OCC symbols. The route is no-auth, and
+   * TRA-2163 is the standing reason not to widen what it discloses about the
+   * live book. A non-zero count here is the signal to go read `/api/state`.
+   */
+  liveUnmanagedRiskSummary(): LiveUnmanagedRiskSummary {
+    return summarizeLiveUnmanagedRisk(this.openOptions.values());
   }
 
   /**

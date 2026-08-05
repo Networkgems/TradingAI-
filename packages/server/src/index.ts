@@ -219,6 +219,8 @@ import {
   backfillLiveOptionFeesFromGainLoss,
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
+// TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
+import { summarizeLiveUnmanagedRisk } from './options-account.js';
 import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -8599,6 +8601,20 @@ app.get('/api/health/options-live', async (_req, res) => {
       // flag AND `liveTestWindowOpen` (see /api/health/live-options-fee-slippage).
       liveOtmArmed: isOptionLiveOtmEnabled(process.env),
       liveTestWindowOpen: isOptionLiveTestWindowOpen(process.env),
+      // TRA-2820 — is the LIVE open book actually under management? A row with
+      // `stopLossPremium: 0` reads identically whether that is a decision or a
+      // dropped schedule, and on 2026-08-04 eight live contracts / $216 of real
+      // premium sat unstopped for a whole session with nothing saying so.
+      //
+      // `unexplained` is the number that must be 0: a zero stop carrying no
+      // `riskUnmanagedReason` is a schedule that went missing. `byReason` is the
+      // deliberate half (auto-manage off / TRA-462 sub-floor import).
+      //
+      // Counts only — no OCC symbols. This route is no-auth; TRA-2163 is the
+      // standing reason not to widen what it says about the real-money book.
+      liveUnmanagedRisk: summarizeLiveUnmanagedRisk(
+        getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
+      ),
     });
   } catch (err) {
     log.error('options-live health probe failed', {
