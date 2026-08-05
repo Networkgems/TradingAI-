@@ -239,6 +239,7 @@ function makeOtmCandidate(overrides: Partial<OtmMispricingCandidate> = {}): OtmM
     daysToExpiration: 31,
     mark: 0.80,
     theo: 1.10,
+    theoRaw: 1.10,
     mispricingPct: -0.27,
     classification: 'cheap',
     bid: 0.78,

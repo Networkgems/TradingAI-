@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { findMispricedOtmContracts, type OptionChainRow } from './otm-mispricing.js';
-import { blackScholesPrice, daysToExpiration } from './black-scholes.js';
+import { blackScholesPrice, blackScholesDelta, daysToExpiration } from './black-scholes.js';
 
 const NOW = Date.parse('2024-01-15T15:00:00Z');
 const EXP = '2024-02-15';
@@ -231,5 +231,116 @@ describe('TRA-2341 — far-OTM theo underflow explodes the mispricing ratio', ()
       0.01,
     );
     expect(findMispricedOtmContracts(chain, SPOT, { now: NOW, minAbsDelta: 0.01 })).toHaveLength(0);
+  });
+});
+
+/**
+ * TRA-2917 — isotonic (PAVA) monotone repair of the theo surface, in the engine.
+ *
+ * The defect this repairs is TRA-2662: `smv_vol` is a per-contract vendor field
+ * with no cross-strike constraint, so the BS theo ladder built on it violates
+ * vertical-spread monotonicity. The fixture below reproduces the mechanism
+ * faithfully — a single inflated `smvVol` on one strike makes that put's theo
+ * exceed the next strike up, exactly what the live captures show.
+ */
+describe('TRA-2917 — PAVA monotone repair of the theo surface', () => {
+  // Puts at 85/90 with the 85 strike's smvVol inflated to 0.60: theo(85) then
+  // exceeds theo(90) computed at 0.30 — a nondecreasing violation.
+  const HOT_SIGMA = 0.6;
+  const rawTheo = (strike: number, optionType: 'call' | 'put', sigma: number) =>
+    blackScholesPrice({
+      spot: SPOT,
+      strike,
+      timeToExpiryYears: T,
+      riskFreeRate: R,
+      volatility: sigma,
+      optionType,
+    });
+
+  const violatingChain = (): OptionChainRow[] => [
+    liquidRow(85, 'put', 0, { smvVol: HOT_SIGMA }),
+    liquidRow(90, 'put', 0),
+    liquidRow(110, 'call', 0.3), // separate bucket — must be untouched
+  ];
+
+  it('fixture precondition: the raw put ladder actually violates (the mutation can mutate)', () => {
+    expect(rawTheo(85, 'put', HOT_SIGMA)).toBeGreaterThan(rawTheo(90, 'put', SIGMA));
+  });
+
+  it('repairs the violating pair to its pooled mean and keeps theoRaw as the raw surface', () => {
+    const result = findMispricedOtmContracts(violatingChain(), SPOT, { now: NOW });
+    const p85 = result.find((r) => r.strike === 85)!;
+    const p90 = result.find((r) => r.strike === 90)!;
+
+    const raw85 = rawTheo(85, 'put', HOT_SIGMA);
+    const raw90 = rawTheo(90, 'put', SIGMA);
+    expect(p85.theoRaw).toBeCloseTo(raw85, 10);
+    expect(p90.theoRaw).toBeCloseTo(raw90, 10);
+
+    const pooled = (raw85 + raw90) / 2;
+    expect(p85.theo).toBeCloseTo(pooled, 10);
+    expect(p90.theo).toBeCloseTo(pooled, 10);
+    // Post-repair the ladder is monotone (nondecreasing for puts, ties allowed).
+    expect(p90.theo).toBeGreaterThanOrEqual(p85.theo);
+  });
+
+  it('recomputes mispricingPct and classification from the REPAIRED theo', () => {
+    const result = findMispricedOtmContracts(violatingChain(), SPOT, { now: NOW });
+    for (const strike of [85, 90]) {
+      const row = result.find((r) => r.strike === strike)!;
+      expect(row.mispricingPct).toBeCloseTo((row.mark - row.theo) / row.theo, 12);
+      const expected =
+        row.mispricingPct > 0.15 ? 'expensive' : row.mispricingPct < -0.15 ? 'cheap' : 'fair';
+      expect(row.classification).toBe(expected);
+    }
+  });
+
+  it('leaves delta and ivUsed computed from raw inputs (risk gate / vendor observable)', () => {
+    const result = findMispricedOtmContracts(violatingChain(), SPOT, { now: NOW });
+    const p85 = result.find((r) => r.strike === 85)!;
+    expect(p85.ivUsed).toBe(HOT_SIGMA);
+    expect(p85.delta).toBeCloseTo(
+      // Sign-adjusted BS delta at the RAW sigma — the repair must not move it.
+      blackScholesDelta({
+        spot: SPOT,
+        strike: 85,
+        timeToExpiryYears: T,
+        riskFreeRate: R,
+        volatility: HOT_SIGMA,
+        optionType: 'put',
+      }),
+      10,
+    );
+  });
+
+  it('leaves rows outside the violating segment byte-unchanged (theo === theoRaw)', () => {
+    const result = findMispricedOtmContracts(violatingChain(), SPOT, { now: NOW });
+    const call = result.find((r) => r.strike === 110)!;
+    expect(call.theo).toBe(call.theoRaw); // exact, not closeTo
+  });
+
+  it('is a no-op on an already-coherent chain: every row keeps theo === theoRaw', () => {
+    const coherent: OptionChainRow[] = [
+      liquidRow(105, 'call', 0.2),
+      liquidRow(110, 'call', 0.1),
+      liquidRow(115, 'call', 0),
+      liquidRow(90, 'put', 0),
+      liquidRow(95, 'put', 0.1),
+    ];
+    const result = findMispricedOtmContracts(coherent, SPOT, { now: NOW });
+    expect(result.length).toBeGreaterThan(0);
+    for (const row of result) {
+      expect(row.theo).toBe(row.theoRaw);
+      expect(row.mispricingPct).toBeCloseTo((row.mark - row.theo) / row.theo, 12);
+    }
+  });
+
+  it('final ranking sorts on the repaired |mispricingPct|', () => {
+    const result = findMispricedOtmContracts(violatingChain(), SPOT, { now: NOW });
+    for (let i = 0; i + 1 < result.length; i += 1) {
+      expect(Math.abs(result[i].mispricingPct)).toBeGreaterThanOrEqual(
+        Math.abs(result[i + 1].mispricingPct),
+      );
+    }
   });
 });

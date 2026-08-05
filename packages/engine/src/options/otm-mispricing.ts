@@ -1,5 +1,6 @@
 import type { OptionType } from '@trading-app/shared';
 import { blackScholesPrice, blackScholesDelta, daysToExpiration } from './black-scholes.js';
+import { pavaMonotone } from './monotone-theo.js';
 
 /**
  * One row of an option chain enriched with quote/greeks/IV — what Tradier returns
@@ -40,8 +41,21 @@ export interface OtmMispricingCandidate {
   daysToExpiration: number;
 
   mark: number;
+  /**
+   * Theoretical price AFTER the TRA-2917 monotone repair — within each
+   * (expiration, optionType) bucket, calls are non-increasing and puts
+   * non-decreasing in strike (ties allowed). Rows outside a violating segment
+   * carry their raw value unchanged (`theo === theoRaw`).
+   */
   theo: number;
-  /** (mark − theo) / theo. Positive → expensive, negative → cheap. */
+  /**
+   * Theoretical price BEFORE the monotone repair — Black-Scholes at this
+   * contract's own `ivUsed`, exactly as the vendor surface implies it. Kept so
+   * the raw surface stays inspectable and so `check:theo-arb` can grade
+   * discrimination retention of the repair (TRA-2917 floors F1–F3).
+   */
+  theoRaw: number;
+  /** (mark − theo) / theo, on the REPAIRED theo. Positive → expensive, negative → cheap. */
   mispricingPct: number;
   classification: Mispricing;
 
@@ -260,6 +274,7 @@ export function findMispricedOtmContracts(
       daysToExpiration: dte,
       mark,
       theo,
+      theoRaw: theo,
       mispricingPct,
       classification: classify(mispricingPct, opts.mispricingThresholdPct),
       bid,
@@ -269,6 +284,41 @@ export function findMispricedOtmContracts(
       volume: row.volume ?? 0,
       ivUsed,
       delta,
+    });
+  }
+
+  // TRA-2917 — monotone (PAVA) repair of the theo surface, per (expiration,
+  // optionType) bucket of the SURVIVING candidates, before the final sort.
+  // `smv_vol` is a per-contract vendor field with no cross-strike constraint
+  // (TRA-2662), so the raw theo ladder can violate vertical-spread
+  // monotonicity; the L2 projection is the minimal repair and leaves every row
+  // outside a violating segment byte-unchanged. `delta` and `ivUsed` stay
+  // computed from raw inputs — delta is a risk gate, not the graded surface,
+  // and ivUsed remains the vendor observable. A subsequence of a monotone
+  // sequence is monotone, so downstream filtering/slicing preserves the
+  // repaired guarantee.
+  const repairBuckets = new Map<string, OtmMispricingCandidate[]>();
+  for (const c of candidates) {
+    const key = `${c.expiration}|${c.optionType}`;
+    let bucket = repairBuckets.get(key);
+    if (!bucket) {
+      bucket = [];
+      repairBuckets.set(key, bucket);
+    }
+    bucket.push(c);
+  }
+  for (const bucket of repairBuckets.values()) {
+    if (bucket.length < 2) continue;
+    bucket.sort((a, b) => a.strike - b.strike);
+    const repaired = pavaMonotone(
+      bucket.map((c) => c.theo),
+      bucket[0].optionType === 'call' ? 'nonincreasing' : 'nondecreasing',
+    );
+    bucket.forEach((c, i) => {
+      if (repaired[i] === c.theo) return;
+      c.theo = repaired[i];
+      c.mispricingPct = (c.mark - c.theo) / c.theo;
+      c.classification = classify(c.mispricingPct, opts.mispricingThresholdPct);
     });
   }
 

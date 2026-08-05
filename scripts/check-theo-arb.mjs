@@ -16,6 +16,11 @@
  *                testable (0 adjacent pairs). A guard that reports "0 violations"
  *                off an empty cohort is the vacuous green this ticket chain kept
  *                producing — so 0 pairs is BLIND, not CLEAN.
+ *   4  OVERSMOOTHED — the TRA-2917 repair is live (`theoRaw` on the wire) and a
+ *                pre-registered discrimination floor (F1–F3 below) is breached:
+ *                the violations were bought by flattening the surface. Only
+ *                reachable on a build serving `theoRaw`; a pre-fix build keeps
+ *                the exact pre-TRA-2917 behavior.
  *
  * ## Why the violation count is a LOWER bound
  *
@@ -43,6 +48,66 @@ const SYMBOLS = (process.env.THEO_ARB_SYMBOLS ?? 'SPY,TSLA,NVDA,QQQ,AAPL')
   .split(',')
   .map((s) => s.trim().toUpperCase())
   .filter(Boolean);
+
+/**
+ * TRA-2917 — pre-registered discrimination floors, REGISTERED 2026-08-05 BEFORE
+ * any post-fix measure existed. Do NOT tune these to an outcome. Baseline: live
+ * 9fbc9077 2026-08-05T10:38:14Z, 112 pairs, 3 theo violations, 0 mark, median
+ * |mispricingPct| 6.10%, p90 9.93%.
+ *
+ *   F1 same-capture ratio : median_rep/median_raw ≥ 0.85 AND p90_rep/p90_raw ≥ 0.85
+ *   F2 absolute backstop  : median_rep ≥ 4.0% AND p90_rep ≥ 6.5%
+ *   F3 repair reach       : fraction of candidates with theo ≠ theoRaw ≤ 20%
+ *   F4 control            : markViolations == 0 (the existing exit 2)
+ */
+const FLOORS = {
+  sameCaptureRatio: 0.85, // F1
+  absMedian: 0.04, // F2
+  absP90: 0.065, // F2
+  maxChangedFraction: 0.2, // F3
+};
+
+/**
+ * Evaluate F1–F3 on one sweep's stats (all ratios, not percent). Returns the
+ * list of breached-floor descriptions, empty when all hold. F1 is skipped when
+ * the raw stats are degenerate (no raw rows / zero median) — a ratio against
+ * nothing is not a floor.
+ */
+function evaluateFloors({ medianRep, p90Rep, medianRaw, p90Raw, changedFraction }) {
+  const breaches = [];
+  if (Number.isFinite(medianRaw) && medianRaw > 0 && Number.isFinite(p90Raw) && p90Raw > 0) {
+    if (medianRep / medianRaw < FLOORS.sameCaptureRatio) {
+      breaches.push(
+        `F1 median ratio ${(medianRep / medianRaw).toFixed(3)} < ${FLOORS.sameCaptureRatio}`,
+      );
+    }
+    if (p90Rep / p90Raw < FLOORS.sameCaptureRatio) {
+      breaches.push(`F1 p90 ratio ${(p90Rep / p90Raw).toFixed(3)} < ${FLOORS.sameCaptureRatio}`);
+    }
+  }
+  if (medianRep < FLOORS.absMedian) {
+    breaches.push(
+      `F2 median ${(medianRep * 100).toFixed(2)}% < ${(FLOORS.absMedian * 100).toFixed(1)}%`,
+    );
+  }
+  if (p90Rep < FLOORS.absP90) {
+    breaches.push(`F2 p90 ${(p90Rep * 100).toFixed(2)}% < ${(FLOORS.absP90 * 100).toFixed(1)}%`);
+  }
+  if (changedFraction > FLOORS.maxChangedFraction) {
+    breaches.push(
+      `F3 changed fraction ${(changedFraction * 100).toFixed(1)}% > ${(FLOORS.maxChangedFraction * 100).toFixed(0)}%`,
+    );
+  }
+  return breaches;
+}
+
+/** Sorted-array percentile helpers matching the original discrimination stats. */
+function medianOf(sortedAbs) {
+  return sortedAbs.length ? sortedAbs[Math.floor(sortedAbs.length / 2)] : 0;
+}
+function p90Of(sortedAbs) {
+  return sortedAbs.length ? sortedAbs[Math.floor(sortedAbs.length * 0.9)] : 0;
+}
 
 /** Adjacent-strike vertical monotonicity, grouped by (expiration, optionType). */
 function findViolations(candidates) {
@@ -125,6 +190,36 @@ if (process.argv.includes('--selftest')) {
       'live 2026-08-05 SPY put 600/625 still flagged',
       findViolations([mk(600, 'put', 0.4634, 0.47), mk(625, 'put', 0.3442, 0.55)]).theo.length === 1,
     ],
+    // TRA-2917 floors — each floor proven to PASS and to BREACH. Baseline-like
+    // stats (median 6.10%, p90 9.93%, 3% of rows touched) must hold all floors.
+    [
+      'floors hold on baseline-like stats → 0 breaches',
+      evaluateFloors({ medianRep: 0.061, p90Rep: 0.0993, medianRaw: 0.061, p90Raw: 0.0993, changedFraction: 0.03 }).length === 0,
+    ],
+    [
+      'F1 breach: repaired median collapses vs raw',
+      evaluateFloors({ medianRep: 0.03, p90Rep: 0.0993, medianRaw: 0.061, p90Raw: 0.0993, changedFraction: 0.03 }).some((b) => b.startsWith('F1 median')),
+    ],
+    [
+      'F1 breach: repaired p90 collapses vs raw',
+      evaluateFloors({ medianRep: 0.061, p90Rep: 0.05, medianRaw: 0.061, p90Raw: 0.0993, changedFraction: 0.03 }).some((b) => b.startsWith('F1 p90')),
+    ],
+    [
+      'F2 breach: absolute median below 4.0%',
+      evaluateFloors({ medianRep: 0.039, p90Rep: 0.07, medianRaw: 0.04, p90Raw: 0.07, changedFraction: 0 }).some((b) => b.startsWith('F2 median')),
+    ],
+    [
+      'F2 breach: absolute p90 below 6.5%',
+      evaluateFloors({ medianRep: 0.05, p90Rep: 0.064, medianRaw: 0.05, p90Raw: 0.066, changedFraction: 0 }).some((b) => b.startsWith('F2 p90')),
+    ],
+    [
+      'F3 breach: repair touched more than 20% of rows',
+      evaluateFloors({ medianRep: 0.061, p90Rep: 0.0993, medianRaw: 0.061, p90Raw: 0.0993, changedFraction: 0.21 }).some((b) => b.startsWith('F3')),
+    ],
+    [
+      'F1 skipped (not vacuously breached) on degenerate raw stats',
+      evaluateFloors({ medianRep: 0.061, p90Rep: 0.0993, medianRaw: 0, p90Raw: 0, changedFraction: 0 }).length === 0,
+    ],
   ];
   let bad = 0;
   for (const [name, ok] of cases) {
@@ -173,6 +268,13 @@ const theo = [];
 const mark = [];
 let servedBlockSeen = 0;
 const disc = [];
+// TRA-2917 — raw-surface discrimination and repair reach, measurable only when
+// the build serves `theoRaw`. The raw equivalent is computed under the SAME
+// `basis=max` denominator this sweep requests: (mark − theoRaw)/max(mark, theoRaw).
+const discRaw = [];
+let rowsWithTheoRaw = 0;
+let rowsChanged = 0;
+let rowsTotal = 0;
 
 for (const symbol of SYMBOLS) {
   // minTheo=0 / minDelta=0 keep the widest testable strike ladder: every filtered
@@ -196,7 +298,16 @@ for (const symbol of SYMBOLS) {
   for (const x of v.theo) theo.push({ symbol, ...x });
   for (const x of v.mark) mark.push({ symbol, ...x });
   for (const c of j.candidates ?? []) {
+    rowsTotal += 1;
     if (Number.isFinite(c.mispricingPct)) disc.push(Math.abs(c.mispricingPct));
+    if (Number.isFinite(c.theoRaw)) {
+      rowsWithTheoRaw += 1;
+      if (c.theo !== c.theoRaw) rowsChanged += 1;
+      const denom = Math.max(c.mark, c.theoRaw);
+      if (Number.isFinite(denom) && denom > 0) {
+        discRaw.push(Math.abs((c.mark - c.theoRaw) / denom));
+      }
+    }
   }
   console.log(
     `[theo-arb]   ${symbol.padEnd(5)} rows=${String(j.candidates?.length ?? 0).padStart(3)}` +
@@ -207,17 +318,30 @@ for (const symbol of SYMBOLS) {
 // A guard that cannot see anything must not report a pass.
 if (pairs === 0) blind('0 adjacent pairs testable across the whole sweep');
 
-// Discrimination — the over-smoothing tripwire. If a future "fix" zeroes the
+// Discrimination — the over-smoothing tripwire. If a "fix" zeroes the
 // violations by flattening the surface, this collapses toward 0 and the fix is
-// not a fix. Reported, never auto-failed: there is no pre-registered floor yet.
+// not a fix. On a build serving `theoRaw` (TRA-2917) the pre-registered floors
+// F1–F3 are ENFORCED (exit 4); on a pre-fix build it stays report-only, exactly
+// the prior behavior.
 disc.sort((a, b) => a - b);
-const median = disc.length ? disc[Math.floor(disc.length / 2)] : 0;
-const p90 = disc.length ? disc[Math.floor(disc.length * 0.9)] : 0;
+const median = medianOf(disc);
+const p90 = p90Of(disc);
+discRaw.sort((a, b) => a - b);
+const medianRaw = medianOf(discRaw);
+const p90Raw = p90Of(discRaw);
+const repairLive = rowsWithTheoRaw > 0;
+const changedFraction = repairLive ? rowsChanged / rowsWithTheoRaw : 0;
 
 console.log(`\n[theo-arb] pairs tested     : ${pairs}`);
 console.log(`[theo-arb] THEO violations  : ${theo.length}`);
 console.log(`[theo-arb] MARK violations  : ${mark.length}   (negative control, expect 0)`);
 console.log(`[theo-arb] discrimination   : median |mispricingPct| ${(median * 100).toFixed(2)}%, p90 ${(p90 * 100).toFixed(2)}%`);
+if (repairLive) {
+  console.log(`[theo-arb] raw surface      : median ${(medianRaw * 100).toFixed(2)}%, p90 ${(p90Raw * 100).toFixed(2)}%   (derived from theoRaw, same max basis)`);
+  console.log(`[theo-arb] repair reach     : ${rowsChanged}/${rowsWithTheoRaw} rows changed (${(changedFraction * 100).toFixed(1)}%)`);
+} else {
+  console.log(`[theo-arb] theoRaw          : absent on all ${rowsTotal} rows — build predates TRA-2917, floors not evaluated`);
+}
 console.log(
   `[theo-arb] served noArbitrage block on ${servedBlockSeen}/${SYMBOLS.length} responses` +
   `${servedBlockSeen === 0 ? '  ← build predates TRA-2662' : ''}`,
@@ -245,5 +369,14 @@ if (theo.length > 0) {
   console.error(`\n[theo-arb] ARB — ${theo.length}/${pairs} adjacent pairs violate on \`theo\` while the`);
   console.error('[theo-arb] market violates 0. The model surface is not arbitrage-free (TRA-2662).');
   process.exit(1);
+}
+if (repairLive) {
+  const breaches = evaluateFloors({ medianRep: median, p90Rep: p90, medianRaw, p90Raw, changedFraction });
+  if (breaches.length > 0) {
+    console.error('\n[theo-arb] OVERSMOOTHED — pre-registered discrimination floor breach (TRA-2917):');
+    for (const b of breaches) console.error(`[theo-arb]   ${b}`);
+    console.error('[theo-arb] The violations were bought by flattening the surface. Not a pass.');
+    process.exit(4);
+  }
 }
 console.log('\n[theo-arb] CLEAN — theo 0, mark 0, over a non-empty pair set.');
