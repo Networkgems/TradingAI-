@@ -7,6 +7,7 @@ import type {
   TradeSignal,
   OptionLeg,
   OptionPosition,
+  OptionPendingExit,
   OptionsAccountState,
   OtmMispricingSignal,
   OtmRiskParams,
@@ -381,6 +382,40 @@ const BROKER_MISSING_SWEEPS_TO_CLOSE = 2;
  */
 const BROKER_MISSING_MIN_AGE_MS = 5 * 60_000;
 
+/**
+ * TRA-2819 — age at which a staged exit that never got a broker order id
+ * (`pendingExit.tradierOrderId === ''`) is treated as ABANDONED rather than
+ * in flight, and reaped by {@link OptionsAccount.reapAbandonedStagedExits}.
+ *
+ * An unattached intent is not a state the system is ever supposed to rest in.
+ * `checkExits({ waitAndHold: true })` stages it and `submitStagedOptionExits`
+ * either attaches an order id or clears the intent — and the TRA-2200 exit
+ * interlock serialises those two so no other pass can observe the gap. So an
+ * unattached intent that survives a pass boundary means the pair was broken:
+ * the submit half returned early on a null `tradierLiveClient` (a mid-pass
+ * `mode` flip — the TRA-2693 bistable window), or the process died between the
+ * two.
+ *
+ * That state was previously PERMANENT and INVISIBLE. Every automated path
+ * declines to touch it, each for a locally-correct reason that is wrong in
+ * aggregate:
+ *   • `resolvePendingOptionExits` skips it — there is no order id to poll;
+ *   • the TRA-2799 broker-flat sweep skips it — a `pendingExit` row is
+ *     "owned by the pollers", which this one is not;
+ *   • the TRA-2889 basis restatement skips it, same reason;
+ *   • `stageManualPendingExit` refuses to re-stage over an existing intent,
+ *     so even the user's Close button is blocked.
+ * The only escape was a human finding the row and clicking cancel-pending-exit.
+ * That is the 4-day phantom shape TRA-2819 measured with real money.
+ *
+ * 30 minutes, not one tick: the exit pass sits at the FRONT of doTick, but a
+ * tick tail of 853s has been measured (TRA-2268), and the reap must never be
+ * able to race a submit that is merely slow. The interlock already makes that
+ * race impossible; the age gate is the belt to its braces, and 30 minutes is
+ * still ~192x tighter than the window this closes.
+ */
+const ABANDONED_STAGED_EXIT_MAX_AGE_MS = 30 * 60_000;
+
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
@@ -505,6 +540,33 @@ export interface LiveUnmanagedRiskSummary {
    * exactly as unexplained.
    */
   unexplained: number;
+}
+
+/**
+ * TRA-2819 — one staged exit that was reaped as abandoned.
+ *
+ * Carries `optionSymbol` because the LOG line needs it to be actionable. It is
+ * deliberately NOT what the no-auth health route publishes: TRA-2163 is the
+ * standing reason not to widen what that surface discloses about the
+ * real-money book, so the route takes counts and the operator reads symbols
+ * from the authenticated `/api/state` or the process log.
+ * @see OptionsAccount.reapAbandonedStagedExits
+ */
+export interface AbandonedStagedExit {
+  /** Position row id the intent was staged on. */
+  id: string;
+  /** OCC symbol, or null on a row that never carried one. */
+  optionSymbol: string | null;
+  /** Book the row belongs to — a live reap is the one that costs money. */
+  mode: AccountMode;
+  /** Which exit staged it (`sl` / `tp1` / `trail` / `manual` / …). */
+  kind: OptionPendingExit['kind'];
+  /** Contracts the abandoned intent would have sold. */
+  qty: number;
+  /** When the intent was staged (epoch ms) — `pendingExit.submittedAt`. */
+  submittedAt: number;
+  /** How long it sat unattached before the reap, in ms. */
+  ageMs: number;
 }
 
 /**
@@ -887,6 +949,27 @@ export class PaperOptionsAccount {
    * which consults it only when `optionsExitsActive` was true.
    */
   private modeSkippedLiveOptionSymbols: string[] = [];
+  /**
+   * TRA-2819 — how many staged exits have been reaped as ABANDONED (staged but
+   * never handed to Tradier) over this process's life. In-memory and reset by
+   * a restart on purpose: it measures the CURRENT process's stage/submit
+   * health, and the failure it counts is itself produced by restarts and
+   * mid-pass `mode` flips, so carrying it across a boot would blur the two.
+   * Durable evidence of each reap is the `exitErrorReason` stamped on the row.
+   * @see reapAbandonedStagedExits
+   */
+  private abandonedStagedExitsReaped = 0;
+  /**
+   * TRA-2819 — the LIVE-book subset of {@link abandonedStagedExitsReaped},
+   * counted separately because it is the only half that costs real money. A
+   * demo reap is a bookkeeping repair; a live reap means a real position spent
+   * up to the age gate with its stop-loss intent sitting in a drawer.
+   */
+  private abandonedStagedExitsReapedLive = 0;
+  /** TRA-2819 — the most recent reap batch, for the health surface. */
+  private lastAbandonedStagedExits: AbandonedStagedExit[] = [];
+  /** TRA-2819 — epoch ms of the most recent reap, or null if none this boot. */
+  private lastAbandonedStagedExitAt: number | null = null;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -4520,6 +4603,110 @@ export class PaperOptionsAccount {
    */
   listPendingExits(): OptionPosition[] {
     return Array.from(this.openOptions.values()).filter(o => o.pendingExit !== undefined);
+  }
+
+  /**
+   * TRA-2819 — clear staged exits that never reached the broker, so a row
+   * cannot rest forever in a state every automated path declines to touch.
+   *
+   * See {@link ABANDONED_STAGED_EXIT_MAX_AGE_MS} for why an unattached
+   * `pendingExit` older than one pass is unambiguously abandoned rather than
+   * in flight, and for the four skips that made it permanent.
+   *
+   * Deliberately narrow, because clearing a genuinely in-flight intent would
+   * re-arm an exit against a position the broker is already selling:
+   *   • `tradierOrderId === ''` ONLY. An intent with an id is owned by
+   *     `resolvePendingOptionExits`, which polls it to terminal state and
+   *     books the real fill price. We never touch those.
+   *   • older than the age gate, measured off `submittedAt` (stamped at stage
+   *     time, so it dates the intent, not the position).
+   *
+   * `countRejection: false` is load-bearing. This is not the broker refusing
+   * the contract — nothing was ever sent — so it must not advance the
+   * TRA-450 auto-close breaker toward `MAX_CONSECUTIVE_CLOSE_REJECTS`. A row
+   * whose submit half was never invoked has earned a clean slate, and
+   * counting it would pause auto-close on exactly the positions that just
+   * proved they need it.
+   *
+   * The residual tail is a submit that DID reach Tradier and died before
+   * `attachPendingExit` persisted the id — a window of one await resolution.
+   * Reaping re-arms the exit there, but Tradier itself is the backstop: a
+   * second `sell_to_close` that would exceed the long position is refused
+   * with "Sell order cannot be placed unless you are closing a long
+   * position", which `reconcileFlatBrokerRejection` already turns into a
+   * correct local close. That tail is strictly narrower than the permanent
+   * strand it replaces.
+   *
+   * Returns one descriptor per reaped row so the caller can log each by
+   * symbol; the cumulative count and the last batch stay on the account for
+   * the health surface. Callers must treat an empty array as "nothing was
+   * abandoned", which is the normal steady state.
+   */
+  reapAbandonedStagedExits(nowMs: number = Date.now()): AbandonedStagedExit[] {
+    const reaped: AbandonedStagedExit[] = [];
+    for (const [id, opt] of this.openOptions) {
+      const pending = opt.pendingExit;
+      if (!pending) continue;
+      if (pending.tradierOrderId !== '') continue;
+      // A row whose `submittedAt` is missing or unusable cannot prove it is
+      // recent, and an unattached intent that cannot date itself is abandoned
+      // by default — reaped, not skipped. Skipping is what created this bug:
+      // `submittedAt` is typed required, so this only reaches a snapshot
+      // persisted before the field or corrupted since, and treating that as
+      // "in flight forever" would rebuild the exact strand on the one shape
+      // nothing else can clear either.
+      const ageMs = Number.isFinite(pending.submittedAt)
+        ? nowMs - pending.submittedAt
+        : Number.POSITIVE_INFINITY;
+      if (ageMs < ABANDONED_STAGED_EXIT_MAX_AGE_MS) continue;
+      reaped.push({
+        id,
+        optionSymbol: opt.optionSymbol ?? null,
+        mode: opt.mode ?? 'demo',
+        kind: pending.kind,
+        qty: pending.qty,
+        submittedAt: pending.submittedAt,
+        ageMs,
+      });
+      const age = Number.isFinite(ageMs)
+        ? `after ${Math.round(ageMs / 60_000)} min`
+        : 'on a snapshot carrying no staging timestamp';
+      this.clearPendingExit(
+        id,
+        'Staged close was never submitted to Tradier (no order id was ever '
+          + `attached), so it was abandoned here ${age} and the position `
+          + 'returned to normal exit management. No order was placed. TRA-2819.',
+        { countRejection: false },
+      );
+    }
+    if (reaped.length > 0) {
+      this.abandonedStagedExitsReaped += reaped.length;
+      this.abandonedStagedExitsReapedLive += reaped.filter(r => r.mode === 'live').length;
+      this.lastAbandonedStagedExits = reaped;
+      this.lastAbandonedStagedExitAt = nowMs;
+    }
+    return reaped;
+  }
+
+  /**
+   * TRA-2819 — cumulative reap telemetry. Published on the options-live health
+   * route so this failure is COUNTABLE the next time it happens rather than
+   * inferred four days later from a broker statement. A non-zero count is not
+   * self-healing good news: it means the stage/submit pair broke, and the
+   * `mode`-flip window (TRA-2693) is the first thing to look at.
+   */
+  getAbandonedStagedExitStats(): {
+    reapedTotal: number;
+    reapedLiveTotal: number;
+    lastReapedAt: number | null;
+    lastReaped: AbandonedStagedExit[];
+  } {
+    return {
+      reapedTotal: this.abandonedStagedExitsReaped,
+      reapedLiveTotal: this.abandonedStagedExitsReapedLive,
+      lastReapedAt: this.lastAbandonedStagedExitAt,
+      lastReaped: this.lastAbandonedStagedExits,
+    };
   }
 
   /**

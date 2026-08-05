@@ -4282,6 +4282,40 @@ export class SignalEngine {
       && this.tradierLiveOptionsEnabled
       && this.tradierLiveClient !== null;
 
+    // TRA-2819 — reap staged exits that were never handed to the broker, BEFORE
+    // anything else looks at `pendingExit`. Three properties of the placement
+    // matter and none of them are incidental:
+    //
+    //   • OUTSIDE `liveOptionsMirroring`. The dominant way an intent is
+    //     abandoned is the submit half returning early on a null
+    //     `tradierLiveClient` (a mid-pass `mode` flip — TRA-2693). Gating the
+    //     cleanup on the same condition that caused the mess would make the
+    //     strand permanent in exactly the case that creates it.
+    //   • BOTH accounts, not `this.optionsAccount`. The active account follows
+    //     the env; a strand left in the other book is invisible to every pass
+    //     until someone flips back. `resolvePendingOptionExits` already sweeps
+    //     both for the same reason.
+    //   • INSIDE the exit region, so the TRA-2200 interlock serialises it
+    //     against `checkExits` → `submitStagedOptionExits`. The reap can never
+    //     land between a stage and its own submit.
+    //
+    // Reaping BEFORE `checkExits` also hands the freed row back to exit
+    // management on this very pass rather than the next one.
+    for (const env of ['sandbox', 'production'] as const) {
+      for (const reaped of this.optionsAccounts[env].reapAbandonedStagedExits()) {
+        log.warn('staged option exit ABANDONED — never submitted to Tradier, reaped', {
+          component: 'abandoned-staged-exit',
+          env,
+          optionSymbol: reaped.optionSymbol,
+          mode: reaped.mode,
+          kind: reaped.kind,
+          qty: reaped.qty,
+          ageMinutes: Math.round(reaped.ageMs / 60_000),
+          issue: 'TRA-2819',
+        });
+      }
+    }
+
     if (liveOptionsMirroring) {
       // Poll any in-flight sell_to_close from a prior tick regardless of the
       // clock — this only finalises/clears existing broker orders, it never
@@ -6614,6 +6648,36 @@ export class SignalEngine {
    * degrades to log + `alerts.jsonl` + the `/api/health/alerts` ring, which is
    * the poll path a monitor can read.
    */
+  /**
+   * TRA-2819 — abandoned-staged-exit reap telemetry, folded across BOTH option
+   * books rather than just the active one: a strand in the inactive book is
+   * exactly as stuck, and the env can flip underneath it.
+   *
+   * Counts and timestamps only — no OCC symbols. The consumer is the no-auth
+   * `/api/health/options-live`, and TRA-2163 is the standing reason not to
+   * widen what that route discloses about the real-money book. Symbols are on
+   * the log line and on the row's `exitErrorReason`.
+   *
+   * `reapedTotal > 0` is NOT "the fix is working, nothing to see". It means
+   * the stage/submit pair broke at least that many times this boot, and the
+   * reap is the containment, not the repair. The `mode`-flip window (TRA-2693)
+   * is the first cause to check.
+   */
+  getAbandonedStagedExitStats(): { reapedTotal: number; reapedLiveTotal: number; lastReapedAt: number | null } {
+    let reapedTotal = 0;
+    let reapedLiveTotal = 0;
+    let lastReapedAt: number | null = null;
+    for (const env of ['sandbox', 'production'] as const) {
+      const stats = this.optionsAccounts[env].getAbandonedStagedExitStats();
+      reapedTotal += stats.reapedTotal;
+      reapedLiveTotal += stats.reapedLiveTotal;
+      if (stats.lastReapedAt !== null && (lastReapedAt === null || stats.lastReapedAt > lastReapedAt)) {
+        lastReapedAt = stats.lastReapedAt;
+      }
+    }
+    return { reapedTotal, reapedLiveTotal, lastReapedAt };
+  }
+
   private alertUnmanagedLiveOptions(): void {
     const skipped = this.optionsAccount.getModeSkippedLiveOptionSymbols();
     if (skipped.length === 0) return;
@@ -6647,7 +6711,25 @@ export class SignalEngine {
       const pending = acct.listPendingExits();
       for (const opt of pending) {
         const pendingExit = opt.pendingExit;
-        if (!pendingExit || pendingExit.tradierOrderId === '') continue;
+        if (!pendingExit) continue;
+        if (pendingExit.tradierOrderId === '') {
+          // TRA-2819 — an intent with no order id has nothing to poll, so the
+          // skip is correct. What was wrong is that it was SILENT: this line
+          // was the last automated code to look at a permanently stranded row
+          // and it said nothing, which is why a 4-day phantom read as normal.
+          // The reap above now clears these on age; anything seen here is
+          // inside that window, so this is a debug breadcrumb for the interval
+          // between abandonment and reap, not an alert.
+          log.debug('pendingExit has no Tradier order id — not pollable', {
+            component: 'abandoned-staged-exit',
+            env,
+            optionSymbol: opt.optionSymbol,
+            kind: pendingExit.kind,
+            stagedMsAgo: Date.now() - pendingExit.submittedAt,
+            issue: 'TRA-2819',
+          });
+          continue;
+        }
         try {
           const detail = await this.tradierLiveClient.getOrderStatus(pendingExit.tradierOrderId);
           if (!detail) continue;

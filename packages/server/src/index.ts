@@ -8695,6 +8695,36 @@ app.get('/api/health/options-live', async (_req, res) => {
       liveUnmanagedRisk: summarizeLiveUnmanagedRisk(
         getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
       ),
+      // TRA-2819 — staged exits that were never handed to Tradier and had to be
+      // reaped. Before this existed, an exit intent that missed its submit sat
+      // on the row forever: unpollable (no order id), untouchable by the
+      // TRA-2799 broker-flat sweep (it skips `pendingExit` rows), and blocking
+      // the user's own Close button. A live position could hold a stop-loss
+      // intent that had never reached the broker and nothing anywhere said so —
+      // the 4-day phantom TRA-2819 measured.
+      //
+      // Read it as a DEFECT counter, not a health score. 0 is the expected
+      // steady state; any non-zero value means the stage→submit pair broke that
+      // many times this boot, and `reapedLive` is the half that had real money
+      // exposed. Resets on restart by design (see the field doc) — a
+      // `lastReapedAt` near boot is a fresh incident, not history.
+      //
+      // Counts only — no OCC symbols. This route is no-auth; TRA-2163 is the
+      // standing reason not to widen what it says about the real-money book.
+      abandonedStagedExits: getAllUserContexts().reduce(
+        (acc, c) => {
+          const s = c.engine.getAbandonedStagedExitStats();
+          return {
+            reaped: acc.reaped + s.reapedTotal,
+            reapedLive: acc.reapedLive + s.reapedLiveTotal,
+            lastReapedAt:
+              s.lastReapedAt !== null && (acc.lastReapedAt === null || s.lastReapedAt > acc.lastReapedAt)
+                ? s.lastReapedAt
+                : acc.lastReapedAt,
+          };
+        },
+        { reaped: 0, reapedLive: 0, lastReapedAt: null as number | null },
+      ),
     });
   } catch (err) {
     log.error('options-live health probe failed', {
