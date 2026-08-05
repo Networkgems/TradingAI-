@@ -250,6 +250,23 @@ export interface RelativeValueScannerService {
     expiration: string,
     optionSymbol: string,
   ): Promise<{ bid: number; ask: number } | null>;
+  /**
+   * TRA-2890 — the broker-tape LAST TRADE for a contract, for the live
+   * DISPLAY mark ({@link displayOptionMark} in shared). {@link getOptionMark}
+   * collapses to the mid and only falls back to `last` on a one-sided book;
+   * this reads `row.last` directly so the dashboard can value an open live
+   * position the way Tradier's own positions view does. Rides the same cached
+   * chain snapshot — polling it right after `getOptionMark` on the engine tick
+   * costs ZERO extra Tradier calls. Returns `null` for unknown contracts or a
+   * row that has never printed. Display-only: no risk-engine consumer may read
+   * it. OPTIONAL on the interface, same contract as {@link getOptionQuote}: a
+   * scanner without it simply leaves live display marks on the mid.
+   */
+  getOptionLastTrade?(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<number | null>;
   diagnostics(): RelativeValueScannerDiagnostics;
 }
 
@@ -524,6 +541,33 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
     if (bid > 0 && ask > 0 && ask >= bid) return (bid + ask) / 2;
     if (typeof row.last === 'number' && row.last > 0) return row.last;
     return null;
+  }
+
+  // TRA-2890 — `row.last` verbatim for the live display mark. See the
+  // interface doc: display-only, rides the same cached snapshot as
+  // getOptionMark, and deliberately does NOT fall back to the mid — a `null`
+  // here means "the tape has never printed", and the caller's display rule
+  // (`displayOptionMark`) owns the fallback.
+  async getOptionLastTrade(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<number | null> {
+    if (!this.client) return null;
+    if (this.isBreakerOpen()) return null;
+    const upper = symbol.trim().toUpperCase();
+    let chain: OptionChainRow[];
+    try {
+      chain = await this.fetchChain(upper, expiration);
+    } catch (err) {
+      this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
+      return null;
+    }
+    const row = chain.find((r) => r.optionSymbol === optionSymbol);
+    if (!row) return null;
+    return typeof row.last === 'number' && Number.isFinite(row.last) && row.last > 0
+      ? row.last
+      : null;
   }
 
   async getOptionQuote(

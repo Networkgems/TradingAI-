@@ -41,6 +41,7 @@ import {
   checkDiscretionaryClose,
   dteFromExpiration,
   tradingDaysBetween,
+  displayOptionMark,
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 // TRA-2820 — provenance oracle for the Tradier reconcile (TRA-2811's ledger join).
@@ -1858,6 +1859,51 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-2890 — the unrealized P&L a DISPLAY surface shows: same rows and same
+   * freshness guards as {@link unrealizedPnlForMode}, but each open LIVE row is
+   * valued at {@link displayOptionMark} (broker-tape last trade when present)
+   * so the footer pill equals the sum of the Gain/Loss column above it AND
+   * Tradier's own positions view. Demo rows are bit-identical to the MID
+   * figure (the helper returns `currentPremium` for them). Feeds ONLY the
+   * `openOptionsUnrealizedPnl` state field — the give-back peak / daily-P&L
+   * basis stays on {@link basisUnrealizedPnlForMode} (mid/marketable): one
+   * stale print latching the book's monotonic peak is the TRA-2927 failure
+   * mode and must stay impossible by construction.
+   */
+  private displayUnrealizedPnlForMode(mode: AccountMode): number {
+    let total = 0;
+    for (const opt of this.openOptions.values()) {
+      if ((opt.mode ?? 'demo') !== mode) continue;
+      if (!Number.isFinite(opt.currentPremium) || opt.currentPremium <= 0) continue;
+      if (!Number.isFinite(opt.premiumPaid) || opt.premiumPaid <= 0) continue;
+      const remaining = opt.contractsRemaining ?? opt.contracts;
+      if (!Number.isFinite(remaining) || remaining <= 0) continue;
+      total += (displayOptionMark(opt) - opt.premiumPaid) * remaining * 100;
+    }
+    return total;
+  }
+
+  /**
+   * TRA-2890 — stamp the broker-tape last trade onto open LIVE rows for the
+   * display mark. Keyed by OCC symbol; values ≤ 0 / non-finite are ignored, and
+   * a contract missing from the map keeps its previous `lastMark` — "no print
+   * this tick" is not "the last trade stopped existing" (the broker's screen
+   * keeps showing the old print too). Demo rows are never touched, so the
+   * demo book stays bit-identical to its pre-TRA-2890 state.
+   */
+  refreshLiveDisplayMarks(lastByOcc: Map<string, number>): void {
+    if (lastByOcc.size === 0) return;
+    for (const opt of this.openOptions.values()) {
+      if ((opt.mode ?? 'demo') !== 'live') continue;
+      if (!opt.optionSymbol) continue;
+      const last = lastByOcc.get(opt.optionSymbol);
+      if (typeof last === 'number' && Number.isFinite(last) && last > 0) {
+        opt.lastMark = last;
+      }
+    }
+  }
+
+  /**
    * TRA-2233 — the REALIZABLE unrealized P&L for a mode: the same open positions
    * as {@link unrealizedPnlForMode}, but each valued at the MARKETABLE mark (long
    * → bid, short → ask) instead of the chain MID. This is the honest "what could I
@@ -1989,8 +2035,12 @@ export class PaperOptionsAccount {
       // TRA-1228 — bucket-wide split figures (both modes).
       dailyRealizedOptionsPnl:
         this.dailyRealizedOptionsPnlForMode('demo') + this.dailyRealizedOptionsPnlForMode('live'),
+      // TRA-2890 — DISPLAY valuation (live rows at broker-tape last trade) so
+      // the pill reconciles with the per-row Gain/Loss column and Tradier's
+      // positions view. The give-back basis in `dailyOptionsPnl` above stays
+      // on the mid/marketable path.
       openOptionsUnrealizedPnl:
-        this.unrealizedPnlForMode('demo') + this.unrealizedPnlForMode('live'),
+        this.displayUnrealizedPnlForMode('demo') + this.displayUnrealizedPnlForMode('live'),
       // TRA-2233 — realizable (marketable-mark) MTM alongside the MID figure.
       openOptionsRealizablePnl:
         this.marketableUnrealizedPnlForMode('demo') + this.marketableUnrealizedPnlForMode('live'),
@@ -2034,7 +2084,8 @@ export class PaperOptionsAccount {
       // (unrealized MTM) so the two dashboard figures are unambiguous and the
       // realized one reconciles with the Calendar + "Closed Today" table.
       dailyRealizedOptionsPnl: this.dailyRealizedOptionsPnlForMode(mode),
-      openOptionsUnrealizedPnl: this.unrealizedPnlForMode(mode),
+      // TRA-2890 — DISPLAY valuation (see getState above): live at last trade.
+      openOptionsUnrealizedPnl: this.displayUnrealizedPnlForMode(mode),
       // TRA-2233 — realizable (marketable-mark) MTM for this mode alongside MID.
       openOptionsRealizablePnl: this.marketableUnrealizedPnlForMode(mode),
       optionsCash: mode === 'demo' ? 0 : this.cash,
@@ -2072,7 +2123,12 @@ export class PaperOptionsAccount {
       const remaining = opt.contractsRemaining ?? opt.contracts;
       if (!Number.isFinite(remaining) || remaining <= 0) continue;
       if (!Number.isFinite(opt.currentPremium) || opt.currentPremium <= 0) continue;
-      longValue += opt.currentPremium * remaining * 100;
+      // TRA-2890 — DISPLAY valuation: live rows at the broker-tape last trade
+      // so the Account Summary card equals the Options table and Book Premium
+      // tile beside it (and Tradier's positions view). Demo unchanged. The
+      // freshness gate above stays on `currentPremium`: "no mid yet" still
+      // means "no value", a lastMark alone never synthesises one.
+      longValue += displayOptionMark(opt) * remaining * 100;
     }
     return { longValue, shortValue };
   }

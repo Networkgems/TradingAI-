@@ -2,10 +2,16 @@
 // Shows Total Value, buying-power / cash, and per-asset-class market values so
 // the operator can reconcile TradeAI against the broker at a glance.
 //
-// The per-asset-class market-value tiles come straight from the Tradier balance
-// snapshot in live mode; in demo/paper the engine derives them from the paper
-// book (TRA-949) so the breakdown reconciles to Total Value instead of "—".
-// Any field still absent renders "—" via `fmtPrice`.
+// Sources, in live mode (TRA-2890): the cash / buying-power / stock rows come
+// from the Tradier balance snapshot, but the two OPTION value rows come from
+// the live options book valued at display marks — the same source as the
+// Options table and Book Premium tile rendered beside this card. They used to
+// mirror `/balances` `option_long_value`, which Tradier leaves stale off-hours;
+// the TRA-2873 screenshots caught this card $85 apart from the table directly
+// below it on the same screen. Each row carries a `title` naming its source so
+// the split is inspectable. In demo/paper the engine derives all value rows
+// from the paper book (TRA-949) so the breakdown reconciles to Total Value
+// instead of "—". Any field still absent renders "—" via `fmtPrice`.
 import type { AccountState } from '@trading-app/shared';
 import { fmtPrice } from '../../lib/format';
 
@@ -22,13 +28,19 @@ export function AccountSummaryCard({
   // falling back to total cash in demo where no broker buying power exists).
   const availableFunds = account.optionBuyingPower ?? account.availableCash;
 
-  const rows: { label: string; value: number | undefined }[] = [
-    { label: 'Total Value', value: account.totalEquity },
-    { label: 'Available Funds', value: availableFunds },
-    { label: 'Cash', value: account.availableCash },
-    { label: 'Long Stock Value', value: account.stockLongValue },
-    { label: 'Long Option Value', value: account.optionLongValue },
-    { label: 'Short Option Value', value: account.optionShortValue },
+  const live = accountMode === 'live';
+  const balanceSrc = live ? 'Tradier balance snapshot' : 'Paper book (demo)';
+  const optionSrc = live
+    ? 'Live options book at broker-tape marks — same source as the Options table and Book Premium tile (TRA-2890)'
+    : 'Paper book (demo)';
+
+  const rows: { label: string; value: number | undefined; src: string }[] = [
+    { label: 'Total Value', value: account.totalEquity, src: balanceSrc },
+    { label: 'Available Funds', value: availableFunds, src: balanceSrc },
+    { label: 'Cash', value: account.availableCash, src: balanceSrc },
+    { label: 'Long Stock Value', value: account.stockLongValue, src: balanceSrc },
+    { label: 'Long Option Value', value: account.optionLongValue, src: optionSrc },
+    { label: 'Short Option Value', value: account.optionShortValue, src: optionSrc },
   ];
 
   return (
@@ -40,8 +52,8 @@ export function AccountSummaryCard({
         </span>
       </header>
       <dl className="account-summary-card__grid">
-        {rows.map(({ label, value }) => (
-          <div className="account-summary-card__row" key={label}>
+        {rows.map(({ label, value, src }) => (
+          <div className="account-summary-card__row" key={label} title={src}>
             <dt>{label}</dt>
             <dd>{fmtPrice(value)}</dd>
           </div>

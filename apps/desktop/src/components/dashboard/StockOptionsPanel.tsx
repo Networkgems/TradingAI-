@@ -3,6 +3,7 @@
 // flow (direct close, the Tradier limit-close drawer, pending-exit cancel and
 // the manual Tradier sync) is owned by the useStockOptionClose hook.
 import type { AccountState, OptionsAccountState, OptionPosition } from '@trading-app/shared';
+import { displayOptionMark } from '@trading-app/shared';
 import { fmt, fmtDollar, fmtPct, formatTime, formatExpirationShort, signalLabel } from '../../lib/format';
 import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getOptionOpenSortValue, getOptionClosedSortValue } from '../../lib/stockSort';
@@ -82,9 +83,14 @@ export function StockOptionsPanel({
                 // still flags origin so the user knows closing routes a real
                 // `sell_to_close`.
                 const isImported = !!o.importedFromTradier;
+                // TRA-2890 — live rows display the broker-tape last trade
+                // (`displayOptionMark`) so Current Mark / Gain-Loss equal
+                // Tradier's own positions view; demo rows stay on the mid. The
+                // freshness gate stays on `currentPremium`: no mid, no mark.
+                const mark = displayOptionMark(o);
                 const hasMark = Number.isFinite(o.currentPremium) && o.currentPremium > 0 && o.premiumPaid > 0;
-                const pnlPct = hasMark ? ((o.currentPremium - o.premiumPaid) / o.premiumPaid) * 100 : 0;
-                const unrealized = hasMark ? (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100 : 0;
+                const pnlPct = hasMark ? ((mark - o.premiumPaid) / o.premiumPaid) * 100 : 0;
+                const unrealized = hasMark ? (mark - o.premiumPaid) * o.contractsRemaining * 100 : 0;
                 const pnlDollar = unrealized + (o.pnl ?? 0);
                 // Auto-managed imports get RV-default thresholds; legacy imports
                 // with auto-management off keep sentinels and render "—".
@@ -111,7 +117,7 @@ export function StockOptionsPanel({
                     <td>{o.contracts}</td>
                     <td>${fmt(o.premiumPaid)}</td>
                     <td className={!hasMark ? 'muted' : (pnlPct >= 0 ? 'green' : 'red')}>
-                      {hasMark ? `$${fmt(o.currentPremium)} (${fmtPct(pnlPct)})` : '—'}
+                      {hasMark ? `$${fmt(mark)} (${fmtPct(pnlPct)})` : '—'}
                     </td>
                     <td className={!hasMark ? 'muted' : (pnlDollar >= 0 ? 'green' : 'red')}>
                       {hasMark ? fmtDollar(pnlDollar) : '—'}
@@ -317,8 +323,10 @@ export function StockOptionsPanel({
         // the open/closed table bodies above.
         const totalOptionsPnl =
           openOptions.reduce((sum, o) => {
+            // TRA-2890 — same display mark as the rows above (live: last trade)
+            // so the total still equals the sum of the per-row P&L on screen.
             const hasMark = Number.isFinite(o.currentPremium) && o.currentPremium > 0 && o.premiumPaid > 0;
-            const unrealized = hasMark ? (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100 : 0;
+            const unrealized = hasMark ? (displayOptionMark(o) - o.premiumPaid) * o.contractsRemaining * 100 : 0;
             return sum + unrealized + (o.pnl ?? 0);
           }, 0)
           + closedOptions.reduce((sum, o) => sum + (o.pnl ?? 0), 0);

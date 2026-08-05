@@ -6474,6 +6474,11 @@ export class SignalEngine {
       if (group) group.push(o);
       else chains.set(key, [o]);
     }
+    // TRA-2890 — broker-tape last trades collected on the same pass, for the
+    // live DISPLAY mark only. Optional scanner capability; absent ⇒ live
+    // display stays on the mid.
+    const lastMarks = new Map<string, number>();
+    const canLastTrade = typeof this.rvScanner.getOptionLastTrade === 'function';
     await Promise.all(
       [...chains.values()].map(async (group) => {
         for (const o of group) {
@@ -6501,9 +6506,29 @@ export class SignalEngine {
           } catch (err: unknown) {
             log.warn('getOptionMark failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
           }
+          if (canLastTrade) {
+            // TRA-2890 — same cached chain row, so this adds zero Tradier
+            // calls. Kept OUT of the mid path's observation tape above: the
+            // TRA-2927 observer watches the risk-engine mark, and last-trade
+            // never feeds a risk consumer.
+            try {
+              const last = await this.rvScanner!.getOptionLastTrade!(o.symbol, o.expiration!, o.optionSymbol!);
+              if (last != null && last > 0) lastMarks.set(o.optionSymbol!, last);
+            } catch (err: unknown) {
+              log.warn('getOptionLastTrade failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
+            }
+          }
         }
       }),
     );
+    // TRA-2890 — fan display marks to open LIVE rows in every bucket, mirroring
+    // refreshImportedMarksAllAccounts' fan-out. Done here (not by callers) so
+    // the mid map's return type — and both existing consumers — stay untouched.
+    if (lastMarks.size > 0) {
+      for (const acct of this.allOptionsAccounts()) {
+        acct.refreshLiveDisplayMarks(lastMarks);
+      }
+    }
     return marks;
   }
 
@@ -14183,6 +14208,17 @@ export class SignalEngine {
       const liveBal = this.liveTradierBalance;
       const optField = (key: keyof AccountState, value: number | null | undefined) =>
         typeof value === 'number' && Number.isFinite(value) ? { [key]: value } : {};
+      // TRA-2890 — the card's Long/Short Option Value used to mirror Tradier's
+      // `/balances` `option_long_value`, a snapshot the broker itself leaves
+      // stale off-hours ($524 on the TRA-2873 screenshots) while the Options
+      // table directly below the card valued the same three contracts from our
+      // marks ($439): one screen, two books, $85 apart with no broker
+      // comparison needed. Value the tiles from the SAME live options book the
+      // table and Book Premium render (display marks: broker-tape last trade
+      // via `displayOptionMark`), so card == table == Tradier's positions view
+      // by construction. `stockLongValue` keeps the balance mirror — equities
+      // are not in the options book and were not the contradiction.
+      const liveOptionMv = this.optionsAccount.getOptionMarketValueForMode('live');
       const liveAccount: AccountState = this.liveTradierBalance
         ? {
           totalEquity: this.liveTradierBalance.totalEquity,
@@ -14197,8 +14233,8 @@ export class SignalEngine {
             : {}),
           ...optField('settledFunds', liveBal?.settledFunds),
           ...optField('stockLongValue', liveBal?.stockLongValue),
-          ...optField('optionLongValue', liveBal?.optionLongValue),
-          ...optField('optionShortValue', liveBal?.optionShortValue),
+          optionLongValue: liveOptionMv.longValue,
+          optionShortValue: liveOptionMv.shortValue,
         }
         : { totalEquity: 0, availableCash: 0, openPositions: liveOpenPositions, dailyPnl: 0 };
       return {

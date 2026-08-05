@@ -3,6 +3,7 @@
 // the SortableTH headers stay in sync; adding a column means adding a key to
 // the union here and a branch to the matching resolver.
 import type { Position, OptionPosition } from '@trading-app/shared';
+import { displayOptionMark } from '@trading-app/shared';
 import type { SymbolState } from '../types/app';
 import { isQuoteMoveUnreliable } from './format';
 
@@ -86,9 +87,11 @@ export function getOptionOpenSortValue(o: OptionPosition, key: OptionOpenSortKey
     case 'type': return o.optionType;
     case 'contracts': return o.contracts;
     case 'premiumPaid': return o.premiumPaid;
-    case 'currentMark': return o.currentPremium;
+    // TRA-2890 — sort on the same display mark the cells render (live rows:
+    // broker-tape last trade), so ordering matches what's on screen.
+    case 'currentMark': return displayOptionMark(o);
     case 'pnlDollar': {
-      const unrealized = (o.currentPremium - o.premiumPaid) * o.contractsRemaining * 100;
+      const unrealized = (displayOptionMark(o) - o.premiumPaid) * o.contractsRemaining * 100;
       return unrealized + (o.pnl ?? 0);
     }
     case 'status': return o.trailingActive ? 'trailing' : 'open';

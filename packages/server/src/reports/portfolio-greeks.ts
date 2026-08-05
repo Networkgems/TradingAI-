@@ -14,7 +14,7 @@
 // resolved spot, so the Greeks reflect today's market rather than a stale
 // entry-time snapshot.
 import type { OptionPosition, PortfolioGreeks, AllocationBucket, GreeksUnvaluedReason } from '@trading-app/shared';
-import { sectorOf } from '@trading-app/shared';
+import { sectorOf, displayOptionMark } from '@trading-app/shared';
 import { blackScholesGreeks, bsImpliedVolatility, daysToExpiration } from '@trading-app/engine';
 
 /** Resolve an underlying ticker to its current spot price (or undefined/≤0 if unknown). */
@@ -77,8 +77,13 @@ function unvalued(base: PositionValuation, reason: GreeksUnvaluedReason): Positi
 function positionNotional(opt: OptionPosition): number {
   const qty = opt.contractsRemaining ?? opt.contracts;
   if (!Number.isFinite(qty) || qty <= 0) return 0;
-  const mark = Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
-    ? opt.currentPremium
+  // TRA-2890 — DISPLAY valuation: an open live row is valued at the
+  // broker-tape last trade when present, so the Book Premium tile and the
+  // allocation buckets equal the Options table and Tradier's positions view.
+  // The "no mid → premium paid" fallback chain is unchanged.
+  const disp = displayOptionMark(opt);
+  const mark = Number.isFinite(disp) && disp > 0
+    ? disp
     : (Number.isFinite(opt.premiumPaid) && opt.premiumPaid > 0 ? opt.premiumPaid : 0);
   if (mark <= 0) return 0;
   return mark * qty * 100;
@@ -112,9 +117,14 @@ function valuePosition(opt: OptionPosition, resolveSpot: SpotResolver, riskFreeR
   const T = days / 365;
   if (!Number.isFinite(T) || T <= 0) return unvalued(base, 'expired');
 
-  // Solve IV from the current mark (per-share premium) so the Greeks track
-  // today's market. The mark used for notional already prefers the live mark.
-  const mark = notional / (qty * 100);
+  // Solve IV from the current MID (per-share premium) so the Greeks track
+  // today's market. TRA-2890 — deliberately NOT the display mark the notional
+  // above uses: Greeks are a risk read, and solving IV off a stale last-trade
+  // print on an illiquid contract would fabricate a vol surface from a price
+  // nobody is quoting. Same "no mid → premium paid" fallback as before.
+  const mark = Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
+    ? opt.currentPremium
+    : opt.premiumPaid;
   const iv = bsImpliedVolatility({
     spot: spot as number,
     strike: opt.strike,

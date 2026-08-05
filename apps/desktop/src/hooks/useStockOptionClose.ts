@@ -148,6 +148,10 @@ export function useStockOptionClose(token: string, tradierEnv: 'sandbox' | 'prod
       // Already pending — let the user cancel from the row's badge.
       return;
     }
+    // TRA-2890 — deliberately the NBBO mid (`currentPremium`), NOT the
+    // last-trade display mark the table renders: this seeds a real limit
+    // order, and a resting limit at a stale print on an illiquid contract
+    // either can't fill or gives away the spread. Execution stays on the mid.
     const defaultPrice = Number.isFinite(o.currentPremium) && o.currentPremium > 0
       ? o.currentPremium
       : o.premiumPaid;

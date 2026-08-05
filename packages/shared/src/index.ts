@@ -2567,6 +2567,19 @@ export interface OptionPosition {
   contractsRemaining: number; // after partial exit at TP1; starts equal to contracts
   premiumPaid: number;        // per-share premium at entry
   currentPremium: number;     // current mark (updated on each tick)
+  /**
+   * TRA-2890 — the broker-tape LAST TRADE per share, refreshed on the same tick
+   * as `currentPremium` (same cached chain snapshot, `row.last`). LIVE rows
+   * only; never set on demo rows. Display surfaces value an OPEN live position
+   * at this price via {@link displayOptionMark} so the screen reconciles with
+   * Tradier's own positions view (which values at last trade), while every
+   * risk-engine consumer (stops, trailing, the give-back peak, IV solves,
+   * close-limit defaults) stays on the NBBO mid in `currentPremium` — a stale
+   * print on an illiquid contract must never fire or suppress a real-money
+   * stop. May go stale between prints; that is the semantics of "last trade"
+   * and exactly what the broker's own screen shows.
+   */
+  lastMark?: number;
   tp1Premium: number;         // partial exit trigger at +25%
   tp1Hit: boolean;            // true once 50% has been exited at TP1
   stopLossPremium: number;    // hard stop loss at -25% (improved from -35%)
@@ -2850,6 +2863,42 @@ export interface OptionPosition {
    * free cash at open — so a credit can't masquerade as spendable buying power.
    */
   creditUsd?: number;
+}
+
+/**
+ * TRA-2890 — THE display-mark rule, in one place. The mark a DISPLAY surface
+ * (Options table row, Gain/Loss, Book Premium / allocation notional, Account
+ * Summary option value, unrealized-P&L footer pill) values a position at:
+ *
+ *   • OPEN + LIVE + fresh `lastMark`  → the broker-tape LAST TRADE. Tradier's
+ *     own positions view values at last trade, so live Gain/Loss equals the
+ *     broker's by construction (cost basis already reconciles via TRA-2889).
+ *   • everything else                 → `currentPremium` (NBBO mid): demo rows
+ *     (paper fills model the mid), live rows the tape hasn't priced yet, and
+ *     CLOSED rows — `currentPremium` on a closed row is the actual exit fill,
+ *     which a stale `lastMark` must never shadow.
+ *
+ * Server (options-account, portfolio-greeks) and desktop (StockOptionsPanel,
+ * stockSort) both call THIS function — the TRA-2873 board screenshot existed
+ * because two surfaces implemented "the value of the book" independently. The
+ * risk engine (stops / trailing / give-back peak / IV solves / close-limit
+ * defaults) deliberately does NOT call it: it stays on the NBBO mid, because a
+ * stale print on an illiquid contract must never fire or suppress a
+ * real-money stop.
+ */
+export function displayOptionMark(
+  o: Pick<OptionPosition, 'mode' | 'closedAt' | 'currentPremium' | 'lastMark'>,
+): number {
+  if (
+    o.closedAt == null
+    && (o.mode ?? 'demo') === 'live'
+    && typeof o.lastMark === 'number'
+    && Number.isFinite(o.lastMark)
+    && o.lastMark > 0
+  ) {
+    return o.lastMark;
+  }
+  return o.currentPremium;
 }
 
 /**
