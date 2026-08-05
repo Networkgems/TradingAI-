@@ -196,7 +196,14 @@ export function rowFromOption(opt: OptionPosition): ExportTradeRow {
     exit_time: isoOrEmpty(opt.closedAt),
     // The last mark recorded on the closed option is its exit premium.
     exit_price: isFiniteNumber(opt.currentPremium) ? opt.currentPremium : null,
-    exit_reason: '',
+    // TRA-2937 — this was a hardcoded `''` for EVERY option row, closed or not,
+    // thirty lines below an equity mapper that maps the field properly. The
+    // export is the only place a human can read "which rule closed this" for a
+    // whole book at once, so the hardcode made every option exit unattributable
+    // from outside the process. `exitReason` is stamped on every option close
+    // path by TRA-2940; empty here now means exactly one thing — the row closed
+    // before that stamp shipped.
+    exit_reason: opt.exitReason ?? '',
     gross_pnl_usd: net,
     fees_usd: 0,
     net_pnl_usd: net,

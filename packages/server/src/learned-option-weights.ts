@@ -16,6 +16,9 @@ import type {
 // module (the base layer); re-export it as `dteBand` so the learned-weights
 // fold and the journal summary can never split DTE on different thresholds.
 import { entryDteBand as dteBand } from './option-trade-journal.js';
+// TRA-2937 — the attribution predicate that keeps un-chosen trades out of the
+// fold; see `excludedUnattributed` on {@link OptionLearnedWeights.generatedFrom}.
+import { isUnattributedImportRow } from './option-trade-journal.js';
 export { dteBand };
 
 // TRA-990 (Learning B) — fold the option-trade journal into learned, bounded
@@ -77,7 +80,23 @@ export interface OptionLearnedWeights {
    * `priorRate` is the global pooled win-rate fed to the shrinkage estimate, or
    * null when the global pool itself has not cleared `minSamples`.
    */
-  generatedFrom: { rows: number; resolved: number; priorRate: number | null };
+  generatedFrom: {
+    rows: number;
+    resolved: number;
+    priorRate: number | null;
+    /**
+     * TRA-2937 — rows DROPPED before the fold because the firm did not choose
+     * them (Tradier imports; see {@link isUnattributedImportRow}).
+     *
+     * Published rather than dropped silently. TRA-2937 made imported positions
+     * journal an OPEN so their close (and its exit reason) stops vanishing —
+     * which, without this filter, would have started teaching the selector from
+     * trades no selector ever picked, with a fabricated trend and no entry
+     * delta. A count of 0 must be readable as "there were none", not as "the
+     * exclusion is not running", so it is emitted on every call.
+     */
+    excludedUnattributed: number;
+  };
   params: LearnedWeightsParams;
   byStructure: OptionLearnedStat[];
   byIvRank: OptionLearnedStat[];
@@ -201,19 +220,43 @@ export function computeOptionLearnedWeights(
   const sortStat = (a: OptionLearnedStat, b: OptionLearnedStat) =>
     a.key.localeCompare(b.key, undefined, { numeric: true });
 
+  // TRA-2937 — fold only trades the SELECTOR chose. A Tradier-imported row is a
+  // real position in the book, but it carries no setup: no IV-rank, no measured
+  // entry delta, and a trend regime no gate ever evaluated. Its outcome is
+  // therefore an observation of the market, not of our selection rule, and every
+  // dimension it would land in (`trend`, `sentiment`, `dte`) is a bucket the live
+  // multiplier is read out of.
+  //
+  // Note this is NOT the censoring TRA-2937 was filed about, it is its mirror.
+  // The filed defect was that the imported cohort contributed ENTRIES and never
+  // OUTCOMES, biasing the fold toward trades the app kept track of. Journaling
+  // the import fixes that asymmetry at the source; dropping the whole row here
+  // keeps the fix from over-correcting into the opposite error of learning from
+  // un-chosen trades. An engine-opened row that the reconcile re-adopted is NOT
+  // excluded — adoption rebinds its close onto the ORIGINAL row, which keeps its
+  // real structure label and its real setup, so it re-enters the fold with its
+  // outcome attached. That is the de-censoring half.
+  const attributed = rows.filter((r) => !isUnattributedImportRow(r));
+  const excludedUnattributed = rows.length - attributed.length;
+
   // Global pooled win-rate is the prior the shrinkage estimate pulls toward, the
   // same across all folds. The fold stays pure (carries both multipliers, reads no
   // flag); the live switch is applied in `optionSetupMultiplier`.
   const isResolved = (r: OptionTradeJournalRecord) => r.outcome !== 'OPEN';
-  const priorRate = globalPriorRate(rows, isResolved, (r) => r.outcome === 'WIN', params);
+  const priorRate = globalPriorRate(attributed, isResolved, (r) => r.outcome === 'WIN', params);
 
   const fold = (keyOf: (r: OptionTradeJournalRecord) => string): OptionLearnedStat[] =>
-    [...groupBy(rows, keyOf).entries()]
+    [...groupBy(attributed, keyOf).entries()]
       .map(([key, list]) => statFor(key, list, priorRate, params))
       .sort(sortStat);
 
   return {
-    generatedFrom: { rows: rows.length, resolved: rows.filter(isResolved).length, priorRate },
+    generatedFrom: {
+      rows: attributed.length,
+      resolved: attributed.filter(isResolved).length,
+      priorRate,
+      excludedUnattributed,
+    },
     params,
     byStructure: fold((r) => r.structure),
     byIvRank: fold((r) => ivRankBand(r.ivRank)),

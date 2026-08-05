@@ -47,8 +47,49 @@ export function isOptionTradeJournalEnabled(env: NodeJS.ProcessEnv = process.env
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-/** Coarse trend regime the structure was opened into. */
-export type JournalTrend = 'up' | 'down' | 'sideways';
+/**
+ * Coarse trend regime the structure was opened into.
+ *
+ * TRA-2937 — widened with `unknown`. A Tradier-imported row has no trend gate
+ * behind it (the firm never chose the trade), and the three graded values had no
+ * honest member for that case. Picking one anyway would have written a
+ * fabricated regime into an append-only ledger, where it is indistinguishable
+ * from a measured one forever after. `unknown` folds into its own bucket the way
+ * a null IV-rank and an absent sentiment-IC grade already do.
+ */
+export type JournalTrend = 'up' | 'down' | 'sideways' | 'unknown';
+
+/**
+ * TRA-2937 — the structure label every Tradier-imported journal row carries.
+ *
+ * This value is the row's ATTRIBUTION marker, not a cosmetic label: it is what
+ * {@link isUnattributedImportRow} tests, and therefore what keeps a trade the
+ * firm did not select out of the learned-weights fold. It is exported (rather
+ * than written as a literal at each site) so the writer and the readers cannot
+ * drift onto different spellings.
+ *
+ * A structure VALUE is used rather than a new boolean flag deliberately. A
+ * boolean would make ABSENT ambiguous — "written before TRA-2937" and
+ * "engine-selected" would collapse into the same reading, and a regressed writer
+ * would hide inside the engine cohort. No row written by any build before this
+ * one carries this structure, and every imported row written by this build and
+ * later does, so the predicate is exact in both directions.
+ */
+export const TRADIER_IMPORT_STRUCTURE = 'tradier_import';
+
+/**
+ * TRA-2937 — true for a journal row that records a position the firm did not
+ * choose: a Tradier-imported contract adopted by `reconcileTradierPositions`.
+ *
+ * Such a row is a real trade in the BOOK (its realized P&L and exit reason are
+ * facts and belong in every descriptive rollup) but it is NOT an observation of
+ * the selector, because no selector ran. Anything that feeds a future entry
+ * decision must exclude it; anything that describes what the book did must keep
+ * it. See `computeOptionLearnedWeights` for the one capital-adjacent consumer.
+ */
+export function isUnattributedImportRow(row: { structure: string }): boolean {
+  return row.structure === TRADIER_IMPORT_STRUCTURE;
+}
 
 /**
  * TRA-993 — the *grade/skill* band of the sentiment signal at entry, sourced from
@@ -743,6 +784,36 @@ export async function getOptionTradeJournalRecord(
 ): Promise<OptionTradeJournalRecord | undefined> {
   const map = await ensureLoaded();
   return map.get(id);
+}
+
+/**
+ * TRA-2937 — every still-OPEN row for one OCC contract in one book.
+ *
+ * Exists for the reconcile ADOPTION path. `reconcileTradierPositions` mints a
+ * fresh `randomUUID()` for a contract the broker reports but the local book has
+ * lost (a restart, a phantom close, a row swept by the broker-flat sweep). If
+ * that contract was originally opened by the engine, its journal row is still
+ * sitting at `outcome: 'OPEN'` under the OLD id — so the trade's eventual close
+ * lands on an id the journal has never heard of and is dropped, while the
+ * original row over-states open exposure forever. Joining on the contract is the
+ * only way back to that row: `optionSymbol` (TRA-1656) is the sole identity the
+ * two ids share.
+ *
+ * Returns an ARRAY, not a first match, and the caller is expected to refuse an
+ * ambiguous adoption rather than pick one. Two open rows for the same contract
+ * in the same book is a state we have no evidence to disentangle, and binding a
+ * close to the wrong one would mis-attribute realized P&L to a trade that did
+ * not earn it — strictly worse than the dropped close this fixes.
+ */
+export async function findOpenOptionTradeJournalRecordsByOptionSymbol(
+  optionSymbol: string,
+  mode: 'demo' | 'live',
+): Promise<OptionTradeJournalRecord[]> {
+  if (!optionSymbol) return [];
+  const map = await ensureLoaded();
+  return [...map.values()].filter(
+    (r) => r.outcome === 'OPEN' && r.optionSymbol === optionSymbol && r.mode === mode,
+  );
 }
 
 /** TRA-991 — per-structure rollup row in {@link OptionTradeJournalSummary}. */

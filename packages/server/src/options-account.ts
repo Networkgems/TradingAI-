@@ -58,6 +58,12 @@ import {
   // TRA-2895 — the dated partial-exit row; see `queueJournalPartial`.
   recordOptionTradePartialClose,
   getOptionTradeJournalRecord,
+  // TRA-2937 — the import-journalling path: the contract-keyed lookup that lets
+  // a re-imported engine row be REBOUND onto its original OPEN instead of
+  // stranding it, and the structure label that keeps a genuinely un-chosen
+  // import out of the learned-weights fold.
+  findOpenOptionTradeJournalRecordsByOptionSymbol,
+  TRADIER_IMPORT_STRUCTURE,
   outcomeForR,
   type JournalTrend,
   type OptionTradeJournalOpen,
@@ -912,6 +918,27 @@ export class PaperOptionsAccount {
    */
   private journalWrites: Promise<unknown> = Promise.resolve();
 
+  /**
+   * TRA-2937 — position id → the journal row id its close must be written to,
+   * populated ONLY when the reconcile ADOPTED an existing OPEN row for the same
+   * contract (see {@link queueJournalImportOpen}). Absent ⇒ the two ids are the
+   * same, which is the case for every engine-opened position.
+   *
+   * The indirection exists because `reconcileTradierPositions` mints a fresh
+   * `randomUUID()` for a contract the local book has lost track of. Without a
+   * rebinding the close is written against an id the journal has never seen and
+   * is silently dropped, while the original row stays OPEN forever — the exact
+   * pair of symptoms this ticket was filed on.
+   *
+   * Safe to read and write off the {@link journalWrites} chain and nowhere else:
+   * every journal emit is serialised onto that one promise, so the entry is
+   * always installed by the open task before any close task for the same
+   * position runs, with no lock and no ordering assumption about the callers.
+   * Entries are deleted once the close is emitted, so this cannot outgrow the
+   * set of positions currently open.
+   */
+  private journalIdByPosition = new Map<string, string>();
+
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
     this.managedAccountRatio = config.managedAccountRatio ?? DEFAULT_ACCOUNT_SETTINGS.managedAccountRatio;
@@ -1094,6 +1121,146 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-2937 — journal a position that `reconcileTradierPositions` just adopted
+   * from the broker, so its eventual CLOSE has somewhere to land.
+   *
+   * ── The hole this closes ───────────────────────────────────────────────────
+   *
+   * An imported row was minted with a fresh `randomUUID()` and never journalled.
+   * {@link queueJournalClose} looks the id up and `return`s when it misses — an
+   * early return, not a caught error, so nothing warned. Every imported round
+   * trip therefore realized its P&L into `closedOptions` and contributed
+   * NOTHING to the journal: four live exits on 2026-08-05 realized -$418 whose
+   * exit reason was not recoverable from anywhere in the app, and whose journal
+   * rows still read `OPEN` while the positions were closed and settled.
+   *
+   * ── Two shapes, and they need opposite treatment ───────────────────────────
+   *
+   * ADOPT — the contract already has an OPEN journal row under a DIFFERENT id.
+   * That row is an ENGINE open the local book lost track of (a restart, a
+   * phantom close, a row the broker-flat sweep removed) and the broker has just
+   * handed it back. Writing a second OPEN here would double-count the exposure
+   * the ticket is complaining about, and would strand the original row forever.
+   * So no row is written: the position is REBOUND onto the existing id, and its
+   * close settles the original row — with its real structure, its real entry
+   * delta and IV-rank intact, which is what puts the trade's outcome back in
+   * front of the learner instead of censoring it.
+   *
+   * MINT — no OPEN row exists for the contract, so this position was only ever
+   * imported. It gets a row of its own, marked {@link TRADIER_IMPORT_STRUCTURE}
+   * and carrying honest-unknown values for everything a selector would have
+   * supplied. That label is load-bearing: it is what
+   * `computeOptionLearnedWeights` excludes on, so booking the trade never turns
+   * into learning from a trade nobody chose.
+   *
+   * AMBIGUOUS — two or more OPEN rows for one contract in one book is a state we
+   * have no evidence to disentangle, and guessing would mis-attribute realized
+   * P&L to a trade that did not earn it. It refuses to adopt, warns, and mints,
+   * which is strictly the safer error: a duplicate descriptive row, rather than
+   * a wrong number on a real trade.
+   *
+   * Fire-and-forget on the same {@link journalWrites} chain as every other emit,
+   * so a journal failure can never reach the reconcile's execution path and the
+   * rebinding is always installed before any close for the same position runs.
+   */
+  private queueJournalImportOpen(position: OptionPosition): void {
+    if (!isOptionTradeJournalEnabled()) return;
+    const id = position.id;
+    const optionSymbol = position.optionSymbol;
+    const mode = (position.mode ?? 'demo') as 'demo' | 'live';
+    // The whole mechanism joins on the OCC symbol (TRA-1656 put it on the row);
+    // with no contract identity there is nothing to adopt and nothing a future
+    // reader could join back, so mint plainly rather than half-doing it.
+    const entryDte = position.expiration
+      ? dteFromExpiration(position.expiration, position.openedAt) ?? 0
+      : 0;
+    // A long option's max loss IS its premium, so this is the true basis for
+    // `realizedR` — not an approximation standing in for a missing stop.
+    const atRiskUsd = position.premiumPaid * position.contracts * 100;
+    this.journalWrites = this.journalWrites
+      .then(async () => {
+        if (optionSymbol) {
+          const open = await findOpenOptionTradeJournalRecordsByOptionSymbol(optionSymbol, mode);
+          const adoptable = open.filter((r) => r.id !== id);
+          if (adoptable.length === 1) {
+            const existing = adoptable[0]!;
+            this.journalIdByPosition.set(id, existing.id);
+            accountLog.info('reconcile rebound an imported row onto its existing journal row', {
+              issue: 'TRA-2937',
+              optionSymbol,
+              mode,
+              positionId: id,
+              journalId: existing.id,
+              structure: existing.structure,
+              note: 'close will settle the ORIGINAL row; no duplicate OPEN written',
+            });
+            return;
+          }
+          if (adoptable.length > 1) {
+            accountLog.warn('refusing to rebind an imported row: multiple OPEN journal rows', {
+              issue: 'TRA-2937',
+              optionSymbol,
+              mode,
+              positionId: id,
+              candidates: adoptable.map((r) => r.id),
+              note: 'minting a tradier_import row instead — an ambiguous rebind would ' +
+                'mis-attribute realized P&L to a trade that did not earn it',
+            });
+          }
+        }
+        const open: OptionTradeJournalOpen = {
+          id,
+          openTs: position.openedAt,
+          symbol: position.symbol,
+          structure: TRADIER_IMPORT_STRUCTURE,
+          mode,
+          // Honest-unknown throughout. None of these were measured, because no
+          // selector ran: the broker handed us a contract we did not pick. They
+          // are written as unknowns rather than as plausible defaults so a future
+          // reader cannot mistake a fabricated regime for a measured one — and
+          // the row is kept out of the learner by its STRUCTURE, never by a
+          // reader happening to interpret these sentinels correctly.
+          ivRank: null,
+          trend: 'unknown',
+          sentiment: null,
+          sentimentIcBand: null,
+          entryDelta: 0,
+          entryDte,
+          atRiskUsd,
+          agentConviction: null,
+          ...(optionSymbol ? { optionSymbol } : {}),
+          ...(Number.isFinite(position.contracts) ? { contracts: position.contracts } : {}),
+          ...(this.owner ? { account: this.owner } : {}),
+          // No sizing chokepoint was consulted — an import is not sized by us at
+          // all — so `1` / `1` / `null` is the literal truth here, the same values
+          // the defined-risk and wheel open paths pass.
+          riskThrottleMultiplier: 1,
+          riskThrottleArmedScope: riskThrottleSizingScope(),
+          riskThrottleDecided: 1,
+          riskThrottleSizingPath: null,
+        };
+        await recordOptionTradeOpen(open);
+      })
+      .catch((err) => {
+        accountLog.warn('option trade journal import open emit failed', {
+          issue: 'TRA-2937',
+          id,
+          optionSymbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  /**
+   * TRA-2937 — the journal row id a position's close/partial must be written to.
+   * Identity for everything except a reconcile-adopted import; see
+   * {@link journalIdByPosition}.
+   */
+  private journalIdFor(positionId: string): string {
+    return this.journalIdByPosition.get(positionId) ?? positionId;
+  }
+
+  /**
    * TRA-2895 — queue a PARTIAL-EXIT row for a position that stays open.
    *
    * Four sites realize a slice without closing the position: the demo TP1 trim
@@ -1126,7 +1293,11 @@ export class PaperOptionsAccount {
     const id = position.id;
     const ts = Date.now();
     this.journalWrites = this.journalWrites
-      .then(() => recordOptionTradePartialClose(id, {
+      // TRA-2937 — resolve the journal id INSIDE the chained task, never at call
+      // time: a reconcile-adopted import installs its rebinding from an earlier
+      // task on this same chain, so reading it here is what guarantees the two
+      // are ordered without a lock.
+      .then(() => recordOptionTradePartialClose(this.journalIdFor(id), {
         ts,
         realizedPnlUsd,
         contracts,
@@ -1164,11 +1335,32 @@ export class PaperOptionsAccount {
     const closeTs = position.closedAt ?? Date.now();
     this.journalWrites = this.journalWrites
       .then(async () => {
-        const rec = await getOptionTradeJournalRecord(id);
-        if (!rec || rec.outcome !== 'OPEN') return;
+        // TRA-2937 — resolved inside the task, for the ordering reason spelled
+        // out on `queueJournalPartial`. Identity unless the reconcile adopted
+        // this position onto an existing OPEN row for the same contract.
+        const journalId = this.journalIdFor(id);
+        const rec = await getOptionTradeJournalRecord(journalId);
+        // TRA-2937 — the miss is now WARNED rather than swallowed. It used to be
+        // a bare `return`: an imported row's close vanished with nothing in the
+        // logs, which is why the gap survived to a live -$418 day before anyone
+        // noticed. Every open path journals, so a miss here is a genuine defect
+        // in the writer, not an expected shape. Still not thrown — the journal is
+        // observe-only and must never reach a capital path.
+        if (!rec) {
+          accountLog.warn('option trade journal close dropped: no OPEN row for this id', {
+            issue: 'TRA-2937',
+            id,
+            journalId,
+            optionSymbol: position.optionSymbol,
+            exitReason,
+            realizedPnlUsd,
+          });
+          return;
+        }
+        if (rec.outcome !== 'OPEN') return;
         const realizedR = rec.atRiskUsd > 0 ? realizedPnlUsd / rec.atRiskUsd : 0;
         const holdDays = Math.max(0, (closeTs - rec.openTs) / MS_PER_DAY);
-        await recordOptionTradeClose(id, {
+        await recordOptionTradeClose(journalId, {
           closeTs,
           outcome: outcomeForR(realizedR),
           realizedPnlUsd,
@@ -1176,6 +1368,12 @@ export class PaperOptionsAccount {
           exitReason,
           holdDays,
         });
+      })
+      // TRA-2937 — the position is settled either way, so drop any rebinding on
+      // BOTH branches (`finally`, not `then`: a failed emit that kept its entry
+      // would leak one per adopted import for the life of the process).
+      .finally(() => {
+        this.journalIdByPosition.delete(id);
       })
       .catch((err) => {
         accountLog.warn('option trade journal close emit failed', {
@@ -1220,6 +1418,8 @@ export class PaperOptionsAccount {
     this.cash = this.initialEquity;
     this.openOptions.clear();
     this.closedOptions = [];
+    // TRA-2937 — the rebindings describe positions that no longer exist.
+    this.journalIdByPosition.clear();
     // TRA-1976 — drop any assigned-share inventory on a book reset.
     this.assignedShares.clear();
     this.optionsPnlByMode = { demo: 0, live: 0 };
@@ -4524,6 +4724,12 @@ export class PaperOptionsAccount {
       };
       this.installReconcileRiskThresholds(position, mode);
       this.openOptions.set(position.id, position);
+      // TRA-2937 — journal the adoption. Until this line an imported row had no
+      // journal record under its freshly-minted id, so `queueJournalClose` found
+      // nothing and returned: the round trip realized into `closedOptions` and
+      // vanished from the ledger, exit reason and all. See
+      // `queueJournalImportOpen` for the rebind-vs-mint split.
+      this.queueJournalImportOpen(position);
       added += 1;
     }
 
@@ -4818,8 +5024,12 @@ export class PaperOptionsAccount {
     delete opt.pendingCloseRepriceSteps;
     this.openOptions.delete(optionId);
     this.closedOptions.push({ ...opt });
-    // TRA-991 — fold the realized outcome onto this trade's journal row. Imported
-    // rows are never journalled at open, so this no-ops for them in practice.
+    // TRA-991 — fold the realized outcome onto this trade's journal row.
+    // TRA-2937 — this used to be annotated "imported rows are never journalled at
+    // open, so this no-ops for them in practice", which is precisely the bug:
+    // EVERY close through this path was dropped. `reconcileTradierPositions` now
+    // journals the import (or rebinds it onto its original engine row), so the
+    // call lands.
     this.queueJournalClose(opt, exitReason);
     // TRA-367 — surface realised P&L immediately on the Live pill instead
     // of waiting for the EOD Tradier-history reconcile. The reconciler
