@@ -313,6 +313,39 @@ export interface OptionTradeJournalClose {
 }
 
 /**
+ * TRA-2895 — ONE partial exit, dated on the day it actually realized.
+ *
+ * The CLOSE row is written only when a position FULLY closes, and its
+ * `realizedPnlUsd` is the position's CUMULATIVE P&L stamped with the FULL-close
+ * timestamp. That is the right trade-level record (an R-multiple must span the
+ * whole round trip) and the wrong DAY record: a TP1 partial realized on Monday
+ * lands, in the day census, on Friday's close.
+ *
+ * Before this row existed the partial's day was invisible to the census
+ * entirely — `journalDayCloses` named 0 closes, so `resolveDailyOptionsPnl`
+ * booked `bucket-journal-silent` (live paths, where the bucket carried the
+ * slice) or a PROVEN ZERO (demo paths, where it did not). The first can never
+ * converge to `journal`; the second reads bit-identical to a day that genuinely
+ * traded nothing. Live proof: bqb1 admin 2026-08-04, `optionsDaily -2.00`,
+ * `journalCloses 0`, against a tape with three tape-verified `sell_to_close`
+ * partials.
+ *
+ * These rows are ADDITIVE to the close row, never a replacement for it — see
+ * {@link OptionTradeJournalRecord.partials} for the invariant that keeps the two
+ * from double-counting.
+ */
+export interface OptionTradeJournalPartial {
+  /** ms-epoch the partial exit realized. This is what dates the slice. */
+  ts: number;
+  /** Signed realized P&L for THIS slice only, USD (net of any modelled fee). */
+  realizedPnlUsd: number;
+  /** Contracts sold in this slice. */
+  contracts: number;
+  /** Why the slice was sold (`tp1`, `manual`, `partial_fill`). */
+  exitReason: string;
+}
+
+/**
  * One journalled option trade: the setup plus (once closed) its realized
  * outcome. `outcome` is `OPEN` until the close row lands.
  */
@@ -325,6 +358,33 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
   holdDays?: number;
   /** TRA-1600 (D) — measured exit-side slippage USD, folded from the CLOSE row. */
   exitSlippageUsd?: number;
+  /**
+   * TRA-2895 — partial exits realized before the full close, in append order.
+   *
+   * ── The invariant every reader depends on ──────────────────────────────────
+   *
+   * `realizedPnlUsd` on the CLOSE row is CUMULATIVE: it already contains every
+   * slice listed here. So the per-day attribution of a trade is
+   *
+   *   day(p.ts) += p.realizedPnlUsd            for each partial p
+   *   day(closeTs) += realizedPnlUsd − Σ p.realizedPnlUsd
+   *
+   * and the trade-level total is `realizedPnlUsd`, unchanged. Adding the slices
+   * to the close day instead of subtracting them is the double-attribution this
+   * ticket exists to kill.
+   *
+   * The invariant is enforced at the four write sites in `options-account.ts`
+   * (they all fold the slice into `position.pnl`), not here — this module cannot
+   * see the book. `options-account-partial-journal.test.ts` pins it.
+   *
+   * ABSENT means "no partial exits", which for a pre-TRA-2895 row is also
+   * "partials were never recorded". Both attribute the whole cumulative figure
+   * to the close day, i.e. exactly the pre-ticket behaviour, so a legacy record
+   * folds identically through the new census. That collapse is deliberate and
+   * safe ONLY because the two states produce the same arithmetic; do not reuse
+   * it for anything that must tell them apart.
+   */
+  partials?: OptionTradeJournalPartial[];
 }
 
 // Append-only line shapes (discriminated by `kind`).
@@ -335,7 +395,10 @@ type CloseLine = { kind: 'close'; id: string; close: OptionTradeJournalClose };
 // row was written at `premiumPaid == rawMark`, so entrySlippageUsd was 0). This
 // line supersedes that value without an in-place rewrite.
 type AmendEntrySlippageLine = { kind: 'amend_entry_slippage'; id: string; entrySlippageUsd: number };
-type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine;
+// TRA-2895 — a partial exit, dated on its own day. Appended while the position
+// is still OPEN; the eventual close row stays cumulative.
+type PartialCloseLine = { kind: 'partial_close'; id: string; partial: OptionTradeJournalPartial };
+type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine | PartialCloseLine;
 
 function defaultStoreFile(): string {
   const root = resolveDataDir();
@@ -403,6 +466,18 @@ function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine)
     if (typeof line.entrySlippageUsd === 'number' && Number.isFinite(line.entrySlippageUsd)) {
       map.set(line.id, { ...rec, entrySlippageUsd: line.entrySlippageUsd });
     }
+    return;
+  }
+  if (line.kind === 'partial_close') {
+    // TRA-2895 — append the dated slice. Like the amend line, a partial for an
+    // unknown id is DROPPED rather than resurrecting a row that has no open: a
+    // slice with no entry basis has no `atRiskUsd` to divide by and would enter
+    // the census as a trade the book never opened.
+    const rec = map.get(line.id);
+    if (!rec) return;
+    const p = line.partial;
+    if (!Number.isFinite(p?.ts) || !Number.isFinite(p?.realizedPnlUsd)) return;
+    map.set(line.id, { ...rec, partials: [...(rec.partials ?? []), p] });
     return;
   }
   const existing = map.get(line.id);
@@ -554,6 +629,40 @@ export async function recordOptionTradeEntrySlippage(
   foldLine(map, { kind: 'amend_entry_slippage', id, entrySlippageUsd });
   await appendLine({ kind: 'amend_entry_slippage', id, entrySlippageUsd });
   log.info('option trade journal entry-slippage amended', { id, entrySlippageUsd });
+  return true;
+}
+
+/**
+ * TRA-2895 — append a PARTIAL-EXIT row for a position that is still open.
+ *
+ * The census dates this slice on `partial.ts` and subtracts it from the
+ * eventual (cumulative) close row, so the day the trim actually realized carries
+ * its own dollars and the close day carries only the residual. See
+ * {@link OptionTradeJournalRecord.partials}.
+ *
+ * No-op (returns false) when the flag is off, the value is not finite, the row
+ * is unknown, or the row is ALREADY CLOSED. The last one matters: a slice
+ * arriving after the close row would be subtracted from a total that never
+ * contained it, turning the residual negative. The close paths never emit one —
+ * this refuses it anyway rather than trusting call order.
+ */
+export async function recordOptionTradePartialClose(
+  id: string,
+  partial: OptionTradeJournalPartial,
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!Number.isFinite(partial.realizedPnlUsd) || !Number.isFinite(partial.ts)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  foldLine(map, { kind: 'partial_close', id, partial });
+  await appendLine({ kind: 'partial_close', id, partial });
+  log.info('option trade journal partial close', {
+    id,
+    contracts: partial.contracts,
+    pnl: partial.realizedPnlUsd,
+    exitReason: partial.exitReason,
+  });
   return true;
 }
 

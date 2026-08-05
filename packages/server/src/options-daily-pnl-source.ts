@@ -68,6 +68,14 @@ export interface OptionsDailyPnlDecision {
   journalPnl: number | null;
   /** Option closes the journal recorded for this ET day; null = no census. */
   journalCloses: number | null;
+  /**
+   * TRA-2895 — partial exits the journal dated on this ET day; null = no census.
+   * Persisted alongside `journalCloses` so a cell sourced `journal` on the
+   * strength of TRIMS ALONE (`journalCloses: 0`) is readable as such forever. A
+   * reader seeing `source: 'journal', journalCloses: 0` with no second field
+   * would be looking at what USED to be the definition of an unsourced day.
+   */
+  journalPartialCloses: number | null;
   /** True when the journal moved the number off the bucket figure. */
   changed: boolean;
 }
@@ -120,6 +128,29 @@ export function journalRowsForBook<T extends { account?: string; openTs?: number
 }
 
 /**
+ * TRA-2895 — realized-options EVENTS the journal recorded on this ET day:
+ * full closes plus partial exits.
+ *
+ * The single shared predicate for "is the journal the authority for this day's
+ * options cell". Three consumers ask it — `resolveDailyOptionsPnl` (the 21:00
+ * writer), `planOptionsDailyPnlRepair` (the historical repair) and
+ * `reconcilePnl`'s false-zero test (the checker) — and TRA-2314's standing
+ * invariant is that the writer, the repair and the checker scope identically.
+ * Before this existed all three asked `closes > 0`, which is why a day whose
+ * only options activity was a partial read as a day with no journal record at
+ * all.
+ *
+ * `null` census (the day is absent from the fold) is 0 events, which is
+ * correct — absent from a census that EXISTS means the journal saw nothing.
+ * Whether a census exists at all is a separate question (`censusAvailable`),
+ * and collapsing the two is the `?? 0` that hid the original defect for 95 days.
+ */
+export function journalRealizingEvents(census: JournalDayCloses | null | undefined): number {
+  if (!census) return 0;
+  return census.closes + census.partialCloses;
+}
+
+/**
  * Decide which source books this ET day's realized options P&L.
  *
  * `census` is this book's journal fold for the day (null = the day is absent
@@ -145,22 +176,32 @@ export function resolveDailyOptionsPnl(args: {
       bucketPnl,
       journalPnl: null,
       journalCloses: null,
+      journalPartialCloses: null,
       changed: false,
     };
   }
 
   const journalCloses = args.census?.closes ?? 0;
+  const journalPartialCloses = args.census?.partialCloses ?? 0;
   const journalPnl = round2(args.census?.realizedPnlUsd ?? 0);
 
-  // The journal named closes on this day: it is the durable record of what
-  // actually happened, so it books the cell. This is the fix.
-  if (journalCloses > 0) {
+  // The journal named realized options activity on this day: it is the durable
+  // record of what actually happened, so it books the cell. This is the fix.
+  //
+  // TRA-2895 — a PARTIAL exit counts as activity. It realizes dollars into
+  // equity exactly as a full close does, and the census now dates it on its own
+  // day (`foldJournalClosesByEtDay`). Testing `closes > 0` here is what made a
+  // trim-only day fall through to `bucket-journal-silent` — a source that says
+  // "the journal is behind" about a journal that was structurally blind and
+  // could therefore never catch up. Live: bqb1 admin 2026-08-04.
+  if (journalRealizingEvents(args.census) > 0) {
     return {
       value: journalPnl,
       source: 'journal',
       bucketPnl,
       journalPnl,
       journalCloses,
+      journalPartialCloses,
       changed: journalPnl !== bucketPnl,
     };
   }
@@ -175,6 +216,7 @@ export function resolveDailyOptionsPnl(args: {
       bucketPnl,
       journalPnl,
       journalCloses,
+      journalPartialCloses,
       changed: false,
     };
   }
@@ -187,6 +229,7 @@ export function resolveDailyOptionsPnl(args: {
     bucketPnl,
     journalPnl,
     journalCloses,
+    journalPartialCloses,
     changed: false,
   };
 }
@@ -202,6 +245,8 @@ export interface OptionsDailyPnlRepairDelta {
   delta: number;
   /** Option closes the journal recorded on this day for this book. */
   journalCloses: number;
+  /** TRA-2895 — partial exits the journal dated on this day for this book. */
+  journalPartialCloses: number;
 }
 
 export interface OptionsDailyPnlRepairPlan {
@@ -241,7 +286,13 @@ export function planOptionsDailyPnlRepair(
   const leftAloneDates: string[] = [];
   for (const s of snapshots) {
     const census = censusByDate.get(s.date);
-    if (!census || census.closes <= 0) continue;
+    // TRA-2895 — same predicate as the 21:00 writer. A historical day whose only
+    // options activity was a TRIM is exactly as repairable as one with a full
+    // close; leaving it out here while the writer books it live would give the
+    // repair and the writer two different populations, which is the split
+    // TRA-2314's invariant exists to forbid.
+    if (journalRealizingEvents(census) <= 0) continue;
+    if (!census) continue;
     const before = round2(s.optionsDailyPnl ?? 0);
     if (before !== 0) {
       leftAloneDates.push(s.date);
@@ -261,7 +312,14 @@ export function planOptionsDailyPnlRepair(
       leftAloneDates.push(s.date);
       continue;
     }
-    deltas.push({ date: s.date, before, after, delta: round2(after - before), journalCloses: census.closes });
+    deltas.push({
+      date: s.date,
+      before,
+      after,
+      delta: round2(after - before),
+      journalCloses: census.closes,
+      journalPartialCloses: census.partialCloses,
+    });
   }
   deltas.sort((a, b) => a.date.localeCompare(b.date));
   return {

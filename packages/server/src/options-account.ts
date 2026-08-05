@@ -53,6 +53,8 @@ import {
   isOptionTradeJournalEnabled,
   recordOptionTradeOpen,
   recordOptionTradeClose,
+  // TRA-2895 — the dated partial-exit row; see `queueJournalPartial`.
+  recordOptionTradePartialClose,
   getOptionTradeJournalRecord,
   outcomeForR,
   type JournalTrend,
@@ -866,6 +868,53 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-2895 — queue a PARTIAL-EXIT row for a position that stays open.
+   *
+   * Four sites realize a slice without closing the position: the demo TP1 trim
+   * in {@link checkExits}, the `tp1` and `manual` partial branches of
+   * {@link finalizePendingExit}, and {@link bookPartialClose}. None of them used
+   * to touch the journal — it only learns about a trade when the LAST contract
+   * goes — so the day a trim realized had no journal record at all and the day
+   * cell fell through to `bucket-journal-silent` (or, in demo, to a zero that
+   * read as proven).
+   *
+   * `realizedPnlUsd` is the slice ONLY, net of any modelled fee: the same number
+   * this site hands {@link bookRealizedPnl}. It must ALSO be folded into
+   * `position.pnl` by the caller, because the census subtracts Σ slices from the
+   * cumulative close row to get the close day's residual — a slice booked here
+   * but missing from `position.pnl` would be subtracted from a total that never
+   * contained it and would push the close day negative by its own amount.
+   *
+   * Fire-and-forget on the same {@link journalWrites} chain as open/close, so a
+   * journal failure can never reach the execution path, and the OPEN → PARTIAL →
+   * CLOSE append order is preserved.
+   */
+  private queueJournalPartial(
+    position: OptionPosition,
+    realizedPnlUsd: number,
+    contracts: number,
+    exitReason: string,
+  ): void {
+    if (!isOptionTradeJournalEnabled()) return;
+    if (!Number.isFinite(realizedPnlUsd)) return;
+    const id = position.id;
+    const ts = Date.now();
+    this.journalWrites = this.journalWrites
+      .then(() => recordOptionTradePartialClose(id, {
+        ts,
+        realizedPnlUsd,
+        contracts,
+        exitReason,
+      }))
+      .catch((err) => {
+        accountLog.warn('option trade journal partial emit failed', {
+          id,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  /**
    * TRA-991 — queue a CLOSE row when a position fully closes. Recovers the
    * entry-time `atRiskUsd` from the stored OPEN record so
    * `realizedR = realizedPnlUsd / atRiskUsd` divides by the same basis the open
@@ -873,6 +922,14 @@ export class PaperOptionsAccount {
    * an imported row, or opened before the flag flipped on), or it is already
    * closed. `realizedPnlUsd` is the position's cumulative realized P&L (`pnl`),
    * which already folds any partial exits.
+   *
+   * TRA-2895 — "already folds any partial exits" is now TRUE at every site. It
+   * was not: the demo TP1 trim in {@link checkExits} booked its slice into
+   * equity and the mode bucket but never into `position.pnl`, so the whole demo
+   * TP1 cohort's close row (and its `realizedR`, and the learner fold behind it)
+   * silently EXCLUDED the winning slice. The other three partial sites always
+   * accumulated. Per-day attribution of the cumulative figure lives in
+   * `foldJournalClosesByEtDay`, not here — this row stays trade-level.
    */
   private queueJournalClose(position: OptionPosition, exitReason: string): void {
     if (!isOptionTradeJournalEnabled()) return;
@@ -3417,8 +3474,21 @@ export class PaperOptionsAccount {
             this.demoSlippageCost += (mark - effectiveExit) * exitContracts * 100;
             this.demoFeeCost += exitFee;
           }
+          // TRA-2895 — fold the slice into the position's cumulative realized
+          // P&L. This site was the ONE partial path that did not (the two
+          // `finalizePendingExit` branches and `bookPartialClose` always have),
+          // so `queueJournalClose`'s "already folds any partial exits" was false
+          // for every demo TP1 trade: the close row, its `realizedR` and the
+          // learned-weights fold behind it all dropped the winning slice, which
+          // biases the recorded edge of TP1 itself downward. Fixed here rather
+          // than compensated for downstream, because the census below now relies
+          // on the close row being genuinely cumulative.
+          opt.pnl = (opt.pnl ?? 0) + partialPnl - exitFee;
           opt.contractsRemaining -= exitContracts;
           opt.tp1Hit = true;
+          // TRA-2895 — date the slice on the day it realized, so the day cell
+          // sources `journal` instead of a zero that reads as proven.
+          this.queueJournalPartial(opt, partialPnl - exitFee, exitContracts, 'tp1');
           // After partial exit, trailing is engaged on the remainder
           opt.trailingActive = true;
           opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
@@ -3836,6 +3906,9 @@ export class PaperOptionsAccount {
       // previously-stored trailingStopPremium so SL doesn't widen.
       delete opt.pendingExit;
       delete opt.exitErrorReason;
+      // TRA-2895 — the LIVE TP1 trim. `pnl` here is the slice (already folded
+      // into `opt.pnl` above); the journal gets it dated on the fill's own day.
+      this.queueJournalPartial(opt, pnl, exitContracts, 'tp1');
       return { ...opt };
     }
 
@@ -3846,6 +3919,10 @@ export class PaperOptionsAccount {
       // running on the remainder unchanged.
       delete opt.pendingExit;
       delete opt.exitErrorReason;
+      // TRA-2895 — the manual trim. This is the path the 2026-08-04 live tape
+      // took (admin sold 4 of a multi-contract SPY position at 13:49:21Z), and
+      // the reason that day's desk cell booked `bucket-journal-silent`.
+      this.queueJournalPartial(opt, pnl, exitContracts, 'manual');
       return { ...opt };
     }
 
@@ -4453,8 +4530,20 @@ export class PaperOptionsAccount {
       this.openOptions.delete(optionId);
       this.closedOptions.push({ ...opt });
       // TRA-991 — the partial drained the position; fold the realized outcome.
+      // TRA-2895 — deliberately NO partial row on this branch. The slice and the
+      // close land on the same instant, so a partial row here would only split
+      // one event into two census entries (`closes: 1, partialCloses: 1` for a
+      // single trade) with the residual arithmetic netting back to the same
+      // dollars. Earlier slices from OTHER orders are already recorded and are
+      // still subtracted from this cumulative close row.
       this.queueJournalClose(opt, 'partial_drain');
+      return { ...opt };
     }
+    // TRA-2895 — the position survives, so this slice needs its own dated row.
+    // `partialCloseBookedOrderId` above is the idempotency guard: the per-tick
+    // reconcile sweep can see the same terminal order twice, and re-entering
+    // here would append the slice a second time.
+    this.queueJournalPartial(opt, pnl, slice, 'partial_fill');
     return { ...opt };
   }
 

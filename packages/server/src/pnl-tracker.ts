@@ -67,6 +67,21 @@ export interface DailySnapshot {
   /** TRA-2314 — option closes the durable journal recorded on this ET day for this book. */
   optionsDailyJournalCloses?: number;
   /**
+   * TRA-2895 — partial exits (TP1 trims / manual partial `sell_to_close` /
+   * partial fills) the journal dated on this ET day for this book.
+   *
+   * Load-bearing for reading a row, not decoration. `optionsDailyPnlSource:
+   * 'journal'` with `optionsDailyJournalCloses: 0` was, before this ticket, an
+   * impossible pair — closes > 0 was the ONLY way to reach the journal branch.
+   * It is now the signature of a trim-only day, and without this second count
+   * such a row is indistinguishable from a writer regression that took the
+   * journal branch on an empty census.
+   *
+   * Absent on rows written before TRA-2895 — which is not the same as 0, and is
+   * why this is written only when the census actually supplied it.
+   */
+  optionsDailyJournalPartialCloses?: number;
+  /**
    * TRA-2323 — `PaperAccount.getOptionsCredited()` as of this row: the CUMULATIVE
    * realized option P&L absorbed into `closingEquity` since the fix went live.
    *

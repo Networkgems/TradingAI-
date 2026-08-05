@@ -1,5 +1,5 @@
 import type { DailySnapshot } from './pnl-tracker.js';
-import { isJournalAuthoritativeSource } from './options-daily-pnl-source.js';
+import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-daily-pnl-source.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
 // compile time, so this is not a runtime cycle.
@@ -248,11 +248,28 @@ export function resolvePnlBaselineDate(
  * tell those two states apart.
  */
 export interface JournalDayCloses {
-  /** Option round trips the journal recorded closing on this ET day. */
+  /** Option round trips the journal recorded FULLY closing on this ET day. */
   closes: number;
-  /** Σ realized P&L over those closes, USD. */
+  /**
+   * TRA-2895 — partial exits the journal recorded realizing on this ET day
+   * (TP1 trims, manual partial `sell_to_close`, partial-fill slices). A day can
+   * have `closes: 0, partialCloses: 2` — real realized dollars, no round trip
+   * finished. Counted separately from `closes` because a slice is NOT a round
+   * trip: folding it into `closes` would inflate every per-trade denominator
+   * built off this census. Use {@link journalRealizingEvents} to ask the only
+   * question the day cell cares about — did the journal see realized options
+   * activity today.
+   */
+  partialCloses: number;
+  /**
+   * Σ realized P&L ATTRIBUTED to this ET day, USD — partial slices on the day
+   * they realized, plus each full close's RESIDUAL (cumulative minus its own
+   * slices) on the close day. Not "Σ over the closes": a trade that trimmed on
+   * Monday and closed on Friday contributes to both days and to neither twice.
+   */
   realizedPnlUsd: number;
 }
+
 
 export interface PnlReconcileDay {
   date: string;
@@ -275,6 +292,15 @@ export interface PnlReconcileDay {
    * load it), which is NOT the same as zero.
    */
   journalCloses: number | null;
+  /**
+   * TRA-2895 — partial exits (TP1 trims / manual partial `sell_to_close` /
+   * partial fills) the journal dated on this ET day. `null` on the same
+   * NOT-MEASURED input as {@link journalCloses}. A row with
+   * `journalCloses: 0, journalPartialCloses: 2` is a day that realized options
+   * dollars without finishing a round trip — before this ticket that day was
+   * indistinguishable from one the journal had no record of.
+   */
+  journalPartialCloses: number | null;
   /** TRA-2302 — Σ realized options P&L the journal recorded for this ET day. */
   journalOptionsPnl: number | null;
   /**
@@ -1399,18 +1425,67 @@ export function staleTailSessions(
   return out;
 }
 
+/**
+ * Fold journal rows into a per-ET-day census of realized options activity.
+ *
+ * ── TRA-2895 — why this is not just "bucket by closeTs" ──────────────────────
+ *
+ * A CLOSE row carries the position's CUMULATIVE realized P&L stamped with the
+ * FULL-close timestamp, and the journal writes no close row at all until the
+ * position fully closes. So a trade that trimmed at TP1 on Monday and closed on
+ * Friday used to fold as: Monday = nothing, Friday = the whole trade. Two
+ * defects in one arithmetic:
+ *
+ *  - Monday's cell had no journal record of a day that DID realize dollars, so
+ *    the writer booked `bucket-journal-silent` (or a proven zero) and could
+ *    never converge to `journal`;
+ *  - Friday's cell was credited with Monday's slice on top of its own, while the
+ *    day-only bucket had already booked that slice on Monday — the same dollars
+ *    in two day cells, so any multi-day sum over day cells overstated by the
+ *    partial.
+ *
+ * This fold re-dates the slices. Each partial lands on ITS OWN day; the close
+ * day gets `realizedPnlUsd − Σ slices`, the residual. Σ over all days is exactly
+ * the trade's cumulative P&L — one dollar, one day, no dollar dropped. A legacy
+ * row with no `partials` has Σ = 0 and folds byte-identically to the old code,
+ * which is what keeps the historical repair reproducible.
+ *
+ * A partial on a row that never closed still counts: the dollars are realized
+ * and spent whether or not the residual position is still open.
+ */
 export function foldJournalClosesByEtDay(
-  rows: ReadonlyArray<{ closeTs?: number; realizedPnlUsd?: number }>,
+  rows: ReadonlyArray<{
+    closeTs?: number;
+    realizedPnlUsd?: number;
+    partials?: ReadonlyArray<{ ts: number; realizedPnlUsd: number }>;
+  }>,
   etDate: (ts: number) => string,
 ): Map<string, JournalDayCloses> {
   const byDay = new Map<string, JournalDayCloses>();
-  for (const r of rows) {
-    if (typeof r.closeTs !== 'number' || !Number.isFinite(r.closeTs)) continue;
-    const day = etDate(r.closeTs);
-    const cur = byDay.get(day) ?? { closes: 0, realizedPnlUsd: 0 };
-    cur.closes += 1;
-    cur.realizedPnlUsd += r.realizedPnlUsd ?? 0;
+  const dayOf = (day: string): JournalDayCloses => {
+    const cur = byDay.get(day) ?? { closes: 0, partialCloses: 0, realizedPnlUsd: 0 };
     byDay.set(day, cur);
+    return cur;
+  };
+  for (const r of rows) {
+    // TRA-2895 — slices first, and INDEPENDENTLY of whether the trade has closed.
+    let sliceTotal = 0;
+    for (const p of r.partials ?? []) {
+      if (typeof p?.ts !== 'number' || !Number.isFinite(p.ts)) continue;
+      if (typeof p.realizedPnlUsd !== 'number' || !Number.isFinite(p.realizedPnlUsd)) continue;
+      // Only a slice this fold could actually PLACE on a day is subtracted from
+      // the close-day residual. An unplaceable one (no usable ts) is left inside
+      // the cumulative figure on the close day rather than deleted from the
+      // ledger — losing a real dollar is worse than dating it late.
+      sliceTotal += p.realizedPnlUsd;
+      const cur = dayOf(etDate(p.ts));
+      cur.partialCloses += 1;
+      cur.realizedPnlUsd += p.realizedPnlUsd;
+    }
+    if (typeof r.closeTs !== 'number' || !Number.isFinite(r.closeTs)) continue;
+    const cur = dayOf(etDate(r.closeTs));
+    cur.closes += 1;
+    cur.realizedPnlUsd += (r.realizedPnlUsd ?? 0) - sliceTotal;
   }
   for (const [day, v] of byDay) byDay.set(day, { ...v, realizedPnlUsd: round2(v.realizedPnlUsd) });
   return byDay;
@@ -1523,6 +1598,12 @@ export function reconcilePnl(
       // No census ⇒ null / false, never an implied zero.
       const census = journalClosesByDate?.get(s.date) ?? null;
       const journalCloses = journalClosesByDate == null ? null : (census?.closes ?? 0);
+      // TRA-2895 — the partial-exit leg of the same census, on its own axis. A
+      // day can carry realized dollars with `journalCloses: 0`; without this
+      // field that row reads as "the journal recorded nothing here" while the
+      // writer treats it as journal-authoritative, and the two surfaces would
+      // disagree about the same census with no way to see why.
+      const journalPartialCloses = journalClosesByDate == null ? null : (census?.partialCloses ?? 0);
       const journalOptionsPnl =
         journalClosesByDate == null ? null : round2(census?.realizedPnlUsd ?? 0);
       // TRA-2642 (found grading TRA-2625) — a day whose closes net EXACTLY $0.00
@@ -1534,8 +1615,12 @@ export function reconcilePnl(
       // `ctoverify_tra2329` held `falseZeroDates:['2026-07-27']` while the repair
       // re-ran `0.00->0.00` on 34 consecutive boots. The day stays fully visible via
       // `journalCloses` / `journalOptionsPnl` on the row; only the accusation goes.
+      // TRA-2895 — count PARTIAL exits too, via the shared predicate. A day
+      // whose only options activity was a trim realizes real dollars the day
+      // cell can still miss, and grading only `closes` left that whole class
+      // outside the accusation the flag exists to make.
       const optionsFalseZero =
-        (journalCloses ?? 0) > 0 && optionsDaily === 0 && (journalOptionsPnl ?? 0) !== 0;
+        journalRealizingEvents(census) > 0 && optionsDaily === 0 && (journalOptionsPnl ?? 0) !== 0;
       // TRA-2630 — the two legs `drift` pools, each on its own axis. Absence is
       // not a mismatch on either (same rule `drift` applies to `eodCombined`),
       // so a missing report leg scores 0 rather than accusing the snapshot.
@@ -1568,6 +1653,7 @@ export function reconcilePnl(
         priorOptionsLagEligible: false,
         optionsFieldPresent,
         journalCloses,
+        journalPartialCloses,
         journalOptionsPnl,
         optionsFalseZero,
         eodOptionsPnl,

@@ -165,8 +165,8 @@ describe('reconcilePnl', () => {
         ],
         ET,
       );
-      expect(m.get('2026-07-13')).toEqual({ closes: 2, realizedPnlUsd: 241.5 });
-      expect(m.get('2026-07-15')).toEqual({ closes: 1, realizedPnlUsd: 17 });
+      expect(m.get('2026-07-13')).toEqual({ closes: 2, partialCloses: 0, realizedPnlUsd: 241.5 });
+      expect(m.get('2026-07-15')).toEqual({ closes: 1, partialCloses: 0, realizedPnlUsd: 17 });
     });
 
     it('ignores rows that never closed — an OPEN row is not a day of activity', () => {
@@ -179,8 +179,12 @@ describe('reconcilePnl', () => {
   });
 
   describe('options false-zero detection (TRA-2302)', () => {
-    const census = (rows: Array<[string, number, number]>) =>
-      new Map(rows.map(([d, closes, pnl]) => [d, { closes, realizedPnlUsd: pnl }]));
+    // TRA-2895 — `[date, closes, pnl]` with an optional 4th `partialCloses`
+    // term, so the existing full-close cases stay byte-identical and the
+    // trim-only case can be expressed.
+    const census = (rows: Array<[string, number, number] | [string, number, number, number]>) =>
+      new Map(rows.map(([d, closes, pnl, partialCloses]) =>
+        [d, { closes, partialCloses: partialCloses ?? 0, realizedPnlUsd: pnl }]));
 
     it('FLAGS a 0.00 options day the journal says had closes', () => {
       const snaps = [snap('2026-07-13', 0, 0)];
@@ -1501,7 +1505,7 @@ describe('TRA-2831 — liveOptionsOnsetEtDate', () => {
 // too because the value was not a wrong zero, it was missing.
 describe('TRA-2637 — absent EOD row is its own state, not a reconciled 0', () => {
   const closes = (date: string, n: number, pnl: number) =>
-    new Map([[date, { closes: n, realizedPnlUsd: pnl }]]);
+    new Map([[date, { closes: n, partialCloses: 0, realizedPnlUsd: pnl }]]);
 
   it('reproduces the live admin 2026-07-29 row: null drift, not 0', () => {
     const snaps = [snap('2026-07-29', -17.87, 250.01)];

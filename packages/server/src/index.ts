@@ -1581,6 +1581,9 @@ async function generateAndSaveReport(
       bucketPnl: optionsDailyDecision.bucketPnl,
       journalPnl: optionsDailyDecision.journalPnl,
       journalCloses: optionsDailyDecision.journalCloses,
+      // TRA-2895 — a re-source driven by trims alone logs `journalCloses: 0`,
+      // which reads like a bug in the line above without this term.
+      journalPartialCloses: optionsDailyDecision.journalPartialCloses,
     });
     finalReport = patchEodReportOptionsPnl(finalReport, optionsDailyDecision.value);
   }
@@ -1774,6 +1777,12 @@ async function generateAndSaveReport(
       optionsDailyPnlBucket: optionsDailyDecision.bucketPnl,
       ...(optionsDailyDecision.journalCloses != null
         ? { optionsDailyJournalCloses: optionsDailyDecision.journalCloses }
+        : {}),
+      // TRA-2895 — the partial-exit leg of the same census. Written on the same
+      // null-guard, so ABSENT keeps meaning "no census" / "pre-TRA-2895 row" and
+      // never a manufactured zero.
+      ...(optionsDailyDecision.journalPartialCloses != null
+        ? { optionsDailyJournalPartialCloses: optionsDailyDecision.journalPartialCloses }
         : {}),
       // TRA-2314 deliberately does NOT touch `combinedPnl` here. It carries the
       // mode's ALL-TIME cumulative `equitySnap.optionsPnl` — a separate, known

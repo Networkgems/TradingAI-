@@ -44,7 +44,11 @@ function row(date: string, over: Partial<DailySnapshot> = {}): DailySnapshot {
 }
 
 function census(entries: Record<string, { closes: number; realizedPnlUsd: number }>) {
-  return new Map<string, JournalDayCloses>(Object.entries(entries));
+  // TRA-2895 — `partialCloses` defaulted for these fixtures: this suite is about
+  // FULL-close back-fill, and every entry here states its close count explicitly.
+  return new Map<string, JournalDayCloses>(
+    Object.entries(entries).map(([d, v]) => [d, { partialCloses: 0, ...v }]),
+  );
 }
 
 const CAL = { lastSettledSession: '2026-08-03', isMarketDay: isWeekdayIso };

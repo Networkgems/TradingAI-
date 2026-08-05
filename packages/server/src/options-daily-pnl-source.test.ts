@@ -299,9 +299,9 @@ describe('TRA-2314 — the historical repair is bounded, attributable and idempo
     trades: 0,
   });
   const census = new Map([
-    ['2026-07-15', { closes: 6, realizedPnlUsd: 17.0 }],
-    ['2026-07-16', { closes: 7, realizedPnlUsd: -4.5 }],
-    ['2026-07-17', { closes: 15, realizedPnlUsd: 217.5 }],
+    ['2026-07-15', { closes: 6, partialCloses: 0, realizedPnlUsd: 17.0 }],
+    ['2026-07-16', { closes: 7, partialCloses: 0, realizedPnlUsd: -4.5 }],
+    ['2026-07-17', { closes: 15, partialCloses: 0, realizedPnlUsd: 217.5 }],
   ]);
 
   it('repairs ONLY proven false zeros and names the days it deliberately left alone', () => {
@@ -408,7 +408,7 @@ describe('TRA-2314 — the historical repair is bounded, attributable and idempo
   // `dates:["2026-07-27:0.00->0.00"], totalDeltaUsd:0` on 34 consecutive boots,
   // and their `falseZeroDates` never cleared — so firm-wide `optionsFalseZeroOk`
   // had NO PASSING STATE. Both arms below fail on the pre-TRA-2642 code.
-  const zeroNetCensus = new Map([['2026-07-27', { closes: 2, realizedPnlUsd: 0 }]]);
+  const zeroNetCensus = new Map([['2026-07-27', { closes: 2, partialCloses: 0, realizedPnlUsd: 0 }]]);
 
   it('TRA-2642: a day whose closes net exactly $0.00 yields NO delta and is named, not moved', () => {
     const plan = planOptionsDailyPnlRepair([day('2026-07-27', 0)], zeroNetCensus);
