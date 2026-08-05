@@ -349,6 +349,42 @@ export function findPreviousBalanceSnapshot(
  * (negative) recorded against `todayDate` across all events; subtract
  * it from the balance delta so cash movements aren't booked as P&L.
  */
+/**
+ * TRA-2875 — sum recorded cash flow over the half-open interval
+ * `(afterDate, throughDate]`, i.e. the exact span the balance delta covers.
+ *
+ * `computeBalanceDailyPnl` subtracts a cash-flow correction from
+ * `todayBalance − prevBalance`. That delta spans from the *previous snapshot*
+ * to the report date, and {@link findPreviousBalanceSnapshot} is explicitly
+ * allowed to return an anchor 1–3 calendar days back (weekends, holidays) —
+ * or further, when a snapshot write failed (the 2026-07-30..08-03 ENOSPC
+ * outage, TRA-2817).
+ *
+ * Reading `netByDate[reportDate]` alone corrected only the LAST day of that
+ * span, so any deposit / withdrawal landing strictly between the anchor and
+ * the report date was booked as trading P&L. On the board's live account a
+ * single missed $300 ACH deposit is larger than the entire realized P&L of
+ * the period, so the failure mode is a fabricated green day bigger than every
+ * real day on the calendar.
+ *
+ * Half-open on purpose: the anchor day's own cash flow is already reflected in
+ * `prevBalance` (the snapshot was taken at 21:00 ET, after that day's events),
+ * so including it would double-count.
+ */
+export function sumCashFlowOverSpan(
+  netByDate: Readonly<Record<string, number>>,
+  afterDate: string,
+  throughDate: string,
+): number {
+  let total = 0;
+  for (const [date, amount] of Object.entries(netByDate)) {
+    if (date <= afterDate || date > throughDate) continue;
+    if (typeof amount !== 'number' || !Number.isFinite(amount)) continue;
+    total += amount;
+  }
+  return total;
+}
+
 export function computeBalanceDailyPnl(
   todayBalance: number | null | undefined,
   prevBalance: number | null | undefined,

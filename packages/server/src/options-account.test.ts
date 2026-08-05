@@ -1375,7 +1375,12 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
     expect(drained).toBeCloseTo(40, 5);
   });
 
-  it('leaves engine-opened positions untouched even when Tradier reports the same OCC', () => {
+  // TRA-2889 — this used to assert that an engine-opened row is left ENTIRELY
+  // untouched. That was the defect: the broker is authoritative on cost basis
+  // (`cost_basis / qty / 100`), so the row kept the scanner's pre-trade mid for
+  // life and the live book was permanently mis-costed. The reconcile now
+  // restates `premiumPaid` only; quantity and import status still stay put.
+  it('restates only the cost basis on an engine-opened row reported by Tradier', () => {
     const acct = new PaperOptionsAccount({
       initialEquity: 50_000,
       managedAccountRatio: 0.5,
@@ -1398,12 +1403,19 @@ describe('PaperOptionsAccount.reconcileTradierPositions', () => {
         premiumPaid: 9.99,
       }),
     ]);
-    // Engine-opened row covers this OCC; reconcile leaves it alone.
-    expect(summary).toEqual({ added: 0, updated: 0, removed: 0, total: 1 });
+    // The basis correction is real work and is now COUNTED — previously an
+    // engine row was invisible to the summary, so a reconcile that fixed
+    // nothing for it still reported a clean tally.
+    expect(summary).toEqual({ added: 0, updated: 1, removed: 0, total: 1 });
     const survivor = acct.getState().openOptions.find(o => o.optionSymbol === 'AAPL240705C00200000');
+    // Still engine-opened — correcting the basis does not turn it into an import.
     expect(survivor?.importedFromTradier).toBeFalsy();
+    // Quantity is still ours: the broker payload's 99 is ignored, because the
+    // partial-close bookkeeping owns `contracts`, not the reconcile.
     expect(survivor?.contracts).toBe(beforeContracts);
-    expect(survivor?.premiumPaid).toBe(beforePremium);
+    // ...but the cost basis is now broker truth, not the pre-trade mid.
+    expect(survivor?.premiumPaid).toBeCloseTo(9.99, 6);
+    expect(survivor?.premiumPaid).not.toBe(beforePremium);
   });
 
   it('checkExits skips imported positions without waitAndHold (no broker mirror available)', () => {

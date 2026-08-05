@@ -428,6 +428,65 @@ function applyImportedRiskThresholds(
   opt.trailingActive = false;
 }
 
+/**
+ * TRA-2889 / TRA-2873 — restate an ENGINE-OPENED row's cost basis to broker
+ * truth and carry its risk schedule across with it.
+ *
+ * An engine-opened position books `premiumPaid = signal.mark` — the scanner's
+ * pre-trade NBBO mid — and the reconcile loop used to `continue` past it, so it
+ * kept that mid for the life of the position. The journal mirror reconciles the
+ * JOURNAL; it never reconciles the POSITION, and the position is what the
+ * Options panel, Book Premium, Portfolio Greeks and every P&L tile read. On the
+ * board's live account that left the book costed $441.00 against Tradier's
+ * $464.00.
+ *
+ * Re-deriving the thresholds is the part most easily missed: `stopLossPremium`,
+ * `tp1Premium` and the trailing activation are all computed off `premiumPaid`
+ * at open, so moving the basis without moving them is a silent risk change on a
+ * real-money position — the stop stays anchored to the old mid.
+ *
+ * We RESCALE rather than recompute. A single-leg engine row carries no strategy
+ * discriminator (OTM and RV positions are structurally identical once open), so
+ * there is no way to tell which schedule — `otmRiskParams` or `rvRiskParams` —
+ * was applied at open. Every threshold is installed as `premiumPaid × k`, so
+ * scaling by `broker / ours` reproduces the original schedule exactly against
+ * the corrected basis, whichever one it was, and leaves the sentinels used by
+ * unmanaged rows intact (`Infinity × r = Infinity`, `0 × r = 0`).
+ *
+ * The one inexact case is the RV stop's dollar floor
+ * (`premium − max(premium × slPct, slDollarFloor)`): when the floor binds,
+ * scaling gives `r × (p − floor)` where a recompute would give `r×p − floor`.
+ * For a basis correction (`r > 1`) the scaled stop is the LOWER of the two —
+ * i.e. slightly wider — so the error is in the conservative direction and
+ * cannot fire a stop early.
+ */
+function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
+  const previous = opt.premiumPaid;
+  if (!Number.isFinite(previous) || previous <= 0) return;
+  const ratio = brokerPremium / previous;
+  if (!Number.isFinite(ratio) || ratio <= 0) return;
+
+  opt.premiumPaid = brokerPremium;
+  // NOT touched, deliberately:
+  //   • `contracts` / `contractsRemaining` — the broker-flat sweep above owns
+  //     disappearance, and letting the payload drive quantity would fight the
+  //     partial-close bookkeeping (a post-TP1 row legitimately holds fewer
+  //     contracts than the broker reports on the parent OCC symbol).
+  //   • `currentPremium` — on an engine row this is a live quote maintained by
+  //     the mark refresher. The imported branch overwrites it because an
+  //     imported row has no other source; here it would corrupt the mark.
+  opt.peakPremium = Math.max(opt.peakPremium, brokerPremium);
+
+  opt.tp1Premium *= ratio;
+  opt.stopLossPremium *= ratio;
+  // Before activation, `trailingStopPremium` holds the ACTIVATION level, which
+  // is `premiumPaid × (1 + trailActivatePct)` — basis-derived, so it rescales.
+  // Once trailing is live the field is derived from `peakPremium` (a realised
+  // high-water mark, not the basis) and must NOT be touched: scaling it would
+  // move a stop that is already protecting real gains.
+  if (!opt.trailingActive) opt.trailingStopPremium *= ratio;
+}
+
 interface OptionsAccountConfig {
   initialEquity?: number;
   managedAccountRatio?: number;
@@ -4166,8 +4225,35 @@ export class PaperOptionsAccount {
       );
       if (existing) {
         if (!existing.importedFromTradier) {
-          // Engine-opened position covers this OCC symbol — skip so we
-          // don't conflict with the engine's own bookkeeping.
+          // TRA-2889 / TRA-2873 — an engine-opened row used to take an
+          // unconditional `continue` here "so we don't conflict with the
+          // engine's own bookkeeping". The skip is load-bearing for QUANTITY
+          // and MARK, but it also suppressed the one field the broker is
+          // authoritative on: the cost basis. `incoming.premiumPaid` is
+          // derived from Tradier's `cost_basis / quantity / 100`, so restate
+          // only that (see `restateEngineOpenedBasis` for what is deliberately
+          // left alone) and leave the rest of the row to the engine.
+          //
+          // Carve-outs mirror the TRA-2799 broker-flat sweep above:
+          //   • live rows only — a demo row has no broker counterpart;
+          //   • single-leg long rows only — a combo is not one OCC row in
+          //     `/positions`, and a covered write is short;
+          //   • nothing in flight — a `pendingExit` / `pendingCloseOrderId`
+          //     row is owned by the exit + close pollers, which book the real
+          //     fill against the broker's ORDER status. Restating the basis
+          //     underneath them would move the realized P&L they are about to
+          //     compute.
+          if ((existing.mode ?? 'demo') !== 'live') continue;
+          if (existing.legs && existing.legs.length > 0) continue;
+          if (existing.coveredWrite) continue;
+          if (existing.pendingExit || existing.pendingCloseOrderId !== undefined) continue;
+          if (!Number.isFinite(incoming.premiumPaid) || incoming.premiumPaid <= 0) continue;
+          if (Math.abs(existing.premiumPaid - incoming.premiumPaid) <= 1e-6) continue;
+          restateEngineOpenedBasis(existing, incoming.premiumPaid);
+          // Count it: an engine-opened row was previously invisible to the
+          // summary, so a reconcile that fixed nothing for it still reported
+          // `updated: 1` — the sweep could not report the gap it was leaving.
+          updated += 1;
           continue;
         }
         const contractsChanged = existing.contracts !== incoming.contracts;

@@ -250,6 +250,7 @@ import {
   liveBackfillWriteWindow,
   planTradierReconcile,
   realizedOptionsPnlByCloseDate,
+  sumCashFlowOverSpan,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
 import {
@@ -2497,7 +2498,11 @@ async function reconcileTradierLiveCalendar(
     return null;
   }
 
-  const netCashFlow = cashFlowState.netByDate[reportDate] ?? 0;
+  // TRA-2875 — correct over the SAME span the balance delta covers,
+  // `(prev.date, reportDate]`, not just `reportDate`. The anchor can be several
+  // days back (weekend/holiday, or a failed snapshot write), and a cash event
+  // landing in the interior of that gap was previously booked as trading P&L.
+  const netCashFlow = sumCashFlowOverSpan(cashFlowState.netByDate, prev.date, reportDate);
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
 
@@ -2539,7 +2544,39 @@ async function reconcileTradierLiveCalendar(
 // (daily/startup) runs and prevents a day's settled equity P&L from being
 // downgraded to options-only.
 const LIVE_REALIZED_BACKFILL_FETCH_LOOKBACK_DAYS = 31; // before the write window — wide enough to capture the opens
-const LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK = 1;      // write window start = first of (this − N) month
+
+// TRA-2874 — this was `1`, i.e. the write window started on the first of LAST
+// month. Every day before that was structurally unreachable: no matter how
+// cleanly it reconstructed from broker truth, the backfill was not allowed to
+// write it.
+//
+// The failure mode is ROLLING AMNESIA, not a one-off gap. At `1`, the boundary
+// advanced on the 1st of every month, so a day got exactly ONE month of
+// chances to be reconstructed. If the box was down, the account did not exist
+// yet, or /data was full that month (the 2026-07-30..08-03 ENOSPC outage,
+// TRA-2817/TRA-2888), the day aged out and was never reconstructable again.
+// Measured cost on the board's live account: all of June 2026, −$837.85 of
+// real realized P&L that the backfill could not write.
+//
+// 24 months is chosen to exceed the live account's whole history (its balance
+// series starts 2026-05-18), so in practice the window is ANCHORED rather than
+// rolling — no day that is reconstructable today ages out next month.
+// Overridable for accounts with a longer tape.
+//
+// Widening is additive, not destructive: `isBackfillRow()` still refuses to
+// overwrite a `tradier-balance` snapshot or an engine EOD row, and a day with
+// no matched closes is left ABSENT (renders `--`) rather than written as a
+// phantom $0.00.
+const LIVE_REALIZED_BACKFILL_DEFAULT_MONTHS_BACK = 24;
+const LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK = (() => {
+  const raw = process.env.LIVE_REALIZED_BACKFILL_MONTHS_BACK;
+  if (raw == null || raw.trim() === '') return LIVE_REALIZED_BACKFILL_DEFAULT_MONTHS_BACK;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+    return LIVE_REALIZED_BACKFILL_DEFAULT_MONTHS_BACK;
+  }
+  return parsed;
+})();
 
 /**
  * Build (or patch) an `EodReport` whose calendar figure is the broker-truth
@@ -2764,7 +2801,9 @@ async function buildLiveTodayCellReport(
   if (!prev) return null;
 
   const cashFlow = await loadTradierCashFlow(ctx, env);
-  const netCashFlow = cashFlow.netByDate[today] ?? 0;
+  // TRA-2875 — same span correction as the settled path above; the intraday
+  // cell reads the same anchor and was equally exposed to an interior deposit.
+  const netCashFlow = sumCashFlowOverSpan(cashFlow.netByDate, prev.date, today);
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
   const combinedPnl = Number(pnl.toFixed(2));

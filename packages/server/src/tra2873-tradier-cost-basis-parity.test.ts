@@ -226,16 +226,16 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
     expect(imported.importedFromTradier).toBe(true);
     expect(imported.premiumPaid).toBeCloseTo(spy820.brokerCostPerShare, 6);
 
-    // TRA-2873 FIX FLIPS THIS — the engine-opened row is skipped by
-    // `if (!existing.importedFromTradier) continue;` and keeps the mid.
+    // TRA-2889 FIXED — the engine-opened row is now restated to broker truth
+    // too. It is still engine-opened (the fix corrects the basis; it does NOT
+    // convert the row into an import).
     expect(engine.importedFromTradier).toBeUndefined();
-    expect(engine.premiumPaid).toBeCloseTo(spy816.scannerMark, 6);
-    expect(engine.premiumPaid).not.toBeCloseTo(spy816.brokerCostPerShare, 6);
+    expect(engine.premiumPaid).toBeCloseTo(spy816.brokerCostPerShare, 6);
+    expect(engine.premiumPaid).not.toBeCloseTo(spy816.scannerMark, 6);
 
-    // Only the imported row is counted as updated; the engine row is invisible
-    // to the summary, so a reconcile that fixed NOTHING for it still reads
-    // "updated: 1" — the sweep cannot report the gap it is leaving behind.
-    expect(summary.updated).toBe(1);
+    // BOTH corrections in the payload are now counted. The sweep can finally
+    // report the gap it used to leave behind silently.
+    expect(summary.updated).toBe(2);
     expect(summary.total).toBe(2);
   });
 
@@ -249,42 +249,128 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
     // Tradier's own "COST BASIS $464.00" portfolio tile.
     expect(brokerCostBasis).toBeCloseTo(464, 6);
 
-    // TRA-2873 FIX FLIPS THIS — after the fix `bookCostBasis` must equal 464.
+    // Before any reconcile the book is still at the scanner mids — that is the
+    // state the screenshots captured.
     expect(bookCostBasis(acct)).toBeCloseTo(441, 6);
 
-    // A reconcile against the real broker book does NOT close the gap.
+    // TRA-2889 FIXED — a reconcile against the real broker book now closes the
+    // gap exactly, to the cent.
     acct.reconcileTradierPositions(BOOK.map(buildBrokerPosition));
-    expect(bookCostBasis(acct)).toBeCloseTo(441, 6);
-    expect(brokerCostBasis - bookCostBasis(acct)).toBeCloseTo(23, 6);
+    expect(bookCostBasis(acct)).toBeCloseTo(464, 6);
+    expect(brokerCostBasis - bookCostBasis(acct)).toBeCloseTo(0, 6);
   });
 
   it('understates the loss: unrealized P&L reads -$2.00 where broker cost basis gives -$25.00', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
     openLiveBook(acct);
-    acct.reconcileTradierPositions(BOOK.map(buildBrokerPosition));
 
-    // Apply the marks TradingAI itself was showing (screenshot: Allocation by
-    // Name sums to the $439.00 Book Premium tile). Marks are NOT the axis under
-    // test here — holding them fixed isolates the cost-basis error.
-    const bySymbol = new Map(acct.getState().openOptions.map(o => [o.optionSymbol, o]));
-    let bookPremium = 0;
-    let unrealizedAtScannerBasis = 0;
-    let unrealizedAtBrokerBasis = 0;
-    for (const o of BOOK) {
-      const pos = bySymbol.get(o.optionSymbol)!;
-      const qty = pos.contractsRemaining;
-      bookPremium += o.currentMark * qty * 100;
-      unrealizedAtScannerBasis += (o.currentMark - pos.premiumPaid) * qty * 100;
-      unrealizedAtBrokerBasis += (o.currentMark - o.brokerCostPerShare) * qty * 100;
-    }
+    // Marks are NOT the axis under test — holding them fixed at what TradingAI
+    // itself was showing (screenshot: Allocation by Name sums to the $439.00
+    // Book Premium tile) isolates the cost-basis error.
+    const unrealizedAgainstBook = (): number => {
+      const bySymbol = new Map(acct.getState().openOptions.map(o => [o.optionSymbol, o]));
+      let total = 0;
+      for (const o of BOOK) {
+        const pos = bySymbol.get(o.optionSymbol)!;
+        total += (o.currentMark - pos.premiumPaid) * pos.contractsRemaining * 100;
+      }
+      return total;
+    };
+
+    const bookPremium = BOOK.reduce((sum, o) => sum + o.currentMark * o.contracts * 100, 0);
+    const unrealizedAtBrokerBasis = BOOK.reduce(
+      (sum, o) => sum + (o.currentMark - o.brokerCostPerShare) * o.contracts * 100, 0,
+    );
 
     // The "BOOK PREMIUM $439.00" tile — reproduced exactly.
     expect(bookPremium).toBeCloseTo(439, 6);
-    // The "OPEN OPTS P&L (UNREALIZED) -$2.00" footer — reproduced exactly.
-    expect(unrealizedAtScannerBasis).toBeCloseTo(-2, 6);
-    // TRA-2873 FIX FLIPS THIS — same marks, broker cost basis, 12.5x the loss.
+    // The "OPEN OPTS P&L (UNREALIZED) -$2.00" footer — reproduced exactly. This
+    // is the screenshot state: pre-reconcile, costed at the scanner mids.
+    expect(unrealizedAgainstBook()).toBeCloseTo(-2, 6);
+    // Same marks, broker cost basis, 12.5x the loss.
     expect(unrealizedAtBrokerBasis).toBeCloseTo(-25, 6);
     // The understatement is exactly the missing cost basis.
-    expect(unrealizedAtScannerBasis - unrealizedAtBrokerBasis).toBeCloseTo(23, 6);
+    expect(unrealizedAgainstBook() - unrealizedAtBrokerBasis).toBeCloseTo(23, 6);
+
+    // TRA-2889 FIXED — after a reconcile the book reports the real loss.
+    acct.reconcileTradierPositions(BOOK.map(buildBrokerPosition));
+    expect(unrealizedAgainstBook()).toBeCloseTo(-25, 6);
+  });
+
+  /**
+   * TRA-2889 — the restatement must carry the risk schedule with it. These are
+   * the guards the ticket flagged as most likely to be missed.
+   */
+  describe('TRA-2889 — restatement safety', () => {
+    const aapl = BOOK[0];
+
+    it('re-derives the stop off the corrected basis, not the stale mid', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      const opened = openLive(acct, aapl)!;
+      const before = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      // Snapshot as PRIMITIVES — `getState()` hands back live position objects,
+      // so holding the reference would see the restatement we are measuring.
+      const stopBefore = before.stopLossPremium;
+      const stopRatioBefore = before.stopLossPremium / before.premiumPaid;
+      const tp1RatioBefore = before.tp1Premium / before.premiumPaid;
+      expect(opened).not.toBeNull();
+
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      expect(after.premiumPaid).toBeCloseTo(aapl.brokerCostPerShare, 6);
+      // The schedule is preserved RELATIVE to the corrected basis — the stop
+      // moved up with the basis instead of staying anchored to the old mid.
+      expect(after.stopLossPremium / after.premiumPaid).toBeCloseTo(stopRatioBefore, 10);
+      expect(after.tp1Premium / after.premiumPaid).toBeCloseTo(tp1RatioBefore, 10);
+      expect(after.stopLossPremium).toBeGreaterThan(stopBefore);
+    });
+
+    it('does not let the broker payload drive quantity', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      const before = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      const contracts = before.contracts;
+      const contractsRemaining = before.contractsRemaining;
+
+      // Broker reports a DIFFERENT quantity — the partial-close bookkeeping
+      // owns that field, not the reconcile.
+      acct.reconcileTradierPositions([
+        { ...buildBrokerPosition(aapl), contracts: 99 },
+      ]);
+
+      const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      expect(after.contracts).toBe(contracts);
+      expect(after.contractsRemaining).toBe(contractsRemaining);
+      expect(after.premiumPaid).toBeCloseTo(aapl.brokerCostPerShare, 6);
+    });
+
+    it('leaves an in-flight row alone — the exit poller books the real fill', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      const pos = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      const live = (acct as unknown as { openOptions: Map<string, typeof pos> }).openOptions.get(pos.id)!;
+      live.pendingCloseOrderId = 12345;
+
+      const summary = acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      expect(after.premiumPaid).toBeCloseTo(aapl.scannerMark, 6);
+      expect(summary.updated).toBe(0);
+    });
+
+    it('is idempotent — a second reconcile is a no-op and is not re-counted', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+
+      const first = acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+      expect(first.updated).toBe(1);
+
+      const second = acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+      expect(second.updated).toBe(0);
+
+      const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      expect(after.premiumPaid).toBeCloseTo(aapl.brokerCostPerShare, 6);
+    });
   });
 });
