@@ -785,7 +785,27 @@ export interface DemoBookPublicReport {
    * (`demoEngineCount` vs this). `null` when the journal could not be read.
    */
   journalAccountCount: number | null;
-  /** Human note when `unrecognisedDeskAccountCount > 0` or unreadable, else null. */
+  /**
+   * TRA-2660 — THE COVERAGE OF THE READING ABOVE, on the wire next to it.
+   *
+   * Measured live 2026-08-05 on `3466624`: **2192 of 2510** journal rows carry
+   * NO `account` at all (pre-TRA-1475 / un-owned opens — `account` and the
+   * fill-time quote were stamped from the same schema change, and every row
+   * since carries both). Those rows cannot be classified by ANY roster, so
+   * `unrecognisedDeskAccountCount: 0` is a statement about the 318 rows that
+   * CAN be classified and says nothing at all about the other 87%.
+   *
+   * Publishing the count without its coverage would re-create this ticket's own
+   * defect one layer up: a clean-looking 0 whose population is not the
+   * population it appears to describe. `null` when the journal is unreadable.
+   */
+  journalRowsScanned: number | null;
+  journalRowsWithoutAccount: number | null;
+  /**
+   * Human note when `unrecognisedDeskAccountCount > 0`, when the journal is
+   * unreadable, OR when unclassifiable rows dominate the domain — the last one
+   * is why a green 0 here is not a licence to invert the fold (TRA-2554).
+   */
   deskAccountRosterNote: string | null;
   /**
    * TRA-2650 — the MODE-BLIND operator-survival probe.
@@ -1090,6 +1110,8 @@ export function summarizeDemoBooksPublic(
     // key that a reader cannot tell from an unpatched build (TRA-2598).
     unrecognisedDeskAccountCount: unrecognisedAccountCount,
     journalAccountCount: deskAccountFold ? deskAccountFold.journalAccountCount : null,
+    journalRowsScanned: deskAccountFold ? deskAccountFold.rowsScanned : null,
+    journalRowsWithoutAccount: deskAccountFold ? deskAccountFold.rowsWithoutAccount : null,
     deskAccountRosterNote: !deskAccounts.ok
       ? `journal-account desk roster UNREAD (${deskAccounts.reason}) — `
         + `unrecognisedDeskAccountCount is null, NOT 0: nothing was measured (TRA-2660)`
@@ -1099,7 +1121,16 @@ export function summarizeDemoBooksPublic(
           + `${unrecognisedAccountCount === 1 ? 'is' : 'are'} on neither the test-account `
           + `patterns nor KNOWN_DESK_BOOKS — names are behind GET /api/admin/desk-roster `
           + `(this route is NO-AUTH and never carries identity) (TRA-2660)`
-        : null,
+        // A clean 0 over a domain that cannot classify most of its own rows is
+        // not a clean bill of health, and must not read as one.
+        : deskAccountFold && deskAccountFold.rowsWithoutAccount > deskAccountFold.rowsScanned / 2
+          ? `0 unrecognised, but ${deskAccountFold.rowsWithoutAccount} of `
+            + `${deskAccountFold.rowsScanned} journal rows carry NO account and are `
+            + `UNCLASSIFIABLE by any roster — this 0 describes only the `
+            + `${deskAccountFold.rowsScanned - deskAccountFold.rowsWithoutAccount} rows that `
+            + `can be classified, and is NOT evidence the fold may be inverted to an `
+            + `allowlist (TRA-2660/TRA-2554)`
+          : null,
     operator: {
       pinConfigured: operatorPinConfigured,
       engineCount: operatorEngines.length,

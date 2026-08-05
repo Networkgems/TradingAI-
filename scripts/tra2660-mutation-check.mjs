@@ -89,6 +89,21 @@ const MUTATIONS = [
     test: 'serves 503 — never an empty clean 200 — when the admin read cannot see the journal',
   },
   {
+    id: 'M12 coverage note suppressed - a 0 over an unclassifiable domain reads clean',
+    file: HR,
+    from: `        : deskAccountFold && deskAccountFold.rowsWithoutAccount > deskAccountFold.rowsScanned / 2`,
+    to: `        : deskAccountFold && deskAccountFold.rowsWithoutAccount > deskAccountFold.rowsScanned * 99`,
+    test: 'says so when a 0 sits on a domain whose rows are mostly unclassifiable',
+  },
+  {
+    id: 'M13 rowsWithoutAccount not counted',
+    file: HR,
+    from: `      rowsWithoutAccount += 1;
+      continue;`,
+    to: `      continue;`,
+    test: 'says so when a 0 sits on a domain whose rows are mostly unclassifiable',
+  },
+  {
     id: 'M10 test residual double-counts (classes stop partitioning)',
     file: HR,
     from: `    testAccountCount: byKey.size - unrecognised.length - roster.length,`,

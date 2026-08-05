@@ -1086,6 +1086,32 @@ describe('TRA-898 demo-book summary', () => {
       expect(body['journalAccountCount']).toBe(1);
     });
 
+    // The live domain is 87% unclassifiable (2192 of 2510 rows carry no
+    // `account` at all). A 0 over that domain is a statement about the OTHER
+    // 13%, and publishing it bare would re-create this ticket's own defect one
+    // layer up — a clean-looking count whose population is not the population it
+    // appears to describe.
+    it('says so when a 0 sits on a domain whose rows are mostly unclassifiable', async () => {
+      const routes = register({
+        journalAccountRows: async () => [
+          journalRow('Richard'),
+          { openTs: NOW, mode: 'demo' },
+          { openTs: NOW, mode: 'demo' },
+          { openTs: NOW, mode: 'demo' },
+        ],
+      });
+      const res = resWithLocals();
+      await routes.get('/api/health/demo-book-public')![0]!({ query: {} }, res);
+      const body = onWire(res.body);
+      expect(body['unrecognisedDeskAccountCount']).toBe(0);
+      expect(body['journalRowsScanned']).toBe(4);
+      expect(body['journalRowsWithoutAccount']).toBe(3);
+      // The coverage must be READABLE next to the count, not inferable.
+      expect(body['deskAccountRosterNote']).toContain('UNCLASSIFIABLE');
+      expect(body['deskAccountRosterNote']).toContain('NOT evidence');
+      expect('journalRowsWithoutAccount' in body).toBe(true);
+    });
+
     // ── The admin NAMES surface ──────────────────────────────────────────────
     it('names the unrecognised accounts (with row counts and first/last open) behind admin auth', async () => {
       const routes = register({
