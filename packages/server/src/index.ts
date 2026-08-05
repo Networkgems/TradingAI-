@@ -2063,7 +2063,20 @@ async function catchUpMissedEodReports(): Promise<void> {
 
 // ── TRA-348: Tradier history reconcile ───────────────────────────────────────
 
-const TRADIER_RECONCILE_LOOKBACK_DAYS = 7;
+// TRA-2864 — 7 was shorter than this account actually holds a contract.
+//
+// The window has to reach the OPEN, not just the close: `aggregateRealizedOptionsPnl`
+// FIFO-matches a close against opens in the same fetch, and (since TRA-2864) an
+// unmatched close is skipped rather than booked at gross proceeds. At 7 days that
+// silently drops the long tail. Measured over the board's uploaded live-production
+// tape: max hold 9 calendar days, p90 = 7, and 3 of 36 matched lots (8%) sat open
+// longer than 7 days — including the whole PSKY 06-16..06-25 position.
+//
+// 45 gives real margin over that tail while staying far inside the `limit: 1000`
+// page (this account books ~90 trade events per 2.5 months). Re-reading the same
+// fills every pass is free: the cursor dedups CLOSES, and opens are cost basis
+// that the matcher is supposed to see again each time.
+const TRADIER_RECONCILE_LOOKBACK_DAYS = 45;
 
 /**
  * TRA-348 — pull Tradier history for the active live env over the last
