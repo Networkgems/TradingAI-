@@ -75,41 +75,70 @@ export const FLOORED_CREDIT_STRUCTURES: ReadonlySet<string> = new Set<string>([
  * stops being a high-probability credit trade and becomes a directional bet. The
  * band is a PROMPT CONTRACT, not a deterministic reject: an idea record carries no
  * strikes, so there is nothing to re-derive the delta from server-side. What we do
- * enforce deterministically is the credit/width floor, which is the same constraint
- * expressed in the dimension we can actually verify from the emitted numbers.
+ * enforce deterministically is the credit/width floor — a RELATED but strictly
+ * TIGHTER constraint in the one dimension the emitted numbers let us verify, not a
+ * restatement of this band (TRA-2681; see {@link DEFAULT_CREDIT_WIDTH_FLOOR}).
  */
 export const DEFAULT_SHORT_DELTA_MIN = 0.2;
 export const DEFAULT_SHORT_DELTA_MAX = 0.3;
 
 /**
  * The floor itself: a credit vertical must collect at least this fraction of its
- * defined width. It is NOT an independent number — it is the bottom of the short-leg
- * delta band, and the two constraints are one constraint.
+ * defined width. Its VALUE is taken from the bottom of the short-leg delta band —
+ * but the two are NOT the same constraint, and TRA-2217's header said they were.
+ * TRA-2681 corrects that. The value and the coupling below both stand; only the
+ * justifying derivation was wrong.
  *
- * NO-ARBITRAGE IDENTITY. A vertical's credit is what the market charges for the
- * short strike being breached, so `credit ≈ width × P_rn(breach)` and therefore
+ * WHAT MOTIVATES THE VALUE. A vertical's credit is what the market charges for the
+ * short strike being breached, so `credit ≈ width × P_rn(breach)`, and in the
+ * ZERO-WIDTH limit the credit/width ratio approaches the short strike's dual delta:
  *
- *     c = creditUsd / (creditUsd + maxLossUsd) ≈ Δ_short
+ *     c = creditUsd / (creditUsd + maxLossUsd) = credit / width  ──width→0──▶  N(−d₂)|_{K_s}
  *
- * The credit/width ratio IS the short-leg delta. Stating a 0.20–0.30 delta band in
- * the prompt mechanically produces `c ∈ [0.20, 0.30]`; the floor is that band's
- * lower edge, expressed in the one dimension we can verify server-side from the
- * emitted numbers (an idea record carries no strikes).
+ * That limit is the motivation for setting the floor AT the band bottom. It is not
+ * an identity at any width we actually trade.
  *
- * Two second-order gaps, in opposite directions, both small at our widths:
- *   - Strictly the ratio tracks the DUAL delta `N(−d₂)`, not delta `N(−d₁)`. For a
- *     put `N(−d₂) > N(−d₁)`, so a 0.20-delta short strike pays slightly MORE than
- *     0.20 of width — the floor errs loose, never tight.
- *   - Over a finite width `c` is the dual delta AVERAGED across the two strikes, so
- *     widening pulls `c` down. Holding R constant only needs ~21% more width
- *     (R = width × (1 − c); 0.97 → 0.80), so this stays second-order.
+ * WHAT IS ACTUALLY TRUE AT FINITE WIDTH. Exactly, for a put vertical:
+ *
+ *     c = [P(K_s) − P(K_l)] / (K_s − K_l) = mean of ∂P/∂K over [K_l, K_s]
+ *       = the width-AVERAGED DUAL DELTA
+ *
+ * Dual delta `N(−d₂)` is increasing in K, so its mean over the spread is STRICTLY
+ * BELOW its value at the short strike. Therefore `c < N(−d₂)|_{K_s}` for every real
+ * width, and the gap grows with width. Two second-order effects run in OPPOSITE
+ * directions and they do NOT offset:
+ *
+ *   - `N(−d₂) > N(−d₁)`, so the dual delta at the short strike sits slightly ABOVE
+ *     the reported delta. Worth ~0.02. Pushes `c` up.
+ *   - Width-averaging pulls `c` down. Worth 0.05–0.19 at ordinary widths. DOMINATES.
+ *
+ * Measured (Black–Scholes, S=100, σ=25%, T=30d, r=0; short strike Δ=0.226, dual
+ * delta 0.248):
+ *
+ *     width │  1.0    2.0    3.0    5.0   10.0   25.0
+ *       c   │ 0.226  0.205  0.185  0.152  0.095  0.039
+ *
+ * CONSEQUENCE — THE FLOOR IS STRICTLY TIGHTER THAN THE BAND, NOT A RESTATEMENT OF
+ * IT. Delete any reading that the floor "errs loose, never tight": at realistic
+ * widths it errs TIGHT. A short strike sitting comfortably INSIDE the mandated
+ * 0.20–0.30 band fails the 0.20 floor at any width beyond ~2 points. The floor is a
+ * width-dependent constraint that the delta band alone does not imply, so a model
+ * told only the band can and will emit ideas the floor deterministically discards.
+ * That is why prompt rule 13 has to tell it that WIDTH IS CAPPED BY THE FLOOR and
+ * that delta — not width — is the lever that buys R capacity (see
+ * `creditWidthFloorPromptAddendum` in `options-research.ts`).
+ *
+ * This also reinforces the TRA-2005 `IVR ≥ 50` filter from an independent direction:
+ * higher IV buys width headroom at the SAME delta (40%/30d supports ~$192 of R at
+ * Δ=0.20 vs ~$48 at 20% vol). The floor and the IV-rank filter push the same way.
  *
  * INVARIANT — IF THE DELTA BAND MOVES, THE FLOOR MOVES WITH IT. Do not restate 0.20
  * here. Two independent constants will drift apart on the next retune and silently
- * reopen the leak this floor exists to close. Deliberately still BELOW the TRA-2005
- * admission bar of 0.28, so this is the survival floor, not the edge bar.
+ * reopen the leak this floor exists to close. The coupling is a DRIFT GUARD, not a
+ * claim that `c = Δ_short`. Deliberately still BELOW the TRA-2005 admission bar of
+ * 0.28, so this is the survival floor, not the edge bar.
  */
-export const DEFAULT_CREDIT_WIDTH_FLOOR = DEFAULT_SHORT_DELTA_MIN; // c ≈ Δ_short (no-arb)
+export const DEFAULT_CREDIT_WIDTH_FLOOR = DEFAULT_SHORT_DELTA_MIN; // drift-coupled to the band bottom
 
 /** Resolved, fully-defaulted floor configuration. Pure — no env access. */
 export interface CreditWidthFloorConfig {
@@ -400,9 +429,11 @@ export function resolveCreditWidthFloorConfigFromEnv(
   const resolvedShortDeltaMin = bandOk ? shortDeltaMin : DEFAULT_SHORT_DELTA_MIN;
   return {
     // The floor defaults to the RESOLVED band bottom, not the module constant: the
-    // c ≈ Δ_short identity has to survive an env-overridden band, or the two drift
-    // apart at runtime. An explicit OPTIONS_IDEA_CREDIT_WIDTH_MIN still wins — that
-    // is a deliberate operator override, not drift.
+    // drift coupling has to survive an env-overridden band, or the two move apart at
+    // runtime. (Coupling, not identity — `c` is the width-averaged dual delta and
+    // sits strictly below the band bottom at any real width; TRA-2681.) An explicit
+    // OPTIONS_IDEA_CREDIT_WIDTH_MIN still wins — that is a deliberate operator
+    // override, not drift.
     minCreditWidth:
       parseBoundedFloat(env[CREDIT_WIDTH_FLOOR_MIN_VAR], 0, 1) ?? resolvedShortDeltaMin,
     shortDeltaMin: resolvedShortDeltaMin,

@@ -20,6 +20,7 @@ import {
   CREDIT_WIDTH_FLOOR_ENABLE_VAR,
 } from './options-idea-credit-width-floor.js';
 import {
+  creditWidthFloorPromptAddendum,
   runOptionsResearch,
   validateOptionsIdeaBatch,
   type OptionsResearchInput,
@@ -338,6 +339,43 @@ describe('runOptionsResearch — floor ON', () => {
       expect(system).toContain('>= 0.20');
       expect(system).toContain('0.20–0.30 delta');
       expect(system).toContain('DO NOT optimise for POP');
+    });
+  });
+
+  // TRA-2681 — rules 10/11/13 have to be JOINTLY satisfiable. `credit/width` is the
+  // width-averaged dual delta, so it falls strictly as the spread widens (measured,
+  // BS S=100 σ=25% T=30d, Δ_short=0.226: c = 0.226 / 0.205 / 0.185 / 0.152 at width
+  // 1 / 2 / 3 / 5). Rule 13 used to say "WIDEN, do not narrow" — the one move that
+  // deterministically pushes a band-legal idea under the floor. These pin the
+  // corrected direction so it cannot silently regress to the infeasible pairing.
+  describe('prompt addendum — TRA-2681 joint feasibility of rules 10/11/13', () => {
+    const addendum = creditWidthFloorPromptAddendum(DEFAULT_CREDIT_WIDTH_FLOOR_CONFIG);
+
+    it('rule 10 prohibits NARROWING, not widening — widening cannot inflate the ratio', () => {
+      // The old clause forbade the safe direction and permitted the gaming one.
+      expect(addendum).not.toContain('Widen nothing to fake it');
+      expect(addendum).toMatch(/Do NOT narrow the spread to fake/);
+      expect(addendum).toContain('DOLLARS');
+    });
+
+    it('rule 13 names the width ceiling and points at delta, not at widening', () => {
+      // The load-bearing content: widening lowers c, the floor caps width, delta
+      // buys width capacity.
+      expect(addendum).not.toContain('WIDEN, do not narrow');
+      expect(addendum).toContain('WIDENING LOWERS credit/width');
+      expect(addendum).toMatch(/floor CAPS how wide you can\s+go/);
+      expect(addendum).toMatch(/move the SHORT strike UP the/);
+      expect(addendum).toMatch(/do NOT narrow to a token-width/);
+    });
+
+    it('rule 13 quotes the RESOLVED band, so an env-overridden band cannot leave it stale', () => {
+      const wide = { minCreditWidth: 0.15, shortDeltaMin: 0.15, shortDeltaMax: 0.35 };
+      const text = creditWidthFloorPromptAddendum(wide);
+      expect(text).toContain('0.15–0.35 band');
+      expect(text).toMatch(/at 0\.15 delta a 30-day name/);
+      expect(text).toMatch(/at\s+0\.35 delta several points/);
+      // …and no hardcoded reference band survived the retune.
+      expect(text).not.toContain('0.20–0.30');
     });
   });
 

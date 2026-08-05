@@ -587,6 +587,19 @@ const SYSTEM_PROMPT = [
  * stops it optimising the wrong number. The floor is ALSO enforced deterministically
  * after the answer — this addendum is what lets the model comply rather than be
  * silently thinned.
+ *
+ * TRA-2681 — RULE 13 MUST STATE THE WIDTH CEILING, or the addendum guarantees the
+ * silent thinning it exists to prevent. `credit/width` is the width-AVERAGED dual
+ * delta, so it falls strictly as the spread widens: a short strike sitting inside
+ * the mandated 0.20–0.30 band fails the 0.20 floor past ~2 points of width (see
+ * `options-idea-credit-width-floor.ts`). Rules 10, 11 and 13 were jointly
+ * near-infeasible at the band bottom — rule 11 pins delta, rule 13 said "widen",
+ * and widening is exactly what drives `c` under the floor and gets the idea
+ * discarded. The model was never told a width ceiling existed, so it could not
+ * comply. Rule 13 now names the real lever: DELTA buys width capacity, width does
+ * not buy itself. Rule 10's anti-gaming clause was also pointed the wrong way — it
+ * forbade widening, which cannot inflate `c` (it destroys it); NARROWING is the
+ * gaming direction, and that is what rule 10 now prohibits.
  */
 export function creditWidthFloorPromptAddendum(config: CreditWidthFloorConfig): string {
   const floorPct = (config.minCreditWidth * 100).toFixed(0);
@@ -595,23 +608,28 @@ export function creditWidthFloorPromptAddendum(config: CreditWidthFloorConfig): 
     `10. Any bull_put_spread / bear_call_spread / iron_condor / iron_butterfly must collect a NET`,
     `    CREDIT of at least ${config.minCreditWidth.toFixed(2)} of its spread width — i.e.`,
     `    creditUsd / (creditUsd + maxLossUsd) >= ${config.minCreditWidth.toFixed(2)}. An idea below that`,
-    `    floor is DISCARDED after you answer; do not propose one. Widen nothing to fake it: pick a`,
-    `    strike that genuinely pays ${floorPct}% of width, or leave the name out.`,
+    `    floor is DISCARDED after you answer; do not propose one. Do NOT narrow the spread to fake`,
+    `    it: a razor-thin spread clears the ratio while collecting almost nothing in DOLLARS, which`,
+    `    is the failure mode, not a fix. Pick a strike that genuinely pays ${floorPct}% of width at a`,
+    `    real width, or leave the name out.`,
     `11. Target the SHORT leg at ${config.shortDeltaMin.toFixed(2)}–${config.shortDeltaMax.toFixed(2)} delta.`,
     `    Each candidate carries its own \`delta\`, so use it. WHY: below ~${config.shortDeltaMin.toFixed(2)} delta the`,
     '    premium collected does not clear transaction costs at our fee base, so the trade is negative',
     '    expectancy no matter how high its probability of profit; above the band the structure stops',
     '    being a high-probability credit trade and becomes a directional bet.',
     "12. Report the short leg's |delta| as `shortDelta` (0..1) on every credit structure.",
-    '13. HOLD R CONSTANT — WIDEN, do not narrow. When the floor pushes you to a nearer short strike,',
-    '    widen the spread so `maxLossUsd` lands roughly where the same idea would have put it without',
-    '    the floor. WHY: our costs are fixed in DOLLARS per trade (two legs, round trip) while',
-    '    R = maxLossUsd = width × (1 − credit/width). Raising the credit ratio at UNCHANGED width',
-    '    shrinks R and therefore inflates cost/R — it makes the trade worse, not better, and hands',
-    '    back more than the floor gains. A floor-clearing credit on a WIDE spread is the target; the',
-    '    same ratio hit by narrowing the spread is the failure mode.',
+    '13. HOLD R CONSTANT — but BUY the width with DELTA, not by stretching a low-delta strike.',
+    '    WIDENING LOWERS credit/width (you pay for the long leg), so the floor CAPS how wide you can',
+    `    go: at ${config.shortDeltaMin.toFixed(2)} delta a 30-day name supports well under a point of width, at`,
+    `    ${config.shortDeltaMax.toFixed(2)} delta several points. If the R you want needs more width than the floor`,
+    `    allows, move the SHORT strike UP the ${config.shortDeltaMin.toFixed(2)}–${config.shortDeltaMax.toFixed(2)} band — do NOT hold delta and`,
+    '    stretch (the ratio collapses and the idea is discarded), and do NOT narrow to a token-width',
+    '    spread to hit the ratio. WHY: our costs are fixed in DOLLARS per trade (two legs, round trip)',
+    '    while R = maxLossUsd = width × (1 − credit/width), so a thin spread that clears the floor',
+    '    still loses to cost/R. Higher IV-rank names give more width headroom at the same delta —',
+    '    prefer them when you need size.',
     'DO NOT optimise for POP. A very high POP on a far-OTM short strike is exactly the failure mode',
-    'these two rules exist to stop: it wins almost every time and collects too little to survive one',
+    'these rules exist to stop: it wins almost every time and collects too little to survive one',
     'loss. Prefer FEWER ideas that clear the floor over a full slate that does not. Returning',
     '{ "ideas": [] } is a correct answer when nothing in the universe pays enough premium.',
     '',
