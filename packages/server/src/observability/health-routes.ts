@@ -11,7 +11,13 @@ import type { Express, Response, RequestHandler } from 'express';
 import { findMissingLiveCredentials, isStockMarketOpen, DEFAULT_ACCOUNT_SETTINGS, type AccountSettings } from '@trading-app/shared';
 import type { DecoupledExitSkipReason, EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance, LiveSkipCategory } from '../signal-engine.js';
 import { DECOUPLED_EXIT_SKIP_REASONS, EXIT_INTERVAL_BUCKETS, LIVE_SKIP_CATEGORIES, emptyDecoupledExitSkips, emptyExitIntervalHistogram, emptyLiveSkipBreakdown, isLiveBrokerOperator, resolveLiveBrokerOperator, isRvEngineEnabled } from '../signal-engine.js';
-import { isTestAccount, unrecognisedDeskBooks, KNOWN_DESK_BOOKS } from '../test-accounts.js'; // TRA-1949, TRA-2524, TRA-2660
+import {
+  isTestAccount,
+  unrecognisedDeskBooks,
+  KNOWN_DESK_BOOKS,
+  testAccountClassifierIdentity, // TRA-2948 — every class-partitioned figure names its classifier
+  type TestAccountClassifierIdentity,
+} from '../test-accounts.js'; // TRA-1949, TRA-2524, TRA-2660
 import {
   applyModelFacingBasis,
   MODEL_FACING_JOURNAL_BASIS,
@@ -1480,6 +1486,14 @@ export interface OptionJournalReport {
       emailAware: false;
       bookFoldRestatesRows: false;
       classifierChangeRestatesRows: true;
+      /**
+       * TRA-2948 — the classifier every class-partitioned figure in this payload
+       * was computed under. Because `classifierChangeRestatesRows` is true, two
+       * reads of this route are comparable ONLY under equal `classifier.hash` —
+       * this field makes that checkable at the point of comparison instead of
+       * requiring an archaeology of pattern-set commits.
+       */
+      classifier: TestAccountClassifierIdentity;
       note: string;
     };
   };
@@ -2010,6 +2024,8 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
     bookFoldRestatesRows: false;
     /** Editing the test-account patterns DOES restate them, retroactively. */
     classifierChangeRestatesRows: true;
+    /** TRA-2948 — the classifier this partition was computed under. See the interface doc. */
+    classifier: TestAccountClassifierIdentity;
     note: string;
   };
 } {
@@ -2048,6 +2064,7 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
       emailAware: false,
       bookFoldRestatesRows: false,
       classifierChangeRestatesRows: true,
+      classifier: testAccountClassifierIdentity(),
       note:
         'A row\'s `account` string is frozen at WRITE time; its CLASS is recomputed at READ '
         + 'time by classifySpreadCeilingAccount -> isTestAccount (username patterns only, no '
@@ -2063,7 +2080,13 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
         + 'TRA-2524\'s e74b4cf was axis (2) and the paired read 9e1b1123 -> 1b803bd8 came '
         + 'back byte-identical, which means the three fixture books wrote ZERO rows here and '
         + 'their desk-dollar contamination is genuinely $0.00. NOTE the retroactivity: '
-        + 'adding a pattern silently restates every previously published desk number.',
+        + 'adding a pattern silently restates every previously published desk number. '
+        + 'TRA-2948 — `classifier` names the pattern set THIS partition was computed under: '
+        + 'two desk figures are comparable only under equal classifier.hash, and the '
+        + 'decision-time twin of this hash is stamped on every spread decision in '
+        + '/api/health/cost-aware-gate (read its classifierProvenance.divergenceDiscriminator '
+        + 'to attribute a split between the two ceiling surfaces to a classifier change vs an '
+        + 'enforcement failure).',
     },
   };
 }
@@ -3934,10 +3957,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // an EMPIRICAL zero and it expires. The partition is the structural one.
       ceilingCompliance: {
         byAccountClass: ceilingByAccountClass,
+        // TRA-2948 — the classifier this payload's account classes were computed
+        // under, on THIS read. This surface reclassifies the frozen `account`
+        // string per request, so a pattern-set edit restates it retroactively —
+        // while /api/health/cost-aware-gate froze each decision's class (and
+        // stamped this same hash) at decision time. Equal hashes on the two
+        // surfaces + `classifier-consistent` on that route's classifierProvenance
+        // rules a classifier change OUT of any disagreement between them.
+        classifier: testAccountClassifierIdentity(),
+        classifierBasis: 'class-recomputed-at-read' as const,
         note:
           'TRA-2316, re-keyed by TRA-2350. TRUE max + strict breach count per (structure × account class × entryArchetype), re-derived from the journal fill-time quote independently of the gate\'s own counters. GRADE `byAccountClass.desk[...].gated` — NOT the pooled top-level numbers on the cell: a structure key is not a sleeve, and `single_leg_directional` is written by three sleeves of which only `entryArchetype: \'directional\'` evaluates the ceiling (`gatedArchetypes` names the set; `ungated` holds the rest; `byArchetype` is the detail). A breach in `ungated` falsifies NOTHING about TRA-2295 — it is a separate question about a sleeve that was never gated. `fixture` is the qa_*/ctoverify* mirror (TRA-2100) and `unattributed` is pre-TRA-1475 rows with no `account` — it is NOT desk. Rows with no measurable two-sided quote DROP OUT of `n` and are counted in `rowsDroppedNoQuote`; they are never counted as zero-spread fills. `null` means NO ROWS TO CHECK and is NOT a pass — only `countAboveCeiling: 0` WITH `n > 0` is. ⚠ TRA-2319 — GATE ON `gated.n > 0`, NEVER on a bare `maxSpreadPct <= ceiling`: this field is `number | null` and `null <= 0.10` is TRUE in JavaScript, so the empty-partition sentinel is SWALLOWED by the obvious predicate and an empty cell reads as a clean pass. `countAboveCeiling` has the same shape (`null` when there was nothing to count) and `null === 0` is false but `null <= 0` is true — compare it with `===`, never with `<=`. Full grid: every sleeve × all three classes is emitted even at n=0, and every DECLARED gated archetype gets a `byArchetype` row even at n=0, because an absent cell reads exactly like a passing one. `gated.n + ungated.n === n` holds by construction; assert it to catch a partition that dropped rows.',
         comparisonBasis:
-          'Cross-check against /api/health/cost-aware-gate: `retained.byStructure[...].maxAdmittedSpreadPct` vs `desk[...].gated.maxSpreadPct`. ⚠ TRA-2306 — READ THE QUALIFIER: that payload carries TWO objects named `byStructure`. The top-level one is `byDay.get(etDay)`, the CURRENT ET DAY ONLY, and it is `[]` on a quiet day; `retained.byStructure` folds every retained day including the in-flight one. Cross-checking against the bare name silently compares against an empty day view. ⚠ TRA-2306 — AND THEY DO NOT TRACK EACH OTHER ON THIS BUILD, SO A DIVERGENCE IS NOT A FINDING. TRA-2350 fixed the ARCHETYPE half of this comparison (the gate counter only ever saw the gated cohort, so compare it against `.gated`, not the pooled cell) and left the ACCOUNT half: the gate tally is ONE MODULE-LEVEL COUNTER PER PROCESS keyed (etDay, structure) with NO account axis, so it pools every book the process runs — the whole demo fleet plus the qa_*/ctoverify* mirrors — while `desk[...].gated` is desk-only. Pooled vs desk-only is two populations, and the pooled side is strictly the larger, so `maxAdmittedSpreadPct >= desk gated max` is the EXPECTED relation, not a defect. Until TRA-2355 lands the account axis on the gate counters there is no like-for-like partner here: a non-zero `spreadCeilingEvaluated` does NOT establish that the DESK sleeve ran, and this comparison can neither confirm nor refute that it did. ⚠ TRA-2306 — DO NOT RESOLVE A DISAGREEMENT AS A BOOKKEEPING ARTIFACT. An earlier version of this note pre-attributed any mismatch to a dropped gate counter rather than to a missing fill, on the premise that these tallies are volatile and single-day. That premise is FALSE on this host and is RETIRED — do not reinstate it: `durability.ephemeral` is false, `applyAndAppend` appends every decision to DATA_DIR synchronously, and `hydrateCostAwareGateFromDisk` re-applies each record inside the 7-day retention back into the same `byDay` map with NO exclude-today filter, so a boot REBUILDS the current day and these counters survive a restart exactly as this read does. A lost FILL is the falsification TRA-2306 exists to catch, and a note that pre-attributes disagreement to bookkeeping talks the grader out of the one reading that can fail the grade. The journal is still the tiebreak — because it is account-scoped and durable, NOT because the other side is volatile.',
+          'Cross-check against /api/health/cost-aware-gate: `retained.byStructure[...].maxAdmittedSpreadPct` vs `desk[...].gated.maxSpreadPct`. ⚠ TRA-2306 — READ THE QUALIFIER: that payload carries TWO objects named `byStructure`. The top-level one is `byDay.get(etDay)`, the CURRENT ET DAY ONLY, and it is `[]` on a quiet day; `retained.byStructure` folds every retained day including the in-flight one. Cross-checking against the bare name silently compares against an empty day view. ⚠ TRA-2306 — AND THEY DO NOT TRACK EACH OTHER ON THIS BUILD, SO A DIVERGENCE IS NOT A FINDING. TRA-2350 fixed the ARCHETYPE half of this comparison (the gate counter only ever saw the gated cohort, so compare it against `.gated`, not the pooled cell) and left the ACCOUNT half: the gate tally is ONE MODULE-LEVEL COUNTER PER PROCESS keyed (etDay, structure) with NO account axis, so it pools every book the process runs — the whole demo fleet plus the qa_*/ctoverify* mirrors — while `desk[...].gated` is desk-only. Pooled vs desk-only is two populations, and the pooled side is strictly the larger, so `maxAdmittedSpreadPct >= desk gated max` is the EXPECTED relation, not a defect. Until TRA-2355 lands the account axis on the gate counters there is no like-for-like partner here: a non-zero `spreadCeilingEvaluated` does NOT establish that the DESK sleeve ran, and this comparison can neither confirm nor refute that it did. ⚠ TRA-2306 — DO NOT RESOLVE A DISAGREEMENT AS A BOOKKEEPING ARTIFACT. An earlier version of this note pre-attributed any mismatch to a dropped gate counter rather than to a missing fill, on the premise that these tallies are volatile and single-day. That premise is FALSE on this host and is RETIRED — do not reinstate it: `durability.ephemeral` is false, `applyAndAppend` appends every decision to DATA_DIR synchronously, and `hydrateCostAwareGateFromDisk` re-applies each record inside the 7-day retention back into the same `byDay` map with NO exclude-today filter, so a boot REBUILDS the current day and these counters survive a restart exactly as this read does. A lost FILL is the falsification TRA-2306 exists to catch, and a note that pre-attributes disagreement to bookkeeping talks the grader out of the one reading that can fail the grade. The journal is still the tiebreak — because it is account-scoped and durable, NOT because the other side is volatile. ⚠ TRA-2948 — ONE MORE CAUSE OF DISAGREEMENT, NOW SEPARABLE: this side recomputes account class at READ time while the gate froze it at DECISION time, so a BUILTIN_TEST_PATTERNS / TEST_ACCOUNT_PREFIXES edit restates this side\'s history and not the gate\'s — the two then split with no enforcement defect anywhere. Before attributing a mismatch, compare `ceilingCompliance.classifier.hash` here with that route\'s `classifierProvenance`: `classifier-change-in-window` names the edit as a cause and bounds the affected decisions; `classifier-consistent` rules it out.',
       },
 
       // (2) The retention statement — the finding when n is short.

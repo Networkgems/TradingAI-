@@ -6,6 +6,7 @@ import {
   unrecognisedDeskBooks,
   KNOWN_DESK_BOOKS,
   TEST_ACCOUNT_PREFIX_ENV,
+  testAccountClassifierIdentity, // TRA-2948
 } from './test-accounts.js';
 
 // TRA-1475 — the QA/test-account classifier drives the firm-wide DESK de-noise.
@@ -178,5 +179,44 @@ describe('excludeTestAccountRows — DESK fold filter', () => {
     const kept = excludeTestAccountRows(rows, { env }).map((r) => r.id);
     // richard is now a test prefix too → only the un-owned row survives
     expect(kept).toEqual(['4']);
+  });
+});
+
+// TRA-2948 — the classifier IDENTITY. A pattern-set edit silently restates every
+// previously published desk number (class is recomputed at read time from the frozen
+// account string), so every class-partitioned figure now carries the hash of the
+// classifier it was computed under. These tests pin the identity's contract: it moves
+// exactly when the effective classifier moves, and only then.
+describe('testAccountClassifierIdentity (TRA-2948)', () => {
+  it('is stable across calls under one env', () => {
+    const env = { [TEST_ACCOUNT_PREFIX_ENV]: 'loadtest,demo_bot' };
+    expect(testAccountClassifierIdentity(env)).toEqual(testAccountClassifierIdentity(env));
+  });
+
+  it('MOVES when a prefix is added — the same edit that flips a classification', () => {
+    const before = testAccountClassifierIdentity({});
+    const after = testAccountClassifierIdentity({ [TEST_ACCOUNT_PREFIX_ENV]: 'widget' });
+    // the classification flips…
+    expect(isTestAccount('widget_book7', {})).toBe(false);
+    expect(isTestAccount('widget_book7', { [TEST_ACCOUNT_PREFIX_ENV]: 'widget' })).toBe(true);
+    // …and the identity flips WITH it, so the restatement is nameable
+    expect(after.hash).not.toBe(before.hash);
+    expect(after.extraPrefixes).toEqual(['widget']);
+    expect(before.extraPrefixes).toEqual([]);
+  });
+
+  it('does NOT move on a reorder/duplicate of a comma list that classifies identically', () => {
+    const a = testAccountClassifierIdentity({ [TEST_ACCOUNT_PREFIX_ENV]: 'loadtest,demo_bot' });
+    const b = testAccountClassifierIdentity({ [TEST_ACCOUNT_PREFIX_ENV]: ' demo_bot , loadtest ,demo_bot' });
+    expect(b.hash).toBe(a.hash);
+  });
+
+  it('publishes the effective inputs, not just the hash', () => {
+    const id = testAccountClassifierIdentity({});
+    expect(id.builtinPatterns).toContain('/^qa/i');
+    expect(id.builtinPatterns.length).toBeGreaterThanOrEqual(7);
+    expect(id.emailSuffix).toBe('@qa.test');
+    // the hash is the 8-hex-char FNV-1a form — a shape a consumer can assert
+    expect(id.hash).toMatch(/^[0-9a-f]{8}$/);
   });
 });

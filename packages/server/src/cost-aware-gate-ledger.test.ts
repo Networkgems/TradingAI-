@@ -15,6 +15,7 @@ import {
 } from './cost-aware-gate-ledger.js';
 import * as spreadCost from './option-spread-cost.js';
 import { DIRECTIONAL_STRUCTURE_LABEL } from './option-spread-cost.js';
+import { testAccountClassifierIdentity } from './test-accounts.js'; // TRA-2948
 
 const DAY = '2026-07-13';
 
@@ -676,5 +677,205 @@ describe('cost-aware-gate-ledger', () => {
         vi.resetModules();
       }
     });
+  });
+});
+
+// ── TRA-2948 — classifier provenance ─────────────────────────────────────────
+//
+// The ledger freezes accountClass at DECISION time; /api/health/option-spread-cost
+// recomputes class at READ time from the row's frozen `account` string. So a
+// BUILTIN_TEST_PATTERNS / TEST_ACCOUNT_PREFIXES edit restates the read-time surface
+// retroactively while this ledger keeps what the gate saw — the two "independent"
+// ceiling cross-checks then disagree BY CONSTRUCTION, in a way that previously read
+// identically to a real enforcement failure. Every spread decision now stamps the
+// hash of the classifier it was classified under, and `classifierProvenance` is the
+// published discriminator. The first test here is the one TRA-2948 demands: it
+// MUTATES the pattern set, proves the two surfaces actually split, and proves the
+// payload names the classifier change as the cause. A test that cannot make them
+// disagree proves nothing (the 1f24217 rule).
+describe('classifier provenance (TRA-2948)', () => {
+  let dir: string;
+  const S = DIRECTIONAL_STRUCTURE_LABEL;
+  const ENV_A: NodeJS.ProcessEnv = {};
+  const ENV_B: NodeJS.ProcessEnv = { TEST_ACCOUNT_PREFIXES: 'widget' };
+  const ACCOUNT = 'widget_book7'; // desk under A, fixture under B — the restated book
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cost-gate-2948-'));
+    clearCostAwareGateLedger();
+  });
+
+  afterEach(() => {
+    clearCostAwareGateLedger();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('an empty window is NO READING, not consistency', () => {
+    const p = summarizeCostAwareGate(DAY, ENV_A).classifierProvenance;
+    expect(p.spreadDecisionsTotal).toBe(0);
+    expect(p.divergenceDiscriminator).toBe('no-spread-decisions-in-window');
+  });
+
+  it('non-spread decisions never enter the census — only the stamped kind is counted', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordCostAwareGateDecision('single_leg_rv', true, 1.4, 1.25, DAY, 1_001);
+    recordEntryDeltaCeilingReject('single_leg_rv', 0.7, DAY, 1_002);
+    const p = summarizeCostAwareGate(DAY, ENV_A).classifierProvenance;
+    expect(p.spreadDecisionsTotal).toBe(0);
+    expect(p.divergenceDiscriminator).toBe('no-spread-decisions-in-window');
+  });
+
+  it('MUTATING THE PATTERN SET splits the two surfaces AND the payload names the change as the cause', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    // Decision time, classifier A: the book is DESK, and the gate freezes that.
+    expect(spreadCost.classifySpreadCeilingAccount(ACCOUNT, ENV_A)).toBe('desk');
+    recordSpreadCeilingDecision(S, 'desk', true, 0.05, 'ok', DAY, 1_001, ENV_A);
+
+    // Read time, classifier B (the pattern-set edit): the SAME frozen string is
+    // now FIXTURE. Surface 1 — the journal-derived read restates retroactively…
+    const grid = spreadCost.summarizeSpreadCeilingCompliance([
+      {
+        structure: S,
+        accountClass: spreadCost.classifySpreadCeilingAccount(ACCOUNT, ENV_B),
+        entryArchetype: 'directional',
+        quote: { bid: 1, ask: 1.05, mark: 1.025 },
+      },
+    ]);
+    const cell = (klass: 'desk' | 'fixture') =>
+      grid.find((c) => c.structure === S && c.accountClass === klass)!;
+    expect(cell('fixture').n).toBe(1);
+    expect(cell('desk').n).toBe(0);
+
+    // …surface 2 — the ledger keeps the class the gate saw at decision time.
+    const s = summarizeCostAwareGate(DAY, ENV_B);
+    const row = s.byStructure.find((r) => r.structure === S)!;
+    expect(row.spreadCeilingByAccountClass.desk.spreadCeilingEvaluated).toBe(1);
+    expect(row.spreadCeilingByAccountClass.fixture.spreadCeilingEvaluated).toBe(0);
+
+    // The surfaces have now SPLIT with no enforcement defect anywhere. The
+    // discriminator must attribute the split to the classifier change — by
+    // foreign hash, with a count that bounds the affected decisions.
+    const hashA = testAccountClassifierIdentity(ENV_A).hash;
+    const p = s.classifierProvenance;
+    expect(p.divergenceDiscriminator).toBe('classifier-change-in-window');
+    expect(p.current.hash).toBe(testAccountClassifierIdentity(ENV_B).hash);
+    expect(p.underOtherClassifiers).toEqual({ [hashA]: 1 });
+    expect(p.underCurrentClassifier).toBe(0);
+    expect(p.unstamped).toBe(0);
+  });
+
+  it('CONTROL — with no edit the surfaces agree and the classifier is ruled OUT', () => {
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordSpreadCeilingDecision(
+      S,
+      spreadCost.classifySpreadCeilingAccount(ACCOUNT, ENV_A),
+      true,
+      0.05,
+      'ok',
+      DAY,
+      1_001,
+      ENV_A,
+    );
+    // Read side, SAME classifier: the row classifies desk, matching the ledger.
+    expect(spreadCost.classifySpreadCeilingAccount(ACCOUNT, ENV_A)).toBe('desk');
+    const s = summarizeCostAwareGate(DAY, ENV_A);
+    expect(
+      s.byStructure.find((r) => r.structure === S)!.spreadCeilingByAccountClass.desk
+        .spreadCeilingEvaluated,
+    ).toBe(1);
+    const p = s.classifierProvenance;
+    expect(p.divergenceDiscriminator).toBe('classifier-consistent');
+    expect(p.underCurrentClassifier).toBe(1);
+    expect(p.underOtherClassifiers).toEqual({});
+    expect(p.unstamped).toBe(0);
+    // In THIS state a split between the surfaces is an enforcement failure — the
+    // one reading the discriminator must never talk a grader out of.
+  });
+
+  it('a pre-TRA-2948 line hydrates UNSTAMPED and reads indeterminate — never as current', () => {
+    writeFileSync(
+      costAwareGateLogPath(dir),
+      JSON.stringify({
+        ts: 900,
+        etDay: DAY,
+        structure: S,
+        admit: true,
+        grossR: 0,
+        barR: 0,
+        gate: 'spread_ceiling_admitted',
+        code: 'ok',
+        accountClass: 'desk',
+      }) + '\n',
+      'utf8',
+    );
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    const p = summarizeCostAwareGate(DAY, ENV_A).classifierProvenance;
+    expect(p.spreadDecisionsTotal).toBe(1);
+    expect(p.unstamped).toBe(1);
+    expect(p.underCurrentClassifier).toBe(0);
+    expect(p.divergenceDiscriminator).toBe('indeterminate-unstamped-records');
+  });
+
+  it('a foreign stamp outranks unstamped noise — the change is CONFIRMED, not indeterminate', () => {
+    writeFileSync(
+      costAwareGateLogPath(dir),
+      JSON.stringify({
+        ts: 900,
+        etDay: DAY,
+        structure: S,
+        admit: true,
+        grossR: 0,
+        barR: 0,
+        gate: 'spread_ceiling_admitted',
+        code: 'ok',
+        accountClass: 'desk',
+      }) + '\n',
+      'utf8',
+    );
+    hydrateCostAwareGateFromDisk(dir, 1_000);
+    recordSpreadCeilingDecision(S, 'desk', true, 0.04, 'ok', DAY, 1_001, ENV_A);
+    const p = summarizeCostAwareGate(DAY, ENV_B).classifierProvenance;
+    expect(p.divergenceDiscriminator).toBe('classifier-change-in-window');
+    expect(p.unstamped).toBe(1);
+    expect(p.spreadDecisionsTotal).toBe(2);
+  });
+
+  it('the stamp survives a reboot AND the compaction rewrite', () => {
+    const BASE = 30 * 24 * 60 * 60 * 1000;
+    hydrateCostAwareGateFromDisk(dir, BASE);
+    recordSpreadCeilingDecision(S, 'desk', true, 0.05, 'ok', DAY, BASE + 1, ENV_A);
+    // Prepend a stale line so the next hydrate must take the compaction REWRITE
+    // path — the one that erased fields for TRA-1703 and TRA-2355 before it.
+    const live = readFileSync(costAwareGateLogPath(dir), 'utf8');
+    const stale = JSON.stringify({
+      ts: BASE - 8 * 24 * 60 * 60 * 1000,
+      etDay: '2026-07-01',
+      structure: S,
+      admit: true,
+      grossR: 0,
+      barR: 0,
+      gate: 'spread_ceiling_admitted',
+      code: 'ok',
+      accountClass: 'desk',
+      classifierHash: 'deadbeef', // dies with its stale record — never re-surfaces
+    });
+    writeFileSync(costAwareGateLogPath(dir), stale + '\n' + live, 'utf8');
+
+    clearCostAwareGateLedger();
+    hydrateCostAwareGateFromDisk(dir, BASE + 2);
+    // …and hydrate AGAIN from the compacted file, so the assertion covers what the
+    // rewrite actually wrote, not what the first hydrate happened to keep in memory.
+    clearCostAwareGateLedger();
+    hydrateCostAwareGateFromDisk(dir, BASE + 3);
+
+    const hashA = testAccountClassifierIdentity(ENV_A).hash;
+    expect(readFileSync(costAwareGateLogPath(dir), 'utf8')).toContain(
+      '"classifierHash":"' + hashA + '"',
+    );
+    const p = summarizeCostAwareGate(DAY, ENV_A).classifierProvenance;
+    expect(p.spreadDecisionsTotal).toBe(1);
+    expect(p.underCurrentClassifier).toBe(1);
+    expect(p.unstamped).toBe(0);
+    expect(p.divergenceDiscriminator).toBe('classifier-consistent');
   });
 });

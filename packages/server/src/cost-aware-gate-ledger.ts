@@ -37,6 +37,10 @@ import {
   SPREAD_CEILING_ACCOUNT_CLASSES,
   type SpreadCeilingAccountClass,
 } from './option-spread-cost.js';
+import {
+  testAccountClassifierIdentity, // TRA-2948 — stamped at decision time, compared at read time.
+  type TestAccountClassifierIdentity,
+} from './test-accounts.js';
 
 const log = logger.child({ module: 'cost-aware-gate-ledger' });
 
@@ -111,6 +115,21 @@ interface CostGateDecisionRecord {
    *     silently changes under a grader is worse than no partition.
    */
   accountClass?: SpreadCeilingAccountClass;
+  /**
+   * TRA-2948 — the {@link testAccountClassifierIdentity} hash of the classifier
+   * `accountClass` was computed UNDER, stamped at decision time beside the class
+   * it explains. `spread_ceiling*` records only; absent on every line written
+   * before this ticket (those tally as UNSTAMPED, never as current).
+   *
+   * This is the field that makes the two ceiling cross-checks separable. The
+   * class above is frozen at decision time while `/api/health/option-spread-cost`
+   * recomputes class at read time, so across any pattern-set edit the two
+   * surfaces disagree BY CONSTRUCTION — and without this stamp that disagreement
+   * is indistinguishable from a real enforcement failure. A retained window whose
+   * stamps all match the current classifier rules the classifier OUT; any stamp
+   * that differs names it as a cause and bounds the blast radius to a count.
+   */
+  classifierHash?: string;
 }
 
 /**
@@ -246,6 +265,14 @@ let hydratedDays = 0;
 /** Appends that threw and were swallowed. > 0 ⇒ rows the counters show are NOT on disk. */
 let appendErrors = 0;
 let lastAppendError: string | null = null;
+// TRA-2948 — census of retained spread-ceiling decisions by the classifier hash each
+// one was STAMPED under. Module-global like `byDay` (fed identically by hydrate and
+// live pass), covering exactly the retained window, because the question it answers —
+// "can a classifier change explain a split between the two ceiling surfaces?" — is a
+// window property, not a day property.
+const spreadDecisionsByClassifier = new Map<string, number>();
+/** Retained spread decisions written before TRA-2948 (no stamp). Indeterminate, never "current". */
+let spreadDecisionsUnstamped = 0;
 
 export function costAwareGateLogPath(dir: string): string {
   return join(dir, COST_AWARE_GATE_LOG_FILENAME);
@@ -261,6 +288,8 @@ export function clearCostAwareGateLedger(): void {
   hydratedDays = 0;
   appendErrors = 0;
   lastAppendError = null;
+  spreadDecisionsByClassifier.clear();
+  spreadDecisionsUnstamped = 0;
 }
 
 /**
@@ -291,6 +320,18 @@ function apply(rec: CostGateDecisionRecord): void {
     // may set it.
     tally = newTally();
     day.set(rec.structure, tally);
+  }
+  if (rec.gate === 'spread_ceiling' || rec.gate === 'spread_ceiling_admitted') {
+    // TRA-2948 — census the stamp in the SAME pass that tallies the decision, so the
+    // provenance counts and the class counts can never describe different populations.
+    if (typeof rec.classifierHash === 'string' && rec.classifierHash !== '') {
+      spreadDecisionsByClassifier.set(
+        rec.classifierHash,
+        (spreadDecisionsByClassifier.get(rec.classifierHash) ?? 0) + 1,
+      );
+    } else {
+      spreadDecisionsUnstamped += 1;
+    }
   }
   if (rec.gate === 'spread_ceiling') {
     // TRA-2295 — the spread gate REFUSED this candidate. Its own axis: it is neither a
@@ -454,6 +495,14 @@ export function recordEntryDeltaCeilingObserved(
  * for the same reason the parameter exists at all — a defaulted class would let a new
  * call site compile into the pooled counter and reproduce this ticket in silence,
  * whereas a required one makes the compiler name every site that has to decide.
+ *
+ * ── TRA-2948 — the record also stamps `classifierHash` ───────────────────────
+ * The hash of the classifier in effect at THIS moment, from the same `env` the
+ * caller classified under (callers classify with the process env; the optional
+ * `env` parameter exists so a test can freeze both halves on one input). The class
+ * answers "which book"; the hash answers "under which rules that answer was
+ * computed", which is what a reader needs when this frozen class later disagrees
+ * with a read-time reclassification of the same account string.
  */
 export function recordSpreadCeilingDecision(
   structure: string,
@@ -463,6 +512,7 @@ export function recordSpreadCeilingDecision(
   code: string,
   etDay: string,
   now: number = Date.now(),
+  env: NodeJS.ProcessEnv = process.env,
 ): void {
   applyAndAppend({
     ts: now,
@@ -475,6 +525,7 @@ export function recordSpreadCeilingDecision(
     ...(spreadPct !== null && Number.isFinite(spreadPct) ? { spreadPct } : {}),
     code,
     accountClass,
+    classifierHash: testAccountClassifierIdentity(env).hash,
   });
 }
 
@@ -589,6 +640,16 @@ export function hydrateCostAwareGateFromDisk(dir: string, now: number = Date.now
       // into `unattributed` on the first reboot, and the desk partition would read `0`
       // for a week of sessions the desk actually traded.
       ...(isSpread ? { accountClass: recAccountClass(rec) } : {}),
+      // TRA-2948 — the classifier stamp must ALSO survive the rewrite, for the same
+      // reason: compaction erased fields stay erased. Dropping it would re-mark every
+      // retained decision UNSTAMPED on the first reboot, and the provenance read would
+      // permanently answer "indeterminate" on a window that was fully stamped. An
+      // absent/blank stamp on a pre-TRA-2948 line is preserved as absent — it must
+      // never be back-filled with the CURRENT hash, which would fabricate exactly the
+      // "computed under today's rules" evidence the stamp exists to withhold.
+      ...(isSpread && typeof rec.classifierHash === 'string' && rec.classifierHash !== ''
+        ? { classifierHash: rec.classifierHash }
+        : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -868,13 +929,115 @@ export interface CostAwareGateSummary {
    * the partition sits beside them and this sentence says which one to grade.
    */
   spreadCeilingAccountClassNote: string;
+  /**
+   * TRA-2948 — WHICH CLASSIFIER each retained spread decision froze its class under,
+   * versus the one in effect now. THE separator for the standing trap this ledger and
+   * `/api/health/option-spread-cost` share: they are published as independent
+   * cross-checks of the same ceiling, but this side stamps class at DECISION time
+   * while that side recomputes it at READ time, so any pattern-set edit makes them
+   * disagree by construction — in a way that previously read identically to a real
+   * enforcement failure. Read `divergenceDiscriminator` BEFORE interpreting any
+   * desk-cell mismatch between the two routes.
+   */
+  classifierProvenance: CostAwareGateClassifierProvenance;
   /** ms epoch of the last recorded decision (null if none yet). */
   lastDecisionAt: number | null;
+}
+
+/**
+ * TRA-2948 — see {@link CostAwareGateSummary.classifierProvenance}.
+ *
+ * Four states, not a boolean, and the order below is the precedence:
+ *   `no-spread-decisions-in-window`   — the census has NOTHING under it. Not a
+ *                                       consistency verdict; an empty window must not
+ *                                       read as the healthy state (the TRA-2295 rule).
+ *   `classifier-change-in-window`     — ≥1 retained decision froze its class under a
+ *                                       DIFFERENT classifier than the current one. A
+ *                                       split between the two ceiling surfaces is
+ *                                       attributable to the classifier change, and
+ *                                       `underOtherClassifiers` bounds how many
+ *                                       decisions can be involved.
+ *   `indeterminate-unstamped-records` — no foreign stamp, but pre-TRA-2948 records
+ *                                       carry none at all; for those the question is
+ *                                       unanswerable in either direction.
+ *   `classifier-consistent`           — every retained decision is stamped with the
+ *                                       current hash. The classifier is RULED OUT: a
+ *                                       split between the surfaces in this state is
+ *                                       an enforcement failure (or a lost fill), not
+ *                                       a regex edit.
+ */
+export interface CostAwareGateClassifierProvenance {
+  /** The classifier in effect on THIS read — the one read-time surfaces are using now. */
+  current: TestAccountClassifierIdentity;
+  /** This ledger's basis, stated so the two surfaces' bases can be compared on the wire. */
+  decisionBasis: 'class-frozen-at-decision-time';
+  /** Retained `spread_ceiling*` decisions (the only stamped kind). The census total. */
+  spreadDecisionsTotal: number;
+  /** Of those, stamped with `current.hash`. */
+  underCurrentClassifier: number;
+  /** Of those, stamped under a DIFFERENT classifier: hash → count. Non-empty names the change. */
+  underOtherClassifiers: Record<string, number>;
+  /** Of those, written before TRA-2948 (no stamp). Indeterminate — never counted as current. */
+  unstamped: number;
+  divergenceDiscriminator:
+    | 'no-spread-decisions-in-window'
+    | 'classifier-change-in-window'
+    | 'indeterminate-unstamped-records'
+    | 'classifier-consistent';
+  note: string;
 }
 
 function round(n: number, dp = 4): number {
   const f = 10 ** dp;
   return Math.round(n * f) / f;
+}
+
+/** TRA-2948 — fold the stamp census against the CURRENT classifier. Pure beyond env. */
+function summarizeClassifierProvenance(env: NodeJS.ProcessEnv): CostAwareGateClassifierProvenance {
+  const current = testAccountClassifierIdentity(env);
+  let underCurrentClassifier = 0;
+  const underOtherClassifiers: Record<string, number> = {};
+  for (const [hash, n] of spreadDecisionsByClassifier.entries()) {
+    if (hash === current.hash) underCurrentClassifier += n;
+    else underOtherClassifiers[hash] = n;
+  }
+  const spreadDecisionsTotal =
+    underCurrentClassifier
+    + Object.values(underOtherClassifiers).reduce((a, n) => a + n, 0)
+    + spreadDecisionsUnstamped;
+  const divergenceDiscriminator: CostAwareGateClassifierProvenance['divergenceDiscriminator'] =
+    spreadDecisionsTotal === 0
+      ? 'no-spread-decisions-in-window'
+      : Object.keys(underOtherClassifiers).length > 0
+        ? 'classifier-change-in-window'
+        : spreadDecisionsUnstamped > 0
+          ? 'indeterminate-unstamped-records'
+          : 'classifier-consistent';
+  return {
+    current,
+    decisionBasis: 'class-frozen-at-decision-time',
+    spreadDecisionsTotal,
+    underCurrentClassifier,
+    underOtherClassifiers,
+    unstamped: spreadDecisionsUnstamped,
+    divergenceDiscriminator,
+    note:
+      'TRA-2948. This ledger freezes accountClass at DECISION time; /api/health/option-spread-cost '
+      + 'and /api/health/option-journal recompute class at READ time from the row\'s frozen `account` '
+      + 'string. Editing BUILTIN_TEST_PATTERNS or TEST_ACCOUNT_PREFIXES therefore restates the '
+      + 'read-time surfaces RETROACTIVELY while this side keeps what the gate saw — the two '
+      + '"independent" ceiling cross-checks then disagree by construction. Each spread decision is '
+      + 'stamped with the hash of the classifier it was classified under; `current` is the classifier '
+      + 'in effect on this read (the same identity those routes now publish). Read '
+      + '`divergenceDiscriminator` BEFORE interpreting a desk-cell mismatch between the routes: '
+      + '`classifier-change-in-window` attributes the split to a pattern-set edit and '
+      + '`underOtherClassifiers` bounds how many decisions it can involve; `classifier-consistent` '
+      + 'RULES THE CLASSIFIER OUT, leaving enforcement failure (or a lost fill) as the remaining '
+      + 'explanations; `indeterminate-unstamped-records` means pre-TRA-2948 lines carry no stamp and '
+      + 'cannot testify either way; `no-spread-decisions-in-window` is NO READING, not consistency. '
+      + 'An unstamped line is never counted as current — back-filling the current hash would '
+      + 'fabricate the exact evidence the stamp exists to withhold.',
+  };
 }
 
 /** Merge one day's tally for a structure into an accumulator (so N days fold like one). */
@@ -1059,12 +1222,16 @@ function summarizeRetained(): CostAwareGateRetainedSummary {
  * window — above all the entry-delta ceiling tripwire — read `retained` instead
  * (TRA-1703): a one-day counter re-arms itself at midnight.
  */
-export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
+export function summarizeCostAwareGate(
+  etDay: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CostAwareGateSummary {
   const day = byDay.get(etDay);
   return {
     decisionsRecorded: decisionsTotal,
     ...foldStructures(day ?? new Map()),
     retained: summarizeRetained(),
+    classifierProvenance: summarizeClassifierProvenance(env),
     spreadCeilingStructureKeys: {
       // TRA-2345 — INTERPOLATED from the constant the recorder keys off, not a
       // second copy of the string. A hardcoded literal here reads identically
@@ -1074,7 +1241,7 @@ export function summarizeCostAwareGate(etDay: string): CostAwareGateSummary {
       otm: 'single_leg_otm — gated in the OTM scanner chain filter, not by this counter; spreadCeilingEvaluated 0 there is expected.',
     },
     spreadCeilingAccountClassNote:
-      'TRA-2355. The pooled `spreadCeiling*` fields on each byStructure[] row are NOT A DESK VERDICT: this ledger is module-global while SignalEngine is constructed per username, so ~51 QA fixture books (qa*/ctoverify*/monitor_qa) tally into the same counters as the desk (admin/Richard). GRADE `byStructure[].spreadCeilingByAccountClass.desk` — a non-zero pooled `spreadCeilingEvaluated` can be 100% fixture, and the fixture fleet is a CURRENTLY-FIRING writer of the directional cohort (64 of 151 pre-fix rows), not an empirical zero that expires. `desk.spreadCeilingEvaluated === 0` is NO READING AT ALL, not a pass — the desk fires zero directional entries on roughly 2 sessions in 5. `unattributed` is records written before TRA-2355 (and any hydrated line carrying no class); it is NOT desk, and folding it into desk would re-pool exactly the retained history a multi-day grade leans on hardest. All three classes are emitted even at 0, because an absent cell reads like a passing one. Classification is frozen at DECISION time via classifySpreadCeilingAccount(), the same predicate /api/health/option-spread-cost applies to a row\'s stored `account`, so the two routes cannot drift on the partition rule. Cross-check: this desk cell should track ceilingCompliance.byAccountClass.desk[single_leg_directional].gated on that route.',
+      'TRA-2355. The pooled `spreadCeiling*` fields on each byStructure[] row are NOT A DESK VERDICT: this ledger is module-global while SignalEngine is constructed per username, so ~51 QA fixture books (qa*/ctoverify*/monitor_qa) tally into the same counters as the desk (admin/Richard). GRADE `byStructure[].spreadCeilingByAccountClass.desk` — a non-zero pooled `spreadCeilingEvaluated` can be 100% fixture, and the fixture fleet is a CURRENTLY-FIRING writer of the directional cohort (64 of 151 pre-fix rows), not an empirical zero that expires. `desk.spreadCeilingEvaluated === 0` is NO READING AT ALL, not a pass — the desk fires zero directional entries on roughly 2 sessions in 5. `unattributed` is records written before TRA-2355 (and any hydrated line carrying no class); it is NOT desk, and folding it into desk would re-pool exactly the retained history a multi-day grade leans on hardest. All three classes are emitted even at 0, because an absent cell reads like a passing one. Classification is frozen at DECISION time via classifySpreadCeilingAccount(), the same predicate /api/health/option-spread-cost applies to a row\'s stored `account`, so the two routes cannot drift on the partition RULE — but (TRA-2948) they CAN drift on the rule\'s INPUTS: that route re-applies the predicate at READ time, so a pattern-set edit restates its history while this side keeps what the gate saw. `classifierProvenance` is the separator — read its divergenceDiscriminator before interpreting a mismatch. Cross-check: this desk cell should track ceilingCompliance.byAccountClass.desk[single_leg_directional].gated on that route.',
     durability: {
       dataDir,
       ephemeral: isEphemeralDataDir(dataDir),

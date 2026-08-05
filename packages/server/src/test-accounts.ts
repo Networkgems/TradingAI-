@@ -97,6 +97,75 @@ export function unrecognisedDeskBooks(
     .filter((u) => !known.has(u.trim().toLowerCase()));
 }
 
+/**
+ * TRA-2948 — the IDENTITY of the effective classifier: exactly the inputs that
+ * determine what {@link isTestAccount} answers, and nothing else.
+ *
+ * A journal row's `account` string is frozen at write time but its CLASS is
+ * recomputed at read time, so editing {@link BUILTIN_TEST_PATTERNS} or
+ * {@link TEST_ACCOUNT_PREFIX_ENV} silently restates every previously published
+ * desk number (TRA-2553 measured the last such restatement at $0.00 — by luck,
+ * not by design). Two figures computed under different classifiers are not
+ * comparable, and before this identity existed nothing at the point of
+ * comparison said so. Publish this beside any class-partitioned figure; stamp
+ * `hash` on any record that freezes a class at decision time.
+ *
+ * {@link KNOWN_DESK_BOOKS} is deliberately EXCLUDED: it feeds the
+ * `unrecognisedDeskBooks` observer only and moves no row between classes, so
+ * folding it in would make the hash restate a change that restates nothing.
+ */
+export interface TestAccountClassifierIdentity {
+  /**
+   * FNV-1a 32-bit hex over the canonical serialization of the fields below.
+   * Two payloads whose class partitions were computed under different pattern
+   * sets carry different hashes — that is the entire contract. Not a security
+   * hash; a version tag that nobody has to remember to bump.
+   */
+  hash: string;
+  /** Source text of every builtin pattern, in match order (`/^qa/i`, …). */
+  builtinPatterns: string[];
+  /**
+   * The {@link TEST_ACCOUNT_PREFIX_ENV} prefixes in effect, normalized the same
+   * way the predicate consumes them (trimmed, lowercased, de-blanked), then
+   * sorted + deduped: reordering a comma list that classifies identically is
+   * NOT a classifier change and must not read as one.
+   */
+  extraPrefixes: string[];
+  emailSuffix: string;
+}
+
+/** FNV-1a 32-bit, hex-padded. Pure — this module must stay import-free. */
+function fnv1a32(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/** TRA-2948 — see {@link TestAccountClassifierIdentity}. */
+export function testAccountClassifierIdentity(
+  env: NodeJS.ProcessEnv = process.env,
+): TestAccountClassifierIdentity {
+  const builtinPatterns = BUILTIN_TEST_PATTERNS.map((re) => String(re));
+  const prefixes = [...new Set(extraPrefixes(env))].sort();
+  // NUL as the element separator, double-NUL between fields: neither can occur
+  // in a regex source read from this file or in a trimmed env prefix, so no two
+  // distinct input sets can serialize to one string.
+  const canonical = [
+    builtinPatterns.join('\u0000'),
+    prefixes.join('\u0000'),
+    TEST_ACCOUNT_EMAIL_SUFFIX,
+  ].join('\u0000\u0000');
+  return {
+    hash: fnv1a32(canonical),
+    builtinPatterns,
+    extraPrefixes: prefixes,
+    emailSuffix: TEST_ACCOUNT_EMAIL_SUFFIX,
+  };
+}
+
 /** Parse the env prefix list into a lowercased, de-blanked array. */
 function extraPrefixes(env: NodeJS.ProcessEnv): string[] {
   const raw = env[TEST_ACCOUNT_PREFIX_ENV];
