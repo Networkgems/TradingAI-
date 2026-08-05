@@ -3115,6 +3115,17 @@ export class PaperOptionsAccount {
         if (opt.staleMarkTicks < STALE_MARK_BACKSTOP_TICKS) continue;
         const currentUnderlying = underlyingPrices.get(opt.symbol);
         if (currentUnderlying == null) continue;
+        // TRA-2893 — the extrapolation is a DELTA off the entry spot, so it is
+        // only meaningful when `underlyingEntryPrice` is a real price. Rows that
+        // never got one (imports; the `spot > 0 ? spot : 0` fallbacks on the OTM
+        // and RV open paths) make `underlyingMove` the WHOLE spot price: a put
+        // fabricates `max(0.01, premium − ~350)` = 0.01, below every stop, so the
+        // very first dark quote books an instant hard SL; a call fabricates a mark
+        // hundreds of dollars above the real one, which poisons the monotonic
+        // `peakPremium` and arms the trail at a price that never existed. Fail
+        // closed — with no anchor there is no honest mark, so leave the row
+        // unmanaged this tick rather than exit it on a fabricated one.
+        if (!Number.isFinite(opt.underlyingEntryPrice) || opt.underlyingEntryPrice <= 0) continue;
         const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
         const deltaMag =
           opt.entryDelta != null && Number.isFinite(opt.entryDelta) && opt.entryDelta !== 0
@@ -3125,6 +3136,11 @@ export class PaperOptionsAccount {
       } else {
         const currentUnderlying = underlyingPrices.get(opt.symbol);
         if (currentUnderlying == null) continue;
+        // TRA-2893 — same fail-closed guard as the OTM/RV backstop above, and this
+        // is the branch `tradier_import` rows actually land in. Note they get NO
+        // `staleMarkTicks` tolerance here, so without the guard the FIRST missed
+        // mark is enough to fabricate one.
+        if (!Number.isFinite(opt.underlyingEntryPrice) || opt.underlyingEntryPrice <= 0) continue;
         const underlyingMove = currentUnderlying - opt.underlyingEntryPrice;
         const premiumMove = underlyingMove * ATM_DELTA * (opt.optionType === 'call' ? 1 : -1);
         mark = Math.max(0.01, opt.premiumPaid + premiumMove);
@@ -3173,7 +3189,42 @@ export class PaperOptionsAccount {
         chandelierUnderlying = underlyingPrices.get(opt.symbol);
         if (chandelierUnderlying != null && uatr !== undefined && uatr > 0) {
           chandelierUSide = opt.optionType === 'call' ? 'buy' : 'sell';
-          if (opt.peakUnderlying === undefined) opt.peakUnderlying = opt.underlyingEntryPrice;
+          // TRA-2893 — the anchor must be a REAL spot price. `underlyingEntryPrice`
+          // is hardcoded `0` on every `tradier_import` row (`reconcileTradierPositions`
+          // has no spot to seed it from) and the OTM/RV open paths fall back to `0`
+          // when the scanner's spot is missing, so a `0` anchor is a routine state,
+          // not a corrupt one.
+          //
+          // Seeding `peakUnderlying` from a `0` anchor is FAIL-OPEN on puts and only
+          // on puts: the favorable direction is a new LOW, so `min(0, spot)` stays 0
+          // forever — spot is never negative, the seed never washes out — the stop
+          // collapses to `mult × ATR` (single digits), and `chandelierExitTriggered`
+          // for a short side is `spot >= stop`, i.e. `700 >= 18`, ALWAYS TRUE. Every
+          // imported put is then force-exited on the first tick that is not
+          // suppressed, journalled as `chandelier` and so indistinguishable in the
+          // books from a legitimate trail exit. (Calls escape by luck: `max(0, spot)`
+          // is `spot`, which is the very fallback installed below.)
+          //
+          // With no honest entry anchor the best available one is the CURRENT spot —
+          // i.e. treat this tick as the start of the trail. That is what the call
+          // side already got implicitly, it cannot trigger on the seeding tick for
+          // either side (`spot >= spot + mult×ATR` and `spot <= spot − mult×ATR` are
+          // both false for `uatr > 0`, asserted above), and it is strictly tighter
+          // than dropping the trail altogether. It is deliberately NOT written back
+          // to `underlyingEntryPrice`, which means "spot at entry" and is consumed by
+          // the stale-mark delta extrapolation below on a different contract.
+          const anchorable = (v: number | undefined): v is number =>
+            v !== undefined && Number.isFinite(v) && v > 0;
+          if (!anchorable(opt.peakUnderlying)) {
+            // A row that already ticked on a build without this guard has `0`
+            // PERSISTED, and `chandelierStop` ratchets monotonically (`min` for a
+            // short), so repairing the anchor alone would still be capped by the
+            // collapsed stop carried in `prevTrailStop`. Drop both together.
+            opt.peakUnderlying = anchorable(opt.underlyingEntryPrice)
+              ? opt.underlyingEntryPrice
+              : chandelierUnderlying;
+            delete opt.chandelierStop;
+          }
           opt.peakUnderlying = chandelierUSide === 'buy'
             ? Math.max(opt.peakUnderlying, chandelierUnderlying)
             : Math.min(opt.peakUnderlying, chandelierUnderlying);

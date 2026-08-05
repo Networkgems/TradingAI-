@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PaperOptionsAccount } from './options-account.js';
 import type { OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
+// TRA-2893 — the chandelier primitives, so the pre-fix expression can be
+// replayed against the SAME code the account calls (not a re-implementation).
+import { chandelierStop, chandelierExitTriggered } from '@trading-app/engine';
 
 // Inside an ET trading window: 10:00 AM ET = 14:00 UTC during EDT (UTC-4).
 // Pin to a Tuesday so the weekday/window predicate passes.
@@ -3487,5 +3490,169 @@ describe('PaperOptionsAccount.closeBrokerFlatPosition (TRA-2799)', () => {
 
     expect(acct.closeBrokerFlatPosition(row.id, 'broker is flat')).toBeNull();
     expect(acct.getState().openOptions).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-2893 — imported PUTs were eligible for an UNCONDITIONAL chandelier exit.
+//
+// `reconcileTradierPositions` hardcodes `underlyingEntryPrice: 0` (it has no
+// spot to seed from), the chandelier seeded `peakUnderlying` off that, and for a
+// PUT the favorable direction is a new LOW — so `min(0, spot)` stays 0 forever,
+// the stop collapses to `mult × ATR`, and the short-side trigger `spot >= stop`
+// is always true. Every imported put was force-closed on the first unsuppressed
+// tick of its second session, journalled as `chandelier` and so indistinguishable
+// from a legitimate trail exit.
+//
+// Demo mode throughout: the TRA-483 PDT hold is live-only and would mask the
+// defect for exactly one session, which is what hid it. The anchor arithmetic is
+// mode-independent.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-2893 — chandelier anchor on imported positions', () => {
+  const QQQ_PUT: TradierOpenOptionPosition = {
+    optionSymbol: 'QQQ260807P00700000',
+    underlying: 'QQQ',
+    optionType: 'put',
+    strike: 700,
+    expiration: '2026-08-07',
+    contracts: 1,
+    premiumPaid: 1.45,
+    acquiredAt: TRADING_TIME,
+  };
+  // ATR 6 on a ~$700 underlying ⇒ trail width 3 × 6 = 18 (base multiplier; the
+  // TRA-1268 tests above pin the same 3× on ATR 4 ⇒ 12).
+  const RISK = { underlyingAtrBySymbol: new Map([['QQQ', 6]]) };
+  const SPOT = 700;
+  // TRA-361 — an imported row is only managed under wait-and-hold broker
+  // mirroring (`checkExits` short-circuits it otherwise), which is exactly the
+  // posture prod runs. Without this the suite would grade a path that never
+  // reaches the chandelier and pass for the wrong reason.
+  const HOLD = { waitAndHold: true };
+  // Mark pinned AT the entry premium so the premium-space hard SL and the
+  // trailing activation both stay dormant and the chandelier is the only rule
+  // under test. (A mark below `stopLossPremium` fires the SL first and the
+  // suite would pass on the wrong exit.)
+  const MARK = 1.45;
+
+  function importPut(overrides: Partial<TradierOpenOptionPosition> = {}) {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([{ ...QQQ_PUT, ...overrides }], 'demo');
+    const row = acct.getState().openOptions[0];
+    // The precondition the whole defect rests on — assert it rather than assume
+    // it, so this suite fails loudly if the import path ever starts seeding one.
+    expect(row.underlyingEntryPrice).toBe(0);
+    expect(row.signalType).toBe('tradier_import');
+    return { acct, sym: row.optionSymbol!, row };
+  }
+
+  // NEGATIVE CONTROL for the fix — replays the PRE-FIX expression against the
+  // engine primitives directly. This must stay RED-shaped (trigger === true)
+  // forever: it is the statement of what the guard prevents, not of current
+  // behaviour. If this ever goes false the defect moved, it did not go away.
+  it('pre-fix expression: a 0 anchor makes the put trigger unconditionally', () => {
+    const oldPeak = Math.min(0, SPOT); // `min(underlyingEntryPrice=0, spot)`
+    expect(oldPeak).toBe(0);
+    const stop = chandelierStop({
+      side: 'sell',
+      initialStop: Number.POSITIVE_INFINITY,
+      extremeSinceEntry: oldPeak,
+      atr: 6,
+    });
+    expect(stop).toBeCloseTo(18, 6); // 0 + 3×6 — single digits under a $700 spot
+    expect(chandelierExitTriggered('sell', SPOT, stop)).toBe(true);
+    // …and it stays true at every plausible spot, which is why no market path
+    // could have saved the position.
+    for (const s of [1, 19, 100, 700, 5000]) {
+      expect(chandelierExitTriggered('sell', s, stop)).toBe(s >= 18);
+    }
+  });
+
+  it('anchors an imported put at the current spot and does NOT exit it', () => {
+    const { acct, sym } = importPut();
+    const staged = acct.checkExits(
+      new Map([['QQQ', SPOT]]), new Map([[sym, 1.45]]), 'demo', HOLD, undefined, RISK,
+    );
+    expect(staged).toHaveLength(0);
+    const open = acct.getState().openOptions[0];
+    expect(open.pendingExit).toBeUndefined();
+    expect(open.peakUnderlying).toBe(SPOT);
+    expect(open.chandelierStop).toBeCloseTo(SPOT + 18, 6); // 718, far above spot
+    // The seeding tick can never trigger for either side: `spot >= spot + w`
+    // and `spot <= spot − w` are both false for a positive trail width.
+    expect(chandelierExitTriggered('sell', SPOT, open.chandelierStop!)).toBe(false);
+  });
+
+  it('repairs a row that already persisted the 0 anchor AND its collapsed stop', () => {
+    const { acct, sym } = importPut();
+    // What a boot on the unfixed build leaves behind. `chandelierStop` ratchets
+    // monotonically (min, for a short), so repairing the anchor alone would still
+    // be capped by 18 through `prevTrailStop` and the row would exit anyway.
+    const row = acct.getState().openOptions[0];
+    row.peakUnderlying = 0;
+    row.chandelierStop = 18;
+
+    const staged = acct.checkExits(
+      new Map([['QQQ', SPOT]]), new Map([[sym, 1.45]]), 'demo', HOLD, undefined, RISK,
+    );
+    expect(staged).toHaveLength(0);
+    const open = acct.getState().openOptions[0];
+    expect(open.pendingExit).toBeUndefined();
+    expect(open.peakUnderlying).toBe(SPOT);
+    expect(open.chandelierStop).toBeCloseTo(SPOT + 18, 6);
+  });
+
+  // POSITIVE CONTROL — the fix must not be "the imported put has no trail". A
+  // genuine rebound through the trail still exits, and still books as a trail.
+  it('still exits an imported put on a REAL trail break', () => {
+    const { acct, sym } = importPut();
+    const marks = new Map([[sym, 1.45]]);
+
+    // Thesis works: spot falls 700 → 690. Trough 690 ⇒ stop 708.
+    expect(acct.checkExits(new Map([['QQQ', 700]]), marks, 'demo', HOLD, undefined, RISK)).toHaveLength(0);
+    expect(acct.checkExits(new Map([['QQQ', 690]]), marks, 'demo', HOLD, undefined, RISK)).toHaveLength(0);
+    expect(acct.getState().openOptions[0].chandelierStop).toBeCloseTo(708, 6);
+
+    // Rebound to 709 ≥ 708 ⇒ the trail breaks and the exit is STAGED (under
+    // wait-and-hold the row stays open until the broker fill finalises it).
+    const staged = acct.checkExits(new Map([['QQQ', 709]]), marks, 'demo', HOLD, undefined, RISK);
+    expect(staged).toHaveLength(1);
+    expect(staged[0].pendingExit?.kind).toBe('trail');
+    expect(staged[0].currentPremium).toBeCloseTo(1.45, 6);
+  });
+
+  it('leaves the imported CALL path behaving as before (anchor = first spot)', () => {
+    const { acct, sym } = importPut({
+      optionSymbol: 'QQQ260807C00700000', optionType: 'call',
+    });
+    const marks = new Map([[sym, 1.45]]);
+    expect(acct.checkExits(new Map([['QQQ', 700]]), marks, 'demo', HOLD, undefined, RISK)).toHaveLength(0);
+    const open = acct.getState().openOptions[0];
+    expect(open.peakUnderlying).toBe(700);
+    expect(open.chandelierStop).toBeCloseTo(682, 6); // 700 − 18
+    // And it still exits on a real break, unchanged.
+    expect(
+      acct.checkExits(new Map([['QQQ', 681]]), marks, 'demo', HOLD, undefined, RISK),
+    ).toHaveLength(1);
+  });
+
+  // The second, lower-severity consequence of the same unseeded field: with no
+  // live mark, the delta extrapolation treats the WHOLE spot as the move.
+  it('refuses to fabricate a mark for an imported row with no anchor', () => {
+    const { acct, sym, row } = importPut();
+    expect(row.stopLossPremium).toBeGreaterThan(0.01); // auto-managed ⇒ a real SL
+
+    // Pre-fix arithmetic, stated so the RED is auditable:
+    //   mark = max(0.01, 1.45 + (700 − 0) × ATM_DELTA × −1) = 0.01
+    // …which is below the SL, so the first dark quote booked an instant hard SL.
+    const fabricated = Math.max(0.01, row.premiumPaid + (SPOT - 0) * 0.5 * -1);
+    expect(fabricated).toBe(0.01);
+    expect(fabricated).toBeLessThan(row.stopLossPremium);
+
+    // No mark supplied for `sym` ⇒ the row is skipped, not exited.
+    const staged = acct.checkExits(new Map([['QQQ', SPOT]]), new Map(), 'demo', HOLD, undefined, RISK);
+    expect(staged).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+    expect(acct.getState().openOptions[0].pendingExit).toBeUndefined();
+    expect(acct.getState().openOptions[0].currentPremium).toBeCloseTo(1.45, 6);
   });
 });
