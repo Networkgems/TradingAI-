@@ -142,7 +142,12 @@
  * Auth: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, PAPERCLIP_COMPANY_ID.
  */
 
-import { enumerateIssues } from './lib/paperclip-enumeration.mjs';
+import { enumerateIssues, enumerateRoutines } from './lib/paperclip-enumeration.mjs';
+
+// Re-exported for the controls that already import it from here. The body moved
+// to the library on TRA-2331 so `check-routine-dispatch.mjs` could reuse it
+// without importing this file (which calls `main()` at module scope).
+export { enumerateRoutines };
 
 const argv = process.argv.slice(2);
 const argOf = (name, fallback) => {
@@ -408,50 +413,9 @@ export function classifyIssue({ issue, item, interactions, index, nowMs }) {
  * Enumeration of the routine population
  * ------------------------------------------------------------------ */
 
-/** Counts that are indistinguishable from a silent server-side cap. */
-const ROUND_CAPS = new Set([25, 50, 100, 200, 250, 500, 1000, 2000]);
-
-/**
- * The routines route ignores `limit` AND `offset` (trap 4), so it cannot be
- * paged and exhaustiveness cannot be proved the way the issue list proves it.
- * What we CAN do is refuse the two readings that would be indistinguishable
- * from a truncated one:
- *
- *   - an EMPTY list. A company with no routines and a route that returned
- *     nothing render identically, and the empty reading turns every leaf on the
- *     board into a finding.
- *   - a count that is exactly a round cap. 143 is not a cap; 250 is.
- *
- * and one positive check: read it twice at DIFFERENT limits. If the smaller
- * read comes back shorter, the route honours `limit` after all — in which case
- * the larger read may itself have been truncated by the server and we say so
- * rather than guessing.
- */
-export async function enumerateRoutines(getRoutines, { limit = ROUTINE_LIMIT } = {}) {
-  const big = await getRoutines({ limit, offset: 0 });
-  if (!Array.isArray(big)) return { routines: [], blind: 'routines route returned a non-array' };
-  if (big.length === 0) {
-    return { routines: [], blind: 'routines route returned 0 rows — a company with no routines and an unread route are the same reading, and the empty one flags every leaf' };
-  }
-  if (ROUND_CAPS.has(big.length)) {
-    return { routines: [], blind: `routines route returned exactly ${big.length} rows — indistinguishable from a silent cap at ${big.length}` };
-  }
-
-  const probeLimit = Math.max(1, Math.floor(big.length / 2));
-  const small = await getRoutines({ limit: probeLimit, offset: 0 });
-  if (!Array.isArray(small)) return { routines: [], blind: 'routines route returned a non-array on the limit probe' };
-  if (small.length < big.length) {
-    return {
-      routines: [],
-      blind:
-        `routines route HONOURS limit (limit=${probeLimit} returned ${small.length} of ${big.length}) — it did not on ` +
-        `2026-07-26, so paging semantics have changed and the limit=${limit} read may itself be truncated. ` +
-        'Re-derive the enumeration before trusting a count.',
-    };
-  }
-
-  return { routines: big, blind: null, probe: { limit, probeLimit, big: big.length, small: small.length } };
-}
+/* `enumerateRoutines` (and its ROUND_CAPS guard) now live in
+ * `./lib/paperclip-enumeration.mjs` — see the import + re-export at the top of
+ * this file. The trap-4 commentary it carried is reproduced verbatim there. */
 
 /* ------------------------------------------------------------------ *
  * The sweep — transport injected so the controls drive the WHOLE pipeline

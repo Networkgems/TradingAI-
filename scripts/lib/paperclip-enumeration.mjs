@@ -68,3 +68,57 @@ export async function enumerateIssues(getIssuesPage, { limit = 1000, maxPages = 
     blind: `page cap (${maxPages}) reached with full pages still returning; enumeration is truncated`,
   };
 }
+
+/* ------------------------------------------------------------------ *
+ * Routines
+ *
+ * Moved here from `check-phantom-rest.mjs` (TRA-2422) when a THIRD detector
+ * (`check-routine-dispatch.mjs`, TRA-2331) needed the same guard. It has to
+ * live in the library for the reason at the top of this file: importing the
+ * detector would run its `main()` and `process.exit()` the importer.
+ * ------------------------------------------------------------------ */
+
+/** Counts that are indistinguishable from a silent server-side cap. */
+export const ROUND_CAPS = new Set([25, 50, 100, 200, 250, 500, 1000, 2000]);
+
+/**
+ * The routines route ignores `limit` AND `offset` (measured 2026-07-26), so it
+ * cannot be paged and exhaustiveness cannot be proved the way the issue list
+ * proves it. What we CAN do is refuse the two readings that would be
+ * indistinguishable from a truncated one:
+ *
+ *   - an EMPTY list. A company with no routines and a route that returned
+ *     nothing render identically, and the empty reading turns every leaf on the
+ *     board into a finding.
+ *   - a count that is exactly a round cap. 143 is not a cap; 250 is.
+ *
+ * and one positive check: read it twice at DIFFERENT limits. If the smaller
+ * read comes back shorter, the route honours `limit` after all — in which case
+ * the larger read may itself have been truncated by the server and we say so
+ * rather than guessing.
+ */
+export async function enumerateRoutines(getRoutines, { limit = 500 } = {}) {
+  const big = await getRoutines({ limit, offset: 0 });
+  if (!Array.isArray(big)) return { routines: [], blind: 'routines route returned a non-array' };
+  if (big.length === 0) {
+    return { routines: [], blind: 'routines route returned 0 rows — a company with no routines and an unread route are the same reading, and the empty one flags every leaf' };
+  }
+  if (ROUND_CAPS.has(big.length)) {
+    return { routines: [], blind: `routines route returned exactly ${big.length} rows — indistinguishable from a silent cap at ${big.length}` };
+  }
+
+  const probeLimit = Math.max(1, Math.floor(big.length / 2));
+  const small = await getRoutines({ limit: probeLimit, offset: 0 });
+  if (!Array.isArray(small)) return { routines: [], blind: 'routines route returned a non-array on the limit probe' };
+  if (small.length < big.length) {
+    return {
+      routines: [],
+      blind:
+        `routines route HONOURS limit (limit=${probeLimit} returned ${small.length} of ${big.length}) — it did not on ` +
+        `2026-07-26, so paging semantics have changed and the limit=${limit} read may itself be truncated. ` +
+        'Re-derive the enumeration before trusting a count.',
+    };
+  }
+
+  return { routines: big, blind: null, probe: { limit, probeLimit, big: big.length, small: small.length } };
+}
