@@ -7873,7 +7873,11 @@ export class SignalEngine {
    * slippage-vs-ask/mid); null when unavailable ⇒ those legs stay null (never 0).
    */
   private recordLiveOptionCloseToLedger(
-    position: import('@trading-app/shared').OptionPosition,
+    // TRA-2959 — structural subset of OptionPosition so the pending-close
+    // reconcile sweep (which only holds a row snapshot, not the position) can
+    // record its fills too. A caller with no signalType gets the ledger-open
+    // sleeve join or an honest 'unattributed', never a guessed sleeve.
+    position: { optionSymbol?: string; signalType?: string },
     qty: number,
     submittedLimit: number | null,
     filledPrice: number | null,
@@ -7895,7 +7899,11 @@ export class SignalEngine {
     // for the genuine RV path if it is ever re-armed.
     const sleeve: LiveFillSleeve =
       lastRecordedOpenSleeve(position.optionSymbol) ??
-      (position.signalType === 'otm_mispricing' ? 'single_leg_otm' : 'single_leg_directional');
+      (position.signalType === undefined
+        ? 'unattributed' // TRA-2959 — a row snapshot carries no signalType; don't guess
+        : position.signalType === 'otm_mispricing'
+          ? 'single_leg_otm'
+          : 'single_leg_directional');
     const ask =
       quote && typeof quote.ask === 'number' && Number.isFinite(quote.ask) ? quote.ask : null;
     const bid =
@@ -13465,6 +13473,23 @@ export class SignalEngine {
               const closed = acct.recordImportedFill(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
+                // TRA-2959 — this sweep is a REAL live close fill like any other:
+                // on 2026-08-04, 7 of 11 filled orders reached the book through
+                // here (and the sites below) with NO fee/slippage ledger row and
+                // appendErrors 0 — the writer was never called, so the counter
+                // had nothing to count. No submit-time quote survives to this
+                // sweep, so slippage stays null (a named exclusion); fees are
+                // measured by the gainloss back-fill.
+                if (env === 'production') {
+                  this.recordLiveOptionCloseToLedger(
+                    { optionSymbol: row.optionSymbol },
+                    row.contractsRemaining,
+                    null,
+                    outcome.avgFillPrice,
+                    typeof row.pendingCloseOrderId === 'number' ? row.pendingCloseOrderId : null,
+                    null,
+                  );
+                }
                 log.info('sell_to_close imported order filled', {
                   component: 'tradier-reconcile',
                   optionSymbol: row.optionSymbol,
@@ -13477,6 +13502,18 @@ export class SignalEngine {
               const closed = acct.closeOption(row.optionId, outcome.avgFillPrice);
               if (closed) {
                 filled += 1;
+                // TRA-2959 — see the imported branch above: a sweep fill is a
+                // real live close and must reach the fee/slippage ledger.
+                if (env === 'production') {
+                  this.recordLiveOptionCloseToLedger(
+                    { optionSymbol: row.optionSymbol },
+                    row.contractsRemaining,
+                    null,
+                    outcome.avgFillPrice,
+                    typeof row.pendingCloseOrderId === 'number' ? row.pendingCloseOrderId : null,
+                    null,
+                  );
+                }
                 log.info('sell_to_close engine order filled', {
                   component: 'tradier-reconcile',
                   optionSymbol: row.optionSymbol,
@@ -13510,6 +13547,17 @@ export class SignalEngine {
               stillPending += 1;
             } else {
               filled += 1;
+              // TRA-2959 — the booked partial slice is a real live close fill.
+              if (env === 'production') {
+                this.recordLiveOptionCloseToLedger(
+                  { optionSymbol: row.optionSymbol },
+                  outcome.filledQty,
+                  null,
+                  outcome.avgFillPrice,
+                  typeof row.pendingCloseOrderId === 'number' ? row.pendingCloseOrderId : null,
+                  null,
+                );
+              }
               const remainder = booked.contractsRemaining;
               log.info('sell_to_close partial-fill booked', {
                 component: 'tradier-reconcile',
@@ -13565,6 +13613,19 @@ export class SignalEngine {
                     : acct.closeOption(row.optionId, resub.avgFillPrice);
                   if (closed) {
                     filled += 1;
+                    // TRA-2959 — the remainder resubmit's fill is a real live
+                    // close; it carries its submit limit but no bid/ask
+                    // snapshot, so slippage stays a named-unmeasured leg.
+                    if (env === 'production') {
+                      this.recordLiveOptionCloseToLedger(
+                        { optionSymbol: row.optionSymbol },
+                        remainder,
+                        resub.limitPrice,
+                        resub.avgFillPrice,
+                        resub.orderId,
+                        null,
+                      );
+                    }
                     if (!row.importedFromTradier) {
                       this.tracker?.saveEquity(
                         this.account.getState().totalEquity,

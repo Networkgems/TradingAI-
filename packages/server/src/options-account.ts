@@ -648,7 +648,10 @@ export function summarizeLiveUnmanagedRisk(
 
 function applyEngineOriginRiskThresholds(
   opt: OptionPosition,
-  sleeve: LiveFillSleeve,
+  // TRA-2959 — 'unattributed' (a history-imported open with no engine
+  // provenance) is excluded at the type: it has no originating sleeve schedule
+  // to restore, so callers route it to the IMPORT schedule instead.
+  sleeve: Exclude<LiveFillSleeve, 'unattributed'>,
   otmRiskParams: OtmRiskParams,
   rvRiskParams: RvRiskParams,
 ): void {
@@ -5040,7 +5043,9 @@ export class PaperOptionsAccount {
   private installReconcileRiskThresholds(opt: OptionPosition, mode: AccountMode): void {
     if (mode === 'live' && opt.optionSymbol) {
       const sleeve = this.resolveLiveOpenSleeve(opt.optionSymbol);
-      if (sleeve) {
+      // TRA-2959 — an 'unattributed' ledger open (history-imported, no engine
+      // provenance) is not evidence of an engine origin; take the import path.
+      if (sleeve && sleeve !== 'unattributed') {
         applyEngineOriginRiskThresholds(opt, sleeve, this.otmRiskParams, this.rvRiskParams);
         accountLog.info('reconcile adopted an ENGINE-OPENED live option as an import', {
           issue: 'TRA-2820',

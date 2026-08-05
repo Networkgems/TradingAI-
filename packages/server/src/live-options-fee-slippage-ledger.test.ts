@@ -13,6 +13,7 @@ import {
   backfillLiveOptionFees,
   backfillLiveOptionFeesFromGainLoss,
   lastRecordedOpenSleeve,
+  diffMissingFillsFromHistory,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
@@ -175,6 +176,7 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       submittedLimit: 0.82, askAtSubmit: 0.82, midAtSubmit: 0.80, filledPrice: 0.83,
       fees: null, feeSource: null, slippageVsAsk: 0.01, slippageVsMid: 0.03,
       orderId: null, // composite-path tests; orderId path tested separately below
+      origin: 'fill',
       ...over,
     };
   }
@@ -532,5 +534,84 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
       if (prev === undefined) delete process.env.DATA_DIR;
       else process.env.DATA_DIR = prev;
     }
+  });
+});
+
+// ── TRA-2959: coverage diff against broker history ───────────────────────────
+
+describe('diffMissingFillsFromHistory (TRA-2959)', () => {
+  function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
+    return {
+      mode: 'live', ts: 1000, etDay: '2026-08-04', sleeve: 'single_leg_otm',
+      optionSymbol: 'TSLA260911C00560000', side: 'buy_to_open', contracts: 4,
+      submittedLimit: 0.27, askAtSubmit: 0.27, midAtSubmit: 0.25, filledPrice: 0.27,
+      fees: null, feeSource: null, slippageVsAsk: 0, slippageVsMid: 0.02,
+      orderId: null, origin: 'fill',
+      ...over,
+    };
+  }
+  function hist(over: Partial<TradierTradeHistoryFill>): TradierTradeHistoryFill {
+    return {
+      date: '2026-08-04', symbol: 'TSLA260911C00560000', tradeType: 'option',
+      description: 'CALL TSLA   09/11/26   560', price: 0.27, quantity: 4,
+      amount: -108, commission: 0, transactionId: 't1', orderId: null,
+      ...over,
+    };
+  }
+
+  it('a partial shortfall imports only the uncovered contracts, from the LAST executions', () => {
+    // Broker: two executions 3 + 2 = 5 contracts sold. Ledger recorded only 3.
+    const { inputs, coverage } = diffMissingFillsFromHistory(
+      [rec({ side: 'sell_to_close', contracts: 3, etDay: '2026-08-04' })],
+      [
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 80, quantity: 3, price: 0.26, transactionId: 'a' }),
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 55, quantity: 2, price: 0.28, transactionId: 'b' }),
+      ],
+      '2026-08-05',
+    );
+    expect(coverage.brokerContracts).toBe(5);
+    expect(coverage.ledgerContracts).toBe(3);
+    expect(coverage.missingContracts).toBe(2);
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.contracts).toBe(2);
+    expect(inputs[0]!.filledPrice).toBeCloseTo(0.28, 6); // the later execution
+    expect(inputs[0]!.origin).toBe('history_import');
+  });
+
+  it('skips equity rows, unclassifiable sides, and ledger-only groups (pre-migration rows are not a gap)', () => {
+    const { inputs, coverage } = diffMissingFillsFromHistory(
+      // A pre-migration ledger row history knows nothing about: NOT a coverage gap.
+      [rec({ optionSymbol: 'ORCL260821P00100000', side: 'sell_to_close', etDay: '2026-07-16' })],
+      [
+        hist({ tradeType: 'equity', symbol: 'TSLA' }),
+        hist({ amount: 0, description: 'CALL TSLA   09/11/26   560' }), // side unclassifiable
+      ],
+      '2026-08-05',
+    );
+    expect(coverage.brokerContracts).toBe(0);
+    expect(coverage.missingContracts).toBe(0);
+    expect(inputs).toHaveLength(0);
+  });
+
+  it('publishes the slippage denominator: nMeasured + excludedNoAskQuote === nTotal', () => {
+    clearLiveOptionsFeeSlippageLedger();
+    recordLiveOptionFill({
+      ts: 1, etDay: '2026-08-04', sleeve: 'single_leg_otm',
+      optionSymbol: 'TSLA260911C00560000', side: 'buy_to_open', contracts: 4,
+      submittedLimit: 0.27, askAtSubmit: 0.27, midAtSubmit: 0.25, filledPrice: 0.27,
+      fees: null, orderId: null,
+    });
+    recordLiveOptionFill({
+      // a market exit: no submit-time quote — the structurally unmeasurable case
+      ts: 2, etDay: '2026-08-04', sleeve: 'single_leg_directional',
+      optionSymbol: 'SPY260807P00760000', side: 'sell_to_close', contracts: 4,
+      submittedLimit: null, askAtSubmit: null, midAtSubmit: null, filledPrice: 0.4575,
+      fees: null, orderId: null,
+    });
+    const s = summarizeLiveOptionsFeeSlippage();
+    expect(s.slippage.nTotal).toBe(2);
+    expect(s.slippage.nMeasured).toBe(1);
+    expect(s.slippage.excludedNoAskQuote).toBe(1);
+    expect(s.slippage.nMeasured + s.slippage.excludedNoAskQuote).toBe(s.slippage.nTotal);
   });
 });

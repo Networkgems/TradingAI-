@@ -49,8 +49,11 @@ import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/e
 import {
   backfillLiveOptionFees,
   backfillLiveOptionFeesFromGainLoss,
+  importMissingLiveOptionFills,
   summarizeLiveOptionsFeeSlippage,
   historyFillSide,
+  type LedgerCoverageResult,
+  type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import { etDateString } from './scheduler.js';
 import { logger } from './observability/index.js';
@@ -63,6 +66,22 @@ const log = logger.child({ module: 'live-options-fee-reconcile' });
  * indistinguishable from a healthy quiet one unless it says so itself.
  */
 export const STALLED_AFTER_NO_MATCH = 3;
+
+/**
+ * TRA-2959 — calendar days after which an unmeasured row stops counting as
+ * ACTIONABLE (and stops feeding the `stalled` alarm). Rationale: a fee becomes
+ * derivable when its lot settles into `/gainloss` — T+1 settlement plus
+ * Tradier's reporting lag, observed at 2–4 calendar days on the live account.
+ * 7 days is comfortably past that: a row still unmeasured after 7 days is not
+ * "pending settlement", it is UNMEASURABLE from this account (the concrete
+ * population: fills predating the TRA-2847 account migration, whose lots live
+ * on the OLD account and can never appear in this one's gainloss). Those rows
+ * are reported as `unmeasuredAged` — a named exclusion with a count — instead
+ * of holding `stalled: true` forever and training readers to ignore it.
+ * The alarm still has teeth: a real join defect keeps its rows inside the
+ * 7-day window for 7 days of hourly ticks, far past STALLED_AFTER_NO_MATCH.
+ */
+export const FEE_MEASURABLE_HORIZON_DAYS = 7;
 
 /** The slice of the Tradier options client this pass needs (injectable in tests). */
 export interface FeeReconcileHistoryClient {
@@ -85,9 +104,15 @@ export interface FeeReconcileHistoryClient {
  * - 'no-unmeasured' — every retained row already has a measured fee (or the
  *   ledger is empty). The quiescent/healthy end state; NO broker call was made.
  * - 'backfilled'    — data fetched, ≥1 row went `fees: null` → measured.
- * - 'no-match'      — data fetched but no unmeasured row joined. Rows stay
- *   `null` (never 0, TRA-1707); the lot may simply not have settled yet.
- *   Consecutive no-matches ≥ STALLED_AFTER_NO_MATCH flip `stalled: true`.
+ * - 'no-match'      — data fetched but no unmeasured ACTIONABLE row joined.
+ *   Rows stay `null` (never 0, TRA-1707); the lot may simply not have settled
+ *   yet. Consecutive no-matches ≥ STALLED_AFTER_NO_MATCH flip `stalled: true`.
+ * - 'no-actionable' — TRA-2959: data fetched, nothing joined, and every
+ *   unmeasured row is either past FEE_MEASURABLE_HORIZON_DAYS (see
+ *   `unmeasuredAged` — e.g. pre-account-migration fills whose lots this
+ *   account will never report) or an open leg whose position has not closed
+ *   yet (`unmeasuredAwaitingClose` — no lot EXISTS to derive from). Not
+ *   evidence of a stall: does not feed `consecutiveNoMatch`.
  * - 'no-client'     — no production Tradier options credentials resolvable (or
  *   the client factory threw). Expected on boxes without live creds.
  * - 'fetch-failed'  — BOTH broker requests threw; see `lastError`. (A partial
@@ -97,6 +122,7 @@ export type LiveOptionsFeeReconcileOutcome =
   | 'no-unmeasured'
   | 'backfilled'
   | 'no-match'
+  | 'no-actionable'
   | 'no-client'
   | 'fetch-failed';
 
@@ -157,6 +183,33 @@ export interface LiveOptionsFeeReconcileState {
    * measurement — 14 "joinable" fills that were nothing of the kind.
    */
   lastJoinableCount: number | null;
+  /**
+   * TRA-2959 — the unmeasured set, PARTITIONED so a reader can tell "work in
+   * flight" from "permanently unmeasurable" from "no lot exists yet":
+   * - actionable: closes (or opens of closed positions) within
+   *   FEE_MEASURABLE_HORIZON_DAYS — these SHOULD measure; only they feed
+   *   `consecutiveNoMatch`/`stalled`.
+   * - awaitingClose: open legs whose position has no recorded close — no
+   *   settled lot can exist for them yet, whatever their age.
+   * - aged: past the horizon — named unmeasurable exclusion (the concrete
+   *   population: fills predating the account migration).
+   */
+  unmeasuredTotal: number;
+  unmeasuredActionable: number;
+  unmeasuredAwaitingClose: number;
+  unmeasuredAged: number;
+  /**
+   * TRA-2959 — fill-coverage cross-check against broker account-history, the
+   * independent denominator `durability.appendErrors` structurally lacks (a
+   * counter inside the writer reads 0 when the writer is never CALLED — the
+   * 2026-08-04 silence: 4 of 11 filled orders in the ledger, appendErrors 0).
+   * `missingContracts > 0` means broker fills existed that NO code path
+   * recorded; the same pass appends them as `origin: 'history_import'` rows,
+   * so the gap both alarms and heals. Null until a history fetch has run.
+   */
+  coverage: LedgerCoverageResult | null;
+  /** Rows imported from history since boot (cumulative across passes). */
+  totalImportedRows: number;
 }
 
 let state: LiveOptionsFeeReconcileState = emptyState();
@@ -179,6 +232,12 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastError: null,
     lastHistorySample: null,
     lastJoinableCount: null,
+    unmeasuredTotal: 0,
+    unmeasuredActionable: 0,
+    unmeasuredAwaitingClose: 0,
+    unmeasuredAged: 0,
+    coverage: null,
+    totalImportedRows: 0,
   };
 }
 
@@ -193,18 +252,56 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
     ...state,
     lastWindow: state.lastWindow === null ? null : { ...state.lastWindow },
     lastHistorySample: state.lastHistorySample === null ? null : state.lastHistorySample.map((s) => ({ ...s })),
+    coverage: state.coverage === null ? null : { ...state.coverage },
   };
+}
+
+/**
+ * TRA-2959 — split the unmeasured rows into the three populations the state
+ * documents (see {@link LiveOptionsFeeReconcileState}). `records` is the FULL
+ * record set (measured rows included — an open leg's close may itself already
+ * be measured). Pure; ET-day strings compare lexicographically.
+ */
+export function partitionUnmeasured(
+  records: readonly LiveOptionFillRecord[],
+  cutoffDay: string,
+): { actionable: LiveOptionFillRecord[]; awaitingClose: LiveOptionFillRecord[]; aged: LiveOptionFillRecord[] } {
+  // Latest recorded close day per symbol — the settlement clock for an OPEN leg
+  // starts at its position's CLOSE, not at the open fill.
+  const lastCloseDay = new Map<string, string>();
+  for (const r of records) {
+    if (r.side !== 'sell_to_close') continue;
+    const prev = lastCloseDay.get(r.optionSymbol);
+    if (prev === undefined || r.etDay > prev) lastCloseDay.set(r.optionSymbol, r.etDay);
+  }
+  const actionable: LiveOptionFillRecord[] = [];
+  const awaitingClose: LiveOptionFillRecord[] = [];
+  const aged: LiveOptionFillRecord[] = [];
+  for (const r of records) {
+    if (r.fees !== null) continue;
+    let basisDay = r.etDay;
+    if (r.side === 'buy_to_open') {
+      const closeDay = lastCloseDay.get(r.optionSymbol);
+      if (closeDay === undefined || closeDay < r.etDay) {
+        awaitingClose.push(r); // position still open — no settled lot can exist
+        continue;
+      }
+      basisDay = closeDay > basisDay ? closeDay : basisDay;
+    }
+    (basisDay < cutoffDay ? aged : actionable).push(r);
+  }
+  return { actionable, awaitingClose, aged };
 }
 
 /**
  * Run one fee back-fill pass: if any retained ledger row is `fees: null`, fetch
  * Tradier account-history AND the settled gain/loss report over
- * [min unmeasured etDay, today ET], then back-fill via the commission join
- * (positive commissions only) and the gainloss derivation (TRA-2850). Both
- * writers rewrite the durable JSONL so the fees survive a redeploy.
- * `buildClient` is invoked ONLY when there is something to measure, so the
- * quiescent path costs no settings read and no broker call. Never throws — see
- * the file header.
+ * [min unmeasured etDay, today ET], then (TRA-2959) import any broker fill the
+ * ledger is missing, and back-fill via the commission join (positive
+ * commissions only) and the gainloss derivation (TRA-2850). All writers rewrite
+ * the durable JSONL so the rows survive a redeploy. `buildClient` is invoked
+ * ONLY when there is something to measure, so the quiescent path costs no
+ * settings read and no broker call. Never throws — see the file header.
  */
 export async function runLiveOptionsFeeReconcile(
   buildClient: () => Promise<FeeReconcileHistoryClient | null>,
@@ -213,8 +310,21 @@ export async function runLiveOptionsFeeReconcile(
   state.ticks += 1;
   state.lastTickAt = now;
 
-  const unmeasured = summarizeLiveOptionsFeeSlippage().records.filter((r) => r.fees === null);
-  if (unmeasured.length === 0) {
+  const cutoffDay = etDateString(new Date(now - FEE_MEASURABLE_HORIZON_DAYS * 86_400_000));
+  const allRecords = summarizeLiveOptionsFeeSlippage().records;
+  const unmeasured = allRecords.filter((r) => r.fees === null);
+  let partition = partitionUnmeasured(allRecords, cutoffDay);
+  state.unmeasuredTotal = unmeasured.length;
+  state.unmeasuredActionable = partition.actionable.length;
+  state.unmeasuredAwaitingClose = partition.awaitingClose.length;
+  state.unmeasuredAged = partition.aged.length;
+  // TRA-2959 — the coverage cross-check must run even when every ledger row is
+  // measured: the fill it exists to find is one the ledger does NOT contain, so
+  // "nothing unmeasured" is not evidence there is nothing to do. Quench only
+  // when there has ALSO been no ledger activity inside the horizon (a ledger
+  // quiet for a week has no same-week broker fills to cross-check).
+  const hasRecentActivity = allRecords.some((r) => r.etDay >= cutoffDay);
+  if (unmeasured.length === 0 && !hasRecentActivity) {
     state.lastOutcome = 'no-unmeasured';
     state.consecutiveNoMatch = 0;
     state.stalled = false;
@@ -244,8 +354,9 @@ export async function runLiveOptionsFeeReconcile(
   // can post later than the fill's own day, so the end is always "now", not the max
   // etDay. The ledger retains 30 days, which bounds the window. The same window
   // works for /gainloss (it filters on close date, and any lot covering an
-  // unmeasured row closes on or after that row's etDay).
-  let start = unmeasured[0]!.etDay;
+  // unmeasured row closes on or after that row's etDay). On a fully-measured
+  // ledger (coverage-only pass, TRA-2959) the window is the measurable horizon.
+  let start = unmeasured.length > 0 ? unmeasured[0]!.etDay : cutoffDay;
   for (const r of unmeasured) if (r.etDay < start) start = r.etDay;
   const today = etDateString(new Date(now));
   const end = today >= start ? today : start;
@@ -283,6 +394,13 @@ export async function runLiveOptionsFeeReconcile(
   let updated = 0;
   let gainLossUpdated = 0;
   if (historyFills !== null) {
+    // TRA-2959 — coverage cross-check FIRST, so a fill no chokepoint recorded
+    // becomes a ledger row before the fee joins run (a missing row otherwise
+    // breaks its whole symbol/day/side group's qty reconciliation in the
+    // gainloss join — one silent fill poisoned the group's fees too).
+    const coverage = importMissingLiveOptionFills(historyFills, today);
+    state.coverage = coverage;
+    state.totalImportedRows += coverage.importedRows;
     updated += backfillLiveOptionFees(historyFills).updated;
     state.lastHistoryFills = historyFills.length;
     // Mirror the join's ACTUAL eligibility (incl. commission > 0) — a diagnostic
@@ -313,8 +431,25 @@ export async function runLiveOptionsFeeReconcile(
   state.lastUpdated = updated;
   state.lastGainLossUpdated = lots !== null ? gainLossUpdated : null;
   state.totalUpdated += updated;
-  state.lastOutcome = updated > 0 ? 'backfilled' : 'no-match';
-  state.consecutiveNoMatch = updated > 0 ? 0 : state.consecutiveNoMatch + 1;
+  // TRA-2959 — re-partition AFTER import + joins: imports add unmeasured rows,
+  // joins remove them. `stalled` keys on the ACTIONABLE population only — rows
+  // past the horizon or awaiting their close cannot match no matter how many
+  // ticks run, and counting them trained readers to ignore the alarm.
+  const after = summarizeLiveOptionsFeeSlippage().records;
+  partition = partitionUnmeasured(after, cutoffDay);
+  state.unmeasuredTotal = after.filter((r) => r.fees === null).length;
+  state.unmeasuredActionable = partition.actionable.length;
+  state.unmeasuredAwaitingClose = partition.awaitingClose.length;
+  state.unmeasuredAged = partition.aged.length;
+  state.lastOutcome =
+    updated > 0
+      ? 'backfilled'
+      : state.unmeasuredTotal === 0
+        ? 'no-unmeasured'
+        : state.unmeasuredActionable > 0
+          ? 'no-match'
+          : 'no-actionable';
+  state.consecutiveNoMatch = state.lastOutcome === 'no-match' ? state.consecutiveNoMatch + 1 : 0;
   state.stalled = state.consecutiveNoMatch >= STALLED_AFTER_NO_MATCH;
   // A partial fetch failure is still a failure — record it even when the other
   // source produced an outcome, so the state never self-reports cleaner than it ran.
@@ -332,6 +467,13 @@ export async function runLiveOptionsFeeReconcile(
     totalFees: summary.totalFees,
     consecutiveNoMatch: state.consecutiveNoMatch,
     partialFetchError: state.lastError,
+    coverage: state.coverage,
+    unmeasured: {
+      total: state.unmeasuredTotal,
+      actionable: state.unmeasuredActionable,
+      awaitingClose: state.unmeasuredAwaitingClose,
+      aged: state.unmeasuredAged,
+    },
   };
   if (state.stalled) {
     log.warn('live-options fee reconcile STALLED — repeated no-match, nothing ever written (TRA-2850)', logFields);

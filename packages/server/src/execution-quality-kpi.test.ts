@@ -25,6 +25,7 @@ function optRec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     slippageVsAsk: null,
     slippageVsMid: null,
     orderId: null,
+    origin: 'fill',
     ...over,
   };
 }

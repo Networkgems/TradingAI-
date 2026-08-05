@@ -60,7 +60,11 @@ export type LiveFillSleeve =
   | 'single_leg_rv'
   | 'single_leg_otm'
   | 'single_leg_directional'
-  | 'directional';
+  | 'directional'
+  // TRA-2959 — a fill recovered from broker account-history (or a close whose
+  // position carries no usable provenance) has no sleeve to inherit. Naming the
+  // absence keeps the row in the ledger without mis-attributing it to a sleeve.
+  | 'unattributed';
 
 /** Order side of the fill. */
 export type LiveFillSide = 'buy_to_open' | 'sell_to_close';
@@ -78,6 +82,24 @@ export type LiveFeeSource = 'history_commission' | 'gainloss_derived';
 
 function isFeeSource(v: unknown): v is LiveFeeSource {
   return v === 'history_commission' || v === 'gainloss_derived';
+}
+
+/**
+ * TRA-2959 — how the row got INTO the ledger:
+ * - 'fill'           — captured at fill time by an order-path chokepoint (has the
+ *   submit-time quote, so slippage is measurable).
+ * - 'history_import' — reconstructed by the reconcile pass from broker
+ *   account-history because NO chokepoint recorded it (the 2026-08-04 shape: 7 of
+ *   11 filled orders never reached the ledger and `appendErrors` stayed 0 — the
+ *   writer was never CALLED, so a write-failure counter had nothing to count).
+ *   Imported rows carry the broker fill price but no submit-time quote: slippage
+ *   stays null (named in the slippage exclusion count), fees remain measurable
+ *   via the gainloss join.
+ */
+export type LiveFillOrigin = 'fill' | 'history_import';
+
+function isOrigin(v: unknown): v is LiveFillOrigin {
+  return v === 'fill' || v === 'history_import';
 }
 
 /**
@@ -130,6 +152,8 @@ export interface LiveOptionFillRecord {
   slippageVsMid: number | null;
   /** Broker order id, when known. */
   orderId: number | null;
+  /** TRA-2959 — fill-time capture vs reconcile-time history reconstruction. */
+  origin: LiveFillOrigin;
 }
 
 /** The mutable inputs a caller hands {@link recordLiveOptionFill}; the module fills ts/etDay/derived slippage. */
@@ -147,6 +171,8 @@ export interface LiveOptionFillInput {
   fees?: number | null;
   feeSource?: LiveFeeSource | null;
   orderId?: number | null;
+  /** Defaults to 'fill' — only the reconcile importer passes 'history_import'. */
+  origin?: LiveFillOrigin;
 }
 
 // ── In-memory store (backs the durable records + the health endpoint) ─────────
@@ -207,6 +233,9 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
     slippageVsAsk: filledPrice !== null && askAtSubmit !== null ? filledPrice - askAtSubmit : null,
     slippageVsMid: filledPrice !== null && midAtSubmit !== null ? filledPrice - midAtSubmit : null,
     orderId: input.orderId ?? null,
+    // Rows written before TRA-2959 carry no origin on disk; they were all
+    // captured by fill-time chokepoints, so 'fill' is the honest default.
+    origin: isOrigin(input.origin) ? input.origin : 'fill',
   };
 }
 
@@ -221,7 +250,9 @@ function toRecord(input: LiveOptionFillInput): LiveOptionFillRecord {
 export function recordLiveOptionFill(input: LiveOptionFillInput): void {
   const rec = toRecord(input);
   fills.push(rec);
-  lastRecordAt = rec.ts;
+  // TRA-2959 — a history import can append a row OLDER than the newest fill;
+  // `lastRecordAt` means "newest record", so it never moves backward.
+  if (lastRecordAt === null || rec.ts > lastRecordAt) lastRecordAt = rec.ts;
   if (dataDir == null) return;
 
   const path = liveOptionsFeeSlippageLogPath(dataDir);
@@ -275,7 +306,8 @@ function isSleeve(v: unknown): v is LiveFillSleeve {
     v === 'single_leg_rv' ||
     v === 'single_leg_otm' ||
     v === 'single_leg_directional' ||
-    v === 'directional'
+    v === 'directional' ||
+    v === 'unattributed'
   );
 }
 function isSide(v: unknown): v is LiveFillSide {
@@ -346,6 +378,7 @@ export function hydrateLiveOptionsFeeSlippageFromDisk(
       fees,
       feeSource: sourced ? rec.feeSource : null,
       orderId: rec.orderId,
+      origin: rec.origin,
     });
     fills.push(clean);
     kept.push(JSON.stringify(clean));
@@ -456,6 +489,7 @@ function recordToInput(
     fees: feesOverride !== undefined ? feesOverride : rec.fees,
     feeSource: feesOverride !== undefined ? feeSourceOverride ?? null : rec.feeSource,
     orderId: rec.orderId,
+    origin: rec.origin,
   };
 }
 
@@ -720,6 +754,168 @@ export function backfillLiveOptionFeesFromGainLoss(
   return result;
 }
 
+// ── TRA-2959: fill-coverage cross-check + history import ─────────────────────
+//
+// 2026-08-04 exposed the failure class `appendErrors` structurally cannot see:
+// 7 of 11 filled orders never produced a ledger row because the close went
+// through the pending-close reconcile sweep, which booked the broker fill
+// without CALLING the recorder. A write-failure counter reads 0 when the writer
+// is never invoked — silence that a coverage gate then consumes as health.
+//
+// The independent denominator is the broker's own account history: every filled
+// order is an event there regardless of which code path (or no code path)
+// observed it. This pass compares CONTRACT TOTALS per (symbol, ET day, side)
+// between history and the ledger and APPENDS a `history_import` row for any
+// shortfall, so the ledger converges on the broker's record even when a future
+// code path forgets to record — and the gap is COUNTED, not silent.
+//
+// Two deliberate exclusions:
+// - Same-ET-day fills are NOT imported. The fill-time chokepoints (and the
+//   sweep, instrumented in TRA-2959) record within a tick; importing intraday
+//   would race them and double-count. A gap heals on the first pass of the
+//   next ET day.
+// - History rows whose side cannot be classified (`historyFillSide` null) are
+//   skipped, same as the fee joins.
+//
+// Imported rows have no submit-time quote: slippage stays null and the row is
+// counted in the slippage exclusion bucket. `filledPrice` comes from the
+// history event, so the gainloss fee join measures the row's fees — which also
+// repairs the group-total reconciliation that a MISSING row was breaking (a
+// gainloss group only derives fees when ledger qty == lot qty, so one silent
+// fill poisoned its whole symbol/day/side group).
+
+/** Coverage of broker history by the ledger, contract-denominated. */
+export interface LedgerCoverageResult {
+  /** Option contracts filled at the broker in the window (classifiable rows). */
+  brokerContracts: number;
+  /** Contracts the ledger held for those same (symbol, day, side) groups BEFORE import. */
+  ledgerContracts: number;
+  /** Shortfall found this pass (brokerContracts − matched ledger contracts, prior days only). */
+  missingContracts: number;
+  /** Rows appended this pass to close the shortfall. */
+  importedRows: number;
+}
+
+/**
+ * PURE diff: which history fills (prior ET days only, `< todayEt`) are not
+ * covered by ledger contract totals, returned as ready-to-append inputs.
+ * Deterministic and idempotent — once imported, the totals match and the next
+ * pass returns nothing.
+ */
+export function diffMissingFillsFromHistory(
+  records: readonly LiveOptionFillRecord[],
+  historyFills: readonly TradierTradeHistoryFill[],
+  todayEt: string,
+): { inputs: LiveOptionFillInput[]; coverage: LedgerCoverageResult } {
+  // History contract totals + per-fill detail per (symbol, day, side).
+  const histGroups = new Map<string, { qty: number; fills: TradierTradeHistoryFill[]; side: LiveFillSide }>();
+  let brokerContracts = 0;
+  for (const f of historyFills) {
+    if (f.tradeType !== 'option') continue;
+    const side = historyFillSide(f.description, f.amount);
+    if (side === null) continue;
+    if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
+    brokerContracts += f.quantity;
+    const key = feeMatchKey(f.symbol, f.date, side, 0);
+    const g = histGroups.get(key);
+    if (g) {
+      g.qty += f.quantity;
+      g.fills.push(f);
+    } else histGroups.set(key, { qty: f.quantity, fills: [f], side });
+  }
+
+  // Ledger contract totals for the SAME groups (only groups history knows about —
+  // ledger-only rows, e.g. pre-account-migration fills, are not a coverage gap).
+  let ledgerContracts = 0;
+  const ledgerQtyByKey = new Map<string, number>();
+  for (const r of records) {
+    const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, 0);
+    if (!histGroups.has(key)) continue;
+    ledgerQtyByKey.set(key, (ledgerQtyByKey.get(key) ?? 0) + r.contracts);
+    ledgerContracts += r.contracts;
+  }
+
+  const inputs: LiveOptionFillInput[] = [];
+  let missingContracts = 0;
+  for (const [key, g] of histGroups) {
+    const day = g.fills[0]!.date;
+    if (day >= todayEt) continue; // intraday fills belong to the fill-time recorders
+    let shortfall = g.qty - (ledgerQtyByKey.get(key) ?? 0);
+    if (shortfall <= 0) continue;
+    missingContracts += shortfall;
+    // Attribute the shortfall to the LAST executions of the group (transactionId
+    // order): the recorded rows were recorded as they filled, so the uncovered
+    // tail is the best deterministic guess — and for fee/coverage purposes only
+    // the contract totals and prices matter, not the pairing.
+    const ordered = [...g.fills].sort((a, b) =>
+      a.transactionId < b.transactionId ? 1 : a.transactionId > b.transactionId ? -1 : 0,
+    );
+    for (const f of ordered) {
+      if (shortfall <= 0) break;
+      const qty = Math.min(shortfall, f.quantity);
+      shortfall -= qty;
+      inputs.push({
+        // History carries only the ET calendar day; noon-ET-ish is honest enough
+        // for retention/ordering (17:00Z is 12:00/13:00 ET year-round).
+        ts: Date.parse(`${day}T17:00:00Z`),
+        etDay: day,
+        // A close inherits its sleeve from the ledger's own open row when one
+        // exists; anything else is honestly unattributed.
+        sleeve:
+          g.side === 'sell_to_close'
+            ? sleeveOfLastOpenIn(records, f.symbol) ?? 'unattributed'
+            : 'unattributed',
+        optionSymbol: f.symbol,
+        side: g.side,
+        contracts: qty,
+        submittedLimit: null,
+        askAtSubmit: null,
+        midAtSubmit: null,
+        filledPrice: typeof f.price === 'number' && Number.isFinite(f.price) && f.price > 0 ? f.price : null,
+        fees: null,
+        orderId: f.orderId ?? null,
+        origin: 'history_import',
+      });
+    }
+  }
+  return {
+    inputs,
+    coverage: { brokerContracts, ledgerContracts, missingContracts, importedRows: inputs.length },
+  };
+}
+
+/** {@link lastRecordedOpenSleeve} against an explicit record set (pure helper). */
+function sleeveOfLastOpenIn(
+  records: readonly LiveOptionFillRecord[],
+  optionSymbol: string,
+): LiveFillSleeve | null {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const f = records[i]!;
+    if (f.side === 'buy_to_open' && f.optionSymbol === optionSymbol) return f.sleeve;
+  }
+  return null;
+}
+
+/**
+ * Apply {@link diffMissingFillsFromHistory} against the in-memory store,
+ * appending one durable JSONL line per imported row (the same counted,
+ * best-effort append semantics as a fill-time record).
+ */
+export function importMissingLiveOptionFills(
+  historyFills: readonly TradierTradeHistoryFill[],
+  todayEt: string,
+): LedgerCoverageResult {
+  const { inputs, coverage } = diffMissingFillsFromHistory(fills, historyFills, todayEt);
+  for (const input of inputs) recordLiveOptionFill(input);
+  if (inputs.length > 0) {
+    log.warn('live-options fee-slippage ledger imported broker fills NO chokepoint recorded (TRA-2959)', {
+      importedRows: inputs.length,
+      missingContracts: coverage.missingContracts,
+    });
+  }
+  return coverage;
+}
+
 // ── Health summary ───────────────────────────────────────────────────────────
 
 /** TRA-1681 — is anything this module reports actually ON DISK? Read `ephemeral` FIRST. */
@@ -758,6 +954,22 @@ function round(n: number | null, dp = 4): number | null {
 export interface SlippageSummary {
   /** Count of fills with a MEASURED slippage-vs-ask (denominator is measured, not total). */
   nMeasured: number;
+  /**
+   * TRA-2959 — the DENOMINATOR, stated next to the numerator: total fills in the
+   * ledger, measured or not. `nMeasured < nTotal` ⇒ the means/medians below are a
+   * SUBSET — and a structurally biased one: the excluded fills are exactly the
+   * market/emergency exits with no submit-time quote, where slippage is worst.
+   * Never read `medianVsAsk` without reading this pair.
+   */
+  nTotal: number;
+  /**
+   * TRA-2959 — the named exclusion: fills with NO usable submit-time ask quote
+   * (market orders, one-sided books, and `history_import` reconstructions).
+   * Slippage-vs-ask is structurally unmeasurable for these; they are excluded
+   * BY NAME with a count, not silently absent. `nMeasured + excludedNoAskQuote
+   * === nTotal` always.
+   */
+  excludedNoAskQuote: number;
   meanVsAsk: number | null;
   medianVsAsk: number | null;
   meanVsMid: number | null;
@@ -830,6 +1042,8 @@ export function summarizeLiveOptionsFeeSlippage(): LiveOptionsFeeSlippageSummary
     closes,
     slippage: {
       nMeasured: askStats.n,
+      nTotal: fills.length,
+      excludedNoAskQuote: fills.length - askStats.n,
       meanVsAsk: round(askStats.mean),
       medianVsAsk: round(askStats.median),
       meanVsMid: round(midStats.mean),
