@@ -1131,9 +1131,44 @@ describe('TRA-898 demo-book summary', () => {
       expect(mystery.firstOpen).toBe(new Date(1_000).toISOString());
       expect(mystery.lastOpen).toBe(new Date(9_000).toISOString());
       expect(mystery.modes).toEqual(['demo', 'live']);
-      // Roster books and test books are NOT named.
-      expect(JSON.stringify(res.body)).not.toContain('Richard');
+      // The test book is never named — it is noise, and naming it would bury
+      // the two accounts that actually want a decision.
       expect(JSON.stringify(res.body)).not.toContain('qa_throwaway');
+    });
+
+    // The three classes must PARTITION the domain. `unrecognised: []` on its own
+    // cannot tell "the roster is complete" from "the census lost an account" —
+    // and a roster that names books which never traded is not a roster either.
+    it('names the VOUCHED half too, and the three classes partition the domain', async () => {
+      const routes = register({
+        journalAccountRows: async () => [
+          journalRow('Richard', { openTs: 7_000 }),
+          journalRow('Richard', { openTs: 8_000 }),
+          journalRow('mysterybook7'),
+          journalRow('qa_throwaway'),
+          journalRow('ctoverify_9'),
+        ],
+        requireAdmin: ((_q: unknown, _s: unknown, n?: () => void) => n?.()) as never,
+      });
+      const res = resWithLocals();
+      await routes.get('/api/admin/desk-roster')![2]!({ query: {} }, res);
+      const body = onWire(res.body) as {
+        journalAccountCount: number;
+        testAccountCount: number;
+        partitions: boolean;
+        rosterDeskAccounts: Array<{ account: string; rowCount: number; lastOpen: string | null }>;
+        unrecognisedDeskAccounts: Array<{ account: string }>;
+      };
+      expect(body.journalAccountCount).toBe(4);
+      expect(body.rosterDeskAccounts.map(a => a.account)).toEqual(['Richard']);
+      expect(body.rosterDeskAccounts[0]!.rowCount).toBe(2);
+      expect(body.rosterDeskAccounts[0]!.lastOpen).toBe(new Date(8_000).toISOString());
+      expect(body.unrecognisedDeskAccounts.map(a => a.account)).toEqual(['mysterybook7']);
+      expect(body.testAccountCount).toBe(2);
+      expect(body.partitions).toBe(true);
+      // `enock` is on KNOWN_DESK_BOOKS but never traded — the roster list is
+      // what it OBSERVED, not an echo of the allowlist.
+      expect(JSON.stringify(res.body)).not.toContain('"account":"enock"');
     });
 
     it('serves 503 — never an empty clean 200 — when the admin read cannot see the journal', async () => {

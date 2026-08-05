@@ -877,7 +877,7 @@ export interface DemoBookPublicReport {
  * judgement `KNOWN_DESK_BOOKS` has to be designed on (TRA-2554). A bare list of
  * names cannot support it.
  */
-export interface UnrecognisedDeskAccount {
+export interface JournalAccountStat {
   /** As first seen in the journal (original case preserved). */
   account: string;
   rowCount: number;
@@ -897,7 +897,22 @@ export interface DeskAccountRosterFold {
   /** Distinct non-blank `account` values, case-insensitively de-duplicated. */
   journalAccountCount: number;
   /** Of those, the ones neither `isTestAccount(...)` nor on `KNOWN_DESK_BOOKS`. */
-  unrecognised: UnrecognisedDeskAccount[];
+  unrecognised: JournalAccountStat[];
+  /**
+   * TRA-2660 — the VOUCHED half, named: accounts on `KNOWN_DESK_BOOKS` that
+   * actually carry journal rows. `unrecognised: []` alone cannot tell TRA-2554
+   * "the roster is complete" from "the roster names books that never traded",
+   * and the roster it has to design is a statement about BOTH halves.
+   */
+  roster: JournalAccountStat[];
+  /**
+   * Accounts that are neither on the roster nor unrecognised — i.e. the ones
+   * the test patterns claimed. Reported as a COUNT (they are the noise), but it
+   * is here so the three classes can be asserted to PARTITION the domain:
+   * `roster.length + unrecognised.length + testAccountCount === journalAccountCount`.
+   * A silent gap between them would mean an account fell out of the census.
+   */
+  testAccountCount: number;
 }
 
 /**
@@ -929,7 +944,7 @@ export function foldDeskAccountRoster(
   rows: ReadonlyArray<{ account?: string; openTs?: number; mode?: string }>,
   env: NodeJS.ProcessEnv = process.env,
 ): DeskAccountRosterFold {
-  const byKey = new Map<string, UnrecognisedDeskAccount>();
+  const byKey = new Map<string, JournalAccountStat>();
   let rowsWithoutAccount = 0;
   for (const row of rows) {
     const raw = typeof row.account === 'string' ? row.account.trim() : '';
@@ -961,13 +976,21 @@ export function foldDeskAccountRoster(
   const unrecognisedNames = new Set(
     unrecognisedDeskBooks([...byKey.values()].map(a => a.account), env).map(n => n.toLowerCase()),
   );
+  const rosterNames = new Set(KNOWN_DESK_BOOKS.map(n => n.trim().toLowerCase()));
+  const byRows = (a: JournalAccountStat, b: JournalAccountStat) =>
+    b.rowCount - a.rowCount || a.account.localeCompare(b.account);
+  const all = [...byKey.values()];
+  const unrecognised = all.filter(a => unrecognisedNames.has(a.account.toLowerCase()));
+  const roster = all.filter(a => rosterNames.has(a.account.toLowerCase()));
   return {
     rowsScanned: rows.length,
     rowsWithoutAccount,
     journalAccountCount: byKey.size,
-    unrecognised: [...byKey.values()]
-      .filter(a => unrecognisedNames.has(a.account.toLowerCase()))
-      .sort((a, b) => b.rowCount - a.rowCount || a.account.localeCompare(b.account)),
+    unrecognised: [...unrecognised].sort(byRows),
+    roster: [...roster].sort(byRows),
+    // The residual, by construction — so the three classes partition the domain
+    // exactly and an account can never fall out of the census unseen.
+    testAccountCount: byKey.size - unrecognised.length - roster.length,
   };
 }
 
@@ -2877,6 +2900,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         return;
       }
       const { fold } = reading;
+      const withDates = (a: JournalAccountStat) => ({
+        ...a,
+        firstOpen: a.firstOpenTs === null ? null : new Date(a.firstOpenTs).toISOString(),
+        lastOpen: a.lastOpenTs === null ? null : new Date(a.lastOpenTs).toISOString(),
+      });
       res.json({
         ok: true,
         time: new Date(now()).toISOString(),
@@ -2885,11 +2913,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         journalAccountCount: fold.journalAccountCount,
         knownDeskBooks: [...KNOWN_DESK_BOOKS],
         unrecognisedDeskAccountCount: fold.unrecognised.length,
-        unrecognisedDeskAccounts: fold.unrecognised.map(a => ({
-          ...a,
-          firstOpen: a.firstOpenTs === null ? null : new Date(a.firstOpenTs).toISOString(),
-          lastOpen: a.lastOpenTs === null ? null : new Date(a.lastOpenTs).toISOString(),
-        })),
+        unrecognisedDeskAccounts: fold.unrecognised.map(withDates),
+        // The vouched half + the test residual. The three classes partition the
+        // domain; `partitions` says so on the wire, so a census that silently
+        // dropped an account cannot read as a clean roster.
+        rosterDeskAccounts: fold.roster.map(withDates),
+        testAccountCount: fold.testAccountCount,
+        partitions:
+          fold.roster.length + fold.unrecognised.length + fold.testAccountCount ===
+          fold.journalAccountCount,
       });
     });
   }

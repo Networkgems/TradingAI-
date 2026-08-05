@@ -89,6 +89,22 @@ const MUTATIONS = [
     test: 'serves 503 — never an empty clean 200 — when the admin read cannot see the journal',
   },
   {
+    id: 'M10 test residual double-counts (classes stop partitioning)',
+    file: HR,
+    from: `    testAccountCount: byKey.size - unrecognised.length - roster.length,`,
+    to: `    testAccountCount: byKey.size - unrecognised.length,`,
+    test: 'names the VOUCHED half too, and the three classes partition the domain',
+  },
+  {
+    id: 'M11 roster list echoes the allowlist instead of what was observed',
+    file: HR,
+    from: `  const roster = all.filter(a => rosterNames.has(a.account.toLowerCase()));`,
+    to: `  const roster = [...rosterNames].map(n => ({
+    account: n, rowCount: 0, firstOpenTs: null, lastOpenTs: null, modes: [],
+  }));`,
+    test: 'names the VOUCHED half too, and the three classes partition the domain',
+  },
+  {
     id: 'M9 includeTest allowed to change the account answer',
     file: HR,
     from: `    const deskAccounts = await readDeskAccountRoster();
