@@ -81,7 +81,17 @@ reading the boolean now consumes a fleet-wide green asserted off **one** row aga
 The counts sit right there and a naive reader steps past them.
 
 This is a distinct axis from the join and is **not** closed by this ticket: it needs a coverage rule,
-not an independence fix. Tracked separately (see the follow-up filed off TRA-2671).
+not an independence fix. Tracked as **TRA-2924**, which also carries the post-deploy live re-measure
+of both this cohort and the `cashInvariant` fix below.
+
+It is the **third** failure mode of this family, and the standing rule at the end of this document
+only covers the first two:
+
+| # | Shape | Ticket | Covered by the rule? |
+|---|---|---|---|
+| 1 | cohort **empty**, `every` scores green | TRA-2635 | yes — clause 2 |
+| 2 | cohort non-empty but **tautological** | TRA-2671 | yes — clause 1 |
+| 3 | cohort non-empty, non-tautological, but **negligible** | TRA-2924 | **no** |
 
 ## AC3 — regression controls
 
