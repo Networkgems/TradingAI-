@@ -4127,10 +4127,45 @@ export class PaperOptionsAccount {
    * two, so the guards here are about refusing to *guess* on a position whose
    * absence from the broker is not evidence of anything.
    *
-   * The realized P&L booked here is an ESTIMATE off `currentPremium` (falling
-   * back to `premiumPaid` — i.e. break-even — when no mark ever landed). The
-   * EOD Tradier-history reconcile restates it to broker truth, exactly as it
-   * does for the imported branch's `recordImportedFill` estimate.
+   * TRA-2801 — this close is BOOKED AT BREAK-EVEN, not at the last known mark.
+   * It refunds exactly the premium the open debited for the remaining contracts
+   * and books $0 realized. Reasoning, since befc82f intended the opposite
+   * ("estimate now, restate later"):
+   *
+   * The estimate is only defensible where a restatement exists, and on this path
+   * NONE of the three axes it moves can be restated:
+   *   • paper `cash` / `equity` — the EOD reconcile's only mutation is
+   *     {@link addReconciledTradierPnl}, which touches `optionsPnlByMode` and
+   *     nothing else. Cash credited at the mark ($88 on the SPY 820C row against
+   *     the $14 the open debited) is never removed by anything.
+   *   • the SIZING equity book — `closeOption` books through
+   *     {@link bookRealizedPnl}, whose `realizedPnlSink` credits the owning
+   *     `PaperAccount` (TRA-2323), and that book is what {@link sizingEquity}
+   *     measures against. `addReconciledTradierPnl` does a bare
+   *     `optionsPnlByMode.live +=` and so NEVER reaches that sink. The estimate
+   *     therefore inflates the bucket that authorises real orders, permanently.
+   *   • the archived row's `pnl`, which `dailyRealizedOptionsPnlForMode` sums —
+   *     also never restated.
+   *
+   * Break-even is correct in BOTH worlds the sweep cannot tell apart:
+   *   • the broker closed the contract out-of-band → EOD adds broker truth on
+   *     top of $0, landing on broker truth exactly;
+   *   • the open never really filled → $0 stands, which is the right answer.
+   * And it invents no dollars in either, which is the property that matters on a
+   * live book: overstating buying power can authorise an order that should have
+   * been refused, while understating it can only refuse one.
+   *
+   * Cost of the choice, stated rather than hidden: in the out-of-band-close world
+   * `cash` / `equity` / the sizing book end SHORT by the real proceeds, because
+   * only `optionsPnlByMode` gets broker truth. That gap is the pre-existing
+   * imported-branch behaviour (nothing has ever restated cash), not a new class
+   * of error — and it errs conservative. Extending the EOD reconcile to restate
+   * cash (option 3 on the ticket) is not implementable from the data it has:
+   * {@link aggregateRealizedOptionsPnl} yields realized P&L per date, never the
+   * gross proceeds a cash restatement needs.
+   *
+   * The archived snapshot's `currentPremium` therefore reads as the break-even
+   * exit price, which is what we actually booked.
    */
   closeBrokerFlatPosition(optionId: string, reason: string): OptionPosition | null {
     const opt = this.openOptions.get(optionId);
@@ -4139,10 +4174,16 @@ export class PaperOptionsAccount {
     if ((opt.mode ?? 'demo') !== 'live') return null;
     if (opt.legs && opt.legs.length > 0) return null;
     if (opt.coveredWrite) return null;
-    const estimatedFill =
-      Number.isFinite(opt.currentPremium) && opt.currentPremium > 0
-        ? opt.currentPremium
-        : opt.premiumPaid;
+    // TRA-2801 — break-even, NOT `currentPremium`. See the docblock: the mark
+    // estimate moved three buckets and not one of them could be restated.
+    // `closeOption` computes `pnl = (effectiveExit − premiumPaid) × remaining ×
+    // 100` and credits `effectiveExit × remaining × 100` to cash; for a live row
+    // `demoExitFillPrice` is the identity and `exitFee` is 0, so passing
+    // `premiumPaid` here refunds EXACTLY `premiumPaid × remaining × 100` — the
+    // per-contract debit every entry path takes (`costPerContract =
+    // premiumPaid * 100`) — and books exactly $0 realized.
+    const breakEvenFill =
+      Number.isFinite(opt.premiumPaid) && opt.premiumPaid >= 0 ? opt.premiumPaid : 0;
     // Stamp BEFORE closing so the reason rides the snapshot `closeOption`
     // pushes onto `closedOptions` — otherwise the row just disappears and the
     // user cannot tell a reconcile close apart from an exit the engine fired.
@@ -4178,10 +4219,19 @@ export class PaperOptionsAccount {
     // under review — precisely where a phantom gain does the most damage.
     //
     // The delta is measured around `closeOption` rather than recomputed from
-    // `estimatedFill` so it stays exact regardless of the fee / slippage
+    // the fill price so it stays exact regardless of the fee / slippage
     // adjustments that path applies.
+    //
+    // TRA-2801 — with the break-even fill above this delta is $0 by construction,
+    // so the registration is a no-op TODAY. It is kept deliberately, and it is
+    // NOT dead-code-as-protection: `tra2801-…test.ts` pins the delta at $0 and
+    // the map as empty, so if a future change reintroduces a non-zero estimate
+    // that test fails and points here — and the registration then routes the
+    // estimate correctly, which is what 4ffbe10 established. TRA-2801 removes the
+    // estimate rather than deduping it; 4ffbe10's mechanism is superseded on this
+    // path, not wrong.
     const liveBefore = this.optionsPnlByMode.live;
-    const closed = this.closeOption(optionId, estimatedFill);
+    const closed = this.closeOption(optionId, breakEvenFill);
     if (closed) this.registerReconcileEstimateForDedupe(this.optionsPnlByMode.live - liveBefore);
     return closed;
   }

@@ -3350,7 +3350,7 @@ describe('PaperOptionsAccount.reconcileTradierPositions — stranded engine rows
     return { acct, contracts: pos!.contracts };
   }
 
-  it('closes an engine-opened live row after two consecutive sweeps miss it, booking P&L at the last mark', () => {
+  it('closes an engine-opened live row after two consecutive sweeps miss it, at BREAK-EVEN (TRA-2801)', () => {
     const { acct, contracts } = openStrandedLive(1.5);
 
     // First miss only arms the counter — one blank snapshot is not proof.
@@ -3366,13 +3366,16 @@ describe('PaperOptionsAccount.reconcileTradierPositions — stranded engine rows
     expect(state.closedOptions).toHaveLength(1);
     const closed = state.closedOptions[0];
     expect(closed.optionSymbol).toBe('AAPL240705C00200000');
-    // Closed at the last known mark, not at break-even.
-    expect(closed.currentPremium).toBeCloseTo(1.5, 5);
-    expect(closed.pnl).toBeCloseTo((1.5 - 1.0) * contracts * 100, 5);
+    // TRA-2801 — closed at BREAK-EVEN, not at the last known mark (1.5). The mark
+    // estimate moved paper cash, paper equity and the SIZING equity book, and the
+    // EOD reconcile restates none of the three, so it could inflate buying power
+    // permanently on a contract the broker was not holding. EOD now adds broker
+    // truth on top of $0 instead. See `closeBrokerFlatPosition`'s docblock.
+    expect(closed.currentPremium).toBeCloseTo(1.0, 5);
+    expect(closed.pnl).toBeCloseTo(0, 5);
     // The archived row explains itself rather than silently vanishing.
     expect(closed.exitErrorReason).toMatch(/broker no longer reports this position/i);
-    // Live mode books no demo slippage/fee haircut.
-    expect(state.optionsPnl).toBeCloseTo((1.5 - 1.0) * contracts * 100, 5);
+    expect(state.optionsPnl).toBeCloseTo(0, 5);
   });
 
   it('resets the miss counter when the broker reports the contract again', () => {
@@ -3432,17 +3435,25 @@ describe('PaperOptionsAccount.reconcileTradierPositions — stranded engine rows
 });
 
 describe('PaperOptionsAccount.closeBrokerFlatPosition (TRA-2799)', () => {
-  it('closes an engine-opened live row at its last mark and stamps the reason', () => {
+  it('closes an engine-opened live row at BREAK-EVEN and stamps the reason (TRA-2801)', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live');
     const row = acct.getStateForMode('live').openOptions[0];
     row.currentPremium = 2.0;
     row.closeRejectCount = 3; // breaker already tripped, as in the report
 
+    const cashBefore = acct.getStateForMode('live').optionsCash;
     const closed = acct.closeBrokerFlatPosition(row.id, 'broker is flat');
 
     expect(closed).not.toBeNull();
-    expect(closed!.pnl).toBeCloseTo((2.0 - 1.0) * pos!.contracts * 100, 5);
+    // TRA-2801 — was (2.0 − 1.0) × contracts × 100 off the mark. Now $0, and the
+    // cash leg refunds exactly the premium the open debited rather than crediting
+    // 2.0 × contracts × 100 for a contract Tradier was not holding.
+    expect(closed!.pnl).toBeCloseTo(0, 5);
+    expect(acct.getStateForMode('live').optionsCash - cashBefore).toBeCloseTo(
+      1.0 * pos!.contracts * 100,
+      5,
+    );
     expect(closed!.exitErrorReason).toBe('broker is flat');
     expect(closed!.closeRejectCount).toBeUndefined();
     expect(acct.getStateForMode('live').openOptions).toHaveLength(0);

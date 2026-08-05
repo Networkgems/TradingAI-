@@ -226,4 +226,63 @@ describe('TRA-2323 — the choke point is the ONLY realized-P&L mutation site', 
       .filter(({ line }) => line !== 'this.optionsPnlByMode[mode] += delta;');
     expect(bare.map(b => `L${b.n}: ${b.line}`)).toEqual([]);
   });
+
+  /**
+   * TRA-2801 — the invariant above had no fail state for the form that actually
+   * escaped. Its regex requires BRACKET indexing (`optionsPnlByMode[...] +=`), so
+   * the three DOT-notation accruals that exist right now
+   * (`optionsPnlByMode.demo +=`, `.live +=`) were invisible to it and it reported
+   * a clean `[]`. The claim "the choke point is the ONLY mutation site" has been
+   * false since it was written.
+   *
+   * That is not cosmetic. `bookRealizedPnl` is what fires `realizedPnlSink` into
+   * the owning `PaperAccount` — the book `sizingEquity()` measures against. Every
+   * accrual listed below therefore never reaches the sizing authority, and in
+   * particular `addReconciledTradierPnl` (the EOD restatement) cannot correct an
+   * estimate that DID reach it via `bookRealizedPnl`. That asymmetry is what
+   * TRA-2801 had to route around in `closeBrokerFlatPosition`, and TRA-2885
+   * tracks routing these three through the choke point.
+   *
+   * SET EQUALITY, not a subset: a fourth bypass fails this, and so does FIXING
+   * one of the three without deleting its line here. An allowlist that can go
+   * stale silently is the trap this test exists to avoid.
+   */
+  it('every optionsPnlByMode accrual — dot form INCLUDED — is a known site', () => {
+    const src = readFileSync(join(__dirname, 'options-account.ts'), 'utf-8');
+    const found = src
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => /this\.optionsPnlByMode\s*(\[[^\]]+\]|\.[A-Za-z_$][\w$]*)\s*[+-]=/.test(line));
+
+    // The choke point.
+    const CHOKE_POINT = 'this.optionsPnlByMode[mode] += delta;';
+    // The three that bypass it today. Each is a bare accrual the sink never sees.
+    const KNOWN_BYPASSES = [
+      // `resolveCombo` — demo-only combo settle (TRA-1966 era).
+      'this.optionsPnlByMode.demo += realized;',
+      // `applyRealtimeImportedPnl` — the imported-fill realtime estimate (TRA-367).
+      'this.optionsPnlByMode.live += pnl;',
+      // `addReconciledTradierPnl` — the EOD restatement (TRA-348). THIS is the one
+      // that makes "estimate now, restate later" unavailable for sizing equity.
+      'this.optionsPnlByMode.live += amount;',
+    ];
+
+    expect([...new Set(found)].sort()).toEqual([CHOKE_POINT, ...KNOWN_BYPASSES].sort());
+  });
+
+  /**
+   * TRA-2801 CONTROL — proves the test above can actually fail, by running the
+   * same predicate over a synthetic source that adds a fourth bypass. Without
+   * this, a regex that silently matched nothing would still report set-equality
+   * against a list it also never matched.
+   */
+  it('CONTROL the accrual sweep catches a newly added dot-form bypass', () => {
+    const predicate = (line: string): boolean =>
+      /this\.optionsPnlByMode\s*(\[[^\]]+\]|\.[A-Za-z_$][\w$]*)\s*[+-]=/.test(line.trim());
+    expect(predicate('    this.optionsPnlByMode.live += somethingNew;')).toBe(true);
+    expect(predicate('    this.optionsPnlByMode.demo -= clawback;')).toBe(true);
+    expect(predicate('    this.optionsPnlByMode[mode] += delta;')).toBe(true);
+    // …and does not fire on a read.
+    expect(predicate('    const x = this.optionsPnlByMode.live;')).toBe(false);
+  });
 });

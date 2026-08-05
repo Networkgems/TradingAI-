@@ -82,36 +82,59 @@ function seed(rows: OptionPosition[]) {
   return acct;
 }
 
+// ─── TRA-2801 SUPERSEDES the accounting these tests originally pinned.
+//
+// Residual A on TRA-2801 decided that a mark estimate is only defensible where a
+// restatement exists, and on this path none of the three buckets it moved could
+// be restated — `cash` / `equity` are untouched by the EOD reconcile, and the
+// SIZING equity book is fed by `bookRealizedPnl`'s `realizedPnlSink` while the
+// EOD restatement (`addReconciledTradierPnl`) is a bare `optionsPnlByMode.live
+// +=` that never reaches it. So `closeBrokerFlatPosition` now books BREAK-EVEN:
+// refund the premium the open debited, book $0 realized, let EOD add broker
+// truth on top of $0.
+//
+// The four tests below are restated to the new behaviour and keep the original
+// defect narrative in their comments, because that narrative is still why the
+// code looks the way it does. Consequence stated plainly rather than hidden:
+// 4ffbe10's registration line is no longer covered by a failing mutation — with
+// the estimate gone there is nothing for it to register, so deleting it changes
+// no observable behaviour. `tra2801-reconcile-close-cash-neutrality.test.ts`
+// carries the mutation teeth for the accounting that is live now, and pins that
+// registration as a no-op so a reintroduced estimate fails loudly.
 describe('TRA-2799 follow-up — reconcile-close P&L attribution', () => {
-  it('books the mark as realized live P&L (+$74 on the SPY 820C row)', () => {
+  it('TRA-2801: books BREAK-EVEN, not the +$74 mark (was: books the mark)', () => {
     const acct = seed([engineRow()]);
     const closed = acct.closeBrokerFlatPosition('opt-spy-820c', 'broker flat');
     expect(closed).not.toBeNull();
-    // (0.44 − 0.07) × 2 × 100 = +$74.00 booked into the LIVE realized bucket.
-    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(74, 5);
-    // Paper cash credited at the mark: 0.44 × 2 × 100 = $88 for a position the
-    // broker was not holding, against $14 of premium actually debited at open.
-    expect(acct.getStateForMode('live').optionsCash).toBeCloseTo(20_000 + 88, 5);
+    // Was (0.44 − 0.07) × 2 × 100 = +$74.00 into the LIVE realized bucket, on a
+    // contract Tradier was not holding. Now $0 — EOD supplies broker truth.
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(0, 5);
+    // Was credited at the mark (0.44 × 2 × 100 = $88) against the $14 of premium
+    // the open actually debited. Now the refund is exactly that $14. (This
+    // fixture seeds cash at 20_000 with the row already open, so the refund
+    // shows as +$14 rather than a return to a pre-open baseline; the pre-open
+    // framing is asserted in the TRA-2801 file.)
+    expect(acct.getStateForMode('live').optionsCash).toBeCloseTo(20_000 + 14, 5);
   });
 
-  it('registers the estimate in the realtime map so the EOD reconcile can subtract it', () => {
+  it('TRA-2801: nothing is registered for EOD dedupe, because nothing was estimated', () => {
     const acct = seed([engineRow()]);
     acct.closeBrokerFlatPosition('opt-spy-820c', 'broker flat');
-    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(74, 5);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(0, 5);
 
-    // This map is exactly what `index.ts` drains into `realtimeOffset` before
-    // computing `netAdded = brokerTruth − realtimeOffset`. It must carry the
-    // estimate; an empty map is the defect (nothing to subtract).
+    // This map is what `index.ts` drains into `realtimeOffset` before computing
+    // `netAdded = brokerTruth − realtimeOffset`. 4ffbe10 made the estimate land
+    // here so it could be subtracted; TRA-2801 removes the estimate instead, so
+    // the correct content is now EMPTY — there is nothing to subtract.
     let offset = 0;
     for (const v of acct.consumeRealtimeImportedPnl().values()) offset += v;
-    expect(offset).toBeCloseTo(74, 5);
+    expect(offset).toBeCloseTo(0, 5);
   });
 
-  it('CONTROL registering does not double-book the live bucket', () => {
+  it('CONTROL the live bucket moves exactly once — and by $0', () => {
     const acct = seed([engineRow()]);
     acct.closeBrokerFlatPosition('opt-spy-820c', 'broker flat');
-    // Recorded for dedupe, but the bucket moved exactly once.
-    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(74, 5);
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(0, 5);
   });
 
   it('broker closed it out-of-band: EOD restates to broker truth (no double-count)', () => {
@@ -153,7 +176,7 @@ describe('TRA-2799 follow-up — reconcile-close P&L attribution', () => {
   // +$372 = $630, the small gap being display rounding of the premium column.
   // Either way the order of magnitude is the point: ~$630 of realized P&L
   // booked against contracts the broker was not holding.
-  it('scaled to the three rows on the ticket: ~$630 of unbacked realized P&L', () => {
+  it('TRA-2801: the three rows book $0, not the ~$630 of unbacked realized P&L', () => {
     const acct = seed([
       engineRow(), // +$74.00
       engineRow({
@@ -180,11 +203,16 @@ describe('TRA-2799 follow-up — reconcile-close P&L attribution', () => {
     for (const id of ['opt-spy-820c', 'opt-spy-816c', 'opt-aapl-280p']) {
       expect(acct.closeBrokerFlatPosition(id, 'broker flat')).not.toBeNull();
     }
-    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(74 + 184 + 372, 5);
-    // All of it is registered for EOD restatement, so none of it can strand.
+    // Was 74 + 184 + 372 = $630 of realized P&L against contracts the broker was
+    // not holding. TRA-2801 books none of it; EOD supplies broker truth per row.
+    expect(acct.getStateForMode('live').optionsPnl).toBeCloseTo(0, 5);
+    // Nothing to strand, because nothing was estimated.
     let offset = 0;
     for (const v of acct.consumeRealtimeImportedPnl().values()) offset += v;
-    expect(offset).toBeCloseTo(74 + 184 + 372, 5);
+    expect(offset).toBeCloseTo(0, 5);
+    // The cash leg of the same $630 is asserted in
+    // `tra2801-reconcile-close-cash-neutrality.test.ts` (mark credit $1,076 vs
+    // the $446 the opens actually debited).
   });
 
   it('the two-sweep + age guards behave as documented (sanity, not the defect)', () => {

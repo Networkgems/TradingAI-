@@ -242,6 +242,7 @@ import {
   computeBalanceDailyPnl,
   findPreviousBalanceSnapshot,
   liveBackfillWriteWindow,
+  planTradierReconcile,
   realizedOptionsPnlByCloseDate,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
@@ -583,6 +584,7 @@ import {
   tradierBaseUrl,
   TradierOptionsClient,
   DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+  type TradierTradeHistoryFill,
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
 import { recordMakerFill } from './option-maker-fill-ledger.js';
@@ -2104,47 +2106,84 @@ async function reconcileTradierOptionsHistory(
   const startMs = today.getTime() - TRADIER_RECONCILE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
   const start = new Date(startMs).toISOString().slice(0, 10);
 
-  let fills;
+  // TRA-2801 — the fetch outcome is now a FLAG, not an early return, because the
+  // realtime-estimate drain below has to run on a SUCCESSFUL-BUT-EMPTY window and
+  // must NOT run on a failed one. `planTradierReconcile` holds that rule; see its
+  // docblock. A failed fetch is BLIND, not empty, and the drain is destructive.
+  let fills: TradierTradeHistoryFill[] = [];
+  let fetchSucceeded = true;
   try {
     fills = await client.listAccountHistory({ start, end, type: 'trade', limit: 1000 });
   } catch (err) {
+    fetchSucceeded = false;
     log.warn('tradier-reconcile history fetch failed', {
       username: ctx.username,
       env,
       reason: err instanceof Error ? err.message : String(err),
     });
-    return;
   }
-  if (fills.length === 0) return;
 
   const cursor = await loadTradierHistoryCursor(ctx, env);
   const knownIds = new Set(cursor.seenIds);
   const totals = aggregateRealizedOptionsPnl(fills, knownIds);
+  const plan = planTradierReconcile({
+    fetchSucceeded,
+    fillsInWindow: fills.length,
+    newTransactionIds: totals.seenTransactionIds.size,
+  });
 
-  if (totals.seenTransactionIds.size === 0) return;
-
-  // TRA-367 — `recordImportedFill` / `finalizePendingExit` for imports
-  // attribute realised P&L to `optionsPnlByMode.live` in realtime so the
-  // dashboard pill updates the moment a sell_to_close fills. Those fills
-  // ALSO show up in Tradier's account history, so the broker-side total
-  // below would double-count them. Drain the per-date realtime tally
-  // here and subtract it from the broker total before bumping the pill.
-  // The per-day sidecar (used by the calendar) still gets the full
-  // broker-side total since it's the canonical "this is what Tradier
-  // settled today" record.
-  const realtimeByDate = ctx.engine.consumeRealtimeImportedPnl(env);
   let realtimeOffset = 0;
-  for (const v of realtimeByDate.values()) realtimeOffset += v;
-
-  // Bump the engine's live-mode P&L bucket by the sum of newly reconciled
-  // realized P&L across all dates in the window so the dashboard pill
-  // updates on the next state broadcast. Subtract the realtime offset so
-  // closes we already attributed via {@link applyRealtimeImportedPnl}
-  // aren't counted again.
+  let netAdded = 0;
   let added = 0;
-  for (const realized of totals.realizedByDate.values()) added += realized;
-  const netAdded = added - realtimeOffset;
-  if (netAdded !== 0) ctx.engine.addReconciledTradierOptionsPnl(env, netAdded);
+  if (plan.drainRealtime) {
+    // TRA-367 — `recordImportedFill` / `finalizePendingExit` for imports
+    // attribute realised P&L to `optionsPnlByMode.live` in realtime so the
+    // dashboard pill updates the moment a sell_to_close fills. Those fills
+    // ALSO show up in Tradier's account history, so the broker-side total
+    // below would double-count them. Drain the per-date realtime tally
+    // here and subtract it from the broker total before bumping the pill.
+    // The per-day sidecar (used by the calendar) still gets the full
+    // broker-side total since it's the canonical "this is what Tradier
+    // settled today" record.
+    const realtimeByDate = ctx.engine.consumeRealtimeImportedPnl(env);
+    for (const v of realtimeByDate.values()) realtimeOffset += v;
+
+    // Bump the engine's live-mode P&L bucket by the sum of newly reconciled
+    // realized P&L across all dates in the window so the dashboard pill
+    // updates on the next state broadcast. Subtract the realtime offset so
+    // closes we already attributed via {@link applyRealtimeImportedPnl}
+    // aren't counted again.
+    //
+    // TRA-2801 — on an empty window `added` is 0, so this is `−realtimeOffset`:
+    // an estimate with no broker-side counterpart goes back to $0 instead of
+    // standing forever. It also closes a pre-existing race the old early return
+    // hid — a fill reconciled from history BEFORE the realtime callback fired
+    // left the estimate stacked on broker truth with every later pass bailing at
+    // `seenTransactionIds.size === 0`.
+    for (const realized of totals.realizedByDate.values()) added += realized;
+    netAdded = added - realtimeOffset;
+    if (netAdded !== 0) ctx.engine.addReconciledTradierOptionsPnl(env, netAdded);
+  }
+
+  // TRA-2801 — nothing NEW to persist: the fetch failed, no fills in the window,
+  // or every fill in it is already in the cursor. The drain above has already run
+  // when it was allowed to (that is the whole point), so bail before the sidecar
+  // and cursor writes, which have no work.
+  //
+  // The back-out is deliberately NOT written to the daily-totals sidecar: that
+  // file is the canonical "what Tradier settled" record, and reversing our own
+  // estimate is not a broker settlement.
+  if (!plan.persistFills) {
+    if (realtimeOffset !== 0)
+      log.info('tradier-reconcile backed out an unmatched realtime estimate', {
+        username: ctx.username,
+        env,
+        fillsInWindow: fills.length,
+        realtimeOffset: Number(realtimeOffset.toFixed(2)),
+        netAddedToPill: Number(netAdded.toFixed(2)),
+      });
+    return;
+  }
 
   // Persist per-day totals onto a sidecar so `mergeReconciledDailyTotalsIntoReport`
   // can sum across runs (the cursor file is the dedup source of truth;
