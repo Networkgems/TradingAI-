@@ -685,8 +685,22 @@ function reachability(scopeRead) {
   const out = [];
   const armed = known && (scope === 'demo' || scope === 'all');
   const label = !known ? 'UNKNOWN' : armed ? 'REACHABLE' : 'UNREACHABLE';
-  out.push(`PASS / FAIL:SELECTION_ADVERSE  ${label} — needs n(T)≥${MIN_N} eligible demo fills opened while the governor read < 1. The demo option paths ARE armed at scope=demo, so T is populated by ordinary tape.`);
+  out.push(`PASS / FAIL:SELECTION_ADVERSE  ${label} — needs n(T)≥${MIN_N} eligible demo fills opened while the governor read < 1. The demo option paths ARE armed at scope=demo, but see the CROSS-BOOK note below: being armed is not the same as being reachable at a useful rate.`);
   out.push(`NOT-GRADED:NO_THROTTLED_FILLS  REACHABLE and EXPECTED — the autopilot sits at 1.0 most sessions.`);
+  // TRA-2331 — the governor that gates T is fed by a DIFFERENT book than the one
+  // graded. Pinned by packages/server/src/tra2331-autopilot-throttle-is-equity-fed.test.ts
+  // (mutation-proven); if those tests fail the wiring changed and this note is stale.
+  out.push(
+    `⛔ CROSS-BOOK — the graded cohort is the demo OPTION book, but 3 of the autopilot's 4 throttle\n`
+    + `   triggers cannot be driven by it. loss_streak + daily_drawdown read consecutiveLosses/dailyPnl,\n`
+    + `   whose ONLY mutator is DailyRiskGovernor.recordTrade — every call site of which is an EQUITY\n`
+    + `   close. Option closes go to optionsBreaker (OptionsRiskBreaker), which never reaches\n`
+    + `   evaluateRiskAutopilot. regime_shift needs marketReviewGatesEnabled, an opt-in defaulting FALSE.\n`
+    + `   Only edge_decay is options-fed, and it needs >=30 recent AND >=30 baseline closes for ONE\n`
+    + `   strategy. So a graded option open is trimmed only while the EQUITY book sits at exactly 2\n`
+    + `   consecutive losses (3 halts, a win resets) on the same ET day. n(T)=0 is therefore mostly a\n`
+    + `   statement about that coupling — NOT evidence the throttle is calibrated wide.`,
+  );
   out.push(`FAIL:WRITER_REGRESSED         REACHABLE — any post-cliff desk row missing riskThrottleMultiplier, OR any row opened after the TRA-2375 boot cliff missing riskThrottleSizingPath on a build that carries ${STAMP_PATH_COMMIT}.`);
   out.push(`eligibility basis=EXACT       UNREACHABLE on live tape — the 11 rows opened in the TRA-2375 merge-to-deploy gap sit permanently inside the population cliff and permanently lack the key. MIXED with PRE_PATH_BUILD attribution is the healthy state; do NOT read a non-EXACT basis as a regression (TRA-2653 D1).`);
   out.push(`VOID                          REACHABLE — a redeploy to a pre-${STAMP_DECIDED_COMMIT} build, or a blind read.`);
