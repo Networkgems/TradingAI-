@@ -551,7 +551,15 @@ import {
 } from './observability/index.js';
 // TRA-1684 — from the module, not the barrel: the barrel re-export dragged the crypto
 // route graph behind every logger import and manufactured the TRA-1674 cycle.
-import { registerLiveHealthRoutes, runStaleStateCheck, projectFleetBooks } from './observability/health-routes.js';
+import { registerLiveHealthRoutes, runStaleStateCheck, projectFleetBooks, rollUpExitCadence } from './observability/health-routes.js';
+// TRA-2840 — durable RTH open/close snapshots of the exit-cadence rollup.
+import {
+  EXIT_CADENCE_SNAPSHOT_MARKER,
+  buildExitCadenceSnapshotLine,
+  dueExitCadenceMark,
+  recordExitCadenceMark,
+  type ExitCadenceEmitState,
+} from './observability/exit-cadence-snapshot.js';
 import {
   rotateBackups,
   checkDataDirHealth,
@@ -12405,6 +12413,54 @@ const backupTimer = setInterval(() => {
   void rotateBackups().catch(err => log.warn('trade-store backup failed', { reason: err instanceof Error ? err.message : String(err) }));
 }, BACKUP_INTERVAL_MS);
 backupTimer.unref?.();
+
+// TRA-2840 — DURABLE exit-cadence snapshots at the RTH open and close.
+//
+// `books.live.tickExitRegionMs` is in-memory and dies with the process, so
+// reading it required an agent inside a ~37-minute unprotected post-close
+// window. That failed four sessions running (see `exit-cadence-snapshot.ts` for
+// the measurements). A log line has no window to lose and no agent that has to
+// be invokable, and Render retains ~7 days of them across every restart.
+//
+// Polled once a minute rather than scheduled at two exact instants on purpose:
+// a fixed `setTimeout` to 13:30Z is itself a single point of failure, and this
+// process is restarted several times an hour. A poll re-derives what is due
+// from the wall clock, so a process that boots at 15:00Z still emits its T0
+// immediately — flagged `partialWindow` so a partial window is visible as
+// partial rather than passing as a whole session.
+const EXIT_CADENCE_SNAPSHOT_POLL_MS = 60_000;
+let exitCadenceEmitState: ExitCadenceEmitState = { lastT0Session: null, lastT1Session: null };
+function emitExitCadenceSnapshotIfDue(nowMs = Date.now()): void {
+  const mark = dueExitCadenceMark(nowMs, exitCadenceEmitState);
+  if (mark === null) return;
+  try {
+    const build = resolveBuildInfo();
+    const line = buildExitCadenceSnapshotLine({
+      mark,
+      nowMs,
+      bootedAtMs: Date.parse(build.startedAt),
+      build,
+      rollup: rollUpExitCadence(getAllUserContexts().map(ctx => ctx.engine.getExitCadenceHealth())),
+    });
+    // The marker leads the message so Render's `text=` filter matches it; the
+    // payload rides as structured fields, parsed not grepped.
+    log.info(EXIT_CADENCE_SNAPSHOT_MARKER, line as unknown as Record<string, unknown>);
+    exitCadenceEmitState = recordExitCadenceMark(exitCadenceEmitState, mark, line.session);
+  } catch (err) {
+    // Never let an instrument take the box down. A failed emit must not also
+    // burn the cursor, so the next poll retries this same mark.
+    log.warn('exit-cadence snapshot emit failed', {
+      mark,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+emitExitCadenceSnapshotIfDue();
+const exitCadenceSnapshotTimer = setInterval(
+  () => emitExitCadenceSnapshotIfDue(),
+  EXIT_CADENCE_SNAPSHOT_POLL_MS,
+);
+exitCadenceSnapshotTimer.unref?.();
 
 // ── Static frontend (production web) ────────────────────────────────────────
 const DIST_DIR = join(__dirname, '..', '..', '..', 'apps', 'desktop', 'dist');
