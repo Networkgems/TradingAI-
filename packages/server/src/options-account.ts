@@ -418,6 +418,75 @@ const BROKER_MISSING_MIN_AGE_MS = 5 * 60_000;
  */
 const ABANDONED_STAGED_EXIT_MAX_AGE_MS = 30 * 60_000;
 
+/**
+ * TRA-2956 — age at which a `sell_to_close` that DID reach the broker and is
+ * still `open` there is withdrawn and re-decided, rather than left working.
+ *
+ * This is the sibling hole to TRA-2819, and the opposite half of the same
+ * state machine. That one was an intent with NO order id; this one has a real
+ * id, so `resolvePendingOptionExits` polls it happily — and polls it forever.
+ * Its three branches are `filled` → finalise, {@link TRADIER_REJECTED_STATUSES}
+ * → clear, and *everything else* → "still open/partial, the next tick polls
+ * again". A limit the market never reaches is neither filled nor rejected, so
+ * it takes the third branch every tick for the life of the order.
+ *
+ * That would only be a stale order, except for `if (opt.pendingExit) continue`
+ * at the TOP of the exit loop — above the line that even reads the mark. While
+ * the latch is set the row skips EVERY exit rule it owns: stop-loss, trailing,
+ * chandelier, time stop, supertrend flip. Not a degraded exit path; no exit
+ * path. On 2026-08-05 a 2-of-4 TP1 on `TSLA260911C00555000` staged at 09:30:25
+ * ET at a `null` limit (the TRA-2957 sentinel inversion), repriced to 0.36 —
+ * above the 0.355 high-water mark the row ever printed, so it could not fill —
+ * and detached the trailing stop on all 4 contracts for 5h09m while that stop
+ * sat violated (mark 0.265 vs trail 0.30175, 25.4% off peak against a 15%
+ * trail).
+ *
+ * ⭐ The failure is SELF-REINFORCING IN EXACTLY THE REGIME THAT NEEDS THE STOP.
+ * A TP1 limit sits ABOVE the market. If the underlying then reverses, the limit
+ * moves FURTHER out of the money — more unfillable, and so latched harder —
+ * at precisely the moment the stop-loss it is suppressing becomes necessary.
+ * The mechanism fails OPEN on adverse moves, which is the one direction a risk
+ * control is not allowed to fail.
+ *
+ * Withdrawing and re-deciding is safe in all three branches, which is why the
+ * remedy is an age-out rather than a rule-domination rewrite:
+ *   • a protective condition is now true → the stop fires on the SAME tick
+ *     (this pass runs before `checkExits`), which is the whole point;
+ *   • the TP1 condition is still true → `checkExits` re-stages it and
+ *     `submitStagedOptionExits` reprices off a FRESH quote (TRA-450), so the
+ *     order lands nearer the market than the stale one it replaced;
+ *   • neither is true → the row rests unlatched with every rule armed.
+ * There is no branch where holding a 5-hour-old unfillable limit beats
+ * re-deriving the decision from the current market. Cancel-and-reprice is also
+ * not a new behaviour here — `tradier-smart-close.ts` already walks a close
+ * that way.
+ *
+ * 15 minutes: ~30 ticks at the 30s cadence, far past any honest fill latency,
+ * and it bounds the detachment window at 15 min instead of a whole session
+ * (~20x tighter than the 5h09m measured). Paired with
+ * {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW} so the reprice cannot become a
+ * churn loop.
+ */
+const WORKING_EXIT_MAX_AGE_MS = 15 * 60_000;
+
+/**
+ * TRA-2956 — how many times one row may have a working exit withdrawn and
+ * re-decided in a single process life.
+ *
+ * The age-out re-arms `checkExits`, which can legitimately re-stage the same
+ * TP1 at a fresh price — so the cancel→re-stage pair is a loop, and an
+ * unbounded one would submit ~26 orders a day against a single position that
+ * simply never reaches its target. Eight is more repricings than any honest
+ * exit needs and still cheap in broker churn.
+ *
+ * On exhaustion the latch is deliberately LEFT ALONE and the row is reported
+ * through {@link OptionsAccount.getStaleWorkingExitStats} instead. That is the
+ * conservative side: an order working at the broker is real, and a row that has
+ * burned its budget is a position the engine cannot price into the market — a
+ * human decision, not a ninth automated retry.
+ */
+const MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW = 8;
+
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
 }
@@ -618,6 +687,36 @@ export interface AbandonedStagedExit {
   /** When the intent was staged (epoch ms) — `pendingExit.submittedAt`. */
   submittedAt: number;
   /** How long it sat unattached before the reap, in ms. */
+  ageMs: number;
+}
+
+/**
+ * TRA-2956 — one working broker exit that aged past
+ * {@link WORKING_EXIT_MAX_AGE_MS} and is a candidate for withdrawal.
+ *
+ * Same disclosure rule as {@link AbandonedStagedExit}: `optionSymbol` exists so
+ * the LOG line is actionable, and the no-auth health route publishes counts
+ * only (TRA-2163).
+ * @see OptionsAccount.listStaleWorkingExits
+ */
+export interface StaleWorkingExit {
+  /** Position row id carrying the latch. */
+  id: string;
+  /** OCC symbol, or null on a row that never carried one. */
+  optionSymbol: string | null;
+  /** Book the row belongs to — live is the half with real money detached. */
+  mode: AccountMode;
+  /** Which rule staged the intent the broker is still working. */
+  kind: OptionPendingExit['kind'];
+  /** Contracts committed to the working order. */
+  qty: number;
+  /** The Tradier order id to cancel. Never `''` — those are TRA-2819's. */
+  tradierOrderId: string | number;
+  /** Limit the order is working at, for the log line's fillability argument. */
+  limitPrice: number;
+  /** When the order was submitted (epoch ms). */
+  submittedAt: number;
+  /** How long it has been working, in ms. */
   ageMs: number;
 }
 
@@ -1137,6 +1236,33 @@ export class PaperOptionsAccount {
   private lastAbandonedStagedExits: AbandonedStagedExit[] = [];
   /** TRA-2819 — epoch ms of the most recent reap, or null if none this boot. */
   private lastAbandonedStagedExitAt: number | null = null;
+  /**
+   * TRA-2956 — how many working broker exits have been withdrawn and
+   * re-decided this process life. Same in-memory / reset-on-restart reasoning
+   * as {@link abandonedStagedExitsReaped}.
+   *
+   * Read it as a DETACHMENT counter, not a repair score. Each increment is a
+   * row that spent up to {@link WORKING_EXIT_MAX_AGE_MS} with every exit rule
+   * off. The repair is the good news; the count is the bad news.
+   */
+  private staleWorkingExitsCleared = 0;
+  /** TRA-2956 — the LIVE subset of {@link staleWorkingExitsCleared}. */
+  private staleWorkingExitsClearedLive = 0;
+  /**
+   * TRA-2956 — rows whose withdrawal budget
+   * ({@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW}) is exhausted, or whose
+   * cancel could not be CONFIRMED unfilled at the broker. Both are left
+   * latched on purpose, so this is the count of positions the automation has
+   * given up on and a human must look at. Unlike the cleared counters, a
+   * non-zero value here does NOT resolve itself.
+   */
+  private staleWorkingExitsHeld = 0;
+  /** TRA-2956 — per-row withdrawal count, keyed by position id, per boot. */
+  private staleWorkingExitClears: Map<string, number> = new Map();
+  /** TRA-2956 — the most recent withdrawal batch, for the health surface. */
+  private lastStaleWorkingExits: StaleWorkingExit[] = [];
+  /** TRA-2956 — epoch ms of the most recent withdrawal, or null this boot. */
+  private lastStaleWorkingExitAt: number | null = null;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -4994,6 +5120,126 @@ export class PaperOptionsAccount {
       reapedLiveTotal: this.abandonedStagedExitsReapedLive,
       lastReapedAt: this.lastAbandonedStagedExitAt,
       lastReaped: this.lastAbandonedStagedExits,
+    };
+  }
+
+  /**
+   * TRA-2956 — list working broker exits old enough to withdraw and re-decide.
+   *
+   * See {@link WORKING_EXIT_MAX_AGE_MS} for why an unfillable limit latches
+   * every exit rule off a row, and why re-deriving the decision beats holding
+   * the order in all three branches.
+   *
+   * This is a pure QUERY. It never mutates, because the cancel it leads to is
+   * a real broker write that only the engine can perform, and the row must not
+   * be marked as handled before that write is CONFIRMED — the caller reports
+   * back through {@link noteStaleWorkingExitCleared} / {@link noteStaleWorkingExitHeld}.
+   *
+   * The complement of TRA-2819's reap, and deliberately disjoint from it:
+   *   • `tradierOrderId !== ''` ONLY. An intent with no id was never sent, so
+   *     there is nothing to cancel and `reapAbandonedStagedExits` owns it.
+   *     Both selecting the same row would mean two paths clearing one latch.
+   *   • a MISSING or unusable `submittedAt` is skipped, not aged out — the
+   *     inverse of the reap's default. There the intent was provably never
+   *     sent, so treating it as old was safe; here a live broker order exists
+   *     and "cannot prove it is recent" must not authorise cancelling it.
+   *   • past its per-row budget → not returned, and counted as HELD.
+   */
+  listStaleWorkingExits(nowMs: number = Date.now()): StaleWorkingExit[] {
+    const stale: StaleWorkingExit[] = [];
+    for (const [id, opt] of this.openOptions) {
+      const pending = opt.pendingExit;
+      if (!pending) continue;
+      if (pending.tradierOrderId === '') continue;
+      if (!Number.isFinite(pending.submittedAt)) continue;
+      const ageMs = nowMs - pending.submittedAt;
+      if (ageMs < WORKING_EXIT_MAX_AGE_MS) continue;
+      if ((this.staleWorkingExitClears.get(id) ?? 0) >= MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW) {
+        continue;
+      }
+      stale.push({
+        id,
+        optionSymbol: opt.optionSymbol ?? null,
+        mode: opt.mode ?? 'demo',
+        kind: pending.kind,
+        qty: pending.qty,
+        tradierOrderId: pending.tradierOrderId,
+        limitPrice: pending.limitPrice,
+        submittedAt: pending.submittedAt,
+        ageMs,
+      });
+    }
+    return stale;
+  }
+
+  /**
+   * TRA-2956 — the broker CONFIRMED the order is terminal with zero contracts
+   * executed, so drop the latch and hand the row back to `checkExits`.
+   *
+   * `countRejection: false` is load-bearing for the same reason as TRA-2819's:
+   * the broker did not refuse this contract, WE withdrew the order. Counting it
+   * would advance the TRA-450 breaker toward `MAX_CONSECUTIVE_CLOSE_REJECTS`
+   * and pause auto-close on exactly the rows that just proved they need it —
+   * and unlike a genuine rejection this path can repeat by design, so it would
+   * trip the breaker on its own after {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW}
+   * withdrawals.
+   *
+   * Returns false when the latch vanished between the query and the confirmed
+   * cancel (a fill finalised it on another path), in which case nothing is
+   * counted — the exit resolved for real and this was not a detachment.
+   */
+  noteStaleWorkingExitCleared(stale: StaleWorkingExit, nowMs: number = Date.now()): boolean {
+    const minutes = Math.round(stale.ageMs / 60_000);
+    const cleared = this.clearPendingExit(
+      stale.id,
+      `A ${stale.kind} sell_to_close was working at Tradier for ${minutes} min at a `
+        + `$${stale.limitPrice.toFixed(2)} limit the market never reached, which detached every `
+        + 'exit rule on this position. The order was cancelled (confirmed unfilled) and the '
+        + 'position returned to normal exit management. No contracts were sold. TRA-2956.',
+      { countRejection: false },
+    );
+    if (!cleared) return false;
+    this.staleWorkingExitClears.set(
+      stale.id,
+      (this.staleWorkingExitClears.get(stale.id) ?? 0) + 1,
+    );
+    this.staleWorkingExitsCleared += 1;
+    if (stale.mode === 'live') this.staleWorkingExitsClearedLive += 1;
+    this.lastStaleWorkingExits = [stale];
+    this.lastStaleWorkingExitAt = nowMs;
+    return true;
+  }
+
+  /**
+   * TRA-2956 — the withdrawal did NOT happen: the cancel threw, or the broker
+   * would not confirm the order terminal-and-unfilled. The latch stays, so the
+   * row is still detached and that has to be countable rather than inferred
+   * from the absence of a cleared count.
+   */
+  noteStaleWorkingExitHeld(): void {
+    this.staleWorkingExitsHeld += 1;
+  }
+
+  /**
+   * TRA-2956 — withdrawal telemetry for the options-live health surface.
+   *
+   * `held` is the field to watch. `cleared` is a repair that already happened;
+   * `held` is a live position whose exit rules are off RIGHT NOW and which no
+   * automated path will fix.
+   */
+  getStaleWorkingExitStats(): {
+    clearedTotal: number;
+    clearedLiveTotal: number;
+    heldTotal: number;
+    lastClearedAt: number | null;
+    lastCleared: StaleWorkingExit[];
+  } {
+    return {
+      clearedTotal: this.staleWorkingExitsCleared,
+      clearedLiveTotal: this.staleWorkingExitsClearedLive,
+      heldTotal: this.staleWorkingExitsHeld,
+      lastClearedAt: this.lastStaleWorkingExitAt,
+      lastCleared: this.lastStaleWorkingExits,
     };
   }
 

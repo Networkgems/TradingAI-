@@ -6826,6 +6826,11 @@ export class SignalEngine {
     ];
     for (const { env, acct } of buckets) {
       const pending = acct.listPendingExits();
+      // TRA-2956 — resolved once per bucket rather than per row: the query is
+      // a whole-account scan, and taking a single `now` for the pass means two
+      // rows staged in the same tick cannot land on opposite sides of the age
+      // gate because the loop took a second to get to the second one.
+      const staleById = new Map(acct.listStaleWorkingExits().map(s => [s.id, s]));
       for (const opt of pending) {
         const pendingExit = opt.pendingExit;
         if (!pendingExit) continue;
@@ -6884,6 +6889,16 @@ export class SignalEngine {
               order: pendingExit.tradierOrderId,
               status: `${status}${reasonSuffix}`,
             });
+          } else {
+            // TRA-2956 — the third branch. Neither filled nor rejected means
+            // the order is STILL WORKING at Tradier, and the pre-fix code said
+            // only "the next tick polls again" — for the life of the order.
+            // A limit the market never reaches never leaves this branch, and
+            // `if (opt.pendingExit) continue` keeps every exit rule on the row
+            // detached for as long as it sits here. Withdraw it on age so the
+            // decision is re-derived from the current market.
+            const stale = staleById.get(opt.id);
+            if (stale) await this.withdrawStaleWorkingExit(env, acct, opt, stale, detail);
           }
         } catch (err: unknown) {
           log.warn('resolvePendingOptionExits failed', {
@@ -6893,6 +6908,134 @@ export class SignalEngine {
         }
       }
     }
+  }
+
+  /**
+   * TRA-2956 — cancel a `sell_to_close` that has been working too long, and
+   * drop the latch ONLY once the broker confirms it terminal and unfilled.
+   *
+   * The whole risk of this repair is in one sentence: clearing `pendingExit`
+   * re-arms the exit rules, so clearing it while the order is still live at
+   * Tradier is how you sell the same contracts twice. Every guard below exists
+   * to make the local clear strictly downstream of a CONFIRMED broker state,
+   * and every one of them fails toward LEAVING THE LATCH ALONE.
+   *
+   *  1. **A partial fill is never touched.** `exec_quantity > 0` means the
+   *     order CAN fill — it is not the unfillable-limit pathology at all — and
+   *     cancelling would strand the executed contracts: the broker has sold
+   *     them, `finalizePendingExit` books `pendingExit.qty`, and nothing
+   *     reconciles the difference. Left working; it resolves normally.
+   *  2. **A cancel that returns is not a cancel that happened.**
+   *     `TradierOptionsClient.cancelOrder` deliberately swallows 422 and 404 —
+   *     the right call for an idempotent DELETE, and it means a clean return
+   *     proves only that we ASKED. So the status is re-read afterwards and the
+   *     latch survives anything short of a terminal, zero-executed answer.
+   *  3. **An absent `exec_quantity` is UNMEASURED, never zero** — the same
+   *     rule `tradier-smart-close.ts` applies to its own fill accounting. A
+   *     broker that will not say how much filled cannot authorise re-arming.
+   *  4. **A fill during the cancel wins.** If the re-read says `filled`, we
+   *     leave `pendingExit` in place and return: the next tick's poll takes the
+   *     `filled` branch and books the real fill price through the normal path.
+   *     The race is not prevented, it is RESOLVED, and in the direction where
+   *     the contracts are only accounted once.
+   *
+   * Held rows are counted, not just skipped. A latch that survives this is a
+   * live position with its exit rules off and no automated path left to fix
+   * it — that has to show up on the health surface as a number, because the
+   * failure it descends from went unnoticed for 5h09m precisely by looking
+   * exactly like nothing happening.
+   */
+  private async withdrawStaleWorkingExit(
+    env: TradierEnv,
+    acct: PaperOptionsAccount,
+    opt: import('@trading-app/shared').OptionPosition,
+    stale: import('./options-account.js').StaleWorkingExit,
+    detail: import('@trading-app/engine').TradierOrderDetail,
+  ): Promise<void> {
+    const client = this.tradierLiveClient;
+    const base = {
+      component: 'stale-working-exit',
+      env,
+      optionSymbol: opt.optionSymbol,
+      mode: stale.mode,
+      kind: stale.kind,
+      qty: stale.qty,
+      order: stale.tradierOrderId,
+      limitPrice: stale.limitPrice,
+      ageMinutes: Math.round(stale.ageMs / 60_000),
+      issue: 'TRA-2956',
+    };
+    if (!client) {
+      acct.noteStaleWorkingExitHeld();
+      return;
+    }
+    // Guard 1 — a partial fill is a different animal; leave it working.
+    if (typeof detail.exec_quantity === 'number' && detail.exec_quantity > 0) {
+      log.info('stale working exit is PARTIALLY FILLED — leaving it to resolve', {
+        ...base,
+        execQuantity: detail.exec_quantity,
+      });
+      return;
+    }
+    try {
+      await client.cancelOrder(stale.tradierOrderId);
+    } catch (err: unknown) {
+      acct.noteStaleWorkingExitHeld();
+      log.warn('stale working exit cancel THREW — latch left in place, position stays detached', {
+        ...base,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    // Guard 2/3/4 — re-read, and demand a terminal, provably-zero-fill answer.
+    const after = await client.getOrderStatus(stale.tradierOrderId);
+    const executed = after && typeof after.exec_quantity === 'number' && Number.isFinite(after.exec_quantity)
+      ? after.exec_quantity
+      : null;
+    const confirmedUnfilled =
+      after !== null
+      && TRADIER_REJECTED_STATUSES.has(after.status)
+      && executed === 0;
+    if (!confirmedUnfilled) {
+      acct.noteStaleWorkingExitHeld();
+      log.warn('stale working exit cancel NOT CONFIRMED unfilled — latch left in place', {
+        ...base,
+        statusAfterCancel: after?.status ?? null,
+        execQuantityAfterCancel: executed,
+      });
+      return;
+    }
+    if (!acct.noteStaleWorkingExitCleared(stale)) return;
+    log.warn('stale working exit WITHDRAWN — unfillable limit had detached every exit rule', {
+      ...base,
+      statusAfterCancel: after.status,
+    });
+  }
+
+  /**
+   * TRA-2956 — withdrawal telemetry, summed across both broker books for the
+   * options-live health route. Mirrors {@link getAbandonedStagedExitStats}.
+   */
+  getStaleWorkingExitStats(): {
+    clearedTotal: number;
+    clearedLiveTotal: number;
+    heldTotal: number;
+    lastClearedAt: number | null;
+  } {
+    let clearedTotal = 0;
+    let clearedLiveTotal = 0;
+    let heldTotal = 0;
+    let lastClearedAt: number | null = null;
+    for (const env of ['sandbox', 'production'] as const) {
+      const stats = this.optionsAccounts[env].getStaleWorkingExitStats();
+      clearedTotal += stats.clearedTotal;
+      clearedLiveTotal += stats.clearedLiveTotal;
+      heldTotal += stats.heldTotal;
+      if (stats.lastClearedAt !== null && (lastClearedAt === null || stats.lastClearedAt > lastClearedAt)) {
+        lastClearedAt = stats.lastClearedAt;
+      }
+    }
+    return { clearedTotal, clearedLiveTotal, heldTotal, lastClearedAt };
   }
 
   /**

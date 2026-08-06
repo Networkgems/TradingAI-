@@ -8780,6 +8780,32 @@ app.get('/api/health/options-live', async (_req, res) => {
         },
         { reaped: 0, reapedLive: 0, lastReapedAt: null as number | null },
       ),
+      // TRA-2956 — the sibling counter, and the one with a field that does not
+      // heal. `cleared` counts unfillable `sell_to_close` limits withdrawn
+      // after they had detached every exit rule on their row; each is a repair
+      // that already happened, so a non-zero value is history plus a defect
+      // rate. `held` is NOT history: it is rows whose cancel could not be
+      // confirmed unfilled, or that burned their per-row retry budget, and
+      // each one is a live position sitting with its stop-loss off and no
+      // automated path left to arm it. `held > 0` wants a human on the
+      // authenticated `/api/state` now, not at the close.
+      //
+      // Counts only — same TRA-2163 disclosure rule as above.
+      staleWorkingExits: getAllUserContexts().reduce(
+        (acc, c) => {
+          const s = c.engine.getStaleWorkingExitStats();
+          return {
+            cleared: acc.cleared + s.clearedTotal,
+            clearedLive: acc.clearedLive + s.clearedLiveTotal,
+            held: acc.held + s.heldTotal,
+            lastClearedAt:
+              s.lastClearedAt !== null && (acc.lastClearedAt === null || s.lastClearedAt > acc.lastClearedAt)
+                ? s.lastClearedAt
+                : acc.lastClearedAt,
+          };
+        },
+        { cleared: 0, clearedLive: 0, held: 0, lastClearedAt: null as number | null },
+      ),
     });
   } catch (err) {
     log.error('options-live health probe failed', {
