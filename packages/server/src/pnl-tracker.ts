@@ -156,7 +156,36 @@ interface PersistedState {
   openingOptionsPnl: number;
   openingDate: string;
   updatedAt: string;
+  /**
+   * TRA-3039 — WHICH authority last set {@link PersistedState.openingEquity}.
+   *
+   * Provenance only: nothing branches on it, and it is absent on every state
+   * file written before this ticket (so it can never gate the fix on a
+   * migration). It exists because the three writers below produce the SAME
+   * number on a healthy book and wildly different ones on a sick book, and
+   * without a marker the on-disk state cannot say which one ran:
+   *
+   *  - `prior-session-close` — {@link PnlTracker.saveSnapshot}. The anchor is
+   *    the previous session's recorded `closingEquity`, which is the ONLY value
+   *    that makes the daily rows telescope (`openingEquity(N) === closingEquity(N-1)`).
+   *  - `rebase` — {@link PnlTracker.syncOpeningEquity}. A starting-balance edit
+   *    / mode switch / forced reset deliberately moved the anchor off the prior
+   *    close so the rebase does not read as daily P&L (TRA-138).
+   *  - `day-roll-state-equity` — {@link PnlTracker.advanceDayIfNeeded} rolled a
+   *    session that never closed. This is the lossy branch: it orphans whatever
+   *    moved since the last booked row (the leak TRA-1557 documented).
+   */
+  openingEquityBasis?: string;
 }
+
+/**
+ * TRA-3039 — the anchor-preservation comparison is on RECORDED DOLLARS, both
+ * sides of which `saveSnapshot` assigned from the same `number`. A half-cent
+ * window absorbs a JSON round-trip without being wide enough to admit a
+ * starting-balance rebase, which is the only other writer of this field and
+ * always moves it by whole dollars.
+ */
+const ANCHOR_MATCH_EPSILON_USD = 0.005;
 
 function todayKey(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -226,14 +255,104 @@ export class PnlTracker {
     return [];
   }
 
+  /**
+   * TRA-3039 — the most recently DATED snapshot, or `null` when none is booked.
+   *
+   * Scans rather than reading `at(-1)`: `saveSnapshot` keeps the array sorted,
+   * but `loadSnapshots` parses a file that the EOD back-fill writer and past
+   * hand-repairs also touch, and an out-of-order tail would silently hand the
+   * anchor test the wrong row.
+   */
+  private latestSnapshot(): DailySnapshot | null {
+    let latest: DailySnapshot | null = null;
+    for (const s of this.snapshots) {
+      if (!s || typeof s.date !== 'string') continue;
+      if (latest === null || s.date > latest.date) latest = s;
+    }
+    return latest;
+  }
+
+  /**
+   * TRA-3039 — is `openingEquity` ALREADY the previous session's recorded close?
+   *
+   * `saveSnapshot` writes `openingEquity = closingEquity` and `openingDate =
+   * snapshot.date` as a pair, meaning "this anchor is the close of `openingDate`,
+   * i.e. the opening of whatever session comes next". When both still hold, the
+   * anchor needs no roll — it is already correct for the new day, and re-rolling
+   * it can only move it AWAY from the prior close.
+   *
+   * A `syncOpeningEquity` rebase breaks the equality (it moves the anchor off the
+   * close on purpose), so this correctly returns false there and the rebase keeps
+   * its TRA-138 day-roll behaviour.
+   */
+  private anchorIsPriorSessionClose(): boolean {
+    const latest = this.latestSnapshot();
+    if (latest === null || latest.date !== this.state.openingDate) return false;
+    const close = latest.closingEquity;
+    if (close === null || !Number.isFinite(close)) return false;
+    if (!Number.isFinite(this.state.openingEquity)) return false;
+    return Math.abs(close - this.state.openingEquity) <= ANCHOR_MATCH_EPSILON_USD;
+  }
+
+  /**
+   * TRA-3039 — DO NOT re-anchor a day whose predecessor actually closed.
+   *
+   * THE DEFECT THIS FIXES. `saveSnapshot` and this method disagreed about what
+   * `openingDate` means. `saveSnapshot` writes it as "the session this anchor
+   * CLOSED"; this method read it as "the session this anchor OPENS", concluded
+   * the anchor was stale on every boot into a new ET day, and overwrote a
+   * correct `closingEquity(N-1)` with `state.equity` — a cache only the TRADE
+   * path (`saveEquity`) ever writes. On any book where those two durable records
+   * had drifted apart, the anchor moved OFF the prior close, and the next 21:00
+   * ET row booked
+   *
+   *     stockDaily = (equity - openingEquity) - creditWindow
+   *
+   * over a window that starts before the prior close — re-booking a slice of the
+   * previous session into this one.
+   *
+   * Live bqb1, 2026-08-05 (the pull on TRA-3039): **31 of 47 gradeable books**
+   * wrote an 08-05 row whose derived `openingEquity` was byte-identical to the
+   * 08-04 row's `openingEquity` and DIFFERENT from the 08-04 row's
+   * `closingEquity` — the anchor had not advanced across the close at all,
+   * because those books were idle and `state.equity` had not moved between the
+   * two boots. Both directions occur (22 books anchored BELOW the prior close,
+   * 14 ABOVE), so no "pick the fresher file" heuristic covers it; the only
+   * correct anchor is the recorded close itself.
+   *
+   * 5 of those 31 additionally tripped the TRA-2658 frozen-counter arm and were
+   * reported as a credit-durability regression — they are not one. The frozen
+   * predicate fires on the subset whose anchor error happens to fit inside the
+   * book's realized-options pool, so it under-counts this defect ~6x and
+   * mis-attributes it. `ctoverify_tra2333` read CLEAN over the same broken
+   * anchor only because the TRA-2847 reseed added exactly the 73.05 its stale
+   * window was short: two errors of equal size cancelling, not a repair.
+   *
+   * The roll from `state.equity` REMAINS for the case it was written for: a
+   * session that never closed (server down at the 21:00 ET archive, or a process
+   * that crossed midnight without the EOD job). There the last snapshot's date
+   * is older than `openingDate`, nothing recorded a close to anchor on, and
+   * rolling to current equity is what keeps the dashboard's daily P&L from
+   * opening the day at a phantom figure (TRA-241). That branch is still lossy —
+   * it orphans the elapsed move from the booked ledger, which is exactly the
+   * leak TRA-1557 reconciles `allTimePnl` against — so it now says so on disk
+   * via {@link PersistedState.openingEquityBasis}.
+   */
   private advanceDayIfNeeded(): void {
     const today = todayKey();
-    if (this.state.openingDate !== today) {
-      this.state.openingEquity = this.state.equity;
-      this.state.openingOptionsPnl = this.state.optionsPnl;
+    if (this.state.openingDate === today) return;
+    if (this.anchorIsPriorSessionClose()) {
+      // The anchor is already `closingEquity(N-1)`. Stamp the new day onto it and
+      // leave the equity/options anchors untouched, so the rows telescope.
       this.state.openingDate = today;
       this.persistState();
+      return;
     }
+    this.state.openingEquity = this.state.equity;
+    this.state.openingOptionsPnl = this.state.optionsPnl;
+    this.state.openingDate = today;
+    this.state.openingEquityBasis = 'day-roll-state-equity';
+    this.persistState();
   }
 
   getSavedEquity(): number {
@@ -269,6 +388,11 @@ export class PnlTracker {
    */
   syncOpeningEquity(currentEquity: number, dailyPnl: number): void {
     this.state.openingEquity = currentEquity - dailyPnl;
+    // TRA-3039 — provenance only. This is the one writer that is SUPPOSED to
+    // move the anchor off the prior session's close, and `advanceDayIfNeeded`
+    // detects that structurally (the equality with the last snapshot's
+    // `closingEquity` breaks), never by reading this field.
+    this.state.openingEquityBasis = 'rebase';
     this.persistState();
   }
 
@@ -287,6 +411,10 @@ export class PnlTracker {
       this.state.openingEquity = snapshot.closingEquity;
       this.state.openingOptionsPnl = this.state.optionsPnl;
       this.state.openingDate = snapshot.date;
+      // TRA-3039 — this pair (`openingEquity` = the close, `openingDate` = the
+      // session that closed) is exactly what `advanceDayIfNeeded` must now
+      // PRESERVE rather than overwrite from `state.equity`.
+      this.state.openingEquityBasis = 'prior-session-close';
       this.persistState();
     }
   }
