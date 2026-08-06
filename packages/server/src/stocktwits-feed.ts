@@ -26,7 +26,17 @@ import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'stocktwits-feed' });
 
-const ST_CALL_TIMEOUT_MS = 6_000;
+/**
+ * Per-call timeout for every StockTwits fetch.
+ *
+ * TRA-3019 — exported because it is the term that SIZES the
+ * `signal.doTick.social-sentiment` wall-clock budget: this sink's worst case is
+ * its budget plus the calls that overrun it, and each overrun is bounded by
+ * exactly this. The budget test imports it rather than re-typing `6000`, so
+ * raising this timeout fails that test instead of silently pushing the sink back
+ * over its 30s bar.
+ */
+export const ST_CALL_TIMEOUT_MS = 6_000;
 /** Default breaker cooldown when a 429 arrives without a parseable reset. */
 const DEFAULT_COOLDOWN_MS = 5 * 60_000;
 /**

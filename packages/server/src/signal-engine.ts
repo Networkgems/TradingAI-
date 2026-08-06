@@ -1236,6 +1236,56 @@ const NEWS_REFRESH_MS = 5 * 60_000;
 // per-IP budget is not exhausted (see SOCIAL_SYMBOL_LIMIT).
 const SOCIAL_REFRESH_MS = 5 * 60_000;
 const SOCIAL_SYMBOL_LIMIT = 8;
+/**
+ * TRA-3019 — wall-clock a `signal.doTick.social-sentiment` rotation may spend
+ * inside one tick. This is a LATENCY bound and it is a different concern from
+ * {@link SOCIAL_SYMBOL_LIMIT}, which is a QUOTA control (the unauthenticated
+ * StockTwits endpoint's per-IP budget). Conflating the two is why this sink was
+ * described as "already budgeted" while carrying no time bound at all.
+ *
+ * ── Why it was unbounded, and what the real ceiling was ──────────────────────
+ * The sink is two SERIAL loops — 8 crowd symbols then 9 curated accounts — and
+ * nothing truncated on elapsed wall clock. Its only ceiling was structural:
+ * 17 sequential calls × `ST_CALL_TIMEOUT_MS` (6s, stocktwits-feed.ts) = 102s.
+ * That is why 62.12s was reachable on the 2026-08-05 RTH tape (≈10 of 17 calls
+ * timing out) while every sink carrying a fan-out budget clamped in the 30s
+ * band. The sink sits INSIDE the tick exit region (TRA-2257), and with
+ * TRA-2607 shipping the exit hoist OFF on the real-money book, live exits still
+ * ride the tick — so this is an exit-latency term, not tidiness.
+ *
+ * ── Why 15s and not the shared 30s ──────────────────────────────────────────
+ * The three TRA-2262 sinks and TRA-2477's fourth share `SWEEP_BUDGET_MS`
+ * (30_000). This one CANNOT: the graded bar is max ≤ 30s, and the worst case is
+ * not the budget, it is the budget plus the calls that overrun it. The budget is
+ * checked AFTER a batch (it has to be — the overrun is always the call already
+ * in flight), and the curated lane is guaranteed one call per pass by
+ * `runBudgetedSweep`'s forward-progress invariant, so:
+ *
+ *   worst pass = budget + in-flight crowd call + forced curated call
+ *              = 15s + 6s + 6s = 27s  ≤ 30s ✅   (30s budget ⇒ 42s ✗)
+ *
+ * ── Why it costs no coverage ────────────────────────────────────────────────
+ * p90 for the WHOLE sink is 9.55s, well inside 15s, so the modal rotation
+ * completes in a single pass and is never truncated — the cap bites only the
+ * tail, exactly as TRA-2477 sized its reuse of the shared budget. In the
+ * pathological all-timeouts world (102s) the rotation spans ~6 passes; an
+ * unfinished sweep re-enters on the NEXT tick (30s) rather than waiting out the
+ * 5-minute throttle, so a full rotation still lands in ~3 min < SOCIAL_REFRESH_MS.
+ *
+ * ⭐ And the request RATE cannot rise: a rotation is still ≤ 8 crowd + 9 curated
+ * calls, and rotations are still no more frequent than {@link SOCIAL_REFRESH_MS}.
+ * Slicing a latency-bound serial walk can only LOWER its rate (TRA-2262), so the
+ * TRA-1996 feed-quota hazard is structurally unreachable here.
+ */
+export const SOCIAL_SWEEP_BUDGET_MS = 15_000;
+
+/**
+ * TRA-3019 — the graded bar this sink's budget is sized against: `max <= 30s`
+ * for `signal.doTick.social-sentiment` over one full RTH session. Exported so
+ * the sizing test asserts the DERIVATION against the bar rather than restating
+ * a number, and so a future edit to either term fails loudly here.
+ */
+export const SOCIAL_SWEEP_GRADED_MAX_MS = 30_000;
 // TRA-226 — refresh the Tradier `/accounts/{id}/balances` snapshot at most
 // every 2 minutes. Tradier rate-limits balance reads, and the dashboard
 // equity does not need second-level freshness — order fills come through
@@ -2634,6 +2684,37 @@ export class SignalEngine {
    */
   private curatedSocialCache: Map<string, StockTwitsMessage[]> = new Map();
   private lastSocialRefresh = 0;
+  /**
+   * TRA-3019 — curated messages accumulated across the budgeted slices of ONE
+   * curated rotation, drained into {@link curatedSocialCache} only when that
+   * rotation COMPLETES.
+   *
+   * 🔴 This is the consumer hazard of slicing this sink, and it is silent.
+   * `curatedSocialCache` is REBUILT WHOLESALE from the collected batch (that is
+   * its contract — "each refresh is a full snapshot of every curated account, so
+   * a stale fold-out can't linger"). Swapping it on a PARTIAL pass would replace
+   * a 9-account snapshot with a 1-3-account one: nothing throws, no fetch fails,
+   * `getSocialSentiment` just quietly returns a thinner curated lane for every
+   * symbol until the rotation happens to finish on a fast tick. Accumulating and
+   * draining on completion keeps the published snapshot whole-universe, which is
+   * the same fix `pendingWheelScans` needed for TRA-2262's short-premium sink.
+   *
+   * (The CROWD lane needs no equivalent: `socialCache` is a per-symbol upsert, so
+   * an unvisited symbol keeps its previous batch — identical to the degradation
+   * a null fetch already produces.)
+   */
+  private pendingCuratedSocial: StockTwitsMessage[] = [];
+  /**
+   * Whether ANY curated account responded during the in-flight rotation. Latched
+   * across slices so the "no account responded ⇒ keep the last snapshot" rule is
+   * evaluated over the WHOLE rotation, never over one slice.
+   */
+  private pendingCuratedSocialAnySuccess = false;
+  /**
+   * TRA-3019 — the last budgeted `social-sentiment` rotation. Incomplete ⇒ the
+   * sink re-enters on the next tick instead of waiting out SOCIAL_REFRESH_MS.
+   */
+  private socialSweep: SweepPass | null = null;
   /**
    * TRA-533 — per-symbol multi-timeframe technical snapshots, refreshed on the
    * tick (throttled, see {@link TECHNICAL_SNAPSHOT_REFRESH_MS}) and read by
@@ -4605,9 +4686,19 @@ export class SignalEngine {
     // throttled / cold) without disturbing the cached batch, so getSocialSentiment
     // keeps serving the last good read. Capped to SOCIAL_SYMBOL_LIMIT symbols to
     // stay within the unauthenticated per-IP budget.
-    if (Date.now() - this.lastSocialRefresh > SOCIAL_REFRESH_MS) {
-      await withPhase('signal.doTick.social-sentiment', () => this.refreshSocialSentiment());
+    // TRA-3019 — …and BUDGETED. This sink was the last `signal.doTick` sub-label
+    // over 60s (max 62.12s on the 2026-08-05 RTH tape) and the only one with no
+    // wall-clock bound of any kind — its 8+9 serial StockTwits calls were capped
+    // only by 17 × the feed's 6s per-call timeout. An unfinished rotation
+    // re-enters on the NEXT tick rather than waiting out the 5-minute throttle,
+    // so the universe is still covered on today's schedule.
+    if (Date.now() - this.lastSocialRefresh
+        >= nextSweepDelayMs(this.socialSweep, SOCIAL_REFRESH_MS)) {
       this.lastSocialRefresh = Date.now();
+      this.socialSweep = await withPhase(
+        'signal.doTick.social-sentiment',
+        () => this.refreshSocialSentiment(),
+      );
     }
 
     // TRA-389 — refresh the cached premarket market-review so the per-tick
@@ -14487,21 +14578,71 @@ export class SignalEngine {
    * the per-symbol message cache. Best-effort: a null fetch (breaker open / 429 /
    * cold) leaves that symbol's previous batch untouched, so a transient blip
    * never wipes a good read. Never throws.
+   *
+   * TRA-3019 — BOUNDED. Both lanes now rotate under ONE shared wall-clock
+   * deadline ({@link SOCIAL_SWEEP_BUDGET_MS}); the returned {@link SweepPass}
+   * tells the caller whether the rotation finished, and an unfinished one
+   * re-enters on the next tick.
+   *
+   * ⚠️ A truncation is NOT a breaker trip and the two must not be read as the
+   * same event. They are distinguishable by construction: a truncation emits
+   * `doTick sink truncated by its wall-clock budget` with `sink: <mode>:social-*`
+   * and touches no cache; a breaker trip emits `rate-limited (429); breaker open`
+   * from stocktwits-feed.ts. Neither reaches the TRA-820/TRA-2519 sentiment
+   * accrual at all — `sentiment-snapshot-recorder.ts` runs on its own 15:55 ET
+   * hook against its own injected fetch, and never reads `socialCache`.
    */
-  private async refreshSocialSentiment(): Promise<void> {
+  private async refreshSocialSentiment(): Promise<SweepPass> {
+    // TRA-3019 — ONE deadline across BOTH lanes, not one each. Budgeting the two
+    // loops independently would put the worst case at 2 × budget + overruns,
+    // which cannot meet a 30s bar at any budget worth having. The crowd lane
+    // spends first; the curated lane gets whatever is LEFT, floored at 0 — and
+    // `runBudgetedSweep`'s forward-progress invariant still runs one curated
+    // account on a pass whose budget the crowd lane consumed entirely, so the
+    // curated rotation can never be starved by a slow crowd lane.
+    const startedAt = Date.now();
+
+    // The quota control is unchanged: still at most SOCIAL_SYMBOL_LIMIT crowd
+    // symbols per rotation. The cursor rotates WITHIN that head slice; it does
+    // not widen it.
     const symbols = this.getActiveSymbols().slice(0, SOCIAL_SYMBOL_LIMIT);
-    for (const sym of symbols) {
-      try {
-        const messages = await fetchStockTwitsStream(sym);
-        if (messages !== null) this.socialCache.set(sym.toUpperCase(), messages);
-      } catch (err) {
-        log.warn('social refresh failed', {
-          symbol: sym,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-    await this.refreshCuratedSocialSentiment();
+    const crowd = await runBudgetedSweep({
+      // Per-engine: `mode` namespaces demo from live so two engines do not
+      // consume each other's cursor.
+      key: `${this.mode}:social-crowd`,
+      symbols,
+      budgetMs: SOCIAL_SWEEP_BUDGET_MS,
+      run: async ([sym]) => {
+        if (!sym) return;
+        try {
+          const messages = await fetchStockTwitsStream(sym);
+          if (messages !== null) this.socialCache.set(sym.toUpperCase(), messages);
+        } catch (err) {
+          log.warn('social refresh failed', {
+            symbol: sym,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    });
+
+    const curated = await this.refreshCuratedSocialSentiment(
+      Math.max(0, SOCIAL_SWEEP_BUDGET_MS - (Date.now() - startedAt)),
+    );
+
+    // The rotation this sink re-enters on is the pair. Reporting `complete` only
+    // when BOTH lanes have finished is what stops a completed crowd lane from
+    // sending a half-swept curated lane back to the 5-minute throttle.
+    return {
+      processed: [...crowd.processed, ...curated.processed],
+      total: crowd.total + curated.total,
+      startIndex: crowd.startIndex,
+      complete: crowd.complete && curated.complete,
+      budgetExhausted: crowd.budgetExhausted || curated.budgetExhausted,
+      stopped: crowd.stopped || curated.stopped,
+      resumeAt: crowd.resumeAt ?? curated.resumeAt,
+      elapsedMs: Date.now() - startedAt,
+    };
   }
 
   /**
@@ -14510,28 +14651,51 @@ export class SignalEngine {
    * message `symbols` entity). Best-effort: if every account fetch degrades to
    * null (breaker open / 429 / cold), the previous curated snapshot is left
    * untouched so a transient blip never wipes a good read. Never throws.
+   *
+   * TRA-3019 — the walk is now budgeted, so ONE ROTATION MAY SPAN SEVERAL TICKS
+   * and `budgetMs` is whatever the crowd lane left. The wholesale rebuild is
+   * still wholesale — it just happens on rotation COMPLETION rather than at the
+   * end of every call, because a partial rebuild publishes a thinner snapshot
+   * without any error surfacing. See {@link pendingCuratedSocial}.
    */
-  private async refreshCuratedSocialSentiment(): Promise<void> {
+  private async refreshCuratedSocialSentiment(budgetMs: number): Promise<SweepPass> {
     const accounts = getCuratedStockTwitsAccounts();
-    const collected: StockTwitsMessage[] = [];
-    let anySuccess = false;
-    for (const user of accounts) {
-      try {
-        const messages = await fetchStockTwitsUserStream(user);
-        if (messages !== null) {
-          anySuccess = true;
-          collected.push(...messages);
+    const pass = await runBudgetedSweep({
+      key: `${this.mode}:social-curated`,
+      symbols: accounts,
+      budgetMs,
+      run: async ([user]) => {
+        if (!user) return;
+        try {
+          const messages = await fetchStockTwitsUserStream(user);
+          if (messages !== null) {
+            this.pendingCuratedSocialAnySuccess = true;
+            this.pendingCuratedSocial.push(...messages);
+          }
+        } catch (err) {
+          log.warn('curated social refresh failed', {
+            account: user,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
-      } catch (err) {
-        log.warn('curated social refresh failed', {
-          account: user,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
+      },
+    });
+
+    // TRA-3019 — publish ONLY on a completed rotation. Mid-rotation the
+    // accumulator holds a partial snapshot, and swapping that in would silently
+    // shrink the curated lane for every symbol (see `pendingCuratedSocial`).
+    if (!pass.complete) return pass;
+
+    // No account responded across the WHOLE rotation (breaker open / all
+    // failed) — keep the last snapshot. Evaluated over the rotation, not over
+    // the final slice, or a rotation whose last slice happened to be empty would
+    // discard the accounts that did answer earlier in it.
+    if (this.pendingCuratedSocialAnySuccess) {
+      this.curatedSocialCache = mapCuratedMessagesBySymbol(this.pendingCuratedSocial);
     }
-    // No account responded (breaker open / all failed) — keep the last snapshot.
-    if (!anySuccess) return;
-    this.curatedSocialCache = mapCuratedMessagesBySymbol(collected);
+    this.pendingCuratedSocial = [];
+    this.pendingCuratedSocialAnySuccess = false;
+    return pass;
   }
 
   /**
