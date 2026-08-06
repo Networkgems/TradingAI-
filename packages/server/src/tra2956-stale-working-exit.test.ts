@@ -25,7 +25,17 @@
 // and the two selectors must stay disjoint: one latch, one owner.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PaperOptionsAccount } from './options-account.js';
+import type { DetachedWorkingExitsByReason } from './options-account.js';
 import type { OtmMispricingSignal } from '@trading-app/shared';
+
+/**
+ * TRA-3050 — the buckets partition `detachedRows`, so the sum is an invariant
+ * and not a restatement. If a new reason is added without a bucket, a detached
+ * row falls out of the split silently; this catches that.
+ */
+function sumByReason(byReason: DetachedWorkingExitsByReason): number {
+  return Object.values(byReason).reduce((a, b) => a + b, 0);
+}
 
 // 10:00 AM ET = 14:00 UTC during EDT, pinned to a Tuesday so the weekday /
 // trading-window predicates pass.
@@ -257,7 +267,7 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     const { acct } = latchUnfillableTp1('live');
     vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
     // The cancel threw, or the broker would not confirm it terminal-and-unfilled.
-    acct.noteStaleWorkingExitHeld();
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'withdrawFailed');
     expect(acct.getStaleWorkingExitStats()).toMatchObject({
       clearedTotal: 0,
       holdAttemptsTotal: 1,
@@ -323,7 +333,7 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
   it('falls back to zero when a transient failure heals, while the counter does not', () => {
     const { acct } = latchUnfillableTp1('live');
     vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
-    acct.noteStaleWorkingExitHeld();
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'withdrawFailed');
     expect(acct.getStaleWorkingExitStats().detachedRows).toBe(1);
 
     // Next tick the cancel goes through. The position is fine.
@@ -339,7 +349,8 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
   it('counts attempts per tick, not positions — `holdAttempts: 3` is one row, three ticks', () => {
     const { acct } = latchUnfillableTp1('live');
     vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
-    for (let i = 0; i < 3; i += 1) acct.noteStaleWorkingExitHeld();
+    const [row] = acct.listStaleWorkingExits();
+    for (let i = 0; i < 3; i += 1) acct.noteStaleWorkingExitHeld(row, 'withdrawFailed');
     const stats = acct.getStaleWorkingExitStats();
     expect(stats.holdAttemptsTotal).toBe(3);
     // Nothing in the payload used to carry this, so a reader had no way to
@@ -354,5 +365,152 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
       detachedRows: 0,
       budgetExhausted: 0,
     });
+  });
+
+  // ── TRA-3050 — the third invisible row, and the one that can mislead ──
+  //
+  // TRA-3048 made detachment visible. It did not make it EXPLICABLE: a row held
+  // by guard 1 (partial fill — the withdrawal ran and correctly declined) and a
+  // row the withdrawal never reached at all (the pre-fix failure) both read as
+  // one aged latch with nothing else moving. `exec_quantity` appears nowhere on
+  // the wire, so from outside the two were indistinguishable, and a healthy
+  // build could be graded as a regression on that signature. It nearly was, on
+  // TRA-3044's primary FAIL arm.
+
+  it('tells guard 1 apart from a withdrawal that never ran — same latch, opposite meanings', () => {
+    // Two accounts, identical from outside on every field that existed before
+    // this change: one aged latch, nothing cleared, no failed cancels.
+    const declined = latchUnfillableTp1('live');
+    const neverRan = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    // Guard 1 fires on the first: the order has 2 of 4 contracts executed, so
+    // cancelling would strand the fills. Correct, benign, self-resolving.
+    declined.acct.noteStaleWorkingExitHeld(
+      declined.acct.listStaleWorkingExits()[0],
+      'partialFill',
+      2,
+    );
+    // The second gets nothing — no pass reached it.
+
+    const a = declined.acct.getStaleWorkingExitStats();
+    const b = neverRan.acct.getStaleWorkingExitStats();
+
+    // Every pre-TRA-3050 field agrees. This is the false-red signature.
+    for (const s of [a, b]) {
+      expect(s).toMatchObject({
+        clearedTotal: 0,
+        holdAttemptsTotal: 0,
+        detachedRows: 1,
+        detachedRowsLive: 1,
+        budgetExhausted: 0,
+      });
+    }
+
+    // `byReason` is the only thing that separates them, and it is decisive.
+    expect(a.byReason).toMatchObject({ partialFill: 1, unattempted: 0 });
+    expect(b.byReason).toMatchObject({ partialFill: 0, unattempted: 1 });
+  });
+
+  it('does not count guard 1 as a failed cancel — declining to cancel is not a defect', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'partialFill', 2);
+
+    const stats = acct.getStaleWorkingExitStats();
+    // `holdAttempts` is a failed-cancel RATE. Guard 1 attempted no cancel, and
+    // folding it in would inflate a defect rate with a correct decision.
+    expect(stats.holdAttemptsTotal).toBe(0);
+    // The row is still detached, though, and that stays visible.
+    expect(stats.detachedRows).toBe(1);
+    expect(stats.byReason.partialFill).toBe(1);
+  });
+
+  it('names the arm that used to leave no trace at all — client torn down mid-pass', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    // TRA-2693's mode flip between the poll and the withdrawal. Its only trace
+    // used to be a silent +1 on a counter three other arms also incremented.
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'clientUnavailable');
+
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.byReason).toMatchObject({
+      clientUnavailable: 1,
+      withdrawFailed: 0,
+      partialFill: 0,
+      unattempted: 0,
+    });
+    // It IS a withdrawal that did not happen, so the rate counts it.
+    expect(stats.holdAttemptsTotal).toBe(1);
+  });
+
+  it('is a gauge, not a counter — three failed ticks on one row is one detached row', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    const [row] = acct.listStaleWorkingExits();
+    for (let i = 0; i < 3; i += 1) acct.noteStaleWorkingExitHeld(row, 'withdrawFailed');
+
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.holdAttemptsTotal).toBe(3);
+    expect(stats.byReason.withdrawFailed).toBe(1);
+    expect(sumByReason(stats.byReason)).toBe(stats.detachedRows);
+  });
+
+  it('does not let a verdict outlive the order it describes', () => {
+    const { acct, sym, id } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'withdrawFailed');
+    expect(acct.getStaleWorkingExitStats().byReason.withdrawFailed).toBe(1);
+
+    // The latch goes away on another path (a broker rejection), and the row
+    // stages a NEW exit that ages out before any withdrawal pass reaches it.
+    acct.clearPendingExit(id, 'Tradier sell_to_close rejected');
+    acct.checkExits(new Map(), new Map([[sym, 1.6]]), 'live', { waitAndHold: true });
+    expect(acct.attachPendingExit(id, 900_001, 1.6)).toBe(true);
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    // The old verdict describes an order that no longer exists. Inheriting it
+    // would report a stale cause as the current one — and specifically would
+    // hide an unattempted row behind a reason that sounds already-diagnosed.
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.detachedRows).toBe(1);
+    expect(stats.byReason).toMatchObject({ withdrawFailed: 0, unattempted: 1 });
+  });
+
+  it('reports a budget-exhausted row as budget-exhausted, whatever it held before', () => {
+    const { acct, sym } = latchUnfillableTp1('live');
+    for (let i = 0; i < MAX_CLEARS_PER_ROW; i += 1) {
+      vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+      acct.noteStaleWorkingExitCleared(acct.listStaleWorkingExits()[0]);
+      acct.checkExits(new Map(), new Map([[sym, 1.6]]), 'live', { waitAndHold: true });
+      acct.attachPendingExit(acct.getState().openOptions[0].id, 900_000 + i, 1.6);
+    }
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    // No withdrawal is attempted on this row ever again, so no arm can name it.
+    // The gauge derives it from the clear budget instead, and it outranks any
+    // marker: whatever held this row earlier, nothing will retry it now.
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.byReason).toMatchObject({
+      budgetExhausted: 1,
+      partialFill: 0,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      unattempted: 0,
+    });
+    expect(sumByReason(stats.byReason)).toBe(stats.detachedRows);
+  });
+
+  it('falls back to zero across every reason when the latch clears', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'partialFill', 2);
+    expect(acct.getStaleWorkingExitStats().byReason.partialFill).toBe(1);
+
+    // The partial resolves on its own, which is what guard 1 was waiting for.
+    expect(acct.noteStaleWorkingExitCleared(acct.listStaleWorkingExits()[0])).toBe(true);
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.detachedRows).toBe(0);
+    expect(sumByReason(stats.byReason)).toBe(0);
   });
 });

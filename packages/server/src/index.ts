@@ -8811,9 +8811,31 @@ app.get('/api/health/options-live', async (_req, res) => {
       //   • `detachedRows` — GAUGE. Every aged latch, including rows the next
       //     tick is expected to withdraw. Falls back to zero on its own.
       //   • `holdAttempts` — monotonic COUNTER of failed cancels this boot.
-      //     Ticks, not positions; a rate, not a state. It cannot name which arm
-      //     held — all three increment sites share it, and the server logs
-      //     (`component: 'stale-working-exit'`) are what distinguish them.
+      //     Ticks, not positions; a rate, not a state.
+      //
+      // TRA-3050 — when `detachedRows > 0`, read `byReason` before concluding
+      // anything. `detachedRows` says exit rules are off somewhere; it does not
+      // say whether that is a problem, and two of the causes are opposites:
+      //
+      //   • `partialFill` — the withdrawal RAN and correctly declined, because
+      //     the order has executed contracts and cancelling would strand them.
+      //     Benign and self-resolving (the order goes terminal on its own; for
+      //     a `day` order, by the close). Needs nobody. This arm used to record
+      //     nothing at all, which gave it the same outside signature as the
+      //     pre-fix failure below — a false-red path that cost TRA-3044 an
+      //     annotation pointing its reader at a log tail.
+      //   • `unattempted` — the withdrawal has NOT reached this row. Transient
+      //     for one read (a row can age past the gate between ticks), but
+      //     persistent across reads means the pass is not running, which IS the
+      //     pre-fix failure TRA-2956 was filed against.
+      //   • `withdrawFailed` — the cancel threw or could not be confirmed
+      //     unfilled. Retried next tick; the arm worth a human's attention.
+      //   • `clientUnavailable` — live client torn down mid-pass (TRA-2693
+      //     mode flip). Rare, transient.
+      //   • `budgetExhausted` — mirrors the top-level field; permanent.
+      //
+      // The five sum to `detachedRows`. Server logs under
+      // `component: 'stale-working-exit'` carry the per-row detail.
       //
       // Counts only — same TRA-2163 disclosure rule as above.
       staleWorkingExits: getAllUserContexts().reduce(
@@ -8827,6 +8849,13 @@ app.get('/api/health/options-live', async (_req, res) => {
             detachedRowsLive: acc.detachedRowsLive + s.detachedRowsLive,
             budgetExhausted: acc.budgetExhausted + s.budgetExhausted,
             budgetExhaustedLive: acc.budgetExhaustedLive + s.budgetExhaustedLive,
+            byReason: {
+              budgetExhausted: acc.byReason.budgetExhausted + s.byReason.budgetExhausted,
+              partialFill: acc.byReason.partialFill + s.byReason.partialFill,
+              withdrawFailed: acc.byReason.withdrawFailed + s.byReason.withdrawFailed,
+              clientUnavailable: acc.byReason.clientUnavailable + s.byReason.clientUnavailable,
+              unattempted: acc.byReason.unattempted + s.byReason.unattempted,
+            },
             lastClearedAt:
               s.lastClearedAt !== null && (acc.lastClearedAt === null || s.lastClearedAt > acc.lastClearedAt)
                 ? s.lastClearedAt
@@ -8841,6 +8870,13 @@ app.get('/api/health/options-live', async (_req, res) => {
           detachedRowsLive: 0,
           budgetExhausted: 0,
           budgetExhaustedLive: 0,
+          byReason: {
+            budgetExhausted: 0,
+            partialFill: 0,
+            withdrawFailed: 0,
+            clientUnavailable: 0,
+            unattempted: 0,
+          },
           lastClearedAt: null as number | null,
         },
       ),

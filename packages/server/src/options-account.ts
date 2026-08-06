@@ -721,6 +721,71 @@ export interface StaleWorkingExit {
 }
 
 /**
+ * TRA-3050 — why a withdrawal pass left a detached row latched.
+ *
+ * Every arm of `withdrawStaleWorkingExit` that returns without clearing the
+ * latch names one of these. They are NOT interchangeable:
+ *
+ *   • `partialFill` — the order has executed contracts, so it is not the
+ *     unfillable-limit pathology at all and cancelling it would strand the
+ *     fills. Benign, correct, and self-resolving: the order goes terminal on
+ *     its own (for a `day` order, by the close). Needs no human.
+ *   • `withdrawFailed` — the cancel threw, or the broker would not confirm the
+ *     order terminal-and-unfilled. The row is detached and the repair did not
+ *     take. Retried next tick, but this is the arm worth looking at.
+ *   • `clientUnavailable` — the live client was torn down between the poll and
+ *     the withdrawal (the mid-pass mode flip of TRA-2693). Rare, transient,
+ *     and resolves when the engine re-arms.
+ *
+ * `budgetExhausted` is deliberately NOT in this union: no withdrawal is ever
+ * attempted on such a row, so no arm can name it. It is derived by
+ * {@link PaperOptionsAccount.countDetachedWorkingExits} from the per-row clear
+ * budget instead.
+ */
+export type StaleWorkingExitHoldReason = 'partialFill' | 'withdrawFailed' | 'clientUnavailable';
+
+/** TRA-3050 — the most recent withdrawal verdict recorded against one row. */
+export interface StaleWorkingExitHold {
+  /** The latch this verdict describes; a marker for any other order is stale. */
+  orderId: string;
+  /** Which arm of the withdrawal declined to clear the latch. */
+  reason: StaleWorkingExitHoldReason;
+  /** Contracts already executed, on `partialFill`; null on the other arms. */
+  execQuantity: number | null;
+  /** When the verdict was recorded (epoch ms). */
+  observedAt: number;
+}
+
+/**
+ * TRA-3050 — the detachment gauge split by cause. Every key is a GAUGE of rows
+ * detached RIGHT NOW, recomputed on read, and the five sum to `detachedRows`.
+ *
+ * `unattempted` is the discriminator the health surface was missing. A row that
+ * the withdrawal pass has reached carries a verdict; one it has not reached
+ * carries none. So a detached row sitting in `unattempted` across successive
+ * reads means the withdrawal is NOT RUNNING on it — which, before this split,
+ * was indistinguishable from a pass that ran and correctly declined.
+ */
+export interface DetachedWorkingExitsByReason {
+  /** Spent all {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW} withdrawals. Permanent. */
+  budgetExhausted: number;
+  /** Guard 1 declined: the order has fills. Benign, self-resolving. */
+  partialFill: number;
+  /** The cancel threw or could not be confirmed unfilled. Look at this one. */
+  withdrawFailed: number;
+  /** The live client vanished mid-pass (TRA-2693 mode flip). Transient. */
+  clientUnavailable: number;
+  /**
+   * Detached with no verdict against the current latch — the withdrawal pass
+   * has not reached this row. Transiently 1 for a row that aged past the gate
+   * between the last tick and this read; PERSISTENTLY non-zero means the pass
+   * is not running (e.g. `resolvePendingOptionExits` returning early on a null
+   * live client), which is the pre-fix failure TRA-2956 was filed against.
+   */
+  unattempted: number;
+}
+
+/**
  * TRA-2820 — count live open rows that are not actually under management.
  *
  * Counts and reasons only, never OCC symbols: this feeds the no-auth
@@ -1266,6 +1331,27 @@ export class PaperOptionsAccount {
    * documented as the gauge for one release and it is not one.
    */
   private staleWorkingExitHoldAttempts = 0;
+  /**
+   * TRA-3050 — WHY each still-detached row was left latched, keyed by position
+   * id: the outcome of the most recent withdrawal pass over it.
+   *
+   * This exists because {@link countDetachedWorkingExits} can see THAT a row is
+   * detached but not why, and the reasons want opposite responses —
+   * `partialFill` is benign and self-resolving, `budgetExhausted` is permanent
+   * for the boot, `withdrawFailed` is the one a human should look at. Collapsed
+   * into one integer they are indistinguishable from outside, which is what
+   * forced TRA-3044 to route its reader to a log tail.
+   *
+   * `orderId` is recorded so a marker cannot outlive the order it describes. A
+   * row that clears and stages a NEW `pendingExit` keeps its stale marker in
+   * this map until it is overwritten; the gauge ignores any marker whose
+   * `orderId` does not match the latch currently on the row, so it reads as
+   * unattempted rather than inheriting the previous order's verdict.
+   *
+   * Boot-scoped and bounded by "rows that had a stale working exit this boot",
+   * the same lifetime and the same bound as {@link staleWorkingExitClears}.
+   */
+  private staleWorkingExitHolds: Map<string, StaleWorkingExitHold> = new Map();
   /** TRA-2956 — per-row withdrawal count, keyed by position id, per boot. */
   private staleWorkingExitClears: Map<string, number> = new Map();
   /** TRA-2956 — the most recent withdrawal batch, for the health surface. */
@@ -5222,28 +5308,68 @@ export class PaperOptionsAccount {
    *   • `budgetExhausted` — the subset past
    *     {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW}. These are not retried,
    *     do not self-heal, and are the ones that want a human now.
+   *
+   * TRA-3050 — `byReason` splits `detachedRows` by WHY the row is still latched,
+   * because `detachedRows` alone cannot separate responses that are opposites.
+   * The five buckets are mutually exclusive and sum to `detachedRows`. Order of
+   * precedence, highest first:
+   *
+   *   1. `budgetExhausted` — derived here, not reported by an arm, because such
+   *      a row is dropped by {@link listStaleWorkingExits} before any withdrawal
+   *      is attempted. It wins outright: any hold marker on it necessarily
+   *      predates the exhaustion and describes a withdrawal that will not run
+   *      again.
+   *   2. the recorded verdict — `partialFill` / `withdrawFailed` /
+   *      `clientUnavailable` — but only when the marker names the order
+   *      currently latched on the row. A marker for a previous order is stale
+   *      and does not carry over.
+   *   3. `unattempted` — no applicable verdict. See
+   *      {@link DetachedWorkingExitsByReason}: this is the bucket that
+   *      distinguishes "the withdrawal never ran" from "it ran and declined",
+   *      which is the false-red path TRA-3050 was filed for.
    */
   countDetachedWorkingExits(nowMs: number = Date.now()): {
     detachedRows: number;
     detachedRowsLive: number;
     budgetExhausted: number;
     budgetExhaustedLive: number;
+    byReason: DetachedWorkingExitsByReason;
   } {
     let detachedRows = 0;
     let detachedRowsLive = 0;
     let budgetExhausted = 0;
     let budgetExhaustedLive = 0;
+    const byReason: DetachedWorkingExitsByReason = {
+      budgetExhausted: 0,
+      partialFill: 0,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      unattempted: 0,
+    };
     for (const [id, opt] of this.openOptions) {
-      if (!this.isDetachedWorkingExit(opt.pendingExit, nowMs)) continue;
+      const pending = opt.pendingExit;
+      if (!this.isDetachedWorkingExit(pending, nowMs)) continue;
       const isLive = opt.mode === 'live';
       detachedRows += 1;
       if (isLive) detachedRowsLive += 1;
       if ((this.staleWorkingExitClears.get(id) ?? 0) >= MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW) {
         budgetExhausted += 1;
         if (isLive) budgetExhaustedLive += 1;
+        byReason.budgetExhausted += 1;
+        continue;
+      }
+      // TRA-3050 — a verdict only counts for the latch it was recorded against.
+      // A row that cleared and staged a new exit keeps the old marker in the
+      // map, and inheriting it would report the previous order's outcome as if
+      // it described this one.
+      const hold = this.staleWorkingExitHolds.get(id);
+      if (hold && hold.orderId === String(pending.tradierOrderId)) {
+        byReason[hold.reason] += 1;
+      } else {
+        byReason.unattempted += 1;
       }
     }
-    return { detachedRows, detachedRowsLive, budgetExhausted, budgetExhaustedLive };
+    return { detachedRows, detachedRowsLive, budgetExhausted, budgetExhaustedLive, byReason };
   }
 
   /**
@@ -5273,6 +5399,11 @@ export class PaperOptionsAccount {
       { countRejection: false },
     );
     if (!cleared) return false;
+    // TRA-3050 — the latch is gone, so any verdict recorded against it is
+    // history. Dropping it here keeps the gauge honest if the row stages a new
+    // exit that ages out before the withdrawal pass reaches it: that must read
+    // `unattempted`, not inherit this order's reason.
+    this.staleWorkingExitHolds.delete(stale.id);
     this.staleWorkingExitClears.set(
       stale.id,
       (this.staleWorkingExitClears.get(stale.id) ?? 0) + 1,
@@ -5294,9 +5425,33 @@ export class PaperOptionsAccount {
    * per stale row, so a row that keeps failing adds one every tick. Whether a
    * position is detached at this instant is
    * {@link countDetachedWorkingExits}'s question, not this counter's.
+   *
+   * TRA-3050 — every arm that leaves the latch in place calls this and names
+   * WHY, so the detachment gauge can report causes that want opposite responses
+   * separately. Two consequences worth stating:
+   *
+   *   • `partialFill` does NOT advance the attempt counter. That counter is a
+   *     failed-cancel rate, and guard 1 is not a failed cancel — it is a cancel
+   *     deliberately not attempted, on an order that is behaving correctly.
+   *     Folding it in would inflate a defect rate with non-defects.
+   *   • The marker is keyed by row and overwritten each pass, so it always
+   *     holds the LATEST verdict rather than the first. A row that fails and
+   *     then hits a partial fill reports `partialFill`, which is the true
+   *     current state of it.
    */
-  noteStaleWorkingExitHeld(): void {
-    this.staleWorkingExitHoldAttempts += 1;
+  noteStaleWorkingExitHeld(
+    stale: StaleWorkingExit,
+    reason: StaleWorkingExitHoldReason,
+    execQuantity: number | null = null,
+    nowMs: number = Date.now(),
+  ): void {
+    if (reason !== 'partialFill') this.staleWorkingExitHoldAttempts += 1;
+    this.staleWorkingExitHolds.set(stale.id, {
+      orderId: String(stale.tradierOrderId),
+      reason,
+      execQuantity,
+      observedAt: nowMs,
+    });
   }
 
   /**
@@ -5312,6 +5467,10 @@ export class PaperOptionsAccount {
    * particular counts ticks, not positions, and cannot see budget exhaustion;
    * it shipped named `heldTotal` and documented as the gauge, which is the bug
    * TRA-3048 fixed.
+   *
+   * TRA-3050 — `byReason` is the field to read when `detachedRows > 0`. It is
+   * what separates a benign decline from a withdrawal that is not running, and
+   * before it existed those two had the same outside signature.
    */
   getStaleWorkingExitStats(nowMs: number = Date.now()): {
     clearedTotal: number;
@@ -5321,6 +5480,7 @@ export class PaperOptionsAccount {
     detachedRowsLive: number;
     budgetExhausted: number;
     budgetExhaustedLive: number;
+    byReason: DetachedWorkingExitsByReason;
     lastClearedAt: number | null;
     lastCleared: StaleWorkingExit[];
   } {

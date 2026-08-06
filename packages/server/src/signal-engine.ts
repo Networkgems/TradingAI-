@@ -6940,10 +6940,16 @@ export class SignalEngine {
    *     the contracts are only accounted once.
    *
    * Held rows are counted, not just skipped. A latch that survives this is a
-   * live position with its exit rules off and no automated path left to fix
-   * it — that has to show up on the health surface as a number, because the
-   * failure it descends from went unnoticed for 5h09m precisely by looking
-   * exactly like nothing happening.
+   * live position with its exit rules off — that has to show up on the health
+   * surface as a number, because the failure it descends from went unnoticed
+   * for 5h09m precisely by looking exactly like nothing happening.
+   *
+   * TRA-3050 — and it has to show up with its REASON. Every arm below records
+   * one via `noteStaleWorkingExitHeld`, because the four causes want different
+   * responses (guard 1 is benign and self-resolving; a budget-exhausted row
+   * never self-repairs; a failed cancel wants a human) and a single integer
+   * cannot tell them apart. Guard 1 in particular used to record nothing, which
+   * gave a correct decline the same outside signature as the pre-fix failure.
    */
   private async withdrawStaleWorkingExit(
     env: TradierEnv,
@@ -6966,11 +6972,32 @@ export class SignalEngine {
       issue: 'TRA-2956',
     };
     if (!client) {
-      acct.noteStaleWorkingExitHeld();
+      // TRA-3050 — reachable only if the live client is torn down during one of
+      // the awaits between `resolvePendingOptionExits`'s own null check and
+      // here (the mid-pass mode flip of TRA-2693, which this box does do). Rare
+      // and real. It used to be the ONE arm that logged nothing at all — its
+      // sole trace was a silent `+1` on a shared counter, so telling it apart
+      // from the other arms meant inferring from the ABSENCE of a log line.
+      acct.noteStaleWorkingExitHeld(stale, 'clientUnavailable');
+      log.warn('stale working exit NOT withdrawn — live client vanished mid-pass, latch left in place', {
+        ...base,
+        issue: 'TRA-3050',
+      });
       return;
     }
     // Guard 1 — a partial fill is a different animal; leave it working.
     if (typeof detail.exec_quantity === 'number' && detail.exec_quantity > 0) {
+      // TRA-3050 — this return is correct and it is also the one that could get
+      // a healthy build graded as a regression. It leaves the latch in place,
+      // so the row stays detached and is re-selected every tick until the order
+      // goes terminal — while touching no counter, which made its outside
+      // signature (aged latch + `cleared: 0` + nothing else moving) identical
+      // to the pre-fix behaviour TRA-2956 was filed against. Nothing on the
+      // wire carries `exec_quantity`, so the reader could not tell "the
+      // withdrawal never ran" from "it ran and correctly declined". Recording
+      // the verdict is what separates them; it does NOT advance the
+      // failed-cancel rate, because declining to cancel is not a failed cancel.
+      acct.noteStaleWorkingExitHeld(stale, 'partialFill', detail.exec_quantity);
       log.info('stale working exit is PARTIALLY FILLED — leaving it to resolve', {
         ...base,
         execQuantity: detail.exec_quantity,
@@ -6980,7 +7007,7 @@ export class SignalEngine {
     try {
       await client.cancelOrder(stale.tradierOrderId);
     } catch (err: unknown) {
-      acct.noteStaleWorkingExitHeld();
+      acct.noteStaleWorkingExitHeld(stale, 'withdrawFailed');
       log.warn('stale working exit cancel THREW — latch left in place, position stays detached', {
         ...base,
         reason: err instanceof Error ? err.message : String(err),
@@ -6997,7 +7024,7 @@ export class SignalEngine {
       && TRADIER_REJECTED_STATUSES.has(after.status)
       && executed === 0;
     if (!confirmedUnfilled) {
-      acct.noteStaleWorkingExitHeld();
+      acct.noteStaleWorkingExitHeld(stale, 'withdrawFailed', executed);
       log.warn('stale working exit cancel NOT CONFIRMED unfilled — latch left in place', {
         ...base,
         statusAfterCancel: after?.status ?? null,
@@ -7024,6 +7051,7 @@ export class SignalEngine {
     detachedRowsLive: number;
     budgetExhausted: number;
     budgetExhaustedLive: number;
+    byReason: import('./options-account.js').DetachedWorkingExitsByReason;
     lastClearedAt: number | null;
   } {
     let clearedTotal = 0;
@@ -7033,6 +7061,13 @@ export class SignalEngine {
     let detachedRowsLive = 0;
     let budgetExhausted = 0;
     let budgetExhaustedLive = 0;
+    const byReason: import('./options-account.js').DetachedWorkingExitsByReason = {
+      budgetExhausted: 0,
+      partialFill: 0,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      unattempted: 0,
+    };
     let lastClearedAt: number | null = null;
     // TRA-3048 — one `now` for both books, so a row cannot be counted detached
     // in one bucket and not the other because the loop took a second.
@@ -7046,6 +7081,9 @@ export class SignalEngine {
       detachedRowsLive += stats.detachedRowsLive;
       budgetExhausted += stats.budgetExhausted;
       budgetExhaustedLive += stats.budgetExhaustedLive;
+      for (const key of Object.keys(byReason) as (keyof typeof byReason)[]) {
+        byReason[key] += stats.byReason[key];
+      }
       if (stats.lastClearedAt !== null && (lastClearedAt === null || stats.lastClearedAt > lastClearedAt)) {
         lastClearedAt = stats.lastClearedAt;
       }
@@ -7058,6 +7096,7 @@ export class SignalEngine {
       detachedRowsLive,
       budgetExhausted,
       budgetExhaustedLive,
+      byReason,
       lastClearedAt,
     };
   }
