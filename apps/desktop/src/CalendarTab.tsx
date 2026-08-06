@@ -149,6 +149,30 @@ function isUnknownDay(report: EodReport | undefined): boolean {
   return !!report?.pnlUnknown;
 }
 
+// ── TRA-3102 — A FIGURE THE BROKER NEVER CONFIRMED ───────────────────────────
+//
+// Distinct from `pnlUnknown` above, and the distinction is the point. An unknown
+// day is one nobody measured. THIS is a day that was measured against the wrong
+// book: on a live account the calendar figure is `realizedPnl + optionsPnl`, and
+// `optionsPnl` is summed from the ENGINE's own closed-options record. An engine
+// close that never corresponded to a broker fill books green into a real-money
+// cell — 20 of the 69 stored live cells carry such a figure, and 3 more are
+// tagged `tradier-balance` while rendering a number their own header contradicts.
+//
+// The figure is still SHOWN: it is what is stored, and hiding it would destroy
+// the audit trail an operator needs. What it must not do is read as a win. It
+// gets the neutral unknown tint, never green/red, carries a `!`, and is pulled
+// out of every total — because "+$385.80 over a week the account did not trade"
+// summed into Net P&L is the whole complaint on the parent ticket.
+function isUnreconciledDay(report: EodReport | undefined): boolean {
+  return !!report?.pnlUnreconciled;
+}
+
+/** A day whose rendered figure is not a claim about money that moved. */
+function isUnbelievableDay(report: EodReport | undefined): boolean {
+  return isUnknownDay(report) || isUnreconciledDay(report);
+}
+
 /**
  * The rows a total is entitled to be computed from.
  *
@@ -160,7 +184,11 @@ function isUnknownDay(report: EodReport | undefined): boolean {
  * "5 / 17 · 3 unknown", and the pre-fix grid could only produce the first.
  */
 function measuredDays(reports: EodReport[]): EodReport[] {
-  return reports.filter(r => !isUnknownDay(r));
+  // TRA-3102 — a broker-unconfirmed day is excluded for a DIFFERENT reason than an
+  // unknown one, and unlike an unknown day it moves the money: an unknown cell's
+  // artefact is 0.00 so dropping it barely changes Net P&L, whereas the
+  // unreconciled cohort is where the fabricated green actually lives.
+  return reports.filter(r => !isUnbelievableDay(r));
 }
 
 /** Rendered under any total that had to drop days it could not measure. */
@@ -183,6 +211,25 @@ function UnknownDaysNote({ reports }: { reports: EodReport[] }) {
   );
 }
 
+/** Rendered under any total that had to drop days the broker never confirmed. */
+function UnreconciledDaysNote({ reports }: { reports: EodReport[] }) {
+  const bad = reports.filter(isUnreconciledDay);
+  if (bad.length === 0) return null;
+  const dates = bad.map(r => r.date).sort();
+  const total = bad.reduce((s, r) => s + r.combinedPnl, 0);
+  return (
+    <div
+      className="cal-summary-unreconciled"
+      title={bad.map(r => `${r.date} — ${r.pnlUnreconciled?.detail ?? 'not broker-confirmed'}`).join('\n\n')}
+    >
+      ⚠ {bad.length} day{bad.length === 1 ? '' : 's'} showing {fmtDollar(total)}{' '}
+      {bad.length === 1 ? 'is' : 'are'} NOT broker-confirmed and {bad.length === 1 ? 'is' : 'are'}{' '}
+      EXCLUDED from these totals ({dates.join(', ')}) — the figure comes from the engine&rsquo;s own
+      closed-trade record, not from broker fills.
+    </div>
+  );
+}
+
 /**
  * The in-cell figure. One place, so the grid and the week strip cannot drift on
  * the one distinction this ticket is about.
@@ -199,6 +246,20 @@ function CellPnl({ report }: { report: EodReport | undefined }) {
       </span>
     );
   }
+  if (isUnreconciledDay(report)) {
+    // TRA-3102 — the figure stays visible (it is what is stored) but carries the
+    // flag and never the win/loss tint. A fabricated +$739.00 rendering exactly
+    // like a real one is the defect.
+    return (
+      <span
+        className="cal-pnl cal-pnl--unreconciled"
+        title={report.pnlUnreconciled?.detail ?? 'This figure is not broker-confirmed.'}
+      >
+        {fmtCompact(report.combinedPnl)}
+        <span className="cal-pnl-flag">!</span>
+      </span>
+    );
+  }
   return <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>;
 }
 
@@ -206,6 +267,9 @@ function CellPnl({ report }: { report: EodReport | undefined }) {
 function cellStateClass(report: EodReport | undefined): string {
   if (!report) return '';
   if (isUnknownDay(report)) return ' cal-cell--unknown';
+  // TRA-3102 — same rule, same reason: a number the broker never confirmed must
+  // not be coloured as though it were money that moved.
+  if (isUnreconciledDay(report)) return ' cal-cell--unreconciled';
   if (report.combinedPnl > 0) return ' cal-cell--win';
   if (report.combinedPnl < 0) return ' cal-cell--loss';
   return '';
@@ -376,6 +440,7 @@ function MonthSummary({ year, month, reports }: {
       </div>
     </div>
     <UnknownDaysNote reports={monthly} />
+    <UnreconciledDaysNote reports={monthly} />
     <MixedMeasureNote reports={measured} />
     </>
   );
@@ -472,6 +537,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
         </div>
       )}
       {weekReports.length > 0 && <UnknownDaysNote reports={weekReports} />}
+      {weekReports.length > 0 && <UnreconciledDaysNote reports={weekReports} />}
       {weekReports.length > 0 && <MixedMeasureNote reports={measured} />}
     </>
   );
@@ -586,6 +652,10 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
   // artefact figure anywhere, including the header strip. This is the screen an
   // auditor opens to check a cell; a `$0.00` here is the claim being disputed.
   const unknown = report.pnlUnknown;
+  // TRA-3102 — and the auditor opening this screen on a green July cell needs to
+  // be told the number is the engine's, not the broker's, before reading anything
+  // else on the page.
+  const unreconciled = report.pnlUnreconciled;
   return (
     <section className="eod-panel">
       <div className="eod-header" style={{ cursor: 'default' }}>
@@ -594,6 +664,12 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
         <span className="eod-summary">
           {unknown ? (
             <span className="cal-pnl--unknown" title={unknown.detail}>P&amp;L unknown</span>
+          ) : unreconciled ? (
+            // TRA-3102 — the header strip is the first thing read on this screen,
+            // so it must not print a green figure the broker never confirmed.
+            <span className="cal-pnl--unreconciled" title={unreconciled.detail}>
+              {fmtDollar(report.combinedPnl)} (not broker-confirmed)
+            </span>
           ) : (
             <span className={report.combinedPnl >= 0 ? 'green' : 'red'}>
               {fmtDollar(report.combinedPnl)}
@@ -630,6 +706,30 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
               series has a hole, and filling it by inference is what produced the original
               phantom-green calendar. The engine-side breakdown below is unaffected by this and is
               still shown.
+            </div>
+          </div>
+        )}
+        {unreconciled && (
+          <div className="cal-unreconciled-banner">
+            <div>
+              <strong>
+                ⚠ The P&amp;L shown for this day is NOT broker-confirmed — it comes from the
+                engine&rsquo;s own closed-trade record.
+              </strong>
+            </div>
+            <div className="cal-unknown-detail">{unreconciled.detail}</div>
+            <div className="cal-unknown-detail">
+              Rendered {fmtDollar(unreconciled.renderedPnl)} · engine options{' '}
+              {fmtDollar(unreconciled.engineOptionsPnl)} ·{' '}
+              {unreconciled.brokerPnl === null
+                ? 'broker figure UNKNOWN (the comparison could not be made)'
+                : `broker ${fmtDollar(unreconciled.brokerPnl)}`}{' '}
+              · <code>{unreconciled.reason}</code>
+            </div>
+            <div className="cal-unknown-detail">
+              The figure has deliberately <em>not</em> been corrected — this row is flagged, not
+              rewritten. It is excluded from the monthly and weekly totals. An engine close with no
+              matching broker fill is not money that moved.
             </div>
           </div>
         )}
@@ -985,7 +1085,10 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // rows are stale-anchor days would be told "your account has no activity" —
   // the same $0.00-means-nothing-happened inference, one level up.
   const accountHasActivity = Object.values(reports).some(
-    r => isUnknownDay(r) || r.combinedPnl !== 0 || r.totalTrades > 0,
+    // TRA-3102 — likewise a broker-unconfirmed day. It is dropped from the
+    // totals, and without this arm a book whose only rows are unreconciled would
+    // be told it has no activity while the grid plainly shows figures.
+    r => isUnbelievableDay(r) || r.combinedPnl !== 0 || r.totalTrades > 0,
   );
   const showEmptyAccountNote = !isDesk && !loading && !selectedDate && !accountHasActivity;
 

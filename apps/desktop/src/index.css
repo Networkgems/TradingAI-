@@ -2154,6 +2154,65 @@ tr:hover td { background: var(--bg-hover); }
   font-size: 0.7rem;
 }
 
+/* ── TRA-3102 — a figure the broker never confirmed ─────────────────────────
+   Deliberately a DIFFERENT signal from the amber absence state above, because
+   it is a different claim: TRA-3101's amber means "nobody measured this day",
+   this violet means "this day was measured against the engine's own book, not
+   the broker's". Both refuse green.
+
+   The figure stays legible — it is the stored value and an auditor needs to see
+   it — but it never takes the win/loss tint, and the `!` makes a flagged cell
+   distinguishable at a glance in a grid full of unflagged ones. A fabricated
+   +$739.00 rendering exactly like a real +$739.00 is the whole defect. */
+.cal-cell--unreconciled {
+  border-style: dashed;
+  border-color: var(--violet, #8b6bd1);
+  background: color-mix(in srgb, var(--violet, #8b6bd1) 9%, transparent);
+}
+
+.cal-pnl--unreconciled {
+  color: var(--violet, #8b6bd1);
+  font-weight: 700;
+  cursor: help;
+}
+
+.cal-pnl-flag {
+  margin-left: 0.15rem;
+  font-size: 0.85em;
+  vertical-align: super;
+  font-weight: 800;
+}
+
+.cal-summary-unreconciled {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--violet, #8b6bd1);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  cursor: help;
+}
+
+.cal-unreconciled-banner {
+  margin-bottom: 0.7rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--violet, #8b6bd1);
+  border-left: 3px solid var(--violet, #8b6bd1);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--violet, #8b6bd1) 7%, var(--surface));
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.cal-unreconciled-banner code {
+  font-size: 0.95em;
+  color: var(--violet, #8b6bd1);
+}
+
 /* Month summary bar */
 .cal-summary {
   display: flex;

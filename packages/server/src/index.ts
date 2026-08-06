@@ -286,6 +286,15 @@ import {
   type BalanceAnchorVerdict,
   type DayActivityEvidence,
 } from './reports/stale-balance-anchor.js';
+// TRA-3102 — on a LIVE book the calendar figure is `realizedPnl + optionsPnl`,
+// and `optionsPnl` comes off the ENGINE's own `closedOptions` book, not broker
+// fills. This decides whether the rendered number is one the broker confirmed; it
+// never corrects one.
+import {
+  auditLiveCellSource,
+  decideLiveCellSourceDisposition,
+  isUnreconciled,
+} from './reports/live-cell-broker-source.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
 import {
   initTwoFactorStore,
@@ -1723,10 +1732,87 @@ async function generateAndSaveReport(
       );
       if (override) {
         finalReport = applyTradierBalanceOverride(finalReport, override, todayBalance);
+      } else {
+        // TRA-3102 — the override returning null is the moment this defect is
+        // MINTED, and until now it was silent. Every reason it returns null (no
+        // broker client, an invalid equity, no prior balance anchor, a delta that
+        // will not compute) leaves `combinedPnl` at the engine's
+        // `realizedPnl + optionsPnl` on a REAL-MONEY cell, with no `pnlSource`
+        // written at all — which is why 46 of the 69 stored live rows are
+        // unlabelled. Label it. An `engine` tag is not a fix, but a cell that
+        // says which book it came from can at least be found later; the audit
+        // below is what decides whether it may be believed.
+        finalReport = { ...finalReport, pnlSource: 'engine' as const };
+        log.warn('TRA-3102 live cell left on the ENGINE book — no broker override available', {
+          username: ctx.username,
+          date: finalReport.date,
+          combinedPnl: Number((finalReport.combinedPnl ?? 0).toFixed(2)),
+          optionsPnl: Number((finalReport.optionsPnl ?? 0).toFixed(2)),
+        });
       }
     } catch (err) {
       log.warn('tradier-live-calendar override failed', {
         username: ctx.username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // TRA-3102 — reconcile the cell against broker fills BEFORE it is written, so a
+  // forward cell is labelled at birth rather than only when someone reads it.
+  //
+  // This runs on the write as well as the read because the two see different
+  // things and neither subsumes the other: the write path has the live broker
+  // sidecar for today, and the read path is the only thing that can reach the 23
+  // already-stored rows the clobber guard protects. A row stamped here is served
+  // as-is by `stampBrokerSourceAudit`, which defers to the write-time verdict.
+  if (settings.mode === 'live' && !backfill && !finalReport.pnlUnknown) {
+    try {
+      const totals = await readTradierDailyTotalsForEvidence(ctx, 'production');
+      const verdict = auditLiveCellSource({
+        reportDate: finalReport.date,
+        pnlSource: finalReport.pnlSource,
+        combinedPnl: finalReport.combinedPnl,
+        realizedPnl: finalReport.realizedPnl,
+        optionsPnl: finalReport.optionsPnl,
+        markdown: finalReport.markdown,
+        broker: totals.ok
+          ? { known: true, realizedUsd: totals.totals[finalReport.date] ?? 0 }
+          : { known: false, reason: totals.reason },
+      });
+      // Log the verdict on EVERY pass, not just the bad ones — a line that only
+      // appears when something is wrong cannot be used to prove the detector ran.
+      log.info('TRA-3102 live cell broker-source audit', {
+        username: ctx.username,
+        date: finalReport.date,
+        status: verdict.status,
+        sourceClass: verdict.sourceClass,
+        renderedPnl: Number(verdict.renderedPnl.toFixed(2)),
+        engineOptionsPnl: Number(verdict.engineOptionsPnl.toFixed(2)),
+        brokerPnl: verdict.brokerPnl,
+      });
+      if (isUnreconciled(verdict)) {
+        const disposition = decideLiveCellSourceDisposition(verdict, new Date().toISOString());
+        if (disposition.pnlUnreconciled) {
+          log.warn('TRA-3102 live calendar cell is NOT broker-confirmed', {
+            username: ctx.username,
+            date: finalReport.date,
+            reason: disposition.pnlUnreconciled.reason,
+            detail: disposition.pnlUnreconciled.detail,
+          });
+          finalReport = {
+            ...finalReport,
+            pnlUnreconciled: disposition.pnlUnreconciled,
+            markdown: `${disposition.header}\n\n${finalReport.markdown}`,
+          };
+        }
+      }
+    } catch (err) {
+      // Never block the report write on the audit — but never let the failure be
+      // indistinguishable from a clean pass either.
+      log.warn('TRA-3102 broker-source audit failed — cell written unaudited', {
+        username: ctx.username,
+        date: finalReport.date,
         reason: err instanceof Error ? err.message : String(err),
       });
     }
@@ -2585,6 +2671,83 @@ async function stampStaleBalanceAnchorAudit(
     // silent, or "the detector never fired" and "the detector never ran" become
     // the same observation.
     log.warn('TRA-3101 stale-anchor audit failed — cell served unaudited', {
+      username: ctx.username,
+      date: report.date,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return report;
+  }
+}
+
+/**
+ * TRA-3102 — flag a live cell whose rendered figure the BROKER never confirmed.
+ *
+ * Same seam and same reasons as {@link stampStaleBalanceAnchorAudit} above: the
+ * broken rows are already on disk, the write path cannot reach them (every day
+ * from 2026-06-10 on carries a row and the clobber guard preserves it — the whole
+ * of TRA-3100), so the audit runs on the READ and writes nothing back.
+ *
+ * What it reaches, measured on the live production account (69 stored cells):
+ *   • 20 rows carrying a non-zero ENGINE options figure. ⛔ 46 of the 69 carry no
+ *     `pnlSource` at all, so the reach gate is an ALLOW-LIST — see
+ *     `classifyCellPnlSource`, which is exported and directly graded because the
+ *     obvious version of it (`=== 'engine'`) reaches exactly zero of them.
+ *   • 3 rows (2026-07-15/17/21) labelled `tradier-balance` whose stored figure
+ *     contradicts the broker figure stated in their own header, equal to
+ *     `optionsPnl` to the cent.
+ *
+ * Deliberately subordinate to TRA-3101: a row already marked `pnlUnknown` says
+ * something strictly stronger ("the day was never measured"), and stacking a
+ * second banner on it would dilute both. It is already excluded from every total.
+ */
+async function stampBrokerSourceAudit(
+  ctx: UserContext,
+  mode: StockModeKey,
+  report: EodReport,
+): Promise<EodReport> {
+  // A demo book HAS no broker, so engine closes are the only source there is and
+  // "unreconciled" would be true of every cell — a flag that is always on is not
+  // an instrument. This defect is about real money.
+  if (mode === 'demo') return report;
+  if (report.pnlUnreconciled) return report;   // write-time verdict wins
+  if (report.pnlUnknown) return report;        // TRA-3101 already says more
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  try {
+    const totals = await readTradierDailyTotalsForEvidence(ctx, env);
+    const verdict = auditLiveCellSource({
+      reportDate: report.date,
+      pnlSource: report.pnlSource,
+      combinedPnl: report.combinedPnl,
+      realizedPnl: report.realizedPnl,
+      optionsPnl: report.optionsPnl,
+      markdown: report.markdown,
+      // ⛔ `{}` from a corrupt read must not read as "the broker was quiet" — see
+      // `readTradierDailyTotalsForEvidence`. A missing file is `ok` with no rows
+      // (a new account genuinely has none); a FAILED read is `known: false` and
+      // the audit fails closed on it.
+      broker: totals.ok
+        ? { known: true, realizedUsd: totals.totals[report.date] ?? 0 }
+        : { known: false, reason: totals.reason },
+    });
+    if (!isUnreconciled(verdict)) return report;
+    const disposition = decideLiveCellSourceDisposition(verdict, new Date().toISOString());
+    if (!disposition.pnlUnreconciled) return report;
+    log.warn('TRA-3102 served a live calendar cell as NOT broker-confirmed', {
+      username: ctx.username,
+      env,
+      date: report.date,
+      reason: disposition.pnlUnreconciled.reason,
+      pnlSource: report.pnlSource ?? '(unlabelled)',
+      renderedPnl: disposition.pnlUnreconciled.renderedPnl,
+      brokerPnl: disposition.pnlUnreconciled.brokerPnl,
+      engineOptionsPnl: disposition.pnlUnreconciled.engineOptionsPnl,
+    });
+    return { ...report, pnlUnreconciled: disposition.pnlUnreconciled };
+  } catch (err) {
+    // A failed audit must not blank the calendar, and must not be silent — or
+    // "the detector found nothing" and "the detector never ran" become the same
+    // observation, which is the defect this cluster keeps producing.
+    log.warn('TRA-3102 broker-source audit failed — cell served unaudited', {
       username: ctx.username,
       date: report.date,
       reason: err instanceof Error ? err.message : String(err),
@@ -9964,7 +10127,13 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
     const raw = await readFile(latestPath, 'utf-8');
     // TRA-3101 — same stale-anchor audit as the per-date route. `latest.json` is
     // a copy of a dated cell and is just as able to be a stale-anchor zero.
-    const latest = await stampStaleBalanceAnchorAudit(ctx, mode, JSON.parse(raw) as EodReport);
+    // TRA-3102 — and just as able to be an engine figure the broker never
+    // confirmed. Both audits run on BOTH routes; a cell that is flagged when
+    // browsed by date and clean as "latest" is the same cell reading two ways.
+    const latest = await stampBrokerSourceAudit(
+      ctx, mode,
+      await stampStaleBalanceAnchorAudit(ctx, mode, JSON.parse(raw) as EodReport),
+    );
     res.json(stampMoverProvenance(latest));
   } catch {
     res.status(500).json({ error: 'Failed to read report' });
@@ -10215,7 +10384,14 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   // TRA-3101 — audit the stored balance anchor on the way out. The seven
   // known-bad cells predate the go-forward detector, so a write-path-only fix
   // could not reach a single one of them.
-  res.json(stampMoverProvenance(await stampStaleBalanceAnchorAudit(ctx, mode, personal)));
+  // TRA-3102 — then audit whether the figure is broker-sourced at all. 23 of the
+  // 69 stored live cells are not, and the clobber guard means the write path can
+  // never rewrite them either.
+  res.json(
+    stampMoverProvenance(
+      await stampBrokerSourceAudit(ctx, mode, await stampStaleBalanceAnchorAudit(ctx, mode, personal)),
+    ),
+  );
 });
 
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {

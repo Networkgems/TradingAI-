@@ -2641,6 +2641,23 @@ export interface OptionPosition {
    */
   importedFromTradier?: boolean;
   /**
+   * TRA-3112 item 3 — the Tradier env the import was pulled FROM.
+   *
+   * `mode` is stamped `'live'` unconditionally on every imported row
+   * (`/api/tradier/positions/sync` → `reconcileTradierPositions(env, …, 'live')`),
+   * so a demo book importing its own SANDBOX account produces rows that are
+   * indistinguishable from production ones to anything partitioning on `mode`.
+   * A fleet census that partitions on `mode` therefore reads perfectly clean
+   * while real production imports sit on non-operator books — the instrument
+   * defect underneath the TRA-3110 security defect.
+   *
+   * Set only on rows minted/refreshed by the Tradier import reconcile. Absent ⇔
+   * engine-opened, or an imported row persisted before this field existed — so
+   * absence is UNKNOWN, never "sandbox". A census must count the unlabelled
+   * cohort rather than fold it into either bucket.
+   */
+  importedFromEnv?: TradierEnv;
+  /**
    * TRA-3078 — the option-trade-journal row id this position's PARTIAL and
    * CLOSE rows must be written to. Absent ⇔ unresolved; present and equal to
    * {@link id} ⇔ resolved to identity, which is the case for every
@@ -4259,6 +4276,60 @@ export interface EodReport {
       | { known: true; brokerCloses: number; brokerRealizedUsd: number; engineTrades: number; openPositions: number }
       | { known: false; reason: string };
     /** Operator-facing explanation of what is unknown and why. */
+    detail: string;
+    /** ISO timestamp the verdict was stamped. */
+    at: string;
+  };
+
+  /**
+   * TRA-3102 — present only when the rendered `combinedPnl` is **not
+   * broker-confirmed**, and its presence means the figure is not a claim about
+   * money that moved.
+   *
+   * `generateEodReport` builds the calendar figure as `realizedPnl +
+   * optionsPnl`, and `optionsPnl` is summed from the ENGINE's own
+   * `closedOptions` book rather than from broker fills. On a demo book that is
+   * the only source there is. On a LIVE book it is money the broker never
+   * confirmed: an engine-side close that never corresponded to a broker fill
+   * books green straight into a real-money cell.
+   *
+   * Measured on the live production account, 69 stored cells: 20 rows render a
+   * non-zero engine options figure, and **46 of the 69 carry no `pnlSource` at
+   * all** — so a scope gate keyed on `pnlSource === 'engine'` reaches none of
+   * them. Three more (`2026-07-15/17/21`) are labelled `tradier-balance` and
+   * render a figure their own header contradicts, equal to `optionsPnl` to the
+   * cent: the broker override was stamped and then overwritten from the engine
+   * book underneath it.
+   *
+   * Readers MUST branch on this field before rendering or summing
+   * `combinedPnl`. Like {@link EodReport.pnlUnknown} it is deliberately NOT a
+   * corrected number — re-deriving a P&L by inference is how the phantom-green
+   * calendar happened (TRA-2864).
+   */
+  pnlUnreconciled?: {
+    /**
+     * - `engine_close_without_broker_fill` — engine options P&L booked on a date
+     *   the broker shows no realized options P&L for. Not money that moved.
+     * - `engine_options_diverges_from_broker` — both non-zero and they disagree;
+     *   broker truth wins and the rendered figure is the engine's.
+     * - `broker_figure_overwritten` — a broker-tagged row whose stored figure
+     *   contradicts the broker figure stated in its own header.
+     * - `broker_evidence_unreadable` / `broker_provenance_unreadable` — the
+     *   comparison could not be made. Blind, not agreed; both fail closed.
+     */
+    reason:
+      | 'engine_close_without_broker_fill'
+      | 'engine_options_diverges_from_broker'
+      | 'broker_figure_overwritten'
+      | 'broker_evidence_unreadable'
+      | 'broker_provenance_unreadable';
+    /** The figure the calendar renders for this day. */
+    renderedPnl: number;
+    /** The broker's figure for the comparison; `null` when unknown/blind. */
+    brokerPnl: number | null;
+    /** The engine's own options figure on the row. */
+    engineOptionsPnl: number;
+    /** Operator-facing explanation of what is unconfirmed and why. */
     detail: string;
     /** ISO timestamp the verdict was stamped. */
     at: string;
