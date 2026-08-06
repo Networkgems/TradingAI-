@@ -327,6 +327,129 @@ test('F11 the pre-window edge, not `from`, is what a bounded events query must r
   assert.match(r.blindReasons.join(' '), /startTime AFTER the window open/);
 });
 
+// ── K (TRA-3060): the FOURTH witness — the external-kill line as a boot candidate ───────────────
+//
+// `__fixtures__/bqb1-2026-08-04-external-kill.json` is the verbatim payload of four Render reads over
+// 2026-08-04T20:30–20:45Z. It holds TWO real boots, each one witnessed THREE ways within ~5 s:
+// a watchdog BOOT echo, an external-kill line ~1 ms later, and a deploy `finishedAt` ~3 s later.
+// That is the overlap the ticket demanded be proven, on bytes rather than on a hand-built pair.
+const FXK = JSON.parse(readFileSync(
+  fileURLToPath(new URL('./__fixtures__/bqb1-2026-08-04-external-kill.json', import.meta.url)), 'utf8'));
+const KW = { from: '2026-08-04T20:30:00.000Z', to: '2026-08-04T20:45:00.000Z' };
+const kill = (over = {}) => buildBootSet({
+  ...KW,
+  watchdogLines: FXK.watchdogLogs, watchdogOk: true,
+  coverageLineCount: 5, coverageOk: true,
+  deploys: FXK.deploys, deploysOk: true,
+  events: FXK.events, eventsOk: true, eventsQueryFrom: KW.from,
+  ...over,
+});
+
+test('K1 ARM A — an external-kill line with NO other witness IS a boot, and is reported as one no '
+  + 'original witness saw', () => {
+  const r = buildBootSet({
+    ...KW,
+    watchdogLines: [], watchdogOk: true,
+    externalKillLines: [FXK.externalKillLogs[0]], externalKillOk: true,
+    coverageLineCount: 5, coverageOk: true,
+    deploys: [{ finishedAt: '2026-07-30T07:57:18.097Z' }], deploysOk: true,
+    events: [], eventsOk: true, eventsQueryFrom: KW.from,
+  });
+  assert.equal(r.blind, false);
+  assert.equal(r.bootCount, 1);
+  assert.deepEqual(r.boots[0].srcs, ['EXTERNAL_KILL']);
+  assert.equal(r.seenOnlyByExternalKill, 1);
+});
+
+test('K2 ARM B — the identical world WITHOUT the line is silent. A detector that fires either way '
+  + 'discriminates nothing', () => {
+  const r = buildBootSet({
+    ...KW,
+    watchdogLines: [], watchdogOk: true,
+    externalKillLines: [], externalKillOk: true,
+    coverageLineCount: 5, coverageOk: true,
+    deploys: [{ finishedAt: '2026-07-30T07:57:18.097Z' }], deploysOk: true,
+    events: [], eventsOk: true, eventsQueryFrom: KW.from,
+  });
+  assert.equal(r.blind, false);
+  assert.equal(r.bootCount, 0);
+  assert.equal(r.seenOnlyByExternalKill, 0);
+});
+
+test('K3 THE TRAP — 2 boots seen by 3 witnesses each is 2 boots, NOT 4 and NOT 6. The failing '
+  + 'direction here is an OVER-count, which is the defect this module exists to prevent', () => {
+  const withKill = kill({ externalKillLines: FXK.externalKillLogs, externalKillOk: true });
+  assert.equal(withKill.blind, false);
+  assert.equal(withKill.bootCount, 2);
+  // Every boot carries all three accounts of itself — that is what proves the collapse happened
+  // rather than that the candidates were silently dropped on the floor.
+  for (const b of withKill.boots) {
+    assert.deepEqual([...b.srcs].sort(), ['DEPLOY', 'EXTERNAL_KILL', 'WATCHDOG']);
+  }
+  assert.equal(withKill.sources.externalKill.candidates, 2, 'both candidates were BUILT…');
+  assert.equal(withKill.seenOnlyByExternalKill, 0, '…and both were absorbed, not counted twice');
+});
+
+test('K4 …and the collapse is the 90 s CLUSTER doing the work, not the emitter\'s own 5 s '
+  + 'suppression — which lives on a build this reader may not be running', () => {
+  // Same verbatim line, moved to +60 s (inside the cluster) and +120 s (outside it). The emitter
+  // suppresses its own duplicate at >5 s, so if that suppression is what we were relying on, BOTH
+  // of these would be single boots. Only the first is.
+  const echoAt = FXK.watchdogLogs[0].timestamp;
+  const shift = (ms) => [{ ...FXK.externalKillLogs[0], timestamp: new Date(new Date(echoAt).getTime() + ms).toISOString() }];
+  const inside = kill({ watchdogLines: [FXK.watchdogLogs[0]], externalKillLines: shift(60_000), deploys: [{ finishedAt: '2026-07-30T07:57:18.097Z' }] });
+  const outside = kill({ watchdogLines: [FXK.watchdogLogs[0]], externalKillLines: shift(120_000), deploys: [{ finishedAt: '2026-07-30T07:57:18.097Z' }] });
+  assert.equal(inside.bootCount, 1, '60 s apart -> one boot, two witnesses');
+  assert.equal(outside.bootCount, 2, '120 s apart -> two boots: the cluster, not the server, decides');
+  assert.ok(60_000 < BOOT_CLUSTER_MS && 120_000 > BOOT_CLUSTER_MS);
+});
+
+test('K5 DEFAULT-INERT — omitting the new input reproduces the pre-TRA-3060 answer byte for byte. '
+  + 'This is the pin that says no shipped consumer moved', () => {
+  const before = live(RTH);
+  assert.equal(before.bootCount, 4);
+  assert.equal(before.invisibleToDeploys, 2);
+  assert.equal(before.blind, false);
+  assert.equal(before.blindReasons.length, 0);
+  assert.equal(before.seenOnlyByExternalKill, 0);
+  // …and on the 08-04 window too: supplying the lines changes NOTHING about the count. This is the
+  // measured finding (delta 0 over every readable session), asserted rather than remembered.
+  assert.equal(kill().bootCount, kill({ externalKillLines: FXK.externalKillLogs }).bootCount);
+});
+
+test('K6 a line on the external-kill read that is NOT an external kill BLINDS — the filter or the '
+  + 'emitter has drifted, and a drifted acquisition must not quietly return fewer boots', () => {
+  const r = kill({ externalKillLines: [TRIP_1956], externalKillOk: true });
+  assert.equal(r.blind, true);
+  assert.match(r.blindReasons.join(' '), /did not classify as EXTERNAL_KILL \(TRIP\)/);
+  assert.equal(r.bootCount, null);
+});
+
+test('K7 an unreadable or truncated external-kill read BLINDS rather than reporting a lower bound — '
+  + 'a lower bound reads as "clean"', () => {
+  const failed = kill({ externalKillLines: [], externalKillOk: false });
+  assert.equal(failed.blind, true);
+  assert.match(failed.blindReasons.join(' '), /external-kill log probe .* FAILED/);
+  const truncated = kill({ externalKillLines: FXK.externalKillLogs, externalKillOk: true, externalKillTruncated: true });
+  assert.equal(truncated.blind, true);
+  assert.match(truncated.blindReasons.join(' '), /external-kill log page was TRUNCATED/);
+});
+
+test('K8 THE MEASURED REDUNDANCY, pinned on real bytes: every external-kill line in the fixture has '
+  + 'a BOOT echo within the cluster. That is WHY the delta is zero, and it stops being true the day '
+  + 'the trip breadcrumb is absent', () => {
+  const echoes = FXK.watchdogLogs.map(classifyWatchdogLine).filter(l => l.kind === 'BOOT');
+  const kills = FXK.externalKillLogs.map(classifyWatchdogLine);
+  assert.equal(kills.length, 2);
+  assert.ok(kills.every(k => k.kind === 'EXTERNAL_KILL'));
+  for (const k of kills) {
+    const near = echoes.filter(e => Math.abs(new Date(e.at) - new Date(k.at)) <= BOOT_CLUSTER_MS);
+    assert.equal(near.length, 1, `${k.at} must have exactly one echo inside the cluster`);
+    // Measured 0.476–4.688 ms across all 39 lines of the 08-01..08-06 population — the same boot.
+    assert.ok(Math.abs(new Date(near[0].at) - new Date(k.at)) < 5_000);
+  }
+});
+
 // ── L-OLD: regression controls. These assert the OLD expressions still get the WRONG answer. ─────
 
 test('L-OLD-a the naive /WATCHDOG TRIP/i DOES match the suppressed line — the bug is still visible', () => {

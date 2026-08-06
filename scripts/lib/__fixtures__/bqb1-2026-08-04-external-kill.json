@@ -1,0 +1,421 @@
+{
+  "_comment": "TRA-3060 — VERBATIM Render /v1/logs + /deploys + /events for tradingai-bqb1, 2026-08-04T20:30:00Z..2026-08-04T20:45:00Z. Captured 2026-08-06. The BOOT echo and the external-kill line are the SAME boot, ~1ms apart; this is the fixture that proves clusterBoots absorbs the overlap.",
+  "window": {
+    "from": "2026-08-04T20:30:00Z",
+    "to": "2026-08-04T20:45:00Z"
+  },
+  "externalKillLogs": [
+    {
+      "timestamp": "2026-08-04T20:37:46.662584712Z",
+      "message": "{\"ts\":\"2026-08-04T20:37:46.662Z\",\"level\":\"warn\",\"msg\":\"prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 / health-check SIGTERM) suspected\",\"module\":\"event-loop-watchdog\",\"lastAliveUptimeSec\":242386,\"lastAliveRssMB\":1372,\"lastAliveExternalMB\":5,\"lastAliveHeapPct\":0.154,\"lastAliveLagMaxMs\":31}"
+    },
+    {
+      "timestamp": "2026-08-04T20:42:11.349566354Z",
+      "message": "{\"ts\":\"2026-08-04T20:42:11.349Z\",\"level\":\"warn\",\"msg\":\"prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 / health-check SIGTERM) suspected\",\"module\":\"event-loop-watchdog\",\"lastAliveUptimeSec\":226,\"lastAliveRssMB\":317,\"lastAliveExternalMB\":4,\"lastAliveHeapPct\":0.068,\"lastAliveLagMaxMs\":30}"
+    }
+  ],
+  "watchdogLogs": [
+    {
+      "timestamp": "2026-08-04T20:37:46.661879456Z",
+      "message": "{\"ts\":\"2026-08-04T20:37:46.661Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":219995,\"rssMB\":1781,\"heapUsedMB\":806,\"lagMaxMs\":8682,\"detail\":\"single event-loop block: max lag 8682ms >= 4000ms in one 1000ms window (mean 983ms) — exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    },
+    {
+      "timestamp": "2026-08-04T20:42:11.348728205Z",
+      "message": "{\"ts\":\"2026-08-04T20:42:11.348Z\",\"level\":\"warn\",\"msg\":\"prior watchdog self-restart detected on boot\",\"module\":\"event-loop-watchdog\",\"reason\":\"block\",\"uptimeSecAtTrip\":219995,\"rssMB\":1781,\"heapUsedMB\":806,\"lagMaxMs\":8682,\"detail\":\"single event-loop block: max lag 8682ms >= 4000ms in one 1000ms window (mean 983ms) — exceeds Render's 5s health-check budget, self-restarting before the platform hard-kill\"}"
+    }
+  ],
+  "deploys": [
+    {
+      "id": "dep-d9q110e1egvs73d3kln0",
+      "status": "live",
+      "finishedAt": "2026-08-06T04:43:29.332654Z",
+      "createdAt": "2026-08-06T04:41:37.97416Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9q0s9ht0dsc73c1v140",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T04:33:22.284593Z",
+      "createdAt": "2026-08-06T04:31:34.80274Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9q0a061egvs73d2f7g0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T03:54:36.867528Z",
+      "createdAt": "2026-08-06T03:52:32.198419Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ptm9vlk1mc73e63nug",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T00:55:50.790845Z",
+      "createdAt": "2026-08-06T00:53:59.561169Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ptfn61egvs73ctft50",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T00:41:56.419569Z",
+      "createdAt": "2026-08-06T00:39:56.301334Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pt6sflk1mc73e5ach0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T00:23:15.319988Z",
+      "createdAt": "2026-08-06T00:21:05.165818Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pstb9t0dsc73bqukeg",
+      "status": "deactivated",
+      "finishedAt": "2026-08-06T00:03:25.429134Z",
+      "createdAt": "2026-08-06T00:00:45.500527Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ppq6ugekts73a128g0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T20:31:18.970988Z",
+      "createdAt": "2026-08-05T20:29:15.802382Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ppd0dai2ds73bolabg",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T20:04:58.830186Z",
+      "createdAt": "2026-08-05T20:01:06.170635Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ppcmu417fc73c2mjn0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T20:02:57.529761Z",
+      "createdAt": "2026-08-05T20:00:28.066663Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pig71t0dsc73do16ag",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T12:11:51.221032Z",
+      "createdAt": "2026-08-05T12:10:04.8292Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pi6r5bedkc73c5he0g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T11:52:08.181944Z",
+      "createdAt": "2026-08-05T11:50:04.348053Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9phuju7bikc73b8o41g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T11:34:17.21895Z",
+      "createdAt": "2026-08-05T11:32:31.802305Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pho1m7bikc73b8bb40",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T11:20:20.254025Z",
+      "createdAt": "2026-08-05T11:18:30.701201Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9phbffavr4c73bmrsr0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T10:53:40.760461Z",
+      "createdAt": "2026-08-05T10:51:41.338127Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pgnrm7bikc73b6cqtg",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T10:11:52.068704Z",
+      "createdAt": "2026-08-05T10:09:50.385583Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pfh7ijnfac73ejc6e0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T08:49:30.073949Z",
+      "createdAt": "2026-08-05T08:47:26.585493Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pfbflbedkc73bvj27g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T08:37:24.227039Z",
+      "createdAt": "2026-08-05T08:35:10.295708Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pafa67bikc73ap0cn0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T03:03:51.472424Z",
+      "createdAt": "2026-08-05T03:02:00.833357Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9pa9hqjnfac73e95sf0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T02:51:47.991645Z",
+      "createdAt": "2026-08-05T02:49:44.056657Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p9q3vavr4c73b5kaog",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T02:18:36.420863Z",
+      "createdAt": "2026-08-05T02:16:47.347018Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p9om5bedkc73bj149g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T02:15:24.202136Z",
+      "createdAt": "2026-08-05T02:13:44.863554Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p9lqnavr4c73b58cp0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-05T02:09:15.460927Z",
+      "createdAt": "2026-08-05T02:07:38.35731Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p79tss728c739401c0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T23:28:06.499031Z",
+      "createdAt": "2026-08-04T23:25:43.375947Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p6g6fqj5pc738qkc9g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:32:39.855471Z",
+      "createdAt": "2026-08-04T22:30:49.866088Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p69lfqj5pc738q8ftg",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:18:42.653411Z",
+      "createdAt": "2026-08-04T22:16:53.984382Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p663asgisc73cgpke0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:13:40.835868Z",
+      "createdAt": "2026-08-04T22:09:18.332622Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p65tm417fc73ep882g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:11:07.262476Z",
+      "createdAt": "2026-08-04T22:08:54.274168Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p62inlk1mc73aequm0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:04:17.364728Z",
+      "createdAt": "2026-08-04T22:01:46.945144Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p61gbl550s73fs3jo0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T22:01:24.630615Z",
+      "createdAt": "2026-08-04T21:59:29.561967Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p5ucflk1mc73aeimq0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:54:38.856102Z",
+      "createdAt": "2026-08-04T21:52:49.708395Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p5lp4s728c738baqj0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:36:18.763158Z",
+      "createdAt": "2026-08-04T21:34:29.031947Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p5gr5bedkc73e58iag",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:26:01.845155Z",
+      "createdAt": "2026-08-04T21:23:56.645192Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p5eup44i1s73fac6j0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:22:25.726823Z",
+      "createdAt": "2026-08-04T21:19:56.363403Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p5ebm7bikc738gn990",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:20:37.130315Z",
+      "createdAt": "2026-08-04T21:18:39.064339Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p57aj7uimc73ajr7rg",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:05:32.929071Z",
+      "createdAt": "2026-08-04T21:03:38.454794Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p569m7bikc738g90b0",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T21:03:22.679013Z",
+      "createdAt": "2026-08-04T21:01:26.484199Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p4sbfavr4c73akve8g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T20:42:16.294014Z",
+      "createdAt": "2026-08-04T20:40:13.708012Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9p4q9u1egvs73f9jo9g",
+      "status": "deactivated",
+      "finishedAt": "2026-08-04T20:37:49.868662Z",
+      "createdAt": "2026-08-04T20:35:51.812976Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9ljtf710e5c73drg670",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T12:10:24.210226Z",
+      "createdAt": "2026-07-30T12:08:28.237246Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lis0ijnfac73aks36g",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T10:59:11.342488Z",
+      "createdAt": "2026-07-30T10:57:06.995259Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lifm2d0e5s73cjm3c0",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T10:32:51.198424Z",
+      "createdAt": "2026-07-30T10:30:49.007529Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lhu76417fc73cunu80",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T09:55:45.842894Z",
+      "createdAt": "2026-07-30T09:53:32.566845Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lhg57qj5pc7393e590",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T09:25:28.50331Z",
+      "createdAt": "2026-07-30T09:23:32.755679Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lhafqd0e5s73chidj0",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T09:13:44.899383Z",
+      "createdAt": "2026-07-30T09:11:27.813036Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lgtau417fc73csocg0",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T08:45:33.051516Z",
+      "createdAt": "2026-07-30T08:43:23.413458Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lgoj7qj5pc73924ih0",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T08:35:03.966247Z",
+      "createdAt": "2026-07-30T08:33:16.217846Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lgfff10e5c73dlh51g",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T08:16:01.13539Z",
+      "createdAt": "2026-07-30T08:13:50.08833Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lg7j2ank6s73f34l90",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T07:59:10.077061Z",
+      "createdAt": "2026-07-30T07:57:01.429206Z",
+      "trigger": "api"
+    },
+    {
+      "id": "dep-d9lg5ead0e5s73cfa5tg",
+      "status": "deactivated",
+      "finishedAt": "2026-07-30T07:57:18.09782Z",
+      "createdAt": "2026-07-30T07:52:25.392639Z",
+      "trigger": "api"
+    }
+  ],
+  "events": [
+    {
+      "id": "evt-d9p4ta144i1s73fa0v2g",
+      "type": "deploy_ended",
+      "timestamp": "2026-08-04T20:42:16.380295Z"
+    },
+    {
+      "id": "evt-d9p4sumsig1c73a13srg",
+      "type": "build_ended",
+      "timestamp": "2026-08-04T20:41:29.81723Z"
+    },
+    {
+      "id": "evt-d9p4sc8meges73d3td3g",
+      "type": "build_started",
+      "timestamp": "2026-08-04T20:40:16.105164Z"
+    },
+    {
+      "id": "evt-d9p4sbp6jivs73bh4v10",
+      "type": "deploy_started",
+      "timestamp": "2026-08-04T20:40:15.95787Z"
+    },
+    {
+      "id": "evt-d9p4r7e5nbts7399psug",
+      "type": "deploy_ended",
+      "timestamp": "2026-08-04T20:37:49.976093Z"
+    },
+    {
+      "id": "evt-d9p4qsefulvc73asc76g",
+      "type": "build_ended",
+      "timestamp": "2026-08-04T20:37:04.864466Z"
+    },
+    {
+      "id": "evt-d9p4qa8meges73d3s270",
+      "type": "build_started",
+      "timestamp": "2026-08-04T20:35:52.175884Z"
+    },
+    {
+      "id": "evt-d9p4qa6fulvc73asbtbg",
+      "type": "deploy_started",
+      "timestamp": "2026-08-04T20:35:52.150363Z"
+    }
+  ]
+}

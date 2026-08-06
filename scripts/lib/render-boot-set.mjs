@@ -32,6 +32,23 @@
 // container-death event either. Every restart path OBSERVED on this service to date leaves one of the
 // three witnesses — that is an observation, not a proof. Do not read `bootCount === 0` as "no process
 // on earth restarted this box"; read it as "none of the three witnesses saw one".
+//
+// ✅ TRA-3060 (2026-08-06) — THE RESIDUAL ABOVE IS NOW **CHARACTERISED BY A PREDICATE**, AND IT IS
+// STILL CORRECT AS WRITTEN. There IS a fourth witness: `prior process died WITHOUT a watchdog trip —
+// external kill …` is emitted AT BOOT by the newly-started process (`event-loop-watchdog.ts:955-969`),
+// so it reports exactly the death the other three can miss. `buildBootSet` ACCEPTS it
+// (`externalKillLines`, `src:'EXTERNAL_KILL'`); `pullBootSet` deliberately DOES NOT FETCH it. The
+// reason is measured, not asserted — see the long note at that call site and
+// `scripts/tra3060-external-kill-delta.mjs`:
+//
+//   THE FOURTH WITNESS ADDS A BOOT **IFF `<DATA_DIR>/watchdog-last-trip.json` IS ABSENT**.
+//
+// Both breadcrumbs are files on the same never-pruned Render persistent disk, so on a box that has
+// tripped even once the boot echo fires at every later boot and the external-kill line is always a
+// duplicate of it — measured 39/39 within 0.476–4.688 ms of a boot echo, ZERO orphans, and
+// `bootCount` 16 -> 16 on both readable full days.
+// ⇒ read `bootCount === 0` as "none of the three witnesses saw one, AND the fourth could only have
+// disagreed with them if this box had never tripped".
 
 export const BOOT_CLUSTER_MS = 90_000;
 
@@ -89,11 +106,10 @@ export const RESTART_EVENT_RE = /restart|crash|oom|server_failed|health_check_fa
 // real `WATCHDOG TRIP — self-restarting…` line still scores TRIP) — a quarantine that swallows the
 // real trip is worse than the bug it fixes.
 //
-// ⚠️ DELIBERATELY NOT CHANGED, AND WORTH A FOLLOW-UP: an EXTERNAL_KILL line is emitted AT BOOT by
-// the newly-started process, so it is a FOURTH boot witness — the one that would cover this module's
-// own STATED RESIDUAL above (`POST /api/admin/restart` on a box that never tripped writes no deploy
-// record and emits no watchdog echo). Feeding it into `buildBootSet` CHANGES VERDICTS, so it is
-// recorded here rather than smuggled into a hardening ticket.
+// ✅ RESOLVED BY TRA-3060 (the follow-up this paragraph used to ask for): an EXTERNAL_KILL line is
+// indeed emitted AT BOOT by the newly-started process, so it IS a fourth boot witness, and
+// `buildBootSet` now accepts it. It turned out NOT to change any verdict, for a structural reason —
+// see the ✅ TRA-3060 block in the header. Fetching it is opt-in and currently off.
 //
 // Order matters: SUPPRESSED, EXTERNAL_KILL and BREADCRUMB_ERROR must all be tested BEFORE TRIP.
 // Anything unrecognised is UNCLASSIFIED, which blinds the caller: a new log variant must make this
@@ -190,10 +206,18 @@ export function clusterBoots(candidates, clusterMs = BOOT_CLUSTER_MS) {
  *   inside the window were never fetched. A truncated trip page UNDER-counts, which is the direction
  *   that reads as "clean".
  * @param {(d:object)=>string} [a.deployLabel]  optional attribution ("why did this deploy happen")
+ * @param {{timestamp:string,message:string}[]} [a.externalKillLines]  logs, `text=external kill` —
+ *   the FOURTH boot witness (TRA-3060). These do NOT arrive on the `text=self-restarting` read: that
+ *   filter's string appears in none of them, so this is a SEPARATE query, not a widened pre-filter.
+ * @param {boolean} [a.externalKillOk]  that fetch succeeded. ⚠️ DEFAULTS TRUE WITH AN EMPTY LIST so a
+ *   caller that never asked for this source is not force-blinded; see the header note on why that is
+ *   sound HERE and would not be for the other three.
+ * @param {boolean} [a.externalKillTruncated] the page came back saturated ⇒ lower bound.
  */
 export function buildBootSet({
   from, to, preWindowMs = 0,
   watchdogLines = [], watchdogOk = true, watchdogTruncated = false,
+  externalKillLines = [], externalKillOk = true, externalKillTruncated = false,
   coverageLineCount = 0, coverageOk = true,
   deploys = [], deploysOk = true,
   events = [], eventsOk = true, eventsQueryFrom = null, eventsTruncated = false,
@@ -243,6 +267,23 @@ export function buildBootSet({
         + 'which on its own writes NO deploy record',
     }));
 
+  // TRA-3060 — THE FOURTH WITNESS. `event-loop-watchdog.ts:955-969` emits this line AT BOOT, by the
+  // NEWLY-STARTED process, off the `readLastLiveness()` breadcrumb — so it is a boot report, not an
+  // incident report, and it is the only witness to the death the module's header calls its residual.
+  const killClassified = externalKillLines.map(classifyWatchdogLine)
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+  const externalKillBoots = killClassified
+    .filter(l => l.kind === 'EXTERNAL_KILL' && inSpan(l.at))
+    .map(l => ({
+      at: l.at,
+      src: 'EXTERNAL_KILL',
+      label: 'boot after a death with NO watchdog trip (external SIGKILL/SIGTERM) — the prior process '
+        + 'left no trip breadcrumb and no deploy record',
+    }));
+  // Anything on this read that is NOT an EXTERNAL_KILL is a filter/emitter drift, not a boot. It must
+  // blind rather than be dropped, exactly as an UNCLASSIFIED line does on the other read.
+  const killForeign = killClassified.filter(l => l.kind !== 'EXTERNAL_KILL');
+
   // Did each paged source reach back far enough to have SEEN the window open? If the oldest record we
   // hold is still newer than `from`, there may be boots inside the window we simply never fetched —
   // that is blind, not clean. (Fourth time on the soak gate that absence of FETCHED evidence was read
@@ -255,6 +296,9 @@ export function buildBootSet({
   const blindReasons = [];
   if (!watchdogOk) blindReasons.push('watchdog log probe (text=self-restarting) FAILED');
   else if (watchdogTruncated) blindReasons.push('the watchdog log page was TRUNCATED (more matching lines exist than were fetched) — the trip count and the echo-boot set are both lower bounds, and a lower bound reads as "clean"');
+  if (!externalKillOk) blindReasons.push('external-kill log probe (text=external kill) FAILED');
+  else if (externalKillTruncated) blindReasons.push('the external-kill log page was TRUNCATED (more matching lines exist than were fetched) — the fourth-witness boot set is a lower bound, and a lower bound reads as "clean"');
+  else if (killForeign.length) blindReasons.push(`${killForeign.length} line(s) on the external-kill read did not classify as EXTERNAL_KILL (${[...new Set(killForeign.map(l => l.kind))].join(',')}) — the filter or the emitter has drifted`);
   if (!coverageOk) blindReasons.push('log coverage probe FAILED');
   // The existence control that makes a zero honest: a `text=self-restarting` query returning nothing
   // is the answer we most want to trust and can least afford to trust naively, so it is paired with an
@@ -276,7 +320,7 @@ export function buildBootSet({
     else if (eventsTruncated) blindReasons.push('the time-bounded events page came back SATURATED at its limit — older container deaths inside the window may never have been fetched');
   } else if (!oldestEvent || new Date(oldestEvent).getTime() > fromMs) blindReasons.push('the events page did not reach back past the window open — container deaths inside it may never have been fetched');
 
-  const bootsWithPreWindow = clusterBoots([...deployBoots, ...deathBoots, ...echoBoots], clusterMs)
+  const bootsWithPreWindow = clusterBoots([...deployBoots, ...deathBoots, ...echoBoots, ...externalKillBoots], clusterMs)
     .map(b => ({ ...b, inWindow: new Date(b.at).getTime() >= fromMs }));
   const boots = bootsWithPreWindow.filter(b => b.inWindow);
   const blind = blindReasons.length > 0;
@@ -289,6 +333,10 @@ export function buildBootSet({
     // like a measurement; `0` is exactly the value that gets quoted as "clean".
     bootCount: blind ? null : boots.length,
     invisibleToDeploys: blind ? null : boots.filter(b => !b.srcs.includes('DEPLOY')).length,
+    // TRA-3060 — boots NO original witness saw. This is the number that says whether the fourth
+    // witness earns its keep; it is 0 whenever the trip breadcrumb survives (see the header note).
+    seenOnlyByExternalKill: blind ? null
+      : boots.filter(b => b.srcs.length === 1 && b.srcs[0] === 'EXTERNAL_KILL').length,
     boots,
     bootsWithPreWindow,
     trips,
@@ -298,6 +346,7 @@ export function buildBootSet({
       deploy: { ok: deploysOk, candidates: deployBoots.length },
       event: { ok: eventsOk, candidates: deathBoots.length },
       watchdog: { ok: watchdogOk, candidates: echoBoots.length, coverageLineCount },
+      externalKill: { ok: externalKillOk, candidates: externalKillBoots.length, lines: killClassified.length },
     },
   };
 }
@@ -337,6 +386,27 @@ export async function pullBootSet({
   const eventsUrl = `${api}/services/${serviceId}/events?limit=${EVENTS_LIMIT}`
     + `&startTime=${encodeURIComponent(leftEdge)}&endTime=${encodeURIComponent(to)}`;
 
+  // ⛔⭐⭐⭐ TRA-3060 — THE FOURTH WITNESS IS **DELIBERATELY NOT FETCHED HERE**, AND THAT IS THE
+  // FINDING, NOT AN OMISSION. `buildBootSet` accepts `externalKillLines`; this shell does not supply
+  // them, so every shipped consumer keeps a byte-identical boot set. Measured before deciding
+  // (`scripts/tra3060-external-kill-delta.mjs`, re-runnable):
+  //   * 08-04 and 08-05 full days — 16 external-kill lines each, `bootCount` 16 -> 16, `delta 0`,
+  //     `seenOnlyByExternalKill` 0. Over 08-01..08-06 the population is 39 lines (`hasMore:false`,
+  //     a COMPLETE population) and ALL 39 sit 0.476–4.688 ms after a `prior watchdog self-restart detected
+  //     on boot` echo ⇒ the 90 s cluster absorbs every one of them.
+  //   * The feared direction did NOT fire: 16 stayed 16, it did not inflate to 32.
+  // WHY IT IS REDUNDANT, STRUCTURALLY RATHER THAN LUCKILY — `event-loop-watchdog.ts:936-969` emits
+  // the BOOT echo iff `readLastTrip()` is non-null and the external-kill line iff `readLastLiveness()`
+  // is non-null AND (no trip OR gap > 5 s). Both breadcrumbs are files on the SAME Render persistent
+  // disk (`/data`, `dsk-d7o371n7f7vs73850j60`), neither is ever deleted and neither has a TTL. So once
+  // this box has tripped ONCE, the echo fires at EVERY later boot and the external-kill line can never
+  // be alone. ⇒ **THE FOURTH WITNESS ADDS A BOOT IFF `<DATA_DIR>/watchdog-last-trip.json` IS ABSENT**
+  // — a never-tripped box, a replaced disk, or `DATA_DIR` unset. That is EXACTLY the residual in the
+  // header, so the residual is now CHARACTERISED BY A PREDICATE rather than open-ended: it is not
+  // "we cannot see this death", it is "we see it through the echo, unless the trip breadcrumb is gone".
+  // Arming this read costs a 5th request and two new BLIND paths on every soak/tape/restart grade
+  // during go-live week, to move a number that provably cannot move. Do not arm it without first
+  // re-running the delta script and getting a NON-zero.
   const [wd, cov, dep, ev] = await Promise.all([
     owner ? get(logUrl(`&text=${encodeURIComponent('self-restarting')}&limit=${WATCHDOG_LIMIT}`)) : { ok: false, body: null },
     owner ? get(logUrl('&limit=5')) : { ok: false, body: null },
