@@ -215,7 +215,45 @@ async function reportDirsUnder(root: string): Promise<string[]> {
 }
 
 /**
- * Sweep every report root given (a user's `reports/` and `crypto-reports/`),
+ * The report roots for every book directory physically under `users/`.
+ *
+ * ⚠️ Enumerated from the FILESYSTEM, never from the user registry. The first
+ * cut of this sweep built its roots from `getAllUsers()` and it under-reclaimed
+ * by more than half: it released 1,242 sidecars on the 2026-08-06T10:34Z boot
+ * and left 3,017 behind. The live walk explains why — `users/` holds **251**
+ * `trades-stocks.json` files against **62** registered accounts, so roughly
+ * three quarters of the book directories on that volume answer to no entry in
+ * `users.json`.
+ *
+ * That gap is not an anomaly to be fixed here; it is the ordinary residue of a
+ * fleet that went 28 -> 56 -> 62 while trees for departed accounts stayed on
+ * disk. It is also exactly the trap TRA-2410 documents from the other side: a
+ * book whose registry entry is gone is invisible to any `getAllUsers()` check,
+ * and it is the most likely shape for a stale tree on this host.
+ *
+ * The inodes are held by the DIRECTORY, not by the account, so the reclaim has
+ * to be denominated in directories. A registry-driven sweep silently scopes
+ * itself to the shrinking half of the problem while reporting a clean run — the
+ * same class of false-green as bounding backups by generation count.
+ */
+export async function bookReportRoots(usersRoot: string): Promise<string[]> {
+  const roots: string[] = [];
+  let books: Array<{ name: string; isDirectory(): boolean }>;
+  try {
+    books = await readdir(usersRoot, { withFileTypes: true });
+  } catch {
+    return roots;
+  }
+  for (const book of books) {
+    if (!book.isDirectory()) continue;
+    roots.push(join(usersRoot, book.name, 'reports'));
+    roots.push(join(usersRoot, book.name, 'crypto-reports'));
+  }
+  return roots;
+}
+
+/**
+ * Sweep every report root given (a book's `reports/` and `crypto-reports/`),
  * sharing one unlink budget across all of them.
  */
 export async function reclaimReportSidecars(

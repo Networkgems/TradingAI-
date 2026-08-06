@@ -7,6 +7,7 @@ import {
   reclaimSidecarsInDir,
   reclaimReportSidecars,
   reportSidecarMaxUnlinks,
+  bookReportRoots,
 } from './report-sidecar-reclaim.js';
 
 // TRA-3064 — reclaim of the write-only `<date>.md` report sidecars.
@@ -210,6 +211,53 @@ describe('reclaimReportSidecars', () => {
 
     expect(r.removed).toBe(0);
     expect(await readdir(join(reports, 'demo'))).toEqual(before);
+  });
+});
+
+describe('bookReportRoots', () => {
+  let users: string;
+
+  beforeEach(async () => {
+    users = await mkdtemp(join(tmpdir(), 'tra3064-users-'));
+  });
+  afterEach(async () => {
+    await rm(users, { recursive: true, force: true });
+  });
+
+  it('yields both report roots for every book DIRECTORY, registry or not', async () => {
+    // The defect this test exists for: the first cut built roots from
+    // `getAllUsers()` and under-reclaimed by more than half, because bqb1's
+    // `users/` holds ~251 book trees against 62 registered accounts. The inodes
+    // belong to the directory, so the enumeration has to.
+    for (const name of ['alice', 'departed-2025', 'never-registered']) {
+      await mkdir(join(users, name), { recursive: true });
+    }
+
+    const roots = await bookReportRoots(users);
+
+    expect(roots).toHaveLength(6);
+    for (const name of ['alice', 'departed-2025', 'never-registered']) {
+      expect(roots).toContain(join(users, name, 'reports'));
+      expect(roots).toContain(join(users, name, 'crypto-reports'));
+    }
+  });
+
+  it('reclaims from a book with no registry entry — the whole point', async () => {
+    const dir = join(users, 'departed', 'reports', 'demo');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, '2026-08-06.json'), '{"markdown":"x"}', 'utf-8');
+    await writeFile(join(dir, '2026-08-06.md'), 'x', 'utf-8');
+
+    const r = await reclaimReportSidecars(await bookReportRoots(users));
+
+    expect(r.removed).toBe(1);
+    expect(await readdir(dir)).toEqual(['2026-08-06.json']);
+  });
+
+  it('skips loose files at the users/ root and returns [] for a missing root', async () => {
+    await writeFile(join(users, 'users.json'), '[]', 'utf-8');
+    expect(await bookReportRoots(users)).toEqual([]);
+    expect(await bookReportRoots(join(users, 'nope'))).toEqual([]);
   });
 });
 

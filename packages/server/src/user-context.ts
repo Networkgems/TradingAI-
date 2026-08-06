@@ -45,6 +45,7 @@ import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
 import { scrubStaleOptionsPnlCells } from './reports/stale-cell-cleanup.js';
 import {
+  bookReportRoots,
   reclaimReportSidecars,
   reportSidecarMaxUnlinks,
 } from './reports/report-sidecar-reclaim.js';
@@ -455,17 +456,22 @@ export async function runTra1472StaleCellCleanup(): Promise<void> {
  * `reports/report-sidecar-reclaim.ts` for why that gate is the whole design.
  */
 export async function runTra3064SidecarReclaim(): Promise<void> {
-  const roots: string[] = [];
-  for (const u of getAllUsers()) {
-    const dir = userDataDir(u.username);
-    roots.push(join(dir, 'reports'), join(dir, 'crypto-reports'));
-  }
   try {
+    // Book directories come off the FILESYSTEM, not `getAllUsers()`. See
+    // `bookReportRoots` — the registry-driven first cut left 3,017 of 4,259
+    // sidecars behind, because `users/` holds ~251 book trees against 62
+    // registered accounts and the inodes belong to the directory, not the
+    // account.
+    const roots = await bookReportRoots(join(DATA_DIR, 'users'));
     const result = await reclaimReportSidecars(roots, reportSidecarMaxUnlinks());
     if (result.removed > 0 || result.budgetExhausted) {
       log.info('TRA-3064: report sidecar reclaim complete', {
         ticket: 'TRA-3064',
-        books: getAllUsers().length,
+        // Both numbers, deliberately. Their divergence is the reason this sweep
+        // is filesystem-driven, and a run that reported only one of them would
+        // hide it again.
+        bookDirsOnDisk: roots.length / 2,
+        registeredUsers: getAllUsers().length,
         removed: result.removed,
         orphansKept: result.orphansKept,
         errors: result.errors,
