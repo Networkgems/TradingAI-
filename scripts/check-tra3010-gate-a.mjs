@@ -11,7 +11,10 @@
 //   2  BLIND  — nothing to measure (no engine row has been restated yet). This
 //               is the expected state until the next live OTM entry fires, and
 //               it is deliberately NOT 0: an empty ledger is not a pass.
-//   3  BLIND  — could not read (host, login, route, or drift)
+//   3  BLIND  — could not read (host, login, route, or drift), OR an engine open
+//               is on the durable fill tape with no durable restatement and the
+//               box restarted since — the since-boot skip counters that would
+//               have explained it are gone, so the row is UNREAD, not absent.
 //
 // Why the census route and not a plain read of `/api/state`:
 // the restatement overwrites `premiumPaid` in place, the live portfolio
@@ -100,6 +103,62 @@ if (stateRes.ok) {
   console.log(`# open live rows      ${live.length}   of which engine-opened (!importedFromTradier) ${cohort.length}`);
 } else {
   console.log(`# book cross-check unavailable (/api/state ${stateRes.status}) — the zero below is uncorroborated`);
+}
+
+// ---------------------------------------------------------------------------
+// The census counters (`candidates`, `skips`, `sweeps.reached`) are SINCE BOOT.
+// The restatement ledger is durable, but it only records restatements that
+// SUCCEEDED. So an engine row that arrived, was declined (`zero_delta`,
+// `broker_premium_unusable`) or was laundered out of the cohort before the
+// sweep saw it, and was then followed by a restart, leaves NO trace anywhere —
+// and `durable.count: 0` reads exactly like a book that was never active.
+//
+// The fill tape (`/api/health/live-options-fee-slippage`) IS durable (/data)
+// and records every engine fill with `origin: 'fill'`. Cross-check it: an
+// engine open after the census went live that has no durable restatement and
+// no live-boot skip to explain it is UNREAD, not idle.
+//
+// Laundering is real and has already happened to a real row: the engine opened
+// TSLA260911C00555000 on 2026-08-04T13:42:52.729Z, and the book now holds an
+// IMPORTED row for that symbol whose `openedAt` is the broker's `acquiredAt`
+// (…52.047Z), i.e. the engine row was closed and re-minted by the import path
+// (the TRA-2799/TRA-2800 broker-flat sweep). Once laundered a row is outside
+// this gate's cohort permanently.
+const CENSUS_LIVE_SINCE_MS = Date.parse('2026-08-06T00:41:56Z'); // `4aace66` live on bqb1
+const bootMs = Date.parse(ver.startedAt);
+
+let unreadFills = [];
+const feeRes = await fetch(`${HOST}/api/health/live-options-fee-slippage`, { headers: auth });
+if (!feeRes.ok) {
+  console.log(`\n# fill-tape cross-check unavailable (${feeRes.status}) — a missed row would read as idle`);
+} else {
+  const fee = await feeRes.json().catch(() => ({}));
+  const engineOpens = (fee.records ?? []).filter(
+    r => /buy_to_open/i.test(r.side ?? '') && r.origin === 'fill' && r.ts >= CENSUS_LIVE_SINCE_MS,
+  );
+  console.log('\n# --- fill-tape cross-check (durable, survives restart) ---');
+  console.log(`# engine opens since census went live   ${engineOpens.length}`);
+  const restated = durable.restatements ?? [];
+  unreadFills = engineOpens.filter(
+    f => !restated.some(r => r.optionSymbol === f.optionSymbol && r.ts >= f.ts),
+  ).filter(f => bootMs > f.ts); // same-boot misses ARE explained by the skips below
+  for (const f of engineOpens) {
+    const hit = restated.some(r => r.optionSymbol === f.optionSymbol && r.ts >= f.ts);
+    const sameBoot = bootMs <= f.ts;
+    console.log(
+      `#   ${new Date(f.ts).toISOString()}  ${f.optionSymbol}  `
+      + `${hit ? 'restated' : sameBoot ? 'no restatement (this boot — see skips)' : 'NO TRACE (restart since)'}`,
+    );
+  }
+}
+
+if (unreadFills.length > 0) {
+  fail(
+    `${unreadFills.length} engine open(s) since the census went live have no durable `
+    + `restatement AND the box restarted after them (${unreadFills.map(f => f.optionSymbol).join(', ')}). `
+    + 'The since-boot skip counters that would explain them were wiped, so this is UNREAD, not idle. '
+    + 'A row may have arrived and been declined or laundered out of the cohort (TRA-2799/TRA-2800).',
+  );
 }
 
 const records = durable.restatements ?? [];
