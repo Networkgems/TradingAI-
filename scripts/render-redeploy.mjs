@@ -148,6 +148,27 @@ export const EMBARGOES = [
       '(see the rationale note below). Runs to 21:00Z because the graded post-close reads land ' +
       'at 20:10Z / 20:20Z / 20:25Z / 20:30Z / 20:45Z and take minutes to execute.',
   },
+  {
+    from: '2026-08-06T13:25:00Z',
+    // Closes at 20:35Z, NOT 20:00Z and NOT 20:05Z. Same shape defect the row above was
+    // fixed for: the reads this protects start at 20:02Z and the last two land at 20:25Z,
+    // so a close on the hour would open the window underneath them.
+    to: '2026-08-06T20:35:00Z',
+    ticket: 'TRA-3066 (QA ask, CTO-accepted) / TRA-3044 / TRA-2956',
+    why:
+      'TRA-3044 is a PRE-REGISTERED grade of the TRA-2956 stale-working-exit withdrawal on the ' +
+      'live book: rubric frozen, nine scheduled session reads, subject row TSLA260911C00555000 ' +
+      'entering the bell pre-armed. Its headline observable, staleWorkingExits.holdAttempts, is ' +
+      'boot-scoped and is the one arm the code deliberately does not self-heal — a boot inside ' +
+      'RTH refills the 8-withdrawal per-row budget, resets the monotonic counters and erases ' +
+      'every hold verdict taken before it. The grader fails safe (NOT_CERTIFIABLE_BOOT_SPLIT) ' +
+      'rather than green, so the cost of a mid-session boot is the whole session and another ' +
+      'day of TRA-2956 blocked, not a wrong answer. The RTH freeze already covers 13:25–20:00Z; ' +
+      'this row exists to (a) require a SECOND, separately-reasoned override to defeat the hold ' +
+      'and (b) extend it across the post-close reads the freeze does not cover: 20:02Z TRA-3052 ' +
+      'stale-working-exit tail, 20:05Z TRA-3044 close fire, 20:25Z TRA-1648 soak check, 20:25Z ' +
+      'TRA-2305 tickExitRegionMs. Spent at 20:35Z; the TRA-3057 carrier deploys at 20:40Z.',
+  },
 ];
 
 // ── Why the 2026-07-27 row closes at 21:00Z, not 20:20Z (TRA-2306, CTO 2026-07-26) ──
