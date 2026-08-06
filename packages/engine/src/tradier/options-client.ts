@@ -88,6 +88,15 @@ interface TradierPositionsEnvelope {
 }
 
 /**
+ * TRA-3067 — a positions read that kept its failure state. See
+ * {@link TradierOptionsClient.readOpenOptionPositions}. `ok: false` is NOT an
+ * empty book, and no consumer may treat it as one.
+ */
+export type TradierPositionsRead =
+  | { ok: true; positions: TradierOpenOptionPosition[] }
+  | { ok: false; reason: 'http_status' | 'transport' | 'malformed'; detail: string };
+
+/**
  * TRA-323 — raw shape of a single Tradier position. `symbol` is the OCC
  * option symbol (e.g. `SPY240315P00500000`) for option contracts and the
  * underlying ticker for equities. `quantity` is in contracts for options
@@ -708,6 +717,54 @@ export class TradierOptionsClient extends TradierOrderClient {
       `/accounts/${encodeURIComponent(this.accountId)}/positions`,
     );
     return parseTradierPositions(data);
+  }
+
+  /**
+   * TRA-3067 — the same read, with its FAILURE STATE INTACT.
+   *
+   * {@link listOpenOptionPositions} returns `[]` for both "the account holds
+   * nothing" and "the request failed": `getJson` maps every non-2xx to `null`
+   * and `parseTradierPositions(null)` is `[]`. That is deliberate there — the
+   * reconcile would rather show "no synced positions" than poison the local
+   * store — but it means the value has **no absence state**, and an instrument
+   * built on it reads a 401 as "the broker is flat on everything", which is the
+   * maximally alarming reading of an unreadable broker.
+   *
+   * The out-of-band-close detector needs the distinction, so this variant keeps
+   * it. It does NOT replace the method above and changes no existing caller.
+   *
+   * `ok: true` with `positions: []` is a REAL empty book — Tradier answers 2xx
+   * with the literal string `positions: "null"` for an account holding nothing,
+   * and that is the only 2xx shape mapped to an empty success. A 2xx envelope
+   * with no `positions` key at all is `malformed`, because we cannot tell what
+   * it was trying to say.
+   */
+  async readOpenOptionPositions(): Promise<TradierPositionsRead> {
+    let resp: Response;
+    try {
+      resp = await fetch(
+        `${this.baseUrl}/accounts/${encodeURIComponent(this.accountId)}/positions`,
+        { headers: { Authorization: this.headers.Authorization, Accept: 'application/json' } },
+      );
+    } catch (err: unknown) {
+      return { ok: false, reason: 'transport', detail: err instanceof Error ? err.message : String(err) };
+    }
+    if (!resp.ok) {
+      return { ok: false, reason: 'http_status', detail: `HTTP ${resp.status}` };
+    }
+    let data: unknown;
+    try {
+      data = await resp.json();
+    } catch (err: unknown) {
+      return { ok: false, reason: 'transport', detail: err instanceof Error ? err.message : String(err) };
+    }
+    if (data == null || typeof data !== 'object') {
+      return { ok: false, reason: 'malformed', detail: 'body is not an object' };
+    }
+    if (!('positions' in (data as Record<string, unknown>))) {
+      return { ok: false, reason: 'malformed', detail: 'no positions key' };
+    }
+    return { ok: true, positions: parseTradierPositions(data as TradierPositionsEnvelope) };
   }
 
   /**

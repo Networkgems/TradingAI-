@@ -2,7 +2,13 @@ import { OrbStrategy, BbFadeStrategy, IchimokuStrategy, SupertrendConfluenceStra
 import { buildExposureBuckets, DEFAULT_EXIT_PARAMS, DEFAULT_MULTILEG_EXIT_PARAMS } from '@trading-app/engine';
 import { evaluateLiquidityGate, DEFAULT_LIQUIDITY_GATE_CONFIG } from '@trading-app/engine'; // TRA-2048 — live spread veto
 import type { StrategySelectorInput, ContractQuote, OptionTrend, RvLongTrendSide, ExitState, ExitParams, MultiLegExitParams, SharedTickIndicators, RelativeValueScannerOptions, OptionChainRow, IvRvScannerOptions, IvRvMispricingCandidate, ExposureBucket, ExposurePositionRisk, CorrelatedExposureDecision, BookHaltReason } from '@trading-app/engine';
-import type { TradierAccountBalance, TradierEquityQuote } from '@trading-app/engine';
+import type { TradierAccountBalance, TradierEquityQuote, TradierPositionsRead } from '@trading-app/engine';
+// TRA-3067 — read-only out-of-band-close detector (see the module doc).
+import {
+  diffLiveBrokerPositions,
+  darkBrokerPositionDriftReport,
+  type LiveBrokerPositionDriftReport,
+} from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
@@ -1304,6 +1310,18 @@ const TRADIER_BALANCE_STALE_MS = 10 * 60_000;
 // during incident throttling) without re-deriving "every tick" from the
 // timer interval.
 const TRADIER_PORTFOLIO_RECONCILE_MS = 30_000;
+/**
+ * TRA-3067 — cadence for the read-only broker-vs-engine position cross-check.
+ *
+ * Its own read, deliberately, rather than piggybacking on the reconcile's:
+ * that one consumes `listOpenOptionPositions()`, which cannot tell a 401 from
+ * an empty account, and an observer inheriting that blindness would publish
+ * "the broker is flat on everything" during an outage. Slower than the
+ * reconcile (60s vs 30s) because the detector is looking for a state that
+ * persists until the next ET day — one extra `/positions` GET per minute buys
+ * intraday visibility into a window that was previously ~20 hours long.
+ */
+const BROKER_POSITION_DRIFT_CHECK_MS = 60_000;
 /**
  * TRA-230 — drop signals from the displayed list once they're no longer
  * actionable. A signal becomes invalid when it ages past this window or, for
@@ -3016,6 +3034,47 @@ export class SignalEngine {
    * if the tick fires faster (e.g. from a test that calls `tick` manually).
    */
   private lastTradierPortfolioReconcileAt = 0;
+  /** TRA-3067 — cadence gate for {@link checkLiveBrokerPositionDrift}. */
+  private lastBrokerPositionDriftCheckAt = 0;
+  /**
+   * TRA-3067 — running state of the out-of-band-close detector.
+   *
+   * Counters, not just the last report, because the condition is TRANSIENT:
+   * the TRA-2799 sweep books a local close after two consecutive misses, so an
+   * out-of-band close is visible to this detector for roughly one minute and
+   * then the book agrees with the broker again. A "last report" alone would
+   * read `clean` five minutes after the event that this ticket exists to
+   * catch — the same shape as TRA-2983's silent heal, one level up.
+   *
+   * `outOfBandChecks` is therefore the load-bearing number, and it is a COUNT
+   * of checks that saw contracts leave with no order of ours, not a latch: a
+   * `>= 1` boolean reads identically at one event and at ten.
+   *
+   * Every counter resets on restart by design; bqb1 reboots several times a
+   * day, so a low count next to a recent `bootedAt` is a fresh incident, not a
+   * clean history. `lastOutOfBandAt` is the timestamp to read against boot.
+   */
+  private brokerPositionDrift: {
+    last: LiveBrokerPositionDriftReport | null;
+    checks: number;
+    driftChecks: number;
+    outOfBandChecks: number;
+    outOfBandContractsMax: number;
+    lastOutOfBandAt: number | null;
+    blindChecks: number;
+    vacuousChecks: number;
+    darkChecks: number;
+  } = {
+    last: null,
+    checks: 0,
+    driftChecks: 0,
+    outOfBandChecks: 0,
+    outOfBandContractsMax: 0,
+    lastOutOfBandAt: null,
+    blindChecks: 0,
+    vacuousChecks: 0,
+    darkChecks: 0,
+  };
   /**
    * TRA-335 — open equity positions opened against Tradier Live. We keep
    * a dedicated store (separate from `this.account`, which is the demo
@@ -4850,6 +4909,21 @@ export class SignalEngine {
     // already cleared its row before we cross-check broker state against
     // local imports. Errors are caught inside the method so one bad sweep
     // doesn't break the rest of the tick.
+    // TRA-3067 — the out-of-band-close observer runs BEFORE the reconcile, on
+    // purpose. The reconcile HEALS (it books a local close once the broker has
+    // stopped reporting an engine-opened row twice); running the observer after
+    // it would mean reading a book that had just been silently squared with the
+    // broker, which is the exact shape TRA-2983 says hid the original event.
+    // Read-only, and its own failure is never allowed to break the tick.
+    try {
+      await withPhase('signal.doTick.broker-position-drift', () => this.checkLiveBrokerPositionDrift());
+    } catch (err: unknown) {
+      log.warn('broker-position-drift check threw', {
+        component: 'broker-position-drift',
+        reason: err instanceof Error ? err.message : String(err),
+        issue: 'TRA-3067',
+      });
+    }
     try {
       await withPhase('signal.doTick.reconcile-live-portfolio', () => this.reconcileLivePortfolio());
     } catch (err: unknown) {
@@ -14263,6 +14337,173 @@ export class SignalEngine {
       lastReachedAt: this.engineBasisSweeps.lastReachedAt,
       lastOutcome: this.engineBasisSweeps.lastOutcome,
       skipped: { ...this.engineBasisSweeps.skipped },
+    };
+  }
+
+  /**
+   * TRA-3067 — read-only intraday cross-check: does the BROKER still hold what
+   * the engine believes it holds?
+   *
+   * TRA-2983 found a live PLTR contract opened by the engine and sold at the
+   * broker with no order from any code path here. Nothing saw it until the next
+   * ET day, because `diffMissingFillsFromHistory` skips same-day fills — so for
+   * the rest of that session the engine's greeks, exposure and equity were
+   * wrong, an exit could have been fired into a flat broker position, and a PDT
+   * day trade had been consumed on a sub-$25k account with no record of it.
+   *
+   * This is an OBSERVER. It never mutates a row, never places an order, never
+   * touches the broker except with a GET. The healing already exists
+   * (`reconcileTradierPositions` books the close after two consecutive misses);
+   * what did not exist is anything that SAYS SO, and the silent heal is exactly
+   * what hid the event.
+   *
+   * Ordering matters: the tick calls this BEFORE `reconcileLivePortfolio`, so
+   * the observer reads the book in its pre-heal state. Reversed, the healer
+   * would remove the row and the observer would report a perfectly clean
+   * comparison over a book that had just lost a position.
+   *
+   * Returns `null` only when the cadence gate skipped the check — a skip is not
+   * a verdict and must not overwrite the last one.
+   */
+  async checkLiveBrokerPositionDrift(
+    opts: { force?: boolean } = {},
+  ): Promise<LiveBrokerPositionDriftReport | null> {
+    const now = Date.now();
+    if (!opts.force && now - this.lastBrokerPositionDriftCheckAt < BROKER_POSITION_DRIFT_CHECK_MS) {
+      return null;
+    }
+
+    const record = (report: LiveBrokerPositionDriftReport): LiveBrokerPositionDriftReport => {
+      const state = this.brokerPositionDrift;
+      state.last = report;
+      state.checks += 1;
+      if (report.status === 'dark') state.darkChecks += 1;
+      if (report.status === 'blind') state.blindChecks += 1;
+      if (report.status === 'vacuous') state.vacuousChecks += 1;
+      if (report.status === 'drift') state.driftChecks += 1;
+      if (report.outOfBandContracts > 0) {
+        state.outOfBandChecks += 1;
+        state.lastOutOfBandAt = report.checkedAt;
+        state.outOfBandContractsMax = Math.max(
+          state.outOfBandContractsMax,
+          report.outOfBandContracts,
+        );
+      }
+      return report;
+    };
+
+    // DARK, not clean: neither of these looked at anything.
+    if (this.mode !== 'live') {
+      this.lastBrokerPositionDriftCheckAt = now;
+      return record(darkBrokerPositionDriftReport('not_live', now));
+    }
+    const env = this.tradierEnv;
+    const client = this.tradierOptionsClientByEnv[env];
+    if (!client) {
+      this.lastBrokerPositionDriftCheckAt = now;
+      return record(darkBrokerPositionDriftReport('no_client', now));
+    }
+
+    const rows = this.optionsAccounts[env].getStateForMode('live').openOptions;
+    // No eligible live row ⇒ the comparison has an empty denominator and the
+    // broker's answer cannot change the verdict, so skip the round trip. This
+    // is `vacuous`, NEVER `clean` — a green over an empty denominator is the
+    // vacuous pass the whole instrument is built to refuse. The one thing lost
+    // by not reading is `brokerOnlySymbols` (foreign inventory), which is
+    // TRA-323's import path's business, not this detector's.
+    if (rows.length === 0) {
+      this.lastBrokerPositionDriftCheckAt = now;
+      return record(diffLiveBrokerPositions({ ok: true, positions: [] }, [], now));
+    }
+
+    // `readOpenOptionPositions`, NOT `listOpenOptionPositions`: the latter maps
+    // every non-2xx to `[]`, which this detector would read as "the broker is
+    // flat on every position we hold" — an unreadable broker manufacturing the
+    // loudest possible alarm. See TRA-3067's module doc.
+    let read: TradierPositionsRead;
+    try {
+      read = await client.readOpenOptionPositions();
+    } catch (err: unknown) {
+      read = {
+        ok: false,
+        reason: 'transport',
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+    this.lastBrokerPositionDriftCheckAt = now;
+
+    const report = record(diffLiveBrokerPositions(read, rows, now));
+
+    if (report.outOfBandContracts > 0) {
+      // ERROR, not warn: real contracts left a real-money account with no order
+      // from this process. The responder's first question is whether the PDT
+      // budget moved, so name the symbols — this is the process log, not the
+      // no-auth health route (TRA-2163 governs that surface, and the route
+      // publishes counts only).
+      log.error('live broker position DRIFT — contracts left the broker with no order from this engine', {
+        component: 'broker-position-drift',
+        env,
+        outOfBandContracts: report.outOfBandContracts,
+        outOfBandSymbols: report.outOfBandSymbols,
+        explainedContracts: report.explainedContracts,
+        engineRowsChecked: report.engineRowsChecked,
+        engineContractsChecked: report.engineContractsChecked,
+        shortfalls: report.shortfalls
+          .filter(s => s.outOfBandContracts > 0)
+          .map(s => ({
+            optionSymbol: s.optionSymbol,
+            engineContracts: s.engineContracts,
+            brokerContracts: s.brokerContracts,
+            outOfBandContracts: s.outOfBandContracts,
+            reason: s.reason,
+            rowIds: s.rowIds,
+          })),
+        // Read-only by design — TRA-2983's lesson is that the silent heal is
+        // what hid the event, so nothing here closes a row.
+        action: 'none — read-only detector; the TRA-2799 sweep owns the local close',
+        issue: 'TRA-3067',
+      });
+    } else if (report.status === 'blind') {
+      // The one reading that must never be mistaken for "flat".
+      log.warn('broker position drift check BLIND — positions unreadable, NOT flat', {
+        component: 'broker-position-drift',
+        env,
+        blindReason: report.blindReason,
+        issue: 'TRA-3067',
+      });
+    } else if (report.status === 'drift') {
+      log.info('broker position shortfall fully explained by an engine order in flight', {
+        component: 'broker-position-drift',
+        env,
+        explainedContracts: report.explainedContracts,
+        tooYoungSymbols: report.tooYoungSymbols,
+        shortfalls: report.shortfalls.map(s => ({ optionSymbol: s.optionSymbol, reason: s.reason })),
+        issue: 'TRA-3067',
+      });
+    }
+
+    return report;
+  }
+
+  /**
+   * TRA-3067 — read side of the out-of-band-close detector. Counters plus the
+   * last report; see the field doc for why the COUNTS are the load-bearing
+   * half (the condition self-heals inside a minute).
+   */
+  getLiveBrokerPositionDriftState(): {
+    last: LiveBrokerPositionDriftReport | null;
+    checks: number;
+    driftChecks: number;
+    outOfBandChecks: number;
+    outOfBandContractsMax: number;
+    lastOutOfBandAt: number | null;
+    blindChecks: number;
+    vacuousChecks: number;
+    darkChecks: number;
+  } {
+    return {
+      ...this.brokerPositionDrift,
+      last: this.brokerPositionDrift.last ? { ...this.brokerPositionDrift.last } : null,
     };
   }
 

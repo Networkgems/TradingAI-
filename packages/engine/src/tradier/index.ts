@@ -29,6 +29,7 @@ export type {
   TradierOptionQuote,
   TradierAccountBalance,
   TradierOpenOptionPosition,
+  TradierPositionsRead,
   TradierTradeHistoryFill,
   TradierCashEvent,
   TradierGainLossLot,

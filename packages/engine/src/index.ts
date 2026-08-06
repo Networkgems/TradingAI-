@@ -186,6 +186,7 @@ export type {
   TradierEquityQuote,
   TradierAccountBalance,
   TradierOpenOptionPosition,
+  TradierPositionsRead,
   TradierOpenEquityPosition,
   TradierTradeHistoryFill,
   TradierCashEvent,

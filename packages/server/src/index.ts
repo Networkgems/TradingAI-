@@ -231,6 +231,11 @@ import {
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors } from './options-account.js';
+// TRA-3067 — counts-only projection of the out-of-band-close detector.
+import {
+  summarizeLiveBrokerPositionDrift,
+  worseBrokerDriftStatus,
+} from './live-broker-position-drift.js';
 import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -8935,6 +8940,81 @@ app.get('/api/health/options-live', async (_req, res) => {
             unattempted: 0,
           },
           lastClearedAt: null as number | null,
+        },
+      ),
+      // TRA-3067 — did contracts leave the broker with no order from us?
+      //
+      // TRA-2983 found a live PLTR contract opened by the engine at 13:43:03Z on
+      // 2026-08-04 and sold at the broker with no order from any code path on
+      // this box. Nothing saw it until the NEXT ET day, because the fee ledger's
+      // history import deliberately skips same-day fills. For the rest of that
+      // session the engine's greeks, exposure and equity were wrong, and a PDT
+      // day trade had been spent on a sub-$25k account with nothing saying so.
+      //
+      // How to read it — the STATUS is five-valued and the three non-verdicts
+      // are not interchangeable:
+      //   • `drift`     — a shortfall was found. Read `outOfBandContracts`.
+      //   • `clean`     — compared a non-empty book and it agreed.
+      //   • `vacuous`   — the read succeeded and there was NOTHING to compare
+      //     (`engineRowsChecked: 0`). Not a pass. A detector whose denominator
+      //     is empty has proved nothing about anything.
+      //   • `blind`     — the broker was UNREADABLE. Never "flat": the detector
+      //     refuses to convert a 401 into "every position is gone".
+      //   • `dark`      — not live / no broker client. The check is not running
+      //     at all, which is a coverage gap, not a green.
+      //   • `never_ran` — booted, first check not yet reached.
+      //
+      // `outOfBandChecks` is the load-bearing COUNTER, not `outOfBandContracts`:
+      // the condition is transient (the TRA-2799 sweep books a local close after
+      // two consecutive misses), so a gauge read five minutes after an event is
+      // back at 0 while the counter still says it happened. Both reset on
+      // restart, and bqb1 reboots several times a day — read `lastOutOfBandAt`
+      // against the boot time, never the count alone.
+      //
+      // Counts only — no OCC symbols. Same TRA-2163 disclosure rule as above;
+      // the symbols are in the process log under
+      // `component: 'broker-position-drift'` and in authenticated `/api/state`.
+      brokerPositionDrift: getAllUserContexts().reduce(
+        (acc, c) => {
+          const s = c.engine.getLiveBrokerPositionDriftState();
+          const last = summarizeLiveBrokerPositionDrift(s.last);
+          return {
+            status: worseBrokerDriftStatus(acc.status, last.status),
+            checks: acc.checks + s.checks,
+            driftChecks: acc.driftChecks + s.driftChecks,
+            outOfBandChecks: acc.outOfBandChecks + s.outOfBandChecks,
+            outOfBandContractsMax: Math.max(acc.outOfBandContractsMax, s.outOfBandContractsMax),
+            outOfBandContractsLast: acc.outOfBandContractsLast + last.outOfBandContracts,
+            explainedContractsLast: acc.explainedContractsLast + last.explainedContracts,
+            engineRowsCheckedLast: acc.engineRowsCheckedLast + last.engineRowsChecked,
+            blindChecks: acc.blindChecks + s.blindChecks,
+            vacuousChecks: acc.vacuousChecks + s.vacuousChecks,
+            darkChecks: acc.darkChecks + s.darkChecks,
+            lastOutOfBandAt:
+              s.lastOutOfBandAt !== null &&
+              (acc.lastOutOfBandAt === null || s.lastOutOfBandAt > acc.lastOutOfBandAt)
+                ? s.lastOutOfBandAt
+                : acc.lastOutOfBandAt,
+            checkedAt:
+              last.checkedAt !== null && (acc.checkedAt === null || last.checkedAt > acc.checkedAt)
+                ? last.checkedAt
+                : acc.checkedAt,
+          };
+        },
+        {
+          status: 'never_ran' as ReturnType<typeof summarizeLiveBrokerPositionDrift>['status'],
+          checks: 0,
+          driftChecks: 0,
+          outOfBandChecks: 0,
+          outOfBandContractsMax: 0,
+          outOfBandContractsLast: 0,
+          explainedContractsLast: 0,
+          engineRowsCheckedLast: 0,
+          blindChecks: 0,
+          vacuousChecks: 0,
+          darkChecks: 0,
+          lastOutOfBandAt: null as number | null,
+          checkedAt: null as number | null,
         },
       ),
       // TRA-2984 — staged exits that reached Tradier and EXPIRED unfilled.

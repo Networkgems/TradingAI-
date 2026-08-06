@@ -1025,6 +1025,99 @@ describe('TradierOptionsClient.listOpenOptionPositions', () => {
   });
 });
 
+// ─── TRA-3067: readOpenOptionPositions keeps the failure state ──────────────
+//
+// The method above is the reason this one exists: its `[]` is the SAME VALUE
+// for "the account holds nothing" and "the request failed", so an instrument
+// fed from it reads a 401 as "the broker is flat on every position we hold".
+// These tests are the proof that the checked variant does not collapse the two
+// — each pairs a failure with the real empty book and asserts they differ.
+describe('TradierOptionsClient.readOpenOptionPositions (TRA-3067)', () => {
+  it('a real EMPTY book is ok:true with no positions', async () => {
+    // Tradier answers 2xx with the literal string `"null"` for an account
+    // holding nothing. This is the only 2xx shape that may become an empty
+    // success.
+    fetchMock.mockResolvedValueOnce(jsonResponse({ positions: 'null' }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const read = await client.readOpenOptionPositions();
+    expect(read).toEqual({ ok: true, positions: [] });
+  });
+
+  it('a non-2xx is ok:false — NOT an empty book', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('unauthorized', 401));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const read = await client.readOpenOptionPositions();
+    expect(read.ok).toBe(false);
+    if (read.ok) throw new Error('unreachable');
+    expect(read.reason).toBe('http_status');
+    expect(read.detail).toContain('401');
+  });
+
+  it('a transport throw is ok:false', async () => {
+    fetchMock.mockRejectedValueOnce(new Error('ECONNRESET'));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const read = await client.readOpenOptionPositions();
+    expect(read.ok).toBe(false);
+    if (read.ok) throw new Error('unreachable');
+    expect(read.reason).toBe('transport');
+  });
+
+  it('a non-JSON 200 body is ok:false, not an empty book', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('<html>maintenance</html>', 200));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const read = await client.readOpenOptionPositions();
+    expect(read.ok).toBe(false);
+    if (read.ok) throw new Error('unreachable');
+    expect(read.reason).toBe('transport');
+  });
+
+  it('a 2xx envelope with NO positions key is malformed, not empty', async () => {
+    // `{}` and `{"positions":"null"}` are different statements: the second says
+    // "I hold nothing", the first says nothing at all.
+    fetchMock.mockResolvedValueOnce(jsonResponse({}));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const read = await client.readOpenOptionPositions();
+    expect(read.ok).toBe(false);
+    if (read.ok) throw new Error('unreachable');
+    expect(read.reason).toBe('malformed');
+  });
+
+  it('parses a populated book the same way the unchecked read does', async () => {
+    const body = {
+      positions: {
+        position: {
+          symbol: 'SPY260515C00450000',
+          quantity: 2,
+          cost_basis: 320,
+          date_acquired: '2026-05-01T15:30:00.000Z',
+        },
+      },
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse(body));
+    fetchMock.mockResolvedValueOnce(jsonResponse(body));
+    const client = new TradierOptionsClient('tok', 'ACCT9', 'sandbox');
+    const read = await client.readOpenOptionPositions();
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error('unreachable');
+    expect(read.positions).toEqual(await client.listOpenOptionPositions());
+    expect(callUrl(0)).toBe('https://sandbox.tradier.com/v1/accounts/ACCT9/positions');
+  });
+
+  it('THE DISCRIMINATOR: a 500 and an empty book do not read alike', async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ positions: 'null' }));
+    const client = new TradierOptionsClient('tok', 'A1');
+    const failed = await client.readOpenOptionPositions();
+    const empty = await client.readOpenOptionPositions();
+    expect(failed.ok).not.toBe(empty.ok);
+    // …whereas the unchecked read cannot tell them apart at all, which is the
+    // whole reason the checked one exists.
+    fetchMock.mockResolvedValueOnce(textResponse('boom', 500));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ positions: 'null' }));
+    expect(await client.listOpenOptionPositions()).toEqual(await client.listOpenOptionPositions());
+  });
+});
+
 // ─── TRA-415: parseTradierEquityPositions + listOpenEquityPositions ─────────
 
 describe('parseTradierEquityPositions', () => {
