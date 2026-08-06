@@ -124,7 +124,27 @@ function stockTwitsProxyDispatcher(env: NodeJS.ProcessEnv = process.env): Dispat
   // Memoize by URL so we reuse one pooled agent across calls (and rebuild only
   // if the secret is rotated to a different endpoint).
   if (cachedStockTwitsProxy?.url !== url) {
-    cachedStockTwitsProxy = { url, agent: new ProxyAgent(url) };
+    // TRA-1969 — `new ProxyAgent()` THROWS on a malformed URL, and this runs
+    // inside every stream/probe call. Before this catch, a single typo in a
+    // hand-set host secret did not degrade the feed — it took the feed DOWN,
+    // turning a fat-finger into an outage. That matters more now that the
+    // approved tier is a self-hosted micro-VM whose URL a human types in.
+    //
+    // Degrading to direct egress is the right failure, but it must not be
+    // SILENT: `describeStockTwitsEgress` will then observe both lookups on the
+    // same IP and report `proxy-bypassed` with `proxyHost: null`, which is the
+    // loud, checkable signal that the secret is set and doing nothing.
+    let agent: ProxyAgent | null = null;
+    try {
+      agent = new ProxyAgent(url);
+    } catch (err) {
+      log.warn('STOCKTWITS_PROXY_URL is not a usable proxy URL — falling back to DIRECT egress', {
+        issue: 'TRA-1969',
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (agent === null) return undefined;
+    cachedStockTwitsProxy = { url, agent };
   }
   return cachedStockTwitsProxy.agent;
 }
@@ -132,6 +152,126 @@ function stockTwitsProxyDispatcher(env: NodeJS.ProcessEnv = process.env): Dispat
 /** Reset the memoized proxy agent. Exported for tests. */
 export function resetStockTwitsProxy(): void {
   cachedStockTwitsProxy = null;
+}
+
+/**
+ * TRA-1969 — is the clean-egress proxy ACTUALLY in the request path?
+ *
+ * ── Why this is not paranoia ─────────────────────────────────────────────────
+ * `STOCKTWITS_PROXY_URL` is a secret set by hand on the host. If it is wrong —
+ * dead micro-VM, rotated password, wrong port, a scheme undici will not dial —
+ * `new ProxyAgent(url)` still constructs, the dispatcher is still attached, and
+ * the call still either succeeds via some other route or fails in a way that
+ * looks exactly like the ordinary Cloudflare/rate-limit failures this feed has
+ * had for months. **A misconfigured proxy and a working proxy produce the same
+ * observable feed**, which is precisely the class of instrument this codebase
+ * keeps getting burned by — and the board has now approved money for a tier
+ * whose entire value proposition is "the egress IP changed".
+ *
+ * So prove it, by measurement rather than by configuration: resolve the egress
+ * IP TWICE against the same echo service — once with the dispatcher attached and
+ * once deliberately without — and compare. No stored baseline is needed and no
+ * assumption about what Render's IP "should" be.
+ *
+ *   proxyIp !== directIp  -> `proxy-in-path`      (the money is buying something)
+ *   proxyIp === directIp  -> `proxy-bypassed`     (⛔ configured and NOT working)
+ *   no proxy configured   -> `no-proxy`
+ *   either lookup failed  -> `unknown`            (NEVER silently 'no-proxy')
+ *
+ * The proxy URL carries credentials, so only `host:port` is ever reported and
+ * the userinfo is dropped. An unparseable URL yields a null host rather than
+ * risking leaking the raw string into a health payload.
+ */
+export interface StockTwitsEgressDescriptor {
+  proxyConfigured: boolean;
+  /** `host:port` ONLY — credentials are never surfaced. Null if unparseable. */
+  proxyHost: string | null;
+  tokenConfigured: boolean;
+  /** Egress IP observed WITH the dispatcher attached (i.e. what StockTwits sees). */
+  proxyEgressIp: string | null;
+  /** Egress IP observed with the dispatcher deliberately omitted (the host's own). */
+  directEgressIp: string | null;
+  verdict: 'proxy-in-path' | 'proxy-bypassed' | 'no-proxy' | 'unknown';
+  /** Why the verdict is `unknown`, when it is. */
+  reason: string | null;
+}
+
+const EGRESS_ECHO_URL = 'https://api.ipify.org?format=json';
+
+function proxyHostOnly(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+  } catch {
+    return null;
+  }
+}
+
+async function echoEgressIp(init: StockTwitsFetchInit): Promise<string | null> {
+  try {
+    const resp = await withTimeout(fetch(EGRESS_ECHO_URL, init), ST_CALL_TIMEOUT_MS, 'egress-echo');
+    if (!resp.ok) return null;
+    const body = (await resp.json()) as { ip?: unknown };
+    return typeof body?.ip === 'string' && body.ip.length > 0 ? body.ip : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function describeStockTwitsEgress(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<StockTwitsEgressDescriptor> {
+  const raw = env['STOCKTWITS_PROXY_URL']?.trim();
+  const proxyConfigured = Boolean(raw);
+  const base = {
+    proxyConfigured,
+    proxyHost: raw ? proxyHostOnly(raw) : null,
+    tokenConfigured: Boolean(env['STOCKTWITS_ACCESS_TOKEN']?.trim()),
+  };
+
+  // The direct lookup is worth taking even with no proxy configured: it records
+  // the egress IP a future Cloudflare verdict would be about, so a later block
+  // can be attributed to an IP rather than guessed at.
+  const directEgressIp = await echoEgressIp({ headers: BROWSER_HEADERS });
+
+  if (!proxyConfigured) {
+    return {
+      ...base,
+      proxyEgressIp: null,
+      directEgressIp,
+      verdict: 'no-proxy',
+      reason: null,
+    };
+  }
+
+  const proxyEgressIp = await echoEgressIp(stockTwitsFetchInit(env));
+  if (proxyEgressIp === null || directEgressIp === null) {
+    return {
+      ...base,
+      proxyEgressIp,
+      directEgressIp,
+      verdict: 'unknown',
+      // Fails to `unknown`, never to `no-proxy` or `proxy-in-path`. An
+      // unanswerable question is not a pass in either direction.
+      reason:
+        proxyEgressIp === null && directEgressIp === null
+          ? 'both egress lookups failed'
+          : proxyEgressIp === null
+            ? 'proxied egress lookup failed — the proxy may be down'
+            : 'direct egress lookup failed, so there is nothing to compare against',
+    };
+  }
+
+  return {
+    ...base,
+    proxyEgressIp,
+    directEgressIp,
+    verdict: proxyEgressIp === directEgressIp ? 'proxy-bypassed' : 'proxy-in-path',
+    reason:
+      proxyEgressIp === directEgressIp
+        ? 'STOCKTWITS_PROXY_URL is set but egress is UNCHANGED — the proxy is not in the request path'
+        : null,
+  };
 }
 
 /** undici's `fetch` accepts a `dispatcher`; the DOM `RequestInit` type does not. */

@@ -352,6 +352,7 @@ import { recordOptionChains, etDateKey } from './options-chain-recorder.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
   fetchStockTwitsStream,
+  describeStockTwitsEgress,
   fetchStockTwitsUserStream,
   getCuratedStockTwitsAccounts,
   isStockTwitsBreakerOpen,
@@ -6515,10 +6516,21 @@ app.get('/api/health/sentiment-probe', async (req, res) => {
   const rawSym = String(req.query.symbol ?? 'AAPL').toUpperCase();
   const symbol = /^[A-Z.]{1,10}$/.test(rawSym) ? rawSym : 'AAPL';
   const result = await probeStockTwits(symbol);
+  // TRA-1969 — `?egress=1` additionally resolves the egress IP with and without
+  // the proxy dispatcher and reports whether the proxy is genuinely in the
+  // request path. OPT-IN because it costs two extra outbound calls; the default
+  // response is byte-identical to before. This is the only way to tell a working
+  // clean-egress proxy from a misconfigured one — both otherwise produce exactly
+  // the same feed behaviour, and the board has approved spend on a tier whose
+  // whole value is that the egress IP changed.
+  const egress = String(req.query.egress ?? '') === '1'
+    ? { egress: await describeStockTwitsEgress() }
+    : {};
   res.json({
     issue: 'TRA-1330',
     symbol,
     ...result,
+    ...egress,
   });
 });
 

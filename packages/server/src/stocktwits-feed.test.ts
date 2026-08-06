@@ -8,6 +8,7 @@ import {
   resetStockTwitsBreaker,
   tripStockTwitsBreaker,
   resetStockTwitsProxy,
+  describeStockTwitsEgress,
   probeStockTwits,
   stockTwitsBreakerOpenUntil,
 } from './stocktwits-feed.js';
@@ -357,5 +358,134 @@ describe('getCuratedStockTwitsAccounts (TRA-603)', () => {
   it('falls back to the default when the env is blank', () => {
     const env = { CURATED_STOCKTWITS_ACCOUNTS: '   ' } as NodeJS.ProcessEnv;
     expect(getCuratedStockTwitsAccounts(env)).toEqual([...DEFAULT_CURATED_STOCKTWITS_ACCOUNTS]);
+  });
+});
+
+// ── TRA-1969 — is the clean-egress proxy ACTUALLY in the request path? ────────
+//
+// The board approved money (micro-VM tier, ~$5-7/mo) for a leg whose entire
+// value proposition is "the egress IP changed". A proxy that is configured but
+// NOT in the path produces exactly the same feed behaviour as a working one —
+// same 200s, same 429s, same Cloudflare verdicts — so "we set the secret and it
+// still works" is unfalsifiable without this. The `proxy-bypassed` control below
+// is the one that earns this suite its keep.
+describe('describeStockTwitsEgress (TRA-1969)', () => {
+  const ECHO = 'https://api.ipify.org?format=json';
+
+  /** Echo server that answers with a different IP depending on the dispatcher. */
+  function echoMock(direct: string | null, proxied: string | null) {
+    return vi.fn(async (url: unknown, init?: { dispatcher?: unknown }) => {
+      if (String(url) !== ECHO) return jsonResponse({});
+      const ip = init?.dispatcher ? proxied : direct;
+      if (ip === null) throw new Error('egress echo unreachable');
+      return jsonResponse({ ip });
+    });
+  }
+
+  beforeEach(() => resetStockTwitsProxy());
+  afterEach(() => { vi.unstubAllGlobals(); resetStockTwitsProxy(); });
+
+  it('reports no-proxy, and still records the host egress IP, when unset', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', 'unused'));
+    const d = await describeStockTwitsEgress({} as NodeJS.ProcessEnv);
+    expect(d.proxyConfigured).toBe(false);
+    expect(d.verdict).toBe('no-proxy');
+    // Recorded even with no proxy: a future Cloudflare block can then be
+    // attributed to a named IP instead of guessed at.
+    expect(d.directEgressIp).toBe('35.1.1.1');
+    expect(d.proxyEgressIp).toBeNull();
+  });
+
+  it('reports proxy-in-path when the egress IP genuinely changes', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', '203.0.113.7'));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'http://user:pass@vm.example.com:3128',
+    } as NodeJS.ProcessEnv);
+    expect(d.verdict).toBe('proxy-in-path');
+    expect(d.directEgressIp).toBe('35.1.1.1');
+    expect(d.proxyEgressIp).toBe('203.0.113.7');
+    expect(d.reason).toBeNull();
+  });
+
+  // ⛔ THE CONTROL THAT MATTERS. Without it the whole descriptor is decoration.
+  it('reports proxy-bypassed when the secret is set but egress is UNCHANGED', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', '35.1.1.1'));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'http://user:pass@vm.example.com:3128',
+    } as NodeJS.ProcessEnv);
+    expect(d.proxyConfigured).toBe(true);
+    expect(d.verdict).toBe('proxy-bypassed');
+    expect(d.reason).toContain('egress is UNCHANGED');
+  });
+
+  it('NEVER leaks the proxy credentials — host:port only', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', '203.0.113.7'));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'http://s3cr3tuser:s3cr3tpass@vm.example.com:3128',
+    } as NodeJS.ProcessEnv);
+    expect(d.proxyHost).toBe('vm.example.com:3128');
+    const serialized = JSON.stringify(d);
+    expect(serialized).not.toContain('s3cr3tpass');
+    expect(serialized).not.toContain('s3cr3tuser');
+  });
+
+  // A malformed secret used to THROW out of `new ProxyAgent()` on every call,
+  // i.e. a typo in a hand-set host env took the whole feed down. It now degrades
+  // to direct egress — and the descriptor is what stops that degradation from
+  // being silent: same IP both ways => `proxy-bypassed`, with a null host.
+  it('does not throw on an unparseable proxy URL, and reports it as bypassed', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', '203.0.113.7'));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'not a url with s3cr3tpass in it',
+    } as NodeJS.ProcessEnv);
+    expect(d.proxyConfigured).toBe(true);
+    expect(d.proxyHost).toBeNull();
+    expect(d.verdict).toBe('proxy-bypassed');
+    expect(JSON.stringify(d)).not.toContain('s3cr3tpass');
+  });
+
+  it('keeps the FEED alive when the proxy URL is malformed (degrade, never crash)', async () => {
+    const prev = process.env.STOCKTWITS_PROXY_URL;
+    process.env.STOCKTWITS_PROXY_URL = '::: not a url :::';
+    resetStockTwitsProxy();
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(STREAM_FIXTURE)));
+    // Before the fix this rejected with `TypeError: Invalid URL` and the feed
+    // was dead for as long as the bad secret was set.
+    await expect(fetchStockTwitsStream('AAPL')).resolves.not.toBeNull();
+    resetStockTwitsProxy();
+    if (prev === undefined) delete process.env.STOCKTWITS_PROXY_URL;
+    else process.env.STOCKTWITS_PROXY_URL = prev;
+  });
+
+  it('fails to UNKNOWN, never to a verdict, when the proxied lookup dies', async () => {
+    // A dead micro-VM. This must not read as `no-proxy` (which would look like a
+    // clean unconfigured state) nor as `proxy-in-path` (which would bless it).
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', null));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'http://user:pass@vm.example.com:3128',
+    } as NodeJS.ProcessEnv);
+    expect(d.verdict).toBe('unknown');
+    expect(d.proxyEgressIp).toBeNull();
+    expect(d.reason).toContain('the proxy may be down');
+  });
+
+  it('fails to UNKNOWN when there is no baseline to compare against', async () => {
+    vi.stubGlobal('fetch', echoMock(null, '203.0.113.7'));
+    const d = await describeStockTwitsEgress({
+      STOCKTWITS_PROXY_URL: 'http://user:pass@vm.example.com:3128',
+    } as NodeJS.ProcessEnv);
+    expect(d.verdict).toBe('unknown');
+    expect(d.reason).toContain('nothing to compare against');
+  });
+
+  it('reports whether the OAuth token (leg A) is set, without revealing it', async () => {
+    vi.stubGlobal('fetch', echoMock('35.1.1.1', 'unused'));
+    const withTok = await describeStockTwitsEgress({
+      STOCKTWITS_ACCESS_TOKEN: 't0ps3cr3ttoken',
+    } as NodeJS.ProcessEnv);
+    expect(withTok.tokenConfigured).toBe(true);
+    expect(JSON.stringify(withTok)).not.toContain('t0ps3cr3ttoken');
+    const without = await describeStockTwitsEgress({} as NodeJS.ProcessEnv);
+    expect(without.tokenConfigured).toBe(false);
   });
 });
