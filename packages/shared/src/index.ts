@@ -2641,6 +2641,32 @@ export interface OptionPosition {
    */
   importedFromTradier?: boolean;
   /**
+   * TRA-3078 — the option-trade-journal row id this position's PARTIAL and
+   * CLOSE rows must be written to. Absent ⇔ unresolved; present and equal to
+   * {@link id} ⇔ resolved to identity, which is the case for every
+   * engine-opened position and every minted import.
+   *
+   * It exists because `reconcileTradierPositions` mints a fresh `randomUUID()`
+   * for a contract the local book has lost track of, while the journal still
+   * holds that contract's original OPEN row under the OLD id. Without a
+   * rebinding the close is written against an id the journal has never seen
+   * and is silently dropped, while the original row stays OPEN forever
+   * (TRA-2937).
+   *
+   * TRA-2937 held the same mapping in a private in-memory `Map` on the
+   * account, which `exportSnapshot`/`importSnapshot` did not carry — so a
+   * rebind established at boot N was gone at boot N+1, and could never be
+   * re-established because the mint/adopt site is only reachable on the
+   * reconcile's `added` branch and a snapshot-restored contract is always
+   * `existing`. Living on the position, it rides the snapshot for free.
+   *
+   * The DISTINCTION between absent and identity is load-bearing: it is what
+   * lets the reconcile tell "predates the fix, still needs resolving" from
+   * "resolved, leave it alone", so the repair sweep terminates instead of
+   * re-scanning the journal on every pass.
+   */
+  journalId?: string;
+  /**
    * TRA-2820 — why this row carries the UNMANAGED sentinel schedule
    * (`stopLossPremium: 0`, `tp1Premium: Infinity`). Set by
    * `applyImportedRiskThresholds` whenever it takes the sentinel path, cleared

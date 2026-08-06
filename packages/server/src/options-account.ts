@@ -1521,26 +1521,6 @@ export class PaperOptionsAccount {
    */
   private journalWrites: Promise<unknown> = Promise.resolve();
 
-  /**
-   * TRA-2937 — position id → the journal row id its close must be written to,
-   * populated ONLY when the reconcile ADOPTED an existing OPEN row for the same
-   * contract (see {@link queueJournalImportOpen}). Absent ⇒ the two ids are the
-   * same, which is the case for every engine-opened position.
-   *
-   * The indirection exists because `reconcileTradierPositions` mints a fresh
-   * `randomUUID()` for a contract the local book has lost track of. Without a
-   * rebinding the close is written against an id the journal has never seen and
-   * is silently dropped, while the original row stays OPEN forever — the exact
-   * pair of symptoms this ticket was filed on.
-   *
-   * Safe to read and write off the {@link journalWrites} chain and nowhere else:
-   * every journal emit is serialised onto that one promise, so the entry is
-   * always installed by the open task before any close task for the same
-   * position runs, with no lock and no ordering assumption about the callers.
-   * Entries are deleted once the close is emitted, so this cannot outgrow the
-   * set of positions currently open.
-   */
-  private journalIdByPosition = new Map<string, string>();
 
   constructor(config: OptionsAccountConfig = {}) {
     this.initialEquity = config.initialEquity ?? DEFAULT_ACCOUNT_SETTINGS.demoEquity;
@@ -1765,8 +1745,27 @@ export class PaperOptionsAccount {
    * Fire-and-forget on the same {@link journalWrites} chain as every other emit,
    * so a journal failure can never reach the reconcile's execution path and the
    * rebinding is always installed before any close for the same position runs.
+   *
+   * ── TRA-3078: idempotent, and it runs on RE-import too ─────────────────────
+   *
+   * Every terminating branch stamps {@link OptionPosition.journalId} — the
+   * adopted id on ADOPT, `position.id` on MINT and on the ambiguous mint — so
+   * the binding is durable across a restart (it rides `exportSnapshot` with the
+   * position) and "absent" unambiguously means UNRESOLVED. `origin` says which
+   * pass installed it.
+   *
+   * Called from two sites: the reconcile's `added` branch (a contract new to
+   * this book) and its `existing` branch for an imported row that arrived from
+   * a snapshot with no `journalId` (the population TRA-2937 could never reach,
+   * because a snapshot-restored contract is `existing` on every later pass and
+   * the mint/adopt site was only wired to `added`). The OWN-ROW check below is
+   * what makes the second call safe: a row already minted under this position's
+   * id resolves to identity instead of being minted a second time.
    */
-  private queueJournalImportOpen(position: OptionPosition): void {
+  private queueJournalImportOpen(
+    position: OptionPosition,
+    origin: 'reconcile_add' | 'reconcile_repair' = 'reconcile_add',
+  ): void {
     if (!isOptionTradeJournalEnabled()) return;
     const id = position.id;
     const optionSymbol = position.optionSymbol;
@@ -1782,14 +1781,28 @@ export class PaperOptionsAccount {
     const atRiskUsd = position.premiumPaid * position.contracts * 100;
     this.journalWrites = this.journalWrites
       .then(async () => {
+        // TRA-3078 — re-checked INSIDE the task, not just at the call site: two
+        // reconcile passes can queue a repair for the same position before the
+        // first one runs, and the second must not re-scan or re-log.
+        if (position.journalId) return;
         if (optionSymbol) {
           const open = await findOpenOptionTradeJournalRecordsByOptionSymbol(optionSymbol, mode);
+          // TRA-3078 — an OPEN row already under THIS position's id means a
+          // previous pass minted it (or the ambiguous branch did). Resolve to
+          // identity and stop: minting again would write a second OPEN row under
+          // one id. Unreachable from the `added` branch, where `id` is a fresh
+          // `randomUUID()`, so this changes nothing for a genuinely new import.
+          if (open.some((r) => r.id === id)) {
+            position.journalId = id;
+            return;
+          }
           const adoptable = open.filter((r) => r.id !== id);
           if (adoptable.length === 1) {
             const existing = adoptable[0]!;
-            this.journalIdByPosition.set(id, existing.id);
+            position.journalId = existing.id;
             accountLog.info('reconcile rebound an imported row onto its existing journal row', {
               issue: 'TRA-2937',
+              origin,
               optionSymbol,
               mode,
               positionId: id,
@@ -1802,6 +1815,7 @@ export class PaperOptionsAccount {
           if (adoptable.length > 1) {
             accountLog.warn('refusing to rebind an imported row: multiple OPEN journal rows', {
               issue: 'TRA-2937',
+              origin,
               optionSymbol,
               mode,
               positionId: id,
@@ -1843,10 +1857,17 @@ export class PaperOptionsAccount {
           riskThrottleSizingPath: null,
         };
         await recordOptionTradeOpen(open);
+        // TRA-3078 — stamp AFTER the write lands. Identity is the truth here,
+        // and recording it explicitly is what tells the repair sweep this row is
+        // resolved; leaving it absent would re-scan the journal every pass.
+        // On the throw path it stays absent on purpose, so the next reconcile
+        // retries rather than binding a close to a row that was never written.
+        position.journalId = id;
       })
       .catch((err) => {
         accountLog.warn('option trade journal import open emit failed', {
           issue: 'TRA-2937',
+          origin,
           id,
           optionSymbol,
           reason: err instanceof Error ? err.message : String(err),
@@ -1855,12 +1876,13 @@ export class PaperOptionsAccount {
   }
 
   /**
-   * TRA-2937 — the journal row id a position's close/partial must be written to.
-   * Identity for everything except a reconcile-adopted import; see
-   * {@link journalIdByPosition}.
+   * TRA-2937 / TRA-3078 — the journal row id a position's close/partial must be
+   * written to. Identity for everything except a reconcile-adopted import; see
+   * {@link OptionPosition.journalId}, which is where the binding lives so it
+   * survives a restart.
    */
-  private journalIdFor(positionId: string): string {
-    return this.journalIdByPosition.get(positionId) ?? positionId;
+  private journalIdFor(position: OptionPosition): string {
+    return position.journalId ?? position.id;
   }
 
   /**
@@ -1912,7 +1934,7 @@ export class PaperOptionsAccount {
       // task on this same chain, so reading it here is what guarantees the two
       // are ordered without a lock.
       .then(async () => {
-        const journalId = this.journalIdFor(id);
+        const journalId = this.journalIdFor(position);
         const rec = await getOptionTradeJournalRecord(journalId);
         if (!rec) {
           accountLog.warn('option trade journal partial close dropped: no OPEN row for this id', {
@@ -1981,7 +2003,7 @@ export class PaperOptionsAccount {
         // TRA-2937 — resolved inside the task, for the ordering reason spelled
         // out on `queueJournalPartial`. Identity unless the reconcile adopted
         // this position onto an existing OPEN row for the same contract.
-        const journalId = this.journalIdFor(id);
+        const journalId = this.journalIdFor(position);
         const rec = await getOptionTradeJournalRecord(journalId);
         // TRA-2937 — the miss is now WARNED rather than swallowed. It used to be
         // a bare `return`: an imported row's close vanished with nothing in the
@@ -2012,12 +2034,11 @@ export class PaperOptionsAccount {
           holdDays,
         });
       })
-      // TRA-2937 — the position is settled either way, so drop any rebinding on
-      // BOTH branches (`finally`, not `then`: a failed emit that kept its entry
-      // would leak one per adopted import for the life of the process).
-      .finally(() => {
-        this.journalIdByPosition.delete(id);
-      })
+      // TRA-3078 — nothing to unbind. The binding lives on the position, which
+      // has already left `openOptions` for `closedOptions` by the time this
+      // runs, so it cannot outgrow anything and keeping it makes the settled
+      // row self-describing: the closed position names the journal row it paid
+      // into. TRA-2937 deleted a side-map entry here.
       .catch((err) => {
         accountLog.warn('option trade journal close emit failed', {
           id,
@@ -2061,8 +2082,8 @@ export class PaperOptionsAccount {
     this.cash = this.initialEquity;
     this.openOptions.clear();
     this.closedOptions = [];
-    // TRA-2937 — the rebindings describe positions that no longer exist.
-    this.journalIdByPosition.clear();
+    // TRA-3078 — the rebindings went with the positions they were stamped on;
+    // TRA-2937's side map needed clearing here, a field does not.
     // TRA-1976 — drop any assigned-share inventory on a book reset.
     this.assignedShares.clear();
     this.optionsPnlByMode = { demo: 0, live: 0 };
@@ -6082,6 +6103,24 @@ export class PaperOptionsAccount {
           // `updated: 1` — the sweep could not report the gap it was leaving.
           updated += 1;
           continue;
+        }
+        // TRA-3078 — the repair pass for imported rows that reached this book
+        // through a SNAPSHOT rather than through the `added` branch below.
+        //
+        // TRA-2937 resolved the journal binding only where a contract is new to
+        // the book. But `importSnapshot` repopulates `openOptions`, so after a
+        // restart the very same contract is `existing` on every subsequent
+        // reconcile and the mint/adopt site is unreachable for it — permanently.
+        // Its close then lands against an id the journal has never seen and is
+        // dropped, which is the original symptom one restart later. bqb1 reboots
+        // several times a day, so "the fix worked" and "the fix is gone" were
+        // separated by hours.
+        //
+        // Cheap and self-terminating: `journalId` is stamped on every
+        // terminating branch, the journal lookup is served from the loaded
+        // in-memory map, and a row that resolves once is skipped from then on.
+        if (existing.journalId === undefined) {
+          this.queueJournalImportOpen(existing, 'reconcile_repair');
         }
         const contractsChanged = existing.contracts !== incoming.contracts;
         const premiumChanged = Math.abs(existing.premiumPaid - incoming.premiumPaid) > 1e-6;
