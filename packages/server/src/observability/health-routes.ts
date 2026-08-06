@@ -3511,8 +3511,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // the next occurrence gets triaged from the fold alone again. Read
       // `markSanity.observed` FIRST — `flagged: 0` on `observed: 0` is an ABSENCE.
       // Observe-only: nothing below was rejected, every one of these marks reached
-      // `peakOpenGain`. Since-boot and NOT durable (bqb1 restarts several times a
-      // day) — unlike `sessions`, which is hydrated from /data.
+      // `peakOpenGain`.
+      //
+      // TRA-2945 — the top-level counters (`observed`/`flagged`/`maxJumpX`/`samples`)
+      // are SINCE-BOOT and answer "is the observer running right now". The bound in
+      // TRA-2945 §3 must instead be derived from `byMode` / `days` / `boundReadiness`,
+      // which are DURABLE (hydrated from /data like `sessions`) and split PER BOOK.
+      // A since-boot read can never accumulate the required 5 sessions because bqb1
+      // restarts several times a day, and a combined read cannot tell a tape that
+      // covered the live book from one that only ever saw demo — check
+      // `durability.ephemeral` and `byMode.live.observed` before trusting either.
       markSanity: summarizeMarkSanity(),
     });
   });

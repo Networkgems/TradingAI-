@@ -10,8 +10,9 @@
 //      observer would read clean against the very book that produced the phantom
 //      peak.
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { readFileSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   classifyMarkJump,
@@ -21,6 +22,12 @@ import {
   markSanityNote,
   OBSERVE_JUMP_X,
   MAX_SAMPLES,
+  // TRA-2945 — the durable, per-book, distribution-keeping half.
+  hydrateMarkSanityFromDisk,
+  markSanityLogPath,
+  jumpBucketIndex,
+  JUMP_BUCKET_COUNT,
+  BOUND_SESSIONS_REQUIRED,
 } from './option-mark-sanity.js';
 
 const obs = (over: Partial<Parameters<typeof recordMarkObservation>[0]> = {}) =>
@@ -194,5 +201,185 @@ describe('TRA-2927 the observer is on the SHARED mark seam, not the imports-only
 
   it('is called exactly once in the engine — two call sites would double-count', () => {
     expect(src.split('recordMarkObservation(').length - 1).toBe(1);
+  });
+});
+
+// ── TRA-2945 ────────────────────────────────────────────────────────────────
+//
+// TRA-2927 shipped an observer that reads CLEAN and cannot support the bound
+// TRA-2945 §3 asks for. All three defects are invisible in the read, so the
+// load-bearing assertions below are the ones that FAIL against the v1 tape:
+//
+//   1. the fold survives a reboot and RESUMES from the disk total (v1 restarted
+//      from zero on every restart, and bqb1 restarts several times a day, so 5
+//      sessions could never accumulate no matter how long you waited);
+//   2. a demo-only tape is DISTINGUISHABLE from one that covered both books (v1's
+//      aggregate was mode-blind, and `samples` is empty when nothing flags, so a
+//      clean read carried ZERO evidence about which book it actually saw);
+//   3. the ratio DISTRIBUTION is retained, not just a running max (v1 discarded
+//      everything between 1.0x and 2.0x, and you cannot read a percentile off a
+//      max — so "bias the bound LOOSE" had nothing to be loose relative to).
+
+describe('TRA-2945 the durable per-book tape', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    clearMarkSanityTape();
+    dir = mkdtempSync(join(tmpdir(), 'mark-sanity-'));
+  });
+  afterEach(() => {
+    clearMarkSanityTape();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const DAY = 24 * 60 * 60 * 1000;
+  const DAY_A = Date.UTC(2026, 7, 4, 18, 0, 0); // 2026-08-04 ET
+  const DAY_B = Date.UTC(2026, 7, 5, 18, 0, 0); // 2026-08-05 ET
+
+  // THE defect this ticket exists to remove.
+  it('survives a reboot and RESUMES from the disk total instead of restarting at zero', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    for (let i = 0; i < 40; i += 1) obs({ mode: 'live', now: DAY_A });
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(40);
+
+    // The reboot: every module global is wiped, exactly as a restart does.
+    clearMarkSanityTape();
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(0);
+
+    const h = hydrateMarkSanityFromDisk(dir, DAY_A);
+    expect(h.observed).toBe(40);
+    expect(h.bookDays).toBe(1);
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(40);
+
+    // And this boot ADDS to the recovered total rather than opening a fresh row
+    // that would overwrite it — the difference between accumulating and resetting.
+    for (let i = 0; i < 30; i += 1) obs({ mode: 'live', now: DAY_A });
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(70);
+
+    clearMarkSanityTape();
+    expect(hydrateMarkSanityFromDisk(dir, DAY_A).observed).toBe(70);
+  });
+
+  // The since-boot counters are UNCHANGED by all of this — they answer a different
+  // question ("is the observer running right now") and callers already read them.
+  it('leaves the since-boot counters alone — they are not the durable ones', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    for (let i = 0; i < 10; i += 1) obs({ mode: 'live', now: DAY_A });
+    expect(summarizeMarkSanity().observed).toBe(10);
+
+    clearMarkSanityTape();
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    const s = summarizeMarkSanity();
+    expect(s.byMode.live.observed).toBe(10); // durable total recovered
+    expect(s.observed).toBe(0); // since-boot correctly still zero
+    expect(s.note).toMatch(/^DARK/);
+  });
+
+  it('a demo-only tape does NOT claim to cover the live book', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    for (let i = 0; i < 20; i += 1) obs({ mode: 'demo', now: DAY_A });
+    const s = summarizeMarkSanity();
+    expect(s.byMode.demo.observed).toBe(20);
+    expect(s.byMode.live.observed).toBe(0);
+    expect(s.note).toContain('LIVE DARK');
+    expect(s.boundReadiness.ready).toBe(false);
+  });
+
+  // Positive control for the assertion above: the caveat must actually MOVE when
+  // the live book appears, or "LIVE DARK" could be absent for any unrelated reason.
+  it('the per-book caveat is a discriminator — it changes when live marks arrive', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    obs({ mode: 'demo', now: DAY_A });
+    const demoOnly = summarizeMarkSanity().note;
+    obs({ mode: 'live', now: DAY_A });
+    const bothBooks = summarizeMarkSanity().note;
+
+    expect(demoOnly).toContain('LIVE DARK');
+    expect(bothBooks).not.toContain('LIVE DARK');
+    expect(bothBooks).toContain('Per book (durable)');
+    expect(bothBooks).not.toBe(demoOnly);
+  });
+
+  it('retains the DISTRIBUTION, not just the max', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    // 1.0x (flat), 1.5x and 100x — three different buckets from the same book.
+    obs({ mode: 'live', mark: 0.3, priorMark: 0.3, now: DAY_A });
+    obs({ mode: 'live', mark: 0.45, priorMark: 0.3, now: DAY_A });
+    obs({ mode: 'live', mark: 30, priorMark: 0.3, now: DAY_A });
+
+    const h = summarizeMarkSanity().byMode.live.histogram;
+    expect(h).toHaveLength(JUMP_BUCKET_COUNT);
+    expect(h[jumpBucketIndex(1)]).toBe(1);
+    expect(h[jumpBucketIndex(1.5)]).toBe(1);
+    expect(h[jumpBucketIndex(100)]).toBe(1);
+    // Every DEFINED ratio lands in exactly one bucket, so the histogram total is a
+    // denominator a percentile can be computed against. A max alone is not.
+    expect(h.reduce((a, b) => a + b, 0)).toBe(3);
+  });
+
+  it('an undefined ratio is counted but never lands in a histogram bucket', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    obs({ mode: 'live', mark: 5, priorMark: 0, now: DAY_A });
+    const t = summarizeMarkSanity().byMode.live;
+    expect(t.observed).toBe(1); // still in the denominator
+    expect(t.undefinedRatio).toBe(1);
+    expect(t.histogram.reduce((a, b) => a + b, 0)).toBe(0);
+  });
+
+  it('counts SESSIONS per book, and a bound needs BOTH books at the bar', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    for (let d = 0; d < BOUND_SESSIONS_REQUIRED; d += 1) {
+      const now = DAY_A + d * DAY;
+      obs({ mode: 'demo', now });
+      if (d > 0) obs({ mode: 'live', now }); // live is one session short
+    }
+    const r = summarizeMarkSanity().boundReadiness;
+    expect(r.demoSessions).toBe(BOUND_SESSIONS_REQUIRED);
+    expect(r.liveSessions).toBe(BOUND_SESSIONS_REQUIRED - 1);
+    expect(r.ready).toBe(false);
+    expect(r.note).toMatch(/NOT READY/);
+
+    obs({ mode: 'live', now: DAY_A }); // closes the gap
+    const r2 = summarizeMarkSanity().boundReadiness;
+    expect(r2.liveSessions).toBe(BOUND_SESSIONS_REQUIRED);
+    expect(r2.ready).toBe(true);
+    expect(r2.note).toMatch(/^READY/);
+  });
+
+  it('splits the fold per ET day, so sessions are not one running blob', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    obs({ mode: 'live', now: DAY_A });
+    obs({ mode: 'live', now: DAY_B });
+    const days = summarizeMarkSanity().days.filter((d) => d.mode === 'live');
+    expect(days.map((d) => d.etDay)).toEqual(['2026-08-05', '2026-08-04']);
+    expect(days.every((d) => d.observed === 1)).toBe(true);
+  });
+
+  it('skips a torn trailing line — a bad tape recovers less, it does not crash', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    obs({ mode: 'live', now: DAY_A });
+    clearMarkSanityTape();
+    appendFileSync(markSanityLogPath(dir), '{"etDay":"2026-08-04","mode":"liv', 'utf8');
+    expect(() => hydrateMarkSanityFromDisk(dir, DAY_A)).not.toThrow();
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(1);
+  });
+
+  it('drops rows past retention so the tape cannot grow without bound', () => {
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    obs({ mode: 'live', now: DAY_A });
+    clearMarkSanityTape();
+    // Hydrate 60 days on: the 08-04 row is outside the 30-day window.
+    const h = hydrateMarkSanityFromDisk(dir, DAY_A + 60 * DAY);
+    expect(h.bookDays).toBe(0);
+    expect(summarizeMarkSanity().byMode.live.observed).toBe(0);
+  });
+
+  // `ephemeral` is a property of the PATH, so it is answerable even when the fold
+  // is empty — `hydratedBookDays: 0` cannot tell a fresh persistent disk from a
+  // wiped ephemeral one, which is the ambiguity this field exists to remove.
+  it('reports durability, and a tape with no configured dir is ephemeral by definition', () => {
+    expect(summarizeMarkSanity().durability).toMatchObject({ dataDir: null, ephemeral: true });
+    hydrateMarkSanityFromDisk(dir, DAY_A);
+    expect(summarizeMarkSanity().durability.dataDir).toBe(dir);
   });
 });

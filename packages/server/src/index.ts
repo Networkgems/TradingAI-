@@ -221,6 +221,7 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
+import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 // TRA-2930 — durable per-book EOD archive-participation record.
 import {
@@ -4132,6 +4133,24 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       days: h.days,
       sessions: h.sessions,
     });
+  }
+
+  // TRA-2945 (parent TRA-2927) — same treatment for the option MARK tape, and for
+  // the same reason. TRA-2927's observer was since-boot only, so its jump
+  // distribution reset on every restart and could never reach the 5 RTH sessions
+  // TRA-2945 §3 requires before an enforcement bound may be pre-registered. This
+  // hydrate is what turns it from a one-boot snapshot into an accumulating tape.
+  // MUST run before any live pass so the first observation folds onto the disk
+  // total rather than starting a fresh row that would overwrite it.
+  {
+    const m = hydrateMarkSanityFromDisk(DATA_DIR);
+    if (m.observed > 0) {
+      log.info('option mark-sanity tape hydrated (TRA-2945)', {
+        bookDays: m.bookDays,
+        observed: m.observed,
+        days: m.days,
+      });
+    }
   }
 
   // TRA-2110 (parent TRA-2109 outcome-2) — re-derive each book's give-back
