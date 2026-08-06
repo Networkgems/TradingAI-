@@ -141,6 +141,9 @@ export const PNL_FROZEN_COUNTER_NOTE =
 export const PNL_LIVE_MODE_SPAN_NOTE =
   'TRA-2831: the live COHORT is keyed on the book\'s mode TODAY (`stockModeKey(loadSettings(username))`, read per request) while the day-cell options ledger under it is per-BOOK and MODE-BLIND for all time. On any book that flipped demo -> live mid-series those compose into a silent attribution defect: the whole pre-flip DEMO history folds into every `live*` credit metric. Live bqb1 2026-08-04T22:22Z: `liveUncreditedOptionsUsd` published 733.60 as a live-money shortfall, whose numerator `postBaselineOptionsRealized` 987.60 is the sum of eleven `journal-repair` cells dated 2026-07-15..2026-07-29 — a window in which the live book (`admin`) held ZERO live options, its first having opened 2026-07-30 09:36 ET. Those 987.60 are admin\'s own DEMO option P&L: summing every book\'s `journal-repair` cells fleet-wide reproduces the demo-mode fleet total to the cent (07-15 301.30, 07-17 102.00, 07-22 4919.50), with admin contributing 17.00 / 217.50 / 54.40. The equality to `eodCombined` on those rows is NOT independent corroboration — it is the TRA-2641 slaving (`syncEodReportOptionsLegs` writes the day cell into the report file\'s options leg on every `journal`/`journal-repair` row) plus a 0.00 stock leg on 9 of the 11. `liveUncreditedOptionsUsd` is now null (NOT MEASURED) whenever any contributing book carries pre-onset options money; read `liveUncreditedOptionsUsdUnscoped` for the arithmetic, `liveUncreditedOptionsGradeable` for the denominator, and `liveModeSpanContaminatedBooks` for the attribution. Completing TRA-2827\'s 07-30/07-31/08-03 back-fill does NOT discharge this: those rows are post-onset and add a live term without removing the 987.60 pre-onset term. NOTE also that `optionsDailyPnl` is not a field on the published day rows at all — the durable snapshot field of that name surfaces as `optionsDaily`, and querying the published shape for `optionsDailyPnl` returns null on all 67 admin cells (and on every cell of every book) as a NAME MISS, not as a TRA-2629-style dropped field; the values are present and journal-sourced (`optionsDaily === journalOptionsPnl` on all 11 repaired cells, where `journalOptionsPnl` is recomputed per request straight from the journal).';
 
+export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
+  'TRA-2919: the live credit axis TRA-2630 named as the INDEPENDENT signal was PERMANENTLY ungradeable after TRA-2831, and is now re-sourced from the option-trade JOURNAL. TRA-2831 was right to suspend `liveUncreditedOptionsUsd` (its numerator was 987.60 of admin\'s own DEMO option P&L), but its gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which is DURABLE history and does not age out -- so the axis could never flip back. DO NOT "fix" this by scoping the existing day-cell numerator to post-onset dates. Measured on bqb1 2026-08-05: admin had exactly ONE post-onset day cell (2026-08-04, `optionsDaily` -2.00, source `bucket-journal-silent`), so a day-cell post-onset numerator publishes -2.00 while the live book actually realized +739.00 on 2026-07-31 across 3 journal closes -- money booked to NO day cell at all, because 07-30/07-31/08-03 are the permanent TRA-2888 hole and back-fill is refused. A wrong number carrying `gradeable: true` is strictly worse than the honest null. The journal is append-only, is keyed by CLOSE timestamp rather than by the existence of a snapshot row, and survived the ENOSPC window with `corruptLines 0`; it is the only surviving source. Read `engines[].postOnsetCredit` per book and `liveOnsetOptionsRealizedJournalUsd` fleet-wide; `liveOnsetOptionsDayCellUsd` publishes the day-cell FOIL over the same window so the rejected arithmetic stays visible. THE COMPARISON IS A SEPARATE QUESTION: the equity leg is holed over the same window, so `liveOnsetUncreditedOptionsUsd` (= journal numerator + post-onset stockDaily - post-onset equity delta) is null whenever an expected NYSE session inside the anchor window `(leftAnchor, rightAnchor]` has no ledger row -- reason `equity-anchor-spans-absent-session`, which is admin\'s standing state. Absence is enumerated from the exchange calendar and diffed against the rows, deliberately NOT from the three known gap dates: a hard-coded list goes green by EVICTION the moment a newer row advances past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to the next hole. `liveUncreditedOptionsGradeable` is REDEFINED by this ticket to mean "some live book has a journal-sourced post-onset numerator", i.e. ATTRIBUTION only; it is NOT a claim that the dollar comparison exists, and `true` alongside `liveOnsetUncreditedOptionsUsd: null` is the correct standing read. A gate wanting the money verdict must require BOTH that boolean AND `liveOnsetCreditNotMeasuredBooks` to be EMPTY. The day-cell fields `liveUncreditedOptionsUsd` / `liveUncreditedOptionsUsdUnscoped` / `liveModeSpanContaminatedBooks` are UNCHANGED and stay published as the evidence the TRA-2831 suspension rests on.';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
@@ -149,6 +152,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_ABSENT_EOD_ROW_NOTE,
   PNL_FROZEN_COUNTER_NOTE,
   PNL_LIVE_MODE_SPAN_NOTE,
+  PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
 ];
@@ -1065,6 +1069,17 @@ export interface PnlReconcileResult {
   /** TRA-2831 — the pre-onset sessions carrying a non-zero options figure. */
   preLiveOnsetOptionsDates: string[];
   /**
+   * TRA-2919 — the live credit axis re-sourced from the option-trade JOURNAL, so
+   * it survives both the TRA-2831 contamination gate (which is permanent on
+   * `admin`) and the permanent TRA-2888 EOD hole. See
+   * {@link summarizePostOnsetLiveCredit} for why the day cells cannot carry it.
+   *
+   * This is the axis to grade. The three `*UncreditedOptions*` fields on the
+   * fleet fold retain their TRA-2831 meaning and are DAY-CELL-sourced over the
+   * whole post-baseline window; they are evidence, not a live-money verdict.
+   */
+  postOnsetCredit: PostOnsetLiveCredit;
+  /**
    * TRA-2635 — how many evaluated sessions could actually have graded the
    * bridge (`optionsCreditedCumulative` present AND `optionsDaily` non-zero).
    * `0` means the verdict above is `null` for want of a cohort, not because
@@ -1202,6 +1217,7 @@ export function summarizeLiveCreditObservation(
     liveOptionsOnsetDate: string | null;
     optionsRealizedBeforeLiveOnsetUsd: number;
     preLiveOnsetOptionsDates: string[];
+    postOnsetCredit: PostOnsetLiveCredit;
   }>,
 ): {
   liveCreditBookCount: number;
@@ -1212,6 +1228,12 @@ export function summarizeLiveCreditObservation(
   liveModeSpanContaminatedBooks: Array<Record<string, unknown>>;
   liveCounterDurableOk: boolean | null;
   liveCreditBooks: Array<Record<string, unknown>>;
+  liveOnsetOptionsRealizedJournalUsd: number | null;
+  liveOnsetOptionsDayCellUsd: number | null;
+  liveOnsetUncreditedOptionsUsd: number | null;
+  liveOnsetCreditNumeratorBookCount: number;
+  liveOnsetCreditComparisonBookCount: number;
+  liveOnsetCreditNotMeasuredBooks: Array<Record<string, unknown>>;
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
   const measurable = liveBooks.filter(e => e.uncreditedOptionsUsd != null);
@@ -1222,6 +1244,21 @@ export function summarizeLiveCreditObservation(
   const unscoped = measurable.length === 0
     ? null
     : round2(measurable.reduce((s, e) => s + (e.uncreditedOptionsUsd ?? 0), 0));
+  // TRA-2919 — the JOURNAL-sourced axis, folded over the same live cohort. Two
+  // separate cohorts, and they must not be collapsed:
+  //
+  //  - NUMERATOR measurable — the book has a live onset and a journal to ask, so
+  //    its post-onset live realized P&L is a number. This is what makes the axis
+  //    gradeable again after TRA-2831 made the day-cell figure permanently null.
+  //  - COMPARISON measurable — additionally, no expected session inside the
+  //    equity anchor window is missing a row, so the subtraction means something.
+  //
+  // On `admin` today the first holds and the second does not (07-30/07-31/08-03
+  // are the permanent TRA-2888 hole), which is exactly the state this fold has to
+  // be able to express: the live money is MEASURED, and whether NAV absorbed it
+  // is NOT.
+  const onsetNumerator = liveBooks.filter(e => e.postOnsetCredit.journalOptionsUsd != null);
+  const onsetComparison = liveBooks.filter(e => e.postOnsetCredit.uncreditedOptionsUsd != null);
   return {
     liveCreditBookCount: liveBooks.length,
     liveEquityAbsorbedOptionsOk: liveBooks.some(e => e.equityAbsorbedOptionsOk === false)
@@ -1253,7 +1290,26 @@ export function summarizeLiveCreditObservation(
     // would destroy the evidence the suspension rests on, and a reader comparing
     // this to `liveUncreditedOptionsUsd` can see the disqualification directly.
     liveUncreditedOptionsUsdUnscoped: unscoped,
-    liveUncreditedOptionsGradeable: measurable.length > 0 && contaminated.length === 0,
+    // TRA-2919 — REDEFINED, and read this before grading it.
+    //
+    // It used to mean "the day-cell figure above is attributable live money",
+    // which on `admin` is FALSE FOREVER: the gate keys on
+    // `optionsRealizedBeforeLiveOnsetUsd`, that figure is durable history, and it
+    // does not age out. A boolean with no reachable true state on the only book
+    // that carries capital is not a grade, it is a mute button.
+    //
+    // It now means: **at least one live book has a post-onset numerator sourced
+    // from the JOURNAL** — i.e. the axis TRA-2630 named as the independent signal
+    // can be measured at all. It is an ATTRIBUTION gate and nothing more.
+    //
+    // IT IS NOT A CLAIM THAT THE DOLLAR COMPARISON IS AVAILABLE. `true` here with
+    // `liveOnsetUncreditedOptionsUsd: null` is the correct and expected reading on
+    // a book whose equity anchor spans the permanent TRA-2888 hole. A gate that
+    // wants the money verdict must require BOTH this AND
+    // `liveOnsetCreditNotMeasuredBooks` to be EMPTY — asserting a published
+    // denominator without also asserting the silenced set is empty is how a
+    // fleet-wide green survives a cohort that quietly shrank to nothing.
+    liveUncreditedOptionsGradeable: onsetNumerator.length > 0,
     // The attribution for the null above. Empty array + `gradeable: false` means
     // "no measurable live book at all"; non-empty means "measured, and the money
     // is not live" — two different states that must not collapse.
@@ -1306,7 +1362,49 @@ export function summarizeLiveCreditObservation(
       liveOptionsOnsetDate: e.liveOptionsOnsetDate,
       optionsRealizedBeforeLiveOnsetUsd: e.optionsRealizedBeforeLiveOnsetUsd,
       preLiveOnsetOptionsDates: e.preLiveOnsetOptionsDates,
+      // TRA-2919 — the journal-sourced axis, per book, on every live book and not
+      // only the measurable ones. A reader must be able to see WHY a book's
+      // comparison is null without inferring it from absence.
+      postOnsetCredit: e.postOnsetCredit,
     })),
+    // TRA-2919 — THE NUMERATOR, folded. Post-onset live realized option P&L
+    // straight from the journal: the money the day cells lost to the TRA-2888
+    // hole. `null` (never 0) when no live book could be measured.
+    liveOnsetOptionsRealizedJournalUsd: onsetNumerator.length === 0
+      ? null
+      : round2(onsetNumerator.reduce((s, e) => s + (e.postOnsetCredit.journalOptionsUsd ?? 0), 0)),
+    // The FOIL, folded over the same windows — what a day-cell-sourced numerator
+    // would have published. Kept beside the real figure so the reason this was
+    // not built the obvious way is readable off the live surface, not just out of
+    // TRA-2919 and a regression test.
+    liveOnsetOptionsDayCellUsd: onsetNumerator.length === 0
+      ? null
+      : round2(onsetNumerator.reduce((s, e) => s + (e.postOnsetCredit.dayCellOptionsUsd ?? 0), 0)),
+    // THE MONEY QUESTION. Null unless some live book's equity leg spans its
+    // post-onset window without a hole in it. Do NOT read a null here as clean —
+    // read `liveOnsetCreditNotMeasuredBooks` for the reason.
+    liveOnsetUncreditedOptionsUsd: onsetComparison.length === 0
+      ? null
+      : round2(onsetComparison.reduce((s, e) => s + (e.postOnsetCredit.uncreditedOptionsUsd ?? 0), 0)),
+    liveOnsetCreditNumeratorBookCount: onsetNumerator.length,
+    liveOnsetCreditComparisonBookCount: onsetComparison.length,
+    // THE SILENCED SET, published. Every live book whose comparison is NOT
+    // MEASURED, with the machine-readable reason and the sessions that caused it.
+    // This is what a gate must assert is empty before treating any figure above
+    // as a verdict; a cohort that shrinks silently is indistinguishable from one
+    // that was never there.
+    liveOnsetCreditNotMeasuredBooks: liveBooks
+      .filter(e => e.postOnsetCredit.uncreditedOptionsUsd == null)
+      .map(e => ({
+        username: e.username,
+        reason: e.postOnsetCredit.notMeasuredReason,
+        onsetDate: e.postOnsetCredit.onsetDate,
+        leftAnchorDate: e.postOnsetCredit.leftAnchorDate,
+        rightAnchorDate: e.postOnsetCredit.rightAnchorDate,
+        absentSessions: e.postOnsetCredit.absentSessions,
+        journalOptionsUsd: e.postOnsetCredit.journalOptionsUsd,
+        dayCellOptionsUsd: e.postOnsetCredit.dayCellOptionsUsd,
+      })),
   };
 }
 
@@ -1744,6 +1842,286 @@ export function liveOptionsOnsetEtDate(
     if (earliest === null || day < earliest) earliest = day;
   }
   return earliest;
+}
+
+/**
+ * TRA-2919 — why the post-onset credit axis reads NOT MEASURED, when it does.
+ *
+ * Every one of these can only push the verdict AWAY from a number. There is no
+ * value of any of them that manufactures a comparison.
+ */
+export type PostOnsetCreditNotMeasuredReason =
+  /** The book has never opened a live option, so there is no post-onset window. */
+  | 'no-live-options-onset'
+  /**
+   * No option-trade journal to ask. The numerator MUST come from the journal
+   * (see {@link summarizePostOnsetLiveCredit}), and `?? 0` here would publish a
+   * zero-dollar live numerator for a book whose whole live record is in the file
+   * we failed to read — the TRA-2314 false zero, one layer up.
+   */
+  | 'no-journal-census'
+  /** No post-baseline row carries a finite `closingEquity` to anchor on. */
+  | 'no-equity-anchor'
+  /** Fewer than two anchorable rows, so the equity delta cannot telescope. */
+  | 'no-post-anchor-span'
+  /** No exchange calendar was supplied, so session ABSENCE has no failing state. */
+  | 'no-session-calendar'
+  /** THE AC2 ARM — an expected session inside the anchor window has no ledger row. */
+  | 'equity-anchor-spans-absent-session';
+
+/** TRA-2919 — the post-onset live-credit measurement for ONE book. */
+export interface PostOnsetLiveCredit {
+  /** {@link PnlReconcileResult.liveOptionsOnsetDate}, echoed so this object stands alone. */
+  onsetDate: string | null;
+  /** Was there a journal to ask at all? `false` ⇒ `no-journal-census`. */
+  journalCensusAvailable: boolean;
+  /**
+   * Which row the left endpoint of the equity delta came from. `pre-onset-close`
+   * is the one that brackets ALL post-onset money; `first-post-onset-close` is
+   * the fallback for a book with no pre-onset row, and it necessarily excludes
+   * its own session's P&L from the window (the same telescoping rule
+   * `postBaselineEquityGrowth` follows).
+   */
+  anchorBasis: 'pre-onset-close' | 'first-post-onset-close' | null;
+  leftAnchorDate: string | null;
+  leftAnchorEquity: number | null;
+  rightAnchorDate: string | null;
+  rightAnchorEquity: number | null;
+  /** Sessions the exchange calendar expects inside `(leftAnchor, rightAnchor]`. */
+  windowSessions: number | null;
+  /** Ledger rows this book actually holds inside that window. */
+  windowRowDates: string[];
+  /**
+   * THE DISQUALIFIER. Expected sessions in the window with NO ledger row —
+   * enumerated from the calendar and diffed against the rows, because you cannot
+   * discover a missing session by iterating the sessions you have. `null` when
+   * there was no calendar to enumerate from; `[]` is the passing state.
+   */
+  absentSessions: string[] | null;
+  /**
+   * THE NUMERATOR, sourced from the option-trade JOURNAL. `null` = NOT MEASURED.
+   */
+  journalOptionsUsd: number | null;
+  /**
+   * THE FOIL — the same window summed from `optionsDaily` DAY CELLS instead.
+   * Published, never used, and that is the entire point: it is the number the
+   * obvious fix would have shipped, so the reason this was not built that way is
+   * readable off the live surface and not only out of TRA-2919. On `admin` at the
+   * time of writing the two read +739.00 (journal) against −2.00 (day cells).
+   */
+  dayCellOptionsUsd: number | null;
+  stockDailyUsd: number | null;
+  equityGrowthUsd: number | null;
+  /**
+   * THE COMPARISON: `journalOptionsUsd + stockDailyUsd − equityGrowthUsd`, i.e.
+   * how much post-onset LIVE realized P&L never reached NAV. `null` whenever
+   * {@link notMeasuredReason} is set — in particular whenever the equity anchor
+   * spans a session with no row, because the equity leg is then missing exactly
+   * the window the numerator covers and the subtraction is meaningless.
+   */
+  uncreditedOptionsUsd: number | null;
+  notMeasuredReason: PostOnsetCreditNotMeasuredReason | null;
+  /**
+   * Per-date decomposition for every date in the window carrying money on
+   * EITHER leg. This is what makes the numerator auditable: the +739.00 lives on
+   * a date with `hasLedgerRow: false`, so it appears on no `days[]` row and is
+   * invisible on every other field this endpoint publishes.
+   */
+  legs: Array<{
+    date: string;
+    journalOptionsUsd: number;
+    journalCloses: number;
+    journalPartialCloses: number;
+    /** `null` when this date has no ledger row at all — the hole, per date. */
+    dayCellOptionsUsd: number | null;
+    hasLedgerRow: boolean;
+  }>;
+}
+
+/**
+ * TRA-2919 (CFO) — **the live credit axis, re-sourced from the JOURNAL.**
+ *
+ * ── Why the day cells cannot carry this ──────────────────────────────────────
+ *
+ * TRA-2831 correctly stopped publishing `liveUncreditedOptionsUsd` as live
+ * money: its numerator `postBaselineOptionsRealized` was 987.60 of `admin`'s own
+ * DEMO-mode option P&L, booked 2026-07-15 … 07-29, folded into the live cohort
+ * because the cohort is keyed on the book's mode TODAY while the ledger under it
+ * is mode-blind for all time. The gate it installed keys on
+ * `optionsRealizedBeforeLiveOnsetUsd > 0`, and that figure is DURABLE HISTORY —
+ * it does not age out. So the axis went null and, without this, stays null
+ * forever on the only book that carries real capital. TRA-2630 had named this
+ * axis as the INDEPENDENT signal to grade after `optionsLegOk` became
+ * self-confirming, so the replacement signal was dead on arrival.
+ *
+ * The natural repair is to scope the existing numerator to post-onset dates.
+ * DO NOT. Measured on bqb1 2026-08-05, `admin` had exactly ONE post-onset day
+ * cell — 2026-08-04, `optionsDaily −2.00`, source `bucket-journal-silent`,
+ * `journalOptionsPnl 0`. Σ post-onset `optionsDaily` = **−2.00**, while the live
+ * book actually realized **+739.00** on 2026-07-31 across 3 journal closes. That
+ * money is booked to NO day cell at all: 07-30 / 07-31 / 08-03 are the permanent
+ * TRA-2888 hole (never captured, back-fill REFUSED, `ENABLE_EOD_ROW_BACKFILL`
+ * stays false — no writer will ever create those rows). A day-cell-sourced
+ * post-onset numerator therefore publishes −2.00 against a real +739.00 and
+ * carries `gradeable: true`. A wrong number that LOOKS gradeable is strictly
+ * worse than the honest null it replaced. `dayCellOptionsUsd` publishes that
+ * −2.00 beside the real figure precisely so this stays visible.
+ *
+ * The journal is append-only, survived the ENOSPC window intact (`corruptLines
+ * 0`) and is keyed by CLOSE timestamp, not by the existence of a snapshot row —
+ * so it holds the 07-31 closes the ledger lost. It is the only surviving source.
+ *
+ * ── Why the journal leg alone must not manufacture a verdict ─────────────────
+ *
+ * The EQUITY leg has a hole over the same window, and it is the subtrahend. The
+ * comparison telescopes `closingEquity[right] − closingEquity[left]`, so an
+ * absent session inside `(left, right]` means the equity delta and the numerator
+ * cover different spans — on `admin`, the delta 07-29 → 08-04 also silently
+ * absorbs whatever happened on three sessions nobody recorded. Publishing a
+ * number there would be the same fabrication in the other operand. Hence
+ * `equity-anchor-spans-absent-session`, and hence the anchor window is diffed
+ * against the CALENDAR rather than against the three known gap dates: a
+ * hard-coded date list goes green by EVICTION the moment a newer row advances
+ * past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to
+ * the next hole. This predicate cannot be emptied by a later row.
+ *
+ * Note the composition: absence is checked over the WHOLE window, which also
+ * covers the gap between `leftAnchor` and the onset. It has to — if an expected
+ * session sat between them it could not hold a row (or it would BE `leftAnchor`,
+ * which is the LAST row before the onset), so a numerator floored at the onset
+ * against a delta anchored earlier is precisely the apples-to-oranges case, and
+ * one predicate fails it closed.
+ *
+ * Pure and calendar-injected, the same discipline the rest of this module keeps.
+ */
+export function summarizePostOnsetLiveCredit(args: {
+  /** Post-baseline rows only, in any order. */
+  rows: ReadonlyArray<{
+    date: string;
+    optionsDaily: number;
+    stockDaily: number;
+    closingEquity: number | null;
+  }>;
+  liveOptionsOnsetDate: string | null;
+  /** `null` = there was no journal to ask, which is NOT a zero numerator. */
+  journalClosesByDate: ReadonlyMap<string, JournalDayCloses> | null;
+  calendar: EodTailCalendar | null;
+}): PostOnsetLiveCredit {
+  const { rows, liveOptionsOnsetDate: onset, journalClosesByDate: census, calendar } = args;
+  const base: PostOnsetLiveCredit = {
+    onsetDate: onset,
+    journalCensusAvailable: census != null,
+    anchorBasis: null,
+    leftAnchorDate: null,
+    leftAnchorEquity: null,
+    rightAnchorDate: null,
+    rightAnchorEquity: null,
+    windowSessions: null,
+    windowRowDates: [],
+    absentSessions: null,
+    journalOptionsUsd: null,
+    dayCellOptionsUsd: null,
+    stockDailyUsd: null,
+    equityGrowthUsd: null,
+    uncreditedOptionsUsd: null,
+    notMeasuredReason: null,
+    legs: [],
+  };
+  if (onset == null) return { ...base, notMeasuredReason: 'no-live-options-onset' };
+  // Ordered here rather than trusted from the caller: every endpoint that will
+  // read this sorts its own rows, and a mis-ordered series would pick the wrong
+  // anchors silently.
+  const sorted = [...rows].sort((a, b) => a.date.localeCompare(b.date));
+  const anchorable = sorted.filter(d => d.closingEquity !== null && Number.isFinite(d.closingEquity));
+  if (anchorable.length === 0) return { ...base, notMeasuredReason: 'no-equity-anchor' };
+  const preOnset = anchorable.filter(d => d.date < onset);
+  const postOnset = anchorable.filter(d => d.date >= onset);
+  const left = preOnset.length > 0
+    ? preOnset[preOnset.length - 1]!
+    : postOnset.length >= 2 ? postOnset[0]! : null;
+  const right = preOnset.length > 0
+    ? (postOnset.length > 0 ? postOnset[postOnset.length - 1]! : null)
+    : postOnset.length >= 2 ? postOnset[postOnset.length - 1]! : null;
+  if (left === null || right === null || right.date <= left.date) {
+    return { ...base, notMeasuredReason: 'no-post-anchor-span' };
+  }
+  const anchorBasis = preOnset.length > 0 ? 'pre-onset-close' as const : 'first-post-onset-close' as const;
+  const anchored = {
+    ...base,
+    anchorBasis,
+    leftAnchorDate: left.date,
+    leftAnchorEquity: round2(left.closingEquity as number),
+    rightAnchorDate: right.date,
+    rightAnchorEquity: round2(right.closingEquity as number),
+    equityGrowthUsd: round2((right.closingEquity as number) - (left.closingEquity as number)),
+  };
+  // A date contributes to the window iff it is strictly after the left anchor
+  // (telescoping: the anchor's own session landed in a delta whose left endpoint
+  // is outside the series), at or after the onset (attribution: nothing pre-onset
+  // may enter the numerator, ever), and at or before the right anchor.
+  const inWindow = (d: string): boolean => d > left.date && d >= onset && d <= right.date;
+  const windowRows = sorted.filter(d => inWindow(d.date));
+  const windowRowDates = windowRows.map(d => d.date);
+  const rowByDate = new Map(windowRows.map(d => [d.date, d] as const));
+  const withRows = {
+    ...anchored,
+    windowRowDates,
+    stockDailyUsd: round2(windowRows.reduce((s, d) => s + d.stockDaily, 0)),
+    dayCellOptionsUsd: round2(windowRows.reduce((s, d) => s + d.optionsDaily, 0)),
+  };
+  if (census == null) return { ...withRows, notMeasuredReason: 'no-journal-census' };
+  const journalUsd = round2(
+    [...census.entries()]
+      .filter(([date]) => inWindow(date))
+      .reduce((s, [, v]) => s + v.realizedPnlUsd, 0),
+  );
+  // Every date in the window carrying money on EITHER leg, journal-first. A date
+  // with journal money and no row is the hole; a date with a row and no journal
+  // money is a cell the journal does not support (`admin` 2026-08-05 booked
+  // −424.00 from the volatile bucket against zero journal closes). Both are
+  // findings, and neither is visible from a single total.
+  const legDates = [...new Set([
+    ...[...census.keys()].filter(d => inWindow(d)
+      && Math.abs(census.get(d)!.realizedPnlUsd) > PNL_RECONCILE_TOLERANCE_USD),
+    ...windowRows
+      .filter(d => Math.abs(d.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD)
+      .map(d => d.date),
+  ])].sort();
+  const withJournal = {
+    ...withRows,
+    journalOptionsUsd: journalUsd,
+    legs: legDates.map(date => {
+      const c = census.get(date) ?? null;
+      const row = rowByDate.get(date) ?? null;
+      return {
+        date,
+        journalOptionsUsd: round2(c?.realizedPnlUsd ?? 0),
+        journalCloses: c?.closes ?? 0,
+        journalPartialCloses: c?.partialCloses ?? 0,
+        dayCellOptionsUsd: row === null ? null : round2(row.optionsDaily),
+        hasLedgerRow: row !== null,
+      };
+    }),
+  };
+  if (calendar == null) return { ...withJournal, notMeasuredReason: 'no-session-calendar' };
+  const expected = sessionsInRange(left.date, right.date, calendar.isMarketDay)
+    .filter(d => d > left.date);
+  const present = new Set(windowRowDates);
+  const absentSessions = expected.filter(d => !present.has(d));
+  const measured = {
+    ...withJournal,
+    windowSessions: expected.length,
+    absentSessions,
+  };
+  if (absentSessions.length > 0) {
+    return { ...measured, notMeasuredReason: 'equity-anchor-spans-absent-session' };
+  }
+  return {
+    ...measured,
+    uncreditedOptionsUsd: round2(
+      journalUsd + (measured.stockDailyUsd ?? 0) - (measured.equityGrowthUsd ?? 0),
+    ),
+  };
 }
 
 /**
@@ -2344,6 +2722,16 @@ export function reconcilePnl(
   const optionsRealizedBeforeLiveOnsetUsd = round2(
     preLiveOnsetRows.reduce((s, d) => s + d.optionsDaily, 0),
   );
+  // TRA-2919 — the JOURNAL-sourced post-onset axis, computed over `evaluated`
+  // (post-baseline rows) and the SAME census/calendar/onset this function was
+  // already handed. Nothing above it changes: the day-cell figures stay published
+  // byte-identically as the evidence the TRA-2831 suspension rests on.
+  const postOnsetCredit = summarizePostOnsetLiveCredit({
+    rows: evaluated,
+    liveOptionsOnsetDate,
+    journalClosesByDate,
+    calendar: tailCalendar,
+  });
 
   return {
     ok: offendingDates.length === 0,
@@ -2420,6 +2808,7 @@ export function reconcilePnl(
     liveOptionsOnsetDate,
     optionsRealizedBeforeLiveOnsetUsd,
     preLiveOnsetOptionsDates: preLiveOnsetRows.map(d => d.date),
+    postOnsetCredit,
     uncreditedOptionsUsd: postBaselineEquityGrowth == null
       ? null
       : round2(postBaselineOptionsRealized + postBaselineStockDaily - postBaselineEquityGrowth),

@@ -155,6 +155,18 @@ with its denominator.
 1. `pnl-reconciliation` → **`equityAbsorbedOptionsOk` / `uncreditedOptionsUsd`** — journal vs equity
    ledger, no joining writer. (Read `liveUncreditedOptionsGradeable` on the `live*` variants: TRA-2831
    scopes them for mode-span contamination.)
+
+   **TRA-2919 amendment.** On the live cohort the day-cell numerator behind `liveUncreditedOptionsUsd`
+   is permanently disqualified — the TRA-2831 gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which
+   is durable history and does not age out — so the live axis moved to
+   `engines[].postOnsetCredit` / `liveOnsetOptionsRealizedJournalUsd`, sourced from the option-trade
+   JOURNAL. Grade THOSE, and note the split: `liveUncreditedOptionsGradeable` is now an ATTRIBUTION
+   boolean ("some live book has a journal-sourced post-onset numerator"), NOT a claim that the dollar
+   comparison exists. A money verdict additionally requires `liveOnsetCreditNotMeasuredBooks` to be
+   EMPTY. `true` there alongside `liveOnsetUncreditedOptionsUsd: null` is `admin`'s correct standing
+   read while the permanent TRA-2888 hole sits inside its equity anchor window, and it must not be
+   read as green. Do NOT re-source the numerator from `optionsDaily` day cells: on `admin` that
+   publishes −2.00 against a real +739.00.
 2. `pnl-reconciliation` → **`counterDurableOk`** — three durable snapshot fields, explicitly unjoined.
 3. `pnl-reconciliation` → **`priorOptionsLagOk`** — exchange-session-adjacent since TRA-2835. A
    post-gap PASS remains provisional; a FAIL is conclusive.

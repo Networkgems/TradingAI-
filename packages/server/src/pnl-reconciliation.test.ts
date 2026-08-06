@@ -10,12 +10,41 @@ import {
   summarizeLiveCohortIntegrity,
   countStaleTailSessions,
   summarizeDriftGradeability,
+  summarizePostOnsetLiveCredit,
   PNL_RECONCILE_DEFAULT_BASELINE_DATE,
   PNL_RECONCILIATION_CAVEATS,
   PNL_DRIFT_DECOMPOSITION_NOTE,
   PNL_ABSENT_EOD_ROW_NOTE,
+  PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
 } from './pnl-reconciliation.js';
+import type { PostOnsetLiveCredit } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
+
+/**
+ * TRA-2919 — the journal-sourced post-onset axis, NOT MEASURED. Every fixture in
+ * the `summarizeLiveCreditObservation` blocks below predates this field and grades
+ * a different question, so the default has to be the state that changes no verdict
+ * they were written to make: no live onset, therefore no numerator.
+ */
+const NO_POST_ONSET_CREDIT: PostOnsetLiveCredit = {
+  onsetDate: null,
+  journalCensusAvailable: true,
+  anchorBasis: null,
+  leftAnchorDate: null,
+  leftAnchorEquity: null,
+  rightAnchorDate: null,
+  rightAnchorEquity: null,
+  windowSessions: null,
+  windowRowDates: [],
+  absentSessions: null,
+  journalOptionsUsd: null,
+  dayCellOptionsUsd: null,
+  stockDailyUsd: null,
+  equityGrowthUsd: null,
+  uncreditedOptionsUsd: null,
+  notMeasuredReason: 'no-live-options-onset',
+  legs: [],
+};
 
 // TRA-1633 FIX 3 — cross-surface reconciliation guard. The identity that must
 // hold per ET day is EOD.combinedPnl == stock dailyPnl + day-only options.
@@ -1501,6 +1530,7 @@ describe('TRA-2658 — liveCounterDurableOk', () => {
     liveOptionsOnsetDate: '2026-07-13' as string | null,
     optionsRealizedBeforeLiveOnsetUsd: 0,
     preLiveOnsetOptionsDates: [] as string[],
+    postOnsetCredit: NO_POST_ONSET_CREDIT,
   });
 
   it('is NOT MEASURED on an empty live cohort — never a passing durability grade', () => {
@@ -1562,6 +1592,7 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     liveOptionsOnsetDate: '2026-07-13' as string | null,
     optionsRealizedBeforeLiveOnsetUsd: 0,
     preLiveOnsetOptionsDates: [] as string[],
+    postOnsetCredit: NO_POST_ONSET_CREDIT,
   });
 
   it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
@@ -1651,7 +1682,11 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
       const r = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
       expect(r.liveCreditBookCount).toBe(1);
       expect(r.liveUncreditedOptionsUsd).toBeNull();
-      expect(r.liveUncreditedOptionsGradeable).toBe(false);
+      // The DAY-CELL figure stays disqualified, and the attribution is published.
+      // TRA-2919 moved `liveUncreditedOptionsGradeable` off this predicate — see
+      // the block below for why it had no reachable true state on `admin` — so the
+      // suspension is asserted here on the two fields that carry it.
+      expect(r.liveModeSpanContaminatedBooks).toHaveLength(1);
     });
 
     it('keeps the arithmetic published as a MEASUREMENT, so the evidence survives', () => {
@@ -1679,6 +1714,7 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
       expect(empty.liveUncreditedOptionsUsd).toBeNull();
       expect(empty.liveModeSpanContaminatedBooks).toEqual([]);
       expect(empty.liveUncreditedOptionsGradeable).toBe(false);
+      expect(empty.liveOnsetCreditNumeratorBookCount).toBe(0);
 
       const dirty = summarizeLiveCreditObservation([flipped('admin', 987.6)]);
       expect(dirty.liveUncreditedOptionsUsd).toBeNull();
@@ -1689,7 +1725,6 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
       // The gate must not be a permanent null — a book that only ever traded
       // live keeps its figure, or this "fix" is just a mute button.
       const r = summarizeLiveCreditObservation([flipped('admin', 0)]);
-      expect(r.liveUncreditedOptionsGradeable).toBe(true);
       expect(r.liveUncreditedOptionsUsd).toBeCloseTo(733.6, 2);
       expect(r.liveModeSpanContaminatedBooks).toEqual([]);
     });
@@ -1774,6 +1809,358 @@ describe('TRA-2831 — reconcilePnl partitions the numerator by live onset', () 
     expect(r.postBaselineOptionsRealized).toBeCloseTo(17, 2);
     expect(r.optionsRealizedBeforeLiveOnsetUsd).toBeCloseTo(17, 2);
     expect(r.preLiveOnsetOptionsDates).toEqual(['2026-07-15']);
+  });
+});
+
+// TRA-2919 (CFO) — THE LIVE CREDIT AXIS, RE-SOURCED FROM THE JOURNAL.
+//
+// The state this block reproduces is `admin` on bqb1 as measured 2026-08-05
+// (build 237c147e) and re-measured 2026-08-06T16:56Z (build f19fb1fa):
+//
+//   liveOptionsOnsetDate            2026-07-30
+//   eleven day cells 07-15..07-29   Σ optionsDaily 987.60   (all DEMO money)
+//   2026-07-30 / 07-31 / 08-03      NO ROW — the permanent TRA-2888 hole
+//   2026-08-04                      optionsDaily −2.00, bucket-journal-silent
+//   journal, close-dated 07-31      3 closes, +739.00 — booked to NO day cell
+//
+// Two numerators are available and they disagree by $741.00. The day cells say
+// −2.00; the journal says +739.00. The journal is right, and the fixtures below
+// are the durable record of that — AC3 asks specifically that the rejected
+// arithmetic live in the repo rather than only in the ticket.
+describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
+  // NYSE sessions: weekdays. Enough for a window that never crosses a holiday.
+  const isMarketDay = (d: string) => {
+    const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const calendar = { lastSettledSession: '2026-08-05', isMarketDay };
+  const row = (date: string, optionsDaily: number, stockDaily: number, closingEquity: number | null) =>
+    ({ date, optionsDaily, stockDaily, closingEquity });
+
+  // `admin`'s tape, trimmed to the rows that matter. Eleven pre-onset cells are
+  // represented by their two endpoints plus their sum on 07-29 — the arithmetic
+  // this axis must EXCLUDE is identical either way.
+  const adminRows = [
+    row('2026-07-15', 17, 0, 1_500),
+    row('2026-07-28', 68, -0.94, 2_147.35),
+    row('2026-07-29', 250.01, -17.87, 2_243.48),
+    // 2026-07-30 / 07-31 / 08-03 — NEVER CAPTURED. There is no row to write here.
+    row('2026-08-04', -2, 0, 2_603.49),
+  ];
+  const adminJournal = new Map([
+    ['2026-07-15', { closes: 1, partialCloses: 0, realizedPnlUsd: 17 }],
+    ['2026-07-29', { closes: 6, partialCloses: 0, realizedPnlUsd: 250.01 }],
+    // The money the ledger lost. Close-dated, so the journal holds it with no row.
+    ['2026-07-31', { closes: 3, partialCloses: 0, realizedPnlUsd: 739 }],
+  ]);
+  const admin = () => summarizePostOnsetLiveCredit({
+    rows: adminRows,
+    liveOptionsOnsetDate: '2026-07-30',
+    journalClosesByDate: adminJournal,
+    calendar,
+  });
+
+  it('AC1 — the numerator INCLUDES the 07-31 +739.00 and EXCLUDES every pre-onset cell', () => {
+    const r = admin();
+    expect(r.journalOptionsUsd).toBeCloseTo(739, 2);
+    // Positive proof of the exclusion, not just the total: the pre-onset money is
+    // 267.01 on these rows, so a numerator that leaked it would read 1006.01.
+    expect(r.journalOptionsUsd).not.toBeCloseTo(1_006.01, 2);
+    expect(r.legs.map(l => l.date)).toEqual(['2026-07-31', '2026-08-04']);
+    expect(r.legs[0]).toEqual({
+      date: '2026-07-31',
+      journalOptionsUsd: 739,
+      journalCloses: 3,
+      journalPartialCloses: 0,
+      // THE HOLE, per date: real money on a session with no ledger row at all.
+      dayCellOptionsUsd: null,
+      hasLedgerRow: false,
+    });
+  });
+
+  it('AC3 — a DAY-CELL numerator would have published −2.00 against that +739.00', () => {
+    // The whole reason this was not built the obvious way. `dayCellOptionsUsd` is
+    // the rejected arithmetic, computed over the SAME window and published beside
+    // the real figure so a reader of the live surface sees both.
+    const r = admin();
+    expect(r.dayCellOptionsUsd).toBeCloseTo(-2, 2);
+    expect(r.journalOptionsUsd).toBeCloseTo(739, 2);
+    expect((r.journalOptionsUsd ?? 0) - (r.dayCellOptionsUsd ?? 0)).toBeCloseTo(741, 2);
+  });
+
+  it('AC2 — the comparison is NOT MEASURED because the equity anchor spans the hole', () => {
+    const r = admin();
+    expect(r.anchorBasis).toBe('pre-onset-close');
+    expect(r.leftAnchorDate).toBe('2026-07-29');
+    expect(r.leftAnchorEquity).toBeCloseTo(2_243.48, 2);
+    expect(r.rightAnchorDate).toBe('2026-08-04');
+    expect(r.absentSessions).toEqual(['2026-07-30', '2026-07-31', '2026-08-03']);
+    expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
+    // The number is what must NOT appear. Had it been published it would read
+    // 739.00 + 0.00 − 360.01 = +378.99, an entirely invented shortfall: the equity
+    // delta 2243.48 → 2603.49 also absorbs three sessions nobody recorded.
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('the equity growth stays published even when the comparison cannot be made', () => {
+    // Suppressing the operands as well would leave a reader unable to see WHY the
+    // subtraction was refused — the same mistake as deleting the 733.60 evidence.
+    const r = admin();
+    expect(r.equityGrowthUsd).toBeCloseTo(360.01, 2);
+    expect(r.stockDailyUsd).toBeCloseTo(0, 2);
+    // (07-29, 08-04] holds four sessions — 07-30, 07-31, 08-03, 08-04 — and the
+    // book has a row for exactly one of them.
+    expect(r.windowSessions).toBe(4);
+    expect(r.windowRowDates).toEqual(['2026-08-04']);
+  });
+
+  it('PUBLISHES the comparison once the window has no hole in it', () => {
+    // The arm that proves this is not a permanent null wearing a new name. Same
+    // book, same journal, with the three sessions present: 739 + 0 − 360.01.
+    const healed = [
+      ...adminRows.slice(0, 3),
+      row('2026-07-30', 0, 0, 2_243.48),
+      row('2026-07-31', 0, 0, 2_605.49),
+      row('2026-08-03', 0, 0, 2_605.49),
+      row('2026-08-04', -2, 0, 2_603.49),
+    ];
+    const r = summarizePostOnsetLiveCredit({
+      rows: healed,
+      liveOptionsOnsetDate: '2026-07-30',
+      journalClosesByDate: adminJournal,
+      calendar,
+    });
+    expect(r.absentSessions).toEqual([]);
+    expect(r.notMeasuredReason).toBeNull();
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(378.99, 2);
+  });
+
+  it('a NEW hole outside the documented three still disqualifies the comparison', () => {
+    // Absence is enumerated from the CALENDAR, so this predicate cannot be
+    // satisfied by a hard-coded allow-list of the TRA-2888 dates, and cannot go
+    // green by eviction the way `liveEodTailStaleBooks` did.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        row('2026-07-29', 0, 0, 2_000),
+        // 2026-07-30 present, 07-31 and 08-03 present, 08-04 MISSING.
+        row('2026-07-30', 0, 0, 2_000),
+        row('2026-07-31', 739, 0, 2_739),
+        row('2026-08-03', 0, 0, 2_739),
+        row('2026-08-05', 0, 0, 2_739),
+      ],
+      liveOptionsOnsetDate: '2026-07-30',
+      journalClosesByDate: adminJournal,
+      calendar,
+    });
+    expect(r.absentSessions).toEqual(['2026-08-04']);
+    expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('reads NOT MEASURED, with a distinct reason, on each way of having no window', () => {
+    // Four nulls that need four different remediations. Collapsing any pair of
+    // them is the defect this module has now shipped in several shapes.
+    const noOnset = summarizePostOnsetLiveCredit({
+      rows: adminRows, liveOptionsOnsetDate: null, journalClosesByDate: adminJournal, calendar,
+    });
+    expect(noOnset.notMeasuredReason).toBe('no-live-options-onset');
+    expect(noOnset.journalOptionsUsd).toBeNull();
+
+    // `v0nni` as armed on 2026-08-06: live, funded, one row, no live option yet.
+    const oneRow = summarizePostOnsetLiveCredit({
+      rows: [row('2026-08-05', 0, 0, 25_000)],
+      liveOptionsOnsetDate: '2026-08-05',
+      journalClosesByDate: new Map(),
+      calendar,
+    });
+    expect(oneRow.notMeasuredReason).toBe('no-post-anchor-span');
+
+    const noAnchor = summarizePostOnsetLiveCredit({
+      rows: [row('2026-08-04', -2, 0, null), row('2026-08-05', 0, 0, null)],
+      liveOptionsOnsetDate: '2026-07-30',
+      journalClosesByDate: adminJournal,
+      calendar,
+    });
+    expect(noAnchor.notMeasuredReason).toBe('no-equity-anchor');
+
+    const noCalendar = summarizePostOnsetLiveCredit({
+      rows: adminRows, liveOptionsOnsetDate: '2026-07-30', journalClosesByDate: adminJournal,
+      calendar: null,
+    });
+    expect(noCalendar.notMeasuredReason).toBe('no-session-calendar');
+    // The numerator survives — it does not need a calendar. Only the comparison does.
+    expect(noCalendar.journalOptionsUsd).toBeCloseTo(739, 2);
+    expect(noCalendar.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('a MISSING journal is not a zero numerator', () => {
+    // `?? 0` here would publish a $0.00 live numerator for a book whose entire
+    // live record is in the file we failed to read — the TRA-2314 false zero one
+    // layer up, and it would carry a comparison that looks perfectly ordinary.
+    const r = summarizePostOnsetLiveCredit({
+      rows: adminRows, liveOptionsOnsetDate: '2026-07-30', journalClosesByDate: null, calendar,
+    });
+    expect(r.journalCensusAvailable).toBe(false);
+    expect(r.notMeasuredReason).toBe('no-journal-census');
+    expect(r.journalOptionsUsd).toBeNull();
+    expect(r.uncreditedOptionsUsd).toBeNull();
+    // The day-cell leg is still summed, so the −2.00 foil survives the degraded
+    // mode and the two legs stay comparable when the journal returns.
+    expect(r.dayCellOptionsUsd).toBeCloseTo(-2, 2);
+  });
+
+  it('publishes a day cell the journal does NOT support, rather than dropping it', () => {
+    // `admin` 2026-08-05 booked −424.00 from the VOLATILE bucket against zero
+    // journal closes (`bucket-journal-silent`). The journal-sourced numerator
+    // excludes it by construction; if the leg were not published the divergence
+    // would vanish, and a $424 discrepancy on real capital would be invisible.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [...adminRows, row('2026-08-05', -424, 0, 2_603.49)],
+      liveOptionsOnsetDate: '2026-07-30',
+      journalClosesByDate: adminJournal,
+      calendar,
+    });
+    const leg = r.legs.find(l => l.date === '2026-08-05');
+    expect(leg).toEqual({
+      date: '2026-08-05',
+      journalOptionsUsd: 0,
+      journalCloses: 0,
+      journalPartialCloses: 0,
+      dayCellOptionsUsd: -424,
+      hasLedgerRow: true,
+    });
+    expect(r.journalOptionsUsd).toBeCloseTo(739, 2);
+    expect(r.dayCellOptionsUsd).toBeCloseTo(-426, 2);
+  });
+
+  it('excludes pre-onset money even when the anchor sits well BEFORE the onset', () => {
+    // A book whose last pre-onset row is 07-15 and whose onset is 07-30: the
+    // window opens at 07-16, so 07-29's 250.01 of DEMO money is inside the equity
+    // delta. The numerator must still be floored at the onset — and because the
+    // sessions between are then rowless, the comparison fails closed rather than
+    // subtracting spans that do not match.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [row('2026-07-15', 17, 0, 1_500), row('2026-08-04', -2, 0, 2_603.49)],
+      liveOptionsOnsetDate: '2026-07-30',
+      journalClosesByDate: adminJournal,
+      calendar,
+    });
+    expect(r.journalOptionsUsd).toBeCloseTo(739, 2);
+    expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
+    expect(r.absentSessions).toContain('2026-07-29');
+  });
+
+  it('falls back to the first post-onset close when the book has no pre-onset row', () => {
+    const r = summarizePostOnsetLiveCredit({
+      rows: [row('2026-08-04', 0, 0, 2_500), row('2026-08-05', 100, 0, 2_600)],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: new Map([['2026-08-05', { closes: 1, partialCloses: 0, realizedPnlUsd: 100 }]]),
+      calendar,
+    });
+    expect(r.anchorBasis).toBe('first-post-onset-close');
+    expect(r.leftAnchorDate).toBe('2026-08-04');
+    // The anchor's own session is outside the telescoped window, on BOTH legs.
+    expect(r.journalOptionsUsd).toBeCloseTo(100, 2);
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(0, 2);
+  });
+});
+
+describe('TRA-2919 — reconcilePnl wires the journal axis, and the fold splits the two cohorts', () => {
+  const isMarketDay = (d: string) => {
+    const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const calendar = { lastSettledSession: '2026-08-05', isMarketDay };
+  // Same tape as the block above, as SNAPSHOTS this time, so the wiring through
+  // `reconcilePnl` is graded and not just the pure helper.
+  const snaps = [
+    { ...snap('2026-07-15', 0, 17), closingEquity: 1_500 },
+    { ...snap('2026-07-29', -17.87, 250.01), closingEquity: 2_243.48 },
+    { ...snap('2026-08-04', 0, -2), closingEquity: 2_603.49 },
+  ];
+  const census = new Map([
+    ['2026-07-15', { closes: 1, partialCloses: 0, realizedPnlUsd: 17 }],
+    ['2026-07-29', { closes: 6, partialCloses: 0, realizedPnlUsd: 250.01 }],
+    ['2026-07-31', { closes: 3, partialCloses: 0, realizedPnlUsd: 739 }],
+  ]);
+  const run = () => reconcilePnl(
+    snaps, new Map(), '2026-07-12', census, null, null, calendar, '2026-07-30',
+  );
+
+  it('publishes the journal axis on the reconciliation result', () => {
+    const r = run();
+    expect(r.postOnsetCredit.journalOptionsUsd).toBeCloseTo(739, 2);
+    expect(r.postOnsetCredit.dayCellOptionsUsd).toBeCloseTo(-2, 2);
+    expect(r.postOnsetCredit.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
+    expect(r.postOnsetCredit.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('AC4 — the TRA-2831 day-cell evidence is published UNCHANGED beside it', () => {
+    // The suspension of the 733.60 rests on these three, so this fix must not
+    // rescale, gate or delete any of them.
+    const r = run();
+    expect(r.postBaselineOptionsRealized).toBeCloseTo(248.01, 2);
+    expect(r.optionsRealizedBeforeLiveOnsetUsd).toBeCloseTo(250.01, 2);
+    expect(r.preLiveOnsetOptionsDates).toEqual(['2026-07-29']);
+    const fold = summarizeLiveCreditObservation([{
+      username: 'admin',
+      mode: 'live',
+      equityAbsorbedOptionsOk: null,
+      counterDurable: true,
+      counterFrozenDates: [],
+      counterNonDurableDates: [],
+      maxUnbookedEquityMoveUsd: 0,
+      optionsCreditedMeasuredCount: 0,
+      optionsCreditedLatest: 0,
+      optionsCreditedDates: [],
+      closingEquityLatest: r.closingEquityLatest,
+      closingEquityLatestDate: r.closingEquityLatestDate,
+      uncreditedOptionsUsd: r.uncreditedOptionsUsd,
+      postBaselineEquityGrowth: r.postBaselineEquityGrowth,
+      postBaselineOptionsRealized: r.postBaselineOptionsRealized,
+      postBaselineStockDaily: r.postBaselineStockDaily,
+      liveOptionsOnsetDate: r.liveOptionsOnsetDate,
+      optionsRealizedBeforeLiveOnsetUsd: r.optionsRealizedBeforeLiveOnsetUsd,
+      preLiveOnsetOptionsDates: r.preLiveOnsetOptionsDates,
+      postOnsetCredit: r.postOnsetCredit,
+    }]);
+    // Still suspended, still attributed — the day-cell axis is untouched.
+    expect(fold.liveUncreditedOptionsUsd).toBeNull();
+    expect(fold.liveUncreditedOptionsUsdUnscoped).not.toBeNull();
+    expect(fold.liveModeSpanContaminatedBooks).toHaveLength(1);
+    // AC1 — and the axis is GRADEABLE again: the numerator is journal-sourced.
+    expect(fold.liveUncreditedOptionsGradeable).toBe(true);
+    expect(fold.liveOnsetOptionsRealizedJournalUsd).toBeCloseTo(739, 2);
+    expect(fold.liveOnsetOptionsDayCellUsd).toBeCloseTo(-2, 2);
+    expect(fold.liveOnsetCreditNumeratorBookCount).toBe(1);
+    // AC2 — and the comparison is NOT MEASURED, in the published silenced set.
+    expect(fold.liveOnsetUncreditedOptionsUsd).toBeNull();
+    expect(fold.liveOnsetCreditComparisonBookCount).toBe(0);
+    expect(fold.liveOnsetCreditNotMeasuredBooks).toEqual([{
+      username: 'admin',
+      reason: 'equity-anchor-spans-absent-session',
+      onsetDate: '2026-07-30',
+      leftAnchorDate: '2026-07-29',
+      rightAnchorDate: '2026-08-04',
+      absentSessions: ['2026-07-30', '2026-07-31', '2026-08-03'],
+      journalOptionsUsd: 739,
+      dayCellOptionsUsd: -2,
+    }]);
+  });
+
+  it('a caller that passes no census gets NOT MEASURED, never a zero numerator', () => {
+    // Every pre-existing caller of `reconcilePnl` is in this shape.
+    const r = reconcilePnl(snaps, new Map(), '2026-07-12');
+    expect(r.postOnsetCredit.journalOptionsUsd).toBeNull();
+    expect(r.postOnsetCredit.notMeasuredReason).toBe('no-live-options-onset');
+  });
+
+  it('the caveat naming the rejected day-cell numerator ships on the endpoint', () => {
+    // AC3's durability requirement, on the wire and not only in a test name.
+    expect(PNL_RECONCILIATION_CAVEATS).toContain(PNL_POST_ONSET_JOURNAL_CREDIT_NOTE);
+    expect(PNL_POST_ONSET_JOURNAL_CREDIT_NOTE).toContain('-2.00');
+    expect(PNL_POST_ONSET_JOURNAL_CREDIT_NOTE).toContain('+739.00');
+    expect(PNL_POST_ONSET_JOURNAL_CREDIT_NOTE).toContain('equity-anchor-spans-absent-session');
   });
 });
 
