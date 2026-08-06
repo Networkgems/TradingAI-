@@ -426,7 +426,18 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
           </div>
         </div>
 
-        {report.top5Movers.length > 0 && (
+        {/* TRA-2631 (board ruling A) — this grid renders the stored `top5Movers`
+            array, which the server has already FILTERED at read time. Two things
+            follow, and both are load-bearing:
+
+            1. The block must render when rows were SUPPRESSED even if nothing is
+               left to show. 5 of 5 rows are suppressed on 2026-07-28 demo; the old
+               `top5Movers.length > 0` guard alone would make that whole table
+               vanish silently, which reads as "no movers that day".
+            2. The suppression notice is not garnish. Without it a filtered table
+               and a genuinely clean one render as the same rows — the exact
+               instrument failure this ticket is about, relocated into the fix. */}
+        {(report.top5Movers.length > 0 || (report.moversProvenance?.filteredCount ?? 0) > 0) && (
           <div className="eod-movers">
             <span className="eod-section-label">Top 5 Movers:</span>
             {report.top5Movers.map(m => (
@@ -435,12 +446,9 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
                 <span className={m.changePct >= 0 ? 'green' : 'red'}>
                   &nbsp;{m.changePct >= 0 ? '+' : ''}{m.changePct.toFixed(2)}%
                 </span>
-                {/* TRA-2631 / TRA-3063 (ruling B) — 64 of 105 stored reports carry a
-                    fabricated row at #1, and this grid renders the stored array. The
-                    server stamps each row at read time; the badge is what makes the
-                    stamp VISIBLE here. Flag only — the row keeps its place and its
-                    number, because filtering a bad headline is what makes the next one
-                    go unnoticed. */}
+                {/* A SERVED row can no longer be `suspect` — those are filtered out
+                    upstream — but it can be `unassessable`, which is RETAINED on
+                    purpose. Badge it: a blind spot must not render as a pass. */}
                 {m.provenance && m.provenance.verdict !== 'plausible' && (
                   <span
                     className="eod-mover-flag"
@@ -460,6 +468,23 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
                 )}
               </span>
             ))}
+            {report.moversProvenance && report.moversProvenance.filteredCount > 0 && (
+              <span
+                className="eod-movers-filtered"
+                title={
+                  `${report.moversProvenance.filteredCount} of ${report.moversProvenance.publishedCount}`
+                  + ' published row(s) suppressed as unverified by'
+                  + ` ${report.moversProvenance.ruleId} (threshold ${report.moversProvenance.threshold}),`
+                  + ` build ${report.moversProvenance.build}. Suppressed: `
+                  + report.moversProvenance.filtered
+                    .map(f => `${f.symbol} $${f.price.toFixed(2)} ${f.changePct >= 0 ? '+' : ''}${f.changePct.toFixed(2)}%`)
+                    .join('; ')
+                  + '. The stored report on disk is unchanged — this is a read-time filter, not a rewrite.'
+                }
+              >
+                ⚠️ {report.moversProvenance.filteredCount} of {report.moversProvenance.publishedCount} suppressed
+              </span>
+            )}
           </div>
         )}
 

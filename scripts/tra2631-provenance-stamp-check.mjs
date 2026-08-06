@@ -1,44 +1,57 @@
-// TRA-2631 / TRA-3063 (ruling B) — grade the READ-TIME PROVENANCE STAMP on the
-// archive as it is actually SERVED.
+// TRA-2631 (board ruling A) — grade the READ-TIME FILTER + PROVENANCE STAMP on
+// the archive as it is actually SERVED.
 //
 // The companion to `tra2610-archive-scan.mjs`. That one asks "how many stored
-// tables carry a fabricated row?" (64 of 105, all at #1). This one asks the
-// question the ruling turns on: **does the response say so, on BOTH surfaces?**
+// tables carry a fabricated row?" (64 of 105, all at #1) and, since the filter
+// shipped, reconstructs the PUBLISHED table before grading so its census is not
+// blinded by this remedy. This one asks the question the ruling turns on:
+// **were the fabricated rows actually suppressed, on BOTH surfaces, and does the
+// response say so?**
 //
-// Both surfaces, because `markdown` is built at generation time and frozen into
-// the stored file — a stamp that lands only on the `top5Movers` array is
-// invisible on the surface the News tab and session reviews render, i.e. the
-// partial fix that reads as complete. So a row is only GRADED PASS when the JSON
-// row carries `provenance.verdict === 'suspect'` AND the served markdown marks
-// that row in place AND the self-dating note (rule id + threshold + build) is
-// present.
+// ── The verification bar, as the board set it ─────────────────────────────────
+// *"Prove the filter actually matched rows. Count the rows filtered and fail at
+// zero. A filter that matches nothing reads exactly like a clean corpus — that is
+// the failure mode this whole issue is about, so do not reproduce it in the fix."*
 //
-// It also grades the two properties the ruling made binding, because "flag, do
-// not filter" is only checkable against the artifact itself:
+// So `filteredRows === 0` across the corpus is a **FAIL**, not a pass. That is
+// this check's single most important line and it is deliberately not softened
+// into a warning.
 //
-//   • NOT FILTERED — the markdown table and the JSON array carry the SAME number
-//     of rows. A filter applied to one surface and not the other shows up here as
-//     a count divergence; a filter applied to both would show up as a dirty
-//     artifact that this scan can no longer see at all (which is exactly why the
-//     64/105 census is re-run alongside, not replaced).
-//   • NOT RE-RANKED — a stamped suspect row is reported WITH ITS RANK. The
-//     ruling says #1 stays #1, flagged, so a suspect row that has quietly moved
-//     off #1 is a FAILURE here, not a success.
+// ── What is graded, per artifact ──────────────────────────────────────────────
+//   • FILTER EFFECTIVE — no SERVED row is one the rule calls suspect. A leaked
+//     row means the filter ran and missed, which is worse than not shipping.
+//   • NOT OVER-FILTERED — every SUPPRESSED row is one the rule calls suspect.
+//     Under A a false positive DELETES a genuine mover from the headline, so the
+//     over-filtering control is not symmetric decoration; it is the expensive
+//     direction. (INLF at r = 1.9717 is the live near-miss this protects.)
+//   • ARITHMETIC — `publishedCount === servedCount + filteredCount`, and
+//     `servedCount` equals the array actually served. A stamp whose numbers do
+//     not add up cannot be used to reconstruct the published table, which is what
+//     the 2610 census now depends on.
+//   • BOTH SURFACES — the markdown table carries exactly the served rows, and no
+//     suppressed symbol survives in it. A filter applied to the JSON only would
+//     leave the fabricated headline fully visible on the surface the News tab
+//     renders: the partial fix that reads as complete.
+//   • DISTINGUISHABLE — a filtered artifact says `SUPPRESSED` and a clean one
+//     says `0 of N row(s) suppressed`. This is the half of A that stops the
+//     remedy from becoming the defect: without it, a silently-filtered report and
+//     a genuinely-clean one are the same bytes to a reader.
+//   • SELF-DATING — rule id + threshold + a real build SHA on the stamp.
 //
-// Exit: 0 PASS · 1 FAIL (served but unstamped / stamped on one surface only /
-//       re-ranked) · 2 NOT_DEPLOYED (nothing served carries a stamp at all — the
+// Exit: 0 PASS · 1 FAIL (leaked row / over-filtered / surface divergence /
+//       arithmetic / indistinguishable / **zero rows filtered corpus-wide**) ·
+//       2 NOT_DEPLOYED (nothing served carries `moversProvenance` at all — the
 //       honest pre-deploy answer, deliberately NOT folded into FAIL) · 3 BLIND
 //       (no table readable, or a control failed).
 //
-// ⛔ Zero graded rows is BLIND, never PASS. An archive that has rolled clean
-// would otherwise report "0 failures" and read identically to a shipped fix.
+// ⛔ Zero artifacts read is BLIND, never PASS. Zero rows FILTERED is FAIL, never
+// PASS. The two zeros mean different things and are reported separately.
 import fs from 'node:fs';
 import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '../packages/shared/dist/index.js';
 
 const HOST = process.env.HOST ?? 'https://tradingai-bqb1.onrender.com';
 const FOLDS = ['demo', 'live', 'sandbox'];
 const RULE_ID = 'TRA-2379:session-move-ratio';
-const INLINE_MARK = '⚠️ UNVERIFIED';
 const MOVERS_HEADING = '## Top 5 Movers (Watchlist)';
 
 // Creds from `.env` if this checkout has one, else from the process env. A
@@ -57,48 +70,61 @@ function loadEnv() {
 }
 const fileEnv = loadEnv();
 const env = {
-  ADMIN_USERNAME: process.env.ADMIN_USERNAME ?? fileEnv.ADMIN_USERNAME,
-  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD ?? fileEnv.ADMIN_PASSWORD,
+  ADMIN_USERNAME: process.env.ADMIN_USERNAME ?? process.env.TRADING_ADMIN_USERNAME ?? fileEnv.ADMIN_USERNAME,
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD ?? process.env.TRADING_ADMIN_PASSWORD ?? fileEnv.ADMIN_PASSWORD,
 };
+
+/** The generator's row rendering. Must stay byte-identical to `formatMoverMarkdownRow`. */
+function moverRow(m) {
+  const usd = '$' + Math.abs(m.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pct = (m.changePct >= 0 ? '+' : '') + m.changePct.toFixed(2);
+  return `| ${m.symbol} | ${usd} | ${pct}% |`;
+}
+
+/**
+ * Data rows of the served markdown movers table.
+ *
+ * `null` means the table could not be located at all — which must NOT be read as
+ * "zero rows". A missing table and an empty table are different facts and only
+ * one of them is a finding.
+ */
+function markdownRows(markdown) {
+  const lines = markdown.split('\n');
+  const h = lines.findIndex(l => l.trim() === MOVERS_HEADING);
+  if (h === -1) return null;
+  const out = [];
+  for (let i = h + 1; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (l.startsWith('## ')) break;
+    if (l.startsWith('>')) continue;                                  // the note, incl. its own table
+    if (l.startsWith('| Symbol ') || l.startsWith('|---')) continue;  // header rows
+    if (l.startsWith('|')) out.push(l);
+  }
+  return out;
+}
 
 // ── controls (run first; a failed control is BLIND, not a verdict) ────────────
 function selftest() {
   const fails = [];
   // The real 2026-07-21 row. If the rule ever stops calling this suspect, this
   // whole check is grading nothing.
-  const selx = assessQuotePlausibility({ price: 0.34, changePct: 1316.67 });
-  if (!selx.suspect) fails.push('control: SELX 0.34/+1316.67% must be suspect');
-  // And the genuine near-doubling just under the bar must NOT be.
-  const inlf = assessQuotePlausibility({ price: 6.27, changePct: 97.17 });
-  if (inlf.suspect) fails.push('control: INLF 6.27/+97.17% must NOT be suspect');
-  // The markdown grader must actually be able to fail.
-  if (markdownMarks('| SELX | $0.34 | +1316.67% |', { symbol: 'SELX', price: 0.34, changePct: 1316.67 })) {
-    fails.push('control: an UNMARKED row must not grade as marked');
+  const selx = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
+  if (!assessQuotePlausibility(selx).suspect) fails.push('control: SELX 0.34/+1316.67% must be suspect');
+  // And the genuine near-doubling just under the bar must NOT be — under A this
+  // control guards a DELETION, not a badge.
+  const inlf = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
+  if (assessQuotePlausibility(inlf).suspect) fails.push('control: INLF 6.27/+97.17% must NOT be suspect');
+  // The row renderer must reproduce the archived line byte-for-byte, or the
+  // surface check silently degrades to "no suppressed row found in the table",
+  // which reads exactly like a correctly filtered table.
+  if (moverRow(selx) !== '| SELX | $0.34 | +1316.67% |') {
+    fails.push(`control: row renderer drifted — got ${moverRow(selx)}`);
   }
+  // And the table parser must be able to SEE a row, else every artifact grades
+  // as trivially consistent.
+  const probe = markdownRows([MOVERS_HEADING, '| Symbol | Price | Change % |', '|---|---|---|', moverRow(inlf)].join('\n'));
+  if (!probe || probe.length !== 1) fails.push(`control: table parser found ${probe?.length ?? 'null'} rows, expected 1`);
   return fails;
-}
-
-/** Is this mover's row marked in place in the served markdown? */
-function markdownMarks(markdown, m) {
-  const usd = '$' + Math.abs(m.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const pct = (m.changePct >= 0 ? '+' : '') + m.changePct.toFixed(2);
-  const head = `| ${m.symbol} | ${usd} | ${pct}% `;
-  return markdown.split('\n').some(l => l.startsWith(head) && l.includes(INLINE_MARK));
-}
-
-/** Rows in the served markdown movers table — for the not-filtered check. */
-function markdownRowCount(markdown) {
-  const lines = markdown.split('\n');
-  const h = lines.findIndex(l => l.trim() === MOVERS_HEADING);
-  if (h === -1) return null;
-  let n = 0;
-  for (let i = h + 3; i < lines.length; i++) {           // +3 skips heading + 2 header rows
-    const l = lines[i].trim();
-    if (l.startsWith('## ')) break;
-    if (l.startsWith('|') && !l.startsWith('| #')) n++;  // '| #' is the note's own table
-    else if (l.length > 0 && !l.startsWith('>')) break;
-  }
-  return n;
 }
 
 const controlFails = selftest();
@@ -107,6 +133,8 @@ if (controlFails.length > 0) {
   console.error('BLIND — controls failed, no verdict computed');
   process.exit(3);
 }
+
+if (!env.ADMIN_PASSWORD) { console.error('no admin password in env or .env — BLIND'); process.exit(3); }
 
 const login = await fetch(`${HOST}/api/auth/login`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -118,11 +146,12 @@ const H = { Authorization: `Bearer ${token}` };
 
 console.log(`host                 : ${HOST}`);
 console.log(`rule                 : ${RULE_ID}  (SUSPECT_MOVE_RATIO = ${SUSPECT_MOVE_RATIO})`);
-console.log('controls             : 3/3 green');
+console.log('controls             : 4/4 green');
 
 const etToday = new Date(Date.now() - 4 * 3600_000).toISOString().slice(0, 10);
 const findings = [];
-let graded = 0, dirty = 0, stampedRows = 0, anyProvenanceSeen = false, readable = 0;
+let artifacts = 0, stamped = 0, filteredRows = 0, servedRows = 0, filteredArtifacts = 0;
+let anyProvenanceSeen = false;
 
 for (const fold of FOLDS) {
   const list = await fetch(`${HOST}/api/reports?mode=${fold}`, { headers: H });
@@ -134,59 +163,102 @@ for (const fold of FOLDS) {
     let rep;
     try { rep = await r.json(); } catch { continue; }
     const mv = Array.isArray(rep.top5Movers) ? rep.top5Movers : [];
-    if (mv.length === 0) continue;
-    readable++;
-    if (mv.some(m => m.provenance)) anyProvenanceSeen = true;
+    const mp = rep.moversProvenance;
+    // An artifact with neither served rows nor suppressed rows had no movers
+    // table to begin with — not a graded population member.
+    if (mv.length === 0 && !(mp && mp.filteredCount > 0)) continue;
+    artifacts++;
+    if (!mp) continue;                        // counted, ungraded — the NOT_DEPLOYED path
+    anyProvenanceSeen = true;
+    stamped++;
 
-    // NOT FILTERED — both surfaces must carry the same number of rows.
-    if (typeof rep.markdown === 'string' && rep.markdown.length > 0) {
-      const n = markdownRowCount(rep.markdown);
-      if (n !== null && n !== mv.length) {
-        findings.push(`${fold} ${date}: SURFACE DIVERGENCE — ${mv.length} JSON rows vs ${n} markdown rows`);
-      }
+    const where = `${fold} ${date}`;
+    const problems = [];
+    const suppressed = Array.isArray(mp.filtered) ? mp.filtered : [];
+
+    // ── ARITHMETIC ────────────────────────────────────────────────────────────
+    if (mp.servedCount !== mv.length) problems.push(`servedCount=${mp.servedCount} but ${mv.length} rows served`);
+    if (mp.filteredCount !== suppressed.length) problems.push(`filteredCount=${mp.filteredCount} but ${suppressed.length} rows carried`);
+    if (mp.publishedCount !== mp.servedCount + mp.filteredCount) {
+      problems.push(`published ${mp.publishedCount} != served ${mp.servedCount} + filtered ${mp.filteredCount}`);
     }
 
+    // ── SELF-DATING ───────────────────────────────────────────────────────────
+    if (mp.ruleId !== RULE_ID) problems.push(`ruleId=${mp.ruleId}`);
+    if (mp.threshold !== SUSPECT_MOVE_RATIO) problems.push(`threshold=${mp.threshold}`);
+    if (!mp.build || mp.build === 'unknown') problems.push('build SHA missing — the stamp is not self-dating');
+
+    // ── FILTER EFFECTIVE: nothing suspect may survive into the served array ───
     for (let i = 0; i < mv.length; i++) {
-      const m = mv[i];
-      graded++;
-      if (!assessQuotePlausibility({ price: m.price, changePct: m.changePct }).suspect) continue;
-      dirty++;
-      const p = m.provenance;
-      const problems = [];
-      if (!p) problems.push('JSON row carries NO provenance');
-      else {
-        if (p.verdict !== 'suspect') problems.push(`verdict=${p.verdict} (expected suspect)`);
-        if (p.ruleId !== RULE_ID) problems.push(`ruleId=${p.ruleId}`);
-        if (p.threshold !== SUSPECT_MOVE_RATIO) problems.push(`threshold=${p.threshold}`);
-        if (!p.build || p.build === 'unknown') problems.push('build SHA missing — the stamp is not self-dating');
+      const v = assessQuotePlausibility({ price: mv[i].price, changePct: mv[i].changePct });
+      if (v.suspect) {
+        problems.push(`LEAKED — served row #${i + 1} ${mv[i].symbol} ${mv[i].price}/${mv[i].changePct}% is suspect (r=${v.ratio?.toFixed(2)})`);
       }
-      if (typeof rep.markdown === 'string' && rep.markdown.length > 0) {
-        if (!markdownMarks(rep.markdown, m)) problems.push('markdown row NOT marked in place');
-        if (!rep.markdown.includes(RULE_ID)) problems.push('markdown note missing the rule id');
-      }
-      // NOT RE-RANKED: the ruling says #1 stays #1, flagged.
-      if (i !== 0 && mv.slice(0, i).every(x => !assessQuotePlausibility({ price: x.price, changePct: x.changePct }).suspect)) {
-        problems.push(`suspect row sits at rank ${i + 1} behind only clean rows — was it demoted?`);
-      }
-      if (problems.length === 0) stampedRows++;
-      else findings.push(`${fold} ${date} #${i + 1} ${m.symbol} ${m.price}/${m.changePct}%: ${problems.join('; ')}`);
     }
+
+    // ── NOT OVER-FILTERED: everything suppressed must be genuinely suspect ────
+    for (const s of suppressed) {
+      const v = assessQuotePlausibility({ price: s.price, changePct: s.changePct });
+      if (!v.suspect) {
+        problems.push(`OVER-FILTERED — suppressed ${s.symbol} ${s.price}/${s.changePct}% is NOT suspect (r=${v.ratio?.toFixed(2)}) — a genuine mover was deleted`);
+      }
+      if (s.provenance?.verdict !== 'suspect') problems.push(`suppressed ${s.symbol} carries verdict=${s.provenance?.verdict}`);
+    }
+
+    // ── BOTH SURFACES ─────────────────────────────────────────────────────────
+    if (typeof rep.markdown === 'string' && rep.markdown.length > 0) {
+      const rows = markdownRows(rep.markdown);
+      if (rows === null) {
+        // The note itself must then say the table was unlocatable — an
+        // unexplained missing table is a finding, an explained one is not.
+        if (!rep.markdown.includes('could not be located in this stored document')) {
+          problems.push('markdown movers table not found and the note does not say so');
+        }
+      } else {
+        if (rows.length !== mv.length) {
+          problems.push(`SURFACE DIVERGENCE — ${mv.length} JSON rows vs ${rows.length} markdown rows`);
+        }
+        for (const s of suppressed) {
+          if (rows.some(l => l === moverRow(s))) {
+            problems.push(`HALF-FILTERED — ${s.symbol} suppressed from JSON but STILL RENDERED in the markdown table`);
+          }
+        }
+      }
+      if (!rep.markdown.includes(RULE_ID)) problems.push('markdown note missing the rule id');
+      if (!rep.markdown.includes(String(mp.build))) problems.push('markdown note missing the build SHA');
+
+      // ── DISTINGUISHABLE: filtered and clean must not read the same ──────────
+      if (mp.filteredCount > 0) {
+        if (!rep.markdown.includes('SUPPRESSED')) problems.push('filtered artifact does not SAY it was filtered — reads as clean');
+        for (const s of suppressed) {
+          if (!rep.markdown.includes(s.symbol)) problems.push(`note does not name the suppressed row ${s.symbol}`);
+        }
+      } else if (!rep.markdown.includes('row(s) suppressed; this table is as published')) {
+        problems.push('clean artifact does not state its denominator — silence is not an answer');
+      }
+    }
+
+    servedRows += mv.length;
+    filteredRows += suppressed.length;
+    if (suppressed.length > 0) filteredArtifacts++;
+    if (problems.length > 0) findings.push(`${where}: ${problems.join('; ')}`);
   }
 }
 
-console.log(`artifacts readable   : ${readable}`);
-console.log(`rows graded          : ${graded}`);
-console.log(`rows the rule flags  : ${dirty}`);
-console.log(`flagged AND stamped  : ${stampedRows}/${dirty} (both surfaces)`);
+console.log(`artifacts read       : ${artifacts}`);
+console.log(`artifacts stamped    : ${stamped}`);
+console.log(`artifacts filtered   : ${filteredArtifacts}`);
+console.log(`rows served          : ${servedRows}`);
+console.log(`ROWS FILTERED        : ${filteredRows}   <-- the board's bar; zero is a FAIL, not a pass`);
 
-if (readable === 0 || graded === 0) {
-  console.error('BLIND — no top-movers table was readable; a zero here is not a pass');
+if (artifacts === 0) {
+  console.error('\nBLIND — no top-movers table was readable; a zero here is not a pass');
   process.exit(3);
 }
 if (!anyProvenanceSeen) {
-  console.log('\nNOT_DEPLOYED — nothing served carries a provenance stamp.');
+  console.log('\nNOT_DEPLOYED — nothing served carries `moversProvenance`.');
   console.log('This is the honest pre-deploy answer, not a failure: merge is not deploy');
-  console.log('(bqb1 runs autoDeploy=no). Re-run after the deploy that carries the stamp.');
+  console.log('(bqb1 runs autoDeploy=no). Re-run after the deploy that carries the filter.');
   process.exit(2);
 }
 if (findings.length > 0) {
@@ -194,5 +266,15 @@ if (findings.length > 0) {
   for (const f of findings) console.log(`  ${f}`);
   process.exit(1);
 }
-console.log('\nPASS — every row the rule flags is stamped on both surfaces, at its published rank.');
+if (filteredRows === 0) {
+  console.error('\nFAIL — the filter matched ZERO rows across the whole corpus.');
+  console.error('Per the board: "Count the rows filtered and fail at zero." A filter that');
+  console.error('matches nothing is indistinguishable from a clean corpus, and the census');
+  console.error(`says the corpus is not clean. Cross-check with tra2610-archive-scan.mjs:`);
+  console.error('if that still reports dirty artifacts, this filter is not reaching them.');
+  process.exit(1);
+}
+console.log(`\nPASS — ${filteredRows} fabricated row(s) suppressed across ${filteredArtifacts} artifact(s),`);
+console.log('on both surfaces, with the published rows recoverable from the stamp, and every');
+console.log('served artifact stating its own denominator.');
 process.exit(0);

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
-import { annotateReportProvenance, INLINE_SUSPECT_MARK } from './mover-provenance.js';
+import { annotateReportProvenance } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
 import {
   isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO,
@@ -1083,7 +1083,7 @@ describe('read-time provenance against a generated report (TRA-2631)', () => {
   // RENDERED — `formatMoverMarkdownRow` is the same line either way — and because
   // `top5Movers` ranks on `|changePct|`, which is why the fabricated row is at #1
   // in all 64 dirty artifacts.
-  it('locates and marks the row inside a full generator-produced report', () => {
+  it('locates and REMOVES the row inside a full generator-produced report', () => {
     const generated = generateEodReport({
       state: makeEngineState(),
       allClosedPositions: [],
@@ -1104,20 +1104,25 @@ describe('read-time provenance against a generated report (TRA-2631)', () => {
     };
     const out = annotateReportProvenance(archived, PROVENANCE_BUILD);
 
-    // #1 stays #1, flagged, with its published numbers intact.
-    expect(out.top5Movers[0]!.symbol).toBe('SELX');
-    expect(out.top5Movers[0]!.provenance!.verdict).toBe('suspect');
-    expect(out.top5Movers).toHaveLength(archived.top5Movers.length);
+    // #1 is SUPPRESSED, and its published numbers survive in the audit field.
+    expect(out.top5Movers.some(m => m.symbol === 'SELX')).toBe(false);
+    expect(out.top5Movers).toHaveLength(archived.top5Movers.length - 1);
+    expect(out.moversProvenance!.filteredCount).toBe(1);
+    expect(out.moversProvenance!.publishedCount).toBe(archived.top5Movers.length);
+    expect(out.moversProvenance!.filtered[0]!.symbol).toBe('SELX');
+    expect(out.moversProvenance!.filtered[0]!.changePct).toBe(1316.67);
+    expect(out.moversProvenance!.filtered[0]!.provenance!.verdict).toBe('suspect');
 
     const outLines = out.markdown.split('\n');
-    const selxIdx = outLines.findIndex(l => l.startsWith('| SELX '));
     const noteIdx = outLines.findIndex(l => l.includes('PROVENANCE'));
     const nextHeadingIdx = outLines.findIndex((l, i) => i > outLines.indexOf(MOVERS_MARKDOWN_HEADING) && l.startsWith('## '));
 
-    expect(outLines[selxIdx]).toContain(INLINE_SUSPECT_MARK);
+    // Gone from the rendered table too — this is the both-surfaces assertion
+    // against a real ~11k-char document, not the module's own fixture.
+    expect(outLines.some(l => l.startsWith('| SELX '))).toBe(false);
     // The note lands INSIDE the movers section — not orphaned at the end of a
     // document whose next dozen headings would bury it.
-    expect(noteIdx).toBeGreaterThan(selxIdx);
+    expect(noteIdx).toBeGreaterThan(outLines.indexOf(MOVERS_MARKDOWN_HEADING));
     expect(noteIdx).toBeLessThan(nextHeadingIdx);
     // Nothing else in the document moved.
     expect(out.markdown).toContain('# Daily EOD Report');

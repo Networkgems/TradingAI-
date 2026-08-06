@@ -9495,16 +9495,20 @@ function resolveCryptoReportMode(req: express.Request, username: string): Crypto
   return cryptoModeKey(getSettings(username));
 }
 
-// TRA-2631 / TRA-3063 (ruling B) — stamp every stock EOD report on its way OUT.
+// TRA-2631 (board ruling A, TRA-3020 card `09bee410`) — FILTER AND STAMP every
+// stock EOD report on its way OUT.
 //
 // 64 of 105 stored top-movers tables carry a fabricated row at #1, TRA-2610 fixed
 // GENERATION only, and regeneration is unavailable (no per-symbol quote tape is
-// retained). The ruling is FLAG, DO NOT FILTER: the stamp is additive, the stored
-// file is never rewritten, and no row is dropped, re-ranked or renumbered.
+// retained). The board ruling is READ-TIME FILTER + PROVENANCE STAMP on both
+// surfaces, superseding the earlier TRA-3063 ruling of B (flag-only): a `suspect`
+// row is SUPPRESSED from the response, the stored file is still never rewritten,
+// and the response carries `moversProvenance` saying how many rows were removed
+// and which — so a filtered report cannot read like a clean one.
 //
 // Applied at the RESPONSE BOUNDARY, not in the readers, so every path that serves
 // an `EodReport` is covered by one call each and a new branch cannot quietly ship
-// an unstamped surface. `annotateReportProvenance` is a no-op on a report with no
+// an unfiltered surface. `annotateReportProvenance` is a no-op on a report with no
 // movers, so journal calendar cells are unaffected.
 function stampMoverProvenance<T extends { top5Movers?: EodMover[]; markdown?: string }>(report: T): T {
   const build = resolveBuildInfo();

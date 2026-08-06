@@ -684,6 +684,18 @@ tr:hover td { background: var(--bg-hover); }
   cursor: help;
 }
 
+/* TRA-2631 (board ruling A) — the table-level suppression notice. Styled to read
+   as a caveat ON the table rather than as another mover: it is the only thing on
+   this surface that distinguishes a filtered table from a genuinely clean one, so
+   it must not be mistakable for a data row. */
+.eod-movers-filtered {
+  cursor: help;
+  font-size: 0.85em;
+  font-style: italic;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
 .eod-trades { display: flex; flex-direction: column; gap: 0.4rem; }
 
 .eod-generated {

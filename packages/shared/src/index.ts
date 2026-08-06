@@ -3959,15 +3959,20 @@ export interface EodTradeEntry {
  *  - **ADDITIVE and READ-TIME ONLY.** It is never persisted. The stored file is
  *    the published record of what we served on that date and is left byte-intact;
  *    only the RESPONSE carries the stamp.
- *  - **NON-BEHAVIOURAL.** No row is dropped, re-ranked or renumbered. #1 stays
- *    #1, flagged. Re-ranking is option A wearing a different hat, and A was
- *    declined — a read-time filter would make a fabricated headline QUIET, and
- *    every ticket in this family (TRA-2610, TRA-2634, TRA-2631) exists because
- *    somebody SAW a bad row at #1.
  *  - **SELF-DATING.** `ruleId` + `threshold` + `build` say WHICH rule said so and
  *    from WHICH build, so a later threshold change re-annotates rather than
  *    silently contradicts. A stamp that just said `suspect` would inherit the
- *    "same URL answers differently after a deploy" objection that killed A.
+ *    "same URL answers differently after a deploy" objection.
+ *
+ * ⚠️ **SUPERSEDED SCOPE — the board ruled A, 2026-08-06 (TRA-3020 card
+ * `09bee410`).** The earlier CTO ruling on TRA-3063 was B (flag, do not filter)
+ * and this type shipped under it. The board has since selected **A: read-time
+ * FILTER plus the provenance stamp, on BOTH surfaces.** So a `verdict: 'suspect'`
+ * row is now **SUPPRESSED** from `top5Movers` rather than served with a badge,
+ * and this stamp survives on it inside `MoversFilterProvenance.filtered` — which
+ * is where a suppressed row's published numbers remain recoverable. Rows that are
+ * SERVED still carry this stamp; only `'plausible'` and `'unassessable'` verdicts
+ * can now appear on a served row.
  */
 export interface MoverProvenance {
   /** Which rule produced this verdict. See `MOVER_PROVENANCE_RULE_ID`. */
@@ -4001,6 +4006,59 @@ export interface EodMover {
    * published record. Optional because every persisted row lacks it.
    */
   provenance?: MoverProvenance;
+}
+
+/**
+ * TRA-2631 — the REPORT-LEVEL read-time filter stamp. Board ruling A
+ * (TRA-3020 card `09bee410`, 2026-08-06): *read-time filter + provenance stamp on
+ * BOTH surfaces.*
+ *
+ * ── Why a report-level stamp is the load-bearing half of A ────────────────────
+ * The filter alone would be a REGRESSION in observability, and the board said so
+ * in the ruling's own words: *"A silently-filtered report and a genuinely-clean
+ * one must not read identically."* Drop `SELX +1,316.67%` from the 2026-07-21
+ * response and what remains is a four-row table that looks exactly like a table
+ * that always had four good rows. That is the same instrument failure the whole
+ * TRA-2610/2634/2631 family is about, just relocated from the archive to the
+ * filter.
+ *
+ * So every stamped response states its own DENOMINATOR: `publishedCount` (what
+ * the stored artifact holds), `servedCount` (what we handed you), and
+ * `filteredCount` (the difference). It is present on a CLEAN report too, reading
+ * `filteredCount: 0` — **absence of this object means the report was never passed
+ * through the filter at all, which is a different fact from "nothing was
+ * filtered"**, and the two must not be collapsed.
+ *
+ * `filtered` carries the suppressed rows VERBATIM as published, each with its
+ * `MoverProvenance`. Nothing is destroyed by the filter: the row is demoted out
+ * of the headline and into the audit field, and the stored file on disk is still
+ * byte-intact. That is what keeps a past citation of a published report
+ * verifiable.
+ */
+export interface MoversFilterProvenance {
+  /** Which rule decided. See `MOVER_PROVENANCE_RULE_ID`. */
+  ruleId: string;
+  /** The rule's threshold at filter time (`SUSPECT_MOVE_RATIO`). */
+  threshold: number;
+  /** Short commit SHA of the build that filtered, or `'unknown'`. */
+  build: string;
+  /** Rows in the STORED artifact, before the filter. The denominator. */
+  publishedCount: number;
+  /** Rows in the served `top5Movers` array, after the filter. */
+  servedCount: number;
+  /**
+   * `publishedCount - servedCount`. **Zero is a real, reportable answer** — it
+   * means the filter ran and matched nothing, NOT that the filter was skipped.
+   * `scripts/tra2631-provenance-stamp-check.mjs` fails corpus-wide at zero,
+   * because a filter that never matches reads exactly like a clean corpus.
+   */
+  filteredCount: number;
+  /**
+   * The suppressed rows, with their published `price`/`changePct` untouched and
+   * their `provenance` verdict attached. This is the recoverability guarantee:
+   * the response still contains what was removed and why.
+   */
+  filtered: EodMover[];
 }
 
 export interface EodSignalAccuracy {
@@ -4110,6 +4168,17 @@ export interface EodReport {
 
   // Market
   top5Movers: EodMover[];
+  /**
+   * TRA-2631 — READ-TIME ONLY, **never persisted**. Attached by
+   * `annotateReportProvenance` at the response boundary under board ruling A.
+   *
+   * When present, `top5Movers` above has already had its fabricated rows
+   * SUPPRESSED and this field says how many and which. When ABSENT, this report
+   * did not go through the filter — which is not the same as "nothing was
+   * filtered" (that case is present-with-`filteredCount: 0`). Readers must not
+   * treat the two identically.
+   */
+  moversProvenance?: MoversFilterProvenance;
 
   // Signal accuracy
   signalAccuracy: EodSignalAccuracy;

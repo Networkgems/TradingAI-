@@ -63,6 +63,30 @@ const grade = mv => mv
   .map((m, i) => ({ i, m, v: assessQuotePlausibility({ price: m.price, changePct: m.changePct }) }))
   .filter(x => x.v.suspect);
 
+// ⛔ TRA-2631 (board ruling A) — RECONSTRUCT THE PUBLISHED TABLE BEFORE GRADING.
+//
+// This census grades the ARCHIVE, and it reads it through `/api/reports/{date}`.
+// Once the read-time filter is live, that route no longer serves the fabricated
+// rows — so grading `top5Movers` alone would report **0 of 105 dirty** and read
+// exactly like "the archive is clean". It would be the same instrument failure
+// this census exists to detect, inflicted on the census by its own remedy.
+//
+// The filter is non-destructive precisely so this stays measurable: a suppressed
+// row survives verbatim in `moversProvenance.filtered`. Re-uniting the two gives
+// back the PUBLISHED table — what the stored file holds — which is the population
+// this census has always been about.
+//
+// Order matters for the `#1` statistic: `top5Movers` ranks on `|changePct|`, and
+// the fabricated rows are at #1 *because* they are the biggest moves. Re-sorting
+// on the same key restores their published rank rather than appending them last.
+function publishedMovers(rep) {
+  const served = Array.isArray(rep.top5Movers) ? rep.top5Movers : [];
+  const filtered = Array.isArray(rep.moversProvenance?.filtered) ? rep.moversProvenance.filtered : [];
+  if (filtered.length === 0) return { mv: served, reconstructed: false };
+  const mv = [...served, ...filtered].sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+  return { mv, reconstructed: true };
+}
+
 // ── the archive sweep ─────────────────────────────────────────────────────────
 // ET date is excluded: `/api/reports/{date}` for TODAY is GENERATED LIVE from the
 // running (post-fix) engine, not read off disk, so it is not an archive artifact.
@@ -96,6 +120,7 @@ if (dates.length === 0) {
 }
 
 let unreadable = 0;
+let reconstructedArtifacts = 0;
 const foldRows = [];          // every (date, fold) hit, including aliases
 const artifacts = new Map();  // identity -> { date, folds[], mv, flagged }
 for (const date of dates) {
@@ -103,7 +128,8 @@ for (const date of dates) {
     const got = await readReport(`/api/reports/${date}${qs(fold)}`);
     if (got.kind === 'absent') continue;
     if (got.kind === 'unreadable') { unreadable++; console.error(`  ! ${date} ${label(fold)}: ${got.why}`); continue; }
-    const mv = got.rep.top5Movers;
+    const { mv, reconstructed } = publishedMovers(got.rep);
+    if (reconstructed) reconstructedArtifacts++;
     if (!Array.isArray(mv) || mv.length === 0) continue;
     foldRows.push({ date, fold });
     // Identity = the bytes that make it the same published artifact.
@@ -131,6 +157,7 @@ console.log(`DISTINCT artifacts   : ${all.length}`);
 console.log(`  carrying a fabricated row : ${dirty.length}`);
 console.log(`  with it at #1             : ${dirtyFirst.length}`);
 console.log(`unreadable fold hits : ${unreadable}`);
+console.log(`reconstructed reads  : ${reconstructedArtifacts}  <-- TRA-2631 read-time filter was ACTIVE on these; graded on the PUBLISHED table (served + moversProvenance.filtered), not on what was served`);
 console.log(`controls             : non-empty-readable=${sawNonEmpty} clean-table-exists=${sawClean} clean-row-exists=${sawCleanRow}`);
 
 if (!sawNonEmpty) { console.error('BLIND — no non-empty stored table was readable; a zero here means nothing.'); process.exit(3); }
@@ -149,12 +176,19 @@ console.log('\n=== /api/reports/latest, per fold (graded) ===');
 for (const fold of FOLDS) {
   const got = await readReport(`/api/reports/latest${qs(fold)}`);
   if (got.kind !== 'ok') { console.log(`  ${label(fold).padEnd(8)} ${got.kind}${got.why ? ` (${got.why})` : ''}`); continue; }
-  const mv = got.rep.top5Movers;
+  const { mv, reconstructed } = publishedMovers(got.rep);
   if (!Array.isArray(mv) || mv.length === 0) { console.log(`  ${label(fold).padEnd(8)} date=${got.rep.date} (no movers)`); continue; }
   const f = grade(mv);
   const head = f.some(x => x.i === 0);
+  // `suppressed` is what a HUMAN on this fold now actually sees removed. The
+  // `FABRICATED AT #1` verdict is about the PUBLISHED artifact and stays true
+  // after the filter ships — the row is still in the file, it is just no longer
+  // served. Reporting only one of the two would be misleading in either
+  // direction, so both are printed.
+  const suppressed = got.rep.moversProvenance?.filteredCount ?? 0;
   console.log(`  ${label(fold).padEnd(8)} date=${got.rep.date}  #1=${mv[0].symbol} $${mv[0].price} ${Number(mv[0].changePct).toFixed(2)}%` +
-    `  suspect=${f.length}/${mv.length}  ${head ? '*** FABRICATED AT #1 ***' : 'headline clean'}`);
+    `  suspect=${f.length}/${mv.length}  ${head ? '*** FABRICATED AT #1 ***' : 'headline clean'}` +
+    `${reconstructed ? `  [read-time filter SUPPRESSED ${suppressed} — served headline is ${got.rep.top5Movers[0]?.symbol ?? '(none left)'}]` : ''}`);
 }
 
 console.log('\n=== distinct dirty artifacts, worst first ===');

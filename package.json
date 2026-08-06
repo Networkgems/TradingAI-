@@ -59,7 +59,9 @@
     "check:theo-arb:controls": "node scripts/check-theo-arb.mjs --selftest",
     "check:tra3010-gate-a": "node scripts/check-tra3010-gate-a.mjs",
     "check:tra3010-gate-a:controls": "node scripts/check-tra3010-gate-a-selftest.mjs",
-    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-data-dir.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && node scripts/check-theo-arb.mjs --selftest && node scripts/check-tra3010-gate-a-selftest.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
+    "check:mover-filter": "node scripts/tra2631-provenance-stamp-check.mjs",
+    "check:mover-filter:controls": "node scripts/tra2631-provenance-stamp-check-selftest.mjs",
+    "pretest": "node scripts/check-stale-js.mjs && node scripts/check-data-dir.mjs && node scripts/check-cycles.mjs && node --test scripts/lib/render-boot-set.test.mjs && node --test scripts/lib/auth-secret-predicate.test.mjs && node --test scripts/lib/tra2399-live-instrument-grade.test.mjs && node scripts/tra2387-auth-secret-gate-check.mjs && node scripts/check-theo-arb.mjs --selftest && node scripts/check-tra3010-gate-a-selftest.mjs && node scripts/tra2631-provenance-stamp-check-selftest.mjs && pnpm --filter @trading-app/shared build && pnpm --filter @trading-app/engine build && pnpm --filter @trading-app/backtest build",
     "test": "pnpm -r test"
   },
   "devDependencies": {
