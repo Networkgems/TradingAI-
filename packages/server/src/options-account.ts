@@ -1532,6 +1532,17 @@ export class PaperOptionsAccount {
    * Fire-and-forget on the same {@link journalWrites} chain as open/close, so a
    * journal failure can never reach the execution path, and the OPEN → PARTIAL →
    * CLOSE append order is preserved.
+   *
+   * TRA-3035 — a dropped slice is WARNED, on both arms, for the same reason the
+   * close path is (TRA-2937): `recordOptionTradePartialClose` answers a bare
+   * `false` and the census counts only rows that got written, so
+   * `journalPartialCloses: 0` reads IDENTICALLY for "no partial occurred" and
+   * "a partial occurred and was thrown away". The live 2026-08-05 `admin` day
+   * cell was the second of those and could only be told apart by digging the
+   * order tape. The two arms carry DIFFERENT messages on purpose: `no OPEN row`
+   * is the writer-side hole, `already closed` is a slice arriving after the
+   * close row (which would be subtracted from a total that never contained it).
+   * A grep that cannot separate them cannot tell you which defect fired.
    */
   private queueJournalPartial(
     position: OptionPosition,
@@ -1548,12 +1559,41 @@ export class PaperOptionsAccount {
       // time: a reconcile-adopted import installs its rebinding from an earlier
       // task on this same chain, so reading it here is what guarantees the two
       // are ordered without a lock.
-      .then(() => recordOptionTradePartialClose(this.journalIdFor(id), {
-        ts,
-        realizedPnlUsd,
-        contracts,
-        exitReason,
-      }))
+      .then(async () => {
+        const journalId = this.journalIdFor(id);
+        const rec = await getOptionTradeJournalRecord(journalId);
+        if (!rec) {
+          accountLog.warn('option trade journal partial close dropped: no OPEN row for this id', {
+            issue: 'TRA-3035',
+            id,
+            journalId,
+            optionSymbol: position.optionSymbol,
+            exitReason,
+            contracts,
+            realizedPnlUsd,
+          });
+          return false;
+        }
+        if (rec.outcome !== 'OPEN') {
+          accountLog.warn('option trade journal partial close dropped: row already closed', {
+            issue: 'TRA-3035',
+            id,
+            journalId,
+            optionSymbol: position.optionSymbol,
+            outcome: rec.outcome,
+            exitReason,
+            contracts,
+            realizedPnlUsd,
+          });
+          return false;
+        }
+        return recordOptionTradePartialClose(journalId, {
+          ts,
+          realizedPnlUsd,
+          contracts,
+          exitReason,
+        });
+      })
       .catch((err) => {
         accountLog.warn('option trade journal partial emit failed', {
           id,
