@@ -4327,8 +4327,44 @@ export class PaperOptionsAccount {
         }
       }
 
-      // Activate trailing once position reaches the per-strategy threshold.
-      if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + trailActivatePct)) {
+      // TRA-2820 — the unmanaged sentinel is a DECISION, and until now it existed
+      // only as a set of values. `applyImportedRiskThresholds` marks a row
+      // unmanaged by writing `tp1 = Infinity` / `stopLoss = 0` /
+      // `trailingActive = false` and stamping `riskUnmanagedReason` — but nothing
+      // in this loop ever read that stamp. Two of the three writes survive anyway
+      // because they are inert by construction (`isArmedThreshold` rejects both
+      // `Infinity` and `0`). `trailingActive: false` does not survive: it is not a
+      // threshold, it is a LATCH, and the activation branch below re-arms it from
+      // the mark alone.
+      //
+      // That is how `TSLA260911C00555000` ended 2026-08-05 carrying a live
+      // trailing stop at 0.30175. A contract TRA-462 deliberately declined to
+      // risk-manage ran to 0.355, tripped activation, and was handed a stop 13.9%
+      // ABOVE its own mark — one that fires on the very next tick, into precisely
+      // the sub-tick quote microstructure the sentinel exists to keep it out of
+      // (the TRA-361/461 failure), and which then latches `pendingExit` on the
+      // unfillable limit (TRA-2956). The sentinel was re-entered through a side
+      // door.
+      //
+      // So read the stamp here — and DISARM rather than merely decline to arm. A
+      // row can arrive already `trailingActive` from a snapshot written by a build
+      // without this guard, and that stale latch is the live hazard; declining to
+      // arm it a second time would leave it exactly as armed as it already is.
+      if (opt.riskUnmanagedReason) {
+        if (opt.trailingActive || opt.trailingStopPremium !== 0) {
+          accountLog.warn('disarmed a trailing stop on a deliberately UNMANAGED option row', {
+            issue: 'TRA-2820',
+            optionSymbol: opt.optionSymbol,
+            reason: opt.riskUnmanagedReason,
+            wasTrailingActive: opt.trailingActive,
+            wasTrailingStopPremium: opt.trailingStopPremium,
+            mark,
+          });
+          opt.trailingActive = false;
+          opt.trailingStopPremium = 0;
+        }
+      } else if (!opt.trailingActive && mark >= opt.premiumPaid * (1 + trailActivatePct)) {
+        // Activate trailing once position reaches the per-strategy threshold.
         opt.trailingActive = true;
         opt.trailingStopPremium = opt.peakPremium * (1 - trailOffsetPct);
       }
@@ -5909,6 +5945,76 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-2820 — restore the unmanaged STAMP on rows persisted before the field
+   * existed, at the same durable boundary TRA-2957 heals the thresholds.
+   *
+   * Two things depend on the stamp being present, and neither is served by a fix
+   * that only holds for newly-written rows:
+   *
+   *   1. The `checkExits` guard above only disarms a row it can recognise. The
+   *      position that motivated this ticket — `TSLA260911C00555000`, live, zero
+   *      stop, `riskUnmanagedReason: null` — is exactly the row the guard cannot
+   *      see, so without a back-stamp the fix skips the only position currently
+   *      exposed to it.
+   *   2. `summarizeLiveUnmanagedRisk().unexplained` is specified to sit at 0, and
+   *      a legacy row pins it at 1 for the whole life of the position. A detector
+   *      whose floor is 1 cannot report the NEXT dropped schedule — it can only
+   *      be read by hand against `/api/state`.
+   *
+   * ── What must NOT be stamped ────────────────────────────────────────────────
+   * The counter's value is that an unexplained zero stop means "a schedule was
+   * dropped" — the TRA-2820 defect itself. Stamping indiscriminately to clear the
+   * number would destroy the signal and call it a fix. So a row is stamped ONLY
+   * where the sentinel state is faithfully RECONSTRUCTIBLE — i.e. where
+   * `applyImportedRiskThresholds`, run against today's config, provably produces
+   * the state already on disk:
+   *
+   *   • engine-opened rows are never stamped. An engine row always gets a real
+   *     stop at open; a zero there IS the dropped schedule. Stays loud.
+   *   • a row with `engineOriginSleeve` is never stamped — the field means we
+   *     PROVED the engine placed it, and `sub_floor_premium` is documented as
+   *     inapplicable to such a row.
+   *   • a row carrying an ARMED `tp1Premium` alongside its zero stop is never
+   *     stamped: the sentinel writes both legs together, so half a schedule is
+   *     not something this function could have produced. Stays loud.
+   *   • an import at/above `RV_MIN_MARK_FLOOR` with auto-manage ON is never
+   *     stamped — that row should HAVE a schedule. Stays loud. This is the exact
+   *     shape of a genuinely dropped schedule, and it is the one this function
+   *     most has to leave alone.
+   *
+   * The `auto_manage_off` branch reads the CURRENT toggle rather than the value
+   * in force when the row was written, which is the same basis `updateConfig`
+   * already re-applies thresholds on: if the toggle later flips, that path
+   * rewrites both the schedule and this stamp, so a wrong reading self-corrects
+   * rather than persisting.
+   */
+  private stampLegacyUnmanagedRows(): void {
+    for (const opt of this.openOptions.values()) {
+      if (opt.closedAt !== undefined) continue;
+      if (opt.riskUnmanagedReason) continue;
+      if (isArmedThreshold(opt.stopLossPremium)) continue;
+      if (!opt.importedFromTradier) continue;
+      if (opt.engineOriginSleeve) continue;
+      if (isArmedThreshold(opt.tp1Premium)) continue;
+      const reason = !this.autoManageImportedTradierOptions
+        ? 'auto_manage_off'
+        : opt.premiumPaid < RV_MIN_MARK_FLOOR
+          ? 'sub_floor_premium'
+          : undefined;
+      if (!reason) continue;
+      opt.riskUnmanagedReason = reason;
+      accountLog.info('back-stamped the unmanaged reason on a legacy option row', {
+        issue: 'TRA-2820',
+        optionSymbol: opt.optionSymbol,
+        mode: opt.mode ?? 'demo',
+        reason,
+        premiumPaid: opt.premiumPaid,
+        note: 'row predates riskUnmanagedReason; sentinel state reconstructed from current config',
+      });
+    }
+  }
+
+  /**
    * TRA-2820 — live open rows carrying the UNMANAGED sentinel (zero stop,
    * infinite TP1), grouped by the reason they carry it. Published on
    * `/api/health/options-live` so a zero stop on the real-money book is
@@ -6659,6 +6765,7 @@ export class PaperOptionsAccount {
       healPersistedThresholds(o);
       this.openOptions.set(o.id, o);
     }
+    this.stampLegacyUnmanagedRows();
     this.closedOptions = [...snap.closedOptions];
     // TRA-1976 — restore assigned-share inventory (empty for legacy snapshots).
     this.assignedShares.clear();
