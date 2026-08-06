@@ -431,11 +431,15 @@ export type {
 export {
   OptionsRiskBreaker,
   DEFAULT_OPTIONS_BREAKER_PARAMS,
+  // TRA-3086 — the sub-halt THROTTLE stage.
+  MIN_OPTIONS_RISK_THROTTLE,
+  resolveOptionsThrottleBand,
 } from './options/options-risk-breaker.js';
 export type {
   OptionsBreakerParams,
   OptionCloseRecord,
   OptionsBreakerSnapshot,
+  OptionsThrottleBand,
 } from './options/options-risk-breaker.js';
 export type {
   OptionTrend,

@@ -100,9 +100,51 @@
 // (`hasOwnProperty` ⇒ this build stamps it), then `!= null` (⇒ this fill was
 // eligible) — never from `decided === 1`, which pools both populations.
 
+// TRA-3086 (CTO ruling on TRA-2878) — the OPTION-sleeve throttle term.
+//
+// Everything above concerns ONE governor: the equity `DailyRiskGovernor`'s
+// autopilot throttle. That was the whole defect TRA-2878 ruled on. Every
+// consulting chokepoint — option paths included — sized off the EQUITY book's
+// throttle, so an option ticket was trimmed only while the OTHER book sat at
+// exactly two consecutive losses. Meanwhile the options sleeve's own breaker
+// (`OptionsRiskBreaker`) had a HALT and no THROTTLE at all, so there was nothing
+// option-fed to size off even in principle.
+//
+// This module now carries the second term and the rule for combining them:
+//
+//   applied = min(equityTerm, optionTerm)
+//
+// `min` is the composition because BOTH terms are tighten-only in (0, 1], so the
+// min is tighten-only by construction and cannot be gamed by adding a governor:
+// a new term can only ever pull the product down. It also encodes the intended
+// reading directly — either book being in trouble is sufficient to size down, and
+// neither book being in trouble is required to be the reason.
+//
+// The option term is scoped to the option chokepoints ({@link RISK_THROTTLE_OPTION_PATHS}).
+// Letting an options-sleeve drawdown trim an EQUITY ticket would be the exact
+// incoherence TRA-2878 ruled against, run backwards, and would re-couple the two
+// books' risk paths that TRA-1023 deliberately decoupled.
+//
+// It ships DARK behind its OWN flag, not behind `RISK_THROTTLE_SIZING_ENABLED`.
+// That flag is already `demo`-armable, so folding the option term into it would
+// apply an UNRATIFIED band the moment it merged — and the band's numbers are
+// explicitly placeholders (see `DEFAULT_OPTIONS_BREAKER_PARAMS`) pending the
+// distribution this dark period exists to accrue. The decided term is computed
+// and counted on every consult regardless, which is what makes `wouldTrims` move
+// while nothing is applied.
+
 import { MIN_RISK_THROTTLE } from './risk-autopilot.js';
 
 export const RISK_THROTTLE_SIZING_FLAG = 'RISK_THROTTLE_SIZING_ENABLED';
+
+/**
+ * TRA-3086 — the separate arm for the OPTION-sleeve throttle term. Boolean, and
+ * deliberately not the tri-state above: the option term applies only to option
+ * chokepoints, none of which is a live-broker path today, so there is no `demo`
+ * vs `all` distinction for it to express. If an option live path is ever added,
+ * this becomes a scope — and a boolean `true` must then narrow, never widen.
+ */
+export const OPTIONS_RISK_THROTTLE_SIZING_FLAG = 'OPTIONS_RISK_THROTTLE_SIZING_ENABLED';
 
 /**
  * TRA-2333 — how far the sizing consumer is armed.
@@ -215,6 +257,55 @@ export function riskThrottleDecidedMultiplier(throttle: number | null | undefine
   return riskThrottleSizeMultiplier(throttle, true);
 }
 
+/**
+ * TRA-3086 — the chokepoints that size an OPTION ticket, and therefore the only
+ * ones the options-sleeve breaker's throttle may touch.
+ *
+ * Note this is a strict subset of the seven paths and does NOT include the five
+ * non-chokepoint option open paths (defined-risk spreads, wheel CSP/covered-call)
+ * — those never consult any throttle and stamp `NON_CHOKEPOINT_THROTTLE_STAMP`.
+ */
+export const RISK_THROTTLE_OPTION_PATHS = ['options_single_leg', 'options_otm'] as const;
+
+/** Is `path` a chokepoint the options-sleeve throttle applies to? */
+export function isOptionsRiskThrottlePath(path: RiskThrottleSizingPath): boolean {
+  return (RISK_THROTTLE_OPTION_PATHS as readonly string[]).includes(path);
+}
+
+/**
+ * TRA-3086 — is the options-sleeve throttle armed for APPLICATION?
+ *
+ * Off by default and off for anything unrecognised, matching
+ * {@link riskThrottleSizingScope}'s fail-closed reading. Unarmed, the option term
+ * is pinned to 1 and sizing is byte-for-byte the pre-TRA-3086 behaviour; the
+ * DECIDED option term is computed and counted either way.
+ */
+export function isOptionsRiskThrottleSizingArmed(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[OPTIONS_RISK_THROTTLE_SIZING_FLAG];
+  if (typeof raw !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * TRA-3086 — compose two tighten-only throttle terms.
+ *
+ * `min`, with a defensive clamp at 1 so a caller that hands in a term above 1
+ * (a future governor with a looser contract, a mocked value in a test) cannot
+ * LOOSEN sizing through this seam. The floor is deliberately absent: both inputs
+ * are already floored by their own clamps, and re-flooring here would silently
+ * repair a term that should have been caught at its source.
+ *
+ * Exists as a named function rather than a bare `Math.min` at three call sites so
+ * "applied, decided, and stamped are composed the same way" is a property of one
+ * function instead of a convention — the same reason
+ * {@link riskThrottleDecidedMultiplier} exists.
+ */
+export function composeRiskThrottleTerms(equityTerm: number, optionTerm: number): number {
+  const e = Number.isFinite(equityTerm) ? equityTerm : 1;
+  const o = Number.isFinite(optionTerm) ? optionTerm : 1;
+  return Math.min(1, e, o);
+}
+
 // ── Counted-reason telemetry ────────────────────────────────────────────────
 
 /** Which sizing chokepoint consulted the throttle. */
@@ -279,7 +370,62 @@ export interface RiskThrottleSizingPathStats {
   minWouldMultiplier: number | null;
   /** The throttle value seen on the most recent consult. */
   lastThrottle: number | null;
+
+  // ── TRA-3086 — the OPTION-sleeve term, counted separately for ATTRIBUTION ──
+  //
+  // `trims`/`wouldTrims` above are computed from the COMPOSED terms, so once two
+  // governors feed them a non-zero count no longer says WHICH book caused it. The
+  // three fields below are the option leg alone. Without them, "the equity book
+  // was at two losses" and "the option sleeve was 1R down" produce identical
+  // rollups — the pass/fail-indistinguishable shape this registry exists to
+  // prevent, reintroduced by the second input.
+
+  /**
+   * Whether the options-sleeve term was armed for APPLICATION on the most recent
+   * consult of this path. Structurally `false` on every non-option path — the
+   * option term does not apply there at all — which is why
+   * {@link optionWouldTrims} on an equity path must always be 0.
+   */
+  optionArmed: boolean;
+  /**
+   * How many consults the OPTIONS-sleeve throttle alone would have trimmed,
+   * counted from its decided term and therefore independent of `optionArmed`.
+   * This is the dark-observation counter TRA-3086 ships for; QuantTrader reads it
+   * (with {@link minOptionWouldMultiplier}) to pick the band before it is armed.
+   */
+  optionWouldTrims: number;
+  /** The smallest DECIDED option-sleeve term seen since boot (null ⇒ never below 1). */
+  minOptionWouldMultiplier: number | null;
+  /**
+   * The raw `OptionsRiskBreaker.riskThrottle()` reading on the most recent
+   * consult, or `null` on a path the option term does not apply to. The `null` is
+   * load-bearing: it distinguishes "not an option chokepoint" from "an option
+   * chokepoint whose sleeve read 1.0".
+   */
+  lastOptionThrottle: number | null;
 }
+
+/**
+ * TRA-3086 — the OPTION-sleeve leg of one sizing consult.
+ *
+ * A discriminated union rather than a nullable bag: `applies: false` is the
+ * complete statement for a non-option chokepoint, and it is impossible to write
+ * one that carries a throttle reading it should not have.
+ */
+export type OptionThrottleConsult =
+  | {
+      /** This chokepoint sizes an option ticket, so the sleeve's throttle reaches it. */
+      applies: true;
+      /** Whether the option term was armed for APPLICATION on this consult. */
+      armed: boolean;
+      /** The raw `OptionsRiskBreaker.riskThrottle()` reading. */
+      throttle: number;
+      /** The APPLIED option term (1 whenever `armed` is false). */
+      multiplier: number;
+      /** The DECIDED option term — the clamp with `armed` pinned true. */
+      decided: number;
+    }
+  | { applies: false };
 
 const pathStats = new Map<RiskThrottleSizingPath, RiskThrottleSizingPathStats>();
 
@@ -291,10 +437,23 @@ const pathStats = new Map<RiskThrottleSizingPath, RiskThrottleSizingPathStats>()
  * report `wouldTrims: 0` on an unarmed path — reinstating, silently, the exact
  * false zero this field exists to remove. Required makes it a compile error at
  * every call site instead.
+ *
+ * TRA-3086 — `option` is REQUIRED for exactly the same reason. `multiplier` and
+ * `decided` are now COMPOSED across two governors, so a call site that computed
+ * the option term and forgot to report it would leave `optionWouldTrims: 0` next
+ * to a `wouldTrims` the option sleeve had just moved — an attribution that is not
+ * merely absent but actively wrong. Pass `{ applies: false }` for a path the
+ * option term does not reach; that is a statement, not a default.
  */
 export function recordRiskThrottleSizing(
   path: RiskThrottleSizingPath,
-  detail: { armed: boolean; throttle: number; multiplier: number; decided: number },
+  detail: {
+    armed: boolean;
+    throttle: number;
+    multiplier: number;
+    decided: number;
+    option: OptionThrottleConsult;
+  },
 ): void {
   const cur = pathStats.get(path) ?? {
     armed: false,
@@ -304,6 +463,10 @@ export function recordRiskThrottleSizing(
     wouldTrims: 0,
     minWouldMultiplier: null,
     lastThrottle: null,
+    optionArmed: false,
+    optionWouldTrims: 0,
+    minOptionWouldMultiplier: null,
+    lastOptionThrottle: null,
   };
   cur.armed = detail.armed;
   cur.consults += 1;
@@ -320,6 +483,17 @@ export function recordRiskThrottleSizing(
     cur.minWouldMultiplier = cur.minWouldMultiplier === null
       ? detail.decided
       : Math.min(cur.minWouldMultiplier, detail.decided);
+  }
+  // TRA-3086 — the OPTION leg alone, so a composed `wouldTrims` stays attributable.
+  if (detail.option.applies) {
+    cur.optionArmed = detail.option.armed;
+    cur.lastOptionThrottle = Number.isFinite(detail.option.throttle) ? detail.option.throttle : null;
+    if (detail.option.decided < 1) {
+      cur.optionWouldTrims += 1;
+      cur.minOptionWouldMultiplier = cur.minOptionWouldMultiplier === null
+        ? detail.option.decided
+        : Math.min(cur.minOptionWouldMultiplier, detail.option.decided);
+    }
   }
   pathStats.set(path, cur);
 }
@@ -363,6 +537,27 @@ export interface RiskThrottleSizingSnapshot {
    *                                        governor.
    */
   totalWouldTrims: number;
+  /**
+   * TRA-3086 — how far the OPTIONS-sleeve throttle term is armed. Separate from
+   * {@link armedScope}: the two governors arm independently, and a surface that
+   * reported only one of them could not tell an option-armed build from an
+   * equity-armed one.
+   */
+  optionsArmed: boolean;
+  /** TRA-3086 — the env key that arms the option term. */
+  optionsFlag: string;
+  /**
+   * TRA-3086 — total consults the OPTIONS-sleeve throttle alone would have
+   * trimmed since boot. Read against {@link totalWouldTrims}, which is composed:
+   *
+   *   • `totalOptionWouldTrims: 0` with `totalWouldTrims > 0` ⇒ every dark trim so
+   *     far came from the EQUITY governor — i.e. TRA-2878's original defect, still
+   *     the only thing moving.
+   *   • `> 0` ⇒ the sleeve entered its own band. THIS is the number that says the
+   *     throttle stage is reachable by the book it governs, and the denominator
+   *     TRA-2331's `n(T)` was missing.
+   */
+  totalOptionWouldTrims: number;
   /** Per-chokepoint breakdown (only paths that were consulted appear). */
   byPath: Partial<Record<RiskThrottleSizingPath, RiskThrottleSizingPathStats>>;
 }
@@ -373,11 +568,13 @@ export function snapshotRiskThrottleSizing(env: NodeJS.ProcessEnv = process.env)
   let totalConsults = 0;
   let totalTrims = 0;
   let totalWouldTrims = 0;
+  let totalOptionWouldTrims = 0;
   for (const [path, stats] of pathStats) {
     byPath[path] = { ...stats };
     totalConsults += stats.consults;
     totalTrims += stats.trims;
     totalWouldTrims += stats.wouldTrims;
+    totalOptionWouldTrims += stats.optionWouldTrims;
   }
   return {
     flag: RISK_THROTTLE_SIZING_FLAG,
@@ -385,6 +582,9 @@ export function snapshotRiskThrottleSizing(env: NodeJS.ProcessEnv = process.env)
     totalConsults,
     totalTrims,
     totalWouldTrims,
+    optionsFlag: OPTIONS_RISK_THROTTLE_SIZING_FLAG,
+    optionsArmed: isOptionsRiskThrottleSizingArmed(env),
+    totalOptionWouldTrims,
     byPath,
   };
 }

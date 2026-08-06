@@ -202,13 +202,19 @@ import {
 } from './risk-autopilot.js';
 // TRA-1001 — the seam that CONSUMES that throttle in per-trade sizing (gated by
 // RISK_THROTTLE_SIZING_ENABLED; tighten-only by construction).
+// TRA-3086 — …and the OPTION-sleeve term that composes with it at the option
+// chokepoints only (`isOptionsRiskThrottlePath`), dark behind its own flag.
 import {
   type RiskThrottleSizingPath,
+  type OptionThrottleConsult,
   riskThrottleSizingScope,
   isRiskThrottleSizingArmedForPath,
   riskThrottleSizeMultiplier,
   riskThrottleDecidedMultiplier,
   recordRiskThrottleSizing,
+  isOptionsRiskThrottlePath,
+  isOptionsRiskThrottleSizingArmed,
+  composeRiskThrottleTerms,
 } from './risk-throttle-sizing.js';
 
 /**
@@ -15697,26 +15703,103 @@ export class SignalEngine {
    * trimmed before the board flips it — and, once armed, whether it ever did.
    */
   private activeRiskSizingMultiplier(path: RiskThrottleSizingPath): number {
-    const scope = riskThrottleSizingScope();
-    // TRA-2333 — the arm decision is now made FROM THE PATH. Under `demo` the
-    // two live-broker chokepoints resolve `armed: false` and size at 1 while the
-    // paper paths trim; the consult is still counted either way, so the dark
-    // observation TRA-2331 step 1 depends on keeps working on both sides.
-    const armed = isRiskThrottleSizingArmedForPath(path, scope);
-    const throttle = this.riskGovernor.getRiskThrottle();
-    const mult = riskThrottleSizeMultiplier(throttle, armed);
-    // TRA-2339 — record the DECIDED term alongside the applied one. `mult` is 1
-    // whenever `armed` is false, so gating the counters on it made `trims`
-    // identically 0 on every unarmed path — which is still every LIVE path under
-    // the current `demo` scope. `decided` is the same clamp with `armed: true`,
-    // so `wouldTrims` moves while the path is dark.
+    const terms = this.riskThrottleTerms(path);
+    // TRA-2339 — record the DECIDED term alongside the applied one. The applied
+    // term is 1 whenever the path is unarmed, so gating the counters on it made
+    // `trims` identically 0 on every unarmed path — which is still every LIVE
+    // path under the current `demo` scope. `decided` is the same clamp with
+    // `armed: true`, so `wouldTrims` moves while the path is dark.
+    //
+    // TRA-3086 — both numbers are now COMPOSED across the equity governor and the
+    // options-sleeve breaker, and `option` carries the sleeve's leg on its own so
+    // a moved counter stays attributable to the book that moved it.
     recordRiskThrottleSizing(path, {
-      armed,
-      throttle,
-      multiplier: mult,
-      decided: riskThrottleDecidedMultiplier(throttle),
+      armed: terms.equityArmed,
+      throttle: terms.equityThrottle,
+      multiplier: terms.applied,
+      decided: terms.decided,
+      option: terms.option,
     });
-    return this.activeSizingMultiplier() * mult;
+    return this.activeSizingMultiplier() * terms.applied;
+  }
+
+  /**
+   * TRA-3086 — every throttle term for one chokepoint, from ONE reading of both
+   * governors. The single derivation behind {@link activeRiskSizingMultiplier}
+   * (which applies it), {@link riskThrottleTermFor} and
+   * {@link riskThrottleDecidedTerm} (which stamp it).
+   *
+   * Extracted rather than mirrored across those three. Before TRA-3086 the applied
+   * and stamped terms were two independent expressions that happened to agree
+   * because both were one line; composing a second governor into each separately
+   * would be three places to keep in sync, and a mirrored gate agrees with itself
+   * right up until it doesn't. The failure would be silent in the worst possible
+   * way: TRA-2331 partitions its graded cohort on `riskThrottleMultiplier < 1`, so
+   * a stamp that drifted from the applied value would grade a number that was
+   * never the one applied — and every row would still look completely ordinary.
+   *
+   * Pure. Records no consult; the caller that applies the term does that.
+   *
+   * The composition is `min(equity, option)`, tighten-only by construction
+   * (see `composeRiskThrottleTerms`). The option leg is scoped to the option
+   * chokepoints: letting an options-sleeve drawdown trim an EQUITY ticket is
+   * TRA-2878's incoherence run backwards, and would re-couple the two books'
+   * risk paths that TRA-1023 deliberately decoupled.
+   */
+  private riskThrottleTerms(path: RiskThrottleSizingPath): {
+    equityThrottle: number;
+    equityArmed: boolean;
+    /** The composed APPLIED term — what sizing actually multiplies by. */
+    applied: number;
+    /** The composed DECIDED term — what it would be with both legs armed. */
+    decided: number;
+    /** The options-sleeve leg alone, for the counted registry. */
+    option: OptionThrottleConsult;
+  } {
+    // TRA-2333 — the arm decision is made FROM THE PATH. Under `demo` the two
+    // live-broker chokepoints resolve `armed: false` and size at 1 while the paper
+    // paths trim; the consult is counted either way, so the dark observation
+    // TRA-2331 step 1 depends on keeps working on both sides.
+    const equityArmed = isRiskThrottleSizingArmedForPath(path, riskThrottleSizingScope());
+    const equityThrottle = this.riskGovernor.getRiskThrottle();
+    const equityApplied = riskThrottleSizeMultiplier(equityThrottle, equityArmed);
+    const equityDecided = riskThrottleDecidedMultiplier(equityThrottle);
+
+    if (!isOptionsRiskThrottlePath(path)) {
+      return {
+        equityThrottle,
+        equityArmed,
+        applied: equityApplied,
+        decided: equityDecided,
+        option: { applies: false },
+      };
+    }
+
+    // TRA-3086 — the sleeve's own stage. DARK behind its OWN flag rather than the
+    // equity scope: that scope is already `demo`-armable, so folding the option
+    // term into it would apply the band the moment this merged — and the band's
+    // numbers are explicit placeholders pending the distribution this dark period
+    // exists to accrue (`DEFAULT_OPTIONS_BREAKER_PARAMS`). The DECIDED term below
+    // is computed regardless, which is what moves `optionWouldTrims` while
+    // nothing is applied.
+    const optionArmed = isOptionsRiskThrottleSizingArmed();
+    const optionThrottle = this.optionsBreaker.riskThrottle();
+    const optionApplied = riskThrottleSizeMultiplier(optionThrottle, optionArmed);
+    const optionDecided = riskThrottleDecidedMultiplier(optionThrottle);
+
+    return {
+      equityThrottle,
+      equityArmed,
+      applied: composeRiskThrottleTerms(equityApplied, optionApplied),
+      decided: composeRiskThrottleTerms(equityDecided, optionDecided),
+      option: {
+        applies: true,
+        armed: optionArmed,
+        throttle: optionThrottle,
+        multiplier: optionApplied,
+        decided: optionDecided,
+      },
+    };
   }
 
   /**
@@ -15733,22 +15816,32 @@ export class SignalEngine {
    * ticket already did and double-counting would corrupt `consults`/`trims`. It
    * reads the same governor state in the same synchronous block, so it returns
    * exactly the term that was applied.
+   *
+   * TRA-3086 — "the throttle term" is now the COMPOSED one, `min(equity, option)`,
+   * because that is the term the sizing call applied. Stamping the equity leg
+   * alone would put a number on the row that was never the multiplier the ticket
+   * was sized by, and TRA-2331 partitions its cohort on exactly this field.
    */
   private riskThrottleTermFor(path: RiskThrottleSizingPath): number {
-    const armed = isRiskThrottleSizingArmedForPath(path, riskThrottleSizingScope());
-    return riskThrottleSizeMultiplier(this.riskGovernor.getRiskThrottle(), armed);
+    return this.riskThrottleTerms(path).applied;
   }
 
   /**
    * TRA-2339 — the DECIDED throttle term for stamping on the fill: the multiplier
    * {@link riskThrottleTermFor} would have returned had the path been armed.
    *
-   * Takes no `path`, and that is not an oversight. The arming scope is the ONLY
-   * thing that differs between paths here, and the counterfactual is precisely
-   * "what if this path were armed?" — so once `armed` is pinned true, every
-   * consulting chokepoint decides the same term off the same governor reading.
-   * A `path` parameter would imply a per-path decision that does not exist and
-   * would invite someone to re-derive `armed` inside it, which is the bug.
+   * TRA-3086 — it NOW TAKES A `path`, reversing TRA-2339's argument above.
+   *
+   * That argument was sound on its own premise: with one governor, arming scope
+   * was the only thing that differed between paths, so pinning `armed` true made
+   * every chokepoint decide the same term and a `path` parameter would have
+   * implied a per-path decision that did not exist. A second governor makes that
+   * premise false. The options-sleeve term reaches the option chokepoints and
+   * nothing else, so the decided term genuinely differs by path now — and pinning
+   * `armed` true no longer collapses them. The hazard TRA-2339 was guarding
+   * against (someone re-deriving `armed` inside) is closed structurally instead:
+   * this delegates to {@link riskThrottleTerms}, the single derivation the applied
+   * term also comes from, so the two cannot drift apart whatever the path.
    *
    * Pure — like `riskThrottleTermFor`, it records no consult. The sizing call for
    * this ticket already recorded one (carrying this same decided value), and
@@ -15759,8 +15852,8 @@ export class SignalEngine {
    * which is a literal `1` for both terms plus a `null` path, because no arming
    * scope would have trimmed them.
    */
-  private riskThrottleDecidedTerm(): number {
-    return riskThrottleDecidedMultiplier(this.riskGovernor.getRiskThrottle());
+  private riskThrottleDecidedTerm(path: RiskThrottleSizingPath): number {
+    return this.riskThrottleTerms(path).decided;
   }
 
   /**
@@ -15789,10 +15882,11 @@ export class SignalEngine {
       // The throttle term ALONE for this chokepoint — NOT the composed sizing
       // scalar, which also carries `optionCapScale` (see `riskThrottleTermFor`).
       riskThrottleMultiplier: this.riskThrottleTermFor(path),
-      // The counterfactual twin. Under `demo` the option paths ARE armed, so the
-      // two agree; the pair still has to be stamped, because a row where they
-      // agree is only meaningful next to rows where they do not.
-      riskThrottleDecided: this.riskThrottleDecidedTerm(),
+      // The counterfactual twin. Under `demo` the option paths ARE armed for the
+      // EQUITY leg, so that leg agrees; TRA-3086's option leg is dark, so on an
+      // option chokepoint the two now diverge exactly when the sleeve is in its
+      // band — which is the dark cohort this issue ships to make observable.
+      riskThrottleDecided: this.riskThrottleDecidedTerm(path),
       // …and the cohort key that says both numbers came from a real chokepoint.
       riskThrottleSizingPath: path,
     };
@@ -15819,7 +15913,7 @@ export class SignalEngine {
     // the LIVE book this is the only field that carries any information: under
     // `demo`, `equity_live_mirror` resolves `armed: false` by design, so its
     // applied term is pinned at 1 no matter what the autopilot decided.
-    pos.riskThrottleDecided = this.riskThrottleDecidedTerm();
+    pos.riskThrottleDecided = this.riskThrottleDecidedTerm(path);
   }
 
   /** TRA-1001 — test seam: the composed sizing scalar for a given chokepoint. */
@@ -15832,9 +15926,20 @@ export class SignalEngine {
     return this.riskThrottleTermFor(path);
   }
 
-  /** TRA-2339 — test seam: the stamped DECIDED throttle term. */
-  _riskThrottleDecidedTermForTests(): number {
-    return this.riskThrottleDecidedTerm();
+  /** TRA-2339 — test seam: the stamped DECIDED throttle term (TRA-3086: per path). */
+  _riskThrottleDecidedTermForTests(path: RiskThrottleSizingPath): number {
+    return this.riskThrottleDecidedTerm(path);
+  }
+
+  /**
+   * TRA-3086 — test seam: the options-sleeve breaker, so a test can drive the
+   * sleeve into its own throttle band and assert the composition at the option
+   * chokepoints. Exposing the breaker rather than a pre-composed number is
+   * deliberate: a seam that returned the answer could not distinguish "the
+   * composition works" from "the seam computes the same thing twice".
+   */
+  _optionsBreakerForTests(): OptionsRiskBreaker {
+    return this.optionsBreaker;
   }
 
   /** TRA-2375 — test seam: the full three-field throttle stamp for a chokepoint. */

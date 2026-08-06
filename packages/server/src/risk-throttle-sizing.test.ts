@@ -566,31 +566,41 @@ describe('SignalEngine.activeRiskSizingMultiplier — the wiring', () => {
     expect(snap.byPath.equity_live).toMatchObject({ minMultiplier: 0.25, minWouldMultiplier: 0.25 });
   });
 
-  it('the DECIDED stamp is path-blind, records no consult, and matches the counter', () => {
+  it('the DECIDED stamp records no consult and matches the counter', () => {
     // The stamp helper must not double-count (the sizing call already recorded
     // this same decided value), and under `demo` it must report the trim the LIVE
     // path declined to take — that is the whole per-fill dark cohort.
+    //
+    // TRA-3086 — this test was `…is path-blind…`. It no longer is, and the rename
+    // is the point: the decided term now takes a `path` because a SECOND governor
+    // (the options sleeve) reaches only the option chokepoints, so pinning `armed`
+    // true no longer collapses every path onto one number. With an idle sleeve the
+    // option leg is 1 and every path below still agrees, which is what keeps these
+    // equity assertions meaningful; the option-fed divergence is pinned in
+    // `tra2331-autopilot-throttle-is-equity-fed.test.ts`.
     process.env[RISK_THROTTLE_SIZING_FLAG] = 'demo';
     const engine = new SignalEngine({ ...DEFAULT_ACCOUNT_SETTINGS });
     throttleEngine(engine, 0.5);
-    const decided = (): number =>
-      (engine as unknown as { _riskThrottleDecidedTermForTests(): number })
-        ._riskThrottleDecidedTermForTests();
+    const decided = (p: RiskThrottleSizingPath): number =>
+      (engine as unknown as { _riskThrottleDecidedTermForTests(p: RiskThrottleSizingPath): number })
+        ._riskThrottleDecidedTermForTests(p);
     const term = (p: RiskThrottleSizingPath): number =>
       (engine as unknown as { _riskThrottleTermForTests(p: RiskThrottleSizingPath): number })
         ._riskThrottleTermForTests(p);
 
-    expect(decided()).toBe(0.5);
+    expect(decided('equity_live')).toBe(0.5);
     expect(snapshotRiskThrottleSizing().totalConsults).toBe(0); // stamping is not a consult
     // On the live path: applied 1, decided 0.5 ⇒ the would-have-been-trimmed row.
     expect(term('equity_live')).toBe(1);
-    expect(decided() < 1 && term('equity_live') === 1).toBe(true);
+    expect(decided('equity_live') < 1 && term('equity_live') === 1).toBe(true);
     // On the armed demo path the two agree ⇒ it is NOT in the dark cohort.
     expect(term('equity_demo')).toBe(0.5);
-    expect(decided()).toBe(term('equity_demo'));
+    expect(decided('equity_demo')).toBe(term('equity_demo'));
     // And it tracks the counter the sizing call writes.
     mult(engine, 'equity_live');
-    expect(snapshotRiskThrottleSizing().byPath.equity_live!.minWouldMultiplier).toBe(decided());
+    expect(snapshotRiskThrottleSizing().byPath.equity_live!.minWouldMultiplier).toBe(
+      decided('equity_live'),
+    );
   });
 
   // TRA-2375 (parent TRA-2331) — the CHOKEPOINT IDENTITY carried alongside the two
@@ -694,8 +704,15 @@ describe('SignalEngine.activeRiskSizingMultiplier — the wiring', () => {
 });
 
 describe('the since-boot registry', () => {
+  // TRA-3086 — every path exercised in this block is an EQUITY chokepoint, so the
+  // options-sleeve leg genuinely does not reach it. `applies: false` is the whole
+  // statement, and the recorder requires it rather than defaulting: a call site
+  // that silently omitted the leg would report `optionWouldTrims: 0` next to a
+  // composed `wouldTrims` the sleeve had just moved.
+  const NO_OPTION_LEG = { applies: false } as const;
+
   it('separates "never consulted" from "consulted, never trimmed"', () => {
-    recordRiskThrottleSizing('equity_live', { armed: true, throttle: 1, multiplier: 1, decided: 1 });
+    recordRiskThrottleSizing('equity_live', { armed: true, throttle: 1, multiplier: 1, decided: 1, option: NO_OPTION_LEG });
     const snap = snapshotRiskThrottleSizing();
     expect(snap.byPath.equity_live).toMatchObject({ armed: true, consults: 1, trims: 0, minMultiplier: null });
     expect(snap.byPath.equity_demo).toBeUndefined();
@@ -704,8 +721,8 @@ describe('the since-boot registry', () => {
   });
 
   it('keeps the SMALLEST multiplier applied, not the latest', () => {
-    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.3, multiplier: 0.3, decided: 0.3 });
-    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.8, multiplier: 0.8, decided: 0.8 });
+    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.3, multiplier: 0.3, decided: 0.3, option: NO_OPTION_LEG });
+    recordRiskThrottleSizing('equity_demo', { armed: true, throttle: 0.8, multiplier: 0.8, decided: 0.8, option: NO_OPTION_LEG });
     expect(snapshotRiskThrottleSizing().byPath.equity_demo).toMatchObject({
       consults: 2, trims: 2, minMultiplier: 0.3, lastThrottle: 0.8,
     });
@@ -716,8 +733,8 @@ describe('the since-boot registry', () => {
   // governor ratchets DOWN only, so it cannot produce a rising sequence, and the
   // min-keeping this pins belongs to the recorder either way.
   it('keeps the SMALLEST DECIDED multiplier while the path is DARK', () => {
-    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.3, multiplier: 1, decided: 0.3 });
-    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.8, multiplier: 1, decided: 0.8 });
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.3, multiplier: 1, decided: 0.3, option: NO_OPTION_LEG });
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 0.8, multiplier: 1, decided: 0.8, option: NO_OPTION_LEG });
     expect(snapshotRiskThrottleSizing({}).byPath.equity_live).toMatchObject({
       consults: 2,
       trims: 0, minMultiplier: null, // applied: untouched, as the dark path must be
@@ -730,7 +747,7 @@ describe('the since-boot registry', () => {
   it('a decided term of exactly 1 counts as no would-trim', () => {
     // The boundary the whole cohort definition rests on: `< 1`, not `<= 1`. A
     // calm autopilot must not land in the would-have-been-trimmed bucket.
-    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 1, multiplier: 1, decided: 1 });
+    recordRiskThrottleSizing('equity_live', { armed: false, throttle: 1, multiplier: 1, decided: 1, option: NO_OPTION_LEG });
     expect(snapshotRiskThrottleSizing({}).byPath.equity_live).toMatchObject({
       consults: 1, wouldTrims: 0, minWouldMultiplier: null,
     });
