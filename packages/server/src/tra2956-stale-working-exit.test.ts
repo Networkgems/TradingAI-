@@ -513,4 +513,153 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     expect(stats.detachedRows).toBe(0);
     expect(sumByReason(stats.byReason)).toBe(0);
   });
+
+  // ── TRA-3056 — whose cause is it? ────────────────────────────────────────
+  //
+  // TRA-3050's buckets partition `detachedRows`, not `detachedRowsLive`. On a
+  // box carrying paper rows — this one does — a bucket can belong to a paper
+  // position, and the payload could not say which. So the ONE reading the field
+  // was added for (a detached live row with a plausible benign explanation
+  // sitting next to it) was exactly the reading it could get wrong, in the
+  // false-CONFIRMATION direction: benign paper cause, stranded live position.
+
+  /** Latch an unfillable TP1 on one row of `acct`, in `mode`. */
+  function latchIn(
+    acct: PaperOptionsAccount,
+    mode: 'demo' | 'live',
+    symbol: string,
+    optionSymbol: string,
+    strike: number,
+    orderId: number,
+  ): { id: string; optionSymbol: string } {
+    const pos = acct.openOptionFromCandidate(
+      buildSignal({ id: `sig-3056-${mode}`, symbol, optionSymbol, strike, mark: 1.0 }),
+      mode,
+      undefined,
+      400,
+    );
+    expect(pos).not.toBeNull();
+    const staged = acct.checkExits(new Map(), new Map([[optionSymbol, 1.6]]), mode, {
+      waitAndHold: true,
+    });
+    expect(staged).toHaveLength(1);
+    expect(acct.attachPendingExit(pos!.id, orderId, 1.6)).toBe(true);
+    return { id: pos!.id, optionSymbol };
+  }
+
+  /** One account, one paper row and one live row, both latched. The bqb1 shape. */
+  function latchMixedBook() {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const paper = latchIn(acct, 'demo', 'AAPL', 'AAPL240705C00200000', 200, 140276225);
+    const live = latchIn(acct, 'live', 'MSFT', 'MSFT240705C00400000', 400, 140276226);
+    return { acct, paper, live };
+  }
+
+  const staleFor = (acct: PaperOptionsAccount, id: string) =>
+    acct.listStaleWorkingExits().find(s => s.id === id)!;
+
+  it('does not let a paper row explain a detached live position', () => {
+    const { acct, paper, live } = latchMixedBook();
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    // Guard 1 declines on the PAPER row: it has fills, cancelling would strand
+    // them. Benign. The LIVE row gets nothing — no pass reached it, which is
+    // the pre-fix failure and the one state that wants a human.
+    acct.noteStaleWorkingExitHeld(staleFor(acct, paper.id), 'partialFill', 2);
+
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.detachedRows).toBe(2);
+    expect(stats.detachedRowsLive).toBe(1);
+
+    // The all-modes split is the misleading read: one live row detached, and a
+    // `partialFill` sitting next to it that belongs to the paper row.
+    expect(stats.byReason).toMatchObject({ partialFill: 1, unattempted: 1 });
+    // The live split is decisive and says the opposite of the benign reading.
+    expect(stats.byReasonLive).toMatchObject({
+      partialFill: 0,
+      unattempted: 1,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      budgetExhausted: 0,
+    });
+  });
+
+  it('holds the partition invariant on the live buckets too', () => {
+    const { acct, paper, live } = latchMixedBook();
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(staleFor(acct, paper.id), 'partialFill', 2);
+    acct.noteStaleWorkingExitHeld(staleFor(acct, live.id), 'withdrawFailed');
+
+    const stats = acct.getStaleWorkingExitStats();
+    // Each split sums to the row count it partitions — the whole point of the
+    // twin, and the bug is precisely that one sum was being read against the
+    // other's total.
+    expect(sumByReason(stats.byReason)).toBe(stats.detachedRows);
+    expect(sumByReason(stats.byReasonLive)).toBe(stats.detachedRowsLive);
+    // And live is a SUBSET, bucket by bucket. A live bucket exceeding its
+    // all-modes twin would mean the two loops had drifted apart.
+    for (const key of Object.keys(stats.byReason) as (keyof DetachedWorkingExitsByReason)[]) {
+      expect(stats.byReasonLive[key]).toBeLessThanOrEqual(stats.byReason[key]);
+    }
+    expect(stats.byReasonLive).toMatchObject({ withdrawFailed: 1, partialFill: 0 });
+  });
+
+  it('agrees with the all-modes split on an all-live book', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(acct.listStaleWorkingExits()[0], 'clientUnavailable');
+
+    // With no paper row there is nothing to attribute wrongly, so the two are
+    // identical — which is why the gap stayed invisible until a paper row
+    // existed. `detachedRows === detachedRowsLive` is the condition TRA-3044
+    // amendment 13 currently tests before trusting `byReason`.
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.detachedRows).toBe(stats.detachedRowsLive);
+    expect(stats.byReasonLive).toEqual(stats.byReason);
+  });
+
+  it('counts a budget-exhausted row in the live split only when it is live', () => {
+    const { acct, paper, live } = latchMixedBook();
+    // Burn the PAPER row's per-row withdrawal budget, leaving the live row
+    // latched and untouched throughout. The paper row is now permanently
+    // detached — and `budgetExhausted` is the one bucket derived in the gauge
+    // rather than reported by an arm, so it needs the same `isLive` branch the
+    // reported ones take.
+    for (let i = 0; i < MAX_CLEARS_PER_ROW; i += 1) {
+      vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+      acct.noteStaleWorkingExitCleared(staleFor(acct, paper.id));
+      acct.checkExits(new Map(), new Map([[paper.optionSymbol, 1.6]]), 'demo', {
+        waitAndHold: true,
+      });
+      acct.attachPendingExit(paper.id, 900_000 + i, 1.6);
+    }
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.budgetExhausted).toBe(1);
+    expect(stats.budgetExhaustedLive).toBe(0);
+    expect(stats.byReason).toMatchObject({ budgetExhausted: 1, unattempted: 1 });
+    // A permanent paper strand must not be read onto the live row, and the
+    // live row's own state must survive it.
+    expect(stats.byReasonLive).toMatchObject({ budgetExhausted: 0, unattempted: 1 });
+    expect(sumByReason(stats.byReasonLive)).toBe(stats.detachedRowsLive);
+    expect(live.id).not.toBe(paper.id);
+  });
+
+  it('falls back to zero on the live split when the live latch clears', () => {
+    const { acct, paper, live } = latchMixedBook();
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld(staleFor(acct, paper.id), 'partialFill', 2);
+    acct.noteStaleWorkingExitHeld(staleFor(acct, live.id), 'withdrawFailed');
+    expect(acct.getStaleWorkingExitStats().byReasonLive.withdrawFailed).toBe(1);
+
+    // The live withdrawal succeeds on the next tick. The live split must fall
+    // to zero even though the paper row is still latched and still counted.
+    expect(acct.noteStaleWorkingExitCleared(staleFor(acct, live.id))).toBe(true);
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.detachedRowsLive).toBe(0);
+    expect(sumByReason(stats.byReasonLive)).toBe(0);
+    expect(stats.detachedRows).toBe(1);
+    expect(stats.byReason).toMatchObject({ partialFill: 1 });
+  });
 });

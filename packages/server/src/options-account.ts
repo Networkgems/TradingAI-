@@ -765,6 +765,15 @@ export interface StaleWorkingExitHold {
  * carries none. So a detached row sitting in `unattempted` across successive
  * reads means the withdrawal is NOT RUNNING on it — which, before this split,
  * was indistinguishable from a pass that ran and correctly declined.
+ *
+ * TRA-3056 — this shape is published TWICE, as `byReason` (all modes) and
+ * `byReasonLive` (live rows only), because the all-modes buckets partition
+ * `detachedRows` and NOT `detachedRowsLive`. On a box carrying paper rows, a
+ * bucket cannot be attributed to the live position that motivated the read:
+ * `partialFill: 1` next to one detached live row reads as "guard 1 declined,
+ * benign" when the `partialFill` may be the paper row and the live row may be
+ * `unattempted`. That is the same false-CONFIRMATION TRA-3050 was filed
+ * against, one level down. Read `byReasonLive` for a live position.
  */
 export interface DetachedWorkingExitsByReason {
   /** Spent all {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW} withdrawals. Permanent. */
@@ -5327,6 +5336,14 @@ export class PaperOptionsAccount {
    *      {@link DetachedWorkingExitsByReason}: this is the bucket that
    *      distinguishes "the withdrawal never ran" from "it ran and declined",
    *      which is the false-red path TRA-3050 was filed for.
+   *
+   * TRA-3056 — `byReasonLive` is the same five buckets restricted to
+   * `mode === 'live'` rows, and it is the one to read about a live position.
+   * `byReason` partitions `detachedRows`, not `detachedRowsLive`, so whenever
+   * the two differ a bucket may belong to a paper row and the payload alone
+   * could not say which — a reader could take a benign paper `partialFill` as
+   * the explanation for a detached LIVE position that is really `unattempted`.
+   * The live buckets sum to `detachedRowsLive` and are bucket-wise ≤ `byReason`.
    */
   countDetachedWorkingExits(nowMs: number = Date.now()): {
     detachedRows: number;
@@ -5334,12 +5351,20 @@ export class PaperOptionsAccount {
     budgetExhausted: number;
     budgetExhaustedLive: number;
     byReason: DetachedWorkingExitsByReason;
+    byReasonLive: DetachedWorkingExitsByReason;
   } {
     let detachedRows = 0;
     let detachedRowsLive = 0;
     let budgetExhausted = 0;
     let budgetExhaustedLive = 0;
     const byReason: DetachedWorkingExitsByReason = {
+      budgetExhausted: 0,
+      partialFill: 0,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      unattempted: 0,
+    };
+    const byReasonLive: DetachedWorkingExitsByReason = {
       budgetExhausted: 0,
       partialFill: 0,
       withdrawFailed: 0,
@@ -5356,6 +5381,7 @@ export class PaperOptionsAccount {
         budgetExhausted += 1;
         if (isLive) budgetExhaustedLive += 1;
         byReason.budgetExhausted += 1;
+        if (isLive) byReasonLive.budgetExhausted += 1;
         continue;
       }
       // TRA-3050 — a verdict only counts for the latch it was recorded against.
@@ -5363,13 +5389,19 @@ export class PaperOptionsAccount {
       // map, and inheriting it would report the previous order's outcome as if
       // it described this one.
       const hold = this.staleWorkingExitHolds.get(id);
-      if (hold && hold.orderId === String(pending.tradierOrderId)) {
-        byReason[hold.reason] += 1;
-      } else {
-        byReason.unattempted += 1;
-      }
+      const bucket: keyof DetachedWorkingExitsByReason =
+        hold && hold.orderId === String(pending.tradierOrderId) ? hold.reason : 'unattempted';
+      byReason[bucket] += 1;
+      if (isLive) byReasonLive[bucket] += 1;
     }
-    return { detachedRows, detachedRowsLive, budgetExhausted, budgetExhaustedLive, byReason };
+    return {
+      detachedRows,
+      detachedRowsLive,
+      budgetExhausted,
+      budgetExhaustedLive,
+      byReason,
+      byReasonLive,
+    };
   }
 
   /**
@@ -5471,6 +5503,9 @@ export class PaperOptionsAccount {
    * TRA-3050 — `byReason` is the field to read when `detachedRows > 0`. It is
    * what separates a benign decline from a withdrawal that is not running, and
    * before it existed those two had the same outside signature.
+   *
+   * TRA-3056 — and `byReasonLive` is the one to read when the question is about
+   * a LIVE position, because `byReason` covers paper rows too.
    */
   getStaleWorkingExitStats(nowMs: number = Date.now()): {
     clearedTotal: number;
@@ -5481,6 +5516,7 @@ export class PaperOptionsAccount {
     budgetExhausted: number;
     budgetExhaustedLive: number;
     byReason: DetachedWorkingExitsByReason;
+    byReasonLive: DetachedWorkingExitsByReason;
     lastClearedAt: number | null;
     lastCleared: StaleWorkingExit[];
   } {

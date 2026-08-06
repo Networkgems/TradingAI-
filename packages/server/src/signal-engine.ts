@@ -7052,6 +7052,7 @@ export class SignalEngine {
     budgetExhausted: number;
     budgetExhaustedLive: number;
     byReason: import('./options-account.js').DetachedWorkingExitsByReason;
+    byReasonLive: import('./options-account.js').DetachedWorkingExitsByReason;
     lastClearedAt: number | null;
   } {
     let clearedTotal = 0;
@@ -7062,6 +7063,13 @@ export class SignalEngine {
     let budgetExhausted = 0;
     let budgetExhaustedLive = 0;
     const byReason: import('./options-account.js').DetachedWorkingExitsByReason = {
+      budgetExhausted: 0,
+      partialFill: 0,
+      withdrawFailed: 0,
+      clientUnavailable: 0,
+      unattempted: 0,
+    };
+    const byReasonLive: import('./options-account.js').DetachedWorkingExitsByReason = {
       budgetExhausted: 0,
       partialFill: 0,
       withdrawFailed: 0,
@@ -7083,6 +7091,7 @@ export class SignalEngine {
       budgetExhaustedLive += stats.budgetExhaustedLive;
       for (const key of Object.keys(byReason) as (keyof typeof byReason)[]) {
         byReason[key] += stats.byReason[key];
+        byReasonLive[key] += stats.byReasonLive[key];
       }
       if (stats.lastClearedAt !== null && (lastClearedAt === null || stats.lastClearedAt > lastClearedAt)) {
         lastClearedAt = stats.lastClearedAt;
@@ -7097,6 +7106,7 @@ export class SignalEngine {
       budgetExhausted,
       budgetExhaustedLive,
       byReason,
+      byReasonLive,
       lastClearedAt,
     };
   }

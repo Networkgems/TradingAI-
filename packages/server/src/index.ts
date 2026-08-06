@@ -8854,6 +8854,16 @@ app.get('/api/health/options-live', async (_req, res) => {
       // The five sum to `detachedRows`. Server logs under
       // `component: 'stale-working-exit'` carry the per-row detail.
       //
+      // TRA-3056 — if the question is about a LIVE position, read
+      // `byReasonLive`, not `byReason`. The all-modes buckets partition
+      // `detachedRows`, NOT `detachedRowsLive`, so on a box carrying paper rows
+      // (this one does) a bucket can belong to a paper position with nothing in
+      // the payload saying which. `partialFill: 1` beside one detached live row
+      // reads as "guard 1 declined, benign, needs nobody" when the `partialFill`
+      // may be the paper row and the live row may be `unattempted` — the
+      // pre-fix failure, i.e. the same false-CONFIRMATION direction TRA-3050
+      // fixed, one level down. `byReasonLive`'s five sum to `detachedRowsLive`.
+      //
       // Counts only — same TRA-2163 disclosure rule as above.
       staleWorkingExits: getAllUserContexts().reduce(
         (acc, c) => {
@@ -8873,6 +8883,14 @@ app.get('/api/health/options-live', async (_req, res) => {
               clientUnavailable: acc.byReason.clientUnavailable + s.byReason.clientUnavailable,
               unattempted: acc.byReason.unattempted + s.byReason.unattempted,
             },
+            byReasonLive: {
+              budgetExhausted: acc.byReasonLive.budgetExhausted + s.byReasonLive.budgetExhausted,
+              partialFill: acc.byReasonLive.partialFill + s.byReasonLive.partialFill,
+              withdrawFailed: acc.byReasonLive.withdrawFailed + s.byReasonLive.withdrawFailed,
+              clientUnavailable:
+                acc.byReasonLive.clientUnavailable + s.byReasonLive.clientUnavailable,
+              unattempted: acc.byReasonLive.unattempted + s.byReasonLive.unattempted,
+            },
             lastClearedAt:
               s.lastClearedAt !== null && (acc.lastClearedAt === null || s.lastClearedAt > acc.lastClearedAt)
                 ? s.lastClearedAt
@@ -8888,6 +8906,13 @@ app.get('/api/health/options-live', async (_req, res) => {
           budgetExhausted: 0,
           budgetExhaustedLive: 0,
           byReason: {
+            budgetExhausted: 0,
+            partialFill: 0,
+            withdrawFailed: 0,
+            clientUnavailable: 0,
+            unattempted: 0,
+          },
+          byReasonLive: {
             budgetExhausted: 0,
             partialFill: 0,
             withdrawFailed: 0,
