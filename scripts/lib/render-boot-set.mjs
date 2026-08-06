@@ -61,9 +61,46 @@ export const RESTART_EVENT_RE = /restart|crash|oom|server_failed|health_check_fa
 // selects on the WORD, and the text describing an action contains the word for that action —
 // INCLUDING in the lines that say the action did not happen.
 //
-// Order matters: SUPPRESSED must be tested BEFORE TRIP. Anything unrecognised is UNCLASSIFIED, which
-// blinds the caller: a new log variant must make this say "I do not know what I am looking at",
-// never silently pick whichever bucket the regexes happen to leave open.
+// ⛔⭐⭐⭐ TRA-3049 (2026-08-06) — THE SAME USE-VS-MENTION CLASS, TWICE MORE, QUARANTINED AT THE
+// SOURCE INSTEAD OF BY A CALLER'S PRECONDITION. The block above documents the trap for SUPPRESSED
+// and then the very next `if` re-commits it:
+//
+//   EXTERNAL_KILL     `prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 /
+//                      health-check SIGTERM) suspected`                              (level=warn)
+//                       `event-loop-watchdog.ts:961`. A line whose WHOLE JOB is to report the
+//                       ABSENCE of a trip, scored as a trip. MEASURED (LeadDev, TRA-3042 §3,
+//                       `text=external kill` over 07-30..08-06T06:00Z): 55 lines, classifier kinds
+//                       {"TRIP": 55}, `distinctTrips` 1 ⇒ a caller that saw these REDS EVERY DAY.
+//   BREADCRUMB_ERROR  `failed to persist watchdog trip breadcrumb`                   (level=warn)
+//                       `event-loop-watchdog.ts:245`. Found by ENUMERATING all ten `log.*` calls in
+//                       the emitting module rather than treating the ticket's one line as the whole
+//                       population. Same class — the subject is a FILE WRITE, not the loop — and it
+//                       carries no `lagMaxMs`/`rssMB`, so it dedupes on `?|?` and would add a
+//                       PHANTOM SECOND distinct trip beside the real one it fires next to.
+//
+// Neither is reachable from any shipped call site today: every one of them pre-filters on
+// `self-restarting` (which neither payload contains) or reads `level=error` (both are warn). That is
+// PRECISELY why they are fixed here — **a defect quarantined by a caller-side precondition is one
+// refactor away from being live, and a precondition in a JSDoc is not a control.**
+//
+// ⚠️ THE QUARANTINE IS DIRECTIONAL AND MUST STAY THAT WAY: it must never swallow a REAL trip.
+// `without a watchdog trip` is inherently a negation-of-trip phrase and cannot occur in a line
+// ASSERTING one. Both arms are asserted in `render-boot-set.test.mjs` (trap not counted **and** a
+// real `WATCHDOG TRIP — self-restarting…` line still scores TRIP) — a quarantine that swallows the
+// real trip is worse than the bug it fixes.
+//
+// ⚠️ DELIBERATELY NOT CHANGED, AND WORTH A FOLLOW-UP: an EXTERNAL_KILL line is emitted AT BOOT by
+// the newly-started process, so it is a FOURTH boot witness — the one that would cover this module's
+// own STATED RESIDUAL above (`POST /api/admin/restart` on a box that never tripped writes no deploy
+// record and emits no watchdog echo). Feeding it into `buildBootSet` CHANGES VERDICTS, so it is
+// recorded here rather than smuggled into a hardening ticket.
+//
+// Order matters: SUPPRESSED, EXTERNAL_KILL and BREADCRUMB_ERROR must all be tested BEFORE TRIP.
+// Anything unrecognised is UNCLASSIFIED, which blinds the caller: a new log variant must make this
+// say "I do not know what I am looking at", never silently pick whichever bucket the regexes happen
+// to leave open. The two new kinds are NAMED rather than left UNCLASSIFIED on purpose — they are
+// known shapes with a known NON-incident meaning, so blinding on them would trade a false RED for a
+// false HELD every time one appeared.
 export function classifyWatchdogLine(line) {
   let rec;
   try { rec = JSON.parse(line.message); } catch { rec = {}; }
@@ -71,8 +108,10 @@ export function classifyWatchdogLine(line) {
   const msg = String(rec.msg ?? line.message ?? '');
   const kind = /prior watchdog self-restart detected on boot/i.test(msg) ? 'BOOT'
     : /suppress/i.test(msg) ? 'SUPPRESSED'
-      : /WATCHDOG TRIP/i.test(msg) ? 'TRIP'
-        : 'UNCLASSIFIED';
+      : /without a watchdog trip/i.test(msg) ? 'EXTERNAL_KILL'
+        : /failed to persist watchdog (trip|liveness) breadcrumb/i.test(msg) ? 'BREADCRUMB_ERROR'
+          : /WATCHDOG TRIP/i.test(msg) ? 'TRIP'
+            : 'UNCLASSIFIED';
   return {
     at: line.timestamp,
     kind,

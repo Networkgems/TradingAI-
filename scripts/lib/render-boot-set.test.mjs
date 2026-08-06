@@ -119,6 +119,83 @@ test('L12 the real 07-24 filter response is 5 BOOT + 3 TRIP + 1 SUPPRESSED, noth
   assert.equal(FX.logs.length, 9);
 });
 
+// ── L13–L17 (TRA-3049): the use-vs-mention quarantine, asserted in BOTH directions ──────────────
+//
+// These two lines are NOT in the 07-24 fixture, because they are the shapes the shipped acquisition
+// axes cannot see (no "self-restarting" in the payload, and level=warn). They are verbatim from
+// `packages/server/src/event-loop-watchdog.ts` — :961 and :245 — which is the only honest source for
+// a line no query returns. L-OLD-c below pins that the naive expression still mis-scores both.
+const EXTKILL = {
+  timestamp: '2026-08-05T15:20:00.000000000Z',
+  message: JSON.stringify({
+    level: 'warn', module: 'event-loop-watchdog',
+    msg: 'prior process died WITHOUT a watchdog trip — external kill (SIGKILL 137 / health-check SIGTERM) suspected',
+    lastAliveUptimeSec: 1721, lastAliveRssMB: 1204, lastAliveLagMaxMs: 41,
+  }),
+};
+const BREADCRUMB_ERR = {
+  timestamp: '2026-08-05T15:16:53.700000000Z',
+  message: JSON.stringify({
+    level: 'warn', module: 'event-loop-watchdog',
+    msg: 'failed to persist watchdog trip breadcrumb', err: 'EACCES: permission denied',
+  }),
+};
+// The OTHER error-level trip wording (`event-loop-watchdog.ts:1149`) and it is a genuine USE — the
+// watchdog really tripped, only the restart action was disabled. It MUST keep scoring TRIP. This is
+// the arm that catches a quarantine which over-reaches, and it is the line a careless tightening
+// would swallow first.
+const OBSERVE_ONLY = {
+  timestamp: '2026-08-05T15:41:00.000000000Z',
+  message: JSON.stringify({
+    level: 'error', module: 'event-loop-watchdog', msg: 'watchdog tripped but restart disabled — observe-only',
+    reason: 'lag', rssMB: 1502, lagMaxMs: 9001,
+    detail: 'single event-loop block: max lag 9001ms >= 4000ms — self-restarting before the platform hard-kill',
+  }),
+};
+
+test('L13 ARM A — "prior process died WITHOUT a watchdog trip" is NOT a TRIP, from the classifier '
+  + 'itself with no pre-filter in front of it', () => {
+  assert.equal(classifyWatchdogLine(EXTKILL).kind, 'EXTERNAL_KILL');
+});
+
+test('L14 ARM B — a real trip still scores TRIP under BOTH of its wordings (a quarantine that '
+  + 'swallows the real trip is worse than the bug it fixes)', () => {
+  assert.equal(classifyWatchdogLine(TRIP_1956).kind, 'TRIP');
+  assert.equal(classifyWatchdogLine(OBSERVE_ONLY).kind, 'TRIP');
+});
+
+test('L15 ARM A — "failed to persist watchdog trip breadcrumb" is NOT a TRIP: the subject is a FILE '
+  + 'WRITE, and it carries no lag/rss so it would dedupe to a PHANTOM SECOND incident', () => {
+  assert.equal(classifyWatchdogLine(BREADCRUMB_ERR).kind, 'BREADCRUMB_ERROR');
+  const beside = [BREADCRUMB_ERR, TRIP_1956].map(classifyWatchdogLine);
+  assert.equal(distinctTrips(beside).length, 1);   // 1, not 2
+});
+
+test('L16 distinctTrips counts the uses and none of the mentions — 2 mentions + 2 uses is 2 '
+  + 'incidents, not 0 and not 4', () => {
+  const slice = [EXTKILL, BREADCRUMB_ERR, TRIP_1956, OBSERVE_ONLY].map(classifyWatchdogLine);
+  assert.equal(distinctTrips([EXTKILL, BREADCRUMB_ERR].map(classifyWatchdogLine)).length, 0);
+  assert.equal(distinctTrips(slice).length, 2);
+});
+
+test('L17 the quarantined kinds are NAMED, not UNCLASSIFIED — a known non-incident must not BLIND '
+  + 'the caller (that trades a false RED for a false HELD)', () => {
+  for (const l of [EXTKILL, BREADCRUMB_ERR]) {
+    assert.notEqual(classifyWatchdogLine(l).kind, 'UNCLASSIFIED');
+  }
+  // Both fixtures sit INSIDE this window, so `trips: 0` is a real observation and not an artifact of
+  // the span filter — `distinctTrips` is applied to the in-span slice.
+  const r = buildBootSet({
+    from: '2026-08-05T13:30:00.000Z', to: '2026-08-05T20:00:00.000Z',
+    watchdogLines: [EXTKILL, BREADCRUMB_ERR], watchdogOk: true,
+    coverageLineCount: FX.coverageLineCount, coverageOk: true,
+    deploys: FX.deploys, deploysOk: true, events: FX.events, eventsOk: true,
+  });
+  assert.equal(r.unclassified.length, 0);   // named ⇒ no blind reason is raised for them
+  assert.equal(r.trips.length, 0);          // in-span, and still not incidents
+  assert.ok(!r.blindReasons.some(x => /fit no known shape/.test(x)));
+});
+
 // ── B: the boot set ─────────────────────────────────────────────────────────────────────────────
 
 test('B1 the real 07-24 RTH window is 4 boots, 2 of them invisible to the deploys API', () => {
@@ -262,6 +339,17 @@ test('L-OLD-b a (lag,rss) dedupe over the BOOT set DOES delete one of the two re
   const kept = [BOOT_1559, BOOT_1615].map(classifyWatchdogLine)
     .filter(b => { const k = `${b.lag}|${b.rss}`; if (seen.has(k)) return false; seen.add(k); return true; });
   assert.equal(kept.length, 1, '2 real boots -> 1: the deletion is real');
+});
+
+test('L-OLD-f (TRA-3049) the naive /WATCHDOG TRIP/i DOES match BOTH quarantined lines — the bugs '
+  + 'stay visible, so a green run means the fix holds rather than that the suite went blind', () => {
+  for (const l of [EXTKILL, BREADCRUMB_ERR]) {
+    assert.equal(/WATCHDOG TRIP/i.test(JSON.parse(l.message).msg), true);
+  }
+  // …and the load-bearing direction: the quarantine regex must NOT match a line asserting a trip.
+  for (const l of [TRIP_1956, OBSERVE_ONLY]) {
+    assert.equal(/without a watchdog trip/i.test(JSON.parse(l.message).msg), false);
+  }
 });
 
 test('L-OLD-c keying deploy boots on the `deploy_started` EVENT reproduces the phantom 6 boots / 4 '
