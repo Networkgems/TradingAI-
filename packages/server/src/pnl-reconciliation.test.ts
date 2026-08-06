@@ -2330,3 +2330,84 @@ describe('TRA-2835 — lag eligibility requires CALENDAR adjacency, not array ad
     expect(r.priorOptionsLagOk).toBeNull();
   });
 });
+
+// TRA-3043 — the anchor and its provenance must SURVIVE the row builder.
+//
+// `reconcilePnl` maps each `DailySnapshot` into a `PnlReconcileDay` field by
+// field, and that shape is what `/api/health/pnl-reconciliation` serialises. A
+// field added to the snapshot but not to the mapper is written to disk by the
+// 21:00 ET writer and then silently dropped on the way out of the endpoint —
+// which is exactly how `openingEquity` came to be a durable recorded field that
+// no reader could see, forcing the inference these tests exist to retire.
+describe('TRA-3043 — openingEquity / openingEquityBasis reach the payload', () => {
+  const row = (date: string, over: Partial<DailySnapshot>): DailySnapshot => ({
+    date,
+    openingEquity: 25_000,
+    closingEquity: 25_100,
+    dailyPnl: 100,
+    optionsPnl: 0,
+    optionsDailyPnl: 0,
+    combinedPnl: 100,
+    trades: 1,
+    ...over,
+  });
+
+  it('publishes the recorded anchor and the writer declaration verbatim', () => {
+    const res = reconcilePnl(
+      [row('2026-08-06', { openingEquityBasis: 'day-roll-preserved-prior-close' })],
+      new Map(),
+      '2026-01-01',
+    );
+    const d = res.days.find(x => x.date === '2026-08-06')!;
+    expect(d.openingEquity).toBe(25_000);
+    expect(d.openingEquityBasis).toBe('day-roll-preserved-prior-close');
+  });
+
+  it('the telescoping invariant is now a comparison of two PUBLISHED fields', () => {
+    // `openingEquity(N) === closingEquity(N-1)` is the direct read of whether a
+    // session advanced its anchor across the prior close — the thing the
+    // TRA-3039 day-roll defect breaks. Until this ticket it could only be
+    // reached by inverting `stockDaily` off three other fields.
+    const res = reconcilePnl(
+      [
+        row('2026-08-05', { openingEquity: 24_900, closingEquity: 25_000 }),
+        // The defect's signature: the anchor did NOT advance to 25,000.
+        row('2026-08-06', { openingEquity: 24_900, closingEquity: 25_100 }),
+      ],
+      new Map(),
+      '2026-01-01',
+    );
+    const [prev, cur] = res.days;
+    expect(cur!.openingEquity).not.toBe(prev!.closingEquity);
+    expect(cur!.openingEquity).toBe(24_900);
+  });
+
+  it('an unmeasured anchor publishes NULL, never a flat-broke zero', () => {
+    // TRA-2829: a back-filled row whose broker equity anchor could not be
+    // measured carries `openingEquity: null`. `?? 0` here would publish a book
+    // that opened the day at nothing and manufacture a book-sized daily P&L for
+    // anyone differencing it.
+    const res = reconcilePnl(
+      [row('2026-08-06', { openingEquity: null, closingEquity: null })],
+      new Map(),
+      '2026-01-01',
+    );
+    expect(res.days[0]!.openingEquity).toBeNull();
+  });
+
+  it('a row written before this ticket publishes NULL, not a default declaration', () => {
+    // The two NOT-MEASURED cases (a pre-TRA-3043 build, and a back-fill row the
+    // live process declined to speak for) must both arrive as `null`. Defaulting
+    // to `prior-session-close` would make every legacy row assert the exact
+    // clean bill of health the field exists to withhold.
+    const res = reconcilePnl([row('2026-08-06', {})], new Map(), '2026-01-01');
+    expect(res.days[0]!.openingEquityBasis).toBeNull();
+    // An empty string is a writer bug, not a declaration — same treatment.
+    const blank = reconcilePnl(
+      [row('2026-08-06', { openingEquityBasis: '' })],
+      new Map(),
+      '2026-01-01',
+    );
+    expect(blank.days[0]!.openingEquityBasis).toBeNull();
+  });
+});

@@ -299,6 +299,41 @@ export interface PnlReconcileDay {
   eodCombined: number | null;
   /** PnL-tracker stock-only realized daily P&L. */
   stockDaily: number;
+  /**
+   * TRA-3043 — the row's RECORDED opening-equity anchor, published rather than
+   * inferred.
+   *
+   * `stockDaily` is written as `(closingEquity − openingEquity) −
+   * optionsCreditedInWindow`, so until this ticket every consumer that wanted
+   * the anchor had to invert that identity off three other published fields
+   * (`closingEquity − stockDaily − optionsCreditedInWindow`). That derivation is
+   * exact but it is an INFERENCE ABOUT the writer, and it silently disappears
+   * wherever any operand is a TRA-2829 null. This is the writer's own number.
+   *
+   * With it, the telescoping invariant `openingEquity(N) === closingEquity(N−1)`
+   * — which the TRA-3039 day-roll defect breaks, and which is the ONLY direct
+   * read of whether a session's anchor advanced across the prior close — becomes
+   * a comparison of two published fields.
+   *
+   * `null` is NOT MEASURED, not zero: see {@link DailySnapshot.closingEquity}
+   * for why a back-filled row may be unable to name an equity anchor at all. A
+   * zero here would read as a book that opened the day flat broke.
+   */
+  openingEquity: number | null;
+  /**
+   * TRA-3043 — WHICH authority set {@link openingEquity}, as declared by the
+   * writer on the row itself. See {@link DailySnapshot.openingEquityBasis} for
+   * the value set and, in particular, for why
+   * `day-roll-preserved-prior-close` is the POST-FIX discriminator: no build
+   * before TRA-3039 can emit it, so its presence is evidence the fixed day roll
+   * governed this session and its absence is evidence some other build did.
+   *
+   * `null` is NOT MEASURED. Two very different rows land here — one written by a
+   * pre-TRA-3043 build, and a back-fill row whose historical anchor the live
+   * process declined to speak for — so it must never be folded into a verdict as
+   * though it were a reading.
+   */
+  openingEquityBasis: string | null;
   /** Day-only realized options P&L (0 on legacy snapshots without the field). */
   optionsDaily: number;
   /**
@@ -1744,6 +1779,17 @@ export function reconcilePnl(
     .sort((a, b) => a.date.localeCompare(b.date))
     .map(s => {
       const stockDaily = round2(s.dailyPnl);
+      // TRA-3043 — the anchor and its provenance, straight off the row. Both
+      // pass through NOT-MEASURED rather than defaulting: `?? 0` on the anchor
+      // would publish a flat-broke opening for every TRA-2829 back-filled row,
+      // and `?? 'prior-session-close'` on the basis would manufacture the exact
+      // declaration the field exists to withhold.
+      const openingEquity = Number.isFinite(s.openingEquity as number)
+        ? round2(s.openingEquity as number)
+        : null;
+      const openingEquityBasis = typeof s.openingEquityBasis === 'string' && s.openingEquityBasis !== ''
+        ? s.openingEquityBasis
+        : null;
       const optionsFieldPresent = s.optionsDailyPnl !== undefined && s.optionsDailyPnl !== null;
       const optionsDaily = round2(s.optionsDailyPnl ?? 0);
       const eodCombined = eodCombinedByDate.has(s.date)
@@ -1801,6 +1847,8 @@ export function reconcilePnl(
         date: s.date,
         eodCombined,
         stockDaily,
+        openingEquity,
+        openingEquityBasis,
         optionsDaily,
         eodStockPnl,
         stockLegDrift: eodStockPnl == null ? 0 : round2(eodStockPnl - stockDaily),

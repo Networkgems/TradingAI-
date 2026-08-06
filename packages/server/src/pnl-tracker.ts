@@ -67,6 +67,46 @@ export interface DailySnapshot {
   /** TRA-2314 — option closes the durable journal recorded on this ET day for this book. */
   optionsDailyJournalCloses?: number;
   /**
+   * TRA-3043 — WHICH authority set the `openingEquity` this row was computed
+   * against, as declared by the writer at the moment it wrote the row.
+   *
+   * The row already carries {@link DailySnapshot.openingEquity}, but that is the
+   * anchor's VALUE; this is its PROVENANCE, and the two answer different
+   * questions. `stockDaily = (equity − openingEquity) − creditWindow`, so a row
+   * whose anchor was rolled off `state.equity` (the TRA-3039 defect) and a row
+   * whose anchor is the prior session's recorded close produce the same shape of
+   * number and differ only in whether that number means anything. Deriving the
+   * distinction after the fact requires joining this row against the previous
+   * one and asserting `openingEquity(N) === closingEquity(N−1)` — an INFERENCE,
+   * and one that is unavailable at all wherever the previous row is missing or
+   * carries a TRA-2829 null close.
+   *
+   * Values are exactly {@link PersistedState.openingEquityBasis}'s, plus the
+   * positive marker only the TRA-3039 day roll can write:
+   *
+   *  - `day-roll-preserved-prior-close` — the FIXED `advanceDayIfNeeded` ran for
+   *    this session, found the anchor already equal to the prior session's
+   *    recorded close, and preserved it. **This value cannot be written by any
+   *    build before TRA-3039**, which is what makes it usable as the POST-FIX
+   *    discriminator rather than a claim about a deploy report.
+   *  - `prior-session-close` — the anchor was last written by `saveSnapshot` and
+   *    no day roll has re-declared it since. On a row dated AFTER the session
+   *    that set it, this means the roll for this session was performed by a
+   *    build that does not write provenance, i.e. a PRE-fix build.
+   *  - `day-roll-state-equity` — the lossy branch ran: no closed session to
+   *    anchor on, so the anchor came from `state.equity` (TRA-241).
+   *  - `rebase` — `syncOpeningEquity` deliberately moved the anchor off the
+   *    prior close (starting-balance edit / mode switch / forced reset, TRA-138).
+   *
+   * ABSENT means NOT MEASURED, and it is load-bearing in two distinct cases that
+   * must not be read as a verdict: a row written by any pre-TRA-3043 build, and
+   * a row whose date is not the session the live anchor belongs to (an EOD
+   * back-fill row — see the stamping guard in {@link PnlTracker.saveSnapshot},
+   * which refuses to attribute the CURRENT anchor's provenance to a HISTORICAL
+   * row it did not govern).
+   */
+  openingEquityBasis?: string;
+  /**
    * TRA-2895 — partial exits (TP1 trims / manual partial `sell_to_close` /
    * partial fills) the journal dated on this ET day for this book.
    *
@@ -345,6 +385,18 @@ export class PnlTracker {
       // The anchor is already `closingEquity(N-1)`. Stamp the new day onto it and
       // leave the equity/options anchors untouched, so the rows telescope.
       this.state.openingDate = today;
+      // TRA-3043 — POSITIVE marker, and the reason this line is not simply left
+      // holding the `prior-session-close` that `saveSnapshot` already wrote.
+      //
+      // A pre-TRA-3039 build takes the roll below unconditionally and writes NO
+      // provenance at all, so it clobbers `openingEquity` while leaving the
+      // basis string reading `prior-session-close` from the previous session's
+      // close. If this branch also left that string alone, the healthy case and
+      // the clobbered case would publish the SAME declaration — the field would
+      // be silent in exactly the situation it exists to discriminate. Stamping a
+      // value no earlier build can produce makes its ABSENCE the evidence:
+      // whichever build rolled this session, it was not this one.
+      this.state.openingEquityBasis = 'day-roll-preserved-prior-close';
       this.persistState();
       return;
     }
@@ -396,9 +448,44 @@ export class PnlTracker {
     this.persistState();
   }
 
+  /**
+   * TRA-3043 — copy `snapshot` with {@link DailySnapshot.openingEquityBasis} set
+   * to the provenance of the anchor this row was actually computed against.
+   *
+   * Read BEFORE `saveSnapshot` overwrites `state.openingEquityBasis` to
+   * `prior-session-close`: that assignment is about the anchor for the NEXT
+   * session, and stamping it here would make every row declare
+   * `prior-session-close` unconditionally — a field that is green by
+   * construction, which is the TRA-2641 self-confirming trap.
+   *
+   * TWO refusals, both of which produce an honest ABSENT rather than a guess:
+   *
+   *  1. `snapshot.date !== state.openingDate` — this row is not the session the
+   *     live anchor governs. That is an EOD BACK-FILL row (`rowSource:
+   *     'backfill-TRA-2827'`) or a hand repair reaching into history, and the
+   *     current in-memory provenance says nothing about the anchor that was in
+   *     force on that past day. Attributing it would be a fabricated audit
+   *     trail, and worse than none.
+   *  2. The state carries no basis at all — every state file written before
+   *     TRA-3039. Absent stays absent.
+   *
+   * A caller that supplied its own basis keeps it; the back-fill writer is the
+   * one that may legitimately know a historical row's provenance when this
+   * method cannot.
+   */
+  private stampAnchorBasis(snapshot: DailySnapshot): DailySnapshot {
+    if (snapshot.openingEquityBasis !== undefined) return snapshot;
+    const basis = this.state.openingEquityBasis;
+    if (typeof basis !== 'string' || basis === '') return snapshot;
+    if (snapshot.date !== this.state.openingDate) return snapshot;
+    // Spread, never a field-by-field rebuild: this method must stay transparent
+    // to fields added to `DailySnapshot` after it was written.
+    return { ...snapshot, openingEquityBasis: basis };
+  }
+
   saveSnapshot(snapshot: DailySnapshot): void {
     this.snapshots = this.snapshots.filter(s => s.date !== snapshot.date);
-    this.snapshots.push(snapshot);
+    this.snapshots.push(this.stampAnchorBasis(snapshot));
     this.snapshots.sort((a, b) => a.date.localeCompare(b.date));
     writeFileSync(this.snapshotsFile, JSON.stringify(this.snapshots, null, 2), 'utf-8');
 

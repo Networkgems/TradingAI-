@@ -308,3 +308,179 @@ describe('TRA-3039 — the day roll preserves an anchor a real close established
     expect(t2.getOpeningEquity()).toBeCloseTo(26_000, 6);
   });
 });
+
+// TRA-3043 — PUBLISH THE ANCHOR'S PROVENANCE, DO NOT MAKE THE READER INFER IT.
+//
+// The CTO grades the TRA-2664 forward test by asking one question of each 21:00
+// ET row: was this session's `openingEquity` the prior session's recorded close,
+// or something the day roll invented? Before this ticket the only way to answer
+// was to invert the writer's own formula off three other published fields
+// (`openingEquity = closingEquity - stockDaily - optionsCreditedInWindow`) and
+// compare the result against the previous row. That is an INFERENCE, and it is
+// unavailable wherever an operand is a TRA-2829 null.
+//
+// The trap these tests exist to stop: a pre-TRA-3039 build CLOBBERS
+// `openingEquity` on its day roll while leaving `openingEquityBasis` reading
+// `prior-session-close` from the previous session's `saveSnapshot`. If the fixed
+// roll had simply left that string in place on its preserve branch, the healthy
+// row and the clobbered row would publish the SAME declaration — a field that is
+// green by construction in exactly the case it exists to discriminate (the
+// TRA-2641 self-confirming trap, third occurrence). So the preserve branch
+// stamps `day-roll-preserved-prior-close`, a value NO earlier build can write.
+describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated default', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3043-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  // `advanceDayIfNeeded` stamps `openingDate = todayKey()`, and `saveSnapshot`
+  // only attributes provenance to a row it governs (`snapshot.date ===
+  // openingDate`). So the row under test must carry the REAL current ET date —
+  // the same expression the tracker uses, not a frozen literal.
+  const TODAY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const PRIOR = '2020-01-06';
+
+  const basisOf = (t: PnlTracker, date: string) =>
+    t.getSnapshots().find(s => s.date === date)?.openingEquityBasis;
+
+  it('the preserve branch stamps the marker, and it reaches the row it governed', () => {
+    // Session PRIOR closed at 25,073.05 and set the anchor. The next boot into a
+    // new ET day is the fixed roll: it finds the anchor already equal to that
+    // recorded close and preserves it.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveEquity(25_000, 0);
+    t1.saveSnapshot(snap(PRIOR, 25_000, 25_073.05));
+
+    const t2 = new PnlTracker(dir, 25_000);
+    expect(t2.getOpeningEquity()).toBeCloseTo(25_073.05, 6);
+    // The 21:00 ET write for the session the roll just opened.
+    t2.saveSnapshot(snap(TODAY, 25_073.05, 25_090));
+
+    expect(basisOf(t2, TODAY)).toBe('day-roll-preserved-prior-close');
+    // And it is DURABLE — the reader pulls this off a file, not off memory.
+    expect(basisOf(new PnlTracker(dir, 25_000), TODAY)).toBe('day-roll-preserved-prior-close');
+  });
+
+  it('CONTROL — a PRE-FIX clobber cannot forge the marker', () => {
+    // THE DISCRIMINATOR. This reproduces the on-disk residue a pre-TRA-3039
+    // build leaves after it has already rolled into today: `openingDate` is
+    // TODAY, `openingEquity` has been overwritten from the stale trade-path
+    // cache (25,000 instead of the recorded 25,073.05 close), and the basis
+    // string still reads `prior-session-close` because that build never wrote
+    // the field at all — the previous session's `saveSnapshot` did.
+    //
+    // The fixed build boots into this and REPAIRS NOTHING: `advanceDayIfNeeded`
+    // is constructor-only and returns immediately once `openingDate === today`.
+    // That is the prevent-only property the deploy ruling turns on, and it is
+    // asserted here rather than described.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveEquity(25_000, 0);
+    t1.saveSnapshot(snap(PRIOR, 25_000, 25_073.05));
+
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    raw['openingDate'] = TODAY;
+    raw['openingEquity'] = 25_000;                     // the clobber
+    raw['openingEquityBasis'] = 'prior-session-close'; // the stale, honest-looking string
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+
+    const t2 = new PnlTracker(dir, 25_000);
+    // Prevent-only: the broken anchor survives the fixed build's boot.
+    expect(t2.getOpeningEquity()).toBeCloseTo(25_000, 6);
+    t2.saveSnapshot(snap(TODAY, 25_000, 25_090));
+
+    // The row does NOT claim the fixed roll governed it. This is the whole
+    // point: absence of the marker is the evidence, and a stale
+    // `prior-session-close` must never be read as a pass.
+    expect(basisOf(t2, TODAY)).toBe('prior-session-close');
+    expect(basisOf(t2, TODAY)).not.toBe('day-roll-preserved-prior-close');
+  });
+
+  // A book that was RUNNING on a past session and never booked a close for it:
+  // equity moved through the trade path, `openingDate` is that past session, and
+  // the snapshot ledger has no row to anchor on. `loadState` defaults
+  // `openingDate` to TODAY on a fresh directory, which would skip the roll
+  // entirely, so the past date is written onto the state file rather than
+  // assumed — the same technique the TRA-3039 controls above use.
+  const openSessionThatNeverClosed = (equity: number) => {
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(equity, 0);
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    raw['openingDate'] = '2020-01-05';
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+    return stateFile;
+  };
+
+  it('the lossy roll declares itself on the row', () => {
+    // A session that never closed: no snapshot to anchor on, so the roll from
+    // `state.equity` (TRA-241) is correct AND lossy, and says so on disk.
+    openSessionThatNeverClosed(26_000);
+
+    const t2 = new PnlTracker(dir, 25_000);
+    expect(t2.getOpeningEquity()).toBeCloseTo(26_000, 6);
+    t2.saveSnapshot(snap(TODAY, 26_000, 26_100));
+    expect(basisOf(t2, TODAY)).toBe('day-roll-state-equity');
+  });
+
+  it('a rebase declares itself on the row', () => {
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveSnapshot(snap(PRIOR, 25_000, 25_073.05));
+    const t2 = new PnlTracker(dir, 25_000);
+    t2.syncOpeningEquity(30_000, 0); // starting-balance edit (TRA-138)
+    t2.saveSnapshot(snap(TODAY, 30_000, 30_050));
+    expect(basisOf(t2, TODAY)).toBe('rebase');
+  });
+
+  it('CONTROL — a BACK-FILL row is left NOT MEASURED, never back-attributed', () => {
+    // The current in-memory anchor says nothing about what governed a session
+    // three weeks ago. Stamping it onto a back-filled row would fabricate an
+    // audit trail, which is worse than having none — so a row whose date is not
+    // `openingDate` is left with the field ABSENT.
+    openSessionThatNeverClosed(26_000);
+    const t2 = new PnlTracker(dir, 25_000);
+    expect(basisOf(t2, TODAY)).toBeUndefined();
+
+    // The row the anchor DOES govern is stamped, so the refusal below is a
+    // scoped decision and not a blanket failure to write. Asserted FIRST: a
+    // past-dated `saveSnapshot` rewinds `openingDate` to its own date (that is
+    // how the anchor telescopes), so writing the back-fill row first would leave
+    // the live row unstamped for that reason instead of the one under test.
+    t2.saveSnapshot(snap(TODAY, 26_000, 26_100));
+    expect(basisOf(t2, TODAY)).toBe('day-roll-state-equity');
+
+    t2.saveSnapshot({
+      date: '2019-11-04', openingEquity: 24_000, closingEquity: 24_100,
+      dailyPnl: 100, optionsPnl: 0, combinedPnl: 100, trades: 0,
+    });
+    expect(basisOf(t2, '2019-11-04')).toBeUndefined();
+  });
+
+  it('CONTROL — a caller that knows a row provenance keeps it', () => {
+    // The EOD back-fill writer can legitimately know what anchored a historical
+    // row. Its value wins; the stamper does not overwrite it. Set up so the
+    // stamper WOULD otherwise have written (`day-roll-state-equity` on a row it
+    // governs) — deferring to the caller from a state that had nothing to say
+    // would not distinguish precedence from a no-op.
+    openSessionThatNeverClosed(26_000);
+    const t2 = new PnlTracker(dir, 25_000);
+    t2.saveSnapshot({ ...snap(TODAY, 26_000, 26_100), openingEquityBasis: 'backfill-TRA-2827' });
+    expect(basisOf(t2, TODAY)).toBe('backfill-TRA-2827');
+  });
+
+  it('CONTROL — a pre-TRA-3039 state file stamps nothing at all', () => {
+    // Every state file written before TRA-3039 has no basis field. Absent must
+    // stay absent: a `?? 'prior-session-close'` default anywhere on this path
+    // would manufacture the exact declaration the field exists to withhold.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveEquity(26_000, 0);
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    delete raw['openingEquityBasis'];
+    raw['openingDate'] = TODAY;
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+
+    const t2 = new PnlTracker(dir, 25_000);
+    t2.saveSnapshot(snap(TODAY, 26_000, 26_100));
+    expect(basisOf(t2, TODAY)).toBeUndefined();
+  });
+});
