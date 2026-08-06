@@ -11,6 +11,7 @@ import { etHour } from './et-clock.js'; // TRA-2498
 // TRA-2689 (leg 2 of TRA-2654) — once-per-session drain of the WRITE-ONLY
 // denominator-flip candidate tape. Nothing on any decision path reads it.
 import { flushDenominatorFlipTape } from './denominator-flip-tape-writer.js';
+import { summarizeDenominatorFlipTape } from './denominator-flip-tape-summary.js';
 import {
   DENOM_FLIP_CHANGEPCT_DELTA_PP,
   type DenominatorFlipTapeDump,
@@ -5192,6 +5193,18 @@ registerLiveHealthRoutes(app, {
   // what the process ACTUALLY resolves rather than against raw process.env (which
   // would report every daemon-free operator flip as phantom drift).
   effectiveEnv: () => demoFlagEnv(),
+  // TRA-3116 — grade every book's denominator-flip tape against the
+  // pre-registered promotion bar. Enumerates the ACTIVE stocks bucket per book,
+  // which is the same bucket `drainDenominatorFlipTapeFor` writes into, so the
+  // reader cannot silently miss a mode the writer is using.
+  denominatorFlipTape: () =>
+    summarizeDenominatorFlipTape(
+      getAllUserContexts().map(ctx => {
+        const mode = stockModeKey(getSettings(ctx.username));
+        return { username: ctx.username, mode, targetDir: stockReportsDirFor(ctx, mode) };
+      }),
+      { todayEt: etDateKey(Date.now()) },
+    ),
   internalToken: () => (process.env['DEMO_BOOK_INTERNAL_TOKEN'] ?? '').trim() || undefined,
   // TRA-2650 — ⚠ DO NOT re-introduce a `.filter(b => b.mode === 'demo')` here,
   // and do not drop `email`. This provider hands over the WHOLE fleet; each

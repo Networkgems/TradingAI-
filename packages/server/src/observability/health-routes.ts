@@ -97,6 +97,7 @@ import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
 import { summarizeEodArchiveParticipation } from '../eod-archive-participation.js'; // TRA-2930
+import type { TapeSummary } from '../denominator-flip-tape-summary.js'; // TRA-3116
 import {
   summarizeGiveBackArmFloor,
   type GiveBackArmFloorSummary,
@@ -234,6 +235,14 @@ export interface LiveHealthDeps {
    * only mounted when this is provided.
    */
   exitCadence?: () => ExitCadenceHealth[];
+  /**
+   * TRA-3116 — grade every book's `tape/<date>.json` against the pre-registered
+   * >=10-RTH-session promotion bar, backing `GET
+   * /api/health/denominator-flip-tape`. Injected rather than imported so this
+   * module keeps its hands off `getAllUserContexts` / the reports layout.
+   * Optional: the route is only mounted when supplied.
+   */
+  denominatorFlipTape?: () => Promise<TapeSummary>;
   /**
    * TRA-2209 — the engine's EFFECTIVE env view (process.env with the
    * `<DATA_DIR>/demo-flags.json` overlay on top), backing the unauthenticated
@@ -3826,6 +3835,62 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             : `MISSES: ${summary.anomalies.length} book(s) missed at least one market-day archive pass over ${summary.marketDayRuns} pass(es). Read each anomaly's lastOutcome — absent_from_context_map is a BOOT failure (candidate a, look at initUserContext / initAllUserContexts), report_threw is a REPORT failure (candidate b, lastReason carries the message). That discrimination is the whole reason this record exists (TRA-2930).`,
     });
   });
+
+  // TRA-3116 — the READ side of the TRA-2689 denominator-flip tape.
+  //
+  // Parts 1-3 of the ruling made the tape survive a restart and stamp its own
+  // coverage. This is what makes those fields gradeable from outside the box:
+  // the part-5 promotion bar is defined entirely over `coverageComplete`,
+  // `saturated`, `truncatedForSize` and `droppedOnMerge`, and until this route
+  // existed nothing could read any of them, so the bar was unreachable for the
+  // second time on the same ticket.
+  //
+  // Read in this order:
+  //  1. `verdict` — TRI-STATE. `null` is BLIND, not clean: no tape written yet
+  //     and a perfect record must not be the same reading. `blindReason` says so.
+  //  2. The triple `complete` / `partial` / `absent`. Never quote `complete`
+  //     alone — a bar reporting "8 of 10 clean" over a silently shrunken
+  //     denominator is the exact failure TRA-3116 exists to close, so partial
+  //     sessions are retained and annotated and absent MARKET days are counted.
+  //  3. `sessions[].disqualifiers` — why a session did not count, by name.
+  //     `coverageComplete:absent` means a pre-fix file, which is NOT a pass.
+  //  4. `rowsLostToRestart` is tri-state and never a positive integer: `0` only
+  //     under proven full coverage, `null` when rows died with their process.
+  //
+  // Observe-only: the trading path never reads the tape, and nothing here feeds
+  // a decision inside the process. Boundary unchanged.
+  if (deps.denominatorFlipTape) {
+    const tape = deps.denominatorFlipTape;
+    app.get('/api/health/denominator-flip-tape', async (_req, res) => {
+      const nowMs = now();
+      try {
+        const summary = await tape();
+        res.json({
+          ok: true,
+          issue: 'TRA-3116',
+          time: new Date(nowMs).toISOString(),
+          build: resolveBuildInfo(),
+          etDay: etDateString(new Date(nowMs)),
+          ...summary,
+          note:
+            summary.verdict === null
+              ? `BLIND — ${summary.blindReason ?? 'no tape on record'}. This is NOT a clean bill of health.`
+              : `${summary.sessionsTowardBar}/${summary.barTarget} sessions toward the bar. TRIPLE: ${summary.complete} complete / ${summary.partial} partial / ${summary.absent} absent. A session counts ONLY with coverageComplete && !saturated && truncatedForSize===0 && droppedOnMerge===0; rows.length===0 under complete coverage COUNTS. Partial sessions are retained and annotated, never excluded.`,
+        });
+      } catch (err: unknown) {
+        // An instrument may not take the box down, and it may not report a read
+        // failure as an absence of findings either.
+        res.status(200).json({
+          ok: false,
+          issue: 'TRA-3116',
+          time: new Date(nowMs).toISOString(),
+          verdict: null,
+          blindReason: err instanceof Error ? err.message : String(err),
+          note: 'BLIND — the tape summary could not be read. This is NOT a clean bill of health.',
+        });
+      }
+    });
+  }
 
   // TRA-1656 (TRA-1602B) — unauthenticated, secrets-free MEASURED option spread
   // cross, in R units. This probe was built to CHECK the cost-aware bar's spread

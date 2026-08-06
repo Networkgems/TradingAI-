@@ -31,6 +31,10 @@ import {
   type DenominatorFlipTapeFile,
 } from './denominator-flip-tape-writer.js';
 import { etWallClockToUtcMs } from './et-clock.js';
+import {
+  summarizeDenominatorFlipTape,
+  gradeTapeSession,
+} from './denominator-flip-tape-summary.js';
 
 type QuoteRow = { price: number; volume: number; change: number; changePct: number };
 const quotes = (rows: Record<string, QuoteRow>) => new Map(Object.entries(rows));
@@ -757,6 +761,114 @@ describe('TRA-3116 — the drain survives a restart (merge, coverage, orphan)', 
     expect(etWallClockToUtcMs('2026-01-15', 16, 0)).toBe(Date.parse('2026-01-15T21:00:00.000Z'));
     // A malformed key publishes ignorance rather than a plausible number.
     expect(etWallClockToUtcMs('not-a-date', 9, 30)).toBeNull();
+  });
+
+  // ── Part 5: the bar is only real if it can be READ ───────────────────────
+
+  it('ACCEPTANCE — the bar rule grades a complete session in and every loss source out', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    await flush(dir, dump(rowsOf(2, 'A')), {
+      trigger: 'eod', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-31T01:00:00.000Z'),
+    });
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: DATE },
+    );
+    expect(summary.verdict).toBe('complete');
+    expect(summary.complete).toBe(1);
+    expect(summary.partial).toBe(0);
+    expect(summary.absent).toBe(0);
+    expect(summary.sessions[0].countsTowardBar).toBe(true);
+    expect(summary.sessions[0].disqualifiers).toEqual([]);
+
+    // Each loss source disqualifies ON ITS OWN NAME, so a reader can tell WHICH
+    // one fired rather than being handed a bare boolean.
+    const ok = { coverageComplete: true, saturated: false, truncatedForSize: 0, droppedOnMerge: 0 };
+    expect(gradeTapeSession(ok).countsTowardBar).toBe(true);
+    expect(gradeTapeSession({ ...ok, coverageComplete: false }).disqualifiers).toEqual(['coverageComplete:false']);
+    expect(gradeTapeSession({ ...ok, saturated: true }).disqualifiers).toEqual(['saturated']);
+    expect(gradeTapeSession({ ...ok, truncatedForSize: 3 }).disqualifiers).toEqual(['truncatedForSize']);
+    expect(gradeTapeSession({ ...ok, droppedOnMerge: 1 }).disqualifiers).toEqual(['droppedOnMerge']);
+    expect(gradeTapeSession({ ...ok, mergeDegraded: true }).disqualifiers).toEqual(['mergeDegraded']);
+  });
+
+  it('a PRE-FIX file (no coverage fields) does NOT grade clean by virtue of the fields being missing', () => {
+    // The 2026-08-04 and 08-05 files on the live box are exactly this shape:
+    // `droppedCandidates: 0`, `saturated: false`, and no coverage stamp at all.
+    // Both are five minutes of after-hours residue. An absent field read as a
+    // passing one would bank them as sessions 1 and 2 of the bar.
+    const preFix = { saturated: false, droppedCandidates: 0, truncatedForSize: 0 };
+    const graded = gradeTapeSession(preFix);
+    expect(graded.countsTowardBar).toBe(false);
+    expect(graded.disqualifiers).toContain('coverageComplete:absent');
+    expect(graded.disqualifiers).toContain('droppedOnMerge:absent');
+  });
+
+  it('a zero-row COMPLETE session counts, and a partial one is retained rather than dropped', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // 07-30: complete coverage, no candidates. Counts.
+    await flush(dir, dump([]), { trigger: 'eod', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-31T01:00:00.000Z') });
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: DATE },
+    );
+    expect(summary.sessions[0].rows).toBe(0);
+    expect(summary.sessions[0].countsTowardBar).toBe(true);
+    expect(summary.sessionsTowardBar).toBe(1);
+  });
+
+  it('BLIND is not CLEAN — no tape on record reports verdict null, never a green', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: DATE },
+    );
+    expect(summary.verdict).toBeNull();
+    expect(summary.blindReason).toBeTruthy();
+    expect(summary.sessionsTowardBar).toBe(0);
+    // The trap this closes: `complete === 0 && partial === 0` must not be
+    // reportable as "nothing wrong".
+    expect(summary.verdict).not.toBe('complete');
+  });
+
+  it('absent MARKET days are counted against the denominator, and holidays do not inflate them', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Two sessions a week apart. 2026-07-30 (Thu) .. 2026-08-05 (Wed) contains
+    // market days 07-30, 07-31, 08-03, 08-04, 08-05 — three of them have no file.
+    await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'eod', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-31T01:00:00.000Z') });
+    await flushDenominatorFlipTape({
+      targetDir: dir, date: '2026-08-05', dump: dump(rowsOf(1, 'B')),
+      admissionRule: { changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP, capacity: DENOM_FLIP_TAPE_CAPACITY },
+      trigger: 'eod',
+      processStartedAt: '2026-08-05T12:00:00.000Z',
+      now: Date.parse('2026-08-06T01:00:00.000Z'),
+    });
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: '2026-08-05' },
+    );
+    expect(summary.absent).toBe(3);
+    expect(summary.absentSessions).toEqual([
+      'admin/live@2026-07-31', 'admin/live@2026-08-03', 'admin/live@2026-08-04',
+    ]);
+    // Weekend days are not absences — a calendar-blind count would say 5.
+    expect(summary.absentSessions.some(s => s.endsWith('2026-08-01'))).toBe(false);
+    // A gap means the fleet reading is PARTIAL even though both files are clean.
+    expect(summary.verdict).toBe('partial');
+  });
+
+  it('an unreadable tape file stays IN the denominator as evidence, not out of it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    await mkdir(join(dir, 'tape'), { recursive: true });
+    await writeFile(join(dir, 'tape', `${DATE}.json`), '{ truncated', 'utf-8');
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: DATE },
+    );
+    expect(summary.sessions).toHaveLength(1);
+    expect(summary.sessions[0].unreadable).toBeTruthy();
+    expect(summary.sessions[0].countsTowardBar).toBe(false);
+    expect(summary.partial).toBe(1);
   });
 
   it('an unresolvable date publishes coverage as NULL, never as zero', () => {
