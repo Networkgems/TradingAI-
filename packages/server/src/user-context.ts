@@ -44,6 +44,10 @@ import type { OptionsBucketSnapshot } from './trade-store.js';
 import type { TradierEnv } from '@trading-app/shared';
 import { getAllUsers } from './users.js';
 import { scrubStaleOptionsPnlCells } from './reports/stale-cell-cleanup.js';
+import {
+  reclaimReportSidecars,
+  reportSidecarMaxUnlinks,
+} from './reports/report-sidecar-reclaim.js';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
 
@@ -429,6 +433,52 @@ export async function runTra1472StaleCellCleanup(): Promise<void> {
   log.info('migration TRA-1472: complete — removed pre-TRA-594 stale cells.', {
     migration: 'TRA-1472', cellCount, userCount,
   });
+}
+
+/**
+ * TRA-3064 — reclaim the write-only `<date>.md` report sidecars across every
+ * book.
+ *
+ * `users/` was the #1 unbounded inode holder on bqb1's `/data` (55.0% of the
+ * 23,070 used inodes, measured 2026-08-06), and 3,820 of those files were
+ * verbatim copies of a `markdown` field already inside the sibling `.json`.
+ * The write sites stopped emitting them in this same change; this releases the
+ * ones already on disk.
+ *
+ * Deliberately NOT marker-gated, unlike TRA-241 / TRA-1472 above. A marker
+ * would make this a historical event, and the bound has to survive a rollback
+ * to a build that still writes sidecars. Idempotent, and one `readdir` per
+ * report directory when there is nothing to do.
+ *
+ * Only deletes a `<name>.md` that has a `<name>.json` beside it, so every byte
+ * it releases is still recoverable from `json.markdown`. See
+ * `reports/report-sidecar-reclaim.ts` for why that gate is the whole design.
+ */
+export async function runTra3064SidecarReclaim(): Promise<void> {
+  const roots: string[] = [];
+  for (const u of getAllUsers()) {
+    const dir = userDataDir(u.username);
+    roots.push(join(dir, 'reports'), join(dir, 'crypto-reports'));
+  }
+  try {
+    const result = await reclaimReportSidecars(roots, reportSidecarMaxUnlinks());
+    if (result.removed > 0 || result.budgetExhausted) {
+      log.info('TRA-3064: report sidecar reclaim complete', {
+        ticket: 'TRA-3064',
+        books: getAllUsers().length,
+        removed: result.removed,
+        orphansKept: result.orphansKept,
+        errors: result.errors,
+        budgetExhausted: result.budgetExhausted,
+      });
+    }
+  } catch (err: unknown) {
+    // A reclaim is housekeeping. It must never be the reason a boot fails.
+    log.warn('TRA-3064: report sidecar reclaim failed', {
+      ticket: 'TRA-3064',
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**

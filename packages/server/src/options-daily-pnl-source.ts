@@ -473,10 +473,13 @@ export async function syncEodReportOptionsLegs(
         // 2026-07-21 the file and the snapshot disagreed, so exactly one of the
         // two needed moving.
         if (patched === report) continue;
+        // TRA-3064 — the sibling `<date>.md` rewrite that used to follow is gone.
+        // `patched.markdown` is a field on the object written on the line above,
+        // so the sidecar was a verbatim second copy that nothing read. Note this
+        // path only ever REWROTE an existing sidecar in place, so dropping it
+        // costs no inode today; it is removed so a patched report cannot
+        // resurrect a file the reclaim sweep just released.
         await writeFile(datePath, JSON.stringify(patched, null, 2), 'utf-8');
-        if (typeof patched.markdown === 'string') {
-          await writeFile(join(dir, `${t.date}.md`), patched.markdown, 'utf-8');
-        }
         out.filesPatched += 1;
         out.patchedDates.push(`${basename(dir)}/${t.date}:${t.value.toFixed(2)}`);
       } catch (err) {

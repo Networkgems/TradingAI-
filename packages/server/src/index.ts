@@ -653,6 +653,7 @@ import {
   runTra237OptionsReset,
   runTra241CalendarReset,
   runTra1472StaleCellCleanup,
+  runTra3064SidecarReclaim,
   runTra301DemoFreshStart,
   runTra330CryptoEquityReset,
   runTra338MegaUsdCleanup,
@@ -968,6 +969,13 @@ await runTra241CalendarReset();
 // pre-2026-06-09 days). Deletes only the leaked historical cell files; post-fix
 // cells are never touched. Idempotent via marker file.
 await runTra1472StaleCellCleanup();
+// TRA-3064 — release the write-only `<date>.md` report sidecars. `users/` was
+// the #1 unbounded inode holder on `/data` (55.0% of used inodes) and half of
+// its report files were verbatim copies of a field inside the sibling `.json`.
+// Runs EVERY boot, not once behind a marker: the write sites stopped emitting
+// sidecars in the same change, and this has to keep holding across a rollback
+// to a build that still does. Only removes a `.md` with a `.json` beside it.
+await runTra3064SidecarReclaim();
 // TRA-301 — full demo fresh-start: with the new strategy generation rolling
 // out for both Stocks and Crypto, the board asked to wipe every user's
 // persisted demo P&L, equity baselines, trade history, and calendar reports
@@ -1635,7 +1643,10 @@ async function generateAndSaveReport(
   }
 
   const datePath = join(targetDir, `${finalReport.date}.json`);
-  const mdPath = join(targetDir, `${finalReport.date}.md`);
+  // TRA-3064 — the `<date>.md` sidecar that used to be written here is GONE.
+  // It held a verbatim copy of `finalReport.markdown`, which is a field on the
+  // JSON written one line below, and nothing ever read it back. Two inodes per
+  // book per trading day for zero information. See `reports/report-sidecar-reclaim.ts`.
 
   // TRA-1398 — never let an EMPTY regeneration clobber a settled non-empty
   // report for the same day. The 21:00 archive writes today WITH trades, then
@@ -1672,18 +1683,19 @@ async function generateAndSaveReport(
 
   const writes: Promise<void>[] = [
     writeFile(datePath, JSON.stringify(finalReport, null, 2), 'utf-8'),
-    writeFile(mdPath, finalReport.markdown, 'utf-8'),
   ];
   // A backfill is for an old date — never let it become "latest".
   if (!backfill) {
     writes.push(
       writeFile(join(targetDir, 'latest.json'), JSON.stringify(finalReport, null, 2), 'utf-8'),
-      writeFile(join(targetDir, 'latest.md'), finalReport.markdown, 'utf-8'),
     );
   }
   // TRA-2817 — the durable ledger row must NOT be hostage to the report FILE.
   //
-  // These four writes each CREATE a file, and a create needs a free inode. The
+  // These writes each CREATE a file, and a create needs a free inode. (There
+  // were four; TRA-3064 dropped the two `.md` sidecars, which were verbatim
+  // copies of a field already inside the JSON — so this path now costs half the
+  // inodes it did during the outage described below.) The
   // snapshot persist below writes `daily-snapshots.json` IN PLACE, with no temp
   // file, so it needs only free blocks. When `/data` ran out of inodes on
   // 2026-07-30 those are opposite fates — and because the throw from here
@@ -2791,8 +2803,10 @@ async function backfillLiveRealizedCalendar(
       closeCountByDate.get(date) ?? 0,
       existing,
     );
+    // TRA-3064 — JSON only. The `<date>.md` sidecar this used to write beside it
+    // was a verbatim copy of `report.markdown`, a field on the object being
+    // serialized here, and no read path ever opened it.
     await writeFile(filePath, JSON.stringify(report, null, 2), 'utf-8');
-    await writeFile(join(dir, `${date}.md`), report.markdown, 'utf-8');
     written[date] = dayRealized;
   }
   log.info('live realized calendar backfill complete', {
@@ -2956,15 +2970,14 @@ async function generateAndSaveCryptoReport(ctx: UserContext): Promise<void> {
   };
   const targetDir = cryptoReportsDirFor(ctx, mode);
   const datePath = join(targetDir, `${report.date}.json`);
-  const mdPath = join(targetDir, `${report.date}.md`);
   const latestJsonPath = join(targetDir, 'latest.json');
-  const latestMdPath = join(targetDir, 'latest.md');
 
+  // TRA-3064 — the `<date>.md` / `latest.md` sidecars are gone. `report.markdown`
+  // is a field on the object serialized into the JSON beside them, so they were
+  // the same bytes on a second inode, and no read path ever opened them.
   await Promise.all([
     writeFile(datePath, JSON.stringify(report, null, 2), 'utf-8'),
-    writeFile(mdPath, report.markdown, 'utf-8'),
     writeFile(latestJsonPath, JSON.stringify(report, null, 2), 'utf-8'),
-    writeFile(latestMdPath, report.markdown, 'utf-8'),
   ]);
 
   // TRA-193 — persist the day's equity snapshot so the crypto P&L calendar and
