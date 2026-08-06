@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { PnlTracker, type DailySnapshot } from './pnl-tracker.js';
+import { PnlTracker, ANCHOR_BASIS_VERIFIED, type DailySnapshot } from './pnl-tracker.js';
 
 // TRA-1557 — the admin demo Calendar / footer showed a phantom all-time gain
 // (+$1,067) that disagreed with the realized daily-snapshot ledger (−$1,144).
@@ -326,7 +326,7 @@ describe('TRA-3039 — the day roll preserves an anchor a real close established
 // row and the clobbered row would publish the SAME declaration — a field that is
 // green by construction in exactly the case it exists to discriminate (the
 // TRA-2641 self-confirming trap, third occurrence). So the preserve branch
-// stamps `day-roll-preserved-prior-close`, a value NO earlier build can write.
+// stamps `verified-prior-session-close`, a value NO earlier build can write.
 describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated default', () => {
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3043-')); });
@@ -355,9 +355,9 @@ describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated d
     // The 21:00 ET write for the session the roll just opened.
     t2.saveSnapshot(snap(TODAY, 25_073.05, 25_090));
 
-    expect(basisOf(t2, TODAY)).toBe('day-roll-preserved-prior-close');
+    expect(basisOf(t2, TODAY)).toBe('verified-prior-session-close');
     // And it is DURABLE — the reader pulls this off a file, not off memory.
-    expect(basisOf(new PnlTracker(dir, 25_000), TODAY)).toBe('day-roll-preserved-prior-close');
+    expect(basisOf(new PnlTracker(dir, 25_000), TODAY)).toBe('verified-prior-session-close');
   });
 
   it('CONTROL — a PRE-FIX clobber cannot forge the marker', () => {
@@ -392,7 +392,7 @@ describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated d
     // point: absence of the marker is the evidence, and a stale
     // `prior-session-close` must never be read as a pass.
     expect(basisOf(t2, TODAY)).toBe('prior-session-close');
-    expect(basisOf(t2, TODAY)).not.toBe('day-roll-preserved-prior-close');
+    expect(basisOf(t2, TODAY)).not.toBe('verified-prior-session-close');
   });
 
   // A book that was RUNNING on a past session and never booked a close for it:
@@ -482,5 +482,136 @@ describe('TRA-3043 — openingEquityBasis is a POSITIVE marker, not a restated d
     const t2 = new PnlTracker(dir, 25_000);
     t2.saveSnapshot(snap(TODAY, 26_000, 26_100));
     expect(basisOf(t2, TODAY)).toBeUndefined();
+  });
+});
+
+// TRA-3043 — THE ATTESTATION, and the live incident that forced it.
+//
+// `advanceDayIfNeeded` is constructor-only, so exactly ONE process per ET day
+// performs that day's roll. On 2026-08-06 that process was a PRE-fix build:
+// `00a8cbb4` (which does not contain 7c373dc) held bqb1 from 03:54:36Z across
+// the 04:00Z ET-day boundary, and the fixed build `1773877` only took over at
+// 04:33:22Z — by which time `openingDate` was already stamped 2026-08-06 and the
+// fixed build's constructor returned without touching, or saying, anything.
+//
+// A marker meaning "the fixed roll ran" would therefore have been SILENT on the
+// exact session it was built to grade, and would have stayed silent for the
+// whole class of days where an old build happens to hold the box across
+// midnight ET. The marker instead asserts the INVARIANT — `openingEquity`
+// equals the newest recorded session's `closingEquity` — which any boot can
+// check against durable state regardless of which build rolled the day.
+describe('TRA-3043 — a boot that INHERITS an anchor can still vouch for it', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3043b-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const TODAY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const PRIOR = '2020-01-06';
+
+  // The on-disk residue of an EARLIER process having already rolled into today.
+  // `openingEquity` is supplied by the caller so both outcomes of that roll —
+  // sound and clobbered — can be set up from the same helper.
+  const earlierProcessAlreadyRolled = (openingEquity: number) => {
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveEquity(25_000, 0);
+    t1.saveSnapshot(snap(PRIOR, 25_000, 25_073.05)); // the recorded close
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    raw['openingDate'] = TODAY;
+    raw['openingEquity'] = openingEquity;
+    raw['openingEquityBasis'] = 'prior-session-close'; // what a pre-fix build leaves
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+  };
+
+  it('a SOUND inherited anchor is attested, and the attestation reaches the row', () => {
+    // The 2026-08-06 good case: the pre-fix build rolled, but this book was not
+    // one the defect moved, so the anchor still equals the recorded close.
+    earlierProcessAlreadyRolled(25_073.05);
+
+    const t = new PnlTracker(dir, 25_000);
+    expect(t.getAnchorState().openingEquityBasis).toBe(ANCHOR_BASIS_VERIFIED);
+    expect(t.getAnchorState().openingEquity).toBeCloseTo(25_073.05, 6);
+    // Readable on the row too, once the 21:00 ET write lands.
+    t.saveSnapshot(snap(TODAY, 25_073.05, 25_090));
+    expect(t.getSnapshots().find(s => s.date === TODAY)?.openingEquityBasis)
+      .toBe(ANCHOR_BASIS_VERIFIED);
+  });
+
+  it('CONTROL — a CLOBBERED inherited anchor is NOT attested', () => {
+    // The 2026-08-06 bad case, and the one the whole field exists for: the
+    // pre-fix roll overwrote the recorded 25,073.05 close with the stale
+    // trade-path cache. The invariant fails, so nothing is written and the stale
+    // `prior-session-close` stands — which must never be read as a pass.
+    earlierProcessAlreadyRolled(25_000);
+
+    const t = new PnlTracker(dir, 25_000);
+    expect(t.getAnchorState().openingEquityBasis).toBe('prior-session-close');
+    expect(t.getAnchorState().openingEquityBasis).not.toBe(ANCHOR_BASIS_VERIFIED);
+    // Prevent-only is unchanged: attesting never REPAIRS. The broken anchor
+    // survives, and the row it produces is still wrong — it just says so.
+    expect(t.getAnchorState().openingEquity).toBeCloseTo(25_000, 6);
+  });
+
+  it('attestation is idempotent — a re-boot rewrites nothing', () => {
+    earlierProcessAlreadyRolled(25_073.05);
+    const stateFile = join(dir, 'equity-state.json');
+    new PnlTracker(dir, 25_000);
+    const afterFirst = readFileSync(stateFile, 'utf-8');
+    new PnlTracker(dir, 25_000);
+    expect(readFileSync(stateFile, 'utf-8')).toBe(afterFirst);
+  });
+
+  it('CONTROL — an UNMEASURED close cannot be attested against', () => {
+    // TRA-2829: a back-filled row with `closingEquity: null` is not a close the
+    // invariant can be checked against. Silence, not a match.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveEquity(25_000, 0);
+    t1.saveSnapshot({
+      date: PRIOR, openingEquity: null, closingEquity: null,
+      dailyPnl: 0, optionsPnl: 0, combinedPnl: 0, trades: 0,
+    });
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    raw['openingDate'] = TODAY;
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+
+    const t = new PnlTracker(dir, 25_000);
+    expect(t.getAnchorState().openingEquityBasis).not.toBe(ANCHOR_BASIS_VERIFIED);
+  });
+
+  it('CONTROL — a close booked FOR the open day is not a PRIOR session', () => {
+    // `latest.date < openingDate` is what makes this a statement about a
+    // COMPLETED prior session. When `saveSnapshot` has just booked today's close
+    // the two are equal, the day has not rolled, and `prior-session-close`
+    // already describes the anchor exactly — re-badging it as attested would
+    // claim a telescope across a session that has not ended.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveSnapshot(snap(TODAY, 25_000, 25_073.05));
+    expect(t1.getAnchorState().openingDate).toBe(TODAY);
+
+    const t2 = new PnlTracker(dir, 25_000);
+    expect(t2.getAnchorState().openingEquityBasis).toBe('prior-session-close');
+  });
+
+  it('a REBASE is not attested away', () => {
+    // TRA-138. A starting-balance edit deliberately moves the anchor off the
+    // prior close, so the invariant fails and `rebase` survives the next boot —
+    // the declaration stays the one that is true.
+    const t1 = new PnlTracker(dir, 25_000);
+    t1.saveSnapshot(snap(PRIOR, 25_000, 25_073.05));
+    t1.syncOpeningEquity(30_000, 0);
+    const stateFile = join(dir, 'equity-state.json');
+    const raw = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+    raw['openingDate'] = TODAY;
+    writeFileSync(stateFile, JSON.stringify(raw), 'utf-8');
+
+    const t2 = new PnlTracker(dir, 25_000);
+    expect(t2.getAnchorState().openingEquityBasis).toBe('rebase');
+  });
+
+  it('getAnchorState reports an absent basis as null, never an empty string', () => {
+    const t = new PnlTracker(dir, 25_000);
+    expect(t.getAnchorState().openingEquityBasis).toBeNull();
+    expect(t.getAnchorState().openingDate).toBe(TODAY);
   });
 });

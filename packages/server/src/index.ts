@@ -4663,6 +4663,16 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
           mode,
           eodBackfillPlan,
           eodInterior,
+          // TRA-3043 — the LIVE opening-equity anchor and its provenance.
+          //
+          // `days[].openingEquity` / `days[].openingEquityBasis` are the durable
+          // record, but a row only exists after the 21:00 ET archive has run.
+          // This is the same declaration readable WHILE the session is open, and
+          // it is the only way to answer "is today's anchor sound?" before the
+          // write that spends today's grade. `openingEquityBasis:
+          // 'verified-prior-session-close'` means a boot checked this number
+          // against the newest recorded close and they matched.
+          anchor: ctx.tracker.getAnchorState(),
           openLiveJournalRowCount: openLiveRows == null ? null : openLiveRows.length,
           openLiveJournalAtRiskUsd: openLiveRows == null
             ? null

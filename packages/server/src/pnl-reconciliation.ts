@@ -324,9 +324,11 @@ export interface PnlReconcileDay {
    * TRA-3043 — WHICH authority set {@link openingEquity}, as declared by the
    * writer on the row itself. See {@link DailySnapshot.openingEquityBasis} for
    * the value set and, in particular, for why
-   * `day-roll-preserved-prior-close` is the POST-FIX discriminator: no build
-   * before TRA-3039 can emit it, so its presence is evidence the fixed day roll
-   * governed this session and its absence is evidence some other build did.
+   * `verified-prior-session-close` is the POST-FIX discriminator: no build
+   * before TRA-3043 can emit it, and it is written only after a boot has CHECKED
+   * `openingEquity` against the newest recorded close. Its presence is evidence
+   * the telescoping invariant held; its absence is evidence nobody could vouch
+   * for the anchor — never a pass.
    *
    * `null` is NOT MEASURED. Two very different rows land here — one written by a
    * pre-TRA-3043 build, and a back-fill row whose historical anchor the live

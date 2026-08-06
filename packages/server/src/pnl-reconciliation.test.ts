@@ -2354,13 +2354,13 @@ describe('TRA-3043 — openingEquity / openingEquityBasis reach the payload', ()
 
   it('publishes the recorded anchor and the writer declaration verbatim', () => {
     const res = reconcilePnl(
-      [row('2026-08-06', { openingEquityBasis: 'day-roll-preserved-prior-close' })],
+      [row('2026-08-06', { openingEquityBasis: 'verified-prior-session-close' })],
       new Map(),
       '2026-01-01',
     );
     const d = res.days.find(x => x.date === '2026-08-06')!;
     expect(d.openingEquity).toBe(25_000);
-    expect(d.openingEquityBasis).toBe('day-roll-preserved-prior-close');
+    expect(d.openingEquityBasis).toBe('verified-prior-session-close');
   });
 
   it('the telescoping invariant is now a comparison of two PUBLISHED fields', () => {

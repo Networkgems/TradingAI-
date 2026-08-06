@@ -84,11 +84,14 @@ export interface DailySnapshot {
    * Values are exactly {@link PersistedState.openingEquityBasis}'s, plus the
    * positive marker only the TRA-3039 day roll can write:
    *
-   *  - `day-roll-preserved-prior-close` — the FIXED `advanceDayIfNeeded` ran for
-   *    this session, found the anchor already equal to the prior session's
-   *    recorded close, and preserved it. **This value cannot be written by any
-   *    build before TRA-3039**, which is what makes it usable as the POST-FIX
-   *    discriminator rather than a claim about a deploy report.
+   *  - `verified-prior-session-close` ({@link ANCHOR_BASIS_VERIFIED}) — a boot
+   *    CHECKED `openingEquity` against the newest recorded session's
+   *    `closingEquity` and they matched, i.e. the telescoping invariant holds.
+   *    **No build before TRA-3043 can write this string**, which is what makes
+   *    it the discriminator — and it is phrased as a claim about the ANCHOR, not
+   *    about which build rolled the day, so a boot that merely INHERITS a
+   *    correct anchor can still vouch for it. See {@link ANCHOR_BASIS_VERIFIED}
+   *    for the 2026-08-06 case that forced that distinction.
    *  - `prior-session-close` — the anchor was last written by `saveSnapshot` and
    *    no day roll has re-declared it since. On a row dated AFTER the session
    *    that set it, this means the roll for this session was performed by a
@@ -226,6 +229,29 @@ interface PersistedState {
  * always moves it by whole dollars.
  */
 const ANCHOR_MATCH_EPSILON_USD = 0.005;
+
+/**
+ * TRA-3043 — the ATTESTED value of {@link PersistedState.openingEquityBasis}.
+ *
+ * Its meaning is one sentence, and the sentence is deliberately about the
+ * ANCHOR rather than about which branch of which build ran: *at the last boot,
+ * `openingEquity` was verified equal to the `closingEquity` of the newest
+ * recorded session, and that session is strictly older than `openingDate`.*
+ * That is the telescoping invariant `openingEquity(N) === closingEquity(N−1)`,
+ * which is precisely what the TRA-3039 day-roll defect breaks.
+ *
+ * Stated that way it survives the case that actually occurred on 2026-08-06: a
+ * PRE-fix build (`00a8cbb4`) held the box across the 04:00Z ET-day boundary and
+ * a fixed build took over 39 minutes later, so the fixed build never performed
+ * that day's roll and had no roll-branch on which to report. A marker that
+ * claimed "the fixed roll ran" would have been silent on the one session it was
+ * built to grade. A marker that claims the invariant holds can be checked by any
+ * boot, at any time, against durable state.
+ *
+ * No build before TRA-3043 can emit this string, so its ABSENCE remains the
+ * evidence — a stale `prior-session-close` is never a pass.
+ */
+export const ANCHOR_BASIS_VERIFIED = 'verified-prior-session-close';
 
 function todayKey(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
@@ -378,9 +404,77 @@ export class PnlTracker {
    * leak TRA-1557 reconciles `allTimePnl` against — so it now says so on disk
    * via {@link PersistedState.openingEquityBasis}.
    */
+  /**
+   * TRA-3043 — verify the LIVE anchor against the newest recorded close and,
+   * when it holds, say so on disk. Writes provenance; never touches the anchor.
+   *
+   * WHY THIS EXISTS AT ALL, rather than trusting the roll branch to report.
+   * `advanceDayIfNeeded` is constructor-only, so exactly one process per ET day
+   * performs that day's roll — and on 2026-08-06 that process was a PRE-fix
+   * build. It rolled at some point after 04:00Z, wrote no provenance, and the
+   * fixed build that replaced it at 04:33Z found `openingDate` already stamped
+   * and returned without a word. Nothing in the roll path could have graded that
+   * session, because the fixed build was never the one that rolled it.
+   *
+   * The invariant, though, is still sitting in durable state and can be checked
+   * by whoever boots next:
+   *
+   *     openingEquity === closingEquity(newest recorded session)
+   *
+   * If a pre-fix roll clobbered the anchor off `state.equity`, this comparison
+   * FAILS and nothing is written — the honest absent. If it holds, the anchor is
+   * sound no matter which build put it there, and that is the fact being graded.
+   *
+   * The `latest.date < openingDate` guard is what makes this a statement about a
+   * COMPLETED prior session. When they are equal, `saveSnapshot` has just booked
+   * a close for the currently-open date; the anchor is that close, the day has
+   * not rolled, and `prior-session-close` already describes it exactly.
+   */
+  private attestAnchorAgainstLatestClose(): void {
+    if (this.state.openingEquityBasis === ANCHOR_BASIS_VERIFIED) return; // idempotent, no churn
+    const latest = this.latestSnapshot();
+    if (latest === null) return;
+    if (!(latest.date < this.state.openingDate)) return;
+    const close = latest.closingEquity;
+    if (close === null || !Number.isFinite(close)) return;
+    if (!Number.isFinite(this.state.openingEquity)) return;
+    if (Math.abs(close - this.state.openingEquity) > ANCHOR_MATCH_EPSILON_USD) return;
+    this.state.openingEquityBasis = ANCHOR_BASIS_VERIFIED;
+    this.persistState();
+  }
+
+  /**
+   * TRA-3043 — the LIVE anchor and its provenance, for publication on
+   * `/api/health/pnl-reconciliation` beside the per-row copy.
+   *
+   * The row-level field is the durable record, but it only exists once the 21:00
+   * ET writer has run. This is the same declaration readable BEFORE that write —
+   * which is the only way to answer "is today's anchor sound?" while today is
+   * still in progress, instead of finding out from the row that today's grade
+   * was already spent.
+   */
+  getAnchorState(): { openingDate: string; openingEquity: number; openingEquityBasis: string | null } {
+    return {
+      openingDate: this.state.openingDate,
+      openingEquity: this.state.openingEquity,
+      openingEquityBasis: typeof this.state.openingEquityBasis === 'string'
+        && this.state.openingEquityBasis !== ''
+        ? this.state.openingEquityBasis
+        : null,
+    };
+  }
+
   private advanceDayIfNeeded(): void {
     const today = todayKey();
-    if (this.state.openingDate === today) return;
+    if (this.state.openingDate === today) {
+      // TRA-3043 — the day is already open, so there is nothing to roll. ATTEST
+      // anyway. See `attestAnchorAgainstLatestClose`: this branch is the one a
+      // build reaches when it boots into a day some EARLIER process already
+      // rolled, and it is the only opportunity that build has to say anything at
+      // all about the anchor it inherited.
+      this.attestAnchorAgainstLatestClose();
+      return;
+    }
     if (this.anchorIsPriorSessionClose()) {
       // The anchor is already `closingEquity(N-1)`. Stamp the new day onto it and
       // leave the equity/options anchors untouched, so the rows telescope.
@@ -396,7 +490,7 @@ export class PnlTracker {
       // be silent in exactly the situation it exists to discriminate. Stamping a
       // value no earlier build can produce makes its ABSENCE the evidence:
       // whichever build rolled this session, it was not this one.
-      this.state.openingEquityBasis = 'day-roll-preserved-prior-close';
+      this.state.openingEquityBasis = ANCHOR_BASIS_VERIFIED;
       this.persistState();
       return;
     }
