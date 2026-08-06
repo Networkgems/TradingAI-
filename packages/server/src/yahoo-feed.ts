@@ -602,15 +602,33 @@ export function getTradierBarPullRateState(now: number = Date.now()): {
 // (Infinity) so the wired throttle is provably inert on the frozen bqb1 host
 // until an operator opts in via the env knob.
 //
-// Enable target RECALIBRATED to ~200 (TRA-2170 board disposition A, 2026-07-24).
-// The original spec's ~150 sits BELOW the measured 173-193/min steady-state
-// bar-pull rate at 568 symbols, so a 150 ceiling would defer COLD pulls
-// continuously and age cold candles past the shard cadence — a TRA-1539
-// regression. ~200 sits at the account-wide Tradier market-data budget and just
-// above steady-state: it never bites in the steady state, and on MTF-burst
-// minutes (~217-222/min) it trims only the COLD-pull contribution back toward
-// the ~200/min budget, reserving headroom for the freshness-critical quote path
-// without starving cold-candle freshness.
+// ⛔ DO NOT SET THIS FROM A NUMBER WRITTEN IN THIS FILE. RE-MEASURE FIRST.
+//
+// THE INVARIANT (true whenever it is read): the ceiling MUST sit ABOVE the
+// steady-state bar-pull rate at the CURRENT symbol universe. A ceiling at or
+// below steady state defers COLD pulls CONTINUOUSLY and ages cold candles past
+// the shard cadence — the TRA-1539 regression. It is only a burst trim when it
+// sits above the steady state and below the account-wide Tradier budget; that is
+// a window, and BOTH of its edges move.
+//
+// WHY NO CONSTANT HERE IS SAFE TO INHERIT: this is an ABSOLUTE req/min value
+// bounding a quantity that scales with the universe, and the universe grows.
+// The spec's original ~150 was already below the then-measured steady state.
+// Disposition A (2026-07-24) recalibrated the enable target to ~200 against a
+// steady state measured at **568 symbols** — and by 2026-08-06 the universe was
+// **633** (+11.4%), which pushes the scaled steady-state band up onto and across
+// 200. So the recalibrated figure went stale in under two weeks, in the direction
+// of the regression, without a single line of this file changing. Any successor
+// number will do the same.
+//
+// BEFORE ENABLING: measure the steady-state mean at the live universe with
+//   node scripts/tra2170-barpull-calibration.mjs --mark --report --ceiling=<n>
+// (two sparse in-RTH marks, cumulative-counter differenced, build-pin asserted).
+// It emits an explicit DO-NOT-SET verdict when the candidate is at or under the
+// measured mean. Note also that enabling is an env write, which redeploys bqb1
+// (`trigger: service_updated`, TRA-2186) and therefore resets the TRA-1648 soak
+// clock — sequence it against that grade, off-hours.
+//
 // See barPullThrottleGate below for the scope caveat (this is NOT the C4 fix).
 const TRADIER_BAR_PULL_CEILING = (() => {
   const raw = Number(process.env['TRADIER_BAR_PULL_CEILING']);
@@ -628,10 +646,20 @@ const TRADIER_BAR_PULL_CEILING = (() => {
  * `159816ca`): at all six `stale-state` windows `quotePathOpen` was false, zero
  * `Quota Violation`, zero quote-breaker trips — the C4 dark-feed was quote-
  * freshness STAMP starvation, fixed by `e5f43b4` (decoupled 30s quote refresh,
- * live on bqb1). This ceiling is therefore NOT the C4 remedy. It is retained as
- * OPT-IN quota-headroom / doTick-I/O-relief insurance (the 568-symbol signal
- * doTick wall-clock 900-1489s problem): trimming COLD bar-pull volume reduces
- * per-tick upstream I/O and keeps total load under the account budget.
+ * live on bqb1). This ceiling is therefore NOT the C4 remedy.
+ *
+ * It was then re-targeted (disposition A, 2026-07-24) at the second rationale:
+ * doTick-I/O relief for the signal `doTick` wall-clock (900-1489s at 568 symbols).
+ * ⚠️ THAT RATIONALE IS ALSO NOW DISCHARGED: TRA-2171 closed `done` on 2026-08-06
+ * against its pre-registered bar on the 2026-08-05 RTH tape — `signal.doTick` p90
+ * 21.87s vs a 45s bar and max 67.14s vs a 300s ceiling, measured at the CURRENT
+ * (larger) universe and with this ceiling INERT. doTick is inside its bound
+ * without it.
+ *
+ * What remains is OPT-IN quota-headroom insurance against a hazard that has not
+ * recurred since `e5f43b4`. Both named rationales having been discharged, enabling
+ * it is a cost (an env write redeploys bqb1) with no measured benefit — so treat
+ * "enable this" as a decision that needs fresh evidence, not as a pending action.
  *
  * Decision:
  *   • disabled (unset / non-positive / non-finite ceiling) → never defer;
