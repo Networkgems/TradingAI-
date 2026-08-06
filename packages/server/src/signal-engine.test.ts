@@ -56,6 +56,15 @@ vi.mock('./yahoo-feed.js', () => ({
   tripYahooBreakerFromExternal: vi.fn(),
   setActiveInterestSymbols: vi.fn(),
   setTradierStocksFeedClient: vi.fn(),
+  // TRA-3068 — the split calendar `applyQuotes` consults when it stamps
+  // `moveSuspect`. Inert here: the calendar leg is exercised in
+  // `quote-plausibility.test.ts` against the deployed predicate, and the point
+  // of this stub is that the ratio-rule behaviour these tests assert is
+  // UNCHANGED when no split is known. Per the note above, a name missing from
+  // this factory is an undefined import, not a pass-through.
+  knownSplitForSession: vi.fn(() => null),
+  knownSplits: vi.fn(() => []),
+  fetchRecentSplits: vi.fn(async () => []),
 }));
 import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 // TRA-2262 — the per-tick fan-out bound on the doTick sinks.

@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 import { annotateReportProvenance, INLINE_SUSPECT_MARK } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
-import { isMoveSuspect, type EodMover, type OptionPosition, type Position } from '@trading-app/shared';
+import {
+  isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO,
+  type EodMover, type OptionPosition, type Position, type CorporateAction,
+} from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -897,6 +900,119 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
     const day1 = row('FGMC', 8.30, 69.04276985743381);
     const report = reportFor([day1, ...GENUINE], [{ symbol: 'SOXL', price: 109.54, changePct: -3.1 }]);
     expect(report.top5Movers[0].symbol).toBe('FGMC');
+  });
+
+  // ── TRA-3068 — ACCEPTANCE at the REPORT BOUNDARY ───────────────────────────
+  //
+  // Nested inside this describe so it reuses the SAME `reportFor` and the SAME
+  // GENUINE table the two instruments above are graded against — the third leg
+  // has to be shown adding something to that exact board, not to a friendlier one.
+  //
+  // The worked example is the ticket's: UPC live 2026-06-30, `12.18 -> 6.10`,
+  // published -49.92%, session ratio 1.9968 (0.16% UNDER the r >= 2 bar),
+  // continuity residual 1.000042 => `consistent`, RANKED #3 in the shipped table.
+  // This is NOT a claim UPC was a split: a genuine -50% session has IDENTICAL
+  // arithmetic, and that indistinguishability IS the finding. It shows the hole
+  // is OCCUPIED rather than theoretical, which is why the ex-date has to come
+  // from outside the row.
+  describe('TRA-3068 — a KNOWN corporate action cannot be the headline', () => {
+    const UPC = row('UPC', 6.10, -49.92);
+    const UPC_PRIOR = [{ symbol: 'UPC', price: 12.18, changePct: 3.4 }];
+    const SPLIT_2_1: CorporateAction = {
+      exDate: '2026-07-16', numerator: 2, denominator: 1, splitRatio: '2:1',
+    };
+    // `reportFor` above pins `priorSessionDate` to 2026-07-16 whenever a prior
+    // table is passed, so the ex-date window here is (2026-07-16, 2026-07-17].
+    const CURRENT_SESSION = '2026-07-17';
+    const EX_DATE_IN_WINDOW = '2026-07-17';
+
+    const reportWithCalendar = (
+      splits: Record<string, readonly CorporateAction[]>,
+      currentSessionDate = CURRENT_SESSION,
+    ) => generateEodReport({
+      state: makeEngineState({ symbols: [UPC, ...GENUINE] }),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+      priorSessionMovers: UPC_PRIOR,
+      priorSessionDate: '2026-07-16',
+      knownSplits: new Map(Object.entries(splits)),
+      currentSessionDate,
+    });
+
+    it('POSITIVE CONTROL — BOTH deployed instruments are genuinely blind to this row', () => {
+      // Without this the exclusion below could be another rule's work, and the
+      // whole ticket is about a claim of coverage that was not real.
+      const session = assessQuotePlausibility(UPC);
+      expect(session.suspect).toBe(false);
+      expect(session.ratio!).toBeLessThan(SUSPECT_MOVE_RATIO);
+      expect(session.ratio!).toBeCloseTo(1.9968, 3);          // 0.16% under the bar
+      expect(isMoveSuspect(UPC)).toBe(false);
+
+      const cont = assessLevelContinuity(UPC_PRIOR[0], UPC);
+      expect(cont.verdict).toBe('consistent');
+      expect(cont.residual!).toBeCloseTo(1.000042, 5);
+
+      // …and with no calendar it therefore RANKS, exactly as it shipped.
+      expect(reportFor([UPC, ...GENUINE], UPC_PRIOR).top5Movers.map(m => m.symbol)).toContain('UPC');
+    });
+
+    it('excludes it once the split calendar knows the ex-date', () => {
+      const report = reportWithCalendar({
+        UPC: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }],
+      });
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('UPC');
+      expect(report.top5Movers[0].symbol).toBe('SOXL');
+      expect(report.markdown).not.toContain('UPC');
+    });
+
+    it('NEGATIVE CONTROL — an ex-date OUTSIDE the window leaves the row ranked', () => {
+      // Proves the WINDOW is doing the work, not the mere presence of a calendar
+      // entry. A guard that fired on "this symbol has ever split" would flag the
+      // row for weeks afterwards and pass every assertion above.
+      const before = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: '2026-07-16' }] });
+      expect(before.top5Movers.map(m => m.symbol)).toContain('UPC');   // ON the prior session
+      const after = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: '2026-07-20' }] });
+      expect(after.top5Movers.map(m => m.symbol)).toContain('UPC');    // in the FUTURE
+    });
+
+    it('an empty / absent calendar changes nothing — the leg is inert by default', () => {
+      // The property that lets this ship without re-grading the archive: every
+      // caller that does not supply a calendar gets the pre-TRA-3068 report.
+      expect(reportWithCalendar({}).top5Movers.map(m => m.symbol)).toContain('UPC');
+      expect(reportWithCalendar({ UPC: [] }).top5Movers.map(m => m.symbol)).toContain('UPC');
+    });
+
+    it('defaults the window`s upper bound to the REPORT`s own session date', () => {
+      // Not a no-op default: a caller that omits `currentSessionDate` still gets
+      // the leg, bounded by the date the report is FOR. Asserted because a silent
+      // "no session date => inert" would make the guard depend on a field nobody
+      // remembers to pass, which is how TRA-1448`s flag went quietly un-applied.
+      const report = generateEodReport({
+        state: makeEngineState({ symbols: [UPC, ...GENUINE] }),
+        allClosedPositions: [],
+        dailySignals: [],
+        signalTypeMap: new Map(),
+        priorSessionMovers: UPC_PRIOR,
+        priorSessionDate: '2026-07-16',
+        knownSplits: new Map([['UPC', [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }]]]),
+      }, EX_DATE_IN_WINDOW);
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('UPC');
+    });
+
+    it('does not condemn the genuine movers standing beside it', () => {
+      // The over-broad failure mode: a calendar keyed loosely, or a window that
+      // ignores the symbol, would empty the table while passing every assertion
+      // about UPC being gone.
+      const report = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }] });
+      expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
+    });
+
+    it('a calendar entry on a DIFFERENT symbol does not reach this row', () => {
+      const report = reportWithCalendar({ SOXL: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }] });
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('SOXL');
+      expect(report.top5Movers.map(m => m.symbol)).toContain('UPC');
+    });
   });
 
   it('KNOWN-GOOD — a quiet name printing the same close twice is still ranked', () => {

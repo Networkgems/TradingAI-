@@ -654,7 +654,9 @@ import {
   MARKETABLE_MTM_SCOPE,
 } from './marketable-mtm-forward-validation.js';
 import type { TradierEnv } from '@trading-app/shared';
-import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals } from './yahoo-feed.js';
+// TRA-3068 — the split calendar, read at the EOD report's generation path.
+import type { CorporateAction } from '@trading-app/shared';
+import { fetchQuotes, fetchDailyCandles, fetchTradierDailyCandles, fetchShortInterestFundamentals, fetchRecentSplits } from './yahoo-feed.js';
 import {
   runFirstBootMigration,
   runTra237OptionsReset,
@@ -1549,6 +1551,62 @@ async function generateAndSaveReport(
   }
   finalSnapshot.priorSessionMovers = priorSessionMovers;
   finalSnapshot.priorSessionDate = priorSessionDate;
+
+  // TRA-3068 (measured on TRA-3065) — read the SPLIT CALENDAR for the rows that
+  // could actually take the headline.
+  //
+  // The two deployed plausibility rules are internal-consistency tests, and an
+  // unadjusted corporate action is internally CONSISTENT, so neither reaches the
+  // class at any threshold: a flat 3:2 forward split publishes -33.33% at
+  // r = 1.4999 with a continuity residual of 1.00005, and both verdicts come back
+  // clean. The ex-date is the only input that distinguishes it from a genuine
+  // -33% session, and it has to be fetched — it is not on the row.
+  //
+  // ⛔ SCOPE, stated because a bounded sweep that does not say so reads as full
+  // coverage. Only rows whose |changePct| could plausibly rank are looked up, so
+  // this is NOT a census of the universe: a split on a quiet symbol is not
+  // fetched and not flagged. That is the right trade here — the defect this
+  // guards is a FABRICATED HEADLINE, and a row that cannot reach the table cannot
+  // fabricate one — but it means an absent calendar entry says "not looked up",
+  // never "no split". The census inside `top5Movers` prints the reached count.
+  //
+  // Cost: one `1d` chart call per candidate, once per session, capped, on a
+  // request shape the feed already makes (`events` is one query-string key). It
+  // honours the shared Yahoo breaker and returns nothing on failure, so a dark
+  // Yahoo degrades this report to its pre-TRA-3068 behaviour rather than
+  // blocking it.
+  const knownSplits = new Map<string, readonly CorporateAction[]>();
+  {
+    const SPLIT_LOOKUP_MIN_ABS_PCT = 10;
+    const SPLIT_LOOKUP_MAX_SYMBOLS = 25;
+    const lookupTargets = (finalSnapshot.state?.symbols ?? [])
+      .filter(s => s.lastUpdated > 0 && s.price > 0 && Number.isFinite(s.changePct)
+        && Math.abs(s.changePct) >= SPLIT_LOOKUP_MIN_ABS_PCT)
+      .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
+      .slice(0, SPLIT_LOOKUP_MAX_SYMBOLS);
+    for (const s of lookupTargets) {
+      try {
+        knownSplits.set(s.symbol.toUpperCase(), await fetchRecentSplits(s.symbol));
+      } catch (err) {
+        // A calendar miss must never cost the report. Absent => the leg is inert
+        // for that symbol, i.e. the pre-TRA-3068 behaviour.
+        log.warn('TRA-3068 split-calendar lookup failed — the ex-date leg abstains for this symbol', {
+          username: ctx.username,
+          symbol: s.symbol,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    log.info('TRA-3068 split-calendar lookup', {
+      username: ctx.username,
+      candidatesConsidered: lookupTargets.length,
+      minAbsChangePct: SPLIT_LOOKUP_MIN_ABS_PCT,
+      cap: SPLIT_LOOKUP_MAX_SYMBOLS,
+      symbolsResolved: knownSplits.size,
+      symbolsWithAnySplit: [...knownSplits.values()].filter(v => v.length > 0).length,
+    });
+  }
+  finalSnapshot.knownSplits = knownSplits;
 
   let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
 

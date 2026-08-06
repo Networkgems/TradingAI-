@@ -10,7 +10,11 @@ import {
   describeLevelContinuity,
   CONTINUITY_RESIDUAL_TOLERANCE,
   REPUBLICATION_CHANGE_PCT_EPSILON,
+  corporateActionFactor,
+  corporateActionInSessionWindow,
+  describeCorporateAction,
   type QuoteMoveRow,
+  type CorporateAction,
 } from './quote-plausibility.js';
 
 /**
@@ -508,5 +512,301 @@ describe('TRA-2634 abstain — a blind read must never read as a clean one', () 
   it('never returns a residual it did not compute', () => {
     expect(assessLevelContinuity(null, { price: 1, changePct: 1 }).residual).toBeNull();
     expect(assessLevelContinuity({ price: 1, changePct: 1 }, { price: 1, changePct: 1 }).residual).toBeNull();
+  });
+});
+
+// ── TRA-3068 — THE SPLIT CALENDAR ─────────────────────────────────────────────
+//
+// Filed off TRA-3065, where the question was MEASURED and came back GAP: a
+// corporate action with factor < 2.0 evades BOTH deployed detectors, and no
+// threshold change reaches it. Every row below is built the way
+// `scripts/tra3065-corporate-action-evasion.mjs` builds its grid — the row a feed
+// actually publishes on an ex-date — so these tests and that checker grade the
+// same artifact from two directions.
+//
+//   D-1  our published close is the pre-action level P0.
+//   D    ex-date. Traded price P1 = (P0 / k) * (1 + m), `m` a GENUINE session move.
+//   (a) UNADJUSTED feed  prevClose_D = P0       -> `changePct` is FABRICATED
+//   (b) ADJUSTED   feed  prevClose_D = P0 / k   -> `changePct` is CORRECT
+//
+// ⛔ EVERY assertion here is paired with the SAME row assessed WITHOUT the
+// calendar. Without that negative control a green test proves only that the row
+// is suspect, not that the NEW LEG is what made it so — and "already caught by
+// the ratio rule" is the exact failure mode this ticket exists to correct.
+
+const CA_P0 = 12.34;
+const round2dp = (x: number) => Math.round(x * 100) / 100;
+
+/** The row a feed publishes on the ex-date, under behaviour `a` or `b`. */
+function exDateRow(k: number, mPct: number, behaviour: 'a' | 'b') {
+  const price = (CA_P0 / k) * (1 + mPct / 100);
+  const feedPrevClose = behaviour === 'a' ? CA_P0 : CA_P0 / k;
+  return { price, changePct: round2dp(((price - feedPrevClose) / feedPrevClose) * 100) };
+}
+
+const SPLIT_3_2: CorporateAction = {
+  exDate: '2026-06-30', numerator: 3, denominator: 2, splitRatio: '3:2',
+};
+const CA_PRIOR = { price: CA_P0, changePct: 1.23 };
+
+/**
+ * The residual an UNADJUSTED ex-date row can reach, DERIVED rather than fitted.
+ *
+ * Under (a) the residual is algebraically 1; it misses only because `changePct`
+ * publishes on a 2-dp grid, and the same expression the
+ * `CONTINUITY_RESIDUAL_TOLERANCE` docblock uses bounds that: a half-grid of
+ * 0.005 pct points gives `d(impliedPrev)/impliedPrev = 0.005 / |100 + pct|`.
+ *
+ * Asserted this way for the reason `tra3065-corporate-action-evasion.mjs` states
+ * outright — a hand-picked `toBeCloseTo` slack would let a REAL residual hide
+ * inside the tolerance and the test would still be green.
+ */
+const twoDpRoundingBound = (publishedPct: number) => 1 + 0.005 / Math.abs(100 + publishedPct);
+
+describe('TRA-3068 the gap: a sub-2.0 corporate action, WITH and WITHOUT the calendar', () => {
+  // The exact row TRA-3065 proved evades both detectors: a FLAT 3:2 forward
+  // split. Published -33.33%, session ratio 1.4999, residual 1.00005.
+  const flat32a = exDateRow(1.5, 0, 'a');
+
+  it('NEGATIVE CONTROL — without the calendar the row is clean on BOTH rules', () => {
+    const session = assessQuotePlausibility(flat32a);
+    expect(session.suspect).toBe(false);
+    expect(session.ratio!).toBeLessThan(SUSPECT_MOVE_RATIO);
+    expect(session.ratio!).toBeCloseTo(1.5, 3);
+
+    const cont = assessLevelContinuity(CA_PRIOR, flat32a);
+    expect(cont.verdict).toBe('consistent');
+    expect(cont.residual!).toBeLessThan(CONTINUITY_RESIDUAL_TOLERANCE);
+    // The load-bearing number from the ticket: under (a) the residual is not
+    // merely inside the tolerance, it is AT the identity. The continuity rule is
+    // blind here by ALGEBRA, not by a threshold being slightly too loose — which
+    // is what the corrected `:214` comment now says. 1.01 is ~130x further away
+    // than the entire rounding grid.
+    expect(cont.residual!).toBeLessThanOrEqual(twoDpRoundingBound(flat32a.changePct));
+  });
+
+  it('WITH the calendar the session rule flags it, naming the CAUSE not the symptom', () => {
+    const v = assessQuotePlausibility(flat32a, SPLIT_3_2);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('corporate_action');
+    expect(v.reason).not.toBe('implausible_move_ratio');
+    // The ratio is still carried, and it is still UNDER the bar — i.e. this
+    // verdict is unreachable by any change to SUSPECT_MOVE_RATIO short of one
+    // that condemns half the tape.
+    expect(v.ratio!).toBeLessThan(SUSPECT_MOVE_RATIO);
+    expect(v.corporateAction).toEqual(SPLIT_3_2);
+  });
+
+  it('FLAG, NEVER CLAMP — the raw numbers survive the verdict untouched', () => {
+    const row = { ...flat32a };
+    assessQuotePlausibility(row, SPLIT_3_2);
+    assessLevelContinuity(CA_PRIOR, row, SPLIT_3_2);
+    expect(row.price).toBe(flat32a.price);
+    expect(row.changePct).toBe(flat32a.changePct);
+  });
+
+  it('logs the ratio, so the flag is evidence rather than an assertion', () => {
+    const line = describeQuoteSuspicion('UPC', flat32a, SPLIT_3_2);
+    expect(line).toContain('corporate_action');
+    expect(line).toContain('corporateAction=3:2');
+    expect(line).toContain('exDate=2026-06-30');
+    expect(line).toContain('factor=1.500000');
+  });
+
+  it('reaches the whole sub-2.0 class, at every factor and every genuine move', () => {
+    // TRA-3065 measured 34 of 64 unadjusted rows evading BOTH rules. None of
+    // them evades the calendar, and the sweep over `m` is the load-bearing part:
+    // the session rule's exposure is a function of the genuine move, not of the
+    // action factor alone, so a single m = 0 row would prove nothing.
+    for (const [num, den] of [[5, 4], [4, 3], [3, 2], [2, 3]] as const) {
+      for (const m of [-30, -25, -10, 0, 10, 25, 100, 200]) {
+        const row = exDateRow(num / den, m, 'a');
+        const action: CorporateAction = { exDate: '2026-06-30', numerator: num, denominator: den };
+        expect(assessQuotePlausibility(row, action).reason).toBe('corporate_action');
+      }
+    }
+  });
+});
+
+describe('TRA-3068 acceptance 4 — a KNOWN ex-date reads `abstain`, never `suspect`', () => {
+  it('abstains under an UNADJUSTED feed, where the rule was already blind', () => {
+    const rowA = exDateRow(1.5, 0, 'a');
+    const v = assessLevelContinuity(CA_PRIOR, rowA, SPLIT_3_2);
+    expect(v.verdict).toBe('abstain');
+    expect(v.verdict).not.toBe('suspect');
+    expect(v.verdict).not.toBe('consistent');   // ⛔ an abstain is NOT a clearance
+    expect(v.reason).toBe('corporate_action');
+    // Carried, because THIS is the live discriminator between the two feed
+    // branches TRA-3065 could not settle from the archive: ~1 says the feed
+    // handed us an unadjusted prev close and the headline is fabricated.
+    expect(v.residual!).toBeLessThanOrEqual(twoDpRoundingBound(rowA.changePct));
+    expect(v.corporateAction).toEqual(SPLIT_3_2);
+  });
+
+  it('abstains under an ADJUSTED feed, suppressing a FALSE POSITIVE on a CORRECT row', () => {
+    // ⭐ The premise TRA-3065 corrected: case (b) is not "defended", it is the
+    // rule MISFIRING. The published `changePct` is RIGHT; only our stored prior
+    // close is un-back-adjusted, so the residual is the action factor k and the
+    // rule fires on 64 of 64 such rows. Inheriting that would trade one defect
+    // for another.
+    const rowB = exDateRow(1.5, 0, 'b');
+    const withoutCal = assessLevelContinuity(CA_PRIOR, rowB);
+    expect(withoutCal.verdict).toBe('suspect');            // the misfire, today
+    expect(withoutCal.residual!).toBeCloseTo(1.5, 3);      // == k, not noise
+
+    const withCal = assessLevelContinuity(CA_PRIOR, rowB, SPLIT_3_2);
+    expect(withCal.verdict).toBe('abstain');
+    expect(withCal.reason).toBe('corporate_action');
+    expect(withCal.residual!).toBeCloseTo(1.5, 3);         // still on the record
+    expect(describeLevelContinuity('X', '2026-06-29', CA_PRIOR, rowB, SPLIT_3_2))
+      .toContain('residualExpectedIfAdjusted=1.500000');
+  });
+
+  it('does not soften a real continuity break when NO action is in the window', () => {
+    // TDIC, a real TRA-2634 offender. Nothing about the calendar leg's existence
+    // may change this verdict.
+    const tdic = { price: 6.13, changePct: -21.31 };
+    const v = assessLevelContinuity({ price: 7.6, changePct: 39.97 }, tdic, null);
+    expect(v.verdict).toBe('suspect');
+    expect(v.reason).toBe('level_discontinuity');
+  });
+
+  it('a republication still reads `republished_prior_row`, not `corporate_action`', () => {
+    // Order matters: a stale republication's residual is garbage by construction
+    // (1.22 .. 14.17 on bqb1), and letting it wear the `corporate_action` label
+    // would contaminate the very branch measurement the abstain's residual feeds.
+    const row = { price: 8.3, changePct: 69.04 };
+    const v = assessLevelContinuity({ ...row }, row, SPLIT_3_2);
+    expect(v.reason).toBe('republished_prior_row');
+    expect(v.verdict).toBe('abstain');
+  });
+});
+
+describe('TRA-3068 the window is HALF-OPEN on (priorSession, currentSession]', () => {
+  const cal: CorporateAction[] = [{ exDate: '2026-06-30', numerator: 2, denominator: 1 }];
+
+  it('matches an ex-date ON the current session', () => {
+    expect(corporateActionInSessionWindow(cal, '2026-06-29', '2026-06-30')).toEqual(cal[0]);
+  });
+
+  it('does NOT match an ex-date ON the prior session — that close is already post-action', () => {
+    expect(corporateActionInSessionWindow(cal, '2026-06-30', '2026-07-01')).toBeNull();
+  });
+
+  it('matches a weekend-straddling window (Friday split, Monday row)', () => {
+    const friday: CorporateAction[] = [{ exDate: '2026-07-03', numerator: 2, denominator: 1 }];
+    expect(corporateActionInSessionWindow(friday, '2026-07-02', '2026-07-06')).toEqual(friday[0]);
+  });
+
+  it('does NOT match a FUTURE ex-date', () => {
+    expect(corporateActionInSessionWindow(cal, '2026-06-01', '2026-06-29')).toBeNull();
+  });
+
+  it('collapses to an exact match when the prior session is unknown (the LIVE quote path)', () => {
+    // For a live quote `prevClose` is the immediately preceding session's close,
+    // and splits ex-date on trading days, so today's is the ONLY ex-date that can
+    // straddle it. Opening the lower bound to -infinity would flag every row for
+    // weeks after a split.
+    expect(corporateActionInSessionWindow(cal, null, '2026-06-30')).toEqual(cal[0]);
+    expect(corporateActionInSessionWindow(cal, null, '2026-07-01')).toBeNull();
+    expect(corporateActionInSessionWindow(cal, undefined, '2026-07-01')).toBeNull();
+  });
+
+  it('takes the LATEST qualifying ex-date when two land in one window', () => {
+    const two: CorporateAction[] = [
+      { exDate: '2026-07-03', numerator: 2, denominator: 1 },
+      { exDate: '2026-07-06', numerator: 3, denominator: 1 },
+    ];
+    expect(corporateActionInSessionWindow(two, '2026-07-02', '2026-07-06')?.exDate).toBe('2026-07-06');
+  });
+
+  it('is inert on an empty / absent calendar and on a missing current session', () => {
+    expect(corporateActionInSessionWindow([], '2026-06-29', '2026-06-30')).toBeNull();
+    expect(corporateActionInSessionWindow(null, '2026-06-29', '2026-06-30')).toBeNull();
+    expect(corporateActionInSessionWindow(undefined, '2026-06-29', '2026-06-30')).toBeNull();
+    expect(corporateActionInSessionWindow(cal, '2026-06-29', undefined)).toBeNull();
+  });
+});
+
+describe('TRA-3068 FAIL-CLOSED — an uninterpretable action can never silence a detector', () => {
+  // A known action SILENCES the continuity rule and REDIRECTS the session rule's
+  // reason, so a garbage provider row must degrade to NO KNOWN ACTION — i.e. the
+  // pre-TRA-3068 behaviour — and never to a suppressed verdict.
+  const degenerate: Array<[string, CorporateAction]> = [
+    ['zero numerator', { exDate: '2026-06-30', numerator: 0, denominator: 1 }],
+    ['zero denominator', { exDate: '2026-06-30', numerator: 2, denominator: 0 }],
+    ['negative', { exDate: '2026-06-30', numerator: -2, denominator: 1 }],
+    ['NaN', { exDate: '2026-06-30', numerator: NaN, denominator: 1 }],
+    ['Infinity', { exDate: '2026-06-30', numerator: Infinity, denominator: 1 }],
+    ['a 1:1 no-op', { exDate: '2026-06-30', numerator: 1, denominator: 1 }],
+    ['non-numeric', { exDate: '2026-06-30', numerator: '2' as unknown as number, denominator: 1 }],
+  ];
+
+  it.each(degenerate)('%s yields no factor and no log line', (_label, action) => {
+    expect(corporateActionFactor(action)).toBeNull();
+    expect(describeCorporateAction(action)).toBe('');
+  });
+
+  it.each(degenerate)('%s does NOT suppress a real continuity break', (_label, action) => {
+    const v = assessLevelContinuity({ price: 7.6, changePct: 39.97 }, { price: 6.13, changePct: -21.31 }, action);
+    expect(v.verdict).toBe('suspect');
+    expect(v.reason).toBe('level_discontinuity');
+  });
+
+  it.each(degenerate)('%s does NOT invent a session-rule verdict either', (_label, action) => {
+    expect(assessQuotePlausibility({ price: 100, changePct: 1.5 }, action).suspect).toBe(false);
+    // and a row the ratio rule DOES catch is still caught, under its own reason.
+    expect(assessQuotePlausibility({ price: 6.49, changePct: 8951.61 }, action).reason)
+      .toBe('implausible_move_ratio');
+  });
+
+  it('never matches a window on a missing / malformed ex-date', () => {
+    const bad = [
+      { exDate: '', numerator: 2, denominator: 1 },
+      { exDate: undefined as unknown as string, numerator: 2, denominator: 1 },
+    ];
+    expect(corporateActionInSessionWindow(bad, '2026-06-29', '2026-06-30')).toBeNull();
+  });
+
+  it('corporateActionFactor is null on null / undefined', () => {
+    expect(corporateActionFactor(null)).toBeNull();
+    expect(corporateActionFactor(undefined)).toBeNull();
+  });
+});
+
+describe('TRA-3068 acceptance 3 + backwards compatibility', () => {
+  it('SUSPECT_MOVE_RATIO is UNCHANGED at 2', () => {
+    // Not decoration. TRA-3065 measured the alternative: reaching a 3:2 needs
+    // R = 1.5, which flags 53.9% of every row we publish (283 of 525 bqb1
+    // symbol-rows vs the deployed 131) against an archive holding ZERO confirmed
+    // corporate actions — and it still would not close the class.
+    expect(SUSPECT_MOVE_RATIO).toBe(2);
+    expect(CONTINUITY_RESIDUAL_TOLERANCE).toBe(1.01);
+  });
+
+  it('omitting the calendar reproduces the pre-TRA-3068 verdicts EXACTLY', () => {
+    // The compatibility that keeps both TRA-3065 checkers and the TRA-2634
+    // control set grading the rule they were written against.
+    const rows = [
+      { price: 6.49, changePct: 8951.61 },     // FFAI — ratio rule
+      { price: 8.3, changePct: 110.66 },       // FGMC 07-29
+      { price: 0.02, changePct: 100 },         // FLYYQ — r = 2.000 exactly
+      { price: 91.99, changePct: -16.02 },     // SOXL — genuinely clean
+    ];
+    for (const r of rows) {
+      expect(assessQuotePlausibility(r, null)).toEqual(assessQuotePlausibility(r));
+      expect(assessQuotePlausibility(r, undefined)).toEqual(assessQuotePlausibility(r));
+      expect(assessLevelContinuity(CA_PRIOR, r, null)).toEqual(assessLevelContinuity(CA_PRIOR, r));
+    }
+  });
+
+  it('the calendar only ever ADDS a session verdict — it never clears one', () => {
+    // FFAI is r = 92.71. A known split in the window must not downgrade it to
+    // "explained"; it stays suspect, and the reason names the better cause.
+    const ffai = { price: 6.49, changePct: 8951.61 };
+    expect(assessQuotePlausibility(ffai).suspect).toBe(true);
+    const v = assessQuotePlausibility(ffai, SPLIT_3_2);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('corporate_action');
   });
 });

@@ -52,13 +52,145 @@
  */
 export const SUSPECT_MOVE_RATIO = 2;
 
+// ── TRA-3068 (measured on TRA-3065) — THE SPLIT CALENDAR ──────────────────────
+//
+// Both predicates in this module are INTERNAL-CONSISTENCY tests: they ask
+// whether the numbers on a row — or on two adjacent rows — agree with each
+// other. An unadjusted corporate action is internally CONSISTENT: the arithmetic
+// is faithful, the INPUT is wrong. So neither statistic can reach the class at
+// any threshold, and the fix has to come from OUTSIDE the row.
+//
+// ⛔ AND DO NOT REACH FOR `SUSPECT_MOVE_RATIO` INSTEAD. TRA-3065 measured the
+// false-positive cost over 525 bqb1 symbol-rows (105 reports, 3 folds, 120d):
+// relative to the deployed bar of 2 (131 rows flagged, 25.0%), a 3:2 needs
+// R = 1.5, which flags 283 rows — 53.9% of everything we publish, 152 of them
+// newly, against an archive holding ZERO confirmed corporate actions. And it
+// still would not close the class: under an unadjusted feed the session ratio is
+// `max((1+m)/k, k/(1+m))`, a function of the genuine ex-date move `m` as well as
+// the factor `k`, so an action of factor `k` is caught only when `m <= k/R - 1`
+// or `m >= R*k - 1`. For 3:2 at R = 1.5 the stock must ALSO genuinely move
+// <= -25% or >= +200% on the ex-date. There is no R that closes it.
+//
+// The ex-date is the one input that distinguishes a 3:2 split from a genuine
+// -33% session, and it is nearly free: Yahoo's chart endpoint — which
+// `yahoo-feed.ts` already calls per symbol — returns split events when asked, so
+// this costs one query-string option, no new provider and no new HTTP call.
+//
+// ⛔ FLAG, NEVER CLAMP, AND NEVER AT THE READ PATH. TRA-2379 decision 1 and the
+// TRA-3063 ruling both apply: `change` / `changePct` stay raw and the verdict is
+// stamped where the row is GENERATED. Masking a fabricated headline at read time
+// converts a loud failure into a silent one.
+
+/**
+ * A corporate action known from the provider's own event calendar, not inferred
+ * from the price series.
+ *
+ * Shaped after Yahoo's `chart(..., { events: 'div|split' }).events.splits[]`
+ * entry — `{ date, numerator, denominator, splitRatio }` — because that is the
+ * only source wired today and re-shaping it would invite a lossy translation.
+ */
+export interface CorporateAction {
+  /**
+   * ET calendar date of the EX-date, `YYYY-MM-DD` — the session the action first
+   * prices in, i.e. the ONE session whose `prevClose` straddles it.
+   *
+   * A string, not an epoch, and deliberately: every session boundary in the
+   * report path is already an ET `YYYY-MM-DD` key (`etDateKey`,
+   * `priorSessionDate`), the format sorts lexicographically in chronological
+   * order, and comparing dates as dates keeps the DST/`hour24` hazards of
+   * TRA-2498 out of a predicate that has no business owning a clock.
+   */
+  exDate: string;
+  /** Yahoo's `numerator`: 10 for a 10:1 forward split, 1 for a 1:10 reverse. */
+  numerator: number;
+  /** Yahoo's `denominator`: 1 for a 10:1 forward split, 10 for a 1:10 reverse. */
+  denominator: number;
+  /** The provider's own label (`"10:1"`). Carried for the log; never parsed. */
+  splitRatio?: string;
+}
+
+/**
+ * The action factor `k = numerator / denominator`. `k > 1` is a forward split
+ * (the traded price falls by `k`); `k < 1` a reverse split.
+ *
+ * Returns `null` — not `NaN`, not `Infinity` — on anything degenerate, INCLUDING
+ * an exact 1:1. This is the fail-closed direction and it is load-bearing: a
+ * known action SILENCES `assessLevelContinuity` and REDIRECTS
+ * `assessQuotePlausibility`'s reason, so a provider row we cannot interpret must
+ * never be able to switch a detector off. No interpretable factor => treated as
+ * NO known action => the row stays subject to both rules exactly as before.
+ */
+export function corporateActionFactor(a: CorporateAction | null | undefined): number | null {
+  if (a == null) return null;
+  const n = a.numerator;
+  const d = a.denominator;
+  if (typeof n !== 'number' || typeof d !== 'number') return null;
+  if (!Number.isFinite(n) || !Number.isFinite(d) || n <= 0 || d <= 0) return null;
+  const k = n / d;
+  if (!Number.isFinite(k) || k <= 0 || k === 1) return null;
+  return k;
+}
+
+/**
+ * The action, if any, whose ex-date lands in `(priorSessionDate, currentSessionDate]`
+ * — the half-open window over which a published `changePct` is not a session move.
+ *
+ * HALF-OPEN ON PURPOSE. An action ex-dated ON the prior session is already
+ * inside the close we published for it, so the current row's `prevClose` is
+ * post-action and nothing is straddled; an action ex-dated on the CURRENT
+ * session is exactly the one whose `prevClose` is pre-action. Including the
+ * lower bound would flag a clean row one session late, every time.
+ *
+ * With no `priorSessionDate` the lower bound is unknown, and the window
+ * collapses to `exDate === currentSessionDate` rather than opening to `-∞`: the
+ * current row's `prevClose` can be no older than the immediately preceding
+ * session, so that is the only ex-date we can prove straddles it. Widening it
+ * would flag every row for weeks after a split.
+ *
+ * Comparison is lexicographic, which for zero-padded `YYYY-MM-DD` IS
+ * chronological. Latest qualifying ex-date wins when two land in one window (a
+ * Monday row after a Friday split and a Monday split) — that is the one whose
+ * arithmetic is on the row.
+ */
+export function corporateActionInSessionWindow(
+  actions: readonly CorporateAction[] | null | undefined,
+  priorSessionDate: string | null | undefined,
+  currentSessionDate: string | null | undefined,
+): CorporateAction | null {
+  if (!actions || actions.length === 0) return null;
+  if (typeof currentSessionDate !== 'string' || currentSessionDate.length === 0) return null;
+  let best: CorporateAction | null = null;
+  for (const a of actions) {
+    if (corporateActionFactor(a) === null) continue;
+    const ex = a?.exDate;
+    if (typeof ex !== 'string' || ex.length === 0) continue;
+    if (ex > currentSessionDate) continue;
+    const inWindow = typeof priorSessionDate === 'string' && priorSessionDate.length > 0
+      ? ex > priorSessionDate
+      : ex === currentSessionDate;
+    if (!inWindow) continue;
+    if (best === null || ex > best.exDate) best = a;
+  }
+  return best;
+}
+
 export type QuoteSuspectReason =
   /** `changePct` (or the price it was derived from) is not a finite number. */
   | 'non_finite'
   /** The implied previous close is <= 0 — an impossible datum, not merely a large one. */
   | 'nonpositive_prev_close'
   /** `max(price/prev, prev/price) >= SUSPECT_MOVE_RATIO`. */
-  | 'implausible_move_ratio';
+  | 'implausible_move_ratio'
+  /**
+   * TRA-3068 — a KNOWN corporate action ex-dated INTO this row's session, from
+   * the provider's split calendar rather than from the row's own arithmetic.
+   *
+   * This is the only reason in the union that is not a function of the numbers,
+   * and it is the only one that can fire on a row whose ratio is nowhere near
+   * `SUSPECT_MOVE_RATIO`. The published `changePct` spans the action, so it is
+   * not a session move and must not be ranked as one. The value stays raw.
+   */
+  | 'corporate_action';
 
 export interface QuotePlausibilityInput {
   price: number;
@@ -75,6 +207,13 @@ export interface QuotePlausibilityVerdict {
   impliedPrevClose: number | null;
   /** `max(price/prev, prev/price)`. `null` when `impliedPrevClose` is unusable. */
   ratio: number | null;
+  /**
+   * The action that produced a `'corporate_action'` verdict. Present ONLY on
+   * that reason, so a caller can log the ratio that condemned the row — a flag
+   * whose cause is not on the record is an assertion, not evidence (TRA-2379
+   * decision 2).
+   */
+  corporateAction?: CorporateAction;
 }
 
 const OK: QuotePlausibilityVerdict = { suspect: false, impliedPrevClose: null, ratio: null };
@@ -107,8 +246,17 @@ export function impliedPrevClose(q: QuotePlausibilityInput): number | null {
  * those are already handled by the existing `'unavailable'` / `'rate_limited'`
  * statuses and must not be reclassified. (SBLX on the 07-26 tape is exactly this
  * case — `price 0`, already `'unavailable'`.)
+ *
+ * `action` (TRA-3068) is the OPTIONAL split-calendar leg: pass the entry
+ * `corporateActionInSessionWindow` returned for this row's session pair, or
+ * nothing. Omitting it reproduces the pre-TRA-3068 behaviour EXACTLY, which is
+ * why every existing caller and both TRA-3065 checkers compile and grade
+ * unchanged — the new leg can only ever ADD a verdict, never remove one.
  */
-export function assessQuotePlausibility(q: QuotePlausibilityInput): QuotePlausibilityVerdict {
+export function assessQuotePlausibility(
+  q: QuotePlausibilityInput,
+  action?: CorporateAction | null,
+): QuotePlausibilityVerdict {
   const { price, change, changePct } = q;
 
   // Not our jurisdiction: the no-quote paths own these.
@@ -133,6 +281,26 @@ export function assessQuotePlausibility(q: QuotePlausibilityInput): QuotePlausib
   if (!Number.isFinite(ratio)) {
     return { suspect: true, reason: 'non_finite', impliedPrevClose: prev, ratio: null };
   }
+
+  // TRA-3068 — a KNOWN ex-date outranks the ratio test, and it is checked BEFORE
+  // it so the reason names the CAUSE rather than the symptom. This is the whole
+  // point of the leg: a 3:2 forward split sits at r = 1.5 and sails past
+  // `SUSPECT_MOVE_RATIO`, while the rows the ratio DOES catch (a 2:1 at r = 2.000
+  // exactly) are a knife edge that any genuine ex-date move knocks back under the
+  // bar. `ratio` is still carried so the log shows both numbers side by side.
+  //
+  // This fires in BOTH feed branches, deliberately, and TRA-3065 could not settle
+  // which one we are in: under an UNADJUSTED prev close the published `changePct`
+  // is fabricated, and under a RETROACTIVELY ADJUSTED one it is correct but is a
+  // post-action move being ranked against pre-action peers. Neither belongs at
+  // #1 in a document a human reads as the session summary, and decision 1 makes
+  // the flag cheap — the row keeps its raw numbers and loses a badge and its
+  // place in a *suggestion* list.
+  const known = corporateActionFactor(action) === null ? null : (action as CorporateAction);
+  if (known) {
+    return { suspect: true, reason: 'corporate_action', impliedPrevClose: prev, ratio, corporateAction: known };
+  }
+
   if (ratio >= SUSPECT_MOVE_RATIO) {
     return { suspect: true, reason: 'implausible_move_ratio', impliedPrevClose: prev, ratio };
   }
@@ -212,8 +380,47 @@ export function isMoveSuspect(row: QuoteMoveRow): boolean {
 //
 // So `impliedPrevClose(today)` must reproduce the close we ourselves published
 // for the prior session. When it does not, the denominator today was re-derived
-// against a reference that is not our own prior artifact — which is exactly
-// what an unadjusted prev close across a corporate action looks like.
+// against a reference that is not our own prior artifact.
+//
+// ⛔ CORRECTED 2026-08-06 (TRA-3068, off the TRA-3065 measurement). This
+// paragraph used to end "— which is exactly what an unadjusted prev close across
+// a corporate action looks like." THAT IS BACKWARDS, and it was the load-bearing
+// sentence that made the sub-2.0 corporate-action gap look covered. The
+// invariant below is SOUND; only the claimed coverage was wrong.
+//
+// Why the rule cannot see a corporate action: `impliedPrevClose(today)` INVERTS
+// the same arithmetic `yahoo-feed.ts` used to BUILD the row, so what it recovers
+// is THE FEED'S OWN `prevClose` — not an independent estimate of it. The
+// residual therefore measures exactly one thing, and it is not plausibility:
+//
+//     residual != 1  <=>  the feed's prevClose today != the close WE published
+//                         for the prior session
+//
+//  - UNADJUSTED prev close (the case the old sentence named — the FFAI
+//    `6.49 / 0.07` shape): the feed's prevClose IS our published prior close, so
+//    the residual is ALGEBRAICALLY FORCED to 1. Not near the tolerance, AT the
+//    identity, for every action factor and every genuine ex-date move. Measured
+//    over the 128-row evasion grid — `scripts/tra3065-corporate-action-evasion.mjs`,
+//    which runs the DEPLOYED predicates rather than a re-implementation — max
+//    residual 1.000142878 against a DERIVED 2-dp-rounding bound of 1.000214316,
+//    i.e. 70x inside the 1.01 tolerance. The rule fired on 0 of 64 such rows.
+//  - RETROACTIVELY ADJUSTED prev close: the published `changePct` is RIGHT and
+//    nothing is fabricated — but our stored prior close is never back-adjusted,
+//    so the residual is the action factor `k` and this rule fires on 64 of 64.
+//    That is a FALSE POSITIVE on a correct row, not a defence.
+//
+// So the rule has no defensive value against a corporate action in EITHER feed
+// branch, and no threshold change reaches the class. The corporate action is
+// owned by the SPLIT CALENDAR ({@link CorporateAction}, read from the chart
+// endpoint's `events` at the generation path) — NOT by this rule. When that
+// calendar knows an ex-date landed in the pair, this rule ABSTAINS rather than
+// firing: see `'corporate_action'` on {@link LevelContinuityAbstainReason}.
+//
+// What the rule DOES catch is the class all 11 of its real archive offenders
+// belong to: the FGMC/FLYYQ FROZEN-PRICE shape — the numerator standing still
+// while the denominator walks underneath it. That is a genuine re-derivation
+// against a reference that is not our artifact, and no ratio test can express it
+// at any threshold, which is the reason this instrument exists.
 //
 // MEASURED, 2026-07-30, over every adjacent-session pair in the stored archive
 // on BOTH boxes (bqb1 2026-05-03 -> 07-30 all three folds, 223 pairs; the
@@ -308,7 +515,14 @@ export type LevelContinuityAbstainReason =
   /** Today's numbers do not imply a usable prev close — the session-move rule owns this. */
   | 'current_unusable'
   /** Prior and current are the SAME observation re-served: no second data point. */
-  | 'republished_prior_row';
+  | 'republished_prior_row'
+  /**
+   * TRA-3068 — a KNOWN corporate action ex-dated into this pair, so the residual
+   * is UNINTERPRETABLE and no verdict is available from THIS instrument. The
+   * session-move rule owns the row instead, via `'corporate_action'` on
+   * {@link QuoteSuspectReason}.
+   */
+  | 'corporate_action';
 
 export interface LevelContinuityVerdict {
   /**
@@ -324,6 +538,18 @@ export interface LevelContinuityVerdict {
   impliedPrevClose: number | null;
   /** The close we ourselves published for the prior session. */
   priorClose: number | null;
+  /**
+   * The action that forced a `'corporate_action'` abstain. Present ONLY on that
+   * reason.
+   *
+   * The abstain still carries `residual` whenever it is computable, and that is
+   * not decoration: on a KNOWN ex-date the residual is the one live measurement
+   * that separates the two feed branches TRA-3065 could not settle from the
+   * archive — ~1 says the feed handed us an UNADJUSTED prev close, ~`k` says it
+   * back-adjusted. Accumulating those is how the question gets answered from the
+   * tape instead of from a two-year-old retrospective read.
+   */
+  corporateAction?: CorporateAction;
 }
 
 /**
@@ -334,10 +560,17 @@ export interface LevelContinuityVerdict {
  * symbol. Adjacency is the caller's job — a gap of even one session makes the
  * comparison a multi-day move and the residual meaningless, so pass `null`
  * rather than the nearest row you happen to have and take the `abstain`.
+ *
+ * `action` (TRA-3068) is the OPTIONAL split-calendar leg: the entry
+ * `corporateActionInSessionWindow` returned for `(priorSessionDate,
+ * currentSessionDate]`, or nothing. Omitting it reproduces the pre-TRA-3068
+ * behaviour EXACTLY — which is what keeps both TRA-3065 checkers and the TRA-2634
+ * control set grading the same rule they were written against.
  */
 export function assessLevelContinuity(
   prior: QuotePlausibilityInput | null | undefined,
   current: QuotePlausibilityInput,
+  action?: CorporateAction | null,
 ): LevelContinuityVerdict {
   const blank = { residual: null, impliedPrevClose: null, priorClose: null };
   if (prior == null) return { verdict: 'abstain', reason: 'no_prior_observation', ...blank };
@@ -370,6 +603,37 @@ export function assessLevelContinuity(
   if (!Number.isFinite(residual)) {
     return { verdict: 'abstain', reason: 'current_unusable', residual: null, impliedPrevClose: implied, priorClose };
   }
+
+  // TRA-3068 — a KNOWN ex-date in this pair makes the residual UNINTERPRETABLE,
+  // so this instrument abstains. `abstain`, NEVER `suspect`, and the distinction
+  // is the whole point of the three-valued verdict: a blind instrument does not
+  // get to look like a clean one, and it does not get to condemn a row either.
+  //
+  // ⛔ THE FIRE THIS SUPPRESSES IS A FALSE POSITIVE ON A CORRECT ROW, not a
+  // catch. If the feed retroactively adjusts `prevClose` the published
+  // `changePct` is RIGHT — but our stored prior close is never back-adjusted, so
+  // the residual is the action factor `k` and the rule fires on 64 of 64 such
+  // rows (TRA-3065). Suppressing it here is the only way the guard added by this
+  // ticket does not INHERIT that misfire. In the other branch the rule was
+  // already blind (residual forced to 1), so nothing real is lost either way:
+  // both branches are ungradeable by THIS statistic, and the session-move rule
+  // owns the row instead via `'corporate_action'`.
+  //
+  // Placed AFTER the republication guard on purpose. A stale republication's
+  // residual is garbage by construction (1.22 .. 14.17 on bqb1) and would
+  // contaminate the branch measurement this abstain's `residual` exists to feed.
+  const known = corporateActionFactor(action) === null ? null : (action as CorporateAction);
+  if (known) {
+    return {
+      verdict: 'abstain',
+      reason: 'corporate_action',
+      residual,
+      impliedPrevClose: implied,
+      priorClose,
+      corporateAction: known,
+    };
+  }
+
   if (residual >= CONTINUITY_RESIDUAL_TOLERANCE) {
     return { verdict: 'suspect', reason: 'level_discontinuity', residual, impliedPrevClose: implied, priorClose };
   }
@@ -388,18 +652,41 @@ export function describeLevelContinuity(
   priorDate: string,
   prior: QuotePlausibilityInput | null | undefined,
   current: QuotePlausibilityInput,
+  action?: CorporateAction | null,
 ): string {
-  const v = assessLevelContinuity(prior, current);
+  const v = assessLevelContinuity(prior, current, action);
   const n = (x: number | null | undefined) =>
     x === null || x === undefined || !Number.isFinite(x) ? 'n/a' : String(x);
   const head = `${symbol}: ${v.verdict}`
     + `${v.reason ? ` (${v.reason})` : ''}`
     + ` today=${n(current.price)}/${n(current.changePct)}%`
     + ` prior[${priorDate}]=${n(prior?.price)}/${n(prior?.changePct)}%`;
-  if (v.residual === null) return head;
+  if (v.residual === null) return head + describeCorporateAction(v.corporateAction);
   return `${head} impliedPrevClose=${v.impliedPrevClose === null ? 'n/a' : v.impliedPrevClose.toFixed(4)}`
     + ` publishedPriorClose=${v.priorClose === null ? 'n/a' : v.priorClose.toFixed(4)}`
-    + ` residual=${v.residual.toFixed(6)} tolerance=${CONTINUITY_RESIDUAL_TOLERANCE}`;
+    + ` residual=${v.residual.toFixed(6)} tolerance=${CONTINUITY_RESIDUAL_TOLERANCE}`
+    + describeCorporateAction(v.corporateAction);
+}
+
+/**
+ * TRA-3068 — the action's own arithmetic, appended to whichever verdict it
+ * caused. Empty string when there is none, so it costs nothing on the common
+ * path.
+ *
+ * `residualExpectedIfUnadjusted` / `IfAdjusted` are printed because they are the
+ * discriminator: on a KNOWN ex-date, a residual landing at ~1 says the feed
+ * handed us an UNADJUSTED prev close and the headline is fabricated, while ~`k`
+ * says it back-adjusted and the headline is merely incomparable. TRA-3065 could
+ * not settle that from the archive because the archive holds zero confirmed
+ * corporate actions. Every line this prints is one row of the evidence that
+ * settles it.
+ */
+export function describeCorporateAction(a: CorporateAction | null | undefined): string {
+  const k = corporateActionFactor(a);
+  if (k === null || a == null) return '';
+  return ` corporateAction=${a.splitRatio ?? `${a.numerator}:${a.denominator}`}`
+    + ` exDate=${a.exDate} factor=${k.toFixed(6)}`
+    + ` residualExpectedIfUnadjusted=1 residualExpectedIfAdjusted=${Math.max(k, 1 / k).toFixed(6)}`;
 }
 
 /**
@@ -407,11 +694,16 @@ export function describeLevelContinuity(
  * dropped row is never silent — per TRA-2379 decision 2, "a silent drop reads
  * identically to nothing was wrong."
  */
-export function describeQuoteSuspicion(symbol: string, q: QuotePlausibilityInput): string {
-  const v = assessQuotePlausibility(q);
+export function describeQuoteSuspicion(
+  symbol: string,
+  q: QuotePlausibilityInput,
+  action?: CorporateAction | null,
+): string {
+  const v = assessQuotePlausibility(q, action);
   if (!v.suspect) return `${symbol}: plausible`;
   const prev = v.impliedPrevClose === null ? 'n/a' : v.impliedPrevClose.toFixed(4);
   const ratio = v.ratio === null ? 'n/a' : v.ratio.toFixed(2);
   return `${symbol}: ${v.reason} (price=${q.price}, changePct=${q.changePct ?? 'n/a'}, `
-    + `impliedPrevClose=${prev}, ratio=${ratio}, threshold=${SUSPECT_MOVE_RATIO})`;
+    + `impliedPrevClose=${prev}, ratio=${ratio}, threshold=${SUSPECT_MOVE_RATIO})`
+    + describeCorporateAction(v.corporateAction);
 }

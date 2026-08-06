@@ -1,6 +1,7 @@
 import YahooFinance from 'yahoo-finance2';
 import { TradierStocksClient, type TradierEnv, type TradierEquityQuote } from '@trading-app/engine';
-import type { Candle, NewsItem } from '@trading-app/shared';
+import type { Candle, NewsItem, CorporateAction } from '@trading-app/shared';
+import { corporateActionInSessionWindow } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
 
 const yf = new YahooFinance({
@@ -1060,6 +1061,172 @@ export async function fetchMinuteBars(symbol: string, count = 60): Promise<Candl
   return bars;
 }
 
+// ── TRA-3068 — THE SPLIT CALENDAR (parent TRA-3065) ───────────────────────────
+//
+// Both deployed plausibility rules are INTERNAL-CONSISTENCY tests, and an
+// unadjusted corporate action is internally consistent, so neither can reach it
+// at any threshold — measured on TRA-3065, 128-row evasion grid. The ex-date is
+// the only input that distinguishes a 3:2 split from a genuine -33% session, and
+// it has to come from outside the row.
+//
+// It costs one query-string option. `yf.chart` is the v8 `/finance/chart` route
+// this module already calls per symbol in three places, and it returns
+// `events.splits` when asked for them — verified directly against NVDA's 10:1:
+//
+//   events.splits[0] = { date: 1718026200, numerator: 10, denominator: 1,
+//                        splitRatio: "10:1" }   // ex-date 2024-06-10
+//
+// So: NO new provider, NO API key, NO extra HTTP call, and nothing here ever
+// blocks a quote — the harvest is a side effect of a response we already parsed,
+// and a symbol whose chart we never fetched simply has no calendar entry and is
+// graded exactly as it was before this ticket.
+//
+// ⛔ THIS IS A CACHE, NOT A RECORD. Coverage is opportunistic by construction:
+// the Tradier-primary paths only fall through to `yf.chart` when Tradier returns
+// nothing, so on a healthy Tradier day most symbols are never harvested here.
+// {@link fetchRecentSplits} is the explicit path for a caller that needs an
+// answer for a specific symbol rather than whatever happens to be warm.
+
+/** Per-symbol split calendar, harvested from any chart response that carried events. */
+const splitCalendar = new Map<string, CorporateAction[]>();
+
+/**
+ * Cap on symbols held. This process has been OOM-killed by an unbounded
+ * per-symbol cache before (TRA-937's `chainCache`), and the scanner universe is
+ * open-ended, so the bound is stated rather than assumed. Eviction is
+ * insertion-order (oldest harvested symbol first) — a symbol we stopped fetching
+ * charts for is also a symbol nothing is about to grade.
+ */
+const SPLIT_CALENDAR_MAX_SYMBOLS = 2_000;
+
+/**
+ * How far back a harvested split is kept. Only the EX-DATE SESSION's own row has
+ * a `prevClose` that straddles the action, so anything older than a couple of
+ * weeks can no longer change a verdict — it would only grow the map.
+ */
+const SPLIT_RETENTION_DAYS = 21;
+
+/** ET calendar date of an epoch-ms instant, `YYYY-MM-DD`. Matches `etDateKey`. */
+function etDay(ms: number): string {
+  return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
+
+/**
+ * Harvest `events.splits` off a chart response into {@link splitCalendar}.
+ *
+ * Defensive to the point of paranoia about the payload shape, on purpose: this
+ * runs inside the quote hot path, `validation: { logErrors: true }` means a
+ * schema drift LOGS rather than throws, and a split calendar that can throw
+ * would take out the quote it was supposed to annotate. Anything unrecognised is
+ * dropped silently — the failure mode is "no calendar entry", i.e. exactly the
+ * pre-TRA-3068 behaviour, never a bad one.
+ */
+function recordChartSplits(symbol: string, result: unknown): void {
+  const events = (result as { events?: { splits?: unknown } } | null | undefined)?.events;
+  const raw = events?.splits;
+  // v3 returns an array for `return: 'array'` (our default) and a
+  // timestamp-keyed object for `return: 'object'`. Accept both.
+  const list: unknown[] = Array.isArray(raw)
+    ? raw
+    : (raw && typeof raw === 'object' ? Object.values(raw as Record<string, unknown>) : []);
+  if (list.length === 0) return;
+
+  const cutoff = etDay(Date.now() - SPLIT_RETENTION_DAYS * 86_400_000);
+  const parsed: CorporateAction[] = [];
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    const { date, numerator, denominator, splitRatio } = s as {
+      date?: unknown; numerator?: unknown; denominator?: unknown; splitRatio?: unknown;
+    };
+    // `date` is a Date after validation and unix SECONDS when validation is
+    // bypassed — the same duality `toIsoTime` above exists for.
+    let ms: number | null = null;
+    if (date instanceof Date) ms = date.getTime();
+    else if (typeof date === 'number' && Number.isFinite(date)) ms = date * 1000;
+    if (ms === null || !Number.isFinite(ms) || ms <= 0) continue;
+    if (typeof numerator !== 'number' || typeof denominator !== 'number') continue;
+
+    const exDate = etDay(ms);
+    if (exDate < cutoff) continue;
+    parsed.push({
+      exDate,
+      numerator,
+      denominator,
+      ...(typeof splitRatio === 'string' ? { splitRatio } : {}),
+    });
+  }
+  if (parsed.length === 0) return;
+
+  const key = symbol.toUpperCase();
+  // Re-insert so the eviction order tracks last-harvest, not first-sight.
+  splitCalendar.delete(key);
+  splitCalendar.set(key, parsed);
+  while (splitCalendar.size > SPLIT_CALENDAR_MAX_SYMBOLS) {
+    const oldest = splitCalendar.keys().next();
+    if (oldest.done) break;
+    splitCalendar.delete(oldest.value);
+  }
+}
+
+/** Every split known for `symbol` inside the retention window. Never `null`. */
+export function knownSplits(symbol: string): readonly CorporateAction[] {
+  return splitCalendar.get(symbol.toUpperCase()) ?? [];
+}
+
+/**
+ * The split, if any, whose ex-date lands in `(priorSessionDate, currentSessionDate]`
+ * — the window over which the row's published `changePct` is not a session move.
+ *
+ * Pass `null` for `priorSessionDate` on the LIVE quote path. The window then
+ * collapses to `exDate === currentSessionDate`, which for a live quote is not an
+ * approximation but the exact answer: the quote's `prevClose` is the immediately
+ * preceding trading session's close, splits only ex-date on trading days, so the
+ * ONE ex-date that can straddle it is the current session's own.
+ */
+export function knownSplitForSession(
+  symbol: string,
+  priorSessionDate: string | null | undefined,
+  currentSessionDate: string,
+): CorporateAction | null {
+  return corporateActionInSessionWindow(knownSplits(symbol), priorSessionDate, currentSessionDate);
+}
+
+/**
+ * Explicitly refresh `symbol`'s split calendar, then answer the same question
+ * {@link knownSplitForSession} does.
+ *
+ * For the callers that need an ANSWER rather than whatever the hot path happened
+ * to warm — today that is the EOD report, which runs once per session over a
+ * handful of ranking candidates and is the exact surface where a fabricated
+ * headline gets published as the session summary. One `1d` chart call over a
+ * month-wide window; it honours the shared Yahoo breaker via `withRetry` and
+ * returns `null` on any failure, so a dark Yahoo degrades to the pre-TRA-3068
+ * behaviour rather than blocking the report.
+ */
+export async function fetchRecentSplits(symbol: string): Promise<readonly CorporateAction[]> {
+  const now = new Date();
+  const from = new Date(now.getTime() - SPLIT_RETENTION_DAYS * 2 * 86_400_000);
+  const result = await withRetry(
+    () => yf.chart(symbol, { period1: from, period2: now, interval: '1d', events: 'div|split' }),
+    `splitCalendar(${symbol})`,
+  );
+  if (result) recordChartSplits(symbol, result);
+  return knownSplits(symbol);
+}
+
+/** Test seam: drop the harvested calendar. */
+export function __resetSplitCalendarForTests(): void {
+  splitCalendar.clear();
+}
+
+/**
+ * Test seam for {@link recordChartSplits}. Exported because the parser is the
+ * one part of this leg that faces a payload we do not control, and the failure
+ * mode it must never have — a throw on the quote hot path — is unreachable
+ * through the network-bound functions above.
+ */
+export const __recordChartSplitsForTests = recordChartSplits;
+
 /**
  * TRA-386 — fetch the last N *daily* candles for a symbol via Yahoo's chart
  * endpoint. Used by the automated market-review generator to read index-level
@@ -1075,10 +1242,13 @@ export async function fetchDailyCandles(symbol: string, count = 30): Promise<Can
   // trading sessions: ~1.6 calendar days per trading day, plus a week of slack.
   const from = new Date(now.getTime() - (count * 1.6 + 7) * 24 * 60 * 60 * 1000);
   const result = await withRetry(
-    () => yf.chart(symbol, { period1: from, period2: now, interval: '1d' }),
+    // TRA-3068 — `events` is the whole cost of the split calendar. Same route,
+    // same round trip, one extra query-string key.
+    () => yf.chart(symbol, { period1: from, period2: now, interval: '1d', events: 'div|split' }),
     `dailyChart(${symbol})`,
   );
   if (!result) return [];
+  recordChartSplits(symbol, result);
   const candles: Candle[] = (result.quotes ?? [])
     .filter(q => q.open != null && q.high != null && q.low != null && q.close != null)
     .map(q => ({
@@ -1348,9 +1518,12 @@ export async function fetchMinuteBarsWithSource(
 
     // Fallback 1: Yahoo Finance.
     const result = await withRetry(
-      () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+      // TRA-3068 — see the split-calendar section. One query-string key on a
+      // request we already make; the harvest below never gates the bars.
+      () => yf.chart(symbol, { period1: from, period2: now, interval: '1m', events: 'div|split' }),
       `chart(${symbol})`,
     );
+    if (result) recordChartSplits(symbol, result);
     const yahooBars: Candle[] = result
       ? (result.quotes ?? [])
           .filter(q => q.open != null && q.high != null && q.low != null && q.close != null && q.volume != null)
@@ -1507,9 +1680,11 @@ export async function fetchYahooChartQuote(symbol: string): Promise<QuoteResult 
   // plus recent bars to back-fill from; short enough to keep the payload small.
   const from = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
   const result = await withRetry(
-    () => yf.chart(symbol, { period1: from, period2: now, interval: '1m' }),
+    // TRA-3068 — see the split-calendar section.
+    () => yf.chart(symbol, { period1: from, period2: now, interval: '1m', events: 'div|split' }),
     `chartQuote(${symbol})`,
   );
+  if (result) recordChartSplits(symbol, result);
   return chartQuoteFromResult(result as Parameters<typeof chartQuoteFromResult>[0]);
 }
 

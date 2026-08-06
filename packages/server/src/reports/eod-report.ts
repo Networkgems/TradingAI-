@@ -15,6 +15,13 @@ import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/
 // TRA-2610 — the consumer-side plausibility predicate. Reads `moveSuspect` AND
 // re-executes the rule, so a lost stamp cannot promote a fabrication.
 import { isMoveSuspect, assessLevelContinuity, describeLevelContinuity } from '@trading-app/shared';
+// TRA-3068 — the split-calendar leg: the ONLY instrument that can reach a
+// sub-2.0 corporate action, because the other two are internal-consistency tests
+// and an unadjusted action is internally consistent (measured, TRA-3065).
+import {
+  assessQuotePlausibility, describeQuoteSuspicion, corporateActionInSessionWindow,
+  type CorporateAction,
+} from '@trading-app/shared';
 import { logger } from '../observability/index.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
@@ -187,6 +194,12 @@ function top5Movers(
   symbols: SymbolState[],
   priorSessionMovers?: EodMover[],
   priorSessionDate?: string,
+  // TRA-3068 — the split calendar for this session, keyed by UPPERCASE symbol.
+  // Supplied by the caller (which owns the network) rather than fetched here, so
+  // this stays the pure, replayable function every archive checker grades. Absent
+  // => the pre-TRA-3068 behaviour, exactly.
+  knownSplits?: ReadonlyMap<string, readonly CorporateAction[]>,
+  currentSessionDate?: string,
 ): EodMover[] {
   // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
   // so the report shows "_No data._" rather than five rows of 0.00% when the feed
@@ -221,16 +234,57 @@ function top5Movers(
   // (this rule passes it), while TDIC `7.60` -> `6.13/-21.31%` is r = 1.271 (the
   // session rule passes it) against an implied prev close of `7.79` (this rule
   // flags it).
+  //
+  // TRA-3068 (measured on TRA-3065) — a THIRD instrument, and the only one that
+  // is not a function of the numbers on the row.
+  //
+  // The two above are internal-consistency tests, and an unadjusted corporate
+  // action is internally CONSISTENT — the arithmetic is faithful, the input is
+  // wrong. So neither can reach the class at ANY threshold: a flat 3:2 forward
+  // split publishes -33.33% at r = 1.4999 with a continuity residual of
+  // 1.00005, and both verdicts come back clean. The worked example is UPC on
+  // 2026-06-30 — `12.18 -> 6.10`, published -49.92%, session ratio 1.9968 (0.16%
+  // under the bar), residual 1.000042 => `consistent`, RANKED #3. That is not a
+  // claim UPC was a split; a genuine -50% session has IDENTICAL arithmetic, and
+  // that indistinguishability IS the finding. The hole is occupied.
+  //
+  // ⛔ AND THE FIX IS NOT A LOWER `SUSPECT_MOVE_RATIO`. Reaching a 3:2 costs
+  // condemning 53.9% of every row we publish (283 of 525 bqb1 symbol-rows vs the
+  // deployed 131), against an archive holding zero confirmed corporate actions —
+  // so all 152 newly-flagged rows are candidate false positives, and it STILL
+  // would not close the class. See the table on TRA-3065.
+  //
+  // So the ex-date is read from the provider's own split calendar instead, and
+  // it changes the verdict in BOTH directions:
+  //  - the session rule gains `'corporate_action'`, which fires regardless of
+  //    ratio — this is what actually closes the gap;
+  //  - the continuity rule ABSTAINS instead of firing, because on a known
+  //    ex-date its residual is uninterpretable. Under an adjusted feed the
+  //    published `changePct` is RIGHT and the rule fires on 64 of 64 such rows;
+  //    inheriting that misfire would have traded one defect for another.
+  const splitFor = (s: SymbolState): CorporateAction | null =>
+    corporateActionInSessionWindow(
+      knownSplits?.get(s.symbol.toUpperCase()) ?? null,
+      priorSessionDate,
+      currentSessionDate,
+    );
+
   const priorRows = new Map<string, EodMover>();
   for (const m of priorSessionMovers ?? []) {
     priorRows.set(String(m.symbol).toUpperCase(), m);
   }
   const continuity = (s: SymbolState) =>
-    assessLevelContinuity(priorRows.get(s.symbol.toUpperCase()) ?? null, s);
+    assessLevelContinuity(priorRows.get(s.symbol.toUpperCase()) ?? null, s, splitFor(s));
+
+  // TRA-3068 — the session-move leg re-executed WITH the calendar. `isMoveSuspect`
+  // still owns the flag-or-rule OR (a lost stamp must not clear a row), and this
+  // only ever ADDS: a row already suspect stays suspect.
+  const moveSuspect = (s: SymbolState) =>
+    isMoveSuspect(s) || assessQuotePlausibility(s, splitFor(s)).suspect;
 
   const rankable = (s: SymbolState) =>
     s.lastUpdated > 0 && s.price > 0
-    && !isMoveSuspect(s)
+    && !moveSuspect(s)
     && continuity(s).verdict !== 'suspect';
   const candidates = symbols.filter(s => s.lastUpdated > 0 && s.price > 0);
   const excluded = candidates.filter(s => isMoveSuspect(s));
@@ -238,6 +292,25 @@ function top5Movers(
     log.warn('top-movers EXCLUDED implausible moves', {
       issue: 'TRA-2610',
       symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%:${s.quoteStatus ?? 'n/a'}`),
+    });
+  }
+  // Reported separately from the two above for the same reason they are reported
+  // separately from each other: this is the census of what the CALENDAR adds, and
+  // pooling it would make the new instrument's contribution unmeasurable.
+  const corporateActions = candidates.filter(s => !isMoveSuspect(s) && splitFor(s) !== null);
+  if (corporateActions.length > 0) {
+    log.warn('top-movers EXCLUDED rows spanning a KNOWN corporate action', {
+      issue: 'TRA-3068',
+      priorSessionDate: priorSessionDate ?? 'n/a',
+      currentSessionDate: currentSessionDate ?? 'n/a',
+      detail: corporateActions.map(s =>
+        // Both verdicts, because on a known ex-date the continuity residual is
+        // the live discriminator between the two feed branches TRA-3065 could
+        // not settle from the archive: ~1 says the feed handed us an UNADJUSTED
+        // prev close and the headline is fabricated, ~k says it back-adjusted.
+        `${describeQuoteSuspicion(s.symbol, s, splitFor(s))} | `
+        + describeLevelContinuity(s.symbol, priorSessionDate ?? 'n/a',
+          priorRows.get(s.symbol.toUpperCase()) ?? null, s, splitFor(s))),
     });
   }
   // A row the session rule already dropped is not re-reported here — the point
@@ -249,7 +322,7 @@ function top5Movers(
       priorSessionDate: priorSessionDate ?? 'n/a',
       detail: discontinuous.map(s =>
         describeLevelContinuity(s.symbol, priorSessionDate ?? 'n/a',
-          priorRows.get(s.symbol.toUpperCase()) ?? null, s)),
+          priorRows.get(s.symbol.toUpperCase()) ?? null, s, splitFor(s))),
     });
   }
   // ⭐ The census is the control, not decoration. This check ABSTAINS whenever the
@@ -279,6 +352,16 @@ function top5Movers(
     candidates: candidates.length,
     ...census,
     abstainReasons,
+    // TRA-3068 — the calendar's own reachability, printed for the same reason
+    // the abstain census is: an "excluded 0" over a universe the calendar was
+    // never warmed for reads identically to an "excluded 0" over one it cleared,
+    // and the calendar is opportunistic (see `fetchRecentSplits`). `covered` is
+    // how many candidates we actually HAVE a calendar answer for — not how many
+    // were clean.
+    splitCalendarCovered: knownSplits ? candidates.filter(
+      s => knownSplits.has(s.symbol.toUpperCase())).length : 0,
+    splitCalendarSymbols: knownSplits?.size ?? 0,
+    corporateActionsInWindow: corporateActions.length,
   });
 
   return [...symbols]
@@ -865,6 +948,32 @@ export interface ReportInput {
    */
   priorSessionMovers?: EodMover[];
   priorSessionDate?: string;
+  /**
+   * TRA-3068 — the provider's SPLIT CALENDAR for the ranking candidates, keyed by
+   * UPPERCASE symbol, fetched by the caller (`fetchRecentSplits`).
+   *
+   * This is the third plausibility instrument and the only one that is not a
+   * function of the row's own numbers. It has to be: the other two are
+   * internal-consistency tests, and an unadjusted corporate action is internally
+   * CONSISTENT, so no threshold on either reaches the class (TRA-3065, measured
+   * over a 128-row evasion grid against the deployed predicates).
+   *
+   * Passed IN rather than fetched here so `top5Movers` stays pure and replayable
+   * against the stored archive — the property that let TRA-2634 grade its
+   * threshold on 260 real adjacent-session pairs before shipping it.
+   *
+   * ⚠️ Optional ↔ the leg is inert, exactly as before this ticket. An ABSENT
+   * entry means NOT LOOKED UP, never "no split": coverage is bounded by what the
+   * caller asked for and by Yahoo's reachability. The census logged inside
+   * `top5Movers` prints how much of the table the calendar actually reached.
+   */
+  knownSplits?: ReadonlyMap<string, readonly CorporateAction[]>;
+  /**
+   * The report's own ET session date, `YYYY-MM-DD`. Names the upper bound of the
+   * `(priorSessionDate, currentSessionDate]` ex-date window; without it the
+   * calendar leg has no window and stays inert.
+   */
+  currentSessionDate?: string;
 }
 
 /**
@@ -884,7 +993,7 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
           sourceQualityWeights, autonomousDemoLoop, analystPlan, analystReview,
           hypothesisQueue, executionQuality,
           journalBasis, journalBasisCounts,
-          priorSessionMovers, priorSessionDate } = input;
+          priorSessionMovers, priorSessionDate, knownSplits } = input;
   const today = asOfDate ?? new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 
   // Closed trades for today only
@@ -952,7 +1061,13 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const maxDrawdown = computeMaxDrawdown(todayClosed, Math.max(sessionOpenEquity, 1));
 
   // Top 5 movers
-  const movers = top5Movers(state.symbols, priorSessionMovers, priorSessionDate);
+  // TRA-3068 — `today` is already this report's ET session date, and it is the
+  // upper bound of the ex-date window. Prefer the caller's explicit value only if
+  // it disagrees deliberately (a replay grading a historical session).
+  const movers = top5Movers(
+    state.symbols, priorSessionMovers, priorSessionDate,
+    knownSplits, input.currentSessionDate ?? today,
+  );
 
   // TRA-844 — portfolio Greeks + theta-$ bleed + allocation rollup over the
   // open options book. Spot is resolved off the same symbol tape the report

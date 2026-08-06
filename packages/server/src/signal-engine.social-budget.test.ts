@@ -34,6 +34,11 @@ vi.mock('./yahoo-feed.js', () => ({
   tripYahooBreakerFromExternal: vi.fn(),
   setActiveInterestSymbols: vi.fn(),
   setTradierStocksFeedClient: vi.fn(),
+  // TRA-3068 — the split calendar `applyQuotes` consults. Inert; a plain factory
+  // REPLACES the module, so a missing name is an undefined import.
+  knownSplitForSession: vi.fn(() => null),
+  knownSplits: vi.fn(() => []),
+  fetchRecentSplits: vi.fn(async () => []),
 }));
 
 vi.mock('./stocktwits-feed.js', () => ({

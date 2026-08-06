@@ -14,7 +14,10 @@ import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEqu
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '@trading-app/shared';
+// TRA-3068 — plus the split-calendar leg, which is the only one that can reach a
+// sub-2.0 corporate action (neither ratio nor continuity can, at any threshold).
+import { assessQuotePlausibility, SUSPECT_MOVE_RATIO, describeCorporateAction } from '@trading-app/shared';
+import { etDateKey } from './et-clock.js';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
 // WS state. P2 wires the REAL LlmClient-backed agents (Haiku analysts + Sonnet
@@ -232,7 +235,7 @@ const NON_CHOKEPOINT_THROTTLE_STAMP = {
   riskThrottleSizingPath: null,
 } as const;
 import type { Regime } from '@trading-app/engine';
-import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient } from './yahoo-feed.js';
+import { fetchMinuteBars, fetchMinuteBarsWithSource, fetchDailyCandles, fetchTradierDailyCandles, fetchQuotes, fetchStocksNews, isYahooBreakerOpen, setActiveInterestSymbols, setTradierStocksFeedClient, getTradierStocksFeedClient, knownSplitForSession } from './yahoo-feed.js';
 import { prioritizeQuoteUniverse } from './quote-priority.js';
 
 /**
@@ -3798,10 +3801,32 @@ export class SignalEngine {
       // published move (unadjusted prev close across a corporate action) WITHOUT
       // touching `change` / `changePct` — decision 1 on that ticket is flag, never
       // clamp, so the bad datum stays visible on /api/state.
-      const plausibility = assessQuotePlausibility(q);
+      //
+      // TRA-3068 — the SPLIT CALENDAR leg. Both rules above are
+      // internal-consistency tests and an unadjusted corporate action is
+      // internally consistent, so no threshold reaches the class: measured on
+      // TRA-3065, a flat 3:2 forward split publishes -33.33% at r = 1.4999 and
+      // both verdicts come back clean. The ex-date is the only input that can
+      // separate it from a genuine -33% session, and it is read here — at the
+      // ONE stamping boundary for the whole stock universe — because TRA-3063
+      // ruled that masking a fabricated headline at the READ path converts a loud
+      // failure into a silent one.
+      //
+      // The window is `exDate === today ET`, and for a live quote that is exact,
+      // not an approximation: `prevClose` is the immediately preceding trading
+      // session's close and splits ex-date on trading days, so today's is the
+      // only ex-date that can straddle it.
+      //
+      // ⚠️ THE CALENDAR IS OPPORTUNISTIC AND THIS FLAG IS THEREFORE FAIL-OPEN. It
+      // is warmed by whichever `yf.chart` calls actually fired, and on a healthy
+      // Tradier day most symbols never reach that fallback — so a silent absence
+      // here means "not looked up", NOT "no split". The report path
+      // (`fetchRecentSplits`) is the one that asks explicitly.
+      const knownSplit = knownSplitForSession(sym, null, etDateKey(Date.now()));
+      const plausibility = assessQuotePlausibility(q, knownSplit);
       if (plausibility.suspect) {
         log.warn('quote move flagged suspect', {
-          issue: 'TRA-2379',
+          issue: plausibility.reason === 'corporate_action' ? 'TRA-3068' : 'TRA-2379',
           symbol: sym,
           reason: plausibility.reason,
           price: q.price,
@@ -3810,6 +3835,12 @@ export class SignalEngine {
           impliedPrevClose: plausibility.impliedPrevClose,
           ratio: plausibility.ratio,
           threshold: SUSPECT_MOVE_RATIO,
+          // Flag, never clamp — so the ratio that condemned the row has to be on
+          // the record beside the raw numbers, or the flag is an assertion rather
+          // than evidence (TRA-2379 decision 2).
+          ...(plausibility.corporateAction
+            ? { corporateAction: describeCorporateAction(plausibility.corporateAction).trim() }
+            : {}),
         });
       }
       this.symbolState.set(sym, {
