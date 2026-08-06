@@ -196,6 +196,70 @@ describe('summarizeLiveArmCensus — TRA-3117 per-book live-arm census', () => {
     expect(v.clientDisagreement).toBe(true);
     expect(r.rollup.modeDisagreementCount).toBe(1);
     expect(r.rollup.clientDisagreementCount).toBe(1);
+    // TRA-3119 — and it NAMES the account. This row says the book is trading
+    // real money (`realMoneyArmed`) off its own saved creds
+    // (`accountIdSource:'saved'`); a null tail here would assert both of those
+    // about an account it refuses to identify. Until TRA-3119 the tail was
+    // gated on `optionsClientConfigured`, which is false on exactly this row.
+    expect(v.realMoneyArmed).toBe(true);
+    expect(v.accountIdSource).toBe('saved');
+    expect(v.optionsAccountIdTail).toBe('***7766');
+  });
+
+  it('separates two armed books that are otherwise IDENTICAL, by account tail (TRA-3119)', () => {
+    // The pass/fail pair the addendum names: both books live, armed, at
+    // production, both with their own saved creds. Every other field on the two
+    // rows agrees. The tail is the whole discriminator — one is on its own
+    // account, the other is sitting in the desk's `***0154`.
+    const r = summarizeLiveArmCensus(
+      [
+        book('v0nni', liveProdSettings({ liveAccountIdOptionsProduction: 'acct-11112222' })),
+        book('richard', liveProdSettings({ liveAccountIdOptionsProduction: 'desk-0154' })),
+      ],
+      env({ TRADIER_API_TOKEN: 'env-tok', TRADIER_ACCOUNT_ID: 'desk-0154' }),
+    );
+    const [v, ri] = [r.books[0]!, r.books[1]!];
+    // Everything the pre-TRA-3119 acceptance would have published is EQUAL…
+    const withoutTail = (b: typeof v): unknown => ({ ...b, username: null, optionsAccountIdTail: null });
+    expect(withoutTail(v)).toEqual(withoutTail(ri));
+    expect(r.rollup.realMoneyArmedCount).toBe(2);
+    expect(r.rollup.sharedAccountCount).toBe(0); // neither uses env fallback
+    // …and only the tail tells the desk which one is on its money.
+    expect(v.optionsAccountIdTail).toBe('***2222');
+    expect(ri.optionsAccountIdTail).toBe('***0154');
+  });
+
+  it('every row that names WHOSE account also names WHICH — tail ⇔ accountIdSource', () => {
+    // The invariant the two fields must hold together: a row can be silent
+    // about the account only by being silent about the source too. A
+    // `source:'saved'` row with a null tail is the TRA-3119 defect.
+    const rows = summarizeLiveArmCensus(
+      [
+        book(PIN, liveProdSettings()),
+        book('v0nni', liveProdSettings({ liveAccountIdOptionsProduction: 'acct-11112222' })),
+        book('split', liveProdSettings({ mode: 'demo' })),
+        book(
+          'sandboxed',
+          liveProdSettings({ liveTradierEnvOptions: 'sandbox', liveApiKeyOptionsSandbox: 'sbx', liveAccountIdOptionsSandbox: 'sbx-4321' }),
+        ),
+        book(
+          'unarmed',
+          liveProdSettings({ liveApiKeyOptionsProduction: '', liveAccountIdOptionsProduction: '' }),
+          runtime({ clientPresent: false }),
+        ),
+      ],
+      env(),
+    ).books;
+    expect(rows).toHaveLength(5);
+    for (const b of rows) {
+      expect([b.username, b.optionsAccountIdTail !== null]).toEqual([
+        b.username,
+        b.accountIdSource !== null,
+      ]);
+    }
+    // …and the invariant is not satisfied vacuously by every tail being null.
+    expect(rows.filter(b => b.optionsAccountIdTail !== null)).toHaveLength(4);
+    expect(rows.find(b => b.username === 'unarmed')!.optionsAccountIdTail).toBeNull();
   });
 
   it('an options-unrouted live book is not armed even with a client present', () => {

@@ -31,10 +31,21 @@ import { resolveLiveOptionsCreds, isLiveBrokerOperator } from './signal-engine.j
  *    never instead of them.
  * 2. **An absent row and a safe row must not read the same.** A live book whose
  *    client does not resolve is emitted as a ROW with
- *    `optionsClientConfigured: false` and a `null` tail — never omitted. Before
- *    this, the only trace such a book left was
+ *    `optionsClientConfigured: false` — never omitted. Before this, the only
+ *    trace such a book left was
  *    `log.warn('live OTM bounded test: no balance snapshot')`, which carried no
  *    username and so could not be attributed to a book at all.
+ * 3. **TRA-3119 — the per-book {@link LiveArmCensusRow.optionsAccountIdTail} is
+ *    the point, not a garnish.** `liveUnmanagedRisk` was the standing candidate
+ *    for "is a foreign account in play" and cannot answer it:
+ *    `summarizeLiveUnmanagedRisk` walks OUR engines' book rows, so a fill
+ *    sitting in the desk's Tradier account that no engine holds a row for is
+ *    invisible to it by construction, and its `{total: 0}` reads identically
+ *    clean either way. Nor is there a read-only way to ask the broker — both
+ *    `/api/tradier/positions/sync` routes are POSTs that mutate the book. The
+ *    tail is therefore the only server-side fact that separates two books both
+ *    reporting `credsSaved: true`, and it must be present on EVERY row whose
+ *    creds resolve.
  *
  * ## Disclosure contract (TRA-2163)
  *
@@ -135,7 +146,27 @@ export interface LiveArmCensusRow {
    *   • `null`           — nothing resolved; no client constructs.
    */
   accountIdSource: 'saved' | 'env-fallback' | null;
-  /** Masked last-4 of the EFFECTIVE account id; `null` when none resolves. */
+  /**
+   * Masked last-4 of the EFFECTIVE account id — WHICH account, where
+   * {@link accountIdSource} says only WHOSE. `null` exactly when no credential
+   * pair resolves, i.e. it is non-null ⇔ `accountIdSource !== null`.
+   *
+   * TRA-3119 promoted this from supporting detail to THE load-bearing field:
+   * two live books both reporting `prodKeySaved`/`prodAccountSaved: true` are
+   * the pass and the fail state of "is a second book pointed at the desk's
+   * money", and nothing else on this row separates them.
+   *
+   * It deliberately does NOT gate on {@link optionsClientConfigured}. It did
+   * until TRA-3119, on the reasoning that a tail must never imply an arm that
+   * does not exist — but the arm claim lives in its own explicit booleans
+   * ({@link liveEntryGateOpen}, {@link realMoneyArmed}), so the tail was never
+   * carrying it. What that gate actually did was blank the tail on the ONE row
+   * where the account is hardest to find and matters most: the TRA-2649
+   * split-brain, durable `demo` + runtime `live`, which reports
+   * `realMoneyArmed: true` and `accountIdSource: 'saved'` and, under the old
+   * rule, a `null` tail — a row asserting a book is trading its own real money
+   * while refusing to name the account.
+   */
   optionsAccountIdTail: string | null;
 }
 
@@ -215,10 +246,12 @@ export function summarizeLiveArmCensus(
       optionsClientConfigured,
       realMoneyArmed: liveEntryGateOpen && resolved.env === 'production',
       accountIdSource,
-      // Tail follows the CLIENT, not the creds: a book whose client would not
-      // construct reports `null` even if a stray cred half-resolved, so the tail
-      // never implies an arm that does not exist.
-      optionsAccountIdTail: optionsClientConfigured ? maskTail(resolved.accountId) : null,
+      // TRA-3119 — tail follows the CREDS, on the same predicate as
+      // `accountIdSource` above, so the two can never disagree: a row that
+      // names WHOSE account always names WHICH. `credentialsResolved` already
+      // requires a non-empty account id, so this is non-null exactly when
+      // `accountIdSource` is.
+      optionsAccountIdTail: resolved.credentialsResolved ? maskTail(resolved.accountId) : null,
     });
   }
   return {
