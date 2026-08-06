@@ -32,11 +32,30 @@ const DAYS = Number(process.env.DAYS ?? 21);
 // Folds to enumerate. `null` = send no `?mode` at all (the alias).
 const FOLDS = ['demo', 'live', 'sandbox', null];
 
-const env = Object.fromEntries(
-  fs.readFileSync(new URL('../.env', import.meta.url), 'utf8').split(/\r?\n/)
-    .filter(l => l.includes('=') && !l.startsWith('#'))
-    .map(l => [l.slice(0, l.indexOf('=')).trim(), l.slice(l.indexOf('=') + 1).trim()]),
-);
+// Creds from `.env` if this checkout has one, else from the process env. A
+// checkout without `.env` must not throw: an uncaught `ENOENT` is a stack trace,
+// and a stack trace is an UNREADABLE verdict that a reader can easily file under
+// "the census could not be run" — when the census is in fact perfectly runnable.
+// Same fallback order as `tra2631-provenance-stamp-check.mjs`, deliberately, so
+// the two instruments cannot disagree about which host/identity they graded.
+// (TRA-3072: this threw on an agent checkout while the pre-deploy capture was
+// the thing being asked for.)
+function loadEnv() {
+  try {
+    return Object.fromEntries(
+      fs.readFileSync(new URL('../.env', import.meta.url), 'utf8').split(/\r?\n/)
+        .filter(l => l.includes('=') && !l.startsWith('#'))
+        .map(l => [l.slice(0, l.indexOf('=')).trim(), l.slice(l.indexOf('=') + 1).trim()]),
+    );
+  } catch {
+    return {};
+  }
+}
+const fileEnv = loadEnv();
+const env = {
+  ADMIN_USERNAME: process.env.ADMIN_USERNAME ?? process.env.TRADING_ADMIN_USERNAME ?? fileEnv.ADMIN_USERNAME,
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD ?? process.env.TRADING_ADMIN_PASSWORD ?? fileEnv.ADMIN_PASSWORD,
+};
 const login = await fetch(`${HOST}/api/auth/login`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ username: env.ADMIN_USERNAME ?? 'admin', password: env.ADMIN_PASSWORD }),
