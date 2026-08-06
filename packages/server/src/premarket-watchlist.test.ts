@@ -276,3 +276,132 @@ describe('filterByPriceFloor (TRA-510)', () => {
     expect(dropped).toEqual([]);
   });
 });
+
+/**
+ * TRA-3071 — the archived `latest.json` is read OFF DISK by this module, so
+ * neither of the shipped defences reaches it: TRA-2610 guards report
+ * GENERATION (a file already on disk is untouched) and TRA-2631 stamps the
+ * archive at the HTTP/WS RESPONSE boundary (this consumer never crosses it).
+ * The guard therefore has to live at the consumer, exactly as TRA-2610 put it
+ * on the other ranking consumers.
+ *
+ * The two rows below are the REAL archived rows off the 2026-05-03 stocks
+ * report, not invented ones — they straddle `SUSPECT_MOVE_RATIO` (2) from
+ * both sides, so together they pin the bar rather than just one side of it:
+ *
+ *   - SELX  $0.34 / +1316.67%  ⇒ prev 0.34/14.1667 = 0.024, r = 14.167  SUSPECT
+ *   - INLF  $6.27 /   +97.17%  ⇒ prev 6.27/1.9717  = 3.180, r =  1.9717 CLEAN
+ *
+ * INLF is the false-positive control and it is deliberately a near-miss: it
+ * clears the bar by 0.0283. A guard that quietly tightened the threshold, or
+ * that keyed on "big percentage" instead of the ratio, fails on it.
+ *
+ * NEITHER row carries `moveSuspect`. That is not an omission in the fixture —
+ * `moveSuspect` is never persisted, so EVERY archived row lacks it, which is
+ * why the guard must RE-EXECUTE the rule and not merely read the flag.
+ */
+describe('scoreSymbols — archived top5Movers plausibility guard (TRA-3071)', () => {
+  const SELX = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
+  const INLF = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
+
+  it('does not bump a suspect archived mover into the eod_mover bucket', () => {
+    const eod = fakeEod({ top5Movers: [SELX] });
+    const ranked = scoreSymbols(eod, []);
+    expect(ranked.map(r => r.symbol)).not.toContain('SELX');
+    expect(ranked).toEqual([]);
+  });
+
+  it('still bumps a clean archived mover — the false-positive control', () => {
+    const eod = fakeEod({ top5Movers: [INLF] });
+    const ranked = scoreSymbols(eod, []);
+    expect(ranked).toEqual([
+      { symbol: 'INLF', score: 5, sources: ['eod_mover'] },
+    ]);
+  });
+
+  it('drops only the suspect row from a mixed archive', () => {
+    const eod = fakeEod({ top5Movers: [SELX, INLF] });
+    const ranked = scoreSymbols(eod, []);
+    expect(ranked.map(r => r.symbol)).toEqual(['INLF']);
+  });
+
+  it('honours a persisted moveSuspect flag even when the rule itself is clean', () => {
+    // Belt-and-braces: a row whose numbers pass (r = 1.9717) but which the
+    // PRODUCER condemned — e.g. off an input the row no longer carries. The
+    // consumer must not silently overrule the stamp.
+    const eod = fakeEod({
+      top5Movers: [{ ...INLF, moveSuspect: true } as unknown as EodReport['top5Movers'][number]],
+    });
+    expect(scoreSymbols(eod, [])).toEqual([]);
+  });
+
+  it('does not suppress a symbol that also has an independent pre-market source', () => {
+    // The guard removes the UNEARNED weight-5 bump, not the symbol. SELX
+    // showing up on today's live gainers screener is real, current evidence
+    // and still earns its weight-4 `gainer` bump.
+    const eod = fakeEod({ top5Movers: [SELX] });
+    const scan: ScanResult[] = [{ symbol: 'SELX', reason: 'gainer', changePct: 9 }];
+    const ranked = scoreSymbols(eod, scan);
+    expect(ranked).toEqual([
+      { symbol: 'SELX', score: 4, sources: ['gainer'] },
+    ]);
+  });
+
+  it('leaves the eod_traded bucket alone — it is not a plausibility claim', () => {
+    // `eod_traded` says the engine HELD this name yesterday, which is a fact
+    // about our own book, not about a provider's quote arithmetic. An open
+    // swing must keep being watched regardless of what the movers table says.
+    const eod = fakeEod({
+      top5Movers: [SELX],
+      trades: [{ symbol: 'SELX' } as unknown as EodReport['trades'][number]],
+    });
+    const ranked = scoreSymbols(eod, []);
+    expect(ranked).toEqual([
+      { symbol: 'SELX', score: 3, sources: ['eod_traded'] },
+    ]);
+  });
+});
+
+describe('filterByPriceFloor — suspect rows do not seed the price map (TRA-3071)', () => {
+  it('prices a suspect mover off a FRESH quote instead of the archived row', async () => {
+    // The archived price ($0.34) would fail the floor outright. The guard's
+    // job here is not to change that verdict but to stop the untrusted number
+    // deciding it: the symbol falls through to the live lookup, which is
+    // strictly better evidence. Here the fresh quote says $12.40 — a real
+    // price for a row whose *changePct* was the fabricated part — and the
+    // symbol is correctly kept.
+    const eod = fakeEod({ top5Movers: [{ symbol: 'SELX', price: 0.34, changePct: 1316.67 }] });
+    const scan: ScanResult[] = [{ symbol: 'SELX', reason: 'gainer', changePct: 9 }];
+    const ranked = scoreSymbols(eod, scan);
+
+    const fetched: string[][] = [];
+    const { kept, dropped } = await filterByPriceFloor(
+      ranked,
+      eod,
+      async (syms) => {
+        fetched.push([...syms]);
+        return new Map([['SELX', { price: 12.40 }]]);
+      },
+    );
+
+    expect(fetched).toEqual([['SELX']]);   // the archived seed was NOT used
+    expect(kept.map(r => r.symbol)).toEqual(['SELX']);
+    expect(dropped).toEqual([]);
+  });
+
+  it('still seeds from a clean archived row without a quote round-trip', async () => {
+    // The false-positive control on the price leg: INLF's $6.27 clears the
+    // $5 floor off the archive alone, and the lookup must not be invoked.
+    const eod = fakeEod({ top5Movers: [{ symbol: 'INLF', price: 6.27, changePct: 97.17 }] });
+    const ranked = scoreSymbols(eod, []);
+
+    const { kept, dropped } = await filterByPriceFloor(
+      ranked,
+      eod,
+      async () => { throw new Error('quote lookup should not be invoked for a clean archived row'); },
+    );
+
+    expect(kept.map(r => r.symbol)).toEqual(['INLF']);
+    expect(dropped).toEqual([]);
+  });
+});

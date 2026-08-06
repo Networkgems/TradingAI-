@@ -12,6 +12,11 @@
  *      actually traded yesterday so the engine keeps watching anything it
  *      already had a thesis on.
  *
+ *      TRA-3071 — this file is read OFF DISK, so it is the one ranking input
+ *      that the read-time archive stamp (TRA-2631) cannot reach. Every
+ *      `top5Movers` row is put through `isMoveSuspect` here, at the consumer,
+ *      before it can seed a symbol or a price. See {@link suspectMover}.
+ *
  *   2. **Pre-market scan** — a fresh `scanStocksMarket()` pull of Yahoo's
  *      day-gainers / losers / most-actives / trending screeners. Pre-market
  *      movers correlate with first-hour volatility; feeding them in early
@@ -34,8 +39,14 @@
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
-import type { EodReport } from '@trading-app/shared';
-import { WATCHLIST, WATCHLIST_MIN_PRICE } from '@trading-app/shared';
+import type { EodMover, EodReport } from '@trading-app/shared';
+import {
+  WATCHLIST,
+  WATCHLIST_MIN_PRICE,
+  SUSPECT_MOVE_RATIO,
+  assessQuotePlausibility,
+  isMoveSuspect,
+} from '@trading-app/shared';
 import { scanStocksMarket, type ScanResult } from './market-scanner.js';
 import { fetchQuotes, fetchMarketNews } from './yahoo-feed.js';
 import { addStocksSymbol, getStocksWatchlistData } from './watchlist-store.js';
@@ -94,6 +105,50 @@ const WEIGHTS: Record<string, number> = {
   trending: 1,
 };
 
+/**
+ * TRA-3071 — the plausibility guard for the ARCHIVED top-movers.
+ *
+ * This module's first input is read STRAIGHT OFF DISK (`loadLatestEodReport`),
+ * so it is the one ranking consumer that neither of the shipped defences can
+ * reach:
+ *
+ *   - **TRA-2610** guards report GENERATION. It stops a NEW `latest.json` from
+ *     containing a suspect row; it says nothing about one already on disk.
+ *   - **TRA-2631** stamps the archive at READ TIME, at the HTTP/WS response
+ *     boundary. This path never crosses that boundary — it opens the file
+ *     itself — so the stamp is structurally invisible to it.
+ *
+ * Without this, a symbol earns the top-weight `eod_mover` bump (5) on a session
+ * move THAT NEVER HAPPENED, and the engine watches it into the next open.
+ *
+ * The predicate is `isMoveSuspect`, the same one TRA-2610 gave the other
+ * ranking consumers: it honours the producer's `moveSuspect` flag AND
+ * re-executes the rule over the numbers. The second half is what makes it work
+ * here at all — a persisted `EodMover` carries no flag (`moveSuspect` is never
+ * written to disk), so a flag-only guard would pass every archived row.
+ *
+ * The split-calendar leg (TRA-3068) is deliberately NOT passed. It needs the
+ * row's session pair against a live provider calendar; an archived row is dated
+ * by the report, not by itself, and TRA-3068 settled that the continuity rule
+ * abstains here rather than guessing. This is the session-move leg only.
+ *
+ * Returns the verdict on a suspect row (so the caller can log the arithmetic
+ * that condemned it — per TRA-2379 decision 2 a silent drop reads identically
+ * to nothing being wrong) and `null` on a row that may be ranked.
+ */
+function suspectMover(mover: EodMover): { reason: string; impliedPrevClose: number | null; ratio: number | null } | null {
+  if (!isMoveSuspect(mover)) return null;
+  const v = assessQuotePlausibility({ price: mover.price, changePct: mover.changePct });
+  return {
+    // `isMoveSuspect` fired but the rule did not ⇒ the row carried the
+    // producer's flag and nothing else. Name that, rather than logging a
+    // suspicion with no reason attached.
+    reason: v.reason ?? 'producer_flag',
+    impliedPrevClose: v.impliedPrevClose,
+    ratio: v.ratio,
+  };
+}
+
 /** Read the prior-session EOD report for a user's active stocks mode. */
 async function loadLatestEodReport(ctx: UserContext): Promise<EodReport | null> {
   const mode = stockModeKey(getSettings(ctx.username));
@@ -143,7 +198,26 @@ export function scoreSymbols(
   };
 
   if (eod) {
-    for (const mover of eod.top5Movers) bump(mover.symbol, 'eod_mover');
+    for (const mover of eod.top5Movers) {
+      // TRA-3071 — the archived row is not fact. Skip the top-weight bump when
+      // its own published numbers are mutually unbelievable; log the arithmetic
+      // so the skip is auditable, not a silent count.
+      const suspect = suspectMover(mover);
+      if (suspect) {
+        log.info('eod_mover skipped — archived row failed the plausibility rule', {
+          symbol: mover.symbol,
+          price: mover.price,
+          changePct: mover.changePct,
+          impliedPrevClose: suspect.impliedPrevClose,
+          ratio: suspect.ratio,
+          suspectMoveRatio: SUSPECT_MOVE_RATIO,
+          reason: suspect.reason,
+          source: 'eod_mover',
+        });
+        continue;
+      }
+      bump(mover.symbol, 'eod_mover');
+    }
     // Symbols the engine actually traded yesterday — keep them under watch.
     const tradedSet = new Set<string>();
     for (const t of eod.trades) tradedSet.add(t.symbol.toUpperCase());
@@ -194,9 +268,31 @@ export async function filterByPriceFloor(
   }
 
   // Step 1: seed the price map from yesterday's EOD top-5 movers (cheap).
+  //
+  // TRA-3071 — but not from a row that failed the plausibility rule. In this
+  // defect class the fabrication usually lives in `changePct` rather than
+  // `price`, so this leg is the weaker of the two; it is guarded anyway because
+  // the seed exists purely to SKIP the live quote, and skipping a live quote in
+  // favour of an untrusted archived number is the wrong trade at any odds. A
+  // skipped seed is not a drop: the symbol simply falls through to step 2 and
+  // gets priced off a fresh quote, which is strictly better evidence.
   const priceBySymbol = new Map<string, number>();
   if (eod) {
     for (const mover of eod.top5Movers) {
+      const suspect = suspectMover(mover);
+      if (suspect) {
+        log.info('eod price seed skipped — archived row failed the plausibility rule', {
+          symbol: mover.symbol,
+          price: mover.price,
+          changePct: mover.changePct,
+          impliedPrevClose: suspect.impliedPrevClose,
+          ratio: suspect.ratio,
+          suspectMoveRatio: SUSPECT_MOVE_RATIO,
+          reason: suspect.reason,
+          source: 'price_floor_seed',
+        });
+        continue;
+      }
       priceBySymbol.set(mover.symbol.toUpperCase(), mover.price);
     }
   }
