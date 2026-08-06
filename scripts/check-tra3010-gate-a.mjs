@@ -24,7 +24,12 @@
 // was never wired. `GET /api/options/basis-restatements` publishes the
 // before/after pair captured at the restatement itself, plus the denominator.
 
-const HOST = 'https://tradingai-bqb1.onrender.com';
+// Default is the explicit bqb1 host — never `TRADING_API_BASE`, which is a
+// localhost decoy. `--host=` exists ONLY so the control harness
+// (`check-tra3010-gate-a-selftest.mjs`) can drive this same code against
+// fixtures; nothing else should pass it.
+const HOST = process.argv.slice(2).find(a => a.startsWith('--host='))?.slice(7)
+  ?? 'https://tradingai-bqb1.onrender.com';
 const CENTS = 2;
 const RATIO_DP = 10;
 
