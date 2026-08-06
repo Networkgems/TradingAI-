@@ -26,9 +26,11 @@ import {
 import {
   flushDenominatorFlipTape,
   serializeTapeWithinBudget,
+  computeTapeCoverage,
   DENOM_FLIP_TAPE_MAX_FILES,
   type DenominatorFlipTapeFile,
 } from './denominator-flip-tape-writer.js';
+import { etWallClockToUtcMs } from './et-clock.js';
 
 type QuoteRow = { price: number; volume: number; change: number; changePct: number };
 const quotes = (rows: Record<string, QuoteRow>) => new Map(Object.entries(rows));
@@ -376,7 +378,19 @@ describe('TRA-2689 — the bounded flush', () => {
       saturated: false,
       droppedCandidates: 0,
       truncatedForSize: 0,
+      droppedOnMerge: 0,
       admitted: 2000,
+      segments: [],
+      segmentCount: 0,
+      restartBoundaries: 0,
+      coverage: {
+        rthOpenUtc: null,
+        rthCloseUtc: null,
+        observedMs: null,
+        uncoveredMs: null,
+        rowsLostToRestart: null,
+      },
+      coverageComplete: false,
       rows: dumpOf(2000).rows,
     };
     const tiny = serializeTapeWithinBudget(file, 20_000);
@@ -431,5 +445,327 @@ describe('TRA-2689 — the bounded flush', () => {
     });
     expect(res.written).toBe(false);
     expect(res.error).toBeTruthy();
+  });
+});
+
+/**
+ * TRA-3116 — the tape survived admission and then died between the close and the
+ * 01:00Z drain. These are the acceptance arms for the CTO's three-part ruling.
+ *
+ * Read the controls as pairs. The whole failure this ticket closes is a file
+ * that reads CLEAN over a session it barely observed, so for every arm that
+ * proves a gap is caught there is a known-good beside it proving the same
+ * predicate still passes a genuinely complete session — a coverage check that
+ * says "incomplete" unconditionally is exactly as useless as the
+ * `droppedCandidates: 0` it replaces.
+ */
+describe('TRA-3116 — the drain survives a restart (merge, coverage, orphan)', () => {
+  /** 2026-07-30 is EDT: RTH is 13:30Z–20:00Z. */
+  const DATE = '2026-07-30';
+  const OPEN_Z = Date.parse('2026-07-30T13:30:00.000Z');
+  const CLOSE_Z = Date.parse('2026-07-30T20:00:00.000Z');
+  const PRE_OPEN_Z = Date.parse('2026-07-30T12:00:00.000Z');
+
+  const rowsOf = (n: number, tag: string) => {
+    const rows: DenominatorFlipCandidate[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const row = buildDenominatorFlipCandidate({
+        symbol: `${tag}${i}`,
+        prev: { price: 1, change: 0.1, changePct: 10, lastUpdated: T_JUL28_1500ET, quoteStatus: 'ok', moveSuspect: false },
+        next: { price: 1, change: 0.2, changePct: 20 },
+        now: T_JUL28_1505ET,
+      });
+      rows.push(row);
+    }
+    return rows;
+  };
+  const dump = (rows: DenominatorFlipCandidate[], dropped = 0, capacity = DENOM_FLIP_TAPE_CAPACITY) => ({
+    rows, droppedCandidates: dropped, saturated: dropped > 0, capacity, admitted: rows.length + dropped,
+  });
+  const flush = (
+    dir: string,
+    d: ReturnType<typeof dump>,
+    opts: { trigger: 'eod' | 'shutdown'; startedAt: number; now: number; capacity?: number },
+  ) => flushDenominatorFlipTape({
+    targetDir: dir,
+    date: DATE,
+    dump: d,
+    admissionRule: { changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP, capacity: opts.capacity ?? DENOM_FLIP_TAPE_CAPACITY },
+    trigger: opts.trigger,
+    processStartedAt: new Date(opts.startedAt).toISOString(),
+    now: opts.now,
+  });
+  const readTape = async (dir: string, name = `${DATE}.json`) =>
+    JSON.parse(await readFile(join(dir, 'tape', name), 'utf-8')) as DenominatorFlipTapeFile;
+
+  // ── Part 1 + 2: the merge ────────────────────────────────────────────────
+
+  it('ACCEPTANCE — a shutdown drain then an EOD drain MERGE; the second does not overwrite the first', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Process A: boots pre-open, dies mid-session. This is the drain that did
+    // not exist before this ticket, and its absence is what destroyed the tape.
+    await flush(dir, dump(rowsOf(3, 'A')), {
+      trigger: 'shutdown', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-30T17:00:00.000Z'),
+    });
+    // Process B: boots straight after, runs to the 01:00Z EOD drain.
+    await flush(dir, dump(rowsOf(2, 'B')), {
+      trigger: 'eod', startedAt: Date.parse('2026-07-30T17:00:00.000Z'), now: Date.parse('2026-07-31T01:00:00.000Z'),
+    });
+
+    const parsed = await readTape(dir);
+    // THE REGRESSION LOCK. Pre-fix this file held 2 rows: last-write-wins.
+    expect(parsed.rows).toHaveLength(5);
+    expect(parsed.rows.map(r => r.symbol)).toEqual(['A0', 'A1', 'A2', 'B0', 'B1']);
+    expect(parsed.segmentCount).toBe(2);
+    expect(parsed.segments.map(s => s.trigger)).toEqual(['shutdown', 'eod']);
+    expect(parsed.admitted).toBe(5);
+  });
+
+  it('counters SUM across segments, and `admitted` is NOT re-derived from rows + dropped', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    await flush(dir, dump(rowsOf(2, 'A'), 7), { trigger: 'shutdown', startedAt: OPEN_Z, now: OPEN_Z + 3_600_000 });
+    await flush(dir, dump(rowsOf(3, 'B'), 11), { trigger: 'eod', startedAt: OPEN_Z + 3_600_000, now: CLOSE_Z });
+
+    const parsed = await readTape(dir);
+    // Summing is only correct because `drain()` resets `dropped` — each segment
+    // describes ONLY its own slice. A merge built on `peek()` (which does not
+    // clear) would double-count both of these.
+    expect(parsed.droppedCandidates).toBe(18);
+    expect(parsed.admitted).toBe(23);
+    expect(parsed.saturated).toBe(true);
+    // 5 rows + 18 dropped happens to equal 23 here; the point is the file's own
+    // number comes from the segments, so it stays right when a third loss source
+    // (`droppedOnMerge`) fires. Pinned by the merge-eviction arm below.
+    expect(parsed.admitted).toBe(parsed.segments.reduce((n, s) => n + s.admitted, 0));
+  });
+
+  it('ACCEPTANCE — merge-time eviction lands on `droppedOnMerge`, NOT on the other two counters', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Capacity 4 across two 3-row segments: the merge must evict 2, and those 2
+    // are rows no segment's own counters ever saw.
+    await flush(dir, dump(rowsOf(3, 'A'), 0, 4), { trigger: 'shutdown', startedAt: OPEN_Z, now: OPEN_Z + 60_000, capacity: 4 });
+    await flush(dir, dump(rowsOf(3, 'B'), 0, 4), { trigger: 'eod', startedAt: OPEN_Z + 60_000, now: CLOSE_Z, capacity: 4 });
+
+    const parsed = await readTape(dir);
+    expect(parsed.rows).toHaveLength(4);
+    // Oldest-first, so the survivors are a contiguous SUFFIX.
+    expect(parsed.rows.map(r => r.symbol)).toEqual(['A2', 'B0', 'B1', 'B2']);
+    expect(parsed.droppedOnMerge).toBe(2);
+    // The load-bearing half: folding this into either existing field would
+    // re-create the silent cap inside the fix.
+    expect(parsed.droppedCandidates).toBe(0);
+    expect(parsed.truncatedForSize).toBe(0);
+    // `admitted` still says 6 even though `rows + droppedCandidates` is 4.
+    expect(parsed.admitted).toBe(6);
+    expect(parsed.rows.length + parsed.droppedCandidates).not.toBe(parsed.admitted);
+
+    // KNOWN-GOOD: the same two drains under a capacity that fits evict nothing,
+    // so `droppedOnMerge` is not simply always-on.
+    const roomy = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    await flush(roomy, dump(rowsOf(3, 'A')), { trigger: 'shutdown', startedAt: OPEN_Z, now: OPEN_Z + 60_000 });
+    await flush(roomy, dump(rowsOf(3, 'B')), { trigger: 'eod', startedAt: OPEN_Z + 60_000, now: CLOSE_Z });
+    expect((await readTape(roomy)).droppedOnMerge).toBe(0);
+  });
+
+  // ── Part 3: coverage ─────────────────────────────────────────────────────
+
+  it('ACCEPTANCE — a restart gap makes `coverageComplete` false and `rowsLostToRestart` NULL, never 0', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Process A observes 13:30Z–15:00Z, then a 2-hour hole, then process B.
+    await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'shutdown', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-30T15:00:00.000Z') });
+    await flush(dir, dump(rowsOf(1, 'B')), { trigger: 'eod', startedAt: Date.parse('2026-07-30T17:00:00.000Z'), now: Date.parse('2026-07-31T01:00:00.000Z') });
+
+    const parsed = await readTape(dir);
+    expect(parsed.coverageComplete).toBe(false);
+    expect(parsed.coverage.uncoveredMs).toBe(2 * 3_600_000);
+    // THE POINT OF PART 3. Those rows died with process A; nothing counted them
+    // and nothing can. A `0` here would be the same fail-open as the
+    // `droppedCandidates: 0` on the real 08-05 file — true and useless.
+    expect(parsed.coverage.rowsLostToRestart).toBeNull();
+    expect(parsed.restartBoundaries).toBe(1);
+    // The pre-fix trap in one assertion: every OTHER counter reads clean.
+    expect(parsed.saturated).toBe(false);
+    expect(parsed.truncatedForSize).toBe(0);
+    expect(parsed.droppedOnMerge).toBe(0);
+  });
+
+  it('KNOWN-GOOD — one process spanning the whole session is coverageComplete with rowsLostToRestart 0', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    await flush(dir, dump(rowsOf(4, 'A')), {
+      trigger: 'eod', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-31T01:00:00.000Z'),
+    });
+    const parsed = await readTape(dir);
+    expect(parsed.coverage.rthOpenUtc).toBe('2026-07-30T13:30:00.000Z');
+    expect(parsed.coverage.rthCloseUtc).toBe('2026-07-30T20:00:00.000Z');
+    expect(parsed.coverage.observedMs).toBe(CLOSE_Z - OPEN_Z);
+    expect(parsed.coverage.uncoveredMs).toBe(0);
+    expect(parsed.coverage.rowsLostToRestart).toBe(0);
+    expect(parsed.coverageComplete).toBe(true);
+    expect(parsed.restartBoundaries).toBe(0);
+  });
+
+  it('two drains by ONE process are not a restart, and their overlap cannot double-count past 100%', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const started = PRE_OPEN_Z;
+    // The EOD drain, then that same process's own shutdown drain minutes later.
+    await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'eod', startedAt: started, now: Date.parse('2026-07-31T01:00:00.000Z') });
+    await flush(dir, dump(rowsOf(1, 'B')), { trigger: 'shutdown', startedAt: started, now: Date.parse('2026-07-31T01:05:00.000Z') });
+    const parsed = await readTape(dir);
+    expect(parsed.segmentCount).toBe(2);
+    // Same `processStartedAt` on both — a seam in the file is not a seam in time.
+    expect(parsed.restartBoundaries).toBe(0);
+    expect(parsed.coverage.observedMs).toBe(CLOSE_Z - OPEN_Z);
+    expect(parsed.coverageComplete).toBe(true);
+  });
+
+  it('a SIGKILL writes no segment at all, and coverage still sees the hole', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Process A drains at 15:00Z. Process B boots at 15:01Z and is SIGKILLed at
+    // 18:00Z — it never writes anything. Process C boots at 18:00Z.
+    await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'shutdown', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-30T15:00:00.000Z') });
+    await flush(dir, dump(rowsOf(1, 'C')), { trigger: 'eod', startedAt: Date.parse('2026-07-30T18:00:00.000Z'), now: Date.parse('2026-07-31T01:00:00.000Z') });
+    const parsed = await readTape(dir);
+    // B's entire lifetime is an uncovered interval BETWEEN the surviving
+    // segments. A coverage number derived from successful drains would score
+    // this clean; one derived from process start times cannot.
+    expect(parsed.coverage.uncoveredMs).toBe(3 * 3_600_000);
+    expect(parsed.coverageComplete).toBe(false);
+    expect(parsed.coverage.rowsLostToRestart).toBeNull();
+  });
+
+  it('ACCEPTANCE — a ZERO-row session under complete coverage is still WRITTEN, and counts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const res = await flush(dir, dump([]), {
+      trigger: 'eod', startedAt: PRE_OPEN_Z, now: Date.parse('2026-07-31T01:00:00.000Z'),
+    });
+    expect(res.written).toBe(true);
+    const parsed = await readTape(dir);
+    expect(parsed.rows).toHaveLength(0);
+    // Per the promotion bar: a proven-full-coverage session with no candidates
+    // is a real observation. The old "skip the empty write" rule made this file
+    // unrepresentable, so the bar could never be reached by a quiet session.
+    expect(parsed.coverageComplete).toBe(true);
+    expect(parsed.saturated).toBe(false);
+    expect(parsed.truncatedForSize).toBe(0);
+    expect(parsed.droppedOnMerge).toBe(0);
+  });
+
+  it('a pre-open-only process contributes no observed time and does not fake coverage', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    // Boots 11:00Z, dies 12:00Z — entirely before the 13:30Z open.
+    await flush(dir, dump([]), {
+      trigger: 'shutdown',
+      startedAt: Date.parse('2026-07-30T11:00:00.000Z'),
+      now: Date.parse('2026-07-30T12:00:00.000Z'),
+    });
+    const parsed = await readTape(dir);
+    expect(parsed.coverage.observedMs).toBe(0);
+    expect(parsed.coverageComplete).toBe(false);
+  });
+
+  // ── Part 2c: the orphan ──────────────────────────────────────────────────
+
+  it('ACCEPTANCE — an UNREADABLE prior file is orphaned, never overwritten', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const tapeDir = join(dir, 'tape');
+    await mkdir(tapeDir, { recursive: true });
+    // A partial write: valid-looking prefix, truncated mid-object. This is the
+    // exact state in which we have the LEAST idea what we would be destroying.
+    await writeFile(join(tapeDir, `${DATE}.json`), '{"issue":"TRA-2689","rows":[{"sym', 'utf-8');
+
+    const res = await flush(dir, dump(rowsOf(2, 'B')), { trigger: 'eod', startedAt: OPEN_Z, now: CLOSE_Z });
+    expect(res.written).toBe(true);
+    expect(res.mergeDegraded).toBe(true);
+    expect(res.orphanedPriorFile).toBe(`${DATE}.orphan1.json`);
+
+    // The bytes we could not parse SURVIVE, untouched.
+    expect(await readFile(join(tapeDir, `${DATE}.orphan1.json`), 'utf-8'))
+      .toBe('{"issue":"TRA-2689","rows":[{"sym');
+    const parsed = await readTape(dir);
+    expect(parsed.mergeDegraded).toBe(true);
+    expect(parsed.orphanedPriorFile).toBe(`${DATE}.orphan1.json`);
+    expect(parsed.rows).toHaveLength(2);
+  });
+
+  it('orphan names do not collide, and orphans COUNT against the 30-file retention budget', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const tapeDir = join(dir, 'tape');
+    await mkdir(tapeDir, { recursive: true });
+    await writeFile(join(tapeDir, `${DATE}.json`), 'not json', 'utf-8');
+    await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'shutdown', startedAt: OPEN_Z, now: OPEN_Z + 1000 });
+    await writeFile(join(tapeDir, `${DATE}.json`), 'still not json', 'utf-8');
+    const res2 = await flush(dir, dump(rowsOf(1, 'B')), { trigger: 'eod', startedAt: OPEN_Z, now: CLOSE_Z });
+    expect(res2.orphanedPriorFile).toBe(`${DATE}.orphan2.json`);
+
+    // Retention must see the orphan form, or an unreadable file grows the budget
+    // without bound. Fill past the cap and check the count includes orphans.
+    for (let i = 1; i <= DENOM_FLIP_TAPE_MAX_FILES; i += 1) {
+      await writeFile(join(tapeDir, `2026-06-${String(i).padStart(2, '0')}.json`), '{}', 'utf-8');
+    }
+    await flush(dir, dump(rowsOf(1, 'C')), { trigger: 'eod', startedAt: OPEN_Z, now: CLOSE_Z });
+    const kept = (await readdir(tapeDir)).filter(n => /^\d{4}-\d{2}-\d{2}(?:\.orphan\d+)?\.json$/.test(n));
+    expect(kept).toHaveLength(DENOM_FLIP_TAPE_MAX_FILES);
+    expect(kept).toContain(`${DATE}.json`);
+  });
+
+  it('CONTROL — a MISSING prior file is the ordinary first drain, not degradation', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-'));
+    const res = await flush(dir, dump(rowsOf(1, 'A')), { trigger: 'eod', startedAt: OPEN_Z, now: CLOSE_Z });
+    expect(res.written).toBe(true);
+    expect(res.merged).toBe(false);
+    expect(res.mergeDegraded).toBeUndefined();
+    expect((await readdir(join(dir, 'tape'))).some(n => n.includes('orphan'))).toBe(false);
+  });
+
+  // ── Part 2d: re-admission ────────────────────────────────────────────────
+
+  it('ACCEPTANCE — a failed write re-admits its rows instead of eating the session', () => {
+    const tape = new DenominatorFlipTape(10);
+    const rows = rowsOf(3, 'A');
+    for (const r of rows) tape.record(r);
+    const drained = tape.drain();
+    expect(tape.length).toBe(0);
+
+    // The writer said `written: false`; the caller hands the rows back.
+    tape.readmit(drained.rows);
+    expect(tape.length).toBe(3);
+    expect(tape.peek().map(r => r.symbol)).toEqual(['A0', 'A1', 'A2']);
+    expect(tape.droppedCandidates).toBe(0);
+  });
+
+  it('over-capacity re-admission inflates `droppedCandidates` rather than vanishing', () => {
+    const tape = new DenominatorFlipTape(4);
+    const drained = { rows: rowsOf(3, 'X') };
+    // The ring refilled while the failed write was in flight.
+    for (const r of rowsOf(3, 'N')) tape.record(r);
+    tape.readmit(drained.rows);
+    expect(tape.length).toBe(4);
+    // 6 rows through a 4-slot ring: 2 overflowed, and they are NAMED.
+    expect(tape.droppedCandidates).toBe(2);
+    expect(tape.saturated).toBe(true);
+  });
+
+  // ── The session window itself ────────────────────────────────────────────
+
+  it('the RTH window is DST-correct, not a hard-coded 13:30Z', () => {
+    // EDT — the case a hard-coded constant gets right by luck.
+    expect(etWallClockToUtcMs('2026-07-30', 9, 30)).toBe(Date.parse('2026-07-30T13:30:00.000Z'));
+    expect(etWallClockToUtcMs('2026-07-30', 16, 0)).toBe(Date.parse('2026-07-30T20:00:00.000Z'));
+    // EST — the case it gets wrong by a full hour, which would grade a complete
+    // session as partial (and, worse, a partial one as complete).
+    expect(etWallClockToUtcMs('2026-01-15', 9, 30)).toBe(Date.parse('2026-01-15T14:30:00.000Z'));
+    expect(etWallClockToUtcMs('2026-01-15', 16, 0)).toBe(Date.parse('2026-01-15T21:00:00.000Z'));
+    // A malformed key publishes ignorance rather than a plausible number.
+    expect(etWallClockToUtcMs('not-a-date', 9, 30)).toBeNull();
+  });
+
+  it('an unresolvable date publishes coverage as NULL, never as zero', () => {
+    const cov = computeTapeCoverage('garbage', [
+      { processStartedAt: new Date(OPEN_Z).toISOString(), flushedAt: new Date(CLOSE_Z).toISOString(), trigger: 'eod', rows: 1, droppedCandidates: 0, truncatedForSize: 0, admitted: 1 },
+    ]);
+    expect(cov.observedMs).toBeNull();
+    expect(cov.uncoveredMs).toBeNull();
+    // `null`, not `0` — an unknown coverage must not read as a complete one.
+    expect(cov.rowsLostToRestart).toBeNull();
   });
 });

@@ -120,3 +120,52 @@ export function etHour(date: Date = new Date()): number {
 export function etDateKey(ms: number): string {
   return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
+
+/**
+ * TRA-3116 — the UTC instant of an ET wall-clock time on an ET calendar date.
+ *
+ * The inverse of {@link etDateKey}, and it exists because the tape's coverage
+ * stamp has to name the session window it is measuring against. The house had
+ * only a hard-coded `13:30Z open / 20:00Z close` (exit-cadence-snapshot.ts),
+ * which is EDT spelled as a constant: it is silently wrong for the ~4 months a
+ * year the session opens at 14:30Z, and a coverage number that is an hour off
+ * is worse than none because it grades a full session as partial (or, in
+ * November, a partial one as full).
+ *
+ * Resolved by fixed point rather than by a DST table: guess the instant as if
+ * ET were UTC, render THAT guess back in ET to read the offset actually in
+ * force there, and re-guess. Two passes, because the first correction can land
+ * on the other side of a transition; the loop exits early once it is stable.
+ * Returns `null` on a malformed date key rather than a plausible-looking wrong
+ * number — the caller publishes coverage as unknown instead.
+ */
+export function etWallClockToUtcMs(
+  dateKey: string,
+  hour: number,
+  minute: number,
+): number | null {
+  const m = dateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const naive = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hour, minute, 0, 0);
+  if (!Number.isFinite(naive)) return null;
+  let guess = naive;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const rendered = formatEtClock(new Date(guess)).match(/(\d+)\/(\d+)\/(\d+),\s+(\d+):(\d+)/);
+    if (!rendered) return null;
+    // The ET wall clock at `guess`, re-encoded as if it were UTC. The delta
+    // between that and `guess` IS the UTC offset in force at `guess`.
+    const wallAsUtc = Date.UTC(
+      Number(rendered[3]),
+      Number(rendered[1]) - 1,
+      Number(rendered[2]),
+      Number(rendered[4]) % 24,
+      Number(rendered[5]),
+      0,
+      0,
+    );
+    const next = naive - (wallAsUtc - guess);
+    if (next === guess) break;
+    guess = next;
+  }
+  return guess;
+}

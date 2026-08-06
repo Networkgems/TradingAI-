@@ -293,6 +293,27 @@ export class DenominatorFlipTape {
     this.head = (this.head + 1) % this.capacity;
   }
 
+  /**
+   * TRA-3116 (2d) — put a drained batch back after a FAILED write.
+   *
+   * {@link drain} resets the ring before the writer is even called, so until
+   * now a write failure destroyed the session's rows even though the process
+   * lived on. With a shutdown drain in place there is a second chance worth
+   * taking, so the flush paths re-admit on `written: false`.
+   *
+   * Deliberately plain {@link record} calls: if the ring has already refilled
+   * past capacity while the write was in flight, re-admission overflows and
+   * increments `droppedCandidates`, which is the correctly-named counter for
+   * "admitted but not in `rows`". Silently discarding the overflow instead
+   * would be the same unnamed loss this ticket exists to close.
+   *
+   * Rows must be handed back oldest-first (i.e. as `drain` returned them) for
+   * the ring's suffix semantics to survive the round trip.
+   */
+  readmit(rows: readonly DenominatorFlipCandidate[]): void {
+    for (const row of rows) this.record(row);
+  }
+
   /** Rows currently held, oldest first. Does not clear. */
   peek(): DenominatorFlipCandidate[] {
     if (!this.buf || this.size === 0) return [];

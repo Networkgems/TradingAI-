@@ -11,7 +11,10 @@ import { etHour } from './et-clock.js'; // TRA-2498
 // TRA-2689 (leg 2 of TRA-2654) — once-per-session drain of the WRITE-ONLY
 // denominator-flip candidate tape. Nothing on any decision path reads it.
 import { flushDenominatorFlipTape } from './denominator-flip-tape-writer.js';
-import { DENOM_FLIP_CHANGEPCT_DELTA_PP } from './denominator-flip-tape.js';
+import {
+  DENOM_FLIP_CHANGEPCT_DELTA_PP,
+  type DenominatorFlipTapeDump,
+} from './denominator-flip-tape.js';
 import { createFileArchiveDateStore } from './scheduler-state.js';
 import {
   buildAllowedOrigins,
@@ -1398,6 +1401,89 @@ async function userCtx(res: express.Response): Promise<UserContext> {
  *     filling an old gap can't clobber the genuine latest report or rebase
  *     the live dashboard's opening equity.
  */
+/**
+ * TRA-3116 — the ONE drain path for the TRA-2689 denominator-flip tape, shared
+ * by the EOD archive and by `gracefulShutdown`.
+ *
+ * Why it is shared rather than duplicated: the two triggers must agree on the
+ * bucket (`stockReportsDirFor` under the active stocks mode), on the date key,
+ * and on re-admission after a failed write. A second hand-rolled copy in the
+ * shutdown handler would drift, and the shape of the drift — writing to the
+ * wrong mode's directory, or forgetting the re-admit — is silent.
+ *
+ * ## Why the empty-dump skip is GONE
+ *
+ * The original writer skipped the write when the ring held nothing, on the
+ * reasoning that "a zero-row file and no file are the same fact". Under
+ * TRA-3116's coverage stamp they are emphatically NOT the same fact:
+ *
+ * - The segment, not the rows, is the payload. A restart during a stretch with
+ *   no candidates still has to stamp its `processStartedAt` / `flushedAt`, or
+ *   the surviving segments will not union to full RTH and a session that WAS
+ *   fully observed gets published as partial.
+ * - Per the CTO's part 5, `rows.length === 0` under `coverageComplete === true`
+ *   COUNTS toward the promotion bar. Skipping the write makes that file — the
+ *   proven-full-coverage quiet session — unrepresentable.
+ *
+ * Retention is unaffected: every drain on one ET date MERGES into that date's
+ * single file, so restarts add segments, not files.
+ *
+ * NEVER THROWS. On a shutdown it also must never be slow — the caller bounds it.
+ */
+async function drainDenominatorFlipTapeFor(
+  ctx: UserContext,
+  trigger: 'eod' | 'shutdown',
+  date?: string,
+): Promise<void> {
+  let dump: DenominatorFlipTapeDump | null = null;
+  try {
+    const mode = stockModeKey(getSettings(ctx.username));
+    const targetDir = stockReportsDirFor(ctx, mode);
+    dump = ctx.engine.drainDenominatorFlipTape();
+    const result = await flushDenominatorFlipTape({
+      targetDir,
+      // The ring holds what was recorded since the last drain, so on a shutdown
+      // the honest bucket is the ET calendar date NOW. At 01:00Z that is still
+      // the prior ET date, which is exactly the session those rows came from.
+      date: date ?? etDateKey(Date.now()),
+      dump,
+      admissionRule: {
+        changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP,
+        capacity: dump.capacity,
+      },
+      trigger,
+      processStartedAt: resolveBuildInfo().startedAt,
+      log,
+    });
+    // TRA-3116 (2d) — `drain()` reset the ring before the write was attempted,
+    // so a failed write would otherwise destroy the session even though this
+    // process is still alive to try again at the next trigger.
+    if (!result.written && dump.rows.length > 0) {
+      ctx.engine.readmitDenominatorFlipRows(dump.rows);
+      log.warn('TRA-3116 tape write failed — rows re-admitted to the ring', {
+        username: ctx.username,
+        trigger,
+        rows: dump.rows.length,
+        reason: result.error,
+      });
+    }
+  } catch (err) {
+    // Second layer: `flushDenominatorFlipTape` already swallows its own errors,
+    // but the EOD report is a human-read money artifact and shutdown must not be
+    // blocked, so nothing from here may propagate to either caller.
+    if (dump && dump.rows.length > 0) {
+      try {
+        ctx.engine.readmitDenominatorFlipRows(dump.rows);
+      } catch { /* the ring is best-effort; never let recovery throw either */ }
+    }
+    log.warn('TRA-2689 denominator-flip tape flush threw', {
+      username: ctx.username,
+      trigger,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function generateAndSaveReport(
   ctx: UserContext,
   opts: { asOfDate?: string } = {},
@@ -1927,29 +2013,7 @@ async function generateAndSaveReport(
   // today's observations under a day they did not happen on — and a tape whose
   // dates lie is worse than no tape.
   if (!backfill) {
-    try {
-      const dump = ctx.engine.drainDenominatorFlipTape();
-      // Skip the write entirely on an empty session — a `tape/<date>.json` with
-      // zero rows and a file that was never written are the same fact, and not
-      // writing it keeps the retention budget for sessions that carry data.
-      if (dump.rows.length > 0 || dump.droppedCandidates > 0) {
-        await flushDenominatorFlipTape({
-          targetDir,
-          date: finalReport.date,
-          dump,
-          admissionRule: {
-            changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP,
-            capacity: dump.capacity,
-          },
-          log,
-        });
-      }
-    } catch (err) {
-      log.warn('TRA-2689 denominator-flip tape flush threw', {
-        username: ctx.username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-    }
+    await drainDenominatorFlipTapeFor(ctx, 'eod', finalReport.date);
   }
 
   // Persist daily equity snapshot for cumulative tracking. Skipped on a
@@ -14435,6 +14499,15 @@ const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
  */
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 15_000;
 
+/**
+ * TRA-3116 — the tape drain's OWN shutdown budget, separate from and additional
+ * to the 15s tick drain above. Kept small on purpose: this is an observability
+ * artifact, and no artifact justifies risking a hard kill by overrunning
+ * Render's SIGTERM grace. A book that does not make it inside the window
+ * publishes a coverage gap, which is a correct reading, not a lost one.
+ */
+const TAPE_SHUTDOWN_DRAIN_TIMEOUT_MS = 2_000;
+
 /** TRA-407 (C5) — guard so a doubled SIGTERM/SIGINT can't re-enter shutdown. */
 let shuttingDown = false;
 
@@ -14489,6 +14562,47 @@ async function gracefulShutdown(signal: string): Promise<void> {
     await Promise.all(all.flatMap(ctx => [persistStocksNow(ctx), persistCryptoNow(ctx)]));
   } catch (err: unknown) {
     log.warn('shutdown persist failed', {
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // TRA-3116 (part 1) — drain the TRA-2689 denominator-flip tape on the way out.
+  //
+  // This is the whole ticket. The EOD archive fires at ~01:00Z, five hours after
+  // the close; on 2026-08-05 seven restarts landed inside that gap and every one
+  // of them zeroed the in-process ring. 364 rows held at 19:59Z reached disk as
+  // one row. Widening the drain's trigger to "EOD archive OR process exit" does
+  // not touch the constraint that actually matters — the FEED still never
+  // writes, and this runs after `engine.stop()` so no tick can admit a row into
+  // a ring we are draining.
+  //
+  // Placed here deliberately: after the tick drain (the ring is quiescent) and
+  // BEFORE `flushLogs()`, so this drain's own warn lines still reach disk.
+  //
+  // Its own <=2s race, consuming none of the 15s tick budget above: a tape is
+  // worth zero seconds of a redeploy, and pushing the process past Render's
+  // SIGTERM grace would trade the artifact for a hard kill. Own try/catch on top
+  // — `drainDenominatorFlipTapeFor` already swallows, and shutdown proceeds
+  // regardless.
+  try {
+    let tapeTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(all.map(ctx => drainDenominatorFlipTapeFor(ctx, 'shutdown'))).then(() => undefined),
+      new Promise<void>(resolve => {
+        tapeTimer = setTimeout(() => {
+          // Not a silent cap: the books that missed their segment will publish a
+          // coverage gap rather than a clean partial tape, which is the point.
+          log.warn('TRA-3116 shutdown tape drain exceeded timeout — exiting anyway', {
+            timeoutMs: TAPE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+            contexts: all.length,
+          });
+          resolve();
+        }, TAPE_SHUTDOWN_DRAIN_TIMEOUT_MS);
+        tapeTimer.unref?.();
+      }),
+    ]);
+    if (tapeTimer) clearTimeout(tapeTimer);
+  } catch (err: unknown) {
+    log.warn('TRA-3116 shutdown tape drain failed', {
       reason: err instanceof Error ? err.message : String(err),
     });
   }

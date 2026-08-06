@@ -3937,12 +3937,23 @@ export class SignalEngine {
   }
 
   /**
-   * TRA-2689 — drain the tape for the once-per-session EOD flush. Resets the
-   * ring. Called ONLY by the archive path in `index.ts`; the feed never writes
-   * to disk.
+   * TRA-2689 — drain the tape for a flush. Resets the ring.
+   *
+   * TRA-3116 widened the trigger: called by the EOD archive path OR by
+   * `gracefulShutdown`, both in `index.ts` and both outside the feed's tick.
+   * The feed still never writes to disk.
    */
   drainDenominatorFlipTape(): DenominatorFlipTapeDump {
     return this.denominatorFlipTape.drain();
+  }
+
+  /**
+   * TRA-3116 (2d) — put a drained batch back after a FAILED write, so a write
+   * error does not destroy a session the process is still alive to re-flush.
+   * Rows must be handed back oldest-first, i.e. exactly as `drain` returned them.
+   */
+  readmitDenominatorFlipRows(rows: readonly DenominatorFlipCandidate[]): void {
+    this.denominatorFlipTape.readmit(rows);
   }
 
   /**
