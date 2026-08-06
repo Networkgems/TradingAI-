@@ -91,7 +91,7 @@ import {
   parseConvictionDcaPaging,
 } from '../conviction-dca-ledger.js';
 import { summarizeChurnBrake } from '../churn-brake-ledger.js';
-import { summarizeDirectionalGate } from '../directional-open-ledger.js';
+import { summarizeDirectionalGate, summarizeDirectionalArm } from '../directional-open-ledger.js';
 import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
@@ -4765,6 +4765,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const directionalEnabled = isOptionDemoDirectionalEnabled(process.env);
     const ivRvRoutingEnabled = isOptionIvRvRoutingEnabled(process.env);
 
+    // TRA-3080 — the retained, per-ET-day, account-class-attributed ARM view.
+    //
+    // `enabled` above is a PROCESS-WIDE flag read. It is fleet-blind: it says nothing
+    // about whether any resident book's MODE lets it reach the pass, so it reported
+    // `true` throughout the desk's 2026-07-30 → 08-05 directional drought while the
+    // `admin` book — moved to `settings.mode: 'live'` for the live-OTM window — could
+    // not reach `evaluateDemoDirectional` at all (live needs
+    // `ENABLE_OPTION_LIVE_DIRECTIONAL`, unset by design). `scanCountSinceBoot` could
+    // not testify either: it is a since-boot latch on a box that reboots daily.
+    // This block is the axis that separates "scanned and rejected" from "never
+    // scanned, and here is why", for a PAST ET day.
+    const armByEtDay = summarizeDirectionalArm();
+
     // Chain provider wiring. Null — not false — when the pipeline dep is absent,
     // because "we cannot see it from here" is not the same fact as "it is missing".
     const chainConfigured: boolean | null = deps.optionsPipeline
@@ -4819,6 +4832,9 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       time: new Date(now()).toISOString(),
       build: resolveBuildInfo(),
       // Top-level `enabled` = is ANY instrumented single-leg entry path armed.
+      // ⚠️ PROCESS-WIDE FLAG STATE ONLY — see `armByEtDay` for whether any book could
+      // actually reach the pass (TRA-3080). The two disagree whenever a book is in a
+      // mode whose arm flag is off, which is the desk's state since 2026-07-30.
       enabled: armed.length > 0,
       verdict,
       lastScanAt,
@@ -4849,6 +4865,28 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         lastFetchError: watched.find((p) => p.lastFetchError != null)?.lastFetchError ?? null,
       },
       paths,
+      // TRA-3080 — RETAINED (30-day, hydrated across reboots), per-ET-day,
+      // account-class-attributed arm disposition of the `directional` pass. Unlike
+      // every other field on this route it can answer a question about LAST WEEK.
+      //
+      // Reading it: a cell with `reachable: false` means the books in that class
+      // never reached the scan, and `disposition` names why — `live_arm_off` is a
+      // book in live mode with `ENABLE_OPTION_LIVE_DIRECTIONAL` unset. A cell with
+      // `reachable: true` means they DID scan, so silence there is a reject question.
+      // NO cell for a class on a day is a THIRD state: no engine of that class ticked
+      // during RTH, and it must not be read as either of the other two.
+      armByEtDay,
+      armNote:
+        'TRA-3080. `enabled` above is process-wide flag state and is FLEET-BLIND — it '
+        + 'reads true even when no resident book can reach the pass. `armByEtDay` is the '
+        + 'per-book axis: it is retained on disk (30d) and survives the daily reboot, so '
+        + 'it is the ONLY field here that can testify about a past ET day. An absent '
+        + '(etDay, accountClass) cell means no engine of that class ticked in RTH — it is '
+        + 'not evidence the pass was off. `ticks` is a LOWER BOUND (persistence is '
+        + 'throttled to 5 min, so a died-boot tail is missing); `disposition`, '
+        + '`reachable`, `accountClass` and `books` are exact from the first tick — grade '
+        + 'on those, never on an exact tick count.',
+      armRetentionDays: 30,
     });
   });
 

@@ -138,6 +138,7 @@ import {
   anySleeveOpensFor,
   directionalOpensFor,
   recordDirectionalGateReject,
+  recordDirectionalArm, // TRA-3080
   type OpenSleeve,
 } from './directional-open-ledger.js';
 import {
@@ -5440,6 +5441,37 @@ export class SignalEngine {
     // unchanged.
     const directionalDemoOn = this.mode === 'demo' && isOptionDemoDirectionalEnabled();
     const directionalLiveOn = this.mode === 'live' && isOptionLiveDirectionalEnabled(process.env);
+
+    // TRA-3080 — leave a RETAINED trace of what this gate decided, per book, per ET
+    // day. Written HERE and not inside the pass on purpose: `evaluateDemoDirectional`
+    // opens its scan (`beginRvScan('directional', …)`) only AFTER re-checking these
+    // same two flags, so a book the gate turns away produces no scan, no reject and
+    // no open — indistinguishable from one that scanned and found nothing. That is
+    // exactly how the desk's directional drought after 2026-07-29 became unreadable:
+    // the `admin` book moved to `settings.mode: 'live'` for the live-OTM window
+    // (TRA-2536 → TRA-2877), `ENABLE_OPTION_LIVE_DIRECTIONAL` is unset by design, and
+    // every live-side instrument stayed silent about it while the fleet-wide
+    // `/api/health/rv-scan` `enabled` flag — a process-env read — went on reporting
+    // `true`.
+    //
+    // Only while the market is open, so that a day with NO cell for a class means
+    // "no engine of that class ticked during RTH" — a third state, kept separate from
+    // "the pass was off".
+    if (isStockMarketOpen()) {
+      recordDirectionalArm({
+        etDay: etDateString(new Date()),
+        account: this.alertUsername ?? '',
+        accountClass: classifySpreadCeilingAccount(this.alertUsername),
+        mode: this.mode,
+        disposition:
+          directionalDemoOn || directionalLiveOn
+            ? (this.rvScanner
+                ? (this.mode === 'live' ? 'armed_live' : 'armed_demo')
+                : 'no_scanner')
+            : (this.mode === 'live' ? 'live_arm_off' : 'demo_flag_off'),
+      });
+    }
+
     if (
       (directionalDemoOn || directionalLiveOn)
       && isStockMarketOpen()

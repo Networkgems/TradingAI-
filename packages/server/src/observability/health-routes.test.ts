@@ -64,6 +64,7 @@ import {
   type EquityEntryFunnelBlock,
 } from '../equity-entry-funnel.js';
 import { beginRvScan, __resetRvScanTelemetry } from '../rv-scan-telemetry.js'; // TRA-2193
+import { recordDirectionalArm, clearDirectionalOpenLedger } from '../directional-open-ledger.js'; // TRA-3080
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
@@ -3186,6 +3187,59 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     expect(String(body.note)).toContain('not a sleeve');
     // All three producer paths are enumerated, so none can go quiet unnoticed.
     expect(paths.length).toBe(3);
+  });
+
+  // TRA-3080 — the failure this route had left: `enabled` is a PROCESS-WIDE flag
+  // read, so it reported `true` all through the desk's 2026-07-30 → 08-05
+  // directional drought while the `admin` book, moved to `settings.mode: 'live'`
+  // for the live-OTM window, could not reach the pass at all. The two readings
+  // must be able to DISAGREE on the same response — if they cannot, the route is
+  // back to the state that made TRA-3080 unanswerable.
+  it('publishes a retained per-ET-day arm view that can contradict the fleet-blind `enabled`', () => {
+    clearDirectionalOpenLedger();
+    recordDirectionalArm(
+      {
+        etDay: '2026-07-31',
+        account: 'admin',
+        accountClass: 'desk',
+        mode: 'live',
+        disposition: 'live_arm_off',
+      },
+      NOW,
+    );
+    recordDirectionalArm(
+      {
+        etDay: '2026-07-31',
+        account: 'qa_reg_0710202220',
+        accountClass: 'fixture',
+        mode: 'demo',
+        disposition: 'armed_demo',
+      },
+      NOW,
+    );
+
+    const { body } = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: 'true' });
+    // The flag says armed…
+    expect(body.enabled as unknown as boolean).toBe(true);
+
+    // …and the retained axis says the desk could not reach the pass that day.
+    const days = body.armByEtDay as unknown as Array<{
+      etDay: string;
+      cells: Array<{ accountClass: string; reachable: boolean; disposition: string }>;
+    }>;
+    const day = days.find((d) => d.etDay === '2026-07-31')!;
+    const desk = day.cells.find((c) => c.accountClass === 'desk')!;
+    const fixture = day.cells.find((c) => c.accountClass === 'fixture')!;
+
+    expect(desk.reachable).toBe(false);
+    expect(desk.disposition).toBe('live_arm_off');
+    expect(fixture.reachable).toBe(true);
+    // The contradiction is the point: a fleet-blind `true` over an unreachable desk.
+    expect(body.enabled as unknown as boolean).not.toBe(desk.reachable);
+    expect(String(body.armNote)).toContain('FLEET-BLIND');
+    expect(body.armRetentionDays as unknown as number).toBe(30);
+
+    clearDirectionalOpenLedger();
   });
 });
 
