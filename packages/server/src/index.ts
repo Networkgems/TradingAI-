@@ -59,6 +59,12 @@ import {
 } from './eod-row-backfill.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells } from './reports/desk-calendar.js';
+// TRA-3100 — the live-calendar backfill's write decision (which cells it is
+// ALLOWED to overwrite), extracted so it is graded directly rather than mirrored.
+import {
+  decideCalendarRowWrite,
+  triageForceDates,
+} from './reports/calendar-write-decision.js';
 // TRA-2407 — default-deny scope for the TRA-1572 firm-wide demo fold.
 import {
   mayViewFirmWideDemoFold,
@@ -2718,6 +2724,14 @@ const LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK = (() => {
  * to 0. Both sleeves are separate tiles in the calendar detail view, so the
  * split is what the user actually reads; folding equity into `optionsPnl` would
  * tie the cell out while misattributing which sleeve earned it.
+ *
+ * TRA-3100 — `superseded` is non-null only on an operator-forced overwrite of a
+ * protected row. Two things follow from it, both audit-facing:
+ *   1. the replaced source + figure are recorded on the row (`supersededPnl`) and
+ *      named in the header, so a corrected cell can be told from a native one;
+ *   2. the prior body is demoted under an explicit marker. It describes the OLD
+ *      number, and an auditor reading a rewritten cell top-to-bottom would
+ *      otherwise find two contradictory figures with nothing saying which is live.
  */
 function makeRealizedBackfillReport(
   date: string,
@@ -2726,10 +2740,14 @@ function makeRealizedBackfillReport(
   closeCount: number,
   existing: ReturnType<typeof generateEodReport> | null,
   equityNote: string,
+  superseded: EodReport['supersededPnl'] | null = null,
 ): ReturnType<typeof generateEodReport> {
   const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
   const dayRealized = Number((dayOptionsRealized + dayEquityRealized).toFixed(2));
-  const header = `> **Live calendar backfill (TRA-244).** ${date} P&L = Tradier broker-truth realized P&L for positions that *closed* this day = **$${sign(dayRealized)}** (options $${sign(dayOptionsRealized)} · stocks $${sign(dayEquityRealized)}). Reconstructed from the Tradier account trade history by FIFO-matching each close to its open by symbol; these rows pre-date the 9 PM EOD snapshot that records this going forward. Un-reconstructable closes (open outside the fetch window) are left flat rather than booked at gross proceeds.${equityNote}`;
+  const supersedeNote = superseded
+    ? ` **Operator-forced correction (TRA-3100).** This cell previously read $${sign(superseded.combinedPnl)} from \`${superseded.pnlSource}\`; that figure is superseded and is retained on the row as \`supersededPnl\` only. Everything below the marker line describes the SUPERSEDED figure, not this one.`
+    : '';
+  const header = `> **Live calendar backfill (TRA-244).** ${date} P&L = Tradier broker-truth realized P&L for positions that *closed* this day = **$${sign(dayRealized)}** (options $${sign(dayOptionsRealized)} · stocks $${sign(dayEquityRealized)}). Reconstructed from the Tradier account trade history by FIFO-matching each close to its open by symbol; these rows pre-date the 9 PM EOD snapshot that records this going forward. Un-reconstructable closes (open outside the fetch window) are left flat rather than booked at gross proceeds.${equityNote}${supersedeNote}`;
   const base: ReturnType<typeof generateEodReport> =
     existing ?? {
       date,
@@ -2763,6 +2781,10 @@ function makeRealizedBackfillReport(
     /^> \*\*Live calendar backfill \(TRA-244\)\.\*\*[\s\S]*?\n\n/,
     '',
   );
+  const body =
+    superseded && priorBody.trim() !== ''
+      ? `---\n\n_The section below is the SUPERSEDED ${superseded.pnlSource} report body for ${date} (combined P&L $${sign(superseded.combinedPnl)}). It is kept for audit and does NOT describe the figure above._\n\n${priorBody}`
+      : priorBody;
   return {
     ...base,
     date,
@@ -2774,21 +2796,56 @@ function makeRealizedBackfillReport(
     // TRA-1192 — mark as a reconstructed historical cell so re-runs recompute it
     // (and never treat it as a real snapshot to be preserved).
     pnlSource: 'realized-backfill' as const,
-    markdown: `${header}\n\n${priorBody}`,
+    // TRA-3100 — an ordinary backfill carries no supersession record; re-running
+    // over an already-forced row must not manufacture one either, so this is
+    // written only when THIS pass overwrote something protected.
+    ...(superseded ? { supersededPnl: superseded } : {}),
+    markdown: `${header}\n\n${body}`,
   };
 }
+
+/**
+ * TRA-3100 — the outcome of one backfill pass, with a DENOMINATOR.
+ *
+ * The old return was `Record<string, number>` — the days written and nothing
+ * else. An empty map therefore read identically for "there was nothing to
+ * correct" and "every candidate day was refused by the clobber guard", which is
+ * exactly how TRA-2874's window widening shipped looking like a fix while
+ * reaching 0 of the 9 broken days. `candidates` / `protectedRows` /
+ * `refusedForce` make a pass that reached nothing say so.
+ */
+type LiveRealizedBackfillOutcome = {
+  /** date → combined realized P&L written. */
+  written: Record<string, number>;
+  /** Dates written by overriding the clobber guard (subset of `written`). */
+  forced: string[];
+  /** Force requests NOT honoured, each with the reason. Never silently dropped. */
+  refusedForce: Array<{ date: string; reason: string }>;
+  /** Days considered this pass (existing rows ∪ broker-close days, in window). */
+  candidates: number;
+  /** Candidates skipped because a real snapshot owns the cell and force was not asked for it. */
+  protectedRows: number;
+};
 
 /**
  * TRA-244 — rewrite a single live/sandbox user's historical June calendar
  * cells from broker-truth realized options P&L. Idempotent: recomputes from
  * the Tradier history each run and only touches the bounded historical window
  * (never `latest.json`, the equity tracker, or the balance-snapshot series).
- * Returns the per-date map that was written, or `null` when the user isn't on
- * a Tradier-backed mode / has no client.
+ * Returns the pass outcome, or `null` when the user isn't on a Tradier-backed
+ * mode / has no client / the broker history could not be read.
+ *
+ * TRA-3100 — `opts.forceDates` is the ONLY way to overwrite a day the clobber
+ * guard protects. It is deliberately not a flag and not a blanket "recompute
+ * everything": a genuine 21:00 broker-balance snapshot is authoritative and must
+ * survive, so a correction has to name the days it is correcting. Absent or
+ * empty, this function behaves exactly as before — the guard is the default and
+ * nothing here arms itself.
  */
 async function backfillLiveRealizedCalendar(
   ctx: UserContext,
-): Promise<Record<string, number> | null> {
+  opts: { forceDates?: readonly string[] } = {},
+): Promise<LiveRealizedBackfillOutcome | null> {
   const settings = getSettings(ctx.username);
   const mode = stockModeKey(settings);
   if (mode === 'demo') return null;
@@ -2868,14 +2925,6 @@ async function backfillLiveRealizedCalendar(
     });
   const dir = stockReportsDirFor(ctx, mode);
 
-  // A day already owned by a *real* snapshot (broker-balance override or an
-  // engine EOD row) is authoritative and must never be downgraded to
-  // options-only realized. Only days with no report file, or a prior
-  // realized-backfill row, are (re)written from broker fills.
-  const isBackfillRow = (r: ReturnType<typeof generateEodReport>): boolean =>
-    r.pnlSource === 'realized-backfill' ||
-    /Live calendar backfill \(TRA-244\)/.test(r.markdown ?? '');
-
   // Candidate days = existing report files in the bucket ∪ realized-close days,
   // bounded to the rolling write window.
   const candidates = new Set<string>();
@@ -2889,9 +2938,31 @@ async function backfillLiveRealizedCalendar(
   }
   for (const d of existingDates) if (inWindow(d)) candidates.add(d);
   for (const d of realizedByDate.keys()) if (inWindow(d)) candidates.add(d);
-  if (candidates.size === 0) return {};
+
+  // TRA-3100 — validate the force list BEFORE the write loop, and name every
+  // rejection. A force request that quietly evaporates is worse than no force
+  // path at all: the operator reads "ok" and believes the day was corrected.
+  const triage = triageForceDates(opts.forceDates ?? [], {
+    writeStart,
+    todayExclusive: today,
+    includeEquity,
+  });
+  const refusedForce = triage.refused;
+  const forceSet = triage.accepted;
+  for (const d of forceSet) candidates.add(d);
+
+  const outcome = (written: Record<string, number>, forced: string[], protectedRows: number) => ({
+    written,
+    forced,
+    refusedForce,
+    candidates: candidates.size,
+    protectedRows,
+  });
+  if (candidates.size === 0) return outcome({}, [], 0);
 
   const written: Record<string, number> = {};
+  const forced: string[] = [];
+  let protectedRows = 0;
   for (const date of [...candidates].sort()) {
     const dayRealized = Number((realizedByDate.get(date) ?? 0).toFixed(2));
     const filePath = join(dir, `${date}.json`);
@@ -2905,38 +2976,61 @@ async function backfillLiveRealizedCalendar(
         existing = null;
       }
     }
-    // Never clobber a real snapshot row (balance-truth or engine EOD).
-    if (existing && !isBackfillRow(existing)) continue;
-    // Nothing to write for a no-activity day that has no existing artifact —
-    // leave it absent so the calendar renders it flat ("--").
-    if (!existing && dayRealized === 0 && (closeCountByDate.get(date) ?? 0) === 0) {
+    const dayCloseCount = closeCountByDate.get(date) ?? 0;
+    // TRA-3100 — the write decision proper. It lives in
+    // `reports/calendar-write-decision.ts` so a test can grade the gate itself
+    // rather than a reproduction of it that agrees with itself by construction.
+    const decision = decideCalendarRowWrite({
+      existing,
+      dayRealized,
+      dayCloseCount,
+      forced: forceSet.has(date),
+    });
+    if (decision.action === 'refuse_force') {
+      refusedForce.push({ date, reason: decision.reason });
+      protectedRows++;
       continue;
     }
+    if (decision.action === 'skip') {
+      if (decision.reason === 'protected_snapshot') protectedRows++;
+      continue;
+    }
+    const superseded: EodReport['supersededPnl'] | null = decision.superseded
+      ? { ...decision.superseded, at: new Date().toISOString() }
+      : null;
     const report = makeRealizedBackfillReport(
       date,
       Number((optionsRealizedByDate.get(date) ?? 0).toFixed(2)),
       Number((equityRealizedByDate.get(date) ?? 0).toFixed(2)),
-      closeCountByDate.get(date) ?? 0,
+      dayCloseCount,
       existing,
       equityNote,
+      superseded,
     );
     // TRA-3064 — JSON only. The `<date>.md` sidecar this used to write beside it
     // was a verbatim copy of `report.markdown`, a field on the object being
     // serialized here, and no read path ever opened it.
     await writeFile(filePath, JSON.stringify(report, null, 2), 'utf-8');
     written[date] = dayRealized;
+    if (superseded) forced.push(date);
   }
   log.info('live realized calendar backfill complete', {
     username: ctx.username,
     env,
     written,
+    // TRA-3100 — the denominator. `written: {}` alone cannot distinguish "nothing
+    // needed correcting" from "the guard refused every candidate".
+    candidates: candidates.size,
+    protectedRows,
+    forced,
+    refusedForce,
     // TRA-2876 — an abstention that is not reported reads exactly like a window
     // with no corporate actions in it.
     equityIncluded: includeEquity,
     equityExcludedSymbols: caScope ? [...caScope.excludeSymbols] : null,
     corporateActionsSeen: corporateActions?.length ?? null,
   });
-  return written;
+  return outcome(written, forced, protectedRows);
 }
 
 /**
@@ -9860,17 +9954,48 @@ app.post('/api/reports/generate', requireAuth, async (_req, res) => {
 // for the current user (also runs automatically at startup). Returns the
 // per-date map that was rewritten so the board can confirm the broker-truth
 // values without restarting the server.
-app.post('/api/reports/backfill-realized', requireAuth, async (_req, res) => {
+//
+// TRA-3100 — optional body `{ "forceDates": ["2026-06-11", …] }` additionally
+// overwrites those specific days even though a real snapshot owns the cell.
+// It is admin-gated and enumerated on purpose: the guard exists because a
+// genuine 21:00 broker-balance snapshot outranks an options-only reconstruction,
+// and the only safe way to correct a *known-bad* row is to name it. There is no
+// "force everything" argument, by design.
+//
+// The response carries the denominator (`candidates` / `protectedRows` /
+// `refusedForce`), so a call that corrected nothing cannot be read as a success.
+app.post('/api/reports/backfill-realized', requireAuth, async (req, res) => {
   try {
     const ctx = await userCtx(res);
-    const written = await backfillLiveRealizedCalendar(ctx);
-    if (written === null) {
+    const rawForce = (req.body as { forceDates?: unknown } | undefined)?.forceDates;
+    let forceDates: string[] = [];
+    if (rawForce !== undefined) {
+      if (!Array.isArray(rawForce) || rawForce.some(d => typeof d !== 'string')) {
+        res.status(400).json({ error: '`forceDates` must be an array of YYYY-MM-DD strings.' });
+        return;
+      }
+      if (getUser(ctx.username)?.role !== 'admin') {
+        res.status(403).json({
+          error:
+            'Forcing an overwrite of a settled calendar row requires an admin session. The unforced backfill is available to any user.',
+        });
+        return;
+      }
+      forceDates = rawForce as string[];
+      log.warn('TRA-3100 forced live-calendar backfill requested', {
+        username: ctx.username,
+        forceDates,
+      });
+    }
+    const result = await backfillLiveRealizedCalendar(ctx, { forceDates });
+    if (result === null) {
       res.status(400).json({
-        error: 'Backfill only applies to a Tradier-backed live/sandbox account.',
+        error:
+          'Backfill did not run: the account is not on a Tradier-backed live/sandbox mode, or the broker trade history could not be read. Nothing was written.',
       });
       return;
     }
-    res.json({ ok: true, written });
+    res.json({ ok: true, ...result });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }

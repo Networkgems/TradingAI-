@@ -34,6 +34,99 @@ function fmtCompact(value: number): string {
   return `${sign}$${abs.toFixed(2)}`;
 }
 
+// ── TRA-3100 — label the MEASURE, not just the number ────────────────────────
+//
+// Two different quantities are rendered in this one grid. A `realized-backfill`
+// cell is realized P&L on positions that CLOSED that day (ties to the broker
+// statement). A `tradier-balance` cell is the change in account value (INCLUDES
+// unrealized mark-to-market on open positions). On a day with open positions
+// those two SHOULD differ — neither is "wrong" — but they were pixel-identical,
+// and the monthly "Net P&L" sums them as if they were one series.
+//
+// `pnlSource` has been on the JSON since TRA-1192 and was never rendered
+// anywhere. That, not an arithmetic error, is why this reads as "the calendar is
+// not tracking correctly". Naming the measure makes the mixing visible; it does
+// not resolve it — which source should own a historical cell is a data decision
+// tracked on TRA-3100 itself.
+type PnlMeasure = { code: string; label: string; title: string };
+
+const PNL_MEASURES: Record<string, PnlMeasure> = {
+  'realized-backfill': {
+    code: 'R',
+    label: 'Realized (broker fills)',
+    title:
+      'Realized P&L on positions CLOSED this day, FIFO-matched from Tradier fills. Excludes mark-to-market on positions still open. This is the measure that ties to your broker statement.',
+  },
+  'tradier-balance': {
+    code: 'B',
+    label: 'Account value change',
+    title:
+      'Change in broker account value over the day, net of deposits/withdrawals. INCLUDES unrealized mark-to-market on open positions, so it will not match a realized-only broker statement.',
+  },
+  engine: {
+    code: 'E',
+    label: 'Engine EOD',
+    title:
+      "Computed by the trading engine from its own closed-trade record, not from broker fills. Can differ from the broker's own figure.",
+  },
+  'live-intraday': {
+    code: '~',
+    label: 'Intraday (not settled)',
+    title:
+      "Today's running figure, recomputed on each load. Not yet settled by the 9 PM EOD snapshot.",
+  },
+};
+
+// A row with no `pnlSource` predates the field. Rendering it as anything
+// specific would be a claim we cannot support, so it says so.
+const UNLABELLED_MEASURE: PnlMeasure = {
+  code: '?',
+  label: 'Source not recorded',
+  title:
+    'This row predates P&L-source labelling, so which measure it holds is unknown. It is not safe to assume it is realized P&L.',
+};
+
+function pnlMeasure(report: EodReport | undefined): PnlMeasure | null {
+  if (!report) return null;
+  return (report.pnlSource ? PNL_MEASURES[report.pnlSource] : undefined) ?? UNLABELLED_MEASURE;
+}
+
+/** Distinct measures present in a set of rows, in first-seen order. */
+function measureMix(reports: EodReport[]): PnlMeasure[] {
+  const seen = new Map<string, PnlMeasure>();
+  for (const r of reports) {
+    const m = pnlMeasure(r);
+    if (m) seen.set(m.code, m);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Rendered under a Net P&L total whose rows do not all measure the same thing.
+ * A total that adds realized closes to account-value deltas is not a quantity
+ * with a name, and silently printing one is the defect this warns about.
+ */
+function MixedMeasureNote({ reports }: { reports: EodReport[] }) {
+  const mix = measureMix(reports);
+  if (mix.length < 2) return null;
+  return (
+    <div
+      className="cal-summary-mixed"
+      title={mix.map(m => `${m.code} = ${m.label}. ${m.title}`).join('\n\n')}
+    >
+      ⚠ Mixed measures ({mix.map(m => `${m.code} ${m.label}`).join(' · ')}) — this total adds
+      different quantities together.
+    </div>
+  );
+}
+
+/** The small measure marker shown in the corner of a calendar cell. */
+function MeasureBadge({ report }: { report: EodReport | undefined }) {
+  const m = pnlMeasure(report);
+  if (!m) return null;
+  return <span className="cal-pnl-src" title={`${m.label}. ${m.title}`}>{m.code}</span>;
+}
+
 function fmt(n: number, decimals = 2) {
   return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
@@ -142,6 +235,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
                 title={clickable ? 'View EOD report' : undefined}
               >
                 <span className="cal-day-num">{isToday ? 'Today' : dayNum}</span>
+                <MeasureBadge report={report} />
                 {report
                   ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
                   : <span className="cal-pnl cal-pnl--empty">--</span>}
@@ -171,6 +265,7 @@ function MonthSummary({ year, month, reports }: {
   const wr     = ((wins / monthly.length) * 100).toFixed(0);
 
   return (
+    <>
     <div className="cal-summary">
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Net P&L</span>
@@ -195,6 +290,8 @@ function MonthSummary({ year, month, reports }: {
         <span className="cal-summary-value">{wr}%</span>
       </div>
     </div>
+    <MixedMeasureNote reports={monthly} />
+    </>
   );
 }
 
@@ -254,6 +351,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
                 <span className="cal-day-num">
                   {isToday ? 'Today' : `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`}
                 </span>
+                <MeasureBadge report={report} />
                 {report
                   ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
                   : <span className="cal-pnl cal-pnl--empty">--</span>}
@@ -288,6 +386,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
           </div>
         </div>
       )}
+      {weekReports.length > 0 && <MixedMeasureNote reports={weekReports} />}
     </>
   );
 }
@@ -366,6 +465,10 @@ function YearView({ year, reports, onMonthClick }: {
 // reachable by selecting the date.
 
 function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => void }) {
+  // TRA-3100 — the detail view is where "what does this number actually measure"
+  // has to be answerable. The grid badge is a hint; this is the statement.
+  const measure = pnlMeasure(report) ?? UNLABELLED_MEASURE;
+  const superseded = report.supersededPnl;
   return (
     <section className="eod-panel">
       <div className="eod-header" style={{ cursor: 'default' }}>
@@ -381,6 +484,15 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
       </div>
 
       <div className="eod-body">
+        <div className="cal-measure-banner" title={measure.title}>
+          <strong>P&amp;L measure:</strong> {measure.label}
+          {superseded && (
+            <>
+              {' '}· <em>corrected {new Date(superseded.at).toLocaleDateString()} — previously read{' '}
+              {fmtDollar(superseded.combinedPnl)} from “{superseded.pnlSource}”</em>
+            </>
+          )}
+        </div>
         <div className="eod-stats-row">
           <div className="eod-stat">
             <span className="eod-stat-label">Realized P&amp;L</span>

@@ -2053,6 +2053,53 @@ tr:hover td { background: var(--bg-hover); }
 .cal-cell--loss .cal-pnl { color: var(--red); }
 .cal-pnl--empty { color: var(--muted); font-weight: 400; }
 
+/* TRA-3100 — the measure marker. A realized-close figure and an account-value
+   delta were rendered identically; this is the one-character tell, with the
+   full explanation on hover. Deliberately low-contrast: it labels the number,
+   it does not compete with it. */
+.cal-pnl-src {
+  position: absolute;
+  top: 3px;
+  right: 5px;
+  font-size: 0.56rem;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--muted);
+  opacity: 0.75;
+  cursor: help;
+}
+
+.cal-cell { position: relative; }
+
+/* A total that adds different measures together is not a quantity with a name.
+   Say so under it rather than printing it bare. */
+.cal-summary-mixed {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber, #d19a3a);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  cursor: help;
+}
+
+.cal-measure-banner {
+  margin-bottom: 0.7rem;
+  padding: 0.45rem 0.8rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.72rem;
+  cursor: help;
+}
+
+.cal-measure-banner em { color: var(--muted); font-style: normal; }
+
 /* Month summary bar */
 .cal-summary {
   display: flex;

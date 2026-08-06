@@ -4206,6 +4206,21 @@ export interface EodReport {
   pnlSource?: 'engine' | 'tradier-balance' | 'realized-backfill' | 'live-intraday';
 
   /**
+   * TRA-3100 — set ONLY when an operator-scoped force pass overwrote a row that
+   * the clobber guard would otherwise have protected. Records what was replaced,
+   * so a corrected cell is distinguishable from one that was always a backfill
+   * and the original figure is not lost. Absent on every ordinary row.
+   */
+  supersededPnl?: {
+    /** `pnlSource` of the row that was overwritten (`unlabelled` when it carried none). */
+    pnlSource: 'engine' | 'tradier-balance' | 'realized-backfill' | 'live-intraday' | 'unlabelled';
+    /** The `combinedPnl` the calendar rendered before the force pass. */
+    combinedPnl: number;
+    /** ISO timestamp of the force pass. */
+    at: string;
+  };
+
+  /**
    * TRA-2214 — the account-class basis the `optionJournal` / `optionLearnedWeights`
    * / `introspection` blocks were folded on. `'desk+unattributed'` since TRA-2214;
    * absent on reports persisted before it, which were folded POOLED (QA fixture
