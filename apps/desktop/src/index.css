@@ -677,6 +677,13 @@ tr:hover td { background: var(--bg-hover); }
   padding: 0.15em 0.5em;
 }
 
+/* TRA-2631 — the read-time provenance badge on a mover the plausibility rule
+   does not vouch for. `cursor: help` because the whole verdict (rule, threshold,
+   ratio, implied prev close, build) lives in the title attribute. */
+.eod-mover-flag {
+  cursor: help;
+}
+
 .eod-trades { display: flex; flex-direction: column; gap: 0.4rem; }
 
 .eod-generated {

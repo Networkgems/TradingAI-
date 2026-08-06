@@ -435,6 +435,29 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
                 <span className={m.changePct >= 0 ? 'green' : 'red'}>
                   &nbsp;{m.changePct >= 0 ? '+' : ''}{m.changePct.toFixed(2)}%
                 </span>
+                {/* TRA-2631 / TRA-3063 (ruling B) — 64 of 105 stored reports carry a
+                    fabricated row at #1, and this grid renders the stored array. The
+                    server stamps each row at read time; the badge is what makes the
+                    stamp VISIBLE here. Flag only — the row keeps its place and its
+                    number, because filtering a bad headline is what makes the next one
+                    go unnoticed. */}
+                {m.provenance && m.provenance.verdict !== 'plausible' && (
+                  <span
+                    className="eod-mover-flag"
+                    title={
+                      `${m.provenance.verdict === 'suspect' ? 'UNVERIFIED' : 'NOT ASSESSABLE'}`
+                      + ` — ${m.provenance.ruleId}`
+                      + `${m.provenance.reason ? ` (${m.provenance.reason})` : ''}`
+                      + `, threshold ${m.provenance.threshold}`
+                      + `${m.provenance.ratio !== null ? `, ratio ${m.provenance.ratio.toFixed(2)}` : ''}`
+                      + `${m.provenance.impliedPrevClose !== null ? `, implied prev close $${m.provenance.impliedPrevClose.toFixed(4)}` : ''}`
+                      + `, stamped by build ${m.provenance.build}.`
+                      + ' Session-move test only — an unflagged row is unflagged, not verified.'
+                    }
+                  >
+                    &nbsp;⚠️
+                  </span>
+                )}
               </span>
             ))}
           </div>

@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { generateEodReport } from './eod-report.js';
+import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
+import { annotateReportProvenance, INLINE_SUSPECT_MARK } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
-import { isMoveSuspect, type OptionPosition, type Position } from '@trading-app/shared';
+import { isMoveSuspect, type EodMover, type OptionPosition, type Position } from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -945,3 +946,68 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
     expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
   });
 });
+
+// ── TRA-2631 — the generated document must be ANNOTATABLE ────────────────────
+const PROVENANCE_BUILD = '7a5317605e1c';
+/** The real fabricated 2026-07-21 archive headline. */
+const ARCHIVED_SELX: EodMover = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
+
+describe('read-time provenance against a generated report (TRA-2631)', () => {
+  // ── Against a REAL generated document, not my 12-line fixture ──────────────
+  //
+  // The fixture above shares this module's own formatter, so it can only prove
+  // internal consistency. This one runs the ACTUAL generator, reconstructs the
+  // archive condition inside its output, and asserts the locator survives a full
+  // ~11k-char document with a dozen sections after the movers table.
+  //
+  // Reconstructing rather than fetching is forced: the deployed generator EXCLUDES
+  // suspect rows (that is TRA-2610), so no freshly generated report can contain
+  // one. The reconstruction is faithful because the pre-fix generator differed
+  // from this one only in WHETHER the row was excluded, never in how the row was
+  // RENDERED — `formatMoverMarkdownRow` is the same line either way — and because
+  // `top5Movers` ranks on `|changePct|`, which is why the fabricated row is at #1
+  // in all 64 dirty artifacts.
+  it('locates and marks the row inside a full generator-produced report', () => {
+    const generated = generateEodReport({
+      state: makeEngineState(),
+      allClosedPositions: [],
+      dailySignals: [],
+      signalTypeMap: new Map(),
+    });
+    expect(generated.top5Movers.length).toBeGreaterThan(0);
+
+    const lines = generated.markdown.split('\n');
+    const h = lines.indexOf(MOVERS_MARKDOWN_HEADING);
+    expect(h).toBeGreaterThan(-1);
+    lines.splice(h + 3, 0, formatMoverMarkdownRow(ARCHIVED_SELX));   // +3 = heading + 2 header rows
+
+    const archived = {
+      ...generated,
+      top5Movers: [ARCHIVED_SELX, ...generated.top5Movers],
+      markdown: lines.join('\n'),
+    };
+    const out = annotateReportProvenance(archived, PROVENANCE_BUILD);
+
+    // #1 stays #1, flagged, with its published numbers intact.
+    expect(out.top5Movers[0]!.symbol).toBe('SELX');
+    expect(out.top5Movers[0]!.provenance!.verdict).toBe('suspect');
+    expect(out.top5Movers).toHaveLength(archived.top5Movers.length);
+
+    const outLines = out.markdown.split('\n');
+    const selxIdx = outLines.findIndex(l => l.startsWith('| SELX '));
+    const noteIdx = outLines.findIndex(l => l.includes('PROVENANCE'));
+    const nextHeadingIdx = outLines.findIndex((l, i) => i > outLines.indexOf(MOVERS_MARKDOWN_HEADING) && l.startsWith('## '));
+
+    expect(outLines[selxIdx]).toContain(INLINE_SUSPECT_MARK);
+    // The note lands INSIDE the movers section — not orphaned at the end of a
+    // document whose next dozen headings would bury it.
+    expect(noteIdx).toBeGreaterThan(selxIdx);
+    expect(noteIdx).toBeLessThan(nextHeadingIdx);
+    // Nothing else in the document moved.
+    expect(out.markdown).toContain('# Daily EOD Report');
+    for (const m of generated.top5Movers) {
+      expect(out.markdown).toContain(formatMoverMarkdownRow(m));
+    }
+  });
+});
+

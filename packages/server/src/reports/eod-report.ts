@@ -662,6 +662,31 @@ ${rows}
 | **Overall** | **${o.measured}/${o.fills}** | **${usd(o.meanRealizedUsd)}** | **${usd(o.meanModeledUsd)}** | **${ratio(o.decayRatio)}** |${emptyNote}`;
 }
 
+/**
+ * The heading the Top-5-Movers table is rendered under. Exported because the
+ * read-time provenance stamp (TRA-2631) locates the table by it.
+ */
+export const MOVERS_MARKDOWN_HEADING = '## Top 5 Movers (Watchlist)';
+
+/**
+ * ONE row of the Top-5-Movers markdown table.
+ *
+ * Exported and shared with the read-time provenance annotator (TRA-2631) on
+ * purpose. `markdown` is built HERE, at generation time, and frozen into the
+ * stored file (`buildMarkdown` takes `Omit<EodReport, 'markdown'>`), so a stamp
+ * that lands only on the `top5Movers` array is invisible on the surface that
+ * actually gets rendered. To mark the row in the served markdown the annotator
+ * has to FIND this exact line in the stored string — and a second, drifting copy
+ * of this formatting would stop matching silently, i.e. would degrade to "no
+ * rows flagged", which reads identically to "nothing was wrong".
+ */
+export function formatMoverMarkdownRow(m: EodMover): string {
+  const usd = (n: number) =>
+    '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
+  return `| ${m.symbol} | ${usd(m.price)} | ${pnlSign(m.changePct)}% |`;
+}
+
 function buildMarkdown(
   report: Omit<EodReport, 'markdown'>,
   optionJournal?: OptionTradeJournalSummary,
@@ -690,9 +715,7 @@ function buildMarkdown(
     `| ${t.symbol} | ${t.strategy} | ${t.side.toUpperCase()} | ${t.quantity} | ${usd(t.entryPrice)} | ${usd(t.exitPrice)} | ${pnlSign(t.pnl)} | 1:${t.rr} |`
   ).join('\n');
 
-  const moverRows = movers.map(m =>
-    `| ${m.symbol} | ${usd(m.price)} | ${pnlSign(m.changePct)}% |`
-  ).join('\n');
+  const moverRows = movers.map(formatMoverMarkdownRow).join('\n');
 
   return `# Daily EOD Report — ${date}
 
@@ -727,7 +750,7 @@ ${tradeRows.length > 0
   ? `| Symbol | Strategy | Side | Qty | Entry | Exit | P&L | R:R |\n|--------|----------|------|-----|-------|------|-----|-----|\n${tradeRows}`
   : '_No closed trades today._'}
 
-## Top 5 Movers (Watchlist)
+${MOVERS_MARKDOWN_HEADING}
 | Symbol | Price | Change % |
 |--------|-------|----------|
 ${moverRows || '_No data._'}

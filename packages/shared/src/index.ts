@@ -3916,10 +3916,65 @@ export interface EodTradeEntry {
   optionSymbol?: string;
 }
 
+/**
+ * TRA-2631 / TRA-3063 (ruling B) — the READ-TIME provenance stamp on one stored
+ * top-movers row.
+ *
+ * 64 of 105 stored EOD top-movers tables carry, at #1, a row the deployed
+ * plausibility rule calls fabricated. `top5Movers` ranks on `|changePct|`, so an
+ * inflated move necessarily outranks the genuine ones. TRA-2610 fixed report
+ * GENERATION; it does not rewrite files already on disk, and
+ * `GET /api/reports/{date}` serves those files verbatim. Regenerating them is not
+ * available — no per-symbol quote tape is retained, so a regenerated 2026-05-03
+ * would stamp TODAY's movers onto a May date.
+ *
+ * The ruling was B: **flag, do not filter.** So this is:
+ *
+ *  - **ADDITIVE and READ-TIME ONLY.** It is never persisted. The stored file is
+ *    the published record of what we served on that date and is left byte-intact;
+ *    only the RESPONSE carries the stamp.
+ *  - **NON-BEHAVIOURAL.** No row is dropped, re-ranked or renumbered. #1 stays
+ *    #1, flagged. Re-ranking is option A wearing a different hat, and A was
+ *    declined — a read-time filter would make a fabricated headline QUIET, and
+ *    every ticket in this family (TRA-2610, TRA-2634, TRA-2631) exists because
+ *    somebody SAW a bad row at #1.
+ *  - **SELF-DATING.** `ruleId` + `threshold` + `build` say WHICH rule said so and
+ *    from WHICH build, so a later threshold change re-annotates rather than
+ *    silently contradicts. A stamp that just said `suspect` would inherit the
+ *    "same URL answers differently after a deploy" objection that killed A.
+ */
+export interface MoverProvenance {
+  /** Which rule produced this verdict. See `MOVER_PROVENANCE_RULE_ID`. */
+  ruleId: string;
+  /** The rule's threshold at the time of stamping (`SUSPECT_MOVE_RATIO`). */
+  threshold: number;
+  /**
+   * Three-valued ON PURPOSE, in the house style: `'unassessable'` is NOT
+   * `'plausible'`. It says the row carries no usable move to disbelieve (no
+   * finite price, or neither `change` nor `changePct`), i.e. the instrument was
+   * blind here. A reader who collapses the two has read a blind spot as a pass.
+   */
+  verdict: 'suspect' | 'plausible' | 'unassessable';
+  /** `QuoteSuspectReason` when `verdict === 'suspect'`. */
+  reason?: string;
+  /** `max(price/prev, prev/price)`, or `null` when it could not be computed. */
+  ratio: number | null;
+  /** The prev close this row's own published numbers imply. */
+  impliedPrevClose: number | null;
+  /** Short commit SHA of the build that stamped it, or `'unknown'`. */
+  build: string;
+}
+
 export interface EodMover {
   symbol: string;
   price: number;
   changePct: number;
+  /**
+   * TRA-2631 — READ-TIME ONLY. Attached by `annotateReportProvenance` at the
+   * response boundary and **never written to disk**: the stored artifact is the
+   * published record. Optional because every persisted row lacks it.
+   */
+  provenance?: MoverProvenance;
 }
 
 export interface EodSignalAccuracy {

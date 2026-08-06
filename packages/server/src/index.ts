@@ -21,6 +21,8 @@ import {
 } from './http-security.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
+// TRA-2631 / TRA-3063 — read-time provenance stamp for stored top-movers rows.
+import { annotateReportProvenance } from './reports/mover-provenance.js';
 import {
   reconcilePnl,
   resolvePnlBaselineDate,
@@ -9355,6 +9357,25 @@ function resolveCryptoReportMode(req: express.Request, username: string): Crypto
   return cryptoModeKey(getSettings(username));
 }
 
+// TRA-2631 / TRA-3063 (ruling B) — stamp every stock EOD report on its way OUT.
+//
+// 64 of 105 stored top-movers tables carry a fabricated row at #1, TRA-2610 fixed
+// GENERATION only, and regeneration is unavailable (no per-symbol quote tape is
+// retained). The ruling is FLAG, DO NOT FILTER: the stamp is additive, the stored
+// file is never rewritten, and no row is dropped, re-ranked or renumbered.
+//
+// Applied at the RESPONSE BOUNDARY, not in the readers, so every path that serves
+// an `EodReport` is covered by one call each and a new branch cannot quietly ship
+// an unstamped surface. `annotateReportProvenance` is a no-op on a report with no
+// movers, so journal calendar cells are unaffected.
+function stampMoverProvenance<T extends { top5Movers?: EodMover[]; markdown?: string }>(report: T): T {
+  const build = resolveBuildInfo();
+  return annotateReportProvenance(
+    report as T & { top5Movers: EodMover[] },
+    build.commitShort ?? 'unknown',
+  );
+}
+
 app.get('/api/reports/latest', requireAuth, async (req, res) => {
   const ctx = await userCtx(res);
   const mode = resolveStockReportMode(req, ctx.username);
@@ -9365,7 +9386,7 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
   }
   try {
     const raw = await readFile(latestPath, 'utf-8');
-    res.json(JSON.parse(raw));
+    res.json(stampMoverProvenance(JSON.parse(raw) as EodReport));
   } catch {
     res.status(500).json({ error: 'Failed to read report' });
   }
@@ -9521,7 +9542,7 @@ app.get('/api/reports/desk/:date', requireAuth, requireAdmin, async (req, res) =
       res.status(404).json({ error: `No desk report for ${date}` });
       return;
     }
-    res.json(cell);
+    res.json(stampMoverProvenance(cell));
   } catch (err) {
     log.warn('desk calendar day read failed', {
       date,
@@ -9562,7 +9583,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     try {
       const liveToday = await buildLiveTodayCellReport(ctx, mode);
       if (liveToday) {
-        res.json(liveToday);
+        res.json(stampMoverProvenance(liveToday));
         return;
       }
     } catch (err) {
@@ -9597,7 +9618,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     try {
       const cell = (await demoJournalCalendarCells()).get(date);
       if (cell && cell.totalTrades > 0) {
-        res.json(cell);
+        res.json(stampMoverProvenance(cell));
         return;
       }
     } catch (err) {
@@ -9612,7 +9633,7 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     res.status(404).json({ error: `No report for ${date}` });
     return;
   }
-  res.json(personal);
+  res.json(stampMoverProvenance(personal));
 });
 
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {
@@ -12835,7 +12856,14 @@ wss.on('connection', async (ws) => {
   if (existsSync(latestPath)) {
     try {
       const raw = await readFile(latestPath, 'utf-8');
-      ws.send(JSON.stringify({ type: 'eod_report', payload: JSON.parse(raw) }));
+      // TRA-2631 — the handshake serves the SAME stored file as
+      // `GET /api/reports/latest`, so it gets the same read-time provenance
+      // stamp. An unstamped socket surface beside a stamped HTTP one is the
+      // partial fix that reads as complete.
+      ws.send(JSON.stringify({
+        type: 'eod_report',
+        payload: stampMoverProvenance(JSON.parse(raw) as EodReport),
+      }));
     } catch { /* ignore */ }
   }
 });
