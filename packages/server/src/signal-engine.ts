@@ -7019,23 +7019,47 @@ export class SignalEngine {
   getStaleWorkingExitStats(): {
     clearedTotal: number;
     clearedLiveTotal: number;
-    heldTotal: number;
+    holdAttemptsTotal: number;
+    detachedRows: number;
+    detachedRowsLive: number;
+    budgetExhausted: number;
+    budgetExhaustedLive: number;
     lastClearedAt: number | null;
   } {
     let clearedTotal = 0;
     let clearedLiveTotal = 0;
-    let heldTotal = 0;
+    let holdAttemptsTotal = 0;
+    let detachedRows = 0;
+    let detachedRowsLive = 0;
+    let budgetExhausted = 0;
+    let budgetExhaustedLive = 0;
     let lastClearedAt: number | null = null;
+    // TRA-3048 — one `now` for both books, so a row cannot be counted detached
+    // in one bucket and not the other because the loop took a second.
+    const nowMs = Date.now();
     for (const env of ['sandbox', 'production'] as const) {
-      const stats = this.optionsAccounts[env].getStaleWorkingExitStats();
+      const stats = this.optionsAccounts[env].getStaleWorkingExitStats(nowMs);
       clearedTotal += stats.clearedTotal;
       clearedLiveTotal += stats.clearedLiveTotal;
-      heldTotal += stats.heldTotal;
+      holdAttemptsTotal += stats.holdAttemptsTotal;
+      detachedRows += stats.detachedRows;
+      detachedRowsLive += stats.detachedRowsLive;
+      budgetExhausted += stats.budgetExhausted;
+      budgetExhaustedLive += stats.budgetExhaustedLive;
       if (stats.lastClearedAt !== null && (lastClearedAt === null || stats.lastClearedAt > lastClearedAt)) {
         lastClearedAt = stats.lastClearedAt;
       }
     }
-    return { clearedTotal, clearedLiveTotal, heldTotal, lastClearedAt };
+    return {
+      clearedTotal,
+      clearedLiveTotal,
+      holdAttemptsTotal,
+      detachedRows,
+      detachedRowsLive,
+      budgetExhausted,
+      budgetExhaustedLive,
+      lastClearedAt,
+    };
   }
 
   /**

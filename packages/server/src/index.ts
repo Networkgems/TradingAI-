@@ -8790,15 +8790,30 @@ app.get('/api/health/options-live', async (_req, res) => {
         },
         { reaped: 0, reapedLive: 0, lastReapedAt: null as number | null },
       ),
-      // TRA-2956 — the sibling counter, and the one with a field that does not
-      // heal. `cleared` counts unfillable `sell_to_close` limits withdrawn
-      // after they had detached every exit rule on their row; each is a repair
-      // that already happened, so a non-zero value is history plus a defect
-      // rate. `held` is NOT history: it is rows whose cancel could not be
-      // confirmed unfilled, or that burned their per-row retry budget, and
-      // each one is a live position sitting with its stop-loss off and no
-      // automated path left to arm it. `held > 0` wants a human on the
-      // authenticated `/api/state` now, not at the close.
+      // TRA-2956 — the sibling counter. `cleared` counts unfillable
+      // `sell_to_close` limits withdrawn after they had detached every exit
+      // rule on their row; each is a repair that already happened, so a
+      // non-zero value is history plus a defect rate.
+      //
+      // TRA-3048 — read the GAUGES, not the counter. This block used to publish
+      // a single `held` and describe it as "rows whose cancel could not be
+      // confirmed unfilled, or that burned their per-row retry budget". It was
+      // neither: it counted failed withdrawal ATTEMPTS (one per tick per row,
+      // monotonic, never reset), and the budget-exhausted case never touched it
+      // at all — those rows are dropped before a withdrawal is attempted. So it
+      // could read non-zero after a transient throw had already self-healed,
+      // and zero with a position permanently stranded.
+      //
+      //   • `budgetExhausted` — GAUGE. Rows that spent all 8 withdrawals and are
+      //     still latched. Every exit rule off, no automated path left. THIS is
+      //     the field the deploy notes meant: `> 0` wants a human on the
+      //     authenticated `/api/state` now, not at the close.
+      //   • `detachedRows` — GAUGE. Every aged latch, including rows the next
+      //     tick is expected to withdraw. Falls back to zero on its own.
+      //   • `holdAttempts` — monotonic COUNTER of failed cancels this boot.
+      //     Ticks, not positions; a rate, not a state. It cannot name which arm
+      //     held — all three increment sites share it, and the server logs
+      //     (`component: 'stale-working-exit'`) are what distinguish them.
       //
       // Counts only — same TRA-2163 disclosure rule as above.
       staleWorkingExits: getAllUserContexts().reduce(
@@ -8807,14 +8822,27 @@ app.get('/api/health/options-live', async (_req, res) => {
           return {
             cleared: acc.cleared + s.clearedTotal,
             clearedLive: acc.clearedLive + s.clearedLiveTotal,
-            held: acc.held + s.heldTotal,
+            holdAttempts: acc.holdAttempts + s.holdAttemptsTotal,
+            detachedRows: acc.detachedRows + s.detachedRows,
+            detachedRowsLive: acc.detachedRowsLive + s.detachedRowsLive,
+            budgetExhausted: acc.budgetExhausted + s.budgetExhausted,
+            budgetExhaustedLive: acc.budgetExhaustedLive + s.budgetExhaustedLive,
             lastClearedAt:
               s.lastClearedAt !== null && (acc.lastClearedAt === null || s.lastClearedAt > acc.lastClearedAt)
                 ? s.lastClearedAt
                 : acc.lastClearedAt,
           };
         },
-        { cleared: 0, clearedLive: 0, held: 0, lastClearedAt: null as number | null },
+        {
+          cleared: 0,
+          clearedLive: 0,
+          holdAttempts: 0,
+          detachedRows: 0,
+          detachedRowsLive: 0,
+          budgetExhausted: 0,
+          budgetExhaustedLive: 0,
+          lastClearedAt: null as number | null,
+        },
       ),
     });
   } catch (err) {

@@ -1249,14 +1249,23 @@ export class PaperOptionsAccount {
   /** TRA-2956 — the LIVE subset of {@link staleWorkingExitsCleared}. */
   private staleWorkingExitsClearedLive = 0;
   /**
-   * TRA-2956 — rows whose withdrawal budget
-   * ({@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW}) is exhausted, or whose
-   * cancel could not be CONFIRMED unfilled at the broker. Both are left
-   * latched on purpose, so this is the count of positions the automation has
-   * given up on and a human must look at. Unlike the cleared counters, a
-   * non-zero value here does NOT resolve itself.
+   * TRA-2956 — failed withdrawal ATTEMPTS this process life: the cancel threw,
+   * or the broker would not confirm the order terminal-and-unfilled.
+   *
+   * TRA-3048 — read this as attempts, NOT as positions. It is monotonic, it is
+   * incremented once per tick per still-stale row, and it is never decremented,
+   * so `47` is 47 ticks and a row that fails once and succeeds on the next tick
+   * leaves it at `1` for the rest of the boot with nothing detached. It also
+   * cannot see budget exhaustion at all — that row is dropped by
+   * {@link listStaleWorkingExits} before any withdrawal is attempted, so no
+   * attempt is ever made to fail.
+   *
+   * The question "is a position detached RIGHT NOW" is answered by
+   * {@link countDetachedWorkingExits}, which is a gauge. This counter is kept
+   * because the rate of failed cancels is worth knowing on its own, but it was
+   * documented as the gauge for one release and it is not one.
    */
-  private staleWorkingExitsHeld = 0;
+  private staleWorkingExitHoldAttempts = 0;
   /** TRA-2956 — per-row withdrawal count, keyed by position id, per boot. */
   private staleWorkingExitClears: Map<string, number> = new Map();
   /** TRA-2956 — the most recent withdrawal batch, for the health surface. */
@@ -5143,17 +5152,17 @@ export class PaperOptionsAccount {
    *     inverse of the reap's default. There the intent was provably never
    *     sent, so treating it as old was safe; here a live broker order exists
    *     and "cannot prove it is recent" must not authorise cancelling it.
-   *   • past its per-row budget → not returned, and counted as HELD.
+   *   • past its per-row budget → NOT returned. The row stays detached and no
+   *     withdrawal is attempted on it ever again, which is why it cannot be
+   *     counted from the withdrawal path — see {@link countDetachedWorkingExits}
+   *     (TRA-3048; this bullet used to claim the drop was "counted as HELD",
+   *     which it never was, and a pure query cannot make it so).
    */
   listStaleWorkingExits(nowMs: number = Date.now()): StaleWorkingExit[] {
     const stale: StaleWorkingExit[] = [];
     for (const [id, opt] of this.openOptions) {
       const pending = opt.pendingExit;
-      if (!pending) continue;
-      if (pending.tradierOrderId === '') continue;
-      if (!Number.isFinite(pending.submittedAt)) continue;
-      const ageMs = nowMs - pending.submittedAt;
-      if (ageMs < WORKING_EXIT_MAX_AGE_MS) continue;
+      if (!this.isDetachedWorkingExit(pending, nowMs)) continue;
       if ((this.staleWorkingExitClears.get(id) ?? 0) >= MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW) {
         continue;
       }
@@ -5166,10 +5175,75 @@ export class PaperOptionsAccount {
         tradierOrderId: pending.tradierOrderId,
         limitPrice: pending.limitPrice,
         submittedAt: pending.submittedAt,
-        ageMs,
+        ageMs: nowMs - pending.submittedAt,
       });
     }
     return stale;
+  }
+
+  /**
+   * TRA-2956/TRA-3048 — the age-gate predicate, shared by the withdrawal
+   * selector and the detachment gauge so the two cannot drift apart.
+   *
+   * True means: this row carries a working broker exit that has been latched
+   * past {@link WORKING_EXIT_MAX_AGE_MS}, i.e. every exit rule on the position
+   * is currently off. It says nothing about whether anything will repair it —
+   * that is the budget check, which lives at each call site because the two
+   * callers want opposite sides of it.
+   */
+  private isDetachedWorkingExit(
+    pending: OptionPendingExit | undefined,
+    nowMs: number,
+  ): pending is OptionPendingExit {
+    if (!pending) return false;
+    if (pending.tradierOrderId === '') return false;
+    if (!Number.isFinite(pending.submittedAt)) return false;
+    return nowMs - pending.submittedAt >= WORKING_EXIT_MAX_AGE_MS;
+  }
+
+  /**
+   * TRA-3048 — the GAUGE the health surface was missing: how many rows are
+   * detached right now, and how many of those no automated path will repair.
+   *
+   * This exists because {@link staleWorkingExitHoldAttempts} answers neither
+   * question. It is monotonic, so it stays non-zero after a transient throw
+   * self-heals; and it is fed only from the withdrawal path, so a row that
+   * burned its per-row budget — the ONE state that is permanently detached with
+   * every exit rule off — never reaches it. The counter could read `0` with a
+   * position stranded, and non-zero with nothing stranded at all.
+   *
+   * Both numbers are recomputed from live rows on every call, so both fall back
+   * to zero the moment the latches clear. Pure query, same contract as
+   * {@link listStaleWorkingExits}: no mutation, no broker write.
+   *
+   *   • `detachedRows` — every aged latch. A row inside its budget is counted
+   *     here too, because at this instant its exit rules ARE off; the next tick
+   *     is expected to withdraw it and the count to fall on its own.
+   *   • `budgetExhausted` — the subset past
+   *     {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW}. These are not retried,
+   *     do not self-heal, and are the ones that want a human now.
+   */
+  countDetachedWorkingExits(nowMs: number = Date.now()): {
+    detachedRows: number;
+    detachedRowsLive: number;
+    budgetExhausted: number;
+    budgetExhaustedLive: number;
+  } {
+    let detachedRows = 0;
+    let detachedRowsLive = 0;
+    let budgetExhausted = 0;
+    let budgetExhaustedLive = 0;
+    for (const [id, opt] of this.openOptions) {
+      if (!this.isDetachedWorkingExit(opt.pendingExit, nowMs)) continue;
+      const isLive = opt.mode === 'live';
+      detachedRows += 1;
+      if (isLive) detachedRowsLive += 1;
+      if ((this.staleWorkingExitClears.get(id) ?? 0) >= MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW) {
+        budgetExhausted += 1;
+        if (isLive) budgetExhaustedLive += 1;
+      }
+    }
+    return { detachedRows, detachedRowsLive, budgetExhausted, budgetExhaustedLive };
   }
 
   /**
@@ -5215,29 +5289,46 @@ export class PaperOptionsAccount {
    * would not confirm the order terminal-and-unfilled. The latch stays, so the
    * row is still detached and that has to be countable rather than inferred
    * from the absence of a cleared count.
+   *
+   * TRA-3048 — one ATTEMPT, not one row. The withdrawal path runs once per tick
+   * per stale row, so a row that keeps failing adds one every tick. Whether a
+   * position is detached at this instant is
+   * {@link countDetachedWorkingExits}'s question, not this counter's.
    */
   noteStaleWorkingExitHeld(): void {
-    this.staleWorkingExitsHeld += 1;
+    this.staleWorkingExitHoldAttempts += 1;
   }
 
   /**
    * TRA-2956 — withdrawal telemetry for the options-live health surface.
    *
-   * `held` is the field to watch. `cleared` is a repair that already happened;
-   * `held` is a live position whose exit rules are off RIGHT NOW and which no
-   * automated path will fix.
+   * TRA-3048 — `detachedRows` / `budgetExhausted` are the fields to watch, and
+   * they are GAUGES: recomputed from live rows on every call, falling to zero
+   * on their own when the latches clear. `budgetExhausted > 0` is the one that
+   * never self-repairs and wants a human now.
+   *
+   * `clearedTotal` and `holdAttemptsTotal` are monotonic per-boot COUNTERS —
+   * history and a defect rate, not a current state. `holdAttemptsTotal` in
+   * particular counts ticks, not positions, and cannot see budget exhaustion;
+   * it shipped named `heldTotal` and documented as the gauge, which is the bug
+   * TRA-3048 fixed.
    */
-  getStaleWorkingExitStats(): {
+  getStaleWorkingExitStats(nowMs: number = Date.now()): {
     clearedTotal: number;
     clearedLiveTotal: number;
-    heldTotal: number;
+    holdAttemptsTotal: number;
+    detachedRows: number;
+    detachedRowsLive: number;
+    budgetExhausted: number;
+    budgetExhaustedLive: number;
     lastClearedAt: number | null;
     lastCleared: StaleWorkingExit[];
   } {
     return {
       clearedTotal: this.staleWorkingExitsCleared,
       clearedLiveTotal: this.staleWorkingExitsClearedLive,
-      heldTotal: this.staleWorkingExitsHeld,
+      holdAttemptsTotal: this.staleWorkingExitHoldAttempts,
+      ...this.countDetachedWorkingExits(nowMs),
       lastClearedAt: this.lastStaleWorkingExitAt,
       lastCleared: this.lastStaleWorkingExits,
     };

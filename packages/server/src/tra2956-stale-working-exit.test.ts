@@ -244,7 +244,7 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     expect(live.acct.getStaleWorkingExitStats()).toMatchObject({
       clearedTotal: 1,
       clearedLiveTotal: 1,
-      heldTotal: 0,
+      holdAttemptsTotal: 0,
     });
     expect(demo.acct.getStaleWorkingExitStats()).toMatchObject({
       clearedTotal: 1,
@@ -253,14 +253,22 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     expect(live.acct.getStaleWorkingExitStats().lastClearedAt).toBe(Date.now());
   });
 
-  it('counts a HELD row — the field that does not heal', () => {
+  it('counts a failed withdrawal ATTEMPT, and the row it left detached', () => {
     const { acct } = latchUnfillableTp1('live');
     vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
     // The cancel threw, or the broker would not confirm it terminal-and-unfilled.
     acct.noteStaleWorkingExitHeld();
-    expect(acct.getStaleWorkingExitStats()).toMatchObject({ clearedTotal: 0, heldTotal: 1 });
-    // Still latched, still detached — which is why it has to be countable
-    // rather than inferred from the absence of a cleared count.
+    expect(acct.getStaleWorkingExitStats()).toMatchObject({
+      clearedTotal: 0,
+      holdAttemptsTotal: 1,
+      // Still latched, still detached — which is why it has to be countable
+      // rather than inferred from the absence of a cleared count.
+      detachedRows: 1,
+      detachedRowsLive: 1,
+      // ...but the withdrawal path will try again next tick, so no human is
+      // needed yet. That distinction is the whole of TRA-3048.
+      budgetExhausted: 0,
+    });
     expect(acct.getState().openOptions[0].pendingExit).toBeDefined();
   });
 
@@ -273,5 +281,78 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     expect(acct.finalizePendingExit(id, 1.6)).not.toBeNull();
     expect(acct.noteStaleWorkingExitCleared(stale)).toBe(false);
     expect(acct.getStaleWorkingExitStats().clearedTotal).toBe(0);
+  });
+
+  // ── TRA-3048 — the gauge the counter was mistaken for ──
+  //
+  // `held` shipped documented as "positions the automation has given up on"
+  // and implemented as a monotonic count of failed withdrawal attempts. It was
+  // wrong in both directions at once, and these four tests pin both:
+  //   • 0 with a position permanently stranded (budget spent — that row never
+  //     reaches the withdrawal path, so nothing can increment for it);
+  //   • non-zero with nothing stranded (a throw that succeeded next tick).
+  // The fix does not repair the counter — a rate is a fine thing to count. It
+  // adds the gauge that answers the question the operator was told to ask.
+
+  it('sees the budget-exhausted row the attempt counter structurally cannot', () => {
+    const { acct, sym } = latchUnfillableTp1('live');
+    for (let i = 0; i < MAX_CLEARS_PER_ROW; i += 1) {
+      vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+      acct.noteStaleWorkingExitCleared(acct.listStaleWorkingExits()[0]);
+      acct.checkExits(new Map(), new Map([[sym, 1.6]]), 'live', { waitAndHold: true });
+      acct.attachPendingExit(acct.getState().openOptions[0].id, 900_000 + i, 1.6);
+    }
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+
+    // The selector correctly stops retrying...
+    expect(acct.listStaleWorkingExits()).toHaveLength(0);
+    // ...so no withdrawal is attempted, so no attempt can fail, so the counter
+    // reads zero — on a live position with every exit rule off and no automated
+    // path that will ever arm them again. This is the state the field existed
+    // to make visible and the one state it could not see.
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.holdAttemptsTotal).toBe(0);
+    expect(stats).toMatchObject({
+      detachedRows: 1,
+      detachedRowsLive: 1,
+      budgetExhausted: 1,
+      budgetExhaustedLive: 1,
+    });
+  });
+
+  it('falls back to zero when a transient failure heals, while the counter does not', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    acct.noteStaleWorkingExitHeld();
+    expect(acct.getStaleWorkingExitStats().detachedRows).toBe(1);
+
+    // Next tick the cancel goes through. The position is fine.
+    expect(acct.noteStaleWorkingExitCleared(acct.listStaleWorkingExits()[0])).toBe(true);
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats).toMatchObject({ detachedRows: 0, budgetExhausted: 0, clearedTotal: 1 });
+    // The counter still reads 1 and will for the rest of the boot. That is
+    // correct FOR A RATE and false for a gauge — which is why they are now two
+    // fields with two names.
+    expect(stats.holdAttemptsTotal).toBe(1);
+  });
+
+  it('counts attempts per tick, not positions — `holdAttempts: 3` is one row, three ticks', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
+    for (let i = 0; i < 3; i += 1) acct.noteStaleWorkingExitHeld();
+    const stats = acct.getStaleWorkingExitStats();
+    expect(stats.holdAttemptsTotal).toBe(3);
+    // Nothing in the payload used to carry this, so a reader had no way to
+    // convert ticks to positions. Now it does.
+    expect(stats.detachedRows).toBe(1);
+  });
+
+  it('reads zero while the order is inside the age gate — a working order is not detached', () => {
+    const { acct } = latchUnfillableTp1('live');
+    vi.advanceTimersByTime(WORKING_AGE_MS - 1_000);
+    expect(acct.getStaleWorkingExitStats()).toMatchObject({
+      detachedRows: 0,
+      budgetExhausted: 0,
+    });
   });
 });
