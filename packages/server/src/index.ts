@@ -228,7 +228,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors } from './options-account.js';
 import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -8934,6 +8934,51 @@ app.get('/api/health/options-live', async (_req, res) => {
           },
           lastClearedAt: null as number | null,
         },
+      ),
+      // TRA-2984 — staged exits that reached Tradier and EXPIRED unfilled.
+      //
+      // This is the one exit failure with no ledger footprint. A fill appends a
+      // fee/slippage row; a rejection at least trips a counter the dashboard
+      // renders. An order that rests all session and lapses at the close writes
+      // NOTHING anywhere — so on 2026-08-04 a live TSLA position sat under a
+      // breached trailing stop for two sessions and every ledger-based monitor
+      // scored it healthy, because "no exit row" is also what a position that
+      // never tried to exit looks like.
+      //
+      // Read `escalatedTotal` WITH `expiredTotal`, never alone. The repair is a
+      // MARKET escalation on the next stop re-stage, and "the escalation shipped
+      // and works" vs "the escalation never ran" both show a climbing expiry
+      // count — only a matching escalation separates them. `expiredLiveTotal`
+      // rising while `escalatedTotal` stays flat is this bug, still open.
+      //
+      // Resets on restart by design, same as `abandonedStagedExits`.
+      expiredExits: getAllUserContexts().reduce(
+        (acc, c) => {
+          const s = c.engine.getExpiredExitStats();
+          return {
+            expired: acc.expired + s.expiredTotal,
+            expiredLive: acc.expiredLive + s.expiredLiveTotal,
+            escalated: acc.escalated + s.escalatedTotal,
+            lastExpiredAt:
+              s.lastExpiredAt !== null && (acc.lastExpiredAt === null || s.lastExpiredAt > acc.lastExpiredAt)
+                ? s.lastExpiredAt
+                : acc.lastExpiredAt,
+          };
+        },
+        { expired: 0, expiredLive: 0, escalated: 0, lastExpiredAt: null as number | null },
+      ),
+      // TRA-2984 — live open rows whose LAST exit attempt failed and was never
+      // resolved. `exitErrorReason` is a free-text string on the authenticated
+      // `/api/state`; nothing polled it, so the only reader it ever had was a
+      // human who happened to look. This is the countable form.
+      //
+      // `stagingStopped > 0` is the one that needs a person: the engine has
+      // withdrawn staging for that row (either breaker), so it will not
+      // self-resolve on the next session no matter how long you wait.
+      //
+      // Counts only — no OCC symbols, no reason text (TRA-2163).
+      liveExitErrors: summarizeLiveExitErrors(
+        getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
       ),
     });
   } catch (err) {

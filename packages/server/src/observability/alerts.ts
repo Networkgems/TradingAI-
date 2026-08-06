@@ -37,7 +37,14 @@ export type AlertKey =
   // profit-lock) are evaluated. The skip is a bare `continue` by design
   // (TRA-231: a demo tick must not close a real position out from under the
   // user) — this is the detector that state previously had none of.
-  | 'unmanaged-live-options';
+  | 'unmanaged-live-options'
+  // TRA-2984 — a staged `sell_to_close` reached the broker, rested, and EXPIRED
+  // unfilled. Its own key because it is the one exit failure with NO ledger
+  // footprint: an order that never fills appends no fee/slippage row, so every
+  // monitor that grades on rows scores the position as healthy while its stop
+  // sits unexecuted. Distinct from `unmanaged-live-options` (rules never
+  // evaluated) — here the rule fired and the ORDER lapsed.
+  | 'expired-exit';
 
 export type AlertSeverity = 'warning' | 'critical';
 

@@ -356,6 +356,35 @@ export interface OptionExitRiskInput {
 const MAX_CONSECUTIVE_CLOSE_REJECTS = 3;
 
 /**
+ * TRA-2984 — separate circuit breaker for exit orders that EXPIRE unfilled.
+ *
+ * The TRA-450 breaker above counts the broker REFUSING the contract. This one
+ * counts our own limit never being hit, which is the opposite problem and takes
+ * the opposite remedy: the first expiry escalates the next `sl`/`trail`
+ * re-stage from LIMIT to MARKET rather than suppressing it. Only if an
+ * escalated exit ALSO fails to resolve this many sessions running does staging
+ * stop — at which point the contract genuinely has no liquidity and a human has
+ * to work the order.
+ *
+ * Deliberately the same value as the rejection breaker: the point is not the
+ * number, it is that expiries and rejections no longer share a counter. On the
+ * TRA-2984 row a single expiry had already put `closeRejectCount` at 1 of 3,
+ * two sessions from disarming the exits on a live position under a breached
+ * trailing stop.
+ *
+ * ── Not a duplicate of TRA-2956 ────────────────────────────────────────────
+ * {@link WORKING_EXIT_MAX_AGE_MS} withdraws an order that has WORKED too long
+ * and re-decides it mid-session. This handles the order that reached the END of
+ * the session anyway, which is still reachable: the re-decided order is another
+ * LIMIT (repriced off a fresh quote, then lifted by the TRA-2811 floor when the
+ * book is wide), and {@link MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW} deliberately
+ * stops withdrawing after 8 and leaves the latch alone. Neither the counter
+ * split nor the MARKET escalation exists on that path — an expiry still landed
+ * on `closeRejectCount`, and the retry was still the same kind of order.
+ */
+const MAX_CONSECUTIVE_EXIT_EXPIRIES = 3;
+
+/**
  * TRA-2799 — consecutive Tradier portfolio reconciles an ENGINE-OPENED live
  * row must be missing from the broker's `/positions` payload before
  * {@link OptionsAccount.reconcileTradierPositions} closes it locally.
@@ -819,6 +848,58 @@ export function summarizeLiveUnmanagedRisk(
     if (!Number.isFinite(opt.stopLossPremium) || opt.stopLossPremium <= 0) unexplained += 1;
   }
   return { total, byReason, unexplained };
+}
+
+/** TRA-2984 — see {@link summarizeLiveExitErrors}. */
+export interface LiveExitErrorSummary {
+  /** Live open rows carrying an `exitErrorReason` — i.e. a failed exit nobody resolved. */
+  total: number;
+  /** The subset whose LAST failure was an order that expired unfilled. */
+  expired: number;
+  /**
+   * The subset where the engine has STOPPED staging exits (either breaker
+   * tripped). These are the rows that will never self-resolve: they need a
+   * human on the broker or the Close button, and until one arrives the position
+   * runs with its risk rules detached.
+   */
+  stagingStopped: number;
+}
+
+/**
+ * TRA-2984 — count live open rows whose last exit attempt FAILED.
+ *
+ * `exitErrorReason` was the only surface that showed the TSLA260911C00555000
+ * expiry, and it is a free-text string on an authenticated payload — nothing
+ * polled it, nothing counted it, nothing alerted on it. A human found it by
+ * reading `/api/state` by hand two days later. This makes it a number a monitor
+ * can watch: `total > 0` on the live book means at least one real position tried
+ * to exit and did not, and `stagingStopped > 0` means the engine has given up on
+ * one and is waiting for a person who has not been told.
+ *
+ * Counts only, never OCC symbols or the reason text — the consumer is the
+ * no-auth `/api/health/options-live` and TRA-2163 is the standing reason not to
+ * widen what it discloses about the real-money book.
+ */
+export function summarizeLiveExitErrors(
+  positions: Iterable<OptionPosition>,
+): LiveExitErrorSummary {
+  let total = 0;
+  let expired = 0;
+  let stagingStopped = 0;
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    if (!opt.exitErrorReason) continue;
+    total += 1;
+    if ((opt.exitExpiredCount ?? 0) > 0) expired += 1;
+    if (
+      (opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
+      || (opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES
+    ) {
+      stagingStopped += 1;
+    }
+  }
+  return { total, expired, stagingStopped };
 }
 
 function applyEngineOriginRiskThresholds(
@@ -1367,6 +1448,35 @@ export class PaperOptionsAccount {
   private lastStaleWorkingExits: StaleWorkingExit[] = [];
   /** TRA-2956 — epoch ms of the most recent withdrawal, or null this boot. */
   private lastStaleWorkingExitAt: number | null = null;
+  /**
+   * TRA-2984 — how many staged exits reached Tradier and then EXPIRED unfilled
+   * over this process's life. This is the counter the issue exists for: an
+   * order that never fills appends NO row to the fee/slippage ledger, so the
+   * event was invisible to every ledger-based monitor and the only trace was a
+   * string on the position. Same in-memory / reset-on-boot semantics as the
+   * TRA-2819 reap counters, and the same reason: it measures this process.
+   *
+   * Read it as a DEFECT counter, not a health score. 0 is the steady state.
+   */
+  private expiredExits = 0;
+  /**
+   * TRA-2984 — the LIVE-book subset of {@link expiredExits}. A demo expiry is a
+   * simulation artefact; a live one means a real position sat through a session
+   * with its stop breached and its exit lapsed at the broker.
+   */
+  private expiredExitsLive = 0;
+  /** TRA-2984 — epoch ms of the most recent expiry, or null if none this boot. */
+  private lastExpiredExitAt: number | null = null;
+  /**
+   * TRA-2984 — how many re-stages this process has escalated from LIMIT to
+   * MARKET because the previous attempt expired. Separated from
+   * {@link expiredExits} because they answer different questions: the expiry
+   * count says the exit path FAILED, the escalation count says the repair
+   * ENGAGED. An expiry count that climbs while this stays 0 means the escalation
+   * never ran — the exact shape of "fixed" that is indistinguishable from
+   * "never reached" if you only publish one of the two numbers.
+   */
+  private escalatedExits = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -4384,6 +4494,15 @@ export class PaperOptionsAccount {
       // live — only NEW order submission is suppressed.
       if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) continue;
 
+      // TRA-2984 — the expiry breaker. Its own counter and its own threshold,
+      // because an expiry is not a rejection: the first one ESCALATES the next
+      // stop re-stage to MARKET (at the staging sites below) rather than
+      // suppressing it. Only a contract that keeps lapsing even after the
+      // escalation gets staging withdrawn, and `clearPendingExit` has already
+      // written WHY onto `exitErrorReason` by the time we get here. Mark /
+      // trailing state above still updates, same as the rejection breaker.
+      if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) continue;
+
       // TRA-483 — PDT-aware overnight hold. Same-day round trips on a live
       // position count as a day trade and burn DTBP; the issue's wake comment
       // makes overnight hold the required default for live so the engine
@@ -4466,12 +4585,19 @@ export class PaperOptionsAccount {
           );
           if (reason === 'supertrend_flip' || reason === 'ma20_close_through' || reason === 'time_stop') {
             if (waitAndHold) {
+              // TRA-2984 — same escalation as the SL/trail staging site below:
+              // a structural exit whose previous order expired unfilled is
+              // re-staged at MARKET, not re-submitted at the price the market
+              // already declined. `kind: 'sl'` here is the order-pricing bucket
+              // and the exit is risk-reducing, so it qualifies.
+              const structuralEscalation = (opt.exitExpiredCount ?? 0) > 0;
+              if (structuralEscalation) this.escalatedExits += 1;
               opt.pendingExit = {
                 tradierOrderId: '',
                 qty: opt.contractsRemaining,
                 limitPrice: mark,
                 submittedAt: Date.now(),
-                pricing: 'limit',
+                pricing: structuralEscalation ? 'market' : 'limit',
                 kind: 'sl',
                 // TRA-2940 — preserve the structural reason across the broker
                 // round-trip; `kind: 'sl'` is only the order-pricing bucket.
@@ -4696,19 +4822,36 @@ export class PaperOptionsAccount {
             && exitKind === 'sl'
             && slPct > 0
             && mark < opt.stopLossPremium * (1 - slPct / 2);
+          // TRA-2984 — the retry escalation. A stop that already lapsed unfilled
+          // does not get the SAME order again: re-submitting an identical LIMIT
+          // the next session is not a retry, it is a repeat, and it expires the
+          // same way. `sl` and `trail` are risk-REDUCING, so once the market has
+          // shown it will not come to our price, crossing the spread is the
+          // cheaper side of the trade — the position is under its stop and every
+          // extra session is unhedged exposure.
+          //
+          // `tp1` is deliberately NOT escalated. An unfilled take-profit leaves
+          // UPSIDE on the table and re-arms itself the moment the mark comes
+          // back; paying market to capture a partial profit is a worse trade
+          // than waiting. The asymmetry is the point: only the leg that carries
+          // risk gets to cross.
+          const expiryEscalation =
+            (opt.exitExpiredCount ?? 0) > 0 && (exitKind === 'sl' || exitKind === 'trail');
+          const useMarket = deepUnderwaterSL || expiryEscalation;
           // TRA-2957 — same refusal as the TP1 staging site. A MARKET escalation
           // carries no price so it stays tradable, but a LIMIT at a non-finite
           // or non-positive `exitPremium` is an order that can never fill, and
           // an unfillable staged exit is strictly worse than no staged exit: it
           // latches `pendingExit` and detaches the rules that would have closed
           // the row. Fail to the next tick, which still sees the position.
-          if (!deepUnderwaterSL && !isArmedThreshold(exitPremium)) continue;
+          if (!useMarket && !isArmedThreshold(exitPremium)) continue;
+          if (expiryEscalation) this.escalatedExits += 1;
           opt.pendingExit = {
             tradierOrderId: '',
             qty: opt.contractsRemaining,
             limitPrice: exitPremium,
             submittedAt: Date.now(),
-            pricing: deepUnderwaterSL ? 'market' : 'limit',
+            pricing: useMarket ? 'market' : 'limit',
             kind: exitKind,
             // TRA-2940 — preserve the TRUE reason (chandelier / profit_lock /
             // take_profit_early) across the broker round-trip. Before this,
@@ -4983,6 +5126,11 @@ export class PaperOptionsAccount {
     // a future exit on the remainder (TP1 / manual partial) starts fresh and
     // the circuit breaker only ever counts *consecutive* failures.
     delete opt.closeRejectCount;
+    // TRA-2984 — and the expiry counter, for the same reason: it gates a MARKET
+    // escalation, so a stale one would make the NEXT exit on the remainder
+    // (a TP1 trim leaves the row open) cross the spread on the strength of a
+    // lapse that has already been superseded by a fill.
+    delete opt.exitExpiredCount;
     const pending = opt.pendingExit;
     const price = (typeof fillPrice === 'number' && Number.isFinite(fillPrice) && fillPrice > 0)
       ? fillPrice
@@ -5110,6 +5258,11 @@ export class PaperOptionsAccount {
     // counter climbs again from zero; a deliberate user retry always gets a
     // clean slate rather than inheriting the engine's abandoned-retry state.
     delete opt.closeRejectCount;
+    // TRA-2984 — same clean slate for the expiry counter. The user is working
+    // this order themselves and chose their own pricing; inheriting the
+    // engine's escalation state would silently convert their next engine-fired
+    // exit into a market order off a lapse they already responded to.
+    delete opt.exitExpiredCount;
     return { ...opt };
   }
 
@@ -5125,16 +5278,46 @@ export class PaperOptionsAccount {
    * `checkExits`. Pass `{ countRejection: false }` for a user-initiated
    * cancel (the user pulled their own order — that is not the broker
    * refusing the contract, so it must not trip the breaker).
+   *
+   * TRA-2984 — pass `{ expired: true }` when the order reached the broker and
+   * LAPSED unfilled at the end of the session. That is a third outcome, not a
+   * flavour of rejection, and routing it through the rejection counter was the
+   * defect: three no-fill sessions would have tripped the TRA-450 breaker and
+   * permanently detached the exit rules from a position whose stop was
+   * breached — the broker never refused anything. An expiry bumps
+   * {@link OptionPosition.exitExpiredCount} instead, which escalates the next
+   * `sl`/`trail` re-stage to MARKET (see the staging site in `checkExits`) and
+   * has its own, separate {@link MAX_CONSECUTIVE_EXIT_EXPIRIES} breaker.
    */
   clearPendingExit(
     optionId: string,
     reason?: string,
-    options: { countRejection?: boolean } = {},
+    options: { countRejection?: boolean; expired?: boolean } = {},
   ): boolean {
     const opt = this.openOptions.get(optionId);
     if (!opt || !opt.pendingExit) return false;
+    const expiredKind = opt.pendingExit.kind;
+    const expiredQty = opt.pendingExit.qty;
     delete opt.pendingExit;
     if (reason) opt.exitErrorReason = reason;
+    if (options.expired === true) {
+      opt.exitExpiredCount = (opt.exitExpiredCount ?? 0) + 1;
+      this.expiredExits += 1;
+      if ((opt.mode ?? 'demo') === 'live') this.expiredExitsLive += 1;
+      this.lastExpiredExitAt = Date.now();
+      if (opt.exitExpiredCount >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
+        // Same shape as the rejection breaker below: once the engine stops
+        // trying, the row must SAY that it stopped, because "expired" alone
+        // reads as "it will go again next session" — and after this point it
+        // will not.
+        opt.exitErrorReason =
+          `${reason ? `${reason} — ` : ''}auto-close paused after ` +
+          `${opt.exitExpiredCount} exit orders expired unfilled ` +
+          `(last: ${expiredKind} ×${expiredQty}); close this position manually ` +
+          `on Tradier or with the Close button.`;
+      }
+      return true;
+    }
     if (options.countRejection !== false) {
       opt.closeRejectCount = (opt.closeRejectCount ?? 0) + 1;
       if (opt.closeRejectCount >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
@@ -5563,6 +5746,46 @@ export class PaperOptionsAccount {
       ...this.countDetachedWorkingExits(nowMs),
       lastClearedAt: this.lastStaleWorkingExitAt,
       lastCleared: this.lastStaleWorkingExits,
+    };
+  }
+
+  /**
+   * TRA-2984 — consecutive expiries currently standing against one open row.
+   * The alert needs it to say "attempt 2 of 3" rather than just "expired", and
+   * a bare `expired` reads the same at attempt 1 (which escalates and will
+   * probably resolve) and attempt 3 (which stops staging and needs a human).
+   * 0 for an unknown / already-closed id.
+   */
+  getExitExpiredCount(optionId: string): number {
+    return this.openOptions.get(optionId)?.exitExpiredCount ?? 0;
+  }
+
+  /**
+   * TRA-2984 — cumulative expired-exit telemetry.
+   *
+   * Publishing `expiredTotal` alone would reproduce the bug in a new place:
+   * "the retry shipped" and "the retry never ran" both show a rising expiry
+   * count. `escalatedTotal` is the discriminator — it only moves when a
+   * re-stage was actually escalated from LIMIT to MARKET because of a prior
+   * expiry. A live expiry with no matching escalation on the next session is
+   * the failure this issue was opened for, still happening.
+   *
+   * Counts and timestamps only — no OCC symbols. The consumer is the no-auth
+   * `/api/health/options-live`; TRA-2163 is the standing reason not to widen
+   * what that route says about the real-money book. Symbols are on the log
+   * line, on `exitErrorReason`, and on the authenticated `/api/state`.
+   */
+  getExpiredExitStats(): {
+    expiredTotal: number;
+    expiredLiveTotal: number;
+    escalatedTotal: number;
+    lastExpiredAt: number | null;
+  } {
+    return {
+      expiredTotal: this.expiredExits,
+      expiredLiveTotal: this.expiredExitsLive,
+      escalatedTotal: this.escalatedExits,
+      lastExpiredAt: this.lastExpiredExitAt,
     };
   }
 
@@ -6122,6 +6345,7 @@ export class PaperOptionsAccount {
     // The row is leaving the open book; a tripped auto-close breaker and a
     // half-counted miss streak would only be noise in the archive.
     delete opt.closeRejectCount;
+    delete opt.exitExpiredCount; // TRA-2984 — same, and it gates a MARKET escalation.
     delete opt.brokerMissingSweeps;
     // A rejected close leaves no live order behind, but clear the staged
     // intent so `closeOption` archives a clean row rather than one that looks

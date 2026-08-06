@@ -6795,6 +6795,86 @@ export class SignalEngine {
     return { reapedTotal, reapedLiveTotal, lastReapedAt };
   }
 
+  /**
+   * TRA-2984 — expired-exit telemetry, folded across BOTH option books for the
+   * same reason as the TRA-2819 fold above: the env can flip underneath a
+   * lapsed order and the inactive book's expiry is exactly as unresolved.
+   *
+   * Counts and timestamps only — no OCC symbols (TRA-2163).
+   */
+  getExpiredExitStats(): {
+    expiredTotal: number;
+    expiredLiveTotal: number;
+    escalatedTotal: number;
+    lastExpiredAt: number | null;
+  } {
+    let expiredTotal = 0;
+    let expiredLiveTotal = 0;
+    let escalatedTotal = 0;
+    let lastExpiredAt: number | null = null;
+    for (const env of ['sandbox', 'production'] as const) {
+      const stats = this.optionsAccounts[env].getExpiredExitStats();
+      expiredTotal += stats.expiredTotal;
+      expiredLiveTotal += stats.expiredLiveTotal;
+      escalatedTotal += stats.escalatedTotal;
+      if (stats.lastExpiredAt !== null && (lastExpiredAt === null || stats.lastExpiredAt > lastExpiredAt)) {
+        lastExpiredAt = stats.lastExpiredAt;
+      }
+    }
+    return { expiredTotal, expiredLiveTotal, escalatedTotal, lastExpiredAt };
+  }
+
+  /**
+   * TRA-2984 — page on a `sell_to_close` that expired unfilled.
+   *
+   * This is the "first-class alert" half of the issue. The reason it needs one
+   * at all: an order that never fills appends NO row to the fee/slippage
+   * ledger, so every monitor that grades on ledger rows — which is all of them
+   * — scores the position as healthy. On the live book that left
+   * TSLA260911C00555000 ×4 sitting under a breached trailing stop for two
+   * sessions with the failure recorded nowhere but a string on the row, found
+   * only because a human read `/api/state` by hand.
+   *
+   * LIVE expiries are `critical` (real money, risk still on); demo is a
+   * `warning` so the paper book cannot page the desk. `dispatchAlert` throttles
+   * per key (30 min) and never throws, so a contract that lapses every session
+   * pages once a window rather than on every tick of the poll path.
+   */
+  private notifyExpiredExit(
+    env: TradierEnv,
+    opt: import('@trading-app/shared').OptionPosition,
+    intent: import('@trading-app/shared').OptionPendingExit,
+    site: 'poll' | 'submit',
+  ): void {
+    const isLive = (opt.mode ?? 'demo') === 'live';
+    const expiries = this.optionsAccounts[env].getExitExpiredCount(opt.id) || 1;
+    const detail = {
+      component: 'expired-exit',
+      env,
+      site,
+      optionSymbol: opt.optionSymbol ?? null,
+      mode: opt.mode ?? 'demo',
+      kind: intent.kind,
+      qty: intent.qty,
+      limitPrice: intent.limitPrice ?? null,
+      order: intent.tradierOrderId,
+      consecutiveExpiries: expiries,
+      issue: 'TRA-2984',
+    };
+    log.warn('tradier sell_to_close EXPIRED unfilled — no ledger row exists for this attempt', detail);
+    dispatchAlert(
+      'expired-exit',
+      isLive ? 'critical' : 'warning',
+      `A ${opt.mode ?? 'demo'} \`sell_to_close\` (${intent.kind} ×${intent.qty}) on `
+        + `${opt.optionSymbol ?? 'an option position'} EXPIRED unfilled at the broker `
+        + `(attempt ${expiries}). The position is STILL OPEN and its exit did not `
+        + `execute. No fee/slippage ledger row exists for an order that never filled, `
+        + `so this alert and \`exitErrorReason\` on the row are the only record. The `
+        + `next ${intent.kind === 'tp1' ? 'attempt keeps LIMIT pricing (a take-profit is not worth crossing the spread for)' : 'stop re-stage escalates to MARKET'}.`,
+      detail,
+    );
+  }
+
   private alertUnmanagedLiveOptions(): void {
     const skipped = this.optionsAccount.getModeSkippedLiveOptionSymbols();
     if (skipped.length === 0) return;
@@ -6883,7 +6963,18 @@ export class SignalEngine {
             // broker is flat, in which case retrying forever is pointless and
             // the row must be closed locally instead of left open.
             if (await this.reconcileFlatBrokerRejection(env, acct, opt, reason)) continue;
-            acct.clearPendingExit(opt.id, reason);
+            // TRA-2984 — `expired` is the day order lapsing at the close, not
+            // the broker refusing us. It takes its own counter (which escalates
+            // the next stop to MARKET) instead of the rejection breaker, and it
+            // gets its own alert: an order that never filled appends NO row to
+            // the fee/slippage ledger, so this log + `notifyExpiredExit` is the
+            // ONLY evidence the attempt ever happened.
+            const expired = status === 'expired';
+            acct.clearPendingExit(opt.id, reason, expired ? { expired: true } : {});
+            if (expired) {
+              this.notifyExpiredExit(env, opt, pendingExit, 'poll');
+              continue;
+            }
             log.warn('tradier sell_to_close not filled — leaving paper position open', {
               optionSymbol: opt.optionSymbol,
               order: pendingExit.tradierOrderId,
@@ -7235,7 +7326,11 @@ export class SignalEngine {
           // "not closing a long position" AND /positions confirms the broker is
           // flat, the row is stranded and closing it locally is the only exit.
           if (await this.reconcileFlatBrokerRejection(this.tradierEnv, acct, snapshot, reason)) continue;
-          acct.clearPendingExit(snapshot.id, reason);
+          // TRA-2984 — see the poll path in `resolvePendingOptionExits`: an
+          // expiry is not a rejection and does not share its counter.
+          const expired = detail.status === 'expired';
+          acct.clearPendingExit(snapshot.id, reason, expired ? { expired: true } : {});
+          if (expired) this.notifyExpiredExit(this.tradierEnv, snapshot, intent, 'submit');
         }
       } catch (err: unknown) {
         log.warn('waitForOrderTerminalStatus failed — leaving pendingExit for next tick poll', {

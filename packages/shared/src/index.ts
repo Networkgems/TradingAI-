@@ -2743,15 +2743,45 @@ export interface OptionPosition {
   /**
    * TRA-450 — consecutive rejected auto-close (`sell_to_close`) attempts the
    * engine has made for this position. Bumped by `clearPendingExit` each time
-   * the broker rejects / cancels / expires a staged exit (or the submit
-   * throws); reset to absent on a fill (`finalizePendingExit`) or a user
+   * the broker REFUSES a staged exit (rejected / canceled / error, or the
+   * submit throws); reset to absent on a fill (`finalizePendingExit`) or a user
    * re-stage (`stageManualPendingExit`). Once it reaches the engine's
    * `MAX_CONSECUTIVE_CLOSE_REJECTS` threshold, `checkExits` stops re-staging
    * the exit so the engine can't spray the broker with hundreds of doomed
    * orders — the row keeps `exitErrorReason` so the user can close manually.
    * Absent ↔ no rejected close attempt outstanding / legacy snapshot.
+   *
+   * TRA-2984 — an `expired` day order is NOT counted here. It is not the broker
+   * refusing the contract; it is our own limit never being hit, and the two need
+   * opposite remedies (stop trying vs. try harder). Expiries go to
+   * {@link exitExpiredCount}.
    */
   closeRejectCount?: number;
+  /**
+   * TRA-2984 — consecutive staged `sell_to_close` orders for this position that
+   * reached the broker, rested, and **expired unfilled** at the end of the
+   * session. Reset on a fill (`finalizePendingExit`) or a user re-stage
+   * (`stageManualPendingExit`), exactly like {@link closeRejectCount}.
+   *
+   * Two things read it, and they are the whole fix:
+   *
+   *  1. `checkExits` escalates the NEXT risk-reducing (`sl` / `trail`) re-stage
+   *     to MARKET pricing once this is ≥ 1. Re-submitting the identical
+   *     unfillable LIMIT the following session is not a retry — it is the same
+   *     order again, and it lapses the same way. A take-profit (`tp1`) is NOT
+   *     escalated: an unfilled TP1 leaves upside on the table, an unfilled stop
+   *     leaves RISK on, and only the second one is worth crossing the spread for.
+   *  2. At `MAX_CONSECUTIVE_EXIT_EXPIRIES` it stops staging and says so on
+   *     `exitErrorReason`, so an escalation that somehow still cannot fill does
+   *     not loop forever.
+   *
+   * The defect it exists for: TSLA260911C00555000 ×4 on the live book submitted
+   * one `sell_to_close` under a breached trailing stop, the order rested all
+   * session and expired, and nothing followed up. The only evidence anywhere was
+   * the `exitErrorReason` string — no ledger row is ever appended for an order
+   * that never filled.
+   */
+  exitExpiredCount?: number;
   /**
    * TRA-2799 — consecutive Tradier portfolio reconciles in which this
    * ENGINE-OPENED live row's OCC symbol was absent from the broker's
