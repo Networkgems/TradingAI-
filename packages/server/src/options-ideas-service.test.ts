@@ -50,6 +50,8 @@ describe('buildIdeasFeed non-live fallbacks', () => {
       expect(feed.source).toBe('non_live');
       expect(feed.ideas).toHaveLength(0);
       expect(feed.note).toMatch(/api key/i);
+      // TRA-3122 — machine-readable absence state, not prose.
+      expect(feed.availability).toEqual({ state: 'degraded', code: 'llm_credential_missing', scope: 'config' });
       expect(feed.noDayTrading.enforced).toBe(true);
     } finally {
       restoreKeys();
@@ -63,6 +65,7 @@ describe('buildIdeasFeed non-live fallbacks', () => {
       const feed = await buildIdeasFeed({ client: null, symbols: ['MSFT'], noCache: true });
       expect(feed.source).toBe('non_live');
       expect(feed.note).toMatch(/tradier/i);
+      expect(feed.availability.code).toBe('options_credentials_missing');
     } finally {
       clearKeys();
       restoreKeys();
@@ -111,6 +114,9 @@ describe('buildIdeasFeed non-live fallbacks', () => {
       expect(feed.ideas).toHaveLength(0);
       expect(feed.note).toMatch(/budget|paused/i);
       expect(feed.note).toMatch(/2026-06/);
+      // TRA-3122 — a BUDGET stop is ours, not the vendor's. It must not read as
+      // a provider outage (that is what pages someone), and must not read as ok.
+      expect(feed.availability).toEqual({ state: 'degraded', code: 'spend_cap_reached', scope: 'budget' });
     } finally {
       resetOptionsSpendForTests();
       clearKeys();

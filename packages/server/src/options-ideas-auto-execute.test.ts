@@ -68,6 +68,7 @@ function feedOf(ideas: OptionsIdeaView[]): OptionsIdeasFeed {
     noDayTrading: { enforced: true, minHoldDays: 1, note: '' },
     generatedAt: NOW,
     source: 'live',
+    availability: { state: 'ok', code: 'ok', scope: 'none' },
   };
 }
 

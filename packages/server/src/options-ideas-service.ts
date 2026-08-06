@@ -29,6 +29,8 @@ import { ivRankSync, recordDailyIv, atmIvFromRows } from './iv-rank-store.js';
 import {
   buildOptionsIdeasFeed,
   noDayTradingBlock,
+  classifyResearchFailure,
+  type OptionsIdeasAvailability,
   type OptionsIdeasFeed,
   type IdeaEntryIntent,
 } from './options-ideas-feed.js';
@@ -224,25 +226,49 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     return feedCache.feed;
   }
 
-  const nonLive = (note: string): OptionsIdeasFeed => ({
-    ideas: [],
-    noDayTrading: noDayTradingBlock(guardrail),
-    generatedAt: now,
-    source: 'non_live',
-    note,
-  });
+  // TRA-3122 — every degrade path now has to name its absence state. The prose
+  // `note` stays (the panel renders it), but the code is what a monitor reads:
+  // an empty feed because the vendor refused must not be reachable by the same
+  // shape as an empty feed because nothing qualified.
+  //
+  // The log line carries a single contiguous token (`options-ideas-unavailable
+  // code=<code>`) so the Render log filter — which is a substring match, not a
+  // phrase search — can alarm on it without anyone polling the route.
+  const nonLive = (note: string, availability: OptionsIdeasAvailability): OptionsIdeasFeed => {
+    log.warn(`options-ideas-unavailable code=${availability.code} scope=${availability.scope}`, {
+      code: availability.code,
+      scope: availability.scope,
+      universe: symbols.length,
+    });
+    return {
+      ideas: [],
+      noDayTrading: noDayTradingBlock(guardrail),
+      generatedAt: now,
+      source: 'non_live',
+      note,
+      availability,
+    };
+  };
+  const degraded = (
+    code: OptionsIdeasAvailability['code'],
+    scope: OptionsIdeasAvailability['scope'],
+  ): OptionsIdeasAvailability => ({ state: 'degraded', code, scope });
 
   const llm = createAnthropicLlmClientFromEnv(credEnv);
   if (!llm) {
     return nonLive(
       'AI Options Ideas is not live: no Anthropic credential is configured. The simplest fix (no API key needed elsewhere) is to open the AI Ideas tab settings and paste a pay-as-you-go console API key from console.anthropic.com → API keys (it starts with "sk-ant-api03…"); it is stored with your account and activates the feed immediately. A Claude Pro/Max subscription token will NOT work here — Anthropic rate-limits it for server use. (Server operators may instead set ANTHROPIC_API_KEY in the environment.) The research pass and guardrails are wired; ideas and Paper entry activate once a console key is set.',
+      degraded('llm_credential_missing', 'config'),
     );
   }
   if (!opts.client) {
-    return nonLive('AI Options Ideas is not live: no Tradier options credentials are configured to pull option chains.');
+    return nonLive(
+      'AI Options Ideas is not live: no Tradier options credentials are configured to pull option chains.',
+      degraded('options_credentials_missing', 'config'),
+    );
   }
   if (!symbols.length) {
-    return nonLive('AI Options Ideas is not live: the watchlist is empty.');
+    return nonLive('AI Options Ideas is not live: the watchlist is empty.', degraded('watchlist_empty', 'config'));
   }
 
   // 1) pull chains → snapshots, recording the daily ATM IV per symbol.
@@ -265,7 +291,10 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     }
   }
   if (!snapshots.length) {
-    return nonLive('AI Options Ideas is not live: no option chains returned for the current universe.');
+    return nonLive(
+      'AI Options Ideas is not live: no option chains returned for the current universe.',
+      degraded('no_chains', 'data'),
+    );
   }
 
   // 2) fuse — wire C1 (earnings), C2 (Fed/FOMC + macro), IV-rank, sentiment.
@@ -299,6 +328,7 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     const s = optionsSpendStatus(now);
     return nonLive(
       `AI Options Ideas is paused for the rest of ${s.month}: the $${s.capUsd}/mo research budget is reached ($${s.spentUsd.toFixed(2)} spent). The feed resumes next month; live capital is unaffected (paper-only).`,
+      degraded('spend_cap_reached', 'budget'),
     );
   }
 
@@ -322,8 +352,11 @@ export async function buildIdeasFeed(opts: BuildIdeasOptions): Promise<OptionsId
     // Reuse the credential resolved at the top of this request (TRA-714): it
     // already reflects a user's app-installed console key overriding the env.
     const credNote = ` [auth=${cred.mode} prefix=${cred.prefix || 'n/a'} apiKeyPresent=${cred.apiKeyPresent} oauthPresent=${cred.oauthPresent}]`;
+    // TRA-3122 — the prose above was the ONLY thing distinguishing "the vendor
+    // refused to bill us" from "the scanner liked nothing today". Classify it.
     return nonLive(
       `AI Options Ideas could not complete the research pass this cycle: ${reason.slice(0, 200)}${credNote}`,
+      classifyResearchFailure(reason),
     );
   }
 

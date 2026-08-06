@@ -16,6 +16,7 @@ import {
   reconcileThesis,
   dteFromExpiration,
   sizeSpreadContractsToCap,
+  classifyResearchFailure,
   STRATEGY_DISPLAY,
 } from './options-ideas-feed.js';
 
@@ -504,6 +505,26 @@ describe('buildOptionsIdeasFeed', () => {
     expect(intent.maxLossUsd).toBe(idea.maxLossUsd);
     expect(intent.maxProfitUsd).toBe(idea.maxProfitUsd);
     expect(intent.breakevens).toEqual(idea.breakevens);
+    // TRA-3122 — a completed research pass is `ok`, so the panel/monitor can
+    // read the slate as a judgement about the tape.
+    expect(feed.availability).toEqual({ state: 'ok', code: 'ok', scope: 'none' });
+  });
+
+  // TRA-3122 — the OTHER arm of the discriminator, and the one that makes it
+  // worth anything: a research pass that RAN and liked nothing still reports
+  // `ok`. Without this, "availability != ok" would just be a synonym for
+  // "ideas is empty" and would separate nothing.
+  it('reports availability ok for an EMPTY slate the research pass actually judged', () => {
+    const { feed } = buildOptionsIdeasFeed({
+      research: { ...research, ideas: [] },
+      input,
+      rowsBySymbol,
+      guardrail: DAY_TRADING_GUARDRAIL,
+      generatedAt: GEN,
+    });
+    expect(feed.ideas).toHaveLength(0);
+    expect(feed.availability.state).toBe('ok');
+    expect(feed.availability.code).toBe('ok');
   });
 
   // TRA-1360 — end-to-end coherence guard. When the chain can only place the
@@ -1044,5 +1065,48 @@ describe('buildOptionsIdeasFeed', () => {
       expect(feed.ideas).toHaveLength(1);
       expect(feed.ideas[0]!.contracts).toBe(1); // sized path ran; floor never applied
     });
+  });
+});
+
+// TRA-3122 — the live outage: `/api/options/ideas` answered HTTP 200 with
+// `ideas: []` because the Anthropic credit balance was exhausted, which is
+// pixel-identical to a quiet tape unless a human reads the prose `note`.
+describe('classifyResearchFailure (TRA-3122)', () => {
+  // Verbatim, as it came back off bqb1 at 2026-08-06 ~16:41Z (SHA f19fb1fa3068).
+  const LIVE_400 =
+    '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}';
+
+  it('classifies the live credit-exhaustion 400 as a provider failure', () => {
+    expect(classifyResearchFailure(LIVE_400)).toEqual({
+      state: 'degraded',
+      code: 'llm_credit_exhausted',
+      scope: 'provider',
+    });
+  });
+
+  it('separates a rejected credential from a billed-out one', () => {
+    expect(classifyResearchFailure('401 {"error":{"type":"authentication_error"}}').code).toBe('llm_auth_rejected');
+  });
+
+  it('classifies throttling and vendor outages distinctly', () => {
+    expect(classifyResearchFailure('429 rate_limit_error: too many requests').code).toBe('llm_rate_limited');
+    expect(classifyResearchFailure('529 {"error":{"type":"overloaded_error"}}').code).toBe('llm_provider_unavailable');
+  });
+
+  // An unrecognised vendor error must still ALARM. The failure mode this guards
+  // is the classifier quietly widening the "nothing qualified" bucket as
+  // Anthropic's error text changes under it.
+  it('falls back to a degraded provider failure for text it does not recognise', () => {
+    const v = classifyResearchFailure('socket hang up while streaming the research pass');
+    expect(v.state).toBe('degraded');
+    expect(v.scope).toBe('provider');
+    expect(v.code).toBe('llm_call_failed');
+  });
+
+  it('never returns ok — every classified reason is a reason the pass did not run', () => {
+    for (const r of [LIVE_400, '401 authentication_error', '429 rate_limit', '500 api_error', 'whatever']) {
+      expect(classifyResearchFailure(r).code).not.toBe('ok');
+      expect(classifyResearchFailure(r).state).toBe('degraded');
+    }
   });
 });

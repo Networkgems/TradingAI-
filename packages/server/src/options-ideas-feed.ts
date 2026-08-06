@@ -112,6 +112,93 @@ export interface OptionsIdeaView {
   entryBlockedReason?: string;
 }
 
+/**
+ * TRA-3122 — why the feed is what it is, as a machine-readable code.
+ *
+ * `ok` is the ONLY value that means "the research pass ran to completion". Every
+ * other value means the slate was cut short before the ranker could judge
+ * anything, and therefore that `ideas: []` carries NO information about the tape.
+ */
+export type OptionsIdeasAvailabilityCode =
+  | 'ok'
+  /** The vendor billed-out: `credit balance is too low` (the TRA-3122 outage). */
+  | 'llm_credit_exhausted'
+  /** The credential is present but the vendor rejected it (401 / invalid key). */
+  | 'llm_auth_rejected'
+  /** 429 — the credential is being throttled. */
+  | 'llm_rate_limited'
+  /** 5xx / overloaded — the vendor is down, nothing is wrong on our side. */
+  | 'llm_provider_unavailable'
+  /** The research pass threw for a reason none of the above classify. */
+  | 'llm_call_failed'
+  /** No Anthropic credential is configured at all. */
+  | 'llm_credential_missing'
+  /** The board-approved monthly research budget is spent (TRA-658). */
+  | 'spend_cap_reached'
+  /** No Tradier options credential to pull chains with. */
+  | 'options_credentials_missing'
+  /** The watchlist is empty — nothing to scan. */
+  | 'watchlist_empty'
+  /** Chains were requested but none came back. */
+  | 'no_chains';
+
+/**
+ * TRA-3122 — the absence state for the ideas feed.
+ *
+ * The defect this exists to kill: `/api/options/ideas` answers `HTTP 200` with
+ * `ideas: []` both when the scanner judged nothing worth trading AND when the
+ * LLM vendor refused to serve the research pass. Those two states were
+ * pixel-identical to every caller — the only thing separating them was a prose
+ * `note`, which no monitor can alarm on and which a human has to think about.
+ *
+ * So: `availability.state === 'ok'` with `ideas: []` means "we looked, nothing
+ * qualified". Anything else means "we never got to look".
+ *
+ * Monitors: a MISSING `availability` is **UNKNOWN, not ok** — it means the build
+ * answering you predates TRA-3122. Treat absent as an alarm, not a pass.
+ */
+export interface OptionsIdeasAvailability {
+  /** `ok` = the research pass completed. `degraded` = it did not run to completion. */
+  state: 'ok' | 'degraded';
+  code: OptionsIdeasAvailabilityCode;
+  /**
+   * Who has to act. `provider` is the one that pages someone — it means an
+   * external vendor refused us, which no amount of retrying fixes.
+   */
+  scope: 'none' | 'provider' | 'config' | 'budget' | 'data';
+}
+
+/** The healthy availability — the research pass ran and the slate is a judgement. */
+export const AVAILABILITY_OK: OptionsIdeasAvailability = {
+  state: 'ok',
+  code: 'ok',
+  scope: 'none',
+};
+
+/**
+ * TRA-3122 — map a thrown research-pass reason onto a machine-readable code.
+ *
+ * The reason is the vendor's own error text as it reached us (e.g.
+ * `400 {"type":"error","error":{"type":"invalid_request_error","message":"Your
+ * credit balance is too low to access the Anthropic API…"}}`). Everything that
+ * does not classify lands on `llm_call_failed` — still `degraded`, still
+ * `provider` scope, so an unrecognised vendor failure alarms rather than
+ * disappearing into the "nothing qualified" bucket.
+ */
+export function classifyResearchFailure(reason: string): OptionsIdeasAvailability {
+  const r = reason.toLowerCase();
+  const code: OptionsIdeasAvailabilityCode = /credit balance is too low|insufficient (credit|quota)|billing/.test(r)
+    ? 'llm_credit_exhausted'
+    : /401|authentication_error|invalid x-api-key|permission_error|403/.test(r)
+      ? 'llm_auth_rejected'
+      : /429|rate_limit/.test(r)
+        ? 'llm_rate_limited'
+        : /\b5\d\d\b|overloaded|api_error|service unavailable/.test(r)
+          ? 'llm_provider_unavailable'
+          : 'llm_call_failed';
+  return { state: 'degraded', code, scope: 'provider' };
+}
+
 export interface OptionsIdeasFeed {
   ideas: OptionsIdeaView[];
   noDayTrading: { enforced: boolean; minHoldDays: number; note: string };
@@ -119,6 +206,12 @@ export interface OptionsIdeasFeed {
   source: 'live' | 'preview' | 'non_live';
   /** Present on the non-live response (no LLM key) so the panel can explain why. */
   note?: string;
+  /**
+   * TRA-3122 — REQUIRED. The absence state described above. Required (not
+   * optional) so every construction site has to state which of the two empty
+   * feeds it is building, rather than defaulting into "healthy".
+   */
+  availability: OptionsIdeasAvailability;
 }
 
 /** Engine strategy id → human display string the panel renders. */
@@ -1030,6 +1123,9 @@ export function buildOptionsIdeasFeed(args: BuildFeedArgs): BuiltFeed {
       noDayTrading: noDayTradingBlock(guardrail),
       generatedAt,
       source: 'live',
+      // TRA-3122 — reached only after the research pass returned a result, so an
+      // empty `ideas` here really is "nothing qualified".
+      availability: AVAILABILITY_OK,
     },
     intents,
   };
