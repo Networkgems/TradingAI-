@@ -29,6 +29,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import type { DiskReading } from './observability/alerts.js';
 import type { DataDirUsage } from './data-dir-usage.js';
+import type { DiskWatermark } from './observability/disk-watermark.js';
 import {
   registerStorageHealthRoutes,
   projectStorageLiveness,
@@ -104,6 +105,28 @@ let baseUrl: string;
 let usageCalls: number;
 let diskReading: DiskReading | null;
 
+// TRA-3011 — the since-boot low-water mark, injectable so the RECOVERED branch
+// can be driven without a filesystem that has actually run out of space.
+const CLEAN_WATERMARK = {
+  bootedAt: '2026-07-30T08:11:22.333Z',
+  readings: 9,
+  failedReadings: 0,
+  lastReadingAt: '2026-07-30T09:59:30.000Z',
+  lastBelowThreshold: false as boolean | null,
+  lastExhausted: null,
+  freePctMin: 42.5,
+  freeBytesMinAt: 425_000_000,
+  inodeFreePctMin: 61.2,
+  inodesFreeMinAt: 40_100,
+  belowThresholdSeen: false,
+  belowReadings: 0,
+  exhaustedSeen: null,
+  firstBelowAt: null,
+  lastBelowAt: null,
+  minFreePctAtWorst: MIN_FREE_PCT,
+} as const;
+let watermark: DiskWatermark = { ...CLEAN_WATERMARK };
+
 /**
  * Mirrors `index.ts`' real middleware contract: 401 for a missing/unknown Bearer
  * token, 403 for a token whose account is not an admin. The separate
@@ -142,6 +165,7 @@ function deps(): StorageHealthDeps {
     getUserContextCount: () => USER_CONTEXT_COUNT,
     diskMinFreePct: () => MIN_FREE_PCT,
     readDiskSpace: async () => diskReading,
+    diskWatermark: () => watermark,
     dataDirUsage: async () => {
       usageCalls += 1;
       return USAGE;
@@ -182,6 +206,7 @@ afterAll(async () => {
 beforeEach(() => {
   usageCalls = 0;
   diskReading = HEALTHY_DISK;
+  watermark = { ...CLEAN_WATERMARK };
 });
 
 const get = (path: string, token?: string) =>
@@ -465,5 +490,83 @@ describe('TRA-2817 disk exhaustion axis', () => {
   it('grades the boundary as free, not exhausted', () => {
     // Strictly below, matching the blocks term this was modelled on.
     expect(diskExhaustedAxis(MIN, MIN, MIN)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-3011 — the watermark. `/data` returned ENOSPC on every write from
+// 2026-07-30T23:40Z to 2026-08-04T~21:20Z; the TRA-2817 backup prune freed the
+// inodes and by 08-05 every field on this route read healthy again. The Render
+// log tape (~7d retention) was the only surviving evidence of a SIX-DAY outage.
+// These pin the field that makes it survivable on the served surface.
+// ---------------------------------------------------------------------------
+
+describe('TRA-3011 — the since-boot low-water mark', () => {
+  /** bqb1 after the prune ran: clean now, inode-exhausted earlier this boot. */
+  const RECOVERED: DiskWatermark = {
+    ...CLEAN_WATERMARK,
+    freePctMin: 37.566,
+    freeBytesMinAt: 383_434_752,
+    inodeFreePctMin: 0.018,
+    inodesFreeMinAt: 12,
+    belowThresholdSeen: true,
+    belowReadings: 640,
+    exhaustedSeen: 'inodes',
+    firstBelowAt: '2026-07-30T23:40:19.000Z',
+    lastBelowAt: '2026-08-04T21:20:35.000Z',
+  };
+
+  it('★ RECOVERED is distinguishable from NEVER-BROKEN on the ANONYMOUS route', () => {
+    // The control comes first: the two states must be identical on every
+    // pre-existing field, or the test is passing on something else.
+    const forDiag = async (w: DiskWatermark) => {
+      watermark = w;
+      const res = await get(STORAGE_LIVENESS_ROUTE);
+      return (await res.json()) as { disk: Record<string, unknown> };
+    };
+    return (async () => {
+      const clean = await forDiag({ ...CLEAN_WATERMARK });
+      const recovered = await forDiag(RECOVERED);
+      expect(recovered.disk['readable']).toBe(clean.disk['readable']);
+      expect(recovered.disk['belowThreshold']).toBe(clean.disk['belowThreshold']);
+      expect(clean.disk['belowThreshold']).toBe(false); // both read healthy NOW
+      // …and this is the one field that separates them.
+      expect(clean.disk['belowThresholdSeen']).toBe(false);
+      expect(recovered.disk['belowThresholdSeen']).toBe(true);
+    })();
+  });
+
+  it('keeps the watermark NUMBERS gated — only the boolean escapes', async () => {
+    watermark = RECOVERED;
+    const anon = (await (await get(STORAGE_LIVENESS_ROUTE)).json()) as {
+      disk: Record<string, unknown>;
+    };
+    expect(anon.disk).not.toHaveProperty('watermark');
+
+    const admin = (await (await get(STORAGE_DETAIL_ROUTE, ADMIN_TOKEN)).json()) as StorageDiagnostic;
+    expect(admin.disk.watermark.inodeFreePctMin).toBe(0.018);
+    expect(admin.disk.watermark.inodesFreeMinAt).toBe(12);
+    expect(admin.disk.watermark.exhaustedSeen).toBe('inodes');
+    expect(admin.disk.watermark.firstBelowAt).toBe('2026-07-30T23:40:19.000Z');
+    expect(admin.disk.watermark.belowReadings).toBe(640);
+  });
+
+  it('publishes the watermark on the UNREADABLE branch too', async () => {
+    // A statfs that fails NOW says nothing about what this box saw an hour ago.
+    // The pre-TRA-2599 route answered the failure branch with a short object and
+    // dropped the key that mattered; the same mistake here would erase the only
+    // record of the outage at exactly the moment the disk is worst.
+    diskReading = null;
+    watermark = RECOVERED;
+    const admin = (await (await get(STORAGE_DETAIL_ROUTE, ADMIN_TOKEN)).json()) as StorageDiagnostic;
+    expect(admin.disk.readable).toBe(false);
+    expect(admin.disk.belowThreshold).toBeNull(); // unknown, not fine
+    expect(admin.disk.belowThresholdSeen).toBe(true);
+    expect(admin.disk.watermark.inodeFreePctMin).toBe(0.018);
+
+    const anon = (await (await get(STORAGE_LIVENESS_ROUTE)).json()) as {
+      disk: Record<string, unknown>;
+    };
+    expect(anon.disk['belowThresholdSeen']).toBe(true);
   });
 });

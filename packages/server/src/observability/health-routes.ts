@@ -102,7 +102,8 @@ import {
   type GiveBackArmFloorSummary,
 } from '../giveback-arm-floor-ledger.js'; // TRA-1892 / TRA-2220
 import { summarizeMarkSanity } from '../option-mark-sanity.js'; // TRA-2927
-import { evaluateDurability } from '../durability.js'; // TRA-1681
+import { evaluateDurability, type DurabilityReport } from '../durability.js'; // TRA-1681
+import { getDiskWatermark, diskReadingAgeSec } from './disk-watermark.js'; // TRA-3011
 import { getStateDbStatus } from '../sqlite.js'; // TRA-1681
 import {
   isOptionCostAwareGateEnabled,
@@ -2247,6 +2248,29 @@ export function givebackArmFloorNote(summary: GiveBackArmFloorSummary): string {
 }
 
 /**
+ * TRA-3011 — the `/api/health/durability` prose, extracted so the RECOVERED
+ * branch can exist at all.
+ *
+ * The old note had two states, `ok` and not-`ok`. That is one short of what the
+ * 2026-07-30 outage needs: a box that filled and was then pruned back is `ok`
+ * again, and on every instantaneous field it is byte-identical to a box that was
+ * never full. `belowThresholdSeen` is the discriminator, so when it is true and
+ * the current reading is clean the note SAYS SO rather than serving the
+ * unqualified all-clear — the exact sentence this route published for six days
+ * while nothing on the box could write.
+ */
+export function durabilityNote(report: DurabilityReport): string {
+  if (!report.ok) {
+    return `NOT DURABLE${report.violations.length > 0 ? ` — broken: ${report.violations.join(', ')}` : ''}${report.unmeasured.length > 0 ? ` — unmeasured (VOIDS a grade, does not stop a boot): ${report.unmeasured.join(', ')}` : ''}. Any multi-session window read off this box is VOID. Policy is '${report.policy}' (set DURABILITY_POLICY=refuse to make a broken guarantee stop the boot).`;
+  }
+  const d = report.disk;
+  if (d && d.belowThresholdSeen) {
+    return `DURABLE NOW, BUT ${d.exhaustedSeen ?? 'the disk'} WENT BELOW THE FREE-SPACE THRESHOLD SINCE THIS BOOT (${d.firstBelowAt} → ${d.lastBelowAt}, boot ${d.bootedAt}). Writes in that window may have failed with ENOSPC and been swallowed by their callers' own try/catch, so any ledger, partition or report artifact dated inside it is SUSPECT even though every count now reads clean. Check /api/health/storage/detail for the byte and inode figures.`;
+  }
+  return 'Durable state is intact: DATA_DIR is on a persistent mount, the hot-state store is open, the journal loaded clean, and the volume has stayed above the free-space threshold on both blocks and inodes for every reading since boot. Counts on this box survive a redeploy.';
+}
+
+/**
  * TRA-2269 — the floor on the decoupled timer's share of the GRADED window.
  *
  * `gradeable` used to assert only that the subject RAN (TRA-2257:
@@ -3358,10 +3382,26 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // guarantee is not a satisfied one (`corruptLines: null` means no load has run, never
   // "a clean load"), and treating the two as the same is the exact false-green this whole
   // chain of tickets is made of. No balances/PII — a path, some counters, and a verdict.
+  //
+  // TRA-3011 — and it now grades WHETHER THE BYTES GO, not just where. Through the
+  // 2026-07-30 → 08-04 `ENOSPC` outage this route served `ok: true` with an empty
+  // `violations` and the note "Durable state is intact"; every field it graded was
+  // genuinely true while nothing on the box could write. The `disk` block below is
+  // the sixth fail-open, plus the one thing no instantaneous field can give you:
+  // `disk.belowThresholdSeen` is a SINCE-BOOT memory, so a box that was full an
+  // hour ago and has since been pruned no longer reads identically to one that was
+  // never full. Booleans and ages only — the byte and inode figures stay behind
+  // admin auth on `/api/health/storage/detail` (TRA-2599) and this route is open.
   app.get('/api/health/durability', (_req, res) => {
     const dataDir = process.env.DATA_DIR ?? null;
     const etDay = etDateString(new Date(now()));
     const ledger = summarizeCostAwareGate(etDay).durability;
+    // TRA-3011 — read the watermark rather than calling `statfs` here. Two reasons:
+    // the verdict stays PURE and synchronous (an open route must not fire IO per
+    // request), and the reading it grades is the one the 60s monitor took — so a
+    // STOPPED monitor surfaces as `disk_headroom` UNMEASURED instead of this route
+    // quietly re-measuring a disk nobody is alerting on.
+    const watermark = getDiskWatermark();
     const report = evaluateDurability({
       // The LEDGER's resolved dir is the truth when it has one: it is the path bytes are
       // actually appended to. `process.env.DATA_DIR` is what the operator *set*, and on a
@@ -3371,6 +3411,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       stateDb: getStateDbStatus(),
       journal: getOptionTradeJournalIntegrity(),
       ledger: { appendErrors: ledger.appendErrors },
+      disk: {
+        belowThreshold: watermark.lastBelowThreshold,
+        exhausted: watermark.lastExhausted,
+        ageSec: diskReadingAgeSec(watermark, now()),
+        belowThresholdSeen: watermark.belowThresholdSeen,
+        exhaustedSeen: watermark.exhaustedSeen,
+        readings: watermark.readings,
+        firstBelowAt: watermark.firstBelowAt,
+        lastBelowAt: watermark.lastBelowAt,
+        bootedAt: watermark.bootedAt,
+      },
     });
     res.json({
       ok: report.ok,
@@ -3385,11 +3436,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       stateDb: report.stateDb,
       journal: report.journal,
       ledger: report.ledger,
+      disk: report.disk,
       violations: report.violations,
       unmeasured: report.unmeasured,
-      note: report.ok
-        ? 'Durable state is intact: DATA_DIR is on a persistent mount, the hot-state store is open, and the journal loaded clean. Counts on this box survive a redeploy.'
-        : `NOT DURABLE${report.violations.length > 0 ? ` — broken: ${report.violations.join(', ')}` : ''}${report.unmeasured.length > 0 ? ` — unmeasured (VOIDS a grade, does not stop a boot): ${report.unmeasured.join(', ')}` : ''}. Any multi-session window read off this box is VOID. Policy is '${report.policy}' (set DURABILITY_POLICY=refuse to make a broken guarantee stop the boot).`,
+      note: durabilityNote(report),
     });
   });
 

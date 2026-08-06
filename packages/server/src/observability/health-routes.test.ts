@@ -25,6 +25,7 @@ import {
   buildOptionJournalReport,
   rollUpExitCadence,
   RTH_DECOUPLED_SHARE_FLOOR,
+  durabilityNote, // TRA-3011
   type HealthUserContext,
   type ExitCadenceRollup,
 } from './health-routes.js';
@@ -4353,5 +4354,91 @@ describe('TRA-2590 option-journal structure x exitReason cross-tab', () => {
         .reduce((a, c) => a + c.closed, 0);
       expect(sum).toBe(s.closed);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-3011 — the durability note's third state.
+//
+// From 2026-07-30T23:40Z to 2026-08-04T~21:20Z every write to /data on bqb1
+// returned ENOSPC. `/api/health/durability` served, verbatim, "Durable state is
+// intact … Counts on this box survive a redeploy" for all six days: every
+// guarantee it graded was genuinely satisfied, because it graded WHERE the bytes
+// go and never WHETHER THEY GO. Once the TRA-2817 prune freed the inodes, the
+// recovered box became byte-identical to one that was never full.
+// ---------------------------------------------------------------------------
+
+describe('durabilityNote (TRA-3011)', () => {
+  const base = {
+    ok: true,
+    policy: 'observe' as const,
+    dataDir: '/data',
+    ephemeral: false,
+    stateDb: { available: true, reason: null, initialized: true },
+    journal: { corruptLines: 0, readError: null },
+    ledger: { appendErrors: 0 },
+    violations: [],
+    unmeasured: [],
+  };
+  const cleanDisk = {
+    belowThreshold: false,
+    exhausted: null,
+    ageSec: 30,
+    belowThresholdSeen: false,
+    exhaustedSeen: null,
+    readings: 40,
+    firstBelowAt: null,
+    lastBelowAt: null,
+    bootedAt: '2026-08-06T00:55:44.111Z',
+  };
+
+  it('serves the unqualified all-clear ONLY when nothing was below since boot', () => {
+    const note = durabilityNote({ ...base, disk: cleanDisk });
+    expect(note).toMatch(/Durable state is intact/);
+    expect(note).toMatch(/stayed above the free-space threshold/);
+  });
+
+  it('★ a RECOVERED box does not get the all-clear', () => {
+    const note = durabilityNote({
+      ...base,
+      disk: {
+        ...cleanDisk,
+        belowThresholdSeen: true,
+        exhaustedSeen: 'inodes',
+        firstBelowAt: '2026-07-30T23:40:19.000Z',
+        lastBelowAt: '2026-08-04T21:20:35.000Z',
+      },
+    });
+    // The exact sentence the route published through the outage must be absent.
+    expect(note).not.toMatch(/Durable state is intact/);
+    expect(note).toMatch(/WENT BELOW THE FREE-SPACE THRESHOLD SINCE THIS BOOT/);
+    expect(note).toMatch(/inodes/);
+    expect(note).toMatch(/2026-07-30T23:40:19\.000Z/);
+    // …and it says what the operator actually needs: artifacts dated inside the
+    // window are suspect even though every count now reads clean.
+    expect(note).toMatch(/SUSPECT/);
+  });
+
+  it('a full disk RIGHT NOW reads as NOT DURABLE and names the violation', () => {
+    const note = durabilityNote({
+      ...base,
+      ok: false,
+      violations: ['data_dir_no_space'],
+      disk: { ...cleanDisk, belowThreshold: true, exhausted: 'inodes', belowThresholdSeen: true },
+    });
+    expect(note).toMatch(/^NOT DURABLE/);
+    expect(note).toMatch(/data_dir_no_space/);
+  });
+
+  it('an unmeasured disk voids the grade rather than passing it', () => {
+    const note = durabilityNote({
+      ...base,
+      ok: false,
+      unmeasured: ['disk_headroom'],
+      disk: { ...cleanDisk, belowThreshold: null, ageSec: null, readings: 0 },
+    });
+    expect(note).toMatch(/^NOT DURABLE/);
+    expect(note).toMatch(/disk_headroom/);
+    expect(note).not.toMatch(/Durable state is intact/);
   });
 });

@@ -18,6 +18,7 @@ import { join } from 'path';
 import { statfs, readFile } from 'fs/promises';
 import { appendJsonLine, LOG_DIR, logger } from './logger.js';
 import { sendOpsAlertEmail, isSmtpConfigured } from '../email.js';
+import { recordDiskReading } from './disk-watermark.js'; // TRA-3011
 
 export type AlertKey =
   | 'health-check'
@@ -394,8 +395,19 @@ export function diskMinFreePct(): number {
  * `totalBytes` is the full filesystem size including reserved blocks — so
  * `freePct` is deliberately the conservative figure the alert grades on, and
  * runs ~1-2 points below `(capacity - usage)` as a hosting dashboard reports it.
+ *
+ * TRA-3011 — every reading, INCLUDING a failed one, is folded into the since-boot
+ * low-water mark (`disk-watermark.ts`). That is a memory write, not a dispatch,
+ * so purity in the sense that matters here — no alert, no throttle consumed — is
+ * unchanged, and an anonymous poll of `/api/health/storage` still cannot fire or
+ * suppress anything. It contributes a sample, which is strictly more signal.
+ * `minFreePct` is threaded through so the watermark remembers the reading
+ * against the threshold it was actually graded by.
  */
-export async function readDiskSpace(path: string): Promise<DiskReading | null> {
+export async function readDiskSpace(
+  path: string,
+  minFreePct: number = diskMinFreePct(),
+): Promise<DiskReading | null> {
   try {
     const fs = await statfs(path);
     const totalBytes = fs.blocks * fs.bsize;
@@ -414,7 +426,7 @@ export async function readDiskSpace(path: string): Promise<DiskReading | null> {
     const inodesFree = hasInodes && Number.isFinite(fs.ffree) ? Math.max(0, fs.ffree) : null;
     const inodeFreePct =
       inodesTotal != null && inodesFree != null ? (inodesFree / inodesTotal) * 100 : null;
-    return {
+    const reading: DiskReading = {
       path,
       freeBytes,
       totalBytes,
@@ -424,7 +436,12 @@ export async function readDiskSpace(path: string): Promise<DiskReading | null> {
       inodesFree,
       inodeFreePct,
     };
+    recordDiskReading(reading, minFreePct); // TRA-3011
+    return reading;
   } catch (err) {
+    // TRA-3011 — a failed statfs is a RECORDED reading, not a missing one. An
+    // unmeasurable volume and a healthy one must not produce the same watermark.
+    recordDiskReading(null, minFreePct);
     logger.warn('disk-space read failed', {
       module: 'alerts',
       path,
@@ -442,7 +459,9 @@ export async function checkDiskSpace(
   path: string,
   minFreePct = diskMinFreePct(),
 ): Promise<DiskReading | null> {
-  const reading = await readDiskSpace(path);
+  // TRA-3011 — thread the caller's threshold, so the watermark records the
+  // reading against the bar it was actually graded by rather than the default.
+  const reading = await readDiskSpace(path, minFreePct);
   if (!reading) return null;
   const { freeBytes, totalBytes, freePct, inodesTotal, inodesFree, inodeFreePct } = reading;
   // TRA-2817 — EITHER resource being exhausted means the disk cannot be written

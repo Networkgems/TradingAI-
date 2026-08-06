@@ -66,6 +66,7 @@ import { stat, readdir } from 'fs/promises';
 import { join } from 'path';
 import type { DiskReading } from './observability/alerts.js';
 import type { DataDirUsage } from './data-dir-usage.js';
+import { getDiskWatermark, type DiskWatermark } from './observability/disk-watermark.js'; // TRA-3011
 
 /** `{ exists }` alone when the file is absent — never a fabricated zero size. */
 export interface FileStamp {
@@ -119,6 +120,23 @@ export interface StorageDiskBlock {
     ageSec: number | null;
     stalled: boolean;
   };
+  /**
+   * TRA-3011 — the SINCE-BOOT low-water mark. Every other field on this block is
+   * instantaneous, and after the 2026-07-30 → 08-04 `ENOSPC` outage that left no
+   * readable trace anywhere: the alert ring is in-memory and the box reboots
+   * several times a day, `alerts.jsonl` lives on the disk that was full, and the
+   * Render log tape retains ~7 days. Recovered and never-broken were the same
+   * reading on every field above. `belowThresholdSeen` is the one that separates
+   * them. Full numbers — gated, like every other byte figure here.
+   */
+  watermark: DiskWatermark;
+  /**
+   * TRA-3011 — the ungated half of the watermark: did this box drop below the
+   * threshold at any point since boot? A boolean, so it widens the anonymous
+   * surface by nothing a `belowThreshold: true` reading would not already have
+   * told a caller who happened to poll at the right second.
+   */
+  belowThresholdSeen: boolean;
 }
 
 /**
@@ -162,8 +180,23 @@ export const STORAGE_LIVENESS_KEYS = [
   'disk',
 ] as const;
 
-/** Ungated `disk` keys. `readable` is what gives the block a fail state. */
-export const STORAGE_LIVENESS_DISK_KEYS = ['readable', 'belowThreshold', 'monitor'] as const;
+/**
+ * Ungated `disk` keys. `readable` is what gives the block a fail state.
+ *
+ * TRA-3011 — `belowThresholdSeen` is the second deliberate widening of this list
+ * (the module header requires the decision be made twice; this is the other
+ * half). It is a since-boot boolean and carries no path, size, count or
+ * timestamp — and it is the only field on the anonymous surface that can answer
+ * "did this box run out of space?" AFTER the fact. Without it, an operator
+ * without an admin token can only ever learn that the disk is fine RIGHT NOW,
+ * which is exactly what everyone read for six days in 2026-07/08.
+ */
+export const STORAGE_LIVENESS_DISK_KEYS = [
+  'readable',
+  'belowThreshold',
+  'belowThresholdSeen',
+  'monitor',
+] as const;
 
 /** Ungated `disk.monitor` keys. `runs` is a count, so it stays gated. */
 export const STORAGE_LIVENESS_DISK_MONITOR_KEYS = ['stalled', 'ageSec'] as const;
@@ -215,6 +248,10 @@ export const STORAGE_GATED_DISK_KEYS = [
   'exhausted',
   'minFreePct',
   'error',
+  // TRA-3011 — the watermark's NUMBERS (worst free %, worst free bytes, worst
+  // free inodes, reading counts). Gated for the same reason the live figures
+  // are; only its `belowThresholdSeen` boolean escapes to the open route.
+  'watermark',
 ] as const;
 
 /**
@@ -243,6 +280,8 @@ export type StorageLivenessResponse = {
   disk: {
     readable: boolean;
     belowThreshold: boolean | null;
+    /** TRA-3011 — since THIS boot. `false` never means "not recently". */
+    belowThresholdSeen: boolean;
     monitor: { stalled: boolean; ageSec: number | null };
   };
 };
@@ -260,6 +299,7 @@ export function projectStorageLiveness(full: StorageDiagnostic): StorageLiveness
     disk: {
       readable: full.disk.readable,
       belowThreshold: full.disk.belowThreshold,
+      belowThresholdSeen: full.disk.belowThresholdSeen,
       monitor: {
         stalled: full.disk.monitor.stalled,
         ageSec: full.disk.monitor.ageSec,
@@ -278,6 +318,12 @@ export interface StorageHealthDeps {
   getUserContextCount: () => number;
   diskMinFreePct: () => number;
   readDiskSpace: (path: string) => Promise<DiskReading | null>;
+  /**
+   * TRA-3011 — since-boot low-water mark. Optional and defaulted to the real
+   * module singleton so every existing caller and test keeps compiling; inject
+   * it to drive the watermark branches without a filesystem.
+   */
+  diskWatermark?: () => DiskWatermark;
   dataDirUsage: (root: string) => Promise<DataDirUsage>;
   /** Heartbeat of `runObservabilityMonitor`, which lives in `index.ts`. */
   observabilityMonitor: () => { runs: number; lastRunAt: string | null };
@@ -348,6 +394,11 @@ export async function buildStorageDiagnostic(
   // one's throttle window.
   const minFreePct = deps.diskMinFreePct();
   const reading = await deps.readDiskSpace(dataDir);
+  // TRA-3011 — read the watermark AFTER `readDiskSpace`, so this request's own
+  // sample is already folded in and the two halves of the block cannot disagree
+  // (a `belowThreshold: true` beside a `belowThresholdSeen: false` would be the
+  // instrument contradicting itself in the one payload that has to be trusted).
+  const watermark = (deps.diskWatermark ?? getDiskWatermark)();
   const monitorState = deps.observabilityMonitor();
   const monitorAgeSec = monitorState.lastRunAt
     ? Math.round((now() - Date.parse(monitorState.lastRunAt)) / 1000)
@@ -386,6 +437,8 @@ export async function buildStorageDiagnostic(
         exhausted: diskExhaustedAxis(reading.freePct, reading.inodeFreePct, minFreePct),
         error: null,
         monitor,
+        watermark,
+        belowThresholdSeen: watermark.belowThresholdSeen,
       }
     : {
         readable: false,
@@ -405,6 +458,12 @@ export async function buildStorageDiagnostic(
         exhausted: null,
         error: 'statfs failed',
         monitor,
+        // TRA-3011 — the watermark is still published on the UNREADABLE branch,
+        // and that is the point: `statfs` failing now says nothing about what
+        // this box saw an hour ago. A short object here would drop the one field
+        // that survives the failure, exactly like the pre-TRA-2599 route did.
+        watermark,
+        belowThresholdSeen: watermark.belowThresholdSeen,
       };
 
   let usage: Record<string, unknown> | null = null;

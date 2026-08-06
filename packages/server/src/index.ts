@@ -12876,6 +12876,20 @@ void recordBootAndCheckRestarts().catch(err =>
   logger.warn('boot-history check failed', { reason: err instanceof Error ? err.message : String(err) }),
 );
 
+// TRA-3011 — seed the disk watermark at boot. The observability monitor is the
+// real feeder, but its first tick is 60s out, and `/api/health/durability` grades
+// a missing reading as `disk_headroom` UNMEASURED (correctly — unknown is not
+// fine). Without this seed every boot publishes a minute of UNMEASURED, and on a
+// box that reboots several times a day that noise is how a real UNMEASURED gets
+// ignored. `readDiskSpace` is the PURE reader: it records the sample and cannot
+// dispatch, so this seeds the watermark without burning the alert's throttle
+// window before the monitor has ever graded the disk.
+void readDiskSpace(DATA_DIR).catch(err =>
+  logger.warn('boot disk-watermark seed failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
 // TRA-851 — owns the per-ET-day dedup for user routines across scheduler ticks.
 const routineRunner = new RoutineRunner();
 

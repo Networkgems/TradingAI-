@@ -9,6 +9,18 @@
 //   3. option-journal read error           → the book serves 0 rows
 //   4. option-journal torn line            → the row is skipped
 //   5. cost-gate append throws             → the write is swallowed
+//   6. the volume is FULL                  → every write throws ENOSPC and each caller's
+//                                            own try/catch swallows it (TRA-3011)
+//
+// #6 was missing from this list until 2026-08-06, and its absence had a six-day
+// cost. From 2026-07-30T23:40Z to 2026-08-04T~21:20Z every write to `/data` on bqb1
+// returned `ENOSPC`; the EOD ledger wrote nothing across 47 books, the option-chain
+// and sentiment recorders lost two full trading days each, and THIS ROUTE served
+// `ok: true`, `violations: []`, `unmeasured: []` and the note "Durable state is
+// intact … Counts on this box survive a redeploy" the entire time. Every field it
+// grades was true: the path was persistent, the store was open, the journal loaded
+// clean. It graded WHERE the bytes go and never WHETHER THEY GO. A verdict whose
+// own name is durability had no failing state for the disk being full.
 //
 // Individually each is a reasonable local call. Together they mean the box can be
 // running with NOTHING durable under it and still look completely healthy, because
@@ -24,6 +36,9 @@
 // has to be willing to act on it. A guard protecting an invariant must fail CLOSED.
 
 import { isEphemeralDataDir } from './data-dir.js';
+// TRA-3011 — the staleness bar for a disk reading. `disk-watermark.ts` has only a
+// type-only import of its own, so this pulls in no runtime dependency.
+import { DISK_READING_MAX_AGE_SEC } from './observability/disk-watermark.js';
 
 /**
  * What the process does when durability is KNOWN BROKEN.
@@ -50,7 +65,14 @@ export type DurabilityViolation =
   /** The journal dropped unparseable lines ⇒ rows are missing and nothing decreased. */
   | 'journal_corrupt_lines'
   /** Cost-gate appends threw and were swallowed ⇒ published counts overstate disk. */
-  | 'ledger_append_errors';
+  | 'ledger_append_errors'
+  /**
+   * TRA-3011 — the volume backing DATA_DIR is below the `disk-near-full`
+   * threshold on blocks or inodes ⇒ writes are failing, or about to.
+   *
+   * Deliberately NOT in `REFUSABLE_VIOLATIONS`. See `enforceDurabilityPolicy`.
+   */
+  | 'data_dir_no_space';
 
 /**
  * A guarantee that has NOT BEEN MEASURED YET — which is not the same as a passing one,
@@ -60,7 +82,16 @@ export type DurabilityViolation =
  * reader that folds unmeasured into ok=true reproduces the exact false-green it was
  * written to catch.
  */
-export type DurabilityUnmeasured = 'journal_integrity' | 'ledger_appends';
+export type DurabilityUnmeasured =
+  | 'journal_integrity'
+  | 'ledger_appends'
+  /**
+   * TRA-3011 — no FRESH disk reading. Either nothing has ever measured the
+   * volume, `statfs` failed, or the 60s observability monitor that feeds the
+   * reading stopped ticking. All three are UNKNOWN, and the whole point of the
+   * outage this axis was added for is that unknown reads exactly like fine.
+   */
+  | 'disk_headroom';
 
 export interface StateDbStatus {
   /** The store opened and durable hot-state is live. */
@@ -69,6 +100,43 @@ export interface StateDbStatus {
   reason: string | null;
   /** False ⇒ `initStateDb` has not been called; `available:false` here means UNKNOWN, not broken. */
   initialized: boolean;
+}
+
+/**
+ * TRA-3011 — free-space headroom on the volume backing DATA_DIR, as a VERDICT
+ * plus a since-boot MEMORY. Numbers stay off this type on purpose: the byte and
+ * inode figures are gated behind admin auth on `/api/health/storage/detail`
+ * (TRA-2599) and this report is served unauthenticated.
+ */
+export interface DurabilityDiskInput {
+  /**
+   * Blocks OR inodes below the `disk-near-full` threshold RIGHT NOW.
+   *
+   * `null` ⇒ `statfs` could not read the volume — UNKNOWN, never `false`. The
+   * pre-TRA-2599 storage route dropped this key entirely on the failure branch,
+   * so `if (body.disk.belowThreshold)` read an unmeasurable filesystem as a
+   * healthy one. Same trap, so the same tri-state.
+   */
+  belowThreshold: boolean | null;
+  /** Which resource: `'blocks'`, `'inodes'`, `'blocks+inodes'`, or `null`. */
+  exhausted: 'blocks' | 'inodes' | 'blocks+inodes' | null;
+  /** Age of the reading in seconds. `null` ⇒ nothing has ever been measured. */
+  ageSec: number | null;
+  /**
+   * **The post-hoc field.** TRUE ⇒ at least one reading SINCE THIS BOOT was
+   * below the threshold, whether or not it is below now. `false` on a
+   * freshly-booted box means "not since boot", not "not recently" — read
+   * `readings` and `bootedAt` beside it.
+   */
+  belowThresholdSeen: boolean;
+  /** Axes seen below since boot, unioned. */
+  exhaustedSeen: 'blocks' | 'inodes' | 'blocks+inodes' | null;
+  /** Readings folded into the watermark. `0` is NOT MEASURED, not a pass. */
+  readings: number;
+  firstBelowAt: string | null;
+  lastBelowAt: string | null;
+  /** When the watermark started accumulating (process boot). */
+  bootedAt: string;
 }
 
 /** Everything the verdict is computed from. Omitted members are UNMEASURED, not passing. */
@@ -80,6 +148,12 @@ export interface DurabilityInputs {
   journal?: { corruptLines: number | null; readError: string | null };
   /** Cost-aware-gate swallowed-append count. Omit when the ledger has not hydrated. */
   ledger?: { appendErrors: number };
+  /**
+   * TRA-3011 — free-space headroom. Omit ⇒ `disk_headroom` is UNMEASURED, like
+   * every other omitted member. There is no "assume fine" branch here: assuming
+   * fine is precisely what this route did for six days.
+   */
+  disk?: DurabilityDiskInput;
 }
 
 export interface DurabilityReport {
@@ -98,6 +172,8 @@ export interface DurabilityReport {
   stateDb: StateDbStatus;
   journal: { corruptLines: number | null; readError: string | null } | null;
   ledger: { appendErrors: number } | null;
+  /** TRA-3011 — the disk headroom verdict + watermark. `null` ⇒ not supplied. */
+  disk: DurabilityDiskInput | null;
   /** Known-broken guarantees. `enforceDurabilityPolicy` refuses on these. */
   violations: DurabilityViolation[];
   /** Not-yet-measurable guarantees. These VOID a grade; they never refuse a boot. */
@@ -137,6 +213,27 @@ export function evaluateDurability(
     violations.push('ledger_append_errors');
   }
 
+  // TRA-3011 — the disk axis. THREE states, and the middle one is the whole point:
+  //
+  //   absent / unreadable / STALE  → `disk_headroom` UNMEASURED (voids a grade)
+  //   below the threshold          → `data_dir_no_space` VIOLATION
+  //   fresh and above              → nothing
+  //
+  // Staleness is graded here rather than at the call site because the reader is
+  // the 60s observability monitor: a stopped monitor produces a reading that is
+  // permanently `belowThreshold: false` and permanently WRONG, and its last
+  // healthy sample would otherwise keep certifying a disk nobody is watching.
+  if (
+    inputs.disk === undefined
+    || inputs.disk.ageSec === null
+    || inputs.disk.ageSec > DISK_READING_MAX_AGE_SEC
+    || inputs.disk.belowThreshold === null
+  ) {
+    unmeasured.push('disk_headroom');
+  } else if (inputs.disk.belowThreshold) {
+    violations.push('data_dir_no_space');
+  }
+
   return {
     ok: violations.length === 0 && unmeasured.length === 0,
     policy: resolveDurabilityPolicy(env),
@@ -145,6 +242,7 @@ export function evaluateDurability(
     stateDb: inputs.stateDb,
     journal: inputs.journal ?? null,
     ledger: inputs.ledger ?? null,
+    disk: inputs.disk ?? null,
     violations,
     unmeasured,
   };
@@ -162,6 +260,31 @@ export class DurabilityRefusedError extends Error {
 }
 
 /**
+ * TRA-3011 — the violations a `refuse` policy will actually stop a boot over.
+ *
+ * `data_dir_no_space` is the one that is graded but NOT refusable, and the
+ * asymmetry is deliberate. Every other violation here is a CONFIGURATION fault:
+ * an ephemeral DATA_DIR, a missing native module, a corrupt journal. The box
+ * cannot fix any of them by running, so refusing costs nothing that was not
+ * already lost.
+ *
+ * A full disk is a RUNTIME condition, and the box demonstrably CAN fix it by
+ * running: the TRA-2817 backup prune is what ended the 2026-07-30 outage, and it
+ * only runs inside a live process. Refusing would take the box down, PM2 would
+ * cycle it into `max_restarts`, and the health surface this ticket exists to add
+ * would go dark at exactly the moment someone needs to read it — turning a
+ * degraded box into a total outage with no instrument. Grade it, alert on it,
+ * publish the watermark; do not make it a suicide switch.
+ */
+export const REFUSABLE_VIOLATIONS: readonly DurabilityViolation[] = [
+  'data_dir_ephemeral',
+  'state_db_unavailable',
+  'journal_read_error',
+  'journal_corrupt_lines',
+  'ledger_append_errors',
+];
+
+/**
  * The fail-CLOSED half. Throws when the policy says `refuse` and a guarantee is KNOWN
  * BROKEN.
  *
@@ -169,9 +292,13 @@ export class DurabilityRefusedError extends Error {
  * read yet, so its integrity is legitimately unknown — refusing over a measurement that
  * cannot exist yet would make the process unbootable by construction. `unmeasured` VOIDS
  * A GRADE (see `ok`); it does not stop a boot.
+ *
+ * TRA-3011 — and it refuses only on `REFUSABLE_VIOLATIONS`. A violation that is
+ * self-healing while the process runs is reported, never fatal.
  */
 export function enforceDurabilityPolicy(report: DurabilityReport): void {
-  if (report.policy === 'refuse' && report.violations.length > 0) {
-    throw new DurabilityRefusedError(report.violations);
+  const refusable = report.violations.filter((v) => REFUSABLE_VIOLATIONS.includes(v));
+  if (report.policy === 'refuse' && refusable.length > 0) {
+    throw new DurabilityRefusedError(refusable);
   }
 }

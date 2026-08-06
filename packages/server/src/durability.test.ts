@@ -16,12 +16,32 @@ import {
 const DURABLE_ENV = { DATA_DIR: '/data' } as NodeJS.ProcessEnv;
 const OPEN_DB = { available: true, reason: null, initialized: true };
 
+// TRA-3011 — a fresh, healthy disk reading. `ageSec` inside the staleness bar.
+const HEALTHY_DISK: NonNullable<DurabilityInputs['disk']> = {
+  belowThreshold: false,
+  exhausted: null,
+  ageSec: 30,
+  belowThresholdSeen: false,
+  exhaustedSeen: null,
+  readings: 42,
+  firstBelowAt: null,
+  lastBelowAt: null,
+  bootedAt: '2026-08-06T00:00:00.000Z',
+};
+
+function disk(
+  over: Partial<NonNullable<DurabilityInputs['disk']>> = {},
+): NonNullable<DurabilityInputs['disk']> {
+  return { ...HEALTHY_DISK, ...over };
+}
+
 function inputs(over: Partial<DurabilityInputs> = {}): DurabilityInputs {
   return {
     dataDir: '/data',
     stateDb: OPEN_DB,
     journal: { corruptLines: 0, readError: null },
     ledger: { appendErrors: 0 },
+    disk: HEALTHY_DISK,
     ...over,
   };
 }
@@ -140,8 +160,121 @@ describe('durability enforcement (TRA-1681)', () => {
       { DATA_DIR: '/data', DURABILITY_POLICY: 'refuse' } as NodeJS.ProcessEnv,
     );
     expect(r.ok).toBe(false);
-    expect(r.unmeasured).toEqual(['journal_integrity', 'ledger_appends']);
+    expect(r.unmeasured).toEqual(['journal_integrity', 'ledger_appends', 'disk_headroom']);
     expect(r.violations).toEqual([]);
     expect(() => enforceDurabilityPolicy(r)).not.toThrow();
+  });
+});
+
+// ── TRA-3011 — the sixth fail-open: the volume is FULL ───────────────────────
+//
+// From 2026-07-30T23:40Z to 2026-08-04T~21:20Z every write to `/data` on bqb1
+// returned ENOSPC. This verdict served `ok: true, violations: [], unmeasured: []`
+// the entire time, because every guarantee it graded was genuinely satisfied: the
+// path was persistent, the store was open, the journal loaded clean. It graded
+// WHERE the bytes go and never WHETHER THEY GO.
+describe('durability disk axis (TRA-3011)', () => {
+  it('★ reproduces the outage: everything else healthy, disk full ⇒ NOT ok', () => {
+    // The exact shape of the 2026-07-30 box. Before this axis existed, this
+    // input produced `ok: true` — there was no value of the disk that could have
+    // made it fail, which is what makes it a blind spot rather than a bug.
+    const r = evaluateDurability(
+      inputs({ disk: disk({ belowThreshold: true, exhausted: 'inodes', belowThresholdSeen: true }) }),
+      DURABLE_ENV,
+    );
+    expect(r.violations).toEqual(['data_dir_no_space']);
+    expect(r.ok).toBe(false);
+    // The rest of the verdict is untouched — this is additive, not a reweighting.
+    expect(r.ephemeral).toBe(false);
+    expect(r.stateDb.available).toBe(true);
+  });
+
+  it('the negative control: the same box with headroom is ok', () => {
+    const r = evaluateDurability(inputs(), DURABLE_ENV);
+    expect(r.violations).toEqual([]);
+    expect(r.unmeasured).toEqual([]);
+    expect(r.ok).toBe(true);
+    expect(r.disk?.belowThreshold).toBe(false);
+  });
+
+  it('an ABSENT, UNREADABLE or STALE reading is UNMEASURED — never a pass', () => {
+    // Three ways to have no fresh reading, one verdict. `unknown` is not `off`.
+    expect(evaluateDurability(inputs({ disk: undefined }), DURABLE_ENV).unmeasured).toContain(
+      'disk_headroom',
+    );
+    // statfs failed — the tri-state that the pre-TRA-2599 storage route erased.
+    expect(
+      evaluateDurability(inputs({ disk: disk({ belowThreshold: null }) }), DURABLE_ENV).unmeasured,
+    ).toContain('disk_headroom');
+    // Nothing has ever measured it.
+    expect(
+      evaluateDurability(inputs({ disk: disk({ ageSec: null, readings: 0 }) }), DURABLE_ENV).unmeasured,
+    ).toContain('disk_headroom');
+    // The 60s monitor that feeds the reading stopped: the last sample is stale
+    // and permanently `false`, so it would otherwise certify a disk nobody is
+    // watching. 180s is the same stall bar `/api/health/storage` grades on.
+    expect(
+      evaluateDurability(inputs({ disk: disk({ ageSec: 181 }) }), DURABLE_ENV).unmeasured,
+    ).toContain('disk_headroom');
+    // …and the boundary is inclusive on the passing side, so a monitor ticking
+    // exactly on time is not perpetually unmeasured.
+    expect(
+      evaluateDurability(inputs({ disk: disk({ ageSec: 180 }) }), DURABLE_ENV).unmeasured,
+    ).toEqual([]);
+  });
+
+  it('a full disk is GRADED but NEVER refuses a boot, unlike every other violation', () => {
+    // The asymmetry, and the reason it is not an oversight: a configuration
+    // fault cannot heal by running, so refusing costs nothing already lost. A
+    // full disk CAN heal by running — the TRA-2817 backup prune is what ended
+    // the 2026-07-30 outage, and it only runs inside a live process. Refusing
+    // would cycle the box into PM2's max_restarts and take the health surface
+    // this ticket adds dark at exactly the moment someone needs to read it.
+    const full = evaluateDurability(
+      inputs({ disk: disk({ belowThreshold: true, exhausted: 'blocks' }) }),
+      { DATA_DIR: '/data', DURABILITY_POLICY: 'refuse' } as NodeJS.ProcessEnv,
+    );
+    expect(full.policy).toBe('refuse');
+    expect(full.violations).toEqual(['data_dir_no_space']);
+    expect(() => enforceDurabilityPolicy(full)).not.toThrow();
+
+    // The control that proves the filter is not just swallowing everything: a
+    // configuration fault alongside it still refuses.
+    const alsoEphemeral = evaluateDurability(
+      {
+        ...inputs({ disk: disk({ belowThreshold: true, exhausted: 'blocks' }) }),
+        dataDir: '/app/packages/server/data',
+      },
+      { DURABILITY_POLICY: 'refuse' } as NodeJS.ProcessEnv,
+    );
+    expect(alsoEphemeral.violations).toContain('data_dir_no_space');
+    expect(() => enforceDurabilityPolicy(alsoEphemeral)).toThrow(DurabilityRefusedError);
+    // And the thrown message names ONLY the refusable one, so the remediation
+    // it prints is the one that actually applies.
+    expect(() => enforceDurabilityPolicy(alsoEphemeral)).toThrow(/data_dir_ephemeral/);
+    expect(() => enforceDurabilityPolicy(alsoEphemeral)).not.toThrow(/data_dir_no_space/);
+  });
+
+  it('carries the since-boot watermark through to the report for the RECOVERED case', () => {
+    // A box that filled and was pruned back reads clean on every instantaneous
+    // field. `belowThresholdSeen` is the only thing that says otherwise, so the
+    // report has to carry it rather than collapsing the disk block to a verdict.
+    const r = evaluateDurability(
+      inputs({
+        disk: disk({
+          belowThreshold: false,
+          belowThresholdSeen: true,
+          exhaustedSeen: 'inodes',
+          firstBelowAt: '2026-08-06T01:00:00.000Z',
+          lastBelowAt: '2026-08-06T02:00:00.000Z',
+        }),
+      }),
+      DURABLE_ENV,
+    );
+    // `ok` is TRUE — the disk is genuinely fine NOW, and claiming otherwise
+    // would make the verdict unusable for the rest of its job.
+    expect(r.ok).toBe(true);
+    expect(r.disk?.belowThresholdSeen).toBe(true);
+    expect(r.disk?.exhaustedSeen).toBe('inodes');
   });
 });
