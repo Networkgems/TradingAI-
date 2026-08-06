@@ -68,6 +68,15 @@ let withTheoRaw = 0;
 let classFlips = 0;
 let cheapGateNewFires = 0; // repaired=cheap, raw≠cheap (repair OPENED the gate)
 let cheapGateLostFires = 0; // raw=cheap, repaired≠cheap (repair CLOSED the gate)
+// TRA-2918 — the DENOMINATOR of the flip count, and the reason this exists:
+// `classification flips: 0` reads IDENTICALLY in two completely different worlds
+// — (a) the repair moved rows and none of them crossed a gate boundary, which is
+// the informative result this acceptance item is asking for, and (b) the repair
+// moved NOTHING in this pull, which makes the flip count vacuous. Without
+// `rowsRepaired` the reader cannot tell them apart, and a vacuous zero would be
+// reported as "the repair is entry-gate-neutral".
+let rowsRepaired = 0; // theo !== theoRaw
+let rowsUnclassifiable = 0; // classify() returned null on either surface
 const flipRows = [];
 
 for (const symbol of SYMBOLS) {
@@ -90,11 +99,12 @@ for (const symbol of SYMBOLS) {
     totalCandidates += 1;
     if (!Number.isFinite(c.theoRaw)) continue;
     withTheoRaw += 1;
+    if (c.theo !== c.theoRaw) rowsRepaired += 1;
 
     // Re-derive theo-basis pct for both repaired and raw theo
     const repairedClass = classify(c.mark, c.theo);
     const rawClass = classify(c.mark, c.theoRaw);
-    if (repairedClass === null || rawClass === null) continue;
+    if (repairedClass === null || rawClass === null) { rowsUnclassifiable += 1; continue; }
 
     if (rawClass !== repairedClass) {
       classFlips += 1;
@@ -124,6 +134,8 @@ for (const symbol of SYMBOLS) {
 
 console.log(`\n[entry-gate-replay] total candidates        : ${totalCandidates}`);
 console.log(`[entry-gate-replay] with theoRaw             : ${withTheoRaw}`);
+console.log(`[entry-gate-replay] ROWS REPAIRED            : ${rowsRepaired}  <-- the flip count's denominator; 0 here makes the flip count VACUOUS`);
+console.log(`[entry-gate-replay] unclassifiable rows      : ${rowsUnclassifiable}  (no verdict on either surface — excluded from the flip count, not counted as 'no flip')`);
 console.log(`[entry-gate-replay] classification flips     : ${classFlips}  (cheap/fair/expensive changed)`);
 console.log(`[entry-gate-replay] cheap gate new fires     : ${cheapGateNewFires}  (repaired=cheap, raw≠cheap — repair OPENED gate)`);
 console.log(`[entry-gate-replay] cheap gate lost fires    : ${cheapGateLostFires}  (raw=cheap, repaired≠cheap — repair CLOSED gate)`);
@@ -137,6 +149,17 @@ if (flipRows.length > 0) {
         `rawPct=${r.rawPct} repPct=${r.repPct} ${r.rawClass}→${r.repairedClass}`,
     );
   }
+} else if (rowsRepaired === 0) {
+  // ⛔ Do NOT report this as "the repair is entry-gate-neutral". The repair moved
+  // nothing in this pull, so the flip count had nothing to count and carries no
+  // information about gate behaviour either way. Exit 5 keeps it out of the PASS
+  // bucket: a vacuous zero must not be graded as a clean result.
+  console.log(`\n[entry-gate-replay] VACUOUS — the repair changed 0 of ${withTheoRaw} rows in this pull,`);
+  console.log(`[entry-gate-replay] so "0 flips" is arithmetic, not evidence. Re-pull when the surface`);
+  console.log(`[entry-gate-replay] actually violates monotonicity (check:theo-arb reports repair reach).`);
+  process.exit(5);
 } else {
-  console.log(`\n[entry-gate-replay] no classification flips — repair did not change any entry gate decision.`);
+  console.log(`\n[entry-gate-replay] no classification flips — the repair moved ${rowsRepaired} of ${withTheoRaw} rows`);
+  console.log(`[entry-gate-replay] and NONE of them crossed a gate boundary. This is a real result: the`);
+  console.log(`[entry-gate-replay] repair is entry-gate-neutral on this capture.`);
 }
