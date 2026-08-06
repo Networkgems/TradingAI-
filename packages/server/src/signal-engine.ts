@@ -7271,6 +7271,32 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3117 — the RUNTIME live-options arm state, as the engine actually holds
+   * it. These three fields are the live entry gate itself (`liveOptionsMirroring`
+   * above): a book opens a live options order iff all three are true.
+   *
+   * This is published per-book by `/api/health/options-live` so "is this book
+   * armed?" is a GET. It is deliberately the ENGINE's in-memory state rather
+   * than a re-derivation from settings: the two can legitimately disagree (a
+   * boot-arm whose force-persist threw leaves the engine Live while disk stays
+   * demoted — TRA-2649), and the engine trades off THIS one. The census reports
+   * both and flags the disagreement rather than picking a winner.
+   *
+   * Read-only: returns booleans, never the client or its credentials.
+   */
+  getLiveOptionsArmState(): {
+    mode: 'demo' | 'live';
+    optionsRouted: boolean;
+    clientPresent: boolean;
+  } {
+    return {
+      mode: this.mode,
+      optionsRouted: this.tradierLiveOptionsEnabled,
+      clientPresent: this.tradierLiveClient !== null,
+    };
+  }
+
+  /**
    * TRA-2956 — withdrawal telemetry, summed across both broker books for the
    * options-live health route. Mirrors {@link getAbandonedStagedExitStats}.
    */
@@ -8708,7 +8734,20 @@ export class SignalEngine {
             .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
           if (availCandidates.length === 0) {
             surfaceOtmLiveSkip('OTM live test skipped — no live Tradier balance snapshot to size against (fail-closed)');
-            log.warn('live OTM bounded test: no balance snapshot', { sym });
+            // TRA-3117 — carry `username`. This line is the ONLY trace a live
+            // book with an unarmed order client leaves, and without the owner it
+            // cannot be attributed to a book: on a fleet of 60+ engines it says
+            // "some live book is unarmed" and nothing more. That is precisely the
+            // question the per-book census on /api/health/options-live answers,
+            // and the log has to be joinable to it.
+            // `alertUsername` is the same string the options account stamps as a
+            // journal `account` (TRA-1475), so the log joins to the census rows
+            // and to the journal without a translation table. `null` (not "") when
+            // unbound, so an unattributable line stays visibly unattributable.
+            log.warn('live OTM bounded test: no balance snapshot', {
+              sym,
+              username: this.alertUsername ?? null,
+            });
             continue;
           }
           const availableCash = Math.min(...availCandidates);
@@ -16390,6 +16429,88 @@ export class SignalEngine {
 }
 
 /**
+ * TRA-3117 — the credential resolution behind the live options ORDER client,
+ * as data, so it can be READ without constructing a client or placing an order.
+ *
+ * This exists because the arming state of a live book was previously only
+ * observable by building the client. `/api/health/options-live` therefore
+ * hand-copied this precedence chain inline, for the pinned operator only, and a
+ * copy is free to drift from the original — the mirrored-gate failure mode
+ * (TRA-2864): an instrument that agrees with itself rather than with the code
+ * it measures. {@link buildTradierLiveClient} and the per-book census now both
+ * call THIS, so they cannot disagree about whether a book is armed.
+ *
+ * ⚠️ `apiToken` is a live real-money credential. It is returned because the
+ * client constructor needs it; NO route may publish it. The census publishes
+ * presence booleans and a masked account-id tail only (TRA-2163).
+ *
+ * Note this deliberately does NOT check `settings.mode`. Mode is the caller's
+ * gate — the census needs to distinguish "demo book" from "live book whose
+ * creds do not resolve", and folding mode in here would render those two
+ * identical, which is the exact confusion TRA-3117 was filed to end.
+ */
+export interface LiveOptionsCredResolution {
+  /** The env these creds address — `production` is the real-money one. */
+  env: TradierEnv;
+  /** TRA-857: may this user fall back to the shared `process.env` TRADIER_*? */
+  allowEnvFallback: boolean;
+  /** Per-user SAVED creds resolved for `env` (presence is the published fact). */
+  savedKey: boolean;
+  savedAccount: boolean;
+  /** Effective creds after the operator-scoped env fallback. Never published. */
+  apiToken: string;
+  accountId: string;
+  /** Both creds resolved ⇒ a client would construct (given live mode). */
+  credentialsResolved: boolean;
+}
+
+export function resolveLiveOptionsCreds(
+  settings: AccountSettings,
+  username: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): LiveOptionsCredResolution {
+  // TRA-226 — sandbox/production credentials live on separate fields. The
+  // shared resolver returns the pair matching the currently selected env; we
+  // layer env-var fallbacks here for deployments that bootstrapped Tradier
+  // creds via env (TRADIER_*).
+  const resolved = resolveTradierOptionsCreds(settings);
+  const tradierEnv = resolved.env;
+  // TRA-857 — like the equity client, this is a real-money LIVE order client.
+  // Scope the shared `process.env` TRADIER_* fallback to the pinned operator so
+  // a fresh non-operator Live user never inherits the operator's options
+  // account (same multi-tenant leak class as TRA-856). Per-user saved creds are
+  // unaffected and continue to work for any user.
+  const allowEnvFallback = isLiveBrokerOperator(username, env);
+  const apiToken = (
+    resolved.apiToken
+    || (allowEnvFallback
+      ? (tradierEnv === 'production'
+        ? env['TRADIER_API_TOKEN']
+        : (env['TRADIER_SANDBOX_API_TOKEN'] ?? env['TRADIER_API_TOKEN']))
+      : '')
+    || ''
+  ).trim();
+  const accountId = (
+    resolved.accountId
+    || (allowEnvFallback
+      ? (tradierEnv === 'production'
+        ? env['TRADIER_ACCOUNT_ID']
+        : (env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? env['TRADIER_ACCOUNT_ID']))
+      : '')
+    || ''
+  ).trim();
+  return {
+    env: tradierEnv,
+    allowEnvFallback,
+    savedKey: resolved.apiToken.length > 0,
+    savedAccount: resolved.accountId.length > 0,
+    apiToken,
+    accountId,
+    credentialsResolved: apiToken.length > 0 && accountId.length > 0,
+  };
+}
+
+/**
  * Build the Tradier options client used to mirror live RV opens (TRA-221).
  *
  * Returns `null` whenever the engine should NOT mirror to Tradier:
@@ -16398,45 +16519,17 @@ export class SignalEngine {
  *
  * Credential precedence — per-options settings → env vars (matches
  * relative-value-scanner.ts so a working RV scanner pair also enables live
- * order placement without re-entering creds).
+ * order placement without re-entering creds). TRA-3117 moved that chain into
+ * {@link resolveLiveOptionsCreds} so a read-only probe can replicate it exactly.
  */
 function buildTradierLiveClient(
   settings: AccountSettings,
   username: string | undefined,
 ): TradierOptionsClient | null {
   if (settings.mode !== 'live') return null;
-  // TRA-226 — sandbox/production credentials live on separate fields. The
-  // shared resolver returns the pair matching the currently selected env; we
-  // layer env-var fallbacks here for deployments that bootstrapped Tradier
-  // creds via env (TRADIER_*).
-  const resolved = resolveTradierOptionsCreds(settings);
-  const env = resolved.env;
-  // TRA-857 — like the equity client, this is a real-money LIVE order client.
-  // Scope the shared `process.env` TRADIER_* fallback to the pinned operator so
-  // a fresh non-operator Live user never inherits the operator's options
-  // account (same multi-tenant leak class as TRA-856). Per-user saved creds are
-  // unaffected and continue to work for any user.
-  const allowEnvFallback = isLiveBrokerOperator(username);
-  const apiToken = (
-    resolved.apiToken
-    || (allowEnvFallback
-      ? (env === 'production'
-        ? process.env['TRADIER_API_TOKEN']
-        : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
-      : '')
-    || ''
-  ).trim();
-  const accountId = (
-    resolved.accountId
-    || (allowEnvFallback
-      ? (env === 'production'
-        ? process.env['TRADIER_ACCOUNT_ID']
-        : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
-      : '')
-    || ''
-  ).trim();
-  if (!apiToken || !accountId) return null;
-  return new TradierOptionsClient(apiToken, accountId, env);
+  const resolved = resolveLiveOptionsCreds(settings, username);
+  if (!resolved.credentialsResolved) return null;
+  return new TradierOptionsClient(resolved.apiToken, resolved.accountId, resolved.env);
 }
 
 /**

@@ -242,6 +242,8 @@ import {
   summarizeLiveBrokerPositionDrift,
   worseBrokerDriftStatus,
 } from './live-broker-position-drift.js';
+// TRA-3117 — per-book live-arm census for /api/health/options-live.
+import { summarizeLiveArmCensus } from './live-arm-census.js';
 import { runLiveOptionsFeeReconcile } from './live-options-fee-reconcile.js'; // TRA-2810/TRA-2850
 import { fetchCrypto4hBars } from './crypto-feed.js';
 import type { CryptoSignalEngine } from './crypto-engine.js';
@@ -9380,6 +9382,22 @@ app.get('/api/health/options-live', async (_req, res) => {
     // stay strictly minimal to match the secrets-free probe contract.
     const optionsAccountIdTail =
       effectiveAccountId.length >= 4 ? `***${effectiveAccountId.slice(-4)}` : (effectiveAccountId ? '***' : null);
+    // TRA-3117 — the PER-BOOK live-arm census. Everything above this line is the
+    // OPERATOR's row and always was; a second live book was invisible on every
+    // instrument this host carries (see live-arm-census.ts for why each of the
+    // three candidates failed). Classified off `loadSettings` — the DURABLE
+    // store, never `getSettings`, whose cache miss serves
+    // `DEFAULT_ACCOUNT_SETTINGS` and would silently empty the live cohort
+    // (TRA-2761, the same trap `/api/health/pnl-reconciliation` documents).
+    const liveArmCensus = summarizeLiveArmCensus(
+      await Promise.all(
+        getAllUserContexts().map(async ctx => ({
+          username: ctx.username,
+          settings: await loadSettings(ctx.username),
+          runtime: ctx.engine.getLiveOptionsArmState(),
+        })),
+      ),
+    );
     res.json({
       ok: true,
       issue: 'TRA-1581',
@@ -9387,6 +9405,10 @@ app.get('/api/health/options-live', async (_req, res) => {
       build: resolveBuildInfo(),
       operator,
       mode,
+      // TRA-3117 — read THIS, not the operator fields, to answer "is any book
+      // armed, and whose money does it point at". The operator block below
+      // describes exactly one book and cannot go false for a second one.
+      liveArmCensus,
       // The two facts the board's Monday canary prereq turns on:
       optionsBrokerEnv,
       optionsBrokerConfigured,
