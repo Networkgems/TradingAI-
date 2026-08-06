@@ -18,6 +18,9 @@ import { shouldAutoConfirm } from '@trading-app/shared';
 // sub-2.0 corporate action (neither ratio nor continuity can, at any threshold).
 import { assessQuotePlausibility, SUSPECT_MOVE_RATIO, describeCorporateAction } from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
+// TRA-3112 — the single copy of the market-data / account endpoint-class split.
+// This module imports nothing back from here, so there is no cycle.
+import { resolveTradierAccountCreds } from './tradier-client-scope.js';
 // TRA-544 (TRA-529 P1) / TRA-747 (P2) — advisory multi-agent layer. ON suspends
 // deterministic auto-routing and the engine surfaces the recommendations on the
 // WS state. P2 wires the REAL LlmClient-backed agents (Haiku analysts + Sonnet
@@ -3275,7 +3278,7 @@ export class SignalEngine {
       this.liveTradeEquitiesTradier = resolveLiveTradeEquitiesTradier(settings);
       this.liveEquityDcaAddsEnabled = resolveLiveEquityDcaAddsTradier(settings); // TRA-1305 (OFF by default)
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(settings, this.alertUsername);
-      this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
+      this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings, this.alertUsername);
       // TRA-505 — seed the watchlist quote feed from the saved Tradier creds at
       // boot so quotes use Tradier (not Yahoo's rate-limited free feed) from the
       // first tick, without waiting for the next Settings save.
@@ -3414,7 +3417,7 @@ export class SignalEngine {
     // TRA-352 follow-up — same for the per-env clients used by the pending-
     // close reconciler, so a fresh token saved mid-session is picked up on
     // the next tick.
-    this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings);
+    this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(settings, this.alertUsername);
     // TRA-336 — re-read the markets selector so flipping
     // Options/Equity/Both in Settings takes effect on the next tick.
     this.tradierLiveOptionsEnabled = isLiveTradierOptionsEnabled(settings);
@@ -13147,6 +13150,14 @@ export class SignalEngine {
     if (changed && this.lastSettings) {
       this.tradierLiveClient = buildTradierLiveClient(this.lastSettings, username);
       this.tradierLiveEquityClient = buildTradierLiveEquityClient(this.lastSettings, username);
+      // ⛔ TRA-3112 — the per-env ACCOUNT clients are now operator-pinned too, so
+      // they are subject to the same constructor-ordering trap as the two above:
+      // built before this binding they resolve with username `undefined`, i.e.
+      // non-operator, i.e. null. Without this line the OPERATOR's own pending-close
+      // reconciler, portfolio reconcile and broker-drift detector would sit dark
+      // until the next settings save — a guard that refuses everyone, which is
+      // AC#4's whole point. This is the negative control's code path.
+      this.tradierOptionsClientByEnv = buildTradierOptionsClientsByEnv(this.lastSettings, username);
     }
   }
 
@@ -16438,45 +16449,39 @@ function buildTradierLiveClient(
  * precedence in {@link buildTradierLiveClient} so both code paths see the
  * same auth.
  */
-function buildTradierOptionsClientForEnv(
+function buildTradierAccountClientForEnv(
   settings: AccountSettings,
   env: TradierEnv,
+  username: string | undefined,
 ): TradierOptionsClient | null {
-  // TRA-714: use `||` (not `??`) so a BLANK saved cred ('' — the default for a
-  // user who configured Tradier only via env vars) falls through to the env-var
-  // fallback. With `??`, an empty-string field short-circuits and the env
-  // fallback never runs, leaving the options/ideas feed stuck on "no Tradier
-  // options credentials" even when TRADIER_* env vars are set. This now mirrors
-  // the equity client `buildTradierLiveClient` above, whose `||` precedence
-  // already handles blanks correctly.
-  const apiToken = (
-    (env === 'production'
-      ? settings.liveApiKeyOptionsProduction
-      : (settings.liveApiKeyOptionsSandbox || settings.liveApiKeyOptions))
-    || (env === 'production'
-      ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] || process.env['TRADIER_API_TOKEN']))
-    || ''
-  ).trim();
-  const accountId = (
-    (env === 'production'
-      ? settings.liveAccountIdOptionsProduction
-      : (settings.liveAccountIdOptionsSandbox || settings.liveAccountIdOptions))
-    || (env === 'production'
-      ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] || process.env['TRADIER_ACCOUNT_ID']))
-    || ''
-  ).trim();
-  if (!apiToken || !accountId) return null;
-  return new TradierOptionsClient(apiToken, accountId, env);
+  // ⛔ TRA-3112 — this is the SIBLING copy. It and the one in `index.ts` had
+  // identical un-scoped bodies, and TRA-3110's write-up cited only this one — a
+  // fix applied here alone would have left `POST /api/tradier/positions/sync`
+  // fully exploitable while reading as fixed. Both now delegate to the single
+  // resolver in `tradier-client-scope.ts` so they cannot drift apart again.
+  //
+  // ACCOUNT surface, and only that: every consumer of
+  // `tradierOptionsClientByEnv` calls `readOpenOptionPositions`,
+  // `listOpenOptionPositions`, `sellContractsLimit`, `cancelOrder` or
+  // `getOrderStatus` — all `/accounts/{id}/*`. There is no market-data consumer
+  // on this path, so there is no market-data builder here; `/api/options/ideas`
+  // (the one caller that needs the open fallback) lives in `index.ts`.
+  //
+  // The pin matches `buildTradierLiveClient` above (TRA-857): per-user SAVED
+  // creds keep working for everyone, only the shared `process.env.TRADIER_*`
+  // inheritance is operator-only.
+  const resolved = resolveTradierAccountCreds(settings, env, isLiveBrokerOperator(username));
+  if (!resolved.ok) return null;
+  return new TradierOptionsClient(resolved.creds.apiToken, resolved.creds.accountId, env);
 }
 
 function buildTradierOptionsClientsByEnv(
   settings: AccountSettings,
+  username: string | undefined,
 ): Record<TradierEnv, TradierOptionsClient | null> {
   return {
-    sandbox: buildTradierOptionsClientForEnv(settings, 'sandbox'),
-    production: buildTradierOptionsClientForEnv(settings, 'production'),
+    sandbox: buildTradierAccountClientForEnv(settings, 'sandbox', username),
+    production: buildTradierAccountClientForEnv(settings, 'production', username),
   };
 }
 

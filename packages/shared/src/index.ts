@@ -2619,6 +2619,20 @@ export interface OptionPosition {
    * view can segregate sandbox vs production state when the user flips
    * `liveTradierEnvOptions`. Optional for backwards compat with snapshots
    * persisted before this field existed; absent ↔ legacy sandbox bucket.
+   *
+   * ⛔ TRA-3112 item 3 — ON AN IMPORTED ROW THIS IS THE ONLY HONEST ENV FIELD.
+   * `mode` is stamped `'live'` UNCONDITIONALLY by the Tradier import
+   * (`/api/tradier/positions/sync` → `reconcileTradierPositions(env, …, 'live')`),
+   * so a demo book importing its own SANDBOX account produces rows whose `mode`
+   * says `'live'`. Any census that partitions imported rows on `mode` therefore
+   * reads perfectly clean while production imports sit on non-operator books —
+   * the instrument defect underneath the TRA-3110 security defect.
+   *
+   * Partition on `importedFromTradier && tradierEnv`, never on `mode`. This field
+   * is minted from the OWNING BUCKET (`PaperOptionsAccount.tradierEnv`, fixed
+   * `'sandbox'` / `'production'` at engine construction), which is exactly the
+   * `env` the sync route resolved — see `tra3112-tradier-client-scope.test.ts`,
+   * which grades that equality rather than assuming it.
    */
   tradierEnv?: TradierEnv;
   /**
@@ -2640,23 +2654,6 @@ export interface OptionPosition {
    * paper cash bucket. Absent ↔ legacy or engine-opened position.
    */
   importedFromTradier?: boolean;
-  /**
-   * TRA-3112 item 3 — the Tradier env the import was pulled FROM.
-   *
-   * `mode` is stamped `'live'` unconditionally on every imported row
-   * (`/api/tradier/positions/sync` → `reconcileTradierPositions(env, …, 'live')`),
-   * so a demo book importing its own SANDBOX account produces rows that are
-   * indistinguishable from production ones to anything partitioning on `mode`.
-   * A fleet census that partitions on `mode` therefore reads perfectly clean
-   * while real production imports sit on non-operator books — the instrument
-   * defect underneath the TRA-3110 security defect.
-   *
-   * Set only on rows minted/refreshed by the Tradier import reconcile. Absent ⇔
-   * engine-opened, or an imported row persisted before this field existed — so
-   * absence is UNKNOWN, never "sandbox". A census must count the unlabelled
-   * cohort rather than fold it into either bucket.
-   */
-  importedFromEnv?: TradierEnv;
   /**
    * TRA-3078 — the option-trade-journal row id this position's PARTIAL and
    * CLOSE rows must be written to. Absent ⇔ unresolved; present and equal to

@@ -309,6 +309,15 @@ import { evaluateDurability, enforceDurabilityPolicy } from './durability.js'; /
 import { checkThrottle, recordFailure, recordSuccess } from './auth-throttle.js';
 import { getSettings, loadSettings, mergeScopedRiskSettings, saveSettings } from './account-settings.js';
 import { resolveLiveBrokerOperator, isLiveBrokerOperator, shouldBootArmLiveEquity, resolveLiveBrokerArmDrift, applyLiveBrokerArm } from './signal-engine.js';
+// TRA-3112 — the ONE copy of the market-data / account endpoint-class split that
+// decides whether the shared `process.env.TRADIER_*` fallback is lendable.
+import {
+  resolveTradierMarketDataCreds,
+  resolveTradierAccountCreds,
+  resolveTradierAccountCredsFromSaved,
+  decideTradierAccountRefusalResponse,
+  type TradierAccountScopeRefusal,
+} from './tradier-client-scope.js';
 import {
   initNotificationDispatcher,
   emitAlert,
@@ -2351,7 +2360,8 @@ async function reconcileTradierOptionsHistory(
 ): Promise<void> {
   if (mode === 'demo') return;
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
-  const client = buildTradierOptionsClientForEnv(settings, env);
+  // TRA-3112 — `listAccountHistory` is `/accounts/{id}/*`: account surface.
+  const client = buildTradierAccountClientForEnv(settings, env, ctx.username);
   if (!client) return;
 
   const today = new Date();
@@ -2958,7 +2968,8 @@ async function reconcileTradierLiveCalendar(
     return null;
   }
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
-  const client = buildTradierOptionsClientForEnv(settings, env);
+  // TRA-3112 — `listAccountCashEvents` / `getAccountBalance`: account surface.
+  const client = buildTradierAccountClientForEnv(settings, env, ctx.username);
 
   // Merge any new non-trade events into the cash-flow cursor. Failure here
   // is non-fatal — we just won't subtract today's deposit and the user
@@ -3270,7 +3281,8 @@ async function backfillLiveRealizedCalendar(
   const mode = stockModeKey(settings);
   if (mode === 'demo') return null;
   const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
-  const client = buildTradierOptionsClientForEnv(settings, env);
+  // TRA-3112 — `listAccountHistory` is `/accounts/{id}/*`: account surface.
+  const client = buildTradierAccountClientForEnv(settings, env, ctx.username);
   if (!client) return null;
 
   // TRA-1192 — dynamic rolling write window: from the first of the month
@@ -4192,7 +4204,10 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | null> {
   const operator = resolveLiveBrokerOperator();
   const settings = await loadSettings(operator);
-  return buildTradierOptionsClientForEnv(settings, 'production');
+  // TRA-3112 — `listAccountHistory` / `listGainLoss`: account surface. The
+  // operator is passed explicitly, so this pass is unaffected by the pin (it is
+  // the one caller that is BY CONSTRUCTION the operator).
+  return buildTradierAccountClientForEnv(settings, 'production', operator);
 }
 
 // TRA-2810 — kick ONE fee reconcile shortly after boot (the hourly tick also runs it).
@@ -6217,7 +6232,11 @@ app.get('/api/options/ideas', requireAuth, async (_req, res) => {
   const ctx = await userCtx(res);
   const settings = getSettings(ctx.username);
   const env = settings.liveTradierEnvOptions ?? 'sandbox';
-  const client = buildTradierOptionsClientForEnv(settings, env);
+  // TRA-3112 — MARKET-DATA builder, deliberately. `buildIdeasFeed` only ever calls
+  // `getExpirations` + `getChainSnapshot` (`options-ideas-service.ts`), both
+  // `/v1/markets/*`. Pinning this to the operator would blank the AI Ideas feed for
+  // all 61 non-operator books — the TRA-714 regression AC#3 exists to catch.
+  const client = buildTradierMarketDataClientForEnv(settings, env);
   const symbols = getStocksWatchlistData(ctx.username).all;
   // TRA-714 — a user's app-installed console API key (if any) overrides the
   // server env credential, so a Claude Max user can make the feed live without
@@ -9753,7 +9772,9 @@ app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, require
   // its production client exactly like the order path (env-var fallback included).
   const operator = resolveLiveBrokerOperator();
   const settings = await loadSettings(operator);
-  const client = buildTradierOptionsClientForEnv(settings, 'production');
+  // TRA-3112 — account surface (`listAccountHistory`). Resolved AS the operator,
+  // so the pin is a no-op here; the route is already `requireAdmin`.
+  const client = buildTradierAccountClientForEnv(settings, 'production', operator);
   if (!client) {
     res.status(409).json({
       ok: false,
@@ -11591,44 +11612,99 @@ app.post('/api/account/reset-demo', requireAuth, async (req, res) => {
 
 /**
  * TRA-323 — build a Tradier options client targeting a specific env regardless
- * of the user's current `liveTradierEnvOptions` selection. Used by the
- * "Sync Tradier positions" flow so a user can pull sandbox state in even
- * while the engine is configured for production (or vice versa). Returns
- * `null` when neither saved per-options creds nor env-var fallbacks are
- * present for the requested env; the caller should respond with a clear
- * 409 rather than silently no-op.
+ * of the user's current `liveTradierEnvOptions` selection.
+ *
+ * ⛔ TRA-3112 SPLIT THIS BY ENDPOINT CLASS. The single un-scoped
+ * `buildTradierOptionsClientForEnv(settings, env)` that used to live here took
+ * only `settings`, so it was structurally unable to scope its `process.env
+ * .TRADIER_*` fallback to anybody — and it handed the SHARED operator broker
+ * account to any of the 62 books that reached it with blank saved creds. Two
+ * routes behind plain `requireAuth` reached it on a real-money path. See
+ * `tradier-client-scope.ts` for the full reasoning; the resolution itself lives
+ * there so this copy and the `signal-engine.ts` sibling cannot drift apart
+ * again (they already had, which is how TRA-3110's fix nearly landed on the
+ * copy the leaking routes do NOT call).
+ *
+ * MARKET-DATA surface only — `/v1/markets/*`. Never interpolates `accountId`.
+ * The env fallback stays OPEN here, unchanged from before TRA-3112: this is what
+ * `/api/options/ideas` uses, and TRA-714 exists precisely so the 61 non-operator
+ * books get a live chains feed off the deployment creds. Returns `null` when
+ * neither saved per-options creds nor env-var fallbacks resolve.
  */
-function buildTradierOptionsClientForEnv(
+function buildTradierMarketDataClientForEnv(
   settings: AccountSettings,
   env: TradierEnv,
 ): TradierOptionsClient | null {
-  // TRA-714: `||` (not `??`) so a BLANK saved cred ('' — the default when
-  // Tradier is configured only via env vars, e.g. the AI Ideas / options-ideas
-  // feed) falls through to the env-var fallback. With `??`, an empty-string
-  // field short-circuits and the env fallback never runs, leaving the feed stuck
-  // on "no Tradier options credentials" even when TRADIER_* env vars are set.
-  // (This is the copy the /api/options/ideas route actually calls; a sibling in
-  // signal-engine.ts was fixed in the same way.)
-  const apiToken = (
-    (env === 'production'
-      ? settings.liveApiKeyOptionsProduction
-      : (settings.liveApiKeyOptionsSandbox || settings.liveApiKeyOptions))
-    || (env === 'production'
-      ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] || process.env['TRADIER_API_TOKEN']))
-    || ''
-  ).trim();
-  const accountId = (
-    (env === 'production'
-      ? settings.liveAccountIdOptionsProduction
-      : (settings.liveAccountIdOptionsSandbox || settings.liveAccountIdOptions))
-    || (env === 'production'
-      ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] || process.env['TRADIER_ACCOUNT_ID']))
-    || ''
-  ).trim();
-  if (!apiToken || !accountId) return null;
-  return new TradierOptionsClient(apiToken, accountId, env);
+  const creds = resolveTradierMarketDataCreds(settings, env);
+  if (!creds) return null;
+  return new TradierOptionsClient(creds.apiToken, creds.accountId, env);
+}
+
+/**
+ * TRA-3112 — ACCOUNT surface: `/accounts/{id}/*` (balances, positions, history,
+ * gain/loss, and every order verb). The shared `process.env.TRADIER_*` fallback is
+ * OPERATOR-PINNED here, exactly as `buildTradierLiveClient` already pins the
+ * engine's order client (TRA-857). Per-user SAVED creds are unaffected and keep
+ * working for every account.
+ *
+ * Returns the full discriminated resolution so a caller can answer 403
+ * ("we refused to lend you the operator's") separately from 409 ("you have
+ * none") — those two were the same 409 before this ticket, which is AC#1.
+ */
+function resolveTradierAccountClientForEnv(
+  settings: AccountSettings,
+  env: TradierEnv,
+  username: string | undefined,
+):
+  | { ok: true; client: TradierOptionsClient }
+  | { ok: false; reason: TradierAccountScopeRefusal } {
+  const resolved = resolveTradierAccountCreds(settings, env, isLiveBrokerOperator(username));
+  if (!resolved.ok) return resolved;
+  return { ok: true, client: new TradierOptionsClient(resolved.creds.apiToken, resolved.creds.accountId, env) };
+}
+
+/**
+ * Convenience wrapper for the INTERNAL account-scoped reconcilers, which have no
+ * HTTP response to shape and treat every refusal the same way (skip the pass).
+ * Route handlers must use {@link resolveTradierAccountClientForEnv} instead so the
+ * refusal reason survives to the caller.
+ */
+function buildTradierAccountClientForEnv(
+  settings: AccountSettings,
+  env: TradierEnv,
+  username: string | undefined,
+): TradierOptionsClient | null {
+  const resolved = resolveTradierAccountClientForEnv(settings, env, username);
+  return resolved.ok ? resolved.client : null;
+}
+
+/**
+ * TRA-3112 AC#1 — answer the two refusals DIFFERENTLY.
+ *
+ * The pre-existing 409 (`"No Tradier credentials saved for {env} …"`) read
+ * identically for "you have no creds" and for "we refused to lend you the
+ * operator's". That is the recurring defect this codebase keeps producing: an
+ * instrument that is pixel-identical in pass and fail state. An operator debugging
+ * a real credential problem could not tell the two apart, and neither could a
+ * grader checking this fix landed — which is why a test asserting only "not 200"
+ * proves nothing here.
+ *
+ *   • `no_creds`        → 409, unchanged text. Genuinely unconfigured; fix in Settings.
+ *   • `operator_pinned` → 403 + `code: 'tradier_operator_pinned'`. The exploit
+ *                         condition, refused. NOT a 409 and not the same prose.
+ */
+function respondTradierAccountRefusal(
+  res: express.Response,
+  reason: TradierAccountScopeRefusal,
+  env: TradierEnv,
+  action: string,
+): void {
+  // Thin on purpose — the decision is `decideTradierAccountRefusalResponse`, which
+  // is exported and directly graded. `index.ts` boots a server on import and has no
+  // route-test harness, so anything left inline here is untestable except by a
+  // mirror of itself.
+  const { status, body } = decideTradierAccountRefusalResponse(reason, env, action);
+  res.status(status).json(body);
 }
 
 // TRA-229 — start/stop are scoped to the dashboard's current account mode
@@ -11891,13 +11967,18 @@ app.post('/api/options/:id/close', requireAuth, async (req, res) => {
       return;
     }
     const settings = getSettings(username);
-    const client = buildTradierOptionsClientForEnv(settings, imported.env);
-    if (!client) {
-      res.status(409).json({
-        error: `No Tradier credentials saved for ${imported.env} — set them in Settings before closing imported positions.`,
-      });
+    // ⛔ TRA-3112 item B — this is a REAL-MONEY SELL into whatever account the
+    // creds resolve to, behind `requireAuth` alone. Before this ticket it built
+    // the un-scoped client, so a non-operator who had first imported the
+    // operator's book via `/api/tradier/positions/sync` could sell out of ***0154
+    // from here: sync-then-close was a two-POST manual path for any of the 62
+    // accounts to trade the operator's live book. Account surface, pinned.
+    const resolved = resolveTradierAccountClientForEnv(settings, imported.env, username);
+    if (!resolved.ok) {
+      respondTradierAccountRefusal(res, resolved.reason, imported.env, 'closing imported positions');
       return;
     }
+    const client = resolved.client;
     const optionSymbol = imported.position.optionSymbol;
     const contracts = imported.position.contractsRemaining;
     if (!optionSymbol || contracts <= 0) {
@@ -12158,13 +12239,19 @@ app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
       ? envParam
       : (settings.liveTradierEnvOptions ?? 'sandbox');
 
-  const client = buildTradierOptionsClientForEnv(settings, env);
-  if (!client) {
-    res.status(409).json({
-      error: `No Tradier credentials saved for ${env} — set them in Settings before syncing.`,
-    });
+  // ⛔ TRA-3112 item A — `listOpenOptionPositions()` is `/accounts/{id}/positions`.
+  // `env` above is read straight off the QUERY STRING, overriding the caller's own
+  // saved `liveTradierEnvOptions`, so before this ticket any of the 62 authenticated
+  // books could POST `?env=production` and import the shared operator book (***0154)
+  // as its own rows — no admin, no live mode, no per-user creds required. Account
+  // surface, pinned; the refusal distinguishes "you have none" from "we refused to
+  // lend you the operator's".
+  const resolved = resolveTradierAccountClientForEnv(settings, env, username);
+  if (!resolved.ok) {
+    respondTradierAccountRefusal(res, resolved.reason, env, 'syncing');
     return;
   }
+  const client = resolved.client;
 
   let positions;
   try {
@@ -12180,6 +12267,28 @@ app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
   // dashboard's mode-scoped views can find them. We attribute them to
   // 'live' since that's where Tradier-mirrored activity belongs; the demo
   // dashboard never owns Tradier positions.
+  //
+  // ⛔ TRA-3112 item 3 — that `'live'` is UNCONDITIONAL, so a demo book importing
+  // its own SANDBOX account gets `'live'` rows too, and a census partitioning on
+  // `mode` (the exact census TRA-3087 was asked to run) reads perfectly clean
+  // while this whole class of defect is open.
+  //
+  // Picked option (b) — keep the `'live'` stamp, partition on a separate env
+  // field — and picked it WITHOUT adding one, because the field already exists:
+  // `reconcileTradierPositions` mints every imported row with
+  // `tradierEnv: <owning bucket's env>`, and the owning bucket is
+  // `this.optionsAccounts[env]` — the same `env` resolved above. Verified, not
+  // assumed: `tra3112-tradier-client-scope.test.ts` grades that a sandbox import
+  // lands `mode:'live'` AND `tradierEnv:'sandbox'`, and that the two envs are
+  // distinguishable on the row.
+  //
+  // Option (a) — deriving `mode` from `env` — was rejected: it would relocate
+  // every sandbox import into the DEMO book, blending broker-real sandbox
+  // positions into paper demo equity accounting. That is a live data change well
+  // beyond this ticket, and it breaks the sandbox-import flow TRA-323 was built
+  // for. Adding a third field duplicating `tradierEnv` was rejected for the
+  // reason this ticket's parent exists: two copies of a symbol let a fix land on
+  // the wrong one.
   const summary = ctx.engine.reconcileTradierPositions(env, positions, 'live');
   broadcastEngineState(ctx);
   res.json({ ok: true, env, ...summary });
@@ -12496,28 +12605,43 @@ app.post('/api/options/tradier/test-connection', requireAuth, async (req, res) =
       accountId: (settings.liveAccountIdOptionsSandbox ?? settings.liveAccountIdOptions ?? '').trim(),
     };
   })();
-  const apiToken = (
-    credsForEnv.apiToken
-    || (env === 'production'
-      ? process.env['TRADIER_API_TOKEN']
-      : (process.env['TRADIER_SANDBOX_API_TOKEN'] ?? process.env['TRADIER_API_TOKEN']))
-    || ''
-  ).trim();
-  const accountId = (
-    credsForEnv.accountId
-    || (env === 'production'
-      ? process.env['TRADIER_ACCOUNT_ID']
-      : (process.env['TRADIER_SANDBOX_ACCOUNT_ID'] ?? process.env['TRADIER_ACCOUNT_ID']))
-    || ''
-  ).trim();
-  if (!apiToken || !accountId) {
+  // ⛔ TRA-3112 — a THIRD route on this defect, not named in the ruling; found by
+  // running AC#5's own grep rather than by reading the two known call sites.
+  //
+  // This is an ACCOUNT-surface route behind `requireAuth` alone: it GETs
+  // `/v1/user/profile` and then `client.getAccountBalance()`
+  // (`/accounts/{id}/balances`), and it answers with `accountNumber`, `status`,
+  // `classification` and BUYING POWER IN DOLLARS. With the old un-pinned fallback
+  // any of the 62 books could POST `{"env":"production"}` with blank saved creds
+  // and read the operator's live account number and cash. It places no order, so
+  // it is a read-only leak — which is exactly the kind that stays open, because
+  // nothing about the response looks unusual.
+  //
+  // Same pin, same resolver as the other two. `settings` is not reused here
+  // because TRA-506's `credsForEnv` deliberately reads the env-PINNED saved pair
+  // (so "Test production" probes production while the saved env is sandbox);
+  // that stays, and only the shared-env fallback underneath it is scoped.
+  const pinnedCreds = resolveTradierAccountCredsFromSaved(
+    credsForEnv,
+    env,
+    isLiveBrokerOperator(username),
+  );
+  if (!pinnedCreds.ok) {
+    const refusal = decideTradierAccountRefusalResponse(pinnedCreds.reason, env, 'testing the connection');
     res.json({
       ok: false,
       env,
-      error: `Tradier ${env} API token and Account ID are not configured. Save them in Settings before testing.`,
+      // Kept as a 200-with-`ok:false` because this is a probe UI, not an action —
+      // but the two causes now read differently, same as the other two routes.
+      code: refusal.body.code,
+      error:
+        pinnedCreds.reason === 'operator_pinned'
+          ? refusal.body.error
+          : `Tradier ${env} API token and Account ID are not configured. Save them in Settings before testing.`,
     });
     return;
   }
+  const { apiToken, accountId } = pinnedCreds.creds;
   try {
     const profileResp = await fetch(`${tradierBaseUrl(env)}/user/profile`, {
       headers: { Authorization: `Bearer ${apiToken}`, Accept: 'application/json' },
