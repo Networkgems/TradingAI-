@@ -1,0 +1,593 @@
+#!/usr/bin/env node
+/**
+ * TRA-3008 — detector for the ANNUAL-CRON ZOMBIE: a date-pinned one-shot that
+ * has already fired, silently re-armed twelve months out, and still reads as
+ * live scheduled coverage on every census.
+ *
+ * WHAT THE SHAPE IS
+ * -----------------
+ * A one-shot is written as a cron with the day and month pinned and NO YEAR
+ * FIELD — `0 21 30 7 *` is "21:00 on 30 July", not "21:00 on 30 July 2026".
+ * Cron has no year, so after the single intended fire the scheduler simply
+ * recomputes the next slot: 2027-07-30T21:00Z. The routine stays
+ * `status: active` with an `enabled` trigger and a `nextRunAt` in the future,
+ * which is byte-for-byte the predicate `check:phantom-rest` (TRA-2422) clears a
+ * leaf as monitored on, and the same one `check:routine-dispatch` (TRA-2331)
+ * takes as its population.
+ *
+ * ⛔ A SPENT ONE-SHOT IS INDISTINGUISHABLE FROM ARMED COVERAGE ON THE BOARD.
+ * That is the whole bug. Its fire is used up; nothing will run for ~12 months;
+ * and every instrument we own reports it as scheduled.
+ *
+ * Measured 2026-08-05T23:50Z across 202 routines (41 active + armed): EIGHT
+ * rows held an enabled trigger more than 120 days out. Two of them were graders
+ * whose verdicts were never delivered — `c0ca474e` (TRA-2519 sentiment
+ * partition) and `589334bc` (TRA-2477 supertrend wall-clock) — both dispatched
+ * 2026-08-02T00:06Z, both died on `"Agent is not invokable in its current
+ * state"`, both left `linkedIssueId: null`, so neither left ANY trace on the
+ * issue it was meant to grade. TRA-2477 then sat `in_review` behind a routine
+ * that would not speak again until July 2027.
+ *
+ * WHY `check:routine-dispatch` CANNOT SEE THIS
+ * -------------------------------------------
+ * That check grades the DISPATCH TAIL — did the last fire run? A spent one-shot
+ * can have a perfectly `completed` last run (`48c5e5ee`, `63218280`,
+ * `03a7b11f` all do). Its tail is healthy. It is the FORWARD promise that is a
+ * lie, and a tail verdict cannot reach it. The two checks are complements:
+ * TRA-2331 asks "did the fires stop dying?", this one asks "is the next fire
+ * inside any horizon a human would call coverage?".
+ *
+ * THE PREDICATE
+ * -------------
+ * Population = every routine with `status: 'active'` AND at least one trigger
+ * that is `enabled` with `kind: 'schedule'` — deliberately the same population
+ * as `check:routine-dispatch`, so the two grade the same claim from both ends.
+ *
+ * For each armed trigger:
+ *
+ *   NEAR              `nextRunAt` within the horizon (default 120 days). This
+ *                     is real coverage; say nothing about it.
+ *   SPENT_ONESHOT     `nextRunAt` beyond the horizon AND `lastFiredAt` is set.
+ *                     FINDING — it fired, and the slot it re-armed is a year
+ *                     away. The single strongest signal in the set.
+ *   FAR_NEVER_FIRED   `nextRunAt` beyond the horizon and it has NEVER fired.
+ *                     FINDING — either a mis-entered cron or a routine whose
+ *                     owner is gone (`e1b97e28`, assignee departed, next fire
+ *                     2027-06-30, last run failed 2026-05-19).
+ *
+ * and roll that up per routine:
+ *
+ *   COVERAGE_LOST     EVERY armed trigger is beyond the horizon. Whatever this
+ *                     routine was watching is unwatched, and the board says
+ *                     otherwise.
+ *   RESIDUAL_ZOMBIE   at least one armed trigger is still NEAR. Coverage is
+ *                     intact; the spent trigger is dead weight that will fire
+ *                     once, a year from now, with no one expecting it.
+ *                     `41c0c68d` is exactly this: a spent 2026-08-05 one-shot
+ *                     riding alongside a live weekly Friday review.
+ *
+ * THE TRAPS — each measured against the live API on 2026-08-05, each with a
+ * control in `--selftest`
+ * ------------------------------------------------------------------------
+ *  1. ⛔⛔ THE ROUTINES ROUTE RETURNS A BARE ARRAY. The first run of this
+ *     census read `body.routines` — `undefined` on a bare array — filtered it
+ *     to nothing, and reported **`0` zombies against a company that had eight**.
+ *     A FILTER THAT MATCHES NOTHING READS EXACTLY LIKE A CLEAN TREE. The unwrap
+ *     here accepts array | {routines} | {data} and NOTHING else, and the row
+ *     count actually graded is printed on every run.
+ *
+ *  2. ⛔ ZERO ROWS SCANNED IS BLIND, NOT CLEAN — the direct consequence of
+ *     trap 1, and the only defence that survives the next shape change. An
+ *     empty population exits 3 and never prints a verdict.
+ *
+ *  3. ⛔⛔ ARCHIVING A ROUTINE DOES NOT DISABLE ITS TRIGGER. Measured on
+ *     `c0ca474e` minutes after I archived it: `status: 'archived'`, and the
+ *     trigger STILL reads `enabled: true`, `nextRunAt: 2027-07-31T00:10Z`. A
+ *     check keyed on `trigger.enabled` alone therefore reports every routine
+ *     ever archived, forever, and the real findings drown. `status === 'active'`
+ *     is the discriminator and it is not optional. (It also means ARCHIVING IS
+ *     the remedy this check asks for — you do not need to hunt the trigger.)
+ *
+ *  4. ⛔ `nextRunAt` AND `lastFiredAt` LIVE ON `triggers[]`, NOT THE ROUTINE
+ *     ROOT (TRA-2422 trap 2). A root-level read of either returns `undefined`
+ *     on a perfectly armed routine — and `undefined > horizon` is `false`, so
+ *     the bug reads as CLEAN.
+ *
+ *  5. ⛔ A MISSING OR UNPARSEABLE `nextRunAt` ON AN ENABLED TRIGGER IS BLIND,
+ *     NOT NEAR. "no next run" is the most spent a trigger can possibly be;
+ *     absorbing it into the healthy branch inverts the check on its worst case.
+ *
+ *  6. ⛔ NON-SCHEDULE AND DISABLED TRIGGERS ARE NOT ARMING. A webhook trigger
+ *     has no slot; a disabled one fires never. Excluded from the population
+ *     rather than counted as healthy members of it.
+ *
+ *  7. ⛔ A SECOND, NEARER TRIGGER IS REAL COVERAGE. Reporting `41c0c68d` as
+ *     "unwatched" because one of its two arms is spent would be a false breach,
+ *     and false breaches are how a check gets ignored. Hence the two-tier
+ *     roll-up.
+ *
+ * WHY 120 DAYS
+ * ------------
+ * The horizon separates "annual re-arm" from "genuinely long cadence". The
+ * longest legitimate cadence on this board is quarterly (~92 days), and every
+ * observed zombie sits at ~365 days. 120 days is the widest bar that still
+ * catches all eight and cannot clip a quarterly. Tunable with `--horizon-days`;
+ * widening it can only ever shrink the finding set, so a caller cannot use it
+ * to manufacture one.
+ *
+ * VERDICTS / EXIT CODES
+ *   0  CLEAN          — population non-empty, every armed trigger fires inside the horizon
+ *   1  FINDINGS       — spent arms exist, but every affected routine still has live coverage
+ *   2  COVERAGE_LOST  — at least one routine's ONLY arms are beyond the horizon
+ *   3  BLIND          — the population or a row is untrustworthy. NOT a pass.
+ *
+ * BLIND outranks everything, including a zero count.
+ *
+ * This script performs GETs and NOTHING else.
+ */
+
+import { enumerateRoutines } from './lib/paperclip-enumeration.mjs';
+
+const argv = process.argv.slice(2);
+const argOf = (name, fallback) => {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`));
+  if (hit) return hit.slice(name.length + 3);
+  const idx = argv.indexOf(`--${name}`);
+  if (idx >= 0 && argv[idx + 1] && !argv[idx + 1].startsWith('--')) return argv[idx + 1];
+  return fallback;
+};
+
+const HORIZON_DAYS = Number(argOf('horizon-days', 120));
+const ROUTINE_LIMIT = Number(argOf('routine-limit', 500));
+
+export const VERDICT_EXIT = { CLEAN: 0, FINDINGS: 1, COVERAGE_LOST: 2, BLIND: 3 };
+
+/* ------------------------------------------------------------------ *
+ * Predicate
+ * ------------------------------------------------------------------ */
+
+/** Enabled schedule triggers only. Trap 6. */
+export function armedTriggers(routine) {
+  const triggers = routine.triggers;
+  if (!Array.isArray(triggers)) return null; // caller turns this into BLIND
+  return triggers.filter((t) => t && t.enabled === true && t.kind === 'schedule');
+}
+
+/**
+ * Classify ONE armed trigger against the horizon.
+ * Returns { state, detail, daysOut } — state is NEAR / SPENT_ONESHOT /
+ * FAR_NEVER_FIRED / BLIND.
+ */
+export function classifyTrigger(trigger, { nowMs, horizonDays = HORIZON_DAYS }) {
+  // Trap 5. Absent is not near.
+  if (!('nextRunAt' in trigger)) {
+    return { state: 'BLIND', detail: 'trigger carries no `nextRunAt` key — the route did not serve the field' };
+  }
+  if (trigger.nextRunAt == null || trigger.nextRunAt === '') {
+    return {
+      state: 'BLIND',
+      detail:
+        'enabled schedule trigger with a null `nextRunAt` — an armed trigger with no next slot is the most spent ' +
+        'state there is; it is never a pass',
+    };
+  }
+  const nextMs = Date.parse(trigger.nextRunAt);
+  if (!Number.isFinite(nextMs)) {
+    return { state: 'BLIND', detail: `unparseable nextRunAt ${JSON.stringify(trigger.nextRunAt)}` };
+  }
+
+  const daysOut = (nextMs - nowMs) / 86_400_000;
+  if (daysOut <= horizonDays) return { state: 'NEAR', daysOut };
+
+  const fired = typeof trigger.lastFiredAt === 'string' && trigger.lastFiredAt !== '';
+  return fired
+    ? {
+        state: 'SPENT_ONESHOT',
+        daysOut,
+        detail:
+          `fired ${trigger.lastFiredAt} and re-armed ${daysOut.toFixed(0)}d out ` +
+          `(cron ${JSON.stringify(trigger.cronExpression ?? null)} has no year field)`,
+      }
+    : {
+        state: 'FAR_NEVER_FIRED',
+        daysOut,
+        detail:
+          `never fired, next slot ${daysOut.toFixed(0)}d out ` +
+          `(cron ${JSON.stringify(trigger.cronExpression ?? null)})`,
+      };
+}
+
+/** Roll one routine's armed triggers up into a routine-level verdict. */
+export function classifyRoutine(routine, { nowMs, horizonDays = HORIZON_DAYS }) {
+  const armed = armedTriggers(routine);
+  if (armed === null) {
+    return { state: 'BLIND', detail: 'row carries no `triggers` array — the route did not serve the relation' };
+  }
+  if (armed.length === 0) return { state: 'NOT_IN_POPULATION' };
+
+  const graded = armed.map((t) => ({ trigger: t, ...classifyTrigger(t, { nowMs, horizonDays }) }));
+  const blind = graded.filter((g) => g.state === 'BLIND');
+  if (blind.length) {
+    return { state: 'BLIND', detail: blind.map((b) => b.detail).join(' · '), triggers: graded };
+  }
+
+  const far = graded.filter((g) => g.state === 'SPENT_ONESHOT' || g.state === 'FAR_NEVER_FIRED');
+  if (far.length === 0) return { state: 'HEALTHY', triggers: graded };
+
+  const near = graded.filter((g) => g.state === 'NEAR');
+  // Trap 7 — a nearer arm on the same routine IS coverage.
+  return {
+    state: near.length ? 'RESIDUAL_ZOMBIE' : 'COVERAGE_LOST',
+    triggers: graded,
+    far,
+    nearCount: near.length,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Sweep
+ * ------------------------------------------------------------------ */
+
+export async function sweep(transport, { routineLimit = ROUTINE_LIMIT, horizonDays = HORIZON_DAYS, nowMs = Date.now() } = {}) {
+  const { routines, blind: enumBlind, probe } = await enumerateRoutines(transport.getRoutines, { limit: routineLimit });
+  if (enumBlind) {
+    return { verdict: 'BLIND', blind: enumBlind, routineCount: 0, graded: 0, findings: [], blindRows: [], tally: {} };
+  }
+
+  const findings = [];
+  const blindRows = [];
+  const tally = { HEALTHY: 0, RESIDUAL_ZOMBIE: 0, COVERAGE_LOST: 0, BLIND: 0 };
+  let graded = 0;
+
+  for (const r of routines) {
+    // Trap 3 — an archived routine keeps its enabled trigger and its 2027
+    // nextRunAt forever. `status` is the discriminator, not `enabled`.
+    if (r.status !== 'active') continue;
+    const verdict = classifyRoutine(r, { nowMs, horizonDays });
+    if (verdict.state === 'NOT_IN_POPULATION') continue;
+    graded += 1;
+    tally[verdict.state] = (tally[verdict.state] ?? 0) + 1;
+
+    const row = {
+      id: String(r.id).slice(0, 8),
+      routineId: r.id,
+      title: r.title,
+      assigneeAgentId: r.assigneeAgentId ?? null,
+      state: verdict.state,
+    };
+    if (verdict.state === 'BLIND') blindRows.push({ ...row, detail: verdict.detail });
+    else if (verdict.state !== 'HEALTHY') {
+      findings.push({
+        ...row,
+        nearCount: verdict.nearCount,
+        lastRunStatus: r.lastRun ? (r.lastRun.status ?? null) : null,
+        spent: verdict.far.map((f) => ({
+          state: f.state,
+          label: f.trigger.label ?? null,
+          cronExpression: f.trigger.cronExpression ?? null,
+          timezone: f.trigger.timezone ?? null,
+          nextRunAt: f.trigger.nextRunAt,
+          lastFiredAt: f.trigger.lastFiredAt ?? null,
+          lastResult: f.trigger.lastResult ?? null,
+          daysOut: Math.round(f.daysOut),
+          detail: f.detail,
+        })),
+      });
+    }
+  }
+
+  // Trap 2. Zero graded rows is BLIND, and it is the exact way this census
+  // failed the first time it was run.
+  if (graded === 0) {
+    return {
+      verdict: 'BLIND',
+      blind:
+        `${routines.length} routines enumerated but ZERO were active with an enabled schedule trigger. ` +
+        'An empty population and a broken predicate render identically, and the empty one always reads CLEAN. ' +
+        'Re-derive the predicate before trusting this.',
+      routineCount: routines.length,
+      graded: 0,
+      findings: [],
+      blindRows,
+      tally,
+      probe,
+    };
+  }
+
+  let verdict = 'CLEAN';
+  if (blindRows.length) verdict = 'BLIND';
+  else if (tally.COVERAGE_LOST > 0) verdict = 'COVERAGE_LOST';
+  else if (findings.length) verdict = 'FINDINGS';
+
+  return { verdict, blind: null, routineCount: routines.length, graded, findings, blindRows, tally, probe, horizonDays };
+}
+
+/* ------------------------------------------------------------------ *
+ * Report
+ * ------------------------------------------------------------------ */
+
+export function renderReport(result, names = {}) {
+  const out = [];
+  const who = (id) => (id ? names[String(id).slice(0, 8)] || String(id).slice(0, 8) : '(unassigned)');
+  out.push(`check:spent-oneshot — TRA-3008 · horizon ${result.horizonDays ?? HORIZON_DAYS}d`);
+  out.push(`  routines enumerated : ${result.routineCount}`);
+  out.push(`  active + armed      : ${result.graded}`);
+  if (result.blind) {
+    out.push('');
+    out.push(`VERDICT: BLIND — ${result.blind}`);
+    return out;
+  }
+  out.push(
+    `  tally               : healthy ${result.tally.HEALTHY ?? 0} · residual ${result.tally.RESIDUAL_ZOMBIE ?? 0} ` +
+      `· coverage-lost ${result.tally.COVERAGE_LOST ?? 0} · blind ${result.tally.BLIND ?? 0}`,
+  );
+  out.push('');
+  for (const f of result.findings) {
+    out.push(`${f.state === 'COVERAGE_LOST' ? '⛔' : '⚠️ '} ${f.id}  ${who(f.assigneeAgentId)}  ${f.title}`);
+    for (const s of f.spent) {
+      out.push(`      ${s.state}  next ${s.nextRunAt} (${s.daysOut}d)  cron ${s.cronExpression} ${s.timezone ?? ''}`);
+      out.push(`      ${s.detail}`);
+      if (s.lastResult) out.push(`      last result: ${s.lastResult}`);
+    }
+    if (f.state === 'RESIDUAL_ZOMBIE') out.push(`      ${f.nearCount} nearer arm(s) still cover this routine.`);
+    out.push('');
+  }
+  for (const b of result.blindRows) out.push(`BLIND  ${b.id}  ${who(b.assigneeAgentId)}  ${b.title}\n      ${b.detail}`);
+  out.push(`VERDICT: ${result.verdict}`);
+  if (result.verdict !== 'CLEAN' && result.verdict !== 'BLIND') {
+    out.push('Remedy: ARCHIVE the routine (trap 3 — that is enough; the trigger stays enabled and it does not matter).');
+    out.push('Routine writes follow the ASSIGNEE and 403 across agents — relay a carrier, do not sweep another owner\'s row.');
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Controls
+ * ------------------------------------------------------------------ */
+
+const NOW = Date.parse('2026-08-05T23:50:00Z');
+const far = (over = {}) => ({
+  id: 'aaaaaaaa-0000-0000-0000-000000000000',
+  status: 'active',
+  title: 'far',
+  assigneeAgentId: 'agent-1',
+  triggers: [
+    {
+      kind: 'schedule',
+      enabled: true,
+      cronExpression: '0 21 30 7 *',
+      timezone: 'UTC',
+      nextRunAt: '2027-07-30T21:00:00.000Z',
+      lastFiredAt: '2026-08-02T00:06:25.499Z',
+      lastResult: 'Execution failed',
+      ...over,
+    },
+  ],
+  lastRun: { status: 'failed' },
+});
+
+const CASES = [
+  {
+    name: 'SPENT_ONESHOT — fired once, re-armed 359d out (589334bc verbatim)',
+    routines: [far()],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1 },
+  },
+  {
+    name: 'FAR_NEVER_FIRED — 2027 slot, never fired (e1b97e28 shape)',
+    routines: [far({ nextRunAt: '2027-06-30T17:17:00.000Z', lastFiredAt: null, lastResult: null })],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, state: 'FAR_NEVER_FIRED' },
+  },
+  {
+    name: 'TRAP 7 — a nearer arm on the same routine is real coverage (41c0c68d)',
+    routines: [
+      {
+        ...far(),
+        triggers: [
+          far().triggers[0],
+          {
+            kind: 'schedule',
+            enabled: true,
+            cronExpression: '15 17 * * 5',
+            timezone: 'America/New_York',
+            nextRunAt: '2026-08-07T21:15:00.000Z',
+            lastFiredAt: null,
+          },
+        ],
+      },
+    ],
+    expect: { verdict: 'FINDINGS', findings: 1, state: 'RESIDUAL_ZOMBIE' },
+  },
+  {
+    name: 'TRAP 3 — an ARCHIVED routine keeps enabled:true + a 2027 nextRunAt and must NOT be a finding (c0ca474e)',
+    routines: [{ ...far(), status: 'archived' }, { ...far(), id: 'bbbbbbbb', triggers: [{ ...far().triggers[0], nextRunAt: '2026-08-06T21:00:00.000Z' }] }],
+    expect: { verdict: 'CLEAN', findings: 0, graded: 1 },
+  },
+  {
+    name: 'TRAP 6 — a disabled trigger and a webhook trigger are not arming',
+    routines: [
+      { ...far(), triggers: [{ ...far().triggers[0], enabled: false }] },
+      { ...far(), id: 'cccccccc', triggers: [{ ...far().triggers[0], kind: 'webhook' }] },
+      { ...far(), id: 'dddddddd', triggers: [{ ...far().triggers[0], nextRunAt: '2026-08-06T21:00:00.000Z' }] },
+    ],
+    expect: { verdict: 'CLEAN', findings: 0, graded: 1 },
+  },
+  {
+    name: 'TRAP 5 — an enabled trigger with a null nextRunAt is BLIND, never NEAR',
+    routines: [far({ nextRunAt: null })],
+    expect: { verdict: 'BLIND' },
+  },
+  {
+    name: 'TRAP 4 — nextRunAt read off the ROUTINE ROOT is absent on the trigger => BLIND',
+    routines: [
+      {
+        ...far(),
+        nextRunAt: '2027-07-30T21:00:00.000Z',
+        triggers: [{ kind: 'schedule', enabled: true, cronExpression: '0 21 30 7 *', lastFiredAt: '2026-08-02T00:06:25Z' }],
+      },
+    ],
+    expect: { verdict: 'BLIND' },
+  },
+  {
+    name: 'CLEAN — a live weekly routine inside the horizon',
+    routines: [
+      {
+        ...far(),
+        triggers: [
+          {
+            kind: 'schedule',
+            enabled: true,
+            cronExpression: '15 17 * * 5',
+            timezone: 'America/New_York',
+            nextRunAt: '2026-08-07T21:15:00.000Z',
+            lastFiredAt: '2026-07-31T21:15:00.000Z',
+          },
+        ],
+      },
+    ],
+    expect: { verdict: 'CLEAN', findings: 0 },
+  },
+  {
+    name: 'TRAP 1/2 — the ACTUAL census bug: the route returns a BARE ARRAY and the filter read `.routines`',
+    // Simulates what the first census run did: unwrap to undefined -> [] -> a
+    // clean-looking zero. The population must come back BLIND, not CLEAN.
+    routines: [],
+    expect: { verdict: 'BLIND' },
+  },
+  {
+    name: 'TRAP 2 — 202 routines, none active+armed => BLIND on graded=0, not CLEAN',
+    routines: Array.from({ length: 202 }, (_, i) => ({ ...far(), id: `e${i}`, status: 'paused' })),
+    expect: { verdict: 'BLIND', graded: 0 },
+  },
+];
+
+async function selftest() {
+  let pass = 0;
+  const seen = new Set();
+  for (const c of CASES) {
+    const transport = { getRoutines: async () => c.routines };
+    let result;
+    try {
+      result = await sweep(transport, { horizonDays: HORIZON_DAYS, nowMs: NOW });
+    } catch (err) {
+      console.log(`FAIL  ${c.name}\n        threw ${err.message}`);
+      continue;
+    }
+    seen.add(result.verdict);
+    const problems = [];
+    if (result.verdict !== c.expect.verdict) problems.push(`verdict ${result.verdict} != ${c.expect.verdict}`);
+    if (c.expect.findings !== undefined && result.findings.length !== c.expect.findings) {
+      problems.push(`findings ${result.findings.length} != ${c.expect.findings}`);
+    }
+    if (c.expect.graded !== undefined && result.graded !== c.expect.graded) {
+      problems.push(`graded ${result.graded} != ${c.expect.graded}`);
+    }
+    if (c.expect.state && result.findings[0]?.state !== c.expect.state && result.findings[0]?.spent?.[0]?.state !== c.expect.state) {
+      problems.push(`state ${result.findings[0]?.state}/${result.findings[0]?.spent?.[0]?.state} != ${c.expect.state}`);
+    }
+    if (problems.length) console.log(`FAIL  ${c.name}\n        ${problems.join('; ')}`);
+    else {
+      console.log(`ok    ${c.name}`);
+      pass += 1;
+    }
+  }
+
+  // GLOBAL control: the module must never issue a write verb.
+  try {
+    const src = await import('node:fs').then((fs) => fs.readFileSync(new URL(import.meta.url), 'utf8'));
+    const bad = /method:\s*['"](POST|PATCH|PUT|DELETE)['"]/i.exec(src);
+    if (bad) throw new Error(`write verb ${bad[1]} present`);
+    console.log('ok    GLOBAL read-only control (no write verb in this file)');
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL read-only control\n        ${err.message}`);
+  }
+
+  const total = CASES.length + 1;
+  console.log('');
+  console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
+  for (const v of ['CLEAN', 'FINDINGS', 'COVERAGE_LOST', 'BLIND']) {
+    if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
+  }
+  return pass === total ? 0 : 1;
+}
+
+/* ================================================================== */
+
+function liveTransport() {
+  const raw = String(process.env.PAPERCLIP_API_URL || '').replace(/\/+$/, '');
+  const BASE = argOf('base', raw.replace(/\/api$/, ''));
+  const KEY = process.env.PAPERCLIP_API_KEY;
+  const CO = argOf('company', process.env.PAPERCLIP_COMPANY_ID);
+  if (!BASE || !KEY || !CO) {
+    throw new Error('PAPERCLIP_API_URL, PAPERCLIP_API_KEY and PAPERCLIP_COMPANY_ID must all be set');
+  }
+  const headers = { Authorization: `Bearer ${KEY}`, Accept: 'application/json' };
+  const get = async (url) => {
+    const res = await fetch(url, { headers });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} on ${url} — ${text.slice(0, 160)}`);
+    return JSON.parse(text);
+  };
+  // Trap 1 — accept a bare array FIRST. That is what this route actually
+  // returns, and reading `.routines` off it is the bug this check was born from.
+  const unwrap = (b, key) => {
+    if (Array.isArray(b)) return b;
+    if (b && Array.isArray(b[key])) return b[key];
+    if (b && Array.isArray(b.data)) return b.data;
+    return null;
+  };
+  return {
+    listAgents: async () => unwrap(await get(`${BASE}/api/companies/${CO}/agents`), 'agents') || [],
+    getRoutines: async ({ limit, offset }) =>
+      unwrap(await get(`${BASE}/api/companies/${CO}/routines?limit=${limit}&offset=${offset}`), 'routines'),
+  };
+}
+
+async function main() {
+  if (argv.includes('--selftest')) return selftest();
+
+  const transport = liveTransport();
+  const result = await sweep(transport, { routineLimit: ROUTINE_LIMIT, horizonDays: HORIZON_DAYS });
+
+  let names = {};
+  try {
+    for (const a of await transport.listAgents()) {
+      if (a && a.id) names[String(a.id).slice(0, 8)] = a.name || a.nameKey || String(a.id).slice(0, 8);
+    }
+  } catch {
+    names = {}; // cosmetic only — never changes the verdict
+  }
+
+  if (argv.includes('--json')) {
+    console.log(
+      JSON.stringify(
+        {
+          issue: 'TRA-3008',
+          checkedAt: new Date().toISOString(),
+          horizonDays: HORIZON_DAYS,
+          verdict: result.verdict,
+          blind: result.blind,
+          routineCount: result.routineCount,
+          graded: result.graded,
+          tally: result.tally,
+          findings: result.findings,
+          blindRows: result.blindRows,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    for (const l of renderReport(result, names)) console.log(l);
+  }
+  return VERDICT_EXIT[result.verdict] ?? 3;
+}
+
+if (!argv.includes('--import-only')) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error('ERROR', err?.stack || err);
+      process.exit(3);
+    });
+}
