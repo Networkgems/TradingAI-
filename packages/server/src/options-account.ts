@@ -46,6 +46,7 @@ import {
 import { logger } from './observability/index.js';
 // TRA-2820 — provenance oracle for the Tradier reconcile (TRA-2811's ledger join).
 import { lastRecordedOpenSleeve, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
+import { appendEngineBasisRestatement } from './engine-basis-restatement-log.js';
 import {
   type MarketableOpenMtmConfig,
   DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
@@ -714,6 +715,83 @@ function applyEngineOriginRiskThresholds(
  * i.e. slightly wider — so the error is in the conservative direction and
  * cannot fire a stop early.
  */
+/**
+ * TRA-3010 — one witnessed engine-basis restatement, captured at the moment it
+ * happens.
+ *
+ * Gate A of TRA-2873 has to prove that {@link restateEngineOpenedBasis} moved an
+ * engine-opened row's basis to broker truth *and* carried its risk schedule
+ * across unscaled. Neither half is observable after the fact:
+ *
+ *   • the pre-restatement `premiumPaid` (the scanner's NBBO mid) is overwritten
+ *     in place, and `reconcileLivePortfolio` runs on a 30s cadence, so the
+ *     pre-state survives for seconds — no external poller can be trusted to
+ *     catch it;
+ *   • the thresholds are RESCALED, so `tp1Premium / premiumPaid` reads the same
+ *     constant before and after. The ratio check is a safety assertion (the stop
+ *     did not silently move on a real-money position), NOT the discriminator;
+ *   • the broker's `cost_basis` is not published by any read-only route — the
+ *     `/api/health/*` family is counts-only by design, and `/api/state` carries
+ *     our numbers, not Tradier's.
+ *
+ * So a post-hoc read of a restated row is byte-identical to a read of a row that
+ * was never restated at all, which is precisely the vacuous green this gate
+ * exists to avoid. Recording both sides here — at the only place that holds them
+ * simultaneously — is what makes the assertion readable.
+ */
+export interface EngineBasisRestatement {
+  ts: number;
+  positionId: string;
+  optionSymbol: string;
+  contracts: number;
+  /** Our pre-restatement basis: the scanner's pre-trade NBBO mid. */
+  premiumPaidBefore: number;
+  /** Broker truth: Tradier `cost_basis / quantity / 100`. */
+  premiumPaidAfter: number;
+  /** `premiumPaidAfter / premiumPaidBefore` — the scale applied to thresholds. */
+  ratio: number;
+  /** Reconstructed broker cost basis in dollars, for the cent-level compare. */
+  brokerCostBasisUsd: number;
+  tp1PremiumBefore: number;
+  tp1PremiumAfter: number;
+  stopLossPremiumBefore: number;
+  stopLossPremiumAfter: number;
+  trailingStopPremiumBefore: number;
+  trailingStopPremiumAfter: number;
+  trailingActive: boolean;
+  /**
+   * The invariant under test in assertion 3: thresholds are rescaled, not
+   * recomputed, so each ratio must be unchanged across the restatement.
+   * Captured as ratios rather than re-derived at grading time so a later
+   * config change to `otmRiskParams` cannot retro-fit the expectation.
+   */
+  tp1RatioBefore: number;
+  tp1RatioAfter: number;
+  stopRatioBefore: number;
+  stopRatioAfter: number;
+}
+
+/**
+ * TRA-3010 — why a matched engine-opened row was NOT restated.
+ *
+ * Published alongside the restatements so the denominator is never implicit. A
+ * restatement pass that matched no rows and one that matched and agreed produce
+ * the same empty ledger unless the skips are counted; that ambiguity is the
+ * exact failure mode TRA-3006 hit on this gate. `zero_delta` is the one that
+ * matters most: it means our mid already equalled broker truth, so the row
+ * exercised nothing and CANNOT serve as gate A's sample.
+ */
+export type EngineBasisSkipReason =
+  | 'not_live'
+  | 'multi_leg'
+  | 'covered_write'
+  | 'in_flight'
+  | 'broker_premium_unusable'
+  | 'zero_delta';
+
+/** TRA-3010 — bounded so a long-lived process cannot grow this without limit. */
+const ENGINE_BASIS_RESTATEMENT_LOG_CAP = 50;
+
 function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
   const previous = opt.premiumPaid;
   if (!Number.isFinite(previous) || previous <= 0) return;
@@ -888,6 +966,34 @@ export class PaperOptionsAccount {
   private cash: number;
   private openOptions: Map<string, OptionPosition> = new Map();
   private closedOptions: OptionPosition[] = [];
+  /**
+   * TRA-3010 — witnessed engine-basis restatements, newest last, capped at
+   * {@link ENGINE_BASIS_RESTATEMENT_LOG_CAP}. See {@link EngineBasisRestatement}
+   * for why this cannot be reconstructed from a later read of the row.
+   */
+  private engineBasisRestatements: EngineBasisRestatement[] = [];
+  /**
+   * TRA-3010 — per-reason counts of engine-opened rows the restatement branch
+   * matched but declined. Publishing this is what stops an empty ledger from
+   * reading as "restatement verified" when it actually means "nothing to do".
+   */
+  private engineBasisSkips: Record<EngineBasisSkipReason, number> = {
+    not_live: 0,
+    multi_leg: 0,
+    covered_write: 0,
+    in_flight: 0,
+    broker_premium_unusable: 0,
+    zero_delta: 0,
+  };
+  /** TRA-3010 — engine-opened rows the branch reached at all (the denominator). */
+  private engineBasisCandidates = 0;
+  /**
+   * TRA-3010 — monotonic count of restatements. Kept separately from the ring
+   * buffer's length because the buffer is capped: past the cap its length
+   * freezes at {@link ENGINE_BASIS_RESTATEMENT_LOG_CAP} and would silently
+   * under-report the very total the gate is counting.
+   */
+  private engineBasisRestatedTotal = 0;
   /**
    * TRA-1976 — equity shares taken on when a cash-secured put is assigned, keyed
    * by lot id. This is the equity inventory the TRA-1966 primitive deferred; it
@@ -4881,6 +4987,90 @@ export class PaperOptionsAccount {
    *
    * Returns a summary of what changed so the caller can log / surface it.
    */
+  /**
+   * TRA-3010 — capture the PRE-restatement half of the record. Called
+   * immediately before {@link restateEngineOpenedBasis} mutates the row; the
+   * post half is filled in by {@link finishEngineBasisRestatement} against the
+   * same object, so the two sides can never be stitched from different rows.
+   */
+  private recordEngineBasisRestatement(opt: OptionPosition, brokerPremium: number): void {
+    const before = opt.premiumPaid;
+    // Ratios are only meaningful against a positive basis; the caller has
+    // already refused a non-positive `premiumPaid`, but a sentinel threshold
+    // (`Infinity` / `0`) is legitimate and must survive into the record as-is
+    // rather than being coerced to a number that reads like a real level.
+    const ratioOf = (v: number): number => (before > 0 ? v / before : Number.NaN);
+    this.engineBasisRestatements.push({
+      ts: Date.now(),
+      positionId: opt.id,
+      optionSymbol: opt.optionSymbol ?? '',
+      contracts: opt.contracts,
+      premiumPaidBefore: before,
+      premiumPaidAfter: Number.NaN,
+      ratio: brokerPremium / before,
+      brokerCostBasisUsd: brokerPremium * opt.contracts * 100,
+      tp1PremiumBefore: opt.tp1Premium,
+      tp1PremiumAfter: Number.NaN,
+      stopLossPremiumBefore: opt.stopLossPremium,
+      stopLossPremiumAfter: Number.NaN,
+      trailingStopPremiumBefore: opt.trailingStopPremium,
+      trailingStopPremiumAfter: Number.NaN,
+      trailingActive: opt.trailingActive,
+      tp1RatioBefore: ratioOf(opt.tp1Premium),
+      tp1RatioAfter: Number.NaN,
+      stopRatioBefore: ratioOf(opt.stopLossPremium),
+      stopRatioAfter: Number.NaN,
+    });
+    if (this.engineBasisRestatements.length > ENGINE_BASIS_RESTATEMENT_LOG_CAP) {
+      this.engineBasisRestatements.splice(
+        0,
+        this.engineBasisRestatements.length - ENGINE_BASIS_RESTATEMENT_LOG_CAP,
+      );
+    }
+  }
+
+  /** TRA-3010 — fill in the POST half of the record just pushed. */
+  private finishEngineBasisRestatement(opt: OptionPosition): void {
+    const rec = this.engineBasisRestatements[this.engineBasisRestatements.length - 1];
+    if (!rec || rec.positionId !== opt.id) return;
+    this.engineBasisRestatedTotal += 1;
+    const after = opt.premiumPaid;
+    const ratioOf = (v: number): number => (after > 0 ? v / after : Number.NaN);
+    rec.premiumPaidAfter = after;
+    rec.tp1PremiumAfter = opt.tp1Premium;
+    rec.stopLossPremiumAfter = opt.stopLossPremium;
+    rec.trailingStopPremiumAfter = opt.trailingStopPremium;
+    rec.tp1RatioAfter = ratioOf(opt.tp1Premium);
+    rec.stopRatioAfter = ratioOf(opt.stopLossPremium);
+    // Persist immediately. bqb1 restarts several times a day and qualifying
+    // rows arrive at most ~once a day, so an in-memory-only record would very
+    // likely be wiped before it was ever read — and an empty buffer after a
+    // restart reads exactly like "the restatement never fired".
+    appendEngineBasisRestatement(process.env['DATA_DIR'], { ...rec });
+  }
+
+  /**
+   * TRA-3010 — read side of the gate-A instrument. `candidates` is the
+   * denominator: zero means the branch never ran, which is BLIND, not a pass.
+   */
+  getEngineBasisRestatementCensus(): {
+    candidates: number;
+    restated: number;
+    retained: number;
+    retentionCap: number;
+    skips: Record<EngineBasisSkipReason, number>;
+    restatements: EngineBasisRestatement[];
+  } {
+    return {
+      candidates: this.engineBasisCandidates,
+      restated: this.engineBasisRestatedTotal,
+      retained: this.engineBasisRestatements.length,
+      retentionCap: ENGINE_BASIS_RESTATEMENT_LOG_CAP,
+      skips: { ...this.engineBasisSkips },
+      restatements: this.engineBasisRestatements.map(r => ({ ...r })),
+    };
+  }
+
   reconcileTradierPositions(
     positions: readonly TradierOpenOptionPosition[],
     mode: AccountMode = 'live',
@@ -5005,13 +5195,32 @@ export class PaperOptionsAccount {
           //     fill against the broker's ORDER status. Restating the basis
           //     underneath them would move the realized P&L they are about to
           //     compute.
-          if ((existing.mode ?? 'demo') !== 'live') continue;
-          if (existing.legs && existing.legs.length > 0) continue;
-          if (existing.coveredWrite) continue;
-          if (existing.pendingExit || existing.pendingCloseOrderId !== undefined) continue;
-          if (!Number.isFinite(incoming.premiumPaid) || incoming.premiumPaid <= 0) continue;
-          if (Math.abs(existing.premiumPaid - incoming.premiumPaid) <= 1e-6) continue;
+          //
+          // TRA-3010 — every arm below is counted, not just the one that acts.
+          // An engine row that reached this branch and was declined is invisible
+          // to `updated`, so without the census a reconcile that restated
+          // NOTHING and one that restated correctly publish the same summary.
+          this.engineBasisCandidates += 1;
+          if ((existing.mode ?? 'demo') !== 'live') { this.engineBasisSkips.not_live += 1; continue; }
+          if (existing.legs && existing.legs.length > 0) { this.engineBasisSkips.multi_leg += 1; continue; }
+          if (existing.coveredWrite) { this.engineBasisSkips.covered_write += 1; continue; }
+          if (existing.pendingExit || existing.pendingCloseOrderId !== undefined) {
+            this.engineBasisSkips.in_flight += 1;
+            continue;
+          }
+          if (!Number.isFinite(incoming.premiumPaid) || incoming.premiumPaid <= 0) {
+            this.engineBasisSkips.broker_premium_unusable += 1;
+            continue;
+          }
+          if (Math.abs(existing.premiumPaid - incoming.premiumPaid) <= 1e-6) {
+            // Our mid already equalled broker truth. The branch is a no-op, so
+            // this row exercises nothing — it must NOT be graded as a pass.
+            this.engineBasisSkips.zero_delta += 1;
+            continue;
+          }
+          this.recordEngineBasisRestatement(existing, incoming.premiumPaid);
           restateEngineOpenedBasis(existing, incoming.premiumPaid);
+          this.finishEngineBasisRestatement(existing);
           // Count it: an engine-opened row was previously invisible to the
           // summary, so a reconcile that fixed nothing for it still reported
           // `updated: 1` — the sweep could not report the gap it was leaving.

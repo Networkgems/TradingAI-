@@ -1,0 +1,155 @@
+/**
+ * TRA-3010 — durable record of every engine-basis restatement (TRA-2889).
+ *
+ * Gate A of TRA-2873 has to prove that the restatement moved an engine-opened
+ * row's `premiumPaid` to broker truth and carried its risk schedule across. The
+ * evidence is destroyed the instant it is produced:
+ *
+ *   • `restateEngineOpenedBasis` overwrites `premiumPaid` in place, and
+ *     `reconcileLivePortfolio` runs on a 30s cadence, so the pre-state survives
+ *     for seconds — no external poller can be relied on to catch it;
+ *   • the thresholds are RESCALED, so `stopLossPremium / premiumPaid` reads the
+ *     same constant before and after. A post-hoc read of the row is therefore
+ *     byte-identical whether the restatement fired or was never wired at all;
+ *   • the broker's `cost_basis` is not published by any read-only route.
+ *
+ * An in-memory buffer is not enough either: bqb1 restarts several times a day
+ * and qualifying rows arrive at most ~once a day (the cost bar blocked 313 of
+ * 314 evaluations on 2026-08-05), so a process-local ledger would very likely be
+ * wiped before anyone read it — and an empty ledger after a restart is
+ * indistinguishable from "the restatement never happened". So records go to
+ * DATA_DIR as JSONL, the same durability substrate `cost-aware-gate-ledger.ts`
+ * uses.
+ *
+ * Volume is inherently tiny (one line per actual basis correction), so this
+ * reads the whole file on demand rather than maintaining a hydrated fold.
+ */
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import { dirname, join } from 'path';
+
+import { logger } from './observability/index.js';
+
+const log = logger.child({ module: 'engine-basis-restatement-log' });
+
+export const ENGINE_BASIS_RESTATEMENT_FILENAME = 'engine-basis-restatements.jsonl';
+
+/** One witnessed restatement: both sides of an edit that is otherwise unobservable. */
+export interface EngineBasisRestatementRecord {
+  ts: number;
+  positionId: string;
+  optionSymbol: string;
+  contracts: number;
+  /** Our pre-restatement basis: the scanner's pre-trade NBBO mid. */
+  premiumPaidBefore: number;
+  /** Broker truth: Tradier `cost_basis / quantity / 100`. */
+  premiumPaidAfter: number;
+  ratio: number;
+  brokerCostBasisUsd: number;
+  tp1PremiumBefore: number;
+  tp1PremiumAfter: number;
+  stopLossPremiumBefore: number;
+  stopLossPremiumAfter: number;
+  trailingStopPremiumBefore: number;
+  trailingStopPremiumAfter: number;
+  trailingActive: boolean;
+  tp1RatioBefore: number;
+  tp1RatioAfter: number;
+  stopRatioBefore: number;
+  stopRatioAfter: number;
+}
+
+/**
+ * Appends that threw and were swallowed. A non-zero value means the counters a
+ * reader sees are NOT backed by disk — published rather than logged-and-lost,
+ * because "no records" and "records we failed to write" grade differently.
+ */
+let appendErrors = 0;
+let lastAppendError: string | null = null;
+
+export function engineBasisRestatementLogPath(dir: string): string {
+  return join(dir, ENGINE_BASIS_RESTATEMENT_FILENAME);
+}
+
+/** Test seam. */
+export function clearEngineBasisRestatementLogErrors(): void {
+  appendErrors = 0;
+  lastAppendError = null;
+}
+
+/**
+ * Best-effort append. IO failure must never break a live reconcile — the
+ * restatement itself is the real work; this is observation. The failure is
+ * counted so it cannot pass as an empty ledger.
+ */
+export function appendEngineBasisRestatement(
+  dir: string | undefined,
+  rec: EngineBasisRestatementRecord,
+): void {
+  if (!dir) return;
+  try {
+    const path = engineBasisRestatementLogPath(dir);
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(rec)}\n`, 'utf8');
+  } catch (err: unknown) {
+    appendErrors += 1;
+    lastAppendError = err instanceof Error ? err.message : String(err);
+    log.warn('engine-basis restatement append failed', {
+      issue: 'TRA-3010',
+      reason: lastAppendError,
+    });
+  }
+}
+
+export interface EngineBasisRestatementLogRead {
+  /** Records recovered from disk, oldest first. */
+  records: EngineBasisRestatementRecord[];
+  /** Lines present but unparseable — surfaced, never silently dropped. */
+  malformedLines: number;
+  appendErrors: number;
+  lastAppendError: string | null;
+  /**
+   * `false` when DATA_DIR is unset or the file does not exist yet. Distinct from
+   * `records: []` with `logPresent: true`, which means the branch really has
+   * produced nothing.
+   */
+  logPresent: boolean;
+  dataDir: string | null;
+}
+
+export function readEngineBasisRestatements(dir: string | undefined): EngineBasisRestatementLogRead {
+  const base: EngineBasisRestatementLogRead = {
+    records: [],
+    malformedLines: 0,
+    appendErrors,
+    lastAppendError,
+    logPresent: false,
+    dataDir: dir ?? null,
+  };
+  if (!dir) return base;
+  const path = engineBasisRestatementLogPath(dir);
+  if (!existsSync(path)) return base;
+  base.logPresent = true;
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    // Unreadable is NOT empty. Leave `logPresent: true` and no records so the
+    // caller cannot read this as "the restatement never ran".
+    return base;
+  }
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as EngineBasisRestatementRecord;
+      if (typeof parsed?.positionId === 'string' && typeof parsed?.premiumPaidBefore === 'number') {
+        base.records.push(parsed);
+      } else {
+        base.malformedLines += 1;
+      }
+    } catch {
+      base.malformedLines += 1;
+    }
+  }
+  return base;
+}

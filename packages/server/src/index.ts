@@ -211,6 +211,7 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 // TRA-2930 — durable per-book EOD archive-participation record.
@@ -11172,6 +11173,67 @@ app.post('/api/tradier/positions/sync', requireAuth, async (req, res) => {
   const summary = ctx.engine.reconcileTradierPositions(env, positions, 'live');
   broadcastEngineState(ctx);
   res.json({ ok: true, env, ...summary });
+});
+
+/**
+ * TRA-3010 (gate A of TRA-2873) — read-only census of engine-basis restatements.
+ *
+ * TRA-2889 restates an engine-opened row's `premiumPaid` from the scanner's
+ * pre-trade mid to the broker's `cost_basis`, and rescales its risk schedule by
+ * the same factor. Both edits are destructive-in-place and the portfolio
+ * reconcile runs every 30s, so by the time any external reader sees the row the
+ * pre-state is gone — and because the thresholds are RESCALED, the surviving
+ * ratios read identically whether the restatement fired or never ran. A
+ * post-hoc read therefore cannot distinguish pass from fail. This publishes the
+ * before/after pair captured at the restatement itself.
+ *
+ * `candidates` is the denominator and is the point of the route: an empty
+ * `restatements` array with `candidates: 0` means the branch never executed
+ * (BLIND), which is NOT the same as a verified restatement, and `skips.zero_delta`
+ * separates "our mid already matched broker truth" (exercises nothing) from a
+ * real match. Grading either as green is the vacuous pass this gate exists to
+ * prevent.
+ *
+ * Behind `requireAuth`, not `/api/health/*`: the payload carries live cost basis
+ * in dollars and the health family is counts-only by design. GET only — it
+ * reads state the reconcile already produced and never triggers a sweep (a sync
+ * would mutate the book under test).
+ */
+app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
+  const username = res.locals['authUser'] as string;
+  const ctx = await userCtx(res);
+  const settings = getSettings(username);
+  const envParam = typeof req.query['env'] === 'string' ? req.query['env'] : undefined;
+  const env: TradierEnv =
+    envParam === 'production' || envParam === 'sandbox'
+      ? envParam
+      : (settings.liveTradierEnvOptions ?? 'sandbox');
+  const memory = ctx.engine.getEngineBasisRestatementCensus(env);
+  const durable = readEngineBasisRestatements(process.env['DATA_DIR']);
+  res.json({
+    ok: true,
+    env,
+    // TRA-2813 — the observation window is stated ON the payload. The counters
+    // below reset on every restart (bqb1 reboots several times a day), so a
+    // zero here means "not since this boot", NOT "never". `uptimeSec` from
+    // `/api/health/version` is the window.
+    sinceBoot: {
+      window: 'process uptime — resets on restart',
+      candidates: memory.candidates,
+      restated: memory.restated,
+      skips: memory.skips,
+    },
+    // Survives restarts. This is the tape gate A is graded against.
+    durable: {
+      logPresent: durable.logPresent,
+      dataDir: durable.dataDir,
+      count: durable.records.length,
+      malformedLines: durable.malformedLines,
+      appendErrors: durable.appendErrors,
+      lastAppendError: durable.lastAppendError,
+      restatements: durable.records,
+    },
+  });
 });
 
 /**

@@ -14152,6 +14152,17 @@ export class SignalEngine {
     return this.optionsAccounts[env].reconcileTradierPositions(positions, mode);
   }
 
+  /**
+   * TRA-3010 — read the engine-basis restatement census for one env. See
+   * `EngineBasisRestatement` in `options-account.ts` for why this cannot be
+   * reconstructed by reading the position row afterwards.
+   */
+  getEngineBasisRestatementCensus(
+    env: TradierEnv,
+  ): ReturnType<PaperOptionsAccount['getEngineBasisRestatementCensus']> {
+    return this.optionsAccounts[env].getEngineBasisRestatementCensus();
+  }
+
   getState(): EngineState {
     const symbols = Array.from(this.symbolState.values()).filter(s => !this.hiddenSymbols.has(s.symbol));
     // TRA-844 — spot resolver for the portfolio Greeks rollup. The options

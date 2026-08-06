@@ -373,4 +373,134 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
       expect(after.premiumPaid).toBeCloseTo(aapl.brokerCostPerShare, 6);
     });
   });
+
+  /**
+   * TRA-3010 — the instrument that makes gate A readable on the live box.
+   *
+   * The restatement is destructive in place and the live reconcile cadence is
+   * 30s, so nothing outside the process can observe the pre-state. Worse, the
+   * thresholds are RESCALED, so `stop / premiumPaid` reads the same constant
+   * whether the restatement fired or was never wired at all. These tests pin the
+   * two properties that make a later live read gradeable rather than vacuous:
+   * the before/after pair is captured, and the DENOMINATOR is published so an
+   * empty ledger cannot be mistaken for a verified one.
+   */
+  describe('TRA-3010 — engine-basis restatement census', () => {
+    const aapl = BOOK[0];
+
+    it('captures the pre-state that the in-place restatement destroys', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.candidates).toBe(1);
+      expect(census.restated).toBe(1);
+      expect(census.restatements).toHaveLength(1);
+
+      const rec = census.restatements[0]!;
+      expect(rec.optionSymbol).toBe(aapl.optionSymbol);
+      // The whole point: the scanner mark is unrecoverable from the row after
+      // the fact, so it has to be here.
+      expect(rec.premiumPaidBefore).toBeCloseTo(aapl.scannerMark, 6);
+      expect(rec.premiumPaidAfter).toBeCloseTo(aapl.brokerCostPerShare, 6);
+      expect(rec.premiumPaidBefore).not.toBeCloseTo(rec.premiumPaidAfter, 6);
+
+      // Assertion 2 of the gate, to the cent, against broker truth.
+      expect(rec.brokerCostBasisUsd).toBeCloseTo(
+        aapl.brokerCostPerShare * aapl.contracts * 100,
+        2,
+      );
+
+      // Assertion 3: rescaled, not recomputed — the ratios are invariant.
+      expect(rec.stopRatioAfter).toBeCloseTo(rec.stopRatioBefore, 10);
+      expect(rec.tp1RatioAfter).toBeCloseTo(rec.tp1RatioBefore, 10);
+      // ...and the levels themselves DID move, which is what distinguishes a
+      // carried schedule from an untouched one (equal ratios alone cannot).
+      expect(rec.stopLossPremiumAfter).not.toBeCloseTo(rec.stopLossPremiumBefore, 6);
+      expect(rec.tp1PremiumAfter).not.toBeCloseTo(rec.tp1PremiumBefore, 6);
+    });
+
+    it('BLIND, not PASS: no engine row means the branch never ran', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      // Exactly today's live book: a payload with nothing of ours in it.
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.candidates).toBe(0);
+      expect(census.restated).toBe(0);
+      expect(census.restatements).toHaveLength(0);
+      // The denominator is what separates this from the case below. Both hand
+      // back an empty `restatements`; only `candidates` says which one it is.
+    });
+
+    it('separates a NO-OP match from a real one — the vacuous-green trap', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      // Broker cost basis lands exactly on the scanner mark (no spread crossed).
+      // The restatement correctly does nothing — but a reader that only checked
+      // "premiumPaid == broker cost_basis" would score this as a PASS while the
+      // corrected branch never executed a single line.
+      acct.reconcileTradierPositions([
+        { ...buildBrokerPosition(aapl), premiumPaid: aapl.scannerMark },
+      ]);
+
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.candidates).toBe(1);
+      expect(census.restated).toBe(0);
+      expect(census.skips.zero_delta).toBe(1);
+      expect(census.restatements).toHaveLength(0);
+    });
+
+    it('counts a declined carve-out instead of dropping it silently', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      const opened = openLive(acct, aapl)!;
+      // An in-flight row is owned by the close poller; the restatement must
+      // stand aside — and must SAY it stood aside.
+      opened.pendingCloseOrderId = 'ord-tra3010';
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.candidates).toBe(1);
+      expect(census.restated).toBe(0);
+      expect(census.skips.in_flight).toBe(1);
+      expect(census.skips.zero_delta).toBe(0);
+    });
+
+    it('keeps `restated` monotonic while the record buffer stays bounded', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+
+      // Walk the basis so every pass is a genuine restatement rather than a
+      // zero-delta skip.
+      const passes = 60;
+      for (let i = 1; i <= passes; i += 1) {
+        acct.reconcileTradierPositions([
+          { ...buildBrokerPosition(aapl), premiumPaid: aapl.scannerMark + i * 0.01 },
+        ]);
+      }
+
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.restated).toBe(passes);
+      expect(census.retained).toBe(census.retentionCap);
+      expect(census.restatements).toHaveLength(census.retentionCap);
+      // Truncation must be visible: `restated` > `retained` is the signal that
+      // the ledger no longer holds the whole tape.
+      expect(census.restated).toBeGreaterThan(census.retained);
+    });
+
+    it('hands back copies — a reader cannot mutate the ledger', () => {
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+
+      const first = acct.getEngineBasisRestatementCensus();
+      first.restatements[0]!.premiumPaidBefore = 999;
+      first.skips.zero_delta = 999;
+
+      const second = acct.getEngineBasisRestatementCensus();
+      expect(second.restatements[0]!.premiumPaidBefore).toBeCloseTo(aapl.scannerMark, 6);
+      expect(second.skips.zero_delta).toBe(0);
+    });
+  });
 });
