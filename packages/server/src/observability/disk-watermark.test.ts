@@ -153,3 +153,52 @@ describe('disk watermark (TRA-3011)', () => {
     expect(diskReadingAgeSec(getDiskWatermark(), T0 + 120_000)).toBe(120);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The wiring, end to end. Everything above tests `recordDiskReading` in
+// isolation, which cannot show that anything CALLS it — and a watermark nobody
+// feeds is exactly the shape of instrument this ticket exists to stop shipping.
+// ---------------------------------------------------------------------------
+
+describe('readDiskSpace feeds the watermark (TRA-3011)', () => {
+  beforeEach(() => __resetDiskWatermarkForTest());
+
+  it('a real statfs lands a sample, and the pure reader still dispatches nothing', async () => {
+    const { readDiskSpace, getRecentAlerts, __resetAlertsForTest, diskMinFreePct } =
+      await import('./alerts.js');
+    __resetAlertsForTest();
+    expect(getDiskWatermark().readings).toBe(0);
+
+    const r = await readDiskSpace(process.cwd());
+    expect(r).not.toBeNull();
+
+    const w = getDiskWatermark();
+    expect(w.readings).toBe(1);
+    expect(w.freePctMin).toBe(r!.freePct);
+    expect(w.lastReadingAt).not.toBeNull();
+    // Derive the expected verdict from THIS host's real reading rather than
+    // hard-coding "a dev disk has headroom" — the first draft did assume that
+    // and failed on a workstation sitting at 4.6% free, which is a correct
+    // reading of a genuinely full disk, not a bug. A test that assumes the
+    // machine it runs on is healthy has no failing state on the machines that
+    // are not.
+    const expected =
+      r!.freePct < diskMinFreePct()
+      || (r!.inodeFreePct !== null && r!.inodeFreePct < diskMinFreePct());
+    expect(w.lastBelowThreshold).toBe(expected);
+    expect(w.belowThresholdSeen).toBe(expected);
+    // TRA-2357's purity guarantee, still intact: an anonymous poll of
+    // /api/health/storage contributes a sample and CANNOT fire an alert or
+    // consume the real `disk-near-full` throttle window.
+    expect(getRecentAlerts()).toHaveLength(0);
+  });
+
+  it('a statfs that FAILS is still recorded — an unreadable volume is not a quiet one', async () => {
+    const { readDiskSpace } = await import('./alerts.js');
+    expect(await readDiskSpace('/definitely/not/a/real/mount/tra3011')).toBeNull();
+    const w = getDiskWatermark();
+    expect(w.readings).toBe(1);
+    expect(w.failedReadings).toBe(1);
+    expect(w.lastBelowThreshold).toBeNull(); // unknown, never false
+  });
+});
