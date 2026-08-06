@@ -5069,7 +5069,19 @@ export class PaperOptionsAccount {
     opt.contractsRemaining = 0;
     this.cash += closeMark * remainingContracts * 100;
     this.equity += realized;
-    this.optionsPnlByMode.demo += realized;
+    // TRA-2885 — through the choke point. The docblock above has always claimed
+    // this settle "books the close through the normal realized-P&L path"; the
+    // bare `optionsPnlByMode.demo +=` it used did not, so the realized combo
+    // result never reached `realizedPnlSink` and never grew the book
+    // {@link sizingEquity} measures against.
+    //
+    // `'demo'` stays a LITERAL rather than `opt.mode ?? 'demo'`: `checkExits`
+    // hard-gates this branch on BOTH `mode === 'demo'` and
+    // `(opt.mode ?? 'demo') === 'demo'`, so the literal is the same value with
+    // no new branch — and passing `opt.mode` would quietly widen the one accrual
+    // in this class whose sink credit actually LANDS (the bridge drops every
+    // `mode !== 'demo'` credit; see `options-equity-bridge.ts`).
+    this.bookRealizedPnl('demo', realized);
     this.openOptions.delete(id);
     this.closedOptions.push({ ...opt });
     // TRA-991 — fold the realized outcome onto this trade's journal row with the
@@ -6299,19 +6311,38 @@ export class PaperOptionsAccount {
    * ("estimate now, restate later"):
    *
    * The estimate is only defensible where a restatement exists, and on this path
-   * NONE of the three axes it moves can be restated:
+   * NEITHER axis it moves can be restated (this list read THREE axes until the
+   * TRA-2885 correction below struck the middle one as false):
    *   • paper `cash` / `equity` — the EOD reconcile's only mutation is
    *     {@link addReconciledTradierPnl}, which touches `optionsPnlByMode` and
    *     nothing else. Cash credited at the mark ($88 on the SPY 820C row against
    *     the $14 the open debited) is never removed by anything.
-   *   • the SIZING equity book — `closeOption` books through
-   *     {@link bookRealizedPnl}, whose `realizedPnlSink` credits the owning
-   *     `PaperAccount` (TRA-2323), and that book is what {@link sizingEquity}
-   *     measures against. `addReconciledTradierPnl` does a bare
-   *     `optionsPnlByMode.live +=` and so NEVER reaches that sink. The estimate
-   *     therefore inflates the bucket that authorises real orders, permanently.
    *   • the archived row's `pnl`, which `dailyRealizedOptionsPnlForMode` sums —
    *     also never restated.
+   *
+   * TRA-2885 CORRECTION — a third bullet stood here and was WRONG. It read: the
+   * estimate reaches the SIZING equity book because `closeOption` goes through
+   * {@link bookRealizedPnl} → `realizedPnlSink` → `PaperAccount` (TRA-2323),
+   * while `addReconciledTradierPnl` does a bare `optionsPnlByMode.live +=` and
+   * "NEVER reaches that sink" — an asymmetry that would let an estimate inflate
+   * the order-authorising book permanently.
+   *
+   * There is no such asymmetry. `bindOptionsPnlToEquityBook` opens with
+   * `if (mode !== 'demo') return;`, and this path is live-only by its own guard
+   * (`(opt.mode ?? 'demo') !== 'live'` returns null above). So the ESTIMATE is
+   * dropped at the sink exactly as the restatement is: NEITHER side has ever
+   * touched sizing equity, and the bare accrual was never the reason. TRA-2885
+   * routed all three dot-form accruals through the choke point and moved $0.
+   *
+   * Two consequences, both load-bearing:
+   *   • the decision above is UNCHANGED — bullets 1 and 3 stand on their own, and
+   *     break-even still invents no dollars;
+   *   • "estimate now, restate later" for the LIVE sizing book is not unlocked by
+   *     any call-site change. It requires the bridge to start crediting live P&L,
+   *     which double-counts against the TRA-359 broker-truth `combinedPnl`
+   *     override (`settings.mode === 'live'`, regardless of Tradier env). Anyone
+   *     reopening this trade-off should be reading `options-equity-bridge.ts`,
+   *     not this method.
    *
    * Break-even is correct in BOTH worlds the sweep cannot tell apart:
    *   • the broker closed the contract out-of-band → EOD adds broker truth on
@@ -6322,8 +6353,11 @@ export class PaperOptionsAccount {
    * been refused, while understating it can only refuse one.
    *
    * Cost of the choice, stated rather than hidden: in the out-of-band-close world
-   * `cash` / `equity` / the sizing book end SHORT by the real proceeds, because
-   * only `optionsPnlByMode` gets broker truth. That gap is the pre-existing
+   * the bucket's own `cash` / `equity` end SHORT by the real proceeds, because
+   * only `optionsPnlByMode` gets broker truth. (TRA-2885: the sizing book was
+   * named here too — it does not belong. It receives no live P&L on ANY path, so
+   * it is not short by the proceeds, it is simply not in this ledger.) That gap
+   * is the pre-existing
    * imported-branch behaviour (nothing has ever restated cash), not a new class
    * of error — and it errs conservative. Extending the EOD reconcile to restate
    * cash (option 3 on the ticket) is not implementable from the data it has:
@@ -6613,7 +6647,18 @@ export class PaperOptionsAccount {
    */
   private applyRealtimeImportedPnl(pnl: number): void {
     if (!Number.isFinite(pnl) || pnl === 0) return;
-    this.optionsPnlByMode.live += pnl;
+    // TRA-2885 — through the choke point. `'live'` is a LITERAL, preserving the
+    // hardcoded bucket this line has always used: an imported fill is a Tradier
+    // fill by definition, and reading `opt.mode` here would be a new branch, not
+    // a fix.
+    //
+    // NO behaviour change: `bindOptionsPnlToEquityBook` drops every
+    // `mode !== 'demo'` credit, so the sink call is INERT on this path. Routing
+    // it anyway is the point — the choke-point invariant becomes true, and if the
+    // bridge's live policy is ever revisited, the imported/reconciled dollars move
+    // WITH the engine ones instead of leaving a half-routed book (the TRA-2210
+    // failure mode TRA-2323 exists to prevent).
+    this.bookRealizedPnl('live', pnl);
     const dateKey = toDateKey(Date.now());
     const prev = this.realtimeImportedPnlByDate.get(dateKey) ?? 0;
     this.realtimeImportedPnlByDate.set(dateKey, prev + pnl);
@@ -6863,10 +6908,26 @@ export class PaperOptionsAccount {
    * reconcile pass dedups Tradier transaction ids via a per-user cursor
    * file before invoking this, so a double-call here would
    * double-count.
+   *
+   * TRA-2885 — routed through {@link bookRealizedPnl}. Read the note in the
+   * body before treating this as the fix for "EOD truth cannot restate sizing
+   * equity": it is NOT. That blocker lives in the bridge, not here.
    */
   addReconciledTradierPnl(amount: number): void {
     if (!Number.isFinite(amount) || amount === 0) return;
-    this.optionsPnlByMode.live += amount;
+    // TRA-2885 — through the choke point, `'live'` a LITERAL (broker truth is
+    // live truth by definition; the caller is the EOD Tradier reconcile).
+    //
+    // ⚠ THIS DOES NOT MAKE THE EOD RESTATEMENT REACH SIZING EQUITY, and TRA-2885
+    // was filed believing it would. `bindOptionsPnlToEquityBook` opens with
+    // `if (mode !== 'demo') return;`, so a live credit is dropped AT THE SINK —
+    // it never mattered that this line was a bare accrual. The sole gate on live
+    // realized P&L reaching `PaperAccount` is that mode filter, and flipping it
+    // is a deliberate policy decision about double-counting against the TRA-359
+    // broker-truth `combinedPnl` override, not a call-site cleanup. So this
+    // change moves ZERO dollars on the live book; see
+    // {@link closeBrokerFlatPosition}'s docblock, corrected on the same ticket.
+    this.bookRealizedPnl('live', amount);
   }
 
   /**

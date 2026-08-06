@@ -28,6 +28,28 @@ import type { PaperOptionsAccount } from './options-account.js';
  * is the broker balance — `index.ts` already overrides live `combinedPnl` from
  * it (TRA-359). Crediting live option P&L into the paper `PaperAccount` would
  * invent paper equity from broker fills and double-count against that override.
+ *
+ * ## TRA-2885 — this filter is the SOLE gate, and it is where the live question lives
+ *
+ * As of TRA-2885 every realized-P&L accrual in `PaperOptionsAccount` — engine
+ * closes, the demo combo settle, the imported-fill realtime estimate, and the EOD
+ * Tradier restatement — routes through `bookRealizedPnl`, so every one of them
+ * offers its delta to the sink below. The `mode !== 'demo'` line is therefore the
+ * one and only place live realized P&L is refused entry to the sizing book.
+ *
+ * That matters because TRA-2801 (and TRA-2885's own description) recorded the
+ * opposite diagnosis: that `addReconciledTradierPnl`'s bare `optionsPnlByMode.live
+ * +=` was why EOD broker truth could never restate sizing equity, and that routing
+ * it through the choke point would change live buying-power behaviour. It would
+ * not, and it did not — the credit was always dropped here. Routing the three
+ * dot-form accruals moved $0 on the live book.
+ *
+ * So "estimate now, restate later" for the LIVE sizing book is a decision about
+ * THIS LINE, not about any call site. Whoever reopens it owns the double-count
+ * against the TRA-359 override (gated on `settings.mode === 'live'` regardless of
+ * Tradier env — see `equity-backfill-credit.ts`'s header for why the env is the
+ * wrong discriminator), and owns it for the WHOLE live book at once, since all
+ * four accrual paths now arrive here together.
  */
 export function bindOptionsPnlToEquityBook(
   optionsAccount: PaperOptionsAccount,

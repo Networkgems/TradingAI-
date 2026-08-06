@@ -4,6 +4,9 @@ import { join } from 'path';
 import { PaperAccount } from './paper-account.js';
 import { PaperOptionsAccount } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
+// TRA-2885 — the demo combo settle is only reachable with the exit params the
+// `ENABLE_OPTION_MULTILEG_EXIT` flag hands `checkExits`.
+import { DEFAULT_MULTILEG_EXIT_PARAMS as MULTILEG_PARAMS } from '@trading-app/engine';
 import type { RelativeValueSignal, TradeSignal } from '@trading-app/shared';
 
 /**
@@ -230,22 +233,30 @@ describe('TRA-2323 — the choke point is the ONLY realized-P&L mutation site', 
   /**
    * TRA-2801 — the invariant above had no fail state for the form that actually
    * escaped. Its regex requires BRACKET indexing (`optionsPnlByMode[...] +=`), so
-   * the three DOT-notation accruals that exist right now
-   * (`optionsPnlByMode.demo +=`, `.live +=`) were invisible to it and it reported
-   * a clean `[]`. The claim "the choke point is the ONLY mutation site" has been
-   * false since it was written.
+   * three DOT-notation accruals (`optionsPnlByMode.demo +=`, `.live +=`) were
+   * invisible to it and it reported a clean `[]`. The claim "the choke point is
+   * the ONLY mutation site" was false from the day it was written.
    *
-   * That is not cosmetic. `bookRealizedPnl` is what fires `realizedPnlSink` into
-   * the owning `PaperAccount` — the book `sizingEquity()` measures against. Every
-   * accrual listed below therefore never reaches the sizing authority, and in
-   * particular `addReconciledTradierPnl` (the EOD restatement) cannot correct an
-   * estimate that DID reach it via `bookRealizedPnl`. That asymmetry is what
-   * TRA-2801 had to route around in `closeBrokerFlatPosition`, and TRA-2885
-   * tracks routing these three through the choke point.
+   * TRA-2885 — all three now route through `bookRealizedPnl`, so `KNOWN_BYPASSES`
+   * is EMPTY and the claim is finally true. What each one was, and why it moved:
    *
-   * SET EQUALITY, not a subset: a fourth bypass fails this, and so does FIXING
-   * one of the three without deleting its line here. An allowlist that can go
-   * stale silently is the trap this test exists to avoid.
+   *   • `evaluateComboExit` (the demo combo settle — TRA-1418, filed on TRA-2885
+   *     as `resolveCombo`, which is not a symbol that exists) — ROUTED, and this
+   *     is the only one of the three that changed a dollar. Demo P&L is what the
+   *     sink credits, so a resolved combo now grows the sizing book like every
+   *     other demo close. Dormant on bqb1 today: gated on
+   *     `ENABLE_OPTION_MULTILEG_EXIT`, absent from process.env, the demo-flags
+   *     overlay, and both self-heal default maps.
+   *   • `applyRealtimeImportedPnl` (TRA-367) and `addReconciledTradierPnl`
+   *     (TRA-348) — ROUTED, $0 moved. Both are live-mode, and
+   *     `bindOptionsPnlToEquityBook` drops `mode !== 'demo'` AT THE SINK. The
+   *     TRA-2801 note calling the second one the reason "estimate now, restate
+   *     later" was unavailable for sizing equity was wrong: the estimate side is
+   *     dropped by the same filter. See the correction in that docblock.
+   *
+   * SET EQUALITY, not a subset — with an empty allowlist that means the choke
+   * point must be the sole match. A newly added bypass fails this, and so does
+   * quietly re-adding one of the three.
    */
   it('every optionsPnlByMode accrual — dot form INCLUDED — is a known site', () => {
     const src = readFileSync(join(__dirname, 'options-account.ts'), 'utf-8');
@@ -256,18 +267,67 @@ describe('TRA-2323 — the choke point is the ONLY realized-P&L mutation site', 
 
     // The choke point.
     const CHOKE_POINT = 'this.optionsPnlByMode[mode] += delta;';
-    // The three that bypass it today. Each is a bare accrual the sink never sees.
-    const KNOWN_BYPASSES = [
-      // `resolveCombo` — demo-only combo settle (TRA-1966 era).
-      'this.optionsPnlByMode.demo += realized;',
-      // `applyRealtimeImportedPnl` — the imported-fill realtime estimate (TRA-367).
-      'this.optionsPnlByMode.live += pnl;',
-      // `addReconciledTradierPnl` — the EOD restatement (TRA-348). THIS is the one
-      // that makes "estimate now, restate later" unavailable for sizing equity.
-      'this.optionsPnlByMode.live += amount;',
-    ];
+    // TRA-2885 — emptied. Re-adding an entry here needs the justification to live
+    // in the SOURCE, next to the accrual, not in this list.
+    const KNOWN_BYPASSES: string[] = [];
 
     expect([...new Set(found)].sort()).toEqual([CHOKE_POINT, ...KNOWN_BYPASSES].sort());
+  });
+
+  /**
+   * TRA-2885 — the sweep above is a text test; these two are the behavioural
+   * halves of the same claim, because "routed" and "routed and it matters" are
+   * different statements and only one of them is true per mode.
+   */
+  it('the DEMO combo settle now credits the equity book (the one dollar-moving route)', () => {
+    const { equityBook, options } = makeBook();
+    const pos = options.openDefinedRiskSpread({
+      symbol: 'AAPL',
+      strategy: 'bull_put_spread',
+      legs: [
+        { action: 'sell', optionType: 'put', strike: 95, expiration: '2024-07-05' },
+        { action: 'buy', optionType: 'put', strike: 94, expiration: '2024-07-05' },
+      ],
+      // $1 wide, $45 credit. Sized for the $2k book: the per-trade max-loss gate
+      // caps risk at $100 here, so the $320 spread the multileg suite uses on its
+      // $50k book is REJECTED at open and the settle never runs.
+      netUsd: 45,
+      maxLossUsd: 55,
+      maxProfitUsd: 45,
+      breakevens: [94.55],
+      spot: 100,
+      targetContracts: 1, // pin one lot so the P&L reads per-lot on the $2k book
+    });
+    expect(pos).not.toBeNull();
+    expect(equityBook.getState().totalEquity).toBe(INITIAL);
+
+    // Legs decayed to 0.30 / 0.08 → markNet = 100×(0.08 − 0.30) = −22;
+    // openPnl = −22 + 45 = +23 = 51.1% of the $45 max profit ≥ the 50% capture.
+    const marks = new Map([['AAPL240705P00095000', 0.30], ['AAPL240705P00094000', 0.08]]);
+    // First tick is blocked by min_hold_bars (barsHeld 0); the second fires.
+    options.checkExits(new Map(), marks, 'demo', {}, undefined, undefined, undefined, MULTILEG_PARAMS);
+    const closed = options.checkExits(new Map(), marks, 'demo', {}, undefined, undefined, undefined, MULTILEG_PARAMS);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].pnl).toBeCloseTo(23, 5);
+
+    // Pre-TRA-2885 both of these read INITIAL / 0 — the combo resolved to a real
+    // WIN and the book it was supposed to grow never saw a cent of it.
+    expect(equityBook.getState().totalEquity).toBeCloseTo(INITIAL + 23, 5);
+    expect(equityBook.getOptionsCredited()).toBeCloseTo(23, 5);
+  });
+
+  it('the EOD live restatement still moves $0 of equity — the sink drops it, not the call site', () => {
+    const { equityBook, options } = makeBook();
+    // The EOD Tradier reconcile's only mutation, now through the choke point.
+    options.addReconciledTradierPnl(250);
+
+    // It lands in the live bucket…
+    expect(options.getStateForMode('live').optionsPnl).toBeCloseTo(250, 6);
+    // …and nowhere near the book that authorises orders. This is the assertion
+    // TRA-2801 and TRA-2885 both assumed would flip when the accrual was routed.
+    // It does not: `bindOptionsPnlToEquityBook` refuses `mode !== 'demo'`.
+    expect(equityBook.getState().totalEquity).toBe(INITIAL);
+    expect(equityBook.getOptionsCredited()).toBe(0);
   });
 
   /**
