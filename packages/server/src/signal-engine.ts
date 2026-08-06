@@ -6844,18 +6844,37 @@ export class SignalEngine {
     const client = this.tradierOptionsClientByEnv[env];
     if (!client) return false;
 
-    let positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[];
+    // TRA-3073 — the SECOND consumer with the same exposure, and it closes a
+    // row too. The confirming read is the whole point of this method: the
+    // "closing a long position" rejection is ambiguous between a genuinely flat
+    // account and one whose quantity is reserved by a working order, and only
+    // `/positions` separates them. Under `listOpenOptionPositions` a non-2xx
+    // came back as `[]`, `some()` was false, and the ambiguity collapsed to
+    // "flat" — booking a break-even close on a position the broker still holds.
+    // The catch below already said the right thing for a throw ("leaving row
+    // open"); a 401 now takes the same branch instead of walking past it.
+    let read: import('@trading-app/engine').TradierPositionsRead;
     try {
-      positions = await client.listOpenOptionPositions();
+      read = await client.readOpenOptionPositions();
     } catch (err: unknown) {
+      read = {
+        ok: false,
+        reason: 'transport',
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (!read.ok) {
       log.warn('flat-broker rejection check could not read positions — leaving row open', {
         component: 'tradier-flat-reconcile',
         optionSymbol,
         env,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: read.reason,
+        detail: read.detail,
       });
       return false;
     }
+    const positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[] =
+      read.positions;
     if (positions.some(p => p.optionSymbol === optionSymbol)) {
       // Broker still holds it — the rejection was the "check open orders"
       // variant (quantity reserved by a working order), not a flat account.
@@ -14429,8 +14448,8 @@ export class SignalEngine {
    *
    *   • the engine is not in live mode, or has no Tradier client — the sweep is
    *     DARK and nothing was ever going to be measured;
-   *   • `listOpenOptionPositions()` threw — the broker was unreadable, which on
-   *     a day-long outage reads exactly like "no engine row arrived";
+   *   • the positions read FAILED — the broker was unreadable, which on a
+   *     day-long outage reads exactly like "no engine row arrived";
    *   • the account was idle — a true no-op, but only meaningful if you can see
    *     that it was the reason;
    *   • the sweep ran end to end and there simply was no engine-opened row —
@@ -14446,11 +14465,22 @@ export class SignalEngine {
     lastReachedAt: number | null;
     lastOutcome: string | null;
     skipped: Record<'mode' | 'no_client' | 'cadence' | 'empty' | 'fetch_failed', number>;
+    /**
+     * TRA-3073 — the `fetch_failed` COUNT says how often the broker was
+     * unreadable; this says WHY the last one was. The two failures the count
+     * folds together have opposite remedies: `http_status` on a live token is
+     * an ops action (the token is dead / rate-limited and NOTHING will heal it
+     * until someone rotates it), while `transport` is a network flap that heals
+     * itself. 400 skips against `HTTP 401` is an incident; 400 skips against
+     * `socket reset` is a bad afternoon.
+     */
+    lastFetchFailure: { reason: string; detail: string; at: number } | null;
   } = {
     reached: 0,
     lastReachedAt: null,
     lastOutcome: null,
     skipped: { mode: 0, no_client: 0, cadence: 0, empty: 0, fetch_failed: 0 },
+    lastFetchFailure: null,
   };
 
   /** TRA-3010 — read side of the sweep witness above. */
@@ -14459,12 +14489,16 @@ export class SignalEngine {
     lastReachedAt: number | null;
     lastOutcome: string | null;
     skipped: Record<'mode' | 'no_client' | 'cadence' | 'empty' | 'fetch_failed', number>;
+    lastFetchFailure: { reason: string; detail: string; at: number } | null;
   } {
     return {
       reached: this.engineBasisSweeps.reached,
       lastReachedAt: this.engineBasisSweeps.lastReachedAt,
       lastOutcome: this.engineBasisSweeps.lastOutcome,
       skipped: { ...this.engineBasisSweeps.skipped },
+      lastFetchFailure: this.engineBasisSweeps.lastFetchFailure
+        ? { ...this.engineBasisSweeps.lastFetchFailure }
+        : null,
     };
   }
 
@@ -14679,14 +14713,48 @@ export class SignalEngine {
       return { skipped: 'empty', ...empty };
     }
 
-    let positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[];
+    // TRA-3073 — `readOpenOptionPositions`, NOT `listOpenOptionPositions`.
+    //
+    // This is the line that books phantom closes. The old call went through
+    // `getJson`, which maps EVERY non-2xx to `null`, and `parseTradierPositions
+    // (null)` is `[]` — byte-identical to the answer for an account that
+    // genuinely holds nothing. The `try/catch` below only ever caught a
+    // transport THROW; a 401 / 429 / 500 / 503 is not a throw, so an outage
+    // sailed past it and handed `reconcileTradierPositions` an empty map.
+    //
+    // Downstream, an empty map is not inert. Every eligible engine-opened live
+    // row misses, `brokerMissingSweeps` increments, and because that counter is
+    // only ever reset by the broker REPORTING the symbol, a sustained non-2xx
+    // satisfies `BROKER_MISSING_SWEEPS_TO_CLOSE = 2` on the second cadence
+    // window — ~30s in — and books a break-even close on the whole live book.
+    // The rows leave Open Options, exits stop being evaluated against them, and
+    // the positions are still really open at the broker. The 2-sweep guard is
+    // the right guard for the one-off snapshot blip it was written for; it does
+    // nothing here, because the outage is what produces both samples.
+    //
+    // So an unreadable broker must be BLIND, never flat — the same reading
+    // TRA-3067 built this method for. `ok: true, positions: []` is still a real
+    // empty book (Tradier answers 2xx with the literal `positions: "null"`) and
+    // still books the close after two misses; disabling THAT would silently
+    // revert TRA-2799.
+    let read: import('@trading-app/engine').TradierPositionsRead;
     try {
-      positions = await client.listOpenOptionPositions();
+      read = await client.readOpenOptionPositions();
     } catch (err: unknown) {
-      log.warn('list positions failed', {
+      // `readOpenOptionPositions` catches its own transport errors, so this is
+      // belt-and-braces for a client that throws before it gets that far.
+      read = {
+        ok: false,
+        reason: 'transport',
+        detail: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (!read.ok) {
+      log.warn('positions read failed — skipping sweep, NOT treating the broker as flat', {
         component: 'tradier-portfolio-reconcile',
         env,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: read.reason,
+        detail: read.detail,
       });
       // Still bump the timestamp so a Tradier outage doesn't burn the cadence
       // budget with a tight retry loop; the next tick after the window will
@@ -14695,10 +14763,18 @@ export class SignalEngine {
       // TRA-3010 — the census is NOT reached on this path. A Tradier outage
       // that lasts a session publishes `candidates: 0`, which is the same
       // reading as "the branch ran and found no engine row". Count it.
+      //
+      // TRA-3073 acceptance 3: the skip is COUNTED, not silent. A session that
+      // skipped 400 sweeps on a dead token is readable off
+      // `/api/options/basis-restatements` without a log dig, and
+      // `lastFetchFailure` names which failure it was.
       witness.skipped.fetch_failed += 1;
       witness.lastOutcome = 'fetch-failed';
+      witness.lastFetchFailure = { reason: read.reason, detail: read.detail, at: now };
       return { skipped: null, ...empty };
     }
+    const positions: readonly import('@trading-app/engine').TradierOpenOptionPosition[] =
+      read.positions;
 
     this.lastTradierPortfolioReconcileAt = now;
     // TRA-3010 — the positive witness: past this line the census branch runs,

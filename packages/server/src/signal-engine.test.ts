@@ -113,6 +113,11 @@ import {
   summarizeLiveEnforceGate,
 } from './live-enforce-gate-ledger.js'; // TRA-2763
 import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
+// TRA-3073 — the REAL client, as a value. The acceptance suite for the
+// broker-flat sweep has to feed it status codes over a stubbed `fetch`: the
+// whole defect is that a non-2xx and an empty book arrive at the sweep as the
+// same `[]`, and a method-level stub cannot express that difference.
+import { TradierOptionsClient as RealTradierOptionsClient } from '@trading-app/engine';
 import {
   clearLiveOptionsFeeSlippageLedger,
   summarizeLiveOptionsFeeSlippage,
@@ -2923,8 +2928,16 @@ describe('SignalEngine — TRA-392 pending-close fill-chaser', () => {
 // These tests drive `reconcileLivePortfolio` directly so we can assert
 // the skip / fetch / dedupe behaviours without standing up a full tick.
 describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
+  // TRA-3073 — the sweep now reads through `readOpenOptionPositions`, which
+  // keeps the failure state. `readOpenOptionPositions` returns `[]` for both a
+  // real empty book and a 401, and feeding THAT to the broker-flat sweep is
+  // what booked phantom closes. These stubs speak the envelope.
   interface ListPositionsStub {
-    listOpenOptionPositions: ReturnType<typeof vi.fn>;
+    readOpenOptionPositions: ReturnType<typeof vi.fn>;
+  }
+  /** A 2xx read of a real book (possibly genuinely empty). */
+  function okRead(positions: unknown[] = []) {
+    return { ok: true as const, positions };
   }
   type EngineInternals = {
     tradierOptionsClientByEnv: Record<TradierEnv, unknown>;
@@ -2991,13 +3004,13 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
   }
 
   it('skips the network call entirely in demo mode', async () => {
-    const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn() };
+    const stub: ListPositionsStub = { readOpenOptionPositions: vi.fn() };
     const engine = setupEngine({ mode: 'demo', client: stub });
 
     const summary = await engine.reconcileLivePortfolio();
 
     expect(summary.skipped).toBe('mode');
-    expect(stub.listOpenOptionPositions).not.toHaveBeenCalled();
+    expect(stub.readOpenOptionPositions).not.toHaveBeenCalled();
   });
 
   it('skips when no Tradier client is configured for the active env', async () => {
@@ -3009,13 +3022,13 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
   });
 
   it('skips when the active env has no open rows, no pending exits, and no pending closes', async () => {
-    const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn() };
+    const stub: ListPositionsStub = { readOpenOptionPositions: vi.fn() };
     const engine = setupEngine({ client: stub });
 
     const summary = await engine.reconcileLivePortfolio();
 
     expect(summary.skipped).toBe('empty');
-    expect(stub.listOpenOptionPositions).not.toHaveBeenCalled();
+    expect(stub.readOpenOptionPositions).not.toHaveBeenCalled();
   });
 
   it('fetches Tradier positions and imports a new external open into the active env', async () => {
@@ -3023,7 +3036,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     // different OCC symbol than the Tradier response so the import path
     // adds the second row instead of just updating the seed.
     const stub: ListPositionsStub = {
-      listOpenOptionPositions: vi.fn().mockResolvedValue([
+      readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([
         {
           optionSymbol: 'MSFT240705C00400000',
           underlying: 'MSFT',
@@ -3034,7 +3047,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
           premiumPaid: 1.10,
           acquiredAt: TRADING_TIME,
         },
-      ]),
+      ])),
     };
     const engine = setupEngine({ client: stub });
     openLiveEngineRow(engine, 'sandbox');
@@ -3043,7 +3056,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
 
     expect(summary.skipped).toBeNull();
     expect(summary.added).toBe(1);
-    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+    expect(stub.readOpenOptionPositions).toHaveBeenCalledTimes(1);
     const liveRows = asInternals(engine).optionsAccounts.sandbox.getStateForMode('live').openOptions;
     expect(liveRows.map(r => (r as unknown as { optionSymbol?: string }).optionSymbol).sort()).toEqual([
       'AAPL240705C00200000',
@@ -3055,7 +3068,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     // Engine-opened (importedFromTradier=false) row with the same OCC symbol
     // Tradier surfaces. Reconcile must skip it rather than mint a second copy.
     const stub: ListPositionsStub = {
-      listOpenOptionPositions: vi.fn().mockResolvedValue([
+      readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([
         {
           optionSymbol: 'AAPL240705C00200000',
           underlying: 'AAPL',
@@ -3066,7 +3079,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
           premiumPaid: 1.0,
           acquiredAt: TRADING_TIME,
         },
-      ]),
+      ])),
     };
     const engine = setupEngine({ client: stub });
     openLiveEngineRow(engine, 'sandbox');
@@ -3081,7 +3094,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
 
   it('enforces the cadence — a second call inside the window is short-circuited', async () => {
     const stub: ListPositionsStub = {
-      listOpenOptionPositions: vi.fn().mockResolvedValue([]),
+      readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([])),
     };
     const engine = setupEngine({ client: stub });
     openLiveEngineRow(engine, 'sandbox');
@@ -3093,18 +3106,18 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     // without listing positions again.
     const second = await engine.reconcileLivePortfolio();
     expect(second.skipped).toBe('cadence');
-    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+    expect(stub.readOpenOptionPositions).toHaveBeenCalledTimes(1);
 
     // Advance past the cadence window and the next call goes out again.
     vi.setSystemTime(TRADING_TIME + 31_000);
     const third = await engine.reconcileLivePortfolio();
     expect(third.skipped).toBeNull();
-    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(2);
+    expect(stub.readOpenOptionPositions).toHaveBeenCalledTimes(2);
   });
 
   it('keeps the cadence timestamp unchanged when the gate skips so the next non-empty tick reconciles immediately', async () => {
     const stub: ListPositionsStub = {
-      listOpenOptionPositions: vi.fn().mockResolvedValue([]),
+      readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([])),
     };
     const engine = setupEngine({ client: stub });
 
@@ -3116,12 +3129,12 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     openLiveEngineRow(engine, 'sandbox');
     const summary = await engine.reconcileLivePortfolio();
     expect(summary.skipped).toBeNull();
-    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+    expect(stub.readOpenOptionPositions).toHaveBeenCalledTimes(1);
   });
 
   it('swallows list-positions failures and bumps the cadence timestamp so we do not tight-loop on a Tradier outage', async () => {
     const stub: ListPositionsStub = {
-      listOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')),
+      readOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')),
     };
     const engine = setupEngine({ client: stub });
     openLiveEngineRow(engine, 'sandbox');
@@ -3137,7 +3150,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     expect(asInternals(engine).lastTradierPortfolioReconcileAt).toBe(TRADING_TIME);
     const second = await engine.reconcileLivePortfolio();
     expect(second.skipped).toBe('cadence');
-    expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
+    expect(stub.readOpenOptionPositions).toHaveBeenCalledTimes(1);
   });
 
   // TRA-3010 — the enabling precondition for the gate-A basis census.
@@ -3151,7 +3164,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
   describe('TRA-3010 sweep witness', () => {
     it('records ZERO reached and names the reason for every state that never gets to the census', async () => {
       // dark: not in live mode
-      const demo = setupEngine({ mode: 'demo', client: { listOpenOptionPositions: vi.fn() } });
+      const demo = setupEngine({ mode: 'demo', client: { readOpenOptionPositions: vi.fn() } });
       await demo.reconcileLivePortfolio();
       expect(demo.getEngineBasisSweepWitness()).toMatchObject({
         reached: 0,
@@ -3169,7 +3182,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
       });
 
       // idle: no open live rows, so the network read is never made
-      const idle = setupEngine({ client: { listOpenOptionPositions: vi.fn().mockResolvedValue([]) } });
+      const idle = setupEngine({ client: { readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([])) } });
       await idle.reconcileLivePortfolio();
       expect(idle.getEngineBasisSweepWitness()).toMatchObject({
         reached: 0,
@@ -3179,7 +3192,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
 
       // broker unreadable: this is the one that most resembles a quiet day
       const outage = setupEngine({
-        client: { listOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')) },
+        client: { readOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')) },
       });
       openLiveEngineRow(outage, 'sandbox');
       await outage.reconcileLivePortfolio();
@@ -3193,7 +3206,7 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     });
 
     it('records reached>0 with a timestamp once the census branch actually runs, even when it matches nothing', async () => {
-      const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn().mockResolvedValue([]) };
+      const stub: ListPositionsStub = { readOpenOptionPositions: vi.fn().mockResolvedValue(okRead([])) };
       const engine = setupEngine({ client: stub });
       openLiveEngineRow(engine, 'sandbox');
 
@@ -3211,6 +3224,155 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
       // The distinguishing assertion: a zero denominator here is NOT the same
       // reading as the outage case above, which also publishes candidates: 0.
       expect(witness.skipped.fetch_failed).toBe(0);
+    });
+  });
+
+  // TRA-3073 — the acceptance suite for "an unreadable broker is BLIND, never
+  // flat".
+  //
+  // BOTH directions live in this one describe on purpose. A suite that only
+  // asserts "an outage closes nothing" is UNFALSIFIABLE: deleting the TRA-2799
+  // sweep outright passes it. The genuine-empty-book case below is the positive
+  // control that says the sweep is still armed, and the two together are the
+  // discriminator — the whole defect was that those two inputs read alike.
+  //
+  // These drive a REAL `TradierOptionsClient` over a stubbed `fetch`, not a
+  // hand-rolled method stub, because the defect is HTTP-shaped: `getJson` maps
+  // every non-2xx to `null`, `parseTradierPositions(null)` is `[]`, and `[]` is
+  // byte-identical to the answer for a genuinely flat account. A stub that just
+  // resolves `[]` cannot express the difference, so the status code has to be
+  // the input under test.
+  describe('TRA-3073 — an unreadable broker is BLIND, never flat', () => {
+    /** > BROKER_MISSING_MIN_AGE_MS (5 min): a young row is exempt from the sweep. */
+    const PAST_MIN_AGE_MS = 6 * 60_000;
+    /** > TRADIER_PORTFOLIO_RECONCILE_MS (30s): the failure path bumps the cadence stamp too. */
+    const PAST_CADENCE_MS = 31_000;
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    function setupLiveClientEngine(respond: () => { status: number; body: unknown }) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          const { status, body } = respond();
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            json: async () => body,
+          } as unknown as Response;
+        }),
+      );
+      const engine = setupEngine({
+        client: new RealTradierOptionsClient(
+          'test-token',
+          'ACCT-3073',
+          'sandbox',
+        ) as unknown as ListPositionsStub,
+      });
+      const { optionId } = openLiveEngineRow(engine, 'sandbox');
+      return { engine, optionId };
+    }
+
+    /** The account's live map, where `brokerMissingSweeps` actually lives. */
+    function liveRowMap(engine: SignalEngine) {
+      return (asInternals(engine).optionsAccounts.sandbox as unknown as {
+        openOptions: Map<string, { brokerMissingSweeps?: number }>;
+      }).openOptions;
+    }
+
+    /** Sweep `i` — spaced past both the row-age floor and the cadence window. */
+    async function sweepAt(engine: SignalEngine, i: number) {
+      vi.setSystemTime(TRADING_TIME + PAST_MIN_AGE_MS + i * PAST_CADENCE_MS);
+      return engine.reconcileLivePortfolio();
+    }
+
+    /**
+     * Acceptance 1. Four sweeps is twice `BROKER_MISSING_SWEEPS_TO_CLOSE`, so
+     * the old code had booked the phantom close by sweep 2 and this asserts
+     * well past the point of no return. `brokerMissingSweeps` must not merely
+     * stay below the trip — it must never be WRITTEN, because the counter is
+     * only ever reset by the broker reporting the symbol, and an outage can
+     * never do that. A half-counted streak survives the outage and trips on the
+     * first real miss afterwards.
+     */
+    async function expectOutageClosesNothing(status: number, detail: string) {
+      const { engine, optionId } = setupLiveClientEngine(() => ({ status, body: {} }));
+      const rows = liveRowMap(engine);
+
+      for (let i = 0; i < 4; i += 1) await sweepAt(engine, i);
+
+      expect(rows.has(optionId)).toBe(true);
+      expect(rows.get(optionId)?.brokerMissingSweeps).toBeUndefined();
+
+      // Acceptance 3 — the skip is COUNTED, not silent, and the count names
+      // which failure it was. 400 skips against `HTTP 401` is an ops incident;
+      // 400 against a socket reset is a bad afternoon.
+      const witness = engine.getEngineBasisSweepWitness();
+      expect(witness.skipped.fetch_failed).toBe(4);
+      expect(witness.lastOutcome).toBe('fetch-failed');
+      expect(witness.lastFetchFailure).toMatchObject({ reason: 'http_status', detail });
+      // And the sweep never reached the census, so a `candidates: 0` published
+      // during the outage is not readable as "ran, found nothing".
+      expect(witness.reached).toBe(0);
+    }
+
+    it('a 401 repeated past the 2-sweep guard removes and closes NOTHING', async () => {
+      await expectOutageClosesNothing(401, 'HTTP 401');
+    });
+
+    it('a 500 repeated past the 2-sweep guard removes and closes NOTHING', async () => {
+      await expectOutageClosesNothing(500, 'HTTP 500');
+    });
+
+    it('a transport failure is counted as `transport`, not as an empty book', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('socket reset'); }));
+      const engine = setupEngine({
+        client: new RealTradierOptionsClient('t', 'A', 'sandbox') as unknown as ListPositionsStub,
+      });
+      const { optionId } = openLiveEngineRow(engine, 'sandbox');
+      const rows = liveRowMap(engine);
+
+      for (let i = 0; i < 4; i += 1) await sweepAt(engine, i);
+
+      expect(rows.has(optionId)).toBe(true);
+      expect(rows.get(optionId)?.brokerMissingSweeps).toBeUndefined();
+      expect(engine.getEngineBasisSweepWitness().lastFetchFailure).toMatchObject({
+        reason: 'transport',
+      });
+    });
+
+    /**
+     * Acceptance 2 — the positive control. Tradier answers a genuinely flat
+     * account with `2xx` and the LITERAL STRING `positions: "null"`. That is a
+     * real reading of a real book, and the TRA-2799 sweep must still act on it
+     * exactly as before: one miss arms the counter, the second books the close.
+     * If this test goes green-by-not-closing, the repair has silently reverted
+     * TRA-2799 and the stranded-row defect is back.
+     */
+    it('still books the close after two misses on a GENUINE empty book', async () => {
+      const { engine, optionId } = setupLiveClientEngine(() => ({
+        status: 200,
+        body: { positions: 'null' },
+      }));
+      const rows = liveRowMap(engine);
+
+      const first = await sweepAt(engine, 0);
+      expect(first.skipped).toBeNull();
+      expect(first.removed).toBe(0);
+      // Armed but not tripped — this is the guard doing its intended job.
+      expect(rows.get(optionId)?.brokerMissingSweeps).toBe(1);
+
+      const second = await sweepAt(engine, 1);
+      expect(second.removed).toBe(1);
+      expect(rows.has(optionId)).toBe(false);
+
+      // …and it got there through the census, not past it.
+      const witness = engine.getEngineBasisSweepWitness();
+      expect(witness.reached).toBe(2);
+      expect(witness.skipped.fetch_failed).toBe(0);
+      expect(witness.lastFetchFailure).toBeNull();
     });
   });
 });

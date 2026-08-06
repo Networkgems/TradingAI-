@@ -12384,6 +12384,19 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       lastReachedAt: sweeps.lastReachedAt === null ? null : new Date(sweeps.lastReachedAt).toISOString(),
       lastOutcome: sweeps.lastOutcome,
       skipped: sweeps.skipped,
+      // TRA-3073 — `skipped.fetch_failed` is now also the count of sweeps that
+      // REFUSED to treat an unreadable broker as flat, so it is the readable
+      // form of "this session declined N phantom-close opportunities". The
+      // count alone cannot tell a dead token from a network flap, and those
+      // have opposite remedies, so the last failure names itself.
+      lastFetchFailure:
+        sweeps.lastFetchFailure === null
+          ? null
+          : {
+              reason: sweeps.lastFetchFailure.reason,
+              detail: sweeps.lastFetchFailure.detail,
+              at: new Date(sweeps.lastFetchFailure.at).toISOString(),
+            },
     },
     // TRA-2813 — the observation window is stated ON the payload. The counters
     // below reset on every restart (bqb1 reboots several times a day), so a
