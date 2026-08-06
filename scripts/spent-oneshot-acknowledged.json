@@ -6,14 +6,6 @@
   "//required": "Every entry MUST carry `trackedBy` (a live issue that owns the repair) and `reason`. An acknowledgement with no owner is a deletion with extra steps.",
   "acknowledged": [
     {
-      "routineId": "48c5e5ee-562b-4059-a64a-2de867c61c18",
-      "spent": [{ "cronExpression": "40 20 30 7 *", "nextRunAt": "2027-07-30T20:40:00.000Z" }],
-      "trackedBy": "TRA-3015",
-      "reason": "LeadDev's row. TRA-2598 and its grade leaf TRA-2731 are both done, so the one-shot is fully spent — but routine writes follow the ASSIGNEE and 403 across agents, so only LeadDev can archive it. Carrier TRA-3015 is open and is a first-class blocker on TRA-3008.",
-      "acknowledgedAt": "2026-08-06",
-      "acknowledgedBy": "CTO"
-    },
-    {
       "routineId": "e1b97e28-4ae6-47d0-a3b6-1038e4e39442",
       "spent": [{ "cronExpression": "17 13 30 6 *", "nextRunAt": "2027-06-30T17:17:00.000Z" }],
       "trackedBy": "TRA-2974",
