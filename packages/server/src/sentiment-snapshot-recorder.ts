@@ -205,6 +205,60 @@ export async function recordSentimentSnapshot(
   const outDir = join(options.outDir, date);
   await mkdir(outDir, { recursive: true });
 
+  const filePath = join(outDir, 'sentiment.json');
+
+  // TRA-2519 — stamp the partition BEFORE the first fetch. A sweep the
+  // watchdog killed mid-pass used to leave NO artifact at all: a 404 that
+  // reads identically to a date never reached (2026-08-04 was dark this way —
+  // the sweep started 21:23:47Z, died, and left nothing to attribute). The
+  // skeleton is all-`no_data` rows with reason `sweep_incomplete`; the
+  // end-of-sweep write (or any later re-fire's merge) upgrades every row it
+  // beats, so a surviving `sweep_incomplete` row IS the durable record that a
+  // sweep started and never finished. Only written when no partition exists —
+  // an earlier run's real rows are never touched.
+  const skeletonOrder: string[] = [];
+  const skeletonSeen = new Set<string>();
+  for (const raw of options.symbols) {
+    const symbol = raw.trim().toUpperCase();
+    if (!skeletonSeen.has(symbol)) {
+      skeletonSeen.add(symbol);
+      skeletonOrder.push(symbol);
+    }
+  }
+  if ((await readExistingPartition(filePath)) === null) {
+    const skeletonRows: SentimentSnapshotRow[] = skeletonOrder.map((symbol) => ({
+      symbol,
+      outcome: 'no_data',
+      sentiment: null,
+      reason: 'sweep_incomplete',
+    }));
+    const skeleton: SentimentSnapshotFile = { date, recordedAt: now, symbols: skeletonRows };
+    await writeFile(filePath, JSON.stringify(skeleton), 'utf-8');
+    await writeFile(
+      join(outDir, '_meta.json'),
+      JSON.stringify(
+        {
+          date,
+          recordedAt: now,
+          symbolCount: skeletonRows.length,
+          recorded: 0,
+          noData: skeletonRows.length,
+          errored: 0,
+          // attempts: 0 is the discriminator — no completed sweep has ever
+          // written this partition. A finished sweep always stamps >= 1.
+          attempts: 0,
+          sweptRecorded: 0,
+          preservedFromPrior: [],
+          reasons: countBy(skeletonRows.map(() => 'sweep_incomplete')),
+          perSymbol: skeletonRows.map((s) => ({ symbol: s.symbol, outcome: s.outcome })),
+        },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+  }
+
   const sleep = options.retry?.sleep ?? defaultSleep;
 
   /** Fetch one symbol into a row. Errors are isolated per symbol. */
@@ -273,7 +327,9 @@ export async function recordSentimentSnapshot(
   const sweptRows = order.map((s) => swept.get(s)!);
 
   // --- merge against any partition an earlier run of this ET day wrote -----
-  const filePath = join(outDir, 'sentiment.json');
+  // (Includes our own skeleton: every swept row ranks >= a skeleton row, so
+  // the merge replaces skeleton rows wholesale and `preservedFromPrior` never
+  // counts them.)
   const prior = await readExistingPartition(filePath);
   const merged = new Map<string, SentimentSnapshotRow>();
   const mergedOrder: string[] = [];

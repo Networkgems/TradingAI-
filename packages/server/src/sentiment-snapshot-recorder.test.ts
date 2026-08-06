@@ -362,4 +362,75 @@ describe('recordSentimentSnapshot — bounded half-open retry (TRA-2519)', () =>
     expect(result.symbols.find((s) => s.symbol === 'AAPL')?.sentiment?.netScore).toBe(0.55);
     expect(result.symbols.find((s) => s.symbol === 'MSFT')?.outcome).toBe('no_data');
   });
+
+  // TRA-2519 — a sweep the watchdog kills mid-pass must leave an attributable
+  // artifact, not a 404. The partition is stamped with an all-`sweep_incomplete`
+  // skeleton BEFORE the first fetch.
+  it('writes a sweep_incomplete skeleton before the first fetch', async () => {
+    let skeletonAtFirstFetch: unknown;
+    let metaAtFirstFetch: unknown;
+    await recordSentimentSnapshot({
+      symbols: ['AAPL', 'MSFT'],
+      fetchSentiment: async (sym) => {
+        if (sym === 'AAPL' && skeletonAtFirstFetch === undefined) {
+          skeletonAtFirstFetch = JSON.parse(
+            readFileSync(join(tmpRoot, '2026-05-15', 'sentiment.json'), 'utf-8'),
+          );
+          metaAtFirstFetch = JSON.parse(
+            readFileSync(join(tmpRoot, '2026-05-15', '_meta.json'), 'utf-8'),
+          );
+        }
+        return reading(sym, 0.2);
+      },
+      outDir: tmpRoot,
+      now: NOW,
+    });
+
+    const skeleton = skeletonAtFirstFetch as { symbols: Array<Record<string, unknown>> };
+    expect(skeleton.symbols.map((s) => s['symbol'])).toEqual(['AAPL', 'MSFT']);
+    expect(skeleton.symbols.every((s) => s['outcome'] === 'no_data')).toBe(true);
+    expect(skeleton.symbols.every((s) => s['reason'] === 'sweep_incomplete')).toBe(true);
+    // attempts: 0 is the "no completed sweep ever wrote this" discriminator.
+    const meta = metaAtFirstFetch as Record<string, unknown>;
+    expect(meta['attempts']).toBe(0);
+    expect(meta['reasons']).toEqual({ sweep_incomplete: 2 });
+
+    // The completed sweep replaces every skeleton row and stamps attempts >= 1.
+    const final = JSON.parse(readFileSync(join(tmpRoot, '2026-05-15', 'sentiment.json'), 'utf-8'));
+    expect(final.symbols.every((s: Record<string, unknown>) => s['outcome'] === 'recorded')).toBe(true);
+    const finalMeta = JSON.parse(readFileSync(join(tmpRoot, '2026-05-15', '_meta.json'), 'utf-8'));
+    expect(finalMeta.attempts).toBeGreaterThanOrEqual(1);
+    expect(finalMeta.reasons).toEqual({});
+  });
+
+  it('does not overwrite an existing partition with the skeleton', async () => {
+    // First run banks a real AAPL read.
+    await recordSentimentSnapshot({
+      symbols: ['AAPL'],
+      fetchSentiment: async (sym) => reading(sym, 0.9),
+      outDir: tmpRoot,
+      now: NOW,
+    });
+
+    // Second run of the same day: at first-fetch time the partition must still
+    // hold the prior real row, not a skeleton downgrade.
+    let partitionAtFirstFetch: unknown;
+    const result = await recordSentimentSnapshot({
+      symbols: ['AAPL'],
+      fetchSentiment: async () => {
+        partitionAtFirstFetch ??= JSON.parse(
+          readFileSync(join(tmpRoot, '2026-05-15', 'sentiment.json'), 'utf-8'),
+        );
+        return null;
+      },
+      outDir: tmpRoot,
+      now: NOW,
+    });
+
+    const seen = partitionAtFirstFetch as { symbols: Array<Record<string, unknown>> };
+    expect(seen.symbols[0]?.['outcome']).toBe('recorded');
+    // And the ratchet still preserves it against the null sweep.
+    expect(result.symbols[0]?.outcome).toBe('recorded');
+    expect(result.preservedFromPrior).toEqual(['AAPL']);
+  });
 });

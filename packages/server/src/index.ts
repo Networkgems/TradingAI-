@@ -339,7 +339,7 @@ import {
 } from './routines/routine-store.js';
 import { parseRoutine, filterLabel, formatScan } from './routines/routine-spec.js';
 import { RoutineRunner, type RoutineRendered } from './routines/routine-runner.js';
-import { recordOptionChains } from './options-chain-recorder.js';
+import { recordOptionChains, etDateKey } from './options-chain-recorder.js';
 import { recordSentimentSnapshot } from './sentiment-snapshot-recorder.js';
 import {
   fetchStockTwitsStream,
@@ -4146,6 +4146,31 @@ async function runSentimentSnapshot(): Promise<void> {
   const symbols = rawUniverse
     ? rawUniverse.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
     : [...WATCHLIST];
+
+  // TRA-2519 — the chain hook now re-invokes this on EVERY catch-up boot (the
+  // day-marker no longer gates it), because the re-fires ARE the sentiment
+  // ratchet's retry mechanism. This guard keeps a restart storm (73 boots on
+  // 2026-07-27) from hammering StockTwits once the day is already fully
+  // recorded: only a day with something left to win sweeps again.
+  const dateKey = etDateKey(Date.now());
+  try {
+    const raw = await readFile(join(SENTIMENT_RECORD_OUT_DIR, dateKey, 'sentiment.json'), 'utf-8');
+    const existing = JSON.parse(raw) as { symbols?: Array<{ symbol?: string; outcome?: string }> };
+    const recordedSet = new Set(
+      (existing.symbols ?? [])
+        .filter((r) => r?.outcome === 'recorded' && typeof r.symbol === 'string')
+        .map((r) => (r.symbol as string).trim().toUpperCase()),
+    );
+    if (symbols.length > 0 && symbols.every((s) => recordedSet.has(s.trim().toUpperCase()))) {
+      log.info('sentiment-recorder day already complete — skipping re-sweep', {
+        date: dateKey,
+        recorded: recordedSet.size,
+      });
+      return;
+    }
+  } catch {
+    // No partition yet (or unreadable) — sweep.
+  }
 
   // Build the curated (followed-account) lane once for the whole sweep, mirroring
   // SignalEngine.refreshCuratedSocialSentiment: pull each curated user stream,
@@ -12971,32 +12996,60 @@ scheduler.start({
   // below lives on the persistent disk so a reboot inside the window skips a
   // capture that already succeeded today; it is stamped ONLY on a real capture
   // (token-less no-ops stay retryable within the day).
+  // TRA-2519 (2026-08-05) — two hook-structure defects zeroed three sentiment
+  // days the ratchet was built to save:
+  //   1. The marker's early-return above skipped the ENTIRE hook, so once the
+  //      chain capture had stamped the day, catch-up boots never re-ran the
+  //      sentiment sweep — but re-firing is exactly the retry mechanism the
+  //      sentiment merge/ratchet was designed around. On 2026-08-04 the sweep
+  //      started 21:23:47Z, the process died mid-sweep, and the 22:33/23:29
+  //      boots both skipped on the marker: the day stayed dark with the fix
+  //      deployed and working.
+  //   2. `runChainRecord()` was the only sub-recorder NOT isolated. On
+  //      2026-07-31 and 08-03 the persistent disk was unusable (ENOSPC family;
+  //      mkdir '/data/option-chains/<date>' threw within the same second the
+  //      trigger fired) and the uncaught throw aborted the hook BEFORE the
+  //      sentiment call — with the scheduler's in-memory dedup already
+  //      stamped, so nothing retried in-process either.
+  // The marker now gates only the chain-side work (capture + squeeze + alert
+  // push — the heavy per-boot cost TRA-2476 was killing); the sentiment sweep
+  // runs on every fire and short-circuits itself once the day is complete.
   onChainRecord: async () => {
     const todayEt = etDateString(new Date());
+    let chainDoneToday = false;
     try {
       const marker = (await readFile(CHAIN_HOOK_MARKER_PATH, 'utf-8')).trim();
-      if (marker === todayEt) {
-        log.info('chain-record hook already ran today — skipping catch-up refire', {
-          date: todayEt,
-        });
-        return;
-      }
+      chainDoneToday = marker === todayEt;
     } catch {
       // No marker yet (first run on this disk) — proceed.
     }
-    const captured = await runChainRecord();
-    if (captured) {
-      await writeFile(CHAIN_HOOK_MARKER_PATH, todayEt, 'utf-8').catch((err) =>
-        log.warn('chain-record day marker write failed', {
+    if (!chainDoneToday) {
+      try {
+        const captured = await runChainRecord();
+        if (captured) {
+          await writeFile(CHAIN_HOOK_MARKER_PATH, todayEt, 'utf-8').catch((err) =>
+            log.warn('chain-record day marker write failed', {
+              reason: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        }
+      } catch (err) {
+        log.error('chain-recorder failed', {
           reason: err instanceof Error ? err.message : String(err),
-        }),
-      );
+        });
+      }
     }
     await runSentimentSnapshot().catch((err) =>
       log.error('sentiment-recorder failed', {
         reason: err instanceof Error ? err.message : String(err),
       }),
     );
+    if (chainDoneToday) {
+      log.info('chain-record hook already ran today — chain-side catch-up skipped', {
+        date: todayEt,
+      });
+      return;
+    }
     // TRA-1209 — short-squeeze observe-capture (default-OFF, observe-only).
     // Isolated so a screener/feed failure can't drop the chain/sentiment
     // captures above (or vice-versa).
