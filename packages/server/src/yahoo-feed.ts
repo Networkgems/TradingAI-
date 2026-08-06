@@ -599,6 +599,52 @@ export function requestsInFixedWindow(
 let tradierQuoteFixedMinutePeak = 0;
 let tradierBarPullFixedMinutePeak = 0;
 
+// TRA-3104 — per-minute histogram of ACCOUNT-WIDE Tradier calls, bounded to the
+// most recent `ACCOUNT_MINUTE_HISTORY` completed minutes.
+//
+// WHY, AND IT IS NOT THE OBVIOUS REASON: the session high-waters above never
+// decay, so a verdict read off them LATCHES — one open-bell burst makes `crossed`
+// true for the rest of the process's life, and the field then answers "did this
+// ever happen?" while reading like "is this happening?". Distinguishing a genuine
+// capacity condition (the MEAN is at the plan; no throttle helps) from a burst
+// (mean under, peak over; a limiter is exactly the right tool) needs a mean AND a
+// peak over the same bounded, recent window. Peak-vs-mean is the whole remedy
+// question, so the statistic has to be able to separate them.
+const ACCOUNT_MINUTE_HISTORY = 30;
+const tradierAccountMinuteCounts = new Map<number, number>();
+
+function recordAccountMinute(now: number): void {
+  const bucket = Math.floor(now / BAR_PULL_RATE_WINDOW_MS);
+  tradierAccountMinuteCounts.set(bucket, (tradierAccountMinuteCounts.get(bucket) ?? 0) + 1);
+  if (tradierAccountMinuteCounts.size > ACCOUNT_MINUTE_HISTORY) {
+    // Prune oldest buckets. Insertion order is arrival order, and buckets only
+    // ever advance, so the first keys are the oldest.
+    const excess = tradierAccountMinuteCounts.size - ACCOUNT_MINUTE_HISTORY;
+    let dropped = 0;
+    for (const k of tradierAccountMinuteCounts.keys()) {
+      if (dropped++ >= excess) break;
+      tradierAccountMinuteCounts.delete(k);
+    }
+  }
+}
+
+/**
+ * TRA-3104 — mean and peak account-wide req/min over the recent COMPLETED minutes.
+ * The current (partial) minute is excluded: a minute sampled 3 seconds in reads as
+ * a near-zero rate and would drag the mean toward a false all-clear.
+ */
+export function accountMinuteStats(
+  counts: ReadonlyMap<number, number>,
+  now: number,
+  windowMs: number,
+): { mean: number; peak: number; minutes: number } {
+  const currentBucket = Math.floor(now / windowMs);
+  const completed = [...counts.entries()].filter(([b]) => b < currentBucket).map(([, c]) => c);
+  if (completed.length === 0) return { mean: 0, peak: 0, minutes: 0 };
+  const sum = completed.reduce((a, b) => a + b, 0);
+  return { mean: sum / completed.length, peak: Math.max(...completed), minutes: completed.length };
+}
+
 function recordTradierQuoteRequest(now: number): void {
   tradierQuoteReqTimestamps.push(now);
   const { kept } = requestsInWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
@@ -653,14 +699,32 @@ function recordTradierBarPullRequest(now: number): void {
   for (const t of kept) tradierBarPullReqTimestamps.push(t);
   const { count } = requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
   if (count > tradierBarPullFixedMinutePeak) tradierBarPullFixedMinutePeak = count;
+  // This meter is fed from every `bumpFallbackCounter('tradier')` site, including
+  // the quote path, so it IS the account-wide population — see
+  // `getTradierAccountSpendThisMinute` for why nothing may be added to it.
+  recordAccountMinute(now);
 }
 
 /**
- * Rolling Tradier bar-pull rate, surfaced by `/api/health/quotes` (TRA-739).
- * Counts only actual upstream Tradier minute/daily-bar fetches (every
- * `bumpFallbackCounter('tradier')` site); cache hits are free and never recorded.
- * The quota Tradier enforces is account-wide, so total load = this bar-pull rate
- * plus `tradierQuoteRate.requestsLastMin`.
+ * Rolling Tradier request rate, surfaced by `/api/health/quotes` (TRA-739).
+ * Counts every actual upstream Tradier call (each `bumpFallbackCounter('tradier')`
+ * site); cache hits are free and never recorded.
+ *
+ * ⛔⛔ TRA-3104 — THIS SERIES IS MISNAMED AND THE OLD DOCBLOCK HERE STATED THE
+ * ARITHMETIC BACKWARDS. It said "the quota Tradier enforces is account-wide, so
+ * total load = this bar-pull rate PLUS `tradierQuoteRate.requestsLastMin`". That
+ * addition DOUBLE-COUNTS: the quote path calls `bumpFallbackCounter('tradier')`
+ * before `recordTradierQuoteRequest`, so this array already contains every quote
+ * batch. It is the ACCOUNT-WIDE total (daily bars + minute bars + quote batches),
+ * and `tradierQuoteRate` is a SUBSET of it. The name is kept for the graders and
+ * the cross-day series that already read `requestsLastMin`; the meaning is
+ * documented here rather than silently changed underneath them.
+ *
+ * The stale sentence had already propagated into a measured conclusion: TRA-3104
+ * was filed asserting "mean 184.0 + quotes 16 = 200 = the budget, fully consumed
+ * in steady state". Corrected, steady-state account demand is ~184/min against a
+ * ~200/min plan and the exhaustion is a BURST (tail 260), not the mean — which
+ * changes the remedy from "buy capacity" to "smooth the peak".
  */
 export function getTradierBarPullRateState(now: number = Date.now()): {
   requestsLastMin: number;
@@ -842,39 +906,56 @@ export function resolveBarPullCeiling(input: {
  * it means the next reader gets the answer off `/api/health/quotes` instead of
  * inheriting a number.
  *
- * `crossed` is true when the bar path's own observed peak already meets or exceeds
- * the ceiling derived for it — i.e. the throttle can only ever bite, so it cannot
- * reserve headroom without continuously aging cold candles. That is a CAPACITY
- * condition, and no setting of any knob in this file resolves it.
+ * ⭐ THE VERDICT IS THREE-VALUED BECAUSE THE REMEDIES ARE OPPOSITE. Collapsing
+ * "demand exceeds the plan" into one boolean is what produced TRA-3104's wrong
+ * headline. Separate them:
+ *   • `budgetExhausted` — the recent MEAN is at the plan. Genuine capacity: no
+ *     throttle creates capacity, so only a bigger quota / smaller universe / longer
+ *     cold cadence helps.
+ *   • `burstBound` — the mean is UNDER the plan but the peak is over it. A
+ *     smoothing problem, and a correctly-windowed limiter is precisely the tool.
+ *   • `ceilingUnsatisfiable` — peak demand already meets the derived allowance, so
+ *     an enabled throttle can only bite and cannot reserve headroom without
+ *     continuously aging cold candles (the TRA-1539 path).
+ * Both mean and peak are read over the same bounded window of recent COMPLETED
+ * minutes, so the verdict decays instead of latching on one open-bell burst.
  */
 export function quotaCrossingVerdict(input: {
   barCeiling: number;
-  barObservedPeak: number;
+  /** Account-wide peak. ⛔ NOT bar-only, and NOT a sum with the quote peak — the
+   * account meter already contains the quote calls (see
+   * {@link getTradierAccountSpendThisMinute}). Summing double-counts them. */
+  accountObservedPeak: number;
+  accountObservedMean: number;
   accountBudget: number;
-  quoteObservedPeak: number;
 }): {
   crossed: boolean;
-  /** Bar demand already meets its derived allowance ⇒ the throttle can only bite. */
+  /** Peak demand already meets its derived allowance ⇒ the throttle can only bite. */
   ceilingUnsatisfiable: boolean;
-  /** Account-wide demand already meets the account plan ⇒ a capacity condition. */
+  /** MEAN demand meets the plan ⇒ a genuine CAPACITY condition: no throttle helps. */
   budgetExhausted: boolean;
+  /** Mean is under the plan but the peak is over it ⇒ a SMOOTHING problem, which a
+   * correctly-windowed limiter is the right tool for. Distinguished from
+   * `budgetExhausted` because the two call for opposite remedies. */
+  burstBound: boolean;
   headroomReqPerMin: number;
-  combinedPeakReqPerMin: number;
+  peakOverBudgetReqPerMin: number;
 } {
-  const { barCeiling, barObservedPeak, accountBudget, quoteObservedPeak } = input;
-  const combinedPeakReqPerMin = barObservedPeak + quoteObservedPeak;
+  const { barCeiling, accountObservedPeak, accountObservedMean, accountBudget } = input;
   // Graded against the BUDGET, never against the resolved ceiling alone: on a
   // default (inert) box the ceiling is Infinity, and a verdict read off it would
   // report `crossed:false` on every box — a gate satisfied by the absence of the
   // thing it grades.
-  const ceilingUnsatisfiable = Number.isFinite(barCeiling) && barObservedPeak >= barCeiling;
-  const budgetExhausted = combinedPeakReqPerMin >= accountBudget;
+  const ceilingUnsatisfiable = Number.isFinite(barCeiling) && accountObservedPeak >= barCeiling;
+  const budgetExhausted = accountObservedMean >= accountBudget;
+  const burstBound = !budgetExhausted && accountObservedPeak >= accountBudget;
   return {
-    crossed: ceilingUnsatisfiable || budgetExhausted,
+    crossed: ceilingUnsatisfiable || budgetExhausted || burstBound,
     ceilingUnsatisfiable,
     budgetExhausted,
-    headroomReqPerMin: accountBudget - combinedPeakReqPerMin,
-    combinedPeakReqPerMin,
+    burstBound,
+    headroomReqPerMin: accountBudget - accountObservedMean,
+    peakOverBudgetReqPerMin: accountObservedPeak - accountBudget,
   };
 }
 
@@ -890,21 +971,30 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   ceilingSource: 'derived_budget' | 'absolute_env' | 'disabled';
   enforcing: boolean;
   enforcementWindow: 'fixed_minute_aligned';
-  barPeakPerFixedMinute: number;
-  quotePeakPerFixedMinute: number;
-  combinedThisMinute: number;
-  combinedPeakReqPerMin: number;
+  /** Account-wide spend in the CURRENT (partial) fixed minute — the gate's input. */
+  accountThisMinute: number;
+  /** Mean / peak account-wide req/min over recent COMPLETED minutes. */
+  accountMeanReqPerMin: number;
+  accountPeakReqPerMin: number;
+  accountMinutesObserved: number;
+  /** The quote path's share, a SUBSET of the account figures above — never a term
+   * to be added to them. TRA-3104's headline double-counted exactly this. */
+  quoteSubsetThisMinute: number;
+  quoteSubsetPeakPerFixedMinute: number;
   headroomReqPerMin: number;
+  peakOverBudgetReqPerMin: number;
   crossed: boolean;
   ceilingUnsatisfiable: boolean;
   budgetExhausted: boolean;
+  burstBound: boolean;
   /** ⚠️ The ceiling bounds only the COLD, deferrable subset — hot / deep-MTF pulls
    * and the whole quote path bypass it while still consuming quota. Published so a
    * consumer cannot read `enforcing:true` as "account spend is bounded". */
   boundsDeferrableSubsetOnly: true;
 } {
   const quoteState = getTradierQuoteRateState(now);
-  const barState = getTradierBarPullRateState(now);
+  const accountState = getTradierBarPullRateState(now); // account-wide, not bars-only
+  const stats = accountMinuteStats(tradierAccountMinuteCounts, now, BAR_PULL_RATE_WINDOW_MS);
   const reservation = quoteReservationReqPerMin({
     structuralFloor: Math.ceil(QUOTE_RATE_WINDOW_MS / Math.max(1, QUOTE_CACHE_TTL_MS)),
     observedPeak: quoteState.peakPerFixedMinute,
@@ -922,9 +1012,9 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
   const impliedCeiling = Math.max(1, TRADIER_ACCOUNT_BUDGET_PER_MIN - reservation);
   const verdict = quotaCrossingVerdict({
     barCeiling: impliedCeiling,
-    barObservedPeak: barState.peakPerFixedMinute,
+    accountObservedPeak: stats.peak,
+    accountObservedMean: stats.mean,
     accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
-    quoteObservedPeak: quoteState.peakPerFixedMinute,
   });
   return {
     accountBudgetReqPerMin: TRADIER_ACCOUNT_BUDGET_PER_MIN,
@@ -933,14 +1023,18 @@ export function getTradierQuotaBudgetState(now: number = Date.now()): {
     ceilingSource: resolved.source,
     enforcing: resolved.source !== 'disabled',
     enforcementWindow: 'fixed_minute_aligned',
-    barPeakPerFixedMinute: barState.peakPerFixedMinute,
-    quotePeakPerFixedMinute: quoteState.peakPerFixedMinute,
-    combinedThisMinute: barState.requestsThisMinute + quoteState.requestsThisMinute,
-    combinedPeakReqPerMin: verdict.combinedPeakReqPerMin,
-    headroomReqPerMin: verdict.headroomReqPerMin,
+    accountThisMinute: accountState.requestsThisMinute,
+    accountMeanReqPerMin: Number(stats.mean.toFixed(1)),
+    accountPeakReqPerMin: stats.peak,
+    accountMinutesObserved: stats.minutes,
+    quoteSubsetThisMinute: quoteState.requestsThisMinute,
+    quoteSubsetPeakPerFixedMinute: quoteState.peakPerFixedMinute,
+    headroomReqPerMin: Number(verdict.headroomReqPerMin.toFixed(1)),
+    peakOverBudgetReqPerMin: verdict.peakOverBudgetReqPerMin,
     crossed: verdict.crossed,
     ceilingUnsatisfiable: verdict.ceilingUnsatisfiable,
     budgetExhausted: verdict.budgetExhausted,
+    burstBound: verdict.burstBound,
     boundsDeferrableSubsetOnly: true,
   };
 }
@@ -1018,15 +1112,34 @@ export function barPullThrottleGate(input: {
 }
 
 /**
- * TRA-3104 — account-wide Tradier spend inside the FIXED minute Tradier meters:
- * bar pulls plus quote calls. This is the statistic {@link barPullThrottleGate}
- * grades, and the one `/api/health/quotes` reports as `combinedThisMinute`.
+ * TRA-3104 — account-wide Tradier spend inside the FIXED minute Tradier meters.
+ * This is the statistic {@link barPullThrottleGate} grades and the one
+ * `/api/health/quotes` reports as `accountThisMinute`.
+ *
+ * ⛔⛔ DO NOT ADD THE QUOTE COUNT TO THIS. `tradierBarPullReqTimestamps` is fed
+ * from `bumpFallbackCounter('tradier')`, and the QUOTE path calls that too (it
+ * calls `bumpFallbackCounter('tradier')` and then `recordTradierQuoteRequest`).
+ * So the "bar pull" array is ALREADY the account-wide population — daily bars +
+ * minute bars + quote batches — and `tradierQuoteReqTimestamps` is a SUBSET of
+ * it, not a sibling series. Summing them double-counts every quote call.
+ *
+ * 🔴 THIS IS THE SECOND CORRECTION TO TRA-3104's OWN HEADLINE, and it moves the
+ * conclusion. The filed finding computed "bar-pull mean 184.0 + quote path 16 =
+ * 200 req/min = the account budget, therefore the budget is FULLY CONSUMED IN
+ * STEADY STATE". The 184.0 was differenced from `fallbackRequestsToday.tradier`,
+ * which is bumped at all three call sites — so it was the account-wide total
+ * ALREADY and the quote path was added to a number that contained it. Corrected:
+ * steady-state account demand is ~184/min against a ~200/min plan, i.e. roughly
+ * 8% headroom, NOT zero. What actually exhausts the quota is the BURST — the
+ * rolling tail measured 260 — not the mean.
+ *
+ * That distinction decides the remedy. "Mean at budget" means only capacity can
+ * help and no throttle creates capacity. "Mean under budget, peak over it" is a
+ * SMOOTHING problem, which a correctly-windowed limiter is exactly the right tool
+ * for. Do not carry the "fully consumed" framing forward.
  */
 export function getTradierAccountSpendThisMinute(now: number = Date.now()): number {
-  return (
-    requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS).count +
-    requestsInFixedWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS).count
-  );
+  return requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS).count;
 }
 
 // ── Per-symbol minute-bar cache ──────────────────────────────────────────────

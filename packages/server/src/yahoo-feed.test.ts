@@ -12,6 +12,7 @@ import {
   quotaCrossingVerdict,
   getTradierQuotaBudgetState,
   getTradierAccountSpendThisMinute,
+  accountMinuteStats,
   canReuseCachedTradierBars,
   getTradierBarPullRateState,
   chartQuoteFromResult,
@@ -483,39 +484,92 @@ describe('resolveBarPullCeiling (TRA-3104 derived budget precedence)', () => {
   });
 });
 
-// TRA-3104 — the CROSSING, made self-reporting. Both branches must be reachable:
-// a verdict that can only ever say "fine" is decoration.
-describe('quotaCrossingVerdict (TRA-3104 capacity condition)', () => {
-  it('is CROSSED on the measured 2026-08-06 world at universe 640', () => {
-    // bar peak 260 (rolling tail) / mean 184 vs a derived ceiling of 180.
-    const v = quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 184, accountBudget: 200, quoteObservedPeak: 16 });
+// TRA-3104 — the CROSSING, made self-reporting, and THREE-VALUED because the
+// remedies are opposite. Every branch must be reachable: a verdict that can only
+// ever say "fine" is decoration, and one that collapses capacity into burst is
+// what produced this ticket's wrong headline.
+describe('quotaCrossingVerdict (TRA-3104 capacity vs burst)', () => {
+  it('is BURST-BOUND on the corrected 2026-08-06 world: mean 184 under a 200 plan, peak 260 over it', () => {
+    // ⚠️ The account meter already INCLUDES the quote calls, so the filed
+    // "184 + 16 = 200 = fully consumed" double-counted. Mean is 184 of 200.
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200 });
+    expect(v.burstBound).toBe(true);
+    expect(v.budgetExhausted).toBe(false);       // NOT a capacity condition
     expect(v.crossed).toBe(true);
-    expect(v.combinedPeakReqPerMin).toBe(200);
-    expect(v.headroomReqPerMin).toBe(0);
+    expect(v.headroomReqPerMin).toBe(16);        // real headroom on the mean
+    expect(v.peakOverBudgetReqPerMin).toBe(60);
   });
 
-  it('is NOT crossed on a universe the budget actually covers (the green branch)', () => {
-    const v = quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 120, accountBudget: 200, quoteObservedPeak: 16 });
+  it('is BUDGET-EXHAUSTED only when the MEAN reaches the plan — the one case no throttle fixes', () => {
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 260, accountObservedMean: 205, accountBudget: 200 });
+    expect(v.budgetExhausted).toBe(true);
+    expect(v.burstBound).toBe(false);            // mutually exclusive by construction
+    expect(v.headroomReqPerMin).toBe(-5);        // negative, never clamped
+  });
+
+  it('is NOT crossed when both mean and peak fit under the plan (the green branch)', () => {
+    const v = quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200 });
     expect(v.crossed).toBe(false);
-    expect(v.headroomReqPerMin).toBe(64);
+    expect(v.burstBound).toBe(false);
+    expect(v.budgetExhausted).toBe(false);
+    expect(v.ceilingUnsatisfiable).toBe(false);
+    expect(v.headroomReqPerMin).toBe(80);
   });
 
   it('still decides against the BUDGET when the ceiling is disabled (Infinity)', () => {
     // A gate satisfied by the absence of the thing it grades: reading `crossed`
-    // off an Infinity ceiling would report false on every default box.
+    // off an Infinity ceiling alone would report false on every default box.
     expect(
-      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, barObservedPeak: 190, accountBudget: 200, quoteObservedPeak: 16 }).crossed,
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 260, accountObservedMean: 184, accountBudget: 200 }).crossed,
     ).toBe(true);
     expect(
-      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, barObservedPeak: 100, accountBudget: 200, quoteObservedPeak: 16 }).crossed,
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, accountObservedPeak: 150, accountObservedMean: 120, accountBudget: 200 }).crossed,
     ).toBe(false);
   });
 
-  it('reports NEGATIVE headroom when demand is over budget — no clamping to zero', () => {
-    // Clamping would hide exactly the condition this exists to report.
-    expect(
-      quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 240, accountBudget: 200, quoteObservedPeak: 16 }).headroomReqPerMin,
-    ).toBe(-56);
+  it('flags ceilingUnsatisfiable independently of the budget verdict', () => {
+    // Peak over the derived allowance but the whole account comfortably under the
+    // plan: enabling the throttle would bite for no quota benefit.
+    const v = quotaCrossingVerdict({ barCeiling: 100, accountObservedPeak: 140, accountObservedMean: 90, accountBudget: 200 });
+    expect(v.ceilingUnsatisfiable).toBe(true);
+    expect(v.budgetExhausted).toBe(false);
+    expect(v.burstBound).toBe(false);
+    expect(v.crossed).toBe(true);
+  });
+});
+
+// TRA-3104 — mean and peak must come from the same bounded window of COMPLETED
+// minutes, or the verdict latches on one open-bell burst and answers "did this
+// ever happen?" while reading like "is this happening?".
+describe('accountMinuteStats (TRA-3104 recent-window mean/peak)', () => {
+  const W = 60_000;
+  const b = (n: number) => n; // bucket index
+
+  it('excludes the CURRENT partial minute, which would drag the mean to a false all-clear', () => {
+    // Three completed minutes at 180 each, plus 3 requests so far in the current one.
+    const counts = new Map([[b(10), 180], [b(11), 180], [b(12), 180], [b(13), 3]]);
+    const s = accountMinuteStats(counts, 13 * W + 3_000, W);
+    expect(s.minutes).toBe(3);
+    expect(s.mean).toBe(180);
+    expect(s.peak).toBe(180);
+  });
+
+  it('separates a burst from a sustained load — the distinction the remedy turns on', () => {
+    const burst = new Map([[b(10), 60], [b(11), 260], [b(12), 60]]);
+    const sustained = new Map([[b(10), 200], [b(11), 205], [b(12), 202]]);
+    const sb = accountMinuteStats(burst, 13 * W, W);
+    const ss = accountMinuteStats(sustained, 13 * W, W);
+    expect(sb.peak).toBeGreaterThan(ss.peak);          // burst has the higher peak
+    expect(sb.mean).toBeLessThan(ss.mean);             // …and the lower mean
+    // Same budget, opposite verdicts.
+    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: sb.peak, accountObservedMean: sb.mean, accountBudget: 200 }).burstBound).toBe(true);
+    expect(quotaCrossingVerdict({ barCeiling: 180, accountObservedPeak: ss.peak, accountObservedMean: ss.mean, accountBudget: 200 }).budgetExhausted).toBe(true);
+  });
+
+  it('reports zero minutes observed rather than a fabricated rate when nothing completed', () => {
+    // BLIND, not "quiet" — an empty history must not read as a clean all-clear.
+    expect(accountMinuteStats(new Map(), 13 * W, W)).toEqual({ mean: 0, peak: 0, minutes: 0 });
+    expect(accountMinuteStats(new Map([[b(13), 50]]), 13 * W + 1_000, W).minutes).toBe(0);
   });
 });
 
@@ -576,6 +630,12 @@ describe('getTradierQuotaBudgetState (TRA-3104 health block)', () => {
     expect(s.boundsDeferrableSubsetOnly).toBe(true);
     expect(typeof s.ceilingUnsatisfiable).toBe('boolean');
     expect(typeof s.budgetExhausted).toBe('boolean');
+    expect(typeof s.burstBound).toBe('boolean');
+    // The quote path is published as a SUBSET, and named as one, so no consumer
+    // repeats the double-count that produced this ticket's headline.
+    expect(s.quoteSubsetThisMinute).toBeLessThanOrEqual(s.accountThisMinute);
+    expect(typeof s.accountMeanReqPerMin).toBe('number');
+    expect(typeof s.accountMinutesObserved).toBe('number');
   });
 });
 
