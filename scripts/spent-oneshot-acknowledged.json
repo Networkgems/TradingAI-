@@ -1,0 +1,25 @@
+{
+  "//": "TRA-3017 — acknowledgement ledger for `pnpm check:spent-oneshot`. HAND-EDITED ONLY; never regenerate it from a live run (that is how a baseline silences the very finding it was built to surface).",
+  "//why": "check:spent-oneshot is armed DAILY on routine efd820ff, and its owning prose says `file ONE issue on exit != 0`. Two of the coverage-lost rows cannot be repaired by the agent that runs the check — 48c5e5ee is another owner's (routine writes 403 across the assignee boundary) and e1b97e28's assignee has DEPARTED and needs a BOARD re-home. Without this ledger the daily fire mints a fresh duplicate issue for the same two rows every morning, forever. A checker that files on every fire becomes noise, and the noise is what gets it archived.",
+  "//scope": "An entry SUPPRESSES THE EXIT CODE ONLY. Acknowledged rows are still printed in full, under their own heading, on every run. This ledger can never make a finding invisible.",
+  "//expiry": "An entry is pinned to `cronExpression` + `nextRunAt` of EVERY spent trigger on that routine. If the row re-arms, grows a second spent trigger, or its slot moves, the pin stops matching and the row is a live finding again. An entry that matches nothing is reported as STALE_ACK — trim it.",
+  "//required": "Every entry MUST carry `trackedBy` (a live issue that owns the repair) and `reason`. An acknowledgement with no owner is a deletion with extra steps.",
+  "acknowledged": [
+    {
+      "routineId": "48c5e5ee-562b-4059-a64a-2de867c61c18",
+      "spent": [{ "cronExpression": "40 20 30 7 *", "nextRunAt": "2027-07-30T20:40:00.000Z" }],
+      "trackedBy": "TRA-3015",
+      "reason": "LeadDev's row. TRA-2598 and its grade leaf TRA-2731 are both done, so the one-shot is fully spent — but routine writes follow the ASSIGNEE and 403 across agents, so only LeadDev can archive it. Carrier TRA-3015 is open and is a first-class blocker on TRA-3008.",
+      "acknowledgedAt": "2026-08-06",
+      "acknowledgedBy": "CTO"
+    },
+    {
+      "routineId": "e1b97e28-4ae6-47d0-a3b6-1038e4e39442",
+      "spent": [{ "cronExpression": "17 13 30 6 *", "nextRunAt": "2027-06-30T17:17:00.000Z" }],
+      "trackedBy": "TRA-2974",
+      "reason": "ORPHAN. Assignee 2fc6fe3b has departed the roster, so EVERY agent write against this routine is 403 — there is no agent on this board that can archive it. It needs a BOARD re-home, which is exactly the deliverable already open on TRA-2974 (same orphan cluster as TRA-381/TRA-382). Never fired, so its FAR_NEVER_FIRED slot is stable at 2027-06-30.",
+      "acknowledgedAt": "2026-08-06",
+      "acknowledgedBy": "CTO"
+    }
+  ]
+}

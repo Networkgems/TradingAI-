@@ -116,16 +116,47 @@
  * to manufacture one.
  *
  * VERDICTS / EXIT CODES
- *   0  CLEAN          — population non-empty, every armed trigger fires inside the horizon
- *   1  FINDINGS       — spent arms exist, but every affected routine still has live coverage
- *   2  COVERAGE_LOST  — at least one routine's ONLY arms are beyond the horizon
- *   3  BLIND          — the population or a row is untrustworthy. NOT a pass.
+ *   0  CLEAN             — population non-empty, every armed trigger fires inside the horizon
+ *   0  ACKNOWLEDGED_ONLY — every remaining finding is in the acknowledgement ledger. File NOTHING.
+ *   1  FINDINGS          — spent arms exist, but every affected routine still has live coverage
+ *   2  COVERAGE_LOST     — at least one routine's ONLY arms are beyond the horizon
+ *   3  BLIND             — the population or a row is untrustworthy. NOT a pass.
  *
  * BLIND outranks everything, including a zero count.
+ *
+ * ⛔ WHY AN ACKNOWLEDGEMENT LEDGER EXISTS (TRA-3017)
+ * -------------------------------------------------
+ * This check is armed DAILY (routine `efd820ff`), and the prose it runs under
+ * says "file ONE issue on exit != 0". Two of the coverage-lost rows CANNOT be
+ * repaired by the agent running the check: routine writes follow the ASSIGNEE
+ * and 403 across agents, and `e1b97e28`'s assignee has DEPARTED, so no agent on
+ * this board can archive it at all — it needs a BOARD re-home. Left alone, the
+ * daily fire mints a duplicate issue for the same two rows every morning until
+ * someone archives the checker. That is the failure mode this check's own
+ * sibling (`check:strands`) already warns about in prose: a checker that files
+ * on every fire becomes noise, and the noise is what gets it retired.
+ *
+ * The ledger (`scripts/spent-oneshot-acknowledged.json`, HAND-EDITED ONLY)
+ * SUPPRESSES THE EXIT CODE AND NOTHING ELSE:
+ *   · acknowledged rows are still printed IN FULL on every run, under their own
+ *     heading — the ledger can never make a finding invisible;
+ *   · every entry must name a live `trackedBy` issue and a `reason`. An entry
+ *     missing either is IGNORED and warned about — an acknowledgement with no
+ *     owner is a deletion with extra steps;
+ *   · an entry is pinned to the `cronExpression` + `nextRunAt` of EVERY spent
+ *     trigger on the row. Re-arm it, move its slot, or grow a second spent
+ *     trigger and the pin stops matching, so the row is a LIVE finding again;
+ *   · an entry that matches nothing is reported as STALE_ACK. It is not
+ *     exit-bearing (by construction it is suppressing nothing), but it is loud.
+ *   · an unreadable or unparseable ledger degrades to ZERO acknowledgements,
+ *     never to "everything is acknowledged" — the failure direction is MORE
+ *     filing, not less.
  *
  * This script performs GETs and NOTHING else.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { enumerateRoutines } from './lib/paperclip-enumeration.mjs';
 
 const argv = process.argv.slice(2);
@@ -140,7 +171,80 @@ const argOf = (name, fallback) => {
 const HORIZON_DAYS = Number(argOf('horizon-days', 120));
 const ROUTINE_LIMIT = Number(argOf('routine-limit', 500));
 
-export const VERDICT_EXIT = { CLEAN: 0, FINDINGS: 1, COVERAGE_LOST: 2, BLIND: 3 };
+export const VERDICT_EXIT = { CLEAN: 0, ACKNOWLEDGED_ONLY: 0, FINDINGS: 1, COVERAGE_LOST: 2, BLIND: 3 };
+
+export const ACK_PATH = argOf('ack-file', fileURLToPath(new URL('./spent-oneshot-acknowledged.json', import.meta.url)));
+
+/* ------------------------------------------------------------------ *
+ * Acknowledgement ledger
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read the hand-edited ledger. NEVER throws: an unreadable or malformed file
+ * degrades to zero acknowledgements (⇒ more filing, never less) plus a loud
+ * warning. Entries missing `trackedBy` or `reason` are dropped the same way.
+ */
+export function loadAcknowledgements(path = ACK_PATH) {
+  let raw;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    return { acks: [], warnings: [`acknowledgement ledger unreadable (${err.code || err.message}) — treating as ZERO acknowledgements`] };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { acks: [], warnings: [`acknowledgement ledger is not valid JSON (${err.message}) — treating as ZERO acknowledgements`] };
+  }
+  return parseAcknowledgements(parsed);
+}
+
+/** The validator half of {@link loadAcknowledgements}, split out so the controls can drive it. */
+export function parseAcknowledgements(parsed) {
+  const warnings = [];
+  const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.acknowledged) ? parsed.acknowledged : null;
+  if (rows === null) {
+    return { acks: [], warnings: ['acknowledgement ledger has no `acknowledged` array — treating as ZERO acknowledgements'] };
+  }
+  const acks = [];
+  for (const [i, r] of rows.entries()) {
+    if (!r || typeof r.routineId !== 'string' || !r.routineId) {
+      warnings.push(`ledger entry #${i} has no routineId — IGNORED`);
+      continue;
+    }
+    // An acknowledgement with no owner is a deletion with extra steps.
+    if (!r.trackedBy || !r.reason) {
+      warnings.push(`ledger entry ${r.routineId.slice(0, 8)} is missing trackedBy and/or reason — IGNORED (it suppresses nothing)`);
+      continue;
+    }
+    if (!Array.isArray(r.spent) || r.spent.length === 0) {
+      warnings.push(`ledger entry ${r.routineId.slice(0, 8)} has no pinned \`spent\` triggers — IGNORED (an unpinned ack never expires)`);
+      continue;
+    }
+    acks.push({ ...r, used: false });
+  }
+  return { acks, warnings };
+}
+
+const sig = (t) => `${t.cronExpression ?? null}@${t.nextRunAt ?? null}`;
+
+/**
+ * A ledger entry covers a finding only if EVERY spent trigger currently on the
+ * row was pinned in the entry. Grow a new spent arm, or let the slot move, and
+ * the pin stops matching — the row becomes live again on its own.
+ */
+export function ackFor(finding, acks) {
+  for (const a of acks) {
+    if (a.routineId !== finding.routineId) continue;
+    const pinned = new Set(a.spent.map(sig));
+    if (finding.spent.every((s) => pinned.has(sig(s)))) {
+      a.used = true;
+      return a;
+    }
+  }
+  return null;
+}
 
 /* ------------------------------------------------------------------ *
  * Predicate
@@ -228,10 +332,13 @@ export function classifyRoutine(routine, { nowMs, horizonDays = HORIZON_DAYS }) 
  * Sweep
  * ------------------------------------------------------------------ */
 
-export async function sweep(transport, { routineLimit = ROUTINE_LIMIT, horizonDays = HORIZON_DAYS, nowMs = Date.now() } = {}) {
+export async function sweep(
+  transport,
+  { routineLimit = ROUTINE_LIMIT, horizonDays = HORIZON_DAYS, nowMs = Date.now(), acks = [], ackWarnings = [] } = {},
+) {
   const { routines, blind: enumBlind, probe } = await enumerateRoutines(transport.getRoutines, { limit: routineLimit });
   if (enumBlind) {
-    return { verdict: 'BLIND', blind: enumBlind, routineCount: 0, graded: 0, findings: [], blindRows: [], tally: {} };
+    return { verdict: 'BLIND', blind: enumBlind, routineCount: 0, graded: 0, findings: [], acknowledged: [], staleAcks: [], ackWarnings, blindRows: [], tally: {} };
   }
 
   const findings = [];
@@ -288,18 +395,46 @@ export async function sweep(transport, { routineLimit = ROUTINE_LIMIT, horizonDa
       routineCount: routines.length,
       graded: 0,
       findings: [],
+      acknowledged: [],
+      staleAcks: [],
+      ackWarnings,
       blindRows,
       tally,
       probe,
     };
   }
 
+  // Ledger pass. Suppresses the EXIT CODE only — every acknowledged row is
+  // still returned and still printed.
+  const live = [];
+  const acknowledged = [];
+  for (const f of findings) {
+    const a = ackFor(f, acks);
+    if (a) acknowledged.push({ ...f, acknowledgedBy: { trackedBy: a.trackedBy, reason: a.reason, acknowledgedAt: a.acknowledgedAt ?? null } });
+    else live.push(f);
+  }
+  const staleAcks = acks.filter((a) => !a.used).map((a) => ({ routineId: a.routineId, trackedBy: a.trackedBy }));
+
   let verdict = 'CLEAN';
   if (blindRows.length) verdict = 'BLIND';
-  else if (tally.COVERAGE_LOST > 0) verdict = 'COVERAGE_LOST';
-  else if (findings.length) verdict = 'FINDINGS';
+  else if (live.some((f) => f.state === 'COVERAGE_LOST')) verdict = 'COVERAGE_LOST';
+  else if (live.length) verdict = 'FINDINGS';
+  else if (acknowledged.length) verdict = 'ACKNOWLEDGED_ONLY';
 
-  return { verdict, blind: null, routineCount: routines.length, graded, findings, blindRows, tally, probe, horizonDays };
+  return {
+    verdict,
+    blind: null,
+    routineCount: routines.length,
+    graded,
+    findings: live,
+    acknowledged,
+    staleAcks,
+    ackWarnings,
+    blindRows,
+    tally,
+    probe,
+    horizonDays,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -321,7 +456,10 @@ export function renderReport(result, names = {}) {
     `  tally               : healthy ${result.tally.HEALTHY ?? 0} · residual ${result.tally.RESIDUAL_ZOMBIE ?? 0} ` +
       `· coverage-lost ${result.tally.COVERAGE_LOST ?? 0} · blind ${result.tally.BLIND ?? 0}`,
   );
+  out.push(`  of those, acknowledged: ${(result.acknowledged ?? []).length} (printed below; suppresses the EXIT CODE only)`);
   out.push('');
+  for (const w of result.ackWarnings ?? []) out.push(`⚠️  LEDGER  ${w}`);
+  if ((result.ackWarnings ?? []).length) out.push('');
   for (const f of result.findings) {
     out.push(`${f.state === 'COVERAGE_LOST' ? '⛔' : '⚠️ '} ${f.id}  ${who(f.assigneeAgentId)}  ${f.title}`);
     for (const s of f.spent) {
@@ -333,8 +471,27 @@ export function renderReport(result, names = {}) {
     out.push('');
   }
   for (const b of result.blindRows) out.push(`BLIND  ${b.id}  ${who(b.assigneeAgentId)}  ${b.title}\n      ${b.detail}`);
+
+  if ((result.acknowledged ?? []).length) {
+    out.push('── ACKNOWLEDGED (real findings, already owned elsewhere — DO NOT FILE) ──');
+    for (const f of result.acknowledged) {
+      out.push(`   ${f.state === 'COVERAGE_LOST' ? '⛔' : '⚠️ '} ${f.id}  ${who(f.assigneeAgentId)}  ${f.title}`);
+      for (const s of f.spent) out.push(`        ${s.state}  next ${s.nextRunAt} (${s.daysOut}d)  cron ${s.cronExpression} ${s.timezone ?? ''}`);
+      out.push(`        tracked by ${f.acknowledgedBy.trackedBy} — ${f.acknowledgedBy.reason}`);
+    }
+    out.push('');
+  }
+  for (const s of result.staleAcks ?? []) {
+    out.push(`⚠️  STALE_ACK  ${s.routineId.slice(0, 8)} (tracked by ${s.trackedBy}) matched no finding — the row is fixed or re-armed. Trim the ledger.`);
+  }
+  if ((result.staleAcks ?? []).length) out.push('');
+
   out.push(`VERDICT: ${result.verdict}`);
-  if (result.verdict !== 'CLEAN' && result.verdict !== 'BLIND') {
+  if (result.verdict === 'ACKNOWLEDGED_ONLY') {
+    out.push('Every remaining finding is in scripts/spent-oneshot-acknowledged.json with a live owner. File NOTHING.');
+    out.push('This is exit 0 because the repair is already owned, NOT because coverage is intact — read the block above.');
+  }
+  if (result.verdict !== 'CLEAN' && result.verdict !== 'ACKNOWLEDGED_ONLY' && result.verdict !== 'BLIND') {
     out.push('Remedy: ARCHIVE the routine (trap 3 — that is enough; the trigger stays enabled and it does not matter).');
     out.push('Routine writes follow the ASSIGNEE and 403 across agents — relay a carrier, do not sweep another owner\'s row.');
   }
@@ -458,6 +615,64 @@ const CASES = [
     routines: Array.from({ length: 202 }, (_, i) => ({ ...far(), id: `e${i}`, status: 'paused' })),
     expect: { verdict: 'BLIND', graded: 0 },
   },
+
+  /* --- acknowledgement ledger (TRA-3017) --------------------------- */
+  {
+    name: 'ACK — a pinned, owned entry moves a COVERAGE_LOST row to ACKNOWLEDGED_ONLY (exit 0, file nothing)',
+    routines: [far()],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'ACKNOWLEDGED_ONLY', findings: 0, acknowledged: 1 },
+  },
+  {
+    name: 'ACK EXPIRES — the row re-armed to a slot the ledger never pinned, so it is LIVE again',
+    routines: [far({ nextRunAt: '2028-07-30T21:00:00.000Z' })],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, acknowledged: 0 },
+  },
+  {
+    name: 'ACK EXPIRES — a SECOND spent arm appears that the ledger never pinned => LIVE again',
+    routines: [
+      {
+        ...far(),
+        triggers: [
+          far().triggers[0],
+          { kind: 'schedule', enabled: true, cronExpression: '0 9 1 1 *', timezone: 'UTC', nextRunAt: '2027-01-01T09:00:00.000Z', lastFiredAt: null },
+        ],
+      },
+    ],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, acknowledged: 0 },
+  },
+  {
+    name: 'ACK IS ROW-SCOPED — an entry for one routine must not cover an identical-looking NEW one',
+    routines: [far(), { ...far(), id: 'ffffffff-0000-0000-0000-000000000000' }],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, acknowledged: 1 },
+  },
+  {
+    name: 'ACK WITHOUT AN OWNER IS IGNORED — no trackedBy/reason means it suppresses nothing',
+    routines: [far()],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }] }],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, acknowledged: 0, ackWarnings: 1 },
+  },
+  {
+    name: 'ACK WITHOUT A PIN IS IGNORED — an unpinned entry would never expire',
+    routines: [far()],
+    ledger: [{ routineId: far().id, trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'COVERAGE_LOST', findings: 1, acknowledged: 0, ackWarnings: 1 },
+  },
+  {
+    name: 'STALE_ACK — the ledger entry matched nothing (row archived/repaired); reported, never exit-bearing',
+    routines: [{ ...far(), status: 'archived' }, { ...far(), id: 'bbbbbbbb', triggers: [{ ...far().triggers[0], nextRunAt: '2026-08-06T21:00:00.000Z' }] }],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'CLEAN', findings: 0, acknowledged: 0, staleAcks: 1 },
+  },
+  {
+    name: 'ACK CANNOT SUPPRESS BLIND — a BLIND row outranks a fully acknowledged population',
+    routines: [far({ nextRunAt: null })],
+    ledger: [{ routineId: far().id, spent: [{ cronExpression: '0 21 30 7 *', nextRunAt: '2027-07-30T21:00:00.000Z' }], trackedBy: 'TRA-3015', reason: 'owner boundary' }],
+    expect: { verdict: 'BLIND' },
+  },
 ];
 
 async function selftest() {
@@ -465,9 +680,10 @@ async function selftest() {
   const seen = new Set();
   for (const c of CASES) {
     const transport = { getRoutines: async () => c.routines };
+    const ledger = parseAcknowledgements({ acknowledged: c.ledger ?? [] });
     let result;
     try {
-      result = await sweep(transport, { horizonDays: HORIZON_DAYS, nowMs: NOW });
+      result = await sweep(transport, { horizonDays: HORIZON_DAYS, nowMs: NOW, acks: ledger.acks, ackWarnings: ledger.warnings });
     } catch (err) {
       console.log(`FAIL  ${c.name}\n        threw ${err.message}`);
       continue;
@@ -483,6 +699,11 @@ async function selftest() {
     }
     if (c.expect.state && result.findings[0]?.state !== c.expect.state && result.findings[0]?.spent?.[0]?.state !== c.expect.state) {
       problems.push(`state ${result.findings[0]?.state}/${result.findings[0]?.spent?.[0]?.state} != ${c.expect.state}`);
+    }
+    for (const [k, label] of [['acknowledged', 'acknowledged'], ['staleAcks', 'staleAcks'], ['ackWarnings', 'ackWarnings']]) {
+      if (c.expect[k] !== undefined && (result[k] ?? []).length !== c.expect[k]) {
+        problems.push(`${label} ${(result[k] ?? []).length} != ${c.expect[k]}`);
+      }
     }
     if (problems.length) console.log(`FAIL  ${c.name}\n        ${problems.join('; ')}`);
     else {
@@ -502,10 +723,40 @@ async function selftest() {
     console.log(`FAIL  GLOBAL read-only control\n        ${err.message}`);
   }
 
-  const total = CASES.length + 1;
+  // GLOBAL control: an UNREADABLE ledger must degrade to ZERO acknowledgements
+  // (⇒ more filing), never to "everything is acknowledged".
+  try {
+    const missing = loadAcknowledgements(`${ACK_PATH}.does-not-exist`);
+    if (missing.acks.length !== 0) throw new Error('a missing ledger produced acknowledgements');
+    if (missing.warnings.length !== 1) throw new Error('a missing ledger did not warn');
+    const junk = parseAcknowledgements({ nope: true });
+    if (junk.acks.length !== 0 || junk.warnings.length !== 1) throw new Error('a malformed ledger did not degrade to zero + warn');
+    console.log('ok    GLOBAL ledger fails OPEN (unreadable/malformed => zero acks + a warning, never blanket suppression)');
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL ledger fail-open control\n        ${err.message}`);
+  }
+
+  // GLOBAL control: the SHIPPED ledger is well-formed. A hand-edit typo that
+  // drops `trackedBy` would otherwise silently un-suppress (or, worse, ship an
+  // ownerless suppression) with nothing to say so.
+  try {
+    const shipped = loadAcknowledgements();
+    if (shipped.warnings.length) throw new Error(`shipped ledger warns: ${shipped.warnings.join(' · ')}`);
+    if (shipped.acks.length === 0) throw new Error('shipped ledger has zero usable entries — the file is present but inert');
+    for (const a of shipped.acks) {
+      if (!/^TRA-\d+$/.test(a.trackedBy)) throw new Error(`entry ${a.routineId.slice(0, 8)} trackedBy ${JSON.stringify(a.trackedBy)} is not an issue identifier`);
+    }
+    console.log(`ok    GLOBAL shipped ledger well-formed (${shipped.acks.length} entries, each pinned and owned)`);
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL shipped-ledger control\n        ${err.message}`);
+  }
+
+  const total = CASES.length + 3;
   console.log('');
   console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
-  for (const v of ['CLEAN', 'FINDINGS', 'COVERAGE_LOST', 'BLIND']) {
+  for (const v of ['CLEAN', 'ACKNOWLEDGED_ONLY', 'FINDINGS', 'COVERAGE_LOST', 'BLIND']) {
     if (!seen.has(v)) console.log(`WARN  verdict ${v} was never reached by any control`);
   }
   return pass === total ? 0 : 1;
@@ -547,7 +798,13 @@ async function main() {
   if (argv.includes('--selftest')) return selftest();
 
   const transport = liveTransport();
-  const result = await sweep(transport, { routineLimit: ROUTINE_LIMIT, horizonDays: HORIZON_DAYS });
+  const ledger = loadAcknowledgements();
+  const result = await sweep(transport, {
+    routineLimit: ROUTINE_LIMIT,
+    horizonDays: HORIZON_DAYS,
+    acks: ledger.acks,
+    ackWarnings: ledger.warnings,
+  });
 
   let names = {};
   try {
@@ -571,6 +828,9 @@ async function main() {
           graded: result.graded,
           tally: result.tally,
           findings: result.findings,
+          acknowledged: result.acknowledged,
+          staleAcks: result.staleAcks,
+          ackWarnings: result.ackWarnings,
           blindRows: result.blindRows,
         },
         null,
