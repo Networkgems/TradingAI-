@@ -263,10 +263,11 @@ import {
   aggregateCashFlowByDate,
   aggregateRealizedOptionsPnl,
   computeBalanceDailyPnl,
+  equitySymbolsInvalidatedByCorporateActions,
   findPreviousBalanceSnapshot,
   liveBackfillWriteWindow,
   planTradierReconcile,
-  realizedOptionsPnlByCloseDate,
+  realizedPnlByCloseDate,
   sumCashFlowOverSpan,
 } from './reports/tradier-reconcile.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
@@ -2706,20 +2707,28 @@ const LIVE_REALIZED_BACKFILL_MAX_MONTHS_BACK = (() => {
 
 /**
  * Build (or patch) an `EodReport` whose calendar figure is the broker-truth
- * realized options P&L for `date`. Equity realized / unrealized are zeroed so
- * the detail view stays internally consistent (`combinedPnl = realizedPnl +
- * optionsPnl`). A prior backfill header is stripped first so re-runs don't
- * stack headers. When `existing` is null a minimal report is synthesised so
- * the day still appears as a calendar cell.
+ * realized P&L for `date`. Unrealized is zeroed so the detail view stays
+ * internally consistent (`combinedPnl = realizedPnl + optionsPnl`). A prior
+ * backfill header is stripped first so re-runs don't stack headers. When
+ * `existing` is null a minimal report is synthesised so the day still appears
+ * as a calendar cell.
+ *
+ * TRA-2876 — stock realized now lands in `realizedPnl` instead of being pinned
+ * to 0. Both sleeves are separate tiles in the calendar detail view, so the
+ * split is what the user actually reads; folding equity into `optionsPnl` would
+ * tie the cell out while misattributing which sleeve earned it.
  */
 function makeRealizedBackfillReport(
   date: string,
-  dayRealized: number,
+  dayOptionsRealized: number,
+  dayEquityRealized: number,
   closeCount: number,
   existing: ReturnType<typeof generateEodReport> | null,
+  equityNote: string,
 ): ReturnType<typeof generateEodReport> {
   const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
-  const header = `> **Live calendar backfill (TRA-244).** ${date} P&L = Tradier broker-truth realized options P&L for contracts that *closed* this day = **$${sign(dayRealized)}**. Reconstructed from the Tradier account trade history by FIFO-matching each close to its open by OCC symbol; these rows pre-date the 9 PM EOD snapshot that records this going forward. Un-reconstructable closes (open outside the fetch window) are left flat rather than booked at gross proceeds.`;
+  const dayRealized = Number((dayOptionsRealized + dayEquityRealized).toFixed(2));
+  const header = `> **Live calendar backfill (TRA-244).** ${date} P&L = Tradier broker-truth realized P&L for positions that *closed* this day = **$${sign(dayRealized)}** (options $${sign(dayOptionsRealized)} · stocks $${sign(dayEquityRealized)}). Reconstructed from the Tradier account trade history by FIFO-matching each close to its open by symbol; these rows pre-date the 9 PM EOD snapshot that records this going forward. Un-reconstructable closes (open outside the fetch window) are left flat rather than booked at gross proceeds.${equityNote}`;
   const base: ReturnType<typeof generateEodReport> =
     existing ?? {
       date,
@@ -2756,9 +2765,9 @@ function makeRealizedBackfillReport(
   return {
     ...base,
     date,
-    realizedPnl: 0,
+    realizedPnl: dayEquityRealized,
     unrealizedPnl: 0,
-    optionsPnl: dayRealized,
+    optionsPnl: dayOptionsRealized,
     totalPnl: dayRealized,
     combinedPnl: dayRealized,
     // TRA-1192 — mark as a reconstructed historical cell so re-runs recompute it
@@ -2815,7 +2824,47 @@ async function backfillLiveRealizedCalendar(
     return null;
   }
 
-  const { realizedByDate, closeCountByDate } = realizedOptionsPnlByCloseDate(fills);
+  // TRA-2876 — equity realized belongs in this cell (Tradier's own gain/loss
+  // books stock closes alongside option closes, so an options-only cell can
+  // never tie out against the statement), but an equity lot book rebuilt from
+  // the trade tape is only trustworthy if no corporate action moved a share
+  // count behind its back. Read the split feed FIRST and let it decide the
+  // scope; a read we could not perform withholds equity entirely rather than
+  // assuming none happened.
+  let corporateActions: Awaited<ReturnType<typeof client.listAccountCorporateActions>> | null =
+    null;
+  try {
+    corporateActions = await client.listAccountCorporateActions({
+      start: fetchStart,
+      end: today,
+      limit: 2000,
+    });
+  } catch (err) {
+    log.warn('live realized backfill: corporate-action read failed, withholding equity', {
+      username: ctx.username,
+      env,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+  const caScope =
+    corporateActions === null
+      ? null
+      : equitySymbolsInvalidatedByCorporateActions(corporateActions, fills);
+  const includeEquity = caScope !== null && !caScope.withholdAllEquity;
+  const equityNote = !includeEquity
+    ? ` **Stock realized withheld this pass** — ${
+        caScope === null
+          ? 'the corporate-action feed could not be read, so no equity lot book in this window can be trusted'
+          : caScope.reasons.join('; ')
+      }. The figure above is options only and will not match an all-instrument Tradier statement.`
+    : caScope.reasons.length > 0
+      ? ` Stock realized excludes ${[...caScope.excludeSymbols].join(', ')} — ${caScope.reasons.join('; ')}.`
+      : '';
+  const { closeCountByDate, equityRealizedByDate, optionsRealizedByDate, realizedByDate } =
+    realizedPnlByCloseDate(fills, {
+      includeEquity,
+      excludeSymbols: caScope?.excludeSymbols,
+    });
   const dir = stockReportsDirFor(ctx, mode);
 
   // A day already owned by a *real* snapshot (broker-balance override or an
@@ -2864,9 +2913,11 @@ async function backfillLiveRealizedCalendar(
     }
     const report = makeRealizedBackfillReport(
       date,
-      dayRealized,
+      Number((optionsRealizedByDate.get(date) ?? 0).toFixed(2)),
+      Number((equityRealizedByDate.get(date) ?? 0).toFixed(2)),
       closeCountByDate.get(date) ?? 0,
       existing,
+      equityNote,
     );
     // TRA-3064 — JSON only. The `<date>.md` sidecar this used to write beside it
     // was a verbatim copy of `report.markdown`, a field on the object being
@@ -2878,6 +2929,11 @@ async function backfillLiveRealizedCalendar(
     username: ctx.username,
     env,
     written,
+    // TRA-2876 — an abstention that is not reported reads exactly like a window
+    // with no corporate actions in it.
+    equityIncluded: includeEquity,
+    equityExcludedSymbols: caScope ? [...caScope.excludeSymbols] : null,
+    corporateActionsSeen: corporateActions?.length ?? null,
   });
   return written;
 }

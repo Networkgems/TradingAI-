@@ -300,6 +300,14 @@ interface TradierRawHistoryEvent {
     /** Tradier order id — present on production history fills; absent on sandbox. */
     order_id?: number;
   };
+  /**
+   * TRA-2876 — Tradier nests each event's leg under a key named after the event
+   * `type` (`trade` → `trade`, `adjustment` → `adjustment`, `journal` →
+   * `journal`, …), so the set of keys on this row is open-ended by design.
+   * {@link parseTradierCorporateActions} reads those legs generically; the
+   * declared members above stay authoritative for the ones we model by name.
+   */
+  [nestedLeg: string]: unknown;
 }
 
 /**
@@ -828,6 +836,44 @@ export class TradierOptionsClient extends TradierOrderClient {
   }
 
   /**
+   * TRA-2876 — list the non-trade history events that CHANGE A SHARE COUNT
+   * (splits and other quantity adjustments) between `start` and `end`.
+   *
+   * Same untyped fetch as {@link listAccountCashEvents} — Tradier's history
+   * endpoint takes a single `type` filter and `adjustment` is not the only
+   * shape a split can arrive as — routed through
+   * {@link parseTradierCorporateActions} instead. The realized-P&L backfill
+   * uses this to QUARANTINE an affected symbol rather than FIFO-match its sells
+   * against a lot book the corporate action already invalidated.
+   *
+   * Throws on auth / network failure, deliberately — and note that this is the
+   * ONE history reader here that does. `getJson` returns `null` on a non-2xx,
+   * and every sibling turns that into `[]`, which is the right call when the
+   * cost of a blind pass is a missing row. It is the WRONG call here: the
+   * caller uses this to decide whether an equity lot book is trustworthy, so
+   * "no corporate actions in the window" and "we could not look" must not be
+   * the same value. Silently returning `[]` on a 401 would make every blind
+   * pass read as a clean bill of health and un-quarantine a split.
+   */
+  async listAccountCorporateActions(
+    options: { start: string; end: string; limit?: number } = { start: '', end: '' },
+  ): Promise<TradierCorporateAction[]> {
+    const params = new URLSearchParams();
+    if (options.start) params.set('start', options.start);
+    if (options.end) params.set('end', options.end);
+    params.set('limit', String(options.limit ?? 250));
+    const data = await this.getJson<TradierHistoryEnvelope>(
+      `/accounts/${encodeURIComponent(this.accountId)}/history?${params}`,
+    );
+    if (data == null) {
+      throw new Error(
+        'tradier corporate-action read failed (non-2xx); refusing to report "none" for an unread window',
+      );
+    }
+    return parseTradierCorporateActions(data);
+  }
+
+  /**
    * TRA-2850 — list SETTLED closed lots from `/accounts/{id}/gainloss`
    * between `start` and `end` (`YYYY-MM-DD`, inclusive; Tradier filters on
    * the close date). This report is where real per-trade fees live: history
@@ -1268,6 +1314,98 @@ export function parseTradierCashEvents(
       raw.id != null ? String(raw.id)
       : `${date}|${type}|${amount}`;
     out.push({ date, type, amount, transactionId });
+  }
+  return out;
+}
+
+/**
+ * TRA-2876 — a NON-TRADE history event that moves a SHARE COUNT.
+ *
+ * A FIFO lot book reconstructed from the trade tape assumes quantity only ever
+ * moves via trades. A corporate action breaks that assumption without leaving a
+ * trade row: the board's live account carries a TDIC reverse split as an
+ * `adjustment` of quantity **−7 at amount 0**. Nothing in the fills stream says
+ * it happened, so a lot book built from fills alone silently keeps 7 shares the
+ * account no longer holds — and the next sell is then matched against a basis
+ * that no longer exists. The realized number that comes out is wrong and looks
+ * completely ordinary.
+ *
+ * Detection here is deliberately SHAPE-driven, never string-driven: an event
+ * qualifies when its nested leg reports a finite NON-ZERO `quantity`. A
+ * description keyword test ("REVERSE SPLIT", "SPLIT", …) is the exact filter
+ * that matched zero rows on this very feed in TRA-2864, and a filter that
+ * matches nothing reads identically to "no corporate actions happened".
+ * `quantity` is a number, so it cannot go vacuous the same way.
+ *
+ * The cash-only siblings of a split (the "REVERSE SPLIT FEE" `transfer` at
+ * −$0.75, the cash-in-lieu `journal` at +$2.07) carry NO share-count change and
+ * are correctly NOT returned here — they are cash flow, which
+ * {@link parseTradierCashEvents} already owns. This parser answers exactly one
+ * question: "did a share count move behind the tape's back?"
+ */
+export interface TradierCorporateAction {
+  /** `YYYY-MM-DD` event date as Tradier reports it (account TZ). */
+  date: string;
+  /** Lowercase event type (`adjustment`, `transfer`, …). */
+  type: string;
+  /** Raw nested `description` — e.g. `"REVERSE SPLIT - TDIC"`. `''` when absent. */
+  description: string;
+  /** Signed share-count change. Always non-zero (that is the selection rule). */
+  quantity: number;
+  /** Signed cash impact. Typically 0 for a pure share-count adjustment. */
+  amount: number;
+  /** Stable dedup id (Tradier `id` when surfaced, else a synthetic key). */
+  transactionId: string;
+}
+
+/**
+ * TRA-2876 — normalise the Tradier `/accounts/{id}/history` envelope into the
+ * subset of non-trade events that CHANGE A SHARE COUNT. See
+ * {@link TradierCorporateAction} for why the selection rule is the presence of
+ * a non-zero nested `quantity` and not a description keyword.
+ *
+ * Tradier nests each event's leg under a key named after the event `type`
+ * (`trade` → `trade`, `adjustment` → `adjustment`). We look there first, then
+ * fall back to scanning the row's other object-valued properties, so a nested
+ * key that does not match its type name still gets read rather than silently
+ * dropping the one event class this exists to catch.
+ */
+export function parseTradierCorporateActions(
+  envelope: TradierHistoryEnvelope | null,
+): TradierCorporateAction[] {
+  if (!envelope || typeof envelope.history !== 'object' || envelope.history == null) {
+    return [];
+  }
+  const out: TradierCorporateAction[] = [];
+  for (const raw of asArray(envelope.history.event)) {
+    if (typeof raw.type !== 'string') continue;
+    const type = raw.type.toLowerCase();
+    if (type === 'trade') continue;
+    const row = raw as unknown as Record<string, unknown>;
+    // Type-named key first, then any other nested object on the row.
+    const candidates: unknown[] = [row[type]];
+    for (const [key, value] of Object.entries(row)) {
+      if (key === type) continue;
+      if (value && typeof value === 'object' && !Array.isArray(value)) candidates.push(value);
+    }
+    let leg: { quantity?: unknown; description?: unknown } | null = null;
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const q = (candidate as { quantity?: unknown }).quantity;
+      if (typeof q === 'number' && Number.isFinite(q) && q !== 0) {
+        leg = candidate as { quantity?: unknown; description?: unknown };
+        break;
+      }
+    }
+    if (!leg) continue;
+    const date = typeof raw.date === 'string' ? raw.date.slice(0, 10) : '';
+    if (!date) continue;
+    const quantity = leg.quantity as number;
+    const amount = typeof raw.amount === 'number' && Number.isFinite(raw.amount) ? raw.amount : 0;
+    const description = typeof leg.description === 'string' ? leg.description : '';
+    const transactionId =
+      raw.id != null ? String(raw.id) : `${date}|${type}|${quantity}|${description}`;
+    out.push({ date, type, description, quantity, amount, transactionId });
   }
   return out;
 }

@@ -21,6 +21,7 @@ export {
   parseTradierPositions,
   parseTradierHistory,
   parseTradierCashEvents,
+  parseTradierCorporateActions,
   parseTradierGainLoss,
   roundToCent,
 } from './options-client.js';
@@ -32,6 +33,7 @@ export type {
   TradierPositionsRead,
   TradierTradeHistoryFill,
   TradierCashEvent,
+  TradierCorporateAction,
   TradierGainLossLot,
   TradierMultilegSide,
   TradierMultilegLeg,

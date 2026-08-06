@@ -7,6 +7,7 @@ import {
   parseTradierPositions,
   parseTradierHistory,
   parseTradierCashEvents,
+  parseTradierCorporateActions,
   parseTradierGainLoss,
 } from './options-client.js';
 
@@ -1832,5 +1833,114 @@ describe('TradierOptionsClient.listGainLoss (TRA-2850)', () => {
     fetchMock.mockResolvedValueOnce(textResponse('nope', 401));
     const client = new TradierOptionsClient('tok', 'A1', 'production');
     expect(await client.listGainLoss({ start: '2026-07-31', end: '2026-08-04' })).toEqual([]);
+  });
+});
+
+// ─── TRA-2876: parseTradierCorporateActions ─────────────────────────────────
+//
+// The one non-trade event class that can corrupt a FIFO lot book is a SHARE
+// COUNT that moves without a trade row. The board's live account carries one: a
+// TDIC reverse split booked as an `adjustment` of −7 shares at $0, alongside two
+// cash-only siblings (a "REVERSE SPLIT FEE" transfer at −$0.75 and a cash-in-lieu
+// journal at +$2.07) that move money but no shares.
+//
+// Selection is by SHAPE (a non-zero nested `quantity`), never by description
+// keyword — a phrase filter is what matched zero of this feed's 38 real option
+// closes in TRA-2864, and a filter that matches nothing reads exactly like
+// "nothing happened".
+
+describe('parseTradierCorporateActions (TRA-2876)', () => {
+  const splitRow = {
+    date: '2026-06-09T00:00:00.000Z',
+    amount: 0,
+    type: 'adjustment',
+    id: 'adj-1',
+    adjustment: { description: 'REVERSE SPLIT - TDIC', quantity: -7 },
+  };
+
+  it('returns a share-count adjustment booked at zero cash', () => {
+    const out = parseTradierCorporateActions({ history: { event: splitRow } });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({
+      date: '2026-06-09',
+      type: 'adjustment',
+      description: 'REVERSE SPLIT - TDIC',
+      quantity: -7,
+      amount: 0,
+      transactionId: 'adj-1',
+    });
+  });
+
+  it('does NOT return the cash-only siblings of the same split', () => {
+    // These move the balance, not a share count. They are cash flow, which
+    // `parseTradierCashEvents` owns; returning them here would quarantine an
+    // equity symbol over a 75-cent fee.
+    const out = parseTradierCorporateActions({
+      history: {
+        event: [
+          { date: '2026-06-09', amount: -0.75, type: 'transfer', id: 't-1', transfer: { description: 'REVERSE SPLIT FEE - TDIC', quantity: 0 } },
+          { date: '2026-06-09', amount: 2.07, type: 'journal', id: 'j-1', journal: { description: 'CASH IN LIEU - TDIC' } },
+          { date: '2026-06-09', amount: 500, type: 'ach', id: 'ach-1' },
+        ],
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('ignores trade events entirely', () => {
+    // Trades are the one thing the lot book already sees.
+    const out = parseTradierCorporateActions({
+      history: {
+        event: {
+          date: '2026-06-09',
+          amount: -1.98,
+          type: 'trade',
+          id: 'tx-054',
+          trade: { description: 'TDIC', quantity: 5, price: 0.3947, symbol: 'TDIC', trade_type: 'equity' },
+        },
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  it('finds the quantity when the nested key is not named after the type', () => {
+    // Belt and braces: we look under the type-named key first, then any other
+    // nested object. Dropping the one event class this exists to catch, because
+    // Tradier named the key something else, is the failure mode with no symptom.
+    const out = parseTradierCorporateActions({
+      history: {
+        event: {
+          date: '2026-06-09',
+          amount: 0,
+          type: 'corporate_action',
+          id: 'ca-1',
+          event_detail: { description: 'FORWARD SPLIT - LASE', quantity: 4 },
+        },
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].quantity).toBe(4);
+    expect(out[0].description).toBe('FORWARD SPLIT - LASE');
+  });
+
+  it('synthesises a dedup id when Tradier omits one, and survives the empty shapes', () => {
+    const [action] = parseTradierCorporateActions({
+      history: { event: { date: '2026-06-09', amount: 0, type: 'adjustment', adjustment: { description: 'REVERSE SPLIT - TDIC', quantity: -7 } } },
+    });
+    expect(action.transactionId).toBe('2026-06-09|adjustment|-7|REVERSE SPLIT - TDIC');
+    expect(parseTradierCorporateActions({ history: 'null' })).toEqual([]);
+    expect(parseTradierCorporateActions({ history: null })).toEqual([]);
+    expect(parseTradierCorporateActions(null)).toEqual([]);
+  });
+
+  it('listAccountCorporateActions THROWS on a failed read rather than reporting none', () => {
+    // "No corporate actions in the window" and "we could not look" must not be
+    // the same value: the caller withholds equity realized in the second case,
+    // and an empty array would make a blind pass read as a clean one.
+    fetchMock.mockResolvedValueOnce(textResponse('nope', 401));
+    const client = new TradierOptionsClient('tok', 'A1', 'production');
+    return expect(
+      client.listAccountCorporateActions({ start: '2026-06-01', end: '2026-06-30' }),
+    ).rejects.toThrow();
   });
 });

@@ -183,11 +183,16 @@ describe('aggregateRealizedOptionsPnl on the live tape (TRA-2864)', () => {
     expect(total).toBeCloseTo(15.11, 2);
   });
 
-  it('ignores the equity legs on the tape (documented scope, not an oversight)', () => {
+  it('ignores the equity legs on the tape (this path feeds the OPTIONS pill)', () => {
     // Tradier's gain/loss report also books equity closes -- MIR +$0.80 on
-    // 2026-06-16 -- which neither path aggregates. That is why 06-16 is pinned
-    // at the OPTIONS-only -163.15 above and not the all-instrument -162.35.
-    // Filed separately; pinned here so the gap is deliberate and visible.
+    // 2026-06-16 -- which is why 06-16 is pinned at the OPTIONS-only -163.15
+    // here and not the all-instrument -162.35.
+    //
+    // TRA-2876 CLOSED that gap for the CALENDAR, via `realizedPnlByCloseDate`
+    // (see `tra2876-equity-realized.test.ts`, where 06-16 reads -162.35). This
+    // path deliberately did NOT change: its output is added to the engine's
+    // live OPTIONS P&L bucket by `addReconciledTradierOptionsPnl`, and a stock
+    // round trip is not options P&L. The two numbers differ on purpose.
     const equity = LIVE_TRADIER_TAPE.filter(f => f.tradeType === 'equity');
     expect(equity.length).toBeGreaterThan(0);
     const totals = aggregateRealizedOptionsPnl(LIVE_TRADIER_TAPE, new Set<string>());

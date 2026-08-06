@@ -125,7 +125,61 @@ export function realizedOptionsPnlByCloseDate(
   return { realizedByDate, closeCountByDate };
 }
 
-/** Outcome of one FIFO pass over a window of option fills. */
+export interface RealizedAllInstrumentTotals extends RealizedBackfillTotals {
+  /** `YYYY-MM-DD` → the EQUITY slice of `realizedByDate` (0 / absent when withheld). */
+  equityRealizedByDate: Map<string, number>;
+  /** `YYYY-MM-DD` → the OPTIONS slice of `realizedByDate`. */
+  optionsRealizedByDate: Map<string, number>;
+}
+
+/**
+ * TRA-2876 — broker-truth realized P&L per close date across BOTH instruments,
+ * for the live-calendar backfill cell.
+ *
+ * {@link realizedOptionsPnlByCloseDate} drops every equity leg on the floor.
+ * Tradier's own gain/loss report does not, so the backfilled cell could never
+ * tie out against the statement the user is holding — and nothing said so. On
+ * the board's live tape, 2026-06-16 reads −163.15 options-only against Tradier's
+ * −162.35 all-instrument: an $0.80 MIR round trip (bought 06-12 at −16.64, sold
+ * 06-16 at +17.44) that the calendar simply did not have. 2026-06-09 is a
+ * −10.37 cluster (CIFR/IREN/INTC/GM/RKLB) the calendar showed nothing for at
+ * all.
+ *
+ * The split-out `equityRealizedByDate` / `optionsRealizedByDate` maps exist
+ * because the EOD report keeps stock and option realized in SEPARATE fields
+ * that the calendar detail view renders as separate tiles. Writing the combined
+ * figure into the options tile would tie the cell out at the cost of lying
+ * about which sleeve earned it.
+ *
+ * `equityScope.includeEquity: false` is the fail-closed setting and the caller
+ * MUST use it whenever the corporate-action read was unavailable or
+ * unattributable — see {@link equitySymbolsInvalidatedByCorporateActions}. With
+ * it the result is exactly the options-only behaviour, i.e. this function
+ * degrades to the thing it replaced instead of guessing.
+ */
+export function realizedPnlByCloseDate(
+  fills: readonly TradierTradeHistoryFill[],
+  equityScope: {
+    includeEquity: boolean;
+    excludeSymbols?: ReadonlySet<string>;
+  } = { includeEquity: false },
+): RealizedAllInstrumentTotals {
+  const instruments: ('option' | 'equity')[] = equityScope.includeEquity
+    ? ['option', 'equity']
+    : ['option'];
+  const { realizedByDate, closeCountByDate, equityRealizedByDate } = fifoRealizedOptionCloses(
+    fills,
+    new Set<string>(),
+    { instruments, excludeSymbols: equityScope.excludeSymbols },
+  );
+  const optionsRealizedByDate = new Map<string, number>();
+  for (const [date, total] of realizedByDate) {
+    optionsRealizedByDate.set(date, total - (equityRealizedByDate.get(date) ?? 0));
+  }
+  return { realizedByDate, closeCountByDate, equityRealizedByDate, optionsRealizedByDate };
+}
+
+/** Outcome of one FIFO pass over a window of fills. */
 interface FifoRealizedResult {
   /** `YYYY-MM-DD` (close date) → realized P&L ATTRIBUTED this pass. */
   realizedByDate: Map<string, number>;
@@ -133,7 +187,24 @@ interface FifoRealizedResult {
   closeCountByDate: Map<string, number>;
   /** Transaction ids of the closes actually attributed (matched, not skipped). */
   attributedCloseIds: Set<string>;
+  /**
+   * TRA-2876 — the EQUITY-only slice of `realizedByDate`. Present so the
+   * calendar can show stock and option realized in their own tiles (they are
+   * separate fields on the EOD report) without running the matcher twice.
+   */
+  equityRealizedByDate: Map<string, number>;
 }
+
+/**
+ * TRA-2876 — quantity comparisons are epsilon-based because equity quantities
+ * are NOT integers. The live tape trades TDIC at $0.3947 and LASE at $3.3699,
+ * and Tradier settles fractional share counts. `lot.qty -= take` on binary
+ * floats leaves ~1e-16 residue, which under a strict `> 0` test keeps a spent
+ * lot at the head of the FIFO queue forever — every later close then matches
+ * against a zombie lot at the old basis. One share of one cent is orders of
+ * magnitude above this threshold, so nothing real is swallowed by it.
+ */
+const QTY_EPSILON = 1e-9;
 
 /**
  * TRA-2864 — the ONE FIFO matcher, shared by the historical backfill
@@ -174,12 +245,32 @@ interface FifoRealizedResult {
  * again, but it still CONSUMES its lots: the lot book has to reflect every
  * close that really happened or the next close would be matched against a
  * basis that was already sold.
+ *
+ * TRA-2876 — `instruments` selects which legs the pass reads. The rules above
+ * are instrument-agnostic (a stock buy debits cash and a stock sell credits it
+ * exactly as a long option open/close does), so equity runs through the SAME
+ * matcher rather than a second implementation of it — two implementations of
+ * one rule being the defect TRA-2864 was.
+ *
+ * The ONE thing equity has that options do not is a share count that can move
+ * WITHOUT a trade row: a split. `excludeSymbols` is that quarantine — a symbol
+ * in it is dropped whole (its opens never enter the lot book and its closes are
+ * never attributed), because a lot book a corporate action has already
+ * invalidated produces a wrong realized number that reads exactly like a right
+ * one. See {@link equitySymbolsInvalidatedByCorporateActions}.
  */
 function fifoRealizedOptionCloses(
   fills: readonly TradierTradeHistoryFill[],
   skipCloseIds: ReadonlySet<string> = new Set<string>(),
+  options: {
+    instruments?: readonly ('option' | 'equity')[];
+    excludeSymbols?: ReadonlySet<string>;
+  } = {},
 ): FifoRealizedResult {
+  const instruments = new Set(options.instruments ?? ['option']);
+  const excludeSymbols = options.excludeSymbols ?? new Set<string>();
   const realizedByDate = new Map<string, number>();
+  const equityRealizedByDate = new Map<string, number>();
   const closeCountByDate = new Map<string, number>();
   const attributedCloseIds = new Set<string>();
 
@@ -187,7 +278,8 @@ function fifoRealizedOptionCloses(
   // trip matches; otherwise sort by date ascending (Tradier returns newest
   // first). `quantity` is already absolute in the parsed fill.
   const ordered = [...fills]
-    .filter(f => f.tradeType === 'option')
+    .filter(f => instruments.has(f.tradeType))
+    .filter(f => !(f.tradeType === 'equity' && excludeSymbols.has(f.symbol)))
     .sort((a, b) => {
       if (a.date !== b.date) return a.date < b.date ? -1 : 1;
       const ao = a.amount < 0 ? 0 : 1; // opens (cash out) before closes
@@ -195,8 +287,11 @@ function fifoRealizedOptionCloses(
       return ao - bo;
     });
 
-  // Per-symbol FIFO queue of open long lots: cost is positive $/contract.
-  const openLots = new Map<string, Array<{ qty: number; costPerContract: number }>>();
+  // FIFO queue of open long lots per instrument+symbol: cost is a positive
+  // $/contract (options) or $/share (equity). The key carries `tradeType` so a
+  // stock ticker can never share a book with an option leg.
+  const openLots = new Map<string, Array<{ qty: number; costPerUnit: number }>>();
+  const lotKey = (f: TradierTradeHistoryFill) => `${f.tradeType}|${f.symbol}`;
 
   for (const fill of ordered) {
     if (fill.quantity <= 0 || fill.amount === 0) continue;
@@ -204,27 +299,27 @@ function fifoRealizedOptionCloses(
       // Long open: `amount` is negative — store cost as a positive number.
       // NOTE: opens are cost basis, not output, so the dedup cursor must NOT
       // filter them. Dropping a "seen" open would strand its close unmatched.
-      const costPerContract = Math.abs(fill.amount) / fill.quantity;
-      const queue = openLots.get(fill.symbol) ?? [];
-      queue.push({ qty: fill.quantity, costPerContract });
-      openLots.set(fill.symbol, queue);
+      const costPerUnit = Math.abs(fill.amount) / fill.quantity;
+      const queue = openLots.get(lotKey(fill)) ?? [];
+      queue.push({ qty: fill.quantity, costPerUnit });
+      openLots.set(lotKey(fill), queue);
       continue;
     }
 
     // Long close: cash IN. FIFO-match against this symbol's open lots.
-    const queue = openLots.get(fill.symbol) ?? [];
-    const proceedsPerContract = fill.amount / fill.quantity; // positive for a sell
+    const queue = openLots.get(lotKey(fill)) ?? [];
+    const proceedsPerUnit = fill.amount / fill.quantity; // positive for a sell
     let remaining = fill.quantity;
     let realized = 0;
     let matchedAny = false;
-    while (remaining > 0 && queue.length > 0) {
+    while (remaining > QTY_EPSILON && queue.length > 0) {
       const lot = queue[0];
       const take = Math.min(remaining, lot.qty);
-      realized += take * (proceedsPerContract - lot.costPerContract);
+      realized += take * (proceedsPerUnit - lot.costPerUnit);
       lot.qty -= take;
       remaining -= take;
       matchedAny = true;
-      if (lot.qty <= 0) queue.shift();
+      if (lot.qty <= QTY_EPSILON) queue.shift();
     }
     // Unmatched portion (open outside the window): skip rather than book
     // gross proceeds. If nothing matched at all, the day stays flat.
@@ -235,9 +330,87 @@ function fifoRealizedOptionCloses(
     attributedCloseIds.add(fill.transactionId);
     realizedByDate.set(fill.date, (realizedByDate.get(fill.date) ?? 0) + realized);
     closeCountByDate.set(fill.date, (closeCountByDate.get(fill.date) ?? 0) + 1);
+    if (fill.tradeType === 'equity') {
+      equityRealizedByDate.set(
+        fill.date,
+        (equityRealizedByDate.get(fill.date) ?? 0) + realized,
+      );
+    }
   }
 
-  return { realizedByDate, closeCountByDate, attributedCloseIds };
+  return { realizedByDate, closeCountByDate, attributedCloseIds, equityRealizedByDate };
+}
+
+/**
+ * TRA-2876 — which equity symbols must be WITHHELD from the FIFO because a
+ * corporate action moved their share count outside the trade tape.
+ *
+ * The hazard is specific: a split changes quantity at zero cash and writes no
+ * trade row, so a lot book built from fills keeps shares the account no longer
+ * holds. The board's live tape carries one — TDIC, an `adjustment` of −7 shares
+ * at $0 on 2026-06-09. FIFO-matching a later sell against those stale lots
+ * yields a realized figure that is wrong in both magnitude and sign, and it
+ * looks exactly like a correct one.
+ *
+ * Attribution is by SYMBOL TOKEN against the tickers actually on the tape
+ * (`"REVERSE SPLIT - TDIC"` → `TDIC`), never by matching the phrase: the
+ * description text is the broker's, undocumented, and free to change, and a
+ * phrase filter that stops matching goes silently vacuous — TRA-2864's whole
+ * lesson. Tokenising and intersecting with known tickers can only ever fail in
+ * the safe direction, because of what happens next:
+ *
+ * **An action we cannot attribute to a symbol withholds ALL equity.** Not the
+ * one symbol we guessed at, not nothing at all. If a corporate action is in the
+ * window and we cannot say which ticker it hit, then every equity lot book in
+ * that window is suspect and none of them may be booked. That is the failure
+ * direction that costs 80 cents of visible reconciliation instead of
+ * manufacturing a plausible wrong number nobody can see is wrong.
+ *
+ * Returns the symbols to exclude plus the unattributable actions, so the caller
+ * can SAY which it withheld and why rather than quietly reporting less.
+ */
+export interface EquityCorporateActionScope {
+  /** Equity tickers to drop from the matcher entirely. */
+  excludeSymbols: Set<string>;
+  /** True when an action could not be pinned to a ticker ⇒ withhold ALL equity. */
+  withholdAllEquity: boolean;
+  /** Human-readable reasons, for the report header / logs. Never empty when withholding. */
+  reasons: string[];
+}
+
+export function equitySymbolsInvalidatedByCorporateActions(
+  actions: readonly { date: string; type: string; description: string; quantity: number }[],
+  fills: readonly TradierTradeHistoryFill[],
+): EquityCorporateActionScope {
+  const tickers = new Set(
+    fills.filter(f => f.tradeType === 'equity').map(f => f.symbol.toUpperCase()),
+  );
+  const excludeSymbols = new Set<string>();
+  const reasons: string[] = [];
+  let withholdAllEquity = false;
+  for (const action of actions) {
+    const tokens = new Set(
+      (action.description ?? '')
+        .toUpperCase()
+        .split(/[^A-Z0-9.]+/)
+        .filter(Boolean),
+    );
+    const hits = [...tickers].filter(t => tokens.has(t));
+    if (hits.length === 1) {
+      excludeSymbols.add(hits[0]);
+      reasons.push(
+        `${hits[0]} withheld: ${action.type} moved ${action.quantity} shares on ${action.date} with no trade row`,
+      );
+      continue;
+    }
+    // Zero hits (description carries no ticker we know) or several (ambiguous):
+    // either way we cannot scope the damage, so we withhold the whole sleeve.
+    withholdAllEquity = true;
+    reasons.push(
+      `all equity withheld: ${action.type} moved ${action.quantity} shares on ${action.date} and could not be attributed to a ticker (${hits.length} candidates)`,
+    );
+  }
+  return { excludeSymbols, withholdAllEquity, reasons };
 }
 
 /**
