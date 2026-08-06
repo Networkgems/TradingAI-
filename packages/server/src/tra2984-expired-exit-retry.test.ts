@@ -244,9 +244,28 @@ describe('TRA-2984 — summarizeLiveExitErrors makes `exitErrorReason` countable
     } as OptionPosition;
   }
 
-  it('counts the production row — one live position with a failed, unresolved exit', () => {
-    // These are the exact fields bqb1 was serving on 2026-08-06.
-    const s = summarizeLiveExitErrors([pos({ exitErrorReason: 'Tradier sell_to_close expired', exitExpiredCount: 1 })]);
+  it('counts the production row — and calls its staging STOPPED, because it is', () => {
+    // The exact fields bqb1 was serving at 2026-08-06T11:00Z, sentinel included.
+    const s = summarizeLiveExitErrors([
+      pos({
+        exitErrorReason: 'Tradier sell_to_close expired',
+        exitExpiredCount: 1,
+        riskUnmanagedReason: 'sub_floor_premium',
+      }),
+    ]);
+    // `stagingStopped: 1` is the load-bearing half. Neither breaker has tripped
+    // (1 expiry of 3), so counting only breakers would say 0 — "it will try
+    // again next session" — about a row TRA-2820 disarms on every tick.
+    expect(s).toEqual({ total: 1, expired: 1, stagingStopped: 1 });
+  });
+
+  it('a MANAGED row mid-retry is NOT stagingStopped — the two must stay apart', () => {
+    // Same failed exit, no sentinel, breaker not tripped: this one genuinely
+    // does get another attempt next session. If both shapes reported 1 the
+    // field would be a restatement of `total` and could not route anything.
+    const s = summarizeLiveExitErrors([
+      pos({ exitErrorReason: 'Tradier sell_to_close expired', exitExpiredCount: 1, stopLossPremium: 0.216 }),
+    ]);
     expect(s).toEqual({ total: 1, expired: 1, stagingStopped: 0 });
   });
 

@@ -857,10 +857,19 @@ export interface LiveExitErrorSummary {
   /** The subset whose LAST failure was an order that expired unfilled. */
   expired: number;
   /**
-   * The subset where the engine has STOPPED staging exits (either breaker
-   * tripped). These are the rows that will never self-resolve: they need a
-   * human on the broker or the Close button, and until one arrives the position
-   * runs with its risk rules detached.
+   * The subset where the engine has STOPPED staging exits — either breaker
+   * tripped, OR the row carries the TRA-462/TRA-2820 unmanaged sentinel. These
+   * are the rows that will never self-resolve: they need a human on the broker
+   * or the Close button, and until one arrives the position sits on a failed
+   * exit nobody is retrying.
+   *
+   * The sentinel belongs here and it is not a technicality. TRA-2820 made
+   * `checkExits` DISARM a sub-floor row rather than merely decline to arm it,
+   * which is right — but it also means such a row's `exitErrorReason` is now
+   * PERMANENT: nothing will ever stage another exit to clear it. Counting only
+   * the breakers reports the production TSLA row as `stagingStopped: 0`, i.e.
+   * "the engine will try again next session", which is the precise opposite of
+   * what happens. Two states, one number, and it reads as the safe one.
    */
   stagingStopped: number;
 }
@@ -895,6 +904,9 @@ export function summarizeLiveExitErrors(
     if (
       (opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS
       || (opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES
+      // TRA-2820 — `checkExits` disarms a sentinel-stamped row outright, so no
+      // future tick will stage the exit that would clear this error.
+      || opt.riskUnmanagedReason !== undefined
     ) {
       stagingStopped += 1;
     }
