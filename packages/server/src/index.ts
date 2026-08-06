@@ -8281,6 +8281,10 @@ app.get('/api/health/order-splitting', (_req, res) => {
 //    registry (same source as /api/health/order-quote-guard, so they can't drift).
 // Counters read empty until live orders flow (live auto-trading is on HOLD,
 // TRA-1897); a `total: 0` here means no orders observed this uptime, not a fault.
+//
+// Sibling probe: `/api/health/execution-quality-kpi` (TRA-1981) — realized-vs-modeled
+// cost decay from persisted data. Different measurement, deliberately a different path
+// (TRA-3051: the two shared this path and the KPI never ran).
 app.get('/api/health/execution-quality', (_req, res) => {
   try {
     res.json({
@@ -8305,7 +8309,20 @@ app.get('/api/health/execution-quality', (_req, res) => {
 // persisted data (no new writes, no behavior change); unmeasured legs are `null`,
 // never `0` (TRA-1707). The options leg is durable; the equity/crypto legs are
 // session-scoped live open positions (folded across all user books).
-app.get('/api/health/execution-quality', (_req, res) => {
+//
+// ⚠️ PATH — `-kpi`, NOT the bare `/api/health/execution-quality` above (TRA-3051).
+// This handler was originally registered on the SAME path as the TRA-2046 telemetry
+// probe. Express matches in registration order and neither block calls `next()`, so
+// TRA-2046 (registered first) answered every request and this one had never run in
+// production — confirmed live on `7a53176`, where the bare path returned
+// `{"issue":"TRA-2046",...}`. The failure was silent in the worst way: callers got a
+// well-formed 200 with a plausible telemetry body, so "the KPI reads empty" and "the
+// KPI is unreachable" looked identical from outside. Both probes are wanted — they
+// measure different things (TRA-2046 folds since-boot order-quality samples; this
+// folds a realized-vs-modeled decay ratio from persisted data) — so the fix is the
+// rename, not a deletion. The bare path keeps the TRA-2046 body it has always served.
+// `route-registration-uniqueness.test.ts` fails the build if any path is doubled again.
+app.get('/api/health/execution-quality-kpi', (_req, res) => {
   try {
     const equityPositions: Position[] = [];
     const cryptoPositions: Position[] = [];
