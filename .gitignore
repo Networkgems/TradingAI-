@@ -19,6 +19,16 @@ packages/backtest/data/*
 # Pinned fixtures committed for deterministic CI tests (TRA-1579)
 !packages/backtest/data/btc-usd.4h.json
 
+# Operator credentials for the diagnostic scripts (TRA-2163 lineage).
+#
+# Several scripts/ tools read `<repo>/.env` for ADMIN_USERNAME / ADMIN_PASSWORD to log
+# into a live box (e.g. scripts/tra2610-archive-scan.mjs). That file was NOT ignored, and
+# this clone is shared: a concurrent agent's `git add -A` can sweep a plaintext admin
+# password into someone else's commit before the author deletes it. Ignore it at rest.
+.env
+.env.*
+!.env.example
+
 # Server runtime output — never commit user data, logs, or QA scratch (TRA-689)
 packages/server/data/
 packages/server/logs/
