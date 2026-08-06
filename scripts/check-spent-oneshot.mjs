@@ -85,8 +85,31 @@
  *     trigger STILL reads `enabled: true`, `nextRunAt: 2027-07-31T00:10Z`. A
  *     check keyed on `trigger.enabled` alone therefore reports every routine
  *     ever archived, forever, and the real findings drown. `status === 'active'`
- *     is the discriminator and it is not optional. (It also means ARCHIVING IS
- *     the remedy this check asks for — you do not need to hunt the trigger.)
+ *     is the discriminator and it is not optional. (It also means archiving IS a
+ *     sufficient remedy — but ONLY on a COVERAGE_LOST row. See trap 8.)
+ *
+ *  8. ⛔⛔ THE REMEDY IS NOT THE SAME FOR THE TWO VERDICTS, AND PRINTING THE
+ *     WRONG ONE DESTROYS LIVE COVERAGE (TRA-3018). This report used to emit
+ *     "Remedy: ARCHIVE the routine" unconditionally on any non-CLEAN verdict —
+ *     six lines after telling the reader that a RESIDUAL_ZOMBIE row still has
+ *     `nearCount` live arms. Archiving takes those arms down with the spent one,
+ *     which is exactly the distinction the RESIDUAL_ZOMBIE / COVERAGE_LOST split
+ *     was built to make; the remedy line threw it away. It was live-relevant:
+ *     `41c0c68d` held a spent annual one-shot AND the weekly Friday TRA-2879
+ *     disarm review, and archiving it would have silently retired an active
+ *     live-sleeve tripwire. The remedy is now derived PER FINDING:
+ *       COVERAGE_LOST   → archive the routine (nothing live is on it)
+ *       RESIDUAL_ZOMBIE → disable the SPENT TRIGGER ONLY, by id:
+ *                         `PATCH /api/routine-triggers/{triggerId} {"enabled":false}`
+ *                         ⛔ the nested `/api/routines/{rid}/triggers/{tid}`
+ *                            spelling is 404. The FLAT route is the one that works.
+ *                         ⛔ `enabled:false` does NOT clear `nextRunAt` — the
+ *                            trigger keeps its 2027 slot after a successful
+ *                            write. READ BACK `enabled`, never `nextRunAt`. This
+ *                            check goes clean because it filters the population
+ *                            on `enabled === true` BEFORE it looks at the
+ *                            horizon; a census keyed on horizon alone will still
+ *                            flag the row.
  *
  *  4. ⛔ `nextRunAt` AND `lastFiredAt` LIVE ON `triggers[]`, NOT THE ROUTINE
  *     ROOT (TRA-2422 trap 2). A root-level read of either returns `undefined`
@@ -370,6 +393,9 @@ export async function sweep(
         lastRunStatus: r.lastRun ? (r.lastRun.status ?? null) : null,
         spent: verdict.far.map((f) => ({
           state: f.state,
+          // Trap 8 — the surgical remedy PATCHes a trigger BY ID. A finding that
+          // cannot name the id can only be repaired with the blunt instrument.
+          triggerId: f.trigger.id ?? null,
           label: f.trigger.label ?? null,
           cronExpression: f.trigger.cronExpression ?? null,
           timezone: f.trigger.timezone ?? null,
@@ -492,9 +518,58 @@ export function renderReport(result, names = {}) {
     out.push('This is exit 0 because the repair is already owned, NOT because coverage is intact — read the block above.');
   }
   if (result.verdict !== 'CLEAN' && result.verdict !== 'ACKNOWLEDGED_ONLY' && result.verdict !== 'BLIND') {
-    out.push('Remedy: ARCHIVE the routine (trap 3 — that is enough; the trigger stays enabled and it does not matter).');
-    out.push('Routine writes follow the ASSIGNEE and 403 across agents — relay a carrier, do not sweep another owner\'s row.');
+    out.push(...remedyLines(result.findings ?? []));
   }
+  return out;
+}
+
+export const ARCHIVE_REMEDY = 'ARCHIVE the routine';
+export const SURGICAL_REMEDY = 'PATCH /api/routine-triggers/{triggerId}';
+
+/**
+ * Trap 8 (TRA-3018). The remedy is derived PER FINDING from its own verdict —
+ * never printed once for the whole run.
+ *
+ * ⛔ The archive line must NEVER appear on a run whose only findings are
+ * RESIDUAL_ZOMBIE: those rows have live arms and archiving takes them down. The
+ * `--selftest` controls assert both directions, and mutate this function back to
+ * the unconditional v1 text to prove they discriminate.
+ */
+export function remedyLines(findings) {
+  const out = [];
+  const lost = findings.filter((f) => f.state === 'COVERAGE_LOST');
+  const residual = findings.filter((f) => f.state === 'RESIDUAL_ZOMBIE');
+
+  if (lost.length) {
+    out.push(`Remedy · COVERAGE_LOST (${lost.length} row(s)): ${ARCHIVE_REMEDY}.`);
+    out.push('      Every armed trigger on these rows is beyond the horizon, so archiving retires nothing live.');
+    out.push('      Trap 3 — the trigger keeps `enabled:true` and its 2027 nextRunAt afterwards; that is fine once `status !== "active"`.');
+    for (const f of lost) out.push(`      archive ${f.id}  ${f.title}`);
+  }
+
+  if (residual.length) {
+    const near = residual.reduce((n, f) => n + (f.nearCount ?? 0), 0);
+    if (lost.length) out.push('');
+    out.push(`Remedy · RESIDUAL_ZOMBIE (${residual.length} row(s)): ⛔ DO NOT ARCHIVE THESE.`);
+    out.push(`      ${near} nearer arm(s) across them are LIVE coverage and archiving takes those down with the spent one`);
+    out.push('      (41c0c68d held a spent annual one-shot AND the weekly TRA-2879 disarm review — TRA-3018).');
+    out.push(`      Disable the SPENT TRIGGER ONLY:  ${SURGICAL_REMEDY}  {"enabled": false}  → 200`);
+    out.push('      ⛔ the nested /api/routines/{routineId}/triggers/{triggerId} spelling is 404. Use the FLAT route.');
+    for (const f of residual) {
+      for (const s of f.spent) {
+        out.push(
+          s.triggerId
+            ? `      disable trigger ${s.triggerId}  (${f.id} ${f.title} — ${s.state}, next ${s.nextRunAt})`
+            : `      ⚠️  ${f.id} ${f.title}: this route served no trigger id — re-GET /api/routines/${f.routineId} for it. DO NOT fall back to archiving.`,
+        );
+      }
+    }
+    out.push('      ⛔ `enabled:false` does NOT clear `nextRunAt` — the trigger still reads its far slot after a successful');
+    out.push('      write. READ BACK `enabled`, never `nextRunAt`. This check clears the row because it filters on');
+    out.push('      `enabled === true` before the horizon; any census keyed on horizon alone will still flag it.');
+  }
+
+  out.push("Routine writes follow the ASSIGNEE and 403 across agents — relay a carrier, do not sweep another owner's row.");
   return out;
 }
 
@@ -503,6 +578,8 @@ export function renderReport(result, names = {}) {
  * ------------------------------------------------------------------ */
 
 const NOW = Date.parse('2026-08-05T23:50:00Z');
+const SPENT_TRIGGER_ID = '11111111-spent-trigger';
+const NEAR_TRIGGER_ID = '22222222-near-trigger';
 const far = (over = {}) => ({
   id: 'aaaaaaaa-0000-0000-0000-000000000000',
   status: 'active',
@@ -510,6 +587,7 @@ const far = (over = {}) => ({
   assigneeAgentId: 'agent-1',
   triggers: [
     {
+      id: SPENT_TRIGGER_ID,
       kind: 'schedule',
       enabled: true,
       cronExpression: '0 21 30 7 *',
@@ -542,6 +620,7 @@ const CASES = [
         triggers: [
           far().triggers[0],
           {
+            id: NEAR_TRIGGER_ID,
             kind: 'schedule',
             enabled: true,
             cronExpression: '15 17 * * 5',
@@ -675,6 +754,133 @@ const CASES = [
   },
 ];
 
+/* --- trap 8: the REMEDY LINE itself is an instrument (TRA-3018) ----- *
+ *
+ * The v1 report printed "ARCHIVE the routine" on every non-CLEAN verdict, six
+ * lines after announcing that a RESIDUAL_ZOMBIE row still had live arms. These
+ * controls grade the remedy TEXT end-to-end through renderReport, in both
+ * directions, and the last one MUTATES the remedy back to v1 to prove they can
+ * actually fail. A control that passes against the defect it grades is not a
+ * control.
+ */
+
+const residualRoutine = () => ({
+  ...far(),
+  id: 'cccccccc-0000-0000-0000-000000000000',
+  title: 'spent annual one-shot RIDING A LIVE WEEKLY REVIEW (41c0c68d shape)',
+  triggers: [
+    far().triggers[0],
+    {
+      id: NEAR_TRIGGER_ID,
+      kind: 'schedule',
+      enabled: true,
+      cronExpression: '15 17 * * 5',
+      timezone: 'America/New_York',
+      nextRunAt: '2026-08-07T21:15:00.000Z',
+      lastFiredAt: null,
+    },
+  ],
+});
+const lostRoutine = () => ({ ...far(), title: 'only arm is spent (589334bc shape)' });
+
+/** Re-render a result with the remedy block swapped — the mutation hook. */
+const renderWith = (result, remedyFn) => {
+  const lines = renderReport(result);
+  const cut = lines.indexOf(`VERDICT: ${result.verdict}`);
+  return [...lines.slice(0, cut + 1), ...remedyFn(result.findings)].join('\n');
+};
+
+/** The v1 remedy, verbatim. Only ever used as a mutation. */
+const REMEDY_V1 = () => [
+  'Remedy: ARCHIVE the routine (trap 3 — that is enough; the trigger stays enabled and it does not matter).',
+  "Routine writes follow the ASSIGNEE and 403 across agents — relay a carrier, do not sweep another owner's row.",
+];
+
+const assertResidual = (text) => {
+  const p = [];
+  if (text.includes(ARCHIVE_REMEDY)) p.push('⛔ told the reader to ARCHIVE a row that still holds live arms');
+  if (!text.includes(SURGICAL_REMEDY)) p.push('no surgical trigger-PATCH remedy offered');
+  if (!text.includes(SPENT_TRIGGER_ID)) p.push('the spent trigger id was never named, so the remedy is not actionable');
+  if (text.includes(NEAR_TRIGGER_ID)) p.push('⛔ named the LIVE trigger as something to disable');
+  if (!/enabled.*does NOT clear/i.test(text)) p.push('did not warn that enabled:false leaves nextRunAt standing');
+  return p;
+};
+
+const REMEDY_CASES = [
+  {
+    name: 'REMEDY — RESIDUAL_ZOMBIE gets the SURGICAL fix and NEVER the archive line (TRA-3018 §1)',
+    routines: [residualRoutine()],
+    verdict: 'FINDINGS',
+    assert: assertResidual,
+  },
+  {
+    name: 'REMEDY — COVERAGE_LOST still gets ARCHIVE, and is not sent hunting a trigger',
+    routines: [lostRoutine()],
+    verdict: 'COVERAGE_LOST',
+    assert: (text) => {
+      const p = [];
+      if (!text.includes(ARCHIVE_REMEDY)) p.push('the archive remedy was lost for the row it IS correct for');
+      if (text.includes(SURGICAL_REMEDY)) p.push('sent a coverage-lost row on a needless trigger hunt');
+      return p;
+    },
+  },
+  {
+    name: 'REMEDY — a MIXED run prints BOTH, each scoped to its own rows (the case v1 got wrong)',
+    routines: [residualRoutine(), lostRoutine()],
+    verdict: 'COVERAGE_LOST',
+    assert: (text) => {
+      const p = [...assertResidual(text.split('Remedy · RESIDUAL_ZOMBIE')[1] ?? '')];
+      if (!text.includes(ARCHIVE_REMEDY)) p.push('the archive remedy vanished on a mixed run');
+      const archiveBlock = text.split('Remedy · RESIDUAL_ZOMBIE')[0];
+      if (!archiveBlock.includes('archive aaaaaaaa')) p.push('the archive list did not name the coverage-lost row');
+      if (archiveBlock.includes('archive cccccccc')) p.push('⛔ the archive list named the RESIDUAL_ZOMBIE row');
+      return p;
+    },
+  },
+  {
+    name: 'REMEDY — the surgical line rejects the 404 nested spelling and names the flat route',
+    routines: [residualRoutine()],
+    verdict: 'FINDINGS',
+    assert: (text) => {
+      const p = [];
+      if (!text.includes('/api/routine-triggers/')) p.push('flat route absent');
+      if (!/404/.test(text)) p.push('did not warn the nested spelling 404s');
+      return p;
+    },
+  },
+];
+
+async function remedyControls() {
+  let pass = 0;
+  let residualResult = null;
+  for (const c of REMEDY_CASES) {
+    const ledger = parseAcknowledgements({ acknowledged: [] });
+    const result = await sweep(
+      { getRoutines: async () => c.routines },
+      { horizonDays: HORIZON_DAYS, nowMs: NOW, acks: ledger.acks, ackWarnings: ledger.warnings },
+    );
+    if (c.verdict === 'FINDINGS' && !residualResult) residualResult = result;
+    const problems = result.verdict !== c.verdict ? [`verdict ${result.verdict} != ${c.verdict}`] : c.assert(renderReport(result).join('\n'));
+    if (problems.length) console.log(`FAIL  ${c.name}\n        ${problems.join('; ')}`);
+    else {
+      console.log(`ok    ${c.name}`);
+      pass += 1;
+    }
+  }
+
+  // MUTATION control. Put the v1 remedy back and the RESIDUAL_ZOMBIE control
+  // must FAIL — otherwise it is not grading anything.
+  try {
+    const killed = assertResidual(renderWith(residualResult, REMEDY_V1));
+    if (!killed.length) throw new Error('the v1 unconditional "ARCHIVE the routine" remedy PASSED the residual control — the control is inert');
+    console.log(`ok    MUTATION — restoring the v1 remedy fails the residual control (${killed.length} problem(s) raised)`);
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  MUTATION control\n        ${err.message}`);
+  }
+  return pass;
+}
+
 async function selftest() {
   let pass = 0;
   const seen = new Set();
@@ -753,7 +959,9 @@ async function selftest() {
     console.log(`FAIL  GLOBAL shipped-ledger control\n        ${err.message}`);
   }
 
-  const total = CASES.length + 3;
+  pass += await remedyControls();
+
+  const total = CASES.length + 3 + REMEDY_CASES.length + 1;
   console.log('');
   console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
   for (const v of ['CLEAN', 'ACKNOWLEDGED_ONLY', 'FINDINGS', 'COVERAGE_LOST', 'BLIND']) {
