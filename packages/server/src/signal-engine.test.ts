@@ -3130,6 +3130,80 @@ describe('SignalEngine — TRA-356 periodic portfolio reconcile', () => {
     expect(second.skipped).toBe('cadence');
     expect(stub.listOpenOptionPositions).toHaveBeenCalledTimes(1);
   });
+
+  // TRA-3010 — the enabling precondition for the gate-A basis census.
+  //
+  // The census publishes `candidates: 0` in five states that mean completely
+  // different things, and only ONE of them ("the sweep ran and there was no
+  // engine-opened row") is honest BLIND. Without a positive witness that the
+  // branch was reached, a Tradier outage or a dark live client is byte-
+  // identical to a quiet day — which is the exact defect the gate exists to
+  // avoid, reproduced one level up. These pin the discriminator.
+  describe('TRA-3010 sweep witness', () => {
+    it('records ZERO reached and names the reason for every state that never gets to the census', async () => {
+      // dark: not in live mode
+      const demo = setupEngine({ mode: 'demo', client: { listOpenOptionPositions: vi.fn() } });
+      await demo.reconcileLivePortfolio();
+      expect(demo.getEngineBasisSweepWitness()).toMatchObject({
+        reached: 0,
+        lastOutcome: 'mode',
+        skipped: expect.objectContaining({ mode: 1 }),
+      });
+
+      // dark: no client for the active env
+      const noClient = setupEngine({ mode: 'live', env: 'sandbox', client: null });
+      await noClient.reconcileLivePortfolio();
+      expect(noClient.getEngineBasisSweepWitness()).toMatchObject({
+        reached: 0,
+        lastOutcome: 'no-client',
+        skipped: expect.objectContaining({ no_client: 1 }),
+      });
+
+      // idle: no open live rows, so the network read is never made
+      const idle = setupEngine({ client: { listOpenOptionPositions: vi.fn().mockResolvedValue([]) } });
+      await idle.reconcileLivePortfolio();
+      expect(idle.getEngineBasisSweepWitness()).toMatchObject({
+        reached: 0,
+        lastOutcome: 'empty',
+        skipped: expect.objectContaining({ empty: 1 }),
+      });
+
+      // broker unreadable: this is the one that most resembles a quiet day
+      const outage = setupEngine({
+        client: { listOpenOptionPositions: vi.fn().mockRejectedValue(new Error('socket reset')) },
+      });
+      openLiveEngineRow(outage, 'sandbox');
+      await outage.reconcileLivePortfolio();
+      expect(outage.getEngineBasisSweepWitness()).toMatchObject({
+        reached: 0,
+        lastOutcome: 'fetch-failed',
+        skipped: expect.objectContaining({ fetch_failed: 1 }),
+      });
+      // and it must NOT be confusable with the idle case
+      expect(outage.getEngineBasisSweepWitness().skipped.empty).toBe(0);
+    });
+
+    it('records reached>0 with a timestamp once the census branch actually runs, even when it matches nothing', async () => {
+      const stub: ListPositionsStub = { listOpenOptionPositions: vi.fn().mockResolvedValue([]) };
+      const engine = setupEngine({ client: stub });
+      openLiveEngineRow(engine, 'sandbox');
+
+      const summary = await engine.reconcileLivePortfolio();
+      expect(summary.skipped).toBeNull();
+
+      const witness = engine.getEngineBasisSweepWitness();
+      // The broker reported nothing, so no row was matched and the census
+      // denominator is legitimately zero — but the sweep DID reach it. That
+      // pairing is what makes the zero readable instead of unread.
+      expect(witness.reached).toBe(1);
+      expect(witness.lastOutcome).toBe('reached');
+      expect(witness.lastReachedAt).toBe(TRADING_TIME);
+      expect(engine.getEngineBasisRestatementCensus('sandbox').candidates).toBe(0);
+      // The distinguishing assertion: a zero denominator here is NOT the same
+      // reading as the outage case above, which also publishes candidates: 0.
+      expect(witness.skipped.fetch_failed).toBe(0);
+    });
+  });
 });
 
 // TRA-415 — periodic equity-position reconcile while live mode is active.

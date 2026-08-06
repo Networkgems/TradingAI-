@@ -11209,10 +11209,22 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       ? envParam
       : (settings.liveTradierEnvOptions ?? 'sandbox');
   const memory = ctx.engine.getEngineBasisRestatementCensus(env);
+  const sweeps = ctx.engine.getEngineBasisSweepWitness();
   const durable = readEngineBasisRestatements(process.env['DATA_DIR']);
   res.json({
     ok: true,
     env,
+    // TRA-3010 — the ENABLING PRECONDITION, published so `candidates: 0` can be
+    // read. `reached` counts sweeps that actually got as far as the census
+    // branch; `skipped` says why the others did not. `reached: 0` is an UNREAD
+    // instrument, never "nothing to measure" — see `reconcileLivePortfolio`.
+    sweeps: {
+      window: 'process uptime — resets on restart',
+      reached: sweeps.reached,
+      lastReachedAt: sweeps.lastReachedAt === null ? null : new Date(sweeps.lastReachedAt).toISOString(),
+      lastOutcome: sweeps.lastOutcome,
+      skipped: sweeps.skipped,
+    },
     // TRA-2813 — the observation window is stated ON the payload. The counters
     // below reset on every restart (bqb1 reboots several times a day), so a
     // zero here means "not since this boot", NOT "never". `uptimeSec` from

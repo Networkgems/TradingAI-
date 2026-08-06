@@ -56,8 +56,19 @@ const census = await res.json();
 
 const boot = census.sinceBoot ?? {};
 const durable = census.durable ?? {};
+const sweeps = census.sweeps ?? null;
 
 console.log(`\n# env                 ${census.env}`);
+if (!sweeps) {
+  fail(
+    'census payload carries no `sweeps` witness — this host predates the '
+    + 'enabling-precondition fix, so `candidates: 0` cannot be told apart from an unread instrument',
+  );
+}
+console.log(`# --- sweep witness (${sweeps.window}) — the ENABLING PRECONDITION ---`);
+console.log(`# reached             ${sweeps.reached}   <- sweeps that got as far as the census branch`);
+console.log(`# lastReachedAt       ${sweeps.lastReachedAt ?? '(never)'}   lastOutcome ${sweeps.lastOutcome ?? '(none)'}`);
+console.log(`# skipped             ${JSON.stringify(sweeps.skipped)}`);
 console.log(`# --- since boot (${boot.window ?? 'unknown window'}) ---`);
 console.log(`# candidates          ${boot.candidates}   <- DENOMINATOR: engine rows the branch reached`);
 console.log(`# restated            ${boot.restated}`);
@@ -76,13 +87,68 @@ if (!durable.dataDir) {
 
 // The trap this gate exists to name: a restatement that matched NO rows and one
 // that matched and agreed publish the same empty ledger. Separate them.
+// Corroborate the zero against the book itself. GET only — never
+// `POST /api/tradier/positions/sync`, which mutates the book under test.
+let cohort = null;
+const stateRes = await fetch(`${HOST}/api/state`, { headers: auth });
+if (stateRes.ok) {
+  const state = await stateRes.json().catch(() => null);
+  const rows = state?.openOptions ?? state?.options?.openOptions ?? [];
+  const live = rows.filter(r => (r.mode ?? 'demo') === 'live');
+  cohort = live.filter(r => !r.importedFromTradier);
+  console.log(`# --- book cross-check (GET /api/state) ---`);
+  console.log(`# open live rows      ${live.length}   of which engine-opened (!importedFromTradier) ${cohort.length}`);
+} else {
+  console.log(`# book cross-check unavailable (/api/state ${stateRes.status}) — the zero below is uncorroborated`);
+}
+
 const records = durable.restatements ?? [];
 if (records.length === 0) {
+  // A zero here has two utterly different causes and they must not share an
+  // exit code: either the sweep ran and found no engine row (BLIND, 2), or the
+  // sweep never reached the census at all (UNREAD, 3).
+  if (boot.candidates === 0 && sweeps.reached === 0) {
+    const s = sweeps.skipped ?? {};
+    if (s.mode > 0 || s.no_client > 0) {
+      fail(
+        `the live reconcile is DARK — skipped mode=${s.mode} no_client=${s.no_client}. `
+        + 'The census branch was never reachable, so its zero says nothing about the restatement.',
+      );
+    }
+    if (s.fetch_failed > 0) {
+      fail(
+        `Tradier /positions failed ${s.fetch_failed} time(s) and the census was never reached. `
+        + 'A broker outage publishes the same zero as "no engine row arrived" — this is unread, not clean.',
+      );
+    }
+    if (s.empty > 0) {
+      console.log('\nBLIND — the live account was idle for the whole observed window');
+      console.log(`        (${s.empty} sweep(s) skipped as \`empty\`: no open live rows, no in-flight`);
+      console.log('        exits or closes), so the network read was never made and the');
+      console.log('        restatement branch could not run. Nothing to measure. NOT a pass.');
+      process.exit(2);
+    }
+    fail(
+      `the census was never reached and no skip reason was recorded (${JSON.stringify(s)}) — `
+      + 'the witness itself is not wired; treat as unread',
+    );
+  }
   console.log('\nBLIND — no engine-opened live row has been restated.');
   if (boot.candidates === 0) {
-    console.log('        The branch has not been reached since boot either: there is no');
-    console.log('        engine-opened live row to measure. Pass and fail states are');
-    console.log('        byte-identical here. NOT a pass.');
+    console.log(`        The sweep DID reach the census branch ${sweeps.reached} time(s)`);
+    console.log(`        (last ${sweeps.lastReachedAt}), so the instrument is armed and readable —`);
+    console.log('        there is simply no engine-opened live row in the book. Pass and fail');
+    console.log('        states are byte-identical here. NOT a pass.');
+    if (cohort !== null && cohort.length > 0) {
+      console.log('');
+      console.log(`        ⚠ BUT the book holds ${cohort.length} open engine-opened live row(s)`);
+      console.log(`          (${cohort.map(r => r.optionSymbol ?? r.symbol).join(', ')}) that the sweep`);
+      console.log('          never matched. That means Tradier /positions is not reporting them');
+      console.log('          — expected only transiently (a just-opened row, or one the');
+      console.log('          broker-flat sweep is about to close). If it persists across');
+      console.log('          reads, the pairing is broken, not idle. Investigate before the');
+      console.log('          next grading read; do NOT read this zero as coverage.');
+    }
   } else if (boot.skips?.zero_delta > 0) {
     console.log(`        ${boot.skips.zero_delta} row(s) skipped as zero_delta: our mid already`);
     console.log('        equalled broker truth, so the corrected code executed nothing.');

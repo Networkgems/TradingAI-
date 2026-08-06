@@ -13814,6 +13814,56 @@ export class SignalEngine {
    * Returns a counter so the tick caller can log activity and decide
    * whether to re-broadcast.
    */
+  /**
+   * TRA-3010 — the ENABLING PRECONDITION for the gate-A census, recorded here
+   * because this is the only place that knows why a sweep did or did not reach
+   * `reconcileTradierPositions`.
+   *
+   * Without it the census is still identical in its pass and fail states, one
+   * level up from the hole it was built to close. `candidates: 0` is published
+   * by ALL of these, and they do not mean the same thing:
+   *
+   *   • the engine is not in live mode, or has no Tradier client — the sweep is
+   *     DARK and nothing was ever going to be measured;
+   *   • `listOpenOptionPositions()` threw — the broker was unreadable, which on
+   *     a day-long outage reads exactly like "no engine row arrived";
+   *   • the account was idle — a true no-op, but only meaningful if you can see
+   *     that it was the reason;
+   *   • the sweep ran end to end and there simply was no engine-opened row —
+   *     the ONLY reading under which `candidates: 0` is honest BLIND rather
+   *     than an unread instrument.
+   *
+   * `reached` is the positive witness: it counts sweeps that actually invoked
+   * the census branch. A grader that sees `reached === 0` must not report
+   * "nothing to measure".
+   */
+  private engineBasisSweeps: {
+    reached: number;
+    lastReachedAt: number | null;
+    lastOutcome: string | null;
+    skipped: Record<'mode' | 'no_client' | 'cadence' | 'empty' | 'fetch_failed', number>;
+  } = {
+    reached: 0,
+    lastReachedAt: null,
+    lastOutcome: null,
+    skipped: { mode: 0, no_client: 0, cadence: 0, empty: 0, fetch_failed: 0 },
+  };
+
+  /** TRA-3010 — read side of the sweep witness above. */
+  getEngineBasisSweepWitness(): {
+    reached: number;
+    lastReachedAt: number | null;
+    lastOutcome: string | null;
+    skipped: Record<'mode' | 'no_client' | 'cadence' | 'empty' | 'fetch_failed', number>;
+  } {
+    return {
+      reached: this.engineBasisSweeps.reached,
+      lastReachedAt: this.engineBasisSweeps.lastReachedAt,
+      lastOutcome: this.engineBasisSweeps.lastOutcome,
+      skipped: { ...this.engineBasisSweeps.skipped },
+    };
+  }
+
   async reconcileLivePortfolio(): Promise<{
     skipped: 'mode' | 'no-client' | 'cadence' | 'empty' | null;
     added: number;
@@ -13822,13 +13872,26 @@ export class SignalEngine {
     total: number;
   }> {
     const empty = { added: 0, updated: 0, removed: 0, total: 0 };
-    if (this.mode !== 'live') return { skipped: 'mode', ...empty };
+    // TRA-3010 — every early return below leaves the gate-A census untouched,
+    // so each one is recorded with its reason. See `engineBasisSweeps`.
+    const witness = this.engineBasisSweeps;
+    if (this.mode !== 'live') {
+      witness.skipped.mode += 1;
+      witness.lastOutcome = 'mode';
+      return { skipped: 'mode', ...empty };
+    }
     const env = this.tradierEnv;
     const client = this.tradierOptionsClientByEnv[env];
-    if (!client) return { skipped: 'no-client', ...empty };
+    if (!client) {
+      witness.skipped.no_client += 1;
+      witness.lastOutcome = 'no-client';
+      return { skipped: 'no-client', ...empty };
+    }
 
     const now = Date.now();
     if (now - this.lastTradierPortfolioReconcileAt < TRADIER_PORTFOLIO_RECONCILE_MS) {
+      witness.skipped.cadence += 1;
+      witness.lastOutcome = 'cadence';
       return { skipped: 'cadence', ...empty };
     }
 
@@ -13840,6 +13903,8 @@ export class SignalEngine {
       // Idle account: don't pay the network round-trip. Leave the timestamp
       // unchanged so the next non-empty tick reconciles immediately rather
       // than waiting out the cadence from the last empty check.
+      witness.skipped.empty += 1;
+      witness.lastOutcome = 'empty';
       return { skipped: 'empty', ...empty };
     }
 
@@ -13856,10 +13921,21 @@ export class SignalEngine {
       // budget with a tight retry loop; the next tick after the window will
       // try again.
       this.lastTradierPortfolioReconcileAt = now;
+      // TRA-3010 — the census is NOT reached on this path. A Tradier outage
+      // that lasts a session publishes `candidates: 0`, which is the same
+      // reading as "the branch ran and found no engine row". Count it.
+      witness.skipped.fetch_failed += 1;
+      witness.lastOutcome = 'fetch-failed';
       return { skipped: null, ...empty };
     }
 
     this.lastTradierPortfolioReconcileAt = now;
+    // TRA-3010 — the positive witness: past this line the census branch runs,
+    // so a later `candidates: 0` genuinely means "no engine-opened row", not
+    // "the instrument was never reached".
+    witness.reached += 1;
+    witness.lastReachedAt = now;
+    witness.lastOutcome = 'reached';
     const summary = acct.reconcileTradierPositions(positions, 'live');
     if (summary.added + summary.updated + summary.removed > 0) {
       log.info('portfolio reconcile summary', {
