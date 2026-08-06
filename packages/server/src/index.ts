@@ -12946,6 +12946,7 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
     getTwelveDataQuotaState,
     getTradierQuoteRateState,
     getTradierBarPullRateState,
+    getTradierQuotaBudgetState,
     getFeedDegradationState,
   } = await import('./yahoo-feed.js');
   const {
@@ -13031,6 +13032,19 @@ async function buildQuotesHealthPayload(): Promise<Record<string, unknown>> {
   // on restart) can't be differenced for a rate.
   try { results['tradierBarPullRate'] = getTradierBarPullRateState(); }
   catch (err) { results['tradierBarPullRate'] = { error: err instanceof Error ? err.message : String(err) }; }
+
+  // TRA-3104 — the account-quota BUDGET block: one account-wide figure, an explicit
+  // quote reservation, and the bar ceiling derived as the remainder — plus the
+  // `crossed` verdict, which is true when observed bar demand already meets the
+  // ceiling the budget implies. That verdict is the 2026-08-06 finding made
+  // self-reporting: bar demand scales with a universe that keeps growing, so a
+  // hand-run RTH calibration expires and the next reader would otherwise inherit
+  // a stale number. Read-only — `enforcing:false` (the default on every box) means
+  // no fetch decision is affected. Note it grades against the budget's IMPLIED
+  // ceiling even when inert, so a default box cannot report `crossed:false` merely
+  // because the gate is off.
+  try { results['tradierQuotaBudget'] = getTradierQuotaBudgetState(); }
+  catch (err) { results['tradierQuotaBudget'] = { error: err instanceof Error ? err.message : String(err) }; }
 
   // TRA-1059 — rolling Coinbase request rate (req/min, 60s window) per host. The
   // crypto candle cascade (cold-start daily warmer + steady-state tick loop) hits

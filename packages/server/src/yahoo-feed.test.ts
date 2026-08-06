@@ -6,6 +6,12 @@ import {
   setTradierStocksFeedClient,
   partitionCachedQuotes,
   requestsInWindow,
+  requestsInFixedWindow,
+  quoteReservationReqPerMin,
+  resolveBarPullCeiling,
+  quotaCrossingVerdict,
+  getTradierQuotaBudgetState,
+  getTradierAccountSpendThisMinute,
   canReuseCachedTradierBars,
   getTradierBarPullRateState,
   chartQuoteFromResult,
@@ -251,6 +257,328 @@ describe('requestsInWindow (TRA-552 req/min meter)', () => {
   });
 });
 
+// ── TRA-3104 — match the enforcement window: FIXED and minute-ALIGNED ─────────
+// Tradier's quota is enforced on a fixed, minute-ALIGNED window: 26/26 `HTTP 400:
+// Quota Violation` responses measured on bqb1 2026-08-06 carried an `Expires`
+// landing exactly on the next `:00` boundary (11 distinct values, all aligned).
+// Our meter was `requestsInWindow(..., 60_000)` — sliding.
+//
+// ⚠️ THE FILED FINDING OVERSTATED THIS AND THESE TESTS ARE WHAT CAUGHT IT. TRA-3104
+// claimed the sliding meter "gives no bound on the count inside any fixed minute"
+// and "fails in both directions". The under-fire half is FALSE: the aligned bucket
+// is always a SUBSET of the trailing 60s, so `slidingCount >= fixedCount` always,
+// and a sliding gate at N is strictly MORE conservative than a fixed gate at N.
+// The test below is the retraction, encoded — it asserts the bound HOLDS under the
+// old reducer, so nobody can re-derive the withdrawn claim from this file. What
+// remains is real and one-directional: the sliding meter OVER-fires, refusing cold
+// pulls while the enforced minute still has headroom.
+describe('requestsInFixedWindow (TRA-3104 fixed minute-aligned enforcement)', () => {
+  const W = 60_000;
+  // A clean minute boundary to reason against: t=600_000 is exactly 10:00.000.
+  const B = 600_000;
+
+  it('counts only the aligned bucket containing `now`, and includes its start', () => {
+    const ts = [B - 1, B, B + 10, B + 30_000];
+    const { count, windowStart } = requestsInFixedWindow(ts, B + 30_000, W);
+    expect(windowStart).toBe(B);
+    // B - 1 belongs to the PREVIOUS enforced minute and must not count.
+    expect(count).toBe(3);
+  });
+
+  it('resets to zero the instant the boundary is crossed (the quota does too)', () => {
+    const ts = Array.from({ length: 50 }, (_, i) => B - 1_000 - i); // all in minute N-1
+    expect(requestsInFixedWindow(ts, B - 1, W).count).toBe(50);
+    expect(requestsInFixedWindow(ts, B, W).count).toBe(0);
+  });
+
+  it('never needs a timestamp the rolling prune would have dropped', () => {
+    // The aligned bucket start is always >= now - windowMs, so the array the
+    // rolling meter keeps is always a superset of what the fixed counter reads.
+    // This is why the two meters share one array with no extra storage.
+    for (const now of [B, B + 1, B + 59_999, B + 60_000, B + 123_456]) {
+      const { windowStart } = requestsInFixedWindow([], now, W);
+      expect(windowStart).toBeGreaterThanOrEqual(now - W);
+      expect(windowStart).toBeLessThanOrEqual(now);
+    }
+  });
+
+  it('is never negative-length or ahead of `now` for a non-aligned clock', () => {
+    const { windowStart, count } = requestsInFixedWindow([B + 137], B + 137, W);
+    expect(windowStart).toBe(B);
+    expect(count).toBe(1);
+  });
+});
+
+describe('TRA-3104 — the sliding-vs-fixed mismatch, in the direction it actually fails', () => {
+  const W = 60_000;
+  const B = 600_000;
+  const CEILING = 100;
+
+  // Replay a spend decision request-by-request under a given reducer and return
+  // the timestamps actually allowed through — the only honest way to compare two
+  // limiters, since each one's refusals change what the next one sees.
+  const replay = (
+    attempts: readonly number[],
+    countPrior: (spent: readonly number[], at: number) => number,
+  ): number[] => {
+    const spent: number[] = [];
+    for (const a of attempts) if (countPrior(spent, a) < CEILING) spent.push(a);
+    return spent;
+  };
+  const sliding = (spent: readonly number[], at: number) => requestsInWindow(spent, at, W).count;
+  const fixed = (spent: readonly number[], at: number) => requestsInFixedWindow(spent, at, W).count;
+  const peakPerFixedMinute = (spent: readonly number[]): number => {
+    const buckets = new Map<number, number>();
+    for (const t of spent) {
+      const b = Math.floor(t / W);
+      buckets.set(b, (buckets.get(b) ?? 0) + 1);
+    }
+    return buckets.size === 0 ? 0 : Math.max(...buckets.values());
+  };
+
+  it('RETRACTION: a sliding gate at N never permits MORE than N inside an enforced minute', () => {
+    // The withdrawn claim was that 99 spends at :59 plus 99 at :01 slip past a
+    // sliding gate at 100 and burn 198 in one enforced minute. They do not: the
+    // trailing window still sees the first half, so the gate refuses. Replaying
+    // the decision — rather than counting a static array — is what shows it.
+    const attempts = [
+      ...Array.from({ length: 99 }, (_, i) => B - 1_000 + i),
+      ...Array.from({ length: 99 }, (_, i) => B + 1_000 + i),
+    ];
+    const bySliding = replay(attempts, sliding);
+    const byFixed = replay(attempts, fixed);
+    // Neither reducer ever exceeds the ceiling inside a fixed minute.
+    expect(peakPerFixedMinute(bySliding)).toBeLessThanOrEqual(CEILING);
+    expect(peakPerFixedMinute(byFixed)).toBeLessThanOrEqual(CEILING);
+    // And the sliding gate is the STRICTER of the two — it lets fewer through,
+    // which is the whole reason the mismatch cannot cause a Quota Violation.
+    expect(bySliding.length).toBeLessThan(byFixed.length);
+  });
+
+  it('the aligned bucket is always a SUBSET of the trailing window (why the bound holds)', () => {
+    // The structural reason, asserted directly rather than left as prose.
+    const ts = Array.from({ length: 200 }, (_, i) => B - 45_000 + i * 400);
+    for (const now of [B - 1, B, B + 137, B + 30_000, B + 59_999]) {
+      expect(requestsInFixedWindow(ts, now, W).count).toBeLessThanOrEqual(
+        requestsInWindow(ts, now, W).count,
+      );
+    }
+  });
+
+  it('OVER-fires: a quiet enforced minute reads AT the ceiling because its trailing 60s straddles a busy one', () => {
+    // 100 requests late in minute N-1; minute N is nearly silent (2 requests).
+    const ts = [
+      ...Array.from({ length: 100 }, (_, i) => B - 30_000 + i),
+      B + 1_000,
+      B + 2_000,
+    ];
+    const now = B + 2_500;
+    // OLD (sliding): 102 in the trailing 60s => at the ceiling => the gate defers
+    // COLD pulls, aging cold candles (the TRA-1539 regression) while the enforced
+    // minute has 98 units of quota going completely unused.
+    expect(requestsInWindow(ts, now, W).count).toBeGreaterThanOrEqual(CEILING);
+    // NEW (fixed): 2 spent in enforced minute N => correctly wide open.
+    expect(requestsInFixedWindow(ts, now, W).count).toBe(2);
+    expect(
+      barPullThrottleGate({
+        isActiveInterest: false,
+        isDeepMtf: false,
+        accountSpendThisMinute: requestsInFixedWindow(ts, now, W).count,
+        ceiling: CEILING,
+      }),
+    ).toEqual({ allowed: true, reason: 'under_ceiling' });
+    // The same gate fed the OLD statistic refuses — the mismatch, demonstrated
+    // through the real gate rather than asserted about it.
+    expect(
+      barPullThrottleGate({
+        isActiveInterest: false,
+        isDeepMtf: false,
+        accountSpendThisMinute: requestsInWindow(ts, now, W).count,
+        ceiling: CEILING,
+      }),
+    ).toEqual({ allowed: false, reason: 'cold_deferred_ceiling' });
+  });
+});
+
+// TRA-3104 — quotes get a FLOOR, bars get the remainder. The point of deriving
+// these is that an ABSOLUTE constant bounding a quantity that scales with a
+// growing universe goes stale silently, in the direction of the regression it was
+// calibrated to avoid.
+describe('quoteReservationReqPerMin (TRA-3104 explicit quote reservation)', () => {
+  it('uses the structural floor when nothing has been observed yet', () => {
+    // 60_000 / 20_000ms TTL = 3 structural calls/min, +max(2, ceil(3*0.25)) = 2.
+    expect(quoteReservationReqPerMin({ structuralFloor: 3, observedPeak: 0 })).toBe(5);
+  });
+
+  it('lets the observed peak dominate the floor once quotes are actually flowing', () => {
+    // The 2026-08-06 measurement: quote path 14-16 req/min at universe 640.
+    expect(quoteReservationReqPerMin({ structuralFloor: 3, observedPeak: 16 })).toBe(20);
+  });
+
+  it('scales its margin as a FRACTION, so the margin cannot go stale', () => {
+    const small = quoteReservationReqPerMin({ structuralFloor: 3, observedPeak: 16 });
+    const large = quoteReservationReqPerMin({ structuralFloor: 3, observedPeak: 160 });
+    expect(large - 160).toBeGreaterThan(small - 16);
+  });
+
+  it('is monotone non-decreasing in the observed peak — the fail-open direction', () => {
+    // Fed a HIGH-WATER (never the instantaneous rate) precisely because when
+    // Tradier starts refusing us the observed rate FALLS. A reservation that
+    // tracked it down would hand the freed budget back to the bar path that
+    // caused the trip.
+    let prev = -1;
+    for (const observedPeak of [0, 1, 5, 14, 16, 40, 199]) {
+      const r = quoteReservationReqPerMin({ structuralFloor: 3, observedPeak });
+      expect(r).toBeGreaterThanOrEqual(prev);
+      prev = r;
+    }
+  });
+
+  it('never returns a reservation below its own base', () => {
+    for (const observedPeak of [0, 7, 16, 300]) {
+      expect(quoteReservationReqPerMin({ structuralFloor: 3, observedPeak })).toBeGreaterThan(
+        Math.max(3, observedPeak),
+      );
+    }
+  });
+});
+
+// TRA-3104 — one resolver, explicit precedence, and DISABLED by default on every
+// box (which is what makes the whole budget block provably inert until opted in).
+describe('resolveBarPullCeiling (TRA-3104 derived budget precedence)', () => {
+  it('derives budget - reservation when enforcement is opted in', () => {
+    // The measured world: budget 200, quote reservation 20 => bars get 180.
+    expect(
+      resolveBarPullCeiling({ enforceDerived: true, accountBudget: 200, quoteReservation: 20, absoluteCeiling: Number.POSITIVE_INFINITY }),
+    ).toEqual({ ceiling: 180, source: 'derived_budget' });
+  });
+
+  it('prefers the derived budget over the superseded absolute knob', () => {
+    expect(
+      resolveBarPullCeiling({ enforceDerived: true, accountBudget: 200, quoteReservation: 20, absoluteCeiling: 999 }).source,
+    ).toBe('derived_budget');
+  });
+
+  it('clamps to >=1 rather than going negative when the reservation exceeds the budget', () => {
+    // Degrades to "defer cold pulls", never to a negative that would read as
+    // disabled and silently fail OPEN.
+    const r = resolveBarPullCeiling({ enforceDerived: true, accountBudget: 10, quoteReservation: 50, absoluteCeiling: Number.POSITIVE_INFINITY });
+    expect(r.ceiling).toBe(1);
+    expect(r.source).toBe('derived_budget');
+  });
+
+  it('falls back to the legacy absolute knob when enforcement is off but the knob is set', () => {
+    expect(
+      resolveBarPullCeiling({ enforceDerived: false, accountBudget: 200, quoteReservation: 20, absoluteCeiling: 200 }),
+    ).toEqual({ ceiling: 200, source: 'absolute_env' });
+  });
+
+  it('is DISABLED when neither is set — the default on every box today', () => {
+    const r = resolveBarPullCeiling({ enforceDerived: false, accountBudget: 200, quoteReservation: 20, absoluteCeiling: Number.POSITIVE_INFINITY });
+    expect(r).toEqual({ ceiling: Number.POSITIVE_INFINITY, source: 'disabled' });
+    // …and a disabled ceiling short-circuits the gate before any counter is read.
+    expect(
+      barPullThrottleGate({ isActiveInterest: false, isDeepMtf: false, accountSpendThisMinute: 10_000, ceiling: r.ceiling }),
+    ).toEqual({ allowed: true, reason: 'ceiling_disabled' });
+  });
+});
+
+// TRA-3104 — the CROSSING, made self-reporting. Both branches must be reachable:
+// a verdict that can only ever say "fine" is decoration.
+describe('quotaCrossingVerdict (TRA-3104 capacity condition)', () => {
+  it('is CROSSED on the measured 2026-08-06 world at universe 640', () => {
+    // bar peak 260 (rolling tail) / mean 184 vs a derived ceiling of 180.
+    const v = quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 184, accountBudget: 200, quoteObservedPeak: 16 });
+    expect(v.crossed).toBe(true);
+    expect(v.combinedPeakReqPerMin).toBe(200);
+    expect(v.headroomReqPerMin).toBe(0);
+  });
+
+  it('is NOT crossed on a universe the budget actually covers (the green branch)', () => {
+    const v = quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 120, accountBudget: 200, quoteObservedPeak: 16 });
+    expect(v.crossed).toBe(false);
+    expect(v.headroomReqPerMin).toBe(64);
+  });
+
+  it('still decides against the BUDGET when the ceiling is disabled (Infinity)', () => {
+    // A gate satisfied by the absence of the thing it grades: reading `crossed`
+    // off an Infinity ceiling would report false on every default box.
+    expect(
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, barObservedPeak: 190, accountBudget: 200, quoteObservedPeak: 16 }).crossed,
+    ).toBe(true);
+    expect(
+      quotaCrossingVerdict({ barCeiling: Number.POSITIVE_INFINITY, barObservedPeak: 100, accountBudget: 200, quoteObservedPeak: 16 }).crossed,
+    ).toBe(false);
+  });
+
+  it('reports NEGATIVE headroom when demand is over budget — no clamping to zero', () => {
+    // Clamping would hide exactly the condition this exists to report.
+    expect(
+      quotaCrossingVerdict({ barCeiling: 180, barObservedPeak: 240, accountBudget: 200, quoteObservedPeak: 16 }).headroomReqPerMin,
+    ).toBe(-56);
+  });
+});
+
+// TRA-3104 — the hole NO window shape and NO ceiling value closes. The quota is
+// account-wide; this gate governs only the COLD, deferrable subset. Asserted so a
+// future reader cannot mistake `enforcing: true` for "account spend is bounded" —
+// which is exactly why the capacity question is upstream of this whole mechanism.
+describe('TRA-3104 — the ceiling bounds only the DEFERRABLE subset', () => {
+  const CEILING = 180;
+
+  it('lets hot and deep-MTF pulls through at ANY spend level, so the total is unbounded', () => {
+    for (const accountSpendThisMinute of [0, 180, 1_000, 100_000]) {
+      expect(
+        barPullThrottleGate({ isActiveInterest: true, isDeepMtf: false, accountSpendThisMinute, ceiling: CEILING }).allowed,
+      ).toBe(true);
+      expect(
+        barPullThrottleGate({ isActiveInterest: false, isDeepMtf: true, accountSpendThisMinute, ceiling: CEILING }).allowed,
+      ).toBe(true);
+    }
+  });
+
+  it('reserves the quote slice by counting ACCOUNT-WIDE spend, not bar pulls alone', () => {
+    // Budget 200, reservation 20 => cold pulls stand down once the account total
+    // (bars + quotes) reaches 180, leaving the reservation genuinely available.
+    const ceiling = resolveBarPullCeiling({
+      enforceDerived: true, accountBudget: 200, quoteReservation: 20, absoluteCeiling: Number.POSITIVE_INFINITY,
+    }).ceiling;
+    const gate = (accountSpendThisMinute: number) =>
+      barPullThrottleGate({ isActiveInterest: false, isDeepMtf: false, accountSpendThisMinute, ceiling }).allowed;
+    expect(gate(179)).toBe(true);
+    expect(gate(180)).toBe(false);
+    // Bar pulls alone at 170 with 12 quote calls already spent = 182 account-wide
+    // => refuse. Metering bars only would have allowed it and eaten the reserve.
+    expect(gate(170 + 12)).toBe(false);
+  });
+
+  it('reads account-wide spend as a single non-negative number', () => {
+    const spend = getTradierAccountSpendThisMinute();
+    expect(Number.isFinite(spend)).toBe(true);
+    expect(spend).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('getTradierQuotaBudgetState (TRA-3104 health block)', () => {
+  it('publishes the budget block INERT by default, with the fixed enforcement window named', () => {
+    const s = getTradierQuotaBudgetState();
+    expect(s.accountBudgetReqPerMin).toBe(200);
+    expect(s.ceilingSource).toBe('disabled');
+    expect(s.enforcing).toBe(false);
+    expect(s.barCeilingReqPerMin).toBeNull();
+    // The window is published so a consumer cannot mistake this for the rolling
+    // telemetry meter next to it.
+    expect(s.enforcementWindow).toBe('fixed_minute_aligned');
+    expect(typeof s.crossed).toBe('boolean');
+    expect(s.quoteReservationReqPerMin).toBeGreaterThan(0);
+    // The caveat travels WITH the payload — a consumer reading `enforcing` must
+    // not conclude the account total is bounded.
+    expect(s.boundsDeferrableSubsetOnly).toBe(true);
+    expect(typeof s.ceilingUnsatisfiable).toBe('boolean');
+    expect(typeof s.budgetExhausted).toBe('boolean');
+  });
+});
+
 // TRA-554 / TRA-735 — minute-bar coalescing must key on the *requested* depth,
 // not the returned bar count. The old `bars.length >= count` guard could never
 // be met by the 80-bar candle loop before 80 RTH minutes elapse, nor by the
@@ -446,28 +774,28 @@ describe('tradierBreakerGate (TRA-1996 per-source breaker split)', () => {
 // at the byte level; `e5f43b4` decoupled-quote-refresh is the C4 fix) — it is opt-in
 // quota-headroom / doTick-I/O-relief insurance, DISABLED by default.
 describe('barPullThrottleGate (TRA-2170 bar-pull ceiling)', () => {
-  const base = { isActiveInterest: false, isDeepMtf: false, barPullsLastMin: 999, ceiling: 150 };
+  const base = { isActiveInterest: false, isDeepMtf: false, accountSpendThisMinute: 999, ceiling: 150 };
 
   it('defers a COLD pull once bar-pull rate reaches the ceiling', () => {
-    expect(barPullThrottleGate({ ...base, barPullsLastMin: 150 })).toEqual({ allowed: false, reason: 'cold_deferred_ceiling' });
-    expect(barPullThrottleGate({ ...base, barPullsLastMin: 220 }).allowed).toBe(false);
+    expect(barPullThrottleGate({ ...base, accountSpendThisMinute: 150 })).toEqual({ allowed: false, reason: 'cold_deferred_ceiling' });
+    expect(barPullThrottleGate({ ...base, accountSpendThisMinute: 220 }).allowed).toBe(false);
   });
 
   it('allows a COLD pull while under the ceiling', () => {
-    expect(barPullThrottleGate({ ...base, barPullsLastMin: 149 })).toEqual({ allowed: true, reason: 'under_ceiling' });
+    expect(barPullThrottleGate({ ...base, accountSpendThisMinute: 149 })).toEqual({ allowed: true, reason: 'under_ceiling' });
   });
 
   it('NEVER defers an active-interest (hot) pull, even far over the ceiling', () => {
-    expect(barPullThrottleGate({ ...base, isActiveInterest: true, barPullsLastMin: 500 })).toEqual({ allowed: true, reason: 'active_interest' });
+    expect(barPullThrottleGate({ ...base, isActiveInterest: true, accountSpendThisMinute: 500 })).toEqual({ allowed: true, reason: 'active_interest' });
   });
 
   it('NEVER defers a deep-MTF snapshot pull, even far over the ceiling', () => {
-    expect(barPullThrottleGate({ ...base, isDeepMtf: true, barPullsLastMin: 500 })).toEqual({ allowed: true, reason: 'deep_mtf' });
+    expect(barPullThrottleGate({ ...base, isDeepMtf: true, accountSpendThisMinute: 500 })).toEqual({ allowed: true, reason: 'deep_mtf' });
   });
 
   it('is DISABLED (never defers) for an unset / non-positive / non-finite ceiling', () => {
     for (const ceiling of [Number.POSITIVE_INFINITY, 0, -1, Number.NaN]) {
-      expect(barPullThrottleGate({ ...base, barPullsLastMin: 10_000, ceiling })).toEqual({ allowed: true, reason: 'ceiling_disabled' });
+      expect(barPullThrottleGate({ ...base, accountSpendThisMinute: 10_000, ceiling })).toEqual({ allowed: true, reason: 'ceiling_disabled' });
     }
   });
 });

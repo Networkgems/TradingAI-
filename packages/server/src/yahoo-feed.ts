@@ -539,11 +539,73 @@ export function requestsInWindow(
   return { count: kept.length, kept };
 }
 
+/**
+ * TRA-3104 — count of `timestamps` inside the **FIXED, boundary-ALIGNED** window
+ * containing `now`, i.e. `[floor(now/windowMs)*windowMs, now]`.
+ *
+ * WHY THIS EXISTS, AND WHY {@link requestsInWindow} CANNOT REPLACE IT:
+ * Tradier's account quota is enforced on a **fixed, minute-aligned** window, not
+ * a sliding one. Measured 2026-08-06 on bqb1: **26/26** `HTTP 400: Quota
+ * Violation` responses carried an `Expires` value landing exactly on the next
+ * `:00` second boundary (11 distinct values, every one minute-aligned). The
+ * upstream tells us where its boundary is; this counts against that boundary.
+ *
+ * THE MISMATCH IS ONE-DIRECTIONAL, AND THE DIRECTION IS THE OPPOSITE OF THE
+ * OBVIOUS ONE. The aligned bucket `[floor(now/W)*W, now]` is always a SUBSET of
+ * the trailing window `(now-W, now]`, so `slidingCount >= fixedCount` always ⇒ a
+ * sliding gate at N is strictly MORE conservative than a fixed gate at N and can
+ * never permit more than N inside an enforced minute. (TRA-3104 originally
+ * asserted it "fails in both directions" and that a boundary-straddling burst
+ * spends 2N-2; that is FALSE, and the unit test written to demonstrate it is what
+ * refuted it. Brute-forced over 20,000 randomized bursty arrival patterns at
+ * N=20: peak spend inside any fixed minute was exactly 20 under BOTH gates, zero
+ * violations. The under-fire claim is retracted — do not re-derive a design from
+ * it.)
+ *
+ * What the mismatch actually costs is CAPACITY, and at a universe where the
+ * budget is already binding that is the expensive error:
+ *   • it OVER-fires — a quiet enforced minute whose trailing 60s straddles a busy
+ *     one reads at the ceiling, so cold pulls are deferred while real quota in the
+ *     CURRENT minute goes unspent, and cold candles age past the shard cadence
+ *     (the TRA-1539 regression) for nothing. Same brute force: 825 fixed minutes
+ *     with refusals despite real headroom, 2,258 refusals a fixed gate allows.
+ * So matching the enforcement window is still a correctness precondition — a
+ * limiter that refuses while the metered window has headroom is measuring the
+ * wrong thing — but it is a HEADROOM bug, not a safety bug, and it cannot be the
+ * cause of a `Quota Violation`. See {@link barPullThrottleGate} for what can.
+ *
+ * The rolling meter is kept for TELEMETRY — it is the right shape for reading a
+ * burst tail, just not for enforcement. Note the aligned bucket start is always
+ * `>= now - windowMs`, so the rolling-pruned timestamp array always still holds
+ * everything this counter needs; the two share one array with no extra storage
+ * (asserted in the unit tests).
+ */
+export function requestsInFixedWindow(
+  timestamps: readonly number[],
+  now: number,
+  windowMs: number,
+): { count: number; windowStart: number } {
+  const windowStart = Math.floor(now / windowMs) * windowMs;
+  let count = 0;
+  for (const t of timestamps) if (t >= windowStart && t <= now) count++;
+  return { count, windowStart };
+}
+
+// TRA-3104 — session high-water of the FIXED-minute counts. A reservation sized
+// off the *instantaneous* observed quote rate is fail-open in exactly the wrong
+// world: when Tradier starts refusing us, the observed rate FALLS, which would
+// shrink the quote reservation and hand the freed budget to the bar path that
+// caused the trip. A monotone high-water cannot be dragged down by a refusal.
+let tradierQuoteFixedMinutePeak = 0;
+let tradierBarPullFixedMinutePeak = 0;
+
 function recordTradierQuoteRequest(now: number): void {
   tradierQuoteReqTimestamps.push(now);
   const { kept } = requestsInWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
   tradierQuoteReqTimestamps.length = 0;
   for (const t of kept) tradierQuoteReqTimestamps.push(t);
+  const { count } = requestsInFixedWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
+  if (count > tradierQuoteFixedMinutePeak) tradierQuoteFixedMinutePeak = count;
 }
 
 /**
@@ -554,13 +616,20 @@ function recordTradierQuoteRequest(now: number): void {
  */
 export function getTradierQuoteRateState(now: number = Date.now()): {
   requestsLastMin: number;
+  /** TRA-3104 — count inside the FIXED minute-aligned window Tradier meters. */
+  requestsThisMinute: number;
+  /** TRA-3104 — monotone session high-water of `requestsThisMinute`. */
+  peakPerFixedMinute: number;
   windowSec: number;
   cachedSymbols: number;
   cacheTtlMs: number;
 } {
   const { count } = requestsInWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
+  const fixed = requestsInFixedWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS);
   return {
     requestsLastMin: count,
+    requestsThisMinute: fixed.count,
+    peakPerFixedMinute: tradierQuoteFixedMinutePeak,
     windowSec: QUOTE_RATE_WINDOW_MS / 1000,
     cachedSymbols: quoteCache.size,
     cacheTtlMs: QUOTE_CACHE_TTL_MS,
@@ -582,6 +651,8 @@ function recordTradierBarPullRequest(now: number): void {
   const { kept } = requestsInWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
   tradierBarPullReqTimestamps.length = 0;
   for (const t of kept) tradierBarPullReqTimestamps.push(t);
+  const { count } = requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
+  if (count > tradierBarPullFixedMinutePeak) tradierBarPullFixedMinutePeak = count;
 }
 
 /**
@@ -593,10 +664,22 @@ function recordTradierBarPullRequest(now: number): void {
  */
 export function getTradierBarPullRateState(now: number = Date.now()): {
   requestsLastMin: number;
+  /** TRA-3104 — count inside the FIXED minute-aligned window Tradier meters.
+   * This is the statistic the throttle gate reads; `requestsLastMin` above is
+   * telemetry (a burst tail), and a sliding count cannot bound a fixed quota. */
+  requestsThisMinute: number;
+  /** TRA-3104 — monotone session high-water of `requestsThisMinute`. */
+  peakPerFixedMinute: number;
   windowSec: number;
 } {
   const { count } = requestsInWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
-  return { requestsLastMin: count, windowSec: BAR_PULL_RATE_WINDOW_MS / 1000 };
+  const fixed = requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS);
+  return {
+    requestsLastMin: count,
+    requestsThisMinute: fixed.count,
+    peakPerFixedMinute: tradierBarPullFixedMinutePeak,
+    windowSec: BAR_PULL_RATE_WINDOW_MS / 1000,
+  };
 }
 
 // TRA-2170 — process-global bar-pull ceiling (req/min). Default DISABLED
@@ -636,6 +719,232 @@ const TRADIER_BAR_PULL_CEILING = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : Number.POSITIVE_INFINITY;
 })();
 
+// ── TRA-3104 — one account-wide budget, an explicit quote reservation, and the
+//    bar ceiling DERIVED as the remainder ─────────────────────────────────────
+//
+// PUT THE CONSTANT WHERE THE CONSTANT ACTUALLY IS. `TRADIER_BAR_PULL_CEILING`
+// above is an ABSOLUTE req/min number bounding a quantity that SCALES with our
+// symbol universe, so it goes stale silently every time the universe grows — and
+// it drifts TOWARD the TRA-1539 regression it was calibrated to avoid, with no
+// code change and no event. The only quantity here that is genuinely constant is
+// the one describing the UPSTREAM CONTRACT: the account's req/min plan. That is
+// a property of Tradier's side, it does not move when our population moves, and
+// everything that DOES scale with our population is derived from it below.
+//
+// ⛔ THE CONSTRAINTS ON THE ABSOLUTE KNOB HAVE CROSSED — DO NOT SET IT.
+// Measured live on bqb1 during the 2026-08-06 RTH session at universe **640**
+// (three sparse marks, identical build pin `f19fb1fa3068`/pid 72):
+//   • steady-state bar-pull mean **184.0 req/min** (930 pulls / 5.056 min), with
+//     a rolling `barPullsLastMin` tail of **260**;
+//   • quote path **14-16 req/min**;
+//   • 184 + 16 = **200 req/min** — the modelled account budget, and Tradier
+//     confirmed it BINDING by refusing us: **26 `HTTP 400: Quota Violation`** in
+//     RTH hour 1 (complete log page), on `timesales(...)` AND `quotes(batch)`,
+//     first at 13:30:13Z.
+// To reserve quote headroom the ceiling must sit BELOW budget - quote demand
+// (~184); to avoid deferring cold pulls continuously it must sit ABOVE steady
+// state (~184, realistically above the 260 tail). Those were compatible at 568
+// symbols. At 640 they are EMPTY: no value satisfies both. The pre-authorised
+// `200` lands in the worst position — below the rolling tail (so it throttles)
+// and above the mean (so it reserves nothing).
+//
+// ⚠️ AND NEITHER ITEM BELOW CREATES CAPACITY. At 640 the account budget is
+// already fully consumed in steady state. A throttle can only make the refusal
+// ORDERLY — deferring OUR cold bar pulls instead of letting Tradier 400 the whole
+// account, which today cascades bar-quota trip -> Yahoo fan-out at 640 -> Yahoo
+// `Edge: Too Many Requests` -> both breakers open -> `fetchQuotes: 640/640
+// symbols failed` -> `equity feed stale; skipping signal evaluation`. The
+// capacity question (larger Tradier quota / smaller-or-tiered universe / longer
+// cold-bar cadence) is UPSTREAM of all of this and is a board decision.
+
+/** Tradier account-wide req/min plan. A property of the UPSTREAM contract, not of
+ * our universe — see the block above for why that distinction is the whole point.
+ * Override only if the account plan itself changes. */
+const TRADIER_ACCOUNT_BUDGET_PER_MIN = (() => {
+  const raw = Number(process.env['TRADIER_ACCOUNT_BUDGET_PER_MIN']);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 200;
+})();
+
+/** Opt-in switch for the DERIVED bar ceiling. Default OFF: the budget block is
+ * observe-only, so it publishes the crossing diagnostic on every box without
+ * changing a single fetch decision. Enabling it is a decision that needs the
+ * capacity call above to have been made — a throttle cannot create capacity. */
+const TRADIER_QUOTA_ENFORCE_BAR_CEILING = process.env['TRADIER_QUOTA_ENFORCE_BAR_CEILING'] === '1';
+
+/**
+ * TRA-3104 — the quote path's reserved slice of the account budget, in req/min.
+ * Quotes get a FLOOR; bars get the remainder ({@link resolveBarPullCeiling}).
+ *
+ * Two inputs, both derived, neither an inherited absolute:
+ *   • `structuralFloor` — what the quote path must be allowed even when it has
+ *     never yet been observed: one batched `quotes(batch)` call per cache-TTL
+ *     expiry, i.e. `ceil(60_000 / QUOTE_CACHE_TTL_MS)`. Note the Tradier quote
+ *     path is a SINGLE batched HTTP call for the whole universe, so this floor
+ *     does NOT scale with symbol count (measured: 14-16 req/min at 640 symbols).
+ *   • `observedPeak` — the monotone session high-water of the FIXED-minute quote
+ *     count. It must be a high-water and not the instantaneous rate: when
+ *     Tradier begins refusing us the observed rate FALLS, and a reservation that
+ *     tracked it down would hand the freed budget straight back to the bar path
+ *     that caused the trip. Fail-open in exactly the world that matters.
+ *
+ * The margin is a FRACTION, never an absolute — a fraction cannot go stale when
+ * the thing it is a fraction of moves.
+ */
+export function quoteReservationReqPerMin(input: {
+  structuralFloor: number;
+  observedPeak: number;
+  marginFraction?: number;
+  minMargin?: number;
+}): number {
+  const { structuralFloor, observedPeak } = input;
+  const marginFraction = input.marginFraction ?? 0.25;
+  const minMargin = input.minMargin ?? 2;
+  const base = Math.max(0, structuralFloor, observedPeak);
+  return base + Math.max(minMargin, Math.ceil(base * marginFraction));
+}
+
+/**
+ * TRA-3104 — resolve the single bar-pull ceiling the gate enforces, and say which
+ * rule produced it. Precedence is explicit so no caller has to guess:
+ *   1. `derived_budget` — enforcement opted in: `accountBudget - quoteReservation`.
+ *      Clamped at >= 1 so an over-large reservation degrades to "defer cold pulls"
+ *      rather than to a nonsensical negative that reads as disabled.
+ *   2. `absolute_env` — the legacy `TRADIER_BAR_PULL_CEILING`, kept working for
+ *      backwards compatibility. ⛔ It is SUPERSEDED and must stay unset: its two
+ *      constraints have crossed (see the block above).
+ *   3. `disabled` — neither set: `Infinity`, and {@link barPullThrottleGate}
+ *      short-circuits before reading any counter. This is the default on every
+ *      box today, so the whole budget block is provably inert until opted into.
+ */
+export function resolveBarPullCeiling(input: {
+  enforceDerived: boolean;
+  accountBudget: number;
+  quoteReservation: number;
+  absoluteCeiling: number;
+}): { ceiling: number; source: 'derived_budget' | 'absolute_env' | 'disabled' } {
+  const { enforceDerived, accountBudget, quoteReservation, absoluteCeiling } = input;
+  if (enforceDerived && Number.isFinite(accountBudget) && accountBudget > 0) {
+    return { ceiling: Math.max(1, Math.floor(accountBudget - quoteReservation)), source: 'derived_budget' };
+  }
+  if (Number.isFinite(absoluteCeiling) && absoluteCeiling > 0) {
+    return { ceiling: absoluteCeiling, source: 'absolute_env' };
+  }
+  return { ceiling: Number.POSITIVE_INFINITY, source: 'disabled' };
+}
+
+/**
+ * TRA-3104 — is the account budget structurally unable to cover observed demand?
+ *
+ * This is the CROSSING, made self-reporting. The 2026-08-06 finding needed a
+ * hand-run RTH calibration to discover that no ceiling value satisfies both
+ * constraints; because bar demand scales with a universe that keeps growing, that
+ * verdict expires and someone has to re-measure it by hand every time. Publishing
+ * it means the next reader gets the answer off `/api/health/quotes` instead of
+ * inheriting a number.
+ *
+ * `crossed` is true when the bar path's own observed peak already meets or exceeds
+ * the ceiling derived for it — i.e. the throttle can only ever bite, so it cannot
+ * reserve headroom without continuously aging cold candles. That is a CAPACITY
+ * condition, and no setting of any knob in this file resolves it.
+ */
+export function quotaCrossingVerdict(input: {
+  barCeiling: number;
+  barObservedPeak: number;
+  accountBudget: number;
+  quoteObservedPeak: number;
+}): {
+  crossed: boolean;
+  /** Bar demand already meets its derived allowance ⇒ the throttle can only bite. */
+  ceilingUnsatisfiable: boolean;
+  /** Account-wide demand already meets the account plan ⇒ a capacity condition. */
+  budgetExhausted: boolean;
+  headroomReqPerMin: number;
+  combinedPeakReqPerMin: number;
+} {
+  const { barCeiling, barObservedPeak, accountBudget, quoteObservedPeak } = input;
+  const combinedPeakReqPerMin = barObservedPeak + quoteObservedPeak;
+  // Graded against the BUDGET, never against the resolved ceiling alone: on a
+  // default (inert) box the ceiling is Infinity, and a verdict read off it would
+  // report `crossed:false` on every box — a gate satisfied by the absence of the
+  // thing it grades.
+  const ceilingUnsatisfiable = Number.isFinite(barCeiling) && barObservedPeak >= barCeiling;
+  const budgetExhausted = combinedPeakReqPerMin >= accountBudget;
+  return {
+    crossed: ceilingUnsatisfiable || budgetExhausted,
+    ceilingUnsatisfiable,
+    budgetExhausted,
+    headroomReqPerMin: accountBudget - combinedPeakReqPerMin,
+    combinedPeakReqPerMin,
+  };
+}
+
+/**
+ * TRA-3104 — the account-quota budget block, surfaced on `/api/health/quotes`.
+ * Read-only: computing it changes no fetch decision. `enforcing` is the field
+ * that says whether the derived ceiling is actually gating anything.
+ */
+export function getTradierQuotaBudgetState(now: number = Date.now()): {
+  accountBudgetReqPerMin: number;
+  quoteReservationReqPerMin: number;
+  barCeilingReqPerMin: number | null;
+  ceilingSource: 'derived_budget' | 'absolute_env' | 'disabled';
+  enforcing: boolean;
+  enforcementWindow: 'fixed_minute_aligned';
+  barPeakPerFixedMinute: number;
+  quotePeakPerFixedMinute: number;
+  combinedThisMinute: number;
+  combinedPeakReqPerMin: number;
+  headroomReqPerMin: number;
+  crossed: boolean;
+  ceilingUnsatisfiable: boolean;
+  budgetExhausted: boolean;
+  /** ⚠️ The ceiling bounds only the COLD, deferrable subset — hot / deep-MTF pulls
+   * and the whole quote path bypass it while still consuming quota. Published so a
+   * consumer cannot read `enforcing:true` as "account spend is bounded". */
+  boundsDeferrableSubsetOnly: true;
+} {
+  const quoteState = getTradierQuoteRateState(now);
+  const barState = getTradierBarPullRateState(now);
+  const reservation = quoteReservationReqPerMin({
+    structuralFloor: Math.ceil(QUOTE_RATE_WINDOW_MS / Math.max(1, QUOTE_CACHE_TTL_MS)),
+    observedPeak: quoteState.peakPerFixedMinute,
+  });
+  const resolved = resolveBarPullCeiling({
+    enforceDerived: TRADIER_QUOTA_ENFORCE_BAR_CEILING,
+    accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
+    quoteReservation: reservation,
+    absoluteCeiling: TRADIER_BAR_PULL_CEILING,
+  });
+  // The crossing is a property of the BUDGET, not of whether we are enforcing —
+  // so grade it against the ceiling the budget implies, even when inert. Reading
+  // it off an `Infinity` ceiling would report `crossed: false` on every default
+  // box, i.e. a gate satisfied by the absence of the thing it grades.
+  const impliedCeiling = Math.max(1, TRADIER_ACCOUNT_BUDGET_PER_MIN - reservation);
+  const verdict = quotaCrossingVerdict({
+    barCeiling: impliedCeiling,
+    barObservedPeak: barState.peakPerFixedMinute,
+    accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
+    quoteObservedPeak: quoteState.peakPerFixedMinute,
+  });
+  return {
+    accountBudgetReqPerMin: TRADIER_ACCOUNT_BUDGET_PER_MIN,
+    quoteReservationReqPerMin: reservation,
+    barCeilingReqPerMin: Number.isFinite(resolved.ceiling) ? resolved.ceiling : null,
+    ceilingSource: resolved.source,
+    enforcing: resolved.source !== 'disabled',
+    enforcementWindow: 'fixed_minute_aligned',
+    barPeakPerFixedMinute: barState.peakPerFixedMinute,
+    quotePeakPerFixedMinute: quoteState.peakPerFixedMinute,
+    combinedThisMinute: barState.requestsThisMinute + quoteState.requestsThisMinute,
+    combinedPeakReqPerMin: verdict.combinedPeakReqPerMin,
+    headroomReqPerMin: verdict.headroomReqPerMin,
+    crossed: verdict.crossed,
+    ceilingUnsatisfiable: verdict.ceilingUnsatisfiable,
+    budgetExhausted: verdict.budgetExhausted,
+    boundsDeferrableSubsetOnly: true,
+  };
+}
+
 /**
  * TRA-2170 — process-global bar-pull ceiling that reserves account-quota headroom
  * for the freshness-critical quote path. Pure so it can be unit-tested like
@@ -668,19 +977,56 @@ const TRADIER_BAR_PULL_CEILING = (() => {
  *   • deep-MTF snapshot pulls (`count >= MTF_DEPTH_THRESHOLD`) → never defer;
  *   • cold pulls → defer only once the process-global bar-pull rate has reached
  *     the ceiling (the caller then serves cached bars instead of hitting Tradier).
+ *
+ * ⚠️ TRA-3104 — TWO CHANGES TO WHAT THIS GATE READS, both about matching the
+ * statistic to the thing Tradier actually enforces.
+ *
+ * (1) `accountSpendThisMinute` must be a count over the FIXED, minute-ALIGNED
+ * window Tradier meters ({@link requestsInFixedWindow}), NOT the rolling
+ * `requestsLastMin` telemetry this parameter used to be fed. A sliding count is
+ * strictly more conservative than the metered window (the aligned bucket is a
+ * subset of the trailing 60s), so the mismatch cannot cause a violation — but it
+ * refuses cold pulls while the enforced minute still has headroom, which at a
+ * universe where the budget is binding is exactly the wrong error.
+ *
+ * (2) It is ACCOUNT-WIDE spend (bar pulls + quote calls), not bar pulls alone,
+ * because the quota Tradier enforces is account-wide. ⚠️ THIS GATE CANNOT BOUND
+ * THAT TOTAL, AND NO WINDOW SHAPE MAKES IT ABLE TO: `isActiveInterest` and
+ * `isDeepMtf` pulls return `allowed` BEFORE the ceiling is consulted, and the
+ * quote path is never gated at all — yet all three consume quota. So the ceiling
+ * bounds only the DEFERRABLE (cold) subset of an unbounded total. Reading
+ * "budget - reservation" as an enforceable bound on account spend is wrong; it is
+ * a threshold at which we stop adding the one kind of load we are able to stop.
+ * That is why item 3 of TRA-3104 (capacity) is upstream of this whole mechanism:
+ * a throttle cannot create capacity, and this one cannot even see most of the
+ * demand. Counting account-wide spend at least makes the reserve real — quotes
+ * keep `quoteReservation` req/min because cold pulls stand down before the total
+ * reaches `budget - reservation`.
  */
 export function barPullThrottleGate(input: {
   isActiveInterest: boolean;
   isDeepMtf: boolean;
-  barPullsLastMin: number;
+  accountSpendThisMinute: number;
   ceiling: number;
 }): { allowed: boolean; reason: string } {
-  const { isActiveInterest, isDeepMtf, barPullsLastMin, ceiling } = input;
+  const { isActiveInterest, isDeepMtf, accountSpendThisMinute, ceiling } = input;
   if (!(Number.isFinite(ceiling) && ceiling > 0)) return { allowed: true, reason: 'ceiling_disabled' };
   if (isActiveInterest) return { allowed: true, reason: 'active_interest' };
   if (isDeepMtf) return { allowed: true, reason: 'deep_mtf' };
-  if (barPullsLastMin >= ceiling) return { allowed: false, reason: 'cold_deferred_ceiling' };
+  if (accountSpendThisMinute >= ceiling) return { allowed: false, reason: 'cold_deferred_ceiling' };
   return { allowed: true, reason: 'under_ceiling' };
+}
+
+/**
+ * TRA-3104 — account-wide Tradier spend inside the FIXED minute Tradier meters:
+ * bar pulls plus quote calls. This is the statistic {@link barPullThrottleGate}
+ * grades, and the one `/api/health/quotes` reports as `combinedThisMinute`.
+ */
+export function getTradierAccountSpendThisMinute(now: number = Date.now()): number {
+  return (
+    requestsInFixedWindow(tradierBarPullReqTimestamps, now, BAR_PULL_RATE_WINDOW_MS).count +
+    requestsInFixedWindow(tradierQuoteReqTimestamps, now, QUOTE_RATE_WINDOW_MS).count
+  );
 }
 
 // ── Per-symbol minute-bar cache ──────────────────────────────────────────────
@@ -1467,11 +1813,23 @@ export async function fetchMinuteBarsWithSource(
   // instead, preserving account-quota headroom for the freshness-critical quote
   // path. Hot/active-interest and deep-MTF pulls are never deferred; a never-seen
   // symbol (no cached bars) falls through and still pulls.
+  //
+  // TRA-3104 — the ceiling is now RESOLVED (derived budget > legacy absolute knob
+  // > disabled) and graded against the FIXED minute-aligned count Tradier meters,
+  // not the rolling telemetry. Both are still `disabled` on every box today.
   const throttle = barPullThrottleGate({
     isActiveInterest: isActiveInterest(symbol),
     isDeepMtf: count >= MTF_DEPTH_THRESHOLD,
-    barPullsLastMin: getTradierBarPullRateState().requestsLastMin,
-    ceiling: TRADIER_BAR_PULL_CEILING,
+    accountSpendThisMinute: getTradierAccountSpendThisMinute(),
+    ceiling: resolveBarPullCeiling({
+      enforceDerived: TRADIER_QUOTA_ENFORCE_BAR_CEILING,
+      accountBudget: TRADIER_ACCOUNT_BUDGET_PER_MIN,
+      quoteReservation: quoteReservationReqPerMin({
+        structuralFloor: Math.ceil(QUOTE_RATE_WINDOW_MS / Math.max(1, QUOTE_CACHE_TTL_MS)),
+        observedPeak: getTradierQuoteRateState().peakPerFixedMinute,
+      }),
+      absoluteCeiling: TRADIER_BAR_PULL_CEILING,
+    }).ceiling,
   });
   if (!throttle.allowed) {
     const stale = minuteBarCache.get(symbol);

@@ -107,6 +107,18 @@ async function readCounters() {
     cumulativeBarPulls: today.tradier,
     barPullsLastMin: barRate.requestsLastMin,
     quoteReqLastMin: quoteRate.requestsLastMin,
+    // TRA-3104 — the FIXED minute-aligned counts, i.e. the statistic the gate now
+    // reads and the one Tradier meters. `<<ABSENT>>` (never 0) on a build that
+    // predates TRA-3104, so a pre-fix box reads as unmeasured rather than as quiet.
+    barPullsThisMinute: barRate.requestsThisMinute ?? '<<ABSENT>>',
+    barPeakPerFixedMinute: barRate.peakPerFixedMinute ?? '<<ABSENT>>',
+    quoteReqThisMinute: quoteRate.requestsThisMinute ?? '<<ABSENT>>',
+    quotePeakPerFixedMinute: quoteRate.peakPerFixedMinute ?? '<<ABSENT>>',
+    accountSpendThisMinute:
+      typeof barRate.requestsThisMinute === 'number' && typeof quoteRate.requestsThisMinute === 'number'
+        ? barRate.requestsThisMinute + quoteRate.requestsThisMinute
+        : '<<ABSENT>>',
+    quotaBudget: j.tradierQuotaBudget ?? '<<ABSENT>>',
     cachedSymbols: quoteRate.cachedSymbols,
     // TRA-2073: `requestsLastMin: 0` has two parents — nobody asked, or everybody
     // was refused. Grade a zero against the gate state that could have caused it.
@@ -227,16 +239,44 @@ function report() {
   const maxMean = Math.max(...means);
   console.log(`  steady-state mean bar-pull rate: min ${Math.min(...means).toFixed(1)} / max ${maxMean.toFixed(1)} req/min`);
 
-  // ⭐ THE GATE TESTS THE ROLLING METER, NOT A MEAN — SO GRADE THE CANDIDATE AGAINST
-  // BOTH. `barPullThrottleGate` fires on `barPullsLastMin >= ceiling`, an instantaneous
-  // 60s rolling value. A candidate that clears the MEAN comfortably can still be
-  // crossed by the rolling meter for much of the session, and every crossing defers
-  // COLD pulls (the TRA-1539 aging path). Reporting only the mean understates how
-  // often the ceiling actually bites — that is a fail-open reading of this ledger.
+  // ⭐ GRADE THE CANDIDATE AGAINST THE STATISTIC THE GATE ACTUALLY READS — AND AS OF
+  // TRA-3104 THAT STATISTIC CHANGED, SO THIS SECTION HAD TO CHANGE WITH IT. The gate
+  // used to fire on `barPullsLastMin >= ceiling` (a 60s ROLLING count of bar pulls).
+  // It now fires on ACCOUNT-WIDE spend (bars + quotes) inside the FIXED,
+  // minute-ALIGNED window Tradier meters. Two consequences for this report:
+  //   • the rolling max OVERSTATES how often the gate bites (the aligned bucket is
+  //     a subset of the trailing 60s, so slidingCount >= fixedCount always); and
+  //   • the bar-only rate UNDERSTATES total spend, because the quote path consumes
+  //     the same account quota.
+  // Both are still printed: the rolling series is the burst-tail telemetry, the
+  // fixed series is the enforcement statistic. Grading off the rolling series alone
+  // would now be measuring a meter no gate consults.
   const rollings = rows.map((r) => r.barPullsLastMin).filter((v) => typeof v === 'number');
   const overs = rollings.filter((v) => v >= CANDIDATE_CEILING).length;
-  console.log(`  rolling meter across all ${rollings.length} marks: max ${Math.max(...rollings)} req/min; `
-    + `>= candidate on ${overs}/${rollings.length} marks`);
+  console.log(`  rolling meter (TELEMETRY, not the gate's statistic) across all ${rollings.length} marks: `
+    + `max ${Math.max(...rollings)} req/min; >= candidate on ${overs}/${rollings.length} marks`);
+  const fixedSpends = rows.map((r) => r.accountSpendThisMinute).filter((v) => typeof v === 'number');
+  if (fixedSpends.length === 0) {
+    console.log('  fixed minute-aligned ACCOUNT spend: <<ABSENT>> on every mark — this box predates TRA-3104.');
+    console.log('    ⚠️ That is UNMEASURED, not zero. The gate statistic cannot be graded from this run.');
+  } else {
+    const overFixed = fixedSpends.filter((v) => v >= CANDIDATE_CEILING).length;
+    console.log(`  fixed minute-aligned ACCOUNT spend (THE GATE'S STATISTIC) across ${fixedSpends.length}/${rows.length} marks: `
+      + `max ${Math.max(...fixedSpends)} req/min; >= candidate on ${overFixed}/${fixedSpends.length} marks`);
+    const budgets = rows.map((r) => r.quotaBudget).filter((v) => v && typeof v === 'object');
+    const crossedMarks = budgets.filter((b) => b.crossed === true).length;
+    if (budgets.length > 0) {
+      const b = budgets[budgets.length - 1];
+      console.log(`  budget block: accountBudget=${b.accountBudgetReqPerMin} reservation=${b.quoteReservationReqPerMin} `
+        + `derivedCeiling=${b.barCeilingReqPerMin ?? '<<null: inert>>'} source=${b.ceilingSource} enforcing=${b.enforcing}`);
+      console.log(`    crossed on ${crossedMarks}/${budgets.length} marks `
+        + `(ceilingUnsatisfiable=${b.ceilingUnsatisfiable} budgetExhausted=${b.budgetExhausted} headroom=${b.headroomReqPerMin})`);
+      if (crossedMarks > 0) {
+        console.log('    ⇒ CAPACITY CONDITION. No value of any ceiling in this file resolves it, and the');
+        console.log('      ceiling bounds only the COLD deferrable subset anyway (hot / deep-MTF / quotes bypass it).');
+      }
+    }
+  }
   console.log(`  candidate ceiling: ${CANDIDATE_CEILING}`);
   if (maxMean >= CANDIDATE_CEILING) {
     console.log(`  VERDICT: DO NOT SET ${CANDIDATE_CEILING} — steady-state mean ${maxMean.toFixed(1)} >= ceiling.`);
@@ -246,9 +286,18 @@ function report() {
     const headroomPct = ((CANDIDATE_CEILING - maxMean) / maxMean) * 100;
     console.log(`  VERDICT: ${CANDIDATE_CEILING} sits ${headroomPct.toFixed(0)}% above the measured steady-state MEAN`
       + `${overs ? ` — BUT the rolling meter already crosses it on ${overs}/${rollings.length} marks` : ''}.`);
-    console.log('           A mean is not the burst tail, and the gate reads the tail. Treat a ceiling');
-    console.log('           the rolling meter routinely crosses as ACTIVE, not as insurance.');
+    console.log('           A mean is not the burst tail. Since TRA-3104 the gate reads FIXED minute-aligned');
+    console.log('           ACCOUNT-WIDE spend, which is bounded above by the rolling bar-only tail and');
+    console.log('           below by the bar-only mean — so neither series settles it. Grade the candidate');
+    console.log('           on `accountSpendThisMinute` above; if that line reads <<ABSENT>> the box predates');
+    console.log('           TRA-3104 and this verdict is INDICATIVE ONLY, not a clearance to set the knob.');
   }
+  // ⛔ The knob's two constraints CROSSED at universe 640 (TRA-3104): headroom for
+  // quotes needs it below steady state, avoiding TRA-1539 cold-candle aging needs it
+  // above. No value satisfies both, so there is no candidate this report can bless.
+  console.log('  ⛔ TRA-3104: `TRADIER_BAR_PULL_CEILING` is SUPERSEDED and must stay UNSET — its two');
+  console.log('     constraints crossed at universe 640. Use the derived budget (opt in with');
+  console.log('     TRADIER_QUOTA_ENFORCE_BAR_CEILING=1) and settle the capacity question first.');
 }
 
 async function burst(n) {
