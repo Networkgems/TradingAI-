@@ -8197,9 +8197,11 @@ export class SignalEngine {
         // placed (avoiding a broker-less phantom live fill). Default OFF ⇒ the
         // shipped state is byte-for-byte inert on real capital. Demo is untouched
         // (guard is live-only). Read from process env — never the demo-flags file.
-        // TRA-1929 — the arm is now the RV flag AND the bounded-test window
-        // (`OPTION_LIVE_TEST_UNTIL`): once the 2-day window closes the flag reads
-        // OFF regardless, so a missed manual disable cannot leave real money armed.
+        // TRA-1929 — the arm is the RV flag AND the shared window
+        // (`OPTION_LIVE_TEST_UNTIL`): once the window closes the flag reads OFF
+        // regardless, so a lost or garbled window disarms rather than fails open.
+        // (TRA-2914: that is a property of the MECHANISM, not a short schedule —
+        // the horizon is ops-set. RV itself is OFF; OTM below is the armed sleeve.)
         if (this.mode === 'live' && !isOptionLiveRvLongArmed(process.env)) {
           signal.signalSkipReason =
             'RV single-leg long live path dark (ENABLE_OPTION_LIVE_RV_LONG off or bounded-test window closed) — build shipped, capital arm gated on board approval (TRA-1491/TRA-1929)';
@@ -8692,10 +8694,17 @@ export class SignalEngine {
         // TRA-1929 (parent TRA-1916) — live+options OTM path. Until TRA-1929 this
         // branch had NO real-money open: it stamped a `liveSkipReason` and skipped,
         // so OTM (the sleeve that actually generates candidates) never contributed
-        // live fills. It is now the bounded 2-day real-money test's ENTRY path,
-        // behind the DARK, self-expiring arm `isOptionLiveOtmArmed`
-        // (ENABLE_OPTION_LIVE_OTM + OPTION_LIVE_TEST_UNTIL window). Demo — the active
-        // book — always opens normally below (this whole branch is live-only).
+        // live fills. It is now the live real-money OTM ENTRY path, behind the arm
+        // `isOptionLiveOtmArmed` (ENABLE_OPTION_LIVE_OTM + OPTION_LIVE_TEST_UNTIL
+        // window). Demo — the active book — always opens normally below (this whole
+        // branch is live-only).
+        //
+        // ⚠️ TRA-2914 — this used to read "the bounded 2-day real-money test's entry
+        // path". It is a STANDING arm now (board direction TRA-2877), not a short
+        // experiment that lapses on its own. This is the site that spends real money
+        // on the ***0154 production account; size any claim about it off
+        // `arm.testUntilIso` on /api/health/live-options-fee-slippage, never off the
+        // word "test" here or in the variable name.
         if (this.mode === 'live' && this.tradierLiveOptionsEnabled) {
           const surfaceOtmLiveSkip = (reason: string): void => {
             signal.mode = 'live';

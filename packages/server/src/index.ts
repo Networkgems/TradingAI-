@@ -4185,7 +4185,7 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
 
 // TRA-1929 (parent TRA-1916) — rebuild the durable per-trade live-options fee/slippage
 // calibration ledger from disk on boot and remember DATA_DIR for subsequent appends, so
-// the bounded 2-day real-money test's fills survive bqb1's nightly reboot and remain
+// the live real-money OTM fills survive bqb1's nightly reboot and remain
 // readable at /api/health/live-options-fee-slippage. Durable only when DATA_DIR is a
 // persistent mount (else `durability.ephemeral` says so; the fix is DATA_DIR=/data per
 // TRA-1719). Best-effort; compacted to 30 days.

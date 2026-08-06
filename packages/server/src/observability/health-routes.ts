@@ -3517,11 +3517,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   });
 
-  // TRA-1929 (parent TRA-1916) — read the bounded 2-day real-money options test's
-  // per-trade fee + slippage calibration, plus the CURRENT live arm state (both
-  // sleeves + the self-expiring window). The board authorized the test to harvest
-  // live fee/slippage before the August go-live gate; this route is how the board and
-  // LeadDev read that data WITHOUT shell access to bqb1. Read `durability.ephemeral`
+  // TRA-1929 (parent TRA-1916) — read the live real-money options per-trade fee +
+  // slippage calibration, plus the CURRENT live arm state (both sleeves + the dated
+  // window). The board authorized this to harvest live fee/slippage before the
+  // August go-live gate; this route is how the board and LeadDev read that data
+  // WITHOUT shell access to bqb1.
+  //
+  // ⭐ TRA-2914 — `arm.testUntilIso` HERE is the only authoritative horizon for the
+  // live options arm. Source comments and ticket titles have described it as a
+  // short bounded test long after the board made it a standing arm (TRA-2877);
+  // TRA-2693 was filed and sized against a horizon that had already moved. If you
+  // are about to state how long real money is armed for, read this field.
+  //
+  // Read `durability.ephemeral`
   // FIRST: true ⇒ the records below die on the next redeploy and the calibration is
   // NOT durably captured (fix = DATA_DIR=/data, TRA-1719). `feesMeasured < n` ⇒
   // commission is not yet back-filled (fill-time payload carries none — a follow-up

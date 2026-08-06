@@ -536,8 +536,30 @@ export function isOptionLiveDirectionalEnabled(env: NodeJS.ProcessEnv = process.
 // --------------------------------------------------------------------------
 // TRA-1929 (parent TRA-1916) — DARK live-capital gate on the OTM
 // (`single_leg_otm`) single-leg long options order path, PLUS a shared,
-// self-expiring 2-day test WINDOW that governs BOTH the OTM and RV live sleeves
-// for the board-authorized bounded real-money fee/slippage calibration test.
+// ops-dated expiry WINDOW that governs BOTH the OTM and RV live sleeves for the
+// board-authorized real-money fee/slippage calibration on live capital.
+//
+// ⚠️ READ BEFORE CITING THIS WINDOW AS A BOUND ON EXPOSURE (TRA-2914).
+// This block, and several call sites, originally described a *short* test with a
+// near-term self-disable, because that is what TRA-1916/TRA-2536 authorized. THAT
+// IS NO LONGER WHAT RUNS. On 2026-08-05 the board directed (TRA-2877, verbatim)
+// "Don't stop trading live, overwrite the 5 day live trading test, keep Live
+// Production trading going with the OTM Mispricing", and the horizon was moved out
+// accordingly. The arm is a STANDING one, renewed by ops, not a short experiment
+// that lapses on its own within days.
+//
+// The MECHANISM below is unchanged and still fail-closed. What changed is the
+// HORIZON, and therefore what the window is evidence OF:
+//   • it is still true that an unset/malformed/past window reads OFF;
+//   • it is NOT true that inattention ends this arm on any near horizon.
+// So do not size a risk, a monitoring gap, or a "bounded exposure" claim off the
+// existence of this window. Read the live horizon — never a number in a comment,
+// a ticket title, or a variable name:
+//     GET /api/health/live-options-fee-slippage  ->  arm.testUntilIso
+// A value is deliberately NOT repeated here: the previous wording went stale
+// precisely because it hard-coded a duration, and TRA-2693 was filed and sized
+// against that stale duration by a reader who was reading this correctly at the
+// time. Whatever horizon is set, this file cannot tell you it — the process can.
 //
 // The OTM scan (`runOtmScan`) runs in BOTH demo and live, but until now the live
 // branch had NO real-money open — it only stamped a `liveSkipReason` and skipped
@@ -549,16 +571,25 @@ export function isOptionLiveDirectionalEnabled(env: NodeJS.ProcessEnv = process.
 // entry is inert (byte-for-byte the pre-TRA-1929 suppress-and-skip behaviour), so
 // the shipped state carries zero real-capital risk.
 //
-// ── THE 2-DAY AUTO-DISABLE (must be CODE, not config trust) ──────────────────
-// The board authorized a BOUNDED 2-day test. A boolean flag left armed is exactly
-// the "missed manual disable leaves real money armed" failure mode, so the arm
-// SELF-EXPIRES: `OPTION_LIVE_TEST_UNTIL=<epoch-ms>` is a hard window end. Past it,
+// ── THE AUTO-DISABLE (must be CODE, not config trust) ────────────────────────
+// A boolean flag left armed is exactly the "missed manual disable leaves real
+// money armed" failure mode, so the arm carries a dated expiry rather than
+// trusting a manual switch-off:
+// `OPTION_LIVE_TEST_UNTIL=<epoch-ms>` is a hard window end. Past it,
 // BOTH `ENABLE_OPTION_LIVE_OTM` and `ENABLE_OPTION_LIVE_RV_LONG` are treated as OFF
 // regardless of their boolean value ({@link isOptionLiveOtmArmed} /
 // {@link isOptionLiveRvLongArmed}). FAIL-CLOSED: an unset or malformed
-// `OPTION_LIVE_TEST_UNTIL` reads as a CLOSED window ⇒ neither sleeve can arm. Prod
-// today runs both sleeve flags OFF, so adding the window gate only ever tightens
-// (a flag-OFF sleeve is unarmed regardless of the window).
+// `OPTION_LIVE_TEST_UNTIL` reads as a CLOSED window ⇒ neither sleeve can arm.
+//
+// ⚠️ The sentence that used to close this block — "prod today runs both sleeve
+// flags OFF, so adding the window gate only ever tightens" — was true when it was
+// written and is NOT true now: prod runs `ENABLE_OPTION_LIVE_OTM` ON against the
+// live Tradier Production account, and this sleeve has real fills and open
+// positions. It is removed rather than reworded because a reassurance about the
+// deployed state does not belong in a source comment at all — it cannot be kept
+// true, and it is read as an alibi by exactly the reviewer who should be checking.
+// The flags' deployed values are readable at /api/health/live-options-fee-slippage
+// (`arm.otmFlagOn` / `arm.rvFlagOn` / `arm.otmArmed`). RV remains OFF; OTM does not.
 // --------------------------------------------------------------------------
 
 export const OPTION_LIVE_OTM_FLAG = 'ENABLE_OPTION_LIVE_OTM';
@@ -702,10 +733,15 @@ export function parseOptionLiveTestUntil(env: NodeJS.ProcessEnv = process.env): 
 }
 
 /**
- * True iff the bounded live-options test window is currently OPEN: a valid
+ * True iff the live-options arm window is currently OPEN: a valid
  * `OPTION_LIVE_TEST_UNTIL` in the future (`now <= until`). FAIL-CLOSED — an unset
- * or malformed window var, or a window whose end has passed, returns false so a
- * missed manual disable cannot leave real money armed.
+ * or malformed window var, or a window whose end has passed, returns false.
+ *
+ * ⚠️ SCOPE OF THAT GUARANTEE (TRA-2914): fail-closed describes the MECHANISM, not
+ * the schedule. It means a lost/garbled window disarms; it does NOT mean the arm
+ * lapses soon. The horizon is ops-set and currently a standing one (TRA-2877), so
+ * "there is a window" is not by itself a bound on exposure. For the live horizon
+ * read `arm.testUntilIso` off /api/health/live-options-fee-slippage.
  */
 export function isOptionLiveTestWindowOpen(
   env: NodeJS.ProcessEnv = process.env,
@@ -717,10 +753,10 @@ export function isOptionLiveTestWindowOpen(
 }
 
 /**
- * True iff the live RV single-leg long path is ACTUALLY armed for the bounded test:
- * the `ENABLE_OPTION_LIVE_RV_LONG` boolean is on AND the test window is open. This
- * is the value the order-decision sites must consult (not the raw flag) so the
- * 2-day auto-disable holds for RV too (TRA-1929).
+ * True iff the live RV single-leg long path is ACTUALLY armed: the
+ * `ENABLE_OPTION_LIVE_RV_LONG` boolean is on AND the arm window is open. This is
+ * the value the order-decision sites must consult (not the raw flag) so the dated
+ * auto-disable holds for RV too (TRA-1929).
  */
 export function isOptionLiveRvLongArmed(
   env: NodeJS.ProcessEnv = process.env,
@@ -730,9 +766,15 @@ export function isOptionLiveRvLongArmed(
 }
 
 /**
- * True iff the live OTM single-leg long path is ACTUALLY armed for the bounded
- * test: the `ENABLE_OPTION_LIVE_OTM` boolean is on AND the test window is open.
- * This is the value the OTM order-decision sites must consult (TRA-1929).
+ * True iff the live OTM single-leg long path is ACTUALLY armed: the
+ * `ENABLE_OPTION_LIVE_OTM` boolean is on AND the arm window is open. This is the
+ * value the OTM order-decision sites must consult (TRA-1929).
+ *
+ * ⚠️ This gates the ENTRY site and nothing else — it authorizes `buy_to_open`.
+ * Exit management gates on a different predicate entirely (mode/broker-client, see
+ * `signal-engine` `liveOptionsMirroring`), so closing the window stops NEW opens
+ * and does nothing for positions already open. Do not accept "close the window" as
+ * a remedy for an open-position hazard (measured, TRA-2693).
  */
 export function isOptionLiveOtmArmed(
   env: NodeJS.ProcessEnv = process.env,
