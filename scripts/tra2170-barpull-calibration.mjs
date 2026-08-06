@@ -160,6 +160,31 @@ function loadLedger() {
   return fs.readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
+/**
+ * Which mark pairs may be differenced.
+ *
+ * ⚠️ ADJACENT-ONLY WAS A DEFECT, AND IT DESTROYS DATA SILENTLY (measured 2026-08-06).
+ * The counter is CUMULATIVE, so ANY two marks sharing a build pin and a UTC day are
+ * differenceable — adjacency is irrelevant. Differencing only consecutive rows meant
+ * one extra mark taken in the middle of a good window SPLIT it into two sub-5-minute
+ * fragments and reported BLIND twice, discarding a perfectly valid 5.1-minute
+ * interval that was sitting in the ledger the whole time. The failure is silent and
+ * it is worst exactly when you are marking carefully (more marks => more splitting).
+ *
+ * So: enumerate ALL pairs (i < j). Report the WIDEST valid span per contiguous
+ * pin-run as the headline — a longer span is a better steady-state mean — and keep
+ * the shorter ones visible so a burst inside the window is still legible.
+ */
+function pairIsDifferenceable(a, b) {
+  const reasons = [];
+  if (!(a.commit === b.commit && a.pid === b.pid && a.startedAt === b.startedAt)) {
+    reasons.push('RESTART between marks (counter reset) — pin changed');
+  }
+  if (a.day !== b.day) reasons.push('UTC day rolled (counter reset)');
+  if (a.snapshotTs === b.snapshotTs) reasons.push('same cached snapshot ts (marks < 20s apart)');
+  return reasons;
+}
+
 function report() {
   const rows = loadLedger();
   console.log(`\n=== TRA-2170 bar-pull calibration — ${rows.length} marks in ${LEDGER}`);
@@ -168,17 +193,12 @@ function report() {
     return;
   }
   const intervals = [];
-  for (let i = 1; i < rows.length; i++) {
-    const a = rows[i - 1];
-    const b = rows[i];
+  for (let i = 0; i < rows.length; i++) {
+  for (let j = i + 1; j < rows.length; j++) {
+    const a = rows[i];
+    const b = rows[j];
     const minutes = (Date.parse(b.wallClock) - Date.parse(a.wallClock)) / 60_000;
-    const samePin = a.commit === b.commit && a.pid === b.pid && a.startedAt === b.startedAt;
-    const sameDay = a.day === b.day;
-    const distinctSnapshot = a.snapshotTs !== b.snapshotTs;
-    const blindReasons = [];
-    if (!samePin) blindReasons.push('RESTART between marks (counter reset) — pin changed');
-    if (!sameDay) blindReasons.push('UTC day rolled (counter reset)');
-    if (!distinctSnapshot) blindReasons.push('same cached snapshot ts (marks < 20s apart)');
+    const blindReasons = pairIsDifferenceable(a, b);
     if (minutes < 5) blindReasons.push(`interval ${minutes.toFixed(1)}min < 5min — too short for a steady-state mean`);
     const delta = b.cumulativeBarPulls - a.cumulativeBarPulls;
     if (delta < 0) blindReasons.push(`counter went BACKWARDS (${a.cumulativeBarPulls} -> ${b.cumulativeBarPulls})`);
@@ -190,16 +210,15 @@ function report() {
       blind: blindReasons.length > 0, blindReasons,
     });
   }
-  for (const iv of intervals) {
+  }
+  // Only the USABLE pairs are worth printing in full — the all-pairs enumeration is
+  // quadratic and most blind pairs are blind for the same one reason (a restart).
+  for (const iv of intervals.filter((i) => !i.blind)) {
     const head = `${iv.from} -> ${iv.to}  (${iv.minutes.toFixed(1)} min, universe ${iv.universeFrom}->${iv.universeTo})`;
-    if (iv.blind) {
-      console.log(`  BLIND  ${head}\n         ${iv.blindReasons.join('; ')}`);
-    } else {
-      console.log(`  MEAN   ${head}\n         ${iv.delta} bar pulls => ${iv.meanBarPullsPerMin.toFixed(1)} req/min   (rolling meter at ends: ${iv.rollingAtEnds.join(', ')})`);
-    }
+    console.log(`  MEAN   ${head}\n         ${iv.delta} bar pulls => ${iv.meanBarPullsPerMin.toFixed(1)} req/min   (rolling meter at ends: ${iv.rollingAtEnds.join(', ')})`);
   }
   const valid = intervals.filter((i) => !i.blind);
-  console.log(`\n  usable intervals: ${valid.length}/${intervals.length}`);
+  console.log(`\n  usable pairs: ${valid.length}/${intervals.length} (${intervals.length - valid.length} blind — restart, day-roll, or <5min)`);
   if (!valid.length) {
     console.log('  VERDICT: BLIND — no usable interval. A ceiling MUST NOT be set from this ledger.');
     return;
@@ -207,6 +226,17 @@ function report() {
   const means = valid.map((i) => i.meanBarPullsPerMin);
   const maxMean = Math.max(...means);
   console.log(`  steady-state mean bar-pull rate: min ${Math.min(...means).toFixed(1)} / max ${maxMean.toFixed(1)} req/min`);
+
+  // ⭐ THE GATE TESTS THE ROLLING METER, NOT A MEAN — SO GRADE THE CANDIDATE AGAINST
+  // BOTH. `barPullThrottleGate` fires on `barPullsLastMin >= ceiling`, an instantaneous
+  // 60s rolling value. A candidate that clears the MEAN comfortably can still be
+  // crossed by the rolling meter for much of the session, and every crossing defers
+  // COLD pulls (the TRA-1539 aging path). Reporting only the mean understates how
+  // often the ceiling actually bites — that is a fail-open reading of this ledger.
+  const rollings = rows.map((r) => r.barPullsLastMin).filter((v) => typeof v === 'number');
+  const overs = rollings.filter((v) => v >= CANDIDATE_CEILING).length;
+  console.log(`  rolling meter across all ${rollings.length} marks: max ${Math.max(...rollings)} req/min; `
+    + `>= candidate on ${overs}/${rollings.length} marks`);
   console.log(`  candidate ceiling: ${CANDIDATE_CEILING}`);
   if (maxMean >= CANDIDATE_CEILING) {
     console.log(`  VERDICT: DO NOT SET ${CANDIDATE_CEILING} — steady-state mean ${maxMean.toFixed(1)} >= ceiling.`);
@@ -214,10 +244,10 @@ function report() {
     console.log('           cold candles past the shard cadence (the TRA-1539 regression).');
   } else {
     const headroomPct = ((CANDIDATE_CEILING - maxMean) / maxMean) * 100;
-    console.log(`  VERDICT: ${CANDIDATE_CEILING} sits ${headroomPct.toFixed(0)}% above the measured steady-state mean.`);
-    console.log('           NOTE: a mean is not the burst tail. The ceiling is intended to bite only on');
-    console.log('           MTF-burst minutes; use --burst samples to see how often the rolling meter');
-    console.log('           crosses the candidate before treating this as sufficient.');
+    console.log(`  VERDICT: ${CANDIDATE_CEILING} sits ${headroomPct.toFixed(0)}% above the measured steady-state MEAN`
+      + `${overs ? ` — BUT the rolling meter already crosses it on ${overs}/${rollings.length} marks` : ''}.`);
+    console.log('           A mean is not the burst tail, and the gate reads the tail. Treat a ceiling');
+    console.log('           the rolling meter routinely crosses as ACTIVE, not as insurance.');
   }
 }
 
