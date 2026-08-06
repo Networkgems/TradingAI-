@@ -4221,6 +4221,50 @@ export interface EodReport {
   };
 
   /**
+   * TRA-3101 — THE ABSENCE STATE. Present only when the day's P&L could not be
+   * established, and its presence means **`combinedPnl` on this row is not a
+   * claim**. The live calendar's balance-delta cell is
+   * `todayBalance − prevBalance − cashFlow`; when the day's balance snapshot
+   * never landed, `findPreviousBalanceSnapshot` hands back a row that is a COPY
+   * of the target day's own value and the delta comes out at exactly `0.00`.
+   *
+   * `0.00` is also what a genuinely quiet day produces, and the grid colours
+   * only `> 0` / `< 0` — so a failed snapshot and a flat market were
+   * pixel-identical. 2026-06-12 rendered `$0.00` against −$141.72 of real
+   * broker closes for two months on that basis.
+   *
+   * Readers MUST branch on this field before rendering or summing
+   * `combinedPnl`. It is deliberately NOT a corrected number: a stale anchor
+   * means the equity series has a hole, and inferring a value for it is how the
+   * original phantom-green calendar happened (TRA-2864).
+   */
+  pnlUnknown?: {
+    /**
+     * - `stale_balance_anchor` — balances identical to the cent, CONTRADICTED by
+     *   broker closes / engine trades / open positions on the day.
+     * - `balance_evidence_unreadable` — balances identical and the activity
+     *   evidence could not be read. Blind, not empty; this arm fails closed.
+     */
+    reason: 'stale_balance_anchor' | 'balance_evidence_unreadable';
+    /** Date of the anchor the delta was taken against. */
+    anchorDate: string;
+    /** The anchor's balance — the value suspected of being a copy. */
+    anchorBalance: number;
+    /** The balance recorded for this day (equal to `anchorBalance`, or absent). */
+    reportedBalance: number;
+    /** Calendar days from anchor to this day (1 = consecutive). */
+    spanDays: number;
+    /** The activity channels checked. `known: false` = the read failed. */
+    evidence:
+      | { known: true; brokerCloses: number; brokerRealizedUsd: number; engineTrades: number; openPositions: number }
+      | { known: false; reason: string };
+    /** Operator-facing explanation of what is unknown and why. */
+    detail: string;
+    /** ISO timestamp the verdict was stamped. */
+    at: string;
+  };
+
+  /**
    * TRA-2214 — the account-class basis the `optionJournal` / `optionLearnedWeights`
    * / `introspection` blocks were folded on. `'desk+unattributed'` since TRA-2214;
    * absent on reports persisted before it, which were folded POOLED (QA fixture

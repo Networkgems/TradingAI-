@@ -2100,6 +2100,60 @@ tr:hover td { background: var(--bg-hover); }
 
 .cal-measure-banner em { color: var(--muted); font-style: normal; }
 
+/* ── TRA-3101 — the absence state ───────────────────────────────────────────
+   A day whose balance snapshot never landed used to render as a neutral $0.00,
+   pixel-identical to a genuinely quiet day. These rules exist so it CANNOT be
+   mistaken for one: amber (neither the green of a win nor the red of a loss nor
+   the grey of "no data"), a dashed border so it reads as provisional, and a `?`
+   where the figure would be. It must never be silently pleasant to look at. */
+.cal-cell--unknown {
+  border-style: dashed;
+  border-color: var(--amber, #d19a3a);
+  background: color-mix(in srgb, var(--amber, #d19a3a) 8%, transparent);
+}
+
+.cal-pnl--unknown {
+  color: var(--amber, #d19a3a);
+  font-weight: 700;
+  cursor: help;
+}
+
+.cal-summary-value--unknown { color: var(--amber, #d19a3a); cursor: help; }
+.cal-year-unknown { color: var(--amber, #d19a3a); font-weight: 700; }
+
+/* Sits under a total that had to drop days. Same shape as the mixed-measure
+   note, louder border — this one says the total is INCOMPLETE, not just mixed. */
+.cal-summary-unknown {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber, #d19a3a);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  cursor: help;
+}
+
+.cal-unknown-banner {
+  margin-bottom: 0.7rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--amber, #d19a3a);
+  border-left: 3px solid var(--amber, #d19a3a);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--amber, #d19a3a) 7%, var(--surface));
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.cal-unknown-detail {
+  margin-top: 0.35rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
 /* Month summary bar */
 .cal-summary {
   display: flex;

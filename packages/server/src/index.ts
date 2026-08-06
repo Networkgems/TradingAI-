@@ -276,6 +276,16 @@ import {
   realizedPnlByCloseDate,
   sumCashFlowOverSpan,
 } from './reports/tradier-reconcile.js';
+// TRA-3101 — a missing balance snapshot renders as a FLAT $0.00 day, not as
+// "unknown". This classifies the anchor; it never repairs the equity series.
+import {
+  classifyBalanceAnchor,
+  decideBalanceCellDisposition,
+  isPnlUnknown,
+  shouldAuditBalanceAnchor,
+  type BalanceAnchorVerdict,
+  type DayActivityEvidence,
+} from './reports/stale-balance-anchor.js';
 import { createToken, verifyToken, createPendingToken, verifyPendingToken, generateResetToken, consumeResetToken, initResetTokenStore, revokeResetTokensFor } from './auth.js';
 import {
   initTwoFactorStore,
@@ -1703,6 +1713,13 @@ async function generateAndSaveReport(
         mode,
         todayBalance,
         finalReport.date,
+        // TRA-3101 — the engine-side activity channels. `trades.length` rather
+        // than `totalTrades`: the latter is a rolling/derived stat on some
+        // paths, and what this needs is "did anything happen on THIS day".
+        {
+          engineTrades: finalReport.trades?.length ?? 0,
+          openPositions: finalReport.openPositionCount ?? 0,
+        },
       );
       if (override) {
         finalReport = applyTradierBalanceOverride(finalReport, override, todayBalance);
@@ -2421,6 +2438,161 @@ async function saveTradierDailyTotals(
   await writeFile(tradierDailyTotalsPath(ctx, env), JSON.stringify(totals, null, 2), 'utf-8');
 }
 
+/**
+ * TRA-3101 — the same sidecar as {@link loadTradierDailyTotals}, but it keeps
+ * the distinction that one throws away.
+ *
+ * `loadTradierDailyTotals` returns `{}` for BOTH "no file, this account has no
+ * broker realized history" and "the file is there and I could not parse it".
+ * That conflation is harmless for a merge target — you just re-add today's
+ * totals — but it is fatal as EVIDENCE. `{}` from a corrupt read would tell
+ * {@link classifyBalanceAnchor} the day was verifiably quiet, which is exactly
+ * the failure-blind-read shape this ticket exists to kill (a broken instrument
+ * reading identically to a clean one).
+ *
+ * So: a missing file is `ok` with no rows — a brand-new account genuinely has
+ * none, and calling that "unreadable" would flag every day it ever has. A read
+ * or parse that FAILS is `ok: false`, and the caller must fail closed.
+ */
+async function readTradierDailyTotalsForEvidence(
+  ctx: UserContext,
+  env: TradierEnv,
+): Promise<{ ok: true; totals: Record<string, number> } | { ok: false; reason: string }> {
+  const path = tradierDailyTotalsPath(ctx, env);
+  if (!existsSync(path)) return { ok: true, totals: {} };
+  try {
+    const raw = await readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const totals: Record<string, number> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'number' && Number.isFinite(v)) totals[k] = v;
+    }
+    return { ok: true, totals };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `tradier-options-pnl.${env}.json unreadable: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
+ * TRA-3101 — assemble the three independent activity channels for one day.
+ *
+ * `engineTrades` / `openPositions` come from the report row itself (present on
+ * EVERY stored cell, including the June ones whose broker sidecar has long since
+ * rolled out of the reconcile window); `brokerRealizedUsd` comes from the
+ * broker-truth sidecar. The sidecar records realized DOLLARS per date, not a
+ * close count, so `brokerCloses` stays 0 and the dollar channel carries it.
+ */
+function buildDayActivityEvidence(
+  totals: { ok: true; totals: Record<string, number> } | { ok: false; reason: string },
+  date: string,
+  engineTrades: number,
+  openPositions: number,
+): DayActivityEvidence {
+  if (!totals.ok) return { known: false, reason: totals.reason };
+  return {
+    known: true,
+    brokerCloses: 0,
+    brokerRealizedUsd: totals.totals[date] ?? 0,
+    engineTrades: Number.isFinite(engineTrades) ? engineTrades : 0,
+    openPositions: Number.isFinite(openPositions) ? openPositions : 0,
+  };
+}
+
+/**
+ * TRA-3101 — stamp the absence state onto a STORED row at read time.
+ *
+ * The seven known-bad cells (2026-06-12 through 2026-07-15) are already on
+ * disk. Detecting the defect only on the go-forward write path would leave every
+ * one of them rendering a neutral `$0.00` — the fix would be structurally unable
+ * to reach the days that are actually wrong, which is the exact trap TRA-2864
+ * documented and TRA-3100 had to build a force path around.
+ *
+ * So the audit runs on the READ. It is:
+ *   • **non-destructive** — nothing is written back. The stored row keeps its
+ *     bytes; only the served copy carries `pnlUnknown`. A stale anchor means the
+ *     equity series has a hole and this ticket is explicit that inventing a
+ *     value for it is out of scope.
+ *   • **subordinate to the write-time verdict** — a row that already carries
+ *     `pnlUnknown` is served as-is. The write path saw the live evidence; this
+ *     path only sees what survived to disk.
+ *   • **scoped to balance-delta rows** — `realized-backfill` / `engine` /
+ *     `live-intraday` cells are not computed against a balance anchor at all, so
+ *     there is no anchor for them to have a stale one.
+ */
+async function stampStaleBalanceAnchorAudit(
+  ctx: UserContext,
+  mode: StockModeKey,
+  report: EodReport,
+): Promise<EodReport> {
+  if (mode === 'demo') return report;              // no broker balance series
+  if (report.pnlUnknown) return report;            // write-time verdict wins
+  // ⛔ THE REACH GATE — see `shouldAuditBalanceAnchor`. It is exported and
+  // directly graded because the obvious version of this line
+  // (`=== 'tradier-balance'`) skipped 2026-06-12, the cell that proves the bug.
+  if (!shouldAuditBalanceAnchor(report.pnlSource)) return report;
+  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
+  try {
+    const snapshots = await loadTradierBalanceSnapshots(ctx, env);
+    const reportBalance = snapshots[report.date] ?? report.totalEquity;
+    if (typeof reportBalance !== 'number' || !Number.isFinite(reportBalance)) return report;
+    const prev = findPreviousBalanceSnapshot(
+      Object.fromEntries(Object.entries(snapshots).filter(([d]) => d !== report.date)),
+      report.date,
+    );
+    if (!prev) return report;
+    const verdict = classifyBalanceAnchor({
+      reportDate: report.date,
+      reportBalance,
+      anchorDate: prev.date,
+      anchorBalance: prev.balance,
+      activity: buildDayActivityEvidence(
+        await readTradierDailyTotalsForEvidence(ctx, env),
+        report.date,
+        report.trades?.length ?? 0,
+        report.openPositionCount ?? 0,
+      ),
+    });
+    if (!isPnlUnknown(verdict)) return report;
+    log.warn('TRA-3101 served a stored calendar cell as UNKNOWN — stale balance anchor', {
+      username: ctx.username,
+      env,
+      date: report.date,
+      status: verdict.status,
+      anchorDate: prev.date,
+      storedCombinedPnl: Number(report.combinedPnl.toFixed(2)),
+    });
+    // Same decision function as the write path, so the read-side stamp and the
+    // stored stamp cannot drift into two shapes of the same claim.
+    const disposition = decideBalanceCellDisposition(
+      {
+        reportDate: report.date,
+        todayBalance: reportBalance,
+        prevDate: prev.date,
+        prevBalance: prev.balance,
+        netCashFlow: 0,
+        combinedPnl: report.combinedPnl,
+        verdict,
+      },
+      new Date().toISOString(),
+    );
+    if (!disposition.pnlUnknown) return report;
+    return { ...report, pnlUnknown: disposition.pnlUnknown };
+  } catch (err) {
+    // A failed audit must not blank the calendar — but it also must not be
+    // silent, or "the detector never fired" and "the detector never ran" become
+    // the same observation.
+    log.warn('TRA-3101 stale-anchor audit failed — cell served unaudited', {
+      username: ctx.username,
+      date: report.date,
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    return report;
+  }
+}
+
 // ── TRA-359: Live calendar broker-truth reconcile ────────────────────────────
 //
 // The Live P&L calendar was historically computed from local engine state:
@@ -2536,12 +2708,36 @@ async function saveTradierCashFlow(
  */
 function applyTradierBalanceOverride(
   report: ReturnType<typeof generateEodReport>,
-  override: { combinedPnl: number; prevDate: string; prevBalance: number; netCashFlow: number },
+  override: {
+    combinedPnl: number;
+    prevDate: string;
+    prevBalance: number;
+    netCashFlow: number;
+    anchorVerdict?: BalanceAnchorVerdict;
+  },
   todayBalance: number,
 ): ReturnType<typeof generateEodReport> {
-  const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
-  const usd = (n: number) => '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const header = `> **Live P&L source: Tradier broker balance (TRA-359).** Combined P&L for ${report.date} = today's Tradier equity (${usd(todayBalance)}) − prev snapshot ${override.prevDate} (${usd(override.prevBalance)}) − net cash flow (${sign(override.netCashFlow)}) = **${sign(override.combinedPnl)}**. Engine-side realized / unrealized / options breakdown below is informational; the calendar uses the broker-truth value.`;
+  // TRA-3101 — the header text AND the absence-state decision both come from
+  // `decideBalanceCellDisposition`, which is exported and directly graded. This
+  // function is deliberately a thin caller: the previous inline version could
+  // only ever be tested by a mirror of itself.
+  //
+  // `combinedPnl` is written unchanged either way. A stale anchor means the
+  // equity series has a hole and this ticket is explicit that filling it by
+  // inference is out of scope — what changes is whether the row CLAIMS the
+  // number, not the number.
+  const disposition = decideBalanceCellDisposition(
+    {
+      reportDate: report.date,
+      todayBalance,
+      prevDate: override.prevDate,
+      prevBalance: override.prevBalance,
+      netCashFlow: override.netCashFlow,
+      combinedPnl: override.combinedPnl,
+      verdict: override.anchorVerdict ?? OK_ANCHOR_VERDICT,
+    },
+    new Date().toISOString(),
+  );
   return {
     ...report,
     combinedPnl: override.combinedPnl,
@@ -2549,9 +2745,24 @@ function applyTradierBalanceOverride(
     // TRA-1192 — tag the broker-truth source so the historical realized-fill
     // backfill never overwrites a settled balance-delta cell.
     pnlSource: 'tradier-balance' as const,
-    markdown: `${header}\n\n${report.markdown}`,
+    ...(disposition.pnlUnknown ? { pnlUnknown: disposition.pnlUnknown } : {}),
+    markdown: `${disposition.header}\n\n${report.markdown}`,
   };
 }
+
+/**
+ * TRA-3101 — the verdict used when a caller supplies none (the demo/backfill
+ * paths, which have no balance anchor to classify). `ok` is correct here: those
+ * cells are not computed from a balance delta at all, so there is no anchor for
+ * them to have a stale one.
+ */
+const OK_ANCHOR_VERDICT: BalanceAnchorVerdict = {
+  status: 'ok',
+  flatVerified: false,
+  spanDays: 0,
+  detail: '',
+  activity: { known: true, brokerCloses: 0, brokerRealizedUsd: 0, engineTrades: 0, openPositions: 0 },
+};
 
 /**
  * TRA-359 — pull recent Tradier cash events into the per-user / per-env
@@ -2568,11 +2779,16 @@ async function reconcileTradierLiveCalendar(
   mode: StockModeKey,
   todayBalance: number | null,
   reportDate: string,
+  // TRA-3101 — the engine-side activity channels for this day, read off the
+  // report the caller already built. Two of the three evidence channels behind
+  // the stale-anchor verdict live here and nowhere else.
+  dayActivity: { engineTrades: number; openPositions: number },
 ): Promise<{
   combinedPnl: number;
   prevDate: string;
   prevBalance: number;
   netCashFlow: number;
+  anchorVerdict: BalanceAnchorVerdict;
 } | null> {
   if (mode === 'demo') return null;
   if (typeof todayBalance !== 'number' || !Number.isFinite(todayBalance) || todayBalance <= 0) {
@@ -2640,6 +2856,24 @@ async function reconcileTradierLiveCalendar(
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
 
+  // TRA-3101 — the arithmetic above is exact and still cannot tell you whether
+  // `prev` is a REAL anchor or a copy of today's own value left behind by a
+  // snapshot write that never landed. When it is a copy the delta comes out at
+  // exactly 0.00, which is also what a quiet day looks like — so classify the
+  // anchor before anyone renders the number.
+  const anchorVerdict = classifyBalanceAnchor({
+    reportDate,
+    reportBalance: todayBalance,
+    anchorDate: prev.date,
+    anchorBalance: prev.balance,
+    activity: buildDayActivityEvidence(
+      await readTradierDailyTotalsForEvidence(ctx, env),
+      reportDate,
+      dayActivity.engineTrades,
+      dayActivity.openPositions,
+    ),
+  });
+
   log.info('tradier-live-calendar computed daily pnl', {
     username: ctx.username,
     env,
@@ -2649,8 +2883,31 @@ async function reconcileTradierLiveCalendar(
     prevBalance: Number(prev.balance.toFixed(2)),
     netCashFlow: Number(netCashFlow.toFixed(2)),
     pnl: Number(pnl.toFixed(2)),
+    // TRA-3101 — log the verdict on EVERY pass, not just the bad ones. A line
+    // that only appears when something is wrong cannot be used to prove the
+    // detector ran at all, which is how a silent instrument gets trusted.
+    anchorStatus: anchorVerdict.status,
+    anchorFlatVerified: anchorVerdict.flatVerified,
+    anchorSpanDays: anchorVerdict.spanDays,
   });
-  return { combinedPnl: pnl, prevDate: prev.date, prevBalance: prev.balance, netCashFlow };
+  if (isPnlUnknown(anchorVerdict)) {
+    log.warn('TRA-3101 live calendar day P&L is UNKNOWN — stale balance anchor', {
+      username: ctx.username,
+      env,
+      reportDate,
+      prevDate: prev.date,
+      balance: Number(todayBalance.toFixed(2)),
+      status: anchorVerdict.status,
+      detail: anchorVerdict.detail,
+    });
+  }
+  return {
+    combinedPnl: pnl,
+    prevDate: prev.date,
+    prevBalance: prev.balance,
+    netCashFlow,
+    anchorVerdict,
+  };
 }
 
 // ── TRA-244: one-shot historical Live-calendar backfill from broker fills ─────
@@ -3087,6 +3344,21 @@ async function buildLiveTodayCellReport(
   if (pnl === null) return null;
   const combinedPnl = Number(pnl.toFixed(2));
 
+  // TRA-3101 — the intraday cell is DELIBERATELY NOT classified for a stale
+  // anchor, and that is not an oversight.
+  //
+  // The stale-anchor fingerprint is "the report date's own snapshot is a copy of
+  // the previous one". TODAY has no snapshot yet — it is not due until the 21:00
+  // ET write — so there is nothing here that can be a copy. What the classifier
+  // would actually see is `current equity === yesterday's close`, which before
+  // the opening bell is TRUE EVERY SINGLE MORNING on any book with open
+  // positions. Running it here would mint a guaranteed daily false positive and
+  // teach the reader to ignore the badge, which costs more than the (already
+  // clearly labelled "not settled") intraday cell is worth.
+  //
+  // The settled 21:00 write for this same day DOES get classified, so a day that
+  // really did lose its snapshot is caught a few hours later — by the path that
+  // can actually tell the difference.
   const sign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
   const usd = (n: number) =>
     '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -9690,7 +9962,10 @@ app.get('/api/reports/latest', requireAuth, async (req, res) => {
   }
   try {
     const raw = await readFile(latestPath, 'utf-8');
-    res.json(stampMoverProvenance(JSON.parse(raw) as EodReport));
+    // TRA-3101 — same stale-anchor audit as the per-date route. `latest.json` is
+    // a copy of a dated cell and is just as able to be a stale-anchor zero.
+    const latest = await stampStaleBalanceAnchorAudit(ctx, mode, JSON.parse(raw) as EodReport);
+    res.json(stampMoverProvenance(latest));
   } catch {
     res.status(500).json({ error: 'Failed to read report' });
   }
@@ -9937,7 +10212,10 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
     res.status(404).json({ error: `No report for ${date}` });
     return;
   }
-  res.json(stampMoverProvenance(personal));
+  // TRA-3101 — audit the stored balance anchor on the way out. The seven
+  // known-bad cells predate the go-forward detector, so a write-path-only fix
+  // could not reach a single one of them.
+  res.json(stampMoverProvenance(await stampStaleBalanceAnchorAudit(ctx, mode, personal)));
 });
 
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {

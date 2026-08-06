@@ -127,6 +127,90 @@ function MeasureBadge({ report }: { report: EodReport | undefined }) {
   return <span className="cal-pnl-src" title={`${m.label}. ${m.title}`}>{m.code}</span>;
 }
 
+// ── TRA-3101 — THE ABSENCE STATE ─────────────────────────────────────────────
+//
+// Until now this grid had exactly two things to say about a day: a number, or
+// `--` for a day with no report at all. It had no way to say **"there is a
+// report for this day and I do not know what it means"**.
+//
+// That gap is the whole bug. A live balance-delta cell whose daily equity
+// snapshot never landed computes `today − prev` against an anchor that is a COPY
+// of today's own value, so it lands on exactly `0.00` — and `0.00` is also what
+// a genuinely quiet day produces. The cell colours only on `> 0` / `< 0`, so
+// both render as identical neutral-flat. 2026-06-12 sat there reading `$0.00`
+// while the broker booked −$141.72 of realized closes, from June to August,
+// because nothing in this file could tell the two apart.
+//
+// So: a day the server marked `pnlUnknown` renders `?`, in its own colour, never
+// green/red, and never as `$0.00`. It is also pulled OUT of every total below —
+// see `measuredDays`.
+
+function isUnknownDay(report: EodReport | undefined): boolean {
+  return !!report?.pnlUnknown;
+}
+
+/**
+ * The rows a total is entitled to be computed from.
+ *
+ * Numerically, dropping the unknown days barely moves Net P&L — their
+ * `combinedPnl` is the artefact `0.00` and adding zero changes nothing. What it
+ * moves is every count built on top: Trading Days, Win Rate, and the implicit
+ * claim that the month was measured end to end. A win rate of "5 wins / 20 days"
+ * that silently includes 3 days nobody measured is a worse number than
+ * "5 / 17 · 3 unknown", and the pre-fix grid could only produce the first.
+ */
+function measuredDays(reports: EodReport[]): EodReport[] {
+  return reports.filter(r => !isUnknownDay(r));
+}
+
+/** Rendered under any total that had to drop days it could not measure. */
+function UnknownDaysNote({ reports }: { reports: EodReport[] }) {
+  const unknown = reports.filter(isUnknownDay);
+  if (unknown.length === 0) return null;
+  const dates = unknown.map(r => r.date).sort();
+  return (
+    <div
+      className="cal-summary-unknown"
+      title={unknown
+        .map(r => `${r.date} — ${r.pnlUnknown?.detail ?? 'P&L unknown'}`)
+        .join('\n\n')}
+    >
+      ⚠ {unknown.length} day{unknown.length === 1 ? '' : 's'} could not be measured and{' '}
+      {unknown.length === 1 ? 'is' : 'are'} EXCLUDED from these totals ({dates.join(', ')}) — the
+      broker balance snapshot for {unknown.length === 1 ? 'that day' : 'those days'} never landed.
+      Their P&L is unknown, not $0.00.
+    </div>
+  );
+}
+
+/**
+ * The in-cell figure. One place, so the grid and the week strip cannot drift on
+ * the one distinction this ticket is about.
+ */
+function CellPnl({ report }: { report: EodReport | undefined }) {
+  if (!report) return <span className="cal-pnl cal-pnl--empty">--</span>;
+  if (isUnknownDay(report)) {
+    return (
+      <span
+        className="cal-pnl cal-pnl--unknown"
+        title={report.pnlUnknown?.detail ?? 'P&L for this day could not be established.'}
+      >
+        ?
+      </span>
+    );
+  }
+  return <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>;
+}
+
+/** The win/loss/unknown tint for a cell. An unknown day gets NEITHER win nor loss. */
+function cellStateClass(report: EodReport | undefined): string {
+  if (!report) return '';
+  if (isUnknownDay(report)) return ' cal-cell--unknown';
+  if (report.combinedPnl > 0) return ' cal-cell--win';
+  if (report.combinedPnl < 0) return ' cal-cell--loss';
+  return '';
+}
+
 function fmt(n: number, decimals = 2) {
   return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
@@ -222,8 +306,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
 
             let cls = 'cal-cell';
             if (isToday)                               cls += ' cal-cell--today';
-            if (report && report.combinedPnl > 0)      cls += ' cal-cell--win';
-            if (report && report.combinedPnl < 0)      cls += ' cal-cell--loss';
+            cls += cellStateClass(report); // TRA-3101 — unknown is neither win nor loss
             if (clickable)                             cls += ' cal-cell--clickable';
 
             return (
@@ -236,9 +319,7 @@ function MonthGrid({ year, month, reports, onSelectDate, cols }: {
               >
                 <span className="cal-day-num">{isToday ? 'Today' : dayNum}</span>
                 <MeasureBadge report={report} />
-                {report
-                  ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
-                  : <span className="cal-pnl cal-pnl--empty">--</span>}
+                <CellPnl report={report} />
               </div>
             );
           })}
@@ -259,10 +340,14 @@ function MonthSummary({ year, month, reports }: {
   // `reports` is already weekend-filtered upstream for the stocks calendar, so
   // monthly/winRate/losses here line up with what the grid renders.
 
-  const net    = monthly.reduce((s, r) => s + r.combinedPnl, 0);
-  const wins   = monthly.filter(r => r.combinedPnl > 0).length;
-  const losses = monthly.filter(r => r.combinedPnl < 0).length;
-  const wr     = ((wins / monthly.length) * 100).toFixed(0);
+  // TRA-3101 — totals are computed over MEASURED days only. A day whose balance
+  // snapshot never landed is not a flat day, and counting it as one inflates
+  // Trading Days and deflates Win Rate against a denominator nobody measured.
+  const measured = measuredDays(monthly);
+  const net    = measured.reduce((s, r) => s + r.combinedPnl, 0);
+  const wins   = measured.filter(r => r.combinedPnl > 0).length;
+  const losses = measured.filter(r => r.combinedPnl < 0).length;
+  const wr     = measured.length ? ((wins / measured.length) * 100).toFixed(0) : '—';
 
   return (
     <>
@@ -275,7 +360,7 @@ function MonthSummary({ year, month, reports }: {
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Trading Days</span>
-        <span className="cal-summary-value">{monthly.length}</span>
+        <span className="cal-summary-value">{measured.length}</span>
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Win Days</span>
@@ -287,10 +372,11 @@ function MonthSummary({ year, month, reports }: {
       </div>
       <div className="cal-summary-stat">
         <span className="cal-summary-label">Win Rate</span>
-        <span className="cal-summary-value">{wr}%</span>
+        <span className="cal-summary-value">{wr}{wr === '—' ? '' : '%'}</span>
       </div>
     </div>
-    <MixedMeasureNote reports={monthly} />
+    <UnknownDaysNote reports={monthly} />
+    <MixedMeasureNote reports={measured} />
     </>
   );
 }
@@ -316,10 +402,12 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
   const weekReports = days
     .map(d => reports[isoDate(d.getFullYear(), d.getMonth(), d.getDate())])
     .filter((r): r is EodReport => !!r);
-  const net    = weekReports.reduce((s, r) => s + r.combinedPnl, 0);
-  const wins   = weekReports.filter(r => r.combinedPnl > 0).length;
-  const losses = weekReports.filter(r => r.combinedPnl < 0).length;
-  const wr     = weekReports.length ? ((wins / weekReports.length) * 100).toFixed(0) : '0';
+  // TRA-3101 — same measured-days rule as the month summary.
+  const measured = measuredDays(weekReports);
+  const net    = measured.reduce((s, r) => s + r.combinedPnl, 0);
+  const wins   = measured.filter(r => r.combinedPnl > 0).length;
+  const losses = measured.filter(r => r.combinedPnl < 0).length;
+  const wr     = measured.length ? ((wins / measured.length) * 100).toFixed(0) : '0';
 
   return (
     <>
@@ -336,8 +424,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
 
             let cls = 'cal-cell';
             if (isToday)                          cls += ' cal-cell--today';
-            if (report && report.combinedPnl > 0) cls += ' cal-cell--win';
-            if (report && report.combinedPnl < 0) cls += ' cal-cell--loss';
+            cls += cellStateClass(report); // TRA-3101
             if (clickable)                        cls += ' cal-cell--clickable';
 
             return (
@@ -352,9 +439,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
                   {isToday ? 'Today' : `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`}
                 </span>
                 <MeasureBadge report={report} />
-                {report
-                  ? <span className="cal-pnl">{fmtCompact(report.combinedPnl)}</span>
-                  : <span className="cal-pnl cal-pnl--empty">--</span>}
+                <CellPnl report={report} />
               </div>
             );
           })}
@@ -370,7 +455,7 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Trading Days</span>
-            <span className="cal-summary-value">{weekReports.length}</span>
+            <span className="cal-summary-value">{measured.length}</span>
           </div>
           <div className="cal-summary-stat">
             <span className="cal-summary-label">Win Days</span>
@@ -386,7 +471,8 @@ function WeekView({ weekStart, cols, reports, onSelectDate }: {
           </div>
         </div>
       )}
-      {weekReports.length > 0 && <MixedMeasureNote reports={weekReports} />}
+      {weekReports.length > 0 && <UnknownDaysNote reports={weekReports} />}
+      {weekReports.length > 0 && <MixedMeasureNote reports={measured} />}
     </>
   );
 }
@@ -401,25 +487,34 @@ function YearView({ year, reports, onMonthClick }: {
   const months = Array.from({ length: 12 }, (_, m) => {
     const prefix  = `${year}-${String(m + 1).padStart(2, '0')}-`;
     const monthly = Object.values(reports).filter(r => r.date.startsWith(prefix));
-    const net     = monthly.reduce((s, r) => s + r.combinedPnl, 0);
-    const wins    = monthly.filter(r => r.combinedPnl > 0).length;
-    const losses  = monthly.filter(r => r.combinedPnl < 0).length;
-    return { m, net, wins, losses, hasData: monthly.length > 0 };
+    // TRA-3101 — measured days only, and carry the unknown COUNT up so the tile
+    // can flag a month whose figure is missing days rather than quietly
+    // presenting a partial year as a complete one.
+    const measured = measuredDays(monthly);
+    const unknown  = monthly.length - measured.length;
+    const net      = measured.reduce((s, r) => s + r.combinedPnl, 0);
+    const wins     = measured.filter(r => r.combinedPnl > 0).length;
+    const losses   = measured.filter(r => r.combinedPnl < 0).length;
+    return { m, net, wins, losses, unknown, hasData: monthly.length > 0 };
   });
 
-  const yearNet    = months.reduce((s, x) => s + (x.hasData ? x.net : 0), 0);
-  const yearWins   = months.reduce((s, x) => s + x.wins, 0);
-  const yearLosses = months.reduce((s, x) => s + x.losses, 0);
+  const yearNet     = months.reduce((s, x) => s + (x.hasData ? x.net : 0), 0);
+  const yearWins    = months.reduce((s, x) => s + x.wins, 0);
+  const yearLosses  = months.reduce((s, x) => s + x.losses, 0);
+  const yearUnknown = months.reduce((s, x) => s + x.unknown, 0);
 
   return (
     <>
       <div className="cal-year-grid">
-        {months.map(({ m, net, wins, losses, hasData }) => (
+        {months.map(({ m, net, wins, losses, unknown, hasData }) => (
           <div
             key={m}
             className={`cal-year-cell${!hasData ? ' cal-year-cell--empty' : net >= 0 ? ' cal-year-cell--win' : ' cal-year-cell--loss'}`}
             onClick={() => hasData && onMonthClick(m)}
             style={{ cursor: hasData ? 'pointer' : 'default' }}
+            title={unknown > 0
+              ? `${unknown} day${unknown === 1 ? '' : 's'} in ${MONTH_SHORT[m]} could not be measured (balance snapshot missing) and ${unknown === 1 ? 'is' : 'are'} excluded from this figure.`
+              : undefined}
           >
             <span className="cal-year-month">{MONTH_SHORT[m]}</span>
             {hasData ? (
@@ -429,6 +524,10 @@ function YearView({ year, reports, onMonthClick }: {
                 </span>
                 <span className="cal-year-wl">
                   <span className="green">W:{wins}</span>&nbsp;<span className="red">L:{losses}</span>
+                  {/* TRA-3101 — a month with unmeasured days says so on the tile.
+                      Without this the year view is the one place a partial
+                      figure can still pass as a complete one. */}
+                  {unknown > 0 && <>&nbsp;<span className="cal-year-unknown">?:{unknown}</span></>}
                 </span>
               </>
             ) : (
@@ -452,6 +551,20 @@ function YearView({ year, reports, onMonthClick }: {
           <span className="cal-summary-label">Loss Days</span>
           <span className="cal-summary-value red">{yearLosses}</span>
         </div>
+        {/* TRA-3101 — a first-class stat, not a footnote. The year figure is the
+            one most likely to be quoted, and "how much of the year is actually
+            in this number" has to travel with it. */}
+        {yearUnknown > 0 && (
+          <div className="cal-summary-stat">
+            <span className="cal-summary-label">Unmeasured Days</span>
+            <span
+              className="cal-summary-value cal-summary-value--unknown"
+              title="Days whose broker balance snapshot never landed. Their P&L is unknown, not $0.00, and they are excluded from every figure above."
+            >
+              {yearUnknown}
+            </span>
+          </div>
+        )}
       </div>
     </>
   );
@@ -469,21 +582,57 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
   // has to be answerable. The grid badge is a hint; this is the statement.
   const measure = pnlMeasure(report) ?? UNLABELLED_MEASURE;
   const superseded = report.supersededPnl;
+  // TRA-3101 — when the day is unmeasured, the detail view must not print the
+  // artefact figure anywhere, including the header strip. This is the screen an
+  // auditor opens to check a cell; a `$0.00` here is the claim being disputed.
+  const unknown = report.pnlUnknown;
   return (
     <section className="eod-panel">
       <div className="eod-header" style={{ cursor: 'default' }}>
         <button className="cal-back-btn" onClick={onBack} title="Back to calendar">&#8592; Back</button>
         <span className="eod-title" style={{ flex: 1 }}>EOD Report — {report.date}</span>
         <span className="eod-summary">
-          <span className={report.combinedPnl >= 0 ? 'green' : 'red'}>
-            {fmtDollar(report.combinedPnl)}
-          </span>
+          {unknown ? (
+            <span className="cal-pnl--unknown" title={unknown.detail}>P&amp;L unknown</span>
+          ) : (
+            <span className={report.combinedPnl >= 0 ? 'green' : 'red'}>
+              {fmtDollar(report.combinedPnl)}
+            </span>
+          )}
           &nbsp;·&nbsp;Win rate {(report.winRate * 100).toFixed(0)}%
           &nbsp;·&nbsp;{report.totalTrades} trades
         </span>
       </div>
 
       <div className="eod-body">
+        {unknown && (
+          <div className="cal-unknown-banner">
+            <div>
+              <strong>⚠ This day&rsquo;s P&amp;L could not be established — it is UNKNOWN, not $0.00.</strong>
+            </div>
+            <div className="cal-unknown-detail">{unknown.detail}</div>
+            <div className="cal-unknown-detail">
+              Anchor {unknown.anchorDate} ({fmtDollar(unknown.anchorBalance)}) vs {report.date} (
+              {fmtDollar(unknown.reportedBalance)}), span {unknown.spanDays}d
+              {unknown.evidence.known ? (
+                <>
+                  {' '}· evidence: {unknown.evidence.brokerCloses} broker closes,{' '}
+                  {fmtDollar(unknown.evidence.brokerRealizedUsd)} realized,{' '}
+                  {unknown.evidence.engineTrades} engine trades,{' '}
+                  {unknown.evidence.openPositions} open positions
+                </>
+              ) : (
+                <> · evidence UNREADABLE: {unknown.evidence.reason}</>
+              )}
+            </div>
+            <div className="cal-unknown-detail">
+              The value has deliberately <em>not</em> been re-derived: a stale anchor means the equity
+              series has a hole, and filling it by inference is what produced the original
+              phantom-green calendar. The engine-side breakdown below is unaffected by this and is
+              still shown.
+            </div>
+          </div>
+        )}
         <div className="cal-measure-banner" title={measure.title}>
           <strong>P&amp;L measure:</strong> {measure.label}
           {superseded && (
@@ -514,9 +663,15 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
           </div>
           <div className="eod-stat">
             <span className="eod-stat-label">Combined P&amp;L</span>
-            <span className={`eod-stat-value ${report.combinedPnl >= 0 ? 'green' : 'red'}`}>
-              {fmtDollar(report.combinedPnl)}
-            </span>
+            {/* TRA-3101 — the stat tile is the second place the artefact zero
+                would otherwise be printed as a finding. */}
+            {unknown ? (
+              <span className="eod-stat-value cal-pnl--unknown" title={unknown.detail}>unknown</span>
+            ) : (
+              <span className={`eod-stat-value ${report.combinedPnl >= 0 ? 'green' : 'red'}`}>
+                {fmtDollar(report.combinedPnl)}
+              </span>
+            )}
           </div>
           <div className="eod-stat">
             <span className="eod-stat-label">Win Rate</span>
@@ -825,8 +980,12 @@ export function CalendarTab({ token, httpUrl, reportsPath = '/api/reports', mode
   // the zero and points to the firm-wide Desk view, so an empty own-book is
   // understood rather than read as a bug. Only shown in the My Account view once
   // the load has settled and no per-day detail is open.
+  // TRA-3101 — an unmeasured day is NOT evidence of an empty book. Its
+  // `combinedPnl` is the artefact 0.00, so without this arm a book whose only
+  // rows are stale-anchor days would be told "your account has no activity" —
+  // the same $0.00-means-nothing-happened inference, one level up.
   const accountHasActivity = Object.values(reports).some(
-    r => r.combinedPnl !== 0 || r.totalTrades > 0,
+    r => isUnknownDay(r) || r.combinedPnl !== 0 || r.totalTrades > 0,
   );
   const showEmptyAccountNote = !isDesk && !loading && !selectedDate && !accountHasActivity;
 
