@@ -1451,7 +1451,7 @@ describe('GET /api/health/options-halt (TRA-3218)', () => {
     const { app, routes } = fakeApp();
     registerLiveHealthRoutes(app, {
       requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
-      userCtx: async () => ctx('admin', pipeState()),
+      userCtx: async () => ctx('admin', engineState() as unknown as EngineState),
       getSettings: () => settings(),
       optionsHalt: () => [
         engineState(),
@@ -1490,7 +1490,7 @@ describe('GET /api/health/options-halt (TRA-3218)', () => {
     const { app, routes } = fakeApp();
     registerLiveHealthRoutes(app, {
       requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
-      userCtx: async () => ctx('admin', pipeState()),
+      userCtx: async () => ctx('admin', engineState() as unknown as EngineState),
       getSettings: () => settings(),
       now: () => NOW,
     });
