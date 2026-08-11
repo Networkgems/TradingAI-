@@ -2481,7 +2481,19 @@ export class SignalEngine {
         ? TAKE_PROFIT_EARLY_CAPTURE_PCT
         : undefined;
     if (underlyingAtrBySymbol.size === 0 && takeProfitEarlyCaptureFrac === undefined) return undefined;
-    return { underlyingAtrBySymbol, underlyingAtrPctBySymbol, takeProfitEarlyCaptureFrac };
+    // TRA-3217 item 2 — opening-range guard for LIVE trail-driven exits
+    // (chandelier / premium trail / profit-lock; hard SL and structural exits
+    // exempt). Default 15 minutes after the 9:30 ET open; `0` disables. Read
+    // per-build rather than cached at module load so an env flip on the box
+    // takes effect on restart without a code change.
+    // An absent/blank/garbage env var means the DEFAULT (15), never 0 —
+    // `Number('')` is 0, and a silently disabled guard would read identically
+    // to an armed one on every session that happens not to gap.
+    const rawOpeningRange = process.env.OPTION_TRAIL_OPENING_RANGE_MIN?.trim();
+    const parsedOpeningRange = rawOpeningRange ? Number(rawOpeningRange) : Number.NaN;
+    const openingRangeGuardMin =
+      Number.isFinite(parsedOpeningRange) && parsedOpeningRange >= 0 ? parsedOpeningRange : 15;
+    return { underlyingAtrBySymbol, underlyingAtrPctBySymbol, takeProfitEarlyCaptureFrac, openingRangeGuardMin };
   }
 
   /**

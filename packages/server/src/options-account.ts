@@ -19,6 +19,7 @@ import type {
   PortfolioGreeks,
 } from '@trading-app/shared';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
+import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -337,6 +338,17 @@ export interface OptionExitRiskInput {
    * fraction of its available profit.
    */
   takeProfitEarlyCaptureFrac?: number;
+  /**
+   * TRA-3217 — opening-range guard for LIVE trail-driven exits, in minutes
+   * after the 9:30 ET RTH open. While the session is younger than this, the
+   * chandelier / premium-trail / profit-lock branches do not fire for live
+   * rows (hard `stopLossPremium` and the structural exits keep their
+   * semantics), and a chandelier breach observed inside the window is treated
+   * like one observed under the PDT/swing hold — re-tested, not latched. The
+   * caller (signal-engine) resolves it from `OPTION_TRAIL_OPENING_RANGE_MIN`
+   * (default 15; `0` disables). Absent → no guard (legacy callers/tests).
+   */
+  openingRangeGuardMin?: number;
 }
 
 /**
@@ -518,6 +530,19 @@ const MAX_STALE_WORKING_EXIT_CLEARS_PER_ROW = 8;
 
 function toDateKey(ts: number): string {
   return new Date(ts).toISOString().slice(0, 10);
+}
+
+/**
+ * TRA-3217 — minutes since today's 9:30 ET RTH open at instant `now`, negative
+ * before the open, `null` only if the ET calendar math fails. DST-correct via
+ * `etWallClockToUtcMs` rather than a hard-coded 13:30Z: the three live rows
+ * this ticket was opened on were all sold ≤17 minutes after the open, and an
+ * hour-off winter window would guard the wrong 15 minutes.
+ */
+function minutesSinceRthOpen(now: number): number | null {
+  const openMs = etWallClockToUtcMs(etDateKey(now), 9, 30);
+  if (openMs == null) return null;
+  return (now - openMs) / 60_000;
 }
 
 /**
@@ -1489,6 +1514,15 @@ export class PaperOptionsAccount {
    * "never reached" if you only publish one of the two numbers.
    */
   private escalatedExits = 0;
+  /**
+   * TRA-3217 — how many chandelier fires this process VETOED because the
+   * breach was carried out of a suppressed window (PDT/swing hold or the live
+   * opening-range window) and the trail was re-anchored instead. The exit
+   * suppression and the veto read identically on the journal (neither writes
+   * a close row), so this counter + the warn log line are the only evidence
+   * the guard engaged rather than never ran.
+   */
+  private chandelierStaleBreachVetoes = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -4244,6 +4278,14 @@ export class PaperOptionsAccount {
   ): OptionPosition[] {
     const closed: OptionPosition[] = [];
     const waitAndHold = options.waitAndHold === true;
+    // TRA-3217 — resolve the live opening-range window ONCE per pass. `0` (or
+    // an absent `openingRangeGuardMin`) disables the guard; a pre-open tick
+    // (negative minutes) counts as inside it, because a trail fire before the
+    // open would be strictly worse than one at the open.
+    const openingRangeGuardMin = exitRisk?.openingRangeGuardMin ?? 0;
+    const openingRangeMins = openingRangeGuardMin > 0 ? minutesSinceRthOpen(Date.now()) : null;
+    const withinOpeningRange =
+      openingRangeGuardMin > 0 && openingRangeMins !== null && openingRangeMins < openingRangeGuardMin;
     // TRA-949 — roll the ET-day before any auto-exit books realized P&L. The
     // opening baseline (openingOptionsPnlByMode) previously only advanced on an
     // ENTRY path; a day whose only options activity is a CLOSE (the demo
@@ -4403,6 +4445,24 @@ export class PaperOptionsAccount {
 
       if (mark > opt.peakPremium) opt.peakPremium = mark;
 
+      // TRA-3217 — the suppression predicates, computed ONCE per row and shared
+      // between the trail-maintenance block below and the `continue` gates
+      // further down, so the bookkeeping that decides "was this breach
+      // observed while we could not act" can never drift from the gates that
+      // actually did the not-acting. `inOpeningRange` is the third window: a
+      // self-imposed one, live-only, during which trail-driven fires are
+      // refused below (hard SL and structural exits are exempt).
+      const positionIsLive = (opt.mode ?? 'demo') === 'live';
+      const openedTodayKey = toDateKey(opt.openedAt) === toDateKey(Date.now());
+      const pdtHeldToday =
+        this.holdLiveOptionsOvernightForPdt && positionIsLive && openedTodayKey;
+      const swingHeldToday =
+        opt.signalType === 'relative_value'
+        && (positionIsLive || this.swingHoldOptions)
+        && openedTodayKey;
+      const inOpeningRange = withinOpeningRange && positionIsLive;
+      const trailExitSuppressed = pdtHeldToday || swingHeldToday || inOpeningRange;
+
       // TRA-1268 (TRA-1250 Rule 1) — maintain the underlying-space chandelier
       // trail every tick (even while a PDT / swing-hold suppression would defer
       // the exit below), mirroring how the premium peak/trailing state above
@@ -4413,6 +4473,16 @@ export class PaperOptionsAccount {
       // the chandelier here is a pure trailing exit on the underlying thesis.
       // The trigger itself fires in the exit-decision block below so the
       // suppressions still gate it.
+      //
+      // TRA-3217 — but the RATCHET was the latch. The trail kept climbing to
+      // the entry-day extreme while the hold made the exit unactionable, so a
+      // stop breached during day 0 stayed breached into the first tick of day
+      // 1 and every held live position was sold into the next open (3/3 live
+      // closes since the cost bar armed, ≤17 min after 13:30Z, all red). The
+      // bookkeeping after the ratchet below records a breach observed while
+      // suppressed and, on the first unsuppressed tick, RE-ANCHORS the trail
+      // at the current spot instead of firing — a stop crossed while we could
+      // not act is not a signal we acted on.
       let chandelierUSide: Side | null = null;
       let chandelierUnderlying: number | undefined;
       if (exitRisk && !opt.legs) {
@@ -4451,9 +4521,15 @@ export class PaperOptionsAccount {
             // PERSISTED, and `chandelierStop` ratchets monotonically (`min` for a
             // short), so repairing the anchor alone would still be capped by the
             // collapsed stop carried in `prevTrailStop`. Drop both together.
-            opt.peakUnderlying = anchorable(opt.underlyingEntryPrice)
-              ? opt.underlyingEntryPrice
-              : chandelierUnderlying;
+            if (anchorable(opt.underlyingEntryPrice)) {
+              opt.peakUnderlying = opt.underlyingEntryPrice;
+            } else {
+              opt.peakUnderlying = chandelierUnderlying;
+              // TRA-3217 item 4 — the third mechanism that journalled as plain
+              // `chandelier`: a trail whose anchor had to be seeded from the
+              // current spot. Stamped so the eventual exit can say so.
+              opt.chandelierTrailNote = 'spot_seeded';
+            }
             delete opt.chandelierStop;
           }
           opt.peakUnderlying = chandelierUSide === 'buy'
@@ -4467,6 +4543,46 @@ export class PaperOptionsAccount {
             atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
             prevTrailStop: opt.chandelierStop,
           });
+
+          // TRA-3217 — breach bookkeeping. While suppressed, the flag mirrors
+          // the CURRENT breach state (a breach that heals mid-hold clears it,
+          // so a later same-session-actionable breach still fires as a
+          // legitimate trail). On the first unsuppressed tick the flag is
+          // consumed: still breached ⇒ the breach originated in a window we
+          // could not act in ⇒ restart the trail at the current spot (the
+          // seeding tick cannot trigger for either side, per TRA-2893 above)
+          // rather than selling the open. The hard `stopLossPremium` below is
+          // untouched either way — a position with a real stop still has it.
+          const trailBreached = chandelierExitTriggered(
+            chandelierUSide, chandelierUnderlying, opt.chandelierStop,
+          );
+          if (trailExitSuppressed) {
+            if (trailBreached) opt.chandelierBreachedWhileSuppressed = true;
+            else delete opt.chandelierBreachedWhileSuppressed;
+          } else if (opt.chandelierBreachedWhileSuppressed) {
+            delete opt.chandelierBreachedWhileSuppressed;
+            if (trailBreached) {
+              accountLog.warn('chandelier fire VETOED: breach carried out of a suppressed window — trail re-anchored at spot', {
+                issue: 'TRA-3217',
+                optionSymbol: opt.optionSymbol,
+                mode: opt.mode ?? 'demo',
+                staleStop: opt.chandelierStop,
+                stalePeak: opt.peakUnderlying,
+                spot: chandelierUnderlying,
+              });
+              opt.peakUnderlying = chandelierUnderlying;
+              delete opt.chandelierStop;
+              opt.chandelierStop = chandelierStop({
+                side: chandelierUSide,
+                initialStop: chandelierUSide === 'buy' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+                extremeSinceEntry: chandelierUnderlying,
+                atr: uatr,
+                atrPct: exitRisk.underlyingAtrPctBySymbol?.get(opt.symbol),
+              });
+              opt.chandelierTrailNote = 'restarted_stale_breach';
+              this.chandelierStaleBreachVetoes += 1;
+            }
+          }
         }
       }
 
@@ -4548,11 +4664,9 @@ export class PaperOptionsAccount {
       // State updates above (mark, peak, trailing activation) still run so
       // the dashboard tracks the position live and the trailing-stop math
       // is correct when the gate releases on the next session.
-      if (
-        this.holdLiveOptionsOvernightForPdt
-        && (opt.mode ?? 'demo') === 'live'
-        && toDateKey(opt.openedAt) === toDateKey(Date.now())
-      ) {
+      // TRA-3217 — predicate computed above, next to the trail bookkeeping it
+      // must stay in lockstep with.
+      if (pdtHeldToday) {
         continue;
       }
 
@@ -4581,11 +4695,9 @@ export class PaperOptionsAccount {
       // the same day by a structural thesis-break / hard SL. Default-off, so the
       // legacy demo same-day behaviour (and its test suite) is unchanged unless
       // the user turns this on.
-      if (
-        opt.signalType === 'relative_value'
-        && ((opt.mode ?? 'demo') === 'live' || this.swingHoldOptions)
-        && toDateKey(opt.openedAt) === toDateKey(Date.now())
-      ) {
+      // TRA-3217 — predicate computed above, next to the trail bookkeeping it
+      // must stay in lockstep with.
+      if (swingHeldToday) {
         continue;
       }
 
@@ -4794,14 +4906,34 @@ export class PaperOptionsAccount {
           && chandelierUSide !== null
           && chandelierUnderlying != null
           && opt.chandelierStop !== undefined
+          // TRA-3217 item 2 — no trail-driven fires inside the live
+          // opening-range window; the bookkeeping above holds the breach for a
+          // post-window re-test instead.
+          && !inOpeningRange
           && chandelierExitTriggered(chandelierUSide, chandelierUnderlying, opt.chandelierStop)
         ) {
           exitPremium = mark;
           exitKind = 'trail';
-          exitJournalReason = 'chandelier';
-        } else if (exitPremium === null) {
+          // TRA-3217 item 4 — one label covered three mechanisms; split them
+          // at the fire. `chandelier_deferred_breach` is the canary: the
+          // bookkeeping above consumes the flag on every unsuppressed tick
+          // before this branch can run, so a non-zero count of that label in
+          // the journal means the veto is structurally broken, not that the
+          // policy chose to fire.
+          exitJournalReason = opt.chandelierBreachedWhileSuppressed
+            ? 'chandelier_deferred_breach'
+            : opt.chandelierTrailNote === 'restarted_stale_breach'
+              ? 'chandelier_restarted'
+              : opt.chandelierTrailNote === 'spot_seeded'
+                ? 'chandelier_spot_seeded'
+                : 'chandelier';
+        } else if (exitPremium === null && !inOpeningRange) {
           // Rule 2 — trade-level profit-lock on premium-derived R (we are always
           // LONG the premium, so entry = premiumPaid, stop = stopLossPremium).
+          // TRA-3217 item 2 — a give-back lock is trail-family, so the live
+          // opening-range window refuses it too (the peak it gives back from
+          // is yesterday's; fifteen minutes of session tell us whether the
+          // give-back is real).
           const lock = profitLockDecision({
             side: 'buy',
             entry: opt.premiumPaid,
@@ -4829,7 +4961,13 @@ export class PaperOptionsAccount {
           exitPremium = opt.stopLossPremium;
           exitKind = 'sl';
           exitJournalReason = 'sl';
-        } else if (opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
+        // TRA-3217 item 2 — the premium-space trail is gated by the live
+        // opening-range window like the chandelier (the hard SL above is
+        // exempt by design). Its ratchet does NOT get the re-anchor
+        // bookkeeping yet — the 3/3 live dumps were all `chandelier`, and a
+        // premium trail only arms after the position is up `trailActivatePct`
+        // — recorded as a residual on the ticket.
+        } else if (!inOpeningRange && opt.trailingActive && isArmedThreshold(opt.trailingStopPremium) && mark <= opt.trailingStopPremium) {
           exitPremium = opt.trailingStopPremium;
           exitKind = 'trail';
           exitJournalReason = 'trail';
@@ -5832,6 +5970,17 @@ export class PaperOptionsAccount {
       escalatedTotal: this.escalatedExits,
       lastExpiredAt: this.lastExpiredExitAt,
     };
+  }
+
+  /**
+   * TRA-3217 — how many chandelier fires this process vetoed because the
+   * breach was carried out of a suppressed window (see
+   * {@link chandelierStaleBreachVetoes}). Since-boot, count only — the veto
+   * writes no journal row by design, so without this number "the guard
+   * engaged" and "the guard never ran" read identically from the book.
+   */
+  getChandelierStaleBreachVetoes(): number {
+    return this.chandelierStaleBreachVetoes;
   }
 
   /**

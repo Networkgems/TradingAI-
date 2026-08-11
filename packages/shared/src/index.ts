@@ -2908,6 +2908,30 @@ export interface OptionPosition {
    */
   chandelierStop?: number;
   /**
+   * TRA-3217 — true while the chandelier stop is breached on ticks where the
+   * exit decision is structurally unable (TRA-483 PDT hold, TRA-495/1136 swing
+   * hold) or deliberately unwilling (live opening-range window) to act. The
+   * flag is re-derived on every suppressed tick — a breach that heals during
+   * the hold clears it — and CONSUMED on the first unsuppressed tick: if the
+   * stop is still breached there, the trail is re-anchored at the current spot
+   * instead of firing, because a stop crossed while we could not act is not a
+   * signal we acted on (3/3 live closes since the cost bar armed were sold
+   * into the next open ≤17 min on exactly this latch). Persisted so a restart
+   * mid-hold cannot launder the breach into a fireable one.
+   */
+  chandelierBreachedWhileSuppressed?: boolean;
+  /**
+   * TRA-3217 — provenance note for the chandelier trail, so a later
+   * `chandelier` exit can say which trail actually fired (three mechanisms
+   * shared one label before this):
+   *   - `restarted_stale_breach` — the trail was re-anchored after a breach
+   *     carried out of a suppressed window (the TRA-3217 veto);
+   *   - `spot_seeded` — the anchor was seeded from the current spot because
+   *     `underlyingEntryPrice` was absent/`0` (the TRA-2893 imported-row case).
+   * Absent ↔ the trail ran from a real entry anchor its whole life.
+   */
+  chandelierTrailNote?: 'restarted_stale_breach' | 'spot_seeded';
+  /**
    * TRA-1966 — premium-selling ("write") discriminator. When present this
    * position is a SHORT option opened for credit (the wheel): a cash-secured
    * put (`cash_secured_put`) or a covered call (`covered_call`). Unlike the

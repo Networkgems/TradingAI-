@@ -3896,3 +3896,190 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
     expect(acct.getState().openOptions[0].currentPremium).toBeCloseTo(1.45, 6);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3217 — the swing hold deferred the EXIT but not the TRAIL.
+//
+// The chandelier ratchets to the entry-day extreme while the TRA-483 PDT hold
+// makes the exit unactionable, so a stop breached on day 0 was still breached
+// on the first tick of day 1 and the position was sold into the open (3/3 live
+// closes since the cost bar armed: KVYO +17m, TROW +4m, ABCL +0m after 13:30Z,
+// all red, all `chandelier`). The fix: a breach observed while suppressed is
+// re-tested on the first unsuppressed tick, and if still standing the trail is
+// RE-ANCHORED at the current spot instead of fired. A live opening-range
+// window (default 15 min, `OPTION_TRAIL_OPENING_RANGE_MIN`) is a third
+// suppressed window with the same semantics. Hard SL is exempt from all of it.
+//
+// TRADING_TIME is 14:00Z = 10:00 ET (EDT) — 30 min after the open, so ticks at
+// `TRADING_TIME + n·24h` sit OUTSIDE the window unless a test aims inside it.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-3217 — stale-breach veto + opening-range window', () => {
+  // ATR 4 ⇒ trail width 3 × 4 = 12 (same pin as the TRA-1268/2893 suites).
+  const RISK = { underlyingAtrBySymbol: new Map([['AAPL', 4]]) };
+  const RISK_GUARDED = { ...RISK, openingRangeGuardMin: 15 };
+  const DAY = 24 * 60 * 60 * 1000;
+  // 2024-06-05 is EDT ⇒ the RTH open is 13:30Z.
+  const D1_OPEN = Date.parse('2024-06-05T13:30:00.000Z');
+
+  function liveAccount() {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      holdLiveOptionsOvernightForPdt: true,
+    });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'live', 50_000);
+    expect(pos).not.toBeNull();
+    expect(pos!.mode).toBe('live');
+    const sym = pos!.optionSymbol!;
+    // Mark pinned at entry so the premium SL (0.80) and trailing activation
+    // stay dormant and the chandelier is the only rule under test.
+    const marks = new Map([[sym, 1.0]]);
+    const tick = (spot: number, risk: object = RISK) =>
+      acct.checkExits(new Map([['AAPL', spot]]), marks, 'live', {}, undefined, risk);
+    const row = () => acct.getState().openOptions[0];
+    return { acct, tick, row };
+  }
+
+  it('vetoes a breach carried out of the PDT hold and restarts the trail; a later REAL break fires as chandelier_restarted', () => {
+    const { acct, tick, row } = liveAccount();
+
+    // Day 0 — trail ratchets to the day's extreme while the PDT hold owns the
+    // exit: 200 → 210 pins peak 210 / stop 198; the fade to 195 breaches it.
+    expect(tick(200)).toHaveLength(0);
+    expect(tick(210)).toHaveLength(0);
+    expect(row().chandelierStop).toBeCloseTo(198, 6);
+    expect(tick(195)).toHaveLength(0); // suppressed — this was the silent latch
+    expect(row().chandelierBreachedWhileSuppressed).toBe(true);
+
+    // Day 1, 10:00 ET — pre-fix this tick sold the position. Now: no exit, the
+    // flag is consumed, and the trail restarts at the CURRENT spot.
+    vi.setSystemTime(TRADING_TIME + DAY);
+    expect(tick(195)).toHaveLength(0);
+    expect(row().chandelierBreachedWhileSuppressed).toBeUndefined();
+    expect(row().peakUnderlying).toBe(195);
+    expect(row().chandelierStop).toBeCloseTo(183, 6);
+    expect(row().chandelierTrailNote).toBe('restarted_stale_breach');
+    expect(acct.getChandelierStaleBreachVetoes()).toBe(1);
+
+    // The restarted trail is a REAL trail: 196 ratchets it to 184, and a
+    // same-session-actionable break through it still exits — labelled with its
+    // provenance, not as a virgin `chandelier`.
+    expect(tick(196)).toHaveLength(0);
+    expect(row().chandelierStop).toBeCloseTo(184, 6);
+    const closed = tick(183.5);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier_restarted');
+    expect(acct.getState().openOptions).toHaveLength(0);
+  });
+
+  it('a breach that HEALS during the hold clears the flag, and a real day-1 break fires as plain chandelier', () => {
+    const { acct, tick, row } = liveAccount();
+
+    // Day 0: breach at 195… then the market takes it back above the stop while
+    // still suppressed. The flag must mirror the CURRENT breach state, or this
+    // healed excursion would veto a legitimate exit tomorrow.
+    tick(200); tick(210); tick(195);
+    expect(row().chandelierBreachedWhileSuppressed).toBe(true);
+    tick(199);
+    expect(row().chandelierBreachedWhileSuppressed).toBeUndefined();
+
+    // Day 1: an actionable fade through the (legitimately ratcheted) stop is a
+    // virgin trail exit — no veto, no relabel.
+    vi.setSystemTime(TRADING_TIME + DAY);
+    const closed = tick(197.5);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier');
+    expect(acct.getChandelierStaleBreachVetoes()).toBe(0);
+  });
+
+  it('opening-range window: a gap through the stop at the open is held, re-tested after the window, and vetoed if still stale', () => {
+    const { acct, tick, row } = liveAccount();
+
+    // Day 0 establishes a clean trail (peak 210 / stop 198), never breached.
+    tick(200, RISK_GUARDED); tick(210, RISK_GUARDED);
+    expect(row().chandelierBreachedWhileSuppressed).toBeUndefined();
+
+    // Day 1, open + 5 min (13:35Z) — the PDT hold has released, but the gap to
+    // 195 lands inside the window: refused, and recorded as suppressed-breach.
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    expect(tick(195, RISK_GUARDED)).toHaveLength(0);
+    expect(row().chandelierBreachedWhileSuppressed).toBe(true);
+
+    // Open + 20 min — still under the day-0 stop ⇒ the breach originated where
+    // we would not act ⇒ re-anchor, don't fire.
+    vi.setSystemTime(D1_OPEN + 20 * 60_000);
+    expect(tick(195, RISK_GUARDED)).toHaveLength(0);
+    expect(row().peakUnderlying).toBe(195);
+    expect(row().chandelierStop).toBeCloseTo(183, 6);
+    expect(acct.getChandelierStaleBreachVetoes()).toBe(1);
+
+    // Mid-session break of the RESTARTED trail exits normally.
+    vi.setSystemTime(D1_OPEN + 90 * 60_000);
+    const closed = tick(182.5, RISK_GUARDED);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier_restarted');
+  });
+
+  it('the opening-range window does NOT hold the hard premium stop', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+
+    // Day 1 inside the window, mark crashes through the SL (0.80) — a real
+    // stop keeps its semantics; only trail-family exits wait out the window.
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    const closed = acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, 0.75]]), 'live', {}, undefined, RISK_GUARDED,
+    );
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('sl');
+  });
+
+  it('the window is live-only: a demo row still exits at the open', () => {
+    const acct = new PaperOptionsAccount({
+      initialEquity: 50_000,
+      managedAccountRatio: 0.5,
+      holdLiveOptionsOvernightForPdt: true,
+    });
+    const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    const marks = new Map([[pos!.optionSymbol!, 1.0]]);
+    const tick = (spot: number) =>
+      acct.checkExits(new Map([['AAPL', spot]]), marks, 'demo', {}, undefined, RISK_GUARDED);
+
+    tick(200); tick(210);
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    const closed = tick(195);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('chandelier');
+  });
+
+  it('a spot-seeded trail (TRA-2893 imported row) journals its provenance on exit', () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 25_000, tradierEnv: 'sandbox' });
+    acct.reconcileTradierPositions([{
+      optionSymbol: 'QQQ260807P00700000',
+      underlying: 'QQQ',
+      optionType: 'put' as const,
+      strike: 700,
+      expiration: '2026-08-07',
+      contracts: 1,
+      premiumPaid: 1.45,
+      acquiredAt: TRADING_TIME,
+    }], 'demo');
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const marks = new Map([[sym, 1.45]]);
+    const risk = { underlyingAtrBySymbol: new Map([['QQQ', 6]]) };
+    const tick = (spot: number) =>
+      acct.checkExits(new Map([['QQQ', spot]]), marks, 'demo', { waitAndHold: true }, undefined, risk);
+
+    // First tick seeds the anchor from spot (underlyingEntryPrice is 0) and
+    // stamps the provenance; the thesis then works 700 → 690 (stop 708).
+    expect(tick(700)).toHaveLength(0);
+    expect(acct.getState().openOptions[0].chandelierTrailNote).toBe('spot_seeded');
+    expect(tick(690)).toHaveLength(0);
+
+    // A REAL rebound through the trail still exits — but the journal now says
+    // which of the three mechanisms this trail was.
+    const staged = tick(709);
+    expect(staged).toHaveLength(1);
+    expect(staged[0].pendingExit?.journalReason).toBe('chandelier_spot_seeded');
+  });
+});
