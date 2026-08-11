@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { PaperOptionsAccount, summarizeLiveUnmanagedRisk } from './options-account.js';
+import { PaperOptionsAccount, summarizeLiveUnmanagedRisk, type OptionExitRiskInput } from './options-account.js';
 import type { OptionPosition, OtmMispricingSignal, RelativeValueSignal } from '@trading-app/shared';
 import { OTM_RISK_PARAMS, OPTIONS_SL_PCT } from '@trading-app/shared';
 import type { TradierOpenOptionPosition } from '@trading-app/engine';
@@ -3934,7 +3934,7 @@ describe('TRA-3217 — stale-breach veto + opening-range window', () => {
     // Mark pinned at entry so the premium SL (0.80) and trailing activation
     // stay dormant and the chandelier is the only rule under test.
     const marks = new Map([[sym, 1.0]]);
-    const tick = (spot: number, risk: object = RISK) =>
+    const tick = (spot: number, risk: OptionExitRiskInput = RISK) =>
       acct.checkExits(new Map([['AAPL', spot]]), marks, 'live', {}, undefined, risk);
     const row = () => acct.getState().openOptions[0];
     return { acct, tick, row };

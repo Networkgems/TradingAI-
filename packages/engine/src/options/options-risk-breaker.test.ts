@@ -262,3 +262,140 @@ describe('resolveOptionsThrottleBand — the band cannot be silently unreachable
     expect(b.riskThrottle()).toBe(1);
   });
 });
+
+// TRA-3218 (parent TRA-2760) — the cooldown re-arm + the durable-restart seam.
+//
+// Two invariants pinned here, each of which fails SILENTLY if broken:
+//   1. The release must not be a no-op: at the moment of release the original
+//      trip predicate (`cumulativeR ≤ −maxR`) still holds, so without the
+//      re-trip floors the very next close re-latches instantly.
+//   2. The restart seam must hold in BOTH directions: a reboot must neither
+//      clear a latched halt (the accidental halt-clearing mechanism the ticket
+//      forbids) nor zero the tallies a bleeding sleeve would re-trip on.
+describe('TRA-3218 — cooldown re-arm + restart seam', () => {
+  const COOLDOWN = { ...DEFAULT_OPTIONS_BREAKER_PARAMS, haltCooldownMinutes: 30, reArmStepR: 1 };
+  const T0 = Date.parse('2026-08-11T15:00:00.000Z');
+
+  function build(params = COOLDOWN) {
+    let now = T0;
+    let day = '2026-08-11';
+    const b = new OptionsRiskBreaker(params, () => new Date(now), () => day);
+    return {
+      b,
+      advanceMin: (m: number) => {
+        now += m * 60_000;
+      },
+      setDay: (d: string) => {
+        day = d;
+      },
+      halt: () => {
+        b.recordClose({ pnl: -200, riskUsd: 200 }, EQUITY);
+        b.recordClose({ pnl: -200, riskUsd: 200 }, EQUITY); // −2R — trips
+      },
+    };
+  }
+
+  it('the default config keeps the legacy day-latch: no release however long the day runs', () => {
+    const { b, advanceMin, halt } = build(DEFAULT_OPTIONS_BREAKER_PARAMS);
+    halt();
+    expect(b.isHalted()).toBe(true);
+    advanceMin(6 * 60); // six hours — the whole rest of the session
+    expect(b.isHalted()).toBe(true);
+    expect(b.snapshot().releasesToday).toBe(0);
+  });
+
+  it('releases after the cooldown, stamping the release and the re-trip water lines', () => {
+    const { b, advanceMin, halt } = build();
+    halt();
+    expect(b.isHalted()).toBe(true);
+    expect(b.snapshot().haltAt).toBe(T0);
+    advanceMin(29);
+    expect(b.isHalted()).toBe(true); // one minute early — still latched
+    advanceMin(1);
+    expect(b.isHalted()).toBe(false); // released at exactly the window
+    const s = b.snapshot();
+    expect(s.releasesToday).toBe(1);
+    expect(s.haltsToday).toBe(1);
+    // Floors: one reArmStepR below the release-time state (−2R / −$400 − $1,250).
+    expect(s.cooldown.reTripFloorR).toBeCloseTo(-3, 5);
+    expect(s.cooldown.reTripFloorPnl).toBeCloseTo(-400 - 0.05 * EQUITY, 5);
+  });
+
+  it('a post-release close does NOT re-latch until it breaches the re-trip floor (release is not a no-op)', () => {
+    const { b, advanceMin, halt } = build();
+    halt();
+    advanceMin(30);
+    expect(b.isHalted()).toBe(false);
+    // −0.5R more: cumulative −2.5R still satisfies the RAW trip (≤ −2R) but not
+    // the −3R floor — pre-fix semantics would re-latch here.
+    b.recordClose({ pnl: -100, riskUsd: 200 }, EQUITY);
+    expect(b.isHalted()).toBe(false);
+    // Another −0.5R: cumulative −3.0R breaches the floor — second latch of the day.
+    b.recordClose({ pnl: -100, riskUsd: 200 }, EQUITY);
+    expect(b.isHalted()).toBe(true);
+    expect(b.snapshot().haltsToday).toBe(2);
+  });
+
+  it('restart seam: a same-day restore re-latches the halt and keeps the cooldown clock (reboot ≠ release)', () => {
+    const src = build();
+    src.halt();
+    const persisted = src.b.exportState();
+    expect(persisted.halted).toBe(true);
+
+    // "Reboot": a fresh breaker, same params, 10 minutes into the cooldown.
+    let now = T0 + 10 * 60_000;
+    const fresh = new OptionsRiskBreaker(COOLDOWN, () => new Date(now), () => '2026-08-11');
+    expect(fresh.isHalted()).toBe(false); // the pre-fix hole: reboot cleared the latch
+    expect(fresh.restoreState(persisted)).toBe(true);
+    expect(fresh.isHalted()).toBe(true); // re-latched
+    now = T0 + 31 * 60_000; // …and the clock ran from the ORIGINAL latch, not the boot
+    expect(fresh.isHalted()).toBe(false);
+    expect(fresh.snapshot().releasesToday).toBe(1);
+  });
+
+  it('restart seam: the tallies restore too, so a bleeding sleeve cannot reboot calm', () => {
+    const src = build();
+    src.b.recordClose({ pnl: -380, riskUsd: 200 }, EQUITY); // −1.9R — one close from the trip
+    const persisted = src.b.exportState();
+
+    const fresh = new OptionsRiskBreaker(COOLDOWN, () => new Date(T0), () => '2026-08-11');
+    expect(fresh.restoreState(persisted)).toBe(true);
+    fresh.recordClose({ pnl: -100, riskUsd: 200 }, EQUITY); // −2.4R total — trips
+    expect(fresh.isHalted()).toBe(true);
+  });
+
+  it('restore refuses a stale day — yesterday\'s halt never resurrects across the roll', () => {
+    const src = build();
+    src.halt();
+    const persisted = src.b.exportState();
+
+    const fresh = new OptionsRiskBreaker(COOLDOWN, () => new Date(T0), () => '2026-08-12');
+    expect(fresh.restoreState(persisted)).toBe(false);
+    expect(fresh.isHalted()).toBe(false);
+  });
+
+  it('restore refuses once live closes exist — a late restore cannot clobber live state', () => {
+    const src = build();
+    src.halt();
+    const persisted = src.b.exportState();
+
+    const fresh = new OptionsRiskBreaker(COOLDOWN, () => new Date(T0), () => '2026-08-11');
+    fresh.recordClose({ pnl: 50, riskUsd: 200 }, EQUITY); // live activity first
+    expect(fresh.restoreState(persisted)).toBe(false);
+    expect(fresh.isHalted()).toBe(false);
+  });
+
+  it('the day roll clears the latch history, floors, and release tallies with everything else', () => {
+    const { b, advanceMin, setDay, halt } = build();
+    halt();
+    advanceMin(30);
+    expect(b.isHalted()).toBe(false); // released — floors now set
+    setDay('2026-08-12');
+    const s = b.snapshot();
+    expect(s.haltsToday).toBe(0);
+    expect(s.releasesToday).toBe(0);
+    expect(s.haltAt).toBeNull();
+    expect(s.cooldown.reTripFloorR).toBeNull();
+    expect(s.cooldown.reTripFloorPnl).toBeNull();
+  });
+});

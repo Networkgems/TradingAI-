@@ -225,6 +225,7 @@ import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
+import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
 // TRA-2930 — durable per-book EOD archive-participation record.
@@ -4267,6 +4268,51 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
   }
 }
 
+// TRA-3218 (parent TRA-2760) — rebuild the DURABLE options-sleeve breaker ledger and
+// re-apply TODAY's (ET) state to each engine's breaker: the sleeve-breaker counterpart
+// of the TRA-2110 give-back seed directly above, and subject to the same rules. Without
+// it a reboot silently CLEARS a latched sleeve halt (the accidental halt-clearing
+// mechanism TRA-3218 forbids) and ZEROES the tallies a bleeding sleeve would re-trip
+// on. GATED on `durability.ephemeral === false` (TRA-2110 AC#3): never seed — or fail
+// to re-latch — a real-capital halt off a ledger that dies with the process. The
+// breaker itself refuses a stale-day or post-activity restore, so this can never
+// resurrect yesterday's halt.
+{
+  const h = hydrateOptionsBreakerLedgerFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('options-breaker ledger hydrated (TRA-3218)', {
+      records: h.records,
+      sessions: h.sessions,
+    });
+  }
+  const breakerDurability = summarizeOptionsBreakerLedger().durability;
+  if (breakerDurability.ephemeral === false) {
+    for (const ctx of getAllUserContexts()) {
+      try {
+        const r = ctx.engine.seedOptionsBreakerFromLedger();
+        if (r.seeded) {
+          log.info('options-sleeve breaker re-derived on boot (TRA-3218)', {
+            username: ctx.username,
+            halted: r.halted,
+          });
+        }
+      } catch (err: unknown) {
+        // Best-effort: a seed failure must never break boot — the breaker simply
+        // runs unseeded (the pre-fix behavior), failing SAFE, not open.
+        log.warn('options-sleeve breaker boot re-derive failed (TRA-3218)', {
+          username: ctx.username,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } else {
+    log.warn(
+      'options-sleeve breaker boot re-derive SKIPPED — ledger ephemeral (TRA-3218/TRA-1719)',
+      { dataDir: breakerDurability.dataDir },
+    );
+  }
+}
+
 // TRA-1929 (parent TRA-1916) — rebuild the durable per-trade live-options fee/slippage
 // calibration ledger from disk on boot and remember DATA_DIR for subsequent appends, so
 // the live real-money OTM fills survive bqb1's nightly reboot and remain
@@ -5244,6 +5290,11 @@ registerLiveHealthRoutes(app, {
         .filter(e => e.mode === 'demo'),
     };
   },
+  // TRA-3218 — unauth options-halt probe. The WHOLE fleet, both modes (unlike
+  // `optionsPipeline` above, which is demo-only by its ticket's scope): the
+  // per-engine rows are what make "what does a second live book inherit"
+  // measurable. Secrets-free (booleans / counts / timestamps / book-level P&L).
+  optionsHalt: () => getAllUserContexts().map(ctx => ctx.engine.getOptionsHaltState()),
 });
 
 // TRA-1004 — autonomous demo-loop status. Unauthenticated by design (parity with

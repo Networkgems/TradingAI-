@@ -440,6 +440,8 @@ export type {
   OptionCloseRecord,
   OptionsBreakerSnapshot,
   OptionsThrottleBand,
+  // TRA-3218 — the durable-restart seam's persisted-state shape.
+  OptionsBreakerPersistedState,
 } from './options/options-risk-breaker.js';
 export type {
   OptionTrend,

@@ -121,7 +121,7 @@ import {
 } from './wheel-iv-entry-filter.js';
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, isBookGiveBackArmFloorEnabled } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -160,6 +160,7 @@ import {
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
+import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation } from './option-mark-sanity.js'; // TRA-2927
 import { recordEntryGreeksVerdict } from './entry-greeks-ledger.js';
 import { isMultiLegOpenPaused } from './multileg-open-pause-flag.js';
@@ -1765,6 +1766,14 @@ export class DailyRiskGovernor {
    * book-halt state. Null while unhalted.
    */
   private sessionHaltReasonCode: BookHaltReason | null = null;
+  /**
+   * TRA-3218 — ms epoch of the book-halt latch (false→true transition in
+   * {@link markBook}). Null while unhalted; clears on the ET day roll with the
+   * rest of the book-halt state. Exists because "a halted day and a quiet day
+   * are pixel-identical from outside" — the health route needs the latch TIME,
+   * not just the latch bit, to show how much session a halt consumed.
+   */
+  private sessionHaltAt: number | null = null;
 
   /**
    * TRA-563 — optional listener fired exactly once when the governor TRANSITIONS
@@ -1823,6 +1832,7 @@ export class DailyRiskGovernor {
       this.sessionHalted = false;
       this.sessionHaltReason = null;
       this.sessionHaltReasonCode = null; // TRA-1892 — clears with the rest of book-halt state
+      this.sessionHaltAt = null; // TRA-3218 — latch time clears with the latch
       this.currentDay = today;
       // TRA-995 — the autopilot throttle is a DAILY breaker like the halt: it
       // clears on the fresh ET day. This is not an "autonomous limit increase"
@@ -1956,6 +1966,7 @@ export class DailyRiskGovernor {
     if (decision.shouldFlattenAndHalt && !this.sessionHalted) {
       // False→true transition: latch for the session and alert once.
       this.sessionHalted = true;
+      this.sessionHaltAt = this.now().getTime(); // TRA-3218 — when the day ended
       this.sessionHaltReasonCode = decision.reason; // TRA-1892 — machine-readable code
       this.sessionHaltReason =
         decision.reason === 'session_net_negative'
@@ -2028,6 +2039,31 @@ export class DailyRiskGovernor {
   getBookHaltReason(): string | null {
     this.resetIfNewDay();
     return this.sessionHaltReason;
+  }
+
+  /**
+   * TRA-3218 — the machine-readable book-halt state for the options-halt health
+   * route: latch bit + reason code + latch TIME + the peak and retained floor
+   * the give-back leg is measured against. Pure read; day-roll settled first so
+   * yesterday's latch never reports as today's.
+   */
+  getBookHaltState(): {
+    halted: boolean;
+    reason: string | null;
+    reasonCode: BookHaltReason | null;
+    haltAt: number | null;
+    peakOpenGain: number;
+    retainedFloor: number;
+  } {
+    this.resetIfNewDay();
+    return {
+      halted: this.sessionHalted,
+      reason: this.sessionHaltReason,
+      reasonCode: this.sessionHaltReasonCode,
+      haltAt: this.sessionHaltAt,
+      peakOpenGain: this.peakOpenGain,
+      retainedFloor: this.peakOpenGain * (1 - BOOK_GIVEBACK_CAP_PCT),
+    };
   }
 
   /**
@@ -2315,6 +2351,27 @@ export class SignalEngine {
     () => new Date(),
     (d) => etDateString(d),
   );
+  /**
+   * TRA-3218 — per-ET-day tally of option-scan passes the BOOK-wide session halt
+   * touched. `blocked` = the gate returned early (scope `book`, the legacy
+   * coupling); `bypassed` = the book was halted but the sleeve scope let the
+   * scan proceed (scope `sleeve`). Counted at BOTH values of the scope flag so
+   * the health route can show the counterfactual BEFORE the board flips it —
+   * this is the number that measures the board's "one red trade ends the day"
+   * complaint directly. In-memory (a scan pass is not worth a ledger line); the
+   * durable halt record lives in the options-breaker ledger.
+   */
+  private optionScanBookHaltTally = { day: '', blocked: 0, bypassed: 0 };
+
+  /** TRA-3218 — roll + bump the book-halt gate tally (see field above). */
+  private noteOptionScanBookHalt(bypassed: boolean): void {
+    const today = etDateString(new Date());
+    if (this.optionScanBookHaltTally.day !== today) {
+      this.optionScanBookHaltTally = { day: today, blocked: 0, bypassed: 0 };
+    }
+    if (bypassed) this.optionScanBookHaltTally.bypassed += 1;
+    else this.optionScanBookHaltTally.blocked += 1;
+  }
   /**
    * TRA-563 — owning username for alert routing. Set by the per-user context
    * after construction via {@link setAlertUsername}. When unset (e.g. a bare
@@ -4733,6 +4790,9 @@ export class SignalEngine {
             ? opt.maxLossUsd
             : (opt.premiumPaid ?? 0) * (opt.contracts ?? 0) * 100;
         this.optionsBreaker.recordClose({ pnl: opt.pnl ?? 0, riskUsd }, sleeveEquity);
+        // TRA-3218 — persist the breaker's state so the sleeve halt + tallies
+        // survive the nightly/mid-session reboot (both restart directions).
+        recordOptionsBreakerState(this.mode, this.feedContextKey, this.optionsBreaker.exportState());
       }
     }
 
@@ -7646,7 +7706,19 @@ export class SignalEngine {
     // whole book has tripped the daily give-back cap we open NO new option
     // tickets for the session; exits still run. Dark until the rules flag is on
     // (markBook never latches `sessionHalted` otherwise), so prod is unchanged.
-    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return;
+    //
+    // TRA-3218 — under `OPTIONS_HALT_SCOPE=sleeve` the sleeve no longer ends its
+    // day off the EQUITY book's session stop: only the sleeve breaker (above)
+    // halts option entries. Counted at both scope values so the health route can
+    // show what the book halt did / would have done.
+    {
+      const bookHaltEnv = this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+      if (isExitRiskRulesEnabled(bookHaltEnv) && this.riskGovernor.isBookHalted()) {
+        const sleeveScoped = isOptionsSleeveHaltScope(bookHaltEnv);
+        this.noteOptionScanBookHalt(sleeveScoped);
+        if (!sleeveScoped) return;
+      }
+    }
 
     // TRA-373 — per-user DTE window overrides the shared scanner singleton's
     // defaults on every call so a settings edit takes effect on the next
@@ -8657,7 +8729,19 @@ export class SignalEngine {
     // gated explicitly here for the same reason as the RV scan: the options
     // paths consult the sleeve breaker, not the equity risk governor. Dark
     // until the rules flag is on.
-    if (isExitRiskRulesEnabled(this.mode === 'live' ? process.env : this.resolveDemoFlagEnv()) && this.riskGovernor.isBookHalted()) return null;
+    //
+    // TRA-3218 — under `OPTIONS_HALT_SCOPE=sleeve` the OTM sleeve no longer ends
+    // its day off the EQUITY book's session stop (the +0.5%-arm one-red-trade
+    // halt the board reported): only the sleeve breaker above halts entries.
+    // Counted at both scope values for the counterfactual readout.
+    {
+      const bookHaltEnv = this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+      if (isExitRiskRulesEnabled(bookHaltEnv) && this.riskGovernor.isBookHalted()) {
+        const sleeveScoped = isOptionsSleeveHaltScope(bookHaltEnv);
+        this.noteOptionScanBookHalt(sleeveScoped);
+        if (!sleeveScoped) return null;
+      }
+    }
 
     // Per-user DTE window (TRA-373) flows through the shared scanner singleton
     // on every call, identical to the RV path.
@@ -9155,6 +9239,8 @@ export class SignalEngine {
           ? closed.maxLossUsd
           : (closed.premiumPaid ?? 0) * (closed.contracts ?? 0) * 100;
       this.optionsBreaker.recordClose({ pnl: closed.pnl ?? 0, riskUsd }, sleeveEquity);
+      // TRA-3218 — same durable write as the primary exit site above.
+      recordOptionsBreakerState(this.mode, this.feedContextKey, this.optionsBreaker.exportState());
       this.emitOptionExitAlert(closed);
       flatOpt++;
     }
@@ -13496,6 +13582,71 @@ export class SignalEngine {
    */
   getOptionsBreakerSnapshot(): ReturnType<OptionsRiskBreaker['snapshot']> {
     return this.optionsBreaker.snapshot();
+  }
+
+  /**
+   * TRA-3218 (parent TRA-2760) — the options-halt state for
+   * `GET /api/health/options-halt`: which halt authority the option entry gates
+   * consult (scope), what each authority currently says (book governor vs sleeve
+   * breaker, with latch TIMES), the headline `entriesHalted` bit, and the
+   * per-day tally of scan passes the book-wide halt blocked/bypassed. This is
+   * the readout the ticket demanded because "a halted day and a quiet day are
+   * currently pixel-identical from outside". Secrets-free: booleans, counts,
+   * timestamps, and book-level P&L marks only.
+   */
+  getOptionsHaltState(): {
+    engineId: string;
+    mode: 'demo' | 'live';
+    /** The resolved halt scope THIS engine's gates read (env differs demo vs live). */
+    scope: OptionsHaltScopeResolution;
+    exitRiskRulesEnabled: boolean;
+    optionExecEnabled: boolean;
+    /** True iff a new option entry would be gated off right now, under the resolved scope. */
+    entriesHalted: boolean;
+    book: ReturnType<DailyRiskGovernor['getBookHaltState']>;
+    sleeve: ReturnType<OptionsRiskBreaker['snapshot']>;
+    bookHaltGate: { day: string; blocked: number; bypassed: number };
+  } {
+    const env = this.mode === 'live' ? process.env : this.resolveDemoFlagEnv();
+    const scope = resolveOptionsHaltScope(env);
+    const exitRules = isExitRiskRulesEnabled(env);
+    const execEnabled = isOptionExecEnabled();
+    const book = this.riskGovernor.getBookHaltState();
+    const sleeve = this.optionsBreaker.snapshot();
+    // Mirrors the two entry-gate checks exactly: the sleeve breaker bites when
+    // exec is on; the book halt bites only under the legacy `book` scope.
+    const entriesHalted =
+      (execEnabled && sleeve.halted) || (exitRules && book.halted && scope.scope !== 'sleeve');
+    return {
+      engineId: this.feedContextKey,
+      mode: this.mode,
+      scope,
+      exitRiskRulesEnabled: exitRules,
+      optionExecEnabled: execEnabled,
+      entriesHalted,
+      book,
+      sleeve,
+      bookHaltGate: { ...this.optionScanBookHaltTally },
+    };
+  }
+
+  /**
+   * TRA-3218 — durable-restart seam, engine side (mirrors
+   * {@link seedBookGiveBackPeakFromLedger}). Re-applies TODAY's persisted
+   * breaker state from the options-breaker ledger at boot; the breaker itself
+   * refuses a stale-day or post-activity restore, so this cannot resurrect
+   * yesterday's halt or clobber live state. Without it a reboot silently clears
+   * a latched sleeve halt AND zeroes the tallies a bleeding sleeve would
+   * re-trip on — bqb1 reboots nightly, so both directions are load-bearing.
+   * Caller MUST gate on the ledger's `durability.ephemeral === false`
+   * (TRA-2110 AC#3 parity): never seed a real-capital latch off a non-durable
+   * ledger.
+   */
+  seedOptionsBreakerFromLedger(now: Date = new Date()): { seeded: boolean; halted: boolean } {
+    const state = getOptionsBreakerRestoreState(this.mode, this.feedContextKey, etDateString(now));
+    if (!state) return { seeded: false, halted: false };
+    const applied = this.optionsBreaker.restoreState(state);
+    return { seeded: applied, halted: applied && state.halted === true };
   }
 
   /** TRA-1023 — operator reset of the options-sleeve breaker for the current day. */

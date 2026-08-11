@@ -62,6 +62,28 @@ export interface OptionsBreakerParams {
   throttleDrawdownPct: number;
   /** TRA-3086 — the multiplier applied inside the band. Tighten-only: clamped into [0.1, 1]. */
   throttleMultiplier: number;
+  /**
+   * TRA-3218 — cooldown re-arm. Minutes a latched halt holds before it RELEASES
+   * and new entries may resume. `0` (the default) DISABLES the release entirely:
+   * the halt latches for the rest of the ET day, byte-for-byte the pre-3218
+   * behaviour. The clock runs from the LATCH ({@link OptionsRiskBreaker}
+   * `haltAt`), not from the last close — further bleed during the cooldown does
+   * not extend it, but it DOES lower the state the re-trip floors are cut from
+   * at release, so a sleeve that kept bleeding needs that much more room before
+   * it trips again.
+   */
+  haltCooldownMinutes: number;
+  /**
+   * TRA-3218 — how much FURTHER the sleeve must deteriorate after a cooldown
+   * release before the halt re-trips, in R (positive magnitude). At release the
+   * breaker records the cumulative-R and daily-P&L water lines; a re-trip
+   * requires the original trip condition AND a drop of this much R (or its
+   * drawdown-dollar equivalent, `dailyDrawdownPct × sleeveEquity`) below those
+   * lines. Without this step the original predicate (`cumulativeR ≤ −maxR`)
+   * still holds at the moment of release and the very next close would re-latch,
+   * making the release a no-op.
+   */
+  reArmStepR: number;
 }
 
 /**
@@ -99,6 +121,13 @@ export const DEFAULT_OPTIONS_BREAKER_PARAMS: OptionsBreakerParams = {
   throttleCumulativeLossR: 1,
   throttleDrawdownPct: 0.025,
   throttleMultiplier: 0.5,
+  // TRA-3218 — cooldown re-arm ships DISABLED (0 ⇒ day-latched halt, the legacy
+  // behaviour) for the same reason the TRA-3086 band shipped dark: the release
+  // window and re-arm step are risk numbers the board signs off on, not values a
+  // build picks unilaterally. `reArmStepR: 1` is a PROVISIONAL placeholder that
+  // is inert while the cooldown is 0.
+  haltCooldownMinutes: 0,
+  reArmStepR: 1,
 };
 
 /** TRA-3086 — the resolved throttle band, with each leg's usability made explicit. */
@@ -186,6 +215,23 @@ export interface OptionsBreakerSnapshot {
   closes: number;
   /** ET day-key the tallies belong to. */
   day: string;
+  /** TRA-3218 — ms epoch of the latest halt latch this day (null when never latched). */
+  haltAt: number | null;
+  /** TRA-3218 — halt latches booked this day (a released-then-re-tripped day counts 2). */
+  haltsToday: number;
+  /** TRA-3218 — cooldown releases granted this day (0 while the cooldown is disabled). */
+  releasesToday: number;
+  /** TRA-3218 — the cooldown re-arm stage's configuration + live floors. */
+  cooldown: {
+    /** Minutes a latch holds before releasing; 0 ⇒ disabled (day-latched, legacy). */
+    minutes: number;
+    /** Extra R of deterioration a re-trip requires after a release. */
+    reArmStepR: number;
+    /** cumulative-R water line a re-trip must breach (null until a release). */
+    reTripFloorR: number | null;
+    /** daily-P&L water line ($) a drawdown re-trip must breach (null until a release). */
+    reTripFloorPnl: number | null;
+  };
   /** TRA-3086 — the sub-halt THROTTLE stage. */
   throttle: {
     /** What {@link OptionsRiskBreaker.riskThrottle} returns right now, in (0, 1]. */
@@ -209,6 +255,28 @@ export interface OptionsBreakerSnapshot {
   };
 }
 
+/**
+ * TRA-3218 — the breaker's full daily state, as persisted by the server's
+ * options-breaker ledger and re-applied at boot via
+ * {@link OptionsRiskBreaker.restoreState}. Everything here is DAY-SCOPED: the
+ * `day` key is what stops yesterday's latch resurrecting across the ET roll.
+ */
+export interface OptionsBreakerPersistedState {
+  /** ET day-key the state belongs to (same semantics as the injected `dayKey`). */
+  day: string;
+  cumulativeR: number;
+  dailyPnl: number;
+  closes: number;
+  sleeveEquityBaseline: number | null;
+  halted: boolean;
+  haltReason: string | null;
+  haltAt: number | null;
+  haltsToday: number;
+  releasesToday: number;
+  reTripFloorR: number | null;
+  reTripFloorPnl: number | null;
+}
+
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
@@ -225,6 +293,21 @@ export class OptionsRiskBreaker {
   private currentDay: string;
   private halted = false;
   private haltReason: string | null = null;
+  /** TRA-3218 — ms epoch of the latest latch (null when never latched today). */
+  private haltAt: number | null = null;
+  /** TRA-3218 — per-day latch / release tallies for the health readout. */
+  private haltsToday = 0;
+  private releasesToday = 0;
+  /**
+   * TRA-3218 — re-trip water lines, cut at the moment of a cooldown RELEASE from
+   * the then-current tallies minus one `reArmStepR` step. Null until a release
+   * happens (the first trip of the day uses the plain thresholds). They exist
+   * because the plain predicates (`cumulativeR ≤ −maxR`) still hold at release —
+   * without a floor strictly below the release-time state, the next close would
+   * re-latch instantly and the release would be a no-op.
+   */
+  private reTripFloorR: number | null = null;
+  private reTripFloorPnl: number | null = null;
   private haltListener: ((reason: string) => void) | null = null;
   /**
    * TRA-3086 — the sleeve-equity denominator from the most recent `recordClose`.
@@ -266,9 +349,45 @@ export class OptionsRiskBreaker {
       this.closes = 0;
       this.halted = false;
       this.haltReason = null;
+      // TRA-3218 — latch time, tallies, and re-trip floors are DAILY state like
+      // everything else here; the ET day roll clears them in lockstep.
+      this.haltAt = null;
+      this.haltsToday = 0;
+      this.releasesToday = 0;
+      this.reTripFloorR = null;
+      this.reTripFloorPnl = null;
       this.sleeveEquityBaseline = null;
       this.currentDay = today;
     }
+  }
+
+  /**
+   * TRA-3218 — the cooldown re-arm. When enabled (`haltCooldownMinutes > 0`) and
+   * the latch is older than the window, RELEASE the halt and cut the re-trip
+   * water lines one `reArmStepR` step below the CURRENT tallies (which include
+   * any further bleed booked by exits during the cooldown — a sleeve that kept
+   * deteriorating needs that much more room before it trips again).
+   *
+   * Deliberately evaluated lazily from the read sites (`isHalted` / `recordClose`
+   * / `snapshot`) rather than on a timer, mirroring how `resetIfNewDay` rolls:
+   * no clock callback to leak, and a restored (post-reboot) latch releases on the
+   * same schedule it would have in-process because `haltAt` is persisted with it.
+   */
+  private maybeReleaseHalt(): void {
+    const mins = this.params.haltCooldownMinutes;
+    if (!this.halted || !(mins > 0) || this.haltAt === null) return;
+    if (this.now().getTime() - this.haltAt < mins * 60_000) return;
+    const stepR = Math.abs(this.params.reArmStepR) || 1;
+    // The drawdown leg's dollar step: one reArmStepR-scaled drawdown-limit's
+    // worth of the retained sleeve equity. With no baseline retained (cannot
+    // happen after a close; defensive) fall back to 0 ⇒ any further loss re-trips.
+    const equity = this.sleeveEquityBaseline ?? 0;
+    const stepPnl = stepR * this.params.dailyDrawdownPct * equity;
+    this.halted = false;
+    this.haltReason = null;
+    this.releasesToday += 1;
+    this.reTripFloorR = this.cumulativeR - stepR;
+    this.reTripFloorPnl = this.dailyPnl - stepPnl;
   }
 
   /**
@@ -279,6 +398,10 @@ export class OptionsRiskBreaker {
    */
   recordClose(rec: OptionCloseRecord, sleeveEquity: number): void {
     this.resetIfNewDay();
+    // TRA-3218 — settle an expired cooldown BEFORE booking, so a close landing
+    // after the window books against a released sleeve and the re-trip floors
+    // (not the raw thresholds) decide whether it re-latches.
+    this.maybeReleaseHalt();
     const pnl = Number.isFinite(rec.pnl) ? rec.pnl : 0;
     this.dailyPnl += pnl;
     this.closes += 1;
@@ -291,16 +414,24 @@ export class OptionsRiskBreaker {
 
     const wasHalted = this.halted;
     const lossR = Math.abs(this.params.maxCumulativeLossR);
-    if (!this.halted && this.cumulativeR <= -lossR) {
+    // TRA-3218 — after a cooldown release the plain threshold still holds, so a
+    // re-trip additionally requires breaching the release-time water line.
+    const rFloorOk = this.reTripFloorR === null || this.cumulativeR <= this.reTripFloorR;
+    if (!this.halted && this.cumulativeR <= -lossR && rFloorOk) {
       this.halted = true;
+      this.haltAt = this.now().getTime();
+      this.haltsToday += 1;
       this.haltReason =
         `Options sleeve cumulative ${this.cumulativeR.toFixed(2)}R ≤ −${lossR}R ` +
         `— sleeve halted for the day`;
     }
 
     const ddPct = sleeveEquity > 0 ? Math.abs(this.dailyPnl) / sleeveEquity : 0;
-    if (!this.halted && this.dailyPnl < 0 && ddPct >= this.params.dailyDrawdownPct) {
+    const pnlFloorOk = this.reTripFloorPnl === null || this.dailyPnl <= this.reTripFloorPnl;
+    if (!this.halted && this.dailyPnl < 0 && ddPct >= this.params.dailyDrawdownPct && pnlFloorOk) {
       this.halted = true;
+      this.haltAt = this.now().getTime();
+      this.haltsToday += 1;
       this.haltReason =
         `Options sleeve daily drawdown −${(ddPct * 100).toFixed(1)}% exceeded ` +
         `${this.params.dailyDrawdownPct * 100}% limit — sleeve halted for the day`;
@@ -318,6 +449,7 @@ export class OptionsRiskBreaker {
   /** True when the options sleeve is halted for the current ET day. */
   isHalted(): boolean {
     this.resetIfNewDay();
+    this.maybeReleaseHalt(); // TRA-3218 — an expired cooldown releases at the read
     return this.halted;
   }
 
@@ -381,6 +513,7 @@ export class OptionsRiskBreaker {
   /** Diagnostics for the `/api/health/options-pipeline` readout. */
   snapshot(): OptionsBreakerSnapshot {
     this.resetIfNewDay();
+    this.maybeReleaseHalt(); // TRA-3218 — never report a latch the read sites would release
     const throttle = this.evaluateThrottle();
     return {
       halted: this.halted,
@@ -389,6 +522,15 @@ export class OptionsRiskBreaker {
       dailyPnl: round2(this.dailyPnl),
       closes: this.closes,
       day: this.currentDay,
+      haltAt: this.haltAt,
+      haltsToday: this.haltsToday,
+      releasesToday: this.releasesToday,
+      cooldown: {
+        minutes: this.params.haltCooldownMinutes,
+        reArmStepR: this.params.reArmStepR,
+        reTripFloorR: this.reTripFloorR === null ? null : round2(this.reTripFloorR),
+        reTripFloorPnl: this.reTripFloorPnl === null ? null : round2(this.reTripFloorPnl),
+      },
       // TRA-3086 — the sub-halt stage, with its band, so a reader can tell a calm
       // sleeve from an unreachable band without re-deriving either.
       throttle: {
@@ -398,6 +540,75 @@ export class OptionsRiskBreaker {
         sleeveEquity: this.sleeveEquityBaseline,
       },
     };
+  }
+
+  /**
+   * TRA-3218 — the durable-restart seam, in BOTH directions.
+   *
+   * `exportState()` is the full daily state a caller persists after each close /
+   * latch; `restoreState()` re-applies it at boot. Together they close the hole
+   * the ticket names: the breaker is in-memory, and bqb1 reboots nightly (plus
+   * mid-session on deploys/crashes) — without this seam a reboot silently CLEARS
+   * a latched halt (the accidental halt-clearing mechanism), and equally
+   * silently ZEROES the tallies so a bleeding sleeve reboots as a calm one and
+   * cannot re-trip. Restoring `haltAt` with the latch means a cooldown release
+   * happens on the same schedule it would have in-process — a reboot neither
+   * shortens nor restarts the window.
+   *
+   * `restoreState` applies ONLY when (a) the persisted day equals the current ET
+   * day (yesterday's halt must never resurrect — the day roll is the one
+   * legitimate clearing mechanism), and (b) this breaker is still pristine
+   * (no closes booked, no halt): it is a BOOT seam, not a merge — once live
+   * closes have booked, the in-memory state is the truth and a late restore
+   * would clobber it. Returns whether it applied.
+   */
+  exportState(): OptionsBreakerPersistedState {
+    this.resetIfNewDay();
+    return {
+      day: this.currentDay,
+      cumulativeR: this.cumulativeR,
+      dailyPnl: this.dailyPnl,
+      closes: this.closes,
+      sleeveEquityBaseline: this.sleeveEquityBaseline,
+      halted: this.halted,
+      haltReason: this.haltReason,
+      haltAt: this.haltAt,
+      haltsToday: this.haltsToday,
+      releasesToday: this.releasesToday,
+      reTripFloorR: this.reTripFloorR,
+      reTripFloorPnl: this.reTripFloorPnl,
+    };
+  }
+
+  restoreState(state: OptionsBreakerPersistedState): boolean {
+    this.resetIfNewDay();
+    if (state.day !== this.currentDay) return false; // stale day — the roll wins
+    if (this.closes > 0 || this.halted) return false; // live state wins over a late restore
+    this.cumulativeR = Number.isFinite(state.cumulativeR) ? state.cumulativeR : 0;
+    this.dailyPnl = Number.isFinite(state.dailyPnl) ? state.dailyPnl : 0;
+    this.closes = Number.isFinite(state.closes) && state.closes > 0 ? Math.floor(state.closes) : 0;
+    this.sleeveEquityBaseline =
+      typeof state.sleeveEquityBaseline === 'number' && state.sleeveEquityBaseline > 0
+        ? state.sleeveEquityBaseline
+        : null;
+    this.halted = state.halted === true;
+    this.haltReason = typeof state.haltReason === 'string' ? state.haltReason : null;
+    this.haltAt = typeof state.haltAt === 'number' && Number.isFinite(state.haltAt) ? state.haltAt : null;
+    this.haltsToday =
+      Number.isFinite(state.haltsToday) && state.haltsToday > 0 ? Math.floor(state.haltsToday) : 0;
+    this.releasesToday =
+      Number.isFinite(state.releasesToday) && state.releasesToday > 0
+        ? Math.floor(state.releasesToday)
+        : 0;
+    this.reTripFloorR =
+      typeof state.reTripFloorR === 'number' && Number.isFinite(state.reTripFloorR)
+        ? state.reTripFloorR
+        : null;
+    this.reTripFloorPnl =
+      typeof state.reTripFloorPnl === 'number' && Number.isFinite(state.reTripFloorPnl)
+        ? state.reTripFloorPnl
+        : null;
+    return true;
   }
 
   /**
@@ -411,6 +622,13 @@ export class OptionsRiskBreaker {
     this.closes = 0;
     this.halted = false;
     this.haltReason = null;
+    // TRA-3218 — an operator reset clears the latch history and re-trip floors
+    // too: "reset means reset", exactly as the baseline note below says.
+    this.haltAt = null;
+    this.haltsToday = 0;
+    this.releasesToday = 0;
+    this.reTripFloorR = null;
+    this.reTripFloorPnl = null;
     // TRA-3086 — clear the throttle's denominator too. Leaving it set would let a
     // reset sleeve carry a stale baseline; with the tallies at 0 that changes no
     // decision today, but "reset means reset" is the invariant worth keeping.

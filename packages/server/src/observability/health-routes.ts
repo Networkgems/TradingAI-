@@ -156,7 +156,8 @@ import {
 } from '../session-edge-blackout-flag.js'; // TRA-2049
 // TRA-1001 — since-boot counters for the risk-throttle sizing consumer.
 import { snapshotRiskThrottleSizing } from '../risk-throttle-sizing.js';
-import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT } from '../exit-risk-rules-flag.js';
+import { isCorrelatedExposureCapEnabled, CORRELATED_EXPOSURE_CAP_FLAG, isTakeProfitEarlyEnabled, TAKE_PROFIT_EARLY_FLAG, isEntryGreeksGateEnabled, ENTRY_GREEKS_GATE_FLAG, isEntryDeltaCeilingEnabled, resolveEntryDeltaCeiling, resolveEntryDeltaCeilingStructures, resolveEntryDeltaCeilingMap, resolveEntryDeltaCeilingObserveStructures, OPTION_ENTRY_DELTA_CEILING_FLAG, isExitRiskRulesEnabled, EXIT_RISK_RULES_FLAG, isBookGiveBackArmFloorEnabled, BOOK_GIVEBACK_ARM_FLOOR_FLAG, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_FLAG, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, isTakeProfitEarlyLiveEnabled, TAKE_PROFIT_EARLY_LIVE_FLAG, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_VALUE, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionsHaltScope, OPTIONS_HALT_SCOPE_VAR, type OptionsHaltScopeResolution } from '../exit-risk-rules-flag.js';
+import { summarizeOptionsBreakerLedger } from '../options-breaker-ledger.js'; // TRA-3218
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import { CONVICTION_DCA, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, TAKE_PROFIT_EARLY_CAPTURE_PCT, ENTRY_SHORT_DELTA_MIN, ENTRY_SHORT_DELTA_MAX, ENTRY_DELTA_THETA_RATIO_FLOOR, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, EQUITY_SWING_UNIVERSE, EQUITY_SWING_GUARDRAIL } from '@trading-app/shared';
 import { resolveDemoFlagEnv, DEMO_FLAG_ALLOWLIST } from '../demo-flags.js';
@@ -338,8 +339,57 @@ export interface LiveHealthDeps {
     rvBreakerOpen: boolean;
     engines: Array<{ state: EngineState; mode: string }>;
   };
+  /**
+   * TRA-3218 (parent TRA-2760) — inputs for the UNAUTHENTICATED
+   * `GET /api/health/options-halt` probe: each engine's
+   * `getOptionsHaltState()` snapshot. Exists because a halted day and a quiet
+   * day were pixel-identical from outside — the book session-stop latch, its
+   * time, the sleeve breaker's state, and the halt SCOPE the option entry
+   * gates consult were all readable only from source + env. Booleans / counts /
+   * timestamps / book-level P&L marks only — no symbols, order ids, or PII.
+   * Enumerates the WHOLE fleet (every engine, both modes), which is what makes
+   * "what does a second live book inherit" measurable rather than inferred.
+   * Only mounted when provided.
+   */
+  optionsHalt?: () => Array<OptionsHaltEngineState>;
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
+}
+
+/** TRA-3218 — one engine's options-halt readout (see `SignalEngine.getOptionsHaltState`). */
+export interface OptionsHaltEngineState {
+  engineId: string;
+  mode: 'demo' | 'live';
+  scope: OptionsHaltScopeResolution;
+  exitRiskRulesEnabled: boolean;
+  optionExecEnabled: boolean;
+  entriesHalted: boolean;
+  book: {
+    halted: boolean;
+    reason: string | null;
+    reasonCode: 'giveback_cap' | 'session_net_negative' | null;
+    haltAt: number | null;
+    peakOpenGain: number;
+    retainedFloor: number;
+  };
+  sleeve: {
+    halted: boolean;
+    reason: string | null;
+    cumulativeR: number;
+    dailyPnl: number;
+    closes: number;
+    day: string;
+    haltAt: number | null;
+    haltsToday: number;
+    releasesToday: number;
+    cooldown: {
+      minutes: number;
+      reArmStepR: number;
+      reTripFloorR: number | null;
+      reTripFloorPnl: number | null;
+    };
+  };
+  bookHaltGate: { day: string; blocked: number; bypassed: number };
 }
 
 /** Shape returned by `GET /api/health/live-equity` — fully redacted. */
@@ -3038,6 +3088,44 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   if (optionsPipeline) {
     app.get('/api/health/options-pipeline', (_req, res) => {
       res.json(summarizeOptionsPipeline(optionsPipeline(), now()));
+    });
+  }
+
+  // TRA-3218 (parent TRA-2760) — unauthenticated, secrets-free options-halt
+  // probe. The book session-stop halt ran for a week unobserved because a halted
+  // day and a quiet day read identically from outside; this names, per engine:
+  // the halt SCOPE its option entry gates consult (book = legacy coupling to the
+  // equity governor, sleeve = the TRA-3218 decoupling), what each halt authority
+  // currently says (with latch TIMES + the peak/retained floor), the headline
+  // `entriesHalted` bit, the per-day count of scans the book halt blocked or —
+  // under sleeve scope — would have blocked (the counterfactual the board reads
+  // BEFORE flipping), and the durable ledger's halted-session count. The
+  // per-engine enumeration is the fleet answer: the scope/rules flags are
+  // PER-PROCESS (`processScope` / `exitRiskRulesFlagLive`), the governors and
+  // breakers are PER-ENGINE, so a second live book shares the flags and gets its
+  // own latches — visible here per row rather than inferred from source.
+  const optionsHalt = deps.optionsHalt;
+  if (optionsHalt) {
+    app.get('/api/health/options-halt', (_req, res) => {
+      const engines = optionsHalt();
+      const nowMs = now();
+      res.json({
+        ok: true,
+        time: new Date(nowMs).toISOString(),
+        build: resolveBuildInfo(),
+        etDay: etDateString(new Date(nowMs)),
+        /** The scope var + its PROCESS-env resolution (what any LIVE book reads). */
+        scopeVar: OPTIONS_HALT_SCOPE_VAR,
+        processScope: resolveOptionsHaltScope(process.env),
+        exitRiskRulesFlag: EXIT_RISK_RULES_FLAG,
+        exitRiskRulesFlagLive: isExitRiskRulesEnabled(process.env),
+        engineCount: engines.length,
+        liveEngineCount: engines.filter((e) => e.mode === 'live').length,
+        entriesHaltedCount: engines.filter((e) => e.entriesHalted).length,
+        engines,
+        /** Durable per-session sleeve-breaker record — read `durability.ephemeral` FIRST. */
+        ledger: summarizeOptionsBreakerLedger(),
+      });
     });
   }
 

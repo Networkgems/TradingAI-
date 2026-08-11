@@ -1410,6 +1410,94 @@ describe('TRA-895 options-pipeline probe', () => {
   });
 });
 
+// ─── TRA-3218 (parent TRA-2760) — /api/health/options-halt ────────────────────
+//
+// The probe that makes a halted day distinguishable from a quiet day. One mount
+// test + one fold test; the underlying states are pinned in the engine/breaker
+// suites, so this only asserts the route surfaces them and the fleet counts.
+describe('GET /api/health/options-halt (TRA-3218)', () => {
+  const engineState = (over: Record<string, unknown> = {}) => ({
+    engineId: 'engine-1',
+    mode: 'live' as const,
+    scope: { scope: 'book' as const, source: 'default' as const },
+    exitRiskRulesEnabled: true,
+    optionExecEnabled: true,
+    entriesHalted: true,
+    book: {
+      halted: true,
+      reason: 'Book session stop — net-negative after being up ≥ 0.50% of book equity; no new entries for the day',
+      reasonCode: 'session_net_negative' as const,
+      haltAt: NOW - 60 * 60 * 1000,
+      peakOpenGain: 2.34,
+      retainedFloor: 1.4,
+    },
+    sleeve: {
+      halted: false,
+      reason: null,
+      cumulativeR: -0.83,
+      dailyPnl: -79,
+      closes: 1,
+      day: '2026-08-11',
+      haltAt: null,
+      haltsToday: 0,
+      releasesToday: 0,
+      cooldown: { minutes: 0, reArmStepR: 1, reTripFloorR: null, reTripFloorPnl: null },
+    },
+    bookHaltGate: { day: '2026-08-11', blocked: 7, bypassed: 0 },
+    ...over,
+  });
+
+  it('mounts unauthenticated when wired and reports the fleet + per-engine halt state', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', pipeState()),
+      getSettings: () => settings(),
+      optionsHalt: () => [
+        engineState(),
+        engineState({ engineId: 'engine-2', mode: 'demo', entriesHalted: false }),
+      ],
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/options-halt')!;
+    expect(handlers).toHaveLength(1); // unauthenticated — handler only, no gate
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    const body = res.body as {
+      ok: boolean;
+      engineCount: number;
+      liveEngineCount: number;
+      entriesHaltedCount: number;
+      processScope: { scope: string };
+      engines: Array<{ book: { haltAt: number | null }; bookHaltGate: { blocked: number } }>;
+      ledger: { durability: { ephemeral: boolean } };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.engineCount).toBe(2);
+    expect(body.liveEngineCount).toBe(1);
+    expect(body.entriesHaltedCount).toBe(1);
+    // The board's complaint, now countable from outside: the latch TIME and the
+    // number of scans the book-wide halt swallowed.
+    expect(body.engines[0]!.book.haltAt).toBe(NOW - 60 * 60 * 1000);
+    expect(body.engines[0]!.bookHaltGate.blocked).toBe(7);
+    // The scope var's process resolution rides along (unset here ⇒ book/default).
+    expect(body.processScope.scope).toBe('book');
+    // The durable ledger block is present so a reader can check ephemeral FIRST.
+    expect(typeof body.ledger.durability.ephemeral).toBe('boolean');
+  });
+
+  it('is not mounted when the dep is absent (surface stays unchanged)', () => {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+      userCtx: async () => ctx('admin', pipeState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    expect(routes.get('/api/health/options-halt')).toBeUndefined();
+  });
+});
+
 describe('TRA-998 hypothesis ratification routes', () => {
   const tmpFile = join(tmpdir(), `health-ratify-${process.pid}.jsonl`);
 

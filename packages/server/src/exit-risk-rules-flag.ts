@@ -462,6 +462,55 @@ export function isTakeProfitEarlyLiveEnabled(env: NodeJS.ProcessEnv = process.en
   return flagOn(env[TAKE_PROFIT_EARLY_LIVE_FLAG]);
 }
 
+// TRA-3218 (parent TRA-2760) — the SCOPE of the book session-stop / give-back
+// halt as seen by the OPTIONS entry gates.
+//
+// The board's finding: `DailyRiskGovernor.sessionHalted` is BOOK-WIDE, and the
+// session-stop arm (+0.5R of book equity = +0.5% ≈ $2.30 on the $468 live
+// sleeve) is inside the noise at that size — so one red option trade after a
+// trivial green tick latched a whole-day entries halt for the options sleeve,
+// and did so through the EQUITY book's governor, which the options sleeve was
+// deliberately decoupled from everywhere else (TRA-1023, TRA-3086).
+//
+// `OPTIONS_HALT_SCOPE=sleeve` completes that decoupling at the HALT decision:
+// the option scans (`runOtmScan` / `runRelativeValueScan`) then consult ONLY the
+// options-sleeve breaker (its −2R / −5% daily-drawdown trips, TRA-1023, plus the
+// TRA-3218 cooldown re-arm) and no longer end the sleeve's day off the equity
+// book's session stop. Any other value — including unset, and including a typo —
+// resolves to `book`, the legacy coupled behaviour, so this ships DARK and the
+// flip is a deliberate board decision alongside the TRA-3218 arm re-scale
+// sign-off. The gates COUNT what the book halt did/would have done either way,
+// so `/api/health/options-halt` can show the counterfactual before the flip.
+export const OPTIONS_HALT_SCOPE_VAR = 'OPTIONS_HALT_SCOPE';
+
+export type OptionsHaltScope = 'book' | 'sleeve';
+
+/** Where the resolved scope came from — `env_invalid` makes a typo loud (TRA-3216 pattern). */
+export interface OptionsHaltScopeResolution {
+  scope: OptionsHaltScope;
+  source: 'default' | 'env' | 'env_invalid';
+}
+
+/**
+ * Resolve the options-halt scope. Only the exact token `sleeve` (case/space
+ * insensitive) decouples; `book` is explicit-legacy; anything else is
+ * `env_invalid` and FAILS CLOSED to `book` — a typo must never silently widen
+ * the entries a halted book can open.
+ */
+export function resolveOptionsHaltScope(env: NodeJS.ProcessEnv = process.env): OptionsHaltScopeResolution {
+  const raw = env[OPTIONS_HALT_SCOPE_VAR];
+  if (typeof raw !== 'string' || raw.trim() === '') return { scope: 'book', source: 'default' };
+  const token = raw.trim().toLowerCase();
+  if (token === 'sleeve') return { scope: 'sleeve', source: 'env' };
+  if (token === 'book') return { scope: 'book', source: 'env' };
+  return { scope: 'book', source: 'env_invalid' };
+}
+
+/** True iff the option entry gates consult ONLY the sleeve breaker (TRA-3218). */
+export function isOptionsSleeveHaltScope(env: NodeJS.ProcessEnv = process.env): boolean {
+  return resolveOptionsHaltScope(env).scope === 'sleeve';
+}
+
 // TRA-2949 — trading-day time stop for swing-held option rows (parent
 // TRA-2946). Swing-held rows (live under the PDT hold; demo under
 // `swingHoldOptions`) release from the hold with the 5-bar time stop trivially
