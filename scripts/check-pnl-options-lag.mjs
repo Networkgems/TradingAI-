@@ -291,10 +291,13 @@ export const AC2_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
  * the durable counter nor any EOD row recorded; it deployed 2026-08-05, so
  * 2026-08-05 is the first session whose EOD row it can have written.
  *
- * This is also the DEFAULT `--since`: the 08-04 lag row is dated after
- * 2026-07-30, so the old boundary would report FAIL on the already-diagnosed
- * row every night forever and bury a real 08-05+ regression under it. The
- * pre-re-fix question stays askable with an explicit `--since=2026-07-30`.
+ * This WAS the default `--since` until 2026-08-11. The 08-05 session FAILED
+ * its frozen arm — root-caused on TRA-3039 as the day-roll anchor overwrite,
+ * NOT a credit regression — so this boundary now reports that diagnosed FAIL
+ * forever, exactly like the 07-30 one before it. The default moved to
+ * {@link TRA2847_ANCHOR_ERA_PIN_DATE} for the same reason it moved here:
+ * a boundary that re-reports a diagnosed failure every night buries the next
+ * regression. `--since=2026-08-05` keeps asking the historical question.
  */
 export const TRA2847_REFIX_DEPLOY_DATE = '2026-08-05';
 
@@ -324,6 +327,81 @@ export const TRA2847_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
 ]);
 
 /**
+ * TRA-2847 / TRA-3039 — THE ANCHOR-ERA COHORT, pinned before the first
+ * observation of the first fully-gradeable consecutive session pair under the
+ * anchor fix `7c373dc` (TRA-3039: `advanceDayIfNeeded` overwrote a correct
+ * opening-equity anchor with the trade-path equity cache on every boot into a
+ * new ET day; live 2026-08-06T04:33Z inside build 1773877).
+ *
+ * Why the pair is [2026-08-11, 2026-08-12] and not anything earlier (TRA-3267,
+ * the UTC `isMarketDay` bug in the 21:00 ET archive, fixed d4246e0):
+ *  - 2026-08-06 graded clean on BOTH arms (0 lag, 0 anchor breaks, 61/62
+ *    `verified-prior-session-close`, 1 legitimate rebase), but its successor
+ *    session 2026-08-07 was never written — Friday's EOD write read "Saturday"
+ *    in UTC and skipped fleet-wide, and EOD rows do not self-heal — so 08-06
+ *    can never anchor a consecutive pair.
+ *  - 2026-08-10 graded 0 lag / 0 anchor breaks (the anchor telescoped exactly
+ *    through the phantom row, 63/63), but its array-adjacent prior row is the
+ *    phantom Sunday 2026-08-09, so its frozen arm is permanently
+ *    gap-suppressed. `null` is NOT clean (TRA-2926: fenced, not deleted).
+ *
+ *   source: GET https://tradingai-bqb1.onrender.com/api/health/pnl-reconciliation?rows=all
+ *   pulled: 2026-08-11T23:02Z — after the 2026-08-11T01:00Z write made the
+ *           2026-08-10 rows immutable, before any 2026-08-11 row exists
+ *           (written ~2026-08-12T01:00Z).
+ *
+ * Every book below carries a non-zero `optionsDaily` on 2026-08-10, so each
+ * names one exact `stockDaily` the 08-11 row can refute. The index case
+ * `ctoverify_tra2333` (od 8.06) is IN the cohort. The live book (admin) has
+ * od 0.00 on 08-10 — genuinely not lag-eligible for this pair. Eligibility
+ * cannot be manufactured, so the live arm is NOT pinned here and a pass over
+ * this cohort says NOTHING about mode:live (NOT MEASURED, not green).
+ */
+export const TRA2847_ANCHOR_ERA_PIN_DATE = '2026-08-11';
+export const TRA2847_ANCHOR_ERA_GRADEABLE_BOOKS = Object.freeze([
+  { username: 'ceo2251v130001', mode: 'demo', priorOptionsDaily: -77.5 },
+  { username: 'ctoverify_2225_1784856407', mode: 'demo', priorOptionsDaily: 72 },
+  { username: 'ctoverify_2225b_1784856491', mode: 'demo', priorOptionsDaily: 43.5 },
+  { username: 'ctoverify_qa_tra2406b', mode: 'demo', priorOptionsDaily: -17.5 },
+  { username: 'ctoverify_qt2331b', mode: 'demo', priorOptionsDaily: -59.5 },
+  { username: 'ctoverify_tra2211', mode: 'demo', priorOptionsDaily: -3.5 },
+  { username: 'ctoverify_tra2227', mode: 'demo', priorOptionsDaily: 42 },
+  { username: 'ctoverify_tra2284', mode: 'demo', priorOptionsDaily: -112.94 },
+  { username: 'ctoverify_tra2329', mode: 'demo', priorOptionsDaily: -19.98 },
+  { username: 'ctoverify_tra2331b', mode: 'demo', priorOptionsDaily: -149.22 },
+  { username: 'ctoverify_tra2333', mode: 'demo', priorOptionsDaily: 8.06 },
+  { username: 'ctoverify_tra2341', mode: 'demo', priorOptionsDaily: -19 },
+  { username: 'ctoverify_tra2356v', mode: 'demo', priorOptionsDaily: -48 },
+  { username: 'ctoverify_tra2388', mode: 'demo', priorOptionsDaily: -162 },
+  { username: 'ctoverify_tra2388s', mode: 'demo', priorOptionsDaily: -27 },
+  { username: 'ctoverify_tra2388w', mode: 'demo', priorOptionsDaily: -22.5 },
+  { username: 'ctoverify_tra2388w195221', mode: 'demo', priorOptionsDaily: -5 },
+  { username: 'ctoverify_tra2388w195302', mode: 'demo', priorOptionsDaily: 21.18 },
+  { username: 'ctoverify_tra2416', mode: 'demo', priorOptionsDaily: 22.5 },
+  { username: 'ctoverify_tra2439a', mode: 'demo', priorOptionsDaily: -22.5 },
+  { username: 'enock', mode: 'demo', priorOptionsDaily: -12 },
+  { username: 'qa2716t0730a', mode: 'demo', priorOptionsDaily: -36.83 },
+  { username: 'qa3120t0806a', mode: 'demo', priorOptionsDaily: 80 },
+  { username: 'qa_mirror_1578_38096', mode: 'demo', priorOptionsDaily: -79 },
+  { username: 'qa_reg_0710202220', mode: 'demo', priorOptionsDaily: -40 },
+  { username: 'qa_tra1475_1783821169', mode: 'demo', priorOptionsDaily: -134.35 },
+  { username: 'qa_tra2407_ms5ajurt', mode: 'demo', priorOptionsDaily: -24.29 },
+  { username: 'qa_tra2407_ms6342f6', mode: 'demo', priorOptionsDaily: 35.75 },
+  { username: 'qa_tra2407_ms6395jy', mode: 'demo', priorOptionsDaily: -5 },
+  { username: 'qa_tra2490_ex_1785285303', mode: 'demo', priorOptionsDaily: 7.5 },
+  { username: 'qa_tra2490_neg_1785285303', mode: 'demo', priorOptionsDaily: -138 },
+  { username: 'qa_tra2491_ex_1785285868', mode: 'demo', priorOptionsDaily: 13.5 },
+  { username: 'qa_tra2492_ctl_1785285374', mode: 'demo', priorOptionsDaily: -3 },
+  { username: 'qa_tra2492_del_1785285374', mode: 'demo', priorOptionsDaily: -171.4 },
+  { username: 'qa_tra2492_inv_1785285374', mode: 'demo', priorOptionsDaily: 45 },
+  { username: 'qa_tra2511_114524', mode: 'demo', priorOptionsDaily: 42.5 },
+  { username: 'qtprobe3', mode: 'demo', priorOptionsDaily: -565.98 },
+  { username: 'qtverify_1785048357', mode: 'demo', priorOptionsDaily: 44.32 },
+  { username: 'qtverify_1785371190', mode: 'demo', priorOptionsDaily: -53.76 },
+  { username: 'qtverify_tra2331_0729a', mode: 'demo', priorOptionsDaily: 12.5 },
+]);
+
+/**
  * Every pinned cohort, keyed by the ONE `--since` it grades, each carrying the
  * immutable prior-session rows that fixed its eligibility. A `--since` outside
  * this table compares nothing (NOT_APPLICABLE) — a pin that quietly kept
@@ -332,6 +410,7 @@ export const TRA2847_EXPECTED_GRADEABLE_BOOKS = Object.freeze([
 const PINNED_COHORTS_BY_SINCE = Object.freeze({
   [AC2_FIX_DEPLOY_DATE]: { priorRowsDate: '2026-07-29', books: AC2_EXPECTED_GRADEABLE_BOOKS },
   [TRA2847_REFIX_DEPLOY_DATE]: { priorRowsDate: '2026-08-04', books: TRA2847_EXPECTED_GRADEABLE_BOOKS },
+  [TRA2847_ANCHOR_ERA_PIN_DATE]: { priorRowsDate: '2026-08-10', books: TRA2847_ANCHOR_ERA_GRADEABLE_BOOKS },
 });
 
 /**
@@ -569,8 +648,18 @@ export const AC2_WRITER_FIX_COMMIT = 'ec05639';
  */
 export const TRA2847_WRITER_REFIX_COMMIT = '6cb3cc0';
 
+/**
+ * TRA-3039 — the ANCHOR-fix commit whose presence in the writer a post-08-11
+ * PASS claims. `6cb3cc0` is a proper ancestor of `7c373dc` (which subsumes
+ * `ec05639` transitively), so attesting the anchor fix subsumes both earlier
+ * claims; the historical boundaries keep attesting exactly what their own
+ * PASS ever claimed.
+ */
+export const TRA3039_WRITER_ANCHOR_FIX_COMMIT = '7c373dc';
+
 /** The commit a given `--since` boundary's writer attestation must carry. */
 export function writerFixCommitForSince(since) {
+  if (String(since) >= TRA2847_ANCHOR_ERA_PIN_DATE) return TRA3039_WRITER_ANCHOR_FIX_COMMIT;
   return String(since) >= TRA2847_REFIX_DEPLOY_DATE
     ? TRA2847_WRITER_REFIX_COMMIT
     : AC2_WRITER_FIX_COMMIT;
@@ -847,7 +936,7 @@ export function gradePayload(payload, opts = {}) {
     // TRA-2847 — the default boundary is the RE-fix deploy date: the 08-04 lag
     // row is dated after 2026-07-30, so the old default would FAIL forever on
     // the already-diagnosed row and bury a fresh regression under it.
-    ac2: gradeAc2Delta(engines, opts.since ?? TRA2847_REFIX_DEPLOY_DATE),
+    ac2: gradeAc2Delta(engines, opts.since ?? TRA2847_ANCHOR_ERA_PIN_DATE),
     engineCount: engines.length,
     liveBookCount,
     liveGradeableBookCount,
@@ -1515,7 +1604,7 @@ async function main(argv) {
   // lag row, so defaulting to it would FAIL every future read on old news.
   // `--since=2026-07-30` still asks the historical TRA-2630 AC2 question.
   const sinceArg = argv.find((a) => a.startsWith('--since='));
-  const since = sinceArg ? sinceArg.slice('--since='.length) : TRA2847_REFIX_DEPLOY_DATE;
+  const since = sinceArg ? sinceArg.slice('--since='.length) : TRA2847_ANCHOR_ERA_PIN_DATE;
   const g = gradePayload(payload, { since });
   if (g.verdict === 'BLIND') {
     console.error(`BLIND — ${g.reason}. Exiting 3; this is NOT a pass.`);
@@ -3230,17 +3319,42 @@ function selftest() {
     { verdict: 'SHRANK', missingLive: ['admin'] },
   );
   check(
-    'WRITER (TRA-2847): the attested commit follows the boundary — re-fix on/after 2026-08-05, ec05639 before',
+    'WRITER (TRA-2847): the attested commit follows the boundary — anchor fix on/after 2026-08-11, re-fix on/after 2026-08-05, ec05639 before',
     {
+      anchor: writerFixCommitForSince(TRA2847_ANCHOR_ERA_PIN_DATE),
       refix: writerFixCommitForSince(TRA2847_REFIX_DEPLOY_DATE),
       historical: writerFixCommitForSince(AC2_FIX_DEPLOY_DATE),
       later: writerFixCommitForSince('2026-09-01'),
     },
     {
+      anchor: TRA3039_WRITER_ANCHOR_FIX_COMMIT,
       refix: TRA2847_WRITER_REFIX_COMMIT,
       historical: AC2_WRITER_FIX_COMMIT,
-      later: TRA2847_WRITER_REFIX_COMMIT,
+      later: TRA3039_WRITER_ANCHOR_FIX_COMMIT,
     },
+  );
+  // TRA-2847 anchor era — the pin whose pair [08-11, 08-12] the close condition grades.
+  const ANCHOR_PINNED = TRA2847_ANCHOR_ERA_GRADEABLE_BOOKS.map((b) => b.username);
+  check(
+    'COHORT (TRA-2847 anchor era): every pinned book present reads INTACT off the 08-10 rows, 40 books',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(ANCHOR_PINNED), TRA2847_ANCHOR_ERA_PIN_DATE);
+      return { verdict: c.verdict, priorRows: c.priorRowsDate, expected: c.expectedCount };
+    })(),
+    { verdict: 'INTACT', priorRows: '2026-08-10', expected: 40 },
+  );
+  check(
+    'COHORT (TRA-2847 anchor era): the INDEX CASE ctoverify_tra2333 is pinned, and dropping it reads SHRANK and names it',
+    (() => {
+      const c = compareAc2Cohort(cohortBooks(ANCHOR_PINNED.filter((u) => u !== 'ctoverify_tra2333')), TRA2847_ANCHOR_ERA_PIN_DATE);
+      return { verdict: c.verdict, missing: c.missing.map((b) => b.username) };
+    })(),
+    { verdict: 'SHRANK', missing: ['ctoverify_tra2333'] },
+  );
+  check(
+    'COHORT (TRA-2847 anchor era): admin (live) is NOT pinned — od(08-10) is 0.00, eligibility cannot be manufactured',
+    ANCHOR_PINNED.includes('admin'),
+    false,
   );
   check(
     'COHORT: gradeAc2Delta carries the pin, and a shrunken PASS reports BOTH',
