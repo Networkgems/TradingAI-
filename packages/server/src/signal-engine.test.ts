@@ -112,6 +112,7 @@ import {
   clearLiveEnforceGateLedger,
   summarizeLiveEnforceGate,
 } from './live-enforce-gate-ledger.js'; // TRA-2763
+import { OPTION_LIVE_OTM_UNIVERSE_VAR } from './otm-live-universe-flag.js'; // TRA-3216
 import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
 // TRA-3073 — the REAL client, as a value. The acceptance suite for the
 // broker-flat sweep has to feed it status codes over a stubbed `fetch`: the
@@ -7133,7 +7134,16 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     expect(engine.getState().options.openOptions).toHaveLength(1);
     // Disarmed ⇒ the gate never evaluates: 0 rows, not "evaluated and passed".
     expect(otmFloorGate()).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(0);
+    // TRA-3216 — this used to assert the ledger-wide `decisionsRecorded` was 0.
+    // It is a GLOBAL counter across every gate, and the live universe allowlist
+    // now records an ADMIT for AAPL on this same pass, so the ledger-wide zero is
+    // no longer the right expression of "the FLOOR recorded nothing". Assert the
+    // floor's own axes are empty, and pin the one row that is legitimately there.
+    const retained = summarizeLiveEnforceGate('1970-01-01').retained.byGate;
+    expect(retained.find((g) => g.gate === 'otm_delta_floor')!.byReason).toEqual([]);
+    expect(retained.find((g) => g.gate === 'cost_bar')).toMatchObject({ evaluated: 0, blocked: 0 });
+    expect(retained.find((g) => g.gate === 'universe')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(1);
   });
 
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
@@ -7199,6 +7209,163 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
 // best in-universe put-credit-spread's short-put leg into a REAL cash-secured put
 // on the demo book (single-leg, no live capital), and that the pass stays wholly
 // observe-only when the sub-flag is off.
+// ─── TRA-3216 (parent TRA-2760) — LIVE OTM UNDERLYING ALLOWLIST ───────────────
+// `runOtmScan` is handed getActiveSymbols() — the full ~614-name watchlist — and
+// nothing anywhere restricted which underlyings real money could open on. The
+// three live opens after the cost bar was armed were KVYO, TROW and ABCL: not
+// selected, merely not excluded. These tests pin (a) an off-allowlist name places
+// NO broker order, (b) an on-allowlist name is unchanged, (c) both verdicts are
+// RECORDED with the rejected NAME and the BOOK — a scanner-level filter whose
+// rejects are invisible is indistinguishable from an inert one — and (d) demo is
+// untouched.
+describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
+  const UNIVERSE_ENV = [
+    OPTION_LIVE_OTM_FLAG,
+    OPTION_LIVE_TEST_UNTIL_VAR,
+    OPTION_LIVE_OTM_UNIVERSE_VAR,
+  ] as const;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of UNIVERSE_ENV) savedEnv[k] = process.env[k];
+    delete process.env[OPTION_LIVE_OTM_UNIVERSE_VAR]; // default = the board's five names
+    process.env[OPTION_LIVE_OTM_FLAG] = '1';
+    process.env[OPTION_LIVE_TEST_UNTIL_VAR] = FAR_FUTURE_TEST_UNTIL;
+    clearLiveOptionsFeeSlippageLedger();
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const k of UNIVERSE_ENV) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    clearLiveOptionsFeeSlippageLedger();
+    clearLiveEnforceGateLedger();
+  });
+
+  function liveStub() {
+    return {
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'AAPL240705C00210000', bid: 0.78, ask: 0.82 }),
+      buyContractsLimit: vi.fn().mockResolvedValue({ id: 42, status: 'ok' }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 42, status: 'filled', avg_fill_price: 0.82 })),
+    };
+  }
+
+  /** The scanner returns the SAME cheap candidate whatever symbol it is asked for. */
+  function anySymbolScanner(): StubScanner {
+    const scanner = new StubScanner();
+    scanner.scanOtm.mockResolvedValue({
+      symbol: 'AAPL', spot: 195, expiration: '2024-07-05', candidates: [makeOtmCandidate()], reason: 'ok',
+    });
+    return scanner;
+  }
+
+  function engineFor(mode: 'demo' | 'live', stub: ReturnType<typeof liveStub>, book = 'admin'): SignalEngine {
+    const engine = new SignalEngine(undefined, undefined, anySymbolScanner());
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = mode;
+    (engine as unknown as { alertUsername: string }).alertUsername = book;
+    (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+      totalEquity: 268.58, totalCash: 268.58, optionBuyingPower: 268.58, dayTradeBuyingPower: 268.58,
+    };
+    return engine;
+  }
+
+  const runOtm = (engine: SignalEngine, syms: string[]) =>
+    (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(syms);
+
+  const gateOf = (g: string) =>
+    summarizeLiveEnforceGate('1970-01-01').retained.byGate.find((x) => x.gate === g)!;
+
+  it('blocks an off-allowlist live name: NO broker order, and the rejected NAME is on the record', async () => {
+    const stub = liveStub();
+    const engine = engineFor('live', stub);
+    // KVYO is one of the three names real money actually opened on 08-06..10.
+    await runOtm(engine, ['KVYO']);
+
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(engine.getState().options.openOptions).toHaveLength(0);
+
+    const universe = gateOf('universe');
+    expect(universe).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
+    // Keyed by SYMBOL — a bare count could not tell you WHICH name was stopped.
+    expect(universe.byScope).toEqual([
+      { scope: 'KVYO', evaluated: 1, blocked: 1, blockRate: 1 },
+    ]);
+    expect(universe.byReason).toEqual([{ reasonCode: 'not_in_universe', blocked: 1, share: 1 }]);
+    // Stamped with the BOOK: this is what makes the fleet claim checkable rather
+    // than inferred from a process-level env var.
+    expect(universe.byBook).toEqual([{ book: 'admin', evaluated: 1, blocked: 1, blockRate: 1 }]);
+
+    // The reject is visible on the feed, not only in the ledger.
+    const sig = engine.getState().signals.find((s) => s.symbol === 'KVYO')!;
+    expect(sig.liveSkipReason).toMatch(/not on the live underlying allowlist/);
+  });
+
+  it('cuts BEFORE the cost bar and the delta floor — they never see an off-allowlist name', async () => {
+    await runOtm(engineFor('live', liveStub()), ['KVYO']);
+    // Ordering is load-bearing: it is why cost_bar's block rate stops describing
+    // a population we never trade (and why its denominator steps down on deploy).
+    expect(gateOf('cost_bar')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+    expect(gateOf('otm_delta_floor')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+  });
+
+  it('leaves an on-allowlist live name byte-for-byte unchanged, and records the ADMIT side', async () => {
+    const stub = liveStub();
+    const engine = engineFor('live', stub);
+    await runOtm(engine, ['AAPL']);
+
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+    // evaluated>0 / blocked:0 — an admitted verdict is recorded too, so an inert
+    // allowlist (evaluated 0) can never read like one that passed everything.
+    expect(gateOf('universe')).toMatchObject({ evaluated: 1, blocked: 0, blockRate: 0 });
+    expect(gateOf('universe').byReason).toEqual([]);
+  });
+
+  it('honours an operator override — a name off the DEFAULT list opens when explicitly allowed', async () => {
+    process.env[OPTION_LIVE_OTM_UNIVERSE_VAR] = 'kvyo, IWM';
+    const stub = liveStub();
+    const engine = engineFor('live', stub);
+    await runOtm(engine, ['KVYO']);
+
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    expect(gateOf('universe')).toMatchObject({ evaluated: 1, blocked: 0 });
+  });
+
+  it('the `*` escape hatch restores the old behaviour and records NO verdict at all', async () => {
+    process.env[OPTION_LIVE_OTM_UNIVERSE_VAR] = '*';
+    const stub = liveStub();
+    await runOtm(engineFor('live', stub), ['KVYO']);
+
+    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    // Unrestricted ⇒ there is no verdict to record. `evaluated:0` here is the ONE
+    // reading on this axis that is ambiguous on its own; the health route pairs it
+    // with arm.universe.restricted, which is the discriminator.
+    expect(gateOf('universe')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+  });
+
+  it('a malformed override does NOT re-open the universe — it falls back to the restriction', async () => {
+    process.env[OPTION_LIVE_OTM_UNIVERSE_VAR] = ',,,';
+    const stub = liveStub();
+    await runOtm(engineFor('live', stub), ['KVYO']);
+
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+    expect(gateOf('universe')).toMatchObject({ evaluated: 1, blocked: 1 });
+  });
+
+  it('demo is untouched: an off-allowlist name still opens on the paper book, 0 ledger rows', async () => {
+    const stub = liveStub();
+    const engine = engineFor('demo', stub);
+    await runOtm(engine, ['KVYO']);
+
+    expect(engine.getState().options.openOptions).toHaveLength(1);
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled(); // demo never touches the broker
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(0);
+  });
+});
+
 describe('SignalEngine — wheel paper routing (TRA-1977)', () => {
   const EXP = '2024-07-19'; // ~45 DTE from TRADING_TIME → clears the 21 DTE C3 gate
   const SPOT = 100;

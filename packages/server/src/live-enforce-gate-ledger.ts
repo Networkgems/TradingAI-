@@ -59,9 +59,11 @@ const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
  * spread veto (`SPREAD_TOO_WIDE` / thin-book / unusable-quote) enforced at the
  * live-options broker seam; `otm_delta_floor` is the TRA-2763 live arm of the
  * TRA-1407 OTM entry |delta| floor (the demo-only guard that left real money
- * running unfiltered at |delta| 0.03-0.07).
+ * running unfiltered at |delta| 0.03-0.07); `universe` is the TRA-3216 live OTM
+ * underlying allowlist (the scan universe was the full ~614-name watchlist, so
+ * real money opened on KVYO / TROW / ABCL because nothing restricted it).
  */
-export type LiveEnforceGate = 'cost_bar' | 'spread' | 'otm_delta_floor';
+export type LiveEnforceGate = 'cost_bar' | 'spread' | 'otm_delta_floor' | 'universe';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -71,17 +73,61 @@ export interface LiveEnforceRecord {
   etDay: string;
   /** Which gate ruled. */
   gate: LiveEnforceGate;
-  /** For `cost_bar`, the structure (single_leg_rv / single_leg_otm / directional); for `spread`, the underlying symbol. */
+  /** For `cost_bar`, the structure (single_leg_rv / single_leg_otm / directional); for `spread` and `universe`, the underlying symbol. */
   scope: string;
   /** TRUE ⇒ the order was BLOCKED (rejected). FALSE ⇒ evaluated and allowed to proceed. */
   blocked: boolean;
   /** Human-readable rejection reason (present only when blocked). */
   reason?: string;
+  /**
+   * TRA-3216 — LOW-CARDINALITY classification of the block, present only when
+   * blocked. `reason` above is per-candidate prose (it embeds the candidate's own
+   * numbers), so folding on it yields one bucket per decision and answers
+   * nothing. This is the tuneable axis: for `cost_bar` it says how far under the
+   * bar the candidate fell, which is what turns "99.15% blocked" into "N of them
+   * were within 0.10R of admission".
+   */
+  reasonCode?: string;
+  /**
+   * TRA-3216 — WHICH LIVE BOOK this verdict governed (the `alertUsername` the
+   * options journal stamps as `account`, so this joins to the journal and to the
+   * TRA-3117 per-book census without a translation table). A process-level flag
+   * reads identically for a book it does not govern; this field is what makes the
+   * fleet claim checkable. Absent ⇒ the call site could not attribute the book,
+   * which folds to an explicit `unattributed` key rather than disappearing.
+   */
+  book?: string;
 }
 
 interface GateScopeTally {
   evaluated: number;
   blocked: number;
+}
+
+/** The per-gate accumulator: the same tally shape folded on three independent keys. */
+interface GateTallies {
+  /** structure (cost_bar) or underlying symbol (spread / universe). */
+  byScope: Map<string, GateScopeTally>;
+  /** normalized block classification — BLOCKED rows only (an admit has no reason). */
+  byReason: Map<string, GateScopeTally>;
+  /** live book (`alertUsername`), or `unattributed`. */
+  byBook: Map<string, GateScopeTally>;
+}
+
+const UNATTRIBUTED_BOOK = 'unattributed';
+
+function emptyTallies(): GateTallies {
+  return { byScope: new Map(), byReason: new Map(), byBook: new Map() };
+}
+
+function bump(map: Map<string, GateScopeTally>, key: string, blocked: boolean): void {
+  let tally = map.get(key);
+  if (!tally) {
+    tally = { evaluated: 0, blocked: 0 };
+    map.set(key, tally);
+  }
+  tally.evaluated += 1;
+  if (blocked) tally.blocked += 1;
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -91,8 +137,8 @@ interface GateScopeTally {
 // threading a path through the SignalEngine.
 
 let dataDir: string | null = null;
-/** etDay -> (gate -> (scope -> tally)). */
-const byDay = new Map<string, Map<LiveEnforceGate, Map<string, GateScopeTally>>>();
+/** etDay -> (gate -> per-axis tallies). */
+const byDay = new Map<string, Map<LiveEnforceGate, GateTallies>>();
 let decisionsTotal = 0;
 let lastDecisionAt: number | null = null;
 // TRA-1681 — durability provenance: `byDay` is fed by BOTH the boot hydrate and the
@@ -118,7 +164,7 @@ export function clearLiveEnforceGateLedger(): void {
   lastAppendError = null;
 }
 
-const GATES: LiveEnforceGate[] = ['cost_bar', 'spread', 'otm_delta_floor'];
+const GATES: LiveEnforceGate[] = ['cost_bar', 'spread', 'otm_delta_floor', 'universe'];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
 function apply(rec: LiveEnforceRecord): void {
@@ -127,18 +173,19 @@ function apply(rec: LiveEnforceRecord): void {
     day = new Map();
     byDay.set(rec.etDay, day);
   }
-  let scopes = day.get(rec.gate);
-  if (!scopes) {
-    scopes = new Map();
-    day.set(rec.gate, scopes);
+  let tallies = day.get(rec.gate);
+  if (!tallies) {
+    tallies = emptyTallies();
+    day.set(rec.gate, tallies);
   }
-  let tally = scopes.get(rec.scope);
-  if (!tally) {
-    tally = { evaluated: 0, blocked: 0 };
-    scopes.set(rec.scope, tally);
+  bump(tallies.byScope, rec.scope, rec.blocked);
+  bump(tallies.byBook, rec.book ?? UNATTRIBUTED_BOOK, rec.blocked);
+  // Blocked rows ONLY: an admitted candidate has no rejection classification, and
+  // folding admits into this axis under a synthetic "admitted" key would make the
+  // dominant bucket of every gate the one that explains nothing.
+  if (rec.blocked && typeof rec.reasonCode === 'string' && rec.reasonCode !== '') {
+    bump(tallies.byReason, rec.reasonCode, true);
   }
-  tally.evaluated += 1;
-  if (rec.blocked) tally.blocked += 1;
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
 }
@@ -157,6 +204,9 @@ export function recordLiveEnforceDecision(
   etDay: string,
   reason?: string,
   now: number = Date.now(),
+  // TRA-3216 — trailing options bag so the three pre-existing call sites keep
+  // their positional signature unchanged.
+  opts?: { reasonCode?: string; book?: string | null },
 ): void {
   const rec: LiveEnforceRecord = {
     ts: now,
@@ -165,6 +215,8 @@ export function recordLiveEnforceDecision(
     scope,
     blocked,
     ...(blocked && reason ? { reason } : {}),
+    ...(blocked && opts?.reasonCode ? { reasonCode: opts.reasonCode } : {}),
+    ...(typeof opts?.book === 'string' && opts.book !== '' ? { book: opts.book } : {}),
   };
   applyAndAppend(rec);
 }
@@ -239,6 +291,13 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
       scope: rec.scope,
       blocked: rec.blocked,
       ...(rec.blocked && typeof rec.reason === 'string' ? { reason: rec.reason } : {}),
+      // TRA-3216 — rows written before these fields existed simply lack them; they
+      // hydrate into the `unattributed` book and contribute no byReason row, which
+      // is the honest reading (the classification was never recorded), not a zero.
+      ...(rec.blocked && typeof rec.reasonCode === 'string' && rec.reasonCode !== ''
+        ? { reasonCode: rec.reasonCode }
+        : {}),
+      ...(typeof rec.book === 'string' && rec.book !== '' ? { book: rec.book } : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -274,6 +333,31 @@ export interface LiveEnforceScopeSummary {
   blockRate: number | null;
 }
 
+/**
+ * TRA-3216 — the tuning axis. One row per normalized block classification,
+ * heaviest first. **Blocks only** — `share` is of this gate's BLOCKED total, so
+ * the rows sum to 1 and read directly as "which term dominated".
+ */
+export interface LiveEnforceReasonSummary {
+  reasonCode: string;
+  blocked: number;
+  /** blocked / (this gate's blocked total); `null` when the gate blocked nothing. */
+  share: number | null;
+}
+
+/**
+ * TRA-3216 — the FLEET axis. One row per live book (`alertUsername`) the gate
+ * actually ruled for, plus `unattributed` for verdicts whose call site could not
+ * name a book. A process-level flag reads identically for a book it does not
+ * govern; this is the split that tells the two apart.
+ */
+export interface LiveEnforceBookSummary {
+  book: string;
+  evaluated: number;
+  blocked: number;
+  blockRate: number | null;
+}
+
 export interface LiveEnforceGateSummary {
   gate: LiveEnforceGate;
   evaluated: number;
@@ -281,6 +365,10 @@ export interface LiveEnforceGateSummary {
   blockRate: number | null;
   /** Per-scope split, busiest first. */
   byScope: LiveEnforceScopeSummary[];
+  /** Per-reason split of the BLOCKS, heaviest first (TRA-3216). */
+  byReason: LiveEnforceReasonSummary[];
+  /** Per-live-book split, busiest first (TRA-3216). */
+  byBook: LiveEnforceBookSummary[];
 }
 
 export interface LiveEnforceDurability {
@@ -316,15 +404,15 @@ function round(n: number, dp = 4): number {
   return Math.round(n * f) / f;
 }
 
-/** Fold a gate->(scope->tally) map for one or more days into the per-gate rows. */
-function foldGates(acc: Map<LiveEnforceGate, Map<string, GateScopeTally>>): LiveEnforceGateSummary[] {
+/** Fold a gate->tallies map for one or more days into the per-gate rows. */
+function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSummary[] {
   const out: LiveEnforceGateSummary[] = [];
   for (const gate of GATES) {
-    const scopes = acc.get(gate) ?? new Map<string, GateScopeTally>();
+    const tallies = acc.get(gate) ?? emptyTallies();
     let evaluated = 0;
     let blocked = 0;
     const byScope: LiveEnforceScopeSummary[] = [];
-    for (const [scope, t] of scopes.entries()) {
+    for (const [scope, t] of tallies.byScope.entries()) {
       evaluated += t.evaluated;
       blocked += t.blocked;
       byScope.push({
@@ -335,33 +423,68 @@ function foldGates(acc: Map<LiveEnforceGate, Map<string, GateScopeTally>>): Live
       });
     }
     byScope.sort((a, b) => b.evaluated - a.evaluated);
+
+    const byBook: LiveEnforceBookSummary[] = [];
+    for (const [book, t] of tallies.byBook.entries()) {
+      byBook.push({
+        book,
+        evaluated: t.evaluated,
+        blocked: t.blocked,
+        blockRate: t.evaluated > 0 ? round(t.blocked / t.evaluated) : null,
+      });
+    }
+    byBook.sort((a, b) => b.evaluated - a.evaluated);
+
+    // `share` denominator is the gate's BLOCKED total (from byScope, which counts
+    // every row) — NOT the sum of the byReason rows. Using the rows' own sum would
+    // silently renormalize away any block that carried no classification, making
+    // partial coverage read as complete.
+    const byReason: LiveEnforceReasonSummary[] = [];
+    for (const [reasonCode, t] of tallies.byReason.entries()) {
+      byReason.push({
+        reasonCode,
+        blocked: t.blocked,
+        share: blocked > 0 ? round(t.blocked / blocked) : null,
+      });
+    }
+    byReason.sort((a, b) => b.blocked - a.blocked);
+
     out.push({
       gate,
       evaluated,
       blocked,
       blockRate: evaluated > 0 ? round(blocked / evaluated) : null,
       byScope,
+      byReason,
+      byBook,
     });
   }
   return out;
 }
 
-/** Merge every retained day into one gate->(scope->tally) accumulator. */
-function accumulateAllDays(): Map<LiveEnforceGate, Map<string, GateScopeTally>> {
-  const acc = new Map<LiveEnforceGate, Map<string, GateScopeTally>>();
+/** Merge one axis map into an accumulator. */
+function mergeAxis(into: Map<string, GateScopeTally>, from: Map<string, GateScopeTally>): void {
+  for (const [key, t] of from.entries()) {
+    const cur = into.get(key) ?? { evaluated: 0, blocked: 0 };
+    cur.evaluated += t.evaluated;
+    cur.blocked += t.blocked;
+    into.set(key, cur);
+  }
+}
+
+/** Merge every retained day into one gate->tallies accumulator. */
+function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
+  const acc = new Map<LiveEnforceGate, GateTallies>();
   for (const day of byDay.values()) {
-    for (const [gate, scopes] of day.entries()) {
+    for (const [gate, tallies] of day.entries()) {
       let into = acc.get(gate);
       if (!into) {
-        into = new Map();
+        into = emptyTallies();
         acc.set(gate, into);
       }
-      for (const [scope, t] of scopes.entries()) {
-        const cur = into.get(scope) ?? { evaluated: 0, blocked: 0 };
-        cur.evaluated += t.evaluated;
-        cur.blocked += t.blocked;
-        into.set(scope, cur);
-      }
+      mergeAxis(into.byScope, tallies.byScope);
+      mergeAxis(into.byReason, tallies.byReason);
+      mergeAxis(into.byBook, tallies.byBook);
     }
   }
   return acc;
@@ -374,7 +497,7 @@ function accumulateAllDays(): Map<LiveEnforceGate, Map<string, GateScopeTally>> 
  * `evaluated > 0 with blocked === 0` is an armed gate that passed everything.
  */
 export function summarizeLiveEnforceGate(etDay: string): LiveEnforceSummary {
-  const day = byDay.get(etDay) ?? new Map<LiveEnforceGate, Map<string, GateScopeTally>>();
+  const day = byDay.get(etDay) ?? new Map<LiveEnforceGate, GateTallies>();
   return {
     decisionsRecorded: decisionsTotal,
     byGate: foldGates(day),

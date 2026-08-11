@@ -7,6 +7,8 @@ import {
   structureCostR,
   isEquityStructure,
   DEFAULT_COST_GATE_CONFIG,
+  costGateBlockReasonCode,
+  describeCostGateBar,
 } from './option-cost-gate.js';
 import { SLEEVE_SPREAD_CEILINGS } from './option-spread-cost.js';
 
@@ -149,5 +151,74 @@ describe('resolveCostGateConfig', () => {
     });
     expect(cfg.optionsCost.commissionR).toBeCloseTo(0.05, 10);
     expect(cfg.optionsMinGrossR).toBeCloseTo(0.3, 10);
+  });
+});
+
+// ── TRA-3216: making a 99.15% live block rate diagnosable ────────────────────
+describe('cost gate block classification (TRA-3216)', () => {
+  const bar = admissionBarR('single_leg_otm'); // 0.485R under the shipped config
+
+  it('returns null for an admit — an admitted candidate has no block to classify', () => {
+    expect(costGateBlockReasonCode(admitByCostAwareGate(bar + 0.01, 'single_leg_otm'))).toBeNull();
+  });
+
+  it('buckets the shortfall so "how far would the bar have to move" is answerable', () => {
+    const code = (gross: number) => costGateBlockReasonCode(admitByCostAwareGate(gross, 'single_leg_otm'));
+    expect(code(bar - 0.01)).toBe('shortfall_lt_0.10');
+    expect(code(bar - 0.15)).toBe('shortfall_0.10_0.25');
+    expect(code(bar - 0.30)).toBe('shortfall_0.25_0.50');
+    // The shipped 0.485R bar is too low for a >=0.50R shortfall to exist at a
+    // NON-negative gross (0.485 - 0.50 < 0), and `gross_negative` deliberately
+    // wins that overlap — so exercise the far bucket against a raised bar.
+    const highBar = resolveCostGateConfig({ OPTION_COST_GATE_MIN_GROSS_R: '1.2' } as NodeJS.ProcessEnv);
+    expect(costGateBlockReasonCode(admitByCostAwareGate(0.5, 'single_leg_otm', highBar))).toBe('shortfall_gte_0.50');
+    // Negative gross classifies as negative regardless of how far under it is.
+    expect(code(bar - 0.90)).toBe('gross_negative');
+  });
+
+  it('separates the two blocks NO bar retune can recover from the tuneable ones', () => {
+    // Non-finite gross: the gate failed closed on an unknown edge. Dropping the
+    // bar to zero admits none of these — the estimator is the defect, not the bar.
+    expect(costGateBlockReasonCode(admitByCostAwareGate(Number.NaN, 'single_leg_otm'))).toBe('gross_unknown');
+    // Negative modeled gross: structurally hopeless at any bar above 0.
+    expect(costGateBlockReasonCode(admitByCostAwareGate(-0.2, 'single_leg_otm'))).toBe('gross_negative');
+  });
+
+  it('emits a BOUNDED key set — the codes must stay foldable across thousands of blocks', () => {
+    const codes = new Set<string>();
+    for (let g = -2; g <= 1; g += 0.001) {
+      const c = costGateBlockReasonCode(admitByCostAwareGate(g, 'single_leg_otm'));
+      if (c) codes.add(c);
+    }
+    expect(codes.size).toBeLessThanOrEqual(6);
+  });
+
+  it('describes the bar composition, and flags the floor PINNING it (a retune no-op)', () => {
+    // Shipped config: 0.05 + 0.235 + 0.20 = 0.485R, clear of the 0.30 floor.
+    const shipped = describeCostGateBar('single_leg_otm');
+    expect(shipped.barR).toBeCloseTo(0.485, 10);
+    expect(shipped.barPinnedByFloor).toBe(false);
+    expect(shipped.dominantTerm).toBe('spread_cross');
+
+    // Raise the floor above costModel+margin and the measured cost inputs go
+    // INERT: retuning commission/spread alone cannot move the bar. This is the
+    // exact trap DEFAULT_COST_GATE_CONFIG's docstring warns about.
+    const pinned = describeCostGateBar(
+      'single_leg_otm',
+      resolveCostGateConfig({ OPTION_COST_GATE_MIN_GROSS_R: '1.2' } as NodeJS.ProcessEnv),
+    );
+    expect(pinned.barR).toBeCloseTo(1.2, 10);
+    expect(pinned.barPinnedByFloor).toBe(true);
+    expect(pinned.dominantTerm).toBe('min_gross_floor');
+
+    // Proof it is a no-op while pinned: halve the spread cross, bar is unchanged.
+    const stillPinned = describeCostGateBar(
+      'single_leg_otm',
+      resolveCostGateConfig({
+        OPTION_COST_GATE_MIN_GROSS_R: '1.2',
+        OPTION_COST_GATE_SPREAD_CROSS_R: '0.1175',
+      } as NodeJS.ProcessEnv),
+    );
+    expect(stillPinned.barR).toBeCloseTo(pinned.barR, 10);
   });
 });

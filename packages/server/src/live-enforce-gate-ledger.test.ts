@@ -14,7 +14,7 @@ import {
 const DAY = '2026-07-18';
 
 /** Convenience: pull one gate's fold out of the day view. */
-function gate(day: string, g: 'cost_bar' | 'spread' | 'otm_delta_floor') {
+function gate(day: string, g: 'cost_bar' | 'spread' | 'otm_delta_floor' | 'universe') {
   return summarizeLiveEnforceGate(day).byGate.find((x) => x.gate === g)!;
 }
 
@@ -36,7 +36,7 @@ describe('live-enforce-gate-ledger', () => {
     expect(s.decisionsRecorded).toBe(0);
     expect(s.lastDecisionAt).toBeNull();
     // Every gate is always present so a reader never mistakes "gate absent" for "gate armed, nothing seen".
-    expect(s.byGate.map((g) => g.gate).sort()).toEqual(['cost_bar', 'otm_delta_floor', 'spread']);
+    expect(s.byGate.map((g) => g.gate).sort()).toEqual(['cost_bar', 'otm_delta_floor', 'spread', 'universe']);
     for (const g of s.byGate) {
       expect(g).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
     }
@@ -150,5 +150,99 @@ describe('live-enforce-gate-ledger', () => {
     clearLiveEnforceGateLedger();
     const h = hydrateLiveEnforceGateFromDisk(dir, farFuture);
     expect(h.records).toBe(0);
+  });
+
+  // ── TRA-3216 ───────────────────────────────────────────────────────────────
+
+  it('records the universe gate keyed by SYMBOL, so the rejects of a scanner-level filter are visible', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('universe', 'AAPL', false, DAY, undefined, 1_001, { book: 'admin' });
+    recordLiveEnforceDecision('universe', 'KVYO', true, DAY, 'not on allowlist', 1_002, {
+      reasonCode: 'not_in_universe',
+      book: 'admin',
+    });
+
+    const u = gate(DAY, 'universe');
+    expect(u).toMatchObject({ evaluated: 2, blocked: 1, blockRate: 0.5 });
+    // The rejected NAME is on the record — an allowlist that only reported a count
+    // could not tell you it was KVYO that real money would have bought.
+    expect(u.byScope.map((s) => s.scope).sort()).toEqual(['AAPL', 'KVYO']);
+    expect(u.byScope.find((s) => s.scope === 'KVYO')).toMatchObject({ blocked: 1, blockRate: 1 });
+    // Admitting a name must NOT be recorded as a block.
+    expect(u.byScope.find((s) => s.scope === 'AAPL')).toMatchObject({ blocked: 0, blockRate: 0 });
+  });
+
+  it('splits blocks byReason with share over the gate BLOCK total, and never folds admits in', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'a', 1_001, { reasonCode: 'shortfall_gte_0.50' });
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'b', 1_002, { reasonCode: 'shortfall_gte_0.50' });
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'c', 1_003, { reasonCode: 'shortfall_lt_0.10' });
+    // An ADMIT carrying a reasonCode must contribute nothing — a "reason" for a
+    // pass is meaningless and would dilute every share.
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', false, DAY, undefined, 1_004, { reasonCode: 'shortfall_lt_0.10' });
+
+    const c = gate(DAY, 'cost_bar');
+    expect(c).toMatchObject({ evaluated: 4, blocked: 3 });
+    // Heaviest bucket first, shares over the 3 BLOCKS (not the 4 evaluations).
+    expect(c.byReason).toEqual([
+      { reasonCode: 'shortfall_gte_0.50', blocked: 2, share: 0.6667 },
+      { reasonCode: 'shortfall_lt_0.10', blocked: 1, share: 0.3333 },
+    ]);
+  });
+
+  it('does not renormalize byReason shares over the classified rows only — unclassified blocks stay visible as a gap', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'classified', 1_001, { reasonCode: 'gross_unknown' });
+    // A block with NO classification (e.g. a pre-TRA-3216 row rehydrated, or a
+    // call site that forgot the code). If `share` were computed over the byReason
+    // rows' own sum this would read 1.0 = "fully explained"; it must read 0.5.
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'unclassified', 1_002);
+
+    const c = gate(DAY, 'cost_bar');
+    expect(c.blocked).toBe(2);
+    expect(c.byReason).toEqual([{ reasonCode: 'gross_unknown', blocked: 1, share: 0.5 }]);
+  });
+
+  it('splits every gate byBook, so a process-level flag cannot pass as a fleet-wide claim', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('universe', 'KVYO', true, DAY, 'no', 1_001, { reasonCode: 'not_in_universe', book: 'admin' });
+    recordLiveEnforceDecision('universe', 'AAPL', false, DAY, undefined, 1_002, { book: 'admin' });
+    recordLiveEnforceDecision('universe', 'TROW', true, DAY, 'no', 1_003, { reasonCode: 'not_in_universe', book: 'richard' });
+    // A call site that could not name the book folds to an explicit key rather
+    // than vanishing — "we governed 2 books" and "we governed 2 books plus one we
+    // cannot name" must not read the same.
+    recordLiveEnforceDecision('universe', 'ABCL', true, DAY, 'no', 1_004, { reasonCode: 'not_in_universe' });
+
+    const u = gate(DAY, 'universe');
+    expect(u.byBook).toEqual([
+      { book: 'admin', evaluated: 2, blocked: 1, blockRate: 0.5 },
+      { book: 'richard', evaluated: 1, blocked: 1, blockRate: 1 },
+      { book: 'unattributed', evaluated: 1, blocked: 1, blockRate: 1 },
+    ]);
+  });
+
+  it('round-trips reasonCode and book through disk, and folds them across retained days', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('universe', 'KVYO', true, '2026-07-17', 'no', 1_001, {
+      reasonCode: 'not_in_universe',
+      book: 'admin',
+    });
+    recordLiveEnforceDecision('universe', 'SPY', false, DAY, undefined, 1_002, { book: 'admin' });
+
+    const lines = readFileSync(liveEnforceGateLogPath(dir), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    expect(lines[0]).toMatchObject({ gate: 'universe', scope: 'KVYO', reasonCode: 'not_in_universe', book: 'admin' });
+    // An ADMITTED row carries a book but NO reasonCode — nothing was rejected.
+    expect(lines[1].book).toBe('admin');
+    expect(lines[1].reasonCode).toBeUndefined();
+
+    clearLiveEnforceGateLedger();
+    expect(hydrateLiveEnforceGateFromDisk(dir, 2_000).records).toBe(2);
+    const retained = summarizeLiveEnforceGate(DAY).retained.byGate.find((g) => g.gate === 'universe')!;
+    expect(retained).toMatchObject({ evaluated: 2, blocked: 1 });
+    expect(retained.byReason).toEqual([{ reasonCode: 'not_in_universe', blocked: 1, share: 1 }]);
+    expect(retained.byBook).toEqual([{ book: 'admin', evaluated: 2, blocked: 1, blockRate: 0.5 }]);
   });
 });

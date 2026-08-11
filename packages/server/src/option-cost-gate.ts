@@ -233,6 +233,113 @@ export function admitByCostAwareGate(
   };
 }
 
+// ── TRA-3216: making a 99.15% block rate DIAGNOSABLE ─────────────────────────
+//
+// Over 5 armed live sessions the live cost bar evaluated 1528 OTM candidates and
+// blocked 1515 of them. `byScope` could only ever answer `single_leg_otm`, and
+// {@link CostGateVerdict.reason} is per-candidate prose carrying that candidate's
+// own gross-R — fold on it and you get 1515 buckets of size 1. Neither says
+// whether the bar is off by a hair or by a mile, so the only way to retune it was
+// to guess and redeploy.
+//
+// Note what is NOT a useful split here: "which cost term dominated the BAR"
+// (commission vs spread cross vs safety margin vs the min-gross floor) is a
+// property of the CONFIG, identical on all 1515 rows — a constant column. That
+// belongs in the arm block of the health payload, published ONCE
+// ({@link describeCostGateBar}), not in a per-decision fold.
+//
+// The informative axis is the CANDIDATE side: the shortfall distribution. It
+// answers the question an operator actually has — "if I drop the bar 0.10R, how
+// many of these come back?" — off recorded data instead of a live experiment.
+
+/**
+ * Bucket boundaries (in R) for {@link costGateBlockReasonCode}. Chosen so the
+ * first bucket is roughly one safety-margin's worth of retune and the last is
+ * "no plausible retune reaches these".
+ */
+export const COST_GATE_SHORTFALL_BUCKETS_R: readonly number[] = [0.1, 0.25, 0.5];
+
+/**
+ * Classify a REJECTED cost-gate verdict into a low-cardinality, foldable code.
+ * Pure. Returns a stable key from a bounded set:
+ *
+ *   `gross_unknown`          — modeled gross R was non-finite; the gate failed
+ *                              closed. NOT a bar-tuning problem: lowering the bar
+ *                              admits none of these, the estimator is the defect.
+ *   `gross_negative`         — modeled gross R below zero. Structurally hopeless;
+ *                              no bar above 0 admits them.
+ *   `shortfall_lt_0.10`      — within 0.10R of the bar. The retune-sensitive
+ *   `shortfall_0.10_0.25`      cohort, in increasing order of how far the bar
+ *   `shortfall_0.25_0.50`      would have to move.
+ *   `shortfall_gte_0.50`     — far below; effectively unreachable by tuning.
+ *
+ * Passing an ADMITTED verdict returns `null` — an admit has no block to classify,
+ * and the ledger deliberately keeps the reason axis blocks-only.
+ */
+export function costGateBlockReasonCode(verdict: CostGateVerdict): string | null {
+  if (verdict.admit) return null;
+  const gross = verdict.modeledGrossR;
+  if (!Number.isFinite(gross)) return 'gross_unknown';
+  if (gross < 0) return 'gross_negative';
+  const shortfall = verdict.barR - gross;
+  const [near, mid, far] = COST_GATE_SHORTFALL_BUCKETS_R;
+  if (shortfall < near) return `shortfall_lt_${near.toFixed(2)}`;
+  if (shortfall < mid) return `shortfall_${near.toFixed(2)}_${mid.toFixed(2)}`;
+  if (shortfall < far) return `shortfall_${mid.toFixed(2)}_${far.toFixed(2)}`;
+  return `shortfall_gte_${far.toFixed(2)}`;
+}
+
+/** The resolved bar and its composition — the CONSTANT half of "why did it block". */
+export interface CostGateBarDescription {
+  structure: string;
+  /** The bar a candidate of this structure must clear. */
+  barR: number;
+  costModelR: number;
+  commissionR: number;
+  spreadCrossR: number;
+  safetyMarginR: number;
+  minGrossR: number;
+  /**
+   * TRUE ⇒ `optionsMinGrossR` sits at or above `costModel + margin` and PINS the
+   * bar, which makes the measured cost inputs inert: retuning commission or
+   * spread cross alone changes nothing. The docstring on
+   * {@link DEFAULT_COST_GATE_CONFIG} warns about exactly this; publishing it
+   * removes the need to re-derive it by hand from four separate env vars.
+   */
+  barPinnedByFloor: boolean;
+  /** Which single input contributes the most to the bar (`min_gross_floor` when pinned). */
+  dominantTerm: 'min_gross_floor' | 'spread_cross' | 'commission' | 'safety_margin';
+}
+
+/** Describe the effective bar for `structure` under `config`. Pure. */
+export function describeCostGateBar(
+  structure: string,
+  config: CostGateConfig = DEFAULT_COST_GATE_CONFIG,
+): CostGateBarDescription {
+  const cost = isEquityStructure(structure) ? config.equityCost : config.optionsCost;
+  const costModelR = structureCostR(cost);
+  const modelBar = costModelR + config.safetyMarginR;
+  const barR = admissionBarR(structure, config);
+  const barPinnedByFloor = !isEquityStructure(structure) && config.optionsMinGrossR >= modelBar;
+  const terms: Array<[CostGateBarDescription['dominantTerm'], number]> = [
+    ['spread_cross', cost.makerAdjustedSpreadCrossR],
+    ['commission', cost.commissionR],
+    ['safety_margin', config.safetyMarginR],
+  ];
+  terms.sort((a, b) => b[1] - a[1]);
+  return {
+    structure,
+    barR,
+    costModelR,
+    commissionR: cost.commissionR,
+    spreadCrossR: cost.makerAdjustedSpreadCrossR,
+    safetyMarginR: config.safetyMarginR,
+    minGrossR: config.optionsMinGrossR,
+    barPinnedByFloor,
+    dominantTerm: barPinnedByFloor ? 'min_gross_floor' : terms[0][0],
+  };
+}
+
 /**
  * Resolve the operator-tunable cost-gate config from env, falling back to
  * {@link DEFAULT_COST_GATE_CONFIG} field-by-field so any unset/malformed knob

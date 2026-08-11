@@ -324,7 +324,12 @@ import {
   admitByCostAwareGate,
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
+  costGateBlockReasonCode, // TRA-3216 — the foldable classification of a block
 } from './option-cost-gate.js';
+// TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
+// handed the full ~614-name watchlist; this is the only universe restriction on
+// the real-money path.
+import { resolveLiveOtmUniverse, isSymbolInLiveOtmUniverse } from './otm-live-universe-flag.js';
 import type { RelativeValueScannerService } from './relative-value-scanner.js';
 import type { DailySignalRecord, ReportInput } from './reports/eod-report.js';
 import type { PnlTracker } from './pnl-tracker.js';
@@ -6102,16 +6107,65 @@ export class SignalEngine {
       if (!isOptionCostGateLiveEnforceEnabled(process.env)) return null;
       const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(process.env));
       const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(process.env));
+      // TRA-3216 — `reason` is per-candidate prose (it embeds this candidate's own
+      // gross R), so a fold on it has one bucket per decision. `reasonCode` is the
+      // bounded shortfall classification that makes a 99%+ block rate tuneable.
       recordLiveEnforceDecision(
         'cost_bar',
         structure,
         !verdict.admit,
         etDateString(new Date()),
         verdict.admit ? undefined : verdict.reason,
+        Date.now(),
+        { reasonCode: costGateBlockReasonCode(verdict) ?? undefined, book: this.alertUsername ?? null },
       );
       return verdict.admit ? null : verdict.reason;
     }
     return null;
+  }
+
+  /**
+   * TRA-3216 (parent TRA-2760) — the LIVE OTM UNDERLYING ALLOWLIST.
+   *
+   * `runOtmScan` is handed `getActiveSymbols()`, the full ~614-name watchlist, and
+   * until now nothing anywhere restricted which underlyings real money could open
+   * on. The three live opens after the cost bar was armed were KVYO, TROW and
+   * ABCL — not because anything selected them, but because nothing excluded them.
+   *
+   * Scoped `mode === 'live'`: demo is the graded book and keeps its wide universe
+   * byte-for-byte. Tightening-only — it can only remove a live open.
+   *
+   * Every ARMED verdict is recorded (admitted AND blocked), keyed by SYMBOL and
+   * stamped with the BOOK. A scanner-level filter whose rejects are invisible is
+   * indistinguishable from an inert one, and a process-level flag reads
+   * identically for a book it does not govern; `byScope` answers the first,
+   * `byBook` the second.
+   *
+   * Returns the rejection reason, or `null` when admitted, in demo, or when the
+   * universe is explicitly unrestricted (`OPTION_LIVE_OTM_UNIVERSE=*`).
+   */
+  private liveOtmUniverseRejectReason(symbol: string): string | null {
+    if (this.mode !== 'live') return null;
+    const universe = resolveLiveOtmUniverse(process.env);
+    // Unrestricted ⇒ no verdict exists to record. `evaluated:0` on this axis is
+    // NOT "the gate never ran" — /api/health/live-enforce-gates publishes
+    // `arm.universe.restricted:false` alongside, which is the discriminator.
+    if (!universe.restricted) return null;
+    const admitted = isSymbolInLiveOtmUniverse(symbol, universe);
+    const reason = admitted
+      ? null
+      : `live OTM universe (TRA-3216): ${symbol} is not on the live underlying allowlist `
+        + `[${universe.symbols.join(',')}] (source ${universe.source})`;
+    recordLiveEnforceDecision(
+      'universe',
+      symbol,
+      !admitted,
+      etDateString(new Date()),
+      reason ?? undefined,
+      Date.now(),
+      { reasonCode: admitted ? undefined : 'not_in_universe', book: this.alertUsername ?? null },
+    );
+    return reason;
   }
 
   /**
@@ -6203,6 +6257,14 @@ export class SignalEngine {
       blocked,
       etDateString(new Date()),
       reason ?? undefined,
+      Date.now(),
+      {
+        // TRA-3216 — the two block modes are operationally different: a
+        // no-usable-delta reject is a DATA defect (lowering the floor admits none
+        // of them), a below-floor reject is a THRESHOLD choice.
+        reasonCode: !blocked ? undefined : absDelta === null ? 'no_usable_delta' : 'below_floor',
+        book: this.alertUsername ?? null,
+      },
     );
     return reason;
   }
@@ -8662,6 +8724,37 @@ export class SignalEngine {
           mispricingPct: cheap.mispricingPct,
           delta: cheap.delta,
         };
+
+        // TRA-3216 (parent TRA-2760) — LIVE UNDERLYING ALLOWLIST. First cut on the
+        // real-money path, and the only one that is about the NAME rather than the
+        // contract. No-op in demo and when explicitly unrestricted.
+        //
+        // Ordered BEFORE the cost bar deliberately. The bar is the expensive,
+        // decisive filter and its block rate is the number operators tune against;
+        // running it over 609 names we will never trade makes that number describe
+        // a population we do not trade. After this cut, `cost_bar` measures the
+        // five names we do. ⚠️ That means the cost_bar denominator STEPS DOWN the
+        // day this deploys — the pre-TRA-3216 rate (1528 evaluated / 0.9915 over
+        // 08-05..11) is NOT comparable to the post rate. The `universe` axis
+        // publishes exactly what was removed, and `retained` keeps 30 days of both.
+        //
+        // Surfaced on the feed like the ceiling/floor rejects, which also parks the
+        // signal in `recentSignals` — so the hour-long dedup above swallows the
+        // repeat and this records ~1 verdict per OCC per hour, not one per sweep.
+        const otmUniverseReject = this.liveOtmUniverseRejectReason(sym);
+        if (otmUniverseReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmUniverseReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by underlying allowlist (TRA-3216)', {
+            sym, optionSymbol: cheap.optionSymbol, reason: otmUniverseReject,
+          });
+          continue;
+        }
 
         // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the OTM
         // open. Same DEMO-ONLY + OFF-by-default gate as the RV path: reject a
@@ -16569,7 +16662,20 @@ export class SignalEngine {
           result.spreadCostBps === null ? 'n/a' : result.spreadCostBps.toFixed(1)
         }bps vs ${DEFAULT_LIQUIDITY_GATE_CONFIG.maxCostBps}bps ceiling) on ${opened.symbol}`
       : undefined;
-    recordLiveEnforceDecision('spread', opened.symbol, blocked, etDateString(new Date()), reason);
+    recordLiveEnforceDecision(
+      'spread',
+      opened.symbol,
+      blocked,
+      etDateString(new Date()),
+      reason,
+      Date.now(),
+      {
+        // TRA-3216 — the gate's own reason tokens, sorted so the key is stable
+        // regardless of the order `evaluateLiquidityGate` happened to emit them.
+        reasonCode: blocked ? [...result.reasons].sort().join('+') : undefined,
+        book: this.alertUsername ?? null,
+      },
+    );
     return blocked ? reason! : null;
   }
 

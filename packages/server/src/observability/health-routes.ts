@@ -110,8 +110,15 @@ import {
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
   admissionBarR,
+  describeCostGateBar, // TRA-3216 — the CONSTANT half of "why did the bar block"
   OPTION_COST_AWARE_GATE_FLAG,
 } from '../option-cost-gate.js';
+// TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist.
+import {
+  resolveLiveOtmUniverse,
+  OPTION_LIVE_OTM_UNIVERSE_VAR,
+  OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED,
+} from '../otm-live-universe-flag.js';
 import {
   summarizeSpreadCost,
   summarizeSpreadCeilingCompliance, // TRA-2316
@@ -3755,6 +3762,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // TRA-2763 — the LIVE arm of the TRA-1407 OTM entry |delta| floor (gate key
     // `otm_delta_floor`). Same tightening-only / process-env-only contract.
     const otmFloorArmed = isOptionOtmDeltaFloorLiveEnforceEnabled(liveEnv);
+    // TRA-3216 — the universe restriction is NOT flag-armed like the three above:
+    // it is ON by default and only an explicit `*` turns it off, so its state
+    // field is `restricted`, not `armed`. Resolving it here (rather than reporting
+    // the raw env var) is what makes a typo'd override visible as
+    // `source:'env_invalid'` instead of reading as a deliberate five-name default.
+    const universe = resolveLiveOtmUniverse(liveEnv);
+    // TRA-3216 — the bar's COMPOSITION, published once. It is identical on every
+    // blocked row, so it cannot live in the per-decision `byReason` fold; without
+    // it, `byReason`'s shortfall buckets have no scale to be read against.
+    const otmBar = describeCostGateBar('single_leg_otm', resolveCostGateConfig(liveEnv));
     const summary = summarizeLiveEnforceGate(etDay);
     const anyArmed = costArmed || spreadArmed || otmFloorArmed;
     res.json({
@@ -3764,8 +3781,29 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       etDay,
       // The arm each live order site actually consults, plus its flag name for ops.
       arm: {
-        costBar: { flag: OPTION_COST_GATE_LIVE_ENFORCE_FLAG, armed: costArmed },
+        costBar: {
+          flag: OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
+          armed: costArmed,
+          /**
+           * TRA-3216 — the resolved `single_leg_otm` bar and where it comes from.
+           * `barPinnedByFloor:true` means OPTION_COST_GATE_MIN_GROSS_R is holding
+           * the bar and retuning COMMISSION_R / SPREAD_CROSS_R alone is a NO-OP —
+           * the single most common way a "retune" ships and changes nothing.
+           */
+          bar: otmBar,
+        },
         spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
+        universe: {
+          var: OPTION_LIVE_OTM_UNIVERSE_VAR,
+          /** FALSE only under an explicit `*` / `ALL`; every other outcome restricts. */
+          restricted: universe.restricted,
+          /** The list the live scan actually enforces (resolver output). Empty ⇒ unrestricted. */
+          symbols: universe.symbols,
+          /** `default` | `env` | `env_unrestricted` | `env_invalid` — `env_invalid` means someone set a value that did not parse and believes something else is in force. */
+          source: universe.source,
+          /** RAW env value, so a fallback is visible rather than inferred. */
+          raw: universe.raw,
+        },
         otmDeltaFloor: {
           flag: OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
           armed: otmFloorArmed,
@@ -3778,10 +3816,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       tighteningOnly: true,
       // Every gate here can ONLY add rejections (TRA-1897-HOLD-safe); none loosens.
       ...summary,
+      // TRA-3216 — the universe restriction is a live rejection path that is ON by
+      // DEFAULT, so it has to enter this sentence. Before this ticket the
+      // `!anyArmed` branch asserted the live path was "byte-for-byte ... no
+      // rejection", which would now be FALSE while reading exactly as before —
+      // the precise instrument failure this route exists to prevent.
       note:
-        !anyArmed
-          ? `SHADOW-ONLY: all live enforcement flags OFF — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection). Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags).`
-          : `ENFORCING (live): cost_bar=${costArmed ? 'ARMED' : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
+        !anyArmed && !universe.restricted
+          ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist.`
+          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}` : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
     });
   });
 

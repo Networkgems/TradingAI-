@@ -30,6 +30,9 @@ import {
   type ExitCadenceRollup,
 } from './health-routes.js';
 import { TEST_ACCOUNT_PREFIX_ENV } from '../test-accounts.js'; // TRA-2478
+// TRA-3216 — the live OTM underlying allowlist + the enforcement-gate ledger it publishes through.
+import { OPTION_LIVE_OTM_UNIVERSE_VAR } from '../otm-live-universe-flag.js';
+import { clearLiveEnforceGateLedger, recordLiveEnforceDecision } from '../live-enforce-gate-ledger.js';
 import type { OptionTradeJournalRecord, OptionTradeJournalOpen } from '../option-trade-journal.js';
 import {
   OPTION_TRADE_JOURNAL_FLAG,
@@ -4494,5 +4497,129 @@ describe('durabilityNote (TRA-3011)', () => {
     expect(note).toMatch(/^NOT DURABLE/);
     expect(note).toMatch(/disk_headroom/);
     expect(note).not.toMatch(/Durable state is intact/);
+  });
+});
+
+// ─── TRA-3216 (parent TRA-2760) — /api/health/live-enforce-gates ──────────────
+// Deliverable 2 of the ticket is "publish the allowlist and COUNT ITS REJECTS".
+// A scanner-level filter whose rejects are invisible is indistinguishable from an
+// inert one, so the publishing IS the deliverable and it needs its own instrument.
+describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
+  const UNIVERSE_VAR = OPTION_LIVE_OTM_UNIVERSE_VAR;
+  let savedUniverse: string | undefined;
+
+  beforeEach(() => {
+    savedUniverse = process.env[UNIVERSE_VAR];
+    delete process.env[UNIVERSE_VAR];
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    if (savedUniverse === undefined) delete process.env[UNIVERSE_VAR];
+    else process.env[UNIVERSE_VAR] = savedUniverse;
+    clearLiveEnforceGateLedger();
+  });
+
+  function serve() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never, // would BLOCK if the route were gated
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/live-enforce-gates')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as {
+      arm: {
+        universe: { var: string; restricted: boolean; symbols: string[]; source: string; raw: string | null };
+        costBar: { bar: { barR: number; barPinnedByFloor: boolean; dominantTerm: string } };
+      };
+      byGate: Array<{
+        gate: string;
+        evaluated: number;
+        blocked: number;
+        byScope: Array<{ scope: string }>;
+        byReason: Array<{ reasonCode: string; blocked: number; share: number | null }>;
+        byBook: Array<{ book: string; evaluated: number; blocked: number }>;
+      }>;
+      note: string;
+    };
+  }
+
+  it('publishes the RESOLVED allowlist, not the raw env var', () => {
+    const body = serve();
+    expect(body.arm.universe).toMatchObject({
+      var: 'OPTION_LIVE_OTM_UNIVERSE',
+      restricted: true,
+      source: 'default',
+      raw: null,
+    });
+    expect(body.arm.universe.symbols).toEqual(['AAPL', 'SPY', 'QQQ', 'PLTR', 'TSLA']);
+    expect(body.note).toMatch(/universe=RESTRICTED to \[AAPL,SPY,QQQ,PLTR,TSLA\]/);
+  });
+
+  it('makes a typo\'d override visible as env_invalid rather than passing as the default', () => {
+    process.env[UNIVERSE_VAR] = ',,,';
+    const body = serve();
+    // Same five symbols as the default — `source` and `raw` are the ONLY things
+    // that tell an operator their value did not take.
+    expect(body.arm.universe).toMatchObject({ restricted: true, source: 'env_invalid', raw: ',,,' });
+  });
+
+  it('does NOT claim the live path is unchanged while the allowlist is restricting', () => {
+    // Every enforcement FLAG is off here, which used to print "all live
+    // enforcement flags OFF — the live options path is byte-for-byte ... (no
+    // rejection)". The allowlist is on by default, so that sentence would now be
+    // false while reading exactly as it always did.
+    const body = serve();
+    expect(body.note).not.toMatch(/SHADOW-ONLY/);
+    expect(body.note).toMatch(/^ENFORCING \(live\)/);
+  });
+
+  it('says SHADOW-ONLY only when the universe is ALSO unrestricted, and names the exposure', () => {
+    process.env[UNIVERSE_VAR] = '*';
+    const body = serve();
+    expect(body.arm.universe).toMatchObject({ restricted: false, source: 'env_unrestricted' });
+    expect(body.note).toMatch(/SHADOW-ONLY/);
+    expect(body.note).toMatch(/~614 watchlist names/);
+  });
+
+  it('publishes the bar composition, so a floor-pinned bar is not re-derived by hand', () => {
+    const body = serve();
+    expect(body.arm.costBar.bar).toMatchObject({ barPinnedByFloor: false, dominantTerm: 'spread_cross' });
+    expect(body.arm.costBar.bar.barR).toBeCloseTo(0.485, 10);
+  });
+
+  it('surfaces the universe rejects with the NAME, the reason split and the BOOK', () => {
+    recordLiveEnforceDecision('universe', 'KVYO', true, etDateString(new Date(NOW)), 'no', NOW, {
+      reasonCode: 'not_in_universe',
+      book: 'admin',
+    });
+    recordLiveEnforceDecision('universe', 'AAPL', false, etDateString(new Date(NOW)), undefined, NOW, {
+      book: 'admin',
+    });
+
+    const u = serve().byGate.find((g) => g.gate === 'universe')!;
+    expect(u).toMatchObject({ evaluated: 2, blocked: 1 });
+    expect(u.byScope.map((s) => s.scope).sort()).toEqual(['AAPL', 'KVYO']);
+    expect(u.byReason).toEqual([{ reasonCode: 'not_in_universe', blocked: 1, share: 1 }]);
+    expect(u.byBook).toEqual([{ book: 'admin', evaluated: 2, blocked: 1, blockRate: 0.5 }]);
+  });
+
+  it('turns the cost bar block rate into a tuneable shortfall distribution', () => {
+    const day = etDateString(new Date(NOW));
+    for (const code of ['shortfall_gte_0.50', 'shortfall_gte_0.50', 'shortfall_lt_0.10']) {
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, day, 'over bar', NOW, { reasonCode: code });
+    }
+    const c = serve().byGate.find((g) => g.gate === 'cost_bar')!;
+    // byScope could only ever answer `single_leg_otm` — that is the whole reason
+    // a 99.15% block rate was undiagnosable.
+    expect(c.byScope).toEqual([expect.objectContaining({ scope: 'single_leg_otm' })]);
+    expect(c.byReason).toEqual([
+      { reasonCode: 'shortfall_gte_0.50', blocked: 2, share: 0.6667 },
+      { reasonCode: 'shortfall_lt_0.10', blocked: 1, share: 0.3333 },
+    ]);
   });
 });
