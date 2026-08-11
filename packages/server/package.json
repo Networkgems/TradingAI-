@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b --force",
     "dev": "node --import tsx/esm src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
