@@ -113,6 +113,8 @@ import {
   describeCostGateBar, // TRA-3216 — the CONSTANT half of "why did the bar block"
   OPTION_COST_AWARE_GATE_FLAG,
 } from '../option-cost-gate.js';
+// TRA-3272 — the NET-EDGE cost-bar form's arm description.
+import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist.
 import {
   resolveLiveOtmUniverse,
@@ -3860,6 +3862,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // blocked row, so it cannot live in the per-decision `byReason` fold; without
     // it, `byReason`'s shortfall buckets have no scale to be read against.
     const otmBar = describeCostGateBar('single_leg_otm', resolveCostGateConfig(liveEnv));
+    // TRA-3272 — the NET-EDGE bar form (per-candidate quote + fees vs k× modeled
+    // edge). When armed for `single_leg_otm` it REPLACES the flat bar above for
+    // that structure, so `form` says which one the live OTM open actually faces.
+    const netEdge = describeNetEdgeBar(liveEnv);
+    const netEdgeGovernsOtm = netEdge.enabled && netEdge.structures.includes('single_leg_otm');
     const summary = summarizeLiveEnforceGate(etDay);
     const anyArmed = costArmed || spreadArmed || otmFloorArmed;
     res.json({
@@ -3879,6 +3886,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
            * the single most common way a "retune" ships and changes nothing.
            */
           bar: otmBar,
+          /**
+           * TRA-3272 — which FORM the live `single_leg_otm` cost bar runs:
+           * `flat` (the constant `bar.barR` above) or `net_edge` (per-candidate
+           * quote + fees vs k× modeled edge; `bar` above is then NOT what the
+           * OTM open faces). Structures outside `netEdge.structures` keep the
+           * flat form regardless of the flag.
+           */
+          form: netEdgeGovernsOtm ? 'net_edge' : 'flat',
+          netEdge,
         },
         spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
         universe: {
@@ -3912,7 +3928,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note:
         !anyArmed && !universe.restricted
           ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist.`
-          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}` : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
+          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
     });
   });
 

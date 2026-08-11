@@ -327,6 +327,15 @@ import {
   resolveCostGateConfig,
   costGateBlockReasonCode, // TRA-3216 — the foldable classification of a block
 } from './option-cost-gate.js';
+// TRA-3272 (parent TRA-3271) — the NET-EDGE form of the cost bar: per-candidate
+// quote + fees vs k× modeled edge, replacing the flat constant bar for the
+// structures it governs. OFF by default; QuantTrader pre-registers parameters
+// off the TRA-3216 reason-split tape before any arming.
+import {
+  resolveNetEdgeBarConfig,
+  isNetEdgeGovernedStructure,
+  netEdgeBarVerdict,
+} from './option-net-edge-bar.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
 // handed the full ~614-name watchlist; this is the only universe restriction on
 // the real-money path.
@@ -6149,11 +6158,46 @@ export class SignalEngine {
    * skipped, or `null` when admitted OR when the gate is inactive (no behaviour
    * change — the caller opens exactly as before).
    */
-  private costAwareGateReject(structure: string, inputs: ModeledGrossRInputs): string | null {
+  private costAwareGateReject(
+    structure: string,
+    inputs: ModeledGrossRInputs,
+    // TRA-3272 — the candidate's OWN quote at decision time, consumed only by the
+    // net-edge bar form. Optional so the three pre-existing call sites compile
+    // unchanged if a future site has no quote (the net-edge form then fails
+    // closed for governed structures — never open).
+    quote?: { bid?: number; ask?: number },
+  ): string | null {
     if (this.mode === 'demo') {
       const env = this.resolveDemoFlagEnv();
       if (!isOptionCostAwareGateEnabled(env)) return null;
       const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
+      // TRA-3272 — NET-EDGE form (demo shadow-arm path via demo-flags env). When
+      // armed for this structure it REPLACES the flat verdict; the recorded barR
+      // is the candidate's equivalent bar (costR / k) so the ledger keeps a scale.
+      const netEdgeConfig = resolveNetEdgeBarConfig(env);
+      if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
+        const verdict = netEdgeBarVerdict(
+          {
+            mark: inputs.mark,
+            bid: quote?.bid,
+            ask: quote?.ask,
+            riskPerShare:
+              typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
+                ? inputs.mark - inputs.stopPrice
+                : undefined,
+            modeledGrossR: estimate.modeledGrossR,
+          },
+          netEdgeConfig,
+        );
+        recordCostAwareGateDecision(
+          structure,
+          verdict.admit,
+          estimate.modeledGrossR,
+          verdict.requiredEdgeR,
+          etDateString(new Date()),
+        );
+        return verdict.admit ? null : verdict.reason;
+      }
       const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
       // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
       // evidence is the trades that DIDN'T happen, so record every armed verdict for
@@ -6178,6 +6222,39 @@ export class SignalEngine {
     if (this.mode === 'live') {
       if (!isOptionCostGateLiveEnforceEnabled(process.env)) return null;
       const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(process.env));
+      // TRA-3272 — NET-EDGE form on the LIVE branch. Process-env only (same
+      // secret-adjacent contract as the enforce flag itself, which is already
+      // armed by the time we are here). When armed for this structure it
+      // REPLACES the flat verdict; blocks fold under `net_edge_*` reason codes
+      // in `/api/health/live-enforce-gates` `byReason`, siblings of the flat
+      // form's `shortfall_*` buckets. OFF by default ⇒ this branch is inert and
+      // the flat bar below runs byte-for-byte unchanged.
+      const netEdgeConfig = resolveNetEdgeBarConfig(process.env);
+      if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
+        const verdict = netEdgeBarVerdict(
+          {
+            mark: inputs.mark,
+            bid: quote?.bid,
+            ask: quote?.ask,
+            riskPerShare:
+              typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
+                ? inputs.mark - inputs.stopPrice
+                : undefined,
+            modeledGrossR: estimate.modeledGrossR,
+          },
+          netEdgeConfig,
+        );
+        recordLiveEnforceDecision(
+          'cost_bar',
+          structure,
+          !verdict.admit,
+          etDateString(new Date()),
+          verdict.admit ? undefined : verdict.reason,
+          Date.now(),
+          { reasonCode: verdict.reasonCode ?? undefined, book: this.alertUsername ?? null },
+        );
+        return verdict.admit ? null : verdict.reason;
+      }
       const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(process.env));
       // TRA-3216 — `reason` is per-candidate prose (it embeds this candidate's own
       // gross R), so a fold on it has one bucket per decision. `reasonCode` is the
@@ -8060,7 +8137,9 @@ export class SignalEngine {
           targetPrice: takeProfit,
           stopPrice: stopLoss,
           riskRewardRatio: signal.riskRewardRatio,
-        });
+          // TRA-3272 — the candidate's own quote, for the net-edge bar form
+          // (inert on this structure until OPTION_NET_EDGE_STRUCTURES adds it).
+        }, { bid: cheap.bid, ask: cheap.ask });
         if (rvCostReject) {
           signal.signalSkipReason = rvCostReject;
           log.info('RV long rejected by cost-aware fire bar (TRA-1602)', { sym, reason: rvCostReject });
@@ -8864,7 +8943,8 @@ export class SignalEngine {
           targetPrice: takeProfit,
           stopPrice: stopLoss,
           riskRewardRatio: signal.riskRewardRatio,
-        });
+          // TRA-3272 — the candidate's own quote, for the net-edge bar form.
+        }, { bid: cheap.bid, ask: cheap.ask });
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
@@ -10057,7 +10137,9 @@ export class SignalEngine {
           mark: best.mark,
           delta: signal.delta,
           riskRewardRatio: signal.riskRewardRatio,
-        });
+          // TRA-3272 — the candidate's own quote, for the net-edge bar form
+          // (inert on this structure until OPTION_NET_EDGE_STRUCTURES adds it).
+        }, { bid: best.row.bid, ask: best.row.ask });
         if (dirCostReject) {
           log.info('demo directional rejected by cost-aware fire bar (TRA-1602)', {
             symbol: sym, reason: dirCostReject,
