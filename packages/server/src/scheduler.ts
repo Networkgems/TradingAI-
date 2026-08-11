@@ -54,10 +54,20 @@ export function etDateString(date: Date = new Date()): string {
   return date.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
+/**
+ * TRA-3267 — is the ET calendar day containing `date` a trading day?
+ *
+ * Day-of-week MUST come from the ET date, not from `date.getDay()`: that reads
+ * the HOST-LOCAL day, and prod runs in UTC, where every instant from 20:00 ET
+ * (EDT; 19:00 EST) onward already sits on the NEXT UTC day. The 21:00 ET
+ * archive lives entirely inside that window, so the local-day version returned
+ * "Saturday" for Friday's close (dropping Friday's EOD ledger row fleet-wide,
+ * 2026-08-07) and "Monday" for Sunday evening (booking a phantom Sunday
+ * session, 2026-08-09). The holiday lookup below was already ET-keyed — the
+ * two halves of the predicate disagreed about what day it was.
+ */
 export function isMarketDay(date: Date = new Date()): boolean {
-  const dayOfWeek = date.getDay(); // 0=Sun, 6=Sat
-  if (dayOfWeek === 0 || dayOfWeek === 6) return false;
-  return !MARKET_HOLIDAYS.has(etDateString(date));
+  return isMarketDayIso(etDateString(date));
 }
 
 /**

@@ -1505,6 +1505,34 @@ describe('TRA-2926 — the frozen accusation is gated on calendar adjacency', ()
     expect(r.counterFrozenDates).toEqual(['2026-08-04']);
     expect(r.counterGapSuppressedDates).toEqual([]);
   });
+
+  // TRA-3267 — the `sessionsInRange(...).length === 2` adjacency test assumes
+  // both endpoints are sessions. The 21:00 ET archive's host-UTC weekday read
+  // wrote a PHANTOM Sunday row fleet-wide on 2026-08-09 while dropping Friday
+  // 08-07, and [Thu 08-06, Sun 08-09] contains exactly two sessions (Thursday
+  // and the unwritten Friday) — so the phantom pair graded ADJACENT and carried
+  // Friday's real P&L as a frozen-counter accusation on 3 live-fleet books.
+  it('TRA-3267: a row dated on a NON-SESSION can never grade adjacent — the phantom Sunday is fenced, not accused', () => {
+    const r = reconcilePnl(
+      [
+        // Thursday close.
+        creditSnap('2026-08-06', 0, 50, 0, 2_000),
+        // Phantom Sunday row: Friday's +40.89 sits in its window, unbooked.
+        creditSnap('2026-08-09', 0, 0, 0, 2_040.89),
+        // Legitimate Monday row.
+        creditSnap('2026-08-10', 0, 0, 0, 2_040.89),
+      ],
+      new Map(), '2026-07-12', null, null, null, cal('2026-08-10'),
+    );
+    const sunday = r.days.find(d => d.date === '2026-08-09')!;
+    expect(sunday.priorSessionAdjacent).toBe(false);
+    expect(sunday.counterFrozen).toBeNull();
+    expect(r.counterFrozenDates).toEqual([]);
+    // The raw arithmetic stays published — fenced, not deleted — and the
+    // suppression is enumerable, never silent (same contract as TRA-2926).
+    expect(sunday.unbookedEquityMoveUsd).toBeCloseTo(40.89, 2);
+    expect(r.counterGapSuppressedDates).toContain('2026-08-09');
+  });
 });
 
 describe('TRA-2658 — liveCounterDurableOk', () => {

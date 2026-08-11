@@ -2302,8 +2302,18 @@ export function reconcilePnl(
   for (let i = 1; i < days.length; i++) {
     const cur = days[i]!;
     const prev = days[i - 1]!;
+    // TRA-3267 — the `=== 2` test assumes BOTH endpoints are sessions. A row
+    // whose own date is not an exchange session (the 21:00 ET archive wrote
+    // phantom Sunday rows when `isMarketDay` read the host-UTC weekday, e.g.
+    // 2026-08-09 fleet-wide) breaks that assumption in the accusing direction:
+    // [Thu 08-06, Sun 08-09] contains exactly two sessions — Thursday and the
+    // UNWRITTEN Friday — so the phantom pair graded as adjacent while carrying
+    // Friday's real P&L as an "unbooked" move. A non-session row can never form
+    // a gradeable pair; the prev-side case needs no gate because a non-session
+    // `prev` already fails the session count.
     const adjacent = tailCalendar
-      ? sessionsInRange(prev.date, cur.date, tailCalendar.isMarketDay).length === 2
+      ? tailCalendar.isMarketDay(cur.date) &&
+        sessionsInRange(prev.date, cur.date, tailCalendar.isMarketDay).length === 2
       : null;
     cur.priorSessionAdjacent = adjacent;
     if (adjacent === false) {

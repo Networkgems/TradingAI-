@@ -50,6 +50,26 @@ describe('isMarketDay', () => {
     // 2026-04-30 is a Thursday and not a holiday
     expect(isMarketDay(new Date(Date.UTC(2026, 3, 30, 17, 0, 0)))).toBe(true);
   });
+
+  // TRA-3267 — the 21:00 ET archive window sits on the NEXT UTC day, and prod
+  // runs in UTC. Day-of-week must follow the ET calendar date, not the host's.
+  // These instants are exactly where the old `date.getDay()` predicate flipped:
+  // it dropped Friday's EOD row (read "Saturday") and booked a phantom Sunday
+  // session (read "Monday"). Assertions are TZ-independent because the impl is;
+  // under `TZ=UTC` (CI/prod parity) the old impl fails both.
+  it('follows the ET calendar day across the UTC midnight boundary (TRA-3267)', () => {
+    // Friday 2026-08-07 21:00 EDT = Saturday 2026-08-08T01:00Z → still Friday in ET.
+    expect(isMarketDay(new Date('2026-08-08T01:00:00Z'))).toBe(true);
+    // Sunday 2026-08-09 21:00 EDT = Monday 2026-08-10T01:00Z → still Sunday in ET.
+    expect(isMarketDay(new Date('2026-08-10T01:00:00Z'))).toBe(false);
+    // Saturday 2026-08-08 21:00 EDT = Sunday 2026-08-09T01:00Z → still Saturday in ET.
+    expect(isMarketDay(new Date('2026-08-09T01:00:00Z'))).toBe(false);
+    // EST spelling of the same boundary: Friday 2026-01-16 21:00 EST = 02:00Z Sat.
+    expect(isMarketDay(new Date('2026-01-17T02:00:00Z'))).toBe(true);
+    // A holiday keyed on the ET date stays a holiday when read from the UTC
+    // evening after it: Juneteenth Friday 2026-06-19 21:00 EDT = 06-20T01:00Z.
+    expect(isMarketDay(new Date('2026-06-20T01:00:00Z'))).toBe(false);
+  });
 });
 
 describe('MarketScheduler — TRA-193 onDaily / onMarketClose / onArchive', () => {
