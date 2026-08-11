@@ -27,6 +27,14 @@ function book(summary: ReturnType<typeof summarizeEodArchiveParticipation>, user
   return summary.byBook.find((b) => b.username === username);
 }
 
+function bookAnomalyNames(summary: ReturnType<typeof summarizeEodArchiveParticipation>) {
+  return summary.anomalies.flatMap((a) => (a.kind === 'book' ? [a.username] : []));
+}
+
+function sessionAnomalies(summary: ReturnType<typeof summarizeEodArchiveParticipation>) {
+  return summary.anomalies.flatMap((a) => (a.kind === 'book' ? [] : [a]));
+}
+
 describe('eod-archive-participation', () => {
   let dir: string;
 
@@ -92,7 +100,7 @@ describe('eod-archive-participation', () => {
 
       const s = summarizeEodArchiveParticipation();
       expect(book(s, 'enock')?.absentFromContextMap).toBe(1);
-      expect(s.anomalies.map((b) => b.username)).toEqual(['enock']);
+      expect(bookAnomalyNames(s)).toEqual(['enock']);
     });
 
     it('writes the absent rows BEFORE the loop, so a mid-loop crash still leaves candidate (a)', () => {
@@ -303,7 +311,7 @@ describe('eod-archive-participation', () => {
       expect(enock?.lastParticipatedDay).toBeNull();
       expect(enock?.participationRate).toBe(0);
       expect(book(s, 'alice')?.consecutiveMisses).toBe(0);
-      expect(s.anomalies.map((b) => b.username)).toEqual(['enock']);
+      expect(bookAnomalyNames(s)).toEqual(['enock']);
       expect(s.verdict).toBe('misses');
     });
 
@@ -337,6 +345,180 @@ describe('eod-archive-participation', () => {
       // Still an anomaly — the window remembers the two misses even after the heal.
       // A self-repairing failure that erases its own evidence is the TRA-2903 trap.
       expect(s.anomalies).toHaveLength(1);
+    });
+  });
+
+  // ── TRA-3284: the denominator must not come from the thing being measured ──
+  //
+  // TRA-3267 broke `isMarketDay()` and this record graded the incident CLEAN, because
+  // its denominator was the archive's own recorded `marketDay`: the lost Friday left
+  // the denominator as `skipped_not_market_day`, the phantom Sunday joined it and
+  // passed 63/63. These tests pin the read-time second opinion (`isMarketDayIso`) that
+  // makes both directions an ANOMALY instead of an exclusion.
+
+  describe('TRA-3284 session-calendar cross-check', () => {
+    it('a run recording marketDay:false on a calendar session is a LOST SESSION, not an exclusion', () => {
+      // Friday 2026-08-07 — the fleet-wide lost session. Under the old grading this
+      // read as BLIND-or-cleaner: the day simply left the denominator.
+      const run = openEodArchiveParticipationRun({
+        etDay: '2026-08-07',
+        marketDay: false,
+        roster: ['alice', 'bob'],
+        contextUsernames: ['alice', 'bob'],
+        now: T0,
+      });
+      recordEodParticipation(run, 'alice', 'skipped_not_market_day', undefined, T0 + 1);
+      recordEodParticipation(run, 'bob', 'skipped_not_market_day', undefined, T0 + 2);
+
+      const s = summarizeEodArchiveParticipation();
+      expect(s.verdict).toBe('session_anomalies');
+      expect(s.verdict).not.toBe('clean');
+      expect(s.verdict).not.toBeNull(); // a lost session is NOT "nothing was expected"
+      const anoms = sessionAnomalies(s);
+      expect(anoms).toHaveLength(1);
+      expect(anoms[0]?.kind).toBe('lost_session');
+      expect(anoms[0]?.etDay).toBe('2026-08-07');
+      expect(anoms[0]?.recordedMarketDay).toBe(false);
+      expect(anoms[0]?.calendarMarketDay).toBe(true);
+      expect(anoms[0]?.skippedNotMarketDay).toBe(2);
+      // Both denominators are published, side by side.
+      expect(s.marketDayRuns).toBe(0);
+      expect(s.calendarSessionRuns).toBe(1);
+      expect(s.byDay[0]?.sessionAnomaly).toBe('lost_session');
+      expect(s.byDay[0]?.calendarMarketDay).toBe(true);
+    });
+
+    it('a run recording marketDay:true on a Sunday is a PHANTOM SESSION, and participation there is not health', () => {
+      // Sunday 2026-08-09 — the phantom session that passed 63/63.
+      const run = openEodArchiveParticipationRun({
+        etDay: '2026-08-09',
+        marketDay: true,
+        roster: ['alice'],
+        contextUsernames: ['alice'],
+        now: T0,
+      });
+      recordEodParticipation(run, 'alice', 'participated', undefined, T0 + 1);
+
+      const s = summarizeEodArchiveParticipation();
+      expect(s.verdict).toBe('session_anomalies');
+      expect(s.verdict).not.toBe('clean');
+      const anoms = sessionAnomalies(s);
+      expect(anoms).toHaveLength(1);
+      expect(anoms[0]?.kind).toBe('phantom_session');
+      expect(anoms[0]?.etDay).toBe('2026-08-09');
+      expect(anoms[0]?.recordedMarketDay).toBe(true);
+      expect(anoms[0]?.calendarMarketDay).toBe(false);
+      expect(anoms[0]?.participated).toBe(1);
+      expect(s.marketDayRuns).toBe(1);
+      expect(s.calendarSessionRuns).toBe(0);
+      expect(s.byDay[0]?.sessionAnomaly).toBe('phantom_session');
+    });
+
+    it('replays the 08-05..08-10 incident window: non-clean, both days named, denominators side by side', () => {
+      // Exactly the live tape that graded CLEAN: Wed/Thu recorded correctly, Friday
+      // lost, Saturday agreed, Sunday phantom, Monday correct. Recorded marketDayRuns
+      // and calendarSessionRuns BOTH read 4 — equal counts, different members. Only
+      // the anomalies expose it.
+      const roster = ['alice', 'bob'];
+      const tape: Array<[string, boolean]> = [
+        ['2026-08-05', true], // Wed — correct
+        ['2026-08-06', true], // Thu — correct
+        ['2026-08-07', false], // Fri — LOST (UTC weekday said Saturday)
+        ['2026-08-08', false], // Sat — correct skip
+        ['2026-08-09', true], // Sun — PHANTOM (UTC weekday said Monday)
+        ['2026-08-10', true], // Mon — correct
+      ];
+      let t = T0;
+      for (const [etDay, marketDay] of tape) {
+        const run = openEodArchiveParticipationRun({
+          etDay,
+          marketDay,
+          roster,
+          contextUsernames: roster,
+          now: t,
+        });
+        for (const u of roster) {
+          recordEodParticipation(
+            run,
+            u,
+            marketDay ? 'participated' : 'skipped_not_market_day',
+            undefined,
+            t + 1,
+          );
+        }
+        t += 86_400_000;
+      }
+
+      const s = summarizeEodArchiveParticipation();
+      expect(s.verdict).toBe('session_anomalies');
+      expect(s.verdict).not.toBe('clean');
+      expect(s.runs).toBe(6);
+      expect(s.marketDayRuns).toBe(4);
+      expect(s.calendarSessionRuns).toBe(4); // same COUNT — which is why counts alone can't grade this
+      const anoms = sessionAnomalies(s);
+      expect(anoms.map((a) => [a.etDay, a.kind])).toEqual(
+        expect.arrayContaining([
+          ['2026-08-07', 'lost_session'],
+          ['2026-08-09', 'phantom_session'],
+        ]),
+      );
+      expect(anoms).toHaveLength(2);
+      // No book anomalies — the defect is the denominator, not any book.
+      expect(bookAnomalyNames(s)).toEqual([]);
+    });
+
+    it('clean stays reachable when the recorded flag and the calendar agree everywhere', () => {
+      const run = openEodArchiveParticipationRun({
+        etDay: '2026-08-10', // Monday
+        marketDay: true,
+        roster: ['alice'],
+        contextUsernames: ['alice'],
+        now: T0,
+      });
+      recordEodParticipation(run, 'alice', 'participated', undefined, T0 + 1);
+      const sat = openEodArchiveParticipationRun({
+        etDay: '2026-08-08', // Saturday, correctly skipped
+        marketDay: false,
+        roster: ['alice'],
+        contextUsernames: ['alice'],
+        now: T0 + 1000,
+      });
+      recordEodParticipation(sat, 'alice', 'skipped_not_market_day', undefined, T0 + 1001);
+
+      const s = summarizeEodArchiveParticipation();
+      expect(s.verdict).toBe('clean');
+      expect(sessionAnomalies(s)).toHaveLength(0);
+      expect(s.marketDayRuns).toBe(1);
+      expect(s.calendarSessionRuns).toBe(1);
+    });
+
+    it('participation on a phantom day does not clear a live market-day miss streak', () => {
+      const roster = ['enock'];
+      // Two real market-day misses…
+      let t = T0;
+      for (const day of ['2026-06-15', '2026-06-16']) {
+        openEodArchiveParticipationRun({
+          etDay: day,
+          marketDay: true,
+          roster,
+          contextUsernames: [],
+          now: t,
+        });
+        t += 86_400_000;
+      }
+      // …then a phantom Sunday where the book "participated". Fabricated evidence.
+      const phantom = openEodArchiveParticipationRun({
+        etDay: '2026-06-21', // Sunday
+        marketDay: true,
+        roster,
+        contextUsernames: ['enock'],
+        now: t,
+      });
+      recordEodParticipation(phantom, 'enock', 'participated', undefined, t + 1);
+
+      const s = summarizeEodArchiveParticipation();
+      expect(book(s, 'enock')?.consecutiveMisses).toBe(2);
+      expect(s.verdict).toBe('session_anomalies');
     });
   });
 

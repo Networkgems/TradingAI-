@@ -96,7 +96,10 @@ import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
-import { summarizeEodArchiveParticipation } from '../eod-archive-participation.js'; // TRA-2930
+import {
+  summarizeEodArchiveParticipation,
+  type EodParticipationSessionAnomaly,
+} from '../eod-archive-participation.js'; // TRA-2930 / TRA-3284
 import type { TapeSummary } from '../denominator-flip-tape-summary.js'; // TRA-3116
 import {
   summarizeGiveBackArmFloor,
@@ -3956,10 +3959,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // Read in this order:
   //  1. `durability.ephemeral` — TRUE ⇒ every row dies on the next redeploy and this
   //     is a since-boot counter wearing a ledger's clothes (fix = DATA_DIR=/data).
-  //  2. `verdict` — TRI-STATE. `null` is BLIND, not clean: a recorder that has never
-  //     seen an archive pass and a perfect record are the same reading on every count
-  //     in this payload, so they are given different values. `blindReason` says which.
-  //  3. `anomalies` — the books with at least one miss, worst first.
+  //  2. `verdict` — `null` is BLIND, not clean: a recorder that has never seen an
+  //     archive pass and a perfect record are the same reading on every count in this
+  //     payload, so they are given different values. `blindReason` says which.
+  //     `session_anomalies` means the archive's own `marketDay` flag disagrees with
+  //     the independent calendar (TRA-3284) — the denominator itself is untrusted, so
+  //     it dominates `misses` and makes `clean` unreachable.
+  //  3. `marketDayRuns` vs `calendarSessionRuns` — the recorded denominator next to
+  //     the calendar-derived one. Equal counts do NOT imply agreement (08-05..08-10
+  //     read 4 vs 4 with different member days); `anomalies` names the disagreements.
+  //  4. `anomalies` — session-calendar disagreements first (lost/phantom sessions),
+  //     then books with at least one miss, worst first.
   //     `consecutiveMisses` is the TRA-2903 shape; it read 28 there.
   //
   // Per-book `participationRate` is `null` on an empty cohort, never 0 and never 1 — a
@@ -3968,6 +3978,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   app.get('/api/health/eod-archive-participation', (_req, res) => {
     const nowMs = now();
     const summary = summarizeEodArchiveParticipation();
+    const sessionAnoms = summary.anomalies.filter(
+      (a): a is EodParticipationSessionAnomaly => a.kind !== 'book',
+    );
+    const bookAnoms = summary.anomalies.filter((a) => a.kind === 'book');
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -3977,9 +3991,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note:
         summary.verdict === null
           ? `BLIND — no gradeable archive pass on record. ${summary.blindReason ?? ''} This is NOT a clean bill of health.`
-          : summary.verdict === 'clean'
-            ? `CLEAN over ${summary.marketDayRuns} market-day archive pass(es) (${summary.firstDay ?? '-'}..${summary.lastDay ?? '-'}): every roster book produced an EOD row on every one. The denominator is published because "clean" and "never observed" are otherwise the same reading.`
-            : `MISSES: ${summary.anomalies.length} book(s) missed at least one market-day archive pass over ${summary.marketDayRuns} pass(es). Read each anomaly's lastOutcome — absent_from_context_map is a BOOT failure (candidate a, look at initUserContext / initAllUserContexts), report_threw is a REPORT failure (candidate b, lastReason carries the message). That discrimination is the whole reason this record exists (TRA-2930).`,
+          : summary.verdict === 'session_anomalies'
+            ? `SESSION-CALENDAR DISAGREEMENT on ${sessionAnoms.length} day(s): ${sessionAnoms
+                .map((a) => `${a.etDay}=${a.kind}`)
+                .join(
+                  ', ',
+                )}. The archive's recorded marketDay contradicts the independent NYSE calendar, so the participation denominator (marketDayRuns=${summary.marketDayRuns} vs calendarSessionRuns=${summary.calendarSessionRuns}) cannot be trusted and NO clean bill is possible — a lost session is a fleet-wide miss reclassified as "never owed", a phantom session is fabricated evidence of health (TRA-3267/TRA-3284).${bookAnoms.length > 0 ? ` Additionally ${bookAnoms.length} book(s) carry ordinary misses — read their lastOutcome.` : ''}`
+            : summary.verdict === 'clean'
+              ? `CLEAN over ${summary.marketDayRuns} market-day archive pass(es) (${summary.firstDay ?? '-'}..${summary.lastDay ?? '-'}), calendar-confirmed (calendarSessionRuns=${summary.calendarSessionRuns}, zero disagreements): every roster book produced an EOD row on every one. Both denominators are published because "clean" and "never observed" are otherwise the same reading.`
+              : `MISSES: ${bookAnoms.length} book(s) missed at least one market-day archive pass over ${summary.marketDayRuns} pass(es). Read each anomaly's lastOutcome — absent_from_context_map is a BOOT failure (candidate a, look at initUserContext / initAllUserContexts), report_threw is a REPORT failure (candidate b, lastReason carries the message). That discrimination is the whole reason this record exists (TRA-2930).`,
     });
   });
 

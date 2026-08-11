@@ -68,6 +68,27 @@
 //     DATA_DIR unset the fallback path lives inside the build bundle and evaporates
 //     on redeploy with NO error to catch.
 //
+// ── THE DENOMINATOR MUST NOT COME FROM THE THING BEING MEASURED (TRA-3284) ───
+// TRA-3267 broke `isMarketDay()` (UTC weekday at the 21:00 ET archive): Friday
+// 2026-08-07 was recorded `marketDay:false` (a full session lost fleet-wide) and
+// Sunday 2026-08-09 `marketDay:true` (a phantom session, 63/63 "participated"). This
+// record graded that incident CLEAN, because it took the archive's own self-reported
+// `marketDay` as its denominator: the lost Friday was EXCLUDED as
+// `skipped_not_market_day` and the phantom Sunday was INCLUDED and passed. A wrong
+// `marketDay` can only ever make this monitor greener, never redder — the
+// self-confirming health-gate class (TRA-2671).
+//
+// So `summarizeEodArchiveParticipation` re-derives every run day's session status from
+// `isMarketDayIso(etDay)` AT READ TIME — a second opinion independent of what the
+// archive recorded. A disagreement is an ANOMALY, never an exclusion:
+//   calendar says session, run recorded `marketDay:false` -> LOST SESSION
+//   calendar says no session, run recorded `marketDay:true` -> PHANTOM SESSION
+// Either forces `verdict` away from `'clean'`. Because the check runs at read time
+// over the retained rows, the verdict is automatically backfilled over the whole
+// window (the GRADE is corrected, never the rows — ENABLE_EOD_ROW_BACKFILL stays
+// false, per the TRA-2888/TRA-2886 refusals). `calendarSessionRuns` is published next
+// to `marketDayRuns` so the two denominators are visible side by side.
+//
 // ── SCOPE / INVARIANT ────────────────────────────────────────────────────────
 // Pure observation. This module NEVER places an order, mutates an account, retries a
 // report, or changes what the archive does. Every write is best-effort and swallowed:
@@ -80,6 +101,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
 import { logger } from './observability/index.js';
+import { isMarketDayIso } from './scheduler.js'; // TRA-3284: the independent second opinion
 
 const log = logger.child({ module: 'eod-archive-participation' });
 
@@ -433,8 +455,12 @@ export function hydrateEodArchiveParticipationFromDisk(
 
 export interface EodParticipationDaySummary {
   etDay: string;
-  /** TRUE ⇒ a stock EOD row was expected from every roster book that day. */
+  /** What the archive RECORDED from `isMarketDay()` at run time. Not ground truth (TRA-3267). */
   marketDay: boolean;
+  /** What the independent calendar (`isMarketDayIso`) says AT READ TIME. TRA-3284. */
+  calendarMarketDay: boolean;
+  /** Non-null ⇔ `marketDay` and `calendarMarketDay` disagree for this pass. */
+  sessionAnomaly: 'lost_session' | 'phantom_session' | null;
   rosterSize: number;
   contextMapSize: number;
   participated: number;
@@ -485,27 +511,74 @@ export interface EodParticipationDurability {
   lastAppendError: string | null;
 }
 
+/**
+ * TRA-3284 — one ET day where the archive's recorded `marketDay` disagrees with the
+ * independent calendar, evaluated at read time. Surfaced as an ANOMALY, never folded
+ * into an exclusion: a wrong `marketDay` used to be able to only make this record
+ * GREENER (a lost session left the denominator; a phantom one joined it and passed).
+ */
+export interface EodParticipationSessionAnomaly {
+  /** `'lost_session'` — calendar session recorded as no-session (the day left the denominator). */
+  kind: 'lost_session' | 'phantom_session';
+  etDay: string;
+  /** What the archive recorded from `isMarketDay()` at run time (any pass that day). */
+  recordedMarketDay: boolean;
+  /** What `isMarketDayIso(etDay)` says at read time. */
+  calendarMarketDay: boolean;
+  /** Book rows written under the wrong flag — `participated` on a phantom day is NOT evidence of health. */
+  participated: number;
+  skippedNotMarketDay: number;
+  runIds: string[];
+  note: string;
+}
+
+export type EodParticipationAnomaly =
+  | ({ kind: 'book' } & EodParticipationBookSummary)
+  | EodParticipationSessionAnomaly;
+
 export interface EodParticipationSummary {
   /** Archive passes on record (all days, market and not). */
   runs: number;
-  /** Passes on NYSE trading days — the denominator any miss claim rests on. */
+  /**
+   * Passes whose run row RECORDED `marketDay:true`. This is what the archive believed,
+   * not ground truth — read it next to `calendarSessionRuns` (TRA-3284).
+   */
   marketDayRuns: number;
+  /**
+   * Passes whose `etDay` is a session by the INDEPENDENT calendar (`isMarketDayIso`
+   * at read time). Published beside `marketDayRuns` because a published denominator is
+   * what separates "clean" from "never observed" — and TWO published denominators are
+   * what let a reader see the archive disagreeing with the calendar at all. Equal
+   * COUNTS do not imply agreement (08-05..08-10 read 4 vs 4 with different members);
+   * `anomalies` carries the per-day disagreements.
+   */
+  calendarSessionRuns: number;
   firstDay: string | null;
   lastDay: string | null;
   /**
-   * Tri-state, deliberately NOT a boolean:
-   *  - `'clean'`         — market-day passes observed, every roster book participated in all of them;
-   *  - `'misses'`        — at least one book missed at least one market-day pass;
-   *  - `null`            — **BLIND**: no market-day pass on record. A never-fired recorder
-   *                        and a perfect record are the same reading on a count, so they
-   *                        are given different values here. Read `blindReason`.
+   * Tri-state-plus, deliberately NOT a boolean:
+   *  - `'clean'`             — market-day passes observed, calendar agrees on every day,
+   *                            every roster book participated in all of them;
+   *  - `'misses'`            — at least one book missed at least one market-day pass;
+   *  - `'session_anomalies'` — the recorded `marketDay` disagrees with the independent
+   *                            calendar on ≥1 day (lost/phantom session, TRA-3284). This
+   *                            DOMINATES `'misses'`: the denominator itself is untrusted,
+   *                            so any per-book grade over it is suspect. `'clean'` is
+   *                            unreachable while a disagreement is in the window.
+   *  - `null`                — **BLIND**: no session on record by EITHER denominator.
+   *                            A never-fired recorder and a perfect record are the same
+   *                            reading on a count, so they are given different values
+   *                            here. Read `blindReason`.
    */
-  verdict: 'clean' | 'misses' | null;
+  verdict: 'clean' | 'misses' | 'session_anomalies' | null;
   blindReason: string | null;
   /** Per-book rollup, worst first (most misses, then fewest participations). */
   byBook: EodParticipationBookSummary[];
-  /** Books with at least one miss in the window — the cohort worth reading. */
-  anomalies: EodParticipationBookSummary[];
+  /**
+   * Everything wrong in the window, worst class first: session-calendar disagreements
+   * (TRA-3284), then books with at least one miss.
+   */
+  anomalies: EodParticipationAnomaly[];
   /** Per-day rollup, most recent first, capped by `dayLimit`. */
   byDay: EodParticipationDaySummary[];
   durability: EodParticipationDurability;
@@ -570,8 +643,12 @@ export function summarizeEodArchiveParticipation(dayLimit = 45): EodParticipatio
   }
 
   // Consecutive most-recent MARKET-DAY misses per book (the TRA-2903 shape).
+  // A run counts toward the streak only when the recorded flag AND the independent
+  // calendar agree it was a session (TRA-3284): a `participated` row on a phantom
+  // Sunday must not clear a live 28-session streak — a fabricated session is not
+  // evidence of health.
   const marketDayRunIds = new Set(
-    [...runsById.values()].filter((r) => r.marketDay).map((r) => r.runId),
+    [...runsById.values()].filter((r) => r.marketDay && isMarketDayIso(r.etDay)).map((r) => r.runId),
   );
   const byBookRowsDesc = new Map<string, EodParticipationBookRecord[]>();
   for (const row of [...sortedBookRows].reverse()) {
@@ -608,9 +685,17 @@ export function summarizeEodArchiveParticipation(dayLimit = 45): EodParticipatio
       const count = (o: EodParticipationOutcome): number =>
         rows.filter((r) => r.outcome === o).length;
       const recorded = new Set(rows.map((r) => r.username)).size;
+      const calendarMarketDay = isMarketDayIso(run.etDay);
       return {
         etDay: run.etDay,
         marketDay: run.marketDay,
+        calendarMarketDay,
+        sessionAnomaly:
+          run.marketDay === calendarMarketDay
+            ? null
+            : calendarMarketDay
+              ? ('lost_session' as const)
+              : ('phantom_session' as const),
         rosterSize: run.rosterSize,
         contextMapSize: run.contextMapSize,
         participated: count('participated'),
@@ -623,6 +708,7 @@ export function summarizeEodArchiveParticipation(dayLimit = 45): EodParticipatio
     });
 
   const marketDayRuns = [...runsById.values()].filter((r) => r.marketDay).length;
+  const calendarSessionRuns = [...runsById.values()].filter((r) => isMarketDayIso(r.etDay)).length;
   const allDays = [...runsById.values()].map((r) => r.etDay).sort();
   const byBook = [...books.values()].sort((a, b) => {
     const missA = a.absentFromContextMap + a.reportThrew + a.archiveThrew;
@@ -630,16 +716,65 @@ export function summarizeEodArchiveParticipation(dayLimit = 45): EodParticipatio
     if (missA !== missB) return missB - missA;
     return a.participated - b.participated;
   });
-  const anomalies = byBook.filter(
+  const bookAnomalies = byBook.filter(
     (b) => b.absentFromContextMap + b.reportThrew + b.archiveThrew > 0,
   );
 
-  const verdict: 'clean' | 'misses' | null =
-    marketDayRuns === 0 ? null : anomalies.length > 0 ? 'misses' : 'clean';
+  // ── TRA-3284: cross-check every run day against the INDEPENDENT calendar ───
+  // The recorded `marketDay` came from the very predicate TRA-3267 proved wrong, so it
+  // cannot be this record's own denominator unchallenged. Disagreement is an ANOMALY,
+  // never an exclusion. Folded per etDay (a restart can double-fire a pass): a day is
+  // recorded-as-session if ANY of its runs said so.
+  const runsByEtDay = new Map<string, EodParticipationRunRecord[]>();
+  for (const r of runsById.values()) {
+    const list = runsByEtDay.get(r.etDay) ?? [];
+    list.push(r);
+    runsByEtDay.set(r.etDay, list);
+  }
+  const sessionAnomalies: EodParticipationSessionAnomaly[] = [];
+  for (const [etDay, runs] of [...runsByEtDay.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1))) {
+    const recordedMarketDay = runs.some((r) => r.marketDay);
+    const calendarMarketDay = isMarketDayIso(etDay);
+    if (recordedMarketDay === calendarMarketDay) continue;
+    const rows = runs.flatMap((r) => dayRows.get(r.runId) ?? []);
+    const participated = rows.filter((r) => r.outcome === 'participated').length;
+    const skippedNotMarketDay = rows.filter((r) => r.outcome === 'skipped_not_market_day').length;
+    sessionAnomalies.push({
+      kind: calendarMarketDay ? 'lost_session' : 'phantom_session',
+      etDay,
+      recordedMarketDay,
+      calendarMarketDay,
+      participated,
+      skippedNotMarketDay,
+      runIds: runs.map((r) => r.runId),
+      note: calendarMarketDay
+        ? `LOST SESSION: ${etDay} is a NYSE session by the independent calendar, but the archive pass recorded marketDay:false and skipped ${skippedNotMarketDay} book(s). The session's EOD rows were never owed by the archive's own accounting — that reclassification is the defect, not a valid exclusion (TRA-3267/TRA-3284).`
+        : `PHANTOM SESSION: ${etDay} is NOT a NYSE session by the independent calendar, but the archive pass recorded marketDay:true and wrote ${participated} participated row(s). A fabricated session must not count as evidence of health (TRA-3267/TRA-3284).`,
+    });
+  }
+
+  const anomalies: EodParticipationAnomaly[] = [
+    ...sessionAnomalies,
+    ...bookAnomalies.map((b) => ({ kind: 'book' as const, ...b })),
+  ];
+
+  // `'clean'` is unreachable while a session-calendar disagreement is in the window:
+  // the first branch wins on ANY disagreement, and the blind branch requires BOTH
+  // denominators to be zero (which a disagreement makes impossible — a lost session
+  // puts the day in `calendarSessionRuns`, a phantom one in `marketDayRuns`).
+  const verdict: 'clean' | 'misses' | 'session_anomalies' | null =
+    sessionAnomalies.length > 0
+      ? 'session_anomalies'
+      : marketDayRuns === 0 && calendarSessionRuns === 0
+        ? null
+        : bookAnomalies.length > 0
+          ? 'misses'
+          : 'clean';
 
   return {
     runs: runsById.size,
     marketDayRuns,
+    calendarSessionRuns,
     firstDay: allDays[0] ?? null,
     lastDay: allDays[allDays.length - 1] ?? null,
     verdict,
@@ -648,7 +783,7 @@ export function summarizeEodArchiveParticipation(dayLimit = 45): EodParticipatio
         ? null
         : runsById.size === 0
           ? 'BLIND: no archive pass on record. This reads identical to a perfect record on any count-based metric, which is why it is null and not "clean". Either the recorder has not run since it was deployed, or the 21:00 ET archive hook is not firing — check durability.ephemeral first, then the scheduler.'
-          : 'BLIND: archive passes on record, but none on a NYSE trading day. No stock EOD row was expected yet, so nothing can be graded.',
+          : 'BLIND: archive passes on record, but none on a NYSE trading day by either the recorded flag or the independent calendar. No stock EOD row was expected yet, so nothing can be graded.',
     byBook,
     anomalies,
     byDay: byDay.slice(0, dayLimit),
