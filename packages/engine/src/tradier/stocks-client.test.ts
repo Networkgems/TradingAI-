@@ -158,6 +158,45 @@ describe('TradierStocksClient.getQuotes', () => {
     const url = String(fetchMock.mock.calls[0][0]);
     expect(url).toContain(`symbols=${encodeURIComponent('VIX,AAPL')}`);
   });
+
+  // TRA-3412 — same defect as ^VIX, second subject. Tradier declares `^IXIC`
+  // unknown under every Yahoo-ish spelling; its identifier for the Nasdaq
+  // Composite is `COMP:GIDS` (measured on the production host, type:'index',
+  // desc "NASDAQ Composite", 26588.488 vs NDX 29683.27 the same second).
+  it('aliases ^IXIC to COMP:GIDS on the wire and keys the row back under ^IXIC', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'COMP:GIDS', last: 26588.488, change: 143.04, change_percentage: 0.55, volume: 0 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['^IXIC']);
+    expect(out.get('^IXIC')).toMatchObject({ symbol: '^IXIC', price: 26588.488 });
+    expect(out.has('COMP:GIDS')).toBe(false); // request-scoped, as for ^VIX
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain(`symbols=${encodeURIComponent('COMP:GIDS')}`);
+    expect(url).not.toContain(encodeURIComponent('^IXIC'));
+  });
+
+  // The trap this alias had to dodge, pinned as a test. Bare `COMP` DOES
+  // resolve on Tradier — to Compass Inc, a ~$12 stock. `^IXIC` must never be
+  // routed there, and a caller asking for the real `COMP` equity must keep
+  // getting the equity: the two are distinct wire symbols, so unlike ^VIX/VIX
+  // they must NOT collapse onto one row.
+  it('does not collide ^IXIC with the real COMP equity (Compass Inc)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: [
+          { symbol: 'COMP:GIDS', last: 26588.488, change: 0, change_percentage: 0, volume: 0 },
+          { symbol: 'COMP', last: 12.73, change: 0, change_percentage: 0, volume: 100 },
+        ],
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['^IXIC', 'COMP']);
+    expect(out.get('^IXIC')?.price).toBe(26588.488);
+    expect(out.get('COMP')?.price).toBe(12.73);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain(`symbols=${encodeURIComponent('COMP:GIDS,COMP')}`);
+  });
 });
 
 // TRA-3385 (Remedy B) — Tradier answers the "which symbols can the primary
@@ -198,6 +237,18 @@ describe('TradierStocksClient.getQuotesDetailed (unmatched_symbols surfaced)', (
     const client = new TradierStocksClient('tok');
     const { unmatchedSymbols } = await client.getQuotesDetailed(['^VIX']);
     expect(unmatchedSymbols).toEqual(['^VIX']);
+  });
+
+  // TRA-3412 — same reverse mapping for the second alias. If Tradier ever
+  // retires `COMP:GIDS`, the census must name `^IXIC` (what the universe holds),
+  // not a wire spelling nobody can act on.
+  it('maps an unmatched COMP:GIDS back to ^IXIC', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: [], unmatched_symbols: { symbol: 'COMP:GIDS' } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const { unmatchedSymbols } = await client.getQuotesDetailed(['^IXIC']);
+    expect(unmatchedSymbols).toEqual(['^IXIC']);
   });
 
   it('returns an empty unmatched list when the field is absent', async () => {

@@ -60,12 +60,30 @@ interface TradierQuotesEnvelope {
  * that fallback and silently re-open the regime-gate exposure TRA-2682 reports
  * as closed.
  *
- * Only spellings CONFIRMED against Tradier belong here. `^IXIC` also shows up
- * in the drop lists but its Tradier spelling is unverified — resolve it from
- * the `unmatched_symbols` measurement (Remedy B) before adding it.
+ * Only spellings CONFIRMED against Tradier belong here, and "confirmed" means
+ * the row came back as the RIGHT INSTRUMENT — not merely that the spelling
+ * resolved. TRA-3412 measured the trap directly: the obvious bare spelling for
+ * the Nasdaq Composite, `COMP`, DOES resolve on Tradier — to `Compass Inc`, a
+ * ~$12 real-estate stock (`type:'stock'`). An alias graded on "a row came back"
+ * would have silently repriced the Nasdaq Composite at $12.73 and fed that into
+ * the watchlist, `symbolState` and the EOD report as a good quote. Grade a
+ * candidate on `type`, `description` AND magnitude before it lands here.
+ *
+ * `:GIDS` is NOT a general grammar — it is part of this one symbol's
+ * identifier. `IXIC:GIDS`, `SPX:GIDS` and `VIX:GIDS` were all measured
+ * `unmatched` in the same batch, so do not derive a new alias from the shape.
+ * Resolve unknown spellings empirically with
+ * `GET /markets/search?q=<name>&indexes=true` (that is what produced
+ * `COMP:GIDS`; `/markets/lookup?types=index` returned 0 for every query tried).
  */
 const TRADIER_SYMBOL_ALIASES: Readonly<Record<string, string>> = {
   '^VIX': 'VIX',
+  // TRA-3412 — measured on the production host 2026-08-12T20:29Z:
+  // `COMP:GIDS` → type:'index' exch:'Q' desc:"NASDAQ Composite" last 26588.488
+  // (vs NDX 29683.27 the same second — ratio 0.896, so it is the Composite and
+  // not the Nasdaq-100). `^IXIC`, `IXIC`, `$IXIC`, `.IXIC`, `IXIC.X`, `COMPX`,
+  // `$COMPX`, `$COMP` and `NASX` all came back in `unmatched_symbols`.
+  '^IXIC': 'COMP:GIDS',
 };
 
 /** Result of {@link TradierStocksClient.getQuotesDetailed}: the quote map plus
