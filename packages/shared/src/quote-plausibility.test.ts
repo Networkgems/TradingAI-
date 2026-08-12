@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   SUSPECT_MOVE_RATIO,
+  SUSPECT_MOVE_RATIO_FLOOR,
+  SPLIT_PROXIMITY_TOLERANCE,
   assessQuotePlausibility,
   describeQuoteSuspicion,
   impliedPrevClose,
@@ -145,17 +147,91 @@ describe('TRA-2379 direction symmetry — the reason a ratio was chosen over a f
 });
 
 describe('TRA-2379 boundary behaviour', () => {
-  it('fires exactly AT the threshold, not just above it', () => {
+  it('fires exactly AT the anchor, with the magnitude reason', () => {
     // a 2:1 split: price 10, prev 20 => r = 2 exactly
-    expect(assessQuotePlausibility({ price: 10, change: -10, changePct: -50 }).suspect).toBe(true);
-    // just inside: r = 1.98
-    expect(assessQuotePlausibility({ price: 10, change: -9.8989898, changePct: -49.75 }).suspect).toBe(false);
+    const v = assessQuotePlausibility({ price: 10, change: -10, changePct: -50 });
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('implausible_move_ratio');
+  });
+
+  // ⛔ HISTORY: this block used to assert r = 1.98 "just inside" was NOT
+  // suspect. That assertion was the TRA-3241 defect frozen into a green test —
+  // the exact hole MNST published -49.92% through. It is deliberately inverted
+  // below, not deleted.
+  it('TRA-3241 — the k = 2 proximity band fires BELOW the anchor, with its own reason', () => {
+    const v = assessQuotePlausibility({ price: 10, change: -9.8989898, changePct: -49.75 });
+    expect(v.ratio).toBeCloseTo(1.98989898, 6);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('near_split_ratio');
   });
 
   it('recovers the previous close from the percentage when no absolute change is given', () => {
     // the Tradier / Yahoo-quote paths supply a provider percentage directly
     expect(impliedPrevClose({ price: 6.49, changePct: 8951.61 })).toBeCloseTo(0.0717, 3);
     expect(assessQuotePlausibility({ price: 6.49, changePct: 8951.61 }).suspect).toBe(true);
+  });
+});
+
+describe('TRA-3241 — the k = 2 proximity band', () => {
+  it('flags MNST, the live 2026-08-11 row the anchor missed (r = 1.99672, #1 loser)', () => {
+    const v = assessQuotePlausibility({ price: 45.79, changePct: -49.92 });
+    expect(v.impliedPrevClose).toBeCloseTo(91.43, 2);
+    expect(v.ratio).toBeCloseTo(1.9968, 4);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('near_split_ratio');
+  });
+
+  it('flags WXM, the same shape on the gainer side (r = 1.99)', () => {
+    const v = assessQuotePlausibility({ price: 7.96, changePct: 99.0 });
+    expect(v.ratio).toBeCloseTo(1.99, 3);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('near_split_ratio');
+  });
+
+  it('flags UPC, the shape already sitting in a shipped report ranked #3 (r = 1.9968)', () => {
+    // eod-report.ts's worked example: 12.18 -> 6.10, published -49.92%.
+    const v = assessQuotePlausibility({ price: 6.1, change: -6.08, changePct: -49.92 });
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('near_split_ratio');
+  });
+
+  it('fires exactly AT the band edge and not below it', () => {
+    // r = 1.9 exactly: price 10, prev 19
+    const at = assessQuotePlausibility({ price: 10, change: -9, changePct: -47.368421 });
+    expect(at.ratio).toBeCloseTo(1.9, 9);
+    expect(at.suspect).toBe(true);
+    expect(at.reason).toBe('near_split_ratio');
+    // r = 1.88 — under the band edge: clean
+    const under = assessQuotePlausibility({ price: 10, change: -8.8, changePct: -46.808511 });
+    expect(under.ratio).toBeCloseTo(1.88, 6);
+    expect(under.suspect).toBe(false);
+  });
+
+  it('keeps the reason partition exact: anchor and above is magnitude, not proximity', () => {
+    const above = assessQuotePlausibility({ price: 10, change: -10.5, changePct: -51.22 });
+    expect(above.ratio).toBeGreaterThan(2);
+    expect(above.reason).toBe('implausible_move_ratio');
+  });
+
+  it('does NOT reach the genuine-mover population below the band', () => {
+    // QMCO, the 2026-08-11 tape's largest plausibly-genuine mover (r = 1.642)
+    expect(assessQuotePlausibility({ price: 19.34, changePct: 64.18 }).suspect).toBe(false);
+    // FGMC's frozen-price shape (r = 1.816) — owned by the continuity rule
+    expect(assessQuotePlausibility({ price: 8.3, changePct: 81.62 }).suspect).toBe(false);
+    // GSUN, the 07-26 tape's largest genuine mover
+    expect(assessQuotePlausibility({ price: 4.01, changePct: -39.6 }).suspect).toBe(false);
+  });
+
+  it('a KNOWN ex-date still outranks the band: reason names the cause, not the symptom', () => {
+    const action = { exDate: '2026-08-11', numerator: 2, denominator: 1 };
+    const v = assessQuotePlausibility({ price: 45.79, changePct: -49.92 }, action);
+    expect(v.suspect).toBe(true);
+    expect(v.reason).toBe('corporate_action');
+  });
+
+  it('the literal floor and its derivation agree — the float product must never drift from the doc', () => {
+    expect(SUSPECT_MOVE_RATIO_FLOOR).toBeCloseTo(SUSPECT_MOVE_RATIO * (1 - SPLIT_PROXIMITY_TOLERANCE), 12);
+    expect(SUSPECT_MOVE_RATIO_FLOOR).toBeLessThan(SUSPECT_MOVE_RATIO);
   });
 });
 
@@ -264,6 +340,14 @@ const CONTINUITY_BAD_ALREADY_CAUGHT = [
     prior: { price: 0.5412, changePct: -51.68 },
     current: { price: 6.05, changePct: 1102.07 },
     residual: 1.075306 },
+  { // was "+99% fabrication caught by nothing" — TRA-3241's k = 2 band now
+    // catches it at the session layer too (r = 1.9864 is in [1.9, 2)), so it
+    // moved here from CONTINUITY_BAD_NEW: both instruments fire, which is the
+    // OR working, not a conflict.
+    symbol: 'CRNX', priorDate: '2026-07-07',
+    prior: { price: 83.53, changePct: 98.739 },
+    current: { price: 83.49, changePct: 98.64382583868664 },
+    residual: 1.987390 },
 ];
 
 /**
@@ -288,12 +372,6 @@ const CONTINUITY_BAD_NEW = [
     prior: { price: 6.52, changePct: -23.2038 },
     current: { price: 5.86, changePct: -30.977620730270907 },
     residual: 1.302147, sessionRatio: 1.4488 },
-  { // the "+99% fabrication is caught by nothing today" case, live in the archive
-    symbol: 'CRNX', priorDate: '2026-07-07',
-    prior: { price: 83.53, changePct: 98.739 },
-    current: { price: 83.49, changePct: 98.64382583868664 },
-    residual: 1.987390, sessionRatio: 1.9864,
-  },
   { symbol: '000660.KS', priorDate: '2026-07-13',
     prior: { price: 1845000, changePct: -15.366973 },
     current: { price: 2117000, changePct: 10.663878 },

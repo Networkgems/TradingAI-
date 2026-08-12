@@ -254,6 +254,14 @@ function top5Movers(
   // so all 152 newly-flagged rows are candidate false positives, and it STILL
   // would not close the class. See the table on TRA-3065.
   //
+  // ⚠️ RE-DERIVED 2026-08-11 (TRA-3241), AND IT STANDS — with one measured
+  // carve-out. The `SUSPECT_MOVE_RATIO_FLOOR` band at 1.9 now catches the
+  // FACTOR-2 near-misses (the UPC shape above, 0.16% under the old bar), because
+  // at k = 2 the artefact cluster sits in a measured gap in the genuine-mover
+  // population. That does not reach 3:2 and does not try to: the arithmetic in
+  // this paragraph is about the factor GRID below 2, where the cost table above
+  // is unchanged and the split calendar remains the only instrument.
+  //
   // So the ex-date is read from the provider's own split calendar instead, and
   // it changes the verdict in BOTH directions:
   //  - the session rule gains `'corporate_action'`, which fires regardless of

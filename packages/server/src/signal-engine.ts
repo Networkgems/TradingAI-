@@ -16,7 +16,7 @@ import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
 // TRA-3068 — plus the split-calendar leg, which is the only one that can reach a
 // sub-2.0 corporate action (neither ratio nor continuity can, at any threshold).
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO, describeCorporateAction } from '@trading-app/shared';
+import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR, describeCorporateAction } from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
 // TRA-3112 — the single copy of the market-data / account endpoint-class split.
 // This module imports nothing back from here, so there is no cycle.
@@ -3919,7 +3919,9 @@ export class SignalEngine {
       const plausibility = assessQuotePlausibility(q, knownSplit);
       if (plausibility.suspect) {
         log.warn('quote move flagged suspect', {
-          issue: plausibility.reason === 'corporate_action' ? 'TRA-3068' : 'TRA-2379',
+          issue: plausibility.reason === 'corporate_action' ? 'TRA-3068'
+            : plausibility.reason === 'near_split_ratio' ? 'TRA-3241'
+            : 'TRA-2379',
           symbol: sym,
           reason: plausibility.reason,
           price: q.price,
@@ -3927,7 +3929,9 @@ export class SignalEngine {
           changePct: q.changePct,
           impliedPrevClose: plausibility.impliedPrevClose,
           ratio: plausibility.ratio,
-          threshold: SUSPECT_MOVE_RATIO,
+          // TRA-3241 — the boundary the ratio was tested against (the band
+          // edge), not the anchor, so the line's verdict is re-derivable.
+          threshold: SUSPECT_MOVE_RATIO_FLOOR,
           // Flag, never clamp — so the ratio that condemned the row has to be on
           // the record beside the raw numbers, or the flag is an assertion rather
           // than evidence (TRA-2379 decision 2).

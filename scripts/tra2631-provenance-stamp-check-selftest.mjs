@@ -31,14 +31,18 @@ import { fileURLToPath } from 'node:url';
 // false green.
 const CHECK = fileURLToPath(new URL('./tra2631-provenance-stamp-check.mjs', import.meta.url));
 
-const RULE_ID = 'TRA-2379:session-move-ratio';
+const RULE_ID = 'TRA-3241:session-move-ratio';
 const BUILD = 'deadbeef1234';
 const HEADING = '## Top 5 Movers (Watchlist)';
 
 /** The real 2026-07-21 fabricated headline (r = 14.17). */
 const SELX = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
-/** The genuine near-doubling just UNDER the bar (r = 1.9717). */
-const INLF = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
+/**
+ * The genuine large mover safely UNDER the band (r = 1.642, 2026-08-11 tape).
+ * TRA-3241 retired INLF (+97.17%, r = 1.9717) from this role: it sits INSIDE
+ * the k = 2 proximity band, i.e. it was an MNST-shaped row all along.
+ */
+const QMCO = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
 const NVDA = { symbol: 'NVDA', price: 178.25, changePct: 2.41 };
 
 function moverRow(m) {
@@ -51,8 +55,8 @@ function stamp(m, verdict, reason) {
   return {
     ...m,
     provenance: {
-      ruleId: RULE_ID, threshold: 2, verdict, build: BUILD,
-      ratio: verdict === 'suspect' ? 14.1667 : 1.97, impliedPrevClose: 0.024,
+      ruleId: RULE_ID, threshold: 1.9, verdict, build: BUILD,
+      ratio: verdict === 'suspect' ? 14.1667 : 1.64, impliedPrevClose: 0.024,
       ...(reason ? { reason } : {}),
     },
   };
@@ -77,7 +81,7 @@ function artifact({ served, suppressed, markdownRows, note }) {
     generatedAt: '2026-07-21T20:05:00Z',
     top5Movers: served,
     moversProvenance: {
-      ruleId: RULE_ID, threshold: 2, build: BUILD,
+      ruleId: RULE_ID, threshold: 1.9, build: BUILD,
       publishedCount: served.length + suppressed.length,
       servedCount: served.length,
       filteredCount: suppressed.length,
@@ -89,7 +93,7 @@ function artifact({ served, suppressed, markdownRows, note }) {
 
 const NOTE_FILTERED = [
   `> ⚠️ **PROVENANCE — 1 of 3 published row(s) SUPPRESSED as unverified. 2 row(s) shown above.**`,
-  `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO = 2\`), build \`${BUILD}\`.`,
+  `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`.`,
   '> The stored report on disk is **unchanged and byte-intact** — TRA-2634.',
   '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
   '> | 1 | SELX | $0.34 / +1316.67% | suspect (implausible_move_ratio) | 0.0240 | 14.17 |',
@@ -97,59 +101,59 @@ const NOTE_FILTERED = [
 
 const NOTE_CLEAN = [
   `> **Provenance — 0 of 2 row(s) suppressed; this table is as published.**`,
-  `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO = 2\`), build \`${BUILD}\`. TRA-2634.`,
+  `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`. TRA-2634.`,
 ].join('\n');
 
 // ── the cases ────────────────────────────────────────────────────────────────
 const GOOD = artifact({
-  served: [stamp(INLF, 'plausible'), stamp(NVDA, 'plausible')],
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
   suppressed: [stamp(SELX, 'suspect', 'implausible_move_ratio')],
-  markdownRows: [INLF, NVDA],
+  markdownRows: [QMCO, NVDA],
   note: NOTE_FILTERED,
 });
 
 const CLEAN_ONLY = artifact({
-  served: [stamp(INLF, 'plausible'), stamp(NVDA, 'plausible')],
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
   suppressed: [],
-  markdownRows: [INLF, NVDA],
+  markdownRows: [QMCO, NVDA],
   note: NOTE_CLEAN,
 });
 
 // MUTATION 1 — the filter ran and MISSED. SELX is still served.
 const LEAKED = artifact({
-  served: [stamp(SELX, 'plausible'), stamp(INLF, 'plausible')],
+  served: [stamp(SELX, 'plausible'), stamp(QMCO, 'plausible')],
   suppressed: [],
-  markdownRows: [SELX, INLF],
+  markdownRows: [SELX, QMCO],
   note: NOTE_CLEAN,
 });
 
-// MUTATION 2 — the filter DELETED a genuine mover (INLF, r = 1.9717).
+// MUTATION 2 — the filter DELETED a genuine mover (QMCO, r = 1.642).
 const OVER = artifact({
   served: [stamp(NVDA, 'plausible')],
-  suppressed: [stamp(INLF, 'suspect', 'implausible_move_ratio')],
+  suppressed: [stamp(QMCO, 'suspect', 'implausible_move_ratio')],
   markdownRows: [NVDA],
   note: NOTE_FILTERED,
 });
 
 // MUTATION 3 — filtered on the JSON surface only; the row is still rendered.
 const HALF = artifact({
-  served: [stamp(INLF, 'plausible'), stamp(NVDA, 'plausible')],
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
   suppressed: [stamp(SELX, 'suspect', 'implausible_move_ratio')],
-  markdownRows: [SELX, INLF, NVDA],
+  markdownRows: [SELX, QMCO, NVDA],
   note: NOTE_FILTERED,
 });
 
 // MUTATION 4 — filtered, but the response does not SAY it was filtered. This is
 // the defect the ruling's second half exists to prevent, so it must not pass.
 const SILENT = artifact({
-  served: [stamp(INLF, 'plausible'), stamp(NVDA, 'plausible')],
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
   suppressed: [stamp(SELX, 'suspect', 'implausible_move_ratio')],
-  markdownRows: [INLF, NVDA],
+  markdownRows: [QMCO, NVDA],
   note: NOTE_CLEAN,
 });
 
 // The pre-deploy shape: served, but no stamp at all.
-const UNSTAMPED = { date: '2026-07-21', generatedAt: 'x', top5Movers: [INLF, NVDA], markdown: `${HEADING}\n| Symbol | Price | Change % |\n|--|--|--|\n${moverRow(INLF)}` };
+const UNSTAMPED = { date: '2026-07-21', generatedAt: 'x', top5Movers: [QMCO, NVDA], markdown: `${HEADING}\n| Symbol | Price | Change % |\n|--|--|--|\n${moverRow(QMCO)}` };
 
 const CASES = [
   { name: 'PASS — a correctly filtered artifact', reports: [GOOD], expect: 0, expectText: 'PASS' },

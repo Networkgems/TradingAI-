@@ -3,7 +3,7 @@ import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } fr
 import { annotateReportProvenance } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
 import {
-  isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO,
+  isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO_FLOOR,
   type EodMover, type OptionPosition, type Position, type CorporateAction,
 } from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
@@ -908,18 +908,19 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
   // GENUINE table the two instruments above are graded against — the third leg
   // has to be shown adding something to that exact board, not to a friendlier one.
   //
-  // The worked example is the ticket's: UPC live 2026-06-30, `12.18 -> 6.10`,
-  // published -49.92%, session ratio 1.9968 (0.16% UNDER the r >= 2 bar),
-  // continuity residual 1.000042 => `consistent`, RANKED #3 in the shipped table.
-  // This is NOT a claim UPC was a split: a genuine -50% session has IDENTICAL
-  // arithmetic, and that indistinguishability IS the finding. It shows the hole
-  // is OCCUPIED rather than theoretical, which is why the ex-date has to come
-  // from outside the row.
+  // The original worked example was UPC live 2026-06-30 (`12.18 -> 6.10`,
+  // -49.92%, session ratio 1.9968, 0.16% under the old r >= 2 bar). TRA-3241's
+  // k = 2 band now catches that shape at the session layer, so UPC no longer
+  // demonstrates a row BOTH instruments miss — see the HANDOFF test below. The
+  // class only the calendar reaches is the sub-band factor grid, and its worked
+  // example is TRA-3065's: a flat 3:2 forward split off a 12.18 prior close
+  // publishes -33.33% at r = 1.4999 — dense inside the genuine-mover population,
+  // unreachable by ANY ratio (the module's own ⛔ paragraph).
   describe('TRA-3068 — a KNOWN corporate action cannot be the headline', () => {
-    const UPC = row('UPC', 6.10, -49.92);
-    const UPC_PRIOR = [{ symbol: 'UPC', price: 12.18, changePct: 3.4 }];
-    const SPLIT_2_1: CorporateAction = {
-      exDate: '2026-07-16', numerator: 2, denominator: 1, splitRatio: '2:1',
+    const SPLT32 = row('SPLT32', 8.12, -33.33);
+    const SPLT32_PRIOR = [{ symbol: 'SPLT32', price: 12.18, changePct: 3.4 }];
+    const SPLIT_3_2: CorporateAction = {
+      exDate: '2026-07-16', numerator: 3, denominator: 2, splitRatio: '3:2',
     };
     // `reportFor` above pins `priorSessionDate` to 2026-07-16 whenever a prior
     // table is passed, so the ex-date window here is (2026-07-16, 2026-07-17].
@@ -930,11 +931,11 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
       splits: Record<string, readonly CorporateAction[]>,
       currentSessionDate = CURRENT_SESSION,
     ) => generateEodReport({
-      state: makeEngineState({ symbols: [UPC, ...GENUINE] }),
+      state: makeEngineState({ symbols: [SPLT32, ...GENUINE] }),
       allClosedPositions: [],
       dailySignals: [],
       signalTypeMap: new Map(),
-      priorSessionMovers: UPC_PRIOR,
+      priorSessionMovers: SPLT32_PRIOR,
       priorSessionDate: '2026-07-16',
       knownSplits: new Map(Object.entries(splits)),
       currentSessionDate,
@@ -942,45 +943,46 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
 
     it('POSITIVE CONTROL — BOTH deployed instruments are genuinely blind to this row', () => {
       // Without this the exclusion below could be another rule's work, and the
-      // whole ticket is about a claim of coverage that was not real.
-      const session = assessQuotePlausibility(UPC);
+      // whole ticket is about a claim of coverage that was not real. Post
+      // TRA-3241 the blind row has to sit UNDER the band, which a 3:2 does.
+      const session = assessQuotePlausibility(SPLT32);
       expect(session.suspect).toBe(false);
-      expect(session.ratio!).toBeLessThan(SUSPECT_MOVE_RATIO);
-      expect(session.ratio!).toBeCloseTo(1.9968, 3);          // 0.16% under the bar
-      expect(isMoveSuspect(UPC)).toBe(false);
+      expect(session.ratio!).toBeLessThan(SUSPECT_MOVE_RATIO_FLOOR);
+      expect(session.ratio!).toBeCloseTo(1.5, 3);
+      expect(isMoveSuspect(SPLT32)).toBe(false);
 
-      const cont = assessLevelContinuity(UPC_PRIOR[0], UPC);
+      const cont = assessLevelContinuity(SPLT32_PRIOR[0], SPLT32);
       expect(cont.verdict).toBe('consistent');
-      expect(cont.residual!).toBeCloseTo(1.000042, 5);
+      expect(cont.residual!).toBeCloseTo(1.00005, 4);
 
       // …and with no calendar it therefore RANKS, exactly as it shipped.
-      expect(reportFor([UPC, ...GENUINE], UPC_PRIOR).top5Movers.map(m => m.symbol)).toContain('UPC');
+      expect(reportFor([SPLT32, ...GENUINE], SPLT32_PRIOR).top5Movers.map(m => m.symbol)).toContain('SPLT32');
     });
 
     it('excludes it once the split calendar knows the ex-date', () => {
       const report = reportWithCalendar({
-        UPC: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }],
+        SPLT32: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }],
       });
-      expect(report.top5Movers.map(m => m.symbol)).not.toContain('UPC');
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('SPLT32');
       expect(report.top5Movers[0].symbol).toBe('SOXL');
-      expect(report.markdown).not.toContain('UPC');
+      expect(report.markdown).not.toContain('SPLT32');
     });
 
     it('NEGATIVE CONTROL — an ex-date OUTSIDE the window leaves the row ranked', () => {
       // Proves the WINDOW is doing the work, not the mere presence of a calendar
       // entry. A guard that fired on "this symbol has ever split" would flag the
       // row for weeks afterwards and pass every assertion above.
-      const before = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: '2026-07-16' }] });
-      expect(before.top5Movers.map(m => m.symbol)).toContain('UPC');   // ON the prior session
-      const after = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: '2026-07-20' }] });
-      expect(after.top5Movers.map(m => m.symbol)).toContain('UPC');    // in the FUTURE
+      const before = reportWithCalendar({ SPLT32: [{ ...SPLIT_3_2, exDate: '2026-07-16' }] });
+      expect(before.top5Movers.map(m => m.symbol)).toContain('SPLT32');   // ON the prior session
+      const after = reportWithCalendar({ SPLT32: [{ ...SPLIT_3_2, exDate: '2026-07-20' }] });
+      expect(after.top5Movers.map(m => m.symbol)).toContain('SPLT32');    // in the FUTURE
     });
 
     it('an empty / absent calendar changes nothing — the leg is inert by default', () => {
       // The property that lets this ship without re-grading the archive: every
       // caller that does not supply a calendar gets the pre-TRA-3068 report.
-      expect(reportWithCalendar({}).top5Movers.map(m => m.symbol)).toContain('UPC');
-      expect(reportWithCalendar({ UPC: [] }).top5Movers.map(m => m.symbol)).toContain('UPC');
+      expect(reportWithCalendar({}).top5Movers.map(m => m.symbol)).toContain('SPLT32');
+      expect(reportWithCalendar({ SPLT32: [] }).top5Movers.map(m => m.symbol)).toContain('SPLT32');
     });
 
     it('defaults the window`s upper bound to the REPORT`s own session date', () => {
@@ -989,29 +991,41 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
       // "no session date => inert" would make the guard depend on a field nobody
       // remembers to pass, which is how TRA-1448`s flag went quietly un-applied.
       const report = generateEodReport({
-        state: makeEngineState({ symbols: [UPC, ...GENUINE] }),
+        state: makeEngineState({ symbols: [SPLT32, ...GENUINE] }),
         allClosedPositions: [],
         dailySignals: [],
         signalTypeMap: new Map(),
-        priorSessionMovers: UPC_PRIOR,
+        priorSessionMovers: SPLT32_PRIOR,
         priorSessionDate: '2026-07-16',
-        knownSplits: new Map([['UPC', [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }]]]),
+        knownSplits: new Map([['SPLT32', [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }]]]),
       }, EX_DATE_IN_WINDOW);
-      expect(report.top5Movers.map(m => m.symbol)).not.toContain('UPC');
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('SPLT32');
     });
 
     it('does not condemn the genuine movers standing beside it', () => {
       // The over-broad failure mode: a calendar keyed loosely, or a window that
       // ignores the symbol, would empty the table while passing every assertion
-      // about UPC being gone.
-      const report = reportWithCalendar({ UPC: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }] });
+      // about SPLT32 being gone.
+      const report = reportWithCalendar({ SPLT32: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }] });
       expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
     });
 
     it('a calendar entry on a DIFFERENT symbol does not reach this row', () => {
-      const report = reportWithCalendar({ SOXL: [{ ...SPLIT_2_1, exDate: EX_DATE_IN_WINDOW }] });
+      const report = reportWithCalendar({ SOXL: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }] });
       expect(report.top5Movers.map(m => m.symbol)).not.toContain('SOXL');
-      expect(report.top5Movers.map(m => m.symbol)).toContain('UPC');
+      expect(report.top5Movers.map(m => m.symbol)).toContain('SPLT32');
+    });
+
+    it("TRA-3241 HANDOFF — UPC's real 2:1 shape is now the session band's catch, no calendar needed", () => {
+      // The row this block was originally built on: 12.18 -> 6.10, -49.92%,
+      // r = 1.9968. The band flags it at the session layer, and the movers
+      // table excludes it with NO split calendar at all.
+      const upc = row('UPC', 6.10, -49.92);
+      const v = assessQuotePlausibility(upc);
+      expect(v.suspect).toBe(true);
+      expect(v.reason).toBe('near_split_ratio');
+      expect(reportFor([upc, ...GENUINE], [{ symbol: 'UPC', price: 12.18, changePct: 3.4 }])
+        .top5Movers.map(m => m.symbol)).not.toContain('UPC');
     });
   });
 

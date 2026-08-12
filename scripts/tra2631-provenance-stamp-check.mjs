@@ -23,7 +23,9 @@
 //   • NOT OVER-FILTERED — every SUPPRESSED row is one the rule calls suspect.
 //     Under A a false positive DELETES a genuine mover from the headline, so the
 //     over-filtering control is not symmetric decoration; it is the expensive
-//     direction. (INLF at r = 1.9717 is the live near-miss this protects.)
+//     direction. (QMCO at r = 1.642 is the live near-miss this protects —
+//     TRA-3241 retired INLF at r = 1.9717 from the role, since the k = 2 band
+//     now correctly flags that shape.)
 //   • ARITHMETIC — `publishedCount === servedCount + filteredCount`, and
 //     `servedCount` equals the array actually served. A stamp whose numbers do
 //     not add up cannot be used to reconstruct the published table, which is what
@@ -47,11 +49,11 @@
 // ⛔ Zero artifacts read is BLIND, never PASS. Zero rows FILTERED is FAIL, never
 // PASS. The two zeros mean different things and are reported separately.
 import fs from 'node:fs';
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '../packages/shared/dist/index.js';
+import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR } from '../packages/shared/dist/index.js';
 
 const HOST = process.env.HOST ?? 'https://tradingai-bqb1.onrender.com';
 const FOLDS = ['demo', 'live', 'sandbox'];
-const RULE_ID = 'TRA-2379:session-move-ratio';
+const RULE_ID = 'TRA-3241:session-move-ratio';
 const MOVERS_HEADING = '## Top 5 Movers (Watchlist)';
 
 // Creds from `.env` if this checkout has one, else from the process env. A
@@ -110,10 +112,19 @@ function selftest() {
   // whole check is grading nothing.
   const selx = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
   if (!assessQuotePlausibility(selx).suspect) fails.push('control: SELX 0.34/+1316.67% must be suspect');
-  // And the genuine near-doubling just under the bar must NOT be — under A this
-  // control guards a DELETION, not a badge.
-  const inlf = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
-  if (assessQuotePlausibility(inlf).suspect) fails.push('control: INLF 6.27/+97.17% must NOT be suspect');
+  // TRA-3241 — the factor-2 near-miss must BE suspect: MNST's real 2026-08-11
+  // row (r = 1.99672, published -49.92% as the session's #1 loser, unflagged by
+  // the old anchor). If the band ever stops firing here, the checker is grading
+  // the pre-TRA-3241 rule.
+  const mnst = { symbol: 'MNST', price: 45.79, changePct: -49.92 };
+  if (assessQuotePlausibility(mnst).reason !== 'near_split_ratio') fails.push('control: MNST 45.79/-49.92% must be near_split_ratio suspect');
+  // And a genuine large mover below the band must NOT be — under A this control
+  // guards a DELETION, not a badge. QMCO is the 2026-08-11 tape's largest
+  // plausibly-genuine mover (r = 1.642). INLF (+97.17%, r = 1.9717) retired from
+  // this role: it sits INSIDE the k = 2 band, i.e. it was an MNST-shaped row all
+  // along (TRA-3241).
+  const qmco = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
+  if (assessQuotePlausibility(qmco).suspect) fails.push('control: QMCO 19.34/+64.18% must NOT be suspect');
   // The row renderer must reproduce the archived line byte-for-byte, or the
   // surface check silently degrades to "no suppressed row found in the table",
   // which reads exactly like a correctly filtered table.
@@ -122,7 +133,7 @@ function selftest() {
   }
   // And the table parser must be able to SEE a row, else every artifact grades
   // as trivially consistent.
-  const probe = markdownRows([MOVERS_HEADING, '| Symbol | Price | Change % |', '|---|---|---|', moverRow(inlf)].join('\n'));
+  const probe = markdownRows([MOVERS_HEADING, '| Symbol | Price | Change % |', '|---|---|---|', moverRow(qmco)].join('\n'));
   if (!probe || probe.length !== 1) fails.push(`control: table parser found ${probe?.length ?? 'null'} rows, expected 1`);
   return fails;
 }
@@ -145,7 +156,7 @@ const token = (await login.json()).token;
 const H = { Authorization: `Bearer ${token}` };
 
 console.log(`host                 : ${HOST}`);
-console.log(`rule                 : ${RULE_ID}  (SUSPECT_MOVE_RATIO = ${SUSPECT_MOVE_RATIO})`);
+console.log(`rule                 : ${RULE_ID}  (SUSPECT_MOVE_RATIO_FLOOR = ${SUSPECT_MOVE_RATIO_FLOOR})`);
 console.log('controls             : 4/4 green');
 
 const etToday = new Date(Date.now() - 4 * 3600_000).toISOString().slice(0, 10);
@@ -185,7 +196,7 @@ for (const fold of FOLDS) {
 
     // ── SELF-DATING ───────────────────────────────────────────────────────────
     if (mp.ruleId !== RULE_ID) problems.push(`ruleId=${mp.ruleId}`);
-    if (mp.threshold !== SUSPECT_MOVE_RATIO) problems.push(`threshold=${mp.threshold}`);
+    if (mp.threshold !== SUSPECT_MOVE_RATIO_FLOOR) problems.push(`threshold=${mp.threshold}`);
     if (!mp.build || mp.build === 'unknown') problems.push('build SHA missing — the stamp is not self-dating');
 
     // ── FILTER EFFECTIVE: nothing suspect may survive into the served array ───

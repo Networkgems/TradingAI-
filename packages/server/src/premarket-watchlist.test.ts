@@ -285,16 +285,18 @@ describe('filterByPriceFloor (TRA-510)', () => {
  * The guard therefore has to live at the consumer, exactly as TRA-2610 put it
  * on the other ranking consumers.
  *
- * The two rows below are the REAL archived rows off the 2026-05-03 stocks
- * report, not invented ones — they straddle `SUSPECT_MOVE_RATIO` (2) from
- * both sides, so together they pin the bar rather than just one side of it:
+ * The two rows below straddle `SUSPECT_MOVE_RATIO_FLOOR` (1.9) from both
+ * sides, so together they pin the bar rather than just one side of it:
  *
- *   - SELX  $0.34 / +1316.67%  ⇒ prev 0.34/14.1667 = 0.024, r = 14.167  SUSPECT
- *   - INLF  $6.27 /   +97.17%  ⇒ prev 6.27/1.9717  = 3.180, r =  1.9717 CLEAN
+ *   - SELX  $0.34 / +1316.67%  ⇒ prev 0.34/14.1667 = 0.024,  r = 14.167  SUSPECT
+ *   - QMCO  $19.34 /  +64.18%  ⇒ prev 19.34/1.6418 = 11.780, r =  1.6418 CLEAN
  *
- * INLF is the false-positive control and it is deliberately a near-miss: it
- * clears the bar by 0.0283. A guard that quietly tightened the threshold, or
- * that keyed on "big percentage" instead of the ratio, fails on it.
+ * QMCO is the false-positive control (real 2026-08-11 tape row, the day's
+ * largest plausibly-genuine mover). The old control here — INLF $6.27/+97.17%,
+ * r = 1.9717, "deliberately a near-miss" — was retired by TRA-3241: it sits
+ * INSIDE the k = 2 proximity band, so the rule now suppresses it CORRECTLY. A
+ * guard that quietly tightened the threshold further, or that keyed on "big
+ * percentage" instead of the ratio, still fails on QMCO.
  *
  * NEITHER row carries `moveSuspect`. That is not an omission in the fixture —
  * `moveSuspect` is never persisted, so EVERY archived row lacks it, which is
@@ -302,7 +304,7 @@ describe('filterByPriceFloor (TRA-510)', () => {
  */
 describe('scoreSymbols — archived top5Movers plausibility guard (TRA-3071)', () => {
   const SELX = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
-  const INLF = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
+  const QMCO = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
 
   it('does not bump a suspect archived mover into the eod_mover bucket', () => {
     const eod = fakeEod({ top5Movers: [SELX] });
@@ -312,17 +314,17 @@ describe('scoreSymbols — archived top5Movers plausibility guard (TRA-3071)', (
   });
 
   it('still bumps a clean archived mover — the false-positive control', () => {
-    const eod = fakeEod({ top5Movers: [INLF] });
+    const eod = fakeEod({ top5Movers: [QMCO] });
     const ranked = scoreSymbols(eod, []);
     expect(ranked).toEqual([
-      { symbol: 'INLF', score: 5, sources: ['eod_mover'] },
+      { symbol: 'QMCO', score: 5, sources: ['eod_mover'] },
     ]);
   });
 
   it('drops only the suspect row from a mixed archive', () => {
-    const eod = fakeEod({ top5Movers: [SELX, INLF] });
+    const eod = fakeEod({ top5Movers: [SELX, QMCO] });
     const ranked = scoreSymbols(eod, []);
-    expect(ranked.map(r => r.symbol)).toEqual(['INLF']);
+    expect(ranked.map(r => r.symbol)).toEqual(['QMCO']);
   });
 
   it('honours a persisted moveSuspect flag even when the rule itself is clean', () => {
@@ -330,7 +332,7 @@ describe('scoreSymbols — archived top5Movers plausibility guard (TRA-3071)', (
     // PRODUCER condemned — e.g. off an input the row no longer carries. The
     // consumer must not silently overrule the stamp.
     const eod = fakeEod({
-      top5Movers: [{ ...INLF, moveSuspect: true } as unknown as EodReport['top5Movers'][number]],
+      top5Movers: [{ ...QMCO, moveSuspect: true } as unknown as EodReport['top5Movers'][number]],
     });
     expect(scoreSymbols(eod, [])).toEqual([]);
   });
@@ -390,9 +392,9 @@ describe('filterByPriceFloor — suspect rows do not seed the price map (TRA-307
   });
 
   it('still seeds from a clean archived row without a quote round-trip', async () => {
-    // The false-positive control on the price leg: INLF's $6.27 clears the
+    // The false-positive control on the price leg: QMCO's $19.34 clears the
     // $5 floor off the archive alone, and the lookup must not be invoked.
-    const eod = fakeEod({ top5Movers: [{ symbol: 'INLF', price: 6.27, changePct: 97.17 }] });
+    const eod = fakeEod({ top5Movers: [{ symbol: 'QMCO', price: 19.34, changePct: 64.18 }] });
     const ranked = scoreSymbols(eod, []);
 
     const { kept, dropped } = await filterByPriceFloor(
@@ -401,7 +403,7 @@ describe('filterByPriceFloor — suspect rows do not seed the price map (TRA-307
       async () => { throw new Error('quote lookup should not be invoked for a clean archived row'); },
     );
 
-    expect(kept.map(r => r.symbol)).toEqual(['INLF']);
+    expect(kept.map(r => r.symbol)).toEqual(['QMCO']);
     expect(dropped).toEqual([]);
   });
 });

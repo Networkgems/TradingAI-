@@ -43,7 +43,7 @@ import type { EodMover, EodReport } from '@trading-app/shared';
 import {
   WATCHLIST,
   WATCHLIST_MIN_PRICE,
-  SUSPECT_MOVE_RATIO,
+  SUSPECT_MOVE_RATIO_FLOOR,
   assessQuotePlausibility,
   isMoveSuspect,
 } from '@trading-app/shared';
@@ -210,7 +210,7 @@ export function scoreSymbols(
           changePct: mover.changePct,
           impliedPrevClose: suspect.impliedPrevClose,
           ratio: suspect.ratio,
-          suspectMoveRatio: SUSPECT_MOVE_RATIO,
+          suspectMoveRatio: SUSPECT_MOVE_RATIO_FLOOR,
           reason: suspect.reason,
           source: 'eod_mover',
         });
@@ -287,7 +287,7 @@ export async function filterByPriceFloor(
           changePct: mover.changePct,
           impliedPrevClose: suspect.impliedPrevClose,
           ratio: suspect.ratio,
-          suspectMoveRatio: SUSPECT_MOVE_RATIO,
+          suspectMoveRatio: SUSPECT_MOVE_RATIO_FLOOR,
           reason: suspect.reason,
           source: 'price_floor_seed',
         });

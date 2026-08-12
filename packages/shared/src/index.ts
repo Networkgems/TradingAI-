@@ -4015,7 +4015,7 @@ export interface EodTradeEntry {
 export interface MoverProvenance {
   /** Which rule produced this verdict. See `MOVER_PROVENANCE_RULE_ID`. */
   ruleId: string;
-  /** The rule's threshold at the time of stamping (`SUSPECT_MOVE_RATIO`). */
+  /** The rule's threshold at the time of stamping (`SUSPECT_MOVE_RATIO_FLOOR` — the effective flag boundary, TRA-3241). */
   threshold: number;
   /**
    * Three-valued ON PURPOSE, in the house style: `'unassessable'` is NOT
@@ -4076,7 +4076,7 @@ export interface EodMover {
 export interface MoversFilterProvenance {
   /** Which rule decided. See `MOVER_PROVENANCE_RULE_ID`. */
   ruleId: string;
-  /** The rule's threshold at filter time (`SUSPECT_MOVE_RATIO`). */
+  /** The rule's threshold at filter time (`SUSPECT_MOVE_RATIO_FLOOR` — the effective flag boundary, TRA-3241). */
   threshold: number;
   /** Short commit SHA of the build that filtered, or `'unknown'`. */
   build: string;

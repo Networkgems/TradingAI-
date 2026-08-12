@@ -67,15 +67,18 @@
 // 64/105 census cannot disagree.
 
 import type { EodMover, EodReport, MoverProvenance, MoversFilterProvenance } from '@trading-app/shared';
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO } from '@trading-app/shared';
+import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR } from '@trading-app/shared';
 import { formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 
 /**
  * Rule identity carried by every stamp. Versioned by the ticket that DERIVED the
  * threshold, not by the ticket that shipped the filter: a reader who wants to know
- * why `2` chased down `SUSPECT_MOVE_RATIO`'s derivation, which lives on TRA-2379.
+ * why `1.9` chased down `SUSPECT_MOVE_RATIO_FLOOR`'s derivation, which lives on
+ * TRA-3241 (the k = 2 proximity band under TRA-2379's anchor). Stamps are applied
+ * at READ time, so historical artifacts re-served today carry the current rule —
+ * bumping this id re-labels every serve, which is the versioning working.
  */
-export const MOVER_PROVENANCE_RULE_ID = 'TRA-2379:session-move-ratio';
+export const MOVER_PROVENANCE_RULE_ID = 'TRA-3241:session-move-ratio';
 
 /** Anything with a top-movers table. Journal calendar cells qualify structurally. */
 type ReportLike = Pick<EodReport, 'top5Movers'> & {
@@ -87,7 +90,7 @@ function assess(m: EodMover, build: string): MoverProvenance {
   const v = assessQuotePlausibility({ price: m.price, changePct: m.changePct });
   const base = {
     ruleId: MOVER_PROVENANCE_RULE_ID,
-    threshold: SUSPECT_MOVE_RATIO,
+    threshold: SUSPECT_MOVE_RATIO_FLOOR,
     ratio: v.ratio,
     impliedPrevClose: v.impliedPrevClose,
     build,
@@ -142,7 +145,7 @@ function buildProvenanceNote(
   tableLocated: boolean,
 ): string {
   const unassessable = served.filter(m => m.provenance?.verdict === 'unassessable');
-  const rule = `rule \`${MOVER_PROVENANCE_RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO = ${SUSPECT_MOVE_RATIO}\`), build \`${build}\``;
+  const rule = `rule \`${MOVER_PROVENANCE_RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = ${SUSPECT_MOVE_RATIO_FLOOR}\`), build \`${build}\``;
   const jurisdiction =
     '> _Session-move test only — it asks whether a row\'s own price and change % believe each other. '
     + 'It is **not** the TRA-2634 cross-artifact continuity test, so a row it did not suppress is unflagged, not verified._';
@@ -301,7 +304,7 @@ export function annotateReportProvenance<T extends ReportLike>(
 
   const moversProvenance: MoversFilterProvenance = {
     ruleId: MOVER_PROVENANCE_RULE_ID,
-    threshold: SUSPECT_MOVE_RATIO,
+    threshold: SUSPECT_MOVE_RATIO_FLOOR,
     build,
     publishedCount,
     servedCount: served.length,

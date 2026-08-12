@@ -20,7 +20,12 @@
 // scanner. See the pre-patch consumer enumeration on TRA-2379.
 
 /**
- * Ratio at or above which a session move is treated as implausible.
+ * Ratio at or above which a session move is implausible ON MAGNITUDE ALONE.
+ *
+ * ⚠️ This is the ANCHOR, not the flag boundary. The boundary the predicate
+ * actually tests is {@link SUSPECT_MOVE_RATIO_FLOOR} below — see the TRA-3241
+ * correction there. Anything at or above THIS value is condemned by magnitude
+ * with no proximity argument needed.
  *
  * DERIVED, not picked (TRA-2379 decision 3). On the 07-26 tape every candidate in
  * `[1.75, 10]` produces the identical partition, so the tape cannot choose; the
@@ -34,23 +39,84 @@
  *    by also firing on the genuine 25-40% single-session microcap moves that are
  *    real (six of them on the 07-26 tape). `max(price/prev, prev/price)` gives the
  *    same value whichever way the action went.
- *  - It must cover the SMALLEST corporate action that can produce the artefact,
- *    which is a factor of 2 (2:1 forward, 1:2 reverse) => r = 2 exactly. Any
- *    higher value opens a hole at the most common split factor.
+ *  - It is ANCHORED at the SMALLEST corporate action that can produce the
+ *    artefact: a factor of 2 (2:1 forward, 1:2 reverse).
  *
- * False-positive check on the 07-26 tape (587 symbols, FFAI excluded as the known
- * bad): 0 flagged rows. Sub-$7 microcaps taken separately — the partition where
- * large genuine moves live — top out at r = 1.670 (GSUN, -39.60%), i.e. 1.20x of
- * headroom; the other five genuine 25-40% movers sit at r = 1.335-1.389. FFAI is
- * at r = 92.71.
- *
- * That headroom is deliberately thin. A genuine -50% microcap session WILL be
- * flagged, and that is the right trade because decision 1 makes a false positive
- * cheap: the row keeps its raw numbers and loses a badge and its place in a
- * *suggestion* list. A false negative published +8,951.61% as fact and ranked it
- * first.
+ * ⛔ CORRECTED 2026-08-11 (TRA-3241). This derivation used to conclude
+ * "=> r = 2 exactly. Any higher value opens a hole at the most common split
+ * factor." That is one step short, and it was a false justification for using
+ * the anchor AS the flag boundary. A factor-2 action lands at r = 2 EXACTLY
+ * only when the price has not moved at all from the split-adjusted prior
+ * close. With a genuine ex-date move `m`, an unadjusted 2:1 forward split
+ * publishes `r = 2/(1+m)` and an unadjusted 1:2 reverse publishes
+ * `r = 2*(1+m)` — any tick in the gap-closing direction pulls r STRICTLY
+ * BELOW 2, and `>=` puts that on the fail-open side. At the modal split factor
+ * the bare anchor is therefore a coin flip on the SIGN of the intraday move.
+ * Measured live (bqb1, 2026-08-11): MNST oscillated between r = 1.99672
+ * (unflagged, publishing -49.92% as the session's #1 loser) and r = 2.00022
+ * (flagged) across ticks of the SAME session.
  */
 export const SUSPECT_MOVE_RATIO = 2;
+
+/**
+ * TRA-3241 — fractional tolerance below {@link SUSPECT_MOVE_RATIO} that the
+ * near-split proximity band covers. See {@link SUSPECT_MOVE_RATIO_FLOOR} for
+ * the derivation; this constant exists so the floor's provenance is arithmetic
+ * on the record rather than a bare literal.
+ */
+export const SPLIT_PROXIMITY_TOLERANCE = 0.05;
+
+/**
+ * TRA-3241 — the boundary the ratio rule actually tests: `r >= 1.9` flags.
+ *
+ * This is the union of two rules, and stating it as a union is what keeps both
+ * derivations honest:
+ *
+ *  - the magnitude floor `r >= SUSPECT_MOVE_RATIO` (TRA-2379, unchanged), and
+ *  - the k = 2 PROXIMITY BAND `[2*(1 - SPLIT_PROXIMITY_TOLERANCE), 2)`, which
+ *    catches the factor-2 artefact when a genuine same-session move has pulled
+ *    r under the anchor: coverage is every ex-date drift in (-5%, +5.26%),
+ *    i.e. the modal split day, where the bare anchor was a coin flip.
+ *
+ * Why a band ONLY at k = 2: every integer split factor (2, 3, 4, 5, 10, 20 and
+ * their reciprocals — r folds direction) is >= 2, so the bands around the
+ * higher factors are subsumed by the magnitude floor; the k = 2 band below the
+ * floor is the ENTIRE incremental surface of "proximity to a plausible integer
+ * factor". A pure proximity test with no floor would be strictly worse — FFAI
+ * at r = 92.71 is near no factor and would UNFLAG. Sub-2 FRACTIONAL factors
+ * (3:2 at r = 1.5, 5:4 at 1.25) stay deliberately out: TRA-3065 measured that
+ * region as dense with genuine movers (a 1.5 floor flags 53.9% of published
+ * mover rows), and those actions are owned by the split-calendar leg
+ * (TRA-3068) and TRA-2380, not by any ratio.
+ *
+ * Why 5%: the band must cover the genuine ex-date drift of a stock that split
+ * overnight. Measured artefacts cluster tight — MNST at r = 1.99672 (0.16%
+ * drift), WXM at 1.97774-1.99 (0.5-1.1%) on 2026-08-11 — while typical
+ * same-session drift is low single digits; 5% covers the modal split day
+ * without reaching the genuine-mover population. The 1.9 edge sits in the
+ * measured EMPTY region between the two: the largest plausibly-genuine movers
+ * are r = 1.670 (GSUN, 07-26 tape) and r = 1.642 (QMCO, 08-11 tape) ⇒ 1.14x
+ * headroom below the edge; the nearest unflagged artefact-shaped row is FGMC's
+ * frozen-price shape at 1.816 (owned by the continuity rule, not this one).
+ * A hard cutoff must sit in a gap in the distribution, never inside a cluster
+ * — the anchor at 2 sat INSIDE the k = 2 artefact cluster [1.97, 2.01], which
+ * is the defect TRA-3241 was filed on.
+ *
+ * False-positive cost, re-measured on the 2026-08-11 tape (663 symbols):
+ * 1.9 flags exactly PLAG (r = 10.80, split artefact), MNST and WXM (both
+ * factor-2-shaped) — zero plausibly-genuine movers. A genuine +90-99% or
+ * -47.4..-50% session WILL be flagged; that trade is accepted because TRA-2379
+ * decision 1 makes a false positive cheap (the row keeps its raw numbers and
+ * loses a badge and its place in a *suggestion* list) while the false negative
+ * published the session's #1 loser off a fabricated denominator.
+ *
+ * A LITERAL, not `SUSPECT_MOVE_RATIO * (1 - SPLIT_PROXIMITY_TOLERANCE)`, on
+ * purpose: the float product is 1.9000000000000001, strictly ABOVE the literal
+ * 1.9, so deriving the edge at runtime would silently exclude the exact value
+ * the docs and logs advertise (TRA-2689's strict-float-comparison shape). The
+ * test suite asserts the literal and the product agree to 12 decimal places.
+ */
+export const SUSPECT_MOVE_RATIO_FLOOR = 1.9;
 
 // ── TRA-3068 (measured on TRA-3065) — THE SPLIT CALENDAR ──────────────────────
 //
@@ -70,6 +136,16 @@ export const SUSPECT_MOVE_RATIO = 2;
 // the factor `k`, so an action of factor `k` is caught only when `m <= k/R - 1`
 // or `m >= R*k - 1`. For 3:2 at R = 1.5 the stock must ALSO genuinely move
 // <= -25% or >= +200% on the ex-date. There is no R that closes it.
+//
+// ⚠️ RE-DERIVED 2026-08-11 (TRA-3241) AND THE PROHIBITION STANDS. The
+// `SUSPECT_MOVE_RATIO_FLOOR` band at 1.9 is NOT the move this paragraph
+// forbids and does NOT discharge it: the band closes the k = 2 PROXIMITY hole
+// specifically (where the artefact cluster measurably sits and the genuine
+// population measurably does not — see the floor's own derivation), while this
+// paragraph's arithmetic is about chasing the class DOWN THE FACTOR GRID. That
+// argument is untouched: 3:2 still lives at r ~ 1.5 inside the genuine-mover
+// population, no floor OR band down there survives the 53.9% cost, and the
+// split calendar remains the only instrument that reaches it.
 //
 // The ex-date is the one input that distinguishes a 3:2 split from a genuine
 // -33% session, and it is nearly free: Yahoo's chart endpoint — which
@@ -182,6 +258,16 @@ export type QuoteSuspectReason =
   /** `max(price/prev, prev/price) >= SUSPECT_MOVE_RATIO`. */
   | 'implausible_move_ratio'
   /**
+   * TRA-3241 — `ratio` is in `[SUSPECT_MOVE_RATIO_FLOOR, SUSPECT_MOVE_RATIO)`:
+   * within the proximity band below the smallest integer split factor. Genuine
+   * moves do not cluster on exact small-integer ratios; corporate actions are
+   * the mechanism that puts them there, and a genuine same-session tick in the
+   * gap-closing direction is what pulls the artefact under the anchor. Distinct
+   * from `'implausible_move_ratio'` so a log line names WHICH rule condemned
+   * the row — the magnitude, or the proximity.
+   */
+  | 'near_split_ratio'
+  /**
    * TRA-3068 — a KNOWN corporate action ex-dated INTO this row's session, from
    * the provider's split calendar rather than from the row's own arithmetic.
    *
@@ -284,10 +370,10 @@ export function assessQuotePlausibility(
 
   // TRA-3068 — a KNOWN ex-date outranks the ratio test, and it is checked BEFORE
   // it so the reason names the CAUSE rather than the symptom. This is the whole
-  // point of the leg: a 3:2 forward split sits at r = 1.5 and sails past
-  // `SUSPECT_MOVE_RATIO`, while the rows the ratio DOES catch (a 2:1 at r = 2.000
-  // exactly) are a knife edge that any genuine ex-date move knocks back under the
-  // bar. `ratio` is still carried so the log shows both numbers side by side.
+  // point of the leg: a 3:2 forward split sits at r = 1.5 and sails past both
+  // the anchor AND the TRA-3241 proximity band, while the factor-2 rows the
+  // ratio does catch are caught by arithmetic that cannot say WHICH action did
+  // it. `ratio` is still carried so the log shows both numbers side by side.
   //
   // This fires in BOTH feed branches, deliberately, and TRA-3065 could not settle
   // which one we are in: under an UNADJUSTED prev close the published `changePct`
@@ -303,6 +389,12 @@ export function assessQuotePlausibility(
 
   if (ratio >= SUSPECT_MOVE_RATIO) {
     return { suspect: true, reason: 'implausible_move_ratio', impliedPrevClose: prev, ratio };
+  }
+  // TRA-3241 — the k = 2 proximity band. Ordered AFTER the magnitude floor so
+  // the reason partition is exact: at or above the anchor is magnitude, inside
+  // the band is proximity, below the band is clean.
+  if (ratio >= SUSPECT_MOVE_RATIO_FLOOR) {
+    return { suspect: true, reason: 'near_split_ratio', impliedPrevClose: prev, ratio };
   }
   return { suspect: false, impliedPrevClose: prev, ratio };
 }
@@ -703,7 +795,11 @@ export function describeQuoteSuspicion(
   if (!v.suspect) return `${symbol}: plausible`;
   const prev = v.impliedPrevClose === null ? 'n/a' : v.impliedPrevClose.toFixed(4);
   const ratio = v.ratio === null ? 'n/a' : v.ratio.toFixed(2);
+  // TRA-3241 — print the boundary the row was actually tested against, so the
+  // reader can re-derive the verdict from the line: the band edge for a
+  // proximity fire, the anchor for a magnitude fire.
+  const bar = v.reason === 'near_split_ratio' ? SUSPECT_MOVE_RATIO_FLOOR : SUSPECT_MOVE_RATIO;
   return `${symbol}: ${v.reason} (price=${q.price}, changePct=${q.changePct ?? 'n/a'}, `
-    + `impliedPrevClose=${prev}, ratio=${ratio}, threshold=${SUSPECT_MOVE_RATIO})`
+    + `impliedPrevClose=${prev}, ratio=${ratio}, threshold=${bar})`
     + describeCorporateAction(v.corporateAction);
 }

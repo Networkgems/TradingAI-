@@ -20,7 +20,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { EodMover } from '@trading-app/shared';
-import { SUSPECT_MOVE_RATIO } from '@trading-app/shared';
+import { SUSPECT_MOVE_RATIO_FLOOR } from '@trading-app/shared';
 import {
   annotateReportProvenance,
   MOVER_PROVENANCE_RULE_ID,
@@ -31,8 +31,13 @@ const BUILD = '7a5317605e1c';
 
 /** The fabricated 2026-07-21 headline: implied prev close 0.0240, r = 14.17. */
 const SELX: EodMover = { symbol: 'SELX', price: 0.34, changePct: 1316.67 };
-/** A genuine near-doubling that sits just UNDER the bar (INLF, 2026-08-05). */
-const INLF: EodMover = { symbol: 'INLF', price: 6.27, changePct: 97.17 };
+/**
+ * A genuine large mover safely under the band (QMCO, 2026-08-11, r = 1.642).
+ * TRA-3241 retired INLF ($6.27 / +97.17%, r = 1.9717) from this role: it sits
+ * INSIDE the k = 2 proximity band — an MNST-shaped row, correctly suppressed
+ * by the current rule.
+ */
+const QMCO: EodMover = { symbol: 'QMCO', price: 19.34, changePct: 64.18 };
 const NVDA: EodMover = { symbol: 'NVDA', price: 178.25, changePct: 2.41 };
 /** The second fabricated headline, off the 2026-07-15 live artifact. */
 const JEM: EodMover = { symbol: 'JEM', price: 6.05, changePct: 1102.07 };
@@ -77,18 +82,18 @@ function tableRows(markdown: string): string[] {
 describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () => {
   // ── Scope point 1: READ-TIME FILTER ────────────────────────────────────────
   it('suppresses the real archived SELX headline from the served array', () => {
-    const out = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
 
-    expect(out.top5Movers.map(m => m.symbol)).toEqual(['INLF', 'NVDA']);
+    expect(out.top5Movers.map(m => m.symbol)).toEqual(['QMCO', 'NVDA']);
     expect(out.top5Movers.some(m => m.symbol === 'SELX')).toBe(false);
     // The survivors keep their published numbers and their published order —
     // suppression is not a re-rank and not a restatement.
-    expect(out.top5Movers[0]!.price).toBe(6.27);
-    expect(out.top5Movers[0]!.changePct).toBe(97.17);
+    expect(out.top5Movers[0]!.price).toBe(19.34);
+    expect(out.top5Movers[0]!.changePct).toBe(64.18);
   });
 
   it('carries the suppressed row verbatim, with its arithmetic, in moversProvenance', () => {
-    const out = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
     const mp = out.moversProvenance!;
 
     expect(mp.publishedCount).toBe(3);
@@ -108,7 +113,7 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
     // SELF-DATING. Rule id + threshold + build, so a later threshold change
     // re-annotates instead of silently contradicting.
     expect(mp.ruleId).toBe(MOVER_PROVENANCE_RULE_ID);
-    expect(mp.threshold).toBe(SUSPECT_MOVE_RATIO);
+    expect(mp.threshold).toBe(SUSPECT_MOVE_RATIO_FLOOR);
     expect(mp.build).toBe(BUILD);
   });
 
@@ -133,20 +138,22 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
     expect(out.markdown).toContain('2 of 2 published row(s) SUPPRESSED');
   });
 
-  it('does not flag or suppress the genuine near-doubling under the bar', () => {
-    const out = annotateReportProvenance(report([INLF, NVDA]), BUILD);
-    expect(out.top5Movers.map(m => m.symbol)).toEqual(['INLF', 'NVDA']);
+  it('does not flag or suppress the genuine large mover under the band', () => {
+    const out = annotateReportProvenance(report([QMCO, NVDA]), BUILD);
+    expect(out.top5Movers.map(m => m.symbol)).toEqual(['QMCO', 'NVDA']);
     expect(out.top5Movers.map(m => m.provenance!.verdict)).toEqual(['plausible', 'plausible']);
-    // INLF is r = 1.9717 against a threshold of 2 — 1.4% of headroom. This is
-    // the FALSE-POSITIVE control: suppressing it would be DELETING a real mover,
-    // which under A is a materially worse error than a wrong badge was under B.
-    expect(out.top5Movers[0]!.provenance!.ratio).toBeCloseTo(1.9717, 4);
+    // QMCO is r = 1.6418 against the 1.9 band edge. This is the FALSE-POSITIVE
+    // control: suppressing it would be DELETING a real mover, which under A is
+    // a materially worse error than a wrong badge was under B. (The old control
+    // here, INLF at r = 1.9717, is inside the TRA-3241 band and is now a
+    // correct suppression, not a false positive.)
+    expect(out.top5Movers[0]!.provenance!.ratio).toBeCloseTo(1.6418, 4);
     expect(out.moversProvenance!.filteredCount).toBe(0);
   });
 
   // ── Scope point 2: a filtered report must not read like a clean one ─────────
   it('states the denominator on a CLEAN report, so silence is never the answer', () => {
-    const out = annotateReportProvenance(report([INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([QMCO, NVDA]), BUILD);
     // Present-with-zero, NOT absent. Absent means the filter never ran, which is
     // a different fact, and the check script discriminates on exactly this.
     expect(out.moversProvenance).toBeDefined();
@@ -160,8 +167,8 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
     // The whole point of scope point 2, as one assertion. Both documents end up
     // with the same two visible rows; if the surfaces did not disagree, the fix
     // would have reproduced the defect it was filed on.
-    const filtered = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
-    const clean = annotateReportProvenance(report([INLF, NVDA]), BUILD);
+    const filtered = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
+    const clean = annotateReportProvenance(report([QMCO, NVDA]), BUILD);
 
     expect(tableRows(filtered.markdown)).toEqual(tableRows(clean.markdown));
     expect(filtered.top5Movers.map(m => m.symbol)).toEqual(clean.top5Movers.map(m => m.symbol));
@@ -175,13 +182,13 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
   });
 
   it('reproduces the suppressed row in the note so the response stays self-contained', () => {
-    const out = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
     expect(out.markdown).toContain('1 of 3 published row(s) SUPPRESSED');
     expect(out.markdown).toContain('SELX');
     expect(out.markdown).toContain('$0.34 / +1316.67%');
     expect(out.markdown).toContain('implausible_move_ratio');
     expect(out.markdown).toContain(MOVER_PROVENANCE_RULE_ID);
-    expect(out.markdown).toContain(`SUSPECT_MOVE_RATIO = ${SUSPECT_MOVE_RATIO}`);
+    expect(out.markdown).toContain(`SUSPECT_MOVE_RATIO_FLOOR = ${SUSPECT_MOVE_RATIO_FLOOR}`);
     expect(out.markdown).toContain(BUILD);
     // The jurisdiction disclaimer: an unsuppressed row is unflagged, not verified.
     expect(out.markdown).toContain('TRA-2634');
@@ -191,7 +198,7 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
   });
 
   it('places the note under the table, above the next heading', () => {
-    const out = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
     const lines = out.markdown.split('\n');
     const noteIdx = lines.findIndex(l => l.includes('PROVENANCE'));
     const nextHeadingIdx = lines.findIndex(l => l === '## Signal Accuracy');
@@ -202,11 +209,11 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
 
   // ── Scope point 3: BOTH surfaces, and never half of one ────────────────────
   it('removes the row from the rendered table, leaving the clean rows byte-identical', () => {
-    const out = annotateReportProvenance(report([SELX, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, QMCO, NVDA]), BUILD);
 
     expect(out.markdown).not.toContain('| SELX | $0.34 | +1316.67% |');
     expect(tableRows(out.markdown)).toEqual([
-      formatMoverMarkdownRow(INLF),
+      formatMoverMarkdownRow(QMCO),
       formatMoverMarkdownRow(NVDA),
     ]);
     // Everything outside the movers section survives untouched.
@@ -216,7 +223,7 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
   });
 
   it('keeps the two surfaces in agreement — no half-filtered report', () => {
-    const out = annotateReportProvenance(report([SELX, JEM, INLF, NVDA]), BUILD);
+    const out = annotateReportProvenance(report([SELX, JEM, QMCO, NVDA]), BUILD);
     const rows = tableRows(out.markdown);
     expect(rows).toHaveLength(out.top5Movers.length);
     expect(rows).toEqual(out.top5Movers.map(m => formatMoverMarkdownRow(m)));
@@ -228,7 +235,7 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
 
   // ── Read-time only: annotate the response, never the artifact ──────────────
   it('does not mutate the object it was handed', () => {
-    const input = report([SELX, INLF]);
+    const input = report([SELX, QMCO]);
     const before = JSON.parse(JSON.stringify(input));
     annotateReportProvenance(input, BUILD);
     expect(input).toEqual(before);
