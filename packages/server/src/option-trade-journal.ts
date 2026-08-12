@@ -957,8 +957,15 @@ export const GATE_R_BASIS_STRUCTURES: ReadonlySet<string> = new Set([
   'directional',
 ]);
 
-/** Ratio between the two R bases: gateR = premiumR / 0.25 = 4 × premiumR. */
-const GATE_R_PER_PREMIUM_R = 1 / STOP_DISTANCE_FRACTION_OF_MARK;
+/**
+ * Ratio between the two R bases: gateR = premiumR / 0.25 = 4 × premiumR.
+ *
+ * EXPORTED since TRA-3391 so the tape-calibrated expectancy folds R_gate through
+ * this one constant rather than writing a second `/0.25` — the 4× unit gap has
+ * already produced one phantom cost input (TRA-1656 #5) and must have exactly one
+ * definition in the tree.
+ */
+export const GATE_R_PER_PREMIUM_R = 1 / STOP_DISTANCE_FRACTION_OF_MARK;
 
 // Entry-|delta| bucket edges: width 0.05 across [0.20, 0.70], plus catch-alls.
 //

@@ -118,6 +118,11 @@ import {
 } from '../option-cost-gate.js';
 // TRA-3272 — the NET-EDGE cost-bar form's arm description.
 import { describeNetEdgeBar } from '../option-net-edge-bar.js';
+// TRA-3391 (TRA-3388 Ruling 2) — the tape-calibrated expectancy table that
+// REPLACED the delta-proxy estimator, published per cell so the admission
+// decision is readable off deployed state instead of re-derived by hand.
+import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
+import { TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist.
 import {
   resolveLiveOtmUniverse,
@@ -3980,6 +3985,57 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   });
 
+  // TRA-3391 (TRA-3388 Ruling 2, acceptance item 6) — the TAPE-CALIBRATED
+  // EXPECTANCY TABLE, per cell, as the gate itself sees it.
+  //
+  // The admission decision is no longer a formula a reader can recompute from the
+  // arm block: it is a lookup into a measured table. Publishing the table is what
+  // makes the decision gradeable off deployed state — `admits` here IS the
+  // decision the live gate makes for a candidate in that cell, computed by the
+  // same pure function, not a re-derivation.
+  //
+  // Read in this order:
+  //  1. `basis` — desk + unattributed, QA fixtures EXCLUDED. Load-bearing: 110 of
+  //     the 116 fixture OTM rows sit in 0.45–0.55, i.e. exactly the decision band,
+  //     so a fixture-inclusive fold manufactures the admission (Ruling 2.1).
+  //  2. `freshness.generation` — 0 / `computedAt: 0` means NOTHING HAS BEEN FOLDED
+  //     and every candidate is currently declining `insufficient_evidence`. That
+  //     is fail-closed, not clean.
+  //  3. `cells[].n` against `minCellN` — a cell under it DECLINES with
+  //     `insufficient_evidence` no matter how good its mean looks.
+  //  4. `cells[].lowerCI95` against `cells[].barR` — the decision rule is the
+  //     LOWER BOUND, not the mean (Ruling 2.4).
+  //
+  // Observe-only, secrets-free (structure / bucket / counts / R-multiples only),
+  // unauthenticated for parity with /option-journal and /live-enforce-gates.
+  app.get('/api/health/option-expectancy-table', async (_req, res) => {
+    const nowMs = now();
+    const cache = tapeExpectancyCache();
+    const cached = await cache.get();
+    const admitted = cached?.table.cells.filter((c) => c.admits) ?? [];
+    const underpowered = cached?.table.cells.filter((c) => c.n < (cached.table.minCellN)) ?? [];
+    res.json({
+      ok: true,
+      issue: 'TRA-3391',
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      etDay: etDateString(new Date(nowMs)),
+      /** The decision rule, published as text so a grader never has to infer it. */
+      rule: 'admit iff mean(R_gate) - 1.96*SE >= admissionBarR AND n >= minCellN; otherwise BLOCK (insufficient_evidence when n < minCellN)',
+      unit: 'R_gate = realizedR / 0.25 — the same currency as admissionBarR',
+      minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
+      freshness: cache.freshness(),
+      basis: cached?.census ?? null,
+      table: cached?.table ?? null,
+      admittedCells: admitted.map((c) => c.cellKey),
+      underpoweredCells: underpowered.map((c) => ({ cell: c.cellKey, n: c.n })),
+      note:
+        cached === null
+          ? 'BLIND — the expectancy tape has never been folded in this process. This is NOT a clean bill: every candidate is currently DECLINED with `insufficient_evidence` (fail-closed). Check freshness.lastError.'
+          : `Folded ${cached.table.rowsUsed} closed rows into ${cached.table.cells.length} cells over a ${cached.table.windowDays ?? 'unbounded'}-day rolling window. ${admitted.length} cell(s) ADMIT: ${admitted.length > 0 ? admitted.map((c) => `${c.cellKey} (n=${c.n}, mean ${c.meanR_gate.toFixed(3)}, lower95 ${(c.lowerCI95 ?? 0).toFixed(3)} >= bar ${c.barR.toFixed(3)})`).join('; ') : 'NONE — every cell either measures below its bar or holds too few rows'}. ${underpowered.length} cell(s) hold n < ${cached.table.minCellN} and DECLINE under \`insufficient_evidence\`, which is distinct from \`gross_negative\`: it means we never measured, not that we measured a loser (TRA-3388 Ruling 2.5). Cross-read against /api/health/live-enforce-gates → byGate[cost_bar].byCell to see which cells the LIVE gate actually decided under.`,
+    });
+  });
+
   app.get('/api/health/cost-aware-gate', (_req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
@@ -4165,6 +4221,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
            */
           form: netEdgeGovernsOtm ? 'net_edge' : 'flat',
           netEdge,
+          /**
+           * TRA-3391 — the EDGE side of the bar. It is no longer
+           * `3·|delta| − 1`; it is the lower 95% CI bound of the candidate's
+           * measured `structure × |delta| bucket` cell. Published here so the
+           * arm block says which estimator is in force, with the OTM cells and
+           * the fold's freshness inline — `generation: 0` means nothing has been
+           * folded and every candidate is declining `insufficient_evidence`.
+           * The full table is `/api/health/option-expectancy-table`.
+           */
+          edge: {
+            estimator: 'tape_expectancy_lower_ci95',
+            issue: 'TRA-3391',
+            minCellN: TAPE_EXPECTANCY_MIN_CELL_N,
+            freshness: tapeExpectancyCache().freshness(),
+            otmCells: (tapeExpectancyCache().peek()?.cells ?? [])
+              .filter((c) => c.structure === 'single_leg_otm')
+              .map((c) => ({
+                bucket: c.bucket,
+                n: c.n,
+                meanR_gate: c.meanR_gate,
+                seR_gate: c.seR_gate,
+                lowerCI95: c.lowerCI95,
+                barR: c.barR,
+                admits: c.admits,
+              })),
+          },
         },
         spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
         universe: {
@@ -4198,7 +4280,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       note:
         !anyArmed && !universe.restricted
           ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist.`
-          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count.`,
+          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count. ⚠️ TRA-3391 changed what cost_bar's edge IS: it is now the LOWER 95% CI bound of the candidate's measured tape cell (arm.costBar.edge), not \`3·|delta| − 1\`. Two consequences for this payload — (1) \`byReason\` now carries \`insufficient_evidence\`, which means WE NEVER MEASURED THAT CELL and is NOT \`gross_negative\` (a measured loser); on the restricted live universe the tape holds 471 rows, ALL |Δ| < 0.20, so every candidate in the admitted band is expected to land there. (2) \`byCell\` names the cell each verdict was decided under, admits included — cross-read it against /api/health/option-expectancy-table, which publishes n / mean / SE / lowerCI95 / admits per cell.`,
     });
   });
 

@@ -224,9 +224,14 @@ export const DEMO_FLAG_ALLOWLIST = [
   'OPTION_COST_GATE_SAFETY_MARGIN_R',
   'OPTION_COST_GATE_COMMISSION_R',
   'OPTION_COST_GATE_SPREAD_CROSS_R',
-  'OPTION_COST_GATE_WIN_PROB_DELTA_MULT',
-  'OPTION_COST_GATE_DEFAULT_REWARD_R',
-  'OPTION_COST_GATE_WIN_PROB_CAP',
+  // TRA-3391 — `OPTION_COST_GATE_WIN_PROB_DELTA_MULT`, `_DEFAULT_REWARD_R` and
+  // `_WIN_PROB_CAP` were removed from this allowlist with the estimator they
+  // parameterised. QuantTrader's TRA-3388 ruling rejected the CONSTRUCTION, not a
+  // setting of it: the tape needs a multiplier of 8.21 at |Δ|≈0.04 and 0.96 at
+  // 0.47 — non-monotone and outside the old [0,5] clamp — so there is no value
+  // that makes `winProb = |delta|·mult` right. The edge is now measured off the
+  // journal tape and has NO env knob by design; the four cost knobs above stay,
+  // because the ruling did not touch the cost side.
   // TRA-1662 (TRA-1600 A2) — the SHADOW maker-chase measurement. Pure telemetry:
   // it re-polls the two-sided quote of a contract the demo book already opened and
   // records what a maker chase WOULD have recovered. It routes no order, prices no

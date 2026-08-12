@@ -192,53 +192,51 @@ export function admissionBarR(structure: string, config: CostGateConfig = DEFAUL
   return Math.max(modelBar, config.optionsMinGrossR);
 }
 
-/** The admit/reject verdict for one candidate. */
-export interface CostGateVerdict {
-  admit: boolean;
-  structure: string;
-  modeledGrossR: number;
-  /** The bar the candidate had to clear. */
-  barR: number;
-  /** commissionR + makerAdjustedSpreadCrossR for this structure. */
-  costModelR: number;
-  safetyMarginR: number;
-  /** Human-readable rejection reason (empty when admitted). */
-  reason: string;
+/**
+ * TRA-3391 — the per-candidate ingredients the open sites hand the gate, after
+ * the delta-proxy estimator was retired.
+ *
+ * `targetPrice` / `riskRewardRatio` are GONE with it: they existed only to build
+ * `rewardR = (target − mark)/(mark − stop)`, and QuantTrader measured that the
+ * mark·1.5 / mark·0.75 bracket resolves 30.8% of closes, so the reward multiple
+ * was never a property of the trades. What survives is what the tape-calibrated
+ * decision and the net-edge cost side actually consume: the premium, the |delta|
+ * that keys the cell, and the stop that defines the R the cost is measured in.
+ */
+export interface CostGateCandidateInputs {
+  /** Option premium mid (per share) — the candidate's `mark`. */
+  mark: number;
+  /** Signed Black-Scholes delta; only the magnitude is used (it keys the cell). */
+  delta: number;
+  /** Stop-loss premium (per share). Absent on the directional path. */
+  stopPrice?: number;
 }
 
-/**
- * The core admission decision (deliverables B + C). Admit iff the candidate's
- * modeled gross R clears the cost-aware bar for its structure. A non-finite
- * modeledGrossR is treated as failing (we never admit on an unknown edge). Pure.
- */
-export function admitByCostAwareGate(
-  modeledGrossR: number,
-  structure: string,
-  config: CostGateConfig = DEFAULT_COST_GATE_CONFIG,
-): CostGateVerdict {
-  const barR = admissionBarR(structure, config);
-  const costModelR = structureCostR(isEquityStructure(structure) ? config.equityCost : config.optionsCost);
-  const gross = Number.isFinite(modeledGrossR) ? modeledGrossR : Number.NaN;
-  const admit = Number.isFinite(gross) && gross >= barR;
-  return {
-    admit,
-    structure,
-    modeledGrossR: gross,
-    barR,
-    costModelR,
-    safetyMarginR: config.safetyMarginR,
-    reason: admit
-      ? ''
-      : `cost-aware gate: modeled gross ${Number.isFinite(gross) ? gross.toFixed(3) : 'unknown'}R < ${barR.toFixed(2)}R bar (costModel ${costModelR.toFixed(2)}R + margin ${config.safetyMarginR.toFixed(2)}R) for ${structure}`,
-  };
-}
+// ── TRA-3391 — where the admit/reject decision went ──────────────────────────
+//
+// `admitByCostAwareGate(modeledGrossR, structure, config)` and its
+// `costGateBlockReasonCode` classifier lived here and were DELETED with the
+// estimator that fed them. Both took a `modeledGrossR` that nothing computes any
+// more: TRA-3388 Ruling 2 retired `3·|delta| − 1` as an estimate of an expectancy
+// under an exit policy this sleeve does not use.
+//
+// The decision now lives in `option-tape-expectancy.ts`
+// (`tapeExpectancyVerdict`), which compares the LOWER 95% CI BOUND of the
+// candidate's measured `structure × |delta| bucket` cell against
+// {@link admissionBarR} — the same bar, the same R unit, a measured edge instead
+// of a modelled one. What stays HERE is the COST side, which the ruling did not
+// touch: the bar, its composition, and the env resolver.
+//
+// They are deleted rather than deprecated on purpose. An exported admission
+// primitive that still compiles is one import away from being wired back in, and
+// nothing in its signature would say the number it wants no longer exists.
 
 // ── TRA-3216: making a 99.15% block rate DIAGNOSABLE ─────────────────────────
 //
 // Over 5 armed live sessions the live cost bar evaluated 1528 OTM candidates and
 // blocked 1515 of them. `byScope` could only ever answer `single_leg_otm`, and
-// {@link CostGateVerdict.reason} is per-candidate prose carrying that candidate's
-// own gross-R — fold on it and you get 1515 buckets of size 1. Neither says
+// the verdict's `reason` is per-candidate prose carrying that candidate's own
+// numbers — fold on it and you get 1515 buckets of size 1. Neither says
 // whether the bar is off by a hair or by a mile, so the only way to retune it was
 // to guess and redeploy.
 //
@@ -253,41 +251,17 @@ export function admitByCostAwareGate(
 // many of these come back?" — off recorded data instead of a live experiment.
 
 /**
- * Bucket boundaries (in R) for {@link costGateBlockReasonCode}. Chosen so the
- * first bucket is roughly one safety-margin's worth of retune and the last is
- * "no plausible retune reaches these".
+ * Bucket boundaries (in R) for the shortfall classification. Chosen so the first
+ * bucket is roughly one safety-margin's worth of retune and the last is "no
+ * plausible retune reaches these".
+ *
+ * The classifier that consumes them moved to `option-tape-expectancy.ts` with the
+ * decision itself (TRA-3391); the EDGES stay here because they are read against
+ * {@link admissionBarR}, which is this module's number. Keeping the vocabulary
+ * identical is deliberate: the live ledger's `byReason` axis has a multi-session
+ * history in these exact keys and a rename would silently reset it.
  */
 export const COST_GATE_SHORTFALL_BUCKETS_R: readonly number[] = [0.1, 0.25, 0.5];
-
-/**
- * Classify a REJECTED cost-gate verdict into a low-cardinality, foldable code.
- * Pure. Returns a stable key from a bounded set:
- *
- *   `gross_unknown`          — modeled gross R was non-finite; the gate failed
- *                              closed. NOT a bar-tuning problem: lowering the bar
- *                              admits none of these, the estimator is the defect.
- *   `gross_negative`         — modeled gross R below zero. Structurally hopeless;
- *                              no bar above 0 admits them.
- *   `shortfall_lt_0.10`      — within 0.10R of the bar. The retune-sensitive
- *   `shortfall_0.10_0.25`      cohort, in increasing order of how far the bar
- *   `shortfall_0.25_0.50`      would have to move.
- *   `shortfall_gte_0.50`     — far below; effectively unreachable by tuning.
- *
- * Passing an ADMITTED verdict returns `null` — an admit has no block to classify,
- * and the ledger deliberately keeps the reason axis blocks-only.
- */
-export function costGateBlockReasonCode(verdict: CostGateVerdict): string | null {
-  if (verdict.admit) return null;
-  const gross = verdict.modeledGrossR;
-  if (!Number.isFinite(gross)) return 'gross_unknown';
-  if (gross < 0) return 'gross_negative';
-  const shortfall = verdict.barR - gross;
-  const [near, mid, far] = COST_GATE_SHORTFALL_BUCKETS_R;
-  if (shortfall < near) return `shortfall_lt_${near.toFixed(2)}`;
-  if (shortfall < mid) return `shortfall_${near.toFixed(2)}_${mid.toFixed(2)}`;
-  if (shortfall < far) return `shortfall_${mid.toFixed(2)}_${far.toFixed(2)}`;
-  return `shortfall_gte_${far.toFixed(2)}`;
-}
 
 /** The resolved bar and its composition — the CONSTANT half of "why did it block". */
 export interface CostGateBarDescription {

@@ -3,11 +3,9 @@ import {
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
   admissionBarR,
-  admitByCostAwareGate,
   structureCostR,
   isEquityStructure,
   DEFAULT_COST_GATE_CONFIG,
-  costGateBlockReasonCode,
   describeCostGateBar,
 } from './option-cost-gate.js';
 import { SLEEVE_SPREAD_CEILINGS } from './option-spread-cost.js';
@@ -89,40 +87,12 @@ describe('structureCostR', () => {
   });
 });
 
-describe('admitByCostAwareGate', () => {
-  it('admits an options idea at/above the 0.485R bar and rejects below', () => {
-    expect(admitByCostAwareGate(0.485, 'single_leg_rv').admit).toBe(true);
-    expect(admitByCostAwareGate(0.5, 'single_leg_otm').admit).toBe(true);
-    const rej = admitByCostAwareGate(0.4, 'single_leg_otm');
-    expect(rej.admit).toBe(false);
-    expect(rej.reason).toMatch(/cost-aware gate/);
-    expect(rej.reason).toMatch(/0\.48R bar/); // barR.toFixed(2) of 0.485
-  });
-
-  it('never admits on a non-finite modeled gross R', () => {
-    expect(admitByCostAwareGate(Number.NaN, 'single_leg_rv').admit).toBe(false);
-    expect(admitByCostAwareGate(Number.POSITIVE_INFINITY, 'single_leg_rv').admit).toBe(false);
-  });
-
-  it('a thin-edge scratch-tier idea (~0R) is rejected — the core intent', () => {
-    // The whole point: stop firing ~0-edge scratches that pay spread cross.
-    const v = admitByCostAwareGate(0.03, 'single_leg_otm');
-    expect(v.admit).toBe(false);
-  });
-
-  it('equity admits at a much lower gross than options', () => {
-    // 0.3R gross: rejected on options (< 0.485), admitted on equity (>= 0.22).
-    expect(admitByCostAwareGate(0.3, 'single_leg_rv').admit).toBe(false);
-    expect(admitByCostAwareGate(0.3, 'equity').admit).toBe(true);
-  });
-
-  it('surfaces the bar decomposition on the verdict', () => {
-    const v = admitByCostAwareGate(0.4, 'single_leg_rv');
-    expect(v.barR).toBeCloseTo(0.485, 10);
-    expect(v.costModelR).toBeCloseTo(0.285, 10);
-    expect(v.safetyMarginR).toBeCloseTo(0.2, 10);
-  });
-});
+// TRA-3391 — the `admitByCostAwareGate` suite that lived here was deleted with the
+// function. The admit/reject decision moved to `tapeExpectancyVerdict`
+// (`option-tape-expectancy.test.ts`), which tests the same three properties on the
+// number that replaced `modeledGrossR`: it clears/misses the SAME `admissionBarR`,
+// it never admits on a non-finite edge, and options and equity keep different bars.
+// The BAR itself is still tested above — that half was not retired.
 
 describe('resolveCostGateConfig', () => {
   it('falls back to the shipped defaults on an empty env', () => {
@@ -154,45 +124,14 @@ describe('resolveCostGateConfig', () => {
   });
 });
 
-// ── TRA-3216: making a 99.15% live block rate diagnosable ────────────────────
-describe('cost gate block classification (TRA-3216)', () => {
-  const bar = admissionBarR('single_leg_otm'); // 0.485R under the shipped config
-
-  it('returns null for an admit — an admitted candidate has no block to classify', () => {
-    expect(costGateBlockReasonCode(admitByCostAwareGate(bar + 0.01, 'single_leg_otm'))).toBeNull();
-  });
-
-  it('buckets the shortfall so "how far would the bar have to move" is answerable', () => {
-    const code = (gross: number) => costGateBlockReasonCode(admitByCostAwareGate(gross, 'single_leg_otm'));
-    expect(code(bar - 0.01)).toBe('shortfall_lt_0.10');
-    expect(code(bar - 0.15)).toBe('shortfall_0.10_0.25');
-    expect(code(bar - 0.30)).toBe('shortfall_0.25_0.50');
-    // The shipped 0.485R bar is too low for a >=0.50R shortfall to exist at a
-    // NON-negative gross (0.485 - 0.50 < 0), and `gross_negative` deliberately
-    // wins that overlap — so exercise the far bucket against a raised bar.
-    const highBar = resolveCostGateConfig({ OPTION_COST_GATE_MIN_GROSS_R: '1.2' } as NodeJS.ProcessEnv);
-    expect(costGateBlockReasonCode(admitByCostAwareGate(0.5, 'single_leg_otm', highBar))).toBe('shortfall_gte_0.50');
-    // Negative gross classifies as negative regardless of how far under it is.
-    expect(code(bar - 0.90)).toBe('gross_negative');
-  });
-
-  it('separates the two blocks NO bar retune can recover from the tuneable ones', () => {
-    // Non-finite gross: the gate failed closed on an unknown edge. Dropping the
-    // bar to zero admits none of these — the estimator is the defect, not the bar.
-    expect(costGateBlockReasonCode(admitByCostAwareGate(Number.NaN, 'single_leg_otm'))).toBe('gross_unknown');
-    // Negative modeled gross: structurally hopeless at any bar above 0.
-    expect(costGateBlockReasonCode(admitByCostAwareGate(-0.2, 'single_leg_otm'))).toBe('gross_negative');
-  });
-
-  it('emits a BOUNDED key set — the codes must stay foldable across thousands of blocks', () => {
-    const codes = new Set<string>();
-    for (let g = -2; g <= 1; g += 0.001) {
-      const c = costGateBlockReasonCode(admitByCostAwareGate(g, 'single_leg_otm'));
-      if (c) codes.add(c);
-    }
-    expect(codes.size).toBeLessThanOrEqual(6);
-  });
-
+// ── TRA-3216 / TRA-3391: the CONSTANT half of "why did the bar block" ────────
+//
+// The shortfall CLASSIFIER moved to `option-tape-expectancy.ts` with the decision
+// (its bucket edges, `COST_GATE_SHORTFALL_BUCKETS_R`, stay here because they are
+// read against `admissionBarR`). What is still this module's to prove is the bar
+// description — including the floor-pinning trap, which is unaffected by the
+// estimator swap and is still the most common way a "retune" ships as a no-op.
+describe('cost gate bar description (TRA-3216)', () => {
   it('describes the bar composition, and flags the floor PINNING it (a retune no-op)', () => {
     // Shipped config: 0.05 + 0.235 + 0.20 = 0.485R, clear of the 0.30 floor.
     const shipped = describeCostGateBar('single_leg_otm');

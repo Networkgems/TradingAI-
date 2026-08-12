@@ -330,20 +330,27 @@ import { isLiveCryptoBootArmEnabled } from './live-crypto-boot-arm-flag.js';
 // mode==='demo'), so wiring it into both accounts can never change a live number.
 import { resolveMarketableOpenMtmConfig } from './marketable-open-mtm-flag.js';
 // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the executing
-// options opens (RV / OTM / directional). The estimator builds a modeled GROSS R
-// from local ingredients (mark, delta, target/stop); the gate nets the structure
-// cost exactly once and rejects scratch-tier ideas. QuantTrader owns the
-// thresholds (TRA-1603 sign-off). DEMO-ONLY + OFF by default at the call sites.
+// options opens (RV / OTM / directional). The gate nets the structure cost
+// exactly once and rejects ideas whose measured edge can't clear it.
+//
+// TRA-3391 (TRA-3388 Ruling 2) — the EDGE side is no longer modelled. The
+// delta-proxy estimator (`estimateModeledGrossR`: winProb = |delta|·mult,
+// rewardR from a mark·1.5 / mark·0.75 barrier race) is DELETED: the two barriers
+// resolve 30.8% of closes, so it priced a race the sleeve does not run. The
+// candidate's edge is now the LOWER 95% CI BOUND of its own
+// `structure × |delta| bucket` cell on the journal tape, and an unmeasured cell
+// DECLINES under `insufficient_evidence`.
 import {
-  estimateModeledGrossR,
-  resolveModeledGrossRConfig,
-  type ModeledGrossRInputs,
-} from './option-modeled-gross-r.js';
+  peekTapeExpectancyTable,
+} from './option-tape-expectancy-cache.js';
 import {
-  admitByCostAwareGate,
+  tapeExpectancyVerdict,
+  tapeEdgeR,
+} from './option-tape-expectancy.js';
+import {
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
-  costGateBlockReasonCode, // TRA-3216 — the foldable classification of a block
+  type CostGateCandidateInputs,
 } from './option-cost-gate.js';
 // TRA-3272 (parent TRA-3271) — the NET-EDGE form of the cost bar: per-candidate
 // quote + fees vs k× modeled edge, replacing the flat constant bar for the
@@ -6440,13 +6447,28 @@ export class SignalEngine {
    * The executing option sleeves admit on a purely STRUCTURAL basis (delta / IVR
    * / trend / DTE / greeks-gate / churn) with no per-candidate edge estimate, so
    * a mass of ~0-edge scratch-tier ideas fire and bleed spread cross net-negative
-   * (measured −0.63R on the live-gate cohort). This gate builds the missing
-   * per-candidate modeled GROSS R ({@link estimateModeledGrossR}) from the local
-   * ingredients (mark, |delta| → win-prob, target/stop → reward:risk) and rejects
-   * any candidate whose modeled edge can't clear the structure's cost-aware bar
-   * ({@link admitByCostAwareGate}: commission + maker-adjusted spread cross +
-   * safety margin). GROSS-in: the gate nets the cost exactly once, so the
-   * estimator must NOT also net it (TRA-1603 decision #4).
+   * (measured −0.63R on the live-gate cohort). This gate supplies the missing
+   * per-candidate edge and rejects any candidate that can't clear the structure's
+   * cost-aware bar (commission + maker-adjusted spread cross + safety margin).
+   * GROSS-in: the gate nets the cost exactly once, so the edge estimate must NOT
+   * also net it (TRA-1603 decision #4).
+   *
+   * ── TRA-3391: the edge is MEASURED now, not modelled ──────────────────────
+   * The edge used to be `3·|delta| − 1` — a win-prob proxy times a 2:1 reward
+   * multiple read off the mark·1.5 / mark·0.75 bracket. QuantTrader measured that
+   * bracket on 1073 model-facing OTM closes: **the two barriers resolve 30.8% of
+   * them**; 69.2% exit `manual` / `trail` / `chandelier` / `time_stop` first. The
+   * estimator priced a race the sleeve does not run, and no multiplier fixes it
+   * (the tape needs 8.21 at |Δ|≈0.04 and 0.96 at 0.47 — non-monotone, outside the
+   * old clamp). It is deleted, knobs included.
+   *
+   * The candidate's edge is now {@link tapeExpectancyVerdict}: the LOWER 95% CI
+   * BOUND of the realized R_gate expectancy of its own `structure × |delta|
+   * bucket` cell on the model-facing journal tape — exit-policy-conditional by
+   * construction, because the tape's exits ARE the exit policy. Three ignorance
+   * cases all DECLINE: no fold yet, no cell, or `n < 30` (reason code
+   * `insufficient_evidence`, distinct from `gross_negative` — "we never measured"
+   * must not read as "we measured a loser").
    *
    * TWO enforcement modes, each behind its OWN flag and its OWN telemetry:
    *   • DEMO — enforced when `mode === 'demo'` AND `ENABLE_OPTION_COST_AWARE_GATE`
@@ -6462,10 +6484,11 @@ export class SignalEngine {
    *     and OFF by default ⇒ the live path is byte-for-byte unchanged until an
    *     operator arms it as an ops action (TRA-1897-HOLD-safe).
    *
-   * Both the estimator config and the cost-gate config are env-overridable so
-   * QuantTrader can retune the delta→win-prob multiplier and the per-structure
-   * cost inputs from the option journal / measured slippage ledger WITHOUT a code
-   * change (demo reads the demo-flags env; live reads the process env).
+   * The COST side stays env-overridable so QuantTrader can retune the
+   * per-structure cost inputs from the measured slippage ledger without a code
+   * change (demo reads the demo-flags env; live reads the process env). The EDGE
+   * side has no knobs by design — every knob on the retired estimator turned out
+   * to be a way of tuning the decision until it agreed with a prior.
    *
    * Returns a human-readable rejection reason when the candidate should be
    * skipped, or `null` when admitted OR when the gate is inactive (no behaviour
@@ -6473,7 +6496,7 @@ export class SignalEngine {
    */
   private costAwareGateReject(
     structure: string,
-    inputs: ModeledGrossRInputs,
+    inputs: CostGateCandidateInputs,
     // TRA-3272 — the candidate's OWN quote at decision time, consumed only by the
     // net-edge bar form. Optional so the three pre-existing call sites compile
     // unchanged if a future site has no quote (the net-edge form then fails
@@ -6483,10 +6506,19 @@ export class SignalEngine {
     if (this.mode === 'demo') {
       const env = this.resolveDemoFlagEnv();
       if (!isOptionCostAwareGateEnabled(env)) return null;
-      const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(env));
+      // TRA-3391 — the measured edge for this candidate's cell. SYNC peek: a null
+      // table (never folded) declines under `insufficient_evidence` rather than
+      // blocking the trade pass on a journal read.
+      const tape = tapeExpectancyVerdict(
+        { structure, delta: inputs.delta },
+        peekTapeExpectancyTable(),
+        resolveCostGateConfig(env),
+      );
       // TRA-3272 — NET-EDGE form (demo shadow-arm path via demo-flags env). When
       // armed for this structure it REPLACES the flat verdict; the recorded barR
       // is the candidate's equivalent bar (costR / k) so the ledger keeps a scale.
+      // TRA-3391 — it consumes the SAME measured lower bound the flat form decides
+      // on, so arming it can no longer relabel a delta-proxy block (Ruling 2.8).
       const netEdgeConfig = resolveNetEdgeBarConfig(env);
       if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
         const verdict = netEdgeBarVerdict(
@@ -6498,32 +6530,31 @@ export class SignalEngine {
               typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
                 ? inputs.mark - inputs.stopPrice
                 : undefined,
-            modeledGrossR: estimate.modeledGrossR,
+            modeledGrossR: tapeEdgeR(tape),
           },
           netEdgeConfig,
         );
         recordCostAwareGateDecision(
           structure,
           verdict.admit,
-          estimate.modeledGrossR,
+          tapeEdgeR(tape),
           verdict.requiredEdgeR,
           etDateString(new Date()),
         );
         return verdict.admit ? null : verdict.reason;
       }
-      const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(env));
       // TRA-1602 arm (board interaction `427b57ee`) — a working admission gate's
       // evidence is the trades that DIDN'T happen, so record every armed verdict for
       // `/api/health/cost-aware-gate`. Observe-only, best-effort on IO — never breaks
       // the trade pass.
       recordCostAwareGateDecision(
         structure,
-        verdict.admit,
-        verdict.modeledGrossR,
-        verdict.barR,
+        tape.admit,
+        tapeEdgeR(tape),
+        tape.barR,
         etDateString(new Date()),
       );
-      return verdict.admit ? null : verdict.reason;
+      return tape.admit ? null : tape.reason;
     }
     // TRA-2048 — LIVE enforcing branch. Read the arm from the PROCESS env only (a
     // secret-adjacent live-order toggle, never the demo-flags file). OFF by default
@@ -6534,7 +6565,17 @@ export class SignalEngine {
     // armed-and-biting. Best-effort telemetry — never breaks the live trade pass.
     if (this.mode === 'live') {
       if (!isOptionCostGateLiveEnforceEnabled(process.env)) return null;
-      const estimate = estimateModeledGrossR(inputs, resolveModeledGrossRConfig(process.env));
+      // TRA-3391 — measured, exit-policy-conditional edge for this candidate's
+      // cell (see the demo branch). On the restricted live universe every
+      // candidate in the admitted band is expected to land in
+      // `insufficient_evidence`: the tape holds 471 live-universe rows and ALL of
+      // them are |Δ| < 0.20, so the band the gate admits has literally never been
+      // measured on the names real money may trade.
+      const tape = tapeExpectancyVerdict(
+        { structure, delta: inputs.delta },
+        peekTapeExpectancyTable(),
+        resolveCostGateConfig(process.env),
+      );
       // TRA-3272 — NET-EDGE form on the LIVE branch. Process-env only (same
       // secret-adjacent contract as the enforce flag itself, which is already
       // armed by the time we are here). When armed for this structure it
@@ -6553,7 +6594,7 @@ export class SignalEngine {
               typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
                 ? inputs.mark - inputs.stopPrice
                 : undefined,
-            modeledGrossR: estimate.modeledGrossR,
+            modeledGrossR: tapeEdgeR(tape),
           },
           netEdgeConfig,
         );
@@ -6564,24 +6605,37 @@ export class SignalEngine {
           etDateString(new Date()),
           verdict.admit ? undefined : verdict.reason,
           Date.now(),
-          { reasonCode: verdict.reasonCode ?? undefined, book: this.alertUsername ?? null },
+          {
+            reasonCode: verdict.reasonCode ?? undefined,
+            book: this.alertUsername ?? null,
+            // TRA-3391 — the cell the edge came from, even when the net-edge form
+            // is what declined: otherwise arming it erases the evidence axis.
+            cell: tape.cellKey ?? undefined,
+          },
         );
         return verdict.admit ? null : verdict.reason;
       }
-      const verdict = admitByCostAwareGate(estimate.modeledGrossR, structure, resolveCostGateConfig(process.env));
       // TRA-3216 — `reason` is per-candidate prose (it embeds this candidate's own
-      // gross R), so a fold on it has one bucket per decision. `reasonCode` is the
-      // bounded shortfall classification that makes a 99%+ block rate tuneable.
+      // numbers), so a fold on it has one bucket per decision. `reasonCode` is the
+      // bounded classification that makes a 99%+ block rate diagnosable, and since
+      // TRA-3391 it separates `insufficient_evidence` (never measured) from
+      // `gross_negative` (measured loser) — the distinction the board could not
+      // previously make. `cell` stamps WHICH cell decided, so the admission is
+      // readable off deployed state instead of re-derived.
       recordLiveEnforceDecision(
         'cost_bar',
         structure,
-        !verdict.admit,
+        !tape.admit,
         etDateString(new Date()),
-        verdict.admit ? undefined : verdict.reason,
+        tape.admit ? undefined : tape.reason,
         Date.now(),
-        { reasonCode: costGateBlockReasonCode(verdict) ?? undefined, book: this.alertUsername ?? null },
+        {
+          reasonCode: tape.reasonCode ?? undefined,
+          book: this.alertUsername ?? null,
+          cell: tape.cellKey ?? undefined,
+        },
       );
-      return verdict.admit ? null : verdict.reason;
+      return tape.admit ? null : tape.reason;
     }
     return null;
   }
@@ -8447,9 +8501,11 @@ export class SignalEngine {
         const rvCostReject = this.costAwareGateReject('single_leg_rv', {
           mark: cheap.mark,
           delta: cheap.delta,
-          targetPrice: takeProfit,
           stopPrice: stopLoss,
-          riskRewardRatio: signal.riskRewardRatio,
+          // TRA-3391 — `targetPrice` / `riskRewardRatio` are no longer passed:
+          // they only ever fed the retired 2:1 reward multiple, and that bracket
+          // resolves 30.8% of closes. `stopPrice` survives because the net-edge
+          // form measures cost in the trade's own R.
           // TRA-3272 — the candidate's own quote, for the net-edge bar form
           // (inert on this structure until OPTION_NET_EDGE_STRUCTURES adds it).
         }, { bid: cheap.bid, ask: cheap.ask });
@@ -9253,9 +9309,8 @@ export class SignalEngine {
         const otmCostReject = this.costAwareGateReject('single_leg_otm', {
           mark: cheap.mark,
           delta: cheap.delta,
-          targetPrice: takeProfit,
           stopPrice: stopLoss,
-          riskRewardRatio: signal.riskRewardRatio,
+          // TRA-3391 — see the RV site: the reward leg is gone with the estimator.
           // TRA-3272 — the candidate's own quote, for the net-edge bar form.
         }, { bid: cheap.bid, ask: cheap.ask });
         if (otmCostReject) {
@@ -10449,7 +10504,10 @@ export class SignalEngine {
         const dirCostReject = this.costAwareGateReject('directional', {
           mark: best.mark,
           delta: signal.delta,
-          riskRewardRatio: signal.riskRewardRatio,
+          // TRA-3391 — no stop on this path (exits are trailed/managed at close),
+          // so the net-edge form falls back to its 0.25·mark R. The EDGE comes
+          // from the `single_leg_directional` tape cells, which is where this
+          // sleeve's own closes are journaled.
           // TRA-3272 — the candidate's own quote, for the net-edge bar form
           // (inert on this structure until OPTION_NET_EDGE_STRUCTURES adds it).
         }, { bid: best.row.bid, ask: best.row.ask });

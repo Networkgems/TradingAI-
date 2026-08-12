@@ -97,6 +97,21 @@ export interface LiveEnforceRecord {
    * which folds to an explicit `unattributed` key rather than disappearing.
    */
   book?: string;
+  /**
+   * TRA-3391 — for `cost_bar`, WHICH tape cell (`structure::|delta| bucket`) the
+   * verdict was decided under. The edge is no longer a per-candidate formula but
+   * a lookup into a measured table, so "why did this block" is only answerable
+   * with the cell identity: `insufficient_evidence` on `single_leg_otm::0.45-0.50`
+   * and on `::0.00-0.10` are different facts about the book.
+   *
+   * Stamped on ADMITS too (unlike `reasonCode`) — the admitted cells are exactly
+   * the ones a grader needs to check against the published table.
+   *
+   * Absent ⇒ the verdict predates this field or the gate does not use cells; that
+   * folds to no `byCell` row at all rather than to a synthetic bucket, because
+   * "never stamped" is not a cell.
+   */
+  cell?: string;
 }
 
 interface GateScopeTally {
@@ -104,7 +119,7 @@ interface GateScopeTally {
   blocked: number;
 }
 
-/** The per-gate accumulator: the same tally shape folded on three independent keys. */
+/** The per-gate accumulator: the same tally shape folded on four independent keys. */
 interface GateTallies {
   /** structure (cost_bar) or underlying symbol (spread / universe). */
   byScope: Map<string, GateScopeTally>;
@@ -112,12 +127,14 @@ interface GateTallies {
   byReason: Map<string, GateScopeTally>;
   /** live book (`alertUsername`), or `unattributed`. */
   byBook: Map<string, GateScopeTally>;
+  /** TRA-3391 tape cell (`structure::bucket`) — rows that carry one, admits included. */
+  byCell: Map<string, GateScopeTally>;
 }
 
 const UNATTRIBUTED_BOOK = 'unattributed';
 
 function emptyTallies(): GateTallies {
-  return { byScope: new Map(), byReason: new Map(), byBook: new Map() };
+  return { byScope: new Map(), byReason: new Map(), byBook: new Map(), byCell: new Map() };
 }
 
 function bump(map: Map<string, GateScopeTally>, key: string, blocked: boolean): void {
@@ -186,6 +203,12 @@ function apply(rec: LiveEnforceRecord): void {
   if (rec.blocked && typeof rec.reasonCode === 'string' && rec.reasonCode !== '') {
     bump(tallies.byReason, rec.reasonCode, true);
   }
+  // TRA-3391 — cell axis, admits INCLUDED (`bump` counts evaluated and, when
+  // blocked, blocked). Only rows that actually carry a cell contribute: a missing
+  // cell is "never stamped", not a bucket.
+  if (typeof rec.cell === 'string' && rec.cell !== '') {
+    bump(tallies.byCell, rec.cell, rec.blocked);
+  }
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
 }
@@ -206,7 +229,7 @@ export function recordLiveEnforceDecision(
   now: number = Date.now(),
   // TRA-3216 — trailing options bag so the three pre-existing call sites keep
   // their positional signature unchanged.
-  opts?: { reasonCode?: string; book?: string | null },
+  opts?: { reasonCode?: string; book?: string | null; cell?: string | null },
 ): void {
   const rec: LiveEnforceRecord = {
     ts: now,
@@ -217,6 +240,7 @@ export function recordLiveEnforceDecision(
     ...(blocked && reason ? { reason } : {}),
     ...(blocked && opts?.reasonCode ? { reasonCode: opts.reasonCode } : {}),
     ...(typeof opts?.book === 'string' && opts.book !== '' ? { book: opts.book } : {}),
+    ...(typeof opts?.cell === 'string' && opts.cell !== '' ? { cell: opts.cell } : {}),
   };
   applyAndAppend(rec);
 }
@@ -298,6 +322,7 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
         ? { reasonCode: rec.reasonCode }
         : {}),
       ...(typeof rec.book === 'string' && rec.book !== '' ? { book: rec.book } : {}),
+      ...(typeof rec.cell === 'string' && rec.cell !== '' ? { cell: rec.cell } : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -358,6 +383,23 @@ export interface LiveEnforceBookSummary {
   blockRate: number | null;
 }
 
+/**
+ * TRA-3391 — the EVIDENCE axis. One row per tape cell (`structure::|delta|
+ * bucket`) the gate decided under, busiest first. Unlike `byReason` this counts
+ * ADMITS too: an admitted cell is exactly what a grader checks against the
+ * published expectancy table, and a cell that only ever appears with
+ * `evaluated === blocked` is one the live universe has never had evidence for.
+ *
+ * Empty on a gate that stamps no cell (`spread`, `universe`, `otm_delta_floor`)
+ * and on rows written before the field existed — never a synthetic bucket.
+ */
+export interface LiveEnforceCellSummary {
+  cell: string;
+  evaluated: number;
+  blocked: number;
+  blockRate: number | null;
+}
+
 export interface LiveEnforceGateSummary {
   gate: LiveEnforceGate;
   evaluated: number;
@@ -369,6 +411,8 @@ export interface LiveEnforceGateSummary {
   byReason: LiveEnforceReasonSummary[];
   /** Per-live-book split, busiest first (TRA-3216). */
   byBook: LiveEnforceBookSummary[];
+  /** Per-tape-cell split, busiest first; admits included (TRA-3391). */
+  byCell: LiveEnforceCellSummary[];
 }
 
 export interface LiveEnforceDurability {
@@ -449,6 +493,17 @@ function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSumma
     }
     byReason.sort((a, b) => b.blocked - a.blocked);
 
+    const byCell: LiveEnforceCellSummary[] = [];
+    for (const [cell, t] of tallies.byCell.entries()) {
+      byCell.push({
+        cell,
+        evaluated: t.evaluated,
+        blocked: t.blocked,
+        blockRate: t.evaluated > 0 ? round(t.blocked / t.evaluated) : null,
+      });
+    }
+    byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
+
     out.push({
       gate,
       evaluated,
@@ -457,6 +512,7 @@ function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSumma
       byScope,
       byReason,
       byBook,
+      byCell,
     });
   }
   return out;
@@ -485,6 +541,7 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
       mergeAxis(into.byScope, tallies.byScope);
       mergeAxis(into.byReason, tallies.byReason);
       mergeAxis(into.byBook, tallies.byBook);
+      mergeAxis(into.byCell, tallies.byCell);
     }
   }
   return acc;
