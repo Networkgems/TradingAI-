@@ -1621,17 +1621,54 @@ export interface OptionJournalReport {
    * passed one, so a grading poll can confirm the `summary` was scoped to the
    * post-arm cohort rather than the cumulative pool. Absent on the unfiltered
    * (cumulative) readout.
+   *
+   * TRA-3380 — an unparseable value is now a **400**, never a 200. Before this
+   * fix `Number('2026-07-24T12:39:00Z')` was `NaN` → the filter was dropped and
+   * the route served the FULL pool behind a 200 whose population was identical
+   * to the unfiltered one, so *"was my filter applied?"* had no answer on the
+   * wire. See {@link parseCohortTsParam}.
    */
   sinceTs?: number;
   /**
    * TRA-2082 — the cohort filter ACTUALLY applied, always present so a consumer
    * asserts what it got instead of assuming its query param took effect.
    * `null` = no filter (cumulative pool); never `0`, which is a real epoch.
-   * `filterAxis` names the timestamp the filter compares against — it is `openTs`
-   * (ENTRY), not `closeTs`, and the two give different counts on the same book.
+   * `filterAxis` names the timestamp the filter compares against — it defaults
+   * to `openTs` (ENTRY), and the two axes give different counts on the same book.
    */
   appliedSinceTs: number | null;
-  filterAxis: 'openTs';
+  /**
+   * TRA-3380 — which timestamp actually served this response.
+   *
+   * `openTs` is the default and is what an unfiltered readout reports, so the
+   * cumulative payload is BYTE-UNCHANGED for every existing consumer. It reads
+   * `closeTs` only when the caller passed the EXIT-axis param, and in that case
+   * `closedSinceTs`/`appliedClosedSinceTs` are present beside it.
+   *
+   * WHY THE SECOND AXIS EXISTS. An entry-axis filter cannot scope an
+   * exit-scoped criterion: TRA-2213 leg 2 grades closes that ran under the
+   * TRA-2200 checkExits hoist, and all four of its `single_leg_otm × sl` closes
+   * were OPENED pre-arm and CLOSED post-arm. At `sinceTs=<arm>` the cell is
+   * absent entirely (desk cells 14 → 10) — the criterion's own population is
+   * empty by construction — while grading the unfiltered cell instead mixes
+   * pre-hoist exits into a post-hoist criterion. Both readings are wrong in
+   * opposite directions; neither is detectable from the payload.
+   */
+  filterAxis: 'openTs' | 'closeTs';
+  /**
+   * TRA-3380 — echo of the EXIT-axis cohort filter (epoch ms). Present only
+   * when the caller passed it, so the cumulative and `sinceTs` payloads keep
+   * their exact existing shape.
+   */
+  closedSinceTs?: number;
+  /**
+   * TRA-3380 — the exit-axis filter actually applied, present only under that
+   * axis (same reason as `closedSinceTs`). Rows still OPEN carry no `closeTs`
+   * and are therefore EXCLUDED by this axis; `closeAxisExcludesOpenRows` states
+   * that on the wire rather than leaving a consumer to infer it from a count.
+   */
+  appliedClosedSinceTs?: number;
+  closeAxisExcludesOpenRows?: true;
   /**
    * TRA-2082 — the `?rows=demo` dump. Present only when rows were requested, and
    * ALWAYS paired with `rowsFiltered` so the two can never be read apart: before
@@ -2252,6 +2289,116 @@ function partitionByMode(rows: OptionTradeJournalRecord[]): {
   };
 }
 
+/**
+ * TRA-3380 — the epoch-ms window a cohort filter must land in to be believed.
+ *
+ * FLOOR is what kills the nastier of the two fail-opens. `?sinceTs=1784896740`
+ * (epoch SECONDS) is a finite number, so the old `Number.isFinite` check passed
+ * it straight through; the filter then resolved to **1970-01-21** and selected
+ * every row, while `appliedSinceTs` echoed back a healthy-looking non-null
+ * value. The obvious *"did my filter apply?"* assertion therefore PASSED on a
+ * completely unfiltered payload — a false green that no amount of care at the
+ * call site can detect. Any epoch-ms instant this journal could hold is ≥ 1e12
+ * (2001-09-09), and every epoch-SECONDS value for a date this side of 5138 AD
+ * is below it, so the two magnitudes cannot overlap.
+ */
+export const OPTION_JOURNAL_COHORT_TS_MIN_MS = 1_000_000_000_000; // 2001-09-09T01:46:40Z
+/** 2100-01-01 — above this the value is not a millisecond instant anyone means. */
+export const OPTION_JOURNAL_COHORT_TS_MAX_MS = 4_102_444_800_000;
+
+export type CohortTsParse =
+  | { ok: true; value: number | undefined }
+  | { ok: false; error: string; detail: string };
+
+/**
+ * TRA-3380 — parse a cohort-filter query param, FAILING CLOSED.
+ *
+ * The rule this encodes: **a filter that cannot be applied must not return a
+ * body indistinguishable from one that selects everything.** Before this, three
+ * separate classes of bad input (ISO-8601, garbage, epoch-seconds) all produced
+ * HTTP 200 with a payload byte-identical in population to the unfiltered one.
+ * Two of them echoed `appliedSinceTs: null`, which at least a careful consumer
+ * could catch; the third echoed a non-null value and was undetectable.
+ *
+ * ISO-8601 is rejected rather than parsed on purpose. Accepting it would widen
+ * the contract mid-flight, and `Date.parse` is lenient in ways that reintroduce
+ * the same silent-wrong-cohort risk (`'2026-07-24'` is UTC midnight but
+ * `'2026-07-24T12:39:00'` is LOCAL time — a same-shaped string that silently
+ * shifts the cohort by the host's offset). The param stays epoch-ms only; it
+ * now just says so instead of pretending it filtered.
+ *
+ * The error names the legal window and what it thinks you sent, because a 400
+ * that self-documents costs the caller one read instead of a probe ladder.
+ */
+export function parseCohortTsParam(raw: unknown, param: string): CohortTsParse {
+  if (raw === undefined) return { ok: true, value: undefined };
+  // `?sinceTs=1&sinceTs=2` arrives as an ARRAY. The old `typeof === 'string'`
+  // test sent it to NaN → dropped filter → full payload, i.e. the same fail-open
+  // wearing a different input shape.
+  if (Array.isArray(raw)) {
+    return {
+      ok: false,
+      error: `${param}_repeated`,
+      detail: `\`${param}\` was supplied ${raw.length} times. Send it exactly once.`,
+    };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, error: `${param}_invalid`, detail: `\`${param}\` must be a scalar query value.` };
+  }
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    return {
+      ok: false,
+      error: `${param}_empty`,
+      detail: `\`${param}=\` was sent with an empty value. Omit the param entirely for the cumulative (unfiltered) pool.`,
+    };
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    const looksIso = /^\d{4}-\d{2}-\d{2}/.test(trimmed);
+    return {
+      ok: false,
+      error: `${param}_not_epoch_ms`,
+      detail:
+        (looksIso
+          ? `\`${param}\` is epoch MILLISECONDS, not ISO-8601. Convert first: Date.parse('${trimmed}') = ${
+              Number.isFinite(Date.parse(trimmed)) ? Date.parse(trimmed) : 'unparseable'
+            }.`
+          : `\`${param}\` must be an integer number of epoch milliseconds.`)
+        + ` Received ${JSON.stringify(trimmed)}.`,
+    };
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value)) {
+    return {
+      ok: false,
+      error: `${param}_not_epoch_ms`,
+      detail: `\`${param}\` exceeds the safe integer range. Received ${JSON.stringify(trimmed)}.`,
+    };
+  }
+  if (value < OPTION_JOURNAL_COHORT_TS_MIN_MS) {
+    // The epoch-SECONDS case gets its own sentence with the corrected value,
+    // because it is the one that used to succeed and silently select everything.
+    const asSeconds = value * 1000;
+    const secondsHint =
+      asSeconds >= OPTION_JOURNAL_COHORT_TS_MIN_MS && asSeconds <= OPTION_JOURNAL_COHORT_TS_MAX_MS
+        ? ` This looks like epoch SECONDS — in milliseconds it is ${asSeconds} (${new Date(asSeconds).toISOString()}). As sent it resolves to ${new Date(value).toISOString()}, which selects the ENTIRE pool.`
+        : '';
+    return {
+      ok: false,
+      error: `${param}_below_min`,
+      detail: `\`${param}\` must be epoch milliseconds >= ${OPTION_JOURNAL_COHORT_TS_MIN_MS}.${secondsHint}`,
+    };
+  }
+  if (value > OPTION_JOURNAL_COHORT_TS_MAX_MS) {
+    return {
+      ok: false,
+      error: `${param}_above_max`,
+      detail: `\`${param}\` must be epoch milliseconds <= ${OPTION_JOURNAL_COHORT_TS_MAX_MS} (2100-01-01).`,
+    };
+  }
+  return { ok: true, value };
+}
+
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
@@ -2262,9 +2409,26 @@ export function buildOptionJournalReport(
   // still accepted and still means `demo`, so every existing caller and test is
   // unchanged; the new modes are additive.
   rowsRequest: boolean | 'demo' | 'open' | 'all' | 'unknown' = false,
+  // TRA-3380 — the EXIT-axis cohort filter, added as a SEVENTH positional param
+  // so every existing call site keeps its exact meaning. When it is `undefined`
+  // (the only thing any pre-existing caller can pass) the fold, the axis label
+  // and the payload keys below are all byte-identical to before.
+  closedSinceTs?: number,
 ): OptionJournalReport {
-  const summaryRows =
-    sinceTs === undefined ? rows : rows.filter((r) => r.openTs >= sinceTs);
+  // TRA-3380 — ONE axis serves a response; the route rejects both params at
+  // once, so `filterAxis` is never ambiguous about what it is reporting.
+  const closeAxis = closedSinceTs !== undefined;
+  const summaryRows = closeAxis
+    ? // An OPEN row has no `closeTs`, so it cannot satisfy "closed since T" and
+      // is excluded. That is the point of the axis: an exit-scoped criterion's
+      // population is the rows that actually CLOSED in the window.
+      rows.filter((r) => {
+        const closeTs = (r as OptionTradeJournalRecord).closeTs;
+        return typeof closeTs === 'number' && closeTs >= closedSinceTs;
+      })
+    : sinceTs === undefined
+      ? rows
+      : rows.filter((r) => r.openTs >= sinceTs);
   const rowsMode: 'demo' | 'open' | 'all' | null | undefined =
     rowsRequest === false ? undefined
       : rowsRequest === true || rowsRequest === 'demo' ? 'demo'
@@ -2316,12 +2480,22 @@ export function buildOptionJournalReport(
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),
     appliedSinceTs: sinceTs ?? null,
-    filterAxis: 'openTs',
+    // TRA-3380 — `openTs` remains the value on the cumulative and `sinceTs`
+    // readouts, so those payloads are byte-unchanged. The new keys below appear
+    // ONLY under the exit axis.
+    filterAxis: closeAxis ? 'closeTs' : 'openTs',
+    ...(closeAxis
+      ? {
+          closedSinceTs,
+          appliedClosedSinceTs: closedSinceTs,
+          closeAxisExcludesOpenRows: true as const,
+        }
+      : {}),
     ...(dumpRows === undefined
       ? {}
       : {
           rows: dumpRows,
-          rowsFiltered: sinceTs !== undefined,
+          rowsFiltered: sinceTs !== undefined || closeAxis,
           rowsMode,
           // Journal rows are entry economics; they hold no live mark. Say so
           // rather than letting a consumer read a missing field as $0 unrealized.
@@ -4824,18 +4998,73 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // summary + the bounded learned weights so the board can confirm accrual is
   // working after the first closed demo trade without a per-user login.
   app.get('/api/health/option-journal', async (req, res) => {
+    // TRA-1591 — optional `?sinceTs=<epoch ms>` scopes the summary fold to the
+    // post-arm cohort (entry `openTs >= sinceTs`) so QT can grade the OTM entry
+    // delta floor (TRA-1407) in isolation from the historical low-delta bleed.
+    //
+    // TRA-3380 — a malformed value is now a 400. It used to be IGNORED, which
+    // served the cumulative pool behind a 200 whose population was identical to
+    // the unfiltered one. `?closedSinceTs=` (alias `?closeTs=`) is the EXIT-axis
+    // sibling: same epoch-ms contract, filtering on `closeTs` instead, so an
+    // exit-scoped criterion can select its own population.
+    const sinceParse = parseCohortTsParam(req.query['sinceTs'], 'sinceTs');
+    if (!sinceParse.ok) {
+      res.status(400).json({
+        ok: false,
+        error: sinceParse.error,
+        detail: sinceParse.detail,
+        filterApplied: false,
+        note:
+          'The cohort filter could not be applied, so no body is served. A filter that '
+          + 'cannot be applied must not return a payload indistinguishable from one that '
+          + 'selects everything (TRA-3380).',
+      });
+      return;
+    }
+    const sinceTs = sinceParse.value;
+
+    // The exit axis accepts two spellings so the obvious guess is not silently
+    // ignored — being quietly dropped is the very defect this ticket fixes.
+    const closeRaw = req.query['closedSinceTs'] ?? req.query['closeTs'];
+    const closeParamName = req.query['closedSinceTs'] !== undefined ? 'closedSinceTs' : 'closeTs';
+    const closeParse = parseCohortTsParam(closeRaw, closeParamName);
+    if (!closeParse.ok) {
+      res.status(400).json({
+        ok: false,
+        error: closeParse.error,
+        detail: closeParse.detail,
+        filterApplied: false,
+        note:
+          'The cohort filter could not be applied, so no body is served. A filter that '
+          + 'cannot be applied must not return a payload indistinguishable from one that '
+          + 'selects everything (TRA-3380).',
+      });
+      return;
+    }
+    const closedSinceTs = closeParse.value;
+
+    // One axis per response. Serving both would make `filterAxis` — the field a
+    // consumer reads to learn WHICH population it got — unable to answer.
+    if (sinceTs !== undefined && closedSinceTs !== undefined) {
+      res.status(400).json({
+        ok: false,
+        error: 'cohort_axis_conflict',
+        detail:
+          'Pass either `sinceTs` (ENTRY axis, openTs) or `closedSinceTs`/`closeTs` (EXIT axis, '
+          + 'closeTs) — not both. `filterAxis` names the single axis that served the response.',
+        filterApplied: false,
+      });
+      return;
+    }
+
+    // Both cohort params are valid past this point, so the journal load and the
+    // weights fold run only for a request that will actually be served.
     const rows = await listOptionTradeJournal();
     // TRA-1046 — serve weights through the intraday refresh cache so the readout
     // shows the same fold live selection reads, plus a freshness generation a
     // probe can watch tick after a demo close.
     const cached = await optionWeightsCache().get();
-    // TRA-1591 — optional `?sinceTs=<epoch ms>` scopes the summary fold to the
-    // post-arm cohort (entry `openTs >= sinceTs`) so QT can grade the OTM entry
-    // delta floor (TRA-1407) in isolation from the historical low-delta bleed.
-    // A malformed / non-finite value is ignored → cumulative (unfiltered) output.
-    const sinceTsRaw = req.query['sinceTs'];
-    const sinceTsParsed = typeof sinceTsRaw === 'string' ? Number(sinceTsRaw) : NaN;
-    const sinceTs = Number.isFinite(sinceTsParsed) ? sinceTsParsed : undefined;
+
     // TRA-1133 — opt-in row-level dump for the OOS validation harness (TRA-992 Step
     // 1). `?rows=demo` appends the RESOLVED demo rows (setup key + realizedR +
     // outcome) so an offline run can fold the journal leave-one-out. Same demo-only,
@@ -4860,6 +5089,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
               ? (req.query['rows'] as 'demo' | 'open' | 'all')
               : 'unknown')
           : false,
+        closedSinceTs,
       ),
     );
   });

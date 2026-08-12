@@ -23,6 +23,9 @@ import {
   summarizeSma200ForwardTestFills,
   summarizeOptionsPipeline,
   buildOptionJournalReport,
+  // TRA-3380 — the cohort-param parser + the epoch-ms floor that separates a
+  // millisecond instant from an epoch-SECONDS value that used to select the pool.
+  parseCohortTsParam,
   rollUpExitCadence,
   RTH_DECOUPLED_SHARE_FLOOR,
   durabilityNote, // TRA-3011
@@ -2305,6 +2308,285 @@ describe('buildOptionJournalReport', () => {
       expect(cohort.sinceTs).toBe(armTs);
       // Learned weights stay over the FULL row set — cohort filter must not perturb them.
       expect(cohort.weights.generatedFrom.rows).toBe(2);
+    });
+  });
+
+  // ── TRA-3380 (TRA-2665) ───────────────────────────────────────────────────
+  //
+  // TWO fail-opens on the same param, both measured live on `eb1dcf0c` 2026-08-12.
+  //
+  //   sent                          appliedSinceTs   summary.total   deskRowCount
+  //   (none)                        null             2689            158
+  //   2026-07-24T12:39:00Z (ISO)    null             2689            158   <-- dropped
+  //   not-a-timestamp (garbage)     null             2689            158   <-- dropped
+  //   1784896740000 (epoch ms)      1784896740000     330             61   <-- works
+  //   1784896740   (epoch SECONDS)  1784896740       2689            158   <-- WORST
+  //
+  // Every unparseable value returned 200 with a payload byte-identical in
+  // POPULATION to the unfiltered one. The epoch-seconds row is the dangerous
+  // one: the echo comes back NON-NULL, so the obvious "was my filter applied?"
+  // assertion PASSES while the filter resolves to 1970 and selects everything.
+  describe('cohort param parsing fails CLOSED (TRA-3380)', () => {
+    // The probe table above, as a test table. Each row is a value that used to
+    // return 200 + the full pool.
+    const rejected: Array<[label: string, sent: unknown, expectedError: string]> = [
+      ['ISO-8601 with Z', '2026-07-24T12:39:00Z', 'sinceTs_not_epoch_ms'],
+      ['ISO-8601 with ms', '2026-07-24T12:39:00.000Z', 'sinceTs_not_epoch_ms'],
+      ['ISO-8601 local (no Z)', '2026-07-24T12:39:00', 'sinceTs_not_epoch_ms'],
+      ['date only', '2026-07-24', 'sinceTs_not_epoch_ms'],
+      ['garbage', 'not-a-timestamp', 'sinceTs_not_epoch_ms'],
+      ['epoch SECONDS', '1784896740', 'sinceTs_below_min'],
+      ['zero (a real epoch, but not a cohort)', '0', 'sinceTs_below_min'],
+      ['negative', '-1784896740000', 'sinceTs_not_epoch_ms'],
+      ['float', '1784896740000.5', 'sinceTs_not_epoch_ms'],
+      ['empty value', '', 'sinceTs_empty'],
+      ['whitespace only', '   ', 'sinceTs_empty'],
+      ['far future (not ms)', '99999999999999999', 'sinceTs_not_epoch_ms'],
+      ['repeated param', ['1784896740000', '1784896750000'], 'sinceTs_repeated'],
+    ];
+
+    it.each(rejected)('rejects %s', (_label, sent, expectedError) => {
+      const parsed = parseCohortTsParam(sent, 'sinceTs');
+      expect(parsed.ok).toBe(false);
+      expect((parsed as { error: string }).error).toBe(expectedError);
+    });
+
+    // BOTH directions. A parser that rejects everything would pass every test
+    // above and be just as useless as one that accepts everything — the epoch-ms
+    // value from the live probe table must still be ACCEPTED, unchanged.
+    it('accepts the epoch-ms value that the live probe proved discriminating', () => {
+      expect(parseCohortTsParam('1784896740000', 'sinceTs')).toEqual({
+        ok: true,
+        value: 1784896740000,
+      });
+      // and surrounding whitespace is not a reason to fail closed
+      expect(parseCohortTsParam(' 1784896740000 ', 'sinceTs')).toEqual({
+        ok: true,
+        value: 1784896740000,
+      });
+      // absent stays absent — this is the cumulative-pool path, unchanged
+      expect(parseCohortTsParam(undefined, 'sinceTs')).toEqual({ ok: true, value: undefined });
+    });
+
+    // The epoch-seconds rejection must NAME the corrected value. That row is the
+    // one a caller cannot self-diagnose: it looked like it worked.
+    it('the epoch-seconds error states the corrected ms value and what it used to select', () => {
+      const parsed = parseCohortTsParam('1784896740', 'sinceTs') as { detail: string };
+      expect(parsed.detail).toContain('1784896740000');
+      expect(parsed.detail).toContain('epoch SECONDS');
+      expect(parsed.detail).toContain('ENTIRE pool');
+    });
+
+    it('the ISO error hands back the epoch-ms conversion instead of just refusing', () => {
+      const parsed = parseCohortTsParam('2026-07-24T12:39:00Z', 'sinceTs') as { detail: string };
+      expect(parsed.detail).toContain(String(Date.parse('2026-07-24T12:39:00Z')));
+    });
+
+    // The route leg: a rejected filter must serve NO body. The whole defect is
+    // that a 200 carrying the full pool is indistinguishable from a filter that
+    // selected everything, so returning the payload alongside an error field
+    // would not fix it.
+    it('the route answers 400 with no journal payload, for both axes', async () => {
+      for (const [param, value] of [
+        ['sinceTs', '2026-07-24T12:39:00Z'],
+        ['sinceTs', '1784896740'],
+        ['closedSinceTs', 'not-a-timestamp'],
+        ['closeTs', '2026-07-24'],
+      ] as const) {
+        const { app, routes } = fakeApp();
+        registerLiveHealthRoutes(app, {
+          requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+          userCtx: async () => ctx('admin', engineState()),
+          getSettings: () => settings(),
+          now: () => NOW,
+        });
+        const res = fakeRes();
+        await routes.get('/api/health/option-journal')![0]!({ query: { [param]: value } }, res);
+
+        expect(res.statusCode).toBe(400);
+        const body = res.body as Record<string, unknown>;
+        expect(body['ok']).toBe(false);
+        expect(body['filterApplied']).toBe(false);
+        // None of the population fields a grader reads may be present.
+        for (const leaked of ['summary', 'deskRowCount', 'appliedSinceTs', 'rows']) {
+          expect(body).not.toHaveProperty(leaked);
+        }
+      }
+    });
+
+    it('rejects both axes at once so filterAxis is never ambiguous', async () => {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      const res = fakeRes();
+      await routes.get('/api/health/option-journal')![0]!(
+        { query: { sinceTs: '1784896740000', closedSinceTs: '1784896740000' } },
+        res,
+      );
+      expect(res.statusCode).toBe(400);
+      expect((res.body as { error: string }).error).toBe('cohort_axis_conflict');
+    });
+
+    // The other direction at the ROUTE level: a valid param must still be served
+    // 200. Without this, "the route 400s" would pass on a route that 400s always.
+    it('still serves 200 for a valid epoch-ms sinceTs and for no param at all', async () => {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      for (const query of [{}, { sinceTs: '1784896740000' }]) {
+        const res = fakeRes();
+        await routes.get('/api/health/option-journal')![0]!({ query }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body).toHaveProperty('summary');
+      }
+    });
+  });
+
+  // TRA-3380 defect 2 — an ENTRY-axis filter cannot scope an EXIT-scoped
+  // criterion, and on the live book it empties the criterion's own cell.
+  //
+  // TRA-2213 leg 2 grades `single_leg_otm × sl` closes that ran under the
+  // TRA-2200 checkExits hoist (armed 2026-07-24T12:39Z). All four of those
+  // closes were OPENED pre-arm and CLOSED post-arm, so:
+  //   - at `sinceTs=<arm>` (entry axis) the cell is ABSENT — n=0, ungradable
+  //   - unfiltered, the cell mixes PRE-hoist exits into a POST-hoist criterion,
+  //     manufacturing a FAIL and attributing it to the hoist
+  // Both readings are wrong, in opposite directions. The fixture below is
+  // asserted to straddle the boundary so it cannot pass in the broken state.
+  describe('closeTs cohort axis (TRA-3380)', () => {
+    const armTs = NOW - 3_600_000;
+    const otm = (
+      id: string,
+      openTs: number,
+      closeTs: number | undefined,
+      r: number,
+    ): OptionTradeJournalRecord => {
+      const row: OptionTradeJournalRecord = {
+        ...closedRow,
+        id,
+        // `closedRow` carries no `account`, which classes as `unattributed`, not
+        // `desk` — and the criterion this axis exists for reads the DESK cell.
+        account: 'admin',
+        structure: 'single_leg_otm',
+        exitReason: 'sl',
+        openTs,
+        closeTs,
+        outcome: closeTs === undefined ? 'OPEN' : 'LOSS',
+        realizedR: r,
+        realizedPnlUsd: r * 100,
+      };
+      // An OPEN row has no close economics at all. Spreading `closedRow` leaves
+      // its `closeTs` behind, and a row that is `outcome: OPEN` *and* carries a
+      // `closeTs` would pass the exit-axis filter — the fixture would then prove
+      // the opposite of what it claims.
+      if (closeTs === undefined) delete row.closeTs;
+      return row;
+    };
+
+    // The TRA-2213 shape: opened pre-arm, closed post-arm.
+    const straddler = otm('opened-pre-closed-post', armTs - 86_400_000, armTs + 60_000, -0.44);
+    // A genuinely pre-hoist close — the row the unfiltered read wrongly includes.
+    const preHoist = otm('closed-pre', armTs - 172_800_000, armTs - 86_400_000, -1.2);
+    // A post-arm entry AND close — selectable on either axis.
+    const postBoth = otm('both-post', armTs + 30_000, armTs + 90_000, -0.6);
+    // Still open — carries no closeTs at all.
+    const open = otm('still-open', armTs + 40_000, undefined, 0);
+    const rows = [straddler, preHoist, postBoth, open];
+
+    it('the fixture straddles the boundary on BOTH axes (control)', () => {
+      // Without this the test below could pass in the broken state.
+      expect(rows.filter((r) => r.openTs >= armTs)).toHaveLength(2);
+      expect(rows.filter((r) => (r.closeTs ?? -1) >= armTs)).toHaveLength(2);
+      // and the two axes must select DIFFERENT sets, or the axis is untestable
+      expect(rows.filter((r) => r.openTs >= armTs).map((r) => r.id)).not.toEqual(
+        rows.filter((r) => (r.closeTs ?? -1) >= armTs).map((r) => r.id),
+      );
+    });
+
+    it('the entry axis DROPS the straddler — the defect, pinned', () => {
+      const entry = buildOptionJournalReport(rows, NOW, true, undefined, armTs);
+      expect(entry.filterAxis).toBe('openTs');
+      expect(entry.summary.closed).toBe(1); // only postBoth; the straddler is gone
+    });
+
+    it('the exit axis SELECTS the straddler and excludes the pre-hoist close', () => {
+      const exit = buildOptionJournalReport(rows, NOW, true, undefined, undefined, false, armTs);
+      expect(exit.filterAxis).toBe('closeTs');
+      expect(exit.closedSinceTs).toBe(armTs);
+      expect(exit.appliedClosedSinceTs).toBe(armTs);
+      expect(exit.closeAxisExcludesOpenRows).toBe(true);
+      // straddler + postBoth; NOT preHoist (closed before the arm), NOT open.
+      expect(exit.summary.closed).toBe(2);
+      const cell = exit.summary.byAccountClass.desk.byStructureExit.cells.find(
+        (c) => c.structure === 'single_leg_otm' && c.exitReason === 'sl',
+      );
+      expect(cell?.closed).toBe(2);
+    });
+
+    it('an OPEN row can never satisfy the exit axis', () => {
+      const exit = buildOptionJournalReport([open], NOW, true, undefined, undefined, false, armTs);
+      expect(exit.summary.total).toBe(0);
+    });
+
+    // Both directions, at the fold: the axis must be able to reduce to EMPTY and
+    // to select EVERYTHING. A filter that only ever reduces to the same set is
+    // indistinguishable from one that is not applied at all — which is the
+    // defect this ticket exists to fix.
+    it('the exit axis discriminates in both directions', () => {
+      const future = buildOptionJournalReport(rows, NOW, true, undefined, undefined, false, NOW + 1);
+      expect(future.summary.total).toBe(0);
+
+      // `1`, not the real epoch-ms floor: these fixtures use the file's synthetic
+      // NOW (2e9), which predates it. The floor is enforced by the PARSER, which
+      // is graded separately above; this leg grades the FOLD.
+      const ancient = buildOptionJournalReport(rows, NOW, true, undefined, undefined, false, 1);
+      // every CLOSED row, and only those (the open row has no closeTs)
+      expect(ancient.summary.total).toBe(3);
+    });
+  });
+
+  // TRA-3380 acceptance 2, the half the CFO called "the half that matters":
+  // `openTs` behaviour is BYTE-UNCHANGED for existing consumers. The new keys
+  // must be ABSENT — not null, not false — unless the exit axis was requested.
+  describe('openTs behaviour is byte-unchanged (TRA-3380)', () => {
+    const NEW_KEYS = ['closedSinceTs', 'appliedClosedSinceTs', 'closeAxisExcludesOpenRows'];
+
+    it('the cumulative payload gains no key and keeps filterAxis openTs', () => {
+      const report = buildOptionJournalReport([closedRow], NOW, true);
+      expect(report.filterAxis).toBe('openTs');
+      expect(report.appliedSinceTs).toBeNull();
+      for (const k of NEW_KEYS) expect(report).not.toHaveProperty(k);
+      // asserted on the SERIALISED body, because "absent" and "present and
+      // undefined" are the same under toHaveProperty but differ on the wire.
+      const wire = JSON.stringify(report);
+      for (const k of NEW_KEYS) expect(wire).not.toContain(k);
+    });
+
+    it('the sinceTs payload gains no key either', () => {
+      const report = buildOptionJournalReport([closedRow], NOW, true, undefined, NOW - 1000);
+      expect(report.filterAxis).toBe('openTs');
+      for (const k of NEW_KEYS) expect(report).not.toHaveProperty(k);
+      expect(JSON.stringify(report)).not.toContain('closeAxisExcludesOpenRows');
+    });
+
+    // The strongest available statement of "unchanged": passing the new 7th
+    // argument as `undefined` — which is all any pre-existing caller can do —
+    // must produce output IDENTICAL to omitting it.
+    it('passing the new param as undefined is identical to omitting it', () => {
+      const rows = [closedRow];
+      for (const since of [undefined, NOW - 1000]) {
+        const omitted = buildOptionJournalReport(rows, NOW, true, undefined, since, 'all');
+        const explicit = buildOptionJournalReport(rows, NOW, true, undefined, since, 'all', undefined);
+        expect(JSON.stringify(explicit)).toBe(JSON.stringify(omitted));
+      }
     });
   });
 
