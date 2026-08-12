@@ -610,6 +610,30 @@ export function planTradierReconcile(input: {
 }
 
 /**
+ * TRA-2819 Ask 3 — which broker envs the EOD history reconcile must cover,
+ * given the stock mode key at the moment the pass fires.
+ *
+ * The old rule was `settings.mode === 'live'`, read at the instant the EOD
+ * report ran. That gate conflates two different questions: "which book is the
+ * UI showing" and "did real-money fills happen at the broker". Fills are
+ * env-scoped, not mode-scoped — a `sell_to_close` that filled on production
+ * stays filled however the toggle reads afterwards. During the bistable-`mode`
+ * window (TRA-2649/TRA-2693) the toggle read `demo` at 00:00 ET, the
+ * production reconcile was skipped silently, and three settled round-trips
+ * (+$713.73) sat unread for 4 days while the calendar booked −$2.00.
+ *
+ * So: PRODUCTION is always attempted — the caller's client builder returning
+ * null (no credentials) is the only thing that skips it, and that skip is
+ * logged. SANDBOX follows the active mode as before; its history is play
+ * money and reconciling it while the desk is armed elsewhere buys nothing.
+ */
+export function tradierReconcileEnvs(
+  modeKey: 'demo' | 'live' | 'sandbox',
+): ReadonlyArray<'production' | 'sandbox'> {
+  return modeKey === 'sandbox' ? ['production', 'sandbox'] : ['production'];
+}
+
+/**
  * TRA-348 / TRA-2864 — realized options P&L per day for the go-forward live
  * reconcile pass, FIFO-matched against the opens in the same fetch window.
  *

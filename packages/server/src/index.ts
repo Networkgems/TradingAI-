@@ -283,6 +283,7 @@ import {
   planTradierReconcile,
   realizedPnlByCloseDate,
   sumCashFlowOverSpan,
+  tradierReconcileEnvs,
 } from './reports/tradier-reconcile.js';
 // TRA-3101 — a missing balance snapshot renders as a FLAT $0.00 day, not as
 // "unknown". This classifies the anchor; it never repairs the equity series.
@@ -1497,19 +1498,30 @@ async function generateAndSaveReport(
   const mode = stockModeKey(settings);
   const targetDir = stockReportsDirFor(ctx, mode);
 
-  // TRA-348 — when the user is in live mode, pull recent Tradier history
-  // and merge any closes the engine didn't process (manual closes on the
-  // broker UI, or `sell_to_close` orders that resolved after the 5s
-  // wait window) into the per-day reports for the active env. Failures
+  // TRA-348 — pull recent Tradier history and merge any closes the engine
+  // didn't process (manual closes on the broker UI, or `sell_to_close` orders
+  // that resolved after the 5s wait window) into the per-day reports. Failures
   // here must not block the local report from being written.
-  if (settings.mode === 'live' && !backfill) {
-    try {
-      await reconcileTradierOptionsHistory(ctx, settings, mode);
-    } catch (err) {
-      log.warn('tradier-reconcile failed', {
-        username: ctx.username,
-        reason: err instanceof Error ? err.message : String(err),
-      });
+  //
+  // TRA-2819 Ask 3 — this used to be gated `settings.mode === 'live'`, read at
+  // the instant the EOD pass fired. A bistable `mode` reading `demo` at
+  // 00:00 ET (TRA-2649/TRA-2693) skipped the PRODUCTION reconcile silently,
+  // and the promised restate-to-broker-truth never ran: the 07-31 cohort sat
+  // unread 4 days while the calendar booked −$2.00 against +$713.73 settled.
+  // Real-money fills are env-scoped, not mode-scoped, so the production pass
+  // now runs whenever production credentials exist, whatever the toggle reads
+  // (`tradierReconcileEnvs` holds the rule and its rationale).
+  if (!backfill) {
+    for (const env of tradierReconcileEnvs(mode)) {
+      try {
+        await reconcileTradierOptionsHistory(ctx, settings, env);
+      } catch (err) {
+        log.warn('tradier-reconcile failed', {
+          username: ctx.username,
+          env,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -2412,9 +2424,12 @@ async function catchUpMissedEodReports(): Promise<void> {
 const TRADIER_RECONCILE_LOOKBACK_DAYS = 45;
 
 /**
- * TRA-348 — pull Tradier history for the active live env over the last
- * `LOOKBACK_DAYS` and merge realized options closes into the local
- * per-day reports + the engine's live-mode `optionsPnl` counter.
+ * TRA-348 — pull Tradier history for `env` over the last `LOOKBACK_DAYS` and
+ * merge realized options closes into the local per-day reports + the engine's
+ * live-mode `optionsPnl` counter. The env is the CALLER's decision
+ * (`tradierReconcileEnvs`) — it is deliberately no longer derived from the
+ * active UI mode, which is bistable (TRA-2649) and was read at exactly the
+ * wrong instant for 4 straight days (TRA-2819).
  *
  * Dedup is enforced via a per-user / per-env cursor file under
  * `<dataDir>/tradier-history-cursor.<env>.json` so a re-fetch over the
@@ -2425,13 +2440,20 @@ const TRADIER_RECONCILE_LOOKBACK_DAYS = 45;
 async function reconcileTradierOptionsHistory(
   ctx: UserContext,
   settings: AccountSettings,
-  mode: StockModeKey,
+  env: TradierEnv,
 ): Promise<void> {
-  if (mode === 'demo') return;
-  const env: TradierEnv = mode === 'live' ? 'production' : 'sandbox';
   // TRA-3112 — `listAccountHistory` is `/accounts/{id}/*`: account surface.
   const client = buildTradierAccountClientForEnv(settings, env, ctx.username);
-  if (!client) return;
+  if (!client) {
+    // TRA-2819 — a bare return here was one of the two silent halves of the
+    // 4-day ingestion gap. No production client means the restate-to-broker-
+    // truth pass CANNOT run; that is a statement about the books, so say it.
+    log.info('tradier-reconcile skipped: no account client for env', {
+      username: ctx.username,
+      env,
+    });
+    return;
+  }
 
   const today = new Date();
   const end = today.toISOString().slice(0, 10);
@@ -14020,6 +14042,34 @@ for (const ctx of getAllUserContexts()) {
 // than waiting for — and depending on — that night's archive tick.
 void catchUpMissedEodReports().catch(err =>
   log.warn('reports startup catch-up failed', {
+    reason: err instanceof Error ? err.message : String(err),
+  }),
+);
+
+// TRA-2819 Ask 3 — on startup, run the Tradier history reconcile itself. The
+// catch-up above fills missed report FILES but passes `asOfDate`, which gates
+// it out of the reconcile — so a missed or mode-flipped 00:00 ET pass left
+// broker fills unread until the next successful live-mode EOD, and 07-31's
+// fills waited 4 days. The 45-day lookback plus the seen-id cursor make this
+// idempotent (one history fetch per env; nothing new → no writes), so every
+// boot closes the gap instead of extending it.
+void (async () => {
+  for (const ctx of getAllUserContexts()) {
+    const settings = getSettings(ctx.username);
+    for (const env of tradierReconcileEnvs(stockModeKey(settings))) {
+      try {
+        await reconcileTradierOptionsHistory(ctx, settings, env);
+      } catch (err) {
+        log.warn('tradier-reconcile startup pass failed', {
+          username: ctx.username,
+          env,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+})().catch(err =>
+  log.warn('tradier-reconcile startup sweep failed', {
     reason: err instanceof Error ? err.message : String(err),
   }),
 );
