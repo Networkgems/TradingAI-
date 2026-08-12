@@ -2,7 +2,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 // TRA-2599 — `stat` left with the storage diagnostic; see `storage-health.ts`.
-import { writeFile, readFile, readdir } from 'fs/promises';
+import { writeFile, readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -634,7 +634,23 @@ import {
   loadCryptoTradeSnapshot,
   type StocksTradeSnapshot,
   type CryptoTradeSnapshot,
+  // TRA-3407 — resolve the snapshot paths through the writer's own helper so the
+  // write-axis instrument stats the file that is actually written.
+  snapshotFilePathFor,
 } from './trade-store.js';
+// TRA-3407 (delivery of TRA-2892) — the WRITE axis of snapshot durability.
+// Separate from `disk.*` on purpose: a write can fail on a healthy volume, and
+// the two verdicts are meant to be able to disagree.
+import {
+  AXIS_TICK_MS,
+  STALENESS_TICKS,
+  LIVENESS_TICKS,
+  getPersistOutcomes,
+  gradePersistRow,
+  foldPersistVerdict,
+  type PersistAxis,
+  type PersistRowInput,
+} from './snapshot-persist-health.js';
 import {
   buildExport,
   toCsv,
@@ -7048,6 +7064,109 @@ registerStorageHealthRoutes(app, {
     lastRunAt: observabilityMonitorLastRunAt,
   }),
   processStart: () => new Date(Date.now() - process.uptime() * 1000).toISOString(),
+});
+
+// TRA-3407 (delivery of TRA-2892) — SNAPSHOT WRITE AXIS. `GET` returned 404
+// until this shipped; there was no persist-outcome surface at all.
+//
+// This is NOT the disk axis and must never be folded into it. `/api/health/storage`
+// answers "is there room on the volume"; this answers "are our writes landing".
+// Both read green together in steady state and are meant to be able to disagree —
+// through the whole 2026-07-30 → 2026-08-04 ENOSPC incident the disk payload was
+// green on this axis while every write failed.
+//
+// OPEN, no auth, like the other health probes and for the reason TRA-2892 names:
+// `/api/health/storage/detail` already exposes the raw `mtime`, but it 401s
+// without admin auth, it is per-file, and NOTHING GRADES ITS AGE. A timestamp a
+// human must interpret is not an instrument — nobody looked at it for five days.
+// What is published here is a VERDICT a probe can branch on. The per-context rows
+// carry usernames, matching the existing open `/api/health/pnl-reconciliation`
+// precedent (`priorOptionsLagBooks`, `counterFrozenBooks`).
+//
+// TRI-STATE, fail closed: `stale: null` is NOT MEASURED and is never a pass.
+// The denominator (`gradedRowCount`) ships alongside the verdict, because
+// `stale: false` over 0 rows and over 122 rows are different claims.
+app.get('/api/health/snapshot-persist', async (_req, res) => {
+  const nowMs = Date.now();
+  const outcomes = getPersistOutcomes();
+  const contexts = getAllUserContexts();
+
+  // Grade EVERY live context × BOTH axes, not just the pairs that happen to have
+  // an outcome record. A writer that has never once succeeded has no record from
+  // the persist path at all, and iterating the registry alone would omit exactly
+  // the book that is most broken. The tick hook does create a record on the first
+  // tick, but a context whose very first write threw before any tick landed would
+  // still be invisible — so the CONTEXT LIST is the population, and the registry
+  // is a left join onto it.
+  const rows: PersistRowInput[] = [];
+  const outcomeByKey = new Map(outcomes.map(o => [`${o.axis}:${o.username}`, o]));
+  for (const ctx of contexts) {
+    for (const axis of ['stocks', 'crypto'] as PersistAxis[]) {
+      const rec = outcomeByKey.get(`${axis}:${ctx.username}`) ?? null;
+      // THE INDEPENDENT READ. `stat()` here, at request time, on the path the
+      // writer resolves. Not `rec.lastSuccessAt`, which the persist path writes
+      // and which would be stale in the same direction as a dead writer.
+      let fileMtimeMs: number | null = null;
+      try {
+        fileMtimeMs = (await stat(snapshotFilePathFor(ctx.username, axis))).mtimeMs;
+      } catch {
+        // Absent or unreadable ⇒ NOT MEASURED downstream. Never CURRENT.
+        fileMtimeMs = null;
+      }
+      rows.push({
+        username: ctx.username,
+        axis,
+        lastTickAt: rec?.lastTickAt ?? null,
+        consecutiveFailures: rec?.consecutiveFailures ?? 0,
+        fileMtimeMs,
+        lastSuccessAt: rec?.lastSuccessAt ?? null,
+      });
+    }
+  }
+
+  const grades = rows.map(r => gradePersistRow(r, nowMs));
+  const verdict = foldPersistVerdict(grades);
+
+  res.json({
+    issue: 'TRA-3407',
+    parent: 'TRA-2892',
+    axis: 'snapshot-write',
+    note: 'Separate from /api/health/storage `disk.*`. A write can fail on a healthy volume.',
+    checkedAt: new Date(nowMs).toISOString(),
+    ...verdict,
+    // The population this verdict was computed over, so a shrunken cohort is
+    // visible rather than being read as a clean one (the TRA-2630 lesson).
+    contextCount: contexts.length,
+    rowCount: rows.length,
+    policy: {
+      stalenessTicks: STALENESS_TICKS,
+      livenessTicks: LIVENESS_TICKS,
+      tickMs: AXIS_TICK_MS,
+      precedence: 'RED > NOT_MEASURED > GREEN',
+      nullMeans: 'NOT MEASURED — never read as a pass',
+      operands: [
+        'lastTickAt (engine tick hook — blind to write outcome)',
+        'consecutiveFailures (in-process persist counter)',
+        'fileMtimeMs (independent stat() at request time)',
+      ],
+      notAnOperand: 'lastSuccessAt — written by the persist path; published only',
+    },
+    // PER CONTEXT, never folded to a fleet scalar. The five-day incident hit
+    // every book, but a single-book writer failure (TRA-2903 / `enock`) is the
+    // shape a fold would hide.
+    contexts: grades.map(g => {
+      const rec = outcomeByKey.get(`${g.axis}:${g.username}`) ?? null;
+      return {
+        ...g,
+        lastSuccessAt: rec?.lastSuccessAt ?? null,
+        lastFailureAt: rec?.lastFailureAt ?? null,
+        lastError: rec?.lastError ?? null,
+        successes: rec?.successes ?? 0,
+        failures: rec?.failures ?? 0,
+        ticks: rec?.ticks ?? 0,
+      };
+    }),
+  });
 });
 
 // TRA-779 — option-chain capture liveness. Open (no auth, like the other

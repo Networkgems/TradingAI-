@@ -51,6 +51,17 @@ import {
 } from './reports/report-sidecar-reclaim.js';
 import { logger } from './observability/index.js';
 import { resolveDataDir } from './data-dir.js';
+// TRA-3407 (delivery of TRA-2892) — the WRITE axis. Every persist failure used
+// to land in a `log.warn` and nowhere else; these three calls are the only
+// producers the graded staleness verdict on `/api/health/snapshot-persist`
+// counts. `recordPersistTick` is wired to the ENGINE tick, deliberately upstream
+// of and blind to the write, so "quiet box" and "dead writer" stay separable.
+import {
+  recordPersistTick,
+  recordPersistSuccess,
+  recordPersistFailure,
+  forgetPersistOutcomes,
+} from './snapshot-persist-health.js';
 
 const log = logger.child({ module: 'user-context' });
 
@@ -1208,8 +1219,19 @@ async function createUserContext(username: string): Promise<UserContext> {
   }
 
   // Wire up debounced trade-history persistence (TRA-140) per user.
-  engine.onTick(() => scheduleStocksPersist(ctx));
-  cryptoEngine.onTick(() => scheduleCryptoPersist(ctx));
+  //
+  // TRA-3407 — the tick observation is recorded HERE, in the same hook, and NOT
+  // inside `persistStocksNow`. That placement is the point: it fires on every
+  // tick whether or not the subsequent write throws, so it is an independent
+  // liveness operand rather than a second reading of the persist outcome.
+  engine.onTick(() => {
+    recordPersistTick(ctx.username, 'stocks');
+    scheduleStocksPersist(ctx);
+  });
+  cryptoEngine.onTick(() => {
+    recordPersistTick(ctx.username, 'crypto');
+    scheduleCryptoPersist(ctx);
+  });
 
   contexts.set(username, ctx);
 
@@ -1250,6 +1272,10 @@ export function destroyUserContext(username: string): void {
   contexts.delete(username);
   clearSettingsCache(username);
   clearWatchlistCache(username);
+  // TRA-3407 — drop the write-axis rows too. A deleted book stops ticking, so it
+  // would grade IDLE rather than STALE, but leaving the record behind keeps a
+  // dead username in the published per-context list forever.
+  forgetPersistOutcomes(username);
 }
 
 function scheduleStocksPersist(ctx: UserContext): void {
@@ -1297,7 +1323,17 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       // the Stage-2 paper count survives the nightly archive and a redeploy.
       supertrendPaperClosed: snap.supertrendPaperClosed,
     });
+    // TRA-3407 — AFTER the await resolves, never before. `saveStocksTradeSnapshot`
+    // is an atomic write-then-rename; recording success on entry would book a
+    // success for the ENOSPC that is about to be thrown by the write.
+    recordPersistSuccess(ctx.username, 'stocks');
   } catch (err: unknown) {
+    // TRA-3407 (delivery of TRA-2892) — this catch used to be the ENTIRE
+    // consequence of a failed write. Five days of ENOSPC (2026-07-30T23:40:19Z →
+    // the TRA-2817 prune at 2026-08-04T21:20Z) produced nothing but these lines.
+    // The counter is what makes it gradeable; the log line stays because it is
+    // what names the error in Render's log search.
+    recordPersistFailure(ctx.username, 'stocks', err);
     log.warn('stocks persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });
   }
 }
@@ -1323,7 +1359,13 @@ export async function persistCryptoNow(ctx: UserContext): Promise<void> {
         openingEquityToday: snap.account.openingEquityToday,
       },
     });
+    // TRA-3407 — see `persistStocksNow`. Same seam, same ordering constraint.
+    recordPersistSuccess(ctx.username, 'crypto');
   } catch (err: unknown) {
+    // TRA-3407 — the crypto writer has the identical swallow-shape and is graded
+    // as its own axis. A fold to one fleet scalar would hide a single-book writer
+    // failure (the TRA-2903 / `enock` shape), which is why this is per context.
+    recordPersistFailure(ctx.username, 'crypto', err);
     log.warn('crypto persist failed', { username: ctx.username, reason: err instanceof Error ? err.message : String(err) });
   }
 }

@@ -110,6 +110,21 @@ function cryptoTradesFile(username: string): string {
 }
 
 /**
+ * TRA-3407 — the paths the write axis stats. Exported so
+ * `/api/health/snapshot-persist` reads the SAME file `saveStocksTradeSnapshot`
+ * writes, resolved by the SAME function, rather than re-deriving the layout at
+ * the call site where a rename would silently point the instrument at a file
+ * nobody writes (which grades NOT_MEASURED forever and reads like a quiet box).
+ *
+ * The route stats these itself. That is the point: the on-disk mtime must come
+ * from a read independent of the in-process outcome counter, or a dead writer
+ * confirms its own freshness.
+ */
+export function snapshotFilePathFor(username: string, axis: 'stocks' | 'crypto'): string {
+  return axis === 'stocks' ? stocksTradesFile(username) : cryptoTradesFile(username);
+}
+
+/**
  * TRA-233 — single env's options bucket as serialized to disk. Existed
  * inline before; pulled out so the per-env snapshot map can reuse the same
  * shape.
