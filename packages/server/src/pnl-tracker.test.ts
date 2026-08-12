@@ -167,6 +167,75 @@ describe('TRA-1633 — window sums use day-only options, not cumulative combined
   });
 });
 
+// TRA-3239 — allTimePnl EXCLUDED the booked options leg the windows include.
+//
+// Post-TRA-2323 every option close credits equity, so `openingEquity`
+// telescopes over closes that CONTAIN options P&L — but the booked sum fed to
+// all-time was stock `dailyPnl` only. Live repro (demo book `qa3120t0806a`,
+// bqb1, 2026-08-11): two option closes ever (+80 booked 08-10, +26 realized
+// 08-11), equity 25,106 on a 25,000 start. One /api/state read served
+// weekly/monthly/yearly 80 and allTimePnl 26 — an all-time strictly SMALLER
+// than the weekly window inside it — and after the day roll allTimePnl read
+// ~1e-13. The true +106 never appeared on any read.
+describe('TRA-3239 — allTimePnl includes the booked options leg (same basis as the windows)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3239-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const optSnap = (date: string, openingEquity: number, closingEquity: number, optionsDailyPnl: number): DailySnapshot => ({
+    date,
+    openingEquity,
+    closingEquity,
+    // Post-TRA-2323 EOD derivation: stockDaily = equity delta − options credit.
+    dailyPnl: (closingEquity - openingEquity) - optionsDailyPnl,
+    optionsPnl: optionsDailyPnl,
+    optionsDailyPnl,
+    combinedPnl: closingEquity - openingEquity,
+    trades: 0,
+  });
+
+  it('the qa3120t0806a book: all-time equals the equity mark AND the window basis', () => {
+    const t = new PnlTracker(dir, 25_000);
+    // 08-10: +80 option close, credited into equity (TRA-2323).
+    t.saveEquity(25_080, 80);
+    t.saveSnapshot(optSnap('2020-01-06', 25_000, 25_080, 80));
+    // 08-11: +26 option close.
+    t.saveEquity(25_106, 106);
+    t.saveSnapshot(optSnap('2020-01-07', 25_080, 25_106, 26));
+
+    // openingEquity telescoped to 25,106; no running delta today.
+    const stats = t.getCumulativeStats(25_106);
+    // Before the fix this read 0 (booked stock 0 + running 0): the book's +106
+    // was invisible to all-time while any window covering the rows read 106.
+    expect(stats.allTimePnl).toBeCloseTo(106, 6);
+    expect(stats.allTimePnl).toBeCloseTo(25_106 - 25_000, 6);
+  });
+
+  it("mid-session: today's running option credit is counted once, not twice", () => {
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_080, 80);
+    t.saveSnapshot(optSnap('2020-01-06', 25_000, 25_080, 80));
+    // Today's +26 close has credited equity but the 21:00 ET row is not booked
+    // yet — the QADesigner's exact 08-11 18:0x read.
+    const stats = t.getCumulativeStats(25_106);
+    // Booked (0 + 80) + running (25,106 − 25,080) = 106. Before the fix: 26.
+    expect(stats.allTimePnl).toBeCloseTo(106, 6);
+  });
+
+  it('all-time is never smaller than a window it super-sets (the filed defect)', () => {
+    const year = new Date().getFullYear();
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_080, 80);
+    t.saveSnapshot(optSnap(`${year}-01-02`, 25_000, 25_080, 80));
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    const stats = t.getCumulativeStats(25_080);
+    if (`${year}-01-02` < today) {
+      expect(stats.yearlyPnl).toBeCloseTo(80, 6);
+    }
+    expect(stats.allTimePnl).toBeGreaterThanOrEqual(stats.yearlyPnl - 1e-6);
+  });
+});
+
 // TRA-3039 — THE DAY ROLL RE-ANCHORED OVER A SESSION THAT ACTUALLY CLOSED.
 //
 // `saveSnapshot` writes `openingEquity = closingEquity` / `openingDate =

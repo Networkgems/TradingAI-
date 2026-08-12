@@ -812,15 +812,25 @@ export class PnlTracker {
     //
     // Derive all-time from the SAME booked ledger every other window uses, plus
     // today's not-yet-booked running delta (`currentEquity - openingEquity`), so
-    // every P&L surface agrees. `dailyPnl` (the stock equity delta) — not
-    // `combinedPnl` — keeps the stock-only basis the equity-mark all-time always
-    // had (`totalEquity` excludes the separately-tracked options P&L), so this
-    // only removes the re-anchor leak and changes nothing on a continuously-run
-    // book: with every day booked, `openingEquity` telescopes to the last close
-    // and the sum collapses back to `currentEquity - initialEquity`.
-    const bookedStockPnl = this.snapshots.reduce((acc, s) => acc + s.dailyPnl, 0);
+    // every P&L surface agrees.
+    //
+    // TRA-3239 — the booked leg sums `dailyPnl + optionsDailyPnl` (the windows'
+    // exact basis), NOT `dailyPnl` alone. The original TRA-1557 fix summed the
+    // stock leg only, justified by "`totalEquity` excludes the separately-tracked
+    // options P&L" — a premise TRA-2323 ended: `creditRealizedOptionsPnl` moves
+    // equity on every option close, so `todayRunning` ALREADY contains today's
+    // options credits while the booked sum contained none. The result on an
+    // options-only book (live repro: demo `qa3120t0806a`, 08-11): all-time read
+    // "today's options P&L" — 26 with weekly at 80, then ~0 after the day roll
+    // re-anchored — strictly SMALLER than the weekly window it super-sets, and
+    // the book's true +106 never appeared on any read. Same telescoping
+    // property as before: with every day booked and credits absorbed, the sum
+    // collapses to `currentEquity - initialEquity`. Legacy rows without
+    // `optionsDailyPnl` contribute stock-only (absent → 0), matching the windows.
+    const bookedPnl = this.snapshots.reduce(
+      (acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
     const todayRunning = currentEquity - this.state.openingEquity;
-    const allTimePnl = bookedStockPnl + todayRunning;
+    const allTimePnl = bookedPnl + todayRunning;
 
     return {
       allTimePnl,
