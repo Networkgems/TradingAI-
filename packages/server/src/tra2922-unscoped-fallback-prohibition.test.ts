@@ -119,6 +119,8 @@ describe('TRA-2922 — the suspended figure must not be readable under a second 
           leftAnchorEquity: 2_243.48,
           rightAnchorDate: '2026-08-05',
           rightAnchorEquity: 2_603.49,
+          leftAnchorEquityBasis: null,
+          rightAnchorEquityBasis: null,
           windowSessions: 5,
           windowRowDates: ['2026-08-04', '2026-08-05'],
           absentSessions: ['2026-07-30', '2026-07-31', '2026-08-03'],

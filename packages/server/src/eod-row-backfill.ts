@@ -1,4 +1,5 @@
 import type { DailySnapshot } from './pnl-tracker.js';
+import { CLOSING_EQUITY_BASIS_BROKER, CLOSING_EQUITY_BASIS_NOT_MEASURED } from './pnl-tracker.js';
 import type { EodTailCalendar, JournalDayCloses } from './pnl-reconciliation.js';
 import { staleTailSessions } from './pnl-reconciliation.js';
 
@@ -44,10 +45,11 @@ import { staleTailSessions } from './pnl-reconciliation.js';
  */
 export const EOD_BACKFILL_ROW_SOURCE = 'backfill-TRA-2827';
 
-/** `closingEquity` was read from the broker balance series for that exact session. */
-export const CLOSING_EQUITY_BASIS_BROKER = 'broker-eod-balance';
-/** The broker balance series has no entry for that session — equity anchors are null. */
-export const CLOSING_EQUITY_BASIS_NOT_MEASURED = 'not-measured';
+// TRA-3288 — the basis vocabulary moved to `pnl-tracker.ts` (the module every
+// interested party already depends on) so `pnl-reconciliation.ts` can test rows
+// against the broker value without importing from THIS module, which
+// value-imports from it. Re-exported here so existing importers keep compiling.
+export { CLOSING_EQUITY_BASIS_BROKER, CLOSING_EQUITY_BASIS_NOT_MEASURED };
 
 /** The stock leg was booked `0` and the equity probe RAN and agreed it is inert. */
 export const STOCK_LEG_BASIS_INERT = 'zero-probe-agrees';

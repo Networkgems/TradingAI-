@@ -1,6 +1,29 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 
+/**
+ * TRA-2829 / TRA-3288 — the {@link DailySnapshot.closingEquityBasis} vocabulary.
+ *
+ * Defined HERE (not in `eod-row-backfill.ts`, which re-exports them) because
+ * `pnl-reconciliation.ts` must test rows against the broker value and
+ * `eod-row-backfill.ts` already value-imports from `pnl-reconciliation.ts` — a
+ * definition in either leaf would force an import cycle. `pnl-tracker.ts` is the
+ * module both already depend on.
+ */
+export const CLOSING_EQUITY_BASIS_BROKER = 'broker-eod-balance';
+export const CLOSING_EQUITY_BASIS_NOT_MEASURED = 'not-measured';
+/**
+ * TRA-3288 — what the 21:00 ET archive's recorded-row writer ACTUALLY writes:
+ * `PaperAccount.getState().totalEquity`, the engine's paper book. On a demo book
+ * that is the book. On a `mode: live` book it is the PRESERVED demo state —
+ * live stock fills and live option credits are both refused entry by design
+ * (`setSettings` live early-return; `bindOptionsPnlToEquityBook` non-demo
+ * refusal) — so the number never moves and is NOT the broker's NAV. The stamp
+ * exists so a read site can tell this surface from `'broker-eod-balance'`
+ * without inferring it from the row's age or the field's absence.
+ */
+export const CLOSING_EQUITY_BASIS_ENGINE_PAPER = 'engine-paper-account';
+
 export interface DailySnapshot {
   date: string;
   /**
@@ -155,10 +178,20 @@ export interface DailySnapshot {
    */
   rowSource?: string;
   /**
-   * TRA-2829 — how `closingEquity` on a back-filled row was established.
+   * TRA-2829 — how `closingEquity` was established.
    * `'broker-eod-balance'` = read from `tradier-eod-balance.<env>.json` for that
    * exact session. `'not-measured'` = the balance series has no entry, so
-   * `closingEquity`/`openingEquity` are `null`. Absent on recorded rows.
+   * `closingEquity`/`openingEquity` are `null`.
+   *
+   * TRA-3288 — no longer absent on recorded rows: the 21:00 ET archive stamps
+   * `'engine-paper-account'` ({@link CLOSING_EQUITY_BASIS_ENGINE_PAPER}),
+   * naming the surface it actually writes — the demo paper book, which on a
+   * live book is a preserved constant, not NAV. Before this stamp a
+   * broker-sourced back-filled row and a demo-book live row were
+   * INDISTINGUISHABLE at the read site, which is how `postOnsetCredit` came to
+   * grade broker-journal dollars against demo-book dollars. ABSENT (a
+   * pre-TRA-3288 row) must be read as NOT broker-sourced — absent is not
+   * broker, and `summarizePostOnsetLiveCredit` fails a live book closed on it.
    */
   closingEquityBasis?: string;
   /**

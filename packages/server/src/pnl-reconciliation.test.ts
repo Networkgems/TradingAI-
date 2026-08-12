@@ -34,6 +34,8 @@ const NO_POST_ONSET_CREDIT: PostOnsetLiveCredit = {
   leftAnchorEquity: null,
   rightAnchorDate: null,
   rightAnchorEquity: null,
+  leftAnchorEquityBasis: null,
+  rightAnchorEquityBasis: null,
   windowSessions: null,
   windowRowDates: [],
   absentSessions: null,
@@ -1881,11 +1883,17 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
     // The money the ledger lost. Close-dated, so the journal holds it with no row.
     ['2026-07-31', { closes: 3, partialCloses: 0, realizedPnlUsd: 739 }],
   ]);
+  // `admin` IS a `mode: live` book, and since TRA-3288 stating that arms the
+  // surface gate: none of these rows carries a broker basis, so the published
+  // reason on the live tape is now `equity-anchor-not-broker-sourced` — with
+  // the absence evidence still enumerated beside it. Tests that exercise the
+  // ABSENCE mechanics in isolation pass `bookMode: 'demo'` below.
   const admin = () => summarizePostOnsetLiveCredit({
     rows: adminRows,
     liveOptionsOnsetDate: '2026-07-30',
     journalClosesByDate: adminJournal,
     calendar,
+    bookMode: 'live',
   });
 
   it('AC1 — the numerator INCLUDES the 07-31 +739.00 and EXCLUDES every pre-onset cell', () => {
@@ -1916,14 +1924,21 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
     expect((r.journalOptionsUsd ?? 0) - (r.dayCellOptionsUsd ?? 0)).toBeCloseTo(741, 2);
   });
 
-  it('AC2 — the comparison is NOT MEASURED because the equity anchor spans the hole', () => {
+  it('AC2 — the comparison is NOT MEASURED, and TRA-3288 names the SURFACE, not the hole', () => {
     const r = admin();
     expect(r.anchorBasis).toBe('pre-onset-close');
     expect(r.leftAnchorDate).toBe('2026-07-29');
     expect(r.leftAnchorEquity).toBeCloseTo(2_243.48, 2);
     expect(r.rightAnchorDate).toBe('2026-08-04');
+    // The absence evidence is still enumerated and published…
     expect(r.absentSessions).toEqual(['2026-07-30', '2026-07-31', '2026-08-03']);
-    expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
+    // …but on a live book whose anchors are demo-book rows the REASON is the
+    // surface gate, with precedence: the hole gate was right by accident (it
+    // clears itself the moment a window has full rows), and the real
+    // disqualifier is that both anchors read the PaperAccount, not the broker.
+    expect(r.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.leftAnchorEquityBasis).toBeNull();
+    expect(r.rightAnchorEquityBasis).toBeNull();
     // The number is what must NOT appear. Had it been published it would read
     // 739.00 + 0.00 − 360.01 = +378.99, an entirely invented shortfall: the equity
     // delta 2243.48 → 2603.49 also absorbs three sessions nobody recorded.
@@ -1952,11 +1967,15 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       row('2026-08-03', 0, 0, 2_605.49),
       row('2026-08-04', -2, 0, 2_603.49),
     ];
+    // TRA-3288 — `bookMode: 'demo'`: on a DEMO book the paper account IS the
+    // book, so a hole-free window publishes with no broker basis required.
+    // (The same tape under `bookMode: 'live'` is the surface-gate arm below.)
     const r = summarizePostOnsetLiveCredit({
       rows: healed,
       liveOptionsOnsetDate: '2026-07-30',
       journalClosesByDate: adminJournal,
       calendar,
+      bookMode: 'demo',
     });
     expect(r.absentSessions).toEqual([]);
     expect(r.notMeasuredReason).toBeNull();
@@ -1979,6 +1998,8 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-07-30',
       journalClosesByDate: adminJournal,
       calendar,
+      // Demo mode so the ABSENCE gate is the one under test, not the surface gate.
+      bookMode: 'demo',
     });
     expect(r.absentSessions).toEqual(['2026-08-04']);
     expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
@@ -1990,6 +2011,7 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
     // them is the defect this module has now shipped in several shapes.
     const noOnset = summarizePostOnsetLiveCredit({
       rows: adminRows, liveOptionsOnsetDate: null, journalClosesByDate: adminJournal, calendar,
+      bookMode: 'live',
     });
     expect(noOnset.notMeasuredReason).toBe('no-live-options-onset');
     expect(noOnset.journalOptionsUsd).toBeNull();
@@ -2000,6 +2022,7 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-08-05',
       journalClosesByDate: new Map(),
       calendar,
+      bookMode: 'live',
     });
     expect(oneRow.notMeasuredReason).toBe('no-post-anchor-span');
 
@@ -2008,12 +2031,16 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-07-30',
       journalClosesByDate: adminJournal,
       calendar,
+      bookMode: 'live',
     });
     expect(noAnchor.notMeasuredReason).toBe('no-equity-anchor');
 
+    // Demo mode: on a live book the TRA-3288 surface gate outranks calendar
+    // availability, so `no-session-calendar` is only reachable off-live here.
     const noCalendar = summarizePostOnsetLiveCredit({
       rows: adminRows, liveOptionsOnsetDate: '2026-07-30', journalClosesByDate: adminJournal,
       calendar: null,
+      bookMode: 'demo',
     });
     expect(noCalendar.notMeasuredReason).toBe('no-session-calendar');
     // The numerator survives — it does not need a calendar. Only the comparison does.
@@ -2025,8 +2052,12 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
     // `?? 0` here would publish a $0.00 live numerator for a book whose entire
     // live record is in the file we failed to read — the TRA-2314 false zero one
     // layer up, and it would carry a comparison that looks perfectly ordinary.
+    // `bookMode: 'live'` deliberately: a missing NUMERATOR outranks even the
+    // TRA-3288 surface gate — with no journal there is nothing to compare on
+    // ANY equity surface, and neither reason path can reach a publish.
     const r = summarizePostOnsetLiveCredit({
       rows: adminRows, liveOptionsOnsetDate: '2026-07-30', journalClosesByDate: null, calendar,
+      bookMode: 'live',
     });
     expect(r.journalCensusAvailable).toBe(false);
     expect(r.notMeasuredReason).toBe('no-journal-census');
@@ -2047,6 +2078,7 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-07-30',
       journalClosesByDate: adminJournal,
       calendar,
+      bookMode: 'demo',
     });
     const leg = r.legs.find(l => l.date === '2026-08-05');
     expect(leg).toEqual({
@@ -2072,6 +2104,8 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-07-30',
       journalClosesByDate: adminJournal,
       calendar,
+      // Demo mode so the failing gate under test is the ABSENCE one.
+      bookMode: 'demo',
     });
     expect(r.journalOptionsUsd).toBeCloseTo(739, 2);
     expect(r.notMeasuredReason).toBe('equity-anchor-spans-absent-session');
@@ -2084,12 +2118,170 @@ describe('TRA-2919 — summarizePostOnsetLiveCredit', () => {
       liveOptionsOnsetDate: '2026-08-04',
       journalClosesByDate: new Map([['2026-08-05', { closes: 1, partialCloses: 0, realizedPnlUsd: 100 }]]),
       calendar,
+      bookMode: 'demo',
     });
     expect(r.anchorBasis).toBe('first-post-onset-close');
     expect(r.leftAnchorDate).toBe('2026-08-04');
     // The anchor's own session is outside the telescoped window, on BOTH legs.
     expect(r.journalOptionsUsd).toBeCloseTo(100, 2);
     expect(r.uncreditedOptionsUsd).toBeCloseTo(0, 2);
+  });
+});
+
+describe('TRA-3288 — the SURFACE gate: a live comparison needs broker-sourced anchors', () => {
+  const isMarketDay = (d: string) => {
+    const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+    return dow !== 0 && dow !== 6;
+  };
+  const calendar = { lastSettledSession: '2026-08-05', isMarketDay };
+  const brow = (
+    date: string, optionsDaily: number, closingEquity: number, closingEquityBasis: string | null,
+  ) => ({ date, optionsDaily, stockDaily: 0, closingEquity, closingEquityBasis });
+  const journal = new Map([
+    ['2026-08-04', { closes: 1, partialCloses: 0, realizedPnlUsd: 125 }],
+  ]);
+
+  it('THE v0nni CASE — a live book with FULL rows is still refused on demo anchors', () => {
+    // This is the only test that proves the gate does anything: `absentSessions`
+    // is `[]`, so the pre-existing hole gate would have OPENED and published the
+    // entire journal numerator (125.00 + 0.00 − 0.00, the flat-25k demo seed
+    // contributing a zero delta) as live money that never reached NAV, on the
+    // first 21:00 ET archive after v0nni's first live close. A test where the
+    // absence gate would also have fired proves nothing.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'engine-paper-account'),
+        brow('2026-08-04', 0, 25_000, 'engine-paper-account'),
+        brow('2026-08-05', 0, 25_000, 'engine-paper-account'),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    expect(r.absentSessions).toEqual([]);
+    expect(r.journalOptionsUsd).toBeCloseTo(125, 2);
+    expect(r.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.leftAnchorEquityBasis).toBe('engine-paper-account');
+    expect(r.rightAnchorEquityBasis).toBe('engine-paper-account');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('an ABSENT basis reads as NOT broker-sourced — absent is not broker', () => {
+    // Every historical row has the field absent, including the demo-book live
+    // rows this gate exists to disqualify. Treating a missing field as a pass
+    // would open the gate on precisely the rows that motivated it.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, null),
+        brow('2026-08-04', 0, 25_000, null),
+        brow('2026-08-05', 0, 25_000, null),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    expect(r.absentSessions).toEqual([]);
+    expect(r.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('ONE non-broker anchor is enough to refuse — the check is per-anchor, both ends', () => {
+    // A broker right anchor against a demo left anchor still subtracts a demo
+    // number from a broker number: the two-surface error, one operand at a time.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'engine-paper-account'),
+        brow('2026-08-04', 0, 25_050, 'broker-eod-balance'),
+        brow('2026-08-05', 0, 25_110, 'broker-eod-balance'),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    expect(r.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.leftAnchorEquityBasis).toBe('engine-paper-account');
+    expect(r.rightAnchorEquityBasis).toBe('broker-eod-balance');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('POSITIVE CONTROL — broker-sourced anchors on a live book DO produce a number', () => {
+    // Without this the gate could be permanently closed for the wrong reason
+    // (a typo in the basis compare, an inverted mode test) and every other test
+    // here would still pass. The denominator is printed, not assumed: `every`
+    // is TRUE on an empty cohort.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'broker-eod-balance'),
+        brow('2026-08-04', 0, 25_050, 'broker-eod-balance'),
+        brow('2026-08-05', 0, 25_110, 'broker-eod-balance'),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    // THE DENOMINATOR: two expected sessions, two rows, zero absences.
+    expect(r.windowSessions).toBe(2);
+    expect(r.windowRowDates).toEqual(['2026-08-04', '2026-08-05']);
+    expect(r.absentSessions).toEqual([]);
+    expect(r.notMeasuredReason).toBeNull();
+    // 125.00 journal + 0.00 stock − 110.00 equity growth.
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(15, 2);
+  });
+
+  it('outranks `no-session-calendar` on a live book — the surface verdict is already known', () => {
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'engine-paper-account'),
+        brow('2026-08-05', 0, 25_000, 'engine-paper-account'),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar: null,
+      bookMode: 'live',
+    });
+    expect(r.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+  });
+
+  it('a DEMO book is untouched: no broker basis required, hole-free window publishes', () => {
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, null),
+        brow('2026-08-04', 0, 25_050, null),
+        brow('2026-08-05', 0, 25_110, null),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'demo',
+    });
+    expect(r.notMeasuredReason).toBeNull();
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(15, 2);
+  });
+
+  it('reconcilePnl wires the mode and the per-row basis through to the gate', () => {
+    // The armed path end-to-end: recorded-style snapshots (basis stamped
+    // `engine-paper-account` per TRA-3288's writer change), full window, live
+    // mode — refused on the surface, with the bases readable off `days[]`.
+    const snaps = [
+      { ...snap('2026-08-03', 0, 0), closingEquity: 25_000, closingEquityBasis: 'engine-paper-account' },
+      { ...snap('2026-08-04', 0, 0), closingEquity: 25_000, closingEquityBasis: 'engine-paper-account' },
+      { ...snap('2026-08-05', 0, 0), closingEquity: 25_000, closingEquityBasis: 'engine-paper-account' },
+    ];
+    const r = reconcilePnl(
+      snaps, new Map(), '2026-07-12', journal, null, null, calendar, '2026-08-04', 'live',
+    );
+    expect(r.days.map(d => d.closingEquityBasis)).toEqual([
+      'engine-paper-account', 'engine-paper-account', 'engine-paper-account',
+    ]);
+    expect(r.postOnsetCredit.absentSessions).toEqual([]);
+    expect(r.postOnsetCredit.journalOptionsUsd).toBeCloseTo(125, 2);
+    expect(r.postOnsetCredit.notMeasuredReason).toBe('equity-anchor-not-broker-sourced');
+    expect(r.postOnsetCredit.uncreditedOptionsUsd).toBeNull();
   });
 });
 
@@ -2166,10 +2358,15 @@ describe('TRA-2919 — reconcilePnl wires the journal axis, and the fold splits 
     expect(fold.liveOnsetCreditComparisonBookCount).toBe(0);
     expect(fold.liveOnsetCreditNotMeasuredBooks).toEqual([{
       username: 'admin',
+      // `run()` passes no `bookMode`, so the surface gate is disarmed and the
+      // absence reason is reachable — the TRA-3288 wiring arm below grades the
+      // armed path.
       reason: 'equity-anchor-spans-absent-session',
       onsetDate: '2026-07-30',
       leftAnchorDate: '2026-07-29',
       rightAnchorDate: '2026-08-04',
+      leftAnchorEquityBasis: null,
+      rightAnchorEquityBasis: null,
       absentSessions: ['2026-07-30', '2026-07-31', '2026-08-03'],
       journalOptionsUsd: 739,
       dayCellOptionsUsd: -2,

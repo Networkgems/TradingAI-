@@ -61,6 +61,8 @@ import {
   isEodRowBackfillArmed,
   EOD_BACKFILL_ROW_SOURCE,
 } from './eod-row-backfill.js';
+// TRA-3288 — the recorded-row writer stamps WHICH surface it writes.
+import { CLOSING_EQUITY_BASIS_ENGINE_PAPER } from './pnl-tracker.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
 // TRA-3100 — the live-calendar backfill's write decision (which cells it is
@@ -2056,6 +2058,18 @@ async function generateAndSaveReport(
       date: finalReport.date,
       openingEquity: ctx.tracker.getOpeningEquity(),
       closingEquity: equitySnap.equity,
+      // TRA-3288 — name the surface this writer ACTUALLY writes: the engine's
+      // PaperAccount, i.e. the demo paper book — stamped unconditionally
+      // because that is what `getEquitySnapshot()` returns in every mode. On a
+      // `mode: live` book this number is the PRESERVED demo state (live fills
+      // and live option credits are both refused entry by design), so without
+      // the stamp a demo-book live row and a broker-sourced back-filled row
+      // are indistinguishable at the read site — which is how `postOnsetCredit`
+      // came to grade broker-journal dollars against demo-book dollars. The
+      // TRA-3288 surface gate refuses a live comparison on any anchor that
+      // does not carry the broker basis, and this stamp is what makes that
+      // refusal name the right surface instead of relying on field absence.
+      closingEquityBasis: CLOSING_EQUITY_BASIS_ENGINE_PAPER,
       dailyPnl: stockOnlyDailyPnl,
       optionsPnl: equitySnap.optionsPnl,
       optionsCreditedCumulative: equitySnap.optionsCreditedToEquity,
@@ -5539,6 +5553,10 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             eodStockByDate,
             tailCalendar,
             liveOptionsOnsetDate,
+            // TRA-3288 — arms the post-onset SURFACE gate. The TRA-2761
+            // `loadSettings` mode from above, so a cache eviction cannot
+            // reclassify the live book as demo and silently disarm it.
+            mode,
           ),
         };
       }),

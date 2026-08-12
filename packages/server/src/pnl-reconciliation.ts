@@ -1,4 +1,5 @@
 import type { DailySnapshot } from './pnl-tracker.js';
+import { CLOSING_EQUITY_BASIS_BROKER } from './pnl-tracker.js';
 import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-daily-pnl-source.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling. `eod-ledger-gap.ts`
 // imports only a TYPE back from this module (`EodTailCalendar`), which erases at
@@ -142,7 +143,7 @@ export const PNL_LIVE_MODE_SPAN_NOTE =
   'TRA-2831: the live COHORT is keyed on the book\'s mode TODAY (`stockModeKey(loadSettings(username))`, read per request) while the day-cell options ledger under it is per-BOOK and MODE-BLIND for all time. On any book that flipped demo -> live mid-series those compose into a silent attribution defect: the whole pre-flip DEMO history folds into every `live*` credit metric. Live bqb1 2026-08-04T22:22Z: `liveUncreditedOptionsUsd` published 733.60 as a live-money shortfall, whose numerator `postBaselineOptionsRealized` 987.60 is the sum of eleven `journal-repair` cells dated 2026-07-15..2026-07-29 — a window in which the live book (`admin`) held ZERO live options, its first having opened 2026-07-30 09:36 ET. Those 987.60 are admin\'s own DEMO option P&L: summing every book\'s `journal-repair` cells fleet-wide reproduces the demo-mode fleet total to the cent (07-15 301.30, 07-17 102.00, 07-22 4919.50), with admin contributing 17.00 / 217.50 / 54.40. The equality to `eodCombined` on those rows is NOT independent corroboration — it is the TRA-2641 slaving (`syncEodReportOptionsLegs` writes the day cell into the report file\'s options leg on every `journal`/`journal-repair` row) plus a 0.00 stock leg on 9 of the 11. `liveUncreditedOptionsUsd` is now null (NOT MEASURED) whenever any contributing book carries pre-onset options money. DO NOT FALL BACK TO `liveUncreditedOptionsUsdUnscoped` -- an earlier revision of this note pointed readers at it "for the arithmetic" and that instruction is WITHDRAWN by TRA-2922 (CFO ruling, 2026-08-05), which made the suspension PERMANENT and keyed it to an IDENTITY rather than to a dollar figure: while `optionsRealizedBeforeLiveOnsetUsd >= postBaselineOptionsRealized` on a book, that book\'s `uncreditedOptionsUsd` carries ZERO live-onset options money and MUST NOT be reported, escalated or budgeted as a live-money shortfall, at ANY value, under any name. `*Unscoped` is that same suspended measurement under a different key and is published as EVIDENCE ONLY. The decisive leg is an inequality, not a magnitude: the pre-onset window 07-15..07-29 is a strict SUBSET of the post-baseline window, so `preOnset <= postBaseline` must hold and it does not (987.60 > 985.60 on 2026-08-05) -- MORE than 100 percent of the numerator predates onset, and zero of it is live-onset money. A rule keyed to the value would have expired on contact: the same contaminated measurement rendered 733.60 (08-04), 371.59 (08-05) and -52.41 (08-06), so it has already changed SIGN and any consumer still reading it would now report the live book as OVER-credited. Read `liveUncreditedOptionsGradeable` for the denominator -- print that denominator alongside any verdict, because exactly ONE book (`admin`) of the two live books carries a non-null `liveOptionsOnsetDate`, so an "all live books pass" predicate is TRUE on a cohort of one and would stay TRUE on a cohort of ZERO -- and `liveModeSpanContaminatedBooks` for the attribution. For an actual live-money number read `engines[].postOnsetCredit` (TRA-2919), never this key. Completing TRA-2827\'s 07-30/07-31/08-03 back-fill does NOT discharge this: those rows are post-onset and add a live term without removing the 987.60 pre-onset term. NOTE also that `optionsDailyPnl` is not a field on the published day rows at all — the durable snapshot field of that name surfaces as `optionsDaily`, and querying the published shape for `optionsDailyPnl` returns null on all 67 admin cells (and on every cell of every book) as a NAME MISS, not as a TRA-2629-style dropped field; the values are present and journal-sourced (`optionsDaily === journalOptionsPnl` on all 11 repaired cells, where `journalOptionsPnl` is recomputed per request straight from the journal).';
 
 export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
-  'TRA-2919: the live credit axis TRA-2630 named as the INDEPENDENT signal was PERMANENTLY ungradeable after TRA-2831, and is now re-sourced from the option-trade JOURNAL. TRA-2831 was right to suspend `liveUncreditedOptionsUsd` (its numerator was 987.60 of admin\'s own DEMO option P&L), but its gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which is DURABLE history and does not age out -- so the axis could never flip back. DO NOT "fix" this by scoping the existing day-cell numerator to post-onset dates. Measured on bqb1 2026-08-05: admin had exactly ONE post-onset day cell (2026-08-04, `optionsDaily` -2.00, source `bucket-journal-silent`), so a day-cell post-onset numerator publishes -2.00 while the live book actually realized +739.00 on 2026-07-31 across 3 journal closes -- money booked to NO day cell at all, because 07-30/07-31/08-03 are the permanent TRA-2888 hole and back-fill is refused. A wrong number carrying `gradeable: true` is strictly worse than the honest null. The journal is append-only, is keyed by CLOSE timestamp rather than by the existence of a snapshot row, and survived the ENOSPC window with `corruptLines 0`; it is the only surviving source. Read `engines[].postOnsetCredit` per book and `liveOnsetOptionsRealizedJournalUsd` fleet-wide; `liveOnsetOptionsDayCellUsd` publishes the day-cell FOIL over the same window so the rejected arithmetic stays visible. THE COMPARISON IS A SEPARATE QUESTION: the equity leg is holed over the same window, so `liveOnsetUncreditedOptionsUsd` (= journal numerator + post-onset stockDaily - post-onset equity delta) is null whenever an expected NYSE session inside the anchor window `(leftAnchor, rightAnchor]` has no ledger row -- reason `equity-anchor-spans-absent-session`, which is admin\'s standing state. Absence is enumerated from the exchange calendar and diffed against the rows, deliberately NOT from the three known gap dates: a hard-coded list goes green by EVICTION the moment a newer row advances past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to the next hole. `liveUncreditedOptionsGradeable` is REDEFINED by this ticket to mean "some live book has a journal-sourced post-onset numerator", i.e. ATTRIBUTION only; it is NOT a claim that the dollar comparison exists, and `true` alongside `liveOnsetUncreditedOptionsUsd: null` is the correct standing read. A gate wanting the money verdict must require BOTH that boolean AND `liveOnsetCreditNotMeasuredBooks` to be EMPTY. The day-cell fields `liveUncreditedOptionsUsd` / `liveUncreditedOptionsUsdUnscoped` / `liveModeSpanContaminatedBooks` are UNCHANGED and stay published as the evidence the TRA-2831 suspension rests on.';
+  'TRA-2919: the live credit axis TRA-2630 named as the INDEPENDENT signal was PERMANENTLY ungradeable after TRA-2831, and is now re-sourced from the option-trade JOURNAL. TRA-2831 was right to suspend `liveUncreditedOptionsUsd` (its numerator was 987.60 of admin\'s own DEMO option P&L), but its gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which is DURABLE history and does not age out -- so the axis could never flip back. DO NOT "fix" this by scoping the existing day-cell numerator to post-onset dates. Measured on bqb1 2026-08-05: admin had exactly ONE post-onset day cell (2026-08-04, `optionsDaily` -2.00, source `bucket-journal-silent`), so a day-cell post-onset numerator publishes -2.00 while the live book actually realized +739.00 on 2026-07-31 across 3 journal closes -- money booked to NO day cell at all, because 07-30/07-31/08-03 are the permanent TRA-2888 hole and back-fill is refused. A wrong number carrying `gradeable: true` is strictly worse than the honest null. The journal is append-only, is keyed by CLOSE timestamp rather than by the existence of a snapshot row, and survived the ENOSPC window with `corruptLines 0`; it is the only surviving source. Read `engines[].postOnsetCredit` per book and `liveOnsetOptionsRealizedJournalUsd` fleet-wide; `liveOnsetOptionsDayCellUsd` publishes the day-cell FOIL over the same window so the rejected arithmetic stays visible. THE COMPARISON IS A SEPARATE QUESTION: the equity leg is holed over the same window, so `liveOnsetUncreditedOptionsUsd` (= journal numerator + post-onset stockDaily - post-onset equity delta) is null whenever an expected NYSE session inside the anchor window `(leftAnchor, rightAnchor]` has no ledger row -- reason `equity-anchor-spans-absent-session`, which is admin\'s standing state. Absence is enumerated from the exchange calendar and diffed against the rows, deliberately NOT from the three known gap dates: a hard-coded list goes green by EVICTION the moment a newer row advances past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to the next hole. `liveUncreditedOptionsGradeable` is REDEFINED by this ticket to mean "some live book has a journal-sourced post-onset numerator", i.e. ATTRIBUTION only; it is NOT a claim that the dollar comparison exists, and `true` alongside `liveOnsetUncreditedOptionsUsd: null` is the correct standing read. A gate wanting the money verdict must require BOTH that boolean AND `liveOnsetCreditNotMeasuredBooks` to be EMPTY. The day-cell fields `liveUncreditedOptionsUsd` / `liveUncreditedOptionsUsdUnscoped` / `liveModeSpanContaminatedBooks` are UNCHANGED and stay published as the evidence the TRA-2831 suspension rests on. TRA-3288 UPDATE: `equity-anchor-spans-absent-session` was a HOLE gate that was right by accident -- `closingEquity` on every RECORDED row is the engine\'s DEMO PaperAccount (frozen on a live book by design), so a hole-free window still grades broker-journal dollars against demo-book dollars. A live book\'s comparison is now refused with `equity-anchor-not-broker-sourced` (precedence over the absence reason) unless BOTH anchor rows carry `closingEquityBasis: \'broker-eod-balance\'`; recorded rows now stamp `\'engine-paper-account\'`, and an ABSENT basis reads as NOT broker-sourced. This is admin\'s and v0nni\'s standing state and it is PERMANENT for admin (its left anchor is a demo-book row and back-fill is refused); the axis becomes measurable only on rows written broker-sourced going forward.';
 
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
@@ -518,6 +519,16 @@ export interface PnlReconcileDay {
    * {@link DailySnapshot.closingEquity} for why an interpolation was refused.
    */
   closingEquity: number | null;
+  /**
+   * TRA-3288 — WHICH surface set {@link closingEquity}, straight off the row
+   * (see {@link DailySnapshot.closingEquityBasis}). `'broker-eod-balance'` is
+   * the broker NAV; `'engine-paper-account'` is the demo paper book, which on a
+   * `mode: live` book is a preserved constant. `null` = the row predates the
+   * stamp — and a null here must be read as NOT broker-sourced, never as a
+   * pass: every historical row has it absent, including the demo-book live
+   * rows this field exists to disqualify.
+   */
+  closingEquityBasis: string | null;
   /**
    * TRA-2635 — `PaperAccount.getOptionsCredited()` as of this row: cumulative
    * realized option P&L this book's EQUITY has absorbed (see
@@ -1401,6 +1412,11 @@ export function summarizeLiveCreditObservation(
         onsetDate: e.postOnsetCredit.onsetDate,
         leftAnchorDate: e.postOnsetCredit.leftAnchorDate,
         rightAnchorDate: e.postOnsetCredit.rightAnchorDate,
+        // TRA-3288 — the operands of `equity-anchor-not-broker-sourced`, so
+        // the disqualifier is readable off the live endpoint: which surface
+        // each anchor actually sits on, `null` = no basis on the row.
+        leftAnchorEquityBasis: e.postOnsetCredit.leftAnchorEquityBasis,
+        rightAnchorEquityBasis: e.postOnsetCredit.rightAnchorEquityBasis,
         absentSessions: e.postOnsetCredit.absentSessions,
         journalOptionsUsd: e.postOnsetCredit.journalOptionsUsd,
         dayCellOptionsUsd: e.postOnsetCredit.dayCellOptionsUsd,
@@ -1866,6 +1882,21 @@ export type PostOnsetCreditNotMeasuredReason =
   | 'no-post-anchor-span'
   /** No exchange calendar was supplied, so session ABSENCE has no failing state. */
   | 'no-session-calendar'
+  /**
+   * TRA-3288 — THE SURFACE GATE. The book is `mode: live` but at least one
+   * equity anchor row does not carry `closingEquityBasis:
+   * 'broker-eod-balance'` — i.e. the equity leg would grade broker-journal
+   * dollars against the DEMO paper book, which on a live book is a preserved
+   * constant (live stock fills and live option credits are both refused entry
+   * by design). Evaluated with PRECEDENCE OVER the absence gate below: the
+   * absence gate is a HOLE gate, right by accident on `admin` only because its
+   * left anchor is pinned behind the permanent TRA-2888 gap, and it clears
+   * itself the moment a window has full rows — which is exactly what happens
+   * on `v0nni`'s first live option close. An ABSENT basis reads as NOT
+   * broker-sourced: every historical row has it absent, and absent is not
+   * broker.
+   */
+  | 'equity-anchor-not-broker-sourced'
   /** THE AC2 ARM — an expected session inside the anchor window has no ledger row. */
   | 'equity-anchor-spans-absent-session';
 
@@ -1887,6 +1918,15 @@ export interface PostOnsetLiveCredit {
   leftAnchorEquity: number | null;
   rightAnchorDate: string | null;
   rightAnchorEquity: number | null;
+  /**
+   * TRA-3288 — `closingEquityBasis` of each anchor row, echoed so the surface
+   * gate's operands are readable off the published object: a reader of
+   * `equity-anchor-not-broker-sourced` can see WHICH surface the anchors
+   * actually sit on without pulling the ledger. `null` = the row carries no
+   * basis (pre-stamp history), which the gate reads as NOT broker-sourced.
+   */
+  leftAnchorEquityBasis: string | null;
+  rightAnchorEquityBasis: string | null;
   /** Sessions the exchange calendar expects inside `(leftAnchor, rightAnchor]`. */
   windowSessions: number | null;
   /** Ledger rows this book actually holds inside that window. */
@@ -1992,6 +2032,25 @@ export interface PostOnsetLiveCredit {
  * against a delta anchored earlier is precisely the apples-to-oranges case, and
  * one predicate fails it closed.
  *
+ * ── TRA-3288: why absence of holes is still not enough ──────────────────────
+ *
+ * The absence gate above is a HOLE gate, and on a live book it is right by
+ * accident. `closingEquity` on every RECORDED row is the PaperAccount — the
+ * demo paper book — written unconditionally at the 21:00 ET archive, and on a
+ * live book that number cannot move: live stock fills are refused by the
+ * `setSettings` live early-return and live option credits by
+ * `bindOptionsPnlToEquityBook`'s non-demo refusal. So a hole-free window over
+ * recorded rows subtracts a demo constant from a demo constant and calls the
+ * result the equity leg of a LIVE credit comparison — on `v0nni` (every row a
+ * flat 25,000.00 demo seed) the first live close would have published the
+ * entire journal numerator, verbatim, as money that never reached NAV. Hence
+ * the surface gate: a live book's comparison is refused with
+ * `equity-anchor-not-broker-sourced`, with precedence over the absence reason,
+ * unless BOTH anchor rows carry `closingEquityBasis: 'broker-eod-balance'`.
+ * Absent basis is NOT broker (every pre-TRA-3288 row has it absent), and the
+ * check is an allow-list on the one broker value so no future basis string can
+ * open it by default.
+ *
  * Pure and calendar-injected, the same discipline the rest of this module keeps.
  */
 export function summarizePostOnsetLiveCredit(args: {
@@ -2001,13 +2060,29 @@ export function summarizePostOnsetLiveCredit(args: {
     optionsDaily: number;
     stockDaily: number;
     closingEquity: number | null;
+    /**
+     * TRA-3288 — `closingEquityBasis` off the row. Absent/`null` reads as NOT
+     * broker-sourced; see the surface gate below.
+     */
+    closingEquityBasis?: string | null;
   }>;
   liveOptionsOnsetDate: string | null;
   /** `null` = there was no journal to ask, which is NOT a zero numerator. */
   journalClosesByDate: ReadonlyMap<string, JournalDayCloses> | null;
   calendar: EodTailCalendar | null;
+  /**
+   * TRA-3288 — the book's read-time mode (`stockModeKey`: 'demo' | 'live' |
+   * 'sandbox'). REQUIRED, not defaulted, because this is the operand that arms
+   * the surface gate and a caller that could silently omit it would ship a
+   * live book graded on demo anchors — the defect this gate exists to refuse.
+   * `null` means "mode unknown", which does NOT arm the gate: arming it on
+   * unknown would put every demo book (whose rows will never carry a broker
+   * basis) into permanent NOT MEASURED the moment a caller loses the mode.
+   * The production caller passes the TRA-2761-hardened `loadSettings` mode.
+   */
+  bookMode: string | null;
 }): PostOnsetLiveCredit {
-  const { rows, liveOptionsOnsetDate: onset, journalClosesByDate: census, calendar } = args;
+  const { rows, liveOptionsOnsetDate: onset, journalClosesByDate: census, calendar, bookMode } = args;
   const base: PostOnsetLiveCredit = {
     onsetDate: onset,
     journalCensusAvailable: census != null,
@@ -2016,6 +2091,8 @@ export function summarizePostOnsetLiveCredit(args: {
     leftAnchorEquity: null,
     rightAnchorDate: null,
     rightAnchorEquity: null,
+    leftAnchorEquityBasis: null,
+    rightAnchorEquityBasis: null,
     windowSessions: null,
     windowRowDates: [],
     absentSessions: null,
@@ -2053,8 +2130,24 @@ export function summarizePostOnsetLiveCredit(args: {
     leftAnchorEquity: round2(left.closingEquity as number),
     rightAnchorDate: right.date,
     rightAnchorEquity: round2(right.closingEquity as number),
+    leftAnchorEquityBasis: left.closingEquityBasis ?? null,
+    rightAnchorEquityBasis: right.closingEquityBasis ?? null,
     equityGrowthUsd: round2((right.closingEquity as number) - (left.closingEquity as number)),
   };
+  // TRA-3288 — THE SURFACE GATE, armed here (the moment the anchors exist) and
+  // returned below with precedence over BOTH calendar availability and the
+  // absence gate. On a live book the recorded rows' `closingEquity` is the
+  // preserved DEMO paper book — a constant that no live fill or option credit
+  // can move — so an equity delta over non-broker anchors grades broker-journal
+  // dollars against demo-book dollars no matter how hole-free the window is.
+  // The check is an allow-list on the ONE broker value, never a deny-list:
+  // absent, `'engine-paper-account'`, `'not-measured'` and every future
+  // non-broker basis all fail it closed. The return sits AFTER the journal
+  // computation so the numerator (TRA-2919's attribution axis) stays published
+  // for a gated book — the gate kills the COMPARISON, not the attribution.
+  const anchorsNotBrokerSourced = bookMode === 'live'
+    && !(left.closingEquityBasis === CLOSING_EQUITY_BASIS_BROKER
+      && right.closingEquityBasis === CLOSING_EQUITY_BASIS_BROKER);
   // A date contributes to the window iff it is strictly after the left anchor
   // (telescoping: the anchor's own session landed in a delta whose left endpoint
   // is outside the series), at or after the onset (attribution: nothing pre-onset
@@ -2103,7 +2196,16 @@ export function summarizePostOnsetLiveCredit(args: {
       };
     }),
   };
-  if (calendar == null) return { ...withJournal, notMeasuredReason: 'no-session-calendar' };
+  if (calendar == null) {
+    // TRA-3288 — even with no calendar the surface verdict is already known,
+    // and it is the more fundamental disqualifier: a calendar can be supplied
+    // later, at which point a live book on demo anchors must NOT degrade to
+    // the self-clearing absence reason on its way to a publish.
+    if (anchorsNotBrokerSourced) {
+      return { ...withJournal, notMeasuredReason: 'equity-anchor-not-broker-sourced' };
+    }
+    return { ...withJournal, notMeasuredReason: 'no-session-calendar' };
+  }
   const expected = sessionsInRange(left.date, right.date, calendar.isMarketDay)
     .filter(d => d > left.date);
   const present = new Set(windowRowDates);
@@ -2113,6 +2215,17 @@ export function summarizePostOnsetLiveCredit(args: {
     windowSessions: expected.length,
     absentSessions,
   };
+  // TRA-3288 — surface gate BEFORE the absence gate, deliberately. The absence
+  // check below is a HOLE gate: it clears itself the moment a window has full
+  // rows, which is precisely the v0nni geometry (first live close ⇒ a
+  // one-session window with one row ⇒ `absentSessions: []` ⇒ the whole journal
+  // numerator publishes as uncredited live money on the next 21:00 ET
+  // archive). A gate that happens to be closed is not a gate, so the published
+  // reason must name the real disqualifier. `absentSessions` is still computed
+  // and published above — the ORDER of the reasons changes, not the evidence.
+  if (anchorsNotBrokerSourced) {
+    return { ...measured, notMeasuredReason: 'equity-anchor-not-broker-sourced' };
+  }
   if (absentSessions.length > 0) {
     return { ...measured, notMeasuredReason: 'equity-anchor-spans-absent-session' };
   }
@@ -2154,6 +2267,14 @@ export function reconcilePnl(
   // to the whole numerator, which reads as "none of this is provably live" —
   // the safe direction. There is no default that fabricates a clean attribution.
   liveOptionsOnsetDate: string | null = null,
+  // TRA-3288 — the book's read-time mode, for the post-onset SURFACE GATE.
+  // Optional so every existing caller keeps compiling, and `null` (= unknown)
+  // does NOT arm the gate — arming on unknown would send every demo book
+  // permanently NOT MEASURED (demo rows never carry a broker basis). That makes
+  // omission fail-OPEN on a live book, so the production endpoint passes the
+  // TRA-2761-hardened `loadSettings` mode; see `summarizePostOnsetLiveCredit`,
+  // where the same field is deliberately REQUIRED.
+  bookMode: string | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -2257,6 +2378,13 @@ export function reconcilePnl(
         closingEquity:
           s.closingEquity !== null && Number.isFinite(s.closingEquity)
             ? round2(s.closingEquity)
+            : null,
+        // TRA-3288 — the provenance travels WITH the number it qualifies.
+        // Absent/empty passes through as `null` (NOT MEASURED, which downstream
+        // must read as not-broker), the same rule `openingEquityBasis` follows.
+        closingEquityBasis:
+          typeof s.closingEquityBasis === 'string' && s.closingEquityBasis !== ''
+            ? s.closingEquityBasis
             : null,
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
@@ -2741,6 +2869,7 @@ export function reconcilePnl(
     liveOptionsOnsetDate,
     journalClosesByDate,
     calendar: tailCalendar,
+    bookMode,
   });
 
   return {
