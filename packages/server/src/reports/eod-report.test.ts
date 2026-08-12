@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 import { annotateReportProvenance } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
@@ -9,6 +9,73 @@ import {
   type EodMover, type OptionPosition, type Position, type CorporateAction,
 } from '@trading-app/shared';
 import type { OptionTradeJournalSummary } from '../option-trade-journal.js';
+
+// ── TRA-2694 — CAPTURE the level-continuity census ───────────────────────────
+//
+// The census (`log.info('top-movers level-continuity census', …)` in
+// `eod-report.ts`) is the SOLE disclosed mitigation for the continuity check's
+// coverage limit, and until this seam existed nothing in the repo referenced it:
+// deleting the emitter outright left the whole server suite's failing-file set
+// byte-identical (measured, TRA-2694).
+//
+// Captured as an OBJECT, not as a stdout line. Two reasons this is a mock and
+// not a `vi.spyOn`: `log` is bound at module load (`logger.child({module})`), so
+// a post-import spy can never reach the object the module actually calls; and a
+// stdout scrape would re-rot on the next serialization change. `vi.hoisted` is
+// required because `vi.mock` is hoisted above every other statement here.
+//
+// ⭐ It is a TEE, not a replacement. The TRA-3387 block at the bottom of this file
+// captures its own census by spying on `process.stdout.write`, so a logger mock
+// that swallowed the record would starve it — which is exactly what happened, and
+// what that block's POSITIVE CONTROL caught. Every record is forwarded to the real
+// logger with its real bindings, so the byte stream is what it would be unmocked.
+const { logCalls } = vi.hoisted(() => ({
+  logCalls: [] as { level: string; msg: string; fields: Record<string, unknown> }[],
+}));
+
+vi.mock('../observability/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../observability/index.js')>();
+  // `...actual` is deliberate: this file's module graph reaches observability for
+  // far more than the logger, and a logger-only factory would break those.
+  type Rec = Record<string, unknown>;
+  const make = (bindings: Rec, real: typeof actual.logger): typeof actual.logger => {
+    const at = (level: 'debug' | 'info' | 'warn' | 'error') => (msg: string, fields?: Rec) => {
+      logCalls.push({ level, msg, fields: { ...bindings, ...(fields ?? {}) } });
+      real[level](msg, fields);          // ← pass through, unchanged
+    };
+    return {
+      debug: at('debug'), info: at('info'), warn: at('warn'), error: at('error'),
+      child: (extra: Rec) => make({ ...bindings, ...extra }, real.child(extra)),
+    };
+  };
+  return { ...actual, logger: make({}, actual.logger) };
+});
+
+/** The shape asserted below — the census payload, field for field. */
+type CensusPayload = {
+  candidates: number;
+  graded: number;
+  abstained: number;
+  suspect: number;
+  consistent: number;
+  abstainReasons: Record<string, number>;
+  priorRowsAvailable: number;
+};
+
+/** Every census payload emitted since the current test began, in emission order. */
+const censusEmissions = (): CensusPayload[] =>
+  logCalls
+    .filter(c => c.msg === 'top-movers level-continuity census')
+    .map(c => c.fields as unknown as CensusPayload);
+
+/** The census from a single `generateEodReport` call — fails loudly if none was emitted. */
+const soleCensus = (): CensusPayload => {
+  const all = censusEmissions();
+  expect(all).toHaveLength(1);
+  return all[0]!;
+};
+
+beforeEach(() => { logCalls.length = 0; });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -902,6 +969,16 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
     const day1 = row('FGMC', 8.30, 69.04276985743381);
     const report = reportFor([day1, ...GENUINE], [{ symbol: 'SOXL', price: 109.54, changePct: -3.1 }]);
     expect(report.top5Movers[0].symbol).toBe('FGMC');
+
+    // TRA-2694 — the second half of the title, which the body used to leave
+    // unasserted. SOXL is the ONLY symbol with a prior row, so `graded === 1`
+    // plus `no_prior_observation === 4` says exactly one thing about FGMC: the
+    // instrument ABSTAINED on it. #1 is ranked on an ungradeable row, and the
+    // census says so out loud.
+    const census = soleCensus();
+    expect(census.graded).toBe(1);
+    expect(census.abstained).toBe(4);
+    expect(census.abstainReasons['no_prior_observation']).toBe(4);
   });
 
   // ── TRA-3068 — ACCEPTANCE at the REPORT BOUNDARY ───────────────────────────
@@ -1076,6 +1153,100 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
     ];
     const report = reportFor(GENUINE, prior);
     expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
+  });
+
+  // ── TRA-2694 — THE CENSUS IS THE CONTROL, so the census gets asserted ───────
+  //
+  // Nested here to reuse the SAME `row`/`GENUINE`/`reportFor` harness the checks
+  // above are graded against. What these assert is not the exclusion decision —
+  // that is covered above — but the DISCLOSURE of how much of the table the
+  // instrument could not reach. Measured across 705 published mover rows, only
+  // 8.1% are gradeable at this boundary, so "excluded 0" is nearly always a
+  // statement about coverage, and the census is the only thing that says which.
+  //
+  // Every assertion in this block dies if the `log.info` census emitter is
+  // deleted — that mutation is the acceptance for TRA-2694, not a green suite.
+  describe('TRA-2694 — the abstain census, asserted rather than assumed', () => {
+    it('reports a known mix field for field', () => {
+      // VEEE is the graded-SUSPECT leg (implied prev close 26.59 vs a published
+      // 38.51). SOXL and IREN reproduce their published prior closes, so they are
+      // graded CONSISTENT. AXTI and ONDS have no prior row at all and can only be
+      // abstained on. One table, all three verdicts, exact counts.
+      const veee = row('VEEE', 36.18, 36.07);
+      const report = reportFor([veee, ...GENUINE], [
+        { symbol: 'VEEE', price: 38.51, changePct: 54.91 },
+        { symbol: 'SOXL', price: 109.54, changePct: -3.1 },
+        { symbol: 'IREN', price: 33.93, changePct: 2.0 },
+      ]);
+      expect(report.top5Movers.map(m => m.symbol)).not.toContain('VEEE');
+
+      const census = soleCensus();
+      expect(census.priorRowsAvailable).toBe(3);
+      expect(census.candidates).toBe(5);
+      expect(census.graded).toBe(3);
+      expect(census.suspect).toBe(1);
+      expect(census.consistent).toBe(2);
+      expect(census.abstained).toBe(2);
+      // `toEqual` on the whole map, not a lookup: a NEW abstain reason silently
+      // appearing is exactly the drift this is here to catch.
+      expect(census.abstainReasons).toEqual({ no_prior_observation: 2 });
+    });
+
+    it('holds the two identities on every emission, on every shape of table', () => {
+      // The arithmetic that makes the number readable. If a future refactor drops
+      // a row on the floor between the branches — an early `continue`, a filter
+      // moved above the loop — the totals stop adding up, and nothing else in the
+      // suite would notice. Asserted over four DIFFERENT tables, including the
+      // no-prior-artifact degenerate case.
+      const veee = row('VEEE', 36.18, 36.07);
+      reportFor([veee, ...GENUINE], [{ symbol: 'VEEE', price: 38.51, changePct: 54.91 }]);
+      reportFor(GENUINE, [{ symbol: 'SOXL', price: 109.54, changePct: -3.1 }]);
+      reportFor(GENUINE, []);
+      reportFor(GENUINE);
+
+      // One census PER RUN — the emitter is unconditional, not gated on something
+      // having been excluded. A census that only fires on a dirty table cannot
+      // disclose the coverage of a clean one.
+      const all = censusEmissions();
+      expect(all).toHaveLength(4);
+      for (const c of all) {
+        expect(c.graded + c.abstained).toBe(c.candidates);
+        expect(c.suspect + c.consistent).toBe(c.graded);
+        // and the reasons account for every abstain, one bucket each
+        expect(Object.values(c.abstainReasons).reduce((a, b) => a + b, 0)).toBe(c.abstained);
+      }
+    });
+
+    it('says 100% UNGRADEABLE when a prior artifact exists but reaches nothing', () => {
+      // The scenario the code comment beside the census is written about: the
+      // table is excluded 0, every row ranks, and the ONLY thing distinguishing
+      // that from a table that was checked and cleared is this payload.
+      const fgmcDay1 = row('FGMC', 8.30, 69.04276985743381);
+      const report = reportFor([fgmcDay1, ...GENUINE],
+        [{ symbol: 'NVDA', price: 100, changePct: 1.0 }]);   // a real prior file, disjoint from the board
+
+      const census = soleCensus();
+      expect(census.priorRowsAvailable).toBe(1);       // the file was READ — this is not a missing-file abstain
+      expect(census.candidates).toBe(5);
+      expect(census.graded).toBe(0);
+      expect(census.abstained).toBe(census.candidates);
+      expect(census.abstainReasons['no_prior_observation']).toBe(census.candidates);
+      // ⭐ the pairing that is the whole point: nothing excluded, nothing graded.
+      expect(report.top5Movers).toHaveLength(5);
+    });
+
+    it('says 100% UNGRADEABLE with no prior artifact at all', () => {
+      // Day 1 of a bucket / a missed 21:00 tick. Same verdict, and it must not be
+      // reported as a clean read either.
+      const report = reportFor([row('FGMC', 8.30, 69.04276985743381), ...GENUINE]);
+      const census = soleCensus();
+      expect(census.priorRowsAvailable).toBe(0);
+      expect(census.candidates).toBe(5);
+      expect(census.graded).toBe(0);
+      expect(census.abstained).toBe(5);
+      expect(census.abstainReasons['no_prior_observation']).toBe(5);
+      expect(report.top5Movers).toHaveLength(5);
+    });
   });
 });
 
