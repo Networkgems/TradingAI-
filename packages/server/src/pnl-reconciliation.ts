@@ -530,6 +530,13 @@ export interface PnlReconcileDay {
    */
   closingEquityBasis: string | null;
   /**
+   * TRA-3288 item 2 — signed broker cash flow over the span this row's equity
+   * delta covers (see {@link DailySnapshot.netCashFlowUsd}). `null` is NOT
+   * MEASURED — never 0 — and the post-onset credit window fails closed on it:
+   * a deposit inside the window would otherwise read as uncredited P&L.
+   */
+  netCashFlowUsd: number | null;
+  /**
    * TRA-2635 — `PaperAccount.getOptionsCredited()` as of this row: cumulative
    * realized option P&L this book's EQUITY has absorbed (see
    * {@link DailySnapshot.optionsCreditedCumulative}).
@@ -1898,7 +1905,16 @@ export type PostOnsetCreditNotMeasuredReason =
    */
   | 'equity-anchor-not-broker-sourced'
   /** THE AC2 ARM — an expected session inside the anchor window has no ledger row. */
-  | 'equity-anchor-spans-absent-session';
+  | 'equity-anchor-spans-absent-session'
+  /**
+   * TRA-3288 item 2 — the anchors are broker-sourced and the window has no
+   * hole, but some window row's `netCashFlowUsd` is NOT MEASURED. A broker
+   * equity delta contains deposits/withdrawals, so subtracting an assumed-zero
+   * flow would book a deposit inside the window as uncredited P&L (or a
+   * withdrawal as credited). Live books only — a demo book's paper delta has
+   * no external flows to net.
+   */
+  | 'cash-flow-not-measured';
 
 /** TRA-2919 — the post-onset live-credit measurement for ONE book. */
 export interface PostOnsetLiveCredit {
@@ -1953,11 +1969,24 @@ export interface PostOnsetLiveCredit {
   stockDailyUsd: number | null;
   equityGrowthUsd: number | null;
   /**
+   * TRA-3288 item 2 — Σ `netCashFlowUsd` over the window rows, i.e. the broker
+   * cash flow the equity delta absorbed that is NOT P&L. Computed (and
+   * required) only on the live broker-anchored path; `null` elsewhere and
+   * whenever any window row's flow is NOT MEASURED — in which case the
+   * comparison is refused with `cash-flow-not-measured` rather than assuming 0.
+   */
+  windowNetCashFlowUsd: number | null;
+  /**
    * THE COMPARISON: `journalOptionsUsd + stockDailyUsd − equityGrowthUsd`, i.e.
    * how much post-onset LIVE realized P&L never reached NAV. `null` whenever
    * {@link notMeasuredReason} is set — in particular whenever the equity anchor
    * spans a session with no row, because the equity leg is then missing exactly
    * the window the numerator covers and the subtraction is meaningless.
+   *
+   * TRA-3288 item 2 — on the live broker-anchored path the equity term is
+   * netted of {@link windowNetCashFlowUsd} first
+   * (`journal + stock − (equityGrowth − flow)`), and the comparison is refused
+   * outright when any window flow is unmeasured.
    */
   uncreditedOptionsUsd: number | null;
   notMeasuredReason: PostOnsetCreditNotMeasuredReason | null;
@@ -2065,6 +2094,11 @@ export function summarizePostOnsetLiveCredit(args: {
      * broker-sourced; see the surface gate below.
      */
     closingEquityBasis?: string | null;
+    /**
+     * TRA-3288 item 2 — the row's broker cash flow. Absent/`null` reads NOT
+     * MEASURED and refuses the live comparison (`cash-flow-not-measured`).
+     */
+    netCashFlowUsd?: number | null;
   }>;
   liveOptionsOnsetDate: string | null;
   /** `null` = there was no journal to ask, which is NOT a zero numerator. */
@@ -2100,6 +2134,7 @@ export function summarizePostOnsetLiveCredit(args: {
     dayCellOptionsUsd: null,
     stockDailyUsd: null,
     equityGrowthUsd: null,
+    windowNetCashFlowUsd: null,
     uncreditedOptionsUsd: null,
     notMeasuredReason: null,
     legs: [],
@@ -2229,6 +2264,34 @@ export function summarizePostOnsetLiveCredit(args: {
   if (absentSessions.length > 0) {
     return { ...measured, notMeasuredReason: 'equity-anchor-spans-absent-session' };
   }
+  // TRA-3288 item 2 — THE CASH-FLOW LEG, live books only. Reached only past
+  // the surface gate, so both anchors are broker-sourced and the equity delta
+  // is a broker delta — which contains deposits and withdrawals. Each broker
+  // row carries `netCashFlowUsd` over the span its own equity delta covers,
+  // and with a hole-free window those spans tile `(leftAnchor, rightAnchor]`
+  // exactly (a row whose broker balance was unmeasured breaks the tiling, but
+  // such a row cannot be inside this path: its flow is null and fails here
+  // first). ANY unmeasured flow refuses the comparison — 0 is an assumption, a
+  // deposit read as uncredited P&L — and the sum is published beside the raw
+  // growth so a reader can re-derive the netting.
+  if (bookMode === 'live') {
+    const flows = windowRows.map(d =>
+      typeof d.netCashFlowUsd === 'number' && Number.isFinite(d.netCashFlowUsd)
+        ? d.netCashFlowUsd
+        : null);
+    if (flows.some(f => f === null)) {
+      return { ...measured, notMeasuredReason: 'cash-flow-not-measured' };
+    }
+    const windowNetCashFlowUsd = round2(flows.reduce<number>((s, f) => s + (f as number), 0));
+    return {
+      ...measured,
+      windowNetCashFlowUsd,
+      uncreditedOptionsUsd: round2(
+        journalUsd + (measured.stockDailyUsd ?? 0)
+        - ((measured.equityGrowthUsd ?? 0) - windowNetCashFlowUsd),
+      ),
+    };
+  }
   return {
     ...measured,
     uncreditedOptionsUsd: round2(
@@ -2298,7 +2361,21 @@ export function reconcilePnl(
         : null;
       // TRA-2637 — ABSENT stays null. `0` here made a session with no EOD report
       // read bit-identical to a session that reconciled to the cent.
-      const drift = eodCombined == null ? null : round2(eodCombined - (stockDaily + optionsDaily));
+      // TRA-3288 item 2 — the drift identity is NOT CLAIMABLE on a broker-shaped
+      // row. `drift` grades `eodCombined == stockDaily + optionsDaily`, a
+      // decomposition of the ENGINE book; a live broker row deliberately books
+      // `dailyPnl: 0` (stock leg made falsifiable via `stockLegProbeUsd`, not
+      // measured) and carries the broker day P&L in `combinedPnl`, so the legs
+      // do not — and must not — sum to the broker figure. Grading it would flag
+      // every live session as an offender for agreeing with the broker. `null`
+      // here is NOT MEASURED (the same value an absent report reads), never a
+      // pass, and the row's `closingEquityBasis` says why.
+      const rowBrokerShaped =
+        typeof s.closingEquityBasis === 'string'
+        && s.closingEquityBasis === CLOSING_EQUITY_BASIS_BROKER;
+      const drift = eodCombined == null || rowBrokerShaped
+        ? null
+        : round2(eodCombined - (stockDaily + optionsDaily));
       const belowBaseline = baselineDate != null && s.date < baselineDate;
       // TRA-2302 — a day is only claimed as a FALSE zero when a census exists
       // for this book AND it names closes the day-only ledger did not receive.
@@ -2385,6 +2462,13 @@ export function reconcilePnl(
         closingEquityBasis:
           typeof s.closingEquityBasis === 'string' && s.closingEquityBasis !== ''
             ? s.closingEquityBasis
+            : null,
+        // TRA-3288 item 2 — absent reads `null` (NOT MEASURED), the same rule
+        // as every other flow-through here. `round2(null)` would be 0, and an
+        // assumed-zero cash flow books a deposit as P&L.
+        netCashFlowUsd:
+          typeof s.netCashFlowUsd === 'number' && Number.isFinite(s.netCashFlowUsd)
+            ? round2(s.netCashFlowUsd)
             : null,
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
@@ -2517,6 +2601,17 @@ export function reconcilePnl(
     const prevEquity = prev.closingEquity;
     if (curEquity === null || prevEquity === null) continue;
     if (!Number.isFinite(curEquity) || !Number.isFinite(prevEquity)) continue;
+    // TRA-3288 item 2 — the frozen-counter axis is a PAPER-book instrument:
+    // its subtrahends (`stockDaily`, the TRA-2323 credit counter) live on the
+    // PaperAccount, so an equity endpoint sourced from the BROKER makes `move`
+    // a cross-surface difference — every real broker day move would read as an
+    // "unbooked" paper credit and the pool (journal money) would happily fund
+    // the accusation, nightly, on every live book. Both fields stay `null`
+    // (NOT MEASURED, the TRA-2926 discipline: absence of a grade, never a
+    // pass), and the pool is not charged — the broker move never entered the
+    // paper book this pool models.
+    if (cur.closingEquityBasis === CLOSING_EQUITY_BASIS_BROKER
+      || prev.closingEquityBasis === CLOSING_EQUITY_BASIS_BROKER) continue;
     const recorded = cur.optionsCreditedInWindow ?? 0;
     const move = round2((curEquity - prevEquity) - cur.stockDaily - recorded);
     cur.unbookedEquityMoveUsd = move;

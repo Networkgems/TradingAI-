@@ -60,6 +60,8 @@ import {
   planLiveEodRowBackfill,
   isEodRowBackfillArmed,
   EOD_BACKFILL_ROW_SOURCE,
+  // TRA-3288 item 2 — the live recorded-row broker shape.
+  shapeLiveRecordedRow,
 } from './eod-row-backfill.js';
 // TRA-3288 — the recorded-row writer stamps WHICH surface it writes.
 import { CLOSING_EQUITY_BASIS_ENGINE_PAPER } from './pnl-tracker.js';
@@ -1827,6 +1829,12 @@ async function generateAndSaveReport(
   // so the Live calendar mirrors what the user sees on the broker. The
   // engine view of realized / unrealized / options is left intact for
   // diagnostic context — a markdown header documents the override.
+  //
+  // TRA-3288 item 2 — the override is HOISTED so the ledger-row writer below
+  // can book the SAME broker figures the report just did. Null = the broker
+  // delta/flow were not measurable this run, and the row must say so rather
+  // than assume anything.
+  let tradierLiveOverride: Awaited<ReturnType<typeof reconcileTradierLiveCalendar>> = null;
   if (settings.mode === 'live' && !backfill) {
     try {
       const todayBalance = finalSnapshot.state.account.totalEquity;
@@ -1845,6 +1853,7 @@ async function generateAndSaveReport(
         },
       );
       if (override) {
+        tradierLiveOverride = override;
         finalReport = applyTradierBalanceOverride(finalReport, override, todayBalance);
       } else {
         // TRA-3102 — the override returning null is the moment this defect is
@@ -2038,6 +2047,22 @@ async function generateAndSaveReport(
   // live daily-P&L baseline.
   if (!backfill) {
     const equitySnap = ctx.engine.getEquitySnapshot();
+    // TRA-3288 item 2 — on a LIVE book the row's equity/stock/cash fields come
+    // from the BROKER (the same balance file + cash-flow figure the TRA-359
+    // report override just used, same tick), shaped by `shapeLiveRecordedRow`.
+    // The PaperAccount is never a fallback: an absent balance entry writes an
+    // honest `null` + 'not-measured'. Demo/sandbox rows are byte-identical to
+    // before. FORWARD ONLY — this shapes the row being written tonight; no
+    // historical row is restated (TRA-2886/TRA-2888 refusal stands,
+    // ENABLE_EOD_ROW_BACKFILL stays false).
+    const liveRowShape = settings.mode === 'live'
+      ? shapeLiveRecordedRow({
+        date: finalReport.date,
+        optionsDailyPnl: finalReport.optionsPnl,
+        balanceByDate: await loadTradierBalanceSnapshots(ctx, 'production'),
+        override: tradierLiveOverride,
+      })
+      : null;
     // TRA-2323 — realized option P&L now lands in `PaperAccount` equity (that is
     // the whole fix: "Total Value" has to compound). `dailyPnl` below is the
     // equity delta, so WITHOUT this subtraction the options leg would be counted
@@ -2059,16 +2084,18 @@ async function generateAndSaveReport(
       openingEquity: ctx.tracker.getOpeningEquity(),
       closingEquity: equitySnap.equity,
       // TRA-3288 — name the surface this writer ACTUALLY writes: the engine's
-      // PaperAccount, i.e. the demo paper book — stamped unconditionally
-      // because that is what `getEquitySnapshot()` returns in every mode. On a
-      // `mode: live` book this number is the PRESERVED demo state (live fills
-      // and live option credits are both refused entry by design), so without
-      // the stamp a demo-book live row and a broker-sourced back-filled row
-      // are indistinguishable at the read site — which is how `postOnsetCredit`
+      // PaperAccount, i.e. the demo paper book — that is what
+      // `getEquitySnapshot()` returns in every mode. On a `mode: live` book
+      // this number is the PRESERVED demo state (live fills and live option
+      // credits are both refused entry by design), so without the stamp a
+      // demo-book live row and a broker-sourced back-filled row are
+      // indistinguishable at the read site — which is how `postOnsetCredit`
       // came to grade broker-journal dollars against demo-book dollars. The
       // TRA-3288 surface gate refuses a live comparison on any anchor that
       // does not carry the broker basis, and this stamp is what makes that
       // refusal name the right surface instead of relying on field absence.
+      // (Item 2: on a live book `liveRowShape` below OVERRIDES this pair with
+      // the broker figures — this paper stamp is the demo/sandbox truth.)
       closingEquityBasis: CLOSING_EQUITY_BASIS_ENGINE_PAPER,
       dailyPnl: stockOnlyDailyPnl,
       optionsPnl: equitySnap.optionsPnl,
@@ -2111,7 +2138,18 @@ async function generateAndSaveReport(
       // second number in the same change and make neither correction readable.
       combinedPnl: stockOnlyDailyPnl + equitySnap.optionsPnl,
       trades: finalSnapshot.allClosedPositions.length,
-    });
+      // TRA-3288 item 2 — spread LAST so on a live book the broker-shaped
+      // fields (opening/closing equity + bases, zero-booked stock leg + probe,
+      // broker combinedPnl, cash flow) override the paper fields above. `{}`
+      // on demo/sandbox: those rows are byte-identical to before this ticket.
+      ...(liveRowShape ?? {}),
+    }, liveRowShape
+      // The dashboard-rebase anchor stays on the PAPER equity: live mode
+      // preserves the demo state for a later switch back, and rebasing the
+      // demo baseline to a broker number would manufacture a phantom
+      // (paper − broker) stock leg on the next write. See `saveSnapshot`.
+      ? { dashboardAnchorEquity: equitySnap.equity }
+      : undefined);
   }
 
   log.info(`EOD report ${backfill ? 'backfilled' : 'saved'}`, {

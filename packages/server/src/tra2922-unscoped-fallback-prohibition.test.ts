@@ -128,6 +128,7 @@ describe('TRA-2922 — the suspended figure must not be readable under a second 
           dayCellOptionsUsd: -426,
           stockDailyUsd: null,
           equityGrowthUsd: null,
+          windowNetCashFlowUsd: null,
           uncreditedOptionsUsd: null,
           notMeasuredReason: 'equity-anchor-spans-absent-session',
           legs: [],

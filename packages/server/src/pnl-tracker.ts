@@ -23,6 +23,17 @@ export const CLOSING_EQUITY_BASIS_NOT_MEASURED = 'not-measured';
  * without inferring it from the row's age or the field's absence.
  */
 export const CLOSING_EQUITY_BASIS_ENGINE_PAPER = 'engine-paper-account';
+/**
+ * TRA-3288 item 2 — `openingEquityBasis` on a live BROKER-shaped recorded row:
+ * the opening anchor is the PREVIOUS broker balance entry from
+ * `tradier-eod-balance.<env>.json`, so the row telescopes on the broker
+ * surface, not the paper one. Deliberately a value the TRA-3043 demo-anchor
+ * vocabulary cannot produce: it must never read as `verified-prior-session-close`
+ * (nothing verified the PAPER anchor here) and `stampAnchorBasis` must not
+ * overwrite it with the paper anchor's provenance (it returns early on any
+ * present value).
+ */
+export const OPENING_EQUITY_BASIS_BROKER_PREV = 'broker-prev-eod-balance';
 
 export interface DailySnapshot {
   date: string;
@@ -123,6 +134,12 @@ export interface DailySnapshot {
    *    anchor on, so the anchor came from `state.equity` (TRA-241).
    *  - `rebase` — `syncOpeningEquity` deliberately moved the anchor off the
    *    prior close (starting-balance edit / mode switch / forced reset, TRA-138).
+   *  - `broker-prev-eod-balance` ({@link OPENING_EQUITY_BASIS_BROKER_PREV}) —
+   *    TRA-3288: a live BROKER-shaped row whose opening anchor is the previous
+   *    `tradier-eod-balance` entry, NOT the paper anchor this vocabulary
+   *    otherwise describes. Written by the row shaper, so `stampAnchorBasis`
+   *    (which yields to any present value) can never claim the paper anchor's
+   *    provenance for a broker number.
    *
    * ABSENT means NOT MEASURED, and it is load-bearing in two distinct cases that
    * must not be read as a verdict: a row written by any pre-TRA-3043 build, and
@@ -214,6 +231,17 @@ export interface DailySnapshot {
    * reconstruction, and without it "the stock leg was inert" is unfalsifiable.
    */
   stockLegProbeUsd?: number | null;
+  /**
+   * TRA-3288 item 2 — signed broker cash flow (deposits − withdrawals +
+   * dividends − fees, from `tradier-cash-flow.<env>.json`) over the span this
+   * row's equity delta covers: `(openingEquity's anchor date, date]`. Written
+   * on live BROKER-shaped recorded rows only, and only when the TRA-359 cash
+   * event fetch actually succeeded this run — `null` means NOT MEASURED, and a
+   * consumer must fail its window closed rather than assume 0: a deposit
+   * inside the window would otherwise read as uncredited P&L. Absent on demo
+   * rows and on every row written before this ticket.
+   */
+  netCashFlowUsd?: number | null;
   trades: number;
 }
 
@@ -610,7 +638,19 @@ export class PnlTracker {
     return { ...snapshot, openingEquityBasis: basis };
   }
 
-  saveSnapshot(snapshot: DailySnapshot): void {
+  saveSnapshot(
+    snapshot: DailySnapshot,
+    // TRA-3288 item 2 — the dashboard-rebase anchor, SEPARATED from the row's
+    // `closingEquity`. A live broker-shaped row carries the BROKER close, but
+    // the state anchor below is a PAPER-book instrument: it feeds
+    // `getOpeningEquity()` → `stockOnlyDailyPnl` and the demo dashboard
+    // baseline that live mode deliberately preserves for a later switch back.
+    // Rebasing it to a broker number would manufacture a (paper − broker)
+    // phantom stock leg on the very next write. A caller writing a broker row
+    // passes the paper equity here; omitting the option keeps the historical
+    // behaviour (rebase to the row's own close).
+    opts?: { dashboardAnchorEquity?: number | null },
+  ): void {
     this.snapshots = this.snapshots.filter(s => s.date !== snapshot.date);
     this.snapshots.push(this.stampAnchorBasis(snapshot));
     this.snapshots.sort((a, b) => a.date.localeCompare(b.date));
@@ -621,13 +661,25 @@ export class PnlTracker {
     // that if some future caller ever hands `saveSnapshot` an unmeasured row,
     // the dashboard's opening equity is LEFT ALONE rather than rebased to
     // `null` — which would read as $0 and manufacture a book-sized phantom P&L.
-    if (snapshot.closingEquity !== null && Number.isFinite(snapshot.closingEquity)) {
-      this.state.openingEquity = snapshot.closingEquity;
+    // TRA-3288 — same guard, same reason, for the explicit anchor: an
+    // unmeasured override leaves the state alone, never rebases to null/NaN.
+    const rebaseTo = opts && 'dashboardAnchorEquity' in opts
+      ? opts.dashboardAnchorEquity
+      : snapshot.closingEquity;
+    if (rebaseTo !== null && rebaseTo !== undefined && Number.isFinite(rebaseTo)) {
+      this.state.openingEquity = rebaseTo;
       this.state.openingOptionsPnl = this.state.optionsPnl;
       this.state.openingDate = snapshot.date;
       // TRA-3039 — this pair (`openingEquity` = the close, `openingDate` = the
       // session that closed) is exactly what `advanceDayIfNeeded` must now
       // PRESERVE rather than overwrite from `state.equity`.
+      //
+      // TRA-3288 — on a live book the row's close is now broker-sourced while
+      // this anchor stays paper, so `anchorIsPriorSessionClose()` reads false
+      // at the next day roll and the roll takes the `day-roll-state-equity`
+      // branch. That is numerically identical on a live book (the paper equity
+      // is frozen, so `state.equity === state.openingEquity`) and the label is
+      // honest: nothing can verify a PAPER anchor against a BROKER ledger row.
       this.state.openingEquityBasis = 'prior-session-close';
       this.persistState();
     }

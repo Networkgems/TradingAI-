@@ -1,5 +1,9 @@
 import type { DailySnapshot } from './pnl-tracker.js';
-import { CLOSING_EQUITY_BASIS_BROKER, CLOSING_EQUITY_BASIS_NOT_MEASURED } from './pnl-tracker.js';
+import {
+  CLOSING_EQUITY_BASIS_BROKER,
+  CLOSING_EQUITY_BASIS_NOT_MEASURED,
+  OPENING_EQUITY_BASIS_BROKER_PREV,
+} from './pnl-tracker.js';
 import type { EodTailCalendar, JournalDayCloses } from './pnl-reconciliation.js';
 import { staleTailSessions } from './pnl-reconciliation.js';
 
@@ -355,6 +359,118 @@ export function planLiveEodRowBackfill(args: {
 /** Is this row a reconstruction rather than a recorded 21:00 ET archive write? */
 export function isBackfilledRow(row: Pick<DailySnapshot, 'rowSource'>): boolean {
   return row.rowSource === EOD_BACKFILL_ROW_SOURCE;
+}
+
+/**
+ * TRA-3288 item 2 — the equity/stock/cash fields of a live RECORDED row,
+ * re-sourced from the broker.
+ *
+ * The 21:00 ET archive previously wrote `PaperAccount.getState().totalEquity`
+ * into `closingEquity` unconditionally — on a `mode: live` book that is the
+ * preserved DEMO seed, a constant no live fill or option credit can move, so
+ * the live report (TRA-359 broker override) and the live ledger row disagreed
+ * about the same book on the same day BY CONSTRUCTION. This shaper makes the
+ * row agree with the report: same balance file, same cash-flow figure, same
+ * arithmetic, on the same tick.
+ *
+ * Not a field substitution — the whole row shape moves together, reusing the
+ * TRA-2829 back-fill vocabulary rather than inventing a second one:
+ *
+ *  - `closingEquity` = the `tradier-eod-balance` entry for this session;
+ *    `null` + `'not-measured'` when the entry is absent. NEVER the
+ *    PaperAccount — a silent fallback would re-create the TRA-3288 defect
+ *    with a basis field that then lies about it.
+ *  - `openingEquity` = the PREVIOUS balance entry (the same anchor the TRA-359
+ *    override differenced), basis `'broker-prev-eod-balance'`, so the row
+ *    telescopes on the broker surface.
+ *  - the STOCK leg is booked `0` and made falsifiable via `stockLegBasis` /
+ *    `stockLegProbeUsd`, exactly like a back-filled row — broker delta-equity
+ *    already contains live stock P&L, so booking a demo stock figure beside a
+ *    broker delta would be the two-surface error relocated to the other
+ *    operand. The probe here additionally subtracts the measured cash flow
+ *    (the back-fill probe could not — flow was never captured historically),
+ *    and reads NOT MEASURED when the flow is.
+ *  - `netCashFlowUsd` = the TRA-359 override's flow over `(prevDate, date]`,
+ *    or `null` (NOT MEASURED) when the override did not compute this run.
+ *    Never assumed 0: a deposit inside a credit window would otherwise read
+ *    as uncredited P&L.
+ *  - `combinedPnl` = the override's broker day P&L when computed (making row
+ *    and report byte-identical on the field TRA-359 overrides), else the
+ *    `dailyPnl + optionsDailyPnl` identity every other row satisfies.
+ *
+ * Pure and injected; the caller supplies the balance file and the override it
+ * already holds.
+ */
+export function shapeLiveRecordedRow(args: {
+  date: string;
+  /** The day-only options figure the row will carry (journal-sourced upstream). */
+  optionsDailyPnl: number;
+  /** `tradier-eod-balance.<env>.json`, as loaded this tick. */
+  balanceByDate: Record<string, number>;
+  /**
+   * The TRA-359 override, when it computed this run. `null` = no broker delta
+   * was measurable (no client / no prior anchor / invalid balance), which
+   * leaves the cash flow NOT MEASURED — never 0.
+   */
+  override: {
+    prevDate: string;
+    prevBalance: number;
+    netCashFlow: number;
+    combinedPnl: number;
+  } | null;
+}): Pick<
+  DailySnapshot,
+  'openingEquity' | 'openingEquityBasis' | 'closingEquity' | 'closingEquityBasis'
+  | 'dailyPnl' | 'combinedPnl' | 'stockLegBasis' | 'stockLegProbeUsd' | 'netCashFlowUsd'
+> {
+  const { date, optionsDailyPnl, balanceByDate, override } = args;
+  const round2 = (n: number): number => Math.round(n * 100) / 100;
+  const rawClose = balanceByDate[date];
+  const closingEquity =
+    typeof rawClose === 'number' && Number.isFinite(rawClose) ? round2(rawClose) : null;
+  // The previous broker anchor. Prefer the override's own (it is the exact
+  // anchor the report's delta and cash-flow span were computed against); fall
+  // back to the newest earlier balance entry so a row can still telescope on a
+  // run where only the delta failed to compute.
+  const prevFromFile = (() => {
+    let best: { date: string; balance: number } | null = null;
+    for (const [d, v] of Object.entries(balanceByDate)) {
+      if (d >= date || typeof v !== 'number' || !Number.isFinite(v)) continue;
+      if (best === null || d > best.date) best = { date: d, balance: v };
+    }
+    return best;
+  })();
+  const prev = override
+    ? { date: override.prevDate, balance: override.prevBalance }
+    : prevFromFile;
+  const openingEquity = prev === null ? null : round2(prev.balance);
+  const netCashFlowUsd = override === null ? null : round2(override.netCashFlow);
+  // The probe needs all three operands MEASURED — equity endpoints AND flow. A
+  // probe computed with an assumed-zero flow would book a deposit as apparent
+  // stock activity, the exact confusion `netCashFlowUsd` exists to prevent.
+  const stockLegProbeUsd =
+    closingEquity !== null && openingEquity !== null && netCashFlowUsd !== null
+      ? round2(closingEquity - openingEquity - optionsDailyPnl - netCashFlowUsd)
+      : null;
+  const probeDisagrees =
+    stockLegProbeUsd !== null && Math.abs(stockLegProbeUsd) > STOCK_LEG_PROBE_TOLERANCE_USD;
+  return {
+    openingEquity,
+    openingEquityBasis:
+      openingEquity === null ? CLOSING_EQUITY_BASIS_NOT_MEASURED : OPENING_EQUITY_BASIS_BROKER_PREV,
+    closingEquity,
+    closingEquityBasis:
+      closingEquity === null ? CLOSING_EQUITY_BASIS_NOT_MEASURED : CLOSING_EQUITY_BASIS_BROKER,
+    dailyPnl: 0,
+    combinedPnl: override === null ? round2(optionsDailyPnl) : round2(override.combinedPnl),
+    stockLegBasis: stockLegProbeUsd === null
+      ? STOCK_LEG_BASIS_NOT_MEASURED
+      : probeDisagrees
+        ? STOCK_LEG_BASIS_PROBE_DISAGREES
+        : STOCK_LEG_BASIS_INERT,
+    stockLegProbeUsd,
+    netCashFlowUsd,
+  };
 }
 
 export { EMPTY_WINDOW as EOD_BACKFILL_EMPTY_BALANCE_WINDOW };

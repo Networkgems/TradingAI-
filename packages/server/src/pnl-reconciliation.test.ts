@@ -43,6 +43,7 @@ const NO_POST_ONSET_CREDIT: PostOnsetLiveCredit = {
   dayCellOptionsUsd: null,
   stockDailyUsd: null,
   equityGrowthUsd: null,
+  windowNetCashFlowUsd: null,
   uncreditedOptionsUsd: null,
   notMeasuredReason: 'no-live-options-onset',
   legs: [],
@@ -2136,7 +2137,8 @@ describe('TRA-3288 — the SURFACE gate: a live comparison needs broker-sourced 
   const calendar = { lastSettledSession: '2026-08-05', isMarketDay };
   const brow = (
     date: string, optionsDaily: number, closingEquity: number, closingEquityBasis: string | null,
-  ) => ({ date, optionsDaily, stockDaily: 0, closingEquity, closingEquityBasis });
+    netCashFlowUsd?: number | null,
+  ) => ({ date, optionsDaily, stockDaily: 0, closingEquity, closingEquityBasis, netCashFlowUsd });
   const journal = new Map([
     ['2026-08-04', { closes: 1, partialCloses: 0, realizedPnlUsd: 125 }],
   ]);
@@ -2211,12 +2213,13 @@ describe('TRA-3288 — the SURFACE gate: a live comparison needs broker-sourced 
     // Without this the gate could be permanently closed for the wrong reason
     // (a typo in the basis compare, an inverted mode test) and every other test
     // here would still pass. The denominator is printed, not assumed: `every`
-    // is TRUE on an empty cohort.
+    // is TRUE on an empty cohort. Flows are MEASURED zeros (item 2): a live
+    // publish requires the cash-flow leg, and 0-measured is not 0-assumed.
     const r = summarizePostOnsetLiveCredit({
       rows: [
-        brow('2026-08-03', 0, 25_000, 'broker-eod-balance'),
-        brow('2026-08-04', 0, 25_050, 'broker-eod-balance'),
-        brow('2026-08-05', 0, 25_110, 'broker-eod-balance'),
+        brow('2026-08-03', 0, 25_000, 'broker-eod-balance', 0),
+        brow('2026-08-04', 0, 25_050, 'broker-eod-balance', 0),
+        brow('2026-08-05', 0, 25_110, 'broker-eod-balance', 0),
       ],
       liveOptionsOnsetDate: '2026-08-04',
       journalClosesByDate: journal,
@@ -2228,8 +2231,61 @@ describe('TRA-3288 — the SURFACE gate: a live comparison needs broker-sourced 
     expect(r.windowRowDates).toEqual(['2026-08-04', '2026-08-05']);
     expect(r.absentSessions).toEqual([]);
     expect(r.notMeasuredReason).toBeNull();
-    // 125.00 journal + 0.00 stock − 110.00 equity growth.
+    expect(r.windowNetCashFlowUsd).toBeCloseTo(0, 2);
+    // 125.00 journal + 0.00 stock − (110.00 equity growth − 0.00 flow).
     expect(r.uncreditedOptionsUsd).toBeCloseTo(15, 2);
+  });
+
+  it('ITEM 2 — a deposit inside the window is netted out, not read as uncredited P&L', () => {
+    // Broker equity grew 1110: 110 of trading and a 1000 deposit on 08-05. An
+    // assumed-zero flow would publish 125 − 1110 = −985 (options massively
+    // over-credited); the measured flow nets to the same +15 as above.
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'broker-eod-balance', 0),
+        brow('2026-08-04', 0, 25_050, 'broker-eod-balance', 0),
+        brow('2026-08-05', 0, 26_110, 'broker-eod-balance', 1_000),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    expect(r.equityGrowthUsd).toBeCloseTo(1_110, 2);
+    expect(r.windowNetCashFlowUsd).toBeCloseTo(1_000, 2);
+    expect(r.uncreditedOptionsUsd).toBeCloseTo(15, 2);
+  });
+
+  it('ITEM 2 — ANY unmeasured window flow refuses the comparison; 0 is never assumed', () => {
+    const r = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, 'broker-eod-balance', 0),
+        // The TRA-359 cash fetch failed on this row's run: flow NOT MEASURED.
+        brow('2026-08-04', 0, 25_050, 'broker-eod-balance', null),
+        brow('2026-08-05', 0, 25_110, 'broker-eod-balance', 0),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'live',
+    });
+    expect(r.absentSessions).toEqual([]);
+    expect(r.notMeasuredReason).toBe('cash-flow-not-measured');
+    expect(r.uncreditedOptionsUsd).toBeNull();
+    // The demo path never requires a flow: same rows, demo mode, publishes.
+    const demo = summarizePostOnsetLiveCredit({
+      rows: [
+        brow('2026-08-03', 0, 25_000, null),
+        brow('2026-08-04', 0, 25_050, null),
+        brow('2026-08-05', 0, 25_110, null),
+      ],
+      liveOptionsOnsetDate: '2026-08-04',
+      journalClosesByDate: journal,
+      calendar,
+      bookMode: 'demo',
+    });
+    expect(demo.notMeasuredReason).toBeNull();
+    expect(demo.windowNetCashFlowUsd).toBeNull();
   });
 
   it('outranks `no-session-calendar` on a live book — the surface verdict is already known', () => {
@@ -2261,6 +2317,34 @@ describe('TRA-3288 — the SURFACE gate: a live comparison needs broker-sourced 
     });
     expect(r.notMeasuredReason).toBeNull();
     expect(r.uncreditedOptionsUsd).toBeCloseTo(15, 2);
+  });
+
+  it('ITEM 2 — drift and the frozen-counter axis go NOT MEASURED on broker-shaped rows', () => {
+    // Both are ENGINE-book identities. A broker-shaped row books `dailyPnl: 0`
+    // and carries the broker day P&L in `combinedPnl`, so grading
+    // `eodCombined == stockDaily + optionsDaily` against it flags every live
+    // session for agreeing with the broker; and the frozen-counter `move`
+    // becomes a cross-surface difference the pool (journal money) would fund
+    // nightly. NOT MEASURED, never a pass, and never an offender.
+    const snaps = [
+      { ...snap('2026-08-04', 0, -16), closingEquity: 2_207.5, closingEquityBasis: 'broker-eod-balance' },
+      { ...snap('2026-08-05', 0, 0), closingEquity: 2_101.5, closingEquityBasis: 'broker-eod-balance' },
+    ];
+    // The report carries the broker override (−106 − (−16) = −90 of residual
+    // the engine legs cannot decompose).
+    const eod = new Map([['2026-08-05', -106]]);
+    const r = reconcilePnl(
+      snaps, eod, '2026-07-12', null, null, null, calendar, '2026-08-04', 'live',
+    );
+    const day = r.days.find(d => d.date === '2026-08-05')!;
+    expect(day.drift).toBeNull();
+    expect(r.offendingDates).toEqual([]);
+    expect(r.ok).toBe(true);
+    // The broker equity moved −106 while the paper counter recorded nothing —
+    // on paper operands that is the frozen-counter signature; across surfaces
+    // it is noise, so the accusation is fenced and the raw figure withheld.
+    expect(day.unbookedEquityMoveUsd).toBeNull();
+    expect(day.counterFrozen).toBeNull();
   });
 
   it('reconcilePnl wires the mode and the per-row basis through to the gate', () => {

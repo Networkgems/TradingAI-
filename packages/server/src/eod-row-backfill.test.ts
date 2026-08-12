@@ -12,6 +12,7 @@ import {
 import {
   planLiveEodRowBackfill,
   isBackfilledRow,
+  shapeLiveRecordedRow,
   EOD_BACKFILL_ROW_SOURCE,
   CLOSING_EQUITY_BASIS_BROKER,
   CLOSING_EQUITY_BASIS_NOT_MEASURED,
@@ -436,5 +437,87 @@ describe('PnlTracker.applyEodRowBackfill', () => {
       row('2026-07-30', { closingEquity: null, openingEquity: null, rowSource: EOD_BACKFILL_ROW_SOURCE }),
     ]);
     expect(t.getCumulativeStats(2243.48).peakEquity).toBe(2243.48);
+  });
+});
+
+// TRA-3288 item 2 — the live RECORDED row, re-sourced from the broker. The
+// contract mirrors the back-fill's: broker or null, never the PaperAccount;
+// flow measured or the field says so; the stock leg booked flat and falsifiable.
+describe('TRA-3288 — shapeLiveRecordedRow', () => {
+  const override = {
+    prevDate: '2026-08-11',
+    prevBalance: 2_207.5,
+    netCashFlow: 0,
+    combinedPnl: -16,
+  };
+
+  it('books the broker close + prev anchor and agrees with the report by construction', () => {
+    const r = shapeLiveRecordedRow({
+      date: '2026-08-12',
+      optionsDailyPnl: -16,
+      balanceByDate: { '2026-08-11': 2_207.5, '2026-08-12': 2_191.5 },
+      override,
+    });
+    expect(r.closingEquity).toBeCloseTo(2_191.5, 2);
+    expect(r.closingEquityBasis).toBe(CLOSING_EQUITY_BASIS_BROKER);
+    expect(r.openingEquity).toBeCloseTo(2_207.5, 2);
+    expect(r.openingEquityBasis).toBe('broker-prev-eod-balance');
+    // The row's combinedPnl IS the report's override figure — the two surfaces
+    // that "disagreed about the same book on the same day, by construction"
+    // now come off one arithmetic.
+    expect(r.combinedPnl).toBeCloseTo(-16, 2);
+    expect(r.netCashFlowUsd).toBeCloseTo(0, 2);
+    // Stock leg: booked flat, probe measured — (2191.5 − 2207.5) − (−16) − 0 = 0.
+    expect(r.dailyPnl).toBe(0);
+    expect(r.stockLegProbeUsd).toBeCloseTo(0, 2);
+    expect(r.stockLegBasis).toBe(STOCK_LEG_BASIS_INERT);
+  });
+
+  it('an absent balance entry writes null + not-measured — NEVER the PaperAccount', () => {
+    const r = shapeLiveRecordedRow({
+      date: '2026-08-12',
+      optionsDailyPnl: 0,
+      balanceByDate: { '2026-08-11': 2_207.5 },
+      override: null,
+    });
+    expect(r.closingEquity).toBeNull();
+    expect(r.closingEquityBasis).toBe(CLOSING_EQUITY_BASIS_NOT_MEASURED);
+    // No override ⇒ the flow was not measured this run, and the probe cannot run.
+    expect(r.netCashFlowUsd).toBeNull();
+    expect(r.stockLegProbeUsd).toBeNull();
+    expect(r.stockLegBasis).toBe(STOCK_LEG_BASIS_NOT_MEASURED);
+    // The identity fallback for combinedPnl, same as a back-filled row.
+    expect(r.combinedPnl).toBe(0);
+    // The prev anchor still telescopes off the file even without an override.
+    expect(r.openingEquity).toBeCloseTo(2_207.5, 2);
+  });
+
+  it('a deposit lands in netCashFlowUsd and the probe, not in the stock leg', () => {
+    // Broker close moved +1016 on a −16 options day with a $1,000 deposit. The
+    // probe nets the flow out and still reads inert; without the netting it
+    // would read +1000 of phantom stock activity.
+    const r = shapeLiveRecordedRow({
+      date: '2026-08-12',
+      optionsDailyPnl: -16,
+      balanceByDate: { '2026-08-11': 2_207.5, '2026-08-12': 3_191.5 },
+      override: { ...override, netCashFlow: 1_000, combinedPnl: -16 },
+    });
+    expect(r.netCashFlowUsd).toBeCloseTo(1_000, 2);
+    expect(r.stockLegProbeUsd).toBeCloseTo(0, 2);
+    expect(r.stockLegBasis).toBe(STOCK_LEG_BASIS_INERT);
+  });
+
+  it('a material residual the flow cannot explain reads probe-disagrees', () => {
+    // Close moved +84 on a −16 options day with zero measured flow: $100 the
+    // booked-flat stock leg would silently absorb. The probe names it.
+    const r = shapeLiveRecordedRow({
+      date: '2026-08-12',
+      optionsDailyPnl: -16,
+      balanceByDate: { '2026-08-11': 2_207.5, '2026-08-12': 2_291.5 },
+      override,
+    });
+    expect(r.stockLegProbeUsd).toBeCloseTo(100, 2);
+    expect(r.stockLegBasis).toBe(STOCK_LEG_BASIS_PROBE_DISAGREES);
+    expect(r.dailyPnl).toBe(0);
   });
 });
