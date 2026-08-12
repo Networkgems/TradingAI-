@@ -228,6 +228,10 @@ import { hydrateScaleoutLadderFromDisk } from './scaleout-ladder-ledger.js';
 import { hydrateDirectionalOpensFromDisk } from './directional-open-ledger.js';
 import { hydrateEntryGreeksGateFromDisk } from './entry-greeks-ledger.js';
 import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
+// TRA-3434 — boot warm for the TRA-3391 tape-expectancy fold the live cost bar
+// admits on. Without it the first candidates after every process start decline
+// blind under a reason code that reads exactly like a measured verdict.
+import { initTapeExpectancyCache } from './option-tape-expectancy-cache.js';
 import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
@@ -4466,6 +4470,38 @@ setTimeout(() => {
     log.info('live-enforce gate ledger hydrated (TRA-2048)', { records: h.records, days: h.days });
   }
 }
+
+// TRA-3434 — WARM THE TAPE-EXPECTANCY FOLD AT BOOT. Placed here, beside the
+// live-enforce hydrate, because it is the other half of the same gate's cold-start
+// state: that one restores what the bar DECIDED, this one restores what it decides
+// WITH.
+//
+// The gate reads the table through `peekTapeExpectancyTable()`, the SYNC accessor,
+// which returns `null` until the first fold completes and merely SCHEDULES a
+// refold. `tapeExpectancyVerdict()` fail-closes on `null` — correct, but it
+// declines under `insufficient_evidence` with `n=0`, which is byte-identical to
+// the code a genuinely unmeasured cell produces. So a blind post-boot decline is
+// indistinguishable in `byReason` from a measured verdict; the only discriminator
+// is `freshness.generation === 0` cross-read against `build.startedAt`, and
+// nothing forces a reader to do that.
+//
+// Measured on the 2026-08-12T22:23:58Z boot: the box sat 3.5 minutes at
+// `generation: 0, otmCells: []` purely because nothing had touched the cache — it
+// folded only when a health route happened to hit the AWAITING `get()`. At 13:30Z
+// instead of 22:24Z that window eats the session's first live candidates, and
+// in-band candidates are RARE by construction (the live-universe tape is almost
+// entirely |Δ| < 0.20), so losing one manufactures a false "the band was never
+// reached" zero on the TRA-3401 / TRA-3417 acceptance read.
+//
+// Fire-and-forget, matching the neighbouring boot warms: the fold must not gate
+// listen(), and a failure is already survivable (the gate keeps failing closed and
+// the next scheduled refold retries). Awaiting it here would trade a 3.5-minute
+// blind window for a boot that blocks on journal IO — strictly worse.
+void initTapeExpectancyCache().catch((err: unknown) => {
+  log.warn('tape-expectancy boot warm failed (TRA-3434) — gate stays fail-closed until the next refold', {
+    reason: err instanceof Error ? err.message : String(err),
+  });
+});
 
 // TRA-2930 — rebuild the per-book EOD archive-participation record from disk and pin
 // the append target. MUST run before the first 21:00 ET archive pass; the hydrate is
