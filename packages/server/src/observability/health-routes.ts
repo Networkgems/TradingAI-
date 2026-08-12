@@ -122,7 +122,28 @@ import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // REPLACED the delta-proxy estimator, published per cell so the admission
 // decision is readable off deployed state instead of re-derived by hand.
 import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
-import { TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
+import { DECLINE_REASON_TAXONOMY, TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
+// TRA-3394 (authorization TRA-3392) — the ratified band table and the live arm of
+// its UPPER edge. The cost bar is algebraically a floor, so without the ceiling the
+// live admitted set exceeds the mandate at the top end.
+import {
+  mandateCeilingFor,
+  mandateFloorFor,
+  OTM_SLEEVE_MANDATE_BANDS,
+  OTM_SLEEVE_MANDATE_ISSUE,
+  OTM_SLEEVE_MANDATE_LABEL,
+  OTM_SLEEVE_MANDATE_PROVENANCE,
+  OTM_SLEEVE_MANDATE_STRUCTURE,
+} from '../otm-sleeve-mandate.js';
+import {
+  ENTRY_DELTA_CEILING_GATE,
+  ENTRY_DELTA_CEILING_REASON_CODE,
+  ENTRY_DELTA_CEILING_SHADOW_GATE,
+  OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
+  OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
+  OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR,
+  resolveEntryDeltaCeilingLive,
+} from '../option-entry-delta-ceiling-live.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist.
 import {
   resolveLiveOtmUniverse,
@@ -4036,6 +4057,124 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     });
   });
 
+  // TRA-3394 (authorization TRA-3392) — the RATIFIED BAND TABLE, the three
+  // decline reason codes, and the ceiling gate's own counters, on one read.
+  //
+  // This endpoint answers the question the board could not previously ask: the
+  // sleeve declines almost everything, and until now every decline looked the
+  // same. Three of them are now distinguishable, and they want three DIFFERENT
+  // responses (`declineReasonCodes` states which):
+  //
+  //   band_deauthorized      we measured it and the mandate forbids it  → do nothing
+  //   insufficient_evidence  we never measured it                        → accrue
+  //   gross_negative         we measured a loser                         → bar working
+  //
+  // It also carries the CEILING, which is the item with live money behind it: the
+  // cost bar is algebraically a FLOOR, so the live admitted set was `[0.495, ∞)`
+  // against an authorization of `[0.495, 0.55)`. Read `ceiling.mode` FIRST —
+  // `off` means the gap is still open and the counters below are structurally
+  // zero, which is NOT the same as a gate that ran and passed everything.
+  //
+  // Observe-only, secrets-free, unauthenticated for parity with the other gate
+  // reads.
+  app.get('/api/health/otm-sleeve-mandate', (_req, res) => {
+    const nowMs = now();
+    const etDay = etDateString(new Date(nowMs));
+    const liveEnv = process.env;
+    const structure = OTM_SLEEVE_MANDATE_STRUCTURE;
+    const ceiling = resolveEntryDeltaCeilingLive(structure, liveEnv);
+    const summary = summarizeLiveEnforceGate(etDay);
+    const gateToday = (g: string) => summary.byGate.find((x) => x.gate === g) ?? null;
+    const gateRetained = (g: string) => summary.retained.byGate.find((x) => x.gate === g) ?? null;
+
+    res.json({
+      ok: true,
+      issue: 'TRA-3394',
+      authorization: OTM_SLEEVE_MANDATE_ISSUE,
+      time: new Date(nowMs).toISOString(),
+      etDay,
+      build: resolveBuildInfo(),
+      sleeve: {
+        /** §7 — the label changed; the KEY is frozen and joins every published number. */
+        label: OTM_SLEEVE_MANDATE_LABEL,
+        structureKey: structure,
+        keyFrozenBecause:
+          'TRA-3392 §7 — `single_leg_otm` is the join column of the journal tape, of '
+          + 'OPTIONS_PRODUCTION_STRATEGIES and of this ledger\'s byScope. Renaming it would silently '
+          + 'restate every published per-structure number (the read-time-reclassification failure '
+          + 'test-accounts.ts / TRA-2948 documents). New label over the old key, in strings only.',
+        authorizedBand: {
+          from: mandateFloorFor(structure),
+          to: mandateCeilingFor(structure),
+          note: 'Half-open [from, to). BOUNDED ON BOTH SIDES — that is the point of the ticket.',
+        },
+      },
+      /** (a) The ratified band table, with n / SE / lo95 per measured cell. */
+      bands: OTM_SLEEVE_MANDATE_BANDS,
+      bandsProvenance: OTM_SLEEVE_MANDATE_PROVENANCE,
+      /** (b) The three decline reason codes, with the response each one calls for. */
+      declineReasonCodes: DECLINE_REASON_TAXONOMY,
+      /** (c) The ceiling gate: arm state, then its OWN evaluated/blocked counters. */
+      ceiling: {
+        mode: ceiling.mode,
+        inForce: ceiling.ceiling,
+        mandateCeiling: ceiling.mandateCeiling,
+        rawOverride: ceiling.rawOverride,
+        overrideRejectedReason: ceiling.overrideRejectedReason,
+        flags: {
+          enforce: OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
+          observe: OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
+          value: OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR,
+        },
+        reasonCode: ENTRY_DELTA_CEILING_REASON_CODE,
+        counters: {
+          enforcing: {
+            gate: ENTRY_DELTA_CEILING_GATE,
+            today: gateToday(ENTRY_DELTA_CEILING_GATE),
+            retained: gateRetained(ENTRY_DELTA_CEILING_GATE),
+          },
+          shadow: {
+            gate: ENTRY_DELTA_CEILING_SHADOW_GATE,
+            today: gateToday(ENTRY_DELTA_CEILING_SHADOW_GATE),
+            retained: gateRetained(ENTRY_DELTA_CEILING_SHADOW_GATE),
+            meaning:
+              '`blocked` on the SHADOW gate means WOULD HAVE BLOCKED. No live open was stopped by it. '
+              + 'It is a separate gate from the enforcing one so a shadow count can never be read as '
+              + 'a trade that was prevented (TRA-1682).',
+          },
+        },
+        durability: summary.durability,
+      },
+      /**
+       * How to read the counters, spelled out because the healthy read is a ZERO
+       * and a zero is exactly what an inert gate produces.
+       */
+      note:
+        ceiling.mode === 'off'
+          ? `CEILING DARK: neither ${OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG} nor `
+            + `${OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG} is set, so NO verdict is recorded and the `
+            + `live admitted set is still [${mandateFloorFor(structure)}, inf) against an authorization of `
+            + `[${mandateFloorFor(structure)}, ${mandateCeilingFor(structure)}). The counters below are `
+            + 'structurally zero — this is the shipped-but-unarmed state TRA-3394 requires, not a clean bill. '
+            + `Next step is the SHADOW arm (${OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG}=1), which records `
+            + 'verdicts and blocks nothing; the enforcing arm is a separate CTO authorization. '
+            + 'Item 2 (band_deauthorized) is ACTIVE regardless of these flags — it is a decline reason on the '
+            + 'admission table, not a gate, and it needs no arm.'
+          : `CEILING ${ceiling.mode.toUpperCase()} at |delta| < ${ceiling.ceiling} on ${structure}. `
+            + 'Expected healthy read is `evaluated > 0, blocked = 0`: the whole 1073-row tape holds n=20 above '
+            + '0.55, so this gate is designed to bite RARELY. `evaluated = 0` means no live OTM candidate '
+            + 'reached the gate at all (check the universe and floor axes upstream on '
+            + '/api/health/live-enforce-gates), NOT that the ceiling passed everything. Use `byCell` on each '
+            + 'gate to see which mandate band the evaluated candidates fell in — that is what makes a zero '
+            + 'blocked count checkable rather than merely reassuring.',
+      crossReads: {
+        gates: '/api/health/live-enforce-gates — byGate[entry_delta_ceiling{,_shadow}], byCell, byReason',
+        expectancy: '/api/health/option-expectancy-table — the measured cell table the bar decides on',
+        journal: '/api/health/option-journal?rows=all — the tape the bands were measured from',
+      },
+    });
+  });
+
   app.get('/api/health/cost-aware-gate', (_req, res) => {
     const dir = process.env.DATA_DIR;
     const env = dir ? resolveDemoFlagEnv(dir) : process.env;
@@ -4247,6 +4386,22 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 admits: c.admits,
               })),
           },
+        },
+        /**
+         * TRA-3394 item 1 — the CEILING, the upper edge of the TRA-3392 band.
+         * `mode: 'off'` means the live admitted set is still [0.495, inf) while
+         * the authorization is [0.495, 0.55) — the gate is shipped and dark, by
+         * design, pending a CTO arm. Full band table and per-band counters at
+         * /api/health/otm-sleeve-mandate.
+         */
+        entryDeltaCeiling: {
+          issue: 'TRA-3394',
+          authorization: OTM_SLEEVE_MANDATE_ISSUE,
+          flag: OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
+          observeFlag: OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
+          ...resolveEntryDeltaCeilingLive(OTM_SLEEVE_MANDATE_STRUCTURE, liveEnv),
+          reasonCode: ENTRY_DELTA_CEILING_REASON_CODE,
+          gates: [ENTRY_DELTA_CEILING_GATE, ENTRY_DELTA_CEILING_SHADOW_GATE],
         },
         spread: { flag: OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG, armed: spreadArmed },
         universe: {

@@ -61,6 +61,10 @@ import {
   DEFAULT_COST_GATE_CONFIG,
   type CostGateConfig,
 } from './option-cost-gate.js';
+// TRA-3394 item 2 — the ratified authorization, as data. Imported for its
+// DE-AUTHORIZATION predicate only; the module holds no bar and no env, so the
+// admission decision cannot acquire one through this edge.
+import { mandateBandFor, OTM_SLEEVE_MANDATE_ISSUE } from './otm-sleeve-mandate.js';
 
 /**
  * Ruling 2.5 — a cell needs this many closed rows before its expectancy may
@@ -359,14 +363,20 @@ export function findTapeExpectancyCell(
  * Bounded, foldable classification of a tape-expectancy BLOCK — the `reasonCode`
  * the live-enforce ledger folds on (`byReason`).
  *
- *   `insufficient_evidence`  — NEW (Ruling 2.5). The cell exists on the delta
- *                              axis but holds `n < 30` closed rows, or the tape
- *                              has never been folded. **We never measured.** It
- *                              DECLINES, and it is deliberately NOT
- *                              `gross_negative`: the board could not previously
- *                              tell those two apart, and on the live universe
- *                              today every candidate in the admitted band is in
- *                              this state.
+ *   `band_deauthorized`      — NEW (TRA-3394 item 2, authorization TRA-3392 §1).
+ *                              The candidate's |delta| is in a band the CTO
+ *                              DE-AUTHORIZED BY EVIDENCE. **We measured it and
+ *                              the mandate forbids it.** Sourced from
+ *                              `otm-sleeve-mandate.ts`, NOT from the bar, and
+ *                              checked BEFORE any bar arithmetic — see
+ *                              {@link tapeExpectancyVerdict}.
+ *   `insufficient_evidence`  — Ruling 2.5. The cell exists on the delta axis but
+ *                              holds `n < 30` closed rows, or the tape has never
+ *                              been folded. **We never measured.** It DECLINES,
+ *                              and it is deliberately NOT `gross_negative`: the
+ *                              board could not previously tell those two apart,
+ *                              and on the live universe today every candidate in
+ *                              the admitted band is in this state.
  *   `gross_unknown`          — the candidate has no usable |delta|, so it has no
  *                              cell at all. Fails closed. An input defect, not a
  *                              tape gap.
@@ -385,10 +395,52 @@ export function findTapeExpectancyCell(
  *                              estimate and lose on CI width.
  */
 export type TapeExpectancyReasonCode =
+  | 'band_deauthorized'
   | 'insufficient_evidence'
   | 'gross_unknown'
   | 'gross_negative'
   | string;
+
+/**
+ * TRA-3394 item 2 — the three codes the board asked to be able to tell apart,
+ * with the question each one answers. Published on the health surface so the
+ * distinction is documented where it is read, not only where it is written.
+ *
+ * The whole point is that these want THREE DIFFERENT RESPONSES:
+ *   • `band_deauthorized`     → nothing. The answer is settled; do not retune.
+ *   • `insufficient_evidence` → accrue evidence (doc §5 pre-registers the test).
+ *   • `gross_negative`        → the cell is measured and losing; the bar is
+ *                               working as intended.
+ */
+export const DECLINE_REASON_TAXONOMY: readonly {
+  code: string;
+  meaning: string;
+  source: string;
+  response: string;
+}[] = [
+  {
+    code: 'band_deauthorized',
+    meaning: 'WE MEASURED IT AND THE MANDATE FORBIDS IT — the band is closed by ratified evidence.',
+    source: 'otm-sleeve-mandate.ts (TRA-3392 §1/§2). NOT derived from the cost bar.',
+    response:
+      'None. A bar / k / multiplier change may not reopen it; that would take a new CTO ruling. '
+      + 'This code exists so a future TRA-3272-style retune cannot silently reopen the band.',
+  },
+  {
+    code: 'insufficient_evidence',
+    meaning: 'WE NEVER MEASURED — the cell holds fewer than the minimum closed rows, or the tape is unfolded.',
+    source: 'option-tape-expectancy.ts, cell n vs minCellN (TRA-3388 Ruling 2.5).',
+    response:
+      'Accrue evidence. TRA-3392 §5 pre-registers the reopening test for [0.20,0.45); note the doc '
+      + 'also records that it cannot currently fire at the observed arrival rate.',
+  },
+  {
+    code: 'gross_negative',
+    meaning: 'WE MEASURED A LOSER — the cell is adequately powered and its MEAN is below zero.',
+    source: 'option-tape-expectancy.ts, cell mean vs 0 (classified on the MEAN, not the lower bound).',
+    response: 'None needed — the bar is doing its job. Do not confuse with an imprecise-but-positive cell.',
+  },
+];
 
 /** The admit/decline verdict for one candidate under the tape-calibrated form. */
 export interface TapeExpectancyVerdict {
@@ -438,6 +490,21 @@ function shortfallCode(shortfall: number): string {
  *
  * FAIL-CLOSED in all three ignorance cases: no table folded yet, no cell, or too
  * few rows. "We have not measured this" declines; it never admits.
+ *
+ * ── TRA-3394 item 2: the de-authorization check runs FIRST ───────────────────
+ *
+ * Before this, `[0.00, 0.20)` was closed by ALGEBRAIC ACCIDENT — the cost bar
+ * happened to work out to a 0.495 delta floor. Nothing in the code knew the band
+ * was a measured loser (n=638, t=−4.45), so any bar / k / multiplier change (the
+ * change TRA-3272 was opened to make) would have reopened the single most
+ * significantly negative cell on the tape with real money, silently.
+ *
+ * So the mandate is consulted BEFORE `barR`, before the cell lookup, and before
+ * any comparison a retune could move. The ORDER is the guarantee: a de-authorized
+ * band cannot be reached by a number. It declines under `band_deauthorized`,
+ * which is distinct from `gross_negative` (we measured a loser) and from
+ * `insufficient_evidence` (we never measured) precisely because the three want
+ * different responses — see {@link DECLINE_REASON_TAXONOMY}.
  */
 export function tapeExpectancyVerdict(
   candidate: { structure: string; delta: number },
@@ -464,6 +531,32 @@ export function tapeExpectancyVerdict(
       lowerCI95: null,
       reasonCode: 'gross_unknown',
       reason: `tape-expectancy gate (TRA-3391): candidate |delta| ${candidate.delta} is not a usable delta — no cell exists, fail closed`,
+    };
+  }
+
+  // TRA-3394 item 2 — the mandate, ahead of every bar-derived number. Note this
+  // runs AFTER the unusable-delta check on purpose: a candidate with no delta has
+  // no band either, and `gross_unknown` (an input defect) must not be relabelled
+  // as a mandate decision.
+  const deAuthorized = mandateBandFor(structure, candidate.delta);
+  if (deAuthorized?.authorization === 'de_authorized') {
+    const cell = findTapeExpectancyCell(table, structure, candidate.delta);
+    return {
+      ...base,
+      admit: false,
+      // The tape stats are reported even though they did not decide anything —
+      // a reader must be able to see that the mandate and the tape AGREE here,
+      // rather than take the de-authorization on trust.
+      n: cell?.n ?? 0,
+      meanR_gate: cell?.meanR_gate ?? null,
+      seR_gate: cell?.seR_gate ?? null,
+      lowerCI95: cell?.lowerCI95 ?? null,
+      reasonCode: 'band_deauthorized',
+      reason:
+        `sleeve mandate (${OTM_SLEEVE_MANDATE_ISSUE}, enforced by TRA-3394): |delta| band `
+        + `${deAuthorized.label} on ${structure} is DE-AUTHORIZED BY EVIDENCE, permanently. `
+        + `${deAuthorized.rationale} This decline is sourced from the ratified band table, NOT from `
+        + 'the cost bar — no bar, k or multiplier change can reopen it.',
     };
   }
 

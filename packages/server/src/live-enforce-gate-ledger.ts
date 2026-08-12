@@ -62,8 +62,23 @@ const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
  * running unfiltered at |delta| 0.03-0.07); `universe` is the TRA-3216 live OTM
  * underlying allowlist (the scan universe was the full ~614-name watchlist, so
  * real money opened on KVYO / TROW / ABCL because nothing restricted it).
+ *
+ * TRA-3394 adds the two CEILING axes. `entry_delta_ceiling` is the live arm of
+ * the TRA-3392 upper band edge — the cut the cost bar is algebraically incapable
+ * of making, since it is a floor. `entry_delta_ceiling_shadow` is the SAME
+ * verdict recorded while the gate is dark: `blocked` there means WOULD HAVE
+ * BLOCKED, and no live open was stopped. They are separate gates rather than one
+ * gate with a mode field because a counter must report what the engine actually
+ * did, not what the config intended (TRA-1682) — folding a shadow "block" into
+ * the enforcing gate's `blocked` would claim a trade was prevented when it fired.
  */
-export type LiveEnforceGate = 'cost_bar' | 'spread' | 'otm_delta_floor' | 'universe';
+export type LiveEnforceGate =
+  | 'cost_bar'
+  | 'spread'
+  | 'otm_delta_floor'
+  | 'universe'
+  | 'entry_delta_ceiling'
+  | 'entry_delta_ceiling_shadow';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -181,7 +196,19 @@ export function clearLiveEnforceGateLedger(): void {
   lastAppendError = null;
 }
 
-const GATES: LiveEnforceGate[] = ['cost_bar', 'spread', 'otm_delta_floor', 'universe'];
+const GATES: LiveEnforceGate[] = [
+  'cost_bar',
+  'spread',
+  'otm_delta_floor',
+  'universe',
+  // TRA-3394 — both ceiling axes are listed so each publishes a row at
+  // `evaluated: 0` before it has ever fired. A gate that is absent from the
+  // payload and a gate that is present-and-silent are the same JSON to a grader
+  // otherwise, and this gate's expected healthy read is precisely
+  // `evaluated > 0, blocked = 0` (n=20 above 0.55 on the whole tape).
+  'entry_delta_ceiling',
+  'entry_delta_ceiling_shadow',
+];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */
 function apply(rec: LiveEnforceRecord): void {

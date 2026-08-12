@@ -347,6 +347,15 @@ import {
   tapeExpectancyVerdict,
   tapeEdgeR,
 } from './option-tape-expectancy.js';
+// TRA-3394 item 1 — the LIVE entry-delta CEILING: the upper edge of the TRA-3392
+// authorized band, and the one cut a cost bar (algebraically a floor) cannot make.
+// Dark by default; see `entryDeltaCeilingLiveRejectReason`.
+import {
+  entryDeltaCeilingLiveVerdict,
+  ENTRY_DELTA_CEILING_GATE,
+  ENTRY_DELTA_CEILING_SHADOW_GATE,
+  ENTRY_DELTA_CEILING_REASON_CODE,
+} from './option-entry-delta-ceiling-live.js';
 import {
   isOptionCostAwareGateEnabled,
   resolveCostGateConfig,
@@ -6786,6 +6795,77 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3394 item 1 (authorization TRA-3392 §3) — the LIVE arm of the entry
+   * |delta| CEILING: the upper edge of the ratified band.
+   *
+   * The cost bar is a FLOOR. Whatever its edge estimate is — the retired
+   * `3·|Δ| − 1` proxy or TRA-3391's measured lower CI bound — it can only ever
+   * push the ADMITTED SET's lower boundary around, so the live admitted set was
+   * `[0.495, ∞)` against an authorization of `[0.495, 0.55)`. The sleeve exceeded
+   * its mandate at the top end, in the direction of the second-most-negative cell
+   * on the tape (n=20, E=−1.072 R_gate). This method is the only cut that reaches
+   * it.
+   *
+   * Containment identical to `otmDeltaFloorLiveRejectReason`: `mode === 'live'`
+   * only, PROCESS env only (secret-adjacent), TIGHTENING-ONLY, OFF by default.
+   *
+   * THREE modes, and the middle one is why this ticket says "land it dark":
+   *   • `off`     — no verdict exists, nothing recorded, live path unchanged.
+   *   • `observe` — the verdict is recorded under gate
+   *     `entry_delta_ceiling_shadow` and the open PROCEEDS. `blocked` on that
+   *     gate reads "would have blocked". This is the pre-arm evidence the CTO
+   *     asked to see before authorizing the live arm.
+   *   • `enforce` — recorded under gate `entry_delta_ceiling` and the open is
+   *     STOPPED.
+   *
+   * EVERY evaluated candidate is recorded in the two non-off modes, admits
+   * included, with the mandate band stamped on the ledger's `cell` axis. n=20
+   * above 0.55 across the entire 1073-row tape means the expected healthy read is
+   * `evaluated > 0, blocked = 0` — which is indistinguishable from an inert gate
+   * without a counter of its own (TRA-1407 / TRA-1486). The per-band cell split is
+   * what makes even the zero checkable: it shows the candidates that were looked
+   * at and which side of 0.55 they fell on.
+   *
+   * Returns the rejection reason only when the breach actually stopped the open.
+   */
+  private entryDeltaCeilingLiveRejectReason(
+    structure: string,
+    delta: number | null | undefined,
+  ): string | null {
+    if (this.mode !== 'live') return null;
+    const verdict = entryDeltaCeilingLiveVerdict(structure, delta, process.env);
+    if (verdict.mode === 'off') return null;
+
+    recordLiveEnforceDecision(
+      verdict.mode === 'enforce' ? ENTRY_DELTA_CEILING_GATE : ENTRY_DELTA_CEILING_SHADOW_GATE,
+      structure,
+      // On the shadow gate this is "would have blocked" — the gate KEY carries
+      // that meaning, so the counter stays a plain would-block rate rather than
+      // an always-false column that measures nothing (TRA-1682: the shadow gate
+      // reports what the shadow did, which is evaluate).
+      verdict.breached,
+      etDateString(new Date()),
+      verdict.reason ?? undefined,
+      Date.now(),
+      {
+        reasonCode: verdict.breached ? ENTRY_DELTA_CEILING_REASON_CODE : undefined,
+        book: this.alertUsername ?? null,
+        // The mandate band, not a tape cell — this gate decides on the ratified
+        // table, and stamping the band is what turns a scalar counter into the
+        // "which side of 0.55 did the candidates fall on" read.
+        cell: verdict.bandLabel ? `${structure}::${verdict.bandLabel}` : undefined,
+      },
+    );
+
+    if (verdict.breached && !verdict.blocked) {
+      log.info('live entry-delta ceiling breach SHADOWED, not blocked (TRA-3394)', {
+        structure, delta, ceiling: verdict.ceiling, band: verdict.bandLabel,
+      });
+    }
+    return verdict.blocked ? verdict.reason : null;
+  }
+
+  /**
    * TRA-2295 (parent TRA-2291) — the SPREAD-CEILING / quotability gate on the
    * option ENTRY path.
    *
@@ -9360,6 +9440,32 @@ export class SignalEngine {
           });
           log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
             sym, delta: cheap.delta, reason: otmLiveFloorReject,
+          });
+          continue;
+        }
+
+        // TRA-3394 item 1 — LIVE arm of the entry delta CEILING, the other edge
+        // of the same band. Runs immediately AFTER the floor so the two halves of
+        // the TRA-3392 authorization are adjacent and each records its own verdict
+        // on its own gate. No-op unless mode==='live' AND one of
+        // ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE{,_OBSERVE} is armed in the
+        // process env; in observe mode it RECORDS and returns null, so the open
+        // proceeds exactly as it does today. Same churn-brake surfacing as the
+        // floor: an enforced reject is visible on the feed, not just in the log.
+        const otmLiveCeilingReject = this.entryDeltaCeilingLiveRejectReason(
+          'single_leg_otm',
+          cheap.delta,
+        );
+        if (otmLiveCeilingReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmLiveCeilingReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by entry delta ceiling (TRA-3394)', {
+            sym, delta: cheap.delta, reason: otmLiveCeilingReject,
           });
           continue;
         }

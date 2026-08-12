@@ -73,6 +73,11 @@ import { beginRvScan, __resetRvScanTelemetry } from '../rv-scan-telemetry.js'; /
 import { recordDirectionalArm, clearDirectionalOpenLedger } from '../directional-open-ledger.js'; // TRA-3080
 import { etDateString } from '../scheduler.js';
 import { checkStaleState } from './alerts.js';
+import { // TRA-3394
+  OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
+  OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
+  OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR,
+} from '../option-entry-delta-ceiling-live.js';
 import { getRecentAlerts, __resetAlertsForTest } from './alerts.js';
 import type { EngineState, ExitCadenceHealth, ExitIntervalBucket, LiveEquityAcceptance } from '../signal-engine.js';
 import { categorizeLiveSkipReason, emptyLiveSkipBreakdown, emptyDecoupledExitSkips, emptyExitIntervalHistogram } from '../signal-engine.js';
@@ -5103,5 +5108,160 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
       { reasonCode: 'shortfall_gte_0.50', blocked: 2, share: 0.6667 },
       { reasonCode: 'shortfall_lt_0.10', blocked: 1, share: 0.3333 },
     ]);
+  });
+});
+
+// ─── TRA-3394 (authorization TRA-3392) — /api/health/otm-sleeve-mandate ───────
+// The ticket names this read as the verification: "(a) the band table with
+// n/SE/lo95 per cell, (b) the three distinct decline reason codes, and (c) the
+// ceiling gate's own evaluated/blocked counters." The payload IS a deliverable,
+// so these assert it is all three at once rather than a promise that it will be.
+describe('GET /api/health/otm-sleeve-mandate (TRA-3394)', () => {
+  const VARS = [
+    OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG,
+    OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG,
+    OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR,
+  ];
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const v of VARS) { saved[v] = process.env[v]; delete process.env[v]; }
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const v of VARS) {
+      if (saved[v] === undefined) delete process.env[v];
+      else process.env[v] = saved[v]!;
+    }
+    clearLiveEnforceGateLedger();
+  });
+
+  function serve() {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never, // would BLOCK if the route were gated
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const handlers = routes.get('/api/health/otm-sleeve-mandate')!;
+    expect(handlers).toHaveLength(1); // unauthenticated, like the other gate probes
+    const res = fakeRes();
+    handlers[0]!({}, res);
+    return res.body as {
+      sleeve: { label: string; structureKey: string; authorizedBand: { from: number; to: number } };
+      bands: Array<{
+        label: string;
+        authorization: string;
+        evidence: { n: number; seR_gate: number | null; lowerCI95: number | null };
+        cells?: Array<{ label: string; n: number; seR_gate: number | null; lowerCI95: number | null }>;
+      }>;
+      declineReasonCodes: Array<{ code: string; meaning: string; response: string }>;
+      ceiling: {
+        mode: string;
+        inForce: number | null;
+        mandateCeiling: number | null;
+        rawOverride: string | null;
+        overrideRejectedReason: string | null;
+        counters: {
+          enforcing: { gate: string; today: { evaluated: number; blocked: number } | null };
+          shadow: { gate: string; today: { evaluated: number; blocked: number } | null };
+        };
+      };
+      note: string;
+    };
+  }
+
+  // (a) the band table
+  it('publishes the band table with n / SE / lo95 per measured cell', () => {
+    const body = serve();
+    const deauth = body.bands.find((b) => b.authorization === 'de_authorized')!;
+    expect(deauth.label).toBe('[0.00,0.20)');
+    expect(deauth.evidence.n).toBe(691);
+    // The doc publishes no SE for the AGGREGATE band, so the CELLS are where
+    // n/SE/lo95 actually live — a reader gets the measured numbers, not an SE
+    // invented for the roll-up.
+    expect(deauth.cells).toHaveLength(2);
+    for (const c of deauth.cells!) {
+      expect(c.seR_gate).toBeTypeOf('number');
+      expect(c.lowerCI95).toBeTypeOf('number');
+    }
+    const authorized = body.bands.filter((b) => b.authorization === 'authorized');
+    expect(authorized).toHaveLength(1);
+    expect(authorized[0]!.evidence).toMatchObject({ n: 100, seR_gate: 0.422, lowerCI95: 0.799 });
+  });
+
+  it('states the authorized band as BOUNDED, and keeps the journal key frozen', () => {
+    const body = serve();
+    expect(body.sleeve.authorizedBand).toMatchObject({ from: 0.495, to: 0.55 });
+    expect(body.sleeve.label).toBe('Near-ATM Single-Leg (long)');
+    // TRA-3392 §7 — the label is new; the KEY is the join column and must not move.
+    expect(body.sleeve.structureKey).toBe('single_leg_otm');
+  });
+
+  // (b) the three decline reason codes
+  it('publishes THREE distinct decline reason codes, each with its own response', () => {
+    const body = serve();
+    expect(body.declineReasonCodes.map((r) => r.code)).toEqual([
+      'band_deauthorized', 'insufficient_evidence', 'gross_negative',
+    ]);
+    expect(new Set(body.declineReasonCodes.map((r) => r.response)).size).toBe(3);
+    // "we measured a loser" vs "we never measured" vs "the mandate forbids it" is
+    // the distinction the board could not previously make.
+    expect(body.declineReasonCodes[0]!.meaning).toMatch(/MANDATE FORBIDS/);
+    expect(body.declineReasonCodes[1]!.meaning).toMatch(/NEVER MEASURED/);
+    expect(body.declineReasonCodes[2]!.meaning).toMatch(/MEASURED A LOSER/);
+  });
+
+  // (c) the ceiling gate's own counters
+  it('publishes the ceiling counters even while the gate is DARK, and says so', () => {
+    const body = serve();
+    expect(body.ceiling.mode).toBe('off');
+    expect(body.ceiling.mandateCeiling).toBe(0.55);
+    // Both counters exist at zero. An absent row and a silent row are the same
+    // JSON otherwise, and a silent row is this gate's EXPECTED healthy state.
+    expect(body.ceiling.counters.enforcing.gate).toBe('entry_delta_ceiling');
+    expect(body.ceiling.counters.shadow.gate).toBe('entry_delta_ceiling_shadow');
+    expect(body.ceiling.counters.enforcing.today).toMatchObject({ evaluated: 0, blocked: 0 });
+    // ...and the note must not let a STRUCTURAL zero read as a clean bill.
+    expect(body.note).toMatch(/CEILING DARK/);
+    expect(body.note).toMatch(/not a clean bill/);
+  });
+
+  it('counts an ENFORCED block on its own gate, separately from the shadow gate', () => {
+    process.env[OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG] = '1';
+    recordLiveEnforceDecision(
+      'entry_delta_ceiling', 'single_leg_otm', true, etDateString(new Date(NOW)),
+      'above ceiling', NOW, { reasonCode: 'above_mandate_ceiling', cell: 'single_leg_otm::[0.55,inf)' },
+    );
+    const body = serve();
+    expect(body.ceiling.mode).toBe('enforce');
+    expect(body.ceiling.inForce).toBe(0.55);
+    expect(body.ceiling.counters.enforcing.today).toMatchObject({ evaluated: 1, blocked: 1 });
+    expect(body.ceiling.counters.shadow.today).toMatchObject({ evaluated: 0, blocked: 0 });
+    expect(body.note).toMatch(/CEILING ENFORCE/);
+    expect(body.note).toMatch(/evaluated > 0, blocked = 0/); // the expected healthy read
+  });
+
+  it('keeps a SHADOW would-block off the enforcing gate entirely', () => {
+    process.env[OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE_FLAG] = '1';
+    recordLiveEnforceDecision(
+      'entry_delta_ceiling_shadow', 'single_leg_otm', true, etDateString(new Date(NOW)),
+      'would have blocked', NOW, { reasonCode: 'above_mandate_ceiling' },
+    );
+    const body = serve();
+    expect(body.ceiling.mode).toBe('observe');
+    // The enforcing gate stays at a TRUE zero: no live open was stopped by it.
+    expect(body.ceiling.counters.enforcing.today).toMatchObject({ evaluated: 0, blocked: 0 });
+    expect(body.ceiling.counters.shadow.today).toMatchObject({ evaluated: 1, blocked: 1 });
+  });
+
+  it('makes a REFUSED widening override visible instead of silently ignoring it', () => {
+    process.env[OPTION_ENTRY_DELTA_CEILING_LIVE_FLAG] = '1';
+    process.env[OPTION_ENTRY_DELTA_CEILING_LIVE_VALUE_VAR] = '0.80';
+    const body = serve();
+    expect(body.ceiling.inForce).toBe(0.55); // the mandate stands
+    expect(body.ceiling.rawOverride).toBe('0.80');
+    expect(body.ceiling.overrideRejectedReason).toMatch(/ABOVE/);
   });
 });

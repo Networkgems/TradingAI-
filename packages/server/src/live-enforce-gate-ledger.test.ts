@@ -36,7 +36,18 @@ describe('live-enforce-gate-ledger', () => {
     expect(s.decisionsRecorded).toBe(0);
     expect(s.lastDecisionAt).toBeNull();
     // Every gate is always present so a reader never mistakes "gate absent" for "gate armed, nothing seen".
-    expect(s.byGate.map((g) => g.gate).sort()).toEqual(['cost_bar', 'otm_delta_floor', 'spread', 'universe']);
+    // TRA-3394 added the two ceiling axes, and they need this invariant MORE than the
+    // others: the ceiling's expected healthy read is `evaluated > 0, blocked = 0`
+    // (n=20 above 0.55 on the whole tape), so an absent row and a silent one would be
+    // indistinguishable exactly where the distinction matters.
+    expect(s.byGate.map((g) => g.gate).sort()).toEqual([
+      'cost_bar',
+      'entry_delta_ceiling',
+      'entry_delta_ceiling_shadow',
+      'otm_delta_floor',
+      'spread',
+      'universe',
+    ]);
     for (const g of s.byGate) {
       expect(g).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
     }
