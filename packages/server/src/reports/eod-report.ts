@@ -14,7 +14,7 @@ import { MANAGED_ACCOUNT_RATIO, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE
 import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/shared';
 // TRA-2610 — the consumer-side plausibility predicate. Reads `moveSuspect` AND
 // re-executes the rule, so a lost stamp cannot promote a fabrication.
-import { isMoveSuspect, assessLevelContinuity, describeLevelContinuity } from '@trading-app/shared';
+import { isMoveSuspect, isMoveSuspectNow, assessLevelContinuity, describeLevelContinuity } from '@trading-app/shared';
 // TRA-3068 — the split-calendar leg: the ONLY instrument that can reach a
 // sub-2.0 corporate action, because the other two are internal-consistency tests
 // and an unadjusted action is internally consistent (measured, TRA-3065).
@@ -295,11 +295,36 @@ function top5Movers(
     && !moveSuspect(s)
     && continuity(s).verdict !== 'suspect';
   const candidates = symbols.filter(s => s.lastUpdated > 0 && s.price > 0);
-  const excluded = candidates.filter(s => isMoveSuspect(s));
+  // TRA-3243 — ATTRIBUTE, DON'T POOL. This census is the CLOSING-SNAPSHOT leg and it
+  // must keep reporting only what the closing snapshot condemns, so it stays the
+  // measure of what the ratio/flag rule contributes. `isMoveSuspect` now ORs in the
+  // session fact, so filtering on it here would have silently re-labelled every
+  // TRA-3243 row as a TRA-2610 catch — the exact attribution error that makes a new
+  // instrument's contribution unmeasurable, and it would have read as "the ratio rule
+  // caught AZI" in the one log line a reader uses to check whether it did.
+  const excluded = candidates.filter(s => isMoveSuspectNow(s));
   if (excluded.length > 0) {
     log.warn('top-movers EXCLUDED implausible moves', {
       issue: 'TRA-2610',
       symbols: excluded.map(s => `${s.symbol}@${s.price}:${s.changePct}%:${s.quoteStatus ?? 'n/a'}`),
+    });
+  }
+  // TRA-3243 — the census of what the SESSION fact adds over the closing snapshot,
+  // reported separately for the same reason as every other leg: this is the set the
+  // feed condemned during the session and the old code republished at the close
+  // (AZI +58.42% #2 on 08-06, RDGT +32.73% #4 on 08-10, both on the SAME implied
+  // prev close in both verdicts). If this line is ever empty on a session where the
+  // feed emitted `quote move flagged suspect`, the session state was lost — a boot
+  // clears it, since it lives in `symbolState` and nothing persists it.
+  const sessionOnly = candidates.filter(s => !isMoveSuspectNow(s) && isMoveSuspect(s));
+  if (sessionOnly.length > 0) {
+    log.warn('top-movers EXCLUDED rows condemned earlier in the session', {
+      issue: 'TRA-3243',
+      symbols: sessionOnly.map(s =>
+        `${s.symbol}@${s.price}:${s.changePct}%`
+        + `:condemnedPrev=${s.moveSuspectPrevClose ?? 'n/a'}`
+        + `:nowPrev=${assessQuotePlausibility(s).impliedPrevClose ?? 'n/a'}`
+        + `:day=${s.moveSuspectSessionDay ?? 'n/a'}`),
     });
   }
   // Reported separately from the two above for the same reason they are reported

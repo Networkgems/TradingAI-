@@ -3833,6 +3833,21 @@ export interface CryptoSymbolState {
    * reading this field directly, so the rule is executed even on a row no producer
    * stamped. NOTE: nothing on the crypto path sets this today, deliberately — see
    * the top-movers comment in `crypto-eod-report.ts`.
+   *
+   * TRA-3243 — this field is the INSTANTANEOUS verdict and it is NOT monotonic
+   * within a session: it is re-derived every tick, so it clears the moment the
+   * numerator mean-reverts under the bar even though the denominator under
+   * suspicion is unchanged.
+   *
+   * ⚠️ The session-scoped companion fields (`moveSuspectSession` /
+   * `moveSuspectSessionDay` / `moveSuspectPrevClose`) are DELIBERATELY NOT declared
+   * here. They exist on the equity `SymbolState` in `signal-engine.ts`, whose
+   * `applyQuotes` is the only producer that runs the state machine. Declaring them
+   * on a shape nothing maintains would let a reader treat an always-`undefined`
+   * field as an always-clean verdict — the same "one field, two facts" mistake
+   * TRA-2610 unwound. `isMoveSuspect()` degrades correctly on a crypto row: with no
+   * session fact present it falls through to `isMoveSuspectNow()`, i.e. exactly
+   * today's behaviour.
    */
   moveSuspect?: boolean;
 }

@@ -420,6 +420,13 @@ export interface QuoteMoveRow {
   changePct?: number;
   /** TRA-2610 — the producer's verdict, stamped by `signal-engine.applyQuotes`. */
   moveSuspect?: boolean;
+  /**
+   * TRA-3243 — the SESSION-SCOPED verdict: this row published an implausible move
+   * at some point in today's session, ON A PREV CLOSE THAT IS STILL THE ONE IN USE.
+   * See `advanceMoveSuspectSession` for the state machine that maintains it and
+   * for why it is a different proposition from `moveSuspect`.
+   */
+  moveSuspectSession?: boolean;
 }
 
 /**
@@ -444,14 +451,201 @@ export interface QuoteMoveRow {
  * The flag is still honoured first because it is the producer's verdict on the
  * quote it actually saw (including inputs the row no longer carries), and because a
  * consumer must not silently disagree with the stamp on `/api/state`.
+ *
+ * TRA-3243 — this is the INSTANTANEOUS reading: *is the move this row is
+ * publishing right now implausible*. It is no longer the default consumer
+ * predicate; `isMoveSuspect` below is. Kept exported and named so the two
+ * propositions can be told apart at a call site and in a census.
  */
-export function isMoveSuspect(row: QuoteMoveRow): boolean {
+export function isMoveSuspectNow(row: QuoteMoveRow): boolean {
   if (row.moveSuspect === true) return true;
   return assessQuotePlausibility({
     price: row.price ?? NaN,
     change: row.change,
     changePct: row.changePct,
   }).suspect;
+}
+
+/**
+ * THE consumer-side predicate (TRA-3243): may this row's `change` / `changePct` be
+ * ranked, headlined or coloured?
+ *
+ * ⭐ **The flag is a verdict on the DENOMINATOR, not on the ratio.** The ratio test
+ * is only the detector. `isMoveSuspectNow` alone answers "is the ratio big *at this
+ * instant*", and that made the guard non-monotonic within a session: a row condemned
+ * at 15:00 read clean at the close because the NUMERATOR mean-reverted, while
+ * `impliedPrevClose` — the datum actually under suspicion — was the same number in
+ * both verdicts (AZI 08-06: condemned on prev `1.0100`, published `1.60 / +58.42%`
+ * ⇒ prev `1.00998`; RDGT 08-10: condemned on prev `0.7390`, published
+ * `0.9899 / +32.73%` ⇒ prev `0.7458`). `eod-report.ts` samples the CLOSING snapshot,
+ * so the published exclusion set was strictly smaller than the set the feed flagged.
+ *
+ * So the session fact is ORed in. It is not a plain latch — see
+ * `advanceMoveSuspectSession` for the discharge conditions.
+ */
+export function isMoveSuspect(row: QuoteMoveRow): boolean {
+  if (row.moveSuspectSession === true) return true;
+  return isMoveSuspectNow(row);
+}
+
+// ── TRA-3243 — WHICH FACT IS BEING LATCHED ───────────────────────────────────
+//
+// Two propositions, deliberately not merged:
+//
+//   P-now      this row's move is implausible AT THIS INSTANT.
+//   P-session  this row published an implausible move AT SOME POINT in today's
+//              session, ON A PREV CLOSE THAT IS STILL THE ONE IN USE.
+//
+// P-session is NOT "was suspect once today". A plain latch was the obvious remedy
+// and it is the wrong one: it permanently badges a genuine intraday spike that
+// mean-reverts, and on the sub-penny partition (FLYYQ, r >= 2 on 4 of 4 readable
+// sessions, where one tick IS a factor of two) it would fire every session and
+// never clear. What is latched here is the CONDEMNATION OF A SPECIFIC DENOMINATOR,
+// and it is discharged the moment that denominator is re-derived to a materially
+// different value — which is exactly the event that would mean the feed had
+// corrected the datum under suspicion.
+
+/**
+ * The prev close a row was condemned on, carried across ticks so the suspicion can
+ * be attached to the datum rather than to the row.
+ */
+export interface MoveSuspectSessionState {
+  /** P-session. */
+  moveSuspectSession?: boolean;
+  /** ET session date key (`YYYY-MM-DD`) the fact belongs to. */
+  moveSuspectSessionDay?: string;
+  /** The `impliedPrevClose` that was condemned. The ANCHOR — never re-based. */
+  moveSuspectPrevClose?: number;
+}
+
+export type MoveSuspectSessionTransition =
+  /** Clean before, clean now. */
+  | 'clean'
+  /** Newly condemned this session. */
+  | 'condemned'
+  /** Already condemned, condemned again. */
+  | 'sustained'
+  /** Instantaneously clean, but on the SAME denominator ⇒ the fact stands. */
+  | 'held'
+  /** Instantaneously clean on a DIFFERENT denominator ⇒ the suspicion is spent. */
+  | 'discharged'
+  /** Instantaneously clean but the denominator is unreadable ⇒ fail closed. */
+  | 'unreadable'
+  /** The carried fact belonged to a previous session and was dropped. */
+  | 'rolled_over';
+
+export interface MoveSuspectSessionAdvance extends MoveSuspectSessionState {
+  moveSuspectSession: boolean;
+  moveSuspectSessionDay: string;
+  transition: MoveSuspectSessionTransition;
+}
+
+/**
+ * Two implied prev closes are THE SAME DATUM.
+ *
+ * The band is derived, not tuned. `impliedPrevClose` prefers `price - change`, and
+ * providers quantise `change` to 2 dp while `price` carries 3-4, so the recovered
+ * denominator of a FIXED true prev close wanders inside a +/- 0.005 half-ulp — two
+ * reads can therefore differ by up to 0.01 with nothing having happened. The band
+ * is set at twice that so it does not sit ON the edge of the population it must
+ * absorb (TRA-3241: a threshold placed at the mode of its own population is a coin
+ * flip), plus a 1% relative term so the same reasoning holds at any price level.
+ *
+ * The other population is orders of magnitude away: a denominator that genuinely
+ * CHANGES does so because the feed swapped an unadjusted close for an adjusted one,
+ * and the smallest corporate action in the grid (3:2) moves it 33%. 2c/1% sits in
+ * the gap between the two, not on either.
+ */
+const PREV_CLOSE_IDENTITY_ABS = 0.02;
+const PREV_CLOSE_IDENTITY_REL = 0.01;
+
+export function isSameImpliedPrevClose(a: number | null | undefined, b: number | null | undefined): boolean {
+  if (typeof a !== 'number' || typeof b !== 'number') return false;
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  const tol = Math.max(PREV_CLOSE_IDENTITY_ABS, PREV_CLOSE_IDENTITY_REL * Math.max(Math.abs(a), Math.abs(b)));
+  return Math.abs(a - b) <= tol;
+}
+
+/**
+ * Advance the session-scoped verdict by one tick. PURE — the engine owns the
+ * storage, this owns the rule, so the state machine is testable without a feed.
+ *
+ * | carried fact | this tick's verdict | denominator | result                  |
+ * |---|---|---|---|
+ * | any          | suspect             | -           | condemned (anchor := this prev close) |
+ * | set          | clean               | same        | HELD                    |
+ * | set          | clean               | different   | discharged              |
+ * | set          | clean               | unreadable  | HELD (fail closed)      |
+ * | unset        | clean               | -           | clean                   |
+ *
+ * The anchor is never re-based while the fact stands. Re-basing it every tick would
+ * let the 0.005 quantisation wander ratchet the "same datum" band arbitrarily far
+ * from the value that was actually condemned.
+ *
+ * A carried fact from a different ET session day is dropped before any of this: the
+ * proposition is scoped to ONE session, and "implausible yesterday" is a claim about
+ * a prev close that is not even in the arithmetic any more.
+ */
+export function advanceMoveSuspectSession(
+  prev: MoveSuspectSessionState | null | undefined,
+  verdict: QuotePlausibilityVerdict,
+  sessionDay: string,
+): MoveSuspectSessionAdvance {
+  const sameSession = prev?.moveSuspectSessionDay === sessionDay;
+  const carried = sameSession && prev?.moveSuspectSession === true;
+  const rolledOver = !sameSession && prev?.moveSuspectSession === true;
+
+  if (verdict.suspect) {
+    const anchor = typeof verdict.impliedPrevClose === 'number' && Number.isFinite(verdict.impliedPrevClose)
+      ? verdict.impliedPrevClose
+      // A `non_finite` / unrecoverable verdict has no denominator to anchor to;
+      // keep whatever we were condemned on so the fact stays discharge-able.
+      : (carried ? prev?.moveSuspectPrevClose : undefined);
+    return {
+      moveSuspectSession: true,
+      moveSuspectSessionDay: sessionDay,
+      ...(typeof anchor === 'number' ? { moveSuspectPrevClose: anchor } : {}),
+      transition: carried ? 'sustained' : 'condemned',
+    };
+  }
+
+  if (!carried) {
+    return {
+      moveSuspectSession: false,
+      moveSuspectSessionDay: sessionDay,
+      transition: rolledOver ? 'rolled_over' : 'clean',
+    };
+  }
+
+  const anchor = prev?.moveSuspectPrevClose;
+  if (typeof anchor !== 'number' || !Number.isFinite(anchor)
+    || typeof verdict.impliedPrevClose !== 'number' || !Number.isFinite(verdict.impliedPrevClose)) {
+    // Cannot compare ⇒ cannot claim the suspicion was discharged. An unreadable
+    // denominator is not evidence of a corrected one (TRA-2379's cost asymmetry:
+    // a false positive costs one row a badge, a false negative headlines a
+    // fabrication in a document a human reads as the session summary).
+    return {
+      moveSuspectSession: true,
+      moveSuspectSessionDay: sessionDay,
+      ...(typeof anchor === 'number' ? { moveSuspectPrevClose: anchor } : {}),
+      transition: 'unreadable',
+    };
+  }
+
+  if (isSameImpliedPrevClose(anchor, verdict.impliedPrevClose)) {
+    return {
+      moveSuspectSession: true,
+      moveSuspectSessionDay: sessionDay,
+      moveSuspectPrevClose: anchor,
+      transition: 'held',
+    };
+  }
+
+  return {
+    moveSuspectSession: false,
+    moveSuspectSessionDay: sessionDay,
+    transition: 'discharged',
+  };
 }
 
 // ── TRA-2634 — LEVEL CONTINUITY ACROSS TWO DATED ARTIFACTS ────────────────────

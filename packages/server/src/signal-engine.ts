@@ -16,7 +16,12 @@ import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
 // TRA-3068 — plus the split-calendar leg, which is the only one that can reach a
 // sub-2.0 corporate action (neither ratio nor continuity can, at any threshold).
-import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR, describeCorporateAction } from '@trading-app/shared';
+import {
+  assessQuotePlausibility,
+  advanceMoveSuspectSession,
+  SUSPECT_MOVE_RATIO_FLOOR,
+  describeCorporateAction,
+} from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
 // TRA-3112 — the single copy of the market-data / account endpoint-class split.
 // This module imports nothing back from here, so there is no cycle.
@@ -438,8 +443,21 @@ export interface SymbolState {
    * Consumers must call `isMoveSuspect()` (shared), never read this directly: it
    * re-executes the rule so a row written by a path that never assessed
    * plausibility still fails closed.
+   *
+   * TRA-3243 — INSTANTANEOUS. Non-monotonic within a session by construction; the
+   * session-scoped fact lives on the three fields below.
    */
   moveSuspect?: boolean;
+  /**
+   * TRA-3243 — "condemned at some point today on a prev close that is still the one
+   * in use". Maintained by `advanceMoveSuspectSession` on BOTH branches of
+   * `applyQuotes`; this is what `isMoveSuspect()` keys on.
+   */
+  moveSuspectSession?: boolean;
+  /** TRA-3243 — the ET session day the fact above is scoped to (`YYYY-MM-DD`). */
+  moveSuspectSessionDay?: string;
+  /** TRA-3243 — the `impliedPrevClose` that was condemned. The anchor, never re-based. */
+  moveSuspectPrevClose?: number;
   /**
    * TRA-1980 — L1 best bid/ask (+ displayed sizes) when the quote source carries a
    * book (Tradier only; the Yahoo/Stooq fallbacks leave these undefined). Consumed
@@ -3869,6 +3887,10 @@ export class SignalEngine {
     activeSymbols: string[],
   ): Map<string, number> {
     const prices = new Map<string, number>();
+    // TRA-3243 — ONE session key for the whole batch, read once. Taking it per
+    // symbol would let a batch that straddles ET midnight roll some rows over and
+    // not others, which is a partition the census could never explain.
+    const sessionDay = etDateKey(Date.now());
     for (const [sym, q] of quotes) {
       prices.set(sym, q.price);
       // TRA-2689 (leg 2 of TRA-2654) — WRITE-ONLY TAPE, NOT A DETECTOR.
@@ -3922,8 +3944,13 @@ export class SignalEngine {
       // Tradier day most symbols never reach that fallback — so a silent absence
       // here means "not looked up", NOT "no split". The report path
       // (`fetchRecentSplits`) is the one that asks explicitly.
-      const knownSplit = knownSplitForSession(sym, null, etDateKey(Date.now()));
+      const knownSplit = knownSplitForSession(sym, null, sessionDay);
       const plausibility = assessQuotePlausibility(q, knownSplit);
+      // TRA-3243 — advance the SESSION-scoped fact before the row is overwritten.
+      // `plausibility.suspect` alone is not monotonic within a session: it clears
+      // the moment the numerator falls back under the bar, on an UNCHANGED
+      // denominator, and `eod-report.ts` samples the closing snapshot.
+      const session = advanceMoveSuspectSession(priorRow, plausibility, sessionDay);
       if (plausibility.suspect) {
         log.warn('quote move flagged suspect', {
           issue: plausibility.reason === 'corporate_action' ? 'TRA-3068'
@@ -3947,6 +3974,28 @@ export class SignalEngine {
             : {}),
         });
       }
+      // TRA-3243 — EDGE-triggered, both directions. The verdict flip is the whole
+      // finding, so it must be readable in the tape rather than inferrable from
+      // the absence of a line: `held` is the row the old code republished, and
+      // `discharged` is the exclusion this ticket is allowed to drop. Only the
+      // transition is logged (the instantaneous verdict just flipped), so this is
+      // at most a couple of lines per symbol per session, not one per tick.
+      if (!plausibility.suspect && priorRow?.moveSuspect === true
+        && (session.transition === 'held' || session.transition === 'unreadable'
+          || session.transition === 'discharged')) {
+        log.warn(session.transition === 'discharged'
+          ? 'quote move session suspicion DISCHARGED'
+          : 'quote move session suspicion HELD across a clean tick', {
+          issue: 'TRA-3243',
+          symbol: sym,
+          transition: session.transition,
+          price: q.price,
+          changePct: q.changePct,
+          ratio: plausibility.ratio,
+          condemnedPrevClose: priorRow?.moveSuspectPrevClose ?? null,
+          impliedPrevClose: plausibility.impliedPrevClose,
+        });
+      }
       this.symbolState.set(sym, {
         symbol: sym,
         price: q.price,
@@ -3959,6 +4008,13 @@ export class SignalEngine {
         // stamp cannot reach it.
         quoteStatus: 'ok',
         moveSuspect: plausibility.suspect,
+        // TRA-3243 — two fields, two facts, same shape as TRA-2610's split above:
+        // `moveSuspect` is P-now, `moveSuspectSession` is P-session.
+        moveSuspectSession: session.moveSuspectSession,
+        moveSuspectSessionDay: session.moveSuspectSessionDay,
+        ...(typeof session.moveSuspectPrevClose === 'number'
+          ? { moveSuspectPrevClose: session.moveSuspectPrevClose }
+          : {}),
         // TRA-1980 — carry the L1 book through when the source provided one
         // (Tradier); the fallbacks omit these, so the liquidity gate degrades to a
         // no-record rather than a bogus decision on a book it never saw.
@@ -3987,12 +4043,26 @@ export class SignalEngine {
         change: prev?.change ?? 0,
         changePct: prev?.changePct ?? 0,
       };
+      // TRA-3243 — the two branches of this stamp used to latch OPPOSITELY: this
+      // one ORed the previous verdict in, the success branch above was a plain
+      // assignment. So the guard protected a row only while the feed was BROKEN
+      // and let go the moment it worked. Both branches now run the same session
+      // state machine; the `prev?.moveSuspect === true ||` below stays because it
+      // is P-now's own carry (the previous verdict may have used inputs — a split
+      // calendar hit — that the carried numbers no longer contain).
+      const carriedVerdict = assessQuotePlausibility(carried);
+      const session = advanceMoveSuspectSession(prev, carriedVerdict, sessionDay);
       this.symbolState.set(sym, {
         symbol: sym,
         ...carried,
         lastUpdated: prev?.lastUpdated ?? 0,
         quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
-        moveSuspect: prev?.moveSuspect === true || assessQuotePlausibility(carried).suspect,
+        moveSuspect: prev?.moveSuspect === true || carriedVerdict.suspect,
+        moveSuspectSession: session.moveSuspectSession || prev?.moveSuspect === true,
+        moveSuspectSessionDay: session.moveSuspectSessionDay,
+        ...(typeof session.moveSuspectPrevClose === 'number'
+          ? { moveSuspectPrevClose: session.moveSuspectPrevClose }
+          : {}),
       });
     }
     // TRA-1996 — record that a quote batch just stamped freshness, so a quote-only

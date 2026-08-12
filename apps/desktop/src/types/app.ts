@@ -18,7 +18,17 @@ export interface SymbolState {
   // (unadjusted prev close). `change` / `changePct` are still the RAW server values;
   // the UI degrades the cells rather than trusting them. Read it through
   // `isQuoteMoveUnreliable()`, which also re-executes the rule.
+  // TRA-3243 — INSTANTANEOUS: it clears when the numerator mean-reverts under the
+  // bar even though the denominator under suspicion is unchanged. Never badge off
+  // this field directly.
   moveSuspect?: boolean;
+  // TRA-3243 — the SESSION fact: condemned at some point today on a prev close that
+  // is still the one in use. This is what `isQuoteMoveUnreliable()` keys on, because
+  // a badge is a verdict on the DENOMINATOR and the denominator has not changed.
+  moveSuspectSession?: boolean;
+  // TRA-3243 — the `impliedPrevClose` the row was condemned on, so the badge's
+  // tooltip can name the datum rather than assert a verdict.
+  moveSuspectPrevClose?: number;
 }
 
 export interface AppState {

@@ -135,6 +135,14 @@ const WEIGHTS: Record<string, number> = {
  * Returns the verdict on a suspect row (so the caller can log the arithmetic
  * that condemned it — per TRA-2379 decision 2 a silent drop reads identically
  * to nothing being wrong) and `null` on a row that may be ranked.
+ *
+ * TRA-3243 — WHICH PROPOSITION THIS CONSUMER NEEDS: **P-now**, and for the same
+ * structural reason as `market-scanner`: an archived `EodMover` carries no session
+ * fact (nothing writes one to disk), so `isMoveSuspect` degrades here to
+ * `isMoveSuspectNow` by construction. That is not a gap — this path got STRICTLY
+ * safer without changing, because the archive it reads is now written by a
+ * `top5Movers` that already dropped the session-condemned rows upstream. The rule is
+ * re-executed here anyway, as the belt-and-braces this docblock describes.
  */
 function suspectMover(mover: EodMover): { reason: string; impliedPrevClose: number | null; ratio: number | null } | null {
   if (!isMoveSuspect(mover)) return null;

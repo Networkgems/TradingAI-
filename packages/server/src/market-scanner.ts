@@ -24,6 +24,23 @@ export interface ScreenerMoveFields {
  *
  * Logs every exclusion: per TRA-2379 decision 2 a silent drop reads identically to
  * "nothing was wrong", which is the failure this ticket exists to end.
+ *
+ * TRA-3243 — WHICH PROPOSITION THIS CONSUMER NEEDS: **P-now**, and it is the only
+ * one available here. Per the module note above, this path never touches
+ * `symbolState`, so there is no session history for a Yahoo screener row and no
+ * `moveSuspectSession` to read — `assessQuotePlausibility` on the row's own numbers
+ * is the whole instrument. That is also the right proposition: the scanner's
+ * question is "is this worth ADDING to a watchlist", a fresh decision about a symbol
+ * we may never have ticked, not "may today's published move be ranked in a document
+ * a human reads as the session summary" (which is EOD movers, and that one is
+ * P-session).
+ *
+ * ⚠️ Residual, stated rather than papered over: a symbol the engine condemned at
+ * 15:00 can still be suggested by a 15:30 screener call if its ratio has fallen back
+ * under the bar. That is bounded — a suggestion is not a publication, and the engine
+ * re-condemns the row on its next tick, at which point every ranking surface honours
+ * P-session. Closing it would mean giving this module an engine-state dependency it
+ * was deliberately built without.
  */
 export function isScreenerMoveSuspect(symbol: string, q: ScreenerMoveFields, reason: ScanReason): boolean {
   const input = {

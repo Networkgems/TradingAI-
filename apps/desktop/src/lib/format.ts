@@ -98,6 +98,15 @@ type QuoteRow = { lastUpdated: number; quoteStatus?: QuoteStatus } & QuoteMoveRo
  * publishes. It used to test `quoteStatus === 'suspect'`, which a later failed fetch
  * erased — so the UI stopped badging exactly the thin, badly-quoted rows most likely
  * to be fabricated.
+ *
+ * TRA-3243 — WHICH PROPOSITION THIS CONSUMER NEEDS: **P-session**, via the shared
+ * `isMoveSuspect`. The badge and the CHANGE % sort resolver are both verdicts on the
+ * DENOMINATOR (`impliedPrevClose`), and a numerator that mean-reverts back under the
+ * ratio bar re-derives nothing about the denominator — so P-now would make the badge
+ * blink off mid-session on an unchanged suspect prev close (WXM 08-11: badged at
+ * +106.78%, unbadged at +98.38%, same session, same implied prev). Use
+ * `isMoveSuspectNow` only where the question really is "is the move implausible at
+ * this instant"; no UI surface asks that.
  */
 export function isQuoteMoveUnreliable(s: QuoteMoveRow): boolean {
   return isMoveSuspect(s);

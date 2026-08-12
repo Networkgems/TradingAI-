@@ -1146,3 +1146,102 @@ describe('read-time provenance against a generated report (TRA-2631)', () => {
   });
 });
 
+/**
+ * TRA-3243 — ACCEPTANCE AT THE REPORT BOUNDARY: the intended EOD disposition of a
+ * row the feed condemned mid-session and that came back CLEAN at the close.
+ *
+ * `packages/shared/src/move-suspect-session.test.ts` grades the state machine. This
+ * one grades the thing the ticket is actually about — `top5Movers` samples the
+ * CLOSING snapshot, so before the fix the published exclusion set was strictly
+ * smaller than the set the feed flagged during the session, and AZI went out at
+ * rank #2 (+58.42%, 08-06) and RDGT at rank #4 (+32.73%, 08-10).
+ *
+ * ⭐ Both closing rows are BELOW every other instrument's bar: r = 1.5842 and
+ * r = 1.3273 are under `SUSPECT_MOVE_RATIO` (2) AND under `SUSPECT_MOVE_RATIO_FLOOR`
+ * (1.9), no split calendar is passed, and no prior-session artifact is passed, so
+ * the level-continuity leg abstains. The session fact is the ONLY thing that can
+ * exclude them — which is what makes the positive control below meaningful rather
+ * than a rubber stamp.
+ */
+describe('TRA-3243 top movers — a row condemned earlier in the session stays excluded', () => {
+  const now = Date.now();
+
+  /** A closing row as `applyQuotes` writes it: instantaneously clean. */
+  const closingRow = (symbol: string, price: number, changePct: number) => ({
+    symbol, price, volume: 100_000, change: price - price / (1 + changePct / 100),
+    changePct, lastUpdated: now, quoteStatus: 'ok' as const, moveSuspect: false,
+  });
+
+  /** ...plus the session fact the engine carried forward from the condemned tick. */
+  const condemnedEarlier = (
+    row: ReturnType<typeof closingRow>, condemnedPrevClose: number, day: string,
+  ) => ({
+    ...row,
+    moveSuspectSession: true,
+    moveSuspectSessionDay: day,
+    moveSuspectPrevClose: condemnedPrevClose,
+  });
+
+  const GENUINE = [
+    closingRow('SOXL', 91.99, -16.02), closingRow('IREN', 29.31, -13.62),
+    closingRow('AXTI', 36.97, -13.54), closingRow('ONDS', 6.80, -13.49),
+  ];
+
+  const reportFor = (symbols: EngineState['symbols']) => generateEodReport({
+    state: makeEngineState({ symbols }),
+    allClosedPositions: [],
+    dailySignals: [],
+    signalTypeMap: new Map(),
+  });
+
+  it('AZI 08-06 (+58.42%, published #2) is excluded on the session fact alone', () => {
+    const clean = closingRow('AZI', 1.60, 58.42);
+
+    // POSITIVE CONTROL — the closing row on its own IS published, by every
+    // instrument the report carries. Without this the test would pass against a
+    // row something else already excluded.
+    expect(isMoveSuspect(clean)).toBe(false);
+    expect(assessQuotePlausibility(clean).suspect).toBe(false);
+    expect(assessQuotePlausibility(clean).ratio).toBeCloseTo(1.5842, 4);
+    expect(assessQuotePlausibility(clean).ratio!).toBeLessThan(SUSPECT_MOVE_RATIO_FLOOR);
+    expect(reportFor([clean, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('AZI');
+
+    // The same row, carrying the fact the feed established at 2.47 / +144.55% on a
+    // prev close of 1.0100 — which is the SAME denominator the +58.42% row implies.
+    const report = reportFor([condemnedEarlier(clean, 1.0100, '2026-08-06'), ...GENUINE]);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('AZI');
+    expect(report.top5Movers[0].symbol).toBe('SOXL');
+    expect(report.markdown).not.toContain('| AZI ');
+  });
+
+  it('RDGT 08-10 (+32.73%, published #4) is excluded on the session fact alone', () => {
+    const clean = closingRow('RDGT', 0.9899, 32.73);
+
+    expect(isMoveSuspect(clean)).toBe(false);
+    expect(assessQuotePlausibility(clean).ratio).toBeCloseTo(1.3273, 4);
+    expect(reportFor([clean, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('RDGT');
+
+    const report = reportFor([condemnedEarlier(clean, 0.7458, '2026-08-10'), ...GENUINE]);
+    expect(report.top5Movers.map(m => m.symbol)).not.toContain('RDGT');
+    expect(report.markdown).not.toContain('| RDGT ');
+  });
+
+  it('CONTROL — a genuinely clean session is untouched, table and ranking intact', () => {
+    // Acceptance criterion 3. The four archived movers carry no session fact, and
+    // the fix must not invent one: same five rows, same order, as before TRA-3243.
+    const report = reportFor(GENUINE);
+    expect(report.top5Movers.map(m => m.symbol)).toEqual(['SOXL', 'IREN', 'AXTI', 'ONDS']);
+    for (const s of GENUINE) expect(isMoveSuspect(s)).toBe(false);
+  });
+
+  it('a DISCHARGED row is published again — the exclusion is not a one-way ratchet', () => {
+    // The engine clears `moveSuspectSession` when the denominator is re-derived to
+    // a materially different value, so by the time the report sees it there is no
+    // fact to honour. Asserted here because "excluded" and "excluded forever" are
+    // different behaviours and only one of them is intended.
+    const discharged = { ...closingRow('AZI', 1.60, 58.42), moveSuspectSession: false,
+      moveSuspectSessionDay: '2026-08-06' };
+    expect(reportFor([discharged, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('AZI');
+  });
+});
+
