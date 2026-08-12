@@ -83,7 +83,7 @@ describe('giveback-arm-floor-ledger', () => {
 
   it('classifies a clean sub-floor-peak day as a PRIMARY-AC pass (no halt, floor uncleared)', () => {
     hydrateGiveBackArmFloorFromDisk(dir, 1_000);
-    // Peak +$7 on a small book, below the $25 arm floor, gives back to +$2 — must NOT halt.
+    // Peak +$7 on a small book, below the $100 arm floor (TRA-3218), gives back to +$2 — must NOT halt.
     recordGiveBackState('demo', 'engine-1', DAY, snap(7, 5), 1_001);
     recordGiveBackState('demo', 'engine-1', DAY, snap(7, 2), 1_002);
 

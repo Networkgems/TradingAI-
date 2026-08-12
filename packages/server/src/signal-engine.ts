@@ -10,7 +10,7 @@ import {
   type LiveBrokerPositionDriftReport,
 } from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
@@ -1758,7 +1758,7 @@ export class DailyRiskGovernor {
    * and — like `dailyPnl` and the daily breaker — resets on the ET day roll
    * (`resetIfNewDay`). `sessionHalted` is a DAY-LATCHED flag set once the book
    * surrenders >40% of that peak (give-back cap) OR goes net-negative after being
-   * up ≥ 0.5R of book equity (session stop). It gates BOTH the equity entry path
+   * up ≥ max(1R of book equity, $100) (session stop, TRA-3218). It gates BOTH the equity entry path
    * (folded into {@link isHalted}) and the options entry path (via
    * {@link isBookHalted}, checked explicitly in `runRelativeValueScan`). It stays
    * dark until `EXIT_RISK_RULES_ENABLED` is set — the caller only invokes
@@ -1932,8 +1932,9 @@ export class DailyRiskGovernor {
    *
    * `realizedPlusOpen` is the current (realized + open) book P&L; `bookEquity`
    * is the managed book equity used only to size the session-stop arm gain
-   * (`BOOK_SESSION_STOP_R × 1R`, where 1R = `DEFAULT_RISK_PER_TRADE` of book
-   * equity — the same risk unit the sizers use). Maintains the monotonic
+   * (TRA-3218: `max(BOOK_SESSION_STOP_R × 1R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD)`,
+   * where 1R = `DEFAULT_RISK_PER_TRADE` of book equity — the same risk unit the
+   * sizers use). Maintains the monotonic
    * `peakOpenGain` (floored at 0) and, once {@link bookGiveBackDecision} says to
    * flatten-and-halt, LATCHES `sessionHalted` for the rest of the ET session and
    * fires the risk_halt listener exactly once on the false→true transition.
@@ -1959,10 +1960,16 @@ export class DailyRiskGovernor {
     // Monotonic intraday high-water mark of book gain, floored at 0.
     this.peakOpenGain = Math.max(this.peakOpenGain, realizedPlusOpen, 0);
 
-    // 0.5R of book equity, where 1R = DEFAULT_RISK_PER_TRADE (1%) of equity —
-    // the standard per-trade risk unit. Non-positive equity ⇒ arm disabled (0).
+    // TRA-3218 — max(1R of book equity, +$100), where 1R = DEFAULT_RISK_PER_TRADE
+    // (1%) of equity — the standard per-trade risk unit. The absolute floor keeps
+    // a small book's trivial peak from arming a session-ending latch (the old
+    // +0.5R arm was +$2.34 on the $468 live options sleeve — inside spread noise).
+    // Non-positive equity keeps the legacy semantic: arm disabled (0).
     const bookRiskUnit = Math.max(0, bookEquity) * DEFAULT_RISK_PER_TRADE;
-    const sessionStopArmGain = BOOK_SESSION_STOP_R * bookRiskUnit;
+    const sessionStopArmGain =
+      bookRiskUnit > 0
+        ? Math.max(BOOK_SESSION_STOP_R * bookRiskUnit, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD)
+        : 0;
 
     const decision = bookGiveBackDecision({
       peakOpenGain: this.peakOpenGain,
@@ -1979,7 +1986,7 @@ export class DailyRiskGovernor {
       this.sessionHaltReasonCode = decision.reason; // TRA-1892 — machine-readable code
       this.sessionHaltReason =
         decision.reason === 'session_net_negative'
-          ? `Book session stop — net-negative after being up ≥ ${(BOOK_SESSION_STOP_R * DEFAULT_RISK_PER_TRADE * 100).toFixed(2)}% of book equity; no new entries for the day`
+          ? `Book session stop — net-negative after being up ≥ +$${sessionStopArmGain.toFixed(0)} (max(${BOOK_SESSION_STOP_R}R, $${BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD}) of book equity); no new entries for the day`
           : `Book give-back cap — surrendered >${(BOOK_GIVEBACK_CAP_PCT * 100).toFixed(0)}% of the day's +$${this.peakOpenGain.toFixed(0)} peak (floor +$${decision.retainedFloor.toFixed(0)}); no new entries for the day`;
       if (this.haltListener) {
         try {
@@ -4822,7 +4829,8 @@ export class SignalEngine {
       const { realizedPlusOpen, bookEquity } = this.computeBookMark(prices);
       // TRA-1435 — minimum arm floor for the give-back cap so a trivial peak day
       // can't latch a whole-session halt. 0 (unchanged) unless the board arms
-      // BOOK_GIVEBACK_ARM_FLOOR_ENABLED; then max($25, 0.5R of book equity).
+      // BOOK_GIVEBACK_ARM_FLOOR_ENABLED; then max($100, 1R of book equity)
+      // (TRA-3218 re-scale, mirroring the session-stop arm).
       const giveBackArmFloor = isBookGiveBackArmFloorEnabled(bookMarkEnv)
         ? Math.max(
             BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
@@ -9254,7 +9262,7 @@ export class SignalEngine {
    * active book (live mirror in live mode, paper book in demo) + the options
    * account's daily P&L for the mode (which already combines options realized-
    * today AND open-premium MTM). `bookEquity` is the paper managed equity — a
-   * stable, always-available basis for the 0.5R session-stop arm; refining it to
+   * stable, always-available basis for the max(1R, $100) session-stop arm; refining it to
    * the live account balance in live mode is deferred to the live-equity risk
    * work (TRA-1269/TRA-1270), and only shifts the SECONDARY session-stop arm
    * threshold (the headline give-back cap uses peak/current only, not equity).

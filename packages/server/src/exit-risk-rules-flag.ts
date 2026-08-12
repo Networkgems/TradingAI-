@@ -412,7 +412,7 @@ export function resolveRvExitFlipMinLossPct(
 // TRA-1435 — minimum ARM floor for the book-level give-back cap (Rule 3). Today
 // the give-back cap arms at ANY positive peak, so a +$7 peak on a $2.2k book that
 // gives back ~$5 inside spread/noise latches a whole-session halt — STRICTER than
-// the sibling session-stop (which has a 0.5R arm). This sub-flag arms a minimum
+// the sibling session-stop (which arms at max(1R, $100), TRA-3218). This sub-flag arms a minimum
 // floor: the give-back cap only trips once the day's peak reaches
 // `max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_ARM_FLOOR_R × book risk
 // unit)`. Gated by BOTH the `EXIT_RISK_RULES_ENABLED` master AND its own flag so
@@ -466,8 +466,9 @@ export function isTakeProfitEarlyLiveEnabled(env: NodeJS.ProcessEnv = process.en
 // halt as seen by the OPTIONS entry gates.
 //
 // The board's finding: `DailyRiskGovernor.sessionHalted` is BOOK-WIDE, and the
-// session-stop arm (+0.5R of book equity = +0.5% ≈ $2.30 on the $468 live
-// sleeve) is inside the noise at that size — so one red option trade after a
+// session-stop arm (at the time +0.5R of book equity = +0.5% ≈ $2.30 on the
+// $468 live sleeve; re-scaled to max(+1R, +$100) by TRA-3218) was inside the
+// noise at that size — so one red option trade after a
 // trivial green tick latched a whole-day entries halt for the options sleeve,
 // and did so through the EQUITY book's governor, which the options sleeve was
 // deliberately decoupled from everywhere else (TRA-1023, TRA-3086).

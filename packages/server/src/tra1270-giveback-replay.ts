@@ -12,7 +12,8 @@
 // "floors a +$1,599 → +$483 day near +$960"; this replay reproduces exactly
 // that, driving the intraday (realized + open) book P&L path tick-by-tick and
 // asserting the halt fires at the give-back floor. A second cached session
-// exercises the hard session-stop (net-negative after being up ≥ 0.5R).
+// exercises the hard session-stop (net-negative after being up ≥ the arm,
+// TRA-3218: max(1R, $100)).
 //
 // This is pure replay: no I/O, no broker, no engine boot. It imports the same
 // `DailyRiskGovernor` the server runs so the thresholds under test ARE the
@@ -24,7 +25,7 @@ import { BOOK_GIVEBACK_CAP_PCT } from '@trading-app/shared';
 export interface CachedSession {
   /** Human label for the replayed day. */
   label: string;
-  /** Managed book equity (sizes the 0.5R session-stop arm; not the give-back floor). */
+  /** Managed book equity (sizes the max(1R, $100) session-stop arm; not the give-back floor). */
   bookEquity: number;
   /**
    * Ordered intraday marks of (realized + open) book P&L in dollars, one per
@@ -122,16 +123,17 @@ export const BOARD_GIVEBACK_SESSION: CachedSession = {
 };
 
 /**
- * Hard session-stop day: book runs up past +0.5R of equity ($500 on $100k) then
- * flips net-negative — the give-back arithmetic is moot; the session-stop latches
- * because a net-negative book after a real up-move is the worst state.
+ * Hard session-stop day: book runs up past the session-stop arm (TRA-3218:
+ * max(1R, $100) = $1,000 on $100k) then flips net-negative — the give-back
+ * arithmetic is moot; the session-stop latches because a net-negative book
+ * after a real up-move is the worst state.
  */
 export const SESSION_STOP_SESSION: CachedSession = {
-  label: 'Session-stop day (up +$620 then net-negative)',
+  label: 'Session-stop day (up +$1,050 then net-negative)',
   bookEquity: 100_000,
-  // Drop from above the give-back floor ($372) STRAIGHT to net-negative in one
+  // Drop from above the give-back floor ($630) STRAIGHT to net-negative in one
   // tick so the session-stop branch (not the give-back cap) is what latches.
-  bookPnlPath: [0, 300, 620, 550, -120], // net-negative after being up ≥ $500
+  bookPnlPath: [0, 300, 1_050, 900, -120], // net-negative after being up ≥ $1,000
 };
 
 export const CACHED_SESSIONS: CachedSession[] = [BOARD_GIVEBACK_SESSION, SESSION_STOP_SESSION];

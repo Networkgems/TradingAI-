@@ -44,10 +44,10 @@ describe('TRA-1270 give-back replay — board +$1,599 → +$483 cached session',
 describe('TRA-1270 give-back replay — hard session-stop cached session', () => {
   const r = replayGivebackSession(SESSION_STOP_SESSION);
 
-  it('latches the session-stop when the book flips net-negative after +0.5R', () => {
+  it('latches the session-stop when the book flips net-negative after the +1R arm', () => {
     expect(r.haltIndex).toBeGreaterThanOrEqual(0);
     expect(r.haltReason).toMatch(/session stop/i);
-    // Peak (+$620) cleared the 0.5R arm ($500 on $100k) before the flip.
+    // Peak (+$1,050) cleared the max(1R, $100) arm ($1,000 on $100k) before the flip.
     expect(r.peakGain).toBeGreaterThan(BOOK_SESSION_STOP_R * 0.01 * SESSION_STOP_SESSION.bookEquity);
     expect(r.entriesBlockedAfterHalt).toBe(true);
   });

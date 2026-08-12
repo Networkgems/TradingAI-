@@ -4,6 +4,8 @@ import { etDateString } from './scheduler.js';
 import {
   BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
   BOOK_GIVEBACK_ARM_FLOOR_R,
+  BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD,
+  BOOK_SESSION_STOP_R,
   DEFAULT_RISK_PER_TRADE,
 } from '@trading-app/shared';
 
@@ -235,9 +237,10 @@ describe('DailyRiskGovernor — TRA-995 risk autopilot (tighten-only)', () => {
 // The governor owns the running peak-open-gain (monotonic, ET-day-scoped) and
 // latches a session halt via the pure `bookGiveBackDecision`. With bookEquity
 // = $100k: 1R = DEFAULT_RISK_PER_TRADE (1%) = $1,000, so the session-stop arm
-// gain = BOOK_SESSION_STOP_R (0.5) × $1,000 = $500. Give-back cap = 40%.
+// gain (TRA-3218) = max(BOOK_SESSION_STOP_R (1.0) × $1,000, $100) = $1,000.
+// Give-back cap = 40%.
 describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
-  const EQ = 100_000; // → floor = peak × 0.60, session-stop arm = $500
+  const EQ = 100_000; // → floor = peak × 0.60, session-stop arm = $1,000
 
   it('latches the give-back halt once the book surrenders >40% of its peak', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
@@ -292,10 +295,11 @@ describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
     expect(gov.getHaltReason()).toMatch(/give-back/i);
   });
 
-  it('applies the hard session stop when the book goes net-negative after being up ≥ 0.5R', () => {
+  it('applies the hard session stop when the book goes net-negative after being up ≥ the +1R arm', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
-    // Up +$600 (> the $500 = 0.5R arm) — no halt yet (floor 360, current 600).
-    expect(gov.markBook(600, EQ).tripped).toBe(false);
+    // Up +$1,200 (> the $1,000 = max(1R, $100) arm, TRA-3218) — no halt yet
+    // (floor 720, current 1,200).
+    expect(gov.markBook(1_200, EQ).tripped).toBe(false);
     // Flip net-negative → session stop latches (takes precedence over give-back).
     const trip = gov.markBook(-50, EQ);
     expect(trip.tripped).toBe(true);
@@ -303,9 +307,9 @@ describe('DailyRiskGovernor — TRA-1267 book give-back cap (Rule 3)', () => {
     expect(gov.getHaltReason()).toMatch(/session stop/i);
   });
 
-  it('does NOT session-stop on a net-negative book that never reached the 0.5R arm', () => {
+  it('does NOT session-stop on a net-negative book that never reached the +1R arm', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
-    gov.markBook(300, EQ); // peak +$300 — below the $500 arm
+    gov.markBook(300, EQ); // peak +$300 — below the $1,000 arm
     // Net-negative, but the book was never up enough to arm the session stop,
     // and peak×0.6 = $180 floor is only breached below +$180 — a small −$50 dip
     // that never armed and whose peak floor is $180 must not halt at −$50? It is
@@ -380,7 +384,7 @@ describe('DailyRiskGovernor — TRA-2246 getHaltKind + reset asymmetry', () => {
 
   it('classifies the session stop as session_stop', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
-    gov.markBook(600, EQ); // up ≥ 0.5R arm
+    gov.markBook(1_200, EQ); // up ≥ the max(1R, $100) arm (TRA-3218)
     gov.markBook(-50, EQ); // net-negative → session stop
     expect(gov.getHaltKind()).toBe('session_stop');
   });
@@ -421,10 +425,11 @@ describe('DailyRiskGovernor — TRA-2110 crash-robust give-back peak hydration',
   // The exact 07-20 engine-4 signature: peak +$183 recorded PRE-restart; the book
   // then collapsed and the process restarted with peakOpenGain reset to 0; the
   // current (realized+open) book at the first post-restart mark was +$30.94. A book
-  // of ~$2.2k → give-back arm floor = max($25, 0.5R = 0.5 × 1% × $2,200 = $11) = $25,
-  // which the +$183 peak clears; session-stop arm = 0.5R = $11. Give-back cap 40% ⇒
-  // retained floor = 183 × 0.6 = +$109.80. The live current +$30.94 sits far below
-  // that floor — the give-back governor SHOULD halt, but only if it knows the peak.
+  // of ~$2.2k → give-back arm floor (TRA-3218 re-scale) = max($100, 1R = 1% ×
+  // $2,200 = $22) = $100, which the +$183 peak clears; session-stop arm =
+  // max(1R, $100) = $100. Give-back cap 40% ⇒ retained floor = 183 × 0.6 =
+  // +$109.80. The live current +$30.94 sits far below that floor — the give-back
+  // governor SHOULD halt, but only if it knows the peak.
   const BOOK_EQ = 2_200;
   const ARM_FLOOR = Math.max(
     BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
@@ -540,5 +545,70 @@ describe('DailyRiskGovernor — TRA-1295 correlated-exposure cap (Rule 5)', () =
   it('surfaces the enforced cap config for the health readout', () => {
     const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
     expect(gov.describeCorrelatedExposureCap()).toEqual({ capPct: 0.07, minTradeRiskPct: 0.0025 });
+  });
+});
+
+// TRA-3218 — the session-stop arm re-scale the board ratified (interaction
+// aaa723a6, option arm_1): arm at max(+1R, +$100). The original +0.5R arm had
+// no absolute floor, so on the $468 live options sleeve a +$2.34 peak armed a
+// latch that a single ordinary red trade then tripped — one red trade ended the
+// sleeve's day (TRA-2760). The discriminating book size is one where 1R < $100:
+// there the $100 absolute floor IS the arm, and a peak between 1R and $100 must
+// no longer arm the session stop.
+describe('DailyRiskGovernor — TRA-3218 session-stop arm = max(+1R, +$100)', () => {
+  // $5,000 book → 1R = $50 < $100 ⇒ the absolute floor is the binding arm.
+  const SMALL_EQ = 5_000;
+  // Give-back arm floor as the caller computes it when BOOK_GIVEBACK_ARM_FLOOR_ENABLED
+  // is on — passed explicitly here so the give-back branch cannot mask the
+  // session-stop branch under test.
+  const GB_FLOOR = Math.max(
+    BOOK_GIVEBACK_ARM_ABS_FLOOR_USD,
+    BOOK_GIVEBACK_ARM_FLOOR_R * SMALL_EQ * DEFAULT_RISK_PER_TRADE,
+  );
+
+  it('a peak above 1R but below the $100 floor does NOT arm the session stop', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    // +$60 peak: ≥ 1R ($50) — the OLD R-only arm would have armed here — but
+    // < the $100 absolute floor, so the session stop must stay disarmed.
+    expect(gov.markBook(60, SMALL_EQ, GB_FLOOR).tripped).toBe(false);
+    // Net-negative: no session stop (never armed) and no give-back (peak $60 is
+    // below the $100 give-back arm floor too).
+    const { tripped, snapshot } = gov.markBook(-20, SMALL_EQ, GB_FLOOR);
+    expect(tripped).toBe(false);
+    expect(snapshot.haltReason).toBeNull();
+    expect(gov.isBookHalted()).toBe(false);
+  });
+
+  it('a peak clearing the $100 floor arms it — net-negative then session-stops', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    expect(gov.markBook(120, SMALL_EQ, GB_FLOOR).tripped).toBe(false);
+    const { tripped, snapshot } = gov.markBook(-20, SMALL_EQ, GB_FLOOR);
+    expect(tripped).toBe(true);
+    // Session stop takes precedence over the (also-satisfied) give-back cap.
+    expect(snapshot.haltReason).toBe('session_net_negative');
+    expect(gov.getHaltReason()).toMatch(/session stop/i);
+    expect(gov.getHaltKind()).toBe('session_stop');
+  });
+
+  it('constants carry the ratified values (guards a silent revert)', () => {
+    expect(BOOK_SESSION_STOP_R).toBe(1.0);
+    expect(BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD).toBe(100);
+    // TRA-1435 mirror: the give-back arm floor tracks the session-stop arm so
+    // the give-back cap is never stricter than the session stop at small peaks.
+    expect(BOOK_GIVEBACK_ARM_FLOOR_R).toBe(BOOK_SESSION_STOP_R);
+    expect(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD).toBe(BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD);
+  });
+
+  it('non-positive book equity still disables the session-stop arm entirely (legacy semantic)', () => {
+    const gov = new DailyRiskGovernor(() => new Date('2026-06-02T15:00:00Z'));
+    gov.markBook(500, 0); // equity unreadable/zero — arm must stay 0, not $100
+    const { tripped, snapshot } = gov.markBook(-50, 0);
+    // The give-back cap (arm floor 0 here — sub-flag path not exercised) still
+    // fires, but the DISCRIMINATOR is the reason: session-stop takes precedence
+    // whenever it is armed, so if the $100 absolute floor wrongly applied at
+    // zero equity (peak 500 ≥ 100, net-negative) this would read
+    // 'session_net_negative' instead.
+    expect(tripped).toBe(true);
+    expect(snapshot.haltReason).toBe('giveback_cap');
   });
 });

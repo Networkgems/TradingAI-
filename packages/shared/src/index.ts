@@ -2229,16 +2229,24 @@ export const PROFIT_LOCK_TIGHTEN_PEAK_R = 2.0;        // once peakR ≥ 2.0R …
 export const PROFIT_LOCK_TIGHTEN_GIVEBACK_R = 0.5;    // … tighten the give-back to 0.5R (lock more of a big winner)
 // Rule 3 — book-level daily give-back cap (the board's headline ask)
 export const BOOK_GIVEBACK_CAP_PCT = 0.40;            // flatten + halt after surrendering >40% of the day's peak open gain
-export const BOOK_SESSION_STOP_R = 0.5;               // hard session stop if net-negative after being up > +0.5R of book equity
+// TRA-3218 — the session stop arms at max(BOOK_SESSION_STOP_R × 1R,
+// BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD). The original +0.5R arm (no absolute
+// floor) sat inside the noise band of a small book — on the live $468 options
+// sleeve a +0.5% peak armed a latch that one ordinary red trade then tripped,
+// ending the sleeve's day (TRA-2760). Board ratified max(+1R, +$100) on
+// 2026-08-11 (TRA-3218 interaction aaa723a6, option arm_1).
+export const BOOK_SESSION_STOP_R = 1.0;               // hard session stop if net-negative after being up > +1R of book equity …
+export const BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD = 100; // … with the arm never below +$100, so a trivial peak cannot arm it
 // TRA-1435 — minimum ARM floor for the give-back cap so a trivial peak can never
 // latch a session halt. The cap only arms once the day's peakOpenGain reaches
 // max(BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_ARM_FLOOR_R × book risk unit),
 // where the book risk unit = DEFAULT_RISK_PER_TRADE × bookEquity (the same 1R the
-// session-stop uses). Mirrors BOOK_SESSION_STOP_R so the give-back cap is never
-// STRICTER than the session-stop at small peaks. Example: a $2,241 book → 0.5R =
-// $11.20, floor = max($25, $11.20) = $25, so a +$7 peak can't halt the day.
-export const BOOK_GIVEBACK_ARM_FLOOR_R = 0.5;         // arm the give-back cap once peak ≥ 0.5R of book equity …
-export const BOOK_GIVEBACK_ARM_ABS_FLOOR_USD = 25;    // … or +$25, whichever is greater
+// session-stop uses). Mirrors the session-stop arm (TRA-3218: 1R / $100) so the
+// give-back cap is never STRICTER than the session-stop at small peaks. Example:
+// a $2,241 book → 1R = $22.41, floor = max($100, $22.41) = $100, so a +$7 peak
+// can't halt the day.
+export const BOOK_GIVEBACK_ARM_FLOOR_R = 1.0;         // arm the give-back cap once peak ≥ 1R of book equity …
+export const BOOK_GIVEBACK_ARM_ABS_FLOOR_USD = 100;   // … or +$100, whichever is greater (mirrors the session-stop arm)
 
 // TRA-1294 — take-profit-early: the symmetric PROFIT-side mirror of the give-back
 // cap. Bank the win once a position has captured this fraction of its available

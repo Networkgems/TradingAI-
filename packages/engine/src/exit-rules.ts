@@ -227,8 +227,9 @@ export interface BookGiveBackParams {
   /**
    * Absolute gain (in book currency) the book must have reached this session
    * to arm the hard session stop — the caller computes this as
-   * `BOOK_SESSION_STOP_R × bookRiskUnit` (0.5R of book equity). When the book
-   * has been up at least this much, a subsequent flip to net-negative halts.
+   * `max(BOOK_SESSION_STOP_R × bookRiskUnit, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD)`
+   * (TRA-3218: 1R of book equity, never below +$100). When the book has been up
+   * at least this much, a subsequent flip to net-negative halts.
    */
   sessionStopArmGain: number;
   giveBackCapPct?: number;
@@ -268,8 +269,9 @@ export interface BookGiveBackDecision {
  *    of it flattens and halts for the session. Example: peak +$1,599 → floor ≈
  *    +$960; dropping below that trips the halt. Below the arm floor a trivial
  *    peak can never latch a halt (defaults to 0 ⇒ legacy: arms at any peak).
- *  - Session stop: if the book was up at least `sessionStopArmGain` (0.5R of
- *    book equity) and then goes net-negative, halt for the session.
+ *  - Session stop: if the book was up at least `sessionStopArmGain` (TRA-3218:
+ *    max(1R of book equity, +$100)) and then goes net-negative, halt for the
+ *    session.
  *
  * The caller owns the running `peakOpenGain` (monotonic max, reset on the ET day
  * roll) and decides how to flatten; this returns only the decision.

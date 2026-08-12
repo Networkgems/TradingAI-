@@ -188,9 +188,10 @@ export const DEMO_FLAG_ALLOWLIST = [
   // TRA-1435 (parent TRA-1434) — the give-back cap's minimum ARM floor: the
   // book-level give-back cap (Rule 3) currently arms at ANY positive peak, so a
   // +$7 peak that gives back ~$5 inside spread/noise latches a whole-session halt
-  // — STRICTER than the sibling 0.5R session-stop. This SUB-flag (gated by the
+  // — STRICTER than the sibling session-stop. This SUB-flag (gated by the
   // EXIT_RISK_RULES master too) arms a floor: the cap only trips once the day's
-  // peak reaches max($25, 0.5R of book equity). OFF preserves today's behavior
+  // peak reaches max($100, 1R of book equity) (TRA-3218 re-scale, mirroring the
+  // session-stop arm). OFF preserves today's behavior
   // (caller passes a 0 arm floor). Non-secret, demo-safe — file override lets the
   // board arm it daemon-free (no PM2/admin) after QuantTrader forward-validates.
   'BOOK_GIVEBACK_ARM_FLOOR_ENABLED',
