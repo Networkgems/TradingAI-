@@ -140,6 +140,8 @@ import {
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
 import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+// TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
+import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
 import { isChurnLossBrakeEnabled, resolveSameSessionOpenCap } from './churn-loss-brake-flag.js';
 import { sessionEdgeBlackoutVerdict } from './session-edge-blackout-flag.js';
@@ -9312,8 +9314,44 @@ export class SignalEngine {
 
         // The scanner sorts by |mispricingPct|, so the first `cheap` candidate
         // is the strongest long-only read for this symbol/scan.
-        const cheap = result.candidates.find((c) => c.classification === 'cheap');
+        //
+        // TRA-3401 — ...and that read is delta-BLIND, which is why the sleeve
+        // stopped opening. `|mispricingPct|` is a ratio, so ranking on it returns
+        // the far tail (|Δ| ~ 0.02-0.20); the cost bar downstream is algebraically
+        // a delta FLOOR (`3|Δ| - 1 >= 0.485` ⟺ |Δ| >= 0.4950, TRA-3388). The
+        // nominee therefore lands where the bar can only ever say `gross_negative`
+        // — 138/138 blocked live on 2026-08-12 — and the `continue` below throws
+        // away the WHOLE SYMBOL, including any near-ATM `cheap` candidate sitting
+        // further down the same chain.
+        //
+        // The selector nominates the strongest mispricing read INSIDE the band
+        // TRA-3392 ratified ([0.495, 0.55) — the one Bonferroni-surviving positive
+        // expectancy cell), so mispricing still drives the pick and the band only
+        // bounds where it may look. No gate threshold moves. DARK by default; when
+        // disarmed it is byte-identical to the legacy `find`, and even when armed
+        // it falls back to the legacy nominee rather than suppressing a signal.
+        const otmPick = selectAdmissibleOtmCandidate(result.candidates, {
+          enabled: isOtmAdmissibleStrikeEnabled(
+            this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
+          ),
+          band: resolveAdmissibleBand(
+            this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
+          ),
+        });
+        const cheap = otmPick.candidate;
         if (!cheap) continue;
+        if (otmPick.selection !== 'legacy') {
+          // Count the verdict on BOTH branches: an armed selector that never finds
+          // an in-band strike must not read like one that was never armed.
+          log.info('OTM strike nomination (TRA-3401)', {
+            sym,
+            selection: otmPick.selection,
+            delta: cheap.delta,
+            cheapConsidered: otmPick.cheapConsidered,
+            cheapInBand: otmPick.cheapInBand,
+            band: otmPick.band,
+          });
+        }
 
         // Dedup: same OCC fired in the last hour — avoid re-spamming the feed
         // when the chain stays cheap across multiple scans.
