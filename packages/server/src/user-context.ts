@@ -970,6 +970,18 @@ async function createUserContext(username: string): Promise<UserContext> {
   // TRA-563 — bind the owning user so engine alert hooks (fill/exit/signal/
   // risk-halt) resolve this user's notification preferences.
   engine.setAlertUsername(username);
+  // TRA-3387 (child of TRA-3243) — restore today's session-scoped moveSuspect condemnations
+  // before the engine starts ticking.
+  //
+  // ORDERING, both directions: after `setAlertUsername` so the restore log names its owner, and
+  // BEFORE `engine.start()` (in `ensureUserContext` / `initUserContext`), which pre-seeds
+  // `symbolState` with blank rows and would otherwise sit in front of the restored ones.
+  //
+  // Per-user `dataDir`, not the shared root: a condemnation belongs to the universe the owning
+  // engine actually quotes, and one shared file would let one user's feed exclude another
+  // user's row. Awaited and never fatal — the store reports how it failed, and the EOD census
+  // grades that failure as BLIND rather than publishing a clean-looking empty exclusion list.
+  await engine.hydrateMoveSuspectSession(dataDir);
   const cryptoEngine = new CryptoSignalEngine(cryptoTracker, settings);
   // TRA-857 — bind the owning user on the crypto engine too so its live-broker
   // builder scopes the shared COINBASE_* env-cred fallback to the pinned

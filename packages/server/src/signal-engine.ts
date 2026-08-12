@@ -23,6 +23,19 @@ import {
   describeCorporateAction,
 } from '@trading-app/shared';
 import { etDateKey } from './et-clock.js';
+// TRA-3387 — durability for the TRA-3243 session-scoped verdict. `symbolState` lives only in
+// this process, so a restart between a condemnation and the 01:00Z EOD run reverted TRA-3243
+// AND published an empty census that read as clean. The store survives the restart; the
+// provenance it returns is what lets the census say BLIND when it did not.
+import {
+  loadMoveSuspectSessionSnapshot,
+  saveMoveSuspectSessionSnapshot,
+  describeStoreDurability,
+  processStartedAtMs,
+  type MoveSuspectSessionRow,
+  type MoveSuspectSessionRestore,
+  type MoveSuspectSessionProvenance,
+} from './move-suspect-session-store.js';
 // TRA-3112 — the single copy of the market-data / account endpoint-class split.
 // This module imports nothing back from here, so there is no cycle.
 import { resolveTradierAccountCreds } from './tradier-client-scope.js';
@@ -2461,6 +2474,21 @@ export class SignalEngine {
   private rvDteTarget: number = DEFAULT_RV_DTE_TARGET;
 
   private symbolState: Map<string, SymbolState> = new Map();
+  // ── TRA-3387 — durable half of the TRA-3243 session-scoped verdict ──────────
+  /** Owning user's data dir once `hydrateMoveSuspectSession` has run; `null` ⇔ memory-only. */
+  private moveSuspectSessionDir: string | null = null;
+  /** What the boot read found. `null` ⇔ never hydrated. Feeds the EOD census's BLIND verdict. */
+  private moveSuspectSessionRestore: MoveSuspectSessionRestore | null = null;
+  /** ms epoch of the last SUCCESSFUL snapshot write by this process. */
+  private moveSuspectSessionFlushAt: number | null = null;
+  /** Non-null ⇔ the last write FAILED — the store is not durable right now, and it must say so. */
+  private moveSuspectSessionFlushError: string | null = null;
+  /**
+   * Serialises flushes. Two concurrent `applyQuotes` batches (the tick and the TRA-1996
+   * quote-only refresher share this engine) would otherwise race two `rename`s onto one path,
+   * and last-write-wins there means the LOSER's condemnation is the one that disappears.
+   */
+  private moveSuspectSessionFlushChain: Promise<void> = Promise.resolve();
   /**
    * TRA-2689 (leg 2 of TRA-2654) — bounded, in-process, WRITE-ONLY tape of
    * intra-session denominator-flip candidates seen at the feed boundary. Never
@@ -3891,6 +3919,30 @@ export class SignalEngine {
     // symbol would let a batch that straddles ET midnight roll some rows over and
     // not others, which is a partition the census could never explain.
     const sessionDay = etDateKey(Date.now());
+    // TRA-3387 — did anything the SNAPSHOT stores actually change this batch?
+    //
+    // Deliberately a diff of the PERSISTED TRIPLE rather than a read of `session.transition`.
+    // The transition describes what the state machine did; the no-quote branch below then ORs
+    // `prev?.moveSuspect` into the written value, so a `'clean'` transition can still change
+    // what is on disk. Grading the field that gets written is the only version that cannot
+    // drift from the write it is supposed to guard.
+    //
+    // A `'sustained'` condemnation writes nothing new (the anchor is never re-based), so the
+    // common case of a row staying suspect all afternoon costs zero writes.
+    let sessionFactChanged = false;
+    const noteSessionFact = (
+      prev: SymbolState | undefined,
+      nextSuspect: boolean,
+      nextDay: string,
+      nextPrevClose: number | undefined,
+    ): void => {
+      if (sessionFactChanged) return;
+      if ((prev?.moveSuspectSession === true) !== nextSuspect) { sessionFactChanged = true; return; }
+      // A clean row contributes no snapshot entry, so its day/anchor cannot change the file.
+      if (!nextSuspect) return;
+      if (prev?.moveSuspectSessionDay !== nextDay) { sessionFactChanged = true; return; }
+      if (prev?.moveSuspectPrevClose !== nextPrevClose) { sessionFactChanged = true; }
+    };
     for (const [sym, q] of quotes) {
       prices.set(sym, q.price);
       // TRA-2689 (leg 2 of TRA-2654) — WRITE-ONLY TAPE, NOT A DETECTOR.
@@ -3996,6 +4048,7 @@ export class SignalEngine {
           impliedPrevClose: plausibility.impliedPrevClose,
         });
       }
+      noteSessionFact(priorRow, session.moveSuspectSession, session.moveSuspectSessionDay, session.moveSuspectPrevClose);
       this.symbolState.set(sym, {
         symbol: sym,
         price: q.price,
@@ -4052,23 +4105,201 @@ export class SignalEngine {
       // calendar hit — that the carried numbers no longer contain).
       const carriedVerdict = assessQuotePlausibility(carried);
       const session = advanceMoveSuspectSession(prev, carriedVerdict, sessionDay);
+      const carriedSessionSuspect = session.moveSuspectSession || prev?.moveSuspect === true;
+      noteSessionFact(prev, carriedSessionSuspect, session.moveSuspectSessionDay, session.moveSuspectPrevClose);
       this.symbolState.set(sym, {
         symbol: sym,
         ...carried,
         lastUpdated: prev?.lastUpdated ?? 0,
         quoteStatus: breakerOpen ? 'rate_limited' : 'unavailable',
         moveSuspect: prev?.moveSuspect === true || carriedVerdict.suspect,
-        moveSuspectSession: session.moveSuspectSession || prev?.moveSuspect === true,
+        moveSuspectSession: carriedSessionSuspect,
         moveSuspectSessionDay: session.moveSuspectSessionDay,
         ...(typeof session.moveSuspectPrevClose === 'number'
           ? { moveSuspectPrevClose: session.moveSuspectPrevClose }
           : {}),
       });
     }
+    // TRA-3387 — make the session fact durable the moment it changes, not on a timer. The
+    // hazard is a restart at an arbitrary instant, so any deferral is a window in which the
+    // condemnation that was just made dies with the process. Fire-and-forget: the write is
+    // chained and self-reports its failures, and blocking the feed on a disk write would trade
+    // a data-quality flag for a quote-freshness one.
+    if (sessionFactChanged) void this.flushMoveSuspectSessionSnapshot();
     // TRA-1996 — record that a quote batch just stamped freshness, so a quote-only
     // refresh landing right after a doTick (or vice-versa) is skipped.
     this.lastQuoteStampAt = Date.now();
     return prices;
+  }
+
+  // ── TRA-3387 — persist / restore the TRA-3243 session-scoped verdict ────────
+
+  /**
+   * Restore today's condemnations from disk and bind the store to `dir`.
+   *
+   * Called by `createUserContext` AFTER `setAlertUsername` and BEFORE `start()`. The ordering is
+   * load-bearing in both directions: the dir is per-user (two users must not share a
+   * condemnation set), and `start()` pre-seeds `symbolState` with blank rows, which would sit
+   * in front of the restored ones if this ran second.
+   *
+   * ⛔ ROLLOVER IS ENFORCED AT THE READ, not by handing yesterday's rows to
+   * `advanceMoveSuspectSession` and trusting its `rolled_over` branch: a fact restored from a
+   * previous ET session would condemn a CLEAN row today, which is a fabricated exclusion and
+   * strictly worse than the lost one this ticket exists to fix. `selectRestorableRows` returns
+   * zero rows on a day mismatch, so those rows never reach `symbolState` at all.
+   *
+   * NEVER throws — the store reports how it failed instead, and the failure is what the EOD
+   * census grades. A boot must not die over this, and it must not pretend the read was clean.
+   */
+  async hydrateMoveSuspectSession(dir: string, now: number = Date.now()): Promise<MoveSuspectSessionRestore> {
+    const sessionDay = etDateKey(now);
+    this.moveSuspectSessionDir = dir;
+    const restore = await loadMoveSuspectSessionSnapshot(dir, sessionDay);
+    this.moveSuspectSessionRestore = restore;
+
+    for (const row of restore.rows) {
+      const existing = this.symbolState.get(row.symbol);
+      // `lastUpdated: 0` on a fresh row is the engine's own "never fetched" marker, and it is
+      // the right seed: `top5Movers` filters candidates on `lastUpdated > 0 && price > 0`, so a
+      // restored symbol that never gets quoted again cannot enter the table — which means this
+      // restore can only ever RE-EXCLUDE a row the feed goes on to publish, never manufacture
+      // one out of a symbol nobody is watching.
+      const base: SymbolState = existing ?? {
+        symbol: row.symbol, price: 0, volume: 0, change: 0, changePct: 0, lastUpdated: 0,
+      };
+      this.symbolState.set(row.symbol, {
+        ...base,
+        moveSuspectSession: true,
+        moveSuspectSessionDay: row.moveSuspectSessionDay,
+        ...(typeof row.moveSuspectPrevClose === 'number'
+          ? { moveSuspectPrevClose: row.moveSuspectPrevClose }
+          : {}),
+      });
+    }
+
+    // Logged on EVERY outcome, including the boring one. A restore that only speaks up when it
+    // finds something is a restore whose silence is ambiguous, and the ambiguity of silence on
+    // this exact fact is the whole ticket.
+    const detail = {
+      issue: 'TRA-3387',
+      username: this.alertUsername ?? null,
+      outcome: restore.outcome,
+      sessionDay,
+      fileSessionDay: restore.fileSessionDay,
+      fileUpdatedAt: restore.fileUpdatedAt === null ? null : new Date(restore.fileUpdatedAt).toISOString(),
+      restoredRows: restore.rows.length,
+      droppedRows: restore.droppedRows,
+      path: restore.path,
+      // Context only — a verdict is NEVER derived from this. See the note on
+      // `MoveSuspectSessionProvenance`: the in-bundle fallback dir is erased by a redeploy yet
+      // survives the memory watchdog's pm2 self-restart, so it predicts the wrong answer for
+      // the restart class that writes no deploy record (TRA-2203 / TRA-2261).
+      ephemeralStore: describeStoreDurability(dir),
+    };
+    if (restore.outcome === 'unreadable') {
+      log.warn('TRA-3387 move-suspect session snapshot UNREADABLE — this session starts blind', {
+        ...detail, reason: restore.reason ?? null,
+      });
+    } else if (restore.outcome === 'rolled_over') {
+      log.info('TRA-3387 move-suspect session snapshot ROLLED OVER — a prior session\'s facts were DROPPED, not applied', detail);
+    } else {
+      log.info('TRA-3387 move-suspect session snapshot read', detail);
+    }
+    return restore;
+  }
+
+  /**
+   * Collect the condemned rows for `sessionDay` out of `symbolState`.
+   *
+   * Scoped by `moveSuspectSessionDay`, not merely by the boolean: a row still carrying
+   * yesterday's fact (possible for a symbol that has not been quoted since the rollover) must
+   * not be written into today's snapshot, or the next boot restores it as today's.
+   */
+  private collectMoveSuspectSessionRows(sessionDay: string): MoveSuspectSessionRow[] {
+    const rows: MoveSuspectSessionRow[] = [];
+    for (const s of this.symbolState.values()) {
+      if (s.moveSuspectSession !== true) continue;
+      if (s.moveSuspectSessionDay !== sessionDay) continue;
+      rows.push({
+        symbol: s.symbol,
+        moveSuspectSessionDay: sessionDay,
+        ...(typeof s.moveSuspectPrevClose === 'number'
+          ? { moveSuspectPrevClose: s.moveSuspectPrevClose }
+          : {}),
+      });
+    }
+    return rows;
+  }
+
+  /**
+   * Write the snapshot. Chained, never concurrent (see `moveSuspectSessionFlushChain`).
+   *
+   * A failure is recorded on `moveSuspectSessionFlushError` and surfaces on the provenance, so
+   * a store that cannot write degrades to a stated BLIND at the census rather than to a clean
+   * empty list at the next boot. That is the same reason it is a `warn` and not a debug line.
+   */
+  flushMoveSuspectSessionSnapshot(now: number = Date.now()): Promise<void> {
+    const dir = this.moveSuspectSessionDir;
+    if (dir === null) return Promise.resolve();
+    const sessionDay = etDateKey(now);
+    const rows = this.collectMoveSuspectSessionRows(sessionDay);
+    this.moveSuspectSessionFlushChain = this.moveSuspectSessionFlushChain
+      .then(async () => {
+        try {
+          const file = await saveMoveSuspectSessionSnapshot(dir, {
+            sessionDay,
+            processStartedAt: processStartedAtMs(now),
+            rows,
+            now,
+          });
+          this.moveSuspectSessionFlushAt = file.updatedAt;
+          this.moveSuspectSessionFlushError = null;
+        } catch (err: unknown) {
+          const reason = err instanceof Error ? err.message : String(err);
+          this.moveSuspectSessionFlushError = reason;
+          log.warn('TRA-3387 move-suspect session snapshot WRITE FAILED — a restart from here loses the session\'s exclusions', {
+            issue: 'TRA-3387',
+            username: this.alertUsername ?? null,
+            sessionDay,
+            rows: rows.length,
+            reason,
+          });
+        }
+      });
+    return this.moveSuspectSessionFlushChain;
+  }
+
+  /**
+   * Resolves once every snapshot write queued so far has settled.
+   *
+   * Exists so a grader can assert on what the AUTOMATIC flush inside `applyQuotes` wrote,
+   * rather than calling `flushMoveSuspectSessionSnapshot()` itself — which would write the file
+   * the test then reads and pass identically if the automatic path were removed. (A control
+   * that supplies its own subject is not a control.)
+   */
+  whenMoveSuspectSessionSettled(): Promise<void> {
+    return this.moveSuspectSessionFlushChain;
+  }
+
+  /**
+   * What the EOD census needs to tell an EMPTY exclusion list apart from a BLIND one.
+   *
+   * Rides on `getReportSnapshot()` rather than being fetched by the report caller: the engine is
+   * the only thing that knows whether its own `symbolState` was continuous across the session,
+   * and a provenance assembled anywhere else would be a claim about the engine rather than a
+   * reading of it.
+   */
+  getMoveSuspectSessionProvenance(now: number = Date.now()): MoveSuspectSessionProvenance {
+    const processStartedAt = processStartedAtMs(now);
+    return {
+      processStartedAt,
+      processStartedSessionDay: etDateKey(processStartedAt),
+      restore: this.moveSuspectSessionRestore,
+      lastFlushAt: this.moveSuspectSessionFlushAt,
+      lastFlushError: this.moveSuspectSessionFlushError,
+      storeDir: this.moveSuspectSessionDir,
+      ephemeralStore: describeStoreDurability(this.moveSuspectSessionDir),
+    };
   }
 
   /**
@@ -15998,6 +16229,10 @@ export class SignalEngine {
       // TRA-995 — the risk-autopilot action log so the EOD report surfaces every
       // halt/throttle with its trigger reason (observe-and-tighten only).
       autopilotActions: this.riskGovernor.getAutopilotActions(),
+      // TRA-3387 — whether this engine's `symbolState` was continuous across the session it is
+      // about to be graded on. Without it, an EMPTY TRA-3243 exclusion census and a census the
+      // process lost to a restart are the same zero, and the empty one reads as clean.
+      moveSuspectSessionProvenance: this.getMoveSuspectSessionProvenance(),
     };
   }
 

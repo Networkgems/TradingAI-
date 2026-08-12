@@ -22,6 +22,14 @@ import {
   assessQuotePlausibility, describeQuoteSuspicion, corporateActionInSessionWindow,
   type CorporateAction,
 } from '@trading-app/shared';
+// TRA-3387 — the LOUD half of the TRA-3243 durability fix. `symbolState` is memory-only, so a
+// restart between a condemnation and this report used to publish an EMPTY exclusion census that
+// read exactly like "there was nothing to exclude". This grades whether the census could have
+// seen anything, so an empty list is either EVIDENCE or a stated BLIND, never a false green.
+import {
+  gradeMoveSuspectSessionCoverage,
+  type MoveSuspectSessionProvenance,
+} from '../move-suspect-session-store.js';
 import { logger } from '../observability/index.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
@@ -200,6 +208,9 @@ function top5Movers(
   // => the pre-TRA-3068 behaviour, exactly.
   knownSplits?: ReadonlyMap<string, readonly CorporateAction[]>,
   currentSessionDate?: string,
+  // TRA-3387 — whether the engine's `symbolState` was continuous across the session being
+  // graded. Absent => the session-condemnation census below grades BLIND, never clean.
+  moveSuspectSessionProvenance?: MoveSuspectSessionProvenance | null,
 ): EodMover[] {
   // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
   // so the report shows "_No data._" rather than five rows of 0.00% when the feed
@@ -313,9 +324,18 @@ function top5Movers(
   // reported separately for the same reason as every other leg: this is the set the
   // feed condemned during the session and the old code republished at the close
   // (AZI +58.42% #2 on 08-06, RDGT +32.73% #4 on 08-10, both on the SAME implied
-  // prev close in both verdicts). If this line is ever empty on a session where the
-  // feed emitted `quote move flagged suspect`, the session state was lost — a boot
-  // clears it, since it lives in `symbolState` and nothing persists it.
+  // prev close in both verdicts).
+  //
+  // ⛔ CORRECTED 2026-08-12 (TRA-3387). This comment used to end: "If this line is ever empty
+  // on a session where the feed emitted `quote move flagged suspect`, the session state was
+  // lost — a boot clears it, since it lives in `symbolState` and nothing persists it." That
+  // was TRUE and it was a REQUIREMENT ON THE READER — it asked whoever read the tape to go
+  // cross-check `scripts/check-restarts.mjs` before believing a zero, which is a control that
+  // exists only for as long as someone remembers it. `symbolState` is now persisted
+  // (`move-suspect-session-store.ts`) AND the coverage verdict is computed and logged below on
+  // EVERY run, so the zero grades itself. Do not delete the verdict line on the grounds that
+  // persistence makes it redundant: persistence failing silently reproduces this exact defect,
+  // and the verdict is the only thing that can see that.
   const sessionOnly = candidates.filter(s => !isMoveSuspectNow(s) && isMoveSuspect(s));
   if (sessionOnly.length > 0) {
     log.warn('top-movers EXCLUDED rows condemned earlier in the session', {
@@ -326,6 +346,47 @@ function top5Movers(
         + `:nowPrev=${assessQuotePlausibility(s).impliedPrevClose ?? 'n/a'}`
         + `:day=${s.moveSuspectSessionDay ?? 'n/a'}`),
     });
+  }
+  // TRA-3387 — the coverage verdict, emitted UNCONDITIONALLY including (especially) when the
+  // census above is empty.
+  //
+  // ⭐ An "excluded 0" is only evidence once the instrument has proven it could have seen a
+  // non-empty list. Before this line the two zeros were byte-identical in the tape: a session
+  // where nothing was condemned, and a session whose condemnations died with a process that
+  // restarted at 20:31Z (TRA-2693, measured — 31 minutes after the close, against a report that
+  // runs at 01:00Z). The second one read as clean on the one surface built to make the TRA-3243
+  // fix measurable.
+  //
+  // `BLIND` is stated, never inferred from an absent line: a missing log line is exactly what a
+  // reader cannot distinguish from a healthy run, which is how the original defect hid.
+  const coverage = gradeMoveSuspectSessionCoverage(
+    moveSuspectSessionProvenance, currentSessionDate ?? '');
+  const coverageDetail = {
+    issue: 'TRA-3387',
+    census: 'top-movers session-condemnation',
+    gradedSessionDate: currentSessionDate ?? 'n/a',
+    excluded: sessionOnly.length,
+    coverage: coverage.coverage,
+    reason: coverage.reason,
+    // TRI-STATE (the TRA-3116 discipline): `0` only where there is provably no gap, `null`
+    // where a gap exists and its size is unknowable. Never a reassuring number for an unknown.
+    uncoveredMs: coverage.uncoveredMs,
+    processStartedAt: moveSuspectSessionProvenance
+      ? new Date(moveSuspectSessionProvenance.processStartedAt).toISOString() : null,
+    restoreOutcome: moveSuspectSessionProvenance?.restore?.outcome ?? null,
+    restoredRows: moveSuspectSessionProvenance?.restore?.rows.length ?? null,
+    lastFlushError: moveSuspectSessionProvenance?.lastFlushError ?? null,
+  };
+  if (coverage.coverage === 'blind') {
+    log.warn(
+      'top-movers session-condemnation census is BLIND — this run CANNOT say whether rows were condemned earlier in the session',
+      coverageDetail);
+  } else if (sessionOnly.length === 0) {
+    log.info(
+      'top-movers session-condemnation census is EMPTY and the session state is INTACT — legitimately nothing to exclude',
+      coverageDetail);
+  } else {
+    log.info('top-movers session-condemnation census covered the graded session', coverageDetail);
   }
   // Reported separately from the two above for the same reason they are reported
   // separately from each other: this is the census of what the CALENDAR adds, and
@@ -1007,6 +1068,19 @@ export interface ReportInput {
    * calendar leg has no window and stays inert.
    */
   currentSessionDate?: string;
+  /**
+   * TRA-3387 — whether the engine's `symbolState` was CONTINUOUS across the session this report
+   * grades, supplied by `SignalEngine.getReportSnapshot()`.
+   *
+   * The TRA-3243 session-scoped verdict lives in `symbolState`, which is per-process. A restart
+   * between a condemnation and this report loses it, and the exclusion census then publishes an
+   * empty list that is byte-identical to "nothing was wrong". This is what tells the two apart.
+   *
+   * ⚠️ Optional ↔ the census grades BLIND, never clean. That asymmetry is the point: a caller
+   * that cannot say whether the state survived must not be able to produce a clean-looking zero
+   * by omission, which is the shape every fail-open on this board has taken.
+   */
+  moveSuspectSessionProvenance?: MoveSuspectSessionProvenance | null;
 }
 
 /**
@@ -1100,6 +1174,10 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   const movers = top5Movers(
     state.symbols, priorSessionMovers, priorSessionDate,
     knownSplits, input.currentSessionDate ?? today,
+    // TRA-3387 — `?? null`, deliberately, so a caller that omits it lands on the SAME BLIND
+    // branch as one that explicitly says "I don't know". An `undefined` that quietly becomes a
+    // pass is how a guard ends up satisfied by the absence of what it grades.
+    input.moveSuspectSessionProvenance ?? null,
   );
 
   // TRA-844 — portfolio Greeks + theta-$ bleed + allocation rollup over the

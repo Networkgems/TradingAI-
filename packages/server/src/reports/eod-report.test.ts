@@ -1,7 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { generateEodReport, formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 import { annotateReportProvenance } from './mover-provenance.js';
 import type { EngineState } from '../signal-engine.js';
+// TRA-3387 — the provenance the session-condemnation census is graded through.
+import type { MoveSuspectSessionProvenance } from '../move-suspect-session-store.js';
 import {
   isMoveSuspect, assessQuotePlausibility, assessLevelContinuity, SUSPECT_MOVE_RATIO_FLOOR,
   type EodMover, type OptionPosition, type Position, type CorporateAction,
@@ -1242,6 +1244,163 @@ describe('TRA-3243 top movers — a row condemned earlier in the session stays e
     const discharged = { ...closingRow('AZI', 1.60, 58.42), moveSuspectSession: false,
       moveSuspectSessionDay: '2026-08-06' };
     expect(reportFor([discharged, ...GENUINE]).top5Movers.map(m => m.symbol)).toContain('AZI');
+  });
+});
+
+/**
+ * TRA-3387 (child of TRA-3243) — THE CENSUS MUST NOT BE ABLE TO PUBLISH A ZERO IT CANNOT BACK.
+ *
+ * `symbolState` is per-process. TRA-2693 measured bqb1 rebooting at 20:31Z, 31 minutes after
+ * the close, against a report that runs at 01:00Z — so a restart in that ~5 h window destroyed
+ * the session's condemnations AND emitted an EMPTY
+ * `top-movers EXCLUDED rows condemned earlier in the session` line, which reads exactly like
+ * "there was nothing to exclude". A false green on the one surface built to measure the fix.
+ *
+ * The durable half (`move-suspect-session-store.ts`) is graded in
+ * `move-suspect-session-store.test.ts`. THIS block grades the loud half: the coverage verdict
+ * that lets a reader tell an empty census apart from a blind one.
+ *
+ * ⭐ It asserts on the EMITTED LOG LINE, captured off `process.stderr` / `process.stdout`,
+ * because the log line IS the deliverable — nothing about this verdict reaches the report JSON,
+ * so a test against an in-memory return value would grade something no operator ever sees.
+ */
+describe('TRA-3387 top movers — an empty session-condemnation census is EVIDENCE or BLIND, never clean', () => {
+  const now = Date.now();
+  const todayEt = new Date(now).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const yesterdayEt = new Date(now - 86_400_000).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+
+  const clean = (symbol: string, price: number, changePct: number) => ({
+    symbol, price, volume: 100_000, change: price - price / (1 + changePct / 100),
+    changePct, lastUpdated: now, quoteStatus: 'ok' as const, moveSuspect: false,
+  });
+  const GENUINE = [clean('SOXL', 91.99, -16.02), clean('IREN', 29.31, -13.62)];
+
+  const provenance = (
+    startedSessionDay: string,
+    restore: MoveSuspectSessionProvenance['restore'],
+  ): MoveSuspectSessionProvenance => ({
+    processStartedAt: now - 60_000,
+    processStartedSessionDay: startedSessionDay,
+    restore,
+    lastFlushAt: null,
+    lastFlushError: null,
+    storeDir: '/data/users/admin',
+    ephemeralStore: false,
+  });
+  const restoreOf = (outcome: 'restored' | 'absent' | 'rolled_over' | 'unreadable') => ({
+    outcome, path: '/data/users/admin/move-suspect-session.json',
+    fileSessionDay: null, fileUpdatedAt: now - 90_000, fileProcessStartedAt: null,
+    rows: [], droppedRows: 0,
+  });
+
+  /** Run a report and return every JSON log line it emitted, on both streams. */
+  function linesFrom(
+    symbols: EngineState['symbols'],
+    moveSuspectSessionProvenance: MoveSuspectSessionProvenance | null,
+  ): Array<Record<string, unknown>> {
+    const captured: string[] = [];
+    const sink = (chunk: unknown): boolean => { captured.push(String(chunk)); return true; };
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(sink as never);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(sink as never);
+    try {
+      generateEodReport({
+        state: makeEngineState({ symbols }),
+        allClosedPositions: [],
+        dailySignals: [],
+        signalTypeMap: new Map(),
+        currentSessionDate: todayEt,
+        moveSuspectSessionProvenance,
+      });
+    } finally {
+      outSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+    return captured.flatMap(c => c.split('\n')).filter(Boolean).flatMap(l => {
+      try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; }
+    });
+  }
+  const censusLine = (lines: Array<Record<string, unknown>>) =>
+    lines.find(l => l.issue === 'TRA-3387' && l.census === 'top-movers session-condemnation');
+
+  it('POSITIVE CONTROL — the capture can see a non-empty log stream at all', () => {
+    // A test whose verdict is "the line I wanted is absent" must first prove it could have seen
+    // a line. Without this, a broken spy turns every assertion below into a silent pass.
+    const lines = linesFrom(GENUINE, provenance(yesterdayEt, restoreOf('absent')));
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.some(l => l.issue === 'TRA-2634')).toBe(true);
+  });
+
+  it('AC1 — a restart INSIDE the session with nothing restored says BLIND, at warn, on an EMPTY census', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('absent'))))!;
+    expect(line).toBeTruthy();
+    expect(line.excluded).toBe(0);
+    expect(line.coverage).toBe('blind');
+    expect(line.reason).toBe('restart_in_session_no_snapshot');
+    // WARN, not info: this line's whole job is to be visible in a tape a human greps for
+    // trouble, and an info line about a blind instrument is a line nobody reads.
+    expect(line.level).toBe('warn');
+    expect(String(line.msg)).toContain('BLIND');
+    // `null`, never `0` — the TRA-3116 tri-state. A zero here would be a reassuring number
+    // standing in for an unknowable one.
+    expect(line.uncoveredMs).toBeNull();
+  });
+
+  it('AC3 CONTROL — a clean session with INTACT state says so, at info, and is textually distinguishable', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(yesterdayEt, restoreOf('absent'))))!;
+    expect(line.excluded).toBe(0);
+    expect(line.coverage).toBe('intact');
+    expect(line.reason).toBe('process_older_than_session');
+    expect(line.level).toBe('info');
+    expect(String(line.msg)).toContain('INTACT');
+    // The whole point of AC3: the two zeros must not read alike.
+    expect(String(line.msg)).not.toContain('BLIND');
+    expect(line.uncoveredMs).toBe(0);
+  });
+
+  it('an ABSENT provenance is BLIND — omission cannot buy a clean census', () => {
+    // The failure mode that matters most, because it is what a new caller gets for free.
+    const line = censusLine(linesFrom(GENUINE, null))!;
+    expect(line.coverage).toBe('blind');
+    expect(line.reason).toBe('provenance_absent');
+    expect(line.level).toBe('warn');
+  });
+
+  it('a RESTORED session reports covered, and the residual gap is a number rather than a shrug', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('restored'))))!;
+    expect(line.coverage).toBe('restored');
+    expect(line.restoreOutcome).toBe('restored');
+    // now-60_000 minus the file's now-90_000: the interval between the dead process's last
+    // durable write and this process's start. Known, so it is stated.
+    expect(line.uncoveredMs).toBe(30_000);
+    expect(line.level).toBe('info');
+  });
+
+  it('a NON-empty census still carries the coverage verdict — a partial census must not read as complete', () => {
+    // The TRA-3243 exclusion line is unchanged and still fires; the verdict rides beside it.
+    // Without this, a run that restored nothing but condemned one row AFTER the restart would
+    // publish a one-row census that looks like the whole session.
+    const condemned = {
+      ...clean('AZI', 1.60, 58.42),
+      moveSuspectSession: true, moveSuspectSessionDay: todayEt, moveSuspectPrevClose: 1.01,
+    };
+    const lines = linesFrom([condemned, ...GENUINE], provenance(todayEt, restoreOf('unreadable')));
+    expect(lines.some(l => l.issue === 'TRA-3243'
+      && String(l.msg).includes('EXCLUDED rows condemned earlier in the session'))).toBe(true);
+    const line = censusLine(lines)!;
+    expect(line.excluded).toBe(1);
+    expect(line.coverage).toBe('blind');
+    expect(line.reason).toBe('restart_in_session_snapshot_unreadable');
+  });
+
+  it('THE VERDICT IS A FUNCTION OF THE PROVENANCE — all three values are reachable from this boundary', () => {
+    // Guards against a verdict hard-wired to whatever each test above expected, and against the
+    // report dropping the argument on the floor (which would pin every run to one branch).
+    const seen = new Set([
+      censusLine(linesFrom(GENUINE, provenance(yesterdayEt, restoreOf('absent'))))!.coverage,
+      censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('restored'))))!.coverage,
+      censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('absent'))))!.coverage,
+    ]);
+    expect([...seen].sort()).toEqual(['blind', 'intact', 'restored']);
   });
 });
 
