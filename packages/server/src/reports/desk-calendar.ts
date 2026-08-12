@@ -1,6 +1,6 @@
 import type { EodReport, EodTradeEntry } from '@trading-app/shared';
 import type { OptionTradeJournalRecord } from '../option-trade-journal.js';
-import { etDateString } from '../scheduler.js';
+import { etDateString, isMarketDayIso } from '../scheduler.js';
 import { excludeTestAccountRows } from '../test-accounts.js';
 
 // TRA-1413 — the DESK (all demo books) calendar aggregation.
@@ -112,6 +112,28 @@ export function aggregateDeskCalendar(
   rows: OptionTradeJournalRecord[],
   generatedAt: number,
 ): Map<string, EodReport> {
+  const out = new Map<string, EodReport>();
+  for (const [date, list] of closedRowsByEtDay(rows)) {
+    // TRA-3298 — a close whose ET day is not a session (weekend OR holiday, per
+    // the independent `isMarketDayIso` calendar TRA-3284 grades against) cannot
+    // be a genuine market close. Every such row on record came from a sweep
+    // batch-closing a book under the TRA-3267 UTC-day bug (07-04/07-05/07-11
+    // carried $647.61; 07-03, the observed July-4 holiday, carried 52 zero-P&L
+    // churn closes a day-of-week check would have missed). These are retracted
+    // from every calendar view — never reattributed to a neighbouring session,
+    // whose settled cell they would silently restate. The retraction is not
+    // silent: `nonSessionCloseRetractions` enumerates the dropped rows and the
+    // desk index route publishes it beside `dates`.
+    if (!isMarketDayIso(date)) continue;
+    out.set(date, buildDeskDayReport(date, list, generatedAt));
+  }
+  return out;
+}
+
+/** Group CLOSED journal rows by the ET day of `closeTs` (open rows skipped). */
+function closedRowsByEtDay(
+  rows: OptionTradeJournalRecord[],
+): Map<string, OptionTradeJournalRecord[]> {
   const byDay = new Map<string, OptionTradeJournalRecord[]>();
   for (const r of rows) {
     if (r.outcome === 'OPEN' || r.closeTs === undefined) continue;
@@ -120,11 +142,42 @@ export function aggregateDeskCalendar(
     list.push(r);
     byDay.set(day, list);
   }
-  const out = new Map<string, EodReport>();
-  for (const [date, list] of byDay) {
-    out.set(date, buildDeskDayReport(date, list, generatedAt));
+  return byDay;
+}
+
+/** TRA-3298 — one non-session ET day whose closed rows were retracted from the fold. */
+export interface NonSessionRetraction {
+  date: string;
+  totalTrades: number;
+  /** Summed realized P&L the retraction removed from any monthly total, USD. */
+  realizedPnlUsd: number;
+  rowIds: string[];
+}
+
+/**
+ * TRA-3298 — enumerate what {@link aggregateDeskCalendar} retracted, on the
+ * same row basis the fold itself uses (`excludeTestAccountRows` composed in,
+ * same `includeTest` escape). A retraction that only manifests as a date
+ * quietly missing from the index is the "silent skip" failure mode TRA-3100
+ * exists to kill; this is the enumeration that keeps it loud.
+ */
+export function nonSessionCloseRetractions(
+  rows: OptionTradeJournalRecord[],
+  opts: { includeTest?: boolean } = {},
+): NonSessionRetraction[] {
+  const out: NonSessionRetraction[] = [];
+  for (const [date, list] of closedRowsByEtDay(excludeTestAccountRows(rows, opts))) {
+    if (isMarketDayIso(date)) continue;
+    out.push({
+      date,
+      totalTrades: list.length,
+      realizedPnlUsd: Number(
+        list.reduce((acc, r) => acc + (r.realizedPnlUsd ?? 0), 0).toFixed(2),
+      ),
+      rowIds: list.map((r) => r.id),
+    });
   }
-  return out;
+  return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 /**

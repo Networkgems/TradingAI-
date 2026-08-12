@@ -62,7 +62,7 @@ import {
   EOD_BACKFILL_ROW_SOURCE,
 } from './eod-row-backfill.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
-import { buildJournalCalendarCells } from './reports/desk-calendar.js';
+import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
 // TRA-3100 — the live-calendar backfill's write decision (which cells it is
 // ALLOWED to overwrite), extracted so it is graded directly rather than mirrored.
 import {
@@ -10469,12 +10469,17 @@ app.get('/api/reports/desk', requireAuth, requireAdmin, async (req, res) => {
     // …) so the firm Desk number reflects real books only. `?includeTest=1` opts
     // the test churn back in for debugging. Legacy un-owned rows are kept.
     const includeTest = req.query['includeTest'] === '1';
-    const cells = buildJournalCalendarCells(
-      await listOptionTradeJournal({ mode: 'demo' }),
-      Date.now(),
-      { includeTest },
-    );
-    res.json({ dates: [...cells.keys()].sort().reverse() });
+    const journalRows = await listOptionTradeJournal({ mode: 'demo' });
+    const cells = buildJournalCalendarCells(journalRows, Date.now(), { includeTest });
+    // TRA-3298 — the fold retracts closes stamped on non-session ET days (the
+    // TRA-3267 sweep artifacts: $647.61 across 07-04/07-05/07-11 plus the 07-03
+    // holiday churn). Publish what was retracted beside the dates so the
+    // correction is auditable from the same route it changed — a date silently
+    // missing from an index is unverifiable; a named retraction is evidence.
+    res.json({
+      dates: [...cells.keys()].sort().reverse(),
+      nonSessionRetracted: nonSessionCloseRetractions(journalRows, { includeTest }),
+    });
   } catch (err) {
     log.warn('desk calendar date list failed', {
       reason: err instanceof Error ? err.message : String(err),
