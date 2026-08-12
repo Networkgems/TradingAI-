@@ -34,8 +34,40 @@ if (!API_KEY) {
 }
 
 const day = new Date().toISOString().slice(0, 10);
-const from = valOf('--from') ?? `${day}T13:30:00Z`;
-const to = valOf('--to') ?? `${day}T20:00:00Z`;
+
+// ── Reject a malformed --from/--to HERE, loudly, instead of letting it become BLIND ────────────
+// The Render logs API parses against `2006-01-02T15:04:05Z07:00` and HTTP 400s anything missing
+// the SECONDS field — `--from=2026-08-12T13:30Z` is rejected. That 400 kills every log probe in
+// `pullBootSet`, which degrades to an incomplete boot set and reports **BLIND**. The operator then
+// reads "a source was unreadable — HOLD the grade" and holds a grade that was perfectly gradeable:
+// the identical window with `:00` appended returns CONTINUOUS. That is exactly backwards — BLIND is
+// meant to mean "the box would not tell us", not "you typed the flag wrong", and the two demand
+// opposite responses (re-arm and wait vs. fix the argument and re-run immediately).
+//
+// This bit TRA-3019: its grading runbook wrote `--from=2026-08-07T13:30Z`, so the Fri 08-07 grade
+// would have reported BLIND no matter how healthy the tape was. Same family as this gate's own
+// `logs:null` rule — an error must never be allowed to wear the costume of an observation.
+const RFC3339_UTC_SECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const requireInstant = (flag, raw) => {
+  if (raw === undefined) return undefined;
+  if (!RFC3339_UTC_SECONDS.test(raw) || Number.isNaN(Date.parse(raw))) {
+    console.error(
+      `${flag}=${raw} is not a valid RFC3339 instant.\n` +
+      `  The Render logs API requires the SECONDS field and a zone: 2026-08-12T13:30:00Z\n` +
+      `  (a bare 2026-08-12T13:30Z is HTTP 400 -> every log probe fails -> this gate reports BLIND).\n` +
+      `  Exiting 2 (operator error), NOT 3 (BLIND) — the window is not un-gradeable, the flag is wrong.`,
+    );
+    process.exit(2);
+  }
+  return raw;
+};
+
+const from = requireInstant('--from', valOf('--from')) ?? `${day}T13:30:00Z`;
+const to = requireInstant('--to', valOf('--to')) ?? `${day}T20:00:00Z`;
+if (Date.parse(to) <= Date.parse(from)) {
+  console.error(`--to (${to}) must be strictly after --from (${from}). Exiting 2 (operator error).`);
+  process.exit(2);
+}
 const preWindowMs = Number(valOf('--pre-window-ms') ?? 0);
 
 const result = await pullBootSet({
