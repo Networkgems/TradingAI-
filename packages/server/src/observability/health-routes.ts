@@ -180,6 +180,7 @@ import {
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
   type OptionTradeJournalRecord,
+  type OptionTradeJournalExitReasonStat,
 } from '../option-trade-journal.js';
 import {
   computeOptionLearnedWeights,
@@ -1544,6 +1545,24 @@ export interface OptionJournalReport {
     };
     accountClassCountsSumToRows: boolean;
     accountClassNote: string;
+    /**
+     * TRA-3381 (TRA-2946) — the MODE partition. `mode` is an execution axis
+     * (`live` = real broker fills, `demo` = paper), ORTHOGONAL to
+     * `byAccountClass` (which classes the BOOK the row was written from). The
+     * board-ratified live swing-exit policy (TRA-2949) carries a pre-registered
+     * 30-close grade on TRA-2946 whose cohort is exactly `mode:live` closed
+     * rows, and until this partition existed those rows were pooled invisibly —
+     * 19 live rows all-time inside a 2700-row demo pool, with no open-endpoint
+     * way to read their realized R. See {@link partitionByMode} for why this is
+     * a bounded projection rather than a third full summary.
+     */
+    byMode: {
+      live: OptionJournalModeStat;
+      demo: OptionJournalModeStat;
+    };
+    /** The two modes must account for every row — same invariant as the class partition. */
+    modeCountsSumToRows: boolean;
+    modeNote: string;
     /** TRA-2590 — why the cross-tab is per-class and not on the pooled fold. */
     structureExitNote: string;
     /**
@@ -2163,6 +2182,76 @@ function partitionByAccountClass(rows: OptionTradeJournalRecord[]): {
   };
 }
 
+/**
+ * TRA-3381 (TRA-2946) — the per-mode grading columns. A bounded PROJECTION of
+ * {@link OptionTradeJournalSummary}, not a third full copy: the TRA-2946 grade
+ * needs the headline resolved-row columns plus the exit-reason attribution
+ * (which exit closed each live trade is the thing the swing-exit policy is
+ * being graded ON), while `byStructure`/`byDelta`/`slippage` over n=19 live
+ * rows would add the most bytes for the least usable number — the same
+ * bounded-emission reasoning as `structureExitNote`. The columns are folded by
+ * `summarizeOptionTradeJournal` itself, so a mode cell and the pooled summary
+ * can never drift on how a winRate or avgR is computed.
+ */
+export interface OptionJournalModeStat {
+  total: number;
+  open: number;
+  closed: number;
+  win: number;
+  loss: number;
+  scratch: number;
+  winRate: number | null;
+  realizedPnlUsd: number;
+  avgR: number | null;
+  byExitReason: OptionTradeJournalExitReasonStat[];
+}
+
+/** TRA-3381 — project the shared fold down to the per-mode grading columns. */
+function modeStat(rows: OptionTradeJournalRecord[]): OptionJournalModeStat {
+  const s = summarizeOptionTradeJournal(rows);
+  return {
+    total: s.total,
+    open: s.open,
+    closed: s.closed,
+    win: s.win,
+    loss: s.loss,
+    scratch: s.scratch,
+    winRate: s.winRate,
+    realizedPnlUsd: s.realizedPnlUsd,
+    avgR: s.avgR,
+    byExitReason: s.byExitReason,
+  };
+}
+
+/**
+ * TRA-3381 (TRA-2946) — split the summary fold on the `mode` axis. `mode` is a
+ * required `'demo' | 'live'` on every OPEN line, so unlike the account-class
+ * partition there is no third "unattributed" bucket — but the sum check is
+ * still published because the journal is folded from an append-only JSONL file
+ * whose rows are whatever parsed, and a partition that silently drops rows is
+ * the TRA-2193 bug relocated, not fixed.
+ */
+function partitionByMode(rows: OptionTradeJournalRecord[]): {
+  byMode: { live: OptionJournalModeStat; demo: OptionJournalModeStat };
+  modeCountsSumToRows: boolean;
+  modeNote: string;
+} {
+  const live = rows.filter((r) => r.mode === 'live');
+  const demo = rows.filter((r) => r.mode === 'demo');
+  return {
+    byMode: { live: modeStat(live), demo: modeStat(demo) },
+    modeCountsSumToRows: live.length + demo.length === rows.length,
+    modeNote:
+      'byMode partitions on the EXECUTION mode (live = real broker fills, demo = paper) — '
+      + 'orthogonal to byAccountClass, which classes the writing BOOK. The TRA-2946 grade of '
+      + 'the live swing-exit policy (TRA-2949) reads byMode.live: closed/avgR/realizedPnlUsd '
+      + 'over mode:live resolved rows, with byExitReason attributing each close to the exit '
+      + 'that fired. Top-level summary stays POOLED across modes (back-compat, same contract '
+      + 'as accountClassNote). Per-trade close economics (closeTs/realizedR/exitReason) are on '
+      + 'the ?rows= dump, which serves full journal records for closed rows.',
+  };
+}
+
 export function buildOptionJournalReport(
   rows: Parameters<typeof summarizeOptionTradeJournal>[0],
   now: number,
@@ -2206,6 +2295,10 @@ export function buildOptionJournalReport(
     summary: {
       ...summarizeOptionTradeJournal(summaryRows),
       ...partitionByAccountClass(summaryRows as OptionTradeJournalRecord[]),
+      // TRA-3381 — the mode partition folds the SAME sinceTs-filtered set as the
+      // summary and the class partition; three folds over two populations in one
+      // 200 is the TRA-2082 shape.
+      ...partitionByMode(summaryRows as OptionTradeJournalRecord[]),
     },
     // TRA-2193 — hoisted to the top level so a consumer that reads nothing else
     // still cannot miss that fixture rows are in the pool.

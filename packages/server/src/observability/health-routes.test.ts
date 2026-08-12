@@ -3654,6 +3654,118 @@ describe('TRA-2193 option-journal rows=open / rows=all', () => {
   });
 });
 
+// TRA-3381 (parent TRA-2946) — the byMode partition. The board-ratified live
+// swing-exit policy (TRA-2949) carries a pre-registered 30-close grade whose
+// cohort is mode:live closed rows, and the summary pooled them invisibly: on
+// 2026-08-12 bqb1 held 19 live rows (6 closed) inside a ~2700-row demo pool
+// with no open-endpoint read of their realized R or exit attribution.
+describe('TRA-3381 option-journal byMode partition', () => {
+  const base = {
+    openTs: NOW - 3_600_000,
+    symbol: 'AAPL',
+    structure: 'single_leg_rv',
+    ivRank: null,
+    trend: 'up',
+    sentiment: null,
+    entryDelta: 0.5,
+    entryDte: 20,
+    atRiskUsd: 100,
+    agentConviction: null,
+  };
+  function closedRow(
+    id: string,
+    mode: 'demo' | 'live',
+    outcome: 'WIN' | 'LOSS' | 'SCRATCH',
+    pnl: number,
+    r: number,
+    exitReason: string,
+  ): OptionTradeJournalRecord {
+    return {
+      ...base, id, mode, outcome,
+      closeTs: NOW, realizedPnlUsd: pnl, realizedR: r, exitReason, holdDays: 1,
+    } as OptionTradeJournalRecord;
+  }
+  const openLive = { ...base, id: 'lo1', mode: 'live', outcome: 'OPEN' } as OptionTradeJournalRecord;
+  const openDemo = { ...base, id: 'do1', mode: 'demo', outcome: 'OPEN' } as OptionTradeJournalRecord;
+  const liveWin = closedRow('lc1', 'live', 'WIN', 714, 1.79, 'trail');
+  const liveLoss = closedRow('lc2', 'live', 'LOSS', -79, -0.22, 'chandelier');
+  const demoWin = closedRow('dc1', 'demo', 'WIN', 50, 0.5, 'tp1');
+  const all = [openLive, openDemo, liveWin, liveLoss, demoWin];
+
+  it('separates live economics from the demo pool the summary hides them in', () => {
+    const report = buildOptionJournalReport(all, NOW, true);
+    const live = report.summary.byMode.live;
+    expect(live.total).toBe(3);
+    expect(live.open).toBe(1);
+    expect(live.closed).toBe(2);
+    expect(live.win).toBe(1);
+    expect(live.loss).toBe(1);
+    expect(live.scratch).toBe(0);
+    expect(live.realizedPnlUsd).toBe(635);
+    expect(live.avgR).toBeCloseTo((1.79 - 0.22) / 2, 10);
+    expect(live.winRate).toBe(0.5);
+
+    const demo = report.summary.byMode.demo;
+    expect(demo.total).toBe(2);
+    expect(demo.closed).toBe(1);
+    expect(demo.realizedPnlUsd).toBe(50);
+  });
+
+  it('carries a per-mode byExitReason rollup — the exit that fired is what the policy is graded on', () => {
+    const report = buildOptionJournalReport(all, NOW, true);
+    const reasons = report.summary.byMode.live.byExitReason;
+    const trail = reasons.find((s) => s.exitReason === 'trail');
+    const chandelier = reasons.find((s) => s.exitReason === 'chandelier');
+    expect(trail?.closed).toBe(1);
+    expect(trail?.win).toBe(1);
+    expect(chandelier?.closed).toBe(1);
+    expect(chandelier?.loss).toBe(1);
+    // The demo close must not bleed into the live attribution.
+    expect(reasons.find((s) => s.exitReason === 'tp1')).toBeUndefined();
+  });
+
+  it('the two modes SUM to the row count', () => {
+    const report = buildOptionJournalReport(all, NOW, true);
+    expect(report.summary.byMode.live.total + report.summary.byMode.demo.total)
+      .toBe(report.summary.total);
+    expect(report.summary.modeCountsSumToRows).toBe(true);
+  });
+
+  it('keeps the pooled top-level summary UNCHANGED (back-compat, same contract as accountClassNote)', () => {
+    const report = buildOptionJournalReport(all, NOW, true);
+    // Pooled = both modes folded together, exactly as before the partition.
+    expect(report.summary.total).toBe(5);
+    expect(report.summary.closed).toBe(3);
+    expect(report.summary.realizedPnlUsd).toBe(685);
+    expect(report.summary.modeNote).toContain('byMode.live');
+    expect(report.summary.modeNote).toContain('POOLED');
+  });
+
+  it('folds the SAME sinceTs cohort as the summary — not the unfiltered pool', () => {
+    const staleLive = { ...liveWin, id: 'lc0', openTs: NOW - 90_000_000 };
+    const report = buildOptionJournalReport(
+      [staleLive, ...all], NOW, true, undefined, NOW - 7_200_000,
+    );
+    expect(report.summary.byMode.live.closed).toBe(2);
+    expect(report.summary.modeCountsSumToRows).toBe(true);
+  });
+
+  it('closed live rows in the rows=all dump carry closeTs + realizedR + exitReason (acceptance b)', () => {
+    // The dump serves full journal records, so the close fields ride along once
+    // the close line folds. Pinned here because the TRA-2946 grade reads
+    // per-trade R off exactly these fields on exactly this dump.
+    const report = buildOptionJournalReport(all, NOW, true, undefined, undefined, 'all');
+    const dumped = report.rows?.filter((r) => r.mode === 'live' && r.outcome !== 'OPEN') ?? [];
+    expect(dumped).toHaveLength(2);
+    for (const r of dumped) {
+      expect(r.closeTs).toBe(NOW);
+      expect(typeof r.realizedR).toBe('number');
+      expect(typeof r.realizedPnlUsd).toBe('number');
+      expect(r.exitReason).toBeTruthy();
+    }
+  });
+});
+
 // TRA-2220 (parent TRA-2195 → TRA-2193) — the give-back arm-floor route could not report
 // its OWN blindness. `recordGiveBackState` is called from inside the
 // `EXIT_RISK_RULES_ENABLED` master gate, so the master going down does not zero the
