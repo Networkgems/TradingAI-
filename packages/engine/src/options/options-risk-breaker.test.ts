@@ -295,13 +295,27 @@ describe('TRA-3218 — cooldown re-arm + restart seam', () => {
     };
   }
 
-  it('the default config keeps the legacy day-latch: no release however long the day runs', () => {
-    const { b, advanceMin, halt } = build(DEFAULT_OPTIONS_BREAKER_PARAMS);
+  it('cooldown 0 keeps the legacy day-latch: no release however long the day runs', () => {
+    const { b, advanceMin, halt } = build({ ...DEFAULT_OPTIONS_BREAKER_PARAMS, haltCooldownMinutes: 0 });
     halt();
     expect(b.isHalted()).toBe(true);
     advanceMin(6 * 60); // six hours — the whole rest of the session
     expect(b.isHalted()).toBe(true);
     expect(b.snapshot().releasesToday).toBe(0);
+  });
+
+  it('the DEFAULT config carries the board-ratified cooldown: 60 min / reArmStepR 1 (aaa723a6)', () => {
+    // Pins the ratified numbers so a silent revert to the dark-ship 0 fails loudly.
+    expect(DEFAULT_OPTIONS_BREAKER_PARAMS.haltCooldownMinutes).toBe(60);
+    expect(DEFAULT_OPTIONS_BREAKER_PARAMS.reArmStepR).toBe(1);
+    const { b, advanceMin, halt } = build(DEFAULT_OPTIONS_BREAKER_PARAMS);
+    halt();
+    expect(b.isHalted()).toBe(true);
+    advanceMin(59);
+    expect(b.isHalted()).toBe(true); // still inside the ratified hour
+    advanceMin(1);
+    expect(b.isHalted()).toBe(false); // released at exactly 60 min
+    expect(b.snapshot().releasesToday).toBe(1);
   });
 
   it('releases after the cooldown, stamping the release and the re-trip water lines', () => {

@@ -121,12 +121,14 @@ export const DEFAULT_OPTIONS_BREAKER_PARAMS: OptionsBreakerParams = {
   throttleCumulativeLossR: 1,
   throttleDrawdownPct: 0.025,
   throttleMultiplier: 0.5,
-  // TRA-3218 — cooldown re-arm ships DISABLED (0 ⇒ day-latched halt, the legacy
-  // behaviour) for the same reason the TRA-3086 band shipped dark: the release
-  // window and re-arm step are risk numbers the board signs off on, not values a
-  // build picks unilaterally. `reArmStepR: 1` is a PROVISIONAL placeholder that
-  // is inert while the cooldown is 0.
-  haltCooldownMinutes: 0,
+  // TRA-3218 — cooldown re-arm RATIFIED. It initially shipped disabled (0 ⇒
+  // day-latched halt) because the release window and re-arm step are risk
+  // numbers the board signs off on, not values a build picks unilaterally.
+  // The board signed off 2026-08-12 (TRA-3218 interaction aaa723a6, option
+  // scope_0): a latched sleeve halt releases after 60 minutes, and re-trips
+  // only one further R (or drawdown-dollar equivalent) below the release-time
+  // water lines. Set `haltCooldownMinutes: 0` to restore the day-latch.
+  haltCooldownMinutes: 60,
   reArmStepR: 1,
 };
 
