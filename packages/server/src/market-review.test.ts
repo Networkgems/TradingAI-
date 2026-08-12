@@ -822,4 +822,61 @@ describe('getFreshMarketReview (TRA-589 live recompute)', () => {
     expect(served?.regime).toBe('green');
     expect(served?.gates.trendState).toBe('up');
   });
+
+  // TRA-3436 — the prior session's `kind` must NOT survive the date roll.
+  //
+  // Measured on bqb1: at 00:01 ET on 2026-08-12 the store held the previous
+  // evening's `postmarket-2026-08-11`. It was stale ONLY because the ET date had
+  // rolled — and the old `persisted?.kind ?? defaultReviewKind(now)` chain read
+  // its `kind` off that very review, minting `postmarket-2026-08-12` from
+  // pre-dawn data and publishing it as "Post-Market Review — 2026-08-12", 16
+  // hours before the close it was dated for.
+  //
+  // The assertion is on the KIND the recompute chose, because that is what the
+  // headline and the report id are built from. `vi.setSystemTime` pins the clock
+  // so `generateMarketReview`'s own `new Date()` agrees with the `now` we pass;
+  // only `Date` is faked so the awaited store I/O still settles.
+  it('derives the kind from the clock, not from the stale prior-session review', async () => {
+    const priorPostmarket: MarketReview = {
+      ...review('2026-06-03', 'up'),
+      id: 'postmarket-2026-06-03',
+      kind: 'postmarket',
+      generatedAt: '2026-06-04T01:00:00.000Z', // 21:00 ET on 06-03
+    };
+    writeFileSync(storePath, JSON.stringify({ version: 1, reviews: [priorPostmarket] }));
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(now); // 15:00Z = 11:00 ET on 06-04 — mid-session, pre-close
+      const served = await getFreshMarketReview(undefined, now);
+      // Pre-close ⇒ `defaultReviewKind` says premarket. Inheriting `postmarket`
+      // here is the defect: it would stamp a mid-session read post-market.
+      expect(served?.kind).toBe('premarket');
+      expect(served?.id).toBe('premarket-2026-06-04');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The other direction, so the fix is not just "always premarket": after the
+  // cash close the clock must pick `postmarket` even though the stale review it
+  // is replacing is a premarket one. Without this, a test asserting only the
+  // case above passes for a hard-coded constant.
+  it('derives postmarket from the clock after the cash close', async () => {
+    writeFileSync(
+      storePath,
+      JSON.stringify({ version: 1, reviews: [review('2026-06-03', 'up')] }), // premarket
+    );
+
+    const afterClose = new Date('2026-06-04T21:00:00.000Z'); // 17:00 ET
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(afterClose);
+      const served = await getFreshMarketReview(undefined, afterClose);
+      expect(served?.kind).toBe('postmarket');
+      expect(served?.id).toBe('postmarket-2026-06-04');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

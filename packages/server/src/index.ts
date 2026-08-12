@@ -1085,9 +1085,21 @@ await seedSampleResearchReportIfEmpty();
 // immediately instead of serving the last persisted YELLOW review until the
 // next scheduled job. Fired non-blocking: a cold/slow feed must not delay
 // startup.
+//
+// TRA-3436 — the kind comes from the CLOCK, never from `existing.kind`. The
+// warm-up only runs when `isReviewStale` is true, and the dominant cause of that
+// is the ET date rolling over — i.e. exactly when the persisted review describes
+// the PREVIOUS session and its `kind` is worthless here. The old
+// `existing?.kind ?? defaultReviewKind()` therefore shadowed the clock in the one
+// window it was written for: measured on bqb1, a 00:01 ET boot on 2026-08-12
+// inherited `postmarket` from the prior evening's 21:00 ET review and minted
+// `postmarket-2026-08-12` — a report headlined "Post-Market Review — 2026-08-12"
+// built from pre-dawn data, 16 hours before the close it is dated for. Only the
+// FIRST boot after ET midnight can do this (it makes the store look fresh for the
+// rest of the day), so the mislabel is durable and silent.
 void getLatestMarketReview().then(existing => {
   if (!isReviewStale(existing)) return;
-  void generateMarketReview(existing?.kind ?? defaultReviewKind()).catch(err =>
+  void generateMarketReview(defaultReviewKind()).catch(err =>
     log.error('market-review boot-time generation failed', {
       reason: err instanceof Error ? err.message : String(err),
     }),

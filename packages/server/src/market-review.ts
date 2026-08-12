@@ -1049,6 +1049,26 @@ export async function generateMarketReview(
   const now = new Date();
   const date = etDate(now);
 
+  // TRA-3436 — durable witness for a mislabelled review. The `kind` is what the
+  // News-tab headline and the `${kind}-${date}` id are minted from, so a wrong
+  // one is not cosmetic: it publishes a pre-session read as a post-market one
+  // (or vice versa) and nothing downstream can tell. The two scheduled hooks
+  // (09:00 ET premarket, 21:00 ET postmarket) and the derived paths always agree
+  // with the clock, so this stays silent in normal operation and only fires on
+  // the admin `/api/market-review/run` override or a future regression of the
+  // kind-inheritance bug. It is a WARN, not a refusal: the admin route is a
+  // legitimate way to force a kind, and the artifact itself is the evidence.
+  const clockKind = defaultReviewKind(now);
+  if (kind !== clockKind) {
+    log.warn('market review kind disagrees with the ET clock', {
+      requestedKind: kind,
+      clockKind,
+      date,
+      generatedAt: now.toISOString(),
+      note: 'a postmarket review stamped before 16:00 ET is a PRE-session read wearing a post-market headline (TRA-3436)',
+    });
+  }
+
   // TRA-472 / TRA-2197 — thread the most-recent persisted review's per-leg
   // trend state (and its dwell-lock dates) into the ±1% hysteresis band so a
   // price inside the band holds rather than flips, and a leg that already went
@@ -1297,7 +1317,14 @@ export async function getFreshMarketReview(
 ): Promise<MarketReview | null> {
   const persisted = await getLatestMarketReview(kind);
   if (!isReviewStale(persisted, now)) return persisted;
-  const refreshKind = kind ?? persisted?.kind ?? defaultReviewKind(now);
+  // TRA-3436 — derive the kind from the CLOCK, never inherit it from the review
+  // we just condemned as stale. The old chain read `persisted?.kind ?? default`,
+  // which is backwards: the dominant reason `isReviewStale` fires is that the ET
+  // date rolled over, and that is precisely the case where the persisted review
+  // is about a DIFFERENT session and its `kind` says nothing about this one. On
+  // bqb1 that shadowed `defaultReviewKind` in the exact window it exists for —
+  // see the boot-path twin in index.ts and the measured artifact in TRA-3436.
+  const refreshKind = kind ?? defaultReviewKind(now);
   try {
     return await generateMarketReview(refreshKind);
   } catch (err) {
