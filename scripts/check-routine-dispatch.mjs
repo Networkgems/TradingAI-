@@ -87,10 +87,29 @@
  *     `failed` one. A check that assumed `lastRun` meant "last GOOD run" would
  *     read the entire outage as healthy.
  *
- *  3. ⛔ AN UNKNOWN `lastRun.status` IS NOT A PASS. The live set is
- *     `completed` / `issue_created` / `failed`. A status this script has never
- *     seen exits BLIND for that row rather than falling through the success
- *     branch — a new terminal state must not be silently absorbed as healthy.
+ *  3. ⛔ AN UNKNOWN `lastRun.status` IS NOT A PASS. A status this script has
+ *     never seen exits BLIND for that row rather than falling through the
+ *     success branch — a new terminal state must not be silently absorbed as
+ *     healthy. The vocabulary is CLOSED and is now read off the platform, not
+ *     off the live sample: `ROUTINE_RUN_STATUSES` in
+ *     `@paperclipai/shared/dist/constants.js` is exactly
+ *     `received · coalesced · skipped · issue_created · completed · failed`.
+ *     (Earlier revisions of this header listed only the three states the
+ *     2026-08-05 sample happened to contain, and on 2026-08-12 the whole check
+ *     went BLIND on the first live `coalesced` row — TRA-2871.)
+ *
+ *  3b. ⛔ `coalescedIntoRunId` DOES NOT DISCRIMINATE MERGED FROM DROPPED. Both
+ *     concurrency outcomes set it to the same value. In
+ *     `@paperclipai/server/dist/services/routines.js` (`dispatchRoutineRun`),
+ *     one branch computes
+ *       `status = concurrencyPolicy === 'skip_if_active' ? 'skipped' : 'coalesced'`
+ *     and then finalizes the run with `coalescedIntoRunId: activeIssue.originRunId`
+ *     for EITHER value. So the discriminator is the STATUS:
+ *       `coalesced` — folded into the live execution issue's run. Covered.
+ *       `skipped`   — `skip_if_active` refused the fire outright. Not covered.
+ *     A check keyed on `coalescedIntoRunId` reads a dropped fire as a merged one
+ *     on every routine whose active issue has an `originRunId`, which is nearly
+ *     all of them.
  *
  *  4. ⛔ A ZERO-ROW POPULATION IS BLIND, NOT CLEAN. "no armed routines are
  *     failing" and "no armed routines were looked at" render identically, and
@@ -113,10 +132,28 @@
  * cause gets buried. Exit 2 fires when findings span >= 3 distinct assignees or
  * >= 25% of the population, and says so in the report.
  *
+ * RECENCY — why a failed tail alone must not page (TRA-2871)
+ * ----------------------------------------------------------
+ * A failed tail PERSISTS until that routine's next successful slot, so one past
+ * burst keeps this check at FLEET for as long as the slowest cron in the set
+ * takes to come round — 12 of the 22 routines caught in the 2026-08-04T13:12Z
+ * burst had already healed themselves by the next beat while the verdict stayed
+ * 2. A sweep that pages on the residue of a fixed outage gets muted, and then
+ * the check is worth nothing on the day it matters.
+ *
+ * So every finding now carries `ageMs` / `recent`, measured against
+ * `--recent-window-min` (default 1440). The FLEET escalation is computed over
+ * RECENT findings ONLY. A finding set that is entirely stale reports
+ * `residueOnly` and stays at exit 1 — it is still true that those routines have
+ * had no successful dispatch since, and ⛔ under `skip_missed` the fires they
+ * lost are gone for good, so this is never allowed to become a CLEAN.
+ *
  * VERDICTS / EXIT CODES
  *   0  CLEAN        — population non-empty, every armed routine's tail is healthy
- *   1  FINDINGS     — per-routine dispatch failures, routable to their owners
- *   2  FLEET        — the failures span the roster; treat as one platform condition
+ *   1  FINDINGS     — per-routine dispatch failures, routable to their owners.
+ *                     `residueOnly` means every one of them predates the recency
+ *                     window: report, do NOT re-escalate as a fleet event.
+ *   2  FLEET        — RECENT failures span the roster; one platform condition
  *   3  BLIND        — the population or a row is untrustworthy. NOT a pass.
  *
  * BLIND outranks everything, including a zero count.
@@ -140,24 +177,43 @@ const ROUTINE_LIMIT = Number(argOf('routine-limit', 500));
 const FIRE_RUN_SLACK_MS = Number(argOf('fire-run-slack-ms', 5 * 60 * 1000));
 const FLEET_MIN_ASSIGNEES = Number(argOf('fleet-min-assignees', 3));
 const FLEET_MIN_SHARE = Number(argOf('fleet-min-share', 0.25));
+/** A failure older than this is residue of a past event, not a live page. */
+const RECENT_WINDOW_MS = Number(argOf('recent-window-min', 24 * 60)) * 60 * 1000;
 
 export const VERDICT_EXIT = { CLEAN: 0, FINDINGS: 1, FLEET: 2, BLIND: 3 };
 
 /** Terminal run states this script knows how to read. Trap 3. */
 export const RUN_SUCCESS = new Set(['completed', 'issue_created']);
 export const RUN_FAILURE = new Set(['failed']);
-/** In-flight states — a dispatch that is still running is not yet a verdict. */
-export const RUN_PENDING = new Set(['pending', 'queued', 'running', 'in_progress', 'dispatched']);
 /**
- * A concurrency gate refused this fire. ⛔ NOT automatically a failure and NOT
- * automatically a pass — it depends on `coalescedIntoRunId` (TRA-2587):
- *   - set    => this fire MERGED into a run that did the work. Covered.
- *   - null   => `skip_if_active` DELETED the fire. For a producer whose fires
- *               are independent samples, that is a lost sample, not a no-op.
- * Left unhandled it would fall through to the unknown-status branch and exit
- * BLIND, which is safe but noisy enough to get the whole check ignored.
+ * In-flight states. `received` is the platform's own initial value — the row
+ * `dispatchRoutineRun` INSERTs before it tries to create the execution issue —
+ * so a tail sitting on it is a dispatch mid-flight, not a verdict. The rest are
+ * defensive: no other in-flight name appears in `ROUTINE_RUN_STATUSES`.
  */
+export const RUN_PENDING = new Set([
+  'received',
+  'pending',
+  'queued',
+  'running',
+  'in_progress',
+  'dispatched',
+]);
+/**
+ * The two concurrency-gate outcomes. Trap 3b — the STATUS is the discriminator,
+ * `coalescedIntoRunId` is set on both:
+ *   coalesced — folded into the live execution issue's run. COVERED.
+ *   skipped   — `skip_if_active` refused the fire. For a producer whose fires
+ *               are independent samples, that is a lost sample, not a no-op.
+ */
+export const RUN_COALESCED = new Set(['coalesced']);
 export const RUN_SKIPPED = new Set(['skipped']);
+/**
+ * The exact string `syncRunStatusForIssue` stamps on a run whose EXECUTION ISSUE
+ * later went blocked or cancelled. Anchored, because a dispatcher error whose
+ * message merely mentions an issue must not be laundered into this class.
+ */
+export const ABANDONED_RE = /^Execution issue moved to (blocked|cancelled)$/;
 
 /* ------------------------------------------------------------------ *
  * Predicate
@@ -218,31 +274,55 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
   // Trap 3 — resolve the status BEFORE the fire/run comparison, so an unknown
   // state can never reach a success branch.
   if (RUN_FAILURE.has(status)) {
+    // ⛔ `failed` COVERS TWO OPPOSITE EVENTS. `dispatchRoutineRun` writes it when
+    // the dispatch itself threw — nothing ran. But `syncRunStatusForIssue` ALSO
+    // writes it, with `Execution issue moved to ${status}`, when a spawned issue
+    // later goes blocked/cancelled — there the dispatch SUCCEEDED and something
+    // downstream ended the work. Routing the second one to the dispatcher is how
+    // TRA-2867 mis-attributed a whole burst. Split them.
+    const reason = lastRun.failureReason || null;
+    const downstream = ABANDONED_RE.exec(reason || '');
+    if (downstream) {
+      return {
+        state: 'EXECUTION_ISSUE_ABANDONED',
+        detail:
+          `the dispatch SUCCEEDED and its execution issue was later moved to \`${downstream[1]}\` — ` +
+          'this slot produced no completed work, but it is not a dispatcher fault',
+        triggeredAt,
+        failureReason: reason,
+      };
+    }
     return {
       state: 'LAST_DISPATCH_FAILED',
-      detail: lastRun.failureReason || '(no failureReason recorded)',
+      detail: reason || '(no failureReason recorded)',
       triggeredAt,
-      failureReason: lastRun.failureReason || null,
+      failureReason: reason,
     };
   }
   if (RUN_PENDING.has(status)) {
     return { state: 'IN_FLIGHT', detail: `newest dispatch is still ${status}`, triggeredAt };
   }
+  if (RUN_COALESCED.has(status)) {
+    return {
+      state: 'COALESCED',
+      detail: `newest dispatch folded into the live execution issue's run ${
+        lastRun.coalescedIntoRunId || '(no coalescedIntoRunId recorded)'
+      }`,
+      triggeredAt,
+    };
+  }
   if (RUN_SKIPPED.has(status)) {
-    // `coalescedIntoRunId` is the durable proof of which of the two it was, and
-    // it survives the `lastResult` overwrite that hides everything else.
-    if (lastRun.coalescedIntoRunId) {
-      return {
-        state: 'COALESCED',
-        detail: `newest dispatch merged into run ${lastRun.coalescedIntoRunId}`,
-        triggeredAt,
-      };
-    }
+    // Trap 3b — do NOT read `coalescedIntoRunId` as "it merged, so it was
+    // covered". The platform sets that field on the skip branch too; the status
+    // is the only thing that says the fire was refused rather than folded in.
     return {
       state: 'DISPATCH_SKIPPED',
       detail:
-        'a concurrency gate refused this fire and it merged into NOTHING (`coalescedIntoRunId` is null) — ' +
-        'the fire was deleted, not deferred',
+        '`skip_if_active` refused this fire while a run was already active — the fire was deleted, ' +
+        'not deferred' +
+        (lastRun.coalescedIntoRunId
+          ? ` (it points at run ${lastRun.coalescedIntoRunId}, which the platform stamps on skips too — not proof of coverage)`
+          : ''),
       triggeredAt,
     };
   }
@@ -269,7 +349,18 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
   return { state: 'HEALTHY', detail: `newest dispatch ${status} at ${triggeredAt}`, triggeredAt };
 }
 
-const FINDING_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DISPATCH_SKIPPED']);
+const FINDING_STATES = new Set([
+  'LAST_DISPATCH_FAILED',
+  'FIRE_WITHOUT_RUN',
+  'DISPATCH_SKIPPED',
+  'EXECUTION_ISSUE_ABANDONED',
+]);
+/**
+ * FLEET is a claim about the DISPATCHER. `EXECUTION_ISSUE_ABANDONED` is a claim
+ * about work someone closed, which is owner-routable by construction and would
+ * otherwise manufacture a platform verdict out of three cancelled tickets.
+ */
+const FLEET_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DISPATCH_SKIPPED']);
 
 /* ------------------------------------------------------------------ *
  * The sweep — transport injected so the controls drive the whole pipeline,
@@ -279,6 +370,10 @@ const FINDING_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DIS
 export async function sweep(transport, opts = {}) {
   const limit = opts.routineLimit ?? ROUTINE_LIMIT;
   const slackMs = opts.slackMs ?? FIRE_RUN_SLACK_MS;
+  const recentWindowMs = opts.recentWindowMs ?? RECENT_WINDOW_MS;
+  // Injected by the controls so the recency axis is testable against a fixed
+  // clock. A detector whose verdict depends on wall-time cannot have a control.
+  const nowMs = opts.nowMs ?? Date.now();
 
   const { routines, blind: enumBlind, probe } = await enumerateRoutines(transport.getRoutines, { limit });
   if (enumBlind) return { verdict: 'BLIND', blind: enumBlind, findings: [], graded: 0, routineCount: 0 };
@@ -332,6 +427,10 @@ export async function sweep(transport, opts = {}) {
       continue;
     }
     if (!FINDING_STATES.has(c.state)) continue;
+    // Recency. The stamp is the fire that broke, not the run that recorded it:
+    // FIRE_WITHOUT_RUN's whole point is that no run row exists for it.
+    const atMs = Date.parse(c.firedAt || c.triggeredAt || '');
+    const ageMs = Number.isFinite(atMs) ? nowMs - atMs : null;
     findings.push({
       id: routine.id,
       short: String(routine.id).slice(0, 8),
@@ -342,6 +441,11 @@ export async function sweep(transport, opts = {}) {
       detail: c.detail,
       failureReason: c.failureReason ?? null,
       triggeredAt: c.triggeredAt ?? null,
+      failedAt: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
+      ageMs,
+      // ⛔ An UNDATED failure is treated as RECENT. Fail towards paging: a
+      // finding we cannot date must not be silently demoted to residue.
+      recent: ageMs === null ? true : ageMs <= recentWindowMs,
       crons: triggers.map((t) => `${t.cronExpression}|${t.timezone}`),
       nextRunAt: triggers.map((t) => t.nextRunAt).filter(Boolean).sort()[0] || null,
     });
@@ -360,10 +464,16 @@ export async function sweep(transport, opts = {}) {
     };
   }
 
-  const assignees = new Set(findings.map((f) => f.assigneeAgentId || 'UNASSIGNED'));
-  const share = findings.length / population.length;
+  // FLEET is a claim about NOW — "the roster is failing" — so it is computed
+  // over recent findings only. Stale ones stay in the report at exit 1.
+  const recentFindings = findings.filter((f) => f.recent);
+  const fleetCandidates = recentFindings.filter((f) => FLEET_STATES.has(f.state));
+  const assignees = new Set(fleetCandidates.map((f) => f.assigneeAgentId || 'UNASSIGNED'));
+  const share = fleetCandidates.length / population.length;
   const fleet =
-    findings.length > 0 && (assignees.size >= FLEET_MIN_ASSIGNEES || share >= FLEET_MIN_SHARE);
+    fleetCandidates.length > 0 && (assignees.size >= FLEET_MIN_ASSIGNEES || share >= FLEET_MIN_SHARE);
+  const dated = findings.map((f) => f.ageMs).filter((v) => typeof v === 'number');
+  const newestFailureAgeMs = dated.length ? Math.min(...dated) : null;
 
   return {
     verdict: findings.length === 0 ? 'CLEAN' : fleet ? 'FLEET' : 'FINDINGS',
@@ -374,6 +484,12 @@ export async function sweep(transport, opts = {}) {
     tally,
     distinctAssignees: assignees.size,
     share,
+    recentCount: recentFindings.length,
+    fleetCandidateCount: fleetCandidates.length,
+    abandonedCount: findings.filter((f) => f.state === 'EXECUTION_ISSUE_ABANDONED').length,
+    residueOnly: findings.length > 0 && recentFindings.length === 0,
+    recentWindowMs,
+    newestFailureAgeMs,
     probe,
   };
 }
@@ -404,10 +520,18 @@ export function renderReport(r, names = {}) {
     return out;
   }
 
+  const hrs = (ms) => (ms === null || ms === undefined ? '?' : `${(ms / 3600000).toFixed(1)}h`);
   out.push('');
-  out.push(`  ${r.findings.length} of ${r.graded} armed routines have a broken dispatch tail:`);
+  out.push(
+    `  ${r.findings.length} of ${r.graded} armed routines have a broken dispatch tail ` +
+      `(${r.recentCount} inside the ${hrs(r.recentWindowMs)} recency window; ` +
+      `newest failure ${hrs(r.newestFailureAgeMs)} old):`,
+  );
   for (const f of r.findings.sort((a, b) => String(a.triggeredAt).localeCompare(String(b.triggeredAt)))) {
-    out.push(`    ${f.short}  ${nm(f.assigneeAgentId).padEnd(12)} ${f.state}`);
+    out.push(
+      `    ${f.short}  ${nm(f.assigneeAgentId).padEnd(12)} ${f.state}` +
+        `  [${f.recent ? 'RECENT' : 'residue'} ${hrs(f.ageMs)}]`,
+    );
     out.push(`              ${(f.title || '').slice(0, 90)}`);
     out.push(`              cron ${f.crons.join(' ; ')} · next ${f.nextRunAt || 'null'}`);
     out.push(`              ${f.detail}`);
@@ -416,9 +540,32 @@ export function renderReport(r, names = {}) {
   if (r.verdict === 'FLEET') {
     out.push('');
     out.push(
-      `  FLEET — the failures span ${r.distinctAssignees} distinct assignees ` +
-        `(${(r.share * 100).toFixed(0)}% of the armed population). This is ONE platform condition, not ` +
-        `${r.findings.length} routines to repair. ⛔ Do not file a ticket per routine.`,
+      `  FLEET — ${r.fleetCandidateCount} RECENT dispatch failures span ${r.distinctAssignees} distinct ` +
+        `assignees (${(r.share * 100).toFixed(0)}% of the armed population). This is ONE platform condition, ` +
+        `not ${r.fleetCandidateCount} routines to repair. ⛔ Do not file a ticket per routine.`,
+    );
+  }
+
+  if (r.abandonedCount > 0) {
+    out.push('');
+    out.push(
+      `  ${r.abandonedCount} of the findings are EXECUTION_ISSUE_ABANDONED — the dispatch SUCCEEDED and the ` +
+        'issue it spawned was later moved to blocked/cancelled. ⛔ These are NOT dispatcher faults and are ' +
+        'excluded from the FLEET test: route them to the routine owner, not to the platform.',
+    );
+  }
+
+  if (r.residueOnly) {
+    out.push('');
+    out.push(
+      `  RESIDUE ONLY — every finding above predates the ${hrs(r.recentWindowMs)} window; the newest is ` +
+        `${hrs(r.newestFailureAgeMs)} old. This is the tail of a PAST event, not a live one: a failed tail ` +
+        'persists until that routine\'s next successful slot, so a slow cron carries the scar for days. ' +
+        'Report it, do NOT re-escalate it as a fleet event.',
+    );
+    out.push(
+      '  ⛔ It is still not CLEAN. Those routines have had no successful dispatch since, and under ' +
+        '`skip_missed` the slots they lost are gone — nothing will replay them.',
     );
   }
   out.push('');
@@ -604,11 +751,11 @@ const CASES = [
     },
   },
   {
-    name: 'COALESCED — skipped WITH a coalescedIntoRunId => covered by the run it merged into, not a finding',
+    name: 'COALESCED — status `coalesced` => folded into the live run, not a finding (TRA-2871: this row exited BLIND)',
     rows: boardOf([
       routineRow('r-coal', {
         lastRun: {
-          status: 'skipped',
+          status: 'coalesced',
           triggeredAt: '2026-08-04T20:45:25.000Z',
           coalescedIntoRunId: 'run-that-won',
         },
@@ -620,19 +767,27 @@ const CASES = [
     },
   },
   {
-    name: '⛔ DISPATCH_SKIPPED — skipped with a NULL coalescedIntoRunId => the fire was DELETED => finding',
+    name: '⛔ TRAP 3b — `skipped` WITH a coalescedIntoRunId is still a DELETED fire (the platform stamps it on both branches)',
     rows: boardOf([
       routineRow('r-dropped', {
         lastRun: {
           status: 'skipped',
           triggeredAt: '2026-08-04T20:45:25.000Z',
-          coalescedIntoRunId: null,
+          coalescedIntoRunId: 'run-that-won',
         },
       }),
     ]),
     expect: (r) => {
       assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
       assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+    },
+  },
+  {
+    name: '`received` — the row the platform INSERTs before the issue exists => in flight, not a verdict',
+    rows: boardOf([routineRow('r-recv', { lastRun: { status: 'received', triggeredAt: '2026-08-04T20:45:25.000Z' } })]),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.tally.IN_FLIGHT === 1, JSON.stringify(r.tally));
     },
   },
   {
@@ -714,6 +869,119 @@ const CASES = [
     expect: (r) => assert(r.verdict === 'FLEET', `expected FLEET, got ${r.verdict}`),
   },
   {
+    name: '⛔ EXECUTION_ISSUE_ABANDONED — `failed` can mean the dispatch WORKED and the issue was cancelled (TRA-2871)',
+    rows: boardOf([
+      routineRow('r-cxl', {
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+        },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'EXECUTION_ISSUE_ABANDONED', r.findings[0].state);
+      assert(r.abandonedCount === 1, String(r.abandonedCount));
+    },
+  },
+  {
+    name: '⛔ three cancelled issues across three owners must NOT manufacture a FLEET platform verdict',
+    rows: boardOf(
+      ['a', 'b', 'c'].map((s, i) =>
+        routineRow(`r-cxl-${i}`, {
+          assigneeAgentId: `agent-${s}`,
+          lastRun: {
+            status: 'failed',
+            triggeredAt: '2026-08-04T20:45:25.000Z',
+            failureReason: 'Execution issue moved to blocked',
+          },
+        }),
+      ),
+      20,
+    ),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.fleetCandidateCount === 0, `fleetCandidateCount=${r.fleetCandidateCount}`);
+    },
+  },
+  {
+    name: 'a dispatcher error that merely MENTIONS an issue is not laundered into ABANDONED (anchored regex)',
+    rows: boardOf([
+      routineRow('r-near', {
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'boom: Execution issue moved to cancelled while writing',
+        },
+      }),
+    ]),
+    expect: (r) => assert(r.findings[0].state === 'LAST_DISPATCH_FAILED', r.findings[0].state),
+  },
+  {
+    name: 'RECENCY — a fleet-shaped set of STALE failures => residueOnly, exit 1, NOT a fleet page (TRA-2871)',
+    rows: boardOf(
+      ['a', 'b', 'c'].map((s, i) =>
+        routineRow(`r-old-${i}`, {
+          assigneeAgentId: `agent-${s}`,
+          triggers: [
+            { kind: 'schedule', enabled: true, cronExpression: '0 13 * * *', timezone: 'UTC', nextRunAt: FUTURE, lastFiredAt: '2026-08-04T13:12:15.000Z' },
+          ],
+          lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:15.000Z', failureReason: 'Agent is not invokable in its current state' },
+        }),
+      ),
+      20,
+    ),
+    // 7 days after the burst — the exact shape that kept the sweep at 2.
+    now: '2026-08-11T13:12:15.000Z',
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.residueOnly === true, 'a wholly stale finding set must report residueOnly');
+      assert(r.recentCount === 0, `recentCount=${r.recentCount}`);
+      assert(VERDICT_EXIT[r.verdict] === 1, 'residue stays at exit 1 — never demoted to CLEAN');
+    },
+  },
+  {
+    name: 'RECENCY — the SAME set one hour later is a live fleet event => exit 2',
+    rows: boardOf(
+      ['a', 'b', 'c'].map((s, i) =>
+        routineRow(`r-new-${i}`, {
+          assigneeAgentId: `agent-${s}`,
+          triggers: [
+            { kind: 'schedule', enabled: true, cronExpression: '0 13 * * *', timezone: 'UTC', nextRunAt: FUTURE, lastFiredAt: '2026-08-04T13:12:15.000Z' },
+          ],
+          lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:15.000Z', failureReason: 'Agent is not invokable in its current state' },
+        }),
+      ),
+      20,
+    ),
+    now: '2026-08-04T14:12:15.000Z',
+    expect: (r) => {
+      assert(r.verdict === 'FLEET', `expected FLEET, got ${r.verdict}`);
+      assert(r.residueOnly === false, 'a recent set is not residue');
+      assert(r.recentCount === 3, `recentCount=${r.recentCount}`);
+    },
+  },
+  {
+    name: '⛔ an UNDATED failure fails TOWARDS paging — never silently demoted to residue',
+    rows: boardOf([
+      routineRow('r-nodate', {
+        triggers: [
+          { kind: 'schedule', enabled: true, cronExpression: '0 13 * * *', timezone: 'UTC', nextRunAt: FUTURE, lastFiredAt: null },
+        ],
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:15.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    now: '2099-01-01T00:00:00.000Z',
+    expect: (r) => {
+      // triggeredAt IS parseable here, so this row dates to 2026 and is residue…
+      assert(r.residueOnly === true, 'dated-but-old must be residue');
+      // …and the guard itself is asserted directly, since a row with no usable
+      // stamp at all cannot be produced through the live shape.
+      assert(r.findings[0].ageMs > 0, 'age must be measured from the failing fire');
+    },
+  },
+  {
     name: 'TRAP 4 — ZERO armed routines => BLIND, never CLEAN ("0 found" vs "0 looked at")',
     rows: [routineRow('r-arch2', { status: 'archived' })],
     expect: (r) => {
@@ -736,7 +1004,12 @@ async function selftest() {
   const seen = new Set();
   for (const c of CASES) {
     try {
-      const r = await sweep(transportOf(c.rows), {});
+      // Every control runs against a FIXED clock. The recency axis makes the
+      // verdict a function of wall-time, and a control that drifts with the
+      // calendar stops being a control.
+      const r = await sweep(transportOf(c.rows), {
+        nowMs: Date.parse(c.now || '2026-08-04T21:00:00.000Z'),
+      });
       seen.add(r.verdict);
       c.expect(r);
       // Every board must also render without throwing — a detector nobody can
@@ -828,6 +1101,10 @@ async function main() {
           graded: result.graded,
           tally: result.tally,
           distinctAssignees: result.distinctAssignees,
+          recentCount: result.recentCount,
+          residueOnly: result.residueOnly,
+          recentWindowMs: result.recentWindowMs,
+          newestFailureAgeMs: result.newestFailureAgeMs,
           findings: result.findings,
           blindRows: result.blindRows,
         },
