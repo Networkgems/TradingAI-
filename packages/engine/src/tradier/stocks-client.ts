@@ -50,6 +50,40 @@ interface TradierQuotesEnvelope {
   quotes?: { quote?: TradierRawQuote | TradierRawQuote[]; unmatched_symbols?: { symbol?: string | string[] } } | string | null;
 }
 
+/**
+ * TRA-3385 — Tradier spells some index tickers differently from the Yahoo-style
+ * spelling the rest of the app uses. The mapping is applied REQUEST-SCOPED in
+ * `getQuotes`/`getQuotesDetailed`: aliased on the way out to Tradier, keyed back
+ * under whatever spelling the caller asked for. It must never be a blanket
+ * rewrite — `readVix()` (market-review.ts, TRA-586) deliberately falls back to
+ * `fetchQuote('VIX')`, so a result map that only ever carries `^VIX` would break
+ * that fallback and silently re-open the regime-gate exposure TRA-2682 reports
+ * as closed.
+ *
+ * Only spellings CONFIRMED against Tradier belong here. `^IXIC` also shows up
+ * in the drop lists but its Tradier spelling is unverified — resolve it from
+ * the `unmatched_symbols` measurement (Remedy B) before adding it.
+ */
+const TRADIER_SYMBOL_ALIASES: Readonly<Record<string, string>> = {
+  '^VIX': 'VIX',
+};
+
+/** Result of {@link TradierStocksClient.getQuotesDetailed}: the quote map plus
+ * the symbols Tradier itself declared unknown (`unmatched_symbols`), both keyed
+ * by the caller's requested spelling. */
+export interface TradierQuotesRead {
+  quotes: Map<string, TradierEquityQuote>;
+  /**
+   * TRA-3385 (Remedy B) — the symbols this batch asked for that Tradier
+   * reported back in `unmatched_symbols`, i.e. the ones the primary feed can
+   * NEVER serve. Previously parsed and discarded, which made the permanently
+   * un-servable class unmeasurable (TRA-2682). Mapped back to the requested
+   * spelling. Note: absence from this list does not guarantee a quote row —
+   * Tradier can also return a row without a usable `last` price.
+   */
+  unmatchedSymbols: string[];
+}
+
 interface TradierTimeSalesRow {
   /** "YYYY-MM-DD HH:MM" — broker-local (US/Eastern) wall-clock for that bar. */
   time?: string;
@@ -149,22 +183,45 @@ export class TradierStocksClient {
    * Fetch quotes for many symbols in a single round-trip. Tradier supports a
    * comma-separated `symbols=` parameter; one HTTP call gets the entire
    * watchlist's quote in one shot. Symbols Tradier doesn't recognise come
-   * back in `unmatched_symbols` and are simply omitted from the result map.
+   * back in `unmatched_symbols` — see {@link getQuotesDetailed} for the read
+   * that surfaces them; this wrapper keeps the original map-only shape.
+   *
+   * TRA-3385 — Yahoo-style spellings in {@link TRADIER_SYMBOL_ALIASES} (today
+   * only `^VIX`→`VIX`) are aliased on the wire and keyed back under the
+   * requested spelling, so `getQuotes(['^VIX'])` resolves under `^VIX` and
+   * `getQuotes(['VIX'])` still resolves under `VIX` (the TRA-586 fallback).
    */
   async getQuotes(symbols: readonly string[]): Promise<Map<string, TradierEquityQuote>> {
+    return (await this.getQuotesDetailed(symbols)).quotes;
+  }
+
+  /** {@link getQuotes} plus the batch's `unmatched_symbols` (TRA-3385 Remedy B). */
+  async getQuotesDetailed(symbols: readonly string[]): Promise<TradierQuotesRead> {
     const out = new Map<string, TradierEquityQuote>();
-    if (symbols.length === 0) return out;
-    const url = `${this.baseUrl}/markets/quotes?symbols=${encodeURIComponent(symbols.join(','))}`;
+    if (symbols.length === 0) return { quotes: out, unmatchedSymbols: [] };
+    // Wire spelling → the requested spelling(s) that map onto it. Requesting
+    // both `^VIX` and `VIX` collapses to ONE wire symbol whose row answers both.
+    const wireToRequested = new Map<string, string[]>();
+    for (const requested of symbols) {
+      const wire = TRADIER_SYMBOL_ALIASES[requested] ?? requested;
+      const list = wireToRequested.get(wire);
+      if (list) list.push(requested);
+      else wireToRequested.set(wire, [requested]);
+    }
+    const url = `${this.baseUrl}/markets/quotes?symbols=${encodeURIComponent([...wireToRequested.keys()].join(','))}`;
     const resp = await fetch(url, { headers: this.headers });
     if (!resp.ok) {
       throw new Error(`Tradier quotes HTTP ${resp.status}: ${(await resp.text().catch(() => '')).slice(0, 200)}`);
     }
     const data = (await resp.json()) as TradierQuotesEnvelope;
-    if (!data.quotes || typeof data.quotes !== 'object') return out;
+    if (!data.quotes || typeof data.quotes !== 'object') return { quotes: out, unmatchedSymbols: [] };
+    const unmatchedSymbols = asArray(data.quotes.unmatched_symbols?.symbol)
+      .filter((s): s is string => typeof s === 'string' && s.length > 0)
+      .flatMap((wire) => wireToRequested.get(wire) ?? [wire]);
     for (const q of asArray(data.quotes.quote)) {
       if (!q.symbol || typeof q.last !== 'number' || q.last <= 0) continue;
-      out.set(q.symbol, {
-        symbol: q.symbol,
+      for (const requested of wireToRequested.get(q.symbol) ?? [q.symbol]) out.set(requested, {
+        symbol: requested,
         price: q.last,
         volume: q.volume ?? 0,
         change: q.change ?? 0,
@@ -188,7 +245,7 @@ export class TradierStocksClient {
           : {}),
       });
     }
-    return out;
+    return { quotes: out, unmatchedSymbols };
   }
 
   /**

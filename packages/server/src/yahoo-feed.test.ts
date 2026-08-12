@@ -1,6 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import {
+  fetchQuote,
+  fetchQuotes,
+  recordTradierUnmatched,
+  __resetTradierUnmatchedForTests,
   evaluateTwelveDataGate,
   isTradierStocksConfigured,
   setTradierStocksFeedClient,
@@ -944,5 +948,97 @@ describe('secondaryFanoutCeiling (TRA-2627 fan-out coverage bound)', () => {
     expect(secondaryFanoutCeiling(0, 200, 5)).toBe(0);
     expect(secondaryFanoutCeiling(8_000, 200, 0)).toBe(0);
     expect(secondaryFanoutCeiling(Number.NaN, 200, 5)).toBe(0);
+  });
+});
+
+// TRA-3385 — the primary Tradier batch never knew Tradier's `VIX` spelling for
+// the universe's `^VIX`, so `^VIX` fell to the Yahoo secondary chain on every
+// tick and was lost 100% of the time the breaker was open (TRA-2682). The alias
+// is request-scoped in TradierStocksClient; these tests pin the two behaviours
+// the ticket names as the acceptance criteria that CAN be pinned off-box:
+// `^VIX` resolves from the primary, and readVix()'s TRA-586 `fetchQuote('VIX')`
+// fallback keeps resolving too.
+describe('TRA-3385 — ^VIX served by the Tradier primary, both spellings resolve', () => {
+  const vixEnvelope = {
+    quotes: { quote: { symbol: 'VIX', last: 14.80, change: 0.20, change_percentage: 1.37, volume: 0 } },
+  };
+  const jsonResponse = (body: unknown): Response =>
+    new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  it('fetchQuote resolves ^VIX AND bare VIX from the Tradier primary (TRA-586 pinned)', async () => {
+    const realFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (_url: unknown) => jsonResponse(vixEnvelope));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      setTradierStocksFeedClient('tra3385-tok', 'production');
+      const caret = await fetchQuote('^VIX');
+      const bare = await fetchQuote('VIX');
+      expect(caret?.price).toBe(14.80);
+      expect(bare?.price).toBe(14.80);
+      // Both requests went to Tradier's /markets/quotes under the bare wire
+      // spelling — neither leaked a literal ^VIX to the wire nor fell through
+      // to the Yahoo secondary chain.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const call of fetchMock.mock.calls) {
+        const url = String(call[0]);
+        expect(url).toContain('/markets/quotes');
+        expect(url).toContain('symbols=VIX');
+        expect(url).not.toContain('%5EVIX');
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+      setTradierStocksFeedClient('', 'production');
+    }
+  });
+
+  it('fetchQuotes serves ^VIX from the primary batch — it never reaches the secondary remainder', async () => {
+    const realFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (_url: unknown) => jsonResponse(vixEnvelope));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      setTradierStocksFeedClient('tra3385-tok-2', 'production');
+      const out = await fetchQuotes(['^VIX']);
+      expect(out.get('^VIX')?.price).toBe(14.80);
+      // One Tradier round-trip, zero secondary (Yahoo/chart/Stooq) calls: the
+      // symbol was satisfied before the fan-out, which is criterion 1's
+      // mechanism (`^VIX` is not in `remaining`).
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toContain('/markets/quotes');
+    } finally {
+      globalThis.fetch = realFetch;
+      setTradierStocksFeedClient('', 'production');
+    }
+  });
+});
+
+// TRA-3385 (Remedy B) — the un-servable set is logged as a FULL membership once
+// per session (again only on change), never a capped 20-name prefix.
+describe('recordTradierUnmatched (TRA-3385 un-servable class measurement)', () => {
+  it('emits the full sorted membership with counts on first sight', () => {
+    __resetTradierUnmatchedForTests();
+    const line = recordTradierUnmatched(['BAYN.DE', 'ARX.TO', '2330.TW'], 670);
+    expect(line).toContain('3/670');
+    expect(line).toContain('unmatched_symbols');
+    expect(line).toContain('2330.TW, ARX.TO, BAYN.DE');
+  });
+
+  it('suppresses a repeat of the same membership (once per session)', () => {
+    __resetTradierUnmatchedForTests();
+    expect(recordTradierUnmatched(['ARX.TO'], 670)).not.toBeNull();
+    expect(recordTradierUnmatched(['ARX.TO'], 670)).toBeNull();
+    // Order must not defeat the dedupe key.
+    expect(recordTradierUnmatched(['ARX.TO'], 671)).toBeNull();
+  });
+
+  it('re-emits when the membership changes', () => {
+    __resetTradierUnmatchedForTests();
+    expect(recordTradierUnmatched(['ARX.TO'], 670)).not.toBeNull();
+    expect(recordTradierUnmatched(['ARX.TO', 'BB.TO'], 670)).not.toBeNull();
+  });
+
+  it('stays silent on an empty set without consuming the session slot', () => {
+    __resetTradierUnmatchedForTests();
+    expect(recordTradierUnmatched([], 670)).toBeNull();
+    expect(recordTradierUnmatched(['ARX.TO'], 670)).not.toBeNull();
   });
 });

@@ -116,6 +116,98 @@ describe('TradierStocksClient.getQuotes', () => {
     expect(q.bidSize).toBeUndefined();
     expect(q.askSize).toBeUndefined();
   });
+
+  // TRA-3385 — Tradier serves the CBOE volatility index as bare `VIX`; the app's
+  // universe uses Yahoo's `^VIX`. The alias must be REQUEST-SCOPED: `^VIX` goes
+  // out on the wire as `VIX` and the row keys back under the spelling the caller
+  // asked for — while a caller asking for bare `VIX` (readVix()'s TRA-586
+  // fallback) still resolves under `VIX`. A blanket rewrite in either direction
+  // breaks one of the two.
+  it('aliases ^VIX to VIX on the wire and keys the row back under ^VIX', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'VIX', last: 14.80, change: 0.20, change_percentage: 1.37, volume: 0 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['^VIX']);
+    expect(out.get('^VIX')).toMatchObject({ symbol: '^VIX', price: 14.80 });
+    expect(out.has('VIX')).toBe(false); // request-scoped: only the asked-for spelling
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('symbols=VIX');
+    expect(url).not.toContain(encodeURIComponent('^VIX'));
+  });
+
+  it('still resolves a bare VIX request under VIX (TRA-586 readVix fallback pinned)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'VIX', last: 14.80, change: 0, change_percentage: 0, volume: 0 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['VIX']);
+    expect(out.get('VIX')).toMatchObject({ symbol: 'VIX', price: 14.80 });
+    expect(out.has('^VIX')).toBe(false);
+  });
+
+  it('answers BOTH spellings from one wire symbol when both are requested', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'VIX', last: 14.80, change: 0, change_percentage: 0, volume: 0 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const out = await client.getQuotes(['^VIX', 'VIX', 'AAPL']);
+    expect(out.get('^VIX')?.price).toBe(14.80);
+    expect(out.get('VIX')?.price).toBe(14.80);
+    // The wire request dedupes to a single VIX plus AAPL.
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain(`symbols=${encodeURIComponent('VIX,AAPL')}`);
+  });
+});
+
+// TRA-3385 (Remedy B) — Tradier answers the "which symbols can the primary
+// never serve?" question on every batch call via `unmatched_symbols`; it was
+// parsed and thrown away, making the un-servable class unmeasurable (TRA-2682).
+describe('TradierStocksClient.getQuotesDetailed (unmatched_symbols surfaced)', () => {
+  it('returns the unmatched set alongside the quote map (array shape)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: { symbol: 'AAPL', last: 195.25, change: 0, change_percentage: 0, volume: 1 },
+        unmatched_symbols: { symbol: ['ARX.TO', 'BAYN.DE'] },
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const { quotes, unmatchedSymbols } = await client.getQuotesDetailed(['AAPL', 'ARX.TO', 'BAYN.DE']);
+    expect(quotes.get('AAPL')?.price).toBe(195.25);
+    expect(unmatchedSymbols).toEqual(['ARX.TO', 'BAYN.DE']);
+  });
+
+  it('handles the collapsed single-string unmatched shape', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: {
+        quote: { symbol: 'AAPL', last: 195.25, change: 0, change_percentage: 0, volume: 1 },
+        unmatched_symbols: { symbol: 'ARX.TO' },
+      },
+    }));
+    const client = new TradierStocksClient('tok');
+    const { unmatchedSymbols } = await client.getQuotesDetailed(['AAPL', 'ARX.TO']);
+    expect(unmatchedSymbols).toEqual(['ARX.TO']);
+  });
+
+  it('maps an unmatched wire spelling back to the requested spelling', async () => {
+    // If Tradier ever fails to match the aliased wire symbol, the caller must
+    // hear about it under the spelling THEY asked for, not the wire one.
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: [], unmatched_symbols: { symbol: 'VIX' } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const { unmatchedSymbols } = await client.getQuotesDetailed(['^VIX']);
+    expect(unmatchedSymbols).toEqual(['^VIX']);
+  });
+
+  it('returns an empty unmatched list when the field is absent', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      quotes: { quote: { symbol: 'AAPL', last: 195.25, change: 0, change_percentage: 0, volume: 1 } },
+    }));
+    const client = new TradierStocksClient('tok');
+    const { unmatchedSymbols } = await client.getQuotesDetailed(['AAPL']);
+    expect(unmatchedSymbols).toEqual([]);
+  });
 });
 
 describe('TradierStocksClient.getMinuteBars', () => {

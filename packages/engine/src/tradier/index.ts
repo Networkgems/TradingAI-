@@ -40,4 +40,4 @@ export type {
   TradierMultilegPricing,
 } from './options-client.js';
 export { TradierStocksClient } from './stocks-client.js';
-export type { TradierEquityQuote } from './stocks-client.js';
+export type { TradierEquityQuote, TradierQuotesRead } from './stocks-client.js';

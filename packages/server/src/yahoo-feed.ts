@@ -305,6 +305,35 @@ export function formatDroppedSymbols(
   return ` — dropped ${head.join(',')}${rest > 0 ? ` (+${rest} more)` : ''}`;
 }
 
+// TRA-3385 (Remedy B) — Tradier names the symbols it cannot serve in
+// `unmatched_symbols` on every batch response; the client used to parse and
+// discard it, which left TRA-2682's coverage question ("which universe members
+// are permanently un-servable by the primary?") looking like an open research
+// task. This surfaces the answer as a measurement: the FULL membership, never
+// a capped prefix — the 20-name `DROPPED_SYMBOL_SAMPLE` prefix on the drop
+// lines is exactly what made this class invisible. Logged once per session and
+// again only when membership changes, so a 670-symbol universe costs one line
+// per boot, not one per tick.
+let lastUnmatchedLoggedKey: string | null = null;
+
+/** Returns the warn line to log for this batch's `unmatched_symbols`, or null
+ * when there is nothing new to say (empty set, or same membership as already
+ * logged this session). Pure apart from the module-level dedupe key, so tests
+ * can drive it directly. */
+export function recordTradierUnmatched(unmatched: readonly string[], requestedCount: number): string | null {
+  if (unmatched.length === 0) return null;
+  const sorted = [...unmatched].sort();
+  const key = sorted.join(',');
+  if (key === lastUnmatchedLoggedKey) return null;
+  lastUnmatchedLoggedKey = key;
+  return `[yahoo-feed] tradier quotes(batch): ${unmatched.length}/${requestedCount} requested symbols un-servable by the primary feed (unmatched_symbols): ${sorted.join(', ')}`;
+}
+
+/** Test seam: forget the last-logged unmatched membership. */
+export function __resetTradierUnmatchedForTests(): void {
+  lastUnmatchedLoggedKey = null;
+}
+
 // ── TRA-505 / TRA-572: wire the quote feed to live UI creds, multi-tenant-safe ─
 // TRA-505: the live app writes each user's Tradier creds into per-user account
 // settings (Settings page), NOT env — so on a normal deployment `TRADIER_API_TOKEN`
@@ -2271,7 +2300,9 @@ export async function fetchQuotes(
         try {
           bumpFallbackCounter('tradier');
           recordTradierQuoteRequest(now);
-          const tradier = await tradierStocksClient!.getQuotes(toFetchArr);
+          const { quotes: tradier, unmatchedSymbols } = await tradierStocksClient!.getQuotesDetailed(toFetchArr);
+          const unmatchedLine = recordTradierUnmatched(unmatchedSymbols, toFetchArr.length);
+          if (unmatchedLine) console.warn(unmatchedLine);
           const storedAt = Date.now();
           for (const [sym, q] of tradier) {
             const quote = tradierQuoteToResult(q);
