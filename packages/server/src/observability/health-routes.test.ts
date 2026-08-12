@@ -5073,6 +5073,85 @@ describe('GET /api/health/live-enforce-gates (TRA-3216)', () => {
     expect(body.note).toMatch(/~614 watchlist names/);
   });
 
+  // ─── TRA-3401 — the NOMINATOR's arm state ───────────────────────────────────
+  // The selector records no live-enforce verdict, so it can never appear in
+  // `byGate`. Without an arm surface, "armed and nothing landed in band" reads
+  // EXACTLY like "never armed" — and it was armed on real money.
+  describe('arm.admissibleStrike (TRA-3401)', () => {
+    const FLAG = 'ENABLE_OTM_ADMISSIBLE_STRIKE_SELECT';
+    const MIN_VAR = 'OTM_ADMISSIBLE_DELTA_MIN';
+    const MAX_VAR = 'OTM_ADMISSIBLE_DELTA_MAX';
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of [FLAG, MIN_VAR, MAX_VAR]) {
+        saved[k] = process.env[k];
+        delete process.env[k];
+      }
+    });
+    afterEach(() => {
+      for (const k of [FLAG, MIN_VAR, MAX_VAR]) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k]!;
+      }
+    });
+
+    type ArmBody = { arm: { admissibleStrike: Record<string, unknown> }; note: string };
+
+    it('reports DISARMED by default, and says the legacy nominee is delta-blind', () => {
+      const body = serve() as unknown as ArmBody;
+      expect(body.arm.admissibleStrike).toMatchObject({
+        issue: 'TRA-3401',
+        flag: FLAG,
+        armed: false,
+        minValueRaw: null,
+        maxValueRaw: null,
+      });
+      expect(body.note).toMatch(/otm_nominator=off \(legacy top-\|mispricingPct\| nominee, delta-blind\)/);
+    });
+
+    it('publishes the RESOLVED band and the raw env, so an armed selector is readable', () => {
+      process.env[FLAG] = 'true';
+      process.env[MIN_VAR] = '0.50';
+      process.env[MAX_VAR] = '0.55';
+      const body = serve() as unknown as ArmBody;
+      expect(body.arm.admissibleStrike).toMatchObject({
+        armed: true,
+        band: { min: 0.5, max: 0.55 },
+        minValueRaw: '0.50',
+        maxValueRaw: '0.55',
+      });
+      expect(body.note).toMatch(/otm_nominator=ARMED into \|delta\| \[0\.5, 0\.55\)/);
+    });
+
+    it('shows a MALFORMED knob as raw, so a silent fallback is not read as the value that was set', () => {
+      process.env[FLAG] = '1';
+      process.env[MIN_VAR] = 'zero point five';
+      const body = serve() as unknown as ArmBody;
+      // The band falls back to the ratified default; `minValueRaw` is the ONLY
+      // thing that tells an operator their value never took.
+      expect(body.arm.admissibleStrike).toMatchObject({
+        armed: true,
+        band: { min: 0.495, max: 0.55 },
+        minValueRaw: 'zero point five',
+      });
+    });
+
+    it('withdraws the SHADOW-ONLY "byte-for-byte unchanged" claim when the nominator is armed', () => {
+      // Every GATE is off and the universe is unrestricted — the one state that
+      // still prints SHADOW-ONLY. An armed selector changes WHICH contract is
+      // nominated, so that sentence is false even though it adds no rejection.
+      process.env[UNIVERSE_VAR] = '*';
+      expect((serve() as unknown as ArmBody).note).toMatch(/SHADOW-ONLY/); // positive control
+
+      process.env[FLAG] = 'true';
+      const body = serve() as unknown as ArmBody;
+      expect(body.arm.admissibleStrike).toMatchObject({ armed: true });
+      expect(body.note).not.toMatch(/SHADOW-ONLY/);
+      expect(body.note).toMatch(/otm_nominator=ARMED/);
+    });
+  });
+
   it('publishes the bar composition, so a floor-pinned bar is not re-derived by hand', () => {
     const body = serve();
     expect(body.arm.costBar.bar).toMatchObject({ barPinnedByFloor: false, dominantTerm: 'spread_cross' });

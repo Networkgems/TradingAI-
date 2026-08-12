@@ -42,10 +42,22 @@
 //
 // A cell with `n < 30` BLOCKS under its own reason code, distinct from
 // `gross_negative` (Ruling 2.5). That distinction is the main deliverable: today
-// the board cannot tell "we measured a loser" from "we never measured", and on
-// the restricted live universe [AAPL,SPY,QQQ,PLTR,TSLA] the tape holds 471 rows,
-// **all of them |Δ| < 0.20 and none anywhere in the band the gate admits** — the
-// live sleeve is entirely in the second state and nothing said so.
+// the board cannot tell "we measured a loser" from "we never measured".
+//
+// ⚠ TRA-3401 — READ THE CELL KEY BEFORE SCOPING THAT CLAIM BY SYMBOL. On the
+// restricted live universe [AAPL,SPY,QQQ,PLTR,TSLA] the tape holds 471 rows, all
+// of them |Δ| < 0.20. That is a true statement about where the live sleeve has
+// historically NOMINATED, and it is NOT a statement about the evidence a live
+// candidate is decided under: {@link tapeExpectancyCellKey} is
+// `structure × |delta| bucket` with **no symbol axis**, so the universe
+// restriction does not scope the fold. A live AAPL candidate at |Δ|=0.51 is
+// decided under `single_leg_otm::0.50-0.55` — pooled across every symbol and
+// mode on the model-facing basis, n=87 on 2026-08-12, which ADMITS.
+//
+// Reading the 471 as "the admitted band is unmeasured" cost TRA-3401 a wrong
+// recommendation to the board (it reported an evidence deadlock that does not
+// exist). The readable answer is /api/health/option-expectancy-table, which
+// publishes n / lowerCI95 / admits per cell — never re-derive it by symbol.
 //
 // PURE — no env, no I/O, no clock (the caller passes `nowMs`). The rolling window
 // and the journal read live in `option-tape-expectancy-cache.ts`.

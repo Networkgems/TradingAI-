@@ -123,6 +123,13 @@ import { describeNetEdgeBar } from '../option-net-edge-bar.js';
 // decision is readable off deployed state instead of re-derived by hand.
 import { tapeExpectancyCache } from '../option-tape-expectancy-cache.js';
 import { DECLINE_REASON_TAXONOMY, TAPE_EXPECTANCY_MIN_CELL_N } from '../option-tape-expectancy.js';
+import {
+  isOtmAdmissibleStrikeEnabled,
+  resolveAdmissibleBand,
+  OTM_ADMISSIBLE_STRIKE_FLAG,
+  OTM_ADMISSIBLE_DELTA_MIN_VAR,
+  OTM_ADMISSIBLE_DELTA_MAX_VAR,
+} from '../otm-admissible-strike.js';
 // TRA-3394 (authorization TRA-3392) — the ratified band table and the live arm of
 // its UPPER edge. The cost bar is algebraically a floor, so without the ceiling the
 // live admitted set exceeds the mandate at the top end.
@@ -4333,6 +4340,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const netEdge = describeNetEdgeBar(liveEnv);
     const netEdgeGovernsOtm = netEdge.enabled && netEdge.structures.includes('single_leg_otm');
     const summary = summarizeLiveEnforceGate(etDay);
+    // TRA-3401 — the nominator's live arm state. Read from `liveEnv` (process
+    // env), the same source the live scan consults; the demo-flag store governs
+    // demo only and must never be what a real-money arm is read off.
+    const admissibleStrikeArmed = isOtmAdmissibleStrikeEnabled(liveEnv);
+    const admissibleStrikeBand = resolveAdmissibleBand(liveEnv);
     const anyArmed = costArmed || spreadArmed || otmFloorArmed;
     res.json({
       ok: true,
@@ -4415,6 +4427,32 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           /** RAW env value, so a fallback is visible rather than inferred. */
           raw: universe.raw,
         },
+        /**
+         * TRA-3401 — the OTM strike NOMINATOR, which is upstream of every gate
+         * below and was the actual suppressor: the legacy `find` returned the
+         * top-|mispricingPct| contract with no reference to delta, so the cost
+         * bar rejected a structurally inadmissible nominee and the `continue`
+         * discarded the whole symbol for that scan.
+         *
+         * This is a SELECTOR, not a gate — it records no live-enforce verdict, so
+         * `byGate` below can never show it and "armed but nothing in band" would
+         * otherwise read EXACTLY like "never armed". That is why the arm state is
+         * published here: an armed real-money selector with no readable arm
+         * surface is the same instrument failure this route exists to prevent.
+         *
+         * `band` is the RESOLVED band (env override or the TRA-3392 ratified
+         * default), and the raw env values sit beside it so a malformed knob —
+         * which silently falls back — is visible rather than inferred.
+         */
+        admissibleStrike: {
+          issue: 'TRA-3401',
+          authorization: OTM_SLEEVE_MANDATE_ISSUE,
+          flag: OTM_ADMISSIBLE_STRIKE_FLAG,
+          armed: admissibleStrikeArmed,
+          band: admissibleStrikeBand,
+          minValueRaw: liveEnv[OTM_ADMISSIBLE_DELTA_MIN_VAR] ?? null,
+          maxValueRaw: liveEnv[OTM_ADMISSIBLE_DELTA_MAX_VAR] ?? null,
+        },
         otmDeltaFloor: {
           flag: OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
           armed: otmFloorArmed,
@@ -4432,10 +4470,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // `!anyArmed` branch asserted the live path was "byte-for-byte ... no
       // rejection", which would now be FALSE while reading exactly as before —
       // the precise instrument failure this route exists to prevent.
+      // TRA-3401 — the SHADOW-ONLY branch asserts the live path is "byte-for-byte
+      // the pre-TRA-2048 behaviour". An ARMED nominator falsifies that sentence
+      // even though it adds no rejection: it changes WHICH contract is nominated,
+      // so the claim has to answer to the selector as well as to the gates.
       note:
-        !anyArmed && !universe.restricted
+        !anyArmed && !universe.restricted && !admissibleStrikeArmed
           ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist.`
-          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count. ⚠️ TRA-3391 changed what cost_bar's edge IS: it is now the LOWER 95% CI bound of the candidate's measured tape cell (arm.costBar.edge), not \`3·|delta| − 1\`. Two consequences for this payload — (1) \`byReason\` now carries \`insufficient_evidence\`, which means WE NEVER MEASURED THAT CELL and is NOT \`gross_negative\` (a measured loser); on the restricted live universe the tape holds 471 rows, ALL |Δ| < 0.20, so every candidate in the admitted band is expected to land there. (2) \`byCell\` names the cell each verdict was decided under, admits included — cross-read it against /api/health/option-expectancy-table, which publishes n / mean / SE / lowerCI95 / admits per cell.`,
+          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}, otm_nominator=${admissibleStrikeArmed ? `ARMED into |delta| [${admissibleStrikeBand.min}, ${admissibleStrikeBand.max}) (TRA-3401 — a SELECTOR upstream of every gate here: it records NO verdict, so it can never appear in byGate; confirm it is biting via arm.admissibleStrike + the OTM nomination log, NOT by looking for a gate row)` : 'off (legacy top-|mispricingPct| nominee, delta-blind)'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count. ⚠️ TRA-3391 changed what cost_bar's edge IS: it is now the LOWER 95% CI bound of the candidate's measured tape cell (arm.costBar.edge), not \`3·|delta| − 1\`. Two consequences for this payload — (1) \`byReason\` now carries \`insufficient_evidence\`, which means WE NEVER MEASURED THAT CELL and is NOT \`gross_negative\` (a measured loser). ⚠️ TRA-3401 — do NOT scope that by symbol: the cell key is \`structure × |delta| bucket\` with NO symbol axis, so the universe restriction does not scope the fold. "On the restricted live universe the tape holds 471 rows, ALL |Δ| < 0.20" describes where the live sleeve has historically NOMINATED, NOT the evidence a candidate in the admitted band is decided under — that band is pooled across every symbol and mode, and it ADMITS. Reading the 471 the other way reported an evidence deadlock that does not exist. (2) \`byCell\` names the cell each verdict was decided under, admits included — cross-read it against /api/health/option-expectancy-table, which publishes n / mean / SE / lowerCI95 / admits per cell.`,
     });
   });
 
