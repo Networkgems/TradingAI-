@@ -3797,6 +3797,8 @@ describe('SignalEngine — TRA-361/TRA-450 submitStagedOptionExits pricing', () 
     sellContractsLimit: ReturnType<typeof vi.fn>;
     sellContracts: ReturnType<typeof vi.fn>;
     waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    getOrderStatus: ReturnType<typeof vi.fn>;
   }
 
   function makeStub(): TradierExitStub {
@@ -3806,6 +3808,8 @@ describe('SignalEngine — TRA-361/TRA-450 submitStagedOptionExits pricing', () 
       sellContracts: vi.fn().mockResolvedValue({ id: 902, status: 'pending' }),
       // No terminal status — keep the pendingExit and let the next tick poll.
       waitForOrderTerminalStatus: vi.fn().mockResolvedValue(null),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      getOrderStatus: vi.fn().mockResolvedValue({ id: 901, status: 'canceled', exec_quantity: 0 }),
     };
   }
 
@@ -3841,15 +3845,26 @@ describe('SignalEngine — TRA-361/TRA-450 submitStagedOptionExits pricing', () 
     } as unknown as import('@trading-app/shared').OptionPosition;
   }
 
-  it('TRA-450 — reprices an SL LIMIT exit onto the live bid, not the stale trigger', async () => {
+  it('TRA-450 — reprices an SL LIMIT exit onto the live book, not the stale trigger', async () => {
     const stub = makeStub();
     const submit = bindSubmit(setupEngine(stub));
     await submit([stagedExit({ kind: 'sl' })]);
-    // bid 0.80 — a sell limit at the bid is immediately marketable. The stale
-    // 1.50 trigger is never submitted.
+    // 0.80 / 1.20 is a 40%-wide book, so TRA-3418 caps the first ask at
+    // mid − max(0.05, 5% of mid) = 1.00 − 0.05 = 0.95 rather than sitting on the
+    // 0.80 bid. Either way the stale 1.50 trigger is never submitted.
     expect(stub.getOptionQuote).toHaveBeenCalledWith('SPY260515C00450000');
-    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 0.80);
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 0.95);
     expect(stub.sellContracts).not.toHaveBeenCalled();
+  });
+
+  it('TRA-450 — sits on the bid untouched when the book is tight enough that the cap is inert', async () => {
+    const stub = makeStub();
+    // mid 1.00, concession 0.02 — well inside max(0.05, 5% of mid).
+    stub.getOptionQuote.mockResolvedValue({ symbol: 'X', bid: 0.98, ask: 1.02 });
+    const submit = bindSubmit(setupEngine(stub));
+    await submit([stagedExit({ kind: 'sl' })]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('SPY260515C00450000', 2, 0.98);
+    expect(stub.cancelOrder).not.toHaveBeenCalled();
   });
 
   it('TRA-450 — reprices a TP1 LIMIT exit onto the live mid', async () => {
@@ -3893,6 +3908,138 @@ describe('SignalEngine — TRA-361/TRA-450 submitStagedOptionExits pricing', () 
 
     expect(stub.sellContracts).toHaveBeenCalledWith('NFLX260515P00400000', 1);
     expect(stub.sellContractsLimit).not.toHaveBeenCalled();
+  });
+});
+
+// ─── TRA-3418 — concession-cap escalation ────────────────────────────────────
+// The cap asks ABOVE the bid on a wide book. That is only defensible because it
+// is bounded: if the book won't meet the cap inside the submit-wait window the
+// order is withdrawn and re-submitted at the un-capped price, so the state
+// "resting above the bid" cannot survive the tick that created it.
+//
+// The failure mode these tests exist for is NOT a missed escalation — declining
+// to escalate merely reproduces the pre-TRA-3418 price. It is a DOUBLE SELL:
+// cancelling an order that filled between the last poll and the cancel, then
+// re-submitting the full quantity, opens a naked short leg on a live account.
+// Every "does NOT escalate" case below is that guard.
+describe('SignalEngine — TRA-3418 capped-exit escalation', () => {
+  interface EscalationStub {
+    getOptionQuote: ReturnType<typeof vi.fn>;
+    sellContractsLimit: ReturnType<typeof vi.fn>;
+    sellContracts: ReturnType<typeof vi.fn>;
+    waitForOrderTerminalStatus: ReturnType<typeof vi.fn>;
+    cancelOrder: ReturnType<typeof vi.fn>;
+    getOrderStatus: ReturnType<typeof vi.fn>;
+  }
+
+  // The 2026-08-07 TROW book: mid 3.60, bid 3.00. Cap = 3.60 − 0.18 = 3.42.
+  const TROW_QUOTE = { symbol: 'TROW260918C00115000', bid: 3.0, ask: 4.2 };
+
+  function makeStub(over: Partial<EscalationStub> = {}): EscalationStub {
+    return {
+      getOptionQuote: vi.fn().mockResolvedValue(TROW_QUOTE),
+      sellContractsLimit: vi.fn().mockResolvedValue({ id: 901, status: 'pending' }),
+      sellContracts: vi.fn().mockResolvedValue({ id: 902, status: 'pending' }),
+      // Working, untouched, past the wait window — the escalation trigger.
+      waitForOrderTerminalStatus: vi.fn().mockResolvedValue({ id: 901, status: 'open', exec_quantity: 0 }),
+      cancelOrder: vi.fn().mockResolvedValue(undefined),
+      getOrderStatus: vi.fn().mockResolvedValue({ id: 901, status: 'canceled', exec_quantity: 0 }),
+      ...over,
+    };
+  }
+
+  function submitWith(stub: EscalationStub) {
+    const engine = new SignalEngine();
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = stub;
+    return (engine as unknown as {
+      submitStagedOptionExits: (s: import('@trading-app/shared').OptionPosition[]) => Promise<void>;
+    }).submitStagedOptionExits.bind(engine);
+  }
+
+  function trowExit(): import('@trading-app/shared').OptionPosition {
+    return {
+      id: 'opt-trow',
+      symbol: 'TROW',
+      optionSymbol: 'TROW260918C00115000',
+      pendingExit: {
+        tradierOrderId: '',
+        qty: 1,
+        limitPrice: 3.5,
+        submittedAt: Date.now(),
+        kind: 'sl',
+        pricing: 'limit',
+      },
+    } as unknown as import('@trading-app/shared').OptionPosition;
+  }
+
+  it('asks 3.42 first and concedes to the 3.00 bid only after the book declines it', async () => {
+    const stub = makeStub();
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenNthCalledWith(1, 'TROW260918C00115000', 1, 3.42);
+    expect(stub.cancelOrder).toHaveBeenCalledWith(901);
+    expect(stub.sellContractsLimit).toHaveBeenNthCalledWith(2, 'TROW260918C00115000', 1, 3.0);
+    // Exactly one escalation — the walk is bounded, not a ladder.
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT escalate when the capped limit filled — no cancel, no second order', async () => {
+    const stub = makeStub({
+      waitForOrderTerminalStatus: vi
+        .fn()
+        .mockResolvedValue({ id: 901, status: 'filled', exec_quantity: 1, avg_fill_price: 3.42 }),
+    });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+    expect(stub.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('does NOT escalate a PARTIAL fill — the remaining qty is not the qty we would re-submit', async () => {
+    const stub = makeStub({
+      waitForOrderTerminalStatus: vi.fn().mockResolvedValue({ id: 901, status: 'open', exec_quantity: 1 }),
+    });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+    expect(stub.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('does NOT escalate when the order state is unknown — never blind-cancel', async () => {
+    // Every status poll failed. The order may be filled; cancelling and
+    // re-submitting on that guess is the double-sell.
+    const stub = makeStub({ waitForOrderTerminalStatus: vi.fn().mockResolvedValue(null) });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+    expect(stub.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('does NOT re-submit when the cancel throws — the capped order is still live at the broker', async () => {
+    const stub = makeStub({ cancelOrder: vi.fn().mockRejectedValue(new Error('Tradier 500')) });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT re-submit when the cancel is not CONFIRMED terminal-and-zero-filled', async () => {
+    // The cancel raced a fill: the re-read comes back filled, not canceled.
+    const stub = makeStub({
+      getOrderStatus: vi.fn().mockResolvedValue({ id: 901, status: 'filled', exec_quantity: 1 }),
+    });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT re-submit when the post-cancel re-read is unavailable', async () => {
+    const stub = makeStub({ getOrderStatus: vi.fn().mockResolvedValue(null) });
+    await submitWith(stub)([trowExit()]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT escalate a TP1 exit — the mid level is above the cap by construction', async () => {
+    const stub = makeStub();
+    const snapshot = trowExit();
+    (snapshot.pendingExit as { kind: string }).kind = 'tp1';
+    await submitWith(stub)([snapshot]);
+    expect(stub.sellContractsLimit).toHaveBeenCalledTimes(1);
+    expect(stub.sellContractsLimit).toHaveBeenCalledWith('TROW260918C00115000', 1, 3.6);
+    expect(stub.cancelOrder).not.toHaveBeenCalled();
   });
 });
 

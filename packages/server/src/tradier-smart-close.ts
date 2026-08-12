@@ -407,20 +407,79 @@ export function derivePricingPath(quote: TradierOptionQuote | null): MidPath | L
  */
 export const MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID = 0.4;
 
-/** TRA-2811 — a floored live sell limit plus the provenance the caller logs. */
+/**
+ * TRA-3418 — the CONCESSION CAP: the most a live `sell_to_close` may sit below
+ * the quote midpoint **on its first attempt**.
+ *
+ * The TRA-2811 floor above is a donation backstop, and it works — nothing has
+ * submitted 87% below mid since. But it left the ordinary case untouched, and
+ * the ordinary case is where the money went. Sitting on the bid concedes the
+ * FULL half-spread, and on a wide book that is the whole loss:
+ *
+ * | 2026-08-0x live | mid | limit = bid | vs mid | outcome |
+ * |---|---|---|---|---|
+ * | `TROW260918C00115000` | 3.60 | 3.00 | −16.7% | **filled AT 3.00** — the limit set the price, ≈$60 donated on one contract |
+ * | `KVYO260918C00017500` | 1.425 | 1.20 | −15.8% | filled 1.3533 — the market, not us, saved it |
+ * | `TSLA260911C00555000` | 0.245 | 0.22 | −10.2% | filled at the limit |
+ *
+ * Every one of those cleared the 40% floor untouched. TROW is the first case
+ * where the floor-less limit demonstrably *set* the realised price rather than
+ * merely risking it.
+ *
+ * **Why two terms.** A pure percentage bites hardest where it helps least: on a
+ * $0.12 contract the whole spread is one or two ticks, 5% of mid is sub-tick,
+ * and holding out for a cent buys nothing while adding non-fill risk to a stop.
+ * So the cap is `max(MIN_LIVE_SELL_CONCESSION_ABS, mid × MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID)`
+ * — the absolute term keeps the penny-option regime behaving EXACTLY as it does
+ * today, and the proportional term engages only once the concession is worth
+ * real money. Against the tape: TSLA (concession $0.025) stays on the bid
+ * untouched; KVYO ($0.225) and TROW ($0.60) are capped.
+ *
+ * **Why 5%.** KVYO is the empirical anchor: submitted at the bid, 15.8% under
+ * mid, and the broker's routing filled it at 1.3533 — mid − 5.03%. The book's
+ * real clearing price was ~5% under mid, and we asked for 15.8% under. 5% is
+ * where that one honest observation says the liquidity actually was.
+ *
+ * **This cap is not a resting order.** It is the FIRST of two attempts. If the
+ * capped limit does not fill inside the submit-wait window, the caller cancels
+ * and re-submits at {@link LiveSellLimitResult.escalateTo} — the donation-floored
+ * bid, i.e. exactly today's price. So the worst case is today's behaviour ~6s
+ * later, and holding out above the bid never survives a tick boundary. That
+ * bound is deliberate: a stop resting above the bid across ticks is the
+ * self-reinforcing detachment TRA-2956 documents, and this must not reintroduce
+ * it to buy a better price.
+ */
+export const MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID = 0.05;
+
+/** TRA-3418 — see {@link MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID}: the absolute leg of the cap, per share. */
+export const MIN_LIVE_SELL_CONCESSION_ABS = 0.05;
+
+/** TRA-2811 / TRA-3418 — a priced live sell limit plus the provenance the caller logs. */
 export interface LiveSellLimitResult {
-  /** The per-share limit to submit (already floored + cent-rounded). */
+  /** The per-share limit to submit FIRST (already floored, capped + cent-rounded). */
   limit: number;
-  /** The pre-floor price the level selected (bid / mid / last). */
+  /** The pre-floor, pre-cap price the level selected (bid / mid / last). */
   raw: number;
-  /** Quote midpoint the floor was computed against; null on a single-sided book. */
+  /** Quote midpoint the floor/cap were computed against; null on a single-sided book. */
   mid: number | null;
   /**
    * TRUE when `raw` sat below `mid × (1 − MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID)`
-   * and the limit was lifted to the floor. The caller must surface this loudly —
-   * it means the live book was too wide to trust the bid.
+   * and the price was lifted to the donation floor. The caller must surface this
+   * loudly — it means the live book was too wide to trust the bid at all.
    */
   floored: boolean;
+  /**
+   * TRA-3418 — TRUE when the concession cap lifted `limit` ABOVE the price this
+   * exit would otherwise have submitted at. Implies `escalateTo` is non-null.
+   */
+  capped: boolean;
+  /**
+   * TRA-3418 — the donation-floored level price (i.e. pre-TRA-3418 behaviour) to
+   * re-submit at if `limit` does not fill inside the submit-wait window. `null`
+   * when the cap did not engage, which is the signal that there is nothing to
+   * escalate to.
+   */
+  escalateTo: number | null;
 }
 
 /**
@@ -445,6 +504,15 @@ export interface LiveSellLimitResult {
  * level is ≥ the floor by construction, and single-sided (`last`) quotes have
  * no mid to floor against, so only degenerate bid-level prices are lifted.
  *
+ * TRA-3418 — the floored price is then CAPPED by
+ * {@link MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID}, so the FIRST submission never
+ * concedes more than `max($0.05, 5% of mid)` below mid. When the cap engages,
+ * `escalateTo` carries the un-capped (floored) price and the caller re-submits
+ * there if the capped limit does not fill — the cap buys a better price, it
+ * never abandons the exit. The mid level and single-sided (`last`) paths are
+ * inert under the cap: a midpoint is above the cap by construction, and a
+ * single-sided quote has no mid to measure a concession against.
+ *
  * Single-sided quotes (no bid) fall back to `last` for either level — the
  * best live price we have. Returns `null` when the quote yields nothing
  * usable; the caller then falls back to the staged trigger price.
@@ -458,17 +526,43 @@ export function liveSellLimitDetailed(
   if (path.kind === 'last') {
     const limit = roundToCent(path.last);
     if (!Number.isFinite(limit) || limit <= 0) return null;
-    return { limit, raw: limit, mid: null, floored: false };
+    return { limit, raw: limit, mid: null, floored: false, capped: false, escalateTo: null };
   }
   const mid = (path.bid + path.ask) / 2;
   const raw = roundToCent(level === 'bid' ? path.bid : mid);
   if (!Number.isFinite(raw) || raw <= 0) return null;
   const floor = roundToCent(mid * (1 - MAX_LIVE_SELL_LIMIT_DISCOUNT_VS_MID));
   const floored = raw < floor;
-  return { limit: floored ? floor : raw, raw, mid: roundToCent(mid), floored };
+  // The price this exit would have submitted at before TRA-3418 — and the price
+  // it escalates back to if the capped limit goes unfilled.
+  const unCapped = floored ? floor : raw;
+  const capPrice = roundToCent(
+    mid - Math.max(MIN_LIVE_SELL_CONCESSION_ABS, mid * MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID),
+  );
+  // A cap at or below zero is not a price — a contract cheaper than the absolute
+  // concession leg (mid ≤ $0.05) can only be sold by crossing, so leave it alone.
+  const capped = capPrice > 0 && unCapped < capPrice;
+  return {
+    limit: capped ? capPrice : unCapped,
+    raw,
+    mid: roundToCent(mid),
+    floored,
+    capped,
+    escalateTo: capped ? unCapped : null,
+  };
 }
 
-/** Back-compat shape of {@link liveSellLimitDetailed} — just the (floored) limit. */
+/**
+ * Back-compat shape of {@link liveSellLimitDetailed} — just the (floored, capped)
+ * limit.
+ *
+ * ⚠️ TRA-3418 — this shape DISCARDS `escalateTo`, so a caller using it submits the
+ * concession-capped price with no way to fall back to the bid. On a wide book that
+ * is an order resting ABOVE the bid with nothing scheduled to withdraw it, which is
+ * the TRA-2956 detachment shape. Any live `sell_to_close` path must call
+ * {@link liveSellLimitDetailed} and honour `escalateTo`; this wrapper is retained
+ * for tests and for callers that only need to price a quote, not submit one.
+ */
 export function liveSellLimit(
   quote: TradierOptionQuote | null,
   level: 'mid' | 'bid',

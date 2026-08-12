@@ -90,11 +90,15 @@ describe('liveSellLimitDetailed floor (TRA-2811)', () => {
   it('floors the exact 2026-08-03 production defect: bid 0.17 / ask 2.49 (mid 1.33)', () => {
     // The live SL exit submitted the raw bid — $0.17 against a $1.33 mid, −87%
     // vs mid, filled at $0.89 (−33% vs mid). Floor = 0.6 × 1.33 = 0.798 → 0.80.
+    // TRA-3418 — the cap then lifts that 0.80 again, to 1.33 − max(0.05, 0.0665)
+    // = 1.2635 → 1.26, and hands 0.80 back as the escalation price.
     expect(liveSellLimitDetailed({ symbol: 'X', bid: 0.17, ask: 2.49 }, 'bid')).toEqual({
-      limit: 0.8,
+      limit: 1.26,
       raw: 0.17,
       mid: 1.33,
       floored: true,
+      capped: true,
+      escalateTo: 0.8,
     });
   });
 
@@ -104,6 +108,8 @@ describe('liveSellLimitDetailed floor (TRA-2811)', () => {
       raw: 0.16,
       mid: 0.19,
       floored: false,
+      capped: false,
+      escalateTo: null,
     });
   });
 
@@ -113,6 +119,8 @@ describe('liveSellLimitDetailed floor (TRA-2811)', () => {
       raw: 1.33,
       mid: 1.33,
       floored: false,
+      capped: false,
+      escalateTo: null,
     });
   });
 
@@ -122,12 +130,96 @@ describe('liveSellLimitDetailed floor (TRA-2811)', () => {
       raw: 0.25,
       mid: null,
       floored: false,
+      capped: false,
+      escalateTo: null,
     });
   });
 
   it('returns null when the quote yields no usable price', () => {
     expect(liveSellLimitDetailed(null, 'bid')).toBeNull();
     expect(liveSellLimitDetailed({ symbol: 'X', bid: 0, ask: 0, last: 0 }, 'bid')).toBeNull();
+  });
+});
+
+/**
+ * TRA-3418 — the concession cap, graded against the three live `single_leg_otm`
+ * exits that produced it. Each row is a real production submission; `limit` is
+ * what the fixed code asks for FIRST and `escalateTo` is what it falls back to,
+ * which is byte-for-byte the price the un-fixed code submitted.
+ */
+describe('liveSellLimitDetailed concession cap (TRA-3418)', () => {
+  it('caps the 2026-08-07 TROW loss: mid 3.60 / bid 3.00 filled AT the 3.00 limit', () => {
+    // `TROW260918C00115000`, live production. Concession allowed =
+    // max(0.05, 3.60 × 0.05) = 0.18 → cap 3.42. The bid conceded 0.60.
+    expect(liveSellLimitDetailed({ symbol: 'TROW260918C00115000', bid: 3.0, ask: 4.2 }, 'bid')).toEqual({
+      limit: 3.42,
+      raw: 3.0,
+      mid: 3.6,
+      floored: false,
+      capped: true,
+      escalateTo: 3.0,
+    });
+  });
+
+  it('caps KVYO to within a cent of the price the book actually cleared at', () => {
+    // `KVYO260918C00017500`: submitted 1.20 (the bid, −15.8% vs mid) and the
+    // broker's routing filled it at 1.3533 — mid − 5.03%. That fill is the
+    // empirical anchor for the 5% fraction: the cap lands at 1.35, i.e. we now
+    // ASK for the price the market was already willing to pay.
+    expect(liveSellLimitDetailed({ symbol: 'KVYO260918C00017500', bid: 1.2, ask: 1.65 }, 'bid')).toEqual({
+      limit: 1.35,
+      raw: 1.2,
+      // 1.425 → 1.42: `roundToCent` is Math.round on a binary float and
+      // 1.425 × 100 is 142.49999999999997. Reported mid only, never the limit.
+      mid: 1.42,
+      floored: false,
+      capped: true,
+      escalateTo: 1.2,
+    });
+  });
+
+  it('leaves the penny-option regime alone — TSLA 0.22/0.27 stays on the bid', () => {
+    // `TSLA260911C00555000`: −10.2% vs mid reads alarming, but it is $0.025 per
+    // share. The absolute leg (max(0.05, …)) is what keeps the cap out of this
+    // regime — holding a STOP above the bid to chase 2.5 cents is a bad trade.
+    expect(liveSellLimitDetailed({ symbol: 'TSLA260911C00555000', bid: 0.22, ask: 0.27 }, 'bid')).toEqual({
+      limit: 0.22,
+      raw: 0.22,
+      mid: 0.25,
+      floored: false,
+      capped: false,
+      escalateTo: null,
+    });
+  });
+
+  it('never prices ABOVE the mid — the cap is a floor on the concession, not a markup', () => {
+    for (const [bid, ask] of [[3.0, 4.2], [1.2, 1.65], [0.17, 2.49], [0.1, 0.14], [0.02, 9.0]]) {
+      const r = liveSellLimitDetailed({ symbol: 'X', bid, ask }, 'bid');
+      expect(r).not.toBeNull();
+      expect(r!.limit).toBeLessThanOrEqual(r!.mid!);
+      // …and never worse than the price the un-fixed code would have submitted.
+      expect(r!.limit).toBeGreaterThanOrEqual(r!.escalateTo ?? r!.limit);
+    }
+  });
+
+  it('stands down on a contract cheaper than the absolute concession leg', () => {
+    // mid 0.03 − max(0.05, 0.0015) is negative; there is no sane cap price, and
+    // a sub-nickel contract can only be sold by crossing. Leave it on the bid.
+    expect(liveSellLimitDetailed({ symbol: 'X', bid: 0.02, ask: 0.04 }, 'bid')).toEqual({
+      limit: 0.02,
+      raw: 0.02,
+      mid: 0.03,
+      floored: false,
+      capped: false,
+      escalateTo: null,
+    });
+  });
+
+  it('escalateTo is exactly the pre-TRA-3418 price, so escalation can only restore old behaviour', () => {
+    const r = liveSellLimitDetailed({ symbol: 'X', bid: 3.0, ask: 4.2 }, 'bid')!;
+    expect(r.escalateTo).toBe(r.raw); // sane book: the un-capped price IS the bid
+    const degenerate = liveSellLimitDetailed({ symbol: 'X', bid: 0.17, ask: 2.49 }, 'bid')!;
+    expect(degenerate.escalateTo).toBe(0.8); // wide book: the TRA-2811 donation floor still binds
   });
 });
 

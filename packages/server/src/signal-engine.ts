@@ -8065,6 +8065,131 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3418 — second leg of the concession cap: the capped limit did not fill
+   * inside its wait window, so withdraw it and re-submit at the un-capped price.
+   *
+   * The cap (see {@link MAX_LIVE_SELL_CONCESSION_FRAC_OF_MID}) asks for a price
+   * above the bid on a wide book. That is only defensible because it is bounded:
+   * this method guarantees the ask-above-the-bid state cannot survive the tick
+   * that created it, so the cap can cost latency but never a fill, and never
+   * re-creates the TRA-2956 detachment where a stop rests unfillable while every
+   * exit rule it owns is suppressed by the `pendingExit` latch.
+   *
+   * The withdrawal borrows {@link withdrawStaleWorkingExit}'s discipline verbatim,
+   * because the hazard is the same and it is the expensive one: re-submitting the
+   * full quantity against an order that filled between our last poll and the
+   * cancel is a DOUBLE SELL — it opens a naked short leg on a live account. So
+   * every arm below fails CLOSED, declining to escalate and leaving the original
+   * order to the next-tick poller:
+   *   • `detail === null` — every poll failed; the order's state is unknown and a
+   *     blind cancel-and-replace is exactly the double-sell shape;
+   *   • terminal (filled / rejected) — nothing to escalate;
+   *   • `exec_quantity > 0` — a partial fill; the remaining quantity is not the
+   *     quantity we would re-submit;
+   *   • the post-cancel re-read is not a terminal, provably-ZERO-fill answer.
+   * Declining is always safe: the un-escalated order is a live limit at the price
+   * the cap lifted it FROM, i.e. no worse than the pre-TRA-3418 behaviour.
+   */
+  private async escalateCappedExit(
+    snapshot: import('@trading-app/shared').OptionPosition,
+    intent: NonNullable<import('@trading-app/shared').OptionPosition['pendingExit']>,
+    resp: import('@trading-app/engine').TradierOrderResponse,
+    detail: import('@trading-app/engine').TradierOrderDetail | null,
+    cappedLimit: number,
+    escalateTo: number | null,
+  ): Promise<
+    | { kind: 'unchanged' }
+    | { kind: 'aborted' }
+    | {
+        kind: 'escalated';
+        resp: import('@trading-app/engine').TradierOrderResponse;
+        detail: import('@trading-app/engine').TradierOrderDetail | null;
+        limit: number;
+      }
+  > {
+    const client = this.tradierLiveClient;
+    if (!client || escalateTo === null || !snapshot.optionSymbol) return { kind: 'unchanged' };
+    const base = {
+      component: 'live-exit-concession-cap',
+      issue: 'TRA-3418',
+      optionSymbol: snapshot.optionSymbol,
+      kind: intent.kind,
+      qty: intent.qty,
+      order: resp.id,
+      cappedLimit,
+      escalateTo,
+    };
+    if (!detail) {
+      log.warn('capped exit NOT escalated — order status unknown after the wait window', base);
+      return { kind: 'unchanged' };
+    }
+    if (detail.status === 'filled' || TRADIER_REJECTED_STATUSES.has(detail.status)) {
+      return { kind: 'unchanged' };
+    }
+    if (typeof detail.exec_quantity === 'number' && detail.exec_quantity > 0) {
+      log.info('capped exit NOT escalated — partially filled, leaving it to resolve', {
+        ...base,
+        execQuantity: detail.exec_quantity,
+      });
+      return { kind: 'unchanged' };
+    }
+    try {
+      await client.cancelOrder(resp.id);
+    } catch (err: unknown) {
+      log.warn('capped exit cancel THREW — leaving the capped order working', {
+        ...base,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return { kind: 'unchanged' };
+    }
+    const after = await client.getOrderStatus(resp.id);
+    const executed =
+      after && typeof after.exec_quantity === 'number' && Number.isFinite(after.exec_quantity)
+        ? after.exec_quantity
+        : null;
+    if (!(after !== null && TRADIER_REJECTED_STATUSES.has(after.status) && executed === 0)) {
+      log.warn('capped exit cancel NOT CONFIRMED unfilled — no re-submit, next tick polls the original order', {
+        ...base,
+        statusAfterCancel: after?.status ?? null,
+        execQuantityAfterCancel: executed,
+      });
+      return { kind: 'unchanged' };
+    }
+
+    let next: import('@trading-app/engine').TradierOrderResponse;
+    try {
+      next = await client.sellContractsLimit(snapshot.optionSymbol, intent.qty, escalateTo);
+    } catch (err: unknown) {
+      // The capped order is confirmed cancelled and the replacement never
+      // reached the broker, so the row has NO working exit. Clear the latch so
+      // `checkExits` re-decides the position on the next tick with every rule
+      // armed — the one thing that must not happen is resting on a latch that
+      // points at a cancelled order.
+      const reason = `TRA-3418 escalated sell_to_close submit threw: ${err instanceof Error ? err.message : String(err)}`;
+      this.optionsAccount.clearPendingExit(snapshot.id, reason);
+      log.warn(reason, base);
+      return { kind: 'aborted' };
+    }
+    this.optionsAccount.attachPendingExit(snapshot.id, next.id, escalateTo);
+    log.info('capped exit ESCALATED — book would not meet the cap, conceding to the un-capped price', {
+      ...base,
+      replacementOrder: next.id,
+      replacementStatus: next.status,
+    });
+    let nextDetail: import('@trading-app/engine').TradierOrderDetail | null = null;
+    try {
+      nextDetail = await client.waitForOrderTerminalStatus(next.id);
+    } catch (err: unknown) {
+      log.warn('escalated exit waitForOrderTerminalStatus failed — leaving pendingExit for next tick poll', {
+        ...base,
+        replacementOrder: next.id,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return { kind: 'escalated', resp: next, detail: nextDetail, limit: escalateTo };
+  }
+
+  /**
    * TRA-354 — submit Tradier `sell_to_close` LIMIT orders for every exit
    * intent that `checkExits({ waitAndHold: true })` just staged. The
    * staged `OptionPosition` snapshots carry `pendingExit.qty` and the
@@ -8093,6 +8218,11 @@ export class SignalEngine {
       // fails or yields no usable price we fall back to the staged trigger
       // price (pre-TRA-450 behaviour) rather than block the exit entirely.
       let submitLimit = intent.limitPrice;
+      // TRA-3418 — when the concession cap lifted `submitLimit` above the price
+      // this exit would otherwise have used, this holds that un-capped price. If
+      // the capped limit goes unfilled inside the submit-wait window we cancel
+      // and re-submit here, so the cap can only ever cost latency, never a fill.
+      let escalateTo: number | null = null;
       // TRA-1929 — capture the exit-time quote so a live close's slippage-vs-ask/mid
       // can be measured in the calibration ledger.
       let exitQuoteForLedger: { bid?: number | null; ask?: number | null } | null = null;
@@ -8104,6 +8234,25 @@ export class SignalEngine {
           const live = liveSellLimitDetailed(quote, level);
           if (live !== null) {
             submitLimit = live.limit;
+            escalateTo = live.escalateTo;
+            // TRA-3418 — the concession cap engaged: the level price conceded more
+            // than max($0.05, 5% of mid) below mid, so we ask for the cap first and
+            // fall back to `escalateTo` only if the book won't meet it. This is the
+            // TROW260918C00115000 shape (mid 3.60, bid 3.00, filled AT 3.00 — the
+            // limit set the price and donated ≈$60 on a single contract).
+            if (live.capped) {
+              log.info('sell_to_close limit CAPPED — asking above the bid before conceding the spread', {
+                component: 'live-exit-concession-cap',
+                issue: 'TRA-3418',
+                optionSymbol: snapshot.optionSymbol,
+                kind: intent.kind,
+                bid: quote?.bid ?? null,
+                ask: quote?.ask ?? null,
+                mid: live.mid,
+                cappedLimit: live.limit,
+                escalateTo: live.escalateTo,
+              });
+            }
             // TRA-2811 — the bid was implausibly far below mid (pathologically wide
             // book) and the limit was lifted to the floor. Surface it loudly: this
             // is the exact shape that submitted a $0.17 limit against a $1.33 mid
@@ -8166,7 +8315,19 @@ export class SignalEngine {
       // tick; if it ends rejected/canceled we clear the intent and surface
       // the reason without waiting for the next tick's poll.
       try {
-        const detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
+        let detail = await this.tradierLiveClient.waitForOrderTerminalStatus(resp.id);
+        // TRA-3418 — the capped limit did not fill inside the wait window. Cancel
+        // it and re-submit at the un-capped price, so holding out above the bid
+        // costs one wait window and NEVER survives a tick boundary (a stop resting
+        // above the bid across ticks is the self-reinforcing detachment TRA-2956
+        // documents — this must not buy a better price with that risk).
+        const escalated = await this.escalateCappedExit(snapshot, intent, resp, detail, submitLimit, escalateTo);
+        if (escalated.kind === 'aborted') continue;
+        if (escalated.kind === 'escalated') {
+          resp = escalated.resp;
+          detail = escalated.detail;
+          submitLimit = escalated.limit;
+        }
         if (!detail) continue;
         if (detail.status === 'filled') {
           const hasAvg = typeof detail.avg_fill_price === 'number' && detail.avg_fill_price > 0;
