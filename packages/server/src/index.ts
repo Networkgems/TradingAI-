@@ -67,6 +67,7 @@ import {
 import { CLOSING_EQUITY_BASIS_ENGINE_PAPER } from './pnl-tracker.js';
 import { generateCryptoEodReport } from './reports/crypto-eod-report.js';
 import { buildJournalCalendarCells, nonSessionCloseRetractions } from './reports/desk-calendar.js';
+import { foldDeskRows } from './test-accounts.js'; // TRA-2554 — the desk fold names itself on the wire
 // TRA-3100 — the live-calendar backfill's write decision (which cells it is
 // ALLOWED to overwrite), extracted so it is graded directly rather than mirrored.
 import {
@@ -10532,9 +10533,24 @@ app.get('/api/reports/desk', requireAuth, requireAdmin, async (req, res) => {
     // holiday churn). Publish what was retracted beside the dates so the
     // correction is auditable from the same route it changed — a date silently
     // missing from an index is unverifiable; a named retraction is evidence.
+    // TRA-2554 — and the same treatment for the OTHER thing that can remove a
+    // row from this number: the desk fold itself. Under the shipped `denylist`
+    // an unrecognised book is silently IN; under `allowlist` it is OUT — and an
+    // exclusion nobody can see is the failure this ticket exists to end. So the
+    // fold NAMES itself and NAMES what it dropped, on the route that serves the
+    // number. `unrecognisedAccounts` is populated under BOTH modes (it is a
+    // census, not a consequence): under `denylist` it is the standing warning
+    // that those books are being counted as desk P&L.
+    const fold = foldDeskRows(journalRows, { includeTest });
     res.json({
       dates: [...cells.keys()].sort().reverse(),
       nonSessionRetracted: nonSessionCloseRetractions(journalRows, { includeTest }),
+      deskFold: {
+        mode: fold.mode,
+        rowsByClass: fold.census,
+        unrecognisedAccounts: fold.unrecognisedAccounts,
+        unrecognisedRowsDropped: fold.unrecognisedRowsDropped,
+      },
     });
   } catch (err) {
     log.warn('desk calendar date list failed', {

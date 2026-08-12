@@ -7,6 +7,10 @@ import {
   KNOWN_DESK_BOOKS,
   TEST_ACCOUNT_PREFIX_ENV,
   testAccountClassifierIdentity, // TRA-2948
+  foldDeskRows, // TRA-2554
+  resolveDeskFoldMode,
+  isRosterDeskBook,
+  DESK_FOLD_DECISIONS,
 } from './test-accounts.js';
 
 // TRA-1475 — the QA/test-account classifier drives the firm-wide DESK de-noise.
@@ -218,5 +222,112 @@ describe('testAccountClassifierIdentity (TRA-2948)', () => {
     expect(id.emailSuffix).toBe('@qa.test');
     // the hash is the 8-hex-char FNV-1a form — a shape a consumer can assert
     expect(id.hash).toMatch(/^[0-9a-f]{8}$/);
+  });
+});
+
+// TRA-2554 — the INVERSION: `KNOWN_DESK_BOOKS` gates the fold when
+// `DESK_FOLD_ALLOWLIST` is armed. A reactive denylist has no failing state (an
+// unseen book name is IN the board number by default — TRA-1475 -> 1949 -> 2488
+// -> 2524, four times), and the fix is to default an unrecognised book OUT and
+// LOUD. Everything below pins the two hazards that inversion creates: dropping
+// the 2,192 account-less rows, and dropping `Richard` on a capital R.
+describe('desk fold inversion (TRA-2554)', () => {
+  const ALLOW = { DESK_FOLD_ALLOWLIST: '1' };
+  // One row per class, in one corpus, so every assertion below reads the same
+  // population the live journal has: unattributed / test / roster / unrecognised.
+  const CORPUS = [
+    { id: 'no-account', account: undefined },
+    { id: 'blank-account', account: '   ' },
+    { id: 'fixture', account: 'qa_reg_1751234567' },
+    { id: 'roster-admin', account: 'admin' },
+    { id: 'roster-cased', account: 'Richard' }, // live journal stamps a capital R
+    { id: 'unvouched', account: 'newdesk7' },
+  ];
+  const ids = (rows: Array<{ id: string }>) => rows.map((r) => r.id);
+
+  it('resolveDeskFoldMode FAILS CLOSED onto the shipped denylist', () => {
+    for (const env of [{}, { DESK_FOLD_ALLOWLIST: '' }, { DESK_FOLD_ALLOWLIST: ' ' },
+      { DESK_FOLD_ALLOWLIST: '0' }, { DESK_FOLD_ALLOWLIST: 'false' }, { DESK_FOLD_ALLOWLIST: 'maybe' }]) {
+      expect(resolveDeskFoldMode(env), JSON.stringify(env)).toBe('denylist');
+    }
+    for (const raw of ['1', 'true', 'TRUE', ' on ', 'yes']) {
+      expect(resolveDeskFoldMode({ DESK_FOLD_ALLOWLIST: raw }), raw).toBe('allowlist');
+    }
+  });
+
+  // CTO item 1 on this ticket: the KEEP rule for account-less rows must be its
+  // OWN named rule with its own test, not a fall-through in a filter.
+  it('KEEPS account-less rows under BOTH modes — the 2,192-row rule', () => {
+    for (const env of [{}, ALLOW]) {
+      const kept = ids(foldDeskRows(CORPUS, { env }).kept);
+      expect(kept, JSON.stringify(env)).toContain('no-account');
+      expect(kept, JSON.stringify(env)).toContain('blank-account');
+    }
+    // and the table says so directly, so flipping the cell fails HERE
+    expect(DESK_FOLD_DECISIONS.denylist.unattributed).toBe(true);
+    expect(DESK_FOLD_DECISIONS.allowlist.unattributed).toBe(true);
+  });
+
+  it('the two folds differ in EXACTLY ONE cell — `unrecognised`', () => {
+    const moved = (Object.keys(DESK_FOLD_DECISIONS.denylist) as Array<keyof typeof DESK_FOLD_DECISIONS.denylist>)
+      .filter((k) => DESK_FOLD_DECISIONS.denylist[k] !== DESK_FOLD_DECISIONS.allowlist[k]);
+    expect(moved).toEqual(['unrecognised']);
+  });
+
+  it('matches the roster case-insensitively — `Richard` (50 live rows) survives', () => {
+    expect(isRosterDeskBook('Richard')).toBe(true);
+    expect(isRosterDeskBook(' ADMIN ')).toBe(true);
+    expect(isRosterDeskBook('richard_2')).toBe(false);
+    expect(isRosterDeskBook('')).toBe(false);
+    expect(ids(foldDeskRows(CORPUS, { env: ALLOW }).kept)).toContain('roster-cased');
+  });
+
+  it('drops an unrecognised book under the allowlist and ENUMERATES it', () => {
+    const denied = foldDeskRows(CORPUS, { env: {} });
+    expect(ids(denied.kept)).toContain('unvouched'); // today: silently IN
+    expect(denied.unrecognisedRowsDropped).toBe(0);
+
+    const allowed = foldDeskRows(CORPUS, { env: ALLOW });
+    expect(ids(allowed.kept)).not.toContain('unvouched'); // inverted: OUT
+    expect(allowed.unrecognisedRowsDropped).toBe(1); // …and NEVER silently
+    expect(allowed.unrecognisedAccounts).toEqual(['newdesk7']);
+    expect(allowed.census).toEqual({ unattributed: 2, test: 1, roster: 2, unrecognised: 1 });
+  });
+
+  // The equivalence theorem the pre-deploy acceptance rests on: the moved set is
+  // exactly the unrecognised rows, so with none in the corpus the inversion is a
+  // byte-for-byte no-op on the board number.
+  it('is a NO-OP when the corpus carries zero unrecognised rows', () => {
+    const clean = CORPUS.filter((r) => r.id !== 'unvouched');
+    const denied = foldDeskRows(clean, { env: {} });
+    const allowed = foldDeskRows(clean, { env: ALLOW });
+    expect(denied.census.unrecognised).toBe(0);
+    expect(ids(allowed.kept)).toEqual(ids(denied.kept));
+    expect(allowed.unrecognisedRowsDropped).toBe(0);
+  });
+
+  it('?includeTest=1 keeps every row under BOTH modes — a query string moves no class boundary', () => {
+    for (const env of [{}, ALLOW]) {
+      expect(ids(foldDeskRows(CORPUS, { env, includeTest: true }).kept)).toEqual(ids(CORPUS));
+    }
+  });
+
+  it('leaves excludeTestAccountRows byte-identical under the default env', () => {
+    expect(ids(excludeTestAccountRows(CORPUS, { env: {} }))).toEqual(
+      ['no-account', 'blank-account', 'roster-admin', 'roster-cased', 'unvouched'],
+    );
+    // and inherits the armed mode without the call site knowing about the flag
+    expect(ids(excludeTestAccountRows(CORPUS, { env: ALLOW }))).not.toContain('unvouched');
+  });
+
+  // TRA-2948 contract: the identity hash moves exactly when the partition moves.
+  it('moves the classifier identity ONLY when the allowlist actually arms', () => {
+    const base = testAccountClassifierIdentity({});
+    expect(testAccountClassifierIdentity({ DESK_FOLD_ALLOWLIST: '0' }).hash).toBe(base.hash);
+    expect(base.deskFoldMode).toBe('denylist');
+    expect(base.knownDeskBooks).toEqual(['admin', 'enock', 'richard']);
+    const armed = testAccountClassifierIdentity(ALLOW);
+    expect(armed.deskFoldMode).toBe('allowlist');
+    expect(armed.hash).not.toBe(base.hash);
   });
 });

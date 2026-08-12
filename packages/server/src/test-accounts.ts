@@ -65,11 +65,28 @@ const BUILTIN_TEST_PATTERNS: readonly RegExp[] = [
  * in the fold: these three plus the three fixtures the patterns above now
  * catch). Compared trimmed + lowercased.
  *
- * This list does NOT gate the fold — widening the desk filter to an allowlist is
- * a separate, larger change (TRA-2524 option 2, explicitly NOT taken here). It
- * feeds {@link unrecognisedDeskBooks}, which only OBSERVES.
+ * TRA-2554 — this list NOW gates the fold, but only when
+ * {@link DESK_FOLD_ALLOWLIST_ENV} is armed. Under the default `denylist` mode it
+ * still only feeds {@link unrecognisedDeskBooks}, which OBSERVES.
  */
 export const KNOWN_DESK_BOOKS: readonly string[] = ['admin', 'richard', 'enock'];
+
+/**
+ * TRA-2554 — true iff `account` is on {@link KNOWN_DESK_BOOKS}.
+ *
+ * ⚠ Compared TRIMMED + LOWERCASED, and that is load-bearing rather than tidy:
+ * the live journal's second-largest desk account is stamped **`Richard`** with a
+ * capital R (50 rows on `GET /api/admin/desk-roster`, 2026-08-06). A
+ * case-sensitive `KNOWN_DESK_BOOKS.includes(r.account)` would drop all 50 the
+ * moment the allowlist arms — a real book silently leaving the board number,
+ * which is the sign-flipped failure this ticket exists to prevent.
+ */
+export function isRosterDeskBook(account: string): boolean {
+  if (typeof account !== 'string') return false;
+  const name = account.trim().toLowerCase();
+  if (name.length === 0) return false;
+  return KNOWN_DESK_BOOKS.some((n) => n.trim().toLowerCase() === name);
+}
 
 /**
  * TRA-2524 — the missing instrument. Returns the usernames sitting in the
@@ -132,6 +149,25 @@ export interface TestAccountClassifierIdentity {
    */
   extraPrefixes: string[];
   emailSuffix: string;
+  /**
+   * TRA-2554 — the fold actually in force ({@link resolveDeskFoldMode}).
+   *
+   * This field is ALWAYS reported but enters {@link hash} only when it is
+   * `allowlist`, and that asymmetry is deliberate: under `denylist` the
+   * partition is bit-for-bit TRA-1475's, so folding the field in would move
+   * every hash and falsely claim a restatement of every figure published to
+   * date. Under `allowlist` the partition genuinely moves, so the hash moves
+   * with it.
+   */
+  deskFoldMode: DeskFoldMode;
+  /**
+   * TRA-2554 — {@link KNOWN_DESK_BOOKS} normalized (trimmed, lowercased,
+   * sorted), reported always. It enters {@link hash} only under `allowlist`,
+   * where — and only where — editing the roster moves rows between KEEP and
+   * DROP. Under `denylist` it feeds the observer alone and restates nothing,
+   * which is why TRA-2948 excluded it.
+   */
+  knownDeskBooks: string[];
 }
 
 /** FNV-1a 32-bit, hex-padded. Pure — this module must stay import-free. */
@@ -150,6 +186,16 @@ export function testAccountClassifierIdentity(
 ): TestAccountClassifierIdentity {
   const builtinPatterns = BUILTIN_TEST_PATTERNS.map((re) => String(re));
   const prefixes = [...new Set(extraPrefixes(env))].sort();
+  const deskFoldMode = resolveDeskFoldMode(env);
+  const knownDeskBooks = [...new Set(KNOWN_DESK_BOOKS.map((n) => n.trim().toLowerCase()))].sort();
+  // TRA-2554 — EMPTY under `denylist`, so the canonical string below stays
+  // byte-identical to TRA-2948's and no hash published to date moves for a
+  // partition that did not move. Under `allowlist` the roster DOES move rows
+  // between KEEP and DROP, so it joins the identity. See
+  // `TestAccountClassifierIdentity.deskFoldMode`.
+  const deskFoldFields = deskFoldMode === 'allowlist'
+    ? [deskFoldMode, knownDeskBooks.join(',')]
+    : [];
   // NUL as the element separator, double-NUL between fields: neither can occur
   // in a regex source read from this file or in a trimmed env prefix, so no two
   // distinct input sets can serialize to one string.
@@ -157,12 +203,15 @@ export function testAccountClassifierIdentity(
     builtinPatterns.join('\u0000'),
     prefixes.join('\u0000'),
     TEST_ACCOUNT_EMAIL_SUFFIX,
+    ...deskFoldFields,
   ].join('\u0000\u0000');
   return {
     hash: fnv1a32(canonical),
     builtinPatterns,
     extraPrefixes: prefixes,
     emailSuffix: TEST_ACCOUNT_EMAIL_SUFFIX,
+    deskFoldMode,
+    knownDeskBooks,
   };
 }
 
@@ -207,18 +256,167 @@ export function isTestAccount(
 }
 
 /**
+ * TRA-2554 — the four classes a journal row's `account` can fall into. Named,
+ * exhaustive and exported because the whole class of bug this ticket closes is
+ * a KEEP/DROP decision that nothing on the wire could name.
+ */
+export type DeskFoldClass =
+  /** No `account` at all — pre-TRA-1475 rows. Unclassifiable by ANY roster. */
+  | 'unattributed'
+  /** {@link isTestAccount} — QA/fixture churn. */
+  | 'test'
+  /** On {@link KNOWN_DESK_BOOKS} — vouched for. */
+  | 'roster'
+  /** Has an account, is not a fixture, and NOBODY has vouched for it. */
+  | 'unrecognised';
+
+/** TRA-2554 — the two folds. `denylist` is TRA-1475's shipped behaviour. */
+export type DeskFoldMode = 'denylist' | 'allowlist';
+
+/**
+ * TRA-2554 — env var arming the allowlist fold. Accepts `1` / `true` / `on` /
+ * `yes` (case-insensitive, trimmed); ANY other value — including absent, blank
+ * or an unparseable string — resolves to `denylist`.
+ *
+ * Fails CLOSED onto today's behaviour deliberately: this flag moves a
+ * board-facing P&L number, so a typo must leave the published number where it
+ * is rather than silently re-partition the journal.
+ */
+export const DESK_FOLD_ALLOWLIST_ENV = 'DESK_FOLD_ALLOWLIST';
+
+/** TRA-2554 — resolve {@link DESK_FOLD_ALLOWLIST_ENV}. See its doc for the fail-closed rule. */
+export function resolveDeskFoldMode(env: NodeJS.ProcessEnv = process.env): DeskFoldMode {
+  const raw = env[DESK_FOLD_ALLOWLIST_ENV];
+  if (typeof raw !== 'string') return 'denylist';
+  const v = raw.trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes' ? 'allowlist' : 'denylist';
+}
+
+/**
+ * TRA-2554 — THE decision table. Written as data, not as expression order in a
+ * filter, because CTO item 1 on this ticket is explicit: the KEEP rule for
+ * account-less rows must be *its own named rule with its own test*, not an
+ * incidental consequence of `r.account && …` short-circuiting.
+ *
+ * ⚠ `unattributed: true` in BOTH rows is the 2,192-row rule. 2,192 of the 2,690
+ * live journal rows (81%, and a CLOSED historical set — every row written since
+ * the TRA-1475 schema change carries an `account`) have no `account` and are
+ * unclassifiable by any roster. A naive inversion —
+ * `KNOWN_DESK_BOOKS.includes(r.account)` — evaluates `false` for a blank account
+ * and drops all 2,192 in one commit: 81% of the journal silently leaving the
+ * board number. `unrecognisedDeskAccountCount` reads a clean `0` either way,
+ * because a row with no account can never BE an unrecognised account, so the
+ * instrument cannot catch it. This table is what catches it.
+ *
+ * ⚠ The two rows differ in EXACTLY ONE cell — `unrecognised`. That is the
+ * equivalence theorem the pre-deploy acceptance rests on: the moved set is
+ * exactly the unrecognised rows, so `delta == 0` on `GET /api/reports/desk`
+ * holds iff the journal carries zero unrecognised rows at fold time.
+ */
+export const DESK_FOLD_DECISIONS: Readonly<
+  Record<DeskFoldMode, Readonly<Record<DeskFoldClass, boolean>>>
+> = {
+  denylist: { unattributed: true, test: false, roster: true, unrecognised: true },
+  allowlist: { unattributed: true, test: false, roster: true, unrecognised: false },
+};
+
+/** TRA-2554 — classify one row's `account`. Total over the four classes. */
+export function classifyDeskFoldAccount(
+  account: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): DeskFoldClass {
+  const name = typeof account === 'string' ? account.trim() : '';
+  if (name.length === 0) return 'unattributed';
+  if (isTestAccount(name, env)) return 'test';
+  if (isRosterDeskBook(name)) return 'roster';
+  return 'unrecognised';
+}
+
+/** TRA-2554 — the fold, plus the census that explains it. */
+export interface DeskFoldResult<T> {
+  /** The fold actually applied — echo this beside any number folded off it. */
+  mode: DeskFoldMode;
+  /** The kept rows, in input order. */
+  kept: T[];
+  /** Row counts per class. Sums to the input length, always. */
+  census: Record<DeskFoldClass, number>;
+  /**
+   * Distinct unrecognised account names, first-seen case, de-duplicated
+   * case-insensitively. NON-EMPTY under `allowlist` means real rows were
+   * dropped that the denylist kept — the drop is enumerated, NEVER silent.
+   * That is the failing state this class (TRA-1475 → 1949 → 2488 → 2524) has
+   * never had.
+   */
+  unrecognisedAccounts: string[];
+  /** Rows dropped SOLELY because of the inversion — 0 under `denylist`. */
+  unrecognisedRowsDropped: number;
+}
+
+/**
+ * TRA-2554 — apply the desk fold and census it. One implementation for both
+ * modes, driven by {@link DESK_FOLD_DECISIONS}.
+ *
+ * `includeTest: true` (the routes' `?includeTest=1`) keeps EVERY row under both
+ * modes — a debugging query string must not be able to change a class boundary.
+ * The census is still computed, so the classes stay readable while debugging.
+ */
+export function foldDeskRows<T extends { account?: string }>(
+  rows: readonly T[],
+  opts: { includeTest?: boolean; env?: NodeJS.ProcessEnv; mode?: DeskFoldMode } = {},
+): DeskFoldResult<T> {
+  const env = opts.env ?? process.env;
+  const mode = opts.mode ?? resolveDeskFoldMode(env);
+  const decisions = DESK_FOLD_DECISIONS[mode];
+  const census: Record<DeskFoldClass, number> = {
+    unattributed: 0,
+    test: 0,
+    roster: 0,
+    unrecognised: 0,
+  };
+  const unrecognisedByKey = new Map<string, string>();
+  const kept: T[] = [];
+  let unrecognisedRowsDropped = 0;
+  for (const row of rows) {
+    const cls = classifyDeskFoldAccount(row.account, env);
+    census[cls] += 1;
+    if (cls === 'unrecognised') {
+      const raw = (row.account as string).trim();
+      const key = raw.toLowerCase();
+      if (!unrecognisedByKey.has(key)) unrecognisedByKey.set(key, raw);
+    }
+    if (opts.includeTest === true || decisions[cls]) {
+      kept.push(row);
+      continue;
+    }
+    if (cls === 'unrecognised') unrecognisedRowsDropped += 1;
+  }
+  return {
+    mode,
+    kept,
+    census,
+    unrecognisedAccounts: [...unrecognisedByKey.values()],
+    unrecognisedRowsDropped,
+  };
+}
+
+/**
  * TRA-1475 — drop journal rows owned by a QA/test account from the DESK fold.
  * Rows with NO `account` (pre-TRA-1475 / un-owned opens) are KEPT — they can't
  * be classified, so excluding them would silently shrink the historical desk
  * number. Pass `includeTest: true` (the route's `?includeTest=1`) to keep every
  * row for debugging. Generic over any `{ account? }`-shaped row so the fold
  * filter and its unit test share one implementation.
+ *
+ * TRA-2554 — now a thin projection of {@link foldDeskRows}, so the KEEP/DROP
+ * decision has exactly one implementation and every existing call site
+ * (`reports/desk-calendar.ts`, `model-facing-journal.ts`) inherits the armed
+ * mode without having to remember the flag. Behaviour under the default
+ * `denylist` mode is unchanged. Callers that need the census — or that must
+ * ENUMERATE what the inversion dropped — should call `foldDeskRows` directly.
  */
 export function excludeTestAccountRows<T extends { account?: string }>(
   rows: readonly T[],
   opts: { includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): T[] {
-  if (opts.includeTest) return [...rows];
-  const env = opts.env ?? process.env;
-  return rows.filter((r) => !(r.account && isTestAccount(r.account, env)));
+  return foldDeskRows(rows, opts).kept;
 }
