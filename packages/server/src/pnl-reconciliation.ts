@@ -150,7 +150,7 @@ export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
  * axis so nobody has to re-derive it.
  */
 export const PNL_COMBINED_AGREEMENT_NOTE =
-  'TRA-3517: `engines[].combinedAgreementOk` / `days[].combinedAgreement` is the reader that REPLACES `drift` on a broker-shaped row. TRA-3349 correctly suppressed `drift` to null there (the `eodCombined == stockDaily + optionsDaily` identity is an engine-book decomposition a broker row does not satisfy), and that suppression removed the ONLY automated cross-check watching `combinedPnl` on live books; the row/report agreement meant to replace it was published on neither side, so a future divergence between the TRA-359 override and the stored row would have been silent. READ A GREEN NARROWLY. Both sides are written from the SAME `override` object on the same tick (`applyTradierBalanceOverride` for the report, `shapeLiveRecordedRow` for the row), so agreement holds BY CONSTRUCTION today and is NOT independent corroboration that the broker figure is right — it would read exactly the same if the figure were wrong on both. What it can catch is the two stores DRIFTING APART later: a re-generated report, a back-fill, a clobber, or a refactor that stops threading the override into the row. The axis is graded ONLY where the claim is made (row `closingEquityBasis: \'broker-eod-balance\'` AND report `pnlSource: \'tradier-balance\'`); everywhere else it is `\'not-measured\'` with a reason, and `\'not-measured\'` MUST NEVER be folded into `\'agree\'` — on the broker-shaped cohort a vacuous true is the same reading as a real pass. `combinedAgreementOk: null` means the axis looked at NOTHING; read `combinedAgreementGradeableCount` (the denominator) and `combinedPnlNoReaderDates` (real-money sessions whose `combinedPnl` neither reader observes) before quoting it, and report that state as `unknown`, never as clean.';
+  'TRA-3517: `engines[].combinedAgreementOk` / `days[].combinedAgreement` is the reader that REPLACES `drift` on a broker-shaped row. TRA-3349 correctly suppressed `drift` to null there (the `eodCombined == stockDaily + optionsDaily` identity is an engine-book decomposition a broker row does not satisfy), and that suppression removed the ONLY automated cross-check watching `combinedPnl` on live books; the row/report agreement meant to replace it was published on neither side, so a future divergence between the TRA-359 override and the stored row would have been silent. READ A GREEN NARROWLY. Both sides are written from the SAME `override` object on the same tick (`applyTradierBalanceOverride` for the report, `shapeLiveRecordedRow` for the row), so agreement holds BY CONSTRUCTION today and is NOT independent corroboration that the broker figure is right — it would read exactly the same if the figure were wrong on both. What it can catch is the two stores DRIFTING APART later: a re-generated report, a back-fill, a clobber, or a refactor that stops threading the override into the row. The axis is graded ONLY where the claim is made (row `closingEquityBasis: \'broker-eod-balance\'` AND report `pnlSource: \'tradier-balance\'`); everywhere else it is `\'not-measured\'` with a reason, and `\'not-measured\'` MUST NEVER be folded into `\'agree\'` — on the broker-shaped cohort a vacuous true is the same reading as a real pass. `combinedAgreementOk: null` means NOTHING THAT COULD HAVE FAILED was looked at; report that state as `unknown`, never as clean. TWO DENOMINATORS, AND THEY DIFFER: `combinedAgreementGradeableCount` is how many sessions the axis GRADED, `combinedAgreementDiscriminatingCount` is how many of those could have read `disagree` (at least one side materially non-zero) — and the verdict keys on the SECOND. A session where the row and the report both read 0.00 emits `agree` however broken the wiring is, so it is a measurement and not evidence. First live read of this axis, 2026-08-13T08:39Z on build 3877000: graded 2, discriminating 1 — `admin` 2026-08-12 at -0.10 vs -0.10 is the real one, `v0nni` 2026-08-12 at 0.00 vs 0.00 is degenerate. Quote the discriminating count beside any verdict; the graded count alone doubles the apparent coverage of a single session. Also read `combinedPnlNoReaderDates` (real-money sessions whose `combinedPnl` neither reader observes).';
 
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
@@ -795,6 +795,29 @@ export interface PnlReconcileDay {
    */
   combinedAgreementReason: CombinedAgreementNotMeasuredReason | null;
   /**
+   * TRA-3517 — **could this graded session have read `disagree` at all?**
+   *
+   * True iff the axis graded AND at least one side is materially non-zero. When
+   * BOTH the row and the report carry `0.00`, `agree` is what the axis emits no
+   * matter how broken the wiring is: a writer that never threaded the override
+   * into the row books the `dailyPnl + optionsDailyPnl` identity, which on a
+   * quiet session is also `0.00`. Such a session has no failing state, so
+   * scoring it as evidence manufactures confidence — the TRA-2633 /
+   * TRA-2630-AC2 rule, one axis over.
+   *
+   * This is not hypothetical and it is not a future risk. The first live read of
+   * this axis (2026-08-13T08:39Z, build 3877000) graded exactly two sessions:
+   * `admin` 2026-08-12 at −0.10 vs −0.10 (sharp — the override shape, and any
+   * other value refutes it) and `v0nni` 2026-08-12 at 0.00 vs 0.00 (degenerate).
+   * Counting both would have published a denominator of 2 for one real reading.
+   *
+   * `combinedAgreement` stays `'agree'` on a degenerate row — it IS an
+   * agreement, and hiding it would lose a measurement. What it must not do is
+   * fund a verdict, which is why {@link PnlReconcileResult.combinedAgreementOk}
+   * keys on this flag and not on the graded count.
+   */
+  combinedAgreementDiscriminating: boolean;
+  /**
    * TRA-3517 — **this session's `combinedPnl` is observed by NOTHING.**
    *
    * True iff `drift` is suppressed for broker shape AND the agreement axis is
@@ -889,19 +912,43 @@ export interface PnlReconcileResult {
    *
    *   - `false` — at least one graded session DISAGREES. The stored row and the
    *     TRA-359 override carry different broker day P&L for the same date.
-   *   - `true`  — every graded session agrees to the cent.
-   *   - `null`  — NOT MEASURED: {@link combinedAgreementGradeableCount} is 0, so
-   *     the axis looked at nothing. **Never a pass.** On a book whose live rows
-   *     are broker-shaped this is the reportable state, not a quiet green: it
-   *     means `combinedPnl` is unobserved (see {@link combinedPnlNoReaderDates}).
+   *   - `true`  — no disagreement, over a NON-EMPTY DISCRIMINATING cohort.
+   *   - `null`  — NOT MEASURED: {@link combinedAgreementDiscriminatingCount} is
+   *     0, so nothing that could have failed was looked at. **Never a pass.** On
+   *     a book whose live rows are broker-shaped this is the reportable state,
+   *     not a quiet green: it means `combinedPnl` is effectively unobserved (see
+   *     {@link combinedPnlNoReaderDates}).
+   *
+   * KEYED ON THE DISCRIMINATING COUNT, NOT THE GRADED ONE. A session where both
+   * sides read 0.00 emits `agree` however broken the wiring is, so a `true`
+   * funded by it is the vacuous pass this ticket exists to prevent — see
+   * {@link PnlReconcileDay.combinedAgreementDiscriminating} for the live
+   * 2026-08-13 reading where exactly that would have happened on `v0nni`. The
+   * narrowing cannot hide a red: a disagreement is discriminating by
+   * construction, and it short-circuits this branch anyway.
    *
    * A demo book has no broker-shaped rows and legitimately reads `null` here
    * forever; that is why the fleet fold scopes to live books and publishes its
    * own denominator rather than `every`-ing over the whole fleet.
    */
   combinedAgreementOk: boolean | null;
-  /** TRA-3517 — the denominator: evaluated sessions the agreement axis GRADED. */
+  /**
+   * TRA-3517 — evaluated sessions the agreement axis GRADED (emitted `agree` or
+   * `disagree` on). This is MEASUREMENT coverage: how many rows the axis
+   * reached. It is deliberately NOT the denominator behind
+   * {@link combinedAgreementOk} — read {@link combinedAgreementDiscriminatingCount}
+   * for that, and publish both, because the gap between them is exactly the
+   * degenerate-session count.
+   */
   combinedAgreementGradeableCount: number;
+  /**
+   * TRA-3517 — the graded sessions that could actually have read `disagree`
+   * (at least one side materially non-zero). **This is the denominator behind
+   * {@link combinedAgreementOk}.** First live read, 2026-08-13T08:39Z: graded 2,
+   * discriminating 1 — `v0nni`'s 0.00-vs-0.00 session is a measurement, not
+   * evidence.
+   */
+  combinedAgreementDiscriminatingCount: number;
   /** TRA-3517 — evaluated sessions whose row and report `combinedPnl` disagree. */
   combinedAgreementDisagreeDates: string[];
   /**
@@ -1758,6 +1805,7 @@ export function summarizeLiveCombinedAgreement(
     mode: string;
     combinedAgreementOk: boolean | null;
     combinedAgreementGradeableCount: number;
+    combinedAgreementDiscriminatingCount: number;
     combinedAgreementDisagreeDates: string[];
     combinedAgreementMaxDeltaUsd: number | null;
     combinedPnlNoReaderDates: string[];
@@ -1766,6 +1814,7 @@ export function summarizeLiveCombinedAgreement(
   liveCombinedAgreementBookCount: number;
   liveCombinedAgreementOk: boolean | null;
   liveCombinedAgreementGradedCount: number;
+  liveCombinedAgreementDiscriminatingCount: number;
   liveCombinedAgreementDisagreeBooks: Array<{
     username: string;
     dates: string[];
@@ -1790,6 +1839,14 @@ export function summarizeLiveCombinedAgreement(
     // cannot tell them apart.
     liveCombinedAgreementGradedCount: liveBooks.reduce(
       (n, e) => n + e.combinedAgreementGradeableCount,
+      0,
+    ),
+    // The EVIDENTIAL denominator. Quote this one beside the verdict, not the
+    // graded count: the first live read of this axis was `graded 2` over
+    // `discriminating 1`, and publishing only the former doubles the apparent
+    // coverage of a single real session.
+    liveCombinedAgreementDiscriminatingCount: liveBooks.reduce(
+      (n, e) => n + e.combinedAgreementDiscriminatingCount,
       0,
     ),
     liveCombinedAgreementDisagreeBooks: liveBooks
@@ -2684,6 +2741,13 @@ export function reconcilePnl(
       // here at all.
       const combinedPnlHasNoReader =
         rowBrokerShaped && combinedAgreement === 'not-measured';
+      // Could this session have read `disagree`? Both sides at 0.00 emit `agree`
+      // however broken the wiring is, so it has no failing state and must not
+      // fund the verdict. It stays published as the measurement it is.
+      const combinedAgreementDiscriminating =
+        combinedAgreementReason === null
+        && (Math.abs(rowCombinedPnl!) > PNL_RECONCILE_TOLERANCE_USD
+          || Math.abs(eodCombined!) > PNL_RECONCILE_TOLERANCE_USD);
       const belowBaseline = baselineDate != null && s.date < baselineDate;
       // TRA-2302 — a day is only claimed as a FALSE zero when a census exists
       // for this book AND it names closes the day-only ledger did not receive.
@@ -2797,6 +2861,7 @@ export function reconcilePnl(
         combinedAgreement,
         combinedAgreementDeltaUsd,
         combinedAgreementReason,
+        combinedAgreementDiscriminating,
         combinedPnlHasNoReader,
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
@@ -3018,6 +3083,14 @@ export function reconcilePnl(
   // the graded cohort is post-fix by construction — there is no pre-fix era for
   // it to drag in.
   const combinedAgreementGraded = evaluated.filter(d => d.combinedAgreement !== 'not-measured');
+  // The GRADEABLE cohort is the DISCRIMINATING subset, not everything the axis
+  // touched. A 0.00-vs-0.00 session emits `agree` however broken the wiring is,
+  // so it is a measurement and not evidence — the same separation TRA-2633 drew
+  // between `stockLegOffendingDates` and `stockLegMeasurableDays`. No red is
+  // lost by the narrowing: a degenerate session cannot produce one.
+  const combinedAgreementDiscriminatingRows = evaluated.filter(
+    d => d.combinedAgreementDiscriminating,
+  );
   const combinedAgreementDisagreeDates = evaluated
     .filter(d => d.combinedAgreement === 'disagree')
     .map(d => d.date);
@@ -3026,11 +3099,18 @@ export function reconcilePnl(
     acc[d.combinedAgreementReason] = (acc[d.combinedAgreementReason] ?? 0) + 1;
     return acc;
   }, {});
-  // NULL on the empty cohort, never `true`. `combinedAgreementGraded.length ===
-  // 0` is the state this whole ticket is about: the axis looked at nothing, and
-  // on a broker-shaped row nothing else is looking either.
+  // NULL on the empty cohort, never `true`. An empty DISCRIMINATING cohort is
+  // the state this whole ticket is about: nothing that could have failed was
+  // looked at, and on a broker-shaped row nothing else is looking either. A
+  // disagreement still wins outright wherever it lands — it is by construction
+  // discriminating (the two sides differ, so they cannot both be 0.00), so this
+  // ordering cannot swallow a red.
   const combinedAgreementOk: boolean | null =
-    combinedAgreementGraded.length === 0 ? null : combinedAgreementDisagreeDates.length === 0;
+    combinedAgreementDisagreeDates.length > 0
+      ? false
+      : combinedAgreementDiscriminatingRows.length === 0
+        ? null
+        : true;
   // TRA-2630 — the per-leg verdicts. Baseline-gated exactly like `ok`: a
   // pre-fix row's stock leg is un-reconcilable for the same reason its `drift`
   // is, so grading it would hand these new fields the same dead state `ok` has.
@@ -3330,6 +3410,7 @@ export function reconcilePnl(
     eodRowGradeableCount: eodRowGradeable.length,
     combinedAgreementOk,
     combinedAgreementGradeableCount: combinedAgreementGraded.length,
+    combinedAgreementDiscriminatingCount: combinedAgreementDiscriminatingRows.length,
     combinedAgreementDisagreeDates,
     combinedAgreementMaxDeltaUsd:
       combinedAgreementGraded.length === 0

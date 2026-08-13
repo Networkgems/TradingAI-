@@ -3362,11 +3362,13 @@ describe('TRA-3517 — summarizeLiveCombinedAgreement', () => {
     disagree: string[] = [],
     maxDelta: number | null = null,
     noReader: string[] = [],
+    discriminating: number = graded,
   ) => ({
     username,
     mode,
     combinedAgreementOk: ok,
     combinedAgreementGradeableCount: graded,
+    combinedAgreementDiscriminatingCount: discriminating,
     combinedAgreementDisagreeDates: disagree,
     combinedAgreementMaxDeltaUsd: maxDelta,
     combinedPnlNoReaderDates: noReader,
@@ -3418,5 +3420,135 @@ describe('TRA-3517 — summarizeLiveCombinedAgreement', () => {
     expect(r.liveCombinedAgreementBookCount).toBe(1);
     expect(r.liveCombinedAgreementGradedCount).toBe(2);
     expect(r.liveCombinedAgreementDisagreeBooks).toEqual([]);
+  });
+});
+
+describe('TRA-3517 — a 0.00-vs-0.00 agreement is a MEASUREMENT, not evidence', () => {
+  const BASELINE = '2026-07-12';
+  const brokerRow = (
+    date: string,
+    combinedPnl: number,
+  ): DailySnapshot => ({
+    ...snap(date, 0, 0),
+    closingEquity: 2_101.5,
+    closingEquityBasis: 'broker-eod-balance',
+    openingEquity: 2_207.5,
+    openingEquityBasis: 'broker-prev-eod-balance',
+    netCashFlowUsd: 0,
+    stockLegBasis: 'zero-probe-agrees',
+    stockLegProbeUsd: 0,
+    combinedPnl,
+  });
+
+  it('THE LIVE CASE — `v0nni` 2026-08-12: agrees at zero, discriminates nothing, verdict null', () => {
+    // First live read of this axis, 2026-08-13T08:39Z on build 3877000. Both
+    // sides 0.00. A writer that never threaded the override into the row books
+    // the `dailyPnl + optionsDailyPnl` identity, which on a quiet session is
+    // ALSO 0.00 — so this session emits `agree` no matter how broken the wiring
+    // is. It has no failing state and must not fund a verdict. The ticket's own
+    // hand analysis pre-registered this: "DEGENERATE -- it discriminates
+    // nothing. Do not count it."
+    const r = reconcilePnl(
+      [brokerRow('2026-08-12', 0)],
+      new Map([['2026-08-12', 0]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-12', 'tradier-balance']]),
+    );
+    const day = r.days[0]!;
+    // The agreement is REAL and stays published — hiding it would lose a
+    // measurement. What it does not do is count.
+    expect(day.combinedAgreement).toBe('agree');
+    expect(day.combinedAgreementDeltaUsd).toBeCloseTo(0, 2);
+    expect(day.combinedAgreementDiscriminating).toBe(false);
+    expect(r.combinedAgreementGradeableCount).toBe(1);
+    expect(r.combinedAgreementDiscriminatingCount).toBe(0);
+    // The whole point: a green here would be vacuous, so there is no green.
+    expect(r.combinedAgreementOk).toBeNull();
+    expect(r.combinedAgreementOk).not.toBe(true);
+  });
+
+  it('THE LIVE CASE — `admin` 2026-08-12 at -0.10 IS sharp and does count', () => {
+    // -0.10 = 1143.96 - 1144.06, the override shape (equity delta net of a 0
+    // flow). Any other value on either side refutes the agreement, so this
+    // session is genuine evidence.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-12', -0.1)],
+      new Map([['2026-08-12', -0.1]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-12', 'tradier-balance']]),
+    );
+    expect(r.days[0]!.combinedAgreementDiscriminating).toBe(true);
+    expect(r.combinedAgreementDiscriminatingCount).toBe(1);
+    expect(r.combinedAgreementOk).toBe(true);
+  });
+
+  it('the two denominators diverge, and BOTH are published', () => {
+    // Exactly the live shape across one book: one sharp session, one degenerate.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-11', 0), brokerRow('2026-08-12', -0.1)],
+      new Map([['2026-08-11', 0], ['2026-08-12', -0.1]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-11', 'tradier-balance'], ['2026-08-12', 'tradier-balance']]),
+    );
+    expect(r.combinedAgreementGradeableCount).toBe(2);
+    expect(r.combinedAgreementDiscriminatingCount).toBe(1);
+    expect(r.combinedAgreementOk).toBe(true);
+    expect(r.days.map(d => d.combinedAgreementDiscriminating)).toEqual([false, true]);
+  });
+
+  it('a DISAGREEMENT is discriminating by construction and cannot be narrowed away', () => {
+    // The ordering guard: the two sides differ, so they cannot both be 0.00.
+    // A red must survive the discriminating gate no matter where it lands.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-11', 0), brokerRow('2026-08-12', -90)],
+      new Map([['2026-08-11', 0], ['2026-08-12', -106]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-11', 'tradier-balance'], ['2026-08-12', 'tradier-balance']]),
+    );
+    expect(r.combinedAgreementOk).toBe(false);
+    expect(r.combinedAgreementDisagreeDates).toEqual(['2026-08-12']);
+    expect(r.days[1]!.combinedAgreementDiscriminating).toBe(true);
+  });
+
+  it('a book of ONLY degenerate sessions reads null, never a green', () => {
+    const r = reconcilePnl(
+      [brokerRow('2026-08-11', 0), brokerRow('2026-08-12', 0)],
+      new Map([['2026-08-11', 0], ['2026-08-12', 0]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-11', 'tradier-balance'], ['2026-08-12', 'tradier-balance']]),
+    );
+    expect(r.combinedAgreementGradeableCount).toBe(2);
+    expect(r.combinedAgreementDiscriminatingCount).toBe(0);
+    expect(r.combinedAgreementOk).toBeNull();
+  });
+
+  it('the fleet fold quotes the DISCRIMINATING denominator, and it can be 0 under a green-looking graded count', () => {
+    const r = summarizeLiveCombinedAgreement([
+      {
+        username: 'admin',
+        mode: 'live',
+        combinedAgreementOk: true,
+        combinedAgreementGradeableCount: 1,
+        combinedAgreementDiscriminatingCount: 1,
+        combinedAgreementDisagreeDates: [],
+        combinedAgreementMaxDeltaUsd: 0,
+        combinedPnlNoReaderDates: [],
+      },
+      {
+        username: 'v0nni',
+        mode: 'live',
+        combinedAgreementOk: null,
+        combinedAgreementGradeableCount: 1,
+        combinedAgreementDiscriminatingCount: 0,
+        combinedAgreementDisagreeDates: [],
+        combinedAgreementMaxDeltaUsd: 0,
+        combinedPnlNoReaderDates: [],
+      },
+    ]);
+    // graded 2, discriminating 1 — the live 2026-08-13 reading. Publishing only
+    // the first doubles the apparent coverage of one real session.
+    expect(r.liveCombinedAgreementGradedCount).toBe(2);
+    expect(r.liveCombinedAgreementDiscriminatingCount).toBe(1);
+    expect(r.liveCombinedAgreementOk).toBe(true);
   });
 });
