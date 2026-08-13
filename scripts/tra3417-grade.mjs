@@ -46,9 +46,21 @@ const BAND = { min: 0.5, max: 0.55 };
 
 // Reason codes that CANNOT be produced without a `|delta|` bucket, and therefore
 // cannot be produced without a `cellKey` — pinned by the shipped test
-// `otm-sleeve-mandate.test.ts` "cost_bar cell stamping (TRA-3483 I3)". If one of
-// these appears while `byCell` is empty, the stamp was LOST between the verdict
-// and the ledger, and that is a defect in the instrument, not a negative result.
+// `otm-sleeve-mandate.test.ts` "cost_bar cell stamping (TRA-3483 I3)".
+//
+// ⛔ 2026-08-13 — THE TRAP THIS LIST USED TO WALK INTO. `byReason` is aggregated
+// over EVERY cell the gate saw, not over the armed one. So the presence of a
+// cell-bearing code while `CELL` is absent proves NOTHING: on the first live RTH
+// read the gate blocked 7, of which SIX were `band_deauthorized` stamped to
+// `single_leg_otm::0.00-0.10` — the mandate's ratified de-authorized band doing
+// precisely its job — and this grader read that as "a 0.50-0.55 cellKey existed
+// and the ledger dropped it" and published DEFECT against a healthy ledger.
+//
+// The only sound test for a LOST stamp is a COUNT RESIDUAL: blocks the ledger
+// counted that no present cell accounts for, net of the one code that legitimately
+// stamps no cell. If every block is stamped somewhere, nothing was dropped and the
+// armed cell was simply never reached — which is criterion 3 FAILING, not the
+// instrument breaking. Those want opposite responses, so they get separate verdicts.
 const CELL_BEARING_REASONS = ['gross_negative', 'insufficient_evidence', 'band_deauthorized'];
 // The one reason code that legitimately stamps NO cell: an unusable |delta|.
 const CELL_FREE_REASON = 'gross_unknown';
@@ -306,7 +318,14 @@ if (!GRADEABLE) {
 } else if (bySel.in_band) {
   record('C2 nominator', 'PASS', `selection in_band on ${bySel.in_band.evaluated ?? bySel.in_band.blocked} row(s) — the nominator reached the gate. full split ${JSON.stringify(selKeys)}`);
 } else if (selKeys.length === 1 && selKeys[0] === 'fallback_top_mispricing') {
-  record('C2 nominator', 'REAL-NEGATIVE', `only fallback_top_mispricing — the band was empty on every name in the universe. This is a genuine negative result, report it as one; it is NOT a bug`);
+  // ⛔ 2026-08-13 — this line used to read "the band was empty on every name in
+  // the universe", and that is NOT what this axis can show. `bySelection` is
+  // stamped only on rows that REACHED the gate. If an in-band nomination is made
+  // but never arrives at the bar, this axis shows fallback-only while the band was
+  // demonstrably NOT empty — which is exactly what happened on the first live RTH
+  // read (gate: fallback only; nomination log: in_band on 29/100, UPS in-universe).
+  // The pre-registered evidence for criterion 2 is the LOG LINE, scored as C2b.
+  record('C2 nominator', 'REAL-NEGATIVE', `no in_band row REACHED the cost bar — every gate-reaching row carried fallback_top_mispricing. ⚠️ This does NOT establish that the band was empty: this axis only sees rows that got to the gate. Criterion 2's pre-registered evidence is the nomination LOG (C2b below) — if C2b says the nominator bit, these two disagree and the gap is between the nominator and the gate, which is C3's finding, NOT a clean negative`);
 } else if (selKeys.length === 1 && selKeys[0] === 'legacy') {
   record('C2 nominator', 'FAIL', `only 'legacy' — the selector never ran, which CONTRADICTS C1's armed read. Instrument disagreement ⇒ escalate, do not publish either side`);
 } else {
@@ -327,13 +346,27 @@ if (!GRADEABLE) {
 } else {
   // byCell is stamped IFF `tape.cellKey` is non-null, and `cellKey` is null IFF
   // the candidate's |delta| was unusable (NaN/±Inf/|d|>1) — which declines under
-  // `gross_unknown`. So an absent cell alongside a cell-BEARING reason code is
-  // the stamp being lost, not the cell never being reached.
+  // `gross_unknown`. So the ledger is INTERNALLY CONSISTENT exactly when every
+  // block is either stamped to some cell or carries the cell-free code. Reconcile
+  // on COUNTS; never on which reason codes happen to appear (see the note on
+  // CELL_BEARING_REASONS — that inference published a false DEFECT once already).
+  const stamped = (cb.byCell ?? []).reduce((n, c) => n + (c.blocked ?? 0), 0);
+  const cellFree = reasons[CELL_FREE_REASON]?.blocked ?? 0;
+  const unexplained = (cb.blocked ?? 0) - stamped - cellFree;
   const bearing = CELL_BEARING_REASONS.filter((r) => reasons[r]);
-  if (bearing.length > 0) {
-    record('C3 verdict', 'DEFECT', `byCell has no ${CELL} row, yet byReason carries ${bearing.join('/')} — those codes REQUIRE a |delta| bucket, so a cellKey existed and the ledger dropped it. Instrument defect; the grade is VOID, not a FAIL`);
-  } else if (reasons[CELL_FREE_REASON]) {
+  const seen = (cb.byCell ?? []).map((c) => `${c.cell}(${c.evaluated}/${c.blocked})`).join(', ') || 'none';
+  if (unexplained > 0) {
+    record('C3 verdict', 'DEFECT', `${unexplained} of ${cb.blocked} block(s) are stamped to NO cell and are not ${CELL_FREE_REASON} (cell-bearing codes present: ${bearing.join('/') || 'none'}) — a cellKey existed and the ledger dropped it. Instrument defect; the grade is VOID, not a FAIL`);
+  } else if (stamped === 0 && cellFree > 0) {
     record('C3 verdict', 'REAL-NEGATIVE', `byCell empty and every decline is ${CELL_FREE_REASON} — the candidates had no usable |delta|. Consistent, and a genuine negative`);
+  } else if (stamped > 0) {
+    // The ledger reconciles. The armed cell was never REACHED — which is exactly
+    // the shape criterion 3 pre-registered as its failure ("a cell that is still
+    // 100% lt-0.20 means the nominator never reached the gate"). Attribution
+    // between "no entry signal fired on the in-band names" (benign) and "the
+    // in-band selection was lost downstream of the nominator" (adverse) is NOT
+    // decidable from this payload — say so rather than pick one.
+    record('C3 verdict', 'FAIL', `ledger RECONCILES (${stamped}/${cb.blocked} blocks stamped, 0 unexplained) — no instrument defect — but ${CELL} recorded ZERO evaluations. Every candidate that reached the bar sat in another cell: ${seen}. Criterion 3 NOT met. Attribution (no entry signal on the in-band names vs. selection lost below the nominator) is UNDECIDABLE from this payload — cross-read C2b, and see the runOtmScan scan-run instrumentation`);
   } else {
     record('C3 verdict', 'UNKNOWN', `evaluated ${cb.evaluated} but no ${CELL} row and no adjudicating reason code (byReason ${JSON.stringify(Object.keys(reasons))}) — do not score this`);
   }

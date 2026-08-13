@@ -198,6 +198,64 @@ const SCENARIOS = [
     routes: { time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T08:46:37.823Z`, open: true, scans: 7, armed: false },
     expect: { zero: 'STARVED-UPSTREAM', exit: 2, has: ['FAIL', 'a restart dropped the env'], absent: ['⇒ PASS'] },
   },
+  {
+    // ⛔ THE REGRESSION. This is the VERBATIM cost_bar shape of the first live RTH
+    // read, 2026-08-13T13:54Z. Six blocks are `band_deauthorized` — the mandate's
+    // ratified de-authorized [0.00,0.20) band declining exactly as TRA-3392 ordered
+    // — and they are STAMPED, to `0.00-0.10`. The armed cell is absent because it
+    // was never reached, not because a stamp was lost. The old grader keyed off the
+    // mere PRESENCE of `band_deauthorized` in the aggregated `byReason` and
+    // published DEFECT/"the grade is VOID" against a perfectly healthy ledger.
+    // 7 blocked = 6 + 1 stamped, 0 unexplained ⇒ FAIL (criterion not met), never DEFECT.
+    name: 'RECONCILES — band_deauthorized from ANOTHER cell is not a lost stamp',
+    routes: {
+      time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T08:46:37.823Z`, open: true, scans: 7,
+      costBar: {
+        evaluated: 7, blocked: 7, blockRate: 1,
+        byCell: [
+          { cell: 'single_leg_otm::0.00-0.10', evaluated: 6, blocked: 6 },
+          { cell: 'single_leg_otm::0.20-0.30', evaluated: 1, blocked: 1 },
+        ],
+        byBook: [{ book: 'admin', evaluated: 4, blocked: 4 }, { book: 'v0nni', evaluated: 1, blocked: 1 }],
+        byReason: [
+          { reasonCode: 'band_deauthorized', blocked: 6, share: 0.8571 },
+          { reasonCode: 'shortfall_gte_0.50', blocked: 1, share: 0.1429 },
+        ],
+      },
+    },
+    expect: {
+      zero: 'GRADEABLE',
+      exit: 2,
+      has: ['FAIL        C3 verdict', 'ledger RECONCILES', 'recorded ZERO evaluations', 'UNDECIDABLE'],
+      absent: ['DEFECT', 'the grade is VOID', '⇒ PASS'],
+    },
+  },
+  {
+    // THE VACUITY GUARD for the control above. Same session, but now the ledger
+    // really DOES drop a stamp: 7 blocked, only 6 stamped, and the 7th is
+    // `gross_negative` — a code that cannot exist without a |delta| bucket, so it
+    // cannot be the cell-free case either. One unexplained block ⇒ DEFECT must
+    // still fire. Without this, the fix above could be "never report DEFECT".
+    name: 'LOST STAMP — an unexplained block still reports DEFECT',
+    routes: {
+      time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T08:46:37.823Z`, open: true, scans: 7,
+      costBar: {
+        evaluated: 7, blocked: 7, blockRate: 1,
+        byCell: [{ cell: 'single_leg_otm::0.00-0.10', evaluated: 6, blocked: 6 }],
+        byBook: [{ book: 'admin', evaluated: 4, blocked: 4 }, { book: 'v0nni', evaluated: 1, blocked: 1 }],
+        byReason: [
+          { reasonCode: 'band_deauthorized', blocked: 6, share: 0.857 },
+          { reasonCode: 'gross_negative', blocked: 1, share: 0.143 },
+        ],
+      },
+    },
+    expect: {
+      zero: 'GRADEABLE',
+      exit: 2,
+      has: ['DEFECT', '1 of 7 block(s) are stamped to NO cell', 'the grade is VOID'],
+      absent: ['ledger RECONCILES', '⇒ PASS'],
+    },
+  },
 ];
 
 const runOne = async (sc) => {
