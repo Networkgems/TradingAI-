@@ -145,6 +145,13 @@ export const PNL_LIVE_MODE_SPAN_NOTE =
 export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
   'TRA-2919: the live credit axis TRA-2630 named as the INDEPENDENT signal was PERMANENTLY ungradeable after TRA-2831, and is now re-sourced from the option-trade JOURNAL. TRA-2831 was right to suspend `liveUncreditedOptionsUsd` (its numerator was 987.60 of admin\'s own DEMO option P&L), but its gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which is DURABLE history and does not age out -- so the axis could never flip back. DO NOT "fix" this by scoping the existing day-cell numerator to post-onset dates. Measured on bqb1 2026-08-05: admin had exactly ONE post-onset day cell (2026-08-04, `optionsDaily` -2.00, source `bucket-journal-silent`), so a day-cell post-onset numerator publishes -2.00 while the live book actually realized +739.00 on 2026-07-31 across 3 journal closes -- money booked to NO day cell at all, because 07-30/07-31/08-03 are the permanent TRA-2888 hole and back-fill is refused. A wrong number carrying `gradeable: true` is strictly worse than the honest null. The journal is append-only, is keyed by CLOSE timestamp rather than by the existence of a snapshot row, and survived the ENOSPC window with `corruptLines 0`; it is the only surviving source. Read `engines[].postOnsetCredit` per book and `liveOnsetOptionsRealizedJournalUsd` fleet-wide; `liveOnsetOptionsDayCellUsd` publishes the day-cell FOIL over the same window so the rejected arithmetic stays visible. THE COMPARISON IS A SEPARATE QUESTION: the equity leg is holed over the same window, so `liveOnsetUncreditedOptionsUsd` (= journal numerator + post-onset stockDaily - post-onset equity delta) is null whenever an expected NYSE session inside the anchor window `(leftAnchor, rightAnchor]` has no ledger row -- reason `equity-anchor-spans-absent-session`, which is admin\'s standing state. Absence is enumerated from the exchange calendar and diffed against the rows, deliberately NOT from the three known gap dates: a hard-coded list goes green by EVICTION the moment a newer row advances past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to the next hole. `liveUncreditedOptionsGradeable` is REDEFINED by this ticket to mean "some live book has a journal-sourced post-onset numerator", i.e. ATTRIBUTION only; it is NOT a claim that the dollar comparison exists, and `true` alongside `liveOnsetUncreditedOptionsUsd: null` is the correct standing read. A gate wanting the money verdict must require BOTH that boolean AND `liveOnsetCreditNotMeasuredBooks` to be EMPTY. The day-cell fields `liveUncreditedOptionsUsd` / `liveUncreditedOptionsUsdUnscoped` / `liveModeSpanContaminatedBooks` are UNCHANGED and stay published as the evidence the TRA-2831 suspension rests on. TRA-3288 UPDATE: `equity-anchor-spans-absent-session` was a HOLE gate that was right by accident -- `closingEquity` on every RECORDED row is the engine\'s DEMO PaperAccount (frozen on a live book by design), so a hole-free window still grades broker-journal dollars against demo-book dollars. A live book\'s comparison is now refused with `equity-anchor-not-broker-sourced` (precedence over the absence reason) unless BOTH anchor rows carry `closingEquityBasis: \'broker-eod-balance\'`; recorded rows now stamp `\'engine-paper-account\'`, and an ABSENT basis reads as NOT broker-sourced. This is admin\'s and v0nni\'s standing state and it is PERMANENT for admin (its left anchor is a demo-book row and back-fill is refused); the axis becomes measurable only on rows written broker-sourced going forward.';
 
+/**
+ * TRA-3517 — what a GREEN `combinedAgreementOk` is worth, published beside the
+ * axis so nobody has to re-derive it.
+ */
+export const PNL_COMBINED_AGREEMENT_NOTE =
+  'TRA-3517: `engines[].combinedAgreementOk` / `days[].combinedAgreement` is the reader that REPLACES `drift` on a broker-shaped row. TRA-3349 correctly suppressed `drift` to null there (the `eodCombined == stockDaily + optionsDaily` identity is an engine-book decomposition a broker row does not satisfy), and that suppression removed the ONLY automated cross-check watching `combinedPnl` on live books; the row/report agreement meant to replace it was published on neither side, so a future divergence between the TRA-359 override and the stored row would have been silent. READ A GREEN NARROWLY. Both sides are written from the SAME `override` object on the same tick (`applyTradierBalanceOverride` for the report, `shapeLiveRecordedRow` for the row), so agreement holds BY CONSTRUCTION today and is NOT independent corroboration that the broker figure is right — it would read exactly the same if the figure were wrong on both. What it can catch is the two stores DRIFTING APART later: a re-generated report, a back-fill, a clobber, or a refactor that stops threading the override into the row. The axis is graded ONLY where the claim is made (row `closingEquityBasis: \'broker-eod-balance\'` AND report `pnlSource: \'tradier-balance\'`); everywhere else it is `\'not-measured\'` with a reason, and `\'not-measured\'` MUST NEVER be folded into `\'agree\'` — on the broker-shaped cohort a vacuous true is the same reading as a real pass. `combinedAgreementOk: null` means the axis looked at NOTHING; read `combinedAgreementGradeableCount` (the denominator) and `combinedPnlNoReaderDates` (real-money sessions whose `combinedPnl` neither reader observes) before quoting it, and report that state as `unknown`, never as clean.';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
@@ -156,6 +163,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
+  PNL_COMBINED_AGREEMENT_NOTE,
 ];
 
 /**
@@ -297,6 +305,51 @@ export interface JournalDayCloses {
   realizedPnlUsd: number;
 }
 
+
+/**
+ * TRA-3517 — the report-file `pnlSource` value that means **the TRA-359 broker
+ * override actually computed and was written into the cell**.
+ *
+ * `applyTradierBalanceOverride` in `index.ts` stamps this and only this. Every
+ * other value (`'engine'`, `'realized-backfill'`, `'live-intraday'`) and an
+ * ABSENT `pnlSource` all mean the report's `combinedPnl` is NOT the override, so
+ * comparing a row against it grades nothing. Absent is the common case — 46 of
+ * 69 stored live rows carry no `pnlSource` at all (TRA-3102) — and it must read
+ * as NOT-OVERRIDDEN, never as a pass.
+ */
+export const EOD_PNL_SOURCE_BROKER_OVERRIDE = 'tradier-balance';
+
+/**
+ * TRA-3517 — tri-state verdict on the row/report `combinedPnl` agreement that
+ * TRA-3349 item 2b shipped and no surface could read.
+ *
+ * `'not-measured'` is a FIRST-CLASS state and must never be folded into
+ * `'agree'`. On a broker-shaped row `drift` is deliberately `null`, so a vacuous
+ * true here would be the same reading as a real pass on the one cohort that has
+ * no other reader at all.
+ */
+export type CombinedAgreementState = 'agree' | 'disagree' | 'not-measured';
+
+/**
+ * TRA-3517 — WHY a row's {@link CombinedAgreementState} is `'not-measured'`.
+ * Four very different rows land in that state and a bare `null` cannot tell
+ * them apart:
+ *
+ *  - `'row-not-broker-shaped'` — the row is an ordinary engine row, so
+ *    {@link PnlReconcileDay.drift} grades it and this axis ABSTAINS. This is the
+ *    only not-measured reason that is not a coverage hole.
+ *  - `'row-combined-absent'` — the snapshot carries no numeric `combinedPnl`.
+ *  - `'no-report-row'` — no EOD report file exists for the date.
+ *  - `'override-not-computed'` — a report file exists but its `pnlSource` is not
+ *    {@link EOD_PNL_SOURCE_BROKER_OVERRIDE}, i.e. the cell carries the ENGINE
+ *    figure. Comparing a broker-shaped row against an engine cell measures the
+ *    TRA-3288 two-surface gap, not the TRA-3349 agreement.
+ */
+export type CombinedAgreementNotMeasuredReason =
+  | 'row-not-broker-shaped'
+  | 'row-combined-absent'
+  | 'no-report-row'
+  | 'override-not-computed';
 
 export interface PnlReconcileDay {
   date: string;
@@ -537,6 +590,43 @@ export interface PnlReconcileDay {
    */
   netCashFlowUsd: number | null;
   /**
+   * TRA-3517 — how the STOCK leg (`dailyPnl`) was established on this row, off
+   * the row itself (see {@link DailySnapshot.stockLegBasis}). `null` = the field
+   * was never written, which is every ordinary recorded row: the stock leg there
+   * is a measured equity delta, not a booked `0` standing in for one.
+   *
+   * WHY IT IS PUBLISHED. On a TRA-3349 broker-shaped row `dailyPnl` is booked
+   * `0` — not because the book was flat, but because broker delta-equity already
+   * contains the stock P&L and booking a demo stock figure beside it would be
+   * the two-surface error relocated. That `0` is only falsifiable if the basis
+   * and its probe are readable, and until this ticket neither string occurred
+   * anywhere in this endpoint's payload. `'zero-probe-disagrees'` is the state
+   * the CFO ruling names as the trigger for building stock reconstruction, and
+   * nothing could see it.
+   */
+  stockLegBasis: string | null;
+  /**
+   * TRA-3517 — the residual the booked-`0` stock leg would have to explain
+   * (see {@link DailySnapshot.stockLegProbeUsd}), projected onto this endpoint.
+   *
+   * `null` is NOT MEASURED — an operand (either equity anchor, or the broker
+   * cash flow) was absent — never `0`. A recomputation of this value from the
+   * published operands is NOT a substitute: the formula cannot fail when the
+   * field is absent, so it reads identically whether the writer stamped the
+   * probe or never ran. This is the writer's own number.
+   */
+  stockLegProbeUsd: number | null;
+  /**
+   * TRA-3517 — the ROW's own `combinedPnl` (see {@link DailySnapshot.combinedPnl}),
+   * as distinct from {@link eodCombined}, which is the REPORT FILE's.
+   *
+   * These are two different stores written by two different code paths, and
+   * TRA-3349 item 2b claims they carry the same figure on a live broker-shaped
+   * row. Nothing published either one beside the other, so the claim had no
+   * reader. `null` when the snapshot carries no numeric `combinedPnl`.
+   */
+  rowCombinedPnl: number | null;
+  /**
    * TRA-2635 — `PaperAccount.getOptionsCredited()` as of this row: cumulative
    * realized option P&L this book's EQUITY has absorbed (see
    * {@link DailySnapshot.optionsCreditedCumulative}).
@@ -663,6 +753,61 @@ export interface PnlReconcileDay {
    */
   eodRowMissing: boolean;
   /**
+   * TRA-3517 — **the reader that replaces `drift` on a broker-shaped row.**
+   *
+   * `drift` grades `eodCombined == stockDaily + optionsDaily`, an ENGINE-book
+   * decomposition a broker row does not satisfy, so TRA-3349 correctly
+   * suppressed it to `null` there. That suppression removed the only automated
+   * cross-check watching `combinedPnl`, and the row/report agreement that was
+   * supposed to replace it was published on neither side. Net effect on live
+   * books: `combinedPnl` had no reader at all, and a future divergence between
+   * the TRA-359 override and the stored row would have been silent.
+   *
+   * Graded ONLY where the claim is actually made: the row is broker-shaped (so
+   * `drift` abstains) AND the report cell carries the override
+   * ({@link EOD_PNL_SOURCE_BROKER_OVERRIDE}). Anywhere else this is
+   * `'not-measured'` with {@link combinedAgreementReason} naming which leg is
+   * missing.
+   *
+   * ## What a green here is, and what it is NOT
+   *
+   * Today both sides are written from the same `override` object on the same
+   * tick (`applyTradierBalanceOverride` and `shapeLiveRecordedRow` share it), so
+   * agreement holds BY CONSTRUCTION and a green is NOT independent
+   * corroboration of either figure. It is a regression tripwire: the two stores
+   * are written by different code paths and are separately re-writable (a
+   * back-fill, a clobber, a re-generated report, a future refactor that stops
+   * threading the override into the row). This axis is what makes that
+   * divergence loud instead of silent. Do not quote it as evidence the broker
+   * figure is right — see `combinedAgreementSameTickCaveat` in the caveats.
+   */
+  combinedAgreement: CombinedAgreementState;
+  /**
+   * TRA-3517 — `rowCombinedPnl − eodCombined` when
+   * {@link combinedAgreement} is `'agree'` or `'disagree'`; `null` on
+   * `'not-measured'`. NEVER `0` on an ungraded row — that is the same value a
+   * perfect agreement writes, which is the TRA-2637 collapse one axis over.
+   */
+  combinedAgreementDeltaUsd: number | null;
+  /**
+   * TRA-3517 — which leg was missing, on a `'not-measured'` row; `null` when the
+   * axis graded. See {@link CombinedAgreementNotMeasuredReason}.
+   */
+  combinedAgreementReason: CombinedAgreementNotMeasuredReason | null;
+  /**
+   * TRA-3517 — **this session's `combinedPnl` is observed by NOTHING.**
+   *
+   * True iff `drift` is suppressed for broker shape AND the agreement axis is
+   * also `'not-measured'`. Both readers abstain, so the field is carried on a
+   * real-money row with no cross-check of any kind behind it.
+   *
+   * Published as its own flag rather than left for a reader to derive, because
+   * the derivation is exactly the one nobody performed: the endpoint served
+   * `drift: null` and no agreement field at all, and `null` reads as "fine" at a
+   * glance. See {@link PnlReconcileResult.combinedPnlNoReaderDates}.
+   */
+  combinedPnlHasNoReader: boolean;
+  /**
    * TRA-1636 — true when `date` predates the reconciliation baseline, i.e. the
    * snapshot was written by pre-fix (buggy) code. The row is still returned for
    * transparency but its drift never affects `ok` / `offendingDates` / maxDrift.
@@ -738,6 +883,46 @@ export interface PnlReconcileResult {
   eodRowsPresentOk: boolean | null;
   /** TRA-2637 — size of the cohort `eodRowsPresentOk` was graded over. */
   eodRowGradeableCount: number;
+  /**
+   * TRA-3517 — TRI-STATE verdict on the row/report `combinedPnl` agreement over
+   * this book's evaluated sessions.
+   *
+   *   - `false` — at least one graded session DISAGREES. The stored row and the
+   *     TRA-359 override carry different broker day P&L for the same date.
+   *   - `true`  — every graded session agrees to the cent.
+   *   - `null`  — NOT MEASURED: {@link combinedAgreementGradeableCount} is 0, so
+   *     the axis looked at nothing. **Never a pass.** On a book whose live rows
+   *     are broker-shaped this is the reportable state, not a quiet green: it
+   *     means `combinedPnl` is unobserved (see {@link combinedPnlNoReaderDates}).
+   *
+   * A demo book has no broker-shaped rows and legitimately reads `null` here
+   * forever; that is why the fleet fold scopes to live books and publishes its
+   * own denominator rather than `every`-ing over the whole fleet.
+   */
+  combinedAgreementOk: boolean | null;
+  /** TRA-3517 — the denominator: evaluated sessions the agreement axis GRADED. */
+  combinedAgreementGradeableCount: number;
+  /** TRA-3517 — evaluated sessions whose row and report `combinedPnl` disagree. */
+  combinedAgreementDisagreeDates: string[];
+  /**
+   * TRA-3517 — largest |row − report| over GRADED sessions, USD. `null` on an
+   * empty cohort — `0` there is the `every`-on-the-empty-set pass wearing a
+   * number.
+   */
+  combinedAgreementMaxDeltaUsd: number | null;
+  /**
+   * TRA-3517 — evaluated sessions by not-measured reason, so a zero denominator
+   * is attributable instead of merely empty. Keys are
+   * {@link CombinedAgreementNotMeasuredReason}; absent keys are 0.
+   */
+  combinedAgreementNotMeasuredCounts: Record<string, number>;
+  /**
+   * TRA-3517 — evaluated sessions where `drift` is suppressed for broker shape
+   * AND the agreement axis is not-measured: real-money rows whose `combinedPnl`
+   * NOTHING reads. Non-empty is a coverage hole, not a failure of the figure —
+   * report it as `unknown`, never as clean.
+   */
+  combinedPnlNoReaderDates: string[];
   /**
    * TRA-2817 — THE TAIL AXIS. Completed NYSE sessions strictly after this book's
    * newest ledger row, through the last session whose 21:00 ET archive is past.
@@ -1544,6 +1729,85 @@ export function summarizeLiveEodRowPresence(
 }
 
 /**
+ * TRA-3517 — fleet fold of the row/report `combinedPnl` agreement over the LIVE
+ * cohort.
+ *
+ * Scoped to live books because only they can carry a broker-shaped row; folding
+ * over the whole fleet would bury one graded live book under ~60 structurally
+ * not-measured demo books and make the denominator meaningless.
+ *
+ * Three states, and the denominator travels with them:
+ *
+ *  - `false` — some live book disagrees. Any disagreement wins outright.
+ *  - `true`  — no disagreement AND at least one live book genuinely graded a
+ *    session. A green requires a real reading somewhere; it is not reachable by
+ *    an empty cohort.
+ *  - `null`  — NOT MEASURED. No live book graded anything. This is the state the
+ *    axis was in before this ticket, and it is the state a live book sits in
+ *    while its rows are engine-shaped or its override is not computing.
+ *
+ * `liveCombinedAgreementBookCount` is the live denominator and
+ * `liveCombinedPnlNoReaderBooks` names the books carrying real-money rows that
+ * NOTHING reads — publish both beside any verdict. A `null` with a non-empty
+ * no-reader list is materially different from a `null` on an empty live cohort,
+ * and the two are indistinguishable from the boolean alone (TRA-2649).
+ */
+export function summarizeLiveCombinedAgreement(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    combinedAgreementOk: boolean | null;
+    combinedAgreementGradeableCount: number;
+    combinedAgreementDisagreeDates: string[];
+    combinedAgreementMaxDeltaUsd: number | null;
+    combinedPnlNoReaderDates: string[];
+  }>,
+): {
+  liveCombinedAgreementBookCount: number;
+  liveCombinedAgreementOk: boolean | null;
+  liveCombinedAgreementGradedCount: number;
+  liveCombinedAgreementDisagreeBooks: Array<{
+    username: string;
+    dates: string[];
+    maxDeltaUsd: number | null;
+  }>;
+  liveCombinedAgreementMaxDeltaUsd: number | null;
+  liveCombinedPnlNoReaderBooks: Array<{ username: string; dates: string[] }>;
+} {
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  const measuredDeltas = liveBooks
+    .map(e => e.combinedAgreementMaxDeltaUsd)
+    .filter((n): n is number => typeof n === 'number');
+  return {
+    liveCombinedAgreementBookCount: liveBooks.length,
+    liveCombinedAgreementOk: liveBooks.some(e => e.combinedAgreementOk === false)
+      ? false
+      : liveBooks.some(e => e.combinedAgreementOk === true)
+        ? true
+        : null,
+    // Sessions, not books: one live book with 40 graded rows and forty books
+    // with one each are very different coverage, and the book count alone
+    // cannot tell them apart.
+    liveCombinedAgreementGradedCount: liveBooks.reduce(
+      (n, e) => n + e.combinedAgreementGradeableCount,
+      0,
+    ),
+    liveCombinedAgreementDisagreeBooks: liveBooks
+      .filter(e => e.combinedAgreementDisagreeDates.length > 0)
+      .map(e => ({
+        username: e.username,
+        dates: e.combinedAgreementDisagreeDates,
+        maxDeltaUsd: e.combinedAgreementMaxDeltaUsd,
+      })),
+    liveCombinedAgreementMaxDeltaUsd:
+      measuredDeltas.length === 0 ? null : Math.max(...measuredDeltas),
+    liveCombinedPnlNoReaderBooks: liveBooks
+      .filter(e => e.combinedPnlNoReaderDates.length > 0)
+      .map(e => ({ username: e.username, dates: e.combinedPnlNoReaderDates })),
+  };
+}
+
+/**
  * TRA-2761 — **cohort-membership integrity: is every open live-mode position
  * still inside the live cohort that grades it?**
  *
@@ -2338,6 +2602,13 @@ export function reconcilePnl(
   // TRA-2761-hardened `loadSettings` mode; see `summarizePostOnsetLiveCredit`,
   // where the same field is deliberately REQUIRED.
   bookMode: string | null = null,
+  // TRA-3517 — date → the EOD report file's `pnlSource`, which is the ONLY way
+  // to tell a cell the TRA-359 override wrote from a cell carrying the engine
+  // figure. Optional and defaulting to `null` so every existing caller keeps
+  // compiling; a caller that passes nothing grades NOTHING on the agreement axis
+  // (every row reads `'override-not-computed'`), which is the safe direction —
+  // omission cannot manufacture a green.
+  eodPnlSourceByDate: ReadonlyMap<string, string> | null = null,
 ): PnlReconcileResult {
   const days: PnlReconcileDay[] = [...snapshots]
     .sort((a, b) => a.date.localeCompare(b.date))
@@ -2376,6 +2647,43 @@ export function reconcilePnl(
       const drift = eodCombined == null || rowBrokerShaped
         ? null
         : round2(eodCombined - (stockDaily + optionsDaily));
+      // TRA-3517 — the reader that REPLACES `drift` on the rows the line above
+      // just suppressed. Ordered so the reason names the FIRST leg that is
+      // missing, and so `'row-not-broker-shaped'` (an abstention, because
+      // `drift` covers that row) is distinguishable from the three that are
+      // genuine coverage holes.
+      const rowCombinedPnl =
+        typeof s.combinedPnl === 'number' && Number.isFinite(s.combinedPnl)
+          ? round2(s.combinedPnl)
+          : null;
+      const eodPnlSource = eodPnlSourceByDate?.get(s.date) ?? null;
+      const combinedAgreementReason: CombinedAgreementNotMeasuredReason | null =
+        !rowBrokerShaped
+          ? 'row-not-broker-shaped'
+          : rowCombinedPnl === null
+            ? 'row-combined-absent'
+            : eodCombined === null
+              ? 'no-report-row'
+              : eodPnlSource !== EOD_PNL_SOURCE_BROKER_OVERRIDE
+                ? 'override-not-computed'
+                : null;
+      // The delta stays `null` on an ungraded row. `0` there is byte-identical
+      // to a perfect agreement, which is the exact collapse TRA-2637 fixed on
+      // `drift` — and this axis exists precisely because `drift` abstains here,
+      // so it has no second reader to catch the mistake.
+      const combinedAgreementDeltaUsd =
+        combinedAgreementReason === null ? round2(rowCombinedPnl! - eodCombined!) : null;
+      const combinedAgreement: CombinedAgreementState =
+        combinedAgreementReason !== null
+          ? 'not-measured'
+          : Math.abs(combinedAgreementDeltaUsd!) > PNL_RECONCILE_TOLERANCE_USD
+            ? 'disagree'
+            : 'agree';
+      // Both readers abstained on a real-money row: `drift` for broker shape,
+      // the agreement axis for a missing leg. Nothing observes `combinedPnl`
+      // here at all.
+      const combinedPnlHasNoReader =
+        rowBrokerShaped && combinedAgreement === 'not-measured';
       const belowBaseline = baselineDate != null && s.date < baselineDate;
       // TRA-2302 — a day is only claimed as a FALSE zero when a census exists
       // for this book AND it names closes the day-only ledger did not receive.
@@ -2470,6 +2778,26 @@ export function reconcilePnl(
           typeof s.netCashFlowUsd === 'number' && Number.isFinite(s.netCashFlowUsd)
             ? round2(s.netCashFlowUsd)
             : null,
+        // TRA-3517 — the booked-`0` stock leg's own falsifier, straight off the
+        // row. Absent/empty passes through as `null` (NOT MEASURED), the same
+        // rule every other basis string here follows; a `?? 'inert'` default
+        // would manufacture the declaration the field exists to withhold.
+        stockLegBasis:
+          typeof s.stockLegBasis === 'string' && s.stockLegBasis !== ''
+            ? s.stockLegBasis
+            : null,
+        // `round2(null)` is 0, and a $0 probe is the PASSING state ("the stock
+        // leg really was inert") — the one value an unmeasured probe must never
+        // be allowed to render as.
+        stockLegProbeUsd:
+          typeof s.stockLegProbeUsd === 'number' && Number.isFinite(s.stockLegProbeUsd)
+            ? round2(s.stockLegProbeUsd)
+            : null,
+        rowCombinedPnl,
+        combinedAgreement,
+        combinedAgreementDeltaUsd,
+        combinedAgreementReason,
+        combinedPnlHasNoReader,
         optionsCreditedCumulative,
         // TRA-2635 — filled in by the second pass below; it needs the PRIOR row.
         optionsCreditedInWindow: null,
@@ -2683,6 +3011,26 @@ export function reconcilePnl(
       : eodRowGradeable.length === 0
         ? null
         : eodRowMissingDates.length === 0;
+  // TRA-3517 — the row/report `combinedPnl` agreement, folded per book.
+  //
+  // Baseline-gated (`evaluated`) exactly like every other verdict here, and the
+  // gate costs nothing: only the TRA-3349 shaper writes a broker-shaped row, so
+  // the graded cohort is post-fix by construction — there is no pre-fix era for
+  // it to drag in.
+  const combinedAgreementGraded = evaluated.filter(d => d.combinedAgreement !== 'not-measured');
+  const combinedAgreementDisagreeDates = evaluated
+    .filter(d => d.combinedAgreement === 'disagree')
+    .map(d => d.date);
+  const combinedAgreementNotMeasuredCounts = evaluated.reduce<Record<string, number>>((acc, d) => {
+    if (d.combinedAgreementReason === null) return acc;
+    acc[d.combinedAgreementReason] = (acc[d.combinedAgreementReason] ?? 0) + 1;
+    return acc;
+  }, {});
+  // NULL on the empty cohort, never `true`. `combinedAgreementGraded.length ===
+  // 0` is the state this whole ticket is about: the axis looked at nothing, and
+  // on a broker-shaped row nothing else is looking either.
+  const combinedAgreementOk: boolean | null =
+    combinedAgreementGraded.length === 0 ? null : combinedAgreementDisagreeDates.length === 0;
   // TRA-2630 — the per-leg verdicts. Baseline-gated exactly like `ok`: a
   // pre-fix row's stock leg is un-reconcilable for the same reason its `drift`
   // is, so grading it would hand these new fields the same dead state `ok` has.
@@ -2980,6 +3328,20 @@ export function reconcilePnl(
     eodRowMissingDates,
     eodRowsPresentOk,
     eodRowGradeableCount: eodRowGradeable.length,
+    combinedAgreementOk,
+    combinedAgreementGradeableCount: combinedAgreementGraded.length,
+    combinedAgreementDisagreeDates,
+    combinedAgreementMaxDeltaUsd:
+      combinedAgreementGraded.length === 0
+        ? null
+        : round2(
+          combinedAgreementGraded.reduce(
+            (m, d) => Math.max(m, Math.abs(d.combinedAgreementDeltaUsd ?? 0)),
+            0,
+          ),
+        ),
+    combinedAgreementNotMeasuredCounts,
+    combinedPnlNoReaderDates: evaluated.filter(d => d.combinedPnlHasNoReader).map(d => d.date),
     eodTailStaleSessions,
     eodTailLatestRowDate,
     eodTailSettledSession,

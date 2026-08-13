@@ -7,6 +7,7 @@ import {
   summarizeLiveLagTripwire,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
+  summarizeLiveCombinedAgreement,
   summarizeLiveCohortIntegrity,
   countStaleTailSessions,
   summarizeDriftGradeability,
@@ -16,6 +17,7 @@ import {
   PNL_DRIFT_DECOMPOSITION_NOTE,
   PNL_ABSENT_EOD_ROW_NOTE,
   PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
+  PNL_COMBINED_AGREEMENT_NOTE,
 } from './pnl-reconciliation.js';
 import type { PostOnsetLiveCredit } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
@@ -3105,5 +3107,316 @@ describe('TRA-3043 — openingEquity / openingEquityBasis reach the payload', ()
       '2026-01-01',
     );
     expect(blank.days[0]!.openingEquityBasis).toBeNull();
+  });
+});
+
+describe('TRA-3517 — the row/report `combinedPnl` agreement gets a READER', () => {
+  const BASELINE = '2026-07-12';
+  const OVERRIDE = new Map([['2026-08-05', 'tradier-balance']]);
+
+  /**
+   * A TRA-3349 broker-shaped recorded row, as `shapeLiveRecordedRow` writes it:
+   * stock leg booked `0` with a falsifiable probe beside it, broker equity
+   * basis, and `combinedPnl` carrying the override's broker day P&L.
+   *
+   * `combinedPnl` is passed SEPARATELY from the legs on purpose — that is the
+   * whole point of the axis. On a broker row the legs do not sum to it, so a
+   * fixture that derived one from the other could not express a disagreement.
+   */
+  const brokerRow = (
+    date: string,
+    combinedPnl: number,
+    over: Partial<DailySnapshot> = {},
+  ): DailySnapshot => ({
+    ...snap(date, 0, 0),
+    closingEquity: 2_101.5,
+    closingEquityBasis: 'broker-eod-balance',
+    openingEquity: 2_207.5,
+    openingEquityBasis: 'broker-prev-eod-balance',
+    netCashFlowUsd: 0,
+    stockLegBasis: 'zero-probe-agrees',
+    stockLegProbeUsd: 0,
+    combinedPnl,
+    ...over,
+  });
+
+  // ── ITEM 1: the two stock-leg fields reach the surface ────────────────────
+
+  it('projects `stockLegBasis` / `stockLegProbeUsd` onto the row', () => {
+    // Before this ticket both strings occurred ZERO times in the full
+    // /api/health/pnl-reconciliation payload, on every probed opt-in variant.
+    // The booked `0` stock leg was unfalsifiable from the published surface.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106, {
+        stockLegBasis: 'zero-probe-disagrees',
+        stockLegProbeUsd: -42.5,
+      })],
+      new Map(), BASELINE,
+    );
+    expect(r.days[0]!.stockLegBasis).toBe('zero-probe-disagrees');
+    expect(r.days[0]!.stockLegProbeUsd).toBeCloseTo(-42.5, 2);
+  });
+
+  it('an unmeasured probe is `null`, NOT the `0` that means "the leg was inert"', () => {
+    // `round2(null)` is 0, and 0 is the PASSING value of this field. An absent
+    // probe rendering as a pass is the exact collapse the field exists to stop.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106, {
+        stockLegBasis: 'zero-probe-not-measured',
+        stockLegProbeUsd: null,
+      })],
+      new Map(), BASELINE,
+    );
+    expect(r.days[0]!.stockLegProbeUsd).toBeNull();
+    expect(r.days[0]!.stockLegBasis).toBe('zero-probe-not-measured');
+  });
+
+  it('an ordinary recorded row carries neither field and reads null on both', () => {
+    const r = reconcilePnl([snap('2026-08-05', 100, 30)], new Map(), BASELINE);
+    expect(r.days[0]!.stockLegBasis).toBeNull();
+    expect(r.days[0]!.stockLegProbeUsd).toBeNull();
+  });
+
+  // ── ITEM 2: the agreement axis, and its three states ──────────────────────
+
+  it('POSITIVE — row and report agree on the override figure: `agree`', () => {
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106)],
+      new Map([['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    const day = r.days[0]!;
+    expect(day.rowCombinedPnl).toBeCloseTo(-106, 2);
+    expect(day.eodCombined).toBeCloseTo(-106, 2);
+    expect(day.combinedAgreement).toBe('agree');
+    expect(day.combinedAgreementDeltaUsd).toBeCloseTo(0, 2);
+    expect(day.combinedAgreementReason).toBeNull();
+    // `drift` is still suppressed — this axis is its REPLACEMENT, not its peer.
+    expect(day.drift).toBeNull();
+    expect(day.combinedPnlHasNoReader).toBe(false);
+    expect(r.combinedAgreementOk).toBe(true);
+    expect(r.combinedAgreementGradeableCount).toBe(1);
+    expect(r.combinedPnlNoReaderDates).toEqual([]);
+  });
+
+  it('NEGATIVE — a row whose `combinedPnl` differs from the override reads `disagree`', () => {
+    // THE FALSIFICATION TEST the ask names. Without it the axis is unfalsifiable:
+    // agreement holds by construction on the same tick today, so a green proves
+    // nothing unless a red is demonstrably reachable. The report carries the
+    // override -106; the stored row carries -90.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -90)],
+      new Map([['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    const day = r.days[0]!;
+    expect(day.combinedAgreement).toBe('disagree');
+    expect(day.combinedAgreementDeltaUsd).toBeCloseTo(16, 2);
+    expect(day.combinedAgreementReason).toBeNull();
+    expect(day.combinedPnlHasNoReader).toBe(false);
+    expect(r.combinedAgreementOk).toBe(false);
+    expect(r.combinedAgreementDisagreeDates).toEqual(['2026-08-05']);
+    expect(r.combinedAgreementMaxDeltaUsd).toBeCloseTo(16, 2);
+  });
+
+  it('a sub-penny difference is rounding, not a disagreement', () => {
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106.004)],
+      new Map([['2026-08-05', -106.01]]),
+      BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    expect(r.days[0]!.combinedAgreement).toBe('agree');
+    expect(r.combinedAgreementOk).toBe(true);
+  });
+
+  it('NOT MEASURED when the override did not compute — and it does NOT read `agree`', () => {
+    // The report fell back to the ENGINE figure (`pnlSource: 'engine'`), and it
+    // happens to EQUAL the row. A pass here would be the vacuous true this
+    // ticket exists to prevent: on a broker row `drift` is null, so a green
+    // sourced from a comparison that measured nothing is the same reading as a
+    // real pass on the one cohort with no second reader.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106)],
+      new Map([['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-05', 'engine']]),
+    );
+    const day = r.days[0]!;
+    expect(day.combinedAgreement).toBe('not-measured');
+    expect(day.combinedAgreementReason).toBe('override-not-computed');
+    // The delta stays NULL. `0` here is byte-identical to a perfect agreement.
+    expect(day.combinedAgreementDeltaUsd).toBeNull();
+    expect(r.combinedAgreementOk).toBeNull();
+    expect(r.combinedAgreementOk).not.toBe(true);
+    expect(r.combinedAgreementGradeableCount).toBe(0);
+    expect(r.combinedAgreementMaxDeltaUsd).toBeNull();
+  });
+
+  it('an ABSENT `pnlSource` is NOT-OVERRIDDEN, never a default source', () => {
+    // 46 of the 69 stored live rows carry no `pnlSource` at all (TRA-3102). If
+    // absence defaulted to the override this axis would grade all of them
+    // against an engine figure and manufacture a fleet of disagreements — or,
+    // worse, of agreements.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106)],
+      new Map([['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live', new Map(),
+    );
+    expect(r.days[0]!.combinedAgreementReason).toBe('override-not-computed');
+    expect(r.combinedAgreementOk).toBeNull();
+  });
+
+  it('a caller that wires no `pnlSource` map at all grades NOTHING', () => {
+    // Omission must fail toward NOT MEASURED. The parameter is optional so
+    // existing callers keep compiling, and the default cannot be one that
+    // manufactures a green.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106)],
+      new Map([['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live',
+    );
+    expect(r.days[0]!.combinedAgreement).toBe('not-measured');
+    expect(r.combinedAgreementOk).toBeNull();
+  });
+
+  it('NOT MEASURED with `no-report-row` when the report file is absent', () => {
+    const r = reconcilePnl(
+      [brokerRow('2026-08-05', -106)],
+      new Map(), BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    expect(r.days[0]!.combinedAgreementReason).toBe('no-report-row');
+    expect(r.combinedAgreementOk).toBeNull();
+  });
+
+  it('an ENGINE-shaped row ABSTAINS — `drift` is its reader, and it still grades', () => {
+    // The axis must not double-accuse. On a non-broker row `drift` is live, so
+    // this reason is an abstention rather than a coverage hole — which is why
+    // `combinedPnlHasNoReader` stays false here.
+    const r = reconcilePnl(
+      [snap('2026-08-05', 100, 30)],
+      new Map([['2026-08-05', 175]]),
+      BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    const day = r.days[0]!;
+    expect(day.combinedAgreementReason).toBe('row-not-broker-shaped');
+    expect(day.combinedAgreement).toBe('not-measured');
+    expect(day.combinedPnlHasNoReader).toBe(false);
+    expect(day.drift).toBeCloseTo(45, 2);
+    expect(r.combinedPnlNoReaderDates).toEqual([]);
+  });
+
+  // ── The coverage hole itself is published ─────────────────────────────────
+
+  it('names the sessions BOTH readers abstain on — `combinedPnlHasNoReader`', () => {
+    // 08-04: broker-shaped, override computed -> graded.
+    // 08-05: broker-shaped, override did NOT compute -> drift null AND agreement
+    //        not-measured. Real money, observed by nothing. That state was
+    //        previously indistinguishable from a clean session at a glance.
+    const r = reconcilePnl(
+      [brokerRow('2026-08-04', -16), brokerRow('2026-08-05', -106)],
+      new Map([['2026-08-04', -16], ['2026-08-05', -106]]),
+      BASELINE, null, null, null, null, null, 'live',
+      new Map([['2026-08-04', 'tradier-balance'], ['2026-08-05', 'engine']]),
+    );
+    expect(r.days.map(d => d.combinedPnlHasNoReader)).toEqual([false, true]);
+    expect(r.combinedPnlNoReaderDates).toEqual(['2026-08-05']);
+    // One graded session is still a graded session — the verdict is a real
+    // `true`, and the hole travels beside it rather than inside it.
+    expect(r.combinedAgreementOk).toBe(true);
+    expect(r.combinedAgreementGradeableCount).toBe(1);
+    expect(r.combinedAgreementNotMeasuredCounts).toEqual({ 'override-not-computed': 1 });
+  });
+
+  it('attributes an empty denominator by reason instead of leaving it merely empty', () => {
+    const r = reconcilePnl(
+      [
+        snap('2026-08-03', 10, 0),
+        brokerRow('2026-08-04', -16, { combinedPnl: Number.NaN }),
+        brokerRow('2026-08-05', -106),
+      ],
+      new Map([['2026-08-03', 10]]),
+      BASELINE, null, null, null, null, null, 'live', OVERRIDE,
+    );
+    expect(r.combinedAgreementOk).toBeNull();
+    expect(r.combinedAgreementNotMeasuredCounts).toEqual({
+      'row-not-broker-shaped': 1,
+      'row-combined-absent': 1,
+      'no-report-row': 1,
+    });
+    expect(r.days[1]!.rowCombinedPnl).toBeNull();
+  });
+
+  it('publishes the same-tick caveat so a green is not over-read', () => {
+    expect(PNL_RECONCILIATION_CAVEATS).toContain(PNL_COMBINED_AGREEMENT_NOTE);
+    expect(PNL_COMBINED_AGREEMENT_NOTE).toContain('NOT independent corroboration');
+    expect(PNL_COMBINED_AGREEMENT_NOTE).toContain('MUST NEVER be folded into');
+  });
+});
+
+describe('TRA-3517 — summarizeLiveCombinedAgreement', () => {
+  const book = (
+    username: string,
+    mode: string,
+    ok: boolean | null,
+    graded: number,
+    disagree: string[] = [],
+    maxDelta: number | null = null,
+    noReader: string[] = [],
+  ) => ({
+    username,
+    mode,
+    combinedAgreementOk: ok,
+    combinedAgreementGradeableCount: graded,
+    combinedAgreementDisagreeDates: disagree,
+    combinedAgreementMaxDeltaUsd: maxDelta,
+    combinedPnlNoReaderDates: noReader,
+  });
+
+  it('one live disagreement outranks every green', () => {
+    const r = summarizeLiveCombinedAgreement([
+      book('admin', 'live', false, 3, ['2026-08-05'], 16),
+      book('v0nni', 'live', true, 4, [], 0),
+    ]);
+    expect(r.liveCombinedAgreementOk).toBe(false);
+    expect(r.liveCombinedAgreementDisagreeBooks).toEqual([
+      { username: 'admin', dates: ['2026-08-05'], maxDeltaUsd: 16 },
+    ]);
+    expect(r.liveCombinedAgreementMaxDeltaUsd).toBe(16);
+    expect(r.liveCombinedAgreementGradedCount).toBe(7);
+  });
+
+  it('a green needs a REAL reading — all-NOT-MEASURED stays null, never true', () => {
+    const r = summarizeLiveCombinedAgreement([
+      book('admin', 'live', null, 0, [], null, ['2026-08-04', '2026-08-05']),
+      book('v0nni', 'live', null, 0),
+    ]);
+    expect(r.liveCombinedAgreementOk).toBeNull();
+    expect(r.liveCombinedAgreementGradedCount).toBe(0);
+    expect(r.liveCombinedAgreementBookCount).toBe(2);
+    // The discriminator a bare `null` cannot carry: this is a coverage HOLE on
+    // two real-money sessions, not an empty live cohort.
+    expect(r.liveCombinedPnlNoReaderBooks).toEqual([
+      { username: 'admin', dates: ['2026-08-04', '2026-08-05'] },
+    ]);
+    expect(r.liveCombinedAgreementMaxDeltaUsd).toBeNull();
+  });
+
+  it('an EMPTY live cohort is null with a zero denominator, not a pass', () => {
+    // `every` is true on the empty set; `some` is the construction that is not.
+    const r = summarizeLiveCombinedAgreement([book('demo1', 'demo', null, 0)]);
+    expect(r.liveCombinedAgreementOk).toBeNull();
+    expect(r.liveCombinedAgreementBookCount).toBe(0);
+    expect(r.liveCombinedPnlNoReaderBooks).toEqual([]);
+  });
+
+  it('a demo book cannot move the live verdict in either direction', () => {
+    const r = summarizeLiveCombinedAgreement([
+      book('admin', 'live', true, 2, [], 0),
+      book('demo1', 'demo', false, 5, ['2026-08-05'], 99),
+    ]);
+    expect(r.liveCombinedAgreementOk).toBe(true);
+    expect(r.liveCombinedAgreementBookCount).toBe(1);
+    expect(r.liveCombinedAgreementGradedCount).toBe(2);
+    expect(r.liveCombinedAgreementDisagreeBooks).toEqual([]);
   });
 });

@@ -37,6 +37,7 @@ import {
   summarizeLiveCohortIntegrity,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
+  summarizeLiveCombinedAgreement,
   summarizeDriftGradeability,
 } from './pnl-reconciliation.js';
 // TRA-2888 — the permanent 07-30/07-31/08-03 gap ruling and the
@@ -5676,6 +5677,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         // moved. Measured on 2026-07-30: 40 of 40 post-baseline sessions with a
         // non-zero `stockDaily` had this leg at exactly 0.00.
         const eodStockByDate = new Map<string, number>();
+        // TRA-3517 — and the cell's PROVENANCE. `combinedPnl` alone cannot say
+        // whether the TRA-359 broker override actually computed for this date or
+        // whether the cell fell back to the engine figure, and those two are the
+        // difference between a graded row/report agreement and a comparison that
+        // measures nothing. An ABSENT `pnlSource` (46 of 69 stored live rows —
+        // TRA-3102) is left out of the map entirely, which reads downstream as
+        // NOT-OVERRIDDEN. Never defaulted to a source.
+        const eodPnlSourceByDate = new Map<string, string>();
         for (const s of snapshots) {
           const filePath = join(dir, `${s.date}.json`);
           if (!existsSync(filePath)) continue;
@@ -5684,10 +5693,14 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
               combinedPnl?: number;
               optionsPnl?: number;
               realizedPnl?: number;
+              pnlSource?: string;
             };
             if (typeof report.combinedPnl === 'number') eodByDate.set(s.date, report.combinedPnl);
             if (typeof report.optionsPnl === 'number') eodOptionsByDate.set(s.date, report.optionsPnl);
             if (typeof report.realizedPnl === 'number') eodStockByDate.set(s.date, report.realizedPnl);
+            if (typeof report.pnlSource === 'string' && report.pnlSource !== '') {
+              eodPnlSourceByDate.set(s.date, report.pnlSource);
+            }
           } catch { /* skip unreadable report file */ }
         }
         // Scope the census to THIS book — pooling another account's closes in
@@ -5797,6 +5810,9 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
             // `loadSettings` mode from above, so a cache eviction cannot
             // reclassify the live book as demo and silently disarm it.
             mode,
+            // TRA-3517 — arms the row/report `combinedPnl` agreement axis, the
+            // reader that replaces `drift` where TRA-3349 suppressed it.
+            eodPnlSourceByDate,
           ),
         };
       }),
@@ -6033,6 +6049,16 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         return measured.length === 0 ? null : Math.max(...measured);
       })(),
       ...summarizeLiveEodRowPresence(engines),
+      // TRA-3517 — THE `combinedPnl` AGREEMENT AXIS, at the head because it is
+      // the reader that replaces `drift` on the live broker-shaped rows where
+      // TRA-3349 suppressed it. Before this the field had NO reader on a live
+      // book at all: `drift: null` for broker shape, and the row/report
+      // agreement published on neither side. Tri-state with its denominator
+      // (`liveCombinedAgreementBookCount` / `liveCombinedAgreementGradedCount`)
+      // and with `liveCombinedPnlNoReaderBooks`, which names the real-money
+      // sessions still observed by nothing — a `null` verdict beside a non-empty
+      // no-reader list is a coverage hole, not a quiet pass.
+      ...summarizeLiveCombinedAgreement(engines),
       // TRA-2888 — THE INTERIOR-ABSENCE AXIS, at the head beside the tail axis
       // it completes. The tail answers "has the writer stopped?"; this answers
       // "is the recorded history complete?" — and on 2026-08-05 the first read
