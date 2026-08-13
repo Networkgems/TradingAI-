@@ -85,6 +85,123 @@ function parseBoundedFloat(raw: string | undefined, min: number, max: number): n
   return Number.isFinite(n) && n >= min && n <= max ? n : undefined;
 }
 
+// ── TRA-3483 — the RECORDER half: `k` is a RATIO and only the denominator ships ──
+//
+// QuantTrader read the deployed surface on 2026-08-13 and found `k` UNIDENTIFIABLE
+// from any published instrument. `admit ⟺ costR ≤ k · modeledGrossR`. The
+// expectancy table publishes `modeledGrossR` per cell; `live-enforce-gates`
+// publishes the shortfall against `barR` and names the cell. **Nothing anywhere
+// emits `costR`** — and inside a cell every row shares the SAME `modeledGrossR`
+// (the cell lower bound), so `costR` is the ONLY axis `k` can discriminate on.
+// Pre-registering a `k` against `byReason` is unfalsifiable by construction.
+//
+// So the numerator is published per decision, and a counterfactual sweep over
+// candidate `k` is folded from the SAME recorded rows. This is instrumentation,
+// NOT an arm: `ENABLE_OPTION_COST_BAR_NET_EDGE` stays `false`, the flat form keeps
+// deciding, and the sweep never touches a verdict. TRA-3272 item 5 (no unilateral
+// arming) is intact — the recorder is precisely what lets someone else pick `k`
+// from evidence instead of from a prior.
+
+/**
+ * The cost side of the net-edge form, decomposed — computed for EVERY cost_bar
+ * decision (admits included) regardless of which form is armed.
+ *
+ * Extracted from {@link netEdgeBarVerdict} rather than re-derived beside it: a
+ * recorder that computes its own copy of the arithmetic is a recorder that can
+ * silently measure a different number than the gate would use, which is the whole
+ * failure this ticket exists to close.
+ */
+export interface NetEdgeCostBreakdown {
+  /** Full taker spread cross, this candidate's own quote (per share). */
+  spreadPerShare: number;
+  /** Fees per share = feesPerContractRoundTrip / 100. Constant across candidates. */
+  feesPerShare: number;
+  /** spreadPerShare + feesPerShare. */
+  costPerShare: number;
+  /** The at-risk basis the cost is expressed in (`mark − stop`, else 0.25·mark). */
+  riskPerShare: number;
+  /** costPerShare / riskPerShare — the NUMERATOR of the `k` comparison, in `R_gate`. */
+  costR: number;
+  /** The spread-cross term alone, same R unit. Sums with feeR to costR. */
+  spreadR: number;
+  /** The commission/fee term alone, same R unit. */
+  feeR: number;
+  /** costPerShare / mark — the fraction {@link NetEdgeBarConfig.absCostFracCeiling} tests. */
+  costFracOfPremium: number;
+}
+
+/**
+ * The per-candidate cost ingredients, or `null` when the quote is unusable
+ * (non-finite / inverted / non-positive mark) — the same fail-closed predicate
+ * {@link netEdgeBarVerdict} blocks on. `null` means "cost UNKNOWN for this row",
+ * which the ledger must publish as a missing sample, never as a zero.
+ */
+export function netEdgeCostBreakdown(
+  inputs: { mark: number; bid: number | undefined; ask: number | undefined; riskPerShare?: number },
+  feesPerContractRoundTrip: number,
+): NetEdgeCostBreakdown | null {
+  const { mark, bid, ask } = inputs;
+  const quoteUsable =
+    typeof bid === 'number' && typeof ask === 'number'
+    && Number.isFinite(bid) && Number.isFinite(ask)
+    && Number.isFinite(mark) && mark > 0
+    && bid >= 0 && ask >= bid;
+  if (!quoteUsable) return null;
+
+  const riskPerShare =
+    typeof inputs.riskPerShare === 'number' && Number.isFinite(inputs.riskPerShare) && inputs.riskPerShare > 0
+      ? inputs.riskPerShare
+      : mark * 0.25;
+  const spreadPerShare = ask - bid;
+  const feesPerShare = feesPerContractRoundTrip / 100;
+  const costPerShare = spreadPerShare + feesPerShare;
+  return {
+    spreadPerShare,
+    feesPerShare,
+    costPerShare,
+    riskPerShare,
+    costR: costPerShare / riskPerShare,
+    spreadR: spreadPerShare / riskPerShare,
+    feeR: feesPerShare / riskPerShare,
+    costFracOfPremium: costPerShare / mark,
+  };
+}
+
+/**
+ * The `k` grid TRA-3481 pre-registers against. Fixed in code rather than
+ * env-resolved: a sweep whose grid can move is a sweep whose published row set is
+ * not reproducible, and this exists to make a decision auditable after the fact.
+ * `0.5876` is QuantTrader's; the rest bracket it.
+ */
+export const NET_EDGE_SHADOW_K_SWEEP: readonly number[] = [
+  0.40, 0.45, 0.50, 0.5876, 0.65, 0.75, 1.00, 1.25,
+];
+
+/** The recorded per-decision facts a counterfactual `k` verdict needs. */
+export interface NetEdgeShadowSample {
+  costR: number;
+  costFracOfPremium: number;
+  /** The modeled gross edge at decision time; `null` ⇒ the edge was unknown. */
+  grossR: number | null;
+}
+
+/**
+ * Would the net-edge form at this `k` have ADMITTED this recorded decision?
+ *
+ * Replays {@link netEdgeBarVerdict}'s admit path in the same order: the absolute
+ * ceiling is `k`-independent and blocks first, an unknown edge fails closed, and
+ * only then does the ratio decide. Rows whose quote was unusable never produce a
+ * sample at all (see {@link netEdgeCostBreakdown}) — under the real form those are
+ * `net_edge_quote_unusable` blocks, so the ledger counts them as blocked-at-every-k
+ * rather than dropping them from the denominator.
+ */
+export function netEdgeShadowAdmits(sample: NetEdgeShadowSample, k: number, absCostFracCeiling: number): boolean {
+  if (!Number.isFinite(sample.costR) || !Number.isFinite(sample.costFracOfPremium)) return false;
+  if (sample.costFracOfPremium > absCostFracCeiling) return false;
+  if (sample.grossR === null || !Number.isFinite(sample.grossR)) return false;
+  return sample.costR <= k * sample.grossR;
+}
+
 /** Resolved, fully-defaulted net-edge bar configuration. Pure — no env access. */
 export interface NetEdgeBarConfig {
   /** {@link OPTION_NET_EDGE_BAR_FLAG} resolved. */
@@ -178,14 +295,12 @@ export function netEdgeBarVerdict(
   config: Omit<NetEdgeBarConfig, 'enabled' | 'structures'>,
 ): NetEdgeBarVerdict {
   const { mark, bid, ask, modeledGrossR } = inputs;
-  const feesPerShare = config.feesPerContractRoundTrip / 100;
-
-  const quoteUsable =
-    typeof bid === 'number' && typeof ask === 'number'
-    && Number.isFinite(bid) && Number.isFinite(ask)
-    && Number.isFinite(mark) && mark > 0
-    && bid >= 0 && ask >= bid;
-  if (!quoteUsable) {
+  // TRA-3483 — ONE arithmetic, shared with the recorder. See netEdgeCostBreakdown.
+  const cost = netEdgeCostBreakdown(
+    { mark, bid, ask, riskPerShare: inputs.riskPerShare },
+    config.feesPerContractRoundTrip,
+  );
+  if (cost === null) {
     return {
       admit: false,
       costPerShare: Number.NaN,
@@ -197,13 +312,7 @@ export function netEdgeBarVerdict(
     };
   }
 
-  const riskPerShare =
-    typeof inputs.riskPerShare === 'number' && Number.isFinite(inputs.riskPerShare) && inputs.riskPerShare > 0
-      ? inputs.riskPerShare
-      : mark * 0.25;
-  const costPerShare = (ask - bid) + feesPerShare;
-  const costR = costPerShare / riskPerShare;
-  const costFracOfPremium = costPerShare / mark;
+  const { costPerShare, costR, costFracOfPremium } = cost;
   const requiredEdgeR = costR / config.k;
 
   if (costFracOfPremium > config.absCostFracCeiling) {

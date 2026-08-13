@@ -40,6 +40,12 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { isEphemeralDataDir } from './data-dir.js';
+import {
+  DEFAULT_NET_EDGE_BAR_CONFIG,
+  NET_EDGE_SHADOW_K_SWEEP,
+  netEdgeShadowAdmits,
+  type NetEdgeShadowSample,
+} from './option-net-edge-bar.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'live-enforce-gate-ledger' });
@@ -135,7 +141,62 @@ export interface LiveEnforceRecord {
    * "never stamped" is not a cell.
    */
   cell?: string;
+  /**
+   * TRA-3483 — the NUMERATOR of the net-edge comparison, recorded on EVERY
+   * `cost_bar` verdict including admits, whichever form actually decided.
+   *
+   * `k` is defined by `admit ⟺ costR ≤ k · modeledGrossR`, and every row inside a
+   * cell shares the same `modeledGrossR` (the cell's lower CI bound), so `costR`
+   * is the ONLY axis `k` can discriminate on. Until this field existed, `k` was
+   * unidentifiable from any deployed instrument no matter how clean the tape.
+   *
+   * ABSENT ⇒ the quote was unusable at decision time (the net-edge form's
+   * fail-closed case) or the row predates this field. Both are published as a
+   * MISSING sample, never as a zero — see `costRQuantiles.rowsMissingCostR`.
+   */
+  cost?: {
+    /** costPerShare / riskPerShare, in the same `R_gate` unit as `barR`. */
+    costR: number;
+    /** The spread-cross term alone (0.235 of the 0.285 modeled bar — 82%). */
+    spreadR: number;
+    /** The commission/fee term alone. `spreadR + feeR === costR`. */
+    feeR: number;
+    /** costPerShare / mark — what the k-INDEPENDENT absolute ceiling tests. */
+    costFracOfPremium: number;
+  };
+  /**
+   * TRA-3483 — the DENOMINATOR at decision time (`tapeEdgeR`: the cell's lower 95%
+   * CI bound). Recorded per row rather than joined from the expectancy table after
+   * the fact, because that table is re-folded continuously and a later read would
+   * answer a different question than the one the verdict was made under.
+   *
+   * Absent ⇒ the edge was unknown (unfolded tape / underpowered cell / no bucket),
+   * which fails closed at every `k`.
+   */
+  grossR?: number;
 }
+
+/**
+ * TRA-3483 — one recorded decision's ingredients for the counterfactual sweep.
+ * Retained per gate-day alongside the counters; `cost_bar` is the only gate that
+ * produces them.
+ */
+interface CostSample extends NetEdgeShadowSample {
+  spreadR: number;
+  feeR: number;
+  /** What the DEPLOYED form actually did — the `flatFormAdmits` baseline. */
+  blocked: boolean;
+  /** The cell this verdict was decided under, for the per-cell quantile fold. */
+  cell: string | null;
+}
+
+/**
+ * Hard cap on retained samples per gate-day. The observed live rate is ~300
+ * decisions/day, so this is a runaway backstop, not a working limit — but it is a
+ * COUNTED cap: `costRQuantiles.samplesDropped > 0` says the quantiles are over a
+ * truncated head and must not be read as the day's distribution.
+ */
+const MAX_COST_SAMPLES_PER_GATE_DAY = 20_000;
 
 interface GateScopeTally {
   evaluated: number;
@@ -152,12 +213,34 @@ interface GateTallies {
   byBook: Map<string, GateScopeTally>;
   /** TRA-3391 tape cell (`structure::bucket`) — rows that carry one, admits included. */
   byCell: Map<string, GateScopeTally>;
+  /**
+   * TRA-3483 — per-decision cost/edge samples (`cost_bar` only). This is a LIST,
+   * not a tally, because quantiles and a median-of-admitted are not foldable into
+   * counters: the sweep's `medianNetR_admitted` is over a k-DEPENDENT subset that
+   * is only known at read time.
+   */
+  costSamples: CostSample[];
+  /** Rows of this gate/day that carried NO usable cost (unusable quote / pre-field). */
+  costRowsMissing: number;
+  /** Samples discarded by {@link MAX_COST_SAMPLES_PER_GATE_DAY}. */
+  costSamplesDropped: number;
+  /** TRA-3483 (D2) — BLOCKED rows carrying no `reasonCode`, so `byReason`'s denominator is visible. */
+  blockedUnclassified: number;
 }
 
 const UNATTRIBUTED_BOOK = 'unattributed';
 
 function emptyTallies(): GateTallies {
-  return { byScope: new Map(), byReason: new Map(), byBook: new Map(), byCell: new Map() };
+  return {
+    byScope: new Map(),
+    byReason: new Map(),
+    byBook: new Map(),
+    byCell: new Map(),
+    costSamples: [],
+    costRowsMissing: 0,
+    costSamplesDropped: 0,
+    blockedUnclassified: 0,
+  };
 }
 
 function bump(map: Map<string, GateScopeTally>, key: string, blocked: boolean): void {
@@ -240,12 +323,42 @@ function apply(rec: LiveEnforceRecord): void {
   // dominant bucket of every gate the one that explains nothing.
   if (rec.blocked && typeof rec.reasonCode === 'string' && rec.reasonCode !== '') {
     bump(tallies.byReason, rec.reasonCode, true);
+  } else if (rec.blocked) {
+    // TRA-3483 (D2) — a block with no classification is NOT absent from the
+    // ledger, it is absent from `byReason`. On the retained 6-day fold 1759 of
+    // 1929 cost_bar blocks predate reason stamping, so `gross_negative`'s
+    // published `share` of 0.0881 reads as a RATE when it is a COVERAGE artifact.
+    // Counting them here puts the missing denominator on the payload.
+    tallies.blockedUnclassified += 1;
   }
   // TRA-3391 — cell axis, admits INCLUDED (`bump` counts evaluated and, when
   // blocked, blocked). Only rows that actually carry a cell contribute: a missing
   // cell is "never stamped", not a bucket.
   if (typeof rec.cell === 'string' && rec.cell !== '') {
     bump(tallies.byCell, rec.cell, rec.blocked);
+  }
+  // TRA-3483 — the cost/edge sample. A row with no usable cost is COUNTED as
+  // missing rather than skipped: the sweep's denominator has to be visible, and a
+  // silently shorter sample list is exactly how a coverage gap reads as a rate.
+  if (rec.cost && Number.isFinite(rec.cost.costR) && Number.isFinite(rec.cost.costFracOfPremium)) {
+    if (tallies.costSamples.length < MAX_COST_SAMPLES_PER_GATE_DAY) {
+      tallies.costSamples.push({
+        costR: rec.cost.costR,
+        spreadR: rec.cost.spreadR,
+        feeR: rec.cost.feeR,
+        costFracOfPremium: rec.cost.costFracOfPremium,
+        grossR: typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? rec.grossR : null,
+        blocked: rec.blocked,
+        cell: typeof rec.cell === 'string' && rec.cell !== '' ? rec.cell : null,
+      });
+    } else {
+      tallies.costSamplesDropped += 1;
+    }
+  } else if (rec.gate === 'cost_bar') {
+    // Scoped to `cost_bar`: the other gates never carry a cost at all, and
+    // counting them here would publish `rowsMissingCostR === evaluated` on a gate
+    // that was never instrumented — a fake coverage hole.
+    tallies.costRowsMissing += 1;
   }
   decisionsTotal += 1;
   lastDecisionAt = rec.ts;
@@ -267,8 +380,25 @@ export function recordLiveEnforceDecision(
   now: number = Date.now(),
   // TRA-3216 — trailing options bag so the three pre-existing call sites keep
   // their positional signature unchanged.
-  opts?: { reasonCode?: string; book?: string | null; cell?: string | null },
+  opts?: {
+    reasonCode?: string;
+    book?: string | null;
+    cell?: string | null;
+    // TRA-3483 — the cost NUMERATOR and edge DENOMINATOR of the net-edge
+    // comparison, on every cost_bar verdict, admits included. Both optional:
+    // `cost: null` is the unusable-quote case, `grossR` non-finite is the
+    // unknown-edge case, and each has to stay distinguishable from the other.
+    cost?: LiveEnforceRecord['cost'] | null;
+    grossR?: number | null;
+  },
 ): void {
+  const cost = opts?.cost;
+  const costUsable =
+    !!cost
+    && Number.isFinite(cost.costR)
+    && Number.isFinite(cost.spreadR)
+    && Number.isFinite(cost.feeR)
+    && Number.isFinite(cost.costFracOfPremium);
   const rec: LiveEnforceRecord = {
     ts: now,
     etDay,
@@ -279,6 +409,8 @@ export function recordLiveEnforceDecision(
     ...(blocked && opts?.reasonCode ? { reasonCode: opts.reasonCode } : {}),
     ...(typeof opts?.book === 'string' && opts.book !== '' ? { book: opts.book } : {}),
     ...(typeof opts?.cell === 'string' && opts.cell !== '' ? { cell: opts.cell } : {}),
+    ...(costUsable ? { cost: cost! } : {}),
+    ...(typeof opts?.grossR === 'number' && Number.isFinite(opts.grossR) ? { grossR: opts.grossR } : {}),
   };
   applyAndAppend(rec);
 }
@@ -304,6 +436,23 @@ function applyAndAppend(rec: LiveEnforceRecord): void {
     lastAppendError = err instanceof Error ? err.message : String(err);
     log.warn('live-enforce-gate append failed', { reason: lastAppendError });
   }
+}
+
+/**
+ * TRA-3483 — is a persisted `cost` block usable? Every term must be a finite
+ * number: a partially-written block would otherwise put a NaN into the quantile
+ * sort, which silently corrupts the whole day's distribution rather than showing
+ * up as one bad row.
+ */
+function hydratedCost(cost: LiveEnforceRecord['cost']): boolean {
+  return (
+    !!cost
+    && typeof cost === 'object'
+    && Number.isFinite(cost.costR)
+    && Number.isFinite(cost.spreadR)
+    && Number.isFinite(cost.feeR)
+    && Number.isFinite(cost.costFracOfPremium)
+  );
 }
 
 /** What {@link hydrateLiveEnforceGateFromDisk} recovered (for the boot log line). */
@@ -361,6 +510,10 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
         : {}),
       ...(typeof rec.book === 'string' && rec.book !== '' ? { book: rec.book } : {}),
       ...(typeof rec.cell === 'string' && rec.cell !== '' ? { cell: rec.cell } : {}),
+      // TRA-3483 — a row written before the cost fields existed simply lacks
+      // them and hydrates as a MISSING sample (counted), never as a zero.
+      ...(hydratedCost(rec.cost) ? { cost: rec.cost! } : {}),
+      ...(typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? { grossR: rec.grossR } : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -436,6 +589,118 @@ export interface LiveEnforceCellSummary {
   evaluated: number;
   blocked: number;
   blockRate: number | null;
+  /**
+   * TRA-3483 — the `costR` distribution WITHIN this cell, which is the only place
+   * it can discriminate anything: every row in a cell shares the same
+   * `modeledGrossR` (the cell lower bound), so the cell-level cost spread IS the
+   * within-cell decision boundary a `k` would move. Null on cells with no sample.
+   */
+  costRQuantiles: CostRQuantiles | null;
+}
+
+/**
+ * TRA-3483 — a distribution, published as quantiles rather than a mean. The bar
+ * is a THRESHOLD, so what decides how many candidates a given `k` admits is the
+ * SHAPE of the cost distribution near it; a mean cannot answer that and a mean is
+ * all the deployed surface could have offered.
+ */
+export interface QuantileBlock {
+  /** Samples behind these quantiles. */
+  n: number;
+  p10: number | null;
+  p25: number | null;
+  p50: number | null;
+  p75: number | null;
+  p90: number | null;
+  min: number | null;
+  max: number | null;
+  mean: number | null;
+}
+
+/**
+ * TRA-3483 — the per-decision `costR` distribution: the NUMERATOR of
+ * `admit ⟺ costR ≤ k · modeledGrossR`, in the same `R_gate` unit as `barR`.
+ *
+ * The decomposition is published beside it because the two terms behave
+ * completely differently under a retune: `feeR` is a constant per share
+ * ($0.229/contract RT ÷ 100 ÷ risk), while `spreadR` is the candidate's OWN quote
+ * and is ~82% of the modeled bar (0.235 of 0.285). A `k` chosen against the
+ * aggregate without seeing which term moves is a `k` chosen against the fee floor.
+ */
+export interface CostRQuantiles extends QuantileBlock {
+  /** The spread-cross term alone, same R unit. */
+  spreadR: QuantileBlock;
+  /** The commission/fee term alone, same R unit. */
+  feeR: QuantileBlock;
+  /** Median of `spreadR / costR` — how much of the cost the quote (not the fee) is. */
+  medianSpreadShareOfCost: number | null;
+  /**
+   * Rows in this fold that carried NO usable `costR` (unusable quote at decision
+   * time, or written before TRA-3483). `n + rowsMissingCostR` is the fold's row
+   * count — publishing it is what stops a partial-coverage quantile from reading
+   * as the day's distribution.
+   */
+  rowsMissingCostR: number;
+  /** Samples dropped by the retention cap; > 0 ⇒ these quantiles are over a truncated head. */
+  samplesDropped: number;
+}
+
+/** TRA-3483 — one counterfactual `k` on the recorded row set. Decides nothing. */
+export interface NetEdgeShadowSweepRow {
+  k: number;
+  /** Rows the net-edge form at this `k` WOULD have admitted. */
+  admits: number;
+  /** admits / rowsEvaluated; null when the fold evaluated nothing. */
+  admitRate: number | null;
+  /**
+   * median(`modeledGrossR − costR`) over the rows this `k` admits — the R2
+   * acceptance statistic in TRA-3481, and the one thing that cannot be
+   * reconstructed from counts. Null when this `k` admits nothing.
+   */
+  medianNetR_admitted: number | null;
+}
+
+/**
+ * TRA-3483 — the counterfactual k-sweep. **A RECORDER, NOT A GATE.**
+ * `ENABLE_OPTION_COST_BAR_NET_EDGE` is `false`; every number here describes what
+ * a form that is NOT running would have done to rows a form that IS running
+ * already decided. Nothing in this block feeds a verdict.
+ */
+export interface NetEdgeShadowSummary {
+  /** The ET day folded, or null on the multi-day `retained` view. */
+  etDay: string | null;
+  /** ET days behind the fold (one entry on the day view). */
+  etDays: string[];
+  /** Every `cost_bar` verdict in the fold — the COVERAGE denominator. */
+  rowsRecorded: number;
+  /**
+   * Rows the sweep could evaluate: those carrying a usable `costR`. Rows with an
+   * unusable quote are EXCLUDED here and reported below, because under the real
+   * net-edge form they are `net_edge_quote_unusable` blocks at every `k` — they
+   * would depress every admit rate identically and tell a reader nothing.
+   */
+  rowsEvaluated: number;
+  /** Rows with no usable cost (unusable quote / pre-instrumentation). */
+  rowsMissingCostR: number;
+  /**
+   * Evaluated rows whose modeled edge was unknown. These fail closed at every
+   * `k` and are counted IN `rowsEvaluated` — an unknown edge is a real block
+   * under the net-edge form, not missing data about the cost side.
+   */
+  rowsMissingGrossR: number;
+  /** Evaluated rows the k-INDEPENDENT absolute ceiling blocks; a floor under every sweep row. */
+  rowsBlockedByAbsCeiling: number;
+  /** The ceiling those rows were tested against (resolved config, not a literal). */
+  absCostFracCeiling: number;
+  /**
+   * Admits under the CURRENTLY DEPLOYED form on the IDENTICAL row set
+   * (`rowsEvaluated`) — the baseline every sweep row is read against. Without it
+   * a sweep row is a number with no comparator.
+   */
+  flatFormAdmits: number;
+  /** Admits under the deployed form over ALL recorded rows, incl. those with no cost sample. */
+  flatFormAdmitsAllRows: number;
+  sweep: NetEdgeShadowSweepRow[];
 }
 
 export interface LiveEnforceGateSummary {
@@ -447,10 +712,27 @@ export interface LiveEnforceGateSummary {
   byScope: LiveEnforceScopeSummary[];
   /** Per-reason split of the BLOCKS, heaviest first (TRA-3216). */
   byReason: LiveEnforceReasonSummary[];
+  /**
+   * TRA-3483 (D2) — BLOCKED rows in this fold carrying NO `reasonCode`, i.e. rows
+   * `byReason` cannot see. `share` on every `byReason` row is of `blocked`, which
+   * INCLUDES these, so a nonzero value here says the rows do not sum to 1 by
+   * design and the gap is coverage, not a residual bucket. On the retained fold
+   * this is the 1759 pre-stamping blocks that made `gross_negative 0.0881` read
+   * as a rate.
+   */
+  blockedUnclassified: number;
   /** Per-live-book split, busiest first (TRA-3216). */
   byBook: LiveEnforceBookSummary[];
   /** Per-tape-cell split, busiest first; admits included (TRA-3391). */
   byCell: LiveEnforceCellSummary[];
+  /**
+   * TRA-3483 — the `costR` distribution over this fold. Non-null on `cost_bar`
+   * (even at `n: 0`, so "not instrumented" and "instrumented, no rows yet" stay
+   * distinguishable); null on every gate that records no cost.
+   */
+  costRQuantiles: CostRQuantiles | null;
+  /** TRA-3483 — the counterfactual k-sweep. Non-null on `cost_bar` only. */
+  netEdgeShadow: NetEdgeShadowSummary | null;
 }
 
 export interface LiveEnforceDurability {
@@ -486,8 +768,123 @@ function round(n: number, dp = 4): number {
   return Math.round(n * f) / f;
 }
 
+// ── TRA-3483 — quantiles and the counterfactual sweep ────────────────────────
+
+/**
+ * Nearest-rank quantile on an ALREADY-SORTED ascending array. Nearest-rank (not
+ * linear interpolation) on purpose: every value returned is a value that actually
+ * occurred, so `p50` names a real candidate's cost and can be traced back to a
+ * decision rather than being a synthetic point between two of them.
+ */
+function quantileSorted(sorted: number[], q: number): number | null {
+  if (sorted.length === 0) return null;
+  const rank = Math.ceil(q * sorted.length);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, rank - 1))]!;
+}
+
+/** Median of an arbitrary (unsorted) sample, or null when empty. */
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return quantileSorted([...values].sort((a, b) => a - b), 0.5);
+}
+
+function quantileBlock(values: number[]): QuantileBlock {
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const q = (p: number): number | null => {
+    const v = quantileSorted(sorted, p);
+    return v === null ? null : round(v, 6);
+  };
+  return {
+    n,
+    p10: q(0.10),
+    p25: q(0.25),
+    p50: q(0.50),
+    p75: q(0.75),
+    p90: q(0.90),
+    min: n > 0 ? round(sorted[0]!, 6) : null,
+    max: n > 0 ? round(sorted[n - 1]!, 6) : null,
+    mean: n > 0 ? round(sorted.reduce((a, b) => a + b, 0) / n, 6) : null,
+  };
+}
+
+/** Fold a sample list into the published `costR` distribution + its decomposition. */
+function costRQuantiles(samples: CostSample[], rowsMissingCostR: number, samplesDropped: number): CostRQuantiles {
+  const shares = samples
+    .filter((s) => s.costR !== 0 && Number.isFinite(s.spreadR / s.costR))
+    .map((s) => s.spreadR / s.costR);
+  const medianShare = median(shares);
+  return {
+    ...quantileBlock(samples.map((s) => s.costR)),
+    spreadR: quantileBlock(samples.map((s) => s.spreadR)),
+    feeR: quantileBlock(samples.map((s) => s.feeR)),
+    medianSpreadShareOfCost: medianShare === null ? null : round(medianShare),
+    rowsMissingCostR,
+    samplesDropped,
+  };
+}
+
+/** Options for the counterfactual sweep — resolved config, never literals. */
+export interface NetEdgeShadowOptions {
+  /** The `k` grid. Defaults to {@link NET_EDGE_SHADOW_K_SWEEP}. */
+  ks?: readonly number[];
+  /** The k-independent absolute ceiling the sweep replays. Defaults to the shipped config. */
+  absCostFracCeiling?: number;
+}
+
+/**
+ * TRA-3483 I2 — fold the recorded decisions into the counterfactual sweep.
+ *
+ * PURE and READ-ONLY. It replays {@link netEdgeShadowAdmits} — the same admit
+ * order the real form uses — over rows that a DIFFERENT form already decided. The
+ * `flatFormAdmits` baseline is taken from the same row set so the comparison is
+ * paired, not two populations.
+ */
+function netEdgeShadow(
+  tallies: GateTallies,
+  etDay: string | null,
+  etDays: string[],
+  rowsRecorded: number,
+  rowsBlocked: number,
+  opts: NetEdgeShadowOptions,
+): NetEdgeShadowSummary {
+  const ks = opts.ks ?? NET_EDGE_SHADOW_K_SWEEP;
+  const ceiling = opts.absCostFracCeiling ?? DEFAULT_NET_EDGE_BAR_CONFIG.absCostFracCeiling;
+  const samples = tallies.costSamples;
+  const sweep: NetEdgeShadowSweepRow[] = ks.map((k) => {
+    const admitted = samples.filter((s) => netEdgeShadowAdmits(s, k, ceiling));
+    const netR = admitted.map((s) => (s.grossR ?? Number.NaN) - s.costR).filter((v) => Number.isFinite(v));
+    const med = median(netR);
+    return {
+      k,
+      admits: admitted.length,
+      admitRate: samples.length > 0 ? round(admitted.length / samples.length) : null,
+      medianNetR_admitted: med === null ? null : round(med, 6),
+    };
+  });
+  return {
+    etDay,
+    etDays,
+    rowsRecorded,
+    rowsEvaluated: samples.length,
+    rowsMissingCostR: tallies.costRowsMissing,
+    rowsMissingGrossR: samples.filter((s) => s.grossR === null).length,
+    rowsBlockedByAbsCeiling: samples.filter((s) => s.costFracOfPremium > ceiling).length,
+    absCostFracCeiling: ceiling,
+    // The DEPLOYED form's verdict on the identical rows: `blocked === false`.
+    flatFormAdmits: samples.filter((s) => !s.blocked).length,
+    flatFormAdmitsAllRows: rowsRecorded - rowsBlocked,
+    sweep,
+  };
+}
+
 /** Fold a gate->tallies map for one or more days into the per-gate rows. */
-function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSummary[] {
+function foldGates(
+  acc: Map<LiveEnforceGate, GateTallies>,
+  etDay: string | null,
+  etDays: string[],
+  shadowOpts: NetEdgeShadowOptions,
+): LiveEnforceGateSummary[] {
   const out: LiveEnforceGateSummary[] = [];
   for (const gate of GATES) {
     const tallies = acc.get(gate) ?? emptyTallies();
@@ -531,16 +928,40 @@ function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSumma
     }
     byReason.sort((a, b) => b.blocked - a.blocked);
 
+    // TRA-3483 — bucket the cost samples by cell ONCE rather than filtering the
+    // full list per cell (that is O(cells × rows) on a 20k-row day).
+    const samplesByCell = new Map<string, CostSample[]>();
+    for (const s of tallies.costSamples) {
+      if (s.cell === null) continue;
+      const list = samplesByCell.get(s.cell);
+      if (list) list.push(s);
+      else samplesByCell.set(s.cell, [s]);
+    }
+
     const byCell: LiveEnforceCellSummary[] = [];
     for (const [cell, t] of tallies.byCell.entries()) {
+      const cellSamples = samplesByCell.get(cell) ?? [];
       byCell.push({
         cell,
         evaluated: t.evaluated,
         blocked: t.blocked,
         blockRate: t.evaluated > 0 ? round(t.blocked / t.evaluated) : null,
+        // Missing = this cell's rows that produced no sample. Derived from the
+        // cell's own `evaluated`, so a cell whose quotes were unusable shows the
+        // hole instead of publishing quantiles over the surviving minority.
+        costRQuantiles:
+          cellSamples.length > 0
+            ? costRQuantiles(cellSamples, Math.max(0, t.evaluated - cellSamples.length), 0)
+            : null,
       });
     }
     byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
+
+    // TRA-3483 — cost instrumentation is `cost_bar`-only. Published as an object
+    // at `n: 0` rather than omitted on that gate, so "the recorder is not
+    // deployed" cannot read the same as "deployed, no live candidates yet" —
+    // the same distinction the zero gate rows exist for.
+    const instrumented = gate === 'cost_bar';
 
     out.push({
       gate,
@@ -549,8 +970,15 @@ function foldGates(acc: Map<LiveEnforceGate, GateTallies>): LiveEnforceGateSumma
       blockRate: evaluated > 0 ? round(blocked / evaluated) : null,
       byScope,
       byReason,
+      blockedUnclassified: tallies.blockedUnclassified,
       byBook,
       byCell,
+      costRQuantiles: instrumented
+        ? costRQuantiles(tallies.costSamples, tallies.costRowsMissing, tallies.costSamplesDropped)
+        : null,
+      netEdgeShadow: instrumented
+        ? netEdgeShadow(tallies, etDay, etDays, evaluated, blocked, shadowOpts)
+        : null,
     });
   }
   return out;
@@ -580,6 +1008,15 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
       mergeAxis(into.byReason, tallies.byReason);
       mergeAxis(into.byBook, tallies.byBook);
       mergeAxis(into.byCell, tallies.byCell);
+      // TRA-3483 — samples concatenate (the retained sweep is over the union of
+      // days), still under the same cap so a runaway day cannot unbound the fold.
+      for (const s of tallies.costSamples) {
+        if (into.costSamples.length < MAX_COST_SAMPLES_PER_GATE_DAY) into.costSamples.push(s);
+        else into.costSamplesDropped += 1;
+      }
+      into.costRowsMissing += tallies.costRowsMissing;
+      into.costSamplesDropped += tallies.costSamplesDropped;
+      into.blockedUnclassified += tallies.blockedUnclassified;
     }
   }
   return acc;
@@ -591,15 +1028,22 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
  * that it is inert; `blocked > 0` is the direct evidence it is biting, and
  * `evaluated > 0 with blocked === 0` is an armed gate that passed everything.
  */
-export function summarizeLiveEnforceGate(etDay: string): LiveEnforceSummary {
+export function summarizeLiveEnforceGate(
+  etDay: string,
+  // TRA-3483 — the sweep's ceiling comes from the caller's RESOLVED net-edge
+  // config, not from a literal in here: a ceiling that drifts from the deployed
+  // one would publish a counterfactual for a form nobody could arm.
+  shadowOpts: NetEdgeShadowOptions = {},
+): LiveEnforceSummary {
   const day = byDay.get(etDay) ?? new Map<LiveEnforceGate, GateTallies>();
+  const retainedDays = [...byDay.keys()].sort();
   return {
     decisionsRecorded: decisionsTotal,
-    byGate: foldGates(day),
+    byGate: foldGates(day, etDay, [etDay], shadowOpts),
     retained: {
-      etDays: [...byDay.keys()].sort(),
+      etDays: retainedDays,
       retentionDays: RETAIN_MS / (24 * 60 * 60 * 1000),
-      byGate: foldGates(accumulateAllDays()),
+      byGate: foldGates(accumulateAllDays(), null, retainedDays, shadowOpts),
     },
     durability: {
       dataDir,

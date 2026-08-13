@@ -11,6 +11,10 @@ import {
   netEdgeBarVerdict,
   resolveNetEdgeBarConfig,
   describeNetEdgeBar,
+  // TRA-3483 — the recorder half.
+  netEdgeCostBreakdown,
+  netEdgeShadowAdmits,
+  NET_EDGE_SHADOW_K_SWEEP,
 } from './option-net-edge-bar.js';
 
 const CFG = { k: 1.0, feesPerContractRoundTrip: 0.229, absCostFracCeiling: 0.5 };
@@ -153,5 +157,104 @@ describe('describeNetEdgeBar', () => {
     expect(d.k).toBe(1.0);
     expect(d.raw.k).toBe('oops');
     expect(d.raw.fees).toBeNull();
+  });
+});
+
+// ── TRA-3483 — the recorder half (costR + the counterfactual sweep) ──────────
+
+describe('netEdgeCostBreakdown (TRA-3483)', () => {
+  it('decomposes cost into a quote term and a fee term that sum back to costR', () => {
+    const b = netEdgeCostBreakdown({ mark: 1.00, bid: 0.95, ask: 1.05, riskPerShare: 0.25 }, 0.229)!;
+    expect(b).not.toBeNull();
+    expect(b.spreadPerShare).toBeCloseTo(0.10, 10);
+    expect(b.feesPerShare).toBeCloseTo(0.00229, 10);
+    expect(b.costPerShare).toBeCloseTo(0.10229, 10);
+    // R basis is the trade's own (mark − stop) = 0.25.
+    expect(b.costR).toBeCloseTo(0.40916, 10);
+    expect(b.spreadR + b.feeR).toBeCloseTo(b.costR, 12);
+    expect(b.costFracOfPremium).toBeCloseTo(0.10229, 10);
+  });
+
+  it('falls back to the 0.25·mark R basis when the site carries no stop', () => {
+    const b = netEdgeCostBreakdown({ mark: 2.00, bid: 1.90, ask: 2.10 }, 0.229)!;
+    expect(b.riskPerShare).toBeCloseTo(0.50, 10);
+    // cost = 0.20 spread + 0.00229 fees = 0.20229 over a 0.50 R basis.
+    expect(b.costR).toBeCloseTo(0.40458, 10);
+  });
+
+  it('returns null — not a zero — on an unusable quote (the fail-closed case)', () => {
+    // A recorded 0 here would be a candidate whose cost is FREE. It has to be
+    // absent so the ledger can count it as missing coverage instead.
+    expect(netEdgeCostBreakdown({ mark: 1, bid: undefined, ask: 1.05 }, 0.229)).toBeNull();
+    expect(netEdgeCostBreakdown({ mark: 1, bid: 1.10, ask: 1.05 }, 0.229)).toBeNull(); // inverted
+    expect(netEdgeCostBreakdown({ mark: 0, bid: 0.95, ask: 1.05 }, 0.229)).toBeNull(); // no premium
+    expect(netEdgeCostBreakdown({ mark: Number.NaN, bid: 0.95, ask: 1.05 }, 0.229)).toBeNull();
+  });
+
+  it('reports EXACTLY the costR the gate would decide on (recorder cannot drift from the form)', () => {
+    // The whole point of TRA-3483: a recorder that computes its own copy of the
+    // arithmetic can silently measure a different number than the gate uses, and
+    // a `k` pre-registered against that number would be wrong in a way nothing
+    // could detect. Both call the same primitive; this pins it.
+    const inputs = { mark: 0.60, bid: 0.52, ask: 0.68, riskPerShare: 0.15 };
+    const b = netEdgeCostBreakdown(inputs, CFG.feesPerContractRoundTrip)!;
+    const v = netEdgeBarVerdict({ ...inputs, modeledGrossR: 0.5 }, CFG);
+    expect(v.costR).toBe(b.costR);
+    expect(v.costPerShare).toBe(b.costPerShare);
+    expect(v.costFracOfPremium).toBe(b.costFracOfPremium);
+  });
+});
+
+describe('netEdgeShadowAdmits (TRA-3483)', () => {
+  const ceiling = DEFAULT_NET_EDGE_BAR_CONFIG.absCostFracCeiling;
+
+  it('replays the ratio: admit iff costR <= k · grossR', () => {
+    const s = { costR: 0.30, costFracOfPremium: 0.10, grossR: 0.50 };
+    expect(netEdgeShadowAdmits(s, 0.50, ceiling)).toBe(false); // 0.30 > 0.25
+    expect(netEdgeShadowAdmits(s, 0.60, ceiling)).toBe(true); // 0.30 <= 0.30
+    expect(netEdgeShadowAdmits(s, 1.00, ceiling)).toBe(true);
+  });
+
+  it('is MONOTONE in k — a looser k can never admit fewer rows', () => {
+    const rows = [
+      { costR: 0.10, costFracOfPremium: 0.05, grossR: 0.40 },
+      { costR: 0.30, costFracOfPremium: 0.10, grossR: 0.40 },
+      { costR: 0.90, costFracOfPremium: 0.20, grossR: 0.40 },
+    ];
+    let prev = -1;
+    for (const k of NET_EDGE_SHADOW_K_SWEEP) {
+      const admits = rows.filter((r) => netEdgeShadowAdmits(r, k, ceiling)).length;
+      expect(admits).toBeGreaterThanOrEqual(prev);
+      prev = admits;
+    }
+  });
+
+  it('blocks on the k-INDEPENDENT absolute ceiling and on an unknown edge at every k', () => {
+    const overCeiling = { costR: 0.01, costFracOfPremium: 0.90, grossR: 99 };
+    const noEdge = { costR: 0.01, costFracOfPremium: 0.05, grossR: null };
+    for (const k of NET_EDGE_SHADOW_K_SWEEP) {
+      expect(netEdgeShadowAdmits(overCeiling, k, ceiling)).toBe(false);
+      expect(netEdgeShadowAdmits(noEdge, k, ceiling)).toBe(false);
+    }
+  });
+
+  it('agrees with the real verdict on the same candidate (shadow is not a second model)', () => {
+    const inputs = { mark: 1.00, bid: 0.95, ask: 1.05, riskPerShare: 0.25 };
+    const b = netEdgeCostBreakdown(inputs, CFG.feesPerContractRoundTrip)!;
+    for (const k of NET_EDGE_SHADOW_K_SWEEP) {
+      for (const grossR of [0.1, 0.409, 0.5, 1.2]) {
+        const real = netEdgeBarVerdict({ ...inputs, modeledGrossR: grossR }, { ...CFG, k }).admit;
+        const shadow = netEdgeShadowAdmits(
+          { costR: b.costR, costFracOfPremium: b.costFracOfPremium, grossR },
+          k,
+          CFG.absCostFracCeiling,
+        );
+        expect(shadow).toBe(real);
+      }
+    }
+  });
+
+  it('pins the pre-registered k grid TRA-3481 grades against', () => {
+    expect([...NET_EDGE_SHADOW_K_SWEEP]).toEqual([0.40, 0.45, 0.50, 0.5876, 0.65, 0.75, 1.00, 1.25]);
   });
 });

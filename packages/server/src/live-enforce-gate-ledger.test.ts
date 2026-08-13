@@ -261,4 +261,218 @@ describe('live-enforce-gate-ledger', () => {
     expect(retained.byReason).toEqual([{ reasonCode: 'not_in_universe', blocked: 1, share: 1 }]);
     expect(retained.byBook).toEqual([{ book: 'admin', evaluated: 2, blocked: 1, blockRate: 0.5 }]);
   });
+
+  // ── TRA-3483 — costR + the counterfactual k-sweep ──────────────────────────
+
+  /** A `cost_bar` decision carrying a full cost sample. */
+  function costRow(
+    blocked: boolean,
+    costR: number,
+    grossR: number | null,
+    opts: { cell?: string; costFrac?: number; ts?: number; day?: string } = {},
+  ) {
+    recordLiveEnforceDecision(
+      'cost_bar',
+      'single_leg_otm',
+      blocked,
+      opts.day ?? DAY,
+      blocked ? 'nope' : undefined,
+      opts.ts ?? 1_000,
+      {
+        reasonCode: blocked ? 'gross_negative' : undefined,
+        book: 'admin',
+        cell: opts.cell ?? 'single_leg_otm::0.50-0.55',
+        // 82/18 — the shipped bar's spread-cross vs fee decomposition.
+        cost: {
+          costR,
+          spreadR: costR * 0.82,
+          feeR: costR * 0.18,
+          costFracOfPremium: opts.costFrac ?? 0.10,
+        },
+        grossR,
+      },
+    );
+  }
+
+  it('publishes costRQuantiles + netEdgeShadow on cost_bar even at zero rows, and NEVER on the other gates', () => {
+    // "The recorder is not deployed" and "deployed, no live candidates yet" must
+    // not be the same JSON — the same reason every gate row is always present.
+    const c = gate(DAY, 'cost_bar');
+    expect(c.costRQuantiles).not.toBeNull();
+    expect(c.costRQuantiles!.n).toBe(0);
+    expect(c.costRQuantiles!.p50).toBeNull();
+    expect(c.netEdgeShadow).not.toBeNull();
+    expect(c.netEdgeShadow!.sweep).toHaveLength(8);
+    expect(gate(DAY, 'spread').costRQuantiles).toBeNull();
+    expect(gate(DAY, 'spread').netEdgeShadow).toBeNull();
+    expect(gate(DAY, 'universe').netEdgeShadow).toBeNull();
+  });
+
+  it('folds costR into nearest-rank quantiles and publishes the spread/fee split', () => {
+    for (const costR of [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]) costRow(true, costR, 0.2);
+    const q = gate(DAY, 'cost_bar').costRQuantiles!;
+    expect(q.n).toBe(10);
+    // Nearest-rank: every published quantile is a value that actually occurred,
+    // so p50 names a real candidate rather than a point between two of them.
+    expect(q.p10).toBeCloseTo(0.1, 6);
+    expect(q.p50).toBeCloseTo(0.5, 6);
+    expect(q.p90).toBeCloseTo(0.9, 6);
+    expect(q.min).toBeCloseTo(0.1, 6);
+    expect(q.max).toBeCloseTo(1.0, 6);
+    // The split is what a retune actually moves — the quote term dominates.
+    expect(q.spreadR.p50! + q.feeR.p50!).toBeCloseTo(q.p50!, 6);
+    expect(q.medianSpreadShareOfCost).toBeCloseTo(0.82, 4);
+    expect(q.rowsMissingCostR).toBe(0);
+  });
+
+  it('counts an unusable-quote row as MISSING, never as a zero cost', () => {
+    costRow(true, 0.4, 0.2);
+    // The fail-closed case: no usable quote, so no cost sample. A recorded 0
+    // here would describe a candidate that trades for free.
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'no quote', 1_001, {
+      reasonCode: 'net_edge_quote_unusable',
+      book: 'admin',
+      cell: 'single_leg_otm::0.50-0.55',
+      cost: null,
+      grossR: 0.2,
+    });
+    const c = gate(DAY, 'cost_bar');
+    expect(c.evaluated).toBe(2);
+    expect(c.costRQuantiles!.n).toBe(1);
+    expect(c.costRQuantiles!.rowsMissingCostR).toBe(1);
+    expect(c.costRQuantiles!.min).toBeCloseTo(0.4, 6);
+    // Excluded from the sweep denominator, but the hole is published beside it.
+    expect(c.netEdgeShadow!.rowsRecorded).toBe(2);
+    expect(c.netEdgeShadow!.rowsEvaluated).toBe(1);
+    expect(c.netEdgeShadow!.rowsMissingCostR).toBe(1);
+  });
+
+  it('sweeps all 8 k, monotonically, against the flat form on the IDENTICAL row set', () => {
+    // Three rows at gross 0.40R; two ADMITTED by the deployed flat form:
+    //   costR 0.10 → net-edge admits from k >= 0.25
+    //   costR 0.24 → from k >= 0.60
+    //   costR 0.50 → from k >= 1.25
+    costRow(false, 0.10, 0.40);
+    costRow(false, 0.24, 0.40);
+    costRow(true, 0.50, 0.40);
+
+    const shadow = gate(DAY, 'cost_bar').netEdgeShadow!;
+    expect(shadow.etDay).toBe(DAY);
+    expect(shadow.rowsEvaluated).toBe(3);
+    // The paired baseline: what the form that IS running did to these same rows.
+    expect(shadow.flatFormAdmits).toBe(2);
+    expect(shadow.flatFormAdmitsAllRows).toBe(2);
+    expect(shadow.sweep.map((r) => r.k)).toEqual([0.40, 0.45, 0.50, 0.5876, 0.65, 0.75, 1.00, 1.25]);
+    expect(shadow.sweep.map((r) => r.admits)).toEqual([1, 1, 1, 1, 2, 2, 2, 3]);
+    expect(shadow.sweep[0]!.admitRate).toBeCloseTo(1 / 3, 4);
+    // R2's statistic: median(grossR − costR) over what THIS k admits.
+    expect(shadow.sweep[0]!.medianNetR_admitted).toBeCloseTo(0.30, 6); // {0.30}
+    expect(shadow.sweep[4]!.medianNetR_admitted).toBeCloseTo(0.16, 6); // {0.30, 0.16}
+    expect(shadow.sweep[7]!.medianNetR_admitted).toBeCloseTo(0.16, 6); // {0.30, 0.16, −0.10}
+  });
+
+  it('an unknown edge is IN the sweep denominator and blocked at every k', () => {
+    // An unknown edge is a real net-edge block (fail-closed), not missing cost
+    // data — dropping it from the denominator would inflate every admit rate.
+    costRow(true, 0.10, null);
+    costRow(false, 0.10, 0.40);
+    const shadow = gate(DAY, 'cost_bar').netEdgeShadow!;
+    expect(shadow.rowsEvaluated).toBe(2);
+    expect(shadow.rowsMissingGrossR).toBe(1);
+    for (const row of shadow.sweep) expect(row.admits).toBe(1);
+  });
+
+  it('the k-INDEPENDENT absolute ceiling floors every sweep row, at the CALLER\'s ceiling', () => {
+    costRow(false, 0.01, 5.0, { costFrac: 0.90 }); // cheap in R, 90% of premium
+    const shadow = gate(DAY, 'cost_bar').netEdgeShadow!;
+    expect(shadow.absCostFracCeiling).toBe(0.5);
+    expect(shadow.rowsBlockedByAbsCeiling).toBe(1);
+    for (const row of shadow.sweep) expect(row.admits).toBe(0);
+    // The sweep replays the RESOLVED config, never a literal — otherwise it
+    // publishes a counterfactual for a form nobody could arm.
+    const loose = summarizeLiveEnforceGate(DAY, { absCostFracCeiling: 0.95 })
+      .byGate.find((g) => g.gate === 'cost_bar')!;
+    expect(loose.netEdgeShadow!.rowsBlockedByAbsCeiling).toBe(0);
+    expect(loose.netEdgeShadow!.sweep.every((r) => r.admits === 1)).toBe(true);
+  });
+
+  it('splits costR PER CELL — the only axis it can discriminate on, since a cell shares one grossR', () => {
+    costRow(true, 0.20, 0.30, { cell: 'single_leg_otm::0.50-0.55' });
+    costRow(true, 0.60, 0.30, { cell: 'single_leg_otm::0.50-0.55' });
+    costRow(true, 0.90, 0.05, { cell: 'single_leg_otm::0.00-0.10' });
+
+    const cells = gate(DAY, 'cost_bar').byCell;
+    const hot = cells.find((c) => c.cell === 'single_leg_otm::0.50-0.55')!;
+    expect(hot.evaluated).toBe(2);
+    expect(hot.costRQuantiles!.n).toBe(2);
+    expect(hot.costRQuantiles!.min).toBeCloseTo(0.20, 6);
+    expect(hot.costRQuantiles!.max).toBeCloseTo(0.60, 6);
+    const cold = cells.find((c) => c.cell === 'single_leg_otm::0.00-0.10')!;
+    expect(cold.costRQuantiles!.p50).toBeCloseTo(0.90, 6);
+  });
+
+  it('publishes blockedUnclassified so a byReason share reads as coverage, not a rate (D2)', () => {
+    // The retained-fold defect: 1759 of 1929 blocks predate reason stamping, so
+    // `gross_negative` at share 0.0881 reads as a rate when it is coverage.
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'old', 1_001, { book: 'admin' });
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'old', 1_002, { book: 'admin' });
+    costRow(true, 0.4, 0.2); // …and one that IS classified
+    const c = gate(DAY, 'cost_bar');
+    expect(c.blocked).toBe(3);
+    expect(c.blockedUnclassified).toBe(2);
+    expect(c.byReason).toEqual([{ reasonCode: 'gross_negative', blocked: 1, share: 0.3333 }]);
+    // The byReason rows do NOT sum to 1, and this field is what says why.
+    expect(c.byReason[0]!.share! + c.blockedUnclassified / c.blocked).toBeCloseTo(1, 3);
+  });
+
+  it('round-trips cost + grossR through disk and folds the sweep across retained days', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    costRow(false, 0.10, 0.40, { day: '2026-07-17', ts: 1_001 });
+    costRow(true, 0.50, 0.40, { day: DAY, ts: 1_002 });
+
+    const lines = readFileSync(liveEnforceGateLogPath(dir), 'utf8')
+      .trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines[0].cost.costR).toBeCloseTo(0.10, 6);
+    expect(lines[0].grossR).toBeCloseTo(0.40, 6);
+
+    clearLiveEnforceGateLedger();
+    expect(hydrateLiveEnforceGateFromDisk(dir, 2_000).records).toBe(2);
+    const retained = summarizeLiveEnforceGate(DAY).retained.byGate.find((g) => g.gate === 'cost_bar')!;
+    expect(retained.costRQuantiles!.n).toBe(2);
+    // The multi-day fold NAMES its days rather than claiming one of them.
+    expect(retained.netEdgeShadow!.etDay).toBeNull();
+    expect(retained.netEdgeShadow!.etDays).toEqual(['2026-07-17', DAY]);
+    expect(retained.netEdgeShadow!.rowsEvaluated).toBe(2);
+    expect(retained.netEdgeShadow!.flatFormAdmits).toBe(1);
+    expect(retained.netEdgeShadow!.sweep).toHaveLength(8);
+  });
+
+  it('a pre-TRA-3483 row on disk hydrates as MISSING cost, not as a zero', () => {
+    hydrateLiveEnforceGateFromDisk(dir, 1_000);
+    recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'legacy', 1_001, {
+      reasonCode: 'gross_negative', book: 'admin', cell: 'single_leg_otm::0.50-0.55',
+    });
+    clearLiveEnforceGateLedger();
+    hydrateLiveEnforceGateFromDisk(dir, 2_000);
+    const c = gate(DAY, 'cost_bar');
+    expect(c.costRQuantiles!.n).toBe(0);
+    expect(c.costRQuantiles!.rowsMissingCostR).toBe(1);
+    expect(c.netEdgeShadow!.sweep.every((r) => r.admits === 0)).toBe(true);
+  });
+
+  it('ACCEPTANCE (TRA-3483): the cost_bar row carries populated costRQuantiles AND all 8 sweep k', () => {
+    costRow(false, 0.12, 0.40);
+    costRow(true, 0.55, 0.40);
+    const c = gate(DAY, 'cost_bar');
+    expect(c.costRQuantiles!.n).toBeGreaterThan(0);
+    expect(c.costRQuantiles!.p10).not.toBeNull();
+    expect(c.costRQuantiles!.p90).not.toBeNull();
+    expect(c.netEdgeShadow!.sweep.map((r) => r.k))
+      .toEqual([0.40, 0.45, 0.50, 0.5876, 0.65, 0.75, 1.00, 1.25]);
+    expect(c.netEdgeShadow!.flatFormAdmits).toBe(1);
+    for (const row of c.netEdgeShadow!.sweep) {
+      expect(typeof row.admits).toBe('number');
+      expect(row.admitRate).not.toBeNull();
+    }
+  });
 });

@@ -304,3 +304,48 @@ describe('TRA-3394 item 1 — the live entry-delta ceiling', () => {
     expect(entryDeltaCeilingLiveVerdict(OTM, 0.7, OBSERVE).bandLabel).toBe('[0.55,inf)');
   });
 });
+
+// TRA-3483 item I3 — the cost_bar `byCell` STAMPING PATH, pinned.
+//
+// The 08-12 tape shows `byCell: []` on both the day row and the retained fold,
+// and QuantTrader's validity gate V4 VOIDS the next tape if it is still empty.
+// The empty read is explained (that session ran a pre-TRA-3391 build), but
+// "explained" is not "confirmed", and confirming it by waiting for the session
+// the gate would void is the wrong order.
+//
+// The engine stamps `cell: tape.cellKey ?? undefined` on every live cost_bar
+// record, so under the current build the field is absent IFF `cellKey` is null —
+// which happens IFF the candidate has no usable |delta| bucket. These pin that
+// the nominator's own admitted band always produces a cell, INCLUDING on the
+// decline paths, which is where an unstamped verdict would actually hide.
+describe('cost_bar cell stamping (TRA-3483 I3)', () => {
+  const OTM_S = OTM_SLEEVE_MANDATE_STRUCTURE;
+
+  it('every |delta| in the TRA-3401 armed nominator band [0.50, 0.55) yields a non-null cellKey', () => {
+    for (const delta of [0.50, 0.505, 0.52, 0.5449, 0.5499]) {
+      const v = tapeExpectancyVerdict({ structure: OTM_S, delta }, null);
+      expect(v.cellKey).not.toBeNull();
+      expect(v.bucket).not.toBeNull();
+      // A null table is the WORST case for stamping (nothing was ever folded)
+      // and it still declines WITH a cell — the decline paths are exactly where
+      // an unstamped verdict would hide.
+      expect(v.reasonCode).toBe('insufficient_evidence');
+    }
+  });
+
+  it('stamps a cell on the de-authorized and gross-negative declines too, not just on admits', () => {
+    // band_deauthorized — the mandate short-circuits ahead of the cell lookup,
+    // and the verdict still carries the cell it was decided for.
+    const deAuth = tapeExpectancyVerdict({ structure: OTM_S, delta: 0.05 }, null);
+    expect(deAuth.reasonCode).toBe('band_deauthorized');
+    expect(deAuth.cellKey).not.toBeNull();
+  });
+
+  it('only an UNUSABLE delta produces no cell — the one input a stamped nominee cannot have', () => {
+    for (const delta of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const v = tapeExpectancyVerdict({ structure: OTM_S, delta }, null);
+      expect(v.cellKey).toBeNull();
+      expect(v.reasonCode).toBe('gross_unknown');
+    }
+  });
+});

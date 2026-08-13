@@ -378,6 +378,9 @@ import {
   resolveNetEdgeBarConfig,
   isNetEdgeGovernedStructure,
   netEdgeBarVerdict,
+  // TRA-3483 — the cost side alone, recorded on every live cost_bar verdict so
+  // `k` (a ratio whose numerator nothing published) becomes identifiable.
+  netEdgeCostBreakdown,
 } from './option-net-edge-bar.js';
 // TRA-3216 (parent TRA-2760) — the LIVE OTM underlying allowlist. The scan is
 // handed the full ~614-name watchlist; this is the only universe restriction on
@@ -6846,18 +6849,36 @@ export class SignalEngine {
       // form's `shortfall_*` buckets. OFF by default ⇒ this branch is inert and
       // the flat bar below runs byte-for-byte unchanged.
       const netEdgeConfig = resolveNetEdgeBarConfig(process.env);
+      // TRA-3483 — the NUMERATOR of the net-edge comparison, computed for EVERY
+      // live cost_bar verdict regardless of which form decides it. `k` is a RATIO
+      // (`admit ⟺ costR ≤ k · modeledGrossR`) and until now only the denominator
+      // shipped, so `k` was unidentifiable from any deployed instrument no matter
+      // how clean the tape. This is a RECORDER: it computes, it does not decide.
+      const netEdgeInputs = {
+        mark: inputs.mark,
+        bid: quote?.bid,
+        ask: quote?.ask,
+        riskPerShare:
+          typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
+            ? inputs.mark - inputs.stopPrice
+            : undefined,
+      };
+      const cost = netEdgeCostBreakdown(netEdgeInputs, netEdgeConfig.feesPerContractRoundTrip);
+      const grossR = tapeEdgeR(tape);
+      const costOpts = {
+        cost: cost
+          ? {
+            costR: cost.costR,
+            spreadR: cost.spreadR,
+            feeR: cost.feeR,
+            costFracOfPremium: cost.costFracOfPremium,
+          }
+          : null,
+        grossR,
+      };
       if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
         const verdict = netEdgeBarVerdict(
-          {
-            mark: inputs.mark,
-            bid: quote?.bid,
-            ask: quote?.ask,
-            riskPerShare:
-              typeof inputs.stopPrice === 'number' && Number.isFinite(inputs.stopPrice)
-                ? inputs.mark - inputs.stopPrice
-                : undefined,
-            modeledGrossR: tapeEdgeR(tape),
-          },
+          { ...netEdgeInputs, modeledGrossR: grossR },
           netEdgeConfig,
         );
         recordLiveEnforceDecision(
@@ -6873,6 +6894,7 @@ export class SignalEngine {
             // TRA-3391 — the cell the edge came from, even when the net-edge form
             // is what declined: otherwise arming it erases the evidence axis.
             cell: tape.cellKey ?? undefined,
+            ...costOpts,
           },
         );
         return verdict.admit ? null : verdict.reason;
@@ -6895,6 +6917,11 @@ export class SignalEngine {
           reasonCode: tape.reasonCode ?? undefined,
           book: this.alertUsername ?? null,
           cell: tape.cellKey ?? undefined,
+          // TRA-3483 — the FLAT form is what is deployed, so this is the branch
+          // that actually produces the recorded tape TRA-3481 will read. The
+          // cost side is recorded here even though nothing in this branch
+          // consults it; that asymmetry is the whole point of the ticket.
+          ...costOpts,
         },
       );
       return tape.admit ? null : tape.reason;
