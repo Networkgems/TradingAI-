@@ -32,24 +32,75 @@
  *
  * ── Usage ────────────────────────────────────────────────────────────────────
  *
- *   node scripts/tra2906-rebuild-cash-flow.mjs                # dry run (default)
+ *   node scripts/tra2906-rebuild-cash-flow.mjs                # inventory + dry run
  *   node scripts/tra2906-rebuild-cash-flow.mjs --apply        # write the v2 file
+ *   node scripts/tra2906-rebuild-cash-flow.mjs --all          # every live book
+ *   node scripts/tra2906-rebuild-cash-flow.mjs --user=admin   # one book
  *   node scripts/tra2906-rebuild-cash-flow.mjs --start=2026-01-01
- *   node scripts/tra2906-rebuild-cash-flow.mjs --selftest     # no network/disk
+ *   node scripts/tra2906-rebuild-cash-flow.mjs --selftest     # no network, temp dir only
+ *
+ * The record is PER BOOK — `DATA_DIR/users/<username>/tradier-cash-flow.<env>.json`
+ * — because the reconcile that writes it runs per user context, gated on that
+ * book's `settings.mode === 'live'`. Run with no flags first: it prints the
+ * inventory of books actually carrying a v1 record, and REFUSES to guess when
+ * there is more than one.
  *
  * Must run ON THE HOST that owns the data dir (bqb1 for `production`): it needs
  * both `TRADIER_API_TOKEN` / `TRADIER_ACCOUNT_ID` and the persisted file.
  *
- * Exit codes:
+ * Exit codes (worst-wins across books; REFUSED outranks all):
  *   0  CLEAN     — dry run completed, or --apply wrote the v2 record
  *   1  REFUSED   — reconstruction did not reproduce the stored totals
- *   2  USAGE     — bad arguments / missing credentials
- *   3  BLIND     — could not read the file or reach the broker
+ *   2  USAGE     — bad arguments / missing credentials / >1 book, no intent
+ *   3  BLIND     — no record found, or could not read the file / reach the broker
  *   4  NOOP      — already v2; nothing to migrate
  */
 
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import {
+  existsSync, readFileSync, writeFileSync, copyFileSync, readdirSync,
+  mkdtempSync, mkdirSync, rmSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+/**
+ * TRA-2906 — locate every cash-flow record the SERVER actually writes.
+ *
+ * The server's path is `tradierCashFlowPath(ctx, env)` = `ctx.dataDir` +
+ * `tradier-cash-flow.<env>.json`, and `ctx.dataDir` is
+ * `userDataDir(username)` = `DATA_DIR/users/<username>` — one record PER BOOK,
+ * not one per host. The reconcile that writes it is gated on
+ * `settings.mode === 'live'`, and there is more than one live-mode book, so
+ * assuming a single record silently leaves the others on the old rule forever.
+ *
+ * The bare `DATA_DIR/tradier-cash-flow.<env>.json` this script originally
+ * resolved is the PRE-TRA-142 layout: that migration moved the root-level files
+ * down into `users/admin/`, so the root path is not merely empty, it is a path
+ * the current server never reads. It is reported separately and never migrated
+ * — repairing it would produce a confident success message about a file nothing
+ * loads, which is the failure mode this whole ticket exists to stop.
+ */
+function resolveRecordPaths(dataDir, env) {
+  const file = `tradier-cash-flow.${env}.json`;
+  const usersRoot = join(dataDir, 'users');
+  const records = [];
+  if (existsSync(usersRoot)) {
+    let entries = [];
+    try {
+      entries = readdirSync(usersRoot, { withFileTypes: true });
+    } catch {
+      entries = [];
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const path = join(usersRoot, e.name, file);
+      if (existsSync(path)) records.push({ username: e.name, path });
+    }
+  }
+  records.sort((a, b) => a.username.localeCompare(b.username));
+  const legacyRootPath = join(dataDir, file);
+  return { records, legacyRoot: existsSync(legacyRootPath) ? legacyRootPath : null, usersRoot };
+}
 
 // ── The classification rules, both of them ───────────────────────────────────
 //
@@ -119,7 +170,9 @@ function reconcileAgainstStored(stored, rebuilt) {
 
 const usd = (n) => `${n < 0 ? '-' : '+'}$${Math.abs(n).toFixed(2)}`;
 
-// ── Self-test: exercises the whole decision without network or disk ──────────
+// ── Self-test: exercises the whole decision with no network. Controls 6 build
+//    a throwaway fixture under the OS temp dir — the path layout is the thing
+//    under test, so it cannot be faked with pure functions. ────────────────────
 
 function selftest() {
   let failures = 0;
@@ -175,6 +228,35 @@ function selftest() {
   check('a stored date absent from the fetch is refused',
     !reconcileAgainstStored(extraStored, rebuiltOld).ok);
 
+  // 6. PATH RESOLUTION. The record lives at DATA_DIR/users/<username>/, and the
+  //    bare DATA_DIR/ path is the pre-TRA-142 layout the server stopped reading.
+  //    Resolving the old path found nothing and exited BLIND — safe, but it
+  //    stalled the migration. These controls pin the layout the server writes.
+  const tmp = mkdtempSync(join(tmpdir(), 'tra2906-'));
+  const file = 'tradier-cash-flow.production.json';
+  mkdirSync(join(tmp, 'users', 'admin'), { recursive: true });
+  mkdirSync(join(tmp, 'users', 'v0nni'), { recursive: true });
+  writeFileSync(join(tmp, 'users', 'admin', file), '{}');
+  writeFileSync(join(tmp, 'users', 'v0nni', file), '{}');
+  writeFileSync(join(tmp, file), '{}'); // the pre-TRA-142 root-level decoy
+  const resolved = resolveRecordPaths(tmp, 'production');
+  check('finds a record for EVERY book, not just the first',
+    resolved.records.length === 2
+    && resolved.records.map((r) => r.username).join(',') === 'admin,v0nni');
+  check('the pre-TRA-142 root record is reported but NOT migrated',
+    resolved.legacyRoot !== null && !resolved.records.some((r) => r.path === resolved.legacyRoot));
+  check('a book with no record is not invented',
+    resolveRecordPaths(join(tmp, 'nope'), 'production').records.length === 0);
+  check('a different env does not pick up production records',
+    resolveRecordPaths(tmp, 'sandbox').records.length === 0);
+  rmSync(tmp, { recursive: true, force: true });
+
+  // 7. Worst-wins. A book that REFUSED must not be averaged away by books that
+  //    migrated cleanly — the refusal IS the finding.
+  check('REFUSED outranks CLEAN across books', worstExit([0, 1, 0]) === 1);
+  check('BLIND outranks NOOP and CLEAN', worstExit([0, 4, 3]) === 3);
+  check('all clean stays clean', worstExit([0, 0]) === 0);
+
   console.log(`\n${failures === 0 ? 'CONTROLS PASS' : `CONTROLS FAILED (${failures})`}`);
   return failures === 0 ? 0 : 1;
 }
@@ -207,26 +289,9 @@ async function fetchAllCashEvents({ token, accountId, start, end }) {
   return out;
 }
 
-async function main() {
-  const argv = process.argv.slice(2);
-  if (argv.includes('--selftest')) return selftest();
-
-  const apply = argv.includes('--apply');
-  const env = (argv.find((a) => a.startsWith('--env='))?.split('=')[1] ?? 'production');
-  const start = (argv.find((a) => a.startsWith('--start='))?.split('=')[1] ?? '2026-01-01');
-  const end = new Date().toISOString().slice(0, 10);
-
-  const dataDir = (process.env.DATA_DIR ?? '').trim() || join(process.cwd(), 'data');
-  const path = join(dataDir, `tradier-cash-flow.${env}.json`);
-
-  console.log(`TRA-2906 cash-flow rebuild — env=${env} mode=${apply ? 'APPLY' : 'DRY RUN'}`);
-  console.log(`  record: ${path}`);
-  console.log(`  window: ${start} .. ${end}\n`);
-
-  if (!existsSync(path)) {
-    console.error(`BLIND — no record at ${path}. Set DATA_DIR, or run this on the host that owns it.`);
-    return 3;
-  }
+async function processRecord({ username, path }, { apply, start, end, fetchEvents }) {
+  console.log(`\n══ book: ${username}`);
+  console.log(`   record: ${path}`);
 
   let parsed;
   try {
@@ -258,17 +323,9 @@ async function main() {
     return 2;
   }
 
-  const token = (process.env.TRADIER_API_TOKEN ?? '').trim();
-  const accountId = (process.env.TRADIER_ACCOUNT_ID ?? '').trim();
-  if (!token || !accountId) {
-    console.error('\nUSAGE — TRADIER_API_TOKEN and TRADIER_ACCOUNT_ID must both be set. '
-      + 'This script has to run on the host that holds them.');
-    return 2;
-  }
-
   let events;
   try {
-    events = await fetchAllCashEvents({ token, accountId, start, end });
+    events = await fetchEvents();
   } catch (err) {
     console.error(`\nBLIND — broker history fetch failed: ${err.message}`);
     return 3;
@@ -343,6 +400,108 @@ async function main() {
   console.log(`  v1 backup: ${backup}`);
   console.log('  Classification is now a read-time decision; changing it again needs no migration.');
   return 0;
+}
+
+/**
+ * Worst-wins across books. REFUSED outranks everything: one book whose fetch
+ * failed its control is the finding, and it must not be averaged away by two
+ * books that migrated cleanly.
+ */
+const EXIT_PRECEDENCE = [1, 3, 2, 4, 0];
+
+function worstExit(codes) {
+  for (const c of EXIT_PRECEDENCE) if (codes.includes(c)) return c;
+  return 0;
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('--selftest')) return selftest();
+
+  const apply = argv.includes('--apply');
+  const all = argv.includes('--all');
+  const env = (argv.find((a) => a.startsWith('--env='))?.split('=')[1] ?? 'production');
+  const start = (argv.find((a) => a.startsWith('--start='))?.split('=')[1] ?? '2026-01-01');
+  const user = argv.find((a) => a.startsWith('--user='))?.split('=')[1] ?? null;
+  const end = new Date().toISOString().slice(0, 10);
+
+  const dataDir = (process.env.DATA_DIR ?? '').trim() || join(process.cwd(), 'data');
+
+  console.log(`TRA-2906 cash-flow rebuild — env=${env} mode=${apply ? 'APPLY' : 'DRY RUN'}`);
+  console.log(`  DATA_DIR: ${dataDir}`);
+  console.log(`  window:   ${start} .. ${end}`);
+
+  const { records, legacyRoot, usersRoot } = resolveRecordPaths(dataDir, env);
+
+  // The INVENTORY is printed before any selection, because "how many books
+  // carry a v1 record" is the fact this migration turns on and the fact a
+  // single-record assumption would hide.
+  console.log(`\nRecords found under ${usersRoot}: ${records.length}`);
+  for (const r of records) console.log(`  - ${r.username}  ${r.path}`);
+  if (legacyRoot) {
+    console.log(`\nNOTE — a PRE-TRA-142 root-level record exists at ${legacyRoot}.`);
+    console.log('  The current server never reads that path (TRA-142 moved it to users/admin/).');
+    console.log('  It is deliberately NOT migrated: repairing a file nothing loads would report');
+    console.log('  success for a correction that did not reach the calendar.');
+  }
+
+  // Fail CLOSED on zero. "No records" is indistinguishable from "wrong host" or
+  // "wrong DATA_DIR" from in here, and exiting 0 would let TRA-3595 report a
+  // completed migration having touched nothing.
+  if (records.length === 0) {
+    console.error(`\nBLIND — no ${env} cash-flow record under ${usersRoot}. Set DATA_DIR, or run `
+      + 'this on the host that owns the data dir (bqb1 for production).');
+    return 3;
+  }
+
+  let selected;
+  if (user) {
+    selected = records.filter((r) => r.username === user);
+    if (selected.length === 0) {
+      console.error(`\nUSAGE — no record for --user=${user}. Named books above.`);
+      return 2;
+    }
+  } else if (records.length === 1) {
+    selected = records;
+  } else if (all) {
+    selected = records;
+  } else {
+    // More than one book and no intent stated. Migrating just the first would
+    // leave the rest permanently on the old rule — half the fleet on each rule
+    // is exactly the half-applied state this ticket refused to accept.
+    console.error(`\nUSAGE — ${records.length} books carry a v1 record. Migrating one and stopping `
+      + 'leaves the others on the old rule permanently.');
+    console.error('  Re-run with --all to migrate every book, or --user=<name> to pick one.');
+    return 2;
+  }
+
+  const token = (process.env.TRADIER_API_TOKEN ?? '').trim();
+  const accountId = (process.env.TRADIER_ACCOUNT_ID ?? '').trim();
+  if (!token || !accountId) {
+    console.error('\nUSAGE — TRADIER_API_TOKEN and TRADIER_ACCOUNT_ID must both be set. '
+      + 'This script has to run on the host that holds them.');
+    return 2;
+  }
+
+  // One shared broker account backs every book (TRA-3081), so the event history
+  // is identical per book — fetch it once and let each record's own control
+  // decide whether that history reproduces ITS stored totals.
+  let cached = null;
+  const fetchEvents = async () => {
+    if (!cached) cached = await fetchAllCashEvents({ token, accountId, start, end });
+    return cached;
+  };
+
+  const codes = [];
+  for (const record of selected) {
+    codes.push(await processRecord(record, { apply, start, end, fetchEvents }));
+  }
+
+  if (selected.length > 1) {
+    console.log('\n══ summary');
+    selected.forEach((r, i) => console.log(`  ${r.username}: exit ${codes[i]}`));
+  }
+  return worstExit(codes);
 }
 
 main().then((code) => process.exit(code)).catch((err) => {
