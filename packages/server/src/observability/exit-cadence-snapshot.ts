@@ -57,11 +57,20 @@ export const RTH_CLOSE_UTC_MIN = 20 * 60;
  * `maxMs` is a running MAXIMUM, not a monotonic counter: `T1.maxMs - T0.maxMs`
  * is not "the max during RTH", it is a meaningless subtraction of two extremes.
  * It is published because the absolute T1 value is useful on its own.
+ *
+ * TRA-3444 — `exitWorkMs.maxMs` is the same shape of quantity one level in and
+ * is listed for the same reason. Its SIBLINGS are deliberately absent:
+ * `exitWorkMs.sumMs`, `exitWorkMs.samples` and `tickExitRegionMs.sumMs` ARE
+ * monotonic, and differencing that trio across a T0/T1 pair is precisely how the
+ * RTH-scoped PREFIX/exit-work split is obtained.
  */
 export const EXIT_CADENCE_NOT_DIFFERENCEABLE: readonly string[] = Object.freeze([
   'books.live.tickExitRegionMs.maxMs',
   'books.demo.tickExitRegionMs.maxMs',
   'tickExitRegionMs.maxMs',
+  'books.live.tickExitRegionMs.exitWorkMs.maxMs',
+  'books.demo.tickExitRegionMs.exitWorkMs.maxMs',
+  'tickExitRegionMs.exitWorkMs.maxMs',
 ]);
 
 export interface ExitCadenceSnapshotLine {

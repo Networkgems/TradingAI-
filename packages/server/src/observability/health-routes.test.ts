@@ -4176,6 +4176,8 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     rthTick?: number;
     boundaryIntervals?: number;
     closedIntervals?: number;
+    /** TRA-3444 — drive the interlock-region terms so the exit-work split can be controlled in both directions. */
+    tickExitRegionMs?: ExitCadenceHealth['tickExitRegionMs'];
   }): ExitCadenceHealth {
     return {
       enabled: true,
@@ -4194,7 +4196,8 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
       tickPassCount: o.rthTick ?? 0,
       decoupledSkips: emptyDecoupledExitSkips(),
       decoupledFireCount: 0,
-      tickExitRegionMs: { lastMs: null, maxMs: null, samples: 0, atOrAbove20s: 0, atOrAbove30s: 0 },
+      tickExitRegionMs: o.tickExitRegionMs
+        ?? { lastMs: null, maxMs: null, samples: 0, sumMs: 0, atOrAbove20s: 0, atOrAbove30s: 0, exitWorkMs: null },
       rth: {
         intervalHistogram: exitHistogram(o.rth.under, o.rth.over),
         decoupledPassCount: o.rthDecoupled ?? 1,
@@ -4603,6 +4606,109 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
       expect(body.tickExitRegionMs.samples).toBe(0);
       expect(body.books.live.tickExitRegionMs).not.toBeNull();
       expect(body.decoupledFireCount).toBe(0);
+    });
+
+    // ── TRA-3444 — the UNCENSORED exit-work split ───────────────────────────
+    //
+    // TRA-2268 has to decide whether narrowing `tickExitRegionActive` is safe,
+    // and needs to know how much of the region is exit-critical work versus
+    // prefix. The `signal.doTick` phase tape cannot tell it: `recordPhaseDuration`
+    // is a no-op below PHASE_TIMING_SLOW_MS, so an ABSENT phase and a phase that
+    // ran every tick at 999ms are byte-identical, and on the 2026-08-12 RTH tape
+    // the split was bounded only to [16,262s, 253,213s] — a factor of 15.6.
+    //
+    // These are the two-directional controls on the replacement: the route must
+    // be able to publish a real split AND to refuse when it has no measurement,
+    // and the refusal must be `null`, not a zero that reads like a measurement.
+    describe('TRA-3444 exit-work split', () => {
+      const region = (o: {
+        samples: number; sumMs: number; maxMs: number;
+        work?: { samples: number; sumMs: number; maxMs: number } | null;
+      }): ExitCadenceHealth['tickExitRegionMs'] => ({
+        lastMs: o.samples > 0 ? o.maxMs : null,
+        maxMs: o.samples > 0 ? o.maxMs : null,
+        samples: o.samples,
+        sumMs: o.sumMs,
+        atOrAbove20s: 0,
+        atOrAbove30s: 0,
+        exitWorkMs: o.work ?? null,
+      });
+
+      it('publishes `exitWorkMs` under BOTH books and at the fleet level', () => {
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'live-1', mode: 'live', lifetime: { under: 10, over: 0 }, rth: { under: 10, over: 0 },
+            tickExitRegionMs: region({ samples: 900, sumMs: 6_300_000, maxMs: 15_876, work: { samples: 900, sumMs: 810_000, maxMs: 4_100 } }),
+          }),
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 10, over: 0 }, rth: { under: 10, over: 0 },
+            tickExitRegionMs: region({ samples: 400, sumMs: 2_800_000, maxMs: 27_796, work: { samples: 400, sumMs: 200_000, maxMs: 9_000 } }),
+          }),
+        ]);
+
+        // Partitioned like its sibling — an unpartitioned figure is the defect
+        // TRA-2645 removed and TRA-2677 re-litigated.
+        expect(body.books.live.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 900, sumMs: 810_000, maxMs: 4_100 });
+        expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 400, sumMs: 200_000, maxMs: 9_000 });
+        // Fleet roll-up sums the counters and takes the max of the maxes.
+        expect(body.tickExitRegionMs.exitWorkMs).toEqual({ samples: 1_300, sumMs: 1_010_000, maxMs: 9_000 });
+
+        // THE POINT OF THE TICKET: the split is now computable, exactly, with no
+        // threshold anywhere in it. The live book's region was 12.9% exit-critical.
+        const live = body.books.live.tickExitRegionMs!;
+        expect(live.sumMs - live.exitWorkMs!.sumMs).toBe(5_490_000);
+        expect(live.exitWorkMs!.sumMs / live.sumMs).toBeCloseTo(0.1286, 4);
+      });
+
+      it('CONTAINMENT: exit work never exceeds the region time that contains it', () => {
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'live-1', mode: 'live', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: region({ samples: 900, sumMs: 6_300_000, maxMs: 15_876, work: { samples: 900, sumMs: 810_000, maxMs: 4_100 } }),
+          }),
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: region({ samples: 400, sumMs: 2_800_000, maxMs: 27_796, work: { samples: 400, sumMs: 200_000, maxMs: 9_000 } }),
+          }),
+        ]);
+        for (const terms of [body.tickExitRegionMs, body.books.live.tickExitRegionMs!, body.books.demo.tickExitRegionMs!]) {
+          expect(terms.exitWorkMs!.sumMs).toBeLessThanOrEqual(terms.sumMs);
+          expect(terms.exitWorkMs!.maxMs).toBeLessThanOrEqual(terms.maxMs!);
+          // One sample per closed region, so the split is over ONE population.
+          expect(terms.exitWorkMs!.samples).toBe(terms.samples);
+        }
+      });
+
+      it('refuses with NULL before the first sample — never 0-for-absent', () => {
+        const body = rollUpExitCadence([
+          exitEngine({ engine: 'live-1', mode: 'live', lifetime: { under: 1, over: 0 }, rth: { under: 1, over: 0 } }),
+          exitEngine({ engine: 'demo-1', mode: 'demo', lifetime: { under: 1, over: 0 }, rth: { under: 1, over: 0 } }),
+        ]);
+        expect(body.books.live.tickExitRegionMs!.exitWorkMs).toBeNull();
+        expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toBeNull();
+        expect(body.tickExitRegionMs.exitWorkMs).toBeNull();
+        // A 0 here would be read as "the region does no exit-critical work",
+        // which is the single most expensive wrong answer this route can give
+        // TRA-2268: it would make narrowing the interlock look free.
+        expect(body.books.live.tickExitRegionMs!.exitWorkMs).not.toEqual({ samples: 0, sumMs: 0, maxMs: 0 });
+      });
+
+      it('DROPS an engine that cannot answer rather than folding it in as a zero', () => {
+        // One engine with 900 regions behind it, one that booted a second ago.
+        // Counting the newcomer as 0 would halve the published exit-work share
+        // of a fleet where 57 of 58 engines are freshly booted.
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: region({ samples: 900, sumMs: 6_300_000, maxMs: 15_876, work: { samples: 900, sumMs: 810_000, maxMs: 4_100 } }),
+          }),
+          exitEngine({
+            engine: 'demo-2', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: region({ samples: 0, sumMs: 0, maxMs: 0, work: null }),
+          }),
+        ]);
+        expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 900, sumMs: 810_000, maxMs: 4_100 });
+      });
     });
   });
 });

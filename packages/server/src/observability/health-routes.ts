@@ -2692,12 +2692,46 @@ export interface ExitCadenceLifetimeTerms {
   intervalHistogram: Record<ExitIntervalBucket, number>;
 }
 
+/**
+ * TRA-3444 — the EXIT-CRITICAL half of the interlock region: `runEquityExitPass`
+ * + `runOptionsExitPass`, bracketed directly with `Date.now()` reads, which is
+ * exactly the set of containers the decoupled `refreshExitsOnly` pass re-runs.
+ *
+ * This is NOT derived from the `signal.doTick` phase tape, and cannot be:
+ * `recordPhaseDuration` is a no-op below PHASE_TIMING_SLOW_MS, so that tape is
+ * LEFT-CENSORED and an ABSENT phase is byte-identical to a phase that ran on
+ * every tick at 999ms. On the 2026-08-12 RTH tape that censoring bounded the
+ * PREFIX/RESIDUAL split only to within a factor of 15.6 — no share was
+ * publishable in either direction.
+ */
+export interface ExitCadenceExitWorkTerms {
+  /** Regions that committed a measurement. 1:1 with `ExitCadenceTickRegionTerms.samples` on any build carrying this field. */
+  samples: number;
+  /** Total exit-critical work. Monotonic ⇒ differenceable across a T0/T1 pair. */
+  sumMs: number;
+  /** Worst single region's exit-critical work. A running MAXIMUM ⇒ NOT differenceable. */
+  maxMs: number;
+}
+
 /** TRA-2257's suppression-window terms, per book (and fleet-summed at the top level). */
 export interface ExitCadenceTickRegionTerms {
   samples: number;
+  /**
+   * TRA-3444 — total region time over `samples` regions. The DENOMINATOR the
+   * split needs: PREFIX (the part a narrowed region would hoist out) is
+   * `sumMs - exitWorkMs.sumMs`, exactly, with no threshold anywhere in it.
+   */
+  sumMs: number;
   maxMs: number | null;
   atOrAbove20s: number;
   atOrAbove30s: number;
+  /**
+   * TRA-3444 — NULL until at least one engine in this population has closed a
+   * region. Never a zero-filled object: a zero would be a claim about a
+   * measurement not taken, and telling "absent" from "zero" is this field's
+   * entire purpose (TRA-1707 null discipline).
+   */
+  exitWorkMs: ExitCadenceExitWorkTerms | null;
 }
 
 /**
@@ -2855,9 +2889,32 @@ const totalOfExitHistogram = (h: Record<ExitIntervalBucket, number>) =>
 const atOrAbove30sOfExitHistogram = (h: Record<ExitIntervalBucket, number>) =>
   h.lt60s + h.lt120s + h.lt300s + h.gte300s;
 
+/**
+ * TRA-3444 — sum the exit-critical terms over a population, preserving the
+ * absent/zero distinction.
+ *
+ * Engines that have not closed a region yet publish `null` and are DROPPED from
+ * the sum rather than folded in as zeroes: a fleet where one engine has taken
+ * 900 regions and the rest booted a second ago must not read as "the other 57
+ * did no exit work". If NO engine can answer, the population cannot answer, and
+ * the result is `null` — never a zero-filled object.
+ */
+function sumTickExitWork(engines: ExitCadenceHealth[]): ExitCadenceExitWorkTerms | null {
+  const terms = engines
+    .map((e) => e.tickExitRegionMs.exitWorkMs)
+    .filter((w): w is ExitCadenceExitWorkTerms => w != null);
+  if (terms.length === 0) return null;
+  return {
+    samples: terms.reduce((n, w) => n + w.samples, 0),
+    sumMs: terms.reduce((n, w) => n + w.sumMs, 0),
+    maxMs: terms.reduce((m, w) => (w.maxMs > m ? w.maxMs : m), 0),
+  };
+}
+
 function sumTickExitRegion(engines: ExitCadenceHealth[]): ExitCadenceTickRegionTerms {
   return {
     samples: engines.reduce((n, e) => n + e.tickExitRegionMs.samples, 0),
+    sumMs: engines.reduce((n, e) => n + e.tickExitRegionMs.sumMs, 0),
     maxMs: engines.reduce<number | null>(
       (acc, e) => (e.tickExitRegionMs.maxMs != null && (acc == null || e.tickExitRegionMs.maxMs > acc)
         ? e.tickExitRegionMs.maxMs
@@ -2866,6 +2923,7 @@ function sumTickExitRegion(engines: ExitCadenceHealth[]): ExitCadenceTickRegionT
     ),
     atOrAbove20s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove20s, 0),
     atOrAbove30s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove30s, 0),
+    exitWorkMs: sumTickExitWork(engines),
   };
 }
 

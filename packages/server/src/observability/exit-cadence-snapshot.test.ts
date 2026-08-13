@@ -182,6 +182,28 @@ describe('TRA-2840 — the line itself', () => {
     expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain('books.demo.tickExitRegionMs.maxMs');
   });
 
+  it('TRA-3444 — the exit-work MAX is not differenceable; its counters are', () => {
+    // `exitWorkMs.maxMs` is a running maximum one level in, exactly like its
+    // parent, and `T1 - T0` on it is a subtraction of two extremes.
+    for (const book of ['books.live', 'books.demo']) {
+      expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain(`${book}.tickExitRegionMs.exitWorkMs.maxMs`);
+    }
+    expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain('tickExitRegionMs.exitWorkMs.maxMs');
+
+    // …and the OTHER direction, which is the half that matters: differencing
+    // `exitWorkMs.sumMs` / `samples` against `tickExitRegionMs.sumMs` across a
+    // T0/T1 pair IS how the RTH-scoped PREFIX split is obtained. Listing them
+    // here would forbid the one computation this instrument exists for.
+    for (const differenceable of [
+      'books.live.tickExitRegionMs.sumMs',
+      'books.live.tickExitRegionMs.exitWorkMs.sumMs',
+      'books.live.tickExitRegionMs.exitWorkMs.samples',
+      'tickExitRegionMs.sumMs',
+    ]) {
+      expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).not.toContain(differenceable);
+    }
+  });
+
   it('carries a marker Render text= can match, and an ET session date', () => {
     const line = buildExitCadenceSnapshotLine({
       mark: 'T1-close', nowMs: at('2026-08-05T20:00:00Z'),

@@ -65,6 +65,7 @@ import { recordExecutedOrder } from './agent-execution-caps-store.js';
 import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memory-store.js';
 import { getLatestMarketReview } from './market-review.js';
 import { withPhase, timeSyncPhase } from './phase-timing.js';
+import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
@@ -1170,8 +1171,30 @@ export interface ExitCadenceHealth {
     lastMs: number | null;
     maxMs: number | null;
     samples: number;
+    /**
+     * TRA-3444 — TOTAL region time over `samples` regions. Monotonic, so a
+     * T0/T1 pair differences into "region time during RTH". Without it the
+     * region is only ever readable as a max and a count, and PREFIX
+     * (`sumMs - exitWorkMs.sumMs`) has no denominator at all.
+     */
+    sumMs: number;
     atOrAbove20s: number;
     atOrAbove30s: number;
+    /**
+     * TRA-3444 — the EXIT-CRITICAL half of the region: `runEquityExitPass` +
+     * `runOptionsExitPass` and nothing else, i.e. exactly what the decoupled
+     * `refreshExitsOnly` pass re-runs and therefore exactly what a narrowed
+     * region would still have to serialise. Measured with two `Date.now()`
+     * reads per pass, NOT off the phase tape, which is left-censored at
+     * PHASE_TIMING_SLOW_MS and cannot distinguish an absent phase from one that
+     * ran every tick at 999ms.
+     *
+     * PREFIX — the part TRA-2268 could hoist out of the interlock — is
+     * `sumMs - exitWorkMs.sumMs`, exactly.
+     *
+     * NULL until the first region closes (TRA-1707 null discipline); never 0.
+     */
+    exitWorkMs: TickExitWorkTerms | null;
   };
   /**
    * TRA-2269 — the SAME instrument, scoped to the window it is a statement about.
@@ -3182,6 +3205,20 @@ export class SignalEngine {
   private tickExitRegionSamples = 0;
   private tickExitRegionAtOrAbove20s = 0;
   private tickExitRegionAtOrAbove30s = 0;
+  /**
+   * TRA-3444 — TOTAL region time, so the region has a denominator and not just a
+   * max. `sumMs - tickExitWork.sumMs` is PREFIX: the part of the interlock that
+   * is NOT exit-critical work and is therefore what TRA-2268 would be hoisting
+   * out if it narrows the region.
+   */
+  private tickExitRegionSumMs = 0;
+  /**
+   * TRA-3444 — the exit-critical half of the region, measured DIRECTLY. See
+   * `tick-exit-work.ts` for why the `signal.doTick` phase tape cannot answer
+   * this (left-censored at PHASE_TIMING_SLOW_MS ⇒ absent and 999ms-every-tick
+   * are the same bytes, and the split is bounded only to within 15.6x).
+   */
+  private readonly tickExitWork = new TickExitWorkMeter();
   // TRA-1350 — wall-clock (ms) of the last COMPLETED scan tick. Unlike
   // `lastTick` (stamped `Date.now()` at getState() serialization time, so it
   // always reads "now"), this only advances when `doTick()` actually finishes a
@@ -4724,6 +4761,11 @@ export class SignalEngine {
   private openTickExitRegion(): void {
     this.tickExitRegionActive = true;
     this.tickExitRegionOpenedAt = Date.now();
+    // TRA-3444 — arm the exit-critical accumulator in the SAME breath as the
+    // flag, for the same reason `tickExitRegionOpenedAt` is set here: a split
+    // whose numerator and denominator are armed at different instants is not a
+    // split of anything.
+    this.tickExitWork.beginRegion();
   }
 
   /**
@@ -4745,8 +4787,15 @@ export class SignalEngine {
     this.lastTickExitRegionMs = heldMs;
     if (heldMs > this.maxTickExitRegionMs) this.maxTickExitRegionMs = heldMs;
     this.tickExitRegionSamples += 1;
+    this.tickExitRegionSumMs += heldMs;
     if (heldMs >= 20_000) this.tickExitRegionAtOrAbove20s += 1;
     if (heldMs >= 30_000) this.tickExitRegionAtOrAbove30s += 1;
+    // TRA-3444 — book the region's exit-critical work against the SAME region,
+    // inside the same idempotency guard, so `exitWorkMs.samples` stays 1:1 with
+    // `samples` and the two can be differenced over one population. Past the
+    // early return above this is the second release of an already-closed region
+    // and must book nothing.
+    this.tickExitWork.commitRegion();
   }
 
   private stampExitPass(source: 'tick' | 'decoupled'): void {
@@ -4899,8 +4948,15 @@ export class SignalEngine {
         lastMs: this.tickExitRegionSamples > 0 ? this.lastTickExitRegionMs : null,
         maxMs: this.tickExitRegionSamples > 0 ? this.maxTickExitRegionMs : null,
         samples: this.tickExitRegionSamples,
+        // A SUM over `samples` regions, so 0-with-samples-0 is not ambiguous the
+        // way a bare `maxMs: 0` would be — it is read against the count beside it.
+        sumMs: this.tickExitRegionSumMs,
         atOrAbove20s: this.tickExitRegionAtOrAbove20s,
         atOrAbove30s: this.tickExitRegionAtOrAbove30s,
+        // TRA-3444 — NULL until the first region commits, never a zero-filled
+        // object: this counter exists precisely to tell "absent" from "zero",
+        // and publishing zeroes would rebuild the ambiguity it removes.
+        exitWorkMs: this.tickExitWork.snapshot(),
       },
       rth: {
         intervalHistogram: { ...this.rthExitIntervalHistogram },
@@ -5483,7 +5539,12 @@ export class SignalEngine {
     //     open as a real Tradier `buy_to_open` market order when creds are
     //     configured.
 
-    this.runEquityExitPass(prices);
+    // TRA-3444 — EXIT-CRITICAL BRACKET 1 of 2. This wrapper times the pass and
+    // nothing else: the tick-pacer yield below, and every reconcile between here
+    // and bracket 2, are PREFIX and must stay outside. Widening this bracket
+    // understates PREFIX, which makes narrowing the interlock look cheaper than
+    // it is — the expensive direction on a money-book interlock.
+    this.tickExitWork.measure(() => this.runEquityExitPass(prices));
     if (tickPacer.shouldYield()) await yieldToEventLoop(); // TRA-1942 tick pacer
 
     // TRA-220 fix: options exits run in BOTH demo and live so the demo paper
@@ -5575,7 +5636,10 @@ export class SignalEngine {
     // refresh, so a chase reads the same-age chain snapshot the marks do.
     await withPhase('signal.doTick.shadow-chases', () => this.advanceShadowChases());
 
-    await this.runOptionsExitPass(prices, tickPacer);
+    // TRA-3444 — EXIT-CRITICAL BRACKET 2 of 2. Same rule as bracket 1: these two
+    // containers are exactly what `refreshExitsOnly` re-runs, and therefore
+    // exactly what a narrowed region would still have to serialise.
+    await this.tickExitWork.measureAsync(() => this.runOptionsExitPass(prices, tickPacer));
     // TRA-2200 — exit evaluation for this tick is COMPLETE. Stamp the interval
     // (the two cadences dedup against this stamp) and release the interlock: the
     // remainder of the tick is entry-scan / cold-bar / MTF work that the decoupled
