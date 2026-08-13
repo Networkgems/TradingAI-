@@ -5,14 +5,20 @@
 // card intentionally omits the Target / R:R chips the intraday trading signals
 // carry, and renders no position/order state for either type.
 import type { TradeSignal, Sma200Signal } from '@trading-app/shared';
-import { fmt, fmtPrice, formatTime, signalLabel } from '../lib/format';
+import { fmt, fmtQuoteLevel, formatTime, signalLabel } from '../lib/format';
 
 /** Narrow a generic signal to an Sma200Signal. */
 export function isSma200Signal(sig: TradeSignal): sig is Sma200Signal {
   return sig.type === 'sma200_pullback' || sig.type === 'sma200_reclaim';
 }
 
-export function Sma200SignalCard({ sig }: { sig: Sma200Signal }) {
+// TRA-3390 (impl child of TRA-2628) — THIS is the card the live `ENR.DE` buy
+// renders on, and it printed `$165.70` / `$139.11` for a EUR instrument. The
+// currency is passed in by the caller off the watchlist row for the same symbol
+// (the Signals panel already holds `symbols`), so this card never re-derives it.
+// `currency` is optional and an absent value renders the level BARE — unknown is
+// not USD, and a card that quietly re-asserts dollars is the original defect.
+export function Sma200SignalCard({ sig, currency }: { sig: Sma200Signal; currency?: string }) {
   return (
     <div className="signal-card buy sma200-card">
       <div className="signal-header">
@@ -29,11 +35,11 @@ export function Sma200SignalCard({ sig }: { sig: Sma200Signal }) {
       <div className="signal-body sma200-body">
         <div className="sig-stat">
           <span>Entry</span>
-          <strong>{fmtPrice(sig.entryPrice)}</strong>
+          <strong>{fmtQuoteLevel(sig.entryPrice, currency)}</strong>
         </div>
         <div className="sig-stat">
           <span>Sugg. Stop</span>
-          <strong className="red">{fmtPrice(sig.stopLoss)}</strong>
+          <strong className="red">{fmtQuoteLevel(sig.stopLoss, currency)}</strong>
         </div>
         <div className="sig-stat">
           <span>RSI(14)</span>

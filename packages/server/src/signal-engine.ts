@@ -13,6 +13,9 @@ import { roundToCent } from '@trading-app/engine';
 import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
+// TRA-3390 (impl child of TRA-2628) — the entry-path currency refusal. See
+// `quoteCurrencyEntryVerdict` below for where it is consulted.
+import { quoteCurrencySizingVerdict } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
 // TRA-3068 — plus the split-calendar leg, which is the only one that can reach a
 // sub-2.0 corporate action (neither ratio nor continuity can, at any threshold).
@@ -518,6 +521,26 @@ export interface SymbolState {
   ask?: number;
   bidSize?: number;
   askSize?: number;
+  /**
+   * TRA-3390 (impl child of TRA-2628) — the currency `price` / `change` are
+   * denominated in, as reported by the source that answered for this row. Never
+   * inferred from the ticker suffix: `AZN.L` quotes in **GBp/GBX (pence)**, so a
+   * `.L → GBP` table is wrong by 100x, which is the same class of error as the
+   * `$`-on-a-KRW-number bug this field exists to fix.
+   *
+   * **ABSENT MEANS UNKNOWN, AND UNKNOWN IS NOT USD.** Every renderer must print
+   * an undefined currency with NO symbol at all (see `formatQuoteLevel`), and
+   * the entry path refuses to size against it on a foreign-suffixed listing (see
+   * `quoteCurrencySizingVerdict`). A silent USD default here would reproduce the
+   * original defect for every row the adapter was quiet on — the loud bug
+   * converted into a quiet one.
+   *
+   * Carried forward on the no-quote branch of `applyQuotes` alongside
+   * price/change/changePct: that branch republishes the previous tick's LEVEL,
+   * so it must republish the previous tick's UNIT or the carried number silently
+   * loses its denomination.
+   */
+  currency?: string;
 }
 
 export interface EngineState {
@@ -4353,6 +4376,11 @@ export class SignalEngine {
         ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
         ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
         ...(typeof q.askSize === 'number' ? { askSize: q.askSize } : {}),
+        // TRA-3390 — the unit travels with the level, from the SAME merged
+        // `fetchQuotes` result the level came from. Spread-when-present, never
+        // `?? 'USD'`: an omitted key is what makes every renderer downstream drop
+        // the currency symbol instead of asserting dollars.
+        ...(typeof q.currency === 'string' ? { currency: q.currency } : {}),
       });
     }
     // For symbols we attempted but couldn't quote, surface a status so the watchlist
@@ -4396,6 +4424,13 @@ export class SignalEngine {
         ...(typeof session.moveSuspectPrevClose === 'number'
           ? { moveSuspectPrevClose: session.moveSuspectPrevClose }
           : {}),
+        // TRA-3390 — carry the UNIT forward with the LEVEL. This branch
+        // republishes `prev.price` verbatim; dropping the currency here would
+        // turn a correctly-labelled `255,500.00 KRW` into a bare number (and, on
+        // any renderer that still defaulted, back into a dollar sign) the moment
+        // one fetch missed. Same argument as `moveSuspect`: what the carry
+        // republishes, the carry must keep true.
+        ...(typeof prev?.currency === 'string' ? { currency: prev.currency } : {}),
       });
     }
     // TRA-3387 — make the session fact durable the moment it changes, not on a timer. The
@@ -6742,6 +6777,31 @@ export class SignalEngine {
     const funnelMode = this.mode;
     const funnelEngineId = this.feedContextKey; // TRA-1834 — split per engine, never pooled
     recordEquityCandidate(funnelMode, funnelEngineId, 'sma200-pullback');
+    // TRA-3390 AC4 — the currency gate, and it runs BEFORE the capital-gate
+    // manifest bail on purpose.
+    //
+    // The live `ENR.DE` buy (EUR, `mode: "live"`) is held today ONLY by the
+    // manifest check immediately below — `display-only: sma200_pullback is not
+    // registered in the TRA-817 capital-gate manifest`. That containment has
+    // nothing to do with currency and evaporates the moment the strategy is
+    // registered. Ordering the currency refusal first is what makes the tape say
+    // `non_usd_quote_currency` rather than `capital_gate_manifest` for a foreign
+    // row, so the funnel counter proves this guard is the thing holding it — a
+    // filter that reduces nothing may simply have had nothing to reduce
+    // (TRA-2590), and behind the manifest bail this one would read as zero
+    // forever whether it worked or not.
+    const sma200CurrencyVerdict = this.quoteCurrencyEntryVerdict(signal.symbol);
+    if (!sma200CurrencyVerdict.allowed) {
+      signal.signalSkipReason = sma200CurrencyVerdict.reason;
+      log.warn('equity signal suppressed: quote currency is not the book currency', {
+        component: 'equity-scan', issue: 'TRA-3390', via: 'sma200-pullback',
+        sym: signal.symbol, signalType: signal.type,
+        currency: this.symbolState.get(signal.symbol)?.currency ?? null,
+        reason: sma200CurrencyVerdict.reason,
+      });
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'non_usd_quote_currency');
+      return;
+    }
     if (!isLiveEntryGatePassed(signal.type)) {
       const demoForwardTest =
         this.mode !== 'live'
@@ -7572,6 +7632,31 @@ export class SignalEngine {
    * equity entry chokepoints ONLY (routeEquitySignal / openSma200Pullback), never on
    * the exit/management paths, so positions still get managed inside the edges.
    */
+  /**
+   * TRA-3390 AC4 (impl child of TRA-2628) — **the currency gate on the entry path.**
+   *
+   * Consulted at the two equity entry chokepoints (`routeEquitySignal` and
+   * `openSma200Pullback`, the second of which opens the book directly and never
+   * passes through the first). TIGHTENING-ONLY: it can suppress an entry, never
+   * create one, so it is applied in BOTH modes.
+   *
+   * The decision and its reasoning live in `quoteCurrencySizingVerdict`
+   * (`@trading-app/shared`), where the two-directional controls grade it. The
+   * short version: the books are USD scalars with no FX layer, so a EUR entry
+   * does not mislabel a number, it produces a WRONG BOOK TOTAL — and every risk
+   * gate that divides by equity then grades against it.
+   *
+   * The currency is read off the engine's own `symbolState` row, i.e. off the
+   * quote the sizing is about to use, not off a separate lookup that could
+   * disagree with it. A symbol with no row at all reaches the same verdict path
+   * as an unknown currency: refused if the ticker is foreign-suffixed, admitted
+   * otherwise (which preserves today's behaviour for every US name).
+   */
+  private quoteCurrencyEntryVerdict(symbol: string): { allowed: true } | { allowed: false; reason: string } {
+    const currency = this.symbolState.get(symbol)?.currency;
+    return quoteCurrencySizingVerdict({ symbol, currency });
+  }
+
   private sessionEdgeBlackoutBlocked(now = Date.now()): boolean {
     const verdict = sessionEdgeBlackoutVerdict(now, this.resolveDemoFlagEnv());
     if (verdict.blocked) {
@@ -14670,6 +14755,22 @@ export class SignalEngine {
     // earlier in the tick and never route through here.
     if (this.sessionEdgeBlackoutBlocked()) {
       recordEquityEntryRejected(funnelMode, funnelEngineId, 'session_edge_blackout');
+      return null;
+    }
+
+    // TRA-3390 AC4 — a non-USD-quoted instrument may not open a position. Placed
+    // AFTER `no_quote` deliberately: the verdict is about the currency of the
+    // quote we are sizing against, so "no quote at all" must stay its own
+    // (retryable) rejection rather than being absorbed into this one.
+    const currencyVerdict = this.quoteCurrencyEntryVerdict(sym);
+    if (!currencyVerdict.allowed) {
+      signal.signalSkipReason = currencyVerdict.reason;
+      log.warn('equity signal suppressed: quote currency is not the book currency', {
+        component: 'equity-scan', issue: 'TRA-3390', via: source, sym,
+        signalType: signal.type, currency: this.symbolState.get(sym)?.currency ?? null,
+        reason: currencyVerdict.reason,
+      });
+      recordEquityEntryRejected(funnelMode, funnelEngineId, 'non_usd_quote_currency');
       return null;
     }
 

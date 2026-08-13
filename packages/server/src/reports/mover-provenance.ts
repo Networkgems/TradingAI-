@@ -70,6 +70,8 @@ import type {
   EodMover, EodReport, MoverProvenance, MoversFilterProvenance, MoversWriteTimeProvenance,
 } from '@trading-app/shared';
 import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR } from '@trading-app/shared';
+// TRA-3390 (impl child of TRA-2628) — currency-aware level rendering. See `moverCell`.
+import { formatQuoteLevel } from '@trading-app/shared';
 import { formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 
 /**
@@ -116,7 +118,18 @@ function num(x: number | null): string {
 }
 
 function moverCell(m: EodMover): string {
-  const price = Number.isFinite(m.price) ? `$${Math.abs(m.price).toFixed(2)}` : 'n/a';
+  // TRA-3390 (impl child of TRA-2628) — the READ-TIME half of the same lie.
+  //
+  // This banner re-prints the level of the very rows the movers table just
+  // corrected, with its own hard-coded `$`. Fixing `formatMoverMarkdownRow`
+  // alone would leave the suppression note asserting `$1,550,000.00` about a KRW
+  // row two paragraphs below a table that had stopped doing exactly that — which
+  // is worse than not fixing either, because the two surfaces would then
+  // disagree with each other about the same datum.
+  //
+  // `n/a` is retained for a non-finite price: that is "no number", a different
+  // fact from `formatQuoteLevel`'s "number with an unknown unit".
+  const price = Number.isFinite(m.price) ? formatQuoteLevel(Math.abs(m.price), m.currency) : 'n/a';
   const pct = Number.isFinite(m.changePct)
     ? `${m.changePct >= 0 ? '+' : ''}${m.changePct.toFixed(2)}%`
     : 'n/a';

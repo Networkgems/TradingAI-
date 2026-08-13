@@ -1,8 +1,15 @@
 import YahooFinance from 'yahoo-finance2';
 import { TradierStocksClient, type TradierEnv, type TradierEquityQuote } from '@trading-app/engine';
 import type { Candle, NewsItem, CorporateAction } from '@trading-app/shared';
-import { corporateActionInSessionWindow } from '@trading-app/shared';
+import { corporateActionInSessionWindow, normalizeQuoteCurrency } from '@trading-app/shared';
 import { fetchStooqQuote } from './stooq-feed.js';
+
+/**
+ * TRA-3390 — the currency of the venue the Tradier equity adapter queries. See
+ * `tradierQuoteToResult` for why a venue constant is a different (and sound)
+ * claim from a ticker-suffix inference table.
+ */
+const TRADIER_VENUE_CURRENCY = 'USD';
 
 const yf = new YahooFinance({
   suppressNotices: ['yahooSurvey'],
@@ -2121,6 +2128,17 @@ type QuoteResult = {
   ask?: number;
   bidSize?: number;
   askSize?: number;
+  /**
+   * TRA-3390 — the currency this quote's `price` / `change` are denominated in,
+   * as reported by the source that answered. Canonicalized through
+   * `normalizeQuoteCurrency` (which preserves the `GBp` pence quotation as
+   * `GBX`; see that function — the distinction is worth 100x on `AZN.L`).
+   *
+   * **ABSENT MEANS UNKNOWN, NOT USD.** The Stooq fallback carries no currency at
+   * all, so its rows arrive here undefined and every consumer renders them with
+   * no symbol rather than assuming dollars.
+   */
+  currency?: string;
 };
 
 /**
@@ -2135,6 +2153,15 @@ function tradierQuoteToResult(q: TradierEquityQuote): QuoteResult {
     volume: q.volume,
     change: q.change,
     changePct: q.changePct,
+    // TRA-3390 — Tradier's quote payload carries no currency field, so this is a
+    // property of THE ADAPTER'S OWN VENUE, not an inference from the ticker.
+    // Tradier's equity book is US-listed securities only; a foreign listing comes
+    // back in `unmatched_symbols` and never reaches this projection, so every row
+    // that DOES reach it is a US listing and is denominated in USD by
+    // construction. That is a different claim from a `.KS → KRW` suffix table:
+    // it is scoped to the one venue this function is a projection of, and it
+    // cannot be wrong for a symbol Tradier declined to answer for.
+    currency: TRADIER_VENUE_CURRENCY,
     ...(typeof q.bid === 'number' ? { bid: q.bid } : {}),
     ...(typeof q.ask === 'number' ? { ask: q.ask } : {}),
     ...(typeof q.bidSize === 'number' ? { bidSize: q.bidSize } : {}),
@@ -2162,6 +2189,11 @@ export function chartQuoteFromResult(result: {
     chartPreviousClose?: number;
     previousClose?: number;
     regularMarketVolume?: number;
+    /**
+     * TRA-3390 — Yahoo's chart `meta` carries the quote currency too (`KRW`,
+     * `GBp`, `TWD`…), so the keyless fallback is not a currency blind spot.
+     */
+    currency?: string;
   };
   quotes?: ReadonlyArray<{ close?: number | null; volume?: number | null }>;
 } | null | undefined): QuoteResult | null {
@@ -2193,7 +2225,11 @@ export function chartQuoteFromResult(result: {
     : (finite(meta.previousClose) && meta.previousClose > 0 ? meta.previousClose : NaN);
   const change = Number.isFinite(prevClose) ? price - prevClose : 0;
   const changePct = Number.isFinite(prevClose) && prevClose > 0 ? (change / prevClose) * 100 : 0;
-  return { price, volume, change, changePct };
+  // TRA-3390 — the keyless chart fallback answers for the currency too, so it is
+  // NOT a currency blind spot. Spread-when-present: a `meta` without `currency`
+  // yields an undefined currency, never a USD assumption.
+  const currency = normalizeQuoteCurrency(meta.currency);
+  return { price, volume, change, changePct, ...(currency !== undefined ? { currency } : {}) };
 }
 
 /**
@@ -2252,6 +2288,13 @@ export async function fetchQuote(symbol: string): Promise<QuoteResult | null> {
       volume: q.regularMarketVolume ?? 0,
       change: q.regularMarketChange ?? 0,
       changePct: q.regularMarketChangePercent ?? 0,
+      // TRA-3390 — the adapter's OWN answer for the unit. Yahoo returns `currency`
+      // on the quote (`KRW` for `005930.KS`, `GBp` for `AZN.L`, `TWD` for
+      // `2330.TW`). Absent => left undefined => rendered with no symbol; never
+      // backfilled to USD, and never derived from the ticker suffix.
+      ...(normalizeQuoteCurrency((q as { currency?: unknown }).currency) !== undefined
+        ? { currency: normalizeQuoteCurrency((q as { currency?: unknown }).currency)! }
+        : {}),
     };
   }
   if (q) console.warn(`[yahoo-feed] quote(${symbol}) returned no regularMarketPrice — trying Yahoo chart-quote fallback`);
@@ -2445,6 +2488,13 @@ async function fetchSecondaryQuote(symbol: string): Promise<QuoteResult | null> 
       volume: q.regularMarketVolume ?? 0,
       change: q.regularMarketChange ?? 0,
       changePct: q.regularMarketChangePercent ?? 0,
+      // TRA-3390 — the adapter's OWN answer for the unit. Yahoo returns `currency`
+      // on the quote (`KRW` for `005930.KS`, `GBp` for `AZN.L`, `TWD` for
+      // `2330.TW`). Absent => left undefined => rendered with no symbol; never
+      // backfilled to USD, and never derived from the ticker suffix.
+      ...(normalizeQuoteCurrency((q as { currency?: unknown }).currency) !== undefined
+        ? { currency: normalizeQuoteCurrency((q as { currency?: unknown }).currency)! }
+        : {}),
     };
   }
   // TRA-1035 — keyless Yahoo chart-quote before Stooq, mirroring fetchQuote's

@@ -5,7 +5,7 @@ import { useRef, useState } from 'react';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmt, fmtDollar, fmtPct, quoteStatusLabel, isQuoteMoveUnreliable } from '../../lib/format';
+import { fmtPct, fmtQuoteLevel, quoteStatusLabel, isQuoteMoveUnreliable } from '../../lib/format';
 import { useTableSort, sortRows, SortableTH } from '../../lib/sort.tsx';
 import { getStockWatchSortValue } from '../../lib/stockSort';
 import type { StockWatchSortKey } from '../../lib/stockSort';
@@ -134,13 +134,20 @@ export function StockWatchlistPanel({ token, symbols }: { token: string; symbols
             // has since failed keeps its badge instead of silently losing it.
             const moveUnreliable = isQuoteMoveUnreliable(s);
             const moveTitle = moveUnreliable
-              ? `Reported ${fmtPct(s.changePct)} (${fmtDollar(s.change)}) — rejected: implied previous close is not believable. Raw value retained; see moveSuspect.`
+              // TRA-3390 — the tooltip re-prints the CHANGE, so it is a
+              // currency-bearing level too and gets the same treatment as the cell.
+              ? `Reported ${fmtPct(s.changePct)} (${fmtQuoteLevel(s.change, s.currency, { signed: true })}) — rejected: implied previous close is not believable. Raw value retained; see moveSuspect.`
               : undefined;
             return (
             <tr key={s.symbol} className={s.lastUpdated === 0 || moveUnreliable ? '' : s.change >= 0 ? 'up' : 'down'}>
               <td className="symbol">{s.symbol}{moveUnreliable && <span className="quote-suspect-badge" title={moveTitle}> ⚠ suspect</span>}</td>
-              <td className="price">{s.lastUpdated === 0 ? '—' : `$${fmt(s.price)}`}</td>
-              <td className={s.lastUpdated === 0 || moveUnreliable ? 'muted' : s.change >= 0 ? 'green' : 'red'} title={moveTitle}>{s.lastUpdated === 0 || moveUnreliable ? '—' : fmtDollar(s.change)}</td>
+              {/* TRA-3390 — 16 of the ~670 universe rows are foreign listings quoted in
+                  their local currency, and this cell hard-coded `$` on every one of
+                  them. `fmtQuoteLevel` prints the unit the adapter reported, and
+                  prints NO symbol when it reported none. `changePct` (next cell but
+                  one) is unit-free and is deliberately untouched. */}
+              <td className="price">{s.lastUpdated === 0 ? '—' : fmtQuoteLevel(s.price, s.currency)}</td>
+              <td className={s.lastUpdated === 0 || moveUnreliable ? 'muted' : s.change >= 0 ? 'green' : 'red'} title={moveTitle}>{s.lastUpdated === 0 || moveUnreliable ? '—' : fmtQuoteLevel(s.change, s.currency, { signed: true })}</td>
               <td className={s.lastUpdated === 0 || moveUnreliable ? 'muted' : s.changePct >= 0 ? 'green' : 'red'} title={moveTitle}>{s.lastUpdated === 0 || moveUnreliable ? '—' : fmtPct(s.changePct)}</td>
               <td>{s.lastUpdated === 0 ? '—' : (s.volume / 1_000_000).toFixed(1) + 'M'}</td>
               <td className="social-td">

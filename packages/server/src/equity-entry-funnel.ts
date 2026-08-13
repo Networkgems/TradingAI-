@@ -109,6 +109,7 @@ export type EquityEntryRejectReason =
   | 'live_client_missing'        // live only — Tradier equity client not configured
   | 'live_order_rejected'        // live only — Tradier rejected/cancelled the OTOCO bracket
   | 'sizing_returned_no_position'// the account/mirror returned null (e.g. sized below a floor)
+  | 'non_usd_quote_currency'     // TRA-3390 — quote is not USD (or unknown on a foreign listing); the book has no FX layer
   // ── openSma200Pullback only (its gates are per-candidate, not per-pass) ──────
   | 'capital_gate_manifest'      // TRA-819/817 — not registered as an OOS-passed live entry
   | 'auto_trading_disabled'      // TRA-544 — auto-trading off / agent layer owns the decision

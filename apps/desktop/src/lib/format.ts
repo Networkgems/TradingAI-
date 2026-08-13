@@ -1,6 +1,6 @@
 // TRA-419 — pure string/number utilities extracted from App.tsx.
 // No JSX or React imports allowed in this file.
-import { isMoveSuspect, type QuoteMoveRow } from '@trading-app/shared';
+import { isMoveSuspect, formatQuoteLevel, type QuoteMoveRow } from '@trading-app/shared';
 
 // TRA-318 follow-up: defend against null/undefined/NaN/non-finite numeric
 // fields arriving from the API (e.g. `Number.POSITIVE_INFINITY` reconciled
@@ -42,6 +42,30 @@ export function fmtSignedIntPct(n: number | null | undefined): string {
 export function fmtPrice(n: number | null | undefined, decimals = 2) {
   if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
   return `$${fmt(n, decimals)}`;
+}
+
+/**
+ * TRA-3390 (impl child of TRA-2628) — a **per-symbol market level** (quote price,
+ * signal entry/stop/target) rendered in the currency it is actually quoted in.
+ *
+ * ── When to use this instead of `fmtPrice` / `fmtDollar` ─────────────────────
+ * Use it whenever the number is a price OF A SYMBOL. `fmtPrice`/`fmtDollar` stay
+ * correct — and stay in use — for BOOK quantities: P&L, equity, cash, position
+ * notionals. Those are USD by construction and are kept that way by the AC4
+ * entry guard, which refuses to open a position on a non-USD-quoted instrument,
+ * so no foreign notional can enter the book in the first place.
+ *
+ * Delegates to the shared `formatQuoteLevel` so the desktop and the server EOD
+ * report cannot drift on the same row. `undefined` currency renders bare — the
+ * absent case is UNKNOWN, never USD.
+ */
+export function fmtQuoteLevel(
+  n: number | null | undefined,
+  currency: string | undefined,
+  opts?: { decimals?: number; signed?: boolean },
+) {
+  if (n == null || !Number.isFinite(n) || Math.abs(n) >= 1e15) return '—';
+  return formatQuoteLevel(n, currency, opts);
 }
 
 export function timeAgo(ts: number) {

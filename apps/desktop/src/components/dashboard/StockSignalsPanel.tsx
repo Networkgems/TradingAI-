@@ -4,7 +4,7 @@ import type { TradeSignal, EngineMarketReviewState } from '@trading-app/shared';
 import { HTTP_URL } from '../../server-url';
 import { logger } from '../../lib/logger';
 import { useToast } from '../../lib/toast.tsx';
-import { fmt, fmtSignedIntPct, formatTime, signalLabel } from '../../lib/format';
+import { fmtSignedIntPct, fmtQuoteLevel, formatTime, signalLabel } from '../../lib/format';
 import { RegimeBanner } from '../RegimeBanner';
 import { SignalOptionRow } from '../SignalOptionRow';
 import { Sma200SignalCard, isSma200Signal } from '../Sma200SignalCard';
@@ -83,7 +83,17 @@ export function StockSignalsPanel({
         <>
           {tradeSignals.length > 0 && (
             <div className="signal-list">
-              {tradeSignals.map(sig => (
+              {tradeSignals.map(sig => {
+                // TRA-3390 (impl child of TRA-2628) — a signal's entry / stop /
+                // target are levels in the SYMBOL's quote currency, not the book's.
+                // This card printed `$165.70 / $139.11 / $218.89` for the live
+                // `ENR.DE` buy, which is EUR. The currency is read off the
+                // watchlist row for the same symbol — the panel already receives
+                // `symbols` — rather than re-derived here, so the card and the
+                // watchlist can never disagree about one instrument's unit.
+                // Unknown => rendered bare, never as dollars.
+                const sigCurrency = symbols.find(x => x.symbol === sig.symbol)?.currency;
+                return (
                 <div key={sig.id} className={`signal-card ${sig.side}`}>
                   <div className="signal-header">
                     <span className="signal-symbol">{sig.symbol}</span>
@@ -94,12 +104,12 @@ export function StockSignalsPanel({
                   <div className="signal-body">
                     <div className="sig-stat">
                       <span>Entry</span>
-                      <strong>${fmt(sig.entryPrice)}</strong>
+                      <strong>{fmtQuoteLevel(sig.entryPrice, sigCurrency)}</strong>
                     </div>
                     <div className="sig-stat">
                       <span>Stop</span>
                       <strong className="red">
-                        ${fmt(sig.stopLoss)}
+                        {fmtQuoteLevel(sig.stopLoss, sigCurrency)}
                         {sig.entryPrice > 0 && (
                           <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.stopLoss - sig.entryPrice) / sig.entryPrice * 100)})</span>
                         )}
@@ -108,7 +118,7 @@ export function StockSignalsPanel({
                     <div className="sig-stat">
                       <span>Target</span>
                       <strong className="green">
-                        ${fmt(sig.takeProfit)}
+                        {fmtQuoteLevel(sig.takeProfit, sigCurrency)}
                         {sig.entryPrice > 0 && (
                           <span className="sig-stat-pct"> ({fmtSignedIntPct((sig.takeProfit - sig.entryPrice) / sig.entryPrice * 100)})</span>
                         )}
@@ -121,7 +131,8 @@ export function StockSignalsPanel({
                   </div>
                   <SignalOptionRow sig={sig} />
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
           {/* TRA-451 — "SMA-200" category: daily-bar trend-filter signals.
@@ -139,8 +150,15 @@ export function StockSignalsPanel({
                 </span>
               </div>
               <div className="signal-list">
+                {/* TRA-3390 — same symbol lookup as the trade-signal cards above:
+                    one source for a symbol's unit, so the two card kinds cannot
+                    disagree. */}
                 {sma200Signals.map(sig => (
-                  <Sma200SignalCard key={sig.id} sig={sig} />
+                  <Sma200SignalCard
+                    key={sig.id}
+                    sig={sig}
+                    currency={symbols.find(x => x.symbol === sig.symbol)?.currency}
+                  />
                 ))}
               </div>
             </div>

@@ -18,6 +18,9 @@ import { EXECUTION_ASSET_CLASSES, type ExecutionQualityKpi } from '@trading-app/
 // TRA-2610 — the consumer-side plausibility predicate. Reads `moveSuspect` AND
 // re-executes the rule, so a lost stamp cannot promote a fabrication.
 import { isMoveSuspect, isMoveSuspectNow, assessLevelContinuity, describeLevelContinuity } from '@trading-app/shared';
+// TRA-3390 (impl child of TRA-2628) — currency-aware level rendering. See
+// `formatMoverMarkdownRow`.
+import { formatQuoteLevel } from '@trading-app/shared';
 // TRA-3068 — the split-calendar leg: the ONLY instrument that can reach a
 // sub-2.0 corporate action, because the other two are internal-consistency tests
 // and an unadjusted action is internally consistent (measured, TRA-3065).
@@ -490,7 +493,18 @@ function top5Movers(
     .filter(rankable)
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
-    .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));
+    // TRA-3390 — carry the UNIT with the LEVEL. `price` here is `SymbolState.price`
+    // verbatim, in whatever currency the quote arrived in; the ranking is on
+    // `|changePct|` and is unchanged, because a local-currency percentage IS
+    // comparable across listings (AC3) while a local-currency level is not.
+    // Spread-when-present so a row whose adapter reported no currency stays
+    // absent here and renders bare, rather than being minted as USD.
+    .map(s => ({
+      symbol: s.symbol,
+      price: s.price,
+      changePct: s.changePct,
+      ...(typeof s.currency === 'string' ? { currency: s.currency } : {}),
+    }));
 
   // ── TRA-3296 — PERSIST what the four censuses above only LOGGED. ─────────────
   //
@@ -971,10 +985,23 @@ export const MOVERS_MARKDOWN_HEADING = '## Top 5 Movers (Watchlist)';
  * rows flagged", which reads identically to "nothing was wrong".
  */
 export function formatMoverMarkdownRow(m: EodMover): string {
-  const usd = (n: number) =>
-    '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // TRA-3390 (impl child of TRA-2628) — THE ROW THIS TICKET WAS FILED ON.
+  //
+  // This function printed `| 000660.KS | $1,550,000.00 | -14.65% |` on 2026-07-28:
+  // SK Hynix, quoted in KRW, with a dollar sign on it, in the document a human
+  // reads as the session summary. The old local `usd()` helper hard-coded the
+  // `$`, so every one of the 16 foreign-suffixed universe rows that reached this
+  // table was mislabelled by construction.
+  //
+  // `formatQuoteLevel` renders USD identically to the old helper (same `en-US`
+  // grouping, same 2dp), renders a known foreign currency with its ISO code, and
+  // renders an UNKNOWN currency as a bare number with no symbol at all. That
+  // last branch is what every archived pre-TRA-3390 row lands on — stating "we
+  // do not know the unit" rather than asserting the wrong one.
+  //
+  // `changePct` is untouched: it ranks across currencies and always did.
   const pnlSign = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
-  return `| ${m.symbol} | ${usd(m.price)} | ${pnlSign(m.changePct)}% |`;
+  return `| ${m.symbol} | ${formatQuoteLevel(Math.abs(m.price), m.currency)} | ${pnlSign(m.changePct)}% |`;
 }
 
 function buildMarkdown(

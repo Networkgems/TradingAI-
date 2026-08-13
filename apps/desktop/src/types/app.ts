@@ -29,6 +29,12 @@ export interface SymbolState {
   // TRA-3243 — the `impliedPrevClose` the row was condemned on, so the badge's
   // tooltip can name the datum rather than assert a verdict.
   moveSuspectPrevClose?: number;
+  // TRA-3390 (impl child of TRA-2628) — the currency `price` / `change` are quoted
+  // in, as reported by the source that answered. 16 of the ~670 universe rows are
+  // foreign listings and this UI printed `$` on all of them. ABSENT MEANS UNKNOWN,
+  // NOT USD: render it through `fmtQuoteLevel`, which drops the symbol entirely
+  // rather than asserting dollars over a number it cannot denominate.
+  currency?: string;
 }
 
 export interface AppState {

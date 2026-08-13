@@ -108,6 +108,44 @@ describe('StockWatchlistPanel (TRA-422)', () => {
     expect(screen.getByText('AAPL')).toBeInTheDocument();
   });
 
+  // ── TRA-3390 (impl child of TRA-2628) — AC5, on the rendered DOM ────────────
+  //
+  // "A positive control must contain what it detects": the fixture holds real
+  // non-USD rows (`005930.KS` at 255500 KRW, `AZN.L` at 11714 GBp) rather than a
+  // synthetic placeholder, and both directions are asserted — a renderer that
+  // simply stopped printing money would pass the first assertion alone.
+  it('renders a foreign listing WITHOUT `$`, and a USD row WITH it', () => {
+    const { container } = renderWithToast(
+      <StockWatchlistPanel
+        token="t"
+        symbols={[
+          symbol({ symbol: '005930.KS', price: 255500, change: -12000, changePct: -4.48, currency: 'KRW' }),
+          symbol({ symbol: 'AZN.L', price: 11714, change: 220, changePct: 1.91, currency: 'GBX' }),
+          symbol({ symbol: 'AAPL', price: 211.2, change: 1.2, changePct: 0.57, currency: 'USD' }),
+        ]}
+      />,
+    );
+    const rowText = (sym: string) =>
+      [...container.querySelectorAll('tr')].find(tr => tr.textContent?.includes(sym))!.textContent!;
+
+    expect(rowText('005930.KS')).not.toContain('$');
+    expect(rowText('005930.KS')).toContain('255,500.00 KRW');
+    expect(rowText('AZN.L')).not.toContain('$');
+    // Pence stay pence — not silently divided by 100 into pounds.
+    expect(rowText('AZN.L')).toContain('11,714.00 GBX');
+    // The other direction, same table, same render.
+    expect(rowText('AAPL')).toContain('$211.20');
+  });
+
+  it('renders a row whose currency is UNKNOWN with no symbol at all — not `$`', () => {
+    const { container } = renderWithToast(
+      <StockWatchlistPanel token="t" symbols={[symbol({ symbol: 'STOOQ', price: 12.5 })]} />,
+    );
+    const row = [...container.querySelectorAll('tr')].find(tr => tr.textContent?.includes('STOOQ'))!;
+    expect(row.textContent).not.toContain('$');
+    expect(row.textContent).toContain('12.50');
+  });
+
   it('rejects an invalid symbol without firing a request', async () => {
     renderWithToast(<StockWatchlistPanel token="t" symbols={[]} />);
     await userEvent.type(screen.getByPlaceholderText('Add symbol (e.g. NVDA)'), 'TOOLONG');
@@ -123,6 +161,34 @@ describe('StockSignalsPanel (TRA-422)', () => {
       <StockSignalsPanel token="t" signals={[]} symbols={[symbol()]} marketReview={undefined} />,
     );
     expect(screen.getByText(/engine is scanning/)).toBeInTheDocument();
+  });
+
+  // TRA-3390 — a signal's entry/stop/target are levels in the SYMBOL's quote
+  // currency. The live `ENR.DE` buy (EUR, `mode: "live"`) rendered as `$165.70`.
+  it('renders a EUR signal card without `$`, and a USD one with it', () => {
+    const { container } = renderWithToast(
+      <StockSignalsPanel
+        token="t"
+        signals={[
+          signal({ id: 'eur', symbol: 'ENR.DE', entryPrice: 165.70, stopLoss: 139.11, takeProfit: 218.89 }),
+          signal({ id: 'usd', symbol: 'NVDA' }),
+        ]}
+        symbols={[
+          symbol({ symbol: 'ENR.DE', price: 165.70, currency: 'EUR' }),
+          symbol({ symbol: 'NVDA', currency: 'USD' }),
+        ]}
+        marketReview={undefined}
+      />,
+    );
+    const cardText = (sym: string) =>
+      [...container.querySelectorAll('.signal-card')].find(c => c.textContent?.includes(sym))!.textContent!;
+
+    expect(cardText('ENR.DE')).not.toContain('$');
+    expect(cardText('ENR.DE')).toContain('165.70 EUR');
+    expect(cardText('ENR.DE')).toContain('139.11 EUR');
+    expect(cardText('ENR.DE')).toContain('218.89 EUR');
+    // The other direction.
+    expect(cardText('NVDA')).toContain('$100.00');
   });
 
   it('renders a signal card with side and symbol', () => {

@@ -39,6 +39,12 @@ export * from './position-advisor.js';
 // published numbers.
 export * from './quote-plausibility.js';
 
+// TRA-3390 (impl child of TRA-2628) — quote-currency vocabulary. Carries the unit
+// a quote is denominated in from the adapter that reported it through to every
+// renderer, and encodes the entry-path refusal for non-USD instruments. Absent
+// currency means UNKNOWN and is never treated as USD.
+export * from './quote-currency.js';
+
 // TRA-950 — structured review block (leaders / invalidation / gapRisk / regime)
 // persisted with each pre/post-market review and wired into both decision paths.
 export * from './review-block.js';
@@ -4102,6 +4108,18 @@ export interface EodMover {
   symbol: string;
   price: number;
   changePct: number;
+  /**
+   * TRA-3390 (impl child of TRA-2628) — the currency `price` is denominated in,
+   * copied from the `SymbolState` row this mover was ranked off. Optional
+   * because every row persisted before this ticket lacks it — and an absent
+   * value renders with NO currency symbol, which is the honest reading of an
+   * archived report we cannot retroactively denominate.
+   *
+   * `changePct` is deliberately NOT affected: a local-currency percentage is
+   * comparable across listings, which is why foreign rows still rank (AC3). Only
+   * the LEVEL is currency-bearing.
+   */
+  currency?: string;
   /**
    * TRA-2631 — READ-TIME ONLY. Attached by `annotateReportProvenance` at the
    * response boundary and **never written to disk**: the stored artifact is the
