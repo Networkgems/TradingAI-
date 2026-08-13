@@ -244,8 +244,38 @@ for (const fold of FOLDS) {
         for (const s of suppressed) {
           if (!rep.markdown.includes(s.symbol)) problems.push(`note does not name the suppressed row ${s.symbol}`);
         }
-      } else if (!rep.markdown.includes('row(s) suppressed; this table is as published')) {
+      } else if (
+        // TRA-3296 — a read-time-clean artifact now has TWO legal renderings, not
+        // one, and this check must accept both or it condemns the entire archive.
+        //
+        //   • "…as published"            — the stored report carries a write-time
+        //                                  record and that record is empty. The only
+        //                                  state that earns the certificate.
+        //   • "…suppressed at read time" — either the record exists and dropped
+        //                                  rows, or the record is ABSENT (a pre-fix
+        //                                  artifact, which renders UNKNOWN).
+        //
+        // ⛔ Do NOT relax this to a bare `includes('suppressed')`. The property being
+        // graded is that the artifact STATES ITS DENOMINATOR, and both strings below
+        // say a number out loud. A looser substring would make this leg a rubber
+        // stamp — the exact defect the TRA-2610/2631/3296 family exists for.
+        !rep.markdown.includes('row(s) suppressed; this table is as published')
+        && !rep.markdown.includes('row(s) suppressed at read time')
+      ) {
         problems.push('clean artifact does not state its denominator — silence is not an answer');
+      }
+
+      // ── TRA-3296 — the WRITE-TIME stage must state itself, in every branch ────
+      // The original defect was a document that said nothing about a stage which
+      // ran before it existed, while affirmatively certifying itself complete.
+      // UNKNOWN is an acceptable answer for a pre-fix artifact; SILENCE is not.
+      if (
+        !rep.markdown.includes('Write-time exclusions: UNKNOWN')
+        && !rep.markdown.includes('Write-time exclusions: none reached this table')
+        && !rep.markdown.includes('dropped BEFORE this report was written')
+      ) {
+        problems.push(
+          'note is SILENT about write-time exclusions (TRA-3296) — a stage that ran before the file existed');
       }
     }
 

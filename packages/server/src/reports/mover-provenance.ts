@@ -66,7 +66,9 @@
 // `scripts/tra2610-archive-scan.mjs` grades with, so the filter and the published
 // 64/105 census cannot disagree.
 
-import type { EodMover, EodReport, MoverProvenance, MoversFilterProvenance } from '@trading-app/shared';
+import type {
+  EodMover, EodReport, MoverProvenance, MoversFilterProvenance, MoversWriteTimeProvenance,
+} from '@trading-app/shared';
 import { assessQuotePlausibility, SUSPECT_MOVE_RATIO_FLOOR } from '@trading-app/shared';
 import { formatMoverMarkdownRow, MOVERS_MARKDOWN_HEADING } from './eod-report.js';
 
@@ -84,6 +86,8 @@ export const MOVER_PROVENANCE_RULE_ID = 'TRA-3241:session-move-ratio';
 type ReportLike = Pick<EodReport, 'top5Movers'> & {
   markdown?: string;
   moversProvenance?: MoversFilterProvenance;
+  /** TRA-3296 — the persisted write-time record. Absent on every pre-fix artifact. */
+  moversWriteTime?: MoversWriteTimeProvenance;
 };
 
 function assess(m: EodMover, build: string): MoverProvenance {
@@ -120,6 +124,73 @@ function moverCell(m: EodMover): string {
 }
 
 /**
+ * TRA-3296 — the WRITE-TIME half of the note, and the only part of this file that
+ * can speak about a stage that ran before the stored file existed.
+ *
+ * THREE states, deliberately, and the third is the one the ticket was filed on:
+ *
+ *   1. **No record** (`hasRecord === false`) — the stored report predates the fix.
+ *      Rendered as UNKNOWN. These artifacts are not repairable: `top5Movers` drops
+ *      its rows before persisting and no per-symbol quote tape is retained, so
+ *      there is nothing to reconstruct from. Re-certifying them as "0 suppressed"
+ *      is the failure mode the whole ticket is about, so the unknown is stated.
+ *   2. **Record, empty** — the generating build kept a record and it dropped
+ *      nothing that would have reached this table. This is the ONLY state that
+ *      earns "as published".
+ *   3. **Record, non-empty** — name the rows and the instrument that dropped each,
+ *      so a reader can tell a read-time suppression from a write-time one.
+ */
+function buildWriteTimeBlock(
+  writeTime: MoversWriteTimeProvenance | undefined,
+  hasRecord: boolean,
+): string[] {
+  if (!hasRecord || !writeTime) {
+    return [
+      '>',
+      '> ⚠️ **Write-time exclusions: UNKNOWN.** This stored report was generated before'
+      + ' TRA-3296, which is the change that started recording rows dropped during report'
+      + ' GENERATION (a corporate action, a level discontinuity, or a move the feed condemned'
+      + ' earlier in the session). Those rows never reached the file, so the read-time'
+      + ' filter above cannot see them and **this note cannot tell you whether any exist.**'
+      + ' The stored artifact is not repairable — no per-symbol quote tape is retained for'
+      + ' past sessions — so this is recorded as unknown rather than resolved.',
+    ];
+  }
+
+  if (writeTime.displaced.length === 0) {
+    return [
+      '>',
+      `> _Write-time exclusions: none reached this table. ${writeTime.excludedTotal} row(s) of`
+      + ` ${writeTime.candidateCount} candidate(s) were dropped during generation, none of which`
+      + ' would have ranked into the top 5 (build `' + writeTime.build + '`)._',
+    ];
+  }
+
+  const rows = writeTime.displaced.map((e, i) => {
+    const price = Number.isFinite(e.price) ? `$${Math.abs(e.price).toFixed(2)}` : 'n/a';
+    const pct = Number.isFinite(e.changePct)
+      ? `${e.changePct >= 0 ? '+' : ''}${e.changePct.toFixed(2)}%`
+      : 'n/a';
+    const why = [e.reason, e.corporateAction].filter(Boolean).join(' — ') || '—';
+    return `> | ${i + 1} | ${e.symbol} | ${price} / ${pct} | \`${e.instrument}\` | ${why}`
+      + ` | ${num(e.impliedPrevClose)} | ${e.ratio === null ? 'n/a' : e.ratio.toFixed(2)} |`;
+  });
+
+  return [
+    '>',
+    `> ⛔ **${writeTime.displaced.length} row(s) were dropped BEFORE this report was written and`
+    + ' are NOT counted in the read-time numbers above.** They never reached the stored file, so'
+    + ` \`publishedCount\` cannot include them. ${writeTime.excludedTotal} row(s) of`
+    + ` ${writeTime.candidateCount} candidate(s) were excluded during generation in total; the`
+    + ' following would have ranked into this table (build `' + writeTime.build + '`):',
+    '>',
+    '> | # | Symbol | Would have shown | Instrument | Why | Implied prev close | Ratio |',
+    '> |---|--------|------------------|------------|-----|--------------------|-------|',
+    ...rows,
+  ];
+}
+
+/**
  * The block appended under the movers table.
  *
  * Rendered as a blockquote so it survives every markdown renderer we serve into
@@ -143,18 +214,60 @@ function buildProvenanceNote(
   build: string,
   unremoved: EodMover[],
   tableLocated: boolean,
+  // TRA-3296 — the WRITE-TIME record off the stored report. `undefined` means the
+  // key was ABSENT, which is a third state and not an empty one; see below.
+  writeTime: MoversWriteTimeProvenance | undefined,
+  hasWriteTimeRecord: boolean,
 ): string {
   const unassessable = served.filter(m => m.provenance?.verdict === 'unassessable');
   const rule = `rule \`${MOVER_PROVENANCE_RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = ${SUSPECT_MOVE_RATIO_FLOOR}\`), build \`${build}\``;
   const jurisdiction =
     '> _Session-move test only — it asks whether a row\'s own price and change % believe each other. '
     + 'It is **not** the TRA-2634 cross-artifact continuity test, so a row it did not suppress is unflagged, not verified._';
+  const writeTimeBlock = buildWriteTimeBlock(writeTime, hasWriteTimeRecord);
 
   // ── The clean branch. It still declares the denominator. ───────────────────
-  if (suppressed.length === 0) {
+  //
+  // ⛔ TRA-3296 — "as published" is claimed ONLY when the stored report carries a
+  // write-time record AND that record is empty. Read-time cleanliness is not
+  // evidence about a stage that ran before the file existed: `suppressed` is
+  // computed over rows already ON DISK, so a row dropped inside `eod-report.ts`
+  // is invisible here by construction. This branch used to print the certificate
+  // regardless, and on 2026-08-11 it certified a table that was missing MNST's
+  // 2:1 split as "as published".
+  if (suppressed.length === 0 && hasWriteTimeRecord && writeTime!.displaced.length === 0) {
     const lines = [
       `> **Provenance — 0 of ${publishedCount} row(s) suppressed; this table is as published.**`,
       `> Filtered at read time by ${rule} (TRA-2631, board ruling A).`,
+      ...writeTimeBlock,
+    ];
+    if (unassessable.length > 0) {
+      lines.push(
+        `> ⚠️ ${unassessable.length} row(s) (${unassessable.map(m => m.symbol).join(', ')}) could **not be assessed**`
+        + ' by this rule and are RETAINED, not vouched for — the rule has no jurisdiction over them,'
+        + ' which is not the same as passing.',
+      );
+    }
+    lines.push(jurisdiction);
+    return lines.join('\n');
+  }
+
+  // ── TRA-3296 — read-time clean, write-time NOT clean (or unknown). ──────────
+  //
+  // A separate branch because the suppressed-row branch below would otherwise
+  // render "0 of 5 published row(s) SUPPRESSED" above an empty table. The
+  // read-time zero is still stated — it is a true fact about its own stage, and
+  // suppressing it would trade one silent stage for another — but it is stated
+  // WITHOUT the "as published" certificate, which this document has not earned.
+  if (suppressed.length === 0) {
+    const lines = [
+      hasWriteTimeRecord
+        ? `> ⚠️ **PROVENANCE — 0 of ${publishedCount} row(s) suppressed at read time, but`
+          + ` ${writeTime!.displaced.length} row(s) were dropped BEFORE this report was written.**`
+        : `> ⚠️ **PROVENANCE — 0 of ${publishedCount} row(s) suppressed at read time.`
+          + ' Whether anything was dropped before this report was written is UNKNOWN.**',
+      `> Filtered at read time by ${rule} (TRA-2631, board ruling A).`,
+      ...writeTimeBlock,
     ];
     if (unassessable.length > 0) {
       lines.push(
@@ -180,6 +293,7 @@ function buildProvenanceNote(
     + ' so the published artifact remains the record of what we served on this date. The suppressed rows are'
     + ' reproduced verbatim below and in the response\'s `moversProvenance.filtered`, so nothing is lost:',
     jurisdiction,
+    ...writeTimeBlock,
     '>',
     '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
     '> |---|--------|-----------|---------|--------------------|-------|',
@@ -234,12 +348,19 @@ export function annotateMoversMarkdown(
   suppressed: EodMover[],
   publishedCount: number,
   build: string,
+  // TRA-3296 — passed through to the note. `hasWriteTimeRecord` is the PRESENCE of
+  // the key on the stored report, carried separately from the value because
+  // `undefined` and "recorded, empty" are different facts and only one of them
+  // earns the "as published" certificate.
+  writeTime?: MoversWriteTimeProvenance,
+  hasWriteTimeRecord = false,
 ): string {
   const lines = markdown.split('\n');
   const headingIdx = lines.findIndex(l => l.trim() === MOVERS_MARKDOWN_HEADING);
 
   if (headingIdx === -1) {
-    const note = buildProvenanceNote(served, suppressed, publishedCount, build, suppressed, false);
+    const note = buildProvenanceNote(
+      served, suppressed, publishedCount, build, suppressed, false, writeTime, hasWriteTimeRecord);
     return `${markdown}\n\n${note}\n`;
   }
 
@@ -272,7 +393,8 @@ export function annotateMoversMarkdown(
   let insertAt = newEndIdx;
   while (insertAt > newHeadingIdx + 1 && kept[insertAt - 1]!.trim() === '') insertAt--;
 
-  const note = buildProvenanceNote(served, suppressed, publishedCount, build, unremoved, true);
+  const note = buildProvenanceNote(
+    served, suppressed, publishedCount, build, unremoved, true, writeTime, hasWriteTimeRecord);
   kept.splice(insertAt, 0, '', note);
   return kept.join('\n');
 }
@@ -297,6 +419,14 @@ export function annotateReportProvenance<T extends ReportLike>(
 ): T & { moversProvenance?: MoversFilterProvenance } {
   if (!report || !Array.isArray(report.top5Movers) || report.top5Movers.length === 0) return report;
 
+  // TRA-3296 — `in`, NOT truthiness and NOT `!== undefined`. The three states this
+  // has to tell apart are "key absent" (pre-fix artifact ⇒ unknown), "key present
+  // with an empty `displaced`" (recorded and genuinely clean), and "key present
+  // with rows". A truthiness test collapses the first two, which is exactly the
+  // collapse the ticket was filed on, one layer up.
+  const hasWriteTimeRecord = 'moversWriteTime' in report && report.moversWriteTime != null;
+  const writeTime = report.moversWriteTime;
+
   const publishedCount = report.top5Movers.length;
   const stamped = report.top5Movers.map(m => ({ ...m, provenance: assess(m, build) }));
   const suppressed = stamped.filter(m => m.provenance.verdict === 'suspect');
@@ -313,7 +443,10 @@ export function annotateReportProvenance<T extends ReportLike>(
   };
 
   const md = typeof report.markdown === 'string' && report.markdown.length > 0
-    ? { markdown: annotateMoversMarkdown(report.markdown, served, suppressed, publishedCount, build) }
+    ? {
+      markdown: annotateMoversMarkdown(
+        report.markdown, served, suppressed, publishedCount, build, writeTime, hasWriteTimeRecord),
+    }
     : {};
 
   return { ...report, top5Movers: served, moversProvenance, ...md } as T;

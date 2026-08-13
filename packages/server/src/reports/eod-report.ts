@@ -4,6 +4,9 @@ import type {
   EodMover,
   EodSignalAccuracy,
   JournalBasisCounts,
+  // TRA-3296 — the persisted WRITE-TIME exclusion record. See the type's header.
+  MoverWriteTimeExclusion,
+  MoversWriteTimeProvenance,
   OptionPosition,
   PortfolioGreeks,
   Position,
@@ -31,6 +34,10 @@ import {
   type MoveSuspectSessionProvenance,
 } from '../move-suspect-session-store.js';
 import { logger } from '../observability/index.js';
+// TRA-3296 — stamped onto the persisted write-time record so a reader can tell which
+// rule version dropped the rows. Resolved at the CALLER, never inside `top5Movers`,
+// which stays pure and replayable against the stored archive.
+import { resolveBuildInfo } from '../observability/build-info.js';
 import { isCorrelatedExposureCapEnabled } from '../exit-risk-rules-flag.js';
 import { summarizeCorrelatedExposureBindings } from '../correlated-exposure-ledger.js';
 import type { EngineState, SymbolState } from '../signal-engine.js';
@@ -211,7 +218,10 @@ function top5Movers(
   // TRA-3387 — whether the engine's `symbolState` was continuous across the session being
   // graded. Absent => the session-condemnation census below grades BLIND, never clean.
   moveSuspectSessionProvenance?: MoveSuspectSessionProvenance | null,
-): EodMover[] {
+  // TRA-3296 — the build that is generating this report, stamped onto the persisted
+  // write-time record so a reader can tell which rule version dropped the rows.
+  build?: string,
+): { movers: EodMover[]; writeTime: MoversWriteTimeProvenance } {
   // TRA-136: drop symbols that were never successfully fetched (lastUpdated === 0)
   // so the report shows "_No data._" rather than five rows of 0.00% when the feed
   // is failing on cold start.
@@ -458,11 +468,96 @@ function top5Movers(
     corporateActionsInWindow: corporateActions.length,
   });
 
-  return [...symbols]
+  const movers = [...symbols]
     .filter(rankable)
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 5)
     .map(s => ({ symbol: s.symbol, price: s.price, changePct: s.changePct }));
+
+  // ── TRA-3296 — PERSIST what the four censuses above only LOGGED. ─────────────
+  //
+  // Every exclusion so far exists exclusively in the tape. The rows are gone from
+  // `movers` before the report is written, so the read-time stamp in
+  // `mover-provenance.ts` — which computes its denominator over the rows ALREADY
+  // ON DISK — cannot see that this stage ran, and its clean branch went on to
+  // print "this table is as published" over the 2026-08-11 report that had just
+  // dropped MNST's 2:1 split. A log line is not a record: nobody reading the
+  // document is reading the tape.
+  //
+  // ⭐ The set is derived from `!rankable`, NOT from unioning the four census
+  // arrays above. Those are ATTRIBUTION views with deliberately different
+  // predicates (`isMoveSuspectNow` vs `isMoveSuspect` vs the calendar-aware
+  // `assessQuotePlausibility`), and their union is not guaranteed to equal the set
+  // `rankable` actually drops. Deriving from the ranking predicate itself is what
+  // makes the persisted count and the published table incapable of disagreeing —
+  // which is the entire property this ticket is about.
+  const excludedRows = candidates.filter(s => !rankable(s));
+
+  const attribute = (s: SymbolState): MoverWriteTimeExclusion => {
+    const action = splitFor(s);
+    const v = assessQuotePlausibility(s, action);
+    const base = {
+      symbol: s.symbol,
+      price: s.price,
+      changePct: s.changePct,
+      impliedPrevClose: v.impliedPrevClose,
+      ratio: v.ratio,
+      ...(action
+        ? {
+          corporateAction: `${action.splitRatio ?? `${action.numerator}:${action.denominator}`}`
+            + ` exDate=${action.exDate}`,
+        }
+        : {}),
+    };
+    const withReason = (reason: string | undefined) => (reason ? { reason } : {});
+    // Same order, same predicates as the censuses above, so a row is attributed to
+    // the instrument that REPORTED it and the two surfaces cannot disagree.
+    if (isMoveSuspectNow(s)) {
+      return { ...base, instrument: 'TRA-2610:session-move', ...withReason(v.reason) };
+    }
+    if (isMoveSuspect(s)) {
+      return { ...base, instrument: 'TRA-3243:session-condemned', ...withReason(v.reason) };
+    }
+    if (action !== null) {
+      return { ...base, instrument: 'TRA-3068:corporate-action', ...withReason(v.reason) };
+    }
+    const cont = continuity(s);
+    if (cont.verdict === 'suspect') {
+      return { ...base, instrument: 'TRA-2634:level-continuity', ...withReason(cont.reason) };
+    }
+    // Residual: `rankable` dropped it but no census claimed it. Recorded rather
+    // than discarded — dropping a row here because it did not fit the taxonomy is
+    // the exact defect this block exists to close, one level in. It is attributed
+    // to the session-move rule because `moveSuspect` is the only remaining leg of
+    // `rankable` that can reach here, and the reason field carries the detail.
+    return { ...base, instrument: 'TRA-2610:session-move', ...withReason(v.reason ?? 'unattributed') };
+  };
+
+  // `displaced` — the rows that would have been ON THE PAGE. Rank ALL candidates,
+  // excluded ones included, and take the top 5: that is the table the reader would
+  // have seen had nothing been dropped, so its excluded members are exactly what is
+  // missing from the five rows in front of them.
+  //
+  // ⛔ NOT the whole excluded set. The instruments run over the full ranking
+  // universe (~525 bqb1 symbol-rows, ~131 condemned), so pooling all of them under
+  // a five-row table would print a 131-row suppression notice under EVERY report —
+  // "a fix that makes every report claim a suppression is worse than the bug".
+  const excludedKeys = new Set(excludedRows.map(s => s.symbol.toUpperCase()));
+  const displaced = [...candidates]
+    .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
+    .slice(0, 5)
+    .filter(s => excludedKeys.has(s.symbol.toUpperCase()))
+    .map(attribute);
+
+  return {
+    movers,
+    writeTime: {
+      displaced,
+      excludedTotal: excludedRows.length,
+      candidateCount: candidates.length,
+      build: build ?? 'unknown',
+    },
+  };
 }
 
 /**
@@ -1171,13 +1266,14 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
   // TRA-3068 — `today` is already this report's ET session date, and it is the
   // upper bound of the ex-date window. Prefer the caller's explicit value only if
   // it disagrees deliberately (a replay grading a historical session).
-  const movers = top5Movers(
+  const { movers, writeTime: moversWriteTime } = top5Movers(
     state.symbols, priorSessionMovers, priorSessionDate,
     knownSplits, input.currentSessionDate ?? today,
     // TRA-3387 — `?? null`, deliberately, so a caller that omits it lands on the SAME BLIND
     // branch as one that explicitly says "I don't know". An `undefined` that quietly becomes a
     // pass is how a guard ends up satisfied by the absence of what it grades.
     input.moveSuspectSessionProvenance ?? null,
+    resolveBuildInfo().commitShort ?? 'unknown',
   );
 
   // TRA-844 — portfolio Greeks + theta-$ bleed + allocation rollup over the
@@ -1224,6 +1320,12 @@ export function generateEodReport(input: ReportInput, asOfDate?: string): EodRep
     maxDrawdown,
     sharpeRatio,
     top5Movers: movers,
+    // TRA-3296 — written UNCONDITIONALLY, including on a session that dropped
+    // nothing (`displaced: []`). The key's PRESENCE is what tells a reader this
+    // report came from a build that keeps a write-time record; making it
+    // conditional on a non-empty array would collapse "clean" and "no record"
+    // into the same absent key, which is the precise defect being fixed.
+    moversWriteTime,
     signalAccuracy,
     portfolioGreeks,
     // TRA-2214 — carried onto the persisted report so a grader reading a stored

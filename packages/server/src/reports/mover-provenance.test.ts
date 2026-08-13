@@ -19,7 +19,9 @@
 // the row quoted verbatim off the 2026-07-21 live artifact on TRA-2631.
 
 import { describe, it, expect } from 'vitest';
-import type { EodMover } from '@trading-app/shared';
+import type {
+  EodMover, MoverWriteTimeExclusion, MoversWriteTimeProvenance,
+} from '@trading-app/shared';
 import { SUSPECT_MOVE_RATIO_FLOOR } from '@trading-app/shared';
 import {
   annotateReportProvenance,
@@ -62,6 +64,44 @@ function markdownWith(movers: EodMover[]): string {
 function report(movers: EodMover[]) {
   return { date: '2026-07-21', top5Movers: movers, markdown: markdownWith(movers) };
 }
+
+/**
+ * TRA-3296 — a report from a build that KEEPS a write-time record. `report()`
+ * above deliberately still omits the key, because that is the shape of every
+ * artifact stored before the fix and the backfill assertions need it.
+ */
+function reportWithWriteTime(movers: EodMover[], writeTime: MoversWriteTimeProvenance) {
+  return { ...report(movers), moversWriteTime: writeTime };
+}
+
+/** A write-time record that dropped nothing into this table. */
+function emptyWriteTime(candidateCount = 2, excludedTotal = 0): MoversWriteTimeProvenance {
+  return { displaced: [], excludedTotal, candidateCount, build: BUILD };
+}
+
+function cleanReport(movers: EodMover[]) {
+  return reportWithWriteTime(movers, emptyWriteTime(movers.length));
+}
+
+/**
+ * The two rows bqb1 dropped at WRITE time on 2026-08-11, quoted off the tape line
+ * in the filing ticket verbatim:
+ *   `["PLAG@5.81:927.05%:ok","MNST@45.53:-50.21%:ok"]`
+ * MNST is the one that matters — a genuine 2:1 split, ex-dated that session, named
+ * as such by the TRA-3068 calendar, and absent from the document a human reads as
+ * the session summary while the footer called that document "as published".
+ */
+const PLAG_WT: MoverWriteTimeExclusion = {
+  symbol: 'PLAG', price: 5.81, changePct: 927.05,
+  instrument: 'TRA-2610:session-move', reason: 'implausible_session_move',
+  impliedPrevClose: 0.5657, ratio: 10.27,
+};
+const MNST_WT: MoverWriteTimeExclusion = {
+  symbol: 'MNST', price: 45.53, changePct: -50.21,
+  instrument: 'TRA-3068:corporate-action', reason: 'corporate_action',
+  impliedPrevClose: 91.44, ratio: 2.008,
+  corporateAction: '2:1 exDate=2026-08-11',
+};
 
 /** Data rows of the movers table in a served document (header rows excluded). */
 function tableRows(markdown: string): string[] {
@@ -153,7 +193,10 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
 
   // ── Scope point 2: a filtered report must not read like a clean one ─────────
   it('states the denominator on a CLEAN report, so silence is never the answer', () => {
-    const out = annotateReportProvenance(report([QMCO, NVDA]), BUILD);
+    // TRA-3296 — the report now has to CARRY a write-time record to earn the
+    // "as published" certificate. `cleanReport` supplies an empty one; a report
+    // WITHOUT the key is the backfill case and is asserted separately below.
+    const out = annotateReportProvenance(cleanReport([QMCO, NVDA]), BUILD);
     // Present-with-zero, NOT absent. Absent means the filter never ran, which is
     // a different fact, and the check script discriminates on exactly this.
     expect(out.moversProvenance).toBeDefined();
@@ -300,5 +343,133 @@ describe('read-time mover filter + provenance (TRA-2631, board ruling A)', () =>
     expect(out.top5Movers).toEqual([]);
     expect(out.moversProvenance!.filteredCount).toBe(1);
     expect(out.markdown).toBeUndefined();
+  });
+});
+
+// ── TRA-3296 ─────────────────────────────────────────────────────────────────
+//
+// The read-time certificate above is honest about its own stage and silent about
+// the one before it. `suppressed` is computed over rows ALREADY ON DISK, so rows
+// dropped inside `eod-report.ts` are invisible here by construction — and the
+// clean branch then printed "this table is as published" over the 2026-08-11
+// report that had just lost MNST's 2:1 split.
+//
+// The controls are the filing ticket's own, in both directions, because the
+// over-correction is the more dangerous failure: a fix that makes EVERY report
+// claim a suppression is worse than the bug, and it would be shipped green by a
+// suite that only tested the positive case.
+describe('write-time exclusions are carried into the read-time note (TRA-3296)', () => {
+  // ── POSITIVE: the 08-11 session, replayed off the tape line in the ticket ────
+  it('names both write-time rows and does NOT claim the table is as published', () => {
+    const out = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [PLAG_WT, MNST_WT], excludedTotal: 131, candidateCount: 525, build: BUILD,
+      }),
+      BUILD,
+    );
+
+    // The harm named by the ticket, killed: that exact string must be gone.
+    expect(out.markdown).not.toContain('this table is as published');
+    // Both symbols are named in the document a human reads.
+    expect(out.markdown).toContain('PLAG');
+    expect(out.markdown).toContain('MNST');
+    // The split is named as the reason, not just the symbol.
+    expect(out.markdown).toContain('2:1 exDate=2026-08-11');
+    // Stage is LABELLED, so a read-time suppression is distinguishable from a
+    // write-time one (TRA-3243's attribute-don't-pool rule, applied to the note).
+    expect(out.markdown).toContain('TRA-3068:corporate-action');
+    expect(out.markdown).toContain('TRA-2610:session-move');
+    expect(out.markdown).toContain('dropped BEFORE this report was written');
+  });
+
+  it('keeps the read-time arithmetic invariant intact — write-time rows are NOT pooled in', () => {
+    // `publishedCount === servedCount + filteredCount` is asserted corpus-wide by
+    // `scripts/tra2631-provenance-stamp-check.mjs`. The write-time rows never
+    // reached the file, so folding them into `filteredCount` would produce a
+    // number that is true of neither stage AND fail that check everywhere.
+    const mp = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [PLAG_WT, MNST_WT], excludedTotal: 131, candidateCount: 525, build: BUILD,
+      }),
+      BUILD,
+    ).moversProvenance!;
+    expect(mp.publishedCount).toBe(2);
+    expect(mp.servedCount).toBe(2);
+    expect(mp.filteredCount).toBe(0);
+    expect(mp.publishedCount).toBe(mp.servedCount + mp.filteredCount);
+  });
+
+  it('pools BOTH stages when the same report is filtered at read time too', () => {
+    const out = annotateReportProvenance(
+      reportWithWriteTime([SELX, QMCO], {
+        displaced: [MNST_WT], excludedTotal: 7, candidateCount: 500, build: BUILD,
+      }),
+      BUILD,
+    );
+    // Read-time stage still reports its own suppression...
+    expect(out.moversProvenance!.filteredCount).toBe(1);
+    expect(out.markdown).toContain('SELX');
+    // ...and the write-time stage is named alongside it rather than swallowed.
+    expect(out.markdown).toContain('MNST');
+    expect(out.markdown).toContain('dropped BEFORE this report was written');
+  });
+
+  // ── NEGATIVE: the one that matters. Do not cry wolf on a clean session. ──────
+  it('a genuinely clean session STILL renders the "as published" line, unchanged', () => {
+    const out = annotateReportProvenance(cleanReport([QMCO, NVDA]), BUILD);
+    expect(out.markdown).toContain('0 of 2 row(s) suppressed; this table is as published');
+    expect(out.markdown).not.toContain('dropped BEFORE this report was written');
+    expect(out.markdown).not.toContain('UNKNOWN');
+  });
+
+  it('a clean TABLE whose session dropped rows elsewhere still says "as published"', () => {
+    // The over-correction guard. 131 rows were excluded from the ranking universe
+    // but none would have reached the top 5, so this table really is as published
+    // and must not be smeared with a suppression notice it did not earn.
+    const out = annotateReportProvenance(
+      reportWithWriteTime([QMCO, NVDA], {
+        displaced: [], excludedTotal: 131, candidateCount: 525, build: BUILD,
+      }),
+      BUILD,
+    );
+    expect(out.markdown).toContain('this table is as published');
+    expect(out.markdown).not.toContain('UNKNOWN');
+    // The full census stays reachable without flooding the note.
+    expect(out.markdown).toContain('131 row(s) of 525 candidate(s)');
+  });
+
+  // ── BACKFILL BOUNDARY: unrepairable must read as UNKNOWN, never as clean ─────
+  it('a report with NO write-time record renders UNKNOWN, not "0 suppressed"', () => {
+    // Every artifact stored before this change is this shape. They cannot be
+    // repaired — the rows never reached the file and no per-symbol quote tape is
+    // retained — so the note must say it does not know. Re-certifying a
+    // silently-unrepairable archive as clean is the failure this ticket is about.
+    const out = annotateReportProvenance(report([QMCO, NVDA]), BUILD);
+    expect(out.markdown).toContain('Write-time exclusions: UNKNOWN');
+    expect(out.markdown).not.toContain('this table is as published');
+    // The read-time stage is still reported honestly — one silent stage must not
+    // be traded for another.
+    expect(out.moversProvenance!.filteredCount).toBe(0);
+    expect(out.markdown).toContain('0 of 2 row(s) suppressed at read time');
+  });
+
+  it('discriminates ABSENT from RECORDED-EMPTY — the two must not render alike', () => {
+    // The single assertion the whole backfill boundary rests on. If a truthiness
+    // test ever replaces the `in` check, these two collapse and this fails.
+    const absent = annotateReportProvenance(report([QMCO, NVDA]), BUILD).markdown;
+    const recorded = annotateReportProvenance(cleanReport([QMCO, NVDA]), BUILD).markdown;
+    expect(absent).not.toBe(recorded);
+    expect(absent).toContain('UNKNOWN');
+    expect(recorded).toContain('as published');
+  });
+
+  it('still suppresses at read time on a pre-fix artifact — the filter is not disabled', () => {
+    // A record-less report is UNKNOWN about the write-time stage only. The
+    // read-time filter must go on doing its job, or the backfill branch would be a
+    // silent regression of TRA-2631 wearing a transparency fix's clothes.
+    const out = annotateReportProvenance(report([SELX, QMCO]), BUILD);
+    expect(out.top5Movers.map(m => m.symbol)).toEqual(['QMCO']);
+    expect(out.moversProvenance!.filteredCount).toBe(1);
+    expect(out.markdown).toContain('Write-time exclusions: UNKNOWN');
   });
 });

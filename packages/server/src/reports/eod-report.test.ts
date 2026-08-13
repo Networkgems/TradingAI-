@@ -1047,6 +1047,95 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
       expect(report.markdown).not.toContain('SPLT32');
     });
 
+    // ── TRA-3296 — the exclusion above must leave a RECORD, not just a log line ──
+    //
+    // The test directly above is the whole defect in miniature: it asserts the row
+    // is gone from both surfaces and stops there. That is exactly the state a
+    // reader of the served document was left in — the row vanished and nothing in
+    // the artifact said so, while the read-time footer went on to certify the
+    // table as published. These assert the PRODUCER emits the record; the renderer
+    // is graded separately in `mover-provenance.test.ts`.
+    it('TRA-3296 — persists the write-time exclusion instead of only logging it', () => {
+      const report = reportWithCalendar({
+        SPLT32: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }],
+      });
+      expect(report.moversWriteTime).toBeDefined();
+      const displaced = report.moversWriteTime!.displaced;
+      expect(displaced.map(e => e.symbol)).toContain('SPLT32');
+
+      const row = displaced.find(e => e.symbol === 'SPLT32')!;
+      // ATTRIBUTED, not pooled — a reader must be able to tell which instrument
+      // dropped it (TRA-3243's rule, and the reason the four censuses are separate).
+      expect(row.instrument).toBe('TRA-3068:corporate-action');
+      expect(row.corporateAction).toContain('3:2');
+      expect(row.corporateAction).toContain(EX_DATE_IN_WINDOW);
+      // The published numbers survive verbatim, so the row stays recoverable.
+      expect(row.price).toBe(8.12);
+      expect(row.changePct).toBe(-33.33);
+    });
+
+    it('TRA-3296 — the record is present-and-EMPTY when nothing was dropped', () => {
+      // The discriminator the whole backfill boundary rests on: a clean session
+      // must emit the key with an empty `displaced`, NOT omit it. Omitting it would
+      // make a clean session indistinguishable from a pre-fix artifact, which is
+      // the same collapse one layer up.
+      const report = reportWithCalendar({});
+      expect(report.moversWriteTime).toBeDefined();
+      expect('moversWriteTime' in report).toBe(true);
+      expect(report.moversWriteTime!.displaced).toEqual([]);
+      // ...and with no calendar the row RANKS, which is what proves this fixture
+      // could have produced a non-empty record. A positive control must contain
+      // what it detects.
+      expect(report.top5Movers.map(m => m.symbol)).toContain('SPLT32');
+    });
+
+    it('TRA-3296 — END TO END: the generated report, served, names the dropped row', () => {
+      // The two TRA-3296 legs above grade the PRODUCER, and `mover-provenance.test.ts`
+      // grades the RENDERER against hand-built records. Neither proves they compose,
+      // and "both halves pass, the seam is broken" is precisely how the original gap
+      // shipped: `eod-report.ts` correctly excluded MNST and `mover-provenance.ts`
+      // correctly stamped what it could see, and the DOCUMENT was still false.
+      const generated = reportWithCalendar({
+        SPLT32: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }],
+      });
+      const served = annotateReportProvenance(generated, PROVENANCE_BUILD);
+
+      // The string the ticket named as the actual harm is gone...
+      expect(served.markdown).not.toContain('this table is as published');
+      // ...and the row that vanished is named, with the instrument that dropped it.
+      expect(served.markdown).toContain('SPLT32');
+      expect(served.markdown).toContain('TRA-3068:corporate-action');
+      expect(served.markdown).toContain('dropped BEFORE this report was written');
+      // The read-time arithmetic is untouched — the stages stay separately scoped.
+      expect(served.moversProvenance!.filteredCount).toBe(0);
+      expect(served.moversProvenance!.publishedCount)
+        .toBe(served.moversProvenance!.servedCount + served.moversProvenance!.filteredCount);
+    });
+
+    it('TRA-3296 — END TO END: a clean generated report still reads as published', () => {
+      // The negative direction of the seam. Same pipeline, no calendar, nothing
+      // dropped into the table ⇒ the certificate must survive intact.
+      const served = annotateReportProvenance(reportWithCalendar({}), PROVENANCE_BUILD);
+      expect(served.markdown).toContain('this table is as published');
+      expect(served.markdown).not.toContain('dropped BEFORE this report was written');
+      expect(served.markdown).not.toContain('UNKNOWN');
+    });
+
+    it('TRA-3296 — displaced counts only rows that would have REACHED the table', () => {
+      // The over-correction guard, at the producer. The instruments run over the
+      // whole ranking universe (~131 of 525 rows on bqb1), so `displaced` must be
+      // the top-5 intersection, not the full census — otherwise every report
+      // renders a suppression notice and the fix is worse than the bug.
+      const report = reportWithCalendar({
+        SPLT32: [{ ...SPLIT_3_2, exDate: EX_DATE_IN_WINDOW }],
+      });
+      const wt = report.moversWriteTime!;
+      expect(wt.displaced.length).toBeLessThanOrEqual(5);
+      expect(wt.displaced.length).toBeLessThanOrEqual(wt.excludedTotal);
+      expect(wt.excludedTotal).toBeGreaterThanOrEqual(1);
+      expect(wt.candidateCount).toBeGreaterThanOrEqual(wt.excludedTotal);
+    });
+
     it('NEGATIVE CONTROL — an ex-date OUTSIDE the window leaves the row ranked', () => {
       // Proves the WINDOW is doing the work, not the mere presence of a calendar
       // entry. A guard that fired on "this symbol has ever split" would flag the

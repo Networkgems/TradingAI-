@@ -852,6 +852,47 @@ function EodReportDetail({ report, onBack }: { report: EodReport; onBack: () => 
                 ⚠️ {report.moversProvenance.filteredCount} of {report.moversProvenance.publishedCount} suppressed
               </span>
             )}
+            {/* TRA-3296 — the WRITE-TIME badge. The notice above is scoped to the
+                read-time filter, which computes its denominator over rows already
+                stored; rows dropped inside `eod-report.ts` never reached the file,
+                so that badge is silent about them by construction. Without this the
+                grid renders a silently-short table — the same defect the markdown
+                footer had, on the third surface. */}
+            {report.moversWriteTime && report.moversWriteTime.displaced.length > 0 && (
+              <span
+                className="eod-movers-filtered"
+                title={
+                  `${report.moversWriteTime.displaced.length} row(s) were dropped BEFORE this report`
+                  + ' was written and are NOT counted in the suppression figure above — they never'
+                  + ' reached the stored file. Dropped: '
+                  + report.moversWriteTime.displaced
+                    .map(e => `${e.symbol} $${e.price.toFixed(2)} ${e.changePct >= 0 ? '+' : ''}${e.changePct.toFixed(2)}%`
+                      + ` [${e.instrument}${e.corporateAction ? `, ${e.corporateAction}` : ''}]`)
+                    .join('; ')
+                  + `. ${report.moversWriteTime.excludedTotal} of ${report.moversWriteTime.candidateCount}`
+                  + ' candidate(s) were excluded during generation in total.'
+                }
+              >
+                ⛔ {report.moversWriteTime.displaced.length} dropped before publish
+              </span>
+            )}
+            {/* The backfill boundary, on the grid. A stored report with no
+                write-time record cannot be repaired, and rendering nothing here
+                would let it read as "nothing was dropped" — which is the exact
+                false certificate this ticket was filed on. */}
+            {!report.moversWriteTime && (
+              <span
+                className="eod-movers-filtered"
+                title={
+                  'This stored report predates TRA-3296 and carries no record of rows dropped during'
+                  + ' report generation (a corporate action, a level discontinuity, or a move the feed'
+                  + ' condemned earlier in the session). It is not repairable — no per-symbol quote tape'
+                  + ' is retained — so whether any rows are missing from this table is UNKNOWN.'
+                }
+              >
+                ⚠️ pre-publish exclusions unknown
+              </span>
+            )}
           </div>
         )}
 

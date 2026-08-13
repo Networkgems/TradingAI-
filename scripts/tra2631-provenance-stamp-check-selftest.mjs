@@ -91,10 +91,19 @@ function artifact({ served, suppressed, markdownRows, note }) {
   };
 }
 
+// TRA-3296 — every served note now also has to speak about the WRITE-TIME stage,
+// so these fixtures carry that line too. Both are the "recorded, nothing reached
+// the table" wording, which is what a post-fix build emits on a clean session; the
+// UNKNOWN and the non-empty wordings get their own dedicated controls below.
+const WRITE_TIME_CLEAN =
+  '> _Write-time exclusions: none reached this table. 0 row(s) of 2 candidate(s) were dropped'
+  + ' during generation, none of which would have ranked into the top 5 (build `' + BUILD + '`)._';
+
 const NOTE_FILTERED = [
   `> ⚠️ **PROVENANCE — 1 of 3 published row(s) SUPPRESSED as unverified. 2 row(s) shown above.**`,
   `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`.`,
   '> The stored report on disk is **unchanged and byte-intact** — TRA-2634.',
+  WRITE_TIME_CLEAN,
   '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
   '> | 1 | SELX | $0.34 / +1316.67% | suspect (implausible_move_ratio) | 0.0240 | 14.17 |',
 ].join('\n');
@@ -102,6 +111,7 @@ const NOTE_FILTERED = [
 const NOTE_CLEAN = [
   `> **Provenance — 0 of 2 row(s) suppressed; this table is as published.**`,
   `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`. TRA-2634.`,
+  WRITE_TIME_CLEAN,
 ].join('\n');
 
 // ── the cases ────────────────────────────────────────────────────────────────
@@ -152,6 +162,45 @@ const SILENT = artifact({
   note: NOTE_CLEAN,
 });
 
+// MUTATION 5 (TRA-3296) — the note speaks about the read-time stage and is SILENT
+// about the write-time one. This is the artifact the ticket was filed on: the
+// 2026-08-11 report certified itself "as published" 14 ms after `eod-report.ts`
+// dropped MNST's 2:1 split, and nothing in the document said a stage had run.
+//
+// ⭐ It exists because the write-time leg must be able to FAIL. A leg that only
+// ever passes is decoration, and the version of this check that shipped without a
+// mutation control is precisely how the original gap survived a green suite.
+const WRITE_TIME_SILENT = artifact({
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
+  suppressed: [stamp(SELX, 'suspect', 'implausible_move_ratio')],
+  markdownRows: [QMCO, NVDA],
+  note: [
+    `> ⚠️ **PROVENANCE — 1 of 3 published row(s) SUPPRESSED as unverified. 2 row(s) shown above.**`,
+    `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`.`,
+    '> The stored report on disk is **unchanged and byte-intact** — TRA-2634.',
+    '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
+    '> | 1 | SELX | $0.34 / +1316.67% | suspect (implausible_move_ratio) | 0.0240 | 14.17 |',
+  ].join('\n'),
+});
+
+// TRA-3296 — the BACKFILL shape, and it must PASS. Every artifact stored before
+// the fix carries no write-time record and renders UNKNOWN. Those are not
+// repairable, and failing them would condemn the whole archive for a defect it
+// cannot fix; stating the unknown is the required behaviour, not a finding.
+const WRITE_TIME_UNKNOWN = artifact({
+  served: [stamp(QMCO, 'plausible'), stamp(NVDA, 'plausible')],
+  suppressed: [stamp(SELX, 'suspect', 'implausible_move_ratio')],
+  markdownRows: [QMCO, NVDA],
+  note: [
+    `> ⚠️ **PROVENANCE — 1 of 3 published row(s) SUPPRESSED as unverified. 2 row(s) shown above.**`,
+    `> Filtered at read time by rule \`${RULE_ID}\` (threshold \`SUSPECT_MOVE_RATIO_FLOOR = 1.9\`), build \`${BUILD}\`.`,
+    '> The stored report on disk is **unchanged and byte-intact** — TRA-2634.',
+    '> ⚠️ **Write-time exclusions: UNKNOWN.** This stored report was generated before TRA-3296.',
+    '> | # | Symbol | Published | Verdict | Implied prev close | Ratio |',
+    '> | 1 | SELX | $0.34 / +1316.67% | suspect (implausible_move_ratio) | 0.0240 | 14.17 |',
+  ].join('\n'),
+});
+
 // The pre-deploy shape: served, but no stamp at all.
 const UNSTAMPED = { date: '2026-07-21', generatedAt: 'x', top5Movers: [QMCO, NVDA], markdown: `${HEADING}\n| Symbol | Price | Change % |\n|--|--|--|\n${moverRow(QMCO)}` };
 
@@ -162,6 +211,8 @@ const CASES = [
   { name: 'MUTATION over-filtered — a genuine mover was deleted', reports: [OVER], expect: 1, expectText: 'OVER-FILTERED' },
   { name: 'MUTATION half-filtered — gone from JSON, still in the markdown', reports: [HALF], expect: 1, expectText: 'HALF-FILTERED' },
   { name: 'MUTATION silent — filtered but the note does not say so', reports: [SILENT], expect: 1, expectText: 'reads as clean' },
+  { name: 'MUTATION write-time silent — the note never mentions the WRITE-TIME stage (TRA-3296)', reports: [WRITE_TIME_SILENT], expect: 1, expectText: 'SILENT about write-time' },
+  { name: 'PASS — a pre-fix artifact that honestly renders write-time as UNKNOWN (TRA-3296)', reports: [WRITE_TIME_UNKNOWN], expect: 0, expectText: 'PASS' },
   { name: 'NOT_DEPLOYED — served, but no stamp anywhere', reports: [UNSTAMPED], expect: 2, expectText: 'NOT_DEPLOYED' },
   { name: 'BLIND — no readable movers table at all', reports: [], expect: 3, expectText: 'BLIND' },
 ];

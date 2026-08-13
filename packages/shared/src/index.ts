@@ -4122,6 +4122,101 @@ export interface MoversFilterProvenance {
   filtered: EodMover[];
 }
 
+/**
+ * TRA-3296 — one row dropped at **WRITE** time, inside `top5Movers`, before the
+ * report was ever persisted.
+ *
+ * ── Why this type has to exist at all ─────────────────────────────────────────
+ * `MoversFilterProvenance` above is a complete and honest certificate **for the
+ * read-time filter**, and that is precisely the problem: it is computed over
+ * `served`, which is the set of rows ALREADY ON DISK. The write-time instruments
+ * run first and remove their rows from the array that gets persisted, so by the
+ * time the read-time stamp is applied there is nothing left for it to notice.
+ * `filteredCount: 0` is then *arithmetically correct for the filter that computed
+ * it* and *false as a claim about the table* — and the clean branch went on to
+ * print "this table is as published" over a document that was missing MNST's 2:1
+ * split on 2026-08-11.
+ *
+ * ⇒ **A COMPLETENESS CERTIFICATE IS SCOPED TO THE FILTER THAT COMPUTED IT.** Two
+ * filters in series, only one of which states its denominator, yields a document
+ * that certifies its own completeness on behalf of a stage it cannot see.
+ *
+ * The remedy is NOT to fold these rows into `filteredCount`. That field carries a
+ * hard invariant — `publishedCount === servedCount + filteredCount`, asserted by
+ * `scripts/tra2631-provenance-stamp-check.mjs` and by the unit tests — and these
+ * rows were **never in `publishedCount`** to begin with, because they never
+ * reached the file. Fusing the two stages into one number produces a count that
+ * is true of neither. Each stage therefore keeps its own certificate, and the
+ * rendered note pools them in PROSE.
+ */
+export interface MoverWriteTimeExclusion {
+  symbol: string;
+  /** The price the row carried when it was excluded, verbatim. */
+  price: number;
+  /** The `changePct` it would have been RANKED on, verbatim. */
+  changePct: number;
+  /**
+   * Which write-time instrument condemned it. Kept as the issue key that OWNS the
+   * instrument, because pooling these is exactly the attribution error TRA-3243
+   * was filed on: a reader must be able to tell what the ratio rule contributed
+   * from what the calendar contributed.
+   */
+  instrument:
+    | 'TRA-2610:session-move'
+    | 'TRA-3243:session-condemned'
+    | 'TRA-3068:corporate-action'
+    | 'TRA-2634:level-continuity';
+  /** `QuoteSuspectReason`, or the continuity verdict's reason, when there is one. */
+  reason?: string;
+  /** The prev close this row's own published numbers imply. */
+  impliedPrevClose: number | null;
+  /** `max(price/prev, prev/price)`, or `null` when it could not be computed. */
+  ratio: number | null;
+  /** For a calendar catch: the action, e.g. `2:1 exDate=2026-08-11 factor=2.000000`. */
+  corporateAction?: string;
+}
+
+/**
+ * TRA-3296 — the WRITE-TIME half of the movers denominator, persisted onto the
+ * stored report so the read-time stamp can see a stage that ran before it.
+ *
+ * ── `displaced` vs `excludedTotal`, and why the distinction is load-bearing ────
+ * The write-time instruments run over the whole ranking universe: on bqb1 that is
+ * ~525 symbol-rows, of which the deployed rule condemns ~131. Reporting all of
+ * them under a five-row table would render a 131-row suppression notice under
+ * EVERY report, which is the failure the filing ticket named explicitly: *"a fix
+ * that makes every report claim a suppression is worse than the bug."*
+ *
+ * So `displaced` is the honest answer to the question a reader of THIS TABLE is
+ * actually asking — *what is missing from the five rows in front of me?* — and it
+ * is computed exactly: rank ALL candidates by `|changePct|`, take the top 5, and
+ * intersect with the excluded set. Those are the rows that would have been on the
+ * page had nothing been dropped. `excludedTotal` keeps the full census reachable
+ * without letting it flood the note.
+ *
+ * ⚠️ **PRESENCE IS THE SIGNAL.** This object is written on EVERY report generated
+ * by a build that carries the fix, including a session that dropped nothing, where
+ * it reads `displaced: []`. Its ABSENCE therefore means "this report predates the
+ * write-time record and CANNOT be repaired" — stored artifacts carry no such
+ * record and no regeneration path exists (see `mover-provenance.ts`). Those must
+ * render as **unknown**, never as "0 suppressed". A silently-unrepairable archive
+ * re-certified as clean is the whole point of the ticket. Readers must test with
+ * `'moversWriteTime' in report`, never on truthiness of the array.
+ */
+export interface MoversWriteTimeProvenance {
+  /**
+   * Excluded rows that WOULD have appeared in the published table. Ranked as they
+   * would have been, so `displaced[0]` is the headline that vanished.
+   */
+  displaced: MoverWriteTimeExclusion[];
+  /** Every row the write-time instruments dropped from the ranking universe. */
+  excludedTotal: number;
+  /** Rows that entered ranking (`lastUpdated > 0 && price > 0`). The denominator. */
+  candidateCount: number;
+  /** Short commit SHA of the build that generated the report, or `'unknown'`. */
+  build: string;
+}
+
 export interface EodSignalAccuracy {
   totalSignals: number;
   /** Signals that closed with profit (TP hit) */
@@ -4240,6 +4335,16 @@ export interface EodReport {
    * treat the two identically.
    */
   moversProvenance?: MoversFilterProvenance;
+  /**
+   * TRA-3296 — WRITE-TIME exclusions, **persisted** (unlike `moversProvenance`
+   * above, which is read-time only and never hits disk).
+   *
+   * Present on every report generated by a build carrying the fix, including a
+   * clean session (`displaced: []`). ABSENT on every report generated before it,
+   * and those are NOT repairable — which is why the read-time note renders them
+   * as *unknown* rather than as "0 suppressed".
+   */
+  moversWriteTime?: MoversWriteTimeProvenance;
 
   // Signal accuracy
   signalAccuracy: EodSignalAccuracy;
