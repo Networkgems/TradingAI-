@@ -1369,6 +1369,116 @@ export const SOCIAL_SWEEP_BUDGET_MS = 15_000;
  * a number, and so a future edit to either term fails loudly here.
  */
 export const SOCIAL_SWEEP_GRADED_MAX_MS = 30_000;
+
+/**
+ * TRA-3441 — wall-clock a `signal.doTick.cold-bar-scan` pass may spend inside one
+ * tick. This sink was the #1 tail owner on the 2026-08-12 RTH tape and the largest
+ * unbounded sink left after TRA-2262 / TRA-2477 / TRA-3019:
+ *
+ *     n=2916   share 25.9%   p50 4.9s   p90 28.9s   max 123.9s
+ *
+ * TRA-2171 phase 1 WRAPPED it for instrumentation (`dotick-phase-coverage.test.ts`);
+ * it was measured, never bounded. Instrumentation is not a budget.
+ *
+ * ── Why the shard was not already a bound ───────────────────────────────────
+ * TRA-739 shards the cold pass — each tick walks active-interest plus one of
+ * {@link COLD_SCAN_INTERVAL} rotating watchlist slices. That bounds the COUNT of
+ * symbols per tick, not the WALL CLOCK spent on them, and TRA-2205 settled the
+ * general form: a throttle bounds FREQUENCY, never MAGNITUDE. 123.9s is what a
+ * count-bounded, time-unbounded pass looks like when the feed goes slow.
+ *
+ * ── Why 30s, and why the modal pass is untouched ────────────────────────────
+ * p90 is 28.9s, so a 30s budget leaves ~90% of passes untruncated and bites only
+ * the tail it was filed for — the same sizing argument TRA-2477 used for its
+ * reuse of {@link SWEEP_BUDGET_MS} (p90 25.8s < 30s). The 123.9s worst pass
+ * becomes ~5 slices; an unfinished sweep re-enters on the NEXT tick, so the
+ * rotation still lands inside the ~5-minute shard cadence that TRA-1539 sized
+ * against `MAX_CANDLE_AGE_MS` (720s) with a ~270s margin. That margin is the
+ * real coverage constraint here — overrun it and the risk-autopilot trips a
+ * `feed_stale` halt, which is strictly worse than a slow tick.
+ */
+export const COLD_BAR_SWEEP_BUDGET_MS = 30_000;
+
+/**
+ * TRA-3441 — deadline on ONE `refreshCandles` call inside the cold-bar sweep.
+ *
+ * 🔴 This constant is load-bearing, not defensive: the budget is checked AFTER a
+ * batch (it has to be — the overrun is always the call already in flight), so
+ *
+ *     worst pass = COLD_BAR_SWEEP_BUDGET_MS + <ceiling of one batch>
+ *
+ * and a batch is {@link COLD_BAR_BATCH} concurrent `refreshCandles` calls, so the
+ * batch ceiling is the ceiling of ONE call. **That call had no ceiling.** The
+ * fallback chain is Tradier -> Yahoo -> Twelve Data, and
+ * `TradierStocksClient.getMinuteBars` issues a BARE `fetch()` with no
+ * `AbortSignal` — its only bound is whatever undici's default header/body
+ * timeouts happen to be, which is not a number this repo owns. Even ignoring
+ * that leg, the Yahoo fallback alone is `withRetry` = 3 x `YF_CALL_TIMEOUT_MS`
+ * plus 1s + 2s of backoff = 27s, and Twelve Data adds another 8s: a 35s+ overrun
+ * term against a 60s bar. **No budget can satisfy the acceptance criterion while
+ * the overrun term is unowned**, which is why this ships a deadline rather than
+ * only a budget.
+ *
+ *     worst pass = 30s + 20s = 50s  <=  60s bar   (see the sizing test)
+ *
+ * ⭐ It is a WAIT bound, not a work-cancel. `fetchMinuteBarsWithSource` keys an
+ * in-flight singleflight and writes `minuteBarCache` when it eventually lands, so
+ * an abandoned call still warms the cache for the next pass — nothing is thrown
+ * away, the sweep just stops waiting for it.
+ */
+export const COLD_BAR_CALL_DEADLINE_MS = 20_000;
+
+/**
+ * TRA-3441 — the graded bar this budget is sized against: `max <= 60s` for
+ * `signal.doTick.cold-bar-scan` over one full post-deploy RTH session. Exported
+ * so the sizing test asserts the DERIVATION against the bar instead of restating
+ * a number, and so widening either term above fails loudly there.
+ */
+export const COLD_BAR_SWEEP_GRADED_MAX_MS = 60_000;
+
+/** Symbols fetched concurrently per cold-bar batch (TRA-739's `CANDLE_BATCH`). */
+export const COLD_BAR_BATCH = 5;
+
+/**
+ * TRA-739 — how many ticks one full cold-scan rotation spans. Module-level (was
+ * inline in `doTick`) because TRA-3441's shard latch and its coverage test both
+ * have to reason about it.
+ */
+export const COLD_SCAN_INTERVAL = 10;
+
+/**
+ * TRA-739 — the cold-bar sweep's universe for one tick: every active-interest
+ * symbol, plus the `shard`-th rotating slice of the watchlist.
+ *
+ * Extracted from `doTick` by TRA-3441 so the coverage property of the bound can
+ * be PROVEN rather than asserted: the sweep's cursor stores a SYMBOL, so a sweep
+ * resumed against a universe computed from a different `shard` cannot find its
+ * parked position and restarts at index 0 — silently dropping the truncated
+ * tail. {@link coldScanShardAdvances} is what stops that, and the two are only
+ * testable together.
+ */
+export function coldScanUniverse(
+  activeSymbols: readonly string[],
+  activeInterest: ReadonlySet<string>,
+  shard: number,
+): string[] {
+  return activeSymbols.filter(
+    (sym, idx) => activeInterest.has(sym) || idx % COLD_SCAN_INTERVAL === shard,
+  );
+}
+
+/**
+ * TRA-3441 — may the cold-scan shard counter advance on this tick?
+ *
+ * Only when no sweep is parked mid-universe. A sweep the wall-clock budget cut
+ * short must re-enter against the SAME universe, or its cursor is meaningless.
+ * (`stopped` counts as "not parked": a caller-side gate refused the batch, which
+ * this sink never does today — it is here so the predicate stays true to
+ * {@link SweepPass}'s contract rather than to this one call site.)
+ */
+export function coldScanShardAdvances(pass: SweepPass | null): boolean {
+  return pass == null || pass.complete || pass.stopped;
+}
 // TRA-226 — refresh the Tradier `/accounts/{id}/balances` snapshot at most
 // every 2 minutes. Tradier rate-limits balance reads, and the dashboard
 // equity does not need second-level freshness — order fills come through
@@ -2916,6 +3026,13 @@ export class SignalEngine {
   private mtfSweep: SweepPass | null = null;
   private otmSweep: SweepPass | null = null;
   private shortPremiumSweep: SweepPass | null = null;
+  /**
+   * TRA-3441 — the cold-bar candle sweep's last pass. An incomplete pass ALSO
+   * freezes {@link candleScanTickCount}: the sink's universe is a rotating shard
+   * of the watchlist, so advancing the shard mid-rotation would swap the universe
+   * out from under the cursor and the truncated tail would never be fetched.
+   */
+  private coldBarSweep: SweepPass | null = null;
   /**
    * Whether the IN-FLIGHT mtf sweep is a full-watchlist cold pass. Latched when a
    * sweep STARTS so the every-4th-cycle counter advances once per sweep, not once
@@ -5458,44 +5575,63 @@ export class SignalEngine {
     const equityStrategiesActiveOnTick =
       this.mode === 'demo'
       || (this.mode === 'live' && this.liveTradeEquitiesTradier && this.tradierLiveEquityClient !== null);
-    if (equityStrategiesActiveOnTick) {
-      this.candleScanTickCount++;
-      const CANDLE_BATCH = 5;
-      // TRA-554: gate the bar pull to active-interest symbols every tick, with a
-      // slow full-watchlist scan for signal discovery.
-      // TRA-739: the old design pulled the ENTIRE watchlist on one "cold-scan"
-      // tick every 10 ticks. With ~364 symbols (Tradier is the minute-bar primary)
-      // that dumped ~364 bar-pulls into a single ~30s tick → a >200 req/min spike
-      // in the rolling 60s meter every 5 min, even though the steady-state rate is
-      // well under target. Instead, SHARD the cold scan: each tick covers one of
-      // COLD_SCAN_INTERVAL rotating slices of the watchlist, so every symbol is
-      // still refreshed once per ~5 min (identical total Tradier volume) but the
-      // per-minute peak is ~1/10th — smoothing the burst below the <200/min target.
-      // Skip entirely when the market is closed — Tradier timesales returns empty
-      // outside session hours (session_filter=open) so fetching is pure waste.
-      if (isStockMarketOpen()) {
-        const COLD_SCAN_INTERVAL = 10;
-        const coldScanShard = this.candleScanTickCount % COLD_SCAN_INTERVAL;
-        const symbolsToFetch = activeSymbols.filter(
-          (sym, idx) => activeInterest.has(sym) || idx % COLD_SCAN_INTERVAL === coldScanShard,
+    // TRA-554: gate the bar pull to active-interest symbols every tick, with a
+    // slow full-watchlist scan for signal discovery.
+    // TRA-739: the old design pulled the ENTIRE watchlist on one "cold-scan"
+    // tick every 10 ticks. With ~364 symbols (Tradier is the minute-bar primary)
+    // that dumped ~364 bar-pulls into a single ~30s tick → a >200 req/min spike
+    // in the rolling 60s meter every 5 min, even though the steady-state rate is
+    // well under target. Instead, SHARD the cold scan: each tick covers one of
+    // COLD_SCAN_INTERVAL rotating slices of the watchlist, so every symbol is
+    // still refreshed once per ~5 min (identical total Tradier volume) but the
+    // per-minute peak is ~1/10th — smoothing the burst below the <200/min target.
+    // Skip entirely when the market is closed — Tradier timesales returns empty
+    // outside session hours (session_filter=open) so fetching is pure waste.
+    if (equityStrategiesActiveOnTick && isStockMarketOpen()) {
+      // TRA-3441 — the shard counter advances once per SWEEP, never once per
+      // SLICE. This sink's universe is `activeInterest ∪ shard(candleScanTickCount)`;
+      // bumping the counter on a resumed slice would hand `runBudgetedSweep` a
+      // DIFFERENT universe, its parked cursor symbol would no longer be in it,
+      // and the sweep would silently restart at index 0 of the next shard — so the
+      // truncated tail of every long pass would never be fetched at all. That is
+      // TRA-2262's "a modulo gate downstream of a loop you just sliced is counting
+      // the wrong thing", and here it would cost coverage rather than rate.
+      // (The counter also no longer ticks while the market is shut, where the scan
+      // never ran: it used to rotate the shard for nothing.)
+      if (coldScanShardAdvances(this.coldBarSweep)) this.candleScanTickCount++;
+      const symbolsToFetch = coldScanUniverse(
+        activeSymbols,
+        activeInterest,
+        this.candleScanTickCount % COLD_SCAN_INTERVAL,
+      );
+      // TRA-2171 — name the cold-bar candle fan-out as its own async sub-phase so
+      // its wall-clock is attributed in the phase tape instead of folding into the
+      // coarse `signal.doTick`. `async` kind (includes awaited feed I/O, so it does
+      // NOT poison `lastSlowSyncPhase` — the TRA-2111 split keeps a slow I/O tick
+      // out of the block-attribution pointer).
+      // TRA-3441 — …and BUDGETED. Phase 1 wrapped this sink for MEASUREMENT and
+      // stopped there; on the 2026-08-12 tape it was the #1 tail owner (p90 28.9s,
+      // max 123.9s) and the last unbounded fan-out in the tick.
+      try {
+        this.coldBarSweep = await withPhase(
+          'signal.doTick.cold-bar-scan',
+          () => this.runColdBarScan(symbolsToFetch, tickPacer),
         );
-        // TRA-2171 — name the cold-bar candle fan-out as its own async sub-phase so
-        // its wall-clock is attributed in the phase tape instead of folding into the
-        // coarse `signal.doTick`. `async` kind (includes awaited feed I/O, so it does
-        // NOT poison `lastSlowSyncPhase` — the TRA-2111 split keeps a slow I/O tick
-        // out of the block-attribution pointer). Prime suspected doTick I/O sink at
-        // the ~568-symbol universe; this is what lets us pick the right bound.
-        await withPhase('signal.doTick.cold-bar-scan', async () => {
-          for (let i = 0; i < symbolsToFetch.length; i += CANDLE_BATCH) {
-            await Promise.all(
-              symbolsToFetch.slice(i, i + CANDLE_BATCH).map(sym => this.refreshCandles(sym)),
-            );
-            // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
-            // so this full-universe loop can starve the loop by itself; pace it.
-            if (tickPacer.shouldYield()) await yieldToEventLoop();
-          }
+      } catch (err: unknown) {
+        // The cursor already advanced past the failing batch inside the sweep;
+        // drop the pass so the shard resumes rotating rather than freezing on a
+        // sweep that can never complete.
+        this.coldBarSweep = null;
+        log.warn('cold-bar candle scan threw', {
+          component: 'cold-bar-scan',
+          reason: err instanceof Error ? err.message : String(err),
         });
       }
+    } else {
+      // Market closed, or equity strategies inactive on this tick — abandon any
+      // half-finished sweep so the next open starts a fresh rotation instead of
+      // resuming into a stale universe (and so the shard counter unfreezes).
+      this.coldBarSweep = null;
     }
 
     // TRA-1269 (TRA-1250 Rule 1, LIVE path) — ratchet the broker-resting OCO
@@ -10004,6 +10140,97 @@ export class SignalEngine {
       flattenedEquity: flatEq,
       flattenedOptions: flatOpt,
       mode: this.mode,
+    });
+  }
+
+  /**
+   * TRA-3441 — the BUDGETED cold-bar candle scan (phase 2 of TRA-2171).
+   *
+   * The old shape was `for (i += CANDLE_BATCH) await Promise.all(...)` over the
+   * whole sharded universe with no wall-clock bound at all — the same defect
+   * TRA-2262 bounded on mtf-refresh / short-premium-scan / otm-scan and TRA-2477
+   * on supertrend-series. On the boot-excluded 2026-08-12 RTH tape it was the #1
+   * tail owner of `signal.doTick`:
+   *
+   *     n=2916   share 25.9%   p50 4.9s   p90 28.9s   max 123.9s
+   *
+   * Two things make the bound safe here, and both were CHECKED rather than
+   * assumed (they are the two traps TRA-2262 and TRA-3019 sprang):
+   *
+   *  1. **The producer UPSERTS, it does not REPLACE.** {@link refreshCandles}
+   *     writes `candleCache.set(symbol, bars)` per symbol, every consumer reads
+   *     `candleCache.get(sym)`, and nothing clears or iterates the map — so a
+   *     truncated pass publishes FEWER FRESH entries, never a partial snapshot
+   *     wearing a whole one's clothes (TRA-3019's silent defect). A symbol whose
+   *     pull is deferred keeps its previous bars, which is already the steady
+   *     state for 9 ticks out of 10 under TRA-739's shard.
+   *  2. **The shard counter is latched to the SWEEP** — see the call site. Without
+   *     that the cursor's universe changes under it every tick.
+   *
+   * The residual coverage cost is bounded by the `feed_stale` gate, not by taste:
+   * TRA-1539 sized the cold cadence at ~300s shard + ~120s newest-bar lag ≈ 450s
+   * against `MAX_CANDLE_AGE_MS` = 720s. A truncated pass resumes on the NEXT tick
+   * (no throttle sits in front of this sink at all), so the worst measured pass
+   * spreads over ~5 ticks and spends ~26s of the ~270s margin.
+   */
+  private async runColdBarScan(symbols: string[], pacer?: TickPacer): Promise<SweepPass> {
+    return runBudgetedSweep({
+      // Per-engine: `mode` namespaces demo from live so two engines sweeping the
+      // same watchlist do not consume each other's cursor.
+      key: `${this.mode}:cold-bar-scan`,
+      symbols,
+      batchSize: COLD_BAR_BATCH,
+      budgetMs: COLD_BAR_SWEEP_BUDGET_MS,
+      run: async (batch) => {
+        await Promise.all(batch.map(sym => this.refreshCandlesBounded(sym)));
+        // TRA-1942 — a cache-served batch resolves in microtasks (no real I/O),
+        // so this loop can starve the event loop by itself; pace it.
+        if (pacer?.shouldYield()) await yieldToEventLoop();
+      },
+    });
+  }
+
+  /**
+   * TRA-3441 — {@link refreshCandles} with a hard {@link COLD_BAR_CALL_DEADLINE_MS}
+   * WAIT bound, so the sweep's overrun term is a constant this repo owns.
+   *
+   * Without this the overrun is unowned: `TradierStocksClient.getMinuteBars`
+   * issues a bare `fetch()` with no `AbortSignal`, and the Yahoo/Twelve-Data
+   * fallbacks behind it are worth 35s on their own — larger than the whole 60s
+   * bar this sink is graded against. A budget alone therefore could not have met
+   * the acceptance criterion, however small it was set.
+   *
+   * ⭐ The in-flight call is ABANDONED, not cancelled. `fetchMinuteBarsWithSource`
+   * dedupes through `minuteBarInflight` and writes `minuteBarCache` when it
+   * lands, so the work still warms the cache for the next pass — we stop waiting,
+   * we do not throw the pull away. Rejections are absorbed here (they were
+   * previously free to escape `Promise.all` and abort the whole scan); every
+   * other bounded sink already swallows its own per-symbol failures.
+   */
+  private refreshCandlesBounded(symbol: string): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        log.warn('cold-bar candle pull exceeded its per-call deadline', {
+          component: 'cold-bar-scan',
+          symbol,
+          deadlineMs: COLD_BAR_CALL_DEADLINE_MS,
+        });
+        resolve();
+      }, COLD_BAR_CALL_DEADLINE_MS);
+      // Never let a pending deadline hold the process open on shutdown.
+      timer.unref?.();
+      this.refreshCandles(symbol).then(
+        () => { clearTimeout(timer); resolve(); },
+        (err: unknown) => {
+          clearTimeout(timer);
+          log.warn('cold-bar candle pull failed', {
+            component: 'cold-bar-scan',
+            symbol,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          resolve();
+        },
+      );
     });
   }
 

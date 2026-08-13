@@ -14,7 +14,35 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Per-call timeout. Yahoo Finance occasionally hangs without responding, which
 // previously blocked the 30-second tick indefinitely (no quotes → watchlist stuck
 // "Loading…", and signals couldn't open positions because price was unavailable).
-const YF_CALL_TIMEOUT_MS = 8_000;
+// TRA-3441 — exported so the cold-bar sizing test can derive its budget against
+// the value that actually ships, rather than restating a number in a comment.
+export const YF_CALL_TIMEOUT_MS = 8_000;
+
+/** Extra attempts {@link withRetry} makes after the first one. */
+export const YF_RETRIES = 2;
+
+/**
+ * TRA-3441 — the structural ceiling of ONE `fetchMinuteBarsWithSource` call,
+ * counting only the legs this repo actually bounds.
+ *
+ * 🔴 It is a LOWER bound on the true ceiling, deliberately. The Tradier primary
+ * (`TradierStocksClient.getMinuteBars`) issues a bare `fetch()` with **no
+ * `AbortSignal`**, so its only limit is whatever undici's default header/body
+ * timeouts happen to be — a number this repo neither sets nor tests. What is
+ * counted here is the fallback chain that IS ours:
+ *
+ *   Yahoo `withRetry`  (YF_RETRIES + 1) x YF_CALL_TIMEOUT_MS + 1s + 2s backoff
+ *   Twelve Data        YF_CALL_TIMEOUT_MS
+ *
+ * = 35s today. Any wall-clock budget on a sink that calls this must be sized
+ * against `budget + this`, and TRA-3441's bar is 60s — which is why the cold-bar
+ * sweep ships a per-call deadline as well as a budget. Exported so that stays an
+ * executable assertion instead of a comment that ages.
+ */
+export const MINUTE_BAR_FALLBACK_CEILING_MS =
+  (YF_RETRIES + 1) * YF_CALL_TIMEOUT_MS   // Yahoo chart attempts
+  + 1_000 + 2_000                          // …and their (attempt + 1) * 1s backoff
+  + YF_CALL_TIMEOUT_MS;                    // Twelve Data fallback
 
 // 429 circuit breaker for Yahoo. When Yahoo rate-limits us, retrying every tick
 // burns the retry budget for nothing and risks extending the lock-out. Open the
@@ -76,7 +104,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-async function withRetry<T>(fn: () => Promise<T>, label: string, retries = 2): Promise<T | null> {
+async function withRetry<T>(fn: () => Promise<T>, label: string, retries = YF_RETRIES): Promise<T | null> {
   if (isRateLimited()) {
     return null;
   }
