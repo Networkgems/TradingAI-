@@ -98,7 +98,14 @@ import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-en
 import {
   listOptionTradeJournal,
   isOptionTradeJournalEnabled,
+  recordOptionTradeClose,
+  recordOptionTradeVoid,
+  getOptionTradeVoids,
 } from './option-trade-journal.js';
+// TRA-3485 — the PARTITIONED repair for the stale live `OPEN` rows. The planner
+// is pure and lives in its own module so the partition can be graded (dry run)
+// before a single byte is appended.
+import { planStaleOpenRepair, RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-open-repair.js';
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
 import { foldModelFacingEodJournal } from './model-facing-journal.js';
@@ -10519,6 +10526,135 @@ app.post('/api/health/live-options-fee-slippage/reconcile', requireAuth, require
       updated > 0
         ? `Back-filled ${updated} fee(s) from ${fills.length} history fill(s) + ${lots.length} settled lot(s); feesMeasured now ${summary.feesMeasured}/${summary.n}. ${summary.durability.ephemeral ? 'NOT DURABLE — DATA_DIR ephemeral; re-run after DATA_DIR=/data (TRA-1719).' : `Durable on ${summary.durability.dataDir}.`}`
         : `No rows back-filled — ${fills.length} history fill(s) + ${lots.length} settled lot(s) in window, none matched an unmeasured ledger row (or all already reconciled). Unmatched rows stay fees:null (never 0, TRA-1707).`,
+  });
+});
+
+// TRA-3485 (parent TRA-3472) — the PARTITIONED repair for stale live `OPEN`
+// journal rows. Retracts the ones that never filled; back-fills a CLOSE from
+// broker truth for the ones that round-tripped and lost their close row.
+//
+// Why this is a route and not a script: the journal store lives on the host's
+// `/data` disk and is loaded into an in-process fold. A repair run anywhere else
+// would either edit a file the running process is caching (so the fix vanishes
+// at the next write) or need a restart to be seen. Running it in-process means
+// the same `foldLine` that serves every read applies the repair, and the
+// `already CLOSED` guard inside `recordOptionTradeVoid` is on the actual path
+// rather than re-implemented next to it.
+//
+// DRY RUN BY DEFAULT. Mutating needs BOTH `?apply=true` and `?confirm=TRA-3485`
+// — the second exists because a retraction DELETES a row and there is no undo,
+// so a mistyped flag must land in the safe branch, not the destructive one.
+app.post('/api/health/option-journal/repair', requireAuth, requireAdmin, async (req, res) => {
+  if (!isOptionTradeJournalEnabled()) {
+    res.status(409).json({ ok: false, error: 'option trade journal is disabled on this host; nothing to repair' });
+    return;
+  }
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-3485';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-3485',
+      detail:
+        'A retraction deletes a journal row through the replay fold and cannot be undone. The '
+        + 'confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+
+  // Re-derive the partition IN THIS REQUEST, off the live journal and the live
+  // durable fill ledger. There is no stored cohort: a repair keyed to a stale
+  // partition is the failure this ticket exists to avoid.
+  const ledger = summarizeLiveOptionsFeeSlippage();
+  const journalRows = await listOptionTradeJournal({ mode: 'live' });
+  const plan = planStaleOpenRepair(journalRows, ledger.records);
+  const voidsBefore = getOptionTradeVoids();
+
+  // The ledger is the ONLY discriminator, so its own health gates the whole run.
+  // An ephemeral store, an append error, or an empty record set all make "no
+  // ledger row" mean "the ledger is broken", not "the order never filled" — and
+  // under that reading a retraction pass would delete real trades. Refuse.
+  const ledgerUsable =
+    !ledger.durability.ephemeral && ledger.durability.appendErrors === 0 && ledger.n > 0;
+  if (apply && !ledgerUsable) {
+    res.status(409).json({
+      ok: false,
+      error: 'fill ledger is not a usable discriminator; refusing to apply',
+      durability: ledger.durability,
+      n: ledger.n,
+      detail:
+        'The partition reads a MISSING ledger row as proof of a non-fill. If the ledger is '
+        + 'ephemeral, has append errors, or is empty, that inference is inverted and the pass would '
+        + 'retract real trades.',
+    });
+    return;
+  }
+
+  const applied: {
+    id: string;
+    optionSymbol: string | null;
+    treatment: string;
+    ok: boolean;
+    detail: string;
+  }[] = [];
+  if (apply) {
+    for (const row of plan.rows) {
+      if (row.treatment === 'retract') {
+        const ok = await recordOptionTradeVoid(row.id, 'tra3485_repair_never_filled');
+        applied.push({
+          id: row.id,
+          optionSymbol: row.optionSymbol,
+          treatment: 'retract',
+          ok,
+          // `false` here is the stop signal from the parent's brief: it means the
+          // fold refused the void because the row was already CLOSED, i.e. the
+          // retraction was pointed at a filled trade.
+          detail: ok ? 'row retracted through the replay fold' : 'REFUSED by the fold (row unknown or already CLOSED)',
+        });
+      } else if (row.treatment === 'backfill_close' && row.close) {
+        await recordOptionTradeClose(row.id, row.close);
+        applied.push({
+          id: row.id,
+          optionSymbol: row.optionSymbol,
+          treatment: 'backfill_close',
+          ok: true,
+          detail: `CLOSE written: ${row.close.outcome} ${row.close.realizedPnlUsd} USD, exitReason ${row.close.exitReason}`,
+        });
+      } else {
+        applied.push({
+          id: row.id,
+          optionSymbol: row.optionSymbol,
+          treatment: 'no_action',
+          ok: true,
+          detail: row.reason,
+        });
+      }
+    }
+  }
+
+  // Re-read AFTER the pass, from the same fold every production read uses, so
+  // the response proves what the store now says rather than what we intended.
+  const after = apply ? await listOptionTradeJournal({ mode: 'live' }) : journalRows;
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    applied: apply,
+    reconstructedExitReason: RECONSTRUCTED_EXIT_REASON,
+    ledger: { n: ledger.n, durability: ledger.durability, usableDiscriminator: ledgerUsable },
+    plan,
+    results: applied,
+    // The before/after control the parent asked for: `voids.total` must grow by
+    // EXACTLY the retract count. A retraction is a DELETE, so a pass that did
+    // nothing and a pass that worked produce the same surviving-row count — the
+    // void witness is the only thing that tells them apart.
+    voids: { before: { total: voidsBefore.total, applied: voidsBefore.applied, refused: voidsBefore.refused }, after: apply ? getOptionTradeVoids() : null },
+    liveOpenRowsAfter: after.filter((r) => r.outcome === 'OPEN').length,
+    note: apply
+      ? `Applied: ${plan.counts.retract} retracted, ${plan.counts.backfillClose} closes back-filled, ${plan.counts.noAction} refused.`
+      : `DRY RUN — nothing written. Plan: ${plan.counts.retract} retract / ${plan.counts.backfillClose} backfill_close / ${plan.counts.noAction} no_action. Re-POST with ?apply=true&confirm=TRA-3485 to execute.`,
   });
 });
 
