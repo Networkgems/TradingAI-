@@ -107,6 +107,51 @@
 // raw route does NOT — measured 2026-08-13), else parsed from that source. A
 // hand-typed copy is defect #2 above, rebuilt one level in.
 //
+// ── TRA-3507: a well-formed pair can still be worthless ──────────────────────
+// Every guard above asks "is this delta ARITHMETICALLY sound?". A pair can pass
+// all of them and still answer a question nobody asked. Reproduced live on
+// 2026-08-13 at 05:22-05:41Z (build e44a6d406a6b, pid 74): same pid, same
+// startedAt, positive deltas, per-book, 1:1 sample parity — and it derives
+// books.live PREFIX = 99.335%. It is worthless twice over, and the payload says
+// so in two fields the original reader never opened:
+//
+//   * `marketOpen: false` — off-hours BOTH exit passes have nothing to do, so
+//     the split measures the instrument's idle cost, not the market's.
+//   * `books.live.armedEngineCount: 0` / `verdict: "disarmed"` — 2.62ms of exit
+//     work per region is the cost of a pass that FINDS NOTHING TO DO. A disarmed
+//     book cannot answer how expensive exit work is.
+//
+// Both fail in the EXPENSIVE direction: a ~99% PREFIX reads as "narrowing hoists
+// out almost everything, it is nearly free" — the reading that makes narrowing a
+// real-money interlock look safe. So:
+//
+//   7. REFUSE unless BOTH reads carry `marketOpen: true` AND both timestamps sit
+//      inside 09:30-16:00 AMERICA/NEW_YORK. Asserted on the payload's own `time`
+//      and `marketOpen`, never on the wall clock this script happened to run at.
+//      The ET test is not redundant with the snapshot module's 13:30-20:00Z
+//      constants: those are FIXED UTC and correct only under EDT. Under EST they
+//      admit a 13:30-14:30Z PRE-OPEN hour and reject the 20:00-21:00Z closing
+//      hour. `marketOpen` is DST-aware (`isStockMarketOpen`) but holiday-BLIND;
+//      the ET clock test is holiday-blind too. Neither subsumes the other and
+//      neither sees a holiday — a session-calendar check needs a server field
+//      this script does not have.
+//   8. REFUSE a BOOK whose `armedEngineCount` is 0 or whose `verdict` is
+//      `disarmed` at EITHER endpoint. It reports `<<DISARMED>>` — never a
+//      number, never a 0. Absent arm state reports `<<ABSENT>>`: a zero is a
+//      claim about a measurement nobody took (TRA-3443's own discipline).
+//      `--allow-outside-rth` does NOT lift this one.
+//   9. A REFUSED read WITHHOLDS EVERY FIGURE. The original reader printed the
+//      full per-book table ABOVE its refusal, so a run that correctly refused
+//      still put "99.33%" on the operator's screen and into `--json`, one
+//      copy-paste from TRA-2268. A refusal that still prints the number is not
+//      a refusal.
+//
+// `marketOpen` is stamped by the ROUTE HANDLER (health-routes.ts, outside
+// `rollUpExitCadence`), so a TRA-2840 snapshot LINE does not carry it — the same
+// location trap as `notDifferenceable`, in the other direction. A snapshot-line
+// read therefore REFUSES under #7 unless the rollup itself grows the field. Fail
+// closed and name the remedy; do not derive it from this script's own clock.
+//
 // ── Usage ────────────────────────────────────────────────────────────────────
 //   node scripts/tra3443-exit-region-taxonomy.mjs                      # taxonomy only
 //   node scripts/tra3443-exit-region-taxonomy.mjs --census=FILE        # + censored grade
@@ -126,9 +171,12 @@
 //                          payload or a TRA-2840 `exit-cadence-snapshot` line.
 //                          OMIT to use the implicit zero vector at process boot.
 //   --exit-cadence-t1=FILE closing read, same two shapes.
-//   --allow-outside-rth    publish a window that is not contained in RTH. LOUD:
-//                          an off-hours split measures the INSTRUMENT, not the
+//   --allow-outside-rth    publish a window that is not contained in RTH, and/or
+//                          whose reads carry `marketOpen: false`. LOUD: an
+//                          off-hours split measures the INSTRUMENT, not the
 //                          market, and must never reach TRA-2268 as an answer.
+//                          It does NOT lift the DISARMED-book guard (TRA-3507
+//                          #8) — a disarmed book has no split at any hour.
 //   --slow-ms=N            PHASE_TIMING_SLOW_MS in force on the measured box (1000).
 //   --max-censor-ratio=R   refuse to publish a CENSORED share when hi/lo exceeds R (2.0).
 //   --src=FILE             override the signal-engine.ts path.
@@ -141,8 +189,9 @@
 //   3  REFUSED — the derivation is vacuous, the census names a phase this source
 //      does not emit, the censoring interval is too wide AND no uncensored read
 //      rescued it, the uncensored pair is not differenceable (restart, negative
-//      delta, broken containment, non-RTH window), or the two instruments
-//      CONTRADICT each other.
+//      delta, broken containment, non-RTH window, market closed, every book
+//      disarmed), or the two instruments CONTRADICT each other. On exit 3 the
+//      uncensored figures are WITHHELD, not printed (TRA-3507 #9).
 //      Exit 3 is a RESULT, not an error: it is this instrument declining to supply
 //      a number TRA-2268 would have to defend.
 
@@ -463,6 +512,65 @@ function getPath(obj, path) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
 }
 
+// ── TRA-3507 #7: the ET session clock ────────────────────────────────────────
+//
+// 09:30-16:00 America/New_York, resolved through the IANA tz database rather
+// than an offset this script computes. That is the same convention the server's
+// own `etSessionDate()` uses (exit-cadence-snapshot.ts), and it is what makes
+// this test independent of the FIXED-UTC 13:30-20:00Z constants, which are
+// correct only under EDT.
+const ET_RTH_OPEN_MIN = 9 * 60 + 30;
+const ET_RTH_CLOSE_MIN = 16 * 60;
+const ET_ZONE = 'America/New_York';
+
+/**
+ * `{ date: 'YYYY-MM-DD', min }` in ET, or null if this runtime cannot resolve
+ * the zone. A small-ICU node silently resolves every zone to UTC, which would
+ * shift the session window by 4-5 hours and quietly admit a pre-open pair — so
+ * the caller REFUSES on null rather than falling back to a computed offset.
+ */
+const ET_FMT = (() => {
+  try {
+    const f = new Intl.DateTimeFormat('en-CA', {
+      timeZone: ET_ZONE, hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+    // Probe: 2026-07-01T16:00Z is 12:00 ET under EDT. A UTC fallback answers 16:00.
+    const probe = f.formatToParts(Date.UTC(2026, 6, 1, 16, 0));
+    const h = Number(probe.find(p => p.type === 'hour')?.value);
+    return h === 12 ? f : null;
+  } catch { return null; }
+})();
+
+function etPartsOf(ms) {
+  if (!ET_FMT || !Number.isFinite(ms)) return null;
+  const p = Object.fromEntries(ET_FMT.formatToParts(ms).map(x => [x.type, x.value]));
+  const hour = Number(p.hour) % 24;
+  return { date: `${p.year}-${p.month}-${p.day}`, min: hour * 60 + Number(p.minute) };
+}
+
+const etClock = parts => `${String(Math.floor(parts.min / 60)).padStart(2, '0')}:${String(parts.min % 60).padStart(2, '0')} ET`;
+
+/**
+ * A book's ARM STATE at one endpoint (TRA-3507 #8).
+ *
+ * Three-valued on purpose. `armedEngineCount` is `number | null` on
+ * `ExitCadenceBookRollup` and is NULL when the book is blind — so a missing
+ * count is ABSENT, never 0, and never "armed by omission". The implicit boot
+ * T0 carries no observation at all and is the caller's to skip explicitly.
+ */
+function armStateOf(read, book) {
+  const armed = getPath(read.rollup, `books.${book}.armedEngineCount`);
+  const verdict = getPath(read.rollup, `books.${book}.verdict`);
+  if (verdict === 'disarmed') return { state: 'DISARMED', armed: armed ?? null, verdict, why: `verdict="disarmed"` };
+  if (typeof armed !== 'number') {
+    return { state: 'ABSENT', armed: null, verdict: verdict ?? null,
+      why: `armedEngineCount is ${armed === null ? 'null (book is blind)' : typeof armed}` };
+  }
+  if (armed === 0) return { state: 'DISARMED', armed, verdict: verdict ?? null, why: 'armedEngineCount=0' };
+  return { state: 'ARMED', armed, verdict: verdict ?? null, why: `armedEngineCount=${armed}` };
+}
+
 /**
  * Normalise either accepted shape into one envelope.
  *
@@ -474,14 +582,24 @@ function getPath(obj, path) {
 function loadCadenceRead(file, mark) {
   const raw = JSON.parse(readFileSync(file, 'utf8'));
   if (raw && raw.rollup && raw.process) {
+    // `marketOpen` is stamped by the route handler OUTSIDE `rollUpExitCadence`,
+    // so a snapshot line does not carry it today. Read it off the rollup anyway
+    // rather than hardcoding the absence: if the field is ever moved inside, this
+    // path starts working with no edit, and until then it resolves to null and
+    // the caller REFUSES. (Measured 2026-08-13: health-routes.ts:5892.)
     return {
-      mark, file, shape: 'TRA-2840 exit-cadence-snapshot line',
+      mark, file, shape: 'TRA-2840 exit-cadence-snapshot line', implicit: false,
       at: raw.at ?? null,
       process: {
         pid: raw.process.pid ?? null,
         startedAt: raw.process.startedAt ?? null,
         commit: raw.process.commit ?? null,
       },
+      marketOpen: typeof raw.rollup.marketOpen === 'boolean' ? raw.rollup.marketOpen : null,
+      marketOpenSource: typeof raw.rollup.marketOpen === 'boolean'
+        ? 'declared on the snapshot line rollup'
+        : 'ABSENT — `marketOpen` is stamped by the route handler outside rollUpExitCadence, so a TRA-2840 '
+          + 'snapshot line does not carry it. Capture the raw /api/health/exit-cadence payload for this read',
       notDifferenceable: Array.isArray(raw.notDifferenceable) ? raw.notDifferenceable : null,
       partialWindow: raw.partialWindow ?? null,
       rollup: raw.rollup,
@@ -489,13 +607,18 @@ function loadCadenceRead(file, mark) {
   }
   if (raw && raw.books && raw.build) {
     return {
-      mark, file, shape: '/api/health/exit-cadence payload',
+      mark, file, shape: '/api/health/exit-cadence payload', implicit: false,
       at: raw.time ?? null,
       process: {
         pid: raw.build.pid ?? null,
         startedAt: raw.build.startedAt ?? null,
         commit: raw.build.commit ?? null,
       },
+      marketOpen: typeof raw.marketOpen === 'boolean' ? raw.marketOpen : null,
+      marketOpenSource: typeof raw.marketOpen === 'boolean'
+        ? 'declared on the payload'
+        : 'ABSENT from a payload that should carry it — this build predates the field, or the capture was '
+          + 'edited. Absent is not open',
       notDifferenceable: Array.isArray(raw.notDifferenceable) ? raw.notDifferenceable : null,
       partialWindow: null,
       rollup: raw,
@@ -516,8 +639,14 @@ function zeroReadAtBoot(t1) {
   const books = {};
   for (const b of Object.keys(t1.rollup.books ?? {})) books[b] = { tickExitRegionMs: zero() };
   return {
-    mark: 'T0', file: '(implicit)', shape: 'implicit zero vector at process boot',
+    mark: 'T0', file: '(implicit)', shape: 'implicit zero vector at process boot', implicit: true,
     at: t1.process.startedAt, process: { ...t1.process },
+    // No observation exists at the boot instant, so there is nothing to declare.
+    // NOT copied from T1: manufacturing an observation is how a guard goes blind.
+    // The caller derives both session state and arm state from T1 EXPLICITLY,
+    // and says so in a note.
+    marketOpen: null,
+    marketOpenSource: 'implicit boot read — no payload was served at the boot instant',
     notDifferenceable: null, partialWindow: null,
     rollup: { books, tickExitRegionMs: zero() },
   };
@@ -596,14 +725,95 @@ function gradeUncensored(t0, t1, snapModule) {
         + 'CHECK. Off-hours the exit passes are near-idle, so PREFIX runs to ~99% and means nothing about '
         + 'narrowing in either direction. This figure must NOT reach TRA-2268.');
     }
+
+    // 3b. TRA-3507 #7, leg one: the SESSION clock, not the fixed-UTC one.
+    // The bounds above come from RTH_{OPEN,CLOSE}_UTC_MIN, which are correct only
+    // under EDT. Under EST they admit a 13:30-14:30Z PRE-OPEN window and reject
+    // the 20:00-21:00Z closing hour. Resolve ET through the tz database instead.
+    const et0 = etPartsOf(t0Ms);
+    const et1 = etPartsOf(t1Ms);
+    if (!et0 || !et1) {
+      refusals.push(`this runtime cannot resolve the ${ET_ZONE} time zone (small-ICU node), so the payload `
+        + 'timestamps cannot be placed inside the ET session. Refusing rather than falling back to a computed '
+        + 'UTC offset: a fallback that is wrong twice a year is wrong exactly when nobody is looking');
+    } else {
+      const etInside = et0.date === et1.date
+        && et0.min >= ET_RTH_OPEN_MIN && et1.min <= ET_RTH_CLOSE_MIN;
+      window.et = { from: `${et0.date} ${etClock(et0)}`, to: `${et1.date} ${etClock(et1)}`, inside: etInside };
+      if (!etInside && !ALLOW_OUTSIDE_RTH) {
+        refusals.push(`the window is NOT inside one 09:30-16:00 ${ET_ZONE} session `
+          + `(T0 ${window.et.from} -> T1 ${window.et.to}). Asserted on the payloads' own timestamps, never on `
+          + 'the wall clock this script ran at. This is a SEPARATE test from the 13:30-20:00Z one above: those '
+          + 'constants are fixed UTC and hold only under EDT');
+      }
+      if (!etInside && ALLOW_OUTSIDE_RTH) {
+        notes.push(`WINDOW IS OUTSIDE THE 09:30-16:00 ${ET_ZONE} SESSION (${window.et.from} -> ${window.et.to}) `
+          + 'and --allow-outside-rth was passed. INSTRUMENT CHECK ONLY.');
+      }
+    }
+  }
+
+  // 3c. TRA-3507 #7, leg two: the producer's own market-session flag.
+  // The clock test above cannot see a holiday or a weekend that the ET calendar
+  // does not distinguish; `marketOpen` is the server's own predicate and is
+  // DST-aware. Neither test subsumes the other, so BOTH are required. Absent is
+  // never "open" — a read that does not declare it has not answered.
+  for (const r of [t0, t1]) {
+    if (r.implicit) continue;   // handled explicitly below
+    if (r.marketOpen === true) continue;
+    const detail = r.marketOpen === false
+      ? `${r.mark} declares \`marketOpen: false\``
+      : `${r.mark} does not declare \`marketOpen\` (${r.marketOpenSource})`;
+    if (!ALLOW_OUTSIDE_RTH) {
+      refusals.push(`${detail} — with the market closed BOTH exit passes have nothing to do, so the split `
+        + 'measures the instrument\'s idle cost and not the market\'s. It fails in the EXPENSIVE direction: a '
+        + '~99% PREFIX reads as "narrowing is nearly free"');
+    } else {
+      notes.push(`${detail}; published only because --allow-outside-rth was passed. INSTRUMENT CHECK ONLY.`);
+    }
+  }
+  if (t0.implicit && !t1.implicit && t1.marketOpen === true) {
+    // The boot instant served no payload, so T0's session state is DERIVED, and
+    // only from facts already asserted above: the window is contained in ONE ET
+    // session, and T1 declares the market open in it. `isStockMarketOpen` is a
+    // pure function of the clock and the weekday, so it cannot have been false at
+    // boot and true at T1 inside one session. Stated out loud because a derived
+    // fact that is not labelled gets re-read as a measured one.
+    notes.push('T0 SESSION STATE IS DERIVED, not observed: the boot instant served no payload. It is sound '
+      + 'only because the window is contained in a single ET session and T1 declares `marketOpen: true` — '
+      + 'both asserted above. It is NOT copied from T1 as an observation.');
   }
 
   // 4. The per-book deltas.
   const books = {};
+  const suppressed = {};
   const bookNames = Object.keys(t1.rollup.books ?? {});
   if (!bookNames.length) refusals.push('T1 carries no `books` partition — refusing to grade a fleet-only rollup (TRA-2645/TRA-2677)');
 
   for (const book of bookNames) {
+    // TRA-3507 #8. Before any arithmetic: does this book have an armed exit
+    // engine? A disarmed book's exit work is the cost of a pass that finds
+    // NOTHING TO DO, so its split answers a question about the idle path. Checked
+    // at EVERY endpoint that served a payload — armed at T1 does not mean armed
+    // across the window. Suppression is PER BOOK, not a whole-read refusal: a
+    // disarmed live book must not silently take a healthy demo split down with
+    // it, and it must not publish a number of its own either.
+    const arms = [t0, t1].filter(r => !r.implicit).map(r => ({ mark: r.mark, ...armStateOf(r, book) }));
+    const bad = arms.find(a => a.state !== 'ARMED');
+    if (bad) {
+      suppressed[book] = {
+        reason: bad.state,                       // DISARMED | ABSENT
+        display: `<<${bad.state}>>`,             // never a number, never a 0
+        detail: `${bad.mark}: ${bad.why}`,
+        arms,
+      };
+      continue;
+    }
+    if (t0.implicit) {
+      notes.push(`books.${book}: arm state is read at T1 only — the implicit boot T0 served no payload, so a `
+        + 'book that was disarmed for part of the window would not be visible here. A real T0 '
+        + '(--exit-cadence-t0=) is the only way to bound that.');
+    }
     if (notDifferenceable) {
       const banned = differencedPaths(book).filter(p => notDifferenceable.includes(p));
       if (banned.length) {
@@ -666,26 +876,67 @@ function gradeUncensored(t0, t1, snapModule) {
     };
   }
 
+  const suppressedNames = Object.keys(suppressed);
+  if (suppressedNames.length && !Object.keys(books).length) {
+    refusals.push(`EVERY book is suppressed (${suppressedNames.map(b => `${b}: ${suppressed[b].reason}`).join(', ')})`
+      + ' — there is no armed population left to grade. That is BLIND, not a 0% split');
+  }
+
   // The fleet aggregate is computed for the CROSS-CHECK ONLY and is never an answer.
+  // It is WITHHELD outright when any book is suppressed: a fleet sum that folds a
+  // disarmed book's idle time into an armed book's is a contaminated positive
+  // control, and a contaminated control agrees with anything.
   let fleet = null;
   const fr1 = t1.rollup.tickExitRegionMs;
   const fr0 = t0.rollup.tickExitRegionMs;
-  if (fr1?.exitWorkMs && fr0?.exitWorkMs) {
+  if (!suppressedNames.length && fr1?.exitWorkMs && fr0?.exitWorkMs) {
     const regionMs = (fr1.sumMs ?? 0) - (fr0.sumMs ?? 0);
     const workMs = (fr1.exitWorkMs.sumMs ?? 0) - (fr0.exitWorkMs.sumMs ?? 0);
     if (regionMs > 0 && workMs >= 0 && workMs <= regionMs) {
       fleet = { regionMs, workMs, prefixMs: regionMs - workMs, prefixShare: (regionMs - workMs) / regionMs };
     }
   }
+  if (suppressedNames.length) {
+    notes.push(`the fleet aggregate is WITHHELD because ${suppressedNames.join(', ')} ${suppressedNames.length > 1 ? 'are' : 'is'} `
+      + 'suppressed — a fleet sum that folds a disarmed book into an armed one cannot serve as a cross-check.');
+  }
 
   const publishable = refusals.length === 0 && Object.keys(books).length > 0;
   return {
     verdict: publishable ? 'PUBLISHED' : 'REFUSED',
     source: 'UNCENSORED — /api/health/exit-cadence tickExitRegionMs.exitWorkMs, T0/T1 differenced (TRA-3444)',
-    refusals, notes, window, books, fleet,
+    refusals, notes, window, books, suppressed, fleet,
     notDifferenceable, notDifferenceableSource: notDiffSource,
-    reads: [t0, t1].map(r => ({ mark: r.mark, file: r.file, shape: r.shape, at: r.at, process: r.process })),
+    reads: [t0, t1].map(r => ({
+      mark: r.mark, file: r.file, shape: r.shape, at: r.at, process: r.process,
+      marketOpen: r.marketOpen ?? null, marketOpenSource: r.marketOpenSource ?? null, implicit: !!r.implicit,
+    })),
   };
+}
+
+/**
+ * TRA-3507 #9 — a REFUSED read publishes NOTHING.
+ *
+ * The original reader printed the whole per-book table ABOVE its refusal, so a
+ * run that correctly refused still put `99.33%` on the screen and into `--json`.
+ * A number in a report gets quoted; the paragraph under it does not travel with
+ * it. Withholding is therefore part of the refusal, not presentation.
+ *
+ * Withheld: every per-book row, the fleet aggregate, and the raw millisecond
+ * terms they are one subtraction apart from. Kept: the refusals, the notes, the
+ * process identity and the window — everything an operator needs to take a
+ * VALID read instead.
+ */
+function withholdFigures(unc) {
+  if (!unc || unc.verdict !== 'REFUSED') return unc;
+  const withheld = {};
+  for (const [b, v] of Object.entries(unc.books)) {
+    withheld[b] = { display: '<<REFUSED>>', regionSamples: v.regionSamples };
+  }
+  for (const [b, v] of Object.entries(unc.suppressed)) {
+    withheld[b] = { display: v.display, reason: v.reason, detail: v.detail };
+  }
+  return { ...unc, books: {}, suppressed: {}, fleet: null, withheld };
 }
 
 /**
@@ -834,6 +1085,9 @@ if (t1File) {
       + 'cumulative since boot. If the window above is not RTH-contained, this process booted before the open '
       + 'and a real T0/T1 pair (--exit-cadence-t0=) is required.');
   }
+  // TRA-3507 #9. Applied HERE, before anything downstream can read a figure off
+  // it — the cross-check, the JSON dump and the human report all consume `unc`.
+  unc = withholdFigures(unc);
 }
 
 // ── the combined verdict ─────────────────────────────────────────────────────
@@ -899,14 +1153,31 @@ if (unc) {
     console.log(`           ${r.shape}${r.file === '(implicit)' ? '' : `  <- ${r.file}`}`);
   }
   if (unc.window) {
-    console.log(`  window : ${unc.window.spanMin} min${unc.window.insideRth ? ', RTH-contained' : ', NOT RTH-contained'}`);
+    console.log(`  window : ${unc.window.spanMin} min${unc.window.insideRth ? ', RTH-contained' : ', NOT RTH-contained'}`
+      + (unc.window.et ? `  |  ${unc.window.et.from} -> ${unc.window.et.to}`
+        + `${unc.window.et.inside ? ', inside the ET session' : ', OUTSIDE the 09:30-16:00 ET session'}` : ''));
   }
+  console.log(`  market : ${unc.reads.map(r => `${r.mark}=${r.implicit ? 'derived' : (r.marketOpen === true ? 'open' : r.marketOpen === false ? 'CLOSED' : 'UNDECLARED')}`).join(' ')}`);
   console.log(`  notDifferenceable: ${unc.notDifferenceableSource}`
     + `${unc.notDifferenceable ? ` (${unc.notDifferenceable.length} entries, honoured)` : ' — UNRESOLVED'}`);
   console.log();
 
   const bookNames = Object.keys(unc.books);
-  if (bookNames.length) {
+  const suppressedNames = Object.keys(unc.suppressed ?? {});
+  const withheldNames = Object.keys(unc.withheld ?? {});
+
+  if (withheldNames.length) {
+    // TRA-3507 #9 — the refusal path. No seconds, no shares, no fleet.
+    console.log(`  ${'book'.padEnd(6)} ${'regions'.padStart(8)}   figures`);
+    for (const b of withheldNames) {
+      const w = unc.withheld[b];
+      console.log(`  ${b.padEnd(6)} ${String(w.regionSamples ?? '-').padStart(8)}   ${w.display}`
+        + `${w.detail ? `  (${w.detail})` : ''}`);
+    }
+    console.log('\n  FIGURES WITHHELD. This read REFUSED, and a refusal that still prints the number is not a');
+    console.log('  refusal — the number gets quoted and the paragraph under it does not travel with it. The');
+    console.log('  refusals below say what to fix; re-take a read that satisfies them.');
+  } else if (bookNames.length || suppressedNames.length) {
     console.log(`  ${'book'.padEnd(6)} ${'regions'.padStart(8)} ${'region'.padStart(11)} ${'exit work'.padStart(11)} `
       + `${'PREFIX'.padStart(11)} ${'PREFIX%'.padStart(9)}`);
     for (const b of bookNames) {
@@ -915,15 +1186,39 @@ if (unc) {
         + `${`${f1(v.workMs / 1000)}s`.padStart(11)} ${`${f1(v.prefixMs / 1000)}s`.padStart(11)} `
         + `${`${(v.prefixShare * 100).toFixed(2)}%`.padStart(9)}`);
     }
-    console.log('\n  PREFIX   = region - exit work, EXACTLY. No threshold, no absent-vs-zero, no censoring.');
-    console.log('  RESIDUAL = exit work = runEquityExitPass + runOptionsExitPass = what refreshExitsOnly re-runs.');
+    for (const b of suppressedNames) {
+      const s = unc.suppressed[b];
+      console.log(`  ${b.padEnd(6)} ${s.display.padStart(8)} ${'-'.padStart(11)} ${'-'.padStart(11)} `
+        + `${'-'.padStart(11)} ${s.display.padStart(9)}`);
+    }
+    if (bookNames.length) {
+      console.log('\n  PREFIX   = region - exit work, EXACTLY. No threshold, no absent-vs-zero, no censoring.');
+      console.log('  RESIDUAL = exit work = runEquityExitPass + runOptionsExitPass = what refreshExitsOnly re-runs.');
+    }
     for (const b of bookNames) {
       const v = unc.books[b];
+      // Kept from the pre-TRA-3507 reader, but its conclusion is now the opposite.
+      // It used to read `enabled: false` as "context, not a reason to discard";
+      // guard 8 discards on the ARM COUNT, so a published book that still reports
+      // `enabled: false` is the two fields DISAGREEING, and that is a defect in
+      // the read, not colour.
       if (v.enabled === false) {
-        console.log(`\n  NOTE books.${b}: enabled=false, armedEngineCount=${v.armedEngineCount} — the decoupled `
-          + 'hoist is DISARMED on this book. The region timing above is still real (doTick runs regardless); what');
-        console.log('       is disarmed is the decoupled pass. Relevant context for TRA-2268, not a reason to discard.');
+        console.log(`\n  ** CONTRADICTION books.${b}: enabled=false but armedEngineCount=${v.armedEngineCount} (> 0, so`);
+        console.log('     TRA-3507 #8 let it through). The two fields disagree about whether this book is armed.');
+        console.log('     Resolve it before quoting the row above — do not read `enabled: false` as harmless context.');
       }
+    }
+    for (const b of suppressedNames) {
+      const s = unc.suppressed[b];
+      console.log(`\n  ${s.display} books.${b}: ${s.detail}. TRA-3507 #8 — a disarmed book's exit work is the cost`);
+      console.log('       of a pass that finds NOTHING TO DO, so its split answers a question about the IDLE path.');
+      console.log(`       No number is printed for books.${b}, and 0 is not the answer either: a zero is a claim`);
+      console.log('       about a measurement nobody took.');
+    }
+    if (suppressedNames.includes('live')) {
+      console.log('\n  ** THIS READ CARRIES NO MONEY-BOOK ANSWER. books.live is the only population TRA-2268 may');
+      console.log('     cite; it is suppressed above. Nothing in this report may be handed to TRA-2268 as a');
+      console.log('     PREFIX/RESIDUAL share, including the demo row.');
     }
     console.log('\n  The fleet aggregate is deliberately NOT published (TRA-2645/TRA-2677): a demo engine cannot');
     console.log('  contribute evidence to a real-money criterion. Read books.live for the money book.');
@@ -954,6 +1249,9 @@ if (!censored) {
       const v = unc.books[b];
       console.log(`  books.${b.padEnd(5)} PREFIX = ${(v.prefixShare * 100).toFixed(2)}% of region  `
         + `(RESIDUAL = ${(v.residualShare * 100).toFixed(2)}%, the floor narrowing cannot reclaim)`);
+    }
+    for (const b of Object.keys(unc.suppressed ?? {})) {
+      console.log(`  books.${b.padEnd(5)} ${unc.suppressed[b].display}  — ${unc.suppressed[b].detail}. No share exists for this book.`);
     }
     console.log('\n  No censored tape was supplied, so the cross-check did not run. Pass --census= to run it.');
   } else {
@@ -1021,6 +1319,9 @@ if (verdict === 'PUBLISHED') {
       const v = unc.books[b];
       console.log(`  books.${b.padEnd(5)} PREFIX = ${(v.prefixShare * 100).toFixed(2)}% of region  `
         + `(RESIDUAL = ${(v.residualShare * 100).toFixed(2)}%, the floor narrowing cannot reclaim)`);
+    }
+    for (const b of Object.keys(unc.suppressed ?? {})) {
+      console.log(`  books.${b.padEnd(5)} ${unc.suppressed[b].display}  — ${unc.suppressed[b].detail}. No share exists for this book.`);
     }
     if (censored.refusals.length) {
       console.log('\n  The censored tape above still refuses, and that refusal is CORRECT for the tape — no');
