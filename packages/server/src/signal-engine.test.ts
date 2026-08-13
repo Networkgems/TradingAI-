@@ -496,6 +496,118 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     });
   });
 
+  // ── TRA-3504 — THE HOIST, and the reason it needs a test of its own ────────
+  //
+  // The live ceiling used to sit BELOW `costAwareGateReject`, which `continue`s on
+  // reject at a measured retained block rate of 0.9928 (1929/1943) with a deployed
+  // tape admitting exactly one cell, `0.50-0.55`. Downstream of that bar every
+  // surviving candidate has |Δ| ∈ [0.50, 0.55) and cannot breach a 0.55 ceiling —
+  // so `entry_delta_ceiling_shadow.blocked` was pinned to 0 BY CONSTRUCTION and
+  // read identically to a clean far-tail. QuantTrader held the observe flip on
+  // TRA-3501 rather than publish that vacuous zero.
+  //
+  // These assert the ordering BEHAVIOURALLY: a candidate the armed live cost bar
+  // DECLINES must still have reached the ceiling and been recorded. Against the
+  // old order every one of them reads `evaluated: 0`. If someone re-sinks the
+  // ceiling below the bar, this suite goes red instead of going quietly vacuous.
+  describe('live entry-delta ceiling is ordered ABOVE the cost bar (TRA-3504)', () => {
+    const HOIST_ENV = [
+      'ENABLE_OPTION_COST_GATE_LIVE_ENFORCE',
+      'ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE',
+      'ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE',
+      'OPTION_ENTRY_DELTA_CEILING_LIVE',
+      'OPTION_LIVE_OTM_UNIVERSE',
+      'DATA_DIR',
+    ] as const;
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of HOIST_ENV) saved[k] = process.env[k];
+      for (const k of HOIST_ENV) delete process.env[k];
+      clearLiveEnforceGateLedger();
+      clearCostAwareGateLedger();
+      // The bar ARMED AND ENFORCING on the live path — exactly how bqb1 runs it.
+      process.env.ENABLE_OPTION_COST_GATE_LIVE_ENFORCE = '1';
+      // The ceiling dark-but-recording: the state TRA-3501 wants to flip into.
+      process.env.ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE = '1';
+    });
+    afterEach(() => {
+      for (const k of HOIST_ENV) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    });
+
+    const runLiveOtm = async (delta: number) => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockResolvedValue({
+        symbol: 'AAPL',
+        spot: 195,
+        expiration: '2024-07-05',
+        candidates: [makeOtmCandidate({ delta })],
+        reason: 'ok',
+      });
+      const engine = new SignalEngine(undefined, undefined, scanner);
+      (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+      await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+      return engine;
+    };
+    const gate = (g: string) =>
+      summarizeLiveEnforceGate(etDateString(new Date())).byGate.find((x) => x.gate === g);
+
+    it('records the shadow verdict for a Δ=0.60 candidate the armed cost bar DECLINES', async () => {
+      await runLiveOtm(0.60);
+
+      // Precondition — this really is a candidate the bar refuses. Without this the
+      // test could pass on a candidate the bar admitted, which proves nothing about
+      // ordering (the old order handles that case fine).
+      const bar = gate('cost_bar');
+      expect(bar?.blocked).toBe(1);
+
+      // THE HOIST. Below the bar this is `evaluated: 0` — the gate never runs.
+      const shadow = gate('entry_delta_ceiling_shadow');
+      expect(shadow?.evaluated).toBe(1);
+      // ...and the far-tail breach is COUNTED, which is the read TRA-3501 needs.
+      expect(shadow?.blocked).toBe(1);
+      expect(shadow?.byReason[0]?.reasonCode).toBe('above_mandate_ceiling');
+    });
+
+    it('records the shadow verdict for a Δ=0.05 candidate the armed cost bar DECLINES', async () => {
+      await runLiveOtm(0.05);
+
+      expect(gate('cost_bar')?.blocked).toBe(1);
+
+      // Evaluated but NOT breached: 0.05 is far below the 0.55 ceiling. This is the
+      // per-band denominator that turns the zero above into a checkable zero — it
+      // separates "looked at, did not breach" from "never looked at" (TRA-1407).
+      const shadow = gate('entry_delta_ceiling_shadow');
+      expect(shadow?.evaluated).toBe(1);
+      expect(shadow?.blocked).toBe(0);
+    });
+
+    it('is a PURE INSTRUMENTATION hoist — observe mode still opens, and blocks nothing', async () => {
+      const engine = await runLiveOtm(0.60);
+      // The ceiling recorded and returned null; the open was stopped by the COST
+      // BAR, on the cost bar's reason — attribution is unchanged while dark.
+      expect(engine.getState().signals[0]?.liveSkipReason ?? '').not.toContain('ceiling');
+      // Nothing landed on the ENFORCING gate — observe records on the shadow axis
+      // only. (`byGate` enumerates every gate, so the read is `evaluated: 0`, not
+      // an absent row — which is exactly the ambiguity the shadow counter exists
+      // to resolve, and why the two tests above assert `evaluated`, not presence.)
+      expect(gate('entry_delta_ceiling')?.evaluated).toBe(0);
+    });
+
+    it('stays OFF by default — no shadow gate exists with the observe flag clear', async () => {
+      delete process.env.ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE_OBSERVE;
+      await runLiveOtm(0.60);
+
+      // The bar still ran (proving the candidate reached the stack at all), but the
+      // hoisted call recorded NOTHING: `mode === 'off'` returns before the ledger.
+      expect(gate('cost_bar')?.blocked).toBe(1);
+      expect(gate('entry_delta_ceiling_shadow')?.evaluated).toBe(0);
+    });
+  });
+
   it('runOtmScan ignores `expensive` OTM candidates (long-only path) (TRA-1207)', async () => {
     const scanner = new StubScanner();
     scanner.scanOtm.mockResolvedValue({

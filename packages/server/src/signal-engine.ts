@@ -9931,12 +9931,75 @@ export class SignalEngine {
           continue;
         }
 
+        // TRA-3394 item 1 — LIVE arm of the entry delta CEILING, the upper edge of
+        // the TRA-3392 band. No-op unless mode==='live' AND one of
+        // ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE{,_OBSERVE} is armed in the process
+        // env; in observe mode it RECORDS and returns null, so the open proceeds
+        // exactly as it does today. Churn-brake surfacing: an enforced reject is
+        // visible on the feed, not just in the log.
+        //
+        // ⚠️ TRA-3504 — ORDERED ABOVE THE COST BAR, and that placement is the whole
+        // instrument. It used to sit below, adjacent to its floor half. But the bar
+        // `continue`s on reject at a measured RETAINED BLOCK RATE OF 0.9928
+        // (1929/1943), and the deployed tape admits exactly ONE cell — `0.50-0.55`
+        // (lo95 +0.712). Every bucket at or above 0.55 is bar-blocked upstream, and
+        // `gross_unknown` fails closed there too. So downstream of the bar, every
+        // candidate that could reach this call has |Δ| in [0.50, 0.55) and CANNOT
+        // breach a ceiling at 0.55: `byGate[entry_delta_ceiling_shadow].blocked` was
+        // pinned to 0 BY CONSTRUCTION, not by the absence of a far-tail nomination.
+        // Those two states read identically, so flipping the observe arm below the
+        // bar would have manufactured a vacuous clean read — worse than silence
+        // (TRA-1407 / TRA-1486, the same failure the shadow gate exists to avoid).
+        //
+        // This is the ordering TRA-3394 item 2 already ratified for the mandate vs
+        // the bar: the mandate is consulted BEFORE `barR`, before the cell lookup,
+        // and before any comparison a retune could move. THE ORDER IS THE GUARANTEE.
+        // The ceiling is the other half of the same authorized band `[0.495, 0.55)`
+        // and belongs on the same side of the bar as its floor half.
+        //
+        // Pure instrumentation hoist under today's config — `off` returns null
+        // before recording anything and `observe` records then returns null, so no
+        // order moves in either state. If the ceiling is ever moved to `enforce`, a
+        // |Δ| ≥ 0.55 candidate attributes to `entry_delta_ceiling` instead of
+        // `cost_bar`: that ledger discontinuity is the CORRECT attribution, not a
+        // regression — a mandate breach is not a cost decline.
+        //
+        // NOTE the FLOOR half (`otmDeltaFloorLiveRejectReason`, TRA-2763) still sits
+        // BELOW the bar and carries the same structural exposure while disarmed; it
+        // is out of scope here and tracked back to QuantTrader on TRA-3501.
+        const otmLiveCeilingReject = this.entryDeltaCeilingLiveRejectReason(
+          'single_leg_otm',
+          cheap.delta,
+        );
+        if (otmLiveCeilingReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmLiveCeilingReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by entry delta ceiling (TRA-3394)', {
+            sym, delta: cheap.delta, reason: otmLiveCeilingReject,
+          });
+          continue;
+        }
+
         // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the OTM
-        // open. Same DEMO-ONLY + OFF-by-default gate as the RV path: reject a
+        // open. Same DEMO-ONLY + OFF-by-default demo arm as the RV path: reject a
         // far-OTM lottery-delta candidate whose modeled gross R can't clear the
-        // options cost bar. Placed before the live-suppression bail; a no-op in
-        // live regardless (costAwareGateReject is mode==='demo'-gated). Ingredients
-        // are the OTM candidate mark + delta and its 2:1 take-profit / stop.
+        // options cost bar. Ingredients are the OTM candidate mark + delta and its
+        // 2:1 take-profit / stop.
+        //
+        // ⚠️ NOT a no-op in live. TRA-2048 added a LIVE ENFORCING branch inside the
+        // method (guarded by `isOptionCostGateLiveEnforceEnabled`, PROCESS env only)
+        // and it is ARMED on bqb1 today — this is the single highest-blocking gate
+        // on the live path, retained block rate 0.9928 (1929/1943). The comment here
+        // read "a no-op in live regardless (costAwareGateReject is
+        // mode==='demo'-gated)" until TRA-3504; that claim was stale for the entire
+        // life of the live arm and is why the `continue` below was not recognised as
+        // the thing pinning every gate ordered after it. Anything added downstream
+        // of this line sees ~0.7% of live nominees.
         const otmCostReject = this.costAwareGateReject('single_leg_otm', {
           mark: cheap.mark,
           delta: cheap.delta,
@@ -9991,32 +10054,6 @@ export class SignalEngine {
           });
           log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
             sym, delta: cheap.delta, reason: otmLiveFloorReject,
-          });
-          continue;
-        }
-
-        // TRA-3394 item 1 — LIVE arm of the entry delta CEILING, the other edge
-        // of the same band. Runs immediately AFTER the floor so the two halves of
-        // the TRA-3392 authorization are adjacent and each records its own verdict
-        // on its own gate. No-op unless mode==='live' AND one of
-        // ENABLE_OPTION_ENTRY_DELTA_CEILING_LIVE{,_OBSERVE} is armed in the
-        // process env; in observe mode it RECORDS and returns null, so the open
-        // proceeds exactly as it does today. Same churn-brake surfacing as the
-        // floor: an enforced reject is visible on the feed, not just in the log.
-        const otmLiveCeilingReject = this.entryDeltaCeilingLiveRejectReason(
-          'single_leg_otm',
-          cheap.delta,
-        );
-        if (otmLiveCeilingReject) {
-          signal.mode = 'live';
-          signal.liveSkipReason = otmLiveCeilingReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-          this.dailySignals.push({
-            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
-          });
-          log.info('live OTM open rejected by entry delta ceiling (TRA-3394)', {
-            sym, delta: cheap.delta, reason: otmLiveCeilingReject,
           });
           continue;
         }
