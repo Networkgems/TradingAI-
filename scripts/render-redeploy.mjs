@@ -85,6 +85,9 @@
 //                       MEASUREMENT, this one protects the SERVICE STAYING UP. "The soak is
 //                       already broken, ship it" is a perfectly good reason to break the
 //                       freeze and no reason at all to boot a process that throws.
+//   --allow-rollback="reason"  deploy something OLDER than what is serving anyway. Fifth
+//                       and last, and the only one whose hazard is created by the caller
+//                       typing MORE, not less — see the gate note below.
 //   --dry-run           print the gate decision and the intended call, POST nothing.
 //
 // ── Exit codes ────────────────────────────────────────────────────────────────
@@ -94,6 +97,7 @@
 //   5  REFUSED — a dated embargo covers this instant and no override given
 //   6  REFUSED — the deploy would carry a HELD COMMIT, or it cannot be proven not to
 //   7  REFUSED — the host's live AUTH_SECRET is unusable, or it cannot be READ (BLIND)
+//   8  REFUSED — the deploy would ROLL THE HOST BACK, or it cannot be proven not to
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -168,6 +172,29 @@ export const EMBARGOES = [
       'and (b) extend it across the post-close reads the freeze does not cover: 20:02Z TRA-3052 ' +
       'stale-working-exit tail, 20:05Z TRA-3044 close fire, 20:25Z TRA-1648 soak check, 20:25Z ' +
       'TRA-2305 tickExitRegionMs. Spent at 20:35Z; the TRA-3057 carrier deploys at 20:40Z.',
+  },
+  {
+    from: '2026-08-13T20:00:00Z',
+    // Contiguous with the RTH freeze close (20:00Z) on purpose — no gap. Closes 21:45Z so
+    // the 21:50Z TRA-3619 carrier is the FIRST legal deploy after it, which is the one boot
+    // this row exists to funnel everything into.
+    to: '2026-08-13T21:45:00Z',
+    ticket: 'TRA-3625 / TRA-1648 / TRA-3619',
+    why:
+      'Thu 2026-08-13 post-close carries NINETEEN graded reads between 20:10Z and 21:40Z, and three ' +
+      'separate deploy carriers fired at bqb1 inside them (20:30Z TRA-3547, 21:00Z TRA-3387, 21:50Z ' +
+      'TRA-3619). Deploying each one separately boots the soak host three times, and the 20:30Z boot ' +
+      'lands underneath the 20:25Z TRA-1648 go-live soak gate (7d30dcfc) plus the 20:30/20:40/20:45Z ' +
+      'reads. Enumerated from the live routine table at 19:2xZ: 20:10 TRA-3417 098ce476 + TRA-3299 ' +
+      '9a576b6f, 20:15 TRA-3394 50d19ffb, 20:20 TRA-3510 384f8725, 20:25 TRA-3417 + TRA-1648 7d30dcfc, ' +
+      '20:30 TRA-2536 7e7ab58e + TRA-3505 c839d767, 20:40 TRA-3417, 20:45 TRA-3516 22fbe2f5 + TRA-2879 ' +
+      '41c0c68d + TRA-2331 7c3af47e + TRA-2945 ec0f4a75, 21:00 TRA-3419 10c10d02, 21:15 TRA-2242 ' +
+      '20d3357e + TRA-2636 8d2c80a9 + TRA-3505 a1cc3e61, 21:30 TRA-1398 6213da0a, 21:40 TRA-2220 ' +
+      '5293f29f. The RTH freeze stops at 20:00Z and does NOT cover post-close reads — that gap is what ' +
+      'the TRA-2306 and TRA-3066 rows above were each written to patch, one day at a time. ' +
+      'NOTHING IS LOST BY WAITING: 8713331 (TRA-3547) and 48a0883 (TRA-3387) are both strict ancestors ' +
+      'of the 229af6d tip, and check:deploy-train-window grades a deploy order by ANCESTRY, so the ' +
+      'single 21:50Z tip deploy satisfies all three orders at once. Three boots collapse into one.',
   },
 ];
 
@@ -369,6 +396,117 @@ export function resolveTarget(branch, requestedCommit) {
   return { sha, source: `origin/${branch} tip (no --commit given)`, carries: held => gitCarries(held, sha) };
 }
 
+// ── The stale-pin ROLLBACK gate (TRA-3625) ────────────────────────────────────
+// Every gate above answers a question about the commit IN ISOLATION: is it held, is the
+// calendar clear, will it boot. None of them compares it to WHAT IS ALREADY SERVING. So a
+// `--commit` that was the tip when somebody wrote it into a carrier, and is an ancestor of
+// the tip by the time that carrier is actually executed, sails through all four and
+// SILENTLY REVERTS the host to it.
+//
+// ⚠ THIS IS THE ONE HAZARD THE CALLER CREATES BY TYPING MORE, NOT LESS. The header above
+// warns that omitting `--commit` ships an unknown tip; that is an UNDER-ship and it is
+// loud (check:deploy-drift reads STALE, and the ordered commit is still an ancestor of
+// live so check:deploy-train-window still reads SATISFIED). The opposite — naming a sha
+// and having it be OLD — reads as the careful thing to do and removes serving code.
+//
+// ── Why the predicate is "older than LIVE", not "ancestor of origin/main" ────
+// The obvious formulation is "refuse a --commit that is a strict ancestor of the tip".
+// That is WRONG, and wrong in a way that would jam an existing remedy shut: Gate 2's own
+// refusal text tells the operator to "deploy a commit that predates the held one
+// (--commit=<sha>)", and check-deploy-drift.mjs prints `--commit=<tip>` — under the
+// ancestor-of-tip rule the first is always refused and the second breaks the moment
+// anybody lands a commit between the print and the run. Neither is a rollback.
+//
+// A rollback is defined against the bytes the host is EXECUTING, so that is what this
+// compares. `origin/main` never enters it. The distance from tip is reported as a
+// non-blocking STALE PIN note instead (see stalePinNote) — under-shipping is worth
+// naming and is not worth refusing.
+//
+// FAILS CLOSED, like Gate 2 and Gate 0: an unreadable live sha, a sha unknown to this
+// checkout, or a git error is BLIND → REFUSE. A guard that degrades to "allowed" the
+// moment /api/health/version times out is not a guard, and the state it is protecting
+// (serving code that is about to vanish) is not recoverable by re-running.
+//
+// `isAncestor(a, b)` is "a is an ancestor of, or equal to, b" → true | false | null,
+// injected so this stays pure and the control suite can drive it without git.
+const short = sha => (typeof sha === 'string' ? sha.slice(0, 12) : '(none)');
+
+export function rollbackState(target, live, isAncestor = gitCarries) {
+  if (!target || !target.sha) {
+    return { verdict: 'BLIND', target, live, why: target?.error ?? 'the target commit could not be resolved' };
+  }
+  if (!live || !live.sha) {
+    return {
+      verdict: 'BLIND',
+      target,
+      live,
+      why: live?.error ?? 'the live commit could not be read, so "older than live" is unanswerable',
+    };
+  }
+  // Compare full shas when we have them, but a short --commit against a long live sha is
+  // the normal case, so fall back to the ancestry answers rather than a string compare.
+  const forward = isAncestor(live.sha, target.sha); // live ⊆ target → nothing is lost
+  if (forward === null) {
+    return {
+      verdict: 'BLIND',
+      target,
+      live,
+      why: `cannot test whether live ${short(live.sha)} is an ancestor of ${short(target.sha)} (object missing from this checkout, or git failed)`,
+    };
+  }
+  const backward = isAncestor(target.sha, live.sha); // target ⊆ live → live has extra commits
+  if (backward === null) {
+    return {
+      verdict: 'BLIND',
+      target,
+      live,
+      why: `cannot test whether ${short(target.sha)} is an ancestor of live ${short(live.sha)} (object missing from this checkout, or git failed)`,
+    };
+  }
+  // Ancestry is reflexive, so equal shas answer true BOTH ways. Check that first, or a
+  // no-op redeploy (the ordinary "restart the box on the same build" call) reads FORWARD
+  // and the operator is never told the deploy changes nothing.
+  if (forward && backward) return { verdict: 'NOOP', target, live, why: null };
+  if (forward) return { verdict: 'FORWARD', target, live, why: null };
+  if (backward) return { verdict: 'ROLLBACK', target, live, why: null };
+  return {
+    verdict: 'DIVERGED',
+    target,
+    live,
+    why:
+      `live ${short(live.sha)} and ${short(target.sha)} are on different histories — neither contains ` +
+      'the other, so this deploy drops live commits AND adds unrelated ones',
+  };
+}
+
+// ROLLBACK and DIVERGED both remove serving code. BLIND means we could not prove it does
+// not. All three refuse; only FORWARD and NOOP proceed.
+export function rollbackBlocks(verdict) {
+  return verdict === 'ROLLBACK' || verdict === 'DIVERGED' || verdict === 'BLIND';
+}
+
+// The non-blocking half: naming an old-but-still-forward sha is legal (it does not remove
+// serving code) and is exactly what the three TRA-3625 carriers did. Say so, with the
+// commits it leaves on the floor, so "the deploy went green" is not read as "we shipped
+// what is on main". Returns '' when there is nothing to say.
+export function stalePinNote(target, tipSha, isAncestor = gitCarries) {
+  if (!target?.sha || !tipSha || target.source !== '--commit') return '';
+  const behindTip = isAncestor(target.sha, tipSha);
+  if (behindTip !== true) return ''; // not behind the tip, or unanswerable — not this note's subject
+  // ⚠ NOT `target.sha === tipSha`. resolveTarget passes --commit through VERBATIM, so the
+  // ordinary "pin the tip" call compares a 7-char sha against a 40-char one, the string
+  // test misses, and ancestry is reflexive — so pinning the tip printed STALE PIN and told
+  // the operator to drop the flag they were right to use. Ask ancestry BOTH ways instead;
+  // that is equality in the only representation both sides agree on.
+  if (isAncestor(tipSha, target.sha) !== false) return ''; // equal, or unanswerable
+  return (
+    `          ⚠ STALE PIN: --commit=${short(target.sha)} is an ANCESTOR of origin/main ${short(tipSha)}.\n` +
+    `            This is an UNDER-ship, not a rollback (nothing serving is removed), so it is\n` +
+    `            allowed — but check:deploy-drift will read STALE against this host afterwards.\n` +
+    `            If you meant "ship what is on main", drop --commit and let Render take the tip.`
+  );
+}
+
 // ── AUTH_SECRET value gate (TRA-2387) ─────────────────────────────────────────
 // Services whose BOOT reads AUTH_SECRET. render.yaml declares the key on exactly one
 // service (L76-77, `generateValue: true`, tradingai-bqb1), and that declaration is the
@@ -482,6 +620,8 @@ const AUTH_SECRET_OVERRIDE_REASON = valOf('--force-auth-secret-override');
 const HAS_AUTH_SECRET_OVERRIDE = argv.some(
   a => a === '--force-auth-secret-override' || a.startsWith('--force-auth-secret-override='),
 );
+const ROLLBACK_OVERRIDE_REASON = valOf('--allow-rollback');
+const HAS_ROLLBACK_OVERRIDE = argv.some(a => a === '--allow-rollback' || a.startsWith('--allow-rollback='));
 
 function fail(code, msg) {
   console.error(`[render-redeploy] ERROR: ${msg}`);
@@ -553,6 +693,55 @@ async function fetchEnvVarProbe(serviceId) {
     if (!cursor) return { rows, truncated: true };
   }
   return { rows, truncated: true };
+}
+
+// What the host is EXECUTING right now — the operand of the rollback gate (TRA-3625).
+//
+// ⛔ DELIBERATELY the process's own answer (/api/health/version), not the Render deploy
+// list, and deliberately NOT `api()`. Same reasoning as fetchEnvVarProbe: an unreachable
+// health route is the gate going BLIND, not a usage error, and it must say so under its
+// own exit code. The deploy list is also the wrong source — it can say `live` for a build
+// the pm2 watchdog has since restarted off of (TRA-2203/TRA-2261).
+const LIVE_HEALTH_URL = process.env.ROLLBACK_LIVE_URL ?? `https://${SOAK_HOST_NAME}.onrender.com/api/health/version`;
+const LIVE_PROBE_TIMEOUT_MS = 25_000;
+
+async function fetchLiveCommit() {
+  let res;
+  try {
+    res = await fetch(LIVE_HEALTH_URL, { signal: AbortSignal.timeout(LIVE_PROBE_TIMEOUT_MS) });
+  } catch (e) {
+    return { sha: null, error: `GET ${LIVE_HEALTH_URL} failed: ${e?.message ?? String(e)}` };
+  }
+  if (!res.ok) return { sha: null, error: `GET ${LIVE_HEALTH_URL} returned HTTP ${res.status}` };
+  let body;
+  try {
+    body = await res.json();
+  } catch (e) {
+    return { sha: null, error: `GET ${LIVE_HEALTH_URL} did not return JSON: ${e?.message ?? String(e)}` };
+  }
+  const commit = body?.commit;
+  // A build that could not read its own SHA still reports SOMETHING. Do not grade a
+  // placeholder as a commit — that would silently turn the gate into a rubber stamp.
+  if (typeof commit !== 'string' || !/^[0-9a-f]{7,40}$/i.test(commit)) {
+    return {
+      sha: null,
+      error:
+        `${LIVE_HEALTH_URL} carried no usable commit (commit=${JSON.stringify(commit)}, ` +
+        `commitSource=${JSON.stringify(body?.commitSource)})`,
+    };
+  }
+  // Resolve against this checkout so the ancestry tests below have a real object. A live
+  // sha we have never fetched is BLIND, not "far away" — same call as check:deploy-drift.
+  const rev = git(['rev-parse', `${commit}^{commit}`]);
+  if (rev.status !== 0) {
+    return {
+      sha: null,
+      error:
+        `the LIVE commit ${commit} is unknown to this checkout — it may predate a fetch, or the ` +
+        'host may be running a build that was never pushed here. Run `git fetch origin` and re-run',
+    };
+  }
+  return { sha: (rev.stdout ?? '').trim(), reported: commit, startedAt: body?.startedAt ?? null };
 }
 
 async function resolveService() {
@@ -696,6 +885,62 @@ async function main() {
     );
   }
 
+  // ── Gate 4: would this deploy ROLL THE HOST BACK? (TRA-3625) ────────────────
+  // Sits next to the commit hold because it is the other "may I deploy THIS?" question,
+  // and ahead of the two calendar gates for the same reason they are: its remedy is a
+  // different COMMIT, not a different HOUR, so answering "outside freeze" first would
+  // answer a question the caller did not ask.
+  const live = isSoakHost ? await fetchLiveCommit() : null;
+  const rollback = isSoakHost ? rollbackState(target, live) : { verdict: 'NOT_GATED', why: null };
+
+  if (isSoakHost && rollbackBlocks(rollback.verdict) && !HAS_ROLLBACK_OVERRIDE) {
+    const dropped =
+      rollback.verdict === 'ROLLBACK' && live?.sha && target.sha
+        ? git(['log', '--format=%h %s', `${target.sha}..${live.sha}`])
+        : null;
+    console.error(
+      `[render-redeploy] REFUSED: this deploy would ${
+        rollback.verdict === 'ROLLBACK'
+          ? 'ROLL THE HOST BACK'
+          : rollback.verdict === 'DIVERGED'
+            ? 'REPLACE THE SERVING HISTORY'
+            : 'CANNOT BE PROVEN not to roll the host back'
+      } — TRA-3625.\n` +
+        `  live    : ${live?.sha ?? '(unreadable)'}${live?.reported ? `  [reported ${live.reported}]` : ''}\n` +
+        `  target  : ${target.sha ?? '(unresolved)'}  [${target.source}]\n` +
+        (rollback.why ? `  blind   : ${rollback.why}\n` : '') +
+        (dropped?.status === 0 && dropped.stdout?.trim()
+          ? `  These commits are SERVING NOW and this deploy REMOVES them:\n` +
+            dropped.stdout
+              .trim()
+              .split('\n')
+              .map(l => `    ✗ ${l}`)
+              .join('\n') +
+            '\n'
+          : '') +
+        `  A pinned --commit ages: it was the tip when somebody wrote it into a carrier, and a\n` +
+        `  deploy carrier is EXECUTED whenever its assignee's queue reaches it, not when it fires.\n` +
+        `  Nothing between those two instants re-derives the pin.\n` +
+        `  FIX: drop --commit and let Render take the branch tip. check:deploy-train-window grades\n` +
+        `  a deploy order by ANCESTRY ("is the ordered commit an ancestor of live?"), not equality,\n` +
+        `  so deploying the TIP still satisfies an order that names an older sha.\n` +
+        `  If the rollback is the POINT (reverting a bad build, or clearing a commit hold per the\n` +
+        `  Gate 2 refusal above), re-run with --allow-rollback="why" — the reason is recorded.`,
+    );
+    process.exit(8);
+  }
+
+  if (isSoakHost && rollbackBlocks(rollback.verdict) && HAS_ROLLBACK_OVERRIDE) {
+    if (!ROLLBACK_OVERRIDE_REASON || !ROLLBACK_OVERRIDE_REASON.trim()) {
+      fail(2, '--allow-rollback requires a non-empty reason, e.g. --allow-rollback="reverting the bad c0ffee build".');
+    }
+    console.error(
+      `[render-redeploy] WARNING: deploying ${rollback.verdict} onto ${service.name} at ${nowZ}. ` +
+        `Reason: ${ROLLBACK_OVERRIDE_REASON}. Anything graded green against the code you are removing ` +
+        `is no longer evidence about this host — re-read it after the boot, and tell whoever published it.`,
+    );
+  }
+
   if (isSoakHost && embargo && !HAS_EMBARGO_OVERRIDE) {
     console.error(
       `[render-redeploy] REFUSED: ${service.name} (${service.id}) is under a DATED EMBARGO ` +
@@ -773,6 +1018,24 @@ async function main() {
   console.log(
     `commit  : ${target.sha ?? '(unresolved)'} [${target.source}]${CLEAR_CACHE ? ' + clear-cache' : ''}`,
   );
+  // Print the live sha and the direction on EVERY run, not only on a refusal. "commit :"
+  // one line up names what ships; without this line nothing on a green run says what it
+  // REPLACES, and a no-op redeploy and a two-commit advance read identically (TRA-3625).
+  console.log(
+    `live    : ${
+      !isSoakHost
+        ? '(not the soak host — rollback gate N/A)'
+        : rollback.verdict === 'NOOP'
+          ? `${short(live.sha)} — target is the SAME build; this deploy changes no code, it only reboots`
+          : rollback.verdict === 'FORWARD'
+            ? `${short(live.sha)} → ${short(target.sha)} FORWARD, nothing serving is removed`
+            : `${live?.sha ? short(live.sha) : 'UNREADABLE'} — ${rollback.verdict}, OVERRIDDEN`
+    }`,
+  );
+  {
+    const note = stalePinNote(target, resolveTarget(service.branch ?? 'main', undefined).sha);
+    if (note) console.log(note);
+  }
   console.log(
     `holds   : ${
       holdCheck.active.length === 0
