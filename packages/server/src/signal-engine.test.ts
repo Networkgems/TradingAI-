@@ -70,6 +70,8 @@ vi.mock('./yahoo-feed.js', () => ({
 import { fetchDailyCandles, fetchTradierDailyCandles } from './yahoo-feed.js';
 // TRA-2262 — the per-tick fan-out bound on the doTick sinks.
 import { resetSweepCursors, sweepCursorSnapshot, type SweepPass } from './tick-sweep-budget.js';
+// TRA-3557 — read the OTM scan-run telemetry the engine is supposed to WRITE.
+import { summarizeRvScanPath, __resetRvScanTelemetry } from './rv-scan-telemetry.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync, writeFileSync } from 'fs';
@@ -868,6 +870,174 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       expect(pass!.budgetExhausted).toBe(false);
       expect(pass!.processed).toEqual(symbols);
       expect(sweepCursorSnapshot()['demo:otm-scan']).toBeUndefined();
+    });
+  });
+
+  // TRA-3557 — scan-run telemetry on the OTM sleeve.
+  //
+  // ⚠️ These drive the REAL `runOtmScan` and read the shared telemetry store. That
+  // is the entire point: `rv-scan-telemetry.test.ts` already proves `RvScanRun`
+  // counts correctly, and `health-routes.test.ts` proves the route publishes it —
+  // neither can say the engine ever CALLS it. A test that opens its own
+  // `beginRvScan('otm', …)` would pass just as green against an uninstrumented
+  // `runOtmScan`, which is the state this ticket exists to fix.
+  describe('runOtmScan opens a scan run (TRA-3557)', () => {
+    const chargeSeconds = (s: number) => vi.setSystemTime(new Date(Date.now() + s * 1000));
+
+    /** Scanner that returns `n` empty-but-OK chains, charging `secs` of latency each. */
+    const emptyScanner = (secs = 0): StubScanner => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockImplementation(async (sym: string) => {
+        if (secs) chargeSeconds(secs);
+        return { symbol: sym, spot: 195, expiration: '2024-07-05', candidates: [], reason: 'ok' };
+      });
+      return scanner;
+    };
+    const runScan = (engine: SignalEngine, symbols: string[]) =>
+      (engine as unknown as { runOtmScan: (s: string[]) => Promise<SweepPass | null> }).runOtmScan(symbols);
+    const otmView = () => summarizeRvScanPath('otm', { enabled: true, instrumented: true });
+
+    beforeEach(() => { resetSweepCursors(); __resetRvScanTelemetry(); });
+
+    // THE ticket. Before this, an all-`continue` OTM pass left nothing anywhere:
+    // the `continue` is upstream of the nominator, of `recordLiveEnforceDecision`
+    // and of the universe gate, so `cost_bar.evaluated === 0` was produced
+    // identically by "scanned 10 names, found nothing" and "never scanned".
+    it('a scan that finds NOTHING reports the symbols CONSIDERED, not zero', async () => {
+      const engine = new SignalEngine(undefined, undefined, emptyScanner());
+
+      await runScan(engine, ['AAPL', 'MSFT', 'NVDA']);
+
+      const view = otmView();
+      expect(view.scanCountSinceBoot).toBe(1);
+      expect(view.lastScanAt).not.toBeNull();
+      const last = view.lastScan!;
+      // 3, not 0 — input-counted at the top of the loop body.
+      expect(last.candidatesEvaluated).toBe(3);
+      expect(last.universeSize).toBe(3);
+      expect(last.candidatesPassed).toBe(0);
+      expect(last.opensPlaced).toBe(0);
+      expect(last.rejectionsByGate).toEqual({ no_candidates: 3 });
+      expect(last.bucketsBalance).toBe(true);
+      // A usable chain came back on every name, so the feed is healthy — this is
+      // what separates a dead provider from a quiet tape on the OTM axis.
+      expect(view.lastFetchOkAt).not.toBeNull();
+    });
+
+    // The fail state of the test above. If the sleeve stands down, it must record
+    // NO scan at all — `lastScanAt: null`, "never ran" — rather than a zero-count
+    // scan that reads as "ran, found nothing". This is why the run is opened BELOW
+    // the early-return gates rather than at the top of the method.
+    it('a stood-down sleeve records NO scan run at all', async () => {
+      const engine = new SignalEngine(undefined, undefined, undefined);
+
+      const pass = await runScan(engine, ['AAPL', 'MSFT', 'NVDA']);
+
+      expect(pass).toBeNull();
+      const view = otmView();
+      expect(view.scanCountSinceBoot).toBe(0);
+      expect(view.lastScanAt).toBeNull();
+      expect(view.lastScan).toBeNull();
+    });
+
+    // Pooling these would re-create the ticket's own ambiguity one level down: an
+    // empty chain is a negative to grade the sleeve on, a provider failure is an
+    // outage that VOIDS the grade.
+    it('splits a provider failure from a genuinely empty chain', async () => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockImplementation(async (sym: string) =>
+        sym === 'AAPL'
+          ? { symbol: sym, spot: 0, expiration: null, candidates: [], reason: 'no_chain' }
+          : { symbol: sym, spot: 195, expiration: '2024-07-05', candidates: [], reason: 'ok' });
+      const engine = new SignalEngine(undefined, undefined, scanner);
+
+      await runScan(engine, ['AAPL', 'MSFT']);
+
+      const last = otmView().lastScan!;
+      expect(last.rejectionsByGate).toEqual({ 'scan:no_chain': 1, no_candidates: 1 });
+      expect(last.bucketsBalance).toBe(true);
+    });
+
+    // The constraint the ticket named: `runOtmScan` returns a budgeted `SweepPass`,
+    // so a truncated pass must not close its run reading like a full sweep.
+    it('a budget-TRUNCATED pass closes its run honestly', async () => {
+      const engine = new SignalEngine(undefined, undefined, emptyScanner(16));
+      const symbols = Array.from({ length: 20 }, (_, i) => `S${i}`);
+
+      const pass = await runScan(engine, symbols);
+      expect(pass!.budgetExhausted).toBe(true);
+
+      const last = otmView().lastScan!;
+      expect(last.universeSize).toBe(20);
+      expect(last.candidatesEvaluated).toBe(2);
+      // The 18-symbol gap is EXPLAINED. Without this it is indistinguishable from
+      // the loop dying at symbol 2.
+      expect(last.stoppedEarlyReason).toBe('sweep_budget_exhausted');
+      expect(last.sweep).toEqual({
+        startIndex: 0, processed: 2, complete: false,
+        budgetExhausted: true, stopped: false, resumeAt: 'S2',
+      });
+    });
+
+    // A RESUMED pass reaches the end of the universe (`complete: true`) having
+    // walked only its tail — the case a completeness flag alone gets wrong.
+    it('a RESUMED tail is named too, and its slice is published', async () => {
+      const engine = new SignalEngine(undefined, undefined, emptyScanner(16));
+      const symbols = Array.from({ length: 4 }, (_, i) => `S${i}`);
+
+      await runScan(engine, symbols);          // S0,S1 — truncated
+      const second = await runScan(engine, symbols); // S2,S3 — resumed, reaches the end
+
+      expect(second!.complete).toBe(true);
+      expect(second!.startIndex).toBe(2);
+      const last = otmView().lastScan!;
+      expect(last.candidatesEvaluated).toBe(2);
+      expect(last.universeSize).toBe(4);
+      expect(last.stoppedEarlyReason).toBe('sweep_resumed_tail');
+      expect(last.sweep!.startIndex).toBe(2);
+      // Two passes, two scan runs — the counter advances per PASS, not per sweep.
+      expect(otmView().scanCountSinceBoot).toBe(2);
+    });
+
+    // POSITIVE CONTROL for the two above. If `stoppedEarlyReason` were set
+    // unconditionally they would both pass against an instrument that reports
+    // "truncated" always — the reason has to have a demonstrable null state.
+    it('a FULL sweep from the head records NO early-stop reason', async () => {
+      const engine = new SignalEngine(undefined, undefined, emptyScanner());
+
+      const pass = await runScan(engine, ['AAPL', 'MSFT', 'NVDA']);
+
+      expect(pass!.complete).toBe(true);
+      const last = otmView().lastScan!;
+      expect(last.stoppedEarlyReason).toBeNull();
+      expect(last.sweep).toEqual({
+        startIndex: 0, processed: 3, complete: true,
+        budgetExhausted: false, stopped: false, resumeAt: null,
+      });
+    });
+
+    // The other end of the ledger: a symbol that clears every gate and opens is
+    // counted as passed AND opened, so `candidatesPassed - opensPlaced` isolates
+    // account-level refusals from scanner-level rejections.
+    it('counts a real open as passed AND opened, with the buckets balancing', async () => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockImplementation(async (sym: string) =>
+        sym === 'AAPL'
+          ? { symbol: sym, spot: 195, expiration: '2024-07-05', candidates: [makeOtmCandidate()], reason: 'ok' }
+          : { symbol: sym, spot: 195, expiration: '2024-07-05', candidates: [], reason: 'ok' });
+      const engine = new SignalEngine(undefined, undefined, scanner);
+
+      await runScan(engine, ['AAPL', 'MSFT']);
+
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+      const last = otmView().lastScan!;
+      expect(last.candidatesEvaluated).toBe(2);
+      expect(last.candidatesPassed).toBe(1);
+      expect(last.opensPlaced).toBe(1);
+      expect(last.rejectionsByGate).toEqual({ no_candidates: 1 });
+      // No `unattributed` residual ⇒ every symbol that entered is accounted for.
+      expect(last.bucketsBalance).toBe(true);
+      expect(last.rejectionsByGate.unattributed).toBeUndefined();
     });
   });
 

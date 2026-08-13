@@ -3484,14 +3484,20 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     // This is the 2026-07-22 state: the flag was wiped, so the loop never ran.
     // Before this route there was no name for it.
     const { body } = mountRvScan({ ENABLE_OPTION_DEMO_DIRECTIONAL: undefined });
-    expect(body.verdict).toBe('disarmed');
-    expect(body.enabled).toBe(false);
+    // TRA-3557 — asserted PER PATH, not on the roll-up. The top-level verdict is an
+    // ANY/ALL fold and `otm` (no feature flag, armed whenever the chain scanner is
+    // wired) now holds it off `disarmed` permanently, so a roll-up assertion here
+    // would be pinned by construction rather than by the flag under test — the
+    // vacuous-green shape this route exists to prevent.
+    expect(body.verdict).toBe('armed_but_never_ran');
+    expect(body.enabled).toBe(true);
     // NULL, not 0. A 0 here is a valid epoch and would survive a finite-check on
     // the consumer side while asserting a scan that never happened.
     expect(body.lastScanAt).toBeNull();
     const dir = (body.paths as unknown as Array<Record<string, unknown>>)
       .find((p) => p.path === 'directional')!;
     expect(dir.enabled).toBe(false);
+    expect(dir.verdict).toBe('disarmed');
     expect(dir.lastScan).toBeNull();
   });
 
@@ -3532,8 +3538,15 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
     // scanner that is armed and not ticking.
     expect(armed.lastScanAt).toBeNull();
     expect(disarmed.lastScanAt).toBeNull();
-    expect(armed.verdict).toBe('armed_but_never_ran');
-    expect(disarmed.verdict).toBe('disarmed');
+    // TRA-3557 — on the PER-PATH axis. The roll-up reads `armed_but_never_ran` in
+    // BOTH arms now (the always-armed `otm` path pins it), so the separation this
+    // test is named for survives only here. That the two roll-ups agree while the
+    // two paths disagree is the whole reason the per-path verdict exists.
+    const dirOf = (b: Record<string, never>) => (b.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'directional')!;
+    expect(dirOf(armed).verdict).toBe('armed_but_never_ran');
+    expect(dirOf(disarmed).verdict).toBe('disarmed');
+    expect(armed.verdict).toBe(disarmed.verdict);
   });
 
   it('reports the UN-INSTRUMENTED iv-rv path with null counters, never zeros', () => {
@@ -3556,15 +3569,129 @@ describe('TRA-2193 GET /api/health/rv-scan', () => {
       rv_scan: 'single_leg_rv',
       directional: 'single_leg_directional',
       iv_rv_buy_premium: 'single_leg_directional',
+      // TRA-3557 — the OTM sleeve journals its own label and never shared a bucket.
+      otm: 'single_leg_otm',
     });
     // Each path also carries its own structureLabel inline.
     const paths = body.paths as unknown as Array<Record<string, unknown>>;
     expect(paths.find((p) => p.path === 'directional')!.structureLabel).toBe('single_leg_directional');
     expect(paths.find((p) => p.path === 'rv_scan')!.structureLabel).toBe('single_leg_rv');
+    expect(paths.find((p) => p.path === 'otm')!.structureLabel).toBe('single_leg_otm');
     expect(String(body.note)).toContain('entryArchetype');
     expect(String(body.note)).toContain('not a sleeve');
-    // All three producer paths are enumerated, so none can go quiet unnoticed.
-    expect(paths.length).toBe(3);
+    // All four producer paths are enumerated, so none can go quiet unnoticed.
+    expect(paths.length).toBe(4);
+  });
+
+  // TRA-3557 — the OTM sleeve is the path under live-money acceptance and was the
+  // only option entry path with NO scan run. Its starve was invisible on every axis
+  // the server published, because the `continue` it fires on sits upstream of the
+  // nominator, of `recordLiveEnforceDecision` and of the universe gate.
+  it('publishes an INSTRUMENTED otm path, so the sleeve under live acceptance is no longer silent', () => {
+    const { body } = mountRvScan();
+    const otm = (body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    expect(otm.instrumented).toBe(true);
+    // Never ran yet ⇒ null, not a zero-count scan that would read as "ran, found
+    // nothing" — the distinction the whole ticket turns on.
+    expect(otm.lastScanAt).toBeNull();
+    expect(otm.lastScan).toBeNull();
+    // 0 (not null) — an INSTRUMENTED path that has not scanned has a real
+    // measurement of zero, unlike the un-instrumented iv-rv path above.
+    expect(otm.scanCountSinceBoot).toBe(0);
+    expect(otm.verdict).toBe('armed_but_never_ran');
+  });
+
+  it('separates the three zeroes the OTM starve used to collapse into one', () => {
+    // (3) NEVER RAN — the defect. Nothing recorded at all.
+    const never = (mountRvScan().body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    expect(never.lastScan).toBeNull();
+    expect(never.scanCountSinceBoot).toBe(0);
+
+    // (2) RAN, FOUND NOTHING — a REAL negative. Ten names considered, all rejected,
+    // and the reasons SPLIT so a provider failure is not pooled with an empty chain.
+    const run = beginRvScan('otm', 10, () => NOW);
+    for (let i = 0; i < 8; i += 1) { run.enterSymbol(); run.reject('no_candidates'); }
+    for (let i = 0; i < 2; i += 1) { run.enterSymbol(); run.reject('scan:chain_error'); }
+    run.finish();
+    const ran = (mountRvScan().body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    const last = ran.lastScan as Record<string, unknown>;
+    expect(ran.scanCountSinceBoot).toBe(1);
+    expect(ran.lastScanAt).toBe(NOW);
+    // The counter that makes (2) legible: input-counted, so an all-`continue` pass
+    // reports the symbols CONSIDERED rather than the zero that reads as (3).
+    expect(last.candidatesEvaluated).toBe(10);
+    expect(last.candidatesPassed).toBe(0);
+    expect(last.rejectionsByGate).toEqual({ no_candidates: 8, 'scan:chain_error': 2 });
+    expect(last.bucketsBalance).toBe(true);
+    // Pooling those two would re-create this ticket's ambiguity one level down:
+    // `no_candidates` is a negative to grade on, `scan:*` is an outage that voids it.
+    expect(Object.keys(last.rejectionsByGate as object)).toHaveLength(2);
+  });
+
+  it('a budget-TRUNCATED otm pass cannot read as a completed sweep', () => {
+    // 80 of 614 walked, cursor parked mid-universe. Without the sweep block this
+    // publishes identically to a pass that died at symbol 80 — the same class of
+    // bug this ticket is about, one level down.
+    const run = beginRvScan('otm', 614, () => NOW);
+    for (let i = 0; i < 80; i += 1) { run.enterSymbol(); run.reject('no_candidates'); }
+    run.noteSweep({
+      startIndex: 0, processed: 80, complete: false,
+      budgetExhausted: true, stopped: false, resumeAt: 'NVDA',
+    }, 'iv_rv_cap_headroom');
+    run.finish();
+
+    const otm = (mountRvScan().body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    const last = otm.lastScan as Record<string, unknown>;
+    expect(last.universeSize).toBe(614);
+    expect(last.candidatesEvaluated).toBe(80);
+    // The gap is EXPLAINED, not left to be inferred.
+    expect(last.stoppedEarlyReason).toBe('sweep_budget_exhausted');
+    expect(last.sweep).toEqual({
+      startIndex: 0, processed: 80, complete: false,
+      budgetExhausted: true, stopped: false, resumeAt: 'NVDA',
+    });
+  });
+
+  it('names a RESUMED tail too — reaching the end of the universe is not covering it', () => {
+    // The case a `complete` flag alone gets wrong: the pass finished the sweep, but
+    // started at the cursor, so it walked 34 of 614. With no reason recorded that
+    // gap reads as a loop that died part-way through.
+    const run = beginRvScan('otm', 614, () => NOW);
+    for (let i = 0; i < 34; i += 1) { run.enterSymbol(); run.reject('no_candidates'); }
+    run.noteSweep({
+      startIndex: 580, processed: 34, complete: true,
+      budgetExhausted: false, stopped: false, resumeAt: null,
+    });
+    run.finish();
+
+    const otm = (mountRvScan().body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    const last = otm.lastScan as Record<string, unknown>;
+    expect(last.stoppedEarlyReason).toBe('sweep_resumed_tail');
+    expect((last.sweep as Record<string, unknown>).startIndex).toBe(580);
+  });
+
+  it('a FULL otm sweep records no early-stop reason — the fail state of the two above', () => {
+    // The positive control. If `stoppedEarlyReason` were set unconditionally the two
+    // assertions above would pass against an instrument that says "truncated" always.
+    const run = beginRvScan('otm', 3, () => NOW);
+    for (let i = 0; i < 3; i += 1) { run.enterSymbol(); run.reject('no_candidates'); }
+    run.noteSweep({
+      startIndex: 0, processed: 3, complete: true,
+      budgetExhausted: false, stopped: false, resumeAt: null,
+    });
+    run.finish();
+
+    const otm = (mountRvScan().body.paths as unknown as Array<Record<string, unknown>>)
+      .find((p) => p.path === 'otm')!;
+    const last = otm.lastScan as Record<string, unknown>;
+    expect(last.stoppedEarlyReason).toBeNull();
+    expect(last.candidatesEvaluated).toBe(3);
+    expect(last.universeSize).toBe(3);
   });
 
   // TRA-3080 — the failure this route had left: `enabled` is a PROCESS-WIDE flag

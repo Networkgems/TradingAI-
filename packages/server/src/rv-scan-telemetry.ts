@@ -37,18 +37,28 @@
 //         the invariant exists to catch.
 //     `bucketsBalance` is the assertion, in the payload, on every response.
 //
+// TRA-3557 — a FOURTH path, `otm`, and the one that needed this most: it is the
+// sleeve under live-money acceptance, and it was the only option entry path with
+// no scan run at all. Its `continue` on an empty/failed chain sits UPSTREAM of the
+// nominator, of `recordLiveEnforceDecision` and of the universe gate, so a starve
+// there left no gate row, no reason code and no log line — `cost_bar.evaluated: 0`
+// was produced identically by "pre-open", "scanned, found nothing" and "never
+// scanned". It is also the only instrumented path behind `runBudgetedSweep`, which
+// is why {@link RvScanSweepSlice} exists: see it before reading its counters.
+//
 // Process-global + in-memory by design, matching `/api/health/iv-rv`: these are
 // liveness facts about THIS process, and `scanCountSinceBoot` is only meaningful
 // since boot. A lifetime counter that survives a reboot cannot prove the scanner
 // ran today, which is the entire question being asked.
 
 /** An option single-leg entry path instrumented for scan liveness (TRA-1682/TRA-2193). */
-export type RvScanPathId = 'rv_scan' | 'directional' | 'iv_rv_buy_premium';
+export type RvScanPathId = 'rv_scan' | 'directional' | 'iv_rv_buy_premium' | 'otm';
 
 export const RV_SCAN_PATH_IDS: readonly RvScanPathId[] = [
   'rv_scan',
   'directional',
   'iv_rv_buy_premium',
+  'otm',
 ] as const;
 
 /**
@@ -61,6 +71,9 @@ export const RV_SCAN_PATH_STRUCTURE_LABEL: Readonly<Record<RvScanPathId, string>
   rv_scan: 'single_leg_rv',
   directional: 'single_leg_directional',
   iv_rv_buy_premium: 'single_leg_directional',
+  // TRA-3557 — the OTM sleeve journals its own label and always has; it is the
+  // one instrumented path that never shared a bucket with another producer.
+  otm: 'single_leg_otm',
 };
 
 /**
@@ -69,6 +82,33 @@ export const RV_SCAN_PATH_STRUCTURE_LABEL: Readonly<Record<RvScanPathId, string>
  * a real finding, not noise.
  */
 export const UNATTRIBUTED_GATE = 'unattributed';
+
+/**
+ * TRA-3557 — the slice a BUDGETED sweep actually walked. Null on the paths that
+ * consume their whole universe in one pass.
+ *
+ * `runOtmScan` is the only instrumented path sitting behind `runBudgetedSweep`
+ * (TRA-2262): it is handed the entire ~614-name watchlist and walks as much of it
+ * as a 30s wall-clock budget buys, resuming next pass at a persisted cursor. So on
+ * that path `candidatesEvaluated < universeSize` is the NORMAL case and carries no
+ * information by itself — which is the same ambiguity this module exists to kill,
+ * one level down. Without these fields a pass that covered symbols 80..160 of 614
+ * and a pass that died at symbol 80 publish byte-identical records.
+ */
+export interface RvScanSweepSlice {
+  /** Index into the universe this pass STARTED at (0 on a fresh sweep). */
+  startIndex: number;
+  /** Symbols the sweep handed to the worker. Diverges from `candidatesEvaluated` only on a bug. */
+  processed: number;
+  /** True iff the pass reached the END of the universe. */
+  complete: boolean;
+  /** True iff the wall-clock budget — rather than the universe — ended the pass. */
+  budgetExhausted: boolean;
+  /** True iff a caller-side gate stopped the pass before the budget did. */
+  stopped: boolean;
+  /** Symbol the next pass resumes at; null once the sweep is complete. */
+  resumeAt: string | null;
+}
 
 /** One completed scan pass over a symbol universe. */
 export interface RvScanRecord {
@@ -86,6 +126,11 @@ export interface RvScanRecord {
   bucketsBalance: boolean;
   /** Why the loop stopped before consuming the universe, or null if it did not. */
   stoppedEarlyReason: string | null;
+  /**
+   * TRA-3557 — budgeted-sweep slice, or null on a path that walks its universe in
+   * one pass. See {@link RvScanSweepSlice}.
+   */
+  sweep: RvScanSweepSlice | null;
 }
 
 interface PathState {
@@ -129,6 +174,7 @@ export class RvScanRun {
   private opens = 0;
   private readonly gates = new Map<string, number>();
   private stoppedEarly: string | null = null;
+  private sweep: RvScanSweepSlice | null = null;
   private done = false;
 
   constructor(
@@ -163,6 +209,30 @@ export class RvScanRun {
   /** The loop broke before consuming the universe (e.g. daily-cap headroom). */
   stopEarly(reason: string): void {
     this.stoppedEarly = reason;
+  }
+
+  /**
+   * TRA-3557 — close a BUDGETED pass honestly. Records the slice AND derives
+   * `stoppedEarlyReason` from it in one call, so the two cannot disagree and a
+   * caller cannot ship a truncated pass that reads as a completed sweep.
+   *
+   * A pass that merely RESUMED mid-universe is named too, not only a truncated
+   * one: it does reach the end of the universe (`complete: true`) but walked only
+   * the tail, so with no reason recorded its `universeSize - candidatesEvaluated`
+   * gap is indistinguishable from the loop dying part-way through — the exact
+   * misread `stoppedEarlyReason` exists to prevent (see the rv_scan path's
+   * `iv_rv_cap_headroom`).
+   *
+   * `stoppedGate` names the caller-side gate behind a `stopped` pass; the budgeted
+   * sweep itself does not know which one refused. Pass the SAME label the
+   * unbudgeted paths use for that gate so the two read against each other.
+   */
+  noteSweep(slice: RvScanSweepSlice, stoppedGate?: string): void {
+    this.sweep = slice;
+    if (slice.budgetExhausted) this.stoppedEarly = 'sweep_budget_exhausted';
+    else if (slice.stopped) this.stoppedEarly = stoppedGate ?? 'sweep_gate_stopped';
+    else if (!slice.complete) this.stoppedEarly = 'sweep_incomplete';
+    else if (slice.startIndex > 0) this.stoppedEarly = 'sweep_resumed_tail';
   }
 
   /** A market-data fetch this scan depends on succeeded. */
@@ -209,6 +279,7 @@ export class RvScanRun {
       rejectionsByGate,
       bucketsBalance: tagged === expected,
       stoppedEarlyReason: this.stoppedEarly,
+      sweep: this.sweep,
     };
 
     s.scanCountSinceBoot += 1;
@@ -231,6 +302,25 @@ export function beginRvScan(
   return new RvScanRun(path, universeSize, clock);
 }
 
+/**
+ * TRA-3557 — the TRA-2193 three-way verdict, PER PATH.
+ *
+ * It was previously computed only as a roll-up across every instrumented path,
+ * and that roll-up is lossy in a way that only bites once the paths disagree:
+ * `disarmed` requires EVERY armed path to be off, so adding `otm` — which carries
+ * no feature flag and is armed whenever the chain scanner is wired — makes the
+ * aggregate `disarmed` unreachable on a live box. That is a true statement about
+ * the fleet and a useless one about any single path, and it would have silently
+ * retired the exact discriminator TRA-2193 was built to provide (the 2026-07-22
+ * wiped-flag state). Stated per path, it survives: a disarmed `directional`
+ * reports `disarmed` no matter what the OTM sleeve is doing.
+ *
+ * `unwatched` is the fourth state and is NOT a verdict about arming: it means
+ * this module does not observe the path, so `disarmed`/`scanning` are both
+ * unknowable — the same null discipline the counters follow.
+ */
+export type RvScanPathVerdict = 'unwatched' | 'disarmed' | 'armed_but_never_ran' | 'scanning';
+
 /** Read-only view of one path, shaped for the health route. */
 export interface RvScanPathView {
   path: RvScanPathId;
@@ -244,6 +334,8 @@ export interface RvScanPathView {
    * did not take.
    */
   instrumented: boolean;
+  /** TRA-3557 — this path's own three-way verdict. See {@link RvScanPathVerdict}. */
+  verdict: RvScanPathVerdict;
   lastScanAt: number | null;
   scanCountSinceBoot: number | null;
   lastScan: RvScanRecord | null;
@@ -266,6 +358,14 @@ export function summarizeRvScanPath(
       structureLabel: RV_SCAN_PATH_STRUCTURE_LABEL[path],
       enabled: opts.enabled,
       instrumented: opts.instrumented,
+      // No state object yet ⇒ zero scans, so the armed branch is always
+      // `armed_but_never_ran` here. `unwatched` outranks arming: for a path we do
+      // not observe, `disarmed` would assert a measurement we did not take.
+      verdict: !opts.instrumented
+        ? 'unwatched'
+        : opts.enabled
+          ? 'armed_but_never_ran'
+          : 'disarmed',
       // Never-ran and never-watched both report null. They are distinguished by
       // `instrumented`, not by a fabricated zero.
       lastScanAt: null,
@@ -280,6 +380,14 @@ export function summarizeRvScanPath(
     structureLabel: RV_SCAN_PATH_STRUCTURE_LABEL[path],
     enabled: opts.enabled,
     instrumented: true,
+    // `scanning` is asserted off the SCAN COUNT, never off `lastScanAt` alone —
+    // both move together today, but a count is the input-side fact and a
+    // timestamp is derived from it (rule 2 in the module header).
+    verdict: !opts.enabled
+      ? 'disarmed'
+      : s.scanCountSinceBoot > 0
+        ? 'scanning'
+        : 'armed_but_never_ran',
     lastScanAt: s.lastScanAt,
     scanCountSinceBoot: s.scanCountSinceBoot,
     lastScan: s.lastScan,

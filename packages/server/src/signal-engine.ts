@@ -9999,13 +9999,37 @@ export class SignalEngine {
         ? { minAbsDelta: resolveOtmDeltaFloor(demoEnv) }
         : undefined;
 
+    // TRA-3557 — open the scan run HERE: below every gate that can `return null`
+    // above (no scanner, sleeve breaker, book halt) and above the sweep. That
+    // placement is the instrument, and it is the one `evaluateDemoDirectional`
+    // already argues for: a path that stood down must record NO scan at all,
+    // leaving `lastScanAt: null` — "never ran" — rather than a zero-count scan
+    // that reads as "ran, found nothing".
+    //
+    // This is the path the ambiguity actually bit. The `continue` on an empty or
+    // failed chain below sits UPSTREAM of the nominator, of
+    // `recordLiveEnforceDecision` and of the universe gate, so every one of the
+    // seven gates on `/api/health/live-enforce-gates` records BELOW it: when it
+    // fires there is no gate row, no reason code, no `bySelection` entry and no
+    // nomination line. `cost_bar.evaluated === 0` was therefore produced
+    // identically by pre-open (benign), by a real all-symbol negative, and by an
+    // OTM scan that never executed (a defect) — and telling (2) from (3) is the
+    // whole question the TRA-3401 live acceptance turns on. TRA-3417 graded it by
+    // inference from the SIBLING `directional` counter, which cannot see a starve
+    // that hits the OTM path alone; this makes it a direct read.
+    //
+    // `universeSize` is the FULL watchlist handed to the sweep, not the slice the
+    // budget buys. The gap to `candidatesEvaluated` is explained by
+    // `lastScan.sweep` below — see `noteSweep` at the bottom of this method.
+    const scanRun = beginRvScan('otm', activeSymbols.length);
+
     // TRA-2262 — budgeted + cursored (p90 110.5s, max 213.8s on the Friday tape).
     // Unlike the old `for (const sym of activeSymbols)`, a pass that runs out of
     // budget resumes at the symbol it stopped on instead of restarting at the head
     // of the watchlist — so the tail of the universe stops being systematically
     // under-scanned for entries, which the plain loop only avoided by never
     // stopping.
-    return runBudgetedSweep({
+    const pass = await runBudgetedSweep({
       key: `${this.mode}:otm-scan`,
       symbols: activeSymbols,
       run: async (batch) => { for (const sym of batch) {
@@ -10016,9 +10040,27 @@ export class SignalEngine {
         && isOptionIvRvRoutingEnabled()
         && this.optionsAccount.optionsDailyRemaining() <= IV_RV_RESERVED_CAP_SLOTS
       ) return false; // was `break` — stops the sweep AND parks the cursor here
+      // TRA-3557 — count the INPUT, at the top of the body and before the
+      // try/continue chain, so an all-`continue` pass reports the symbols it
+      // CONSIDERED rather than zero. Deriving the count from results instead is
+      // how you re-create the false zero one layer down (TRA-1729). Ordered
+      // BELOW the iv-rv cap `return false` deliberately: that batch never runs
+      // and the cursor is parked ON it, so counting it would inflate `evaluated`
+      // against symbols the next pass will walk again.
+      scanRun.enterSymbol();
       try {
         const result = await this.rvScanner!.scanOtm(sym, otmScanOpts, dtePrefs);
-        if (result.reason !== 'ok' || result.candidates.length === 0) continue;
+        // A usable chain came back, so the market-data leg is healthy as of now.
+        // This is what lets `dataSource.lastFetchOkAt` separate a dead feed from
+        // a quiet tape on the OTM axis specifically.
+        if (result.reason === 'ok') scanRun.fetchOk();
+        // TRA-3557 — SPLIT, not pooled. A provider/data failure and a genuinely
+        // empty chain are different facts about the world and pooling them
+        // re-creates this ticket's own ambiguity one level down: `no_candidates`
+        // is a real negative the sleeve should be graded on, `scan:*` is an
+        // outage that voids the grade.
+        if (result.reason !== 'ok') { scanRun.reject(`scan:${result.reason}`); continue; }
+        if (result.candidates.length === 0) { scanRun.reject('no_candidates'); continue; }
 
         // The scanner sorts by |mispricingPct|, so the first `cheap` candidate
         // is the strongest long-only read for this symbol/scan.
@@ -10047,7 +10089,12 @@ export class SignalEngine {
           ),
         });
         const cheap = otmPick.candidate;
-        if (!cheap) continue;
+        // TRA-3557 — the chain HAD candidates but none classified `cheap` (the
+        // selector's `selection: 'none'`; it falls back to the legacy nominee
+        // rather than suppressing, so this is never the armed band's doing). A
+        // distinct bucket from `no_candidates` above: that one is an empty chain,
+        // this one is a chain with nothing long-only in it.
+        if (!cheap) { scanRun.reject('no_cheap_candidate'); continue; }
         // TRA-3510 — the nominator branch, stamped on EVERY live gate verdict
         // below rather than only logged. The `log.info` under it reaches an
         // operator tailing Render; it reaches no endpoint, so until now no fold
@@ -10078,7 +10125,7 @@ export class SignalEngine {
             && (s as OtmMispricingSignal).optionSymbol === cheap.optionSymbol
             && Date.now() - s.timestamp < 60 * 60_000,
         );
-        if (recentDup) continue;
+        if (recentDup) { scanRun.reject('recent_duplicate'); continue; }
 
         const stopLoss = cheap.mark * 0.75;
         const takeProfit = cheap.mark * 1.5;
@@ -10133,6 +10180,7 @@ export class SignalEngine {
           log.info('live OTM open rejected by underlying allowlist (TRA-3216)', {
             sym, optionSymbol: cheap.optionSymbol, reason: otmUniverseReject,
           });
+          scanRun.reject('live_universe');
           continue;
         }
 
@@ -10189,6 +10237,7 @@ export class SignalEngine {
           log.info('live OTM open rejected by entry delta ceiling (TRA-3394)', {
             sym, delta: cheap.delta, reason: otmLiveCeilingReject,
           });
+          scanRun.reject('entry_delta_ceiling_live');
           continue;
         }
 
@@ -10237,6 +10286,7 @@ export class SignalEngine {
           log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
             sym, delta: cheap.delta, reason: otmLiveFloorReject,
           });
+          scanRun.reject('otm_delta_floor_live');
           continue;
         }
 
@@ -10265,6 +10315,11 @@ export class SignalEngine {
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
+          // The single highest-blocking gate on the live path (retained block rate
+          // 0.9928). Named the same as the RV/directional paths' `cost_aware_bar`
+          // would be misleading here — this is the LIVE-ENFORCING arm, and it is
+          // the one that pins every gate ordered below it.
+          scanRun.reject('cost_bar');
           continue;
         }
 
@@ -10287,6 +10342,7 @@ export class SignalEngine {
           log.info('OTM open rejected by entry-delta ceiling (TRA-1670)', {
             sym, delta: cheap.delta, reason: otmDeltaCeiling,
           });
+          scanRun.reject('entry_delta_ceiling');
           continue;
         }
 
@@ -10322,6 +10378,7 @@ export class SignalEngine {
               'OTM single-leg live path dark (ENABLE_OPTION_LIVE_OTM off or bounded-test window closed) — build shipped, capital arm gated on board confirm (TRA-1916/TRA-1929)',
             );
             log.info('live OTM entry suppressed — dark flag off / window closed (TRA-1929)', { sym });
+            scanRun.reject('live_otm_dark');
             continue;
           }
 
@@ -10333,6 +10390,7 @@ export class SignalEngine {
           if (askLimit === null) {
             surfaceOtmLiveSkip('OTM live test skipped — no usable ask to submit an ask-limit entry (never a market cross)');
             log.warn('live OTM bounded test: no ask', { sym, optionSymbol: cheap.optionSymbol });
+            scanRun.reject('no_ask');
             continue;
           }
           // Available cash — require a known live balance; fail-closed if absent (do
@@ -10356,6 +10414,7 @@ export class SignalEngine {
               sym,
               username: this.alertUsername ?? null,
             });
+            scanRun.reject('no_balance_snapshot');
             continue;
           }
           const availableCash = Math.min(...availCandidates);
@@ -10378,6 +10437,7 @@ export class SignalEngine {
             log.info('live OTM bounded test: over cap, skipped', {
               sym, optionSymbol: cheap.optionSymbol, oneContractNotional, notionalCap, maxContracts,
             });
+            scanRun.reject('over_entry_cap');
             continue;
           }
           const testNotional = askLimit * 100 * testContracts;
@@ -10436,6 +10496,7 @@ export class SignalEngine {
               aggregateCapUsd,
               username: this.alertUsername ?? null,
             });
+            scanRun.reject('over_aggregate_cap');
             continue;
           }
 
@@ -10462,6 +10523,12 @@ export class SignalEngine {
             // OTM chokepoint). The `null` path stamp is what closes that leak.
             ...NON_CHOKEPOINT_THROTTLE_STAMP,
           };
+          // TRA-3557 — every gate cleared; this symbol is a genuine candidate.
+          // Counted HERE, before the account can refuse it, so
+          // `candidatesPassed - opensPlaced` isolates account-level refusals
+          // (daily cap, sizing, window) and broker-mirror failures from the
+          // scanner-level rejections in `rejectionsByGate`.
+          scanRun.pass();
           // Open exactly `testContracts` on the paper book (bounded-test override
           // bypasses the $5k OTM min-equity gate + the 15% cap the small live account
           // can't clear); the mirror books the real broker order and voids this on
@@ -10492,6 +10559,11 @@ export class SignalEngine {
           });
           if (!mirrored) continue;
 
+          // TRA-3557 — counted only once the open is FINAL. A failed broker mirror
+          // rolls the paper open back, so booking it at `openOptionFromCandidate`
+          // would report opens the book does not hold (the directional path's
+          // TRA-2193 rule, and it matters more here: this is the real-money site).
+          scanRun.opened();
           this.emitOptionFillAlert(openedLive);
           signal.mode = 'live';
           this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
@@ -10527,6 +10599,7 @@ export class SignalEngine {
           log.info('OTM open rejected by churn brake (TRA-1408)', {
             sym, count: otmChurnCap.count, cap: otmChurnCap.cap,
           });
+          scanRun.reject('churn_brake');
           continue;
         }
 
@@ -10548,6 +10621,8 @@ export class SignalEngine {
           // chokepoint (see the RV setup above).
           ...this.riskThrottleStampFor('options_otm'),
         };
+        // TRA-3557 — see the live site above: passed = cleared every scanner gate.
+        scanRun.pass();
         const opened = this.optionsAccount.openOptionFromCandidate(
           signal,
           this.mode,
@@ -10559,6 +10634,7 @@ export class SignalEngine {
           this.activeRiskSizingMultiplier('options_otm'),
         );
         if (!opened) continue;
+        scanRun.opened();
         this.recordChurnOpen(signal.symbol); // TRA-1408 per-name same-session churn counter
         // TRA-1662 — shadow the maker chase this demo open did NOT route.
         this.beginShadowMakerChase('single_leg_otm', signal, opened);
@@ -10571,10 +10647,44 @@ export class SignalEngine {
           id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
         });
       } catch (err: unknown) {
-        log.warn('OTM scan failed', { sym, reason: err instanceof Error ? err.message : String(err) });
+        const reason = err instanceof Error ? err.message : String(err);
+        log.warn('OTM scan failed', { sym, reason });
+        // TRA-3557 — a swallowed per-symbol throw is exactly the silent drop the
+        // bucket-sum invariant exists to expose: without this the symbol entered,
+        // neither passed nor rejected, and surfaced only as `unattributed`. Tagged
+        // AND recorded as a feed error, so a systematically failing chain reads as
+        // an OUTAGE on this axis rather than as an empty scan.
+        scanRun.reject('scan_error');
+        scanRun.fetchError(`${sym}: ${reason}`);
       }
       } return undefined; },
     });
+
+    // TRA-3557 — close the run honestly. `runOtmScan` is the only instrumented
+    // path behind a budgeted sweep, so on a ~614-name watchlist with a 30s budget
+    // MOST passes are slices: `candidatesEvaluated` ≈ 80 against a `universeSize`
+    // of 614 is the healthy steady state here, not a truncated tick. Publishing
+    // that gap with no explanation would be this ticket's own bug re-created one
+    // level down — a partial pass reading identically to a complete one — so the
+    // slice ships as data (`lastScan.sweep`) and `stoppedEarlyReason` is DERIVED
+    // from it rather than hand-asserted.
+    //
+    // `iv_rv_cap_headroom` is the same label the rv_scan path stamps for the same
+    // caller-side gate (the `return false` above), so the two paths' early stops
+    // read against each other.
+    scanRun.noteSweep(
+      {
+        startIndex: pass.startIndex,
+        processed: pass.processed.length,
+        complete: pass.complete,
+        budgetExhausted: pass.budgetExhausted,
+        stopped: pass.stopped,
+        resumeAt: pass.resumeAt,
+      },
+      'iv_rv_cap_headroom',
+    );
+    scanRun.finish();
+    return pass;
   }
 
   /** Build account state augmented with cumulative P&L pulled from the tracker. */

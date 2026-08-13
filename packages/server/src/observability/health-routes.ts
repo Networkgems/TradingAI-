@@ -6036,6 +6036,30 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         enabled: isRvEngineEnabled(),
         instrumented: true,
       }),
+      // TRA-3557 — the OTM sleeve, and the one that needed this most: it is the path
+      // under live-money acceptance and was the only option entry path with no scan
+      // run at all. Its `continue` on an empty/failed chain sits UPSTREAM of the
+      // nominator, of `recordLiveEnforceDecision` and of the universe gate, so a
+      // starve there produced `cost_bar.evaluated: 0` — bit-identical to "pre-open"
+      // and to "scanned all names, found nothing".
+      //
+      // `enabled`: this path carries NO feature flag. It runs in both demo and live
+      // whenever the chain scanner is wired, so the one thing that can disarm it is
+      // `runOtmScan`'s own first line (`if (!this.rvScanner) return null`), which is
+      // exactly what `rvScannerConfigured` reports — resolve it from there and
+      // nowhere else. A null (pipeline dep absent from this process) is NOT read as
+      // disarmed: "we cannot see it from here" is not "it is off", and `lastScanAt`
+      // carries the real answer either way.
+      //
+      // ⚠️ This path being armed by default MOVES the roll-up below: on a box with
+      // `directional` and `rv_scan` both disarmed, top-level `enabled` goes false →
+      // true and `verdict` goes `disarmed` → `scanning`. That is a CORRECTION, not a
+      // regression — the OTM pass has been running every tick the whole time and the
+      // roll-up simply could not see it. Grade per-path, not on the roll-up.
+      summarizeRvScanPath('otm', {
+        enabled: chainConfigured !== false,
+        instrumented: true,
+      }),
       // NOT instrumented this iteration. Reports null counters rather than zeros —
       // see the null discipline above.
       summarizeRvScanPath('iv_rv_buy_premium', {
@@ -6058,6 +6082,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // inferred. `disarmed` is the state that had no name before this route: the
     // path is off, so silence is CORRECT and no amount of staring at the journal
     // would ever have revealed it.
+    //
+    // ⚠️ TRA-3557 — READ THE PER-PATH `verdict`, NOT THIS ONE. This roll-up is an
+    // ANY/ALL fold, so `disarmed` requires EVERY instrumented path to be off. Since
+    // `otm` joined the set that can no longer happen on a box with a wired chain
+    // scanner — the OTM sleeve carries no feature flag — so the aggregate is
+    // structurally incapable of reporting `disarmed` and cannot testify about the
+    // 2026-07-22 wiped-flag state it was built for. It is retained because it is
+    // still TRUE (some path is armed), but the discriminator now lives on
+    // `paths[].verdict`, where a disarmed `directional` still reads `disarmed`
+    // regardless of what the OTM sleeve is doing.
     const verdict =
       armed.length === 0
         ? 'disarmed'
