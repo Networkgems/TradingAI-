@@ -80,8 +80,16 @@
 // `--no-require-per-structure-min-n` override it.
 //
 // Exit code: 0 = PASS on the QUOTED basis (or self-test ok), 2 = REVIEW (insufficient quoted n
-// or model off), 1 = usage / IO error. Read-only: never writes any journal. Arms nothing:
-// `h` stays 0.134 and ENABLE_MARKETABLE_OPEN_MTM is untouched (TRA-1897 hold).
+// or model off), 4 = NOT_GRADEABLE (TRA-3459 — this population provably has no pass state; more
+// rows of the same book cannot change it), 1 = usage / IO error.
+//
+// ⚠ 2 and 4 are DELIBERATELY different codes. A caller that cannot tell "come back with more
+// rows" from "this venue can never answer the question" is the shell-level form of the exact
+// defect TRA-3459 fixed in the payload, and it is the one that cost TRA-2242 four beats of
+// accrual. Anything scripting this must branch on 4, not fold it into "non-zero".
+//
+// Read-only: never writes any journal. Arms nothing: `h` stays 0.134 and
+// ENABLE_MARKETABLE_OPEN_MTM is untouched (TRA-1897 hold).
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -257,6 +265,51 @@ function toSample(rec, strategyFilter, tally) {
   };
 }
 
+const TICK_USD = 0.01;
+const TICK_EPSILON = 1e-9;
+
+/**
+ * TRA-3459 Task 2 — the MID-INVARIANT discriminator, in the absolute units `h` normalizes
+ * away. MIRRORS `foldMidInvariants` in the server module; keep the two in step.
+ *
+ * The old non-degeneracy guard (`median !== p90`, `clamped === 0`) is VACUOUS — a synthetic
+ * constant-width book passes it, because the MID varies even when the width does not. The
+ * integer-tick count is the check that separates a lattice from a real book.
+ *
+ * `hOf` may be signed (`actualH` is); the magnitude is taken, because a book's WIDTH has no
+ * sign and signing it would put half the rows at negative ticks.
+ */
+function foldMidInvariants(rows, hOf) {
+  if (rows.length === 0) {
+    return {
+      n: 0, midMedianUsd: null, fullSpreadUsd: null, fullSpreadTicks: null,
+      tickQuantizedRows: 0, maxTickDeviation: null, distinctWidthTicks: null,
+      modalWidthTicks: null, widthHistogramTicks: [],
+    };
+  }
+  const mids = rows.map((s) => s.exitMidPerShare).sort((a, b) => a - b);
+  const full = rows.map((s) => 2 * Math.abs(hOf(s)) * s.exitMidPerShare);
+  const ticks = full.map((w) => w / TICK_USD);
+  const devs = ticks.map((t) => Math.abs(t - Math.round(t)));
+  const hist = new Map();
+  for (const t of ticks) { const k = Math.round(t); hist.set(k, (hist.get(k) ?? 0) + 1); }
+  const entries = [...hist.entries()].sort((a, b) => a[0] - b[0]);
+  const modal = [...entries].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0];
+  const fullSorted = [...full].sort((a, b) => a - b);
+  const tickSorted = [...ticks].sort((a, b) => a - b);
+  return {
+    n: rows.length,
+    midMedianUsd: quantile(mids, 0.5),
+    fullSpreadUsd: { median: quantile(fullSorted, 0.5), p90: quantile(fullSorted, 0.9) },
+    fullSpreadTicks: { median: quantile(tickSorted, 0.5), p90: quantile(tickSorted, 0.9) },
+    tickQuantizedRows: devs.filter((d) => d < TICK_EPSILON).length,
+    maxTickDeviation: Math.max(...devs),
+    distinctWidthTicks: entries.length,
+    modalWidthTicks: { ticks: modal[0], rows: modal[1] },
+    widthHistogramTicks: entries,
+  };
+}
+
 function summarize(samples, h) {
   const actualHs = samples.map((s) => s.actualH).sort((a, b) => a - b);
   const actualCross = samples.map((s) => s.exitSlippageUsd).sort((a, b) => a - b);
@@ -331,6 +384,11 @@ function summarize(samples, h) {
       etDayMin: quotedEtDays.length ? quotedEtDays[0] : null,
       etDayMax: quotedEtDays.length ? quotedEtDays[quotedEtDays.length - 1] : null,
     },
+    // TRA-3459 Task 2 — the mid-invariant discriminator on both bases.
+    midInvariants: {
+      quoted: foldMidInvariants(quotedRows, (s) => s.quotedH),
+      all: foldMidInvariants(samples, (s) => s.actualH),
+    },
   };
 }
 
@@ -362,6 +420,85 @@ function deadSnapClause(c) {
 /** TRA-2600 — patch the dead-venue cross-reference onto a summary's coverage census. */
 function withUnpricedDrops(summary, dropped) {
   return { ...summary, quoteCoverage: { ...summary.quoteCoverage, unpricedExitQuoteDropped: dropped } };
+}
+
+/**
+ * TRA-3459 — the CALIBRATION POPULATION of `h = 0.134`. MIRRORS `MODELED_H_CALIBRATION` in
+ * packages/server/src/marketable-mtm-forward-validation.ts; keep the two in step. See that
+ * constant's doc for provenance — 140 demo-journal rows, 2026-07-15..07-21, reproduced against
+ * `.tra2131-analysis.md` on every published moment.
+ *
+ * The load-bearing field is `statistic: 'mean'`. `0.134` is the MEAN of a right-skewed
+ * distribution whose MEDIAN is 0.0667, and the predicate below used to compare a median to it.
+ */
+const MODELED_H_CALIBRATION = {
+  statistic: 'mean',
+  n: 140,
+  h: { mean: 0.1351, median: 0.0667, p90: 0.3532, medianToMeanRatio: 0.4937 },
+  midUsd: { median: 1.32 },
+  fullSpreadUsd: { median: 0.15 },
+};
+const POPULATION_FITNESS_MIN_N = 10;
+const POPULATION_FITNESS_MAX_RATIO = 3;
+
+/**
+ * TRA-3459 — can `h` be graded on this population AT ALL? MIRRORS
+ * `marketableMtmPopulationFitness` in the server module; keep the two in step.
+ *
+ * The rule is a theorem, not a threshold: `min(x) <= mean(x) <= max(x)` for every sample, so if
+ * `modeledH` sits further than `tol` outside `[min(quotedH), max(quotedH)]` then
+ * `|mean(quotedH) − modeledH| > tol` is FORCED and the comparison has no pass state on this
+ * book. The width/mid ratios are reported to EXPLAIN it and decide nothing.
+ */
+function populationFitness(summary, tol) {
+  const inv = summary.midInvariants?.quoted;
+  const ratio = (a, b) => (
+    a == null || !Number.isFinite(a) || a <= 0 || !Number.isFinite(b) || b <= 0
+      ? null
+      : (a >= b ? a / b : b / a)
+  );
+  const observed = {
+    midMedianUsd: inv?.midMedianUsd ?? null,
+    fullSpreadUsdMedian: inv?.fullSpreadUsd?.median ?? null,
+  };
+  const widthRatio = ratio(observed.fullSpreadUsdMedian, MODELED_H_CALIBRATION.fullSpreadUsd.median);
+  const midRatio = ratio(observed.midMedianUsd, MODELED_H_CALIBRATION.midUsd.median);
+  const lo = summary.quotedH.min, hi = summary.quotedH.max;
+  const base = {
+    n: summary.quotedH.n, tol, modeledH: summary.modeledH,
+    observedHSupport: { min: lo, max: hi },
+    maxRatio: POPULATION_FITNESS_MAX_RATIO, widthRatio, midRatio, observed,
+  };
+  if (summary.quotedH.n < POPULATION_FITNESS_MIN_N
+    || lo == null || hi == null || !Number.isFinite(lo) || !Number.isFinite(hi)) {
+    return { ...base, verdict: 'unmeasured', supportGap: null, hNeededForGradeability: null, reasons: [] };
+  }
+  const h = summary.modeledH;
+  const supportGap = h < lo ? lo - h : h > hi ? h - hi : 0;
+  if (supportGap <= tol) {
+    return { ...base, verdict: 'fit', supportGap, hNeededForGradeability: null, reasons: [] };
+  }
+  const needed = h > hi ? h - tol : h + tol;
+  const reasons = [
+    `modeled h ${h} lies ${supportGap.toFixed(4)} OUTSIDE the entire observed support of `
+    + `quotedH [${lo.toFixed(5)}, ${hi.toFixed(5)}] over ${summary.quotedH.n} rows, against a `
+    + `tolerance of ${tol}. A mean always lies inside its own sample's support, so `
+    + `|mean(quotedH) − ${h}| > ${tol} is FORCED on this population — the comparison has no `
+    + `pass state here, and accruing more rows of the same book cannot create one. It would `
+    + `become gradeable if the book's far edge reached h ≈ ${needed.toFixed(4)}`,
+  ];
+  if (widthRatio != null && widthRatio > POPULATION_FITNESS_MAX_RATIO) {
+    reasons.push(`WIDTH regime differs ${widthRatio.toFixed(1)}× (validation median full spread `
+      + `$${observed.fullSpreadUsdMedian.toFixed(3)} vs calibration `
+      + `$${MODELED_H_CALIBRATION.fullSpreadUsd.median.toFixed(2)}). h is LINEAR in the width, so `
+      + 'no mid-bucketing removes this term');
+  }
+  if (midRatio != null && midRatio > POPULATION_FITNESS_MAX_RATIO) {
+    reasons.push(`MID regime differs ${midRatio.toFixed(1)}× (validation median mid `
+      + `$${observed.midMedianUsd.toFixed(2)} vs calibration `
+      + `$${MODELED_H_CALIBRATION.midUsd.median.toFixed(2)}). h is INVERSE in the mid`);
+  }
+  return { ...base, verdict: 'unfit', supportGap, hNeededForGradeability: needed, reasons };
 }
 
 /** True when the modeled p90 cross fails to cover the actual p90 cross. */
@@ -398,6 +535,32 @@ function quotedUnderChargeRatio(summary) {
  */
 function quotedVerdict(summary, tol, minN) {
   const qn = summary.quotedH.n;
+
+  // TRA-3459 — POPULATION FITNESS, asked BEFORE the n floor. When the population cannot decide
+  // the question, "insufficient n" is the wrong answer and it is the one that cost TRA-2242
+  // four beats of accrual. MIRRORS the server module's ordering; keep the two in step.
+  const fitness = populationFitness(summary, tol);
+  if (fitness.verdict === 'unfit') {
+    const inv = summary.midInvariants.quoted;
+    return {
+      code: 'NOT_GRADEABLE',
+      basis: 'quotedH',
+      reason: 'NOT GRADEABLE ON THIS POPULATION — the validation book is not the book h was '
+        + `calibrated on, and MORE ROWS OF THIS BOOK CANNOT FIX IT. ${fitness.reasons.join('; ')}. `
+        + `Calibration population: ${MODELED_H_CALIBRATION.n} demo-journal rows, median mid `
+        + `$${MODELED_H_CALIBRATION.midUsd.median.toFixed(2)}, median full spread `
+        + `$${MODELED_H_CALIBRATION.fullSpreadUsd.median.toFixed(2)}, mean h `
+        + `${MODELED_H_CALIBRATION.h.mean} (median ${MODELED_H_CALIBRATION.h.median}). `
+        + `Validation population: ${qn} quoted rows, median mid `
+        + `$${(inv.midMedianUsd ?? NaN).toFixed(2)}, median full spread `
+        + `$${(inv.fullSpreadUsd?.median ?? NaN).toFixed(3)} (${inv.tickQuantizedRows}/${inv.n} `
+        + `integer-tick, ${inv.distinctWidthTicks ?? 0} distinct widths, modal `
+        + `${inv.modalWidthTicks?.ticks ?? 0}¢). This is a TERMINAL, not a wait. TRA-2242 needs a `
+        + 'different evidence source for h. Do NOT retune h to close the gap: fitting 0.134 to '
+        + '~0.003 collapses the haircut to mid-marking, the TRA-2131 shape TRA-2233 removes.',
+    };
+  }
+
   if (qn < minN) {
     const c = summary.quoteCoverage;
     return {
@@ -412,19 +575,30 @@ function quotedVerdict(summary, tol, minN) {
         + 'the DROP count does not drain and means the gate can never be graded.',
     };
   }
-  const withinTol = Math.abs(summary.quotedH.median - summary.modeledH) <= tol;
+  // TRA-3459 — the decision variable is the MEAN. `modeledH` IS a mean
+  // (MODELED_H_CALIBRATION.statistic) and the DARK mark applies it to every position. This
+  // line used to read `summary.quotedH.median`, which is a p50 against a mean across a 2.03×
+  // skew and cannot pass on the calibration population itself (TRA-2602).
+  const impliedMedianH = summary.modeledH * MODELED_H_CALIBRATION.h.medianToMeanRatio;
+  const shape = `shape: median ${summary.quotedH.median.toFixed(4)} vs the calibration-implied `
+    + `${impliedMedianH.toFixed(4)} — DIAGNOSTIC, not graded`;
+  const withinTol = Math.abs(summary.quotedH.mean - summary.modeledH) <= tol;
   const tailOk = !isQuotedTailUnderCharged(summary);
   if (withinTol && tailOk) {
     return {
       code: 'PASS',
       basis: 'quotedH',
-      reason: `median QUOTED h ${summary.quotedH.median.toFixed(4)} within ±${tol} of modeled `
-        + `${summary.modeledH}; quoted tail covered (modeled p90 $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} `
-        + `≥ quoted p90 $${summary.quotedCrossUsd.p90.toFixed(2)} over the same ${qn} quote-bearing rows)`,
+      reason: `mean QUOTED h ${summary.quotedH.mean.toFixed(4)} within ±${tol} of modeled `
+        + `${summary.modeledH} (statistic-matched: modeledH is a MEAN); quoted tail covered `
+        + `(modeled p90 $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} `
+        + `≥ quoted p90 $${summary.quotedCrossUsd.p90.toFixed(2)} over the same ${qn} quote-bearing rows); ${shape}`,
     };
   }
   const bits = [];
-  if (!withinTol) bits.push(`median QUOTED h ${summary.quotedH.median.toFixed(4)} outside ±${tol} of modeled ${summary.modeledH}`);
+  if (!withinTol) {
+    bits.push(`mean QUOTED h ${summary.quotedH.mean.toFixed(4)} outside ±${tol} of modeled `
+      + `${summary.modeledH} (statistic-matched: modeledH is a MEAN); ${shape}`);
+  }
   if (!tailOk) {
     const r = quotedUnderChargeRatio(summary);
     bits.push(`modeled p90 cross $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} < quoted p90 `
@@ -453,6 +627,12 @@ function quotedPooledVerdict(summary, structures, tol, minN, requirePerStructure
     bits.push(`insufficient per-structure QUOTED n (< ${perStructureMinN}), NOT gradeable: ${below.join(', ')}`);
   }
   if (bits.length === 0) return base;
+  // TRA-3459 — a NOT_GRADEABLE base KEEPS its code. Folding it down to REVIEW would restore
+  // the "grade it later" reading the terminal exists to remove, from a branch that only fires
+  // once rows accrue. MIRRORS the server module; keep the two in step.
+  if (base.code === 'NOT_GRADEABLE') {
+    return { code: 'NOT_GRADEABLE', basis: 'quotedH', reason: `${base.reason} ALSO: ${bits.join('; ')}` };
+  }
   return { code: 'REVIEW', basis: 'quotedH', reason: `${base.code === 'REVIEW' ? `${base.reason}; ` : ''}${bits.join('; ')}` };
 }
 
@@ -780,23 +960,27 @@ function runSelfTest(args) {
       process.exit(1);
     }
   }
-  // 5. PROVE IT FIRES ON THE TAIL ALONE. 80% of rows quote at exactly the modeled 0.134 and
-  //    20% at 0.40, so the MEDIAN is exactly modeled — the tolerance check PASSES — and the
-  //    only thing that can produce a REVIEW is the quoted tail check. A self-test that only
-  //    exercised the passing direction is what let the actualH path look healthy for three
-  //    tickets; this is the failing direction, isolated.
+  // 5. PROVE IT FIRES ON THE TAIL ALONE. 80% of rows quote at 0.0675 and 20% at 0.40, so the
+  //    MEAN is exactly the modeled 0.134 — the tolerance check PASSES — and the only thing
+  //    that can produce a REVIEW is the quoted tail check. A self-test that only exercised the
+  //    passing direction is what let the actualH path look healthy for three tickets; this is
+  //    the failing direction, isolated.
+  //
+  //    TRA-3459 rebalanced these values from `[0.134 ×4, 0.40]`, which pinned the MEDIAN at
+  //    0.134 back when the median was the decision variable. Under a mean-based predicate that
+  //    old corpus fails BOTH arms and stops isolating the tail.
   {
-    const f = foldAll(parseSandboxJournal(synthQuotedCorpus([0.134, 0.134, 0.134, 0.134, 0.40])), args);
-    if (Math.abs(f.summary.quotedH.median - 0.134) > 1e-9) {
-      console.error(`SELF-TEST FAILED: the tail fixture must hold the median AT the modeled h (got ${f.summary.quotedH.median})`);
+    const f = foldAll(parseSandboxJournal(synthQuotedCorpus([0.0675, 0.0675, 0.0675, 0.0675, 0.40])), args);
+    if (Math.abs(f.summary.quotedH.mean - 0.134) > 1e-9) {
+      console.error(`SELF-TEST FAILED: the tail fixture must hold the MEAN at the modeled h (got ${f.summary.quotedH.mean})`);
       process.exit(1);
     }
     if (f.quotedV.code !== 'REVIEW' || !/under-charges the tail/.test(f.quotedV.reason)) {
       console.error(`SELF-TEST FAILED: a wide quoted tail must force a quoted REVIEW (got ${f.quotedV.code} — ${f.quotedV.reason})`);
       process.exit(1);
     }
-    if (/outside ±/.test(f.quotedV.reason)) {
-      console.error('SELF-TEST FAILED: this fixture must fire on the TAIL, not the median');
+    if (/mean QUOTED h .* outside/.test(f.quotedV.reason)) {
+      console.error('SELF-TEST FAILED: this fixture must fire on the TAIL, not the tolerance');
       process.exit(1);
     }
   }
@@ -876,10 +1060,69 @@ function runSelfTest(args) {
       process.exit(1);
     }
   }
+  // 8. TRA-3459 — NOT_GRADEABLE, and the three states it must stay distinct from.
+  //    The failing direction the old harness could not express at all: a population on which
+  //    the comparison provably has no pass state used to render "insufficient n", which reads
+  //    as "come back with more rows" and cost TRA-2242 four beats of exactly that.
+  {
+    // (a) THE LIVE SANDBOX SHAPE — a 2¢ book at h ≈ 0.0027, 25× below the modeled 0.134, so
+    //     0.134 sits outside the ENTIRE observed support. Terminal.
+    const tight = foldAll(parseSandboxJournal(synthQuotedCorpus([0.0023, 0.0027, 0.0031, 0.0053], 20, 4.31)), args);
+    if (tight.quotedV.code !== 'NOT_GRADEABLE') {
+      console.error(`SELF-TEST FAILED: a book whose entire support is 25× below h must be NOT_GRADEABLE (got ${tight.quotedV.code} — ${tight.quotedV.reason})`);
+      process.exit(1);
+    }
+    if (/insufficient QUOTED-basis n/.test(tight.quotedV.reason)) {
+      console.error('SELF-TEST FAILED: the terminal must NOT be dressed as an accrual wait — this is the TRA-2242 misreading');
+      process.exit(1);
+    }
+    // The mid-invariant block must be POPULATED — the terminal's reason quotes it, and a null
+    // there would render "$NaN median full spread" into the sentence a reader acts on. The
+    // integer-tick counter itself is graded against the REAL live rows in the server unit
+    // test; this synthetic book is deliberately OFF the cent lattice (fractional widths), so
+    // asserting quantization here would assert the fixture, not the instrument.
+    const ti = tight.summary.midInvariants.quoted;
+    if (ti.n !== tight.summary.quotedH.n || ti.midMedianUsd == null || ti.fullSpreadUsd == null) {
+      console.error(`SELF-TEST FAILED: the mid-invariant block must be populated over every quoted row (got ${JSON.stringify(ti)})`);
+      process.exit(1);
+    }
+    if (ti.tickQuantizedRows !== 0) {
+      console.error('SELF-TEST FAILED: this fixture is OFF the cent lattice by construction — a non-zero tick count means the counter is not measuring what it claims');
+      process.exit(1);
+    }
+    // (b) GRADEABLE AND WRONG must stay a REVIEW. Support [0.10, 0.30] contains 0.134, mean
+    //     0.20 is outside tol. Collapsing this into the terminal would hide a real failure.
+    const wrong = foldAll(parseSandboxJournal(synthQuotedCorpus([0.10, 0.30], 40)), args);
+    if (wrong.quotedV.code !== 'REVIEW' || !/mean QUOTED h 0\.2000 outside/.test(wrong.quotedV.reason)) {
+      console.error(`SELF-TEST FAILED: a gradeable-but-wrong book must REVIEW on the mean, not go terminal (got ${wrong.quotedV.code} — ${wrong.quotedV.reason})`);
+      process.exit(1);
+    }
+    // (c) UNMEASURED must not read as unfit. 8 quoted rows is under the fitness floor.
+    const few = foldAll(parseSandboxJournal(synthQuotedCorpus([0.002], 8, 4.31)), args);
+    if (few.quotedV.code !== 'REVIEW' || !/insufficient QUOTED-basis n/.test(few.quotedV.reason)) {
+      console.error(`SELF-TEST FAILED: below the fitness floor the n-floor must speak, not the terminal (got ${few.quotedV.code})`);
+      process.exit(1);
+    }
+    // (d) THE STATISTIC-MATCHED FIX, with its positive control. A corpus carrying the
+    //     CALIBRATION population's own moments (mean 0.1351 / median 0.0667) must clear the
+    //     tolerance arm — and the OLD median-vs-mean predicate must NOT. Without the control
+    //     the first assertion could hold for reasons unrelated to the fix.
+    const calib = foldAll(parseSandboxJournal(synthQuotedCorpus([0.0634, 0.07, 0.021, 0.386], 40, 1.32)), args);
+    if (Math.abs(calib.summary.quotedH.mean - args.h) > args.tol) {
+      console.error(`SELF-TEST FAILED: the statistic-matched arm must PASS on the calibration population (mean ${calib.summary.quotedH.mean})`);
+      process.exit(1);
+    }
+    if (Math.abs(calib.summary.quotedH.median - args.h) <= args.tol) {
+      console.error('SELF-TEST FAILED: the OLD median-vs-mean predicate must FAIL here — if it passes, this fixture no longer reproduces the TRA-2602 defect and proves nothing');
+      process.exit(1);
+    }
+  }
   console.log('self-test OK (advisory: PASS on 0.13, REVIEW mid-booked, fillPx=0 excluded; '
-    + 'GRADED quotedH: PASS at 0.13, REVIEW on a wide tail at the SAME median, quote states separable; '
+    + 'GRADED quotedH: PASS at 0.13, REVIEW on a wide tail at the SAME mean, quote states separable; '
     + 'TRA-2600: quote_null_at_snap writer-unreachable, dead-venue drops surfaced in quoteCoverage '
-    + 'and the DEAD-vs-LEGACY reason strings DIFFER)');
+    + 'and the DEAD-vs-LEGACY reason strings DIFFER; TRA-3459: NOT_GRADEABLE on a support-disjoint '
+    + 'book and distinct from REVIEW-wrong / under-floor, tolerance arm clears its own calibration '
+    + 'population where the old median predicate could not)');
   process.exit(0);
 }
 
@@ -914,7 +1157,8 @@ function main() {
   // TRA-2300 §1 — the exit code follows the GRADED (quotedH) verdict, not the advisory one.
   // An automation that trusted the old code would otherwise be gated on a detector with no
   // failing state on this venue.
-  process.exit(f.quotedV.code === 'PASS' ? 0 : 2);
+  // TRA-3459 — NOT_GRADEABLE gets its OWN code. See the exit-code contract in the header.
+  process.exit(f.quotedV.code === 'PASS' ? 0 : f.quotedV.code === 'NOT_GRADEABLE' ? 4 : 2);
 }
 
 main();

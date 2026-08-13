@@ -167,6 +167,121 @@ export const MARKETABLE_MTM_OUTLIER_ABS_H = MAX_MARKETABLE_HALF_SPREAD_FRAC;
 /** Cap on rows echoed in the diagnostics block / `samples` dump, so the payload stays bounded. */
 export const MARKETABLE_MTM_MAX_DIAGNOSTIC_ROWS = 50;
 
+/** One option price tick, $. The lattice the mid-invariant test below checks against. */
+export const MARKETABLE_MTM_TICK_USD = 0.01;
+/**
+ * How close to an integer tick a derived width must sit to count as quantized. 1e-9 is ~4
+ * orders of magnitude above the float noise a `2·h·mid` round-trip actually produces
+ * (measured max deviation 1.7e-13) and ~7 below a tenth of a tick, so it separates
+ * "computed off an integer-cent book" from "measured off a continuous one" with margin at
+ * both ends.
+ */
+export const MARKETABLE_MTM_TICK_EPSILON = 1e-9;
+
+/**
+ * TRA-3459 — **THE CALIBRATION POPULATION OF `h = 0.134`, MEASURED.**
+ *
+ * `DEFAULT_MARKETABLE_HALF_SPREAD_FRAC = 0.134` is not a free parameter: it is the **MEAN**
+ * of `h = (mid − bid)/mid` over a specific, finite set of demo-journal rows
+ * (`.tra2131-analysis.md` L17-22). Until this constant existed, the only thing the codebase
+ * recorded about that population was the number `0.134` itself — so the gate could compare a
+ * `median` to it (TRA-2602) with nothing on the wire to say the two were different statistics,
+ * and nothing to say what BOOK the number came from.
+ *
+ * Re-measured 2026-08-13 off the LIVE demo journal
+ * (`GET /api/health/option-journal?rows=demo`, build `be7600e1`) and reproduced against the
+ * source document to 3–4 significant figures on every published moment, which is what
+ * identifies these 140 rows as exactly the calibration set:
+ *
+ * | moment | this measurement | `.tra2131-analysis.md` |
+ * |---|---|---|
+ * | mean h | 0.1351 | 0.134 |
+ * | p50 h | 0.0667 | 0.067 |
+ * | p75 h | 0.1065 | 0.106 |
+ * | max h | 0.9667 | 0.967 |
+ * | mean h `single_leg_rv` (n=124) | 0.1428 | 0.142 |
+ * | mean h `single_leg_otm` (n=16) | 0.0752 | 0.075 |
+ *
+ * ⚠ The `h` moments here are **UNCLAMPED**, and that is a property of the constant, not of
+ * this record: 10 of the 140 rows sit above {@link MAX_MARKETABLE_HALF_SPREAD_FRAC}, so the
+ * shipped `clampHalfSpreadFrac` path can never reproduce a population whose mean is
+ * 0.1351 (the clamped mean is 0.1123). Any future retune must state which of the two it is.
+ *
+ * ⚠ `midUsd` and `fullSpreadUsd` are the fields TRA-2602 had to DERIVE and got wrong. Its
+ * "implied demo mid $0.149", inferred from a constant-book identity, is **REFUTED** by the
+ * measured median of $1.32 — 8.9× out, and above that finding's own pre-registered
+ * retraction threshold of $1.00. The demo book is a WIDE, CHEAP book (median full spread 15¢
+ * on a $1.32 mid), not a narrow one; 47 distinct integer-cent widths across 140 rows.
+ */
+export const MODELED_H_CALIBRATION = {
+  issue: 'TRA-3459',
+  measuredOnUtc: '2026-08-13',
+  source: 'GET /api/health/option-journal?rows=demo — CLOSED demo option-trade-journal rows '
+    + 'carrying a two-sided fill-time quote (entryBid/entryAsk/entryMarkUsd)',
+  liveBuild: 'be7600e1',
+  /** Entry-timestamp window of the 140 rows, inclusive. */
+  windowUtc: { from: '2026-07-15T13:33:16.188Z', to: '2026-07-21T15:53:13.040Z' },
+  n: 140,
+  byStructure: { single_leg_rv: 124, single_leg_otm: 16 },
+  /**
+   * **The statistic `0.134` IS.** Named on the wire because the whole TRA-2602 defect was a
+   * `median` graded against it. Anything comparing to `modeledH` must be a mean.
+   */
+  statistic: 'mean' as const,
+  h: {
+    mean: 0.1351,
+    median: 0.0667,
+    p75: 0.1065,
+    p90: 0.3532,
+    max: 0.9667,
+    /**
+     * `median / mean` on the calibration population = 0.4937. The distribution is
+     * right-skewed by a factor of two, which is what makes median-vs-mean a 2× error rather
+     * than a rounding one. Transporting `h` to a median comparison means multiplying by
+     * THIS, not comparing raw.
+     */
+    medianToMeanRatio: 0.4937,
+    /** Rows above {@link MAX_MARKETABLE_HALF_SPREAD_FRAC} — clamped by the shipped mark. */
+    rowsAboveClamp: 10,
+    /** Mean after applying the shipped clamp. NOT the calibrated constant. */
+    meanClamped: 0.1123,
+  },
+  /** Premium per share, USD. The read TRA-2602 could not make and had to derive. */
+  midUsd: { min: 0.09, p25: 0.90, median: 1.32, p75: 1.66, max: 2.69 },
+  /** Implied FULL quoted spread per share, USD (`ask − bid`). */
+  fullSpreadUsd: { min: 0.02, p25: 0.07, median: 0.15, p75: 0.30, max: 2.70 },
+  /** All 140 rows are integer-cent; 47 distinct widths. A wide book, not a constant one. */
+  tickQuantizedRows: 140,
+  distinctWidthTicks: 47,
+} as const;
+
+/**
+ * TRA-3459 — the factor at which a REGIME divergence between the validation and calibration
+ * books is called out by name in the fitness reason.
+ *
+ * ⚠ **REPORTING ONLY. This threshold decides nothing** — see
+ * {@link marketableMtmPopulationFitness}, whose decision rests on the support theorem instead.
+ * It was very nearly the decision rule, and the first draft of it would have been the bug this
+ * ticket exists to remove: `h` calibrates to the population MEAN (0.134) while the calibration
+ * book's MEDIAN width is only $0.15, so a book quoting at exactly the modeled `h` on a $2 mid
+ * already sits 3.5× off that median — a correct model failing an arbitrary bar. A criterion
+ * that a right answer nearly fails is as useless as one a wrong answer cannot.
+ *
+ * What the ratios ARE good for is EXPLANATION. `h = (fullSpread/2) / mid` is linear in the
+ * width and inverse in the mid, so publishing both terms says WHICH regime moved. Both are
+ * published separately, never as a quotient, because they can cancel: a 3× wider book at a 3×
+ * higher mid has the same `h` for entirely different reasons, and that is an accidental
+ * agreement, not a validation.
+ */
+export const MARKETABLE_MTM_POPULATION_FITNESS_MAX_RATIO = 3;
+/**
+ * Quoted rows needed before population fitness is CLAIMED either way. Below this the fitness
+ * block reports `unmeasured` and the n-floor speaks instead — an unmeasured population must
+ * not read as an unfit one any more than it may read as a fit one. The support of a 1-row
+ * sample is a point, which would call almost any population unfit.
+ */
+export const MARKETABLE_MTM_POPULATION_FITNESS_MIN_N = 10;
+
 export const MARKETABLE_MTM_SCOPE =
   'SANDBOX ONLY (acct VA20296703), $0 real notional. Parity-true EXIT-leg cross folded '
   + 'from the sandbox round-trip itself (mid vs real fill) — NEVER pooled with demo '
@@ -556,6 +671,45 @@ export interface MarketableMtmQuoteCoverage {
   etDayMax: string | null;
 }
 
+/**
+ * TRA-3459 Task 2 — **THE MID-INVARIANT DISCRIMINATOR.** One basis's price regime, in the
+ * ABSOLUTE units `h` normalizes away.
+ *
+ * Every `h`-shaped number on this payload is a fraction of the mid, and a fraction of the mid
+ * reads identically for a 2¢ book at $4.31 and a 62¢ book at $134. This block is what
+ * separates them, and it exists because the previous non-degeneracy guard could not: that
+ * guard asserted `median !== p90` and `clamped === 0`, both of which a **synthetic
+ * constant-width book passes**, because the MID varies even when the width does not. It read
+ * the same in the real-book and synthetic-book states for four beats.
+ *
+ * {@link tickQuantizedRows} is the check that does separate them. An exact integer number of
+ * cents, repeated across every row, is a lattice — a simulator or a tick-rounded feed — not a
+ * continuously-quoted market. Do not substitute the old dispersion guard for it.
+ */
+export interface MarketableMtmMidInvariants {
+  /** Rows folded here (`quotedH.n` for the quoted basis, `n` for the actual basis). */
+  n: number;
+  /** Median decision mid per share, $. `null` at n=0 — never 0, which is a real price. */
+  midMedianUsd: number | null;
+  /** Implied FULL spread per share, $ (`2·|h|·mid`). `null` moments at n=0. */
+  fullSpreadUsd: { median: number; p90: number } | null;
+  /** The same width in TICKS (`fullSpreadUsd / 0.01`). `null` moments at n=0. */
+  fullSpreadTicks: { median: number; p90: number } | null;
+  /**
+   * Rows whose implied full spread is within {@link MARKETABLE_MTM_TICK_EPSILON} of an
+   * integer tick. `tickQuantizedRows === n` with `n` large ⇒ an integer-cent lattice.
+   */
+  tickQuantizedRows: number;
+  /** Largest distance from an integer tick across the rows; `null` at n=0. */
+  maxTickDeviation: number | null;
+  /** Count of DISTINCT integer widths. A handful across many rows is a lattice tell. */
+  distinctWidthTicks: number | null;
+  /** The modal width in ticks and its row count; `null` at n=0. */
+  modalWidthTicks: { ticks: number; rows: number } | null;
+  /** Full `[ticks, rows]` histogram, ascending — so a reader can see the shape, not a summary of it. */
+  widthHistogramTicks: Array<[number, number]>;
+}
+
 export interface MarketableMtmSummary {
   n: number;
   modeledH: number;
@@ -601,6 +755,66 @@ export interface MarketableMtmSummary {
    * and sits deliberately OUTSIDE that sum (a dropped record is never a retained sample).
    */
   quoteCoverage: MarketableMtmQuoteCoverage;
+  /**
+   * TRA-3459 Task 2 — the mid-invariant discriminator, on BOTH bases. `quoted` folds the
+   * quote-bearing subset (the GRADED corpus); `all` folds every retained row off `actualH`.
+   * They are published side by side because they answer the same question of two different
+   * measurements, and a lattice that shows on one and not the other is itself a finding.
+   */
+  midInvariants: { quoted: MarketableMtmMidInvariants; all: MarketableMtmMidInvariants };
+}
+
+/**
+ * TRA-3459 — fold one basis's rows into {@link MarketableMtmMidInvariants}.
+ *
+ * `hOf` returns the row's half-spread on this basis. `actualH` is SIGNED (a fill can land on
+ * either side of the mid), so the magnitude is taken: the WIDTH of a book has no sign, and
+ * signing it would put half the rows at negative ticks and destroy the quantization test.
+ */
+function foldMidInvariants(
+  rows: readonly MarketableMtmSample[],
+  hOf: (s: MarketableMtmSample) => number,
+): MarketableMtmMidInvariants {
+  if (rows.length === 0) {
+    return {
+      n: 0,
+      midMedianUsd: null,
+      fullSpreadUsd: null,
+      fullSpreadTicks: null,
+      tickQuantizedRows: 0,
+      maxTickDeviation: null,
+      distinctWidthTicks: null,
+      modalWidthTicks: null,
+      widthHistogramTicks: [],
+    };
+  }
+  const mids = rows.map((s) => s.exitMidPerShare).sort((a, b) => a - b);
+  const full = rows.map((s) => 2 * Math.abs(hOf(s)) * s.exitMidPerShare);
+  const ticks = full.map((w) => w / MARKETABLE_MTM_TICK_USD);
+  const deviations = ticks.map((t) => Math.abs(t - Math.round(t)));
+  const histogram = new Map<number, number>();
+  for (const t of ticks) {
+    const k = Math.round(t);
+    histogram.set(k, (histogram.get(k) ?? 0) + 1);
+  }
+  const entries = [...histogram.entries()].sort((a, b) => a[0] - b[0]);
+  // Ties broken on the NARROWER width so the modal value is deterministic across runs.
+  const modal = [...entries].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0];
+  const fullSorted = [...full].sort((a, b) => a - b);
+  const tickSorted = [...ticks].sort((a, b) => a - b);
+  return {
+    n: rows.length,
+    midMedianUsd: quantile(mids, 0.5),
+    fullSpreadUsd: { median: quantile(fullSorted, 0.5), p90: quantile(fullSorted, 0.9) },
+    fullSpreadTicks: { median: quantile(tickSorted, 0.5), p90: quantile(tickSorted, 0.9) },
+    tickQuantizedRows: deviations.filter((d) => d < MARKETABLE_MTM_TICK_EPSILON).length,
+    maxTickDeviation: Math.max(...deviations),
+    // Counted on the ROUNDED tick, matching the histogram: two rows one float-ulp apart are
+    // one width, not two. Counting raw floats would report 46 distinct widths on a lattice.
+    distinctWidthTicks: entries.length,
+    modalWidthTicks: { ticks: modal[0], rows: modal[1] },
+    widthHistogramTicks: entries,
+  };
 }
 
 /** Fold a set of samples into the comparison summary at modeled half-spread `h`. Pure. */
@@ -671,11 +885,23 @@ export function summarizeMarketableMtm(
       etDayMin: quotedEtDays.length ? quotedEtDays[0] : null,
       etDayMax: quotedEtDays.length ? quotedEtDays[quotedEtDays.length - 1] : null,
     },
+    midInvariants: {
+      quoted: foldMidInvariants(quotedRows, (s) => s.quotedH as number),
+      all: foldMidInvariants(samples, (s) => s.actualH),
+    },
   };
 }
 
 export interface MarketableMtmVerdict {
-  code: 'PASS' | 'REVIEW';
+  /**
+   * TRA-3459 added `NOT_GRADEABLE`, and the distinction from `REVIEW` is the entire point of
+   * that ticket. `REVIEW` says *"not yet"* — accrue rows, come back. `NOT_GRADEABLE` says
+   * *"not here, ever"* — the validation population cannot decide this question and no amount
+   * of n will change that. Four beats of accrual were spent on a predicate that reported
+   * `REVIEW` while being arithmetically incapable of passing. A terminal that reads as a
+   * waiting state is the defect, not the wait.
+   */
+  code: 'PASS' | 'REVIEW' | 'NOT_GRADEABLE';
   reason: string;
   /**
    * TRA-2300 §1 — WHICH measurement this verdict graded. Carried on the verdict object itself
@@ -797,19 +1023,195 @@ function withUnpricedDrops<T extends MarketableMtmSummary>(summary: T, dropped: 
 }
 
 /**
- * TRA-2300 §1 — **THE GATE.** PASS iff the median QUOTED-book half-spread is within `±tol` of
- * modeled `h` AND the modeled p90 cross covers the quoted p90 cross on the same rows.
+ * TRA-3459 — is the validation population one on which `h` can be graded AT ALL?
  *
- * Identical in shape and tolerance to {@link marketableMtmVerdict}; only the decision variable
- * differs — `quotedH.median` instead of `actualH.median` — and the sufficiency floor is read
- * off `quotedH.n`, NOT `summary.n`. That distinction is the point: `summary.n` counts rows with
- * a usable exit FILL, and on this venue every one of those has a dead `actualH`. Gating the
- * quoted verdict on `summary.n` would let 30 quote-less rows clear the floor and hand back a
- * verdict computed from `NaN`.
+ * ## The decision rule is a theorem, not a threshold
  *
- * Below `minN` QUOTED samples the code is REVIEW, never PASS, and the reason carries
- * {@link MARKETABLE_MTM_QUOTED_COVERAGE_NOTE} plus the ABSENT-vs-NULL split so "not yet
- * gradeable (legacy rows draining)" is never confused with "instrument dead".
+ * The graded comparison is `|mean(quotedH) − modeledH| <= tol`. A mean **always lies inside
+ * the support of its own sample**: `min(x) <= mean(x) <= max(x)`, for every sample, with no
+ * distributional assumption. Therefore:
+ *
+ * > If `modeledH` sits further than `tol` outside `[min(quotedH), max(quotedH)]`, then
+ * > `|mean(quotedH) − modeledH| > tol` **necessarily** — for this population, at this
+ * > support, whatever the rows inside it turn out to be.
+ *
+ * That is what `NOT_GRADEABLE` means here, and it is provable rather than tuned. It is the
+ * operational form of the TRA-2602 finding: a criterion no achievable measurement could pass
+ * was reporting `REVIEW`, which reads as *"grade it later"*. This computes the difference.
+ *
+ * Live 2026-08-13: quoted support is `[0, 0.00527]` against a modeled 0.134 — the ENTIRE
+ * observed book is 25× below the model, gap 0.1287 against a tolerance of 0.03.
+ *
+ * ⚠ **Honest scope of the terminal.** The support is a MEASUREMENT and it can widen: a future
+ * sandbox row quoting `h >= 0.104` would make the gate gradeable again, and this function is
+ * re-evaluated on every read, so it un-latches by itself. What it rules out is *accruing more
+ * of the same book* — which is exactly the four beats TRA-2242 spent. It says "not on this
+ * book", not "never".
+ *
+ * ## The regime ratios EXPLAIN it; they do not decide it
+ *
+ * `h = (fullSpread/2) / mid` is a composite of two regimes the fraction hides:
+ *
+ *     h_validation / h_calibration  =  (width ratio) × (1 / mid ratio)
+ *
+ * Measured 2026-08-13: median full spread **2¢** (sandbox) vs **15¢** (demo) = 7.5×, on a
+ * median mid of **$4.31** vs **$1.32** = 3.3× ⇒ the observed ~24× `h` gap, as `7.5 × 3.3`
+ * with the mid term working the other way. Both terms are real and both point the same way.
+ *
+ * ⚠ This is why **matched mid buckets do not rescue the gate** — and that was the obvious
+ * fix, so it is worth refuting with a number rather than an argument. Bucketing on the mid
+ * removes the 3.3× term and leaves the 7.5× width term untouched. Measured directly: the 16
+ * demo rows whose mid falls inside the sandbox's `[$2.85, $6.83]` range carry a median `h` of
+ * **0.0492** against the sandbox's **0.00274** — an **18× residual AFTER matching the mid**.
+ * The two books do not differ in where they are priced so much as in how wide they are quoted.
+ *
+ * `unmeasured` below {@link MARKETABLE_MTM_POPULATION_FITNESS_MIN_N} quoted rows.
+ */
+export interface MarketableMtmPopulationFitness {
+  verdict: 'fit' | 'unfit' | 'unmeasured';
+  /** Quoted rows the fitness was assessed over. */
+  n: number;
+  /** The DECIDING quantity: distance from `modeledH` to `[min, max]` of `quotedH`; 0 if inside. */
+  supportGap: number | null;
+  /** The band `supportGap` is compared against — the gate's own `tol`. */
+  tol: number;
+  /** The observed support of the graded statistic. `null` at n=0. */
+  observedHSupport: { min: number | null; max: number | null };
+  modeledH: number;
+  /**
+   * The `h` a row would have to quote at, at the far edge, for this population to become
+   * gradeable — i.e. what the book would have to DO, stated as a number a reader can watch
+   * for. `null` when already fit or unmeasured.
+   */
+  hNeededForGradeability: number | null;
+  /** REPORTING ONLY ({@link MARKETABLE_MTM_POPULATION_FITNESS_MAX_RATIO}) — decides nothing. */
+  maxRatio: number;
+  /** `median(validation width)` vs `median(calibration width)`, orientation-free (≥ 1). */
+  widthRatio: number | null;
+  /** `median(validation mid)` vs `median(calibration mid)`, orientation-free (≥ 1). */
+  midRatio: number | null;
+  observed: { midMedianUsd: number | null; fullSpreadUsdMedian: number | null };
+  calibration: { midMedianUsd: number; fullSpreadUsdMedian: number; n: number };
+  /** Empty iff not `unfit`. The support statement first, then whichever regimes are out of band. */
+  reasons: string[];
+}
+
+/** Ratio of two positive magnitudes, orientation-free (always ≥ 1); `null` if either is unusable. */
+function regimeRatio(a: number | null, b: number): number | null {
+  if (a == null || !Number.isFinite(a) || a <= 0 || !Number.isFinite(b) || b <= 0) return null;
+  return a >= b ? a / b : b / a;
+}
+
+/** TRA-3459 — see {@link MarketableMtmPopulationFitness}. Pure. */
+export function marketableMtmPopulationFitness(
+  summary: MarketableMtmSummary,
+  tol: number = MARKETABLE_MTM_DEFAULT_TOL,
+  minN: number = MARKETABLE_MTM_POPULATION_FITNESS_MIN_N,
+  maxRatio: number = MARKETABLE_MTM_POPULATION_FITNESS_MAX_RATIO,
+): MarketableMtmPopulationFitness {
+  const inv = summary.midInvariants.quoted;
+  const calibration = {
+    midMedianUsd: MODELED_H_CALIBRATION.midUsd.median,
+    fullSpreadUsdMedian: MODELED_H_CALIBRATION.fullSpreadUsd.median,
+    n: MODELED_H_CALIBRATION.n,
+  };
+  const observed = {
+    midMedianUsd: inv.midMedianUsd,
+    fullSpreadUsdMedian: inv.fullSpreadUsd?.median ?? null,
+  };
+  const widthRatio = regimeRatio(observed.fullSpreadUsdMedian, calibration.fullSpreadUsdMedian);
+  const midRatio = regimeRatio(observed.midMedianUsd, calibration.midMedianUsd);
+  const lo = summary.quotedH.min;
+  const hi = summary.quotedH.max;
+  const base = {
+    n: summary.quotedH.n, tol, modeledH: summary.modeledH,
+    observedHSupport: { min: lo, max: hi },
+    maxRatio, widthRatio, midRatio, observed, calibration,
+  };
+  if (
+    summary.quotedH.n < minN
+    || lo == null || hi == null
+    || !Number.isFinite(lo) || !Number.isFinite(hi)
+  ) {
+    return {
+      ...base, verdict: 'unmeasured', supportGap: null, hNeededForGradeability: null, reasons: [],
+    };
+  }
+  // Distance from the modeled point to the observed support interval; 0 when inside.
+  const h = summary.modeledH;
+  const supportGap = h < lo ? lo - h : h > hi ? h - hi : 0;
+  if (supportGap <= tol) {
+    return { ...base, verdict: 'fit', supportGap, hNeededForGradeability: null, reasons: [] };
+  }
+  // What the far edge of the book would have to reach. Stated so the terminal names a
+  // watchable condition rather than only a refusal.
+  const needed = h > hi ? h - tol : h + tol;
+  const reasons: string[] = [
+    `modeled h ${h} lies ${supportGap.toFixed(4)} OUTSIDE the entire observed support of `
+    + `quotedH [${lo.toFixed(5)}, ${hi.toFixed(5)}] over ${summary.quotedH.n} rows, against a `
+    + `tolerance of ${tol}. A mean always lies inside its own sample's support, so `
+    + `|mean(quotedH) − ${h}| > ${tol} is FORCED on this population — the comparison has no `
+    + `pass state here, and accruing more rows of the same book cannot create one. It would `
+    + `become gradeable if the book's far edge reached h ≈ ${needed.toFixed(4)}`,
+  ];
+  if (widthRatio != null && widthRatio > maxRatio) {
+    reasons.push(
+      `WIDTH regime differs ${widthRatio.toFixed(1)}× (validation median full spread `
+      + `$${(observed.fullSpreadUsdMedian as number).toFixed(3)} vs calibration `
+      + `$${calibration.fullSpreadUsdMedian.toFixed(2)}). h is LINEAR in the width, so no `
+      + `mid-bucketing removes this term`,
+    );
+  }
+  if (midRatio != null && midRatio > maxRatio) {
+    reasons.push(
+      `MID regime differs ${midRatio.toFixed(1)}× (validation median mid `
+      + `$${(observed.midMedianUsd as number).toFixed(2)} vs calibration `
+      + `$${calibration.midMedianUsd.toFixed(2)}). h is INVERSE in the mid`,
+    );
+  }
+  return { ...base, verdict: 'unfit', supportGap, hNeededForGradeability: needed, reasons };
+}
+
+/**
+ * TRA-2300 §1 — **THE GATE.** TRA-3459 re-specified what it grades and added a terminal it
+ * could not previously reach.
+ *
+ * Three checks, in this order, and the order is load-bearing:
+ *
+ * 1. **Population fitness** ({@link marketableMtmPopulationFitness}) — asked FIRST, above the
+ *    n floor, because when the answer is `unfit` the honest reply is "accrual cannot fix
+ *    this", and reporting `insufficient n` instead is precisely the misreading that cost
+ *    TRA-2242 four beats of waiting. `unfit` ⇒ **`NOT_GRADEABLE`**, a terminal.
+ * 2. **Sufficiency** — below `minN` QUOTED samples the code is `REVIEW`, carrying
+ *    {@link MARKETABLE_MTM_QUOTED_COVERAGE_NOTE} and the ABSENT-vs-NULL split so a draining
+ *    legacy backlog is never confused with a dead instrument. Read off `quotedH.n`, NOT
+ *    `summary.n`: `summary.n` counts rows with a usable exit FILL, every one of which has a
+ *    dead `actualH` on this venue, so gating on it would return a verdict computed from `NaN`.
+ * 3. **Statistic-matched comparison** — see below.
+ *
+ * ## What TRA-2602 found, and what changed here
+ *
+ * The predicate used to be `|quotedH.median − modeledH| <= tol`. `modeledH = 0.134` is the
+ * **MEAN** of a right-skewed distribution whose median is **0.0667**
+ * ({@link MODELED_H_CALIBRATION}) — mean/median = 2.03. So the old predicate, evaluated on
+ * the very population that DEFINED its target, gives `|0.0667 − 0.134| = 0.067 > 0.03` and
+ * **FAILS**. A criterion that cannot pass on its own calibration data has no pass state, and
+ * every REVIEW it ever emitted was uninformative.
+ *
+ * The decision variable is now the **MEAN**: `|mean(quotedH) − h| <= tol`. Matched to what
+ * `h` IS, and matched to what `h` DOES — the DARK mark haircuts every position by `mid·(1−h)`,
+ * so the aggregate error over a book is driven by the mean, not the median.
+ *
+ * ⚠ The median is deliberately NOT gated on, and that is a decision, not an omission. Gating
+ * it too (against `h · medianToMeanRatio`) would REJECT a book that quotes at a uniform
+ * 0.134 — a book on which the model is exactly right and merely unskewed. A second criterion
+ * that fails a correct answer is not extra rigour. The median rides the payload as a SHAPE
+ * diagnostic, beside `impliedMedianH`, and the reason states both.
+ *
+ * **This passes on the calibration data** — mean 0.1351 vs 0.134, Δ 0.0011, inside ±0.03.
+ * That property is asserted by a unit test, and it is the minimum bar any replacement must
+ * clear. **And it has a reachable failing state on a FIT population**: a quoted mean of 0.20
+ * (Δ 0.066) FAILS. The tail check is unchanged and is `AND`ed in.
  */
 export function marketableMtmQuotedVerdict(
   summary: MarketableMtmSummary,
@@ -817,6 +1219,36 @@ export function marketableMtmQuotedVerdict(
   minN: number,
 ): MarketableMtmVerdict {
   const qn = summary.quotedH.n;
+
+  // (1) TRA-3459 — fitness BEFORE sufficiency. See the doc comment: the whole point of the
+  // terminal is that it must not be reachable only after a floor that will never be cleared
+  // in a way that matters.
+  const fitness = marketableMtmPopulationFitness(summary, tol);
+  if (fitness.verdict === 'unfit') {
+    const inv = summary.midInvariants.quoted;
+    return {
+      code: 'NOT_GRADEABLE',
+      basis: 'quotedH',
+      reason: `NOT GRADEABLE ON THIS POPULATION — the validation book is not the book h was `
+        + `calibrated on, and MORE ROWS OF THIS BOOK CANNOT FIX IT. ${fitness.reasons.join('; ')}. `
+        + `Calibration population: ${MODELED_H_CALIBRATION.n} demo-journal rows `
+        + `(${MODELED_H_CALIBRATION.windowUtc.from.slice(0, 10)}..${MODELED_H_CALIBRATION.windowUtc.to.slice(0, 10)}), `
+        + `median mid $${MODELED_H_CALIBRATION.midUsd.median.toFixed(2)}, median full spread `
+        + `$${MODELED_H_CALIBRATION.fullSpreadUsd.median.toFixed(2)}, mean h ${MODELED_H_CALIBRATION.h.mean} `
+        + `(median ${MODELED_H_CALIBRATION.h.median}). Validation population: ${qn} quoted rows, `
+        + `median mid $${(inv.midMedianUsd ?? Number.NaN).toFixed(2)}, median full spread `
+        + `$${(inv.fullSpreadUsd?.median ?? Number.NaN).toFixed(3)} `
+        + `(${inv.tickQuantizedRows}/${inv.n} integer-tick, ${inv.distinctWidthTicks ?? 0} distinct widths, `
+        + `modal ${inv.modalWidthTicks?.ticks ?? 0}¢). This is a TERMINAL, not a wait: it does not say `
+        + `"grade it later", it says this venue cannot decide the question. TRA-2242 needs a `
+        + `different evidence source for h — validate on a population whose width regime is within `
+        + `${fitness.maxRatio}× of the calibration book, or re-calibrate h per-population and publish `
+        + `mean AND median for each. Do NOT retune h to close the gap: fitting 0.134 to ~0.003 `
+        + `collapses the haircut to mid-marking, the TRA-2131 shape TRA-2233 exists to remove.`,
+    };
+  }
+
+  // (2) Sufficiency.
   if (qn < minN) {
     const cov = summary.quoteCoverage;
     return {
@@ -830,20 +1262,36 @@ export function marketableMtmQuotedVerdict(
         + `${MARKETABLE_MTM_QUOTED_COVERAGE_NOTE}`,
     };
   }
-  const withinTol = Math.abs(summary.quotedH.median - summary.modeledH) <= tol;
+  // (3) TRA-3459 — STATISTIC-MATCHED comparison on the MEAN. `modeledH` IS a mean
+  // (MODELED_H_CALIBRATION.statistic) and the DARK mark applies it to every position, so the
+  // mean is both what the constant is and what it does. This line used to read
+  // `Math.abs(summary.quotedH.median - summary.modeledH)` — a p50 against a mean across a
+  // 2.03× skew, which cannot pass on the calibration population itself (TRA-2602).
+  const impliedMedianH = summary.modeledH * MODELED_H_CALIBRATION.h.medianToMeanRatio;
+  const withinTol = Math.abs(summary.quotedH.mean - summary.modeledH) <= tol;
   const tailOk = !quotedTailUnderCharged(summary);
+  // Reported, never gated on — see the doc comment. A book quoting a uniform 0.134 is the
+  // model being exactly right, and would fail a median arm.
+  const shape = `shape: median ${summary.quotedH.median.toFixed(4)} vs the calibration-implied `
+    + `${impliedMedianH.toFixed(4)} (= ${summary.modeledH} × ${MODELED_H_CALIBRATION.h.medianToMeanRatio}) `
+    + '— DIAGNOSTIC, not graded';
   if (withinTol && tailOk) {
     return {
       code: 'PASS',
       basis: 'quotedH',
-      reason: `median QUOTED h ${summary.quotedH.median.toFixed(4)} within ±${tol} of modeled `
-        + `${summary.modeledH}; quoted tail covered (modeled p90 $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} `
-        + `≥ quoted p90 $${summary.quotedCrossUsd.p90.toFixed(2)} over the same ${qn} quote-bearing rows)`,
+      reason: `mean QUOTED h ${summary.quotedH.mean.toFixed(4)} within ±${tol} of modeled `
+        + `${summary.modeledH} (statistic-matched: modeledH is a MEAN); quoted tail covered `
+        + `(modeled p90 $${summary.modeledCrossUsdOnQuoted.p90.toFixed(2)} ≥ quoted p90 `
+        + `$${summary.quotedCrossUsd.p90.toFixed(2)} over the same ${qn} quote-bearing rows); `
+        + `population FIT (modeled h inside the observed support `
+        + `[${(fitness.observedHSupport.min ?? Number.NaN).toFixed(5)}, `
+        + `${(fitness.observedHSupport.max ?? Number.NaN).toFixed(5)}] to within ${tol}); ${shape}`,
     };
   }
   const bits: string[] = [];
   if (!withinTol) {
-    bits.push(`median QUOTED h ${summary.quotedH.median.toFixed(4)} outside ±${tol} of modeled ${summary.modeledH}`);
+    bits.push(`mean QUOTED h ${summary.quotedH.mean.toFixed(4)} outside ±${tol} of modeled `
+      + `${summary.modeledH} (statistic-matched: modeledH is a MEAN); ${shape}`);
   }
   if (!tailOk) {
     const ratio = quotedTailUnderChargeRatio(summary);
@@ -971,6 +1419,13 @@ export function marketableMtmQuotedPooledVerdict(
   }
 
   if (bits.length === 0) return base;
+  // TRA-3459 — a NOT_GRADEABLE base KEEPS its code. Per-structure detail is additional
+  // information about a question that is already terminally unanswerable; folding it down to
+  // REVIEW would restore the exact "grade it later" reading the terminal exists to remove,
+  // and it would do so silently, from a branch that only fires once rows accrue.
+  if (base.code === 'NOT_GRADEABLE') {
+    return { code: 'NOT_GRADEABLE', basis: 'quotedH', reason: `${base.reason} ALSO: ${bits.join('; ')}` };
+  }
   const prefix = base.code === 'REVIEW' ? `${base.reason}; ` : '';
   return { code: 'REVIEW', basis: 'quotedH', reason: `${prefix}${bits.join('; ')}` };
 }
@@ -1055,6 +1510,18 @@ export interface MarketableMtmForwardValidation extends MarketableMtmSummary {
   /** Restates the floor's epistemic status on the payload so it is not read as precision. */
   perStructureMinNNote: string;
   diagnostics: MarketableMtmDiagnostics;
+  /**
+   * TRA-3459 — the population-fitness read behind a `NOT_GRADEABLE` verdict, as NUMBERS.
+   *
+   * On the payload in its own right so a consumer never has to parse the verdict's prose to
+   * learn WHY the gate is terminal, or how far out of band the population is. `widthRatio` and
+   * `midRatio` are published separately, never as a quotient — see
+   * {@link MARKETABLE_MTM_POPULATION_FITNESS_MAX_RATIO} for why a canceling pair is an
+   * accidental agreement rather than a validation.
+   */
+  populationFitness: MarketableMtmPopulationFitness;
+  /** TRA-3459 — the calibration population `modeledH` was measured on. See {@link MODELED_H_CALIBRATION}. */
+  modeledHCalibration: typeof MODELED_H_CALIBRATION;
   /** Per-row samples, only when `includeSamples` is set. Capped; see `diagnostics.truncated`. */
   samples?: MarketableMtmSample[];
   actualHCaveat: string;
@@ -1258,6 +1725,10 @@ export function foldMarketableMtmForwardValidation(
     perStructureMinN,
     perStructureMinNNote: MARKETABLE_MTM_PER_STRUCTURE_MIN_N_NOTE,
     diagnostics,
+    // TRA-3459 — computed off the POOLED summary, the same object `quotedVerdict` grades, so
+    // the numbers on the payload and the numbers behind the verdict cannot disagree.
+    populationFitness: marketableMtmPopulationFitness(summary, tol),
+    modeledHCalibration: MODELED_H_CALIBRATION,
     ...(opts.includeSamples === true ? { samples: samples.slice(0, cap) } : {}),
     actualHCaveat: MARKETABLE_MTM_ACTUAL_H_CAVEAT,
     totalRecords: records.length,

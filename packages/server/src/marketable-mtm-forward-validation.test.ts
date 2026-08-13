@@ -12,6 +12,7 @@ import {
   MARKETABLE_MTM_DEFAULT_MIN_N,
   MARKETABLE_MTM_DEFAULT_PER_STRUCTURE_MIN_N,
   MARKETABLE_MTM_OUTLIER_ABS_H,
+  MODELED_H_CALIBRATION,
 } from './marketable-mtm-forward-validation.js';
 import type { SandboxStrategyRecord, SandboxStrategyLeg } from './sandbox-strategy-journal.js';
 // TRA-2600 — the REAL writer, imported so the dead-snap fixture below cannot decouple
@@ -543,7 +544,9 @@ describe('TRA-2300 — the graded basis is quotedH', () => {
 
     expect(result.quotedVerdict.code).toBe('PASS');
     expect(result.quotedVerdict.basis).toBe('quotedH');
-    expect(result.quotedVerdict.reason).toMatch(/median QUOTED h 0\.1300 within ±0\.03 of modeled 0\.134/);
+    // TRA-3459 — the graded moment is the MEAN (modeledH IS a mean). On this constant book
+    // the two coincide; the wide-book case below is where they part.
+    expect(result.quotedVerdict.reason).toMatch(/mean QUOTED h 0\.1300 within ±0\.03 of modeled 0\.134/);
     expect(result.quotedVerdict.reason).toMatch(/quoted tail covered/);
 
     expect(result.actualH.median).toBeCloseTo(0, 12);
@@ -578,16 +581,21 @@ describe('TRA-2300 — the graded basis is quotedH', () => {
 
   // ── §2: the quoted-basis tail check — the prove-it-fires case ──────────────
   it('§2: a genuinely WIDE quoted book forces a quoted-basis REVIEW on the TAIL ALONE', () => {
-    // 80% of rows quote at exactly the modeled 0.134 and 20% at 0.40. The MEDIAN is therefore
-    // EXACTLY the modeled h — the tolerance check PASSES — so the only thing that can produce a
-    // REVIEW here is the tail check. A tail-blind gate would call this corpus healthy while the
-    // p90 book charges 3× what the mark haircuts.
+    // 80% of rows quote at 0.0675 and 20% at 0.40, so the MEAN is EXACTLY the modeled 0.134
+    // (0.8·0.0675 + 0.2·0.40) — the tolerance check PASSES — and the only thing that can
+    // produce a REVIEW here is the tail check. A tail-blind gate would call this corpus
+    // healthy while the p90 book charges 3× what the mark haircuts.
+    //
+    // TRA-3459 rebalanced these values from `[0.134 ×4, 0.40]`, which pinned the MEDIAN at
+    // 0.134 back when the median was the decision variable. Under a mean-based predicate that
+    // old corpus fails BOTH checks, which would stop isolating the tail — the property this
+    // test exists for. Same intent, moment-matched to the predicate it grades.
     const result = foldMarketableMtmForwardValidation(
-      quotedCorpus([0.134, 0.134, 0.134, 0.134, 0.40]),
+      quotedCorpus([0.0675, 0.0675, 0.0675, 0.0675, 0.40]),
     );
     expect(result.quotedH.n).toBe(40);
-    expect(result.quotedH.median).toBeCloseTo(MARKETABLE_MTM_DEFAULT_H, 12); // tolerance: PASS
-    expect(Math.abs(result.quotedH.median - MARKETABLE_MTM_DEFAULT_H))
+    expect(result.quotedH.mean).toBeCloseTo(MARKETABLE_MTM_DEFAULT_H, 12); // tolerance: PASS
+    expect(Math.abs(result.quotedH.mean - MARKETABLE_MTM_DEFAULT_H))
       .toBeLessThanOrEqual(MARKETABLE_MTM_DEFAULT_TOL);
     expect(result.quotedH.p90).toBeCloseTo(0.40, 12);                        // tail: FAIL
     expect(result.quotedCrossUsd.p90).toBeCloseTo(80, 9);                    // 0.40 · 2 · 100
@@ -621,18 +629,31 @@ describe('TRA-2300 — the graded basis is quotedH', () => {
     const result = foldMarketableMtmForwardValidation(recs);
     // The pooled tail literally reads "covered" — this is the masking, made explicit.
     expect(result.modeledCrossUsdOnQuoted.p90).toBeGreaterThanOrEqual(result.quotedCrossUsd.p90);
+    // TRA-3459 — and here is the OLD decision variable, on D3's own fixture, still reading
+    // healthy: the pooled MEDIAN is csp's 0.13, comfortably inside ±0.03 of 0.134. The
+    // pooled MEAN is 0.21 and is NOT, because 10 rows at 0.45 drag it. A median can be
+    // masked by pooling in a way a mean cannot, which is a second reason the moment-matched
+    // fix is the right one — not merely the honest one.
     expect(result.quotedH.median).toBeCloseTo(0.13, 12);
-    // The pooled quoted checks, in isolation, would PASS…
+    expect(Math.abs(result.quotedH.median - MARKETABLE_MTM_DEFAULT_H))
+      .toBeLessThanOrEqual(MARKETABLE_MTM_DEFAULT_TOL);        // the old check: masked
+    expect(result.quotedH.mean).toBeCloseTo(0.21, 12);
+    expect(Math.abs(result.quotedH.mean - MARKETABLE_MTM_DEFAULT_H))
+      .toBeGreaterThan(MARKETABLE_MTM_DEFAULT_TOL);            // the new check: catches it
     const pooledOnly = marketableMtmQuotedVerdict(result, MARKETABLE_MTM_DEFAULT_TOL, MARKETABLE_MTM_DEFAULT_MIN_N);
-    expect(pooledOnly.code).toBe('PASS');
-    // …and the shipped quoted verdict still REVIEWs, naming the structure and its multiple.
+    expect(pooledOnly.code).toBe('REVIEW');
+    // …and the shipped quoted verdict still REVIEWs, naming the structure and its multiple —
+    // which is the D3 rule, and it holds whether or not the pooled tolerance also fires.
     expect(result.quotedVerdict.code).toBe('REVIEW');
     expect(result.quotedVerdict.reason).toMatch(/per-structure QUOTED tail UNDER-CHARGED/);
     expect(result.quotedVerdict.reason).toMatch(/long_call/);
     const lc = result.perStructure.find((s) => s.structure === 'long_call')!;
     expect(lc.quotedTailUnderCharged).toBe(true);
     expect(lc.quotedTailUnderChargeRatio).toBeCloseTo(0.45 / 0.134, 6);
-    expect(lc.quotedVerdict.code).toBe('REVIEW');
+    // TRA-3459 — long_call ALONE is a uniform 0.45 book, so 0.134 sits 0.316 outside its
+    // entire support and no mean over those rows can reach it: NOT_GRADEABLE, which is a
+    // strictly more specific statement than the REVIEW this used to assert.
+    expect(lc.quotedVerdict.code).toBe('NOT_GRADEABLE');
     const csp = result.perStructure.find((s) => s.structure === 'csp')!;
     expect(csp.quotedTailUnderCharged).toBe(false);
     expect(csp.quotedTailUnderChargeRatio).toBeNull();
@@ -986,5 +1007,284 @@ describe('summary shape matches the harness fields', () => {
     expect(v.code).toBe('PASS');
     // modeled cross uses the SAME exit mid the actual cross was measured against (per row)
     expect(summary.modeledCrossUsd.mean).toBeCloseTo(MARKETABLE_MTM_DEFAULT_H * CONTRACT_MULTIPLIER * summary.actualCrossUsd.mean / (0.13 * CONTRACT_MULTIPLIER), 6);
+  });
+});
+
+// ── TRA-3459: the calibration population, the mid invariants, the new terminal ──
+describe('TRA-3459 — the gate is re-specified against a MEASURED calibration population', () => {
+  /**
+   * THE LIVE SANDBOX BOOK, verbatim. All 20 quote-bearing exit legs on
+   * `/api/health/parity-reconcile/records` as of live `be7600e1` (ET days 2026-07-29 ..
+   * 2026-08-12), as `[strategy, exitSide, requestedPx, bid, ask]`.
+   *
+   * Copied rather than synthesized on purpose. Every pre-registered number in this block was
+   * measured off these exact rows BEFORE the code that emits them existed, so the assertions
+   * below are a falsifiable arrival check on the instrument, not a restatement of it.
+   */
+  const LIVE_QUOTED_EXITS: ReadonlyArray<readonly [string, 'buy' | 'sell', number, number, number]> = [
+    ['long_call', 'sell', 6.83, 6.81, 6.85],
+    ['long_put', 'sell', 6.199999999999999, 6.18, 6.22],
+    ['csp', 'buy', 6.26, 6.24, 6.28],
+    ['covered_call', 'buy', 6.75, 6.75, 6.75],
+    ['long_call', 'sell', 5.6899999999999995, 5.66, 5.72],
+    ['long_put', 'sell', 5.9, 5.88, 5.92],
+    ['csp', 'buy', 5.9, 5.88, 5.92],
+    ['covered_call', 'buy', 5.76, 5.74, 5.78],
+    ['long_call', 'sell', 4.275, 4.26, 4.29],
+    ['long_put', 'sell', 3.96, 3.95, 3.97],
+    ['csp', 'buy', 3.96, 3.95, 3.97],
+    ['covered_call', 'buy', 4.285, 4.27, 4.3],
+    ['long_call', 'sell', 4.35, 4.34, 4.36],
+    ['long_put', 'sell', 3.935, 3.93, 3.94],
+    ['csp', 'buy', 3.9299999999999997, 3.92, 3.94],
+    ['covered_call', 'buy', 4.33, 4.32, 4.34],
+    ['long_call', 'sell', 3.6500000000000004, 3.64, 3.66],
+    ['long_put', 'sell', 2.855, 2.85, 2.86],
+    ['csp', 'buy', 2.855, 2.85, 2.86],
+    ['covered_call', 'buy', 3.6500000000000004, 3.64, 3.66],
+  ];
+
+  /** The live rows as records. Fills at the mid, exactly as this venue behaves. */
+  function liveCorpus(): SandboxStrategyRecord[] {
+    return LIVE_QUOTED_EXITS.map(([strategy, side, mid, bid, ask], i) => record(
+      strategy,
+      leg({ side: side === 'sell' ? 'buy' : 'sell', requestedPx: mid, bid, ask, fillPx: mid }),
+      leg({ side, requestedPx: mid, bid, ask, fillPx: mid }),
+      `2026-08-${String(1 + (i % 12)).padStart(2, '0')}`,
+    ));
+  }
+
+  function quotedish(hs: readonly number[], n: number, mid = 1.32): SandboxStrategyRecord[] {
+    const recs: SandboxStrategyRecord[] = [];
+    for (let i = 0; i < n; i++) {
+      const isLong = i % 2 === 0;
+      const qh = hs[i % hs.length];
+      const book = { bid: mid * (1 - qh), ask: mid * (1 + qh) };
+      recs.push(record(
+        isLong ? 'long_call' : 'csp',
+        leg({ side: isLong ? 'buy' : 'sell', requestedPx: mid, ...book, fillPx: mid }),
+        leg({ side: isLong ? 'sell' : 'buy', requestedPx: mid, ...book, fillPx: mid }),
+        '2026-08-13',
+      ));
+    }
+    return recs;
+  }
+
+  /**
+   * A corpus whose QUOTED book reproduces the CALIBRATION population's own moments — mean
+   * 0.1351, median 0.0667, on its measured median mid of $1.32. Four values round-robin so the
+   * two moments are separately visible and separately checkable; the whole defect was that
+   * they were treated as one number.
+   */
+  const calibrationShapedCorpus = (n = 40) => quotedish([0.0634, 0.07, 0.021, 0.386], n);
+
+  // ── the constant is a MEAN, and the record now says so ─────────────────────
+  it('MODELED_H_CALIBRATION pins the statistic, the population and the window of h=0.134', () => {
+    expect(MODELED_H_CALIBRATION.statistic).toBe('mean');
+    expect(MODELED_H_CALIBRATION.n).toBe(140);
+    // The shipped constant IS the calibration mean, to the precision the source doc published.
+    expect(MARKETABLE_MTM_DEFAULT_H).toBeCloseTo(MODELED_H_CALIBRATION.h.mean, 2);
+    // The skew that broke the old predicate: mean/median ~ 2.03, not ~ 1.
+    expect(MODELED_H_CALIBRATION.h.mean / MODELED_H_CALIBRATION.h.median).toBeCloseTo(2.03, 2);
+    expect(MODELED_H_CALIBRATION.h.medianToMeanRatio)
+      .toBeCloseTo(MODELED_H_CALIBRATION.h.median / MODELED_H_CALIBRATION.h.mean, 3);
+    // The MEASURED mid — the number TRA-2602 DERIVED as $0.149 and got wrong by 8.9x. That
+    // finding's own pre-registered retraction threshold was "measured median mid > $1.00".
+    expect(MODELED_H_CALIBRATION.midUsd.median).toBeGreaterThan(1.0);
+  });
+
+  // ── THE bar any replacement must clear ─────────────────────────────────────
+  it('the TOLERANCE arm now passes on its own calibration data — the old one could not', () => {
+    const result = foldMarketableMtmForwardValidation(calibrationShapedCorpus());
+    expect(result.quotedH.n).toBe(40);
+    expect(result.quotedH.mean).toBeCloseTo(MODELED_H_CALIBRATION.h.mean, 4);
+    expect(result.quotedH.median).toBeCloseTo(MODELED_H_CALIBRATION.h.median, 4);
+    expect(result.populationFitness.verdict).toBe('fit');
+
+    // THE FIX, isolated: the statistic-matched arm clears its own calibration population.
+    expect(Math.abs(result.quotedH.mean - result.modeledH))
+      .toBeLessThanOrEqual(MARKETABLE_MTM_DEFAULT_TOL);
+
+    // POSITIVE CONTROL — the OLD predicate, on this very same corpus, FAILS. Without it the
+    // assertion above could pass for reasons unrelated to the fix, and the regression could
+    // walk back in unnoticed. |0.0667 - 0.134| = 0.067 > 0.03.
+    const oldPredicateHolds =
+      Math.abs(result.quotedH.median - result.modeledH) <= MARKETABLE_MTM_DEFAULT_TOL;
+    expect(oldPredicateHolds).toBe(false);
+    expect(Math.abs(result.quotedH.median - result.modeledH)).toBeCloseTo(0.0673, 3);
+
+    // The reason names the tolerance arm as SATISFIED — it appears nowhere in the REVIEW bits.
+    expect(result.quotedVerdict.reason).not.toMatch(/mean QUOTED h .* outside/);
+  });
+
+  /**
+   * TRA-3459 — a SECOND no-pass-state, in the OTHER arm, surfaced by the test above.
+   *
+   * Fixing the tolerance arm exposed it: the gate PASSES only if the tail arm also holds
+   * (`modeledCrossUsdOnQuoted.p90 >= quotedCrossUsd.p90`), and on a constant `mid` that reduces
+   * to `h >= p90(quotedH)`. `h` is calibrated as a MEAN, and on a right-skewed population the
+   * mean is BELOW the p90 by construction — here 0.1351 against 0.3532, 2.6x. So a SCALAR
+   * mean-calibrated `h` can never cover the tail of the very book it was fitted to.
+   *
+   * This is NOT fixed here, deliberately. The tail check is TRA-2300 §2's and it is correct in
+   * what it asserts — the model DOES under-charge the tail, and that is the bias TRA-2233
+   * exists to remove, pointing the wrong way. Weakening a live safety check to make a green
+   * appear is the failure mode this whole ticket family is about. It is PINNED here instead,
+   * so the constraint is a recorded fact rather than a surprise the next grader rediscovers:
+   * TRA-2242 cannot clear this gate with a scalar `h` on a skewed book, at any n, on any
+   * population — it needs a tail-aware haircut, or a tail criterion stated in terms a point
+   * estimate can meet.
+   */
+  it('PINS the second no-pass-state: a scalar mean-calibrated h cannot cover its own p90', () => {
+    const result = foldMarketableMtmForwardValidation(calibrationShapedCorpus());
+    // p90 of the calibration shape is 2.6x its mean — the skew, in the tail.
+    expect(result.quotedH.p90 / result.quotedH.mean).toBeGreaterThan(2.5);
+    expect(result.modeledCrossUsdOnQuoted.p90).toBeLessThan(result.quotedCrossUsd.p90);
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/under-charges the tail/);
+    // …and it is the TAIL alone that blocks. If this ever starts matching, the tolerance arm
+    // has regressed and this test is the one that says so.
+    expect(result.quotedVerdict.reason).not.toMatch(/mean QUOTED h .* outside/);
+
+    // A reachable PASS for the gate AS A WHOLE still exists — see the TRA-2300 §4 constant-book
+    // case, where p90 === mean === 0.134 so the tail is covered by equality. Restated here so
+    // "REVIEW on the calibration shape" is never read as "this gate cannot pass at all".
+    const flat = foldMarketableMtmForwardValidation(quotedish([MARKETABLE_MTM_DEFAULT_H], 40));
+    expect(flat.quotedVerdict.code).toBe('PASS');
+  });
+
+  it('has a reachable FAIL on a FIT population — a quoted mean of 0.20 does not pass', () => {
+    // Support [0.10, 0.30] contains 0.134 => gradeable. Mean 0.20 => delta 0.066 > tol =>
+    // REVIEW, NOT the terminal. "Gradeable and wrong" and "ungradeable" must not collapse.
+    const result = foldMarketableMtmForwardValidation(quotedish([0.10, 0.30], 40));
+    expect(result.quotedH.mean).toBeCloseTo(0.20, 12);
+    expect(result.populationFitness.verdict).toBe('fit');
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/mean QUOTED h 0\.2000 outside/);
+    expect(result.quotedVerdict.reason).not.toMatch(/NOT GRADEABLE/);
+  });
+
+  // ── the terminal, on the real book ─────────────────────────────────────────
+  it('the LIVE sandbox book is NOT_GRADEABLE — and does not read as "insufficient n"', () => {
+    const result = foldMarketableMtmForwardValidation(liveCorpus());
+    expect(result.quotedH.n).toBe(20);
+    expect(result.quotedH.mean).toBeCloseTo(0.002717, 6);
+
+    const fit = result.populationFitness;
+    expect(fit.verdict).toBe('unfit');
+    // The support theorem: 0.134 lies 0.1287 above the widest quote in the entire book.
+    expect(fit.observedHSupport.max).toBeCloseTo(0.005272, 6);
+    expect(fit.supportGap).toBeCloseTo(0.134 - 0.005272, 5);
+    expect(fit.supportGap as number).toBeGreaterThan(fit.tol);
+    // And it names what the book would have to DO, so the terminal stays watchable.
+    expect(fit.hNeededForGradeability).toBeCloseTo(0.104, 3);
+    // The regime decomposition that EXPLAINS it (reported, not decisive).
+    expect(fit.widthRatio as number).toBeCloseTo(7.5, 1);
+    expect(fit.midRatio as number).toBeCloseTo(3.26, 1);
+
+    expect(result.quotedVerdict.code).toBe('NOT_GRADEABLE');
+    expect(result.quotedVerdict.reason).toMatch(/NOT GRADEABLE ON THIS POPULATION/);
+    expect(result.quotedVerdict.reason).toMatch(/OUTSIDE the entire observed support/);
+    // The misreading that cost TRA-2242 four beats of accrual: the terminal must never be
+    // dressed as a wait.
+    expect(result.quotedVerdict.reason).not.toMatch(/insufficient QUOTED-basis n/);
+    // Nor may it read as a licence to retune h onto the sandbox book.
+    expect(result.quotedVerdict.reason).toMatch(/Do NOT retune h/);
+  });
+
+  it('the terminal survives the per-structure pooled fold instead of decaying to REVIEW', () => {
+    // Every structure here is below the per-structure quoted floor (5 rows each), so the
+    // pooled fold appends its bits. Without TRA-3459's guard that branch returned a hard-coded
+    // REVIEW, silently restoring "grade it later" — from a branch that only fires once rows
+    // accrue, i.e. exactly when nobody is looking at it.
+    const result = foldMarketableMtmForwardValidation(liveCorpus());
+    expect(result.structuresBelowQuotedMinN.length).toBeGreaterThan(0);
+    expect(result.quotedVerdict.code).toBe('NOT_GRADEABLE');
+    expect(result.quotedVerdict.reason).toMatch(/ALSO: /);
+    expect(result.quotedVerdict.reason).toMatch(/insufficient per-structure QUOTED n/);
+  });
+
+  it('an UNMEASURED population is not reported as an unfit one', () => {
+    // 8 quoted rows, under the fitness floor of 10. The support of a handful of rows would
+    // call almost any population unfit; absent evidence is not evidence of unfitness.
+    const result = foldMarketableMtmForwardValidation(quotedish([0.002], 8));
+    expect(result.quotedH.n).toBe(8);
+    expect(result.populationFitness.verdict).toBe('unmeasured');
+    expect(result.populationFitness.supportGap).toBeNull();
+    expect(result.quotedVerdict.code).toBe('REVIEW');
+    expect(result.quotedVerdict.reason).toMatch(/insufficient QUOTED-basis n \(8 < 30\)/);
+  });
+
+  // ── Task 2: the mid-invariant discriminator ────────────────────────────────
+  it('emits the mid invariants, matching the values pre-registered off the live book', () => {
+    const inv = foldMarketableMtmForwardValidation(liveCorpus()).midInvariants;
+
+    // QUOTED basis — every one of these was pre-registered on TRA-3459 before this code existed.
+    expect(inv.quoted.n).toBe(20);
+    expect(inv.quoted.tickQuantizedRows).toBe(20);                    // 20/20
+    expect(inv.quoted.maxTickDeviation as number).toBeLessThan(1e-12); // measured 1.3e-13
+    expect(inv.quoted.distinctWidthTicks).toBe(6);
+    expect(inv.quoted.widthHistogramTicks.map(([t]) => t)).toEqual([0, 1, 2, 3, 4, 6]);
+    expect(inv.quoted.modalWidthTicks).toEqual({ ticks: 2, rows: 7 });
+    expect(inv.quoted.midMedianUsd).toBeCloseTo(4.31, 2);
+    expect((inv.quoted.fullSpreadUsd as { median: number }).median).toBeCloseTo(0.02, 6);
+    expect((inv.quoted.fullSpreadTicks as { median: number }).median).toBeCloseTo(2, 6);
+
+    // ACTUAL basis. This corpus is quote-bearing throughout, so both bases fold the same rows;
+    // the point of the assertion is that the block exists on BOTH and is not the quoted one
+    // emitted twice under two names.
+    expect(inv.all.n).toBe(20);
+    expect(inv.all.midMedianUsd).toBeCloseTo(4.31, 2);
+  });
+
+  it('the integer-tick counter separates a lattice from a real book — the old guard cannot', () => {
+    const lattice = foldMarketableMtmForwardValidation(liveCorpus()).midInvariants.quoted;
+    // A continuously-quoted book: widths off the cent lattice, on varying mids.
+    const realish = foldMarketableMtmForwardValidation(
+      Array.from({ length: 20 }, (_, i) => {
+        const mid = 4.0 + i * 0.137;
+        const qh = 0.0031 + i * 0.00017;
+        const book = { bid: mid * (1 - qh), ask: mid * (1 + qh) };
+        return record('long_call',
+          leg({ side: 'buy', requestedPx: mid, ...book, fillPx: mid }),
+          leg({ side: 'sell', requestedPx: mid, ...book, fillPx: mid }),
+          '2026-08-13');
+      }),
+    ).midInvariants.quoted;
+
+    // The OLD non-degeneracy guard was `median !== p90` (+ `clamped === 0`). BOTH books clear
+    // it, because the MID varies even when the book is a lattice. It is VACUOUS.
+    const lq = lattice.fullSpreadUsd as { median: number; p90: number };
+    const rq = realish.fullSpreadUsd as { median: number; p90: number };
+    expect(lq.median).not.toBeCloseTo(lq.p90, 6);
+    expect(rq.median).not.toBeCloseTo(rq.p90, 6);
+
+    // The integer-tick counter is not: 20/20 against 0/20.
+    expect(lattice.tickQuantizedRows).toBe(20);
+    expect(realish.tickQuantizedRows).toBe(0);
+    expect(realish.maxTickDeviation as number).toBeGreaterThan(1e-3);
+    expect(realish.distinctWidthTicks as number).toBeGreaterThan(lattice.distinctWidthTicks as number);
+  });
+
+  it('mid invariants are null-not-zero on an empty basis — an absent width is not a zero one', () => {
+    const none = foldMarketableMtmForwardValidation(
+      quotedish([0.13], 12).map((r) => ({
+        ...r, legs: r.legs.map((l) => ({ ...l, bid: null, ask: null })),
+      })),
+    ).midInvariants;
+    expect(none.quoted.n).toBe(0);
+    expect(none.quoted.midMedianUsd).toBeNull();
+    expect(none.quoted.fullSpreadUsd).toBeNull();
+    expect(none.quoted.maxTickDeviation).toBeNull();
+    expect(none.quoted.distinctWidthTicks).toBeNull();
+    expect(none.quoted.tickQuantizedRows).toBe(0);
+    expect(none.all.n).toBe(12);
+  });
+
+  it('arms nothing and does not move h', () => {
+    const result = foldMarketableMtmForwardValidation(liveCorpus());
+    expect(result.modeledH).toBe(0.134);
+    expect(result.modeledH).toBe(MARKETABLE_MTM_DEFAULT_H);
+    expect(result.fillRealism).toBe('SANDBOX_SIMULATED');
   });
 });
