@@ -292,6 +292,57 @@ export function lastRecordedOpenSleeve(optionSymbol: string): LiveFillSleeve | n
   return null;
 }
 
+/**
+ * TRA-3553 — the last `buy_to_open` this ledger recorded for `optionSymbol`,
+ * whole, rather than just its sleeve.
+ *
+ * {@link lastRecordedOpenSleeve} answers the RISK-SCHEDULE question. This
+ * answers the PROVENANCE question, and the extra field that matters is
+ * `orderId`: it is the only durable handle tying an adopted row back to the
+ * order the app itself placed. TRA-2820 names its two lost TSLA positions by
+ * their broker order ids (`140022786` / `140028461`) precisely because nothing
+ * left on the position row could name them.
+ */
+export function lastRecordedOpenFill(optionSymbol: string): LiveOptionFillRecord | null {
+  for (let i = fills.length - 1; i >= 0; i--) {
+    const f = fills[i]!;
+    if (f.side === 'buy_to_open' && f.optionSymbol === optionSymbol) return f;
+  }
+  return null;
+}
+
+/**
+ * TRA-3553 — how many `buy_to_open` rows the ledger currently holds.
+ *
+ * This is the ORACLE-HEALTH probe, and it exists because
+ * {@link lastRecordedOpenSleeve} returns `null` for two states that must not be
+ * treated alike:
+ *
+ *   - the ledger is POPULATED and holds no row for this contract => the
+ *     contract is genuinely foreign inventory, and the import schedule is the
+ *     right answer;
+ *   - the ledger is EMPTY — never hydrated, `DATA_DIR` unreadable, a reconcile
+ *     that ran before `hydrateLiveOptionsFeeSlippageFromDisk`, or a retention
+ *     window that aged every row out => the oracle cannot answer AT ALL, and
+ *     reading its silence as "foreign" declares EVERY engine-placed contract
+ *     foreign. That is a fail-OPEN, and it is the state in which TRA-2820's 8
+ *     live contracts / $216 of real premium were handed the RV sub-floor
+ *     sentinel and left with no stop for a whole session.
+ *
+ * A discriminator that cannot tell "no" from "I do not know" is not a
+ * discriminator. Callers pair this with the sleeve lookup so the second case is
+ * reported as UNRESOLVED rather than silently absorbed into the first.
+ *
+ * Deliberately a COUNT of the side actually consulted, not `fills.length`: a
+ * ledger holding only `sell_to_close` rows can answer no open-provenance
+ * question either, and a non-zero total would call that oracle healthy.
+ */
+export function recordedOpenFillCount(): number {
+  let n = 0;
+  for (const f of fills) if (f.side === 'buy_to_open') n += 1;
+  return n;
+}
+
 /** What {@link hydrateLiveOptionsFeeSlippageFromDisk} recovered (for the boot log line). */
 export interface LiveOptionsFeeSlippageHydration {
   records: number;
@@ -661,6 +712,36 @@ export interface GainLossRejection {
   detail: string;
 }
 
+/**
+ * TRA-3558 — a lot whose broker-reported `symbol` was TRUNCATED and which this
+ * pass re-keyed onto the full ledger symbol. Measured live on 2026-08-13: the
+ * ***0154 `/gainloss` payload returned `KVYO260918C0` / `TROW260918C0` (12
+ * chars, cut one digit into the strike) for two lots while every other lot in
+ * the same response carried its full 18–19 char OCC symbol. The lots were
+ * PRESENT, correctly priced, and simply keyed to a symbol no ledger row has —
+ * so four rows sat unmeasured for six days reading as `no-match`.
+ *
+ * A rewrite of a symbol in a money path must never be silent, so every repair
+ * is recorded and republished on the health route.
+ */
+export interface GainLossPrefixRepair {
+  /** The truncated symbol exactly as the broker sent it. */
+  lotSymbol: string;
+  /** The full ledger symbol it was uniquely resolved to. */
+  resolvedSymbol: string;
+  day: string;
+  side: LiveFillSide;
+}
+
+/**
+ * A symbol that LOOKS like an OCC option symbol cut short: root, 6-digit expiry,
+ * C/P, then FEWER than the 8 strike digits. A complete symbol cannot be a strict
+ * prefix of another complete one (same-root strikes are all 8 digits), so this
+ * pattern plus the exact-match test below means a well-formed lot never enters
+ * the repair path at all.
+ */
+const TRUNCATED_OCC_SYMBOL = /^[A-Z]{1,6}\d{6}[CP]\d{0,7}$/;
+
 /** {@link FeeBackfillResult} plus the named reason for every group that did NOT derive. */
 export interface GainLossBackfillResult extends FeeBackfillResult {
   /**
@@ -669,6 +750,12 @@ export interface GainLossBackfillResult extends FeeBackfillResult {
    * recent ET day first, so the ACTIONABLE groups lead (aged rows sort last).
    */
   rejections: GainLossRejection[];
+  /**
+   * TRA-3558 — lots re-keyed off a TRUNCATED broker symbol this pass. Empty on
+   * a healthy payload; non-empty means the broker sent a short symbol and this
+   * pass resolved it, which the reader is entitled to see.
+   */
+  prefixRepairs: GainLossPrefixRepair[];
 }
 
 function round2(n: number): number {
@@ -695,9 +782,39 @@ export function reconcileLedgerFeesFromGainLoss(
       t.basis += basis;
     } else lotTotals.set(key, { qty, basis });
   };
+  // TRA-3558 — the broker truncates a symbol occasionally (see
+  // {@link GainLossPrefixRepair}). Resolve such a lot onto the ONE ledger symbol
+  // it can belong to, and only when that one is unambiguous: same ET day, same
+  // side, strict prefix, EXACTLY one candidate. Two strikes of the same root and
+  // expiry traded the same day/side leave it unresolved — the group then reports
+  // 'no-lot' and `lastGainLossSample` shows the short symbol, which is a correct
+  // honest-unmeasured, not a guess. The qty reconciliation and the per-contract
+  // sanity bound below still apply to every repaired lot.
+  const ledgerSymbols = new Set(records.map((r) => r.optionSymbol));
+  const symbolsByDaySide = new Map<string, Set<string>>();
+  for (const r of records) {
+    const k = `${r.etDay} ${r.side}`;
+    const g = symbolsByDaySide.get(k);
+    if (g) g.add(r.optionSymbol);
+    else symbolsByDaySide.set(k, new Set([r.optionSymbol]));
+  }
+  const prefixRepairs: GainLossPrefixRepair[] = [];
+  const resolveLotSymbol = (symbol: string, day: string, side: LiveFillSide): string => {
+    if (ledgerSymbols.has(symbol)) return symbol; // exact match — never repaired
+    if (!TRUNCATED_OCC_SYMBOL.test(symbol)) return symbol;
+    const candidates = [...(symbolsByDaySide.get(`${day} ${side}`) ?? [])].filter(
+      (s) => s.length > symbol.length && s.startsWith(symbol),
+    );
+    if (candidates.length !== 1) return symbol; // absent or ambiguous — do not guess
+    const resolvedSymbol = candidates[0]!;
+    prefixRepairs.push({ lotSymbol: symbol, resolvedSymbol, day, side });
+    return resolvedSymbol;
+  };
   for (const lot of lots) {
-    addLot(feeMatchKey(lot.symbol, lot.openDate, 'buy_to_open', 0), lot.quantity, lot.cost);
-    addLot(feeMatchKey(lot.symbol, lot.closeDate, 'sell_to_close', 0), lot.quantity, lot.proceeds);
+    const openSymbol = resolveLotSymbol(lot.symbol, lot.openDate, 'buy_to_open');
+    const closeSymbol = resolveLotSymbol(lot.symbol, lot.closeDate, 'sell_to_close');
+    addLot(feeMatchKey(openSymbol, lot.openDate, 'buy_to_open', 0), lot.quantity, lot.cost);
+    addLot(feeMatchKey(closeSymbol, lot.closeDate, 'sell_to_close', 0), lot.quantity, lot.proceeds);
   }
 
   // ALL ledger rows per group — measured rows participate in the totals (their
@@ -819,7 +936,7 @@ export function reconcileLedgerFeesFromGainLoss(
     }
     return toRecord(recordToInput(r));
   });
-  return { updated, records: out, rejections };
+  return { updated, records: out, rejections, prefixRepairs };
 }
 
 /** Swap a reconcile result into the store and, when rows changed, REWRITE the durable JSONL. */

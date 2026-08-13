@@ -52,6 +52,7 @@ import {
   importMissingLiveOptionFills,
   summarizeLiveOptionsFeeSlippage,
   historyFillSide,
+  type GainLossPrefixRepair,
   type GainLossRejection,
   type GainLossRejectionReason,
   type LedgerCoverageResult,
@@ -191,6 +192,14 @@ export interface LiveOptionsFeeReconcileState {
    * per-group list is truncated. Null until a gainloss fetch has run.
    */
   lastGainLossRejectionCounts: Record<GainLossRejectionReason, number> | null;
+  /**
+   * TRA-3558 — lots the last pass re-keyed off a TRUNCATED broker symbol. A
+   * symbol rewrite inside the path that writes real money numbers must be
+   * VISIBLE, not just correct: each entry names the short symbol the broker
+   * sent and the full ledger symbol it was uniquely resolved to. Empty array =
+   * the payload was clean; null = no gainloss fetch has run.
+   */
+  lastGainLossPrefixRepairs: GainLossPrefixRepair[] | null;
   /** Rows back-filled by the last attempt, both sources (null when none ran). */
   lastUpdated: number | null;
   /** TRA-2850 — of `lastUpdated`, rows measured by the gainloss derivation. */
@@ -275,6 +284,7 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastGainLossSample: null,
     lastGainLossRejections: null,
     lastGainLossRejectionCounts: null,
+    lastGainLossPrefixRepairs: null,
     lastUpdated: null,
     lastGainLossUpdated: null,
     totalUpdated: 0,
@@ -308,6 +318,8 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
       state.lastGainLossRejections === null ? null : state.lastGainLossRejections.map((r) => ({ ...r })),
     lastGainLossRejectionCounts:
       state.lastGainLossRejectionCounts === null ? null : { ...state.lastGainLossRejectionCounts },
+    lastGainLossPrefixRepairs:
+      state.lastGainLossPrefixRepairs === null ? null : state.lastGainLossPrefixRepairs.map((r) => ({ ...r })),
     coverage: state.coverage === null ? null : { ...state.coverage },
   };
 }
@@ -505,6 +517,7 @@ export async function runLiveOptionsFeeReconcile(
     };
     for (const r of gainLoss.rejections) counts[r.reason] += 1;
     state.lastGainLossRejectionCounts = counts;
+    state.lastGainLossPrefixRepairs = gainLoss.prefixRepairs;
   }
 
   state.lastUpdated = updated;
@@ -548,6 +561,9 @@ export async function runLiveOptionsFeeReconcile(
     // TRA-3558 — a 'no-match' log line that does not say WHICH test fired is a
     // dead end; carry the histogram and the actionable groups into the log too.
     gainLossRejectionCounts: state.lastGainLossRejectionCounts,
+    gainLossPrefixRepairs: (state.lastGainLossPrefixRepairs ?? []).map(
+      (r) => `${r.lotSymbol} -> ${r.resolvedSymbol} (${r.day} ${r.side})`,
+    ),
     gainLossRejections: (state.lastGainLossRejections ?? [])
       .slice(0, 5)
       .map((r) => `${r.symbol} ${r.day} ${r.side}: ${r.reason} (${r.observed} vs ${r.expected})`),

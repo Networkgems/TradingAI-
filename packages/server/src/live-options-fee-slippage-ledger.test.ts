@@ -677,6 +677,82 @@ describe('gainloss join rejection reasons (TRA-3558)', () => {
     );
   });
 
+  // ── TRA-3558: the broker sends a TRUNCATED symbol ────────────────────────
+  //
+  // Measured on the live ***0154 gainloss payload 2026-08-13: two of 22 lots came
+  // back as `KVYO260918C0` / `TROW260918C0` — 12 chars, cut one digit into the
+  // strike — while every other lot in the SAME response carried its full 18-19
+  // char OCC symbol. The lots were present and correctly priced; they simply keyed
+  // to a symbol no ledger row has, and four rows sat unmeasured for six days.
+
+  it('resolves a truncated lot symbol onto the one ledger symbol it can belong to', () => {
+    const rows = [
+      row(),
+      row({ ts: 2, etDay: '2026-08-07', side: 'sell_to_close', filledPrice: 3.0 }),
+    ];
+    const lots = [glLot({ symbol: 'TROW260918C0' })]; // cost 379.11 / proceeds 299.87
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.updated).toBe(2);
+    expect(r.rejections).toEqual([]);
+    const byDay = new Map(r.records.map((x) => [x.etDay, x.fees]));
+    expect(byDay.get('2026-08-06')).toBeCloseTo(0.11, 6); // 379.11 − 379.00
+    expect(byDay.get('2026-08-07')).toBeCloseTo(0.11, 6); // 300.00 − 299.89
+    expect(r.prefixRepairs).toEqual([
+      { lotSymbol: 'TROW260918C0', resolvedSymbol: 'TROW260918C00115000', day: '2026-08-06', side: 'buy_to_open' },
+      { lotSymbol: 'TROW260918C0', resolvedSymbol: 'TROW260918C00115000', day: '2026-08-07', side: 'sell_to_close' },
+    ]);
+  });
+
+  it('refuses an AMBIGUOUS truncated symbol — two strikes, same root/expiry/day/side', () => {
+    // The exact case the repair must not guess at: the short symbol prefixes both.
+    const rows = [
+      row({ ts: 1, optionSymbol: 'TROW260918C00115000' }),
+      row({ ts: 2, optionSymbol: 'TROW260918C00120000' }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, [glLot({ symbol: 'TROW260918C0' })]);
+    expect(r.updated).toBe(0);
+    expect(r.prefixRepairs).toEqual([]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['no-lot', 'no-lot']);
+  });
+
+  it('never repairs a lot whose symbol matches a ledger row exactly', () => {
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot()]);
+    expect(r.updated).toBe(1);
+    expect(r.prefixRepairs).toEqual([]);
+  });
+
+  it('leaves a truncated symbol with NO candidate on that day/side alone', () => {
+    // Right root, wrong day: the repair is scoped to the lot\u2019s own (day, side).
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot({ symbol: 'TROW260918C0', openDate: '2026-08-05' })]);
+    expect(r.updated).toBe(0);
+    expect(r.prefixRepairs).toEqual([]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['no-lot']);
+  });
+
+  it('a symbol that is not OCC-shaped is never treated as truncated', () => {
+    // An equity lot on the same account: no digits/right shape, so it cannot enter
+    // the repair path even though it prefixes nothing.
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot({ symbol: 'TROW' })]);
+    expect(r.prefixRepairs).toEqual([]);
+    expect(r.updated).toBe(0);
+  });
+
+  it('a repaired lot still faces the qty reconciliation and the sanity bound', () => {
+    // Repair is a KEYING fix, not a licence: the derived fee must still pass.
+    const overpriced = reconcileLedgerFeesFromGainLoss([row()], [glLot({ symbol: 'TROW260918C0', cost: 381.0 })]);
+    expect(overpriced.updated).toBe(0);
+    expect(overpriced.rejections.map((x) => x.reason)).toEqual(['above-bound']);
+    // repaired on the OPEN leg (the only leg with a row on that day/side), then
+    // rejected on merit — the repair is a keying fix, it grants nothing.
+    expect(overpriced.prefixRepairs).toHaveLength(1);
+    const shortQty = reconcileLedgerFeesFromGainLoss(
+      [row({ contracts: 3 })],
+      [glLot({ symbol: 'TROW260918C0', quantity: 1 })],
+    );
+    expect(shortQty.updated).toBe(0);
+    expect(shortQty.rejections.map((x) => x.reason)).toEqual(['qty-mismatch']);
+  });
+
   it('rejections lead with the most recent ET day — a truncated publish keeps the actionable ones', () => {
     const rows = [
       row({ ts: 1, etDay: '2026-07-16', optionSymbol: 'OLD260918C00010000' }),
