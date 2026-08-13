@@ -41,8 +41,9 @@
  *                     active`, and a trigger that is `enabled` with a non-null
  *                     `nextRunAt` IN THE FUTURE.
  *   PLATFORM_MONITOR  `monitorNextCheckAt` in the future — the platform's own
- *                     wake, scheduled by the assignee. 7 in_review leaves rest
- *                     on this today; omitting it invents 7 false findings.
+ *                     wake, scheduled by the assignee. 27 in_review leaves rest
+ *                     on this on 2026-08-13; omitting it invents 27 false
+ *                     findings, ~5x the size of the real signal (TRA-3604).
  *   OPEN_BLOCKER      a `blockedBy` entry whose own status is not done/cancelled.
  *   OPEN_INTERACTION  an interaction at status `pending` whose
  *                     `continuationPolicy` is not `none`.
@@ -106,6 +107,40 @@
  *     `pending` / `accepted` / `rejected` / `answered` / `expired`; only
  *     `pending` is open. And one pending interaction on this board carries
  *     `continuationPolicy: "none"` — pending forever, waking nobody.
+ *
+ *  8. ⛔⛔ A FIRED PLATFORM MONITOR SELF-CLEARS, AND THE RESIDUE IT LEAVES IS
+ *     BYTE-IDENTICAL TO A LEAF THAT WAS NEVER MONITORED (TRA-3604). On firing,
+ *     `monitorNextCheckAt` goes null and `monitorLastTriggeredAt` is stamped;
+ *     `issue.updatedAt` moves by ~50ms and NOTHING else changes. If the fire
+ *     does not result in a disposition, the leaf keeps resting and no wake, no
+ *     recovery action and no `missing_disposition` is raised.
+ *
+ *     Reporting that as PHANTOM_REST is not merely imprecise, it prescribes the
+ *     WRONG REPAIR. PHANTOM_REST says "arm the monitor that was promised". On
+ *     TRA-3436 — the measured instance, fired 2026-08-13T13:30:04Z, one attempt
+ *     — arming a second monitor would have been wrong; the fire had already
+ *     been spent and the correct repair was to RUN THE GRADE it should have
+ *     produced. So a spent monitor gets its own class,
+ *     FIRED_MONITOR_NO_DISPOSITION, and its own repair sentence.
+ *
+ *     ⛔ It is NOT enough to test `monitorLastTriggeredAt` alone. A monitor that
+ *     fired and RE-ARMED itself carries both fields, and is a live rest — the
+ *     future `monitorNextCheckAt` wins. And a fired monitor sitting behind a
+ *     still-pending interaction card is ALSO a legal rest: TRA-2631 / TRA-3104
+ *     self-describe as "Backstop only" and their primary cards are open, while
+ *     TRA-2305 / TRA-2937 rest on live LINKED routines. Four of the five
+ *     measured class-B leaves were healthy. The discriminator is not "did it
+ *     fire", it is "is there a primary path still open behind it" — which is
+ *     exactly what the six paths above already answer, so this class is only
+ *     ever reached once every one of them has said no.
+ *
+ *  9. ⛔ THE SIX `monitor*` FIELDS ARE READ FROM THE LIST ROUTE, AND THEIR
+ *     ABSENCE IS SILENT. If that route stops carrying `monitorNextCheckAt`, the
+ *     PLATFORM_MONITOR path evaluates `undefined` — every armed leaf reads as
+ *     unmonitored and the sweep manufactures a finding for each. Same failure
+ *     direction as trap 4, at 27 rows. So key PRESENCE is asserted across the
+ *     swept population (not value, which is legitimately null on 31 of 62) and
+ *     its absence is BLIND, never a page of findings.
  *
  *  7. ⛔ AN 8-HEX SCAN FOR DECLARED ROUTINE IDS MATCHES INSIDE A UUID. The
  *     first version of the advisory below reported TRA-1659 as declaring a
@@ -184,6 +219,8 @@ export const PATH = {
   LIVE_RUN: 'LIVE_RUN',
   LINKED_ROUTINE: 'LINKED_ROUTINE',
   PLATFORM_MONITOR: 'PLATFORM_MONITOR',
+  /** A monitor that fired inside the grace window — the wake is still in flight. */
+  MONITOR_IN_FLIGHT: 'MONITOR_IN_FLIGHT',
   OPEN_BLOCKER: 'OPEN_BLOCKER',
   OPEN_INTERACTION: 'OPEN_INTERACTION',
 };
@@ -196,7 +233,94 @@ export const FINDING = {
    * fire; it will not wake this leaf, and nothing will re-disposition it.
    */
   UNLINKED_MONITOR: 'UNLINKED_MONITOR',
+  /**
+   * TRAP 8. An issue-level monitor WAS armed and DID fire. It self-cleared on
+   * firing and no disposition followed, so the leaf now reads exactly like one
+   * that was never monitored. The fire is spent: the repair is to run the grade
+   * it should have produced, NOT to arm a second monitor.
+   */
+  FIRED_MONITOR_NO_DISPOSITION: 'FIRED_MONITOR_NO_DISPOSITION',
 };
+
+/**
+ * Provenance of the ISSUE-LEVEL monitor — a different table from routines, and
+ * invisible to any sweep that resolves leaves against routines only (TRA-3604).
+ *
+ * These four are the true denominator. Before TRA-3604 the report published
+ * findings without them, so "5 spent monitors" and "31 leaves that were never
+ * monitored at all" could not be told apart, and neither could be rated.
+ */
+export const MONITOR_STATE = {
+  /** A — a future `monitorNextCheckAt`. A live path; never a finding. */
+  ARMED_PENDING: 'ARMED_PENDING',
+  /** D — `monitorNextCheckAt` is set but elapsed, and it never fired. */
+  ARMED_OVERDUE: 'ARMED_OVERDUE',
+  /** B — it fired and self-cleared. Spent unless something else is open. */
+  FIRED_CLEARED: 'FIRED_CLEARED',
+  /**
+   * B-fresh — it fired within the grace window. The wake it delivered has not
+   * had time to produce a disposition yet, so this is IN FLIGHT, not a strand.
+   */
+  FIRED_IN_FLIGHT: 'FIRED_IN_FLIGHT',
+  /** C — no issue-level monitor was ever scheduled on this row. */
+  NEVER_MONITORED: 'NEVER_MONITORED',
+};
+
+/**
+ * How long a fire is allowed to sit before its silence counts as a strand.
+ *
+ * ⛔ MEASURED, NOT GUESSED. The first live run of this class flagged TRA-3496
+ * 132 SECONDS after its monitor fired (2026-08-13T17:30:10Z), with the leaf's
+ * `updatedAt` 51ms behind the fire and no run attached — i.e. it flagged the
+ * assignee for not having answered a wake delivered two minutes earlier. A
+ * detector that fires on every fire is a false positive by construction.
+ *
+ * Six hours: the four class-B leaves measured on TRA-3604 had been sitting for
+ * 2 to 11 DAYS, and TRA-3436 — the one real strand — was still undispositioned
+ * 2.5h after its fire, so 6h clears in-flight wakes without hiding a strand
+ * from a detector that runs daily.
+ */
+export const FIRE_GRACE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Classify the issue-row monitor. `row` is the LIST-route row, `item` the
+ * ITEM-route payload (or null) — both carry the six fields; the list route is
+ * preferred because it is the one read for every swept issue.
+ *
+ * ORDER MATTERS. A future `monitorNextCheckAt` outranks a past
+ * `monitorLastTriggeredAt`: that is a monitor which fired and RE-ARMED, and it
+ * is resting, not spent. Testing `monitorLastTriggeredAt` first would report
+ * every healthy repeating monitor as a spent one.
+ */
+export function monitorState(row, item, nowMs, graceMs = FIRE_GRACE_MS) {
+  const pick = (k) => {
+    const v = row?.[k];
+    return v === undefined || v === null ? item?.[k] ?? null : v;
+  };
+  const nextCheckAt = pick('monitorNextCheckAt');
+  const lastTriggeredAt = pick('monitorLastTriggeredAt');
+  const attempts = Number(pick('monitorAttemptCount') || 0);
+  const scheduledBy = pick('monitorScheduledBy');
+  const notes = pick('monitorNotes');
+  // TRAP 9. Key PRESENCE, not truthiness — null is the legitimate value on the
+  // 31 leaves that carry no monitor, and `undefined` means the route shape moved.
+  const present = Boolean(row && 'monitorNextCheckAt' in row) || Boolean(item && 'monitorNextCheckAt' in item);
+  const base = { nextCheckAt, lastTriggeredAt, attempts, scheduledBy, notes, present };
+
+  if (isFuture(nextCheckAt, nowMs)) return { ...base, state: MONITOR_STATE.ARMED_PENDING };
+  // `attempts > 0` with no stamp still means it ran — do not read it as virgin.
+  // With no stamp there is no age to grace, so it falls through as spent.
+  if (lastTriggeredAt || attempts > 0) {
+    const firedMs = lastTriggeredAt ? Date.parse(lastTriggeredAt) : NaN;
+    const ageMs = Number.isFinite(firedMs) ? nowMs - firedMs : null;
+    if (ageMs !== null && ageMs >= 0 && ageMs < graceMs) {
+      return { ...base, ageMs, state: MONITOR_STATE.FIRED_IN_FLIGHT };
+    }
+    return { ...base, ageMs, state: MONITOR_STATE.FIRED_CLEARED };
+  }
+  if (nextCheckAt) return { ...base, state: MONITOR_STATE.ARMED_OVERDUE };
+  return { ...base, state: MONITOR_STATE.NEVER_MONITORED };
+}
 
 const isFuture = (iso, nowMs) => {
   if (!iso) return false;
@@ -329,7 +453,7 @@ export function resolveDeclaredRefs(refs, routines) {
  * Returns { paths[], finding, unreadable, notes[] }. `unreadable` is a reason
  * string: an issue we could not fully read is NEVER a finding and NEVER a pass.
  */
-export function classifyIssue({ issue, item, interactions, index, nowMs }) {
+export function classifyIssue({ issue, item, interactions, index, nowMs, fireGraceMs = FIRE_GRACE_MS }) {
   const paths = [];
   const notes = [];
 
@@ -347,11 +471,21 @@ export function classifyIssue({ issue, item, interactions, index, nowMs }) {
     });
   }
 
-  if (isFuture(issue.monitorNextCheckAt || item?.monitorNextCheckAt, nowMs)) {
+  const monitor = monitorState(issue, item, nowMs, fireGraceMs);
+  if (monitor.state === MONITOR_STATE.FIRED_IN_FLIGHT) {
+    paths.push({
+      path: PATH.MONITOR_IN_FLIGHT,
+      detail:
+        `monitor fired ${monitor.lastTriggeredAt} (${Math.round(monitor.ageMs / 60000)} min ago) — inside the ` +
+        `${Math.round(fireGraceMs / 3600000)}h grace window; the wake it delivered has not had time to answer`,
+    });
+  }
+  if (monitor.state === MONITOR_STATE.ARMED_PENDING) {
     paths.push({
       path: PATH.PLATFORM_MONITOR,
-      detail: `monitorNextCheckAt ${issue.monitorNextCheckAt || item?.monitorNextCheckAt}` +
-        (issue.monitorScheduledBy ? ` (by ${issue.monitorScheduledBy})` : ''),
+      detail: `monitorNextCheckAt ${monitor.nextCheckAt}` +
+        (monitor.scheduledBy ? ` (by ${monitor.scheduledBy})` : '') +
+        (monitor.lastTriggeredAt ? ` — fired ${monitor.lastTriggeredAt} and RE-ARMED` : ''),
     });
   }
 
@@ -361,6 +495,7 @@ export function classifyIssue({ issue, item, interactions, index, nowMs }) {
     if (!('blockedBy' in item)) {
       return {
         paths,
+        monitor,
         finding: null,
         unreadable:
           'item route returned no `blockedBy` key — the route shape changed. ' +
@@ -389,12 +524,23 @@ export function classifyIssue({ issue, item, interactions, index, nowMs }) {
     }
   }
 
-  if (paths.length) return { paths, finding: null, unreadable: null, notes };
+  if (paths.length) return { paths, monitor, finding: null, unreadable: null, notes };
+
+  // A spent monitor is worth saying out loud even when a titled routine is the
+  // headline: the two prescribe different repairs and the leaf needs both.
+  if (monitor.state === MONITOR_STATE.FIRED_CLEARED) {
+    notes.push(
+      `issue-level monitor fired ${monitor.lastTriggeredAt ?? '(no stamp)'} ` +
+        `after ${monitor.attempts} attempt(s)${monitor.scheduledBy ? ` (by ${monitor.scheduledBy})` : ''} and self-cleared` +
+        (monitor.notes ? ` — monitorNotes: "${String(monitor.notes).replace(/\s+/g, ' ').slice(0, 160)}"` : ''),
+    );
+  }
 
   const titled = index.titled.get(issue.identifier) || [];
   if (titled.length) {
     return {
       paths,
+      monitor,
       finding: {
         cls: FINDING.UNLINKED_MONITOR,
         detail: titled
@@ -406,7 +552,36 @@ export function classifyIssue({ issue, item, interactions, index, nowMs }) {
     };
   }
 
-  return { paths, finding: { cls: FINDING.PHANTOM_REST, detail: 'no routine anywhere names this issue' }, unreadable: null, notes };
+  // TRAP 8. Spent-monitor and never-monitored are the same bytes on the row and
+  // opposite repairs, so they are never allowed to share a class.
+  if (monitor.state === MONITOR_STATE.FIRED_CLEARED) {
+    return {
+      paths,
+      monitor,
+      finding: {
+        cls: FINDING.FIRED_MONITOR_NO_DISPOSITION,
+        detail:
+          `the monitor WAS armed and DID fire (${monitor.lastTriggeredAt ?? 'no stamp'}, ` +
+          `${monitor.attempts} attempt(s)); it self-cleared and no disposition followed`,
+      },
+      unreadable: null,
+      notes,
+    };
+  }
+
+  return {
+    paths,
+    monitor,
+    finding: {
+      cls: FINDING.PHANTOM_REST,
+      detail:
+        monitor.state === MONITOR_STATE.ARMED_OVERDUE
+          ? `no routine names this issue, and its monitorNextCheckAt ${monitor.nextCheckAt} is ELAPSED with no fire recorded`
+          : 'no routine anywhere names this issue, and no issue-level monitor was ever scheduled on it',
+    },
+    unreadable: null,
+    notes,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -441,6 +616,7 @@ export async function sweep(
   opts = {},
 ) {
   const nowMs = opts.nowMs ?? Date.now();
+  const fireGraceMs = opts.fireGraceMs ?? FIRE_GRACE_MS;
   const agents = await listAgents();
   const roster = new Map((Array.isArray(agents) ? agents : []).map((a) => [a.id, a]));
 
@@ -451,6 +627,20 @@ export async function sweep(
   if (routineBlind) return blindResult(routineBlind, { pages, scanned: issues.length });
 
   const swept = issues.filter((x) => SWEPT_STATUSES.has(x.status));
+
+  // TRAP 9. If the list route stops carrying the monitor fields, every armed
+  // leaf reads as unmonitored and this sweep pages 27 healthy rows. Absence of
+  // the KEY across the whole swept population is a route change, not a board
+  // with no monitors — and it is BLIND, the same as a truncated routine list.
+  if (swept.length && !swept.some((x) => 'monitorNextCheckAt' in x)) {
+    return blindResult(
+      `not one of ${swept.length} swept rows carries a \`monitorNextCheckAt\` key — the issues list route ` +
+        'no longer exposes the issue-level monitor fields. Every ARMED_PENDING leaf would be reported as a ' +
+        'phantom rest (27 of 62 in_review leaves on 2026-08-13).',
+      { pages, scanned: swept.length },
+    );
+  }
+
   const index = indexRoutines(routines, swept.map((x) => x.identifier), nowMs);
 
   const findings = [];
@@ -462,7 +652,7 @@ export async function sweep(
   const results = await mapLimit(swept, opts.concurrency ?? CONCURRENCY, async (issue) => {
     // Cheap paths first, from data already in hand — an issue cleared here
     // costs zero extra reads.
-    const cheap = classifyIssue({ issue, item: null, interactions: null, index, nowMs });
+    const cheap = classifyIssue({ issue, item: null, interactions: null, index, nowMs, fireGraceMs });
     if (cheap.paths.length) return { issue, res: cheap };
 
     let item = null;
@@ -482,8 +672,23 @@ export async function sweep(
         res: { paths: [], finding: null, unreadable: `interactions route failed: ${err?.message || err}`, notes: [] },
       };
     }
-    return { issue, res: classifyIssue({ issue, item, interactions, index, nowMs }) };
+    return { issue, res: classifyIssue({ issue, item, interactions, index, nowMs, fireGraceMs }) };
   });
+
+  // ITEM 3 of TRA-3604 — the true denominator. Published on CLEAN too: a rate
+  // quoted over "the 5 we noticed" is the reading this whole file exists to stop.
+  const monitorCensus = {
+    [MONITOR_STATE.ARMED_PENDING]: 0,
+    [MONITOR_STATE.ARMED_OVERDUE]: 0,
+    [MONITOR_STATE.FIRED_CLEARED]: 0,
+    [MONITOR_STATE.FIRED_IN_FLIGHT]: 0,
+    [MONITOR_STATE.NEVER_MONITORED]: 0,
+    UNCLASSIFIED: 0,
+  };
+  for (const { res } of results) {
+    if (res.monitor?.state) monitorCensus[res.monitor.state] += 1;
+    else monitorCensus.UNCLASSIFIED += 1;
+  }
 
   for (const { issue, res } of results) {
     if (res.unreadable) {
@@ -500,6 +705,8 @@ export async function sweep(
       cls: res.finding.cls,
       detail: res.finding.detail,
       notes: res.notes,
+      monitorState: res.monitor?.state ?? null,
+      monitorLastTriggeredAt: res.monitor?.lastTriggeredAt ?? null,
       assigneeAgentId: issue.assigneeAgentId || null,
       assigneeName: assignee?.name || null,
       routable: Boolean(assignee),
@@ -538,6 +745,7 @@ export async function sweep(
     population: issues.length,
     routineCount: routines.length,
     routineProbe: probe,
+    monitorCensus,
     liveRoutines: index.live.length,
     staleActiveRoutines: index.stale,
     itemReads,
@@ -585,6 +793,21 @@ export function renderReport(r) {
     `population ${r.population} issues · swept ${r.scanned} non-terminal · ` +
       `routines ${r.routineCount} (${r.liveRoutines} live) · item reads ${r.itemReads} · interaction reads ${r.interactionReads}`,
   );
+
+  // The denominator, always — findings are rated against this, not against the
+  // subset somebody happened to notice (TRA-3604 item 3).
+  if (r.monitorCensus) {
+    const c = r.monitorCensus;
+    L.push(
+      `issue-level monitors over the swept population: ` +
+        `${c.ARMED_PENDING} armed+pending · ${c.ARMED_OVERDUE} armed+overdue · ` +
+        `${c.FIRED_CLEARED} fired+self-cleared · ${c.FIRED_IN_FLIGHT} fired+in-flight · ` +
+        `${c.NEVER_MONITORED} never monitored` +
+        (c.UNCLASSIFIED ? ` · ${c.UNCLASSIFIED} unclassified` : ''),
+    );
+    L.push('  (a monitor lives on the ISSUE ROW, not in the routines table — resolving leaves against');
+    L.push('   routines alone cannot see any of the first three columns.)');
+  }
   L.push('');
 
   if (r.verdict === 'CLEAN') {
@@ -592,15 +815,20 @@ export function renderReport(r) {
   } else {
     L.push(`VERDICT: ${r.verdict} — ${r.findings.length} issue(s) resting on nothing.`);
     L.push('');
-    for (const cls of [FINDING.PHANTOM_REST, FINDING.UNLINKED_MONITOR]) {
+    const HEADLINE = {
+      [FINDING.PHANTOM_REST]: 'nothing is coming. No routine names these and no issue-level monitor is pending.',
+      [FINDING.UNLINKED_MONITOR]:
+        'a live routine is TITLED for these but is not attached to them.' +
+        ' It will fire; it will not wake the leaf, and nothing will re-disposition it.',
+      [FINDING.FIRED_MONITOR_NO_DISPOSITION]:
+        'the monitor fired and SELF-CLEARED, and no disposition followed. The fire is SPENT.' +
+        '\n      REPAIR: run the grade that fire should have produced. Do NOT arm a second monitor —' +
+        '\n      on TRA-3436, the measured instance, arming one would have been the wrong repair.',
+    };
+    for (const cls of [FINDING.FIRED_MONITOR_NO_DISPOSITION, FINDING.PHANTOM_REST, FINDING.UNLINKED_MONITOR]) {
       const set = r.findings.filter((f) => f.cls === cls);
       if (!set.length) continue;
-      L.push(
-        cls === FINDING.PHANTOM_REST
-          ? `${cls} (${set.length}) — nothing is coming. No routine anywhere names these.`
-          : `${cls} (${set.length}) — a live routine is TITLED for these but is not attached to them.` +
-            ' It will fire; it will not wake the leaf, and nothing will re-disposition it.',
-      );
+      L.push(`${cls} (${set.length}) — ${HEADLINE[cls]}`);
       for (const f of set) {
         L.push(`  ${f.identifier} [${f.status}] ${f.title?.slice(0, 88) ?? ''}`);
         L.push(`      owner: ${f.assigneeName || f.assigneeAgentId || 'UNASSIGNED'}${f.routable ? '' : '  ⛔ NOT REPAIRABLE BY ANY AGENT — needs a human'}`);
@@ -610,8 +838,10 @@ export function renderReport(r) {
       }
       L.push('');
     }
-    L.push('REPAIR IS THE OWNER\'S CALL. Do NOT auto-park these: the usual fix is to arm the');
-    L.push('monitor that was promised, and only the owner knows what it was supposed to run.');
+    L.push('REPAIR IS THE OWNER\'S CALL. Do NOT auto-park these. For PHANTOM_REST the usual fix is');
+    L.push('to arm the monitor that was promised, and only the owner knows what it was supposed to');
+    L.push('run. For FIRED_MONITOR_NO_DISPOSITION it is the opposite: that fire already happened and');
+    L.push('re-arming buys another wait for an answer the monitor was already sent to fetch.');
     L.push('');
   }
 
@@ -644,6 +874,10 @@ export function renderReport(r) {
 const NOW = Date.parse('2026-07-26T12:00:00.000Z');
 const FUTURE = '2026-07-27T20:50:00.000Z';
 const PAST = '2026-07-20T20:50:00.000Z';
+/** The TRA-3496 shape: fired 132 seconds ago. Inside any sane grace window. */
+const FIRED_2_MIN_AGO = new Date(NOW - 132 * 1000).toISOString();
+/** Just outside the 6h grace — the first age at which silence is a strand. */
+const FIRED_7_H_AGO = new Date(NOW - 7 * 3600 * 1000).toISOString();
 
 const ROSTER = [
   { id: 'agent-cto', name: 'CTO' },
@@ -659,6 +893,9 @@ const issueRow = (identifier, over = {}) => ({
   description: '',
   monitorNextCheckAt: null,
   monitorScheduledBy: null,
+  monitorLastTriggeredAt: null,
+  monitorAttemptCount: 0,
+  monitorNotes: null,
   activeRun: null,
   checkoutRunId: null,
   parentId: null,
@@ -874,7 +1111,159 @@ const CASES = [
   {
     name: 'a PAST platform monitor => finding (an elapsed check is not a pending one)',
     build: () => transportFor({ issues: [issueRow('TRA-9001', { monitorNextCheckAt: PAST })] }),
-    expect: (r) => assert(r.findings.length === 1, 'an elapsed monitorNextCheckAt is not coverage'),
+    expect: (r) => {
+      assert(r.findings.length === 1, 'an elapsed monitorNextCheckAt is not coverage');
+      // D, not B: nothing fired, so the repair really is "arm it".
+      assert(r.findings[0].cls === FINDING.PHANTOM_REST, `expected PHANTOM_REST, got ${r.findings[0].cls}`);
+      assert(r.findings[0].monitorState === MONITOR_STATE.ARMED_OVERDUE, `state ${r.findings[0].monitorState}`);
+      assert(/ELAPSED/.test(r.findings[0].detail), 'must say the monitor elapsed rather than "no routine names this"');
+    },
+  },
+  {
+    name: 'TRAP 8 — THE TRA-3436 SHAPE: monitor fired, self-cleared, nothing else open => FIRED_MONITOR_NO_DISPOSITION',
+    build: () =>
+      transportFor({
+        issues: [
+          issueRow('TRA-9001', {
+            monitorNextCheckAt: null,
+            monitorLastTriggeredAt: PAST,
+            monitorAttemptCount: 1,
+            monitorScheduledBy: 'assignee',
+            monitorNotes: 'TRA-3436 fix grade. Criteria are PRE-REGISTERED in the LeadDev comment.',
+          }),
+        ],
+      }),
+    expect: (r) => {
+      assert(r.findings.length === 1, `expected one finding, got ${r.findings.length}`);
+      assert(
+        r.findings[0].cls === FINDING.FIRED_MONITOR_NO_DISPOSITION,
+        `a spent monitor must not be reported as a never-armed one (got ${r.findings[0].cls})`,
+      );
+      assert(r.findings[0].monitorLastTriggeredAt === PAST, 'the fire timestamp must reach the report');
+      assert(r.findings[0].notes.some((n) => /monitorNotes/.test(n)), 'the monitorNotes are the only record of what it was for');
+    },
+  },
+  {
+    name: 'TRAP 8 REGRESSION — never monitored at all => still PHANTOM_REST (the new class must not swallow class C)',
+    build: () => transportFor({ issues: [issueRow('TRA-9001')] }),
+    expect: (r) => {
+      assert(r.findings[0].cls === FINDING.PHANTOM_REST, `got ${r.findings[0].cls}`);
+      assert(r.findings[0].monitorState === MONITOR_STATE.NEVER_MONITORED, `state ${r.findings[0].monitorState}`);
+    },
+  },
+  {
+    name: 'TRAP 8b — fired then RE-ARMED (both fields set, nextCheckAt in future) => CLEAN, not spent',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorNextCheckAt: FUTURE, monitorLastTriggeredAt: PAST, monitorAttemptCount: 3 })],
+      }),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `a repeating monitor is resting, not spent (verdict ${r.verdict})`);
+    },
+  },
+  {
+    name: 'TRAP 8c — THE TRA-2631/TRA-3104 SHAPE: fired backstop behind a still-pending card => CLEAN',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: PAST, monitorAttemptCount: 1, monitorNotes: 'Backstop only.' })],
+        interactions: { 'id-TRA-9001': [{ kind: 'ask_user_questions', status: 'pending', continuationPolicy: 'wake_assignee' }] },
+      }),
+    expect: (r) => assert(r.verdict === 'CLEAN', 'a fired backstop over a LIVE primary is legitimate rest'),
+  },
+  {
+    name: 'TRAP 8d — THE TRA-2305/TRA-2937 SHAPE: fired backstop behind a live LINKED routine => CLEAN',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: PAST, monitorAttemptCount: 3 })],
+        routines: [routineRow('r-linked', { parentIssueId: 'id-TRA-9001' })],
+      }),
+    expect: (r) => assert(r.verdict === 'CLEAN', 'the discriminator is the primary path, not "did it fire"'),
+  },
+  {
+    name: 'TRAP 8e — attemptCount>0 with no lastTriggeredAt stamp still reads as FIRED, never as virgin',
+    build: () => transportFor({ issues: [issueRow('TRA-9001', { monitorAttemptCount: 2, monitorLastTriggeredAt: null })] }),
+    expect: (r) =>
+      assert(
+        r.findings[0].cls === FINDING.FIRED_MONITOR_NO_DISPOSITION,
+        `attempts are evidence of a run (got ${r.findings[0].cls})`,
+      ),
+  },
+  {
+    name: 'TRAP 8f — the two classes carry OPPOSITE repairs and the render must not hand a spent monitor the "arm it" one',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: PAST, monitorAttemptCount: 1 })],
+      }),
+    expect: (r) => {
+      const out = renderReport(r).join('\n');
+      assert(/Do NOT arm a second monitor/.test(out), 'the spent-monitor repair must be printed with the finding');
+      assert(/SPENT/.test(out), 'the report must say the fire is spent');
+    },
+  },
+  {
+    name: 'GRACE — THE TRA-3496 SHAPE: fired 132 SECONDS ago, no run yet => CLEAN, in flight, never a strand',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: FIRED_2_MIN_AGO, monitorAttemptCount: 1 })],
+      }),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `flagging a wake delivered 2 min ago is a false positive (verdict ${r.verdict})`);
+      assert(r.monitorCensus.FIRED_IN_FLIGHT === 1, `census ${JSON.stringify(r.monitorCensus)}`);
+    },
+  },
+  {
+    name: 'GRACE — the OTHER direction: fired 7h ago (outside the 6h window) => a finding, so the window cannot hide a strand',
+    build: () =>
+      transportFor({
+        issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: FIRED_7_H_AGO, monitorAttemptCount: 1 })],
+      }),
+    expect: (r) => {
+      assert(r.findings.length === 1, 'past the grace window silence IS the defect');
+      assert(r.findings[0].cls === FINDING.FIRED_MONITOR_NO_DISPOSITION, `got ${r.findings[0].cls}`);
+    },
+  },
+  {
+    name: 'GRACE — the window is a parameter, not a constant: --fire-grace-hours=0 re-flags the 132-second fire',
+    build: () =>
+      transportFor({ issues: [issueRow('TRA-9001', { monitorLastTriggeredAt: FIRED_2_MIN_AGO, monitorAttemptCount: 1 })] }),
+    opts: { fireGraceMs: 0 },
+    expect: (r) => assert(r.findings.length === 1, 'a zero grace must restore the pre-grace behaviour exactly'),
+  },
+  {
+    name: 'ITEM 3 — the monitor census is the DENOMINATOR: one leaf of each state, counted 1/1/1/1/1',
+    build: () =>
+      transportFor({
+        issues: [
+          issueRow('TRA-9001', { monitorNextCheckAt: FUTURE }),                        // A
+          issueRow('TRA-9002', { monitorNextCheckAt: PAST }),                          // D
+          issueRow('TRA-9003', { monitorLastTriggeredAt: PAST, monitorAttemptCount: 1 }), // B
+          issueRow('TRA-9004'),                                                        // C
+          issueRow('TRA-9005', { monitorLastTriggeredAt: FIRED_2_MIN_AGO, monitorAttemptCount: 1 }), // B-fresh
+        ],
+      }),
+    expect: (r) => {
+      const c = r.monitorCensus;
+      assert(
+        c.ARMED_PENDING === 1 && c.ARMED_OVERDUE === 1 && c.FIRED_CLEARED === 1 &&
+          c.FIRED_IN_FLIGHT === 1 && c.NEVER_MONITORED === 1,
+        `census ${JSON.stringify(c)}`,
+      );
+      assert(c.UNCLASSIFIED === 0, 'every swept row must land in exactly one column');
+      const out = renderReport(r).join('\n');
+      assert(/never monitored/.test(out) && /in-flight/.test(out), 'the census must be printed, not merely computed');
+    },
+  },
+  {
+    name: 'TRAP 9 — the list route stops carrying monitorNextCheckAt => BLIND, never 27 invented findings',
+    build: () => {
+      // A row that genuinely LACKS the key, while resting on a monitor.
+      const bare = { id: 'id-TRA-9001', identifier: 'TRA-9001', title: 't', status: 'in_review', assigneeAgentId: 'agent-cto', description: '' };
+      return transportFor({ issues: [bare], items: { 'id-TRA-9001': { ...bare, blockedBy: [] } } });
+    },
+    expect: (r) => {
+      assert(r.verdict === 'BLIND', `verdict ${r.verdict} — a vanished monitor field must not read as "unmonitored"`);
+      assert(/monitorNextCheckAt/.test(r.blind), 'BLIND must name the field that went missing');
+    },
   },
   {
     name: 'status=todo with nothing attached => PARKED_READY, never a finding',
@@ -1120,11 +1509,16 @@ async function main() {
   const nowMs = nowArg ? Date.parse(nowArg) : Date.now();
   if (!Number.isFinite(nowMs)) throw new Error(`--now is not a parseable timestamp: ${nowArg}`);
 
+  const graceArg = argOf('fire-grace-hours', null);
+  const fireGraceMs = graceArg === null ? FIRE_GRACE_MS : Number(graceArg) * 3600000;
+  if (!Number.isFinite(fireGraceMs) || fireGraceMs < 0) throw new Error(`--fire-grace-hours is not a number: ${graceArg}`);
+
   const result = await sweep(liveTransport(), {
     limit: PAGE_LIMIT,
     maxPages: MAX_PAGES,
     concurrency: CONCURRENCY,
     routineLimit: ROUTINE_LIMIT,
+    fireGraceMs,
     nowMs,
   });
 
@@ -1139,6 +1533,7 @@ async function main() {
           population: result.population,
           scanned: result.scanned,
           routineCount: result.routineCount,
+          monitorCensus: result.monitorCensus,
           liveRoutines: result.liveRoutines,
           itemReads: result.itemReads,
           interactionReads: result.interactionReads,
