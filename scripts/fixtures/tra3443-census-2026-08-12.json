@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "TRA-3443 — the 2026-08-12 RTH doTick phase census, transcribed VERBATIM from TRA-2305",
+    "comment 39e4ef03 (CTO, 2026-08-12T23:36:48Z), which cut it from",
+    "  scripts/tra2203-dotick-tape.mjs --from=2026-08-12T13:30:00Z --to=2026-08-12T20:05:00Z",
+    "  EXIT 0, 253 pages, 25486 raw records, Render logs API.",
+    "Boot-excluded (1 boot at 20:03:05.621Z, bootTransientMs=120000, 31 records dropped) => 25455.",
+    "",
+    "INTEGRITY CHECK, and it is the reason this file is worth committing: parent n (10946) plus the",
+    "sum of every phase n below equals 25455 EXACTLY. So the census is COMPLETE — comment 39e4ef03",
+    "omitted no phase, and any label missing here is missing from the TAPE, not from the transcription.",
+    "That distinction is the whole subject of TRA-3443, so it must not rest on trust.",
+    "",
+    "The raw --dump did not survive its run scratch directory. This is the durable re-cut source.",
+    "Re-pulling the window costs ~253 pages against a rate-limited API for numbers that cannot move —",
+    "the window is closed and Render retention is ~7d, so after 2026-08-19 it cannot be re-pulled at all."
+  ],
+  "source": "TRA-2305 comment 39e4ef03 — tra2203-dotick-tape.mjs 2026-08-12 RTH 13:30-20:05Z, boot-excluded (25455 records)",
+  "window": { "from": "2026-08-12T13:30:00Z", "to": "2026-08-12T20:05:00Z", "bootExcluded": true, "records": 25455 },
+  "parent": { "n": 10946, "sumS": 128723.6, "p50S": 7.3, "p90S": 28.3, "maxS": 143.8 },
+  "phases": {
+    "signal.doTick.quote-batch":        { "n": 2211, "sumS": 11362.6, "maxS": 14.1 },
+    "signal.doTick.social-sentiment":   { "n": 1153, "sumS":  3851.3, "maxS": 17.8 },
+    "signal.doTick.news-refresh":       { "n":  320, "sumS":   633.2, "maxS":  8.3 },
+    "signal.doTick.tradier-balance":    { "n":   12, "sumS":    16.4, "maxS":  2.0 },
+    "signal.doTick.option-marks":       { "n":  162, "sumS":   392.2, "maxS":  7.3 },
+    "signal.doTick.shadow-chases":      { "n":    3, "sumS":     6.4, "maxS":  3.9 },
+    "signal.doTick.otm-scan":           { "n": 2477, "sumS": 34493.5, "maxS": 32.6 },
+    "signal.doTick.cold-bar-scan":      { "n": 2916, "sumS": 33368.9, "maxS": 123.9 },
+    "signal.doTick.short-premium-scan": { "n": 2194, "sumS": 27384.2, "maxS": 33.2 },
+    "signal.doTick.demo-directional":   { "n": 1479, "sumS":  4239.3, "maxS": 19.8 },
+    "signal.doTick.mtf-refresh":        { "n":  321, "sumS":  2688.5, "maxS": 50.4 },
+    "signal.reversalShadowEval":        { "n":  343, "sumS":  1795.1, "maxS": 11.9 },
+    "signal.doTick.supertrend-series":  { "n":  149, "sumS":  1498.4, "maxS": 49.1 },
+    "signal.doTick.equity-entry-sweep": { "n":  706, "sumS":  1109.1, "maxS":  6.7 },
+    "signal.optionShadowEval":          { "n":   44, "sumS":   779.4, "maxS": 55.7 },
+    "signal.doTick.agents-advisory":    { "n":    9, "sumS":   732.6, "maxS": 94.6 },
+    "signal.doTick.sma200-scan":        { "n":   10, "sumS":    28.3, "maxS":  6.6 }
+  }
+}
