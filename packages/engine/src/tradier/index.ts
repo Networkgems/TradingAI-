@@ -21,6 +21,7 @@ export {
   parseTradierPositions,
   parseTradierHistory,
   parseTradierCashEvents,
+  isCapitalMovement,
   parseTradierCorporateActions,
   parseTradierGainLoss,
   roundToCent,

@@ -1267,8 +1267,18 @@ export function parseTradierHistory(
 
 /**
  * TRA-359 — set of Tradier event types that move the account balance
- * independently of trading. Used to discriminate cash flow from trade
- * P&L when reconciling the Live calendar against the broker balance.
+ * independently of trading.
+ *
+ * TRA-2906 — this is the **RECORDING** set, not the classification set. Its only
+ * job is "is this a non-trade balance movement worth writing down". Whether a
+ * recorded event should be *subtracted from P&L* is a separate, later decision
+ * made by {@link isCapitalMovement}.
+ *
+ * The split exists because those two questions were previously the same set, so
+ * `fee` sitting next to `ach` silently added broker fees back into reported P&L
+ * — nobody decided that, it fell out of list membership. Adding a type here is
+ * cheap and reversible (it only widens what we persist); changing whether it
+ * counts as cash flow is a judgement, and now has to be stated as one.
  *
  * Sourced from Tradier's documented event types
  * (https://documentation.tradier.com/brokerage-api/accounts/get-account-history).
@@ -1286,6 +1296,73 @@ const TRADIER_CASH_EVENT_TYPES = new Set<string>([
   'deposit',
   'withdrawal',
 ]);
+
+/**
+ * TRA-2906 — is this event **capital the user moved into or out of the
+ * account**, as opposed to a cost or a credit the account earned by operating?
+ *
+ * This is the predicate the Live-calendar reconcile subtracts on. The settled
+ * cell is `pnl = todayBalance − prevBalance − netCashFlow`, so returning `true`
+ * REMOVES the event from reported P&L and returning `false` LEAVES IT IN.
+ *
+ * The distinction that matters: the subtraction exists so performance is not
+ * distorted by **funding**. A $500 ACH deposit is not a $500 trading win, so it
+ * comes out. A $10 broker fee is not funding — it is a cost the account incurred
+ * by operating, and it belongs in P&L exactly like a commission does.
+ *
+ * `fee` used to be excluded, which added every broker fee back into the reported
+ * number and flattered every day one landed on. Nobody decided that; it fell out
+ * of `fee` sitting in a list next to `ach`. It is decided now, and this function
+ * is the place the decision lives.
+ *
+ * Every recorded type is listed explicitly and no type falls through to a
+ * default: an unrecognised type returns `false` (stays in P&L) and is the
+ * conservative choice, because wrongly excluding a movement silently deletes it
+ * from performance, while wrongly including one leaves a visible number that can
+ * be argued with.
+ */
+export function isCapitalMovement(type: string): boolean {
+  switch (type.toLowerCase()) {
+    // ── Funding: capital the user moved. Excluded from P&L. ──
+    case 'ach':
+    case 'wire':
+    case 'check':
+    case 'deposit':
+    case 'withdrawal':
+    // A journal moves cash between accounts under the same ownership. It is a
+    // transfer, not something the book earned.
+    case 'journal':
+      return true;
+
+    // ── Costs and credits the account incurred by operating. Kept IN P&L. ──
+    // TRA-2906 — the ruling this ticket exists for. A broker fee is a cost of
+    // doing business. This is also the direction TRA-2850 took deliberately in
+    // the same subsystem: it derives per-trade fees from settled `/gainloss`
+    // lots specifically so round-trip cost is MEASURED rather than assumed away.
+    case 'fee':
+      return false;
+
+    // ── Unchanged by TRA-2906, and deliberately so. ──
+    // `dividend` and `interest` are income the book earned, which by the same
+    // argument as `fee` arguably belongs IN P&L. That is a finance
+    // classification call with its own magnitude, NOT the call this ticket was
+    // scoped to make, so the existing behaviour is preserved rather than flipped
+    // in passing. See TRA-2906's follow-up: whoever changes these states why.
+    case 'dividend':
+    case 'interest':
+      return true;
+
+    // A broker-initiated correction to the balance. Retained as a movement
+    // because it is not something the strategy did. Note TRA-2876: an
+    // `adjustment` can also be a corporate action carrying quantity at
+    // `amount: 0`, in which case this classification is a no-op either way.
+    case 'adjustment':
+      return true;
+
+    default:
+      return false;
+  }
+}
 
 /**
  * TRA-359 — normalise the Tradier `/accounts/{id}/history` envelope into

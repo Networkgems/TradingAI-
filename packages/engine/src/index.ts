@@ -170,6 +170,7 @@ export {
   parseTradierOrderLegs,
   parseTradierHistory,
   parseTradierCashEvents,
+  isCapitalMovement,
   parseTradierCorporateActions,
   parseTradierGainLoss,
   roundToCent,

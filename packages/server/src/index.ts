@@ -304,10 +304,13 @@ import {
   equitySymbolsInvalidatedByCorporateActions,
   findPreviousBalanceSnapshot,
   liveBackfillWriteWindow,
+  mergeCashEventsIntoRecord,
   planTradierReconcile,
   realizedPnlByCloseDate,
+  resolveCashFlowNetByDate,
   sumCashFlowOverSpan,
   tradierReconcileEnvs,
+  type TradierCashFlowRecord,
 } from './reports/tradier-reconcile.js';
 // TRA-3101 — a missing balance snapshot renders as a FLAT $0.00 day, not as
 // "unknown". This classifies the anchor; it never repairs the equity series.
@@ -716,6 +719,7 @@ import {
   tradierBaseUrl,
   TradierOptionsClient,
   DEFAULT_SHORT_SQUEEZE_THRESHOLDS,
+  type TradierCashEvent,
   type TradierTradeHistoryFill,
 } from '@trading-app/engine';
 import { submitSmartSellToClose } from './tradier-smart-close.js';
@@ -3088,12 +3092,13 @@ async function stampBrokerSourceAudit(
 
 const TRADIER_CASH_FLOW_LOOKBACK_DAYS = 14;
 
-interface TradierCashFlowState {
-  /** Per-day signed net cash flow (deposits − withdrawals + dividends − fees). */
-  netByDate: Record<string, number>;
-  /** Dedup cursor — Tradier transaction ids already merged into `netByDate`. */
-  seenIds: string[];
-}
+/**
+ * TRA-2906 — the on-disk cash-flow record. See {@link TradierCashFlowRecord} for
+ * why this is a discriminated union and not one lenient shape: a file carrying
+ * BOTH a legacy aggregate and a partial event list is unreadable in a way that
+ * still produces a plausible number.
+ */
+type TradierCashFlowState = TradierCashFlowRecord;
 
 function tradierBalancePath(ctx: UserContext, env: TradierEnv): string {
   return join(ctx.dataDir, `tradier-eod-balance.${env}.json`);
@@ -3135,22 +3140,50 @@ async function loadTradierCashFlow(
   env: TradierEnv,
 ): Promise<TradierCashFlowState> {
   const path = tradierCashFlowPath(ctx, env);
-  if (!existsSync(path)) return { netByDate: {}, seenIds: [] };
+  // TRA-2906 — a MISSING file starts life as v2-typed. There is no legacy
+  // aggregate to preserve, so there is nothing to migrate and no reason for a
+  // fresh account to be born into the old shape.
+  if (!existsSync(path)) return { schema: 'v2-typed', events: [] };
   try {
     const raw = await readFile(path, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<TradierCashFlowState>;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+
+    // TRA-2906 — the presence of an `events` ARRAY is the version discriminator.
+    // Tested on shape rather than on a `schemaVersion` string deliberately: a
+    // version field can be present-but-wrong on a hand-edited file, whereas the
+    // data either is there or it is not.
+    if (Array.isArray(parsed['events'])) {
+      const events: TradierCashEvent[] = [];
+      for (const raw of parsed['events'] as unknown[]) {
+        if (!raw || typeof raw !== 'object') continue;
+        const e = raw as Record<string, unknown>;
+        const date = typeof e['date'] === 'string' ? e['date'].slice(0, 10) : '';
+        const type = typeof e['type'] === 'string' ? e['type'].toLowerCase() : '';
+        const amount = typeof e['amount'] === 'number' ? e['amount'] : NaN;
+        const transactionId = typeof e['transactionId'] === 'string' ? e['transactionId'] : '';
+        if (!date || !type || !transactionId || !Number.isFinite(amount)) continue;
+        events.push({ date, type, amount, transactionId });
+      }
+      return { schema: 'v2-typed', events };
+    }
+
     const netByDate: Record<string, number> = {};
-    if (parsed.netByDate && typeof parsed.netByDate === 'object') {
-      for (const [k, v] of Object.entries(parsed.netByDate as Record<string, unknown>)) {
+    if (parsed['netByDate'] && typeof parsed['netByDate'] === 'object') {
+      for (const [k, v] of Object.entries(parsed['netByDate'] as Record<string, unknown>)) {
         if (typeof v === 'number' && Number.isFinite(v)) netByDate[k] = v;
       }
     }
-    const seenIds = Array.isArray(parsed.seenIds)
-      ? parsed.seenIds.filter((s): s is string => typeof s === 'string')
+    const seenIds = Array.isArray(parsed['seenIds'])
+      ? (parsed['seenIds'] as unknown[]).filter((s): s is string => typeof s === 'string')
       : [];
-    return { netByDate, seenIds };
+    return { schema: 'v1-aggregate', netByDate, seenIds };
   } catch {
-    return { netByDate: {}, seenIds: [] };
+    // TRA-2906 — an unreadable file must NOT come back as an empty v2 record:
+    // that would present "we could not read the deposits" as "no capital ever
+    // moved", and the next settled cell would book every past deposit as P&L.
+    // v1 with an empty map is the pre-existing (equally empty) behaviour, but it
+    // also refuses to look like a completed migration.
+    return { schema: 'v1-aggregate', netByDate: {}, seenIds: [] };
   }
 }
 
@@ -3278,12 +3311,22 @@ async function reconcileTradierLiveCalendar(
       const startMs = today.getTime() - TRADIER_CASH_FLOW_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
       const start = new Date(startMs).toISOString().slice(0, 10);
       const cashEvents = await client.listAccountCashEvents({ start, end, limit: 1000 });
-      const knownIds = new Set(cashFlowState.seenIds);
-      const totals = aggregateCashFlowByDate(cashEvents, knownIds);
-      for (const [date, net] of totals.netByDate) {
-        cashFlowState.netByDate[date] = (cashFlowState.netByDate[date] ?? 0) + net;
+      // TRA-2906 — the merge follows the shape the file is ALREADY in, and never
+      // converts between them. Appending typed events to a v1 file would strand
+      // every pre-existing deposit outside the derived total (the record would
+      // then claim capital that moved never moved), so the v1→v2 migration is
+      // owned exclusively by the one-time rebuild, which fetches a COMPLETE
+      // history rather than this rolling 14-day window.
+      if (cashFlowState.schema === 'v2-typed') {
+        cashFlowState.events = mergeCashEventsIntoRecord(cashFlowState.events, cashEvents);
+      } else {
+        const knownIds = new Set(cashFlowState.seenIds);
+        const totals = aggregateCashFlowByDate(cashEvents, knownIds);
+        for (const [date, net] of totals.netByDate) {
+          cashFlowState.netByDate[date] = (cashFlowState.netByDate[date] ?? 0) + net;
+        }
+        for (const id of totals.seenTransactionIds) cashFlowState.seenIds.push(id);
       }
-      for (const id of totals.seenTransactionIds) cashFlowState.seenIds.push(id);
       await saveTradierCashFlow(ctx, env, cashFlowState);
     } catch (err) {
       log.warn('tradier-live-calendar cash event fetch failed', {
@@ -3322,7 +3365,14 @@ async function reconcileTradierLiveCalendar(
   // `(prev.date, reportDate]`, not just `reportDate`. The anchor can be several
   // days back (weekend/holiday, or a failed snapshot write), and a cash event
   // landing in the interior of that gap was previously booked as trading P&L.
-  const netCashFlow = sumCashFlowOverSpan(cashFlowState.netByDate, prev.date, reportDate);
+  // TRA-2906 — `netByDate` is now RESOLVED, not read: on a rebuilt (v2) record it
+  // is derived from the typed events through `isCapitalMovement`, so a broker fee
+  // is no longer added back into the reported number.
+  const netCashFlow = sumCashFlowOverSpan(
+    resolveCashFlowNetByDate(cashFlowState),
+    prev.date,
+    reportDate,
+  );
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
 
@@ -3810,7 +3860,7 @@ async function buildLiveTodayCellReport(
   const cashFlow = await loadTradierCashFlow(ctx, env);
   // TRA-2875 — same span correction as the settled path above; the intraday
   // cell reads the same anchor and was equally exposed to an interior deposit.
-  const netCashFlow = sumCashFlowOverSpan(cashFlow.netByDate, prev.date, today);
+  const netCashFlow = sumCashFlowOverSpan(resolveCashFlowNetByDate(cashFlow), prev.date, today);
   const pnl = computeBalanceDailyPnl(todayBalance, prev.balance, netCashFlow);
   if (pnl === null) return null;
   const combinedPnl = Number(pnl.toFixed(2));

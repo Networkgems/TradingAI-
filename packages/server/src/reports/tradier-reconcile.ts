@@ -1,3 +1,4 @@
+import { isCapitalMovement } from '@trading-app/engine';
 import type { TradierCashEvent, TradierTradeHistoryFill } from '@trading-app/engine';
 
 /**
@@ -449,6 +450,110 @@ export function aggregateCashFlowByDate(
     netByDate.set(ev.date, prev + ev.amount);
   }
   return { netByDate, seenTransactionIds };
+}
+
+/**
+ * TRA-2906 — the persisted cash-flow record, in its two possible shapes.
+ *
+ * `v1-aggregate` is the ORIGINAL format: one signed number per date, with the
+ * event `type` discarded at parse time and a `seenIds` cursor preventing a
+ * re-merge. Its defining property is that classification was baked in at WRITE
+ * time — so the two $10 broker fees already folded into those totals cannot be
+ * un-baked, and changing the classification rule cannot reach them.
+ *
+ * `v2-typed` keeps the events themselves. `netByDate` becomes a DERIVED read-time
+ * value ({@link deriveNetByDateFromEvents}), so the classification rule can
+ * change later with no migration at all — which is the whole point.
+ *
+ * The two are a discriminated union rather than one lenient shape on purpose.
+ * A file that carried a legacy `netByDate` AND a partial `events` list would be
+ * HALF migrated, and there is no correct way to read it: derive from `events`
+ * and every pre-migration deposit silently vanishes from the record; sum both
+ * and every post-migration event is counted twice. Either way the number stays
+ * plausible and stops being true. So the migration is all-or-nothing, and the
+ * only thing that performs it is the one-time rebuild
+ * (`scripts/tra2906-rebuild-cash-flow.mjs`), which sources a COMPLETE event
+ * history from the broker.
+ */
+export type TradierCashFlowRecord =
+  | {
+      schema: 'v1-aggregate';
+      /** Per-day signed net, classification already baked in at write time. */
+      netByDate: Record<string, number>;
+      /** Dedup cursor — transaction ids already merged into `netByDate`. */
+      seenIds: string[];
+    }
+  | {
+      schema: 'v2-typed';
+      /** Every recorded non-trade event, classification deferred to read time. */
+      events: TradierCashEvent[];
+    };
+
+/**
+ * TRA-2906 — derive per-day net CAPITAL MOVEMENT from the typed event record.
+ *
+ * This is the read-time half of the fix. Only events {@link isCapitalMovement}
+ * accepts contribute; everything else (today: `fee`) stays in P&L by simply not
+ * being subtracted. Non-finite amounts are dropped rather than propagated —
+ * a NaN here would poison the whole daily cell.
+ *
+ * Dates with no surviving contribution are OMITTED rather than written as 0, so
+ * a caller cannot tell "no capital moved" apart from "date absent" by key
+ * presence — they are the same thing to {@link sumCashFlowOverSpan}, which
+ * treats a missing key as 0.
+ */
+export function deriveNetByDateFromEvents(
+  events: readonly TradierCashEvent[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const ev of events) {
+    if (!isCapitalMovement(ev.type)) continue;
+    if (typeof ev.amount !== 'number' || !Number.isFinite(ev.amount)) continue;
+    out[ev.date] = (out[ev.date] ?? 0) + ev.amount;
+  }
+  return out;
+}
+
+/**
+ * TRA-2906 — resolve the per-date cash flow map a reader should subtract,
+ * from either record shape.
+ *
+ * A `v1-aggregate` record returns its stored totals UNCHANGED — including the
+ * mis-signed fees. That is deliberate and is not a bug being preserved: the v1
+ * totals are the only record of the deposits on those days, and re-deriving them
+ * is impossible without the discarded types. Until the rebuild runs, the fee
+ * defect stands; when it runs, it is corrected completely and at once.
+ */
+export function resolveCashFlowNetByDate(
+  record: TradierCashFlowRecord,
+): Record<string, number> {
+  return record.schema === 'v2-typed'
+    ? deriveNetByDateFromEvents(record.events)
+    : record.netByDate;
+}
+
+/**
+ * TRA-2906 — merge newly fetched events into a typed record, keyed on
+ * `transactionId`.
+ *
+ * Replaces the v1 `seenIds` cursor: with the events themselves retained, the
+ * record IS its own dedup cursor, so the two can no longer disagree. Existing
+ * entries win over incoming duplicates so a re-fetch never mutates history.
+ * Returns a new array; the input is not modified.
+ */
+export function mergeCashEventsIntoRecord(
+  existing: readonly TradierCashEvent[],
+  incoming: readonly TradierCashEvent[],
+): TradierCashEvent[] {
+  const byId = new Map<string, TradierCashEvent>();
+  for (const ev of existing) byId.set(ev.transactionId, ev);
+  for (const ev of incoming) {
+    if (byId.has(ev.transactionId)) continue;
+    byId.set(ev.transactionId, ev);
+  }
+  return [...byId.values()].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.transactionId.localeCompare(b.transactionId),
+  );
 }
 
 /**
