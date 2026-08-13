@@ -22,8 +22,52 @@
 //              was derived inside must still be empty.
 //
 // Exit: 0 PASS · 1 a control failed · 3 BLIND (nothing readable / no gradeable
-// pair). ⛔ 3 IS A HOLD, NOT A PASS — a zero pair count is a fact about the
-// fetch, never about the archive.
+// pair / the host refused the connection). ⛔ 3 IS A HOLD, NOT A PASS — a zero
+// pair count is a fact about the fetch, never about the archive.
+//
+// ── TRA-3461 — THE LENS BETWEEN THIS INSTRUMENT AND ITS OWN CONTROLS ──────────
+//
+// This script used to build its population from `GET /api/reports/:date` ->
+// `top5Movers` and nothing else. Since TRA-2631 / TRA-3020 ruling A that route no
+// longer serves the stored table: `annotateReportProvenance`
+// (`packages/server/src/reports/mover-provenance.ts`) FILTERS it at the response
+// boundary, suppressing every row whose session-move verdict is `suspect`.
+//
+// The rows it suppresses are implausible movers. THAT IS WHAT THE KNOWN-BAD
+// CONTROLS BELOW ARE MADE OF. Measured on bqb1 (anchor 2026-07-30, 100d): the
+// archive published 515 rows, the route served 356, the lens ate 159 — including
+// TDIC, FLYYQ, JEM and ATLN verbatim. The resulting control failures read as
+// "the detector regressed". It did not. The filter is correct and is not the
+// defect; reading the archive THROUGH it was.
+//
+//   ⭐ A POSITIVE CONTROL MUST *CONTAIN* WHAT THE INSTRUMENT DETECTS. Here it
+//   still does — and a LENS removed it in transit without touching either the
+//   control or the archive. Neither end was defective; the COMPOSITION was.
+//
+// The fix costs one union and the payload was built for it. Nothing is lost: the
+// same response carries `moversProvenance.filtered`, the suppressed rows
+// verbatim, precisely so a reader can rebuild the published table. We reunite
+// them and re-rank by |changePct| descending — the key `top5Movers()` itself
+// ranks on (`eod-report.ts`) — so the reconstruction carries the published rank,
+// not a concatenation artifact.
+//
+// STAMP COVERAGE is graded as its own three-valued verdict, because an ABSENT
+// `moversProvenance` means "this response never went through the filter", which
+// is a DIFFERENT FACT from "nothing was filtered" (the module header says so in
+// as many words), and a bypassed filter must never masquerade as a clean one:
+//
+//   LENSED   every movers-bearing response carries the stamp. Reunite and grade.
+//   UNLENSED no response carries it => the filter is not deployed on this box, so
+//            `top5Movers` IS the published table and the population is whole by
+//            construction. NOT a failure — but `SUPPRESSED 0` here says nothing
+//            about the archive being clean, and the banner says so.
+//   PARTIAL  some carry it and some do not => a LIVE filter skipped responses.
+//            The unstamped ones cannot be reunited, so the population is unknown
+//            on exactly the rows most likely to have been suppressed. FAIL.
+//
+// And the reunion is checked against the payload's OWN denominator: every stamp
+// states `publishedCount`, so `served + filtered` must sum to it across the box.
+// A population you cannot reconstruct exactly is not one to grade controls on.
 //
 // Usage:
 //   HOST=https://tradingai-bqb1.onrender.com node scripts/tra2634-continuity-archive-check.mjs
@@ -43,7 +87,17 @@ import {
   assessLevelContinuity,
   CONTINUITY_RESIDUAL_TOLERANCE,
   SUSPECT_MOVE_RATIO,
+  SUSPECT_MOVE_RATIO_FLOOR,
 } from '../packages/shared/dist/index.js';
+
+// ⛔ THE LEGEND MUST NAME THE BOUNDARY THE PREDICATE ACTUALLY TESTS (TRA-3461).
+// Every message in this file used to print `r>=SUSPECT_MOVE_RATIO` (2) while the
+// `deployedSuspect` column beside it is computed by `assessQuotePlausibility`,
+// which since TRA-3241 fires at `SUSPECT_MOVE_RATIO_FLOOR` (1.9) via the k = 2
+// proximity band. A reader comparing a 1.9874 row against a printed "r>=2" reads
+// the checker as broken; it was the caption that was 0.1 stale. `SUSPECT_MOVE_RATIO`
+// remains the magnitude ANCHOR and is printed as such — both, never one.
+const DEPLOYED_BAR = SUSPECT_MOVE_RATIO_FLOOR;
 
 const HOST = process.env.HOST ?? 'https://tradingai-bqb1.onrender.com';
 const FOLDS = ['demo', 'live', 'sandbox'];
@@ -109,7 +163,18 @@ const MUST_FIRE = [
   { box: BQB1, k: key('JEM', '2026-07-13', '2026-07-14'), newCatch: false, residual: 1.075306 },
   // localhost — where the FGMC files TRA-2610 was filed on actually live
   { box: LOCAL, k: key('FGMC', '2026-07-28', '2026-07-29'), newCatch: false, residual: 2.106599 },
-  { box: LOCAL, k: key('CRNX', '2026-07-07', '2026-07-08'), newCatch: true, residual: 1.987390 },
+  // ⭐ `newCatch` FLIPPED true -> false, 2026-08-13 (TRA-3461), and the row is KEPT.
+  // It is still a known-bad — the continuity detector must still condemn it, and
+  // does, at residual 1.9874 against a 1.01 tolerance. What changed is upstream:
+  // TRA-3241 lowered the session rule's effective boundary from 2 to
+  // `SUSPECT_MOVE_RATIO_FLOOR` = 1.9 (the k = 2 proximity band), and CRNX's own
+  // session ratio is 1.9864 — which used to sit in the gap and now does not. So
+  // the deployed rule catches it too and it no longer measures INCREMENTAL
+  // coverage. Flipping the annotation is the honest read of a moved threshold,
+  // not a silenced control: ABTC (1.3021) and 000660.KS (1.0369) still carry the
+  // incremental claim on this box, and the CONTROL SET assertion below now fails
+  // loudly if that set ever empties.
+  { box: LOCAL, k: key('CRNX', '2026-07-07', '2026-07-08'), newCatch: false, residual: 1.987390 },
   { box: LOCAL, k: key('ABTC', '2026-07-07', '2026-07-08'), newCatch: true, residual: 1.302147 },
   { box: LOCAL, k: key('000660.KS', '2026-07-13', '2026-07-14'), newCatch: true, residual: 1.036856 },
   { box: LOCAL, k: key('SDOT', '2026-07-07', '2026-07-08'), newCatch: false, residual: 1.219750 },
@@ -142,38 +207,134 @@ const env = Object.fromEntries(
     .filter(l => l.includes('=') && !l.startsWith('#'))
     .map(l => [l.slice(0, l.indexOf('=')).trim(), l.slice(l.indexOf('=') + 1).trim()]),
 );
-const login = await fetch(`${HOST}/api/auth/login`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ username: env.ADMIN_USERNAME ?? 'admin', password: env.ADMIN_PASSWORD }),
-});
+// ⛔ A CONNECTION REFUSAL IS BLIND, NOT A ZERO — AND NOT A TOOLING BUG EITHER.
+// Unwrapped, `fetch` throws `TypeError: fetch failed` on ECONNREFUSED and this
+// script dies with a stack trace, so a legitimate HOLD ("the box is down, I
+// cannot see") arrives wearing the face of a broken checker and gets triaged as
+// one. Exit 3 says the right thing, and 3 is never a pass. (TRA-3461)
+let login;
+try {
+  login = await fetch(`${HOST}/api/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: env.ADMIN_USERNAME ?? 'admin', password: env.ADMIN_PASSWORD }),
+  });
+} catch (err) {
+  console.error(`cannot reach ${HOST} (${err?.cause?.code ?? err?.message})`
+    + ' — BLIND (this is a HOLD, not a pass)');
+  process.exit(3);
+}
 if (!login.ok) {
   console.error(`login ${login.status} on ${HOST} — BLIND (this is a HOLD, not a pass)`);
   process.exit(3);
 }
-const H = { Authorization: `Bearer ${(await login.json()).token}` };
+let H = { Authorization: `Bearer ${(await login.json()).token}` };
+
+// ── TRA-3461 — SURVIVE A RESTART, AND REFUSE TO GRADE WHAT YOU COULD NOT READ.
+//
+// Measured 2026-08-13 while ruling on this ticket: bqb1 restarted TWICE inside a
+// single run (b8f9bb17 -> 4780dc9e, uptime 36s), which killed the bearer token
+// mid-window. 101 of 218 requests came back unreadable, the population fell 515
+// -> 435 rows — and the run still printed PASS, because every control row
+// happened to land in the readable half. That is the same blind-gate shape this
+// ticket exists to close, one layer up: a green over a population nobody
+// reconstructed. It was not simulated; it happened, so it is kept as the control.
+//
+// Two halves, and both are needed. RETRY absorbs the blip (a restart is not
+// evidence about the archive). The unreadable GATE below fails closed on whatever
+// survives the retries — BLIND (3), never FAIL (1), because nothing is broken:
+// we simply cannot see, and a band claim is a statement about the WHOLE
+// population.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function getReport(fold, date) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let r;
+    try {
+      r = await fetch(`${HOST}/api/reports/${date}?mode=${fold}`, { headers: H });
+    } catch {
+      if (attempt === 3) return { ok: false };
+      await sleep(attempt * 500);
+      continue;
+    }
+    if (r.status === 404) return { ok: true, missing: true };   // a real negative
+    if (r.ok) {
+      const text = await r.text();
+      try { return { ok: true, rep: JSON.parse(text) }; } catch { return { ok: false }; }
+    }
+    // A 401 mid-window means the token died under us (the box restarted), not
+    // that we lack permission — re-login once and keep going.
+    if (r.status === 401 && attempt < 3) {
+      try {
+        const re = await fetch(`${HOST}/api/auth/login`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: env.ADMIN_USERNAME ?? 'admin', password: env.ADMIN_PASSWORD }),
+        });
+        if (re.ok) H = { Authorization: `Bearer ${(await re.json()).token}` };
+      } catch { /* fall through to the backoff */ }
+    }
+    if (attempt === 3) return { ok: false };
+    await sleep(attempt * 500);
+  }
+  return { ok: false };
+}
 
 const dates = [];
 const base = new Date(`${ANCHOR}T12:00:00Z`).getTime();
 for (let i = 0; i < DAYS; i++) dates.push(new Date(base - i * 86400000).toISOString().slice(0, 10));
 
 let unreadable = 0;
+// ── Lens accounting (TRA-3461). Every number here is printed, because a census
+// whose denominator you cannot see is a claim, not a measurement.
+let filesRead = 0;          // readable report responses
+let filesWithTable = 0;     // ...that carry a movers table at all
+let filesStamped = 0;       // ...that carry `moversProvenance` (the filter RAN)
+let rowsServed = 0;         // rows the route handed us
+let rowsSuppressed = 0;     // rows the lens ate — the known-bads
+let publishedCountSum = 0;  // the payload's OWN denominator, summed over stamps
+let stampedRowsReunited = 0;// what we rebuilt for those same stamped responses
+const unstampedWithRows = []; // a LIVE filter that skipped a response
+
 const tables = new Map();          // fold -> date -> Map(symbol -> row)
 for (const fold of FOLDS) {
   const byDate = new Map();
   for (const date of dates) {
-    const r = await fetch(`${HOST}/api/reports/${date}?mode=${fold}`, { headers: H });
-    if (r.status === 404) continue;                       // a real negative
-    const text = await r.text();
-    if (!r.ok) { unreadable++; continue; }                // NOT a zero
-    let rep;
-    try { rep = JSON.parse(text); } catch { unreadable++; continue; }
-    const movers = rep?.top5Movers ?? [];
+    const got = await getReport(fold, date);
+    if (!got.ok) { unreadable++; continue; }   // NOT a zero, and NOT a 404
+    if (got.missing) continue;                 // a real negative
+    const rep = got.rep;
+    filesRead++;
+
+    const served = Array.isArray(rep?.top5Movers) ? rep.top5Movers : [];
+    const mp = rep?.moversProvenance;
+    // The suppressed rows, verbatim, from the same payload. `filtered` is the
+    // whole reason the reunion is a union and not a re-fetch.
+    const filtered = Array.isArray(mp?.filtered) ? mp.filtered : [];
+    if (served.length > 0 || mp) filesWithTable++;
+    if (mp) {
+      filesStamped++;
+      publishedCountSum += mp.publishedCount ?? 0;
+      stampedRowsReunited += served.length + filtered.length;
+    } else if (served.length > 0) {
+      unstampedWithRows.push(`${fold} ${date}`);
+    }
+    rowsServed += served.length;
+    rowsSuppressed += filtered.length;
+
+    // THE REUNION. Re-ranked on |changePct| descending, which is the key
+    // `top5Movers()` ranks on, so `rank` is the PUBLISHED rank rather than an
+    // artifact of concatenation order.
+    const movers = [...served, ...filtered]
+      .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
     if (movers.length === 0) continue;
     byDate.set(date, new Map(movers.map((m, i) => [String(m.symbol).toUpperCase(),
       { price: m.price, changePct: m.changePct, rank: i + 1 }])));
   }
   tables.set(fold, byDate);
 }
+
+// ── Stamp coverage, as a three-valued verdict. See the header.
+const lensState = filesStamped === 0
+  ? (filesWithTable === 0 ? 'NO-TABLE' : 'UNLENSED')
+  : (unstampedWithRows.length > 0 ? 'PARTIAL' : 'LENSED');
 
 // ── Grade every adjacent-session pair.
 const pairs = [];
@@ -193,6 +354,38 @@ for (const [fold, byDate] of tables) {
     }
   }
 }
+// The lens table prints BEFORE the blind gate below, so a HOLD still hands the
+// operator the numbers that explain it rather than a bare refusal.
+console.log(`HOST ${HOST}  anchor ${ANCHOR}  window ${DAYS}d  unreadable ${unreadable}`);
+console.log(`\nTHE LENS (TRA-3461): files ${filesRead} (with a movers table ${filesWithTable},`
+  + ` stamped ${filesStamped}) — ${lensState}`);
+console.log(`  rows the route SERVES      ${rowsServed}`);
+console.log(`  rows the filter SUPPRESSES ${rowsSuppressed}`
+  + `   <- the known-bads; graded here, NOT dropped`);
+console.log(`  rows the archive PUBLISHED ${rowsServed + rowsSuppressed}`
+  + `   (sum of the stamps' own publishedCount: ${publishedCountSum})`);
+if (lensState === 'UNLENSED') {
+  console.log('  ⚠️  No response carried `moversProvenance` => the read-time filter is NOT'
+    + ' deployed on this box.\n      `top5Movers` IS the published table here, so the population'
+    + ' is whole and this is not a\n      failure — but SUPPRESSES 0 above is a fact about the'
+    + ' FILTER, not a clean bill of\n      health for the archive. Do not read it as one.');
+}
+console.log('');
+
+// ⛔ ORDER THE LEGS BY ANSWERABILITY: this runs BEFORE any control is graded.
+// An unreadable date is a date whose rows are UNKNOWN — it can hold a control
+// row, or the healthy row that sizes the band. Grading through it produces a
+// verdict about a population nobody reconstructed, and the failure then arrives
+// wearing a control-failure face ("the detector regressed") instead of its own.
+// 3, not 1: nothing is broken, we cannot see. Re-run when the box is settled.
+if (unreadable > 0) {
+  console.error(`${unreadable} report response(s) on ${HOST} stayed unreadable after 3 attempts`
+    + ` (readable ${filesRead}, rows ${rowsServed + rowsSuppressed})`
+    + ' — the archive is only PARTIALLY visible, so neither the band nor a control set can be'
+    + ' graded over it. BLIND (this is a HOLD, not a pass; if the host is mid-restart, re-run).');
+  process.exit(3);
+}
+
 const graded = pairs.filter(p => p.verdict !== 'abstain');
 if (graded.length === 0) {
   console.error(`no gradeable adjacent-session pair over ${DAYS}d on ${HOST}`
@@ -206,11 +399,11 @@ const abstains = pairs.filter(p => p.verdict === 'abstain');
 const reasons = {};
 for (const a of abstains) reasons[a.reason ?? '?'] = (reasons[a.reason ?? '?'] ?? 0) + 1;
 
-console.log(`HOST ${HOST}  anchor ${ANCHOR}  window ${DAYS}d  unreadable ${unreadable}`);
 console.log(`mover rows ${pairs.length} | GRADED ${graded.length}`
   + ` (suspect ${suspects.length}, consistent ${healthy.length})`
   + ` | ABSTAINED ${abstains.length} ${JSON.stringify(reasons)}`);
-console.log(`tolerance ${CONTINUITY_RESIDUAL_TOLERANCE} | session rule r>=${SUSPECT_MOVE_RATIO}`);
+console.log(`tolerance ${CONTINUITY_RESIDUAL_TOLERANCE} | session rule fires at r>=${DEPLOYED_BAR}`
+  + ` (magnitude anchor ${SUSPECT_MOVE_RATIO}; the band between them is TRA-3241's near_split_ratio)`);
 
 // ⭐ Reachability first. A verdict of "0 offenders" is only meaningful if both
 // branches could have fired on this population.
@@ -218,8 +411,27 @@ const fails = [];
 if (suspects.length === 0) fails.push('BLIND: no row reached the suspect branch');
 if (healthy.length === 0) fails.push('BLIND: no row reached the consistent branch');
 
+// ── LENS controls (TRA-3461). These guard the POPULATION, and they run before
+// any control is graded — a control failure on a population you cannot
+// reconstruct is a fact about the fetch, and it reads as a detector regression.
+if (lensState === 'PARTIAL') {
+  fails.push(`LENS: ${unstampedWithRows.length} response(s) carry movers with NO`
+    + ' `moversProvenance` while others are stamped — a LIVE filter skipped them, so those'
+    + ' rows cannot be reunited and the population is unknown on exactly the rows most'
+    + ` likely to have been suppressed (${unstampedWithRows.slice(0, 5).join(', ')}`
+    + `${unstampedWithRows.length > 5 ? ', …' : ''})`);
+}
+// The payload states its own denominator on every stamp. If our reunion does not
+// reproduce it, we are grading a population we cannot rebuild — worse than not
+// grading, because it would ship wearing a PASS.
+if (filesStamped > 0 && stampedRowsReunited !== publishedCountSum) {
+  fails.push(`LENS: the reunion does not reproduce the published table —`
+    + ` rebuilt ${stampedRowsReunited} rows across ${filesStamped} stamped response(s)`
+    + ` but their own publishedCount sums to ${publishedCountSum}`);
+}
+
 const newCatches = suspects.filter(p => !p.deployedSuspect);
-console.log(`\nrows this instrument catches that r>=${SUSPECT_MOVE_RATIO} PASSES: ${newCatches.length}`);
+console.log(`\nrows this instrument catches that r>=${DEPLOYED_BAR} PASSES: ${newCatches.length}`);
 for (const p of newCatches.sort((a, b) => b.residual - a.residual)) {
   console.log(`  ${p.sym}\t${p.fold}\t${p.priorDate}->${p.date}\t#${p.rank}`
     + `\tprior=${p.prior.price}/${p.prior.changePct}\ttoday=${p.cur.price}/${p.cur.changePct}`
@@ -228,7 +440,7 @@ for (const p of newCatches.sort((a, b) => b.residual - a.residual)) {
 }
 // The mirror direction, printed because neither rule is a superset of the other.
 const sessionOnly = graded.filter(p => p.deployedSuspect && p.verdict === 'consistent');
-console.log(`rows r>=${SUSPECT_MOVE_RATIO} catches that this one calls CONSISTENT: ${sessionOnly.length}`
+console.log(`rows r>=${DEPLOYED_BAR} catches that this one calls CONSISTENT: ${sessionOnly.length}`
   + ` (${sessionOnly.map(p => `${p.sym} ${p.date}`).join(', ') || 'none'})`);
 
 // ── KNOWN-BAD control, scoped to this box.
@@ -252,9 +464,26 @@ for (const { k, newCatch, residual } of mustFire) {
   }
   // The leg that stops this being a restatement of TRA-2379.
   if (newCatch && p.deployedSuspect) {
-    fails.push(`KNOWN-BAD ${k}: marked newCatch but the deployed r>=${SUSPECT_MOVE_RATIO} rule ALSO flags it`
+    fails.push(`KNOWN-BAD ${k}: marked newCatch but the deployed r>=${DEPLOYED_BAR} rule ALSO flags it`
       + ` — this row no longer measures what the new instrument adds`);
   }
+}
+
+// ⭐ THE INCREMENTAL CLAIM NEEDS ITS OWN CONTROL (TRA-3461). The `newCatch` leg
+// above is per-row: it can only ever say "THIS row stopped measuring the delta".
+// Nothing said what happens when the LAST one degrades. Every future tightening
+// of the session rule eats newCatch rows — TRA-3241 already ate CRNX by lowering
+// the boundary 2 -> 1.9 — and a table whose newCatch set has quietly emptied
+// still passes every assertion above while proving NOTHING about incremental
+// coverage. That is a coverage metric defined over the fixed set instead of over
+// the population, and it certifies an instrument that is no longer earning its
+// keep. Assert the property directly.
+const boxNewCatch = mustFire.filter(r => r.newCatch);
+if (boxNewCatch.length === 0) {
+  fails.push(`CONTROL SET: box "${box}" has no \`newCatch\` known-bad left — every control row is`
+    + ` also caught by the deployed r>=${DEPLOYED_BAR} rule, so nothing here demonstrates that the`
+    + ` continuity instrument adds coverage. Re-derive the table against the current boundary`
+    + ` before trusting a PASS.`);
 }
 
 // ── KNOWN-GOOD control. The half nobody runs, and the one that catches a blind
@@ -283,5 +512,6 @@ if (fails.length > 0) {
   process.exit(1);
 }
 console.log(`\nPASS on box "${box}" — ${mustFire.length} known-bad fired, ${mustNotFire.length} known-good silent,`
-  + ` both branches reachable, band intact.`);
+  + ` both branches reachable, band intact, lens ${lensState}`
+  + ` (${rowsSuppressed} suppressed row(s) reunited).`);
 console.log(`⚠️  This grades ONE box. The other box's control rows were skipped above; run both.`);
