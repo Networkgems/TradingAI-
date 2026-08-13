@@ -1168,6 +1168,105 @@ export function buildForwardTestReport(
 // is still missing). Secrets-free: it reports whether each credential is
 // CONFIGURED as a boolean, never the value.
 
+// ── TRA-3456 — the journal-tail staleness read ────────────────────────────────
+//
+// The monitor above counted sample and never asked whether the count could still
+// MOVE. On 2026-08-12 that produced a textbook false green: the idea journal had
+// captured nothing since 2026-07-23 (every `GET /api/options/ideas` pass was
+// degrading to `llm_credit_exhausted` before it ever reached `recordSurfacedIdeas`),
+// yet the monitor published `weeksRemaining: 3`, `clock.started: true` and an EMPTY
+// `clock.blockedOn` — read literally, "three more weeks and the criterion clears".
+// It was a countdown against a clock that had stopped 20 days earlier, and it is
+// the reason the stall ran that long without anyone grading it.
+//
+// A motion detector cannot see a FROZEN operand unless something explicitly asks
+// "has the operand moved?". That is what this does.
+
+/**
+ * Observed ET trading sessions the idea journal may go without appending before
+ * its tail is graded DEAD.
+ *
+ * Five = one full trading week in which the host was up, the market was open, the
+ * chain recorder wrote a partition on every one of those days — and the journal
+ * appended nothing. The panel is user-driven (nothing polls it on a schedule), so
+ * a one- or two-day gap is ordinary traffic variance; a whole observed week is not.
+ */
+export const JOURNAL_STALE_AFTER_SESSIONS = 5;
+
+/** Tri-state — `unknown` is NOT `live`. See {@link evaluateJournalStaleness}. */
+export type JournalTailState = 'live' | 'stale' | 'unknown';
+
+/**
+ * TRA-3456 — is the idea journal's tail alive, measured against the ET TRADING
+ * calendar rather than wall-clock days?
+ *
+ * The calendar is not computed from weekday arithmetic — it is READ off the chain
+ * recorder's own partition dates. A recorded partition is positive evidence that on
+ * that ET date the market was open AND the host was up AND a durable write
+ * succeeded; i.e. it is a day the idea journal genuinely COULD have captured on and
+ * didn't. That makes the denominator observed rather than assumed, and it makes the
+ * predicate fail closed: if the recorder is dead too, there is no calendar to
+ * measure against and the verdict is `unknown`, never `live`.
+ */
+export interface JournalStaleness {
+  /**
+   * `live` — the tail is advancing. `stale` — provably frozen. `unknown` — the
+   * predicate had nothing to read (empty journal, or no recorded sessions).
+   * Tri-state on purpose: TRA-3456's whole failure mode was an absence rendering
+   * as a clean reading.
+   */
+  state: JournalTailState;
+  /**
+   * ANTI-VACUITY DENOMINATOR. Recorded chain partitions on/before `asOfDate` — the
+   * ET trading sessions this predicate actually examined. **Zero means the
+   * predicate read nothing**, which is reported as `unknown`; it can never be
+   * confused with a clean pass, because a clean pass prints a non-zero denominator
+   * alongside it.
+   */
+  sessionsObserved: number;
+  /** NUMERATOR — observed sessions strictly after `lastJournaledDate`. The gap. */
+  sessionsSinceLastEntry: number;
+  /** The bar `sessionsSinceLastEntry` is graded against. */
+  staleAfterSessions: number;
+  /** Most recent observed ET trading session (last chain partition ≤ `asOfDate`). */
+  lastObservedSession: string | null;
+  /** The sentence a human reads — always names both the numerator and denominator. */
+  reason: string;
+}
+
+/**
+ * TRA-3456 — can the `weeks_of_evidence` / `sample_size` bars still be REACHED by
+ * the ideas already in the journal?
+ *
+ * `weeksWithResolved` counts distinct SURFACED ISO weeks carrying ≥1 resolution, so
+ * its ceiling is fixed by the journal's surfaced-week span. Once capture stops, that
+ * span stops growing and the criterion acquires a hard ceiling that no amount of
+ * waiting lifts — which is exactly the claim a countdown denies.
+ *
+ * Gated on a DEAD tail deliberately. On a live journal the span grows every week, so
+ * a ceiling below the bar is the normal early-accumulation state and flagging it
+ * there would fire the alarm from day one — a warning that is always on is a warning
+ * nobody reads (same reasoning as TRA-2335's `unknown` carve-out).
+ */
+export interface AccumulationReachability {
+  /** Distinct surfaced ISO weeks in the journal. */
+  surfacedWeeks: number;
+  /**
+   * Ceiling on `weeksWithResolved` given the CURRENT journal: surfaced weeks that
+   * still hold at least one resolved-or-open idea. A week whose every idea was
+   * excluded or never got data can never carry a resolution, so it cannot count.
+   */
+  maxReachableWeeksWithResolved: number;
+  /** Ceiling on `resolved` given the current journal: already-resolved + still-open. */
+  maxReachableResolved: number;
+  /** True only when the tail is DEAD **and** the weeks ceiling sits below the bar. */
+  weeksBarUnreachable: boolean;
+  /** True only when the tail is DEAD **and** the resolved ceiling sits below the bar. */
+  resolvedBarUnreachable: boolean;
+  /** AC4 — the ceiling stated in words, or null when nothing is provably capped. */
+  note: string | null;
+}
+
 /** Snapshot of AI-Options-Ideas forward-test accumulation progress. */
 export interface AccumulationMonitor {
   asOfDate: string;
@@ -1195,6 +1294,12 @@ export interface AccumulationMonitor {
     firstJournaledDate: string | null;
     /** ET date the most recent idea was journaled, or null if none. */
     lastJournaledDate: string | null;
+    /**
+     * TRA-3456 — is that tail still ADVANCING? Read against the ET trading calendar
+     * the chain recorder observed, not wall-clock days. Everything downstream that
+     * could publish a countdown keys off this.
+     */
+    staleness: JournalStaleness;
   };
   accumulation: {
     surfaced: number;
@@ -1223,10 +1328,18 @@ export interface AccumulationMonitor {
      * is *on track, keep going*. A gate that silently fails is bad; one that
      * publishes a countdown to an event that cannot occur manufactures false
      * confidence on a schedule.
+     *
+     * TRA-3456 — **also null when `reachability.weeksBarUnreachable`.** Same
+     * principle, second mechanism: TRA-2335 killed the countdown that could not be
+     * reached because the BAR was too high; this kills the one that cannot be
+     * reached because the OPERAND has stopped moving. Both publish "N to go" for an
+     * event that cannot occur.
      */
     weeksRemaining: number | null;
     /** Resolved ideas still needed to clear the sample-size floor. Null when infeasible — see above. */
     resolvedRemaining: number | null;
+    /** TRA-3456 — whether the two sample bars can still be reached at all, and the ceiling in words. */
+    reachability: AccumulationReachability;
     /** TRA-2335 — the cost-NET expectancy bar the gate grades against. */
     minExpectancyR: number;
     /** TRA-2335 — the book's cost-NET payoff ceiling; `expectancyNetR` cannot exceed it. */
@@ -1242,10 +1355,139 @@ export interface AccumulationMonitor {
     feasibility: FeasibilityResult;
   };
   clock: {
-    /** True once BOTH feeds have produced their first durable artifact. */
+    /**
+     * True once BOTH feeds have produced their first durable artifact **and the
+     * idea journal's tail is still advancing**.
+     *
+     * TRA-3456 — this used to mean "the clock ever started", which stayed `true`
+     * for the twenty days the clock was stopped. A boolean that reads the same
+     * whether the clock is running or frozen is not a liveness signal, so it now
+     * means RUNNING. `state` keeps "stopped" distinguishable from "never started" —
+     * the historical fact is still legible, it just no longer masquerades as motion.
+     */
     started: boolean;
-    /** Machine-readable reasons the clock hasn't started (empty once started). */
+    /**
+     * TRA-3456 — `not_started` (a feed has never produced) · `running` · `stopped`
+     * (both feeds seeded, but the journal tail is DEAD).
+     */
+    state: 'not_started' | 'running' | 'stopped';
+    /**
+     * Machine-readable reasons the clock is not ADVANCING — empty only while it
+     * runs. TRA-3456 added `journal_capture_stalled`: before it, a stopped clock
+     * published an empty list, which reads as "nothing wrong".
+     */
     blockedOn: string[];
+    /** TRA-3456 — the clock state in one sentence, for the roll-up and for humans. */
+    note: string;
+  };
+}
+
+/**
+ * TRA-3456 — grade the idea journal's tail against the OBSERVED ET trading calendar.
+ * Pure. See {@link JournalStaleness} for why the calendar is read off recorded chain
+ * partitions instead of computed from weekday arithmetic.
+ */
+export function evaluateJournalStaleness(input: {
+  lastJournaledDate: string | null;
+  /** Recorded chain partition dates, ascending (ET `YYYY-MM-DD`). */
+  chainDates: readonly string[];
+  asOfDate: string;
+  staleAfterSessions?: number;
+}): JournalStaleness {
+  const staleAfterSessions = input.staleAfterSessions ?? JOURNAL_STALE_AFTER_SESSIONS;
+  // ISO dates compare correctly as strings; `chainDates` may run past `asOfDate` on
+  // a report built for a historical as-of, and a session after the as-of is not a
+  // session this reading is entitled to count.
+  const sessions = input.chainDates.filter((d) => d <= input.asOfDate);
+  const sessionsObserved = sessions.length;
+  const lastObservedSession = sessionsObserved > 0 ? sessions[sessionsObserved - 1]! : null;
+  const base = { sessionsObserved, staleAfterSessions, lastObservedSession };
+
+  if (sessionsObserved === 0) {
+    // FAIL CLOSED. No observed calendar ⇒ no basis to call the tail fresh. This is
+    // the branch that stops "the detector never fired here" from reading as "clean".
+    return {
+      ...base,
+      state: 'unknown',
+      sessionsSinceLastEntry: 0,
+      reason: `journal tail freshness UNKNOWN — 0 recorded chain sessions on/before ${input.asOfDate}, so there is no observed ET trading calendar to measure it against. Denominator is empty; this is NOT a clean reading.`,
+    };
+  }
+  if (input.lastJournaledDate === null) {
+    return {
+      ...base,
+      state: 'unknown',
+      sessionsSinceLastEntry: 0,
+      reason: `journal tail freshness UNKNOWN — the journal is empty, so there is no tail to grade (${sessionsObserved} ET trading session(s) observed on/before ${input.asOfDate}).`,
+    };
+  }
+
+  const last = input.lastJournaledDate;
+  const sessionsSinceLastEntry = sessions.filter((d) => d > last).length;
+  const stale = sessionsSinceLastEntry >= staleAfterSessions;
+  return {
+    ...base,
+    state: stale ? 'stale' : 'live',
+    sessionsSinceLastEntry,
+    reason: stale
+      ? `journal tail is DEAD — the last idea was journaled ${last}, and ${sessionsSinceLastEntry} ET trading session(s) have been RECORDED since (bar: ${staleAfterSessions}), the most recent ${lastObservedSession}. Those are days the market was open, the host was up and the chain recorder wrote — the idea journal simply captured nothing. Denominator: ${sessionsObserved} observed session(s) on/before ${input.asOfDate}.`
+      : `journal tail is LIVE — the last idea was journaled ${last}, ${sessionsSinceLastEntry} recorded ET trading session(s) back (bar: ${staleAfterSessions}), against the latest recorded session ${lastObservedSession}. Denominator: ${sessionsObserved} observed session(s) on/before ${input.asOfDate}.`,
+  };
+}
+
+/**
+ * TRA-3456 — the sample bars' ceilings under the CURRENT journal. Pure.
+ * See {@link AccumulationReachability} for why the flags are gated on a dead tail.
+ */
+export function evaluateAccumulationReachability(input: {
+  report: ForwardTestReport;
+  gate: { minWeeksWithResolved: number; minResolvedIdeas: number };
+  staleness: JournalStaleness;
+}): AccumulationReachability {
+  const t = input.report.totals;
+  const weeks = input.report.weeks;
+  const surfacedWeeks = weeks.length;
+  // A week whose ideas are all excluded / never got data can never carry a
+  // resolution, so it is not part of the ceiling even though it was surfaced.
+  //
+  // Both ceilings deliberately OVER-count: `open` includes still-open ideas that
+  // are already flagged excluded and so will never be graded. A ceiling has to be
+  // an upper bound to be sound — a loose one only ever withholds the unreachable
+  // verdict, while a tight one could declare a still-clearable bar dead. This flag
+  // fails SAFE toward "keep counting".
+  const maxReachableWeeksWithResolved = weeks.filter((w) => w.resolved > 0 || w.open > 0).length;
+  const maxReachableResolved = t.resolved + t.open;
+  const tailDead = input.staleness.state === 'stale';
+  const weeksBarUnreachable =
+    tailDead && maxReachableWeeksWithResolved < input.gate.minWeeksWithResolved;
+  const resolvedBarUnreachable = tailDead && maxReachableResolved < input.gate.minResolvedIdeas;
+
+  const spanNote =
+    surfacedWeeks > 0
+      ? ` The journal's surfaced-week span runs ${weeks[0]!.week}..${weeks[surfacedWeeks - 1]!.week} and stopped growing when capture stopped.`
+      : '';
+  const parts: string[] = [];
+  if (weeksBarUnreachable) {
+    parts.push(
+      `max reachable \`weeksWithResolved\` is ${maxReachableWeeksWithResolved} against a bar of ${input.gate.minWeeksWithResolved} — even if every still-open idea resolved tomorrow, the criterion could not clear.${spanNote}`,
+    );
+  }
+  if (resolvedBarUnreachable) {
+    parts.push(
+      `max reachable \`resolved\` is ${maxReachableResolved} (${t.resolved} settled + ${t.open} open) against a bar of ${input.gate.minResolvedIdeas} — the sample floor cannot be met from the ideas already journaled.`,
+    );
+  }
+  const note = parts.length
+    ? `⛔ NOT a waiting problem — the idea journal has stopped capturing, so ${parts.join(' Likewise, ')} No future date clears this until fresh ideas are journaled.`
+    : null;
+
+  return {
+    surfacedWeeks,
+    maxReachableWeeksWithResolved,
+    maxReachableResolved,
+    weeksBarUnreachable,
+    resolvedBarUnreachable,
+    note,
   };
 }
 
@@ -1384,11 +1626,37 @@ export function buildAccumulationMonitor(input: {
   if (!input.anthropicConfigured) blockedOn.push('anthropic_key_unset');
   if (firstRecordedDate === null) blockedOn.push('no_chain_partitions');
   if (input.firstJournaledDate === null) blockedOn.push('no_journaled_ideas');
-  const started = firstRecordedDate !== null && input.firstJournaledDate !== null;
+  const seeded = firstRecordedDate !== null && input.firstJournaledDate !== null;
+
+  // TRA-3456 — seeded is not running. Ask whether the journal tail has MOVED.
+  const staleness = evaluateJournalStaleness({
+    lastJournaledDate: input.lastJournaledDate,
+    chainDates: input.chainDates,
+    asOfDate: input.report.asOfDate,
+  });
+  const stopped = seeded && staleness.state === 'stale';
+  if (stopped) blockedOn.push('journal_capture_stalled');
+  const started = seeded && !stopped;
+  const clockState: 'not_started' | 'running' | 'stopped' = !seeded
+    ? 'not_started'
+    : stopped
+      ? 'stopped'
+      : 'running';
+  const clockNote = !seeded
+    ? `accumulation clock NOT STARTED — blocked on: ${blockedOn.join(', ') || 'unknown'}.`
+    : stopped
+      ? `accumulation clock STOPPED — it started (first chain ${firstRecordedDate}, first idea ${input.firstJournaledDate}) but has not advanced since ${input.lastJournaledDate}. ${staleness.reason}`
+      : `accumulation clock RUNNING — ${staleness.reason}`;
 
   // TRA-2335 — the same verdict criterion 3 publishes, via the same function.
   const feasibility = evaluateBookFeasibility(input.report, input.gate.minExpectancyR);
   const countdownWithheld = feasibility.verdict === 'infeasible';
+  // TRA-3456 — the second way a countdown can be a lie: the operand is frozen.
+  const reachability = evaluateAccumulationReachability({
+    report: input.report,
+    gate: input.gate,
+    staleness,
+  });
 
   return {
     asOfDate: input.report.asOfDate,
@@ -1406,6 +1674,7 @@ export function buildAccumulationMonitor(input: {
       ideaCount: input.journalCount,
       firstJournaledDate: input.firstJournaledDate,
       lastJournaledDate: input.lastJournaledDate,
+      staleness,
     },
     accumulation: {
       surfaced: t.surfaced,
@@ -1428,18 +1697,24 @@ export function buildAccumulationMonitor(input: {
       // reason to exist, so suppressing the countdown there would both destroy the
       // instrument's primary function and fire the alarm every week from day one. A
       // warning that is always on is a warning nobody reads.
-      weeksRemaining: countdownWithheld
-        ? null
-        : Math.max(0, input.gate.minWeeksWithResolved - t.weeksWithResolved),
-      resolvedRemaining: countdownWithheld
-        ? null
-        : Math.max(0, input.gate.minResolvedIdeas - t.resolved),
+      //
+      // TRA-3456 — the identical argument, applied to a frozen operand. A countdown
+      // over a dead journal is not "N weeks to go", it is "N weeks to go, forever".
+      weeksRemaining:
+        countdownWithheld || reachability.weeksBarUnreachable
+          ? null
+          : Math.max(0, input.gate.minWeeksWithResolved - t.weeksWithResolved),
+      resolvedRemaining:
+        countdownWithheld || reachability.resolvedBarUnreachable
+          ? null
+          : Math.max(0, input.gate.minResolvedIdeas - t.resolved),
       minExpectancyR: input.gate.minExpectancyR,
       ceilingNetR: t.ceilingNetR,
       feasible: feasibility.feasible,
       feasibility,
+      reachability,
     },
-    clock: { started, blockedOn },
+    clock: { started, state: clockState, blockedOn, note: clockNote },
   };
 }
 
@@ -1471,9 +1746,15 @@ export function renderWeeklyRollupMarkdown(input: {
 }): string {
   const { monitor: m, report } = input;
   const t = report.totals;
-  const clockLine = m.clock.started
-    ? `▶ **Accumulation clock: STARTED** (first chain ${m.chains.firstRecordedDate}, first idea ${m.journal.firstJournaledDate})`
-    : `⏸ **Accumulation clock: NOT started** — blocked on: ${m.clock.blockedOn.join(', ') || 'unknown'}`;
+  // TRA-3456 — three states, not two. The roll-up published "clock: STARTED" for the
+  // twenty days the clock was stopped, because `started` was a historical fact
+  // rendered as a liveness claim.
+  const clockLine =
+    m.clock.state === 'running'
+      ? `▶ **Accumulation clock: RUNNING** (first chain ${m.chains.firstRecordedDate}, first idea ${m.journal.firstJournaledDate}, latest idea ${m.journal.lastJournaledDate})`
+      : m.clock.state === 'stopped'
+        ? `⛔ **Accumulation clock: STOPPED** — ${m.clock.note}`
+        : `⏸ **Accumulation clock: NOT started** — blocked on: ${m.clock.blockedOn.join(', ') || 'unknown'}`;
 
   const lines: string[] = [];
   lines.push(`## AI Options Ideas — Forward-Test Roll-Up`);
@@ -1490,6 +1771,12 @@ export function renderWeeklyRollupMarkdown(input: {
   // the "N weeks to go" reading that four weeks of roll-ups already established.
   if (m.gate.feasibility.verdict === 'infeasible') {
     lines.push(`> ⛔ **Gate not reachable — this is NOT a sample-size problem.** The cost-net expectancy bar is **${m.gate.minExpectancyR.toFixed(2)}R**, but the graded book's cost-net payoff **ceiling is ${fmtR4(m.gate.ceilingNetR)}R** (loss is pinned at −1R; reward is capped at maxProfit ÷ maxLoss, so realized R can never exceed it). **No amount of additional sample can clear this bar** — the accumulation countdown below is withheld because reaching zero would not open the gate. ${m.gate.feasibility.reason}`);
+    lines.push('');
+  }
+  // TRA-3456 — a frozen operand gets the same treatment the unreachable bar got:
+  // the countdown is REPLACED by the ceiling stated in words, not annotated with it.
+  if (m.gate.reachability.note != null) {
+    lines.push(`> ${m.gate.reachability.note}`);
     lines.push('');
   }
   lines.push(`### Accumulation progress`);
@@ -1512,6 +1799,10 @@ export function renderWeeklyRollupMarkdown(input: {
   lines.push('');
   lines.push(`- Chain recorder (Tradier): ${m.feeds.tradierConfigured ? 'configured' : 'NOT configured'} — ${m.chains.partitionDays} partition day(s) on disk${m.chains.lastRecordedDate ? `, latest ${m.chains.lastRecordedDate}` : ''}`);
   lines.push(`- Ideas pass (Anthropic): ${m.feeds.anthropicConfigured ? 'configured' : 'NOT configured'} — ${m.journal.ideaCount} idea(s) journaled${m.journal.lastJournaledDate ? `, latest ${m.journal.lastJournaledDate}` : ''}`);
+  // TRA-3456 — "configured" is a config read, not a liveness read: the credential was
+  // present and valid on every one of the twenty days nothing was captured. Print the
+  // tail verdict WITH its denominator so a clean reading and a never-fired one differ.
+  lines.push(`  - Journal tail: **${m.journal.staleness.state.toUpperCase()}** — ${m.journal.staleness.reason}`);
 
   // Most-recent weeks (up to 6), newest first, so the roll-up reads at a glance.
   const recent = [...report.weeks].slice(-6).reverse();

@@ -4996,6 +4996,13 @@ async function runWeeklyOptionsRollup(): Promise<void> {
     weeksWithResolved: report.totals.weeksWithResolved,
     gatePassed: gate.passed,
     clockStarted: monitor.clock.started,
+    // TRA-3456 — `clockStarted` alone stayed `true` through a 20-day capture stall,
+    // so the weekly log line was as blind as the artifact it announced. The single
+    // contiguous token is what the Render log filter (substring match) can alarm on.
+    clockState: monitor.clock.state,
+    journalTail: `journal-tail=${monitor.journal.staleness.state}`,
+    journalTailSessions: monitor.journal.staleness.sessionsSinceLastEntry,
+    weeksBarUnreachable: monitor.gate.reachability.weeksBarUnreachable,
   });
 }
 

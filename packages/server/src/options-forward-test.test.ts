@@ -8,6 +8,8 @@ import {
   buildForwardTestReport,
   buildIdeasDecomposition,
   buildAccumulationMonitor,
+  evaluateJournalStaleness,
+  JOURNAL_STALE_AFTER_SESSIONS,
   renderWeeklyRollupMarkdown,
   applyIvRankReconstruction,
   structureCostUsd,
@@ -678,6 +680,262 @@ describe('buildAccumulationMonitor', () => {
   });
 });
 
+// ── TRA-3456 — journal-tail staleness + reachability ─────────────────────────
+//
+// The defect: on 2026-08-12 the monitor published `weeksRemaining: 3`,
+// `clock.started: true`, `clock.blockedOn: []` over an idea journal whose last
+// entry was 2026-07-23. Every `GET /api/options/ideas` pass in that window
+// degraded to `llm_credit_exhausted` before reaching `recordSurfacedIdeas`, so
+// the operand the countdown counted down had been frozen for 20 days.
+
+describe('evaluateJournalStaleness (TRA-3456)', () => {
+  /** Ascending ET weekday dates, `n` of them, ending on `end` inclusive. */
+  function sessions(end: string, n: number): string[] {
+    const out: string[] = [];
+    const d = new Date(`${end}T00:00:00Z`);
+    while (out.length < n) {
+      const dow = d.getUTCDay();
+      if (dow !== 0 && dow !== 6) out.push(d.toISOString().slice(0, 10));
+      d.setUTCDate(d.getUTCDate() - 1);
+    }
+    return out.reverse();
+  }
+
+  // ── AC5, the pinned CLEAN fixture ───────────────────────────────────────────
+  // This is the control. It reads `live` on a genuinely live journal AND prints a
+  // non-zero denominator, which is the whole point: a predicate that has never
+  // fired reports `sessionsObserved: 0` and state `unknown` (next test), so
+  // "clean" and "never fired here" cannot be confused on this field.
+  it('reads CLEAN on a live journal, with a NON-ZERO denominator', () => {
+    const chainDates = sessions('2026-08-12', 40); // 40 observed ET sessions
+    const s = evaluateJournalStaleness({
+      lastJournaledDate: chainDates[chainDates.length - 2]!, // one session back
+      chainDates,
+      asOfDate: '2026-08-12',
+    });
+    expect(s.state).toBe('live');
+    expect(s.sessionsObserved).toBe(40); // ← the denominator, printed
+    expect(s.sessionsSinceLastEntry).toBe(1); // ← the numerator
+    expect(s.lastObservedSession).toBe('2026-08-12');
+    expect(s.reason).toContain('LIVE');
+    expect(s.reason).toContain('Denominator: 40 observed session(s)');
+  });
+
+  it('reads UNKNOWN — never `live` — when there is no observed calendar to read', () => {
+    // The anti-vacuity branch. No recorded sessions ⇒ the predicate examined
+    // nothing, and an empty examination must not render as a pass.
+    const s = evaluateJournalStaleness({
+      lastJournaledDate: '2026-07-23',
+      chainDates: [],
+      asOfDate: '2026-08-12',
+    });
+    expect(s.state).toBe('unknown');
+    expect(s.state).not.toBe('live');
+    expect(s.sessionsObserved).toBe(0);
+    expect(s.reason).toContain('NOT a clean reading');
+  });
+
+  it('reads UNKNOWN on an empty journal — there is no tail to grade', () => {
+    const s = evaluateJournalStaleness({
+      lastJournaledDate: null,
+      chainDates: sessions('2026-08-12', 10),
+      asOfDate: '2026-08-12',
+    });
+    expect(s.state).toBe('unknown');
+    expect(s.sessionsObserved).toBe(10);
+  });
+
+  it('grades against the OBSERVED trading calendar, not wall-clock days', () => {
+    // 20 wall-clock days stale, but the recorder only captured 3 sessions in the
+    // window (a holiday-shortened stretch / partial outage). Three missed sessions
+    // is under the bar, so the tail is LIVE — a wall-clock predicate would have
+    // called this dead at day 6.
+    const s = evaluateJournalStaleness({
+      lastJournaledDate: '2026-07-23',
+      chainDates: ['2026-07-20', '2026-07-23', '2026-07-30', '2026-08-06', '2026-08-12'],
+      asOfDate: '2026-08-12',
+    });
+    expect(s.sessionsSinceLastEntry).toBe(3);
+    expect(s.state).toBe('live');
+  });
+
+  it('fires exactly AT the bar, not one session early', () => {
+    const at = evaluateJournalStaleness({
+      lastJournaledDate: '2026-07-23',
+      chainDates: ['2026-07-23', ...sessions('2026-08-12', JOURNAL_STALE_AFTER_SESSIONS)],
+      asOfDate: '2026-08-12',
+    });
+    expect(at.sessionsSinceLastEntry).toBe(JOURNAL_STALE_AFTER_SESSIONS);
+    expect(at.state).toBe('stale');
+
+    const under = evaluateJournalStaleness({
+      lastJournaledDate: '2026-07-23',
+      chainDates: ['2026-07-23', ...sessions('2026-08-12', JOURNAL_STALE_AFTER_SESSIONS - 1)],
+      asOfDate: '2026-08-12',
+    });
+    expect(under.sessionsSinceLastEntry).toBe(JOURNAL_STALE_AFTER_SESSIONS - 1);
+    expect(under.state).toBe('live');
+  });
+
+  it('ignores recorded sessions AFTER the report as-of date', () => {
+    const s = evaluateJournalStaleness({
+      lastJournaledDate: '2026-08-10',
+      chainDates: ['2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14'],
+      asOfDate: '2026-08-11',
+    });
+    expect(s.sessionsObserved).toBe(2);
+    expect(s.sessionsSinceLastEntry).toBe(1);
+    expect(s.lastObservedSession).toBe('2026-08-11');
+  });
+});
+
+describe('buildAccumulationMonitor — frozen journal (TRA-3456)', () => {
+  const GATE_3456 = { minWeeksWithResolved: 8, minResolvedIdeas: 3, minExpectancyR: 0 };
+
+  function outcome(over: Partial<IdeaOutcome> & { key: string; surfacedWeek: string }): IdeaOutcome {
+    return {
+      ticker: 'AAA',
+      strategy: 'long_call',
+      surfacedDate: '2026-06-10',
+      expiration: '2026-07-17',
+      pop: 0.6,
+      maxLossUsd: 300,
+      maxProfitUsd: 600,
+      entryNetUsd: -300,
+      status: 'resolved',
+      valuedAt: '2026-07-17',
+      liquidationUsd: 450,
+      pnlUsd: 150,
+      pnlR: 0.5,
+      costsUsd: 6,
+      pnlNetUsd: 144,
+      pnlNetR: 0.48,
+      costEfficiencyRatio: 0.02,
+      win: true,
+      excluded: false,
+      excludeReason: null,
+      settleLagDays: 0,
+      maxLossBreached: false,
+      ...over,
+    };
+  }
+
+  /**
+   * The live 2026-08-12 shape, reduced: surfaced weeks W24..W31, five carrying a
+   * resolution, two still open, and W31 holding nothing but an EXCLUDED idea — so
+   * the true ceiling is 7, not the 8 a naive `weeks.length` would give.
+   */
+  function frozenBookReport() {
+    const outcomes: IdeaOutcome[] = [];
+    for (let i = 0; i < 5; i++) outcomes.push(outcome({ key: `r${i}`, surfacedWeek: `2026-W2${4 + i}` }));
+    outcomes.push(outcome({ key: 'o1', surfacedWeek: '2026-W29', status: 'open', pnlUsd: null, pnlR: null, win: null }));
+    outcomes.push(outcome({ key: 'o2', surfacedWeek: '2026-W30', status: 'open', pnlUsd: null, pnlR: null, win: null }));
+    outcomes.push(outcome({ key: 'x1', surfacedWeek: '2026-W31', excluded: true, excludeReason: 'fallback_priced' }));
+    return buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-08-12') });
+  }
+
+  /** 15 recorded ET sessions after the last journal entry — the recorder is alive. */
+  const CHAINS_ALIVE = [
+    '2026-07-23', '2026-07-24', '2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30',
+    '2026-07-31', '2026-08-03', '2026-08-04', '2026-08-05', '2026-08-06', '2026-08-07',
+    '2026-08-10', '2026-08-11', '2026-08-12',
+  ];
+
+  const frozenMonitor = () =>
+    buildAccumulationMonitor({
+      report: frozenBookReport(),
+      gate: GATE_3456,
+      chainOutDir: '/data/option-chains',
+      chainDates: CHAINS_ALIVE,
+      journalCount: 8,
+      firstJournaledDate: '2026-06-10',
+      lastJournaledDate: '2026-07-23',
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+
+  it('reads the clock STOPPED — not "started" — and names the stall in blockedOn', () => {
+    const m = frozenMonitor();
+    expect(m.clock.state).toBe('stopped');
+    expect(m.clock.started).toBe(false); // the literal read must not say "running"
+    expect(m.clock.blockedOn).toContain('journal_capture_stalled');
+    expect(m.clock.note).toContain('STOPPED');
+    expect(m.journal.staleness.state).toBe('stale');
+    expect(m.journal.staleness.sessionsSinceLastEntry).toBe(14);
+    expect(m.journal.staleness.sessionsObserved).toBe(15); // denominator, non-zero
+  });
+
+  it('withholds the weeks countdown — `weeksRemaining` is null, never a number', () => {
+    const m = frozenMonitor();
+    expect(m.gate.weeksRemaining).toBeNull();
+    expect(typeof m.gate.weeksRemaining).not.toBe('number');
+    expect(m.accumulation.weeksWithResolved).toBe(5); // the count itself still reports
+  });
+
+  it('NAMES the ceiling in words — "max reachable ... is 7 against a bar of 8"', () => {
+    const m = frozenMonitor();
+    expect(m.gate.reachability.surfacedWeeks).toBe(8);
+    // W31 holds only an excluded idea, so it can never carry a resolution.
+    expect(m.gate.reachability.maxReachableWeeksWithResolved).toBe(7);
+    expect(m.gate.reachability.weeksBarUnreachable).toBe(true);
+    expect(m.gate.reachability.note).toContain(
+      'max reachable `weeksWithResolved` is 7 against a bar of 8',
+    );
+    expect(m.gate.reachability.note).toContain('No future date clears this');
+  });
+
+  it('leaves a MET bar alone — only the unreachable criterion is withheld', () => {
+    const m = frozenMonitor();
+    // 5 resolved ≥ the 3-idea floor, and 5 + 2 open can still grow it.
+    expect(m.gate.reachability.resolvedBarUnreachable).toBe(false);
+    expect(m.gate.resolvedRemaining).toBe(0);
+  });
+
+  it('does NOT flag an early but LIVE journal as unreachable', () => {
+    // The guard against a warning that is always on: at week 2 of accumulation the
+    // ceiling is trivially below the 8-week bar, but the span is still growing, so
+    // the countdown is a true statement and must keep rendering.
+    const outcomes = [
+      outcome({ key: 'a', surfacedWeek: '2026-W32' }),
+      outcome({ key: 'b', surfacedWeek: '2026-W33' }),
+    ];
+    const m = buildAccumulationMonitor({
+      report: buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-08-12') }),
+      gate: GATE_3456,
+      chainOutDir: '/data/option-chains',
+      chainDates: CHAINS_ALIVE,
+      journalCount: 2,
+      firstJournaledDate: '2026-08-10',
+      lastJournaledDate: '2026-08-12', // caught up with the recorder
+      tradierConfigured: true,
+      anthropicConfigured: true,
+    });
+    expect(m.journal.staleness.state).toBe('live');
+    expect(m.clock.state).toBe('running');
+    expect(m.clock.blockedOn).toEqual([]);
+    expect(m.gate.reachability.maxReachableWeeksWithResolved).toBe(2); // 2 < 8 …
+    expect(m.gate.reachability.weeksBarUnreachable).toBe(false); // … but NOT flagged
+    expect(m.gate.reachability.note).toBeNull();
+    expect(m.gate.weeksRemaining).toBe(6); // the countdown is still true here
+  });
+
+  it('renders STOPPED and the ceiling sentence in the weekly roll-up', () => {
+    const report = frozenBookReport();
+    const md = renderWeeklyRollupMarkdown({
+      monitor: frozenMonitor(),
+      report,
+      gatePassed: false,
+      gateSummary: 'HOLD',
+    });
+    expect(md).toContain('Accumulation clock: STOPPED');
+    expect(md).not.toContain('Accumulation clock: RUNNING');
+    expect(md).toContain('max reachable `weeksWithResolved` is 7 against a bar of 8');
+    // The countdown cell must read as WITHHELD, never as a number.
+    expect(md).toContain('| Weeks with resolved ideas | 5 | 8 | — (bar unreachable) |');
+    expect(md).toContain('Journal tail: **STALE**');
+  });
+});
+
 describe('renderWeeklyRollupMarkdown', () => {
   const emptyMonitor = (_blockedOn: string[]) =>
     buildAccumulationMonitor({
@@ -756,7 +1014,9 @@ describe('renderWeeklyRollupMarkdown', () => {
       gatePassed: false,
       gateSummary: 'HOLD — needs more weeks',
     });
-    expect(md).toContain('STARTED');
+    // TRA-3456 — "STARTED" became "RUNNING": the old label was a historical fact
+    // rendered as a liveness claim, and it stayed on through a 20-day capture stall.
+    expect(md).toContain('RUNNING');
     expect(md).toContain('### Recent weeks');
     expect(md).toContain('2026-W02');
   });

@@ -208,6 +208,36 @@ roll-up **withhold the sample-size countdown** when the bar is unreachable. That
 was not a passive omission: it published "N weeks to go" every Monday toward an event that
 could not occur, which reads as *on track, keep going*.
 
+#### The second way a countdown lies: a frozen operand (TRA-3456)
+
+TRA-2335 killed the countdown that could not be reached because the **bar** was too high.
+TRA-3456 is the same defect through the **operand**: the idea journal captured nothing
+between **2026-07-23 and 2026-08-12** (every `GET /api/options/ideas` pass degraded to
+`llm_credit_exhausted` before it reached `recordSurfacedIdeas`), and the monitor published
+`weeksRemaining: 3`, `clock.started: true`, `clock.blockedOn: []` right across it. A motion
+detector cannot see a frozen operand unless something explicitly asks whether it moved.
+
+- **`journal.staleness`** — the tail verdict, graded against the ET trading calendar. The
+  calendar is **read off the chain recorder's own partition dates**, not computed from
+  weekday arithmetic: a recorded partition is positive evidence the market was open, the
+  host was up and a durable write landed, i.e. a day the journal genuinely *could* have
+  captured on. It is tri-state (`live` / `stale` / `unknown`) and prints both the
+  **numerator** (`sessionsSinceLastEntry`) and the **denominator** (`sessionsObserved`).
+  Zero observed sessions ⇒ `unknown`, never `live` — the predicate fails closed, so *"the
+  detector never fired here"* and *"clean"* cannot read the same.
+- **`clock.state`** — `not_started` / `running` / `stopped`, and `clock.started` now means
+  **running**. It used to mean "ever started", which stayed `true` for the whole stall;
+  `blockedOn` gains `journal_capture_stalled`.
+- **`gate.reachability`** — the ceiling **in words**: *"max reachable `weeksWithResolved` is
+  7 against a bar of 8"*. `weeksWithResolved` counts distinct **surfaced** ISO weeks, so its
+  ceiling is pinned by the journal's surfaced-week span; once capture stops, no future date
+  clears it. `weeksRemaining` / `resolvedRemaining` go **null** when their bar is capped.
+
+Both flags are gated on a **dead tail** on purpose. On a live journal the span grows every
+week, so a ceiling below the bar is the normal early-accumulation state — flagging it there
+would fire the alarm from day one, and a warning that is always on is a warning nobody
+reads (the same carve-out TRA-2335 makes for `unknown`).
+
 ### Per-sleeve feasibility (TRA-2353) — the book verdict is a **composition artifact**
 
 The bound above is correct on any mix, but it is **one number for the whole book**, and on
