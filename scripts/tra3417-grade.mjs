@@ -8,19 +8,24 @@
 // is the only way to find out that the instrument reads FAIL against working
 // code before it is pointed at the one session that matters.
 //
-// ── The three reads that are NOT interchangeable ────────────────────────────
+// ── The reads that are NOT interchangeable ──────────────────────────────────
 //
-// 1. `evaluated === 0`  ⇒ UNGRADEABLE. No scan has recorded a cost_bar verdict
-//    on this ET day. This is the PRE-OPEN state and it is NOT a failure.
+// 1. `evaluated === 0`  ⇒ THREE different states, not one. See the LIVENESS
+//    block: pre-open (benign) · the engine ticked but the sleeve was starved
+//    upstream (a real negative) · nothing scanned at all (a defect). The first
+//    draft hardcoded the benign reading, which at 14:15Z — 45 min AFTER the
+//    open — is the least likely of the three.
 // 2. `evaluated > 0` and the OTM cell is present ⇒ GRADEABLE.
 // 3. `evaluated > 0` and the OTM cell is ABSENT ⇒ adjudicate with `byReason`,
 //    never on the absence alone. See C3 below.
 //
 // ── Exit codes ──────────────────────────────────────────────────────────────
-//   0  every gradeable criterion PASSED
-//   2  a criterion FAILED (a real negative result, reportable as such)
-//   3  UNGRADEABLE / BLIND — pre-open, no scans, or an instrument that cannot
-//      see. FAIL-CLOSED: this is never collapsed into 0 or 2.
+//   0  every gradeable criterion PASSED (the nominator bit AND it traded)
+//   2  a criterion FAILED, or the instrument is DEFECTIVE
+//   3  UNGRADEABLE / BLIND — pre-open, no session, or an instrument that cannot
+//      see. FAIL-CLOSED: this is never collapsed into 0, 2 or 4.
+//   4  REAL NEGATIVE — the instruments worked and the answer is NO TRADE.
+//      Distinct from 0 on purpose: a negative result is not a pass.
 //
 // Usage:  node scripts/tra3417-grade.mjs            (logs read when RENDER_API_KEY is set)
 //         node scripts/tra3417-grade.mjs --no-logs  (payload-only)
@@ -113,7 +118,116 @@ console.log(`decisionsRecorded ${gates.decisionsRecorded}  durability.ephemeral 
 // that predate the `cell`/`selection` axes entirely (1943 evaluated, byCell []),
 // so it holds no positive control and must never be cited as a baseline for
 // either axis. Grade the day counter or grade nothing.
-const GRADEABLE = cb.evaluated > 0;
+const HAVE_VERDICTS = cb.evaluated > 0;
+
+// ── LIVENESS — what a ZERO means, and why this payload cannot say ───────────
+//
+// ⛔ The first draft read `evaluated === 0` as "pre-open, NOT a failure" and
+// stopped there. That is the same zero as two OTHER states, and at 14:15Z — 45
+// minutes AFTER the open — the benign one is the least likely of the three:
+//
+//   (a) pre-open / no session          → benign, ungradeable
+//   (b) session live, scanner returned no candidates on every name
+//                                      → a REAL negative, and reportable
+//   (c) session live, the scan never ran at all
+//                                      → a DEFECT; grading it as (a) or (b) publishes a lie
+//
+// Nothing in `/api/health/live-enforce-gates` separates them. Verified against
+// the LIVE bytes (c44a890) rather than the local fork:
+//
+//   `runOtmScan` (signal-engine.ts:9837) does
+//       `if (result.reason !== 'ok' || result.candidates.length === 0) continue;`   (:9900)
+//   BEFORE the nominator (:9920), before `recordLiveEnforceDecision` (:10294) and
+//   before the universe gate (:10003). Every one of the seven gates in `byGate`
+//   is recorded DOWNSTREAM of that `continue`, so a starve leaves no gate row, no
+//   nomination line and no reason code — it is invisible on every axis this
+//   payload publishes. A sibling gate is therefore NOT a usable control here.
+//
+// The OTM sleeve is also the only option path with no scan-run telemetry:
+// `beginRvScan` is opened for 'rv_scan' (:8824) and 'directional' (:11233) and
+// surfaces at /api/health/rv-scan as exactly the distinction wanted here — its
+// own comment says a disarmed path must read "never ran" rather than "ran, found
+// nothing". `runOtmScan` never calls it. That gap is CTO work and will not be
+// deployed today, so today's grade adjudicates with what is observable now:
+//
+//   · marketOpen        — the server's OWN market clock (not my arithmetic)
+//   · directional scans — a SIBLING path inside the same doTick. It cannot prove
+//                         the OTM scan ran, but a non-zero proves the ENGINE
+//                         ticked, which separates (c) from (b).
+//   · tradier-chain lastFetchOkAt — the shared chain provider both paths fetch.
+//
+// FAIL-CLOSED: if either route is unreachable the liveness verdict is UNKNOWN and
+// every zero below stays ungraded. An unreadable control must never resolve to
+// the benign branch.
+const softFetch = async (path) => {
+  try { return await j(`${HOST}${path}`); } catch (e) { return { __err: e.message }; }
+};
+const [pipe, rvs] = await Promise.all([
+  softFetch('/api/health/options-pipeline'),
+  softFetch('/api/health/rv-scan'),
+]);
+
+const serverNow = new Date(gates.time ?? Date.now());
+// RTH is 13:30–20:00Z (CLAUDE.md). Used only to place `now` in the session; the
+// server's `marketOpen` is authoritative for whether it is open RIGHT NOW.
+const openZ = new Date(`${etDay}T13:30:00Z`);
+const closeZ = new Date(`${etDay}T20:00:00Z`);
+const beforeOpen = serverNow < openZ;
+const afterClose = serverNow >= closeZ;
+const minsSinceOpen = Math.round((serverNow - openZ) / 60_000);
+
+// `engines` is the DEMO set (`demoEngineCount === engines.length`) — the absence
+// of a live-mode row here says nothing about live books. `marketOpen` is a
+// market-wide fact, so reading it off a demo engine is sound; reading anything
+// ELSE off this array is not.
+const engines = Array.isArray(pipe?.engines) ? pipe.engines : [];
+const openFlags = [...new Set(engines.map((e) => e.marketOpen))];
+const marketOpen = openFlags.length === 1 ? openFlags[0] : null;
+const blockedBy = [...new Set(engines.map((e) => e.blockedBy).filter(Boolean))];
+
+const rvPaths = Array.isArray(rvs?.paths) ? rvs.paths : [];
+const dirPath = rvPaths.find((p) => p.path === 'directional');
+const siblingScans = dirPath?.scanCountSinceBoot ?? null;
+const chainFetchOkAt = rvs?.dataSource?.lastFetchOkAt ?? null;
+// `scanCountSinceBoot` is SINCE BOOT, not per ET day (TRA-2945). It only covers
+// today's session while the process booted BEFORE the open; a mid-session restart
+// resets it to 0 and would forge state (c) out of a perfectly healthy session.
+const bootMs = Date.parse(ver.startedAt);
+const bootBeforeOpen = Number.isFinite(bootMs) && bootMs < openZ.getTime();
+
+console.log('LIVENESS');
+console.log(`  server now ${serverNow.toISOString()}  (open ${openZ.toISOString()}, ${minsSinceOpen >= 0 ? `T+${minsSinceOpen}` : `T${minsSinceOpen}`} min)`);
+console.log(`  marketOpen ${JSON.stringify(marketOpen)}${blockedBy.length ? `  blockedBy ${JSON.stringify(blockedBy)}` : ''}${pipe?.__err ? `  ⛔ options-pipeline: ${pipe.__err}` : ''}`);
+console.log(`  sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}  lastScanAt ${JSON.stringify(dirPath?.lastScanAt ?? null)}  chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}${rvs?.__err ? `  ⛔ rv-scan: ${rvs.__err}` : ''}`);
+console.log(`  boot ${ver.startedAt} — ${bootBeforeOpen ? 'BEFORE the open, since-boot counters cover the session' : '⛔ AT/AFTER the open: since-boot counters were RESET mid-session, the sibling control is VOID'}`);
+console.log(`  live universe (${gates.arm?.universe?.symbols?.length ?? '?'} names) ${JSON.stringify(gates.arm?.universe?.symbols ?? null)}  restricted ${gates.arm?.universe?.restricted}`);
+
+const engineTicked = (siblingScans ?? 0) > 0 || Boolean(chainFetchOkAt);
+const controlsReadable = !pipe?.__err && !rvs?.__err && marketOpen !== null;
+
+// The adjudicated meaning of a cost_bar zero. Consumed by C2/C3/C4/C7 in place of
+// the old bare `evaluated > 0`.
+let ZERO_STATE;
+if (HAVE_VERDICTS) ZERO_STATE = { kind: 'GRADEABLE', why: `cost_bar evaluated ${cb.evaluated} on ${etDay}` };
+else if (!controlsReadable) ZERO_STATE = { kind: 'BLIND', why: `cost_bar evaluated 0 and the liveness controls are unreadable (marketOpen ${JSON.stringify(marketOpen)}${pipe?.__err ? `, pipeline ${pipe.__err}` : ''}${rvs?.__err ? `, rv-scan ${rvs.__err}` : ''}) — this zero CANNOT be attributed` };
+else if (marketOpen === false && beforeOpen) ZERO_STATE = { kind: 'PRE-OPEN', why: `market not yet open (T${minsSinceOpen} min) — a zero here is expected and is NOT a negative` };
+else if (marketOpen === false && !afterClose) ZERO_STATE = { kind: 'NO-SESSION', why: `it is T+${minsSinceOpen} min past the nominal open yet the server reports marketOpen=false${blockedBy.length ? ` (blockedBy ${blockedBy.join('/')})` : ''} — holiday/half-day/halt. Benign, but it means TODAY CANNOT GRADE THIS; do not re-arm anything on the strength of it` };
+else if (!bootBeforeOpen) ZERO_STATE = { kind: 'BLIND', why: `the process booted ${ver.startedAt}, AT OR AFTER the open — since-boot scan counters were reset mid-session, so 'the engine never ticked' is unprovable. Re-read after the next clean session` };
+else if (!engineTicked) ZERO_STATE = { kind: 'ENGINE-SILENT', why: `session ${afterClose ? 'has CLOSED' : `live (T+${minsSinceOpen} min)`} and NOTHING scanned: sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}. The engine did not run — this is a DEFECT, not a nominator result, and must NOT be reported as 'the band was empty'` };
+else ZERO_STATE = { kind: 'STARVED-UPSTREAM', why: `session ${afterClose ? 'closed' : `live (T+${minsSinceOpen} min)`}, the engine DID tick (directional scansSinceBoot ${siblingScans}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}) yet cost_bar recorded nothing. Every gate sits downstream of signal-engine.ts:9900, so the candidates died at 'result.reason !== ok || candidates.length === 0' — UPSTREAM of the nominator. A REAL negative, attributable to the scanner, NOT to the band` };
+
+console.log(`  ⇒ ZERO-STATE: ${ZERO_STATE.kind} — ${ZERO_STATE.why}\n`);
+const GRADEABLE = ZERO_STATE.kind === 'GRADEABLE';
+
+// How a non-gradeable zero scores. The three states are NOT interchangeable and
+// none of them may quietly become "PASS".
+const ZERO_VERDICT = {
+  'PRE-OPEN': 'UNGRADEABLE',
+  'NO-SESSION': 'UNGRADEABLE',
+  BLIND: 'BLIND',
+  'ENGINE-SILENT': 'DEFECT',
+  'STARVED-UPSTREAM': 'REAL-NEGATIVE',
+}[ZERO_STATE.kind] ?? 'BLIND';
 
 // ── C2 — the nominator is biting ────────────────────────────────────────────
 // It is a SELECTOR: it records NO gate verdict and can never appear in byGate's
@@ -124,7 +238,7 @@ const GRADEABLE = cb.evaluated > 0;
 const bySel = Object.fromEntries((cb.bySelection ?? []).map((s) => [s.selection ?? s.key, s]));
 const selKeys = Object.keys(bySel);
 if (!GRADEABLE) {
-  record('C2 nominator', 'UNGRADEABLE', `cost_bar evaluated 0 on ${etDay} — no scan has run; pre-open, NOT a negative`);
+  record('C2 nominator', ZERO_VERDICT, `${ZERO_STATE.kind} — ${ZERO_STATE.why}`);
 } else if (selKeys.length === 0) {
   record('C2 nominator', 'UNKNOWN', `evaluated ${cb.evaluated} but bySelection is EMPTY — no row carried a nominator; cross-read the log line before calling this either way`);
 } else if (bySel.in_band) {
@@ -142,7 +256,7 @@ const cells = Object.fromEntries((cb.byCell ?? []).map((c) => [c.cell, c]));
 const otm = cells[CELL];
 const reasons = Object.fromEntries((cb.byReason ?? []).map((r) => [r.reasonCode, r]));
 if (!GRADEABLE) {
-  record('C3 verdict', 'UNGRADEABLE', `cost_bar evaluated 0 on ${etDay} — nothing to grade; byCell [] here is the PRE-OPEN zero, not a FAIL`);
+  record('C3 verdict', ZERO_VERDICT, `${ZERO_STATE.kind} — byCell [] is this zero, and it is ${ZERO_STATE.kind === 'PRE-OPEN' || ZERO_STATE.kind === 'NO-SESSION' ? 'benign' : 'NOT benign'}: ${ZERO_STATE.why}`);
 } else if (otm) {
   const admits = (otm.evaluated ?? 0) - (otm.blocked ?? 0);
   record('C3 verdict', admits > 0 ? 'PASS' : 'REAL-NEGATIVE',
@@ -185,7 +299,7 @@ console.log(`  byReason: ${(cb.byReason ?? []).map((r) => `${r.reasonCode} ${r.b
 // says "traded".
 const WANT_BOOKS = ['admin', 'v0nni'];
 if (!GRADEABLE) {
-  record('C4 fills', 'UNGRADEABLE', 'no cost_bar verdicts today — a book cannot have filled under a gate that never ran');
+  record('C4 fills', ZERO_VERDICT, `no cost_bar verdict on any book today — a book cannot have filled under a gate that recorded nothing. ${ZERO_STATE.kind}: ${ZERO_STATE.why}`);
 } else {
   const per = WANT_BOOKS.map((name) => {
     const b = books.find((x) => x.book === name);
@@ -287,9 +401,66 @@ if (!WANT_LOGS) {
     const c4v = c4.filter((l) => (l.message ?? '').includes('zzz-tra3417-never-emitted')).length;
     console.log(`  CONTROL 4 (comma-OR)        : served ${c4.length}, verified ${c4v} — comma splitting ${c4.length > 0 && c4v === 0 ? 'CONFIRMED (and neutralised)' : 'NOT as measured — treat every log read below as VOID'}`);
 
+    // ── C2b — the nominator's OWN evidence, SCORED ──────────────────────────
+    //
+    // Criterion 2 was pre-registered against THIS log line (`selection` and
+    // `cheapInBand`), not against `bySelection`. The first draft printed the
+    // lines and graded C2 off the ledger anyway, so the empty-`bySelection`
+    // branch punted to "cross-read the log line by hand" — which is the exact
+    // hand-read this grader exists to remove. Score it.
+    //
+    // The logger emits ONE JSON OBJECT PER LINE with the fields spread at top
+    // level (observability/logger.ts:118 `JSON.stringify(record)`), so parse it
+    // rather than regex it. A line that will not parse is NOT scored as absent —
+    // it is counted and reported, because "unparseable" and "not emitted" are
+    // different states and only one of them is a negative result.
     const nom = await pull('OTM strike nomination (TRA-3401)');
     console.log(`  nomination lines            : served ${nom.served}, verified ${nom.verified}`);
     for (const l of nom.lines.slice(0, 6)) console.log(`    ${(l.timestamp ?? '')} ${(l.message ?? '').slice(0, 260)}`);
+
+    const parsed = [];
+    let unparseable = 0;
+    for (const l of nom.lines) {
+      const m = typeof l.message === 'string' ? l.message.slice(l.message.indexOf('{')) : '';
+      try {
+        const r = JSON.parse(m);
+        if (r && typeof r === 'object' && typeof r.selection === 'string') parsed.push(r);
+        else unparseable += 1;
+      } catch { unparseable += 1; }
+    }
+    const selCount = {};
+    for (const r of parsed) selCount[r.selection] = (selCount[r.selection] ?? 0) + 1;
+    const inBand = parsed.filter((r) => r.selection === 'in_band');
+    const maxCheapInBand = parsed.reduce((n, r) => Math.max(n, Number(r.cheapInBand) || 0), 0);
+    const symsSeen = [...new Set(parsed.map((r) => r.sym).filter(Boolean))];
+    // `user` is stamped from the trace context, so the line carries the BOOK.
+    const booksSeen = [...new Set(parsed.map((r) => r.user).filter(Boolean))];
+    if (nom.verified > 0) {
+      console.log(`    parsed ${parsed.length}/${nom.verified} (unparseable ${unparseable})  selections ${JSON.stringify(selCount)}  maxCheapInBand ${maxCheapInBand}`);
+      console.log(`    symbols ${JSON.stringify(symsSeen)}  books ${JSON.stringify(booksSeen)}`);
+    }
+
+    if (nom.verified === 0) {
+      // The line is emitted on BOTH nominator branches and suppressed only when
+      // `selection === 'legacy'` (signal-engine.ts:9940) — i.e. only when the
+      // selector is disarmed. C1 says it is ARMED, so zero lines cannot mean
+      // "armed but quiet": it means no symbol ever reached the nominator, which
+      // is the :9900 starve. Attribute it to the SCANNER, never to the band.
+      record('C2b nomination log', ZERO_STATE.kind === 'PRE-OPEN' || ZERO_STATE.kind === 'NO-SESSION' ? 'UNGRADEABLE' : ZERO_VERDICT,
+        `ZERO nomination lines this boot while C1 reads ARMED. The line is suppressed only for selection==='legacy' (disarmed), so this is not a quiet nominator — no candidate ever reached it. ${ZERO_STATE.kind}: ${ZERO_STATE.why}`);
+    } else if (parsed.length === 0) {
+      record('C2b nomination log', 'BLIND',
+        `${nom.verified} nomination line(s) but NONE parsed as JSON — the log shape moved; the selection axis is unreadable, do not score C2 either way`);
+    } else if (inBand.length > 0) {
+      record('C2b nomination log', 'PASS',
+        `selection 'in_band' on ${inBand.length}/${parsed.length} nomination(s), maxCheapInBand ${maxCheapInBand}, symbols ${JSON.stringify([...new Set(inBand.map((r) => r.sym))])} — THE NOMINATOR BIT${unparseable ? ` (⚠ ${unparseable} line(s) unparseable, count is a FLOOR)` : ''}`);
+    } else if (Object.keys(selCount).length === 1 && selCount.fallback_top_mispricing) {
+      record('C2b nomination log', 'REAL-NEGATIVE',
+        `${parsed.length} nomination(s), ALL 'fallback_top_mispricing', maxCheapInBand ${maxCheapInBand} across ${symsSeen.length} symbol(s) ${JSON.stringify(symsSeen)} — the scanner DID produce candidates and NONE fell in [0.50,0.55). A genuine empty-band negative, denominated on the symbols that actually produced a chain, NOT on the ${gates.arm?.universe?.symbols?.length ?? '?'}-name universe`);
+    } else {
+      record('C2b nomination log', 'REVIEW',
+        `selection split ${JSON.stringify(selCount)} with no in_band — read by hand`);
+    }
 
     // C7 — at $150/1 contract the bounded-test sizer SKIPS names whose premium
     // is over cap, so those names never reach the expected path at all. Grade
@@ -315,7 +486,7 @@ if (!WANT_LOGS) {
     }
 
     if (!GRADEABLE) {
-      record('C7 over-cap', 'UNGRADEABLE', 'pre-open — the sizer has not run');
+      record('C7 over-cap', ZERO_VERDICT, `the sizer recorded no gate verdict — ${ZERO_STATE.kind}: ${ZERO_STATE.why}`);
     } else {
       const capN = outcomes['over cap (per-book)'] + outcomes['over AGGREGATE cap'];
       record('C7 over-cap', capN > 0 ? 'OBSERVED' : 'NOT-OBSERVED',
@@ -331,6 +502,13 @@ console.log('\n──────── DISPOSITION ────────');
 for (const r of results) console.log(`  ${r.verdict.padEnd(13)} ${r.id}`);
 const anyFail = results.some((r) => r.verdict === 'FAIL' || r.verdict === 'DEFECT');
 const anyUngradeable = results.some((r) => ['UNGRADEABLE', 'UNKNOWN', 'BLIND', 'REVIEW'].includes(r.verdict));
+// ⛔ REAL-NEGATIVE and HONEST-ZERO used to fall through to exit 0 — so "the band
+// was empty on every name all session" would have printed `⇒ PASS` and exited
+// GREEN. A negative result is not a pass. It gets its own code so the wake that
+// reads this can tell "the nominator traded" from "the nominator correctly did
+// nothing", which is precisely the distinction criterion 4 was written to force
+// ("do NOT report 'armed' as if it were 'traded'").
+const anyNegative = results.some((r) => ['REAL-NEGATIVE', 'HONEST-ZERO', 'NOT-OBSERVED'].includes(r.verdict));
 if (anyFail) {
   console.log('  ⇒ FAIL — a criterion produced a negative or the instrument is defective.');
   process.exit(2);
@@ -338,6 +516,12 @@ if (anyFail) {
 if (anyUngradeable) {
   console.log('  ⇒ UNGRADEABLE — fail-closed. Do NOT publish this as a pass or a fail.');
   process.exit(3);
+}
+if (anyNegative) {
+  console.log('  ⇒ REAL NEGATIVE — the instruments worked and the answer is NO TRADE.');
+  console.log('    Report it as a negative result with its attribution. This is NOT a pass');
+  console.log('    and NOT a defect; do not re-arm or re-grade on the strength of it.');
+  process.exit(4);
 }
 console.log('  ⇒ PASS');
 process.exit(0);
