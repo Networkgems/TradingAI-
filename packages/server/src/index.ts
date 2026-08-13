@@ -655,6 +655,9 @@ import {
   type PersistAxis,
   type PersistRowInput,
 } from './snapshot-persist-health.js';
+// TRA-3432 — the crypto axis of the TRA-3407 verdict is only interpretable
+// alongside the master kill switch that decides whether its engine ticks at all.
+import { isCryptoEngineEnabled, CRYPTO_ENGINE_FLAG } from './crypto-engine-flag.js';
 import {
   buildExport,
   toCsv,
@@ -7168,6 +7171,15 @@ app.get('/api/health/snapshot-persist', async (_req, res) => {
         consecutiveFailures: rec?.consecutiveFailures ?? 0,
         fileMtimeMs,
         lastSuccessAt: rec?.lastSuccessAt ?? null,
+        // TRA-3432 — label an IDLE crypto row with WHY it is quiet. The crypto
+        // engine is master-killed by default (TRA-1580), so `start()` never arms
+        // the 60s interval, `doTick` never runs, and the `onTick` handler that
+        // carries BOTH `recordPersistTick` and `scheduleCryptoPersist` is never
+        // invoked. Without this label, 64 crypto rows reading IDLE/`no-tick-observed`
+        // are indistinguishable from 64 books whose writers just died — and a
+        // reader would be entitled to mistake the column for coverage.
+        // Reason-only; see `engineEnabled` in snapshot-persist-health.ts.
+        engineEnabled: axis === 'crypto' ? isCryptoEngineEnabled() : true,
       });
     }
   }
@@ -7186,6 +7198,25 @@ app.get('/api/health/snapshot-persist', async (_req, res) => {
     // visible rather than being read as a clean one (the TRA-2630 lesson).
     contextCount: contexts.length,
     rowCount: rows.length,
+    // TRA-3432 — WHY the crypto column reads the way it does, published as a
+    // boolean a probe can branch on rather than as prose in a ticket.
+    //
+    // When this is `false`, every crypto row is IDLE `engine-disabled` and the
+    // crypto axis is STRUCTURALLY UNGRADEABLE on this host: `start()` never arms
+    // the tick interval, so the hook carrying `scheduleCryptoPersist` never runs
+    // and each `trades-crypto.json` stays at whatever the boot-time
+    // `persistCryptoNow` wrote. That is the CORRECT grade for a parked engine —
+    // a dark book cannot lose state it is not changing — but the crypto IDLE
+    // column must NOT be read as coverage of the crypto writer. It has never
+    // been exercised past boot.
+    cryptoAxis: {
+      engineFlag: CRYPTO_ENGINE_FLAG,
+      engineEnabled: isCryptoEngineEnabled(),
+      gradeable: isCryptoEngineEnabled(),
+      note: isCryptoEngineEnabled()
+        ? 'crypto engine is ticking; crypto rows are graded like stocks rows'
+        : `crypto engine is dark (${CRYPTO_ENGINE_FLAG} off, TRA-1580) — crypto rows grade IDLE/engine-disabled and are NOT coverage of the crypto writer (TRA-3432)`,
+    },
     policy: {
       stalenessTicks: STALENESS_TICKS,
       livenessTicks: LIVENESS_TICKS,

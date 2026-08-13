@@ -421,6 +421,134 @@ describe('TRA-3407 tri-state, fail closed', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3432 — the crypto axis of this instrument graded 64/64 IDLE on its first
+// live read of bqb1, because the crypto engine is master-killed by default
+// (TRA-1580): `start()` never arms the tick interval, so the `onTick` handler
+// carrying `scheduleCryptoPersist` is never invoked and every `trades-crypto.json`
+// keeps the bytes the boot-time `persistCryptoNow` wrote.
+//
+// IDLE is the CORRECT grade for that — a parked engine cannot lose state it is
+// not changing — but 64 IDLE rows reading `no-tick-observed` are indistinguishable
+// from 64 books whose writers just died. `engineEnabled` labels the difference.
+//
+// The whole risk of adding a label to a grader is that the label starts DECIDING.
+// These tests pin that it cannot.
+describe('TRA-3432 engine-disabled is a LABEL, not an operand', () => {
+  it('refines the reason on an already-IDLE row without moving the verdict', () => {
+    const base = liveRow({
+      axis: 'crypto',
+      lastTickAt: null,
+      fileMtimeMs: NOW - 86_400_000,
+    });
+
+    // Two rows differing in exactly ONE cell. The verdict must be identical in
+    // both, which makes "the label cannot move the verdict" a theorem about this
+    // pair rather than an observation about one of them.
+    const unlabelled = gradePersistRow(base, NOW);
+    const disabled = gradePersistRow({ ...base, engineEnabled: false }, NOW);
+
+    expect(unlabelled.verdict).toBe('IDLE');
+    expect(disabled.verdict).toBe('IDLE');
+    expect(disabled.verdict).toBe(unlabelled.verdict);
+
+    // ...and the ONLY thing that changed is the reason.
+    expect(unlabelled.reason).toBe('no-tick-observed');
+    expect(disabled.reason).toBe('engine-disabled');
+    expect({ ...disabled, reason: unlabelled.reason }).toEqual(unlabelled);
+  });
+
+  it('⛔ CANNOT suppress a red: a LIVE failing writer stays STALE even with the flag off', () => {
+    // The failure mode that would make this label dangerous. If a flag ever read
+    // `false` while the engine was in fact ticking, checking it BEFORE the
+    // liveness qualifier would convert a genuinely failing writer into a
+    // plausible-looking IDLE — trading a visible red for a silent one, which is
+    // precisely the defect class this whole instrument exists to catch.
+    const failingButFlaggedOff = gradePersistRow(
+      liveRow({
+        axis: 'crypto',
+        lastTickAt: new Date(NOW - 1_000).toISOString(), // LIVE — ticking right now
+        consecutiveFailures: 4,
+        engineEnabled: false,
+      }),
+      NOW,
+    );
+    expect(failingButFlaggedOff.verdict).toBe('STALE');
+    expect(failingButFlaggedOff.reason).toBe('persist-failing');
+    expect(foldPersistVerdict([failingButFlaggedOff]).stale).toBe(true);
+
+    // Same, via the on-disk operand rather than the counter.
+    const staleFileFlaggedOff = gradePersistRow(
+      liveRow({
+        axis: 'crypto',
+        lastTickAt: new Date(NOW - 1_000).toISOString(),
+        fileMtimeMs: NOW - 86_400_000,
+        engineEnabled: false,
+      }),
+      NOW,
+    );
+    expect(staleFileFlaggedOff.verdict).toBe('STALE');
+    expect(staleFileFlaggedOff.reason).toBe('file-age');
+
+    // And it cannot manufacture a GREEN either.
+    const healthyFlaggedOff = gradePersistRow(
+      liveRow({ axis: 'crypto', engineEnabled: false }),
+      NOW,
+    );
+    expect(healthyFlaggedOff.verdict).toBe('CURRENT');
+  });
+
+  it('an engine-disabled row is still excluded from the denominator, never STALE', () => {
+    // The property TRA-3407's negative control pins, restated for the labelled
+    // row: loosening the qualifier so a dark box grades STALE is the failure mode
+    // the qualifier exists to prevent. 64 dark crypto books must not turn the
+    // fleet verdict red.
+    const dark = Array.from({ length: 64 }, (_, i) =>
+      gradePersistRow(
+        liveRow({
+          username: `book${i}`,
+          axis: 'crypto',
+          lastTickAt: null,
+          fileMtimeMs: NOW - 86_400_000, // WAY past the 600s crypto budget
+          engineEnabled: false,
+        }),
+        NOW,
+      ),
+    );
+    expect(dark.every(r => r.verdict === 'IDLE')).toBe(true);
+    expect(dark.every(r => r.reason === 'engine-disabled')).toBe(true);
+
+    const fold = foldPersistVerdict(dark);
+    expect(fold.idleRowCount).toBe(64);
+    expect(fold.gradedRowCount).toBe(0);
+    expect(fold.staleRowCount).toBe(0);
+    // Nothing gradeable ⇒ NOT MEASURED. ⛔ Never read this null as a pass.
+    expect(fold.stale).toBeNull();
+  });
+
+  it('omitting the label is treated as ENABLED — a forgetful caller loses legibility, not safety', () => {
+    const row = liveRow({ axis: 'crypto', lastTickAt: null });
+    expect(row.engineEnabled).toBeUndefined();
+    expect(gradePersistRow(row, NOW).reason).toBe('no-tick-observed');
+    // `true` and omitted must agree.
+    expect(gradePersistRow({ ...row, engineEnabled: true }, NOW).reason).toBe('no-tick-observed');
+  });
+
+  it('the flag is read from the ENV the engine itself consults, and is OFF by default', async () => {
+    // Grading the crypto column off a hand-written boolean would let the route
+    // and the engine disagree about whether crypto is dark. Same function, same
+    // env key, so they cannot.
+    const { isCryptoEngineEnabled, CRYPTO_ENGINE_FLAG } = await import('./crypto-engine-flag.js');
+    expect(CRYPTO_ENGINE_FLAG).toBe('CRYPTO_ENGINE_ENABLED');
+    // Compiled default = OFF (TRA-1580), which is why bqb1 reads 64/64 IDLE with
+    // no such key set in Render's env at all.
+    expect(isCryptoEngineEnabled({})).toBe(false);
+    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: '1' })).toBe(true);
+    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: 'true' })).toBe(true);
+    expect(isCryptoEngineEnabled({ CRYPTO_ENGINE_ENABLED: '0' })).toBe(false);
+  });
+});
+
 afterEach(() => {
   vi.clearAllMocks();
 });

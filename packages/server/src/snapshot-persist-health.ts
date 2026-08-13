@@ -130,6 +130,11 @@ export type PersistRowReason =
   | 'file-age'
   | 'file-unreadable'
   | 'no-tick-observed'
+  // TRA-3432 — an IDLE row whose engine is switched OFF at the flag. Strictly a
+  // REFINEMENT of `no-tick-observed`: same IDLE verdict, same exclusion from the
+  // denominator, but it names a DELIBERATE dark engine rather than leaving the
+  // reader to guess whether a writer died. See `engineEnabled` below.
+  | 'engine-disabled'
   | 'fresh';
 
 export interface PersistRowInput {
@@ -145,6 +150,21 @@ export interface PersistRowInput {
   fileMtimeMs: number | null;
   /** Published for context; NOT an operand. See the header note on independence. */
   lastSuccessAt?: string | null;
+  /**
+   * TRA-3432 — is the engine that drives this axis switched ON at all?
+   * `false` ⇔ a master kill (crypto's TRA-1580 `CRYPTO_ENGINE_ENABLED`, off by
+   * compiled default) means `start()` never arms the tick interval, so the tick
+   * hook — and therefore the persist scheduler wired to it — can never fire.
+   *
+   * This is a LABEL, NOT AN OPERAND. It only refines the reason on a row that
+   * ALREADY grades IDLE on the liveness qualifier; it can never turn a red row
+   * green. That ordering is deliberate: were it checked first, a flag that read
+   * `false` while the engine was in fact ticking would mask a genuinely failing
+   * writer — swapping a visible red for a plausible-looking IDLE, which is the
+   * exact class of defect this instrument exists to catch. Omitted ⇒ treated as
+   * enabled, so a caller that forgets to pass it loses legibility, not safety.
+   */
+  engineEnabled?: boolean;
 }
 
 export interface PersistRowGrade {
@@ -206,8 +226,19 @@ export function gradePersistRow(row: PersistRowInput, nowMs: number): PersistRow
   // LIVENESS QUALIFIER. A box nobody is ticking has no writer to accuse. This
   // is checked FIRST and off the tick hook, which is upstream of — and blind to
   // — whether the write itself landed.
+  //
+  // TRA-3432 — the reason (never the verdict) distinguishes the two ways a row
+  // can be quiet: an engine deliberately switched off at the flag, versus a
+  // ticking engine that simply has not ticked yet. `engineEnabled` is consulted
+  // only INSIDE this already-IDLE branch, so it cannot suppress a red.
   const live = tickMsAt !== null && nowMs - tickMsAt <= livenessMs;
-  if (!live) return { ...base, verdict: 'IDLE', reason: 'no-tick-observed' };
+  if (!live) {
+    return {
+      ...base,
+      verdict: 'IDLE',
+      reason: row.engineEnabled === false ? 'engine-disabled' : 'no-tick-observed',
+    };
+  }
 
   // OPERAND 2, alone. The writer is throwing right now.
   if (row.consecutiveFailures > 0) return { ...base, verdict: 'STALE', reason: 'persist-failing' };
