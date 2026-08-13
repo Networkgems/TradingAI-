@@ -14,6 +14,7 @@ import {
   backfillLiveOptionFeesFromGainLoss,
   lastRecordedOpenSleeve,
   diffMissingFillsFromHistory,
+  repriceImportedFillsFromHistory,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
 import type { TradierTradeHistoryFill, TradierGainLossLot } from '@trading-app/engine';
@@ -784,10 +785,13 @@ describe('diffMissingFillsFromHistory (TRA-2959)', () => {
     };
   }
 
-  it('a partial shortfall imports only the uncovered contracts, from the LAST executions', () => {
-    // Broker: two executions 3 + 2 = 5 contracts sold. Ledger recorded only 3.
+  it('a partial shortfall imports only the uncovered contracts, at the UNCOVERED execution price', () => {
+    // Broker: two executions 3 + 2 = 5 contracts sold, at DIFFERENT prices.
+    // Ledger recorded only the 3 @ 0.26 — so the missing 2 are the 0.28 leg, and
+    // that is DERIVED by cancellation, not guessed off whichever execution the
+    // shortfall walk lands on (TRA-3563).
     const { inputs, coverage } = diffMissingFillsFromHistory(
-      [rec({ side: 'sell_to_close', contracts: 3, etDay: '2026-08-04' })],
+      [rec({ side: 'sell_to_close', contracts: 3, etDay: '2026-08-04', filledPrice: 0.26 })],
       [
         hist({ description: 'CALL TSLA   09/11/26   560', amount: 80, quantity: 3, price: 0.26, transactionId: 'a' }),
         hist({ description: 'CALL TSLA   09/11/26   560', amount: 55, quantity: 2, price: 0.28, transactionId: 'b' }),
@@ -799,8 +803,95 @@ describe('diffMissingFillsFromHistory (TRA-2959)', () => {
     expect(coverage.missingContracts).toBe(2);
     expect(inputs).toHaveLength(1);
     expect(inputs[0]!.contracts).toBe(2);
-    expect(inputs[0]!.filledPrice).toBeCloseTo(0.28, 6); // the later execution
+    expect(inputs[0]!.filledPrice).toBeCloseTo(0.28, 6);
     expect(inputs[0]!.origin).toBe('history_import');
+    // The invariant that matters: ledger gross now equals the broker's.
+    expect(0.26 * 100 * 3 + inputs[0]!.filledPrice! * 100 * inputs[0]!.contracts).toBeCloseTo(
+      0.26 * 100 * 3 + 0.28 * 100 * 2,
+      6,
+    );
+  });
+
+  // ── TRA-3563: the imported row must never borrow a SIBLING's price ──────────
+
+  it('POSITIVE CONTROL: a group filled at TWO prices, ledger holds ONE — the import does NOT inherit the recorded price', () => {
+    // The live 2026-08-04 shape: the engine's order filled 4 @ 0.58 and was
+    // recorded; a silent 1-contract fill at 0.53 was not. The old attribution
+    // walked the executions in transactionId order, landed on the 4-contract
+    // leg and minted the missing contract at 0.58 — contract totals reconciled
+    // (5 == 5, `missingContracts: 0`) while the ledger gross overstated the
+    // broker by $5.00 and the gainloss join derived a fee of -4.47.
+    const { inputs, coverage } = diffMissingFillsFromHistory(
+      [rec({ optionSymbol: 'QQQ260911P00545000', contracts: 4, filledPrice: 0.58 })],
+      [
+        hist({ symbol: 'QQQ260911P00545000', description: 'PUT QQQ   09/11/26   545',
+          amount: -232.42, quantity: 4, price: 0.58, transactionId: 't9' }),
+        hist({ symbol: 'QQQ260911P00545000', description: 'PUT QQQ   09/11/26   545',
+          amount: -53.11, quantity: 1, price: 0.53, transactionId: 't2' }),
+      ],
+      '2026-08-05',
+    );
+    expect(coverage.missingContracts).toBe(1);
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.contracts).toBe(1);
+    // THE ASSERTION: not 0.58. The recorded row's price is not evidence about
+    // the unrecorded fill, and `transactionId` order would have picked it.
+    expect(inputs[0]!.filledPrice).not.toBeCloseTo(0.58, 6);
+    expect(inputs[0]!.filledPrice).toBeCloseTo(0.53, 6);
+    // Gross now matches the broker: 0.58*400 + 0.53*100 = 285.00 against a lot
+    // basis of 285.53 ⇒ a derived fee of +0.53, not −4.47.
+    expect(0.58 * 100 * 4 + inputs[0]!.filledPrice! * 100 * 1).toBeCloseTo(285, 6);
+  });
+
+  it('an undeterminable attribution writes filledPrice null, never a sibling price', () => {
+    // The ledger row is priced at something NO execution filled at (0.27 against
+    // 0.26/0.28), so the cancellation leaves a remainder and no execution can be
+    // claimed as the uncovered one. `null` is honest-unmeasured — the gainloss
+    // join names it 'priceless-row' instead of deriving a silent negative fee.
+    const { inputs } = diffMissingFillsFromHistory(
+      [rec({ side: 'sell_to_close', contracts: 3, filledPrice: 0.27 })],
+      [
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 80, quantity: 3, price: 0.26, transactionId: 'a' }),
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 55, quantity: 2, price: 0.28, transactionId: 'b' }),
+      ],
+      '2026-08-05',
+    );
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.contracts).toBe(2);
+    expect(inputs[0]!.filledPrice).toBeNull();
+  });
+
+  it('a group whose executions all filled at ONE price still prices the import (nothing to choose between)', () => {
+    // No cancellation is needed when there is only one candidate price — and an
+    // unpriced ledger row must not downgrade it to null.
+    const { inputs } = diffMissingFillsFromHistory(
+      [rec({ side: 'sell_to_close', contracts: 3, filledPrice: null })],
+      [
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 80, quantity: 3, price: 0.26, transactionId: 'a' }),
+        hist({ description: 'CALL TSLA   09/11/26   560', amount: 55, quantity: 2, price: 0.26, transactionId: 'b' }),
+      ],
+      '2026-08-05',
+    );
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.contracts).toBe(2);
+    expect(inputs[0]!.filledPrice).toBeCloseTo(0.26, 6);
+  });
+
+  it('a multi-price shortfall spanning executions imports ONE row PER execution price', () => {
+    // Ledger holds 1 of the 0.58 leg; the uncovered volume is 3 @ 0.58 + 1 @ 0.53
+    // and each gets its own row, so no row carries a price its contracts did not
+    // fill at (and the group gross is exact).
+    const { inputs } = diffMissingFillsFromHistory(
+      [rec({ optionSymbol: 'QQQ260911P00545000', contracts: 1, filledPrice: 0.58 })],
+      [
+        hist({ symbol: 'QQQ260911P00545000', description: 'PUT QQQ   09/11/26   545',
+          amount: -232.42, quantity: 4, price: 0.58, transactionId: 't9' }),
+        hist({ symbol: 'QQQ260911P00545000', description: 'PUT QQQ   09/11/26   545',
+          amount: -53.11, quantity: 1, price: 0.53, transactionId: 't2' }),
+      ],
+      '2026-08-05',
+    );
+    expect(inputs.map((i) => [i.contracts, i.filledPrice])).toEqual([[3, 0.58], [1, 0.53]]);
   });
 
   it('skips equity rows, unclassifiable sides, and ledger-only groups (pre-migration rows are not a gap)', () => {
@@ -838,5 +929,132 @@ describe('diffMissingFillsFromHistory (TRA-2959)', () => {
     expect(s.slippage.nMeasured).toBe(1);
     expect(s.slippage.excludedNoAskQuote).toBe(1);
     expect(s.slippage.nMeasured + s.slippage.excludedNoAskQuote).toBe(s.slippage.nTotal);
+  });
+});
+
+describe('repriceImportedFillsFromHistory (TRA-3563)', () => {
+  function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
+    return {
+      mode: 'live', ts: 1000, etDay: '2026-08-04', sleeve: 'single_leg_otm',
+      optionSymbol: 'QQQ260911P00545000', side: 'buy_to_open', contracts: 4,
+      submittedLimit: 0.58, askAtSubmit: 0.58, midAtSubmit: 0.555, filledPrice: 0.58,
+      fees: null, feeSource: null, slippageVsAsk: 0, slippageVsMid: 0.025,
+      orderId: 140028484, origin: 'fill',
+      ...over,
+    };
+  }
+  const imported = (over: Partial<LiveOptionFillRecord> = {}): LiveOptionFillRecord =>
+    rec({
+      ts: 900, contracts: 1, sleeve: 'unattributed', submittedLimit: null, askAtSubmit: null,
+      midAtSubmit: null, slippageVsAsk: null, slippageVsMid: null, orderId: null,
+      origin: 'history_import', ...over,
+    });
+  function hist(over: Partial<TradierTradeHistoryFill>): TradierTradeHistoryFill {
+    return {
+      date: '2026-08-04', symbol: 'QQQ260911P00545000', tradeType: 'option',
+      description: 'PUT QQQ   09/11/26   545', price: 0.58, quantity: 4,
+      amount: -232.42, commission: 0, transactionId: 't9', orderId: null,
+      ...over,
+    };
+  }
+  const executions = [hist({}), hist({ price: 0.53, quantity: 1, amount: -53.11, transactionId: 't2' })];
+
+  it('heals a row already minted at a sibling execution price (the live 2026-08-04 group)', () => {
+    const r = repriceImportedFillsFromHistory([imported({ filledPrice: 0.58 }), rec({})], executions);
+    expect(r.updated).toBe(1);
+    expect(r.repairs).toEqual([
+      { optionSymbol: 'QQQ260911P00545000', day: '2026-08-04', side: 'buy_to_open',
+        contracts: 1, from: 0.58, to: 0.53 },
+    ]);
+    expect(r.records.map((x) => x.filledPrice)).toEqual([0.53, 0.58]);
+    // The fix the ledger actually needed: gross 285.00 against a 285.53 basis.
+    const gross = r.records.reduce((s, x) => s + x.filledPrice! * 100 * x.contracts, 0);
+    expect(gross).toBeCloseTo(285, 6);
+    // Idempotent — the repaired prices now cancel, so a second pass is a no-op.
+    const again = repriceImportedFillsFromHistory(r.records, executions);
+    expect(again.updated).toBe(0);
+    expect(again.repairs).toEqual([]);
+  });
+
+  it('the end-to-end grade: the negative-fee rejection clears and both rows measure', () => {
+    const lots: TradierGainLossLot[] = [
+      { symbol: 'QQQ260911P00545000', quantity: 4, cost: 232.42, proceeds: 174.76,
+        gainLoss: -57.66, openDate: '2026-08-04', closeDate: '2026-08-05' },
+      { symbol: 'QQQ260911P00545000', quantity: 1, cost: 53.11, proceeds: 43.69,
+        gainLoss: -9.42, openDate: '2026-08-04', closeDate: '2026-08-05' },
+    ];
+    const before = reconcileLedgerFeesFromGainLoss([imported({ filledPrice: 0.58 }), rec({})], lots);
+    expect(before.updated).toBe(0);
+    const openLeg = before.rejections.find((x) => x.side === 'buy_to_open');
+    expect(openLeg?.reason).toBe('negative-fee');
+    expect(openLeg?.observed).toBeCloseTo(-4.47, 6);
+
+    const repaired = repriceImportedFillsFromHistory([imported({ filledPrice: 0.58 }), rec({})], executions);
+    const after = reconcileLedgerFeesFromGainLoss(repaired.records, lots);
+    expect(after.rejections.filter((x) => x.side === 'buy_to_open')).toEqual([]);
+    expect(after.updated).toBe(2);
+    // Apportioned pro-rata, and it lands EXACTLY on the per-lot decomposition
+    // (232.42 − 232.00 = 0.42; 53.11 − 53.00 = 0.11).
+    expect(after.records.map((x) => x.fees)).toEqual([0.11, 0.42]);
+  });
+
+  it('a settled fee in the group is never re-priced underneath', () => {
+    // A measured row means the group already reconciled at these prices; moving
+    // one now would silently invalidate a written money number.
+    const r = repriceImportedFillsFromHistory(
+      [imported({ filledPrice: 0.58, fees: 0.11, feeSource: 'gainloss_derived' }), rec({})],
+      executions,
+    );
+    expect(r.updated).toBe(0);
+    expect(r.repairs).toEqual([]);
+  });
+
+  it('a `fill` row is input, never output — only imported rows move', () => {
+    // Both ledger rows are fill-origin and mis-priced against the broker; with no
+    // imported row in the group there is nothing this pass may touch.
+    const r = repriceImportedFillsFromHistory([rec({ contracts: 1, filledPrice: 0.58, ts: 900 }), rec({})], executions);
+    expect(r.updated).toBe(0);
+    expect(r.repairs).toEqual([]);
+  });
+
+  it('an uncovered group is left to the import pass (totals must match first)', () => {
+    const r = repriceImportedFillsFromHistory([imported({ filledPrice: 0.58 })], executions);
+    expect(r.updated).toBe(0);
+    expect(r.repairs).toEqual([]);
+  });
+
+  it('an undeterminable group still nulls a price NO execution filled at', () => {
+    // The trusted row is priced at 0.60, so the cancellation leaves a remainder
+    // and nothing is derivable. But the imported row's 0.575 matches no
+    // execution either — provably not the broker's number — so it is nulled
+    // (named 'priceless-row') rather than left reading as a measurement.
+    const r = repriceImportedFillsFromHistory(
+      [imported({ filledPrice: 0.575 }), rec({ filledPrice: 0.6 })],
+      executions,
+    );
+    expect(r.updated).toBe(1);
+    expect(r.repairs).toEqual([
+      { optionSymbol: 'QQQ260911P00545000', day: '2026-08-04', side: 'buy_to_open',
+        contracts: 1, from: 0.575, to: null },
+    ]);
+  });
+
+  it('an undeterminable group LEAVES a price some execution did fill at', () => {
+    // 0.58 is a real execution price here, so it may well be the right one —
+    // an undeterminable cancellation is not a licence to overwrite it. The
+    // group stays `negative-fee`: named, unmeasured, and honest.
+    const r = repriceImportedFillsFromHistory([imported({ filledPrice: 0.58 }), rec({ filledPrice: 0.6 })], executions);
+    expect(r.updated).toBe(0);
+    expect(r.repairs).toEqual([]);
+  });
+
+  it('a row straddling two execution prices goes null, never a blended price', () => {
+    const straddle = repriceImportedFillsFromHistory(
+      [imported({ contracts: 5, filledPrice: 0.58 })],
+      executions,
+    );
+    expect(straddle.updated).toBe(1);
+    expect(straddle.repairs[0]).toMatchObject({ from: 0.58, to: null });
+    expect(straddle.records[0]!.filledPrice).toBeNull();
   });
 });

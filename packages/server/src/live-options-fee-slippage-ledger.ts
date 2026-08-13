@@ -1019,6 +1019,28 @@ export function backfillLiveOptionFeesFromGainLoss(
 // repairs the group-total reconciliation that a MISSING row was breaking (a
 // gainloss group only derives fees when ledger qty == lot qty, so one silent
 // fill poisoned its whole symbol/day/side group).
+//
+// ── TRA-3563: WHICH history execution's price the imported row inherits ──────
+//
+// The original attribution copied `f.price` off whichever execution the
+// shortfall walk landed on (the LAST ones in `transactionId` order). When a
+// group's executions filled at DIFFERENT prices that is a GUESS, and on
+// 2026-08-04 it guessed wrong: `QQQ260911P00545000 buy_to_open` filled 4 @ 0.58
+// and 1 @ 0.53, the ledger held only the 4, and the minted 1-contract row was
+// written at 0.58. Contract TOTALS still reconciled (5 == 5) — which is all the
+// coverage cross-check grades, so `missingContracts: 0` read clean — while the
+// ledger gross overstated the broker by $5.00 and the gainloss join derived a
+// fee of -4.47 for six days. `filledPrice` on an imported row also feeds the
+// slippage and P&L reads, so a borrowed price is wrong in three places.
+//
+// The attribution below derives the price instead of guessing it: CANCEL the
+// contracts the ledger already holds against the executions that share their
+// price, and what remains IS the uncovered execution, at its own price. When
+// the cancellation does not come out exactly (a ledger row priced at something
+// no execution filled at), no attribution is determinable and the row is
+// written `filledPrice: null` — honest-unmeasured, which the gainloss join
+// names 'priceless-row' instead of silently deriving a negative fee. A wrong
+// price is worse than an absent one: absent is already handled.
 
 /** Coverage of broker history by the ledger, contract-denominated. */
 export interface LedgerCoverageResult {
@@ -1030,6 +1052,93 @@ export interface LedgerCoverageResult {
   missingContracts: number;
   /** Rows appended this pass to close the shortfall. */
   importedRows: number;
+}
+
+/** A price the ledger already holds, for the cancellation below. `null` = row carries no price. */
+interface CoveredContracts {
+  price: number | null;
+  contracts: number;
+}
+
+/**
+ * TRA-3563 — bucket a price so two equal prices from different JSON parses
+ * compare equal. Option prices carry at most 4 decimals (0.4575); 1e-6 is two
+ * orders finer than anything a broker quotes and coarse enough to absorb the
+ * float noise a round-trip through JSON cannot introduce but arithmetic can.
+ */
+function priceBucket(price: number): number {
+  return Math.round(price * 1e6);
+}
+
+/** A history execution's price, or null when the broker sent nothing usable. */
+function executionPrice(f: TradierTradeHistoryFill): number | null {
+  return typeof f.price === 'number' && Number.isFinite(f.price) && f.price > 0 ? f.price : null;
+}
+
+/**
+ * TRA-3563 — the shared attribution core (see the section header). Cancel the
+ * contracts the ledger already holds against the executions that filled at the
+ * SAME price; what survives is the uncovered volume, still carrying its own
+ * execution's price.
+ *
+ * `determinable` is the honesty flag: it is true only when EVERY covered
+ * contract found a same-priced execution to cancel against. A ledger row priced
+ * at something no execution filled at (or carrying no price at all) leaves a
+ * remainder, and then the residual below is arithmetic, not evidence — the
+ * caller must fall back rather than write a price it cannot source.
+ *
+ * PURE. `executions` is consumed in the order given, which is the order the
+ * residual is reported in.
+ */
+function attributeUncoveredExecutions(
+  executions: readonly TradierTradeHistoryFill[],
+  covered: readonly CoveredContracts[],
+): { residual: Array<{ fill: TradierTradeHistoryFill; qty: number }>; determinable: boolean } {
+  const remaining = new Map<number, number>();
+  let unpriced = 0;
+  for (const c of covered) {
+    if (!(c.contracts > 0)) continue;
+    if (c.price === null) {
+      unpriced += c.contracts;
+      continue;
+    }
+    const b = priceBucket(c.price);
+    remaining.set(b, (remaining.get(b) ?? 0) + c.contracts);
+  }
+  const residual: Array<{ fill: TradierTradeHistoryFill; qty: number }> = [];
+  for (const fill of executions) {
+    const price = executionPrice(fill);
+    let qty = fill.quantity;
+    if (price !== null) {
+      const b = priceBucket(price);
+      const take = Math.min(qty, remaining.get(b) ?? 0);
+      if (take > 0) {
+        remaining.set(b, (remaining.get(b) ?? 0) - take);
+        qty -= take;
+      }
+    }
+    if (qty > 0) residual.push({ fill, qty });
+  }
+  let leftover = unpriced;
+  for (const q of remaining.values()) leftover += q;
+  return { residual, determinable: leftover === 0 };
+}
+
+/**
+ * TRA-3563 — the ONE price every execution in the group filled at, or null when
+ * they differ (or any is unusable). A group whose executions all filled at the
+ * same price needs no cancellation: the shortfall's price is that price no
+ * matter which executions the ledger already covers.
+ */
+function soleExecutionPrice(executions: readonly TradierTradeHistoryFill[]): number | null {
+  let sole: number | null = null;
+  for (const f of executions) {
+    const price = executionPrice(f);
+    if (price === null) return null;
+    if (sole === null) sole = price;
+    else if (priceBucket(sole) !== priceBucket(price)) return null;
+  }
+  return sole;
 }
 
 /**
@@ -1062,13 +1171,20 @@ export function diffMissingFillsFromHistory(
 
   // Ledger contract totals for the SAME groups (only groups history knows about —
   // ledger-only rows, e.g. pre-account-migration fills, are not a coverage gap).
+  // TRA-3563 — the PRICES are carried alongside the totals: the shortfall's price
+  // is derived by cancelling these against the executions, not copied off one.
   let ledgerContracts = 0;
   const ledgerQtyByKey = new Map<string, number>();
+  const ledgerPricesByKey = new Map<string, CoveredContracts[]>();
   for (const r of records) {
     const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, 0);
     if (!histGroups.has(key)) continue;
     ledgerQtyByKey.set(key, (ledgerQtyByKey.get(key) ?? 0) + r.contracts);
     ledgerContracts += r.contracts;
+    const priced = ledgerPricesByKey.get(key);
+    const entry: CoveredContracts = { price: r.filledPrice, contracts: r.contracts };
+    if (priced) priced.push(entry);
+    else ledgerPricesByKey.set(key, [entry]);
   }
 
   const inputs: LiveOptionFillInput[] = [];
@@ -1081,11 +1197,30 @@ export function diffMissingFillsFromHistory(
     missingContracts += shortfall;
     // Attribute the shortfall to the LAST executions of the group (transactionId
     // order): the recorded rows were recorded as they filled, so the uncovered
-    // tail is the best deterministic guess — and for fee/coverage purposes only
-    // the contract totals and prices matter, not the pairing.
+    // tail is the best deterministic guess for WHICH contracts are missing — and
+    // for fee/coverage purposes only the contract totals matter, not the pairing.
     const ordered = [...g.fills].sort((a, b) =>
       a.transactionId < b.transactionId ? 1 : a.transactionId > b.transactionId ? -1 : 0,
     );
+    // TRA-3563 — the PRICE is a different question, and the guess above is not an
+    // answer to it. Cancel what the ledger holds against the same-priced
+    // executions; the residual is the uncovered volume at its OWN price. Use it
+    // only when the cancellation came out exactly AND accounts for the whole
+    // shortfall (the second test is arithmetically implied by the first — it is
+    // asserted anyway, because writing a price off a broken invariant is the
+    // defect this replaces).
+    const attributed = attributeUncoveredExecutions(ordered, ledgerPricesByKey.get(key) ?? []);
+    const attributedQty = attributed.residual.reduce((sum, r) => sum + r.qty, 0);
+    if (attributed.determinable && attributedQty === shortfall) {
+      for (const { fill, qty } of attributed.residual) {
+        inputs.push(importedInput(fill, day, qty, g.side, records));
+      }
+      continue;
+    }
+    // Not determinable. One case still is: every execution in the group filled at
+    // the SAME price, so there is nothing to choose between. Otherwise the price
+    // is unknown and says so — `null`, never a sibling's.
+    const sole = soleExecutionPrice(g.fills);
     for (const f of ordered) {
       if (shortfall <= 0) break;
       const qty = Math.min(shortfall, f.quantity);
@@ -1107,7 +1242,7 @@ export function diffMissingFillsFromHistory(
         submittedLimit: null,
         askAtSubmit: null,
         midAtSubmit: null,
-        filledPrice: typeof f.price === 'number' && Number.isFinite(f.price) && f.price > 0 ? f.price : null,
+        filledPrice: sole,
         fees: null,
         orderId: f.orderId ?? null,
         origin: 'history_import',
@@ -1117,6 +1252,35 @@ export function diffMissingFillsFromHistory(
   return {
     inputs,
     coverage: { brokerContracts, ledgerContracts, missingContracts, importedRows: inputs.length },
+  };
+}
+
+/** One imported row, priced from the execution it was actually attributed to (TRA-3563). */
+function importedInput(
+  f: TradierTradeHistoryFill,
+  day: string,
+  qty: number,
+  side: LiveFillSide,
+  records: readonly LiveOptionFillRecord[],
+): LiveOptionFillInput {
+  return {
+    // History carries only the ET calendar day; noon-ET-ish is honest enough
+    // for retention/ordering (17:00Z is 12:00/13:00 ET year-round).
+    ts: Date.parse(`${day}T17:00:00Z`),
+    etDay: day,
+    // A close inherits its sleeve from the ledger's own open row when one
+    // exists; anything else is honestly unattributed.
+    sleeve: side === 'sell_to_close' ? sleeveOfLastOpenIn(records, f.symbol) ?? 'unattributed' : 'unattributed',
+    optionSymbol: f.symbol,
+    side,
+    contracts: qty,
+    submittedLimit: null,
+    askAtSubmit: null,
+    midAtSubmit: null,
+    filledPrice: executionPrice(f),
+    fees: null,
+    orderId: f.orderId ?? null,
+    origin: 'history_import',
   };
 }
 
@@ -1150,6 +1314,203 @@ export function importMissingLiveOptionFills(
     });
   }
   return coverage;
+}
+
+/**
+ * TRA-3563 — one `history_import` row whose `filledPrice` this pass RE-DERIVED
+ * from the broker's own executions. A price rewrite inside the path that feeds
+ * fees, slippage and P&L must be VISIBLE, not merely correct (the TRA-3558
+ * lesson, one field over), so every repair is published on the health route.
+ *
+ * `to: null` is a repair too, and the intended one when the attribution is not
+ * determinable: it converts a silent wrong number into a named `priceless-row`.
+ */
+export interface ImportedPriceRepair {
+  optionSymbol: string;
+  day: string;
+  side: LiveFillSide;
+  contracts: number;
+  /** The price the row carried — a sibling execution's, under the old attribution. */
+  from: number | null;
+  /** The price the broker's executions actually support. `null` = honest-unmeasured. */
+  to: number | null;
+}
+
+/**
+ * TRA-3563 — PURE repair pass for rows ALREADY written with a borrowed price.
+ * Fixing the attribution forward does nothing for the rows the old one minted:
+ * the import is idempotent on contract TOTALS, so a wrong price never re-enters
+ * the diff and sits in the ledger forever (the live `QQQ260911P00545000`
+ * 2026-08-04 row: 0.58 borrowed off the 4-contract leg, broker filled it at
+ * 0.53, group fee derived -4.47 for six days).
+ *
+ * Deliberately narrow — this rewrites settled money numbers, so it only fires
+ * where the broker's own record decides the answer:
+ * - only `origin: 'history_import'` rows move. A `fill` row's price came from
+ *   the fill itself and is authoritative; it is INPUT here, never output.
+ * - the group must hold NO measured row. A derived fee was computed off these
+ *   prices; re-pricing underneath it would silently invalidate a settled number.
+ * - ledger and history contract totals for the group must match exactly. Below
+ *   that, the import pass has work to do first and its rows are the answer.
+ * - the cancellation must come out exactly ({@link attributeUncoveredExecutions}
+ *   `determinable`), and each row's contracts must land inside ONE price. A row
+ *   spanning two prices has no single execution price and is written `null` —
+ *   never a blended one no execution filled at.
+ *
+ * When the cancellation does NOT come out, a second arm still applies: a price
+ * that matches NO execution in the group is provably not the broker's, and is
+ * nulled. Everything else is left exactly as it is — an undeterminable group is
+ * not a licence to overwrite a row that may well be right.
+ *
+ * Idempotent: once repaired, the ledger prices cancel against the executions and
+ * the next pass computes the same values, so `updated` is 0 and nothing rewrites.
+ */
+export function repriceImportedFillsFromHistory(
+  records: readonly LiveOptionFillRecord[],
+  historyFills: readonly TradierTradeHistoryFill[],
+): { records: LiveOptionFillRecord[]; updated: number; repairs: ImportedPriceRepair[] } {
+  const histGroups = new Map<string, { qty: number; fills: TradierTradeHistoryFill[] }>();
+  for (const f of historyFills) {
+    if (f.tradeType !== 'option') continue;
+    const side = historyFillSide(f.description, f.amount);
+    if (side === null) continue;
+    if (typeof f.quantity !== 'number' || !Number.isFinite(f.quantity) || f.quantity <= 0) continue;
+    const key = feeMatchKey(f.symbol, f.date, side, 0);
+    const g = histGroups.get(key);
+    if (g) {
+      g.qty += f.quantity;
+      g.fills.push(f);
+    } else histGroups.set(key, { qty: f.quantity, fills: [f] });
+  }
+
+  const rowGroups = new Map<string, number[]>();
+  records.forEach((r, i) => {
+    const key = feeMatchKey(r.optionSymbol, r.etDay, r.side, 0);
+    const g = rowGroups.get(key);
+    if (g) g.push(i);
+    else rowGroups.set(key, [i]);
+  });
+
+  const priceByIndex = new Map<number, number | null>();
+  const repairs: ImportedPriceRepair[] = [];
+  for (const [key, indices] of rowGroups) {
+    const hist = histGroups.get(key);
+    if (!hist) continue;
+    const importIndices = indices.filter((i) => records[i]!.origin === 'history_import');
+    if (importIndices.length === 0) continue;
+    if (indices.some((i) => records[i]!.fees !== null)) continue; // a settled fee owns these prices
+    let ledgerQty = 0;
+    for (const i of indices) ledgerQty += records[i]!.contracts;
+    if (ledgerQty !== hist.qty) continue; // coverage gap — the import pass runs first
+
+    const ordered = [...hist.fills].sort((a, b) =>
+      a.transactionId < b.transactionId ? 1 : a.transactionId > b.transactionId ? -1 : 0,
+    );
+    // The TRUSTED rows are the input: what the executions still hold after they
+    // cancel is exactly what the imported rows represent.
+    const trusted: CoveredContracts[] = indices
+      .filter((i) => records[i]!.origin !== 'history_import')
+      .map((i) => ({ price: records[i]!.filledPrice, contracts: records[i]!.contracts }));
+    const attributed = attributeUncoveredExecutions(ordered, trusted);
+    const residualQty = attributed.residual.reduce((sum, r) => sum + r.qty, 0);
+    let importQty = 0;
+    for (const i of importIndices) importQty += records[i]!.contracts;
+    if (!attributed.determinable || residualQty !== importQty) {
+      // ARM 2 — nothing is derivable, but one thing is still PROVABLE: a price no
+      // execution in the group filled at cannot have come from the broker's
+      // record, so it is wrong whatever the right answer is. Null it (the group
+      // then reports 'priceless-row' instead of a silent gross error). This
+      // cannot destroy a good price — a correctly attributed row always carries
+      // SOME execution's price, including the single-price case — and it is
+      // gated on the same full-coverage precondition, so a partially fetched
+      // group can never make a legitimate price look foreign.
+      const executionPrices = new Set<number>();
+      for (const f of ordered) {
+        const p = executionPrice(f);
+        if (p !== null) executionPrices.add(priceBucket(p));
+      }
+      for (const i of importIndices) {
+        const rec = records[i]!;
+        if (rec.filledPrice === null) continue;
+        if (executionPrices.has(priceBucket(rec.filledPrice))) continue;
+        priceByIndex.set(i, null);
+        repairs.push({
+          optionSymbol: rec.optionSymbol,
+          day: rec.etDay,
+          side: rec.side,
+          contracts: rec.contracts,
+          from: rec.filledPrice,
+          to: null,
+        });
+      }
+      continue;
+    }
+
+    // Walk the imported rows against the residual. A row consuming contracts at
+    // one price takes it; a row straddling two different prices takes null.
+    const pool = attributed.residual.map((r) => ({ price: executionPrice(r.fill), qty: r.qty }));
+    let cursor = 0;
+    for (const i of importIndices) {
+      const rec = records[i]!;
+      let need = rec.contracts;
+      let price: number | null = null;
+      let straddled = false;
+      let first = true;
+      while (need > 0 && cursor < pool.length) {
+        const slot = pool[cursor]!;
+        const take = Math.min(need, slot.qty);
+        if (first) price = slot.price;
+        else if (price === null || slot.price === null || priceBucket(price) !== priceBucket(slot.price)) {
+          straddled = true;
+        }
+        first = false;
+        slot.qty -= take;
+        need -= take;
+        if (slot.qty === 0) cursor += 1;
+      }
+      const resolved = straddled ? null : price;
+      const before = rec.filledPrice;
+      const same =
+        before === null ? resolved === null : resolved !== null && priceBucket(before) === priceBucket(resolved);
+      if (same) continue;
+      priceByIndex.set(i, resolved);
+      repairs.push({
+        optionSymbol: rec.optionSymbol,
+        day: rec.etDay,
+        side: rec.side,
+        contracts: rec.contracts,
+        from: before,
+        to: resolved,
+      });
+    }
+  }
+
+  let updated = 0;
+  const out = records.map((r, i) => {
+    if (priceByIndex.has(i)) {
+      updated += 1;
+      return toRecord({ ...recordToInput(r), filledPrice: priceByIndex.get(i)! });
+    }
+    return toRecord(recordToInput(r));
+  });
+  return { records: out, updated, repairs };
+}
+
+/**
+ * TRA-3563 — apply {@link repriceImportedFillsFromHistory} against the in-memory
+ * store with the same durable-rewrite semantics as the fee back-fills.
+ */
+export function repriceImportedLiveOptionFills(
+  historyFills: readonly TradierTradeHistoryFill[],
+): { updated: number; repairs: ImportedPriceRepair[] } {
+  const result = repriceImportedFillsFromHistory(fills, historyFills);
+  applyBackfillResult({ updated: result.updated, records: result.records });
+  if (result.repairs.length > 0) {
+    log.warn('live-options fee-slippage ledger RE-PRICED imported rows off broker executions (TRA-3563)', {
+      repairs: result.repairs.map((r) => `${r.optionSymbol} ${r.day} ${r.side} x${r.contracts}: ${r.from} -> ${r.to}`),
+    });
+  }
+  return { updated: result.updated, repairs: result.repairs };
 }
 
 // ── Health summary ───────────────────────────────────────────────────────────

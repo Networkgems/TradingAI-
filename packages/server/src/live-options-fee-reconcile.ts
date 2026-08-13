@@ -50,9 +50,11 @@ import {
   backfillLiveOptionFees,
   backfillLiveOptionFeesFromGainLoss,
   importMissingLiveOptionFills,
+  repriceImportedLiveOptionFills,
   summarizeLiveOptionsFeeSlippage,
   historyFillSide,
   type GainLossPrefixRepair,
+  type ImportedPriceRepair,
   type GainLossRejection,
   type GainLossRejectionReason,
   type LedgerCoverageResult,
@@ -100,6 +102,19 @@ export const GAINLOSS_SAMPLE_MAX = 40;
 
 /** TRA-3558 — how many named group rejections the state republishes (newest ET day first). */
 export const GAINLOSS_REJECTION_MAX = 25;
+
+/**
+ * TRA-3563 — how many RAW history fills the state republishes. The old cap of 5
+ * against 37 observed fills was a SPOT CHECK, not a presence test: diagnosing
+ * TRA-3563 needed the executions of one 2026-08-04 group and the sample held
+ * only the five newest, so the prices that decided the defect were unreadable
+ * from the route entirely. Same reasoning as {@link GAINLOSS_SAMPLE_MAX}: sit
+ * the cap ABOVE the observed volume, so `lastHistoryFills <= this` means the
+ * sample IS the fetch. The sample now also carries `price`/`quantity` — the two
+ * fields the import attribution runs on, and without which "which execution did
+ * this row's price come from" cannot be answered.
+ */
+export const HISTORY_SAMPLE_MAX = 60;
 
 /** The slice of the Tradier options client this pass needs (injectable in tests). */
 export interface FeeReconcileHistoryClient {
@@ -222,9 +237,11 @@ export interface LiveOptionsFeeReconcileState {
   /** Message from the most recent failure (cleared on the next fully clean attempt). */
   lastError: string | null;
   /**
-   * Up to 5 history fills from the last fetch — diagnostic for key-mismatch
-   * investigation. Shows symbol, date, description (truncated), orderId, and
-   * commission so caller can verify the join is seeing the right account fills.
+   * History fills from the last fetch, PRE-filter — diagnostic for key-mismatch
+   * investigation and (TRA-3563) for the import price attribution. Shows symbol,
+   * date, description (truncated), orderId, commission, and the `price`/
+   * `quantity` the attribution runs on. Capped at {@link HISTORY_SAMPLE_MAX};
+   * truncated iff `lastHistoryFills > HISTORY_SAMPLE_MAX`.
    */
   lastHistorySample: Array<{
     symbol: string;
@@ -232,6 +249,8 @@ export interface LiveOptionsFeeReconcileState {
     description: string;
     orderId: number | null;
     commission: number;
+    price: number;
+    quantity: number;
   }> | null;
   /**
    * How many history fills could actually enter the commission join (tradeType
@@ -267,6 +286,22 @@ export interface LiveOptionsFeeReconcileState {
   coverage: LedgerCoverageResult | null;
   /** Rows imported from history since boot (cumulative across passes). */
   totalImportedRows: number;
+  /**
+   * TRA-3563 — `history_import` rows whose `filledPrice` this pass RE-DERIVED
+   * from the broker's own executions. The old attribution copied the price off
+   * whichever execution the shortfall walk landed on, so a group that filled at
+   * two prices could mint a row at its SIBLING's price — contract totals still
+   * reconciled (`coverage.missingContracts: 0` read clean) while the ledger
+   * gross overstated the broker and the gainloss join derived a negative fee.
+   * A price rewrite in a money path must be visible: each entry names the row
+   * and both prices. `to: null` means no attribution was determinable, which is
+   * the intended outcome — it converts a silent wrong price into a named
+   * `priceless-row` rejection. Empty array = nothing needed repair; null = no
+   * history fetch has run.
+   */
+  lastImportPriceRepairs: ImportedPriceRepair[] | null;
+  /** Imported rows re-priced since boot (cumulative across passes). */
+  totalImportPriceRepairs: number;
 }
 
 let state: LiveOptionsFeeReconcileState = emptyState();
@@ -299,6 +334,8 @@ function emptyState(): LiveOptionsFeeReconcileState {
     unmeasuredAged: 0,
     coverage: null,
     totalImportedRows: 0,
+    lastImportPriceRepairs: null,
+    totalImportPriceRepairs: 0,
   };
 }
 
@@ -321,6 +358,8 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
     lastGainLossPrefixRepairs:
       state.lastGainLossPrefixRepairs === null ? null : state.lastGainLossPrefixRepairs.map((r) => ({ ...r })),
     coverage: state.coverage === null ? null : { ...state.coverage },
+    lastImportPriceRepairs:
+      state.lastImportPriceRepairs === null ? null : state.lastImportPriceRepairs.map((r) => ({ ...r })),
   };
 }
 
@@ -469,6 +508,16 @@ export async function runLiveOptionsFeeReconcile(
     const coverage = importMissingLiveOptionFills(historyFills, today);
     state.coverage = coverage;
     state.totalImportedRows += coverage.importedRows;
+    // TRA-3563 — then RE-PRICE any imported row the old attribution minted at a
+    // sibling execution's price. It runs AFTER the import (which establishes the
+    // contract coverage the repair requires) and BEFORE the fee joins, so a
+    // repaired price is the one the gainloss derivation reconciles against on
+    // this same pass. It is NOT counted in `updated`: that counter means "rows
+    // that gained a fee", and a pass that only fixed a price must not report
+    // 'backfilled'.
+    const repriced = repriceImportedLiveOptionFills(historyFills);
+    state.lastImportPriceRepairs = repriced.repairs;
+    state.totalImportPriceRepairs += repriced.repairs.length;
     updated += backfillLiveOptionFees(historyFills).updated;
     state.lastHistoryFills = historyFills.length;
     // Mirror the join's ACTUAL eligibility (incl. commission > 0) — a diagnostic
@@ -480,14 +529,16 @@ export async function runLiveOptionsFeeReconcile(
         && typeof f.quantity === 'number' && Number.isFinite(f.quantity) && f.quantity > 0
         && typeof f.commission === 'number' && Number.isFinite(f.commission) && f.commission > 0,
     ).length;
-    // Take up to 5 fills from the raw array BEFORE the join filters them —
-    // include fills regardless of tradeType/side so we can diagnose filter drops.
-    state.lastHistorySample = historyFills.slice(0, 5).map((f) => ({
+    // Take fills from the raw array BEFORE the join filters them — include fills
+    // regardless of tradeType/side so we can diagnose filter drops.
+    state.lastHistorySample = historyFills.slice(0, HISTORY_SAMPLE_MAX).map((f) => ({
       symbol: f.symbol,
       date: f.date,
       description: f.description.slice(0, 80), // truncate long descriptions
       orderId: f.orderId,
       commission: f.commission,
+      price: f.price,
+      quantity: f.quantity,
     }));
   }
   if (lots !== null) {
@@ -569,6 +620,11 @@ export async function runLiveOptionsFeeReconcile(
       .map((r) => `${r.symbol} ${r.day} ${r.side}: ${r.reason} (${r.observed} vs ${r.expected})`),
     partialFetchError: state.lastError,
     coverage: state.coverage,
+    // TRA-3563 — coverage reads clean (missingContracts 0) on exactly the defect
+    // this repairs, so the repair has to speak for itself in the same line.
+    importPriceRepairs: (state.lastImportPriceRepairs ?? []).map(
+      (r) => `${r.optionSymbol} ${r.day} ${r.side} x${r.contracts}: ${r.from} -> ${r.to}`,
+    ),
     unmeasured: {
       total: state.unmeasuredTotal,
       actionable: state.unmeasuredActionable,
