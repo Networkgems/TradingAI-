@@ -1134,6 +1134,13 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
     const report = reportFor([soxl, ...GENUINE.slice(1)],
       [{ symbol: 'SOXL', price: 91.99, changePct: -16.0215 }]);
     expect(report.top5Movers.map(m => m.symbol)).toContain('SOXL');
+
+    // TRA-2657 — the title says ABSTAINS, so the body has to check that and not
+    // just the ranking. "Still ranked" alone is satisfied by a row that was
+    // graded CONSISTENT, which is the one reading this branch must never
+    // produce: a republication is not a second observation, and calling it
+    // clean is the fail-open the census exists to size.
+    expect(soleCensus().abstainReasons['republished_prior_row']).toBe(1);
   });
 
   it('an absent prior artifact changes nothing — no prior file, no exclusions', () => {
@@ -1215,6 +1222,44 @@ describe('TRA-2634 top movers — a re-derived denominator cannot be the headlin
         // and the reasons account for every abstain, one bucket each
         expect(Object.values(c.abstainReasons).reduce((a, b) => a + b, 0)).toBe(c.abstained);
       }
+    });
+
+    it('TRA-2657 — names the REPUBLICATION bucket, the one an abstain can hide in', () => {
+      // The second-largest bucket in production (203 of 705 published mover rows,
+      // 29%) and the only one that is reachable, populated, and still ungraded —
+      // `no_prior_observation` is asserted three ways above, this one nowhere.
+      // It is also the bucket where a regression is quietest: a republication
+      // re-graded as CONSISTENT keeps the row ranked and the table identical, so
+      // the ONLY witness that the second observation never existed is this key.
+      const soxl = row('SOXL', 91.99, -16.0215);
+      const report = reportFor([soxl, ...GENUINE.slice(1)], [
+        { symbol: 'SOXL', price: 91.99, changePct: -16.0215 },  // the same row, re-served
+        { symbol: 'IREN', price: 33.93, changePct: 2.0 },       // a genuine second observation
+      ]);
+
+      // ⭐ POSITIVE CONTROL — the fixture CONTAINS what the bucket is withholding.
+      // Move the prior pct outside the republication epsilon and nothing else,
+      // and the identical pair grades SUSPECT at residual 1.19. So the abstain
+      // is the guard doing work, not the instrument finding the row boring —
+      // without it this table would report an exclusion it has not earned.
+      const asSecondObservation = assessLevelContinuity(
+        { price: 91.99, changePct: -1.0 }, soxl);
+      expect(asSecondObservation.verdict).toBe('suspect');
+
+      const census = soleCensus();
+      expect(census.priorRowsAvailable).toBe(2);
+      expect(census.candidates).toBe(4);
+      expect(census.graded).toBe(1);          // IREN, and only IREN
+      expect(census.consistent).toBe(1);
+      expect(census.suspect).toBe(0);
+      expect(census.abstained).toBe(3);
+      // The whole map, so the two abstain classes stay DISTINGUISHABLE: a
+      // republication collapsing into `no_prior_observation` would keep every
+      // total above intact and lose the reason the row was unreadable.
+      expect(census.abstainReasons)
+        .toEqual({ republished_prior_row: 1, no_prior_observation: 2 });
+      // and the fail-open is disclosed rather than hidden: the row still ranks.
+      expect(report.top5Movers.map(m => m.symbol)).toContain('SOXL');
     });
 
     it('says 100% UNGRADEABLE when a prior artifact exists but reaches nothing', () => {
