@@ -46,6 +46,7 @@ import {
   netEdgeShadowAdmits,
   type NetEdgeShadowSample,
 } from './option-net-edge-bar.js';
+import type { AdmissibleSelection } from './otm-admissible-strike.js';
 import { logger } from './observability/index.js';
 
 const log = logger.child({ module: 'live-enforce-gate-ledger' });
@@ -174,7 +175,49 @@ export interface LiveEnforceRecord {
    * which fails closed at every `k`.
    */
   grossR?: number;
+  /**
+   * TRA-3510 — WHICH NOMINATOR BRANCH produced the candidate this verdict ruled
+   * on (TRA-3401's `selectAdmissibleOtmCandidate`).
+   *
+   * This is the axis that makes a ZERO on the delta gates readable. The selector
+   * runs UPSTREAM of every gate here, and on its `in_band` branch the nominee's
+   * `|Δ|` is inside `[min, max)` BY CONSTRUCTION — so it cannot breach a ceiling
+   * at the band's own `max`, nor a floor at or below its `min`. Without this
+   * field, `entry_delta_ceiling_shadow.blocked === 0` has two byte-identical
+   * causes:
+   *
+   *   • the selector clamped every row into the band (a vacuous zero), and
+   *   • the far tail was nominated and genuinely did not breach (a real zero).
+   *
+   * `cheapConsidered` / `cheapInBand` are the CHAIN SHAPE behind the branch: a
+   * `fallback_top_mispricing` row with `cheapInBand: 0` says the chain offered no
+   * admissible strike, which is a different fact about the book than a chain that
+   * offered one and lost it downstream.
+   *
+   * Absent ⇒ the verdict did not come from the OTM nominator (RV / directional
+   * cost-bar rows) or predates this field. That folds to no `bySelection` row
+   * rather than to a synthetic bucket — "never stamped" is not a branch.
+   */
+  nominator?: LiveEnforceNominator;
 }
+
+/** TRA-3510 — the nominator branch + chain shape carried on an OTM verdict. */
+export interface LiveEnforceNominator {
+  /** `in_band` | `fallback_top_mispricing` | `legacy` | `none`. */
+  selection: AdmissibleSelection;
+  /** How many `cheap` candidates the scanned chain offered. */
+  cheapConsidered: number;
+  /** How many of those landed inside the armed band (0 when the selector is dark). */
+  cheapInBand: number;
+}
+
+/** The selection values a persisted row may carry. Anything else is dropped on hydrate. */
+const SELECTIONS: readonly AdmissibleSelection[] = [
+  'in_band',
+  'fallback_top_mispricing',
+  'legacy',
+  'none',
+];
 
 /**
  * TRA-3483 — one recorded decision's ingredients for the counterfactual sweep.
@@ -203,6 +246,20 @@ interface GateScopeTally {
   blocked: number;
 }
 
+/**
+ * TRA-3510 — the selection axis carries the plain evaluated/blocked tally PLUS
+ * the chain-shape sums, because `cheapConsidered` / `cheapInBand` are per-row
+ * measurements rather than keys. Sums (not means) are accumulated so the axis
+ * merges across days by addition like every other axis; the mean is derived at
+ * read time over `rowsWithChainShape`, which is its own denominator.
+ */
+interface GateSelectionTally extends GateScopeTally {
+  cheapConsideredSum: number;
+  cheapInBandSum: number;
+  /** Rows that carried the chain-shape numbers at all. */
+  rowsWithChainShape: number;
+}
+
 /** The per-gate accumulator: the same tally shape folded on four independent keys. */
 interface GateTallies {
   /** structure (cost_bar) or underlying symbol (spread / universe). */
@@ -213,6 +270,13 @@ interface GateTallies {
   byBook: Map<string, GateScopeTally>;
   /** TRA-3391 tape cell (`structure::bucket`) — rows that carry one, admits included. */
   byCell: Map<string, GateScopeTally>;
+  /**
+   * TRA-3510 — TRA-3401 nominator branch, admits included. Rows that carry no
+   * nominator contribute no key: this axis answers "which branch nominated the
+   * candidate this gate ruled on", and a row from a non-OTM path was not
+   * nominated by it at all.
+   */
+  bySelection: Map<string, GateSelectionTally>;
   /**
    * TRA-3483 — per-decision cost/edge samples (`cost_bar` only). This is a LIST,
    * not a tally, because quantiles and a median-of-admitted are not foldable into
@@ -236,6 +300,7 @@ function emptyTallies(): GateTallies {
     byReason: new Map(),
     byBook: new Map(),
     byCell: new Map(),
+    bySelection: new Map(),
     costSamples: [],
     costRowsMissing: 0,
     costSamplesDropped: 0,
@@ -251,6 +316,27 @@ function bump(map: Map<string, GateScopeTally>, key: string, blocked: boolean): 
   }
   tally.evaluated += 1;
   if (blocked) tally.blocked += 1;
+}
+
+/** TRA-3510 — `bump` plus the chain-shape sums. Non-finite chain numbers are counted
+ *  as evaluated but contribute NO sample, so a malformed row cannot move a mean. */
+function bumpSelection(
+  map: Map<string, GateSelectionTally>,
+  nom: LiveEnforceNominator,
+  blocked: boolean,
+): void {
+  let tally = map.get(nom.selection);
+  if (!tally) {
+    tally = { evaluated: 0, blocked: 0, cheapConsideredSum: 0, cheapInBandSum: 0, rowsWithChainShape: 0 };
+    map.set(nom.selection, tally);
+  }
+  tally.evaluated += 1;
+  if (blocked) tally.blocked += 1;
+  if (Number.isFinite(nom.cheapConsidered) && Number.isFinite(nom.cheapInBand)) {
+    tally.cheapConsideredSum += nom.cheapConsidered;
+    tally.cheapInBandSum += nom.cheapInBand;
+    tally.rowsWithChainShape += 1;
+  }
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -337,6 +423,12 @@ function apply(rec: LiveEnforceRecord): void {
   if (typeof rec.cell === 'string' && rec.cell !== '') {
     bump(tallies.byCell, rec.cell, rec.blocked);
   }
+  // TRA-3510 — nominator branch, admits INCLUDED. A gate whose whole `blocked`
+  // count sits on `in_band` is reporting a bound the SELECTOR imposed, not one it
+  // measured; that is only visible if admits are on the same axis as blocks.
+  if (rec.nominator && SELECTIONS.includes(rec.nominator.selection)) {
+    bumpSelection(tallies.bySelection, rec.nominator, rec.blocked);
+  }
   // TRA-3483 — the cost/edge sample. A row with no usable cost is COUNTED as
   // missing rather than skipped: the sweep's denominator has to be visible, and a
   // silently shorter sample list is exactly how a coverage gap reads as a rate.
@@ -390,6 +482,10 @@ export function recordLiveEnforceDecision(
     // unknown-edge case, and each has to stay distinguishable from the other.
     cost?: LiveEnforceRecord['cost'] | null;
     grossR?: number | null;
+    // TRA-3510 — which TRA-3401 branch nominated this candidate. Null/absent on
+    // every non-OTM call site, which is the honest reading: those rows were not
+    // produced by the OTM nominator at all.
+    nominator?: LiveEnforceNominator | null;
   },
 ): void {
   const cost = opts?.cost;
@@ -411,6 +507,7 @@ export function recordLiveEnforceDecision(
     ...(typeof opts?.cell === 'string' && opts.cell !== '' ? { cell: opts.cell } : {}),
     ...(costUsable ? { cost: cost! } : {}),
     ...(typeof opts?.grossR === 'number' && Number.isFinite(opts.grossR) ? { grossR: opts.grossR } : {}),
+    ...(usableNominator(opts?.nominator) ? { nominator: opts!.nominator! } : {}),
   };
   applyAndAppend(rec);
 }
@@ -452,6 +549,26 @@ function hydratedCost(cost: LiveEnforceRecord['cost']): boolean {
     && Number.isFinite(cost.spreadR)
     && Number.isFinite(cost.feeR)
     && Number.isFinite(cost.costFracOfPremium)
+  );
+}
+
+/**
+ * TRA-3510 — is a nominator block usable? `selection` must be one of the four
+ * KNOWN branches: this value becomes a map key, so accepting an arbitrary string
+ * off a persisted line would let a corrupt row invent an unbounded axis. Both
+ * chain counts must be finite non-negative integers for the same reason a NaN
+ * `costR` is rejected — one bad row would otherwise poison a published mean.
+ *
+ * Shared by the write path and the hydrate path deliberately: a row this refuses
+ * to record must also be a row it refuses to read back.
+ */
+function usableNominator(nom: LiveEnforceNominator | null | undefined): boolean {
+  return (
+    !!nom
+    && typeof nom === 'object'
+    && SELECTIONS.includes(nom.selection)
+    && Number.isInteger(nom.cheapConsidered) && nom.cheapConsidered >= 0
+    && Number.isInteger(nom.cheapInBand) && nom.cheapInBand >= 0
   );
 }
 
@@ -514,6 +631,19 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
       // them and hydrates as a MISSING sample (counted), never as a zero.
       ...(hydratedCost(rec.cost) ? { cost: rec.cost! } : {}),
       ...(typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? { grossR: rec.grossR } : {}),
+      // TRA-3510 — a row written before the nominator axis existed simply lacks
+      // it and contributes no `bySelection` key. That is what makes the axis
+      // honest across the deploy boundary: the retained fold's `bySelection`
+      // denominator is the rows that were STAMPED, never the gate's `evaluated`.
+      ...(usableNominator(rec.nominator)
+        ? {
+          nominator: {
+            selection: rec.nominator!.selection,
+            cheapConsidered: rec.nominator!.cheapConsidered,
+            cheapInBand: rec.nominator!.cheapInBand,
+          },
+        }
+        : {}),
     };
     apply(clean);
     kept.push(JSON.stringify(clean));
@@ -596,6 +726,47 @@ export interface LiveEnforceCellSummary {
    * within-cell decision boundary a `k` would move. Null on cells with no sample.
    */
   costRQuantiles: CostRQuantiles | null;
+}
+
+/**
+ * TRA-3510 — one nominator branch's contribution to a gate.
+ *
+ * ## How to read it
+ *
+ * `entry_delta_ceiling_shadow` at `blocked: 0` is only informative once this axis
+ * is present:
+ *
+ *   • rows concentrated on `in_band` ⇒ the zero is BY CONSTRUCTION. The selector
+ *     nominated inside `[min, max)` and the ceiling sits at `max`, so no row it
+ *     saw was capable of breaching. Do not publish that zero as a tail estimate.
+ *   • rows on `fallback_top_mispricing` / `legacy` ⇒ the far tail WAS nominated
+ *     and did not breach. That zero is a measurement.
+ *
+ * The same reading, mirrored, applies to `otm_delta_floor`: an `in_band` row
+ * cannot breach a floor at or below the band's `min` either.
+ */
+export interface LiveEnforceSelectionSummary {
+  /** `in_band` | `fallback_top_mispricing` | `legacy` | `none`. */
+  selection: string;
+  evaluated: number;
+  blocked: number;
+  /** blocked / evaluated; `null` when this branch produced nothing. */
+  blockRate: number | null;
+  /**
+   * Rows on this branch carrying the chain-shape numbers — the DENOMINATOR of
+   * the two means below, published rather than implied so a partially-stamped
+   * fold cannot read as a complete one.
+   */
+  rowsWithChainShape: number;
+  /** Mean `cheap` candidates the chain offered, over `rowsWithChainShape`. */
+  meanCheapConsidered: number | null;
+  /**
+   * Mean `cheap` candidates that landed INSIDE the armed band. On a
+   * `fallback_top_mispricing` row this is 0 by definition (the fallback is taken
+   * precisely because nothing was in band), so a nonzero value here on that
+   * branch would be a wiring defect, not a finding.
+   */
+  meanCheapInBand: number | null;
 }
 
 /**
@@ -725,6 +896,14 @@ export interface LiveEnforceGateSummary {
   byBook: LiveEnforceBookSummary[];
   /** Per-tape-cell split, busiest first; admits included (TRA-3391). */
   byCell: LiveEnforceCellSummary[];
+  /**
+   * TRA-3510 — per-NOMINATOR-BRANCH split, busiest first; admits included. This
+   * is the axis that makes a zero on a delta gate readable — see
+   * {@link LiveEnforceRecord.nominator}. An EMPTY array on a gate with
+   * `evaluated > 0` means those rows predate the axis or came from a non-OTM
+   * path; it never means "one branch produced them all".
+   */
+  bySelection: LiveEnforceSelectionSummary[];
   /**
    * TRA-3483 — the `costR` distribution over this fold. Non-null on `cost_bar`
    * (even at `n: 0`, so "not instrumented" and "instrumented, no rows yet" stay
@@ -957,6 +1136,26 @@ function foldGates(
     }
     byCell.sort((a, b) => b.evaluated - a.evaluated || a.cell.localeCompare(b.cell));
 
+    // TRA-3510 — the nominator axis. Means are derived HERE from the retained
+    // sums over `rowsWithChainShape`, never from `evaluated`: a fold that spans
+    // the deploy boundary holds rows that carry no chain shape, and dividing by
+    // `evaluated` would silently deflate both means toward zero.
+    const bySelection: LiveEnforceSelectionSummary[] = [];
+    for (const [selection, t] of tallies.bySelection.entries()) {
+      bySelection.push({
+        selection,
+        evaluated: t.evaluated,
+        blocked: t.blocked,
+        blockRate: t.evaluated > 0 ? round(t.blocked / t.evaluated) : null,
+        rowsWithChainShape: t.rowsWithChainShape,
+        meanCheapConsidered:
+          t.rowsWithChainShape > 0 ? round(t.cheapConsideredSum / t.rowsWithChainShape) : null,
+        meanCheapInBand:
+          t.rowsWithChainShape > 0 ? round(t.cheapInBandSum / t.rowsWithChainShape) : null,
+      });
+    }
+    bySelection.sort((a, b) => b.evaluated - a.evaluated || a.selection.localeCompare(b.selection));
+
     // TRA-3483 — cost instrumentation is `cost_bar`-only. Published as an object
     // at `n: 0` rather than omitted on that gate, so "the recorder is not
     // deployed" cannot read the same as "deployed, no live candidates yet" —
@@ -973,6 +1172,7 @@ function foldGates(
       blockedUnclassified: tallies.blockedUnclassified,
       byBook,
       byCell,
+      bySelection,
       costRQuantiles: instrumented
         ? costRQuantiles(tallies.costSamples, tallies.costRowsMissing, tallies.costSamplesDropped)
         : null,
@@ -994,6 +1194,28 @@ function mergeAxis(into: Map<string, GateScopeTally>, from: Map<string, GateScop
   }
 }
 
+/**
+ * TRA-3510 — merge the selection axis. Separate from {@link mergeAxis} because
+ * the chain-shape SUMS and their own row denominator have to travel with the
+ * counters; folding this axis with `mergeAxis` would drop them and publish
+ * `meanCheapInBand: null` on every retained row.
+ */
+function mergeSelectionAxis(
+  into: Map<string, GateSelectionTally>,
+  from: Map<string, GateSelectionTally>,
+): void {
+  for (const [key, t] of from.entries()) {
+    const cur = into.get(key)
+      ?? { evaluated: 0, blocked: 0, cheapConsideredSum: 0, cheapInBandSum: 0, rowsWithChainShape: 0 };
+    cur.evaluated += t.evaluated;
+    cur.blocked += t.blocked;
+    cur.cheapConsideredSum += t.cheapConsideredSum;
+    cur.cheapInBandSum += t.cheapInBandSum;
+    cur.rowsWithChainShape += t.rowsWithChainShape;
+    into.set(key, cur);
+  }
+}
+
 /** Merge every retained day into one gate->tallies accumulator. */
 function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
   const acc = new Map<LiveEnforceGate, GateTallies>();
@@ -1008,6 +1230,7 @@ function accumulateAllDays(): Map<LiveEnforceGate, GateTallies> {
       mergeAxis(into.byReason, tallies.byReason);
       mergeAxis(into.byBook, tallies.byBook);
       mergeAxis(into.byCell, tallies.byCell);
+      mergeSelectionAxis(into.bySelection, tallies.bySelection);
       // TRA-3483 — samples concatenate (the retained sweep is over the union of
       // days), still under the same cap so a runaway day cannot unbound the fold.
       for (const s of tallies.costSamples) {

@@ -185,7 +185,7 @@ import {
   classifySpreadCeilingAccount, // TRA-2355
   DIRECTIONAL_STRUCTURE_LABEL, // TRA-2345 — moved here from this module; see below.
 } from './option-spread-cost.js';
-import { recordLiveEnforceDecision } from './live-enforce-gate-ledger.js';
+import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation } from './option-mark-sanity.js'; // TRA-2927
@@ -6767,6 +6767,10 @@ export class SignalEngine {
     // unchanged if a future site has no quote (the net-edge form then fails
     // closed for governed structures — never open).
     quote?: { bid?: number; ask?: number },
+    // TRA-3510 — which TRA-3401 branch nominated this candidate. Absent on the RV
+    // and directional call sites: those structures have no OTM nominator, so
+    // their rows contribute no `bySelection` key rather than a synthetic one.
+    nominator?: LiveEnforceNominator | null,
   ): string | null {
     if (this.mode === 'demo') {
       const env = this.resolveDemoFlagEnv();
@@ -6875,6 +6879,10 @@ export class SignalEngine {
           }
           : null,
         grossR,
+        // TRA-3510 — travels with the cost block so BOTH the flat and net-edge
+        // record sites carry it; the deployed form is the flat one, and it is the
+        // branch TRA-3481's k-decision will actually be read off.
+        nominator: nominator ?? null,
       };
       if (isNetEdgeGovernedStructure(structure, netEdgeConfig)) {
         const verdict = netEdgeBarVerdict(
@@ -6949,7 +6957,13 @@ export class SignalEngine {
    * Returns the rejection reason, or `null` when admitted, in demo, or when the
    * universe is explicitly unrestricted (`OPTION_LIVE_OTM_UNIVERSE=*`).
    */
-  private liveOtmUniverseRejectReason(symbol: string): string | null {
+  private liveOtmUniverseRejectReason(
+    symbol: string,
+    // TRA-3510 — the nominator branch behind this candidate. See the ledger's
+    // `LiveEnforceRecord.nominator`: it is what separates a zero the SELECTOR
+    // imposed from a zero the gate measured.
+    nominator?: LiveEnforceNominator | null,
+  ): string | null {
     if (this.mode !== 'live') return null;
     const universe = resolveLiveOtmUniverse(process.env);
     // Unrestricted ⇒ no verdict exists to record. `evaluated:0` on this axis is
@@ -6968,7 +6982,11 @@ export class SignalEngine {
       etDateString(new Date()),
       reason ?? undefined,
       Date.now(),
-      { reasonCode: admitted ? undefined : 'not_in_universe', book: this.alertUsername ?? null },
+      {
+        reasonCode: admitted ? undefined : 'not_in_universe',
+        book: this.alertUsername ?? null,
+        nominator: nominator ?? null,
+      },
     );
     return reason;
   }
@@ -7045,7 +7063,10 @@ export class SignalEngine {
    *
    * Returns the rejection reason, or `null` when admitted OR when disarmed.
    */
-  private otmDeltaFloorLiveRejectReason(delta: number | null | undefined): string | null {
+  private otmDeltaFloorLiveRejectReason(
+    delta: number | null | undefined,
+    nominator?: LiveEnforceNominator | null,
+  ): string | null {
     if (this.mode !== 'live') return null;
     if (!isOptionOtmDeltaFloorLiveEnforceEnabled(process.env)) return null;
     const floor = resolveOptionOtmDeltaFloorLive(process.env);
@@ -7069,6 +7090,12 @@ export class SignalEngine {
         // of them), a below-floor reject is a THRESHOLD choice.
         reasonCode: !blocked ? undefined : absDelta === null ? 'no_usable_delta' : 'below_floor',
         book: this.alertUsername ?? null,
+        // TRA-3510 — load-bearing on THIS gate specifically. An `in_band` nominee
+        // has |Δ| ≥ the band's `min` by construction, so with the selector armed a
+        // floor at or below `min` can only ever record `blocked: 0` on those rows.
+        // Without this axis that zero is indistinguishable from a floor that was
+        // tested against the real low tail and cleared it.
+        nominator: nominator ?? null,
       },
     );
     return reason;
@@ -7111,6 +7138,7 @@ export class SignalEngine {
   private entryDeltaCeilingLiveRejectReason(
     structure: string,
     delta: number | null | undefined,
+    nominator?: LiveEnforceNominator | null,
   ): string | null {
     if (this.mode !== 'live') return null;
     const verdict = entryDeltaCeilingLiveVerdict(structure, delta, process.env);
@@ -7134,6 +7162,12 @@ export class SignalEngine {
         // table, and stamping the band is what turns a scalar counter into the
         // "which side of 0.55 did the candidates fall on" read.
         cell: verdict.bandLabel ? `${structure}::${verdict.bandLabel}` : undefined,
+        // TRA-3510 — the SECOND thing that zero needs. `byCell` says which side
+        // of 0.55 the nominees fell on; `bySelection` says whether anything was
+        // ever ALLOWED to fall on the far side. TRA-3401's `in_band` branch caps
+        // the nominee at the band's exclusive `max` — the ceiling's own value —
+        // so on those rows `blocked: 0` is arithmetic, not evidence.
+        nominator: nominator ?? null,
       },
     );
 
@@ -9853,6 +9887,16 @@ export class SignalEngine {
         });
         const cheap = otmPick.candidate;
         if (!cheap) continue;
+        // TRA-3510 — the nominator branch, stamped on EVERY live gate verdict
+        // below rather than only logged. The `log.info` under it reaches an
+        // operator tailing Render; it reaches no endpoint, so until now no fold
+        // of the ledger could tell a gate's zero that the SELECTOR imposed from
+        // one the gate measured. See `LiveEnforceRecord.nominator`.
+        const nominator: LiveEnforceNominator = {
+          selection: otmPick.selection,
+          cheapConsidered: otmPick.cheapConsidered,
+          cheapInBand: otmPick.cheapInBand,
+        };
         if (otmPick.selection !== 'legacy') {
           // Count the verdict on BOTH branches: an armed selector that never finds
           // an in-band strike must not read like one that was never armed.
@@ -9916,7 +9960,7 @@ export class SignalEngine {
         // Surfaced on the feed like the ceiling/floor rejects, which also parks the
         // signal in `recentSignals` — so the hour-long dedup above swallows the
         // repeat and this records ~1 verdict per OCC per hour, not one per sweep.
-        const otmUniverseReject = this.liveOtmUniverseRejectReason(sym);
+        const otmUniverseReject = this.liveOtmUniverseRejectReason(sym, nominator);
         if (otmUniverseReject) {
           signal.mode = 'live';
           signal.liveSkipReason = otmUniverseReject;
@@ -9964,12 +10008,14 @@ export class SignalEngine {
         // `cost_bar`: that ledger discontinuity is the CORRECT attribution, not a
         // regression — a mandate breach is not a cost decline.
         //
-        // NOTE the FLOOR half (`otmDeltaFloorLiveRejectReason`, TRA-2763) still sits
-        // BELOW the bar and carries the same structural exposure while disarmed; it
-        // is out of scope here and tracked back to QuantTrader on TRA-3501.
+        // TRA-3510 — the FLOOR half (`otmDeltaFloorLiveRejectReason`, TRA-2763) now
+        // sits immediately BELOW this call and still above the bar, so both edges of
+        // the ratified band are on the same side of it. That note used to say the
+        // floor was still sunk below the bar; it no longer is.
         const otmLiveCeilingReject = this.entryDeltaCeilingLiveRejectReason(
           'single_leg_otm',
           cheap.delta,
+          nominator,
         );
         if (otmLiveCeilingReject) {
           signal.mode = 'live';
@@ -9981,6 +10027,54 @@ export class SignalEngine {
           });
           log.info('live OTM open rejected by entry delta ceiling (TRA-3394)', {
             sym, delta: cheap.delta, reason: otmLiveCeilingReject,
+          });
+          continue;
+        }
+
+        // TRA-2763 — LIVE arm of the OTM entry delta floor. No-op unless
+        // mode==='live' AND ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE is armed in the
+        // process env (the method is the gate; demo and disarmed-live fall
+        // straight through). Every armed verdict — this reject AND the admit of a
+        // candidate that clears it — lands on the
+        // `/api/health/live-enforce-gates` `otm_delta_floor` axis. Surfaced with a
+        // visible reason, mirroring the ceiling's churn-brake pattern.
+        //
+        // ⚠️ TRA-3510 — HOISTED ABOVE THE COST BAR, for the identical reason
+        // TRA-3504 hoisted the ceiling, and this is the higher-value half. The bar
+        // `continue`s on reject at a retained block rate of 0.9928 (1929/1943), so
+        // everything ordered below it sees ~0.7% of live nominees. But where the
+        // ceiling's pin was structural (nothing surviving the bar can exceed 0.55),
+        // the floor's is worse: the bar is ALGEBRAICALLY A DELTA FLOOR at 0.4950
+        // (`3|Δ| − 1 ≥ 0.485`), so it blocks a strict SUPERSET of what a floor at
+        // 0.40 would, and the floor below it could never record a single block no
+        // matter how the live tape moved. Measured: 170 of 170 attributed
+        // post-universe rows on 08-05..08-12 blocked `gross_negative`, i.e. every
+        // live nominee sat under 0.495. Up here the floor gets a live, non-degenerate
+        // counter the first session it is armed.
+        //
+        // The two halves of the TRA-3392 band now sit ADJACENT and on the same side
+        // of the bar, which is what the ratification assumed.
+        //
+        // Value-neutral and behaviour-neutral: `floor` stays at its 0.40 default and
+        // `ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE` stays DISARMED, so the method returns
+        // null before recording anything and no order moves. When it is later armed,
+        // a sub-floor candidate attributes to `otm_delta_floor` instead of
+        // `cost_bar`/`gross_negative` — the CORRECT attribution, not a regression,
+        // and the same ledger discontinuity TRA-3504 recorded for the ceiling.
+        //
+        // (The 0.40 default vs the ratified 0.495 lower edge is a live value/arming
+        // decision and it is QuantTrader's, on TRA-3501. Not changed here.)
+        const otmLiveFloorReject = this.otmDeltaFloorLiveRejectReason(cheap.delta, nominator);
+        if (otmLiveFloorReject) {
+          signal.mode = 'live';
+          signal.liveSkipReason = otmLiveFloorReject;
+          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
+          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
+          this.dailySignals.push({
+            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
+          });
+          log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
+            sym, delta: cheap.delta, reason: otmLiveFloorReject,
           });
           continue;
         }
@@ -10006,7 +10100,7 @@ export class SignalEngine {
           stopPrice: stopLoss,
           // TRA-3391 — see the RV site: the reward leg is gone with the estimator.
           // TRA-3272 — the candidate's own quote, for the net-edge bar form.
-        }, { bid: cheap.bid, ask: cheap.ask });
+        }, { bid: cheap.bid, ask: cheap.ask }, nominator);
         if (otmCostReject) {
           signal.signalSkipReason = otmCostReject;
           log.info('OTM open rejected by cost-aware fire bar (TRA-1602)', { sym, reason: otmCostReject });
@@ -10031,29 +10125,6 @@ export class SignalEngine {
           });
           log.info('OTM open rejected by entry-delta ceiling (TRA-1670)', {
             sym, delta: cheap.delta, reason: otmDeltaCeiling,
-          });
-          continue;
-        }
-
-        // TRA-2763 — LIVE arm of the OTM entry delta floor. No-op unless
-        // mode==='live' AND ENABLE_OPTION_OTM_DELTA_FLOOR_LIVE is armed in the
-        // process env (the method is the gate; demo and disarmed-live fall
-        // straight through). Placed before the live-suppression bail so the
-        // reject is surfaced with a visible reason, mirroring the ceiling's
-        // churn-brake pattern, and every armed verdict — this reject AND the
-        // admit of a candidate that clears it — lands on the
-        // `/api/health/live-enforce-gates` `otm_delta_floor` axis.
-        const otmLiveFloorReject = this.otmDeltaFloorLiveRejectReason(cheap.delta);
-        if (otmLiveFloorReject) {
-          signal.mode = 'live';
-          signal.liveSkipReason = otmLiveFloorReject;
-          this.recentSignals.unshift(signal); this.emitSignalAlert(signal);
-          if (this.recentSignals.length > MAX_SIGNALS) this.recentSignals.pop();
-          this.dailySignals.push({
-            id: signal.id, symbol: signal.symbol, type: 'otm_mispricing', firedAt: signal.timestamp,
-          });
-          log.info('live OTM open rejected by entry delta floor (TRA-2763)', {
-            sym, delta: cheap.delta, reason: otmLiveFloorReject,
           });
           continue;
         }

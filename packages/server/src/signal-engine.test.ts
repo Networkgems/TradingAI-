@@ -114,6 +114,7 @@ import {
   summarizeLiveEnforceGate,
 } from './live-enforce-gate-ledger.js'; // TRA-2763
 import { OPTION_LIVE_OTM_UNIVERSE_VAR } from './otm-live-universe-flag.js'; // TRA-3216
+import { OTM_ADMISSIBLE_STRIKE_FLAG } from './otm-admissible-strike.js'; // TRA-3510
 import { blackScholesPrice as bsPriceForWheel, daysToExpiration as dteForWheel } from '@trading-app/engine';
 // TRA-3073 — the REAL client, as a value. The acceptance suite for the
 // broker-flat sweep has to feed it status codes over a stubbed `fetch`: the
@@ -605,6 +606,178 @@ describe('SignalEngine — relative-value scanner bridge', () => {
       // hoisted call recorded NOTHING: `mode === 'off'` returns before the ledger.
       expect(gate('cost_bar')?.blocked).toBe(1);
       expect(gate('entry_delta_ceiling_shadow')?.evaluated).toBe(0);
+    });
+  });
+
+  // ── TRA-3510 — THE FLOOR HOIST, and the nominator-selection axis ───────────
+  //
+  // TRA-3504 hoisted the CEILING above the cost bar. The FLOOR half stayed below
+  // it, and it is the worse pin of the two: the bar is ALGEBRAICALLY a delta floor
+  // at 0.4950 (`3|Δ| − 1 ≥ 0.485`), so it blocks a strict SUPERSET of what a floor
+  // at 0.40 would — the floor below it could never record a single block no matter
+  // how the live tape moved. Measured on the retained window: 170 of 170 attributed
+  // post-universe rows blocked `gross_negative`, i.e. every live nominee sat under
+  // 0.495.
+  //
+  // These assert the ordering BEHAVIOURALLY, the same way the TRA-3504 suite does:
+  // a candidate the armed live cost bar DECLINES must still have reached the floor
+  // and been recorded. Against the old order the first one reads `evaluated: 0`.
+  describe('live OTM delta floor is ordered ABOVE the cost bar (TRA-3510)', () => {
+    const FLOOR_ENV = [
+      'ENABLE_OPTION_COST_GATE_LIVE_ENFORCE',
+      OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
+      OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR,
+      OTM_ADMISSIBLE_STRIKE_FLAG,
+      'OPTION_LIVE_OTM_UNIVERSE',
+      'DATA_DIR',
+    ] as const;
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of FLOOR_ENV) saved[k] = process.env[k];
+      for (const k of FLOOR_ENV) delete process.env[k];
+      clearLiveEnforceGateLedger();
+      clearCostAwareGateLedger();
+      // The bar ARMED AND ENFORCING on the live path — exactly how bqb1 runs it.
+      // Without this the suite would prove nothing about ordering: the whole
+      // question is what survives the 0.9928 `continue`.
+      process.env.ENABLE_OPTION_COST_GATE_LIVE_ENFORCE = '1';
+      // The floor armed at its shipped 0.40 default (no value override — the
+      // deployed number is what the hoist has to be readable under).
+      process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG] = '1';
+    });
+    afterEach(() => {
+      for (const k of FLOOR_ENV) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    });
+
+    /** Drive the REAL `runOtmScan` live path over a one-candidate chain. */
+    const runLiveOtm = async (candidates: OtmMispricingCandidate[]) => {
+      const scanner = new StubScanner();
+      scanner.scanOtm.mockResolvedValue({
+        symbol: 'AAPL',
+        spot: 195,
+        expiration: '2024-07-05',
+        candidates,
+        reason: 'ok',
+      });
+      const engine = new SignalEngine(undefined, undefined, scanner);
+      (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+      await (engine as unknown as { runOtmScan: (s: string[]) => Promise<void> }).runOtmScan(['AAPL']);
+      return engine;
+    };
+    const gate = (g: string) =>
+      summarizeLiveEnforceGate(etDateString(new Date())).byGate.find((x) => x.gate === g);
+
+    it('records the floor verdict for a Δ=0.05 candidate the armed cost bar DECLINES', async () => {
+      await runLiveOtm([makeOtmCandidate({ delta: 0.05 })]);
+
+      // THE HOIST. Below the bar this is `evaluated: 0` — the gate never runs,
+      // because the bar `continue`d on a candidate it is algebraically certain to
+      // reject. That assertion is what proves the ordering rather than assuming it.
+      const floor = gate('otm_delta_floor');
+      expect(floor?.evaluated).toBe(1);
+      expect(floor?.blocked).toBe(1);
+      expect(floor?.byReason[0]?.reasonCode).toBe('below_floor');
+
+      // ...and the attribution MOVED: the floor now `continue`s first, so the bar
+      // never sees this candidate. That step-down in `cost_bar`'s denominator is
+      // the correct attribution of a mandate breach, not a cost decline.
+      expect(gate('cost_bar')?.evaluated).toBe(0);
+    });
+
+    it('records an ADMIT for a Δ=0.52 candidate — the per-band denominator that makes a zero checkable', async () => {
+      await runLiveOtm([makeOtmCandidate({ delta: 0.52 })]);
+
+      const floor = gate('otm_delta_floor');
+      expect(floor?.evaluated).toBe(1);
+      expect(floor?.blocked).toBe(0);
+
+      // The candidate CLEARED the floor and went on to the bar, so the hoist is a
+      // reordering and not a new rejection: `evaluated > 0` on both gates.
+      expect(gate('cost_bar')?.evaluated).toBe(1);
+    });
+
+    it('is behaviour-neutral while DISARMED — the flag off records nothing and the bar still rules', async () => {
+      delete process.env[OPTION_OTM_DELTA_FLOOR_LIVE_FLAG];
+      const engine = await runLiveOtm([makeOtmCandidate({ delta: 0.05 })]);
+
+      // The method returns null before recording anything, so the hoisted call is
+      // inert and the open is stopped by the COST BAR on the cost bar's reason —
+      // which is the whole "value-neutral" claim, asserted rather than asserted-of.
+      expect(gate('otm_delta_floor')?.evaluated).toBe(0);
+      expect(gate('cost_bar')?.blocked).toBe(1);
+      expect(engine.getState().options.openOptions).toHaveLength(0);
+    });
+
+    // ── The nominator-selection axis (Ask 2) ────────────────────────────────
+    //
+    // `otm_delta_floor.blocked === 0` has two byte-identical causes once TRA-3401
+    // is armed: the selector clamped every row into `[0.495, 0.55)` (vacuous — an
+    // `in_band` nominee cannot breach a floor at 0.40 BY CONSTRUCTION), or the low
+    // tail was nominated and genuinely cleared. `bySelection` is the only axis on
+    // the payload that separates them.
+    describe('bySelection separates a clamped zero from a measured one', () => {
+      beforeEach(() => {
+        process.env[OTM_ADMISSIBLE_STRIKE_FLAG] = '1';
+      });
+
+      it('an in_band pick and a fallback_top_mispricing pick land on DISTINCT rows', async () => {
+        // Chain A: a cheap strike inside the ratified band ⇒ `in_band`.
+        await runLiveOtm([
+          makeOtmCandidate({ optionSymbol: 'AAPL240705C00200000', delta: 0.05 }),
+          makeOtmCandidate({ optionSymbol: 'AAPL240705C00205000', delta: 0.52 }),
+        ]);
+        // Chain B: nothing in band ⇒ the legacy top-|mispricingPct| nominee is
+        // kept, and it is the far LOW tail the floor exists to cut.
+        await runLiveOtm([makeOtmCandidate({ optionSymbol: 'AAPL240705C00215000', delta: 0.05 })]);
+
+        const floor = gate('otm_delta_floor');
+        expect(floor?.evaluated).toBe(2);
+
+        const inBand = floor?.bySelection.find((s) => s.selection === 'in_band');
+        const fallback = floor?.bySelection.find((s) => s.selection === 'fallback_top_mispricing');
+
+        // Two rows, not one bucket — the axis discriminates.
+        expect(floor?.bySelection).toHaveLength(2);
+
+        // The `in_band` row cleared the floor because the SELECTOR put it above
+        // 0.495, not because the floor measured anything. That is the vacuous zero.
+        expect(inBand?.evaluated).toBe(1);
+        expect(inBand?.blocked).toBe(0);
+        expect(inBand?.meanCheapConsidered).toBe(2);
+        expect(inBand?.meanCheapInBand).toBe(1);
+
+        // The `fallback` row is the real measurement: the low tail WAS nominated
+        // and the floor bit. `cheapInBand: 0` is definitional on this branch — the
+        // fallback is taken precisely because nothing was admissible.
+        expect(fallback?.evaluated).toBe(1);
+        expect(fallback?.blocked).toBe(1);
+        expect(fallback?.meanCheapInBand).toBe(0);
+        expect(fallback?.rowsWithChainShape).toBe(1);
+      });
+
+      it('the axis is present on the RETAINED fold too, not only the current ET day', async () => {
+        await runLiveOtm([makeOtmCandidate({ delta: 0.05 })]);
+        const retained = summarizeLiveEnforceGate(etDateString(new Date()))
+          .retained.byGate.find((x) => x.gate === 'otm_delta_floor');
+        expect(retained?.bySelection.map((s) => s.selection)).toEqual(['fallback_top_mispricing']);
+      });
+
+      it('a DISARMED selector folds to `legacy` — armed-and-empty never reads as never-armed', async () => {
+        delete process.env[OTM_ADMISSIBLE_STRIKE_FLAG];
+        await runLiveOtm([makeOtmCandidate({ delta: 0.05 })]);
+
+        const floor = gate('otm_delta_floor');
+        expect(floor?.bySelection).toHaveLength(1);
+        expect(floor?.bySelection[0]?.selection).toBe('legacy');
+        // Dark ⇒ the band was never applied, so `cheapInBand` is 0 as a statement
+        // about the SELECTOR, not about the chain. Same number, different fact —
+        // which is why `selection` has to be read before either mean.
+        expect(floor?.bySelection[0]?.meanCheapInBand).toBe(0);
+      });
     });
   });
 
