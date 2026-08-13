@@ -66,9 +66,16 @@ const pipeline = (marketOpen) => ({
   ],
 });
 
-const rvScan = (scans) => ({
+// `armCells` — the TRA-3080 retained per-ET-day arm ledger. Passed explicitly
+// (never derived from `scans`) so a scenario can put the two axes in DISAGREEMENT:
+// since-boot counters at zero after a restart, retained desk×live cell still
+// present. That is the whole point of the retained axis, and it is unreachable
+// if the fixture ties the two together.
+const rvScan = (scans, armCells = []) => ({
   ok: true,
   enabled: true,
+  armByEtDay: armCells.length ? [{ etDay: ET_DAY, cells: armCells }] : [],
+  armRetentionDays: 30,
   verdict: scans > 0 ? 'ran' : 'armed_but_never_ran',
   scanCountSinceBoot: scans,
   dataSource: { provider: 'tradier-chain', keyPresent: true, lastFetchOkAt: scans > 0 ? '2026-08-13T13:31:02.000Z' : null, lastFetchError: null },
@@ -95,6 +102,17 @@ const SCENARIOS = [
     expect: { zero: 'STARVED-UPSTREAM', exit: 4, has: ['REAL-NEGATIVE C2 nominator', 'REAL NEGATIVE', 'UPSTREAM of the nominator'], absent: ['⇒ PASS', 'pre-open'] },
   },
   {
+    // THE BELL. Same shape as ENGINE-SILENT below — open, nothing on any axis —
+    // but two minutes in, when the retained arm cell (written on the first RTH
+    // tick), the RV scan counter and the chain fetch have all simply not happened
+    // yet. Without the floor this publishes exit 2, a DEFECT, against a healthy
+    // box. The ENGINE-SILENT case below is the SAME fixture at T+45 and must still
+    // go red, which is what stops the floor from being a blanket excuse.
+    name: 'EARLY-SESSION — 13:32Z, two minutes past the bell, nothing has ticked yet',
+    routes: { time: `${ET_DAY}T13:32:00Z`, boot: `${ET_DAY}T08:46:37.823Z`, open: true, scans: 0 },
+    expect: { zero: 'EARLY-SESSION', exit: 3, has: ['NOT attributable'], absent: ['DEFECT', 'REAL NEGATIVE', '⇒ PASS'] },
+  },
+  {
     name: 'ENGINE-SILENT — 14:15Z, open, NOTHING scanned',
     routes: { time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T08:46:37.823Z`, open: true, scans: 0 },
     expect: { zero: 'ENGINE-SILENT', exit: 2, has: ['DEFECT', 'must NOT be reported'], absent: ['⇒ PASS'] },
@@ -105,6 +123,37 @@ const SCENARIOS = [
     // Without this guard a mid-session restart forges ENGINE-SILENT (a DEFECT)
     // out of a healthy session, because scanCountSinceBoot resets to 0.
     expect: { zero: 'BLIND', exit: 3, has: ['a reset is indistinguishable from a silent engine'], absent: ['DEFECT', '⇒ PASS'] },
+  },
+  {
+    // THE RETAINED AXIS (TRA-3080 `armByEtDay`). Same restart as the case above —
+    // since-boot counters at zero, boot AFTER the open — but the per-ET-day arm
+    // ledger, which lives on disk and survives the reboot, still carries today's
+    // desk×live cell. That cell is written at signal-engine.ts:6254, inside
+    // `isStockMarketOpen()` and BELOW the `runOtmScan` call in the same doTick, so
+    // it is positive proof a LIVE DESK engine ticked past the OTM scan site today.
+    // Without it this session grades BLIND — no verdict — on the ~70%-likely
+    // restart path. `disposition: live_arm_off` is deliberate: the recorder sits
+    // ABOVE the directional flag gates, so the cell exists even though that
+    // sleeve's live arm is off. Nothing here depends on the directional arm.
+    name: 'STARVED-UPSTREAM — restart after the open, since-boot ZERO, RETAINED desk×live cell present',
+    routes: {
+      time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T13:55:00.000Z`, open: true, scans: 0,
+      armCells: [{ accountClass: 'desk', mode: 'live', disposition: 'live_arm_off', reachable: false, books: 3, ticks: 812, boots: 2, firstAt: Date.parse(`${ET_DAY}T13:30:16Z`), lastAt: Date.parse(`${ET_DAY}T14:12:40Z`) }],
+    },
+    expect: { zero: 'STARVED-UPSTREAM', exit: 4, has: ['retained desk×live cell PRESENT', 'REAL NEGATIVE'], absent: ['BLIND', 'DEFECT', '⇒ PASS'] },
+  },
+  {
+    // THE SCOPING GUARD. Same restart, and the retained ledger DOES carry cells for
+    // today — but only for the 60 fixture demo books, which say nothing about
+    // whether a live desk engine ran. Widening the cell lookup to "any cell" would
+    // turn a genuinely unattributable zero into a published REAL NEGATIVE, so this
+    // must stay BLIND.
+    name: 'BLIND — retained cells exist today but ONLY for the fixture/demo class',
+    routes: {
+      time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T13:55:00.000Z`, open: true, scans: 0,
+      armCells: [{ accountClass: 'fixture', mode: 'demo', disposition: 'armed_demo', reachable: true, books: 60, ticks: 45708, boots: 2, firstAt: Date.parse(`${ET_DAY}T13:30:16Z`), lastAt: Date.parse(`${ET_DAY}T14:12:40Z`) }],
+    },
+    expect: { zero: 'BLIND', exit: 3, has: ['retained desk×live cell ABSENT'], absent: ['REAL NEGATIVE', 'DEFECT', '⇒ PASS'] },
   },
   {
     // The PAIR to the case above, and the one bqb1 will most likely actually be
@@ -159,7 +208,7 @@ const runOne = async (sc) => {
     const body = url.endsWith('/version') ? version(r.boot)
       : url.endsWith('/live-enforce-gates') ? gates({ time: r.time, costBar: r.costBar, armed: r.armed ?? true })
         : url.endsWith('/options-pipeline') ? pipeline(r.open)
-          : url.endsWith('/rv-scan') ? rvScan(r.scans)
+          : url.endsWith('/rv-scan') ? rvScan(r.scans, r.armCells)
             : null;
     if (!body) { res.writeHead(404).end('{}'); return; }
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body));

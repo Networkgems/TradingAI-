@@ -189,6 +189,42 @@ const rvPaths = Array.isArray(rvs?.paths) ? rvs.paths : [];
 const dirPath = rvPaths.find((p) => p.path === 'directional');
 const siblingScans = dirPath?.scanCountSinceBoot ?? null;
 const chainFetchOkAt = rvs?.dataSource?.lastFetchOkAt ?? null;
+
+// ── the RETAINED liveness axis (TRA-3080 `armByEtDay`) ──────────────────────
+// Same payload, no extra fetch. It is a STRICTLY BETTER control than the two
+// since-boot fields above, on four counts, all read off live bytes at 4cac8b70:
+//
+//   1. PER ET DAY, ON DISK (30d retention) — not since-boot. bqb1 booted 13x in
+//      7.8h today; `scanCountSinceBoot` is reset by every one of them, this is
+//      not. It is the only field on this route that can testify about a past day.
+//   2. SCOPED TO THE OTM POPULATION. Cells are keyed (accountClass × mode), so
+//      `desk × live` is exactly the 3 live desk books the sleeve runs on
+//      (byBook: admin / v0nni / Richard) — NOT the 60 fixture demo books, whose
+//      ticks say nothing about whether a live engine ran.
+//   3. UPSTREAM OF EVERY ARM FLAG. `recordDirectionalArm` is called at
+//      signal-engine.ts:6254 inside `if (isStockMarketOpen())` and ABOVE both
+//      directional flag gates — which is why 08-12's live cell exists at all,
+//      carrying `disposition: live_arm_off`. An unrelated disarm cannot silence it.
+//   4. DOWNSTREAM OF THE OTM SCAN, SAME doTick. `runOtmScan` is awaited at :6156,
+//      ~100 lines ABOVE the recorder. So a cell for today is positive proof the
+//      tick reached PAST the OTM scan site without throwing.
+//
+// POSITIVE CONTROL (the thing `scanCountSinceBoot` never had here): the 08-12
+// payload carries desk×live ticks 2216, books 3, firstAt 13:30:16Z, lastAt
+// 19:57:50Z — it has demonstrably populated across a real RTH session, and only
+// inside RTH.
+//
+// Used ONLY as a POSITIVE. Presence of the cell is the proof (a cell exists only
+// because a tick wrote it); `ticks` is a LOWER BOUND by the route's own armNote
+// (persistence is throttled to 5 min), so it is printed and never graded on.
+// Absence changes nothing on its own — the ENGINE-SILENT branch below still
+// requires the since-boot counters to agree.
+const armDays = Array.isArray(rvs?.armByEtDay) ? rvs.armByEtDay : [];
+const armToday = armDays.find((d) => d.etDay === etDay) ?? null;
+const deskLiveCell = Array.isArray(armToday?.cells)
+  ? (armToday.cells.find((c) => c.accountClass === 'desk' && c.mode === 'live') ?? null)
+  : null;
+const deskLiveTicked = Boolean(deskLiveCell);
 // `scanCountSinceBoot` is SINCE BOOT, not per ET day (TRA-2945). It only covers
 // today's session while the process booted BEFORE the open; a mid-session restart
 // resets it to 0 and would forge state (c) out of a perfectly healthy session.
@@ -199,10 +235,14 @@ console.log('LIVENESS');
 console.log(`  server now ${serverNow.toISOString()}  (open ${openZ.toISOString()}, ${minsSinceOpen >= 0 ? `T+${minsSinceOpen}` : `T${minsSinceOpen}`} min)`);
 console.log(`  marketOpen ${JSON.stringify(marketOpen)}${blockedBy.length ? `  blockedBy ${JSON.stringify(blockedBy)}` : ''}${pipe?.__err ? `  ⛔ options-pipeline: ${pipe.__err}` : ''}`);
 console.log(`  sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}  lastScanAt ${JSON.stringify(dirPath?.lastScanAt ?? null)}  chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}${rvs?.__err ? `  ⛔ rv-scan: ${rvs.__err}` : ''}`);
-console.log(`  boot ${ver.startedAt} — ${bootBeforeOpen ? 'BEFORE the open, since-boot counters cover the session' : '⛔ AT/AFTER the open: since-boot counters were RESET mid-session, the sibling control is VOID'}`);
+console.log(`  retained desk×live arm cell for ${etDay}: ${deskLiveCell ? `PRESENT — ticks ${deskLiveCell.ticks} (lower bound), books ${deskLiveCell.books}, boots ${deskLiveCell.boots}, disposition ${deskLiveCell.disposition}, first ${new Date(deskLiveCell.firstAt).toISOString()}, last ${new Date(deskLiveCell.lastAt).toISOString()}` : `ABSENT (${armDays.length} retained day(s): ${JSON.stringify(armDays.map((d) => d.etDay))})`}`);
+console.log(`  boot ${ver.startedAt} — ${bootBeforeOpen ? 'BEFORE the open, since-boot counters cover the session' : `⛔ AT/AFTER the open: since-boot counters were RESET mid-session, so the sibling control is VOID${deskLiveTicked ? ' — but the RETAINED desk×live cell is per-ET-day and survives the restart' : ''}`}`);
 console.log(`  live universe (${gates.arm?.universe?.symbols?.length ?? '?'} names) ${JSON.stringify(gates.arm?.universe?.symbols ?? null)}  restricted ${gates.arm?.universe?.restricted}`);
 
-const engineTicked = (siblingScans ?? 0) > 0 || Boolean(chainFetchOkAt);
+const engineTicked = deskLiveTicked || (siblingScans ?? 0) > 0 || Boolean(chainFetchOkAt);
+/** Minutes after the open before a zero on EVERY liveness axis can mean anything. */
+const EARLY_SESSION_MIN = 5;
+const tickEvidence = () => `retained desk×live cell ${deskLiveCell ? `PRESENT (ticks ${deskLiveCell.ticks}, ${deskLiveCell.disposition})` : 'ABSENT'}, directional scansSinceBoot ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}`;
 const controlsReadable = !pipe?.__err && !rvs?.__err && marketOpen !== null;
 
 // The adjudicated meaning of a cost_bar zero. Consumed by C2/C3/C4/C7 in place of
@@ -212,6 +252,15 @@ if (HAVE_VERDICTS) ZERO_STATE = { kind: 'GRADEABLE', why: `cost_bar evaluated ${
 else if (!controlsReadable) ZERO_STATE = { kind: 'BLIND', why: `cost_bar evaluated 0 and the liveness controls are unreadable (marketOpen ${JSON.stringify(marketOpen)}${pipe?.__err ? `, pipeline ${pipe.__err}` : ''}${rvs?.__err ? `, rv-scan ${rvs.__err}` : ''}) — this zero CANNOT be attributed` };
 else if (marketOpen === false && beforeOpen) ZERO_STATE = { kind: 'PRE-OPEN', why: `market not yet open (T${minsSinceOpen} min) — a zero here is expected and is NOT a negative` };
 else if (marketOpen === false && !afterClose) ZERO_STATE = { kind: 'NO-SESSION', why: `it is T+${minsSinceOpen} min past the nominal open yet the server reports marketOpen=false${blockedBy.length ? ` (blockedBy ${blockedBy.join('/')})` : ''} — holiday/half-day/halt. Benign, but it means TODAY CANNOT GRADE THIS; do not re-arm anything on the strength of it` };
+// THE FIRST MINUTES OF THE SESSION ARE NOT A DEFECT. Every liveness axis here
+// lags the bell: the retained arm cell is written on the first RTH tick (08-12:
+// firstAt 13:30:16Z, i.e. open+16s), the directional scan counter moves on the RV
+// cadence, and the chain fetch on the quote cadence. Run the grader at T+2 and a
+// perfectly healthy box reads zero on all three — which fell straight through to
+// ENGINE-SILENT and would have PUBLISHED A DEFECT (exit 2) against a real-money
+// acceptance. The scheduled read is T+45, so a 5-minute floor cannot mask anything
+// the carrier grades; it only stops a hand-run at the bell from forging one.
+else if (!engineTicked && minsSinceOpen < EARLY_SESSION_MIN) ZERO_STATE = { kind: 'EARLY-SESSION', why: `it is only T+${minsSinceOpen} min past the open and no liveness axis has moved yet (${tickEvidence()}) — every one of them lags the bell by at least a tick, so a zero this early is NOT attributable. Re-read at T+${EARLY_SESSION_MIN} or later (the carrier reads at T+45)` };
 // A mid-session restart voids the since-boot counter ONLY WHERE IT READS ZERO.
 // A zero after a 13:55Z boot cannot be told apart from a genuinely silent engine
 // — that is the BLIND case. But a NON-ZERO counter is POSITIVE evidence: the
@@ -222,18 +271,21 @@ else if (marketOpen === false && !afterClose) ZERO_STATE = { kind: 'NO-SESSION',
 // This matters TODAY: bqb1 booted 13x in 7.8h (median gap 18.7min), so P(restart
 // inside the 13:30-14:15Z grading window) is ~70% — the old ordering would have
 // BLINDed the acceptance at its scheduled read far more often than not.
-else if (!bootBeforeOpen && !engineTicked) ZERO_STATE = { kind: 'BLIND', why: `the process booted ${ver.startedAt}, AT OR AFTER the open, AND the since-boot scan counters read zero (directional ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}) — a reset is indistinguishable from a silent engine here, so 'the engine never ticked' is unprovable. Re-read after the next clean session` };
-else if (!engineTicked) ZERO_STATE = { kind: 'ENGINE-SILENT', why: `session ${afterClose ? 'has CLOSED' : `live (T+${minsSinceOpen} min)`} and NOTHING scanned: sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}. The engine did not run — this is a DEFECT, not a nominator result, and must NOT be reported as 'the band was empty'` };
-else ZERO_STATE = { kind: 'STARVED-UPSTREAM', why: `session ${afterClose ? 'closed' : `live (T+${minsSinceOpen} min)`}, the engine DID tick (directional scansSinceBoot ${siblingScans}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}) yet cost_bar recorded nothing. Every gate sits downstream of signal-engine.ts:9900, so the candidates died at 'result.reason !== ok || candidates.length === 0' — UPSTREAM of the nominator. A REAL negative, attributable to the scanner, NOT to the band` };
+else if (!bootBeforeOpen && !engineTicked) ZERO_STATE = { kind: 'BLIND', why: `the process booted ${ver.startedAt}, AT OR AFTER the open, AND every liveness axis reads empty (${tickEvidence()}) — the since-boot counters were reset, and the retained cell can lag the last 5 min (persistence throttle), so a reset is indistinguishable from a silent engine here and 'the engine never ticked' is unprovable. Re-read after the next clean session` };
+else if (!engineTicked) ZERO_STATE = { kind: 'ENGINE-SILENT', why: `session ${afterClose ? 'has CLOSED' : `live (T+${minsSinceOpen} min)`} and NOTHING ticked on ANY axis: ${tickEvidence()}. No live desk engine reached signal-engine.ts:6254 inside RTH today, and that recorder sits BELOW the OTM scan in the same doTick. The engine did not run — this is a DEFECT, not a nominator result, and must NOT be reported as 'the band was empty'` };
+else ZERO_STATE = { kind: 'STARVED-UPSTREAM', why: `session ${afterClose ? 'closed' : `live (T+${minsSinceOpen} min)`}, the engine DID tick (${tickEvidence()}) yet cost_bar recorded nothing. Every gate sits downstream of signal-engine.ts:9900, so the candidates died at 'result.reason !== ok || candidates.length === 0' — UPSTREAM of the nominator. A REAL negative, attributable to the scanner, NOT to the band` };
 
 console.log(`  ⇒ ZERO-STATE: ${ZERO_STATE.kind} — ${ZERO_STATE.why}\n`);
 const GRADEABLE = ZERO_STATE.kind === 'GRADEABLE';
+/** Zero-states where a zero is EXPECTED, so C2b/C3 must not read it as an adverse signal. */
+const BENIGN_ZERO = new Set(['PRE-OPEN', 'NO-SESSION', 'EARLY-SESSION']);
 
 // How a non-gradeable zero scores. The three states are NOT interchangeable and
 // none of them may quietly become "PASS".
 const ZERO_VERDICT = {
   'PRE-OPEN': 'UNGRADEABLE',
   'NO-SESSION': 'UNGRADEABLE',
+  'EARLY-SESSION': 'UNGRADEABLE',
   BLIND: 'BLIND',
   'ENGINE-SILENT': 'DEFECT',
   'STARVED-UPSTREAM': 'REAL-NEGATIVE',
@@ -266,7 +318,7 @@ const cells = Object.fromEntries((cb.byCell ?? []).map((c) => [c.cell, c]));
 const otm = cells[CELL];
 const reasons = Object.fromEntries((cb.byReason ?? []).map((r) => [r.reasonCode, r]));
 if (!GRADEABLE) {
-  record('C3 verdict', ZERO_VERDICT, `${ZERO_STATE.kind} — byCell [] is this zero, and it is ${ZERO_STATE.kind === 'PRE-OPEN' || ZERO_STATE.kind === 'NO-SESSION' ? 'benign' : 'NOT benign'}: ${ZERO_STATE.why}`);
+  record('C3 verdict', ZERO_VERDICT, `${ZERO_STATE.kind} — byCell [] is this zero, and it is ${BENIGN_ZERO.has(ZERO_STATE.kind) ? 'benign' : 'NOT benign'}: ${ZERO_STATE.why}`);
 } else if (otm) {
   const admits = (otm.evaluated ?? 0) - (otm.blocked ?? 0);
   record('C3 verdict', admits > 0 ? 'PASS' : 'REAL-NEGATIVE',
@@ -470,7 +522,7 @@ if (!WANT_LOGS) {
       // selector is disarmed. C1 says it is ARMED, so zero lines cannot mean
       // "armed but quiet": it means no symbol ever reached the nominator, which
       // is the :9900 starve. Attribute it to the SCANNER, never to the band.
-      record('C2b nomination log', ZERO_STATE.kind === 'PRE-OPEN' || ZERO_STATE.kind === 'NO-SESSION' ? 'UNGRADEABLE' : ZERO_VERDICT,
+      record('C2b nomination log', BENIGN_ZERO.has(ZERO_STATE.kind) ? 'UNGRADEABLE' : ZERO_VERDICT,
         `ZERO nomination lines this boot while C1 reads ARMED. The line is suppressed only for selection==='legacy' (disarmed), so this is not a quiet nominator — no candidate ever reached it. ${ZERO_STATE.kind}: ${ZERO_STATE.why}`);
     } else if (parsed.length === 0) {
       record('C2b nomination log', 'BLIND',
