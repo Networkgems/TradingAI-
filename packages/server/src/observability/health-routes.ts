@@ -4651,12 +4651,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //    than from the rows — a denominator taken from the rows would have reported 100%
   //    coverage over the exact week that had 0%.
   //  - `byDay[].verdict` — `fail` (a live book overstated NAV / lost an EOD row / went
-  //    tail-stale), `blind` (not graded — includes an ungraded live book), `clean`, or
-  //    `missing`. `blind` is deliberately NOT folded into `fail`: `v0nni` is live with
+  //    tail-stale), `blind` (not graded — includes an ungraded live book), `vacuous`,
+  //    `clean`, or `missing`. `blind` is deliberately NOT folded into `fail`: `v0nni` is live with
   //    $25,000 and has not filled yet, so it is ungraded every day until TRA-3417 lands,
   //    and a gate that published a red for that would be switched off inside a week.
   //    `blind` is still `alarm: true` and still not clean — the book is NAMED with the
   //    reason it could not be graded, so it is not silent either.
+  //  - `vacuity` (TRA-3450) — the tripwire RAN and had NOTHING to grade. `livePriorOptionsLagOk`
+  //    is `true` today over an EMPTY pair set: `admin`'s last non-zero `stockDaily` is
+  //    2026-07-29, one session BEFORE its own 07-30 live-options onset, so its post-onset
+  //    trip-capable denominator is 0 and `v0nni` has never traded. A gate keyed on the scalar
+  //    alone would read green forever. `vacuous` is its own persisted verdict, never folded
+  //    into `clean` and never into `blind` — read `vacuity.sessionsWithTripCapableEvidence`
+  //    before quoting this instrument as evidence that anything is being watched.
   //
   // Nothing here keys on `ok`, `drift`, `maxDriftUsd`, or `eodInteriorAbsentOk` — the
   // endpoint's own `ungradeableFields` (TRA-2630 Defect A). If the served list ever grows
@@ -4682,7 +4689,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                 ? `BLIND — graded, not clean. ${summary.coverage.marketDaysMissing.length} missing session(s); latest ungraded books: ${
                     (summary.latest?.ungradedBooks ?? []).map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
                   }.`
-                : `CLEAN — every NYSE session in the window has a graded, passing row (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).`,
+                : summary.verdict === 'vacuous'
+                  ? `VACUOUS — the tripwire RAN and had NOTHING to grade. ${summary.vacuity.consecutiveVacuousSessions} consecutive graded session(s) with a ZERO post-onset trip-capable denominator; ${summary.vacuity.sessionsWithTripCapableEvidence}/${summary.coverage.marketDaysRecorded} recorded session(s) carried any evidence. Books at zero: ${
+                      summary.vacuity.vacuousBooks.map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
+                    }. This is NOT a pass — see TRA-3450.`
+                  : `CLEAN — every NYSE session in the window has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).`,
       /**
        * RECORDED, NOT GRADED. `liveEodInteriorAbsentBooks` is the TRA-2943 discriminator
        * of record, and it is non-empty today on both live books (2026-08-07, a date NOT in

@@ -128,6 +128,61 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
     expect(body.lastFailDay).toBe('2026-08-12');
     expect(body.note).toContain('FAIL');
   });
+
+  // TRA-3450 — the route has to SAY vacuous. A reader who only ever looks at `note` is the
+  // reason the amendment exists: `livePriorOptionsLagOk: true` reads like good news.
+  it('reports VACUOUS through the route when the denominator is empty', async () => {
+    // The route summarises the last 45 CALENDAR days ending today, so every session in that
+    // window has to carry a row — otherwise `missing` makes the fold `blind` and the vacuity
+    // prose is never reached. Filled relative to the real clock so this does not rot.
+    const grade = gradeLiveNavTripwirePayload({
+        ungradeableFields: [],
+        livePriorOptionsLagOk: true, // the vacuous true
+        livePriorOptionsLagBooks: [],
+        liveBookCount: 1,
+        liveGradeableBookCount: 1,
+        liveEodRowsPresentOk: true,
+        liveEodTailMaxStaleSessions: 0,
+        engines: [
+          {
+            username: 'admin',
+            mode: 'live',
+            liveOptionsOnsetDate: '2026-07-30',
+            // Last non-zero `stockDaily` is 07-29 — one session BEFORE onset. The live state.
+            days: [
+              { date: '2026-07-29', stockDaily: -17.87, optionsDaily: 114 },
+              { date: '2026-08-12', stockDaily: 0, optionsDaily: -16 },
+            ],
+            priorOptionsLagOk: true,
+            priorOptionsLagEligibleDates: ['2026-08-12'],
+          },
+        ],
+    });
+    expect(grade.verdict).toBe('vacuous');
+    for (let back = 0; back < 46; back += 1) {
+      recordLiveNavTripwireAssertion({
+        grade,
+        source: 'served',
+        now: Date.now() - back * 86_400_000,
+      });
+    }
+    const routes = register();
+    const res = fakeRes();
+    await routes.get('/api/health/live-nav-tripwire')![0]!({ query: {} }, res);
+    const body = res.body as {
+      verdict: string;
+      alarm: boolean;
+      note: string;
+      vacuity: { vacuousBooks: Array<{ username: string; reason: string }> };
+    };
+    expect(body.verdict).toBe('vacuous');
+    expect(body.alarm).toBe(true);
+    expect(body.note).toContain('VACUOUS');
+    expect(body.note).toContain('NOTHING to grade');
+    expect(body.vacuity.vacuousBooks).toEqual([
+      { username: 'admin', reason: 'no_post_onset_trip_capable_pairs' },
+    ]);
+  });
 });
 
 describe('TRA-3449 wiring — index.ts actually calls it', () => {

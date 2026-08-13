@@ -51,7 +51,54 @@
  *   - `liveEodRowsPresentOk === false`             -> `fail`  — unwritten EOD row, live book.
  *   - `liveEodTailMaxStaleSessions > 0`            -> `fail`  — dead tail, live book.
  *   - `liveGradeableBookCount < liveBookCount`     -> `blind` — a live book is UNGRADED.
+ *   - post-onset TRIP-CAPABLE pair count `=== 0`   -> `vacuous` — ran, graded NOTHING.
  *   - any of the above `null` / absent / ungradeable-declared -> `blind`.
+ *
+ * ## TRA-3450 — why `vacuous` had to become a fifth verdict
+ *
+ * The gate as first shipped keyed the alarm on `livePriorOptionsLagOk === false`. QuantTrader
+ * measured that scalar the same beat and found it is a **VACUOUS true**: it is `true` because
+ * the pair set it quantifies over is EMPTY, not because anything passed.
+ *
+ * Recomputed here off the served 2026-08-13T03:53:21Z payload, independently of the filing:
+ *
+ *     book    onset        pairs | skipped | tripCapable | POST-onset tripCapable | trips
+ *     admin   2026-07-30      73 |      71 |           2 |                      0 |     0
+ *     v0nni   (null)           5 |       5 |           0 |                      0 |     0
+ *
+ * `admin`'s only two trip-capable pairs are 2026-07-28 and 2026-07-29 — its last non-zero
+ * `stockDaily` is 07-29, **one session BEFORE its own `liveOptionsOnsetDate` of 07-30**. So the
+ * tripwire has never observed a trip-capable session in the live-options era it exists to watch,
+ * and a gate keyed on the scalar alone would have read GREEN FOREVER and hardened a false
+ * assurance into code — the precise opposite of why TRA-3449 was filed.
+ *
+ * This is TRA-3449 item 4 ("`null` is not a pass") extended from a null scalar to an EMPTY
+ * DENOMINATOR. "Ran and passed" and "ran and had nothing to grade" are different facts and the
+ * durable record has to be able to tell them apart, so `vacuous` is its own persisted verdict —
+ * never folded into `clean`, and never folded into `blind` either. `blind` means the operand
+ * could not be read; `vacuous` means it was read perfectly and quantified over nothing.
+ *
+ * ### Two denominators, and why the STRICTER one grades
+ *
+ * `priorOptionsLagEligible` (the endpoint's own cohort) requires only `prev.optionsDaily != 0`,
+ * deliberately NOT `cur.stockDaily != 0` — given a non-zero prior the lag hypothesis names one
+ * exact value for `cur.stockDaily`, so observing `0.00` refutes it as hard as any third number.
+ * That reasoning is sound and is left untouched. But it makes the two denominators diverge on
+ * live data today: `admin` has **3** post-onset eligible dates (08-05, 08-06, 08-12) and **0**
+ * post-onset trip-capable ones. TRA-3450 asks for the trip-capable count, which is the strictly
+ * more conservative of the two, so that is what grades. The eligible count is published beside
+ * it on every row ({@link LiveNavBookDenominator.postOnsetEligiblePairs}) so the gap between the
+ * two readings stays auditable rather than becoming an argument nobody can settle from the data.
+ *
+ * ### It is graded PER BOOK, and it is red on day one — on purpose
+ *
+ * Any live book whose post-onset trip-capable count is 0 makes the axis vacuous, because a
+ * fleet-wide sum would let a busy book manufacture cover for a silent one. Both live books are
+ * at 0 today, so this axis is `vacuous` from its first row. That is the module header's
+ * born-red warning being knowingly overridden: the born-red gate that gets switched off in a
+ * week is one that reports a condition nobody can act on, whereas this one reports the exact
+ * thing the filer wants known — the real-money tripwire is currently grading nothing — and it
+ * clears by itself the first session `admin` books stock P&L after an options day.
  *
  * RECORDED BUT NOT GRADED — `liveEodInteriorAbsentBooks`. It is the discriminator of
  * record per TRA-2943 (the boolean `eodInteriorAbsentOk` is retired, pinned false), and
@@ -123,7 +170,13 @@ export const LIVE_NAV_GRADED_FIELDS = [
  */
 export const LIVE_NAV_FORBIDDEN_FIELDS = ['ok', 'drift', 'maxDriftUsd', 'eodInteriorAbsentOk'] as const;
 
-export type LiveNavAxisStatus = 'pass' | 'fail' | 'blind';
+/**
+ * `vacuous` (TRA-3450) — the axis was READ CLEANLY and quantified over an EMPTY set. It is
+ * neither `pass` (nothing passed) nor `blind` (nothing was unreadable). Keeping it distinct is
+ * the whole point of the amendment: a scalar that is `true` over zero observations and one that
+ * is `true` over a hundred are different facts.
+ */
+export type LiveNavAxisStatus = 'pass' | 'fail' | 'blind' | 'vacuous';
 
 export interface LiveNavAxis {
   status: LiveNavAxisStatus;
@@ -131,8 +184,8 @@ export interface LiveNavAxis {
   reason: string | null;
 }
 
-/** `fail` > `blind` > `clean`. `alarm` is true for the first two. */
-export type LiveNavVerdict = 'clean' | 'blind' | 'fail';
+/** `fail` > `blind` > `vacuous` > `clean`. `alarm` is true for the first three. */
+export type LiveNavVerdict = 'clean' | 'vacuous' | 'blind' | 'fail';
 
 export interface LiveNavUngradedBook {
   username: string;
@@ -145,6 +198,39 @@ export interface LiveNavUngradedBook {
    *   That is a defect in the grader, not a quiet book.
    */
   reason: 'no_eligible_dates' | 'ungraded';
+}
+
+/**
+ * TRA-3450 — per-live-book pair census for the lag tripwire's own denominator.
+ *
+ * Every count is recomputed HERE from `engines[].days[]`, not read from a served summary
+ * scalar. That is deliberate: the defect being fixed is a served scalar that reads `true` over
+ * an empty set, so a denominator taken from that same summary layer could inherit the exact
+ * emptiness it is supposed to expose.
+ */
+export interface LiveNavBookDenominator {
+  username: string;
+  /** `engines[].liveOptionsOnsetDate`. `null` ⇒ the book has never opened a live option. */
+  onsetDate: string | null;
+  /** Consecutive day pairs in the book's series, post-onset or not. */
+  totalPairs: number;
+  /**
+   * Pairs where `stockDaily[t] != 0` AND `optionsDaily[t-1] != 0` — the pairs on which
+   * `round(stockDaily[t],2) === round(optionsDaily[t-1],2)` COULD have fired. Not onset-gated.
+   */
+  tripCapablePairs: number;
+  /** {@link tripCapablePairs} additionally gated on `date[t] >= onsetDate`. **THE denominator.** */
+  postOnsetTripCapablePairs: number;
+  /** Post-onset pairs that actually tripped. Non-zero here means the `lag` axis should be red. */
+  postOnsetTripPairs: number;
+  /**
+   * The endpoint's own weaker cohort, post-onset: `priorOptionsLagEligible` requires only a
+   * non-zero PRIOR options figure. Published to keep the two readings comparable — see the
+   * module header. NOT graded.
+   */
+  postOnsetEligiblePairs: number;
+  /** `null` when the book's post-onset trip-capable count is > 0. */
+  vacuousReason: 'no_live_options_onset' | 'no_post_onset_trip_capable_pairs' | null;
 }
 
 /** The graded result. Pure function of the payload — no IO, no clock, no LLM. */
@@ -160,6 +246,12 @@ export interface LiveNavGrade {
     eodRows: LiveNavAxis;
     /** `liveEodTailMaxStaleSessions` — dead tail on a live book. */
     eodTail: LiveNavAxis;
+    /**
+     * TRA-3450 — did the `lag` axis have ANYTHING to grade? `vacuous` when any live book's
+     * post-onset trip-capable pair count is 0. Never `pass` unless every live book has at
+     * least one, so a `clean` verdict now carries a non-empty denominator by construction.
+     */
+    lagDenominator: LiveNavAxis;
   };
   /** Offending books, ready to print. Empty on a clean lag axis. */
   lagBooks: Array<{ username: string; dates: string[] }>;
@@ -172,6 +264,12 @@ export interface LiveNavGrade {
    * Diff this across consecutive rows to detect a NEW interior absence.
    */
   interiorAbsentBooks: Array<{ username: string; dates: string[] }>;
+  /**
+   * TRA-3450 — the per-live-book pair census behind the `lagDenominator` axis. Written into
+   * every row so "the tripwire had nothing to grade that day" is recoverable a year later
+   * WITHOUT the payload, which is the same durability argument as TRA-3449 criterion 2.
+   */
+  lagDenominatorBooks: LiveNavBookDenominator[];
   /** The operands verbatim, so a row is auditable a year later without re-fetching. */
   observed: {
     livePriorOptionsLagOk: boolean | null | undefined;
@@ -179,6 +277,12 @@ export interface LiveNavGrade {
     liveGradeableBookCount: number | null | undefined;
     liveEodRowsPresentOk: boolean | null | undefined;
     liveEodTailMaxStaleSessions: number | null | undefined;
+    /**
+     * TRA-3450 — the fleet sum of {@link LiveNavBookDenominator.postOnsetTripCapablePairs}.
+     * `null` when the census could not be computed at all (no readable `engines`). Recorded as
+     * a scalar as well as per book so a one-line query answers "was there anything to grade".
+     */
+    postOnsetTripCapablePairs: number | null;
     /** The endpoint's own disowned-field list, as served. */
     ungradeableFields: string[] | null;
   };
@@ -233,6 +337,101 @@ function bookList(v: unknown): Array<{ username: string; dates: string[] }> {
       username: typeof e.username === 'string' ? e.username : '(unnamed)',
       dates: Array.isArray(e.dates) ? e.dates.filter((d): d is string => typeof d === 'string') : [],
     }));
+}
+
+/**
+ * The cent tolerance the endpoint itself compares P&L at (`PNL_RECONCILE_TOLERANCE_USD`).
+ * Duplicated rather than imported so this module keeps zero coupling to the computation it
+ * audits — importing the constant would mean a future edit to the thing under test silently
+ * moves the auditor's own threshold with it.
+ */
+const CENT_TOLERANCE_USD = 0.01;
+
+function num(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * TRA-3450 — recompute, per live book, how many pairs the lag tripwire could possibly have
+ * fired on since that book's live-options onset.
+ *
+ * A pair `(t-1, t)` is TRIP-CAPABLE when `stockDaily[t] != 0` and `optionsDaily[t-1] != 0`:
+ * those are the two operands of `round(stockDaily[t],2) === round(optionsDaily[t-1],2)`, and
+ * with either at zero the predicate has no failing state on that pair. POST-ONSET adds
+ * `date[t] >= liveOptionsOnsetDate` — a trip before the book held any live option cannot be a
+ * real-money NAV overstatement, which is the same onset scoping TRA-2831 forced on the credit
+ * metrics after 100% of a "live" numerator turned out to predate onset.
+ *
+ * Returns `null` when `engines` is unreadable — the caller must grade that `blind`, never
+ * vacuous. "The census said zero" and "there was no census" are not the same reading, which is
+ * this ticket's own lesson applied one level down.
+ */
+export function computeLiveLagDenominators(payload: unknown): LiveNavBookDenominator[] | null {
+  const p = (typeof payload === 'object' && payload !== null ? payload : null) as Record<
+    string,
+    unknown
+  > | null;
+  if (p === null || !Array.isArray(p.engines)) return null;
+
+  const out: LiveNavBookDenominator[] = [];
+  for (const e of p.engines) {
+    if (typeof e !== 'object' || e === null) continue;
+    const eng = e as Record<string, unknown>;
+    if (eng.mode !== 'live') continue;
+    const username = typeof eng.username === 'string' ? eng.username : '(unnamed)';
+    const onsetDate = typeof eng.liveOptionsOnsetDate === 'string' ? eng.liveOptionsOnsetDate : null;
+    const days = Array.isArray(eng.days)
+      ? eng.days.filter((d): d is Record<string, unknown> => typeof d === 'object' && d !== null)
+      : [];
+
+    let totalPairs = 0;
+    let tripCapablePairs = 0;
+    let postOnsetTripCapablePairs = 0;
+    let postOnsetTripPairs = 0;
+    for (let i = 1; i < days.length; i += 1) {
+      const cur = days[i]!;
+      const prev = days[i - 1]!;
+      totalPairs += 1;
+      const stock = num(cur.stockDaily);
+      const priorOptions = num(prev.optionsDaily);
+      // A row missing either operand is NOT trip-capable and is NOT counted as evidence —
+      // it is the absent-field case, and counting it would inflate the very denominator
+      // whose emptiness is the finding.
+      if (stock === null || priorOptions === null) continue;
+      if (Math.abs(stock) <= CENT_TOLERANCE_USD || Math.abs(priorOptions) <= CENT_TOLERANCE_USD) {
+        continue;
+      }
+      tripCapablePairs += 1;
+      const date = typeof cur.date === 'string' ? cur.date : null;
+      // No onset ⇒ no post-onset pair can exist. ISO dates compare correctly as strings.
+      if (onsetDate === null || date === null || date < onsetDate) continue;
+      postOnsetTripCapablePairs += 1;
+      if (Math.abs(stock - priorOptions) <= CENT_TOLERANCE_USD) postOnsetTripPairs += 1;
+    }
+
+    const postOnsetEligiblePairs = Array.isArray(eng.priorOptionsLagEligibleDates)
+      ? eng.priorOptionsLagEligibleDates.filter(
+          (d): d is string => typeof d === 'string' && onsetDate !== null && d >= onsetDate,
+        ).length
+      : 0;
+
+    out.push({
+      username,
+      onsetDate,
+      totalPairs,
+      tripCapablePairs,
+      postOnsetTripCapablePairs,
+      postOnsetTripPairs,
+      postOnsetEligiblePairs,
+      vacuousReason:
+        postOnsetTripCapablePairs > 0
+          ? null
+          : onsetDate === null
+            ? 'no_live_options_onset'
+            : 'no_post_onset_trip_capable_pairs',
+    });
+  }
+  return out;
 }
 
 /**
@@ -300,6 +499,9 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
   const blind = (reason: string): LiveNavAxis => ({ status: 'blind', reason });
   const pass = (): LiveNavAxis => ({ status: 'pass', reason: null });
   const fail = (reason: string): LiveNavAxis => ({ status: 'fail', reason });
+  const vacuous = (reason: string): LiveNavAxis => ({ status: 'vacuous', reason });
+
+  const denominators = payloadUsable ? computeLiveLagDenominators(p) : null;
 
   // ── lag axis — THE tripwire ────────────────────────────────────────────────
   let lag: LiveNavAxis;
@@ -348,13 +550,41 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
   else if (eodTailRaw.value > 0) eodTail = fail(`live_book_eod_tail_stale:${eodTailRaw.value}`);
   else eodTail = pass();
 
-  const axes = { lag, coverage, eodRows, eodTail };
+  // ── TRA-3450 — did the lag axis have anything to grade? ───────────────────
+  //
+  // Graded PER BOOK: any live book at zero makes the axis vacuous. A fleet SUM would let one
+  // busy book manufacture cover for a silent one, which is the same offender-only-cohort
+  // mistake `liveGradeableBookCount` exists to catch one field over.
+  let lagDenominator: LiveNavAxis;
+  const emptyBooks = (denominators ?? []).filter((b) => b.vacuousReason !== null);
+  if (!payloadUsable) lagDenominator = blind('payload_unusable');
+  else if (disowned('livePriorOptionsLagOk')) lagDenominator = blind('operand_declared_ungradeable');
+  // A census we could not take is BLIND, never vacuous — see `computeLiveLagDenominators`.
+  else if (denominators === null) lagDenominator = blind('engines_unreadable');
+  else if (denominators.length === 0) lagDenominator = blind('empty_live_cohort');
+  else if (emptyBooks.length > 0)
+    lagDenominator = vacuous(
+      `no_post_onset_trip_capable_pairs:${emptyBooks.map((b) => `${b.username}=${b.vacuousReason}`).join(',')}`,
+    );
+  // A post-onset trip that the served scalar did NOT report is a contradiction between the
+  // endpoint's verdict and its own day rows. Louder than vacuous: it means the tripwire had
+  // something to grade and graded it wrong.
+  else if (denominators.some((b) => b.postOnsetTripPairs > 0) && lagRaw.value !== false)
+    lagDenominator = fail('post_onset_trip_not_reported_by_scalar');
+  else lagDenominator = pass();
+
+  const axes = { lag, coverage, eodRows, eodTail, lagDenominator };
   const statuses = Object.values(axes).map((a) => a.status);
+  // `fail` > `blind` > `vacuous` > `clean`. `vacuous` must outrank `clean` (TRA-3450: never
+  // folded into green) and must NOT outrank `blind` — an unreadable operand is the worse
+  // state, because it could be hiding either of the other two.
   const verdict: LiveNavVerdict = statuses.includes('fail')
     ? 'fail'
     : statuses.includes('blind')
       ? 'blind'
-      : 'clean';
+      : statuses.includes('vacuous')
+        ? 'vacuous'
+        : 'clean';
 
   return {
     verdict,
@@ -365,12 +595,17 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
     eodRowMissingBooks,
     eodTailStaleBooks,
     interiorAbsentBooks,
+    lagDenominatorBooks: denominators ?? [],
     observed: {
       livePriorOptionsLagOk: lagRaw.value,
       liveBookCount: bookCountRaw.value,
       liveGradeableBookCount: gradeableRaw.value,
       liveEodRowsPresentOk: eodRowsRaw.value,
       liveEodTailMaxStaleSessions: eodTailRaw.value,
+      postOnsetTripCapablePairs:
+        denominators === null
+          ? null
+          : denominators.reduce((n, b) => n + b.postOnsetTripCapablePairs, 0),
       ungradeableFields: rawUngradeable,
     },
   };
@@ -408,7 +643,12 @@ function validRecord(v: unknown): LiveNavTripwireRecord | null {
   if (r.kind !== 'assert') return null;
   if (typeof r.ts !== 'number' || !Number.isFinite(r.ts)) return null;
   if (typeof r.etDay !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.etDay)) return null;
-  if (r.verdict !== 'clean' && r.verdict !== 'blind' && r.verdict !== 'fail') return null;
+  // `vacuous` is TRA-3450's persisted state. Rows written before it existed carry the other
+  // three and hydrate unchanged — their `lagDenominatorBooks` is simply absent, which the
+  // summary reports as an unknown census rather than as a zero one.
+  if (r.verdict !== 'clean' && r.verdict !== 'blind' && r.verdict !== 'fail' && r.verdict !== 'vacuous') {
+    return null;
+  }
   if (typeof r.axes !== 'object' || r.axes === null) return null;
   return r as unknown as LiveNavTripwireRecord;
 }
@@ -474,6 +714,14 @@ export function recordLiveNavTripwireAssertion(
       lagBooks: rec.lagBooks,
       eodRowMissingBooks: rec.eodRowMissingBooks,
       eodTailStaleBooks: rec.eodTailStaleBooks,
+    });
+  } else if (rec.verdict === 'vacuous') {
+    // WARN, not INFO. The tripwire ran and had nothing to grade — which reads exactly like a
+    // clean day to anyone watching the scalar, and is the whole of TRA-3450.
+    log.warn('live-money NAV tripwire: VACUOUS — ran, graded NOTHING (TRA-3450)', {
+      etDay,
+      lagDenominatorBooks: rec.lagDenominatorBooks,
+      postOnsetTripCapablePairs: rec.observed.postOnsetTripCapablePairs,
     });
   } else if (rec.verdict === 'blind') {
     log.warn('live-money NAV tripwire: BLIND — not clean, not graded (TRA-3449)', {
@@ -564,6 +812,11 @@ export interface LiveNavDaySummary {
   axes: LiveNavTripwireRecord['axes'] | null;
   lagBooks: Array<{ username: string; dates: string[] }>;
   ungradedBooks: LiveNavUngradedBook[];
+  /**
+   * TRA-3450 — fleet post-onset trip-capable pair count on that day. `null` on a `missing`
+   * day and on a pre-TRA-3450 row (census not taken vs census taken and empty).
+   */
+  postOnsetTripCapablePairs: number | null;
 }
 
 export interface LiveNavTripwireSummary {
@@ -587,6 +840,26 @@ export interface LiveNavTripwireSummary {
   lastFailDay: string | null;
   /** Consecutive most-recent market days with no row. >0 means the writer is down NOW. */
   consecutiveMissingSessions: number;
+  /**
+   * TRA-3450 — the vacuity record. Separate from `coverage`: coverage answers "did the check
+   * run", this answers "did it have anything to grade when it did". A window can be 100%
+   * covered and 100% vacuous at the same time, which is exactly the state on 2026-08-13.
+   */
+  vacuity: {
+    /** Sessions in the window whose verdict was `vacuous`. */
+    sessionsVacuous: number;
+    /**
+     * Sessions whose row was graded (any verdict) AND carried a non-empty post-onset
+     * trip-capable census. THE number to quote when claiming the tripwire is watching.
+     */
+    sessionsWithTripCapableEvidence: number;
+    /** Consecutive most-recent GRADED sessions with a zero/absent census. */
+    consecutiveVacuousSessions: number;
+    /** Latest row's per-book census, or `[]` on a pre-TRA-3450 / absent row. */
+    latestDenominators: LiveNavBookDenominator[];
+    /** Live books at zero on the latest row, with the reason. */
+    vacuousBooks: Array<{ username: string; reason: string }>;
+  };
   /** Non-graded evidence — diff across days to find a NEW interior absence (TRA-2943). */
   interiorAbsentBooksLatest: Array<{ username: string; dates: string[] }>;
   durability: {
@@ -643,6 +916,7 @@ export function summarizeLiveNavTripwire(
         axes: null,
         lagBooks: [],
         ungradedBooks: [],
+        postOnsetTripCapablePairs: null,
       };
     }
     return {
@@ -654,6 +928,9 @@ export function summarizeLiveNavTripwire(
       axes: rec.axes,
       lagBooks: rec.lagBooks,
       ungradedBooks: rec.ungradedBooks,
+      // `?? null` covers the pre-TRA-3450 row, whose census was never taken. Defaulting it
+      // to 0 would back-date a vacuity finding onto days that were never measured for it.
+      postOnsetTripCapablePairs: rec.observed?.postOnsetTripCapablePairs ?? null,
     };
   });
 
@@ -661,11 +938,20 @@ export function summarizeLiveNavTripwire(
   const missing = sessions.filter((d) => d.verdict === 'missing').map((d) => d.etDay);
   const recorded = sessions.length - missing.length;
 
-  // Only sessions carry a verdict. `fail` beats `blind`/`missing` beats `clean`.
+  // Only sessions carry a verdict. `fail` > `blind`/`missing` > `vacuous` > `clean`.
   const anyFail = sessions.some((d) => d.verdict === 'fail');
   const anyBlind = sessions.some((d) => d.verdict === 'blind' || d.verdict === 'missing');
+  const anyVacuous = sessions.some((d) => d.verdict === 'vacuous');
   const verdict: LiveNavVerdict | null =
-    sessions.length === 0 ? null : anyFail ? 'fail' : anyBlind ? 'blind' : 'clean';
+    sessions.length === 0
+      ? null
+      : anyFail
+        ? 'fail'
+        : anyBlind
+          ? 'blind'
+          : anyVacuous
+            ? 'vacuous'
+            : 'clean';
 
   let consecutiveMissing = 0;
   for (const d of sessions) {
@@ -675,6 +961,21 @@ export function summarizeLiveNavTripwire(
 
   const ordered = [...rows.values()].sort((a, b) => b.ts - a.ts);
   const latest = ordered[0] ?? null;
+
+  // TRA-3450 — vacuity is counted over GRADED sessions only. A `missing` session is a coverage
+  // fact, already counted above; folding it in here would double-count the same absence under
+  // two headings and make "the tripwire had nothing to grade" unreadable.
+  const gradedSessions = sessions.filter((d) => d.verdict !== 'missing');
+  const sessionsVacuous = gradedSessions.filter((d) => d.verdict === 'vacuous').length;
+  const sessionsWithTripCapableEvidence = gradedSessions.filter(
+    (d) => (d.postOnsetTripCapablePairs ?? 0) > 0,
+  ).length;
+  let consecutiveVacuousSessions = 0;
+  for (const d of gradedSessions) {
+    if ((d.postOnsetTripCapablePairs ?? 0) > 0) break;
+    consecutiveVacuousSessions += 1;
+  }
+  const latestDenominators = latest?.lagDenominatorBooks ?? [];
 
   return {
     verdict,
@@ -689,6 +990,15 @@ export function summarizeLiveNavTripwire(
     latest,
     lastFailDay: sessions.find((d) => d.verdict === 'fail')?.etDay ?? null,
     consecutiveMissingSessions: consecutiveMissing,
+    vacuity: {
+      sessionsVacuous,
+      sessionsWithTripCapableEvidence,
+      consecutiveVacuousSessions,
+      latestDenominators,
+      vacuousBooks: latestDenominators
+        .filter((b) => b.vacuousReason !== null)
+        .map((b) => ({ username: b.username, reason: b.vacuousReason as string })),
+    },
     interiorAbsentBooksLatest: latest?.interiorAbsentBooks ?? [],
     durability: {
       ephemeral: isEphemeralDataDir(dataDir),
