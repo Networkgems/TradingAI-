@@ -6,6 +6,7 @@ import { isJournalAuthoritativeSource, journalRealizingEvents } from './options-
 // compile time, so this is not a runtime cycle.
 import {
   PNL_EOD_DOCUMENTED_GAP_NOTE,
+  PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   sessionsInRange,
 } from './eod-ledger-gap.js';
@@ -163,6 +164,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
+  PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_COMBINED_AGREEMENT_NOTE,
 ];
 
@@ -215,6 +217,13 @@ export const PNL_DRIFT_GRADEABLE = false;
  * `eodInteriorAbsentBooks`; see `EOD_INTERIOR_ABSENT_OK_RETIREMENT`, published on
  * the payload as `eodInteriorAbsentOkRetirement`. `liveEodInteriorAbsentOk` is a
  * DIFFERENT cohort and is deliberately absent from this list — it stays gradeable.
+ *
+ * TRA-2931 gives that entry a machine-readable successor: `eodInteriorAbsentOk`
+ * stays here and stays pinned false, but `eodInteriorNotAcknowledgedOk` /
+ * `eodInteriorNotAcknowledgedBooks` grade the same absence with the adjudicated
+ * `enock` pairs subtracted, so a gate has a predicate instead of the retirement's
+ * human instruction to "read the set of usernames". It is deliberately NOT in
+ * this list. Note it is RED today and correctly so — 2026-08-07, TRA-3267.
  */
 export const PNL_UNGRADEABLE_FIELDS = [
   'ok',

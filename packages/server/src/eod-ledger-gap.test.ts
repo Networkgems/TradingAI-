@@ -3,9 +3,12 @@ import {
   EOD_DOCUMENTED_GAP,
   EOD_DOCUMENTED_GAP_DATES,
   EOD_INTERIOR_ABSENT_OK_RETIREMENT,
+  EOD_INTERIOR_ACKNOWLEDGED_ABSENCE,
   PNL_EOD_DOCUMENTED_GAP_NOTE,
+  PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   detectEodInteriorAbsence,
+  isAcknowledgedInteriorAbsence,
   sessionsInRange,
   summarizeEodInteriorAbsence,
 } from './eod-ledger-gap.js';
@@ -417,5 +420,242 @@ describe('TRA-2943 — the in-band retirement of eodInteriorAbsentOk', () => {
       expect(published).toContain(named.replace(/`/g, ''));
     }
     expect(published).toContain('eodInteriorAbsentOkRetirement');
+  });
+});
+
+// ── TRA-2931 (ruling TRA-2928 D2) ────────────────────────────────────────────
+//
+// The acknowledged `(book, date)` allow-list and the gateable not-acknowledged
+// axis. The ruling's six original constraints plus constraint 7 from the
+// 2026-08-12 amendment are encoded one-to-one below, because every one of them
+// names an implementation that is plausible and NOT authorised.
+//
+// The fixture reproduces the live fleet shape read off bqb1 2026-08-13T15:17Z:
+// `enock` absent on its 10 post-baseline acknowledged dates + the 3 ENOSPC dates
+// + 2026-08-07; `admin` and `v0nni` absent on the 3 ENOSPC dates + 2026-08-07;
+// one book clean throughout. That is deliberately not a hand-built pair of
+// arrays — it is driven through `detectEodInteriorAbsence` off row dates, so the
+// constraint-1 assertions grade the real path and not a mock of it.
+
+const TRA2931_CALENDAR = { lastSettledSession: '2026-08-12', isMarketDay };
+const TRA2931_BASELINE = '2026-07-12';
+const ENOSPC = ['2026-07-30', '2026-07-31', '2026-08-03'];
+const FRIDAY_BUG = '2026-08-07'; // TRA-3267 — open, undocumented, NOT acknowledged
+
+const rowsMissing = (absent: readonly string[], from = '2026-06-01'): string[] => {
+  const skip = new Set(absent);
+  return sessionsInRange(from, '2026-08-12', isMarketDay).filter(s => !skip.has(s));
+};
+
+const book = (username: string, mode: string, absent: readonly string[], from?: string) => ({
+  username,
+  mode,
+  interior: detectEodInteriorAbsence(rowsMissing(absent, from), TRA2931_CALENDAR, TRA2931_BASELINE),
+});
+
+/** The 28 acknowledged sessions, derived from the calendar rather than retyped. */
+const ACK_28 = sessionsInRange('2026-06-15', '2026-07-24', isMarketDay);
+/** The post-baseline remainder the route can actually see — the clamp artifact. */
+const ACK_VISIBLE_10 = ACK_28.filter(d => d > TRA2931_BASELINE);
+
+const fleet = () => [
+  book('enock', 'demo', [...ACK_28, ...ENOSPC, FRIDAY_BUG]),
+  book('admin', 'live', [...ENOSPC, FRIDAY_BUG], '2026-07-01'),
+  book('v0nni', 'live', [...ENOSPC, FRIDAY_BUG], '2026-07-01'),
+  book('clean_book', 'demo', [], '2026-07-01'),
+];
+
+describe('TRA-2931 — acknowledged interior absence, published as an identity + a gateable axis', () => {
+  it('constraint 1 — ADDITIVE ONLY: every pre-existing field holds its pre-change value', () => {
+    const s = summarizeEodInteriorAbsence(fleet());
+
+    // The fleet fold stays RED. This is the assertion the ruling cares about
+    // most: if the acknowledgement had been wired as an exclusion, this flips.
+    expect(s.eodInteriorAbsentOk).toBe(false);
+
+    // `enock` is STILL NAMED, with ALL of its net dates — the 10 acknowledged
+    // ones included. Misuse of an annotation stays visible in the raw array;
+    // misuse of an exclusion does not, which is the whole difference.
+    const abs = new Map(s.eodInteriorAbsentBooks.map(b => [b.username, b.dates]));
+    expect(abs.get('enock')).toEqual([...ACK_VISIBLE_10, FRIDAY_BUG]);
+    expect(abs.get('admin')).toEqual([FRIDAY_BUG]);
+    expect(abs.get('v0nni')).toEqual([FRIDAY_BUG]);
+    expect(abs.has('clean_book')).toBe(false);
+
+    // The acceptance arm — a drop here would mean the detector was blinded.
+    expect(s.eodInteriorAbsentRawBookCount).toBe(3);
+    expect(s.eodInteriorGradeableBookCount).toBe(4);
+    expect(s.eodInteriorDocumentedGapBooks.map(b => b.username).sort())
+      .toEqual(['admin', 'enock', 'v0nni']);
+
+    // Per book, exact, through the real detector.
+    const enock = fleet()[0]!.interior;
+    expect(enock.interiorAbsentRaw).toEqual([...ACK_VISIBLE_10, ...ENOSPC, FRIDAY_BUG]);
+    expect(enock.interiorAbsentDocumented).toEqual(ENOSPC);
+    expect(enock.interiorAbsentNet).toEqual([...ACK_VISIBLE_10, FRIDAY_BUG]);
+    expect(enock.interiorAbsentOk).toBe(false);
+
+    // And the live cohort — enock is demo, so it was never in it.
+    expect(s.liveEodInteriorAbsentOk).toBe(false);
+    expect(s.liveEodInteriorAbsentBooks.map(b => b.dates)).toEqual([[FRIDAY_BUG], [FRIDAY_BUG]]);
+  });
+
+  it('constraint 2 — enumerates all 28 sessions, not the 10 the clamped route can see', () => {
+    const r = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE;
+    expect(r.pairCount).toBe(28);
+    expect(r.pairs.length).toBe(28);
+    expect(r.pairs.map(p => p.date)).toEqual(ACK_28);
+    expect(r.pairs.every(p => p.book === 'enock')).toBe(true);
+    // The 18 pre-baseline pairs are inert TODAY and that is the point: they stop
+    // the axis re-redding the day `baselineDate` moves off 2026-07-12.
+    expect(ACK_VISIBLE_10.length).toBe(10);
+    expect(r.pairs.filter(p => p.date <= TRA2931_BASELINE).length).toBe(18);
+  });
+
+  it('constraint 3 — the unit is a (book, date) PAIR, so a 29th date or a second book fires', () => {
+    // A 29th absent date on enock, one session past the acknowledged span.
+    const extra = book('enock', 'demo', [...ACK_28, '2026-07-27', ...ENOSPC, FRIDAY_BUG]);
+    const withExtra = summarizeEodInteriorAbsence([extra]);
+    expect(withExtra.eodInteriorNotAcknowledgedBooks[0]!.dates).toEqual(['2026-07-27', FRIDAY_BUG]);
+    expect(withExtra.eodInteriorNotAcknowledgedOk).toBe(false);
+
+    // The SAME acknowledged dates on a DIFFERENT book are not acknowledged at
+    // all. A bare date list — the obvious wrong implementation — would green
+    // this book too.
+    const impostor = summarizeEodInteriorAbsence([book('v0nni', 'live', [...ACK_28, FRIDAY_BUG])]);
+    expect(impostor.eodInteriorNotAcknowledgedBooks[0]!.dates)
+      .toEqual([...ACK_VISIBLE_10, FRIDAY_BUG]);
+    expect(impostor.eodInteriorNotAcknowledgedOk).toBe(false);
+    expect(isAcknowledgedInteriorAbsence('v0nni', ACK_28[0]!)).toBe(false);
+    expect(isAcknowledgedInteriorAbsence('enock', ACK_28[0]!)).toBe(true);
+  });
+
+  it('constraint 4 — 2026-06-19 and 2026-07-03 are holidays and are NOT in the list', () => {
+    const dates = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.pairs.map(p => p.date);
+    expect(dates).not.toContain('2026-06-19');
+    expect(dates).not.toContain('2026-07-03');
+    expect(EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.nonSessionDatesInSpan)
+      .toEqual(['2026-06-19', '2026-07-03']);
+    // They are not sessions, so the detector never expects a row on them either —
+    // the record and the calendar must not disagree about what a session is.
+    expect(isMarketDay('2026-06-19')).toBe(false);
+    expect(isMarketDay('2026-07-03')).toBe(false);
+  });
+
+  it('constraint 5 — an ACKNOWLEDGEMENT, cause NOT MEASURED, pointing at the open question', () => {
+    const r = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE;
+    expect(r.cause).toContain('NOT MEASURED');
+    expect(r.cause).toContain('TRA-2903');
+    expect(r.openQuestionTicket).toBe('TRA-2903');
+    expect(r.isDocumentedGap).toBe(false);
+    expect(r.feedsDocumentedGapExclusion).toBe(false);
+    expect(r.excludedFromVerdict).toBe(false);
+    expect(r.backfillAuthorised).toBe(false);
+    // DISJOINT from the documented-gap path, in both directions.
+    const ack = new Set(r.pairs.map(p => p.date));
+    for (const d of EOD_DOCUMENTED_GAP_DATES) expect(ack.has(d)).toBe(false);
+    for (const d of ack) expect(EOD_DOCUMENTED_GAP_DATES).not.toContain(d);
+  });
+
+  it('constraint 6 — EOD_DOCUMENTED_GAP_DATES is untouched and still un-scoped by book', () => {
+    // No per-book scoping was built. The constant is still three bare date
+    // strings on a fleet-wide path, exactly as TRA-2888 left it.
+    expect([...EOD_DOCUMENTED_GAP_DATES]).toEqual(ENOSPC);
+    for (const d of EOD_DOCUMENTED_GAP_DATES) expect(typeof d).toBe('string');
+    // And the acknowledged pairs cannot be fed to it: they are book-keyed
+    // objects, so the documented-gap `Set` membership test can never match one.
+    // (Forced past the type system here precisely because the type system is the
+    // guarantee — this asserts it holds at runtime too.)
+    const asGap = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.pairs as unknown as readonly string[];
+    const forced = detectEodInteriorAbsence(
+      rowsMissing([...ACK_28, ...ENOSPC, FRIDAY_BUG]),
+      TRA2931_CALENDAR,
+      TRA2931_BASELINE,
+      asGap,
+    );
+    expect(forced.interiorAbsentDocumented).toEqual([]);
+    expect(forced.interiorAbsentNet).toEqual([...ACK_VISIBLE_10, ...ENOSPC, FRIDAY_BUG]);
+  });
+
+  it('constraint 7 — 2026-08-07 is an OPEN defect and stays RED on all books, enock included', () => {
+    const s = summarizeEodInteriorAbsence(fleet());
+    expect(isAcknowledgedInteriorAbsence('enock', FRIDAY_BUG)).toBe(false);
+    expect(JSON.stringify(EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.pairs)).not.toContain(FRIDAY_BUG);
+    const named = EOD_INTERIOR_ACKNOWLEDGED_ABSENCE.deliberatelyNotAcknowledged
+      .find(x => x.dates.includes(FRIDAY_BUG));
+    expect(named?.ticket).toBe('TRA-3267');
+    expect(s.eodInteriorNotAcknowledgedBooks.length).toBe(3);
+    for (const b of s.eodInteriorNotAcknowledgedBooks) expect(b.dates).toContain(FRIDAY_BUG);
+  });
+
+  it('acceptance C — the live positive control: RED, and enock reads EXACTLY [2026-08-07]', () => {
+    const s = summarizeEodInteriorAbsence(fleet());
+    const not = new Map(s.eodInteriorNotAcknowledgedBooks.map(b => [b.username, b.dates]));
+
+    // `[]` would mean the acknowledgement swallowed a date outside its set;
+    // the full 11 would mean it is not subtracting at all. One assertion, both
+    // failure directions.
+    expect(not.get('enock')).toEqual([FRIDAY_BUG]);
+    expect(not.get('admin')).toEqual([FRIDAY_BUG]);
+    expect(not.get('v0nni')).toEqual([FRIDAY_BUG]);
+    expect(not.has('clean_book')).toBe(false);
+    expect(s.eodInteriorNotAcknowledgedBookCount).toBe(3);
+    expect(s.eodInteriorNotAcknowledgedOk).toBe(false);
+    expect(s.liveEodInteriorNotAcknowledgedOk).toBe(false);
+    expect(s.liveEodInteriorNotAcknowledgedBooks.map(b => b.username)).toEqual(['admin', 'v0nni']);
+
+    // The OBSERVED acknowledged arm — 10 visible against a pairCount of 28. The
+    // gap is the clamp, published rather than inferred.
+    expect(s.eodInteriorAcknowledgedBooks).toEqual([
+      { username: 'enock', dates: ACK_VISIBLE_10, acknowledgedPairCount: 28 },
+    ]);
+  });
+
+  it('goes GREEN only when the un-acknowledged absence is actually repaired', () => {
+    // Same fleet with 2026-08-07 written (what TRA-3267 + a re-archive would
+    // produce). The axis has a REACHABLE green — without this it would be the
+    // same dead reading the ticket was filed to replace.
+    const repaired = [
+      book('enock', 'demo', [...ACK_28, ...ENOSPC]),
+      book('admin', 'live', [...ENOSPC], '2026-07-01'),
+      book('clean_book', 'demo', [], '2026-07-01'),
+    ];
+    const s = summarizeEodInteriorAbsence(repaired);
+    expect(s.eodInteriorNotAcknowledgedOk).toBe(true);
+    expect(s.eodInteriorNotAcknowledgedBooks).toEqual([]);
+    // ...while the retired boolean is STILL false, because enock still has the
+    // absence. That divergence IS the deliverable.
+    expect(s.eodInteriorAbsentOk).toBe(false);
+    expect(s.eodInteriorAbsentBooks.map(b => b.username)).toEqual(['enock']);
+  });
+
+  it('inherits NOT MEASURED — an empty interior cohort is never folded to a pass', () => {
+    // No rows at all => `interiorAbsentOk: null`. Subtracting an allow-list from
+    // an empty set must not manufacture a green out of it; `every` on the empty
+    // cohort is exactly the vacuous pass this module exists to refuse.
+    const blind = {
+      username: 'never_archived',
+      mode: 'demo',
+      interior: detectEodInteriorAbsence([], TRA2931_CALENDAR, TRA2931_BASELINE),
+    };
+    expect(blind.interior.interiorAbsentOk).toBeNull();
+    const s = summarizeEodInteriorAbsence([blind]);
+    expect(s.eodInteriorNotAcknowledgedOk).toBeNull();
+    expect(s.eodInteriorNotAcknowledgedBooks).toEqual([]);
+    // And the empty fleet stays null on the new axis too.
+    expect(summarizeEodInteriorAbsence([]).eodInteriorNotAcknowledgedOk).toBeNull();
+  });
+
+  it('the caveat ships and only names fields that exist on the published shape', () => {
+    expect(PNL_RECONCILIATION_CAVEATS).toContain(PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE);
+    const published = Object.keys(summarizeEodInteriorAbsence([]));
+    for (const named of PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE.match(/`eodInterior[A-Za-z]+`/g) ?? []) {
+      expect(published).toContain(named.replace(/`/g, ''));
+    }
+    expect(published).toContain('eodInteriorAcknowledgedAbsence');
+    // The note must name the gateable axis and the two tickets a reader needs.
+    expect(PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE).toContain('eodInteriorNotAcknowledgedOk');
+    expect(PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE).toContain('TRA-3267');
+    expect(PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE).toContain('NOT MEASURED');
   });
 });
