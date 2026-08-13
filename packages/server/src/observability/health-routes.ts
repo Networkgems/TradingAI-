@@ -70,6 +70,7 @@ import {
 } from '../option-exec-flag.js';
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
+import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeRvScanPath, RV_SCAN_PATH_STRUCTURE_LABEL } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
@@ -5758,6 +5759,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         closedSinceTs,
       ),
       voids,
+      // TRA-3547 — the zombie alarm, unauthenticated like the rest of this
+      // route. A live `OPEN` row the broker tape says is NOT open sat silently
+      // for 10 days because nothing published the contradiction; `summary` alone
+      // cannot show it, since the journal is internally consistent — the defect
+      // is only visible AGAINST the fill ledger.
+      //
+      // Read `zombieOpenRows.count`: `null` = never checked (the pass has not
+      // ticked, or the journal flag is off), `0` = checked and clean. Those are
+      // different facts and this shape refuses to collapse them.
+      zombieSweep: getZombieOpenSweepState(),
     });
   });
 
