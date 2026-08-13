@@ -38,6 +38,11 @@ export {
   modelSupportsAdaptiveThinking,
   DEFAULT_TIER_MODELS,
   DEFAULT_MODEL_PRICING,
+  // TRA-3442 — the per-call ceiling, exported so a caller's budget arithmetic can
+  // be asserted against the module that OWNS it rather than against a copy.
+  LLM_CALL_TIMEOUT_MS,
+  LLM_MAX_RETRIES,
+  LLM_CALL_CEILING_MS,
   type AnthropicLlmClientOptions,
   type AnthropicLike,
   type TierModelMap,

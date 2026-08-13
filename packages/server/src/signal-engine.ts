@@ -119,7 +119,13 @@ import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 import { beginRvScan } from './rv-scan-telemetry.js';
 // TRA-2262 (parent TRA-2203) — per-tick wall-clock budget + rotating cursor for
 // the three unbounded doTick fan-out sinks named by the Friday RTH tape.
-import { runBudgetedSweep, nextSweepDelayMs, type SweepPass } from './tick-sweep-budget.js';
+import { runBudgetedSweep, nextSweepDelayMs, sweepCursors, type SweepPass } from './tick-sweep-budget.js';
+import {
+  AGENTS_ADVISORY_SYMBOL_DEADLINE_MS,
+  AGENTS_ADVISORY_BREAKER_COOLDOWN_MS,
+  runAdvisorySweep,
+  withSymbolDeadline,
+} from './agents-advisory-bound.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
 import {
   DEFAULT_WHEEL_GUARDS,
@@ -3026,6 +3032,31 @@ export class SignalEngine {
   private mtfSweep: SweepPass | null = null;
   private otmSweep: SweepPass | null = null;
   private shortPremiumSweep: SweepPass | null = null;
+  /**
+   * TRA-3442 — the last budgeted `agents-advisory` pass. Incomplete ⇒ the sweep
+   * is parked mid-universe and resumes on the next tick, which is what keeps the
+   * 30s budget from pinning LLM coverage to the head of the watchlist. (Measured
+   * on the 2026-08-12 tape: every unbounded pass ran `first=AAPL last=BAOS`, so a
+   * budget WITHOUT a cursor would starve the tail permanently.)
+   */
+  private agentsAdvisorySweep: SweepPass | null = null;
+  /**
+   * TRA-3442 — recommendations accumulated across the CURRENT rotation, drained
+   * into `latestAgentRecommendations` only when the rotation completes.
+   *
+   * ⭐ TRA-3019's producer rule: `latestAgentRecommendations` is consumed as a
+   * WHOLE-UNIVERSE snapshot (proposal raising, the WS `agentRecommendations`
+   * payload, `find`/`filter` by symbol), and the tick REPLACES it wholesale.
+   * Slicing the producer without accumulating would swap a 639-symbol snapshot
+   * for a ~230-symbol one on every truncated pass — nothing throws, no counter
+   * moves, the panel just quietly shows a third of the book.
+   */
+  private pendingAgentRecos = new Map<string, AgentRecommendation>();
+  /**
+   * TRA-3442 — epoch ms until which the advisory sink stands down after its
+   * failure breaker tripped. 0 = armed. See AGENTS_ADVISORY_BREAKER_COOLDOWN_MS.
+   */
+  private agentsAdvisoryBreakerUntil = 0;
   /**
    * TRA-3441 — the cold-bar candle sweep's last pass. An incomplete pass ALSO
    * freezes {@link candleScanTickCount}: the sink's universe is a rotating shard
@@ -6135,7 +6166,13 @@ export class SignalEngine {
     // TRADING_AGENTS_IGNORE_MARKET_HOURS=1 to restore the old always-on behaviour.
     // Outside the window we fall through to the stale-recommendation clear below.
     const agentMarketWindowOpen = isAgentMarketHoursGateDisabled() || isAgentTradingWindowOpen();
-    if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted() && agentMarketWindowOpen) {
+    // TRA-3442 — the failure breaker's cooldown. A systemic provider refusal
+    // (billing/credential/outage) cannot be fixed by trying the next symbol or
+    // the next tick, and on 2026-08-12 this loop re-discovered one 5,184 times in
+    // 15 minutes. Standing down is the whole point; it self-arms when the
+    // cooldown expires, so a restored provider needs no operator action.
+    const agentsBreakerClear = Date.now() >= this.agentsAdvisoryBreakerUntil;
+    if (this.tradingAgentsEnabled && equityStrategiesActiveOnTick && !this.riskGovernor.isHalted() && agentMarketWindowOpen && agentsBreakerClear) {
       await withPhase('signal.doTick.agents-advisory', () => this.runTradingAgentsAdvisory(activeSymbols));
       // TRA-941 (TRA-813 P2/3) — proposal queue. Each APPROVE recommendation
       // becomes a PENDING proposal (never an immediate order); the demo auto-
@@ -6145,9 +6182,23 @@ export class SignalEngine {
       // pending-proposals panel. This replaces the TRA-796 blanket auto-route so
       // a confirmed proposal is the ONLY thing that reaches capital.
       await withPhase('signal.doTick.agent-proposals', () => this.processAgentProposals(prices));
-    } else if (this.latestAgentRecommendations.length > 0) {
-      // Clear stale recommendations once the layer is switched back off.
+    } else if (this.latestAgentRecommendations.length > 0 || this.pendingAgentRecos.size > 0) {
+      // Clear stale recommendations once the layer is switched back off — and,
+      // TRA-3442, once the failure breaker has stood the sink down. Both mean the
+      // same thing to a consumer: nothing is refreshing this set any more, so
+      // continuing to surface it (or to raise proposals from it) would be acting
+      // on an advisory read the layer can no longer vouch for. The half-built
+      // rotation goes with it, so the sink restarts from a clean snapshot rather
+      // than draining a partial accumulated before the outage.
       this.latestAgentRecommendations = [];
+      this.pendingAgentRecos.clear();
+      // 🔴 The cursor MUST go with the accumulator. Dropping the half-built
+      // rotation while leaving the cursor parked mid-universe would let the next
+      // resumed pass reach the end of the walk — `pass.complete` — holding only
+      // the TAIL it happened to run after the outage, and publish that as the
+      // whole-universe snapshot. Two safe pieces, one unsafe composition.
+      sweepCursors.clear(`${this.mode}:agents-advisory`);
+      this.agentsAdvisorySweep = null;
     }
 
     // TRA-451 — SMA-200 trend-filter scan on daily bars. Runs on its own slow
@@ -12621,9 +12672,14 @@ export class SignalEngine {
    * symbol through `adviseSymbol`, which (a) runs the REAL Haiku/Sonnet agents when
    * the layer is enabled, a model is wired, and the user is under the $2/user/day
    * cap, else the deterministic zero-spend graph, (b) accounts real spend, and
-   * (c) NEVER routes to capital (advisor-only; gating is P4). Per-symbol failures
-   * are logged and skipped so one bad symbol can't kill the tick. Risk-gated by the
+   * (c) NEVER routes to capital (advisor-only; gating is P4). Risk-gated by the
    * caller (halt / kill switch suppress it).
+   *
+   * TRA-3442 — the walk is now BUDGETED, CURSORED and BREAKERED. A single bad
+   * symbol is still logged and skipped; a RUN of failures stands the sink down,
+   * because on 2026-08-12 "skip and continue" meant re-discovering one
+   * non-retryable provider refusal 639 times per pass, 8 passes, for 732.6s of
+   * tick wall clock and no recommendations at all.
    */
   private async runTradingAgentsAdvisory(symbols: string[]): Promise<void> {
     const llm = this.resolveAgentsLlm();
@@ -12641,10 +12697,78 @@ export class SignalEngine {
     const reviewBlock = this.tradingAgentsEnabled
       ? (await getLatestReviewBlock()) ?? undefined
       : undefined;
-    const recos: AgentRecommendation[] = [];
-    for (const sym of symbols) {
+    // TRA-3442 — bounded + cursored. On the 2026-08-12 RTH tape this walk ran the
+    // WHOLE 639-symbol universe serially, 8 times, at ~130ms/symbol, with all
+    // 5,184 per-symbol calls failing on one non-retryable Anthropic 400 ("credit
+    // balance is too low") — 732.6s of tick wall clock for zero recommendations.
+    // The budget bounds the pass, the cursor keeps the truncation from starving
+    // the tail, and `consecutiveFailures` stops a pass that is only discovering
+    // the same systemic refusal 639 times. See agents-advisory-bound.ts.
+    let firstFailure: string | null = null;
+    const key = `${this.mode}:agents-advisory`;
+    const { pass, breakerTripped, maxConsecutiveFailures, failures: failuresThisPass } =
+      await runAdvisorySweep({
+        key,
+        symbols,
+        advise: (sym) => this.adviseOneSymbol(sym, { llm, userMemory, reviewBlock }, (err) => {
+          if (firstFailure == null) firstFailure = `${sym}: ${err}`;
+        }),
+      });
+    this.agentsAdvisorySweep = pass;
+
+    if (breakerTripped) {
+      this.agentsAdvisoryBreakerUntil = Date.now() + AGENTS_ADVISORY_BREAKER_COOLDOWN_MS;
+      // ONE line, carrying the first error verbatim, replacing what was 639
+      // identical warns per pass. This is also the POSITIVE WITNESS that the
+      // breaker armed and bit — the budget's own truncation marker cannot fire on
+      // a pass the breaker stopped, so without this marker a graded window would
+      // be silent in exactly the failure mode this ticket was filed about.
+      log.warn('agents-advisory: LLM failure breaker tripped — standing down (TRA-3442)', {
+        component: 'agents-advisory',
+        sink: key,
+        consecutiveFailures: maxConsecutiveFailures,
+        processed: pass.processed.length,
+        total: pass.total,
+        startIndex: pass.startIndex,
+        resumeAt: pass.resumeAt,
+        cooldownMs: AGENTS_ADVISORY_BREAKER_COOLDOWN_MS,
+        firstError: firstFailure,
+      });
+    } else if (failuresThisPass > 0) {
+      log.warn('agents-advisory: symbols failed this pass', {
+        component: 'agents-advisory',
+        failed: failuresThisPass,
+        processed: pass.processed.length,
+        firstError: firstFailure,
+      });
+    }
+
+    // TRA-3019's producer rule — publish a WHOLE rotation, never a slice.
+    if (pass.complete) {
+      this.latestAgentRecommendations = [...this.pendingAgentRecos.values()];
+      this.pendingAgentRecos.clear();
+    }
+  }
+
+  /**
+   * TRA-3442 — one symbol's advisory graph, under
+   * {@link AGENTS_ADVISORY_SYMBOL_DEADLINE_MS}. Returns true iff a recommendation
+   * was produced; a skipped symbol (too few candles) counts as a success, because
+   * it is not evidence about the provider and must not feed the failure breaker.
+   */
+  private async adviseOneSymbol(
+    sym: string,
+    ctx: {
+      llm: LlmClient | null;
+      userMemory: ReturnType<typeof getUserMemorySync>;
+      reviewBlock: NonNullable<Awaited<ReturnType<typeof getLatestReviewBlock>>> | undefined;
+    },
+    onFailure: (err: string) => void,
+  ): Promise<boolean> {
+    const { llm, userMemory, reviewBlock } = ctx;
+    {
       const candles = this.candleCache.get(sym) ?? [];
-      if (candles.length < 15) continue;
+      if (candles.length < 15) return true;
       const asOf = candles[candles.length - 1]!.timestamp;
       // TRA-596 — feed the real upcoming-earnings count into the fundamental
       // analyst. `earningsInDaysSync` reads the boot-loaded calendar cache and
@@ -12663,16 +12787,26 @@ export class SignalEngine {
       // makes the analyst abstain, so this stays additive like the news feed.
       const social = this.getSocialSentiment(sym);
       try {
-        const { recommendation } = await adviseSymbol(
-          { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social, userMemory, reviewBlock },
-          { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
+        const { recommendation } = await withSymbolDeadline(
+          sym,
+          AGENTS_ADVISORY_SYMBOL_DEADLINE_MS,
+          () => adviseSymbol(
+            { symbol: sym, asOf, candles, candidateSignal: null, fundamentals, news, social, userMemory, reviewBlock },
+            { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
+          ),
         );
-        recos.push(recommendation);
+        this.pendingAgentRecos.set(sym, recommendation);
+        return true;
       } catch (err) {
-        logger.warn('trading-agents advisory failed for symbol', { sym, err: String(err) });
+        // Per-symbol detail drops to `debug` (below bqb1's default level): the
+        // 2026-08-12 window emitted 5,184 of these in 15 minutes, all identical,
+        // on a box whose log volume already makes an unfiltered walk impossible.
+        // The per-PASS summary above is the line that survives.
+        logger.debug('trading-agents advisory failed for symbol', { sym, err: String(err) });
+        onFailure(String(err));
+        return false;
       }
     }
-    this.latestAgentRecommendations = recos;
   }
 
   /**

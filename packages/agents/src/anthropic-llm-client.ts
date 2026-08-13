@@ -135,6 +135,43 @@ export interface AnthropicLlmClientOptions {
 const DEFAULT_MAX_TOKENS = 4096;
 
 /**
+ * TRA-3442 — per-request wall-clock ceiling handed to the Anthropic SDK.
+ *
+ * 🔴 This constant exists because the repo did not own this number at all. The
+ * client was built as `new Anthropic({ apiKey })`, which sets NEITHER `timeout`
+ * NOR `maxRetries`, so every call inherited the SDK's own defaults (10 minutes,
+ * 2 retries). That is the ceiling a caller sizing a wall-clock budget would have
+ * to plan against — and `signal.doTick.agents-advisory` runs up to NINE such
+ * calls per symbol (a 4-wide analyst fan-out, then the trader, then the risk
+ * panel, each wrapped in `completeJson`'s 3 validation attempts). 10 min × 3
+ * attempts × 3 waves is larger than TRA-2171's entire 300s tick ceiling, so no
+ * budget expressed in the caller could have held.
+ *
+ * The number is deliberately small: every tier bqb1 maps to is Haiku/Sonnet with
+ * `max_tokens` in the 700–900 range (`LLM_MODEL_STRONG=claude-haiku-4-5` live),
+ * whose observed round-trip is single-digit seconds. A call still running at 20s
+ * is not slow, it is stuck.
+ */
+export const LLM_CALL_TIMEOUT_MS = 20_000;
+
+/**
+ * TRA-3442 — SDK-level retry count. The SDK retries only 408/409/429/5xx, never
+ * a 4xx refusal, so this multiplies the timeout ceiling without ever helping the
+ * credential/billing class that motivated this ticket. Kept at 1 so the
+ * structural per-call ceiling is `LLM_CALL_TIMEOUT_MS × 2` and can be quoted in
+ * a caller's budget arithmetic.
+ */
+export const LLM_MAX_RETRIES = 1;
+
+/**
+ * TRA-3442 — the structural per-call ceiling a caller must use as the overrun
+ * term when sizing a wall-clock budget around this client. Derived HERE, in the
+ * module that owns both factors, so raising either one fails the caller's
+ * arithmetic test instead of silently pushing its sink back over its bar.
+ */
+export const LLM_CALL_CEILING_MS = LLM_CALL_TIMEOUT_MS * (1 + LLM_MAX_RETRIES);
+
+/**
  * Live `LlmClient` over the Anthropic Messages API. System messages are folded
  * into the top-level `system` param (the API keeps system separate from the
  * user/assistant turn list); the remaining turns pass through verbatim, so
@@ -275,14 +312,19 @@ export function createAnthropicLlmClientFromEnv(
 
   // Prefer the API key when both are present: passing apiKey + authToken makes
   // the SDK send both `x-api-key` and `Authorization`, which the API 401s.
+  // TRA-3442 — pin `timeout`/`maxRetries` on BOTH credential paths. Left unset
+  // they fall back to the SDK's 10-minute / 2-retry defaults, i.e. a per-call
+  // ceiling no caller in this repo could bound (see LLM_CALL_TIMEOUT_MS).
+  const limits = { timeout: LLM_CALL_TIMEOUT_MS, maxRetries: LLM_MAX_RETRIES };
   const client = apiKey
-    ? new Anthropic({ apiKey })
+    ? new Anthropic({ apiKey, ...limits })
     : new Anthropic({
         // `apiKey: null` suppresses the SDK's env-var auto-pickup so only the
         // bearer token is sent.
         apiKey: null,
         authToken,
         defaultHeaders: { 'anthropic-beta': OAUTH_BETA_HEADER },
+        ...limits,
       });
 
   return new AnthropicLlmClient({ client, models });
