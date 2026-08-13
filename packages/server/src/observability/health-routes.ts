@@ -104,6 +104,7 @@ import {
   summarizeEodArchiveParticipation,
   type EodParticipationSessionAnomaly,
 } from '../eod-archive-participation.js'; // TRA-2930 / TRA-3284
+import { summarizeLiveNavTripwire } from '../live-nav-tripwire-ledger.js'; // TRA-3449
 import type { TapeSummary } from '../denominator-flip-tape-summary.js'; // TRA-3116
 import {
   summarizeGiveBackArmFloor,
@@ -4638,6 +4639,61 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   // Per-book `participationRate` is `null` on an empty cohort, never 0 and never 1 — a
   // book observed on no market day must not read like one that participated in all.
   // Observe-only: reading this never routes an order or changes an archive.
+  // TRA-3449 — the durable, queryable record of the LIVE-MONEY NAV tripwire.
+  //
+  // Read this to answer "did the check run, and what did it say?" for any day in the
+  // window. The two questions the routine-only mechanism could not answer:
+  //
+  //  - `coverage.marketDaysMissing` — sessions with NO row at all. The instrument this
+  //    replaces had `status: active` and `enabled: true` through three consecutive lost
+  //    fires; the arming fields read IDENTICALLY in the covered and uncovered state. Here
+  //    a non-run is a first-class `missing` day, derived from the EXCHANGE CALENDAR rather
+  //    than from the rows — a denominator taken from the rows would have reported 100%
+  //    coverage over the exact week that had 0%.
+  //  - `byDay[].verdict` — `fail` (a live book overstated NAV / lost an EOD row / went
+  //    tail-stale), `blind` (not graded — includes an ungraded live book), `clean`, or
+  //    `missing`. `blind` is deliberately NOT folded into `fail`: `v0nni` is live with
+  //    $25,000 and has not filled yet, so it is ungraded every day until TRA-3417 lands,
+  //    and a gate that published a red for that would be switched off inside a week.
+  //    `blind` is still `alarm: true` and still not clean — the book is NAMED with the
+  //    reason it could not be graded, so it is not silent either.
+  //
+  // Nothing here keys on `ok`, `drift`, `maxDriftUsd`, or `eodInteriorAbsentOk` — the
+  // endpoint's own `ungradeableFields` (TRA-2630 Defect A). If the served list ever grows
+  // to cover an operand this gate DOES use, that axis grades `blind`, not green.
+  // Observe-only: reading this never routes an order.
+  app.get('/api/health/live-nav-tripwire', (_req, res) => {
+    const nowMs = now();
+    const summary = summarizeLiveNavTripwire();
+    res.json({
+      ok: true,
+      time: new Date(nowMs).toISOString(),
+      build: resolveBuildInfo(),
+      etDay: etDateString(new Date(nowMs)),
+      ...summary,
+      note:
+        summary.verdict === null
+          ? 'BLIND — no NYSE session in the window. Not a clean bill of health.'
+          : summary.verdict === 'fail'
+            ? `FAIL — live-money NAV tripwire fired. Last fail ${summary.lastFailDay}. See byDay[].axes and lagBooks.`
+            : summary.consecutiveMissingSessions > 0
+              ? `WRITER DOWN — ${summary.consecutiveMissingSessions} consecutive session(s) with no assertion row. Realized coverage ${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}. This is the TRA-3449 failure mode itself, one layer down.`
+              : summary.verdict === 'blind'
+                ? `BLIND — graded, not clean. ${summary.coverage.marketDaysMissing.length} missing session(s); latest ungraded books: ${
+                    (summary.latest?.ungradedBooks ?? []).map((b) => `${b.username}=${b.reason}`).join(', ') || 'none'
+                  }.`
+                : `CLEAN — every NYSE session in the window has a graded, passing row (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).`,
+      /**
+       * RECORDED, NOT GRADED. `liveEodInteriorAbsentBooks` is the TRA-2943 discriminator
+       * of record, and it is non-empty today on both live books (2026-08-07, a date NOT in
+       * the TRA-2886 documented permanent gap). Gating on it would ship a born-red gate.
+       * Diff this across consecutive `byDay` rows to detect a NEW interior absence.
+       */
+      interiorAbsentNote:
+        'liveEodInteriorAbsentBooks is recorded on every row but NOT graded — see TRA-3449. Promoting it needs a pinned known-hole baseline first.',
+    });
+  });
+
   app.get('/api/health/eod-archive-participation', (_req, res) => {
     const nowMs = now();
     const summary = summarizeEodArchiveParticipation();

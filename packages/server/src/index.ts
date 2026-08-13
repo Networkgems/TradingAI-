@@ -244,6 +244,12 @@ import {
   recordEodParticipation,
   type EodParticipationOutcome,
 } from './eod-archive-participation.js';
+// TRA-3449 — the live-money NAV tripwire, asserted server-side off the 21:00 ET archive
+// so a lost agent run costs a narrative instead of costing coverage.
+import {
+  hydrateLiveNavTripwireFromDisk,
+  runLiveNavTripwireTick,
+} from './live-nav-tripwire-ledger.js';
 import {
   hydrateLiveOptionsFeeSlippageFromDisk,
   backfillLiveOptionFees,
@@ -4516,6 +4522,21 @@ void initTapeExpectancyCache().catch((err: unknown) => {
   const h = hydrateEodArchiveParticipationFromDisk(DATA_DIR);
   if (h.records > 0) {
     log.info('EOD archive-participation record hydrated (TRA-2930)', {
+      records: h.records,
+      days: h.days,
+    });
+  }
+}
+
+// TRA-3449 — rebuild the live-money NAV tripwire ledger and pin the append target. MUST
+// run before the first 21:00 ET archive pass. Without the hydrate the endpoint would be a
+// since-boot ring, and "no row for 2026-08-11" would be indistinguishable from "deployed
+// this morning" — which is the exact ambiguity that let three lost agent fires read as
+// covered for a week.
+{
+  const h = hydrateLiveNavTripwireFromDisk(DATA_DIR);
+  if (h.records > 0) {
+    log.info('live-money NAV tripwire ledger hydrated (TRA-3449)', {
       records: h.records,
       days: h.days,
     });
@@ -14668,6 +14689,33 @@ scheduler.start({
         log.error('learned-weights snapshot tick failed', {
           reason: err instanceof Error ? err.message : String(err),
         }),
+    );
+    // TRA-3449 — assert the LIVE-MONEY NAV tripwire and write one durable row for this ET
+    // day. LAST in the chain: `runDailyCloseForAllUsers()` above is what writes today's EOD
+    // rows, and the tripwire's operands (`liveEodRowsPresentOk`, `liveEodTailMaxStaleSessions`)
+    // are read straight off them — asserting before the archive would grade yesterday's disk
+    // and report a stale tail as fresh.
+    //
+    // The payload is self-fetched over loopback rather than recomputed here. That is
+    // deliberate: it grades the SERVING build's actual response body, so a rename or a
+    // dropped field lands as `blind`/`missing_field` on the next row instead of silently
+    // degrading to green. `runLiveNavTripwireTick` never throws and always writes a row
+    // (`source: 'unreachable'` on a fetch failure) — the whole ticket is "the check did not
+    // run and nobody could tell afterwards", so a swallowed failure would rebuild the bug.
+    await runLiveNavTripwireTick({
+      fetchPayload: async () => {
+        const resp = await fetch(`http://127.0.0.1:${PORT}/api/health/pnl-reconciliation`, {
+          signal: AbortSignal.timeout(30_000),
+        });
+        return { ok: resp.ok, status: resp.status, body: resp.ok ? await resp.json() : null };
+      },
+    }).catch(err =>
+      // Belt and braces. The tick already fails closed internally; if the RECORDER itself
+      // throws, the day is left with no row and `marketDaysMissing` reports it — which is
+      // the correct, visible reading, not a silent pass.
+      log.error('live-money NAV tripwire tick failed to record (TRA-3449)', {
+        reason: err instanceof Error ? err.message : String(err),
+      }),
     );
   },
   // TRA-249-D — hourly funding accrual on open Coinbase INTX perps. Fires
