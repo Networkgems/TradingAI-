@@ -6,6 +6,14 @@ import {
 } from './options-forward-test.js';
 import { isOptionCostAwareGateEnabled, resolveCostGateConfig } from './option-cost-gate.js';
 import type { FeasibilityResult } from './gate-feasibility.js';
+// TRA-3368 (TRA-2346) — the power-based detectability criterion that replaces the raw
+// 30-idea floor as the gate's theory of "enough sample". Constants + math live there.
+import {
+  evaluateGatePower,
+  POWER_CONFIDENCE_SIGMA,
+  TARGET_EFFECT_R,
+  type GatePowerResult,
+} from './gate-power.js';
 
 // TRA-601 (TRA-595 C6) — the AI-Options-Ideas LIVE-CAPITAL GATE.
 //
@@ -24,7 +32,13 @@ import type { FeasibilityResult } from './gate-feasibility.js';
 export interface LiveCapitalGateCriteria {
   /** Minimum distinct ISO weeks that must carry ≥1 resolved (settled) idea. */
   minWeeksWithResolved: number;
-  /** Minimum total resolved ideas — a sample-size floor against small-n noise. */
+  /**
+   * The surviving hard SAMPLE FLOOR. TRA-3368 (TRA-2346): this is no longer the whole
+   * sample criterion — `sample_size` is graded on the power-based requirement
+   * `n_req = max(minResolvedIdeas, ceil((2σ/δ)²))` (see `gate-power.ts`), of which this
+   * constant is the floor term. It survives deliberately: strictly monotone on the
+   * sample axis, and the hard bar when the computed requirement degenerates.
+   */
   minResolvedIdeas: number;
   /**
    * Required overall COST-NET R-expectancy (net P/L ÷ max-loss). Must be strictly
@@ -96,8 +110,19 @@ export function resolveLiveCapitalGateCriteria(
  *
  * ⚠️ `INFEASIBLE` is a LOUDER stop than `FAIL`, never a softer one, and must never read
  * as "pending". It carries `pass: false` (below) so it blocks promotion identically.
+ *
+ * TRA-3368 (TRA-2346) — the FOURTH state, `UNDERPOWERED`, asserts a third distinct
+ * fact: the SAMPLE cannot resolve the question. Its remedy points the OPPOSITE way
+ * from `INFEASIBLE`'s — more sample is the ONLY remedy — so folding it into either
+ * neighbour prints an actively misdirecting instruction:
+ *   • as `FAIL` it reads "the book underperformed a bar it could have cleared" on a
+ *     sample that resolves nothing;
+ *   • as `INFEASIBLE` it reads "MORE SAMPLE CANNOT RESOLVE IT", the exact inverse.
+ * It attaches to BOTH `sample_size` and `positive_expectancy`, pre-empting `FAIL` AND
+ * `PASS` (a mean clearing the bar on an unpowered sample is a coin flip, not evidence).
+ * Precedence: `INFEASIBLE` > `UNDERPOWERED` > `FAIL`/`PASS`. `pass: false` always.
  */
-export type GateCriterionStatus = 'PASS' | 'FAIL' | 'INFEASIBLE';
+export type GateCriterionStatus = 'PASS' | 'FAIL' | 'INFEASIBLE' | 'UNDERPOWERED';
 
 export interface GateCriterionResult {
   name: string;
@@ -153,6 +178,13 @@ export interface LiveCapitalGateResult {
    * of the graded book, which is the reason R1 exists.
    */
   sleeveFeasibility: BookSleeveFeasibility;
+  /**
+   * TRA-3368 (TRA-2346) — the power criterion's full verdict: pooled + per-sleeve
+   * `{σ used, σ source, n required, powered}` and `forcedBy` naming WHICH conjunct or
+   * sleeve forced an unpowered read. Published whole on
+   * `/api/health/live-capital-gate` as `power`.
+   */
+  power: GatePowerResult;
   /** One-line plain-English disposition. */
   summary: string;
   /** Standing reminder that a pass is permission-to-propose, not auto-wiring. */
@@ -203,11 +235,29 @@ export function evaluateLiveCapitalGate(
     feasibility.verdict,
   );
 
+  // TRA-3368 (TRA-2346) — the POWER criterion, replacing the raw `resolved >= 30` read.
+  // `powered` is the conjunct `pooled ∧ every ≥20%-weight sleeve at its own c`, computed
+  // from observations the report derived over the SAME graded set as every total above.
+  // Absent inputs (legacy report) grade UNDERPOWERED — fail-closed, because the change
+  // is ratified monotone non-increasing and a degraded read must close, never open.
+  // Note `powered ⇒ resolved ≥ minResolvedIdeas` by construction (the floor survives
+  // inside `n_req = max(minResolvedIdeas, ceil((2σ/δ)²))`), so the old floor read is
+  // strictly implied and `pass′ ≤ pass` holds on the sample criterion pointwise.
+  const power = evaluateGatePower(t.powerInputs, {
+    floor: criteria.minResolvedIdeas,
+    nObserved: t.resolved,
+  });
+  // The sentence a reader lands on when either criterion reads UNDERPOWERED. Names the
+  // forcing conjunct/sleeve, and states the remedy in the direction OPPOSITE to
+  // INFEASIBLE's: more sample is the ONLY remedy here.
+  const underpoweredNote = power.powered
+    ? null
+    : `⚠️ UNDERPOWERED (TRA-2346) — at δ = ${TARGET_EFFECT_R}R and ${POWER_CONFIDENCE_SIGMA}σ the graded sample cannot resolve the expectancy bar: required n ≥ ${power.nRequired ?? `uncomputable (σ degenerate: source ${power.sigmaSource}, σ̂ ${power.sigmaUsed ?? 'null'})`}, observed ${power.nObserved}. Forced by: ${power.forcedBy.join(', ')}. A PASS or FAIL read off this sample is a coin flip; MORE SAMPLE IS THE ONLY REMEDY — the bar itself stays as written.`;
+
   // TRA-2335 — `pass` is computed ONCE and `status` is derived from it, so the two can
   // never drift apart for the criteria that have no feasibility precondition.
   const plain = (pass: boolean): GateCriterionStatus => (pass ? 'PASS' : 'FAIL');
   const weeksPass = t.weeksWithResolved >= criteria.minWeeksWithResolved;
-  const samplePass = t.resolved >= criteria.minResolvedIdeas;
   const durabilityPass =
     positiveWeekFraction != null && positiveWeekFraction >= criteria.minPositiveWeekFraction;
   const calibrationPass = calGap != null && Math.abs(calGap) <= criteria.maxPopCalibrationGap;
@@ -256,10 +306,20 @@ export function evaluateLiveCapitalGate(
   ].sort((a, b) => (b.s.weight ?? 0) - (a.s.weight ?? 0) || a.s.key.localeCompare(b.s.key));
 
   // A sleeve block is the SAME KIND of stop as an unreachable book bar — more sample
-  // cannot resolve either — so it reuses the loud `INFEASIBLE` headline path rather than
-  // gaining a fourth state that every downstream consumer would have to learn.
+  // cannot resolve either — so it reuses the loud `INFEASIBLE` headline path.
+  //
+  // TRA-3368 — precedence `INFEASIBLE` > `UNDERPOWERED` > `FAIL`/`PASS`: when the bar is
+  // unreachable, accruing the required sample resolves nothing, so INFEASIBLE (whose
+  // headline says exactly that) must win over a status whose remedy is "accrue more".
+  // Below it, UNDERPOWERED pre-empts BOTH plain verdicts — a FAIL here would assert the
+  // book underperformed a bar it could have cleared, and a PASS would promote on a
+  // coin flip; neither is a fact this sample can carry.
   const expectancyStatus: GateCriterionStatus =
-    barUnreachable || sleeveBlocking ? 'INFEASIBLE' : plain(expectancyMeasuredPass);
+    barUnreachable || sleeveBlocking
+      ? 'INFEASIBLE'
+      : !power.powered
+        ? 'UNDERPOWERED'
+        : plain(expectancyMeasuredPass);
 
   /**
    * The clause the headline prints for an INFEASIBLE criterion.
@@ -298,11 +358,23 @@ export function evaluateLiveCapitalGate(
     },
     {
       name: 'sample_size',
-      description: 'Total resolved (settled) ideas',
-      required: `≥ ${criteria.minResolvedIdeas}`,
+      // TRA-3368 — no longer the raw 30-idea floor: the requirement is the power-based
+      // n_req = max(minResolvedIdeas, ceil((2σ/δ)²)), σ = max(σ̂_{n−1}, σ_param(c)),
+      // conjoined pooled ∧ every ≥20%-weight sleeve at its own c (both axes).
+      description:
+        'Total resolved (settled) ideas vs the power-required sample (TRA-2346: n_req = max(30, ceil((2σ/δ)²)), pooled AND every ≥20% sleeve)',
+      required:
+        power.nRequired == null
+          ? `≥ max(${criteria.minResolvedIdeas}, (2σ/δ)²) — n_req uncomputable (σ degenerate)`
+          : `≥ ${power.nRequired}${power.forcedBy.some((f) => f !== 'pooled') ? ' (pooled) + per-sleeve requirements' : ''}`,
       actual: t.resolved,
-      pass: samplePass,
-      status: plain(samplePass),
+      // `powered` subsumes the old floor read: n_req ≥ minResolvedIdeas by construction,
+      // so `pass` here is monotone non-increasing vs the pre-TRA-3368 criterion.
+      pass: power.powered,
+      // UNDERPOWERED pre-empts FAIL: "too few ideas" was a fact about a constant; "the
+      // sample cannot resolve the effect" is the fact the criterion exists to state.
+      status: power.powered ? 'PASS' : 'UNDERPOWERED',
+      ...(underpoweredNote == null ? {} : { feasibilityNote: underpoweredNote }),
     },
     {
       name: 'positive_expectancy',
@@ -314,7 +386,10 @@ export function evaluateLiveCapitalGate(
       // TRA-2361 — `!sleeveBlocking` is a NEW CONJUNCT on an existing conjunction, which
       // is monotone non-increasing: `pass′ ≤ pass` and therefore `passed′ ≤ passed`. This
       // can only ever CLOSE the capital path, never open one.
-      pass: !barUnreachable && !sleeveBlocking && expectancyMeasuredPass,
+      // TRA-3368 — `power.powered` is the SAME move again: a new conjunct, monotone
+      // non-increasing, pre-empting PASS because a mean clearing the bar on an
+      // unpowered sample is a coin flip, not evidence.
+      pass: !barUnreachable && !sleeveBlocking && power.powered && expectancyMeasuredPass,
       status: expectancyStatus,
       barR: criteria.minExpectancyR,
       // ⚠️ Still the BOOK ceiling — the number the book verdict was derived from. On a
@@ -339,6 +414,11 @@ export function evaluateLiveCapitalGate(
               } as GateCriterionResult,
             )}`
           : null,
+        // TRA-3368 — the power sentence travels on the criterion ONLY when it is the
+        // binding state. Under INFEASIBLE it is withheld here: the two remedies point
+        // opposite ways, and a note saying "more sample is the only remedy" beside a
+        // headline saying "more sample cannot resolve it" would be self-contradicting.
+        expectancyStatus === 'UNDERPOWERED' ? underpoweredNote : null,
         feasibility.reason,
         sleeveFeasibility.note == null ? null : `⚠️ ${sleeveFeasibility.note}`,
       ]
@@ -380,11 +460,18 @@ export function evaluateLiveCapitalGate(
   // reads as a to-do, and "keep accruing" is the wrong action when the bar is
   // untestable. AC2 — the summary names BOTH the bar and the ceiling.
   const infeasible = criteriaResults.filter((c) => c.status === 'INFEASIBLE');
+  // TRA-3368 — UNDERPOWERED gets its OWN headline, below INFEASIBLE in precedence and
+  // above the plain HOLD. The INFEASIBLE clause "MORE SAMPLE CANNOT RESOLVE IT" stays
+  // scoped to INFEASIBLE only: for an under-powered sample more sample is the ONLY
+  // remedy, and routing it through either neighbour prints the opposite instruction.
+  const underpowered = criteriaResults.filter((c) => c.status === 'UNDERPOWERED');
   const headline = passed
     ? 'PASS — forward-test track record clears every documented criterion; live-capital wiring may now be PROPOSED (not auto-enabled).'
     : infeasible.length > 0
       ? `INFEASIBLE — live capital stays gated, and ${infeasible.length === 1 ? 'one criterion CANNOT BE TESTED' : `${infeasible.length} criteria CANNOT BE TESTED`} against this book: ${infeasible.map(infeasibleClause).join('; ')}. This is NOT a shortfall of evidence and MORE SAMPLE CANNOT RESOLVE IT — re-derive the bar or change the instrument.${failed.filter((n) => !infeasible.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !infeasible.some((c) => c.name === n)).join(', ')}.` : ''}`
-      : `HOLD — live capital stays gated. Unmet: ${failed.join(', ')}.`;
+      : underpowered.length > 0
+        ? `UNDERPOWERED — live capital stays gated: at δ = ${TARGET_EFFECT_R}R and ${POWER_CONFIDENCE_SIGMA}σ the graded sample cannot resolve the expectancy bar (required n ≥ ${power.nRequired ?? 'uncomputable — σ degenerate'}, observed ${power.nObserved}; forced by ${power.forcedBy.join(', ')}). A PASS or FAIL from this sample would be a coin flip. This IS a shortfall of evidence and MORE SAMPLE IS THE ONLY REMEDY — the bar and the instrument stay as written.${failed.filter((n) => !underpowered.some((c) => c.name === n)).length > 0 ? ` Also unmet: ${failed.filter((n) => !underpowered.some((c) => c.name === n)).join(', ')}.` : ''}`
+        : `HOLD — live capital stays gated. Unmet: ${failed.join(', ')}.`;
 
   // TRA-2353 (AC4) — `unknown` MUST RENDER AS UNKNOWN IN THE HEADLINE, not only on the
   // criterion. The ceiling is an UPPER bound, so `unknown` is not the symmetric partner
@@ -409,6 +496,7 @@ export function evaluateLiveCapitalGate(
     criteria: criteriaResults,
     feasibility,
     sleeveFeasibility,
+    power,
     summary,
     note:
       'A passing gate is permission to PROPOSE live wiring to the board — it enables no orders. Live ' +

@@ -151,9 +151,17 @@ describe('TRA-2361 · AC3 — the block is wired, and the headline it prints is 
     //     is the only shape that can produce a `true → false` cell.
     expect(g.feasibility.verdict).toBe('feasible');
     // (2) …and every OTHER criterion passes, so `passed` was true before this change.
-    for (const c of g.criteria.filter((x) => x.name !== 'positive_expectancy')) {
+    //     ⚠️ TRA-3368 EXCEPTS `sample_size`: this is a 48-row book, and the power
+    //     criterion refuses any book that cannot resolve a 0.03R effect. R1's own claim
+    //     is unaffected — it is about criterion 3 — but the exception must be NAMED here
+    //     rather than loosened to "most criteria pass", or a future regression that broke
+    //     an unrelated criterion would hide inside the same slack.
+    for (const c of g.criteria.filter(
+      (x) => x.name !== 'positive_expectancy' && x.name !== 'sample_size',
+    )) {
       expect(c.pass, c.name).toBe(true);
     }
+    expect(g.criteria.find((x) => x.name === 'sample_size')!.status).toBe('UNDERPOWERED');
     // (3) The sleeve inside it cannot reach the same bar at any hit rate.
     const s = sleeve(g, 'byStructure', 'bull_put_spread');
     expect(s.verdict).toBe('infeasible');
@@ -227,7 +235,18 @@ describe('TRA-2361 · AC4 — a sleeve approaching the threshold is visible BEFO
     expect(s.weight!).toBeGreaterThanOrEqual(APPROACHING_BLOCKING_SLEEVE_WEIGHT);
     expect(s.approachingBlockingThreshold).toBe(true);
     expect(s.blocking).toBe(false);
-    expect(g.passed).toBe(true); // ← it really is still open; the warning is not a stop
+    // ⚠️ TRA-3368 — this used to read `expect(g.passed).toBe(true)`, i.e. "R1 did not
+    // stop this book". `passed` can no longer carry that claim: the power criterion closes
+    // every 47-row fixture in this file, so a `false` here is now ambiguous between "the
+    // warning became a stop" (the regression AC4 exists to catch) and "the sample is
+    // small" (expected, and nothing to do with R1). So the claim is re-pointed at the
+    // R1-attributable signal, which is unambiguous: criterion 3 is NOT INFEASIBLE and
+    // nothing was blocked. Asserting the exact status also pins the precedence — an
+    // approaching sleeve leaves the loud stop unclaimed.
+    expect(g.criteria.find((c) => c.name === 'positive_expectancy')!.status).toBe('UNDERPOWERED');
+    expect(g.sleeveFeasibility.byStructure.blockingSleeves).toEqual([]);
+    expect(g.sleeveFeasibility.byPremiumDirection.blockingSleeves).toEqual([]);
+    expect(g.summary).not.toContain('BLOCKED BY SLEEVE');
     expect(g.summary).toContain('APPROACHING THE BLOCKING THRESHOLD');
     expect(g.summary).toContain('COMPOSITION ALONE');
   });
@@ -262,9 +281,15 @@ describe('TRA-2361 · AC6 — controls in BOTH directions', () => {
     expect(s.approachingBlockingThreshold).toBe(false);
     expect(g.sleeveFeasibility.byStructure.blockingSleeves).toEqual([]);
     expect(g.sleeveFeasibility.byPremiumDirection.blockingSleeves).toEqual([]);
-    // Byte-identical to pre-fix: every criterion passes and so does the gate.
-    expect(g.passed).toBe(true);
-    expect(g.criteria.find((c) => c.name === 'positive_expectancy')!.status).toBe('PASS');
+    // ⚠️ TRA-3368 — this used to read `passed === true` / criterion 3 `PASS`, the
+    // "byte-identical to pre-fix" control. It is now `UNDERPOWERED`: a 40-row book cannot
+    // resolve a 0.03R effect, so criterion 3 never reaches a plain verdict. What the
+    // NEGATIVE CONTROL still has to show is that R1 stayed silent, and it does —
+    // `UNDERPOWERED`, not `INFEASIBLE`, is precisely "the sleeve rule did not fire".
+    // Keeping the two states distinguishable here is the control; `passed` alone is not,
+    // because it is false in both worlds.
+    expect(g.criteria.find((c) => c.name === 'positive_expectancy')!.status).toBe('UNDERPOWERED');
+    expect(g.summary).not.toContain('BLOCKED BY SLEEVE');
     // …and the sub-threshold offender is STILL REPORTED. A threshold that hides is a new
     // blind spot in an instrument that exists because a true state was invisible.
     expect(g.sleeveFeasibility.byStructure.worstSleeve!.key).toBe('bull_put_spread');
@@ -275,7 +300,10 @@ describe('TRA-2361 · AC6 — controls in BOTH directions', () => {
     const g = gateOf('clean-book-all-sleeves-feasible');
     expect(g.sleeveFeasibility.byStructure.worstSleeve).toBeNull();
     expect(g.sleeveFeasibility.byStructure.blockingSleeves).toEqual([]);
-    expect(g.passed).toBe(true);
+    // ⚠️ TRA-3368 — same re-pointing as the 5% control above: "SILENT AND OPEN" is now
+    // carried by the R1-attributable fields, because a 48-row book is UNDERPOWERED
+    // regardless of what its sleeves do.
+    expect(g.criteria.find((c) => c.name === 'positive_expectancy')!.status).toBe('UNDERPOWERED');
     expect(g.summary).not.toContain('BLOCKED BY SLEEVE');
     expect(g.summary).not.toContain('SLEEVE INFEASIBLE');
   });
@@ -311,12 +339,25 @@ describe('TRA-2361 · AC5 — the MONOTONICITY property, pinned from a real diff
     const cells = { tt: 0, tf: 0, ft: 0, ff: 0 } as Record<'tt' | 'tf' | 'ft' | 'ff', number>;
     const promoted: string[] = [];
     const demoted: string[] = [];
+    // ⚠️ TRA-3368 — R1's OWN differential, isolated. A SECOND monotone non-increasing
+    // criterion (the power criterion) now closes every fixture in this file, so `demoted`
+    // above no longer measures R1: it measures the union of two changes, and R1 could be
+    // deleted entirely without moving a single cell of it. The R1-attributable signal is
+    // the one R1 actually writes — a non-empty `blockingSleeves` on either axis, which is
+    // what makes criterion 3 INFEASIBLE. Pinning THAT is what keeps AC5 a test of R1
+    // rather than a test of whichever criterion happens to be strictest today.
+    const r1Demoted: string[] = [];
     for (const c of MONOTONICITY_CASES()) {
       const oldPassed = OLD_PASSED[c.key];
       expect(oldPassed, `no recorded pre-fix value for ${c.key} — re-run the script`).not.toBe(
         undefined,
       );
-      const newPassed = gateFor(c).passed;
+      const g = gateFor(c);
+      const newPassed = g.passed;
+      const r1Blocked =
+        g.sleeveFeasibility.byStructure.blockingSleeves.length > 0 ||
+        g.sleeveFeasibility.byPremiumDirection.blockingSleeves.length > 0;
+      if (oldPassed && r1Blocked) r1Demoted.push(c.key);
       if (oldPassed && newPassed) {
         cells.tt += 1;
       } else if (oldPassed && !newPassed) {
@@ -329,21 +370,30 @@ describe('TRA-2361 · AC5 — the MONOTONICITY property, pinned from a real diff
         cells.ff += 1;
       }
     }
-    return { cells, promoted, demoted };
+    return { cells, promoted, demoted, r1Demoted };
   };
 
   it('ZERO `false → true` cells — the change can only ever CLOSE a capital path', () => {
+    // Still exactly the AC5 claim, and it now covers BOTH monotone criteria at once: the
+    // OLD column is the pre-R1 recording, so this compares the pre-R1 build against the
+    // post-TRA-3368 one. (TRA-3368's own pre/post differential is measured separately, in
+    // `gate-power.test.ts`, against a PRE column recorded at `1d7f180d`.)
     const { cells, promoted } = matrix();
     expect(promoted, 'a fixture the pre-fix gate REFUSED now PASSES').toEqual([]);
     expect(cells.ft).toBe(0);
   });
 
   it('AT LEAST ONE `true → false` cell — otherwise the change is inert and proves nothing', () => {
-    const { cells, demoted } = matrix();
+    const { cells } = matrix();
     expect(cells.tf).toBeGreaterThanOrEqual(1);
-    // Named, so a future edit that accidentally neuters R1 fails here rather than passing
-    // a vacuous "no regressions" check.
-    expect(demoted.sort()).toEqual([
+  });
+
+  it('and the demoted cells are R1`s OWN — named, so neutering R1 fails here', () => {
+    // Named against the R1-attributable projection rather than `passed` (see `matrix`):
+    // an edit that accidentally neuters R1 fails HERE, instead of passing a vacuous
+    // "everything is closed anyway" check that TRA-3368 would satisfy on its own.
+    const { r1Demoted } = matrix();
+    expect(r1Demoted.sort()).toEqual([
       'known-bad-25pct-infeasible-sleeve',
       'premium-axis-only-block',
       'unusable-rows-count-toward-weight',

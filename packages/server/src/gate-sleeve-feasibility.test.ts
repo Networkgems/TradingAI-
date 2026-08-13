@@ -327,15 +327,25 @@ describe('TRA-2353 · AC4 — `unknown` must render AS UNKNOWN in the headline',
   it('a FAIL on an unestablished ceiling no longer reads as a bare "book underperformed"', () => {
     // The conflation TRA-2335 exists to prevent, surviving in the one field the operator
     // reads first. `feasibilityNote` carried it on the criterion; the headline did not.
+    // ⚠️ TRA-3368 — `resolved` and `powerInputs` describe a book that IS adequately
+    // powered. This test's subject is the REACHABILITY rendering on a bare `FAIL`, and
+    // `UNDERPOWERED` pre-empts `FAIL` — so on a 30-row fixture criterion 3 would never
+    // reach the state under test and the assertion below would pass vacuously against a
+    // different verdict. `legacy` still means what it meant: no `ceilingAxes`.
     const legacy = {
       asOfDate: '2026-07-11',
       totals: {
         weeksWithResolved: 8,
         weeksPositiveExpectancyNet: 6,
         popCalibrationGap: 0.05,
-        resolved: 30,
+        resolved: 4000,
         expectancyNetR: 0.1, // below the 0.20R bar ⇒ criterion 3 FAILs
         maxLossBreaches: 0,
+        powerInputs: {
+          pooled: { n: 4000, c: 0.0366, sigmaSample: 0.9 },
+          byStructure: [],
+          byPremiumDirection: [],
+        },
       },
     } as unknown as Parameters<typeof evaluateBookFeasibility>[0];
 

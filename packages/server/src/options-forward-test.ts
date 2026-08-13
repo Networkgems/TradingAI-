@@ -40,6 +40,13 @@ import {
   type FeasibilityVerdict,
   type RewardSourceCounts,
 } from './gate-feasibility.js';
+// TRA-3368 (TRA-2346) — the power-based detectability criterion's helper + input
+// shapes. Leaf module (imports only gate-feasibility), so it adds no cycle either.
+import {
+  sampleStdev,
+  type GatePowerInputs,
+  type SleevePowerObservation,
+} from './gate-power.js';
 // TRA-2208 — the floor + its governed families, imported (not restated) so the
 // counterfactual this probe reports is measured against the exact bar the emission
 // gate enforces. See `CellCreditWidthFloor`.
@@ -571,6 +578,15 @@ export interface ForwardTestReport {
      * the totals above are computed from, never a re-derived population.
      */
     ceilingAxes: BookCeilingAxes;
+    /**
+     * TRA-3368 (TRA-2346) — the observations the power-based detectability criterion
+     * is evaluated from: pooled and per-sleeve `{n, c, σ̂}` where `c` is the mean
+     * signed credit/width ratio and `σ̂` is the n−1 sample sd of cost-net R
+     * ({@link sampleStdev} — null, never 0, below n=2). Computed over the SAME
+     * `resolved && !excluded` array as every metric above, partitioned on the SAME
+     * two axes as `ceilingAxes` — never a re-derived population.
+     */
+    powerInputs: GatePowerInputs;
     wins: number;
     losses: number;
     scratches: number;
@@ -1045,6 +1061,56 @@ function premiumDirection(o: IdeaOutcome): string {
   return o.entryNetUsd > 0 ? 'credit' : 'debit';
 }
 
+// ── TRA-3368 (TRA-2346) — power-criterion observations ────────────────────────
+//
+// One `{n, c, σ̂}` triple per gradeable population: the pooled book and each sleeve on
+// the SAME two axes the ceiling is partitioned along. `c` is the mean SIGNED
+// credit/width ratio ({@link creditWidthRatio}) over rows where one is derivable —
+// null when none is (an all-debit/long population has no meaningful breakeven c; the
+// evaluator grades it `sample_only`). `σ̂` uses the same `pnlNetR ?? 0` fold as
+// `expectancyNetR`, so the sd describes exactly the numbers the mean is computed from.
+
+function powerObservationFor(rows: readonly IdeaOutcome[]): {
+  n: number;
+  c: number | null;
+  sigmaSample: number | null;
+} {
+  const ratios = rows.map(creditWidthRatio).filter((x): x is number => x != null);
+  return {
+    n: rows.length,
+    c: mean(ratios),
+    sigmaSample: sampleStdev(rows.map((o) => o.pnlNetR ?? 0)),
+  };
+}
+
+function powerAxisFor(
+  graded: readonly IdeaOutcome[],
+  keyFn: (o: IdeaOutcome) => string,
+): SleevePowerObservation[] {
+  const bookN = graded.length;
+  return [...groupOutcomes(graded, keyFn).entries()]
+    .map(([key, rows]) => ({
+      key,
+      weight: bookN > 0 ? rows.length / bookN : null,
+      ...powerObservationFor(rows),
+    }))
+    .sort((a, b) => b.n - a.n || a.key.localeCompare(b.key));
+}
+
+/**
+ * The power criterion's report-side inputs, over the ALREADY-FILTERED graded set —
+ * a partition of the caller's array, never a second filter (TRA-2346 §6: the looser
+ * `maxLossUsd > 0` predicate re-admits the fabricated fallback-priced rows, silently
+ * and in the fail-open direction).
+ */
+function computePowerInputs(resolved: readonly IdeaOutcome[]): GatePowerInputs {
+  return {
+    pooled: powerObservationFor(resolved),
+    byStructure: powerAxisFor(resolved, (o) => o.strategy),
+    byPremiumDirection: powerAxisFor(resolved, premiumDirection),
+  };
+}
+
 /** Roll a set of idea outcomes into the weekly + overall forward-test report. */
 export function buildForwardTestReport(
   outcomes: readonly IdeaOutcome[],
@@ -1125,6 +1191,8 @@ export function buildForwardTestReport(
       ceilingGrossRPriced: ceiling.ceilingGrossRPriced,
       ceilingSourceCounts: ceiling.sourceCounts,
       ceilingAxes,
+      // TRA-3368 — power observations over the SAME graded set, on the SAME axes.
+      powerInputs: computePowerInputs(resolved),
       wins: wins.length,
       losses: losses.length,
       scratches: scratches.length,

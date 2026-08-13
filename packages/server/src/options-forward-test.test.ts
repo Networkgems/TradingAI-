@@ -430,15 +430,41 @@ describe('evaluateLiveCapitalGate', () => {
     const gate = evaluateLiveCapitalGate(report);
     expect(gate.passed).toBe(false);
     expect(gate.criteria.find((c) => c.name === 'sample_size')?.pass).toBe(false);
-    expect(gate.summary).toMatch(/HOLD/);
+    // TRA-3368 — an EMPTY book's headline is now `UNDERPOWERED`, not the generic `HOLD`.
+    // Both say "live capital stays gated"; the new one also says WHY and what fixes it,
+    // which on a zero-row book is the whole of the truth. Asserting the specific state
+    // (not just "not passed") is the AC6 discipline this gate is built under.
+    expect(gate.criteria.find((c) => c.name === 'sample_size')?.status).toBe('UNDERPOWERED');
+    expect(gate.summary).toMatch(/live capital stays gated/);
+    expect(gate.summary).toMatch(/MORE SAMPLE IS THE ONLY REMEDY/);
   });
 
   it('passes only when every criterion is met', () => {
-    // Synthesize 8 weeks × 5 winning resolved ideas (40 total), all wins, with
-    // POP set so calibration is exact (hit-rate 1.0 vs stated 1.0).
+    // ⚠️ THIS IS THE ONLY END-TO-END FIXTURE IN WHICH THE GATE EVER OPENS, so it is the
+    // positive control for every criterion at once — and a grader that can only ever be
+    // shown to CLOSE is not controlled in both directions.
+    //
+    // TRA-3368 rebuilt it, and the rebuild IS the lesson. It used to be 8 weeks × 5
+    // IDENTICAL winners (40 rows, hit-rate 1.00, every `pnlNetR` exactly 0.98). Under the
+    // power criterion that book is `UNDERPOWERED`, and correctly so — it is fixture (c) of
+    // the ratified set almost exactly: a book that has not lost yet has σ̂ ≈ 0, which under
+    // a naive `n_req = (2σ̂/δ)²` would certify itself as adequately powered at n = 3. The
+    // gate's only passing fixture was a book that could not resolve anything.
+    //
+    // So the fixture now has a REAL loss rate and enough rows to resolve a 0.03R effect:
+    // 8 weeks × 400 ideas, 4-in-5 winners at +0.98R and 1-in-5 full losses at −1.02R.
+    // ⇒ hit-rate 0.80 (POP stated 0.80, so calibration is still exact), expectancy
+    // +0.58R net, σ̂ = 0.80012 ⇒ n_req = 2846, and 3200 ≥ 2846. (The population sd here is
+    // exactly 0.8 and would give 2845 — the extra row is the n−1 denominator, visible even
+    // at n = 3200 and the reason the helper is not the population one.) Every other criterion is
+    // satisfied exactly as before; what changed is that the book now carries the evidence
+    // its own PASS claims to rest on.
+    const WEEKS = 8;
+    const PER_WEEK = 400;
     const outcomes: IdeaOutcome[] = [];
-    for (let w = 0; w < 8; w++) {
-      for (let i = 0; i < 5; i++) {
+    for (let w = 0; w < WEEKS; w++) {
+      for (let i = 0; i < PER_WEEK; i++) {
+        const win = i % 5 !== 4;
         outcomes.push({
           key: `w${w}-${i}`,
           ticker: 'AAA',
@@ -446,31 +472,37 @@ describe('evaluateLiveCapitalGate', () => {
           surfacedDate: '2026-01-05',
           surfacedWeek: `2026-W${String(w + 2).padStart(2, '0')}`,
           expiration: '2026-02-20',
-          pop: 1.0,
+          pop: 0.8,
           maxLossUsd: 300,
           maxProfitUsd: 600,
           entryNetUsd: -300,
           status: 'resolved',
           valuedAt: '2026-02-20',
-          liquidationUsd: 600,
-          pnlUsd: 300,
-          pnlR: 1.0,
+          liquidationUsd: win ? 600 : 0,
+          pnlUsd: win ? 300 : -300,
+          pnlR: win ? 1.0 : -1.0,
           costsUsd: 6,
-          pnlNetUsd: 294,
-          pnlNetR: 0.98,
+          pnlNetUsd: win ? 294 : -306,
+          pnlNetR: win ? 0.98 : -1.02,
           costEfficiencyRatio: 0.02,
-          win: true,
+          win,
           excluded: false,
           excludeReason: null,
           settleLagDays: 0,
+          // A full −1R loss is the defined risk PERFORMING, not a breach.
           maxLossBreached: false,
         });
       }
     }
     const report = buildForwardTestReport(outcomes, { asOf: ET_NOON('2026-03-01') });
     const gate = evaluateLiveCapitalGate(report, LIVE_CAPITAL_GATE);
-    expect(report.totals.resolved).toBe(40);
+    expect(report.totals.resolved).toBe(WEEKS * PER_WEEK);
     expect(report.totals.weeksWithResolved).toBe(8);
+    // The power criterion is SATISFIED here, not bypassed — pinned so a future edit that
+    // thins the fixture back out fails on the reason rather than on a bare `passed`.
+    expect(gate.power.powered).toBe(true);
+    expect(gate.power.nRequired).toBe(2846);
+    expect(gate.criteria.find((c) => c.name === 'sample_size')!.status).toBe('PASS');
     expect(gate.passed).toBe(true);
     expect(gate.summary).toMatch(/PASS/);
   });

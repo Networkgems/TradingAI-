@@ -125,8 +125,8 @@ Live-capital wiring may be **proposed** only when **all** of the following hold
 | # | Criterion | Threshold | Why |
 |---|-----------|-----------|-----|
 | 1 | **Weeks of evidence** — distinct ISO weeks with ≥1 settled idea | **≥ 8** | ~2 months of weekly forward data; one lucky week is not a track record. |
-| 2 | **Sample size** — total resolved (settled) ideas | **≥ 30** | A small-n floor so hit-rate / expectancy are not noise. |
-| 3 | **Positive expectancy** — overall **cost-net** R-expectancy (net P/L ÷ max-loss) | **> 0**, **and** the bar must be *reachable* — see the feasibility precondition (TRA-2335) and **rule R1** (TRA-2361) | The edge must be positive *after* normalizing for risk taken **and net of modeled transaction costs** (F1) — and the bar must be one the instrument can produce, at the **book** level *and* in every sleeve carrying ≥ 20% of it. |
+| 2 | **Sample size** — total resolved (settled) ideas vs the **power-required** sample | **≥ `n_req = max(30, ceil((2σ/δ)²))`**, pooled **AND** every ≥20% sleeve — see the power criterion (TRA-2346/TRA-3368) | "Is n ≥ 30?" is not the question the gate needs answered. The question is whether the sample can **resolve** the effect the gate must detect. |
+| 3 | **Positive expectancy** — overall **cost-net** R-expectancy (net P/L ÷ max-loss) | **> 0**, **and** the bar must be *reachable* — see the feasibility precondition (TRA-2335) and **rule R1** (TRA-2361) — **and** the sample must be able to *resolve* it (TRA-2346) | The edge must be positive *after* normalizing for risk taken **and net of modeled transaction costs** (F1) — and the bar must be one the instrument can produce, at the **book** level *and* in every sleeve carrying ≥ 20% of it, measured on a sample that can tell the difference. |
 | 4 | **Expectancy durability** — fraction of resolved-bearing weeks with positive **cost-net** R-expectancy | **≥ 60%** | The edge must persist across weeks (net of costs), not come from one outlier. |
 | 5 | **POP calibration** — \|realized hit-rate − mean stated POP\| | **≤ 10 pts** | The model's stated probabilities must be honest, not optimistic. |
 | 6 | **Defined-risk integrity** — realized losses that breached the stated max-loss | **= 0** | Defined-risk must actually be defined; any breach is disqualifying. |
@@ -406,6 +406,55 @@ partition check — the one that proves nothing was filtered) · `blockingSleeve
 the per-sleeve flags · and, **when R1 is biting**, criterion 3 reads `INFEASIBLE` with the
 offending sleeve **named in the headline**. Those are all coherence properties of the
 payload, not statements about the book.
+
+### The power criterion (TRA-2346 / TRA-3368) — `UNDERPOWERED`, the fourth state
+
+Ratified by QuantTrader on TRA-2346, 2026-08-12 (Q1–Q6). Mirrored here because the
+constants are a **pre-registration**: fixing δ and z after seeing a book is the same
+disease the R1 threshold was pre-registered to avoid.
+
+> **The requirement.** `n_req = max(30, ceil((z·σ / δ)²))` with
+> `z = POWER_CONFIDENCE_SIGMA = 2.0` and `δ = TARGET_EFFECT_R = 0.03` **on the R scale**,
+> both in `gate-power.ts`.
+> **σ = `max(σ̂_{n−1}, σ_param(c))`** where `σ_param(c) = √(c/(1−c))` — the sd of the
+> two-point per-idea R (`+c/(1−c)` win, `−1` loss) at the breakeven hit rate `p = 1−c`,
+> `c = credit ÷ width`.
+> **Powered iff `powered_pooled(book n, pooled c)` AND every sleeve with `weight ≥ 0.20`
+> is powered at its OWN c**, on either axis. Not powered ⇒ `UNDERPOWERED`, `pass: false`,
+> on **both** `sample_size` and `positive_expectancy`.
+> **Precedence: `INFEASIBLE` > `UNDERPOWERED` > `FAIL`/`PASS`.**
+
+Reference values at δ = 0.03: **`c = 0.03 → 138` · `0.20 → 1112` · `0.30 → 1905`.**
+⚠️ **NOT 129 / 711 / 933** — those are the *hit-rate*-scale numbers, and the gate grades
+**R**. The R-scale requirement is the hit-rate one ÷ `(1−c)²`, i.e. 1.6–2.0× larger on
+exactly the 0.20–0.30 credit sleeves where the criterion has to bite. Against the live
+pooled `c = 0.0366` the shipped 30-idea floor was **~5.6× short**.
+
+Four things are **closed decisions**, not open design space:
+
+1. **Never raw σ̂ alone.** `n_req = (2σ̂/δ)²` on a book that has not lost yet gives σ̂ ≈ 0
+   ⇒ "adequately powered at n = 3" — a fail-open **worse than the constant it replaces**,
+   because it opens widest on the thinnest books. Hence the parametric floor. Where no `c`
+   exists (debit/long), the sleeve is `sample_only` and a degenerate σ̂ is `UNDERPOWERED`
+   **by rule**, publishing `nRequired: null` rather than a fabricated bar.
+2. **Never a δ̂ derived from the book** — in particular never `|expectancyNetR − minExpectancyR|`.
+   A lucky mean would shrink its own required sample: the same disease, on the other variable.
+3. **A χ² upper confidence bound on σ̂ is REJECTED OUTRIGHT**, not deferred. It assumes
+   normality and two-point R breaks that assumption badly enough to make its coverage
+   fiction. Do not ship it later as an "upgrade".
+4. **The pooled conjunct is load-bearing.** A per-sleeve-only ∀ is *vacuously true* on a
+   fragmented book (six 15% sleeves) — a materiality-quantified ∀ fails open on a
+   fragmented population. Fixture (f) in `gate-power.test.ts` fails if it is dropped.
+
+`z = 2.0` puts δ at two standard errors: ~95% confidence against a *zero* effect, but only
+**~50% power at δ itself**. True 80% power needs `z ≈ 2.81`. That is a **parameter change
+on a named constant**, not a redesign — but it is QuantTrader's to make.
+
+`GET /api/health/live-capital-gate` publishes the whole verdict under `power`, including
+`sigmaSource` (`sample` | `parametric_floor` | `sample_only`), the per-sleeve `byAxis`
+entries, and **`forcedBy`** — so a reader can see *which* conjunct forced the verdict
+without re-deriving it. A report with no power inputs grades `UNDERPOWERED`: the criterion
+is monotone non-increasing, so a degraded read must close the path, never open it.
 
 ### Criterion 5 — POP post-calibration (TRA-2006, SHADOW-first)
 

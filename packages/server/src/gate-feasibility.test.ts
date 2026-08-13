@@ -105,9 +105,20 @@ describe('TRA-2335 · computeBookCeiling — the payoff ceiling and its provenan
 describe('TRA-2335 · AC6 — FAIL and INFEASIBLE must be DISTINGUISHABLE', () => {
   const CRITERIA = { ...LIVE_CAPITAL_GATE, minExpectancyR: 0.2 };
 
-  /** FIXTURE 1 — a REACHABLE bar the book simply underperformed. Must read FAIL. */
+  /**
+   * FIXTURE 1 — a REACHABLE bar the book simply underperformed. Must read FAIL.
+   *
+   * ⚠️ TRA-3368 — n IS 700, NOT 35, AND THAT IS THE POINT OF THE FIXTURE, NOT PADDING.
+   * `FAIL` asserts "the book underperformed a bar it could have cleared", and a 35-row
+   * book cannot support that claim about a 0.03R effect — the power criterion pre-empts
+   * it with `UNDERPOWERED`, which is a fact about the SAMPLE and not about the book. To
+   * keep asserting the FAIL/INFEASIBLE distinction, the fixture has to be a book that
+   * genuinely resolves: at c = 36.6/300 = 0.122 the parametric floor σ_param = 0.3728
+   * puts n_req at 618, so 700 rows clear it. Every per-row number is unchanged, so the
+   * ceiling this fixture exists to exercise is still exactly 2.0 gross / 1.95 net.
+   */
   const underperformingBook = (): IdeaOutcome[] =>
-    Array.from({ length: 35 }, (_, i) =>
+    Array.from({ length: 700 }, (_, i) =>
       outcome({
         key: `u-${i}`,
         // rewardR = 200/100 = 2.0 — the 0.20R bar is comfortably reachable here.
@@ -357,9 +368,19 @@ describe('TRA-2335 · a report without the ceiling fields degrades, never throws
         weeksWithResolved: 8,
         weeksPositiveExpectancyNet: 6,
         popCalibrationGap: 0.05,
-        resolved: 30,
+        resolved: 4000,
         expectancyNetR: 0.45,
         maxLossBreaches: 0,
+        // ⚠️ TRA-3368 — the claim under test is that an UNKNOWN CEILING does not block a
+        // book that empirically clears the bar. `UNDERPOWERED` pre-empts `PASS`, so
+        // without a powered observation the assertion below would go green against a
+        // verdict reached for an entirely different reason — the ceiling degradation
+        // could be broken outright and this test would not notice.
+        powerInputs: {
+          pooled: { n: 4000, c: 0.0366, sigmaSample: 0.9 },
+          byStructure: [],
+          byPremiumDirection: [],
+        },
       },
     } as unknown as Parameters<typeof evaluateBookFeasibility>[0];
 

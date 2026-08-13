@@ -55,6 +55,13 @@ function forwardReport(totals: Partial<ForwardTestReport['totals']> = {}): Forwa
         byStructure: emptyCeilingAxis('strategy'),
         byPremiumDirection: emptyCeilingAxis('premium_direction'),
       },
+      // TRA-3368 — the scorecard reads none of the power block either; a degenerate
+      // pooled observation keeps the fixture honest (no rows were partitioned).
+      powerInputs: {
+        pooled: { n: 35, c: null, sigmaSample: null },
+        byStructure: [],
+        byPremiumDirection: [],
+      },
       wins: 21,
       losses: 12,
       scratches: 2,

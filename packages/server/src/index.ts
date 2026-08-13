@@ -7102,6 +7102,19 @@ app.get('/api/health/live-capital-gate', async (_req, res) => {
       // the sleeve block is carried in the already-whitelisted `feasibilityNote` and in
       // `summary`. If you add one there, add it to the whitelist in the same commit.
       sleeveFeasibility: gate.sleeveFeasibility,
+      // TRA-3368 (TRA-2346) — the POWER criterion's verdict, whole. `powered` is the
+      // conjunct `pooled ∧ every ≥20%-weight sleeve at its own c` (both axes); a reader
+      // must be able to see WHICH conjunct/sleeve forced the verdict without re-deriving
+      // it — that is `forcedBy`, plus the per-sleeve `byAxis` entries it points into.
+      // `sigmaSource: 'sample' | 'parametric_floor' | 'sample_only'` names which σ the
+      // requirement was computed from; `sample_only` with a degenerate σ̂ is UNDERPOWERED
+      // by ratified rule and publishes `nRequired: null`, never a fabricated bar.
+      // ⚠️ WHOLE-OBJECT pass-through (like `sleeveFeasibility`): new fields on
+      // `GatePowerResult` DO flow. The `criteria` whitelist above is unchanged —
+      // TRA-3368 added no `GateCriterionResult` field (UNDERPOWERED is a new VALUE of
+      // the already-whitelisted `status`, and the power sentence rides the
+      // already-whitelisted `feasibilityNote`).
+      power: gate.power,
       evidence: {
         surfaced: report.totals.surfaced,
         resolved: report.totals.resolved,

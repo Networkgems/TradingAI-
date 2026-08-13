@@ -32,6 +32,15 @@ describe('resolveLiveCapitalGateCriteria (TRA-1600 B)', () => {
 });
 
 // Minimal report builder — only the totals fields the gate reads.
+//
+// ⚠️ TRA-3368 — `resolved` IS 4000, NOT 30, AND THAT IS LOAD-BEARING. These tests are
+// about the cost-aware BAR, so every other criterion must be satisfied or a failure here
+// stops meaning what the test says it means. Under the power criterion a 30-idea book is
+// UNDERPOWERED (n_req = max(30, ceil((2σ/δ)²)) = 3600 at the live σ = 0.9, c = 0.0366),
+// which pre-empts BOTH plain verdicts — so a 30-row fixture can no longer reach `PASS` or
+// `FAIL` at all, and these tests would be asserting the power criterion by accident.
+// `powerInputs` carries the matching observations: a book that IS powered, so the only
+// thing left to move is the bar.
 function reportWith(expectancyNetR: number): ForwardTestReport {
   return {
     asOfDate: '2026-07-11',
@@ -39,8 +48,13 @@ function reportWith(expectancyNetR: number): ForwardTestReport {
       weeksWithResolved: 8,
       weeksPositiveExpectancyNet: 6,
       popCalibrationGap: 0.05,
-      resolved: 30,
+      resolved: 4000,
       expectancyNetR,
+      powerInputs: {
+        pooled: { n: 4000, c: 0.0366, sigmaSample: 0.9 },
+        byStructure: [{ key: 'bull_put_spread', n: 4000, weight: 1, c: 0.0366, sigmaSample: 0.9 }],
+        byPremiumDirection: [{ key: 'credit', n: 4000, weight: 1, c: 0.0366, sigmaSample: 0.9 }],
+      },
       maxLossBreaches: 0,
       // TRA-2335 — a healthy 2:1 book, so the payoff ceiling (1.95R cost-net) sits well
       // above every bar exercised here and the feasibility precondition is satisfied.
