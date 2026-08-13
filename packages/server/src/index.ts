@@ -6931,11 +6931,33 @@ app.get('/api/health/agent-spend', (_req, res) => {
 // Unauthenticated, matching /api/health/agent-spend: it carries symbol shortlists and
 // counters, no balances and no trade detail. Usernames are included because the cap
 // is per-user and a fleet reader needs to know which book spent the session.
-app.get('/api/health/agents-advisory', (_req, res) => {
+app.get('/api/health/agents-advisory', (req, res) => {
   const nowMs = Date.now();
+  // The fleet is 68 books and at most one has the advisory layer on, so listing every
+  // book's identical "never ran" row buries the one that matters under 67 copies of
+  // nothing. Report the books with something to say, and SAY HOW MANY were left out —
+  // `booksOmitted` is what keeps this a filter rather than a silent truncation.
+  // `?all=1` restores the full list.
+  const all = (req as { query?: Record<string, unknown> }).query?.['all'] === '1';
   const perBook: unknown[] = [];
+  let booksOmitted = 0;
+  let booksTotal = 0;
+  const fleet = { latched: 0, advised: 0, fellBack: 0, skipped: 0, failed: 0, breakered: 0, booksWithAPass: 0 };
   for (const ctx of getAllUserContexts()) {
-    perBook.push({ user: ctx.username, ...ctx.engine.getAgentsAdvisoryBound(nowMs) });
+    booksTotal++;
+    const b = ctx.engine.getAgentsAdvisoryBound(nowMs);
+    if (b.sessionLatched) fleet.latched++;
+    if (b.breakerCooldownUntil != null) fleet.breakered++;
+    if (b.lastPass) {
+      fleet.booksWithAPass++;
+      fleet.advised += b.lastPass.census.advised;
+      fleet.fellBack += b.lastPass.census.fellBack;
+      fleet.skipped += b.lastPass.census.skipped;
+      fleet.failed += b.lastPass.census.failed;
+    }
+    const interesting = b.lastPass != null || b.sessionLatched || b.breakerCooldownUntil != null;
+    if (all || interesting) perBook.push({ user: ctx.username, ...b });
+    else booksOmitted++;
   }
   res.json({
     ok: true,
@@ -6958,6 +6980,15 @@ app.get('/api/health/agents-advisory', (_req, res) => {
       callCostEstimateUsd: callCostEstimateUsd(),
       reservationExceedsCap: callCostEstimateUsd() > companyDailyCapUsd(),
     },
+    // ⚠️ A fleet census, NOT a substitute for perBook. Zeros here are ambiguous by
+    // construction (no pass ran / passes ran and advised nothing), which is exactly
+    // why `booksWithAPass` is reported next to them: grade the zero against that.
+    fleet: { ...fleet, booksTotal },
+    booksTotal,
+    booksOmitted,
+    booksOmittedNote: booksOmitted > 0
+      ? `${booksOmitted} book(s) have never run an advised pass this process and carry no latch or breaker; add ?all=1 to list them`
+      : null,
     perBook,
   });
 });
