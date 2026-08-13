@@ -99,3 +99,44 @@ pnpm check:deploy-drift
 It fails closed: an unreachable health route, a live SHA unknown to this checkout, or a failed
 `git fetch` all exit BLIND (3), never 0 — because a stale local `origin/main` matching an equally
 stale live build would otherwise manufacture a CURRENT verdict. (TRA-2229)
+
+### A deploy one-shot must state its order as DATA, not as prose
+
+A deploy train is written because a deploy has to happen inside a window — after the close, before
+the open, outside the freeze. But the carrier issue it creates is picked up whenever the assignee's
+queue reaches it. On 2026-08-13 TRA-3493 sat **5.4h** and TRA-3511 **3.4h** with nobody woken on
+them; both were dispositioned by hand, from an unrelated run, by a human reading the prose and
+re-deriving the ancestry. Nothing stranded — because an unrelated deploy path happened to carry the
+same commits. That was luck, and under `skip_missed` the slot is not replayed. (TRA-3529/TRA-3533)
+
+**Do not "fix" this by giving the trains an unattended executor.** That re-creates `autoDeploy`
+through the back door, which is the pin two sections up, and hands the live host a standing
+automated write. The queue dependency IS the "a human decides each deploy" posture, one layer down.
+
+So the remediation is detection, and it has to run **outside the carrier** — a lateness check
+written into the carrier's own prose only runs if somebody runs the carrier, which is the exact
+event whose absence is the defect. Every deploy-train carrier therefore carries exactly one block:
+
+````
+```deploy-order
+commit: 65fdb95
+host: tradingai-bqb1
+deadline: 2026-08-13T13:25:00Z
+```
+````
+
+`deadline` **must** end in `Z`. Crons are evaluated in **ET** and these windows are written in UTC;
+a bare local time is rejected, never guessed. A carrier that mentions deploying but orders nothing
+opts out with `<!-- deploy-order: none -->` — there is no way to leave the population by accident.
+
+```bash
+pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED
+pnpm check:deploy-train-window:controls
+```
+
+`STRANDED` (deadline passed, ordered commit not in the live build) is the incident and the only
+code that should page. `UNGRADED` is the migration backlog — suspected trains carrying no block —
+non-zero so it cannot read as green, separate so eighteen backlog rows cannot bury one incident.
+And `SATISFIED` means the commit is live **now**, not that it was live **by the deadline**: the
+timing arm needs Render deploy history and reports `UNREAD`, never OK. TRA-3536 is the live fixture
+(its ordered commit is the SHA already live, so obeying it is a strict no-op).
