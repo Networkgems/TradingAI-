@@ -25,13 +25,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rm } from 'fs/promises';
+import { rm, appendFile } from 'fs/promises';
 import { PaperOptionsAccount } from './options-account.js';
 import {
   listOptionTradeJournal,
   recordOptionTradeVoid,
   recordOptionTradeClose,
   setOptionTradeJournalFileForTests,
+  getOptionTradeVoids,
 } from './option-trade-journal.js';
 import type { OtmMispricingSignal } from '@trading-app/shared';
 
@@ -205,5 +206,134 @@ describe('TRA-3472 — an order that never filled leaves no OPEN row behind', ()
   it('no-ops when the journal flag is off', async () => {
     delete process.env['ENABLE_OPTION_TRADE_JOURNAL'];
     expect(await recordOptionTradeVoid('anything')).toBe(false);
+  });
+});
+
+// ── The acceptance witness ───────────────────────────────────────────────────
+//
+// The retraction above is correct and, on its own, UNGRADEABLE in production.
+// It deletes the row, so a book with no stranded rows because the fix fired
+// reads exactly like a book with no stranded rows because no order was ever
+// attempted — and the second is what an overnight window actually looks like.
+// The two `log` calls were the only witnesses, and `/v1/logs?text=` returns
+// `logs:null` on bqb1 (TRA-2951 spent a run establishing that).
+//
+// So the `void` lines, which were already durable on `/data`, are now surfaced.
+// A positive control must CONTAIN what it detects.
+describe('TRA-3472 — the retraction is observable, or it cannot be accepted', () => {
+  it('records a witness naming the abort branch, the OCC and the book', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+    const pos = liveOtmOpen(acct);
+    await acct.flushOptionTradeJournal();
+
+    // Negative control: nothing to see before the void. Without this the
+    // assertions below would pass against a ledger that reports every open.
+    expect(getOptionTradeVoids().total).toBe(0);
+
+    acct.voidOpenOption(pos.id);
+    await acct.flushOptionTradeJournal();
+    expect(await recordOptionTradeVoid(pos.id, 'walk_exhausted', TRADING_TIME + 1_000)).toBe(true);
+
+    const voids = getOptionTradeVoids();
+    expect(voids.total).toBe(1);
+    expect(voids.applied).toBe(1);
+    expect(voids.refused).toBe(0);
+    expect(voids.live).toBe(1);
+    expect(voids.dropped).toBe(0);
+    expect(voids.recent[0]).toMatchObject({
+      id: pos.id,
+      ts: TRADING_TIME + 1_000,
+      reason: 'walk_exhausted',
+      applied: true,
+      mode: 'live',
+      symbol: 'SO',
+      optionSymbol: OCC,
+      structure: 'single_leg_otm',
+    });
+
+    // The row itself is gone — which is exactly why the witness has to exist.
+    expect(await listOptionTradeJournal()).toHaveLength(0);
+  });
+
+  // The witness is read off the record the fold is ABOUT to delete. Get the
+  // order wrong and every field but `id` comes back null, which reads as a
+  // successful retraction of nothing.
+  it('survives the reboot, because the witness is replayed from the file', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+    const pos = liveOtmOpen(acct);
+    await voidLikeTheMirror(acct, pos.id);
+
+    setOptionTradeJournalFileForTests(tmpFile); // drops the cache, replays the bytes
+    await listOptionTradeJournal(); // force the load
+    const voids = getOptionTradeVoids();
+    expect(voids.total).toBe(1);
+    expect(voids.applied).toBe(1);
+    expect(voids.recent[0]!.optionSymbol).toBe(OCC);
+    expect(voids.recent[0]!.mode).toBe('live');
+  });
+
+  // A void that arrives for an ALREADY-CLOSED row is refused by the fold — the
+  // guard that protects settled P&L. Refusing it silently would hide something
+  // trying to unwind a real round trip, so it is recorded as `applied:false`.
+  it('records a REFUSED void rather than dropping it', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+    const pos = liveOtmOpen(acct);
+    await acct.flushOptionTradeJournal();
+
+    // Hand-write the out-of-order pair the writer's own guard would never emit,
+    // then replay: open → close → void.
+    await recordOptionTradeClose(pos.id, {
+      closeTs: TRADING_TIME + 3_600_000,
+      outcome: 'WIN',
+      realizedPnlUsd: 120,
+      realizedR: 0.35,
+      exitReason: 'take_profit',
+      holdDays: 0,
+    });
+    await appendFile(
+      tmpFile,
+      `${JSON.stringify({ kind: 'void', id: pos.id, ts: TRADING_TIME + 7_200_000, reason: 'replayed' })}\n`,
+      'utf-8',
+    );
+
+    setOptionTradeJournalFileForTests(tmpFile);
+    const rows = await listOptionTradeJournal();
+
+    // The settled round trip is intact — the guard held.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.outcome).toBe('WIN');
+    expect(rows[0]!.realizedPnlUsd).toBe(120);
+
+    // ...and the refusal is visible instead of silent.
+    const voids = getOptionTradeVoids();
+    expect(voids.total).toBe(1);
+    expect(voids.applied).toBe(0);
+    expect(voids.refused).toBe(1);
+    expect(voids.recent[0]).toMatchObject({ id: pos.id, applied: false, reason: 'replayed' });
+  });
+
+  // A legacy `{kind,id}` line — written by the shipped `a4ed77a2` build before
+  // this change — must still yield a usable witness, just without ts/reason.
+  // Otherwise deploying the witness would make the retractions already on disk
+  // read as if they had never happened.
+  it('yields a witness for a pre-existing void line with no ts or reason', async () => {
+    const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+    const pos = liveOtmOpen(acct);
+    await acct.flushOptionTradeJournal();
+    await appendFile(tmpFile, `${JSON.stringify({ kind: 'void', id: pos.id })}\n`, 'utf-8');
+
+    setOptionTradeJournalFileForTests(tmpFile);
+    expect(await listOptionTradeJournal()).toHaveLength(0);
+
+    const voids = getOptionTradeVoids();
+    expect(voids.total).toBe(1);
+    expect(voids.applied).toBe(1);
+    expect(voids.recent[0]).toMatchObject({
+      id: pos.id,
+      ts: null,
+      reason: null,
+      optionSymbol: OCC,
+      mode: 'live',
+    });
   });
 });

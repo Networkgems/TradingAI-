@@ -454,8 +454,91 @@ type PartialCloseLine = { kind: 'partial_close'; id: string; partial: OptionTrad
 // one of those is a place to forget. Deleting it needs none, because the fold is
 // a replay over an append-only log: the `void` line supersedes the `open` line
 // the same way `close` does, and the file still never rewrites a byte.
-type VoidLine = { kind: 'void'; id: string };
+//
+// TRA-3472 (acceptance) — `ts` and `reason` are carried on the LINE because they
+// are the only two facts a replay cannot recover: the row they describe is gone
+// by the time anyone reads. Everything else on the witness below (symbol, OCC,
+// structure, mode) is read off the record the fold is about to delete, so a
+// legacy `{kind,id}` line still yields a usable witness minus those two fields.
+type VoidLine = { kind: 'void'; id: string; ts?: number; reason?: string };
 type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine | PartialCloseLine | VoidLine;
+
+/**
+ * TRA-3472 — a retraction that leaves no trace is ungradeable.
+ *
+ * The `void` fix DELETES the stranded row, which is the right repair and also
+ * makes its own success invisible: a book with no stranded rows because the
+ * retraction fired reads EXACTLY like a book with no stranded rows because no
+ * order was ever attempted. Every production readout of this journal folds to
+ * outcomes, so `void` lines — which are durable, on `/data`, in the append-only
+ * file — surfaced nowhere at all. The only witnesses were two `log` calls, and
+ * `/v1/logs?text=` returns `logs:null` on this host (TRA-2951 burned a run
+ * proving that), so the acceptance for the fix could not be read back.
+ *
+ * A positive control must CONTAIN what it detects. This is that control: the
+ * count is what turns "no new stranded rows" from a NO-RUN into a PASS, and
+ * `reason` names WHICH of the seven abort branches fired.
+ *
+ * `applied:false` is the interesting one — a `void` line whose row was already
+ * CLOSED, i.e. the out-of-order case the fold guard refuses. It must be visible
+ * rather than silently dropped: it would mean something tried to unwind a
+ * settled round trip.
+ */
+export interface OptionTradeVoidRecord {
+  id: string;
+  /** When the void was written; `null` on a line predating this field. */
+  ts: number | null;
+  /** Which abort branch voided the open; `null` on a line predating this field. */
+  reason: string | null;
+  /** Did the fold actually retract a row, or was it refused / unknown? */
+  applied: boolean;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  structure: string | null;
+}
+
+/**
+ * Bounded so a pathological run cannot grow the process heap without limit —
+ * this is a witness for a rare event, not a second journal. The file remains
+ * the record of truth; drop the OLDEST on overflow and say so via `truncated`.
+ */
+const VOID_LEDGER_CAP = 500;
+let voidLedger: OptionTradeVoidRecord[] = [];
+let voidLedgerDropped = 0;
+
+function pushVoid(sink: OptionTradeVoidRecord[], rec: OptionTradeVoidRecord): void {
+  sink.push(rec);
+  while (sink.length > VOID_LEDGER_CAP) {
+    sink.shift();
+    voidLedgerDropped += 1;
+  }
+}
+
+/**
+ * Retractions observed by the last load plus every one written since — the
+ * acceptance read for TRA-3472. Served by `/api/health/option-journal`.
+ *
+ * `dropped` counts witnesses evicted by the cap, so a truncated ledger cannot
+ * pass for a complete one.
+ */
+export function getOptionTradeVoids(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  recent: OptionTradeVoidRecord[];
+} {
+  return {
+    total: voidLedger.length,
+    dropped: voidLedgerDropped,
+    applied: voidLedger.filter((v) => v.applied).length,
+    refused: voidLedger.filter((v) => !v.applied).length,
+    live: voidLedger.filter((v) => v.mode === 'live').length,
+    recent: voidLedger.map((v) => ({ ...v })),
+  };
+}
 
 function defaultStoreFile(): string {
   const root = resolveDataDir();
@@ -468,6 +551,10 @@ export function setOptionTradeJournalFileForTests(path: string | null): void {
   storeFileOverride = path;
   cache = null;
   integrity = UNMEASURED_INTEGRITY;
+  // TRA-3472 — the void witnesses describe the OLD file; carrying them across a
+  // re-point would let one test's retraction be read as another's.
+  voidLedger = [];
+  voidLedgerDropped = 0;
 }
 function storeFile(): string {
   return storeFileOverride ?? defaultStoreFile();
@@ -509,7 +596,15 @@ export function getOptionTradeJournalIntegrity(): OptionTradeJournalIntegrity {
 /** In-memory folded view: id -> latest record. */
 let cache: Map<string, OptionTradeJournalRecord> | null = null;
 
-function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine): void {
+function foldLine(
+  map: Map<string, OptionTradeJournalRecord>,
+  line: JournalLine,
+  // TRA-3472 — where void witnesses land. `ensureLoaded` passes a LOCAL array
+  // and publishes it only once the replay completed, for the same reason the
+  // integrity latch exists: a half-built ledger from a failed read must never be
+  // served as a complete one. Live writes pass the published ledger directly.
+  voidSink: OptionTradeVoidRecord[] = voidLedger,
+): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
     return;
@@ -547,7 +642,37 @@ function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine)
     // An unknown id is a no-op, so a replayed void can never delete a row it
     // did not open.
     const rec = map.get(line.id);
-    if (!rec || rec.outcome !== 'OPEN') return;
+    if (!rec || rec.outcome !== 'OPEN') {
+      // Refused — but RECORDED. A void line that no longer applies is the
+      // out-of-order case the guard exists for; dropping it silently would hide
+      // an attempt to unwind a settled round trip.
+      pushVoid(voidSink, {
+        id: line.id,
+        ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
+        reason: typeof line.reason === 'string' ? line.reason : null,
+        applied: false,
+        mode: rec?.mode ?? null,
+        symbol: rec?.symbol ?? null,
+        optionSymbol: rec?.optionSymbol ?? null,
+        structure: rec?.structure ?? null,
+      });
+      return;
+    }
+    // Read the witness off the record BEFORE deleting it — after the delete
+    // there is nothing left to describe what was retracted.
+    pushVoid(voidSink, {
+      id: line.id,
+      ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
+      reason: typeof line.reason === 'string' ? line.reason : null,
+      applied: true,
+      mode: rec.mode,
+      symbol: rec.symbol,
+      // `optionSymbol` is optional on the record (older rows predate it), so an
+      // absent OCC is reported as `null` rather than dropping the key — a
+      // witness with a missing field would read as a malformed record.
+      optionSymbol: rec.optionSymbol ?? null,
+      structure: rec.structure,
+    });
     map.delete(line.id);
     return;
   }
@@ -574,6 +699,8 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   const path = storeFile();
   let corruptLines = 0;
   let readError: string | null = null;
+  // TRA-3472 — replay into a LOCAL sink, publish below. See `foldLine`.
+  const voidSink: OptionTradeVoidRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -581,7 +708,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -597,6 +724,11 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
     log.warn('option trade journal skipped unparseable lines', { corruptLines, path });
   }
   integrity = { corruptLines, readError };
+  // TRA-3472 — publish the replayed witnesses only now the replay is over. On a
+  // read error this still publishes what was folded, matching `map`: the two
+  // must describe the same partial world, and `integrity.readError` is what
+  // tells a reader to VOID rather than trust either.
+  voidLedger = voidSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -802,19 +934,31 @@ export async function recordOptionTradeClose(
  * unwind a settled round trip would be a strictly worse defect than the
  * stranded row it fixes.
  */
-export async function recordOptionTradeVoid(id: string): Promise<boolean> {
+export async function recordOptionTradeVoid(
+  id: string,
+  // TRA-3472 (acceptance) — WHICH abort branch fired. Optional so the existing
+  // call contract still compiles, but every caller should pass it: without it
+  // the witness can say a retraction happened and not say why, and the seven
+  // branches (buying power, day-trade BP, spread veto, broker `rejected`,
+  // `walk_exhausted`, `no_quote`, throw) need different follow-ups.
+  reason?: string,
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<boolean> {
   if (!isOptionTradeJournalEnabled()) return false;
   const map = await ensureLoaded();
   const existing = map.get(id);
   if (!existing || existing.outcome !== 'OPEN') return false;
-  foldLine(map, { kind: 'void', id });
-  await appendLine({ kind: 'void', id });
+  const line: VoidLine = { kind: 'void', id, ts, ...(reason !== undefined ? { reason } : {}) };
+  foldLine(map, line);
+  await appendLine(line);
   log.info('option trade journal open VOIDED (order never filled)', {
     id,
     symbol: existing.symbol,
     optionSymbol: existing.optionSymbol,
     structure: existing.structure,
     mode: existing.mode,
+    reason: reason ?? null,
   });
   return true;
 }

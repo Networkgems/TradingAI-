@@ -9575,7 +9575,11 @@ export class SignalEngine {
       // into the order path (same posture as the entry-slippage amend below).
       void this.optionsAccount
         .flushOptionTradeJournal()
-        .then(() => recordOptionTradeVoid(opened.id))
+        // TRA-3472 (acceptance) — `reason` rides the void line onto disk. The
+        // retraction deletes the row, so without it the only trace of WHICH
+        // abort fired is a log line, and `/v1/logs?text=` is unreadable on this
+        // host. `/api/health/option-journal` serves it back as `voids.recent[]`.
+        .then(() => recordOptionTradeVoid(opened.id, reason))
         .catch((err: unknown) => {
           log.warn('option trade journal void failed', {
             positionId: opened.id,

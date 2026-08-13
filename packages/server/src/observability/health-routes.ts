@@ -214,6 +214,7 @@ import {
   summarizeOptionTradeJournal,
   isOptionTradeJournalEnabled,
   getOptionTradeJournalIntegrity,
+  getOptionTradeVoids, // TRA-3472 — the acceptance witness for the never-filled retraction
   GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
@@ -5553,8 +5554,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // secrets-free basis the route already documents — rows carry no balances/PII.
     // TRA-2082 — the dump is built INSIDE the report off the same `sinceTs`-filtered
     // set as the summary; the route must not re-derive it from the unfiltered `rows`.
-    res.json(
-      buildOptionJournalReport(
+    // TRA-3472 — `voids` is NOT part of the report fold and must not be: the
+    // report is a fold over SURVIVING rows, and a retracted row is by
+    // construction absent from it. Reading the witness off the journal module
+    // directly is the only way to see the retractions at all. It is deliberately
+    // OUTSIDE the `?sinceTs` cohort filter too — the filter selects rows, and
+    // these are the rows that no longer exist.
+    const voids = getOptionTradeVoids();
+    res.json({
+      ...buildOptionJournalReport(
         rows,
         now(),
         isOptionTradeJournalEnabled(),
@@ -5573,7 +5581,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           : false,
         closedSinceTs,
       ),
-    );
+      voids,
+    });
   });
 
   // TRA-1601 (TRA-1600 A/telemetry) — maker-fill routing readout. Surfaces the
