@@ -376,7 +376,9 @@ import {
   type ChannelAdapter,
   type RoutineSummary,
 } from './notifications/index.js';
-import { LLM_KILL_ENV_VAR } from './trading-agents-advisory.js';
+// TRA-3514 monitor — `isAgentMarketHoursGateDisabled` joins the health readout so
+// the process-global half of the advisory eligibility predicate is observable.
+import { LLM_KILL_ENV_VAR, isAgentMarketHoursGateDisabled } from './trading-agents-advisory.js';
 import {
   initWatchlistStore,
   getCryptoWatchlistData,
@@ -476,6 +478,7 @@ import {
   ADVISORY_PASSES_PER_SESSION,
   ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE,
   advisoryWorstDailyUsd,
+  summariseAdvisoryFleet,
 } from './agents-advisory-bound.js';
 import { executionCapStatus } from './agent-execution-caps-store.js';
 import { proposalTtlMs } from './proposal-store.js';
@@ -809,6 +812,9 @@ import {
   type AlertChannel,
   type AlertPreferences,
   type PositionAdvisorReadout,
+  // TRA-3514 monitor — the advisory market-hours window, published on
+  // /api/health/agents-advisory so a zero census can be graded against it.
+  isAgentTradingWindowOpen,
 } from '@trading-app/shared';
 import {
   saveResearchReport,
@@ -6946,26 +6952,20 @@ app.get('/api/health/agents-advisory', (req, res) => {
   // `booksOmitted` is what keeps this a filter rather than a silent truncation.
   // `?all=1` restores the full list.
   const all = (req as { query?: Record<string, unknown> }).query?.['all'] === '1';
-  const perBook: unknown[] = [];
-  let booksOmitted = 0;
-  let booksTotal = 0;
-  const fleet = { latched: 0, advised: 0, fellBack: 0, skipped: 0, failed: 0, breakered: 0, booksWithAPass: 0 };
-  for (const ctx of getAllUserContexts()) {
-    booksTotal++;
-    const b = ctx.engine.getAgentsAdvisoryBound(nowMs);
-    if (b.sessionLatched) fleet.latched++;
-    if (b.breakerCooldownUntil != null) fleet.breakered++;
-    if (b.lastPass) {
-      fleet.booksWithAPass++;
-      fleet.advised += b.lastPass.census.advised;
-      fleet.fellBack += b.lastPass.census.fellBack;
-      fleet.skipped += b.lastPass.census.skipped;
-      fleet.failed += b.lastPass.census.failed;
-    }
-    const interesting = b.lastPass != null || b.sessionLatched || b.breakerCooldownUntil != null;
-    if (all || interesting) perBook.push({ user: ctx.username, ...b });
-    else booksOmitted++;
-  }
+  // TRA-3514 monitor — the counting and the filter both live in
+  // `summariseAdvisoryFleet` so they are reachable from the suite. Inline here they
+  // were only gradeable by curling the live host, which is exactly the endpoint
+  // whose own zero could not be graded.
+  const books = getAllUserContexts().map(ctx => ({
+    user: ctx.username,
+    bound: ctx.engine.getAgentsAdvisoryBound(nowMs),
+  }));
+  const { fleet, perBook: kept, booksOmitted: wouldOmit } = summariseAdvisoryFleet(books);
+  const booksTotal = fleet.booksTotal;
+  const perBook = (all ? books : kept).map(e => ({ user: e.user, ...e.bound }));
+  // `booksOmitted` counts what is missing from THIS response, so `?all=1` reports 0
+  // — otherwise the note tells the reader to pass a flag they already passed.
+  const booksOmitted = all ? 0 : wouldOmit;
   res.json({
     ok: true,
     issue: 'TRA-3514',
@@ -6987,14 +6987,26 @@ app.get('/api/health/agents-advisory', (req, res) => {
       callCostEstimateUsd: callCostEstimateUsd(),
       reservationExceedsCap: callCostEstimateUsd() > companyDailyCapUsd(),
     },
+    // TRA-3514 monitor — the two PROCESS-GLOBAL arms of the eligibility predicate at
+    // signal-engine.ts:6399. Without them, a fleet-wide `booksWithAPass: 0` still
+    // has an innocent explanation the reader cannot check (out of window / breaker
+    // armed), so the zero stays ungradeable no matter how good the denominator is.
+    // A denominator answers "of how many?"; these answer "and was it even allowed
+    // to run?".
+    gate: {
+      marketWindowOpen: isAgentMarketHoursGateDisabled() || isAgentTradingWindowOpen(nowMs),
+      marketHoursGateDisabled: isAgentMarketHoursGateDisabled(),
+    },
     // ⚠️ A fleet census, NOT a substitute for perBook. Zeros here are ambiguous by
     // construction (no pass ran / passes ran and advised nothing), which is exactly
-    // why `booksWithAPass` is reported next to them: grade the zero against that.
+    // why `booksWithAPass` AND `enabledBooks` are reported next to them: grade the
+    // zero against the pair. `enabledBooks: 0` makes `advised: 0` a NO-OP;
+    // `enabledBooks > 0` with `booksWithAPass: 0` inside an open window is a DEFECT.
     fleet: { ...fleet, booksTotal },
     booksTotal,
     booksOmitted,
     booksOmittedNote: booksOmitted > 0
-      ? `${booksOmitted} book(s) have never run an advised pass this process and carry no latch or breaker; add ?all=1 to list them`
+      ? `${booksOmitted} book(s) have the advisory layer OFF and have never run an advised pass this process, and carry no latch or breaker; add ?all=1 to list them`
       : null,
     perBook,
   });

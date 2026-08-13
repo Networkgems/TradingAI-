@@ -21,6 +21,9 @@ import {
   assertAdvisoryUniverseAffordable,
   buildAdvisoryShortlist,
   emptyAdvisoryPassCensus,
+  summariseAdvisoryFleet,
+  advisoryBookIsInteresting,
+  type AdvisoryBookReadout,
 } from './agents-advisory-bound.js';
 import { COMPANY_CAP_ENV_VAR } from './agent-spend-store.js';
 
@@ -264,5 +267,106 @@ describe('TRA-3514 Part 1 §4 — the per-pass census', () => {
     const a = emptyAdvisoryPassCensus();
     a.advised = 5;
     expect(emptyAdvisoryPassCensus().advised).toBe(0);
+  });
+});
+
+// ── The fleet roll-up: the denominator that makes a zero gradeable ───────────
+//
+// The monitor on 2026-08-13T14:30Z read `booksWithAPass: 0 of 66` and could NOT
+// grade it, even though the first cut of this endpoint had deliberately shipped a
+// denominator next to the counter. `booksTotal` was the wrong denominator: the
+// layer-off fleet and a fully-broken layer-on fleet are byte-identical under it.
+// These assertions pin the DISAMBIGUATION, in both directions.
+
+describe('TRA-3514 monitor — the fleet roll-up separates "layer off" from "layer broken"', () => {
+  const book = (over: Partial<AdvisoryBookReadout> = {}): AdvisoryBookReadout => ({
+    enabled: false,
+    sessionLatched: false,
+    breakerCooldownUntil: null,
+    lastPass: null,
+    ...over,
+  });
+  const withUsers = (bs: AdvisoryBookReadout[]) =>
+    bs.map((bound, i) => ({ user: `u${i}`, bound }));
+
+  it('DIRECTION 1 — an all-OFF fleet reports enabledBooks 0, which makes advised 0 a NO-OP', () => {
+    const { fleet } = summariseAdvisoryFleet(withUsers([book(), book(), book()]));
+    expect(fleet.enabledBooks).toBe(0);
+    expect(fleet.booksWithAPass).toBe(0);
+    expect(fleet.booksTotal).toBe(3);
+  });
+
+  it('DIRECTION 2 — an ON fleet that never ran reports enabledBooks > 0 with booksWithAPass 0 (a DEFECT)', () => {
+    const { fleet } = summariseAdvisoryFleet(
+      withUsers([book({ enabled: true }), book({ enabled: true }), book()]),
+    );
+    expect(fleet.enabledBooks).toBe(2);
+    expect(fleet.booksWithAPass).toBe(0);
+    // ⭐ The whole point: the two directions differ. Under the shipped
+    // `booksWithAPass`/`booksTotal` pair alone they did NOT.
+    expect(fleet.enabledBooks).not.toBe(0);
+  });
+
+  it('the two fleets above are DISTINGUISHABLE — a control that the denominator earns its place', () => {
+    const off = summariseAdvisoryFleet(withUsers([book(), book(), book()])).fleet;
+    const on = summariseAdvisoryFleet(
+      withUsers([book({ enabled: true }), book({ enabled: true }), book({ enabled: true })]),
+    ).fleet;
+    expect(off.booksWithAPass).toBe(on.booksWithAPass); // identical on the OLD readout…
+    expect(off.booksTotal).toBe(on.booksTotal);
+    expect(off).not.toEqual(on); // …and separable on the new one.
+  });
+
+  it('sums the census across books that ran, and leaves it at zero for books that did not', () => {
+    const { fleet } = summariseAdvisoryFleet(withUsers([
+      book({ enabled: true, lastPass: { census: { advised: 3, fellBack: 2, skipped: 1, failed: 0 } } }),
+      book({ enabled: true, lastPass: { census: { advised: 1, fellBack: 0, skipped: 0, failed: 4 } } }),
+      book({ enabled: true }),
+    ]));
+    expect(fleet).toEqual({
+      enabledBooks: 3, latched: 0, advised: 4, fellBack: 2, skipped: 1,
+      failed: 4, breakered: 0, booksWithAPass: 2, booksTotal: 3,
+    });
+  });
+
+  it('counts latches and breakers directly, not by inference from lastPass', () => {
+    const { fleet } = summariseAdvisoryFleet(withUsers([
+      book({ enabled: true, sessionLatched: true }),
+      book({ breakerCooldownUntil: 1_000 }),
+    ]));
+    expect(fleet.latched).toBe(1);
+    expect(fleet.breakered).toBe(1);
+  });
+
+  it('⚠️ KEEPS an ENABLED book that has never run — the row the old filter dropped', () => {
+    const enabledNeverRan = book({ enabled: true });
+    const { perBook, booksOmitted } = summariseAdvisoryFleet(withUsers([enabledNeverRan]));
+    expect(advisoryBookIsInteresting(enabledNeverRan)).toBe(true);
+    expect(perBook).toHaveLength(1);
+    expect(booksOmitted).toBe(0);
+  });
+
+  it('and still OMITS a disabled book that never ran — the filter did not become a no-op', () => {
+    const idle = book();
+    expect(advisoryBookIsInteresting(idle)).toBe(false);
+    const { perBook, booksOmitted } = summariseAdvisoryFleet(withUsers([idle, idle]));
+    expect(perBook).toHaveLength(0);
+    expect(booksOmitted).toBe(2);
+  });
+
+  it('keeps a DISABLED book that carries a latch, a breaker or a pass', () => {
+    expect(advisoryBookIsInteresting(book({ sessionLatched: true }))).toBe(true);
+    expect(advisoryBookIsInteresting(book({ breakerCooldownUntil: 1 }))).toBe(true);
+    expect(advisoryBookIsInteresting(book({
+      lastPass: { census: emptyAdvisoryPassCensus() },
+    }))).toBe(true);
+  });
+
+  it('an empty fleet yields zeros, not a throw or a NaN', () => {
+    const { fleet, perBook, booksOmitted } = summariseAdvisoryFleet([]);
+    expect(fleet.booksTotal).toBe(0);
+    expect(fleet.enabledBooks).toBe(0);
+    expect(perBook).toEqual([]);
+    expect(booksOmitted).toBe(0);
   });
 });

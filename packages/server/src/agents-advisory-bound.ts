@@ -434,6 +434,91 @@ export function emptyAdvisoryPassCensus(): AdvisoryPassCensus {
 }
 
 /**
+ * The per-book advisory readout, as far as the fleet summary needs to see it.
+ * Structurally typed so `SignalEngine.getAgentsAdvisoryBound`'s richer return
+ * satisfies it without an import cycle.
+ */
+export interface AdvisoryBookReadout {
+  /** The per-book "Trading Agents" toggle — the ELIGIBILITY bit. */
+  enabled: boolean;
+  sessionLatched: boolean;
+  breakerCooldownUntil: number | null;
+  lastPass: { census: AdvisoryPassCensus } | null;
+}
+
+export interface AdvisoryFleetSummary {
+  /**
+   * Books with the advisory layer ON. **The denominator that makes the rest of
+   * this object gradeable** — see the note on {@link summariseAdvisoryFleet}.
+   */
+  enabledBooks: number;
+  latched: number;
+  advised: number;
+  fellBack: number;
+  skipped: number;
+  failed: number;
+  breakered: number;
+  booksWithAPass: number;
+  booksTotal: number;
+}
+
+/**
+ * TRA-3514 (monitor 08-13T14:30Z) — roll the per-book readouts into the fleet
+ * census, and decide which books the default (unfiltered) view keeps.
+ *
+ * ⭐⭐⭐ **A ZERO NEEDS THE *ELIGIBLE* DENOMINATOR, NOT THE TOTAL ONE.** The first
+ * cut of this endpoint shipped `booksWithAPass` beside `booksTotal` precisely so a
+ * zero could be graded — and it still could not be. 66 books with the layer OFF and
+ * 66 books with the layer ON that every failed to run produce byte-identical
+ * readouts under that pair, and only the second is a defect. `enabledBooks` is the
+ * number that separates them. Counting a denominator is not the same as counting
+ * the RIGHT denominator, and "I already shipped a denominator" is what stopped the
+ * question being asked a second time.
+ *
+ * ⚠️ And the filter follows the same rule. It used to keep books with a pass, a
+ * latch or a breaker — every one of which is a book that already RAN. An ENABLED
+ * book that has never run a pass is the exact failure this endpoint exists to
+ * surface, and it was the single row the default view dropped. **A filter tuned to
+ * what already worked is blind to what did not.**
+ *
+ * Both counters are accumulated DIRECTLY rather than derived from each other:
+ * a derived counter inherits the bugs of both its inputs and reports them with a
+ * clean face.
+ */
+export function summariseAdvisoryFleet<T extends AdvisoryBookReadout>(
+  books: Array<{ user: string; bound: T }>,
+): { fleet: AdvisoryFleetSummary; perBook: Array<{ user: string; bound: T }>; booksOmitted: number } {
+  const fleet: AdvisoryFleetSummary = {
+    enabledBooks: 0, latched: 0, advised: 0, fellBack: 0, skipped: 0,
+    failed: 0, breakered: 0, booksWithAPass: 0, booksTotal: 0,
+  };
+  const perBook: Array<{ user: string; bound: T }> = [];
+  let booksOmitted = 0;
+  for (const entry of books) {
+    const b = entry.bound;
+    fleet.booksTotal++;
+    if (b.enabled) fleet.enabledBooks++;
+    if (b.sessionLatched) fleet.latched++;
+    if (b.breakerCooldownUntil != null) fleet.breakered++;
+    if (b.lastPass) {
+      fleet.booksWithAPass++;
+      fleet.advised += b.lastPass.census.advised;
+      fleet.fellBack += b.lastPass.census.fellBack;
+      fleet.skipped += b.lastPass.census.skipped;
+      fleet.failed += b.lastPass.census.failed;
+    }
+    if (advisoryBookIsInteresting(b)) perBook.push(entry);
+    else booksOmitted++;
+  }
+  return { fleet, perBook, booksOmitted };
+}
+
+/** Whether the default view keeps this book. See {@link summariseAdvisoryFleet}. */
+export function advisoryBookIsInteresting(b: AdvisoryBookReadout): boolean {
+  return b.enabled || b.lastPass != null || b.sessionLatched || b.breakerCooldownUntil != null;
+}
+
+/**
  * The graded worst case of one bounded pass. Exported so the ticket's arithmetic
  * lives in code (and in the suite) rather than only in a comment — TRA-2262's
  * "put the spec's arithmetic in the suite", applied at the spot it was learned.

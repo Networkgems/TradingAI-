@@ -13425,6 +13425,7 @@ export class SignalEngine {
    * "the layer is off".
    */
   getAgentsAdvisoryBound(now = Date.now()): {
+    enabled: boolean;
     maxSymbolsPerPass: number;
     passesPerSession: number;
     session: string;
@@ -13445,6 +13446,15 @@ export class SignalEngine {
     const sl = this.agentsAdvisoryShortlist;
     const census = this.agentsAdvisoryCensus;
     return {
+      // TRA-3514 monitor 08-13T14:30Z — the ELIGIBILITY bit, and the reason this
+      // readout can be graded at all. `booksWithAPass: 0` was shipped with
+      // `booksTotal` beside it as the denominator, but 66 is the wrong
+      // denominator: it cannot separate "the layer is OFF on every book" from
+      // "the layer is ON and no pass completed". Only the first is a no-op; the
+      // second is the defect this ticket exists to catch. The eligible set is the
+      // denominator that disambiguates the zero — the same mistake the hook on
+      // this ticket warns about, one level down.
+      enabled: this.tradingAgentsEnabled,
       maxSymbolsPerPass: ADVISORY_MAX_SYMBOLS_PER_PASS,
       passesPerSession: ADVISORY_PASSES_PER_SESSION,
       session,
