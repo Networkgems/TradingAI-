@@ -1680,6 +1680,60 @@ describe('TRA-3387 top movers — an empty session-condemnation census is EVIDEN
     expect(line.level).toBe('info');
   });
 
+  // ⭐ TRA-3468 — THE REGRESSION. Every assertion in the test above is on a STRUCTURED FIELD, and
+  // all of them passed while the emitted sentence read "the session state is INTACT". The line is
+  // the deliverable (nothing about this verdict reaches the report JSON), so the sentence needs
+  // its own assertions or the one surface an operator actually greps goes ungraded. Observed live
+  // 2026-08-13T01:00:31Z on bqb1: `coverage:"restored"`, `uncoveredMs:14716396`, prose "INTACT".
+  it('TRA-3468 — a RESTORED verdict must NOT say INTACT: the prose cannot contradict the field', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('restored'))))!;
+    expect(line.coverage).toBe('restored');
+    expect(line.excluded).toBe(0);           // the empty census — the exact shape that regressed
+    expect(String(line.msg)).not.toContain('INTACT');
+    expect(String(line.msg)).not.toContain('BLIND');
+    expect(String(line.msg)).toContain('RESTORED');
+  });
+
+  it('TRA-3468 — INTACT prose is reachable ONLY from coverage:"intact"', () => {
+    // The inverse guard: a fix that simply deleted the INTACT sentence would pass the test above.
+    const intact = censusLine(linesFrom(GENUINE, provenance(yesterdayEt, restoreOf('absent'))))!;
+    expect(intact.coverage).toBe('intact');
+    expect(String(intact.msg)).toContain('INTACT');
+    // …and every OTHER verdict this boundary can produce must avoid the word.
+    const others = [
+      provenance(todayEt, restoreOf('restored')),
+      provenance(todayEt, restoreOf('absent')),
+      provenance(todayEt, restoreOf('rolled_over')),
+      provenance(todayEt, restoreOf('unreadable')),
+      null,
+    ].map(p => String(censusLine(linesFrom(GENUINE, p))!.msg));
+    expect(others.filter(m => m.includes('INTACT'))).toEqual([]);
+  });
+
+  it('TRA-3468 — the four verdict sentences are mutually distinct', () => {
+    // AC3 turns on two zeros not reading alike; that holds only while each verdict owns its own
+    // sentence. A Set collapse here is the cheapest way to catch a future branch reusing one.
+    const sentences = [
+      provenance(yesterdayEt, restoreOf('absent')),   // intact, empty census
+      provenance(todayEt, restoreOf('restored')),     // restored
+      provenance(todayEt, restoreOf('absent')),       // blind
+    ].map(p => String(censusLine(linesFrom(GENUINE, p))!.msg));
+    // …plus the "covered" branch, which needs a non-empty census to be reachable at all.
+    // The session-day stamp is todayEt (it must match the graded session for the row to count as
+    // condemned) while the PROVENANCE is yesterdayEt — that pair is intact-coverage over a
+    // non-empty census, the only way to reach the fourth branch.
+    const condemned = {
+      ...clean('AZI', 1.60, 58.42),
+      moveSuspectSession: true, moveSuspectSessionDay: todayEt, moveSuspectPrevClose: 1.01,
+    };
+    const covered = censusLine(
+      linesFrom([condemned, ...GENUINE], provenance(yesterdayEt, restoreOf('absent'))))!;
+    expect(covered.coverage).toBe('intact');
+    expect(covered.excluded).toBe(1);
+    sentences.push(String(covered.msg));
+    expect(new Set(sentences).size).toBe(4);
+  });
+
   it('a NON-empty census still carries the coverage verdict — a partial census must not read as complete', () => {
     // The TRA-3243 exclusion line is unchanged and still fires; the verdict rides beside it.
     // Without this, a run that restored nothing but condemned one row AFTER the restart would

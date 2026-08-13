@@ -387,9 +387,27 @@ function top5Movers(
     restoredRows: moveSuspectSessionProvenance?.restore?.rows.length ?? null,
     lastFlushError: moveSuspectSessionProvenance?.lastFlushError ?? null,
   };
+  // ⛔ The branch below dispatches on `coverage.coverage` FIRST, and only then on the census
+  // size. It used to test `sessionOnly.length === 0` immediately after the blind branch, which
+  // made the INTACT sentence reachable on a `restored` verdict — and on 2026-08-13T01:00:31Z it
+  // fired live: `admin` published
+  //   "census is EMPTY and the session state is INTACT — legitimately nothing to exclude"
+  // carrying `coverage:"restored"`, `uncoveredMs:14716396` — i.e. the prose said "intact" over a
+  // 4h05m hole. This is precisely the false-clean read this whole ticket exists to remove, just
+  // relocated from the empty census into the sentence explaining it. The structured verdict was
+  // right the whole time; the deliverable is the LINE, so a correct field under a wrong sentence
+  // is still the defect. INTACT is now emitted for `coverage === 'intact'` and nothing else.
+  // (TRA-3468, grading the first post-deploy 01:00Z run of TRA-3387.)
   if (coverage.coverage === 'blind') {
     log.warn(
       'top-movers session-condemnation census is BLIND — this run CANNOT say whether rows were condemned earlier in the session',
+      coverageDetail);
+  } else if (coverage.coverage === 'restored') {
+    // A fourth distinct sentence rather than a reuse of "covered": a restore leaves a REAL
+    // residual gap (`uncoveredMs`, whatever the dead process condemned after its last durable
+    // write), so it must not read like a session that never lost state.
+    log.info(
+      'top-movers session-condemnation census was RESTORED across an in-session restart — covered except the pre-restart flush gap',
       coverageDetail);
   } else if (sessionOnly.length === 0) {
     log.info(
