@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -137,8 +137,13 @@ describe('TRA-1633 — window sums use day-only options, not cumulative combined
     t.saveSnapshot(cumSnap(d1, 100, 20, 500));   // day-only 120, cumulative carries 500
     t.saveSnapshot(cumSnap(d2, -30, 5, 800));    // day-only −25, cumulative carries 800
 
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-    const inYear = [d1, d2].filter(d => d < today && d >= `${year}-01-01`);
+    // TRA-3421 — the window basis is now every booked row in the window (today's
+    // INCLUDED) plus today's running delta, so the filter is `>= yearStart` with
+    // no upper bound rather than `< today`. The old `d < today` predicate made
+    // this expectation silently wrong on Jan 2–3, the only days these fixture
+    // dates are not "past"; the guard comment above claimed both sides collapsed
+    // to 0 there, which stopped being true once today counts.
+    const inYear = [d1, d2].filter(d => d >= `${year}-01-01`);
     const expectedDayOnly = inYear.reduce((acc, d) =>
       acc + (d === d1 ? 120 : -25), 0);
 
@@ -161,9 +166,10 @@ describe('TRA-1633 — window sums use day-only options, not cumulative combined
     const t = new PnlTracker(dir, 25_000);
     t.saveSnapshot(legacy);
 
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
-    const expected = d < today ? 100 : 0; // stock-only 100, not the 1,000 combined
-    expect(t.getCumulativeStats(25_100).yearlyPnl).toBeCloseTo(expected, 6);
+    // TRA-3421 — the row counts whether or not it is "past"; `saveSnapshot`
+    // rebased `openingEquity` to its 25,100 close, so today's running delta is 0
+    // and the window is the booked row alone.
+    expect(t.getCumulativeStats(25_100).yearlyPnl).toBeCloseTo(100, 6); // stock-only 100, not the 1,000 combined
   });
 });
 
@@ -682,5 +688,213 @@ describe('TRA-3043 — a boot that INHERITS an anchor can still vouch for it', (
     const t = new PnlTracker(dir, 25_000);
     expect(t.getAnchorState().openingEquityBasis).toBeNull();
     expect(t.getAnchorState().openingDate).toBe(TODAY);
+  });
+});
+
+// TRA-3421 — THE ROLLING WINDOWS WERE BLIND TO THE CURRENT ET DAY.
+//
+// `weeklyPnl`/`monthlyPnl`/`yearlyPnl` summed `snapshots.filter(date < today)`,
+// so today contributed NOTHING to a window that plainly contains it — neither
+// the booked row (excluded by the strict `<` from the 21:00 ET close until the
+// next day roll) nor, before that, the un-booked running delta.
+//
+// Live repro, bqb1 `4780dc9edc43` pid 73, 2026-08-12 (a Wednesday): book
+// `qa581t0811a`, whose entire realized history is one EQUITY close (NBIS,
+// +$13.12, 16:41:36Z that day), served `dailyPnl 13.12` / `allTimePnl 13.12`
+// against `weekly = monthly = yearly = 0`. A weekly strictly below the daily it
+// super-sets is a one-read impossibility under every boundary convention.
+//
+// The hypothesis on the ticket — "the windows count OPTION P&L and miss EQUITY
+// P&L" — is FALSIFIED by these tests: the reducer sums `dailyPnl +
+// optionsDailyPnl` and cannot tell the asset classes apart. The control book
+// `qa3120t0806a` populated its windows only because its rows are dated 08-10 /
+// 08-11, i.e. PAST. The discriminator is the row's DATE, not what it traded.
+describe('TRA-3421 — the rolling windows include the current ET day', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3421-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  const ET_TODAY = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+
+  /** A day row in the post-TRA-2323 EOD shape: stock leg = equity delta − options credit. */
+  const dayRow = (
+    date: string, openingEquity: number, closingEquity: number, optionsDailyPnl: number,
+  ): DailySnapshot => ({
+    date,
+    openingEquity,
+    closingEquity,
+    dailyPnl: (closingEquity - openingEquity) - optionsDailyPnl,
+    optionsPnl: optionsDailyPnl,
+    optionsDailyPnl,
+    combinedPnl: closingEquity - openingEquity,
+    trades: 1,
+  });
+
+  it("the qa581t0811a shape: today's BOOKED equity row is in every window, not 0", () => {
+    // The exact filed book: one equity close, +13.125, on the current ET day,
+    // already booked by the 21:00 ET report — which is the state bqb1 served at
+    // 02:5xZ, `dailyPnl` reset to 0 while `allTimePnl` still read 13.12.
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_013.125, 0);
+    t.saveSnapshot(dayRow(ET_TODAY, 25_000, 25_013.125, 0));
+
+    const stats = t.getCumulativeStats(25_013.125);
+    // Before the fix all three read exactly 0 — the filed impossibility.
+    expect(stats.weeklyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.monthlyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.yearlyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.allTimePnl).toBeCloseTo(13.125, 6);
+  });
+
+  it('mid-session, before the row is booked: the running delta is in every window', () => {
+    // The 20:2xZ read the QADesigner filed from: the close has credited equity
+    // but no snapshot exists yet, so the ONLY carrier of today's P&L is
+    // `currentEquity − openingEquity`, which the old `sum` never consulted.
+    const t = new PnlTracker(dir, 25_000);
+    const stats = t.getCumulativeStats(25_013.125);
+    expect(stats.weeklyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.monthlyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.yearlyPnl).toBeCloseTo(13.125, 6);
+  });
+
+  it('weekly is never below the daily P&L it contains (the filed invariant)', () => {
+    const t = new PnlTracker(dir, 25_000);
+    const dailyPnl = 13.125;
+    const stats = t.getCumulativeStats(25_000 + dailyPnl);
+    expect(stats.weeklyPnl).toBeGreaterThanOrEqual(dailyPnl - 1e-9);
+    expect(stats.monthlyPnl).toBeGreaterThanOrEqual(stats.weeklyPnl - 1e-9);
+    expect(stats.yearlyPnl).toBeGreaterThanOrEqual(stats.monthlyPnl - 1e-9);
+    expect(stats.allTimePnl).toBeGreaterThanOrEqual(stats.yearlyPnl - 1e-9);
+  });
+
+  it('books the same-day row ONCE — booking it does not double it against the running delta', () => {
+    // The property that makes "booked rows in the window + todayRunning" safe:
+    // `saveSnapshot` rebases `openingEquity` to the row's own close, so the
+    // running delta collapses to 0 exactly when the row starts counting.
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_013.125, 0);
+    const before = t.getCumulativeStats(25_013.125).weeklyPnl;
+    t.saveSnapshot(dayRow(ET_TODAY, 25_000, 25_013.125, 0));
+    const after = t.getCumulativeStats(25_013.125).weeklyPnl;
+    expect(before).toBeCloseTo(13.125, 6);
+    expect(after).toBeCloseTo(13.125, 6); // not 26.25
+  });
+
+  it('an OPTIONS-only same-day book is treated identically (kills the equity-vs-options hypothesis)', () => {
+    // Same book, same day, same magnitude — the P&L now arrives entirely through
+    // `optionsDailyPnl`. If the windows discriminated by asset class as filed,
+    // this case and the equity case above could not agree. They do.
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_013.125, 13.125);
+    t.saveSnapshot(dayRow(ET_TODAY, 25_000, 25_013.125, 13.125));
+    const stats = t.getCumulativeStats(25_013.125);
+    expect(stats.weeklyPnl).toBeCloseTo(13.125, 6);
+    expect(stats.yearlyPnl).toBeCloseTo(13.125, 6);
+  });
+
+  it('all-time minus yearly is EXACTLY the booked rows before Jan 1 (the windows telescope)', () => {
+    // The structural property, not just the instance: every window now shares
+    // all-time's basis, so their difference is a pure set difference of booked
+    // rows. That is what rules out the whole "a window exceeds the window
+    // containing it" class that TRA-3239 and this ticket are both instances of.
+    const year = Number(ET_TODAY.slice(0, 4));
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_040, 0);
+    t.saveSnapshot(dayRow(`${year - 1}-11-04`, 25_000, 25_040, 15));   // last year: +40
+    t.saveEquity(25_090, 0);
+    t.saveSnapshot(dayRow(`${year}-01-02`, 25_040, 25_090, 10));       // this year, past: +50
+    t.saveEquity(25_103.125, 0);
+    t.saveSnapshot(dayRow(ET_TODAY, 25_090, 25_103.125, 0));           // today: +13.125
+
+    const stats = t.getCumulativeStats(25_103.125);
+    expect(stats.yearlyPnl).toBeCloseTo(63.125, 6);
+    expect(stats.allTimePnl).toBeCloseTo(103.125, 6);
+    expect(stats.allTimePnl - stats.yearlyPnl).toBeCloseTo(40, 6);
+  });
+
+});
+
+// TRA-3421 (secondary) — THE WINDOW BOUNDARIES WERE CUT FROM THE PROCESS CLOCK.
+//
+// `startOfWeek` took `new Date().getDay()` and `getCumulativeStats` took
+// `getFullYear()/getMonth()` — all three read the PROCESS timezone — then
+// compared the result against snapshot `date` keys, which are ET calendar dates.
+// bqb1 runs UTC, and from 00:00Z to 04:00Z the UTC date is already TOMORROW in
+// ET terms, so every boundary landed a day late.
+//
+// THIS BLOCK MUST PIN THE CLOCK AND THE ZONE. Run under an ET-local process on a
+// Wednesday, the buggy and the fixed code return the SAME answer — the first
+// draft of this test passed against the unfixed source, which makes it evidence
+// of nothing. The condition being detected has to be inside the test.
+describe('TRA-3421 (secondary) — window boundaries come from the ET date, not the host clock', () => {
+  let dir: string;
+  let priorTz: string | undefined;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pnl-tracker-3421tz-'));
+    priorTz = process.env.TZ;
+    process.env.TZ = 'UTC';                 // bqb1's zone; Node re-reads this per Date
+    vi.useFakeTimers();
+    // 02:00Z on Thursday 2026-08-13 === 22:00 ET on WEDNESDAY 2026-08-12.
+    vi.setSystemTime(new Date('2026-08-13T02:00:00.000Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    if (priorTz === undefined) delete process.env.TZ; else process.env.TZ = priorTz;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const plainRow = (date: string, openingEquity: number, closingEquity: number): DailySnapshot => ({
+    date,
+    openingEquity,
+    closingEquity,
+    dailyPnl: closingEquity - openingEquity,
+    optionsPnl: 0,
+    optionsDailyPnl: 0,
+    combinedPnl: closingEquity - openingEquity,
+    trades: 1,
+  });
+
+  it("the week starts Monday 08-10, not the Sunday the host clock's day-of-week produced", () => {
+    // Old code: `getDay()` under UTC saw THURSDAY 08-13, subtracted 3, formatted
+    // 08-10T02:00Z in ET → "2026-08-09", a SUNDAY. So a Sunday row counted as
+    // "this week". No stock row lands on a Sunday — but `CryptoEngine` feeds
+    // this same tracker a 7-day tape.
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_500, 0);
+    t.saveSnapshot(plainRow('2026-08-09', 25_000, 25_500));   // +500, Sunday
+    const stats = t.getCumulativeStats(25_500);
+    expect(stats.weeklyPnl).toBeCloseTo(0, 6);       // pre-fix: 500
+    expect(stats.allTimePnl).toBeCloseTo(500, 6);    // still real money, just last week
+  });
+
+  it('a Monday 08-10 row IS inside the week (the boundary is not merely pushed out)', () => {
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_500, 0);
+    t.saveSnapshot(plainRow('2026-08-10', 25_000, 25_500));
+    expect(t.getCumulativeStats(25_500).weeklyPnl).toBeCloseTo(500, 6);
+  });
+
+  it('the month boundary does not skip into next month at 02:00Z on the 1st', () => {
+    // 2026-09-01T02:00Z is still 2026-08-31 in ET. The old code cut monthStart at
+    // "2026-09-01" — strictly AFTER today — and the monthly window silently
+    // dropped the whole of August plus the live session.
+    vi.setSystemTime(new Date('2026-09-01T02:00:00.000Z'));
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_500, 0);
+    t.saveSnapshot(plainRow('2026-08-20', 25_000, 25_500));
+    const stats = t.getCumulativeStats(25_500);
+    expect(stats.monthlyPnl).toBeCloseTo(500, 6);    // pre-fix: 0
+    expect(stats.yearlyPnl).toBeCloseTo(500, 6);
+  });
+
+  it('the year boundary does not skip into next year at 02:00Z on Dec 31', () => {
+    // 2027-01-01T02:00Z is still 2026-12-31 in ET; the old yearStart read
+    // "2027-01-01" and blanked the yearly window for those four hours.
+    vi.setSystemTime(new Date('2027-01-01T02:00:00.000Z'));
+    const t = new PnlTracker(dir, 25_000);
+    t.saveEquity(25_500, 0);
+    t.saveSnapshot(plainRow('2026-06-15', 25_000, 25_500));
+    expect(t.getCumulativeStats(25_500).yearlyPnl).toBeCloseTo(500, 6);  // pre-fix: 0
   });
 });

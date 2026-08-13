@@ -318,13 +318,27 @@ function todayKey(): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
 }
 
+/**
+ * The ET calendar date of this week's Monday, `YYYY-MM-DD`.
+ *
+ * TRA-3421 (secondary) — derived from the ET CALENDAR DATE, never from the
+ * host's local one. The previous version took `new Date().getDay()`, which
+ * reads the PROCESS timezone (UTC on bqb1) and then formatted the result in ET.
+ * Between 00:00Z and 04:00Z those two disagree by a day, so the subtraction ran
+ * off a day-of-week one ahead of the ET date it was labelling and returned
+ * SUNDAY as the week start. Harmless on a stock/options book — Sunday carries
+ * no rows — but `CryptoEngine` feeds this same tracker a 7-day tape, so the
+ * previous Sunday's realized P&L leaked into "this week" for those four hours.
+ *
+ * Anchoring at 12:00 UTC keeps the arithmetic clear of every DST edge: no ET
+ * transition moves a date across midday.
+ */
 function startOfWeek(): string {
-  const now = new Date();
-  const dow = now.getDay();
-  const diff = dow === 0 ? 6 : dow - 1;
-  const mon = new Date(now);
-  mon.setDate(now.getDate() - diff);
-  return mon.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+  const [y, m, d] = todayKey().split('-').map(Number);
+  const anchor = new Date(Date.UTC(y as number, (m as number) - 1, d as number, 12));
+  const dow = anchor.getUTCDay();
+  anchor.setUTCDate(anchor.getUTCDate() - (dow === 0 ? 6 : dow - 1));
+  return anchor.toISOString().slice(0, 10);
 }
 
 export class PnlTracker {
@@ -765,13 +779,19 @@ export class PnlTracker {
   }
 
   getCumulativeStats(currentEquity: number): CumulativeStats {
+    // TRA-3421 (secondary) — every window boundary is cut from the ET calendar
+    // date, the same clock `todayKey()` / the snapshot `date` keys use. `new
+    // Date().getFullYear()/.getMonth()` read the PROCESS timezone (UTC on bqb1),
+    // which is a DIFFERENT day from 00:00Z to 04:00Z. On 2026-08-01T02:00Z the
+    // ET date is still 2026-07-31, so the old month boundary read "2026-08-01"
+    // — strictly AFTER today — and the monthly window silently excluded the
+    // whole of July plus the live session. Same defect at the year boundary,
+    // where it would blank the yearly window for four hours on Dec 31.
     const today = todayKey();
     const weekStart = startOfWeek();
-    const now = new Date();
-    const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
-    const yearStart = `${now.getFullYear()}-01-01`;
+    const monthStart = `${today.slice(0, 7)}-01`;
+    const yearStart = `${today.slice(0, 4)}-01-01`;
 
-    const past = this.snapshots.filter(s => s.date < today);
     // TRA-1633 BUG 2 — sum DAY-ONLY realized (stock `dailyPnl` + day-only
     // `optionsDailyPnl`) over each window, NOT the per-snapshot `combinedPnl`.
     // `combinedPnl` carried the mode's ALL-TIME cumulative options total
@@ -780,8 +800,8 @@ export class PnlTracker {
     // day with option activity — the same phantom class TRA-1557 removed from
     // `allTimePnl`. `optionsDailyPnl` is absent on legacy rows (→ 0), so they
     // contribute stock-only rather than a phantom.
-    const sum = (from: string) =>
-      past
+    const bookedFrom = (from: string) =>
+      this.snapshots
         .filter(s => s.date >= from)
         .reduce((acc, s) => acc + s.dailyPnl + (s.optionsDailyPnl ?? 0), 0);
 
@@ -832,11 +852,48 @@ export class PnlTracker {
     const todayRunning = currentEquity - this.state.openingEquity;
     const allTimePnl = bookedPnl + todayRunning;
 
+    // TRA-3421 — THE WINDOWS WERE BLIND TO THE CURRENT ET DAY, both halves of it.
+    //
+    // The old basis was `snapshots.filter(date < today)`, so a window covering
+    // today contributed nothing for today: not the booked row (excluded by the
+    // strict `<`, from the moment the 21:00 ET close writes it until the next
+    // day roll makes it "past"), and not the un-booked running delta before that
+    // (`currentEquity − openingEquity`, which never entered `sum` at all).
+    // Every rolling window therefore understated the book by its ENTIRE
+    // same-day P&L, on exactly the surface a human reads intraday.
+    //
+    // It produced a one-read impossibility on any book whose realized history is
+    // only today. Live repro, bqb1 `4780dc9edc43` pid 73, book `qa581t0811a`
+    // (one closed EQUITY row, NBIS +13.12, 2026-08-12): `dailyPnl 13.12` /
+    // `allTimePnl 13.12` against `weekly = monthly = yearly = 0` — a weekly
+    // strictly below the daily it super-sets, which no boundary convention
+    // permits (2026-08-12 is a Wednesday, inside its own week/month/year).
+    //
+    // NOT the filed hypothesis. The defect is not an EQUITY-vs-OPTIONS asymmetry:
+    // the reducer above sums `dailyPnl + optionsDailyPnl` and cannot tell the two
+    // asset classes apart. The control book `qa3120t0806a` read 106 only because
+    // its rows are dated 08-10/08-11 — PAST days. Re-measured 02:5xZ with its own
+    // rows now past, the equity book still read weekly 0 with the row booked, so
+    // the discriminator is the row's DATE, not its asset class. Corollary worth
+    // stating: this defect SELF-HEALS at the next ET day roll, so a re-read the
+    // following morning shows the true number and reads as "not reproducible".
+    //
+    // Fix: give the windows the same two-part basis `allTimePnl` already uses —
+    // booked rows in the window (today's INCLUDED) plus `todayRunning`. The two
+    // never double-count: `saveSnapshot` rebases `openingEquity` to the row's own
+    // close, so `todayRunning` collapses to ~0 the instant today's row is booked,
+    // and before that the row does not exist. This also makes the whole family
+    // telescope exactly — `allTimePnl − yearlyPnl` is now precisely the sum of
+    // booked rows before Jan 1 — which is the property that rules out the entire
+    // "a window exceeds the window that contains it" class, not just this
+    // instance of it.
+    const windowPnl = (from: string) => bookedFrom(from) + todayRunning;
+
     return {
       allTimePnl,
-      weeklyPnl: sum(weekStart),
-      monthlyPnl: sum(monthStart),
-      yearlyPnl: sum(yearStart),
+      weeklyPnl: windowPnl(weekStart),
+      monthlyPnl: windowPnl(monthStart),
+      yearlyPnl: windowPnl(yearStart),
       peakEquity,
     };
   }
