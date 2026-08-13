@@ -211,7 +211,7 @@ export const DEFAULT_DB_URL = 'postgres://paperclip:paperclip@127.0.0.1:54329/pa
  * platform itself installed it. Every failure path returns null and the caller
  * turns that into a BLIND tape — never into "no pauses found".
  */
-async function loadPgClient(explicit) {
+export async function loadPgClient(explicit) {
   const tried = [];
 
   // ⛔ `pg` is CommonJS and ships as a DIRECTORY. `import('file:///…/node_modules/pg')`

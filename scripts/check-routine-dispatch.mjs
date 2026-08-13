@@ -159,8 +159,8 @@
  *                        re-home, not a dispatcher repair.)
  *   OWNER_STATE_UNKNOWN  attribution could not be completed. See below.
  *
- * All three are STILL FINDINGS — the slots died and nothing replays them under
- * `skip_missed` — but they are held OUT of the FLEET test exactly the way
+ * All three are STILL FINDINGS — those slots produced no completed work — but
+ * they are held OUT of the FLEET test exactly the way
  * `EXECUTION_ISSUE_ABANDONED` already was, because they are owner/board
  * routable and not claims about the dispatcher. The banner now NAMES the
  * subject it is asserting instead of asserting "platform" unconditionally, and
@@ -190,8 +190,16 @@
  * `--recent-window-min` (default 1440). The FLEET escalation is computed over
  * RECENT findings ONLY. A finding set that is entirely stale reports
  * `residueOnly` and stays at exit 1 — it is still true that those routines have
- * had no successful dispatch since, and ⛔ under `skip_missed` the fires they
- * lost are gone for good, so this is never allowed to become a CLEAN.
+ * had no successful dispatch since, so this is never allowed to become a CLEAN.
+ *
+ * ⛔ TRA-3372 — this file used to add "and under `skip_missed` those fires are
+ * gone for good". Do not put that back. `skip_missed` is the CRON catch-up
+ * policy; it is not the only path to a fire. Measured 2026-08-13 on the three
+ * TRA-3372 routines: each missed BOTH its 07-31 and 08-07 on-slot fire and BOTH
+ * were replayed OFF-CRON by a restart backlog drain (2026-08-02T00:08Z and
+ * 2026-08-11T13:30Z), one of which ran to completion. This check reads the TAIL,
+ * not the schedule ledger, so it cannot tell a lost slot from a replayed one —
+ * and telling a responder the work is gone is how they re-run work that ran.
  *
  * VERDICTS / EXIT CODES
  *   0  CLEAN        — population non-empty, every armed routine's tail is healthy
@@ -221,6 +229,13 @@ import {
   resolveOwnerStateAt,
   DEFAULT_DB_URL,
 } from './lib/paperclip-pause-tape.mjs';
+import {
+  CLOSE_ATTRIBUTION,
+  attributeCloseFromTape,
+  blindCloseTape,
+  emptyCloseTape,
+  readCloseTapeFromPostgres,
+} from './lib/paperclip-close-tape.mjs';
 
 const argv = process.argv.slice(2);
 const argOf = (name, fallback) => {
@@ -349,6 +364,14 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
           'this slot produced no completed work, but it is not a dispatcher fault',
         triggeredAt,
         failureReason: reason,
+        // ⛔ TRA-3372 — the status is taken from the DISPATCHER'S OWN sentence,
+        // never from the issue's status now. The issue can have moved on since
+        // (TRA-3196 was re-blocked and re-homed 33h after the close it is
+        // graded on), and attributing the close to the newest write would name
+        // the wrong actor entirely.
+        closedStatus: downstream[1],
+        linkedIssueId: lastRun.linkedIssueId || lastRun.linkedIssue?.id || null,
+        linkedIssueIdentifier: lastRun.linkedIssue?.identifier || null,
       };
     }
     return {
@@ -410,8 +433,8 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
 
 /**
  * The owner-attributed splits of `LAST_DISPATCH_FAILED`. Findings, all three —
- * the slot died either way and `skip_missed` will not replay it — but NOT
- * dispatcher claims.
+ * the slot produced no completed work either way — but NOT dispatcher claims.
+ * (⛔ Not "the slot is gone": see the header, TRA-3372.)
  */
 export const OWNER_ATTRIBUTED_STATES = new Set([
   'OWNER_PAUSED',
@@ -594,6 +617,9 @@ export async function sweep(transport, opts = {}) {
       ownerState: c.ownerState ?? null,
       ownerWhy: c.ownerWhy ?? null,
       failureReason: c.failureReason ?? null,
+      closedStatus: c.closedStatus ?? null,
+      linkedIssueId: c.linkedIssueId ?? null,
+      linkedIssueIdentifier: c.linkedIssueIdentifier ?? null,
       triggeredAt: c.triggeredAt ?? null,
       failedAt: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
       ageMs,
@@ -616,6 +642,43 @@ export async function sweep(transport, opts = {}) {
       tally,
       probe,
     };
+  }
+
+  // ⛔ TRA-3372 — the CLOSE tape. `EXECUTION_ISSUE_ABANDONED` is routed to the
+  // ROUTINE OWNER, and the sentence they read is "your spawned issue was closed
+  // non-done". On the founding run two of the three closes were written by the
+  // 08-12 mass-strand cleanup, on issues the platform's strand-recovery had
+  // already re-homed AWAY from that owner — so the owner had to reconstruct the
+  // actor and the ownership by hand from the activity log before they could
+  // answer. Carry both. Bounded to the abandoned rows' linked issues only.
+  const abandoned = findings.filter((f) => f.state === 'EXECUTION_ISSUE_ABANDONED');
+  let closeTape = emptyCloseTape({ source: 'no abandoned findings to attribute' });
+  if (abandoned.length > 0) {
+    try {
+      closeTape = transport.getCloseTape
+        ? await transport.getCloseTape(abandoned.map((f) => f.linkedIssueId).filter(Boolean))
+        : blindCloseTape('this transport has no `getCloseTape` reader');
+    } catch (err) {
+      closeTape = blindCloseTape(`the close-tape reader threw — ${err?.message || err}`);
+    }
+    for (const f of abandoned) {
+      const a = attributeCloseFromTape(closeTape, f.linkedIssueId, f.closedStatus);
+      f.closeAttribution = a.attribution;
+      f.closedAt = a.closedAt;
+      f.closedByActorType = a.closedByActorType;
+      f.closedByActorId = a.closedByActorId;
+      f.assigneeAtCloseAgentId = a.assigneeAtCloseAgentId;
+      f.closeWhy = a.why;
+      // ⛔ The whole point. `true` means the row is being routed to somebody who
+      // did not own the issue when it died, so "was this intentional?" is a
+      // question they CANNOT answer from their own record. `null` (not `false`)
+      // whenever the attribution did not resolve — an unfinished read must not
+      // render as "yes, it was yours".
+      f.ownerHeldIssueAtClose =
+        a.attribution === CLOSE_ATTRIBUTION.RESOLVED
+          ? (a.assigneeAtCloseAgentId || null) === (f.assigneeAgentId || null)
+          : null;
+    }
   }
 
   // FLEET is a claim about NOW — "the roster is failing" — so it is computed
@@ -658,7 +721,15 @@ export async function sweep(transport, opts = {}) {
     share,
     recentCount: recentFindings.length,
     fleetCandidateCount: fleetCandidates.length,
-    abandonedCount: findings.filter((f) => f.state === 'EXECUTION_ISSUE_ABANDONED').length,
+    abandonedCount: abandoned.length,
+    closeTape: {
+      ok: closeTape?.ok === true,
+      reason: closeTape?.ok === true ? null : closeTape?.reason || null,
+      source: closeTape?.source || null,
+    },
+    // Rows routed to an owner who did not hold the issue when it was closed.
+    misroutedCloseCount: abandoned.filter((f) => f.ownerHeldIssueAtClose === false).length,
+    unattributedCloseCount: abandoned.filter((f) => f.ownerHeldIssueAtClose === null).length,
     residueOnly: findings.length > 0 && recentFindings.length === 0,
     recentWindowMs,
     newestFailureAgeMs,
@@ -707,6 +778,34 @@ export function renderReport(r, names = {}) {
     out.push(`              ${(f.title || '').slice(0, 90)}`);
     out.push(`              cron ${f.crons.join(' ; ')} · next ${f.nextRunAt || 'null'}`);
     out.push(`              ${f.detail}`);
+    // ⛔ TRA-3372 — WHO closed it and WHO owned it then. Printed on every
+    // abandoned row, including the ones we could not attribute: an owner who
+    // sees nothing here cannot tell "it was you" from "we did not look".
+    if (f.state === 'EXECUTION_ISSUE_ABANDONED') {
+      const issue = f.linkedIssueIdentifier || (f.linkedIssueId ? String(f.linkedIssueId).slice(0, 8) : 'unknown issue');
+      if (f.closeAttribution === 'RESOLVED') {
+        const actor =
+          f.closedByActorType === 'agent'
+            ? nm(f.closedByActorId)
+            : `${f.closedByActorType || 'unknown'}:${f.closedByActorId || '?'}`;
+        out.push(
+          `              close: ${issue} -> \`${f.closedStatus}\` at ${f.closedAt} ` +
+            `by ${actor} · assignee at close: ${nm(f.assigneeAtCloseAgentId)}`,
+        );
+        if (f.ownerHeldIssueAtClose === false) {
+          out.push(
+            `              ⛔ THIS ROW IS ROUTED TO ${nm(f.assigneeAgentId)} AS THE ROUTINE OWNER, BUT THE ISSUE ` +
+              `WAS ${nm(f.assigneeAtCloseAgentId)}'S WHEN IT CLOSED — they cannot answer ` +
+              '"was this intentional?" from their own record. Ask the closer, not the routine owner.',
+          );
+        }
+      } else {
+        out.push(
+          `              close: ${issue} -> \`${f.closedStatus}\` — ⛔ ACTOR/OWNERSHIP UNATTRIBUTED: ${f.closeWhy || 'no reason recorded'}. ` +
+            'This is NOT "the routine owner closed it".',
+        );
+      }
+    }
   }
 
   if (r.verdict === 'FLEET') {
@@ -749,7 +848,9 @@ export function renderReport(r, names = {}) {
     );
     out.push(
       '  ⛔ Do NOT file this against the platform, and do not file one ticket per routine. Route it to the ' +
-        'owner/board. The slots are gone — `skip_missed` does not replay them.',
+        'owner/board. ⚠️ Do NOT assert the slots are gone: `skip_missed` is the cron policy, but an ' +
+        'off-cron restart backlog drain replays missed fires anyway (measured, TRA-3372) and this check ' +
+        'cannot see which happened.',
     );
   } else if (r.ownerPausedCount > 0) {
     out.push('');
@@ -786,6 +887,22 @@ export function renderReport(r, names = {}) {
         'issue it spawned was later moved to blocked/cancelled. ⛔ These are NOT dispatcher faults and are ' +
         'excluded from the FLEET test: route them to the routine owner, not to the platform.',
     );
+    // ⛔ TRA-3372 — "route to the routine owner" is the DEFAULT, not a finding
+    // about who acted. Say so out loud whenever the tape disagrees with it.
+    if (r.misroutedCloseCount > 0) {
+      out.push(
+        `  ⛔ ${r.misroutedCloseCount} of them were closed while the issue belonged to SOMEBODY ELSE. ` +
+          'The routine owner is the right place to ask "do you still want this slot", but they are the ' +
+          'WRONG place to ask "why did you close it" — the per-row `close:` line names the actual actor.',
+      );
+    }
+    if (r.unattributedCloseCount > 0) {
+      out.push(
+        `  ⛔ ${r.unattributedCloseCount} of them could not be attributed at all` +
+          (r.closeTape?.ok === false ? ` — the close tape is unreadable: ${r.closeTape.reason}` : '') +
+          '. An unattributed close is NOT an owner-written close.',
+      );
+    }
   }
 
   if (r.residueOnly) {
@@ -797,8 +914,12 @@ export function renderReport(r, names = {}) {
         'Report it, do NOT re-escalate it as a fleet event.',
     );
     out.push(
-      '  ⛔ It is still not CLEAN. Those routines have had no successful dispatch since, and under ' +
-        '`skip_missed` the slots they lost are gone — nothing will replay them.',
+      '  ⛔ It is still not CLEAN. Those routines have had no successful dispatch since. ' +
+        '⚠️ This check CANNOT tell you whether the lost slot was replayed: ' +
+        '"`skip_missed` means the slot is gone" is the CRON policy, and it is not the only path to a fire — ' +
+        'measured on 2026-08-13 (TRA-3372), routines 81928e50/a986323e/f28ea628 each missed BOTH the 07-31 ' +
+        'and 08-07 on-slot fires and BOTH were replayed off-cron by a restart backlog drain, one of which ' +
+        'completed. Read the run history before re-running anything by hand.',
     );
   }
   out.push('');
@@ -863,8 +984,39 @@ function boardOf(rows, filler = 8) {
  *   LAST_DISPATCH_FAILED control to UNKNOWN and hide a real regression behind
  *   a fixture choice.
  */
-function transportOf(rows, tape) {
-  return { getRoutines: async () => rows, getPauseTape: async () => tape ?? emptyTape() };
+function transportOf(rows, tape, closeTape) {
+  const t = { getRoutines: async () => rows, getPauseTape: async () => tape ?? emptyTape() };
+  // ⛔ Deliberately absent unless a case supplies one, so the DEFAULT for every
+  // pre-TRA-3372 control is "no close reader" — which must render as
+  // UNATTRIBUTED, never as an owner-written close.
+  if (closeTape) t.getCloseTape = async () => closeTape;
+  return t;
+}
+
+/**
+ * A close tape for one issue. `rows` are `issue.updated` details in ascending
+ * order, given as `[isoTime, actorType, actorId, details]`.
+ */
+function closeTapeOf(issueId, { currentAssigneeAgentId, rows }) {
+  return {
+    ok: true,
+    source: 'synthetic',
+    issues: new Map([
+      [
+        issueId,
+        {
+          currentAssigneeAgentId,
+          rows: rows.map(([iso, actorType, actorId, details]) => ({
+            atMs: at(iso),
+            actorType,
+            actorId,
+            agentId: actorType === 'agent' ? actorId : null,
+            details,
+          })),
+        },
+      ],
+    ]),
+  };
 }
 
 /** A tape carrying `events`, covering everything since the epoch. */
@@ -1132,6 +1284,299 @@ const CASES = [
       assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
       assert(r.findings[0].state === 'EXECUTION_ISSUE_ABANDONED', r.findings[0].state);
       assert(r.abandonedCount === 1, String(r.abandonedCount));
+      // ⛔ TRA-3372 — no close reader on this (pre-existing) transport, so the
+      // attribution must come back UNATTRIBUTED and SAY so. The failure mode
+      // being fenced is a silent omission reading as "the owner closed it".
+      assert(r.findings[0].ownerHeldIssueAtClose === null, String(r.findings[0].ownerHeldIssueAtClose));
+      assert(r.unattributedCloseCount === 1, String(r.unattributedCloseCount));
+      const text = renderReport(r).join('\n');
+      assert(/ACTOR\/OWNERSHIP UNATTRIBUTED/.test(text), 'an unattributed close must be printed as such');
+      assert(/NOT "the routine owner closed it"/.test(text), text.slice(0, 600));
+    },
+  },
+  {
+    /**
+     * The founding case, TRA-3372: TRA-3195 was cancelled by CFO during the
+     * 08-12 mass-strand cleanup, on an issue the platform's strand recovery had
+     * already re-homed off QuantTrader. The check routes to the routine owner
+     * (QT) and the sentence it prints is "your spawned issue was closed" — so
+     * QT had to reconstruct the actor by hand before they could answer.
+     */
+    name: '⛔ TRA-3372 — a close written by a THIRD PARTY is NAMED, and the mis-routing is called out',
+    rows: boardOf([
+      routineRow('r-3372', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-3195',
+          linkedIssue: { id: 'issue-3195', identifier: 'TRA-3195', status: 'cancelled' },
+        },
+      }),
+    ]),
+    closeTape: closeTapeOf('issue-3195', {
+      currentAssigneeAgentId: 'agent-cfo',
+      rows: [
+        // The strand recovery re-homes WITHOUT logging `assigneeAgentId`.
+        [
+          '2026-08-04T20:50:00.000Z',
+          'system',
+          'system',
+          {
+            source: 'recovery.reconcile_stranded_assigned_issue',
+            status: 'blocked',
+            previousStatus: 'in_progress',
+            previousOwnerAgentId: 'agent-qt',
+            recoveryOwnerAgentId: 'agent-cfo',
+          },
+        ],
+        // ...and the cleanup cancels it an hour later.
+        [
+          '2026-08-04T20:55:00.000Z',
+          'agent',
+          'agent-cfo',
+          { status: 'cancelled', _previous: { status: 'blocked' } },
+        ],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.short === 'r-3372');
+      assert(f.closeAttribution === 'RESOLVED', `${f.closeAttribution} — ${f.closeWhy}`);
+      assert(f.closedByActorId === 'agent-cfo', String(f.closedByActorId));
+      assert(f.closedAt === '2026-08-04T20:55:00.000Z', String(f.closedAt));
+      // ⛔ THE HOLE: the re-home logged no `assigneeAgentId`, so a forward
+      // replay would still say `agent-qt` here. It must say `agent-cfo`.
+      assert(f.assigneeAtCloseAgentId === 'agent-cfo', String(f.assigneeAtCloseAgentId));
+      assert(f.ownerHeldIssueAtClose === false, String(f.ownerHeldIssueAtClose));
+      assert(r.misroutedCloseCount === 1, String(r.misroutedCloseCount));
+      const text = renderReport(r).join('\n');
+      assert(/assignee at close: agent-cf/.test(text), text.slice(0, 800));
+      assert(/WRONG place to ask "why did you close it"/.test(text), text.slice(0, 900));
+    },
+  },
+  {
+    name: '⛔ TRA-3372 — a close the ROUTINE OWNER did write must NOT be flagged as mis-routed',
+    rows: boardOf([
+      routineRow('r-own', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-own',
+          linkedIssue: { id: 'issue-own', identifier: 'TRA-9001', status: 'cancelled' },
+        },
+      }),
+    ]),
+    closeTape: closeTapeOf('issue-own', {
+      currentAssigneeAgentId: 'agent-qt',
+      rows: [
+        ['2026-08-04T20:55:00.000Z', 'agent', 'agent-qt', { status: 'cancelled', _previous: { status: 'todo' } }],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.short === 'r-own');
+      assert(f.ownerHeldIssueAtClose === true, String(f.ownerHeldIssueAtClose));
+      assert(r.misroutedCloseCount === 0, String(r.misroutedCloseCount));
+      assert(r.unattributedCloseCount === 0, String(r.unattributedCloseCount));
+      const text = renderReport(r).join('\n');
+      assert(!/WRONG place to ask/.test(text), 'an owner-written close must not be flagged as mis-routed');
+    },
+  },
+  {
+    /**
+     * ⛔ The close is the transition INTO the status the DISPATCHER named, not
+     * the newest write. TRA-3196 was re-blocked and re-homed 33h after the
+     * close its run was graded on; taking the last row would name the wrong
+     * actor and the wrong owner, with nothing in the output to reveal it.
+     */
+    name: '⛔ TRA-3372 — a later write RESTATING the same status must not steal the attribution',
+    rows: boardOf([
+      routineRow('r-restate', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to blocked',
+          linkedIssueId: 'issue-3196',
+          linkedIssue: { id: 'issue-3196', identifier: 'TRA-3196', status: 'blocked' },
+        },
+      }),
+    ]),
+    closeTape: closeTapeOf('issue-3196', {
+      currentAssigneeAgentId: 'agent-qt',
+      rows: [
+        [
+          '2026-08-04T20:50:00.000Z',
+          'system',
+          'system',
+          {
+            source: 'recovery.reconcile_stranded_assigned_issue',
+            status: 'blocked',
+            previousStatus: 'in_progress',
+            previousOwnerAgentId: 'agent-qt',
+            recoveryOwnerAgentId: 'agent-ceo',
+          },
+        ],
+        // Restates `blocked` — `_previous` carries NO status, so nothing moved.
+        [
+          '2026-08-04T20:56:00.000Z',
+          'agent',
+          'agent-ceo',
+          { status: 'blocked', _previous: { blockedByIssueIds: [] }, blockedByIssueIds: ['x'] },
+        ],
+        // The re-home back to QT, long after.
+        [
+          '2026-08-04T20:58:00.000Z',
+          'agent',
+          'agent-ceo',
+          { status: 'blocked', assigneeAgentId: 'agent-qt', _previous: { assigneeAgentId: 'agent-ceo' } },
+        ],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.id === 'r-restate');
+      assert(f.closedAt === '2026-08-04T20:50:00.000Z', `took the wrong row: ${f.closedAt}`);
+      assert(f.closedByActorType === 'system', String(f.closedByActorType));
+      assert(f.assigneeAtCloseAgentId === 'agent-ceo', String(f.assigneeAtCloseAgentId));
+      assert(f.ownerHeldIssueAtClose === false, String(f.ownerHeldIssueAtClose));
+    },
+  },
+  {
+    /**
+     * ⛔ THE MUTATION THAT SURVIVED. The two controls above both happen to have
+     * the recovery row BEFORE the close, so the backward replay never has to
+     * undo one — disabling the recovery branch entirely left them both green.
+     * This is the case that reaches it: a recovery re-home AFTER the close,
+     * which logs no `assigneeAgentId` and would otherwise be replayed as a
+     * no-op, reporting the CURRENT owner as the owner at close.
+     */
+    name: '⛔ TRA-3372 — a recovery re-home AFTER the close must be REWOUND (it logs no assigneeAgentId)',
+    rows: boardOf([
+      routineRow('r-rewind', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-rw',
+          linkedIssue: { id: 'issue-rw', identifier: 'TRA-9004', status: 'cancelled' },
+        },
+      }),
+    ]),
+    closeTape: closeTapeOf('issue-rw', {
+      // Where it sits NOW — the recovery below put it here.
+      currentAssigneeAgentId: 'agent-cfo',
+      rows: [
+        ['2026-08-04T20:50:00.000Z', 'agent', 'agent-qt', { status: 'cancelled', _previous: { status: 'todo' } }],
+        [
+          '2026-08-04T20:55:00.000Z',
+          'system',
+          'system',
+          {
+            source: 'recovery.reconcile_stranded_assigned_issue',
+            previousOwnerAgentId: 'agent-qt',
+            recoveryOwnerAgentId: 'agent-cfo',
+          },
+        ],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.id === 'r-rewind');
+      assert(f.closeAttribution === 'RESOLVED', `${f.closeAttribution} — ${f.closeWhy}`);
+      // ⛔ Not `agent-cfo`. The owner DID hold it at the close; the recovery
+      // moved it afterwards. Flagging this as mis-routed would be a false
+      // accusation in the opposite direction.
+      assert(f.assigneeAtCloseAgentId === 'agent-qt', String(f.assigneeAtCloseAgentId));
+      assert(f.ownerHeldIssueAtClose === true, String(f.ownerHeldIssueAtClose));
+      assert(r.misroutedCloseCount === 0, String(r.misroutedCloseCount));
+    },
+  },
+  {
+    name: '⛔ TRA-3372 — a later assignee move with NO recorded "before" => UNKNOWN owner, actor still named',
+    rows: boardOf([
+      routineRow('r-ambig', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-am',
+          linkedIssue: { id: 'issue-am', identifier: 'TRA-9005', status: 'cancelled' },
+        },
+      }),
+    ]),
+    closeTape: closeTapeOf('issue-am', {
+      currentAssigneeAgentId: 'agent-cfo',
+      rows: [
+        ['2026-08-04T20:50:00.000Z', 'agent', 'agent-cfo', { status: 'cancelled', _previous: { status: 'todo' } }],
+        // Moved the assignee and recorded no previous value.
+        ['2026-08-04T20:55:00.000Z', 'agent', 'agent-ceo', { assigneeAgentId: 'agent-cfo', _previous: {} }],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.id === 'r-ambig');
+      assert(f.closeAttribution === 'UNKNOWN', String(f.closeAttribution));
+      // The actor survives — it is the assignee replay that failed, not the close.
+      assert(f.closedByActorId === 'agent-cfo', String(f.closedByActorId));
+      assert(f.assigneeAtCloseAgentId === null, String(f.assigneeAtCloseAgentId));
+      assert(f.ownerHeldIssueAtClose === null, String(f.ownerHeldIssueAtClose));
+      assert(r.unattributedCloseCount === 1, String(r.unattributedCloseCount));
+    },
+  },
+  {
+    name: '⛔ TRA-3372 — an UNREADABLE close tape must yield UNATTRIBUTED, never "the owner closed it"',
+    rows: boardOf([
+      routineRow('r-blindclose', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-x',
+          linkedIssue: { id: 'issue-x', identifier: 'TRA-9002', status: 'cancelled' },
+        },
+      }),
+    ]),
+    closeTape: blindCloseTape('the pg driver could not be resolved'),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.id === 'r-blindclose');
+      assert(f.closeAttribution === 'UNKNOWN', String(f.closeAttribution));
+      assert(f.ownerHeldIssueAtClose === null, String(f.ownerHeldIssueAtClose));
+      assert(r.misroutedCloseCount === 0, String(r.misroutedCloseCount));
+      assert(r.unattributedCloseCount === 1, String(r.unattributedCloseCount));
+      const text = renderReport(r).join('\n');
+      assert(/close tape is unreadable/.test(text), 'the report must NAME why the attribution failed');
+      assert(/pg driver could not be resolved/.test(text), text.slice(0, 900));
+    },
+  },
+  {
+    name: '⛔ TRA-3372 — a close OLDER than the tape must be UNKNOWN, not attributed to the nearest row',
+    rows: boardOf([
+      routineRow('r-floor', {
+        assigneeAgentId: 'agent-qt',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          failureReason: 'Execution issue moved to cancelled',
+          linkedIssueId: 'issue-f',
+          linkedIssue: { id: 'issue-f', identifier: 'TRA-9003', status: 'cancelled' },
+        },
+      }),
+    ]),
+    // The tape has rows, but none transitions INTO `cancelled`.
+    closeTape: closeTapeOf('issue-f', {
+      currentAssigneeAgentId: 'agent-cfo',
+      rows: [
+        ['2026-08-04T20:56:00.000Z', 'agent', 'agent-cfo', { status: 'cancelled', _previous: { priority: 'low' } }],
+      ],
+    }),
+    expect: (r) => {
+      const f = r.findings.find((x) => x.short === 'r-floor');
+      assert(f.closeAttribution === 'UNKNOWN', String(f.closeAttribution));
+      assert(f.assigneeAtCloseAgentId === null, String(f.assigneeAtCloseAgentId));
+      assert(/transition INTO/.test(f.closeWhy || ''), String(f.closeWhy));
     },
   },
   {
@@ -1502,7 +1947,7 @@ async function selftest() {
       // Every control runs against a FIXED clock. The recency axis makes the
       // verdict a function of wall-time, and a control that drifts with the
       // calendar stops being a control.
-      const r = await sweep(c.transport ? c.transport(c.rows) : transportOf(c.rows, c.tape), {
+      const r = await sweep(c.transport ? c.transport(c.rows) : transportOf(c.rows, c.tape, c.closeTape), {
         nowMs: Date.parse(c.now || '2026-08-04T21:00:00.000Z'),
       });
       seen.add(r.verdict);
@@ -1553,7 +1998,29 @@ async function selftest() {
     console.log(`FAIL  GLOBAL pause-tape read-only control\n        ${err.message}`);
   }
 
-  const total = CASES.length + 2;
+  // GLOBAL — ⛔ TRA-3372 — the close tape reads the same platform-owned DB.
+  try {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync(new URL('./lib/paperclip-close-tape.mjs', import.meta.url), 'utf8');
+    const sql = src.match(/client\.query\(\s*(`[^`]*`|'[^']*')/g) || [];
+    assert(sql.length > 0, 'no SQL found in the close-tape reader — the control cannot be checked');
+    for (const s of sql) {
+      assert(
+        /^\s*(`|')\s*select\b/i.test(s.replace(/client\.query\(\s*/, '')),
+        `a non-SELECT statement appears in the close-tape reader: ${s.slice(0, 80)}`,
+      );
+    }
+    assert(
+      !/\b(insert|update|delete|drop|alter|truncate|create)\s+(into|from|table|set)\b/i.test(src),
+      'a write statement appears in the close-tape reader',
+    );
+    console.log(`ok    GLOBAL — the close tape SELECTs and nothing else (${sql.length} statements checked)`);
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL close-tape read-only control\n        ${err.message}`);
+  }
+
+  const total = CASES.length + 3;
   console.log('');
   console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
   for (const v of ['CLEAN', 'FINDINGS', 'FLEET', 'BLIND']) {
@@ -1600,6 +2067,16 @@ function liveTransport() {
         connectionString: argOf('pause-db', process.env.PAPERCLIP_DB_URL || DEFAULT_DB_URL),
         pgModulePath: process.env.PAPERCLIP_PG_MODULE || null,
       }),
+    // ⛔ TRA-3372 — same database, same reason. `/api/.../activity` cannot
+    // serve a 22h-old close: it caps at ~500 rows (~3.4h) and its `action`
+    // filter is ignored. Bounded to the abandoned findings' linked issues.
+    getCloseTape: async (issueIds) =>
+      readCloseTapeFromPostgres({
+        companyId: CO,
+        issueIds,
+        connectionString: argOf('pause-db', process.env.PAPERCLIP_DB_URL || DEFAULT_DB_URL),
+        pgModulePath: process.env.PAPERCLIP_PG_MODULE || null,
+      }),
   };
 }
 
@@ -1631,6 +2108,10 @@ async function main() {
           tally: result.tally,
           distinctAssignees: result.distinctAssignees,
           tape: result.tape,
+          closeTape: result.closeTape,
+          abandonedCount: result.abandonedCount,
+          misroutedCloseCount: result.misroutedCloseCount,
+          unattributedCloseCount: result.unattributedCloseCount,
           ownerPausedCount: result.ownerPausedCount,
           ownerTerminatedCount: result.ownerTerminatedCount,
           ownerUnknownCount: result.ownerUnknownCount,
