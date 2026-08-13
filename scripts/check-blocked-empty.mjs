@@ -294,6 +294,7 @@ export const VERDICT_EXIT = {
 
 export { enumerateIssues } from './lib/paperclip-enumeration.mjs';
 import { enumerateIssues } from './lib/paperclip-enumeration.mjs';
+import { pathToFileURL } from 'node:url';
 
 /* ------------------------------------------------------------------ *
  * The parent graph — built from the SAME enumeration, zero extra reads
@@ -2749,11 +2750,44 @@ async function main() {
   return VERDICT_EXIT[result.verdict] ?? 3;
 }
 
-// `process.exit()` inside a try skips the finally; return the code instead and
-// exit once, at the top.
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error('ERROR', err?.stack || err);
-    process.exit(3);
-  });
+/**
+ * ENTRY GUARD (TRA-3541).
+ *
+ * `main()` used to run at module scope, which made this file un-importable: an
+ * `import` performed a live company-wide sweep and then `process.exit()`ed the
+ * importer. That is why `enumerateIssues` had to be lifted out to `./lib/` for a
+ * second reader to share it.
+ *
+ * The DRAIN (`scripts/drain-blocked-empty.mjs`) needs more than the enumeration:
+ * it has to write to EXACTLY the cohort this detector reports, executing the
+ * `RESTORE-PATCH` pair `deriveRepair()` already derives. A drain carrying its
+ * own copy of the predicate would silently repair a DIFFERENT population than
+ * the one being graded, and the two would drift on the first edit to either. So
+ * it imports `sweep()` itself, and this guard is what makes that safe.
+ *
+ * Run as a script, behaviour is unchanged; `--selftest` is the control for that
+ * claim (43/43 before this guard, 43/43 after).
+ */
+const IS_ENTRYPOINT = (() => {
+  try {
+    const entry = process.argv[1];
+    if (!entry) return false;
+    return pathToFileURL(entry).href === import.meta.url;
+  } catch {
+    // Cannot tell. Fall back to the OLD behaviour (run), never to silence: a
+    // detector that quietly does nothing is the one failure this file exists
+    // to prevent.
+    return true;
+  }
+})();
+
+if (IS_ENTRYPOINT) {
+  // `process.exit()` inside a try skips the finally; return the code instead and
+  // exit once, at the top.
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error('ERROR', err?.stack || err);
+      process.exit(3);
+    });
+}
