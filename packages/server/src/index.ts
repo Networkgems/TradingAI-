@@ -11,6 +11,7 @@ import { etHour } from './et-clock.js'; // TRA-2498
 // TRA-2689 (leg 2 of TRA-2654) — once-per-session drain of the WRITE-ONLY
 // denominator-flip candidate tape. Nothing on any decision path reads it.
 import { flushDenominatorFlipTape } from './denominator-flip-tape-writer.js';
+import { writeCloseLedger, priorSessionLedgerMovers } from './close-ledger.js';
 import { summarizeDenominatorFlipTape } from './denominator-flip-tape-summary.js';
 import {
   DENOM_FLIP_CHANGEPCT_DELTA_PP,
@@ -1707,32 +1708,82 @@ async function generateAndSaveReport(
   // shape) — but it does NOT cover a symbol that was clean yesterday, and it
   // cannot cover a symbol's first appearance at all. The census logged inside
   // `top5Movers` prints how much of the table was ungradeable each run.
+  //
+  // ⭐ TRA-2688 (leg 1 of TRA-2654) LIFTS LIMITS 1 AND 2 ABOVE — for every session
+  // AFTER the ledger's own first day. `closes/<date>.json` (written at the bottom
+  // of this function) carries ONE ROW PER SYMBOL rather than five, so the
+  // population above stops being "whatever was in yesterday's top five".
+  //
+  // ⛔ THE ARCHIVE FALLBACK IS NOT OPTIONAL, and it is not dead code. It is what
+  // keeps the 223-pair historical measurement reproducible against the EXISTING
+  // archive — which is the only evidence we have that this change is ADDITIVE
+  // rather than a re-partition of the census.
+  //
+  // ⚠️ THE LEDGER'S OWN DAY 1 IS AN ABSTAIN, NOT A CLEAN READ. The first session
+  // that writes a ledger has no ledger for its PREDECESSOR, so it takes the
+  // fallback and every symbol outside yesterday's top five abstains
+  // `no_prior_observation` — same discipline as FGMC on 07-28. A later reader
+  // will assume "a ledger exists ⇒ full coverage" unless something says no;
+  // `close-ledger.test.ts` pins it.
   let priorSessionMovers: EodMover[] | undefined;
   let priorSessionDate: string | undefined;
+  let priorSessionSource: 'close_ledger' | 'archive_top5' | 'none' = 'none';
+  // Why the ledger did not serve, when it did not. `none` + `ledger_absent` is
+  // day 1; `none` + `ledger_unreadable` is a corrupt file that silently took
+  // the same path, and the two must not be indistinguishable in the tape.
+  let ledgerSource: string = 'not_attempted';
   {
     const reportDate = opts.asOfDate ?? etDateString();
     const prevSession = previousMarketDayIso(reportDate);
     if (prevSession) {
-      const priorPath = join(targetDir, `${prevSession}.json`);
-      try {
-        if (existsSync(priorPath)) {
-          const prior = JSON.parse(await readFile(priorPath, 'utf-8')) as EodReport;
-          if (Array.isArray(prior?.top5Movers) && prior.top5Movers.length > 0) {
-            priorSessionMovers = prior.top5Movers;
-            priorSessionDate = prevSession;
+      // Preferred: the prior session's close ledger. A ledger that exists and
+      // cannot be trusted is discarded WHOLE and we fall through to the archive
+      // — never a partial parse, per the ruling's failure posture.
+      const ledger = await priorSessionLedgerMovers({
+        targetDir, prevSession, log, username: ctx.username,
+      });
+      ledgerSource = ledger.source;
+      if (ledger.movers) {
+        priorSessionMovers = ledger.movers;
+        priorSessionDate = prevSession;
+        priorSessionSource = 'close_ledger';
+      }
+
+      if (priorSessionSource === 'none') {
+        const priorPath = join(targetDir, `${prevSession}.json`);
+        try {
+          if (existsSync(priorPath)) {
+            const prior = JSON.parse(await readFile(priorPath, 'utf-8')) as EodReport;
+            if (Array.isArray(prior?.top5Movers) && prior.top5Movers.length > 0) {
+              priorSessionMovers = prior.top5Movers;
+              priorSessionDate = prevSession;
+              priorSessionSource = 'archive_top5';
+            }
           }
+        } catch (err) {
+          // An unreadable prior artifact must abstain, never grade against a
+          // partial parse — a continuity verdict built on half a table is worse
+          // than no verdict.
+          log.warn('TRA-2634 prior-session report unreadable — continuity check abstains', {
+            username: ctx.username,
+            priorPath,
+            reason: err instanceof Error ? err.message : String(err),
+          });
         }
-      } catch (err) {
-        // An unreadable prior artifact must abstain, never grade against a
-        // partial parse — a continuity verdict built on half a table is worse
-        // than no verdict.
-        log.warn('TRA-2634 prior-session report unreadable — continuity check abstains', {
-          username: ctx.username,
-          priorPath,
-          reason: err instanceof Error ? err.message : String(err),
-        });
       }
     }
+    // Emitted on EVERY run, including `none`. Which INSTRUMENT produced a
+    // census is not recoverable from the census itself, and a ledger-backed
+    // 614-row population and an archive-backed 5-row one are the difference
+    // between a measurement and a rounding error.
+    log.info('TRA-2634/TRA-2688 prior-session observation source', {
+      username: ctx.username,
+      reportDate,
+      priorSessionDate: priorSessionDate ?? 'n/a',
+      source: priorSessionSource,
+      ledgerSource,
+      priorRows: priorSessionMovers?.length ?? 0,
+    });
   }
   finalSnapshot.priorSessionMovers = priorSessionMovers;
   finalSnapshot.priorSessionDate = priorSessionDate;
@@ -2081,6 +2132,44 @@ async function generateAndSaveReport(
   // dates lie is worse than no tape.
   if (!backfill) {
     await drainDenominatorFlipTapeFor(ctx, 'eod', finalReport.date);
+  }
+
+  // TRA-2688 (leg 1 of TRA-2654) — write this session's CLOSE LEDGER,
+  // `closes/<date>.json`, one row per symbol in `state.symbols`.
+  //
+  // Everything it writes is already in memory, so this costs ZERO network
+  // requests and cannot reopen TRA-2627's fan-out budget or the TRA-2170
+  // ceiling. That is a property of the design, not a measurement — see the
+  // module header for the prohibition that preserves it.
+  //
+  // Ordered here, after the report writes and beside leg 2's drain, and wrapped
+  // for the same reason: `writeCloseLedger` already swallows its own errors and
+  // this try/catch is the second layer. The EOD report is a human-read money
+  // artifact and a ledger is worth zero of it.
+  //
+  // ⛔ SKIPPED ON A BACKFILL, and this is a correctness rule rather than an
+  // optimisation. `state.symbols` is the feed's CURRENT table; a backfill
+  // regenerates an OLD date from it, so writing `closes/<asOfDate>.json` here
+  // would file today's closes under a session they did not happen in — and the
+  // next run would then grade a real session as "continuous" with today. A
+  // ledger whose dates lie is strictly worse than no ledger, exactly as leg 2
+  // says of its tape.
+  if (!backfill) {
+    try {
+      await writeCloseLedger({
+        targetDir,
+        date: finalReport.date,
+        symbols: finalSnapshot.state?.symbols ?? [],
+        usersRoot: join(DATA_DIR, 'users'),
+        log,
+      });
+    } catch (err) {
+      log.warn('TRA-2688 close-ledger write threw — the report is unaffected', {
+        username: ctx.username,
+        date: finalReport.date,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   // Persist daily equity snapshot for cumulative tracking. Skipped on a
