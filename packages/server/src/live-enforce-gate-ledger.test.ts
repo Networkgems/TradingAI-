@@ -40,7 +40,12 @@ describe('live-enforce-gate-ledger', () => {
     // others: the ceiling's expected healthy read is `evaluated > 0, blocked = 0`
     // (n=20 above 0.55 on the whole tape), so an absent row and a silent one would be
     // indistinguishable exactly where the distinction matters.
+    // TRA-3445 — `aggregate_cap` is on the same footing: the board's "$750
+    // total" bound will spend most of its life at `evaluated > 0, blocked = 0`
+    // (the sleeve rarely fills), which is precisely the reading an absent row
+    // would forge.
     expect(s.byGate.map((g) => g.gate).sort()).toEqual([
+      'aggregate_cap',
       'cost_bar',
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',

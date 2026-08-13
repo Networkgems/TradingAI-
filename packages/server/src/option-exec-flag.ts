@@ -701,6 +701,116 @@ export function resolveLiveOptionTestMaxContracts(
   return Math.min(n, LIVE_OPTION_TEST_CONTRACTS_HARD_MAX);
 }
 
+// --------------------------------------------------------------------------
+// TRA-3445 — the AGGREGATE bound. The board's TRA-3384 answer (option A,
+// 2026-08-12T23:32Z) authorized "1 contract/name, max $150/entry, **max $750
+// total**". The first two clauses are the two resolvers above. The third had NO
+// enforcement path: every guard in this file bounds a SINGLE entry.
+//
+// The comment on LIVE_OPTION_TEST_NOTIONAL_CEILING_USD above argues aggregate
+// exposure is "bounded by the real balance — each open reduces buying power, so
+// successive entries self-limit". That is TRUE and it is the WRONG BOUND: it is
+// the CASH bound, not the board's. Measured on the admin book (***0154) the night
+// this was filed: `optionsCash` $1,035.94, `openOptions: 0` ⇒ floor(1035.94/150)
+// = SIX entries fit before cash blocks the seventh, i.e. a $900 worst case, $150
+// over the authorization. The 1-hour `recentSignals` dedupe is keyed on the exact
+// OCC symbol, so it does not dedupe by underlying and bounds no dollars at all.
+//
+// The utilization side of this bound is DELIBERATELY not a counter. A since-boot
+// accumulator resets to 0 on every redeploy (bqb1 restarted six times on
+// 2026-08-12 alone) and so cannot bound a multi-session window — and, worse, a
+// reset one reads IDENTICALLY to a genuinely empty book. The order site derives
+// it from the CURRENTLY-OPEN POSITIONS instead (see
+// `foldOpenPremiumAtRisk` in options-account.ts), which survives a restart
+// because the positions do.
+// --------------------------------------------------------------------------
+
+/**
+ * Compiled default AGGREGATE cap on concurrent live bounded-test premium at
+ * risk, USD — the board's stated "$750 total" (TRA-3445 / TRA-3384).
+ *
+ * Unlike the per-entry pair, the default and the ceiling are the SAME number:
+ * the board named one figure and there is no conservative value below it that
+ * was separately authorized. Keeping both constants (rather than one) preserves
+ * the fail-safe shape of the sibling resolvers and lets a future board raise or
+ * lower one edge without the other silently following.
+ */
+export const LIVE_OPTION_TEST_AGGREGATE_CAP_USD = 750;
+
+/**
+ * Hard ceiling on the aggregate cap, USD. No env value may authorize more total
+ * exposure than the board did — a larger value clamps DOWN, it never widens.
+ */
+export const LIVE_OPTION_TEST_AGGREGATE_CEILING_USD = 750;
+
+export const LIVE_OPTION_TEST_AGGREGATE_CAP_VAR = 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD';
+
+/**
+ * Resolve the AGGREGATE premium-at-risk cap (USD) for the bounded live-options
+ * test. Clamped to `(0, LIVE_OPTION_TEST_AGGREGATE_CEILING_USD]`. Absent,
+ * malformed or non-positive ⇒ the compiled
+ * {@link LIVE_OPTION_TEST_AGGREGATE_CAP_USD} default — never unlimited, and
+ * never larger than the ceiling.
+ */
+export function resolveLiveOptionTestAggregateCapUsd(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[LIVE_OPTION_TEST_AGGREGATE_CAP_VAR];
+  if (typeof raw !== 'string') return LIVE_OPTION_TEST_AGGREGATE_CAP_USD;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n <= 0) return LIVE_OPTION_TEST_AGGREGATE_CAP_USD;
+  return Math.min(n, LIVE_OPTION_TEST_AGGREGATE_CEILING_USD);
+}
+
+/** Round a USD figure to whole cents (integer cents) for exact comparison. */
+function cents(usd: number): number {
+  return Math.round(usd * 100);
+}
+
+/**
+ * Does one more entry of `entryNotionalUsd` fit under the aggregate cap given
+ * `openPremiumAtRiskUsd` already at risk? The rule is
+ * `openPremiumAtRisk + entryNotional <= capUsd`, **boundary INCLUSIVE** — an
+ * entry that lands exactly on the cap is admitted, matching the board's "max
+ * $750" (a maximum is attainable).
+ *
+ * Compared in whole CENTS, because the operands are products of a per-share
+ * premium and 100 and neither side is exactly representable in binary: at
+ * $468.58-class numbers a plain `<=` rejects sums that are one ULP over a cap
+ * they equal to the penny, which would make the boundary case flap.
+ *
+ * FAILS SAFE — returns `false` (block) on any unusable input: a non-finite or
+ * negative at-risk figure, a non-finite / non-positive entry notional, or a
+ * non-finite / non-positive cap. An unreadable exposure is not evidence of
+ * headroom.
+ */
+export function fitsLiveOptionTestAggregateCap(
+  openPremiumAtRiskUsd: number,
+  entryNotionalUsd: number,
+  capUsd: number,
+): boolean {
+  if (!Number.isFinite(openPremiumAtRiskUsd) || openPremiumAtRiskUsd < 0) return false;
+  if (!Number.isFinite(entryNotionalUsd) || entryNotionalUsd <= 0) return false;
+  if (!Number.isFinite(capUsd) || capUsd <= 0) return false;
+  return cents(openPremiumAtRiskUsd) + cents(entryNotionalUsd) <= cents(capUsd);
+}
+
+/**
+ * Dollars of aggregate headroom left under `capUsd`, floored at 0. Publishing
+ * this is the point of the instrument: "cap armed, headroom $600" and "cap
+ * armed, headroom $0" are the two states a reader needs to tell apart, and a
+ * cap value alone reads identically in both. Non-finite / negative at-risk ⇒
+ * `null` (unreadable is not "full headroom").
+ */
+export function liveOptionTestAggregateHeadroomUsd(
+  openPremiumAtRiskUsd: number,
+  capUsd: number,
+): number | null {
+  if (!Number.isFinite(openPremiumAtRiskUsd) || openPremiumAtRiskUsd < 0) return null;
+  if (!Number.isFinite(capUsd) || capUsd <= 0) return null;
+  return Math.max(0, Math.round((capUsd - openPremiumAtRiskUsd) * 100) / 100);
+}
+
 /**
  * The contract count a bounded-test entry should open: the largest integer in
  * `[1, maxContracts]` whose ask notional (`ask * 100 * contracts`) fits `capUsd`.

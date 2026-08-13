@@ -5450,3 +5450,79 @@ describe('GET /api/health/otm-sleeve-mandate (TRA-3394)', () => {
     expect(body.ceiling.overrideRejectedReason).toMatch(/ABOVE/);
   });
 });
+
+// ─── TRA-3445 — the AGGREGATE live-OTM cap, on the read side ──────────────────
+// The board authorized "1 contract/name, max $150/entry, max $750 TOTAL". The
+// first two clauses were already published here; the third was neither enforced
+// nor readable. Publishing the CAP alone would not have been an instrument: a
+// cap value reads identically at headroom $600 and headroom $0, and those two
+// states are the whole reason the block exists.
+describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)', () => {
+  const AGG_VAR = 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD';
+  let savedAgg: string | undefined;
+
+  beforeEach(() => { savedAgg = process.env[AGG_VAR]; delete process.env[AGG_VAR]; });
+  afterEach(() => {
+    if (savedAgg === undefined) delete process.env[AGG_VAR];
+    else process.env[AGG_VAR] = savedAgg;
+  });
+
+  function serveFeeSlippage(
+    liveOtmAggregateExposure?: () => Array<{
+      book: string | null; mode: 'demo' | 'live'; capUsd: number;
+      openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
+      headroomUsd: number | null;
+    }>,
+  ) {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+      ...(liveOtmAggregateExposure ? { liveOtmAggregateExposure } : {}),
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-options-fee-slippage')![0]!({}, res);
+    return res.body as {
+      aggregateCapUsd: number;
+      aggregateCapDefaultUsd: number;
+      aggregateCapCeilingUsd: number;
+      aggregateCapVar: string;
+      aggregateExposure: unknown;
+    };
+  }
+
+  it('publishes the RESOLVED cap plus its default / ceiling / var name', () => {
+    const body = serveFeeSlippage();
+    expect(body.aggregateCapUsd).toBe(750);
+    expect(body.aggregateCapDefaultUsd).toBe(750);
+    expect(body.aggregateCapCeilingUsd).toBe(750);
+    expect(body.aggregateCapVar).toBe(AGG_VAR);
+  });
+
+  it('reports the RESOLVED value, not the constant — a clamped env is visible as clamped', () => {
+    process.env[AGG_VAR] = '5000';
+    expect(serveFeeSlippage().aggregateCapUsd).toBe(750); // clamped DOWN
+    process.env[AGG_VAR] = '300';
+    expect(serveFeeSlippage().aggregateCapUsd).toBe(300); // a tightening is honoured
+  });
+
+  it('separates "armed, $600 headroom" from "armed, $0 headroom" per book', () => {
+    const body = serveFeeSlippage(() => [
+      { book: 'admin', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
+      { book: 'v0nni', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
+    ]);
+    expect(body.aggregateExposure).toEqual([
+      { book: 'admin', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
+      { book: 'v0nni', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
+    ]);
+  });
+
+  it('serves NULL when the provider is unwired — never [], which would claim "no books"', () => {
+    // The two states must not collide: a build that serves the cap without a
+    // utilization read is not a fleet with nothing open.
+    expect(serveFeeSlippage().aggregateExposure).toBeNull();
+    expect(serveFeeSlippage(() => []).aggregateExposure).toEqual([]);
+  });
+});

@@ -113,7 +113,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd } from './option-exec-flag.js';
 import { lastRecordedOpenSleeve, recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
@@ -8244,6 +8244,40 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3445 — this book's AGGREGATE live-OTM exposure against the board's
+   * "$750 total" bound, computed by the SAME resolver and the SAME positions
+   * fold the order site uses. Publishing the cap value alone is not an
+   * instrument: "cap armed, headroom $600" and "cap armed, headroom $0" are the
+   * two states a reader has to tell apart, and only `openPremiumAtRiskUsd` /
+   * `headroomUsd` separate them.
+   *
+   * Reported for EVERY engine, demo included (`mode` says which), so a live
+   * book that stops being live is visibly absent from the live rows rather than
+   * silently missing. Read-only; no balances or credentials.
+   */
+  getLiveOtmAggregateExposure(): {
+    book: string | null;
+    mode: 'demo' | 'live';
+    capUsd: number;
+    openPremiumAtRiskUsd: number;
+    openRows: number;
+    unpricedOpenRows: number;
+    headroomUsd: number | null;
+  } {
+    const capUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+    const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+    return {
+      book: this.alertUsername ?? null,
+      mode: this.mode,
+      capUsd,
+      openPremiumAtRiskUsd: atRisk.usd,
+      openRows: atRisk.rows,
+      unpricedOpenRows: atRisk.unpricedRows,
+      headroomUsd: liveOptionTestAggregateHeadroomUsd(atRisk.usd, capUsd),
+    };
+  }
+
+  /**
    * TRA-2956 — withdrawal telemetry, summed across both broker books for the
    * options-live health route. Mirrors {@link getAbandonedStagedExitStats}.
    */
@@ -10011,6 +10045,63 @@ export class SignalEngine {
             continue;
           }
           const testNotional = askLimit * 100 * testContracts;
+
+          // TRA-3445 — the AGGREGATE bound. Everything above this line caps ONE
+          // entry; the board's TRA-3384 option-A answer also said "max $750
+          // total", and nothing enforced it. `min(available cash, cap)` is the
+          // CASH bound, not the board's: with $1,035.94 of options cash and a
+          // $150 per-entry cap, six entries fit before cash blocks the seventh —
+          // $900, i.e. $150 over the authorization.
+          //
+          // Utilization is derived from the OPEN POSITIONS, never from a
+          // since-boot counter: this box restarted six times on 2026-08-12 and a
+          // reset counter reads identically to a flat book, which would re-grant
+          // the full $750 after every redeploy.
+          //
+          // SCOPE: per book. Each engine sizes against its own Tradier balance
+          // and there is no fleet accumulator, so two armed books admit $750
+          // each — see the aggregate-cap note in the PR / TRA-3445 comment; the
+          // fleet number is DISCLOSED, not silently assumed to be $750.
+          const aggregateCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+          const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+          const fitsAggregate = fitsLiveOptionTestAggregateCap(
+            atRisk.usd, testNotional, aggregateCapUsd,
+          );
+          const aggregateReason = fitsAggregate
+            ? undefined
+            : `OTM live test skipped — aggregate cap: $${atRisk.usd.toFixed(2)} already at risk across `
+              + `${atRisk.rows} open live position(s) + this $${testNotional.toFixed(2)} entry exceeds the `
+              + `$${aggregateCapUsd.toFixed(2)} total authorized (board TRA-3384 option A, TRA-3445)`;
+          // Recorded on BOTH verdicts. A guard whose rejects are invisible is
+          // indistinguishable from an inert one (TRA-3216), and the admits are
+          // what supply the `evaluated` denominator that tells "never had to
+          // bite" apart from "never wired in".
+          recordLiveEnforceDecision(
+            'aggregate_cap',
+            'single_leg_otm',
+            !fitsAggregate,
+            etDateString(new Date()),
+            aggregateReason,
+            Date.now(),
+            {
+              reasonCode: fitsAggregate ? undefined : 'over_aggregate_cap',
+              book: this.alertUsername ?? null,
+            },
+          );
+          if (!fitsAggregate) {
+            surfaceOtmLiveSkip(aggregateReason!);
+            log.info('live OTM bounded test: over AGGREGATE cap, skipped (TRA-3445)', {
+              sym,
+              optionSymbol: cheap.optionSymbol,
+              openPremiumAtRiskUsd: atRisk.usd,
+              openRows: atRisk.rows,
+              unpricedOpenRows: atRisk.unpricedRows,
+              testNotional,
+              aggregateCapUsd,
+              username: this.alertUsername ?? null,
+            });
+            continue;
+          }
 
           const underlyingSpotLive =
             typeof result.spot === 'number' && result.spot > 0 ? result.spot : undefined;

@@ -5444,6 +5444,15 @@ registerLiveHealthRoutes(app, {
   // per-engine rows are what make "what does a second live book inherit"
   // measurable. Secrets-free (booleans / counts / timestamps / book-level P&L).
   optionsHalt: () => getAllUserContexts().map(ctx => ctx.engine.getOptionsHaltState()),
+  // TRA-3445 — per-book aggregate live-OTM exposure for the "$750 total" bound.
+  // ⚠ WHOLE FLEET, BOTH MODES — no `.filter(mode === 'live')` here. The cap is
+  // enforced PER BOOK, so the fleet total is a sum the reader takes themselves,
+  // and a filter applied in this caller would hide exactly the rows that make
+  // that sum checkable — invisibly to every unit test, because the defect would
+  // be here and not in the function under test (the TRA-2650 `fleetBooks`
+  // lesson, ~40 lines up).
+  liveOtmAggregateExposure: () =>
+    getAllUserContexts().map(ctx => ctx.engine.getLiveOtmAggregateExposure()),
 });
 
 // TRA-1004 — autonomous demo-loop status. Unauthenticated by design (parity with

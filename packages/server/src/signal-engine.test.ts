@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { summarizeCostAwareGate, clearCostAwareGateLedger } from './cost-aware-gate-ledger.js';
+import type { PaperOptionsAccount } from './options-account.js'; // TRA-3445
 import { etDateString } from './scheduler.js';
 // TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
 // the equity feed when the in-process dailyCloseCache is cold (the iv-rv option
@@ -7290,7 +7291,12 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     expect(retained.find((g) => g.gate === 'otm_delta_floor')!.byReason).toEqual([]);
     expect(retained.find((g) => g.gate === 'cost_bar')).toMatchObject({ evaluated: 0, blocked: 0 });
     expect(retained.find((g) => g.gate === 'universe')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(1);
+    // TRA-3445 — and a SECOND legitimate row for the same reason: the aggregate
+    // cap records its ADMIT on this pass too (an empty book, $82 entry). Pin it
+    // by name rather than loosening the total, so the next gate to start
+    // recording here is caught the same way these two were.
+    expect(retained.find((g) => g.gate === 'aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(2);
   });
 
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
@@ -7510,6 +7516,160 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
     expect(engine.getState().options.openOptions).toHaveLength(1);
     expect(stub.buyContractsLimit).not.toHaveBeenCalled(); // demo never touches the broker
     expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(0);
+  });
+
+  // ─── TRA-3445 — the AGGREGATE cap, at the order site ────────────────────────
+  // The board's TRA-3384 answer had THREE clauses; two were armable as env knobs
+  // and the third ("max $750 total") had no code path at all. Every guard above
+  // this one bounds a SINGLE entry, and the surviving argument for aggregate
+  // safety was `min(available cash, cap)` — the CASH bound, not the board's.
+  //
+  // Note the balance these tests run against: $10,000, deliberately far above
+  // the $1,035.94 the admin book actually held. If the cash bound were doing the
+  // work, every one of these would open. The cap is what stops them.
+  describe('aggregate cap (TRA-3445)', () => {
+    const AGG_VAR = 'LIVE_OPTION_TEST_AGGREGATE_CAP_USD';
+    let savedAgg: string | undefined;
+    beforeEach(() => { savedAgg = process.env[AGG_VAR]; delete process.env[AGG_VAR]; });
+    afterEach(() => {
+      if (savedAgg === undefined) delete process.env[AGG_VAR];
+      else process.env[AGG_VAR] = savedAgg;
+    });
+
+    /** A cash bound that can never be the thing doing the blocking. */
+    function richEngine(stub: ReturnType<typeof liveStub>): SignalEngine {
+      const engine = engineFor('live', stub);
+      (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+        totalEquity: 10_000, totalCash: 10_000, optionBuyingPower: 10_000, dayTradeBuyingPower: 10_000,
+      };
+      return engine;
+    }
+
+    /** Seed `usd` of ALREADY-OPEN live premium at risk on the engine's book. */
+    function seedOpenLivePremium(engine: SignalEngine, usd: number): void {
+      const acct = (engine as unknown as { optionsAccount: PaperOptionsAccount }).optionsAccount;
+      acct.importSnapshot({
+        // One row carrying the whole figure. OCC symbol deliberately DIFFERENT
+        // from the candidate's, so the 1-hour same-contract dedupe cannot be
+        // what blocks — the aggregate gate has to be.
+        openOptions: [{
+          id: 'seed-1', symbol: 'MSFT', optionSymbol: 'MSFT240705C00420000',
+          optionType: 'call', strike: 420, expiration: '2024-07-05',
+          contracts: 1, contractsRemaining: 1,
+          premiumPaid: usd / 100, currentPremium: usd / 100,
+          tp1Premium: (usd / 100) * 1.25, tp1Hit: false,
+          stopLossPremium: (usd / 100) * 0.75, peakPremium: usd / 100,
+          trailingActive: false, trailingStopPremium: (usd / 100) * 0.88,
+          underlyingEntryPrice: 415, openedAt: TRADING_TIME,
+          signalId: 'seed-sig', signalType: 'otm_mispricing', mode: 'live',
+        }],
+        closedOptions: [], optionsPnl: 0, dailyCount: 0,
+        currentDayKey: '2026-08-12', cash: 10_000, equity: 10_000,
+      });
+    }
+
+    // The candidate is ask $0.82 ⇒ ONE contract = $82 of premium.
+    const ENTRY_USD = 82;
+
+    it('SKIPS an entry that fits per-entry but breaches the aggregate — and RECORDS the skip', async () => {
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      seedOpenLivePremium(engine, 700); // 700 + 82 = 782 > 750
+      await runOtm(engine, ['AAPL']);
+
+      // No broker order, and no new row on the paper book either (the seeded one
+      // is still there — hence 1, not 0).
+      expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+      expect(engine.getState().options.openOptions).toHaveLength(1);
+
+      const agg = gateOf('aggregate_cap');
+      expect(agg).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
+      expect(agg.byReason).toEqual([{ reasonCode: 'over_aggregate_cap', blocked: 1, share: 1 }]);
+      expect(agg.byBook).toEqual([{ book: 'admin', evaluated: 1, blocked: 1, blockRate: 1 }]);
+
+      // Visible on the feed, not only in the ledger.
+      const sig = engine.getState().signals.find((s) => s.symbol === 'AAPL')!;
+      expect(sig.liveSkipReason).toMatch(/aggregate cap/);
+      expect(sig.liveSkipReason).toMatch(/\$700\.00 already at risk/);
+    });
+
+    it('ADMITS an entry that lands EXACTLY on the cap — boundary inclusive', async () => {
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      seedOpenLivePremium(engine, 750 - ENTRY_USD); // 668 + 82 = 750 exactly
+      await runOtm(engine, ['AAPL']);
+
+      expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+      // evaluated>0 / blocked:0 — the ADMIT is recorded too, so a cap that never
+      // had to bite can never read like one that is not wired in.
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0, blockRate: 0 });
+      expect(gateOf('aggregate_cap').byReason).toEqual([]);
+    });
+
+    it('one cent over the cap is BLOCKED — the boundary is a boundary, not a suggestion', async () => {
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      seedOpenLivePremium(engine, 750 - ENTRY_USD + 0.01);
+      await runOtm(engine, ['AAPL']);
+
+      expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 1 });
+    });
+
+    it('an EMPTY live book opens normally — the cap does not block the first entry', async () => {
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      await runOtm(engine, ['AAPL']);
+
+      expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0 });
+    });
+
+    it('an oversized env value cannot buy headroom — $5000 clamps to the board $750', async () => {
+      process.env[AGG_VAR] = '5000';
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      seedOpenLivePremium(engine, 700);
+      await runOtm(engine, ['AAPL']);
+
+      // Under a naive env read this entry opens ($782 < $5000). It must not.
+      expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 1 });
+    });
+
+    it('a DEMO row does not consume live headroom', async () => {
+      const stub = liveStub();
+      const engine = richEngine(stub);
+      seedOpenLivePremium(engine, 700);
+      // Re-stamp the seeded row demo: same dollars, different book.
+      const acct = (engine as unknown as { optionsAccount: PaperOptionsAccount }).optionsAccount;
+      acct.getState().openOptions[0]!.mode = 'demo';
+      await runOtm(engine, ['AAPL']);
+
+      expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0 });
+    });
+
+    it('demo mode never reaches the gate at all — 0 rows on the live ledger', async () => {
+      const stub = liveStub();
+      const engine = engineFor('demo', stub);
+      await runOtm(engine, ['AAPL']);
+
+      expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 0, blocked: 0, blockRate: null });
+    });
+
+    it('publishes headroom per book, so "armed, $600 left" is not "armed, $0 left"', async () => {
+      const engine = richEngine(liveStub());
+      expect(engine.getLiveOtmAggregateExposure()).toEqual({
+        book: 'admin', mode: 'live', capUsd: 750,
+        openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
+      });
+
+      seedOpenLivePremium(engine, 700);
+      expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
+        openPremiumAtRiskUsd: 700, openRows: 1, headroomUsd: 50,
+      });
+    });
   });
 });
 

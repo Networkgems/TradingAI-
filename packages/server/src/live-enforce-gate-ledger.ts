@@ -71,6 +71,13 @@ const RETAIN_MS = 30 * 24 * 60 * 60 * 1000;
  * gate with a mode field because a counter must report what the engine actually
  * did, not what the config intended (TRA-1682) — folding a shadow "block" into
  * the enforcing gate's `blocked` would claim a trade was prevented when it fired.
+ *
+ * TRA-3445 adds `aggregate_cap` — the board's "max $750 TOTAL" bound on the live
+ * bounded-test sleeve, which until now had no enforcement path at all (every
+ * other guard bounds a SINGLE entry). It is its own gate rather than a reason
+ * code on an existing one for the usual reason: only a gate carries an
+ * `evaluated` denominator, and "the cap never had to bite" (`evaluated > 0,
+ * blocked: 0`) must not read the same as "the cap is inert" (`evaluated: 0`).
  */
 export type LiveEnforceGate =
   | 'cost_bar'
@@ -78,7 +85,8 @@ export type LiveEnforceGate =
   | 'otm_delta_floor'
   | 'universe'
   | 'entry_delta_ceiling'
-  | 'entry_delta_ceiling_shadow';
+  | 'entry_delta_ceiling_shadow'
+  | 'aggregate_cap';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -208,6 +216,9 @@ const GATES: LiveEnforceGate[] = [
   // `evaluated > 0, blocked = 0` (n=20 above 0.55 on the whole tape).
   'entry_delta_ceiling',
   'entry_delta_ceiling_shadow',
+  // TRA-3445 — same reasoning: publish a zero row so an aggregate cap that has
+  // never been reached is distinguishable from one that is not wired in.
+  'aggregate_cap',
 ];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */

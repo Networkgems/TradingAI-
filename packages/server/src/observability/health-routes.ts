@@ -55,6 +55,10 @@ import {
   LIVE_OPTION_TEST_CONTRACTS_HARD_MAX,
   resolveLiveOptionTestNotionalCapUsd,
   resolveLiveOptionTestMaxContracts,
+  LIVE_OPTION_TEST_AGGREGATE_CAP_USD, // TRA-3445
+  LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
+  LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
+  resolveLiveOptionTestAggregateCapUsd,
   isOptionCostGateLiveEnforceEnabled,
   isOptionLiquidityLiveEnforceEnabled,
   OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
@@ -391,8 +395,35 @@ export interface LiveHealthDeps {
    * Only mounted when provided.
    */
   optionsHalt?: () => Array<OptionsHaltEngineState>;
+  /**
+   * TRA-3445 — per-book AGGREGATE live-OTM exposure against the board's "$750
+   * total" bound, backing the `aggregateExposure` block on
+   * `GET /api/health/live-options-fee-slippage`. Wire it to
+   * `getAllUserContexts().map(ctx => ctx.engine.getLiveOtmAggregateExposure())`
+   * — the WHOLE fleet, both modes, because the per-book scope of the cap means
+   * the fleet total is a SUM the reader has to be able to take. Filtering to
+   * live here would make a demoted book vanish instead of reading `mode:
+   * 'demo'`, and would hide the very rows that make the fleet figure checkable.
+   * Optional: absent ⇒ the route serves `aggregateExposure: null`, which says
+   * "not wired", never `[]` ("no books").
+   */
+  liveOtmAggregateExposure?: () => Array<LiveOtmAggregateExposure>;
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   now?: () => number;
+}
+
+/** TRA-3445 — one engine's aggregate live-OTM exposure readout. */
+export interface LiveOtmAggregateExposure {
+  /** `alertUsername`, joining to the journal `account` and the TRA-3117 census. */
+  book: string | null;
+  mode: 'demo' | 'live';
+  capUsd: number;
+  openPremiumAtRiskUsd: number;
+  openRows: number;
+  /** > 0 ⇒ the enforced figure is known to UNDERSTATE exposure (see `foldOpenPremiumAtRisk`). */
+  unpricedOpenRows: number;
+  /** `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable. */
+  headroomUsd: number | null;
 }
 
 /** TRA-3218 — one engine's options-halt readout (see `SignalEngine.getOptionsHaltState`). */
@@ -4034,6 +4065,25 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       maxContracts: resolveLiveOptionTestMaxContracts(liveEnv),
       maxContractsVar: LIVE_OPTION_TEST_MAX_CONTRACTS_VAR,
       maxContractsHardMax: LIVE_OPTION_TEST_CONTRACTS_HARD_MAX,
+      // TRA-3445 — the board's THIRD clause ("max $750 total"), which had no
+      // enforcement path until now. Same publication contract as the per-entry
+      // pair above: the RESOLVED value, not the constant.
+      aggregateCapUsd: resolveLiveOptionTestAggregateCapUsd(liveEnv),
+      aggregateCapDefaultUsd: LIVE_OPTION_TEST_AGGREGATE_CAP_USD,
+      aggregateCapCeilingUsd: LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
+      aggregateCapVar: LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
+      // ⭐ READ THIS, NOT THE CAP ALONE. A cap value reads IDENTICALLY at
+      // headroom $600 and headroom $0, and those two states are the entire
+      // point of the instrument. One row per engine, computed by the same fold
+      // the order site enforces on. `null` ⇒ the provider is not wired (this
+      // build serves the cap without a utilization read) — never `[]`, which
+      // would claim "no books" against an unwired route.
+      //
+      // SCOPE IS PER BOOK (TRA-3445 item 3): each engine sizes against its own
+      // Tradier balance and there is no fleet accumulator, so N armed live
+      // books admit N × the cap. Sum `openPremiumAtRiskUsd` over the
+      // `mode: 'live'` rows to read the FLEET figure — it is not bounded here.
+      aggregateExposure: deps.liveOtmAggregateExposure?.() ?? null,
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {

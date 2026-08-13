@@ -1246,6 +1246,60 @@ interface OptionsAccountConfig {
  *   • Daily limit reduced to 4 high-quality trades (was 10)
  *   • Time filter: only open options during valid ET trading windows
  */
+/** TRA-3445 — the fold behind the aggregate live-OTM cap's utilization figure. */
+export interface OpenPremiumAtRisk {
+  /** Σ `premiumPaid × contractsRemaining × 100` over the rows below, USD. */
+  usd: number;
+  /** Open rows that contributed a positive figure. */
+  rows: number;
+  /**
+   * Open rows SKIPPED because their premium / remaining count was unusable.
+   * Published rather than folded to zero: a skipped row UNDERSTATES exposure,
+   * so a non-zero value here means the cap is being enforced against a number
+   * that is known to be low. Zero on every engine-opened row (`premiumPaid` is
+   * set at open); a Tradier import with a missing cost basis is the case this
+   * exists to make visible.
+   */
+  unpricedRows: number;
+}
+
+/**
+ * TRA-3445 — sum PREMIUM AT RISK over open long-option rows, USD.
+ *
+ * This is deliberately a fold over POSITIONS rather than a counter incremented
+ * at the order site. A since-boot counter cannot bound a multi-session window:
+ * it resets to 0 on every redeploy (bqb1 restarted six times on 2026-08-12) and
+ * a reset counter reads IDENTICALLY to a genuinely flat book, so the cap would
+ * silently re-grant its full allowance after each deploy. Positions survive the
+ * restart, so this figure does too — see the restart assertion in
+ * `option-live-otm-aggregate-cap.test.ts`, which is the one test the counter
+ * variant fails and every other test passes.
+ *
+ * Basis is the ENTRY premium (`premiumPaid`), not the current mark: the board
+ * bounded what may be SPENT, and a cap that relaxed as positions appreciated
+ * would authorize new entries out of unrealized gains.
+ */
+export function foldOpenPremiumAtRisk(
+  positions: readonly OptionPosition[],
+): OpenPremiumAtRisk {
+  let usd = 0;
+  let rows = 0;
+  let unpricedRows = 0;
+  for (const p of positions) {
+    const remaining = p.contractsRemaining ?? p.contracts;
+    if (
+      !Number.isFinite(p.premiumPaid) || p.premiumPaid <= 0
+      || !Number.isFinite(remaining) || remaining <= 0
+    ) {
+      unpricedRows += 1;
+      continue;
+    }
+    usd += p.premiumPaid * remaining * 100;
+    rows += 1;
+  }
+  return { usd: Math.round(usd * 100) / 100, rows, unpricedRows };
+}
+
 export class PaperOptionsAccount {
   private initialEquity: number;
   private managedAccountRatio: number;
@@ -2387,6 +2441,18 @@ export class PaperOptionsAccount {
   /** TRA-246 — total realized options P&L across both modes. */
   private totalOptionsPnl(): number {
     return this.optionsPnlByMode.demo + this.optionsPnlByMode.live;
+  }
+
+  /**
+   * TRA-3445 — PREMIUM AT RISK on this book's currently-open positions for
+   * `mode`, the utilization side of the board's aggregate live-OTM cap. See
+   * {@link foldOpenPremiumAtRisk} for why this is derived from the open rows
+   * and not accumulated in a counter.
+   */
+  openPremiumAtRiskForMode(mode: AccountMode): OpenPremiumAtRisk {
+    return foldOpenPremiumAtRisk(
+      Array.from(this.openOptions.values()).filter((p) => (p.mode ?? 'demo') === mode),
+    );
   }
 
   /**

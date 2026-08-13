@@ -46,6 +46,12 @@ import {
   resolveLiveOptionTestNotionalCapUsd,
   resolveLiveOptionTestMaxContracts,
   resolveLiveOptionTestContracts,
+  LIVE_OPTION_TEST_AGGREGATE_CAP_USD, // TRA-3445
+  LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
+  LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
+  resolveLiveOptionTestAggregateCapUsd,
+  fitsLiveOptionTestAggregateCap,
+  liveOptionTestAggregateHeadroomUsd,
   isOptionOtmDeltaFloorLiveEnforceEnabled,
   resolveOptionOtmDeltaFloorLive,
   OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
@@ -366,6 +372,81 @@ describe('resolveLiveOptionTestNotionalCapUsd (TRA-2536)', () => {
     // a fat-finger cannot authorize more than the funded balance
     expect(resolveLiveOptionTestNotionalCapUsd({ [LIVE_OPTION_TEST_NOTIONAL_CAP_VAR]: '46858' }))
       .toBe(LIVE_OPTION_TEST_NOTIONAL_CEILING_USD);
+  });
+});
+
+// TRA-3445 — the board's THIRD clause, "max $750 total". Every other guard in
+// this file bounds ONE entry; with $1,035.94 of options cash and a $150 per-entry
+// cap, six entries fit before cash blocks the seventh — $900, i.e. $150 over the
+// authorization. These pin the resolver's fail-safe shape and the boundary rule.
+describe('resolveLiveOptionTestAggregateCapUsd (TRA-3445)', () => {
+  it('returns the board figure when UNSET — never unlimited', () => {
+    expect(resolveLiveOptionTestAggregateCapUsd({})).toBe(750);
+    expect(resolveLiveOptionTestAggregateCapUsd({})).toBe(LIVE_OPTION_TEST_AGGREGATE_CAP_USD);
+  });
+
+  it('falls back to the compiled default on garbage / zero / negative', () => {
+    for (const bad of ['', '   ', 'abc', '0', '-1', '-750', 'NaN', 'Infinity']) {
+      expect(resolveLiveOptionTestAggregateCapUsd({ [LIVE_OPTION_TEST_AGGREGATE_CAP_VAR]: bad }))
+        .toBe(LIVE_OPTION_TEST_AGGREGATE_CAP_USD);
+    }
+  });
+
+  it('CLAMPS DOWN above the ceiling — an env value cannot authorize more than the board did', () => {
+    expect(resolveLiveOptionTestAggregateCapUsd({ [LIVE_OPTION_TEST_AGGREGATE_CAP_VAR]: '5000' }))
+      .toBe(LIVE_OPTION_TEST_AGGREGATE_CEILING_USD);
+    expect(resolveLiveOptionTestAggregateCapUsd({ [LIVE_OPTION_TEST_AGGREGATE_CAP_VAR]: '751' }))
+      .toBe(750);
+  });
+
+  it('honours a value BELOW the ceiling — the knob can only tighten', () => {
+    expect(resolveLiveOptionTestAggregateCapUsd({ [LIVE_OPTION_TEST_AGGREGATE_CAP_VAR]: '300' }))
+      .toBe(300);
+  });
+});
+
+describe('fitsLiveOptionTestAggregateCap (TRA-3445)', () => {
+  it('admits an entry that lands EXACTLY on the cap — a maximum is attainable', () => {
+    expect(fitsLiveOptionTestAggregateCap(600, 150, 750)).toBe(true);
+    expect(fitsLiveOptionTestAggregateCap(0, 750, 750)).toBe(true);
+    expect(fitsLiveOptionTestAggregateCap(750, 0.01, 750)).toBe(false);
+  });
+
+  it('blocks the entry that fits PER-ENTRY but breaches the aggregate — the whole point', () => {
+    // The measured worst case: five $150 entries already open, a sixth offered.
+    expect(fitsLiveOptionTestAggregateCap(750, 150, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(700, 82, 750)).toBe(false);
+  });
+
+  it('is cent-exact at the boundary rather than ULP-sensitive', () => {
+    // 0.1+0.2 arithmetic on premium×100 products: the sum is 468.58000000000004
+    // in binary, and a plain `<=` would reject a boundary case that is equal to
+    // the penny. This is the case that makes the boundary flap, not the maths.
+    expect(fitsLiveOptionTestAggregateCap(268.58, 200, 468.58)).toBe(true);
+    expect(fitsLiveOptionTestAggregateCap(0.1 + 0.2, 749.7, 750)).toBe(true);
+  });
+
+  it('FAILS SAFE — an unusable at-risk / notional / cap BLOCKS, it does not assume headroom', () => {
+    expect(fitsLiveOptionTestAggregateCap(Number.NaN, 82, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(Number.POSITIVE_INFINITY, 82, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(-1, 82, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(0, Number.NaN, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(0, 0, 750)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(0, 82, 0)).toBe(false);
+    expect(fitsLiveOptionTestAggregateCap(0, 82, Number.NaN)).toBe(false);
+  });
+});
+
+describe('liveOptionTestAggregateHeadroomUsd (TRA-3445)', () => {
+  it('separates "cap armed, headroom $600" from "cap armed, headroom $0"', () => {
+    expect(liveOptionTestAggregateHeadroomUsd(150, 750)).toBe(600);
+    expect(liveOptionTestAggregateHeadroomUsd(750, 750)).toBe(0);
+  });
+
+  it('floors at 0 rather than reporting negative headroom, and returns null when unreadable', () => {
+    expect(liveOptionTestAggregateHeadroomUsd(900, 750)).toBe(0);
+    expect(liveOptionTestAggregateHeadroomUsd(Number.NaN, 750)).toBeNull();
+    expect(liveOptionTestAggregateHeadroomUsd(100, 0)).toBeNull();
   });
 });
 
