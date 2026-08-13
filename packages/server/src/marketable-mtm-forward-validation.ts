@@ -1007,6 +1007,11 @@ export function marketableMtmVerdict(
  * in a different section of the payload that the coverage reader never reaches. Three distinct
  * renderings — attributed-and-dead, attributed-and-healthy, not-attributed — and never a
  * silent omission, because an omitted clause reads exactly like a zero.
+ *
+ * ⚠ **Scope: branch (2) SUFFICIENCY only.** Its strings are written against *"the shortfall
+ * above"* and its zero-branch promises a resolvable LEGACY DRAIN, so it is only correct where a
+ * shortfall is what the reader is being told about. The `unfit` TERMINAL — which returns ABOVE
+ * this call site — needs {@link venueLivenessClause} instead. See TRA-3526.
  */
 function deadSnapClause(cov: MarketableMtmQuoteCoverage): string {
   const dropped = cov.unpricedExitQuoteDropped;
@@ -1023,6 +1028,62 @@ function deadSnapClause(cov: MarketableMtmQuoteCoverage): string {
   return ' No record was dropped for a missing exit quote (exclusions.unpriced_exit_quote = 0),'
     + ' so the venue returned a two-sided book on every snap: the shortfall above is a LEGACY'
     + ' DRAIN, which does resolve as post-4871bbc round-trips accrue.';
+}
+
+/**
+ * TRA-3526 — the TERMINAL-side twin of {@link deadSnapClause}.
+ *
+ * ## Why this is a second function and not a flag on the first
+ *
+ * `deadSnapClause` has exactly ONE call site, inside branch (2) *Sufficiency* of
+ * {@link marketableMtmQuotedVerdict}. TRA-3459's fitness terminal returns ABOVE it, so once a
+ * population is `unfit` its reason could never carry ANY venue-liveness sentence — the pooled
+ * `quotedVerdict` rendered the coverage prose **0×** while the four per-structure verdicts
+ * rendered it **4×** (verified live 2026-08-13T09:15:46Z against SHA `c44a890030c6`). The
+ * structured signal was fine throughout: `quoteCoverage.unpricedExitQuoteDropped` is a number at
+ * every level. This is a PROSE fix on an intact signal.
+ *
+ * `deadSnapClause` is not reused because all three of its strings are written against *"the
+ * shortfall above"* — a sentence branch (1) does not contain. Spliced into the terminal they
+ * dangle, and its zero-branch actively CONTRADICTS the terminal by promising a LEGACY DRAIN
+ * "which does resolve as round-trips accrue" three sentences after *"MORE ROWS OF THIS BOOK
+ * CANNOT FIX IT"*.
+ *
+ * ## The zero branch is required, not optional
+ *
+ * Silence at zero would make *attributed-and-genuinely-zero* read identically to *clause never
+ * reached* — the same null-vs-zero collapse this function exists to fix, one branch over — and
+ * would leave a deletion of the call site undetectable by the suite.
+ *
+ * ## What it may NOT do
+ *
+ * A liveness alarm may change the REASON, never the CODE. `unfit` stays `NOT_GRADEABLE` at every
+ * value of `dropped`; folding it to `REVIEW` to reach branch (2) would restore "grade it later"
+ * on a provably ungradeable population, which is the TRA-2602 / TRA-3459 defect re-entered
+ * through the alarm path. For the same reason no branch here may say `LEGACY DRAIN` or
+ * `does resolve as`.
+ */
+function venueLivenessClause(cov: MarketableMtmQuoteCoverage): string {
+  const dropped = cov.unpricedExitQuoteDropped;
+  if (dropped == null) {
+    return ' VENUE LIVENESS: NOT ATTRIBUTED at this level — this census covers retained rows'
+      + ' only; read the pooled quoteCoverage.unpricedExitQuoteDropped.';
+  }
+  if (dropped > 0) {
+    return ` VENUE LIVENESS — SEPARATE, AND ALSO TERMINAL: a further ${dropped} record(s) were`
+      + ' DROPPED BEFORE retention with no usable exit quote at all'
+      + ` (exclusions.unpriced_exit_quote), OVER AND ABOVE the ${cov.retained} retained rows.`
+      + ' This is a SECOND and INDEPENDENT reason accrual cannot fix the gate: the fitness'
+      + " verdict above says this book's WIDTH/MID REGIME cannot grade h, and this says the"
+      + ' venue did not return a two-sided book on every snap at all. Those rows will never age'
+      + ' into a gradeable quotedH and the count does not shrink on its own. Fix the exit-quote'
+      + ' source BEFORE sourcing the different evidence population this terminal asks for — a'
+      + ' replacement population drawn from the same dead venue inherits the same hole.';
+  }
+  return ' VENUE LIVENESS: not the problem here — 0 records were dropped for a missing exit'
+    + ` quote (exclusions.unpriced_exit_quote = 0) alongside the ${cov.retained} retained rows,`
+    + ' so the venue returned a two-sided book on every snap. This terminal is about the'
+    + ' WIDTH/MID REGIME of the quotes, NOT their absence.';
 }
 
 /**
@@ -1245,7 +1306,12 @@ export function marketableMtmQuotedVerdict(
       code: 'NOT_GRADEABLE',
       basis: 'quotedH',
       reason: `NOT GRADEABLE ON THIS POPULATION — the validation book is not the book h was `
-        + `calibrated on, and MORE ROWS OF THIS BOOK CANNOT FIX IT. ${fitness.reasons.join('; ')}. `
+        // The trailing space this line used to carry now comes from the clause's own leading
+        // space, which is `deadSnapClause`'s convention and keeps the two twins interchangeable.
+        + `calibrated on, and MORE ROWS OF THIS BOOK CANNOT FIX IT. ${fitness.reasons.join('; ')}.`
+        // TRA-3526 — spliced HERE, not at the end: a liveness alarm buried past ~char 1400 is
+        // not an alarm. And not before the headline, which must not be split.
+        + `${venueLivenessClause(summary.quoteCoverage)} `
         + `Calibration population: ${MODELED_H_CALIBRATION.n} demo-journal rows `
         + `(${MODELED_H_CALIBRATION.windowUtc.from.slice(0, 10)}..${MODELED_H_CALIBRATION.windowUtc.to.slice(0, 10)}), `
         + `median mid $${MODELED_H_CALIBRATION.midUsd.median.toFixed(2)}, median full spread `
