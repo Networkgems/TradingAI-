@@ -132,6 +132,51 @@
  * cause gets buried. Exit 2 fires when findings span >= 3 distinct assignees or
  * >= 25% of the population, and says so in the report.
  *
+ * ⛔⛔ WHICH SUBJECT THAT CONDITION IS ABOUT — TRA-3487
+ * ----------------------------------------------------
+ * Until TRA-3487 this check had NO concept of an owner pause (`grep -i pause`
+ * over the whole file returned zero hits) and its FLEET banner asserted, in
+ * fixed prose, "This is ONE platform condition" — a claim about THE DISPATCHER.
+ *
+ * Per TRA-2871 that subject is usually WRONG. `INVOKABLE_AGENT_STATUSES` is
+ * `{active, idle, running, error}` — read off `@paperclipai/shared/dist/
+ * agent-eligibility.js`, and note `running` IS invokable — so the message
+ * "Agent is not invokable in its current state" can NEVER mean "busy". It is
+ * emitted only for `paused` / `terminated` / `pending_approval` / out-of-enum.
+ * The 2026-08-04T13:12Z burst was 100% roster coverage of PAUSED agents.
+ *
+ * So the banner was right that it was ONE condition and named the wrong
+ * subject, handing the next responder a pre-committed "platform fault" verdict
+ * twice a day. TRA-2867 and TRA-2871 each took exactly that wrong turn.
+ *
+ * Every `LAST_DISPATCH_FAILED` is now resolved against the durable pause tape
+ * (`scripts/lib/paperclip-pause-tape.mjs`) AT THE FAILURE INSTANT, and splits:
+ *
+ *   OWNER_PAUSED         the assignee was `paused` when the dispatch died.
+ *   OWNER_TERMINATED     the assignee was `terminated`. (Live on this board:
+ *                        `e1b97e28`'s assignee `2fc6fe3b` is terminated, which
+ *                        is why no agent can archive it — it needs a BOARD
+ *                        re-home, not a dispatcher repair.)
+ *   OWNER_STATE_UNKNOWN  attribution could not be completed. See below.
+ *
+ * All three are STILL FINDINGS — the slots died and nothing replays them under
+ * `skip_missed` — but they are held OUT of the FLEET test exactly the way
+ * `EXECUTION_ISSUE_ABANDONED` already was, because they are owner/board
+ * routable and not claims about the dispatcher. The banner now NAMES the
+ * subject it is asserting instead of asserting "platform" unconditionally, and
+ * a roster-wide pause burst prints an OWNER-side banner instead.
+ *
+ * ⛔ WHY ATTRIBUTION FAILS CLOSED
+ * `resume` writes `{status:'idle', pauseReason:null, pausedAt:null}` — it
+ * ERASES the evidence, so reading the agent row proves nothing (TRA-2867 cited
+ * exactly such a read as proof the agents were fine). And `PATCH /agents/:id`
+ * accepts `status:'paused'` while logging only `agent.updated` with
+ * `{changedTopLevelKeys:['status']}` — THE KEY, NEVER THE VALUE. A resolver
+ * that ignored that would print INVOKABLE for a PATCH-paused owner, which
+ * reads byte-identically to a true negative. So an unreadable tape, a window
+ * that does not reach the failure, or a status-touching PATCH all resolve
+ * UNKNOWN. ⛔ UNKNOWN IS NEVER THE BENIGN VALUE.
+ *
  * RECENCY — why a failed tail alone must not page (TRA-2871)
  * ----------------------------------------------------------
  * A failed tail PERSISTS until that routine's next successful slot, so one past
@@ -158,10 +203,24 @@
  *
  * BLIND outranks everything, including a zero count.
  *
- * This script performs GETs and NOTHING else.
+ * ⛔ A per-finding OWNER_STATE_UNKNOWN does NOT promote the run to BLIND. BLIND
+ * returns early and would suppress every other finding in the report, so an
+ * unattributable row would silence the rows that ARE attributable. It stays a
+ * finding at exit 1, is named in the report, and — because it is not in
+ * FLEET_STATES — can never be counted as evidence for a dispatcher claim.
+ *
+ * This script performs GETs and read-only SELECTs, and NOTHING else.
  */
 
 import { enumerateRoutines } from './lib/paperclip-enumeration.mjs';
+import {
+  OWNER_STATE,
+  blindTape,
+  emptyTape,
+  readPauseTapeFromPostgres,
+  resolveOwnerStateAt,
+  DEFAULT_DB_URL,
+} from './lib/paperclip-pause-tape.mjs';
 
 const argv = process.argv.slice(2);
 const argOf = (name, fallback) => {
@@ -349,18 +408,94 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
   return { state: 'HEALTHY', detail: `newest dispatch ${status} at ${triggeredAt}`, triggeredAt };
 }
 
+/**
+ * The owner-attributed splits of `LAST_DISPATCH_FAILED`. Findings, all three —
+ * the slot died either way and `skip_missed` will not replay it — but NOT
+ * dispatcher claims.
+ */
+export const OWNER_ATTRIBUTED_STATES = new Set([
+  'OWNER_PAUSED',
+  'OWNER_TERMINATED',
+  'OWNER_STATE_UNKNOWN',
+]);
+
 const FINDING_STATES = new Set([
   'LAST_DISPATCH_FAILED',
   'FIRE_WITHOUT_RUN',
   'DISPATCH_SKIPPED',
   'EXECUTION_ISSUE_ABANDONED',
+  ...OWNER_ATTRIBUTED_STATES,
 ]);
 /**
- * FLEET is a claim about the DISPATCHER. `EXECUTION_ISSUE_ABANDONED` is a claim
- * about work someone closed, which is owner-routable by construction and would
- * otherwise manufacture a platform verdict out of three cancelled tickets.
+ * FLEET is a claim about the DISPATCHER, so a state may only appear here if the
+ * dispatcher is the REMAINING subject once everything else has been ruled out.
+ *
+ * `EXECUTION_ISSUE_ABANDONED` is a claim about work someone closed, which is
+ * owner-routable by construction and would otherwise manufacture a platform
+ * verdict out of three cancelled tickets.
+ *
+ * ⛔ TRA-3487: the three OWNER_* states are held out for the same reason and it
+ * is the whole point of that ticket — a burst of paused owners is ONE
+ * condition whose subject is the OWNER, and letting it reach this set is how
+ * the banner came to assert a dispatcher fault twice a day. OWNER_STATE_UNKNOWN
+ * is held out too: an attribution we could not complete is not evidence FOR the
+ * dispatcher.
  */
 const FLEET_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DISPATCH_SKIPPED']);
+
+/**
+ * Re-attribute a `LAST_DISPATCH_FAILED` against the pause tape.
+ *
+ * ⛔ Resolved at the FAILURE INSTANT (`triggeredAt`), never at now — the owner
+ * has almost always been resumed by the time anyone reads the report, and
+ * `resume` erases `pausedAt`/`pauseReason` outright.
+ */
+export function attributeOwnerState(classified, { assigneeAgentId, tape }) {
+  if (classified.state !== 'LAST_DISPATCH_FAILED') return classified;
+
+  const atMs = Date.parse(classified.triggeredAt || '');
+  const { state, why } = resolveOwnerStateAt(tape, assigneeAgentId, atMs);
+
+  if (state === OWNER_STATE.PAUSED) {
+    return {
+      ...classified,
+      state: 'OWNER_PAUSED',
+      ownerState: state,
+      ownerWhy: why,
+      detail:
+        `the OWNER WAS PAUSED when this dispatch died — ${why}. The dispatcher did what it was told; ` +
+        'an agent in `paused` is not invokable, so this slot was destroyed at the gate. ' +
+        `⛔ Route to the owner/board, NOT the platform. (dispatcher said: ${JSON.stringify(classified.failureReason)})`,
+    };
+  }
+  if (state === OWNER_STATE.TERMINATED) {
+    return {
+      ...classified,
+      state: 'OWNER_TERMINATED',
+      ownerState: state,
+      ownerWhy: why,
+      detail:
+        `the OWNER WAS TERMINATED when this dispatch died — ${why}. No agent can repair this routine: ` +
+        'it needs a BOARD re-home to a live assignee. ' +
+        `(dispatcher said: ${JSON.stringify(classified.failureReason)})`,
+    };
+  }
+  if (state === OWNER_STATE.UNKNOWN) {
+    return {
+      ...classified,
+      state: 'OWNER_STATE_UNKNOWN',
+      ownerState: state,
+      ownerWhy: why,
+      detail:
+        `⛔ THE OWNER'S STATE AT THE FAILURE INSTANT COULD NOT BE RESOLVED — ${why}. ` +
+        'This is NOT "the owner was fine" and NOT a dispatcher fault: it is an unfinished attribution, ' +
+        `and it is excluded from the FLEET test for that reason. (dispatcher said: ${JSON.stringify(classified.failureReason)})`,
+    };
+  }
+
+  // INVOKABLE — the owner was up, so the dispatcher IS the remaining subject.
+  return { ...classified, ownerState: state, ownerWhy: why };
+}
 
 /* ------------------------------------------------------------------ *
  * The sweep — transport injected so the controls drive the whole pipeline,
@@ -377,6 +512,20 @@ export async function sweep(transport, opts = {}) {
 
   const { routines, blind: enumBlind, probe } = await enumerateRoutines(transport.getRoutines, { limit });
   if (enumBlind) return { verdict: 'BLIND', blind: enumBlind, findings: [], graded: 0, routineCount: 0 };
+
+  // ⛔ TRA-3487 — the owner-pause tape. A transport that cannot serve one
+  // yields a BLIND tape, and every dispatch failure it should have explained
+  // becomes OWNER_STATE_UNKNOWN. It must NOT fall through to the old behaviour,
+  // because "attribution is broken" and "the owner was not paused" would then
+  // render identically — the exact defect class this ticket is about.
+  let tape;
+  try {
+    tape = transport.getPauseTape
+      ? await transport.getPauseTape()
+      : blindTape('this transport has no `getPauseTape` reader');
+  } catch (err) {
+    tape = blindTape(`the pause-tape reader threw — ${err?.message || err}`);
+  }
 
   const population = [];
   const unreadable = [];
@@ -420,7 +569,10 @@ export async function sweep(transport, opts = {}) {
   const blindRows = [];
   const tally = {};
   for (const { routine, triggers } of population) {
-    const c = classifyDispatch(routine, triggers, { slackMs });
+    const c = attributeOwnerState(classifyDispatch(routine, triggers, { slackMs }), {
+      assigneeAgentId: routine.assigneeAgentId || null,
+      tape,
+    });
     tally[c.state] = (tally[c.state] || 0) + 1;
     if (c.state === 'BLIND') {
       blindRows.push({ id: routine.id, title: routine.title, reason: c.detail });
@@ -439,6 +591,8 @@ export async function sweep(transport, opts = {}) {
       parentIssueId: routine.parentIssueId || null,
       state: c.state,
       detail: c.detail,
+      ownerState: c.ownerState ?? null,
+      ownerWhy: c.ownerWhy ?? null,
       failureReason: c.failureReason ?? null,
       triggeredAt: c.triggeredAt ?? null,
       failedAt: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
@@ -475,10 +629,28 @@ export async function sweep(transport, opts = {}) {
   const dated = findings.map((f) => f.ageMs).filter((v) => typeof v === 'number');
   const newestFailureAgeMs = dated.length ? Math.min(...dated) : null;
 
+  // ⛔ TRA-3487 — the OWNER-side aggregate, computed on exactly the same axes as
+  // the dispatcher one so "roster-wide" means the same thing for both subjects.
+  // Without this a pause burst simply vanishes from the report: it is excluded
+  // from FLEET, and nothing else would have said the roster went down at once.
+  const pausedFindings = recentFindings.filter((f) => f.state === 'OWNER_PAUSED');
+  const pausedAssignees = new Set(pausedFindings.map((f) => f.assigneeAgentId || 'UNASSIGNED'));
+  const pausedShare = pausedFindings.length / population.length;
+  const ownerPauseBurst =
+    pausedFindings.length > 0 &&
+    (pausedAssignees.size >= FLEET_MIN_ASSIGNEES || pausedShare >= FLEET_MIN_SHARE);
+
   return {
     verdict: findings.length === 0 ? 'CLEAN' : fleet ? 'FLEET' : 'FINDINGS',
     blind: null,
     findings,
+    tape: { ok: tape?.ok === true, reason: tape?.ok === true ? null : tape?.reason || null, source: tape?.source || null },
+    ownerPausedCount: findings.filter((f) => f.state === 'OWNER_PAUSED').length,
+    ownerTerminatedCount: findings.filter((f) => f.state === 'OWNER_TERMINATED').length,
+    ownerUnknownCount: findings.filter((f) => f.state === 'OWNER_STATE_UNKNOWN').length,
+    ownerPauseBurst,
+    ownerPauseBurstAssignees: pausedAssignees.size,
+    ownerPauseBurstShare: pausedShare,
     graded: population.length,
     routineCount: routines.length,
     tally,
@@ -539,10 +711,71 @@ export function renderReport(r, names = {}) {
 
   if (r.verdict === 'FLEET') {
     out.push('');
+    // ⛔ TRA-3487 — NAME THE SUBJECT. This banner used to assert "ONE platform
+    // condition" unconditionally, which is a claim about the DISPATCHER that
+    // the check had no means to test. It may only be made about failures whose
+    // owner was proven INVOKABLE at the failure instant.
     out.push(
       `  FLEET — ${r.fleetCandidateCount} RECENT dispatch failures span ${r.distinctAssignees} distinct ` +
-        `assignees (${(r.share * 100).toFixed(0)}% of the armed population). This is ONE platform condition, ` +
+        `assignees (${(r.share * 100).toFixed(0)}% of the armed population). This is ONE condition, ` +
         `not ${r.fleetCandidateCount} routines to repair. ⛔ Do not file a ticket per routine.`,
+    );
+    out.push(
+      '  SUBJECT: THE DISPATCHER — and that is asserted, not assumed: every failure counted above was ' +
+        'resolved against the durable pause tape (`activity_log` agent.paused/agent.resumed/agent.terminated) ' +
+        'AT ITS FAILURE INSTANT, and its owner was invokable. Owner-paused, owner-terminated and ' +
+        'unattributable failures are excluded from this count.',
+    );
+    if (r.ownerUnknownCount > 0) {
+      out.push(
+        `  ⚠️ ${r.ownerUnknownCount} further failure(s) could NOT be attributed (OWNER_STATE_UNKNOWN). They ` +
+          'are not evidence for the dispatcher and are not counted above — but they mean this subject ' +
+          'attribution is INCOMPLETE. Read those rows before acting on this banner.',
+      );
+    }
+  }
+
+  // ⛔ TRA-3487 — the owner-side counterpart. A roster-wide pause is ALSO one
+  // condition; it is just not the dispatcher's. Per TRA-2871 it is in fact the
+  // MOST COMMON cause of a roster-wide burst, so it gets equal billing.
+  if (r.ownerPauseBurst) {
+    out.push('');
+    out.push(
+      `  OWNER PAUSE BURST — ${r.ownerPausedCount} of the findings are OWNER_PAUSED, spanning ` +
+        `${r.ownerPauseBurstAssignees} distinct assignees (${(r.ownerPauseBurstShare * 100).toFixed(0)}% of ` +
+        'the armed population). This is ONE condition and ⛔ ITS SUBJECT IS THE OWNER, NOT THE DISPATCHER: ' +
+        'those agents were `paused` at the instant their dispatches died, and a paused agent is not ' +
+        'invokable by construction.',
+    );
+    out.push(
+      '  ⛔ Do NOT file this against the platform, and do not file one ticket per routine. Route it to the ' +
+        'owner/board. The slots are gone — `skip_missed` does not replay them.',
+    );
+  } else if (r.ownerPausedCount > 0) {
+    out.push('');
+    out.push(
+      `  ${r.ownerPausedCount} of the findings are OWNER_PAUSED — the assignee was paused when the dispatch ` +
+        'died. ⛔ NOT dispatcher faults, and excluded from the FLEET test: route them to the owner/board.',
+    );
+  }
+
+  if (r.ownerTerminatedCount > 0) {
+    out.push('');
+    out.push(
+      `  ${r.ownerTerminatedCount} of the findings are OWNER_TERMINATED — the assignee no longer exists as a ` +
+        'live agent. ⛔ NO agent can repair these: the routine needs a BOARD re-home to a live assignee. ' +
+        'Excluded from the FLEET test.',
+    );
+  }
+
+  if (r.ownerUnknownCount > 0) {
+    out.push('');
+    out.push(
+      `  ⛔ ${r.ownerUnknownCount} of the findings are OWNER_STATE_UNKNOWN — this check could NOT establish ` +
+        'whether the owner was paused when the dispatch died. ' +
+        (r.tape && r.tape.ok === false ? `The pause tape itself is unreadable: ${r.tape.reason}. ` : '') +
+        'UNKNOWN IS NOT "the owner was fine" and is NOT a dispatcher fault. It is an unfinished attribution, ' +
+        'it is excluded from the FLEET test, and it is not CLEAN.',
     );
   }
 
@@ -621,9 +854,25 @@ function boardOf(rows, filler = 8) {
   return [...rows, ...pad];
 }
 
-function transportOf(rows) {
-  return { getRoutines: async () => rows };
+/**
+ * @param {object[]} rows
+ * @param {object} [tape] the pause tape. Defaults to a READABLE, EMPTY tape —
+ *   "the tape works and nobody was ever paused" — so the pre-TRA-3487 controls
+ *   keep asserting exactly what they asserted before. ⛔ It is deliberately not
+ *   `blindTape()`: a default of "unreadable" would flip every existing
+ *   LAST_DISPATCH_FAILED control to UNKNOWN and hide a real regression behind
+ *   a fixture choice.
+ */
+function transportOf(rows, tape) {
+  return { getRoutines: async () => rows, getPauseTape: async () => tape ?? emptyTape() };
 }
+
+/** A tape carrying `events`, covering everything since the epoch. */
+function tapeOf(events, over = {}) {
+  return emptyTape({ events, ...over });
+}
+
+const at = (s) => Date.parse(s);
 
 const CASES = [
   {
@@ -997,6 +1246,252 @@ const CASES = [
       assert(/0 rows/.test(r.blind), r.blind);
     },
   },
+
+  /* ---------------- TRA-3487 — owner attribution ---------------- */
+
+  {
+    name: '⛔ TRA-3487 #1 — owner PAUSED at the failure instant => OWNER_PAUSED, held OUT of the FLEET test',
+    rows: boardOf([
+      routineRow('r-paused', {
+        assigneeAgentId: 'agent-p',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T13:12:30.000Z',
+          failureReason: 'Agent is not invokable in its current state',
+        },
+      }),
+    ]),
+    tape: tapeOf([{ agentId: 'agent-p', kind: 'paused', atMs: at('2026-08-04T13:11:00.000Z') }]),
+    expect: (r) => {
+      assert(r.findings.length === 1, `expected 1 finding, got ${r.findings.length}`);
+      assert(r.findings[0].state === 'OWNER_PAUSED', r.findings[0].state);
+      assert(r.ownerPausedCount === 1, `ownerPausedCount=${r.ownerPausedCount}`);
+      assert(r.fleetCandidateCount === 0, `a paused owner must not be a FLEET candidate (got ${r.fleetCandidateCount})`);
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(/OWNER WAS PAUSED/.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — DISCRIMINATOR: owner paused but RESUMED before the failure => stays LAST_DISPATCH_FAILED',
+    rows: boardOf([
+      routineRow('r-resumed', {
+        assigneeAgentId: 'agent-p',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T20:50:00.000Z',
+          failureReason: 'Agent is not invokable in its current state',
+        },
+      }),
+    ]),
+    tape: tapeOf([
+      { agentId: 'agent-p', kind: 'paused', atMs: at('2026-08-04T13:11:00.000Z') },
+      { agentId: 'agent-p', kind: 'resumed', atMs: at('2026-08-04T20:32:00.000Z') },
+    ]),
+    expect: (r) => {
+      // Without this the resolver could be hard-wired to PAUSED and #1 would
+      // still pass. The pause is REAL and on the tape — it just ended first.
+      assert(r.findings[0].state === 'LAST_DISPATCH_FAILED', r.findings[0].state);
+      assert(r.findings[0].ownerState === 'INVOKABLE', String(r.findings[0].ownerState));
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — a pause AFTER the failure instant must not be back-dated onto it',
+    rows: boardOf([
+      routineRow('r-later', {
+        assigneeAgentId: 'agent-p',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:00:00.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    tape: tapeOf([{ agentId: 'agent-p', kind: 'paused', atMs: at('2026-08-04T18:00:00.000Z') }]),
+    expect: (r) => assert(r.findings[0].state === 'LAST_DISPATCH_FAILED', r.findings[0].state),
+  },
+  {
+    name: '⛔ TRA-3487 #2 — pause tape UNREADABLE => OWNER_STATE_UNKNOWN, never HEALTHY and never a dispatcher fault',
+    rows: boardOf([
+      routineRow('r-blindtape', {
+        assigneeAgentId: 'agent-p',
+        lastRun: {
+          status: 'failed',
+          triggeredAt: '2026-08-04T13:12:30.000Z',
+          failureReason: 'Agent is not invokable in its current state',
+        },
+      }),
+    ]),
+    tape: blindTape('the `pg` driver could not be resolved'),
+    expect: (r) => {
+      assert(r.findings.length === 1, `an unattributable failure is still a FINDING (got ${r.findings.length})`);
+      assert(r.findings[0].state === 'OWNER_STATE_UNKNOWN', r.findings[0].state);
+      assert(r.verdict !== 'CLEAN', 'UNKNOWN is never CLEAN');
+      assert(r.fleetCandidateCount === 0, 'an unattributed failure is not evidence for the dispatcher');
+      assert(r.tape.ok === false, 'the report must carry the tape failure');
+      assert(/pg. driver/.test(renderReport(r).join('\n')), 'the report must NAME why attribution failed');
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — transport with NO pause-tape reader at all => UNKNOWN, not the old behaviour',
+    rows: boardOf([
+      routineRow('r-notape', {
+        assigneeAgentId: 'agent-p',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:30.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    // Bypasses transportOf's healthy default entirely — this is the shape a
+    // caller wired before TRA-3487 would present.
+    transport: (rows) => ({ getRoutines: async () => rows }),
+    expect: (r) => assert(r.findings[0].state === 'OWNER_STATE_UNKNOWN', r.findings[0].state),
+  },
+  {
+    name: '⛔⛔ TRA-3487 — an `agent.updated` PATCH touching `status` => UNKNOWN (the platform logs the KEY, not the VALUE)',
+    rows: boardOf([
+      routineRow('r-patched', {
+        assigneeAgentId: 'agent-p',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-12T06:00:00.000Z', failureReason: 'boom' },
+        triggers: [
+          { kind: 'schedule', enabled: true, cronExpression: '0 6 * * *', timezone: 'UTC', nextRunAt: FUTURE, lastFiredAt: '2026-08-12T06:00:00.000Z' },
+        ],
+      }),
+    ]),
+    now: '2026-08-12T12:00:00.000Z',
+    tape: tapeOf([
+      // The owner was resumed long ago — so WITHOUT the patch this is INVOKABLE.
+      { agentId: 'agent-p', kind: 'resumed', atMs: at('2026-08-04T20:32:00.000Z') },
+      // `PATCH /agents/:id` accepts `status:'paused'` and logs only
+      // `{changedTopLevelKeys:['status']}`. This is a REAL row on this company
+      // (2026-08-12T04:47:17.629Z, agent 671785a4).
+      { agentId: 'agent-p', kind: 'status_patch', atMs: at('2026-08-12T04:47:17.629Z') },
+    ]),
+    expect: (r) => {
+      assert(r.findings[0].state === 'OWNER_STATE_UNKNOWN', r.findings[0].state);
+      assert(/never the value/i.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name: '⛔ TRA-3487 #2b — tape coverage floor is AFTER the failure => UNKNOWN, not "no pause found"',
+    rows: boardOf([
+      routineRow('r-short', {
+        assigneeAgentId: 'agent-p',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:30.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    // The exact shape the API-only read would have produced: a 3.4h window that
+    // does not reach the failure. Zero events found — which must NOT read as
+    // "the owner was never paused".
+    tape: tapeOf([], { floorMs: at('2026-08-04T18:00:00.000Z') }),
+    expect: (r) => {
+      assert(r.findings[0].state === 'OWNER_STATE_UNKNOWN', r.findings[0].state);
+      assert(/PREDATES/.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — owner TERMINATED => OWNER_TERMINATED, held out of FLEET (needs a BOARD re-home)',
+    rows: boardOf([
+      routineRow('r-dead-owner', {
+        assigneeAgentId: 'agent-gone',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:30.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    tape: tapeOf([{ agentId: 'agent-gone', kind: 'terminated', atMs: at('2026-06-07T01:43:16.957Z') }]),
+    expect: (r) => {
+      assert(r.findings[0].state === 'OWNER_TERMINATED', r.findings[0].state);
+      assert(r.ownerTerminatedCount === 1, String(r.ownerTerminatedCount));
+      assert(r.fleetCandidateCount === 0, 'a terminated owner is not a dispatcher fault');
+      assert(/BOARD re-home/.test(renderReport(r).join('\n')), 'the report must name the remedy');
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — an UNASSIGNED routine cannot be attributed => UNKNOWN, not INVOKABLE',
+    rows: boardOf([
+      routineRow('r-noowner', {
+        assigneeAgentId: null,
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T13:12:30.000Z', failureReason: 'boom' },
+      }),
+    ]),
+    expect: (r) => assert(r.findings[0].state === 'OWNER_STATE_UNKNOWN', r.findings[0].state),
+  },
+  {
+    name: '⛔⛔ TRA-3487 #3 — ROSTER-WIDE PAUSE BURST => the "ONE platform condition" dispatcher banner must NOT print',
+    rows: boardOf(
+      ['a', 'b', 'c', 'd'].map((k) =>
+        routineRow(`r-burst-${k}`, {
+          assigneeAgentId: `agent-${k}`,
+          lastRun: {
+            status: 'failed',
+            triggeredAt: '2026-08-04T13:12:30.000Z',
+            failureReason: 'Agent is not invokable in its current state',
+          },
+        }),
+      ),
+    ),
+    // The 2026-08-04T13:12Z burst, in miniature: 100% roster coverage of paused
+    // agents. 4 findings over 12 armed = 33% and 4 distinct assignees, so this
+    // WOULD trip both FLEET thresholds if the owner state were ignored.
+    tape: tapeOf(
+      ['a', 'b', 'c', 'd'].map((k) => ({
+        agentId: `agent-${k}`,
+        kind: 'paused',
+        atMs: at('2026-08-04T13:11:00.000Z'),
+      })),
+    ),
+    expect: (r) => {
+      const text = renderReport(r).join('\n');
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS (owner-routable), got ${r.verdict}`);
+      assert(r.ownerPausedCount === 4, String(r.ownerPausedCount));
+      assert(r.ownerPauseBurst === true, 'the burst must be recognised as ONE owner-side condition');
+      assert(!/ONE platform condition/.test(text), 'the dispatcher banner must not print for a pause burst');
+      assert(!/SUBJECT: THE DISPATCHER/.test(text), 'the dispatcher must not be named as the subject');
+      assert(/OWNER PAUSE BURST/.test(text), 'the owner-side banner must print instead');
+      assert(/ITS SUBJECT IS THE OWNER/.test(text), text.slice(0, 400));
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — REGRESSION: a real dispatcher burst with provably invokable owners STILL reaches FLEET',
+    rows: boardOf(
+      ['a', 'b', 'c', 'd'].map((k) =>
+        routineRow(`r-real-${k}`, {
+          assigneeAgentId: `agent-${k}`,
+          lastRun: { status: 'failed', triggeredAt: '2026-08-04T20:50:00.000Z', failureReason: 'ECONNREFUSED' },
+        }),
+      ),
+    ),
+    tape: tapeOf(
+      ['a', 'b', 'c', 'd'].map((k) => ({
+        agentId: `agent-${k}`,
+        kind: 'resumed',
+        atMs: at('2026-08-04T20:32:00.000Z'),
+      })),
+    ),
+    expect: (r) => {
+      const text = renderReport(r).join('\n');
+      assert(r.verdict === 'FLEET', `expected FLEET, got ${r.verdict}`);
+      assert(r.fleetCandidateCount === 4, String(r.fleetCandidateCount));
+      assert(/SUBJECT: THE DISPATCHER/.test(text), 'FLEET must NAME the subject it asserts');
+    },
+  },
+  {
+    name: '⛔ TRA-3487 — a FLEET burst alongside unattributable rows must DISCLOSE the incomplete attribution',
+    rows: boardOf([
+      ...['a', 'b', 'c'].map((k) =>
+        routineRow(`r-mix-${k}`, {
+          assigneeAgentId: `agent-${k}`,
+          lastRun: { status: 'failed', triggeredAt: '2026-08-04T20:50:00.000Z', failureReason: 'ECONNREFUSED' },
+        }),
+      ),
+      routineRow('r-mix-unknown', {
+        assigneeAgentId: 'agent-z',
+        lastRun: { status: 'failed', triggeredAt: '2026-08-04T20:50:00.000Z', failureReason: 'ECONNREFUSED' },
+      }),
+    ]),
+    tape: tapeOf([
+      ...['a', 'b', 'c'].map((k) => ({ agentId: `agent-${k}`, kind: 'resumed', atMs: at('2026-08-04T20:32:00.000Z') })),
+      { agentId: 'agent-z', kind: 'status_patch', atMs: at('2026-08-04T20:40:00.000Z') },
+    ]),
+    expect: (r) => {
+      const text = renderReport(r).join('\n');
+      assert(r.verdict === 'FLEET', `expected FLEET, got ${r.verdict}`);
+      assert(r.ownerUnknownCount === 1, String(r.ownerUnknownCount));
+      assert(/attribution is INCOMPLETE/.test(text), 'the banner must disclose the unattributed rows');
+    },
+  },
 ];
 
 async function selftest() {
@@ -1007,7 +1502,7 @@ async function selftest() {
       // Every control runs against a FIXED clock. The recency axis makes the
       // verdict a function of wall-time, and a control that drifts with the
       // calendar stops being a control.
-      const r = await sweep(transportOf(c.rows), {
+      const r = await sweep(c.transport ? c.transport(c.rows) : transportOf(c.rows, c.tape), {
         nowMs: Date.parse(c.now || '2026-08-04T21:00:00.000Z'),
       });
       seen.add(r.verdict);
@@ -1035,7 +1530,30 @@ async function selftest() {
     console.log(`FAIL  GLOBAL write-verb control\n        ${err.message}`);
   }
 
-  const total = CASES.length + 1;
+  // GLOBAL — the pause tape reads the platform's OWN database. It must SELECT
+  // and nothing else; the server owns that DB.
+  try {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync(new URL('./lib/paperclip-pause-tape.mjs', import.meta.url), 'utf8');
+    const sql = src.match(/client\.query\(\s*(`[^`]*`|'[^']*')/g) || [];
+    assert(sql.length > 0, 'no SQL found in the pause-tape reader — the control cannot be checked');
+    for (const s of sql) {
+      assert(
+        /^\s*(`|')\s*select\b/i.test(s.replace(/client\.query\(\s*/, '')),
+        `a non-SELECT statement appears in the pause-tape reader: ${s.slice(0, 80)}`,
+      );
+    }
+    assert(
+      !/\b(insert|update|delete|drop|alter|truncate|create)\s+(into|from|table|set)\b/i.test(src),
+      'a write statement appears in the pause-tape reader',
+    );
+    console.log(`ok    GLOBAL — the pause tape SELECTs and nothing else (${sql.length} statements checked)`);
+    pass += 1;
+  } catch (err) {
+    console.log(`FAIL  GLOBAL pause-tape read-only control\n        ${err.message}`);
+  }
+
+  const total = CASES.length + 2;
   console.log('');
   console.log(`${pass}/${total} controls pass; verdicts reachable: ${[...seen].sort().join(', ')}`);
   for (const v of ['CLEAN', 'FINDINGS', 'FLEET', 'BLIND']) {
@@ -1071,6 +1589,17 @@ function liveTransport() {
     listAgents: async () => unwrap(await get(`${BASE}/api/companies/${CO}/agents`), 'agents') || [],
     getRoutines: async ({ limit, offset }) =>
       unwrap(await get(`${BASE}/api/companies/${CO}/routines?limit=${limit}&offset=${offset}`), 'routines'),
+    // ⛔ TRA-3487 — read from Postgres, NOT from `/api/.../activity`. Measured
+    // on that route: the `action` filter is SILENTLY IGNORED (a query for
+    // `agent.paused` returns the newest unfiltered rows), and `limit=1000`
+    // yields 500 rows covering ~3.4h. Both failures are invisible in the
+    // response, which would make a short/wrong window read as "no pause found".
+    getPauseTape: async () =>
+      readPauseTapeFromPostgres({
+        companyId: CO,
+        connectionString: argOf('pause-db', process.env.PAPERCLIP_DB_URL || DEFAULT_DB_URL),
+        pgModulePath: process.env.PAPERCLIP_PG_MODULE || null,
+      }),
   };
 }
 
@@ -1101,6 +1630,11 @@ async function main() {
           graded: result.graded,
           tally: result.tally,
           distinctAssignees: result.distinctAssignees,
+          tape: result.tape,
+          ownerPausedCount: result.ownerPausedCount,
+          ownerTerminatedCount: result.ownerTerminatedCount,
+          ownerUnknownCount: result.ownerUnknownCount,
+          ownerPauseBurst: result.ownerPauseBurst,
           recentCount: result.recentCount,
           residueOnly: result.residueOnly,
           recentWindowMs: result.recentWindowMs,
