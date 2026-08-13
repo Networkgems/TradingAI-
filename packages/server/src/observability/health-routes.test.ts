@@ -4164,6 +4164,58 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     return h;
   }
 
+  /**
+   * TRA-3464 — one engine's interlock-region terms, in BOTH scopes.
+   *
+   * The RTH bins are fully drivable so a test can emit a boundary region, a
+   * closed region and a cold-boot region ON DEMAND, and can break
+   * `partitionHolds` on purpose. The DEFAULT is the self-consistent case (every
+   * lifetime region is an RTH region, nothing excluded), which is what the
+   * pre-TRA-3464 fixtures were implicitly asserting when they read the region
+   * terms as if they were RTH-scoped — the exact confusion this ticket removes,
+   * made explicit here rather than left to position.
+   */
+  function regionTerms(o: {
+    samples: number; sumMs: number; maxMs: number;
+    work?: { samples: number; sumMs: number; maxMs: number } | null;
+    rth?: Partial<ExitCadenceHealth['tickExitRegionMs']['rth']>;
+  }): ExitCadenceHealth['tickExitRegionMs'] {
+    const rth = o.rth ?? {};
+    const rthSamples = rth.samples ?? o.samples;
+    const boundaryRegions = rth.boundaryRegions ?? 0;
+    const closedRegions = rth.closedRegions ?? 0;
+    const bootRegionMs = rth.bootRegionMs ?? null;
+    const bootRegionExcluded = rth.bootRegionExcluded ?? bootRegionMs != null;
+    return {
+      lastMs: o.samples > 0 ? o.maxMs : null,
+      maxMs: o.samples > 0 ? o.maxMs : null,
+      samples: o.samples,
+      sumMs: o.sumMs,
+      atOrAbove20s: 0,
+      atOrAbove30s: 0,
+      exitWorkMs: o.work ?? null,
+      rth: {
+        window: 'rth',
+        samples: rthSamples,
+        sumMs: rth.sumMs ?? o.sumMs,
+        maxMs: rth.maxMs !== undefined ? rth.maxMs : (rthSamples > 0 ? o.maxMs : null),
+        atOrAbove20s: rth.atOrAbove20s ?? 0,
+        atOrAbove30s: rth.atOrAbove30s ?? 0,
+        exitWorkMs: rth.exitWorkMs !== undefined ? rth.exitWorkMs : (o.work ?? null),
+        boundaryRegions,
+        closedRegions,
+        bootRegionExcluded,
+        bootRegionMs,
+        // Computed, not asserted-in: a fixture that hand-set this could publish
+        // `partitionHolds: true` over bins that do not add up, which is precisely
+        // the thing the flag exists to catch.
+        partitionHolds:
+          rth.partitionHolds
+          ?? (o.samples === rthSamples + boundaryRegions + closedRegions + (bootRegionExcluded ? 1 : 0)),
+      },
+    };
+  }
+
   function exitEngine(o: {
     engine?: string;
     /** TRA-2645 — `unknown` so a control can drive the `mode: null` / absent-key shapes. */
@@ -4196,8 +4248,7 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
       tickPassCount: o.rthTick ?? 0,
       decoupledSkips: emptyDecoupledExitSkips(),
       decoupledFireCount: 0,
-      tickExitRegionMs: o.tickExitRegionMs
-        ?? { lastMs: null, maxMs: null, samples: 0, sumMs: 0, atOrAbove20s: 0, atOrAbove30s: 0, exitWorkMs: null },
+      tickExitRegionMs: o.tickExitRegionMs ?? regionTerms({ samples: 0, sumMs: 0, maxMs: 0 }),
       rth: {
         intervalHistogram: exitHistogram(o.rth.under, o.rth.over),
         decoupledPassCount: o.rthDecoupled ?? 1,
@@ -4621,18 +4672,12 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
     // be able to publish a real split AND to refuse when it has no measurement,
     // and the refusal must be `null`, not a zero that reads like a measurement.
     describe('TRA-3444 exit-work split', () => {
-      const region = (o: {
-        samples: number; sumMs: number; maxMs: number;
-        work?: { samples: number; sumMs: number; maxMs: number } | null;
-      }): ExitCadenceHealth['tickExitRegionMs'] => ({
-        lastMs: o.samples > 0 ? o.maxMs : null,
-        maxMs: o.samples > 0 ? o.maxMs : null,
-        samples: o.samples,
-        sumMs: o.sumMs,
-        atOrAbove20s: 0,
-        atOrAbove30s: 0,
-        exitWorkMs: o.work ?? null,
-      });
+      // TRA-3464 — these fixtures put every region in the RTH bin, which is what
+      // TRA-3444's split was always ABOUT ("the RTH-scoped PREFIX/exit-work
+      // split", `exit-cadence-snapshot.ts`). Before this ticket the field these
+      // tests read was the lifetime accumulator and the RTH scoping was
+      // asserted only in prose; now the fixture states it.
+      const region = regionTerms;
 
       it('publishes `exitWorkMs` under BOTH books and at the fleet level', () => {
         const body = rollUpExitCadence([
@@ -4708,6 +4753,163 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
           }),
         ]);
         expect(body.books.demo.tickExitRegionMs!.exitWorkMs).toEqual({ samples: 900, sumMs: 810_000, maxMs: 4_100 });
+      });
+    });
+
+    // TRA-3464 — `books.<book>.tickExitRegionMs` USED TO BE the fleet-summed
+    // lifetime accumulator copied one level down and emitted as a sibling of the
+    // RTH-only terms. A per-book copy of a fleet field is not a partition: it
+    // mislabels the accumulator BY POSITION, and position is the only label most
+    // readers ever read.
+    //
+    // The measured proof, bqb1 `10e68acf9c2e` 2026-08-13 — a book reporting ZERO
+    // RTH intervals and refusing to grade published 6810 region samples one key
+    // over, under a payload whose top level said `window: "rth"`:
+    //
+    //     books.demo.samples                  = 0
+    //     books.demo.verdict                  = "armed_but_no_rth_interval"
+    //     books.demo.tickExitRegionMs.samples = 6810
+    describe('TRA-3464 — the region terms are RTH-scoped per book, and the lifetime ones are demoted', () => {
+      it('reproduces the filing shape and shows it FIXED: 0 RTH intervals no longer publishes lifetime regions at the RTH level', () => {
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'demo-1', mode: 'demo',
+            lifetime: { under: 6_748, over: 0 }, rth: { under: 0, over: 0 },
+            tickExitRegionMs: regionTerms({
+              samples: 6_810, sumMs: 1_300_953, maxMs: 15_772,
+              // Post-close boot: one cold-boot region, the rest closed-market.
+              rth: { samples: 0, sumMs: 0, maxMs: null, closedRegions: 6_809, bootRegionMs: 4_200, exitWorkMs: null },
+            }),
+          }),
+        ]);
+        const demo = body.books.demo;
+        expect(demo.verdict).toBe('armed_but_no_rth_interval');
+        expect(demo.samples).toBe(0);
+        // THE FIX. The RTH-level field now agrees with its RTH-level siblings.
+        expect(demo.tickExitRegionMs!.window).toBe('rth');
+        expect(demo.tickExitRegionMs!.samples).toBe(0);
+        expect(demo.tickExitRegionMs!.maxMs).toBeNull();
+        expect(demo.tickExitRegionMs!.exitWorkMs).toBeNull();
+        // The numbers are NOT gone. They MOVED, unchanged.
+        expect(demo.lifetime!.tickExitRegionMs.samples).toBe(6_810);
+        expect(demo.lifetime!.tickExitRegionMs.maxMs).toBe(15_772);
+        // And the excluded regions are visible rather than vanished.
+        expect(demo.tickExitRegionMs!.closedRegions).toBe(6_809);
+        expect(demo.tickExitRegionMs!.bootRegionExcluded).toBe(true);
+        expect(demo.tickExitRegionMs!.bootRegionsExcluded).toBe(1);
+        expect(demo.tickExitRegionMs!.bootRegionMaxMs).toBe(4_200);
+        expect(demo.tickExitRegionMs!.partitionHolds).toBe(true);
+      });
+
+      it('does not let the DEMO book\'s regions reach the LIVE book\'s RTH terms', () => {
+        // The other axis of the same defect. The published fleet `maxMs 14121`
+        // on 2026-08-13 was the LIVE book's max wearing an unscoped name; the
+        // reverse — a fat demo region setting a live max — is the direction that
+        // would put a false RED on the money book.
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'live-1', mode: 'live', lifetime: { under: 10, over: 0 }, rth: { under: 10, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 334, sumMs: 900_000, maxMs: 5_000, rth: { samples: 333, bootRegionMs: 800, sumMs: 899_200, maxMs: 5_000 } }),
+          }),
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 10, over: 0 }, rth: { under: 10, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 6_810, sumMs: 1_300_953, maxMs: 14_121, rth: { samples: 6_809, bootRegionMs: 900, sumMs: 1_300_053, maxMs: 14_121 } }),
+          }),
+        ]);
+        expect(body.books.live.tickExitRegionMs!.maxMs).toBe(5_000);
+        expect(body.books.demo.tickExitRegionMs!.maxMs).toBe(14_121);
+        // The deprecated top-level spelling still carries the unscoped max — it
+        // is deleted in the next deploy generation, and this asserts WHY.
+        expect(body.tickExitRegionMs.maxMs).toBe(14_121);
+        expect(body.tickExitRegionMs.samples).toBe(334 + 6_810);
+      });
+
+      it('counts one boot exclusion PER ENGINE and closes the partition over the whole book', () => {
+        // A book has up to 57 engines and each drops its own cold-boot region.
+        // A boolean cannot be summed, so `bootRegionsExcluded` is the term the
+        // partition needs; `bootRegionMaxMs` / `bootRegionSumMs` are named as
+        // aggregates rather than as a bare `bootRegionMs`, because an unscoped
+        // scalar over N engines is this ticket's own defect.
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 10, sumMs: 50_000, maxMs: 9_000, rth: { samples: 6, boundaryRegions: 2, closedRegions: 1, bootRegionMs: 9_000 } }),
+          }),
+          exitEngine({
+            engine: 'demo-2', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 4, sumMs: 20_000, maxMs: 3_000, rth: { samples: 1, boundaryRegions: 1, closedRegions: 1, bootRegionMs: 2_500 } }),
+          }),
+        ]);
+        const r = body.books.demo.tickExitRegionMs!;
+        expect(r.bootRegionsExcluded).toBe(2);
+        expect(r.bootRegionMaxMs).toBe(9_000);
+        expect(r.bootRegionSumMs).toBe(11_500);
+        // 14 === 7 + 3 + 2 + 2
+        expect(body.books.demo.lifetime!.tickExitRegionMs.samples).toBe(14);
+        expect(r.samples).toBe(7);
+        expect(r.boundaryRegions).toBe(3);
+        expect(r.closedRegions).toBe(2);
+        expect(r.partitionHolds).toBe(true);
+      });
+
+      it('BREAKS `partitionHolds` when an engine loses a region — the flag is controllable in both directions', () => {
+        // A flag observed only true has been shown to be quiet, not to work.
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            // 10 lifetime regions, but the bins only account for 8 (6+1+0+boot).
+            tickExitRegionMs: regionTerms({ samples: 10, sumMs: 50_000, maxMs: 9_000, rth: { samples: 6, boundaryRegions: 1, closedRegions: 0, bootRegionMs: 900 } }),
+          }),
+        ]);
+        expect(body.books.demo.tickExitRegionMs!.partitionHolds).toBe(false);
+      });
+
+      it('REFUSES a book-level true that two cancelling engines would sum into', () => {
+        // The summed identity alone is satisfiable by a population in which NO
+        // member satisfies it: engine A over-counts by 2, engine B under-counts
+        // by 2. An aggregate invariant a mixed population can pass while every
+        // member fails is not an invariant, so `partitionHolds` requires BOTH
+        // arms.
+        const body = rollUpExitCadence([
+          exitEngine({
+            engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 10, sumMs: 10, maxMs: 1, rth: { samples: 11, boundaryRegions: 0, closedRegions: 0, bootRegionMs: 1, partitionHolds: false } }),
+          }),
+          exitEngine({
+            engine: 'demo-2', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 },
+            tickExitRegionMs: regionTerms({ samples: 10, sumMs: 10, maxMs: 1, rth: { samples: 7, boundaryRegions: 0, closedRegions: 0, bootRegionMs: 1, partitionHolds: false } }),
+          }),
+        ]);
+        const r = body.books.demo.tickExitRegionMs!;
+        // The SUMMED identity passes: 20 === 18 + 0 + 0 + 2.
+        expect(body.books.demo.lifetime!.tickExitRegionMs.samples).toBe(20);
+        expect(r.samples + r.boundaryRegions + r.closedRegions + r.bootRegionsExcluded).toBe(20);
+        // The published flag does NOT.
+        expect(r.partitionHolds).toBe(false);
+      });
+
+      it('nulls every new term on a BLIND book — never a 0, which reads like a measurement', () => {
+        const body = rollUpExitCadence([]);
+        expect(body.books.live.blind).toBe(true);
+        expect(body.books.live.tickExitRegionMs).toBeNull();
+        expect(body.books.live.lifetime).toBeNull();
+        expect(body.books.demo.tickExitRegionMs).toBeNull();
+        expect(body.books.demo.lifetime).toBeNull();
+      });
+
+      it('publishes `window: "rth"` as a LITERAL so a reader can fail closed on a pre-TRA-3464 build', () => {
+        // The marker is the whole reason the defect was catchable at all: a
+        // payload whose `books.<book>.tickExitRegionMs` carries no `window` key
+        // is the old build, where that field IS the lifetime accumulator.
+        const body = rollUpExitCadence([
+          exitEngine({ engine: 'live-1', mode: 'live', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 } }),
+          exitEngine({ engine: 'demo-1', mode: 'demo', lifetime: { under: 5, over: 0 }, rth: { under: 5, over: 0 } }),
+        ]);
+        expect(body.books.live.tickExitRegionMs!.window).toBe('rth');
+        expect(body.books.demo.tickExitRegionMs!.window).toBe('rth');
+        // …and the lifetime block deliberately does NOT carry it: it is not RTH,
+        // and a `window` key there would rebuild the ambiguity one level down.
+        expect(body.books.live.lifetime!.tickExitRegionMs).not.toHaveProperty('window');
       });
     });
   });

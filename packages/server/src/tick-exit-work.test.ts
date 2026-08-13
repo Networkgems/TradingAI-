@@ -24,6 +24,10 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { TickExitWorkMeter } from './tick-exit-work.js';
+import type { TickExitRegionBin } from './tick-exit-region.js';
+
+/** TRA-3464 — this module's own source, for the "no second RTH test lives here" assertion. */
+const METER_SRC = readFileSync(fileURLToPath(new URL('./tick-exit-work.ts', import.meta.url)), 'utf8');
 
 /** A controllable clock, so a "duration" in these tests is an exact number and not a flake. */
 function fakeClock(): { now: () => number; advance: (ms: number) => void } {
@@ -44,7 +48,7 @@ describe('TRA-3444: the meter', () => {
     m2.measure(() => { c.advance(400); });
     expect(m2.snapshot()).toBeNull();
 
-    m2.commitRegion();
+    m2.commitRegion('rth');
     expect(m2.snapshot()).toEqual({ samples: 1, sumMs: 400, maxMs: 400 });
   });
 
@@ -56,13 +60,13 @@ describe('TRA-3444: the meter', () => {
     meter.measure(() => { c.advance(120); });          // equity pass
     c.advance(9_000);                                   // reconciles — PREFIX, not measured
     meter.measure(() => { c.advance(880); });          // options pass
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 1_000, maxMs: 1_000 });
 
     // A quieter second region must not pull the max down.
     meter.beginRegion();
     meter.measure(() => { c.advance(50); });
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 2, sumMs: 1_050, maxMs: 1_000 });
   });
 
@@ -76,7 +80,7 @@ describe('TRA-3444: the meter', () => {
       throw new Error('checkExits blew up');
     })).toThrow('checkExits blew up');
 
-    meter.commitRegion();
+    meter.commitRegion('rth');
     // Un-attributed, that 700ms would have silently become PREFIX.
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 700, maxMs: 700 });
   });
@@ -91,7 +95,7 @@ describe('TRA-3444: the meter', () => {
       throw new Error('submitStagedOptionExits blew up');
     })).rejects.toThrow('submitStagedOptionExits blew up');
 
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 2_500, maxMs: 2_500 });
   });
 
@@ -110,7 +114,7 @@ describe('TRA-3444: the meter', () => {
     const meter = new TickExitWorkMeter(c.now);
     meter.beginRegion();
     c.advance(31_000);
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 0, maxMs: 0 });
   });
 
@@ -119,9 +123,9 @@ describe('TRA-3444: the meter', () => {
     const meter = new TickExitWorkMeter(c.now);
     meter.beginRegion();
     meter.measure(() => { c.advance(300); });
-    meter.commitRegion();
-    meter.commitRegion();
-    meter.commitRegion();
+    meter.commitRegion('rth');
+    meter.commitRegion('rth');
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 300, maxMs: 300 });
   });
 
@@ -135,7 +139,7 @@ describe('TRA-3444: the meter', () => {
     meter.measure(() => { c.advance(5_000); });
     meter.beginRegion();
     meter.measure(() => { c.advance(100); });
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 100, maxMs: 100 });
   });
 
@@ -145,7 +149,7 @@ describe('TRA-3444: the meter', () => {
     meter.beginRegion();
     meter.measure(() => { t = -4_000; });   // NTP step / container migration
     meter.measure(() => { t += 600; });
-    meter.commitRegion();
+    meter.commitRegion('rth');
     expect(meter.snapshot()).toEqual({ samples: 1, sumMs: 600, maxMs: 600 });
   });
 
@@ -178,7 +182,7 @@ describe('TRA-3444: the meter', () => {
         } catch { /* runTickGuarded swallows it; the region still closes */ }
       }
       regionSumMs += c.now() - openedAt;
-      meter.commitRegion();
+      meter.commitRegion('rth');
     }
 
     const snap = meter.snapshot()!;
@@ -323,28 +327,102 @@ describe('TRA-3444: the bracket covers the two exit passes and NOTHING else', ()
     expect(REFRESH_EXITS_ONLY).not.toContain('tickExitWork');
   });
 
-  it('uses the meter in exactly five places, all of them named', () => {
-    // Pins the whole surface: arm, two brackets, commit, read. Anything else
-    // touching this meter is a change to what the published number MEANS.
-    expect(countOf(ENGINE_SRC, 'this.tickExitWork.')).toBe(5);
+  it('uses the meter in exactly six places, all of them named', () => {
+    // Pins the whole surface: arm, two brackets, commit, and TWO reads (TRA-3464
+    // added the RTH-scoped one). Anything else touching this meter is a change
+    // to what the published number MEANS.
+    expect(countOf(ENGINE_SRC, 'this.tickExitWork.')).toBe(6);
     expect(countOf(ENGINE_SRC, 'this.tickExitWork.beginRegion()')).toBe(1);
-    expect(countOf(ENGINE_SRC, 'this.tickExitWork.commitRegion()')).toBe(1);
+    expect(countOf(ENGINE_SRC, 'this.tickExitWork.commitRegion(bin)')).toBe(1);
     expect(countOf(ENGINE_SRC, 'this.tickExitWork.snapshot()')).toBe(1);
+    expect(countOf(ENGINE_SRC, 'this.tickExitWork.rthSnapshot()')).toBe(1);
     // Armed and committed in lockstep with the flag+clock they split.
     expect(methodBody('private openTickExitRegion(): void')).toContain('this.tickExitWork.beginRegion()');
-    expect(methodBody('private releaseTickExitRegion(): void')).toContain('this.tickExitWork.commitRegion()');
+    expect(methodBody('private releaseTickExitRegion(): void')).toContain('this.tickExitWork.commitRegion(bin)');
   });
 
   it('commits the region sample and the exit-work sample under the SAME idempotency guard', () => {
     // `releaseTickExitRegion` returns early on a second release. If the commit
     // sat above that guard, `exitWorkMs.samples` would drift away from
     // `tickExitRegionMs.samples` and the two would stop describing one population.
+    //
+    // TRA-3464 — the guard MOVED into `TickExitRegionMeter.release()`, which
+    // returns null on the second release. Same guard, one indirection out: the
+    // engine now books nothing anywhere unless it got a bin back.
     const body = methodBody('private releaseTickExitRegion(): void');
-    const guard = body.indexOf('if (this.tickExitRegionOpenedAt <= 0) return;');
-    const commit = body.indexOf('this.tickExitWork.commitRegion()');
-    const sample = body.indexOf('this.tickExitRegionSamples += 1');
-    expect(guard).toBeGreaterThanOrEqual(0);
-    expect(sample).toBeGreaterThan(guard);
+    const release = body.indexOf('this.tickExitRegion.release()');
+    const guard = body.indexOf('if (bin == null) return;');
+    const commit = body.indexOf('this.tickExitWork.commitRegion(bin)');
+    expect(release).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeGreaterThan(release);
     expect(commit).toBeGreaterThan(guard);
+  });
+
+  // TRA-3464 — TRA-2698 ordered that this accumulator inherit the region's RTH
+  // predicate rather than carry its own. Two measurements of ONE region that
+  // disagree about which regions count surface downstream as a phase split whose
+  // parts do not reconcile with their own denominator (TRA-3443).
+  //
+  // These are the controls in BOTH directions: the RTH scope must be able to
+  // publish a real split, to EXCLUDE what the region meter excluded, and to
+  // refuse with `null` rather than a zero that reads like a measurement.
+  describe('TRA-3464 — the RTH predicate is inherited, not re-derived', () => {
+    const meterWith = (bins: readonly TickExitRegionBin[], msPerRegion: number) => {
+      const c = fakeClock();
+      const m = new TickExitWorkMeter(c.now);
+      for (const bin of bins) {
+        m.beginRegion();
+        m.measure(() => { c.advance(msPerRegion); });
+        m.commitRegion(bin);
+      }
+      return m;
+    };
+
+    it('books EVERY bin into lifetime and only `rth` into the RTH scope', () => {
+      const m = meterWith(['boot', 'closed', 'rth', 'boundary', 'rth'], 100);
+      // Lifetime counts all five — it is the denominator the region partition is
+      // checked against, so it must not be shrunk by the bins that drop samples.
+      expect(m.snapshot()).toEqual({ samples: 5, sumMs: 500, maxMs: 100 });
+      expect(m.rthSnapshot()).toEqual({ samples: 2, sumMs: 200, maxMs: 100 });
+    });
+
+    it('REFUSES with null when no RTH region has committed, while lifetime answers', () => {
+      // The post-close boot: the process measured real work, none of it in the
+      // window. `{samples: 0, sumMs: 0}` here would be the TRA-2698 defect
+      // rebuilt one field down — a book that measured nothing in the window
+      // publishing numbers that read like a measurement.
+      const m = meterWith(['boot', 'closed', 'closed'], 250);
+      expect(m.snapshot()).toEqual({ samples: 3, sumMs: 750, maxMs: 250 });
+      expect(m.rthSnapshot()).toBeNull();
+    });
+
+    it('keeps a SEPARATE max per scope, so a fat closed-market region cannot inflate the RTH max', () => {
+      // The direction that matters: an overnight region is exactly the sample
+      // that would set an unscoped max, and TRA-2268 reads the max.
+      const c = fakeClock();
+      const m = new TickExitWorkMeter(c.now);
+      m.beginRegion(); m.measure(() => { c.advance(30_000); }); m.commitRegion('closed');
+      m.beginRegion(); m.measure(() => { c.advance(700); }); m.commitRegion('rth');
+      expect(m.snapshot()?.maxMs).toBe(30_000);
+      expect(m.rthSnapshot()?.maxMs).toBe(700);
+    });
+
+    it('does not re-derive the bin — the ONLY RTH test reachable from here is the caller\'s argument', () => {
+      // The structural half of "inherit the identical predicate". If this module
+      // ever grows its own market-hours read, the two accumulators can disagree
+      // about one region, which is the failure TRA-2698 ordered against.
+      //
+      // Asserted against CALL syntax, not the bare names: a doc comment that
+      // explains WHY the predicate is inherited necessarily names it, and a
+      // grader that fails on the explanation of its own rule is a grader that
+      // gets deleted.
+      expect(METER_SRC).not.toMatch(/isStockMarketOpen\s*\(/);
+      expect(METER_SRC).not.toMatch(/classifyExitInterval\s*\(/);
+      // And the engine hands over the SAME value it classified with, not a
+      // recomputation: one `release()`, one `bin`, both consumers downstream.
+      const body = methodBody('private releaseTickExitRegion(): void');
+      expect(body).toContain('const bin = this.tickExitRegion.release();');
+      expect(body).toContain('this.tickExitWork.commitRegion(bin);');
+    });
   });
 });

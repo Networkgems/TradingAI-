@@ -24,6 +24,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
+import { EXIT_CADENCE_NOT_DIFFERENCEABLE } from './observability/exit-cadence-snapshot.js';
+
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 const SCRIPT = join(REPO, 'scripts', 'tra3443-exit-region-taxonomy.mjs');
 const CENSUS_0812 = join(REPO, 'scripts', 'fixtures', 'tra3443-census-2026-08-12.json');
@@ -75,11 +77,23 @@ function routeRead(o: {
   demoArm?: BookArm;
 }): unknown {
   const region = (b: BookCounters) => ({
+    // TRA-3464 — the per-book field is RTH-scoped now and says so as a LITERAL.
+    // The reader fails closed on its absence (absent ⇒ pre-TRA-3464 build ⇒ that
+    // field is the lifetime accumulator wearing an RTH-scoped position), so a
+    // fixture without it exercises the refusal, not the grade.
+    window: 'rth',
     samples: b.samples,
     sumMs: b.sumMs,
     maxMs: 999,
     atOrAbove20s: 0,
     atOrAbove30s: 0,
+    boundaryRegions: 0,
+    closedRegions: 0,
+    bootRegionExcluded: false,
+    bootRegionsExcluded: 0,
+    bootRegionMaxMs: null,
+    bootRegionSumMs: null,
+    partitionHolds: true,
     ...(b.work ? { exitWorkMs: { samples: b.work.samples, sumMs: b.work.sumMs, maxMs: 99 } } : {}),
   });
   const fleet: BookCounters = {
@@ -571,6 +585,40 @@ describe('TRA-3507 #8: a disarmed book reports <<DISARMED>>, never a number and 
     expect(out).not.toContain('CROSS-CHECK (positive control)');
   });
 
+  it('TRA-3464 — withholds the fleet cross-check on a PRE-TRA-3464 payload, and says why', () => {
+    // The cross-check is now summed from `books.<book>.tickExitRegionMs`, which
+    // is RTH-scoped as of TRA-3464 and carries `window: "rth"` as a literal. On
+    // an older build that same path IS the lifetime accumulator, so summing it
+    // would cross-check an RTH split against a lifetime one — and a control that
+    // disagrees for a reason unrelated to its subject is worse than no control,
+    // because the disagreement gets attributed to the subject.
+    //
+    // The literal is the discriminator, so strip it and nothing else.
+    const strip = (path: string) => {
+      const read = JSON.parse(readFileSync(path, 'utf8')) as {
+        books: Record<string, { tickExitRegionMs: Record<string, unknown> }>;
+      };
+      for (const b of Object.values(read.books)) delete b.tickExitRegionMs.window;
+      return fixture(read);
+    };
+    const { t0, t1 } = healthyPair();
+    const { status, out } = run([`--exit-cadence-t0=${strip(t0)}`, `--exit-cadence-t1=${strip(t1)}`]);
+    // The per-book grade still publishes — the books' own counters are readable
+    // either way, and withholding them would be a bigger claim than the evidence
+    // supports. Only the CROSS-CHECK is withheld.
+    expect(status, out).toBe(0);
+    expect(out).toContain('fleet cross-check is WITHHELD');
+    expect(out).toContain('pre-TRA-3464 build');
+    expect(out).not.toContain('CROSS-CHECK (positive control)');
+  });
+
+  it('TRA-3464 — and PUBLISHES the cross-check when the literal IS there (the control has both directions)', () => {
+    const { t0, t1 } = healthyPair();
+    const { status, out } = run([`--exit-cadence-t0=${t0}`, `--exit-cadence-t1=${t1}`]);
+    expect(status, out).toBe(0);
+    expect(out).not.toContain('fleet cross-check is WITHHELD');
+  });
+
   it('PUBLISHES both books when both are armed (not a rubber stamp)', () => {
     const { status, out } = run([`--exit-cadence-t1=${rthPair({ enabled: true, armedEngineCount: 2 })}`]);
     expect(status, out).toBe(0);
@@ -615,7 +663,13 @@ describe('TRA-3496: notDifferenceable is READ, never typed', () => {
     const { status, out } = run([`--exit-cadence-t0=${t0}`, `--exit-cadence-t1=${t1}`]);
     expect(status, out).toBe(0);
     expect(out).toContain('exit-cadence-snapshot.ts');
-    expect(out).toContain('6 entries, honoured');
+    // TRA-3464 — the COUNT is derived from the constant, not typed. A literal
+    // `6` here is the same fossil this test exists to forbid one level out: the
+    // list grew when the lifetime terms were demoted to their own paths, and a
+    // hard-coded count would have failed on a correct change while proving
+    // nothing about the mechanism.
+    expect(out).toContain(`${EXIT_CADENCE_NOT_DIFFERENCEABLE.length} entries, honoured`);
+    expect(EXIT_CADENCE_NOT_DIFFERENCEABLE.length).toBeGreaterThan(0);
   });
 
   it('REFUSES rather than falling back to a typed list when the source will not parse', () => {

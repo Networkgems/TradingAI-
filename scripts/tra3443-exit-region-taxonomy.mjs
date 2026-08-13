@@ -635,7 +635,17 @@ function loadCadenceRead(file, mark) {
  * which the caller asserts.
  */
 function zeroReadAtBoot(t1) {
-  const zero = () => ({ samples: 0, sumMs: 0, exitWorkMs: { samples: 0, sumMs: 0 } });
+  // TRA-3464 — `window: 'rth'` is carried on the synthetic T0 because the T1 it
+  // is differenced against carries it, and the reader FAILS CLOSED on its
+  // absence (absent ⇒ pre-TRA-3464 build ⇒ that field is the lifetime
+  // accumulator). A synthetic read that cannot state its own scope would be
+  // rejected by the very guard it exists to satisfy.
+  //
+  // The zero itself is MORE defensible after TRA-3464, not less: the boot
+  // instant is now genuinely excluded from the RTH population by the boot guard,
+  // so "zero RTH region time at boot" is a fact about the instrument rather than
+  // an assumption about the process.
+  const zero = () => ({ window: 'rth', samples: 0, sumMs: 0, exitWorkMs: { samples: 0, sumMs: 0 } });
   const books = {};
   for (const b of Object.keys(t1.rollup.books ?? {})) books[b] = { tickExitRegionMs: zero() };
   return {
@@ -886,15 +896,48 @@ function gradeUncensored(t0, t1, snapModule) {
   // It is WITHHELD outright when any book is suppressed: a fleet sum that folds a
   // disarmed book's idle time into an armed book's is a contaminated positive
   // control, and a contaminated control agrees with anything.
+  //
+  // TRA-3464 — THIS IS SUMMED FROM THE BOOKS, NOT READ OFF `$.tickExitRegionMs`.
+  //
+  // It used to read the top-level field, and that field is now deprecated (it is
+  // deleted in the next deploy generation). But the reason to move it is not the
+  // deletion — moving early only avoids a future edit. The reason is that the
+  // top-level field was never RTH-scoped, and as of TRA-3464 the per-book fields
+  // ARE. Left alone, this "cross-check" would have compared an RTH-scoped
+  // per-book split against a LIFETIME fleet split and disagreed on every run
+  // that spanned a boot or an overnight — a control that disagrees for a reason
+  // unrelated to what it controls is worse than no control, because the
+  // disagreement gets attributed to the subject.
+  //
+  // ⚠️ This is a 4th/5th consumer of a kind `tsc` cannot see: a `.mjs` script,
+  // reaching in through `getPath()` with STRING paths. Neither the typechecker
+  // nor a named-field grep of the TS sources would have named it. Reported on
+  // TRA-3464 as a finding, not fixed silently.
   let fleet = null;
-  const fr1 = t1.rollup.tickExitRegionMs;
-  const fr0 = t0.rollup.tickExitRegionMs;
-  if (!suppressedNames.length && fr1?.exitWorkMs && fr0?.exitWorkMs) {
-    const regionMs = (fr1.sumMs ?? 0) - (fr0.sumMs ?? 0);
-    const workMs = (fr1.exitWorkMs.sumMs ?? 0) - (fr0.exitWorkMs.sumMs ?? 0);
+  const sumBooks = (read) => {
+    const parts = ['live', 'demo'].map(b => getPath(read.rollup, `books.${b}.tickExitRegionMs`));
+    if (parts.some(p => !p || p.window !== 'rth' || !p.exitWorkMs)) return null;
+    return {
+      sumMs: parts.reduce((n, p) => n + (p.sumMs ?? 0), 0),
+      workMs: parts.reduce((n, p) => n + (p.exitWorkMs.sumMs ?? 0), 0),
+    };
+  };
+  const fr1 = sumBooks(t1);
+  const fr0 = sumBooks(t0);
+  if (!suppressedNames.length && fr1 && fr0) {
+    const regionMs = fr1.sumMs - fr0.sumMs;
+    const workMs = fr1.workMs - fr0.workMs;
     if (regionMs > 0 && workMs >= 0 && workMs <= regionMs) {
       fleet = { regionMs, workMs, prefixMs: regionMs - workMs, prefixShare: (regionMs - workMs) / regionMs };
     }
+  } else if (!suppressedNames.length && !(fr1 && fr0)) {
+    // FAIL CLOSED on a pre-TRA-3464 payload. Without the `window: 'rth'` literal
+    // the per-book field IS the lifetime accumulator, and summing two of those
+    // would produce a cross-check that silently disagrees with the books it is
+    // meant to check.
+    notes.push('the fleet cross-check is WITHHELD: at least one read carries no `books.<book>.tickExitRegionMs.window` '
+      + '=== "rth" (a pre-TRA-3464 build, where that field is the LIFETIME accumulator sitting among RTH-scoped '
+      + 'siblings) or no `exitWorkMs`. Summing those would cross-check an RTH split against a lifetime one.');
   }
   if (suppressedNames.length) {
     notes.push(`the fleet aggregate is WITHHELD because ${suppressedNames.join(', ')} ${suppressedNames.length > 1 ? 'are' : 'is'} `

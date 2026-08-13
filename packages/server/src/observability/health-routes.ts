@@ -2730,6 +2730,17 @@ export interface ExitCadenceLifetimeTerms {
   atOrAbove30s: number;
   p99Under30s: boolean | null;
   intervalHistogram: Record<ExitIntervalBucket, number>;
+  /**
+   * TRA-3464 — the interlock-region accumulator, DEMOTED to where it belongs.
+   *
+   * These are the exact numbers that used to be published as
+   * `books.<book>.tickExitRegionMs` (and fleet-summed at the top level): every
+   * closed region since boot, no market-hours predicate, no boot guard. They are
+   * the right population for "is the interlock being held at all" and the WRONG
+   * one for TRA-2268's narrowing decision. Same demotion, same reason, as the
+   * interval terms beside them.
+   */
+  tickExitRegionMs: ExitCadenceTickRegionTerms;
 }
 
 /**
@@ -2775,6 +2786,77 @@ export interface ExitCadenceTickRegionTerms {
 }
 
 /**
+ * TRA-3464 — TRA-2257's suppression window, RTH-SCOPED AND BOOT-GUARDED, per
+ * book. This is the spelling TRA-2268's narrowing decision and TRA-2305's
+ * measurement should read.
+ *
+ * WHAT THIS REPLACES. `books.<book>.tickExitRegionMs` used to be
+ * `sumTickExitRegion(engines)` — the same unfiltered lifetime-since-boot
+ * accumulator the top level published, copied one level down and emitted as a
+ * sibling of the RTH-only terms (`samples`, `atOrAbove30s`, `p99Under30s`,
+ * `intervalHistogram`), while `books.<book>.lifetime` carried no region terms at
+ * all. A PER-BOOK COPY OF A FLEET FIELD IS NOT A PARTITION: it mislabels the
+ * accumulator BY POSITION, and position is the only label most readers ever
+ * read. Measured on bqb1 `10e68acf9c2e`, 2026-08-13:
+ *
+ *     books.demo.samples                  = 0     <- RTH intervals: NONE
+ *     books.demo.verdict                  = "armed_but_no_rth_interval"
+ *     books.demo.lifetime.samples         = 6748
+ *     books.demo.tickExitRegionMs.samples = 6810  <- at the RTH level, IS lifetime
+ *     $.window                            = "rth"
+ *
+ * The lifetime numbers are not deleted, they are DEMOTED to
+ * `lifetime.tickExitRegionMs`, unchanged.
+ */
+export interface ExitCadenceTickRegionRthTerms {
+  /** Literal, so a reader cannot mistake the scope by position. */
+  window: 'rth';
+  /** Regions with BOTH endpoints inside 09:30-16:00 ET, cold-boot region excluded. */
+  samples: number;
+  sumMs: number;
+  maxMs: number | null;
+  atOrAbove20s: number;
+  atOrAbove30s: number;
+  /** TRA-3444's split over THIS population. Null until an RTH region commits — never zero-filled. */
+  exitWorkMs: ExitCadenceExitWorkTerms | null;
+  /** Regions with one endpoint each side of the open or the close. */
+  boundaryRegions: number;
+  /** Regions with both endpoints outside RTH. */
+  closedRegions: number;
+  /** Did the cold-boot guard fire on ANY engine in this book. */
+  bootRegionExcluded: boolean;
+  /**
+   * HOW MANY engines dropped a cold-boot region — one per engine, so this is the
+   * term the book-level partition needs. The per-engine boolean cannot be summed
+   * and a book has up to 57 engines in it.
+   */
+  bootRegionsExcluded: number;
+  /**
+   * The LARGEST cold-boot region dropped in this book, and their total. Null when
+   * the guard has not fired.
+   *
+   * Deliberately NOT spelled `bootRegionMs`. At ENGINE level that name denotes
+   * exactly one region and is unambiguous (and `engines[].tickExitRegionMs.rth`
+   * publishes it under that name); at BOOK level it would be an aggregate over N
+   * engines wearing an unscoped scalar name, which is the defect this whole
+   * ticket exists to remove.
+   */
+  bootRegionMaxMs: number | null;
+  bootRegionSumMs: number | null;
+  /**
+   * `lifetime.tickExitRegionMs.samples === samples + boundaryRegions +
+   *  closedRegions + bootRegionsExcluded`, AND every engine's own copy of that
+   *  identity holds.
+   *
+   * Both arms, because the summed identity alone can be satisfied by two engines
+   * whose errors cancel. Excluded regions are COUNTED, NOT DROPPED: a silently
+   * shrunken denominator is the failure this route was rebuilt to prevent, and
+   * this is how a reader would find out the classifier was wrong.
+   */
+  partitionHolds: boolean;
+}
+
+/**
  * TRA-2645 — ONE BOOK's exit-cadence rollup. This is the unit that can be
  * graded: `mode=live` engines share a broker, capital and flag source with each
  * other and with NOTHING in the demo fleet (`signal-engine.ts` resolves
@@ -2815,7 +2897,12 @@ export interface ExitCadenceBookRollup {
   tickPassCount: number | null;
   decoupledFireCount: number | null;
   decoupledSkips: Record<DecoupledExitSkipReason, number> | null;
-  tickExitRegionMs: ExitCadenceTickRegionTerms | null;
+  /**
+   * TRA-3464 — GRADED (RTH-only, boot-guarded) region terms. Was the fleet-summed
+   * lifetime accumulator; those numbers moved to `lifetime.tickExitRegionMs`
+   * unchanged.
+   */
+  tickExitRegionMs: ExitCadenceTickRegionRthTerms | null;
 }
 
 /**
@@ -2881,9 +2968,23 @@ export interface ExitCadenceRollup {
   decoupledSkips: Record<DecoupledExitSkipReason, number>;
   /**
    * doTick's exit-interlock suppression window, FLEET-SUMMED over every engine
-   * with no RTH predicate and no boot guard. Left fleet-scoped deliberately —
-   * TRA-2305/TRA-2268 grade this exact accumulator and moving it would silently
-   * change someone else's subject. Per-book copies are in `books`.
+   * with no RTH predicate and no boot guard.
+   *
+   * ⛔ TRA-3464 — DEPRECATED, AND SCHEDULED FOR DELETION IN THE NEXT DEPLOY
+   * GENERATION. Do not add a reader.
+   *
+   * It survives exactly one generation because TRA-2698's migration order is
+   * ADD-then-verify-then-migrate-then-REMOVE, and compressing that would take
+   * the field out from under TRA-2305/TRA-2268 before either had a replacement
+   * path named on its own thread. The replacements, both already live beside it:
+   *
+   *   - `books.<book>.tickExitRegionMs`          — RTH-scoped, boot-guarded
+   *   - `books.<book>.lifetime.tickExitRegionMs` — these exact numbers, per book
+   *
+   * Its defect is not just the missing predicate: it is FLEET-summed, so on
+   * 2026-08-13 its `{samples 7143}` was `books.live {333}` + `books.demo {6810}`
+   * and its published `maxMs 14121` was the LIVE book's max wearing an unscoped
+   * name. There is no population this field is a statement about.
    */
   tickExitRegionMs: ExitCadenceTickRegionTerms;
   rthDecoupledShareFloor: number;
@@ -2939,15 +3040,66 @@ const atOrAbove30sOfExitHistogram = (h: Record<ExitIntervalBucket, number>) =>
  * did no exit work". If NO engine can answer, the population cannot answer, and
  * the result is `null` — never a zero-filled object.
  */
-function sumTickExitWork(engines: ExitCadenceHealth[]): ExitCadenceExitWorkTerms | null {
-  const terms = engines
-    .map((e) => e.tickExitRegionMs.exitWorkMs)
-    .filter((w): w is ExitCadenceExitWorkTerms => w != null);
+function sumTickExitWork(
+  engines: ExitCadenceHealth[],
+  pick: (e: ExitCadenceHealth) => ExitCadenceExitWorkTerms | null,
+): ExitCadenceExitWorkTerms | null {
+  const terms = engines.map(pick).filter((w): w is ExitCadenceExitWorkTerms => w != null);
   if (terms.length === 0) return null;
   return {
     samples: terms.reduce((n, w) => n + w.samples, 0),
     sumMs: terms.reduce((n, w) => n + w.sumMs, 0),
     maxMs: terms.reduce((m, w) => (w.maxMs > m ? w.maxMs : m), 0),
+  };
+}
+
+const maxOverEngines = (
+  engines: ExitCadenceHealth[],
+  pick: (e: ExitCadenceHealth) => number | null,
+) =>
+  engines.reduce<number | null>((acc, e) => {
+    const v = pick(e);
+    return v != null && (acc == null || v > acc) ? v : acc;
+  }, null);
+
+/**
+ * TRA-3464 — sum the RTH-SCOPED, BOOT-GUARDED region terms over a book.
+ *
+ * Every engine classified its own regions with its own `isStockMarketOpen`
+ * reads, so this is a sum of per-engine partitions and NOT a re-classification —
+ * there is no second RTH test anywhere in this file.
+ *
+ * `partitionHolds` is computed BOTH ways deliberately. The summed identity is
+ * the one a reader can verify from the published numbers; the per-engine `every`
+ * is what stops two engines with cancelling errors from summing to a true. An
+ * aggregate invariant that a mixed population can satisfy while no member does
+ * is not an invariant.
+ */
+function sumTickExitRegionRth(engines: ExitCadenceHealth[]): ExitCadenceTickRegionRthTerms {
+  const rth = engines.map((e) => e.tickExitRegionMs.rth);
+  const bootRegions = rth.map((r) => r.bootRegionMs).filter((m): m is number => m != null);
+  const samples = rth.reduce((n, r) => n + r.samples, 0);
+  const boundaryRegions = rth.reduce((n, r) => n + r.boundaryRegions, 0);
+  const closedRegions = rth.reduce((n, r) => n + r.closedRegions, 0);
+  const bootRegionsExcluded = bootRegions.length;
+  const lifetimeSamples = engines.reduce((n, e) => n + e.tickExitRegionMs.samples, 0);
+  return {
+    window: 'rth',
+    samples,
+    sumMs: rth.reduce((n, r) => n + r.sumMs, 0),
+    maxMs: maxOverEngines(engines, (e) => e.tickExitRegionMs.rth.maxMs),
+    atOrAbove20s: rth.reduce((n, r) => n + r.atOrAbove20s, 0),
+    atOrAbove30s: rth.reduce((n, r) => n + r.atOrAbove30s, 0),
+    exitWorkMs: sumTickExitWork(engines, (e) => e.tickExitRegionMs.rth.exitWorkMs),
+    boundaryRegions,
+    closedRegions,
+    bootRegionExcluded: bootRegionsExcluded > 0,
+    bootRegionsExcluded,
+    bootRegionMaxMs: bootRegions.length > 0 ? Math.max(...bootRegions) : null,
+    bootRegionSumMs: bootRegions.length > 0 ? bootRegions.reduce((n, m) => n + m, 0) : null,
+    partitionHolds:
+      rth.every((r) => r.partitionHolds)
+      && lifetimeSamples === samples + boundaryRegions + closedRegions + bootRegionsExcluded,
   };
 }
 
@@ -2963,7 +3115,7 @@ function sumTickExitRegion(engines: ExitCadenceHealth[]): ExitCadenceTickRegionT
     ),
     atOrAbove20s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove20s, 0),
     atOrAbove30s: engines.reduce((n, e) => n + e.tickExitRegionMs.atOrAbove30s, 0),
-    exitWorkMs: sumTickExitWork(engines),
+    exitWorkMs: sumTickExitWork(engines, (e) => e.tickExitRegionMs.exitWorkMs),
   };
 }
 
@@ -3193,12 +3345,18 @@ export function gradeExitCadenceBook(
       atOrAbove30s: lifetimeAtOrAbove30s,
       p99Under30s: lifetimeSamples > 0 ? lifetimeAtOrAbove30s / lifetimeSamples < 0.01 : null,
       intervalHistogram: lifetimeHistogram,
+      // TRA-3464 — the region accumulator, byte-for-byte what
+      // `books.<book>.tickExitRegionMs` used to carry, moved to the scope it was
+      // always computed over. A reader diffing the two builds sees these numbers
+      // stand still and the RTH ones appear; nothing was silently recomputed.
+      tickExitRegionMs: sumTickExitRegion(engines),
     },
     decoupledPassCount,
     tickPassCount,
     decoupledFireCount,
     decoupledSkips,
-    tickExitRegionMs: sumTickExitRegion(engines),
+    // TRA-3464 — GRADED SCOPE. RTH-only, boot-guarded, exclusions counted.
+    tickExitRegionMs: sumTickExitRegionRth(engines),
   };
 }
 
@@ -3322,14 +3480,32 @@ export function rollUpExitCadence(engines: ExitCadenceHealth[]): ExitCadenceRoll
       + '`tick_dominated_window` and refuses rather than grading doTick as the hoist. All '
       + 'counters are strictly monotonic within a process, so two same-process snapshots '
       + '(assert identical `build.startedAt` AND `build.pid`) difference cleanly into any '
-      + 'sub-window. The TOP-LEVEL `tickExitRegionMs` is FLEET-SUMMED with no RTH predicate and '
-      + 'no boot guard (TRA-2305/TRA-2268 grade that exact accumulator, so it is deliberately '
-      + 'left fleet-scoped; per-book copies are in `books`). It is the suppression window doTick '
-      + 'holds the exit interlock for (news + social + market-review + journal + '
-      + 'tradier-balance + the 568-symbol quote-batch + 3 reconciles + '
-      + 'shadow-chases): worst-case exit interval is bounded by THAT plus the '
-      + 'timer period, never by the timer period alone, so a region at or above '
-      + '30s makes `p99Under30s` unreachable however well the timer behaves.',
+      + 'sub-window. '
+      + 'TRA-3464: `books.<book>.tickExitRegionMs` is the SUPPRESSION WINDOW doTick holds the exit '
+      + 'interlock for (news + social + market-review + journal + tradier-balance + the 568-symbol '
+      + 'quote-batch + 3 reconciles + shadow-chases), and it is now RTH-SCOPED AND BOOT-GUARDED like '
+      + 'everything beside it: it carries `window: "rth"` as a literal and counts ONLY regions with '
+      + 'BOTH endpoints inside 09:30-16:00 ET, classified by the SAME `isStockMarketOpen` the '
+      + 'decoupled gate itself refuses on. Worst-case exit interval is bounded by THAT plus the timer '
+      + 'period, never by the timer period alone, so a region at or above 30s makes `p99Under30s` '
+      + 'unreachable however well the timer behaves — which is why it has to be measured over the '
+      + 'window it is a claim about. Excluded regions are COUNTED, NOT DROPPED: '
+      + '`lifetime.tickExitRegionMs.samples === tickExitRegionMs.samples + boundaryRegions + '
+      + 'closedRegions + bootRegionsExcluded` (`partitionHolds`, which additionally requires every '
+      + 'engine\'s own copy of that identity to hold, so two engines with cancelling errors cannot '
+      + 'sum to a true). The COLD-BOOT region — the first region each engine closes, carrying '
+      + 'cold-start work no steady-state region carries and therefore a plausible candidate for the '
+      + 'published `maxMs` — is excluded ahead of the RTH test and PUBLISHED as `bootRegionMaxMs` / '
+      + '`bootRegionSumMs` rather than dropped: a guard whose effect is unobservable cannot be told '
+      + 'apart from a guard that never fired. The pre-TRA-3464 lifetime numbers are not gone, they '
+      + 'are DEMOTED unchanged to `books.<book>.lifetime.tickExitRegionMs`. ⛔ The TOP-LEVEL '
+      + '`tickExitRegionMs` is DEPRECATED and is deleted in the next deploy generation: it is '
+      + 'fleet-summed with no RTH predicate and no boot guard, so on 2026-08-13 its `samples 7143` '
+      + 'was `books.live 333` + `books.demo 6810` and its `maxMs 14121` was the LIVE book\'s max '
+      + 'wearing an unscoped name. Read `books.<book>.tickExitRegionMs`; do not add a reader of the '
+      + 'top-level spelling. A payload whose `books.<book>.tickExitRegionMs` carries NO `window` key '
+      + 'is a pre-TRA-3464 build where that field is the LIFETIME accumulator sitting among '
+      + 'RTH-scoped siblings — FAIL CLOSED on its absence, do not read it as the graded scope.',
   };
 }
 

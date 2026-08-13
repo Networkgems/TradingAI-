@@ -178,8 +178,15 @@ describe('TRA-2840 — the line itself', () => {
     });
     expect(line.rollup.books.live.tickExitRegionMs!.maxMs).toBe(52_310);
     expect(line.notDifferenceable).toContain('books.live.tickExitRegionMs.maxMs');
-    expect(line.notDifferenceable).toContain('tickExitRegionMs.maxMs');
     expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain('books.demo.tickExitRegionMs.maxMs');
+    // TRA-3464 — the unscoped `tickExitRegionMs.maxMs` entry is GONE with the
+    // field it named. A running maximum did not stop existing, it MOVED: the
+    // lifetime numbers are now per book under `lifetime`, and an unlisted
+    // maximum is one a differencing consumer will happily subtract.
+    expect(line.notDifferenceable).not.toContain('tickExitRegionMs.maxMs');
+    for (const book of ['books.live', 'books.demo']) {
+      expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain(`${book}.lifetime.tickExitRegionMs.maxMs`);
+    }
   });
 
   it('TRA-3444 — the exit-work MAX is not differenceable; its counters are', () => {
@@ -187,8 +194,10 @@ describe('TRA-2840 — the line itself', () => {
     // parent, and `T1 - T0` on it is a subtraction of two extremes.
     for (const book of ['books.live', 'books.demo']) {
       expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain(`${book}.tickExitRegionMs.exitWorkMs.maxMs`);
+      // TRA-3464 — and the same quantity in the demoted lifetime scope.
+      expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain(`${book}.lifetime.tickExitRegionMs.exitWorkMs.maxMs`);
     }
-    expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).toContain('tickExitRegionMs.exitWorkMs.maxMs');
+    expect(EXIT_CADENCE_NOT_DIFFERENCEABLE).not.toContain('tickExitRegionMs.exitWorkMs.maxMs');
 
     // …and the OTHER direction, which is the half that matters: differencing
     // `exitWorkMs.sumMs` / `samples` against `tickExitRegionMs.sumMs` across a

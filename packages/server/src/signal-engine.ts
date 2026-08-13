@@ -68,6 +68,7 @@ import { getUserMemorySync, recordInteractionOutcome } from './user-trading-memo
 import { getLatestMarketReview } from './market-review.js';
 import { withPhase, timeSyncPhase } from './phase-timing.js';
 import { TickExitWorkMeter, type TickExitWorkTerms } from './tick-exit-work.js';
+import { TickExitRegionMeter, classifyExitInterval, type TickExitRegionRthTerms } from './tick-exit-region.js';
 import { trySma200ScanSlot, releaseSma200ScanSlot } from './sma200-scan-admission.js';
 import { getLatestReviewBlock } from './research-store.js';
 import { earningsInDaysSync } from './earnings-store.js';
@@ -1100,27 +1101,15 @@ export function bucketExitInterval(intervalMs: number): ExitIntervalBucket {
  * TRA-2269 — which population an exit-evaluation interval belongs to, from the
  * market state at each of its two endpoints.
  *
- * Only `rth` is graded. The asymmetry is deliberate and fail-CLOSED: an interval
- * is admitted only when BOTH endpoints were inside 09:30-16:00 ET, because the
- * decoupled timer refuses on `marketClosed` by design, so any interval with a
- * closed-market endpoint spent part of its length in a window the subject was
- * forbidden to run in — it grades doTick, not the hoist. `boundary` (exactly one
- * endpoint inside) is excluded but COUNTED, so the three bins partition the
- * lifetime histogram exactly and the route can publish a checkable invariant
- * instead of a silently lossy filter.
- *
- * `prevMarketOpen` is null only before the first pass, where there is no
- * interval to classify at all; treating it as non-RTH is unreachable in practice
- * and harmless if it were.
+ * TRA-3464 MOVED THE DEFINITION to `tick-exit-region.ts` and re-exports it here.
+ * It is unchanged, and this spelling stays because it is the one every existing
+ * caller and test imports. The move exists so `TickExitRegionMeter` can call the
+ * SAME function without importing `signal-engine.ts` (which imports it back —
+ * a cycle). Two copies of an RTH test is exactly what TRA-2269 forbids: if the
+ * population filter and the subject's own gate can disagree, a sample can be
+ * admitted to a window its producer was forbidden to run in.
  */
-export function classifyExitInterval(
-  prevMarketOpen: boolean | null,
-  marketOpen: boolean,
-): 'rth' | 'boundary' | 'closed' {
-  if (prevMarketOpen === null) return 'closed';
-  if (prevMarketOpen && marketOpen) return 'rth';
-  return prevMarketOpen === marketOpen ? 'closed' : 'boundary';
-}
+export { classifyExitInterval } from './tick-exit-region.js';
 
 /** Zeroed histogram over {@link EXIT_INTERVAL_BUCKETS}. */
 export function emptyExitIntervalHistogram(): Record<ExitIntervalBucket, number> {
@@ -1206,6 +1195,30 @@ export interface ExitCadenceHealth {
      * NULL until the first region closes (TRA-1707 null discipline); never 0.
      */
     exitWorkMs: TickExitWorkTerms | null;
+    /**
+     * TRA-3464 — THE SAME REGION MEASUREMENT, SCOPED TO THE WINDOW IT IS A
+     * STATEMENT ABOUT, and boot-guarded.
+     *
+     * Everything above this line is a LIFETIME-since-boot accumulator with no
+     * market-hours predicate. Until TRA-3464 that accumulator was published
+     * fleet-summed at the route's top level AND copied per book as a sibling of
+     * the RTH-only terms, which mislabelled it BY POSITION: on 2026-08-13
+     * `books.demo` read `samples: 0` / `verdict: "armed_but_no_rth_interval"`
+     * next to `tickExitRegionMs.samples: 6810`, under `window: "rth"`.
+     *
+     * `rth.samples` counts REGIONS with both endpoints inside 09:30-16:00 ET,
+     * classified by the producer's own `isStockMarketOpen`. The cold-boot region
+     * is excluded ahead of that classification and published as
+     * `rth.bootRegionMs` — a guard whose effect is unobservable cannot be
+     * distinguished from a guard that never fired, and the excluded sample is a
+     * plausible candidate for the published `maxMs`.
+     *
+     * INVARIANT the route can be read against, exactly like the interval
+     * partition one field down: `samples === rth.samples + rth.boundaryRegions
+     * + rth.closedRegions + (rth.bootRegionExcluded ? 1 : 0)`, published as
+     * `rth.partitionHolds`.
+     */
+    rth: TickExitRegionRthTerms & { exitWorkMs: TickExitWorkTerms | null };
   };
   /**
    * TRA-2269 — the SAME instrument, scoped to the window it is a statement about.
@@ -3257,20 +3270,23 @@ export class SignalEngine {
    * suppressor of the 10s timer, so the region's duration — not the timer's
    * period — is what sets the worst-case exit-evaluation interval, and it is
    * therefore the quantity TRA-2213's `p99Under30s` leg is really grading.
+   *
+   * TRA-3464 — the raw counters that used to live here are now inside
+   * {@link TickExitRegionMeter}, which additionally partitions them by RTH (both
+   * endpoints, via the producer's OWN `isStockMarketOpen`) and drops the
+   * cold-boot region into a published `bootRegionMs`. `sumMs` is still the
+   * denominator TRA-3444's PREFIX split needs; it is now available in BOTH
+   * scopes rather than lifetime-only.
    */
-  private tickExitRegionOpenedAt = 0;
-  private lastTickExitRegionMs = 0;
-  private maxTickExitRegionMs = 0;
-  private tickExitRegionSamples = 0;
-  private tickExitRegionAtOrAbove20s = 0;
-  private tickExitRegionAtOrAbove30s = 0;
-  /**
-   * TRA-3444 — TOTAL region time, so the region has a denominator and not just a
-   * max. `sumMs - tickExitWork.sumMs` is PREFIX: the part of the interlock that
-   * is NOT exit-critical work and is therefore what TRA-2268 would be hoisting
-   * out if it narrows the region.
-   */
-  private tickExitRegionSumMs = 0;
+  private readonly tickExitRegion = new TickExitRegionMeter(
+    Date.now,
+    // THE PRODUCER'S OWN PREDICATE, not a second RTH test. This is the same
+    // function the decoupled exit gate refuses on (`refreshExitsOnly` ->
+    // `marketClosed`) and the same one `stampExitPass` classifies intervals
+    // with, so the region population and the region's own producer cannot
+    // disagree about what RTH is.
+    isStockMarketOpen,
+  );
   /**
    * TRA-3444 — the exit-critical half of the region, measured DIRECTLY. See
    * `tick-exit-work.ts` for why the `signal.doTick` phase tape cannot answer
@@ -4885,11 +4901,15 @@ export class SignalEngine {
    */
   private openTickExitRegion(): void {
     this.tickExitRegionActive = true;
-    this.tickExitRegionOpenedAt = Date.now();
+    // TRA-3464 — this also LATCHES the market state at the open instant. It has
+    // to be read here and carried, not re-derived at release: a region that
+    // spans 16:00 ET would otherwise be classified from two reads of "now" and
+    // no read of its own start, i.e. on one endpoint while claiming two.
+    this.tickExitRegion.open();
     // TRA-3444 — arm the exit-critical accumulator in the SAME breath as the
-    // flag, for the same reason `tickExitRegionOpenedAt` is set here: a split
-    // whose numerator and denominator are armed at different instants is not a
-    // split of anything.
+    // flag, for the same reason the region's clock starts here: a split whose
+    // numerator and denominator are armed at different instants is not a split
+    // of anything.
     this.tickExitWork.beginRegion();
   }
 
@@ -4906,21 +4926,21 @@ export class SignalEngine {
    */
   private releaseTickExitRegion(): void {
     this.tickExitRegionActive = false;
-    if (this.tickExitRegionOpenedAt <= 0) return;
-    const heldMs = Date.now() - this.tickExitRegionOpenedAt;
-    this.tickExitRegionOpenedAt = 0;
-    this.lastTickExitRegionMs = heldMs;
-    if (heldMs > this.maxTickExitRegionMs) this.maxTickExitRegionMs = heldMs;
-    this.tickExitRegionSamples += 1;
-    this.tickExitRegionSumMs += heldMs;
-    if (heldMs >= 20_000) this.tickExitRegionAtOrAbove20s += 1;
-    if (heldMs >= 30_000) this.tickExitRegionAtOrAbove30s += 1;
+    // TRA-3464 — the meter books the lifetime terms, applies the cold-boot guard
+    // and classifies the region on BOTH endpoints, then hands back the bin. It
+    // returns null on the second (idempotent) release of an already-closed
+    // region, which is also the signal that nothing may be booked anywhere else.
+    const bin = this.tickExitRegion.release();
+    if (bin == null) return;
     // TRA-3444 — book the region's exit-critical work against the SAME region,
     // inside the same idempotency guard, so `exitWorkMs.samples` stays 1:1 with
-    // `samples` and the two can be differenced over one population. Past the
-    // early return above this is the second release of an already-closed region
-    // and must book nothing.
-    this.tickExitWork.commitRegion();
+    // `samples` and the two can be differenced over one population.
+    //
+    // TRA-3464 — and against the SAME bin. The predicate is inherited, never
+    // re-derived: two measurements of one region that disagree about which
+    // regions count surface as a phase split whose parts do not reconcile with
+    // their own denominator (TRA-3443).
+    this.tickExitWork.commitRegion(bin);
   }
 
   private stampExitPass(source: 'tick' | 'decoupled'): void {
@@ -5067,22 +5087,37 @@ export class SignalEngine {
       tickPassCount: this.tickPassCount,
       decoupledSkips: { ...this.decoupledSkips },
       decoupledFireCount: this.decoupledFireCount,
-      tickExitRegionMs: {
-        // Null until a region has actually closed — a 0 here would be a claim
-        // about a measurement not taken (TRA-1707 null discipline).
-        lastMs: this.tickExitRegionSamples > 0 ? this.lastTickExitRegionMs : null,
-        maxMs: this.tickExitRegionSamples > 0 ? this.maxTickExitRegionMs : null,
-        samples: this.tickExitRegionSamples,
-        // A SUM over `samples` regions, so 0-with-samples-0 is not ambiguous the
-        // way a bare `maxMs: 0` would be — it is read against the count beside it.
-        sumMs: this.tickExitRegionSumMs,
-        atOrAbove20s: this.tickExitRegionAtOrAbove20s,
-        atOrAbove30s: this.tickExitRegionAtOrAbove30s,
-        // TRA-3444 — NULL until the first region commits, never a zero-filled
-        // object: this counter exists precisely to tell "absent" from "zero",
-        // and publishing zeroes would rebuild the ambiguity it removes.
-        exitWorkMs: this.tickExitWork.snapshot(),
-      },
+      tickExitRegionMs: (() => {
+        const region = this.tickExitRegion.snapshot();
+        return {
+          // Null until a region has actually closed — a 0 here would be a claim
+          // about a measurement not taken (TRA-1707 null discipline).
+          lastMs: region.lastMs,
+          // LIFETIME terms. Unchanged semantics from the pre-TRA-3464 build:
+          // every closed region since boot, INCLUDING the cold-boot one, with no
+          // market-hours predicate. Kept here rather than renamed so the
+          // demotion under `books.<book>.lifetime` is a pure MOVE and a reader
+          // diffing the old payload against the new one sees these numbers
+          // stand still.
+          maxMs: region.lifetime.maxMs,
+          samples: region.lifetime.samples,
+          // A SUM over `samples` regions, so 0-with-samples-0 is not ambiguous the
+          // way a bare `maxMs: 0` would be — it is read against the count beside it.
+          sumMs: region.lifetime.sumMs,
+          atOrAbove20s: region.lifetime.atOrAbove20s,
+          atOrAbove30s: region.lifetime.atOrAbove30s,
+          // TRA-3444 — NULL until the first region commits, never a zero-filled
+          // object: this counter exists precisely to tell "absent" from "zero",
+          // and publishing zeroes would rebuild the ambiguity it removes.
+          exitWorkMs: this.tickExitWork.snapshot(),
+          // TRA-3464 — THE GRADED SCOPE. Regions with BOTH endpoints inside
+          // 09:30-16:00 ET, cold-boot region excluded and published rather than
+          // dropped, exclusions COUNTED so `partitionHolds` can be checked
+          // rather than trusted. `exitWorkMs` here is the same population, from
+          // the same single classification.
+          rth: { ...region.rth, exitWorkMs: this.tickExitWork.rthSnapshot() },
+        };
+      })(),
       rth: {
         intervalHistogram: { ...this.rthExitIntervalHistogram },
         decoupledPassCount: this.rthDecoupledPassCount,

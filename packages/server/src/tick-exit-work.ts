@@ -42,6 +42,22 @@
 // money-book interlock. `tick-exit-work.test.ts` asserts the bracket from the
 // SOURCE for that reason.
 
+// TRA-3464 — THE RTH PREDICATE IS INHERITED, NOT RE-DERIVED.
+//
+// TRA-2698 ordered that this accumulator carry the identical predicate as
+// `tickExitRegionMs` itself, because two measurements of ONE region that
+// disagree about which regions count surface downstream as a phase split whose
+// parts do not reconcile with their own denominator — the exact failure TRA-3443
+// was opened for.
+//
+// So this meter does not classify anything. `TickExitRegionMeter.release()`
+// classifies ONCE and RETURNS the bin, and `commitRegion(bin)` takes that same
+// value. There is one RTH test in the process and both accumulators are
+// downstream of it; a shared return value cannot drift the way two copies of a
+// predicate can.
+
+import type { TickExitRegionBin } from './tick-exit-region.js';
+
 /** What a meter publishes once it has taken at least one region. */
 export interface TickExitWorkTerms {
   /** Regions COMMITTED — one per closed `tickExitRegionActive` region, so this is directly comparable with `tickExitRegionMs.samples`. */
@@ -80,6 +96,13 @@ export class TickExitWorkMeter {
   private samples = 0;
   private sumMs = 0;
   private maxMs = 0;
+
+  // TRA-3464 — the same terms over the RTH-only population. Separate counters
+  // rather than a filter applied at snapshot time, because the bin is only known
+  // at commit and the pending accumulation is discarded immediately after.
+  private rthSamples = 0;
+  private rthSumMs = 0;
+  private rthMaxMs = 0;
 
   constructor(now: () => number = Date.now) {
     this.now = now;
@@ -127,8 +150,16 @@ export class TickExitWorkMeter {
    * `tickExitRegionMs.samples`, so PREFIX = regionSum - workSum is computed over
    * the same population. A tick that threw before reaching the passes really did
    * spend its whole region on prefix, and that is what it should read as.
+   *
+   * TRA-3464 — `bin` is the classification `TickExitRegionMeter.release()`
+   * already computed for THIS region. Passing it (rather than re-deriving it)
+   * is what keeps the two accumulators 1:1 in BOTH populations: `samples` stays
+   * 1:1 with `tickExitRegionMs.lifetime.samples` and `rthSamples` stays 1:1 with
+   * `tickExitRegionMs.samples`, so PREFIX differences over one population in
+   * either scope. A `'boot'` bin is booked into lifetime and excluded from RTH,
+   * exactly as the region meter does it.
    */
-  commitRegion(): void {
+  commitRegion(bin: TickExitRegionBin): void {
     if (!this.regionOpen) return;
     this.regionOpen = false;
     const heldMs = this.pendingMs;
@@ -136,6 +167,10 @@ export class TickExitWorkMeter {
     this.samples += 1;
     this.sumMs += heldMs;
     if (heldMs > this.maxMs) this.maxMs = heldMs;
+    if (bin !== 'rth') return;
+    this.rthSamples += 1;
+    this.rthSumMs += heldMs;
+    if (heldMs > this.rthMaxMs) this.rthMaxMs = heldMs;
   }
 
   /**
@@ -147,6 +182,21 @@ export class TickExitWorkMeter {
   snapshot(): TickExitWorkTerms | null {
     if (this.samples === 0) return null;
     return { samples: this.samples, sumMs: this.sumMs, maxMs: this.maxMs };
+  }
+
+  /**
+   * TRA-3464 — the same terms over regions with BOTH endpoints inside RTH.
+   *
+   * NULL until an RTH region commits, and null INDEPENDENTLY of
+   * {@link snapshot}: a process that booted post-close has a non-null lifetime
+   * snapshot and a null RTH one, and that pair is the honest reading. Publishing
+   * a zero-filled object here is the specific defect TRA-2698 was filed over —
+   * a book that measured nothing in the window still published numbers that
+   * read like a measurement.
+   */
+  rthSnapshot(): TickExitWorkTerms | null {
+    if (this.rthSamples === 0) return null;
+    return { samples: this.rthSamples, sumMs: this.rthSumMs, maxMs: this.rthMaxMs };
   }
 
   private add(elapsedMs: number): void {

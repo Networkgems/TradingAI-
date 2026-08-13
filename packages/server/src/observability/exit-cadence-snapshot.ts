@@ -63,14 +63,41 @@ export const RTH_CLOSE_UTC_MIN = 20 * 60;
  * `exitWorkMs.sumMs`, `exitWorkMs.samples` and `tickExitRegionMs.sumMs` ARE
  * monotonic, and differencing that trio across a T0/T1 pair is precisely how the
  * RTH-scoped PREFIX/exit-work split is obtained.
+ *
+ * TRA-3464 — the unscoped `tickExitRegionMs.maxMs` / `tickExitRegionMs.exitWorkMs.maxMs`
+ * entries are GONE, because the top-level field they named is deprecated and is
+ * deleted in the next deploy generation. The lifetime maxima that replace them
+ * are named explicitly: a frozen list of STRING paths is invisible to `tsc`, so
+ * a dangling entry here would survive the field it points at and read to every
+ * future maintainer as a live rule.
+ *
+ * ⚠️ THIS TAPE IS SAFE ACROSS THE TRA-3464 SCHEMA CHANGE, AND THE REASON IS NOT
+ * THE OBVIOUS ONE. It already REFUSES to difference a pair whose `pid` or
+ * `startedAt` disagree — and a build change is ALWAYS a process change, so a
+ * T0 line written by the old schema can never be differenced against a T1 line
+ * written by the new one. That guard reads as ordinary restart-safety and it is
+ * doing schema-migration work as well. DO NOT DELETE IT AS REDUNDANT.
  */
 export const EXIT_CADENCE_NOT_DIFFERENCEABLE: readonly string[] = Object.freeze([
+  // TRA-3464 — RTH-scoped (the graded scope).
   'books.live.tickExitRegionMs.maxMs',
   'books.demo.tickExitRegionMs.maxMs',
-  'tickExitRegionMs.maxMs',
   'books.live.tickExitRegionMs.exitWorkMs.maxMs',
   'books.demo.tickExitRegionMs.exitWorkMs.maxMs',
-  'tickExitRegionMs.exitWorkMs.maxMs',
+  // TRA-3464 — the demoted lifetime accumulator. Same shape of quantity, same
+  // rule; listed because the numbers MOVED here rather than disappearing, and an
+  // unlisted running maximum is one a differencing consumer will subtract.
+  'books.live.lifetime.tickExitRegionMs.maxMs',
+  'books.demo.lifetime.tickExitRegionMs.maxMs',
+  'books.live.lifetime.tickExitRegionMs.exitWorkMs.maxMs',
+  'books.demo.lifetime.tickExitRegionMs.exitWorkMs.maxMs',
+  // TRA-3464 — `bootRegionMaxMs` is a maximum over the cold-boot regions the
+  // guard dropped. `bootRegionSumMs` is monotonic in the number of ENGINES, not
+  // in time, and differencing it across a same-process pair yields 0 by
+  // construction; it is not listed because it is not a running maximum, but it
+  // is not a counter either. Do not build a rate out of it.
+  'books.live.tickExitRegionMs.bootRegionMaxMs',
+  'books.demo.tickExitRegionMs.bootRegionMaxMs',
 ]);
 
 export interface ExitCadenceSnapshotLine {
