@@ -500,6 +500,42 @@ describe('deriveGates', () => {
     expect(deriveGates('yellow', inputs).sizingMultiplier).toBe(0.5);
   });
 
+  // TRA-3440 — losing the 10Y feed must not print a LARGER multiplier than
+  // reading it would have. Measured 2026-08-12: all 6 reviews in the 60-review
+  // store whose multiplier was not 0.5 were dark-^TNX reviews; four printed
+  // 1.00×. The readable-feed leg is pinned alongside so the fix can never be
+  // "delete the rate cut".
+  it('a DARK 10Y takes the same cut a > 4.50% print does', () => {
+    const gates = deriveGates('green', { spx: 5200, spxTrendMa: 5100, vix: 13, tnx: null });
+    expect(gates.sizingMultiplier).toBeLessThanOrEqual(0.5);
+    // and it says so in its own words — not by asserting a reading we never took
+    expect(gates.sizingRationale).toMatch(/feed unavailable/i);
+    expect(gates.sizingRationale).not.toMatch(/4\.5/);
+  });
+
+  it('a readable 10Y at 4.65% still yields 0.5, with the measured reason', () => {
+    const gates = deriveGates('green', { spx: 5200, spxTrendMa: 5100, vix: 13, tnx: 4.65 });
+    expect(gates.sizingMultiplier).toBe(0.5);
+    expect(gates.sizingRationale).toContain('4.65%');
+    expect(gates.sizingRationale).not.toMatch(/unavailable/i);
+  });
+
+  // A non-finite reading round-trips through JSON as `null` and loses every
+  // `>` comparison, so it is a DARK feed, not a low one.
+  it('a NaN 10Y is treated as dark, not as a sub-4.50% reading', () => {
+    const gates = deriveGates('green', { spx: 5200, spxTrendMa: 5100, vix: 13, tnx: NaN });
+    expect(gates.sizingMultiplier).toBeLessThanOrEqual(0.5);
+    expect(gates.sizingRationale).toMatch(/feed unavailable/i);
+  });
+
+  it('a readable 10Y BELOW the threshold leaves the scalar and the rate leg alone', () => {
+    // positive control for the two above: the rate leg must still be able to
+    // NOT bind, otherwise "always cut" would pass every dark-feed assertion.
+    const gates = deriveGates('green', { spx: 5200, spxTrendMa: 5100, vix: 13, tnx: 4.0 });
+    expect(gates.sizingMultiplier).toBe(1.0);
+    expect(gates.sizingRationale).toBeUndefined();
+  });
+
   // TRA-469 — trendState records *why* the trend gates resolved so the signal
   // engine can tell a real downtrend apart from a dark feed.
   it('trendState reflects an uptrend / downtrend / unreadable feed', () => {

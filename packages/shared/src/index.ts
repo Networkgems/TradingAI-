@@ -1668,6 +1668,19 @@ export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   demoSlippagePct: 0,
   demoFeePerContract: 0,
   // TRA-389 — market-review gate consumption defaults off (soft-launch).
+  //
+  // ⚠️ TRA-3437 preconditions — read these BEFORE flipping this to `true`
+  // anywhere (this default, the Settings toggle, or a stored book):
+  //   1. TRA-3440 — a DARK 10Y must not increase size. Fixed in `deriveGates`
+  //      (`market-review.ts`): an unreadable `^TNX` now takes the same 50% cut
+  //      a `> 4.50%` print does. Do not regress it; the seam that consumes
+  //      `sizingMultiplier` (`paper-account.ts` `openPosition`'s third arg) is
+  //      pre-built, so a regression would read as a sizing bug, not a feed bug.
+  //   2. UNDECIDED — `resolveCompositeTrend` (`market-review.ts`) SKIPS
+  //      unreadable legs, so losing the WEAKER leg turns a `down` fold into
+  //      `up` (`^NDX` is the binding leg today). Needs a ruling before enable.
+  //   3. The ±1% hysteresis band and the `sessionDate` dwell lock assume ONE
+  //      read per session — do NOT re-sample intraday (the NO-GO on TRA-3437).
   marketReviewGatesEnabled: false,
   // TRA-483 — PDT-aware overnight hold defaults ON for live positions.
   holdLiveOptionsOvernightForPdt: true,
@@ -3752,8 +3765,23 @@ export interface MarketReviewGates {
   meanReversionTilt: boolean;
   /** Breakout strategies enabled — disabled when VIX > 22. */
   breakoutsEnabled: boolean;
-  /** Position-size scalar in (0,1]; trimmed in elevated-vol / high-rate tape. */
+  /**
+   * Position-size scalar in (0,1]; trimmed in elevated-vol / high-rate tape.
+   *
+   * TRA-3440 — an UNREADABLE 10Y (`tnx` null/non-finite) takes the SAME 50% cut
+   * a `> 4.50%` print does. A dark feed must never widen the scalar; read
+   * {@link sizingRationale} to tell the two apart.
+   */
   sizingMultiplier: number;
+  /**
+   * TRA-3440 — why the rate leg moved {@link sizingMultiplier}, or absent when
+   * it did not bind. Two distinct strings on purpose: a measured
+   * `10Y yield 4.65% > 4.5%` cut vs `10Y feed unavailable — sizing held at
+   * cautious`. Never collapse them — reusing the `> 4.5%` wording on a dark
+   * feed asserts a reading that was not taken. Optional so reviews persisted
+   * before TRA-3440 still deserialise.
+   */
+  sizingRationale?: string;
   /**
    * TRA-469 — direction of the S&P 500 trend filter the gates were derived
    * from: `'up'` / `'down'` relative to the trend MA (TRA-472: 50-day SMA

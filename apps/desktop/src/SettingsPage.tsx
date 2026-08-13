@@ -1862,7 +1862,22 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
             {/* TRA-389 — opt-in for the market-review regime gates. Default
                 off (soft-launch): until checked the engine ignores the
                 TRA-386 regime review entirely. Stocks-only — the gates
-                govern equity (ORB) signals. */}
+                govern equity (ORB) signals.
+
+                ⚠️ TRA-3437 preconditions — read these BEFORE anyone ticks this
+                box (mirrored at the default in `packages/shared/src/index.ts`):
+                  1. TRA-3440 — a DARK 10Y must not increase size. Fixed in
+                     `deriveGates` (`market-review.ts`): an unreadable `^TNX`
+                     now takes the same 50% cut a `> 4.50%` print does. The
+                     seam that consumes `sizingMultiplier` (`paper-account.ts`
+                     `openPosition`'s third arg) is pre-built, so a regression
+                     here reads as a sizing bug, not a feed bug.
+                  2. UNDECIDED — `resolveCompositeTrend` SKIPS unreadable legs,
+                     so losing the WEAKER leg turns a `down` fold into `up`
+                     (`^NDX` binds today). Needs a ruling before enable.
+                  3. The ±1% band and the `sessionDate` dwell lock assume ONE
+                     read per session — do NOT re-sample intraday (the NO-GO
+                     ruled on TRA-3437). */}
             {(!context || context === 'stocks') && (
               <div className="settings-field" style={{ marginTop: '0.5rem' }}>
                 <label className="checkbox-option">

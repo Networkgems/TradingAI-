@@ -551,11 +551,32 @@ export function deriveGates(
   const { trendKnown, trendUp, trendDown } = composite;
   const highVix = vix != null && vix > VIX_NO_BREAKOUT;
   const elevatedVix = vix != null && vix >= VIX_TREND_FOLLOW && vix <= VIX_NO_BREAKOUT;
-  const highRates = tnx != null && tnx > TNX_HIGH;
+  // TRA-3440 — a DARK 10Y is not a low 10Y. `tnx != null` alone also admits
+  // `NaN` (which round-trips through JSON as `null` anyway), and `NaN > TNX_HIGH`
+  // is false — so the feed counts as READ only when it is a finite number.
+  const rateKnown = tnx != null && Number.isFinite(tnx);
+  const highRates = rateKnown && tnx! > TNX_HIGH;
 
   let sizingMultiplier = regime === 'red' ? 0.5 : regime === 'yellow' ? 0.75 : 1.0;
   // 10Y above 4.50% cuts tech-long sizing by half on top of the regime scalar.
-  if (highRates) sizingMultiplier = Math.min(sizingMultiplier, 0.5);
+  //
+  // TRA-3440 — an UNREADABLE 10Y takes the SAME cut. Losing the rate feed must
+  // never print a LARGER multiplier than reading it would have; every other
+  // dark-feed path here fails cautious (`!trendKnown` → YELLOW) and this leg
+  // used to be the one that did the opposite. Measured live 2026-08-12 over the
+  // 60-review store: all 6 reviews whose multiplier was not 0.5 were reviews
+  // where `^TNX` was dark, four of them printing a full 1.00×; there was no
+  // counterexample with a readable 10Y. The two cases carry SEPARATE rationale
+  // strings on purpose — a dark feed must not be reported as a `> 4.50%`
+  // reading we never took.
+  let sizingRationale: string | undefined;
+  if (highRates) {
+    sizingMultiplier = Math.min(sizingMultiplier, 0.5);
+    sizingRationale = `10Y yield ${tnx!.toFixed(2)}% > ${TNX_HIGH}% — tech-long sizing cut 50%.`;
+  } else if (!rateKnown) {
+    sizingMultiplier = Math.min(sizingMultiplier, 0.5);
+    sizingRationale = '10Y feed unavailable — sizing held at cautious (no rate reading was taken).';
+  }
 
   // TRA-469 — record *why* the trend gates resolved, so the signal engine can
   // tell a real downtrend apart from a dark feed instead of always blaming a
@@ -572,6 +593,9 @@ export function deriveGates(
     meanReversionTilt: elevatedVix,
     breakoutsEnabled: !highVix,
     sizingMultiplier,
+    // TRA-3440 — why the rate leg moved the scalar (or `undefined` when it did
+    // not bind). Lets a reader tell a dark feed from a genuine 4.65% print.
+    sizingRationale,
     trendState,
     // TRA-2197 — the per-leg detail behind the composite. Load-bearing: the
     // next review reads `downFlipDate` back out of here to re-arm the dwell
@@ -868,9 +892,12 @@ async function readIndexes(memory?: TrendMemoryInput): Promise<{
         : vix <= VIX_NO_BREAKOUT
           ? `${VIX_TREND_FOLLOW}–${VIX_NO_BREAKOUT} — mean-reversion tilt.`
           : `> ${VIX_NO_BREAKOUT} — breakouts disabled, reversal-at-VWAP only.`;
+  // TRA-3440 — the dark note must say what the dark feed DID, not just that it
+  // was dark: an unreadable 10Y now takes the same 50% cut a > 4.50% print
+  // would, so the table and `gates.sizingRationale` tell the same story.
   const tnxNote =
-    tnx == null
-      ? 'Feed unavailable.'
+    tnx == null || !Number.isFinite(tnx)
+      ? 'Feed unavailable — sizing held at cautious (no reading taken).'
       : tnx > TNX_HIGH
         ? `> ${TNX_HIGH}% — cut tech-long sizing 50%.`
         : `≤ ${TNX_HIGH}% — no rate-driven sizing cut.`;
@@ -975,6 +1002,9 @@ function renderMarkdown(review: MarketReview): string {
   lines.push(`- **Mean-reversion tilt:** ${gates.meanReversionTilt ? 'on' : 'off'}`);
   lines.push(`- **Breakouts:** ${gates.breakoutsEnabled ? 'enabled' : 'OFF (high vol)'}`);
   lines.push(`- **Position-size multiplier:** ${gates.sizingMultiplier.toFixed(2)}×`);
+  // TRA-3440 — name the rate leg when it bound the scalar, so a 0.50× from a
+  // dark feed cannot be read as a 0.50× from a measured 4.65% print.
+  if (gates.sizingRationale) lines.push(`  - ${gates.sizingRationale}`);
   lines.push('');
   lines.push('---');
   lines.push('');
@@ -1239,6 +1269,10 @@ export async function generateMarketReview(
     trendState: gates.trendState,
     trendBindingSymbol: gates.trendBindingSymbol,
     sizingMultiplier: gates.sizingMultiplier,
+    // TRA-3440 — the rate leg's own reason, so a 0.50× in the log can be
+    // attributed to a dark feed vs a measured > 4.50% print without re-reading
+    // the review body.
+    sizingRationale: gates.sizingRationale ?? null,
   });
 
   return review;
