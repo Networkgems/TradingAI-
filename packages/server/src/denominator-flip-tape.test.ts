@@ -34,6 +34,8 @@ import { etWallClockToUtcMs } from './et-clock.js';
 import {
   summarizeDenominatorFlipTape,
   gradeTapeSession,
+  computeBarDays,
+  type TapeSessionSummary,
 } from './denominator-flip-tape-summary.js';
 
 type QuoteRow = { price: number; volume: number; change: number; changePct: number };
@@ -879,5 +881,211 @@ describe('TRA-3116 — the drain survives a restart (merge, coverage, orphan)', 
     expect(cov.uncoveredMs).toBeNull();
     // `null`, not `0` — an unknown coverage must not read as a complete one.
     expect(cov.rowsLostToRestart).toBeNull();
+  });
+});
+
+/**
+ * TRA-3494 — the bar's UNIT.
+ *
+ * The instrument as first shipped counted BOOK-DAYS and read 64/10 on the first
+ * clean night, clearing a ">= 10 RTH sessions" bar on one calendar day of
+ * evidence pooled across 66 books (61 demo). These arms are the ruling made
+ * executable, and they are bidirectional on purpose: for every arm proving the
+ * pooled reading is gone there is one proving a genuinely clean live day still
+ * banks, because a counter that never advances is exactly as useless as one that
+ * clears on night one.
+ */
+describe('TRA-3494 — the bar counts market DAYS on the live-money cohort', () => {
+  /** Both are NYSE sessions (Wed/Thu). */
+  const D1 = '2026-08-12';
+  const D2 = '2026-08-13';
+
+  const session = (
+    o: Partial<TapeSessionSummary> & { username: string; mode: string; date: string },
+  ): TapeSessionSummary => ({
+    generatedAt: null,
+    rows: 1,
+    admitted: 1,
+    droppedCandidates: 0,
+    truncatedForSize: 0,
+    droppedOnMerge: 0,
+    saturated: false,
+    segmentCount: 1,
+    restartBoundaries: 0,
+    coverageComplete: true,
+    observedMs: 23_400_000,
+    uncoveredMs: 0,
+    rowsLostToRestart: 0,
+    mergeDegraded: false,
+    countsTowardBar: true,
+    disqualifiers: [],
+    ...o,
+  });
+
+  /** The 2026-08-12 fleet exactly as TRA-3466 read it: 64 clean of 66. */
+  const nightOne = (): TapeSessionSummary[] => {
+    const out: TapeSessionSummary[] = [];
+    for (let i = 0; i < 61; i += 1) out.push(session({ username: `demo${i}`, mode: 'demo', date: D1 }));
+    out.push(session({ username: 'sbx', mode: 'sandbox', date: D1 }));
+    out.push(session({ username: 'admin', mode: 'live', date: D1, rows: 1057 }));
+    out.push(session({ username: 'v0nni', mode: 'live', date: D1, rows: 74 }));
+    // The two that did NOT clear: demo books stamped `observedMs: 0`.
+    for (const u of ['idleA', 'idleB']) {
+      out.push(session({
+        username: u, mode: 'demo', date: D1, rows: 0, observedMs: 0, segmentCount: 0,
+        coverageComplete: false, countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+      }));
+    }
+    return out;
+  };
+
+  it('ACCEPTANCE — night one banks ONE day, not 64', () => {
+    const days = computeBarDays(nightOne(), []);
+    expect(days).toHaveLength(1);
+    expect(days[0].date).toBe(D1);
+    expect(days[0].live).toBe('counted');
+    // The pooled number is not deleted, it is just not the unit any more.
+    expect(days[0].bookSessionsClean).toBe(64);
+    expect(days[0].bookSessions).toBe(66);
+    expect(days.filter(d => d.live === 'counted')).toHaveLength(1);
+    // Both rejected quorums are published, and they disagree — which is the
+    // whole reason the ruling had to name one.
+    expect(days[0].anyBookClean).toBe(true);   // B1 would pass
+    expect(days[0].allBooksClean).toBe(false); // B2 would fail
+  });
+
+  it('a clean DEMO fleet cannot bank a day the live book failed', () => {
+    const sessions = nightOne().map(s =>
+      s.username === 'admin'
+        ? { ...s, countsTowardBar: false, disqualifiers: ['droppedOnMerge'], droppedOnMerge: 4 }
+        : s,
+    );
+    const days = computeBarDays(sessions, []);
+    expect(days[0].live).toBe('failed');
+    expect(days[0].liveFailingBooks).toEqual(['admin/live']);
+    // ...even though 63 books were clean and quorum B1 would still have passed.
+    expect(days[0].anyBookClean).toBe(true);
+    expect(days[0].bookSessionsClean).toBe(63);
+  });
+
+  it('an EMPTY live cohort is `vacuous` — neither a credit nor a failure', () => {
+    // `every` is true on the empty set; a day with only demo books must not bank.
+    const days = computeBarDays([session({ username: 'demo0', mode: 'demo', date: D1 })], []);
+    expect(days[0].live).toBe('vacuous');
+    expect(days[0].vacuousReason).toBeTruthy();
+    expect(days[0].liveObserved).toBe(0);
+    expect(days.filter(d => d.live === 'counted')).toHaveLength(0);
+    expect(days.filter(d => d.live === 'failed')).toHaveLength(0);
+  });
+
+  it('an IDLE live book is `vacuous`, but an UNREADABLE one FAILS', () => {
+    // Idle: a file exists, but nothing in it says the process observed anything.
+    const idle = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D1,
+      rows: 0, observedMs: 0, segmentCount: 0, coverageComplete: false,
+      countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+    })], []);
+    expect(idle[0].live).toBe('vacuous');
+    expect(idle[0].liveIdle).toBe(1);
+
+    // Unreadable: also zero observation on its face, but it is EVIDENCE of a
+    // problem. Letting it read as idle would buy a corrupt write a free pass.
+    const corrupt = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D1,
+      rows: 0, observedMs: null, segmentCount: null, coverageComplete: null,
+      countsTowardBar: false, disqualifiers: ['unreadable'], unreadable: 'Unexpected end of JSON input',
+    })], []);
+    expect(corrupt[0].live).toBe('failed');
+  });
+
+  it('any ONE of observedMs / rows / segmentCount is enough to prove the book ran', () => {
+    // A regression of the TRA-3116 fix attacks these one at a time, so a book
+    // that lost its coverage stamp must still be graded, not excused as idle.
+    for (const shape of [
+      { observedMs: 1, rows: 0, segmentCount: 0 },
+      { observedMs: 0, rows: 1, segmentCount: 0 },
+      { observedMs: 0, rows: 0, segmentCount: 1 },
+    ]) {
+      const days = computeBarDays([session({
+        username: 'admin', mode: 'live', date: D1, ...shape,
+        coverageComplete: false, countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+      })], []);
+      expect(days[0].live).toBe('failed');
+    }
+  });
+
+  it('SANDBOX is not live money — a sandbox book cannot bank a day', () => {
+    // `stockModeKey` stamps `sandbox` for mode:'live' on Tradier's sandbox env.
+    const days = computeBarDays([session({ username: 'sbx', mode: 'sandbox', date: D1 })], []);
+    expect(days[0].live).toBe('vacuous');
+  });
+
+  it('a WEEKEND tape file cannot fill a trading-session bar', () => {
+    // 2026-08-15 is a Saturday. After-hours residue, not an RTH session.
+    const days = computeBarDays([
+      session({ username: 'admin', mode: 'live', date: '2026-08-15' }),
+      session({ username: 'admin', mode: 'live', date: D1 }),
+    ], []);
+    expect(days.map(d => d.date)).toEqual([D1]);
+  });
+
+  it('an ABSENT live tape is PUBLISHED, and cannot vacuously bank a day on its own', () => {
+    const days = computeBarDays([], [`admin/live@${D2}`, `demo0/demo@${D2}`]);
+    expect(days).toHaveLength(1);
+    expect(days[0].live).toBe('vacuous');
+    // The live absence is named; the demo one is not the deciding cohort.
+    expect(days[0].liveAbsentBooks).toEqual(['admin/live']);
+    expect(days[0].liveAbsent).toBe(1);
+  });
+
+  it('days accrue independently, and a failure does not erase a banked day', () => {
+    const days = computeBarDays([
+      session({ username: 'admin', mode: 'live', date: D1 }),
+      session({ username: 'admin', mode: 'live', date: D2, countsTowardBar: false, disqualifiers: ['saturated'] }),
+    ], []);
+    expect(days.map(d => d.live)).toEqual(['counted', 'failed']);
+  });
+
+  it('ACCEPTANCE — the summary publishes the DAY count and RETAINS the pooled one', async () => {
+    // Two live books, one date. The pooled reading is 2; the ruled unit is 1.
+    const a = await mkdtemp(join(tmpdir(), 'tra3494-a-'));
+    const b = await mkdtemp(join(tmpdir(), 'tra3494-b-'));
+    for (const dir of [a, b]) {
+      await flushDenominatorFlipTape({
+        targetDir: dir, date: '2026-07-30',
+        dump: { rows: [], droppedCandidates: 0, saturated: false, capacity: DENOM_FLIP_TAPE_CAPACITY, admitted: 0 },
+        admissionRule: { changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP, capacity: DENOM_FLIP_TAPE_CAPACITY },
+        trigger: 'eod',
+        processStartedAt: '2026-07-30T12:00:00.000Z',
+        now: Date.parse('2026-07-31T01:00:00.000Z'),
+      });
+    }
+    const summary = await summarizeDenominatorFlipTape(
+      [
+        { username: 'admin', mode: 'live', targetDir: a },
+        { username: 'v0nni', mode: 'live', targetDir: b },
+      ],
+      { todayEt: '2026-07-30' },
+    );
+    expect(summary.complete).toBe(2);
+    expect(summary.completeBookSessions).toBe(2);
+    expect(summary.sessionsTowardBar).toBe(1);
+    expect(summary.barTarget).toBe(10);
+    expect(summary.barUnit).toBe('distinct-et-market-days:live-money-cohort');
+    expect(summary.barDays).toHaveLength(1);
+    expect(summary.barDaysVacuous).toBe(0);
+    expect(summary.barDaysFailed).toBe(0);
+    expect(summary.unclassifiedModes).toEqual([]);
+  });
+
+  it('an unrecognised mode is NAMED rather than silently graded not-live', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3494-x-'));
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live-options', targetDir: dir }],
+      { todayEt: '2026-07-30' },
+    );
+    // The trap: a future writer's mode string falls out of the live cohort, every
+    // day reads `vacuous`, and the header still looks orderly.
+    expect(summary.unclassifiedModes).toEqual(['live-options']);
   });
 });

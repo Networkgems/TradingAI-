@@ -35,6 +35,52 @@
  * exact failure this ticket exists to close, so `countsTowardBar` is reported
  * beside the reason it is false, and absent market days are counted against a
  * real NYSE calendar rather than being left out of the denominator.
+ *
+ * ## TRA-3494 — the bar UNIT is a market DAY, not a book-day
+ *
+ * As first shipped, `sessionsTowardBar` was `sessions.filter(countsTowardBar)`,
+ * and `sessions` is one entry per BOOK per DAY. With 66 books in the fleet, the
+ * very first clean night read **64 / 10** and cleared a ">= 10 RTH sessions" bar
+ * permanently — on ONE calendar day of evidence, 61 of those 64 sessions demo.
+ * That is not an over-strict reading of the bar, it is the opposite: a pooled
+ * count measures FLEET WIDTH, and once past 10 it can never fall back even if
+ * every subsequent session regresses to the original TRA-3116 failure.
+ *
+ * Ruled (CTO, 2026-08-13): the unit is a **distinct ET market day**, and the
+ * deciding cohort for a day is the **live-money books only** (`mode === 'live'`,
+ * i.e. Tradier `production`). `sandbox` and `demo` are excluded from the
+ * decision — the promotion is about whether the LIVE tape survives restarts, and
+ * 61 diluting demo sessions are exactly the signal-killer. The rejected
+ * alternatives, and why:
+ *
+ *   - `>= 1 clean book that day` — one clean demo book banks a day on which the
+ *     live tape failed outright. Published as `barDaysAnyBook`, never deciding.
+ *   - `every book clean that day` — hostage to any idle demo book. It already
+ *     FAILED on night one (64/66; two demo books stamped `observedMs: 0`), so it
+ *     makes the bar unreachable by a veto from outside the measured cohort.
+ *     Published as `barDaysAllBooks`, never deciding.
+ *
+ * Three consequences are load-bearing and must not be "simplified" away:
+ *
+ *   1. **A day with no live observation is `vacuous`, its own third state.** It
+ *      is neither counted nor failed. Folding it into either direction is the
+ *      bug: counted mints a free credit off an empty cohort (`every` is true on
+ *      the empty set), failed makes the bar unreachable the first weekend the
+ *      live book is idle. `vacuousReason` is always populated when it fires.
+ *   2. **Only market days can bank a session.** A weekend/holiday tape file is
+ *      after-hours residue; letting it count would fill a trading-session bar
+ *      with non-trading days.
+ *   3. **An absent live tape does not silently skip.** A live book with a tape
+ *      directory and no file for a market day is published per-day as
+ *      `liveAbsent` / `liveAbsentBooks`. It does not auto-fail the day (that
+ *      would let a decommissioned book veto the bar forever), so the promotion
+ *      decision — not this instrument — absorbs it: per the ruling, a 10-day
+ *      window containing any `liveAbsent > 0` day is not promotable until that
+ *      absence is separately explained.
+ *
+ * The old pooled number is NOT deleted — it is still published, as
+ * `completeBookSessions` (and as `complete`). Only the name that gates the
+ * promotion moved.
  */
 
 import { readdir, readFile } from 'fs/promises';
@@ -80,6 +126,55 @@ export interface TapeBookInput {
   targetDir: string;
 }
 
+/**
+ * The real-money cohort. `stockModeKey` yields `live` ONLY for
+ * `mode: 'live' && liveTradierEnvOptions === 'production'`; a live account
+ * pointed at Tradier's sandbox is stamped `sandbox` and is deliberately not in
+ * here. Demo is paper.
+ */
+const LIVE_MODES = new Set(['live']);
+
+/**
+ * The vocabulary `stockModeKey` can emit. This exists ONLY so that a mode string
+ * from some future writer cannot fall out of `LIVE_MODES` silently and turn every
+ * day `vacuous` while the header still looks orderly — an unrecognised mode is
+ * published as `unclassifiedModes` rather than being quietly graded as not-live.
+ */
+const KNOWN_MODES = new Set(['live', 'demo', 'sandbox']);
+
+/**
+ * TRI-STATE, and `vacuous` is NOT a soft `failed` nor a soft `counted`.
+ * `vacuous` = the deciding cohort was empty that day, so the day says nothing
+ * about the fix in either direction.
+ */
+export type TapeBarDayState = 'counted' | 'failed' | 'vacuous';
+
+/** One ET market day, graded as the TRA-3494 ruling defines the bar's unit. */
+export interface TapeBarDay {
+  date: string;
+  /** The DECIDING grade: the live-money cohort only. */
+  live: TapeBarDayState;
+  /** Always set when `live === 'vacuous'`; never set otherwise. */
+  vacuousReason?: string;
+  /** Live books whose tape shows the process actually observed something. */
+  liveObserved: number;
+  /** ...and how many of those cleared the per-session bar. */
+  liveClean: number;
+  /** Live tape files present but showing no observation at all (idle book). */
+  liveIdle: number;
+  /** Live books with a tape directory and NO file for this market day. */
+  liveAbsent: number;
+  liveFailingBooks: string[];
+  liveAbsentBooks: string[];
+  /** NON-DECIDING (rejected quorum B1), published so the ruling can be audited. */
+  anyBookClean: boolean;
+  /** NON-DECIDING (rejected quorum B2). False on an empty day, never vacuously true. */
+  allBooksClean: boolean;
+  /** Book-day sessions on this date, and how many were clean. */
+  bookSessions: number;
+  bookSessionsClean: number;
+}
+
 export interface TapeSummary {
   /**
    * TRI-STATE, and `null` is BLIND rather than clean. A fleet with no tape file
@@ -93,9 +188,35 @@ export interface TapeSummary {
   partial: number;
   /** Market days in range with no tape file for that book at all. */
   absent: number;
-  /** Complete sessions, i.e. progress toward the >=10 bar. */
+  /**
+   * TRA-3494 — progress toward the >=10 bar, in the RULED unit: distinct ET
+   * market days whose live-money cohort was non-empty and wholly clean.
+   *
+   * ⚠ This is NOT `complete`. It used to be, and that is the defect TRA-3494
+   * ruled on: `complete` is a pooled BOOK-DAY count across a 66-book fleet, so
+   * it read 64/10 on night one. The pooled number still ships, as
+   * `completeBookSessions`.
+   */
   sessionsTowardBar: number;
   barTarget: number;
+  /** Names the unit in the payload so a reader cannot re-derive the wrong one. */
+  barUnit: 'distinct-et-market-days:live-money-cohort';
+  /** The pre-TRA-3494 number, retained and renamed rather than deleted. */
+  completeBookSessions: number;
+  /** The per-day ledger the bar is counted off. */
+  barDays: TapeBarDay[];
+  /** Days whose live cohort was empty. Never folded into counted or failed. */
+  barDaysVacuous: number;
+  /** Days on which an observed live book missed the per-session bar. */
+  barDaysFailed: number;
+  /** Days with >=1 live book absent. Published; gates promotion, not the count. */
+  barDaysWithLiveAbsence: number;
+  /** REJECTED quorum B1, published alongside so the ruling stays auditable. */
+  barDaysAnyBook: number;
+  /** REJECTED quorum B2, likewise. */
+  barDaysAllBooks: number;
+  /** Mode strings this grader does not recognise. Non-empty is a BUG, not a state. */
+  unclassifiedModes: string[];
   firstDate: string | null;
   lastDate: string | null;
   books: number;
@@ -123,6 +244,105 @@ export function gradeTapeSession(file: Partial<DenominatorFlipTapeFile>): {
   }
   if (file.mergeDegraded === true) bad.push('mergeDegraded');
   return { countsTowardBar: bad.length === 0, disqualifiers: bad };
+}
+
+/**
+ * Did this live book's process actually observe anything that day?
+ *
+ * The point of the question is to separate an IDLE book (nothing to say about
+ * the fix — the day goes `vacuous`) from a book that ran and produced a bad tape
+ * (a real FAIL). Three signals answer it, OR'd, because a regression of the
+ * TRA-3116 fix attacks them one at a time: `observedMs` comes from the coverage
+ * stamp, `rows` survives independently of it, and `segmentCount` is non-zero for
+ * any process that flushed at all.
+ *
+ * An UNREADABLE tape returns true on purpose. It is evidence of a problem, so it
+ * must be able to fail a day; treating it as "no observation" would let a corrupt
+ * write buy a free pass by looking like an idle book.
+ */
+function liveSessionObserved(s: TapeSessionSummary): boolean {
+  if (s.unreadable !== undefined) return true;
+  return (s.observedMs ?? 0) > 0 || s.rows > 0 || (s.segmentCount ?? 0) > 0;
+}
+
+/**
+ * The TRA-3494 unit: fold book-day sessions into one row per ET MARKET day and
+ * grade each day on the live-money cohort. See the ruling in this file's header
+ * for why the cohort is live-only and why `vacuous` is a first-class state.
+ */
+export function computeBarDays(
+  sessions: readonly TapeSessionSummary[],
+  absentSessions: readonly string[] = [],
+): TapeBarDay[] {
+  const byDate = new Map<string, TapeSessionSummary[]>();
+  for (const s of sessions) {
+    // Consequence 2: only a trading day can bank a trading session. A weekend or
+    // holiday file is after-hours residue.
+    if (!isMarketDayIso(s.date)) continue;
+    const list = byDate.get(s.date);
+    if (list) list.push(s);
+    else byDate.set(s.date, [s]);
+  }
+
+  // Consequence 3: a live book that is absent for a market day is PUBLISHED, not
+  // skipped into silence.
+  const absentByDate = new Map<string, string[]>();
+  for (const entry of absentSessions) {
+    const at = entry.lastIndexOf('@');
+    if (at < 0) continue;
+    const key = entry.slice(0, at);
+    const date = entry.slice(at + 1);
+    if (!isMarketDayIso(date)) continue;
+    if (!LIVE_MODES.has(key.slice(key.lastIndexOf('/') + 1))) continue;
+    const list = absentByDate.get(date);
+    if (list) list.push(key);
+    else absentByDate.set(date, [key]);
+  }
+
+  const dates = [...new Set([...byDate.keys(), ...absentByDate.keys()])].sort();
+  return dates.map(date => {
+    const daySessions = byDate.get(date) ?? [];
+    const liveSessions = daySessions.filter(s => LIVE_MODES.has(s.mode));
+    const observed = liveSessions.filter(liveSessionObserved);
+    const clean = observed.filter(s => s.countsTowardBar);
+    const liveAbsentBooks = absentByDate.get(date) ?? [];
+
+    let live: TapeBarDayState;
+    let vacuousReason: string | undefined;
+    if (observed.length === 0) {
+      // Consequence 1. NOT counted (an empty cohort must never mint a credit)
+      // and NOT failed (an idle live book must never veto the bar).
+      live = 'vacuous';
+      vacuousReason =
+        liveSessions.length > 0
+          ? 'every live-money tape for this market day shows no observation at all (idle book)'
+          : liveAbsentBooks.length > 0
+            ? 'no live-money tape file was written for this market day'
+            : 'no live-money book was present in the fleet for this market day';
+    } else {
+      live = clean.length === observed.length ? 'counted' : 'failed';
+    }
+
+    return {
+      date,
+      live,
+      ...(vacuousReason ? { vacuousReason } : {}),
+      liveObserved: observed.length,
+      liveClean: clean.length,
+      liveIdle: liveSessions.length - observed.length,
+      liveAbsent: liveAbsentBooks.length,
+      liveFailingBooks: observed
+        .filter(s => !s.countsTowardBar)
+        .map(s => `${s.username}/${s.mode}`),
+      liveAbsentBooks,
+      anyBookClean: daySessions.some(s => s.countsTowardBar),
+      // `every` is TRUE on the empty array, which would report a day with no
+      // sessions at all as "all books clean". The length guard is the point.
+      allBooksClean: daySessions.length > 0 && daySessions.every(s => s.countsTowardBar),
+      bookSessions: daySessions.length,
+      bookSessionsClean: daySessions.filter(s => s.countsTowardBar).length,
+    };
+  });
 }
 
 /**
@@ -223,6 +443,13 @@ export async function summarizeDenominatorFlipTape(
 
   const complete = sessions.filter(s => s.countsTowardBar).length;
   const partial = sessions.length - complete;
+
+  // TRA-3494 — the bar is counted off DAYS, not book-days. `complete` above is
+  // the pooled book-day number that read 64/10 on night one; it stays in the
+  // payload as `completeBookSessions`, it just no longer gates anything.
+  const barDays = computeBarDays(sessions, absentSessions);
+  const unclassifiedModes = [...new Set(books.map(b => b.mode).filter(m => !KNOWN_MODES.has(m)))].sort();
+
   return {
     // `null` when nothing has been observed at all. A blind read is not a clean
     // one; the caller must not be able to mistake "no tape yet" for "all good".
@@ -233,8 +460,17 @@ export async function summarizeDenominatorFlipTape(
     complete,
     partial,
     absent: absentSessions.length,
-    sessionsTowardBar: complete,
+    sessionsTowardBar: barDays.filter(d => d.live === 'counted').length,
     barTarget,
+    barUnit: 'distinct-et-market-days:live-money-cohort',
+    completeBookSessions: complete,
+    barDays,
+    barDaysVacuous: barDays.filter(d => d.live === 'vacuous').length,
+    barDaysFailed: barDays.filter(d => d.live === 'failed').length,
+    barDaysWithLiveAbsence: barDays.filter(d => d.liveAbsent > 0).length,
+    barDaysAnyBook: barDays.filter(d => d.anyBookClean).length,
+    barDaysAllBooks: barDays.filter(d => d.allBooksClean).length,
+    unclassifiedModes,
     firstDate,
     lastDate,
     books: seen.size,
