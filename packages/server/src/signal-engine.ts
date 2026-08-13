@@ -9671,16 +9671,64 @@ export class SignalEngine {
    * day-trade-buying-power (TRA-483) pre-checks and void-on-reject rollback
    * (TRA-332) the RV path has always used — so both dark live routes share ONE
    * audited broker path instead of divergent copies. Returns `true` when the
-   * paper open stands (the broker filled, or there is nothing to mirror against —
-   * no client / symbol / contracts — matching the pre-extraction behaviour where
-   * the mirror `if` simply didn't run); returns `false` when the open was voided
-   * (insufficient BP, no quote, rejected, walk-exhausted, or a thrown submit) and
-   * the caller must skip that fill.
+   * paper open stands (the broker filled); returns `false` when the open was
+   * voided (no broker client, no symbol, no contracts, insufficient BP, no quote,
+   * rejected, walk-exhausted, or a thrown submit) and the caller must skip that
+   * fill.
    *
    * The CALLER owns the live arm-flag + `tradierLiveOptionsEnabled` gate (each
    * path re-asserts its own dark flag there, defense-in-depth) BEFORE calling
-   * this; this seam assumes the mirror should be attempted and never reads a
+   * this; this seam assumes the mirror should be attempted and never reads an arm
    * flag itself.
+   *
+   * TRA-3486 — it DOES read `this.mode`, and that is the only benign early exit
+   * left. Until this ticket the head of this function was one shared guard:
+   *
+   *     if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0))
+   *       return true;
+   *
+   * `true` is the caller's "mirrored" verdict, so a null `tradierLiveClient`
+   * placed NO broker order and reported success — the caller then emitted a FILL
+   * alert, stamped `signal.mode = 'live'` and left the paper position in
+   * `openOptions` with its journal row at `outcome:'OPEN'`, `mode:'live'`. The
+   * TRA-3472 retraction could not cover it, because the void path was never
+   * taken: there was nothing to retract it FROM. Not theoretical — a null client
+   * under `mode === 'live'` is the TRA-2693 bistable window (a mid-pass `mode`
+   * flip), the same window the exit side needed `reapAbandonedStagedExits` for
+   * (see the note at ~:5258, where the submit half "returned early on a null
+   * `tradierLiveClient`"). The exit side got a reaper; the entry side reported
+   * success.
+   *
+   * All three conditions now VOID. That is not "when in doubt, void" — every
+   * caller (RV :9636, OTM :10556, directional :11850) is unconditionally inside
+   * `this.mode === 'live' && this.tradierLiveOptionsEnabled`, so "nothing to
+   * mirror" is not a category that reaches here: every position handed to this
+   * seam is a LIVE-book position that requires a broker leg to be real. The two
+   * non-client conditions were the ones flagged as risky to flip, so they are
+   * priced separately:
+   *
+   *   • `!opened.optionSymbol` — unreachable from all three callers today, since
+   *     both `RelativeValueSignal` and `OtmMispricingSignal` declare
+   *     `optionSymbol: string` and the account copies it onto the position
+   *     verbatim. If it ever DID arrive empty, the position would be not just
+   *     unbacked but unclosable: every live exit path keys on `optionSymbol`
+   *     (`submitStagedOptionExits`, `recordLiveOptionCloseToLedger`, the
+   *     liquidity shadow at :18670) and returns early without it.
+   *   • `!(opened.contracts > 0)` — `contracts <= 0` is already refused upstream
+   *     inside both `openOptionFromCandidate` and `openOptionFromRvCandidate`
+   *     (`if (contracts <= 0) return null`), so zero never gets here. What those
+   *     refusals do NOT catch is **NaN** — `NaN <= 0` is false, so the position
+   *     is created, and `!(NaN > 0)` is true, so the old guard called it
+   *     mirrored. That is the live-reachable half of this condition and it lands
+   *     in exactly the same unbacked-live-open state as a null client.
+   *
+   * So flipping them is a tightening with no measurable change on the reachable
+   * paths, and it closes the identical hole on the paths that are not.
+   *
+   * `mode !== 'live'` keeps the old permissive `return true`: a demo book has no
+   * broker leg to mirror, and this seam must never void a demo open. No caller
+   * reaches it today; it exists so that a future one cannot re-open the hole from
+   * the other side.
    */
   private async mirrorLiveOptionOpen(
     opened: import('@trading-app/shared').OptionPosition,
@@ -9695,16 +9743,11 @@ export class SignalEngine {
      */
     opts?: { sleeve?: LiveFillSleeve; walk?: MakerWalkConfig },
   ): Promise<boolean> {
-    if (!this.tradierLiveClient || !opened.optionSymbol || !(opened.contracts > 0)) {
-      return true;
-    }
-    // TRA-1980 — SHADOW-first pre-trade liquidity record at order-decision time
-    // (before the smart-open walk moves the book). Fire-and-forget: a no-op when the
-    // flag is off, and best-effort so it can never delay or throw into the fill path.
-    void this.recordOptionLiquidityShadow(opened);
-    const notionalCost = opened.premiumPaid * opened.contracts * 100;
     // TRA-332 — surface the void reason on the dashboard so the user sees why no
     // trade opened, not just a silent log line.
+    // TRA-3486 — hoisted above the entry guards (it was defined below them) so
+    // those guards can void too. It closes over nothing but `opened` and
+    // `surfaceLiveSkip`, so the move is position-independent.
     const tradierVoid = (reason: string): void => {
       log.warn('voiding paper open', {
         positionId: opened.id,
@@ -9746,6 +9789,35 @@ export class SignalEngine {
         });
       surfaceLiveSkip(reason);
     };
+
+    // TRA-3486 — the three entry conditions, split. See the header for why each
+    // one is a failure rather than a benign "nothing to mirror". Ordered
+    // client-first so the TRA-2693 window names itself in the void reason
+    // instead of hiding behind a generic one.
+    if (this.mode !== 'live') {
+      // The only surviving permissive branch: no live book, so no broker leg is
+      // expected and the paper open stands untouched.
+      return true;
+    }
+    if (!this.tradierLiveClient) {
+      tradierVoid('no live Tradier options client — broker seam unavailable (TRA-2693 mode-flip window)');
+      return false;
+    }
+    if (!opened.optionSymbol) {
+      tradierVoid('live open carries no option symbol — nothing to submit and no exit path could key on it');
+      return false;
+    }
+    if (!(opened.contracts > 0)) {
+      // `!( > 0)` and not `<= 0`: NaN is the case that gets here (a zero count is
+      // already refused by the account), and NaN fails BOTH comparisons.
+      tradierVoid(`live open carries a non-positive contract count (${String(opened.contracts)})`);
+      return false;
+    }
+    // TRA-1980 — SHADOW-first pre-trade liquidity record at order-decision time
+    // (before the smart-open walk moves the book). Fire-and-forget: a no-op when the
+    // flag is off, and best-effort so it can never delay or throw into the fill path.
+    void this.recordOptionLiquidityShadow(opened);
+    const notionalCost = opened.premiumPaid * opened.contracts * 100;
 
     // Pre-check: bail before submitting an order we know will be rejected.
     // `optionBuyingPower` is `null` for cash accounts on a raw payload — fall

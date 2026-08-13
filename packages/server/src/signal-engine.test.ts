@@ -1639,6 +1639,47 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     expect(state.signals[0].liveSkipReason).toContain('insufficient buying power');
   });
 
+  // TRA-3486 — the same caller-visible outcome, for the one abort branch that
+  // did NOT produce it. `mirrorLiveOptionOpen` used to `return true` on a null
+  // `tradierLiveClient`, and `true` is this caller's "mirrored" verdict: the scan
+  // ran straight past `if (!mirrored) continue;` into `emitOptionFillAlert` and
+  // stamped `signal.mode = 'live'`, so the dashboard showed a FILL and a live
+  // open position for an order that never reached a broker. Nothing voided it,
+  // so TRA-3472's journal retraction never fired either.
+  //
+  // A null client under `mode === 'live'` is not hypothetical — it is the
+  // TRA-2693 bistable window (a mid-pass `mode` flip), the same window the EXIT
+  // side needed `reapAbandonedStagedExits` for. The seam-level coverage lives in
+  // `tra3486-unbacked-live-open.test.ts`; this pins the consequence at the
+  // caller, which is where the phantom fill was actually user-visible.
+  it('voids and surfaces a skip instead of a PHANTOM FILL when the live broker client is null (TRA-3486)', async () => {
+    const scanner = freshScanner();
+    const engine = new SignalEngine(undefined, undefined, scanner);
+    (engine as unknown as { mode: 'demo' | 'live' }).mode = 'live';
+    // THE window: live mode, options routed, arm flag on — and no client.
+    (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = null;
+    seedRvTrend(engine);
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
+      totalEquity: 1000, totalCash: 300, optionBuyingPower: 999_999,
+    };
+
+    await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
+
+    const state = engine.getState();
+    // No unbacked live position, and no slot burned on an order nobody placed.
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    expect(state.options.closedOptions).toHaveLength(0);
+    // The signal is surfaced as SUPPRESSED, not as an entry. Pre-fix this row
+    // existed too — but with `liveSkipReason` undefined, because it was pushed
+    // by the FILL path, not by `surfaceLiveSkip`. That field is the whole
+    // difference between "we told the user why nothing opened" and "we told the
+    // user something opened".
+    expect(state.signals).toHaveLength(1);
+    expect(state.signals[0].liveSkipReason).toBeDefined();
+    expect(state.signals[0].liveSkipReason).toContain('no live Tradier options client');
+  });
+
   // TRA-1677 — the tests in this block arm ENABLE_OPTION_LIVE_RV_LONG to reach the
   // mirror mechanics. That arming is exactly what must NOT be true by default, so
   // pin the dark default here: with the flag off, a live RV scan places NO broker
