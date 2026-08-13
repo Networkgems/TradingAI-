@@ -101,6 +101,24 @@ describe('TRA-2922 — the suspended figure must not be readable under a second 
         closingEquityLatest: 2_603.49,
         closingEquityLatestDate: '2026-08-05',
         uncreditedOptionsUsd: -52.41,
+        // TRA-3589 — this fixture is the 2026-08-06 shape, which PREDATES the
+        // TRA-3349 broker boundary (2026-08-12). Its window sits wholly inside
+        // the paper era, so it does not straddle and the TRA-2922 identity is
+        // what suspends it — not the era gate. Set explicitly so a later change
+        // to the era default cannot silently re-route which rule this test
+        // grades.
+        uncreditedOptionsNotMeasuredReason: null,
+        postBaselineEquityGrowthSpansEquitySourceEras: false,
+        equitySourceEraBoundary: {
+          brokerOnsetDate: null,
+          brokerOnsetOpeningEquity: null,
+          priorEraRowDate: null,
+          priorEraRowEquitySourceEra: null,
+          priorEraRowClosingEquity: null,
+          restatementUsd: null,
+          eraCensus: { 'unstamped-pre-tra3349': 18 },
+          seriesSpansBrokerBoundary: false,
+        },
         postBaselineEquityGrowth: 595.2,
         postBaselineOptionsRealized: 561.6,
         postBaselineStockDaily: -18.81,
