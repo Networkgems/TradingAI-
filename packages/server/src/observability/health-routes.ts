@@ -416,7 +416,14 @@ export interface LiveHealthDeps {
 export interface LiveOtmAggregateExposure {
   /** `alertUsername`, joining to the journal `account` and the TRA-3117 census. */
   book: string | null;
+  /** ENGINE mode. ⚠ NOT the arm — see `liveEntryGateOpen`. */
   mode: 'demo' | 'live';
+  /**
+   * Can this book actually place a live options order? SUM THE FLEET ON THIS.
+   * bqb1 carries three `mode: 'live'` books and only two armed ones, so a
+   * `mode`-based sum overstates the fleet worst case by a whole cap.
+   */
+  liveEntryGateOpen: boolean;
   capUsd: number;
   openPremiumAtRiskUsd: number;
   openRows: number;
@@ -4081,8 +4088,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       //
       // SCOPE IS PER BOOK (TRA-3445 item 3): each engine sizes against its own
       // Tradier balance and there is no fleet accumulator, so N armed live
-      // books admit N × the cap. Sum `openPremiumAtRiskUsd` over the
-      // `mode: 'live'` rows to read the FLEET figure — it is not bounded here.
+      // books admit N × the cap. The fleet figure is a sum the reader takes —
+      // it is not bounded here — and it must be taken over the
+      // `liveEntryGateOpen` rows, NOT the `mode: 'live'` ones. bqb1 carries
+      // three of the latter and two of the former.
       aggregateExposure: deps.liveOtmAggregateExposure?.() ?? null,
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).

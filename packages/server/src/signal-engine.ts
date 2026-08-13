@@ -8258,6 +8258,7 @@ export class SignalEngine {
   getLiveOtmAggregateExposure(): {
     book: string | null;
     mode: 'demo' | 'live';
+    liveEntryGateOpen: boolean;
     capUsd: number;
     openPremiumAtRiskUsd: number;
     openRows: number;
@@ -8269,6 +8270,17 @@ export class SignalEngine {
     return {
       book: this.alertUsername ?? null,
       mode: this.mode,
+      // ⚠ SUM THE FLEET ON **THIS**, NOT ON `mode`. Measured on bqb1 the night
+      // this shipped: THREE books read `mode: 'live'` (admin, Richard, v0nni)
+      // while only TWO can place a live options order — Richard is live-mode on
+      // SANDBOX with no options client. A fleet worst case taken off `mode`
+      // reads $2,250; the true figure is $1,500. The engine mode is not the
+      // arm, and the two are indistinguishable without this field.
+      // `/api/health/options-live` → `liveArmCensus.books[].realMoneyArmed` is
+      // the authoritative predicate (it also sees production-vs-sandbox creds);
+      // this is the same gate as the engine itself holds it.
+      liveEntryGateOpen:
+        this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
       capUsd,
       openPremiumAtRiskUsd: atRisk.usd,
       openRows: atRisk.rows,

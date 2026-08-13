@@ -5469,7 +5469,7 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
 
   function serveFeeSlippage(
     liveOtmAggregateExposure?: () => Array<{
-      book: string | null; mode: 'demo' | 'live'; capUsd: number;
+      book: string | null; mode: 'demo' | 'live'; liveEntryGateOpen: boolean; capUsd: number;
       openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
       headroomUsd: number | null;
     }>,
@@ -5509,14 +5509,19 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
   });
 
   it('separates "armed, $600 headroom" from "armed, $0 headroom" per book', () => {
-    const body = serveFeeSlippage(() => [
-      { book: 'admin', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
-      { book: 'v0nni', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
-    ]);
-    expect(body.aggregateExposure).toEqual([
-      { book: 'admin', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
-      { book: 'v0nni', mode: 'live', capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
-    ]);
+    // Three live-MODE rows, TWO armed — the shape bqb1 actually serves. The
+    // fleet worst case is 2 x (, not 3: sum on `liveEntryGateOpen`.
+    const rows = [
+      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
+      { book: 'Richard', mode: 'live' as const, liveEntryGateOpen: false, capUsd: 750, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750 },
+      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
+    ];
+    const body = serveFeeSlippage(() => rows);
+    expect(body.aggregateExposure).toEqual(rows);
+    const armed = rows.filter((r) => r.liveEntryGateOpen);
+    expect(armed).toHaveLength(2);
+    expect(armed.reduce((s, r) => s + r.capUsd, 0)).toBe(1_500); // the disclosed fleet bound
+    expect(rows.filter((r) => r.mode === 'live')).toHaveLength(3); // the WRONG denominator
   });
 
   it('serves NULL when the provider is unwired — never [], which would claim "no books"', () => {

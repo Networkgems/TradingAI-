@@ -7661,13 +7661,33 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
     it('publishes headroom per book, so "armed, $600 left" is not "armed, $0 left"', async () => {
       const engine = richEngine(liveStub());
       expect(engine.getLiveOtmAggregateExposure()).toEqual({
-        book: 'admin', mode: 'live', capUsd: 750,
+        book: 'admin', mode: 'live', liveEntryGateOpen: true, capUsd: 750,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
       });
 
       seedOpenLivePremium(engine, 700);
       expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
         openPremiumAtRiskUsd: 700, openRows: 1, headroomUsd: 50,
+      });
+    });
+
+    // Measured on bqb1: THREE books read `mode: 'live'` and only TWO can place
+    // a live options order. A fleet sum taken off `mode` reads $2,250 against a
+    // true worst case of $1,500 — so the two fields must not be able to collapse
+    // into each other.
+    it('a live-MODE book with no options client is NOT counted as an armed one', () => {
+      const engine = richEngine(liveStub());
+      // Richard's shape: mode live, no live options client.
+      (engine as unknown as { tradierLiveClient: unknown }).tradierLiveClient = null;
+      const row = engine.getLiveOtmAggregateExposure();
+      expect(row.mode).toBe('live');       // the field a naive fleet sum uses…
+      expect(row.liveEntryGateOpen).toBe(false); // …and the one that is correct
+    });
+
+    it('a DEMO book reports the gate CLOSED, not merely a demo mode', () => {
+      const engine = engineFor('demo', liveStub());
+      expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
+        mode: 'demo', liveEntryGateOpen: false,
       });
     });
   });
