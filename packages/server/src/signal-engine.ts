@@ -327,7 +327,7 @@ import { resolveMakerWalkConfig, type MakerWalkConfig } from './option-maker-con
  * this only bounds the pathological case where the tick stops draining them.
  */
 const SHADOW_CHASE_MAX_IN_FLIGHT = 200;
-import { recordOptionTradeEntrySlippage } from './option-trade-journal.js';
+import { recordOptionTradeEntrySlippage, recordOptionTradeVoid } from './option-trade-journal.js';
 import { isLiveEntryGatePassed } from './capital-gate-manifest.js';
 import { isSma200DemoForwardTestEnabled } from './sma200-forward-test-flag.js';
 import { resolveDemoFlagEnv } from './demo-flags.js';
@@ -9494,6 +9494,34 @@ export class SignalEngine {
         reason,
       });
       this.optionsAccount.voidOpenOption(opened.id);
+      // TRA-3472 — retract the journal OPEN too. The row was written BEFORE this
+      // function contacted the broker (the paper open calls `queueJournalOpen`
+      // synchronously), and `voidOpenOption` only deletes the POSITION — so
+      // without this the row sat at `outcome:'OPEN'` on a live book forever, for
+      // an order that never filled, with no position left for any close path to
+      // key on. Six such rows were measured on the real admin book, the newest
+      // opened 2026-08-11.
+      //
+      // The flush is load-bearing, not defensive. `queueJournalOpen` CHAINS the
+      // append onto `OptionsAccount.journalWrites` rather than awaiting it, so a
+      // bare `recordOptionTradeVoid(id)` here races it and loses on the common
+      // path: the void would find no row, no-op, and then the open would land —
+      // leaving exactly the stranded row this is meant to remove, but now with a
+      // retraction that appears to have run. Awaiting the chain first is what
+      // makes the retraction ordered behind the write it retracts.
+      //
+      // Fire-and-forget after that: a journal write must never delay or throw
+      // into the order path (same posture as the entry-slippage amend below).
+      void this.optionsAccount
+        .flushOptionTradeJournal()
+        .then(() => recordOptionTradeVoid(opened.id))
+        .catch((err: unknown) => {
+          log.warn('option trade journal void failed', {
+            positionId: opened.id,
+            optionSymbol: opened.optionSymbol,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        });
       surfaceLiveSkip(reason);
     };
 

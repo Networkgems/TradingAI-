@@ -439,7 +439,23 @@ type AmendEntrySlippageLine = { kind: 'amend_entry_slippage'; id: string; entryS
 // TRA-2895 — a partial exit, dated on its own day. Appended while the position
 // is still OPEN; the eventual close row stays cumulative.
 type PartialCloseLine = { kind: 'partial_close'; id: string; partial: OptionTradeJournalPartial };
-type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine | PartialCloseLine;
+// TRA-3472 — RETRACT an OPEN row for an order that never reached a fill. The
+// live open paths write the journal row BEFORE the broker is contacted (see the
+// TRA-1601 note above — that ordering is what `amend_entry_slippage` exists to
+// patch up), so every abort inside `mirrorLiveOptionOpen` used to leave a
+// `mode:'live'` row stranded at `outcome:'OPEN'` forever: `voidOpenOption`
+// deletes the position, and the close path keys on a position id that no longer
+// exists, so nothing could ever settle it.
+//
+// A retraction, not a fourth `OptionTradeOutcome`. The row must LEAVE the
+// population rather than join it under a new label: a trade that never filled
+// has no entry basis, no realized R and no exit reason, so every summary,
+// cross-tab and learner fold would need a new branch to exclude it — and each
+// one of those is a place to forget. Deleting it needs none, because the fold is
+// a replay over an append-only log: the `void` line supersedes the `open` line
+// the same way `close` does, and the file still never rewrites a byte.
+type VoidLine = { kind: 'void'; id: string };
+type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine | PartialCloseLine | VoidLine;
 
 function defaultStoreFile(): string {
   const root = resolveDataDir();
@@ -519,6 +535,20 @@ function foldLine(map: Map<string, OptionTradeJournalRecord>, line: JournalLine)
     const p = line.partial;
     if (!Number.isFinite(p?.ts) || !Number.isFinite(p?.realizedPnlUsd)) return;
     map.set(line.id, { ...rec, partials: [...(rec.partials ?? []), p] });
+    return;
+  }
+  if (line.kind === 'void') {
+    // TRA-3472 — retract an OPEN row whose order never filled. Guarded on
+    // `outcome === 'OPEN'`: a void arriving after a close would otherwise
+    // ERASE a settled round trip, which is a strictly worse failure than the
+    // stranded row this fixes. The two are serialised on the same
+    // `journalWrites` chain in practice; this refuses out-of-order anyway
+    // rather than trusting call order (same posture as `partial_close`).
+    // An unknown id is a no-op, so a replayed void can never delete a row it
+    // did not open.
+    const rec = map.get(line.id);
+    if (!rec || rec.outcome !== 'OPEN') return;
+    map.delete(line.id);
     return;
   }
   const existing = map.get(line.id);
@@ -729,6 +759,64 @@ export async function recordOptionTradeClose(
   // refresh subscribers so the next selection read recomputes (intraday) rather
   // than waiting for the EOD snapshot.
   notifyClose(id, close);
+}
+
+/**
+ * TRA-3472 — RETRACT the OPEN row for an order that never reached a fill.
+ *
+ * ── The hole this closes ───────────────────────────────────────────────────
+ *
+ * The live open paths journal the OPEN **before** contacting the broker
+ * (`signal-engine.ts` opens the paper position, which calls `queueJournalOpen`,
+ * and only then awaits `mirrorLiveOptionOpen`). Every abort inside that mirror
+ * — OBP pre-check, DTBP guard, liquidity/spread veto, `rejected`,
+ * `walk_exhausted`, `no_quote`, or a throw — funnels into `tradierVoid`, which
+ * calls `OptionsAccount.voidOpenOption` to refund the cash and DELETE the
+ * position.
+ *
+ * Nothing retracted the journal row. The position id it keys on was gone, so
+ * `queueJournalClose` could never settle it and no exit path could ever reach
+ * it: the row read `outcome: 'OPEN'` on a live book, forever, for a trade that
+ * never happened.
+ *
+ * Measured on the real admin book (TRA-3472): six of the thirteen stale live
+ * OPEN rows had NO broker fill in the durable fee/slippage ledger on either
+ * leg, the most recent of them opened 2026-08-11, six days after the TRA-2937
+ * fix that was assumed to cover this shape. It does not — that fix is about
+ * DROPPED CLOSES on filled trades, which is the other seven rows. A never-filled
+ * row is not a lost exit and must never be backfilled as one.
+ *
+ * ── Retract, don't relabel ─────────────────────────────────────────────────
+ *
+ * The row is DELETED rather than moved to a fourth `OptionTradeOutcome`. A
+ * trade that never filled has no entry basis, no realized R and no exit reason,
+ * so a new label would oblige every summary, cross-tab, expectancy fold and
+ * learned-weights read to grow an exclusion branch — and each of those is a
+ * place to forget one. Deletion needs none of them.
+ *
+ * The store is still append-only: this writes a `void` line that the replay
+ * fold applies, exactly as `close` supersedes `open`. No byte is rewritten.
+ *
+ * No-op (returns false) when the flag is off, the id is unknown, or the row is
+ * ALREADY CLOSED. That last guard is the important one — a void that could
+ * unwind a settled round trip would be a strictly worse defect than the
+ * stranded row it fixes.
+ */
+export async function recordOptionTradeVoid(id: string): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome !== 'OPEN') return false;
+  foldLine(map, { kind: 'void', id });
+  await appendLine({ kind: 'void', id });
+  log.info('option trade journal open VOIDED (order never filled)', {
+    id,
+    symbol: existing.symbol,
+    optionSymbol: existing.optionSymbol,
+    structure: existing.structure,
+    mode: existing.mode,
+  });
+  return true;
 }
 
 /** Classify a signed R-multiple into a WIN/LOSS/SCRATCH verdict. */
