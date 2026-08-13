@@ -91,13 +91,33 @@
  * copy-pasteable PATCH built on that field, alongside four lines of prose
  * warning not to run it. Prose does not survive a copy-paste.
  *
- * So: this script emits NO repair PATCH, ever. What it emits instead is an
- * ANCHOR VERDICT — every rollup candidate resolved against the parent chain and
- * every descendant/self/ancestor/closed one struck out. When nothing survives,
- * the true and actionable message is "no valid anchor: every unresolved blocker
- * in the rollup is a descendant", and that is what it prints. The rollup COUNT
- * is still printed: work really is parked downstream. Only the anchor
- * suggestion had to go.
+ * So: this script emits no ANCHOR-BEARING repair PATCH, ever. What it emits
+ * instead is an ANCHOR VERDICT — every rollup candidate resolved against the
+ * parent chain and every descendant/self/ancestor/closed one struck out. When
+ * nothing survives, the true and actionable message is "no valid anchor: every
+ * unresolved blocker in the rollup is a descendant", and that is what it prints.
+ * The rollup COUNT is still printed: work really is parked downstream. Only the
+ * anchor suggestion had to go.
+ *
+ *   ⚠ AMENDED, ONE COHORT ONLY (TRA-3451). The rule above is about a GUESSED
+ *   restore. It does not reach a `stranded_assigned_issue` row, because there
+ *   the restore target is READ, not guessed: the recovery payload carries
+ *   `evidence.previousStatus` AND `returnOwnerAgentId` — the two values the CTO
+ *   and CEO typed by hand 31 times on 2026-08-12 with zero judgement calls. For
+ *   that cohort exactly (and only when the interaction route confirmed ZERO
+ *   pending cards) the report emits the two-step restore, in order:
+ *
+ *        PATCH {"status":"todo"}                    ← never `done`; `todo` is
+ *                                                     queue-visible AND still
+ *                                                     counts upstream
+ *        PATCH {"assigneeAgentId": returnOwner}     ← LAST; it is one-way
+ *
+ *   It NEVER re-sends the write-only blocker key: there is no open anchor, and
+ *   an empty write-key list reproduces the born-blocked state. The generic
+ *   shape-1 no-repair rule is untouched — the discriminator is `restore target:
+ *   KNOWN` vs `NONE`, which this script already computes. `deriveRepair()` is
+ *   the branch; the global control now allows ONLY those two verbs and still
+ *   forbids the blocker key everywhere.
  *
  * ⛔ THE CAUSE IS A BRANCH, NOT A SENTENCE (TRA-2396). Two different writers
  * produce `blocked` + empty, and they need OPPOSITE repairs:
@@ -124,6 +144,35 @@
  *   ⛔ And an UNREAD comment thread is not an absent marker. A failed comment
  *   GET yields cause UNKNOWN, never DROPPED-EDGE — otherwise the inference
  *   would be strongest exactly where we read least.
+ *
+ * ⛔ THE WAKE SUPPRESSION HAS AN EXPIRY (TRA-3451). A finding whose recovery
+ * action is `active` with a `wake_owner` policy used to be annotated "platform
+ * wake ALREADY ACTIVE … Do NOT file a duplicate" and dropped from the routing
+ * table, unconditionally. The DETECTION was always right — the row is graded
+ * shape 1 and printed either way — but the reporting rule then converted a
+ * correct detection into a non-filing, and that is how this event recurred
+ * three times (TRA-3105 62 rows, TRA-3365/TRA-3366, 2026-08-12's 47) with the
+ * detector green-by-suppression every time.
+ *
+ * The premise "an active wake_owner action is a live continuation path" was
+ * falsified at scale on 2026-08-12: 47 `stranded_assigned_issue` actions minted
+ * in three bursts, ALL still `status: active` at `attemptCount: 1` when the
+ * sweep read them — the oldest 13h old — and ZERO drained on their own; all 47
+ * were cleared by hand. An active wake that has not advanced in 13h is not a
+ * continuation path. It IS the strand.
+ *
+ * So the suppression is AGE-GATED: it applies only while the wake is FRESH AND
+ * ADVANCING. "Advancing" is read off `lastAttemptAt` (an `attemptCount` bump
+ * writes it), so a 13h-old action that retried five minutes ago still
+ * suppresses, and a 3h-old one stuck at attempt 1 does not. Past the bound the
+ * row is FILED and says why: "wake ACTIVE but STALE @ Nh, attemptCount 1 — not
+ * draining". An action with NO readable timestamp is treated as STALE, not
+ * fresh: the suppression must not be strongest exactly where we read least.
+ *
+ * The bound (`WAKE_STALE_AFTER_MS`) MUST stay well under the sweep interval.
+ * The sweep that consumes this runs twice daily; a bound at or above ~12h means
+ * a wake minted just after fire N is still "fresh" at fire N+1 and the board
+ * goes silent for a whole cycle — the exact hole this replaces.
  *
  * THE TWO SILENT READS THIS SCRIPT EXISTS TO SURVIVE
  * --------------------------------------------------
@@ -572,6 +621,92 @@ export function gradeBlockerSet(blockedBy, label = 'issue') {
 }
 
 /* ------------------------------------------------------------------ *
+ * The platform wake — a suppression with an EXPIRY (TRA-3451)
+ *
+ * See the header. An `active` `wake_owner` recovery action suppresses ROUTING
+ * (never detection) only while it is fresh AND advancing. Everything else
+ * files.
+ * ------------------------------------------------------------------ */
+
+/**
+ * How long an unadvanced `active` wake may still be called a continuation path.
+ *
+ * ⛔ Do not raise this to "safely" above the observed drain time. It is bounded
+ * ABOVE by the sweep interval, not below by platform latency: the twice-daily
+ * sweep is the reader, so a bound ≥ ~12h means a wake minted right after one
+ * fire is still "fresh" at the next one and nothing is ever filed. 2h is well
+ * under the 13h non-drain measured on 2026-08-12 and well under half a cycle.
+ * A false FILE costs one extra row in a report; a false SUPPRESS costs a
+ * silent board, which is the defect this constant exists to fix.
+ */
+export const WAKE_STALE_AFTER_MS = 2 * 60 * 60 * 1000;
+
+const hoursOf = (ms) => (ms === null || ms === undefined ? null : Math.round((ms / 3600000) * 10) / 10);
+
+/**
+ * Grade the platform wake attached to a recovery action. Pure; `nowMs` is
+ * injected so the controls can pin both branches instead of racing the clock.
+ *
+ * Returns `null` when there is no live wake at all (no recovery, not `active`,
+ * or no `wake_owner` policy) — i.e. nobody is coming for this one.
+ *
+ * `suppresses` is the ONLY field the routing table may read. `stale` is the
+ * reason, and both are printed.
+ */
+export function gradeWake(recovery, nowMs) {
+  if (!recovery || recovery.status !== 'active') return null;
+  const policy = recovery.wakePolicy || null;
+  if (!policy || policy.type !== 'wake_owner') return null;
+
+  const ownerAgentId = policy.ownerAgentId || recovery.ownerAgentId || null;
+  const attemptCount = Number.isFinite(recovery.attemptCount) ? recovery.attemptCount : null;
+  // The ADVANCE stamp, not the birth stamp. `attemptCount` bumps write
+  // `lastAttemptAt`, so this is the stateless equivalent of "did attemptCount
+  // increase since the previous fire" — and it is strictly better, because it
+  // needs no memory of the previous fire to answer.
+  const lastAdvanceAt = recovery.lastAttemptAt || recovery.updatedAt || recovery.createdAt || null;
+  const advanceMs = lastAdvanceAt ? Date.parse(lastAdvanceAt) : NaN;
+
+  if (!Number.isFinite(advanceMs) || !Number.isFinite(nowMs)) {
+    // Fail LOUD, in the filing direction. An unreadable stamp cannot establish
+    // that the wake is advancing, and the whole bug was a suppression that did
+    // not have to prove anything.
+    return {
+      ownerAgentId,
+      attemptCount,
+      lastAdvanceAt,
+      ageMs: null,
+      ageHours: null,
+      stale: true,
+      suppresses: false,
+      why:
+        'no readable advance timestamp on the recovery action — freshness could NOT be established, so the ' +
+        'suppression does not apply. Absent is not fresh.',
+    };
+  }
+
+  const ageMs = nowMs - advanceMs;
+  const stale = ageMs > WAKE_STALE_AFTER_MS;
+  return {
+    ownerAgentId,
+    attemptCount,
+    lastAdvanceAt,
+    ageMs,
+    ageHours: hoursOf(ageMs),
+    stale,
+    suppresses: !stale,
+    why: stale
+      ? `wake ACTIVE but STALE @ ${hoursOf(ageMs)}h since its last attempt` +
+        `${attemptCount === null ? '' : `, attemptCount ${attemptCount}`} — not draining. ` +
+        'An active action that has not advanced is not a continuation path, it IS the strand ' +
+        '(measured 2026-08-12: 47 of 47 sat active at attempt 1, oldest 13h, zero drained).'
+      : `wake ACTIVE and fresh @ ${hoursOf(ageMs)}h since its last attempt` +
+        `${attemptCount === null ? '' : `, attemptCount ${attemptCount}`} — inside the ` +
+        `${hoursOf(WAKE_STALE_AFTER_MS)}h bound, so the owner really is being poked right now.`,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Restore target — a value + provenance. Never a command.
  * ------------------------------------------------------------------ */
 
@@ -676,13 +811,83 @@ export function deriveRestoreTarget({ item, blockers, pendingInteractions }) {
   return { target, provenance, overrode: null, why };
 }
 
+/* ------------------------------------------------------------------ *
+ * The repair — emitted for ONE cohort, where the target is READ (TRA-3451)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Pure. Decide whether this finding's repair is mechanical, and what it is.
+ *
+ * ELIGIBLE requires all four, and every one of them is a READ, not a guess:
+ *
+ *   1. `recoveryKind === 'stranded_assigned_issue'` — the platform's own
+ *      terminal-run recovery wrote this `blocked`. No agent intended an anchor.
+ *   2. `restoreTarget.provenance === FROM_EVIDENCE` — the payload carried
+ *      `evidence.previousStatus`, so the leaf's prior state is known.
+ *   3. `returnOwnerAgentId` (or `previousOwnerAgentId`) is present — the real
+ *      owner is NAMED in the payload; we are not inferring it from the thread.
+ *   4. `pendingInteractions === 0` — KNOWN zero, never `null`. The repair
+ *      demotes to `todo`, and demoting a leaf that holds a live card buries a
+ *      decision a human is expected to answer (TRA-2598). Unknown ⇒ no repair.
+ *
+ * ⛔ The written status is `todo`, NOT the `previousStatus` that was read.
+ * `in_progress` is what the recovery reconciler mints strands FROM: restoring
+ * it hands back a leaf with no live run, which the next reconciler pass
+ * re-blocks. `todo` is queue-visible AND still counts as an unresolved blocker
+ * upstream, so nothing is lost. And never `done` — that discards the work.
+ *
+ * ⛔ The assignee write goes LAST. It is one-way: once the issue leaves this
+ * actor's boundary the status PATCH would 403.
+ */
+export function deriveRepair(f) {
+  const no = (why) => ({ eligible: false, status: null, assigneeAgentId: null, restoredFrom: null, why });
+
+  if (f.recoveryKind !== 'stranded_assigned_issue') {
+    return no(
+      `restore target is not mechanically known for recovery kind \`${f.recoveryKind || 'none'}\` — the generic ` +
+        'rule stands (TRA-2396): routing is this detector\'s job and the anchor is the assignee\'s to re-derive.',
+    );
+  }
+  if (!f.recoveryReturnOwnerAgentId) {
+    return no(
+      'a `stranded_assigned_issue` row, but NO `returnOwnerAgentId` in the payload — the second step would be a ' +
+        'guess at who owns it. Route it instead.',
+    );
+  }
+  // Ordered BEFORE the provenance test on purpose: a live card REWRITES the
+  // restore target to `in_review`, so testing provenance first would report
+  // "no evidence.previousStatus" on a row that plainly carried one.
+  if (f.pendingInteractions !== 0) {
+    return no(
+      `pending interactions: ${f.pendingInteractions === null ? 'UNKNOWN (route unread)' : f.pendingInteractions} — ` +
+        'the repair demotes to `todo` and a leaf holding a live card rests at `in_review`. Unknown is not zero.',
+    );
+  }
+  const rt = f.restoreTarget || {};
+  if (rt.provenance !== RESTORE.FROM_EVIDENCE || !rt.target) {
+    return no(
+      'a `stranded_assigned_issue` row, but the payload carried no `evidence.previousStatus` — the restore ' +
+        `target is ${rt.target ? `\`${rt.target}\` from ${rt.provenance}` : 'NONE'}, which is a derivation, not a read.`,
+    );
+  }
+  return {
+    eligible: true,
+    status: 'todo',
+    assigneeAgentId: f.recoveryReturnOwnerAgentId,
+    restoredFrom: rt.target,
+    why:
+      `previousStatus was \`${rt.target}\` and returnOwnerAgentId is named in the payload — both READ. This is the ` +
+      'same two-step the CTO and CEO ran by hand 31 times on 2026-08-12 with zero judgement calls.',
+  };
+}
+
 /**
  * Grade ONE item-route payload.
  *
  * `null` means "not in the shape". A string reason on `.unreadable` means the
  * payload could not be graded at all — which is BLIND, not clean.
  */
-export function classifyIssue(item, roster, { graph = null } = {}) {
+export function classifyIssue(item, roster, { graph = null, now = null } = {}) {
   if (!item || typeof item !== 'object') {
     return { unreadable: 'item payload was not an object' };
   }
@@ -782,16 +987,29 @@ export function classifyIssue(item, roster, { graph = null } = {}) {
     recoveryCause: recovery ? recovery.cause || null : null,
     recoveryStatus: recovery ? recovery.status || null : null,
     recoveryAt: recovery ? recovery.createdAt || recovery.updatedAt || null : null,
-    // Whether anyone is ALREADY being woken for this. An active recovery action
-    // with a `wake_owner` policy is a live continuation path; a finding with
-    // none has nobody coming for it. Both are findings — the shape is the
-    // defect either way — but only the second needs a fresh wake, and filing
-    // one against the first is a duplicate wake on an owner the platform is
-    // already poking. Do not remediate overload with a fan-out.
+    recoveryAttemptCount: recovery && Number.isFinite(recovery.attemptCount) ? recovery.attemptCount : null,
+    // The agent the recovery action says the issue belongs BACK to. This is the
+    // second half of the mechanical repair (TRA-3451) and it is a READ: the
+    // platform names it on the payload. `previousOwnerAgentId` is the same value
+    // on every row measured so far; it is a fallback, not an inference.
+    recoveryReturnOwnerAgentId: recovery ? recovery.returnOwnerAgentId || recovery.previousOwnerAgentId || null : null,
+    // Whether anyone is ALREADY being woken for this. Both are findings — the
+    // shape is the defect either way — but only a row with no live wake needs a
+    // fresh one, and filing against a live one is a duplicate wake on an owner
+    // the platform is already poking. Do not remediate overload with a fan-out.
+    //
+    // ⛔ "Live" is AGE-GATED (TRA-3451). This field says an active wake_owner
+    // action EXISTS; `platformWake.suppresses` says whether it is still
+    // advancing. Only the second may remove a row from the routing table — the
+    // unconditional read is what went silent on 47 rows.
     platformWakeOwnerAgentId:
       recovery && recovery.status === 'active' && recovery.wakePolicy && recovery.wakePolicy.type === 'wake_owner'
         ? recovery.wakePolicy.ownerAgentId || recovery.ownerAgentId || null
         : null,
+    platformWake: gradeWake(recovery, Number.isFinite(now) ? now : Date.now()),
+    // Filled in by sweep() once the restore target and the interaction count are
+    // known — both are inputs to the eligibility test.
+    repair: null,
   };
 }
 
@@ -828,6 +1046,9 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
 
   const hits = [];
   const unreadable = [];
+  // One clock for the whole sweep, injectable so the wake-age controls pin a
+  // branch instead of racing the wall clock.
+  const nowMs = Number.isFinite(opts.now) ? opts.now : Date.now();
   const concurrency = Math.max(1, Number(opts.concurrency || CONCURRENCY));
   let cursor = 0;
 
@@ -841,7 +1062,7 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
         unreadable.push(`${row.identifier || row.id}: item GET threw — ${err?.message || err}`);
         continue;
       }
-      const graded = classifyIssue(item, roster, { graph });
+      const graded = classifyIssue(item, roster, { graph, now: nowMs });
       if (graded && graded.unreadable) unreadable.push(graded.unreadable);
       else if (graded) hits.push({ graded, item });
     }
@@ -907,6 +1128,9 @@ export async function sweep({ getIssuesPage, getIssue, listAgents, getComments, 
         blockers,
         pendingInteractions: pending,
       });
+      // Strictly last: eligibility reads BOTH the restore target and the
+      // interaction count, so it cannot be computed in classifyIssue().
+      entry.graded.repair = deriveRepair(entry.graded);
     }),
   );
 
@@ -1074,11 +1298,42 @@ export function renderReport(result) {
           `  recovery=${f.recoveryKind || 'none'}${f.recoveryCause ? `/${f.recoveryCause}` : ''}` +
           `${f.recoveryStatus ? `:${f.recoveryStatus}` : ''}${f.recoveryAt ? ` @ ${f.recoveryAt}` : ''}`,
       );
-      L.push(
-        wakeOwner
-          ? `     platform wake ALREADY ACTIVE -> ${wakeOwner}. Do NOT file a duplicate; the owner is being poked.`
-          : `     no platform wake — nobody is coming for this one unless it is routed.`,
-      );
+      const wake = f.platformWake || null;
+      if (!wakeOwner) {
+        L.push('     no platform wake — nobody is coming for this one unless it is routed.');
+      } else if (wake && wake.suppresses) {
+        L.push(`     platform wake ACTIVE and ADVANCING -> ${wakeOwner}. Do NOT file a duplicate; the owner is being poked.`);
+        L.push(`       ${wake.why}`);
+      } else {
+        L.push(
+          `     platform wake ACTIVE but STALE -> ${wakeOwner}` +
+            `${wake && wake.ageHours !== null ? ` @ ${wake.ageHours}h` : ''}` +
+            `${wake && wake.attemptCount !== null ? `, attemptCount ${wake.attemptCount}` : ''}` +
+            ' — NOT draining. FILE IT.',
+        );
+        L.push(`       ${wake ? wake.why : 'freshness could not be established'}`);
+      }
+      // The repair. Emitted ONLY where the restore target and the owner were both
+      // READ off the recovery payload (TRA-3451); every other row keeps the
+      // generic no-command rule (TRA-2396) and prints the reason it kept it.
+      const rep = f.repair || null;
+      if (rep && rep.eligible) {
+        const back = (result.roster.get(rep.assigneeAgentId) || {}).name || rep.assigneeAgentId;
+        L.push('     repair KNOWN (stranded_assigned_issue) — two steps, in THIS order:');
+        L.push(`       RESTORE-PATCH 1/2  PATCH /api/issues/${f.id} {"status":"${rep.status}"}`);
+        L.push(`       RESTORE-PATCH 2/2  PATCH /api/issues/${f.id} {"assigneeAgentId":"${rep.assigneeAgentId}"}   # -> ${back}`);
+        L.push(`       ${rep.why}`);
+        L.push(
+          `       \`${rep.status}\`, never \`done\` and never the read \`${rep.restoredFrom}\`: todo is queue-visible AND ` +
+            'still counts as an unresolved blocker upstream, while in_progress is what the reconciler mints strands FROM.',
+        );
+        L.push(
+          '       Assign LAST — it is one-way; after it the status PATCH is a 403. Do NOT re-send the WRITE-ONLY ' +
+            'blocker key: there is no open anchor, and an empty write-key list reproduces the born-blocked state.',
+        );
+      } else if (rep) {
+        L.push(`     no repair command (the TRA-2396 rule stands here): ${rep.why}`);
+      }
       // The cause branch and the anchor verdict. Both are here because both were
       // getting improvised into filings (TRA-2396): the cause asserted from a
       // guess, the anchor lifted from a rollup that only ever samples descendants.
@@ -1100,8 +1355,14 @@ export function renderReport(result) {
   // Routing table. Repair is assignee-scoped, so the actionable unit is the
   // OWNER, not the issue — and one child issue per owner, never a fan-out of
   // N wakes (the failure mode that caused this shape is session-limit load).
-  const routable = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter((f) => !f.platformWakeOwnerAgentId);
-  const alreadyWoken = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter((f) => f.platformWakeOwnerAgentId);
+  //
+  // ⛔ The suppression predicate is `platformWake.suppresses`, NOT the mere
+  // existence of an active wake (TRA-3451). A wake that has not advanced past
+  // the bound routes like any other finding — it is the strand, not a path.
+  const suppressed = (f) => Boolean(f.platformWake && f.platformWake.suppresses);
+  const routable = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter((f) => !suppressed(f));
+  const alreadyWoken = (bySeverity.get(SEVERITY.ROUTE_TO_ASSIGNEE) || []).filter(suppressed);
+  const staleWakes = routable.filter((f) => f.platformWakeOwnerAgentId);
   if (routable.length) {
     const byOwner = new Map();
     for (const f of routable) {
@@ -1114,13 +1375,35 @@ export function renderReport(result) {
     for (const [owner, ids] of byOwner) L.push(`   ${owner}  ->  ${ids.join(', ')}`);
     L.push('');
   }
+  if (staleWakes.length) {
+    L.push(`STALE WAKES  ${staleWakes.length} of the routable rows above carry an \`active\` wake_owner recovery`);
+    L.push(`             action that has NOT advanced inside the ${hoursOf(WAKE_STALE_AFTER_MS)}h bound. They are routed ON PURPOSE.`);
+    L.push('             An active action stuck at its first attempt is not a continuation path — measured');
+    L.push('             2026-08-12: 47 of 47 sat `active` at attemptCount 1, oldest 13h, and ZERO drained on');
+    L.push('             their own. Suppressing these is how the board went silent through three of these events:');
+    for (const f of staleWakes) {
+      const w = (result.roster.get(f.platformWakeOwnerAgentId) || {}).name || f.platformWakeOwnerAgentId;
+      const wk = f.platformWake || {};
+      L.push(
+        `   ${f.identifier || f.id}  wake -> ${w}` +
+          `${wk.ageHours !== null && wk.ageHours !== undefined ? `, stale ${wk.ageHours}h` : ', age UNREADABLE'}` +
+          `${wk.attemptCount !== null && wk.attemptCount !== undefined ? `, attemptCount ${wk.attemptCount}` : ''}`,
+      );
+    }
+    L.push('');
+  }
   if (alreadyWoken.length) {
-    L.push('do NOT route  a live recovery action is already waking the owner on these. They are');
-    L.push('              still findings — the empty array is still an auto-flip risk — but a');
-    L.push('              fresh child issue here is a duplicate wake, not a remedy:');
+    L.push('do NOT route  a live recovery action is already waking the owner on these AND it is still');
+    L.push(`              advancing (inside the ${hoursOf(WAKE_STALE_AFTER_MS)}h bound). They are still findings — the empty array`);
+    L.push('              is still an auto-flip risk — but a fresh child issue here is a duplicate wake,');
+    L.push('              not a remedy. Re-run after the bound: if it has not advanced by then it FILES.');
     for (const f of alreadyWoken) {
       const w = (result.roster.get(f.platformWakeOwnerAgentId) || {}).name || f.platformWakeOwnerAgentId;
-      L.push(`   ${f.identifier || f.id}  (platform is waking ${w})`);
+      const wk = f.platformWake || {};
+      L.push(
+        `   ${f.identifier || f.id}  (platform is waking ${w}` +
+          `${wk.ageHours !== null && wk.ageHours !== undefined ? `, last advance ${wk.ageHours}h ago` : ''})`,
+      );
     }
     L.push('');
   }
@@ -1174,12 +1457,25 @@ export function renderReport(result) {
   L.push('          blocker" — that is a 2-cycle neither side can break. `todo` is the correct');
   L.push('          disposition for a parked-ready leaf.');
   L.push('');
-  L.push('no repair command is emitted, on purpose (TRA-2396). The rollup field that used to');
-  L.push('supply the anchor samples DESCENDANTS, so an edge built from it is a guaranteed');
+  const repairable = result.findings.filter((f) => f.repair && f.repair.eligible);
+  L.push('no ANCHOR-BEARING repair command is emitted, on purpose (TRA-2396). The rollup field that');
+  L.push('used to supply the anchor samples DESCENDANTS, so an edge built from it is a guaranteed');
   L.push('2-cycle — worse than the empty array, because an empty blockedBy at least auto-flips');
   L.push('and stays visible. A wrong repair command is worse output than none: routing is this');
   L.push('detector\'s job, and the anchor is the assignee\'s to re-derive. Paste the `cause:` line');
   L.push('as-is when you file — it is branched on the marker, not guessed.');
+  L.push('');
+  // ⚠ Do NOT write the row-level sentinel into this prose. The controls assert
+  // its ABSENCE on every board that emits no repair, so a mention here would
+  // green four negative controls by accident.
+  L.push(
+    `ONE cohort is exempt (TRA-3451): ${repairable.length} row(s) above carry a two-step restore pair. They are ` +
+      '`stranded_assigned_issue`',
+  );
+  L.push('rows whose restore target and return owner were both READ off the recovery payload');
+  L.push('(`evidence.previousStatus` + `returnOwnerAgentId`), with the interaction route confirming');
+  L.push('ZERO pending cards. Nothing there is inferred, so there is nothing to get wrong. Every');
+  L.push('other row keeps the rule above and prints the reason it kept it.');
   return L;
 }
 
@@ -1346,6 +1642,51 @@ const stranded = (id, ident, assignee, extra = {}) => ({
 });
 
 /**
+ * The 2026-08-12 cohort, verbatim in shape from a live `stranded_assigned_issue`
+ * payload (recovery action fc93ac5d on TRA-2102): `attemptCount`,
+ * `lastAttemptAt`, `returnOwnerAgentId`/`previousOwnerAgentId` and
+ * `evidence.previousStatus` are all real fields, not invented for the fixture.
+ *
+ * The bursts that day minted at 11:39Z and were still `active` at attempt 1
+ * when the sweep read them ~13h later, so the defaults reproduce exactly that.
+ */
+const MINTED_AT = '2026-08-12T11:39:00.000Z';
+const NOW_STALE = Date.parse('2026-08-12T22:30:00.000Z'); // 10.9h after the mint
+const NOW_FRESH = Date.parse('2026-08-12T12:00:00.000Z'); // 21m after the mint
+
+const recoveryStrand = (
+  id,
+  ident,
+  assignee,
+  {
+    kind = 'stranded_assigned_issue',
+    status = 'active',
+    attemptCount = 1,
+    createdAt = MINTED_AT,
+    lastAttemptAt = null,
+    wakeOwner = 'agent-cfo',
+    returnOwner = 'agent-cto',
+    previousStatus = 'in_progress',
+  } = {},
+) =>
+  stranded(id, ident, assignee, {
+    activeRecoveryAction: {
+      kind,
+      cause: kind,
+      status,
+      ownerAgentId: wakeOwner,
+      previousOwnerAgentId: returnOwner,
+      returnOwnerAgentId: returnOwner,
+      evidence: previousStatus ? { previousStatus, sourceIdentifier: ident } : { sourceIdentifier: ident },
+      wakePolicy: { type: 'wake_owner', reason: 'source_scoped_recovery_action', ownerAgentId: wakeOwner },
+      attemptCount,
+      lastAttemptAt: lastAttemptAt || createdAt,
+      createdAt,
+      updatedAt: lastAttemptAt || createdAt,
+    },
+  });
+
+/**
  * A non-blocked issue planted only so the parent GRAPH has something in it. It
  * is never itself a finding (status !== 'blocked'), which is the point: the
  * descendant test has to work off the enumeration, not off the findings.
@@ -1438,7 +1779,13 @@ const CASES = [
     // have missed it, and the active wake must annotate the row without ever
     // suppressing it — the empty array is an auto-flip risk regardless of who
     // is being poked.
+    //
+    // ⚠ TRA-3451 pinned the clock here. The annotation is now the FRESH branch
+    // of an age gate, so a control that let the wall clock decide would silently
+    // become a test of the STALE branch the day after it was written — and the
+    // fresh branch, which is the one that still suppresses, would be untested.
     expectAnnotation: true,
+    opts: { now: Date.parse('2026-07-26T06:40:00.000Z') }, // 16m after the mint
     build: () =>
       transportFor(
         fakeBoard([
@@ -1449,18 +1796,210 @@ const CASES = [
               status: 'active',
               ownerAgentId: 'agent-qt',
               wakePolicy: { type: 'wake_owner', ownerAgentId: 'agent-qt' },
+              attemptCount: 1,
+              lastAttemptAt: '2026-07-26T06:24:12.346Z',
               createdAt: '2026-07-26T06:24:12.346Z',
             },
           }),
         ]),
       ),
-    assert: (r) =>
-      r.findings.length === 1 &&
-      r.findings[0].severity === SEVERITY.ROUTE_TO_ASSIGNEE &&
-      r.findings[0].recoveryKind === 'missing_disposition' &&
-      r.findings[0].platformWakeOwnerAgentId === 'agent-qt' &&
-      // and the annotation must NOT have removed it from the report
-      renderReport(r).join('\n').includes('TRA-8050'),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        r.findings.length === 1 &&
+        f.severity === SEVERITY.ROUTE_TO_ASSIGNEE &&
+        f.recoveryKind === 'missing_disposition' &&
+        f.platformWakeOwnerAgentId === 'agent-qt' &&
+        // fresh => the suppression still applies, and it is the ONLY thing it
+        // may do: annotate and de-route.
+        f.platformWake.stale === false &&
+        f.platformWake.suppresses === true &&
+        /platform wake ACTIVE and ADVANCING/.test(out) &&
+        /do NOT route/.test(out) &&
+        !/routing {2}one child issue per OWNER/.test(out) &&
+        // and the annotation must NOT have removed it from the report
+        out.includes('TRA-8050')
+      );
+    },
+  },
+  {
+    // ⛔ THE TRA-3451 CASE. This is the hole the whole ticket exists to close:
+    // the predicate detected all 47 rows on 2026-08-12 and the REPORTING rule
+    // then de-routed every one of them, so the board read green three events
+    // running. A control that only covers the fresh case above re-greens it.
+    name: 'TRA-3451 — an ACTIVE wake_owner STALE at attemptCount 1 => FILED and ROUTED, never a do-not-route annotation',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8600', 'agent-cfo')])),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        r.findings.length === 1 &&
+        f.platformWakeOwnerAgentId === 'agent-cfo' && // the wake IS active…
+        f.platformWake.stale === true && // …and it is NOT a continuation path
+        f.platformWake.suppresses === false &&
+        f.platformWake.attemptCount === 1 &&
+        f.platformWake.ageHours > 10 &&
+        /platform wake ACTIVE but STALE/.test(out) &&
+        /attemptCount 1/.test(out) &&
+        /STALE WAKES {2}1 of the routable rows/.test(out) &&
+        // the load-bearing half: it is in the ROUTING table, not the do-not-route list
+        /routing {2}one child issue per OWNER/.test(out) &&
+        !/do NOT route/.test(out)
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 — a 13h-old wake that RETRIED 10m ago still suppresses (the gate is ADVANCE, not birth)',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () =>
+      transportFor(
+        fakeBoard([
+          recoveryStrand('s1', 'TRA-8610', 'agent-cfo', {
+            createdAt: '2026-08-12T09:00:00.000Z',
+            lastAttemptAt: '2026-08-12T22:20:00.000Z',
+            attemptCount: 4,
+          }),
+        ]),
+      ),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const w = r.findings[0].platformWake;
+      return (
+        r.findings.length === 1 &&
+        w.stale === false &&
+        w.suppresses === true &&
+        w.attemptCount === 4 &&
+        w.ageHours < 1 &&
+        /platform wake ACTIVE and ADVANCING/.test(out) &&
+        /do NOT route/.test(out)
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 — an active wake with NO readable advance stamp is STALE, never fresh (absent is not fresh)',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () =>
+      transportFor(
+        fakeBoard([
+          stranded('s1', 'TRA-8620', 'agent-cfo', {
+            activeRecoveryAction: {
+              kind: 'stranded_assigned_issue',
+              status: 'active',
+              ownerAgentId: 'agent-cfo',
+              wakePolicy: { type: 'wake_owner', ownerAgentId: 'agent-cfo' },
+              attemptCount: 1,
+            },
+          }),
+        ]),
+      ),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const w = r.findings[0].platformWake;
+      return (
+        w.stale === true &&
+        w.suppresses === false &&
+        w.ageMs === null &&
+        /Absent is not fresh/.test(out) &&
+        /routing {2}one child issue per OWNER/.test(out)
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 REPAIR — previousStatus + returnOwnerAgentId both READ => the two-step RESTORE-PATCH is emitted',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8630', 'agent-cfo', { returnOwner: 'agent-qt' })])),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        f.repair.eligible === true &&
+        f.repair.status === 'todo' &&
+        f.repair.assigneeAgentId === 'agent-qt' &&
+        f.repair.restoredFrom === 'in_progress' &&
+        f.recoveryReturnOwnerAgentId === 'agent-qt' &&
+        /RESTORE-PATCH 1\/2 {2}PATCH \/api\/issues\/s1 \{"status":"todo"\}/.test(out) &&
+        /RESTORE-PATCH 2\/2 {2}PATCH \/api\/issues\/s1 \{"assigneeAgentId":"agent-qt"\}/.test(out) &&
+        // the two ways to get this wrong, both pinned as ABSENT
+        !/\{"status":"done"\}/.test(out) &&
+        !/\{"status":"in_progress"\}/.test(out) &&
+        // and the assignee write must come SECOND — it is one-way
+        out.indexOf('RESTORE-PATCH 1/2') < out.indexOf('RESTORE-PATCH 2/2')
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 REPAIR — the GENERIC shape-1 row (no evidence.previousStatus) still gets NO command, rule untouched',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () => transportFor(fakeBoard([stranded('s1', 'TRA-8640', 'agent-cto')])),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        f.repair.eligible === false &&
+        f.restoreTarget.provenance === RESTORE.NONE &&
+        !/RESTORE-PATCH/.test(out) &&
+        /no repair command \(the TRA-2396 rule stands here\)/.test(out)
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 REPAIR — a LIVE pending card blocks the repair (todo would bury a decision, TRA-2598)',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () =>
+      transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8650', 'agent-cfo')]), {
+        interactions: { s1: [{ id: 'i1', status: 'pending', kind: 'request_confirmation' }] },
+      }),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const f = r.findings[0];
+      return (
+        f.pendingInteractions === 1 &&
+        f.restoreTarget.provenance === RESTORE.HOLD_FOR_CARD &&
+        f.repair.eligible === false &&
+        /rests at `in_review`/.test(f.repair.why) &&
+        !/RESTORE-PATCH/.test(out)
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 REPAIR — an UNREADABLE interaction route blocks the repair too (unknown is not zero)',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () =>
+      transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8660', 'agent-cfo')]), { interactionsThrow: true }),
+    assert: (r) => {
+      const f = r.findings[0];
+      return (
+        f.pendingInteractions === null &&
+        f.repair.eligible === false &&
+        /UNKNOWN \(route unread\)/.test(f.repair.why) &&
+        !/RESTORE-PATCH/.test(renderReport(r).join('\n'))
+      );
+    },
+  },
+  {
+    name: 'TRA-3451 REPAIR — a known target but NO returnOwnerAgentId => routed, not repaired (the owner would be a guess)',
+    expect: 'FINDINGS',
+    opts: { now: NOW_STALE },
+    build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8670', 'agent-cfo', { returnOwner: null })])),
+    assert: (r) => {
+      const f = r.findings[0];
+      return (
+        f.recoveryReturnOwnerAgentId === null &&
+        f.restoreTarget.provenance === RESTORE.FROM_EVIDENCE &&
+        f.repair.eligible === false &&
+        /NO `returnOwnerAgentId`/.test(f.repair.why) &&
+        !/RESTORE-PATCH/.test(renderReport(r).join('\n'))
+      );
+    },
   },
   {
     name: 'a RESOLVED recovery action does NOT count as a live wake (status must be active)',
@@ -1994,9 +2533,29 @@ async function rollupMaskControl() {
  * may contain a copy-pasteable `blockedByIssueIds` write. TRA-2383 shipped one
  * inside a report that also argued against running it — prose loses to
  * copy-paste, so the string must simply never be emitted.
+ *
+ * TRA-3451 narrows it rather than dropping it. Exactly two verbs are now
+ * sanctioned, both on lines carrying the `RESTORE-PATCH` sentinel, and the
+ * blocker key stays banned EVERYWHERE including on those lines:
+ *
+ *   {"status":"todo"}                — never `done`, never a raw previousStatus
+ *   {"assigneeAgentId":"<id>"}       — the return owner, read off the payload
+ *
+ * Any other `PATCH /api/issues` anywhere in any report, or any sanctioned line
+ * whose body is not one of those two, fails the suite. The sentinel is what
+ * keeps this a whitelist instead of a hole: a future edit that starts printing
+ * `{"status":"done"}` or a third verb goes red here, not in production.
  */
+const RESTORE_PATCH_LINE = /^\s*RESTORE-PATCH /;
+const SANCTIONED_VERB = /^\s*RESTORE-PATCH \d\/2 {2}PATCH \/api\/issues\/\S+ (\{"status":"todo"\}|\{"assigneeAgentId":"[^"]+"\})(\s|$)/;
+
 function assertNoRepairCommand(rendered) {
-  return !/blockedByIssueIds/.test(rendered) && !/PATCH \/api\/issues/.test(rendered);
+  if (/blockedByIssueIds/.test(rendered)) return false;
+  const lines = String(rendered).split('\n');
+  const sanctioned = lines.filter((l) => RESTORE_PATCH_LINE.test(l));
+  const rest = lines.filter((l) => !RESTORE_PATCH_LINE.test(l)).join('\n');
+  if (/PATCH \/api\/issues/.test(rest)) return false;
+  return sanctioned.every((l) => SANCTIONED_VERB.test(l));
 }
 
 async function selftest() {
