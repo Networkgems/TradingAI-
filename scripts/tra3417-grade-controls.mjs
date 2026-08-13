@@ -100,11 +100,23 @@ const SCENARIOS = [
     expect: { zero: 'ENGINE-SILENT', exit: 2, has: ['DEFECT', 'must NOT be reported'], absent: ['⇒ PASS'] },
   },
   {
-    name: 'BLIND — restart AFTER the open voids the since-boot control',
+    name: 'BLIND — restart AFTER the open, counter STILL zero',
     routes: { time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T13:55:00.000Z`, open: true, scans: 0 },
     // Without this guard a mid-session restart forges ENGINE-SILENT (a DEFECT)
     // out of a healthy session, because scanCountSinceBoot resets to 0.
-    expect: { zero: 'BLIND', exit: 3, has: ['since-boot scan counters were reset'], absent: ['DEFECT', '⇒ PASS'] },
+    expect: { zero: 'BLIND', exit: 3, has: ['a reset is indistinguishable from a silent engine'], absent: ['DEFECT', '⇒ PASS'] },
+  },
+  {
+    // The PAIR to the case above, and the one bqb1 will most likely actually be
+    // in at 14:15Z: it booted 13x in 7.8h today, so a restart inside the grading
+    // window is ~70% likely — but by T+45 the engine has ticked again since that
+    // restart. A NON-ZERO counter is positive proof the engine ran; the zero is
+    // then attributable exactly as on a clean boot. Guarding on the boot time
+    // ALONE (the old ordering) discarded that proof and returned BLIND, i.e. no
+    // verdict, on the most probable healthy state of the session.
+    name: 'STARVED-UPSTREAM — restart after the open, but the engine DID tick since',
+    routes: { time: `${ET_DAY}T14:15:00Z`, boot: `${ET_DAY}T13:55:00.000Z`, open: true, scans: 3 },
+    expect: { zero: 'STARVED-UPSTREAM', exit: 4, has: ['REAL NEGATIVE', 'UPSTREAM of the nominator'], absent: ['BLIND', '⇒ PASS'] },
   },
   {
     name: 'NO-SESSION — 14:15Z but the server says the market never opened',

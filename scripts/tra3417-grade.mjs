@@ -212,7 +212,17 @@ if (HAVE_VERDICTS) ZERO_STATE = { kind: 'GRADEABLE', why: `cost_bar evaluated ${
 else if (!controlsReadable) ZERO_STATE = { kind: 'BLIND', why: `cost_bar evaluated 0 and the liveness controls are unreadable (marketOpen ${JSON.stringify(marketOpen)}${pipe?.__err ? `, pipeline ${pipe.__err}` : ''}${rvs?.__err ? `, rv-scan ${rvs.__err}` : ''}) — this zero CANNOT be attributed` };
 else if (marketOpen === false && beforeOpen) ZERO_STATE = { kind: 'PRE-OPEN', why: `market not yet open (T${minsSinceOpen} min) — a zero here is expected and is NOT a negative` };
 else if (marketOpen === false && !afterClose) ZERO_STATE = { kind: 'NO-SESSION', why: `it is T+${minsSinceOpen} min past the nominal open yet the server reports marketOpen=false${blockedBy.length ? ` (blockedBy ${blockedBy.join('/')})` : ''} — holiday/half-day/halt. Benign, but it means TODAY CANNOT GRADE THIS; do not re-arm anything on the strength of it` };
-else if (!bootBeforeOpen) ZERO_STATE = { kind: 'BLIND', why: `the process booted ${ver.startedAt}, AT OR AFTER the open — since-boot scan counters were reset mid-session, so 'the engine never ticked' is unprovable. Re-read after the next clean session` };
+// A mid-session restart voids the since-boot counter ONLY WHERE IT READS ZERO.
+// A zero after a 13:55Z boot cannot be told apart from a genuinely silent engine
+// — that is the BLIND case. But a NON-ZERO counter is POSITIVE evidence: the
+// engine demonstrably ticked after the restart, so "the engine never ticked" is
+// not unprovable, it is DISPROVEN, and the zero is attributable exactly as it
+// would be on a clean boot. Ordering this guard ahead of `!engineTicked`
+// (as it was) threw that proof away and reported BLIND on a healthy session.
+// This matters TODAY: bqb1 booted 13x in 7.8h (median gap 18.7min), so P(restart
+// inside the 13:30-14:15Z grading window) is ~70% — the old ordering would have
+// BLINDed the acceptance at its scheduled read far more often than not.
+else if (!bootBeforeOpen && !engineTicked) ZERO_STATE = { kind: 'BLIND', why: `the process booted ${ver.startedAt}, AT OR AFTER the open, AND the since-boot scan counters read zero (directional ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}) — a reset is indistinguishable from a silent engine here, so 'the engine never ticked' is unprovable. Re-read after the next clean session` };
 else if (!engineTicked) ZERO_STATE = { kind: 'ENGINE-SILENT', why: `session ${afterClose ? 'has CLOSED' : `live (T+${minsSinceOpen} min)`} and NOTHING scanned: sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}. The engine did not run — this is a DEFECT, not a nominator result, and must NOT be reported as 'the band was empty'` };
 else ZERO_STATE = { kind: 'STARVED-UPSTREAM', why: `session ${afterClose ? 'closed' : `live (T+${minsSinceOpen} min)`}, the engine DID tick (directional scansSinceBoot ${siblingScans}, chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}) yet cost_bar recorded nothing. Every gate sits downstream of signal-engine.ts:9900, so the candidates died at 'result.reason !== ok || candidates.length === 0' — UPSTREAM of the nominator. A REAL negative, attributable to the scanner, NOT to the band` };
 
@@ -348,7 +358,21 @@ if (!GRADEABLE) {
 if (!WANT_LOGS) {
   console.log('\n(logs skipped — no RENDER_API_KEY or --no-logs; C2 fallback + C7 not read)');
 } else {
-  const START = new Date(Date.parse(ver.startedAt) - 60_000).toISOString();
+  // Anchor the window to the EARLIER of (boot - 60s) and today's open.
+  //
+  // Render RETAINS logs across restarts — the nomination line is written to a
+  // stream that a pm2 relaunch does not truncate. Anchoring to boot alone threw
+  // that away: a 14:00Z restart shrank this window to 13:59Z->14:15Z and silently
+  // discarded every nomination line from 13:30-13:59, so C2b would report "zero
+  // nomination lines" — which §12 reads as the :9900 starve — against a session
+  // that may well have nominated. An UNDERCOUNT wearing the costume of a zero,
+  // and the C2b prose asserts a zero is decisive BECAUSE the line is only
+  // suppressed when disarmed. That inference is sound only over a window that
+  // actually covers the session.
+  //
+  // Only ever widens, and never past today's open, so it cannot pull in a prior
+  // session's lines. Pre-open (boot < open) this is a no-op: boot-60s stays.
+  const START = new Date(Math.min(Date.parse(ver.startedAt) - 60_000, openZ.getTime())).toISOString();
   const END = new Date().toISOString();
   // `allowComma` exists for CONTROL 4 alone, which must send a comma on purpose
   // to prove the OR is still there. No measurement may set it.
