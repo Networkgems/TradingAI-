@@ -61,7 +61,17 @@ import {
   marketableMarkPerShare,
   marketableUnrealizedUsd,
   positionSide,
+  // TRA-3502 — the exact per-position half-spread, for the exit sites whose reference
+  // price is a TRIGGER LEVEL rather than the quote's own mid. See `demoExitFillPrice`.
+  halfSpreadFracFromQuoteForSide,
 } from './marketable-open-mtm.js';
+// TRA-3502 — quote-coverage ledger, APPLICATION seam. The `resolution` seam lives in
+// `signal-engine.ts::refreshOptionMarks` and is the one with a failing state while the
+// mark stays DARK; read both, never one as the other.
+import {
+  markMarketableQuoteSeamWired,
+  recordMarketableQuoteResolution,
+} from './marketable-quote-coverage.js';
 import {
   isOptionTradeJournalEnabled,
   recordOptionTradeOpen,
@@ -1733,6 +1743,21 @@ export class PaperOptionsAccount {
    * {@link OptionsAccountConfig.marketableOpenMtm}.
    */
   private marketableOpenMtm: MarketableOpenMtmConfig = DEFAULT_MARKETABLE_OPEN_MTM_CONFIG;
+  /**
+   * TRA-3502 — the live TWO-SIDED quote per OCC symbol, refreshed wholesale each
+   * engine tick by {@link refreshOptionQuotes}. This is the input the marketable mark
+   * was reconstructing with a mean-calibrated constant: `marketable-open-mtm.ts`
+   * models `h = (mid − bid)/mid` ONLY because "the engine's optionMarks feed is
+   * `Map<string, number>` — a mid, with no two-sided quote threaded into the per-tick
+   * exit path". It is threaded now, and `h` degrades to what its own header already
+   * says it is — the fallback for a one-sided or absent book.
+   *
+   * Deliberately NOT persisted and NOT seeded from the entry quote: a quote is a
+   * snapshot of a book at one instant, and an entry quote is minutes-to-days stale by
+   * the time the position exits. Empty ⇒ every mark falls back to the model, which is
+   * exactly today's shipped behaviour.
+   */
+  private optionQuotes = new Map<string, { bid: number; ask: number }>();
   private currentDayKey = toDateKey(Date.now());
   /**
    * TRA-991 — serialized tail of pending option-trade-journal appends. The
@@ -2702,6 +2727,35 @@ export class PaperOptionsAccount {
   }
 
   /**
+   * TRA-3502 — install this tick's two-sided quotes. WHOLESALE REPLACE, never a merge:
+   * a contract the scanner could not quote THIS tick must lose last tick's quote, or
+   * the marketable mark would exit against a bid the book no longer shows. An empty
+   * map is a legitimate (and meaningful) input — it means "nothing quotable right
+   * now", and every mark correctly falls back to the modeled `h`.
+   *
+   * Copied rather than aliased so a caller mutating its map afterwards cannot reach
+   * inside the account's valuation state.
+   */
+  refreshOptionQuotes(quotesByOcc: Map<string, { bid: number; ask: number }>): void {
+    this.optionQuotes = new Map(quotesByOcc);
+  }
+
+  /**
+   * TRA-3502 — the live quote for a position, or `null`. Guarded here so both mark
+   * sites share one usability predicate: two-sided, non-negative bid, positive ask,
+   * uncrossed. A crossed or half-empty book is NOT a quote — it falls to the model,
+   * which is the case `h` exists for.
+   */
+  private liveQuoteFor(opt: OptionPosition): { bid: number; ask: number } | null {
+    if (!opt.optionSymbol) return null;
+    const q = this.optionQuotes.get(opt.optionSymbol);
+    if (q == null) return null;
+    if (!Number.isFinite(q.bid) || !Number.isFinite(q.ask)) return null;
+    if (q.bid < 0 || q.ask <= 0 || q.ask < q.bid) return null;
+    return q;
+  }
+
+  /**
    * TRA-2233 — the REALIZABLE unrealized P&L for a mode: the same open positions
    * as {@link unrealizedPnlForMode}, but each valued at the MARKETABLE mark (long
    * → bid, short → ask) instead of the chain MID. This is the honest "what could I
@@ -2713,9 +2767,27 @@ export class PaperOptionsAccount {
    */
   private marketableUnrealizedPnlForMode(mode: AccountMode): number {
     let total = 0;
+    // TRA-3502 — this seam runs whenever the realizable number is computed, which
+    // includes the flag-independent dashboard reference read. Wired unconditionally so
+    // a quiet book renders WIRED_NO_OBSERVATIONS, not UNWIRED.
+    markMarketableQuoteSeamWired('application');
     for (const opt of this.openOptions.values()) {
       if ((opt.mode ?? 'demo') !== mode) continue;
-      total += marketableUnrealizedUsd(opt, { halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac });
+      // TRA-3502 — `currentPremium` IS the mid this tick's quote was read off (both
+      // come from the same cached chain row via `getOptionMark`/`getOptionQuoteDetail`
+      // on the same pass), so the quote is authoritative here with no reconciliation
+      // needed: long → bid, short → ask, exactly.
+      const quote = this.liveQuoteFor(opt);
+      recordMarketableQuoteResolution({
+        seam: 'application',
+        outcome: quote ? 'served' : 'unquoted_at_mark',
+        mode: mode === 'live' ? 'live' : 'demo',
+        now: Date.now(),
+      });
+      total += marketableUnrealizedUsd(opt, {
+        halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac,
+        ...(quote ? { quote: { bid: quote.bid, ask: quote.ask } } : {}),
+      });
     }
     return total;
   }
@@ -2755,9 +2827,56 @@ export class PaperOptionsAccount {
   private demoExitFillPrice(price: number, opt: OptionPosition): number {
     if ((opt.mode ?? 'demo') !== 'demo') return price;
     if (this.marketableOpenMtm.enabled) {
+      const side = positionSide(opt);
+      // TRA-3502 — the live two-sided quote, when this tick served one, SUPERSEDES the
+      // modeled `h`. Two branches, because this method's `price` is NOT always the mid:
+      // `checkExits`' structural and TP1 sites pass the current `mark`, but the SL /
+      // trailing site passes the TRIGGER LEVEL (`stopLossPremium` /
+      // `trailingStopPremium` / the chandelier), and `closeOption` passes
+      // `opt.currentPremium`.
+      //
+      //   • price IS this quote's own mid  ⇒ the exact bid (long) / ask (short). This is
+      //     the "per-position own quote" measurement: 100% tail coverage, 1.00× charged,
+      //     $0.00 mean abs error on the quote-bearing rows.
+      //   • price is a TRIGGER LEVEL       ⇒ apply the quote's MEASURED half-spread
+      //     fraction to that level. Substituting the raw bid here would be a different
+      //     change entirely: a row whose mark gapped to $0.10 under a $0.50 stop would
+      //     book $0.09 instead of $0.43, which is not "thread the quote in", it is
+      //     re-deciding what price a stop fills at. The measured fraction is still an
+      //     exact per-position number — it just replaces the CONSTANT, not the level.
+      //
+      // Both branches are quote-served; the fallback below is the only `h` path left.
+      const quote = this.liveQuoteFor(opt);
+      markMarketableQuoteSeamWired('application');
+      recordMarketableQuoteResolution({
+        seam: 'application',
+        outcome: quote ? 'served' : 'unquoted_at_mark',
+        mode: 'demo', // the live early-return above makes this exhaustive
+        now: Date.now(),
+      });
+      if (quote != null) {
+        const quoteMid = (quote.bid + quote.ask) / 2;
+        // Same cached chain row on the same pass ⇒ exact equality is the norm; the
+        // epsilon only absorbs float round-trips, never a genuinely different level.
+        const priceIsQuoteMid = Math.abs(price - quoteMid) <= 1e-9 * Math.max(1, Math.abs(quoteMid));
+        const measured = halfSpreadFracFromQuoteForSide(
+          { bid: quote.bid, ask: quote.ask, mark: quoteMid },
+          side,
+        );
+        if (priceIsQuoteMid) {
+          return marketableMarkPerShare({
+            midPerShare: price,
+            side,
+            quote: { bid: quote.bid, ask: quote.ask },
+          });
+        }
+        if (measured != null) {
+          return marketableMarkPerShare({ midPerShare: price, side, halfSpreadFrac: measured });
+        }
+      }
       return marketableMarkPerShare({
         midPerShare: price,
-        side: positionSide(opt),
+        side,
         halfSpreadFrac: this.marketableOpenMtm.halfSpreadFrac,
       });
     }

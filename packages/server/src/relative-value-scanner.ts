@@ -182,6 +182,20 @@ export interface SelectorChainSnapshot {
   rows: OptionChainRow[];
 }
 
+/**
+ * TRA-3502 — the outcome of one two-sided-quote lookup, with the reason KEPT.
+ *
+ * Exhaustive and mutually exclusive. `bid`/`ask` are echoed on `one_sided` (whichever
+ * side was there) so a reader can see that the book existed and was half-empty rather
+ * than having to trust the label — the discriminator is on the payload, not in prose.
+ */
+export type OptionQuoteResolution =
+  | { status: 'quoted'; bid: number; ask: number }
+  | { status: 'one_sided'; bid: number | null; ask: number | null }
+  | { status: 'absent' }
+  | { status: 'breaker_open' }
+  | { status: 'no_client' };
+
 export interface RelativeValueScannerService {
   /**
    * TRA-917 — full chain snapshot (spot + nearest in-window expiration + ALL
@@ -250,6 +264,26 @@ export interface RelativeValueScannerService {
     expiration: string,
     optionSymbol: string,
   ): Promise<{ bid: number; ask: number } | null>;
+  /**
+   * TRA-3502 — {@link getOptionQuote} with the REASON attached.
+   *
+   * `getOptionQuote` collapses three different worlds into one `null`: the breaker was
+   * open so we never asked, the contract had no row in the snapshot, and the row was
+   * there but one-sided. Those are a scanner outage, a stale/delisted contract, and a
+   * genuinely illiquid book — and TRA-3502's fallback counter has to tell them apart,
+   * because only the third one is a case the modeled `h` legitimately covers. A counter
+   * whose one-sided bucket cannot be distinguished from its absent bucket is the
+   * `UNKNOWN`-reads-as-`OFF` defect this ticket family exists to remove.
+   *
+   * Same cached snapshot, same zero-extra-Tradier-calls-when-warm property, same
+   * OPTIONAL-capability contract as {@link getOptionQuote} — which is now a thin
+   * projection of this, so the two can never disagree about what counts as usable.
+   */
+  getOptionQuoteDetail?(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<OptionQuoteResolution>;
   /**
    * TRA-2890 — the broker-tape LAST TRADE for a contract, for the live
    * DISPLAY mark ({@link displayOptionMark} in shared). {@link getOptionMark}
@@ -570,29 +604,54 @@ export class TradierRelativeValueScannerService implements RelativeValueScannerS
       : null;
   }
 
-  async getOptionQuote(
+  // TRA-3502 — the reason-carrying form. `getOptionQuote` below is now a projection
+  // of THIS, so the usability predicate (`bid > 0 && ask > 0 && ask >= bid`) exists
+  // exactly once and the counter's `one_sided` bucket can never disagree with what
+  // the maker chase treats as unusable.
+  //
+  // A thrown fetch trips the breaker and reports `breaker_open` rather than `absent`:
+  // an outage is not an empty book, and the whole point of the split is that a
+  // fallback rate driven by scanner outages demands a different fix than one driven
+  // by genuinely illiquid contracts.
+  async getOptionQuoteDetail(
     symbol: string,
     expiration: string,
     optionSymbol: string,
-  ): Promise<{ bid: number; ask: number } | null> {
-    if (!this.client) return null;
-    if (this.isBreakerOpen()) return null;
+  ): Promise<OptionQuoteResolution> {
+    if (!this.client) return { status: 'no_client' };
+    if (this.isBreakerOpen()) return { status: 'breaker_open' };
     const upper = symbol.trim().toUpperCase();
     let chain: OptionChainRow[];
     try {
       chain = await this.fetchChain(upper, expiration);
     } catch (err) {
       this.tripBreaker(`getChainSnapshot(${upper},${expiration}) failed`, err);
-      return null;
+      return { status: 'breaker_open' };
     }
     const row = chain.find((r) => r.optionSymbol === optionSymbol);
-    if (!row) return null;
+    if (!row) return { status: 'absent' };
     const bid = row.bid ?? 0;
     const ask = row.ask ?? 0;
     // Two-sided and sane, or nothing. A one-sided book gives a maker chase no
     // midpoint to rest against, and `last` is a print, not a resting price.
-    if (bid > 0 && ask > 0 && ask >= bid) return { bid, ask };
-    return null;
+    if (bid > 0 && ask > 0 && ask >= bid) return { status: 'quoted', bid, ask };
+    // Echo whichever side WAS there (null for the missing/invalid one) so the
+    // half-empty book is visible as data. A crossed book (`ask < bid`) lands here
+    // too, with both sides echoed — it is unusable, not absent.
+    return {
+      status: 'one_sided',
+      bid: row.bid != null && row.bid >= 0 ? row.bid : null,
+      ask: row.ask != null && row.ask > 0 ? row.ask : null,
+    };
+  }
+
+  async getOptionQuote(
+    symbol: string,
+    expiration: string,
+    optionSymbol: string,
+  ): Promise<{ bid: number; ask: number } | null> {
+    const detail = await this.getOptionQuoteDetail(symbol, expiration, optionSymbol);
+    return detail.status === 'quoted' ? { bid: detail.bid, ask: detail.ask } : null;
   }
 
   private isBreakerOpen(): boolean {

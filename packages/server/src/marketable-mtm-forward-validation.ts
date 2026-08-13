@@ -938,15 +938,30 @@ function tailUnderChargeRatio(summary: MarketableMtmSummary): number | null {
  * The `quotedH.n` floor in {@link marketableMtmQuotedVerdict} is what stops an unmeasurable
  * tail from reading as a covered one.
  */
-function quotedTailUnderCharged(summary: MarketableMtmSummary): boolean {
+export function quotedTailUnderCharged(summary: QuotedTailInput): boolean {
   const m = summary.modeledCrossUsdOnQuoted.p90;
   const q = summary.quotedCrossUsd.p90;
   if (!Number.isFinite(m) || !Number.isFinite(q)) return false;
   return !(m >= q);
 }
 
+/**
+ * TRA-3502 — the MINIMAL structural input the two tail functions actually read.
+ *
+ * Widened from `MarketableMtmSummary` (which still satisfies it) so the demo-journal
+ * basis in `marketable-mtm-demo-journal-basis.ts` can call THESE functions rather than
+ * re-deriving the identity. TRA-3499 pinned that the shipped gate compares DOLLARS —
+ * `p90(modeledCrossUsdOnQuoted) >= p90(quotedCrossUsd)` — and reduces to the h-space
+ * form only on a constant mid; a second copy of that comparison living next to the
+ * first is precisely how a discriminator drifts into a dead one.
+ */
+export interface QuotedTailInput {
+  modeledCrossUsdOnQuoted: { p90: number };
+  quotedCrossUsd: { p90: number };
+}
+
 /** How many × the quoted tail exceeds the modeled tail on the same rows; `null` when it does not. */
-function quotedTailUnderChargeRatio(summary: MarketableMtmSummary): number | null {
+export function quotedTailUnderChargeRatio(summary: QuotedTailInput): number | null {
   const m = summary.modeledCrossUsdOnQuoted.p90;
   const q = summary.quotedCrossUsd.p90;
   if (!Number.isFinite(m) || !Number.isFinite(q) || m <= 0 || q <= m) return null;

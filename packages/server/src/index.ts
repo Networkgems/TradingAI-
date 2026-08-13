@@ -756,6 +756,11 @@ import {
   resolveMarketableMtmGateThresholds,
   MARKETABLE_MTM_SCOPE,
 } from './marketable-mtm-forward-validation.js';
+// TRA-3502 — the live per-tick mark-path quote-coverage counter. See the route.
+import { marketableQuoteCoverageSnapshot } from './marketable-quote-coverage.js';
+// TRA-3502 Task 2 — the demo-journal (out-of-sample) basis beside the sandbox one.
+import { foldMarketableMtmDemoJournalBasis } from './marketable-mtm-demo-journal-basis.js';
+import { isTestAccount as isTestAccountName } from './test-accounts.js';
 import type { TradierEnv } from '@trading-app/shared';
 // TRA-3068 — the split calendar, read at the EOD report's generation path.
 import type { CorporateAction } from '@trading-app/shared';
@@ -14405,7 +14410,23 @@ app.get('/api/health/parity-reconcile/records', (_req, res) => {
 // per-structure floor ships ON at 10 (pooled 30) — env-overridable via `MARKETABLE_MTM_MIN_N`,
 // `MARKETABLE_MTM_PER_STRUCTURE_MIN_N`, `MARKETABLE_MTM_REQUIRE_PER_STRUCTURE_MIN_N`. Still
 // read-only; arms NOTHING (h stays 0.134, ENABLE_MARKETABLE_OPEN_MTM untouched, TRA-1897 holds).
-app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
+// TRA-3502 Task 2 — a DEMO-JOURNAL basis now rides beside the sandbox one. TRA-3459
+// ruled the sandbox UNFIT (7.5× width regime, 0/140 overlap), which makes TRA-2242's
+// "accrue ≥ 30 parity-true SANDBOX round-trips" an accrual that can never complete. The
+// demo journal matches the calibration population on the term the sandbox misses —
+// median full spread $0.15 vs $0.15 vs the sandbox's $0.02 — so it is the source that
+// can grade the model. Read it under `demoJournalBasis`:
+//   • `refusal` FIRST. Non-null ⇒ NOT A GRADE; `pooled`/`cells` carry nothing. The
+//     cohort is out-of-sample by construction (strictly after
+//     `MODELED_H_CALIBRATION.windowUtc.to`) and an in-sample cohort is REFUSED, never
+//     clamped forward to a safe one.
+//   • `cells` is structure × account class with mean AND median AND p90 on each, plus
+//     the `'*'` marginals. Grade `accountClass: 'desk'` — the pooled figure carries QA
+//     fixture books.
+//   • `seamCaveat` is load-bearing: these are ENTRY quotes and the haircut applies at
+//     EXIT, so this grades the WIDTH REGIME, not the exit cross.
+// Arms nothing. `h` stays 0.134 and no retune target is emitted anywhere in the payload.
+app.get('/api/health/marketable-mtm-forward-validation', async (req, res) => {
   const numParam = (v: unknown): number | undefined => {
     if (typeof v !== 'string' || v.trim() === '') return undefined;
     const n = Number(v);
@@ -14433,10 +14454,40 @@ app.get('/api/health/marketable-mtm-forward-validation', (req, res) => {
     perStructureMinN: numParam(req.query.perStructureMinN) ?? thresholds.perStructureMinN,
     includeSamples: boolParam(req.query.samples),
   });
+  // TRA-3502 Task 2 — the demo-journal basis. Read off the live demo option-trade
+  // journal, cohort-filtered to strictly forward of the calibration window's close.
+  // `demoCohortFromTs` overrides the boundary for what-if reads; an in-sample value is
+  // REFUSED by the fold, so the override cannot be used to manufacture a passing grade.
+  const demoJournalBasis = foldMarketableMtmDemoJournalBasis(
+    await listOptionTradeJournal({ mode: 'demo' }),
+    {
+      h: numParam(req.query.h),
+      cohortFromTsExclusive: numParam(req.query.demoCohortFromTs),
+      // Bound to the real classifier, not a stub: a `desk` cell computed against an
+      // always-false predicate would silently include every QA fixture book and read
+      // exactly like a clean desk population.
+      isTestAccount: (username: string) => isTestAccountName(username),
+      includeSamples: boolParam(req.query.samples),
+    },
+  );
   res.status(200).json({
     ...result,
+    demoJournalBasis,
     fillRealismNote: FILL_REALISM_NOTE,
     scope: MARKETABLE_MTM_SCOPE,
+    // TRA-3502 acceptance #2 — THE FALLBACK COUNTER, deliberately named `markQuoteCoverage`
+    // and NOT merged into the fold's `quoteCoverage`. They answer different questions over
+    // different populations: `quoteCoverage` censuses the SANDBOX ROUND-TRIP JOURNAL (were
+    // the recorded legs quote-bearing?), this censuses THE LIVE PER-TICK MARK PATH (is the
+    // engine being served a two-sided book right now?). One name over two populations is how
+    // a reader grades the wrong one.
+    //
+    // Read `resolution` for "how much does h still matter": it records regardless of
+    // ENABLE_MARKETABLE_OPEN_MTM, so it has a failing state today. Read `instrumentState`
+    // BEFORE any count — UNWIRED (never ran) and LIVE-with-zero-fallbacks are both all-zero
+    // vectors, and `fallbackRate` is `null` rather than `0` until something is observed.
+    // The `application` seam reading UNWIRED is EXPECTED while the flag is DARK.
+    markQuoteCoverage: marketableQuoteCoverageSnapshot(),
     ts: new Date().toISOString(),
   });
 });

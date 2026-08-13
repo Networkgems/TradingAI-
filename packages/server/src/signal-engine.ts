@@ -350,6 +350,15 @@ import { isLiveCryptoBootArmEnabled } from './live-crypto-boot-arm-flag.js';
 // ENABLE_MARKETABLE_OPEN_MTM. Demo-scoped downstream (account guards on
 // mode==='demo'), so wiring it into both accounts can never change a live number.
 import { resolveMarketableOpenMtmConfig } from './marketable-open-mtm-flag.js';
+// TRA-3502 — the quote-coverage ledger for the marketable mark. Recording is
+// flag-INDEPENDENT: it measures what the scanner could serve, which is the number
+// that says how much the modeled h=0.134 still matters, and it must have a failing
+// state while the mark itself is still DARK.
+import {
+  markMarketableQuoteSeamWired,
+  recordMarketableQuoteResolution,
+  type MarketableQuoteOutcome,
+} from './marketable-quote-coverage.js';
 // TRA-1602 (TRA-1600C) — per-candidate cost-aware fire bar on the executing
 // options opens (RV / OTM / directional). The gate nets the structure cost
 // exactly once and rejects ideas whose measured edge can't clear it.
@@ -7900,6 +7909,13 @@ export class SignalEngine {
    */
   private async refreshOptionMarks(): Promise<Map<string, number>> {
     const marks = new Map<string, number>();
+    // TRA-3502 — the quote-coverage positive control, fired at the TOP: before the
+    // no-scanner return, before the no-positions return, before any outcome can be
+    // recorded. "This pass never ran" (UNWIRED) and "it ran and every mark was
+    // quote-served" (LIVE, zero fallbacks) are both all-zero count vectors; this flag
+    // is the only thing that separates them, so it must not sit behind a guard that
+    // the very failure it detects would skip.
+    markMarketableQuoteSeamWired('resolution');
     if (!this.rvScanner) return marks;
 
     const seenSymbols = new Set<string>();
@@ -7941,6 +7957,16 @@ export class SignalEngine {
     // display stays on the mid.
     const lastMarks = new Map<string, number>();
     const canLastTrade = typeof this.rvScanner.getOptionLastTrade === 'function';
+    // TRA-3502 — the TWO-SIDED quote, collected on this same pass off the same
+    // cached chain snapshot (zero extra Tradier calls when warm), for the
+    // marketable(bid) mark. Before this, the exit/MTM path saw only a scalar mid
+    // and `marketable-open-mtm.ts` had to RECONSTRUCT the bid from a mean-calibrated
+    // constant `h` — a number that was measured exactly two calls upstream and
+    // thrown away. Same optional-capability / graceful-degradation contract as
+    // `getOptionLastTrade` above: a scanner without it leaves the mark on the
+    // modeled `h`, which is exactly what that constant's own header says it is for.
+    const quotes = new Map<string, { bid: number; ask: number }>();
+    const canQuoteDetail = typeof this.rvScanner.getOptionQuoteDetail === 'function';
     await Promise.all(
       [...chains.values()].map(async (group) => {
         for (const o of group) {
@@ -7980,6 +8006,38 @@ export class SignalEngine {
               log.warn('getOptionLastTrade failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
             }
           }
+          // TRA-3502 — the two-sided quote for the marketable mark, on the same
+          // cached chain row. EVERY position records an outcome, including the ones
+          // that fail: a counter that only counts successes has no fail state, and
+          // the fallback rate is the entire question this seam exists to answer.
+          const quoteMode = o.mode === 'live' ? 'live' : 'demo';
+          let outcome: MarketableQuoteOutcome;
+          if (!canQuoteDetail) {
+            outcome = 'no_capability';
+          } else {
+            try {
+              const detail = await this.rvScanner!.getOptionQuoteDetail!(o.symbol, o.expiration!, o.optionSymbol!);
+              switch (detail.status) {
+                case 'quoted':
+                  quotes.set(o.optionSymbol!, { bid: detail.bid, ask: detail.ask });
+                  outcome = 'served';
+                  break;
+                case 'one_sided': outcome = 'one_sided'; break;
+                case 'absent': outcome = 'absent'; break;
+                case 'breaker_open': outcome = 'breaker_open'; break;
+                case 'no_client': outcome = 'no_client'; break;
+              }
+            } catch (err: unknown) {
+              outcome = 'error';
+              log.warn('getOptionQuoteDetail failed', { optionSymbol: o.optionSymbol, reason: err instanceof Error ? err.message : String(err) });
+            }
+          }
+          recordMarketableQuoteResolution({
+            seam: 'resolution',
+            outcome,
+            mode: quoteMode,
+            now: Date.now(),
+          });
         }
       }),
     );
@@ -7990,6 +8048,15 @@ export class SignalEngine {
       for (const acct of this.allOptionsAccounts()) {
         acct.refreshLiveDisplayMarks(lastMarks);
       }
+    }
+    // TRA-3502 — fanned UNCONDITIONALLY, including when empty. This is a wholesale
+    // REPLACE, not a merge, and that is the point: a quote is a snapshot of a book at
+    // one instant, so a tick that served none must CLEAR the previous tick's, never
+    // leave a stale bid standing in for a live one. (`lastMarks` above can guard on
+    // size because a display mark is allowed to persist; a price the book will be
+    // exited at is not.)
+    for (const acct of this.allOptionsAccounts()) {
+      acct.refreshOptionQuotes(quotes);
     }
     return marks;
   }
