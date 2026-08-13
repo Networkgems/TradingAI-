@@ -544,4 +544,98 @@ describe('live-options fee reconcile coverage + partition (TRA-2959)', () => {
     expect(s.unmeasuredActionable).toBe(2); // BOTH legs: settlement clock runs from the close
     expect(s.unmeasuredAged).toBe(0);
   });
+
+  // ── TRA-3558: the gainloss join must be as instrumented as the commission one ──
+  //
+  // TRA-3554 residual: `lastHistorySample` shipped for the COMMISSION join,
+  // which is structurally dead in production (commission is 0 on every row),
+  // while the GAINLOSS join — which measures every real fee — published only a
+  // bare lot COUNT. A 'no-match' was therefore a dead end from the health route.
+
+  it('publishes the RAW gainloss lots pre-filter, so an ABSENT lot is distinguishable from a MIS-KEYED one (TRA-3558)', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    seedCloseFill();
+    // A lot that is PRESENT in the fetch but keyed to a day the ledger has no
+    // row for: the join rejects it, and only the raw sample can say so.
+    const misKeyed: TradierGainLossLot = {
+      symbol: 'AAPL260904P00280000',
+      quantity: 4,
+      cost: 416.44,
+      proceeds: 479.56,
+      gainLoss: 63.12,
+      openDate: '2026-07-29',
+      closeDate: '2026-07-29',
+    };
+    const { client } = fakeClient([], [misKeyed]);
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('no-match');
+    expect(s.lastGainLossLots).toBe(1);
+    expect(s.lastGainLossSample).toEqual([
+      {
+        symbol: 'AAPL260904P00280000',
+        quantity: 4,
+        cost: 416.44,
+        proceeds: 479.56,
+        openDate: '2026-07-29',
+        closeDate: '2026-07-29',
+      },
+    ]);
+  });
+
+  it("names the rejection reason per group instead of a bare 'no-match' (TRA-3558)", async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    seedCloseFill();
+    const { client } = fakeClient([], []); // fetch succeeded, returned nothing
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('no-match');
+    expect(s.lastGainLossRejections).not.toBeNull();
+    // Both unmeasured groups (the open and the close) are named, not counted.
+    expect(s.lastGainLossRejections!.length).toBe(2);
+    for (const rej of s.lastGainLossRejections!) {
+      expect(rej.reason).toBe('no-lot');
+      expect(rej.observed).toBe(0);
+      expect(rej.expected).toBe(4); // contracts the ledger holds
+      expect(rej.detail).toContain(rej.symbol);
+    }
+    expect(s.lastGainLossRejectionCounts).toEqual({
+      'no-lot': 2,
+      'priceless-row': 0,
+      'qty-mismatch': 0,
+      'negative-fee': 0,
+      'above-bound': 0,
+    });
+  });
+
+  it('clears the rejections when the join actually measures the rows (TRA-3558)', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    const settled: TradierGainLossLot = {
+      symbol: 'AAPL260904P00280000',
+      quantity: 4,
+      cost: 416.44, // 416.00 gross + 0.44
+      proceeds: 479.56,
+      gainLoss: 63.12,
+      openDate: '2026-07-30',
+      closeDate: '2026-07-31',
+    };
+    const { client } = fakeClient([], [settled]);
+    const s = await runLiveOptionsFeeReconcile(async () => client, NOW);
+    expect(s.lastOutcome).toBe('backfilled');
+    expect(s.lastGainLossRejections).toEqual([]);
+    expect(s.lastGainLossRejectionCounts!['no-lot']).toBe(0);
+  });
+
+  it('the published state is a COPY — a caller cannot mutate the pass through it (TRA-3558)', async () => {
+    clearLiveOptionsFeeSlippageLedger();
+    seedOpenFill();
+    seedCloseFill();
+    const { client } = fakeClient([], []);
+    await runLiveOptionsFeeReconcile(async () => client, NOW);
+    const first = getLiveOptionsFeeReconcileState();
+    first.lastGainLossRejections!.length = 0;
+    first.lastGainLossSample = null;
+    expect(getLiveOptionsFeeReconcileState().lastGainLossRejections!.length).toBe(2);
+  });
 });

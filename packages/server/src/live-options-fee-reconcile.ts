@@ -52,6 +52,8 @@ import {
   importMissingLiveOptionFills,
   summarizeLiveOptionsFeeSlippage,
   historyFillSide,
+  type GainLossRejection,
+  type GainLossRejectionReason,
   type LedgerCoverageResult,
   type LiveOptionFillRecord,
 } from './live-options-fee-slippage-ledger.js';
@@ -82,6 +84,21 @@ export const STALLED_AFTER_NO_MATCH = 3;
  * 7-day window for 7 days of hourly ticks, far past STALLED_AFTER_NO_MATCH.
  */
 export const FEE_MEASURABLE_HORIZON_DAYS = 7;
+
+/**
+ * TRA-3558 — how many RAW gainloss lots the state republishes. The commission
+ * join has had `lastHistorySample` since TRA-2850; the gainloss join — the one
+ * that measures every production fee — had only a bare `lastGainLossLots` count,
+ * so a 'no-match' could not distinguish a lot that never came back from the
+ * broker from one that came back MIS-KEYED. The cap is generous relative to the
+ * observed lot volume (22 on the 2026-08-13 live read) precisely so the sample is
+ * usable as a PRESENCE test: `lastGainLossLots <= this` ⇒ the sample is the whole
+ * fetch, and a symbol absent from it is absent from the broker payload, full stop.
+ */
+export const GAINLOSS_SAMPLE_MAX = 40;
+
+/** TRA-3558 — how many named group rejections the state republishes (newest ET day first). */
+export const GAINLOSS_REJECTION_MAX = 25;
 
 /** The slice of the Tradier options client this pass needs (injectable in tests). */
 export interface FeeReconcileHistoryClient {
@@ -143,6 +160,37 @@ export interface LiveOptionsFeeReconcileState {
   lastHistoryFills: number | null;
   /** TRA-2850 — settled gainloss lots returned by the last successful fetch. */
   lastGainLossLots: number | null;
+  /**
+   * TRA-3558 — RAW settled lots from the last gainloss fetch, PRE-filter and
+   * PRE-join, capped at {@link GAINLOSS_SAMPLE_MAX}. The counterpart of
+   * `lastHistorySample` for the join that does the real work. Read it together
+   * with `lastGainLossRejections`: a group rejected `no-lot` whose symbol does
+   * NOT appear here was never fetched; one whose symbol DOES appear here is
+   * mis-keyed, and the lot dates/quantity printed here say on which field.
+   * Truncated iff `lastGainLossLots > GAINLOSS_SAMPLE_MAX`.
+   */
+  lastGainLossSample: Array<{
+    symbol: string;
+    quantity: number;
+    cost: number;
+    proceeds: number;
+    openDate: string;
+    closeDate: string;
+  }> | null;
+  /**
+   * TRA-3558 — WHICH test rejected each still-unmeasured (symbol, day, side)
+   * group, with the two numbers that decided it. A bare 'no-match' trains
+   * readers to ignore it (the same failure shape TRA-2819 ask 4B was filed
+   * about); this names the branch. Newest ET day first, capped at
+   * {@link GAINLOSS_REJECTION_MAX} — the counts below are NOT capped.
+   */
+  lastGainLossRejections: GainLossRejection[] | null;
+  /**
+   * TRA-3558 — histogram of EVERY rejection this pass produced, by reason.
+   * Survives the sample cap, so the shape of a stall is readable even when the
+   * per-group list is truncated. Null until a gainloss fetch has run.
+   */
+  lastGainLossRejectionCounts: Record<GainLossRejectionReason, number> | null;
   /** Rows back-filled by the last attempt, both sources (null when none ran). */
   lastUpdated: number | null;
   /** TRA-2850 — of `lastUpdated`, rows measured by the gainloss derivation. */
@@ -224,6 +272,9 @@ function emptyState(): LiveOptionsFeeReconcileState {
     lastWindow: null,
     lastHistoryFills: null,
     lastGainLossLots: null,
+    lastGainLossSample: null,
+    lastGainLossRejections: null,
+    lastGainLossRejectionCounts: null,
     lastUpdated: null,
     lastGainLossUpdated: null,
     totalUpdated: 0,
@@ -252,6 +303,11 @@ export function getLiveOptionsFeeReconcileState(): LiveOptionsFeeReconcileState 
     ...state,
     lastWindow: state.lastWindow === null ? null : { ...state.lastWindow },
     lastHistorySample: state.lastHistorySample === null ? null : state.lastHistorySample.map((s) => ({ ...s })),
+    lastGainLossSample: state.lastGainLossSample === null ? null : state.lastGainLossSample.map((s) => ({ ...s })),
+    lastGainLossRejections:
+      state.lastGainLossRejections === null ? null : state.lastGainLossRejections.map((r) => ({ ...r })),
+    lastGainLossRejectionCounts:
+      state.lastGainLossRejectionCounts === null ? null : { ...state.lastGainLossRejectionCounts },
     coverage: state.coverage === null ? null : { ...state.coverage },
   };
 }
@@ -423,9 +479,32 @@ export async function runLiveOptionsFeeReconcile(
     }));
   }
   if (lots !== null) {
-    gainLossUpdated = backfillLiveOptionFeesFromGainLoss(lots).updated;
+    const gainLoss = backfillLiveOptionFeesFromGainLoss(lots);
+    gainLossUpdated = gainLoss.updated;
     updated += gainLossUpdated;
     state.lastGainLossLots = lots.length;
+    // TRA-3558 — the RAW lots, before any filter or key derivation, so an ABSENT
+    // lot is distinguishable from a MIS-KEYED one without source access.
+    state.lastGainLossSample = lots.slice(0, GAINLOSS_SAMPLE_MAX).map((l) => ({
+      symbol: l.symbol,
+      quantity: l.quantity,
+      cost: l.cost,
+      proceeds: l.proceeds,
+      openDate: l.openDate,
+      closeDate: l.closeDate,
+    }));
+    state.lastGainLossRejections = gainLoss.rejections.slice(0, GAINLOSS_REJECTION_MAX);
+    // Counted over ALL rejections, not the published slice — a truncated list
+    // must not make a stall read smaller than it is.
+    const counts: Record<GainLossRejectionReason, number> = {
+      'no-lot': 0,
+      'priceless-row': 0,
+      'qty-mismatch': 0,
+      'negative-fee': 0,
+      'above-bound': 0,
+    };
+    for (const r of gainLoss.rejections) counts[r.reason] += 1;
+    state.lastGainLossRejectionCounts = counts;
   }
 
   state.lastUpdated = updated;
@@ -466,6 +545,12 @@ export async function runLiveOptionsFeeReconcile(
     n: summary.n,
     totalFees: summary.totalFees,
     consecutiveNoMatch: state.consecutiveNoMatch,
+    // TRA-3558 — a 'no-match' log line that does not say WHICH test fired is a
+    // dead end; carry the histogram and the actionable groups into the log too.
+    gainLossRejectionCounts: state.lastGainLossRejectionCounts,
+    gainLossRejections: (state.lastGainLossRejections ?? [])
+      .slice(0, 5)
+      .map((r) => `${r.symbol} ${r.day} ${r.side}: ${r.reason} (${r.observed} vs ${r.expected})`),
     partialFetchError: state.lastError,
     coverage: state.coverage,
     unmeasured: {

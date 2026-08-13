@@ -539,6 +539,155 @@ describe('live-options fee/slippage ledger (TRA-1929)', () => {
 
 // ── TRA-2959: coverage diff against broker history ───────────────────────────
 
+// ── TRA-3558: a rejection must NAME its reason ───────────────────────────────
+//
+// TRA-3554's residual: the gainloss join reported a bare `no-match` on 4 rows
+// that plainly should have derived, and from outside the process it was
+// impossible to tell WHICH of the five tests below rejected them. These cases
+// pin one rejection reason per branch, the two numbers that decided it, and —
+// the load-bearing one — that NO unmeasured group can leave the join silently.
+
+describe('gainloss join rejection reasons (TRA-3558)', () => {
+  // The live TRA-3558 shape: TROW 1 contract @ 3.79 opened 2026-08-06.
+  function row(over: Partial<LiveOptionFillRecord> = {}): LiveOptionFillRecord {
+    return {
+      mode: 'live', ts: 1000, etDay: '2026-08-06', sleeve: 'single_leg_otm',
+      optionSymbol: 'TROW260918C00115000', side: 'buy_to_open', contracts: 1,
+      submittedLimit: 3.9, askAtSubmit: 3.9, midAtSubmit: 3.55, filledPrice: 3.79,
+      fees: null, feeSource: null, slippageVsAsk: -0.11, slippageVsMid: 0.24,
+      orderId: 140730135, origin: 'fill',
+      ...over,
+    };
+  }
+  function glLot(over: Partial<TradierGainLossLot> = {}): TradierGainLossLot {
+    // Matches row(): 1 contract @ 3.79 = 379.00 gross opened 2026-08-06.
+    return {
+      symbol: 'TROW260918C00115000',
+      quantity: 1,
+      cost: 379.11,
+      proceeds: 299.89,
+      gainLoss: -79.22,
+      openDate: '2026-08-06',
+      closeDate: '2026-08-07',
+      ...over,
+    };
+  }
+
+  it('a group that DERIVES produces no rejection at all', () => {
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot()]);
+    expect(r.updated).toBe(1);
+    expect(r.rejections).toEqual([]);
+  });
+
+  it('an already-measured group is not a rejection — quiet is not a failure', () => {
+    const r = reconcileLedgerFeesFromGainLoss([row({ fees: 0.11 })], []);
+    expect(r.updated).toBe(0);
+    expect(r.rejections).toEqual([]);
+  });
+
+  it("names 'no-lot' when NOTHING in the fetch keys to the group — absent, not mis-joined", () => {
+    const r = reconcileLedgerFeesFromGainLoss([row()], []);
+    expect(r.updated).toBe(0);
+    expect(r.rejections).toHaveLength(1);
+    const [rej] = r.rejections;
+    expect(rej!.reason).toBe('no-lot');
+    expect(rej!.symbol).toBe('TROW260918C00115000');
+    expect(rej!.day).toBe('2026-08-06');
+    expect(rej!.side).toBe('buy_to_open');
+    expect(rej!.unmeasuredRows).toBe(1);
+    expect(rej!.observed).toBe(0); // lots keyed here
+    expect(rej!.expected).toBe(1); // contracts the ledger holds
+  });
+
+  it("a MIS-KEYED lot still reads 'no-lot' — which is why the raw sample ships with it", () => {
+    // The lot exists in the fetch but its openDate is a day off, so it keys to
+    // a group the ledger does not have. Indistinguishable from absence WITHOUT
+    // the raw sample — see the reconcile-state test for the other half.
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot({ openDate: '2026-08-05' })]);
+    expect(r.rejections.map((x) => x.reason)).toEqual(['no-lot']);
+  });
+
+  it("names 'qty-mismatch' with BOTH totals — ledger contracts vs settled lot contracts", () => {
+    const r = reconcileLedgerFeesFromGainLoss([row({ contracts: 3 })], [glLot({ quantity: 1 })]);
+    expect(r.updated).toBe(0);
+    const [rej] = r.rejections;
+    expect(rej!.reason).toBe('qty-mismatch');
+    expect(rej!.observed).toBe(3); // ledger
+    expect(rej!.expected).toBe(1); // lots
+  });
+
+  it("names 'priceless-row' with the priced/total row counts", () => {
+    const rows = [
+      row({ ts: 1000, contracts: 1 }),
+      row({ ts: 2000, contracts: 3, filledPrice: null }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, [glLot({ quantity: 4, cost: 1516.44 })]);
+    expect(r.updated).toBe(0);
+    const [rej] = r.rejections;
+    expect(rej!.reason).toBe('priceless-row');
+    expect(rej!.observed).toBe(1); // priced rows
+    expect(rej!.expected).toBe(2); // rows in the group
+  });
+
+  it("names 'negative-fee' with the fee and the 0 floor — never clamped", () => {
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot({ cost: 375.0 })]);
+    expect(r.updated).toBe(0);
+    const [rej] = r.rejections;
+    expect(rej!.reason).toBe('negative-fee');
+    expect(rej!.observed).toBeCloseTo(-4, 6);
+    expect(rej!.expected).toBe(0);
+  });
+
+  it("names 'above-bound' with the fee and the per-contract ceiling it broke", () => {
+    const r = reconcileLedgerFeesFromGainLoss([row()], [glLot({ cost: 381.0 })]);
+    expect(r.updated).toBe(0);
+    const [rej] = r.rejections;
+    expect(rej!.reason).toBe('above-bound');
+    expect(rej!.observed).toBeCloseTo(2, 6);
+    expect(rej!.expected).toBeCloseTo(0.9, 6); // 0.90 × 1 contract
+  });
+
+  it('EVERY still-unmeasured group carries a reason — no silent survivor (the invariant)', () => {
+    // One group per branch plus one that derives cleanly. The assertion is not
+    // "some rejections were produced" — it is that the set of unmeasured groups
+    // AFTER the pass is exactly the set of rejected groups. A future branch that
+    // forgets to call reject() fails here, not silently in production.
+    const rows = [
+      row({ ts: 1, optionSymbol: 'AAA260918C00010000' }),                                    // derives
+      row({ ts: 2, optionSymbol: 'BBB260918C00010000' }),                                    // no-lot
+      row({ ts: 3, optionSymbol: 'CCC260918C00010000', contracts: 3 }),                      // qty-mismatch
+      row({ ts: 4, optionSymbol: 'DDD260918C00010000', filledPrice: null }),                 // priceless-row
+      row({ ts: 5, optionSymbol: 'EEE260918C00010000' }),                                    // negative-fee
+      row({ ts: 6, optionSymbol: 'FFF260918C00010000' }),                                    // above-bound
+    ];
+    const lots = [
+      glLot({ symbol: 'AAA260918C00010000' }),
+      glLot({ symbol: 'CCC260918C00010000', quantity: 1 }),
+      glLot({ symbol: 'DDD260918C00010000' }),
+      glLot({ symbol: 'EEE260918C00010000', cost: 375.0 }),
+      glLot({ symbol: 'FFF260918C00010000', cost: 381.0 }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, lots);
+    expect(r.updated).toBe(1);
+    const unmeasured = new Set(r.records.filter((x) => x.fees === null).map((x) => x.optionSymbol));
+    const explained = new Set(r.rejections.map((x) => x.symbol));
+    expect([...explained].sort()).toEqual([...unmeasured].sort());
+    expect(r.rejections.map((x) => x.reason).sort()).toEqual(
+      ['above-bound', 'negative-fee', 'no-lot', 'priceless-row', 'qty-mismatch'],
+    );
+  });
+
+  it('rejections lead with the most recent ET day — a truncated publish keeps the actionable ones', () => {
+    const rows = [
+      row({ ts: 1, etDay: '2026-07-16', optionSymbol: 'OLD260918C00010000' }),
+      row({ ts: 2, etDay: '2026-08-12', optionSymbol: 'NEW260918C00010000' }),
+      row({ ts: 3, etDay: '2026-08-01', optionSymbol: 'MID260918C00010000' }),
+    ];
+    const r = reconcileLedgerFeesFromGainLoss(rows, []);
+    expect(r.rejections.map((x) => x.day)).toEqual(['2026-08-12', '2026-08-01', '2026-07-16']);
+  });
+});
+
 describe('diffMissingFillsFromHistory (TRA-2959)', () => {
   function rec(over: Partial<LiveOptionFillRecord>): LiveOptionFillRecord {
     return {

@@ -622,6 +622,55 @@ export function reconcileLedgerFees(
 /** Per-contract ceiling a gainloss-derived fee must clear to be written (see above). */
 const GAINLOSS_FEE_MAX_PER_CONTRACT_USD = 0.9;
 
+/**
+ * TRA-3558 — WHY one (symbol, ET day, side) group holding an unmeasured row did
+ * not derive a fee. A bare `no-match` is unactionable: it collapses "the lot
+ * never came back from the broker" into "the lot came back and the join rejected
+ * it", and those need opposite fixes. Each reason below is ONE test in the join,
+ * in the order the join applies them:
+ * - 'no-lot'        — nothing in the fetched lots keys to this group at all.
+ * - 'priceless-row' — a row in the group has no `filledPrice` (or no contracts),
+ *                     so the group's gross is not computable.
+ * - 'qty-mismatch'  — lots and rows both exist but their contract totals differ.
+ * - 'negative-fee'  — the derived fee is below 0 (the lot is not these fills).
+ * - 'above-bound'   — the derived fee exceeds $0.90/contract (a join artifact).
+ */
+export type GainLossRejectionReason =
+  | 'no-lot'
+  | 'priceless-row'
+  | 'qty-mismatch'
+  | 'negative-fee'
+  | 'above-bound';
+
+/**
+ * TRA-3558 — one rejected group, with THE TWO NUMBERS that decided it. `observed`
+ * and `expected` are in the reason's own units (contracts for the qty tests, USD
+ * for the fee tests, rows for 'priceless-row'); `detail` renders them so a reader
+ * of the health route needs no source access to act on it.
+ */
+export interface GainLossRejection {
+  symbol: string;
+  /** ET day of the ledger rows in this group. */
+  day: string;
+  side: LiveFillSide;
+  reason: GainLossRejectionReason;
+  /** Rows this rejection keeps at `fees: null`. */
+  unmeasuredRows: number;
+  observed: number;
+  expected: number;
+  detail: string;
+}
+
+/** {@link FeeBackfillResult} plus the named reason for every group that did NOT derive. */
+export interface GainLossBackfillResult extends FeeBackfillResult {
+  /**
+   * One entry per (symbol, day, side) group that still holds an unmeasured row
+   * after this pass. Empty ⇒ every unmeasured row was measured. Ordered most
+   * recent ET day first, so the ACTIONABLE groups lead (aged rows sort last).
+   */
+  rejections: GainLossRejection[];
+}
+
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
@@ -635,7 +684,7 @@ function round2(n: number): number {
 export function reconcileLedgerFeesFromGainLoss(
   records: readonly LiveOptionFillRecord[],
   lots: readonly TradierGainLossLot[],
-): FeeBackfillResult {
+): GainLossBackfillResult {
   // Lot totals per (symbol, day, side): the basis is fees-INCLUSIVE cost for the
   // open leg and fees-NET proceeds for the close leg.
   const lotTotals = new Map<string, { qty: number; basis: number }>();
@@ -662,28 +711,96 @@ export function reconcileLedgerFeesFromGainLoss(
   });
 
   const feeByIndex = new Map<number, number>();
+  const rejections: GainLossRejection[] = [];
   for (const [key, indices] of rowGroups) {
-    if (!indices.some((i) => records[i]!.fees === null)) continue; // nothing to measure
-    const lotTotal = lotTotals.get(key);
-    if (!lotTotal) continue; // not settled yet (or not in the fetched window)
+    const unmeasuredRows = indices.filter((i) => records[i]!.fees === null).length;
+    if (unmeasuredRows === 0) continue; // nothing to measure — not a rejection
+    const first = records[indices[0]!]!;
+    // TRA-3558 — every `continue` below MUST route through this, so a group can
+    // never leave the loop unmeasured AND unexplained.
+    const reject = (
+      reason: GainLossRejectionReason,
+      observed: number,
+      expected: number,
+      detail: string,
+    ): void => {
+      rejections.push({
+        symbol: first.optionSymbol,
+        day: first.etDay,
+        side: first.side,
+        reason,
+        unmeasuredRows,
+        observed,
+        expected,
+        detail,
+      });
+    };
 
+    // Group totals. `groupContracts` counts EVERY row (so a no-lot group can be
+    // described honestly); `rowQty`/`rowGross` only the priced ones.
+    let groupContracts = 0;
     let rowQty = 0;
     let rowGross = 0;
-    let derivable = true;
+    let pricedRows = 0;
     for (const i of indices) {
       const r = records[i]!;
-      if (r.filledPrice === null || !(r.contracts > 0)) {
-        derivable = false; // a priceless row poisons the group's gross — stay null
-        break;
-      }
+      groupContracts += r.contracts;
+      if (r.filledPrice === null || !(r.contracts > 0)) continue;
+      pricedRows += 1;
       rowQty += r.contracts;
       rowGross += r.filledPrice * 100 * r.contracts;
     }
-    if (!derivable || rowQty !== lotTotal.qty) continue; // totals must reconcile exactly
 
-    const side = records[indices[0]!]!.side;
+    const lotTotal = lotTotals.get(key);
+    if (!lotTotal) {
+      reject(
+        'no-lot',
+        0,
+        groupContracts,
+        `no settled gainloss lot keys to ${key}: the ledger holds ${groupContracts} contract(s), the fetched lots hold 0 — the lot is either ABSENT from the fetch (unsettled, or outside the window) or keyed to a different symbol, date or side; compare against lastGainLossSample`,
+      );
+      continue;
+    }
+    if (pricedRows !== indices.length) {
+      reject(
+        'priceless-row',
+        pricedRows,
+        indices.length,
+        `${indices.length - pricedRows} of ${indices.length} row(s) in this group carry no filledPrice (or no contracts), so the group gross is not computable — the whole group stays null rather than derive a fee off a partial gross`,
+      );
+      continue;
+    }
+    if (rowQty !== lotTotal.qty) {
+      reject(
+        'qty-mismatch',
+        rowQty,
+        lotTotal.qty,
+        `ledger holds ${rowQty} contract(s) for ${key} but the settled lots total ${lotTotal.qty} — totals must reconcile exactly before a fee is apportioned`,
+      );
+      continue;
+    }
+
+    const side = first.side;
     const groupFee = round2(side === 'buy_to_open' ? lotTotal.basis - rowGross : rowGross - lotTotal.basis);
-    if (groupFee < 0 || groupFee > GAINLOSS_FEE_MAX_PER_CONTRACT_USD * rowQty) continue;
+    if (groupFee < 0) {
+      reject(
+        'negative-fee',
+        groupFee,
+        0,
+        `derived fee ${groupFee} is negative (lot basis ${round2(lotTotal.basis)} vs row gross ${round2(rowGross)}) — the lot did not come from these fills; never clamped to 0`,
+      );
+      continue;
+    }
+    const bound = round2(GAINLOSS_FEE_MAX_PER_CONTRACT_USD * rowQty);
+    if (groupFee > bound) {
+      reject(
+        'above-bound',
+        groupFee,
+        bound,
+        `derived fee ${groupFee} exceeds the ${GAINLOSS_FEE_MAX_PER_CONTRACT_USD}/contract sanity bound (${bound} for ${rowQty} contract(s)) — a mis-pairing artifact, not a fee`,
+      );
+      continue;
+    }
 
     for (const i of indices) {
       const r = records[i]!;
@@ -691,7 +808,9 @@ export function reconcileLedgerFeesFromGainLoss(
       feeByIndex.set(i, round2((groupFee * r.contracts) / rowQty));
     }
   }
-
+  // Most recent ET day first: the ACTIONABLE groups are the newest, and a
+  // truncated publish must not drop them in favour of aged ones.
+  rejections.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
   let updated = 0;
   const out = records.map((r, i) => {
     if (feeByIndex.has(i)) {
@@ -700,7 +819,7 @@ export function reconcileLedgerFeesFromGainLoss(
     }
     return toRecord(recordToInput(r));
   });
-  return { updated, records: out };
+  return { updated, records: out, rejections };
 }
 
 /** Swap a reconcile result into the store and, when rows changed, REWRITE the durable JSONL. */
@@ -748,7 +867,7 @@ export function backfillLiveOptionFees(
  */
 export function backfillLiveOptionFeesFromGainLoss(
   lots: readonly TradierGainLossLot[],
-): FeeBackfillResult {
+): GainLossBackfillResult {
   const result = reconcileLedgerFeesFromGainLoss(fills, lots);
   applyBackfillResult(result);
   return result;
