@@ -196,6 +196,16 @@ const engines = Array.isArray(pipe?.engines) ? pipe.engines : [];
 const openFlags = [...new Set(engines.map((e) => e.marketOpen))];
 const marketOpen = openFlags.length === 1 ? openFlags[0] : null;
 const blockedBy = [...new Set(engines.map((e) => e.blockedBy).filter(Boolean))];
+// TRA-3417 §51 — the disclaimer above lived ONLY in this comment, and the
+// LIVENESS line printed `blockedBy ["trading_halted"]` flush against
+// `marketOpen true` with no scope. Reading my own output at 14:5xZ I logged that
+// as an unreconciled conflict with `/api/state`'s `tradingHalted:false` — there
+// is no conflict, the two describe DISJOINT populations. So the scope is now
+// carried by the OUTPUT, and the demo-only premise is ASSERTED, not assumed: if a
+// live-mode row ever appears here the label stops claiming demo-only.
+const nonDemoEngines = engines.filter((e) => e.mode !== 'demo');
+const enginesAreDemoOnly = engines.length > 0 && nonDemoEngines.length === 0;
+const haltedDemo = engines.filter((e) => e.tradingHalted === true).length;
 
 const rvPaths = Array.isArray(rvs?.paths) ? rvs.paths : [];
 const dirPath = rvPaths.find((p) => p.path === 'directional');
@@ -245,7 +255,8 @@ const bootBeforeOpen = Number.isFinite(bootMs) && bootMs < openZ.getTime();
 
 console.log('LIVENESS');
 console.log(`  server now ${serverNow.toISOString()}  (open ${openZ.toISOString()}, ${minsSinceOpen >= 0 ? `T+${minsSinceOpen}` : `T${minsSinceOpen}`} min)`);
-console.log(`  marketOpen ${JSON.stringify(marketOpen)}${blockedBy.length ? `  blockedBy ${JSON.stringify(blockedBy)}` : ''}${pipe?.__err ? `  ⛔ options-pipeline: ${pipe.__err}` : ''}`);
+console.log(`  marketOpen ${JSON.stringify(marketOpen)}${pipe?.__err ? `  ⛔ options-pipeline: ${pipe.__err}` : ''}`);
+console.log(`  ⚠ options-pipeline enumerates ${engines.length} engine(s), ${enginesAreDemoOnly ? 'ALL mode=demo' : `${nonDemoEngines.length} NON-demo (${JSON.stringify([...new Set(nonDemoEngines.map((e) => e.mode))])})`} — admin/v0nni are NOT in this array.${blockedBy.length ? `  blockedBy ${JSON.stringify(blockedBy)} (${haltedDemo}/${engines.length} halted) applies to ${enginesAreDemoOnly ? 'DEMO books ONLY — it is NOT a statement about the graded live books' : '⛔ a set that now CONTAINS non-demo rows — re-check before dismissing'}` : ''}`);
 console.log(`  sibling 'directional' scansSinceBoot ${JSON.stringify(siblingScans)}  lastScanAt ${JSON.stringify(dirPath?.lastScanAt ?? null)}  chain lastFetchOkAt ${JSON.stringify(chainFetchOkAt)}${rvs?.__err ? `  ⛔ rv-scan: ${rvs.__err}` : ''}`);
 console.log(`  retained desk×live arm cell for ${etDay}: ${deskLiveCell ? `PRESENT — ticks ${deskLiveCell.ticks} (lower bound), books ${deskLiveCell.books}, boots ${deskLiveCell.boots}, disposition ${deskLiveCell.disposition}, first ${new Date(deskLiveCell.firstAt).toISOString()}, last ${new Date(deskLiveCell.lastAt).toISOString()}` : `ABSENT (${armDays.length} retained day(s): ${JSON.stringify(armDays.map((d) => d.etDay))})`}`);
 console.log(`  boot ${ver.startedAt} — ${bootBeforeOpen ? 'BEFORE the open, since-boot counters cover the session' : `⛔ AT/AFTER the open: since-boot counters were RESET mid-session, so the sibling control is VOID${deskLiveTicked ? ' — but the RETAINED desk×live cell is per-ET-day and survives the restart' : ''}`}`);
