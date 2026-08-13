@@ -1592,10 +1592,16 @@ describe('TRA-3387 top movers — an empty session-condemnation census is EVIDEN
     storeDir: '/data/users/admin',
     ephemeralStore: false,
   });
-  const restoreOf = (outcome: 'restored' | 'absent' | 'rolled_over' | 'unreadable') => ({
+  const restoreOf = (
+    outcome: 'restored' | 'absent' | 'rolled_over' | 'unreadable',
+    // TRA-3480 — what the snapshot's WRITER had already lost. `0` here keeps every assertion in
+    // this block grading the single hop it was written to grade; `null` is the inherited-blind
+    // arm and gets its own test below.
+    uncoveredMsCarried: number | null = 0,
+  ) => ({
     outcome, path: '/data/users/admin/move-suspect-session.json',
     fileSessionDay: null, fileUpdatedAt: now - 90_000, fileProcessStartedAt: null,
-    rows: [], droppedRows: 0,
+    rows: [], droppedRows: 0, uncoveredMsCarried,
   });
 
   /** Run a report and return every JSON log line it emitted, on both streams. */
@@ -1678,6 +1684,32 @@ describe('TRA-3387 top movers — an empty session-condemnation census is EVIDEN
     // durable write and this process's start. Known, so it is stated.
     expect(line.uncoveredMs).toBe(30_000);
     expect(line.level).toBe('info');
+  });
+
+  // ⭐ TRA-3480 — THE TRAP THIS PAIR EXISTS TO CATCH. `uncoveredMs` is now `carried + gap`, and
+  // an absent/garbage `carried` makes that `NaN` — which `JSON.stringify` writes into the tape as
+  // `null`, the exact token this instrument reserves for "unknowable". A reader would then see a
+  // shrug emitted from a restore that was completely fine, at INFO, under the RESTORED sentence.
+  // Only a test that grades the SERIALISED LINE can see it; the returned object says `NaN`.
+  it('TRA-3480 — a restored hop with an UNKNOWN carry is BLIND at warn, and never a NaN dressed as null', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('restored', null))))!;
+    expect(line.coverage).toBe('blind');
+    expect(line.reason).toBe('restored_but_session_start_unobserved');
+    expect(line.level).toBe('warn');
+    expect(String(line.msg)).toContain('BLIND');
+    expect(line.uncoveredMs).toBeNull();
+    // The rows DID come back — the restore worked. It is the guarantee that did not, and the
+    // line has to carry both facts at once or a reader will read the outcome as the verdict.
+    expect(line.restoreOutcome).toBe('restored');
+  });
+
+  it('TRA-3480 — the carry ADDS to the hop, so a chain of restarts cannot report only its last gap', () => {
+    const line = censusLine(linesFrom(GENUINE, provenance(todayEt, restoreOf('restored', 4 * 60_000))))!;
+    expect(line.coverage).toBe('restored');
+    // 4 minutes inherited + this hop's own 30 s. Without the addition this reads 30_000 — a
+    // number that SHRINKS as the evidence gets worse, which is the one direction a coverage
+    // bound may never move.
+    expect(line.uncoveredMs).toBe(4 * 60_000 + 30_000);
   });
 
   // ⭐ TRA-3468 — THE REGRESSION. Every assertion in the test above is on a STRUCTURED FIELD, and

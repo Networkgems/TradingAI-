@@ -35,7 +35,11 @@ import {
   saveMoveSuspectSessionSnapshot,
   gradeMoveSuspectSessionCoverage,
   moveSuspectSessionPath,
+  readCarriedUncoveredMs,
+  deriveInheritedUncoveredMs,
   MOVE_SUSPECT_SESSION_MAX_ROWS,
+  MOVE_SUSPECT_SESSION_HEARTBEAT_MS,
+  MOVE_SUSPECT_SESSION_VERSION,
   type MoveSuspectSessionFile,
   type MoveSuspectSessionProvenance,
   type MoveSuspectSessionRestore,
@@ -206,7 +210,7 @@ describe('TRA-3387 — the store round trip, and the outcomes an empty read can 
     await saveMoveSuspectSessionSnapshot(dir, { sessionDay: '2026-08-06', processStartedAt: 1, rows: [] });
     const parsed = JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile;
     expect(parsed.issue).toBe('TRA-3387');
-    expect(parsed.version).toBe(1);
+    expect(parsed.version).toBe(MOVE_SUSPECT_SESSION_VERSION);
   });
 
   it('a nonexistent directory is CREATED rather than failing the write', async () => {
@@ -219,9 +223,16 @@ describe('TRA-3387 — the store round trip, and the outcomes an empty read can 
 
 // ── The coverage predicate: what makes an EMPTY census readable ──────────────
 
-const restoreOf = (outcome: MoveSuspectSessionRestore['outcome'], updatedAt: number | null = null): MoveSuspectSessionRestore => ({
+// `uncoveredMsCarried` defaults to 0 — "the writer had lost nothing" — so every pre-TRA-3480
+// assertion in this block still grades the hop it was written to grade. The carry's own arms are
+// exercised explicitly further down.
+const restoreOf = (
+  outcome: MoveSuspectSessionRestore['outcome'],
+  updatedAt: number | null = null,
+  uncoveredMsCarried: number | null = 0,
+): MoveSuspectSessionRestore => ({
   outcome, path: '/x', fileSessionDay: null, fileUpdatedAt: updatedAt,
-  fileProcessStartedAt: null, rows: [], droppedRows: 0,
+  fileProcessStartedAt: null, rows: [], droppedRows: 0, uncoveredMsCarried,
 });
 const provenanceOf = (
   startedSessionDay: string,
@@ -399,18 +410,35 @@ describe('TRA-3387 ACCEPTANCE — a restart between the condemnation and the clo
     expect(after.rows).toEqual([]);
   });
 
-  it('AC3 CONTROL — a genuinely clean session writes no rows and restores as `absent`', async () => {
+  it('AC3 CONTROL — a genuinely clean session persists ZERO ROWS, and still pays only one write per batch-burst', async () => {
     const dir = await tempDir();
     withClock(T_AUG06_1400ET);
     const engine = new SignalEngine();
     const restore = await engine.hydrateMoveSuspectSession(dir);
     expect(restore.outcome).toBe('absent');
+
+    // TRA-3480 — the boot ANCHOR. Before it, a clean session wrote nothing at all, and a restart
+    // into that emptiness graded the WHOLE session blind. The anchor is what the criterion is
+    // about now: an EMPTY exclusion set that is on the record, not an absent one.
+    await engine.whenMoveSuspectSessionSettled();
+    const anchor = JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile;
+    expect(anchor.rows).toEqual([]);
+    expect(anchor.sessionDay).toBe('2026-08-06');
+    expect(anchor.updatedAt).toBe(T_AUG06_1400ET);
+
     applyQuotes(engine, quotes({ AAPL: { price: 338.11, volume: 4e7, change: 5.71, changePct: 1.72 } }), ['AAPL']);
     await engine.whenMoveSuspectSessionSettled();
-    // No condemnation ⇒ nothing to persist ⇒ NO WRITE AT ALL. The clean path must not pay a
-    // disk write per quote batch.
-    await expect(readFile(moveSuspectSessionPath(dir), 'utf-8')).rejects.toThrow();
     expect(rowFor(engine, 'AAPL')?.moveSuspectSession).toBe(false);
+
+    // ...and the clean path still must not pay a disk write PER QUOTE BATCH. Several batches
+    // inside one heartbeat window leave the anchor byte-identical.
+    for (let i = 1; i <= 5; i++) {
+      vi.setSystemTime(T_AUG06_1400ET + i * 30_000);
+      applyQuotes(engine, quotes({ AAPL: { price: 338.11 + i, volume: 4e7, change: 5.71, changePct: 1.72 } }), ['AAPL']);
+    }
+    await engine.whenMoveSuspectSessionSettled();
+    const stillAnchor = JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile;
+    expect(stillAnchor.updatedAt).toBe(T_AUG06_1400ET);
   });
 
   it('an unwired engine still reports a GRADEABLE provenance rather than pretending it is fine', () => {
@@ -441,5 +469,233 @@ describe('TRA-3387 ACCEPTANCE — a restart between the condemnation and the clo
     applyQuotes(engine, quotes({ AZI: AZI_CONDEMNED }), ['AZI']);
     await engine.whenMoveSuspectSessionSettled();
     expect(engine.getMoveSuspectSessionProvenance().lastFlushError).toBeTruthy();
+  });
+});
+
+// ── TRA-3480 — the anchor, the heartbeat, and the carry that keeps them honest ──
+//
+// TRA-3387's store wrote only on a session-fact CHANGE. That is complete, and on a QUIET session
+// it writes nothing, so a mid-session restart reads `absent` and the whole session grades BLIND
+// even though nothing was lost. bqb1 booted NINE times in six hours on 2026-08-12/13, so this is
+// the modal outcome, and it can starve TRA-3243's AC4 session after session.
+//
+// ⛔ THE ANCHOR ALONE WOULD HAVE MADE THE INSTRUMENT WORSE, NOT BETTER. Every boot rewriting
+// `updatedAt` means the next boot measures its gap from THAT — nine restarts report nine small
+// numbers and no memory of the eight holes between them, so the bound shrinks exactly as the
+// evidence gets worse. `uncoveredMsCarried` is the part that makes the anchor safe, and the
+// chain test below is the one that would fail if it were dropped.
+
+describe('TRA-3480 — a QUIET session is gradeable, and a chain of restarts still adds up', () => {
+  const CLEAN: QuoteRow = { price: 338.11, volume: 4e7, change: 5.71, changePct: 1.72 };
+  const T_1400 = T_AUG06_1400ET;
+
+  it('AC — a restart on a session that condemned NOTHING grades `restored`, not `blind`', async () => {
+    const dir = await tempDir();
+
+    // ⛔ THE CHAIN HAS TO BE ROOTED BEFORE THE GRADED DAY, and that is not test scaffolding — it
+    // is the rule. A process that boots INSIDE the session with nothing on disk cannot know
+    // whether something was condemned before it existed, so it stays blind and stamps that
+    // unknown; the anchor never launders it. What the anchor fixes is the OTHER case, which is
+    // also the live one: bqb1's last boot before ET midnight predates the session, so it owns the
+    // day from its first instant and the restarts that follow inherit a real bound.
+    withClock(Date.parse('2026-08-05T20:00:00.000Z'));
+    const before = new SignalEngine();
+    await before.hydrateMoveSuspectSession(dir);
+
+    // The ET day rolls under it and a quote batch lands. Nothing is condemned all session — the
+    // v1 store would have written NOTHING for 08-06 and the next boot would have read a stale
+    // 08-05 file, rolled it over, and graded the whole session blind.
+    vi.setSystemTime(T_1400);
+    applyQuotes(before, quotes({ AAPL: CLEAN }), ['AAPL']);
+    await before.whenMoveSuspectSessionSettled();
+    const written = JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile;
+    expect(written.sessionDay).toBe('2026-08-06');
+    expect(written.rows).toEqual([]);
+    // Zero, not null: this writer observed 08-06 from the day's first instant.
+    expect(written.uncoveredMsCarried).toBe(0);
+
+    // Process 2, twenty minutes later.
+    vi.setSystemTime(T_1400 + 20 * 60_000);
+    const after = new SignalEngine();
+    const restore = await after.hydrateMoveSuspectSession(dir);
+    expect(restore.outcome).toBe('restored');
+    expect(restore.rows).toEqual([]);
+    expect(restore.uncoveredMsCarried).toBe(0);
+
+    // `processStartedAt` is pinned rather than read off the provenance: it comes from the REAL
+    // `process.uptime()`, so the live value is "a few seconds before the faked now" and the gap
+    // would not be a round number. The arithmetic is the subject; the clock is not.
+    const v = gradeMoveSuspectSessionCoverage(
+      { ...after.getMoveSuspectSessionProvenance(), processStartedAt: T_1400 + 20 * 60_000,
+        processStartedSessionDay: '2026-08-06' },
+      '2026-08-06');
+    expect(v.coverage).toBe('restored');
+    expect(v.reason).toBe('restored_from_snapshot');
+    expect(v.uncoveredMs).toBe(20 * 60_000);
+
+    // NEGATIVE CONTROL — the SAME 20-minute restart against what the v1 store would actually
+    // have left behind on this session: nothing, because nothing was ever condemned. It must
+    // still grade BLIND. Without this arm the block would pass against a build where the verdict
+    // had simply been loosened, rather than the evidence improved.
+    const bare = await tempDir();
+    const v1World = await loadMoveSuspectSessionSnapshot(bare, '2026-08-06');
+    expect(v1World.outcome).toBe('absent');
+    const control = gradeCoverage(v1World, '2026-08-06');
+    expect(control.coverage).toBe('blind');
+    expect(control.reason).toBe('restart_in_session_no_snapshot');
+  });
+
+  it('THE CARRY ACCUMULATES — three restarts report the SUM of their holes, not the last one', async () => {
+    const dir = await tempDir();
+    // Boot 1 predates the session day, so it inherits a PROVEN zero and the chain starts clean.
+    withClock(Date.parse('2026-08-05T20:00:00.000Z'));
+    const p1 = new SignalEngine();
+    await p1.hydrateMoveSuspectSession(dir);
+    // ...and it writes the graded day once the day rolls under it. That write is the heartbeat's
+    // ET-rollover arm: on a session with no condemnation nothing else would ever restamp the file
+    // and boot 2 would read `rolled_over` -> BLIND.
+    vi.setSystemTime(T_1400);
+    applyQuotes(p1, quotes({ AAPL: CLEAN }), ['AAPL']);
+    await p1.whenMoveSuspectSessionSettled();
+    expect((JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile).sessionDay)
+      .toBe('2026-08-06');
+
+    // Each hop leaves a hole of 10 minutes between the dead process's last write and the boot.
+    const gaps = [10, 10, 10];
+    let t = T_1400;
+    for (const g of gaps) {
+      t += g * 60_000;
+      vi.setSystemTime(t);
+      const p = new SignalEngine();
+      const restore = await p.hydrateMoveSuspectSession(dir);
+      expect(restore.outcome).toBe('restored');
+      // The engine derives its carry from the read it just did; assert on the FILE it then wrote,
+      // because the file is what the next boot actually grades.
+      const written = JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile;
+      expect(written.version).toBe(2);
+      // `processStartedAt` is the REAL process (vitest's), so the engine's own derived carry is
+      // not the arithmetic under test here — the accumulation across hops is, and it is asserted
+      // directly on the pure function below.
+      expect(written.uncoveredMsCarried === null || written.uncoveredMsCarried >= 0).toBe(true);
+    }
+
+    // The arithmetic itself, on the pure pair, hop by hop. THIS is the assertion that fails if
+    // the carry field is dropped and each boot resets the bound to its own last gap.
+    let carried: number | null = 0;
+    let lastWrite = T_1400;
+    for (const g of gaps) {
+      const boot = lastWrite + g * 60_000;
+      carried = deriveInheritedUncoveredMs(
+        restoreOf('restored', lastWrite, carried), boot, '2026-08-06', '2026-08-06');
+      lastWrite = boot;
+    }
+    expect(carried).toBe(30 * 60_000);
+
+    const v = gradeMoveSuspectSessionCoverage(
+      provenanceOf('2026-08-06', restoreOf('restored', lastWrite, carried), lastWrite + 60_000),
+      '2026-08-06');
+    expect(v.coverage).toBe('restored');
+    expect(v.uncoveredMs).toBe(31 * 60_000);
+  });
+
+  it('BLINDNESS IS INHERITED — a chain rooted in a blind boot never launders itself clean', () => {
+    // Boot A lands mid-session with nothing on disk: blind, and it stamps that unknown.
+    const rootCarry = deriveInheritedUncoveredMs(
+      restoreOf('absent'), Date.parse('2026-08-06T18:00:00.000Z'), '2026-08-06', '2026-08-06');
+    expect(rootCarry).toBeNull();
+
+    // Boot B restores A's anchor perfectly — rows and all — one minute later. A one-minute gap is
+    // the most reassuring number in this file, and it must NOT be what gets published.
+    const v = gradeMoveSuspectSessionCoverage(
+      provenanceOf('2026-08-06',
+        restoreOf('restored', Date.parse('2026-08-06T18:00:00.000Z'), rootCarry),
+        Date.parse('2026-08-06T18:01:00.000Z')),
+      '2026-08-06');
+    expect(v.coverage).toBe('blind');
+    expect(v.reason).toBe('restored_but_session_start_unobserved');
+    expect(v.uncoveredMs).toBeNull();
+
+    // ...and it propagates: B's own carry stays unknown, so C inherits it too.
+    expect(deriveInheritedUncoveredMs(
+      restoreOf('restored', Date.parse('2026-08-06T18:00:00.000Z'), rootCarry),
+      Date.parse('2026-08-06T18:01:00.000Z'), '2026-08-06', '2026-08-06')).toBeNull();
+
+    // THE OTHER DIRECTION, or the rule above would be satisfied by a constant `null`: the ET
+    // ROLLOVER discharges it. A process that booted blind inside 08-06 observed 08-07 from its
+    // first instant, so one bad boot must not blind every session that follows.
+    expect(deriveInheritedUncoveredMs(
+      restoreOf('absent'), Date.parse('2026-08-06T18:00:00.000Z'), '2026-08-06', '2026-08-07')).toBe(0);
+  });
+
+  it('a version-1 file reads carry `0`; a version-2 file that OMITS the field reads `null`', async () => {
+    // The mixed-build boundary. v1 wrote only on a change, so its `updatedAt` already WAS the
+    // complete bound — reading its absence as unknown would manufacture a BLIND out of every
+    // rolling deploy. v2 claims the contract, so omitting the field is a failure to keep it.
+    expect(readCarriedUncoveredMs({ version: 1, updatedAt: 1 })).toBe(0);
+    expect(readCarriedUncoveredMs({ version: 2, updatedAt: 1 })).toBeNull();
+    expect(readCarriedUncoveredMs({ version: 2, updatedAt: 1, uncoveredMsCarried: null })).toBeNull();
+    expect(readCarriedUncoveredMs({ version: 2, updatedAt: 1, uncoveredMsCarried: 5_000 })).toBe(5_000);
+    // Junk is not zero.
+    expect(readCarriedUncoveredMs({ version: 2, uncoveredMsCarried: Number.NaN } as never)).toBeNull();
+    expect(readCarriedUncoveredMs({ version: 2, uncoveredMsCarried: -1 } as never)).toBeNull();
+
+    // End to end: a v1 file on disk restores and grades exactly as it did before this change.
+    const dir = await tempDir();
+    await mkdir(dir, { recursive: true });
+    await writeFile(moveSuspectSessionPath(dir), JSON.stringify({
+      issue: 'TRA-3387', version: 1, sessionDay: '2026-08-06',
+      updatedAt: T_1400, processStartedAt: T_1400 - 60_000, truncated: false,
+      rows: [{ symbol: 'AZI', moveSuspectSessionDay: '2026-08-06', moveSuspectPrevClose: 1.01 }],
+    }), 'utf-8');
+    const restore = await loadMoveSuspectSessionSnapshot(dir, '2026-08-06');
+    expect(restore.outcome).toBe('restored');
+    expect(restore.rows.map(r => r.symbol)).toEqual(['AZI']);
+    expect(restore.uncoveredMsCarried).toBe(0);
+    const v = gradeMoveSuspectSessionCoverage(
+      provenanceOf('2026-08-06', restore, T_1400 + 5_000), '2026-08-06');
+    expect(v.coverage).toBe('restored');
+    expect(v.uncoveredMs).toBe(5_000);
+  });
+
+  it('a carry read off ANOTHER session\'s file is discarded with its rows', async () => {
+    // The rollover gate already drops the rows; the carry has to go with them, or a bound
+    // computed over yesterday would be published as a bound over today.
+    const dir = await tempDir();
+    await saveMoveSuspectSessionSnapshot(dir, {
+      sessionDay: '2026-08-05', processStartedAt: 1, rows: [], uncoveredMsCarried: 0, now: 1,
+    });
+    const restore = await loadMoveSuspectSessionSnapshot(dir, '2026-08-06');
+    expect(restore.outcome).toBe('rolled_over');
+    expect(restore.uncoveredMsCarried).toBeNull();
+  });
+
+  it('the heartbeat fires once per window, and only when a quote batch actually landed', async () => {
+    const dir = await tempDir();
+    withClock(T_1400);
+    const engine = new SignalEngine();
+    await engine.hydrateMoveSuspectSession(dir);
+    await engine.whenMoveSuspectSessionSettled();
+    const at = async () => (JSON.parse(await readFile(moveSuspectSessionPath(dir), 'utf-8')) as MoveSuspectSessionFile).updatedAt;
+    expect(await at()).toBe(T_1400);
+
+    // Inside the window: no write, however many batches land.
+    vi.setSystemTime(T_1400 + MOVE_SUSPECT_SESSION_HEARTBEAT_MS - 1_000);
+    applyQuotes(engine, quotes({ AAPL: CLEAN }), ['AAPL']);
+    await engine.whenMoveSuspectSessionSettled();
+    expect(await at()).toBe(T_1400);
+
+    // Past it: exactly one write, stamped now.
+    const due = T_1400 + MOVE_SUSPECT_SESSION_HEARTBEAT_MS + 1_000;
+    vi.setSystemTime(due);
+    applyQuotes(engine, quotes({ AAPL: CLEAN }), ['AAPL']);
+    await engine.whenMoveSuspectSessionSettled();
+    expect(await at()).toBe(due);
+
+    // ...and the clock alone does not do it. Two more windows pass with NO quote batch and the
+    // file does not move: the timestamp is a claim that the engine was observing the FEED, and a
+    // heartbeat that kept stamping through a dead feed would be asserting something it cannot see.
+    vi.setSystemTime(due + 3 * MOVE_SUSPECT_SESSION_HEARTBEAT_MS);
+    await engine.whenMoveSuspectSessionSettled();
+    expect(await at()).toBe(due);
   });
 });

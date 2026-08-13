@@ -30,6 +30,8 @@ import { etDateKey } from './et-clock.js';
 import {
   loadMoveSuspectSessionSnapshot,
   saveMoveSuspectSessionSnapshot,
+  deriveInheritedUncoveredMs,
+  MOVE_SUSPECT_SESSION_HEARTBEAT_MS,
   describeStoreDurability,
   processStartedAtMs,
   type MoveSuspectSessionRow,
@@ -2655,6 +2657,24 @@ export class SignalEngine {
    * and last-write-wins there means the LOSER's condemnation is the one that disappears.
    */
   private moveSuspectSessionFlushChain: Promise<void> = Promise.resolve();
+  // ── TRA-3480 — the anchor + heartbeat that make a QUIET session gradeable ───
+  /**
+   * The ET session day {@link moveSuspectSessionCarriedUncoveredMs} is a claim about. Held
+   * separately because the claim expires at the rollover: a process that lives through ET
+   * midnight observed the NEW day from its first instant and inherits zero for it, whatever it
+   * inherited for the old one.
+   */
+  private moveSuspectSessionCarryDay: string | null = null;
+  /** ms of {@link moveSuspectSessionCarryDay} already lost when this process booted. `null` ⇔ unknown. */
+  private moveSuspectSessionCarriedUncoveredMs: number | null = null;
+  /**
+   * ms epoch of the last write ATTEMPT, successful or not. The heartbeat throttles on this and
+   * not on `moveSuspectSessionFlushAt`, which only advances on success — throttling on success
+   * would turn a store that cannot write into one that retries on every single quote batch.
+   */
+  private moveSuspectSessionWriteAttemptAt: number | null = null;
+  /** ET session day of that attempt. A mismatch with `now`'s day means the file on disk is stale. */
+  private moveSuspectSessionWriteDay: string | null = null;
   /**
    * TRA-2689 (leg 2 of TRA-2654) — bounded, in-process, WRITE-ONLY tape of
    * intra-session denominator-flip candidates seen at the feed boundary. Never
@@ -4367,7 +4387,18 @@ export class SignalEngine {
     // condemnation that was just made dies with the process. Fire-and-forget: the write is
     // chained and self-reports its failures, and blocking the feed on a disk write would trade
     // a data-quality flag for a quote-freshness one.
-    if (sessionFactChanged) void this.flushMoveSuspectSessionSnapshot();
+    if (sessionFactChanged) {
+      void this.flushMoveSuspectSessionSnapshot();
+    } else if (this.moveSuspectSessionHeartbeatDue(Date.now(), sessionDay)) {
+      // TRA-3480 — the LIVENESS write. Same rows, fresh `updatedAt`, at most once per
+      // MOVE_SUSPECT_SESSION_HEARTBEAT_MS, and only here — where a quote batch has provably just
+      // landed. It exists because a change-triggered write leaves a QUIET session with nothing on
+      // disk, and a restart into that emptiness grades the whole session BLIND. It is also the
+      // only thing that carries the file across the ET rollover on a day where nothing is ever
+      // condemned: `flush` writes today's `sessionDay`, so the next boot restores instead of
+      // reading a stale day and rolling it over into a blind.
+      void this.flushMoveSuspectSessionSnapshot();
+    }
     // TRA-1996 — record that a quote batch just stamped freshness, so a quote-only
     // refresh landing right after a doTick (or vice-versa) is skipped.
     this.lastQuoteStampAt = Date.now();
@@ -4447,6 +4478,31 @@ export class SignalEngine {
     } else {
       log.info('TRA-3387 move-suspect session snapshot read', detail);
     }
+
+    // TRA-3480 — what this process inherits as already-lost for the day it booted into. Computed
+    // from the boot read BEFORE the anchor write below overwrites the file it was derived from.
+    const processStartedAt = processStartedAtMs(now);
+    this.moveSuspectSessionCarryDay = sessionDay;
+    this.moveSuspectSessionCarriedUncoveredMs = deriveInheritedUncoveredMs(
+      restore, processStartedAt, etDateKey(processStartedAt), sessionDay);
+
+    // ── THE ANCHOR ──────────────────────────────────────────────────────────
+    //
+    // Write immediately, on EVERY outcome, before a single quote has flowed. Without it the
+    // store's first write waits for the session's first condemnation, so a restart that lands
+    // before that — the ordinary case on a host that boots nine times in six hours — finds
+    // nothing and grades the WHOLE session blind, though nothing was lost.
+    //
+    // ⛔ IT OVERWRITES AN `unreadable` FILE TOO, AND THAT IS NOT A LOSS OF EVIDENCE. The verdict
+    // the corrupt bytes carried is `uncoveredMsCarried: null` — computed above and now stamped
+    // on the anchor — so every later boot in this chain still grades BLIND. What the file cannot
+    // do is quietly heal: a store that failed to parse stays failed for the session, stated as a
+    // number rather than as bytes nobody will read. Keeping the corrupt file instead would only
+    // preserve it until the first heartbeat replaced it five minutes later.
+    //
+    // Awaited so `hydrate` returning means the anchor is ON DISK. `flush` swallows and records
+    // its own failures, so this cannot throw and cannot take a boot down.
+    await this.flushMoveSuspectSessionSnapshot(now);
     return restore;
   }
 
@@ -4474,6 +4530,22 @@ export class SignalEngine {
   }
 
   /**
+   * TRA-3480 — is a liveness write due?
+   *
+   * Two triggers, and the second is not a nicety: an ET ROLLOVER makes the on-disk file stale
+   * for the day now being accumulated, and on a session where nothing is ever condemned there is
+   * no other event that would ever rewrite it. A boot after that reads `rolled_over` and grades
+   * BLIND over a session that was covered end to end.
+   */
+  private moveSuspectSessionHeartbeatDue(now: number, sessionDay: string): boolean {
+    if (this.moveSuspectSessionDir === null) return false;
+    const last = this.moveSuspectSessionWriteAttemptAt;
+    if (last === null) return true;
+    if (this.moveSuspectSessionWriteDay !== sessionDay) return true;
+    return now - last >= MOVE_SUSPECT_SESSION_HEARTBEAT_MS;
+  }
+
+  /**
    * Write the snapshot. Chained, never concurrent (see `moveSuspectSessionFlushChain`).
    *
    * A failure is recorded on `moveSuspectSessionFlushError` and surfaces on the provenance, so
@@ -4485,6 +4557,19 @@ export class SignalEngine {
     if (dir === null) return Promise.resolve();
     const sessionDay = etDateKey(now);
     const rows = this.collectMoveSuspectSessionRows(sessionDay);
+    // TRA-3480 — the carry is stamped only on the day it is a claim ABOUT. Once the ET day has
+    // rolled under this process, it observed the new day from that day's first instant, so it
+    // inherits zero: carrying `null` across the rollover would make one bad boot blind every
+    // session that followed it.
+    const carried = this.moveSuspectSessionCarryDay === null
+      // A dir bound without a boot read: this process observed no predecessor, so it can bound
+      // nothing. `null`, never `0` — the whole point of the field is that an unknown says so.
+      ? null
+      : this.moveSuspectSessionCarryDay === sessionDay
+        ? this.moveSuspectSessionCarriedUncoveredMs
+        : 0;
+    this.moveSuspectSessionWriteAttemptAt = now;
+    this.moveSuspectSessionWriteDay = sessionDay;
     this.moveSuspectSessionFlushChain = this.moveSuspectSessionFlushChain
       .then(async () => {
         try {
@@ -4492,6 +4577,7 @@ export class SignalEngine {
             sessionDay,
             processStartedAt: processStartedAtMs(now),
             rows,
+            uncoveredMsCarried: carried,
             now,
           });
           this.moveSuspectSessionFlushAt = file.updatedAt;

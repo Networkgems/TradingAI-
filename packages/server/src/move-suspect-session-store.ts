@@ -55,6 +55,24 @@ export const MOVE_SUSPECT_SESSION_FILE = 'move-suspect-session.json';
  */
 export const MOVE_SUSPECT_SESSION_MAX_ROWS = 2000;
 
+/**
+ * TRA-3480 — how stale the snapshot may get while the engine is demonstrably alive.
+ *
+ * The v1 store wrote only on a session-fact CHANGE, which is complete but leaves `updatedAt`
+ * meaning "the last time something happened" — indistinguishable from "the last time this store
+ * was known to be working". On a QUIET session nothing is ever written, so a boot mid-session
+ * reads `absent` (or a previous day's file) and the whole session grades BLIND even though
+ * nothing was lost. bqb1 booted NINE times in six hours on 2026-08-12/13, so that is not a
+ * corner: it is the modal outcome, and it starves TRA-3243's acceptance criterion indefinitely.
+ *
+ * The heartbeat rewrites the same rows with a fresh `updatedAt` at most this often, and ONLY
+ * from inside `applyQuotes` — i.e. only when a quote batch actually landed. That coupling is the
+ * point: the timestamp then asserts "the engine was alive AND observing the feed as of T, and
+ * held exactly these rows". A bare `setInterval` would keep stamping a confident T through a
+ * dead feed, which is a liveness claim the file has no right to make.
+ */
+export const MOVE_SUSPECT_SESSION_HEARTBEAT_MS = 5 * 60_000;
+
 /** One condemned symbol, exactly the three fields `SymbolState` carries. */
 export interface MoveSuspectSessionRow {
   symbol: string;
@@ -66,10 +84,22 @@ export interface MoveSuspectSessionRow {
   moveSuspectPrevClose?: number;
 }
 
+/**
+ * Snapshot format version.
+ *
+ * `1` — TRA-3387: written ONLY when a session fact changed. `updatedAt` is therefore a
+ *       change stamp, and there is no carried-gap field.
+ * `2` — TRA-3480: written also at boot (the anchor) and on a liveness heartbeat, so
+ *       `updatedAt` means "the store was live and held exactly `rows` as of T" — and the file
+ *       carries {@link MoveSuspectSessionFile.uncoveredMsCarried} so a CHAIN of restarts
+ *       accumulates its holes instead of each boot resetting the bound to its own last gap.
+ */
+export const MOVE_SUSPECT_SESSION_VERSION = 2;
+
 /** The serialized shape of `<userDataDir>/move-suspect-session.json`. */
 export interface MoveSuspectSessionFile {
   issue: 'TRA-3387';
-  version: 1;
+  version: number;
   /** The ET session day EVERY row in `rows` belongs to. The scoping key, checked on read. */
   sessionDay: string;
   /** ms epoch of this write. */
@@ -82,6 +112,22 @@ export interface MoveSuspectSessionFile {
   processStartedAt: number;
   /** True when `rows` was cut to {@link MOVE_SUSPECT_SESSION_MAX_ROWS}. */
   truncated: boolean;
+  /**
+   * TRA-3480 — ms of `sessionDay` that were already unobserved BEFORE this writer's process
+   * started, i.e. everything its predecessors lost, summed down the restart chain.
+   *
+   * ⭐ THIS FIELD IS WHAT KEEPS THE ANCHOR HONEST. Without it, every boot rewrites `updatedAt`
+   * to its own start, so the next boot's gap is measured from THAT — and a host that restarts
+   * nine times in six hours reports nine small gaps for a session that was blind for hours. The
+   * bound would shrink precisely as the evidence got worse, which is the one direction a
+   * coverage instrument may never move.
+   *
+   * `null` ⇔ some stretch of `sessionDay` was observed by NOBODY in this chain (a mid-session
+   * boot that found no usable snapshot). Blindness is INHERITED: a later boot that restores this
+   * file restores the unknown with it, and its verdict stays `blind`. It does not decay into a
+   * number just because the most recent hop happens to be measurable.
+   */
+  uncoveredMsCarried: number | null;
   rows: MoveSuspectSessionRow[];
 }
 
@@ -114,6 +160,21 @@ export interface MoveSuspectSessionRestore {
   rows: MoveSuspectSessionRow[];
   /** Rows present in the file that were NOT applied (the rollover drop). */
   droppedRows: number;
+  /**
+   * TRA-3480 — the snapshot's own {@link MoveSuspectSessionFile.uncoveredMsCarried}, i.e. what
+   * the WRITER had already lost. Meaningful only on `'restored'`; every other outcome means this
+   * process inherited nothing it can bound.
+   *
+   * A version-1 file (pre-TRA-3480) carries no such field and reads as **`0`**, NOT as `null`.
+   * That is deliberate and it is not a fail-open: v1 wrote only on a session-fact CHANGE, so its
+   * `updatedAt` IS a change stamp and `processStartedAt - updatedAt` was already the complete
+   * bound under the old rule. Reading the absence as `null` would instead turn every
+   * mixed-build boot — exactly what a rolling deploy produces — into a manufactured BLIND, and
+   * a verdict that cries wolf on its own upgrade is the one nobody reads on the day it is right.
+   * A version-2 file that omits the field is a different animal: it claims the new contract and
+   * fails it, so it reads `null`.
+   */
+  uncoveredMsCarried: number | null;
   /** Present only on `'unreadable'`. */
   reason?: string;
 }
@@ -192,6 +253,24 @@ export function moveSuspectSessionPath(dir: string): string {
 }
 
 /**
+ * TRA-3480 — read the carried-gap field, resolving the two ways it can be missing.
+ *
+ * See {@link MoveSuspectSessionRestore.uncoveredMsCarried} for why a v1 absence is `0` and a v2
+ * absence is `null`. Exported so the asymmetry is gradeable on its own rather than only through
+ * a filesystem round trip.
+ */
+export function readCarriedUncoveredMs(
+  parsed: Partial<MoveSuspectSessionFile> | null | undefined,
+): number | null {
+  const raw = parsed?.uncoveredMsCarried;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return Math.round(raw);
+  if (raw === null) return null;
+  const version = parsed?.version;
+  // Absent field. Only a file that predates the contract gets the legacy reading.
+  return typeof version === 'number' && version < MOVE_SUSPECT_SESSION_VERSION ? 0 : null;
+}
+
+/**
  * Read the snapshot for `currentSessionDay`.
  *
  * NEVER throws: every failure resolves to an outcome a caller can grade. A store that throws on
@@ -210,7 +289,7 @@ export async function loadMoveSuspectSessionSnapshot(
   } catch (err: unknown) {
     const code = (err as { code?: string } | null)?.code;
     if (code === 'ENOENT') {
-      return { outcome: 'absent', path, fileSessionDay: null, fileUpdatedAt: null, fileProcessStartedAt: null, rows: [], droppedRows: 0 };
+      return { outcome: 'absent', path, fileSessionDay: null, fileUpdatedAt: null, fileProcessStartedAt: null, rows: [], droppedRows: 0, uncoveredMsCarried: null };
     }
     return {
       outcome: 'unreadable',
@@ -220,6 +299,7 @@ export async function loadMoveSuspectSessionSnapshot(
       fileProcessStartedAt: null,
       rows: [],
       droppedRows: 0,
+      uncoveredMsCarried: null,
       reason: err instanceof Error ? err.message : String(err),
     };
   }
@@ -236,6 +316,7 @@ export async function loadMoveSuspectSessionSnapshot(
       fileProcessStartedAt: null,
       rows: [],
       droppedRows: 0,
+      uncoveredMsCarried: null,
       reason: err instanceof Error ? err.message : String(err),
     };
   }
@@ -257,6 +338,7 @@ export async function loadMoveSuspectSessionSnapshot(
       fileProcessStartedAt,
       rows: [],
       droppedRows: Array.isArray(parsed?.rows) ? parsed.rows.length : 0,
+      uncoveredMsCarried: null,
       reason: 'snapshot carries no sessionDay',
     };
   }
@@ -270,6 +352,9 @@ export async function loadMoveSuspectSessionSnapshot(
     fileProcessStartedAt,
     rows,
     droppedRows,
+    // Scoped to the SAME session, like the rows. A carry read off a previous session's file
+    // would be a bound on a window that is not the one being graded.
+    uncoveredMsCarried: sameSession ? readCarriedUncoveredMs(parsed) : null,
   };
 }
 
@@ -286,17 +371,28 @@ export async function loadMoveSuspectSessionSnapshot(
  */
 export async function saveMoveSuspectSessionSnapshot(
   dir: string,
-  input: { sessionDay: string; processStartedAt: number; rows: readonly MoveSuspectSessionRow[]; now?: number },
+  input: {
+    sessionDay: string;
+    processStartedAt: number;
+    rows: readonly MoveSuspectSessionRow[];
+    /** TRA-3480 — what this writer inherited for `sessionDay`. `null` ⇔ inherited an unknown. */
+    uncoveredMsCarried?: number | null;
+    now?: number;
+  },
 ): Promise<MoveSuspectSessionFile> {
   const all = input.rows;
   const truncated = all.length > MOVE_SUSPECT_SESSION_MAX_ROWS;
   const file: MoveSuspectSessionFile = {
     issue: 'TRA-3387',
-    version: 1,
+    version: MOVE_SUSPECT_SESSION_VERSION,
     sessionDay: input.sessionDay,
     updatedAt: input.now ?? Date.now(),
     processStartedAt: input.processStartedAt,
     truncated,
+    // `undefined` would be DROPPED by `JSON.stringify` and then read back as "absent", which for
+    // a v2 file means `null` anyway — but relying on that would make the file's meaning depend
+    // on a serializer quirk. Normalized here so what is written is what is meant.
+    uncoveredMsCarried: input.uncoveredMsCarried ?? null,
     rows: truncated ? all.slice(0, MOVE_SUSPECT_SESSION_MAX_ROWS) : [...all],
   };
   await mkdir(dir, { recursive: true });
@@ -333,6 +429,34 @@ export function describeStoreDurability(dir: string | null): boolean | null {
   return dir === null ? null : isEphemeralDataDir(dir);
 }
 
+/**
+ * TRA-3480 — how much of `sessionDay` this process inherits as ALREADY LOST, given the boot read
+ * it just did. The value it will stamp on every snapshot it writes for that day.
+ *
+ * PURE, and deliberately the same arithmetic the coverage verdict applies — the writer's claim
+ * and the reader's grade must be the same function or the chain accumulates two different
+ * numbers. `gradeMoveSuspectSessionCoverage` is the reader; this is the writer.
+ *
+ * ⛔ THE SESSION-DAY COMPARISON IS NOT AN OPTIMISATION. A process that started on an EARLIER ET
+ * day observed `sessionDay` from its very first instant, so it inherits ZERO no matter what its
+ * boot read said — including a boot read that was itself blind about the PREVIOUS day. Without
+ * this branch a process that booted blind at 15:00 on 08-13 would keep stamping `null` through
+ * 08-14 and every day after, and the store would be permanently, wrongly blind from one bad boot.
+ */
+export function deriveInheritedUncoveredMs(
+  restore: MoveSuspectSessionRestore | null | undefined,
+  processStartedAt: number,
+  processStartedSessionDay: string,
+  sessionDay: string,
+): number | null {
+  if (processStartedSessionDay < sessionDay) return 0;
+  if (processStartedSessionDay > sessionDay) return null;
+  if (!restore || restore.outcome !== 'restored') return null;
+  if (typeof restore.fileUpdatedAt !== 'number') return null;
+  if (restore.uncoveredMsCarried === null) return null;
+  return restore.uncoveredMsCarried + Math.max(0, processStartedAt - restore.fileUpdatedAt);
+}
+
 // ── THE LOUD HALF'S PREDICATE ────────────────────────────────────────────────
 
 /**
@@ -357,6 +481,17 @@ export type MoveSuspectSessionCoverageReason =
   | 'restart_in_session_snapshot_unreadable'
   /** Started inside the graded day and no store is wired at all (pre-TRA-3387 behaviour). */
   | 'restart_in_session_store_not_wired'
+  /**
+   * TRA-3480 — a same-day snapshot WAS applied, but it carries an unknown: somewhere earlier in
+   * this restart chain a process booted mid-session with nothing to restore. The rows came back;
+   * the guarantee did not. Blindness is inherited, so this is `blind`, not `restored`.
+   */
+  | 'restored_but_session_start_unobserved'
+  /**
+   * TRA-3480 — a same-day snapshot was applied but has no legible `updatedAt`, so this hop's own
+   * gap has no upper bound. Restored rows with an unbounded hole is still an unbounded hole.
+   */
+  | 'restored_but_gap_unbounded'
   /** The engine state is from a LATER session than the one being graded (a backfill). */
   | 'state_from_a_later_session'
   /** No provenance supplied — the caller cannot say. Never clean. */
@@ -413,12 +548,28 @@ export function gradeMoveSuspectSessionCoverage(
   }
   if (restore.outcome === 'restored') {
     // The one gap that survives a successful restore: whatever the dead process condemned
-    // between its last durable write and its death. Computable, so it is reported as a number
-    // rather than as `null`.
+    // between its last durable write and its death.
     const gap = typeof restore.fileUpdatedAt === 'number'
       ? Math.max(0, provenance.processStartedAt - restore.fileUpdatedAt)
       : null;
-    return { coverage: 'restored', reason: 'restored_from_snapshot', uncoveredMs: gap };
+    if (gap === null) {
+      return { coverage: 'blind', reason: 'restored_but_gap_unbounded', uncoveredMs: null };
+    }
+    // TRA-3480 — ADD what the writer had already lost. The anchor + heartbeat write means
+    // `updatedAt` now advances on liveness rather than only on a change, which is what makes
+    // `gap` small and therefore what would make it MISLEADING on its own: nine restarts would
+    // report nine small numbers and no memory of the eight holes between them.
+    //
+    // ⛔ TESTED FOR FINITENESS, NOT FOR `=== null`. A caller that hand-builds a restore and omits
+    // the field hands us `undefined`; `undefined + gap` is `NaN`, and `JSON.stringify(NaN)` is
+    // `null` — so the ONE arm that must be loud would have serialised into the tape as the exact
+    // token this file uses for "unknowable", from a restore that was actually fine. Caught by
+    // `eod-report.test.ts`, which grades the emitted LINE rather than the returned object.
+    const carried = restore.uncoveredMsCarried;
+    if (typeof carried !== 'number' || !Number.isFinite(carried)) {
+      return { coverage: 'blind', reason: 'restored_but_session_start_unobserved', uncoveredMs: null };
+    }
+    return { coverage: 'restored', reason: 'restored_from_snapshot', uncoveredMs: carried + gap };
   }
   const reason: MoveSuspectSessionCoverageReason =
     restore.outcome === 'rolled_over' ? 'restart_in_session_snapshot_rolled_over'
