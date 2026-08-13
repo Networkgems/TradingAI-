@@ -93,7 +93,7 @@ import { wipeAccountData, refuseSelfDelete, performSelfDelete, redactWipeReceipt
 import { accountDeletedAt, recordAccountTombstone } from './deleted-accounts.js';
 // TRA-2410 — the ADOPTION side of the same hazard: registering a name whose book
 // is still on disk hands the new account the previous holder's positions.
-import { retireOrphanedBook } from './orphaned-books.js';
+import { retireOrphanedBook, shapeRetiredOrphanReceipt } from './orphaned-books.js';
 import { redactTradierEnvLabel, isRecognizedTradierEnvLabel } from './tradier-env-label.js';
 import {
   listOptionTradeJournal,
@@ -8616,17 +8616,16 @@ app.post('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
     // was dropped" and "there was never a row" produce identical `GET
     // /api/account/settings` output. This admin response is the only place a grader
     // can tell a guard that fired from a disk that was already clean.
+    //
+    // TRA-2691/TRA-3386 — the key list USED to be an inline literal here, and it
+    // was an ALLOW-LIST rather than an echo: `identityRowsDeleted` /
+    // `identityRowsRemaining` were computed on this path (they gate `ok`) and then
+    // dropped at the wire. The shaping now lives in `shapeRetiredOrphanReceipt`,
+    // the same module that produces the receipt, so the test exercises the code
+    // that actually runs and the next field added cannot drift out of this
+    // response. DO NOT re-inline it.
     ...(retiredOrphan?.orphanFound
-      ? {
-          retiredOrphanedBook: {
-            quarantinedTo: retiredOrphan.quarantinedTo,
-            retiredAt: retiredOrphan.retiredAt,
-            settingsRowFound: retiredOrphan.settingsRowFound,
-            settingsRowRetired: retiredOrphan.settingsRowRetired,
-            settingsCredentialFieldsCleared: retiredOrphan.settingsCredentialFieldsCleared,
-            settingsQuarantinedTo: retiredOrphan.settingsQuarantinedTo,
-          },
-        }
+      ? { retiredOrphanedBook: shapeRetiredOrphanReceipt(retiredOrphan) }
       : {}),
   });
 });

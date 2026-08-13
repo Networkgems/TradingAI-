@@ -170,6 +170,80 @@ export interface OrphanRetirementReceipt {
   ok: boolean;
 }
 
+/**
+ * The adoption receipt exactly as `POST /api/admin/users` puts it on the wire,
+ * under `retiredOrphanedBook`.
+ *
+ * ── Why this is a FUNCTION and not an object literal in the route ─────────────
+ *
+ * TRA-2691/TRA-3386. It WAS a literal, and the literal was an ALLOW-LIST rather
+ * than an echo: `identityRowsDeleted`/`identityRowsRemaining` were computed by
+ * `retireOrphanedBook` (they are terms of `ok`), and then dropped at the wire —
+ * so the only channel a grader can read the recycle-path identity sweep through
+ * reported the four settings fields and stayed silent about the two that decide
+ * the verdict. Same class as `9d1c41e`/TRA-2583: an allow-list fails OPEN and
+ * fails SILENTLY, because a field nobody forwarded reads identically to a field
+ * that was never computed.
+ *
+ * A shipped pure function is the shape that kills the class rather than the one
+ * instance: the route SPREADS this, `orphaned-books-adoption-receipt.test.ts`
+ * exercises this, and there is no second copy of the key list to drift from.
+ *
+ * `errors` and `username` are deliberately NOT here. `errors` is operator-only
+ * and may name absolute paths (`quarantine:/data/users/...`) — see the field's
+ * own doc comment; `username` is already the request the admin just made.
+ */
+export interface PublicRetiredOrphanedBook {
+  quarantinedTo: string | null;
+  retiredAt: number | null;
+  settingsRowFound: boolean;
+  settingsRowRetired: boolean;
+  settingsCredentialFieldsCleared: number;
+  settingsQuarantinedTo: string | null;
+  /**
+   * TRA-2535's teeth number, forwarded from TRA-3386 on. THE ONLY DISCRIMINATING
+   * FIELD in this object for the identity channel: non-zero says the sweep found
+   * and cleared real rows, zero says the disk was already clean.
+   */
+  identityRowsDeleted: number;
+  /**
+   * ⚠️ INVARIANT-`0` ON THIS ROUTE — NOT A MEASUREMENT. Do not read a green zero
+   * here as evidence of anything.
+   *
+   * `receipt.ok` requires `identityRowsRemaining === 0` (see the verdict below),
+   * and `POST /api/admin/users` 503s on `!ok`, so the 201 that carries this
+   * object is UNREACHABLE with any other value — the `-1` UNKNOWN sentinel
+   * included. Forwarded anyway for symmetry with the self-delete receipt
+   * (`redactWipeReceipt`, where it is NOT constant), and because it stops being
+   * constant the day that `ok` term changes. The field that moves on this route
+   * is `identityRowsDeleted`.
+   */
+  identityRowsRemaining: number;
+}
+
+/**
+ * Shape an orphan-retirement receipt for the admin `201`.
+ *
+ * Pure and total: no I/O, no throw, every field copied straight across. Adding a
+ * field to `OrphanRetirementReceipt` does not silently widen this — the key set
+ * is asserted in `orphaned-books-adoption-receipt.test.ts`, so a new field is an
+ * explicit decision (forward it, or record why it stays operator-only).
+ */
+export function shapeRetiredOrphanReceipt(
+  receipt: OrphanRetirementReceipt,
+): PublicRetiredOrphanedBook {
+  return {
+    quarantinedTo: receipt.quarantinedTo,
+    retiredAt: receipt.retiredAt,
+    settingsRowFound: receipt.settingsRowFound,
+    settingsRowRetired: receipt.settingsRowRetired,
+    settingsCredentialFieldsCleared: receipt.settingsCredentialFieldsCleared,
+    settingsQuarantinedTo: receipt.settingsQuarantinedTo,
+    identityRowsDeleted: receipt.identityRowsDeleted,
+    identityRowsRemaining: receipt.identityRowsRemaining,
+  };
+}
+
 function userDirIn(root: string, username: string): string {
   return join(root, 'users', username);
 }
