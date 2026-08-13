@@ -460,6 +460,111 @@ describe('live-enforce-gate-ledger', () => {
     expect(c.netEdgeShadow!.sweep.every((r) => r.admits === 0)).toBe(true);
   });
 
+  // ── TRA-3619: the pre-cheapness strike counts across the deploy boundary ────
+  //
+  // The field is new, so every retained row written before it lacks the pair. If
+  // both pairs shared one denominator, a fold spanning the boundary would divide
+  // a partial numerator by a complete denominator and deflate `meanStrikesInBand`
+  // toward zero — the exact value that decides State A vs State B.
+  describe('strikesInBand folds on its OWN denominator (TRA-3619)', () => {
+    const nomRow = (nominator: Record<string, unknown>, ts: number) =>
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, DAY, 'legacy', ts, {
+        reasonCode: 'gross_negative',
+        nominator: nominator as never,
+      });
+
+    it('a PRE-FIELD row keeps its bySelection place but is excluded from the strike means', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      // Written before TRA-3619: cheap pair only.
+      nomRow({ selection: 'fallback_top_mispricing', cheapConsidered: 25, cheapInBand: 0 }, 1_001);
+      // Written after: carries the strike pair too.
+      nomRow({
+        selection: 'fallback_top_mispricing',
+        cheapConsidered: 25, cheapInBand: 0,
+        strikesConsidered: 40, strikesInBand: 2,
+      }, 1_002);
+
+      const sel = gate(DAY, 'cost_bar').bySelection
+        .find((s) => s.selection === 'fallback_top_mispricing')!;
+      // Both rows are on the axis and both carry chain shape...
+      expect(sel.evaluated).toBe(2);
+      expect(sel.rowsWithChainShape).toBe(2);
+      // ...but only ONE measured the band pre-cheapness, and the mean says 2, not 1.
+      expect(sel.rowsWithStrikeShape).toBe(1);
+      expect(sel.meanStrikesInBand).toBe(2);
+      expect(sel.meanStrikesConsidered).toBe(40);
+    });
+
+    it('a fold with NO stamped row publishes null, which cannot be read as a measured zero', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      nomRow({ selection: 'fallback_top_mispricing', cheapConsidered: 3, cheapInBand: 0 }, 1_001);
+      const sel = gate(DAY, 'cost_bar').bySelection[0]!;
+      expect(sel.meanCheapInBand).toBe(0);          // measured
+      expect(sel.rowsWithStrikeShape).toBe(0);
+      expect(sel.meanStrikesInBand).toBeNull();     // NOT measured — a different fact
+    });
+
+    it('survives a restart: the strike pair round-trips through disk', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      nomRow({
+        selection: 'fallback_top_mispricing',
+        cheapConsidered: 25, cheapInBand: 0,
+        strikesConsidered: 40, strikesInBand: 3,
+      }, 1_001);
+      clearLiveEnforceGateLedger();
+      expect(hydrateLiveEnforceGateFromDisk(dir, 2_000).records).toBe(1);
+
+      const sel = gate(DAY, 'cost_bar').bySelection[0]!;
+      expect(sel.rowsWithStrikeShape).toBe(1);
+      expect(sel.meanStrikesInBand).toBe(3);
+      expect(sel.meanStrikesConsidered).toBe(40);
+    });
+
+    it('a MALFORMED strike pair drops the pair, never the row', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      // Negative, fractional, and half-present — each must fail the count test
+      // without taking the nominator (and its cheap pair) down with it.
+      nomRow({
+        selection: 'fallback_top_mispricing', cheapConsidered: 9, cheapInBand: 0,
+        strikesConsidered: -1, strikesInBand: 2,
+      }, 1_001);
+      nomRow({
+        selection: 'fallback_top_mispricing', cheapConsidered: 9, cheapInBand: 0,
+        strikesConsidered: 4.5, strikesInBand: 1,
+      }, 1_002);
+      nomRow({
+        selection: 'fallback_top_mispricing', cheapConsidered: 9, cheapInBand: 0,
+        strikesInBand: 1,
+      }, 1_003);
+
+      const sel = gate(DAY, 'cost_bar').bySelection[0]!;
+      expect(sel.evaluated).toBe(3);
+      expect(sel.rowsWithChainShape).toBe(3);
+      expect(sel.rowsWithStrikeShape).toBe(0);
+      expect(sel.meanStrikesInBand).toBeNull();
+    });
+
+    it('the RETAINED multi-day view carries the strike sums', () => {
+      hydrateLiveEnforceGateFromDisk(dir, 1_000);
+      nomRow({
+        selection: 'fallback_top_mispricing', cheapConsidered: 25, cheapInBand: 0,
+        strikesConsidered: 40, strikesInBand: 2,
+      }, 1_001);
+      recordLiveEnforceDecision('cost_bar', 'single_leg_otm', true, '2026-07-17', 'legacy', 1_002, {
+        reasonCode: 'gross_negative',
+        nominator: {
+          selection: 'fallback_top_mispricing', cheapConsidered: 25, cheapInBand: 0,
+          strikesConsidered: 40, strikesInBand: 4,
+        },
+      });
+
+      const sel = summarizeLiveEnforceGate(DAY).retained.byGate
+        .find((g) => g.gate === 'cost_bar')!.bySelection[0]!;
+      expect(sel.rowsWithStrikeShape).toBe(2);
+      expect(sel.meanStrikesInBand).toBe(3); // (2 + 4) / 2 — sums travel, not means
+    });
+  });
+
   it('ACCEPTANCE (TRA-3483): the cost_bar row carries populated costRQuantiles AND all 8 sweep k', () => {
     costRow(false, 0.12, 0.40);
     costRow(true, 0.55, 0.40);

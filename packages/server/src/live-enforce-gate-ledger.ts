@@ -209,6 +209,24 @@ export interface LiveEnforceNominator {
   cheapConsidered: number;
   /** How many of those landed inside the armed band (0 when the selector is dark). */
   cheapInBand: number;
+  /**
+   * TRA-3619 — every candidate the scanner offered the selector, BEFORE the
+   * cheapness screen (post-liquidity; see `AdmissibleStrikeResult`).
+   *
+   * OPTIONAL, and it stays optional forever: rows written before this field
+   * existed carry the nominator block without it, and demanding it in
+   * {@link usableNominator} would silently drop every one of them from the
+   * `bySelection` axis — turning a field addition into a retroactive data loss.
+   * The pair below therefore folds on its OWN denominator (`rowsWithStrikeShape`).
+   */
+  strikesConsidered?: number;
+  /**
+   * TRA-3619 — of those, how many sat inside the armed band. This is the field
+   * that separates "the band is empty in the chain" (0) from "the cheapness
+   * screen emptied it" (≥1 while `cheapInBand` is 0). 0 on the dark `legacy`
+   * branch, where the band is never consulted.
+   */
+  strikesInBand?: number;
 }
 
 /** The selection values a persisted row may carry. Anything else is dropped on hydrate. */
@@ -258,6 +276,17 @@ interface GateSelectionTally extends GateScopeTally {
   cheapInBandSum: number;
   /** Rows that carried the chain-shape numbers at all. */
   rowsWithChainShape: number;
+  /**
+   * TRA-3619 — the pre-cheapness pair, on its OWN denominator. It is NOT folded
+   * into `rowsWithChainShape` because the two fields were deployed on different
+   * days: a fold spanning that boundary holds rows with the cheap counts and no
+   * strike counts, and sharing a denominator would divide a partial numerator by
+   * a complete denominator — deflating `meanStrikesInBand` toward zero, which is
+   * precisely the value that decides State A vs State B.
+   */
+  strikesConsideredSum: number;
+  strikesInBandSum: number;
+  rowsWithStrikeShape: number;
 }
 
 /** The per-gate accumulator: the same tally shape folded on four independent keys. */
@@ -327,7 +356,7 @@ function bumpSelection(
 ): void {
   let tally = map.get(nom.selection);
   if (!tally) {
-    tally = { evaluated: 0, blocked: 0, cheapConsideredSum: 0, cheapInBandSum: 0, rowsWithChainShape: 0 };
+    tally = emptySelectionTally();
     map.set(nom.selection, tally);
   }
   tally.evaluated += 1;
@@ -337,6 +366,26 @@ function bumpSelection(
     tally.cheapInBandSum += nom.cheapInBand;
     tally.rowsWithChainShape += 1;
   }
+  // TRA-3619 — same discipline, separate denominator: a row carrying only the
+  // cheap pair contributes to `rowsWithChainShape` and NOT to this one.
+  if (isStrikeCount(nom.strikesConsidered) && isStrikeCount(nom.strikesInBand)) {
+    tally.strikesConsideredSum += nom.strikesConsidered;
+    tally.strikesInBandSum += nom.strikesInBand;
+    tally.rowsWithStrikeShape += 1;
+  }
+}
+
+function emptySelectionTally(): GateSelectionTally {
+  return {
+    evaluated: 0,
+    blocked: 0,
+    cheapConsideredSum: 0,
+    cheapInBandSum: 0,
+    rowsWithChainShape: 0,
+    strikesConsideredSum: 0,
+    strikesInBandSum: 0,
+    rowsWithStrikeShape: 0,
+  };
 }
 
 // ── In-memory store (backs the durable counts + the health endpoint) ─────────
@@ -561,6 +610,12 @@ function hydratedCost(cost: LiveEnforceRecord['cost']): boolean {
  *
  * Shared by the write path and the hydrate path deliberately: a row this refuses
  * to record must also be a row it refuses to read back.
+ *
+ * TRA-3619's `strikesConsidered` / `strikesInBand` are deliberately NOT part of
+ * this predicate. They post-date the field, so requiring them would reject every
+ * previously-written nominator block on hydrate and vaporize the retained
+ * `bySelection` axis. They are validated where they are USED
+ * ({@link isStrikeCount}), which drops a bad pair without dropping the row.
  */
 function usableNominator(nom: LiveEnforceNominator | null | undefined): boolean {
   return (
@@ -570,6 +625,16 @@ function usableNominator(nom: LiveEnforceNominator | null | undefined): boolean 
     && Number.isInteger(nom.cheapConsidered) && nom.cheapConsidered >= 0
     && Number.isInteger(nom.cheapInBand) && nom.cheapInBand >= 0
   );
+}
+
+/**
+ * TRA-3619 — a strike count is a non-negative integer or it is absent. Anything
+ * else (NaN off a truncated line, a float, a negative) contributes NO sample
+ * rather than a poisoned one, exactly as {@link bumpSelection} treats a
+ * non-finite cheap count.
+ */
+function isStrikeCount(v: number | undefined): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
 }
 
 /** What {@link hydrateLiveEnforceGateFromDisk} recovered (for the boot log line). */
@@ -641,6 +706,18 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
             selection: rec.nominator!.selection,
             cheapConsidered: rec.nominator!.cheapConsidered,
             cheapInBand: rec.nominator!.cheapInBand,
+            // TRA-3619 — carried only when the pair is BOTH present and sane.
+            // A row from before the field, or one holding half of it, hydrates
+            // with no strike shape and lands outside `rowsWithStrikeShape`,
+            // which is what keeps `meanStrikesInBand` a mean over rows that
+            // actually measured it.
+            ...(isStrikeCount(rec.nominator!.strikesConsidered)
+              && isStrikeCount(rec.nominator!.strikesInBand)
+              ? {
+                strikesConsidered: rec.nominator!.strikesConsidered,
+                strikesInBand: rec.nominator!.strikesInBand,
+              }
+              : {}),
           },
         }
         : {}),
@@ -767,6 +844,39 @@ export interface LiveEnforceSelectionSummary {
    * branch would be a wiring defect, not a finding.
    */
   meanCheapInBand: number | null;
+  /**
+   * TRA-3619 — rows on this branch carrying the PRE-CHEAPNESS strike counts.
+   * Its own denominator, separate from `rowsWithChainShape`: rows written before
+   * the field carry the cheap pair and not this one, and a fold across that
+   * boundary must not divide a partial numerator by a complete denominator.
+   * `0` here with `rowsWithChainShape > 0` means "this fold predates the
+   * measurement", NOT "the chain had no strikes".
+   */
+  rowsWithStrikeShape: number;
+  /**
+   * TRA-3619 — mean candidates the scanner offered BEFORE the cheapness screen,
+   * over `rowsWithStrikeShape`. Post-liquidity, not the raw chain.
+   */
+  meanStrikesConsidered: number | null;
+  /**
+   * TRA-3619 — **the separator.** Mean candidates whose |Δ| sat inside the band,
+   * counted BEFORE `classification === 'cheap'` is applied.
+   *
+   * Read it against `meanCheapInBand` on the `fallback_top_mispricing` branch,
+   * where `meanCheapInBand` is 0 by construction:
+   *
+   *   • `meanStrikesInBand ≈ 0` ⇒ the band is EMPTY IN THE CHAIN. Re-ordering the
+   *     screens cannot manufacture a strike that is not there; the band edges are
+   *     the open question (TRA-3401 / board).
+   *   • `meanStrikesInBand ≥ 1` ⇒ the chain HELD in-band strikes and the cheapness
+   *     screen discarded them upstream of the band filter. The screen ORDER is
+   *     then the lever.
+   *
+   * `null` on the dark `legacy` branch's semantics is not how this reports: the
+   * selector writes 0 there (the band is never consulted), and `legacy` is its
+   * own axis key, so a dark 0 can never be pooled with an armed branch's zero.
+   */
+  meanStrikesInBand: number | null;
 }
 
 /**
@@ -1152,6 +1262,12 @@ function foldGates(
           t.rowsWithChainShape > 0 ? round(t.cheapConsideredSum / t.rowsWithChainShape) : null,
         meanCheapInBand:
           t.rowsWithChainShape > 0 ? round(t.cheapInBandSum / t.rowsWithChainShape) : null,
+        // TRA-3619 — the pre-cheapness pair, over its OWN denominator.
+        rowsWithStrikeShape: t.rowsWithStrikeShape,
+        meanStrikesConsidered:
+          t.rowsWithStrikeShape > 0 ? round(t.strikesConsideredSum / t.rowsWithStrikeShape) : null,
+        meanStrikesInBand:
+          t.rowsWithStrikeShape > 0 ? round(t.strikesInBandSum / t.rowsWithStrikeShape) : null,
       });
     }
     bySelection.sort((a, b) => b.evaluated - a.evaluated || a.selection.localeCompare(b.selection));
@@ -1205,13 +1321,17 @@ function mergeSelectionAxis(
   from: Map<string, GateSelectionTally>,
 ): void {
   for (const [key, t] of from.entries()) {
-    const cur = into.get(key)
-      ?? { evaluated: 0, blocked: 0, cheapConsideredSum: 0, cheapInBandSum: 0, rowsWithChainShape: 0 };
+    const cur = into.get(key) ?? emptySelectionTally();
     cur.evaluated += t.evaluated;
     cur.blocked += t.blocked;
     cur.cheapConsideredSum += t.cheapConsideredSum;
     cur.cheapInBandSum += t.cheapInBandSum;
     cur.rowsWithChainShape += t.rowsWithChainShape;
+    // TRA-3619 — the strike pair travels with its own denominator, or the
+    // retained view would publish `meanStrikesInBand: null` on every row.
+    cur.strikesConsideredSum += t.strikesConsideredSum;
+    cur.strikesInBandSum += t.strikesInBandSum;
+    cur.rowsWithStrikeShape += t.rowsWithStrikeShape;
     into.set(key, cur);
   }
 }

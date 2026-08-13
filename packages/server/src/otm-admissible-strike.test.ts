@@ -144,3 +144,116 @@ describe('selectAdmissibleOtmCandidate (TRA-3401)', () => {
     expect(selectAdmissibleOtmCandidate(chain, { enabled: true, band: custom }).band).toEqual(custom);
   });
 });
+
+// ── TRA-3619: the pre-cheapness band count ───────────────────────────────────
+//
+// `cheapInBand: 0` on a `fallback_top_mispricing` row is JOINTLY caused, and the
+// two causes call for opposite actions:
+//
+//   State A — the chain holds no strike in the band at all. The band edges are
+//             the question; re-ordering the screens cannot conjure a strike.
+//   State B — the chain holds in-band strikes and the cheapness screen (which
+//             runs FIRST, `otm-admissible-strike.ts` line ~165) discarded them
+//             before the band filter ever ran. The screen ORDER is the lever.
+//
+// Every test below is a discrimination test: same `cheapInBand`, different world.
+describe('strikesInBand — the pre-cheapness band count (TRA-3619)', () => {
+  it('STATE B: an in-band strike the cheapness screen dropped is COUNTED', () => {
+    // 0.51 is inside [0.495, 0.55) but classified `expensive`, so the cheapness
+    // screen removes it upstream of the band filter. This is the live shape the
+    // issue's prior predicts: near-ATM contracts are expensive, "cheap" selects
+    // the far-OTM tail.
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.51, 'expensive'), cand(0.52, 'fair')],
+      { enabled: true, band },
+    );
+    expect(got.selection).toBe('fallback_top_mispricing');
+    expect(got.cheapInBand).toBe(0);       // what the deployed surface shows...
+    expect(got.strikesInBand).toBe(2);     // ...and what it could not show.
+    expect(got.strikesConsidered).toBe(3);
+  });
+
+  it('STATE A: a chain with no in-band strike reads ZERO on both counts', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.11, 'expensive'), cand(0.62, 'fair')],
+      { enabled: true, band },
+    );
+    expect(got.selection).toBe('fallback_top_mispricing');
+    expect(got.cheapInBand).toBe(0);
+    expect(got.strikesInBand).toBe(0);
+    expect(got.strikesConsidered).toBe(3);
+  });
+
+  it('the two states are INDISTINGUISHABLE without it — same selection, same cheapInBand', () => {
+    const stateB = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.51, 'expensive')], { enabled: true, band },
+    );
+    const stateA = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.11, 'expensive')], { enabled: true, band },
+    );
+    // Every previously-published field agrees...
+    expect(stateB.selection).toBe(stateA.selection);
+    expect(stateB.cheapConsidered).toBe(stateA.cheapConsidered);
+    expect(stateB.cheapInBand).toBe(stateA.cheapInBand);
+    expect(stateB.strikesConsidered).toBe(stateA.strikesConsidered);
+    // ...and exactly one field separates them.
+    expect(stateB.strikesInBand).not.toBe(stateA.strikesInBand);
+  });
+
+  it('counts the band over ALL classifications, so it is >= cheapInBand always', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.499), cand(0.51, 'expensive'), cand(0.54)],
+      { enabled: true, band },
+    );
+    expect(got.selection).toBe('in_band');
+    expect(got.cheapInBand).toBe(2);
+    expect(got.strikesInBand).toBe(3);
+  });
+
+  it('uses the SAME band predicate as cheapInBand — edges and magnitude included', () => {
+    // Lower edge inclusive, upper edge exclusive, puts by magnitude, non-finite out.
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.495, 'fair'), cand(0.55, 'fair'), cand(-0.52, 'fair'), cand(Number.NaN, 'fair')],
+      { enabled: true, band },
+    );
+    expect(got.strikesInBand).toBe(2); // 0.495 and -0.52; 0.55 and NaN excluded
+    expect(got.selection).toBe('none'); // nothing `cheap` — and still counted
+  });
+
+  it('a `none` chain still reports the shape, so a thin chain is not a silent zero', () => {
+    const got = selectAdmissibleOtmCandidate([cand(0.51, 'expensive')], { enabled: true, band });
+    expect(got.candidate).toBeNull();
+    expect(got.selection).toBe('none');
+    expect(got.cheapConsidered).toBe(0);
+    expect(got.strikesConsidered).toBe(1);
+    expect(got.strikesInBand).toBe(1);
+  });
+
+  it('DISARMED reports 0 in band — the band was never consulted (cheapInBand parity)', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [cand(0.03), cand(0.51, 'expensive')], { enabled: false, band },
+    );
+    expect(got.selection).toBe('legacy');
+    // Same convention as `cheapInBand`, and `legacy` is its own axis key, so this
+    // 0 can never be pooled with an armed branch's measured 0.
+    expect(got.strikesInBand).toBe(0);
+    // The denominator is still honest: the chain size does not depend on the flag.
+    expect(got.strikesConsidered).toBe(2);
+  });
+
+  it('changes NO verdict — the nominee is identical with and without the count', () => {
+    // The recorder discipline, asserted rather than asserted-of: adding the count
+    // must not perturb selection or candidate on any branch.
+    for (const c of [
+      [cand(0.04), cand(0.51)],
+      [cand(0.04), cand(0.51, 'expensive')],
+      [cand(0.04)],
+      [] as ReturnType<typeof cand>[],
+    ]) {
+      const got = selectAdmissibleOtmCandidate(c, { enabled: true, band });
+      const cheap = c.filter((x) => x.classification === 'cheap');
+      const inBandCheap = cheap.filter((x) => Math.abs(x.delta) >= band.min && Math.abs(x.delta) < band.max);
+      expect(got.candidate).toBe(inBandCheap[0] ?? cheap[0] ?? null);
+    }
+  });
+});

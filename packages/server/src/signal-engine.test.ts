@@ -780,6 +780,61 @@ describe('SignalEngine — relative-value scanner bridge', () => {
         // which is why `selection` has to be read before either mean.
         expect(floor?.bySelection[0]?.meanCheapInBand).toBe(0);
       });
+
+      // ── TRA-3619: State A vs State B, end to end ──────────────────────────
+      //
+      // `meanCheapInBand: 0` on the fallback branch is jointly caused. These two
+      // tests drive the REAL live scan over chains that differ ONLY in whether an
+      // in-band strike exists, and assert the published payload separates them.
+      it('STATE B — an in-band strike the cheapness screen dropped reaches the payload', async () => {
+        await runLiveOtm([
+          makeOtmCandidate({ optionSymbol: 'AAPL240705C00210000', delta: 0.05 }),
+          // In band, but `expensive` ⇒ removed by the cheapness screen BEFORE the
+          // band filter runs. The old surface cannot see it at all.
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00205000', delta: 0.52, classification: 'expensive',
+          }),
+        ]);
+
+        const fallback = gate('otm_delta_floor')?.bySelection
+          .find((s) => s.selection === 'fallback_top_mispricing');
+        expect(fallback?.meanCheapInBand).toBe(0);        // unchanged, still 0
+        expect(fallback?.meanStrikesInBand).toBe(1);      // and now: State B
+        expect(fallback?.meanStrikesConsidered).toBe(2);
+        expect(fallback?.rowsWithStrikeShape).toBe(1);
+      });
+
+      it('STATE A — a chain with no in-band strike publishes ZERO, not null', async () => {
+        await runLiveOtm([
+          makeOtmCandidate({ optionSymbol: 'AAPL240705C00210000', delta: 0.05 }),
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00215000', delta: 0.11, classification: 'expensive',
+          }),
+        ]);
+
+        const fallback = gate('otm_delta_floor')?.bySelection
+          .find((s) => s.selection === 'fallback_top_mispricing');
+        expect(fallback?.meanCheapInBand).toBe(0);
+        // A measured 0 — `rowsWithStrikeShape > 0` is what makes it a measurement
+        // rather than "this fold predates the field".
+        expect(fallback?.meanStrikesInBand).toBe(0);
+        expect(fallback?.rowsWithStrikeShape).toBe(1);
+      });
+
+      it('the strike counts survive the RETAINED fold, not just the ET-day view', async () => {
+        await runLiveOtm([
+          makeOtmCandidate({ delta: 0.05 }),
+          makeOtmCandidate({
+            optionSymbol: 'AAPL240705C00205000', delta: 0.52, classification: 'expensive',
+          }),
+        ]);
+        const retained = summarizeLiveEnforceGate(etDateString(new Date()))
+          .retained.byGate.find((x) => x.gate === 'otm_delta_floor');
+        const fallback = retained?.bySelection
+          .find((s) => s.selection === 'fallback_top_mispricing');
+        expect(fallback?.meanStrikesInBand).toBe(1);
+        expect(fallback?.rowsWithStrikeShape).toBe(1);
+      });
     });
   });
 
