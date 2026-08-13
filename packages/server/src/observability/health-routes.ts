@@ -4765,9 +4765,13 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
   //     `complete` pools 66 books and read 64/10 on night one. The pooled number
   //     is still here as `completeBookSessions`, it just gates nothing. Read
   //     `barDays[]` beside it — `live` is tri-state (`counted`/`failed`/
-  //     `vacuous`), and `vacuous` (empty live cohort that day) is neither a
-  //     credit nor a failure. `barDaysWithLiveAbsence > 0` does not stop the
-  //     count but does block promotion until the absence is explained.
+  //     `vacuous`/`in_flight`), and NONE of those is a soft version of another.
+  //     `vacuous` = empty live cohort that day. `in_flight` = the session is
+  //     still open; the CURRENT day always reads that way at the 21:15 ET fire,
+  //     because the ~23:45 ET EOD drain has not landed and the day is graded
+  //     against an RTH window it has not lived through yet. It is NOT a failure.
+  //     `barDaysWithLiveAbsence > 0` does not stop the count but does block
+  //     promotion until the absence is explained.
   //
   // Observe-only: the trading path never reads the tape, and nothing here feeds
   // a decision inside the process. Boundary unchanged.
@@ -4787,7 +4791,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           note:
             summary.verdict === null
               ? `BLIND — ${summary.blindReason ?? 'no tape on record'}. This is NOT a clean bill of health.`
-              : `${summary.sessionsTowardBar}/${summary.barTarget} toward the bar, UNIT = ${summary.barUnit} (TRA-3494: distinct ET market days on the LIVE-MONEY books, NOT book-days — the pooled book-day count is ${summary.completeBookSessions} and gates nothing). DAY LEDGER: ${summary.sessionsTowardBar} counted / ${summary.barDaysFailed} failed / ${summary.barDaysVacuous} vacuous (empty live cohort — neither a credit nor a failure)${summary.barDaysWithLiveAbsence > 0 ? `; ${summary.barDaysWithLiveAbsence} day(s) with a live book ABSENT — these do NOT reduce the count but DO block promotion until explained` : ''}${summary.unclassifiedModes.length > 0 ? `; ⚠ UNCLASSIFIED MODE(S) ${summary.unclassifiedModes.join(', ')} — the live cohort may be under-read` : ''}. Rejected quorums, published so this cannot be cherry-picked: any-book ${summary.barDaysAnyBook}, all-books ${summary.barDaysAllBooks}. TRIPLE: ${summary.complete} complete / ${summary.partial} partial / ${summary.absent} absent BOOK-DAY sessions. A session counts ONLY with coverageComplete && !saturated && truncatedForSize===0 && droppedOnMerge===0; rows.length===0 under complete coverage COUNTS. Partial sessions are retained and annotated, never excluded.`,
+              : `${summary.sessionsTowardBar}/${summary.barTarget} toward the bar, UNIT = ${summary.barUnit} (TRA-3494: distinct ET market days on the LIVE-MONEY books, NOT book-days — the pooled book-day count is ${summary.completeBookSessions} and gates nothing). DAY LEDGER: ${summary.sessionsTowardBar} counted / ${summary.barDaysFailed} failed / ${summary.barDaysVacuous} vacuous (empty live cohort — neither a credit nor a failure) / ${summary.barDaysInFlight} in-flight (session still OPEN, no EOD drain yet — NOT a failure; the current day reads this way at every 21:15 ET fire by construction)${summary.barDaysWithLiveAbsence > 0 ? `; ${summary.barDaysWithLiveAbsence} day(s) with a live book ABSENT — these do NOT reduce the count but DO block promotion until explained` : ''}${summary.unclassifiedModes.length > 0 ? `; ⚠ UNCLASSIFIED MODE(S) ${summary.unclassifiedModes.join(', ')} — the live cohort may be under-read` : ''}. Rejected quorums, published so this cannot be cherry-picked: any-book ${summary.barDaysAnyBook}, all-books ${summary.barDaysAllBooks}. TRIPLE: ${summary.complete} complete / ${summary.partial} partial / ${summary.absent} absent BOOK-DAY sessions. A session counts ONLY with coverageComplete && !saturated && truncatedForSize===0 && droppedOnMerge===0; rows.length===0 under complete coverage COUNTS. Partial sessions are retained and annotated, never excluded.`,
         });
       } catch (err: unknown) {
         // An instrument may not take the box down, and it may not report a read

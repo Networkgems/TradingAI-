@@ -62,6 +62,16 @@
  *
  * Three consequences are load-bearing and must not be "simplified" away:
  *
+ *   0. **An OPEN session is `in_flight`, not `failed`.** The EOD drain lands
+ *      ~23:45 ET but TRA-3466 reads at 21:15 ET, so the current day is always
+ *      mid-session at read time and fails the per-session grade by construction
+ *      (`uncoveredMs` = the whole RTH window it has not lived through yet).
+ *      Calling that a failure prints a phantom red EVERY night and makes "no
+ *      failed day in the window" permanently unsatisfiable — a bar-unreachable
+ *      defect of exactly the class this ticket is ruling on. Settled-ness is read
+ *      off the segment ledger (`some(trigger === 'eod')`), never off a date
+ *      comparison: at 21:15 ET the current ET day and `todayEt` are the SAME
+ *      string, so a date compare would drop the session it just observed.
  *   1. **A day with no live observation is `vacuous`, its own third state.** It
  *      is neither counted nor failed. Folding it into either direction is the
  *      bug: counted mints a free credit off an empty cohort (`every` is true on
@@ -111,6 +121,19 @@ export interface TapeSessionSummary {
   uncoveredMs: number | null;
   /** Tri-state, never a positive integer. `null` means unknown-and-unknowable. */
   rowsLostToRestart: number | null;
+  /**
+   * TRA-3494 — has this date's EOD drain landed yet? TRI-STATE: `null` on a
+   * pre-fix file that carries no `segments` array, which is UNKNOWN and must not
+   * be read as "not yet".
+   *
+   * This exists because the day is not evidence until it is settled. The EOD
+   * drain lands ~23:45 ET, but TRA-3466 reads at 21:15 ET, so the current day is
+   * ALWAYS mid-session at read time: `observedMs: 0`, `uncoveredMs` = the whole
+   * RTH window, and the per-session grade says `coverageComplete:false`. Grading
+   * that as a FAILED day would print a phantom red every single night and make
+   * "no failed day in the window" permanently unsatisfiable.
+   */
+  eodFlushed: boolean | null;
   mergeDegraded: boolean;
   /** The part-5 rule, evaluated. */
   countsTowardBar: boolean;
@@ -143,11 +166,17 @@ const LIVE_MODES = new Set(['live']);
 const KNOWN_MODES = new Set(['live', 'demo', 'sandbox']);
 
 /**
- * TRI-STATE, and `vacuous` is NOT a soft `failed` nor a soft `counted`.
- * `vacuous` = the deciding cohort was empty that day, so the day says nothing
- * about the fix in either direction.
+ * FOUR states, and none of them is a soft version of another.
+ *   `counted`   — settled, live cohort non-empty, every observed live book clean.
+ *   `failed`    — settled, and an observed live book missed the per-session bar.
+ *   `vacuous`   — the deciding cohort was EMPTY that day. Says nothing in either
+ *                 direction; folding it either way is the bug.
+ *   `in_flight` — the session is still open (no EOD drain has landed). NOT a
+ *                 failure: the current day reads `coverageComplete:false` all day
+ *                 by construction, because the RTH window it is measured against
+ *                 has not elapsed yet.
  */
-export type TapeBarDayState = 'counted' | 'failed' | 'vacuous';
+export type TapeBarDayState = 'counted' | 'failed' | 'vacuous' | 'in_flight';
 
 /** One ET market day, graded as the TRA-3494 ruling defines the bar's unit. */
 export interface TapeBarDay {
@@ -207,6 +236,8 @@ export interface TapeSummary {
   barDays: TapeBarDay[];
   /** Days whose live cohort was empty. Never folded into counted or failed. */
   barDaysVacuous: number;
+  /** Open sessions (no EOD drain yet). NOT failures — see `TapeBarDayState`. */
+  barDaysInFlight: number;
   /** Days on which an observed live book missed the per-session bar. */
   barDaysFailed: number;
   /** Days with >=1 live book absent. Published; gates promotion, not the count. */
@@ -309,7 +340,15 @@ export function computeBarDays(
 
     let live: TapeBarDayState;
     let vacuousReason: string | undefined;
-    if (observed.length === 0) {
+    // Settled-ness is asked FIRST, because an open session fails the per-session
+    // grade by construction: it is measured against an RTH window that has not
+    // elapsed yet, so `uncoveredMs` is the whole window and `coverageComplete` is
+    // false. `eodFlushed === null` (a pre-fix file, no segment ledger) is UNKNOWN
+    // and deliberately does NOT qualify — those days really did lose rows.
+    const settled = observed.some(s => s.eodFlushed !== false);
+    if (observed.length > 0 && !settled) {
+      live = 'in_flight';
+    } else if (observed.length === 0) {
       // Consequence 1. NOT counted (an empty cohort must never mint a credit)
       // and NOT failed (an idle live book must never veto the bar).
       live = 'vacuous';
@@ -391,7 +430,7 @@ export async function summarizeDenominatorFlipTape(
           truncatedForSize: null, droppedOnMerge: null, saturated: null,
           segmentCount: null, restartBoundaries: null, coverageComplete: null,
           observedMs: null, uncoveredMs: null, rowsLostToRestart: null,
-          mergeDegraded: false, countsTowardBar: false,
+          mergeDegraded: false, countsTowardBar: false, eodFlushed: null,
           disqualifiers: ['unreadable'],
           unreadable: err instanceof Error ? err.message : String(err),
         });
@@ -416,6 +455,11 @@ export async function summarizeDenominatorFlipTape(
         observedMs: cov?.observedMs ?? null,
         uncoveredMs: cov?.uncoveredMs ?? null,
         rowsLostToRestart: cov?.rowsLostToRestart ?? null,
+        // `null` (not `false`) when the file predates the segment ledger: an
+        // absent field is UNKNOWN, never a passing or a pending one.
+        eodFlushed: Array.isArray(parsed.segments)
+          ? parsed.segments.some(seg => seg.trigger === 'eod')
+          : null,
         mergeDegraded: parsed.mergeDegraded === true,
         ...graded,
       });
@@ -466,6 +510,7 @@ export async function summarizeDenominatorFlipTape(
     completeBookSessions: complete,
     barDays,
     barDaysVacuous: barDays.filter(d => d.live === 'vacuous').length,
+    barDaysInFlight: barDays.filter(d => d.live === 'in_flight').length,
     barDaysFailed: barDays.filter(d => d.live === 'failed').length,
     barDaysWithLiveAbsence: barDays.filter(d => d.liveAbsent > 0).length,
     barDaysAnyBook: barDays.filter(d => d.anyBookClean).length,

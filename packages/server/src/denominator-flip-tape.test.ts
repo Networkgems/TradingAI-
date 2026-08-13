@@ -916,6 +916,9 @@ describe('TRA-3494 — the bar counts market DAYS on the live-money cohort', () 
     observedMs: 23_400_000,
     uncoveredMs: 0,
     rowsLostToRestart: 0,
+    // Default SETTLED: these arms grade finished sessions. The in-flight arm
+    // below overrides it, and that override is the whole point of the field.
+    eodFlushed: true,
     mergeDegraded: false,
     countsTowardBar: true,
     disqualifiers: [],
@@ -1012,6 +1015,46 @@ describe('TRA-3494 — the bar counts market DAYS on the live-money cohort', () 
       })], []);
       expect(days[0].live).toBe('failed');
     }
+  });
+
+  it('an OPEN session is `in_flight`, NEVER a failure', () => {
+    // The exact 2026-08-13 shape off the live box at 05:12Z: the day's file
+    // exists (a restart drained into it) but the RTH window it is graded against
+    // has not elapsed, so uncoveredMs is the WHOLE window. TRA-3466 reads at
+    // 21:15 ET, before the ~23:45 ET EOD drain, so this is what it sees EVERY
+    // night. Calling it `failed` prints a phantom red for ever.
+    const days = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D2,
+      rows: 1, observedMs: 0, uncoveredMs: 23_400_000, segmentCount: 3,
+      restartBoundaries: 2, coverageComplete: false, eodFlushed: false,
+      countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+    })], []);
+    expect(days[0].live).toBe('in_flight');
+    // ...and it must not be laundered into a credit either.
+    expect(days.filter(d => d.live === 'counted')).toHaveLength(0);
+  });
+
+  it('settled-ness is read off the SEGMENT LEDGER, not a date compare', () => {
+    // Same date, same everything, one EOD segment landed. Now it is evidence,
+    // and it is a genuine FAIL rather than an open session.
+    const days = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D2,
+      observedMs: 0, uncoveredMs: 23_400_000, coverageComplete: false, eodFlushed: true,
+      countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+    })], []);
+    expect(days[0].live).toBe('failed');
+  });
+
+  it('a PRE-FIX file (eodFlushed null) is UNKNOWN, and still FAILS rather than hiding', () => {
+    // The 08-04..08-10 files carry no segment ledger at all. `null` must not be
+    // read as "not yet settled" — those days really did lose rows, and excusing
+    // them as in-flight would erase four real failures from the record.
+    const days = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D1, rows: 515,
+      observedMs: null, coverageComplete: null, segmentCount: null, eodFlushed: null,
+      countsTowardBar: false, disqualifiers: ['coverageComplete:absent', 'droppedOnMerge:absent'],
+    })], []);
+    expect(days[0].live).toBe('failed');
   });
 
   it('SANDBOX is not live money — a sandbox book cannot bank a day', () => {
