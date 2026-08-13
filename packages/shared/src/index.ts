@@ -2709,8 +2709,49 @@ export interface OptionPosition {
    *                            NOTE this reason cannot apply to a row we can
    *                            prove the engine opened — see
    *                            {@link engineOriginSleeve}.
+   *   • `provenance_unresolved` — TRA-3553: the provenance oracle itself could
+   *                            not answer, so we do not know whether the engine
+   *                            placed this contract. See below.
+   *
+   * TRA-3553 — `provenance_unresolved` is a THIRD kind of thing and the reason
+   * it had to be added. The first two are DECISIONS: we know what this row is
+   * and we chose not to manage it. `provenance_unresolved` is an ADMISSION —
+   * the live fee/slippage ledger was empty (never hydrated, `DATA_DIR`
+   * unreadable, a reconcile that beat hydration, or retention aged every row
+   * out), so `lastRecordedOpenSleeve` answered `null` for a contract the engine
+   * may well have placed. Before this reason existed that silence was absorbed
+   * into `sub_floor_premium`, which reads as a deliberate TRA-462 refusal — the
+   * exact misreading that let TRA-2820's 8 live contracts sit unstopped and be
+   * filed as working-as-intended. A row carrying this reason is NOT explained;
+   * it is flagged, and it wants an operator.
    */
-  riskUnmanagedReason?: 'auto_manage_off' | 'sub_floor_premium';
+  riskUnmanagedReason?: 'auto_manage_off' | 'sub_floor_premium' | 'provenance_unresolved';
+  /**
+   * TRA-3553 (TRA-2820 ask 2) — why {@link underlyingEntryPrice} is `0` on a
+   * reconstructed row, when it is.
+   *
+   * `underlyingEntryPrice` means "spot at entry" and is what the chandelier
+   * exit and the underlying-stop backstop anchor on. The Tradier reconcile has
+   * no spot to seed it from, so it wrote a hard `0` — and every consumer treats
+   * `0` as "not a real price" and declines to evaluate. All five open rows in
+   * the TRA-2820 capture carried `0`, so those exits could not evaluate at all,
+   * and nothing anywhere said so.
+   *
+   * Same discipline as {@link riskUnmanagedReason}: `0` is a value, and a value
+   * cannot carry the fact that it was never measured. This field is what makes
+   * "we could not price the underlying at `openedAt`" READABLE instead of
+   * inferable, and it is what {@link OptionPosition.underlyingEntryPrice}'s
+   * consumers can cite when they skip a row.
+   *
+   *   • `no_spot_oracle`  — no historical-spot resolver was wired in, so the
+   *                         backfill could not be attempted at all.
+   *   • `spot_unusable`   — a resolver ran and returned nothing usable
+   *                         (null / non-finite / ≤ 0) for this symbol at this
+   *                         timestamp.
+   *
+   * Cleared the moment a real spot lands on the row.
+   */
+  underlyingEntryUnknownReason?: 'no_spot_oracle' | 'spot_unusable';
   /**
    * TRA-2820 — the sleeve that ACTUALLY placed this contract, recovered from
    * the live fee/slippage ledger's `buy_to_open` row (the same TRA-2811

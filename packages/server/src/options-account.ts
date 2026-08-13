@@ -17,6 +17,7 @@ import type {
   DayTradingGuardrailConfig,
   GuardrailVerdict,
   PortfolioGreeks,
+  SignalType,
 } from '@trading-app/shared';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
@@ -46,7 +47,12 @@ import {
 } from '@trading-app/shared';
 import { logger } from './observability/index.js';
 // TRA-2820 — provenance oracle for the Tradier reconcile (TRA-2811's ledger join).
-import { lastRecordedOpenSleeve, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
+import {
+  lastRecordedOpenSleeve,
+  lastRecordedOpenFill,
+  recordedOpenFillCount,
+  type LiveFillSleeve,
+} from './live-options-fee-slippage-ledger.js';
 import { appendEngineBasisRestatement } from './engine-basis-restatement-log.js';
 import {
   type MarketableOpenMtmConfig,
@@ -939,6 +945,74 @@ export function summarizeLiveExitErrors(
   return { total, expired, stagingStopped };
 }
 
+/**
+ * TRA-3553 (TRA-2820 asks 1 + 3) — what the provenance oracle can say about a
+ * contract the Tradier reconcile is about to adopt.
+ *
+ * ── Why this replaces a bare `sleeve | null` ────────────────────────────────
+ * {@link lastRecordedOpenSleeve} collapses two different states into `null`:
+ * "the ledger is populated and has never seen this contract" (⇒ foreign
+ * inventory, the import schedule is right) and "the ledger has nothing in it at
+ * all" (⇒ the oracle cannot answer, and calling the contract foreign is a
+ * GUESS). TRA-2820's remedy — restore the originating sleeve's schedule —
+ * silently does nothing in the second state, because the oracle it consults is
+ * exactly the thing that is broken. A fix whose own discriminator can be sick
+ * has to say so out loud; it must not report the sick reading as an answer.
+ *
+ * So the verdict is a three-valued thing, and the third value is the point.
+ */
+export type LiveOpenProvenance =
+  | {
+      /** The app placed this contract; `sleeve` is the schedule to restore. */
+      kind: 'engine';
+      sleeve: Exclude<LiveFillSleeve, 'unattributed'>;
+      /** Broker order id from the ledger row, when it recorded one. */
+      orderId: number | null;
+    }
+  | {
+      /**
+       * The oracle is HEALTHY and has no record of us opening this contract ⇒
+       * genuinely foreign broker inventory. TRA-462 and the import schedule
+       * apply exactly as before.
+       */
+      kind: 'foreign';
+    }
+  | {
+      /**
+       * The oracle could not answer. NOT a synonym for `foreign` — it is the
+       * absence of a reading, and it is what gets stamped on the row so the
+       * zero stop is legible as "unknown" rather than "declined".
+       */
+      kind: 'unresolved';
+      reason: 'ledger_empty';
+    };
+
+/**
+ * TRA-3553 — the default oracle: the live fee/slippage ledger, read for BOTH
+ * the answer and its own health.
+ *
+ * The health probe is `recordedOpenFillCount() > 0`, and it is consulted ONLY
+ * on the `null` branch. That ordering matters: a ledger that answers for this
+ * symbol has proved it can answer, so no separate liveness check can add
+ * anything — and a positive control that is only run when the result is
+ * negative cannot inflate a positive.
+ *
+ * `unattributed` (TRA-2959: a fill recovered from broker account history, with
+ * no engine provenance to inherit) is a real, healthy reading that names no
+ * sleeve — so it is `foreign`, not `unresolved`. The oracle answered; the answer
+ * is "nothing of ours".
+ */
+function ledgerOpenProvenance(optionSymbol: string): LiveOpenProvenance {
+  const fill = lastRecordedOpenFill(optionSymbol);
+  if (fill && fill.sleeve !== 'unattributed') {
+    return { kind: 'engine', sleeve: fill.sleeve, orderId: fill.orderId };
+  }
+  if (fill) return { kind: 'foreign' };
+  return recordedOpenFillCount() > 0
+    ? { kind: 'foreign' }
+    : { kind: 'unresolved', reason: 'ledger_empty' };
+}
+
 function applyEngineOriginRiskThresholds(
   opt: OptionPosition,
   // TRA-2959 — 'unattributed' (a history-imported open with no engine
@@ -1168,6 +1242,33 @@ interface OptionsAccountConfig {
    * append are not a test dependency.
    */
   resolveLiveOpenSleeve?: (optionSymbol: string) => LiveFillSleeve | null;
+  /**
+   * TRA-3553 — the three-valued form of the same oracle; see
+   * {@link LiveOpenProvenance}. Defaults to the live fee/slippage ledger.
+   *
+   * When {@link resolveLiveOpenSleeve} is supplied and this is not, the legacy
+   * hook wins and its `null` maps to `foreign` — i.e. a caller that installs
+   * its own oracle is ASSERTING that oracle is healthy, which is true of every
+   * test double by construction. That keeps the `unresolved` verdict a
+   * statement about the real ledger's real health, and stops it from firing on
+   * a stub whose emptiness is the point of the stub.
+   */
+  resolveLiveOpenProvenance?: (optionSymbol: string) => LiveOpenProvenance;
+  /**
+   * TRA-3553 (TRA-2820 ask 2) — historical spot for `symbol` at `atMs`, used to
+   * backfill {@link OptionPosition.underlyingEntryPrice} on a row the Tradier
+   * reconcile adopted. Return `null` when the price cannot be established;
+   * the row is then stamped `spot_unusable` rather than quietly keeping the
+   * `0` that reads as a price.
+   *
+   * Optional, and absent by default ON PURPOSE. The reconcile runs inside the
+   * live portfolio sweep and must not grow a synchronous network fetch per
+   * adopted contract; wiring a real resolver is a separate, explicitly-costed
+   * change (TRA-3558). Until one exists the honest state is `no_spot_oracle`,
+   * which is exactly what an unwired hook now stamps — the gap becomes
+   * countable instead of looking like a measured zero.
+   */
+  resolveUnderlyingEntrySpot?: (symbol: string, atMs: number) => number | null;
   /**
    * TRA-361 — auto-manage Tradier-imported option positions (run them through
    * the engine SL / TP1-partial / trailing pipeline and mirror exits to
@@ -1402,6 +1503,41 @@ export class PaperOptionsAccount {
   private rvRiskParams: RvRiskParams;
   /** TRA-2820 — see `OptionsAccountConfig.resolveLiveOpenSleeve`. */
   private resolveLiveOpenSleeve: (optionSymbol: string) => LiveFillSleeve | null;
+  /** TRA-3553 — see `OptionsAccountConfig.resolveLiveOpenProvenance`. */
+  private resolveLiveOpenProvenance: (optionSymbol: string) => LiveOpenProvenance;
+  /** TRA-3553 — see `OptionsAccountConfig.resolveUnderlyingEntrySpot`. */
+  private resolveUnderlyingEntrySpot?: (symbol: string, atMs: number) => number | null;
+  /**
+   * TRA-3553 — running census of what the import path DID, per adopted row.
+   *
+   * Ships with the fix because the fix is otherwise unobservable in the state
+   * it most needs to be observed in. An adopted row that got its engine
+   * schedule back and an adopted row the oracle could not classify both end up
+   * in `openOptions`; the difference lives in a decision that has already been
+   * made and thrown away by the time anything reads the book. And the live
+   * cohort is EMPTY most days (it was flat on 2026-08-13), so "no bad rows" is
+   * the reading you get whether this works or does nothing at all.
+   *
+   * `adopted` is the denominator and is the whole point: zero means the branch
+   * never ran, which is BLIND, not a pass.
+   */
+  private importProvenanceCensus: {
+    adopted: number;
+    engineOrigin: number;
+    foreign: number;
+    unresolved: number;
+    underlyingBackfilled: number;
+    underlyingUnknown: number;
+    entryDeltaRestored: number;
+  } = {
+    adopted: 0,
+    engineOrigin: 0,
+    foreign: 0,
+    unresolved: 0,
+    underlyingBackfilled: 0,
+    underlyingUnknown: 0,
+    entryDeltaRestored: 0,
+  };
   private tradierEnv: TradierEnv | null;
   /**
    * TRA-361 — when true, Tradier-imported positions run through the engine
@@ -1620,6 +1756,24 @@ export class PaperOptionsAccount {
     this.otmRiskParams = config.otmRiskParams ?? OTM_RISK_PARAMS;
     this.rvRiskParams = config.rvRiskParams ?? RV_RISK_PARAMS;
     this.resolveLiveOpenSleeve = config.resolveLiveOpenSleeve ?? lastRecordedOpenSleeve;
+    // TRA-3553 — precedence, stated once here rather than re-derived at each
+    // call site: an explicit three-valued oracle wins; otherwise a caller that
+    // installed the legacy sleeve hook gets its `null` read as `foreign` (it
+    // asserted its own oracle by supplying it); otherwise the real ledger,
+    // which is the only configuration whose emptiness is evidence of anything.
+    this.resolveLiveOpenProvenance =
+      config.resolveLiveOpenProvenance ??
+      (config.resolveLiveOpenSleeve
+        ? (sym: string): LiveOpenProvenance => {
+            const sleeve = config.resolveLiveOpenSleeve!(sym);
+            return sleeve && sleeve !== 'unattributed'
+              ? { kind: 'engine', sleeve, orderId: null }
+              : { kind: 'foreign' };
+          }
+        : ledgerOpenProvenance);
+    if (config.resolveUnderlyingEntrySpot) {
+      this.resolveUnderlyingEntrySpot = config.resolveUnderlyingEntrySpot;
+    }
     this.tradierEnv = config.tradierEnv ?? null;
     this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions ?? true;
     // TRA-374 — start at 0/0 by default so the cost model is opt-in until
@@ -1888,6 +2042,30 @@ export class PaperOptionsAccount {
           if (adoptable.length === 1) {
             const existing = adoptable[0]!;
             position.journalId = existing.id;
+            // TRA-3553 (TRA-2820 ask 2) — the ADOPT branch has just PROVED this
+            // contract has an engine-written OPEN row, and that row is the only
+            // surviving record of the position's entry delta. The reconstructed
+            // position carries none (the mint has nothing to compute one from),
+            // so every |delta|-weighted consumer — the stale-mark backstop's
+            // premium-move estimate, portfolio greeks, exposure — silently
+            // falls back to 0 on a live row whose real exposure is not zero.
+            //
+            // Copied only when the journal's value is USABLE. The import mint
+            // itself writes `entryDelta: 0` as an honest unknown, so adopting a
+            // 0 back would be laundering that unknown into the position as a
+            // measurement. Guarded on the position not already having one, so a
+            // repair pass over a row that was fixed on an earlier sweep is a
+            // no-op rather than a re-write.
+            const journalDelta = existing.entryDelta;
+            if (
+              (position.entryDelta === undefined || position.entryDelta === null)
+              && typeof journalDelta === 'number'
+              && Number.isFinite(journalDelta)
+              && journalDelta !== 0
+            ) {
+              position.entryDelta = journalDelta;
+              this.importProvenanceCensus.entryDeltaRestored += 1;
+            }
             accountLog.info('reconcile rebound an imported row onto its existing journal row', {
               issue: 'TRA-2937',
               origin,
@@ -1896,6 +2074,7 @@ export class PaperOptionsAccount {
               positionId: id,
               journalId: existing.id,
               structure: existing.structure,
+              entryDeltaRestored: position.entryDelta ?? null,
               note: 'close will settle the ORIGINAL row; no duplicate OPEN written',
             });
             return;
@@ -4675,9 +4854,17 @@ export class PaperOptionsAccount {
       // row can arrive already `trailingActive` from a snapshot written by a build
       // without this guard, and that stale latch is the live hazard; declining to
       // arm it a second time would leave it exactly as armed as it already is.
+      // TRA-3553 — the guard reads the stamp's PRESENCE, not its value, which is
+      // what makes it correct for the new `provenance_unresolved` reason too: an
+      // unclassified row must be disarmed for the same mechanical cause (a stale
+      // latch over a sentinel schedule), even though the row is unclassified
+      // rather than deliberately unmanaged. The message no longer says
+      // "deliberately" for exactly that reason — two of the three reasons are
+      // decisions and the third is an admission, and the log line is read by
+      // whoever has to go look at the position.
       if (opt.riskUnmanagedReason) {
         if (opt.trailingActive || opt.trailingStopPremium !== 0) {
-          accountLog.warn('disarmed a trailing stop on a deliberately UNMANAGED option row', {
+          accountLog.warn('disarmed a trailing stop on an UNMANAGED option row', {
             issue: 'TRA-2820',
             optionSymbol: opt.optionSymbol,
             reason: opt.riskUnmanagedReason,
@@ -6387,6 +6574,12 @@ export class PaperOptionsAccount {
         ...(this.tradierEnv ? { tradierEnv: this.tradierEnv } : {}),
       };
       this.installReconcileRiskThresholds(position, mode);
+      // TRA-3553 (TRA-2820 asks 2 + 3) — the risk block is only half of what
+      // this row lost. Provenance and the underlying anchor are restored here,
+      // AFTER the schedule, because the engine-origin branch above is what
+      // proves there is any provenance to restore.
+      this.restoreImportProvenance(position, mode);
+      this.seedImportUnderlyingEntry(position);
       this.openOptions.set(position.id, position);
       // TRA-2937 — journal the adoption. Until this line an imported row had no
       // journal record under its freshly-minted id, so `queueJournalClose` found
@@ -6416,24 +6609,30 @@ export class PaperOptionsAccount {
    * money with nothing evaluating against it.
    */
   private installReconcileRiskThresholds(opt: OptionPosition, mode: AccountMode): void {
-    if (mode === 'live' && opt.optionSymbol) {
-      const sleeve = this.resolveLiveOpenSleeve(opt.optionSymbol);
-      // TRA-2959 — an 'unattributed' ledger open (history-imported, no engine
-      // provenance) is not evidence of an engine origin; take the import path.
-      if (sleeve && sleeve !== 'unattributed') {
-        applyEngineOriginRiskThresholds(opt, sleeve, this.otmRiskParams, this.rvRiskParams);
-        accountLog.info('reconcile adopted an ENGINE-OPENED live option as an import', {
-          issue: 'TRA-2820',
-          optionSymbol: opt.optionSymbol,
-          sleeve: opt.engineOriginSleeve,
-          premiumPaid: opt.premiumPaid,
-          stopLossPremium: opt.stopLossPremium,
-          note: 'kept on its originating sleeve schedule, not the RV import sentinel',
-        });
-        return;
-      }
+    const verdict = this.liveOpenProvenanceFor(opt, mode);
+    if (verdict?.kind === 'engine') {
+      applyEngineOriginRiskThresholds(opt, verdict.sleeve, this.otmRiskParams, this.rvRiskParams);
+      accountLog.info('reconcile adopted an ENGINE-OPENED live option as an import', {
+        issue: 'TRA-2820',
+        optionSymbol: opt.optionSymbol,
+        sleeve: opt.engineOriginSleeve,
+        premiumPaid: opt.premiumPaid,
+        stopLossPremium: opt.stopLossPremium,
+        note: 'kept on its originating sleeve schedule, not the RV import sentinel',
+      });
+      return;
     }
     applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions);
+    // TRA-3553 — the oracle could not answer, so we do NOT know that this row
+    // is foreign. Overwrite whichever confident reason the import path just
+    // stamped: `sub_floor_premium` and `auto_manage_off` both assert we know
+    // what the row is, and that assertion is what made TRA-2820's TSLA rows
+    // read as working-as-intended for a session. The SCHEDULE is unchanged —
+    // the sentinel is the safe state and guessing a stop on a contract of
+    // unknown origin would be worse — but the LABEL now says "unknown".
+    if (verdict?.kind === 'unresolved') {
+      opt.riskUnmanagedReason = 'provenance_unresolved';
+    }
     if (mode === 'live' && opt.riskUnmanagedReason) {
       accountLog.warn('live imported option is UNMANAGED — zero stop, no take-profit', {
         issue: 'TRA-2820',
@@ -6441,8 +6640,185 @@ export class PaperOptionsAccount {
         reason: opt.riskUnmanagedReason,
         contracts: opt.contracts,
         premiumPaid: opt.premiumPaid,
+        ...(verdict?.kind === 'unresolved'
+          ? {
+              issueDetail: 'TRA-3553',
+              oracle: verdict.reason,
+              note:
+                'the live fee/slippage ledger holds NO buy_to_open rows, so it cannot ' +
+                'say whether the engine placed this contract. Treat as UNCLASSIFIED, ' +
+                'not as a decision to leave it unmanaged.',
+            }
+          : {}),
       });
     }
+  }
+
+  /**
+   * TRA-3553 — the provenance verdict for a row the reconcile is adopting, or
+   * `null` when the question does not apply.
+   *
+   * Live book only, and for the reason TRA-2820 gave: the fee/slippage ledger
+   * records LIVE fills only, so on a demo reconcile the oracle would answer for
+   * nothing and could only ever mis-fire on an OCC collision. `null` here means
+   * "not asked", which is why callers must not read it as `foreign`.
+   */
+  private liveOpenProvenanceFor(
+    opt: OptionPosition,
+    mode: AccountMode,
+  ): LiveOpenProvenance | null {
+    if (mode !== 'live') return null;
+    if (!opt.optionSymbol) return null;
+    return this.resolveLiveOpenProvenance(opt.optionSymbol);
+  }
+
+  /**
+   * TRA-3553 (TRA-2820 ask 3) — stop the import path from stamping IMPORT
+   * provenance over a contract we can prove the app itself placed.
+   *
+   * ── What was actually wrong ─────────────────────────────────────────────────
+   * The mint hardcodes `signalType: 'tradier_import'` and a synthetic
+   * `signalId: 'tradier-import-<OCC>'`. On a contract the engine placed and
+   * then lost the row for, both are FALSE — and they are false in the one
+   * direction that erases the evidence, because `signalId` is what ties the
+   * position back to the order that opened it. TRA-2820's two TSLA contracts
+   * are identified in that ticket by broker order ids (`140022786` /
+   * `140028461`) recovered from the FEE LEDGER, not from the rows, and that is
+   * the whole tell: the row had thrown away every handle on its own origin.
+   *
+   * ── Why `importedFromTradier` is deliberately NOT cleared ───────────────────
+   * That flag is not a provenance claim, it is a BOOKKEEPING claim — "the
+   * broker payload is the authority on whether this row still exists". The
+   * broker-missing sweep, `recordImportedFill` and `closeOption`'s routing all
+   * key on it, and the local book genuinely has no independent record of this
+   * position (that is why the reconcile had to adopt it). Clearing it would
+   * hand a row with no engine-side bookkeeping to the engine-row code paths,
+   * which is a much larger and much riskier change than the one this ticket
+   * asks for, on real money. The ask is that provenance SURVIVE, not that the
+   * row be re-typed as engine-managed — so the two facts are recorded
+   * separately and both stay true.
+   */
+  private restoreImportProvenance(opt: OptionPosition, mode: AccountMode): void {
+    this.importProvenanceCensus.adopted += 1;
+    const verdict = this.liveOpenProvenanceFor(opt, mode);
+    if (verdict?.kind === 'unresolved') this.importProvenanceCensus.unresolved += 1;
+    if (!verdict || verdict.kind !== 'engine') {
+      if (verdict?.kind === 'foreign') this.importProvenanceCensus.foreign += 1;
+      return;
+    }
+    this.importProvenanceCensus.engineOrigin += 1;
+    // Only the two sleeves that HAVE a `SignalType` are re-typed. There is no
+    // member for `single_leg_directional`, and inventing the nearest-looking
+    // one would put a false label on a real-money row to satisfy a field —
+    // strictly worse than `tradier_import`, which at least remains TRUE (the
+    // row did arrive through the import path). `engineOriginSleeve` carries
+    // the precise answer in every case, including this one, so nothing is lost
+    // by declining to guess here.
+    //
+    // Both surviving targets stay eligible for `refreshOptionMarks`, which
+    // admits exactly `relative_value | otm_mispricing | tradier_import` — so
+    // the re-type cannot strand an adopted row with a frozen mark. Checked,
+    // not assumed: that is the only non-display consumer of the field.
+    const retyped: SignalType | null =
+      verdict.sleeve === 'single_leg_rv'
+        ? 'relative_value'
+        : verdict.sleeve === 'single_leg_otm'
+          ? 'otm_mispricing'
+          : null;
+    if (retyped) opt.signalType = retyped;
+    // Prefer the broker order id — it is the handle that joins this row to the
+    // fill, the fee ledger and Tradier's own order history. Fall back to the
+    // OCC-keyed form (still marked engine-origin) rather than keeping the
+    // `tradier-import-` prefix, which asserts the opposite of what we proved.
+    opt.signalId =
+      verdict.orderId !== null
+        ? `engine-origin-order-${verdict.orderId}`
+        : `engine-origin-${opt.optionSymbol}`;
+    accountLog.info('reconcile restored ENGINE provenance on an adopted live option', {
+      issue: 'TRA-3553',
+      optionSymbol: opt.optionSymbol,
+      sleeve: verdict.sleeve,
+      orderId: verdict.orderId,
+      signalType: opt.signalType,
+      signalTypeRetyped: retyped !== null,
+      signalId: opt.signalId,
+      note:
+        'importedFromTradier stays true — the broker remains the authority on ' +
+        'whether the row exists; only the ORIGIN claim is corrected',
+    });
+  }
+
+  /**
+   * TRA-3553 (TRA-2820 ask 2) — seed `underlyingEntryPrice` on an adopted row,
+   * or say why it could not be seeded.
+   *
+   * `underlyingEntryPrice` means "spot at entry". The reconcile has no spot, so
+   * it wrote `0`, and every consumer that anchors on it — the chandelier exit,
+   * the underlying-stop backstop, portfolio greeks' entry fallback — treats `0`
+   * as "not a real price" and declines to evaluate. All five open rows in the
+   * TRA-2820 capture carried `0`; those exits could not evaluate at all, and
+   * nothing said so. The correctly-managed 2026-07-30 rows carried real
+   * anchors (331.69 / 735.58 / 738.295), which is what proves this is a dropped
+   * write rather than a feature nobody built.
+   *
+   * The write is only half the fix. The other half is that a row which STILL
+   * cannot be anchored now says so on its face
+   * ({@link OptionPosition.underlyingEntryUnknownReason}) instead of presenting
+   * an unmeasured `0` in the same field, with the same type, as a measured
+   * price. TRA-2893 is the standing reminder of what that ambiguity costs: a
+   * `0` anchor made every imported PUT trigger its chandelier unconditionally.
+   */
+  private seedImportUnderlyingEntry(opt: OptionPosition): void {
+    const resolver = this.resolveUnderlyingEntrySpot;
+    if (!resolver) {
+      opt.underlyingEntryUnknownReason = 'no_spot_oracle';
+      this.importProvenanceCensus.underlyingUnknown += 1;
+      return;
+    }
+    let spot: number | null = null;
+    try {
+      spot = resolver(opt.symbol, opt.openedAt);
+    } catch {
+      // A resolver that throws is a resolver that did not answer. Same state as
+      // one that returned null — never a reason to abort the adoption itself.
+      spot = null;
+    }
+    if (spot === null || !Number.isFinite(spot) || spot <= 0) {
+      opt.underlyingEntryUnknownReason = 'spot_unusable';
+      this.importProvenanceCensus.underlyingUnknown += 1;
+      accountLog.warn('could not anchor an adopted option to a spot at entry', {
+        issue: 'TRA-3553',
+        optionSymbol: opt.optionSymbol,
+        symbol: opt.symbol,
+        openedAt: opt.openedAt,
+        note: 'chandelier and underlying-stop exits cannot evaluate on this row',
+      });
+      return;
+    }
+    opt.underlyingEntryPrice = spot;
+    delete opt.underlyingEntryUnknownReason;
+    this.importProvenanceCensus.underlyingBackfilled += 1;
+  }
+
+  /**
+   * TRA-3553 — read side of the import-path witness; see
+   * {@link importProvenanceCensus} for why it exists.
+   *
+   * `adopted` is the denominator. `adopted === 0` is BLIND — the import branch
+   * never ran — and must never be graded as a pass, which is the specific trap
+   * this ticket was filed with: the live book is flat, so every `every(...)`
+   * predicate over the imported cohort is vacuously true.
+   */
+  importProvenanceSummary(): {
+    adopted: number;
+    engineOrigin: number;
+    foreign: number;
+    unresolved: number;
+    underlyingBackfilled: number;
+    underlyingUnknown: number;
+    entryDeltaRestored: number;
+  } {
+    return { ...this.importProvenanceCensus };
   }
 
   /**
