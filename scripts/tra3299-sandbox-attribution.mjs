@@ -289,7 +289,7 @@ export function grade({ journal, orders, runs = [], leaves = {}, day }) {
   if (brokerLegs === 0) {
     const ran = dispatches.filter((d) => d.state === 'RAN');
     const noRun = dispatches.filter((d) => d.state === 'NO_RUN');
-    if (dispatches.length === 0) notes.push('ZERO ORDERS, ZERO DISPATCH ROWS for this day — no writer was scheduled; this is not evidence about the writer.');
+    if (dispatches.length === 0) notes.push('ZERO ORDERS and NO dispatch row at all for this ET day — either nothing was scheduled, or the day has not reached its first slot yet. Read the trigger cron before calling this a quiet session; it is not evidence about the writer.');
     else if (ran.length === 0) notes.push(`ZERO ORDERS but NO dispatch executed (${noRun.length} NO_RUN, ${dispatches.length - noRun.length} indeterminate) — the runner was ABSENT, NOT quiet. Do not score this as a clean session for d8ec9395.`);
     else notes.push(`ZERO ORDERS with ${ran.length} dispatch(es) that did execute — the runner ran and legitimately placed nothing.`);
   }
