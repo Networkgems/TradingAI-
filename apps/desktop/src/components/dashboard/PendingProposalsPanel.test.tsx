@@ -39,6 +39,9 @@ const proposal = (over: Partial<TradeProposal> = {}): TradeProposal => ({
   note: 'momentum continuation',
   createdAt: Date.now(),
   status: 'pending',
+  // TRA-3514 - default to an LLM-backed read, which is what every agent-sourced
+  // proposal production mints actually carries (adviseSymbol stamps both arms).
+  llmUsed: true,
   ...over,
 });
 
@@ -111,5 +114,66 @@ describe('PendingProposalsPanel — TRA-945 nits', () => {
 
     expect(await screen.findByRole('button', { name: 'Approve' })).toBeEnabled();
     expect(screen.queryByText('STALE')).not.toBeInTheDocument();
+  });
+  // -- TRA-3514 (TRA-3460 (c) section 2) -- the backing badge, BOTH directions ----
+  //
+  // The requirement is that "a conviction number produced by the zero-cost graph must
+  // not render identically to a real one". These two cases are identical except for
+  // `llmUsed`, so any difference they show is attributable to the backing alone.
+  it('badges a FALLBACK read and de-emphasises its conviction', async () => {
+    stubFetch({
+      proposals: [proposal({ llmUsed: false, conviction: 0.95 })],
+      caps: CAPS, killSwitchEngaged: false, tradingAgentsEnabled: true,
+    });
+    renderPanel();
+
+    // findAll, not find: the badge string also appears inside the explanatory
+    // paragraph's ancestor chain, and a strict single-match assertion would fail on a
+    // component that is rendering CORRECTLY.
+    expect((await screen.findAllByText(/FALLBACK/i)).length).toBeGreaterThan(0);
+    // The conviction label itself changes, so the number cannot be read as researched.
+    expect(screen.getByText(/Conviction \(deterministic\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/No model call backed this recommendation/i)).toBeInTheDocument();
+  });
+
+  it('badges an LLM-BACKED read and leaves its conviction plain', async () => {
+    stubFetch({
+      proposals: [proposal({ llmUsed: true, conviction: 0.95 })],
+      caps: CAPS, killSwitchEngaged: false, tradingAgentsEnabled: true,
+    });
+    renderPanel();
+
+    expect(await screen.findByText('LLM-backed')).toBeInTheDocument();
+    expect(screen.queryAllByText(/FALLBACK/i)).toHaveLength(0);
+    expect(screen.queryByText(/Conviction \(deterministic\)/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Conviction')).toBeInTheDocument();
+  });
+
+  // The EXEMPTION. An options-feed proposal has no advisory graph behind it, so an
+  // unstamped options card is correct and must NOT be badged as a fallback - a false
+  // alarm on a healthy rail teaches operators to ignore the badge entirely.
+  it('does NOT badge an options-feed proposal that legitimately carries no backing', async () => {
+    stubFetch({
+      proposals: [proposal({ kind: 'options', llmUsed: undefined })],
+      caps: CAPS, killSwitchEngaged: false, tradingAgentsEnabled: true,
+    });
+    renderPanel();
+
+    await screen.findByText('NVDA');
+    expect(screen.queryAllByText(/FALLBACK/i)).toHaveLength(0);
+    expect(screen.queryByText('LLM-backed')).not.toBeInTheDocument();
+  });
+
+  // Fail-closed: an AGENT (equity) proposal with the stamp MISSING is not evidence of
+  // an LLM read, and the panel must not be more optimistic than the server gate that
+  // already refused it.
+  it('treats a MISSING stamp on an equity proposal as a fallback read', async () => {
+    stubFetch({
+      proposals: [proposal({ llmUsed: undefined })],
+      caps: CAPS, killSwitchEngaged: false, tradingAgentsEnabled: true,
+    });
+    renderPanel();
+
+    expect((await screen.findAllByText(/FALLBACK/i)).length).toBeGreaterThan(0);
   });
 });

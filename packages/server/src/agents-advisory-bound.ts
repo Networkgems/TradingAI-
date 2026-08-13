@@ -83,6 +83,7 @@
 // `assertAdvisoryBudgetArithmetic` fails the SUITE if either drifts.
 import { LLM_CALL_CEILING_MS } from '@trading-app/agents';
 import { runBudgetedSweep, type SweepCursorStore, type SweepPass } from './tick-sweep-budget.js';
+import { companyDailyCapUsd } from './agent-spend-store.js';
 
 /** Wall clock one `agents-advisory` pass may spend inside one `doTick`. */
 export const AGENTS_ADVISORY_SWEEP_BUDGET_MS = 30_000;
@@ -249,6 +250,187 @@ export async function runAdvisorySweep(opts: {
   });
 
   return { pass, breakerTripped, maxConsecutiveFailures: maxConsecutive, failures, firstError };
+}
+
+// ─── TRA-3514 (TRA-3460 (a)) — THE UNIVERSE BOUND ────────────────────────────
+//
+// TRA-3442 (above) bounded how LONG a pass may run. It did not bound how WIDE
+// the pass is, and width is what the money bound is about: `runTradingAgentsAdvisory`
+// was handed `getActiveSymbols()` — 639 names — against a $0.50/day company cap.
+//
+// ⭐ These two bounds are NOT redundant, and it matters which one is load-bearing
+// for which failure. The wall-clock budget truncates a wide pass and PARKS THE
+// CURSOR, so coverage rotates and every symbol is eventually attempted — which is
+// correct for a latency bound and exactly WRONG for a spend bound, because a
+// rotating cursor spends the cap on whichever slice the cursor happened to reach.
+// A cap that is exhausted by symbol ~10 does not need a fair rotation over 639
+// names; it needs a universe it can actually AFFORD, chosen for relevance rather
+// than for cursor position. Hence a width bound, and hence one pass per session
+// rather than a cursor.
+//
+// The CFO's sizing (TRA-3514 Part 2), re-derived here and asserted below:
+//
+//     company daily cap                       $0.50   (TRADING_AGENTS_COMPANY_DAILY_USD_CAP)
+//     per-symbol cost, conservative           $0.05   (top of the parent's $0.02-0.05 band)
+//     8 symbols x $0.05 x 1 pass/session      $0.40   -> 20% headroom under the cap
+//     12 symbols would be $0.60               OVER    -> which is why the ceiling is 8, not 12
+
+/**
+ * Hard ceiling on symbols handed to ONE advised pass. A CEILING, not a target: a
+ * shortlist that comes in under it is advised whole.
+ */
+export const ADVISORY_MAX_SYMBOLS_PER_PASS = 8;
+
+/**
+ * Conservative per-symbol advisory cost used for the affordability arithmetic —
+ * the TOP of the parent's measured $0.02-0.05 band, so the bound is sized against
+ * the expensive end rather than the hoped-for one.
+ *
+ * ⚠️ This is an ESTIMATE and is labelled as one. TRA-3514 Part 4 replaces it with
+ * a MEASURED figure off the first funded RTH session; if the measurement puts 8
+ * symbols outside the cap, the number the CFO re-sizes is this one.
+ */
+export const ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE = 0.05;
+
+/** Advised passes permitted per RTH session (a ceiling, like the width). */
+export const ADVISORY_PASSES_PER_SESSION = 1;
+
+/** Worst-case daily advisory spend under the shipped width/cadence bounds, USD. */
+export function advisoryWorstDailyUsd(
+  maxSymbols: number = ADVISORY_MAX_SYMBOLS_PER_PASS,
+  perSymbolUsd: number = ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE,
+  passes: number = ADVISORY_PASSES_PER_SESSION,
+): number {
+  return maxSymbols * perSymbolUsd * passes;
+}
+
+/**
+ * Throw unless the shipped width/cadence bounds still fit the LIVE company daily
+ * cap. Called from the suite, so raising the width, the cadence or the cost
+ * estimate fails HERE rather than showing up as a silent tail of deterministic
+ * recommendations in a funded session.
+ *
+ * ⭐ Reads {@link companyDailyCapUsd} rather than hard-coding $0.50: the cap is an
+ * env value the CFO owns and can move without a redeploy, and an arithmetic
+ * assertion pinned to a literal would go quietly false the moment they did. The
+ * cost of that choice is that the assertion is only as good as the env the SUITE
+ * runs under — which is why the failure message prints the cap it actually read.
+ */
+export function assertAdvisoryUniverseAffordable(capUsd: number = companyDailyCapUsd()): void {
+  const worst = advisoryWorstDailyUsd();
+  if (!(worst <= capUsd)) {
+    throw new Error(
+      `TRA-3514 universe bound violated: ${ADVISORY_MAX_SYMBOLS_PER_PASS} symbols x `
+      + `$${ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE}/symbol x ${ADVISORY_PASSES_PER_SESSION} pass `
+      + `= $${worst.toFixed(2)}/day > the $${capUsd.toFixed(2)} company daily cap`,
+    );
+  }
+}
+
+/** Where a shortlisted symbol came from — the reason it earned a paid read. */
+export type AdvisoryShortlistReason = 'open_position' | 'pending_proposal' | 'curated_shortlist';
+
+export interface AdvisoryShortlist {
+  /** The bounded universe, in priority order, `<= max`. */
+  symbols: string[];
+  /** Why each symbol is in, keyed by symbol — the audit trail for the bound. */
+  reasons: Record<string, AdvisoryShortlistReason>;
+  /** How many candidates the cap DROPPED. Non-zero must never be silent. */
+  dropped: number;
+  /** Distinct candidates before the cap (post-dedup). */
+  candidates: number;
+}
+
+/**
+ * Build the bounded advised universe: open positions, then active-interest /
+ * pending proposals, then the curated liquid swing shortlist — deduped, in that
+ * priority order, capped at `max`.
+ *
+ * ⭐ THE ORDER IS THE POLICY, and it is the part a reader should check rather than
+ * the cap. When the cap binds, the order decides who gets the paid read, so it
+ * runs strictly most-committed-first: a symbol we are ALREADY EXPOSED TO is worth
+ * more analysis than one we might enter, which is worth more than one on a
+ * watchlist. The previous behaviour had no order at all — `getActiveSymbols()` is
+ * alphabetical, so the paid reads went to whatever sorted first (`AAPL` ... on
+ * every pass of the 2026-08-12 tape) and an open position at `Z` never got one.
+ * That is the positional bias the parent named, and an ordering is the fix for it;
+ * the width bound alone would merely have made it cheaper.
+ *
+ * Pure and total: no clock, no engine, no env. Everything it decides is a
+ * function of its arguments, so the priority policy is unit-testable at the
+ * boundary (exactly-at-cap, over-cap, empty shortlist) without a live book.
+ */
+export function buildAdvisoryShortlist(opts: {
+  /** Symbols with an OPEN position — highest priority, we are already exposed. */
+  openPositions: readonly string[];
+  /** Symbols with active interest: a pending/unresolved trade proposal. */
+  pendingProposals: readonly string[];
+  /** The curated liquid swing universe — the standing scan candidates. */
+  curated: readonly string[];
+  max?: number;
+}): AdvisoryShortlist {
+  const max = Math.max(0, Math.floor(opts.max ?? ADVISORY_MAX_SYMBOLS_PER_PASS));
+  const reasons: Record<string, AdvisoryShortlistReason> = {};
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+
+  const tiers: Array<readonly [AdvisoryShortlistReason, readonly string[]]> = [
+    ['open_position', opts.openPositions],
+    ['pending_proposal', opts.pendingProposals],
+    ['curated_shortlist', opts.curated],
+  ];
+  for (const [reason, list] of tiers) {
+    for (const raw of list) {
+      const sym = String(raw ?? '').trim().toUpperCase();
+      if (sym === '' || seen.has(sym)) continue;
+      seen.add(sym);
+      ordered.push(sym);
+      // First tier to claim a symbol owns its reason — a symbol that is BOTH an
+      // open position and curated is reported as the open position, which is the
+      // fact that earned it the slot.
+      reasons[sym] = reason;
+    }
+  }
+
+  const symbols = ordered.slice(0, max);
+  // ⚠️ Reasons are trimmed to the ADMITTED set. Publishing a reason for a symbol
+  // that was dropped would read as coverage the pass never gave it.
+  const trimmed: Record<string, AdvisoryShortlistReason> = {};
+  for (const s of symbols) trimmed[s] = reasons[s]!;
+  return {
+    symbols,
+    reasons: trimmed,
+    dropped: ordered.length - symbols.length,
+    candidates: ordered.length,
+  };
+}
+
+/**
+ * TRA-3514 (TRA-3460 (c) §4) — the per-pass backing census. `advised` and
+ * `fellBack` are the two ways a symbol PRODUCES a recommendation; the split is
+ * the whole point, because before this the two were summed into one
+ * `recommendationCount` and the degradation was invisible.
+ *
+ * ⚠️ `skipped` and `failed` are kept APART on purpose (the ticket's "a missing
+ * symbol and a deterministically-advised symbol are different facts", one level
+ * in): a skip is a symbol we declined to ask about (too few candles), a failure
+ * is a symbol we asked about and got nothing for. Summing them would make a dead
+ * provider look like a thin watchlist.
+ */
+export interface AdvisoryPassCensus {
+  /** Symbols that produced an LLM-backed recommendation. */
+  advised: number;
+  /** Symbols that produced a DETERMINISTIC (zero-cost) recommendation. */
+  fellBack: number;
+  /** Symbols deliberately not asked about (insufficient candles). */
+  skipped: number;
+  /** Symbols asked about that produced nothing (throw / deadline). */
+  failed: number;
+}
+
+/** A census with every counter at zero — the shape a pass starts from. */
+export function emptyAdvisoryPassCensus(): AdvisoryPassCensus {
+  return { advised: 0, fellBack: 0, skipped: 0, failed: 0 };
 }
 
 /**

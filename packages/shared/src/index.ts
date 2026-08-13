@@ -4642,6 +4642,27 @@ export interface AgentRecommendation {
   costUsd: number;
   /** Wall-clock latency of the graph run, in ms. */
   latencyMs: number;
+  /**
+   * TRA-3514 (TRA-3460 (c)) — WHICH GRAPH PRODUCED THIS. `true` = a real, paid
+   * model round-trip backed the analysts/trader/risk panel; `false` = the
+   * DETERMINISTIC zero-cost fallback ran, because the layer was disabled, no
+   * credential was wired, or `tryReserveAgentSpend` found no headroom under the
+   * $0.50/day caps.
+   *
+   * ⭐ This field exists because the two graphs are OTHERWISE INDISTINGUISHABLE
+   * DOWNSTREAM. The deterministic fallback does not throw and does not abstain:
+   * it returns a schema-valid AgentRecommendation carrying a real-looking
+   * `conviction`, so a capped tail publishes numbers that render identically to
+   * a researched read. `costUsd` is NOT a usable proxy for it either - a cached
+   * or zero-billed real call also stamps 0.
+   *
+   * ⚠️ OPTIONAL BY DESIGN, and the ABSENT case is not "LLM-backed". Every
+   * recommendation minted by `adviseSymbol` carries it explicitly; absent means
+   * the object predates TRA-3514 or came from a non-advisory producer, and every
+   * consumer that gates on it must treat absent as NOT-PROVEN (see
+   * {@link shouldAutoConfirm}, which refuses on anything but `true`).
+   */
+  llmUsed?: boolean;
 }
 
 /**
@@ -4768,6 +4789,16 @@ export interface TradeProposal {
   kind?: ProposalKind;
   /** Present iff `kind === 'options'` — the defined-risk options payload. */
   option?: OptionProposalDetail;
+  /**
+   * TRA-3514 — the source recommendation's backing, snapshotted at creation
+   * (== {@link AgentRecommendation.llmUsed}). Carried on the proposal rather than
+   * re-read from the recommendation because `latestAgentRecommendations` is
+   * wholesale-replaced every rotation, so by the time an operator looks at the
+   * card the source object may be gone. `undefined` on an options-feed proposal
+   * (that path has no advisory graph behind it) and on any proposal minted before
+   * TRA-3514.
+   */
+  llmUsed?: boolean;
 }
 
 /**
@@ -4848,6 +4879,24 @@ export interface AutoConfirmInput {
    * equity proposal. Live still returns NO before this is ever read.
    */
   option?: AutoConfirmOptionInput;
+  /**
+   * TRA-3514 (TRA-3460 (c) §3) — was the recommendation behind this proposal
+   * backed by a REAL model call (== {@link AgentRecommendation.llmUsed})?
+   *
+   * Supply it from every call-site that has an advisory graph behind it; OMIT it
+   * from call-sites that do not (the options-IDEAS feed). When supplied, anything
+   * other than `true` REFUSES the auto-confirm — `undefined` is treated as
+   * not-proven, not as fine.
+   *
+   * This is the clause that protects the paper book once the Anthropic account is
+   * funded: at that point the $0.50/day cap starts denying reservations partway
+   * through a pass, and a denied reservation does NOT throw — it runs the
+   * deterministic zero-cost graph, which returns a schema-valid recommendation
+   * with a plausible `conviction`. Without this gate the auto-confirm rule
+   * (conviction >= 0.70 AND notional <= $250) would fire on a number no analyst
+   * produced.
+   */
+  agentBacked?: boolean;
 }
 
 export interface AutoConfirmDecision {
@@ -4870,6 +4919,9 @@ export interface AutoConfirmDecision {
  * single-lot max-loss <= $250. Live options auto-confirm is a hard NO (the live
  * branch returns first, before `option` is read).
  *
+ * TRA-3514 (TRA-3460 (c) §3) — when {@link AutoConfirmInput.agentBacked} is
+ * supplied it must be `true`, or the proposal is refused. See that field.
+ *
  * Otherwise the proposal stays pending for manual confirmation (never silently
  * dropped).
  */
@@ -4882,6 +4934,29 @@ export function shouldAutoConfirm(input: AutoConfirmInput): AutoConfirmDecision 
   }
   if (!input.autoTradeEnabled) {
     return { autoConfirm: false, reason: 'per-mode auto-trade toggle is OFF' };
+  }
+  // TRA-3514 — REFUSE A FALLBACK-BACKED READ. Placed ABOVE the equity/options
+  // split on purpose: this is a fact about where the NUMBERS came from, not about
+  // what instrument they price, so it must not be re-litigated once per proposal
+  // kind — and a future third kind inherits it for free.
+  //
+  // ⭐ The predicate is `!== true`, deliberately NOT `=== false`. The gate is
+  // about EVIDENCE, and `undefined` is the ABSENCE of evidence, not evidence of
+  // an LLM read — so an agent proposal whose backing went missing (a store
+  // round-trip, a producer that forgot to stamp it) fails CLOSED. The whole
+  // premise of the field is that a deterministic conviction is indistinguishable
+  // from a researched one; a gate that read absent-as-fine would restore exactly
+  // the hole it was added to close.
+  //
+  // ⚠️ Call-sites with no advisory graph behind them (the options-IDEAS feed,
+  // `autoConfirmOptionsIdea`) must OMIT `agentBacked` rather than pass `false` —
+  // the field is opt-in PER CALL-SITE, and omitting it is what keeps this clause
+  // from silently disabling a rail it was never about.
+  if (input.agentBacked !== undefined && input.agentBacked !== true) {
+    return {
+      autoConfirm: false,
+      reason: 'recommendation is NOT LLM-backed (deterministic fallback graph) — queued for manual approval',
+    };
   }
   // TRA-1142 — options proposals: defined-risk only, POP floor, single-lot
   // max-loss cap. Demo/paper only (live already returned above).

@@ -18,7 +18,17 @@ type Privates = {
   account: { applyEquity: (e: number) => void };
 };
 
-function buildApprove(symbol: string, asOf: number, conviction = 0.8, mode: 'demo' | 'live' = 'demo'): AgentRecommendation {
+// TRA-3514 — `llmUsed` now defaults to `true` here, and that default is the honest
+// one: `adviseSymbol` stamps EVERY recommendation it mints (true on the paid path,
+// false on the deterministic fallback), so an unstamped recommendation is not a state
+// production can reach. Pass `false` to exercise the fallback-read refusal.
+function buildApprove(
+  symbol: string,
+  asOf: number,
+  conviction = 0.8,
+  mode: 'demo' | 'live' = 'demo',
+  llmUsed = true,
+): AgentRecommendation {
   const proposedSignal: TradeSignal = {
     id: `agent-${symbol}-${asOf}`,
     symbol,
@@ -36,7 +46,7 @@ function buildApprove(symbol: string, asOf: number, conviction = 0.8, mode: 'dem
     verdict: 'APPROVE', analystReports: [], debateTranscript: { rounds: [], judgeSummary: '' },
     traderDecision: { action: 'BUY', conviction, proposedEntry: 100, proposedStop: 95, proposedTarget: 110, riskRewardRatio: 2, thesis: 'breakout', dissent: 'overbought' },
     riskVerdict: { verdict: 'APPROVE', sizeMultiplier: 0.6, panel: [], reasons: [] },
-    costUsd: 0, latencyMs: 1,
+    costUsd: 0, latencyMs: 1, llmUsed,
   } as unknown as AgentRecommendation;
 }
 
@@ -79,6 +89,45 @@ describe('SignalEngine — TRA-941 proposal queue + execution', () => {
     expect(audit[0]!.proposalId).toMatch(/^prop-/);
     // No longer pending once executed.
     expect(engine.getPendingProposals().length).toBe(0);
+  });
+
+  // ── TRA-3514 (TRA-3460 (c) §3) — acceptance #2, at the ENGINE boundary ──────
+  //
+  // ⭐ This is the pair the acceptance criterion actually asks for, and the value is
+  // in the pair, not either half. The test above and the test below are IDENTICAL in
+  // every input the ratified gate reads — same $1,000 equity, same $100 notional, same
+  // 0.80 conviction, same toggles — and differ in exactly ONE bit: `llmUsed`. So the
+  // first proves the rail still routes a real read (a refuse-everything clause would
+  // break it), and the second proves a fallback read cannot reach capital. Holding
+  // every other axis fixed is what makes the difference attributable to the backing.
+  it('REFUSES to auto-confirm the identical proposal when the read is a deterministic fallback', async () => {
+    const engine = await demoEngine(1_000);
+    engine.setTradingAgents(true);
+    priv(engine).latestAgentRecommendations = [buildApprove('AAPL', 1_000, 0.8, 'demo', false)];
+
+    await priv(engine).processAgentProposals(new Map([['AAPL', 100]]));
+
+    // Nothing reached capital...
+    expect(engine.getState().account.openPositions.some(p => p.symbol === 'AAPL')).toBe(false);
+    expect(engine.getAgentOrderAudit().length).toBe(0);
+    // ...but the proposal is NOT silently dropped either. The ticket is explicit that
+    // a fallback recommendation must still be published; it just waits for a human.
+    const pending = engine.getPendingProposals();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.symbol).toBe('AAPL');
+    // And the card carries the backing, so the panel can badge it after the
+    // recommendation set has rotated away.
+    expect(pending[0]!.llmUsed).toBe(false);
+  });
+
+  it('carries llmUsed:true onto the proposal for an LLM-backed read', async () => {
+    // The positive half of the snapshot: the field must not be write-only-false.
+    const engine = await demoEngine(); // large notional ⇒ stays pending, so we can read it
+    engine.setTradingAgents(true);
+    priv(engine).latestAgentRecommendations = [buildApprove('MSFT', 3_000)];
+
+    await priv(engine).processAgentProposals(new Map([['MSFT', 100]]));
+    expect(engine.getPendingProposals()[0]!.llmUsed).toBe(true);
   });
 
   it('queues (does NOT auto-confirm) a large-notional demo proposal; manual confirm routes it', async () => {

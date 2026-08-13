@@ -10,7 +10,7 @@ import {
   type LiveBrokerPositionDriftReport,
 } from './live-broker-position-drift.js';
 import { roundToCent } from '@trading-app/engine';
-import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
+import { WATCHLIST, isLiquidSwingSymbol, resolveEquitySwingModeEnabled, resolveEquitySwingUniverse, checkEquitySwingClose, MANAGED_ACCOUNT_RATIO, MAX_CONSECUTIVE_LOSSES, DAILY_DRAWDOWN_HALT_PCT, BOOK_SESSION_STOP_R, BOOK_SESSION_STOP_ARM_ABS_FLOOR_USD, BOOK_GIVEBACK_CAP_PCT, BOOK_GIVEBACK_ARM_FLOOR_R, BOOK_GIVEBACK_ARM_ABS_FLOOR_USD, TAKE_PROFIT_EARLY_CAPTURE_PCT, CORRELATED_EXPOSURE_CAP_PCT, CORRELATED_EXPOSURE_MIN_TRADE_RISK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_PCT, LIVE_EQUITY_STOP_MODIFY_MIN_TICK_ABS, LIVE_EQUITY_STOP_MODIFY_COOLDOWN_MS, DEFAULT_RISK_PER_TRADE, OPTIONS_PER_TICKET_DOLLAR_FLOOR, OPTIONS_POSITION_CAP_RATIO, aliasWatchlistSymbol, isLiveTradierOptionsEnabled, isStockMarketOpen, perPositionCap, resolveAutoManageImportedTradierOptions, resolveDemoCostModel, resolveHoldLiveOptionsOvernight, resolveSwingHoldOptions, resolveLiveTradeEquitiesTradier, resolveLiveEquityDcaAddsTradier, resolveManagedAccountRatio, resolveMarketReviewGatesEnabled, resolveRiskPerTrade, resolveRvDtePrefs, resolveTradierOptionsCreds, validateBracket, DEFAULT_RV_DTE_MIN, DEFAULT_RV_DTE_MAX, DEFAULT_RV_DTE_TARGET, scoreNewsSentiment, aggregateSymbolSentiment, aggregateFedSentiment, aggregateStockTwitsSentiment, dedupeStockTwitsMessages, mapCuratedMessagesBySymbol, nameAliasesFor, evaluateEquityDcaAdd, evaluateOptionDcaAdd, CONVICTION_DCA, EQUITY_DCA_MAX_SYMBOL_NOTIONAL_FRAC, capEquityAddQtyToSymbolNotional, blendedAverage, positionRiskDollars, minutesToSessionClose, getEasternUtcOffset, isAgentTradingWindowOpen } from '@trading-app/shared';
 import type { TradeSignal, RelativeValueSignal, OtmMispricingSignal, Sma200Signal, Candle, OptionsAccountState, SignalType, Position, OptionPosition, AccountMode, AccountSettings, AccountState, NewsItem, SymbolSentiment, SocialSentiment, StockTwitsMessage, TechnicalSignalSnapshot, TradierEnv, MarketReview, MarketReviewGates, EngineMarketReviewState, GatedStrategyNote, AgentRecommendation, TradeProposal, AgentOrderAudit, GuardrailVerdict, OptionType, PositionAdvisorRow, AdvisorSellPlan, AdvisorDcaPlan, ExitReason } from '@trading-app/shared';
 import { shouldAutoConfirm } from '@trading-app/shared';
 // TRA-2379 — feed-boundary plausibility check for a quote's published session move.
@@ -124,8 +124,14 @@ import { runBudgetedSweep, nextSweepDelayMs, sweepCursors, type SweepPass } from
 import {
   AGENTS_ADVISORY_SYMBOL_DEADLINE_MS,
   AGENTS_ADVISORY_BREAKER_COOLDOWN_MS,
+  ADVISORY_MAX_SYMBOLS_PER_PASS,
+  ADVISORY_PASSES_PER_SESSION,
+  buildAdvisoryShortlist,
+  emptyAdvisoryPassCensus,
   runAdvisorySweep,
   withSymbolDeadline,
+  type AdvisoryPassCensus,
+  type AdvisoryShortlist,
 } from './agents-advisory-bound.js';
 import { scanShortPremiumFromSnapshot, recordShortPremiumScan, type ShortPremiumScanResult } from './short-premium-scanner.js';
 import {
@@ -3083,6 +3089,36 @@ export class SignalEngine {
    * failure breaker tripped. 0 = armed. See AGENTS_ADVISORY_BREAKER_COOLDOWN_MS.
    */
   private agentsAdvisoryBreakerUntil = 0;
+  /**
+   * TRA-3514 (TRA-3460 (a)) — the ET session key (`YYYY-MM-DD`) whose ONE advised
+   * pass has already been spent, or null if this session has not spent it yet.
+   *
+   * ⭐ THE LATCH IS SET ONLY BY A COMPLETED PASS, and that asymmetry is the design.
+   * A pass stopped by the TRA-3442 failure breaker is not `complete`, so it does
+   * NOT burn the session — otherwise one provider hiccup at 09:46 would cost the
+   * entire day's advisory coverage, and the remedy (wait for tomorrow) would be
+   * wildly out of proportion to the fault. A pass that completes has DELIVERED the
+   * session's read, whatever the mix of advised/fell-back/skipped inside it, so it
+   * latches. The breaker's own 5-minute cooldown is what throttles the retry path;
+   * these two bounds compose rather than duplicating each other.
+   *
+   * ⚠️ Deliberately NOT reset by the stale-recommendation clear in `doTick`. The
+   * cap it exists to protect is a DAILY dollar budget, so a mid-session toggle of
+   * the layer off and on again must not buy a second paid pass — that is precisely
+   * the loop a per-tick cadence had.
+   */
+  private agentsAdvisoryPassSession: string | null = null;
+  /**
+   * TRA-3514 (TRA-3460 (c) §4) — the last advised pass's backing census and the
+   * shortlist it actually ran, kept for `/api/health/agents-advisory`.
+   *
+   * ⭐ Held as LIVE STATE rather than only logged because acceptance #3 asks for
+   * the bound "shown from the running process, not from the diff": a log line
+   * proves what a build INTENDED, a readout off the serving process proves what it
+   * DID. Both ship — the log for the durable tape, this for the live read.
+   */
+  private agentsAdvisoryCensus: AdvisoryPassCensus | null = null;
+  private agentsAdvisoryShortlist: AdvisoryShortlist | null = null;
   /**
    * TRA-3441 — the cold-bar candle sweep's last pass. An incomplete pass ALSO
    * freezes {@link candleScanTickCount}: the sink's universe is a rotating shard
@@ -13014,8 +13050,23 @@ export class SignalEngine {
    * because on 2026-08-12 "skip and continue" meant re-discovering one
    * non-retryable provider refusal 639 times per pass, 8 passes, for 732.6s of
    * tick wall clock and no recommendations at all.
+   *
+   * TRA-3514 (TRA-3460 (a)) — and the walk is now BOUNDED IN WIDTH AND CADENCE.
+   * `symbols` arrives as the full `getActiveSymbols()` universe and is REPLACED
+   * here by {@link buildAdvisoryShortlist}'s <= 8 names; the pass runs at most
+   * once per ET session. Both bounds are ceilings on paid reads against the
+   * $0.50/day company cap — see the sizing in agents-advisory-bound.ts.
    */
   private async runTradingAgentsAdvisory(symbols: string[]): Promise<void> {
+    // TRA-3514 — ONE ADVISED PASS PER ET SESSION. Checked here rather than in the
+    // caller's `if` on purpose: the caller's ELSE branch CLEARS
+    // `latestAgentRecommendations` and the sweep cursor (the stale-read guard),
+    // and a session already served must not read as a layer that went dark. So the
+    // latch returns early WITHOUT disturbing the published set, and the panel keeps
+    // showing the session's advisory read for the rest of the day.
+    const session = etDateKey(Date.now());
+    if (this.agentsAdvisoryPassSession === session) return;
+
     const llm = this.resolveAgentsLlm();
     // TRA-850 — read the owning user's persistent advisory PREFERENCES once for
     // the batch (risk tolerance, preferred/avoided strategies, a de-risk sizing
@@ -13031,6 +13082,19 @@ export class SignalEngine {
     const reviewBlock = this.tradingAgentsEnabled
       ? (await getLatestReviewBlock()) ?? undefined
       : undefined;
+    // TRA-3514 — BOUND THE WIDTH. `symbols` is `getActiveSymbols()`, 639 names, and
+    // the cap affords ~10 paid reads a DAY. The shortlist replaces it with the
+    // symbols an advisory read is actually worth spending on, most-committed-first.
+    const shortlist = buildAdvisoryShortlist({
+      openPositions: this.advisoryOpenPositionSymbols(),
+      pendingProposals: this.advisoryActiveInterestSymbols(),
+      // ⚠️ INTERSECTED with the live active universe, not used raw. The curated list
+      // is a static allow-list; a name on it that this engine is not tracking has no
+      // candle cache, so advising it would burn a slot to produce a `skipped`.
+      curated: resolveEquitySwingUniverse().filter(s => symbols.includes(s)),
+      max: ADVISORY_MAX_SYMBOLS_PER_PASS,
+    });
+    this.agentsAdvisoryShortlist = shortlist;
     // TRA-3442 — bounded + cursored. On the 2026-08-12 RTH tape this walk ran the
     // WHOLE 639-symbol universe serially, 8 times, at ~130ms/symbol, with all
     // 5,184 per-symbol calls failing on one non-retryable Anthropic 400 ("credit
@@ -13040,15 +13104,43 @@ export class SignalEngine {
     // the same systemic refusal 639 times. See agents-advisory-bound.ts.
     let firstFailure: string | null = null;
     const key = `${this.mode}:agents-advisory`;
+    // TRA-3514 (§4) — the per-pass backing census. Accumulated by `adviseOneSymbol`
+    // so `advised` vs `fellBack` is counted where the fact is KNOWN, rather than
+    // re-derived afterwards from the published set (which cannot see a skip or a
+    // failure at all, and so could never have produced a denominator).
+    const census = emptyAdvisoryPassCensus();
     const { pass, breakerTripped, maxConsecutiveFailures, failures: failuresThisPass } =
       await runAdvisorySweep({
         key,
-        symbols,
-        advise: (sym) => this.adviseOneSymbol(sym, { llm, userMemory, reviewBlock }, (err) => {
+        symbols: shortlist.symbols,
+        advise: (sym) => this.adviseOneSymbol(sym, { llm, userMemory, reviewBlock, census }, (err) => {
           if (firstFailure == null) firstFailure = `${sym}: ${err}`;
         }),
       });
     this.agentsAdvisorySweep = pass;
+    this.agentsAdvisoryCensus = census;
+
+    // TRA-3514 (§4) — ONE line per pass carrying the backing split, so the
+    // positional bias the parent inferred is now MEASURED. Logged at info (not
+    // debug) because this is the number Part 4 has to report off the first funded
+    // session, and `dropped` is logged even when zero so a silent cap is impossible
+    // to mistake for full coverage.
+    log.info('agents-advisory: pass census (TRA-3514)', {
+      component: 'agents-advisory',
+      session,
+      advised: census.advised,
+      fellBack: census.fellBack,
+      skipped: census.skipped,
+      failed: census.failed,
+      shortlisted: shortlist.symbols.length,
+      candidates: shortlist.candidates,
+      dropped: shortlist.dropped,
+      maxPerPass: ADVISORY_MAX_SYMBOLS_PER_PASS,
+      universeOffered: symbols.length,
+      symbols: shortlist.symbols,
+      reasons: shortlist.reasons,
+      complete: pass.complete,
+    });
 
     if (breakerTripped) {
       this.agentsAdvisoryBreakerUntil = Date.now() + AGENTS_ADVISORY_BREAKER_COOLDOWN_MS;
@@ -13081,7 +13173,101 @@ export class SignalEngine {
     if (pass.complete) {
       this.latestAgentRecommendations = [...this.pendingAgentRecos.values()];
       this.pendingAgentRecos.clear();
+      // TRA-3514 — LATCH THE SESSION, and only here. `pass.complete` is the single
+      // condition under which the session's advisory read has actually been
+      // delivered, which is why the latch shares a branch with the publish rather
+      // than sitting at the top of the function: a pass the breaker stopped, or one
+      // the budget truncated, leaves this null and is retried.
+      this.agentsAdvisoryPassSession = session;
     }
+  }
+
+  /**
+   * TRA-3514 (acceptance #3) — the LIVE advisory bound, read off the serving
+   * process. Published on `GET /api/health/agents-advisory`.
+   *
+   * ⭐ Reports the shipped ceilings AND what the last pass actually did, side by
+   * side, because only the pair is evidence. The constants alone are a claim about
+   * the build (the diff already says that); `lastPass` alone cannot show a bound
+   * that has not yet been hit. `sessionLatched` is the cadence bound's only
+   * observable — nothing else in the process distinguishes "one pass, done" from
+   * "the layer is off".
+   */
+  getAgentsAdvisoryBound(now = Date.now()): {
+    maxSymbolsPerPass: number;
+    passesPerSession: number;
+    session: string;
+    sessionLatched: boolean;
+    latchedSession: string | null;
+    breakerCooldownUntil: number | null;
+    lastPass: {
+      census: AdvisoryPassCensus;
+      symbols: string[];
+      reasons: Record<string, string>;
+      shortlisted: number;
+      candidates: number;
+      dropped: number;
+      complete: boolean;
+    } | null;
+  } {
+    const session = etDateKey(now);
+    const sl = this.agentsAdvisoryShortlist;
+    const census = this.agentsAdvisoryCensus;
+    return {
+      maxSymbolsPerPass: ADVISORY_MAX_SYMBOLS_PER_PASS,
+      passesPerSession: ADVISORY_PASSES_PER_SESSION,
+      session,
+      sessionLatched: this.agentsAdvisoryPassSession === session,
+      latchedSession: this.agentsAdvisoryPassSession,
+      breakerCooldownUntil:
+        this.agentsAdvisoryBreakerUntil > now ? this.agentsAdvisoryBreakerUntil : null,
+      lastPass: sl && census
+        ? {
+          census,
+          symbols: sl.symbols,
+          reasons: sl.reasons,
+          shortlisted: sl.symbols.length,
+          candidates: sl.candidates,
+          dropped: sl.dropped,
+          complete: this.agentsAdvisorySweep?.complete ?? false,
+        }
+        : null,
+    };
+  }
+
+  /**
+   * TRA-3514 — the symbols this engine holds an OPEN position in: the equity paper
+   * book plus the open options underlyings. Highest shortlist priority, because
+   * these are the names where an advisory read has something to act on.
+   */
+  private advisoryOpenPositionSymbols(): string[] {
+    const out: string[] = [];
+    for (const p of this.account.getState().openPositions) out.push(p.symbol);
+    // The options book is keyed by the UNDERLYING on `symbol` (`optionSymbol` holds
+    // the OCC contract), which is what the advisory graph takes.
+    for (const p of this.optionsAccount.getState().openOptions) {
+      if (p.symbol) out.push(p.symbol);
+    }
+    return out;
+  }
+
+  /**
+   * TRA-3514 — ACTIVE INTEREST: symbols carrying a proposal this desk has not
+   * finished with. `pending` is the obvious one; `approved` is included because an
+   * approved-but-not-yet-executed proposal is still an open intention.
+   *
+   * ⚠️ Scoped to THIS engine's user and mode. The proposal store is process-global
+   * and shared across the fleet's books, so an unscoped read would let another
+   * user's queue spend this book's advisory budget.
+   */
+  private advisoryActiveInterestSymbols(): string[] {
+    const out: string[] = [];
+    for (const status of ['pending', 'approved'] as const) {
+      for (const p of listProposals({ user: this.alertUsername, status })) {
+        if (p.mode === this.mode && p.symbol) out.push(p.symbol);
+      }
+    }
+    return out;
   }
 
   /**
@@ -13089,6 +13275,10 @@ export class SignalEngine {
    * {@link AGENTS_ADVISORY_SYMBOL_DEADLINE_MS}. Returns true iff a recommendation
    * was produced; a skipped symbol (too few candles) counts as a success, because
    * it is not evidence about the provider and must not feed the failure breaker.
+   *
+   * TRA-3514 (§4) — also accumulates `ctx.census`. The three outcomes the sweep's
+   * boolean CANNOT distinguish (advised / fell back / skipped) are counted here
+   * because this is the only frame that knows which happened.
    */
   private async adviseOneSymbol(
     sym: string,
@@ -13096,13 +13286,21 @@ export class SignalEngine {
       llm: LlmClient | null;
       userMemory: ReturnType<typeof getUserMemorySync>;
       reviewBlock: NonNullable<Awaited<ReturnType<typeof getLatestReviewBlock>>> | undefined;
+      census?: AdvisoryPassCensus;
     },
     onFailure: (err: string) => void,
   ): Promise<boolean> {
-    const { llm, userMemory, reviewBlock } = ctx;
+    const { llm, userMemory, reviewBlock, census } = ctx;
     {
       const candles = this.candleCache.get(sym) ?? [];
-      if (candles.length < 15) return true;
+      if (candles.length < 15) {
+        // TRA-3514 — a SKIP, counted as its own fact. The ticket is explicit that a
+        // missing symbol and a deterministically-advised symbol are different
+        // facts; this is the third one, and folding it into either would make a thin
+        // candle cache look like provider degradation (or vice versa).
+        if (census) census.skipped++;
+        return true;
+      }
       const asOf = candles[candles.length - 1]!.timestamp;
       // TRA-596 — feed the real upcoming-earnings count into the fundamental
       // analyst. `earningsInDaysSync` reads the boot-loaded calendar cache and
@@ -13121,7 +13319,7 @@ export class SignalEngine {
       // makes the analyst abstain, so this stays additive like the news feed.
       const social = this.getSocialSentiment(sym);
       try {
-        const { recommendation } = await withSymbolDeadline(
+        const { recommendation, llmUsed } = await withSymbolDeadline(
           sym,
           AGENTS_ADVISORY_SYMBOL_DEADLINE_MS,
           () => adviseSymbol(
@@ -13129,6 +13327,14 @@ export class SignalEngine {
             { user: this.alertUsername, enabled: this.tradingAgentsEnabled, llm },
           ),
         );
+        // TRA-3514 (§4) — count the BACKING, not just the outcome. `llmUsed === false`
+        // is a published recommendation whose conviction came from the zero-cost
+        // graph: it is NOT a failure (the consumer needs it, per the ticket's "do not
+        // silently drop fallback recommendations"), and it is NOT a real read either.
+        if (census) {
+          if (llmUsed) census.advised++;
+          else census.fellBack++;
+        }
         this.pendingAgentRecos.set(sym, recommendation);
         return true;
       } catch (err) {
@@ -13136,6 +13342,7 @@ export class SignalEngine {
         // 2026-08-12 window emitted 5,184 of these in 15 minutes, all identical,
         // on a box whose log volume already makes an unfiltered walk impossible.
         // The per-PASS summary above is the line that survives.
+        if (census) census.failed++;
         logger.debug('trading-agents advisory failed for symbol', { sym, err: String(err) });
         onFailure(String(err));
         return false;
@@ -14421,6 +14628,11 @@ export class SignalEngine {
         mode: this.mode,
         conviction: reco.conviction,
         verdict: reco.verdict,
+        // TRA-3514 — snapshot the backing onto the proposal. `latestAgentRecommendations`
+        // is wholesale-replaced each rotation, so by the time an operator reads the
+        // card the source recommendation may be gone; the panel badge has to read a
+        // field the proposal owns.
+        ...(reco.llmUsed !== undefined ? { llmUsed: reco.llmUsed } : {}),
         ...(reco.traderDecision?.thesis ? { note: reco.traderDecision.thesis } : {}),
         createdAt: now,
       });
@@ -14436,9 +14648,28 @@ export class SignalEngine {
         notional: proposal.notional,
         autoTradeEnabled: this.isAutoTradingEnabled(),
         killSwitchClear: this.killSwitchClearForExecution(),
+        // TRA-3514 (TRA-3460 (c) §3) — a deterministic-backed read must not
+        // auto-route. Passed ALWAYS, and coerced with `=== true` so an unstamped
+        // recommendation reads as not-proven rather than as LLM-backed. That is the
+        // fail-closed direction and it costs a manual confirm, nothing more.
+        agentBacked: reco.llmUsed === true,
       });
       if (decision.autoConfirm) {
         await this.confirmProposalById(proposal.id, price);
+      } else if (reco.llmUsed !== true) {
+        // TRA-3514 (§3) — THE LOGGED REFUSAL the acceptance criterion asks for. At
+        // `warn` because a proposal reaching the auto-confirm gate on a fallback
+        // read means the $0.50 cap is denying reservations mid-pass, which is a
+        // cost/coverage event someone should see, not routine flow.
+        log.warn('agent-proposals: auto-confirm REFUSED — recommendation is not LLM-backed (TRA-3514)', {
+          component: 'agent-proposals',
+          symbol: reco.symbol,
+          proposalId: proposal.id,
+          conviction: reco.conviction,
+          notional: proposal.notional,
+          llmUsed: reco.llmUsed ?? null,
+          reason: decision.reason,
+        });
       }
     }
   }

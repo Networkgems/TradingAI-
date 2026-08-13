@@ -70,6 +70,13 @@ export interface CreateProposalInput {
   verdict: AgentRecommendation['verdict'];
   note?: string;
   createdAt: number;
+  /**
+   * TRA-3514 — the source recommendation's backing
+   * (== {@link AgentRecommendation.llmUsed}). Snapshotted onto the proposal so the
+   * card can distinguish a researched conviction from a deterministic one after
+   * the recommendation set has rotated away.
+   */
+  llmUsed?: boolean;
 }
 
 function userKey(user: string | undefined): string {
@@ -102,6 +109,11 @@ export function createProposal(input: CreateProposalInput): TradeProposal {
     mode: input.mode,
     conviction: input.conviction,
     verdict: input.verdict,
+    // TRA-3514 — carried only when the caller knew; `undefined` stays absent rather
+    // than becoming `false`, so "not stated" and "deterministic" remain distinct on
+    // the stored object. The auto-confirm gate is what collapses them, and it does
+    // so in the refusing direction.
+    ...(input.llmUsed !== undefined ? { llmUsed: input.llmUsed } : {}),
     ...(input.note ? { note: input.note } : {}),
     createdAt: input.createdAt,
     status: 'pending',

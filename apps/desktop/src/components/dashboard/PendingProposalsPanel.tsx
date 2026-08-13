@@ -332,7 +332,27 @@ function ProposalCard({
 }) {
   const isLive = p.mode === 'live';
   const convPct = Math.round(p.conviction * 100);
-  const convOk = p.conviction >= AUTO_CONFIRM_MIN_CONVICTION;
+  // TRA-3514 (TRA-3460 (c) §2) — WHICH GRAPH PRODUCED THIS CONVICTION.
+  //
+  // ⭐ `=== true`, not `!== false`: an equity/agent proposal that arrives without the
+  // stamp has not PROVEN an LLM read, and the server's auto-confirm gate refuses it
+  // on exactly that reading. The panel must not be more optimistic than the gate, or
+  // an operator reads a green conviction on a card the server already declined to
+  // route and concludes the difference is a bug.
+  //
+  // ⚠️ `kind === 'options'` proposals come from the AI-Ideas feed, which has no
+  // advisory graph behind it, so they legitimately carry no stamp and are exempted
+  // rather than badged FALLBACK. Badging them would be a false alarm on every card
+  // in the options queue — an unexplained warning on a healthy rail teaches
+  // operators to ignore the badge, which costs us the one case it exists for.
+  const backingKnown = p.kind !== 'options';
+  const llmBacked = p.llmUsed === true;
+  const isFallbackRead = backingKnown && !llmBacked;
+  // The conviction number itself is DE-EMPHASISED on a fallback read, not just
+  // annotated. The requirement is that it "must not render identically to a real
+  // one", and a badge elsewhere in the header is easy to miss while reading the
+  // number — so the number stops being green even when it clears the threshold.
+  const convOk = p.conviction >= AUTO_CONFIRM_MIN_CONVICTION && !isFallbackRead;
   // TRA-945 §2 — near-TTL staleness: once a pending proposal ages into the warn
   // window the server reported (proposalTtlMs), grey it out and disable Approve
   // with a "stale — re-request" hint, rather than letting it silently vanish at
@@ -373,6 +393,23 @@ function ProposalCard({
             STALE
           </span>
         )}
+        {/* TRA-3514 §2 — the backing badge. Shown in BOTH directions on purpose: a
+            silent card would leave the operator unable to tell "LLM-backed" from
+            "this build does not report backing", and an absent badge is exactly what
+            the old build looked like. */}
+        {backingKnown && (
+          <span
+            className="signal-side"
+            title={isFallbackRead
+              ? 'Conviction came from the DETERMINISTIC zero-cost graph (no model call — the daily LLM cap was reached, the layer was off, or no credential was wired). Auto-confirm is refused on this read; approve only on your own judgement.'
+              : 'Conviction came from a real LLM analyst/trader/risk run.'}
+            style={isFallbackRead
+              ? { background: 'var(--orange-soft, var(--surface))', color: 'var(--orange)', border: '1px solid var(--orange)', fontWeight: 700 }
+              : { background: 'var(--surface)', color: 'var(--text-dim)', border: '1px solid var(--border)' }}
+          >
+            {isFallbackRead ? '⚠ FALLBACK — no LLM read' : 'LLM-backed'}
+          </span>
+        )}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-dim)' }}>
           🕑 {relAge(p.createdAt, now)}
         </span>
@@ -381,12 +418,32 @@ function ProposalCard({
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, margin: '8px 0', fontSize: 12 }}>
         <Stat label="Size" value={String(p.size)} />
         <Stat label="Notional" value={`$${p.notional.toFixed(0)}`} />
-        <Stat label="Conviction" value={`${convPct}%`} valueColor={convOk ? 'var(--green)' : 'var(--orange)'} />
+        <Stat
+          label={isFallbackRead ? 'Conviction (deterministic)' : 'Conviction'}
+          value={`${convPct}%`}
+          valueColor={convOk ? 'var(--green)' : 'var(--orange)'}
+        />
         <Stat label="Verdict" value={p.verdict} />
       </div>
       <div style={{ height: 4, background: 'var(--border)', borderRadius: 2, marginBottom: 8 }}>
-        <div style={{ width: `${convPct}%`, height: '100%', borderRadius: 2, background: convOk ? 'var(--green)' : 'var(--orange)' }} />
+        <div
+          style={{
+            width: `${convPct}%`,
+            height: '100%',
+            borderRadius: 2,
+            background: convOk ? 'var(--green)' : 'var(--orange)',
+            // A hatched/faded bar on a fallback read, so the AT-A-GLANCE signal (bar
+            // length) is visibly not a researched measurement either.
+            ...(isFallbackRead ? { opacity: 0.45 } : {}),
+          }}
+        />
       </div>
+      {isFallbackRead && (
+        <p style={{ margin: '0 0 8px', fontSize: 11, color: 'var(--orange)' }}>
+          No model call backed this recommendation — the numbers above come from the
+          deterministic fallback graph. Auto-confirm is refused on a fallback read.
+        </p>
+      )}
 
       {p.note && <p style={{ margin: '0 0 8px', fontSize: 12, color: 'var(--text-dim)' }}>{p.note}</p>}
 

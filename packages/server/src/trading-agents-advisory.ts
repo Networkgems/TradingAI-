@@ -220,12 +220,27 @@ export async function adviseSymbol(
   };
 
   try {
-    const recommendation = await runAgentGraph(input, deps);
+    const graphResult = await runAgentGraph(input, deps);
     if (reservation) {
       // Reconcile the in-flight hold to the call's real cost. Only real, non-cached
       // spend is booked (the deterministic path stamps 0 → the hold is just released).
-      commitReservation(reservation, recommendation.costUsd, now);
+      commitReservation(reservation, graphResult.costUsd, now);
     }
+    // TRA-3514 (TRA-3460 (c) §1) — STAMP THE BACKING ONTO THE RECOMMENDATION, not
+    // just onto the AdviseResult beside it.
+    //
+    // ⭐ This is the whole fix, and the placement IS the fix. `llmUsed` has been on
+    // `AdviseResult` since TRA-747 and every caller destructured `{ recommendation }`
+    // and dropped it — which is not a caller bug so much as an invitation: the
+    // provenance lived on a wrapper that gets unwrapped one line later, while the
+    // object that actually travels (into `pendingAgentRecos`, then
+    // `latestAgentRecommendations`, then the WS payload, then a TradeProposal) had
+    // no room for it. Putting it ON the travelling object means a consumer cannot
+    // lose it by accident; it has to strip it on purpose.
+    //
+    // Returned on BOTH the recommendation and the result: the duplicate is
+    // deliberate, so no existing reader of `AdviseResult.llmUsed` breaks.
+    const recommendation = { ...graphResult, llmUsed: useLlm };
     return { recommendation, llmUsed: useLlm, routedToCapital: false };
   } catch (err) {
     // The paid call threw — release the hold so a transient failure can't leak budget

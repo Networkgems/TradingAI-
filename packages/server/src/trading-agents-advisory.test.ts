@@ -301,3 +301,126 @@ describe('buildNewsHeadlines (TRA-795 news feed wiring)', () => {
     expect(buildNewsHeadlines(cache, 'NVDA', asOf)).toEqual([]);
   });
 });
+
+// ── TRA-3514 (TRA-3460 (c) §1) — the backing stamp on the RECOMMENDATION ─────
+//
+// The pre-existing tests above already assert `AdviseResult.llmUsed`. That field has
+// been correct since TRA-747 and was still discarded by the only caller, because it
+// lived on a wrapper that gets unwrapped one line later. These tests assert it on the
+// object that actually TRAVELS downstream — which is the whole of the fix.
+describe('adviseSymbol — stamps llmUsed onto the recommendation itself (TRA-3514)', () => {
+  it('stamps true on the LLM path', async () => {
+    const llm = cannedLlm(0.001);
+    const r = await adviseSymbol(input, { user: 'stamp-a', enabled: true, llm, now: NOW });
+    expect(r.llmUsed).toBe(true);
+    expect(r.recommendation.llmUsed).toBe(true);
+    // The wrapper and the stamped object must never disagree — a consumer reading
+    // either one has to reach the same conclusion.
+    expect(r.recommendation.llmUsed).toBe(r.llmUsed);
+  });
+
+  it('stamps false on the DETERMINISTIC fallback — the read the panel must not trust', async () => {
+    // No llm wired at all: the zero-cost graph runs.
+    const r = await adviseSymbol(input, { user: 'stamp-b', enabled: true, llm: null, now: NOW });
+    expect(r.llmUsed).toBe(false);
+    expect(r.recommendation.llmUsed).toBe(false);
+    // ⭐ The fallback is NOT an abstention and NOT a throw: it publishes a
+    // schema-valid recommendation carrying a real-looking conviction. This assertion
+    // IS the defect statement — without the stamp there is nothing on this object to
+    // distinguish it from the LLM-backed one above.
+    expect(r.recommendation.symbol).toBe('AAA');
+    expect(typeof r.recommendation.conviction).toBe('number');
+    expect(r.recommendation.costUsd).toBe(0);
+  });
+
+  it('stamps false when the banner toggle is OFF', async () => {
+    const llm = cannedLlm(0.001);
+    const r = await adviseSymbol(input, { user: 'stamp-c', enabled: false, llm, now: NOW });
+    expect(r.recommendation.llmUsed).toBe(false);
+    expect(llm.calls).toBe(0);
+  });
+
+  it('stamps false on the CAP-DENIED tail — the case that arms on the first funded session', async () => {
+    const llm = cannedLlm(0.001);
+    // Park the user at the cap so `tryReserveAgentSpend` returns null.
+    recordAgentSpend('stamp-d', 999, NOW);
+    const r = await adviseSymbol(input, { user: 'stamp-d', enabled: true, llm, now: NOW });
+    expect(r.llmUsed).toBe(false);
+    expect(r.recommendation.llmUsed).toBe(false);
+    expect(llm.calls).toBe(0);
+  });
+
+  it('costUsd is NOT a usable proxy for the backing (why the field had to be added)', async () => {
+    // A real, LLM-backed run that happened to bill $0 stamps `llmUsed: true` while
+    // `costUsd` is 0 — identical to the fallback on the cost axis. Anyone tempted to
+    // infer backing from cost would read this row backwards.
+    const free = cannedLlm(0);
+    const r = await adviseSymbol(input, { user: 'stamp-e', enabled: true, llm: free, now: NOW });
+    expect(r.recommendation.costUsd).toBe(0);
+    expect(r.recommendation.llmUsed).toBe(true);
+    expect(free.calls).toBeGreaterThan(0);
+  });
+});
+
+// ── TRA-3514 Part 3 — the reservation-estimate question, pinned in code ──────
+describe('TRA-3514 Part 3 — the $2 default does NOT gate the first reservation', () => {
+  it('K is not 0: a serial walk gets real reads until COMMITTED spend reaches the cap', async () => {
+    const savedUser = process.env['TRADING_AGENTS_DAILY_USER_USD_CAP'];
+    const savedCo = process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'];
+    const savedEst = process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'];
+    // Reproduce bqb1: $0.50 caps, reservation estimate UNSET (so the $2 default).
+    process.env['TRADING_AGENTS_DAILY_USER_USD_CAP'] = '0.50';
+    process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'] = '0.50';
+    delete process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'];
+    try {
+      resetAgentSpendForTests();
+      // 6 calls/run at $0.01 => $0.06 committed per advised symbol.
+      const llm = cannedLlm(0.01);
+      const backings: boolean[] = [];
+      // SERIAL, exactly as runAdvisorySweep walks it (batchSize 1, awaited).
+      for (let i = 0; i < 12; i++) {
+        const r = await adviseSymbol(input, { user: 'k', enabled: true, llm, now: NOW });
+        backings.push(r.llmUsed);
+      }
+      const advised = backings.filter(Boolean).length;
+      // ⭐ THE ANSWER. If the $2 estimate gated the first reservation, this would be 0.
+      // It is not: the guard is an AT-CAP test on booked spend, and the $2 hold is
+      // released before the next symbol checks.
+      expect(advised).toBeGreaterThan(0);
+      // And K is bounded by COMMITTED spend, not by the estimate: $0.50 / $0.06 = 8.
+      expect(advised).toBe(9); // symbols 1..9 admitted; the 9th tips the total over $0.50
+      expect(backings.slice(advised).every(b => b === false)).toBe(true);
+      // The tail is the defect Part 1 makes visible: real recommendations, fake backing.
+      expect(backings[11]).toBe(false);
+    } finally {
+      if (savedUser === undefined) delete process.env['TRADING_AGENTS_DAILY_USER_USD_CAP'];
+      else process.env['TRADING_AGENTS_DAILY_USER_USD_CAP'] = savedUser;
+      if (savedCo === undefined) delete process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'];
+      else process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'] = savedCo;
+      if (savedEst !== undefined) process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'] = savedEst;
+      resetAgentSpendForTests();
+    }
+  });
+
+  it('but the $2 default DOES deny every CONCURRENT call at a $0.50 cap', async () => {
+    const savedCo = process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'];
+    const savedEst = process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'];
+    process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'] = '0.50';
+    delete process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'];
+    try {
+      resetAgentSpendForTests();
+      const llm = cannedLlm(0.01);
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => adviseSymbol(input, { user: 'conc', enabled: true, llm, now: NOW })),
+      );
+      // Exactly ONE reservation fits: the first books $2.00 of in-flight hold, which is
+      // 4x the whole company cap, so every sibling is denied and silently degraded.
+      expect(results.filter(r => r.llmUsed).length).toBe(1);
+    } finally {
+      if (savedCo === undefined) delete process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'];
+      else process.env['TRADING_AGENTS_COMPANY_DAILY_USD_CAP'] = savedCo;
+      if (savedEst !== undefined) process.env['TRADING_AGENTS_CALL_COST_ESTIMATE_USD'] = savedEst;
+      resetAgentSpendForTests();
+    }
+  });
+});

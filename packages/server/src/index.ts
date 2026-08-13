@@ -460,7 +460,15 @@ import {
   describeUserAnthropicApiKey,
 } from './anthropic-cred-store.js';
 import { optionsSpendStatus } from './options-spend-store.js';
-import { agentSpendAggregate } from './agent-spend-store.js';
+import { agentSpendAggregate, callCostEstimateUsd, companyDailyCapUsd } from './agent-spend-store.js';
+// TRA-3514 (TRA-3460) — the advisory universe/cadence bound, published on
+// /api/health/agents-advisory so acceptance #3 can be graded off the running process.
+import {
+  ADVISORY_MAX_SYMBOLS_PER_PASS,
+  ADVISORY_PASSES_PER_SESSION,
+  ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE,
+  advisoryWorstDailyUsd,
+} from './agents-advisory-bound.js';
 import { executionCapStatus } from './agent-execution-caps-store.js';
 import { proposalTtlMs } from './proposal-store.js';
 import {
@@ -6875,6 +6883,57 @@ app.get('/api/health/agent-spend', (_req, res) => {
   // read-only signal an operator/probe has that durability is actually engaged on
   // Render, since no agent can read the boot log directly.
   res.json({ ...agentSpendAggregate(), durable: getStateDb() !== null });
+});
+
+// TRA-3514 (TRA-3460 (a)+(c)) — the advisory UNIVERSE + CADENCE bound, read off the
+// serving process rather than off the diff (acceptance #3), plus the per-pass
+// BACKING census (acceptance #1/#4).
+//
+// ⭐ Why this route exists at all, when the same numbers are in the log: a log line
+// proves what a build INTENDED, and the standing rule on this repo is that a merged
+// PR is not a live state. This surface is the only thing that can answer "is the
+// bound actually in force on the box right now" — including in the boring case where
+// the layer is off and no pass has ever run, which is exactly the state a
+// pre-deployment probe will find and must be able to read honestly.
+//
+// ⚠️ `perBook.lastPass: null` means NO PASS HAS RUN IN THIS PROCESS, which is NOT the
+// same as a pass that ran and advised nothing. Do not grade a zero off a null — the
+// distinction is why `census` is nested inside `lastPass` rather than flattened with
+// zero defaults, and it is the difference between "bound not yet exercised" and
+// "bound exercised and everything fell back".
+//
+// Unauthenticated, matching /api/health/agent-spend: it carries symbol shortlists and
+// counters, no balances and no trade detail. Usernames are included because the cap
+// is per-user and a fleet reader needs to know which book spent the session.
+app.get('/api/health/agents-advisory', (_req, res) => {
+  const nowMs = Date.now();
+  const perBook: unknown[] = [];
+  for (const ctx of getAllUserContexts()) {
+    perBook.push({ user: ctx.username, ...ctx.engine.getAgentsAdvisoryBound(nowMs) });
+  }
+  res.json({
+    ok: true,
+    issue: 'TRA-3514',
+    time: new Date(nowMs).toISOString(),
+    build: resolveBuildInfo(),
+    // The affordability arithmetic, evaluated against the LIVE cap — so a reader
+    // does not have to multiply three numbers from three places to check it.
+    sizing: {
+      maxSymbolsPerPass: ADVISORY_MAX_SYMBOLS_PER_PASS,
+      passesPerSession: ADVISORY_PASSES_PER_SESSION,
+      perSymbolCostUsdEstimate: ADVISORY_PER_SYMBOL_COST_USD_ESTIMATE,
+      worstDailyUsd: advisoryWorstDailyUsd(),
+      companyDailyCapUsd: companyDailyCapUsd(),
+      affordable: advisoryWorstDailyUsd() <= companyDailyCapUsd(),
+      // TRA-3514 Part 3 — the in-flight reservation estimate. At the $2 default this
+      // is 4x the whole company cap, which cannot deny the FIRST reservation (the
+      // guard is an at-cap test, not a would-exceed test) but denies every
+      // CONCURRENT one. Published so the value is checkable without log access.
+      callCostEstimateUsd: callCostEstimateUsd(),
+      reservationExceedsCap: callCostEstimateUsd() > companyDailyCapUsd(),
+    },
+    perBook,
+  });
 });
 
 // TRA-601 (TRA-595 C6) — the forward-test report. Re-prices every surfaced idea
