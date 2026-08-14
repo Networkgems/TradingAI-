@@ -468,6 +468,10 @@ import {
   isOptionLiveOtmEnabled,
   isOptionLiveTestWindowOpen,
   isOptionLiveDirectionalEnabled,
+  // TRA-3689 — the EFFECTIVE arms (flag AND window), i.e. what the order sites call.
+  isOptionLiveOtmArmed,
+  isOptionLiveRvLongArmed,
+  parseOptionLiveTestUntil,
 } from './option-exec-flag.js';
 import { runIdeasAutoExecute } from './options-ideas-auto-execute.js';
 import {
@@ -10263,6 +10267,41 @@ app.get('/api/health/options-live', async (_req, res) => {
       // flag AND `liveTestWindowOpen` (see /api/health/live-options-fee-slippage).
       liveOtmArmed: isOptionLiveOtmEnabled(process.env),
       liveTestWindowOpen: isOptionLiveTestWindowOpen(process.env),
+      // TRA-3689 — the EFFECTIVE arm, published on the route people actually read.
+      //
+      // The three fields above whose names end in `Armed` are NOT arms. Each is the
+      // raw env boolean (`isOptionLive*Enabled`); the value every order-decision site
+      // consults is that boolean AND the window (`isOptionLiveOtmArmed`, called at
+      // the `buy_to_open` site in signal-engine). A reader who takes `liveOtmArmed`
+      // at its name has read one conjunct of a two-conjunct predicate under a name
+      // that claims to be the whole thing — and there is no way to tell from the
+      // payload that a second conjunct exists. That is not hypothetical: the
+      // QuantTrader read `liveOtmArmed: true` + `liveTestWindowOpen: true` off this
+      // route on 2026-08-14 and had to ask which field separated armed-and-routing
+      // from armed-and-held, because this route published neither.
+      //
+      // The names above are LEFT ALONE rather than corrected: they are the documented
+      // read for TRA-1490/TRA-1491 and renaming them breaks every existing reader
+      // silently. These are added BESIDE them, computed by the same pure functions
+      // /api/health/live-options-fee-slippage `arm.*` uses, so the two routes cannot
+      // disagree.
+      //
+      // ⭐ `liveOtmRouting` is THE field. true ⇒ the live OTM entry site will open a
+      // real-money `buy_to_open` for any candidate that clears the per-candidate
+      // filters below it (underlying allowlist, cost bar, ask/balance/cap guards).
+      // Those filters are FILTERS, NOT A HOLD — the cost bar's measured retained
+      // block rate is 0.9928, which still passes 0.72% of nominees.
+      //
+      // ⚠️ `liveTestUntilIso` is the horizon, and it is the number that bounds this,
+      // not the word "test" in the var name. Publish it next to the boolean so a
+      // standing multi-month arm cannot read as a bounded experiment (TRA-2914).
+      // null ⇒ unset/malformed ⇒ window CLOSED (fail-closed) ⇒ both sleeves dark.
+      liveOtmRouting: isOptionLiveOtmArmed(process.env),
+      liveRvLongRouting: isOptionLiveRvLongArmed(process.env),
+      liveTestUntilIso: (() => {
+        const until = parseOptionLiveTestUntil(process.env);
+        return until === null ? null : new Date(until).toISOString();
+      })(),
       // TRA-2820 — is the LIVE open book actually under management? A row with
       // `stopLossPremium: 0` reads identically whether that is a decision or a
       // dropped schedule, and on 2026-08-04 eight live contracts / $216 of real
