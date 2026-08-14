@@ -94,9 +94,20 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
       coverage: { realizedCoverage: number | null; marketDaysMissing: string[] };
       consecutiveMissingSessions: number;
       note: string;
+      degraded: boolean;
+      attention: boolean;
+      signalNote: string;
+      signalClasses: { sessionsTrip: number; sessionsDegradedOnly: number };
     };
     expect(body.verdict).toBe('blind');
-    expect(body.alarm).toBe(true);
+    // TRA-3711 — the writer being down is a COVERAGE fact, so it rides `degraded`, not the
+    // trip channel. It stays exactly as loud: WRITER DOWN, the named missing sessions, 0%
+    // realized coverage. What it must not do is read the same as a live-money NAV breach.
+    expect(body.alarm).toBe(false);
+    expect(body.degraded).toBe(true);
+    expect(body.attention).toBe(true);
+    expect(body.signalClasses.sessionsTrip).toBe(0);
+    expect(body.signalNote).toContain('DEGRADED, NOT TRIPPED');
     expect(body.coverage.realizedCoverage).toBe(0);
     expect(body.consecutiveMissingSessions).toBeGreaterThan(0);
     expect(body.note).toContain('WRITER DOWN');
@@ -123,10 +134,28 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
     const routes = register();
     const res = fakeRes();
     await routes.get('/api/health/live-nav-tripwire')![0]!({ query: {} }, res);
-    const body = res.body as { verdict: string; lastFailDay: string; note: string };
+    const body = res.body as {
+      verdict: string;
+      lastFailDay: string;
+      note: string;
+      alarm: boolean;
+      signalNote: string;
+      driver: { axis: string; kind: string; status: string } | null;
+    };
     expect(body.verdict).toBe('fail');
     expect(body.lastFailDay).toBe('2026-08-12');
     expect(body.note).toContain('FAIL');
+    // TRA-3711 discriminating arm, through the ROUTE: a real trip must still reach the
+    // trip channel and say which axis fired. This is the arm that makes the blind-case
+    // silencing a fix rather than a mute button.
+    expect(body.alarm).toBe(true);
+    expect(body.driver).toEqual({
+      axis: 'lag',
+      kind: 'assertion',
+      status: 'fail',
+      reason: 'live_book_overstated_nav',
+    });
+    expect(body.signalNote).toContain('TRIP');
   });
 
   // TRA-3450 — the route has to SAY vacuous. A reader who only ever looks at `note` is the
@@ -173,10 +202,16 @@ describe('TRA-3449 wiring — the route exists and reports a non-run', () => {
       verdict: string;
       alarm: boolean;
       note: string;
+      degraded: boolean;
+      attention: boolean;
       vacuity: { vacuousBooks: Array<{ username: string; reason: string }> };
     };
     expect(body.verdict).toBe('vacuous');
-    expect(body.alarm).toBe(true);
+    // TRA-3711 — `vacuous` is "graded NOTHING", which is a coverage statement. Still never
+    // green, still never silent: it rides `degraded`/`attention` and the note still says so.
+    expect(body.alarm).toBe(false);
+    expect(body.degraded).toBe(true);
+    expect(body.attention).toBe(true);
     expect(body.note).toContain('VACUOUS');
     expect(body.note).toContain('NOTHING to grade');
     expect(body.vacuity.vacuousBooks).toEqual([

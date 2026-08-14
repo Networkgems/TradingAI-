@@ -167,7 +167,7 @@ describe('TRA-3449 grading — the three fail conditions', () => {
     );
     expect(g.verdict).toBe('fail');
     expect(g.alarm).toBe(true);
-    expect(g.axes.lag).toEqual({ status: 'fail', reason: 'live_book_overstated_nav' });
+    expect(g.axes.lag).toEqual({ status: 'fail', reason: 'live_book_overstated_nav', kind: 'assertion' });
     // The offending rows have to come out of the record ready to print — the whole reason
     // the endpoint publishes `livePriorOptionsLagBooks` rather than just a boolean.
     expect(g.lagBooks).toEqual([{ username: 'admin', dates: ['2026-08-12'] }]);
@@ -193,7 +193,7 @@ describe('TRA-3449 grading — the three fail conditions', () => {
       }),
     );
     expect(g.verdict).toBe('fail');
-    expect(g.axes.eodTail).toEqual({ status: 'fail', reason: 'live_book_eod_tail_stale:3' });
+    expect(g.axes.eodTail).toEqual({ status: 'fail', reason: 'live_book_eod_tail_stale:3', kind: 'assertion' });
   });
 
   it('FAIL outranks BLIND — a real breach is not downgraded by an unrelated coverage hole', () => {
@@ -211,10 +211,16 @@ describe('TRA-3449 grading — the three fail conditions', () => {
     expect(g.axes.eodTail.status).toBe('pass');
     expect(g.axes.coverage).toEqual({
       status: 'blind',
-      reason: 'ungraded_live_books:1_of_2',
+      // TRA-3711 — the reason now names the CLASS of the hole, not just its size.
+      reason: 'ungraded_live_books:1_of_2:no_eligible_dates',
+      kind: 'coverage',
     });
     expect(g.verdict).toBe('blind');
-    expect(g.alarm).toBe(true);
+    // TRA-3711 — the verdict is unchanged and the ALARM is not. `blind` is a hole in the
+    // instrument, so it rides `degraded`/`attention`; `alarm` is reserved for a trip.
+    expect(g.alarm).toBe(false);
+    expect(g.degraded).toBe(true);
+    expect(g.attention).toBe(true);
     // AC4 — the ungraded live book is NAMED, with the reason it could not be graded.
     // `no_eligible_dates` is benign TODAY and becomes a live grade the instant it fills.
     expect(g.ungradedBooks).toEqual([{ username: 'v0nni', reason: 'no_eligible_dates' }]);
@@ -280,7 +286,7 @@ describe('TRA-3449 AC3 — the forbidden operands (TRA-2630 Defect A)', () => {
         ungradeableFields: ['ok', 'maxDriftUsd', 'livePriorOptionsLagOk'],
       }),
     );
-    expect(g.axes.lag).toEqual({ status: 'blind', reason: 'operand_declared_ungradeable' });
+    expect(g.axes.lag).toEqual({ status: 'blind', reason: 'operand_declared_ungradeable', kind: 'assertion' });
     expect(g.verdict).toBe('blind');
   });
 
@@ -304,8 +310,13 @@ describe('TRA-3449 AC4 — null is not a pass, and neither is an absent field', 
     ['liveEodTailMaxStaleSessions', 'eodTail'],
   ] as const)('grades %s: null as BLIND on the %s axis', (field, axis) => {
     const g = gradeLiveNavTripwirePayload(coveredPayload({ [field]: null }));
-    expect(g.axes[axis]).toEqual({ status: 'blind', reason: 'not_measured' });
+    expect(g.axes[axis]).toEqual({ status: 'blind', reason: 'not_measured', kind: 'assertion' });
     expect(g.verdict).toBe('blind');
+    // TRA-3711 — an unreadable operand is a hole in the instrument, not a trip. It is
+    // still never green: `degraded` and `attention` both carry it.
+    expect(g.alarm).toBe(false);
+    expect(g.degraded).toBe(true);
+    expect(g.attention).toBe(true);
   });
 
   it.each([
@@ -318,14 +329,19 @@ describe('TRA-3449 AC4 — null is not a pass, and neither is an absent field', 
     const p = coveredPayload();
     delete p[field];
     const g = gradeLiveNavTripwirePayload(p);
-    expect(g.axes[axis]).toEqual({ status: 'blind', reason: 'missing_field' });
+    expect(g.axes[axis]).toEqual({ status: 'blind', reason: 'missing_field', kind: 'assertion' });
     expect(g.verdict).toBe('blind');
+    // TRA-3711 — an unreadable operand is a hole in the instrument, not a trip. It is
+    // still never green: `degraded` and `attention` both carry it.
+    expect(g.alarm).toBe(false);
+    expect(g.degraded).toBe(true);
+    expect(g.attention).toBe(true);
   });
 
   it('grades a wrong-typed operand as BLIND, not by coercion', () => {
     // `"true"` is truthy. A gate that coerced would read this as a pass.
     const g = gradeLiveNavTripwirePayload(coveredPayload({ livePriorOptionsLagOk: 'true' }));
-    expect(g.axes.lag).toEqual({ status: 'blind', reason: 'field_wrong_type' });
+    expect(g.axes.lag).toEqual({ status: 'blind', reason: 'field_wrong_type', kind: 'assertion' });
     expect(g.verdict).toBe('blind');
   });
 
@@ -335,7 +351,7 @@ describe('TRA-3449 AC4 — null is not a pass, and neither is an absent field', 
     const g = gradeLiveNavTripwirePayload(
       coveredPayload({ liveBookCount: 0, liveGradeableBookCount: 0, engines: [] }),
     );
-    expect(g.axes.coverage).toEqual({ status: 'blind', reason: 'empty_live_cohort' });
+    expect(g.axes.coverage).toEqual({ status: 'blind', reason: 'empty_live_cohort', kind: 'coverage' });
     expect(g.verdict).toBe('blind');
   });
 
@@ -387,7 +403,25 @@ describe('TRA-3449 AC2 — durable, and a missed day is distinguishable from a c
     ]);
     // The reading that the routine's `status: active` / `enabled: true` could not give.
     expect(s.verdict).toBe('blind');
-    expect(s.alarm).toBe(true);
+    // TRA-3711 — a week the writer never reached is a COVERAGE fact, so it lands on
+    // `degraded`/`attention`, not on the trip channel. It must stay just as loud: the
+    // named missing sessions, the 0% realized coverage and `consecutiveMissingSessions`
+    // are all still here, and the driver says WHY in one field.
+    expect(s.attention).toBe(true);
+    expect(s.degraded).toBe(true);
+    expect(s.alarm).toBe(false);
+    expect(s.driver).toEqual({
+      axis: 'writer',
+      kind: 'coverage',
+      status: 'blind',
+      reason: 'no_assertion_row',
+    });
+    expect(s.signalClasses).toEqual({
+      sessionsTrip: 0,
+      sessionsDegradedOnly: 5,
+      sessionsClean: 0,
+      sessionsAttention: 5,
+    });
     expect(s.consecutiveMissingSessions).toBe(5);
   });
 
@@ -420,6 +454,15 @@ describe('TRA-3449 AC2 — durable, and a missed day is distinguishable from a c
     const s = summarizeLiveNavTripwire(7, '2026-08-12');
     expect(s.verdict).toBe('clean');
     expect(s.alarm).toBe(false);
+    expect(s.degraded).toBe(false);
+    expect(s.attention).toBe(false);
+    expect(s.driver).toBeNull();
+    expect(s.signalClasses).toEqual({
+      sessionsTrip: 0,
+      sessionsDegradedOnly: 0,
+      sessionsClean: 5,
+      sessionsAttention: 0,
+    });
     expect(s.coverage.realizedCoverage).toBe(1);
     expect(s.consecutiveMissingSessions).toBe(0);
   });
@@ -584,8 +627,13 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     expect(g.axes.lag.status).toBe('pass'); // the scalar says true...
     expect(g.axes.lagDenominator.status).toBe('vacuous'); // ...over nothing
     expect(g.verdict).toBe('vacuous');
-    // The amendment's core ask: it is an ALARM, and it is NOT green.
-    expect(g.alarm).toBe(true);
+    // The amendment's core ask: it is NOT green, and it raises attention. TRA-3711 moved
+    // WHICH channel carries it — `vacuous` means "graded nothing", which is a coverage
+    // statement, so it rides `degraded`/`attention` and not the trip channel. It is still
+    // never `clean` and still never silent.
+    expect(g.attention).toBe(true);
+    expect(g.degraded).toBe(true);
+    expect(g.alarm).toBe(false);
     expect(g.verdict).not.toBe('clean');
     expect(g.observed.postOnsetTripCapablePairs).toBe(0);
     expect(g.axes.lagDenominator.reason).toContain('admin=no_post_onset_trip_capable_pairs');
@@ -594,7 +642,7 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
 
   it('grades CLEAN only when every live book has a post-onset trip-capable pair', () => {
     const g = gradeLiveNavTripwirePayload(coveredPayload());
-    expect(g.axes.lagDenominator).toEqual({ status: 'pass', reason: null });
+    expect(g.axes.lagDenominator).toEqual({ status: 'pass', reason: null, kind: 'coverage' });
     expect(g.verdict).toBe('clean');
     expect(g.observed.postOnsetTripCapablePairs).toBe(2); // one per live book
   });
@@ -655,7 +703,7 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     // No `engines` ⇒ we did not measure the denominator. "The census said zero" and "there
     // was no census" are different facts — this ticket's own lesson, one level down.
     const g = gradeLiveNavTripwirePayload(coveredPayload({ engines: undefined }));
-    expect(g.axes.lagDenominator).toEqual({ status: 'blind', reason: 'engines_unreadable' });
+    expect(g.axes.lagDenominator).toEqual({ status: 'blind', reason: 'engines_unreadable', kind: 'coverage' });
     expect(g.verdict).toBe('blind');
     expect(g.observed.postOnsetTripCapablePairs).toBeNull();
   });
@@ -705,8 +753,20 @@ describe('TRA-3450 — the denominator, and why a `true` scalar is not a pass', 
     expect(g.axes.lagDenominator).toEqual({
       status: 'fail',
       reason: 'post_onset_trip_not_reported_by_scalar',
+      kind: 'coverage',
     });
     expect(g.verdict).toBe('fail');
+    // TRA-3711 — the trip channel is keyed on STATUS, not on axis KIND. This axis is filed
+    // `coverage` (its `vacuous` branch is what it exists for), but a `fail` on it means the
+    // endpoint's own verdict contradicts its own day rows, which IS an assertion failing.
+    // Gating `alarm` on `kind === 'assertion'` would have silenced exactly this.
+    expect(g.alarm).toBe(true);
+    expect(g.driver).toEqual({
+      axis: 'lagDenominator',
+      kind: 'coverage',
+      status: 'fail',
+      reason: 'post_onset_trip_not_reported_by_scalar',
+    });
   });
 
   it('the ungradeable-field guard covers the denominator axis too', () => {
@@ -834,5 +894,318 @@ describe('TRA-3450 — vacuity is DURABLE and distinguishable after the fact', (
     expect(s.vacuity.sessionsVacuous).toBe(0);
     // Not counted as evidence either — an unknown census proves nothing in either direction.
     expect(s.vacuity.sessionsWithTripCapableEvidence).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3711 — the ALARM was pinned on, so nobody could read it.
+//
+// The state that filed this, from the first ever written row (2026-08-13): `lag`,
+// `eodRows`, `eodTail` all `pass`; `lagDenominator` correctly `vacuous`; `coverage`
+// `blind` because `v0nni` is a live book with no eligible dates and no live-options
+// onset. `blind` dominates the fold, and `alarm` was `verdict !== 'clean'` — so every
+// session wrote `alarm: true` on an endpoint where nothing had tripped.
+//
+// The evidence bar this block has to clear is the one the ticket set, and it is three
+// parts, not one:
+//   (a) the blind case stops consuming the trip channel;
+//   (b) the DISCRIMINATING arm — a genuine assertion failure still surfaces as a trip.
+//       A change that only silences (a) is a mute button, not a fix;
+//   (c) the PER-CLASS split before and after, measured on the SAME rows. An invariant
+//       total with a flipped class split is what a relabelling looks like from outside.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('TRA-3711 — `alarm` is the TRIP channel, `degraded` is the COVERAGE channel', () => {
+  it('the filing row: four axes pass, coverage is structurally blind, and NOTHING tripped', () => {
+    const g = gradeLiveNavTripwirePayload(servedPayload());
+    // The exact row from the ticket, re-derived rather than quoted.
+    expect(g.axes.lag.status).toBe('pass');
+    expect(g.axes.eodRows.status).toBe('pass');
+    expect(g.axes.eodTail.status).toBe('pass');
+    expect(g.axes.lagDenominator.status).toBe('vacuous');
+    expect(g.axes.coverage.status).toBe('blind');
+    expect(g.ungradedBooks).toEqual([{ username: 'v0nni', reason: 'no_eligible_dates' }]);
+
+    // THE fix. The verdict lattice is untouched — `blind` still dominates, and this row is
+    // still not `clean`. What changed is that `blind` no longer spends the trip signal.
+    expect(g.verdict).toBe('blind');
+    expect(g.alarm).toBe(false);
+    expect(g.degraded).toBe(true);
+    // And the union that `alarm` USED to mean is still published, so a consumer that
+    // genuinely wanted "anything wrong at all" re-binds instead of silently under-alerting.
+    expect(g.attention).toBe(true);
+
+    // The aggregate publishes WHICH axis drove it and WHY — the ticket's third ask. A rule
+    // binds to this, not to `verdict`, and gets a CAUSE instead of a value.
+    expect(g.driver).toEqual({
+      axis: 'coverage',
+      kind: 'coverage',
+      status: 'blind',
+      reason: 'ungraded_live_books:1_of_2:no_eligible_dates',
+    });
+  });
+
+  it('THE DISCRIMINATING ARM — a real trip on the same payload still fires', () => {
+    // Identical fixture, identical structural coverage hole, one operand flipped. If this
+    // reads `alarm: false` the change is a mute button and not a fix.
+    const g = gradeLiveNavTripwirePayload(
+      servedPayload({
+        livePriorOptionsLagOk: false,
+        livePriorOptionsLagBooks: [{ username: 'admin', dates: ['2026-08-12'] }],
+      }),
+    );
+    expect(g.axes.coverage.status).toBe('blind'); // the hole is STILL there
+    expect(g.verdict).toBe('fail');
+    expect(g.alarm).toBe(true);
+    expect(g.degraded).toBe(true); // both channels can be hot at once; neither masks the other
+    expect(g.attention).toBe(true);
+    // The driver names the TRIP, not the coverage hole sitting next to it. Precedence the
+    // other way would have a reader filing a live-money NAV overstatement as an instrument
+    // problem — this ticket, reproduced one level down.
+    expect(g.driver).toEqual({
+      axis: 'lag',
+      kind: 'assertion',
+      status: 'fail',
+      reason: 'live_book_overstated_nav',
+    });
+    expect(g.lagBooks).toEqual([{ username: 'admin', dates: ['2026-08-12'] }]);
+  });
+
+  it('every assertion axis reaches the trip channel — not just `lag`', () => {
+    for (const [over, axis, reason] of [
+      [{ liveEodRowsPresentOk: false }, 'eodRows', 'live_book_missing_eod_row'],
+      [{ liveEodTailMaxStaleSessions: 2 }, 'eodTail', 'live_book_eod_tail_stale:2'],
+    ] as const) {
+      const g = gradeLiveNavTripwirePayload(servedPayload(over));
+      expect(g.alarm, `${axis} must raise the trip channel`).toBe(true);
+      expect(g.driver).toEqual({ axis, kind: 'assertion', status: 'fail', reason });
+    }
+  });
+
+  it('separates a STRUCTURAL coverage hole from a GRADER DEFECT in the axis reason', () => {
+    // Both books ungraded, but for different reasons and with different remediations:
+    // `no_eligible_dates` clears itself when the book fills; `ungraded` is a bug in the
+    // grader and never clears on its own. A count alone cannot say which repair applies.
+    const g = gradeLiveNavTripwirePayload(
+      servedPayload({
+        liveGradeableBookCount: 0,
+        engines: [
+          {
+            username: 'admin',
+            mode: 'live',
+            priorOptionsLagOk: null,
+            priorOptionsLagEligibleDates: ['2026-08-12'],
+          },
+          { username: 'v0nni', mode: 'live', priorOptionsLagOk: null, priorOptionsLagEligibleDates: [] },
+        ],
+      }),
+    );
+    expect(g.axes.coverage.reason).toBe('ungraded_live_books:0_of_2:no_eligible_dates+ungraded');
+    // Still degraded, still not a trip — the class is published so the reader can route it,
+    // not so it can be escalated into the trip channel by string matching.
+    expect(g.alarm).toBe(false);
+    expect(g.degraded).toBe(true);
+  });
+
+  it('REJECTED ALTERNATIVE: a `no_eligible_dates` book is NOT dropped from the coverage cohort', () => {
+    // The other candidate direction was to put `v0nni` out of cohort. It is rejected, and
+    // this test is the guard: `liveBookCount` stays 2, the axis stays `blind`, and the book
+    // stays NAMED. Excluding it would make this axis read `pass` over a cohort of one — so
+    // the session `v0nni` finally fills with a grader still returning `null`, the coverage
+    // hole this axis exists to catch would be invisible. TRA-3450's exclusion was legitimate
+    // because it made a denominator STRICTER and published a LOUDER state; this one would
+    // make a denominator weaker and publish GREEN.
+    const g = gradeLiveNavTripwirePayload(servedPayload());
+    expect(g.observed.liveBookCount).toBe(2);
+    expect(g.observed.liveGradeableBookCount).toBe(1);
+    expect(g.axes.coverage.status).toBe('blind');
+    expect(g.axes.coverage.reason).toContain('1_of_2');
+    expect(g.ungradedBooks.map((b) => b.username)).toContain('v0nni');
+    // And the exclusion count that a cohort change WOULD have to report is non-zero and
+    // named here already, which is what made the exclusion unnecessary.
+    expect(g.ungradedBooks).toHaveLength(1);
+  });
+});
+
+describe('TRA-3711 — the per-class split, measured on the same rows', () => {
+  const T = (etDay: string): number => Date.parse(`${etDay}T21:20:00-04:00`);
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tra3711-'));
+    clearLiveNavTripwire();
+    hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+  });
+  afterEach(() => {
+    clearLiveNavTripwire();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function assertOn(etDay: string, payload: unknown): void {
+    recordLiveNavTripwireAssertion({
+      grade: gradeLiveNavTripwirePayload(payload),
+      source: 'served',
+      now: T(etDay),
+    });
+  }
+
+  /**
+   * The PRE-TRA-3711 rule, reconstructed from published fields rather than remembered:
+   * `alarm` was exactly `verdict !== 'clean'`. Computing it off `byDay[].verdict` means the
+   * before/after comparison is made on the SAME rows by the SAME reader, so a difference
+   * cannot be an artefact of two different denominators.
+   */
+  function oldRuleAlarmingSessions(s: ReturnType<typeof summarizeLiveNavTripwire>): number {
+    return s.byDay.filter((d) => d.marketDay && d.verdict !== 'clean').length;
+  }
+
+  it('BEFORE/AFTER: 5 alarming sessions become 0 TRIPS and 5 DEGRADED — total invariant', () => {
+    // Every session in the window carries the real served row: structurally blind coverage,
+    // every assertion passing. This is the state that will hold for as long as `v0nni` has
+    // no live-options onset, i.e. indefinitely.
+    for (const d of ['2026-08-06', '2026-08-07', '2026-08-10', '2026-08-11', '2026-08-12']) {
+      assertOn(d, servedPayload());
+    }
+    const s = summarizeLiveNavTripwire(7, '2026-08-12');
+    expect(s.coverage.marketDaysRecorded).toBe(5);
+
+    // BEFORE: every one of the 5 raised the alarm.
+    expect(oldRuleAlarmingSessions(s)).toBe(5);
+
+    // AFTER: the same 5 sessions, re-classified. The TOTAL is invariant — which is exactly
+    // why the total is not the evidence. The SPLIT is.
+    expect(s.signalClasses).toEqual({
+      sessionsTrip: 0,
+      sessionsDegradedOnly: 5,
+      sessionsClean: 0,
+      sessionsAttention: 5,
+    });
+    expect(s.signalClasses.sessionsAttention).toBe(oldRuleAlarmingSessions(s));
+    expect(s.alarm).toBe(false);
+    expect(s.degraded).toBe(true);
+    expect(s.driver?.axis).toBe('coverage');
+    expect(s.driver?.reason).toBe('ungraded_live_books:1_of_2:no_eligible_dates');
+  });
+
+  it('BEFORE/AFTER: one real trip among four blind sessions is now the ONLY thing in the trip class', () => {
+    for (const d of ['2026-08-06', '2026-08-07', '2026-08-10', '2026-08-12']) {
+      assertOn(d, servedPayload());
+    }
+    assertOn('2026-08-11', servedPayload({ livePriorOptionsLagOk: false }));
+
+    const s = summarizeLiveNavTripwire(7, '2026-08-12');
+    // BEFORE: 5 of 5 alarming — the trip is INDISTINGUISHABLE from the four blind days.
+    // That is the failure mode in one line.
+    expect(oldRuleAlarmingSessions(s)).toBe(5);
+
+    // AFTER: exactly one session is in the trip class, and it is the right one.
+    expect(s.signalClasses).toEqual({
+      sessionsTrip: 1,
+      sessionsDegradedOnly: 4,
+      sessionsClean: 0,
+      sessionsAttention: 5,
+    });
+    expect(s.alarm).toBe(true);
+    expect(s.lastFailDay).toBe('2026-08-11');
+    expect(s.byDay.filter((d) => d.alarm).map((d) => d.etDay)).toEqual(['2026-08-11']);
+    // The window driver is the TRIP, not one of the four coverage holes outranking it.
+    expect(s.driver).toEqual({
+      axis: 'lag',
+      kind: 'assertion',
+      status: 'fail',
+      reason: 'live_book_overstated_nav',
+    });
+  });
+
+  it('the three classes PARTITION the sessions — no row can fall out of the split', () => {
+    assertOn('2026-08-10', coveredPayload()); // clean
+    assertOn('2026-08-11', servedPayload()); // degraded
+    assertOn('2026-08-12', coveredPayload({ livePriorOptionsLagOk: false })); // trip
+    // 08-06 and 08-07 have no row at all -> degraded via `missing`.
+    const s = summarizeLiveNavTripwire(7, '2026-08-12');
+    const c = s.signalClasses;
+    expect(c.sessionsTrip + c.sessionsDegradedOnly + c.sessionsClean).toBe(
+      s.coverage.marketDaysExpected,
+    );
+    expect(c).toEqual({
+      sessionsTrip: 1,
+      sessionsDegradedOnly: 3,
+      sessionsClean: 1,
+      sessionsAttention: 4,
+    });
+  });
+
+  it('a row written BEFORE this fix re-reads under the new rule, not under its stored boolean', () => {
+    // The 2026-08-13 row is already on disk in production, carrying the OLD union
+    // `alarm: true`. If the summary echoed that stored field, the pinned alarm would
+    // survive the very deploy that fixes it — and the endpoint would report exactly what it
+    // reported yesterday. The channels are derived from `axes`, which is the primitive.
+    const legacy = {
+      kind: 'assert',
+      ts: T('2026-08-12'),
+      etDay: '2026-08-12',
+      marketDay: true,
+      source: 'served',
+      verdict: 'blind',
+      alarm: true, // <- the stored pre-TRA-3711 value
+      axes: {
+        lag: { status: 'pass', reason: null },
+        coverage: { status: 'blind', reason: 'ungraded_live_books:1_of_2' },
+        eodRows: { status: 'pass', reason: null },
+        eodTail: { status: 'pass', reason: null },
+        lagDenominator: {
+          status: 'vacuous',
+          reason: 'no_post_onset_trip_capable_pairs:v0nni=no_live_options_onset',
+        },
+      },
+      lagBooks: [],
+      ungradedBooks: [{ username: 'v0nni', reason: 'no_eligible_dates' }],
+      observed: { livePriorOptionsLagOk: true },
+    };
+    writeFileSync(liveNavTripwireLogPath(dir), JSON.stringify(legacy) + '\n', 'utf8');
+    hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+
+    const day = summarizeLiveNavTripwire(1, '2026-08-12').byDay[0]!;
+    expect(day.verdict).toBe('blind'); // the persisted verdict is untouched
+    expect(day.alarm).toBe(false); // ...and the stored `alarm: true` is NOT echoed
+    expect(day.degraded).toBe(true);
+    expect(day.attention).toBe(true);
+    // The axis kind is re-derived from the axis NAME, so an old row with no `kind` field
+    // classifies identically to a fresh one — no migration, no back-filled guess.
+    expect(day.driver).toEqual({
+      axis: 'coverage',
+      kind: 'coverage',
+      status: 'blind',
+      reason: 'ungraded_live_books:1_of_2',
+    });
+  });
+
+  it('an axis this build does not know about still counts in the fold', () => {
+    // Forward-compat: a newer writer adds a sixth axis and an older reader hydrates the row.
+    // Dropping the unknown axis would let a future FAIL read as clean on an old process —
+    // the same silent-degradation class the ungradeable-field guard exists for.
+    const future = {
+      kind: 'assert',
+      ts: T('2026-08-12'),
+      etDay: '2026-08-12',
+      marketDay: true,
+      source: 'served',
+      verdict: 'fail',
+      alarm: true,
+      axes: {
+        lag: { status: 'pass', reason: null },
+        coverage: { status: 'pass', reason: null },
+        eodRows: { status: 'pass', reason: null },
+        eodTail: { status: 'pass', reason: null },
+        lagDenominator: { status: 'pass', reason: null },
+        someNewAxis: { status: 'fail', reason: 'a_thing_this_build_never_heard_of' },
+      },
+      lagBooks: [],
+      ungradedBooks: [],
+      observed: { livePriorOptionsLagOk: true },
+    };
+    writeFileSync(liveNavTripwireLogPath(dir), JSON.stringify(future) + '\n', 'utf8');
+    hydrateLiveNavTripwireFromDisk(dir, T('2026-08-13'));
+    const day = summarizeLiveNavTripwire(1, '2026-08-12').byDay[0]!;
+    expect(day.alarm).toBe(true);
+    expect(day.driver?.axis).toBe('someNewAxis');
   });
 });

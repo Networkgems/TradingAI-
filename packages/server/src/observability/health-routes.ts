@@ -4921,6 +4921,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
                     }. This is NOT a pass — see TRA-3450.`
                   : `CLEAN — every NYSE session in the window has a graded, passing row over a NON-EMPTY post-onset trip-capable denominator (${summary.coverage.marketDaysRecorded}/${summary.coverage.marketDaysExpected}).`,
       /**
+       * TRA-3711 — `note` narrates the VERDICT lattice, which is dominated by the WORST
+       * axis. `signalNote` narrates the two CHANNELS, which is the reading a consumer
+       * actually has to make: `alarm` means an assertion TRIPPED, `degraded` means we could
+       * not grade. Both are published because the verdict alone cannot say which of the two
+       * it means — and a `blind` verdict off a structurally ungradeable live book (`v0nni`,
+       * `no_eligible_dates`, no live-options onset) was pinning the trip signal ON for every
+       * session, on an endpoint where every assertion axis was passing.
+       */
+      signalNote: summary.alarm
+        ? `TRIP — an assertion FAILED (driver ${summary.driver?.axis}=${summary.driver?.status}, ${summary.driver?.reason ?? 'no reason'}). ${summary.signalClasses.sessionsTrip}/${summary.coverage.marketDaysExpected} session(s) tripped. This is the real-money signal; act on it.`
+        : summary.degraded
+          ? `DEGRADED, NOT TRIPPED — 0/${summary.coverage.marketDaysExpected} session(s) tripped an assertion; ${summary.signalClasses.sessionsDegradedOnly} could not be graded (driver ${summary.driver?.axis}=${summary.driver?.status}, ${summary.driver?.reason ?? 'no reason'}). alarm=false is CORRECT here and is NOT an all-clear: the instrument has a hole, nothing has fired. Bind a coverage monitor to \`degraded\`/\`attention\`, never to \`alarm\`. See TRA-3711.`
+          : `OK — 0 trips and 0 degraded sessions across ${summary.coverage.marketDaysExpected} session(s).`,
+      /**
        * RECORDED, NOT GRADED. `liveEodInteriorAbsentBooks` is the TRA-2943 discriminator
        * of record, and it is non-empty today on both live books (2026-08-07, a date NOT in
        * the TRA-2886 documented permanent gap). Gating on it would ship a born-red gate.

@@ -117,10 +117,63 @@
  * hole into the same bucket as a real-money NAV overstatement would mean `v0nni` — a live
  * book with $25,000 that has not filled yet, so `priorOptionsLagOk: null` and
  * `priorOptionsLagEligibleDates: []` — publishes a red every single day until TRA-3417
- * lands. That is the false-red that gets a gate disabled. So: three verdicts, `alarm` is
- * TRUE for both `fail` and `blind`, `clean` requires every axis to have genuinely passed,
- * and the ungraded book is NAMED in the row with the reason it could not be graded. It is
- * not silent, it is not green, and it is not indistinguishable from a $-real breach.
+ * lands. That is the false-red that gets a gate disabled. So: three verdicts, `clean`
+ * requires every axis to have genuinely passed, and the ungraded book is NAMED in the row
+ * with the reason it could not be graded. It is not silent, it is not green, and it is
+ * not indistinguishable from a $-real breach.
+ *
+ * ## TRA-3711 — the verdict was right and the ALARM was wrong
+ *
+ * The paragraph above got the VERDICT lattice right and then hung a single boolean off it:
+ * `alarm = verdict !== 'clean'`. That boolean is the thing a consumer actually binds to, and
+ * it collapsed the exact distinction the verdict had just been careful to make. Measured on
+ * the first ever written row (2026-08-13): `lag`, `eodRows`, `eodTail` all `pass`,
+ * `lagDenominator` correctly `vacuous`, `coverage` `blind` for `ungraded_live_books:1_of_2`
+ * — `v0nni`, `no_eligible_dates`, no live-options onset. `blind` dominates the fold, so
+ * `alarm: true`. And `v0nni` having no onset is STRUCTURAL, not transient: every session
+ * writes that same row. **An alarm that is pinned on is an alarm nobody can read** — the
+ * first real trip would land on a row that already said `alarm: true` yesterday, and the day
+ * before, and every day since. It had already cost a grading rule: TRA-3489 bound its
+ * PASS/FAIL branches to this aggregate and was structurally incapable of ever passing, and
+ * the TRA-3684 ruling had to re-bind rule v2 to `axes.lagDenominator.status` to make it
+ * decidable at all.
+ *
+ * This is the mirror image of TRA-3450. That one was a vacuous TRUE (a false clean); this is
+ * a vacuous ALARM (a false red). Same root cause — a signal computed over a denominator that
+ * does not exist — opposite polarity.
+ *
+ * ### Two channels, because there are two questions
+ *
+ * `blind`/`vacuous` answer **"could we grade it?"**. `fail` answers **"did it trip?"**. One
+ * boolean cannot carry both, so there are now three, all published on every row and on the
+ * summary:
+ *
+ *   - {@link LiveNavGrade.alarm}      — **NARROWED.** An assertion TRIPPED: some axis is `fail`.
+ *   - {@link LiveNavGrade.degraded}   — we could NOT grade: some axis is `blind` or `vacuous`.
+ *   - {@link LiveNavGrade.attention}  — `alarm || degraded`. The PRE-TRA-3711 `alarm`
+ *     semantics, preserved verbatim under a name so that anything which needed the union
+ *     cannot silently under-alert by keeping its old binding.
+ *   - {@link LiveNavGrade.driver}     — WHICH axis set the verdict, its kind, and its reason,
+ *     so a consumer binds to a CAUSE and not to a value. This is the field the next TRA-3489
+ *     should read; the aggregate `verdict` is a summary, not an operand.
+ *
+ * `fail` on ANY axis raises `alarm`, including `lagDenominator`'s
+ * `post_onset_trip_not_reported_by_scalar` — that one IS an assertion (the endpoint's verdict
+ * contradicting its own day rows), so the trip channel must not be gated on the axis's kind.
+ *
+ * ### The rejected alternative, and why
+ *
+ * The other candidate was to put a `no_eligible_dates` book OUT OF COHORT for the `coverage`
+ * axis — the denominator discipline TRA-3450 applied to `lag`, applied one axis over. It is
+ * rejected. TRA-3450's exclusion made its denominator STRICTER and published a NEW, LOUDER
+ * state (`vacuous`); excluding `v0nni` from `coverage` makes that denominator WEAKER and
+ * publishes GREEN. `v0nni` is a live book holding $25,000. The session it finally fills, a
+ * grader still returning `null` on it would read `pass` over a cohort of one — the coverage
+ * hole this axis exists to catch, hidden by the fix for a cosmetic complaint about it. The
+ * book stays IN cohort, keeps grading `blind`, and `blind` simply stops consuming the trip
+ * signal. What DOES change on the axis is its `reason`, which now names the CLASS of the
+ * hole (`no_eligible_dates` = structural, `ungraded` = a defect in the grader) rather than
+ * only its count.
  *
  * ## Where the payload comes from
  *
@@ -178,14 +231,151 @@ export const LIVE_NAV_FORBIDDEN_FIELDS = ['ok', 'drift', 'maxDriftUsd', 'eodInte
  */
 export type LiveNavAxisStatus = 'pass' | 'fail' | 'blind' | 'vacuous';
 
+/**
+ * TRA-3711 — what KIND of question the axis answers.
+ *
+ * - `assertion` — "did the thing we are watching for happen?" A `fail` here is a real trip.
+ * - `coverage`  — "were we in a position to answer at all?" `blind`/`vacuous` here is a hole
+ *   in the instrument, not an event in the world.
+ *
+ * Published so a reader can tell the two apart without knowing the axis names. It does NOT
+ * gate the trip channel: a `fail` on a `coverage` axis (see `lagDenominator`'s
+ * `post_onset_trip_not_reported_by_scalar`) still raises `alarm`, because that status means
+ * the axis DID grade something and found it wrong.
+ */
+export type LiveNavAxisKind = 'assertion' | 'coverage';
+
 export interface LiveNavAxis {
   status: LiveNavAxisStatus;
   /** Machine-readable cause. `null` only on `pass`. */
   reason: string | null;
+  /**
+   * TRA-3711. Optional on the type because rows written before TRA-3711 do not carry it —
+   * {@link liveNavAxisKind} re-derives it from the axis NAME so a hydrated old row classifies
+   * identically to a fresh one, with no migration and no back-filled guess.
+   */
+  kind?: LiveNavAxisKind;
 }
 
-/** `fail` > `blind` > `vacuous` > `clean`. `alarm` is true for the first three. */
+/** `fail` > `blind` > `vacuous` > `clean`. */
 export type LiveNavVerdict = 'clean' | 'vacuous' | 'blind' | 'fail';
+
+/**
+ * The five axis names in PRECEDENCE order. Used to pick {@link LiveNavSignals.driver}
+ * deterministically, and as the authority for {@link liveNavAxisKind}.
+ *
+ * Assertion axes come first so that when a real trip and a coverage hole are present on the
+ * same row, the published driver names the TRIP. Ordering the other way would reproduce this
+ * ticket one level down: the consumer reads `driver.axis === 'coverage'` and files it as an
+ * instrument problem while a live book is overstating NAV.
+ */
+export const LIVE_NAV_AXIS_ORDER = [
+  'lag',
+  'eodRows',
+  'eodTail',
+  'lagDenominator',
+  'coverage',
+] as const;
+
+export type LiveNavAxisName = (typeof LIVE_NAV_AXIS_ORDER)[number];
+
+const AXIS_KINDS: Record<LiveNavAxisName, LiveNavAxisKind> = {
+  lag: 'assertion',
+  eodRows: 'assertion',
+  eodTail: 'assertion',
+  // Both of these answer "could we grade?", not "did it trip?". `lagDenominator` is filed
+  // `coverage` because that is what `vacuous` means on it; its `fail` branch is handled by
+  // status, not by kind.
+  lagDenominator: 'coverage',
+  coverage: 'coverage',
+};
+
+export function liveNavAxisKind(axis: string): LiveNavAxisKind {
+  return AXIS_KINDS[axis as LiveNavAxisName] ?? 'coverage';
+}
+
+/** TRA-3711 — the axis that set the verdict, published so a consumer can bind to a CAUSE. */
+export interface LiveNavDriver {
+  axis: string;
+  kind: LiveNavAxisKind;
+  status: LiveNavAxisStatus;
+  reason: string | null;
+}
+
+/**
+ * TRA-3711 — the three separated channels, derived from the axes and NOTHING else.
+ *
+ * Deliberately a pure function of `axes` rather than of a stored boolean: a row written
+ * before TRA-3711 carries the old union `alarm: true`, and re-reading that field would keep
+ * the pinned alarm alive in the served summary forever. The axes are the primitive; these
+ * are a view of them, recomputed on every read.
+ */
+export interface LiveNavSignals {
+  /** An assertion TRIPPED — some axis is `fail`. THE real-money signal. */
+  alarm: boolean;
+  /** We could NOT grade — some axis is `blind` or `vacuous`. An instrument hole. */
+  degraded: boolean;
+  /** `alarm || degraded`. The pre-TRA-3711 `alarm` semantics, preserved under a name. */
+  attention: boolean;
+  /** Which axis set the verdict, and why. `null` only when every axis passed. */
+  driver: LiveNavDriver | null;
+}
+
+const STATUS_RANK: Record<LiveNavAxisStatus, number> = { fail: 3, blind: 2, vacuous: 1, pass: 0 };
+
+/**
+ * Classify a set of axes into the three channels plus the driver.
+ *
+ * Tolerates a partial / unknown-shaped `axes` map on purpose: it is fed both freshly graded
+ * axes and axes rehydrated from a JSONL row that a future build may have written with more
+ * axes than this one knows about. An unrecognised axis still ranks by status, so a new axis
+ * cannot be silently dropped out of the fold.
+ */
+export function signalsFromAxes(axes: Record<string, LiveNavAxis | undefined> | null | undefined): LiveNavSignals {
+  const entries: Array<[string, LiveNavAxis]> = [];
+  const seen = new Set<string>();
+  for (const name of LIVE_NAV_AXIS_ORDER) {
+    const a = axes?.[name];
+    if (a && typeof a.status === 'string') {
+      entries.push([name, a]);
+      seen.add(name);
+    }
+  }
+  for (const [name, a] of Object.entries(axes ?? {})) {
+    if (seen.has(name) || !a || typeof a.status !== 'string') continue;
+    entries.push([name, a]);
+  }
+
+  let driver: LiveNavDriver | null = null;
+  let alarm = false;
+  let degraded = false;
+  for (const [name, a] of entries) {
+    if (a.status === 'fail') alarm = true;
+    else if (a.status === 'blind' || a.status === 'vacuous') degraded = true;
+    if (a.status === 'pass') continue;
+    const rank = STATUS_RANK[a.status] ?? 0;
+    if (driver === null || rank > (STATUS_RANK[driver.status] ?? 0)) {
+      driver = { axis: name, kind: a.kind ?? liveNavAxisKind(name), status: a.status, reason: a.reason ?? null };
+    }
+  }
+  return { alarm, degraded, attention: alarm || degraded, driver };
+}
+
+/** The verdict lattice, over the same axis set. `fail` > `blind` > `vacuous` > `clean`. */
+export function verdictFromAxes(
+  axes: Record<string, LiveNavAxis | undefined> | null | undefined,
+): LiveNavVerdict {
+  const statuses = Object.values(axes ?? {})
+    .filter((a): a is LiveNavAxis => !!a && typeof a.status === 'string')
+    .map((a) => a.status);
+  return statuses.includes('fail')
+    ? 'fail'
+    : statuses.includes('blind')
+      ? 'blind'
+      : statuses.includes('vacuous')
+        ? 'vacuous'
+        : 'clean';
+}
 
 export interface LiveNavUngradedBook {
   username: string;
@@ -234,9 +424,8 @@ export interface LiveNavBookDenominator {
 }
 
 /** The graded result. Pure function of the payload — no IO, no clock, no LLM. */
-export interface LiveNavGrade {
+export interface LiveNavGrade extends LiveNavSignals {
   verdict: LiveNavVerdict;
-  alarm: boolean;
   axes: {
     /** `livePriorOptionsLagOk` — the real-money NAV-overstatement tripwire. */
     lag: LiveNavAxis;
@@ -523,11 +712,18 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
   // The empty live cohort is the original TRA-2630 AC3 manufactured-green: "no live book
   // was affected" and "there was no live book" must never be the same reading.
   else if (bookCountRaw.value === 0) coverage = blind('empty_live_cohort');
-  else if (gradeableRaw.value < bookCountRaw.value)
+  else if (gradeableRaw.value < bookCountRaw.value) {
+    // TRA-3711 — name the CLASS of the hole, not just its size. `no_eligible_dates` is a
+    // structural condition of the book (live, never filled, no live-options onset) and clears
+    // by itself; `ungraded` is a defect in the grader and does not. A count alone cannot tell
+    // a consumer which repair applies, which is how this axis came to pin an alarm nobody
+    // could act on. The books themselves stay in `ungradedBooks`, named.
+    const classes = [...new Set(ungradedBooks.map((b) => b.reason))].sort();
     coverage = blind(
-      `ungraded_live_books:${gradeableRaw.value}_of_${bookCountRaw.value}`,
+      `ungraded_live_books:${gradeableRaw.value}_of_${bookCountRaw.value}` +
+        (classes.length > 0 ? `:${classes.join('+')}` : ''),
     );
-  else coverage = pass();
+  } else coverage = pass();
 
   // ── EOD interior row presence, live books ─────────────────────────────────
   let eodRows: LiveNavAxis;
@@ -573,22 +769,23 @@ export function gradeLiveNavTripwirePayload(payload: unknown): LiveNavGrade {
     lagDenominator = fail('post_onset_trip_not_reported_by_scalar');
   else lagDenominator = pass();
 
-  const axes = { lag, coverage, eodRows, eodTail, lagDenominator };
-  const statuses = Object.values(axes).map((a) => a.status);
+  const axes = {
+    lag: { ...lag, kind: liveNavAxisKind('lag') },
+    coverage: { ...coverage, kind: liveNavAxisKind('coverage') },
+    eodRows: { ...eodRows, kind: liveNavAxisKind('eodRows') },
+    eodTail: { ...eodTail, kind: liveNavAxisKind('eodTail') },
+    lagDenominator: { ...lagDenominator, kind: liveNavAxisKind('lagDenominator') },
+  };
   // `fail` > `blind` > `vacuous` > `clean`. `vacuous` must outrank `clean` (TRA-3450: never
   // folded into green) and must NOT outrank `blind` — an unreadable operand is the worse
   // state, because it could be hiding either of the other two.
-  const verdict: LiveNavVerdict = statuses.includes('fail')
-    ? 'fail'
-    : statuses.includes('blind')
-      ? 'blind'
-      : statuses.includes('vacuous')
-        ? 'vacuous'
-        : 'clean';
+  const verdict = verdictFromAxes(axes);
 
   return {
     verdict,
-    alarm: verdict !== 'clean',
+    // TRA-3711 — `alarm` is now the TRIP channel only. It was `verdict !== 'clean'`, which
+    // pinned it true on every session a live book was structurally ungradeable.
+    ...signalsFromAxes(axes),
     axes,
     lagBooks,
     ungradedBooks,
@@ -708,8 +905,9 @@ export function recordLiveNavTripwireAssertion(
   appendRow(rec);
 
   if (rec.verdict === 'fail') {
-    log.error('LIVE-MONEY NAV TRIPWIRE: FAIL (TRA-3449)', {
+    log.error('LIVE-MONEY NAV TRIPWIRE: FAIL — alarm=true, an assertion TRIPPED (TRA-3449)', {
       etDay,
+      driver: rec.driver,
       axes: rec.axes,
       lagBooks: rec.lagBooks,
       eodRowMissingBooks: rec.eodRowMissingBooks,
@@ -724,8 +922,13 @@ export function recordLiveNavTripwireAssertion(
       postOnsetTripCapablePairs: rec.observed.postOnsetTripCapablePairs,
     });
   } else if (rec.verdict === 'blind') {
-    log.warn('live-money NAV tripwire: BLIND — not clean, not graded (TRA-3449)', {
+    // WARN, and `alarm` is FALSE here (TRA-3711). Blind is a hole in the instrument, not a
+    // trip; it rides `degraded`/`attention`. A blind row that kept raising the trip channel
+    // is what made this alarm unreadable for as long as `v0nni` has no onset.
+    log.warn('live-money NAV tripwire: BLIND — degraded, not tripped (TRA-3449/TRA-3711)', {
       etDay,
+      driver: rec.driver,
+      degraded: rec.degraded,
       axes: rec.axes,
       ungradedBooks: rec.ungradedBooks,
       source: rec.source,
@@ -802,12 +1005,11 @@ export function hydrateLiveNavTripwireFromDisk(dir: string, now: number = Date.n
 // ── Health summary ───────────────────────────────────────────────────────────
 
 /** A day in the window that SHOULD have a row. `missing` is the whole point of this module. */
-export interface LiveNavDaySummary {
+export interface LiveNavDaySummary extends LiveNavSignals {
   etDay: string;
   marketDay: boolean;
   /** `missing` — the assertion did not run at all that day. Distinguishable from `clean`. */
   verdict: LiveNavVerdict | 'missing';
-  alarm: boolean;
   source: 'served' | 'unreachable' | null;
   axes: LiveNavTripwireRecord['axes'] | null;
   lagBooks: Array<{ username: string; dates: string[] }>;
@@ -819,10 +1021,33 @@ export interface LiveNavDaySummary {
   postOnsetTripCapablePairs: number | null;
 }
 
-export interface LiveNavTripwireSummary {
+/**
+ * TRA-3711 — the per-class session split behind the window verdict.
+ *
+ * Published because the fix's own evidence bar demands it: an INVARIANT TOTAL with a FLIPPED
+ * CLASS SPLIT is the shape a "fix" takes when it has merely relabelled the same rows. The
+ * three classes partition the sessions exactly — `sessionsTrip + sessionsDegradedOnly +
+ * sessionsClean === coverage.marketDaysExpected` — so the split is checkable, not asserted.
+ */
+export interface LiveNavSignalClasses {
+  /** Sessions whose row TRIPPED an assertion (`verdict: 'fail'`). The number that must page. */
+  sessionsTrip: number;
+  /** Sessions that were degraded (`blind` / `vacuous` / `missing`) with NO trip. */
+  sessionsDegradedOnly: number;
+  /** Sessions with a graded, fully passing row. */
+  sessionsClean: number;
+  /** `sessionsTrip + sessionsDegradedOnly` — what the PRE-TRA-3711 `alarm` counted. */
+  sessionsAttention: number;
+}
+
+export interface LiveNavTripwireSummary extends LiveNavSignals {
   /** `fail` if ANY market day in the window failed; else `blind` if any blind/missing; else `clean`; `null` on an empty window. */
   verdict: LiveNavVerdict | null;
-  alarm: boolean;
+  /**
+   * TRA-3711 — the class split behind `verdict`. Read this before quoting `alarm`: the whole
+   * window can be `attention: true` at 0 trips.
+   */
+  signalClasses: LiveNavSignalClasses;
   /** Newest first. */
   byDay: LiveNavDaySummary[];
   coverage: {
@@ -911,7 +1136,18 @@ export function summarizeLiveNavTripwire(
         // the 21:00 archive on a trading day. Folding weekends in would bury a real miss
         // under ~30% expected absence (the TRA-2930 denominator mistake).
         verdict: marketDay ? ('missing' as const) : ('clean' as const),
-        alarm: marketDay,
+        // TRA-3711 — a session the writer never reached is a COVERAGE fact, so it rides
+        // `degraded`, not `alarm`. It stays just as loud: `attention`, the named
+        // `coverage.marketDaysMissing`, `consecutiveMissingSessions` and the route's
+        // WRITER DOWN note all still carry it. What it must NOT do is spend the trip
+        // channel, because the week TRA-3449 was filed for would then read the same as a
+        // real-money NAV overstatement.
+        alarm: false,
+        degraded: marketDay,
+        attention: marketDay,
+        driver: marketDay
+          ? { axis: 'writer', kind: 'coverage' as const, status: 'blind' as const, reason: 'no_assertion_row' }
+          : null,
         source: null,
         axes: null,
         lagBooks: [],
@@ -919,11 +1155,15 @@ export function summarizeLiveNavTripwire(
         postOnsetTripCapablePairs: null,
       };
     }
+    // Derived from the row's AXES, never from its stored `alarm`. A row written before
+    // TRA-3711 carries the old union boolean; reading it back would keep the pinned alarm
+    // alive across the very deploy that fixes it.
+    const signals = signalsFromAxes(rec.axes as unknown as Record<string, LiveNavAxis>);
     return {
       etDay,
       marketDay,
       verdict: rec.verdict,
-      alarm: rec.alarm,
+      ...signals,
       source: rec.source,
       axes: rec.axes,
       lagBooks: rec.lagBooks,
@@ -953,6 +1193,21 @@ export function summarizeLiveNavTripwire(
             ? 'vacuous'
             : 'clean';
 
+  // TRA-3711 — the window's channels are the OR of its sessions', so a single tripped
+  // session cannot be diluted by 44 clean ones. The driver is the driver of the WORST
+  // session, picked by the same status rank, so `driver.axis` names the axis a reader
+  // should go look at.
+  const windowAlarm = sessions.some((d) => d.alarm);
+  const windowDegraded = sessions.some((d) => d.degraded);
+  const windowDriver =
+    sessions
+      .map((d) => d.driver)
+      .filter((d): d is LiveNavDriver => d !== null)
+      .sort((a, b) => (STATUS_RANK[b.status] ?? 0) - (STATUS_RANK[a.status] ?? 0))[0] ?? null;
+
+  const sessionsTrip = sessions.filter((d) => d.alarm).length;
+  const sessionsDegradedOnly = sessions.filter((d) => !d.alarm && d.degraded).length;
+
   let consecutiveMissing = 0;
   for (const d of sessions) {
     if (d.verdict === 'missing') consecutiveMissing += 1;
@@ -979,7 +1234,18 @@ export function summarizeLiveNavTripwire(
 
   return {
     verdict,
-    alarm: verdict != null && verdict !== 'clean',
+    alarm: windowAlarm,
+    degraded: windowDegraded,
+    attention: windowAlarm || windowDegraded,
+    driver: windowDriver,
+    signalClasses: {
+      sessionsTrip,
+      sessionsDegradedOnly,
+      // By subtraction, so the three classes PARTITION the sessions by construction and a
+      // future fourth day-verdict cannot quietly fall out of the split.
+      sessionsClean: sessions.length - sessionsTrip - sessionsDegradedOnly,
+      sessionsAttention: sessionsTrip + sessionsDegradedOnly,
+    },
     byDay,
     coverage: {
       marketDaysExpected: sessions.length,
