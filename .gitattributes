@@ -1,3 +1,8 @@
 # Shell scripts must keep LF endings so they run on the Linux/PM2 host
 # regardless of the committer's platform (TRA-522 ops bootstrap script).
 *.sh text eol=lf
+
+# Git hooks are `/bin/sh` scripts with no `.sh` suffix. CRLF here is not cosmetic: a Linux
+# clone gets `/bin/sh^M: bad interpreter` and the TRA-3695 pre-push build gate silently
+# stops running on exactly the platform the deploy host uses.
+.githooks/** text eol=lf

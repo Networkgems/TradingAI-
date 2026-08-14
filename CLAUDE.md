@@ -45,6 +45,65 @@ instead of passing quietly. `.gitignore` also covers `packages/*/src` and `apps/
 that only stops a stray `git add -A` from committing the emit — **it does not stop the shadowing**.
 The guard is the part that does.
 
+## A push to `main` runs the deploy's build first. It takes ~70s and it will refuse you.
+
+`070a188a` reached `origin/main` carrying `error TS18047`, **eight further commits landed on top
+of it**, and the thing that noticed was a live deploy to the money host — which then had to be
+bisected forward commit-by-commit, briefly serving two off-tip mid-train builds. ~35 minutes off a
+critical go-live path at 02:00Z. (TRA-3695, off TRA-3671.)
+
+The defect was an **asymmetry, not a missing checker**. The *advisory* check ran pre-deploy and is
+explicitly non-blocking:
+
+```
+[render-build] lint reported issues (non-blocking for deploy; fix via CI/pre-commit)
+```
+
+…while the *blocking* one — `pnpm build`, i.e. `tsc -b --force` — ran only at deploy time. CI does
+compile the packages, but CI runs **on push to main**, which is after the commit is on the branch
+the deploy pulls from. A detector behind the branch is what we already had.
+
+```bash
+pnpm check:deploy-build              # grade HEAD in isolation
+pnpm check:deploy-build --rev=<sha>  # grade any commit
+pnpm check:deploy-build --worktree   # grade the dirty tree in place (fast local loop)
+pnpm check:deploy-build:controls
+#   0 CLEAN · 1 BROKEN (the incident) · 2 usage · 3 BLIND;  BLIND > BROKEN > CLEAN
+```
+
+It runs automatically from `.githooks/pre-push` and **refuses the push** on BROKEN *and* on BLIND —
+"could not check" and "checked and it is fine" must never share an exit code. `git push --no-verify`
+bypasses it and hands you the deploy.
+
+**`tsc -b --force` type-checks the `.test.ts` files.** A broken test file does not fail the suite —
+it fails the BUILD, without ever running. So "tests pass" is not evidence here, and neither is
+`pnpm typecheck`, whose project graph is not the graph `packages/server` compiles. The gate
+therefore runs **no proxy**: it parses the deploy's build script out of `package.json` and executes
+those segments verbatim, and reads BLIND rather than guessing if the shape changes.
+
+Which command the deploy runs is **not knowable from this repo** — `render.yaml` pins `web:build`,
+the live bqb1 log prints `[render-build]`, and they are not the same chain (`render-build`
+hardcodes four packages; `web:build` globs five — `packages/agents` is in the glob and not in the
+list). The gate grades the **union** and does not have to be right about which one the dashboard
+holds. A `render.yaml` re-pointed at some third script reads BLIND, not green.
+
+**The subject is the commit being pushed, never your working tree.** It is built in a throwaway
+`git worktree` with `node_modules` junctioned in. Grading the tree in place is wrong in both
+directions: an unstaged fix passes a broken commit, and an unrelated dirty file fails a clean one —
+and a gate that is red for reasons you did not cause gets `--no-verify`'d on day one, which is the
+same end state as no gate.
+
+`core.hooksPath` is **local** config and is not committed, so the hook file is inert until something
+arms it. That is `prepare` → `pnpm hooks:install`, run by `pnpm install`. Whether it is actually
+armed is **measured**, never assumed:
+
+```bash
+pnpm check:deploy-build --verify-hook
+```
+
+This is a gate in front of `main`, not in front of the host. It is **not** a deploy executor: the
+`autoDeploy=no` pin (TRA-1653/TRA-1665) below stands.
+
 ## Merging does not deploy. Deploying is a command you run.
 
 `tradingai-bqb1` has `autoDeploy=no` / `autoDeployTrigger=off` — **on purpose** (the launch-window

@@ -94,6 +94,37 @@ jobs:
       - name: Check for import cycles
         run: pnpm check:cycles
 
+      # TRA-3695 — the DEPLOY'S OWN build command, named as such and run FIRST.
+      #
+      # `070a188a` reached origin/main with a hard TS error and eight commits landed on top
+      # of it before a live deploy to the money host was the thing that noticed. The steps
+      # below do compile the packages, but they are `pnpm typecheck` and a package glob —
+      # NOT the chain the Render dashboard executes, and the two are not the same set
+      # (`render-build` hardcodes four packages, `web:build` globs five). This step parses
+      # the deploy's own scripts and runs those segments verbatim, so a chain that only the
+      # deploy runs cannot go ungraded here.
+      #
+      # `--worktree` is correct in CI and only in CI: actions/checkout gives a pristine tree
+      # that IS the commit, so isolation would buy nothing. Locally the gate isolates,
+      # because a developer's tree is not the commit.
+      - name: Deploy build gate — the deploy's own build command (TRA-3695)
+        run: pnpm check:deploy-build --worktree
+
+      # TRA-3695 — the gate above is a DETECTOR (it runs after the push, like everything
+      # else in this file). The BLOCKING copy is the `.githooks/pre-push` hook, and
+      # `core.hooksPath` is local config that is not committed — so "installed" is the thing
+      # that silently is not. This asserts the hook is tracked, wired to `prepare`, and that
+      # `pnpm install` above actually armed it.
+      - name: Pre-push build gate is installed (TRA-3695)
+        run: pnpm check:deploy-build --verify-hook
+
+      # TRA-3695 — the gate's own both-direction controls, run on LIVE HISTORY (needs the
+      # fetch-depth: 0 above): `070a188a` must read BROKEN and reproduce the Render log's own
+      # `(202,66) error TS18047`, and `1ff4fa7b` must read CLEAN. Without that second arm a
+      # gate hardwired to refuse would pass every other control.
+      - name: Deploy build gate controls (TRA-3695)
+        run: pnpm check:deploy-build:controls
+
       - name: Build shared packages
         run: pnpm -r --filter './packages/**' build
 

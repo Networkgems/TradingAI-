@@ -1,0 +1,14 @@
+#!/bin/sh
+# TRA-3695 — the deploy's own build command, in front of `main`, blocking.
+#
+# `070a188a` reached origin/main with a hard TS error and eight commits landed on top of
+# it before a live deploy to the money host was the thing that noticed. Nothing ran
+# `pnpm build` in front of the branch; lint ran in the Render build and is explicitly
+# non-blocking. This closes that asymmetry.
+#
+# The gate builds THE SHA BEING PUSHED in a throwaway worktree — not this working tree —
+# so uncommitted files can neither mask a broken commit nor fail a clean one. ~70s.
+#
+# It refuses on BROKEN (exit 1) and on BLIND (exit 3): "could not check" is not a pass.
+# `git push --no-verify` bypasses it and hands you the deploy.
+exec node scripts/check-deploy-build.mjs --hook
