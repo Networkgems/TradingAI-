@@ -119,6 +119,80 @@ describe('starving — the TRA-1677 signature (armed gate, empty admissible set)
   });
 });
 
+describe('TRA-3682 state — `starving: false` is TWO different worlds, and they must not render alike', () => {
+  // The defect: on 2026-08-13 `single_leg_rv` published
+  //   evaluated 0 · admitted 0 · rejectedTotal 0 · admitRate null · starving false
+  // while its producer had been compile-time OFF since 2026-06-30 (TRA-1207). Every
+  // field is individually correct; the COMPOSITE reads as "healthy, quiet day".
+  // `state` is the field that has to say the difference out loud.
+
+  it('UNFED: nothing reached the gate ⇒ no_candidates, NOT a clean bill of health', () => {
+    hydrateEntryGreeksGateFromDisk(dir, T);
+    const s = summarizeEntryGreeksGate(DAY);
+    // The exact live shape from the ticket, asserted as a unit.
+    expect(s.evaluated).toBe(0);
+    expect(s.starving).toBe(false);
+    expect(s.admitRate).toBeNull();
+    // ...and the field that stops that shape reading as OK.
+    expect(s.state).toBe('no_candidates');
+  });
+
+  it('THE DISCRIMINATOR: unfed and all-reject BOTH differ, and differ from each other', () => {
+    // Vacuity control. A `state` hardcoded to any single literal passes one of the
+    // three assertions below and fails the other two, so this test cannot green on a
+    // constant — which is the failure mode the flag it replaces actually had.
+    hydrateEntryGreeksGateFromDisk(dir, T);
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('no_candidates');
+
+    for (let i = 0; i < 40; i++) recordEntryGreeksVerdict(false, 'delta_out_of_band', DAY, 'rv-long', T);
+    const rejecting = summarizeEntryGreeksGate(DAY);
+    expect(rejecting.state).toBe('starving');
+    // Both worlds are now distinguishable by `state` alone...
+    expect(rejecting.state).not.toBe('no_candidates');
+    // ...where `admitted` alone still cannot tell them apart.
+    expect(rejecting.admitted).toBe(0);
+  });
+
+  it('a working gate reads live_firing; an all-admit gate reads live_clean', () => {
+    hydrateEntryGreeksGateFromDisk(dir, T);
+    recordEntryGreeksVerdict(true, null, DAY, 'rv-long', T);
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('live_clean');
+
+    recordEntryGreeksVerdict(false, 'delta_out_of_band', DAY, 'rv-long', T);
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('live_firing');
+  });
+
+  it('state is DERIVED, so it can never contradict the counters beside it', () => {
+    hydrateEntryGreeksGateFromDisk(dir, T);
+    for (let i = 0; i < 3; i++) recordEntryGreeksVerdict(true, null, DAY, 'rv-long', T);
+    for (let i = 0; i < 7; i++) recordEntryGreeksVerdict(false, 'theta_ratio_floor', DAY, 'rv-long', T);
+
+    const s = summarizeEntryGreeksGate(DAY);
+    expect(s.state).toBe('live_firing');
+    expect(s.evaluated).toBe(s.admitted + s.rejectedTotal);
+    expect(s.state === 'no_candidates').toBe(s.evaluated === 0);
+    expect(s.state === 'starving').toBe(s.starving);
+  });
+
+  it('survives the reboot: a hydrated all-reject day still reads starving, not no_candidates', () => {
+    // `state` must be recomputed from the DURABLE counters, not from since-boot memory —
+    // otherwise a restart silently downgrades a real starve ("suspect the gate") into
+    // no_candidates ("suspect the producer"), pointing the next reader at the wrong layer.
+    hydrateEntryGreeksGateFromDisk(dir, T);
+    for (let i = 0; i < 5; i++) recordEntryGreeksVerdict(false, 'delta_out_of_band', DAY, 'rv-long', T);
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('starving');
+
+    clearEntryGreeksLedger(); // the reboot
+    // Positive control on the reboot itself: with the ledger cleared and nothing
+    // re-read, the state MUST collapse to no_candidates — so the post-hydrate
+    // assertion below is carried by the disk, not by surviving memory.
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('no_candidates');
+
+    hydrateEntryGreeksGateFromDisk(dir, T + 6 * 60 * 60 * 1000);
+    expect(summarizeEntryGreeksGate(DAY).state).toBe('starving');
+  });
+});
+
 describe('durability across the daily-close reboot', () => {
   it('rebuilds the ET day tally from disk (the post-close grade reads the RTH session)', () => {
     // bqb1 reboots at/after the close. An in-memory since-boot counter is already `{}`

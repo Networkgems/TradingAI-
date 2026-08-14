@@ -265,6 +265,41 @@ export function hydrateEntryGreeksGateFromDisk(dir: string, now: number = Date.n
 
 // ── Health summary ───────────────────────────────────────────────────────────
 
+/**
+ * TRA-3682 — the named verdict a bare `starving: false` could not express.
+ *
+ * `starving` is defined as `evaluated > 0 && admitted === 0`, which is correct but
+ * NOT self-describing: it is also `false` when `evaluated === 0`, i.e. when nothing
+ * ever reached the gate. So a completely dead upstream renders
+ * `starving: false, admitRate: null` — which a reader scans as HEALTHY. That is the
+ * reassurance half of the same TRA-1677 ambiguity this ledger exists to kill: the
+ * gate stopped conflating "rejected everything" with "saw nothing" in its COUNTS,
+ * but its FLAGS still did.
+ *
+ * On 2026-08-13 `single_leg_rv` reported exactly this shape while its upstream
+ * producer had been compile-time OFF since 2026-06-30 (TRA-1207).
+ *
+ * Derived from the counters, never stored — so it can never disagree with them.
+ * Mirrors `guardStateOf()` in `conviction-dca-ledger.ts`, which already got this
+ * right; the two surfaces should read the same way.
+ */
+export type EntryGreeksGateState =
+  /** No candidate reached the gate at all. The gate is silent because it is UNFED — say nothing about its thresholds; look UPSTREAM. */
+  | 'no_candidates'
+  /** Candidates arrived and the gate admitted NONE. The TRA-1677 signature: suspect the GATE. */
+  | 'starving'
+  /** The gate ran and admitted every candidate it saw. */
+  | 'live_clean'
+  /** The gate ran, admitted some and refused some — the ordinary working state. */
+  | 'live_firing';
+
+function gateStateOf(admitted: number, rejectedTotal: number): EntryGreeksGateState {
+  if (admitted + rejectedTotal === 0) return 'no_candidates';
+  if (admitted === 0) return 'starving';
+  if (rejectedTotal === 0) return 'live_clean';
+  return 'live_firing';
+}
+
 export interface EntryGreeksGateSummary {
   /** Candidates the gate ADMITTED on the requested ET day. */
   admitted: number;
@@ -287,6 +322,12 @@ export interface EntryGreeksGateSummary {
    * as "suspect the gate", not "suspect the market".
    */
   starving: boolean;
+  /**
+   * TRA-3682 — the disambiguated verdict. Prefer this over `starving` when
+   * rendering: `starving: false` alone cannot distinguish "the gate is working"
+   * from "nothing ever arrived". See {@link EntryGreeksGateState}.
+   */
+  state: EntryGreeksGateState;
   /** ms epoch of the last admit / reject (null if none yet). */
   lastAdmitAt: number | null;
   lastRejectAt: number | null;
@@ -315,6 +356,7 @@ export function summarizeEntryGreeksGate(etDay: string): EntryGreeksGateSummary 
     evaluated,
     admitRate: evaluated > 0 ? Math.round((admitted / evaluated) * 10000) / 10000 : null,
     starving: evaluated > 0 && admitted === 0,
+    state: gateStateOf(admitted, rejectedTotal),
     lastAdmitAt,
     lastRejectAt,
   };
