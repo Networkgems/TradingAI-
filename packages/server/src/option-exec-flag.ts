@@ -1136,6 +1136,21 @@ export function gradeLiveOtmFleetBound(
       + `this sum — see TRA-3723`;
   }
 
+  // ⚠ A pass computed one book short is not a pass over the whole arm. The
+  // verdict itself stays honest either way — a dark book has `B_i = 0` and the
+  // order site fails closed at `no_balance_snapshot`, so it cannot spend — but
+  // COVERAGE and CORRECTNESS are different claims and the reason string must not
+  // let a reader collapse them. Measured live on the TRA-3723 deploy itself:
+  // seconds after boot, v0nni had no balance yet and the fleet read $555.73
+  // `within`, which is 74% of the authorization and looks like plenty of room.
+  if (unreadableBalanceBooks.length > 0 && verdict !== 'breach') {
+    reason +=
+      ` ⚠ PARTIAL: ${unreadableBalanceBooks.length} armed book(s) `
+      + `(${unreadableBalanceBooks.map(b => b ?? '<unnamed>').join(', ')}) had no balance `
+      + `snapshot and contributed $0 — this verdict covers ${readable.length}/${open.length} `
+      + `of the arm, and does not say what the fleet sums to once they read`;
+  }
+
   return {
     verdict,
     reason,

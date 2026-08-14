@@ -245,6 +245,33 @@ describe('TRA-3723 — the fleet fail-open the per-book clamp cannot catch', () 
       expect(g.sumBookCapUsd).toBe(750.0);
       expect(g.fleetCapitalUsd).toBe(2000.0); // readable capital only
       expect(g.verdict).toBe('within'); // honest: nothing can spend past A right now
+      // …and the reason says the pass is PARTIAL, so coverage is not read as
+      // correctness. This is not hypothetical: seconds after the TRA-3723
+      // deploy itself, v0nni had no balance snapshot and the live fleet read
+      // $555.73 `within` — 74% of the authorization, which looks like room.
+      expect(g.reason).toContain('PARTIAL');
+      expect(g.reason).toContain('v0nni');
+      expect(g.reason).toContain('1/2');
+    });
+
+    it('a FULL fleet carries no PARTIAL caveat — the marker must discriminate', () => {
+      const g = gradeLiveOtmFleetBound(
+        [bookRow('admin', ADMIN_CASH_TODAY), bookRow('v0nni', V0NNI_CASH)], A, PHI,
+      );
+      expect(g.unreadableBalanceBooks).toEqual([]);
+      expect(g.reason).not.toContain('PARTIAL');
+    });
+
+    it('a BREACH is never softened by a PARTIAL caveat — it is already over', () => {
+      // The overage is real whatever the dark book would have added; hedging it
+      // is how a loud finding gets read as a caveat.
+      const g = gradeLiveOtmFleetBound(
+        [bookRow('admin', 2000), bookRow('v0nni', V0NNI_CASH), bookRow('third', null)], A, PHI,
+      );
+      expect(g.verdict).toBe('breach');
+      expect(g.sumBookCapUsd).toBe(944.32); // the dark book added nothing and it is STILL over
+      expect(g.unreadableBalanceBooks).toEqual(['third']);
+      expect(g.reason).not.toContain('PARTIAL');
     });
   });
 });
