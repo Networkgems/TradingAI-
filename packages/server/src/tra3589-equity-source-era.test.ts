@@ -198,8 +198,18 @@ describe('TRA-3589 — the contaminated numerator refuses, and says why', () => 
     expect(r.postBaselineOptionsRealized).toBeCloseTo(0, 2);
     expect(r.postBaselineStockDaily).toBeCloseTo(0, 2);
     expect(r.postBaselineEquityGrowth).toBeCloseTo(-24_600, 2);
+    // `postBaselineEquityGrowth` is `number | null` (pnl-reconciliation.ts:1440) — the type
+    // cannot know this fixture sits on the measured side, and `pnpm build` runs
+    // `tsc -b --force` over the tests, so the arithmetic below is a compile error without a
+    // narrowing. Narrow by THROWING rather than with `!` or `?? 0`: a coerced operand would
+    // still reproduce SOME number here, and a reproduction of the shipped 24,600.00 built on
+    // a manufactured operand is exactly the evidence this test exists to refuse.
+    const equityGrowth = r.postBaselineEquityGrowth;
+    if (equityGrowth === null) {
+      throw new Error('TRA-3589 fixture: postBaselineEquityGrowth must be measured to reproduce the defect');
+    }
     const whatItUsedToPublish =
-      r.postBaselineOptionsRealized + r.postBaselineStockDaily - r.postBaselineEquityGrowth;
+      r.postBaselineOptionsRealized + r.postBaselineStockDaily - equityGrowth;
     expect(whatItUsedToPublish).toBeCloseTo(24_600, 2);
     // A book that has never opened an option cannot be short 24,600.00 OF
     // OPTIONS MONEY at any value. The figure is now NOT MEASURED, with a reason.
