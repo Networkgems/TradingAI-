@@ -231,8 +231,19 @@ for (const r of agreeRows) {
 // ("C:\…") is not a valid specifier and fails inside the ESM loader. The script argument
 // below is the opposite: a filesystem path, because that is what spawn resolves.
 const E2E_STUB = new URL('./lib/tra2387-render-api-stub.mjs', import.meta.url).href;
-const BQB1 = { id: 'srv-d7mb7rr7uimc73ev0chg', name: 'tradingai-bqb1', branch: 'main' };
-const OTHER = { id: 'srv-someothersvc', name: 'tradingai-scratch', branch: 'main' };
+// The live service as the platform actually reports it (re-measured 2026-08-14): `name` is
+// `TradingAI-`, `slug` is `tradingai-bqb1`, and the slug is what the onrender hostname
+// tracks. This stub used to carry the SLUG in the `name` field — a fixture that lies about
+// the platform in exactly the direction TRA-3719/3736/3743 keep biting. The bqb1 cases
+// below passed anyway because `isSoakHost` also disjuncts on `id`; that is the id arm
+// carrying a dead name arm, not the name arm working.
+const BQB1 = {
+  id: 'srv-d7mb7rr7uimc73ev0chg',
+  name: 'TradingAI-',
+  slug: 'tradingai-bqb1',
+  branch: 'main',
+};
+const OTHER = { id: 'srv-someothersvc', name: 'tradingai-scratch', slug: 'tradingai-scratch', branch: 'main' };
 const PORT = { key: 'PORT', value: '4000' };
 // A sha that is not a commit in any checkout: makes the commit-hold gate resolve without a
 // network round-trip, so these cases stay offline. Whatever it decides is downstream of the

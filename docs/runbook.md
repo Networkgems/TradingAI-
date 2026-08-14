@@ -597,7 +597,16 @@ log window for that deploy and prints it. Exit codes: `0` succeeded, `1` failed
   dashboard → *Account Settings → API Keys*. Keep it in the environment; never
   commit it (same rule as the `sync:false` secrets in `render.yaml`).
 - Override the target with `RENDER_SERVICE_ID=srv-…` (skips name lookup) or
-  `RENDER_SERVICE_NAME=…` (default `tradingai-bqb1`).
+  `RENDER_SERVICE_NAME=…` (default `TradingAI-`). **The service's Render `name` is
+  `TradingAI-`; `tradingai-bqb1` is its `slug`**, which is what the onrender hostname
+  tracks and what everything else in this runbook calls the host. `GET
+  /v1/services?name=tradingai-bqb1` returns `[]` — the filter is exact and
+  case-sensitive. Both helpers now accept **either** string (name is tried first, so one
+  service's slug can never shadow another's name), and a name that resolves to nothing
+  reports whether the key saw **zero** services (a key problem) or saw some and none
+  matched (a name problem). The default used to be the slug and the refusal blamed the
+  API key for it — TRA-3743, off TRA-3736/TRA-3719. `RENDER_SERVICE_ID` is still the only
+  binding that cannot drift.
 - Set `RENDER_WATCH_MS=10000` to poll until the deploy reaches a terminal state —
   handy right after a push.
 - Because it exits non-zero on a failed deploy, it can back a recurring

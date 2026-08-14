@@ -5,8 +5,9 @@
 // logs automatically?" — yes, this is that tool.
 //
 // It drives the Render REST API to:
-//   1. resolve the service (by RENDER_SERVICE_ID, or by name — default the live
-//      public backend `tradingai-bqb1`, see render.yaml / docs/runbook.md §1),
+//   1. resolve the service (by RENDER_SERVICE_ID, or by name/slug — default the live
+//      public backend, whose Render `name` is `TradingAI-` and whose `slug` — and
+//      therefore hostname — is `tradingai-bqb1`; see render.yaml / docs/runbook.md §1),
 //   2. read the LATEST deploy and print its status / commit / timings,
 //   3. if that deploy FAILED, automatically pull the build/deploy logs for the
 //      deploy's time window and print them so the failure is diagnosable
@@ -23,7 +24,9 @@
 // ── Options (env) ─────────────────────────────────────────────────────────────
 //   RENDER_API_KEY     (required) Render API key, `rnd_…`.
 //   RENDER_SERVICE_ID  (optional) `srv-…`. Skips the name lookup when set.
-//   RENDER_SERVICE_NAME(optional) service name to resolve. Default `tradingai-bqb1`.
+//   RENDER_SERVICE_NAME(optional) service name OR slug to resolve. Default `TradingAI-`.
+//                      It read `tradingai-bqb1` — the SLUG — which resolves to `[]`, and
+//                      the refusal blamed the API key for it (TRA-3743).
 //   RENDER_LOG_LIMIT   (optional) max log lines to pull on failure. Default 200.
 //   RENDER_WATCH_MS    (optional) when set, poll every N ms until the deploy
 //                      reaches a terminal state (live / failed / canceled),
@@ -35,11 +38,19 @@
 //   2  usage / auth / API error
 //   3  latest deploy is still in progress (non-terminal) and we are not watching
 
+// The shared service resolver (TRA-3743) — one implementation, one message, for this
+// script and render-redeploy.mjs.
+import {
+  DEFAULT_SERVICE_NAME,
+  resolveServiceByName,
+  explainUnresolved,
+} from './lib/render-service-resolve.mjs';
+
 const API = 'https://api.render.com/v1';
 
 const API_KEY = process.env.RENDER_API_KEY;
 const SERVICE_ID_ENV = process.env.RENDER_SERVICE_ID;
-const SERVICE_NAME = process.env.RENDER_SERVICE_NAME ?? 'tradingai-bqb1';
+const SERVICE_NAME = process.env.RENDER_SERVICE_NAME ?? DEFAULT_SERVICE_NAME;
 const LOG_LIMIT = Number(process.env.RENDER_LOG_LIMIT ?? 200);
 const WATCH_MS = process.env.RENDER_WATCH_MS ? Number(process.env.RENDER_WATCH_MS) : 0;
 
@@ -79,19 +90,15 @@ async function resolveService() {
     const svc = await api(`/services/${SERVICE_ID_ENV}`);
     return svc;
   }
-  // List API returns an array of { service } wrappers; filter by exact name.
-  const list = await api('/services', { name: SERVICE_NAME, limit: 20 });
-  const match = list
-    .map(x => x.service ?? x)
-    .find(s => s?.name === SERVICE_NAME);
-  if (!match) {
-    fail(
-      2,
-      `no service named "${SERVICE_NAME}" visible to this API key. ` +
-        `Set RENDER_SERVICE_ID or RENDER_SERVICE_NAME.`,
+  const r = await resolveServiceByName(SERVICE_NAME, path => api(path));
+  if (!r.service) fail(2, explainUnresolved(SERVICE_NAME, r));
+  if (r.matchedOn === 'slug') {
+    console.log(
+      `[render-status] resolved "${SERVICE_NAME}" by SLUG -> ${r.service.id} ` +
+        `(Render name="${r.service.name}")`,
     );
   }
-  return match;
+  return r.service;
 }
 
 async function latestDeploy(serviceId) {

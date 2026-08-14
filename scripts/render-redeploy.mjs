@@ -70,7 +70,11 @@
 //
 // ── Options ───────────────────────────────────────────────────────────────────
 //   RENDER_SERVICE_ID   (optional) `srv-…`. Default the soak host bqb1.
-//   RENDER_SERVICE_NAME (optional) resolve by name instead. Default `tradingai-bqb1`.
+//   RENDER_SERVICE_NAME (optional) resolve by name instead. Default `TradingAI-` — the
+//                       live service's Render `name`. Its SLUG `tradingai-bqb1` (which is
+//                       what the onrender hostname tracks) also resolves. That default
+//                       read `tradingai-bqb1` and resolved to `[]`, and the refusal blamed
+//                       the API key for it — TRA-3743, see scripts/lib/render-service-resolve.mjs.
 //   --commit=<sha>      (optional) deploy a specific commit; default = tip of the
 //                       service's branch (Render picks it).
 //   --clear-cache       (optional) deploy with a cleared build cache.
@@ -116,6 +120,14 @@ import {
   carriesFromVerdict,
   BLIND_ANCESTRY_CAUSES,
 } from './lib/shallow-ancestry.mjs';
+// The shared service resolver (TRA-3743). Both Render helpers had their own copy and
+// both carried the same dead default name.
+import {
+  BQB1,
+  DEFAULT_SERVICE_NAME,
+  resolveServiceByName,
+  explainUnresolved,
+} from './lib/render-service-resolve.mjs';
 
 const API = 'https://api.render.com/v1';
 
@@ -123,12 +135,20 @@ const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const API_KEY = process.env.RENDER_API_KEY;
 const SERVICE_ID_ENV = process.env.RENDER_SERVICE_ID;
-const SERVICE_NAME = process.env.RENDER_SERVICE_NAME ?? 'tradingai-bqb1';
+const SERVICE_NAME = process.env.RENDER_SERVICE_NAME ?? DEFAULT_SERVICE_NAME;
 
 // The one service under go-live soak. The freeze applies ONLY to this host; every
 // other Render service deploys with no time gate.
+//
+// ⚠️ THREE IDENTITY STRINGS, KEPT APART ON PURPOSE (TRA-3743). `SOAK_HOST_NAME` used to
+// hold `tradingai-bqb1` and was doing double duty: correct as a HOSTNAME (the hostname
+// tracks the SLUG) and DEAD as a service `name` (the live `name` is `TradingAI-`), so the
+// `service.name === SOAK_HOST_NAME` arm below could never match. It was covered by the id
+// arm beside it and so never fired — a dead disjunct in a safety predicate is still a
+// disjunct that will not be there when the id arm needs company.
 const SOAK_HOST_ID = 'srv-d7mb7rr7uimc73ev0chg';
-const SOAK_HOST_NAME = 'tradingai-bqb1';
+const SOAK_HOST_NAME = BQB1.name; //  `TradingAI-`     — Render `service.name`
+const SOAK_HOST_SLUG = BQB1.slug; //  `tradingai-bqb1` — Render `service.slug`, and the HOSTNAME
 
 // ─────────────────────────────────────────────────────────────────────────────────
 // ENV_WRITE_TRUTH (TRA-3724) — what an env/settings write does on bqb1, per VERB.
@@ -742,7 +762,10 @@ export function stalePinNote(target, tipSha, isAncestor = gitCarries) {
 //                    somebody else's critical path (TRA-2348).
 // A key that is PRESENT-but-unusable REFUSES on ANY service, in the set or not: somebody
 // set that key on purpose and then blanked it, which is positive evidence it matters there.
-export const AUTH_SECRET_REQUIRED_ON = new Set([SOAK_HOST_ID, SOAK_HOST_NAME]);
+// All three of the host's identity strings, because the call site tests membership of
+// whichever field it happens to hold. Before TRA-3743 this set held the SLUG under the
+// name of the NAME, so the `service.name` membership test at the call site was dead.
+export const AUTH_SECRET_REQUIRED_ON = new Set([SOAK_HOST_ID, SOAK_HOST_NAME, SOAK_HOST_SLUG]);
 
 // The gate's decision, as a pure function of an injected probe so it is testable without
 // the network (same idiom as commitHoldState's injected `carries`).
@@ -922,7 +945,9 @@ async function fetchEnvVarProbe(serviceId) {
 // health route is the gate going BLIND, not a usage error, and it must say so under its
 // own exit code. The deploy list is also the wrong source — it can say `live` for a build
 // the pm2 watchdog has since restarted off of (TRA-2203/TRA-2261).
-const LIVE_HEALTH_URL = process.env.ROLLBACK_LIVE_URL ?? `https://${SOAK_HOST_NAME}.onrender.com/api/health/version`;
+// SLUG, not name: the onrender hostname is derived from the slug and does not track a
+// service rename (TRA-3736/TRA-3743). This URL was always right; it is now labelled.
+const LIVE_HEALTH_URL = process.env.ROLLBACK_LIVE_URL ?? `https://${SOAK_HOST_SLUG}.onrender.com/api/health/version`;
 const LIVE_PROBE_TIMEOUT_MS = 25_000;
 
 async function fetchLiveCommit() {
@@ -966,10 +991,18 @@ async function fetchLiveCommit() {
 
 async function resolveService() {
   if (SERVICE_ID_ENV) return api(`/services/${SERVICE_ID_ENV}`);
-  const list = await api(`/services?name=${encodeURIComponent(SERVICE_NAME)}&limit=20`);
-  const match = list.map(x => x.service ?? x).find(s => s?.name === SERVICE_NAME);
-  if (!match) fail(2, `no service named "${SERVICE_NAME}" visible to this API key.`);
-  return match;
+  const r = await resolveServiceByName(SERVICE_NAME, api);
+  if (!r.service) fail(2, explainUnresolved(SERVICE_NAME, r));
+  // Say WHICH string matched. Resolving the money host by its slug is correct and
+  // supported, and it is also the exact moment an operator is one identity field away
+  // from talking to a service they did not mean.
+  if (r.matchedOn === 'slug') {
+    console.log(
+      `[render-redeploy] resolved "${SERVICE_NAME}" by SLUG -> ${r.service.id} ` +
+        `(Render name="${r.service.name}")`,
+    );
+  }
+  return r.service;
 }
 
 // Is `now` inside the RTH freeze window? Weekend deploys are always allowed (market
@@ -998,7 +1031,8 @@ async function main() {
   if (!API_KEY) fail(2, 'RENDER_API_KEY is required (never commit it).');
 
   const service = await resolveService();
-  const isSoakHost = service.id === SOAK_HOST_ID || service.name === SOAK_HOST_NAME;
+  const isSoakHost =
+    service.id === SOAK_HOST_ID || service.name === SOAK_HOST_NAME || service.slug === SOAK_HOST_SLUG;
 
   const now = new Date();
   const { frozen } = freezeState(now);
