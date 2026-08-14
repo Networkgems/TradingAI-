@@ -119,7 +119,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, LIVE_OPTION_TEST_NOTIONAL_CAP_USD, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd } from './option-exec-flag.js';
 import { lastRecordedOpenSleeve, recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
@@ -8650,17 +8650,51 @@ export class SignalEngine {
    * book that stops being live is visibly absent from the live rows rather than
    * silently missing. Read-only; no balances or credentials.
    */
+  /**
+   * TRA-3674 — the sizing basis for the bounded live-options test:
+   * `min(optionBuyingPower, totalCash, totalEquity)` over whichever of the three
+   * the broker actually reported, or `null` when NONE is usable.
+   *
+   * Extracted so the order site and the health route's per-book row derive the
+   * budget from the SAME number. They previously could not disagree (the row
+   * published a process constant); now that `B_i` is a function of the balance,
+   * a second hand-rolled derivation here would be a instrument that reads
+   * plausibly while naming a budget the order site never enforced.
+   *
+   * `null` (not 0) for "no snapshot", so the caller's fail-closed branch stays
+   * distinguishable from a genuinely empty account.
+   */
+  private liveAvailableCashUsd(): number | null {
+    const bal = this.liveTradierBalance;
+    const candidates = [bal?.optionBuyingPower, bal?.totalCash, bal?.totalEquity]
+      .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+    return candidates.length === 0 ? null : Math.min(...candidates);
+  }
+
   getLiveOtmAggregateExposure(): {
     book: string | null;
     mode: 'demo' | 'live';
     liveEntryGateOpen: boolean;
     capUsd: number;
+    fleetCapUsd: number;
+    fleetRiskFraction: number;
+    availableCashUsd: number | null;
     openPremiumAtRiskUsd: number;
     openRows: number;
     unpricedOpenRows: number;
     headroomUsd: number | null;
   } {
-    const capUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+    // TRA-3674 — the RESOLVED PER-BOOK budget, not the fleet scalar. Before
+    // this, all 67 rows reported a uniform `capUsd: 750`, so the route could
+    // not distinguish the two armed books — which is the read this ticket is
+    // graded on. `availableCashUsd: null` ⇒ `capUsd: 0`, the same fail-closed
+    // verdict the order site reaches at `no_balance_snapshot`.
+    const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+    const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
+    const availableCashUsd = this.liveAvailableCashUsd();
+    const capUsd = resolveLiveOptionTestBookAggregateCapUsd(
+      availableCashUsd, fleetCapUsd, fleetRiskFraction,
+    );
     const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
     return {
       book: this.alertUsername ?? null,
@@ -8677,6 +8711,9 @@ export class SignalEngine {
       liveEntryGateOpen:
         this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
       capUsd,
+      fleetCapUsd,
+      fleetRiskFraction,
+      availableCashUsd,
       openPremiumAtRiskUsd: atRisk.usd,
       openRows: atRisk.rows,
       unpricedOpenRows: atRisk.unpricedRows,
@@ -10653,10 +10690,10 @@ export class SignalEngine {
           }
           // Available cash — require a known live balance; fail-closed if absent (do
           // not arm real money against an unknown balance).
-          const bal = this.liveTradierBalance;
-          const availCandidates = [bal?.optionBuyingPower, bal?.totalCash, bal?.totalEquity]
-            .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0);
-          if (availCandidates.length === 0) {
+          // TRA-3674 — same derivation the health route's per-book row uses, so
+          // the published budget and the enforced one cannot drift.
+          const availableCashOrNull = this.liveAvailableCashUsd();
+          if (availableCashOrNull === null) {
             surfaceOtmLiveSkip('OTM live test skipped — no live Tradier balance snapshot to size against (fail-closed)');
             // TRA-3117 — carry `username`. This line is the ONLY trace a live
             // book with an unarmed order client leaves, and without the owner it
@@ -10675,7 +10712,7 @@ export class SignalEngine {
             scanRun.reject('no_balance_snapshot');
             continue;
           }
-          const availableCash = Math.min(...availCandidates);
+          const availableCash = availableCashOrNull;
           // TRA-2536 — the cap and the contract CEILING are both ops-settable but
           // clamped in code (see option-exec-flag.ts). `min(available cash, cap)`
           // means each open shrinks the next entry's headroom, so the window's
@@ -10712,20 +10749,50 @@ export class SignalEngine {
           // reset counter reads identically to a flat book, which would re-grant
           // the full $750 after every redeploy.
           //
-          // SCOPE: per book. Each engine sizes against its own Tradier balance
-          // and there is no fleet accumulator, so two armed books admit $750
-          // each — see the aggregate-cap note in the PR / TRA-3445 comment; the
-          // fleet number is DISCLOSED, not silently assumed to be $750.
-          const aggregateCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+          // TRA-3674 — SCOPE IS STILL PER BOOK, but the budget is now
+          // CAPITAL-PROPORTIONAL, so the fleet total is bounded without a fleet
+          // accumulator:
+          //
+          //     B_i = min( φ · availableCash , A )     Σ_i φ·E_i = φ·Σ_i E_i ≡ A
+          //
+          // The note this replaces read "two armed books admit $750 each … the
+          // fleet number is DISCLOSED, not silently assumed to be $750". The
+          // disclosure was correct and it is exactly what bit: measured
+          // 2026-08-14, admin ($1,143.96) and v0nni ($400.00) are both gate-open,
+          // so the flat cap's fleet worst case was $1,150 — $400 over the board's
+          // authorization — and v0nni's own bound was 100% OF ITS OWN ACCOUNT,
+          // because a dollar cap is equity-blind and its cash ran out before the
+          // cap could ever bite.
+          //
+          // `availableCash` is the SAME figure sized against ~40 lines up, so no
+          // new data source and no new fetch. The `min(…, A)` is kept so no
+          // single book can hold the whole authorization at any φ.
+          //
+          // Utilization is still derived from the OPEN POSITIONS, never from a
+          // since-boot counter: this box restarted six times on 2026-08-12 and a
+          // reset counter reads identically to a flat book.
+          const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
+          const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
+          const aggregateCapUsd = resolveLiveOptionTestBookAggregateCapUsd(
+            availableCash, fleetCapUsd, fleetRiskFraction,
+          );
           const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
           const fitsAggregate = fitsLiveOptionTestAggregateCap(
             atRisk.usd, testNotional, aggregateCapUsd,
           );
+          // TRA-3674 — the reason DISCLOSES all three terms the budget was
+          // resolved from. "over budget" alone reads byte-identically for a full
+          // book, a mis-resolved φ, and a collapsed balance; those are three
+          // different incidents. A guard whose rejects are unattributable is the
+          // TRA-3216 shape.
           const aggregateReason = fitsAggregate
             ? undefined
             : `OTM live test skipped — aggregate cap: $${atRisk.usd.toFixed(2)} already at risk across `
-              + `${atRisk.rows} open live position(s) + this $${testNotional.toFixed(2)} entry exceeds the `
-              + `$${aggregateCapUsd.toFixed(2)} total authorized (board TRA-3384 option A, TRA-3445)`;
+              + `${atRisk.rows} open live position(s) + this $${testNotional.toFixed(2)} entry exceeds this `
+              + `book's $${aggregateCapUsd.toFixed(2)} budget `
+              + `(= min(φ ${fleetRiskFraction} × available cash $${availableCash.toFixed(2)}, `
+              + `$${fleetCapUsd.toFixed(2)} fleet total authorized)) `
+              + `(board TRA-3384 option A, TRA-3445, capital-proportional per TRA-3674)`;
           // Recorded on BOTH verdicts. A guard whose rejects are invisible is
           // indistinguishable from an inert one (TRA-3216), and the admits are
           // what supply the `evaluated` denominator that tells "never had to
@@ -10740,6 +10807,16 @@ export class SignalEngine {
             {
               reasonCode: fitsAggregate ? undefined : 'over_aggregate_cap',
               book: this.alertUsername ?? null,
+              // TRA-3674 — admits included. `reason` is only retained on
+              // blocks, so without this the admitted rows carry no budget at
+              // all and "φ resolved correctly" would be unverifiable from the
+              // ledger on exactly the days nothing blocked.
+              budget: {
+                capUsd: aggregateCapUsd,
+                fleetCapUsd,
+                fleetRiskFraction,
+                availableCashUsd: availableCash,
+              },
             },
           );
           if (!fitsAggregate) {
@@ -10752,6 +10829,11 @@ export class SignalEngine {
               unpricedOpenRows: atRisk.unpricedRows,
               testNotional,
               aggregateCapUsd,
+              // TRA-3674 — the three terms behind `aggregateCapUsd`, so the log
+              // line is self-attributing without a join to the ledger.
+              fleetCapUsd,
+              fleetRiskFraction,
+              availableCash,
               username: this.alertUsername ?? null,
             });
             scanRun.reject('over_aggregate_cap');

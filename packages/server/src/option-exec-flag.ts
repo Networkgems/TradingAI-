@@ -762,6 +762,124 @@ export function resolveLiveOptionTestAggregateCapUsd(
   return Math.min(n, LIVE_OPTION_TEST_AGGREGATE_CEILING_USD);
 }
 
+// --------------------------------------------------------------------------
+// TRA-3674 — the aggregate cap is CAPITAL-PROPORTIONAL, not a flat per-book
+// dollar figure.
+//
+// The scalar above is enforced PER BOOK (each engine sizes against its own
+// Tradier balance; there is no fleet accumulator), which TRA-3445 disclosed
+// rather than fixed. Measured 2026-08-14T01:0xZ off `/api/health/options-live`
+// → `liveArmCensus`, TWO books hold `liveEntryGateOpen`: `admin` (***0154,
+// $1,143.96) and `v0nni` (***9652, $400.00). Under a flat $750/book cap the
+// fleet worst case is $1,150 — $400 over the board's TRA-3384 authorization —
+// and v0nni's own bound is **100% of its account**: its cash runs out before
+// the cap ever bites. A dollar-denominated cap is EQUITY-BLIND, so it
+// necessarily mis-sizes one of any two books with different balances.
+//
+// ⚠ The worst case is NOT `cap × books`. That multiplication assumes the cap is
+// what binds; run the admit loop instead. admin binds on the cap ($750), v0nni
+// binds on its own cash ($400) ⇒ $1,150, not $1,400.
+//
+// The replacement needs NO cross-engine state, which is the whole point:
+//
+//     B_i = min( φ · availableCash_i , A )        Σ_i φ·E_i = φ·Σ_i E_i ≡ A
+//
+// The fleet bound falls out of the arithmetic, so each engine needs only ITS
+// OWN balance and one shared scalar — an absolute fleet authorization becomes
+// enforceable from inside a per-book check.
+//
+// Two properties worth naming because they are the reason to prefer this over a
+// smaller flat cap:
+//   • it EQUALIZES concentration — every book lands on the same fraction of
+//     itself, rather than one at 66% and another at 100%;
+//   • it self-adjusts in the SAFE direction — a book that loses money gets a
+//     smaller budget. A fixed cap does the reverse: as a book shrinks, a flat
+//     $750 becomes an ever larger fraction of it. That is exactly how v0nni
+//     reached 100%.
+//
+// `min(…, A)` is retained so no single book can ever hold the whole
+// authorization, whatever φ resolves to.
+// --------------------------------------------------------------------------
+
+/**
+ * Compiled default fleet risk fraction φ — the share of a book's own available
+ * cash it may put at aggregate risk in the bounded live-options test.
+ *
+ * `0.4858` = 750 / 1,543.96 = the board's authorization over today's fleet
+ * capital (admin $1,143.96 + v0nni $400.00), so `Σ φ·E_i` lands on the
+ * authorization exactly. It is a DEFAULT, not a law: when fleet capital moves,
+ * ops re-points {@link LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR} — and because
+ * `min(…, A)` still caps every book, a stale φ can only ever mis-size in the
+ * bounded direction, never above `A`.
+ *
+ * ⚠ DISCLOSED, not hidden: `0.4858` is 750/1,543.96 = `0.485764…` rounded UP at
+ * the 4th place, so on today's two books `Σ B_i` = 555.73 + 194.32 = **$750.05**
+ * — five cents over the authorization, from the rounding of φ itself and not
+ * from the bound. Named here because the whole point of this ticket is that a
+ * fleet figure must be stated rather than assumed; a φ of `0.48576` clears it
+ * if the board ever wants the cent. Per book `B_i ≤ A` holds exactly.
+ */
+export const LIVE_OPTION_TEST_FLEET_RISK_FRACTION = 0.4858;
+
+/**
+ * Hard ceiling on φ. 1.0 = "a book may risk its entire own balance", which is
+ * the state TRA-3674 exists to stop being reachable by accident; no env value
+ * may authorize more than the whole account, so a larger value clamps DOWN.
+ */
+export const LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING = 1.0;
+
+export const LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
+
+/**
+ * Resolve the fleet risk fraction φ. Clamped to
+ * `(0, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING]`. Absent, malformed
+ * (`''` / `abc` / `NaN` / `Infinity`) or non-positive (`0` / `-1`) ⇒ the
+ * compiled {@link LIVE_OPTION_TEST_FLEET_RISK_FRACTION} default.
+ *
+ * Same fail-safe shape as its three siblings above, deliberately: a malformed
+ * value falls back to a bounded default rather than to 0 (which would silently
+ * dark the whole sleeve and read identically to "the market offered nothing")
+ * and never to 1.0.
+ */
+export function resolveLiveOptionTestFleetRiskFraction(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env[LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR];
+  if (typeof raw !== 'string') return LIVE_OPTION_TEST_FLEET_RISK_FRACTION;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n <= 0) return LIVE_OPTION_TEST_FLEET_RISK_FRACTION;
+  return Math.min(n, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING);
+}
+
+/**
+ * This book's aggregate premium-at-risk budget `B_i = min(φ · availableCash, A)`,
+ * USD, rounded DOWN to whole cents.
+ *
+ * FAILS CLOSED to `0` — which {@link fitsLiveOptionTestAggregateCap} rejects on
+ * — for every unusable input: an absent / non-finite / negative balance, a
+ * non-positive fleet cap, a non-positive φ. **No balance snapshot ⇒ the book
+ * takes nothing.** (The order site already fails closed one gate earlier at
+ * `no_balance_snapshot`; this is the same verdict re-derived here so the health
+ * route's row cannot publish a budget the order site would not honour.)
+ *
+ * Floored, not rounded: `Math.round` would widen the budget by up to half a
+ * cent, and TRA-3674 is a TIGHTENING-ONLY change — for every book
+ * `B_i ≤ A`, the bound in force before it.
+ */
+export function resolveLiveOptionTestBookAggregateCapUsd(
+  availableCashUsd: number | null | undefined,
+  fleetCapUsd: number,
+  fleetRiskFraction: number,
+): number {
+  if (typeof availableCashUsd !== 'number') return 0;
+  if (!Number.isFinite(availableCashUsd) || availableCashUsd < 0) return 0;
+  if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) return 0;
+  if (!Number.isFinite(fleetRiskFraction) || fleetRiskFraction <= 0) return 0;
+  const phi = Math.min(fleetRiskFraction, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING);
+  const proRata = Math.floor(availableCashUsd * phi * 100) / 100;
+  return Math.min(proRata, fleetCapUsd);
+}
+
 /** Round a USD figure to whole cents (integer cents) for exact comparison. */
 function cents(usd: number): number {
   return Math.round(usd * 100);

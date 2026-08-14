@@ -8258,9 +8258,13 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
     });
 
     it('publishes headroom per book, so "armed, $600 left" is not "armed, $0 left"', async () => {
+      // $10,000 of balance ⇒ φ·E = $4,858, so `min(…, A)` binds and the budget
+      // is the full $750. TRA-3674 is a TIGHTENING: on a rich book it changes
+      // nothing, which is what makes the poor-book test below the discriminator.
       const engine = richEngine(liveStub());
       expect(engine.getLiveOtmAggregateExposure()).toEqual({
         book: 'admin', mode: 'live', liveEntryGateOpen: true, capUsd: 750,
+        fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 10_000,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
       });
 
@@ -8268,6 +8272,81 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
       expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
         openPremiumAtRiskUsd: 700, openRows: 1, headroomUsd: 50,
       });
+    });
+
+    // ── TRA-3674 ────────────────────────────────────────────────────────────
+    // The budget is CAPITAL-PROPORTIONAL: `B_i = min(φ · availableCash, A)`.
+    // These run against the ENGINE, not the resolver, because the resolver
+    // table cannot catch the failure that matters — a call site that ignores
+    // the balance (or compiles φ in) passes every arithmetic test there is.
+    /** An engine whose live book holds exactly `usd` of available cash. */
+    function bookWithCash(stub: ReturnType<typeof liveStub>, usd: number): SignalEngine {
+      const engine = engineFor('live', stub);
+      (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
+        totalEquity: usd, totalCash: usd, optionBuyingPower: usd, dayTradeBuyingPower: usd,
+      };
+      return engine;
+    }
+
+    it('sizes the budget off THIS BOOK\'S cash — the two live books read distinct', () => {
+      // The real balances, off `liveArmCensus` 2026-08-14T01:0xZ.
+      expect(bookWithCash(liveStub(), 1143.96).getLiveOtmAggregateExposure())
+        .toMatchObject({ capUsd: 555.73, availableCashUsd: 1143.96, headroomUsd: 555.73 });
+      expect(bookWithCash(liveStub(), 400).getLiveOtmAggregateExposure())
+        .toMatchObject({ capUsd: 194.32, availableCashUsd: 400, headroomUsd: 194.32 });
+      // Under the flat cap BOTH of these read `capUsd: 750`, and the route was
+      // structurally unable to tell the two books apart. That is the defect.
+    });
+
+    it('FAILS CLOSED with no balance snapshot — budget 0, cash null, not a silent $750', () => {
+      // Explicitly dark, matching the `no_balance_snapshot` branch at the order
+      // site (a failed/absent Tradier balance fetch leaves this null). The row
+      // must NOT fall back to the fleet cap: an unreadable balance is not
+      // evidence of headroom, and `availableCashUsd: null` is what tells this
+      // apart from a genuinely empty $0 account.
+      const engine = engineFor('live', liveStub());
+      (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = null;
+      expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
+        capUsd: 0, availableCashUsd: null, headroomUsd: null,
+      });
+    });
+
+    // THE discriminator for this ticket. Everything else here is satisfied by a
+    // call site that ignores env and compiles φ in; only a test that MOVES φ and
+    // watches the order site change its mind can tell the two apart. Both
+    // verdicts are asserted, so "blocks everything" cannot pass as success.
+    it('VACUITY CONTROL — moving φ moves the ADMIT DECISION at the order site', async () => {
+      const VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
+      const saved = process.env[VAR];
+      try {
+        // A $400 book (v0nni's balance) with $150 already at risk. At the
+        // default φ the budget is $194.32, so a further entry is BLOCKED — and
+        // no broker order is placed.
+        const tightStub = liveStub();
+        const tight = bookWithCash(tightStub, 400);
+        seedOpenLivePremium(tight, 150);
+        await runOtm(tight, ['AAPL']);
+        expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 1 });
+        expect(tightStub.buyContractsLimit).not.toHaveBeenCalled();
+
+        // Same book, same balance, same already-at-risk, same candidate — the
+        // ONLY thing that changes is the env scalar. φ=1 ⇒ budget $400 ⇒ the
+        // SAME entry is now ADMITTED and the order goes to the broker.
+        process.env[VAR] = '1';
+        const looseStub = liveStub();
+        const loose = bookWithCash(looseStub, 400);
+        seedOpenLivePremium(loose, 150);
+        await runOtm(loose, ['AAPL']);
+        // `evaluated` advances, `blocked` does NOT — the delta is the admit.
+        expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 2, blocked: 1 });
+        expect(looseStub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        expect(loose.getLiveOtmAggregateExposure()).toMatchObject({
+          capUsd: 400, fleetRiskFraction: 1,
+        });
+      } finally {
+        if (saved === undefined) delete process.env[VAR];
+        else process.env[VAR] = saved;
+      }
     });
 
     // Measured on bqb1: THREE books read `mode: 'live'` and only TWO can place

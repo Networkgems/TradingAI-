@@ -176,6 +176,36 @@ export interface LiveEnforceRecord {
    */
   grossR?: number;
   /**
+   * TRA-3674 — for `aggregate_cap`, the THREE TERMS the per-book budget
+   * `B_i = min(φ · availableCash, A)` was resolved from, recorded on EVERY
+   * verdict including admits.
+   *
+   * The budget stopped being a process constant the reader could look up: it is
+   * now a function of a per-book balance that moves intra-session and of a
+   * process scalar ops can re-point. Without these terms a block is
+   * UNATTRIBUTABLE — "over budget" reads byte-identically for
+   *
+   *   • a genuinely full book,
+   *   • a φ that mis-resolved to the compiled default when ops meant to move it,
+   *   • a stale/absent balance snapshot that collapsed the budget toward 0,
+   *
+   * and those are three different incidents with three different remedies. A
+   * guard whose rejects cannot be told apart is the TRA-3216 shape.
+   *
+   * Absent ⇒ a non-`aggregate_cap` gate, or a row predating this field; that is
+   * a MISSING stamp, never a zero budget.
+   */
+  budget?: {
+    /** The resolved per-book budget `B_i` actually compared against, USD. */
+    capUsd: number;
+    /** `A` — the fleet authorization the per-book budget was clamped to, USD. */
+    fleetCapUsd: number;
+    /** φ as resolved from env at decision time (compiled default if unset/malformed). */
+    fleetRiskFraction: number;
+    /** `min(optionBuyingPower, totalCash, totalEquity)` for this book at decision time, USD. */
+    availableCashUsd: number;
+  };
+  /**
    * TRA-3510 — WHICH NOMINATOR BRANCH produced the candidate this verdict ruled
    * on (TRA-3401's `selectAdmissibleOtmCandidate`).
    *
@@ -535,6 +565,8 @@ export function recordLiveEnforceDecision(
     // every non-OTM call site, which is the honest reading: those rows were not
     // produced by the OTM nominator at all.
     nominator?: LiveEnforceNominator | null;
+    // TRA-3674 — the per-book budget's three resolved terms, admits included.
+    budget?: LiveEnforceRecord['budget'] | null;
   },
 ): void {
   const cost = opts?.cost;
@@ -557,6 +589,10 @@ export function recordLiveEnforceDecision(
     ...(costUsable ? { cost: cost! } : {}),
     ...(typeof opts?.grossR === 'number' && Number.isFinite(opts.grossR) ? { grossR: opts.grossR } : {}),
     ...(usableNominator(opts?.nominator) ? { nominator: opts!.nominator! } : {}),
+    // TRA-3674 — stamped on BOTH verdicts. The admits are what supply the
+    // denominator that tells "the budget never had to bite" apart from "the
+    // budget resolved to 0 and blocked everything silently".
+    ...(hydratedBudget(opts?.budget ?? undefined) ? { budget: opts!.budget! } : {}),
   };
   applyAndAppend(rec);
 }
@@ -590,6 +626,24 @@ function applyAndAppend(rec: LiveEnforceRecord): void {
  * sort, which silently corrupts the whole day's distribution rather than showing
  * up as one bad row.
  */
+/**
+ * TRA-3674 — is a budget block usable? ALL FOUR terms must be finite, because
+ * the block exists precisely to tell a full book apart from a mis-resolved φ
+ * and from a collapsed balance: a partial block would answer none of the three.
+ * `capUsd` may legitimately be `0` (the fail-closed no-balance verdict), so the
+ * test is finiteness, not positivity.
+ */
+function hydratedBudget(budget: LiveEnforceRecord['budget']): boolean {
+  return (
+    !!budget
+    && typeof budget === 'object'
+    && Number.isFinite(budget.capUsd)
+    && Number.isFinite(budget.fleetCapUsd)
+    && Number.isFinite(budget.fleetRiskFraction)
+    && Number.isFinite(budget.availableCashUsd)
+  );
+}
+
 function hydratedCost(cost: LiveEnforceRecord['cost']): boolean {
   return (
     !!cost
@@ -696,6 +750,10 @@ export function hydrateLiveEnforceGateFromDisk(dir: string, now: number = Date.n
       // them and hydrates as a MISSING sample (counted), never as a zero.
       ...(hydratedCost(rec.cost) ? { cost: rec.cost! } : {}),
       ...(typeof rec.grossR === 'number' && Number.isFinite(rec.grossR) ? { grossR: rec.grossR } : {}),
+      // TRA-3674 — a row written before the budget terms existed hydrates
+      // WITHOUT them (a missing stamp), never with a synthetic zero budget,
+      // which would read as "this book was allowed nothing".
+      ...(hydratedBudget(rec.budget) ? { budget: rec.budget! } : {}),
       // TRA-3510 — a row written before the nominator axis existed simply lacks
       // it and contributes no `bySelection` key. That is what makes the axis
       // honest across the deploy boundary: the retained fold's `bySelection`

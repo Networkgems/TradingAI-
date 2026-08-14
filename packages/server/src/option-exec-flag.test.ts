@@ -52,6 +52,11 @@ import {
   resolveLiveOptionTestAggregateCapUsd,
   fitsLiveOptionTestAggregateCap,
   liveOptionTestAggregateHeadroomUsd,
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION, // TRA-3674
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING,
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR,
+  resolveLiveOptionTestFleetRiskFraction,
+  resolveLiveOptionTestBookAggregateCapUsd,
   isOptionOtmDeltaFloorLiveEnforceEnabled,
   resolveOptionOtmDeltaFloorLive,
   OPTION_OTM_DELTA_FLOOR_LIVE_FLAG,
@@ -434,6 +439,147 @@ describe('fitsLiveOptionTestAggregateCap (TRA-3445)', () => {
     expect(fitsLiveOptionTestAggregateCap(0, 0, 750)).toBe(false);
     expect(fitsLiveOptionTestAggregateCap(0, 82, 0)).toBe(false);
     expect(fitsLiveOptionTestAggregateCap(0, 82, Number.NaN)).toBe(false);
+  });
+});
+
+// TRA-3674 — φ, the scalar that makes the fleet-absolute authorization
+// enforceable from inside a per-book check. Same fail-safe table as
+// `resolveLiveOptionTestAggregateCapUsd` above, deliberately: this is the
+// fourth sibling and the shape is the contract.
+describe('resolveLiveOptionTestFleetRiskFraction (TRA-3674)', () => {
+  it('returns the compiled default when UNSET — never 1.0, never 0', () => {
+    expect(resolveLiveOptionTestFleetRiskFraction({})).toBe(0.4858);
+    expect(resolveLiveOptionTestFleetRiskFraction({}))
+      .toBe(LIVE_OPTION_TEST_FLEET_RISK_FRACTION);
+  });
+
+  it('falls back to the compiled default on garbage / zero / negative', () => {
+    for (const bad of ['', '   ', 'abc', '0', '-1', '-0.5', 'NaN', 'Infinity', '-Infinity']) {
+      expect(resolveLiveOptionTestFleetRiskFraction({
+        [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: bad,
+      })).toBe(LIVE_OPTION_TEST_FLEET_RISK_FRACTION);
+    }
+  });
+
+  it('CLAMPS DOWN at 1.0 — no env value may authorize more than the whole account', () => {
+    // `5` is the acceptance-table entry: 500% of a book's own cash is exactly
+    // the state this ticket exists to make unreachable.
+    expect(resolveLiveOptionTestFleetRiskFraction({
+      [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: '5',
+    })).toBe(LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING);
+    expect(resolveLiveOptionTestFleetRiskFraction({
+      [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: '1.0001',
+    })).toBe(1.0);
+  });
+
+  it('honours a value at or below the ceiling', () => {
+    expect(resolveLiveOptionTestFleetRiskFraction({
+      [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: '0.4858',
+    })).toBe(0.4858);
+    expect(resolveLiveOptionTestFleetRiskFraction({
+      [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: '0.25',
+    })).toBe(0.25);
+    expect(resolveLiveOptionTestFleetRiskFraction({
+      [LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR]: '1',
+    })).toBe(1);
+  });
+});
+
+describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
+  const PHI = LIVE_OPTION_TEST_FLEET_RISK_FRACTION;
+
+  it('is pro-rata on the book\'s own cash, floored to whole cents', () => {
+    // The two live books, verified 2026-08-14T01:0xZ off `liveArmCensus`.
+    expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI)).toBe(555.73);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI)).toBe(194.32);
+  });
+
+  it('keeps min(…, A) — no single book may hold the whole authorization at any φ', () => {
+    // A book far larger than the fleet: pro-rata would hand it $4,858.
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, PHI)).toBe(750);
+    // …and at the ceiling φ, still clamped.
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, 1.0)).toBe(750);
+    // The env-tightened fleet cap (the TRA-3664 interim, 375) binds too.
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 375, PHI)).toBe(375);
+  });
+
+  it('TIGHTENING ONLY — B_i never exceeds the flat bound it replaces', () => {
+    // The property the ticket makes a defect if violated. Swept across the
+    // balance range that spans both live books and well beyond.
+    for (const cash of [0, 1, 100, 400, 750, 1143.96, 1543.96, 5000, 100_000]) {
+      for (const phi of [0.0001, 0.25, PHI, 0.9, 1.0]) {
+        expect(resolveLiveOptionTestBookAggregateCapUsd(cash, 750, phi))
+          .toBeLessThanOrEqual(750);
+      }
+    }
+  });
+
+  it('FAILS CLOSED to 0 — no balance snapshot means the book takes NOTHING', () => {
+    // This is the `no_balance_snapshot` verdict re-derived; `null` is what
+    // `liveAvailableCashUsd()` returns when the broker reported nothing usable.
+    for (const bad of [null, undefined, Number.NaN, Number.POSITIVE_INFINITY, -1, -0.01]) {
+      expect(resolveLiveOptionTestBookAggregateCapUsd(bad, 750, PHI)).toBe(0);
+    }
+    // …and 0 is a BLOCK downstream, not an unbounded pass.
+    expect(fitsLiveOptionTestAggregateCap(0, 0.01, 0)).toBe(false);
+  });
+
+  it('FAILS CLOSED to 0 on an unusable fleet cap or φ', () => {
+    for (const badCap of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, badCap, PHI)).toBe(0);
+    }
+    for (const badPhi of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, badPhi)).toBe(0);
+    }
+  });
+
+  it('EQUALIZES concentration — every book lands on the same fraction of itself', () => {
+    // The property that fixes v0nni: under the flat cap admin was bounded at
+    // 65.6% of its account and v0nni at 100%. Under pro-rata both land on φ.
+    const admin = resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI) / 1143.96;
+    const v0nni = resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI) / 400;
+    expect(admin).toBeCloseTo(PHI, 4);
+    expect(v0nni).toBeCloseTo(PHI, 4);
+    expect(Math.abs(admin - v0nni)).toBeLessThan(0.0001);
+    // The flat cap, for contrast — this is the disparity being removed.
+    expect(Math.min(750, 1143.96) / 1143.96).toBeCloseTo(0.6556, 3);
+    expect(Math.min(750, 400) / 400).toBe(1.0);
+  });
+
+  it('self-adjusts in the SAFE direction — a shrinking book gets a SMALLER budget', () => {
+    // The flat cap does the reverse: as a book shrinks, $750 becomes an ever
+    // larger fraction of it, which is precisely how v0nni reached 100%.
+    const shrinking = [1143.96, 800, 400, 200, 100].map((e) =>
+      resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI),
+    );
+    for (let i = 1; i < shrinking.length; i += 1) {
+      expect(shrinking[i]).toBeLessThan(shrinking[i - 1]);
+    }
+    // Concentration under the FLAT cap goes the wrong way over the same path.
+    const flatConcentration = [1143.96, 800, 400, 200, 100].map((e) => Math.min(750, e) / e);
+    for (let i = 1; i < flatConcentration.length; i += 1) {
+      expect(flatConcentration[i]).toBeGreaterThanOrEqual(flatConcentration[i - 1]);
+    }
+  });
+
+  it('Σ B_i is bounded by the authorization WITHOUT a fleet accumulator', () => {
+    // `Σ φ·E_i = φ·Σ E_i ≡ A` — the arithmetic that is the point of the ticket.
+    // Each engine used only its OWN balance to compute its own row.
+    const fleet = [1143.96, 400];
+    const sum = fleet.reduce(
+      (acc, e) => acc + resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI), 0,
+    );
+    // 555.73 + 194.32. Five cents over $750 because φ = 0.4858 is 750/1543.96
+    // rounded UP at the 4th place — an artifact of φ's precision, disclosed at
+    // the constant, NOT of the bound. Pinned so it cannot drift unnoticed.
+    expect(sum).toBeCloseTo(750.05, 2);
+    // The flat cap's worst case over the SAME fleet, for contrast — and note it
+    // is NOT `750 × 2 = 1500`. Run the admit loop: admin binds on the CAP
+    // ($750), v0nni binds on its OWN CASH ($400) ⇒ $1,150, $400 over the
+    // authorization. Multiplying a cap by a book count assumes the cap binds.
+    const flatSum = fleet.reduce((acc, e) => acc + Math.min(750, e), 0);
+    expect(flatSum).toBe(1150);
+    expect(sum).toBeLessThan(flatSum);
   });
 });
 

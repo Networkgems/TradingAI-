@@ -59,6 +59,10 @@ import {
   LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
   LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
   resolveLiveOptionTestAggregateCapUsd,
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION, // TRA-3674
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING,
+  LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR,
+  resolveLiveOptionTestFleetRiskFraction,
   isOptionCostGateLiveEnforceEnabled,
   isOptionLiquidityLiveEnforceEnabled,
   OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
@@ -427,7 +431,25 @@ export interface LiveOtmAggregateExposure {
    * `mode`-based sum overstates the fleet worst case by a whole cap.
    */
   liveEntryGateOpen: boolean;
+  /**
+   * TRA-3674 — THIS BOOK'S resolved budget `B_i = min(φ · availableCashUsd,
+   * fleetCapUsd)`, USD. Was a uniform process scalar (all 67 rows read `750`),
+   * which made the route structurally unable to tell the two armed books apart —
+   * the exact read TRA-3674 is graded on. `0` ⇒ fail-closed: no usable balance
+   * snapshot, so this book may take nothing.
+   */
   capUsd: number;
+  /** `A` — the fleet authorization every per-book budget is clamped to, USD. */
+  fleetCapUsd: number;
+  /** φ as resolved from env (compiled default when unset/malformed). */
+  fleetRiskFraction: number;
+  /**
+   * `min(optionBuyingPower, totalCash, totalEquity)` — the SIZING BASIS, not the
+   * book's paper equity. `null` ⇒ no usable live balance snapshot, which is why
+   * `capUsd` is 0; publishing the basis is what separates "this book is full"
+   * from "this book's balance went dark" from "φ mis-resolved".
+   */
+  availableCashUsd: number | null;
   openPremiumAtRiskUsd: number;
   openRows: number;
   /** > 0 ⇒ the enforced figure is known to UNDERSTATE exposure (see `foldOpenPremiumAtRisk`). */
@@ -4258,6 +4280,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       aggregateCapDefaultUsd: LIVE_OPTION_TEST_AGGREGATE_CAP_USD,
       aggregateCapCeilingUsd: LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
       aggregateCapVar: LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
+      // TRA-3674 — φ, the scalar that turns the fleet-absolute authorization
+      // above into an enforceable PER-BOOK budget `B_i = min(φ·E_i, A)`. Same
+      // publication contract as every knob on this route: the RESOLVED value
+      // beside its default/ceiling/var name, because a compiled constant reads
+      // identically on a box running a different φ. Read this WITH the per-book
+      // `capUsd` in `aggregateExposure` — φ alone does not say what any book
+      // was actually allowed, and `capUsd` alone cannot distinguish a small
+      // budget caused by a small balance from one caused by a mis-set φ.
+      fleetRiskFraction: resolveLiveOptionTestFleetRiskFraction(liveEnv),
+      fleetRiskFractionDefault: LIVE_OPTION_TEST_FLEET_RISK_FRACTION,
+      fleetRiskFractionCeiling: LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING,
+      fleetRiskFractionVar: LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR,
       // ⭐ READ THIS, NOT THE CAP ALONE. A cap value reads IDENTICALLY at
       // headroom $600 and headroom $0, and those two states are the entire
       // point of the instrument. One row per engine, computed by the same fold
@@ -4266,11 +4300,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // would claim "no books" against an unwired route.
       //
       // SCOPE IS PER BOOK (TRA-3445 item 3): each engine sizes against its own
-      // Tradier balance and there is no fleet accumulator, so N armed live
-      // books admit N × the cap. The fleet figure is a sum the reader takes —
-      // it is not bounded here — and it must be taken over the
-      // `liveEntryGateOpen` rows, NOT the `mode: 'live'` ones. bqb1 carries
-      // three of the latter and two of the former.
+      // Tradier balance and there is no fleet accumulator. TRA-3674 made that
+      // sound: each row's `capUsd` is now `min(φ · availableCashUsd,
+      // fleetCapUsd)`, so `Σ B_i ≤ φ · Σ E_i ≡ A` — the fleet bound falls out of
+      // the arithmetic and no cross-engine state is needed to hold it.
+      //
+      // ⚠ The fleet figure is still a sum the READER takes, over the
+      // `liveEntryGateOpen` rows and NOT the `mode: 'live'` ones (bqb1 carries
+      // three of the latter, two of the former) — and it is a sum of the rows'
+      // own `capUsd`, NEVER `cap × books`. That multiplication assumes the cap
+      // binds; before TRA-3674 it read $1,400 against a true worst case of
+      // $1,150, because v0nni bound on its own $400 of cash and the cap never
+      // bit. Run the admit loop, or sum this column.
       aggregateExposure: deps.liveOtmAggregateExposure?.() ?? null,
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).

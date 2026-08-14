@@ -5799,6 +5799,10 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
   function serveFeeSlippage(
     liveOtmAggregateExposure?: () => Array<{
       book: string | null; mode: 'demo' | 'live'; liveEntryGateOpen: boolean; capUsd: number;
+      // TRA-3674 — `capUsd` is now the PER-BOOK budget; these three are the
+      // terms it was resolved from, without which a small budget cannot be
+      // attributed to a small balance vs a mis-set φ.
+      fleetCapUsd: number; fleetRiskFraction: number; availableCashUsd: number | null;
       openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
       headroomUsd: number | null;
     }>,
@@ -5838,19 +5842,80 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
   });
 
   it('separates "armed, $600 headroom" from "armed, $0 headroom" per book', () => {
-    // Three live-MODE rows, TWO armed — the shape bqb1 actually serves. The
-    // fleet worst case is 2 x (, not 3: sum on `liveEntryGateOpen`.
+    // Three live-MODE rows, TWO armed — the shape bqb1 actually serves, with
+    // the real balances (admin $1,143.96 / v0nni $400.00) and the TRA-3674
+    // per-book budgets they resolve to. Sum on `liveEntryGateOpen`, not `mode`.
     const rows = [
-      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 750, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 600 },
-      { book: 'Richard', mode: 'live' as const, liveEntryGateOpen: false, capUsd: 750, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750 },
-      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 750, openPremiumAtRiskUsd: 750, openRows: 5, unpricedOpenRows: 0, headroomUsd: 0 },
+      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 405.73 },
+      { book: 'Richard', mode: 'live' as const, liveEntryGateOpen: false, capUsd: 0, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: null, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: null },
+      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 194.32, openRows: 2, unpricedOpenRows: 0, headroomUsd: 0 },
     ];
     const body = serveFeeSlippage(() => rows);
     expect(body.aggregateExposure).toEqual(rows);
     const armed = rows.filter((r) => r.liveEntryGateOpen);
     expect(armed).toHaveLength(2);
-    expect(armed.reduce((s, r) => s + r.capUsd, 0)).toBe(1_500); // the disclosed fleet bound
     expect(rows.filter((r) => r.mode === 'live')).toHaveLength(3); // the WRONG denominator
+    // TRA-3674 — the fleet bound is now the SUM OF THE ROWS' OWN BUDGETS, and it
+    // honours the board's $750 to within the disclosed 5c of φ rounding. Under
+    // the flat cap this same sum read $1,500 here and $1,150 in the real admit
+    // loop, neither of which was the authorization.
+    expect(armed.reduce((s, r) => s + r.capUsd, 0)).toBeCloseTo(750.05, 2);
+  });
+
+  // TRA-3674 — acceptance item 4. Before this the route reported a uniform
+  // `capUsd: 750` on all 67 rows and was STRUCTURALLY unable to tell the two
+  // armed books apart, which is the read the ticket is graded on.
+  it('gives the two live books DISTINCT, readable budgets', () => {
+    const rows = [
+      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 555.73 },
+      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 194.32 },
+    ];
+    const served = serveFeeSlippage(() => rows).aggregateExposure as typeof rows;
+    expect(served[0]!.capUsd).not.toBe(served[1]!.capUsd);
+    // Each budget is attributable to its own balance — the three terms travel
+    // together, so a small budget can be told apart from a mis-resolved φ.
+    for (const r of served) {
+      expect(r.capUsd).toBeCloseTo(
+        Math.min(r.fleetRiskFraction * (r.availableCashUsd ?? 0), r.fleetCapUsd), 1,
+      );
+    }
+    // …and both books land on the SAME fraction of themselves, which the flat
+    // cap could not do (admin 65.6%, v0nni 100%).
+    const conc = served.map((r) => r.capUsd / (r.availableCashUsd ?? 1));
+    expect(conc[0]).toBeCloseTo(conc[1]!, 4);
+  });
+
+  it('publishes the RESOLVED φ beside its default / ceiling / var name', () => {
+    const body = serveFeeSlippage() as unknown as {
+      fleetRiskFraction: number; fleetRiskFractionDefault: number;
+      fleetRiskFractionCeiling: number; fleetRiskFractionVar: string;
+    };
+    expect(body.fleetRiskFraction).toBe(0.4858);
+    expect(body.fleetRiskFractionDefault).toBe(0.4858);
+    expect(body.fleetRiskFractionCeiling).toBe(1.0);
+    expect(body.fleetRiskFractionVar).toBe('LIVE_OPTION_TEST_FLEET_RISK_FRACTION');
+  });
+
+  it('reports the RESOLVED φ, not the constant — a clamped env is visible as clamped', () => {
+    // The same publication contract the cap above is held to, and for the same
+    // reason: a compiled constant reads identically on a box running a
+    // different φ, which would make the per-book budgets unverifiable.
+    const VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
+    const saved = process.env[VAR];
+    try {
+      process.env[VAR] = '0.25';
+      expect((serveFeeSlippage() as unknown as { fleetRiskFraction: number }).fleetRiskFraction)
+        .toBe(0.25);
+      process.env[VAR] = '5';
+      expect((serveFeeSlippage() as unknown as { fleetRiskFraction: number }).fleetRiskFraction)
+        .toBe(1.0); // clamped DOWN
+      process.env[VAR] = 'abc';
+      expect((serveFeeSlippage() as unknown as { fleetRiskFraction: number }).fleetRiskFraction)
+        .toBe(0.4858); // fail-safe to the compiled default
+    } finally {
+      if (saved === undefined) delete process.env[VAR];
+      else process.env[VAR] = saved;
+    }
   });
 
   it('serves NULL when the provider is unwired — never [], which would claim "no books"', () => {
