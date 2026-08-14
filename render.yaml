@@ -5,17 +5,38 @@
 # for the public GitHub Pages site — `https://tradingai-bqb1.onrender.com`
 # (health verified `GET /api/health → {ok:true}`). The canonical public backend
 # URL is recorded in `apps/desktop/src/server-url.ts` (`PROD_BACKEND_URL`) and
-# the CI `VITE_SERVER_URL` secret. The `name:` below is now `tradingai-bqb1`
-# to MATCH the live service (Render derives the hostname from the service
-# name). The earlier name (`tradingai-server.onrender.com`) is dead (404); do
-# not revert `name:` to it or a re-applied blueprint will provision a SECOND,
-# empty service instead of updating the live one.
+# the CI `VITE_SERVER_URL` secret. The earlier host
+# (`tradingai-server.onrender.com`) is dead (404).
+#
+# TRA-3736 CORRECTION (CTO, 2026-08-14) — this paragraph used to say the `name:`
+# below was `tradingai-bqb1` "to MATCH the live service (Render derives the
+# hostname from the service name)". BOTH halves were false by then, and the
+# second half is the sentence that would have stopped anyone fixing the first.
+# MEASURED against `srv-d7mb7rr7uimc73ev0chg`, 2026-08-14T08:24Z:
+#
+#     service.name         = "TradingAI-"
+#     service.slug         = "tradingai-bqb1"      <- the hostname comes from HERE
+#     serviceDetails.url   = "https://tradingai-bqb1.onrender.com"
+#
+# The hostname is derived from `slug`, which is a SEPARATE, immutable field
+# stamped from the name at creation (2026-04-25) and NOT re-derived on rename.
+# So renaming the service does NOT move the public backend URL — the fear that
+# sentence encoded is unfounded, and `name` is free to be the fact.
 #
 # ⚠️ Not multi-instance safe: never run two live instances against the same
-# broker (Tradier) credentials.
+# broker (Tradier) credentials. `name:` below is the field a blueprint apply
+# matches on, which is why it is kept true to the live host — but a matching
+# name is NECESSARY, NOT SUFFICIENT, to be safe here: `GET /v1/blueprints`
+# returns `[]` on this account, i.e. bqb1 was created from the DASHBOARD and is
+# in no blueprint at all (the same fact `auth.ts` records about env blocks being
+# inert here). An apply of this file therefore has no existing blueprint to sync
+# INTO, and can still stand up a second service no matter what this line says.
+# ⛔ Treat "apply this blueprint" as an unreviewed action during go-live week,
+# not as a safe idempotent re-sync.
 #
 # TRA-549 OWNERSHIP DECISION (CTO, 2026-06-03): THIS Render service
-# (`tradingai-bqb1`) is the SINGLE owner of live (production) Tradier
+# (`srv-d7mb7rr7uimc73ev0chg`, host `tradingai-bqb1.onrender.com`) is the
+# SINGLE owner of live (production) Tradier
 # credentials — it is the only publicly-reachable backend (it serves the GitHub
 # Pages site), whereas the self-hosted PM2 process on `PG-DEVOPS14`
 # (`docs/runbook.md` §1) binds host-local with no reverse proxy and cannot be
@@ -34,7 +55,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   - type: web
-    name: tradingai-bqb1
+    # TRA-3736 (CTO, 2026-08-14) — this line read `tradingai-bqb1` and was WRONG,
+    # the same drift TRA-3719 found one field down in `buildCommand`. The live
+    # service's `name` is `TradingAI-`; `tradingai-bqb1` is its `slug` (the
+    # hostname), a different field. Corrected in the same direction as TRA-3719:
+    # THE LIVE HOST IS THE FACT. Renaming the live service to match this file was
+    # the alternative and is REJECTED — changing the money host's identity during
+    # go-live week to tidy a repo file is the wrong risk trade.
+    #
+    # Quoted deliberately: the value ends in `-`, and an unquoted trailing hyphen
+    # is the kind of scalar a future reader "cleans up" into a different string.
+    #
+    # ⛔ DO NOT resolve this service by name in tooling. `GET /v1/services?name=
+    # tradingai-bqb1` returns `[]` (measured), so a lookup keyed on the hostname
+    # silently resolves to NOBODY. Bind by service id `srv-d7mb7rr7uimc73ev0chg`,
+    # or by live-SHA identity the way `check-deploy-train-window.mjs` does.
+    name: "TradingAI-"
     runtime: node
     # TRA-1683 — `pro` (4 GB). THIS LINE IS LOAD-BEARING FOR THE WATCHDOG.
     #
