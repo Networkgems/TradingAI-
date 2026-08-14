@@ -1072,6 +1072,91 @@ describe('TRA-3494 — the bar counts market DAYS on the live-money cohort', () 
     expect(days.map(d => d.date)).toEqual([D1]);
   });
 
+  it('REGRESSION — an UNSTARTED day is `in_flight`, not a vacuous "no tape was written"', () => {
+    // The live 2026-08-14 shape, read off the box at 05:04Z = 01:04 ET, 8.5h
+    // BEFORE the bell. Both live books were enumerated absent (no file exists
+    // pre-open, because the feed never writes — only a drain does), the day had
+    // zero observations, and it fell through to `vacuous` carrying the reason
+    // "no live-money tape file was written for this market day". That asserts a
+    // SETTLED fact about a session that has not opened.
+    const days = computeBarDays([], [`admin/live@${D2}`, `v0nni/live@${D2}`], D2);
+    expect(days).toHaveLength(1);
+    expect(days[0].live).toBe('in_flight');
+    expect(days[0].vacuousReason).toBeUndefined();
+    expect(days[0].inFlightReason).toContain('has not settled');
+    // The absence is still PUBLISHED on the row — it is only the promotion gate
+    // that must not read it as real yet.
+    expect(days[0].liveAbsent).toBe(2);
+    expect(days[0].liveAbsentBooks).toEqual(['admin/live', 'v0nni/live']);
+  });
+
+  it('REGRESSION — a not-yet-settled absence is DEFERRED from the promotion gate, and counted while deferred', async () => {
+    // `barDaysWithLiveAbsence` read 4 on the live box when only 3 were real:
+    // today's two phantom absences added a day to a field published as blocking
+    // promotion. The deferral must be visible, never a silent decrement.
+    const dir = await mkdtemp(join(tmpdir(), 'tra3116-unstarted-'));
+    await flushDenominatorFlipTape({
+      targetDir: dir, date: D1,
+      dump: { rows: [], droppedCandidates: 0, saturated: false, capacity: DENOM_FLIP_TAPE_CAPACITY, admitted: 0 },
+      admissionRule: { changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP, capacity: DENOM_FLIP_TAPE_CAPACITY },
+      trigger: 'eod',
+      processStartedAt: `${D1}T12:00:00.000Z`,
+      now: Date.parse(`${D2}T01:00:00.000Z`),
+    });
+    // One live book with a settled D1 tape; D2 is "today" and has no file yet,
+    // so the absence sweep mints `admin/live@D2`.
+    const summary = await summarizeDenominatorFlipTape(
+      [{ username: 'admin', mode: 'live', targetDir: dir }],
+      { todayEt: D2 },
+    );
+    expect(summary.barDays.map(d => d.live)).toEqual(['counted', 'in_flight']);
+    expect(summary.sessionsTowardBar).toBe(1);
+    expect(summary.barDaysWithLiveAbsence).toBe(0);
+    expect(summary.barDaysWithLiveAbsenceInFlight).toBe(1);
+    // Deferral only — the raw absence is untouched in the denominator.
+    expect(summary.absent).toBe(1);
+    expect(summary.absentSessions).toEqual([`admin/live@${D2}`]);
+  });
+
+  it('the unstarted-day clock is consulted ONLY where the segment ledger is silent', () => {
+    // The guard consequence 0 demands: at the 21:15 ET fire the day being
+    // banked IS `todayEt`, so a blanket date compare would drop the session the
+    // drain just wrote. With an observation present the ledger still decides.
+    const settledToday = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D2,
+      observedMs: 0, uncoveredMs: 23_400_000, coverageComplete: false, eodFlushed: true,
+      countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+    })], [], D2);
+    expect(settledToday[0].live).toBe('failed');
+    expect(settledToday[0].inFlightReason).toBeUndefined();
+
+    const cleanToday = computeBarDays([session({ username: 'admin', mode: 'live', date: D2 })], [], D2);
+    expect(cleanToday[0].live).toBe('counted');
+
+    // ...and a PAST day with nothing observed is still genuinely vacuous.
+    const pastEmpty = computeBarDays([], [`admin/live@${D1}`], D2);
+    expect(pastEmpty[0].live).toBe('vacuous');
+    expect(pastEmpty[0].vacuousReason).toContain('no live-money tape file was written');
+  });
+
+  it('`in_flight` never ships without naming WHICH of its two causes fired', () => {
+    const open = computeBarDays([session({
+      username: 'admin', mode: 'live', date: D2, eodFlushed: false,
+      coverageComplete: false, countsTowardBar: false, disqualifiers: ['coverageComplete:false'],
+    })], [], D2);
+    expect(open[0].live).toBe('in_flight');
+    expect(open[0].inFlightReason).toContain('no EOD drain has landed');
+    // The two causes are distinguishable, which is the point of the field.
+    expect(open[0].inFlightReason).not.toContain('has not settled');
+  });
+
+  it('with NO clock supplied every day is treated as settled (no silent behaviour change)', () => {
+    // `todayEt: ''` is the "no clock" contract. It must not turn every absence
+    // day into a phantom in-flight one.
+    const days = computeBarDays([], [`admin/live@${D2}`], '');
+    expect(days[0].live).toBe('vacuous');
+  });
+
   it('an ABSENT live tape is PUBLISHED, and cannot vacuously bank a day on its own', () => {
     const days = computeBarDays([], [`admin/live@${D2}`, `demo0/demo@${D2}`]);
     expect(days).toHaveLength(1);

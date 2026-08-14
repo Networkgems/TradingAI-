@@ -72,6 +72,28 @@
  *      off the segment ledger (`some(trigger === 'eod')`), never off a date
  *      comparison: at 21:15 ET the current ET day and `todayEt` are the SAME
  *      string, so a date compare would drop the session it just observed.
+ *   0b. **An UNSTARTED day is `in_flight` too — consequence 0 has an unguarded
+ *      sibling.** Consequence 0 only reaches a day that HAS a live tape file.
+ *      Pre-open there is no file at all (the feed never writes; a file appears
+ *      only at the EOD drain or a shutdown drain), so `observed.length === 0`
+ *      and the day fell through to `vacuous` carrying the reason "no
+ *      live-money tape file was written for this market day" — a SETTLED claim
+ *      about a session that has not opened. Measured live on 2026-08-14 at
+ *      05:04Z (01:04 ET, 8.5h before the bell): the day was already in the
+ *      ledger as `vacuous`, and its two phantom absences pushed
+ *      `barDaysWithLiveAbsence` from 3 to 4 — a field published as blocking
+ *      promotion until explained. So a day at or after `todayEt` with nothing
+ *      observed is `in_flight`, not `vacuous`.
+ *      This does NOT reintroduce the date compare consequence 0 forbids. The
+ *      ledger still decides whenever there is a ledger to read; the clock is
+ *      consulted ONLY where the ledger is empty and therefore silent. At the
+ *      21:15 ET fire the drain has landed, `observed.length > 0`, and this
+ *      branch is not reached — the session it just observed is still graded.
+ *      The residual is named rather than hidden: if today's drain genuinely
+ *      wrote nothing for a live book, that absence reads `in_flight` today and
+ *      only surfaces as `vacuous` + absent tomorrow, when `todayEt` moves on.
+ *      A one-day deferral of a signal, published as
+ *      `barDaysWithLiveAbsenceInFlight`, never a lost one.
  *   1. **A day with no live observation is `vacuous`, its own third state.** It
  *      is neither counted nor failed. Folding it into either direction is the
  *      bug: counted mints a free credit off an empty cohort (`every` is true on
@@ -171,7 +193,10 @@ const KNOWN_MODES = new Set(['live', 'demo', 'sandbox']);
  *   `failed`    — settled, and an observed live book missed the per-session bar.
  *   `vacuous`   — the deciding cohort was EMPTY that day. Says nothing in either
  *                 direction; folding it either way is the bug.
- *   `in_flight` — the session is still open (no EOD drain has landed). NOT a
+ *   `in_flight` — the session is NOT SETTLED. Two ways in, and `inFlightReason`
+ *                 tells them apart: the day's tape exists but no EOD drain has
+ *                 landed, or the day is at/after `todayEt` and has produced
+ *                 nothing yet (pre-open, so there is no file to read). NOT a
  *                 failure: the current day reads `coverageComplete:false` all day
  *                 by construction, because the RTH window it is measured against
  *                 has not elapsed yet.
@@ -185,6 +210,12 @@ export interface TapeBarDay {
   live: TapeBarDayState;
   /** Always set when `live === 'vacuous'`; never set otherwise. */
   vacuousReason?: string;
+  /**
+   * Always set when `live === 'in_flight'`; never set otherwise. The two ways in
+   * are not the same finding — an open session HAS observed something, an
+   * unstarted day has not — so the state never ships without naming which.
+   */
+  inFlightReason?: string;
   /** Live books whose tape shows the process actually observed something. */
   liveObserved: number;
   /** ...and how many of those cleared the per-session bar. */
@@ -240,8 +271,24 @@ export interface TapeSummary {
   barDaysInFlight: number;
   /** Days on which an observed live book missed the per-session bar. */
   barDaysFailed: number;
-  /** Days with >=1 live book absent. Published; gates promotion, not the count. */
+  /**
+   * SETTLED days with >=1 live book absent. Published; gates promotion, not the
+   * count.
+   *
+   * Settled-only because an `in_flight` day's absence is PREMATURE, not real:
+   * pre-open every live book is "absent" simply because the drain that writes
+   * its file has not run. Counting those inflated the promotion gate by one
+   * every single day between midnight ET and the first flush (measured 4 vs a
+   * true 3 on 2026-08-14 at 01:04 ET). The deferred ones are not dropped — see
+   * `barDaysWithLiveAbsenceInFlight`.
+   */
   barDaysWithLiveAbsence: number;
+  /**
+   * The exclusion above, counted rather than silent. Non-zero means "an absence
+   * exists on a day that has not settled yet, and it will be re-graded once it
+   * does" — never "no absence".
+   */
+  barDaysWithLiveAbsenceInFlight: number;
   /** REJECTED quorum B1, published alongside so the ruling stays auditable. */
   barDaysAnyBook: number;
   /** REJECTED quorum B2, likewise. */
@@ -304,6 +351,14 @@ function liveSessionObserved(s: TapeSessionSummary): boolean {
 export function computeBarDays(
   sessions: readonly TapeSessionSummary[],
   absentSessions: readonly string[] = [],
+  /**
+   * The CURRENT ET day, `YYYY-MM-DD`. Consulted for consequence 0b ONLY — the
+   * unstarted-day branch, where there is no segment ledger to read. Empty
+   * string means "no clock available", under which every day is treated as
+   * settled and this function behaves exactly as it did before TRA-3116's
+   * unstarted-day fix.
+   */
+  todayEt = '',
 ): TapeBarDay[] {
   const byDate = new Map<string, TapeSessionSummary[]>();
   for (const s of sessions) {
@@ -340,6 +395,7 @@ export function computeBarDays(
 
     let live: TapeBarDayState;
     let vacuousReason: string | undefined;
+    let inFlightReason: string | undefined;
     // Settled-ness is asked FIRST, because an open session fails the per-session
     // grade by construction: it is measured against an RTH window that has not
     // elapsed yet, so `uncoveredMs` is the whole window and `coverageComplete` is
@@ -348,6 +404,18 @@ export function computeBarDays(
     const settled = observed.some(s => s.eodFlushed !== false);
     if (observed.length > 0 && !settled) {
       live = 'in_flight';
+      inFlightReason =
+        'a live-money tape exists for this day but no EOD drain has landed yet — the session is still open';
+    } else if (observed.length === 0 && todayEt !== '' && date >= todayEt) {
+      // Consequence 0b. The ledger is EMPTY here, so it cannot answer, and the
+      // clock can: a day that has not finished cannot have been observed in
+      // full. Reached only pre-open / pre-first-flush — by the 21:15 ET fire
+      // the drain has written and the branch above owns the day instead.
+      live = 'in_flight';
+      inFlightReason =
+        date > todayEt
+          ? 'this market day is in the FUTURE relative to the process clock — it cannot have settled'
+          : 'the current ET market day has not settled: no live-money tape exists yet, which is indistinguishable from one not yet written';
     } else if (observed.length === 0) {
       // Consequence 1. NOT counted (an empty cohort must never mint a credit)
       // and NOT failed (an idle live book must never veto the bar).
@@ -366,6 +434,7 @@ export function computeBarDays(
       date,
       live,
       ...(vacuousReason ? { vacuousReason } : {}),
+      ...(inFlightReason ? { inFlightReason } : {}),
       liveObserved: observed.length,
       liveClean: clean.length,
       liveIdle: liveSessions.length - observed.length,
@@ -491,7 +560,7 @@ export async function summarizeDenominatorFlipTape(
   // TRA-3494 — the bar is counted off DAYS, not book-days. `complete` above is
   // the pooled book-day number that read 64/10 on night one; it stays in the
   // payload as `completeBookSessions`, it just no longer gates anything.
-  const barDays = computeBarDays(sessions, absentSessions);
+  const barDays = computeBarDays(sessions, absentSessions, opts.todayEt);
   const unclassifiedModes = [...new Set(books.map(b => b.mode).filter(m => !KNOWN_MODES.has(m)))].sort();
 
   return {
@@ -512,7 +581,8 @@ export async function summarizeDenominatorFlipTape(
     barDaysVacuous: barDays.filter(d => d.live === 'vacuous').length,
     barDaysInFlight: barDays.filter(d => d.live === 'in_flight').length,
     barDaysFailed: barDays.filter(d => d.live === 'failed').length,
-    barDaysWithLiveAbsence: barDays.filter(d => d.liveAbsent > 0).length,
+    barDaysWithLiveAbsence: barDays.filter(d => d.liveAbsent > 0 && d.live !== 'in_flight').length,
+    barDaysWithLiveAbsenceInFlight: barDays.filter(d => d.liveAbsent > 0 && d.live === 'in_flight').length,
     barDaysAnyBook: barDays.filter(d => d.anyBookClean).length,
     barDaysAllBooks: barDays.filter(d => d.allBooksClean).length,
     unclassifiedModes,
