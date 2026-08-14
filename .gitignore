@@ -56,3 +56,9 @@ apps/desktop/src/**/*.js.map
 apps/desktop/src/**/*.d.ts
 apps/desktop/src/**/*.d.ts.map
 !apps/desktop/src/vite-env.d.ts
+
+# TRA-3727 — the counterfactual replay harness caches raw chain partitions here
+# (`--cache=`, default `.tra3727-cache`). One run of the default population is
+# ~76 MB of recorded option chains; it is a rebuildable mirror of
+# `/api/health/chain-capture/partition/:date`, never a source artifact.
+.tra3727-cache/
