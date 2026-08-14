@@ -24,15 +24,19 @@
 // The freeze itself starts DEPLOY_LEAD_MIN earlier than that, because the thing that
 // breaks the soak is the BOOT, not the API call — see below.
 //
-// ── What this gate does NOT cover (TRA-2325) ──────────────────────────────────
+// ── What this gate does NOT cover (TRA-2325, NARROWED BY MEASUREMENT — TRA-3724) ──
 // It intercepts DEPLOYS. It does not — and structurally cannot — intercept an
-// ENV/SETTINGS write, and an env write on this service redeploys it anyway with
-// `trigger: service_updated`, *despite* `autoDeploy: no` (measured on bqb1:
-// dep-d9h1j5nlk1mc738s57qg, 13:39:34Z, 9.5 min into RTH — TRA-2186). Nor does it see
-// the memory watchdog's own pm2 self-restart, which writes no deploy record at all
-// (TRA-2203/TRA-2261).
+// ENV/SETTINGS write. Nor does it see the memory watchdog's own pm2 self-restart,
+// which writes no deploy record at all (TRA-2203/TRA-2261).
 // ⇒ A GREEN RUN OF THIS SCRIPT IS NOT EVIDENCE THAT THE HOST IS SAFE TO TOUCH.
 //   It is evidence about one of the three paths that can boot the box.
+//
+// What an env/settings write actually DOES is verb-dependent and was measured wrong
+// here for three weeks. The per-verb truth, the safe apply path, and the one sentence
+// that used to steer operators off it all live in ENV_WRITE_TRUTH below — read that,
+// not this paragraph, and do not restate its claims inline anywhere. The reason the
+// correction needed a ticket is that the wrong version had been copy-pasted to seven
+// sites in this file, so fixing one site left six lying.
 //
 // ── The AUTH_SECRET value gate (TRA-2387, residual of TRA-2315) ───────────────
 // The three gates above answer "may I deploy NOW?" (freeze, embargo) and "may I deploy
@@ -125,6 +129,133 @@ const SERVICE_NAME = process.env.RENDER_SERVICE_NAME ?? 'tradingai-bqb1';
 // other Render service deploys with no time gate.
 const SOAK_HOST_ID = 'srv-d7mb7rr7uimc73ev0chg';
 const SOAK_HOST_NAME = 'tradingai-bqb1';
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// ENV_WRITE_TRUTH (TRA-3724) — what an env/settings write does on bqb1, per VERB.
+//
+// This block replaces the sentence this file used to print at seven sites:
+//
+//     "An env/settings write redeploys this service from its BRANCH TIP immediately
+//      and unguarded (trigger: service_updated, TRA-2186). It does NOT honour --commit"
+//
+// The first half was true when written and is no longer reproducible. The second half
+// was never true, and it is the half that cost us: on 2026-08-14 it told the operator
+// holding TRA-3708 that pinning was futile, so the recovery reached for an untargeted
+// POST /deploys, resolved the branch tip, and shipped five unrelated commits — including
+// `signal-engine.ts +110` on the real-money OTM entry path — into this host 9.5 hours
+// before the go-live-week open. Nobody decided that; the omitted flag did.
+//
+// ── The measurement (Render events API, ALL 1161 deploy_started, 2026-04-25 → 08-14) ──
+// Render stamps every deploy with the cause. The markers are disjoint, so the verbs are
+// distinguishable from the record alone — nothing here is inferred:
+//
+//   marker                  cause                                n    LAST occurrence
+//   ----------------------  -----------------------------------  ---  -------------------
+//   newCommit:<sha>         git push auto-deploy                 854  2026-07-12T20:34Z
+//   user:{...}              POST /deploys  (this script)         280  2026-08-14T05:48Z
+//   envUpdated:true         an ENV-VAR write                      22  2026-07-23T13:39Z
+//   updatedProperty:<name>  a SETTINGS write, PATCH /services/{id} 4  2026-04-28T04:11Z
+//   firstBuild:true         service creation                       1  2026-04-25T12:30Z
+//
+// VERB 1 — ENV-VAR WRITE. TRA-2186 was RIGHT when it was written, and its artifact holds
+//   up: dep-d9h1j5nlk1mc738s57qg, 2026-07-23T13:39:34Z, `trigger:"service_updated"`,
+//   event trigger `envUpdated:true` with NO `user` (Render-initiated, not operator-
+//   initiated). It shipped `1e5c4883` — the branch tip, pushed 13:25:32Z, fourteen
+//   minutes earlier — and NOT `9493b4ec`, the commit the same operator had deliberately
+//   deployed at 13:23Z. So "redeploys from BRANCH TIP, despite autoDeploy:no" is measured
+//   true for that occurrence: git-push deploys had already stopped on 07-12, so the pin
+//   was in force and did not suppress it.
+//   BUT that occurrence is the LAST of the 22, and there have been ZERO since, across at
+//   least two subsequent env writes on this service:
+//     · 2026-07-24 ~15:55Z  TRADIER_ENV -> "production"  (TRA-2163 remediation)
+//     · 2026-08-14T03:53Z   PUT /env-vars/ENABLE_OPTION_LIVE_OTM -> HTTP 200 (TRA-3708);
+//       no deploy, no event of any kind — the stream goes deploy_ended 02:23:55.856Z
+//       straight to server_restarted 03:53:53.783Z.
+//   Service now reads `autoDeploy:"no"`, `autoDeployTrigger:"off"`. Do NOT trust this
+//   paragraph over the live reading the script prints; see envWriteAutoDeployPosture().
+//
+// VERB 2 — SETTINGS WRITE, `PATCH /v1/services/{id}`. A DIFFERENT verb: Render labels it
+//   `updatedProperty`, never `envUpdated`. Only 4 in this service's whole life (build
+//   command, start command, Plan, Disk), all 2026-04-25/28, all long before the pin.
+//   ⇒ UNMEASURED under the current pin, and deliberately left untested: the only way to
+//   test it is to write a setting on the real-money host during go-live week, which is
+//   the exact unguarded branch-tip deploy this block exists to prevent. THE WARNING IS
+//   RETAINED FOR THIS VERB. Treat a settings write as capable of shipping the tip.
+//
+// VERB 3 — FULL-SET `PUT /v1/services/{id}/env-vars`. BANNED (TRA-2136: it REPLACES the
+//   entire set and wiped 19 secrets). Its deploy behaviour is unmeasured and irrelevant —
+//   it is banned for the wipe, not for the deploy. Never run it to find out.
+//
+// VERB 4 — `--commit` / `commitId`. The old claim was a CATEGORY ERROR. A `service_updated`
+//   deploy is created by Render, not by this script, so there is no `--commit` in that path
+//   to honour or ignore. The deploys this script creates DO honour it: 280 api deploys,
+//   including the TRA-3671 bisect, which deployed six commits BY SHA to this same service
+//   (f9f4bd7354be, 070a188a5f08, 606be9e5693b, 4ed46445daa3, 8713331519bc, 1ff4fa7be6f1),
+//   most of them not the tip. `--commit` is honoured. Pinning is not futile. Pin.
+//
+// ── THE ENV-ONLY APPLY PATH (this is the instruction that was missing) ───────────────
+//   To apply an env-level change on bqb1 with a ZERO-BYTE code delta:
+//
+//       node scripts/render-redeploy.mjs --commit=<THE SHA ALREADY SERVING>
+//
+//   i.e. POST /deploys with `commitId` = the currently-live commit. Render materialises
+//   env vars into the deploy AT DEPLOY TIME regardless of which commit it targets, so
+//   re-deploying the serving commit bakes the new env and ships no code.
+//   MEASURED ON THIS SERVICE, the day after TRA-2186's incident: the 07-24 ~15:55Z
+//   TRADIER_ENV write was applied by deploys at 15:58:03Z and 16:13:30Z, BOTH of
+//   `8a7ecf50eee4` — the commit already live since 12:50:42Z. Same commit in, same commit
+//   out, env applied.
+//   Get the serving sha from the host itself, never from git:
+//       curl -s https://tradingai-bqb1.onrender.com/api/health/options-live \
+//         | python -c "import sys,json;b=json.load(sys.stdin)['build'];print(b['commitShort'],b['startedAt'])"
+//
+// ── `POST /restart` IS NOT AN ENV-APPLY MECHANISM ────────────────────────────────────
+//   It re-launches the instance from the EXISTING deploy's spec, i.e. it replays the env
+//   snapshot resolved when that deploy was created. A write made AFTER the last deploy is
+//   structurally invisible to it. That is why the 2026-08-14T03:53:53Z restart still
+//   published `otmFlagOn:true` off a spec built at 02:21:34Z, and why the operator
+//   concluded the env write had not taken and escalated to an untargeted deploy.
+//
+// ── IS A CODE FREEZE THE SAME FREEZE AS AN ENV FREEZE ON THIS HOST? ─────────────────
+//   NO — PROVIDED THE OPERATOR PINS. An env-only change can be applied by deploying the
+//   serving sha, which is a zero-byte code delta, so an env freeze can be lifted while a
+//   code freeze holds. They collapse into ONE freeze only when the apply is UNPINNED,
+//   because an unpinned POST /deploys resolves the branch tip and ships whatever landed.
+//   The freeze is separable; the separation is bought entirely by `--commit`.
+//   (Both remain subject to the RTH freeze and any embargo below: pinning removes the
+//   CODE delta, it does not remove the BOOT, and the boot is what resets the soak clock.)
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// The one-paragraph version, printed wherever this file used to print the wrong claim.
+// Single source of truth on purpose: the defect TRA-3724 fixed was seven copies drifting
+// together. If you need to say this somewhere new, CALL this — do not paraphrase it.
+const ENV_WRITE_CAVEAT_SHORT =
+  'This gate sees DEPLOYS only. An env/settings write does not pass through it. A SETTINGS\n' +
+  '  write (PATCH /services) can still redeploy from the BRANCH TIP unguarded — hold those by\n' +
+  '  hand. An ENV-VAR write has produced no deploy on this host since 2026-07-23 (TRA-3724),\n' +
+  '  so it applies NOTHING until you deploy: apply it with --commit=<sha already serving>,\n' +
+  '  which bakes the env with a zero-byte code delta. --commit IS honoured. POST /restart is\n' +
+  '  NOT an env-apply path — it replays the last deploy\'s env snapshot.';
+
+// Report the LIVE setting rather than a compiled belief. The 2026-07-23 -> 08-14 change in
+// env-write behaviour is not attributable to any code we own, so a hard-coded claim here
+// ages silently; these two fields are the ones that actually govern it. They are TOP-LEVEL
+// on the Render service object, not under serviceDetails (TRA-1665).
+function envWriteAutoDeployPosture(service) {
+  const ad = service?.autoDeploy ?? '(unread)';
+  const adt = service?.autoDeployTrigger ?? '(absent)';
+  const suppressed = ad === 'no' && adt === 'off';
+  return {
+    autoDeploy: ad,
+    autoDeployTrigger: adt,
+    suppressed,
+    line:
+      `autoDeploy=${ad} autoDeployTrigger=${adt} — ` +
+      (suppressed
+        ? 'env-var writes are NOT expected to self-deploy here (matches every reading since 2026-07-23)'
+        : 'THIS HOST MAY SELF-DEPLOY FROM THE BRANCH TIP ON AN ENV/SETTINGS WRITE — re-read TRA-3724 before writing anything'),
+  };
+}
 
 // RTH window, in UTC minutes-of-day, matching tra1648_soak_check.mjs.
 const RTH_OPEN_MIN = 13 * 60 + 30; // 13:30Z
@@ -359,16 +490,24 @@ export function commitHoldState(now, target, table = COMMIT_HOLDS) {
 
 // ── The env-write escape hatch underneath Gate 0 (TRA-2306) ───────────────────
 // Gate 0 (AUTH_SECRET, exit 7) runs BEFORE the commit-hold and embargo gates, and its
-// remediation — "set a real AUTH_SECRET on the service" — is an ENV WRITE. An env write
-// redeploys this service from its BRANCH TIP on the spot (trigger: service_updated, despite
-// autoDeploy: no — TRA-2186). So the gate that fires FIRST is the one whose printed FIX can
-// ship whatever the tip carries, and it exits before the caller has been shown either of the
-// gates that exist to refuse that tip. Gate 2's refusal text already carries this warning
-// ("hold those by hand"); a caller stopped at Gate 0 never reaches it.
+// remediation — "set a real AUTH_SECRET on the service" — is an ENV WRITE. It exits before
+// the caller has been shown either of the gates that exist to refuse the tip, and Gate 2's
+// refusal text is where that warning normally lives, so it is restated here.
 //
-// Two details that are easy to get backwards:
-//   • Evaluate the hold against the TIP, never against --commit. An env write does not
-//     honour --commit, so naming a hold-clear SHA does not make the write safe.
+// NARROWED 2026-08-14 (TRA-3724) — see ENV_WRITE_TRUTH. The dangerous half of what this
+// block used to say is gone:
+//   • An ENV-VAR write has produced no deploy on this host since 2026-07-23, so the
+//     realistic failure is now the OPPOSITE one: the operator writes the secret, sees the
+//     box still serving the old value, and escalates to an UNPINNED deploy that ships the
+//     tip. The tip is still the thing that gets shipped; the write is no longer what ships
+//     it. Evaluate the hold against the TIP anyway — that is what an unpinned recovery
+//     resolves to.
+//   • --commit IS honoured by POST /deploys. Apply the secret with
+//     --commit=<sha already serving>: it bakes the env with a zero-byte code delta and is
+//     the only apply path that respects a commit hold. The old text said the reverse and
+//     that is what steered TRA-3708 into a five-commit train.
+//   • A SETTINGS write (PATCH /services) is a different verb and remains untested under
+//     the pin — assume it CAN still ship the tip.
 //   • BLIND blocks too (authSecretBlocks), and BLIND means the secret could not be READ —
 //     not that it is wrong. On BLIND the printed FIX asks for a write that was never
 //     needed, which is exactly the case where this warning is load-bearing.
@@ -390,13 +529,23 @@ export function envWriteHoldWarning({ holdCheck, embargo, isSoakHost }) {
   }
   if (lines.length === 0) return '';
   return (
-    `\n  ⛔ DO NOT FIX THIS WITH AN ENV WRITE RIGHT NOW. An env/settings write redeploys this\n` +
-    `  service from its BRANCH TIP immediately and unguarded (trigger: service_updated,\n` +
-    `  TRA-2186). It does NOT honour --commit, and neither of the gates below can see it.\n` +
-    `  This refusal exits BEFORE both of them, so they are reported here instead:\n` +
+    `\n  ⛔ THERE IS AN OPEN HOLD ON THIS HOST. Neither of the gates below can see an env or\n` +
+    `  settings write, and this refusal exits BEFORE both of them, so they are reported here:\n` +
     lines.join('\n') +
-    `\n  Set the secret AFTER the hold/embargo lifts, or get the owner of the held work to\n` +
-    `  sign off first. Writing env now ships the tip regardless of what you passed.`
+    `\n  HOW TO WRITE THE SECRET WITHOUT SHIPPING THE HELD COMMIT (TRA-3724):\n` +
+    `    1. Write the ONE key: PUT /v1/services/{id}/env-vars/{KEY}. Never the full-set PUT\n` +
+    `       (TRA-2136 — it replaces the whole set and wiped 19 secrets).\n` +
+    `    2. That write applies NOTHING on its own: no env-var write has produced a deploy on\n` +
+    `       this host since 2026-07-23. Do NOT read the unchanged box as a failed write, and\n` +
+    `       do NOT reach for POST /restart — it replays the last deploy's env snapshot.\n` +
+    `    3. Apply it with --commit=<THE SHA ALREADY SERVING>. --commit IS honoured; that is a\n` +
+    `       zero-byte code delta, so it does not ship the held commit and Gate 2 stays clean.\n` +
+    `       Serving sha: curl -s $HOST/api/health/options-live -> build.commitShort\n` +
+    `  ⚠ A SETTINGS write (PATCH /services/{id}) is a DIFFERENT verb and is UNTESTED under the\n` +
+    `    current pin — it can still redeploy from the branch tip and would ship the held\n` +
+    `    commit. Do not change service settings while this hold is open.\n` +
+    `  ⚠ What you must NOT do is what happened on TRA-3708: an UNPINNED deploy. That resolves\n` +
+    `    the branch tip and ships every commit that has landed since, held or not.`
   );
 }
 
@@ -880,14 +1029,16 @@ async function main() {
   });
   const authBlocking = authSecretBlocks(authGate.verdict);
 
-  // The caveat this gate must repeat wherever it speaks, refusal or not (TRA-2186/TRA-2325).
+  // The caveat this gate must repeat wherever it speaks, refusal or not
+  // (TRA-2186/TRA-2325, narrowed by TRA-3724 — see ENV_WRITE_TRUTH).
   const AUTH_ENV_WRITE_CAVEAT =
     'NOTE: this gate reads the value; it cannot guard the WRITE. Blanking AUTH_SECRET in the\n' +
-    '  dashboard is itself an env write, and an env write redeploys this service on the spot\n' +
-    '  (trigger: service_updated, despite autoDeploy: no — TRA-2186). So the gate cannot see its\n' +
-    '  own most likely cause. What it DOES catch is the state that outlives that write: a boot\n' +
-    '  that throws never goes live, Render keeps the previous process serving, and the box then\n' +
-    '  runs healthy on an in-memory secret with a broken env until somebody deploys.';
+    '  dashboard is itself an env write, so the gate cannot see its own most likely cause.\n' +
+    '  ' +
+    ENV_WRITE_CAVEAT_SHORT +
+    '\n  What it DOES catch is the state that outlives that write: a boot that throws never goes\n' +
+    '  live, Render keeps the previous process serving, and the box then runs healthy on an\n' +
+    '  in-memory secret with a broken env until somebody deploys.';
 
   if (authBlocking && !HAS_AUTH_SECRET_OVERRIDE) {
     // TRA-2306: resolve the hold/embargo picture HERE. This refusal exits before Gate 2 and
@@ -950,9 +1101,7 @@ async function main() {
         `  The hold expires ${h.until}. Deploy a commit that predates the held one\n` +
         `  (--commit=<sha>), or wait. If it is truly urgent, re-run with\n` +
         `  --force-commit-hold-override="why this cannot wait" (the reason is recorded).\n` +
-        `  NOTE: a commit hold, like the embargo, covers DEPLOYS ONLY. An env/settings write\n` +
-        `  redeploys the service from its branch tip unguarded (trigger: service_updated,\n` +
-        `  TRA-2186) and would ship the held commit anyway — hold those by hand.`,
+        `  NOTE: a commit hold, like the embargo, covers DEPLOYS ONLY. ${ENV_WRITE_CAVEAT_SHORT}`,
     );
     process.exit(6);
   }
@@ -1031,8 +1180,7 @@ async function main() {
         `  ${embargo.why}\n` +
         `  Deploy before ${embargo.from} or after ${embargo.to}, or, if it is truly urgent, re-run with\n` +
         `  --force-embargo-override="why this cannot wait" (the reason is recorded).\n` +
-        `  NOTE: this refusal covers DEPLOYS ONLY. An env/settings write redeploys the service too\n` +
-        `  (trigger: service_updated, TRA-2186) and no guard intercepts it — hold those by hand.`,
+        `  NOTE: this refusal covers DEPLOYS ONLY. ${ENV_WRITE_CAVEAT_SHORT}`,
     );
     process.exit(5);
   }
@@ -1144,10 +1292,17 @@ async function main() {
   // protected", and the write that breaks it never comes through this script.
   console.log(
     `          ⚠ this gate reads the VALUE, it does not guard the WRITE: blanking AUTH_SECRET is\n` +
-      `            itself an env write, which redeploys this service unguarded (service_updated,\n` +
-      `            TRA-2186). A green line here means the value is usable RIGHT NOW, nothing more.`,
+      `            itself an env write and never passes through here. A green line means the value\n` +
+      `            is usable RIGHT NOW, nothing more.`,
   );
-  console.log('note    : this gate sees DEPLOYS only — env/settings writes redeploy the box unguarded (TRA-2186).');
+  console.log(`note    : ${ENV_WRITE_CAVEAT_SHORT}`);
+  // Print the LIVE governing setting, not a compiled belief about it (TRA-3724). The
+  // 2026-07-23 change in env-write behaviour came from the platform, not from us, so the
+  // only honest statement is the one re-read on this run.
+  {
+    const posture = envWriteAutoDeployPosture(service);
+    console.log(`envdep  : ${posture.line}`);
+  }
 
   if (DRY_RUN) {
     console.log('[render-redeploy] --dry-run: would POST /services/%s/deploys %j', service.id, body);

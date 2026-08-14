@@ -130,10 +130,17 @@ env-var list exits `7`, never `0` — and unlike the first three it is not scope
 `docs/runbook.md` §"Four gates". The overrides are not interchangeable: a reason that justifies
 deploying inside RTH is not a reason to boot a process that throws.
 
-⚠️ It gates **deploys**. It cannot see an **env/settings write**, and one of those redeploys bqb1
-anyway (`trigger: service_updated`) *despite* `autoDeploy=no` (TRA-2186), nor the memory watchdog's
-own pm2 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the
-script is not evidence the host is safe to touch.**
+⚠️ It gates **deploys**. It cannot see an **env/settings write**, nor the memory watchdog's own pm2
+self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). **A green run of the script
+is not evidence the host is safe to touch.**
+
+⚠️ **An env-var write on bqb1 does NOT auto-deploy and `--commit` IS honoured (TRA-3724).** The old
+claim here said the opposite and cost us a five-commit train into the real-money host (TRA-3708). To
+apply an env change with a zero-byte code delta: write the single key, then
+`node scripts/render-redeploy.mjs --commit=<sha already serving>`. `POST /restart` is **not** an
+env-apply path — it replays the last deploy's env snapshot. A **settings** write (`PATCH /services`)
+is a different verb and is still assumed to ship the branch tip. Full per-verb measurement:
+`ENV_WRITE_TRUTH` in `scripts/render-redeploy.mjs`; operator steps in `docs/runbook.md`.
 
 Do not "fix" the pin by turning `autoDeploy` back on. It is what stops a mid-session merge from
 dumping bqb1's warm quote cache and resetting the go-live soak clock (TRA-1996), and lifting it is

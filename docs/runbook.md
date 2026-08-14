@@ -418,11 +418,47 @@ grader agree with no DST drift. This rule lifts together with the launch-window 
 at go-live sign-off (TRA-1648).
 
 ⚠️ **A green run of the wrapper is not evidence the host is safe to touch.** It gates
-**deploys**. It cannot see an **env/settings write** — and one of those redeploys bqb1
-anyway (`trigger: service_updated`) *despite* `autoDeploy=no` (TRA-2186) — nor the memory
-watchdog's own pm2 self-restart, which writes no deploy record at all (TRA-2203/TRA-2261).
-A raw `POST /v1/services/…/deploys` curl also bypasses it, so the wrapper is the
-*documented, enforced* path; do not hand-roll the curl during the soak.
+**deploys**. It cannot see an **env/settings write**, nor the memory watchdog's own pm2
+self-restart, which writes no deploy record at all (TRA-2203/TRA-2261). A raw
+`POST /v1/services/…/deploys` curl also bypasses it, so the wrapper is the *documented,
+enforced* path; do not hand-roll the curl during the soak.
+
+#### Applying an env change on bqb1 — the pinned path (TRA-3724)
+
+The claim that used to sit here — "an env write redeploys bqb1 anyway, and it does not
+honour `--commit`" — was **measured wrong on 2026-08-14** and it is wrong in the dangerous
+direction: it tells you pinning is futile at the moment pinning is the correct move. Acting
+on it shipped five unrelated commits into the real-money host 9.5 hours before the go-live
+week open (TRA-3708). The per-verb measurement is in `scripts/render-redeploy.mjs`,
+`ENV_WRITE_TRUTH` — read that block before any env write on this host. In short:
+
+| verb | does it deploy? | evidence |
+|---|---|---|
+| `PUT /env-vars/{KEY}` (single key) | **No** — not since 2026-07-23 | 22 `envUpdated:true` deploys ever, last `dep-d9h1j5nlk1mc738s57qg` 07-23T13:39Z; writes on 07-24 and 08-14 produced none |
+| `PATCH /services/{id}` (settings) | **Assume YES, from the tip** | Render labels it `updatedProperty`; only 4 ever, all pre-pin — **untested** under the pin and not worth testing on this host |
+| `PUT /env-vars` (full set) | **BANNED** regardless | TRA-2136 — replaces the whole set, wiped 19 secrets |
+| `POST /deploys` + `commitId` | Yes, and **`--commit` IS honoured** | 280 api deploys, incl. the TRA-3671 bisect of 6 commits by SHA |
+
+**To apply an env change with a zero-byte code delta:** write the one key, then
+
+```bash
+node scripts/render-redeploy.mjs --commit=<THE SHA ALREADY SERVING>
+```
+
+Render bakes env vars into the deploy at deploy time whatever commit it targets, so
+re-deploying the *serving* commit applies the env and ships no code. Measured on this
+service 2026-07-24: the `TRADIER_ENV` write at ~15:55Z was applied by deploys at 15:58Z
+and 16:13Z, both of `8a7ecf50eee4` — already live since 12:50Z. Read the serving sha off
+the host, never off git: `/api/health/options-live` → `build.commitShort`.
+
+**`POST /restart` is not an env-apply path.** It replays the existing deploy's instance
+spec, so a write made after that deploy is structurally invisible to it — which is why the
+08-14T03:53:53Z restart still published `otmFlagOn: true`.
+
+**Is a code freeze the same freeze as an env freeze here? No — provided you pin.** They
+collapse into one freeze only when the apply is unpinned, because an unpinned deploy
+resolves the branch tip. Pinning is what separates them. Both still owe the RTH freeze and
+any embargo: `--commit` removes the code delta, not the boot.
 
 ### Standard deploy (self-hosted PM2)
 
