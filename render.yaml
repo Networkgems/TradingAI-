@@ -65,7 +65,27 @@ services:
     # That is why TRA-1635 (right-size pro -> standard) is a hard NO-GO.
     # `starter` (512 MB) would OOM on boot. CPU avg ~0.28 / peak ~0.96 of 1 vCPU.
     plan: pro
-    buildCommand: pnpm install --frozen-lockfile && pnpm run web:build
+    # TRA-3719 (CTO, 2026-08-14) — this line read `pnpm run web:build` and was
+    # WRONG. The live service has been building with `render-build` for months;
+    # the blueprint was never updated. Corrected to match the money host, because
+    # THE LIVE HOST IS THE FACT and re-pointing the dashboard at `web:build`
+    # during go-live week would change what builds it. MEASURED, from the
+    # "Running build command" banner Render itself prints at the top of every
+    # build log — deploys 02:21Z / 05:12Z / 07:29Z on 2026-08-14 all print:
+    #
+    #     ==> Running build command 'pnpm install --frozen-lockfile && pnpm run render-build'...
+    #
+    # ⛔ DO NOT "correct" this back from the Render REST API. `GET /v1/services/
+    # {id}` -> `serviceDetails.envSpecificDetails.buildCommand` is a THIRD,
+    # PHANTOM string: `pnpm install --frozen-lockfile; pnpm run build`. It was
+    # re-read 60s after the 07:29Z banner above and still disagreed, so it is not
+    # a lag — that field simply does not report what Render executes. It is wrong
+    # in three ways at once: wrong script, `;` instead of `&&` (so an install
+    # failure would not stop the build), and `build` is
+    # `pnpm --filter desktop tauri build` — a Tauri DESKTOP build that cannot
+    # produce the `packages/server/dist/index.js` named by startCommand below.
+    # The banner is the only reading of this field that has ever been true.
+    buildCommand: pnpm install --frozen-lockfile && pnpm run render-build
     startCommand: node packages/server/dist/index.js
     healthCheckPath: /api/health
     disk:
