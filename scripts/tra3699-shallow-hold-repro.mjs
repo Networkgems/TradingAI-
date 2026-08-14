@@ -30,25 +30,28 @@
 //   node scripts/tra3699-shallow-hold-repro.mjs [--keep]
 //   exit 0 = every arm as expected · 1 = an arm failed · 2 = could not build the repro
 
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { mkdtempSync, rmSync, copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+// The graft builder moved to lib in TRA-3721 so the sibling suite
+// (tra3721-shallow-ancestry-repro.mjs) grades the SAME repro, not a re-typed imitation.
+import {
+  REPO_ROOT,
+  gitOut,
+  pickPair,
+  buildGraft,
+  graftDetail,
+  stageScripts,
+  ANCESTRY_LIB,
+} from './lib/shallow-graft-repro.mjs';
 
-const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const KEEP = process.argv.includes('--keep');
 
 // The bytes that carried the defect. Pinned by REV, not by prose, so arm 1b runs the real
 // pre-fix implementation rather than a re-typed imitation of it. af0a6f2f is the tip this
 // fix was written against; scripts/render-redeploy.mjs there is the unfixed gitCarries.
 const PRE_FIX_REV = 'af0a6f2f22765220471c0230767aa477f2bf2095';
-
-const git = (args, cwd = REPO_ROOT) => spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 120_000 });
-const gitOut = (args, cwd = REPO_ROOT) => {
-  const r = git(args, cwd);
-  return r.status === 0 ? (r.stdout ?? '').trim() : null;
-};
 
 const bail = msg => {
   console.error(`[tra3699] CANNOT RUN: ${msg}`);
@@ -64,12 +67,11 @@ const arm = (name, ok, detail) => {
 
 // ── Pick the pair. TARGET must genuinely CARRY HELD on the complete clone, or arm 1
 // is testing a true negative and would pass without the fix. ───────────────────
-const TARGET = gitOut(['rev-parse', 'HEAD^{commit}']);
-if (!TARGET) bail('cannot resolve HEAD — is this the TradingAI repo?');
-const HELD = gitOut(['rev-parse', 'HEAD~50^{commit}']);
-if (!HELD) bail('cannot resolve HEAD~50; this checkout is too short to build the repro. Run `git fetch origin --unshallow`.');
-if (gitOut(['rev-parse', '--is-shallow-repository']) !== 'false') {
-  bail('this checkout is itself SHALLOW, so arm 2 has no complete clone to control against. Run `git fetch origin --unshallow`.');
+let TARGET, HELD;
+try {
+  ({ target: TARGET, held: HELD } = pickPair({ depth: 50 }));
+} catch (e) {
+  bail(e.message);
 }
 
 console.log('[tra3699] shallow-graft repro for the render-redeploy commit-hold gate (Gate 2)');
@@ -104,45 +106,30 @@ const cleanup = () => {
 
 try {
   // ── Build the grafted shallow clone ────────────────────────────────────────
-  const commonDir = gitOut(['rev-parse', '--path-format=absolute', '--git-common-dir']);
-  if (!commonDir) bail('cannot locate this repo\'s git dir');
-  // --depth is silently IGNORED for a plain local path; the file:// transport is what
-  // makes git actually cut the history.
-  const src = pathToFileURL(commonDir).href;
-  const graft = join(root, 'grafted');
-
-  const clone = git(['clone', '--quiet', '--depth=1', '--no-tags', src, graft], root);
-  if (clone.status !== 0) bail(`git clone --depth=1 failed: ${clone.stderr ?? clone.error?.message}`);
-  // Fetch each sha at depth 1: the OBJECT lands, the path between them does not.
-  for (const sha of [TARGET, HELD]) {
-    const f = git(['fetch', '--quiet', '--depth=1', 'origin', sha], graft);
-    if (f.status !== 0) bail(`git fetch --depth=1 origin ${sha.slice(0, 12)} failed: ${f.stderr ?? f.error?.message}`);
+  let graft, facts;
+  try {
+    ({ graft, facts } = buildGraft(root, { target: TARGET, held: HELD }));
+  } catch (e) {
+    bail(e.message);
   }
 
   // ── ARM 0 — is the repro the thing it claims to be? ────────────────────────
-  const isShallow = gitOut(['rev-parse', '--is-shallow-repository'], graft) === 'true';
-  const heldPresent = git(['cat-file', '-e', `${HELD}^{commit}`], graft).status === 0;
-  const targetPresent = git(['cat-file', '-e', `${TARGET}^{commit}`], graft).status === 0;
-  const graftRc = git(['merge-base', '--is-ancestor', HELD, TARGET], graft).status;
-  const mergeBase = gitOut(['merge-base', HELD, TARGET], graft);
-  const faithful = isShallow && heldPresent && targetPresent && graftRc === 1;
   arm(
     'ARM 0 — the repro is the OBJECT-PRESENT / PATH-CUT state, not a plain --depth clone',
-    faithful,
-    `shallow=${isShallow}  held object present=${heldPresent}  target object present=${targetPresent}  ` +
-      `--is-ancestor rc=${graftRc} (1 = the trap)  merge-base=${mergeBase === null || mergeBase === '' ? '(empty)' : mergeBase}`,
+    facts.faithful,
+    graftDetail(facts),
   );
-  if (!faithful) bail('the repro did not reach the grafted state; grading it would prove nothing');
+  if (!facts.faithful) bail('the repro did not reach the grafted state; grading it would prove nothing');
 
   // ── ARM 1 — the FIXED bytes, in the grafted clone. Must REFUSE. ────────────
-  // Copy this working tree's script in, so the arm grades the bytes being shipped rather
-  // than whatever the clone happened to check out.
-  mkdirSync(join(graft, 'scripts', 'lib'), { recursive: true });
-  copyFileSync(join(REPO_ROOT, 'scripts', 'render-redeploy.mjs'), join(graft, 'scripts', 'render-redeploy.mjs'));
-  copyFileSync(
-    join(REPO_ROOT, 'scripts', 'lib', 'auth-secret-predicate.mjs'),
-    join(graft, 'scripts', 'lib', 'auth-secret-predicate.mjs'),
-  );
+  // Copy this working tree's scripts in, so the arm grades the bytes being shipped rather
+  // than whatever the clone happened to check out. `ANCESTRY_LIB` is the grader itself,
+  // which render-redeploy.mjs imports since TRA-3721 — omit it and the arm does not run.
+  stageScripts(graft, [
+    'scripts/render-redeploy.mjs',
+    'scripts/lib/auth-secret-predicate.mjs',
+    ...ANCESTRY_LIB,
+  ]);
 
   const runGate = async scriptPath => {
     const mod = await import(pathToFileURL(scriptPath).href);

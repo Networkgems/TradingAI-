@@ -59,6 +59,8 @@
 // Exit codes: 0 = interlock LIVE. 1 = a check FAILED. 2 = the checker could not run.
 
 import { execFileSync } from 'node:child_process';
+// TRA-3721 — the shared shallow-graft ancestry grader (TRA-3699 / TRA-3678 remedy shape).
+import { gradedAncestry, blindReason, isShallowCheckout } from './lib/shallow-ancestry.mjs';
 
 const INTERLOCK_COMMIT = 'ffe656c3d84d7f850eb1d5a6c2f14f5562ebd594';
 const INTERLOCK_TICKET = 'TRA-2336';
@@ -251,12 +253,26 @@ function selfTest() {
   } catch {
     bail(`${PRE_INTERLOCK_SHA.slice(0, 8)} is not in this clone; cannot self-test. Run \`git fetch origin\`.`);
   }
-  let ancestry;
-  try {
-    git(['merge-base', '--is-ancestor', INTERLOCK_COMMIT, PRE_INTERLOCK_SHA]);
-    ancestry = true;
-  } catch {
-    ancestry = false;
+  // ⚠ THE NEGATIVE CONTROL IS THE ONE THING THAT MUST NOT GUESS (TRA-3721).
+  // This row asserts `ancestry === false` against a build that PRECEDES the interlock, and
+  // that row is what licenses the main arm's PASS ("SELF-TEST OK" below). The old code was
+  // `try { … } catch { ancestry = false }` — on a SHALLOW/grafted checkout the catch fires
+  // unconditionally, so the row went green without the predicate having discriminated
+  // anything at all. A positive control must CONTAIN what it detects; on a graft that one
+  // contained nothing, and it is the standing pre-condition on the `TRADIER_ENV` write and
+  // on arming live crypto.
+  //
+  // So: grade the negative, and treat "cannot tell" as CANNOT RUN (exit 2), never as a pass.
+  // A self-test that cannot tell whether it discriminated has not run.
+  const { verdict: ancestryVerdict, answer: ancestry } = gradedAncestry(INTERLOCK_COMMIT, PRE_INTERLOCK_SHA);
+  if (ancestry === null) {
+    bail(
+      `the self-test's ANCESTRY negative control is UNREADABLE (${ancestryVerdict}) — ${blindReason(ancestryVerdict)}\n` +
+        `           \`merge-base --is-ancestor ${INTERLOCK_COMMIT.slice(0, 8)} ${PRE_INTERLOCK_SHA.slice(0, 8)}\` returns the SAME\n` +
+        '           exit code for "genuinely not an ancestor" and for "the path was grafted away", so reading it\n' +
+        '           as a clean negative would print SELF-TEST OK on a control that discriminated nothing.\n' +
+        '           This is CANNOT RUN, not a FAIL and emphatically not a PASS.',
+    );
   }
   let engine = '';
   try {

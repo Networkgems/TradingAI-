@@ -102,6 +102,16 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyAuthSecret } from './lib/auth-secret-predicate.mjs';
+// The shallow-graft ancestry grader (TRA-3699, moved to lib by TRA-3721). Imported for
+// local use AND re-exported below — `export … from` alone would leave `isShallowCheckout`
+// undefined at the gate-6 call site in this file.
+import {
+  gradedAncestry,
+  isShallowCheckout,
+  gradeCarries,
+  carriesFromVerdict,
+  BLIND_ANCESTRY_CAUSES,
+} from './lib/shallow-ancestry.mjs';
 
 const API = 'https://api.render.com/v1';
 
@@ -308,12 +318,13 @@ export const COMMIT_HOLDS = [
 // FAILS CLOSED on purpose, in the same spirit as check:deploy-drift's BLIND: an
 // unresolvable tip or an ungrepable object yields REFUSE, never PROCEED. A hold that
 // silently degrades to "allowed" the moment the network hiccups is not a hold.
-// The three ways an ancestry question comes back unanswerable. Written once, because a
-// BLIND that only names the two OBVIOUS causes sends the reader looking for a missing
-// object when the real answer is `git fetch --unshallow` (TRA-3699).
-export const BLIND_ANCESTRY_CAUSES =
-  'the object is missing from this checkout, or this checkout is SHALLOW so a negative ' +
-  'ancestry answer is unreadable here (TRA-3699 — run `git fetch origin --unshallow`), or git failed';
+// The grader itself now lives in scripts/lib/shallow-ancestry.mjs and is re-exported from
+// here unchanged (TRA-3721). It moved because the same predicate was needed by two more
+// call sites — tra2342's --self-test and tra2306's build detector — and three independent
+// copies of a fail-open fix is how one of them drifts back. The names, the verdict strings
+// and the row order are identical to what shipped in 12305eba; tra2325-embargo-gate-check.mjs
+// keeps driving `gradeCarries` through this module's exports.
+export { BLIND_ANCESTRY_CAUSES, gradeCarries, carriesFromVerdict, isShallowCheckout };
 
 export function commitHoldState(now, target, table = COMMIT_HOLDS) {
   const t = now.getTime();
@@ -393,10 +404,6 @@ function git(args, timeout = 20000) {
   return spawnSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8', timeout });
 }
 
-function gitHasCommit(sha) {
-  return git(['cat-file', '-e', `${sha}^{commit}`]).status === 0;
-}
-
 // ── The shallow-graft hole under every gate below (TRA-3699 / TRA-3678) ───────
 // `git merge-base --is-ancestor A B` exits 1 for TWO different facts:
 //   (a) B genuinely does not contain A — a real, usable negative;
@@ -421,50 +428,16 @@ function gitHasCommit(sha) {
 // answer is PROVEN by objects that are present, and a graft can only ever hide history,
 // never invent it.
 //
-// Pure so the control suite can drive every row without a git repo
-// (tra2325-embargo-gate-check.mjs) — the same shape as `gradeAncestry` in
-// check-deploy-floor.mjs, which is the sibling remedy for the same defect.
-export function gradeCarries({ rc, isShallow, mergeBaseEmpty }) {
-  if (rc !== 0 && rc !== 1) return 'blind-undecidable'; // git errored; never "not an ancestor"
-  if (rc === 0) return 'carries'; // proven by present objects — trust it even when shallow
-  if (isShallow) return 'blind-shallow'; // indistinguishable from a grafted-away path
-  if (mergeBaseEmpty) return 'blind-unrelated'; // disconnected graphs: unsatisfiable, not answered "no"
-  return 'not-carried';
-}
-
-// true / false / null, from the verdict. Exported with the grader so the mapping cannot
-// drift away from it — the whole defect was a `false` standing in for a blind.
-export function carriesFromVerdict(verdict) {
-  if (verdict === 'carries') return true;
-  if (verdict === 'not-carried') return false;
-  return null;
-}
-
-// Cached: it is one git call and cannot change inside a run.
-let shallowCache;
-export function isShallowCheckout() {
-  if (shallowCache === undefined) {
-    const r = git(['rev-parse', '--is-shallow-repository']);
-    // An unreadable answer is treated as SHALLOW on purpose: it makes the negative
-    // unreadable rather than trusted, which is the fail-closed direction here.
-    shallowCache = r.status !== 0 || (r.stdout ?? '').trim() !== 'false';
-  }
-  return shallowCache;
-}
+// `gradeCarries` / `carriesFromVerdict` / `isShallowCheckout` now live in
+// scripts/lib/shallow-ancestry.mjs and are re-exported at the top of this section, so this
+// file's public surface is unchanged (TRA-3721).
 
 // true = target carries held · false = it does not · null = cannot tell.
 // `merge-base --is-ancestor` exits 0/1 for the real answers and something else for an
 // error, so anything but 0/1 must NOT be collapsed into "not an ancestor" — and neither
-// may a 1 that came out of a grafted history (see gradeCarries above).
+// may a 1 that came out of a grafted history (see gradeCarries in the lib).
 function gitCarries(heldSha, targetSha) {
-  if (!gitHasCommit(heldSha) || !gitHasCommit(targetSha)) return null;
-  const r = git(['merge-base', '--is-ancestor', heldSha, targetSha]);
-  // Only reached for a negative, and only on a complete clone: the extra git call is
-  // never paid on the ordinary "yes it carries it" path.
-  const isShallow = r.status === 1 ? isShallowCheckout() : false;
-  const mergeBaseEmpty =
-    r.status === 1 && !isShallow ? (git(['merge-base', heldSha, targetSha]).stdout ?? '').trim() === '' : false;
-  return carriesFromVerdict(gradeCarries({ rc: r.status, isShallow, mergeBaseEmpty }));
+  return gradedAncestry(heldSha, targetSha).answer;
 }
 
 // What Render will actually build. With --commit that is the sha given; without it Render

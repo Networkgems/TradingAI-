@@ -18,7 +18,8 @@
 // Exit: 0 PASS · 1 FAIL · 2 VOID · 3 NOT_GRADED_YET · 4 BLIND (never conflate with PASS)
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+// TRA-3721 — the shared shallow-graft ancestry grader (TRA-3699 / TRA-3678 remedy shape).
+import { gradedAncestry } from './lib/shallow-ancestry.mjs';
 
 const HOST = process.env.BQB1_HOST ?? 'https://tradingai-bqb1.onrender.com';
 const STRUCT = 'single_leg_directional'; // NOT `directional` — that row is cost-bar/delta only
@@ -87,17 +88,27 @@ export function readBuild({ liveSha = null, isAncestor = null } = {}) {
   return out;
 }
 
+// ⚠ EXIT 1 IS NOT ONE FACT, IT IS TWO (TRA-3721).
+// This function used to read `e?.status === 1 ? false : null` — it guarded every OTHER exit
+// status and left the one that matters. `merge-base --is-ancestor` exits 1 both for "the live
+// build genuinely does not contain TRA-2355" AND for "the path between them was grafted away
+// by a shallow clone", byte-identically: same status, no stderr, no warning. A shallow
+// checkout is the default shape of a fresh CI or agent workspace, so the grafted case is the
+// ordinary one, not the exotic one — and `readBuild` emits a note for `true` and for `null`
+// and NOTHING for `false`, so on a graft the second detector reported "TRA-2355 is not in the
+// live build" in silence, the PASS direction stayed open, and this grade could certify a tally
+// that had been re-keyed under it. The comment above was already right about the hazard; the
+// code underneath it admitted exactly that hazard through the one branch it did not screen.
+//
+// Now graded by the shared grader (scripts/lib/shallow-ancestry.mjs — TRA-3699 / TRA-3678
+// remedy shape). Only the NEGATIVE is re-graded: rc 0 stays trustworthy while shallow, because
+// an affirmative is proven by objects that are PRESENT and a graft can only hide history,
+// never invent it. Direction is unchanged — `true` VOIDs, `false` clears, `null` SUPPRESSES
+// THE PASS DIRECTION ONLY (grade() turns it into a DEFER -> NOT_GRADED_YET, exit 3; controlled
+// by the `build identity UNKNOWN suppresses a PASS` case in --self-test).
 function tra2355IsLive(liveSha) {
   if (!liveSha) return null;
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', TRA2355_COMMIT, liveSha], { stdio: 'ignore' });
-    return true;
-  } catch (e) {
-    // Exit 1 = a clean "not an ancestor". Anything else (unknown SHA, no git, not a repo) is an
-    // UNANSWERED question and must not be read as "absent" — that is the fail-open this whole
-    // ticket exists to prevent.
-    return e?.status === 1 ? false : null;
-  }
+  return gradedAncestry(TRA2355_COMMIT, liveSha).answer;
 }
 
 // ── READ 1: /api/health/cost-aware-gate ──────────────────────────────────────
@@ -504,6 +515,27 @@ const argv = process.argv.slice(2);
 const arg = k => argv.find(a => a.startsWith(`--${k}=`))?.split('=').slice(1).join('=');
 
 if (argv.includes('--self-test')) process.exit(selfTest());
+
+// `--ancestry-probe=<held>:<target>` — run THIS file's build detector against an arbitrary
+// pair and print the answer, nothing else. It exists because everything below this line does
+// network I/O at module load, so the shallow-graft repro (scripts/tra3721-shallow-ancestry-repro.mjs)
+// cannot `import` this module to grade it; it runs these SHIPPED BYTES as a subprocess inside a
+// grafted clone instead. Printing `null` there is the whole finding — `false` was the fail-open.
+// Prints one token: `true` | `false` | `null`. Exit 0 = the probe ran (the ANSWER is the payload,
+// not the exit code) · 2 = bad usage.
+{
+  const probe = arg('ancestry-probe');
+  if (probe !== undefined) {
+    const [held, target] = probe.split(':');
+    if (!held || !target) {
+      console.error('usage: --ancestry-probe=<heldSha>:<targetSha>');
+      process.exit(2);
+    }
+    const { verdict, answer } = gradedAncestry(held, target);
+    console.log(`${answer === null ? 'null' : answer} ${verdict}`);
+    process.exit(0);
+  }
+}
 
 const dir = arg('dir');
 const sinceTs = arg('since') ? Date.parse(arg('since')) : undefined;
