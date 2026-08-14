@@ -167,6 +167,18 @@ import {
   OPTION_LIVE_OTM_UNIVERSE_VAR,
   OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED,
 } from '../otm-live-universe-flag.js';
+// TRA-3694 (parent TRA-3661) — the RATIFICATION stamp. A ratified widening and an
+// unratified one used to render byte-identically on `arm.universe`; the route now
+// computes the comparison and publishes the VERDICT, because the failure being
+// fixed is precisely a comparison nobody performs.
+import {
+  resolveLiveOtmUniverseRatification,
+  resolveNumericRatification,
+  foldRatificationVerdicts,
+  LIVE_OPTION_TEST_NOTIONAL_CAP_RATIFIED_VAR,
+  LIVE_OPTION_TEST_AGGREGATE_CAP_RATIFIED_VAR,
+  LIVE_OPTION_TEST_CAPS_RATIFIED_BY_VAR,
+} from '../ratification-stamp.js';
 import {
   summarizeSpreadCost,
   summarizeSpreadCeilingCompliance, // TRA-2316
@@ -4379,6 +4391,28 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     const nowMs = now();
     const summary = summarizeLiveOptionsFeeSlippage();
     const testUntil = parseOptionLiveTestUntil(liveEnv);
+    // TRA-3694 — the same principle as `arm.universe.ratification`, applied to the
+    // resolved caps. `notionalCapUsd: 350` reads IDENTICALLY whether the board
+    // authorised 350 or 250; the resolved value proves what the order site uses
+    // and says nothing about what it was allowed to use.
+    const notionalCapLive = resolveLiveOptionTestNotionalCapUsd(liveEnv);
+    const aggregateCapLive = resolveLiveOptionTestAggregateCapUsd(liveEnv);
+    const capRatification = {
+      notionalCap: resolveNumericRatification(
+        LIVE_OPTION_TEST_NOTIONAL_CAP_RATIFIED_VAR,
+        LIVE_OPTION_TEST_CAPS_RATIFIED_BY_VAR,
+        'per-entry notional cap (USD)',
+        notionalCapLive,
+        liveEnv,
+      ),
+      aggregateCap: resolveNumericRatification(
+        LIVE_OPTION_TEST_AGGREGATE_CAP_RATIFIED_VAR,
+        LIVE_OPTION_TEST_CAPS_RATIFIED_BY_VAR,
+        'fleet aggregate cap (USD)',
+        aggregateCapLive,
+        liveEnv,
+      ),
+    };
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -4390,7 +4424,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // the compiled default. Reporting the constant here would read identically on a
       // box running a different cap/size, which is the whole failure class: a size
       // parameter with no read path cannot be verified after arming.
-      notionalCapUsd: resolveLiveOptionTestNotionalCapUsd(liveEnv),
+      notionalCapUsd: notionalCapLive,
       notionalCapDefaultUsd: LIVE_OPTION_TEST_NOTIONAL_CAP_USD,
       notionalCapCeilingUsd: LIVE_OPTION_TEST_NOTIONAL_CEILING_USD,
       notionalCapVar: LIVE_OPTION_TEST_NOTIONAL_CAP_VAR,
@@ -4400,10 +4434,31 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // TRA-3445 — the board's THIRD clause ("max $750 total"), which had no
       // enforcement path until now. Same publication contract as the per-entry
       // pair above: the RESOLVED value, not the constant.
-      aggregateCapUsd: resolveLiveOptionTestAggregateCapUsd(liveEnv),
+      aggregateCapUsd: aggregateCapLive,
       aggregateCapDefaultUsd: LIVE_OPTION_TEST_AGGREGATE_CAP_USD,
       aggregateCapCeilingUsd: LIVE_OPTION_TEST_AGGREGATE_CEILING_USD,
       aggregateCapVar: LIVE_OPTION_TEST_AGGREGATE_CAP_VAR,
+      /**
+       * ⭐ TRA-3694 — the AUTHORIZATION behind the two resolved caps above.
+       * Every `*CapUsd` here proves what the order site USES and is silent on
+       * what it was ALLOWED to use, so an unratified cap and a ratified one read
+       * byte-identically — the same defect this ticket fixed on `arm.universe`.
+       *
+       * READ `.matchesLive` on each, and `ratificationMatchesLive` for the fold.
+       * `true | false | 'unstamped'`; an unset stamp is `'unstamped'`, NEVER
+       * `true`. The fold is FAIL-LOUD: any `false` ⇒ `false`, else any
+       * `'unstamped'` ⇒ `'unstamped'`. READ-ONLY — a mismatch blocks no order.
+       *
+       * ⚠️ The per-entry/aggregate UNIT confusion is the live trap here (a
+       * "$750 total" authorization once shipped as $750 PER BOOK): the two
+       * stamps are separate vars precisely so one cannot silently grade the
+       * other.
+       */
+      capRatification,
+      ratificationMatchesLive: foldRatificationVerdicts([
+        capRatification.notionalCap.matchesLive,
+        capRatification.aggregateCap.matchesLive,
+      ]),
       // TRA-3674 — φ, the scalar that turns the fleet-absolute authorization
       // above into an enforceable PER-BOOK budget `B_i = min(φ·E_i, A)`. Same
       // publication contract as every knob on this route: the RESOLVED value
@@ -4791,6 +4846,18 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // the raw env var) is what makes a typo'd override visible as
     // `source:'env_invalid'` instead of reading as a deliberate five-name default.
     const universe = resolveLiveOtmUniverse(liveEnv);
+    // TRA-3694 — the AUTHORIZATION of that resolved universe. Computed here so it
+    // can enter the `note` sentence as well as `arm.universe.ratification`: the
+    // prose is what a reader who is not looking for this field still sees, and
+    // "ENFORCING (live): universe=RESTRICTED to [...]" reads identically whether
+    // that list was ratified or not, which is the whole defect.
+    const universeRatification = resolveLiveOtmUniverseRatification(universe, liveEnv);
+    const universeRatificationClause =
+      universeRatification.matchesLive === true
+        ? 'RATIFIED'
+        : universeRatification.matchesLive === 'unstamped'
+          ? `RATIFICATION UNSTAMPED (${universeRatification.var} unset — UNKNOWN, not OK)`
+          : `⚠️ RATIFICATION MISMATCH${universeRatification.onlyLive.length > 0 ? ` — UNRATIFIED WIDENING onto [${universeRatification.onlyLive.join(',')}]` : ''}`;
     // TRA-3216 — the bar's COMPOSITION, published once. It is identical on every
     // blocked row, so it cannot live in the per-decision `byReason` fold; without
     // it, `byReason`'s shortfall buckets have no scale to be read against.
@@ -4894,6 +4961,24 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
           source: universe.source,
           /** RAW env value, so a fallback is visible rather than inferred. */
           raw: universe.raw,
+          /**
+           * ⭐ TRA-3694 — the AUTHORIZATION, which everything above is silent on.
+           * `source: 'env'` says an operator set this; it does NOT say the board
+           * ratified it, and a RATIFIED widening and an UNRATIFIED one rendered
+           * byte-identically here. The same field was consequently flagged twice
+           * in 26 hours by two independent readers off exactly this absence.
+           *
+           * READ `ratification.matchesLive`, not the two strings. It is
+           * `true | false | 'unstamped'` and an UNSET stamp is `'unstamped'`,
+           * NEVER `true` — a stamp that defaults to OK would reproduce the very
+           * defect it fixes, one layer up. A set-but-unparseable stamp reads
+           * `false` (somebody wrote a value and believes it is in force).
+           *
+           * `onlyLive` is the direction that matters: names real money can open
+           * that the ratification does not cover. This is a READ-ONLY instrument
+           * — a mismatch blocks nothing.
+           */
+          ratification: universeRatification,
         },
         /**
          * TRA-3401 — the OTM strike NOMINATOR, which is upstream of every gate
@@ -4944,8 +5029,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // so the claim has to answer to the selector as well as to the gates.
       note:
         !anyArmed && !universe.restricted && !admissibleStrikeArmed
-          ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist.`
-          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}, otm_nominator=${admissibleStrikeArmed ? `ARMED into |delta| [${admissibleStrikeBand.min}, ${admissibleStrikeBand.max}) (TRA-3401 — a SELECTOR upstream of every gate here: it makes no verdict of its own, so it is not a row in byGate; since TRA-3510 it is instead an AXIS ON every gate, \`bySelection\` — see the paragraph at the end)` : 'off (legacy top-|mispricingPct| nominee, delta-blind)'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count. ⚠️ TRA-3391 changed what cost_bar's edge IS: it is now the LOWER 95% CI bound of the candidate's measured tape cell (arm.costBar.edge), not \`3·|delta| − 1\`. Two consequences for this payload — (1) \`byReason\` now carries \`insufficient_evidence\`, which means WE NEVER MEASURED THAT CELL and is NOT \`gross_negative\` (a measured loser). ⚠️ TRA-3401 — do NOT scope that by symbol: the cell key is \`structure × |delta| bucket\` with NO symbol axis, so the universe restriction does not scope the fold. "On the restricted live universe the tape holds 471 rows, ALL |Δ| < 0.20" describes where the live sleeve has historically NOMINATED, NOT the evidence a candidate in the admitted band is decided under — that band is pooled across every symbol and mode, and it ADMITS. Reading the 471 the other way reported an evidence deadlock that does not exist. (2) \`byCell\` names the cell each verdict was decided under, admits included — cross-read it against /api/health/option-expectancy-table, which publishes n / mean / SE / lowerCI95 / admits per cell. ⚠️ TRA-3483 — \`byGate[cost_bar]\` now also carries \`costRQuantiles\` and \`netEdgeShadow\`, and BOTH ARE RECORDERS: \`${netEdge.flag}\` is ${netEdge.enabled ? 'ARMED' : '\`false\`'} and nothing in either block feeds a verdict. They exist because \`k\` is a RATIO — \`admit ⟺ costR ≤ k · modeledGrossR\` — and the deployed surface published the DENOMINATOR only (the expectancy table's per-cell lowerCI95), while every row inside a cell shares that same denominator. \`costR\` is therefore the ONLY axis \`k\` can discriminate on, and it is now emitted per decision, admits included, in the same \`R_gate\` unit as \`barR\`, split into \`spreadR\` (the candidate's own quote cross) and \`feeR\` (the $${netEdge.feesPerContractRoundTrip}/contract RT floor). \`netEdgeShadow.sweep\` replays the net-edge admit rule at 8 candidate \`k\` on those recorded rows and reports \`medianNetR_admitted\` = median(modeledGrossR − costR) over what each \`k\` would admit, against \`flatFormAdmits\` — the DEPLOYED form's admits on the IDENTICAL row set, so the comparison is paired. Read \`rowsEvaluated\` vs \`rowsRecorded\` / \`rowsMissingCostR\` FIRST: a row whose quote was unusable produces no cost sample and is excluded from the sweep denominator (under the real form it would be a \`net_edge_quote_unusable\` block at every k), and \`samplesDropped > 0\` means the quantiles are over a truncated head. \`rowsMissingGrossR\` counts evaluated rows whose edge was unknown — those fail closed at every \`k\` and are IN the denominator, because an unknown edge is a real block, not missing cost data. ⚠️ TRA-3483 (D2) — each gate also publishes \`blockedUnclassified\`: BLOCKED rows carrying no \`reasonCode\`, which \`byReason\` cannot see. Every \`byReason.share\` is of \`blocked\`, which INCLUDES those rows, so when \`blockedUnclassified > 0\` the rows DO NOT sum to 1 and the gap is COVERAGE, not a residual bucket. On the retained fold this is the pre-stamping backlog that made \`gross_negative\`'s share read as a rate. ⚠️ TRA-3510 — every gate now also carries \`bySelection\`: which TRA-3401 NOMINATOR BRANCH produced the candidate each verdict ruled on (\`in_band\` | \`fallback_top_mispricing\` | \`legacy\`), admits included, with \`meanCheapConsidered\` / \`meanCheapInBand\` over their own \`rowsWithChainShape\` denominator. READ THIS BEFORE QUOTING ANY ZERO ON A DELTA GATE. The selector runs upstream of every gate here, and on its \`in_band\` branch the nominee's |Δ| is inside [${admissibleStrikeBand.min}, ${admissibleStrikeBand.max}) BY CONSTRUCTION — so it cannot breach a ceiling at the band's own max, and it cannot breach a floor at or below the band's min. \`entry_delta_ceiling_shadow.blocked === 0\` and \`otm_delta_floor.blocked === 0\` therefore have two byte-identical causes — "the selector clamped every row into the band" (a vacuous zero, arithmetic) and "the far tail was nominated and genuinely did not breach" (a measurement) — and \`bySelection\` is the ONLY axis on this payload that separates them. Rows concentrated on \`in_band\` ⇒ do not publish that zero as a tail estimate. An EMPTY \`bySelection\` on a gate with \`evaluated > 0\` means those rows predate this axis or came from a non-OTM path (RV / directional cost_bar rows carry no nominator); it never means one branch produced them all. ⚠️ TRA-3510 also HOISTED \`otm_delta_floor\` above the cost bar, joining the ceiling TRA-3504 hoisted: both edges of the ratified band are now on the same side of it. Consequence for this payload — when the floor is armed, a sub-floor candidate attributes to \`otm_delta_floor\` instead of \`cost_bar\`/\`gross_negative\`, and \`cost_bar\`'s denominator steps DOWN by exactly the floor's blocked count. That is correct attribution, not a regression; do not compare a post-arm cost_bar rate to a pre-arm one.`,
+          ? `SHADOW-ONLY: all live enforcement flags OFF and the live OTM universe is UNRESTRICTED (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${universe.raw ?? ''}) — the live options path is byte-for-byte the pre-TRA-2048/pre-TRA-2763 behaviour (no rejection) AND real money can open on any of the ~614 watchlist names, which is the TRA-3216 defect. Arm as an ops action: ${OPTION_COST_GATE_LIVE_ENFORCE_FLAG}=1, ${OPTION_LIQUIDITY_LIVE_ENFORCE_FLAG}=1 and/or ${OPTION_OTM_DELTA_FLOOR_LIVE_FLAG}=1 (+ ${OPTION_OTM_DELTA_FLOOR_LIVE_VALUE_VAR}=<floor>) on bqb1 (process env, never demo-flags); unset ${OPTION_LIVE_OTM_UNIVERSE_VAR} to restore the allowlist. Ratification: ${universeRatificationClause} (TRA-3694 — arm.universe.ratification).`
+          : `ENFORCING (live): universe=${universe.restricted ? `RESTRICTED to [${universe.symbols.join(',')}] (${universe.source}; ${universeRatificationClause})` : `UNRESTRICTED — all ~614 watchlist names tradeable with real money (${OPTION_LIVE_OTM_UNIVERSE_VAR}=${OPTION_LIVE_OTM_UNIVERSE_UNRESTRICTED})`}, cost_bar=${costArmed ? (netEdgeGovernsOtm ? `ARMED in NET_EDGE form (TRA-3272: block when cost > k=${netEdge.k} × modeled edge; fees $${netEdge.feesPerContractRoundTrip}/contract RT; abs ceiling ${(netEdge.absCostFracCeiling * 100).toFixed(0)}% of premium — arm.costBar.bar is NOT what the OTM open faces)` : `ARMED at ${otmBar.barR.toFixed(3)}R${otmBar.barPinnedByFloor ? ' (PINNED BY THE MIN_GROSS FLOOR — retuning commission/spread alone is a no-op)' : ` (dominant term ${otmBar.dominantTerm})`}`) : 'off'}, spread=${spreadArmed ? 'ARMED' : 'off'}, otm_delta_floor=${otmFloorArmed ? `ARMED at |delta| >= ${resolveOptionOtmDeltaFloorLive(liveEnv)}` : 'off'}, otm_nominator=${admissibleStrikeArmed ? `ARMED into |delta| [${admissibleStrikeBand.min}, ${admissibleStrikeBand.max}) (TRA-3401 — a SELECTOR upstream of every gate here: it makes no verdict of its own, so it is not a row in byGate; since TRA-3510 it is instead an AXIS ON every gate, \`bySelection\` — see the paragraph at the end)` : 'off (legacy top-|mispricingPct| nominee, delta-blind)'}. Per gate, blocked>0 is the direct evidence it is biting; evaluated>0 with blocked=0 is an armed gate passing every candidate it saw. On the universe axis ONLY, evaluated=0 is ambiguous unless read with arm.universe.restricted — an unrestricted universe records no verdict at all. byReason splits the BLOCKS (cost_bar buckets the shortfall below arm.costBar.bar.barR, so "how much would I have to move the bar" is answered off recorded data); byBook names the live books each gate actually governed, so a fleet claim is checkable rather than assumed from a process-level flag. ⚠️ The universe cut runs BEFORE the cost bar, so cost_bar's denominator STEPS DOWN when the allowlist first takes effect — do not compare a post-TRA-3216 block rate to a pre one. Read retained for the multi-day fold (a one-day counter self-clears at ET midnight) and durability.ephemeral before trusting any count. ⚠️ TRA-3391 changed what cost_bar's edge IS: it is now the LOWER 95% CI bound of the candidate's measured tape cell (arm.costBar.edge), not \`3·|delta| − 1\`. Two consequences for this payload — (1) \`byReason\` now carries \`insufficient_evidence\`, which means WE NEVER MEASURED THAT CELL and is NOT \`gross_negative\` (a measured loser). ⚠️ TRA-3401 — do NOT scope that by symbol: the cell key is \`structure × |delta| bucket\` with NO symbol axis, so the universe restriction does not scope the fold. "On the restricted live universe the tape holds 471 rows, ALL |Δ| < 0.20" describes where the live sleeve has historically NOMINATED, NOT the evidence a candidate in the admitted band is decided under — that band is pooled across every symbol and mode, and it ADMITS. Reading the 471 the other way reported an evidence deadlock that does not exist. (2) \`byCell\` names the cell each verdict was decided under, admits included — cross-read it against /api/health/option-expectancy-table, which publishes n / mean / SE / lowerCI95 / admits per cell. ⚠️ TRA-3483 — \`byGate[cost_bar]\` now also carries \`costRQuantiles\` and \`netEdgeShadow\`, and BOTH ARE RECORDERS: \`${netEdge.flag}\` is ${netEdge.enabled ? 'ARMED' : '\`false\`'} and nothing in either block feeds a verdict. They exist because \`k\` is a RATIO — \`admit ⟺ costR ≤ k · modeledGrossR\` — and the deployed surface published the DENOMINATOR only (the expectancy table's per-cell lowerCI95), while every row inside a cell shares that same denominator. \`costR\` is therefore the ONLY axis \`k\` can discriminate on, and it is now emitted per decision, admits included, in the same \`R_gate\` unit as \`barR\`, split into \`spreadR\` (the candidate's own quote cross) and \`feeR\` (the $${netEdge.feesPerContractRoundTrip}/contract RT floor). \`netEdgeShadow.sweep\` replays the net-edge admit rule at 8 candidate \`k\` on those recorded rows and reports \`medianNetR_admitted\` = median(modeledGrossR − costR) over what each \`k\` would admit, against \`flatFormAdmits\` — the DEPLOYED form's admits on the IDENTICAL row set, so the comparison is paired. Read \`rowsEvaluated\` vs \`rowsRecorded\` / \`rowsMissingCostR\` FIRST: a row whose quote was unusable produces no cost sample and is excluded from the sweep denominator (under the real form it would be a \`net_edge_quote_unusable\` block at every k), and \`samplesDropped > 0\` means the quantiles are over a truncated head. \`rowsMissingGrossR\` counts evaluated rows whose edge was unknown — those fail closed at every \`k\` and are IN the denominator, because an unknown edge is a real block, not missing cost data. ⚠️ TRA-3483 (D2) — each gate also publishes \`blockedUnclassified\`: BLOCKED rows carrying no \`reasonCode\`, which \`byReason\` cannot see. Every \`byReason.share\` is of \`blocked\`, which INCLUDES those rows, so when \`blockedUnclassified > 0\` the rows DO NOT sum to 1 and the gap is COVERAGE, not a residual bucket. On the retained fold this is the pre-stamping backlog that made \`gross_negative\`'s share read as a rate. ⚠️ TRA-3510 — every gate now also carries \`bySelection\`: which TRA-3401 NOMINATOR BRANCH produced the candidate each verdict ruled on (\`in_band\` | \`fallback_top_mispricing\` | \`legacy\`), admits included, with \`meanCheapConsidered\` / \`meanCheapInBand\` over their own \`rowsWithChainShape\` denominator. READ THIS BEFORE QUOTING ANY ZERO ON A DELTA GATE. The selector runs upstream of every gate here, and on its \`in_band\` branch the nominee's |Δ| is inside [${admissibleStrikeBand.min}, ${admissibleStrikeBand.max}) BY CONSTRUCTION — so it cannot breach a ceiling at the band's own max, and it cannot breach a floor at or below the band's min. \`entry_delta_ceiling_shadow.blocked === 0\` and \`otm_delta_floor.blocked === 0\` therefore have two byte-identical causes — "the selector clamped every row into the band" (a vacuous zero, arithmetic) and "the far tail was nominated and genuinely did not breach" (a measurement) — and \`bySelection\` is the ONLY axis on this payload that separates them. Rows concentrated on \`in_band\` ⇒ do not publish that zero as a tail estimate. An EMPTY \`bySelection\` on a gate with \`evaluated > 0\` means those rows predate this axis or came from a non-OTM path (RV / directional cost_bar rows carry no nominator); it never means one branch produced them all. ⚠️ TRA-3510 also HOISTED \`otm_delta_floor\` above the cost bar, joining the ceiling TRA-3504 hoisted: both edges of the ratified band are now on the same side of it. Consequence for this payload — when the floor is armed, a sub-floor candidate attributes to \`otm_delta_floor\` instead of \`cost_bar\`/\`gross_negative\`, and \`cost_bar\`'s denominator steps DOWN by exactly the floor's blocked count. That is correct attribution, not a regression; do not compare a post-arm cost_bar rate to a pre-arm one. ⚠️ TRA-3694 — \`arm.universe.ratification\` publishes the AUTHORIZATION, which every other field on \`arm.universe\` is silent about. \`source: 'env'\` says an operator set the value; it does NOT say the board ratified it, and before this ticket a ratified widening and an unratified one rendered BYTE-IDENTICALLY here — the same field was flagged twice in 26 hours by two independent readers (CFO interaction \`8e303cd7\`, then TRA-3661) because each had to re-derive the answer from board records that sit nowhere near this route. READ \`ratification.matchesLive\`, not the two strings: the failure being fixed is precisely a comparison nobody performs, so the route computes it. It is \`true | false | 'unstamped'\` — an UNSET stamp is \`'unstamped'\` and NEVER \`true\`, because a stamp defaulting to OK reproduces the original defect one layer up; a SET-but-unparseable stamp reads \`false\`, not \`'unstamped'\`, since somebody wrote a value and believes it is in force. The comparison is on the RESOLVED symbol SET under the enforcement path's own parse, so whitespace and ordering cannot manufacture a false alarm, while \`ratification.onlyLive\` names the live symbols the ratification does NOT cover — the unratified-widening direction, which is the one that spends real money. This is a READ-ONLY instrument: a mismatch here blocks no order, because a missing env var halting a real-money sleeve would be strictly worse than the defect it fixes.`,
     });
   });
 

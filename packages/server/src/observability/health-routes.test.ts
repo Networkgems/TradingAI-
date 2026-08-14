@@ -6179,3 +6179,238 @@ describe('TRA-3715 option-journal sleeve cells + ET window', () => {
     });
   });
 });
+// ─── TRA-3694 (parent TRA-3661) — the RATIFICATION STAMP ─────────────────────
+// `arm.universe` published the live VALUE and its SOURCE and nothing about its
+// AUTHORIZATION, so a RATIFIED widening and an UNRATIFIED one rendered
+// BYTE-IDENTICALLY. Acceptance item 2 is explicit that the fail state must be
+// "demonstrated on a real read, not argued" — every case below therefore reads
+// the SHIPPED route handler's own JSON body, not the pure resolver.
+describe('GET /api/health/live-enforce-gates — arm.universe.ratification (TRA-3694)', () => {
+  const UNIVERSE_VAR = 'OPTION_LIVE_OTM_UNIVERSE';
+  const RATIFIED_VAR = 'OPTION_LIVE_OTM_UNIVERSE_RATIFIED';
+  const RATIFIED_BY_VAR = 'OPTION_LIVE_OTM_UNIVERSE_RATIFIED_BY';
+  const VARS = [UNIVERSE_VAR, RATIFIED_VAR, RATIFIED_BY_VAR];
+  // The live 10 (TRA-3417/TRA-3592) and the TRA-3216 five the ticket names as
+  // the negative control's "any other string".
+  const LIVE_TEN = 'AAPL,SPY,QQQ,PLTR,TSLA,GIS,TFC,MO,VZ,UPS';
+  const RATIFIED_FIVE = 'AAPL,SPY,QQQ,PLTR,TSLA';
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of VARS) { saved[k] = process.env[k]; delete process.env[k]; }
+    clearLiveEnforceGateLedger();
+  });
+  afterEach(() => {
+    for (const k of VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
+    clearLiveEnforceGateLedger();
+  });
+
+  type Stamp = {
+    var: string; byVar: string | null; raw: string | null; ratifiedBy: string | null;
+    matchesLive: boolean | 'unstamped'; reason: string; note: string;
+    ratifiedSymbols: string[] | null; ratifiedRestricted: boolean | null;
+    onlyLive: string[]; onlyRatified: string[];
+  };
+  type UniverseBlock = { symbols: string[]; restricted: boolean; source: string; ratification: Stamp };
+
+  function serveGates(): { universe: UniverseBlock; note: string } {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-enforce-gates')![0]!({}, res);
+    const body = res.body as { arm: { universe: UniverseBlock }; note: string };
+    return { universe: body.arm.universe, note: body.note };
+  }
+
+  // ── Acceptance 1 — POSITIVE control ────────────────────────────────────────
+  it('reads TRUE when the stamp is the live string', () => {
+    process.env[UNIVERSE_VAR] = LIVE_TEN;
+    process.env[RATIFIED_VAR] = LIVE_TEN;
+    process.env[RATIFIED_BY_VAR] = '8e303cd7';
+    const { universe, note } = serveGates();
+    expect(universe.symbols).toHaveLength(10);
+    expect(universe.ratification.matchesLive).toBe(true);
+    expect(universe.ratification.reason).toBe('match');
+    expect(universe.ratification.ratifiedBy).toBe('8e303cd7');
+    expect(universe.ratification.onlyLive).toEqual([]);
+    expect(universe.ratification.onlyRatified).toEqual([]);
+    expect(note).toMatch(/RATIFIED/);
+    expect(note).not.toMatch(/RATIFICATION MISMATCH/);
+  });
+
+  // ── Acceptance 2 — the NEGATIVE control, the discriminator ─────────────────
+  // Without this the field has no demonstrated fail state, which is the exact
+  // class of instrument defect this ticket exists to close.
+  it('reads FALSE when the stamp is the TRA-3216 five and live is the ten, and NAMES the widening', () => {
+    process.env[UNIVERSE_VAR] = LIVE_TEN;
+    process.env[RATIFIED_VAR] = RATIFIED_FIVE;
+    const { universe, note } = serveGates();
+    expect(universe.ratification.matchesLive).toBe(false);
+    expect(universe.ratification.reason).toBe('mismatch');
+    // The DIRECTION is the deliverable: these five names are what real money can
+    // open without an authorization covering them.
+    expect(universe.ratification.onlyLive).toEqual(['GIS', 'TFC', 'MO', 'VZ', 'UPS']);
+    expect(universe.ratification.onlyRatified).toEqual([]);
+    expect(universe.ratification.note).toMatch(/UNRATIFIED WIDENING/);
+    expect(note).toMatch(/RATIFICATION MISMATCH — UNRATIFIED WIDENING onto \[GIS,TFC,MO,VZ,UPS\]/);
+  });
+
+  // ── Acceptance 3 — an unset stamp is UNKNOWN, never a pass ────────────────
+  it("reads 'unstamped' when the var is unset — NOT true, even on the shipped default", () => {
+    const { universe, note } = serveGates();
+    expect(universe.symbols).toEqual(['AAPL', 'SPY', 'QQQ', 'PLTR', 'TSLA']); // the default
+    expect(universe.ratification.matchesLive).toBe('unstamped');
+    expect(universe.ratification.matchesLive).not.toBe(true);
+    expect(universe.ratification.reason).toBe('absent');
+    expect(universe.ratification.raw).toBeNull();
+    expect(universe.ratification.ratifiedSymbols).toBeNull();
+    expect(note).toMatch(/RATIFICATION UNSTAMPED/);
+  });
+
+  it('a BLANK stamp is unstamped, not an empty ratified set', () => {
+    process.env[RATIFIED_VAR] = '   ';
+    expect(serveGates().universe.ratification.matchesLive).toBe('unstamped');
+  });
+
+  // ── The trap the ticket names: a stamp that defaults to OK ────────────────
+  it('a SET-but-unparseable stamp reads FALSE, never unstamped and never true', () => {
+    // `,,,` parses to zero symbols. The live universe here is the SHIPPED FIVE,
+    // so a "fall back to the default and compare" implementation would report a
+    // spurious `true` — reproducing the original defect one layer up.
+    process.env[RATIFIED_VAR] = ',,,';
+    const { universe } = serveGates();
+    expect(universe.symbols).toEqual(['AAPL', 'SPY', 'QQQ', 'PLTR', 'TSLA']);
+    expect(universe.ratification.matchesLive).toBe(false);
+    expect(universe.ratification.reason).toBe('unparseable');
+  });
+
+  // ── The comparison is SEMANTIC, so it cannot be red for the wrong reason ──
+  it('matches across whitespace, case and ordering — a bytewise diff would false-alarm', () => {
+    process.env[UNIVERSE_VAR] = 'AAPL,SPY,QQQ';
+    process.env[RATIFIED_VAR] = ' qqq   aapl, spy ';
+    expect(serveGates().universe.ratification.matchesLive).toBe(true);
+  });
+
+  it('an UNRESTRICTED live universe against a listed stamp is the extreme widening case', () => {
+    process.env[UNIVERSE_VAR] = '*';
+    process.env[RATIFIED_VAR] = RATIFIED_FIVE;
+    const { universe } = serveGates();
+    expect(universe.restricted).toBe(false);
+    expect(universe.ratification.matchesLive).toBe(false);
+    expect(universe.ratification.note).toMatch(/MISMATCH \(WIDENING\)/);
+  });
+
+  it('a stamp that ratifies `*` matches an unrestricted live universe', () => {
+    process.env[UNIVERSE_VAR] = '*';
+    process.env[RATIFIED_VAR] = 'ALL';
+    expect(serveGates().universe.ratification.matchesLive).toBe(true);
+  });
+
+  it('grades the ENFORCED list, not the raw env — an env_invalid live value is graded as the default', () => {
+    process.env[UNIVERSE_VAR] = ',,,';            // enforces the shipped five
+    process.env[RATIFIED_VAR] = RATIFIED_FIVE;    // which IS the ratified set
+    const { universe } = serveGates();
+    expect(universe.source).toBe('env_invalid');
+    expect(universe.ratification.matchesLive).toBe(true);
+  });
+});
+
+// TRA-3694 — the same stamp on the resolved caps. A cap value reads identically
+// whether the board authorised it or not, which is the identical defect.
+describe('GET /api/health/live-options-fee-slippage — capRatification (TRA-3694)', () => {
+  const VARS = [
+    'LIVE_OPTION_TEST_NOTIONAL_CAP_USD',
+    'LIVE_OPTION_TEST_AGGREGATE_CAP_USD',
+    'OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED',
+    'OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED',
+    'OPTION_LIVE_TEST_CAPS_RATIFIED_BY',
+  ];
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => { for (const k of VARS) { saved[k] = process.env[k]; delete process.env[k]; } });
+  afterEach(() => {
+    for (const k of VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
+  });
+
+  type CapStamp = { matchesLive: boolean | 'unstamped'; reason: string; ratifiedValue: number | null; liveValue: number; note: string };
+  type CapsBody = {
+    notionalCapUsd: number; aggregateCapUsd: number;
+    capRatification: { notionalCap: CapStamp; aggregateCap: CapStamp };
+    ratificationMatchesLive: boolean | 'unstamped';
+  };
+  function serveCaps(): CapsBody {
+    const { app, routes } = fakeApp();
+    registerLiveHealthRoutes(app, {
+      requireAuth: (() => undefined) as never,
+      userCtx: async () => ctx('admin', engineState()),
+      getSettings: () => settings(),
+      now: () => NOW,
+    });
+    const res = fakeRes();
+    routes.get('/api/health/live-options-fee-slippage')![0]!({}, res);
+    return res.body as CapsBody;
+  }
+
+  it("is 'unstamped' out of the box — an unset stamp never reads as a pass", () => {
+    const body = serveCaps();
+    expect(body.capRatification.notionalCap.matchesLive).toBe('unstamped');
+    expect(body.capRatification.aggregateCap.matchesLive).toBe('unstamped');
+    expect(body.ratificationMatchesLive).toBe('unstamped');
+  });
+
+  it('reads TRUE when both stamps equal the RESOLVED caps', () => {
+    const live = serveCaps();
+    process.env.OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED = String(live.notionalCapUsd);
+    process.env.OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED = String(live.aggregateCapUsd);
+    process.env.OPTION_LIVE_TEST_CAPS_RATIFIED_BY = 'TRA-3445';
+    const body = serveCaps();
+    expect(body.capRatification.notionalCap.matchesLive).toBe(true);
+    expect(body.capRatification.aggregateCap.matchesLive).toBe(true);
+    expect(body.ratificationMatchesLive).toBe(true);
+  });
+
+  // The negative control, and the direction that matters: live LOOSER than ratified.
+  it('reads FALSE on a mismatch and says which side is looser', () => {
+    process.env.OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED = '250';
+    const body = serveCaps();
+    expect(body.aggregateCapUsd).toBe(750);
+    expect(body.capRatification.aggregateCap.matchesLive).toBe(false);
+    expect(body.capRatification.aggregateCap.ratifiedValue).toBe(250);
+    expect(body.capRatification.aggregateCap.note).toMatch(/LOOSER than the authorization/);
+  });
+
+  it('the fold is FAIL-LOUD: one false beats one unstamped', () => {
+    process.env.OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED = '250'; // false
+    // notionalCap stays unset => 'unstamped'
+    const body = serveCaps();
+    expect(body.capRatification.notionalCap.matchesLive).toBe('unstamped');
+    expect(body.ratificationMatchesLive).toBe(false);
+  });
+
+  it('a non-numeric stamp reads FALSE, not unstamped', () => {
+    process.env.OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED = 'yes';
+    const s = serveCaps().capRatification.notionalCap;
+    expect(s.matchesLive).toBe(false);
+    expect(s.reason).toBe('unparseable');
+  });
+
+  it('matches on the QUANTITY, not the spelling', () => {
+    // The shipped cap is 268.58, not a round number — trailing zeros and
+    // surrounding whitespace are the same authorization and must not read as a
+    // mismatch. (A `false` an operator cannot reproduce is a gate that gets
+    // ignored, which is the same end state as no gate.)
+    const live = serveCaps();
+    process.env.OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED = ` ${live.notionalCapUsd.toFixed(4)} `;
+    expect(serveCaps().capRatification.notionalCap.matchesLive).toBe(true);
+  });
+});
