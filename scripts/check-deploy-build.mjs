@@ -76,7 +76,7 @@
 //   node scripts/check-deploy-build.mjs --verify-hook  # is the gate actually INSTALLED?
 //   node scripts/check-deploy-build.mjs --selftest     # both-direction controls
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -390,25 +390,50 @@ function verifyHook({ requireConfig = true } = {}) {
 // ---------------------------------------------------------------------------
 const ZERO = /^0{40,64}$/;
 
+// `readFileSync(0)` is NOT enough here, and the first live push proved it: git hands the
+// hook its ref list on a PIPE, and on Windows a single read of a pipe that is not yet ready
+// comes back EMPTY rather than blocking. The gate then fell through to its no-stdin branch
+// and graded HEAD. It happened to be the same commit that time, so nothing was missed — but
+// the ref filter and the multi-ref loop had silently stopped running, which is a blind spot
+// that only shows up on the push where HEAD is not what you are pushing.
+//
+// So: read to EOF, retrying EAGAIN, and report WHICH path produced the result.
 function readStdin() {
-  try {
-    return readFileSync(0, 'utf8');
-  } catch {
-    return '';
+  const chunks = [];
+  const buf = Buffer.alloc(64 * 1024);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    let n;
+    try {
+      n = readSync(0, buf, 0, buf.length, null);
+    } catch (e) {
+      if (e.code === 'EAGAIN' && Date.now() < deadline) {
+        // Busy-wait a beat. A hook has no event loop to yield to before it must answer.
+        spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},20)']);
+        continue;
+      }
+      if (e.code === 'EOF' || e.code === 'EAGAIN') break;
+      return { text: chunks.join(''), read: false, reason: `${e.code ?? e.message}` };
+    }
+    if (n === 0) break;
+    chunks.push(buf.toString('utf8', 0, n));
   }
+  return { text: chunks.join(''), read: true, reason: '' };
 }
 
 function hookMode() {
-  const raw = readStdin();
-  const rows = raw
+  const stdin = readStdin();
+  const rows = stdin.text
     .split(/\r?\n/)
     .filter(Boolean)
     .map((l) => l.split(/\s+/));
 
   // No stdin (hand-run, or a git that fed us nothing) — grade HEAD rather than wave it
-  // through. A gate that no-ops when it cannot read its input is not a gate.
+  // through. A gate that no-ops when it cannot read its input is not a gate. Say so out
+  // loud, because in this branch the ref filter below is not running.
   const targets = [];
   if (rows.length === 0) {
+    console.warn(`[deploy-build] no ref list on stdin${stdin.reason ? ` (${stdin.reason})` : ''} — grading HEAD instead, and NOT filtering by ref.`);
     targets.push({ sha: 'HEAD', remoteRef: '(no stdin — grading HEAD)' });
   } else {
     for (const [, localSha, remoteRef] of rows) {
