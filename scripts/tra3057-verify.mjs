@@ -23,9 +23,17 @@
 // Fails closed: an unreachable host, unparseable body, or a live SHA this
 // checkout does not know all exit non-zero. Never prints PROVEN on a doubt.
 //
+//   exit 0  PROVEN     — all four legs pass
+//   exit 1  NOT PROVEN — a leg was measured and FAILED
+//   exit 3  BLIND      — a leg could not be READ (TRA-3722). Separate from 1 on purpose:
+//                        the remedy for "the fix is not live" is a deploy, and the remedy
+//                        for "I cannot tell" is `git fetch origin --unshallow`. Emitting
+//                        the wrong one is how a gate gets routed around.
+//
 // Usage: node scripts/tra3057-verify.mjs [--host=https://...]
 
 import { execFileSync } from 'node:child_process';
+import { gradedAncestry, blindReason } from './lib/shallow-ancestry.mjs';
 
 const HOST = (process.argv.find((a) => a.startsWith('--host=')) ?? '')
   .slice('--host='.length) || 'https://tradingai-bqb1.onrender.com';
@@ -40,6 +48,33 @@ const TIMEOUT_MS = 30_000;
 
 function git(...args) {
   return execFileSync('git', args, { encoding: 'utf8' }).trim();
+}
+
+// Leg 1's ancestry decision, as a function (TRA-3722), so the shallow-graft repro can drive
+// THIS FILE'S ROUTING inside a real graft rather than the shared grader alone.
+//   'contains' -> leg 1 PASSes · 'absent' -> leg 1 FAILs · BLIND -> leg 1 is unreadable
+function legOneState(fixSha, liveSha) {
+  const { verdict, answer } = gradedAncestry(fixSha, liveSha);
+  return { state: answer === true ? 'contains' : answer === false ? 'absent' : 'BLIND', verdict };
+}
+
+// `--ancestry-probe=<fixSha>:<liveSha>` — print leg 1's state and nothing else, then exit.
+// Everything below does network I/O at module load, so the repro cannot import this module;
+// it runs these SHIPPED BYTES as a subprocess inside a grafted clone. Printing `BLIND` there
+// is the whole finding — `absent` was the false RED.
+// Prints `contains|absent|BLIND <verdict>`. Exit 0 = the probe ran · 2 = bad usage.
+{
+  const probe = process.argv.find((a) => a.startsWith('--ancestry-probe='));
+  if (probe !== undefined) {
+    const [fixSha, liveSha] = probe.slice('--ancestry-probe='.length).split(':');
+    if (!fixSha || !liveSha) {
+      console.error('usage: --ancestry-probe=<fixSha>:<liveSha>');
+      process.exit(2);
+    }
+    const { state, verdict } = legOneState(fixSha, liveSha);
+    console.log(`${state} ${verdict}`);
+    process.exit(0);
+  }
 }
 
 async function getJson(path) {
@@ -69,10 +104,24 @@ const log = (s) => {
   console.log(s);
 };
 
+// A leg is true (PASS), false (FAIL) or BLIND (TRA-3722 — could not be READ).
+//
+// BLIND had to be ADDED here; the sibling files in this sweep already had one. Before it,
+// leg 1's ancestry was a bare `catch { contains = false }`, so rc 128, no git, an unknown
+// object and a SHALLOW GRAFT all read as "the fix is not live" and leg 1 FAILed against a
+// build that carries it. Three legs already printed the WORD "BLIND" in their detail while
+// recording `ok:false` — those are upgraded to the real state, because a refusal that
+// prescribes "the fix is not deployed" sends the reader to deploy something that is
+// already deployed.
+//
+// ⚠ BLIND is a STRING and therefore TRUTHY. The tally at the bottom tests `=== true`, not
+// truthiness — `legs.every(l => l.ok)` would pass every blind leg, which is the fail-open
+// this ticket's sibling exists to fix. Do not "simplify" it back.
+const BLIND = 'BLIND';
 const legs = [];
 const leg = (n, name, ok, detail) => {
   legs.push({ n, name, ok, detail });
-  log(`[tra3057] LEG ${n} ${ok ? 'PASS' : 'FAIL'} — ${name}`);
+  log(`[tra3057] LEG ${n} ${ok === true ? 'PASS' : ok === BLIND ? 'BLIND' : 'FAIL'} — ${name}`);
   if (detail) for (const d of String(detail).split('\n')) log(`[tra3057]        ${d}`);
 };
 
@@ -82,9 +131,9 @@ log(`[tra3057] host : ${HOST}`);
 const version = await getJson('/api/health/version');
 let liveSha = null;
 if (version.status !== 200 || !version.body?.commit) {
-  leg(1, 'live SHA at/after f045ed5', false,
+  leg(1, 'live SHA at/after f045ed5', BLIND,
     `/api/health/version unreachable or shape-less (HTTP ${version.status}). ` +
-    'BLIND — refusing to grade legs 2-4 against an unknown build.');
+    'Refusing to grade legs 2-4 against an unknown build.');
 } else {
   liveSha = version.body.commit;
   let known = true;
@@ -94,21 +143,28 @@ if (version.status !== 200 || !version.body?.commit) {
     known = false;
   }
   if (!known) {
-    leg(1, 'live SHA at/after f045ed5', false,
-      `live ${liveSha.slice(0, 8)} is UNKNOWN to this checkout — fetch, then re-run. BLIND.`);
+    leg(1, 'live SHA at/after f045ed5', BLIND,
+      `live ${liveSha.slice(0, 8)} is UNKNOWN to this checkout — fetch, then re-run.`);
   } else {
-    let contains = false;
+    // TRA-3722: only the NEGATIVE is re-graded. rc 0 stands on its own — an affirmative is
+    // proven by objects that are present, and a graft can only hide history, never invent it.
+    const { state, verdict } = legOneState(FIX_COMMIT, liveSha);
+    let behind = '(not read)';
     try {
-      execFileSync('git', ['merge-base', '--is-ancestor', FIX_COMMIT, liveSha], { stdio: 'ignore' });
-      contains = true;
+      behind = git('rev-list', '--count', `${liveSha}..origin/main`);
     } catch {
-      contains = false;
+      // On a graft `origin/main` may not even be a walkable ref. It is context, not a leg;
+      // losing it must not change the verdict.
     }
-    const behind = contains
-      ? git('rev-list', '--count', `${liveSha}..origin/main`)
-      : git('rev-list', '--count', `${liveSha}..origin/main`);
-    leg(1, 'live SHA at/after f045ed5', contains,
-      `live=${liveSha.slice(0, 8)}  fix=${FIX_COMMIT}  ancestor=${contains}  behind origin/main=${behind}`);
+    const facts = `live=${liveSha.slice(0, 8)}  fix=${FIX_COMMIT}  ancestry=${verdict}  behind origin/main=${behind}`;
+    if (state === BLIND) {
+      leg(1, 'live SHA at/after f045ed5', BLIND,
+        `${facts}\n${blindReason(verdict)}\n` +
+        'This is NOT "the fix is not live" — that verdict would prescribe deploying a commit ' +
+        'that may already be deployed (TRA-3722).');
+    } else {
+      leg(1, 'live SHA at/after f045ed5', state === 'contains', facts);
+    }
   }
 }
 
@@ -159,7 +215,20 @@ if (kpiOk) {
   log('[tra3057] LEG 4 SKIPPED — leg 2 did not pass, so there is no reading to record.');
 }
 
-const allOk = legs.every((l) => l.ok);
+// `=== true`, not truthiness: BLIND is a non-empty string (see the `leg` helper).
+const blindLegs = legs.filter((l) => l.ok === BLIND);
+const failedLegs = legs.filter((l) => l.ok === false);
+const allOk = legs.every((l) => l.ok === true);
 log('');
-log(`[tra3057] ${allOk ? 'PROVEN — all four acceptance legs pass.' : 'NOT PROVEN — ' + legs.filter((l) => !l.ok).map((l) => `leg ${l.n}`).join(', ') + ' failed.'}`);
+if (blindLegs.length) {
+  // BLIND outranks FAIL, the way every other gate in this repo orders it
+  // (BLIND > BROKEN > CLEAN, BLIND > STRANDED > LATE). "I could not check" and
+  // "I checked and it is broken" must not share an exit code, and they must not
+  // share a REMEDY either: a blind leg is fixed by `git fetch origin --unshallow`,
+  // a failed one by deploying.
+  log(`[tra3057] BLIND — ${blindLegs.map((l) => `leg ${l.n}`).join(', ')} could not be READ. NOT PROVEN, and not a failure either.`);
+  if (failedLegs.length) log(`[tra3057]         (${failedLegs.map((l) => `leg ${l.n}`).join(', ')} also FAILED — but grade the blind first.)`);
+  process.exit(3);
+}
+log(`[tra3057] ${allOk ? 'PROVEN — all four acceptance legs pass.' : 'NOT PROVEN — ' + failedLegs.map((l) => `leg ${l.n}`).join(', ') + ' failed.'}`);
 process.exit(allOk ? 0 : 1);

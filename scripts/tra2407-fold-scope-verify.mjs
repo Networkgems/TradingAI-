@@ -53,7 +53,7 @@
 // reaches a process listing or a routine transcript:
 //   TRA2407_OPERATOR_TOKEN | TRA2407_OPERATOR_USER + TRA2407_OPERATOR_PASS
 
-import { execFileSync } from 'node:child_process';
+import { gradedAncestry, blindReason } from './lib/shallow-ancestry.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (name, dflt) => {
@@ -120,17 +120,26 @@ async function req(path, { token, method = 'GET', body } = {}) {
   }
 }
 
-/** Is the live build a descendant of the fix? Ancestry, never equality. */
-function deployVerdict(liveSha) {
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', FIX_SHA, liveSha], { stdio: 'ignore' });
-    return 'CONTAINS';
-  } catch (err) {
-    // Exit 1 = a real "not an ancestor". Anything else (unknown object, no git)
-    // is BLIND — a stale local checkout must not manufacture an UNDEPLOYED verdict
-    // any more than it may manufacture a deployed one.
-    return err && err.status === 1 ? 'MISSING' : 'UNKNOWN';
-  }
+/**
+ * Is the live build a descendant of the fix? Ancestry, never equality.
+ * `fixSha` is a parameter only so `--ancestry-probe` can drive THIS ROUTING over an
+ * arbitrary pair inside a grafted clone; every real call site uses the default.
+ */
+function deployVerdict(liveSha, fixSha = FIX_SHA) {
+  // Exit 1 = a real "not an ancestor". Anything else (unknown object, no git) is BLIND —
+  // a stale local checkout must not manufacture an UNDEPLOYED verdict any more than it
+  // may manufacture a deployed one.
+  //
+  // TRA-3722: exit 1 was NOT the safe half of that split. `merge-base --is-ancestor` also
+  // exits 1 when a SHALLOW graft cut the path between the two commits — byte-identical,
+  // no stderr — so the graft landed in `MISSING`, the one branch this comment exists to
+  // forbid, and the script exited 2 UNDEPLOYED against a host that has the fix. The
+  // negative is now re-graded; `UNKNOWN` (exit 3 BLIND) already existed and is where it
+  // goes. rc 0 is unchanged: an affirmative is proven by present objects.
+  const { verdict, answer } = gradedAncestry(fixSha, liveSha);
+  if (answer === true) return { state: 'CONTAINS', verdict };
+  if (answer === false) return { state: 'MISSING', verdict };
+  return { state: 'UNKNOWN', verdict };
 }
 
 /** A report cell with nothing in it — the route's own `isHollowReportCell`. */
@@ -244,9 +253,13 @@ async function main() {
   const liveSha = ver.json.commit;
   say(`live build ${ver.json.commitShort ?? liveSha} (startedAt ${ver.json.startedAt})`);
 
-  const dv = deployVerdict(liveSha);
+  const { state: dv, verdict: dvWhy } = deployVerdict(liveSha);
   if (dv === 'UNKNOWN') {
-    say(`BLIND — live sha ${liveSha} is unknown to this checkout (git fetch first).`);
+    // Name WHICH blind it was. "git fetch first" is the wrong instruction for a shallow
+    // graft — the object is already here; it is the path between the two that is gone,
+    // and the remedy is `--unshallow` (TRA-3722).
+    say(`BLIND — ancestry ${FIX_SHA.slice(0, 12)}..${liveSha.slice(0, 12)} is unreadable (${dvWhy}).`);
+    say(`  ${blindReason(dvWhy)}`);
     return 3;
   }
   if (dv === 'MISSING') {
@@ -428,6 +441,26 @@ function selfTest() {
 if (argv.includes('--self-test')) {
   process.exit(selfTest());
 }
+
+// `--ancestry-probe=<fixSha>:<liveSha>` — print deployVerdict's state and nothing else.
+// `main()` does network I/O, so the shallow-graft repro cannot import this module to grade
+// it; it runs these SHIPPED BYTES as a subprocess inside a grafted clone instead. Printing
+// `UNKNOWN` there is the whole finding — `MISSING` was the false RED (TRA-3722).
+// Prints `CONTAINS|MISSING|UNKNOWN <verdict>`. Exit 0 = the probe ran · 2 = bad usage.
+{
+  const probe = arg('ancestry-probe');
+  if (probe !== undefined) {
+    const [fixSha, liveSha] = probe.split(':');
+    if (!fixSha || !liveSha) {
+      console.error('usage: --ancestry-probe=<fixSha>:<liveSha>');
+      process.exit(2);
+    }
+    const { state, verdict } = deployVerdict(liveSha, fixSha);
+    console.log(`${state} ${verdict}`);
+    process.exit(0);
+  }
+}
+
 main().then(
   (code) => process.exit(code),
   (err) => {

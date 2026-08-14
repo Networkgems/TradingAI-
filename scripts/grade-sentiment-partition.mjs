@@ -48,6 +48,20 @@ const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
 // deploy of `d12d19ab`, finished 2026-07-30T00:29:50.769Z. The preceding deploy
 // (`9e1b1123`, 07-29T12:57:54Z) does not carry it, so the cliff is exact, not a
 // bracket. Override with --carrier-boot=<iso> if the fix is ever re-based.
+//
+// ⚠ IF YOU RE-RUN THAT CROSS-CHECK BY HAND, DO IT ON A COMPLETE CLONE (TRA-3722).
+// This file imports no `child_process`; the command above is an instruction to a HUMAN,
+// which is exactly why it carries no screen. `merge-base --is-ancestor` exits **1** both
+// for "that deploy genuinely does not carry b7dd483" and for "a shallow clone grafted the
+// path between them away" — same exit code, no stderr — and `cat-file -e` does not screen
+// it, because in the grafted state BOTH shas resolve and it is the history BETWEEN them
+// that is gone. A shallow checkout is the default shape of a fresh CI or agent workspace,
+// so the bare loop would silently walk the cliff DOWN the history and re-date it later
+// than it is. Check first:
+//     git rev-parse --is-shallow-repository   # must print false
+//     git fetch origin --unshallow            # if it does not
+// Everything in this repo that runs the predicate in CODE now routes the negative through
+// scripts/lib/shallow-ancestry.mjs (`gradedAncestry`) instead of believing it.
 const FIRST_CARRYING_BOOT_MS = Date.parse('2026-07-30T00:29:50.769Z');
 
 const META_KEYS = ['attempts', 'sweptRecorded', 'preservedFromPrior', 'reasons'];

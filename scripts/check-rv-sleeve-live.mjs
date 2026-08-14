@@ -52,6 +52,8 @@ const RV_LONG_DELTA_FLOOR = 0.45;
 // The commit that makes the enforced band the RV long's own (TRA-1677).
 const SLEEVE_FIX = '07ea3b1';
 
+import { gradedAncestry, blindReason } from './lib/shallow-ancestry.mjs';
+
 const argv = process.argv.slice(2);
 const host = (argv.find(a => a.startsWith('--host='))?.slice('--host='.length) ?? DEFAULT_HOST).replace(/\/$/, '');
 const NO_GIT = argv.includes('--no-git');
@@ -70,6 +72,40 @@ function dead(msg, detail) {
   console.error('[rv-sleeve] Its empty set reads exactly like a hostile tape. Do NOT grade it:');
   console.error('[rv-sleeve] no RV outcome row from this build is real (TRA-1718).');
   process.exit(1);
+}
+
+// ── Leg 4's decision, as a function (TRA-3722) ────────────────────────────────
+// `merge-base --is-ancestor` exits 1 both for "the build genuinely lacks 07ea3b1" and
+// for "a shallow graft cut the path between them" — same code, no stderr. This file
+// already screened statuses OUTSIDE 0/1 into blind(); the remaining `status !== 0` went
+// to dead(), which condemns EVERY RV outcome row from a build that carries the fix. The
+// blind() branch already said the right thing; only the routing was wrong.
+//
+// Extracted so the shallow-graft repro (scripts/tra3722-shallow-false-red-repro.mjs) can
+// drive THIS FILE'S ROUTING inside a real graft, not merely the shared grader.
+//   'contains' -> leg 4 passes · 'absent' -> dead() (1) · 'blind' -> blind() (3)
+function sleeveAncestryState(fixSha, liveSha) {
+  const { verdict, answer } = gradedAncestry(fixSha, liveSha);
+  return { state: answer === true ? 'contains' : answer === false ? 'absent' : 'blind', verdict };
+}
+
+// `--ancestry-probe=<fixSha>:<liveSha>` — print leg 4's state and nothing else, then exit.
+// Everything below does network I/O at module load, so the repro cannot import this module;
+// it runs these SHIPPED BYTES as a subprocess inside a grafted clone. Placed before the
+// first fetch on purpose. Prints `contains|absent|blind <verdict>`. Exit 0 = the probe ran
+// (the ANSWER is the payload, not the exit code) · 2 = bad usage.
+{
+  const probe = argv.find(a => a.startsWith('--ancestry-probe='))?.slice('--ancestry-probe='.length);
+  if (probe !== undefined) {
+    const [fixSha, liveSha] = probe.split(':');
+    if (!fixSha || !liveSha) {
+      console.error('usage: --ancestry-probe=<fixSha>:<liveSha>');
+      process.exit(2);
+    }
+    const { state, verdict } = sleeveAncestryState(fixSha, liveSha);
+    console.log(`${state} ${verdict}`);
+    process.exit(0);
+  }
 }
 
 // ── Leg 1: CURL THE ROUTE. Never grep the route file — a key can arrive via a
@@ -150,9 +186,18 @@ if (!NO_GIT) {
     );
   }
 
-  const anc = spawnSync('git', ['merge-base', '--is-ancestor', SLEEVE_FIX, commit]);
-  if (anc.status !== 0 && anc.status !== 1) blind(`ancestry undecidable for ${SLEEVE_FIX}..${shortCommit}`);
-  if (anc.status !== 0) {
+  // TRA-3722: the NEGATIVE is re-graded before it is believed. rc 0 still stands on its
+  // own — an affirmative is PROVEN by objects that are present, and a graft can only hide
+  // history, never invent it.
+  const { state, verdict } = sleeveAncestryState(SLEEVE_FIX, commit);
+  if (state === 'blind') {
+    blind(
+      `ancestry for ${SLEEVE_FIX}..${shortCommit} is UNREADABLE (${verdict}) — ${blindReason(verdict)} ` +
+        'Reading it as a negative would condemn every RV outcome row from a build that may well ' +
+        'CARRY the fix (TRA-3722).',
+    );
+  }
+  if (state === 'absent') {
     dead(
       `the running build ${shortCommit} does NOT contain ${SLEEVE_FIX}.`,
       'The band above cannot be the fixed one. Re-derive the deploy id: node scripts/check-deploy-floor.mjs',

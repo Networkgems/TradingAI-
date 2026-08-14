@@ -56,7 +56,10 @@
 // quiet when it cannot see is the TRA-1695 failure (a guard that cannot tell "I am
 // broken" from "subject is fine").
 //
-// Exit codes: 0 = interlock LIVE. 1 = a check FAILED. 2 = the checker could not run.
+// Exit codes: 0 = interlock LIVE. 1 = a check FAILED. 2 = the checker could not run —
+// which since TRA-3722 also covers a check that RAN and came back UNREADABLE (a BLIND),
+// because "deploy it before arming" is the wrong remedy for a shallow graft that already
+// carries the commit. BLIND outranks FAIL in the verdict block.
 
 import { execFileSync } from 'node:child_process';
 // TRA-3721 — the shared shallow-graft ancestry grader (TRA-3699 / TRA-3678 remedy shape).
@@ -209,15 +212,75 @@ const valOf = name => {
 const BASE = (valOf('--base') || process.env['BQB1_BASE'] || 'https://tradingai-bqb1.onrender.com').replace(/\/$/, '');
 const POST_ARM = valOf('--post-arm');
 
+// `ok` is true (PASS) · false (FAIL) · null (SKIP) · BLIND (TRA-3722 — could not be READ).
+//
+// BLIND is NOT null. A SKIP is a check that never ran and the verdict block below tolerates
+// it (exit 0, "a SKIPPED check is not a passed check"). A BLIND is a check that RAN and came
+// back unreadable, on the standing pre-condition for the `TRADIER_ENV=production` write —
+// that may not exit 0. It is also not a FAIL: the three live ancestry arms print "Deploy it
+// before arming", and on a shallow graft that prescribes a deploy which has already happened.
+// Right direction, wrong instruction — which is how a refusal reads as a deadlock and gets
+// routed around (the same failure this file's TRA-2351 note describes).
+const BLIND = 'BLIND';
 const results = [];
 const record = (name, ok, detail) => {
   results.push({ name, ok, detail });
-  const tag = ok === null ? 'SKIP' : ok ? 'PASS' : 'FAIL';
+  const tag = ok === null ? 'SKIP' : ok === BLIND ? 'BLIND' : ok ? 'PASS' : 'FAIL';
   console.log(`[${tag}] ${name}\n       ${detail}`);
 };
 
 function git(args) {
   return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+}
+
+// The shape all three LIVE ancestry arms share (TRA-3722). Written once because all three
+// carried the same `catch { ok = false }` and therefore the same false RED.
+//
+// `absent` is the message for a GENUINE non-carry — the arm that legitimately says "Deploy
+// it before arming". A BLIND gets its own message and its own remedy: on a graft the
+// commit may well be live and the deploy already done.
+//
+// The `ok` an ancestry arm records, and why. Split out from recordAncestryArm so
+// `--ancestry-probe` grades THIS MAPPING — the thing that was wrong — and not merely the
+// shared grader underneath it.
+function ancestryArmState(heldSha, liveSha) {
+  const { verdict, answer } = gradedAncestry(heldSha, liveSha);
+  return { ok: answer === true ? true : answer === false ? false : BLIND, verdict };
+}
+
+function recordAncestryArm(name, heldSha, liveSha, { carries, absent }) {
+  const { ok, verdict } = ancestryArmState(heldSha, liveSha);
+  record(
+    name,
+    ok,
+    ok === true
+      ? carries
+      : ok === false
+        ? absent
+        : `ancestry ${heldSha.slice(0, 7)}..${liveSha.slice(0, 8)} is UNREADABLE (${verdict}) — ${blindReason(verdict)}\n` +
+          '       Do NOT read this as "not deployed": that prescribes a deploy which may already have\n' +
+          '       happened. Nothing is proven either way, so the TRADIER_ENV write stays refused.',
+  );
+  return ok;
+}
+
+// `--ancestry-probe=<heldSha>:<liveSha>` — print the state ONE live arm would record, and
+// nothing else. `main()` does network I/O, so the shallow-graft repro cannot import this
+// module to grade it; it runs these SHIPPED BYTES as a subprocess inside a grafted clone.
+// Printing `BLIND` there is the whole finding — `false` was the false RED.
+// Prints `PASS|FAIL|BLIND <verdict>`. Exit 0 = the probe ran · 2 = bad usage.
+{
+  const probe = valOf('--ancestry-probe');
+  if (probe !== undefined) {
+    const [held, target] = probe.split(':');
+    if (!held || !target) {
+      console.error('usage: --ancestry-probe=<heldSha>:<liveSha>');
+      process.exit(2);
+    }
+    const { ok, verdict } = ancestryArmState(held, target);
+    console.log(`${ok === true ? 'PASS' : ok === false ? 'FAIL' : ok} ${verdict}`);
+    process.exit(0);
+  }
 }
 
 function bail(msg) {
@@ -357,20 +420,10 @@ async function main() {
   }
 
   // ---- 1. ANCESTRY ----------------------------------------------------------
-  let ancestryOk = false;
-  try {
-    git(['merge-base', '--is-ancestor', INTERLOCK_COMMIT, live]);
-    ancestryOk = true;
-  } catch {
-    ancestryOk = false;
-  }
-  record(
-    'ANCESTRY — ffe656c is an ancestor of the live SHA',
-    ancestryOk,
-    ancestryOk
-      ? `${INTERLOCK_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
-      : `${live.slice(0, 8)} does NOT contain ${INTERLOCK_COMMIT.slice(0, 7)}. The interlock is NOT live. Deploy it before arming.`,
-  );
+  recordAncestryArm('ANCESTRY — ffe656c is an ancestor of the live SHA', INTERLOCK_COMMIT, live, {
+    carries: `${INTERLOCK_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`,
+    absent: `${live.slice(0, 8)} does NOT contain ${INTERLOCK_COMMIT.slice(0, 7)}. The interlock is NOT live. Deploy it before arming.`,
+  });
 
   // ---- 2. CALL SITE, read out of the LIVE tree ------------------------------
   let engine = '';
@@ -421,19 +474,16 @@ async function main() {
   }
 
   // ---- 4. TRA-2351 — the third path, and the inherited-arm gap ---------------
-  let thirdPathAncestry = false;
   try {
     git(['cat-file', '-e', `${THIRD_PATH_COMMIT}^{commit}`]);
-    try {
-      git(['merge-base', '--is-ancestor', THIRD_PATH_COMMIT, live]);
-      thirdPathAncestry = true;
-    } catch { /* not an ancestor */ }
-    record(
+    recordAncestryArm(
       `TRA-2351 — ${THIRD_PATH_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
-      thirdPathAncestry,
-      thirdPathAncestry
-        ? `${THIRD_PATH_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
-        : `${live.slice(0, 8)} does NOT contain ${THIRD_PATH_COMMIT.slice(0, 7)}. The crypto-start bypass is OPEN. Deploy it before arming.`,
+      THIRD_PATH_COMMIT,
+      live,
+      {
+        carries: `${THIRD_PATH_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`,
+        absent: `${live.slice(0, 8)} does NOT contain ${THIRD_PATH_COMMIT.slice(0, 7)}. The crypto-start bypass is OPEN. Deploy it before arming.`,
+      },
     );
     for (const e of tra2351Edges(live)) record(e.name, e.ok, e.detail);
   } catch {
@@ -495,26 +545,39 @@ async function main() {
   // into an unconditional check — read the paragraph above first.
   const cryptoArmReachable = carrierOn || argv.includes('--crypto-arm');
   const notices = [];
+  // TRA-3722 — a BLIND is NEVER softened to a NOTICE. The softening above is licensed by
+  // "the predicate RAN and came back negative"; a blind predicate did not come back at all,
+  // so there is nothing to scope the severity of. `ok === BLIND` is checked EXPLICITLY
+  // rather than riding on the fact that a non-empty string is truthy.
   const recordUniverse = (name, ok, detail) => {
-    if (ok || cryptoArmReachable) return record(name, ok, detail);
+    if (ok === BLIND || ok || cryptoArmReachable) return record(name, ok, detail);
     notices.push({ name, detail });
     console.log(`[NOTE] ${name}\n       ${detail}`);
   };
 
-  let universeAncestry = false;
   try {
     git(['cat-file', '-e', `${UNIVERSE_COMMIT}^{commit}`]);
-    try {
-      git(['merge-base', '--is-ancestor', UNIVERSE_COMMIT, live]);
-      universeAncestry = true;
-    } catch { /* not an ancestor */ }
-    recordUniverse(
-      `TRA-2348 — ${UNIVERSE_COMMIT.slice(0, 7)} is an ancestor of the live SHA`,
-      universeAncestry,
-      universeAncestry
-        ? `${UNIVERSE_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
-        : `${live.slice(0, 8)} does NOT contain ${UNIVERSE_COMMIT.slice(0, 7)}. On this build a live preset swap to the ~395-pair universe is UNGATED (roster delta {dca} → {dca} is empty). LIVE CRYPTO MUST NOT BE ARMED until it is deployed.`,
-    );
+    {
+      const { verdict, answer } = gradedAncestry(UNIVERSE_COMMIT, live);
+      const name = `TRA-2348 — ${UNIVERSE_COMMIT.slice(0, 7)} is an ancestor of the live SHA`;
+      if (answer === null) {
+        recordUniverse(
+          name,
+          BLIND,
+          `ancestry ${UNIVERSE_COMMIT.slice(0, 7)}..${live.slice(0, 8)} is UNREADABLE (${verdict}) — ${blindReason(verdict)}\n` +
+            '       Do NOT read this as "not deployed": that prescribes a deploy which may already have\n' +
+            '       happened. The universe bound is UNKNOWN on this build, which is not the same as OPEN.',
+        );
+      } else {
+        recordUniverse(
+          name,
+          answer,
+          answer
+            ? `${UNIVERSE_COMMIT.slice(0, 7)} ⊆ ${live.slice(0, 8)}`
+            : `${live.slice(0, 8)} does NOT contain ${UNIVERSE_COMMIT.slice(0, 7)}. On this build a live preset swap to the ~395-pair universe is UNGATED (roster delta {dca} → {dca} is empty). LIVE CRYPTO MUST NOT BE ARMED until it is deployed.`,
+        );
+      }
+    }
     for (const e of tra2348Edges(live)) recordUniverse(e.name, e.ok, e.detail);
   } catch {
     recordUniverse(
@@ -556,7 +619,27 @@ async function main() {
   // ---- verdict --------------------------------------------------------------
   const failed = results.filter(r => r.ok === false);
   const skipped = results.filter(r => r.ok === null);
+  // `=== BLIND`, and BLIND is excluded from `failed`/`skipped` by their `===` tests.
+  const blind = results.filter(r => r.ok === BLIND);
   console.log('');
+
+  // TRA-3722 — BLIND outranks FAIL, the way every other gate in this repo orders it
+  // (BLIND > BROKEN > CLEAN; BLIND > STRANDED > LATE). Its own exit code, because its
+  // REMEDY is different: `git fetch origin --unshallow`, not a deploy. A blind check
+  // that borrowed FAIL's exit would send someone to re-deploy a commit that is already
+  // live, and a blind check that borrowed SKIP's would exit 0 on the standing
+  // pre-condition for a real-money env write.
+  if (blind.length) {
+    console.error(`[tra2342] CANNOT RUN — ${blind.length} check(s) could not be READ. This is not a PASS and not a FAIL.`);
+    for (const b of blind) console.error(`          - ${b.name}`);
+    console.error('          do NOT set TRADIER_ENV=production on an unread interlock.');
+    if (failed.length) {
+      console.error(`          (${failed.length} check(s) also FAILED — listed below the blind ones on purpose.)`);
+      for (const f of failed) console.error(`          - ${f.name}`);
+    }
+    process.exit(2);
+  }
+
   if (failed.length) {
     // TRA-2348 — name the REMEDY that matches the failure. A universe failure does
     // not mean "do not set TRADIER_ENV"; it means "do not arm live crypto on this

@@ -151,7 +151,7 @@
  * credential is a checker nobody runs.
  */
 
-import { execFileSync } from 'node:child_process';
+import { gradedAncestry } from './lib/shallow-ancestry.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1033,21 +1033,22 @@ function selftest() {
 
 // ── live run ───────────────────────────────────────────────────────────────
 
+// Distinguish "not an ancestor" from "unknown object / no git / a SHALLOW GRAFT". The
+// second is BLIND and must not read as a clean `false` — a stale checkout would otherwise
+// VOID a current build.
+//
+// TRA-3722 — this site is a MISATTRIBUTED VOID, not a fail-open, and the distinction is
+// worth keeping straight because it reads like one at a glance. `false` and `null` BOTH end
+// in VOID (exit 3) and both attribute proxy rows to UNATTRIBUTABLE, so relative to the blind
+// case no PASS is manufactured and no FAIL is suppressed. What differed was the REASON, and
+// therefore the REMEDY: on a graft the old exit-1 branch returned `false`, which prints
+// BUILD_PREDATES_STAMP — "the running build predates 2339; absent stamps are EXPECTED, not a
+// regression. Deploy before grading." — against a build that is already deployed. Right
+// verdict, wrong instruction, and this file already carries a section on misattributed VOIDs
+// reading like quiet sessions. Only the negative is re-graded; rc 0 still stands alone.
 function buildCarries(ancestor, commit) {
   if (!commit) return null;
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', ancestor, commit], {
-      cwd: REPO,
-      stdio: 'ignore',
-    });
-    return true;
-  } catch (err) {
-    // Distinguish "not an ancestor" (exit 1) from "unknown object / no git"
-    // (exit 128 or spawn failure). The second is BLIND and must not read as a
-    // clean `false` — a stale checkout would otherwise VOID a current build.
-    if (err && err.status === 1) return false;
-    return null;
-  }
+  return gradedAncestry(ancestor, commit).answer;
 }
 
 /**
