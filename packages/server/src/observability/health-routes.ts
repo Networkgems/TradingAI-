@@ -5519,6 +5519,17 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
             warning: `entry-greeks gate admitted 0 of ${counts.evaluated} candidates on ${etDay} — suspect the GATE, not the tape (TRA-1677: an impossible band reads exactly like no candidates).`,
           }
         : {}),
+      // TRA-3682 — the OTHER half of that ambiguity, and the one that actually bit.
+      // `evaluated: 0` is silent on this surface: `starving` is false, `admitRate` is
+      // null, no warning fires, and the payload reads as an ordinary quiet session —
+      // which is how `single_leg_rv` went 14 sessions with a dead upstream while this
+      // route reported healthy. An UNFED gate is a finding about the PRODUCER, so say
+      // so here and point the reader upstream rather than at the thresholds above.
+      ...(enabled && counts.state === 'no_candidates'
+        ? {
+            warning: `entry-greeks gate evaluated 0 candidates on ${etDay} — it is UNFED, not passing. This says NOTHING about the band/ratio config above; the producer upstream of the gate is what to check (TRA-3682). Confirm the sleeve's scan path is armed at /api/health/rv-scan before grading it.`,
+          }
+        : {}),
     });
   });
 
