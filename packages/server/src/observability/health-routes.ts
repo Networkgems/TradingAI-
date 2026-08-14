@@ -77,6 +77,7 @@ import {
 import { summarizeLiveOptionsFeeSlippage } from '../live-options-fee-slippage-ledger.js'; // TRA-1929
 import { getLiveOptionsFeeReconcileState } from '../live-options-fee-reconcile.js'; // TRA-2810
 import { getZombieOpenSweepState } from '../zombie-open-journal-sweep.js'; // TRA-3547
+import { getCloseBasisSweepState } from '../tra3730-close-basis-sweep.js'; // TRA-3730
 import { summarizeIvRvScans } from '../iv-rv-scanner.js';
 import { summarizeRvScanPath, RV_SCAN_PATH_STRUCTURE_LABEL } from '../rv-scan-telemetry.js'; // TRA-2193 / TRA-2245
 import { summarizeShortPremiumScans } from '../short-premium-scanner.js';
@@ -6168,6 +6169,20 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // ticked, or the journal flag is off), `0` = checked and clean. Those are
       // different facts and this shape refuses to collapse them.
       zombieSweep: getZombieOpenSweepState(),
+      // TRA-3730 — the SELF-DRIVING half of the close-basis restatement, and the
+      // only thing that separates "the journal agrees with the broker" from "the
+      // pass that would have checked never ran". `closeBasisAmends` above is a
+      // witness to WRITES; it reads identically on a healthy book and on a box
+      // where the sweep is not wired, because both wrote nothing.
+      //
+      // Read `restatableRows.count`: `null` = never checked (no tick yet, or the
+      // journal flag is off), `0` = checked and every closed live row is on
+      // broker truth. `feesPendingRows.count` is the backlog waiting on
+      // settlement — a NON-zero there is the correct quiet state, not a fault:
+      // `fees: null` means UNMEASURED, not free (TRA-1707), so the pass skips
+      // those rows and picks them up on a later tick rather than publishing a
+      // gross number wearing a broker-settled label.
+      closeBasisSweep: getCloseBasisSweepState(),
     });
   });
 

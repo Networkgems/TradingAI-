@@ -110,6 +110,13 @@ import {
 // gross-of-fees arithmetic onto the broker's fills. Same pure-planner shape, so
 // the correction can be read in full before a byte is appended.
 import { planCloseBasisRestate } from './tra2819-close-basis-restate.js';
+// TRA-3730 — that restatement, SELF-DRIVING, for the reason TRA-3547 exists one
+// import below: the route it fires is admin-gated, admin writes are unreachable
+// on bqb1, and the defect is RECURRING (commission is unknowable at close time,
+// so every live round trip is booked gross until something comes back for it).
+// A repair only a human with an admin token can fire is a repair that runs once,
+// on the rows that happened to be wrong the day somebody looked.
+import { runCloseBasisSweep } from './tra3730-close-basis-sweep.js';
 // TRA-3485 — the PARTITIONED repair for the stale live `OPEN` rows. The planner
 // is pure and lives in its own module so the partition can be graded (dry run)
 // before a single byte is appended.
@@ -4676,6 +4683,38 @@ const zombieOpenSweepDeps = {
 setTimeout(() => {
   void runZombieOpenSweep(zombieOpenSweepDeps);
 }, 120_000).unref();
+
+// TRA-3730 — everything the close-basis sweep touches, in one place, injected
+// for the same reasons TRA-3547's deps are: the pass must be testable without
+// the process-global journal, and the LEDGER it prices from must be the same
+// `summarizeLiveOptionsFeeSlippage()` the admin repair route reads — a second
+// ledger accessor is how the route and the sweep would silently stop agreeing.
+// The writer is the production fold entry point, so `recordOptionTradeCloseBasis`
+// still refuses a row that is not CLOSED and the sweep cannot route around it.
+const closeBasisSweepDeps = {
+  journalEnabled: () => isOptionTradeJournalEnabled(),
+  listLiveJournalRows: () => listOptionTradeJournal({ mode: 'live' }),
+  readLedger: () => {
+    const s = summarizeLiveOptionsFeeSlippage();
+    return { n: s.n, records: s.records, durability: s.durability };
+  },
+  recordCloseBasis: (id: string, basis: Parameters<typeof recordOptionTradeCloseBasis>[1]) =>
+    recordOptionTradeCloseBasis(id, basis),
+};
+
+// TRA-3730 — kick ONE close-basis sweep after boot (the hourly tick also runs
+// it). 150s sits deliberately AFTER both passes above, and the order is the data
+// dependency, not a preference:
+//   90s  fee reconcile   — derives `fees` from /gainloss onto the fill ledger
+//   120s zombie sweep    — turns a stale OPEN row into a CLOSED one
+//   150s close-basis     — prices CLOSED rows off fills, NET of those fees
+// Run earlier than either and the pass would find the same rows `fees_unmeasured`
+// (skipped, correctly) or still OPEN, and would simply do nothing until the next
+// hour — a whole hour of a flattered number on the surface the desk reads as the
+// record of what the program earned.
+setTimeout(() => {
+  void runCloseBasisSweep(closeBasisSweepDeps);
+}, 150_000).unref();
 
 // TRA-2048 (parent TRA-2044) — rebuild the durable LIVE gate-enforcement ledger
 // (cost-bar + spread veto promoted from shadow to enforcing) and remember DATA_DIR
@@ -15428,6 +15467,16 @@ scheduler.start({
     // fill ledger, no broker call), self-quenching, and internally best-effort —
     // it cannot throw into this tick.
     await runZombieOpenSweep(zombieOpenSweepDeps);
+    // TRA-3730 — restate the MONEY on closed live rows the fee reconcile has
+    // since measured: broker entry fill, broker exit fill, NET of measured
+    // commission. Runs LAST of the three on purpose — it consumes what both
+    // passes above produce (this hour's fees, and any close the sweep just
+    // back-filled). Commission is not knowable at close time, so without this
+    // every live round trip reads GROSS forever, in the direction that flatters.
+    // Pure local IO (journal + fill ledger, no broker call), refuses rather than
+    // zero-fills an unmeasured fee, and internally best-effort — it cannot throw
+    // into this tick.
+    await runCloseBasisSweep(closeBasisSweepDeps);
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes
