@@ -460,6 +460,75 @@ collapse into one freeze only when the apply is unpinned, because an unpinned de
 resolves the branch tip. Pinning is what separates them. Both still owe the RTH freeze and
 any embargo: `--commit` removes the code delta, not the boot.
 
+#### After the board ratifies a live-arm value, WRITE THE STAMP (TRA-3694)
+
+`/api/health/live-enforce-gates` → `arm.universe` used to publish the live value and its
+source and **nothing about its authorization**, so a *ratified* widening and an
+*unratified* one rendered **byte-identically**. That is not hypothetical: the same field
+was flagged twice in 26 hours by two independent readers (CFO interaction `8e303cd7`, then
+QT on TRA-3661), each of whom had to re-derive the answer from board interaction records
+that sit nowhere near the health surface. It is a real-money sleeve, so the case that
+matters is the reverse one — an **actually** unratified widening would have looked
+identical to both of them.
+
+The route now computes the comparison and publishes the verdict. **Read
+`arm.universe.ratification.matchesLive`, not the two strings** — the failure being fixed is
+precisely a comparison nobody performs.
+
+| verdict | meaning |
+|---|---|
+| `true` | live universe == the ratified set (semantic set compare, so whitespace/order/case cannot false-alarm) |
+| `false` | mismatch **or** a set-but-unparseable stamp. `onlyLive` names the symbols real money can open that the ratification does not cover — the unratified-widening direction |
+| `'unstamped'` | the var is unset. **UNKNOWN, never a pass** — a stamp that defaulted to OK would reproduce the original defect one layer up |
+
+Same shape on `/api/health/live-options-fee-slippage` → `capRatification` +
+`ratificationMatchesLive` (fold is fail-loud: any `false` ⇒ `false`, else any
+`'unstamped'` ⇒ `'unstamped'`).
+
+**This is a READ-ONLY instrument.** A mismatch blocks no order — a missing env var halting
+a real-money sleeve would be strictly worse than the defect it fixes. So a stale stamp is
+loud but harmless, and there is no failure mode in which writing it costs you a session.
+
+**⇒ THE PROCEDURE. When the board ratifies a change to any of these values, the same hand
+that writes the enforcement var writes the stamp.** Skipping it leaves a `false` on a
+correct box, which trains readers to ignore the field:
+
+| enforcement var | stamp var |
+|---|---|
+| `OPTION_LIVE_OTM_UNIVERSE` | `OPTION_LIVE_OTM_UNIVERSE_RATIFIED` (+ `..._RATIFIED_BY`) |
+| `LIVE_OPTION_TEST_NOTIONAL_CAP_USD` | `OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED` |
+| `LIVE_OPTION_TEST_AGGREGATE_CAP_USD` | `OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED` |
+| (both caps) | `OPTION_LIVE_TEST_CAPS_RATIFIED_BY` |
+
+⛔ **Source the stamp from the interaction record, never from the live env.** Copying the
+live value into the stamp manufactures a `true` and proves nothing — it is the same
+circularity the ticket exists to break. Read it off
+`GET /api/issues/{id}/interactions` → `result.answers` plus the resolved option's label.
+The `_BY` vars are free text; carry the interaction id, the issue, the option id and the
+resolve time so the next reader can re-derive it in one GET.
+
+Values in force as of 2026-08-14 (each verified against its record that day):
+
+```
+OPTION_LIVE_OTM_UNIVERSE_RATIFIED    AAPL,SPY,QQQ,PLTR,TSLA,GIS,TFC,MO,VZ,UPS
+                                     8e303cd7 · TRA-3417 · universe_0 · 2026-08-13T10:22:25Z
+OPTION_LIVE_TEST_NOTIONAL_CAP_USD_RATIFIED   350
+                                     1db5e5ca · TRA-3592 · cap_350 · 2026-08-13T15:40:17Z
+OPTION_LIVE_TEST_AGGREGATE_CAP_USD_RATIFIED  750
+                                     458710ce · TRA-3384 · expand_holdout_nke · 2026-08-12T23:32:44Z
+```
+
+⚠️ **Mind the unit.** `458710ce` authorised "max $750 **total**" and $750-total has already
+once shipped as $750-per-book. `aggregateCapUsd` publishes the FLEET total, which is the
+unit that record grants; the per-entry cap is a separate stamp on purpose, so one can never
+silently grade the other. Note also that `LIVE_OPTION_TEST_AGGREGATE_CAP_USD` is **unset**
+on bqb1 — the 750 in force is the compiled default, and the stamp grades the RESOLVED value,
+which is what the order site actually uses.
+
+Writes go through the single-key path above, then the pinned apply
+(`--commit=<sha already serving>`) — the stamp is inert until a deploy bakes it.
+
+
 ### Standard deploy (self-hosted PM2)
 
 1. On the production machine, sync the target commit — deploys track `main`:
