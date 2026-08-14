@@ -7920,6 +7920,22 @@ export class SignalEngine {
 
     const seenSymbols = new Set<string>();
     const open: import('@trading-app/shared').OptionPosition[] = [];
+    // TRA-2945 — the TRA-2927 observer's per-BOOK partition must not inherit this
+    // pass's cross-account dedupe. `seenSymbols` is fleet-wide and first-wins, and
+    // `allOptionsAccounts()` yields sandbox before production, so a contract held in
+    // BOTH books was fetched once and observed once — credited to demo. The live
+    // book then reads `observed: 0` while it is genuinely being marked every tick,
+    // which is pixel-identical to the honest absence it reads when it holds nothing
+    // at all. That zero is the denominator `boundReadiness` gates on (5 sessions per
+    // book), so under overlap the bound could never become derivable for live no
+    // matter how long the tape ran — and both books trade the same OTM universe, so
+    // overlap is the expected case, not the corner one.
+    //
+    // The FETCH dedupe is deliberately untouched: still one chain read per unique
+    // symbol per tick (TRA-1044), and the marketable-quote seam (TRA-3502) still
+    // resolves once per symbol, so neither ledger's denominator moves. Only the
+    // observation is fanned, at most one per (mode, symbol).
+    const holdersBySymbol = new Map<string, import('@trading-app/shared').OptionPosition[]>();
     for (const acct of this.allOptionsAccounts()) {
       for (const o of acct.getState().openOptions) {
         const eligible =
@@ -7928,7 +7944,11 @@ export class SignalEngine {
             || o.signalType === 'tradier_import')
           && !!o.optionSymbol
           && !!o.expiration;
-        if (!eligible || seenSymbols.has(o.optionSymbol!)) continue;
+        if (!eligible) continue;
+        const holders = holdersBySymbol.get(o.optionSymbol!);
+        if (!holders) holdersBySymbol.set(o.optionSymbol!, [o]);
+        else if (!holders.some((h) => (h.mode === 'live') === (o.mode === 'live'))) holders.push(o);
+        if (seenSymbols.has(o.optionSymbol!)) continue;
         seenSymbols.add(o.optionSymbol!);
         open.push(o);
       }
@@ -7979,16 +7999,21 @@ export class SignalEngine {
               // The live OTM sleeve's rows are engine-opened, so an imports-only
               // observer would read a clean 0 against the very book that produced the
               // 2026-08-03 phantom peak. Observe-only: the mark is set either way.
-              recordMarkObservation({
-                optionSymbol: o.optionSymbol!,
-                symbol: o.symbol,
-                mode: o.mode === 'live' ? 'live' : 'demo',
-                mark,
-                priorMark: o.currentPremium,
-                entryPremium: o.premiumPaid,
-                contracts: o.contractsRemaining ?? o.contracts,
-                now: Date.now(),
-              });
+              // One record per BOOK holding this contract (TRA-2945). `priorMark`
+              // is each book's own `currentPremium`, so the jump ratio stays a
+              // per-book statistic rather than one book's ratio stamped twice.
+              for (const holder of holdersBySymbol.get(o.optionSymbol!) ?? [o]) {
+                recordMarkObservation({
+                  optionSymbol: holder.optionSymbol!,
+                  symbol: holder.symbol,
+                  mode: holder.mode === 'live' ? 'live' : 'demo',
+                  mark,
+                  priorMark: holder.currentPremium,
+                  entryPremium: holder.premiumPaid,
+                  contracts: holder.contractsRemaining ?? holder.contracts,
+                  now: Date.now(),
+                });
+              }
               marks.set(o.optionSymbol!, mark);
             }
           } catch (err: unknown) {

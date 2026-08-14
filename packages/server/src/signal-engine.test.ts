@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { summarizeCostAwareGate, clearCostAwareGateLedger } from './cost-aware-gate-ledger.js';
+// TRA-2945 — read the per-book mark tape the engine is supposed to WRITE.
+import { summarizeMarkSanity, clearMarkSanityTape } from './option-mark-sanity.js';
 import type { PaperOptionsAccount } from './options-account.js'; // TRA-3445
 import { etDateString } from './scheduler.js';
 // TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
@@ -1231,6 +1233,52 @@ describe('SignalEngine — relative-value scanner bridge', () => {
     const marks = await (engine as unknown as { refreshOptionMarks: () => Promise<Map<string, number>> }).refreshOptionMarks();
     expect(marks.get('AAPL240705C00200000')).toBe(0.85);
     expect(scanner.getOptionMark).toHaveBeenCalledWith('AAPL', '2024-07-05', 'AAPL240705C00200000');
+  });
+
+  // TRA-2945 — the TRA-2927 observer's per-BOOK partition against THIS pass's
+  // cross-account symbol dedupe. Before the fix the assertion below read
+  // `live.observed === 0` while the live book was being marked on every tick —
+  // the same zero it publishes when it holds nothing at all, and the denominator
+  // `boundReadiness` gates the give-back mark bound on.
+  it('observes a shared contract ONCE PER BOOK, so the demo book cannot shadow the live one', async () => {
+    clearMarkSanityTape();
+    const scanner = new StubScanner();
+    scanner.getOptionMark.mockResolvedValue(0.85);
+    const engine = new SignalEngine(undefined, undefined, scanner);
+
+    // Same contract, both books — the expected shape, not a corner case: demo and
+    // live run the same OTM universe through the same selector.
+    const row = (mode: 'demo' | 'live', currentPremium: number) => ({
+      id: `row-${mode}`,
+      symbol: 'SPY',
+      optionSymbol: 'SPY260807C00650000',
+      expiration: '2026-08-07',
+      signalType: 'otm_mispricing',
+      mode,
+      currentPremium,
+      premiumPaid: 0.3,
+      contracts: 1,
+      contractsRemaining: 1,
+    });
+    const book = (positions: ReturnType<typeof row>[]) => ({
+      getState: () => ({ openOptions: positions }),
+      refreshLiveDisplayMarks: vi.fn(),
+      refreshOptionQuotes: vi.fn(),
+    });
+    (engine as unknown as { optionsAccounts: unknown }).optionsAccounts = {
+      sandbox: book([row('demo', 0.5)]),
+      production: book([row('live', 0.5)]),
+    };
+
+    await (engine as unknown as { refreshOptionMarks: () => Promise<Map<string, number>> }).refreshOptionMarks();
+
+    // The FETCH dedupe is untouched — still one chain read for the shared contract…
+    expect(scanner.getOptionMark).toHaveBeenCalledTimes(1);
+    // …and yet BOTH books are credited, each against its own prior mark.
+    const s = summarizeMarkSanity();
+    expect(s.byMode.demo.observed).toBe(1);
+    expect(s.byMode.live.observed).toBe(1);
+    clearMarkSanityTape();
   });
 
   it('dedups subsequent scans on the same OCC within the 1h dedup window', async () => {
