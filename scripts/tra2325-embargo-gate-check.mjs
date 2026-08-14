@@ -24,6 +24,9 @@ import {
   rollbackState,
   rollbackBlocks,
   stalePinNote,
+  gradeCarries,
+  carriesFromVerdict,
+  isShallowCheckout,
   EMBARGOES,
   COMMIT_HOLDS,
   DEPLOY_LEAD_MIN,
@@ -131,6 +134,28 @@ const HOLD_CASES = [
   ['2026-07-27T21:00:00Z', carrying(HELD), 'PROCEED', 'Mon 21:00:00Z sharp — hold spent, the held commit ships (half-open)'],
   ['2026-07-27T21:00:00Z', unresolved, 'PROCEED', 'Mon 21:00:00Z — no active hold, so BLIND cannot fire either'],
   ['2026-07-28T09:00:00Z', carrying(HELD), 'PROCEED', 'Tue — expired row is inert, left in place as a record'],
+];
+
+// ── The ancestry grader underneath the hold (TRA-3699) ───────────────────────
+// Every HOLD_CASE above INJECTS `carries`, so none of them reaches the real predicate.
+// That is what let the shallow-graft hole live under a green suite: `gitCarries` collapsed
+// a grafted `rc=1` into a confident `false`, the hold read CLEAR, and the deploy PROCEEDED.
+//
+// These drive the pure grader directly, in BOTH directions — a table that only ever
+// produced "blind" would jam the gate shut and pass just as vacuously as the bug did.
+const CARRY_CASES = [
+  // [name, input, expected verdict, expected true/false/null]
+  ['a true carry, full clone', { rc: 0, isShallow: false, mergeBaseEmpty: false }, 'carries', true],
+  // rc 0 is PROVEN by objects that are present. A graft hides history, it cannot invent it,
+  // so this must stay trustworthy — re-grading it would break every shallow CI deploy.
+  ['a true carry, SHALLOW clone', { rc: 0, isShallow: true, mergeBaseEmpty: false }, 'carries', true],
+  ['a genuine non-carry, full clone', { rc: 1, isShallow: false, mergeBaseEmpty: false }, 'not-carried', false],
+  // THE TRA-3699 BUG. Before the fix this row returned `false` and the hold was lifted.
+  ['THE BUG: negative + SHALLOW', { rc: 1, isShallow: true, mergeBaseEmpty: true }, 'blind-shallow', null],
+  ['negative + shallow, merge-base present', { rc: 1, isShallow: true, mergeBaseEmpty: false }, 'blind-shallow', null],
+  ['re-rooted history on a full clone', { rc: 1, isShallow: false, mergeBaseEmpty: true }, 'blind-unrelated', null],
+  ['git could not decide (128)', { rc: 128, isShallow: false, mergeBaseEmpty: false }, 'blind-undecidable', null],
+  ['git could not spawn (null rc)', { rc: null, isShallow: false, mergeBaseEmpty: false }, 'blind-undecidable', null],
 ];
 
 // ── Gate 0's env-write warning (TRA-2306) ────────────────────────────────────
@@ -271,6 +296,37 @@ for (const [iso, target, expected, why] of HOLD_CASES) {
 const holdProduced = new Set(HOLD_CASES.map(([iso, target]) => holdVerdict(iso, target)));
 const holdMissing = ['PROCEED', 'REFUSE_HOLD_CARRIES', 'REFUSE_HOLD_BLIND'].filter(v => !holdProduced.has(v));
 
+for (const [name, input, expectedVerdict, expectedAnswer] of CARRY_CASES) {
+  const got = gradeCarries(input);
+  const answer = carriesFromVerdict(got);
+  const ok = got === expectedVerdict && answer === expectedAnswer;
+  if (ok) {
+    pass += 1;
+    console.log(`  ok   ancestry  ${got.padEnd(17)} ${name}`);
+  } else {
+    failures.push({ iso: 'ancestry', expected: `${expectedVerdict}/${expectedAnswer}`, got: `${got}/${answer}`, why: name });
+    console.log(`  FAIL ancestry  expected ${expectedVerdict}/${expectedAnswer}, got ${got}/${answer}  — ${name}`);
+  }
+}
+
+// COMPOSITION, not assumption. The grader returning `null` is only half the fix: the null
+// has to reach the gate's cannot-tell branch AND that branch has to REFUSE. Feed the real
+// grader's blind-shallow output through the real hold gate and assert the deploy is refused.
+const shallowAnswer = carriesFromVerdict(gradeCarries({ rc: 1, isShallow: true, mergeBaseEmpty: true }));
+const composed = holdVerdict('2026-07-26T04:45:00Z', { sha: 'c0ffee', source: 'test', carries: () => shallowAnswer });
+if (composed === 'REFUSE_HOLD_BLIND') {
+  pass += 1;
+  console.log(`  ok   ancestry  ${composed.padEnd(17)} grafted-shallow negative routes to the hold gate's REFUSE branch`);
+} else {
+  failures.push({ iso: 'ancestry', expected: 'REFUSE_HOLD_BLIND', got: composed, why: 'blind-shallow must REFUSE end to end' });
+  console.log(`  FAIL ancestry  expected REFUSE_HOLD_BLIND, got ${composed}  — a null that also fails open fixes nothing`);
+}
+
+const carryProduced = new Set(CARRY_CASES.map(([, i]) => gradeCarries(i)));
+const carryMissing = ['carries', 'not-carried', 'blind-shallow', 'blind-unrelated', 'blind-undecidable'].filter(
+  v => !carryProduced.has(v),
+);
+
 for (const [iso, expected, why] of CASES) {
   const got = verdict(at(iso));
   if (got === expected) {
@@ -384,8 +440,9 @@ const rbMissing = ['FORWARD', 'NOOP', 'REFUSE_ROLLBACK', 'REFUSE_DIVERGED', 'REF
 const noteProduced = new Set(NOTE_CASES.map(([t, s]) => noteVerdict(t, s)));
 const noteMissing = ['NOTED', 'QUIET'].filter(v => !noteProduced.has(v));
 
-const TOTAL = CASES.length + HOLD_CASES.length + WARN_CASES.length + ROLLBACK_CASES.length + NOTE_CASES.length;
-const allMissing = [...missing, ...holdMissing, ...warnMissing, ...rbMissing, ...noteMissing];
+const TOTAL =
+  CASES.length + HOLD_CASES.length + WARN_CASES.length + ROLLBACK_CASES.length + NOTE_CASES.length + CARRY_CASES.length + 1;
+const allMissing = [...missing, ...holdMissing, ...warnMissing, ...rbMissing, ...noteMissing, ...carryMissing];
 
 console.log('');
 console.log(`freeze  : ${FREEZE_OPEN_MIN}–${FREEZE_CLOSE_MIN} UTC min-of-day (lead ${DEPLOY_LEAD_MIN} min)`);
@@ -395,8 +452,9 @@ console.log(
 );
 console.log(`cases   : ${pass}/${TOTAL} pass`);
 console.log(
-  `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced])].sort().join(', ')}`,
+  `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced, ...carryProduced])].sort().join(', ')}`,
 );
+console.log(`checkout: ${isShallowCheckout() ? 'SHALLOW — a negative ancestry answer is BLIND here (TRA-3699)' : 'complete'}`);
 
 if (allMissing.length) {
   console.error(`[tra2325] FAIL: verdict(s) never reached by any case: ${allMissing.join(', ')} — suite is one-sided.`);

@@ -308,6 +308,13 @@ export const COMMIT_HOLDS = [
 // FAILS CLOSED on purpose, in the same spirit as check:deploy-drift's BLIND: an
 // unresolvable tip or an ungrepable object yields REFUSE, never PROCEED. A hold that
 // silently degrades to "allowed" the moment the network hiccups is not a hold.
+// The three ways an ancestry question comes back unanswerable. Written once, because a
+// BLIND that only names the two OBVIOUS causes sends the reader looking for a missing
+// object when the real answer is `git fetch --unshallow` (TRA-3699).
+export const BLIND_ANCESTRY_CAUSES =
+  'the object is missing from this checkout, or this checkout is SHALLOW so a negative ' +
+  'ancestry answer is unreadable here (TRA-3699 — run `git fetch origin --unshallow`), or git failed';
+
 export function commitHoldState(now, target, table = COMMIT_HOLDS) {
   const t = now.getTime();
   const active = table.filter(h => t < Date.parse(h.until));
@@ -331,7 +338,7 @@ export function commitHoldState(now, target, table = COMMIT_HOLDS) {
         hold,
         active,
         target,
-        why: `cannot test whether ${target.sha.slice(0, 12)} carries ${hold.commit.slice(0, 12)} (object missing from this checkout, or git failed)`,
+        why: `cannot test whether ${target.sha.slice(0, 12)} carries ${hold.commit.slice(0, 12)} (${BLIND_ANCESTRY_CAUSES})`,
       };
     }
     if (carries) return { verdict: 'CARRIES', hold, active, target, why: null };
@@ -390,15 +397,74 @@ function gitHasCommit(sha) {
   return git(['cat-file', '-e', `${sha}^{commit}`]).status === 0;
 }
 
+// ── The shallow-graft hole under every gate below (TRA-3699 / TRA-3678) ───────
+// `git merge-base --is-ancestor A B` exits 1 for TWO different facts:
+//   (a) B genuinely does not contain A — a real, usable negative;
+//   (b) the path between A and B was GRAFTED AWAY by a shallow clone — no answer at all.
+// The two are byte-identical: same exit code, no stderr, no warning. And
+// `gitHasCommit` does NOT screen (b) out — in the grafted state BOTH shas resolve
+// fine (`git fetch --depth=1 origin <sha>` puts the object in the store); it is the
+// history BETWEEN them that is missing. So the house idiom "probe each sha, unknown
+// ⇒ BLIND" passes straight through this.
+//
+// A shallow checkout is the DEFAULT shape of a fresh CI or agent workspace, and was
+// the shape of this repo's shared workspace until 2026-08-13.
+//
+// ⚠ THE DIRECTION IS NOT UNIFORM ACROSS CALLERS, which is why this is graded here
+// once instead of at each site. TRA-3678's `check-deploy-floor.mjs` turned a false
+// negative into a false RED (it blocked — annoying, safe). Gate 2 below turns the
+// SAME false negative into "the target does not carry the held commit" ⇒ the hold is
+// silently LIFTED and the deploy PROCEEDS. Same git exit code, opposite blast radius,
+// on the live-money path.
+//
+// Only the NEGATIVE is re-graded. rc 0 stays trustworthy while shallow: an affirmative
+// answer is PROVEN by objects that are present, and a graft can only ever hide history,
+// never invent it.
+//
+// Pure so the control suite can drive every row without a git repo
+// (tra2325-embargo-gate-check.mjs) — the same shape as `gradeAncestry` in
+// check-deploy-floor.mjs, which is the sibling remedy for the same defect.
+export function gradeCarries({ rc, isShallow, mergeBaseEmpty }) {
+  if (rc !== 0 && rc !== 1) return 'blind-undecidable'; // git errored; never "not an ancestor"
+  if (rc === 0) return 'carries'; // proven by present objects — trust it even when shallow
+  if (isShallow) return 'blind-shallow'; // indistinguishable from a grafted-away path
+  if (mergeBaseEmpty) return 'blind-unrelated'; // disconnected graphs: unsatisfiable, not answered "no"
+  return 'not-carried';
+}
+
+// true / false / null, from the verdict. Exported with the grader so the mapping cannot
+// drift away from it — the whole defect was a `false` standing in for a blind.
+export function carriesFromVerdict(verdict) {
+  if (verdict === 'carries') return true;
+  if (verdict === 'not-carried') return false;
+  return null;
+}
+
+// Cached: it is one git call and cannot change inside a run.
+let shallowCache;
+export function isShallowCheckout() {
+  if (shallowCache === undefined) {
+    const r = git(['rev-parse', '--is-shallow-repository']);
+    // An unreadable answer is treated as SHALLOW on purpose: it makes the negative
+    // unreadable rather than trusted, which is the fail-closed direction here.
+    shallowCache = r.status !== 0 || (r.stdout ?? '').trim() !== 'false';
+  }
+  return shallowCache;
+}
+
 // true = target carries held · false = it does not · null = cannot tell.
 // `merge-base --is-ancestor` exits 0/1 for the real answers and something else for an
-// error, so anything but 0/1 must NOT be collapsed into "not an ancestor".
+// error, so anything but 0/1 must NOT be collapsed into "not an ancestor" — and neither
+// may a 1 that came out of a grafted history (see gradeCarries above).
 function gitCarries(heldSha, targetSha) {
   if (!gitHasCommit(heldSha) || !gitHasCommit(targetSha)) return null;
   const r = git(['merge-base', '--is-ancestor', heldSha, targetSha]);
-  if (r.status === 0) return true;
-  if (r.status === 1) return false;
-  return null;
+  // Only reached for a negative, and only on a complete clone: the extra git call is
+  // never paid on the ordinary "yes it carries it" path.
+  const isShallow = r.status === 1 ? isShallowCheckout() : false;
+  const mergeBaseEmpty =
+    r.status === 1 && !isShallow ? (git(['merge-base', heldSha, targetSha]).stdout ?? '').trim() === '' : false;
+  return carriesFromVerdict(gradeCarries({ rc: r.status, isShallow, mergeBaseEmpty }));
 }
 
 // What Render will actually build. With --commit that is the sha given; without it Render
@@ -483,7 +549,7 @@ export function rollbackState(target, live, isAncestor = gitCarries) {
       verdict: 'BLIND',
       target,
       live,
-      why: `cannot test whether live ${short(live.sha)} is an ancestor of ${short(target.sha)} (object missing from this checkout, or git failed)`,
+      why: `cannot test whether live ${short(live.sha)} is an ancestor of ${short(target.sha)} (${BLIND_ANCESTRY_CAUSES})`,
     };
   }
   const backward = isAncestor(target.sha, live.sha); // target ⊆ live → live has extra commits
@@ -492,7 +558,7 @@ export function rollbackState(target, live, isAncestor = gitCarries) {
       verdict: 'BLIND',
       target,
       live,
-      why: `cannot test whether ${short(target.sha)} is an ancestor of live ${short(live.sha)} (object missing from this checkout, or git failed)`,
+      why: `cannot test whether ${short(target.sha)} is an ancestor of live ${short(live.sha)} (${BLIND_ANCESTRY_CAUSES})`,
     };
   }
   // Ancestry is reflexive, so equal shas answer true BOTH ways. Check that first, or a
@@ -816,6 +882,18 @@ async function main() {
   const { frozen } = freezeState(now);
   const { active: embargo, upcoming, minsToUpcoming } = embargoState(now);
   const nowZ = now.toISOString().slice(11, 16) + 'Z';
+
+  // Say it ONCE, up front, before any gate speaks — because on a shallow checkout the two
+  // ancestry gates below can only ever answer YES or BLIND, and a reader who meets the BLIND
+  // first will go looking for a missing object that is not missing (TRA-3699).
+  if (isSoakHost && isShallowCheckout()) {
+    console.log(
+      '[render-redeploy] NOTE: this checkout is SHALLOW. A NEGATIVE ancestry answer is unreadable\n' +
+        '  here — a grafted-away path and a genuine absence produce the SAME git exit code — so the\n' +
+        '  commit-hold and rollback gates report BLIND (refuse) rather than guessing PROCEED.\n' +
+        '  Run `git fetch origin --unshallow` and re-run to get a real answer. TRA-3699.',
+    );
+  }
 
   // ── Gate 0: the host's live AUTH_SECRET (TRA-2387) ──────────────────────────
   // FIRST of the four, on severity. The other three protect a measurement: breaking them
