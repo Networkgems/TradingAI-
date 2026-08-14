@@ -19,7 +19,7 @@ import {
   PNL_POST_ONSET_JOURNAL_CREDIT_NOTE,
   PNL_COMBINED_AGREEMENT_NOTE,
 } from './pnl-reconciliation.js';
-import type { PostOnsetLiveCredit } from './pnl-reconciliation.js';
+import type { EquitySourceEraBoundary, PostOnsetLiveCredit } from './pnl-reconciliation.js';
 import type { DailySnapshot } from './pnl-tracker.js';
 
 /**
@@ -49,6 +49,26 @@ const NO_POST_ONSET_CREDIT: PostOnsetLiveCredit = {
   uncreditedOptionsUsd: null,
   notMeasuredReason: 'no-live-options-onset',
   legs: [],
+};
+
+/**
+ * TRA-3589 — no NAV source-of-record boundary on this book's series.
+ *
+ * Every `summarizeLiveCreditObservation` fixture below predates the field and
+ * grades a different question, so the default is the state that changes none of
+ * their verdicts. It must be the NON-straddling one specifically: a fixture that
+ * straddled by default would null `uncreditedOptionsUsd` fleet-wide and silence
+ * the TRA-2635/2831/2922 assertions rather than failing them.
+ */
+const NO_EQUITY_SOURCE_ERA_BOUNDARY: EquitySourceEraBoundary = {
+  brokerOnsetDate: null,
+  brokerOnsetOpeningEquity: null,
+  priorEraRowDate: null,
+  priorEraRowEquitySourceEra: null,
+  priorEraRowClosingEquity: null,
+  restatementUsd: null,
+  eraCensus: {},
+  seriesSpansBrokerBoundary: false,
 };
 
 // TRA-1633 FIX 3 — cross-surface reconciliation guard. The identity that must
@@ -1564,6 +1584,10 @@ describe('TRA-2658 — liveCounterDurableOk', () => {
     optionsRealizedBeforeLiveOnsetUsd: 0,
     preLiveOnsetOptionsDates: [] as string[],
     postOnsetCredit: NO_POST_ONSET_CREDIT,
+    // TRA-3589 — no era boundary by default; see NO_EQUITY_SOURCE_ERA_BOUNDARY.
+    uncreditedOptionsNotMeasuredReason: null as string | null,
+    postBaselineEquityGrowthSpansEquitySourceEras: false,
+    equitySourceEraBoundary: NO_EQUITY_SOURCE_ERA_BOUNDARY,
   });
 
   it('is NOT MEASURED on an empty live cohort — never a passing durability grade', () => {
@@ -1626,6 +1650,10 @@ describe('TRA-2635 — summarizeLiveCreditObservation', () => {
     optionsRealizedBeforeLiveOnsetUsd: 0,
     preLiveOnsetOptionsDates: [] as string[],
     postOnsetCredit: NO_POST_ONSET_CREDIT,
+    // TRA-3589 — no era boundary by default; see NO_EQUITY_SOURCE_ERA_BOUNDARY.
+    uncreditedOptionsNotMeasuredReason: null as string | null,
+    postBaselineEquityGrowthSpansEquitySourceEras: false,
+    equitySourceEraBoundary: NO_EQUITY_SOURCE_ERA_BOUNDARY,
   });
 
   it('is NOT MEASURED on an EMPTY live cohort — never a pass', () => {
@@ -2429,6 +2457,12 @@ describe('TRA-2919 — reconcilePnl wires the journal axis, and the fold splits 
       optionsRealizedBeforeLiveOnsetUsd: r.optionsRealizedBeforeLiveOnsetUsd,
       preLiveOnsetOptionsDates: r.preLiveOnsetOptionsDates,
       postOnsetCredit: r.postOnsetCredit,
+      // TRA-3589 — threaded from the real engine summary rather than stubbed, so
+      // if this fixture's series ever grows a broker row the fold sees it.
+      uncreditedOptionsNotMeasuredReason: r.uncreditedOptionsNotMeasuredReason,
+      postBaselineEquityGrowthSpansEquitySourceEras:
+        r.postBaselineEquityGrowthSpansEquitySourceEras,
+      equitySourceEraBoundary: r.equitySourceEraBoundary,
     }]);
     // Still suspended, still attributed — the day-cell axis is untouched.
     expect(fold.liveUncreditedOptionsUsd).toBeNull();

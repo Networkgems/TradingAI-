@@ -10324,10 +10324,17 @@ export class SignalEngine {
         // operator tailing Render; it reaches no endpoint, so until now no fold
         // of the ledger could tell a gate's zero that the SELECTOR imposed from
         // one the gate measured. See `LiveEnforceRecord.nominator`.
+        // TRA-3619 — `strikesConsidered` / `strikesInBand` are the SAME chain,
+        // counted before the cheapness screen. `cheapInBand: 0` on a fallback row
+        // is jointly caused (no in-band strike in the chain vs. an in-band strike
+        // the cheapness screen already dropped), and these two split it. Recorder
+        // only: nothing below reads them, and no verdict moves.
         const nominator: LiveEnforceNominator = {
           selection: otmPick.selection,
           cheapConsidered: otmPick.cheapConsidered,
           cheapInBand: otmPick.cheapInBand,
+          strikesConsidered: otmPick.strikesConsidered,
+          strikesInBand: otmPick.strikesInBand,
         };
         if (otmPick.selection !== 'legacy') {
           // Count the verdict on BOTH branches: an armed selector that never finds
@@ -10338,6 +10345,8 @@ export class SignalEngine {
             delta: cheap.delta,
             cheapConsidered: otmPick.cheapConsidered,
             cheapInBand: otmPick.cheapInBand,
+            strikesConsidered: otmPick.strikesConsidered,
+            strikesInBand: otmPick.strikesInBand,
             band: otmPick.band,
           });
         }

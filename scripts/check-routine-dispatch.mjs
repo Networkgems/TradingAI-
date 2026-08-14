@@ -253,6 +253,16 @@ const FLEET_MIN_ASSIGNEES = Number(argOf('fleet-min-assignees', 3));
 const FLEET_MIN_SHARE = Number(argOf('fleet-min-share', 0.25));
 /** A failure older than this is residue of a past event, not a live page. */
 const RECENT_WINDOW_MS = Number(argOf('recent-window-min', 24 * 60)) * 60 * 1000;
+/**
+ * ⛔ TRA-3603 — how far BEFORE a skip a sibling rung's fire may sit and still
+ * count as the primary this skip is a retry of. A retry rung is close to its
+ * primary by construction (10min on the founding fixture `098ce476`); 3h is
+ * loose enough for a same-session ladder and tight enough that a carrier which
+ * never closes stops buying silence and goes back to being a finding. Named,
+ * configurable, and PRINTED on every run — a bound nobody can see is a bound
+ * nobody can audit.
+ */
+const RETRY_COVER_WINDOW_MS = Number(argOf('retry-cover-window-min', 180)) * 60 * 1000;
 
 export const VERDICT_EXIT = { CLEAN: 0, FINDINGS: 1, FLEET: 2, BLIND: 3 };
 
@@ -290,6 +300,193 @@ export const RUN_SKIPPED = new Set(['skipped']);
 export const ABANDONED_RE = /^Execution issue moved to (blocked|cancelled)$/;
 
 /* ------------------------------------------------------------------ *
+ * ⛔ TRA-3603 — a DESIGNED RETRY RUNG'S SKIP IS NOT A BROKEN DISPATCH TAIL
+ * ------------------------------------------------------------------ */
+/**
+ * A date-pinned acceptance ladder is commonly built as PRIMARY + RETRY pairs on
+ * ONE routine under `skip_if_active`: the primary fires and creates a carrier,
+ * and the retry rung ten minutes later is REFUSED because that carrier is still
+ * live. That is the retry doing exactly the job it was configured to do — no
+ * slot was lost — and the pre-TRA-3603 check called every one of them a broken
+ * tail. So the false-positive rate rose with how carefully the routine had been
+ * designed, which is the wrong incentive. (Founding fixture: routine `098ce476`
+ * on 2026-08-13, filed as TRA-3601 and ruled a false positive.)
+ *
+ * The discriminator is an IDENTITY, not a proximity heuristic. The skipped run
+ * records `linkedIssueId` = THE ISSUE THAT REFUSED THE FIRE, and a sibling
+ * trigger's `lastResult` records the issue IT created. Same uuid ⇒ the thing
+ * that blocked this fire is provably this routine's own carrier for the slot.
+ *
+ * ⛔ FOUR TRAPS, each pinned by a control:
+ *
+ *  a. SCAN `routine.triggers` — NEVER the armed subset. The covering sibling is
+ *     usually DISABLED by the time anyone looks: retiring a spent one-shot arm
+ *     is the standing remedy for the zombie 2027 `nextRunAt` that
+ *     check:spent-oneshot files, and on `098ce476` the owner had already done
+ *     it to both morning rungs. Reading `armedTriggers()` here would make this
+ *     fix fail on its own founding fixture — and, worse, would work LESS well
+ *     the better the owner's hygiene was.
+ *
+ *  b. THE LABEL IS NOT THE INSTRUMENT. `t.label` on the founding fixture reads
+ *     "RETRY of the 14:15Z early-signal slot (no-op if it landed)" and it is
+ *     tempting to key on it. It is prose, written by the same hand that may
+ *     have built the ladder wrong: a genuinely self-colliding routine can carry
+ *     the word RETRY and a correct one can carry no label at all. The label is
+ *     REPORTED, so a human can read the intent — it never DECIDES.
+ *
+ *  c. `coalescedIntoRunId` STILL PROVES NOTHING (Trap 3b, unchanged — the
+ *     platform stamps it on both branches). This resolver never reads it.
+ *
+ *  d. A WINDOW IS REQUIRED, or a STUCK CARRIER buys permanent silence. An issue
+ *     that never closes matches this identity on every slot the routine has for
+ *     the rest of time — and a whole slot cohort collapsing into skips against
+ *     one wedged carrier is the REAL self-collision, the case this check exists
+ *     to catch. The covering fire must sit within `retryCoverWindowMs` BEFORE
+ *     the skip.
+ *
+ * Fails CLOSED at every step: an unparseable `lastResult`, an absent
+ * `linkedIssueId`, an unreadable carrier status, or a fire outside the window
+ * all leave the row a `DISPATCH_SKIPPED` finding. "Coverage could not be
+ * proven" must never render as "it was covered" — that would trade this
+ * check's false positives for false negatives on the one state it owns.
+ */
+export const CREATED_ISSUE_RE =
+  /^Created execution issue ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i;
+
+/**
+ * Carrier statuses that mean the covered slot produced NO work after all. Kept
+ * consistent with `ABANDONED_RE` above: the same two statuses the dispatcher
+ * itself treats as an abandoned execution issue.
+ */
+export const CARRIER_DEAD = new Set(['blocked', 'cancelled', 'canceled']);
+
+export const RETRY_COVER = {
+  COVERED: 'COVERED',
+  CARRIER_ABANDONED: 'CARRIER_ABANDONED',
+  NOT_COVERED: 'NOT_COVERED',
+};
+
+/**
+ * Did a sibling rung on this same routine create the carrier that refused this
+ * fire, recently enough to be a retry of the same slot?
+ *
+ * @returns {{cover: string, why: string} & Record<string, unknown>}
+ */
+export function resolveRetryCoverage(routine, lastRun, { windowMs, slackMs = 0 } = {}) {
+  const blockedBy = lastRun?.linkedIssueId || lastRun?.linkedIssue?.id || null;
+  if (!blockedBy) {
+    return {
+      cover: RETRY_COVER.NOT_COVERED,
+      why:
+        'the skipped run records no `linkedIssueId`, so the carrier that refused this fire cannot be ' +
+        'identified at all — there is nothing to match a sibling against',
+    };
+  }
+  // Trap (a). ALL triggers, enabled or not.
+  const all = Array.isArray(routine?.triggers) ? routine.triggers : null;
+  if (!all) {
+    return {
+      cover: RETRY_COVER.NOT_COVERED,
+      carrierId: blockedBy,
+      why: 'the row carries no `triggers` array, so no covering sibling could be looked for',
+    };
+  }
+  const skipMs = Date.parse(lastRun.triggeredAt || '');
+  if (!Number.isFinite(skipMs)) {
+    return {
+      cover: RETRY_COVER.NOT_COVERED,
+      carrierId: blockedBy,
+      why: 'the skipped run has no parseable `triggeredAt`, so no covering window can be drawn',
+    };
+  }
+
+  // Every sibling that PROVABLY created this exact carrier, before this fire.
+  // Collected rather than short-circuited so the verdict cannot depend on the
+  // order the route happened to serve the triggers in.
+  const candidates = [];
+  for (const t of all) {
+    if (!t) continue;
+    if (lastRun.triggerId && t.id === lastRun.triggerId) continue; // a fire cannot cover itself
+    const m = CREATED_ISSUE_RE.exec(typeof t.lastResult === 'string' ? t.lastResult : '');
+    if (!m) continue;
+    if (m[1].toLowerCase() !== String(blockedBy).toLowerCase()) continue; // identity, not proximity
+    const fireMs = Date.parse(t.lastFiredAt || '');
+    if (!Number.isFinite(fireMs)) continue;
+    if (fireMs > skipMs + slackMs) continue; // a LATER fire did not cause this skip
+    candidates.push({ t, fireMs });
+  }
+
+  if (candidates.length === 0) {
+    return {
+      cover: RETRY_COVER.NOT_COVERED,
+      carrierId: blockedBy,
+      why:
+        `no trigger on this routine records having created ${blockedBy} — the carrier that refused this ` +
+        'fire came from somewhere else, so this routine\'s own slot really was dropped',
+    };
+  }
+
+  // The newest qualifying fire is the one this skip is a retry of.
+  candidates.sort((a, b) => b.fireMs - a.fireMs);
+  const { t, fireMs } = candidates[0];
+  const carrier = lastRun.linkedIssue;
+  const carrierStatus = carrier && typeof carrier.status === 'string' ? carrier.status : null;
+  const base = {
+    siblingTriggerId: t.id ?? null,
+    // Trap (b) — carried for the reader, never read by the predicate.
+    siblingLabel: typeof t.label === 'string' ? t.label : null,
+    siblingFiredAt: t.lastFiredAt,
+    carrierId: blockedBy,
+    carrierIdentifier: carrier?.identifier ?? null,
+    carrierStatus,
+    gapMs: skipMs - fireMs,
+  };
+  const gapMin = Math.round(base.gapMs / 60000);
+  const sib = String(t.id ?? 'unknown').slice(0, 8);
+  const named = carrier?.identifier || String(blockedBy).slice(0, 8);
+
+  // Trap (d).
+  if (base.gapMs > windowMs) {
+    return {
+      ...base,
+      cover: RETRY_COVER.NOT_COVERED,
+      why:
+        `sibling trigger ${sib} DID create the carrier ${named} that refused this fire — but it fired ` +
+        `${(base.gapMs / 3600000).toFixed(1)}h earlier, outside the ${Math.round(windowMs / 60000)}min ` +
+        'retry window. A carrier that old is EATING this routine\'s slots, not covering one of them',
+    };
+  }
+  if (!carrierStatus) {
+    return {
+      ...base,
+      cover: RETRY_COVER.NOT_COVERED,
+      why:
+        `sibling trigger ${sib} DID create the carrier ${named} that refused this fire, but that ` +
+        'carrier\'s status could not be read from this row (`lastRun.linkedIssue.status` absent). ' +
+        'Coverage is UNPROVEN, and unproven is not covered',
+    };
+  }
+  if (CARRIER_DEAD.has(carrierStatus)) {
+    return {
+      ...base,
+      cover: RETRY_COVER.CARRIER_ABANDONED,
+      why:
+        `the retry was correctly refused by this routine's own carrier ${named} (created ${gapMin}min ` +
+        `earlier by sibling trigger ${sib}) — but that carrier went \`${carrierStatus}\`, so the slot ` +
+        'produced no completed work. The ladder behaved; the work did not land',
+    };
+  }
+  return {
+    ...base,
+    cover: RETRY_COVER.COVERED,
+    why:
+      `sibling trigger ${sib} fired ${gapMin}min earlier and created carrier ${named} ` +
+      `(now \`${carrierStatus}\`), which is the very issue that refused this fire — \`skip_if_active\` ` +
+      'suppressed a redundant retry of a slot that had already landed',
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Predicate
  * ------------------------------------------------------------------ */
 
@@ -306,7 +503,11 @@ export function armedTriggers(routine) {
  * Returns { state, detail } where `state` is one of PENDING_FIRST_FIRE /
  * HEALTHY / IN_FLIGHT / LAST_DISPATCH_FAILED / FIRE_WITHOUT_RUN / BLIND.
  */
-export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_MS } = {}) {
+export function classifyDispatch(
+  routine,
+  triggers,
+  { slackMs = FIRE_RUN_SLACK_MS, retryCoverWindowMs = RETRY_COVER_WINDOW_MS } = {},
+) {
   // Trap 1. The KEY, not the value. `undefined` here means we asked a route
   // that does not serve this relation, which is not the same as "never ran".
   if (!('lastRun' in routine)) {
@@ -394,6 +595,38 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
     };
   }
   if (RUN_SKIPPED.has(status)) {
+    // ⛔ TRA-3603 — before calling a refused fire a broken tail, ask whether a
+    // SIBLING RUNG on this same routine created the very carrier that refused
+    // it. If it did, this is a designed retry no-opping, not a lost slot.
+    const cov = resolveRetryCoverage(routine, lastRun, { windowMs: retryCoverWindowMs, slackMs });
+    const coverage = {
+      siblingTriggerId: cov.siblingTriggerId ?? null,
+      siblingLabel: cov.siblingLabel ?? null,
+      siblingFiredAt: cov.siblingFiredAt ?? null,
+      carrierId: cov.carrierId ?? null,
+      carrierIdentifier: cov.carrierIdentifier ?? null,
+      carrierStatus: cov.carrierStatus ?? null,
+      coverGapMs: cov.gapMs ?? null,
+      coverWhy: cov.why,
+    };
+    if (cov.cover === RETRY_COVER.COVERED) {
+      return {
+        state: 'DISPATCH_SKIPPED_RETRY_COVERED',
+        detail: `a designed RETRY rung correctly no-opped — ${cov.why}`,
+        triggeredAt,
+        ...coverage,
+      };
+    }
+    if (cov.cover === RETRY_COVER.CARRIER_ABANDONED) {
+      return {
+        state: 'DISPATCH_SKIPPED_CARRIER_ABANDONED',
+        detail:
+          `this skip WAS covered by a sibling rung, and the coverage then died — ${cov.why}. ` +
+          '⛔ Not a dispatcher fault and not a self-collision: route it like any abandoned execution issue.',
+        triggeredAt,
+        ...coverage,
+      };
+    }
     // Trap 3b — do NOT read `coalescedIntoRunId` as "it merged, so it was
     // covered". The platform sets that field on the skip branch too; the status
     // is the only thing that says the fire was refused rather than folded in.
@@ -404,8 +637,10 @@ export function classifyDispatch(routine, triggers, { slackMs = FIRE_RUN_SLACK_M
         'not deferred' +
         (lastRun.coalescedIntoRunId
           ? ` (it points at run ${lastRun.coalescedIntoRunId}, which the platform stamps on skips too — not proof of coverage)`
-          : ''),
+          : '') +
+        `. ⛔ NOT a designed retry either: ${cov.why}`,
       triggeredAt,
+      ...coverage,
     };
   }
   if (!RUN_SUCCESS.has(status)) {
@@ -447,6 +682,11 @@ const FINDING_STATES = new Set([
   'FIRE_WITHOUT_RUN',
   'DISPATCH_SKIPPED',
   'EXECUTION_ISSUE_ABANDONED',
+  // ⛔ TRA-3603 — the coverage EXISTED and then DIED. Still a finding (the slot
+  // produced no completed work) but NOT the same claim as DISPATCH_SKIPPED,
+  // which asserts the fire was dropped. `DISPATCH_SKIPPED_RETRY_COVERED` is
+  // deliberately ABSENT from this set — that is the whole fix.
+  'DISPATCH_SKIPPED_CARRIER_ABANDONED',
   ...OWNER_ATTRIBUTED_STATES,
 ]);
 /**
@@ -463,6 +703,10 @@ const FINDING_STATES = new Set([
  * the banner came to assert a dispatcher fault twice a day. OWNER_STATE_UNKNOWN
  * is held out too: an attribution we could not complete is not evidence FOR the
  * dispatcher.
+ *
+ * ⛔ TRA-3603: `DISPATCH_SKIPPED_CARRIER_ABANDONED` is held out on exactly the
+ * `EXECUTION_ISSUE_ABANDONED` reasoning — the dispatch was refused BY DESIGN and
+ * what failed afterwards was the work, which is owner-routable by construction.
  */
 const FLEET_STATES = new Set(['LAST_DISPATCH_FAILED', 'FIRE_WITHOUT_RUN', 'DISPATCH_SKIPPED']);
 
@@ -529,6 +773,7 @@ export async function sweep(transport, opts = {}) {
   const limit = opts.routineLimit ?? ROUTINE_LIMIT;
   const slackMs = opts.slackMs ?? FIRE_RUN_SLACK_MS;
   const recentWindowMs = opts.recentWindowMs ?? RECENT_WINDOW_MS;
+  const retryCoverWindowMs = opts.retryCoverWindowMs ?? RETRY_COVER_WINDOW_MS;
   // Injected by the controls so the recency axis is testable against a fixed
   // clock. A detector whose verdict depends on wall-time cannot have a control.
   const nowMs = opts.nowMs ?? Date.now();
@@ -590,15 +835,39 @@ export async function sweep(transport, opts = {}) {
 
   const findings = [];
   const blindRows = [];
+  const coveredSkips = [];
   const tally = {};
   for (const { routine, triggers } of population) {
-    const c = attributeOwnerState(classifyDispatch(routine, triggers, { slackMs }), {
+    const c = attributeOwnerState(classifyDispatch(routine, triggers, { slackMs, retryCoverWindowMs }), {
       assigneeAgentId: routine.assigneeAgentId || null,
       tape,
     });
     tally[c.state] = (tally[c.state] || 0) + 1;
     if (c.state === 'BLIND') {
       blindRows.push({ id: routine.id, title: routine.title, reason: c.detail });
+      continue;
+    }
+    // ⛔ TRA-3603 — a suppressed row is PRINTED, never silently dropped. This
+    // check's own history is a list of states that looked identical in the pass
+    // and fail case; a suppression nobody can see would add one more. The
+    // reader gets the whole evidence chain (which sibling, which carrier, what
+    // status, what gap) so they can overturn it without re-deriving it.
+    if (c.state === 'DISPATCH_SKIPPED_RETRY_COVERED') {
+      coveredSkips.push({
+        id: routine.id,
+        short: String(routine.id).slice(0, 8),
+        title: routine.title,
+        assigneeAgentId: routine.assigneeAgentId || null,
+        triggeredAt: c.triggeredAt ?? null,
+        siblingTriggerId: c.siblingTriggerId ?? null,
+        siblingLabel: c.siblingLabel ?? null,
+        siblingFiredAt: c.siblingFiredAt ?? null,
+        carrierId: c.carrierId ?? null,
+        carrierIdentifier: c.carrierIdentifier ?? null,
+        carrierStatus: c.carrierStatus ?? null,
+        coverGapMs: c.coverGapMs ?? null,
+        why: c.coverWhy ?? c.detail,
+      });
       continue;
     }
     if (!FINDING_STATES.has(c.state)) continue;
@@ -620,6 +889,17 @@ export async function sweep(transport, opts = {}) {
       closedStatus: c.closedStatus ?? null,
       linkedIssueId: c.linkedIssueId ?? null,
       linkedIssueIdentifier: c.linkedIssueIdentifier ?? null,
+      // ⛔ TRA-3603 — on a skip row these say WHY coverage was not proven. A
+      // DISPATCH_SKIPPED that survived the coverage test must be able to show
+      // its work, or the next reader re-litigates it by hand (which is what
+      // TRA-3601 cost).
+      siblingTriggerId: c.siblingTriggerId ?? null,
+      siblingLabel: c.siblingLabel ?? null,
+      siblingFiredAt: c.siblingFiredAt ?? null,
+      carrierId: c.carrierId ?? null,
+      carrierIdentifier: c.carrierIdentifier ?? null,
+      carrierStatus: c.carrierStatus ?? null,
+      coverGapMs: c.coverGapMs ?? null,
       triggeredAt: c.triggeredAt ?? null,
       failedAt: Number.isFinite(atMs) ? new Date(atMs).toISOString() : null,
       ageMs,
@@ -731,6 +1011,10 @@ export async function sweep(transport, opts = {}) {
     misroutedCloseCount: abandoned.filter((f) => f.ownerHeldIssueAtClose === false).length,
     unattributedCloseCount: abandoned.filter((f) => f.ownerHeldIssueAtClose === null).length,
     residueOnly: findings.length > 0 && recentFindings.length === 0,
+    // ⛔ TRA-3603 — informational, and reported at every verdict INCLUDING
+    // CLEAN. These are the rows the old check filed as broken tails.
+    coveredSkips,
+    retryCoverWindowMs,
     recentWindowMs,
     newestFailureAgeMs,
     probe,
@@ -757,13 +1041,50 @@ export function renderReport(r, names = {}) {
     return out;
   }
 
+  const hrs = (ms) => (ms === null || ms === undefined ? '?' : `${(ms / 3600000).toFixed(1)}h`);
+
+  // ⛔ TRA-3603 — the SUPPRESSED rows, printed at every verdict including CLEAN.
+  // Before this ticket each of these was a finding; a reader who cannot see what
+  // the check decided NOT to tell them cannot audit the suppression, and this
+  // check's entire history is about states that read identically in pass and
+  // fail. Rendered as its own block so it can never be mistaken for a finding.
+  const renderCovered = () => {
+    const rows = r.coveredSkips || [];
+    if (rows.length === 0) return;
+    out.push('');
+    out.push(
+      `  ℹ️ ${rows.length} designed RETRY rung(s) correctly no-opped — SUPPRESSED, not findings ` +
+        `(TRA-3603; retry window ${Math.round((r.retryCoverWindowMs ?? 0) / 60000)}min):`,
+    );
+    for (const c of rows) {
+      out.push(`    ${c.short}  ${nm(c.assigneeAgentId).padEnd(12)} DISPATCH_SKIPPED_RETRY_COVERED`);
+      out.push(`              ${(c.title || '').slice(0, 90)}`);
+      out.push(
+        `              skip ${c.triggeredAt} ← covered by sibling trigger ` +
+          `${String(c.siblingTriggerId || 'unknown').slice(0, 8)} fired ${c.siblingFiredAt} ` +
+          `(${Math.round((c.coverGapMs ?? 0) / 60000)}min earlier)`,
+      );
+      out.push(
+        `              carrier ${c.carrierIdentifier || String(c.carrierId || '?').slice(0, 8)} \`${c.carrierStatus}\` ` +
+          '— matched by UUID IDENTITY, not by the trigger label',
+      );
+      // Trap (b) again, at the point of reading: the label is context only.
+      if (c.siblingLabel) out.push(`              sibling label (context only): ${String(c.siblingLabel).slice(0, 88)}`);
+    }
+    out.push(
+      '    ⛔ A skip is only suppressed when a SIBLING RUNG PROVABLY CREATED THE VERY CARRIER that ' +
+        'refused it, inside the window. A skip whose whole slot cohort collapsed — no sibling carrier, ' +
+        'or one too old — is still DISPATCH_SKIPPED and still fires.',
+    );
+  };
+
   if (r.findings.length === 0) {
     out.push('');
     out.push(`  CLEAN — every one of the ${r.graded} armed routines has a healthy dispatch tail.`);
+    renderCovered();
     return out;
   }
 
-  const hrs = (ms) => (ms === null || ms === undefined ? '?' : `${(ms / 3600000).toFixed(1)}h`);
   out.push('');
   out.push(
     `  ${r.findings.length} of ${r.graded} armed routines have a broken dispatch tail ` +
@@ -806,7 +1127,20 @@ export function renderReport(r, names = {}) {
         );
       }
     }
+    // ⛔ TRA-3603 — on a skip row, show the coverage test's working. A reader
+    // looking at DISPATCH_SKIPPED must be able to see that a retry rung WAS
+    // looked for and why it did not clear the row, without re-reading the
+    // routine record by hand — which is exactly what TRA-3601 cost.
+    if (f.state === 'DISPATCH_SKIPPED_CARRIER_ABANDONED') {
+      out.push(
+        `              carrier ${f.carrierIdentifier || String(f.carrierId || '?').slice(0, 8)} ` +
+          `\`${f.carrierStatus}\` · created by sibling trigger ${String(f.siblingTriggerId || '?').slice(0, 8)} ` +
+          `at ${f.siblingFiredAt}`,
+      );
+    }
   }
+
+  renderCovered();
 
   if (r.verdict === 'FLEET') {
     out.push('');
@@ -966,6 +1300,84 @@ function routineRow(id, over = {}) {
     },
     ...over,
   };
+}
+
+/**
+ * ⛔ TRA-3603 — the founding fixture, copied from the LIVE record of routine
+ * `098ce476` read at 2026-08-13T15:52Z (5-rung PRIMARY+RETRY ladder, morning
+ * pair already retired by the owner, three evening rungs still armed).
+ *
+ * Two properties of the real row are load-bearing and are reproduced exactly:
+ *
+ *   1. The covering PRIMARY is `enabled:false`. Retiring a spent one-shot arm is
+ *      the standing remedy for the zombie 2027 `nextRunAt`, so by the time this
+ *      check runs the evidence of coverage usually sits on a DISABLED trigger.
+ *      A resolver scanning `armedTriggers()` fails this fixture.
+ *   2. The armed rungs have `lastFiredAt: null`. That keeps `newestFireMs` from
+ *      the armed set out of the way, so this control tests the SKIP branch and
+ *      not FIRE_WITHOUT_RUN.
+ */
+const LADDER_CARRIER = 'c62cfd87-192c-496a-a554-cebf5e4326dd';
+
+function ladderRow(id, over = {}) {
+  const { primary = {}, retry = {}, carrierStatus = 'done', dropLinkedIssue = false, ...rest } = over;
+  const armed = (tid, cron, label) => ({
+    id: tid,
+    kind: 'schedule',
+    enabled: true,
+    cronExpression: cron,
+    timezone: 'America/New_York',
+    nextRunAt: FUTURE,
+    lastFiredAt: null,
+    lastResult: null,
+    label,
+  });
+  const lastRun = {
+    id: 'run-037b2bc9',
+    triggerId: '076a9de8',
+    status: 'skipped',
+    triggeredAt: '2026-08-04T20:45:25.000Z',
+    // Trap 3b — present, and still proving nothing on its own.
+    coalescedIntoRunId: '999e3c69-dfe6-45e9-be64-95a3fd9741ae',
+    linkedIssueId: LADDER_CARRIER,
+    linkedIssue: { id: LADDER_CARRIER, identifier: 'TRA-3591', status: carrierStatus },
+    failureReason: null,
+  };
+  if (dropLinkedIssue) delete lastRun.linkedIssue;
+  return routineRow(id, {
+    concurrencyPolicy: 'skip_if_active',
+    triggers: [
+      {
+        id: 'b060336e',
+        kind: 'schedule',
+        enabled: false, // ⛔ property (1)
+        cronExpression: '15 10 13 8 *',
+        timezone: 'America/New_York',
+        nextRunAt: '2027-08-13T14:15:00.000Z',
+        lastFiredAt: '2026-08-04T20:35:25.000Z', // 10min before the skip
+        lastResult: `Created execution issue ${LADDER_CARRIER}`,
+        label: 'mid-session early signal (10:15 ET)',
+        ...primary,
+      },
+      {
+        id: '076a9de8',
+        kind: 'schedule',
+        enabled: false,
+        cronExpression: '25 10 13 8 *',
+        timezone: 'America/New_York',
+        nextRunAt: '2027-08-13T14:25:00.000Z',
+        lastFiredAt: '2026-08-04T20:45:25.000Z',
+        lastResult: 'Skipped because a live execution issue already exists',
+        label: 'RETRY of the 14:15Z early-signal slot (no-op if it landed) - 10:25 ET',
+        ...retry,
+      },
+      armed('df5e9541', '10 16 13 8 *', 'post-close grade (16:10 ET)'),
+      armed('cdde1043', '25 16 13 8 *', 'RETRY #1 of the 20:10Z grade slot (no-op if it landed) - 16:25 ET'),
+      armed('f581a7c5', '40 16 13 8 *', 'RETRY #2 of the 20:10Z grade slot (no-op if it landed) - 16:40 ET'),
+    ],
+    lastRun,
+    ...rest,
+  });
 }
 
 /** A board with `n` healthy filler rows so a single finding is not a fleet. */
@@ -1183,6 +1595,164 @@ const CASES = [
       assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
     },
   },
+
+  /* ---------------- ⛔ TRA-3603 — the designed-retry discriminator ---------------- */
+  {
+    name:
+      '⛔ TRA-3603 FOUNDING FIXTURE (098ce476, byte-shape) — a RETRY rung refused by the carrier its own ' +
+      'PRIMARY created is NOT a broken tail. ⛔ Both morning rungs are `enabled:false` (the owner retired the ' +
+      'spent one-shots), so a resolver reading `armedTriggers()` would MISS the coverage and re-file TRA-3601.',
+    rows: boardOf([ladderRow('r-098ce476')]),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict} :: ${JSON.stringify(r.findings)}`);
+      assert(r.tally.DISPATCH_SKIPPED_RETRY_COVERED === 1, JSON.stringify(r.tally));
+      assert(r.coveredSkips.length === 1, `covered rows: ${r.coveredSkips.length}`);
+      assert(r.coveredSkips[0].carrierIdentifier === 'TRA-3591', r.coveredSkips[0].carrierIdentifier);
+      assert(r.coveredSkips[0].carrierStatus === 'done', r.coveredSkips[0].carrierStatus);
+      assert(r.coveredSkips[0].siblingTriggerId === 'b060336e', r.coveredSkips[0].siblingTriggerId);
+      // The suppression must be VISIBLE in the rendered report, not just in the object.
+      const txt = renderReport(r).join('\n');
+      assert(/DISPATCH_SKIPPED_RETRY_COVERED/.test(txt), 'the suppressed row is not printed');
+      assert(/TRA-3591/.test(txt), 'the covering carrier is not named in the report');
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 TRAP (a) — the covering sibling\'s `enabled` state is IRRELEVANT: the same ladder with the ' +
+      'primary still ARMED is suppressed identically (coverage is a fact about a fire that happened)',
+    rows: boardOf([ladderRow('r-armed-primary', { primary: { enabled: true } })]),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.tally.DISPATCH_SKIPPED_RETRY_COVERED === 1, JSON.stringify(r.tally));
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 TRAP (b) — PROSE IS NOT THE INSTRUMENT: a rung LABELLED "RETRY ... (no-op if it landed)" ' +
+      'whose siblings produced NO carrier is the REAL self-collision and must still fire',
+    rows: boardOf([
+      ladderRow('r-liar', {
+        // The label still screams RETRY. Nothing created the blocking carrier.
+        primary: { lastResult: 'Skipped because a live execution issue already exists' },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+      assert(/no trigger on this routine records having created/.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 IDENTITY, NOT PROXIMITY — a sibling that fired in the window but created a DIFFERENT issue ' +
+      'than the one that refused this fire does NOT cover it',
+    rows: boardOf([
+      ladderRow('r-other', {
+        primary: { lastResult: 'Created execution issue aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa' },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 TRAP (d) — a STUCK CARRIER does not buy permanent silence: identity matches, but the ' +
+      'covering fire is 20h before the skip, so the carrier is EATING slots and the row still fires',
+    rows: boardOf([
+      ladderRow('r-stuck', {
+        primary: { lastFiredAt: '2026-08-04T00:45:25.000Z' },
+        carrierStatus: 'in_progress',
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+      assert(/EATING this routine's slots/.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 — a LIVE carrier (`in_progress`) inside the window IS coverage: the slot is being worked. ' +
+      '(Whether that carrier is ever picked up is check:carrier-dispatch\'s subject, not this one\'s.)',
+    rows: boardOf([ladderRow('r-live', { carrierStatus: 'in_progress' })]),
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.tally.DISPATCH_SKIPPED_RETRY_COVERED === 1, JSON.stringify(r.tally));
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 — coverage that DIED: the retry was correctly refused, then the carrier went `cancelled`. ' +
+      'Still a finding (no work landed) but a DIFFERENT claim, and held OUT of the FLEET test',
+    rows: boardOf([ladderRow('r-dead', { carrierStatus: 'cancelled' })]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED_CARRIER_ABANDONED', r.findings[0].state);
+      assert(r.fleetCandidateCount === 0, `abandoned coverage must not feed FLEET: ${r.fleetCandidateCount}`);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 FAILS CLOSED — identity matches but `lastRun.linkedIssue` is absent, so the carrier status ' +
+      'is unreadable. UNPROVEN coverage is not coverage: the row stays a finding',
+    rows: boardOf([ladderRow('r-unread', { dropLinkedIssue: true })]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+      assert(/UNPROVEN/.test(r.findings[0].detail), r.findings[0].detail);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 — a fire CANNOT COVER ITSELF: the only "Created execution issue" lastResult belongs to the ' +
+      'very trigger whose run was skipped (a stale value), which proves nothing about a sibling',
+    rows: boardOf([
+      routineRow('r-self', {
+        triggers: [
+          {
+            id: 't-only',
+            kind: 'schedule',
+            enabled: true,
+            cronExpression: '45 16 * * 1-5',
+            timezone: 'America/New_York',
+            nextRunAt: FUTURE,
+            lastFiredAt: '2026-08-04T20:45:25.000Z',
+            lastResult: `Created execution issue ${LADDER_CARRIER}`,
+          },
+        ],
+        lastRun: {
+          id: 'run-skip',
+          triggerId: 't-only',
+          status: 'skipped',
+          triggeredAt: '2026-08-04T20:45:25.000Z',
+          linkedIssueId: LADDER_CARRIER,
+          linkedIssue: { id: LADDER_CARRIER, identifier: 'TRA-3591', status: 'done' },
+        },
+      }),
+    ]),
+    expect: (r) => {
+      assert(r.verdict === 'FINDINGS', `expected FINDINGS, got ${r.verdict}`);
+      assert(r.findings[0].state === 'DISPATCH_SKIPPED', r.findings[0].state);
+    },
+  },
+  {
+    name:
+      '⛔ TRA-3603 — a whole BOARD of designed retry rungs is CLEAN, never FLEET. Before this ticket six ' +
+      'well-built ladders were six dispatch failures spanning six assignees, i.e. a manufactured platform verdict',
+    rows: [
+      ...['a', 'b', 'c', 'd', 'e', 'f'].map((k) =>
+        ladderRow(`r-fleet-${k}`, { assigneeAgentId: `agent-${k}` }),
+      ),
+    ],
+    expect: (r) => {
+      assert(r.verdict === 'CLEAN', `expected CLEAN, got ${r.verdict}`);
+      assert(r.tally.DISPATCH_SKIPPED_RETRY_COVERED === 6, JSON.stringify(r.tally));
+      assert(r.coveredSkips.length === 6, `covered rows: ${r.coveredSkips.length}`);
+    },
+  },
+
   {
     name: '`received` — the row the platform INSERTs before the issue exists => in flight, not a verdict',
     rows: boardOf([routineRow('r-recv', { lastRun: { status: 'received', triggeredAt: '2026-08-04T20:45:25.000Z' } })]),

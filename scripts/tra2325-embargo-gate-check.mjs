@@ -14,12 +14,16 @@
 //   node scripts/tra2325-embargo-gate-check.mjs
 //   exit 0 = all cases pass · 1 = a case failed
 
+import { spawnSync } from 'node:child_process';
 import {
   freezeState,
   embargoState,
   commitHoldState,
   envWriteHoldWarning,
   resolveTarget,
+  rollbackState,
+  rollbackBlocks,
+  stalePinNote,
   EMBARGOES,
   COMMIT_HOLDS,
   DEPLOY_LEAD_MIN,
@@ -73,6 +77,21 @@ const CASES = [
   ['2026-07-25T17:00:00Z', 'PROCEED', 'Sat 17:00Z — weekend, clock inside RTH: freeze must NOT fire'],
   ['2026-07-26T17:00:00Z', 'PROCEED', 'Sun 17:00Z — weekend, clock inside RTH: freeze must NOT fire'],
   ['2026-07-27T02:00:00Z', 'PROCEED', 'Mon 02:00Z — weekday, pre-open, before the embargo'],
+
+  // ── The 2026-08-13 post-close row (TRA-3625) ───────────────────────────────
+  // This row exists to collapse three deploy carriers into ONE boot, so the cases that
+  // matter are the three carrier instants themselves: two must be refused, the last must
+  // NOT be. A row that also swallowed the 21:50Z carrier would strand TRA-3619's number
+  // for Friday's RTH, which is the failure this is trying to avoid, not cause.
+  ['2026-08-13T19:59:59Z', 'REFUSE_FREEZE', 'Thu 19:59:59Z — still the RTH freeze; the row is contiguous with it'],
+  ['2026-08-13T20:00:00Z', 'REFUSE_EMBARGO', 'Thu 20:00:00Z sharp — freeze hands off to the embargo with NO gap'],
+  ['2026-08-13T20:25:00Z', 'REFUSE_EMBARGO', 'Thu 20:25Z — 7d30dcfc TRA-1648 soak gate, the read a 20:30Z boot lands under'],
+  ['2026-08-13T20:30:00Z', 'REFUSE_EMBARGO', 'Thu 20:30Z — fc05a69f TRA-3547 carrier fires HERE; must be held'],
+  ['2026-08-13T21:00:00Z', 'REFUSE_EMBARGO', 'Thu 21:00Z — 31a25426 TRA-3387 carrier fires HERE; must be held'],
+  ['2026-08-13T21:40:00Z', 'REFUSE_EMBARGO', 'Thu 21:40Z — 5293f29f TRA-2220, the last graded read of the cluster'],
+  ['2026-08-13T21:45:00Z', 'PROCEED', 'Thu 21:45:00Z sharp — row spent, half-open [from,to)'],
+  ['2026-08-13T21:50:00Z', 'PROCEED', 'Thu 21:50Z — e7ccfe59 TRA-3619 tip deploy: the ONE boot everything funnels into'],
+  ['2026-08-14T13:24:59Z', 'PROCEED', 'Fri pre-open — the row is spent and does not leak into the next day'],
 ];
 
 // ── The COMMIT HOLD (TRA-2306 / TRA-2355) ────────────────────────────────────
@@ -145,6 +164,81 @@ const WARN_CASES = [
   ['2026-07-26T04:45:00Z', clean('88a072e'), true, 'SILENT', 'SAME instant, clean tip, no embargo — nothing to warn about'],
   ['2026-07-27T21:00:00Z', carrying(HELD), true, 'SILENT', 'Mon 21:00:00Z — hold and embargo both spent: self-expires with the tables'],
   ['2026-07-27T14:00:00Z', carrying(HELD), false, 'SILENT', 'not the soak host — the hold/embargo are bqb1-scoped'],
+];
+
+// ── Gate 4: the stale-pin ROLLBACK guard (TRA-3625) ──────────────────────────
+// Driven off a fake linear history so the suite needs no git and no network. The chain is
+// the real one from the night the bug was found:
+//   4cac8b70 (serving) → 8713331 (TRA-3547) → 070a188 (TRA-3589) → 229af6d (tip, TRA-3619)
+// `hotfix` is deliberately OFF the chain, so neither contains the other.
+// Full 40-char shas, matched by PREFIX — because the bug this suite has to be able to see
+// is a short/long mismatch. `resolveTarget` passes --commit through verbatim, so the real
+// gate routinely compares a 7-char pin against a 40-char tip; a fake harness that only ever
+// holds 7-char shas on both sides cannot reach that branch at all.
+const CHAIN = [
+  '4cac8b70ee3c206306bd17d6a836ff60374895fc',
+  '8713331d0a49b1a37b9e8f0c4a6d2e5b1f3c7a90',
+  '070a188c5e2b9d4f6a1c8e3b7d0f2a5c9e4b6d81',
+  '229af6d6e985609c2b2204b4202c7d3b20a9419c',
+];
+const idxOf = s => CHAIN.findIndex(full => full.startsWith(s));
+const chainAncestry = (a, b) => {
+  if (a === 'nosuch' || b === 'nosuch') return null; // object missing from this checkout
+  const ia = idxOf(a);
+  const ib = idxOf(b);
+  if (ia === -1 || ib === -1) return idxOf(a) === idxOf(b) && a === b; // off-chain: related only to itself
+  return ia <= ib; // reflexive, like `merge-base --is-ancestor`
+};
+const FULL = { A: CHAIN[0], B: CHAIN[1], C: CHAIN[2], D: CHAIN[3] };
+
+const pin = sha => ({ sha, source: '--commit' });
+const tip = sha => ({ sha, source: 'origin/main tip (no --commit given)' });
+const at_ = sha => ({ sha });
+const unreadable = { sha: null, error: '/api/health/version timed out' };
+
+// The decision main() makes: anything rollbackBlocks() refuses, everything else proceeds.
+const rbVerdict = (target, live) => {
+  const v = rollbackState(target, live, chainAncestry).verdict;
+  return rollbackBlocks(v) ? `REFUSE_${v}` : v;
+};
+
+const ROLLBACK_CASES = [
+  // The bug, exactly as measured. A carrier pinned to 8713331 executed after 070a188 shipped.
+  [pin('8713331'), at_('070a188'), 'REFUSE_ROLLBACK', 'TRA-3547 pin executed after TRA-3589 shipped — reverts the equity-source-era marker'],
+  [pin('4cac8b70'), at_('229af6d'), 'REFUSE_ROLLBACK', 'the oldest pin against the tip — three commits removed at once'],
+
+  // The paired PROCEEDs. Each differs from a REFUSE above by exactly one variable; without
+  // them a gate jammed shut would pass this suite and no deploy would ever leave again.
+  [pin('229af6d'), at_('070a188'), 'FORWARD', 'SAME shape, pin is NEWER than live — the ordinary pinned deploy must still ship'],
+  [tip('229af6d'), at_('4cac8b70'), 'FORWARD', 'no --commit, tip ahead of live — the default path is untouched'],
+  [pin('070a188'), at_('070a188'), 'NOOP', 'pin IS the serving build — a reboot, not a rollback, and must not be refused'],
+  [pin('8713331'), at_('4cac8b70'), 'FORWARD', 'an OLD pin that is still ahead of live: under-ships, but removes nothing'],
+
+  // Divergence removes serving code too, and it is the one case the default (tip) path can
+  // hit on its own — live ahead of main is a hotfix nobody landed.
+  [tip('229af6d'), at_('hotfix'), 'REFUSE_DIVERGED', 'live is a hotfix that never landed — deploying the tip drops it'],
+
+  // FAILS CLOSED. "I could not check" is never "it is not a rollback".
+  [pin('8713331'), unreadable, 'REFUSE_BLIND', 'health route down — must refuse, not assume forward'],
+  [pin('nosuch'), at_('070a188'), 'REFUSE_BLIND', 'target object missing from this checkout — cannot tell is not no'],
+  [pin('8713331'), at_('nosuch'), 'REFUSE_BLIND', 'live sha unknown to this checkout — same, from the other side'],
+  [{ sha: null, source: '--commit', error: 'ls-remote failed' }, at_('070a188'), 'REFUSE_BLIND', 'target unresolvable'],
+];
+
+// The non-blocking half. A note that is always printed is noise; one that never prints is
+// the original defect. Pin-behind-tip NOTES, everything else stays QUIET.
+const noteVerdict = (target, tipSha) => (stalePinNote(target, tipSha, chainAncestry) === '' ? 'QUIET' : 'NOTED');
+
+const NOTE_CASES = [
+  [pin('8713331'), FULL.D, 'NOTED', 'pinned behind the tip — the under-ship worth naming'],
+  // ⚠ THE REGRESSION CASE. A 7-char pin of the tip against the 40-char tip: the shas are
+  // EQUAL but the strings are not, and ancestry is reflexive, so a `===` equality guard
+  // reports the tip as a stale pin. Caught on the live arm 2026-08-13, not by the fakes.
+  [pin('229af6d'), FULL.D, 'QUIET', 'SHORT pin of the tip vs the FULL tip — equal, so nothing to say'],
+  [pin(FULL.D), FULL.D, 'QUIET', 'full-length pin AT the tip — nothing to say'],
+  [tip('229af6d'), FULL.D, 'QUIET', 'no --commit at all — this note is about pins only'],
+  [pin('hotfix'), FULL.D, 'QUIET', 'off-chain pin — not behind the tip, so not this note subject'],
+  [pin('nosuch'), FULL.D, 'QUIET', 'unanswerable ancestry must not manufacture a note'],
 ];
 
 let pass = 0;
@@ -220,10 +314,78 @@ if (process.argv.includes('--live')) {
     console.error('[tra2325] FAIL: the live resolver refuses a commit that carries no hold — jammed shut.');
     process.exit(1);
   }
+
+  // ── Rollback gate, live arm (TRA-3625) ────────────────────────────────────
+  // Not optional colour. The fake chain above ran 68/68 green while stalePinNote reported
+  // the TIP as a stale pin, because every fake sha was 7 chars on BOTH sides and the real
+  // resolver passes --commit through verbatim against a 40-char tip. This arm is what
+  // found it. If the fakes and this disagree again, believe this one.
+  const liveUrl = process.env.ROLLBACK_LIVE_URL ?? 'https://tradingai-bqb1.onrender.com/api/health/version';
+  let liveSha = null;
+  try {
+    const r = await fetch(liveUrl, { signal: AbortSignal.timeout(25_000) });
+    const b = r.ok ? await r.json() : null;
+    if (typeof b?.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(b.commit)) {
+      const rev = spawnSync('git', ['rev-parse', `${b.commit}^{commit}`], { encoding: 'utf8' });
+      if (rev.status === 0) liveSha = rev.stdout.trim();
+    }
+  } catch {
+    /* leave null — reported as BLIND below, which is the correct reading */
+  }
+  const liveTip = liveTarget.sha;
+  console.log('');
+  console.log(`rollback: live ${liveSha ? liveSha.slice(0, 12) : '(unreadable)'} · tip ${liveTip?.slice(0, 12) ?? '(unresolved)'}`);
+  const liveOperand = liveSha ? { sha: liveSha } : { sha: null, error: 'health route unreachable' };
+
+  // The tip must ALWAYS be deployable — if this ever refuses, the gate is jammed shut and
+  // nobody can ship. This is the negative control, and it is the one that matters.
+  const tipRb = rollbackState(resolveTarget('main', undefined), liveOperand);
+  console.log(`  tip     : ${tipRb.verdict}  ${rollbackBlocks(tipRb.verdict) ? 'REFUSE' : 'proceed'}`);
+  if (liveSha && rollbackBlocks(tipRb.verdict)) {
+    console.error(`[tra2325] FAIL: deploying the TIP is refused (${tipRb.verdict}) — the rollback gate is jammed shut.`);
+    process.exit(1);
+  }
+  // And pinning the tip must be identical to taking it, AND must not print a stale-pin note.
+  const pinnedTip = resolveTarget('main', liveTip);
+  const pinNote = stalePinNote(pinnedTip, liveTip);
+  console.log(`  tip pin : ${rollbackState(pinnedTip, liveOperand).verdict}  stale-pin note ${pinNote ? 'PRINTED' : 'quiet'}`);
+  if (pinNote) {
+    console.error('[tra2325] FAIL: --commit=<the tip> printed a STALE PIN note. Pinning the tip is not stale.');
+    process.exit(1);
+  }
 }
 
-const TOTAL = CASES.length + HOLD_CASES.length + WARN_CASES.length;
-const allMissing = [...missing, ...holdMissing, ...warnMissing];
+for (const [target, live, expected, why] of ROLLBACK_CASES) {
+  const got = rbVerdict(target, live);
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   rollback  ${got.padEnd(17)} ${why}`);
+  } else {
+    failures.push({ iso: 'rollback', expected, got, why });
+    console.log(`  FAIL rollback  expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+for (const [target, tipSha, expected, why] of NOTE_CASES) {
+  const got = noteVerdict(target, tipSha);
+  if (got === expected) {
+    pass += 1;
+    console.log(`  ok   stalepin  ${got.padEnd(17)} ${why}`);
+  } else {
+    failures.push({ iso: 'stalepin', expected, got, why });
+    console.log(`  FAIL stalepin  expected ${expected}, got ${got}  — ${why}`);
+  }
+}
+
+const rbProduced = new Set(ROLLBACK_CASES.map(([t, l]) => rbVerdict(t, l)));
+const rbMissing = ['FORWARD', 'NOOP', 'REFUSE_ROLLBACK', 'REFUSE_DIVERGED', 'REFUSE_BLIND'].filter(
+  v => !rbProduced.has(v),
+);
+const noteProduced = new Set(NOTE_CASES.map(([t, s]) => noteVerdict(t, s)));
+const noteMissing = ['NOTED', 'QUIET'].filter(v => !noteProduced.has(v));
+
+const TOTAL = CASES.length + HOLD_CASES.length + WARN_CASES.length + ROLLBACK_CASES.length + NOTE_CASES.length;
+const allMissing = [...missing, ...holdMissing, ...warnMissing, ...rbMissing, ...noteMissing];
 
 console.log('');
 console.log(`freeze  : ${FREEZE_OPEN_MIN}–${FREEZE_CLOSE_MIN} UTC min-of-day (lead ${DEPLOY_LEAD_MIN} min)`);
@@ -232,7 +394,9 @@ console.log(
   `holds   : ${COMMIT_HOLDS.length} row(s) — ${COMMIT_HOLDS.map(h => `${h.commit.slice(0, 7)}→${h.until} (${h.ticket})`).join(', ')}`,
 );
 console.log(`cases   : ${pass}/${TOTAL} pass`);
-console.log(`verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced])].sort().join(', ')}`);
+console.log(
+  `verdicts: reached ${[...new Set([...produced, ...holdProduced, ...warnProduced, ...rbProduced, ...noteProduced])].sort().join(', ')}`,
+);
 
 if (allMissing.length) {
   console.error(`[tra2325] FAIL: verdict(s) never reached by any case: ${allMissing.join(', ')} — suite is one-sided.`);
@@ -242,5 +406,6 @@ if (failures.length) {
   console.error(`[tra2325] FAIL: ${failures.length} case(s) failed.`);
   process.exit(1);
 }
-console.log('[tra2325] PASS — all three gates discriminate, and every verdict is reachable.');
+console.log('[tra2325] PASS — freeze, embargo, commit-hold, rollback and stale-pin all discriminate,');
+console.log('[tra2325] and every verdict is reachable.');
 process.exit(0);

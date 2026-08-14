@@ -57,6 +57,20 @@
  * with no `cheap` candidate at all both read as "no signal". Both branches here
  * return a populated result so the caller can log and count the verdict, which
  * is the property TRA-2341/TRA-2388 exist to preserve.
+ *
+ * ## Screen order (TRA-3619)
+ *
+ * **The cheapness screen runs FIRST and the band filter runs INSIDE its output.**
+ * `selectAdmissibleOtmCandidate` filters `classification === 'cheap'`, then
+ * filters THAT subset on |Δ|. The band never sees a non-`cheap` strike, so
+ * `cheapInBand` is `cheap ∩ band` and a zero on it is jointly caused: the chain
+ * may hold no in-band strike, or it may hold one that the cheapness screen
+ * already threw away. `strikesInBand` splits those two by running the same band
+ * predicate over the pre-cheapness candidate set.
+ *
+ * The upstream ordering matters too: `findMispricedOtmContracts` applies the OTM
+ * side test and the liquidity/quality screens BEFORE classifying, so even the
+ * "pre-cheapness" set is post-liquidity. See {@link AdmissibleStrikeResult.strikesConsidered}.
  */
 
 /** The subset of `OtmMispricingCandidate` this selector reads. */
@@ -138,6 +152,40 @@ export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
   cheapConsidered: number;
   /** How many of those landed inside the band. */
   cheapInBand: number;
+  /**
+   * TRA-3619 — every candidate the scanner handed this selector, BEFORE the
+   * cheapness screen. The denominator {@link strikesInBand} has to be read
+   * against: `strikesInBand: 0` out of 3 considered is a thin chain, and
+   * `strikesInBand: 0` out of 40 is a statement about where the band sits.
+   *
+   * NOT the raw option chain. `findMispricedOtmContracts` has already applied the
+   * OTM side test and the liquidity/quality screens (bid>0, ask≥bid,
+   * mark ≥ `minMark`, spreadPct ≤ `maxSpreadPct`, openInterest ≥ `minOpenInterest`,
+   * dte > 0, resolvable IV, and `minAbsDelta` when a caller sets one — the live
+   * path does not). So this counts SURVIVING strikes, and the honest reading of a
+   * zero is "no in-band strike survived the liquidity screen", which is one step
+   * short of "the chain has no in-band strike".
+   */
+  strikesConsidered: number;
+  /**
+   * TRA-3619 — the measurement this field exists for. Candidates whose |Δ| is
+   * inside the band, counted BEFORE `classification === 'cheap'` is applied.
+   *
+   * {@link cheapInBand} is `cheap ∩ band`, so on a `fallback_top_mispricing` row
+   * it is 0 by construction and cannot separate two very different worlds:
+   *
+   *   • `strikesInBand: 0`  ⇒ the band is empty IN THE CHAIN. Nothing the branch
+   *     ordering does can help; the band edges are the question (TRA-3401).
+   *   • `strikesInBand ≥ 1` ⇒ the chain HAD in-band strikes and the cheapness
+   *     screen discarded them before the band filter ran. The branch ordering is
+   *     then the lever.
+   *
+   * The band is only consulted when the selector is armed, so this is 0 on the
+   * `legacy` (disarmed) branch — the same convention {@link cheapInBand} uses.
+   * `legacy` is its own key on the `bySelection` axis, so a dark-selector 0 can
+   * never be folded in with an armed branch's measured 0.
+   */
+  strikesInBand: number;
   /** The band applied, echoed so a verdict is readable without re-deriving it. */
   band: AdmissibleBand;
 }
@@ -171,14 +219,24 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
       selection: top ? 'legacy' : 'none',
       cheapConsidered: cheap.length,
       cheapInBand: 0,
+      strikesConsidered: candidates.length,
+      strikesInBand: 0,
       band,
     };
   }
 
-  const inBand = cheap.filter((c) => {
+  const inBandOf = (c: AdmissibleStrikeCandidate): boolean => {
     const abs = Math.abs(c.delta);
     return Number.isFinite(abs) && abs >= band.min && abs < band.max;
-  });
+  };
+
+  // TRA-3619 — the SAME band predicate, run once over the pre-cheapness set. It
+  // is deliberately the identical function rather than a re-implementation: the
+  // whole value of the count is that `strikesInBand === 0` and `cheapInBand === 0`
+  // are comparable, and two predicates that could drift apart would make the
+  // comparison meaningless.
+  const strikesInBand = candidates.filter(inBandOf).length;
+  const inBand = cheap.filter(inBandOf);
 
   if (inBand.length > 0) {
     return {
@@ -186,6 +244,8 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
       selection: 'in_band',
       cheapConsidered: cheap.length,
       cheapInBand: inBand.length,
+      strikesConsidered: candidates.length,
+      strikesInBand,
       band,
     };
   }
@@ -195,6 +255,8 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
     selection: top ? 'fallback_top_mispricing' : 'none',
     cheapConsidered: cheap.length,
     cheapInBand: 0,
+    strikesConsidered: candidates.length,
+    strikesInBand,
     band,
   };
 }

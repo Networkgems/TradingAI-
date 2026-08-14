@@ -1287,4 +1287,124 @@ describe('TRA-3459 — the gate is re-specified against a MEASURED calibration p
     expect(result.modeledH).toBe(MARKETABLE_MTM_DEFAULT_H);
     expect(result.fillRealism).toBe('SANDBOX_SIMULATED');
   });
+
+  /**
+   * TRA-3526 — the venue-liveness clause reaches the NOT_GRADEABLE terminal.
+   *
+   * `deadSnapClause` has one call site, in branch (2) SUFFICIENCY. The fitness terminal above
+   * returns first, so an `unfit` population's reason could carry NO liveness sentence at any
+   * value of `unpricedExitQuoteDropped`. Live 2026-08-13T09:15:46Z against SHA `c44a890030c6`:
+   * the pooled `quotedVerdict` is NOT_GRADEABLE and rendered the coverage prose 0x, while all
+   * four per-structure verdicts rendered it 4x.
+   *
+   * Nested inside the TRA-3459 block deliberately — it reuses `liveCorpus()`, the population
+   * whose terminal is the thing under test.
+   */
+  describe('TRA-3526 — the VENUE LIVENESS clause in the NOT_GRADEABLE terminal', () => {
+    /** The live book as a bare summary: `unfit`, and `unpricedExitQuoteDropped` = null. */
+    function unfitSummary() {
+      return summarizeMarketableMtm(
+        liveCorpus().map((r) => sampleFromRecord(r)).filter((s): s is NonNullable<typeof s> => s != null),
+        MARKETABLE_MTM_DEFAULT_H,
+      );
+    }
+
+    /** Same population, drop count forced — mirrors what the fold's `withUnpricedDrops` does. */
+    function unfitWithDrops(dropped: number | null) {
+      const s = unfitSummary();
+      return { ...s, quoteCoverage: { ...s.quoteCoverage, unpricedExitQuoteDropped: dropped } };
+    }
+
+    const verdictAt = (dropped: number | null) => marketableMtmQuotedVerdict(
+      unfitWithDrops(dropped), MARKETABLE_MTM_DEFAULT_TOL, MARKETABLE_MTM_DEFAULT_MIN_N,
+    );
+
+    // The fixture is only meaningful if it actually reaches the terminal rather than branch (2).
+    it('the fixture reaches the TERMINAL, not the sufficiency branch', () => {
+      const v = verdictAt(5);
+      expect(v.code).toBe('NOT_GRADEABLE');
+      expect(v.reason).toMatch(/NOT GRADEABLE ON THIS POPULATION/);
+      expect(v.reason).not.toMatch(/insufficient QUOTED-basis n/);
+    });
+
+    // T1 — positive.
+    it('T1: unfit x dropped=5 renders the liveness alarm and keeps the code terminal', () => {
+      const v = verdictAt(5);
+      expect(v.code).toBe('NOT_GRADEABLE');
+      expect(v.reason)
+        .toMatch(/VENUE LIVENESS — SEPARATE, AND ALSO TERMINAL: a further 5 record\(s\) were DROPPED/);
+    });
+
+    // T2 — the discriminator. Without this, "attributed and genuinely zero" and "clause never
+    // reached" are the same string, which is the null-vs-zero collapse this ticket is fixing.
+    it('T2: unfit x dropped=0 says so EXPLICITLY, and differs from the dropped>0 reason', () => {
+      const zero = verdictAt(0);
+      expect(zero.code).toBe('NOT_GRADEABLE');
+      expect(zero.reason).not.toMatch(/a further \d+ record\(s\) were DROPPED/);
+      expect(zero.reason).toMatch(/VENUE LIVENESS: not the problem here/);
+      // The inequality is the assertion that kills the bug; the matches above say which way.
+      expect(zero.reason).not.toBe(verdictAt(5).reason);
+    });
+
+    // T3 — the contradiction guard. A blind `deadSnapClause` append would satisfy T1/T2/T4 and
+    // fail HERE: its zero-branch promises a LEGACY DRAIN "which does resolve as round-trips
+    // accrue", three sentences after MORE ROWS OF THIS BOOK CANNOT FIX IT. Demonstrated RED
+    // against exactly that append before being trusted (TRA-3526 §4).
+    it.each([[0], [5], [null]] as const)(
+      'T3: the terminal never promises accrual resolves it (dropped=%s)', (dropped) => {
+        const v = verdictAt(dropped);
+        expect(v.code).toBe('NOT_GRADEABLE');
+        expect(v.reason).toMatch(/MORE ROWS OF THIS BOOK CANNOT FIX IT/);
+        expect(v.reason).not.toMatch(/LEGACY DRAIN/);
+        expect(v.reason).not.toMatch(/does resolve as/);
+      },
+    );
+
+    // T4 — null is not zero, at the terminal too.
+    it('T4: unfit x dropped=null reports NOT ATTRIBUTED rather than a false all-clear', () => {
+      const v = verdictAt(null);
+      expect(v.code).toBe('NOT_GRADEABLE');
+      expect(v.reason).toMatch(/NOT ATTRIBUTED at this level/);
+      expect(v.reason).not.toMatch(/a further \d+ record\(s\) were DROPPED/);
+      expect(v.reason).not.toMatch(/not the problem here/);
+    });
+
+    // T5 — THE test that closes the filed defect. T1-T4 only prove the clause CAN render, which
+    // is exactly what the 58 pre-existing dead-venue tests already proved while the POOLED
+    // reader saw nothing. This drives the real fold end-to-end.
+    it('T5: the POOLED quotedVerdict of an unfit book with real drops carries the count', () => {
+      const result = foldMarketableMtmForwardValidation([
+        ...liveCorpus(),
+        // Dead snaps built through the REAL writer — a hand-authored leg cannot produce this.
+        ...Array.from({ length: 3 }, () => writerRecord('long_call',
+          writerLeg('buy', { bid: 1.74, ask: 2.26 }, 2), writerLeg('sell', { ask: 5 }, 2))),
+      ]);
+
+      // The population is still the ungradeable one — dropped rows never enter the support.
+      expect(result.populationFitness.verdict).toBe('unfit');
+      expect(result.quoteCoverage.unpricedExitQuoteDropped).toBe(3);
+      expect(result.exclusions.unpriced_exit_quote).toBe(3);
+
+      // …and the POOLED reason — the string the live health route publishes — now says so.
+      expect(result.quotedVerdict.code).toBe('NOT_GRADEABLE');
+      expect(result.quotedVerdict.reason)
+        .toMatch(/VENUE LIVENESS — SEPARATE, AND ALSO TERMINAL: a further 3 record\(s\) were DROPPED/);
+      expect(result.quotedVerdict.reason).not.toMatch(/LEGACY DRAIN/);
+
+      // A liveness alarm may change the REASON, never the CODE. Folding `unfit` to REVIEW to
+      // reach branch (2) is the tempting two-line version and it is the TRA-2602 defect.
+      expect(result.quotedVerdict.reason).not.toMatch(/insufficient QUOTED-basis n/);
+    });
+
+    // The alarm has to be readable, not buried past the calibration boilerplate.
+    it('the clause lands BEFORE the calibration prose and AFTER the headline', () => {
+      const reason = verdictAt(5).reason;
+      const headline = reason.indexOf('NOT GRADEABLE ON THIS POPULATION');
+      const clause = reason.indexOf('VENUE LIVENESS');
+      const calibration = reason.indexOf('Calibration population:');
+      expect(headline).toBe(0);
+      expect(clause).toBeGreaterThan(headline);
+      expect(clause).toBeLessThan(calibration);
+    });
+  });
 });

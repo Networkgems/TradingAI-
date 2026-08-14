@@ -12,6 +12,107 @@ import {
 } from './eod-ledger-gap.js';
 
 /**
+ * TRA-3589 — the era label a row carries when it predates the
+ * {@link DailySnapshot.closingEquityBasis} stamp entirely.
+ *
+ * A string, not `null`, and deliberately so: `equitySourceEra` is the ONE field
+ * on the published row that is never absent and never null, so a reader that
+ * finds the KEY missing is reading a build older than this fix rather than a row
+ * whose provenance is merely unknown. Absence of the key is the evidence.
+ */
+export const EQUITY_SOURCE_ERA_UNSTAMPED = 'unstamped-pre-tra3349';
+
+/**
+ * TRA-3589 — name the surface that set a row's `closingEquity`, as an era label
+ * that always renders.
+ *
+ * The vocabulary is OPEN: `closingEquityBasis` is an enumerated string written by
+ * several writers over several tickets, and a classifier that folded an unknown
+ * value into a known bucket would launder a surface nobody has audited into one
+ * somebody has. So the label is the basis string VERBATIM whenever there is one,
+ * and the only closed decision in the module is the equality in
+ * {@link isBrokerEquityEra} against the single constant that means "broker NAV".
+ */
+export function equitySourceEraOf(basis: string | null | undefined): string {
+  return typeof basis === 'string' && basis !== '' ? basis : EQUITY_SOURCE_ERA_UNSTAMPED;
+}
+
+/**
+ * TRA-3589 — where a book's published equity series changes SURFACE, and the
+ * size of the step it takes when it does.
+ *
+ * The marker the CFO asked for in TRA-3589 ask 3, phrased as the invariant and
+ * not as "the re-source ran": every field here is derived from durable row state
+ * (two rows' basis stamps and their equity figures), so any later build can
+ * re-attest it, and a build that never observed the deploy still renders it
+ * correctly. Nothing is stamped onto a historical row — the era of a past row is
+ * READ from what that row already carries, never written back (TRA-2886/2888
+ * refuse back-fill, and a fabricated audit trail is worse than an honest gap).
+ */
+export interface EquitySourceEraBoundary {
+  /** First session whose `closingEquity` came from the broker, or `null` if none has. */
+  brokerOnsetDate: string | null;
+  /** That row's `openingEquity` — a `broker-prev-eod-balance` anchor. */
+  brokerOnsetOpeningEquity: number | null;
+  /** The newest measured row STRICTLY BEFORE the onset, i.e. the last pre-boundary close. */
+  priorEraRowDate: string | null;
+  priorEraRowEquitySourceEra: string | null;
+  priorEraRowClosingEquity: number | null;
+  /**
+   * `brokerOnsetOpeningEquity - priorEraRowClosingEquity`.
+   *
+   * THIS NUMBER IS NOT P&L AND MUST NOT BE REPORTED AS ONE, at any value, under
+   * any name. It is the same book re-measured on a different instrument on the
+   * first session after TRA-3349 went live; the onset row books it to neither
+   * `stockDaily`, nor `optionsDaily`, nor `netCashFlowUsd`, which is why it is
+   * invisible to every leg-level check and has to be named here instead.
+   *
+   * It is published as a SIGNED DOLLAR FIGURE rather than a boolean so it cannot
+   * decay the way a pinned verdict does: a second boundary on a third book moves
+   * it, and a reader who computed the delta by hand can match it to the cent.
+   */
+  restatementUsd: number | null;
+  /** Every era label present on this book's rows, with counts. Open vocabulary. */
+  eraCensus: Record<string, number>;
+  /**
+   * TRUE when this book has rows on BOTH sides of the boundary — i.e. when a
+   * cross-era subtraction is possible on its published series at all. This is
+   * the flag that says "a naive reader of this series can be wrong here".
+   */
+  seriesSpansBrokerBoundary: boolean;
+}
+
+/** TRA-3589 — the one closed decision: is this row's equity the BROKER's NAV? */
+export function isBrokerEquityEra(basis: string | null | undefined): boolean {
+  return basis === CLOSING_EQUITY_BASIS_BROKER;
+}
+
+/**
+ * TRA-3589 — THE INVARIANT, as a predicate.
+ *
+ * An equity delta is a measurement of P&L only when BOTH of its endpoints were
+ * read off the SAME surface. `closingEquity` on a `mode: live` book was the
+ * engine's demo PaperAccount until TRA-3349 (commit `eb1dcf0`, live
+ * 2026-08-12T10:39:01Z) re-sourced it from the broker FORWARD ONLY — so on both
+ * live books there is a date at which the series changes surface mid-flight, and
+ * a subtraction spanning it measures the change of surface, not the change of
+ * money.
+ *
+ * Stated as the invariant rather than as "the fixed writer ran", so any later
+ * build can attest it off durable row state: the operands are two rows' basis
+ * stamps and nothing else. Deliberately says NOTHING about whether two
+ * non-broker endpoints are mutually comparable — an unstamped row and an
+ * `engine-paper-account` row are both not-broker, and asserting more than that
+ * would be a fabricated audit trail.
+ */
+export function equitySpanCrossesSourceEra(
+  leftBasis: string | null | undefined,
+  rightBasis: string | null | undefined,
+): boolean {
+  return isBrokerEquityEra(leftBasis) !== isBrokerEquityEra(rightBasis);
+}
+
+/**
  * TRA-1633 FIX 3 — cross-surface P&L reconciliation guard.
  *
  * The board asked that the four daily-P&L surfaces (trade journal / PnL tracker /
@@ -153,6 +254,17 @@ export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
 export const PNL_COMBINED_AGREEMENT_NOTE =
   'TRA-3517: `engines[].combinedAgreementOk` / `days[].combinedAgreement` is the reader that REPLACES `drift` on a broker-shaped row. TRA-3349 correctly suppressed `drift` to null there (the `eodCombined == stockDaily + optionsDaily` identity is an engine-book decomposition a broker row does not satisfy), and that suppression removed the ONLY automated cross-check watching `combinedPnl` on live books; the row/report agreement meant to replace it was published on neither side, so a future divergence between the TRA-359 override and the stored row would have been silent. READ A GREEN NARROWLY. Both sides are written from the SAME `override` object on the same tick (`applyTradierBalanceOverride` for the report, `shapeLiveRecordedRow` for the row), so agreement holds BY CONSTRUCTION today and is NOT independent corroboration that the broker figure is right — it would read exactly the same if the figure were wrong on both. What it can catch is the two stores DRIFTING APART later: a re-generated report, a back-fill, a clobber, or a refactor that stops threading the override into the row. The axis is graded ONLY where the claim is made (row `closingEquityBasis: \'broker-eod-balance\'` AND report `pnlSource: \'tradier-balance\'`); everywhere else it is `\'not-measured\'` with a reason, and `\'not-measured\'` MUST NEVER be folded into `\'agree\'` — on the broker-shaped cohort a vacuous true is the same reading as a real pass. `combinedAgreementOk: null` means NOTHING THAT COULD HAVE FAILED was looked at; report that state as `unknown`, never as clean. TWO DENOMINATORS, AND THEY DIFFER: `combinedAgreementGradeableCount` is how many sessions the axis GRADED, `combinedAgreementDiscriminatingCount` is how many of those could have read `disagree` (at least one side materially non-zero) — and the verdict keys on the SECOND. A session where the row and the report both read 0.00 emits `agree` however broken the wiring is, so it is a measurement and not evidence. First live read of this axis, 2026-08-13T08:39Z on build 3877000: graded 2, discriminating 1 — `admin` 2026-08-12 at -0.10 vs -0.10 is the real one, `v0nni` 2026-08-12 at 0.00 vs 0.00 is degenerate. Quote the discriminating count beside any verdict; the graded count alone doubles the apparent coverage of a single session. Also read `combinedPnlNoReaderDates` (real-money sessions whose `combinedPnl` neither reader observes).';
 
+/**
+ * TRA-3589 — the NAV source-of-record boundary, in band.
+ *
+ * Filed by the CFO off an independent pull: on 2026-08-12 both `mode: live`
+ * books changed the surface their equity is read from and stepped down in the
+ * same session, with `netCashFlowUsd: 0`. The change was intended and is an
+ * improvement; what was missing was any statement of it inside the data.
+ */
+export const PNL_EQUITY_SOURCE_ERA_NOTE =
+  'TRA-3589: `closingEquity` on a `mode: live` book changed SOURCE OF RECORD mid-series. TRA-3349 (commit `eb1dcf0`, authored 2026-08-12 06:36 ET, live on bqb1 2026-08-12T10:39:01Z) re-sourced the live recorded row from the broker `tradier-eod-balance` file, FORWARD ONLY — historical rows were deliberately NOT restated, because back-fill is refused (TRA-2886/2888) and a fabricated audit trail is worse than an honest gap. Before that boundary a live book\'s `closingEquity` was `PaperAccount.getState().totalEquity`, written unconditionally at `index.ts:2058` — on a live book that is the PRESERVED DEMO seed, a constant no live fill or option credit can move (TRA-3288, RULED). So EVERY live NAV figure this endpoint published before 2026-08-12 was demo-sourced, and the numbers on either side of the boundary are not the same measurement. FIRST BOUNDARY, MEASURED: `admin` 2026-08-11 close 2603.49 -> 2026-08-12 open 1144.06 (step -1459.43); `v0nni` 25000.00 -> 400.00 (step -24600.00); combined -26059.43. Both onset rows carry `netCashFlowUsd: 0`, `stockDaily: 0` and `optionsDaily: 0`, so the step is booked to NO leg and is invisible to every leg-level check — which is why it is named here instead. THE INVARIANT: an equity delta is a P&L measurement only when BOTH endpoints were read off the SAME surface. Read `days[].equitySourceEra` (always present, never null — the basis string verbatim, or `\'unstamped-pre-tra3349\'`; if the KEY itself is missing you are reading a build older than this fix), `engines[].equitySourceEraBoundary` per book, and `liveEquitySourceEraBoundaryBooks` / `liveEquitySourceEraRestatementUsd` fleet-wide. `restatementUsd` IS NOT P&L AND MUST NOT BE REPORTED, ESCALATED OR BUDGETED AS A LOSS, at any value, under any name — it is the same book re-measured on a different instrument. WHAT THIS ALREADY CONTAMINATED: `engines[].postBaselineEquityGrowth` differences `closingEquity[last] - closingEquity[first]` across the whole post-baseline window, and since 2026-08-12 those endpoints straddle the boundary — the SAME cross-surface error TRA-3288 gated out of `postOnsetCredit`, relocated from across-books to across-time. Live on build `4cac8b70ee3c` 2026-08-13T18:27Z it published `v0nni.uncreditedOptionsUsd: 24600.00` on a book with `liveOptionsOnsetDate: null` and `postBaselineOptionsRealized: 0` — a book that has never opened an option in any mode, so 100% of that "options money missing from NAV" was the surface change; `admin` carried 1371.12 the same way, and the fleet fold `liveUncreditedOptionsUsdUnscoped` published their sum 25971.12, against 733.60 (2026-07-30) and 371.59 (2026-08-05). `uncreditedOptionsUsd` now reads NOT MEASURED with `uncreditedOptionsNotMeasuredReason: \'equity-span-crosses-equity-source-era\'` on any book whose window straddles, and `liveUncreditedOptionsUsdUnscoped` follows it to `null` (never 0). THE OPERANDS STAY PUBLISHED — `postBaselineEquityGrowth`, `postBaselineOptionsRealized` and `postBaselineStockDaily` are unchanged, because deleting the arithmetic would destroy the evidence the refusal rests on. NOT AFFECTED: the dashboard / daily-P&L baseline still rebases on the paper equity (`engines[].anchor` read 2603.49 basis `day-roll-state-equity` on 2026-08-13, i.e. it did NOT follow the row), so the step does not surface there as a one-day loss; and `postOnsetCredit` was already refusing with `equity-anchor-not-broker-sourced`. This suppression is NOT a cohort eviction: the boundary is published as a signed dollar figure per named book, so a second boundary on a third book moves it.';
+
 /** Two legers never reconciled — surfaced in the endpoint output as a caveat. */
 export const PNL_RECONCILIATION_CAVEATS = [
   'The account calendar reads the user\'s personal engine book; the Desk calendar + demo back-fill read the firm-wide option-trade-journal.jsonl — the SAME date can show different numbers for the operator vs the trading accounts. These two ledgers are never reconciled by design.',
@@ -166,6 +278,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_COMBINED_AGREEMENT_NOTE,
+  PNL_EQUITY_SOURCE_ERA_NOTE,
 ];
 
 /**
@@ -591,6 +704,20 @@ export interface PnlReconcileDay {
    * rows this field exists to disqualify.
    */
   closingEquityBasis: string | null;
+  /**
+   * TRA-3589 — the same provenance as {@link closingEquityBasis}, rendered so it
+   * can never be absent: the basis string verbatim, or
+   * {@link EQUITY_SOURCE_ERA_UNSTAMPED} on a row written before the stamp
+   * existed. See {@link equitySourceEraOf}.
+   *
+   * WHY A SECOND FIELD FOR THE SAME FACT. `closingEquityBasis: null` is read by
+   * a human as "provenance unknown", and on a `mode: live` book that is exactly
+   * wrong — the provenance IS known (TRA-3288 ruled it the demo PaperAccount,
+   * written unconditionally at `index.ts:2058`), it is simply not written down.
+   * A silence and a disclosure must not render identically. This field always
+   * renders, so the absence of the KEY means "old build", never "old row".
+   */
+  equitySourceEra: string;
   /**
    * TRA-3288 item 2 — signed broker cash flow over the span this row's equity
    * delta covers (see {@link DailySnapshot.netCashFlowUsd}). `null` is NOT
@@ -1302,8 +1429,24 @@ export interface PnlReconcileResult {
    * double-count that must not be denominated into an equity backfill).
    */
   uncreditedOptionsUsd: number | null;
+  /**
+   * TRA-3589 — why {@link uncreditedOptionsUsd} is `null`, or `null` when it is
+   * a number. `'equity-span-crosses-equity-source-era'` is the TRA-3349
+   * boundary: the window's two equity endpoints were read off different
+   * surfaces, so their difference is not a P&L measurement at any value.
+   */
+  uncreditedOptionsNotMeasuredReason: string | null;
   /** TRA-2635 — the three operands, published so the subtraction is checkable. */
   postBaselineEquityGrowth: number | null;
+  /**
+   * TRA-3589 — TRUE when {@link postBaselineEquityGrowth}'s two endpoints sit on
+   * either side of the broker boundary, i.e. when that number measures a change
+   * of instrument rather than a change of money. The operand stays published
+   * when this is `true`; only the derived verdict refuses.
+   */
+  postBaselineEquityGrowthSpansEquitySourceEras: boolean;
+  /** TRA-3589 — where this book's equity changed surface. See {@link EquitySourceEraBoundary}. */
+  equitySourceEraBoundary: EquitySourceEraBoundary;
   postBaselineOptionsRealized: number;
   postBaselineStockDaily: number;
   /**
@@ -1477,12 +1620,17 @@ export function summarizeLiveCreditObservation(
     optionsRealizedBeforeLiveOnsetUsd: number;
     preLiveOnsetOptionsDates: string[];
     postOnsetCredit: PostOnsetLiveCredit;
+    uncreditedOptionsNotMeasuredReason: string | null;
+    postBaselineEquityGrowthSpansEquitySourceEras: boolean;
+    equitySourceEraBoundary: EquitySourceEraBoundary;
   }>,
 ): {
   liveCreditBookCount: number;
   liveEquityAbsorbedOptionsOk: boolean | null;
   liveUncreditedOptionsUsd: number | null;
   liveUncreditedOptionsUsdUnscoped: number | null;
+  liveEquitySourceEraBoundaryBooks: Array<Record<string, unknown>>;
+  liveEquitySourceEraRestatementUsd: number | null;
   liveUncreditedOptionsGradeable: boolean;
   liveModeSpanContaminatedBooks: Array<Record<string, unknown>>;
   liveCounterDurableOk: boolean | null;
@@ -1496,6 +1644,13 @@ export function summarizeLiveCreditObservation(
 } {
   const liveBooks = engines.filter(e => e.mode === 'live');
   const measurable = liveBooks.filter(e => e.uncreditedOptionsUsd != null);
+  // TRA-3589 — the live books whose published equity series changes surface
+  // mid-flight. A SET of named books with their dates and dollar steps, never a
+  // boolean and never a count: a boolean pinned `true` by `admin` and `v0nni`
+  // stops discriminating the moment a third book joins them, and a count is dead
+  // the same way once one entity permanently occupies slot one.
+  const eraBoundaryBooks = liveBooks.filter(e =>
+    e.equitySourceEraBoundary.seriesSpansBrokerBoundary);
   // TRA-2831 — a measurable book whose numerator is (partly) demo money. The
   // dollar figure is arithmetically fine; what is wrong is calling it LIVE.
   const contaminated = measurable.filter(e =>
@@ -1549,6 +1704,38 @@ export function summarizeLiveCreditObservation(
     // would destroy the evidence the suspension rests on, and a reader comparing
     // this to `liveUncreditedOptionsUsd` can see the disqualification directly.
     liveUncreditedOptionsUsdUnscoped: unscoped,
+    // TRA-3589 — THE MARKER, at the fleet level: which live books' equity series
+    // changes surface, where, and by how much. Published beside the numbers it
+    // disqualifies so a reader cannot find one without the other.
+    //
+    // Until 2026-08-12 both entries here were absent and `*Unscoped` published
+    // 733.60 / 371.59; on 2026-08-13 it published 25,971.12, of which 24,600.00
+    // came from a book that has never opened an option. That jump WAS the
+    // boundary, and nothing in the payload said so.
+    liveEquitySourceEraBoundaryBooks: eraBoundaryBooks.map(e => ({
+      username: e.username,
+      brokerOnsetDate: e.equitySourceEraBoundary.brokerOnsetDate,
+      brokerOnsetOpeningEquity: e.equitySourceEraBoundary.brokerOnsetOpeningEquity,
+      priorEraRowDate: e.equitySourceEraBoundary.priorEraRowDate,
+      priorEraRowEquitySourceEra: e.equitySourceEraBoundary.priorEraRowEquitySourceEra,
+      priorEraRowClosingEquity: e.equitySourceEraBoundary.priorEraRowClosingEquity,
+      restatementUsd: e.equitySourceEraBoundary.restatementUsd,
+      eraCensus: e.equitySourceEraBoundary.eraCensus,
+      uncreditedOptionsNotMeasuredReason: e.uncreditedOptionsNotMeasuredReason,
+      // The operand kept visible beside the verdict it disqualifies.
+      postBaselineEquityGrowth: e.postBaselineEquityGrowth,
+      postBaselineOptionsRealized: e.postBaselineOptionsRealized,
+      postBaselineStockDaily: e.postBaselineStockDaily,
+    })),
+    // The combined step, published so the -26,059.43 a reader can compute is
+    // already named. NOT a loss, NOT a cash movement, NOT P&L — see
+    // {@link EquitySourceEraBoundary.restatementUsd}. `null` (never 0) when no
+    // live book has both endpoints, so "no boundary yet" and "the boundary
+    // netted to zero" cannot render alike.
+    liveEquitySourceEraRestatementUsd: eraBoundaryBooks.length === 0
+      ? null
+      : round2(eraBoundaryBooks.reduce(
+        (s, e) => s + (e.equitySourceEraBoundary.restatementUsd ?? 0), 0)),
     // TRA-2919 — REDEFINED, and read this before grading it.
     //
     // It used to mean "the day-cell figure above is attributable live money",
@@ -1611,6 +1798,12 @@ export function summarizeLiveCreditObservation(
       closingEquityLatest: e.closingEquityLatest,
       closingEquityLatestDate: e.closingEquityLatestDate,
       uncreditedOptionsUsd: e.uncreditedOptionsUsd,
+      // TRA-3589 — a `null` above now always carries its reason, so a suppressed
+      // figure and an unreachable one do not read alike on the book list.
+      uncreditedOptionsNotMeasuredReason: e.uncreditedOptionsNotMeasuredReason,
+      equitySourceEraBoundary: e.equitySourceEraBoundary,
+      postBaselineEquityGrowthSpansEquitySourceEras:
+        e.postBaselineEquityGrowthSpansEquitySourceEras,
       postBaselineEquityGrowth: e.postBaselineEquityGrowth,
       postBaselineOptionsRealized: e.postBaselineOptionsRealized,
       postBaselineStockDaily: e.postBaselineStockDaily,
@@ -2844,6 +3037,10 @@ export function reconcilePnl(
           typeof s.closingEquityBasis === 'string' && s.closingEquityBasis !== ''
             ? s.closingEquityBasis
             : null,
+        // TRA-3589 — the SAME fact, rendered so it is never absent. This is the
+        // one field on the row that a null-tolerant reader cannot mistake for
+        // "not applicable"; see {@link PnlDayRow.equitySourceEra}.
+        equitySourceEra: equitySourceEraOf(s.closingEquityBasis),
         // TRA-3288 item 2 — absent reads `null` (NOT MEASURED), the same rule
         // as every other flow-through here. `round2(null)` would be 0, and an
         // assumed-zero cash flow books a deposit as P&L.
@@ -3380,6 +3577,89 @@ export function reconcilePnl(
       : round2(lastEquity - firstEquity);
   const postBaselineOptionsRealized = round2(spanned.reduce((s, d) => s + d.optionsDaily, 0));
   const postBaselineStockDaily = round2(spanned.reduce((s, d) => s + d.stockDaily, 0));
+  // TRA-3589 — WHERE THIS BOOK'S EQUITY CHANGED SURFACE, and by how much.
+  //
+  // TRA-3349 (`eb1dcf0`, live 2026-08-12T10:39:01Z) re-sourced the live recorded
+  // row's equity from the broker FORWARD ONLY — by design, and correctly: no
+  // historical row was restated, because back-fill is refused (TRA-2886/2888).
+  // The unavoidable consequence is a discontinuity inside a single published
+  // series: the onset row's `openingEquity` is a BROKER anchor while the row
+  // immediately before it closed on the demo PaperAccount. On 2026-08-12 that
+  // step was -1,459.43 on `admin` and -24,600.00 on `v0nni`, with
+  // `netCashFlowUsd: 0`, `stockDaily: 0` and `optionsDaily: 0` — i.e. it is
+  // NOT a cash movement and NOT P&L, it is the same book measured on a
+  // different instrument. Published so a reader who computes that delta finds it
+  // already named, rather than discovering a $26k one-day loss that never
+  // happened.
+  const brokerRows = days.filter(d => isBrokerEquityEra(d.closingEquityBasis));
+  const brokerOnsetRow = brokerRows[0] ?? null;
+  const priorEraRow = brokerOnsetRow === null
+    ? null
+    : [...days].reverse().find(d =>
+      d.date < brokerOnsetRow.date && Number.isFinite(d.closingEquity)) ?? null;
+  const eraCensus = days.reduce<Record<string, number>>((acc, d) => {
+    const era = equitySourceEraOf(d.closingEquityBasis);
+    acc[era] = (acc[era] ?? 0) + 1;
+    return acc;
+  }, {});
+  const equitySourceEraBoundary: EquitySourceEraBoundary = {
+    brokerOnsetDate: brokerOnsetRow?.date ?? null,
+    brokerOnsetOpeningEquity: brokerOnsetRow?.openingEquity ?? null,
+    priorEraRowDate: priorEraRow?.date ?? null,
+    priorEraRowEquitySourceEra: priorEraRow === null
+      ? null
+      : equitySourceEraOf(priorEraRow.closingEquityBasis),
+    priorEraRowClosingEquity: priorEraRow?.closingEquity ?? null,
+    // The step across the boundary. NOT P&L — see the field doc. `null` unless
+    // BOTH endpoints exist, never 0: a manufactured zero here would read as
+    // "the surfaces agreed", which is the one conclusion this field must never
+    // be able to state by absence.
+    restatementUsd:
+      brokerOnsetRow === null
+      || priorEraRow === null
+      || brokerOnsetRow.openingEquity === null
+      || priorEraRow.closingEquity === null
+        ? null
+        : round2(brokerOnsetRow.openingEquity - priorEraRow.closingEquity),
+    eraCensus,
+    seriesSpansBrokerBoundary: brokerOnsetRow !== null && priorEraRow !== null,
+  };
+  // TRA-3589 — does the `postBaseline*` window itself straddle the boundary?
+  //
+  // This is the defect, and it is the TRA-3288 finding a second time in an
+  // adjacent metric. TRA-3288 gated `postOnsetCredit` on the anchor rows'
+  // broker basis (`equity-anchor-not-broker-sourced`) because differencing a
+  // broker figure against a demo figure is meaningless. It did NOT gate the
+  // older day-cell `postBaselineEquityGrowth`, which differences
+  // `closingEquity[last] - closingEquity[first]` over the whole post-baseline
+  // window — and since 2026-08-12 those two endpoints sit on DIFFERENT
+  // surfaces. Same error, moved from across-books to across-time.
+  //
+  // Measured live on bqb1 2026-08-13T18:27Z, build `4cac8b70ee3c`: `v0nni`
+  // published `uncreditedOptionsUsd: 24600.00` — on a book with
+  // `liveOptionsOnsetDate: null`, `postBaselineOptionsRealized: 0` and
+  // `postBaselineStockDaily: 0`. It has never traded an option in any mode, so
+  // every cent of that "options money missing from NAV" is the 25,000.00 ->
+  // 400.00 surface change and nothing else. `admin` carried the same artifact at
+  // 1,371.12 (its -1,459.43 step), and the fleet fold
+  // `liveUncreditedOptionsUsdUnscoped` published their sum, 25,971.12 — against
+  // 733.60 on 2026-07-30 and 371.59 on 2026-08-05.
+  const postBaselineEquityGrowthSpansEquitySourceEras =
+    evaluatedEquity.length >= 2
+    && equitySpanCrossesSourceEra(
+      evaluatedEquity[0]!.closingEquityBasis,
+      evaluatedEquity[evaluatedEquity.length - 1]!.closingEquityBasis,
+    );
+  // The VERDICT refuses; the OPERANDS stay published. Deleting
+  // `postBaselineEquityGrowth` would destroy the evidence this refusal rests on
+  // — the same reason TRA-2831 kept 733.60 visible while suspending it. A reader
+  // can still see -24,600.00 sitting next to the boundary that explains it.
+  const uncreditedOptionsNotMeasuredReason: string | null =
+    postBaselineEquityGrowth == null
+      ? 'equity-growth-not-measured'
+      : postBaselineEquityGrowthSpansEquitySourceEras
+        ? 'equity-span-crosses-equity-source-era'
+        : null;
   // TRA-2831 — decompose the numerator by whether the book was demonstrably live
   // on the session. Computed over `spanned`, the SAME rows the numerator sums, so
   // `optionsRealizedBeforeLiveOnsetUsd` is a true partition of
@@ -3489,15 +3769,18 @@ export function reconcilePnl(
       days.reduce((m, d) => Math.max(m, Math.abs(d.unbookedEquityMoveUsd ?? 0)), 0),
     ),
     postBaselineEquityGrowth,
+    postBaselineEquityGrowthSpansEquitySourceEras,
+    equitySourceEraBoundary,
     postBaselineOptionsRealized,
     postBaselineStockDaily,
     liveOptionsOnsetDate,
     optionsRealizedBeforeLiveOnsetUsd,
     preLiveOnsetOptionsDates: preLiveOnsetRows.map(d => d.date),
     postOnsetCredit,
-    uncreditedOptionsUsd: postBaselineEquityGrowth == null
+    uncreditedOptionsUsd: uncreditedOptionsNotMeasuredReason !== null || postBaselineEquityGrowth == null
       ? null
       : round2(postBaselineOptionsRealized + postBaselineStockDaily - postBaselineEquityGrowth),
+    uncreditedOptionsNotMeasuredReason,
     optionsCreditedMeasuredCount: creditMeasurableDays.length,
     optionsCreditedDates,
     optionsCreditedLatest: creditWritten.length === 0

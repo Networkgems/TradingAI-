@@ -106,6 +106,10 @@ import {
 // is pure and lives in its own module so the partition can be graded (dry run)
 // before a single byte is appended.
 import { planStaleOpenRepair, RECONSTRUCTED_EXIT_REASON } from './tra3485-stale-open-repair.js';
+// TRA-3547 — the same repair, SELF-DRIVING. The route above is admin-gated and
+// admin writes are unreachable on bqb1, so left as a route alone it would never
+// run against the rows it was written for (the TRA-1954 -> TRA-2810 lesson).
+import { runZombieOpenSweep } from './zombie-open-journal-sweep.js';
 // TRA-2214 — the EOD journal blocks fold HERE, not inline, so this module holds
 // no bare fold that could be fed a differently-sourced (pooled) row list.
 import { foldModelFacingEodJournal } from './model-facing-journal.js';
@@ -4632,6 +4636,33 @@ async function buildLiveFeeReconcileClient(): Promise<TradierOptionsClient | nul
 setTimeout(() => {
   void runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
 }, 90_000).unref();
+
+// TRA-3547 — everything the zombie-open sweep touches, in one place. Injected
+// rather than imported inside the module so the pass is testable without the
+// process-global journal, and so the LEDGER it discriminates against is the same
+// `summarizeLiveOptionsFeeSlippage()` the repair route reads. Both writers are
+// the production fold entry points: `recordOptionTradeVoid` still refuses a row
+// that is not OPEN, so the sweep cannot route around the guard.
+const zombieOpenSweepDeps = {
+  journalEnabled: () => isOptionTradeJournalEnabled(),
+  listLiveJournalRows: () => listOptionTradeJournal({ mode: 'live' }),
+  readLedger: () => {
+    const s = summarizeLiveOptionsFeeSlippage();
+    return { n: s.n, records: s.records, durability: s.durability };
+  },
+  recordClose: async (id: string, close: Parameters<typeof recordOptionTradeClose>[1]) => {
+    await recordOptionTradeClose(id, close);
+  },
+  recordVoid: (id: string, reason: string) => recordOptionTradeVoid(id, reason),
+};
+
+// TRA-3547 — kick ONE sweep after boot (the hourly tick also runs it). 120s sits
+// deliberately AFTER the 90s fee reconcile: the fee join is what fills in a
+// record's commission, and a close back-filled before it lands would carry a
+// `feesComplete: false` P&L that nothing ever revisits.
+setTimeout(() => {
+  void runZombieOpenSweep(zombieOpenSweepDeps);
+}, 120_000).unref();
 
 // TRA-2048 (parent TRA-2044) — rebuild the durable LIVE gate-enforcement ledger
 // (cost-bar + spread veto promoted from shadow to enforcing) and remember DATA_DIR
@@ -15221,6 +15252,13 @@ scheduler.start({
     // ledger row still fees:null. Self-quenching (zero IO once nothing is unmeasured)
     // and internally best-effort — it cannot throw into this tick.
     await runLiveOptionsFeeReconcile(buildLiveFeeReconcileClient);
+    // TRA-3547 — resolve live journal rows the broker tape says are NOT open:
+    // back-fill the CLOSE for a real round trip, retract a row that never
+    // filled, refuse anything ambiguous. Runs AFTER the fee reconcile above so a
+    // reconstructed P&L sees this hour's commissions. Pure local IO (journal +
+    // fill ledger, no broker call), self-quenching, and internally best-effort —
+    // it cannot throw into this tick.
+    await runZombieOpenSweep(zombieOpenSweepDeps);
   },
   // TRA-849 — 8:30 AM ET pre-market morning brief. Renders the macro gate +
   // each user's watchlist setups, open book, and overnight news, then pushes
