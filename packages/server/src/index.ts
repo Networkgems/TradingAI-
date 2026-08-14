@@ -630,6 +630,7 @@ import {
 } from './users.js';
 import { sendPasswordResetEmail, sendOtpEmail, sendWelcomeEmail } from './email.js';
 import { startEventLoopWatchdog, type WatchdogHandle } from './event-loop-watchdog.js';
+import { installStdioBlockMeter } from './stdio-block-meter.js';
 import {
   logger,
   flushLogs,
@@ -15447,6 +15448,23 @@ httpServer.listen(PORT, () => {
 // exits(1) for a clean Render restart, instead of hanging indefinitely in 502
 // limbo. Monitoring is cheap and on by default; restart action is on by default
 // (env-disableable). Started AFTER listen so a slow boot never trips it.
+// TRA-3660 (AC1) — install the stdio write-block meter BEFORE the watchdog, so
+// the very first trip already carries write attribution.
+//
+// `process.stdout`/`stderr` writes to a pipe are SYNCHRONOUS on Linux, and Render
+// collects container output through a pipe. When the collector stalls, the 64 KiB
+// kernel pipe buffer fills and the next `write(2)` blocks the entire process —
+// measured at 3684.7ms against a 4000ms stall by
+// `scripts/tra3660-log-storm-loop-lag.mjs`, versus 33.8ms for the identical write
+// volume with the reader draining. That block has no JS frame of ours on the
+// stack, so no phase wraps it and no stack sample can reach it (the watchdog's own
+// timer cannot fire during a synchronous block). Timing the write is the only
+// place the block is visible, and it lands in `slowSyncPhase` — the field the
+// 2026-08-13T14:18:47Z trip read as `null`.
+installStdioBlockMeter();
+
+// TRA-1080 — event-loop/heap starvation watchdog. Detects the bqb1 "HTTP
+// listener dead while worker timers live" state from inside the process.
 const eventLoopWatchdog: WatchdogHandle | null = startEventLoopWatchdog();
 
 /**

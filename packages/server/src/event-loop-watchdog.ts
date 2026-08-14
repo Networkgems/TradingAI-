@@ -52,6 +52,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { logger, flushLogs } from './observability/index.js';
 import { getPhaseAttribution, type PhaseAttribution, type SlowPhase } from './phase-timing.js';
+import { getStdioBlockSnapshot, type StdioBlockSnapshot } from './stdio-block-meter.js';
 
 const log = logger.child({ module: 'event-loop-watchdog' });
 
@@ -123,6 +124,112 @@ export interface PersistedTrip {
    * pointer). `elapsedMs` is how long that phase had been running at trip time.
    */
   activePhase?: { name: string; elapsedMs: number } | null;
+  /**
+   * TRA-3660 — did anything we own actually NAME this block?
+   *
+   * The 2026-08-13T14:18:47Z trip recorded `lagMaxMs 4060` with `slowSyncPhase:
+   * null`, and because the process that stalled is gone, nobody can ever say what
+   * blocked. That is an attribution GAP, and until this field existed the gap was
+   * indistinguishable from "nothing blocked" — a null read that a hurried reader
+   * scores as evidence of health. Now the breadcrumb states which of the two it
+   * is, in the record itself, at the moment of the trip. See
+   * {@link classifyBlockAttribution} for the four verdicts and why staleness
+   * matters (a sync phase from an hour ago is not this block's culprit).
+   */
+  attribution?: BlockAttribution;
+  /**
+   * TRA-3660 — the stdio write meter at trip time (see `stdio-block-meter.ts`).
+   *
+   * `process.stdout`/`stderr` writes to a pipe are SYNCHRONOUS on Linux, so a
+   * stalled log collector blocks the whole process inside `write(2)` — no JS
+   * frame of ours on the stack, no phase to wrap, and unreachable by a stack
+   * sample because the watchdog's own timer cannot fire during the block. The
+   * meter times the write itself, and `topEmitters` names who was writing DURING
+   * the block, which is the one class of evidence that survives it. Optional so
+   * pre-existing trip files stay readable.
+   */
+  stdio?: StdioBlockSnapshot;
+}
+
+/**
+ * TRA-3660 — how well the instruments explain a `block`/`lag` trip's lag.
+ *
+ * - `not-a-block-trip`  — a `heap`/`rss` trip; loop attribution is not the question.
+ * - `attributed`        — a `sync` phase ended inside this block's window and is
+ *                         long enough to account for most of the measured lag.
+ * - `partial`           — a fresh `sync` phase exists but is far too short to
+ *                         explain the lag. Something ELSE held most of it. This
+ *                         verdict exists because a plausible-looking non-null
+ *                         `slowSyncPhase` is more dangerous than a null one.
+ * - `unattributed-stale`— the only `sync` phase on record ended before this block
+ *                         even started. It is a fossil, not the culprit.
+ * - `unattributed-none` — no `sync` phase at all. THE 2026-08-13 SHAPE.
+ */
+export type BlockAttributionVerdict =
+  | 'not-a-block-trip'
+  | 'attributed'
+  | 'partial'
+  | 'unattributed-stale'
+  | 'unattributed-none';
+
+export interface BlockAttribution {
+  verdict: BlockAttributionVerdict;
+  /** How far back a `sync` phase had to end to be a candidate for this block. */
+  windowMs: number;
+  /** Age (ms) of the `sync` phase considered, or null when there was none. */
+  syncPhaseAgeMs: number | null;
+  /** Share of the measured lag the considered `sync` phase accounts for, or null. */
+  explainedFraction: number | null;
+}
+
+/**
+ * At least this share of the measured lag must be accounted for by a fresh `sync`
+ * phase before the block counts as explained. Below it the honest verdict is
+ * `partial` — a 1.1s phase does not explain a 4.1s block, and calling it the
+ * culprit is how a root cause gets closed on the wrong code.
+ */
+export const ATTRIBUTION_EXPLAINED_MIN = 0.5;
+
+/** Slack (ms) added to the candidate window for clock granularity and rounding. */
+const ATTRIBUTION_SLACK_MS = 1_000;
+
+/**
+ * Decide whether a trip's lag is explained by the phase instrument. Pure, so the
+ * verdict is unit-testable without timers, a live process, or a real stall.
+ *
+ * The candidate window is `lagMaxMs + sampleMs + slack` back from the trip: the
+ * block lasted at most `lagMaxMs`, and the watchdog can only evaluate AFTER the
+ * loop resumes, up to one sample period later. A `sync` phase that ended outside
+ * that window belongs to an earlier block and must not be read as this one's
+ * culprit — the exact fossil-vs-fresh mistake that made 21 boot echoes look like
+ * 21 trips on a day that had one.
+ */
+export function classifyBlockAttribution(input: {
+  reason: 'heap' | 'lag' | 'block' | 'rss' | undefined;
+  tripAtMs: number;
+  lagMaxMs: number;
+  sampleMs: number;
+  slowSyncPhase: SlowPhase | null | undefined;
+}): BlockAttribution {
+  const windowMs = Math.max(0, input.lagMaxMs) + Math.max(0, input.sampleMs) + ATTRIBUTION_SLACK_MS;
+  if (input.reason !== 'block' && input.reason !== 'lag') {
+    return { verdict: 'not-a-block-trip', windowMs, syncPhaseAgeMs: null, explainedFraction: null };
+  }
+  const phase = input.slowSyncPhase;
+  if (!phase) {
+    return { verdict: 'unattributed-none', windowMs, syncPhaseAgeMs: null, explainedFraction: null };
+  }
+  const ageMs = input.tripAtMs - phase.atMs;
+  if (!(ageMs <= windowMs)) {
+    return { verdict: 'unattributed-stale', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: null };
+  }
+  // Guard the denominator: a zero/negative lag cannot be a share of anything, and
+  // dividing by it would publish Infinity as a confident-looking number.
+  const explained = input.lagMaxMs > 0 ? phase.durationMs / input.lagMaxMs : null;
+  if (explained == null || !(explained >= ATTRIBUTION_EXPLAINED_MIN)) {
+    return { verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
+  }
+  return { verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
 }
 
 // TRA-1463 — periodic LIVENESS breadcrumb. `lastTrip` above only records a
@@ -837,6 +944,13 @@ export interface WatchdogStatus {
    * self-restart. Absent until the first slow phase is recorded.
    */
   phaseAttribution?: PhaseAttribution;
+  /**
+   * TRA-3660 — live stdio write-block meter. Readable WITHOUT waiting for a trip,
+   * so a stalled collector that holds the loop 3s (under the 4s acute threshold,
+   * therefore invisible to every trip-based instrument) is still observable from a
+   * single `/api/health/watchdog` poll. Absent when the meter is not installed.
+   */
+  stdio?: StdioBlockSnapshot;
 }
 
 export interface WatchdogHandle {
@@ -863,6 +977,12 @@ export interface StartWatchdogOptions {
    * the global phase-timing state.
    */
   readPhaseAttribution?: () => PhaseAttribution;
+  /**
+   * TRA-3660 — stdio write-block meter reader (defaults to the module getter).
+   * Injectable so a test can drive the "the block was inside write(2)" path
+   * without stalling a real pipe.
+   */
+  readStdioBlock?: () => StdioBlockSnapshot;
 }
 
 let lastStatus: WatchdogStatus | null = null;
@@ -929,6 +1049,15 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   const readHeap = opts.readHeap ?? defaultReadHeap;
   const onTrip = opts.onTrip ?? defaultOnTrip;
   const readPhaseAttribution = opts.readPhaseAttribution ?? getPhaseAttribution;
+  // TRA-3660 — guarded: an observability read must never be able to abort the
+  // trip path it decorates. A throw here would swallow the restart.
+  const readStdio = (): StdioBlockSnapshot | null => {
+    try {
+      return (opts.readStdioBlock ?? getStdioBlockSnapshot)();
+    } catch {
+      return null;
+    }
+  };
   const now = opts.now ?? Date.now;
   const startedAtMs = now();
   const state: WatchdogState = { consecutiveHeapBreaches: 0, consecutiveLagBreaches: 0 };
@@ -995,6 +1124,9 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
     // heartbeat, the trip breadcrumb, and the live status all reflect the same
     // most-recent blocking phase.
     const phaseAttribution = readPhaseAttribution();
+    // TRA-3660 — same discipline for the write-block meter: read once per publish
+    // so the live status and the liveness heartbeat agree with each other.
+    const livePublishStdio = readStdio();
     // Only fold steady-state (post-grace) samples into the peak/ring so warmup's
     // legitimate synchronous candle-load blocks don't pollute the evidence.
     if (now() - startedAtMs >= cfg.bootGraceMs) {
@@ -1057,6 +1189,7 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       lastTrip,
       priorLiveness,
       phaseAttribution,
+      ...(livePublishStdio ? { stdio: livePublishStdio } : {}),
     };
   }
 
@@ -1123,11 +1256,40 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
         // TRA-1463 — read the phase attribution ONCE at trip time so slowPhase +
         // activePhase reflect the same instant the loop was starved.
         const tripAttribution = readPhaseAttribution();
+        const tripAtMs = Date.now();
+        // TRA-3660 — state, in the record, whether anything actually NAMED this
+        // block. Without this a null `slowSyncPhase` is silent: it reads as "no
+        // block" to a hurried reader and as "unknowable" to a careful one, and
+        // there is nothing in the artifact that separates the two.
+        const attribution = classifyBlockAttribution({
+          reason: decision.reason,
+          tripAtMs,
+          lagMaxMs: sample.lagMaxMs,
+          sampleMs: cfg.sampleMs,
+          slowSyncPhase: tripAttribution.lastSlowSyncPhase,
+        });
+        const stdio = readStdio();
+        if (attribution.verdict.startsWith('unattributed') || attribution.verdict === 'partial') {
+          // The one line a future reader needs in the Render tape when the durable
+          // breadcrumb is all they have. `topEmitters` is written DURING the block,
+          // so it is present even when every phase field is null.
+          log.error('BLOCK NOT ATTRIBUTED — no instrumented sync phase accounts for this stall', {
+            verdict: attribution.verdict,
+            lagMaxMs: Math.round(sample.lagMaxMs),
+            windowMs: attribution.windowMs,
+            syncPhaseAgeMs: attribution.syncPhaseAgeMs,
+            explainedFraction: attribution.explainedFraction,
+            stdioMaxWriteMs: stdio?.maxWrite?.durationMs ?? null,
+            stdioSlowWrites: stdio?.slowWrites ?? null,
+            topEmitters: stdio?.topEmitters ?? null,
+            windowLines: stdio?.windowLines ?? null,
+          });
+        }
         persistTripRecord(
           {
             reason: decision.reason,
             detail: decision.detail ?? '',
-            atMs: Date.now(),
+            atMs: tripAtMs,
             uptimeSecAtTrip: Math.round((now() - startedAtMs) / 1000),
             heapUsedMB: Math.round(sample.heapUsedBytes / 1e6),
             heapLimitMB: Math.round(sample.heapLimitBytes / 1e6),
@@ -1139,6 +1301,8 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             slowPhase: tripAttribution.lastSlowPhase,
             slowSyncPhase: tripAttribution.lastSlowSyncPhase,
             activePhase: tripAttribution.activePhase,
+            attribution,
+            ...(stdio ? { stdio } : {}),
           },
           opts.env,
         );

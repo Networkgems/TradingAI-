@@ -340,6 +340,140 @@ export function formatDroppedSymbols(
   return ` — dropped ${head.join(',')}${rest > 0 ? ` (+${rest} more)` : ''}`;
 }
 
+/**
+ * TRA-3660 — coalesce the pre-fanout drop report across a breaker-open episode.
+ *
+ * ── Why the existing "batch it per call" advice does not apply here ────────────
+ * The line below IS already one per `fetchQuotes` call. What degenerated is the
+ * CALL, not the line: `index.ts` `fetchSpot` calls `fetchQuotes([symbol])` for a
+ * single symbol, and both option scanners (`signal.doTick.rv-scan` and
+ * `signal.doTick.otm-scan`) sweep the universe symbol-by-symbol on the same
+ * cadence. So `symbols.length` is 1, the line reads `1/1`, and one tick writes
+ * ~2 lines per symbol. There is no batch left to batch — the unit that has to
+ * coalesce is the breaker-open EPISODE.
+ *
+ * ── Why it has to coalesce at all ─────────────────────────────────────────────
+ * Measured by `scripts/tra3660-log-storm-loop-lag.mjs` (win32, node 22; Node
+ * documents pipe writes as synchronous on Windows AND Linux, and the knee below
+ * lands on the 64 KiB pipe buffer both platforms use):
+ *
+ *   lines   bytes    healthy reader   reader stalled 4s   reader stalled 8s
+ *     600    66 KB          32.1ms              32.1ms              32.2ms
+ *    1200   132 KB          34.7ms            3699.4ms            7688.2ms
+ *    3648   401 KB          63.7ms            3707.8ms            7684.0ms
+ *
+ * Two things fall out, and both matter more than the raw count:
+ *   1. The knee is a BYTE threshold at one pipe buffer, not a line-count
+ *      threshold. Under 64 KiB the burst fits and the process never blocks, at
+ *      any stall duration. Over it, the next `write(2)` blocks the whole process.
+ *   2. Past the knee the block duration is set by the STALL, not by N — 1200 and
+ *      3648 lines block for the same ~3.7s. N decides only whether we are
+ *      EXPOSED. So "log a bit less" is not a fix; staying under one buffer is.
+ *
+ * ── What is deliberately preserved ────────────────────────────────────────────
+ * TRA-2627's rule was that this path must never drop symbols silently, and
+ * TRA-2643's was that it must name WHAT it dropped. Neither is weakened:
+ *   * the FIRST drop of an episode still logs immediately (the leading edge is
+ *     never suppressed — a throttle that swallows the first line is the silent
+ *     drop wearing a different hat);
+ *   * every suppressed call is still COUNTED and reported in the next summary,
+ *     so the totals are complete rather than sampled;
+ *   * the summary keeps the literal `pre-fanout short-circuit` substring, which
+ *     `scripts/_tra2682_criterion1.mjs` and `scripts/_tra3412_criterion1.mjs`
+ *     both page on. Renaming it would silently blind two existing graders.
+ */
+export const PRE_FANOUT_REPORT_INTERVAL_MS = 10_000;
+
+/**
+ * A gap this long without a drop ends the episode, so the next outage gets a
+ * fresh un-throttled leading-edge line instead of inheriting an old window's
+ * throttle. Keyed off the drops themselves rather than a breaker-close callback:
+ * a hook that has to be wired at every trip site is a hook that will be missed.
+ */
+const PRE_FANOUT_EPISODE_GAP_MS = PRE_FANOUT_REPORT_INTERVAL_MS * 2;
+
+interface PreFanoutEpisode {
+  /** Calls short-circuited since the last emitted line. */
+  callsSinceEmit: number;
+  /** Symbols dropped since the last emitted line. */
+  symbolsSinceEmit: number;
+  /** Calls short-circuited since the episode began. */
+  callsTotal: number;
+  /** Symbols dropped since the episode began. */
+  symbolsTotal: number;
+  startedAtMs: number;
+  lastEmitAtMs: number;
+  lastDropAtMs: number;
+  /** Head of the dropped set for this window, most-important-first (TRA-2643). */
+  head: string[];
+}
+
+let preFanoutEpisode: PreFanoutEpisode | null = null;
+
+/**
+ * Record a pre-fanout short-circuit drop and return the line to log, or `null`
+ * when this drop is folded into a pending summary.
+ *
+ * Pure apart from the module-level episode state, and every input that decides
+ * the outcome is a parameter — so the test drives it with a fake clock instead
+ * of sleeping, and the throttle is verified rather than assumed.
+ */
+export function recordPreFanoutDrop(
+  dropped: readonly string[],
+  universeSize: number,
+  nowMs: number = Date.now(),
+  intervalMs: number = PRE_FANOUT_REPORT_INTERVAL_MS,
+): string | null {
+  const ep = preFanoutEpisode;
+  const isNewEpisode = ep === null || nowMs - ep.lastDropAtMs > PRE_FANOUT_EPISODE_GAP_MS;
+
+  if (isNewEpisode) {
+    preFanoutEpisode = {
+      callsSinceEmit: 0,
+      symbolsSinceEmit: 0,
+      callsTotal: 1,
+      symbolsTotal: dropped.length,
+      startedAtMs: nowMs,
+      lastEmitAtMs: nowMs,
+      lastDropAtMs: nowMs,
+      head: [],
+    };
+    // Leading edge: log it exactly as before, unthrottled. A reader watching the
+    // tape sees the outage begin at the instant it begins.
+    return `[yahoo-feed] fetchQuotes: ${dropped.length}/${universeSize} symbols failed ` +
+      `(Yahoo breaker open, pre-fanout short-circuit)${formatDroppedSymbols(dropped)}`;
+  }
+
+  ep!.callsSinceEmit++;
+  ep!.symbolsSinceEmit += dropped.length;
+  ep!.callsTotal++;
+  ep!.symbolsTotal += dropped.length;
+  ep!.lastDropAtMs = nowMs;
+  for (const sym of dropped) {
+    if (ep!.head.length >= DROPPED_SYMBOL_SAMPLE) break;
+    if (!ep!.head.includes(sym)) ep!.head.push(sym);
+  }
+
+  if (nowMs - ep!.lastEmitAtMs < intervalMs) return null;
+
+  const windowMs = nowMs - ep!.lastEmitAtMs;
+  const line =
+    `[yahoo-feed] fetchQuotes: ${ep!.symbolsSinceEmit} symbols dropped across ${ep!.callsSinceEmit} calls ` +
+    `in the last ${Math.round(windowMs / 1000)}s (Yahoo breaker open, pre-fanout short-circuit; coalesced — ` +
+    `episode total ${ep!.symbolsTotal} symbols / ${ep!.callsTotal} calls over ` +
+    `${Math.round((nowMs - ep!.startedAtMs) / 1000)}s)${formatDroppedSymbols(ep!.head)}`;
+  ep!.callsSinceEmit = 0;
+  ep!.symbolsSinceEmit = 0;
+  ep!.lastEmitAtMs = nowMs;
+  ep!.head = [];
+  return line;
+}
+
+/** Test seam — forget the current pre-fanout episode. */
+export function _resetPreFanoutEpisodeForTests(): void {
+  preFanoutEpisode = null;
+}
+
 // TRA-3385 (Remedy B) — Tradier names the symbols it cannot serve in
 // `unmatched_symbols` on every batch response; the client used to parse and
 // discard it, which left TRA-2682's coverage question ("which universe members
@@ -2416,7 +2550,15 @@ export async function fetchQuotes(
   if (remaining.length > 0 && isRateLimited()) {
     // TRA-2643 — name the head of the drop here too. This path loses the WHOLE
     // remainder, so it is the one most likely to take the risk gate with it.
-    console.warn(`[yahoo-feed] fetchQuotes: ${remaining.length}/${symbols.length} symbols failed (Yahoo breaker open, pre-fanout short-circuit)${formatDroppedSymbols(remaining)}`);
+    // TRA-3660 — but emit through the episode coalescer. With per-symbol callers
+    // (`fetchSpot` → `fetchQuotes([symbol])`, twice per symbol per tick across the
+    // RV and OTM sweeps) this line degenerated to 1 line per symbol and wrote
+    // >=1824 lines in 1.8s on 2026-08-13 — >=200 KB, past the 64 KiB pipe buffer,
+    // which is where a stalled Render log collector turns a `write(2)` into a
+    // whole-process event-loop block. Counting is unchanged; only the emission
+    // rate is bounded. See `recordPreFanoutDrop`.
+    const preFanoutLine = recordPreFanoutDrop(remaining, symbols.length);
+    if (preFanoutLine) console.warn(preFanoutLine);
     return results;
   }
   // TRA-2627 — say out loud when the budget CANNOT cover this universe. A line
