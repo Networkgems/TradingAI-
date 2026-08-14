@@ -552,6 +552,18 @@ if (!WANT_LOGS) {
     for (const r of parsed) selCount[r.selection] = (selCount[r.selection] ?? 0) + 1;
     const inBand = parsed.filter((r) => r.selection === 'in_band');
     const maxCheapInBand = parsed.reduce((n, r) => Math.max(n, Number(r.cheapInBand) || 0), 0);
+    // TRA-3619 — `cheapInBand` is `cheap ∩ band`, because the selector filters on
+    // `classification === 'cheap'` FIRST and runs the band predicate over that
+    // subset (`otm-admissible-strike.ts`, `selectAdmissibleOtmCandidate`). So on a
+    // `fallback_top_mispricing` row `cheapInBand` is 0 BY CONSTRUCTION and cannot
+    // separate "the chain held no in-band strike" from "it held one the cheapness
+    // screen threw away first". `strikesInBand` runs the SAME band predicate over
+    // the pre-cheapness set and is the only field that splits them — so read it by
+    // presence, never treat its absence as a zero. It ships in `229af6d`; until
+    // that is LIVE the split is unmeasurable and C2b must say so rather than
+    // publish the stronger claim.
+    const strikeRows = parsed.filter((r) => 'strikesInBand' in r);
+    const maxStrikesInBand = strikeRows.reduce((n, r) => Math.max(n, Number(r.strikesInBand) || 0), 0);
     const symsSeen = [...new Set(parsed.map((r) => r.sym).filter(Boolean))];
     // `user` is stamped from the trace context, so the line carries the BOOK.
     const booksSeen = [...new Set(parsed.map((r) => r.user).filter(Boolean))];
@@ -575,8 +587,18 @@ if (!WANT_LOGS) {
       record('C2b nomination log', 'PASS',
         `selection 'in_band' on ${inBand.length}/${parsed.length} nomination(s), maxCheapInBand ${maxCheapInBand}, symbols ${JSON.stringify([...new Set(inBand.map((r) => r.sym))])} — THE NOMINATOR BIT${unparseable ? ` (⚠ ${unparseable} line(s) unparseable, count is a FLOOR)` : ''}`);
     } else if (Object.keys(selCount).length === 1 && selCount.fallback_top_mispricing) {
-      record('C2b nomination log', 'REAL-NEGATIVE',
-        `${parsed.length} nomination(s), ALL 'fallback_top_mispricing', maxCheapInBand ${maxCheapInBand} across ${symsSeen.length} symbol(s) ${JSON.stringify(symsSeen)} — the scanner DID produce candidates and NONE fell in [0.50,0.55). A genuine empty-band negative, denominated on the symbols that actually produced a chain, NOT on the ${gates.arm?.universe?.symbols?.length ?? '?'}-name universe`);
+      const scope = `${parsed.length} nomination(s), ALL 'fallback_top_mispricing', maxCheapInBand ${maxCheapInBand} across ${symsSeen.length} symbol(s) ${JSON.stringify(symsSeen)} — denominated on the symbols that actually produced a chain, NOT on the ${gates.arm?.universe?.symbols?.length ?? '?'}-name universe`;
+      if (strikeRows.length === 0) {
+        // No `strikesInBand` on any row ⇒ `229af6d` is not live. State the limit.
+        record('C2b nomination log', 'REAL-NEGATIVE',
+          `${scope}. ⚠ SCOPE: this establishes only that no CHEAP candidate fell in [0.50,0.55) — 'cheapInBand' is cheap∩band and is 0 by construction on a fallback row (TRA-3619). Whether the chain held an in-band strike the cheapness screen discarded first is NOT measurable on this build: 'strikesInBand' is absent from all ${parsed.length} row(s), so 229af6d is not deployed. Do NOT publish this as "the band was empty"`);
+      } else if (maxStrikesInBand > 0) {
+        record('C2b nomination log', 'FAIL',
+          `${scope}. ⛔ NOT an empty band: strikesInBand reached ${maxStrikesInBand} on ${strikeRows.length} instrumented row(s) — the chain DID hold in-band strikes and the cheapness screen discarded them BEFORE the band filter ran. The branch ordering is the lever, not the band edges`);
+      } else {
+        record('C2b nomination log', 'REAL-NEGATIVE',
+          `${scope}. strikesInBand 0 on all ${strikeRows.length} instrumented row(s) ⇒ the band is genuinely empty IN THE CHAIN (post-liquidity-screen), not emptied by the cheapness screen. A measured empty-band negative`);
+      }
     } else {
       record('C2b nomination log', 'REVIEW',
         `selection split ${JSON.stringify(selCount)} with no in_band — read by hand`);
