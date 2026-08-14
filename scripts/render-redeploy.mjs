@@ -196,6 +196,38 @@ export const EMBARGOES = [
       'of the 229af6d tip, and check:deploy-train-window grades a deploy order by ANCESTRY, so the ' +
       'single 21:50Z tip deploy satisfies all three orders at once. Three boots collapse into one.',
   },
+  {
+    from: '2026-08-14T20:00:00Z',
+    // Same shape as the row above, one day later, and written for the same reason: the row
+    // above is SPENT at 21:45Z on 08-13 and self-expiring rows do not renew themselves.
+    // Contiguous with the RTH freeze close (20:00Z) — no gap. Closes 21:45Z so the 21:50Z
+    // TRA-3702 carrier is the FIRST legal deploy after it.
+    to: '2026-08-14T21:45:00Z',
+    ticket: 'TRA-3702 / TRA-1648 / TRA-3547 / TRA-3701',
+    why:
+      'Fri 2026-08-14 post-close carries SIXTEEN graded reads between 20:25Z and 21:40Z, and the day ' +
+      'opens with THREE separate things wanting to boot bqb1 inside them. Enumerated from the live ' +
+      'routine table + the issue monitor column at 03:2xZ. Routines: 20:25 TRA-1648 7d30dcfc, 20:30 ' +
+      'TRA-2536 7e7ab58e + TRA-971 81928e50 + TRA-1965 a986323e + TRA-3547 fc05a69f, 20:35 TRA-3619 ' +
+      'leg 2 7aa04c72, 20:45 TRA-2331 7c3af47e + TRA-2945 ec0f4a75, 21:15 TRA-2879 41c0c68d + TRA-2636 ' +
+      '8d2c80a9, 21:30 TRA-1398 6213da0a + TRA-820 f28ea628 + LeadDev unlinked-monitor census 1aa6b2c1, ' +
+      '21:40 TRA-2220 5293f29f. Issue monitors: 20:30 TRA-3660, 20:45 TRA-3464, 21:00 TRA-3442. ' +
+      'THE 20:25Z TRA-1648 READ IS NOT THE END OF THE HOLD, IT IS THE START OF IT — TRA-3702 was ' +
+      'filed reasoning "not merely after 20:00Z, because a 20:05Z deploy boots the box before the ' +
+      '20:25Z re-grade reads it", and then armed its own carrier at 20:35Z, which clears the one read ' +
+      'it was watching and lands underneath TRA-3660 (20:30, boot-scoped watchdog lastTrip), TRA-3464 ' +
+      '(20:45, RTH-partitioned exit cadence), TRA-3442 (21:00, per-session advisory census) and the ' +
+      '21:40Z TRA-2220 liveness watch. That is the identical defect one layer further down, which is ' +
+      'why this is a table row and not a note in a ticket: prose that reasons correctly about the ' +
+      'read in front of it does not execute against the four behind it. ' +
+      'NOTHING IS LOST BY WAITING: the 21:50Z tip deploy carries b4cb1664 (TRA-3702), fe603074 ' +
+      '(TRA-3674, whose live-read acceptance is TRA-3701) and 0096adf3 (TRA-3678) in one boot, and ' +
+      'check:deploy-train-window grades a deploy order by ANCESTRY. Three boots collapse into one. ' +
+      'The fc05a69f 20:30Z fire should read its own STEP 0 the same way it did on 08-13: exit 5 is ' +
+      'the correct outcome, do not override, do not archive — 8713331 is already SERVING (it is an ' +
+      'ancestor of the live 1ff4fa7b), so that carrier has nothing left to deploy and only a grade ' +
+      'to take.',
+  },
 ];
 
 // ── Why the 2026-07-27 row closes at 21:00Z, not 20:20Z (TRA-2306, CTO 2026-07-26) ──
