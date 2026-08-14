@@ -227,6 +227,17 @@ import {
   type OptionTradeJournalRecord,
   type OptionTradeJournalExitReasonStat,
 } from '../option-trade-journal.js';
+// TRA-3715 — the accountClass × structure × entryArchetype grading surface, its
+// strategy-vs-harness exit table, and the ET-session close window. See
+// `option-journal-sleeve-cells.ts` for why none of that could be read off the
+// marginals this route already published.
+import {
+  foldOptionSleeveCells,
+  parseEtDayCloseWindow,
+  rowCloseEtDay,
+  type OptionSleeveCellGrid,
+  type EtDayCloseWindow,
+} from '../option-journal-sleeve-cells.js';
 import {
   computeOptionLearnedWeights,
   type OptionLearnedWeights,
@@ -1605,6 +1616,28 @@ export function summarizeOptionsPipeline(
  * route never 404s mid-rollout. `weights` is the bounded learned multipliers the
  * fold derives — surfaced for visibility only; nothing here feeds a decision.
  */
+/**
+ * TRA-3715 item 2 (the minimum-viable half) — a `?rows=` element with its
+ * account class STAMPED ON IT.
+ *
+ * The dump used to serve bare `OptionTradeJournalRecord`s. A row carries
+ * `account` (a free-form username) but not its CLASS, and the classification
+ * rule lives in this repo, not in the payload — so every hand-fold over `rows[]`
+ * either re-implemented `classifySpreadCeilingAccount` or, in practice, skipped
+ * it and pooled 92.8% QA fixture books into a desk number. Both TRA-3682 and
+ * TRA-3709 took the second path. The class is computed by the SAME classifier
+ * `summary.byAccountClass` uses, so a hand-fold and the published partition
+ * cannot disagree.
+ *
+ * `closeEtDay` is stamped for the same reason: the windows people grade are ET
+ * session days, and deriving one from `closeTs` at the call site is another
+ * place to get DST wrong. `null` while the row is still open.
+ */
+export type OptionJournalDumpRow = OptionTradeJournalRecord & {
+  accountClass: SpreadCeilingAccountClass;
+  closeEtDay: string | null;
+};
+
 export interface OptionJournalReport {
   ok: true;
   time: string;
@@ -1702,6 +1735,37 @@ export interface OptionJournalReport {
    * certifying. `corruptLines: null` = not measured, never `0`.
    */
   integrity: OptionTradeJournalIntegrity;
+  /**
+   * TRA-3715 — the `accountClass × structure × entryArchetype` grid, each cell
+   * split into strategy-owned vs harness/manual exits and labelled
+   * `UNDERPOWERED` below n = 20.
+   *
+   * THIS is the surface a sleeve grade may be read from. `summary.byAccountClass
+   * .*.byStructure` and `.byArchetype` are separate MARGINALS — the axis
+   * TRA-3682/TRA-3709 explicitly forbid grading on — and every figure in them
+   * pools QA hand-closes with strategy exits. Two tickets in a row hand-folded
+   * `rows[]` instead and published a fabricated positive baseline because
+   * `rows[]` carried no `accountClass`. Sits at the TOP LEVEL, deliberately not
+   * under `summary`, whose own note says never to grade it.
+   */
+  sleeveCells: OptionSleeveCellGrid;
+  /**
+   * TRA-3715 — the window that actually served this response, resolved and
+   * echoed so a grader asserts what it got rather than assuming its params took
+   * effect. `axis` names the timestamp compared against; `fromMs`/`toMs` are
+   * both INCLUSIVE and `null` where that side is unbounded (a lifetime fold
+   * reads `fromMs: null, toMs: null`).
+   */
+  window: {
+    axis: 'openTs' | 'closeTs';
+    fromMs: number | null;
+    toMs: number | null;
+    fromInclusive: true;
+    toInclusive: true;
+    /** Present only when the ET-session-day params resolved this window. */
+    etDay: EtDayCloseWindow | null;
+    note: string;
+  };
   weights: OptionLearnedWeights;
   /**
    * TRA-2214 — the account-class basis `weights` was folded on, stated because it
@@ -1773,7 +1837,7 @@ export interface OptionJournalReport {
    * populations with nothing on the wire marking the difference. Both halves now
    * derive from the same filtered set; `rowsFiltered` states it on the wire.
    */
-  rows?: OptionTradeJournalRecord[];
+  rows?: OptionJournalDumpRow[];
   rowsFiltered?: boolean;
   /**
    * TRA-2082 — the SECOND population axis, surfaced for the same reason as the
@@ -2511,21 +2575,47 @@ export function buildOptionJournalReport(
   // (the only thing any pre-existing caller can pass) the fold, the axis label
   // and the payload keys below are all byte-identical to before.
   closedSinceTs?: number,
+  // TRA-3715 — the UPPER bounds, and the ET-session-day window that resolves to
+  // one. Collected into an options object rather than positions 9/10/11: this
+  // signature is already seven deep and a caller counting `undefined`s is how a
+  // filter silently lands on the wrong axis. Every existing caller omits it and
+  // is byte-unchanged.
+  bounds: {
+    /** ENTRY-axis upper bound, epoch ms, INCLUSIVE. Pairs with `sinceTs`. */
+    untilTs?: number;
+    /** EXIT-axis upper bound, epoch ms, INCLUSIVE. Pairs with `closedSinceTs`. */
+    closedUntilTs?: number;
+    /** ET session-day window on `closeTs`; when set it OWNS the exit axis. */
+    etDayWindow?: EtDayCloseWindow | null;
+  } = {},
 ): OptionJournalReport {
+  const { untilTs, closedUntilTs, etDayWindow } = bounds;
   // TRA-3380 — ONE axis serves a response; the route rejects both params at
   // once, so `filterAxis` is never ambiguous about what it is reporting.
-  const closeAxis = closedSinceTs !== undefined;
+  // TRA-3715 — the ET-day window is an EXIT-axis filter too, so it joins the
+  // same axis rather than adding a third.
+  const closeAxis =
+    closedSinceTs !== undefined || closedUntilTs !== undefined || !!etDayWindow;
+  // The resolved bounds, in one place, so the filter below and the `window`
+  // echo on the wire can never describe different windows.
+  const fromMs = etDayWindow
+    ? etDayWindow.fromMs
+    : closeAxis
+      ? (closedSinceTs ?? null)
+      : (sinceTs ?? null);
+  const toMs = etDayWindow ? etDayWindow.toMs : closeAxis ? (closedUntilTs ?? null) : (untilTs ?? null);
   const summaryRows = closeAxis
-    ? // An OPEN row has no `closeTs`, so it cannot satisfy "closed since T" and
-      // is excluded. That is the point of the axis: an exit-scoped criterion's
-      // population is the rows that actually CLOSED in the window.
+    ? // An OPEN row has no `closeTs`, so it cannot satisfy "closed in [from,to]"
+      // and is excluded. That is the point of the axis: an exit-scoped
+      // criterion's population is the rows that actually CLOSED in the window.
       rows.filter((r) => {
         const closeTs = (r as OptionTradeJournalRecord).closeTs;
-        return typeof closeTs === 'number' && closeTs >= closedSinceTs;
+        if (typeof closeTs !== 'number' || !Number.isFinite(closeTs)) return false;
+        return (fromMs === null || closeTs >= fromMs) && (toMs === null || closeTs <= toMs);
       })
-    : sinceTs === undefined
-      ? rows
-      : rows.filter((r) => r.openTs >= sinceTs);
+    : rows.filter(
+        (r) => (fromMs === null || r.openTs >= fromMs) && (toMs === null || r.openTs <= toMs),
+      );
   const rowsMode: 'demo' | 'open' | 'all' | null | undefined =
     rowsRequest === false ? undefined
       : rowsRequest === true || rowsRequest === 'demo' ? 'demo'
@@ -2535,7 +2625,7 @@ export function buildOptionJournalReport(
             // rather than falling back to `demo`: silently serving a different
             // population than the one asked for is the TRA-2082 failure shape.
             : null;
-  const dumpRows: OptionTradeJournalRecord[] | undefined =
+  const dumpSource: OptionTradeJournalRecord[] | undefined =
     rowsMode === undefined
       ? undefined
       : rowsMode === 'demo'
@@ -2547,6 +2637,16 @@ export function buildOptionJournalReport(
           : rowsMode === 'all'
             ? (summaryRows as OptionTradeJournalRecord[])
             : [];
+  // TRA-3715 — stamp the class and the ET close day ONTO each dumped row. A
+  // hand-fold over this array is exactly what produced TRA-3682's and
+  // TRA-3709's fabricated baselines, and it did so because the array carried no
+  // axis to fold on. Same classifier as `byAccountClass`, so the two cannot
+  // disagree. See {@link OptionJournalDumpRow}.
+  const dumpRows: OptionJournalDumpRow[] | undefined = dumpSource?.map((r) => ({
+    ...r,
+    accountClass: classifySpreadCeilingAccount(r.account),
+    closeEtDay: rowCloseEtDay(r),
+  }));
   return {
     ok: true,
     time: new Date(now).toISOString(),
@@ -2565,6 +2665,27 @@ export function buildOptionJournalReport(
     // still cannot miss that fixture rows are in the pool.
     ...accountClassRowCounts(summaryRows as OptionTradeJournalRecord[]),
     integrity: getOptionTradeJournalIntegrity(),
+    // TRA-3715 — folded off the SAME filtered set as `summary` and the two
+    // partitions. Four folds over one population; a second population in one
+    // 200 is the TRA-2082 shape.
+    sleeveCells: foldOptionSleeveCells(summaryRows as OptionTradeJournalRecord[]),
+    window: {
+      axis: closeAxis ? 'closeTs' : 'openTs',
+      fromMs,
+      toMs,
+      fromInclusive: true as const,
+      toInclusive: true as const,
+      etDay: etDayWindow ?? null,
+      note:
+        'The window that served this response. `axis` names the timestamp compared against; '
+        + 'both bounds are INCLUSIVE and `null` means unbounded on that side, so a LIFETIME '
+        + 'fold reads fromMs:null,toMs:null. Entry axis: ?sinceTs=/&untilTs= (epoch ms on '
+        + 'openTs). Exit axis: ?closedSinceTs=/&closedUntilTs= (epoch ms on closeTs) or '
+        + '?sinceEtDay=/&untilEtDay= (YYYY-MM-DD ET SESSION DAYS on closeTs, both inclusive, '
+        + 'DST resolved per-instant) — the exit axis is the one a sleeve grade wants. The two '
+        + 'axes cannot be mixed in one request; on the exit axis rows still OPEN are excluded '
+        + 'by construction. TRA-3715.',
+    },
     // TRA-2214 — BOTH branches must fold on the same basis. The cached branch is
     // the `OptionWeightsCache`, which is now desk+unattributed; a cold cache used
     // to fall through to a POOLED refold of the same field. One field, two bases,
@@ -2581,13 +2702,15 @@ export function buildOptionJournalReport(
     // readouts, so those payloads are byte-unchanged. The new keys below appear
     // ONLY under the exit axis.
     filterAxis: closeAxis ? 'closeTs' : 'openTs',
-    ...(closeAxis
-      ? {
-          closedSinceTs,
-          appliedClosedSinceTs: closedSinceTs,
-          closeAxisExcludesOpenRows: true as const,
-        }
-      : {}),
+    // TRA-3715 — `closeAxis` can now be entered by `closedUntilTs` or by the
+    // ET-day window alone, so the two legacy echo keys are emitted only when
+    // their own param was actually supplied. Emitting `closedSinceTs:
+    // undefined` would put a key on the wire that says "no lower bound" and
+    // reads, to a `'closedSinceTs' in body` check, as if one had been applied.
+    ...(closeAxis ? { closeAxisExcludesOpenRows: true as const } : {}),
+    ...(closedSinceTs === undefined
+      ? {}
+      : { closedSinceTs, appliedClosedSinceTs: closedSinceTs }),
     ...(dumpRows === undefined
       ? {}
       : {
@@ -5776,15 +5899,91 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     }
     const closedSinceTs = closeParse.value;
 
+    // TRA-3715 — the UPPER bounds. Same fail-closed epoch-ms contract as their
+    // lower-bound siblings: a window that cannot be applied must never return a
+    // body indistinguishable from one that selects everything.
+    const untilParse = parseCohortTsParam(req.query['untilTs'], 'untilTs');
+    const closedUntilRaw = req.query['closedUntilTs'] ?? req.query['closeUntilTs'];
+    const closedUntilName =
+      req.query['closedUntilTs'] !== undefined ? 'closedUntilTs' : 'closeUntilTs';
+    const closedUntilParse = parseCohortTsParam(closedUntilRaw, closedUntilName);
+    // TRA-3715 — the ET SESSION DAY window, which is how every grade this
+    // journal is asked for is actually written. Resolves onto the exit axis.
+    const etDayParse = parseEtDayCloseWindow(req.query['sinceEtDay'], req.query['untilEtDay']);
+    for (const parse of [untilParse, closedUntilParse, etDayParse] as const) {
+      if (parse.ok) continue;
+      res.status(400).json({
+        ok: false,
+        error: parse.error,
+        detail: parse.detail,
+        filterApplied: false,
+        note:
+          'The cohort filter could not be applied, so no body is served. A filter that '
+          + 'cannot be applied must not return a payload indistinguishable from one that '
+          + 'selects everything (TRA-3380).',
+      });
+      return;
+    }
+    const untilTs = untilParse.ok ? untilParse.value : undefined;
+    const closedUntilTs = closedUntilParse.ok ? closedUntilParse.value : undefined;
+    const etDayWindow = etDayParse.ok ? etDayParse.window : null;
+
     // One axis per response. Serving both would make `filterAxis` — the field a
     // consumer reads to learn WHICH population it got — unable to answer.
-    if (sinceTs !== undefined && closedSinceTs !== undefined) {
+    // TRA-3715 — the ET-day window and `closedUntilTs` are EXIT-axis members
+    // too, so they conflict with the entry axis on the same rule.
+    const entryAxisUsed = sinceTs !== undefined || untilTs !== undefined;
+    const exitAxisUsed =
+      closedSinceTs !== undefined || closedUntilTs !== undefined || etDayWindow !== null;
+    if (entryAxisUsed && exitAxisUsed) {
       res.status(400).json({
         ok: false,
         error: 'cohort_axis_conflict',
         detail:
-          'Pass either `sinceTs` (ENTRY axis, openTs) or `closedSinceTs`/`closeTs` (EXIT axis, '
-          + 'closeTs) — not both. `filterAxis` names the single axis that served the response.',
+          'Pass EITHER the ENTRY axis (`sinceTs` / `untilTs`, on openTs) OR the EXIT axis '
+          + '(`closedSinceTs`/`closeTs`, `closedUntilTs`/`closeUntilTs`, `sinceEtDay` + '
+          + '`untilEtDay`, on closeTs) — not both. `filterAxis` and `window.axis` name the '
+          + 'single axis that served the response.',
+        filterApplied: false,
+      });
+      return;
+    }
+    // Two spellings of the same exit bound would leave `window.fromMs`/`toMs`
+    // reporting one of them with nothing on the wire saying which lost.
+    if (etDayWindow !== null && (closedSinceTs !== undefined || closedUntilTs !== undefined)) {
+      res.status(400).json({
+        ok: false,
+        error: 'cohort_window_conflict',
+        detail:
+          'Pass EITHER the ET session-day window (`sinceEtDay` + `untilEtDay`) OR the epoch-ms '
+          + 'exit bounds (`closedSinceTs` / `closedUntilTs`) — not both. They are two spellings '
+          + 'of the same axis and only one can be reported in `window`.',
+        filterApplied: false,
+      });
+      return;
+    }
+    if (
+      sinceTs !== undefined
+      && untilTs !== undefined
+      && untilTs < sinceTs
+    ) {
+      res.status(400).json({
+        ok: false,
+        error: 'cohort_window_inverted',
+        detail: `\`untilTs\` (${untilTs}) is before \`sinceTs\` (${sinceTs}).`,
+        filterApplied: false,
+      });
+      return;
+    }
+    if (
+      closedSinceTs !== undefined
+      && closedUntilTs !== undefined
+      && closedUntilTs < closedSinceTs
+    ) {
+      res.status(400).json({
+        ok: false,
+        error: 'cohort_window_inverted',
+        detail: `\`closedUntilTs\` (${closedUntilTs}) is before \`closedSinceTs\` (${closedSinceTs}).`,
         filterApplied: false,
       });
       return;
@@ -5838,6 +6037,8 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
               : 'unknown')
           : false,
         closedSinceTs,
+        // TRA-3715 — the upper bounds + the ET session-day window.
+        { untilTs, closedUntilTs, etDayWindow },
       ),
       voids,
       closeBasisAmends,

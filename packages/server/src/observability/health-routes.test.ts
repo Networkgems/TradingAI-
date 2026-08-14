@@ -2569,17 +2569,22 @@ describe('buildOptionJournalReport', () => {
       expect(report.filterAxis).toBe('openTs');
       expect(report.appliedSinceTs).toBeNull();
       for (const k of NEW_KEYS) expect(report).not.toHaveProperty(k);
-      // asserted on the SERIALISED body, because "absent" and "present and
+      // Asserted on the SERIALISED body too, because "absent" and "present and
       // undefined" are the same under toHaveProperty but differ on the wire.
+      // TRA-3715 — matched as a JSON KEY (`"k":`), not as a bare substring: the
+      // `window.note` added there names these params in prose so a caller can
+      // discover them, and a substring test would forbid documenting the very
+      // contract it guards. The pair (toHaveProperty + key match) is strictly
+      // stronger than either alone.
       const wire = JSON.stringify(report);
-      for (const k of NEW_KEYS) expect(wire).not.toContain(k);
+      for (const k of NEW_KEYS) expect(wire).not.toContain(`"${k}":`);
     });
 
     it('the sinceTs payload gains no key either', () => {
       const report = buildOptionJournalReport([closedRow], NOW, true, undefined, NOW - 1000);
       expect(report.filterAxis).toBe('openTs');
       for (const k of NEW_KEYS) expect(report).not.toHaveProperty(k);
-      expect(JSON.stringify(report)).not.toContain('closeAxisExcludesOpenRows');
+      expect(JSON.stringify(report)).not.toContain('"closeAxisExcludesOpenRows":');
     });
 
     // The strongest available statement of "unchanged": passing the new 7th
@@ -5923,5 +5928,254 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
     // utilization read is not a fleet with nothing open.
     expect(serveFeeSlippage().aggregateExposure).toBeNull();
     expect(serveFeeSlippage(() => []).aggregateExposure).toEqual([]);
+  });
+});
+
+// ── TRA-3715 — the sleeve grading surface, wired to the route ────────────────
+//
+// The measurement half (TRA-3709) is closed; this is the code half. Everything
+// below grades the WIRING: the fold itself is graded in
+// `option-journal-sleeve-cells.test.ts`, including the two positive controls the
+// ticket demands. What can only be checked here is that the grid reaches the
+// payload off the SAME filtered population as `summary`, that the ET-session-day
+// window is honoured and fails closed, and that the `?rows=` dump now carries
+// the class a hand-fold needs — its absence is what let TRA-3682 and TRA-3709
+// pool 92.8% QA fixture books into a published desk baseline.
+describe('TRA-3715 option-journal sleeve cells + ET window', () => {
+  const base: OptionTradeJournalRecord = {
+    id: 'seed',
+    openTs: NOW - 86_400_000,
+    symbol: 'AAPL',
+    structure: 'single_leg_directional',
+    mode: 'demo',
+    ivRank: 40,
+    trend: 'up',
+    sentiment: 0,
+    entryDelta: 0.45,
+    entryDte: 35,
+    atRiskUsd: 200,
+    entryArchetype: 'directional',
+    account: 'admin',
+    outcome: 'WIN',
+    closeTs: NOW,
+    realizedPnlUsd: 20,
+    realizedR: 0.1,
+    exitReason: 'sl',
+    holdDays: 1,
+  };
+  const at = (id: string, over: Partial<OptionTradeJournalRecord>): OptionTradeJournalRecord => ({
+    ...base,
+    id,
+    ...over,
+  });
+
+  it('publishes the grid at the TOP level with all three classes at n=0', () => {
+    const report = buildOptionJournalReport([at('a', {})], NOW, true);
+    expect(report.sleeveCells.cells.length).toBe(3 * report.sleeveCells.axisPairs.length);
+    for (const klass of ['desk', 'fixture', 'unattributed'] as const) {
+      expect(
+        report.sleeveCells.cells.some(
+          (c) =>
+            c.accountClass === klass
+            && c.structure === 'single_leg_directional'
+            && c.entryArchetype === 'directional',
+        ),
+      ).toBe(true);
+    }
+    expect(report.sleeveCells.cellsSumToClosed).toBe(true);
+    expect(report.sleeveCells.residual).toBe(0);
+    expect(report.sleeveCells.minSampleForVerdict).toBe(20);
+    // The classification rule ships WITH the numbers it produced.
+    expect(report.sleeveCells.exitOwnerTable.find((r) => r.reason === 'manual')?.owner)
+      .toBe('harness');
+  });
+
+  // The TRA-2082 invariant, extended to the new fold: `summary`, the class
+  // partition and the grid must all describe ONE population. Two populations in
+  // one 200 is exactly how the earlier surfaces misled.
+  it('folds the grid off the SAME filtered rows as the summary', () => {
+    const old = at('old', { openTs: NOW - 90_000_000 });
+    const report = buildOptionJournalReport(
+      [old, at('new', { openTs: NOW - 3_600_000 })],
+      NOW,
+      true,
+      undefined,
+      NOW - 7_200_000,
+    );
+    expect(report.summary.closed).toBe(1);
+    expect(report.sleeveCells.closed).toBe(1);
+    expect(report.deskRowCount).toBe(1);
+  });
+
+  it('stamps accountClass and closeEtDay onto every dumped row', () => {
+    const report = buildOptionJournalReport(
+      [
+        at('d', { account: 'admin' }),
+        at('f', { account: 'qa_mirror_1' }),
+        at('u', { account: undefined }),
+      ],
+      NOW,
+      true,
+      undefined,
+      undefined,
+      'all',
+    );
+    const byId = new Map((report.rows ?? []).map((r) => [r.id, r]));
+    expect(byId.get('d')?.accountClass).toBe('desk');
+    expect(byId.get('f')?.accountClass).toBe('fixture');
+    expect(byId.get('u')?.accountClass).toBe('unattributed');
+    // The class the dump reports must be the class the partition counted.
+    expect(report.deskRowCount).toBe(1);
+    expect(report.fixtureRowCount).toBe(1);
+    expect(report.unattributedRowCount).toBe(1);
+    expect(byId.get('d')?.closeEtDay).toBe(
+      new Date(NOW).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }),
+    );
+  });
+
+  it('reports an unbounded window as null on both ends, never 0', () => {
+    const report = buildOptionJournalReport([at('a', {})], NOW, true);
+    expect(report.window).toMatchObject({
+      axis: 'openTs',
+      fromMs: null,
+      toMs: null,
+      fromInclusive: true,
+      toInclusive: true,
+      etDay: null,
+    });
+  });
+
+  // The upper bounds have to DISCRIMINATE, or "the filter applied" is
+  // unfalsifiable — the TRA-3380 lesson, one param pair over.
+  it('applies untilTs on the entry axis and closedUntilTs on the exit axis', () => {
+    const early = at('early', { openTs: NOW - 200_000, closeTs: NOW - 150_000 });
+    const late = at('late', { openTs: NOW - 50_000, closeTs: NOW - 10_000 });
+    const rows = [early, late];
+
+    const entry = buildOptionJournalReport(rows, NOW, true, undefined, undefined, false, undefined, {
+      untilTs: NOW - 100_000,
+    });
+    expect(entry.window).toMatchObject({ axis: 'openTs', fromMs: null, toMs: NOW - 100_000 });
+    expect(entry.summary.total).toBe(1);
+
+    const exit = buildOptionJournalReport(rows, NOW, true, undefined, undefined, false, undefined, {
+      closedUntilTs: NOW - 100_000,
+    });
+    expect(exit.window).toMatchObject({ axis: 'closeTs', fromMs: null, toMs: NOW - 100_000 });
+    expect(exit.filterAxis).toBe('closeTs');
+    expect(exit.summary.total).toBe(1);
+    // The lower-bound echo keys stay ABSENT when only an upper bound was given —
+    // a `closedSinceTs: undefined` on the wire would read as a filter nobody set.
+    expect(exit).not.toHaveProperty('closedSinceTs');
+    expect(exit.closeAxisExcludesOpenRows).toBe(true);
+  });
+
+  // Byte-unchanged for every pre-existing caller: the 8th argument is all any of
+  // them can omit, and omitting it must be identical to passing `{}`.
+  it('passing the new bounds argument empty is identical to omitting it', () => {
+    const rows = [at('a', {}), at('b', { account: 'qa_x' })];
+    for (const since of [undefined, NOW - 1000]) {
+      const omitted = buildOptionJournalReport(rows, NOW, true, undefined, since, 'all');
+      const explicit = buildOptionJournalReport(
+        rows,
+        NOW,
+        true,
+        undefined,
+        since,
+        'all',
+        undefined,
+        {},
+      );
+      expect(JSON.stringify(explicit)).toBe(JSON.stringify(omitted));
+    }
+  });
+
+  describe('route wiring', () => {
+    const mount = () => {
+      const { app, routes } = fakeApp();
+      registerLiveHealthRoutes(app, {
+        requireAuth: ((_q: unknown, _s: unknown, n: () => void) => n()) as never,
+        userCtx: async () => ctx('admin', engineState()),
+        getSettings: () => settings(),
+        now: () => NOW,
+      });
+      return routes;
+    };
+
+    it('serves 200 and resolves an ET session-day window onto closeTs', async () => {
+      const routes = mount();
+      const res = fakeRes();
+      await routes.get('/api/health/option-journal')![0]!(
+        { query: { sinceEtDay: '2026-07-27', untilEtDay: '2026-08-13' } },
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      const body = res.body as {
+        filterAxis: string;
+        window: {
+          axis: string;
+          fromMs: number;
+          toMs: number;
+          etDay: { sinceEtDay: string } | null;
+        };
+      };
+      expect(body.filterAxis).toBe('closeTs');
+      expect(body.window.axis).toBe('closeTs');
+      // 00:00 ET 2026-07-27 (EDT) through the last ms of 2026-08-13 ET.
+      expect(body.window.fromMs).toBe(Date.UTC(2026, 6, 27, 4, 0, 0, 0));
+      expect(body.window.toMs).toBe(Date.UTC(2026, 7, 14, 4, 0, 0, 0) - 1);
+      expect(body.window.etDay?.sinceEtDay).toBe('2026-07-27');
+    });
+
+    // Fail closed, and serve NO body — the same contract TRA-3380 established.
+    it('400s on a malformed, half-open or conflicting window and leaks no population', async () => {
+      const cases: Array<[Record<string, string>, string]> = [
+        [{ sinceEtDay: '2026-07-27' }, 'et_day_window_incomplete'],
+        [{ untilEtDay: '2026-08-13' }, 'et_day_window_incomplete'],
+        [{ sinceEtDay: '07/27/2026', untilEtDay: '2026-08-13' }, 'sinceEtDay_not_et_day'],
+        [{ sinceEtDay: '2026-08-13', untilEtDay: '2026-07-27' }, 'et_day_window_inverted'],
+        [{ untilTs: 'not-a-number' }, 'untilTs_not_epoch_ms'],
+        [{ closedUntilTs: '1784896740' }, 'closedUntilTs_below_min'],
+        [
+          { sinceTs: '1784896740000', sinceEtDay: '2026-07-27', untilEtDay: '2026-08-13' },
+          'cohort_axis_conflict',
+        ],
+        [{ untilTs: '1784896740000', closedUntilTs: '1784896740000' }, 'cohort_axis_conflict'],
+        [
+          { sinceEtDay: '2026-07-27', untilEtDay: '2026-08-13', closedSinceTs: '1784896740000' },
+          'cohort_window_conflict',
+        ],
+        [{ sinceTs: '1784896740000', untilTs: '1784896739000' }, 'cohort_window_inverted'],
+      ];
+      for (const [query, error] of cases) {
+        const routes = mount();
+        const res = fakeRes();
+        await routes.get('/api/health/option-journal')![0]!({ query }, res);
+        expect(res.statusCode, JSON.stringify(query)).toBe(400);
+        const body = res.body as Record<string, unknown>;
+        expect(body['error'], JSON.stringify(query)).toBe(error);
+        expect(body['filterApplied']).toBe(false);
+        for (const leaked of ['summary', 'sleeveCells', 'deskRowCount', 'rows']) {
+          expect(body).not.toHaveProperty(leaked);
+        }
+      }
+    });
+
+    // The other direction, without which "the route 400s" would pass on a route
+    // that 400s always.
+    it('still serves 200 with the grid for the unwindowed and epoch-ms cases', async () => {
+      for (const query of [
+        {},
+        { untilTs: '1784896740000' },
+        { closedSinceTs: '1784896740000', closedUntilTs: '1784996740000' },
+      ]) {
+        const routes = mount();
+        const res = fakeRes();
+        await routes.get('/api/health/option-journal')![0]!({ query }, res);
+        expect(res.statusCode, JSON.stringify(query)).toBe(200);
+        expect(res.body).toHaveProperty('sleeveCells');
+        expect(res.body).toHaveProperty('window');
+      }
+    });
   });
 });
