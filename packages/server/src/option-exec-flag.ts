@@ -782,11 +782,36 @@ export function resolveLiveOptionTestAggregateCapUsd(
 //
 // The replacement needs NO cross-engine state, which is the whole point:
 //
-//     B_i = min( φ · availableCash_i , A )        Σ_i φ·E_i = φ·Σ_i E_i ≡ A
+//     B_i = min( φ · availableCash_i , A )
 //
-// The fleet bound falls out of the arithmetic, so each engine needs only ITS
-// OWN balance and one shared scalar — an absolute fleet authorization becomes
-// enforceable from inside a per-book check.
+// ⚠⚠ TRA-3723 — READ THE PRECONDITION. This block used to close the line above
+// with `Σ_i φ·E_i = φ·Σ_i E_i ≡ A` and call the fleet bound automatic. IT IS
+// NOT. That identity is not an identity; it is a FITTED COINCIDENCE that holds
+// only while
+//
+//     Σ_i E_i  ≤  A / φ  =  750 / 0.4858  =  $1,543.85
+//
+// because φ was fitted to ONE NIGHT of balances — the two numbers measured
+// 2026-08-14T01:0xZ, right above, summing to $1,543.96
+// ({@link LIVE_OPTION_TEST_FLEET_CAPITAL_BASIS_USD}). Note those are not the
+// same figure: rounding φ UP at the 4th place puts the ceiling ELEVEN CENTS
+// BELOW the capital it was fitted to, so the precondition is *already*
+// marginally violated — which is precisely the disclosed $0.05 overage, and
+// nothing more. `min(…, A)` is a PER-BOOK clamp; a per-book
+// clamp cannot bound a SUM. Past the basis the fleet fails OPEN, and the
+// trigger is a DEPOSIT — nobody has to touch φ, this file, or an env var:
+//
+//     admin at $2,000 : min(0.4858 × 2000, 750) = 750.00
+//     v0nni at $  400 : min(0.4858 ×  400, 750) = 194.32
+//     fleet                                       $944.32   vs a $750 authorization
+//
+// Bounding the SUM itself needs the cross-engine accumulator TRA-3445
+// deliberately avoided. TRA-3723 took the other option (its option (c)): the
+// fail-open is now DETECTED AND PUBLISHED rather than assumed away — see
+// `gradeLiveOtmFleetBound` below, served as `aggregateFleetBound` on
+// `GET /api/health/live-options-fee-slippage`. Be exact about what that buys:
+// it is a DETECTOR, not a bound. It makes the breach visible; it does not stop
+// it. The bound in force is still per book.
 //
 // Two properties worth naming because they are the reason to prefer this over a
 // smaller flat cap:
@@ -805,12 +830,21 @@ export function resolveLiveOptionTestAggregateCapUsd(
  * Compiled default fleet risk fraction φ — the share of a book's own available
  * cash it may put at aggregate risk in the bounded live-options test.
  *
- * `0.4858` = 750 / 1,543.96 = the board's authorization over today's fleet
- * capital (admin $1,143.96 + v0nni $400.00), so `Σ φ·E_i` lands on the
- * authorization exactly. It is a DEFAULT, not a law: when fleet capital moves,
- * ops re-points {@link LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR} — and because
- * `min(…, A)` still caps every book, a stale φ can only ever mis-size in the
- * bounded direction, never above `A`.
+ * `0.4858` = 750 / 1,543.96 = the board's authorization over the fleet capital
+ * MEASURED ON THE NIGHT THIS SHIPPED (admin $1,143.96 + v0nni $400.00), so
+ * `Σ φ·E_i` lands on the authorization exactly — *at that capital and no
+ * other*. It is a DEFAULT, not a law: when fleet capital moves, ops re-points
+ * {@link LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR}.
+ *
+ * ⚠⚠ TRA-3723 — this docstring used to close with "a stale φ can only ever
+ * mis-size in the bounded direction, never above `A`". That is true PER BOOK
+ * (`B_i ≤ A` always) and FALSE FOR THE FLEET, which is the number the board
+ * actually authorized. A stale φ over GROWN capital fails open on the sum:
+ * admin at $2,000 + v0nni at $400 ⇒ `Σ B_i` = $944.32 against `A` = $750. The
+ * precondition is `Σ E_i ≤ A/φ` = $1,543.85, it is not enforced anywhere, and
+ * the thing that violates it is a DEPOSIT — not an edit.
+ * {@link gradeLiveOtmFleetBound} detects and publishes the violation; nothing
+ * prevents it.
  *
  * ⚠ DISCLOSED, not hidden: `0.4858` is 750/1,543.96 = `0.485764…` rounded UP at
  * the 4th place, so on today's two books `Σ B_i` = 555.73 + 194.32 = **$750.05**
@@ -883,6 +917,240 @@ export function resolveLiveOptionTestBookAggregateCapUsd(
 /** Round a USD figure to whole cents (integer cents) for exact comparison. */
 function cents(usd: number): number {
   return Math.round(usd * 100);
+}
+
+// --------------------------------------------------------------------------
+// TRA-3723 — the FLEET-LEVEL assertion. Option (c) of the filing.
+//
+// Everything above bounds ONE book. Nothing above bounds the SUM, and the
+// comments used to say otherwise (see the corrected block at
+// `LIVE_OPTION_TEST_FLEET_RISK_FRACTION`). This is the detector that makes the
+// difference readable instead of assumed.
+//
+// It does NOT gate any order. A refusal would need every engine's balance at
+// the order site, i.e. the cross-engine accumulator TRA-3445 avoided on
+// purpose. What it converts is the FAILURE MODE: a silent, deposit-triggered
+// fail-open becomes a published verdict with the arithmetic attached.
+// --------------------------------------------------------------------------
+
+/**
+ * The fleet capital φ's compiled default was fitted to, USD: admin $1,143.96 +
+ * v0nni $400.00 as measured 2026-08-14T01:0xZ.
+ *
+ * This is the PRECONDITION of the whole capital-proportional scheme:
+ * `Σ_i E_i ≲ 1,543.96` ⇒ `Σ_i B_i ≲ A`. Above it the fleet exceeds the board's
+ * authorization with no edit, no flag and no env write — a deposit is enough.
+ *
+ * ⚠ `≲`, not `≤`. The bound that actually binds is `A/φ` = $1,543.85, ELEVEN
+ * CENTS below this, because `0.4858` is `0.485764…` rounded UP. Today's fleet
+ * therefore sits marginally past its own ceiling already, and that — not
+ * anything about capital — is the entire disclosed $0.05 overage.
+ * {@link gradeLiveOtmFleetBound} computes the ceiling from the φ IN FORCE
+ * rather than from this constant, so an ops re-point of φ moves it.
+ *
+ * ⚠ It is a DISCLOSURE, not a bound. Nothing reads it to refuse. It exists so
+ * the number the scheme silently depends on is nameable, greppable and
+ * gradeable, and so {@link gradeLiveOtmFleetBound} can publish the headroom
+ * against it. Re-derive it (and re-point φ) whenever the fleet's composition
+ * changes; a book joining the arm moves it as surely as a deposit does.
+ */
+export const LIVE_OPTION_TEST_FLEET_CAPITAL_BASIS_USD = 1543.96;
+
+/**
+ * φ is published and configured to FOUR decimal places, so the value in force
+ * may exceed the exact ratio `A / Σ E_i` by up to one unit in that place. That
+ * slack costs `1e-4 × Σ E_i` on the fleet sum — $0.15 at today's capital, which
+ * is what admits the already-disclosed $0.05 overage (`0.4858` is `0.485764…`
+ * rounded UP) without calling it a breach.
+ *
+ * It scales WITH capital deliberately. A flat dollar tolerance would be the
+ * same mistake as φ itself: a constant fitted to one night's balances, wrong by
+ * construction the moment they move.
+ */
+export const LIVE_OPTION_TEST_FLEET_RISK_FRACTION_ULP = 1e-4;
+
+/** One book's row as the fleet grade reads it. Matches `LiveOtmAggregateExposure`. */
+export interface LiveOtmFleetBoundRow {
+  /** `alertUsername`. Named in `books` / `unreadableBalanceBooks` so a breach is attributable. */
+  book: string | null;
+  /**
+   * ⭐ THE DISCRIMINATING FIELD. Rows are summed on THIS, never on `mode`:
+   * bqb1 carries three `mode: 'live'` books and two armed ones, so a
+   * mode-based sum overstates the fleet by a whole book (TRA-3445).
+   */
+  liveEntryGateOpen: boolean;
+  /** `B_i = min(φ · availableCashUsd, A)` as the order site would resolve it. */
+  capUsd: number;
+  /** `E_i` — the sizing basis. `null` ⇒ no usable snapshot ⇒ `capUsd` is 0. */
+  availableCashUsd: number | null;
+}
+
+/**
+ * - `within` — `Σ B_i ≤ A`. The authorization holds.
+ * - `rounding_only` — over `A`, but by no more than the φ 4th-place slack
+ *   ({@link LIVE_OPTION_TEST_FLEET_RISK_FRACTION_ULP}). The disclosed $0.05,
+ *   NOT the defect TRA-3723 is about. Separated so it cannot be spent as
+ *   evidence in either direction.
+ * - `breach` — `Σ B_i` exceeds `A` by more than that slack. THE FAIL-OPEN.
+ * - `blind` — could not be graded (provider unwired, unusable `A`, a non-finite
+ *   `capUsd`). Never collapse this into `within`: "checked and fine" and "could
+ *   not check" must not share a value.
+ */
+export type LiveOtmFleetBoundVerdict = 'within' | 'rounding_only' | 'breach' | 'blind';
+
+/** TRA-3723 — the published fleet-bound assertion. */
+export interface LiveOtmFleetBoundGrade {
+  verdict: LiveOtmFleetBoundVerdict;
+  /** Why, in words, for a reader who has only this object. */
+  reason: string;
+  /** `A`, the board's TRA-3384 fleet authorization as resolved from env. */
+  fleetCapUsd: number;
+  /** φ as resolved from env. `null` ⇒ unusable, which nulls the capital columns ONLY. */
+  fleetRiskFraction: number | null;
+  /** How many rows were summed (`liveEntryGateOpen === true`). */
+  gateOpenBooks: number;
+  /** Every gate-open book, named. */
+  books: Array<string | null>;
+  /** `Σ B_i` over the gate-open rows. `null` when `blind`. */
+  sumBookCapUsd: number | null;
+  /** `max(0, Σ B_i − A)`. `null` when `blind`. */
+  overageUsd: number | null;
+  /** The φ-rounding slack allowed before `overageUsd` counts as a breach. */
+  roundingAllowanceUsd: number | null;
+  /** `Σ E_i` over gate-open rows with a readable balance. */
+  fleetCapitalUsd: number | null;
+  /** `A / φ` — the capital ceiling the scheme silently assumes. `null` ⇒ φ unusable. */
+  fleetCapitalCeilingUsd: number | null;
+  /** `ceiling − capital`; NEGATIVE means the precondition is already violated. */
+  fleetCapitalHeadroomUsd: number | null;
+  /** Gate-open books whose balance was unreadable — they contribute `B_i = 0`. */
+  unreadableBalanceBooks: Array<string | null>;
+}
+
+function blindGrade(reason: string, fleetCapUsd: number): LiveOtmFleetBoundGrade {
+  return {
+    verdict: 'blind',
+    reason,
+    fleetCapUsd,
+    fleetRiskFraction: null,
+    gateOpenBooks: 0,
+    books: [],
+    sumBookCapUsd: null,
+    overageUsd: null,
+    roundingAllowanceUsd: null,
+    fleetCapitalUsd: null,
+    fleetCapitalCeilingUsd: null,
+    fleetCapitalHeadroomUsd: null,
+    unreadableBalanceBooks: [],
+  };
+}
+
+/**
+ * Grade the FLEET bound: does `Σ_i B_i` over the armed books still fit the
+ * board's authorization `A`?
+ *
+ * Two columns, deliberately independent (TRA-3421: a validity gate for the
+ * SECONDARY reading must not suppress the PRIMARY one):
+ *
+ *   1. THE VERDICT — summed from `capUsd`, which is what each order site will
+ *      actually honour. A book whose balance is dark has `capUsd = 0` and can
+ *      spend nothing, so the sum is exact even when the capital column is not.
+ *      An unusable φ does NOT blind it.
+ *   2. THE CAPITAL COLUMNS — `Σ E_i` against `A/φ`, the forward-looking
+ *      precondition. These go `null` when they cannot be computed, and that
+ *      never touches the verdict.
+ *
+ * Fails to `blind`, never to `within`: an unwired provider (`rows == null`), a
+ * non-finite / non-positive `A`, or any gate-open row carrying a non-finite
+ * `capUsd`.
+ */
+export function gradeLiveOtmFleetBound(
+  rows: readonly LiveOtmFleetBoundRow[] | null | undefined,
+  fleetCapUsd: number,
+  fleetRiskFraction: number,
+): LiveOtmFleetBoundGrade {
+  if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) {
+    return blindGrade('fleet authorization A is unusable — cannot grade a sum against it', fleetCapUsd);
+  }
+  if (!Array.isArray(rows)) {
+    return blindGrade('aggregate exposure provider is not wired — no rows to sum', fleetCapUsd);
+  }
+
+  const open = rows.filter(r => r?.liveEntryGateOpen === true);
+  const books = open.map(r => r.book);
+  if (open.some(r => typeof r.capUsd !== 'number' || !Number.isFinite(r.capUsd))) {
+    return {
+      ...blindGrade('a gate-open book published a non-finite capUsd — the sum is unknowable', fleetCapUsd),
+      gateOpenBooks: open.length,
+      books,
+    };
+  }
+
+  const sumCents = open.reduce((acc, r) => acc + cents(r.capUsd), 0);
+  const sumBookCapUsd = sumCents / 100;
+  const overageUsd = Math.max(0, (sumCents - cents(fleetCapUsd)) / 100);
+
+  const phi =
+    Number.isFinite(fleetRiskFraction) && fleetRiskFraction > 0 ? fleetRiskFraction : null;
+  const readable = open.filter(
+    r => typeof r.availableCashUsd === 'number' && Number.isFinite(r.availableCashUsd),
+  );
+  const unreadableBalanceBooks = open
+    .filter(r => typeof r.availableCashUsd !== 'number' || !Number.isFinite(r.availableCashUsd))
+    .map(r => r.book);
+  const fleetCapitalUsd =
+    readable.reduce((acc, r) => acc + cents(r.availableCashUsd as number), 0) / 100;
+  const fleetCapitalCeilingUsd = phi === null ? null : Math.round((fleetCapUsd / phi) * 100) / 100;
+  const fleetCapitalHeadroomUsd =
+    fleetCapitalCeilingUsd === null
+      ? null
+      : Math.round((fleetCapitalCeilingUsd - fleetCapitalUsd) * 100) / 100;
+
+  // The slack is a property of how precisely φ can be EXPRESSED, so it is
+  // measured against the capital that produced the sum — never a flat dollar
+  // figure, which would be φ's own mistake one level up.
+  const roundingAllowanceUsd =
+    Math.round(LIVE_OPTION_TEST_FLEET_RISK_FRACTION_ULP * fleetCapitalUsd * 100) / 100;
+
+  let verdict: LiveOtmFleetBoundVerdict;
+  let reason: string;
+  if (overageUsd <= 0) {
+    verdict = 'within';
+    reason =
+      `Σ B_i $${sumBookCapUsd.toFixed(2)} over ${open.length} armed book(s) fits the `
+      + `$${fleetCapUsd.toFixed(2)} fleet authorization`;
+  } else if (cents(overageUsd) <= cents(roundingAllowanceUsd)) {
+    verdict = 'rounding_only';
+    reason =
+      `Σ B_i $${sumBookCapUsd.toFixed(2)} is $${overageUsd.toFixed(2)} over the `
+      + `$${fleetCapUsd.toFixed(2)} authorization, within the $${roundingAllowanceUsd.toFixed(2)} `
+      + `φ 4th-place slack — the disclosed rounding overage, not a capital fail-open`;
+  } else {
+    verdict = 'breach';
+    reason =
+      `FLEET FAIL-OPEN: Σ B_i $${sumBookCapUsd.toFixed(2)} over ${open.length} armed book(s) `
+      + `exceeds the $${fleetCapUsd.toFixed(2)} authorization by $${overageUsd.toFixed(2)} `
+      + `(φ ${phi ?? 'unreadable'} is stale against fleet capital `
+      + `$${fleetCapitalUsd.toFixed(2)}; the precondition is Σ E_i ≤ `
+      + `$${fleetCapitalCeilingUsd?.toFixed(2) ?? '?'}). min(…, A) is PER BOOK and does not bound `
+      + `this sum — see TRA-3723`;
+  }
+
+  return {
+    verdict,
+    reason,
+    fleetCapUsd,
+    fleetRiskFraction: phi,
+    gateOpenBooks: open.length,
+    books,
+    sumBookCapUsd,
+    overageUsd,
+    roundingAllowanceUsd,
+    fleetCapitalUsd,
+    fleetCapitalCeilingUsd,
+    fleetCapitalHeadroomUsd,
+    unreadableBalanceBooks,
+  };
 }
 
 /**

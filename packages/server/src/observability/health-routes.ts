@@ -63,6 +63,8 @@ import {
   LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING,
   LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR,
   resolveLiveOptionTestFleetRiskFraction,
+  LIVE_OPTION_TEST_FLEET_CAPITAL_BASIS_USD, // TRA-3723
+  gradeLiveOtmFleetBound,
   isOptionCostGateLiveEnforceEnabled,
   isOptionLiquidityLiveEnforceEnabled,
   OPTION_COST_GATE_LIVE_ENFORCE_FLAG,
@@ -4413,6 +4415,10 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         liveEnv,
       ),
     };
+    // TRA-3723 — read ONCE. The published rows and the fleet grade below must be
+    // the same snapshot: two calls walk every engine twice and could serve a sum
+    // that no row set on this response supports.
+    const aggregateExposureRows = deps.liveOtmAggregateExposure?.() ?? null;
     res.json({
       ok: true,
       time: new Date(nowMs).toISOString(),
@@ -4471,6 +4477,11 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       fleetRiskFractionDefault: LIVE_OPTION_TEST_FLEET_RISK_FRACTION,
       fleetRiskFractionCeiling: LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING,
       fleetRiskFractionVar: LIVE_OPTION_TEST_FLEET_RISK_FRACTION_VAR,
+      // TRA-3723 — the capital the COMPILED φ was fitted to, published because
+      // the scheme's correctness depends on it and nothing enforced it. Compare
+      // against `aggregateFleetBound.fleetCapitalUsd` below: once live fleet
+      // capital passes this figure, `Σ B_i` passes the authorization.
+      fleetCapitalBasisUsd: LIVE_OPTION_TEST_FLEET_CAPITAL_BASIS_USD,
       // ⭐ READ THIS, NOT THE CAP ALONE. A cap value reads IDENTICALLY at
       // headroom $600 and headroom $0, and those two states are the entire
       // point of the instrument. One row per engine, computed by the same fold
@@ -4479,19 +4490,39 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // would claim "no books" against an unwired route.
       //
       // SCOPE IS PER BOOK (TRA-3445 item 3): each engine sizes against its own
-      // Tradier balance and there is no fleet accumulator. TRA-3674 made that
-      // sound: each row's `capUsd` is now `min(φ · availableCashUsd,
-      // fleetCapUsd)`, so `Σ B_i ≤ φ · Σ E_i ≡ A` — the fleet bound falls out of
-      // the arithmetic and no cross-engine state is needed to hold it.
+      // Tradier balance and there is no fleet accumulator. TRA-3674 made each
+      // row's `capUsd` `min(φ · availableCashUsd, fleetCapUsd)`.
       //
-      // ⚠ The fleet figure is still a sum the READER takes, over the
-      // `liveEntryGateOpen` rows and NOT the `mode: 'live'` ones (bqb1 carries
-      // three of the latter, two of the former) — and it is a sum of the rows'
-      // own `capUsd`, NEVER `cap × books`. That multiplication assumes the cap
-      // binds; before TRA-3674 it read $1,400 against a true worst case of
-      // $1,150, because v0nni bound on its own $400 of cash and the cap never
-      // bit. Run the admit loop, or sum this column.
-      aggregateExposure: deps.liveOtmAggregateExposure?.() ?? null,
+      // ⚠⚠ TRA-3723 — this note used to continue "so `Σ B_i ≤ φ · Σ E_i ≡ A` —
+      // the fleet bound falls out of the arithmetic and no cross-engine state is
+      // needed to hold it." THAT WAS FALSE and it is deleted rather than
+      // softened, because a comment that tells the reader the bound is
+      // structural retires the question. `min(…, A)` is a PER-BOOK clamp; it
+      // cannot bound a sum. The fleet bound holds only while
+      // `Σ E_i ≤ A/φ = $1,543.85` — the capital φ was FITTED to on the night it
+      // shipped ($1,543.96), less the 11¢ that rounding φ up at the 4th place
+      // costs — and the thing that violates it is a DEPOSIT, not an edit.
+      // Grade it, do not assume it: `aggregateFleetBound` below.
+      //
+      // ⚠ The fleet figure is a sum over the `liveEntryGateOpen` rows and NOT
+      // the `mode: 'live'` ones (bqb1 carries three of the latter, two of the
+      // former) — and it is a sum of the rows' own `capUsd`, NEVER
+      // `cap × books`. That multiplication assumes the cap binds; before
+      // TRA-3674 it read $1,400 against a true worst case of $1,150, because
+      // v0nni bound on its own $400 of cash and the cap never bit. Run the
+      // admit loop, or sum this column.
+      aggregateExposure: aggregateExposureRows,
+      // TRA-3723 — the sum taken FOR the reader, and graded. `aggregateExposure`
+      // above published every term needed to catch the fail-open and nobody
+      // took the sum, which is the whole reason it shipped believed-safe. This
+      // is a DETECTOR, not a bound: no order site consults it, so a `breach`
+      // means money is already authorized past the board's figure — it does not
+      // mean anything stopped. `blind` ⇒ could not grade; never read it as fine.
+      aggregateFleetBound: gradeLiveOtmFleetBound(
+        aggregateExposureRows,
+        aggregateCapLive, // the SAME resolved A the route publishes above
+        resolveLiveOptionTestFleetRiskFraction(liveEnv),
+      ),
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {

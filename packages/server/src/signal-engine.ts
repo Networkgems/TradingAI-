@@ -10749,11 +10749,24 @@ export class SignalEngine {
           // reset counter reads identically to a flat book, which would re-grant
           // the full $750 after every redeploy.
           //
-          // TRA-3674 — SCOPE IS STILL PER BOOK, but the budget is now
-          // CAPITAL-PROPORTIONAL, so the fleet total is bounded without a fleet
-          // accumulator:
+          // TRA-3674 — SCOPE IS STILL PER BOOK, and the budget is
+          // CAPITAL-PROPORTIONAL:
           //
-          //     B_i = min( φ · availableCash , A )     Σ_i φ·E_i = φ·Σ_i E_i ≡ A
+          //     B_i = min( φ · availableCash , A )
+          //
+          // ⚠⚠ TRA-3723 — this note used to end that line with
+          // `Σ_i φ·E_i = φ·Σ_i E_i ≡ A` and claim the fleet total was "bounded
+          // without a fleet accumulator". IT IS NOT. `min(…, A)` clamps THIS
+          // BOOK; it cannot bound a SUM. The fleet bound holds only while
+          // `Σ_i E_i ≤ A/φ = $1,543.85` — the capital φ was fitted to on the
+          // night it shipped ($1,543.96), less the 11¢ that rounding φ UP
+          // costs. Grow admin to $2,000 and the fleet admits
+          // $750.00 + $194.32 = $944.32 against a $750 authorization, with no
+          // edit and no env write: A DEPOSIT IS THE TRIGGER. Nothing at this
+          // site can see the other books, so nothing here refuses it; the
+          // breach is DETECTED and published as `aggregateFleetBound` on
+          // `GET /api/health/live-options-fee-slippage`
+          // (`gradeLiveOtmFleetBound`). Detector, not bound.
           //
           // The note this replaces read "two armed books admit $750 each … the
           // fleet number is DISCLOSED, not silently assumed to be $750". The

@@ -5929,6 +5929,94 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
     expect(serveFeeSlippage().aggregateExposure).toBeNull();
     expect(serveFeeSlippage(() => []).aggregateExposure).toEqual([]);
   });
+
+  // ─── TRA-3723 — the sum, TAKEN, not left to the reader ─────────────────────
+  // Every term needed to catch the fleet fail-open was already published in the
+  // rows above, and the block comment told the reader not to bother: "the fleet
+  // bound falls out of the arithmetic and no cross-engine state is needed to
+  // hold it." It does not, and this is the field that says so out loud.
+  //
+  // ⚠ DETECTOR, NOT BOUND. No order site reads `aggregateFleetBound`. A
+  // `breach` here means money is ALREADY authorized past the board's figure —
+  // it does not mean anything stopped.
+  describe('aggregateFleetBound (TRA-3723)', () => {
+    type Row = {
+      book: string | null; mode: 'demo' | 'live'; liveEntryGateOpen: boolean; capUsd: number;
+      fleetCapUsd: number; fleetRiskFraction: number; availableCashUsd: number | null;
+      openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
+      headroomUsd: number | null;
+    };
+    const row = (
+      book: string, liveEntryGateOpen: boolean, capUsd: number, availableCashUsd: number | null,
+    ): Row => ({
+      book, mode: 'live', liveEntryGateOpen, capUsd, fleetCapUsd: 750,
+      fleetRiskFraction: 0.4858, availableCashUsd, openPremiumAtRiskUsd: 0, openRows: 0,
+      unpricedOpenRows: 0, headroomUsd: capUsd,
+    });
+    const bound = (rows?: Row[]) =>
+      (serveFeeSlippage(rows ? () => rows : undefined) as unknown as {
+        aggregateFleetBound: {
+          verdict: string; reason: string; sumBookCapUsd: number | null;
+          overageUsd: number | null; gateOpenBooks: number; books: Array<string | null>;
+          fleetCapitalUsd: number | null; fleetCapitalCeilingUsd: number | null;
+        };
+      }).aggregateFleetBound;
+
+    it("today's fleet publishes `rounding_only` — the disclosed 5c, not a breach", () => {
+      const g = bound([
+        row('admin', true, 555.73, 1143.96),
+        row('Richard', false, 0, null),
+        row('v0nni', true, 194.32, 400),
+      ]);
+      expect(g.verdict).toBe('rounding_only');
+      expect(g.sumBookCapUsd).toBe(750.05);
+      expect(g.overageUsd).toBe(0.05);
+      expect(g.gateOpenBooks).toBe(2); // NOT the three `mode: 'live'` rows
+      expect(g.books).toEqual(['admin', 'v0nni']);
+    });
+
+    it('THE FAIL-OPEN: admin at $2,000 publishes `breach` with the overage named', () => {
+      // The same rows the engine would serve after a DEPOSIT — no flag moved,
+      // no env written, no code edited.
+      const g = bound([row('admin', true, 750, 2000), row('v0nni', true, 194.32, 400)]);
+      expect(g.verdict).toBe('breach');
+      expect(g.sumBookCapUsd).toBe(944.32);
+      expect(g.overageUsd).toBe(194.32);
+      expect(g.fleetCapitalUsd).toBe(2400);
+      expect(g.fleetCapitalCeilingUsd).toBe(1543.85); // A/φ
+      expect(g.reason).toContain('FLEET FAIL-OPEN');
+    });
+
+    it('an unwired provider is `blind` on the route too — not a quiet pass', () => {
+      const g = bound();
+      expect(g.verdict).toBe('blind');
+      expect(g.sumBookCapUsd).toBeNull();
+    });
+
+    it('is graded from the SAME snapshot it publishes — the provider is read once', () => {
+      // Two reads could serve a sum no row on this response supports. Also the
+      // only thing that would catch the grade being computed off a second,
+      // differently-timed walk of the engines.
+      let calls = 0;
+      const rows = [row('admin', true, 750, 2000), row('v0nni', true, 194.32, 400)];
+      const body = serveFeeSlippage(() => { calls += 1; return rows; }) as unknown as {
+        aggregateExposure: Row[];
+        aggregateFleetBound: { sumBookCapUsd: number };
+      };
+      expect(calls).toBe(1);
+      // `toBeCloseTo`, because the naive float reduce here lands on
+      // 944.3199999999999 — the grade itself sums in whole CENTS and does not.
+      expect(body.aggregateFleetBound.sumBookCapUsd).toBeCloseTo(
+        body.aggregateExposure.filter(r => r.liveEntryGateOpen).reduce((s, r) => s + r.capUsd, 0),
+        2,
+      );
+    });
+
+    it('publishes the fitted capital basis so the precondition is greppable', () => {
+      expect((serveFeeSlippage() as unknown as { fleetCapitalBasisUsd: number })
+        .fleetCapitalBasisUsd).toBe(1543.96);
+    });
+  });
 });
 
 // ── TRA-3715 — the sleeve grading surface, wired to the route ────────────────
