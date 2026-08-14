@@ -101,7 +101,15 @@ import {
   recordOptionTradeClose,
   recordOptionTradeVoid,
   getOptionTradeVoids,
+  recordOptionTradeCloseBasis,
+  getOptionTradeCloseBasisAmends,
 } from './option-trade-journal.js';
+// TRA-2819 — the money-side sibling of the repair below. That one decides
+// whether a stale OPEN row is a trade at all; this one takes rows that are
+// already correctly CLOSED and moves their P&L from the app's mid-basis,
+// gross-of-fees arithmetic onto the broker's fills. Same pure-planner shape, so
+// the correction can be read in full before a byte is appended.
+import { planCloseBasisRestate } from './tra2819-close-basis-restate.js';
 // TRA-3485 — the PARTITIONED repair for the stale live `OPEN` rows. The planner
 // is pure and lives in its own module so the partition can be graded (dry run)
 // before a single byte is appended.
@@ -10806,6 +10814,127 @@ app.post('/api/health/option-journal/repair', requireAuth, requireAdmin, async (
     note: apply
       ? `Applied: ${plan.counts.retract} retracted, ${plan.counts.backfillClose} closes back-filled, ${plan.counts.noAction} refused.`
       : `DRY RUN — nothing written. Plan: ${plan.counts.retract} retract / ${plan.counts.backfillClose} backfill_close / ${plan.counts.noAction} no_action. Re-POST with ?apply=true&confirm=TRA-3485 to execute.`,
+  });
+});
+
+// TRA-2819 asks 1+2 — restate the MONEY on closed live rows to broker truth.
+//
+// Deliberately a SEPARATE route from the repair above, not a flag on it. The two
+// act on disjoint populations (`OPEN` rows vs closed ones), carry different
+// confirmation tokens, and have different worst cases: that one can delete a
+// real trade, this one can misprice a settled one. Folding them together would
+// also cost the repair its idempotency tell — a re-run of TRA-3485 reports
+// `scanned: 0`, which is only readable because nothing else shares the counter.
+app.post('/api/health/option-journal/close-basis-repair', requireAuth, requireAdmin, async (req, res) => {
+  if (!isOptionTradeJournalEnabled()) {
+    res.status(409).json({ ok: false, error: 'option trade journal is disabled on this host; nothing to restate' });
+    return;
+  }
+  const q = req.query as Record<string, unknown>;
+  const wantsApply = q['apply'] === 'true' || q['apply'] === '1';
+  const confirmed = q['confirm'] === 'TRA-2819';
+  if (wantsApply && !confirmed) {
+    res.status(400).json({
+      ok: false,
+      error: 'apply=true requires confirm=TRA-2819',
+      detail:
+        'A restatement supersedes realized P&L on a settled live round trip through the replay fold '
+        + 'and cannot be undone. The confirmation is what keeps a mistyped flag in the dry-run branch.',
+    });
+    return;
+  }
+  const apply = wantsApply && confirmed;
+
+  // Re-derived in THIS request off the live journal and the live fill ledger.
+  // There is no stored cohort and no list of ids in the code, for the reason the
+  // repair above states: a correction keyed to a stale partition rewrites
+  // history in the wrong direction while still reading as correct.
+  const ledger = summarizeLiveOptionsFeeSlippage();
+  const journalRows = await listOptionTradeJournal({ mode: 'live' });
+  const plan = planCloseBasisRestate(journalRows, ledger.records);
+  const amendsBefore = getOptionTradeCloseBasisAmends();
+
+  // The ledger is the ONLY source of broker truth here, so its health gates the
+  // run — the same refusal the repair above makes, for a different failure. Here
+  // a sick ledger does not invert an inference; it supplies MISSING FEES, and a
+  // missing fee reads as a smaller correction rather than as an error. The
+  // planner already refuses a row whose fees are null, but an ephemeral or
+  // erroring store can also mean the FILLS are partial — under which the entry
+  // or exit leg silently prices off whatever survived.
+  const ledgerUsable =
+    !ledger.durability.ephemeral && ledger.durability.appendErrors === 0 && ledger.n > 0;
+  if (apply && !ledgerUsable) {
+    res.status(409).json({
+      ok: false,
+      error: 'fill ledger is not a usable source of broker truth; refusing to apply',
+      durability: ledger.durability,
+      n: ledger.n,
+      detail:
+        'Every restated figure is derived from this ledger\'s fills and fees. An ephemeral store, an '
+        + 'append error, or an empty record set means a leg can be missing, and a partially-covered '
+        + 'round trip would be priced off the fills that happened to survive.',
+    });
+    return;
+  }
+
+  const results: {
+    id: string;
+    optionSymbol: string | null;
+    ok: boolean;
+    realizedPnlUsdBefore: number | null;
+    realizedPnlUsdAfter: number | null;
+    deltaUsd: number | null;
+    detail: string;
+  }[] = [];
+  if (apply) {
+    for (const row of plan.rows) {
+      if (row.treatment !== 'restate' || !row.basis) continue;
+      const ok = await recordOptionTradeCloseBasis(row.id, row.basis);
+      results.push({
+        id: row.id,
+        optionSymbol: row.optionSymbol,
+        ok,
+        realizedPnlUsdBefore: row.realizedPnlUsdBefore,
+        realizedPnlUsdAfter: row.realizedPnlUsdAfter,
+        deltaUsd: row.deltaUsd,
+        // `false` is the stop signal: the fold refused because the row is
+        // unknown or still OPEN, i.e. the restatement was pointed at a position
+        // that has not settled.
+        detail: ok
+          ? `restated through the replay fold: ${row.realizedPnlUsdBefore} -> ${row.realizedPnlUsdAfter} USD (fees ${row.feesUsd})`
+          : 'REFUSED by the fold (row unknown or still OPEN)',
+      });
+    }
+  }
+
+  // Re-read AFTER the pass, through the same fold every production read uses, so
+  // the response proves what the store now says rather than what we intended.
+  const after = apply ? await listOptionTradeJournal({ mode: 'live' }) : journalRows;
+  const restatedRows = after.filter((r) => r.pnlBasis === 'broker-fill');
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+    build: resolveBuildInfo(),
+    applied: apply,
+    ledger: { n: ledger.n, durability: ledger.durability, usableSourceOfTruth: ledgerUsable },
+    plan,
+    results,
+    // The before/after control. A restatement changes a number IN PLACE, so a
+    // pass that did nothing and a pass that worked leave the same row count —
+    // the amend witness and the net delta are the only things that separate
+    // them. `netDeltaUsd` is the acceptance figure: on the 2026-07-30 cohort it
+    // is the −25.27 that moves the live journal from +739.00 to Tradier's
+    // +713.73.
+    amends: {
+      before: { total: amendsBefore.total, applied: amendsBefore.applied, netDeltaUsd: amendsBefore.netDeltaUsd },
+      after: apply ? getOptionTradeCloseBasisAmends() : null,
+    },
+    liveRowsCarryingBrokerBasis: restatedRows.length,
+    liveClosedRealizedPnlUsd:
+      Math.round(after.filter((r) => r.outcome !== 'OPEN').reduce((s, r) => s + (r.realizedPnlUsd ?? 0), 0) * 100) / 100,
+    note: apply
+      ? `Applied: ${results.filter((r) => r.ok).length}/${plan.counts.restate} rows restated, net ${plan.netDeltaUsd} USD.`
+      : `DRY RUN — nothing written. Plan: ${plan.counts.restate} restate / ${plan.counts.skip} skip, net ${plan.netDeltaUsd} USD. Re-POST with ?apply=true&confirm=TRA-2819 to execute.`,
   });
 });
 

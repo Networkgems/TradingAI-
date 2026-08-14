@@ -426,6 +426,81 @@ export interface OptionTradeJournalRecord extends OptionTradeJournalOpen {
    * it for anything that must tell them apart.
    */
   partials?: OptionTradeJournalPartial[];
+  /**
+   * TRA-2819 — PROVENANCE of `realizedPnlUsd`, and the field that makes an
+   * engine-booked figure distinguishable from a broker-settled one.
+   *
+   * ABSENT means the engine's own close arithmetic produced the number:
+   * `(exit − premiumPaid) × contracts × 100`, where `premiumPaid` on an
+   * engine-opened row is the scanner's pre-trade NBBO **mid**, and where no
+   * broker commission has been deducted. That figure is honest about what the
+   * app observed and is NOT broker truth — measured on the three live
+   * 2026-07-30 round trips it read **+739.00** against Tradier's **+713.73**,
+   * a +25.27 overstatement that decomposes exactly into +23.00 of entry-basis
+   * (mid vs fill) and +2.27 of unbilled fees.
+   *
+   * `'broker-fill'` means the row has been restated from the durable fill
+   * ledger: broker entry fill, broker exit fill, NET of MEASURED broker fees.
+   *
+   * The two must be tellable apart at the row level and not merely in a
+   * changelog. A restated row and an engine row are both just a number in the
+   * same field, and a reader that cannot separate them will average a
+   * broker-exact figure against a mid-basis one and publish the mean as
+   * settled. Absent-means-engine is safe because it is the pre-ticket state of
+   * every existing row; do not reuse that collapse for anything that must tell
+   * "unrestated" from "restated and unchanged" — for that, read
+   * {@link getOptionTradeCloseBasisAmends}, which records the zero-delta skips
+   * the row itself cannot show.
+   */
+  pnlBasis?: 'broker-fill';
+  /**
+   * TRA-2819 — Σ measured broker fees netted out of `realizedPnlUsd`. Set ONLY
+   * alongside `pnlBasis`. Never zero-filled: the restatement refuses outright
+   * when any allocated leg's fee is unmeasured (TRA-1707 — `fees: null` means
+   * UNMEASURED, not free), because a GROSS number wearing a broker-truth label
+   * is worse than the wrong number it replaced. It at least looks settled.
+   */
+  feesUsd?: number;
+  /** TRA-2819 — volume-weighted broker ENTRY fill per contract, the restated basis. */
+  entryFillPremium?: number;
+  /** TRA-2819 — volume-weighted broker EXIT fill per contract. */
+  exitFillPremium?: number;
+  /**
+   * TRA-2819 — what `realizedPnlUsd` said BEFORE the restatement.
+   *
+   * Carried on the row so the correction is auditable from the row alone,
+   * without a diff against a store nobody kept. This is the same reasoning as
+   * the {@link EngineBasisRestatement} witness in `options-account.ts`: the
+   * pre-state is overwritten in place, so unless it is recorded at the moment
+   * it moves, a restated row is byte-indistinguishable from a row that was
+   * always right — which is the vacuous green this ticket exists to avoid.
+   */
+  realizedPnlUsdBeforeRestatement?: number;
+}
+
+/**
+ * TRA-2819 — the broker-settled money for a round trip whose CLOSE is already
+ * journalled, ready to supersede the engine's own arithmetic.
+ *
+ * Deliberately carries ONLY the money and its provenance. `closeTs`,
+ * `exitReason` and `holdDays` are NOT here and must not be touched by a
+ * restatement: the close genuinely happened, the engine genuinely journalled
+ * WHY (`trail`, `stop`, …), and that decision is not something broker fills can
+ * speak to. This differs from `reconstructed-TRA-3472` (TRA-3485), which
+ * fabricates a close row that never existed and therefore has to mark the exit
+ * reason as unknown. Here the exit reason is known and stays.
+ */
+export interface OptionTradeCloseBasis {
+  /** Broker-fill derived, NET of `feesUsd`. */
+  realizedPnlUsd: number;
+  /** `realizedPnlUsd / atRiskUsd` — recomputed, same denominator as before. */
+  realizedR: number;
+  /** Re-derived from the restated R; a fee correction can legitimately flip a near-scratch row. */
+  outcome: OptionTradeOutcome;
+  /** Σ measured broker fees. Never null, never zero-filled — see `feesUsd` above. */
+  feesUsd: number;
+  entryFillPremium: number;
+  exitFillPremium: number;
 }
 
 // Append-only line shapes (discriminated by `kind`).
@@ -461,7 +536,32 @@ type PartialCloseLine = { kind: 'partial_close'; id: string; partial: OptionTrad
 // structure, mode) is read off the record the fold is about to delete, so a
 // legacy `{kind,id}` line still yields a usable witness minus those two fields.
 type VoidLine = { kind: 'void'; id: string; ts?: number; reason?: string };
-type JournalLine = OpenLine | CloseLine | AmendEntrySlippageLine | PartialCloseLine | VoidLine;
+// TRA-2819 — supersede the MONEY on an already-CLOSED row with broker truth.
+//
+// The mirror image of `void`. That line retracts a row for a trade that never
+// happened; this one keeps a row for a trade that certainly did and corrects
+// what it earned. Both exist because the store is an append-only replay, so a
+// correction is a new line, never a rewritten byte.
+//
+// It is a SEPARATE kind rather than a second `close` line for the same id on
+// purpose. `recordOptionTradeClose` refuses anything that is not `OPEN` — that
+// guard is what stops a duplicate close from double-counting a round trip, and
+// it is load-bearing. Relaxing it so a restatement could ride the close path
+// would trade a known, narrow correction for a general re-close capability that
+// every other caller would then inherit.
+type AmendCloseBasisLine = {
+  kind: 'amend_close_basis';
+  id: string;
+  ts: number;
+  basis: OptionTradeCloseBasis;
+};
+type JournalLine =
+  | OpenLine
+  | CloseLine
+  | AmendEntrySlippageLine
+  | PartialCloseLine
+  | VoidLine
+  | AmendCloseBasisLine;
 
 /**
  * TRA-3472 — a retraction that leaves no trace is ungradeable.
@@ -540,6 +640,84 @@ export function getOptionTradeVoids(): {
   };
 }
 
+/**
+ * TRA-2819 — one witnessed restatement of a closed row's money.
+ *
+ * The row itself carries `realizedPnlUsdBeforeRestatement`, so why a second
+ * witness? Because the row can only testify about restatements that HAPPENED.
+ * The two facts this ledger holds and the row cannot are:
+ *
+ *   • `applied: false` — the fold REFUSED, because the row was still `OPEN` (a
+ *     restatement pointed at an unsettled position) or unknown. Dropping that
+ *     silently would hide an attempt to rewrite the money on a live trade.
+ *   • the `deltaUsd` of the whole pass, which is the number the acceptance
+ *     criterion is written against. A pass that restated nothing because every
+ *     row already agreed with the broker and a pass that restated nothing
+ *     because it never ran produce an IDENTICAL journal. Only a count tells
+ *     them apart — the same reason `voids` exists (TRA-3472).
+ */
+export interface OptionTradeCloseBasisAmendRecord {
+  id: string;
+  ts: number | null;
+  /** Did the fold actually restate a row, or was it refused (unknown / still OPEN)? */
+  applied: boolean;
+  mode: 'demo' | 'live' | null;
+  symbol: string | null;
+  optionSymbol: string | null;
+  /** The engine's figure this superseded; `null` when the fold refused. */
+  realizedPnlUsdBefore: number | null;
+  realizedPnlUsdAfter: number | null;
+  /** `after − before`; `null` when the fold refused. Signed: negative means the app was OVERSTATING. */
+  deltaUsd: number | null;
+  feesUsd: number | null;
+}
+
+/** Same rationale and cap as {@link VOID_LEDGER_CAP} — a witness, not a second journal. */
+const CLOSE_BASIS_AMEND_LEDGER_CAP = 500;
+let closeBasisAmendLedger: OptionTradeCloseBasisAmendRecord[] = [];
+let closeBasisAmendDropped = 0;
+
+function pushCloseBasisAmend(
+  sink: OptionTradeCloseBasisAmendRecord[],
+  rec: OptionTradeCloseBasisAmendRecord,
+): void {
+  sink.push(rec);
+  while (sink.length > CLOSE_BASIS_AMEND_LEDGER_CAP) {
+    sink.shift();
+    closeBasisAmendDropped += 1;
+  }
+}
+
+/**
+ * Restatements observed by the last load plus every one written since — the
+ * acceptance read for TRA-2819. Served by `/api/health/option-journal`.
+ *
+ * `netDeltaUsd` is the headline: Σ (after − before) over APPLIED restatements.
+ * On the 2026-07-30 live cohort it is the −25.27 that moves the journal from
+ * the app's +739.00 onto Tradier's +713.73.
+ */
+export function getOptionTradeCloseBasisAmends(): {
+  total: number;
+  dropped: number;
+  applied: number;
+  refused: number;
+  live: number;
+  netDeltaUsd: number;
+  recent: OptionTradeCloseBasisAmendRecord[];
+} {
+  const applied = closeBasisAmendLedger.filter((a) => a.applied);
+  return {
+    total: closeBasisAmendLedger.length,
+    dropped: closeBasisAmendDropped,
+    applied: applied.length,
+    refused: closeBasisAmendLedger.length - applied.length,
+    live: closeBasisAmendLedger.filter((a) => a.mode === 'live').length,
+    netDeltaUsd:
+      Math.round(applied.reduce((s, a) => s + (a.deltaUsd ?? 0), 0) * 100) / 100,
+    recent: closeBasisAmendLedger.map((a) => ({ ...a })),
+  };
+}
+
 function defaultStoreFile(): string {
   const root = resolveDataDir();
   return join(root, 'option-trade-journal.jsonl');
@@ -604,6 +782,10 @@ function foldLine(
   // integrity latch exists: a half-built ledger from a failed read must never be
   // served as a complete one. Live writes pass the published ledger directly.
   voidSink: OptionTradeVoidRecord[] = voidLedger,
+  // TRA-2819 — same contract as `voidSink`: a LOCAL array during replay,
+  // published only once the load completed, so a half-built witness from a
+  // failed read is never served as a complete one.
+  amendSink: OptionTradeCloseBasisAmendRecord[] = closeBasisAmendLedger,
 ): void {
   if (line.kind === 'open') {
     if (!map.has(line.rec.id)) map.set(line.rec.id, { ...line.rec, outcome: 'OPEN' });
@@ -676,6 +858,70 @@ function foldLine(
     map.delete(line.id);
     return;
   }
+  if (line.kind === 'amend_close_basis') {
+    // TRA-2819 — supersede the MONEY on a row that is already closed.
+    //
+    // Guarded on `outcome !== 'OPEN'`, which is the exact inverse of the `void`
+    // guard above and load-bearing for the same reason. A restatement landing
+    // on an OPEN row would stamp a realized P&L onto an unsettled position: it
+    // would enter every expectancy fold, learner read and day cell as a
+    // completed trade while the contracts are still at the broker. Refused —
+    // but RECORDED, because that would mean something is pricing a live
+    // position as settled and the silence is the expensive part.
+    const rec = map.get(line.id);
+    const basis = line.basis;
+    if (!rec || rec.outcome === 'OPEN' || !Number.isFinite(basis?.realizedPnlUsd)) {
+      pushCloseBasisAmend(amendSink, {
+        id: line.id,
+        ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
+        applied: false,
+        mode: rec?.mode ?? null,
+        symbol: rec?.symbol ?? null,
+        optionSymbol: rec?.optionSymbol ?? null,
+        realizedPnlUsdBefore: null,
+        realizedPnlUsdAfter: null,
+        deltaUsd: null,
+        feesUsd: null,
+      });
+      return;
+    }
+    // Read the pre-state off the record BEFORE overwriting it — after the
+    // `map.set` there is nothing left that remembers what the engine said.
+    const before = Number.isFinite(rec.realizedPnlUsd) ? (rec.realizedPnlUsd as number) : null;
+    pushCloseBasisAmend(amendSink, {
+      id: line.id,
+      ts: typeof line.ts === 'number' && Number.isFinite(line.ts) ? line.ts : null,
+      applied: true,
+      mode: rec.mode,
+      symbol: rec.symbol,
+      optionSymbol: rec.optionSymbol ?? null,
+      realizedPnlUsdBefore: before,
+      realizedPnlUsdAfter: basis.realizedPnlUsd,
+      deltaUsd: before === null ? null : Math.round((basis.realizedPnlUsd - before) * 100) / 100,
+      feesUsd: basis.feesUsd,
+    });
+    map.set(line.id, {
+      ...rec,
+      outcome: basis.outcome,
+      realizedPnlUsd: basis.realizedPnlUsd,
+      realizedR: basis.realizedR,
+      pnlBasis: 'broker-fill',
+      feesUsd: basis.feesUsd,
+      entryFillPremium: basis.entryFillPremium,
+      exitFillPremium: basis.exitFillPremium,
+      // On a REPLAY of two amends for the same id, the first one already moved
+      // `realizedPnlUsd`, so reading the pre-state off `rec` a second time
+      // would record the intermediate value as "what the engine said". Pin the
+      // ORIGINAL: absent means this is the first amend, and once set it never
+      // moves again. Only the money is last-write-wins.
+      ...(rec.realizedPnlUsdBeforeRestatement === undefined && before !== null
+        ? { realizedPnlUsdBeforeRestatement: before }
+        : {}),
+      // `closeTs`, `exitReason`, `holdDays` and `partials` are carried through
+      // by the spread and deliberately NOT restated — see OptionTradeCloseBasis.
+    });
+    return;
+  }
   const existing = map.get(line.id);
   if (!existing) return; // a close with no open is ignored, never resurrected
   map.set(line.id, {
@@ -701,6 +947,9 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   let readError: string | null = null;
   // TRA-3472 — replay into a LOCAL sink, publish below. See `foldLine`.
   const voidSink: OptionTradeVoidRecord[] = [];
+  // TRA-2819 — the restatement witness replays into a local sink for the same
+  // reason, and is published beside `voidLedger` below.
+  const amendSink: OptionTradeCloseBasisAmendRecord[] = [];
   if (existsSync(path)) {
     try {
       const raw = await readFile(path, 'utf-8');
@@ -708,7 +957,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
         const trimmed = rawLine.trim();
         if (!trimmed) continue;
         try {
-          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink);
+          foldLine(map, JSON.parse(trimmed) as JournalLine, voidSink, amendSink);
         } catch {
           // Skip a single corrupt line rather than losing the whole journal — but
           // COUNT it, so a dropped row cannot pass for a clean load.
@@ -729,6 +978,7 @@ async function ensureLoaded(): Promise<Map<string, OptionTradeJournalRecord>> {
   // must describe the same partial world, and `integrity.readError` is what
   // tells a reader to VOID rather than trust either.
   voidLedger = voidSink;
+  closeBasisAmendLedger = amendSink;
 
   // TRA-1681 — do NOT cache a book we could not read.
   //
@@ -959,6 +1209,75 @@ export async function recordOptionTradeVoid(
     structure: existing.structure,
     mode: existing.mode,
     reason: reason ?? null,
+  });
+  return true;
+}
+
+/**
+ * TRA-2819 — RESTATE the money on an already-CLOSED row to broker truth.
+ *
+ * ── The hole this closes ───────────────────────────────────────────────────
+ *
+ * A live round trip is journalled twice over by two different instruments that
+ * do not agree, and only one of them is the broker:
+ *
+ *   • `queueJournalClose` writes `position.pnl`, which is
+ *     `(exit − premiumPaid) × contracts × 100`. On an engine-opened row
+ *     `premiumPaid` starts life as the scanner's pre-trade NBBO **mid**
+ *     (`restateEngineOpenedBasis` moves it to broker truth, but only while the
+ *     position is still open and only once the reconcile reaches it), and
+ *     nothing anywhere subtracts commission — the broker's fee is not knowable
+ *     at close time, it lands on the account HISTORY endpoint a day later.
+ *   • the fee/slippage ledger holds the actual fills and, after the reconcile,
+ *     the actual fees.
+ *
+ * So the journal systematically overstates a live winner by
+ * `(fillPrice − mid) × contracts × 100 + fees`, in the direction that flatters,
+ * with no tell. Measured on the three 2026-07-30 live round trips: journal
+ * +739.00, Tradier `/gainloss` +713.73, and the +25.27 gap splits exactly
+ * +23.00 entry-basis / +2.27 fees. The same arithmetic applied to the
+ * TRA-3485-reconstructed PLTR row lands on 155.75 against the broker's 155.75 —
+ * that row is the positive control living in the same store: it is broker-exact
+ * precisely because it was priced from fills and netted of fees.
+ *
+ * ── Why this is not `recordOptionTradeClose` ──────────────────────────────
+ *
+ * That path refuses anything not `OPEN`, and that refusal is what stops a
+ * duplicate close from double-counting a round trip. This writes its own line
+ * kind instead of relaxing it. Money moves; `closeTs`, `exitReason`, `holdDays`
+ * and the partial slices do not — broker fills say what a trade earned, never
+ * why it was exited (the distinction `reconstructed-TRA-3472` had to make in
+ * the other direction, where the reason genuinely was unknown).
+ *
+ * No-op (returns false) when the flag is off, the id is unknown, the row is
+ * still OPEN, or the basis is not finite. The OPEN guard is the important one:
+ * stamping a realized figure on an unsettled position would publish it as a
+ * completed trade while the contracts are still at the broker.
+ */
+export async function recordOptionTradeCloseBasis(
+  id: string,
+  basis: OptionTradeCloseBasis,
+  // Test seam — pin the witness clock. Defaults to wall time.
+  ts: number = Date.now(),
+): Promise<boolean> {
+  if (!isOptionTradeJournalEnabled()) return false;
+  if (!Number.isFinite(basis?.realizedPnlUsd) || !Number.isFinite(basis?.feesUsd)) return false;
+  const map = await ensureLoaded();
+  const existing = map.get(id);
+  if (!existing || existing.outcome === 'OPEN') return false;
+  const before = existing.realizedPnlUsd;
+  const line: AmendCloseBasisLine = { kind: 'amend_close_basis', id, ts, basis };
+  foldLine(map, line);
+  await appendLine(line);
+  log.info('option trade journal close basis RESTATED to broker fills', {
+    issue: 'TRA-2819',
+    id,
+    symbol: existing.symbol,
+    optionSymbol: existing.optionSymbol,
+    mode: existing.mode,
+    realizedPnlUsdBefore: before,
+    realizedPnlUsdAfter: basis.realizedPnlUsd,
+    feesUsd: basis.feesUsd,
   });
   return true;
 }

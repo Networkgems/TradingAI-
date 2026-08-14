@@ -220,6 +220,7 @@ import {
   isOptionTradeJournalEnabled,
   getOptionTradeJournalIntegrity,
   getOptionTradeVoids, // TRA-3472 — the acceptance witness for the never-filled retraction
+  getOptionTradeCloseBasisAmends, // TRA-2819 — the acceptance witness for the broker-basis restatement
   GATE_R_BASIS_STRUCTURES, // TRA-2590 — which structures have a valid premium→gate R conversion
   type OptionTradeJournalSummary,
   type OptionTradeJournalIntegrity,
@@ -5810,6 +5811,14 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
     // OUTSIDE the `?sinceTs` cohort filter too — the filter selects rows, and
     // these are the rows that no longer exist.
     const voids = getOptionTradeVoids();
+    // TRA-2819 — outside the `?sinceTs` cohort filter for the same reason
+    // `voids` is: the filter selects rows, and this describes CORRECTIONS made
+    // to rows. Read `closeBasisAmends.netDeltaUsd` — a restatement moves a
+    // number in place, so the journal after a successful pass and the journal
+    // after a pass that never ran hold the same rows and the same row count.
+    // This is the only field that tells them apart, and `applied` vs `refused`
+    // is what says whether the fold accepted them.
+    const closeBasisAmends = getOptionTradeCloseBasisAmends();
     res.json({
       ...buildOptionJournalReport(
         rows,
@@ -5831,6 +5840,7 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         closedSinceTs,
       ),
       voids,
+      closeBasisAmends,
       // TRA-3547 — the zombie alarm, unauthenticated like the rest of this
       // route. A live `OPEN` row the broker tape says is NOT open sat silently
       // for 10 days because nothing published the contradiction; `summary` alone

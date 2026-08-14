@@ -150,7 +150,7 @@ export interface StaleOpenPlan {
   counts: { retract: number; backfillClose: number; noAction: number };
 }
 
-function isFinitePositive(v: number | null | undefined): v is number {
+export function isFinitePositive(v: number | null | undefined): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0;
 }
 
@@ -373,7 +373,13 @@ function planOne(row: OptionTradeJournalRecord, fills: LiveOptionFillRecord[]): 
   };
 }
 
-function allocate(
+/**
+ * TRA-2819 — exported so the close-basis restatement prices a round trip with
+ * the EXACT arithmetic that made the reconstructed rows broker-exact, rather
+ * than a second copy of it. Two implementations of one fee pro-rating rule is
+ * how two numbers that must agree quietly drift apart.
+ */
+export function allocate(
   fills: LiveOptionFillRecord[],
   want: number,
 ): { allocations: AllocatedFill[]; remaining: number } {
@@ -403,10 +409,12 @@ function allocate(
   return { allocations, remaining };
 }
 
-function round2(v: number): number {
+/** @see allocate — exported with it, for the same reason. */
+export function round2(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
-function round4(v: number): number {
+/** @see allocate — exported with it, for the same reason. */
+export function round4(v: number): number {
   return Math.round(v * 10_000) / 10_000;
 }
