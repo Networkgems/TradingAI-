@@ -189,13 +189,30 @@ a bare local time is rejected, never guessed. A carrier that mentions deploying 
 opts out with `<!-- deploy-order: none -->` — there is no way to leave the population by accident.
 
 ```bash
-pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED
+pnpm check:deploy-train-window       # 0 clean · 1 STRANDED · 3 BLIND · 4 UNGRADED · 5 LATE
 pnpm check:deploy-train-window:controls
 ```
 
 `STRANDED` (deadline passed, ordered commit not in the live build) is the incident and the only
 code that should page. `UNGRADED` is the migration backlog — suspected trains carrying no block —
 non-zero so it cannot read as green, separate so eighteen backlog rows cannot bury one incident.
-And `SATISFIED` means the commit is live **now**, not that it was live **by the deadline**: the
-timing arm needs Render deploy history and reports `UNREAD`, never OK. TRA-3536 is the live fixture
-(its ordered commit is the SHA already live, so obeying it is a strict no-op).
+TRA-3536 is the live fixture (its ordered commit is the SHA already live, so obeying it is a strict
+no-op).
+
+`SATISFIED` means the commit is live **now**. Whether it was live **by the deadline** is a separate
+column, and it is the one this ticket is actually about — on 08-13 both orders were satisfied
+*hours late by an unrelated path*, which an ancestry-only pass calls a healthy train. That column is
+measured when `RENDER_API_KEY` + `RENDER_SERVICE_ID` are in the environment (`--render-key` /
+`--render-service`), and whether the arm is ON or OFF is **printed with its reason** — `UNREAD` is
+never OK. A missed window exits **5 LATE**: nothing is stranded, so it must not page as one, and the
+window was missed, so it must not pass as clean. Precedence `BLIND > STRANDED > LATE > UNGRADED >
+CLEAN`.
+
+⛔ The arm binds Render's history to the box by **live-SHA identity**, not by name: a deploy-order
+block names the onrender hostname `tradingai-bqb1` while the Render service's own `name` is
+`TradingAI-`, so `GET /v1/services?name=tradingai-bqb1` returns `[]`. If the newest `live` deploy in
+the fetched history is not the SHA the health route just served, the arm stays off rather than time
+an order against some other service's deploys. It also fails to `UNREAD`, never to `LATE`, when the
+history starts after the deadline, when a pre-deadline deploy carries a commit this checkout does
+not know, or when nothing in the window carries the commit at all — the expensive direction of a
+grader over other people's deploys is the false accusation.

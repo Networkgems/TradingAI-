@@ -76,7 +76,7 @@
 //   node scripts/check-deploy-build.mjs --verify-hook  # is the gate actually INSTALLED?
 //   node scripts/check-deploy-build.mjs --selftest     # both-direction controls
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -390,39 +390,43 @@ function verifyHook({ requireConfig = true } = {}) {
 // ---------------------------------------------------------------------------
 const ZERO = /^0{40,64}$/;
 
-// `readFileSync(0)` is NOT enough here, and the first live push proved it: git hands the
-// hook its ref list on a PIPE, and on Windows a single read of a pipe that is not yet ready
-// comes back EMPTY rather than blocking. The gate then fell through to its no-stdin branch
-// and graded HEAD. It happened to be the same commit that time, so nothing was missed — but
-// the ref filter and the multi-ref loop had silently stopped running, which is a blind spot
-// that only shows up on the push where HEAD is not what you are pushing.
+// `readFileSync(0)` is NOT enough here, and two live pushes proved it: git hands the hook
+// its ref list on a PIPE, and a synchronous read of that pipe on Windows returns EMPTY —
+// first read as a bare `readFileSync`, then again through an EAGAIN retry loop, which never
+// saw EAGAIN because the read reported a clean zero-byte EOF instead. The gate fell through
+// to its no-stdin branch and graded HEAD both times. It happened to BE the pushed commit, so
+// nothing was missed — but the ref filter and the multi-ref loop had silently stopped
+// running, and that blind spot only shows on the push where HEAD is not what you push.
 //
-// So: read to EOF, retrying EAGAIN, and report WHICH path produced the result.
+// So: consume the stream properly, and report WHICH path produced the result. The timeout is
+// a floor, not a feature — a hook that hangs forever on a stream that never ends is a hook
+// somebody removes.
 function readStdin() {
-  const chunks = [];
-  const buf = Buffer.alloc(64 * 1024);
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    let n;
-    try {
-      n = readSync(0, buf, 0, buf.length, null);
-    } catch (e) {
-      if (e.code === 'EAGAIN' && Date.now() < deadline) {
-        // Busy-wait a beat. A hook has no event loop to yield to before it must answer.
-        spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},20)']);
-        continue;
-      }
-      if (e.code === 'EOF' || e.code === 'EAGAIN') break;
-      return { text: chunks.join(''), read: false, reason: `${e.code ?? e.message}` };
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) {
+      resolve({ text: '', read: false, reason: 'stdin is a tty' });
+      return;
     }
-    if (n === 0) break;
-    chunks.push(buf.toString('utf8', 0, n));
-  }
-  return { text: chunks.join(''), read: true, reason: '' };
+    let data = '';
+    let settled = false;
+    const finish = (reason) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ text: data, read: true, reason });
+    };
+    const timer = setTimeout(() => finish('timed out waiting for the ref list'), 5000);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => {
+      data += c;
+    });
+    process.stdin.on('end', () => finish(''));
+    process.stdin.on('error', (e) => finish(e.code ?? e.message));
+  });
 }
 
-function hookMode() {
-  const stdin = readStdin();
+async function hookMode() {
+  const stdin = await readStdin();
   const rows = stdin.text
     .split(/\r?\n/)
     .filter(Boolean)
@@ -604,7 +608,7 @@ function selftest() {
 }
 
 // ---------------------------------------------------------------------------
-function main() {
+async function main() {
   const argv = process.argv.slice(2);
   const has = (f) => argv.includes(f);
   const revArg = argv.find((a) => a.startsWith('--rev='));
@@ -617,7 +621,7 @@ function main() {
   try {
     if (has('--selftest')) return selftest();
     if (has('--verify-hook')) return verifyHook();
-    if (has('--hook')) return hookMode();
+    if (has('--hook')) return await hookMode();
     const result = grade({ rev: revArg ? revArg.slice('--rev='.length) : 'HEAD', inTree: has('--worktree'), quiet: has('--quiet') });
     report(result);
     return result.code;
@@ -631,4 +635,4 @@ function main() {
   }
 }
 
-process.exit(main());
+process.exit(await main());

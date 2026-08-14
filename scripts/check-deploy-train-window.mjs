@@ -118,6 +118,10 @@
  *   node scripts/check-deploy-train-window.mjs --selftest      # controls only
  *   node scripts/check-deploy-train-window.mjs --live=<sha>    # grade a SHA you hold
  *   node scripts/check-deploy-train-window.mjs --host=https://…
+ *   node scripts/check-deploy-train-window.mjs --render-key=… --render-service=srv-…
+ *       # the TIMING arm. Off by default only in the sense that it needs a key: with
+ *       # RENDER_API_KEY + RENDER_SERVICE_ID in the environment it arms itself, and
+ *       # whether it is on or off is PRINTED with its reason, never left to inference.
  *
  * ⛔ THE PROSE CLASSIFIER IS A HINT, NOT THE VERDICT — AND ITS FALSE POSITIVES ARE THE
  * EXPENSIVE DIRECTION
@@ -146,9 +150,14 @@
  *   4  UNGRADED  — no stranded order, but N carriers carry no machine-readable order, so
  *                  the sweep could not see them. Non-zero on purpose (it must not read
  *                  as green) and distinct from 1 on purpose (it is not an incident).
+ *   5  LATE      — every order is live NOW, but at least one of them did not become live
+ *                  until AFTER its deadline. Distinct from 1 because nothing is stranded
+ *                  and distinct from 0 because the window was missed — which is the
+ *                  literal subject of this ticket, and the state 2026-08-13 was in.
  *
- * Precedence when several apply: BLIND > STRANDED > UNGRADED > CLEAN. A blind leg
- * outranks a clean one, and an incident outranks a backlog.
+ * Precedence when several apply: BLIND > STRANDED > LATE > UNGRADED > CLEAN. A blind leg
+ * outranks a clean one, a stranded order outranks a missed window, and both outrank a
+ * backlog.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -158,8 +167,21 @@ export const EXIT_FINDINGS = 1;
 export const EXIT_ERROR = 2;
 export const EXIT_BLIND = 3;
 export const EXIT_UNGRADED = 4;
+export const EXIT_LATE = 5;
 
 const DEFAULT_HOST = 'https://tradingai-bqb1.onrender.com';
+
+// The `host` field a deploy-order block names. It is the ONRENDER HOSTNAME, not the
+// Render service's own name — the service reads `TradingAI-` in the API, which is why
+// the timing arm cannot resolve a service by matching that string and binds by live-SHA
+// identity instead (see `bindDeployHistory`).
+const ORDER_HOST = 'tradingai-bqb1';
+
+// Only these two ever served bytes. `build_failed` / `update_failed` / `canceled` /
+// `*_in_progress` are deploys that existed and did NOT put the commit on the box, and
+// counting one of them as "the commit was live by then" is the single most attractive
+// wrong answer available to this arm.
+const SERVED_STATUSES = new Set(['live', 'deactivated']);
 
 // ⛔ `/api/health` carries NO `build` block. The commit lives on the options-live route.
 const HEALTH_PATH = '/api/health/options-live';
@@ -310,6 +332,99 @@ export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
   return isAncestor(commit, liveSha) ? 'present' : 'absent';
 }
 
+/** "3h 12m" — for a lateness that has to be read at a glance in a report line. */
+export function humanGap(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h === 0 && m === 0) return `${s}s`;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+/**
+ * THE TIMING ARM — "was it live BY THE DEADLINE", which is a different question from
+ * "is it live NOW" and is the one this whole ticket is about. On 2026-08-13 both deploy
+ * orders were satisfied HOURS LATE by an unrelated path; an ancestry-only pass calls
+ * that a healthy train.
+ *
+ * Pure: the Render deploy history is injected as plain rows, so both directions carry a
+ * control. Every read is `{ commit, status, finishedAt }`.
+ *
+ * ⛔ IT FAILS TO `unread`, NEVER TO `late`. This arm grades OTHER PEOPLE'S deploys, so
+ * its expensive direction is the false accusation, and there are three separate ways to
+ * arrive at "I did not see an on-time deploy" that are NOT "there wasn't one":
+ *
+ *   1. HISTORY THAT STARTS AFTER THE DEADLINE. A truncated page cannot distinguish "no
+ *      on-time deploy" from "the on-time deploy is one page further back". Coverage is
+ *      asserted (the oldest served row must be at or before the deadline), not assumed.
+ *   2. A PRE-DEADLINE DEPLOY WHOSE COMMIT THIS CHECKOUT DOES NOT KNOW. Ancestry against
+ *      it is unanswerable, and an unanswerable ancestry inside the window is exactly
+ *      where an on-time carrier would hide.
+ *   3. NOTHING IN HISTORY CARRIES THE COMMIT AT ALL, while ancestry says it is live now
+ *      — i.e. the carrying deploy is outside the fetched window.
+ *
+ * @returns {{ timing: 'on_time'|'late'|'unread', timingDetail: string }}
+ */
+export function gradeTiming({ order, deploys, knownSha, isAncestor, historyHost = null }) {
+  if (historyHost && order?.host && order.host !== historyHost) {
+    return {
+      timing: 'unread',
+      timingDetail: `order targets ${order.host}; the deploy history read is ${historyHost} — another service's history cannot time this order`,
+    };
+  }
+  if (!Array.isArray(deploys) || deploys.length === 0) {
+    return { timing: 'unread', timingDetail: 'no Render deploy history was read' };
+  }
+
+  const served = deploys
+    .map((d) => ({ commit: d?.commit, status: d?.status, finishedMs: Date.parse(d?.finishedAt) }))
+    .filter((d) => SERVED_STATUSES.has(d.status) && Number.isFinite(d.finishedMs));
+  if (served.length === 0) {
+    return { timing: 'unread', timingDetail: 'the deploy history contains no deploy that ever served' };
+  }
+
+  const carries = (d) => typeof d.commit === 'string' && knownSha(d.commit) && isAncestor(order.commit, d.commit);
+  const carrying = served.filter(carries).sort((a, b) => a.finishedMs - b.finishedMs);
+
+  const onTime = carrying.filter((d) => d.finishedMs <= order.deadlineMs);
+  if (onTime.length > 0) {
+    return {
+      timing: 'on_time',
+      timingDetail: `serving by ${new Date(onTime[0].finishedMs).toISOString()} (deploy of ${short(onTime[0].commit)}), before the ${order.deadline} deadline`,
+    };
+  }
+
+  const oldestServed = Math.min(...served.map((d) => d.finishedMs));
+  if (oldestServed > order.deadlineMs) {
+    return {
+      timing: 'unread',
+      timingDetail: `deploy history reaches back only to ${new Date(oldestServed).toISOString()}, AFTER the ${order.deadline} deadline — an on-time deploy would be invisible, so LATE cannot be asserted`,
+    };
+  }
+
+  const blindPreDeadline = served.filter(
+    (d) => d.finishedMs <= order.deadlineMs && !(typeof d.commit === 'string' && knownSha(d.commit)),
+  );
+  if (blindPreDeadline.length > 0) {
+    return {
+      timing: 'unread',
+      timingDetail: `${blindPreDeadline.length} deploy(s) that served before the deadline carry commits unknown to this checkout — ancestry unanswerable in exactly the window an on-time carrier would occupy`,
+    };
+  }
+
+  if (carrying.length === 0) {
+    return {
+      timing: 'unread',
+      timingDetail: 'the commit is live now, but no deploy in the fetched history carries it — the carrying deploy is outside the window',
+    };
+  }
+
+  return {
+    timing: 'late',
+    timingDetail: `first served ${new Date(carrying[0].finishedMs).toISOString()}, ${humanGap(carrying[0].finishedMs - order.deadlineMs)} AFTER the ${order.deadline} deadline (deploy of ${short(carrying[0].commit)})`,
+  };
+}
+
 /**
  * Grade ONE carrier. Pure: every read is injected.
  *
@@ -320,15 +435,16 @@ export function gradeAncestry({ commit, liveSha, knownSha, isAncestor }) {
  * @returns {{ verdict, finding: boolean, ungraded: boolean, timing: 'unread'|'n/a', detail: string }}
  *   verdict ∈ SATISFIED | PENDING | STRANDED | UNGRADEABLE | AMBIGUOUS | NOT_TRAIN | BLIND
  */
-export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor, hasTimingArm = false }) {
+export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor, deploys = null, historyHost = null }) {
   const cls = classifyCarrier(description);
   if (cls.kind === 'not-train') {
-    return { verdict: 'NOT_TRAIN', finding: false, ungraded: false, timing: 'n/a', detail: cls.reason, span: cls.span };
+    return { verdict: 'NOT_TRAIN', finding: false, late: false, ungraded: false, timing: 'n/a', detail: cls.reason, span: cls.span };
   }
   if (cls.kind === 'ambiguous') {
     return {
       verdict: 'AMBIGUOUS',
       finding: false,
+      late: false,
       ungraded: true,
       timing: 'n/a',
       detail: `${cls.reason} — probably not a train, but a grep cannot prove which, so it is not dropped silently`,
@@ -341,6 +457,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
     return {
       verdict: 'UNGRADEABLE',
       finding: false,
+      late: false,
       ungraded: true,
       timing: 'n/a',
       detail: `${parsed.error} — SUSPECTED train: add the block if it is one, or the \`deploy-order: none\` marker if it is not`,
@@ -354,6 +471,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
     return {
       verdict: 'BLIND',
       finding: false,
+      late: false,
       ungraded: false,
       timing: 'n/a',
       detail: `ancestry unanswerable for ${short(order.commit)} against live ${short(liveSha)} — shallow checkout or unknown sha`,
@@ -367,12 +485,26 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
     // ⛔ Live NOW is not live BY THE DEADLINE. Without the Render history arm this
     // cannot tell a train that ran on time from one whose commit arrived hours late on
     // somebody else's deploy — which is exactly the 2026-08-13 case. Say so.
-    const timing = pastDeadline && !hasTimingArm ? 'unread' : 'n/a';
+    let timing = 'n/a';
+    let timingDetail = null;
+    if (pastDeadline) {
+      if (Array.isArray(deploys)) {
+        ({ timing, timingDetail } = gradeTiming({ order, deploys, knownSha, isAncestor, historyHost }));
+      } else {
+        timing = 'unread';
+        timingDetail = 'no Render deploy history read — pass --render-key or set RENDER_API_KEY to add the timing arm';
+      }
+    }
     return {
       verdict: 'SATISFIED',
       finding: false,
+      // A missed window is NOT a stranded order: the bytes are on the box. It gets its
+      // own flag and its own exit code so it can neither page as an incident nor hide
+      // inside a pass.
+      late: timing === 'late',
       ungraded: false,
       timing,
+      timingDetail,
       detail: `${short(order.commit)} is an ancestor of live ${short(liveSha)}`,
       order,
       span: cls.span,
@@ -383,6 +515,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
     return {
       verdict: 'PENDING',
       finding: false,
+      late: false,
       ungraded: false,
       timing: 'n/a',
       detail: `${short(order.commit)} not yet live; deadline ${order.deadline} is still ahead`,
@@ -394,6 +527,7 @@ export function gradeCarrier({ description, nowMs, liveSha, knownSha, isAncestor
   return {
     verdict: 'STRANDED',
     finding: true,
+    late: false,
     ungraded: false,
     timing: 'n/a',
     detail: `deadline ${order.deadline} PASSED and ${short(order.commit)} is NOT an ancestor of live ${short(liveSha)}`,
@@ -555,6 +689,107 @@ const CONTROLS = [
     name: 'RECENCY FAILS OPEN INTO THE POPULATION — an unreadable triggeredAt is INCLUDED',
     run: () => expect([firedSince(null, T0), firedSince('not-a-date', T0)], (r) => r[0] === true && r[1] === true),
   },
+  // ── the timing arm ────────────────────────────────────────────────────────
+  // The arm that answers the question the ticket is actually about. Its POSITIVE
+  // direction must be able to reach LATE, and its three fail-closed directions must
+  // each be able to refuse it, or "0 late" is a statement about the instrument.
+  {
+    name: 'TIMING POSITIVE — the only carrying deploy served AFTER the deadline grades LATE (exit 5, not stranded)',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          deploys: [
+            { commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' },
+            { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:00:00Z' },
+          ],
+        }),
+        (r) => r.verdict === 'SATISFIED' && r.timing === 'late' && r.late === true && r.finding === false,
+      ),
+  },
+  {
+    name: 'TIMING NEGATIVE — a carrying deploy that served BEFORE the deadline is ON TIME and silent',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          deploys: [
+            { commit: LIVE, status: 'live', finishedAt: '2026-08-13T10:30:00Z' },
+            { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:00:00Z' },
+          ],
+        }),
+        (r) => r.verdict === 'SATISFIED' && r.timing === 'on_time' && r.late === false,
+      ),
+  },
+  {
+    name: 'TIMING FAILS CLOSED — history that starts AFTER the deadline is UNREAD, never LATE',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          deploys: [{ commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' }],
+        }),
+        (r) => r.timing === 'unread' && r.late === false,
+      ),
+  },
+  {
+    name: 'TIMING FAILS CLOSED — a pre-deadline deploy whose commit is UNKNOWN to the checkout is UNREAD, never LATE',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          deploys: [
+            { commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' },
+            { commit: 'facefeed'.repeat(5), status: 'deactivated', finishedAt: '2026-08-13T10:00:00Z' },
+          ],
+        }),
+        (r) => r.timing === 'unread' && r.late === false,
+      ),
+  },
+  {
+    name: 'TIMING — a BUILD_FAILED deploy of the commit before the deadline is NOT "it was live by then"',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          deploys: [
+            { commit: LIVE, status: 'build_failed', finishedAt: '2026-08-13T10:00:00Z' },
+            { commit: NOT_IN_LIVE, status: 'deactivated', finishedAt: '2026-08-13T09:30:00Z' },
+            { commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' },
+          ],
+        }),
+        (r) => r.timing === 'late',
+      ),
+  },
+  {
+    name: 'TIMING — an order for a DIFFERENT host is UNREAD against this history, not graded off it',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: ['```deploy-order', `commit: ${IN_LIVE}`, 'host: some-other-service', 'deadline: 2026-08-13T11:00:00Z', '```'].join('\n'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+          historyHost: 'tradingai-bqb1',
+          deploys: [{ commit: LIVE, status: 'live', finishedAt: '2026-08-13T11:45:00Z' }],
+        }),
+        (r) => r.timing === 'unread' && r.late === false,
+      ),
+  },
+  {
+    name: 'TIMING — with NO history injected a passed deadline is still UNREAD (the arm is off, not OK)',
+    run: () =>
+      expect(
+        gradeCarrier({
+          description: orderBlock(IN_LIVE, '2026-08-13T11:00:00Z'),
+          nowMs: T0, liveSha: LIVE, knownSha: stubKnown, isAncestor: stubAncestor,
+        }),
+        (r) => r.timing === 'unread' && r.late === false,
+      ),
+  },
   {
     name: 'POPULATION — a carrier with no deploy mention at all is NOT_TRAIN and silent',
     run: () =>
@@ -600,6 +835,14 @@ const git = (args) => {
   const r = spawnSync('git', args, { encoding: 'utf8' });
   return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
+/** The timing column, rendered so `on time` and `unread` can never be read as the same thing. */
+const timingTag = (r) => {
+  if (r.timing === 'late') return '  [LATE — window MISSED]';
+  if (r.timing === 'on_time') return '  [ON TIME]';
+  if (r.timing === 'unread') return '  [timing UNREAD]';
+  return '';
+};
+
 const knownSha = (s) => git(['cat-file', '-e', `${s}^{commit}`]).ok;
 const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).ok;
 
@@ -607,6 +850,66 @@ async function getJson(url, headers) {
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
   return res.json();
+}
+
+const RENDER_API = 'https://api.render.com/v1';
+const RENDER_PAGE = 100;
+const RENDER_MAX_PAGES = 6; // 600 deploys — a printed cap, and a short history is UNREAD anyway.
+
+/**
+ * Read Render's deploy history for the service, and PROVE it is the history of the box
+ * whose live SHA we just graded against.
+ *
+ * ⛔ THE BINDING IS NOT A NAME MATCH. A deploy-order block names the ONRENDER HOSTNAME
+ * (`tradingai-bqb1`); the Render service's own `name` is `TradingAI-`, and
+ * `GET /v1/services?name=tradingai-bqb1` returns []. So a service resolved by string
+ * would silently be nobody's, and a service id taken on faith from an env var could be
+ * some other box entirely — whose history would then produce a confident, wrong LATE
+ * against another team's deploy. The identity test used instead is: the newest deploy
+ * with status `live` in this history must carry EXACTLY the SHA the health route just
+ * served. If it does not, the arm stays OFF and every timing reads UNREAD.
+ */
+async function bindDeployHistory({ key, serviceId, liveSha }) {
+  const headers = { Authorization: `Bearer ${key}`, Accept: 'application/json' };
+  const rows = [];
+  let cursor = null;
+  let pages = 0;
+  while (pages < RENDER_MAX_PAGES) {
+    const url = `${RENDER_API}/services/${serviceId}/deploys?limit=${RENDER_PAGE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const page = await getJson(url, headers);
+    if (!Array.isArray(page) || page.length === 0) break;
+    for (const item of page) {
+      const d = item?.deploy;
+      if (!d) continue;
+      rows.push({ commit: d?.commit?.id, status: d?.status, finishedAt: d?.finishedAt ?? null });
+    }
+    pages += 1;
+    cursor = page[page.length - 1]?.cursor ?? null;
+    if (!cursor || page.length < RENDER_PAGE) break;
+  }
+  if (rows.length === 0) return { ok: false, reason: 'the deploys route returned no rows' };
+
+  const newestLive = rows.find((r) => r.status === 'live');
+  if (!newestLive) {
+    return { ok: false, reason: `no deploy with status \`live\` in the newest ${rows.length} rows — cannot bind this history to the box` };
+  }
+  if (newestLive.commit !== liveSha) {
+    return {
+      ok: false,
+      reason: `service ${serviceId}'s newest live deploy is ${short(newestLive.commit)} but the health route served ${short(liveSha)} — this history is not this box's, so no timing is asserted`,
+    };
+  }
+  const oldest = rows
+    .map((r) => Date.parse(r.finishedAt))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b)[0];
+  return {
+    ok: true,
+    rows,
+    pages,
+    cappedAt: pages >= RENDER_MAX_PAGES,
+    oldest: Number.isFinite(oldest) ? new Date(oldest).toISOString() : 'unknown',
+  };
 }
 
 async function main() {
@@ -662,6 +965,37 @@ async function main() {
     return EXIT_BLIND;
   }
 
+  // ── the timing arm ─────────────────────────────────────────────────────────
+  // Off is a NAMED state with its reason printed, never silence: this arm is the only
+  // thing that separates "the train ran" from "the commit turned up eventually", and a
+  // reader who cannot see that it was off will read UNREAD as OK.
+  let deploys = null;
+  const renderKey = typeof flag('render-key') === 'string' ? flag('render-key') : process.env.RENDER_API_KEY;
+  const renderService = typeof flag('render-service') === 'string' ? flag('render-service') : process.env.RENDER_SERVICE_ID;
+  if (!renderKey || !renderService) {
+    console.log('[train] timing arm OFF — no RENDER_API_KEY / RENDER_SERVICE_ID (or --render-key / --render-service).');
+    console.log('[train]   Every SATISFIED past its deadline will read `timing UNREAD`, which is NOT "on time".');
+  } else {
+    try {
+      const bound = await bindDeployHistory({ key: renderKey, serviceId: renderService, liveSha });
+      if (!bound.ok) {
+        console.log(`[train] timing arm OFF — ${bound.reason}`);
+      } else {
+        deploys = bound.rows;
+        console.log(
+          `[train] timing arm ON — ${bound.rows.length} deploy records over ${bound.pages} page(s), back to ${bound.oldest};` +
+            ` history bound to live ${short(liveSha)} by its newest \`live\` deploy.`,
+        );
+        if (bound.cappedAt) {
+          console.log(`[train]   ⛔ page cap ${RENDER_MAX_PAGES} hit — history may be truncated. An order whose deadline`);
+          console.log('[train]   predates the oldest record above is reported UNREAD, never on-time and never LATE.');
+        }
+      }
+    } catch (err) {
+      console.log(`[train] timing arm OFF — Render history unreadable: ${err.message}`);
+    }
+  }
+
   // ── single-issue mode ──────────────────────────────────────────────────────
   // ⭐ THE CONTROLS ABOVE PROVE THE PREDICATE ON SYNTHETIC STRINGS. They say nothing
   // about whether the LIVE path — fetch a real issue, find the block in a real
@@ -678,13 +1012,15 @@ async function main() {
       console.error(`[train] ERROR reading ${ident}: ${err.message}`);
       return EXIT_ERROR;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs: Date.now(), liveSha, knownSha, isAncestor });
+    const g = gradeCarrier({ description: issue?.description, nowMs: Date.now(), liveSha, knownSha, isAncestor, deploys, historyHost: ORDER_HOST });
     console.log(`[train] single issue ${issue?.identifier || ident} — ${issue?.title || ''}`);
-    console.log(`[train]   VERDICT = ${g.verdict}${g.timing === 'unread' ? '  [timing UNREAD]' : ''}`);
+    console.log(`[train]   VERDICT = ${g.verdict}${timingTag(g)}`);
     console.log(`[train]   ${g.detail}`);
+    if (g.timingDetail) console.log(`[train]   timing: ${g.timingDetail}`);
     if (g.span) console.log(`[train]   span: ${g.span}`);
     if (g.verdict === 'BLIND') return EXIT_BLIND;
     if (g.finding) return EXIT_FINDINGS;
+    if (g.late) return EXIT_LATE;
     if (g.ungraded) return EXIT_UNGRADED;
     return EXIT_CLEAN;
   }
@@ -756,25 +1092,26 @@ async function main() {
       rows.push({ ...c, identifier: c.issueId, verdict: 'BLIND', finding: false, detail: `carrier unreadable: ${err.message}` });
       continue;
     }
-    const g = gradeCarrier({ description: issue?.description, nowMs, liveSha, knownSha, isAncestor });
+    const g = gradeCarrier({ description: issue?.description, nowMs, liveSha, knownSha, isAncestor, deploys, historyHost: ORDER_HOST });
     rows.push({ ...c, identifier: issue?.identifier || c.issueId, status: issue?.status, startedAt: issue?.startedAt ?? null, ...g });
   }
 
   // ── report ─────────────────────────────────────────────────────────────────
   const trains = rows.filter((r) => r.verdict !== 'NOT_TRAIN');
   const stranded = rows.filter((r) => r.finding);
+  const late = rows.filter((r) => r.late);
   const ungraded = rows.filter((r) => r.ungraded);
   const graded = trains.filter((r) => !r.ungraded && r.verdict !== 'BLIND');
   const blind = rows.filter((r) => r.verdict === 'BLIND');
 
   if (flag('json')) {
-    console.log(JSON.stringify({ liveSha, carriers: rows.length, trains: trains.length, stranded, ungraded, blind }, null, 2));
+    console.log(JSON.stringify({ liveSha, timingArm: deploys != null, carriers: rows.length, trains: trains.length, stranded, late, ungraded, blind }, null, 2));
   }
 
   const line = (r) => {
-    const timing = r.timing === 'unread' ? '  [timing UNREAD]' : '';
     console.log(`[train]   ${r.verdict.padEnd(11)} ${String(r.identifier).padEnd(10)} routine ${r.routine}  fired ${r.firedAt ?? 'unknown'}`);
-    console.log(`[train]       ${r.detail}${timing}`);
+    console.log(`[train]       ${r.detail}${timingTag(r)}`);
+    if (r.timingDetail) console.log(`[train]       timing: ${r.timingDetail}`);
     if (r.span && r.verdict !== 'SATISFIED') console.log(`[train]       span: ${r.span}`);
   };
 
@@ -801,10 +1138,16 @@ async function main() {
   console.log('[train]    list route, i.e. ONE per routine, the newest. A worked newer carrier hides an');
   console.log('[train]    abandoned older one. Deploy trains are one-shots that archive themselves at');
   console.log('[train]    step 1, so they have ~one carrier each — close to complete here, still a limit.');
-  console.log('[train] ⛔ SATISFIED means the commit is live NOW, not that it was live BY THE DEADLINE.');
-  console.log('[train]    The timing arm needs Render deploy history and is UNREAD, not OK.');
+  console.log('[train] ⛔ SATISFIED means the commit is live NOW. Whether it was live BY THE DEADLINE is the');
+  if (deploys == null) {
+    console.log('[train]    separate `timing` column, and on this run the arm was OFF — every timing is UNREAD,');
+    console.log('[train]    which is not "on time". Set RENDER_API_KEY / RENDER_SERVICE_ID to measure it.');
+  } else {
+    console.log(`[train]    separate \`timing\` column, measured on this run against ${deploys.length} Render deploy records.`);
+  }
 
-  // Precedence: a blind leg outranks a clean one, and an incident outranks a backlog.
+  // Precedence: a blind leg outranks a clean one, a stranded order outranks a missed
+  // window, and both outrank a backlog.
   console.log('');
   if (blind.length > 0) {
     console.log(`[train] VERDICT = BLIND — ${blind.length} carrier(s) could not be read at all.`);
@@ -815,11 +1158,22 @@ async function main() {
     console.log('[train] This is the incident this check exists for. Each is named above with its commit.');
     return EXIT_FINDINGS;
   }
+  if (late.length > 0) {
+    console.log(`[train] VERDICT = LATE — ${late.length} order(s) are live, but did not become live until AFTER`);
+    console.log('[train] their deadline. Nothing is stranded, so this is not a page — but the window the');
+    console.log('[train] one-shot exists to hit was MISSED, and an ancestry-only pass calls that healthy.');
+    return EXIT_LATE;
+  }
   if (ungraded.length > 0) {
-    console.log(`[train] VERDICT = UNGRADED — 0 stranded among the ${graded.length} order(s) this check could`);
+    console.log(`[train] VERDICT = UNGRADED — 0 stranded and 0 late among the ${graded.length} order(s) this check could`);
     console.log(`[train] measure, and ${ungraded.length} suspected carrier(s) it could not. NOT a clean bill of health:`);
-    console.log('[train] with 0 graded orders a "no stranded deploys" result is a statement about the');
-    console.log('[train] instrument, not about the board.');
+    if (graded.length === 0) {
+      console.log('[train] with 0 graded orders a "no stranded deploys" result is a statement about the');
+      console.log('[train] instrument, not about the board.');
+    } else {
+      console.log('[train] the un-graded rows are un-measured, not measured-and-fine — a stranded order');
+      console.log('[train] hiding in one of them is indistinguishable from this output.');
+    }
     return EXIT_UNGRADED;
   }
   console.log(`[train] VERDICT = CLEAN — all ${graded.length} graded deploy order(s) SATISFIED or legitimately PENDING,`);
