@@ -6,10 +6,17 @@
     <title>Trading App</title>
 
     <!-- PWA -->
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <!--
+      No <link rel="manifest"> here on purpose — vite-plugin-pwa injects one at build
+      time and base-prefixes it. Vite does NOT rewrite a hand-written manifest href
+      (rel="manifest" is not in its asset-attribute table, unlike rel="icon" below), so
+      a literal "/manifest.webmanifest" 404s on the GitHub Pages subpath. TRA-3803.
+    -->
     <meta name="theme-color" content="#7c3aed" />
+    <meta name="mobile-web-app-capable" content="yes" />
 
     <!-- iOS PWA -->
+    <!-- Deprecated alias of mobile-web-app-capable above; kept for older iOS Safari. -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="TradingApp" />

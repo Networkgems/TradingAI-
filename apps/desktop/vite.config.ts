@@ -1,8 +1,13 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
+import { buildPwaManifest, resolveBase } from './pwa.config';
 
 const host = process.env.TAURI_DEV_HOST;
+
+// Resolved once and used for both `base` and the manifest — the manifest's URLs and
+// the app's base have to agree, and reading `VITE_BASE` twice is how they drift apart.
+const base = resolveBase(process.env.VITE_BASE);
 
 export default defineConfig({
   plugins: [
@@ -10,20 +15,7 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: ['apple-touch-icon.png', 'icon-192.png', 'icon-512.png'],
-      manifest: {
-        name: 'Trading App',
-        short_name: 'TradingApp',
-        description: 'AI-powered trading signal dashboard',
-        start_url: '/',
-        display: 'standalone',
-        background_color: '#0f172a',
-        theme_color: '#7c3aed',
-        icons: [
-          { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
-          { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
-          { src: '/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
-        ],
-      },
+      manifest: buildPwaManifest(base),
       workbox: {
         // Cache app shell and static assets; skip API and WebSocket routes
         navigateFallback: 'index.html',
@@ -46,7 +38,7 @@ export default defineConfig({
       },
     }),
   ],
-  base: process.env.VITE_BASE ?? '/',
+  base,
   clearScreen: false,
   server: {
     port: 1420,
