@@ -1298,6 +1298,18 @@ export interface ExitCadenceHealth {
     /** Intervals with NEITHER endpoint inside RTH — the contamination itself. */
     closedIntervals: number;
   };
+  /**
+   * TRA-3800 — over-threshold intervals kept OFF the Render tape because they were
+   * `boundary` or `closed`, i.e. not in the population the threshold is about.
+   *
+   * The tape breadcrumb inherited no window predicate when TRA-2269 partitioned the
+   * histogram, so it warned on all three bins. Out of hours that is every interval
+   * on every engine: bqb1 2026-08-16 measured 28,291/28,291 closed and 134
+   * lines/min, 73.3% of the whole service tape. This counter is what makes the
+   * suppression readable — silence on the tape otherwise means either "working" or
+   * "the emitter is gone", which is the same reading.
+   */
+  exitIntervalLogSuppressed: number;
 }
 
 /**
@@ -3275,6 +3287,19 @@ export class SignalEngine {
   private rthBoundaryIntervals = 0;
   private rthClosedIntervals = 0;
   /**
+   * TRA-3800 — intervals that CLEARED `EXIT_INTERVAL_LOG_MS` but were kept off the
+   * tape because neither endpoint was in RTH (`boundary` or `closed`).
+   *
+   * This is the pass state of the suppression. The emitter's absence from the tape
+   * is not self-describing: "the partition is correctly swallowing ~28k
+   * closed-market intervals a day" and "exit stamping has stopped, or the log call
+   * was lost in a refactor" both show up as zero matching lines on Render, and the
+   * second one is the failure the whole exit-cadence instrument exists to catch.
+   * A suppressed count that TRACKS `rthClosedIntervals + rthBoundaryIntervals`
+   * separates them from outside the box, with no log line spent.
+   */
+  private exitIntervalLogSuppressed = 0;
+  /**
    * TRA-2200 — decoupled passes skipped because NO symbol carried a stamp fresh
    * enough to price an exit against. Surfaced because "the hoist is armed and
    * evaluating nothing" and "the hoist is armed and healthy" are otherwise the
@@ -5002,7 +5027,8 @@ export class SignalEngine {
       if (intervalMs > this.maxExitIntervalMs) this.maxExitIntervalMs = intervalMs;
       this.exitIntervalHistogram[bucketExitInterval(intervalMs)] += 1;
       // TRA-2269 — partition the SAME interval into exactly one of three bins.
-      switch (classifyExitInterval(this.lastExitPassMarketOpen, marketOpen)) {
+      const region = classifyExitInterval(this.lastExitPassMarketOpen, marketOpen);
+      switch (region) {
         case 'rth':
           this.rthExitIntervalHistogram[bucketExitInterval(intervalMs)] += 1;
           if (source === 'decoupled') this.rthDecoupledPassCount += 1;
@@ -5020,7 +5046,26 @@ export class SignalEngine {
       // histogram + `exitPassCount` on the health route carry the full shape. The
       // threshold sits BELOW the 30s bar so an interval approaching the bar is
       // already on the tape before it crosses it.
-      if (intervalMs >= EXIT_INTERVAL_LOG_MS) {
+      //
+      // TRA-3800 — and it carries the SAME POPULATION the grade reads. TRA-2269
+      // gave the histogram an RTH partition precisely because a closed-market
+      // interval is not a statement about this timer: the decoupled hoist refuses
+      // on `marketClosed` BY DESIGN, so out of hours doTick's ~30s cadence is the
+      // only thing stamping — every interval lands dead on 30s, clears a 20s
+      // threshold that was written about a 10s timer, and warns. The partition was
+      // never applied to the tape, so the emitter kept firing on all three bins.
+      //
+      // Measured on bqb1 2026-08-16 (Sunday, market shut all day): 28,291 intervals
+      // since boot, `rth.closedIntervals` 28,291 — 100.0% closed, zero RTH, zero
+      // boundary — emitting 134 lines/min across 67 engines, 73.3% of the entire
+      // service tape (~193k lines/day from this one call site). Not one of those
+      // lines was about the thing the threshold measures.
+      //
+      // This is a latency risk, not a cosmetic one: Node writes stdout/stderr
+      // SYNCHRONOUSLY to a pipe on Linux, which is how Render captures container
+      // output, so a stalled collector converts log volume into event-loop
+      // starvation with no JS stack to blame (TRA-3660).
+      if (region === 'rth' && intervalMs >= EXIT_INTERVAL_LOG_MS) {
         log.warn('exit evaluation interval exceeded the log threshold', {
           component: 'exit-cadence',
           source,
@@ -5029,6 +5074,13 @@ export class SignalEngine {
           mode: this.mode,
           engine: this.feedContextKey,
         });
+      } else if (intervalMs >= EXIT_INTERVAL_LOG_MS) {
+        // COUNT WHAT THE GATE SWALLOWS. Without this the fix has no pass state
+        // distinguishable from its own failure: after deploy the tape shows zero
+        // of these lines whether the partition is correctly suppressing 28k
+        // closed-market intervals, or the engines stopped stamping exits
+        // altogether. A silent gate is not gradeable from outside the box.
+        this.exitIntervalLogSuppressed += 1;
       }
     }
     this.lastExitPassAt = now;
@@ -5169,6 +5221,12 @@ export class SignalEngine {
         boundaryIntervals: this.rthBoundaryIntervals,
         closedIntervals: this.rthClosedIntervals,
       },
+      // TRA-3800 — how many over-threshold intervals the tape partition swallowed.
+      // Read it against `rth.closedIntervals + rth.boundaryIntervals`: out of hours
+      // every interval is ~30s and clears the 20s bar, so the two track. A zero
+      // here while those climb means the emitter is gated by something other than
+      // the partition.
+      exitIntervalLogSuppressed: this.exitIntervalLogSuppressed,
     };
   }
 

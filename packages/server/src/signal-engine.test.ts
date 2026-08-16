@@ -8943,6 +8943,153 @@ describe('TRA-2269 — the WIRING: stampExitPass routes each interval to the rig
 });
 
 /**
+ * TRA-3800 — the TAPE inherited no window predicate when TRA-2269 partitioned the
+ * histogram, so it kept warning on all three bins.
+ *
+ * Out of hours the decoupled hoist refuses on `marketClosed` BY DESIGN, leaving
+ * doTick's ~30s cadence as the only thing stamping exits. Every one of those
+ * intervals lands dead on 30s and clears a 20s threshold that was written as a
+ * statement about a 10s timer — so the emitter fires on literally every pass, on
+ * every engine, for every hour the market is shut.
+ *
+ * Measured on bqb1 2026-08-16 (a Sunday, market shut all day), commit `a6c3212`:
+ *
+ *   GET /api/health/exit-cadence  ->  67 engines, 28,291 intervals since boot
+ *                                     rth.closedIntervals   28,291  (100.0%)
+ *                                     rth.intervalHistogram      0
+ *                                     rth.boundaryIntervals      0
+ *   Render tape census, 10 min    ->  1,829 lines total, 134.0/min from THIS call
+ *                                     site alone = 73.3% of the whole service tape
+ *                                     (~193k lines/day), zero of them about RTH.
+ *
+ * Asserted against `process.stderr.write` rather than a logger mock on purpose:
+ * the defect is BYTES ON THE PIPE. Node writes stderr synchronously to a pipe on
+ * Linux — which is how Render captures container output — so when the collector
+ * stalls, the 64 KiB buffer fills and the next write blocks the whole process
+ * (TRA-3660). Spying one layer above the write would not measure the thing that
+ * costs.
+ */
+describe('TRA-3800 — the exit-cadence tape carries the RTH population, not all three bins', () => {
+  const RTH = Date.parse('2026-07-27T15:00:00Z');      // Monday, mid-session
+  const CLOSED = Date.parse('2026-07-27T21:00:00Z');   // after the 16:00 ET close
+  const OVER = 30_000;    // the observed closed-market cadence: clears the 20s bar
+  const UNDER = 10_000;   // what the hoist produces in RTH: under the bar
+
+  let written: string[];
+  // Structural, not `ReturnType<typeof vi.spyOn>`: `process.stderr.write` is an
+  // overloaded signature and vitest's spy generic will not accept the key. All
+  // this block needs off the handle is the restore.
+  let spy: { mockRestore(): void };
+
+  beforeEach(() => {
+    written = [];
+    spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+  });
+  afterEach(() => { spy.mockRestore(); vi.useRealTimers(); });
+
+  /** Lines this call site actually put on the pipe. */
+  const tapeLines = () =>
+    written.filter((l) => l.includes('exit evaluation interval exceeded the log threshold'));
+
+  const total = (h: Record<string, number>) => Object.values(h).reduce((n, v) => n + v, 0);
+
+  function stampAt(instants: Array<{ at: number; source: 'tick' | 'decoupled' }>) {
+    vi.useFakeTimers();
+    const engine = new SignalEngine();
+    const stamp = (engine as unknown as {
+      stampExitPass: (s: 'tick' | 'decoupled') => void;
+    }).stampExitPass.bind(engine);
+    for (const s of instants) {
+      vi.setSystemTime(new Date(s.at));
+      stamp(s.source);
+    }
+    return engine.getExitCadenceHealth();
+  }
+
+  it('POSITIVE CONTROL — an over-threshold RTH interval still reaches the tape', () => {
+    // Without this the suppression tests below are unfalsifiable: a spy that
+    // captures nothing would pass every one of them.
+    const h = stampAt([
+      { at: RTH, source: 'tick' },
+      { at: RTH + OVER, source: 'tick' },
+    ]);
+    expect(tapeLines()).toHaveLength(1);
+    expect(tapeLines()[0]).toContain('"component":"exit-cadence"');
+    expect(tapeLines()[0]).toContain('"intervalMs":30000');
+    expect(h.exitIntervalLogSuppressed).toBe(0);
+    expect(total(h.rth.intervalHistogram)).toBe(1);
+  });
+
+  it('THE FIX — an over-threshold CLOSED-market interval is COUNTED and not written', () => {
+    // Remove the `region === \'rth\'` conjunct and this is the line that comes back.
+    const h = stampAt([
+      { at: CLOSED, source: 'tick' },
+      { at: CLOSED + OVER, source: 'tick' },
+    ]);
+    expect(tapeLines()).toHaveLength(0);
+    expect(h.exitIntervalLogSuppressed).toBe(1);
+    expect(h.rth.closedIntervals).toBe(1);
+  });
+
+  it('a BOUNDARY straddle is suppressed too — half of it lived in a window the timer may not run in', () => {
+    const h = stampAt([
+      { at: Date.parse('2026-07-27T19:59:50Z'), source: 'decoupled' },  // inside RTH
+      { at: Date.parse('2026-07-27T20:00:35Z'), source: 'tick' },       // after the close
+    ]);
+    expect(tapeLines()).toHaveLength(0);
+    expect(h.exitIntervalLogSuppressed).toBe(1);
+    expect(h.rth.boundaryIntervals).toBe(1);
+  });
+
+  it('the counter counts suppression BY WINDOW, not by threshold — an under-bar RTH interval increments neither', () => {
+    // Otherwise `exitIntervalLogSuppressed` would climb through a healthy RTH
+    // session and stop being readable as "closed-market intervals withheld".
+    const h = stampAt([
+      { at: RTH, source: 'decoupled' },
+      { at: RTH + UNDER, source: 'decoupled' },
+    ]);
+    expect(tapeLines()).toHaveLength(0);
+    expect(h.exitIntervalLogSuppressed).toBe(0);
+    expect(total(h.rth.intervalHistogram)).toBe(1);
+  });
+
+  it('THE INCIDENT, TO SCALE: an hour of closed-market ticks writes NOTHING and accounts for all 120', () => {
+    // 120 x 30s = the exact shape one engine produced on the 2026-08-16 tape.
+    // Pre-fix this was 120 lines from one engine; bqb1 runs 67 of them.
+    const passes = Array.from({ length: 121 }, (_, i) => ({
+      at: CLOSED + i * OVER, source: 'tick' as const,
+    }));
+    const h = stampAt(passes);
+    expect(tapeLines()).toHaveLength(0);
+    expect(h.rth.closedIntervals).toBe(120);
+    // Every withheld interval is accounted for. A gate whose refusals are
+    // anonymous is a gate you cannot grade from outside the box — and after this
+    // ships, silence on the tape is ALSO what "exit stamping died" looks like.
+    expect(h.exitIntervalLogSuppressed).toBe(120);
+  });
+
+  it('a session that opens keeps reporting: closed pre-open is withheld, RTH is written, and the two reconcile', () => {
+    const h = stampAt([
+      { at: Date.parse('2026-07-27T13:00:00Z'), source: 'tick' },       // -
+      { at: Date.parse('2026-07-27T13:00:30Z'), source: 'tick' },       // closed, over
+      { at: Date.parse('2026-07-27T13:01:00Z'), source: 'tick' },       // closed, over
+      { at: Date.parse('2026-07-27T13:30:05Z'), source: 'decoupled' },  // boundary, over
+      { at: Date.parse('2026-07-27T13:30:40Z'), source: 'tick' },       // RTH, over  <- written
+      { at: Date.parse('2026-07-27T13:30:50Z'), source: 'decoupled' },  // RTH, under
+    ]);
+    expect(tapeLines()).toHaveLength(1);
+    expect(tapeLines()[0]).toContain('"source":"tick"');
+    expect(h.exitIntervalLogSuppressed).toBe(3);   // 2 closed + 1 boundary
+    expect(h.rth.closedIntervals).toBe(2);
+    expect(h.rth.boundaryIntervals).toBe(1);
+    expect(total(h.rth.intervalHistogram)).toBe(2);
+  });
+});
+
+/**
  * TRA-2610 — the PRODUCER half of the fix, tested where the erasure happened.
  *
  * `applyQuotes` has two loops. The first stamps quoted symbols; the second stamps

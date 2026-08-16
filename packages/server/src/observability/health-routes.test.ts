@@ -4388,6 +4388,11 @@ describe('TRA-2269 — the exit-cadence grade is scoped to its subject (rollUpEx
         boundaryIntervals: o.boundaryIntervals ?? 0,
         closedIntervals: o.closedIntervals ?? 0,
       },
+      // TRA-3800 — these fixtures drive the RTH-purity verdict, which this counter
+      // takes no part in. Pinned at 0 rather than plumbed through the options bag
+      // so a future change that DOES make the verdict depend on it fails here
+      // instead of silently reading a fixture default as a measurement.
+      exitIntervalLogSuppressed: 0,
     };
   }
 
