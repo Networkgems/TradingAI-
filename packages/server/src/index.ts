@@ -11887,6 +11887,23 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
       // identified from its payload shape without logging the payload itself.
       bodyFields: Object.keys(body ?? {}),
       writeRepairsSinceBoot: liveBrokerArmWriteRepairs,
+      // TRA-3809 — request ORIGIN. The payload-shape-only reasoning above was
+      // measured and found insufficient: the 2026-08-16T18:42:20Z fire on bqb1
+      // logged `bodyFields:["mode"]`, which identifies nothing on its own, and
+      // there was no access-log line carrying the traceId — the writer
+      // (`AccountModeSwitcher`, i.e. a human clicking our own Demo toggle) was
+      // only found by grepping the client. These four fields make the next
+      // occurrence attributable at read time instead of by forensic hunt.
+      // Still no payload contents and no bearer token: origin, not secrets.
+      origin: {
+        ip: req.ip ?? null,
+        forwardedFor: typeof req.headers['x-forwarded-for'] === 'string'
+          ? req.headers['x-forwarded-for']
+          : null,
+        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+        route: `${req.method} ${req.originalUrl}`,
+        referer: typeof req.headers['referer'] === 'string' ? req.headers['referer'] : null,
+      },
     });
   }
   const missingLiveCredentials = Array.from(new Set([

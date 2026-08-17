@@ -2636,6 +2636,12 @@ tr:hover td { background: var(--bg-hover); }
 .account-mode-option:hover:not(:disabled):not(.active) { color: var(--text); }
 .account-mode-option.demo.active { background: var(--blue-soft); color: var(--blue); }
 .account-mode-option.live.active { background: var(--green-soft); color: var(--green); }
+/* TRA-3809 — the server has been observed REFUSING this side (the pinned
+   operator's live-broker arm re-converges a demote back to live and still
+   answers 200). Mark it struck-through rather than disabling it: the operator
+   may clear the pin at any time, and this is the control they reach for when
+   they are trying to get OUT of a live arm. The `title` carries the reason. */
+.account-mode-option[data-clamped='true'] { text-decoration: line-through; opacity: 0.55; }
 
 /* ── Crypto dashboard: orange accent ─────────────────────────────────────────── */
 
