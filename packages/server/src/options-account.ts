@@ -891,6 +891,315 @@ export function summarizeLiveUnmanagedRisk(
   return { total, byReason, unexplained };
 }
 
+/**
+ * TRA-3822 — the runtime facts `summarizeLiveStopActionability` needs and that
+ * a row cannot carry, because they live on the ENGINE and on the account's
+ * config rather than on the position.
+ *
+ * `brokerMirroring` is `checkExits({ waitAndHold })` as the engine actually
+ * computes it — `mode === 'live' && tradierLiveOptionsEnabled &&
+ * tradierLiveClient !== null` (`signal-engine.ts:5351-5354`), i.e. exactly
+ * `getLiveOptionsArmState()` AND-ed. It is a parameter and not a re-derivation
+ * on purpose: the engine trades off its in-memory state, and settings on disk
+ * can legitimately disagree with it (TRA-2649).
+ */
+export interface LiveStopActionabilityContext {
+  /** `checkExits({ waitAndHold })` for the book these rows belong to. */
+  brokerMirroring: boolean;
+  /** TRA-361 — `PaperOptionsAccount.autoManageImportedTradierOptions`, resolved. */
+  autoManageImportedTradierOptions: boolean;
+  /** TRA-483 — the resolved knob, NOT the `options-account.ts` field default. */
+  holdLiveOptionsOvernightForPdt: boolean;
+  /** TRA-1136 — the resolved knob. */
+  swingHoldOptions: boolean;
+  /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
+  now?: number;
+}
+
+/**
+ * TRA-3822 — the first `checkExits` gate that refuses a BREACHED live stop,
+ * named in the order the loop hits them. Every value here is a `continue` in
+ * `checkExits` that sits BEFORE the hard-SL branch at `options-account.ts:5332`.
+ */
+export type LiveStopInertReason =
+  /** `opt.legs.length > 1` — the combo skip (`:4691-4712`); live combos never reach the SL. */
+  | 'multi_leg_combo'
+  /** TRA-1966 covered write (`:4717`) — inverted P&L basis, no long-side schedule. */
+  | 'covered_write'
+  /** TRA-361 (`:4726`) — imported row, auto-management off. */
+  | 'imported_auto_manage_off'
+  /** TRA-361 (`:4727`) — imported row, no broker mirror to route the exit through. */
+  | 'imported_no_broker_mirror'
+  /** TRA-450 (`:5016`) — the close-reject circuit breaker has withdrawn staging. */
+  | 'close_reject_breaker'
+  /** TRA-2984 (`:5025`) — the expiry breaker has withdrawn staging. */
+  | 'exit_expired_breaker'
+  /** TRA-483 (`:5041`) — the PDT overnight hold. Has a known release. */
+  | 'pdt_hold_today'
+  /** TRA-495/TRA-1136 (`:5072`) — the swing hold. Has a known release. */
+  | 'swing_hold_today';
+
+/** TRA-3822 — see {@link summarizeLiveStopActionability}. */
+export interface LiveStopActionabilitySummary {
+  /**
+   * Live open rows carrying an ARMED stop (`isArmedThreshold`) whose mark is at
+   * or through it. The denominator; `breached === actionable + inFlight + inert`.
+   */
+  breached: number;
+  /** The subset `checkExits` WOULD act on this tick — it reaches `:5332`. */
+  actionable: number;
+  /**
+   * The subset already carrying a `pendingExit` — an exit IS staged/working at
+   * the broker. Not inert: something is acting. ⚠️ Not a promise of a FILL —
+   * the stall mode is `staleWorkingExits` / `abandonedStagedExits` (TRA-2956 /
+   * TRA-2819), which are their own counters on this same route.
+   */
+  inFlight: number;
+  /**
+   * **The number this ticket exists for.** Live rows through an armed stop that
+   * `checkExits` cannot act on, because a `continue` fires before the SL branch.
+   * 0 is the healthy reading. Non-zero means real money is past its stop and
+   * nothing in the engine will do anything about it.
+   */
+  inert: number;
+  /** `inert` split by the FIRST refusing gate. Reasons only — never OCC symbols. */
+  byReason: Partial<Record<LiveStopInertReason, number>>;
+  /**
+   * ISO of the EARLIEST instant any inert row stops being suppressed — the
+   * moment the pile starts unwinding. `null` when nothing is inert, or when
+   * every inert row is `indefinite`.
+   *
+   * ⚠️ This is when the GATE lifts, not when a fill happens. `pdtHeldToday` /
+   * `swingHeldToday` are keyed on `toDateKey`, which is `toISOString().slice(0,10)`
+   * — a **UTC** day, so the release is the next 00:00Z, NOT ET midnight.
+   */
+  releasesAt: string | null;
+  /**
+   * ISO by which EVERY inert row has been released. `null` when nothing is
+   * inert, or when `indefinite > 0` (no such instant exists).
+   */
+  fullyReleasesAt: string | null;
+  /**
+   * Inert rows whose suppression has NO known expiry — a breaker, a combo, a
+   * covered write, an import with auto-management off. These do not release on
+   * a clock; they need a human. `indefinite > 0` is the escalating half.
+   */
+  indefinite: number;
+}
+
+/**
+ * TRA-3822 — is a real-money stop that is already THROUGH actually going to be
+ * acted on?
+ *
+ * ## Why this is a new field and not a widening
+ *
+ * On 2026-08-17 the money book (***0154) held two live option rows through
+ * their stops, with every engine exit suppressed, for a full session — and the
+ * two counters a reader reaches for both read a clean `0`, and both were RIGHT:
+ *
+ *   • {@link summarizeLiveUnmanagedRisk} asks only **"is a stop WRITTEN on this
+ *     row"**. Both rows carried a positive finite stop and no
+ *     `riskUnmanagedReason`, so `total: 0` / `unexplained: 0` was arithmetically
+ *     correct. **A perfect stop under a `continue` scores as fully managed.**
+ *   • `chandelier_deferred_breach` (`:5295-5301`) is an exit-JOURNAL label
+ *     stamped AT FIRE TIME, inside a branch that has already decided to exit. It
+ *     counts FIRES, not BREACHES. Zero fires, zero labels — and its own docstring
+ *     says a NON-zero count means the veto is broken, so `0` is the healthy
+ *     reading of a different question.
+ *
+ * Neither is a defect and neither may be widened: `liveUnmanagedRisk.unexplained`
+ * is TRA-2820's dropped-schedule signal and is SPECIFIED to sit at 0, and a
+ * non-zero `chandelier_deferred_breach` is TRA-3217's structural-break canary.
+ * Overloading either would destroy a live signal to manufacture a new one. **A
+ * positive control must CONTAIN what it detects** — so this is a new name.
+ *
+ * ## What it composes
+ *
+ * Three facts that were each individually visible on 08-17 and never joined:
+ *
+ *   1. **breach** — `isArmedThreshold(stopLossPremium) && mark <= stopLossPremium`,
+ *      the exact predicate at `:5332`, on a `mode: 'live'` open row.
+ *   2. **suppression** — does `checkExits` REACH `:5332` for this row, or does a
+ *      `continue` fire first? Walked in loop order, so `byReason` names the
+ *      gate that actually did the refusing rather than every gate that would.
+ *   3. **release horizon** — the two date-keyed holds expire on a clock, so the
+ *      answer the desk needs is not a boolean, it is *"this stop cannot fire
+ *      before <timestamp>"*. Everything else is `indefinite` and needs a human.
+ *
+ * ## Both directions
+ *
+ * A detector that over-matches voids every future clean read, so the shape is
+ * deliberately narrow in three places: an unbreached row is not counted at all
+ * (it is not `inert`, it is fine); a row already carrying a `pendingExit` scores
+ * `inFlight`, because something IS acting on it; and a row that reaches `:5332`
+ * scores `actionable`, not inert, even though it has not fired yet this tick.
+ *
+ * ## Disclosure
+ *
+ * Counts, reasons and one timestamp. **Never OCC symbols** — this feeds the
+ * no-auth `/api/health/options-live` and TRA-2163 is the standing reason not to
+ * widen what that route says about the real-money book.
+ *
+ * The breach test reads `currentPremium` (the mid this row's last quote was read
+ * off, maintained every tick) rather than the per-pass `optionMarks` map, which
+ * only exists inside a running `checkExits`. A row whose mark has gone stale
+ * therefore grades on its last known mid — the same number `/api/state` shows.
+ */
+export function summarizeLiveStopActionability(
+  positions: Iterable<OptionPosition>,
+  ctx: LiveStopActionabilityContext,
+): LiveStopActionabilitySummary {
+  const now = ctx.now ?? Date.now();
+  const nowKey = toDateKey(now);
+  const byReason: Partial<Record<LiveStopInertReason, number>> = {};
+  let breached = 0;
+  let actionable = 0;
+  let inFlight = 0;
+  let inert = 0;
+  let indefinite = 0;
+  let earliestRelease: number | null = null;
+  let latestRelease: number | null = null;
+
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    // Fact 1 — the breach, using the SAME predicate as the SL branch at `:5332`.
+    // `isArmedThreshold` first: `stopLossPremium: 0` means "no stop", and a
+    // `null` from disk ToNumber-coerces in `mark <= null` (TRA-2957).
+    if (!isArmedThreshold(opt.stopLossPremium)) continue;
+    const mark = opt.currentPremium;
+    if (!Number.isFinite(mark) || mark > opt.stopLossPremium) continue;
+    breached += 1;
+
+    // Fact 2 — walk the `continue` gates in `checkExits` loop order and stop at
+    // the FIRST one that refuses. Order matters: a row can satisfy several, and
+    // only the first is the one that actually did the not-acting.
+    let reason: LiveStopInertReason | null = null;
+    if (opt.legs && opt.legs.length > 1) reason = 'multi_leg_combo';
+    else if (opt.coveredWrite) reason = 'covered_write';
+    else if (opt.importedFromTradier === true && !ctx.autoManageImportedTradierOptions) {
+      reason = 'imported_auto_manage_off';
+    } else if (opt.importedFromTradier === true && !ctx.brokerMirroring) {
+      reason = 'imported_no_broker_mirror';
+    } else if (opt.pendingExit) {
+      // NOT inert — TRA-354 holds the row because an exit is already in flight.
+      inFlight += 1;
+      continue;
+    } else if ((opt.closeRejectCount ?? 0) >= MAX_CONSECUTIVE_CLOSE_REJECTS) {
+      reason = 'close_reject_breaker';
+    } else if ((opt.exitExpiredCount ?? 0) >= MAX_CONSECUTIVE_EXIT_EXPIRIES) {
+      reason = 'exit_expired_breaker';
+    } else if (ctx.holdLiveOptionsOvernightForPdt && toDateKey(opt.openedAt) === nowKey) {
+      reason = 'pdt_hold_today';
+    } else if (
+      opt.signalType === 'relative_value'
+      && toDateKey(opt.openedAt) === nowKey
+    ) {
+      // `swingHeldToday` at `:4823` is `(positionIsLive || swingHoldOptions)`,
+      // and every row here is already live — so the knob cannot un-latch it.
+      reason = 'swing_hold_today';
+    }
+
+    if (reason === null) {
+      actionable += 1;
+      continue;
+    }
+    inert += 1;
+    byReason[reason] = (byReason[reason] ?? 0) + 1;
+
+    // Fact 3 — the horizon. Only the two date-keyed holds have one: they test
+    // `toDateKey(openedAt) === toDateKey(now)`, so they release the instant the
+    // UTC day rolls past the row's open date.
+    if (reason === 'pdt_hold_today' || reason === 'swing_hold_today') {
+      const release = nextUtcDayStart(opt.openedAt);
+      if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+      if (latestRelease === null || release > latestRelease) latestRelease = release;
+    } else {
+      indefinite += 1;
+    }
+  }
+
+  return {
+    breached,
+    actionable,
+    inFlight,
+    inert,
+    byReason,
+    releasesAt: earliestRelease === null ? null : new Date(earliestRelease).toISOString(),
+    // No such instant exists while an indefinite row is outstanding, and
+    // publishing the clocked one anyway would read as "all clear by then".
+    fullyReleasesAt:
+      indefinite > 0 || latestRelease === null ? null : new Date(latestRelease).toISOString(),
+    indefinite,
+  };
+}
+
+/**
+ * TRA-3822 — fold per-book summaries into the fleet figure the no-auth route
+ * publishes.
+ *
+ * The two timestamps do NOT sum, they extremise: `releasesAt` is the earliest
+ * across books (when the pile starts unwinding) and `fullyReleasesAt` the latest
+ * (when it is done) — and `fullyReleasesAt` collapses to `null` the moment ANY
+ * book contributes an indefinite row, because no such instant exists then and a
+ * clocked value would read as "all clear by then".
+ */
+export function mergeLiveStopActionability(
+  summaries: Iterable<LiveStopActionabilitySummary>,
+): LiveStopActionabilitySummary {
+  const byReason: Partial<Record<LiveStopInertReason, number>> = {};
+  let breached = 0;
+  let actionable = 0;
+  let inFlight = 0;
+  let inert = 0;
+  let indefinite = 0;
+  let earliest: string | null = null;
+  let latest: string | null = null;
+  let anyFullyUnknown = false;
+  for (const s of summaries) {
+    breached += s.breached;
+    actionable += s.actionable;
+    inFlight += s.inFlight;
+    inert += s.inert;
+    indefinite += s.indefinite;
+    for (const [k, v] of Object.entries(s.byReason)) {
+      const key = k as LiveStopInertReason;
+      byReason[key] = (byReason[key] ?? 0) + (v ?? 0);
+    }
+    if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
+      earliest = s.releasesAt;
+    }
+    if (s.fullyReleasesAt !== null && (latest === null || s.fullyReleasesAt > latest)) {
+      latest = s.fullyReleasesAt;
+    }
+    // A book with inert rows but no `fullyReleasesAt` has an indefinite one, so
+    // the fleet figure cannot claim a completion instant either.
+    if (s.inert > 0 && s.fullyReleasesAt === null) anyFullyUnknown = true;
+  }
+  return {
+    breached,
+    actionable,
+    inFlight,
+    inert,
+    byReason,
+    releasesAt: earliest,
+    fullyReleasesAt: anyFullyUnknown ? null : latest,
+    indefinite,
+  };
+}
+
+/**
+ * TRA-3822 — 00:00:00.000Z of the UTC day AFTER `ts`'s UTC day. This is the
+ * literal expiry of a `toDateKey(openedAt) === toDateKey(now)` latch, because
+ * {@link toDateKey} is `toISOString().slice(0, 10)` — a **UTC** calendar day.
+ * It is NOT ET midnight, and the four-hour difference is a whole evening of
+ * unattended exposure in the wrong direction if you assume otherwise.
+ */
+function nextUtcDayStart(ts: number): number {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+}
+
 /** TRA-2984 — see {@link summarizeLiveExitErrors}. */
 export interface LiveExitErrorSummary {
   /** Live open rows carrying an `exitErrorReason` — i.e. a failed exit nobody resolved. */
@@ -7022,6 +7331,36 @@ export class PaperOptionsAccount {
    */
   liveUnmanagedRiskSummary(): LiveUnmanagedRiskSummary {
     return summarizeLiveUnmanagedRisk(this.openOptions.values());
+  }
+
+  /**
+   * TRA-3822 — the sibling of {@link liveUnmanagedRiskSummary}, keyed on
+   * ACTIONABILITY rather than on threshold presence. See
+   * {@link summarizeLiveStopActionability} for why that distinction is the whole
+   * point: this account's own `liveUnmanagedRiskSummary()` returned a correct
+   * `{ total: 0, unexplained: 0 }` over two real-money rows sitting through
+   * their stops under a `continue`.
+   *
+   * `brokerMirroring` must come from the ENGINE (`getLiveOptionsArmState()`
+   * AND-ed), because `checkExits({ waitAndHold })` is a per-pass argument and
+   * the account cannot see it. `now` is injectable for the controls only.
+   *
+   * The three config terms are read off this account's RESOLVED fields, not off
+   * a default — note that `options-account.ts` defaults
+   * `holdLiveOptionsOvernightForPdt` to `false` while the shared resolver
+   * defaults it to `true` and the engine always passes the resolved value, so
+   * re-deriving it anywhere else would invert the answer.
+   */
+  liveStopActionabilitySummary(
+    opts: { brokerMirroring: boolean; now?: number },
+  ): LiveStopActionabilitySummary {
+    return summarizeLiveStopActionability(this.openOptions.values(), {
+      brokerMirroring: opts.brokerMirroring,
+      autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
+      holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
+      swingHoldOptions: this.swingHoldOptions,
+      now: opts.now,
+    });
   }
 
   /**

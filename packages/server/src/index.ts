@@ -293,7 +293,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeLiveStopActionability } from './options-account.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   summarizeLiveBrokerPositionDrift,
@@ -10434,6 +10434,59 @@ app.get('/api/health/options-live', async (_req, res) => {
       liveUnmanagedRisk: summarizeLiveUnmanagedRisk(
         getAllUserContexts().flatMap(c => c.engine.getState().options.openOptions ?? []),
       ),
+      // TRA-3822 — the counter `liveUnmanagedRisk` above is STRUCTURALLY UNABLE
+      // to contain: is a live stop that is already THROUGH going to be acted on?
+      //
+      // On 2026-08-17 the money book held two real-money rows through their
+      // stops for a full session with every engine exit suppressed, and the
+      // field above read a correct `{ total: 0, unexplained: 0 }` — it asks only
+      // whether a stop is WRITTEN, so a perfect stop under a `continue` scores
+      // as fully managed. `chandelier_deferred_breach` read a correct 0 too: it
+      // is a fire-time journal label, so it counts FIRES, not breaches.
+      //
+      // Neither was widened. Both are load-bearing elsewhere and specified to
+      // sit at 0 (TRA-2820 dropped schedules; TRA-3217's structural-break
+      // canary), and overloading either would have destroyed a live signal to
+      // manufacture this one. New field, new name.
+      //
+      // **`inert` is the number.** It is the count of live rows through an armed
+      // stop that `checkExits` cannot act on because a `continue` fires before
+      // the SL branch. `releasesAt` answers the question the desk actually has —
+      // *"this stop cannot fire before when?"* — and it is a **UTC** day roll,
+      // not ET midnight, because that is what `toDateKey` compares.
+      //
+      // Counts, reasons and two timestamps. No OCC symbols: no-auth route,
+      // TRA-2163 standing.
+      //
+      // Wrapped because this route is the instrument every other grader reads
+      // through, and a new aggregation must not be able to 500 it. It fails to
+      // an explicit `instrumentBlind: true` with the counts NULLED rather than
+      // zeroed — "could not measure" and "measured zero" must never share a
+      // reading (the repo rule that BLIND > CLEAN).
+      liveStopActionability: (() => {
+        try {
+          return {
+            ...mergeLiveStopActionability(
+              getAllUserContexts().map(c => c.engine.getLiveStopActionability()),
+            ),
+            instrumentBlind: false as const,
+            blindReason: null,
+          };
+        } catch (err) {
+          return {
+            breached: null,
+            actionable: null,
+            inFlight: null,
+            inert: null,
+            byReason: null,
+            releasesAt: null,
+            fullyReleasesAt: null,
+            indefinite: null,
+            instrumentBlind: true as const,
+            blindReason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })(),
       // TRA-2819 — staged exits that were never handed to Tradier and had to be
       // reaped. Before this existed, an exit intent that missed its submit sat
       // on the row forever: unpollable (no order id), untouchable by the

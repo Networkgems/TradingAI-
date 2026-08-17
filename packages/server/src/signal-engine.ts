@@ -311,7 +311,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, type OptionTradeJournalSetup, type OptionExitRiskInput } from './options-account.js';
+import { PaperOptionsAccount, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -8694,6 +8694,29 @@ export class SignalEngine {
       optionsRouted: this.tradierLiveOptionsEnabled,
       clientPresent: this.tradierLiveClient !== null,
     };
+  }
+
+  /**
+   * TRA-3822 — this book's BREACHED-BUT-INERT live stop count.
+   *
+   * Lives on the engine rather than being computed in the route because
+   * `checkExits({ waitAndHold })` is the discriminator and it is a per-pass
+   * argument the account cannot see. `waitAndHold` is `liveOptionsMirroring`
+   * (`:5351-5354`), recomputed here from the SAME three fields — deliberately
+   * duplicated as an expression rather than routed through a shared helper, so
+   * that it stays byte-comparable to the call site it is claiming to predict.
+   *
+   * ⚠️ This grades the ROWS, not the cadence. A book whose `doTick` is not
+   * running at all still reports `actionable` here — that is the correct
+   * division of labour (`/api/health/exit-cadence` grades the pass; TRA-3821
+   * is the ruling on why `armedEngineCount: 0` is not the same question), but
+   * do not read a zero `inert` as "exits are firing".
+   */
+  getLiveStopActionability(): LiveStopActionabilitySummary {
+    return this.optionsAccount.liveStopActionabilitySummary({
+      brokerMirroring:
+        this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+    });
   }
 
   /**
