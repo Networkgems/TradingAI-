@@ -262,6 +262,14 @@ import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 import { initTapeExpectancyCache } from './option-tape-expectancy-cache.js';
 import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
+// TRA-3810 — the DURABLE record of live-arm demotion attempts, and the three-state
+// instrument that replaces the since-boot `bootArmWriteRepairs` counter as an alarm basis.
+import {
+  hydrateBootArmRepairLedgerFromDisk,
+  recordBootArmObservationStart,
+  recordBootArmRepair,
+  summarizeBootArmRepairs,
+} from './boot-arm-repair-ledger.js';
 import { hydrateOptionsBreakerLedgerFromDisk, summarizeOptionsBreakerLedger } from './options-breaker-ledger.js'; // TRA-3218
 import { hydrateMarkSanityFromDisk } from './option-mark-sanity.js'; // TRA-2945
 import { hydrateLiveEnforceGateFromDisk } from './live-enforce-gate-ledger.js';
@@ -4505,6 +4513,51 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
       days: h.days,
       sessions: h.sessions,
     });
+  }
+
+  // TRA-3810 (parent TRA-3809 → TRA-2649) — rebuild the DURABLE live-arm demotion-attempt
+  // record, then stamp this process's observation marker and carry over any repair the
+  // boot-arm itself performed.
+  //
+  // ORDER IS LOAD-BEARING, and it is the reason the boot repair is folded in HERE rather than at
+  // its own site in `user-context.ts`: `initAllUserContexts()` (line ~1141) runs the
+  // boot-arm long BEFORE this block, and the hydrate CLEARS the store — a record written
+  // from inside `createUserContext` would be silently erased right here. So the boot
+  // outcome is READ back from `getLiveBrokerBootArmOutcome()` after the hydrate, keyed on
+  // its `ranAt` so a re-read can never double-count it.
+  {
+    const b = hydrateBootArmRepairLedgerFromDisk(DATA_DIR);
+    if (b.records > 0) {
+      log.info('boot-arm repair ledger hydrated (TRA-3810)', {
+        records: b.records,
+        // The acceptance criterion in one number: repairs that OUTLIVED a restart. The
+        // counter this ledger replaces resets to 0 here, every single time.
+        repairs: b.repairs,
+        observationBoots: b.markers,
+        observingSince: b.observingSinceMs === null ? null : new Date(b.observingSinceMs).toISOString(),
+      });
+    }
+    // One marker per process: what gives a clean read a denominator. Without it,
+    // "no attempts" is an assertion over an unknown window (TRA-3810 header).
+    recordBootArmObservationStart(resolveBuildInfo().startedAt);
+
+    const bootOutcome = getLiveBrokerBootArmOutcome();
+    if (bootOutcome && bootOutcome.repaired.length > 0) {
+      recordBootArmRepair({
+        origin: 'boot',
+        username: bootOutcome.username,
+        repaired: bootOutcome.repaired,
+        // A boot repair has no request behind it — that is the discriminator TRA-2649
+        // named (the boot write carries no traceId), and `null` here preserves it.
+        requestOrigin: null,
+        dedupeKey: `boot:${bootOutcome.ranAt}`,
+      });
+      log.warn('TRA-3810 boot-arm repaired a PERSISTED demotion — recorded durably', {
+        username: bootOutcome.username,
+        repaired: bootOutcome.repaired,
+        ranAt: bootOutcome.ranAt,
+      });
+    }
   }
 
   // TRA-2945 (parent TRA-2927) — same treatment for the option MARK tape, and for
@@ -10300,8 +10353,26 @@ app.get('/api/health/options-live', async (_req, res) => {
       bootArmRanAt: getLiveBrokerBootArmOutcome()?.ranAt ?? null,
       bootArmRepairedAtBoot: getLiveBrokerBootArmOutcome()?.repaired ?? null,
       bootArmPersistError: getLiveBrokerBootArmOutcome()?.persistError ?? null,
+      // TRA-3810 — these two are RETAINED as a liveness cross-check of the CURRENT
+      // process, and are NO LONGER an alarm basis. Both are since-boot deltas: `0` reads
+      // identically for "the write path is clean" and "it has never been exercised"
+      // (the 2026-08-13 guard fire recorded 0 and that proved nothing), and a redeploy
+      // zeroes them, so an alarm built here self-clears on every deploy and pins OFF
+      // exactly when it matters. Read `bootArmRepairLedger` below instead.
       bootArmWriteRepairs: liveBrokerArmWriteRepairs,
       bootArmLastWriteRepairAt: liveBrokerArmLastWriteRepairAt,
+      // TRA-3810 — the DURABLE, append-only record of every demotion attempt, plus the
+      // three-state verdict a detector binds to: `attempts_recorded` / `no_attempt_observed`
+      // (VACUOUS — not a pass) / `instrument_blind`. `eligible` is passed explicitly and
+      // fails CLOSED: on a service where the arm is not eligible, `applyLiveBrokerArm`
+      // returns [] unconditionally, so an empty ledger is empty BY CONSTRUCTION and must
+      // read blind, never clean (the same vacuity trap `check-boot-arm.mjs` control 3 pins).
+      // Carries NO client IP or user-agent string — this route is unauthenticated; the
+      // full origin stays on disk. See `boot-arm-repair-ledger.ts`.
+      bootArmRepairLedger: summarizeBootArmRepairs({
+        eligible: shouldBootArmLiveEquity(settings, operator),
+        bootMs: Date.parse(resolveBuildInfo().startedAt),
+      }),
       // TRA-1490 / TRA-1491 — DARK strategy arm-flag states so the board/QA can
       // confirm (secrets-free) that the live single-leg option order paths are
       // still OFF. Both default false; arming either is a SEPARATE board approval.
@@ -11880,6 +11951,28 @@ app.put('/api/account/settings', requireAuth, async (req, res) => {
   if (armRepaired.length > 0) {
     liveBrokerArmWriteRepairs += 1;
     liveBrokerArmLastWriteRepairAt = new Date().toISOString();
+    // TRA-3810 — DURABLE first, log second. The two lines below this pair are the entire
+    // reason this ticket exists: the counter dies at the next redeploy and the warn line
+    // reaches a log surface the board/desk cannot read, so on 2026-08-16 an attempt to
+    // stand down a live real-money arm survived only as long as pid 73 did. This append
+    // is what makes the event readable after the restart, and it is what the detector
+    // (`scripts/check-boot-arm-repairs.mjs`) grades. Never throws; a swallowed append is
+    // COUNTED and forces the detector to `instrument_blind` rather than a false clean.
+    recordBootArmRepair({
+      origin: 'settings_write',
+      username,
+      repaired: armRepaired,
+      bodyFields: Object.keys(body ?? {}),
+      requestOrigin: {
+        ip: req.ip ?? null,
+        forwardedFor: typeof req.headers['x-forwarded-for'] === 'string'
+          ? req.headers['x-forwarded-for']
+          : null,
+        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+        route: `${req.method} ${req.originalUrl}`,
+        referer: typeof req.headers['referer'] === 'string' ? req.headers['referer'] : null,
+      },
+    });
     log.warn('TRA-2649 live-broker arm: settings write would have DEMOTED the pinned operator off the ratified arm — re-converged', {
       username,
       repaired: armRepaired,
