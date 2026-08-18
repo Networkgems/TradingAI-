@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { logger } from './lib/logger';
+import {
+  LIVE_ARM_FIELD_LABELS,
+  diffSettingsForSave,
+  partitionArmClamps,
+  resolveClampedFields,
+  touchesLiveArmField,
+  type LiveArmField,
+} from './lib/settings-save';
 import { NotificationsSettings } from './components/notifications/NotificationsSettings';
 import type {
   AccountMode,
@@ -1346,6 +1354,21 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
   // connection test go green down the wrong path. Capture the server's message
   // so the footer can show *why* the save was refused.
   const [saveErrorMessage, setSaveErrorMessage] = useState<string | null>(null);
+  // TRA-3833 — set when a 200 save came back with a SENT field holding a
+  // different value than we sent (the server clamped/repaired it), or when the
+  // response reported no settings at all while the save touched a live-arm
+  // field. The old behavior merged the clamped value back into the form
+  // (TRA-327) and reported a plain "Saved" — so unchecking "Tradier Live
+  // trades equities" and saving showed success while the TRA-2649 write-path
+  // arm kept the account trading live equities (ledger event
+  // 2026-08-17T13:53:42Z). Same defect class as the TRA-3809 Demo toggle: the
+  // response body was in hand and the UI claimed an outcome it never observed.
+  const [saveClampNotice, setSaveClampNotice] = useState<
+    | null
+    | { kind: 'arm'; fields: LiveArmField[] }
+    | { kind: 'other'; fields: string[] }
+    | { kind: 'unverified' }
+  >(null);
   const [resetPending, setResetPending] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [coinbaseTestStatus, setCoinbaseTestStatus] = useState<'idle' | 'testing'>('idle');
@@ -1505,6 +1528,18 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
     setSaveStatus('saving');
     setSaveErrorKind(null);
     setSaveErrorMessage(null);
+    setSaveClampNotice(null);
+    // TRA-3833 — send ONLY the fields that changed since the last load/save.
+    // The full-body `JSON.stringify(settings)` this replaces shipped all ~60
+    // fields on every save, so any staleness anywhere in the form state rode
+    // along and got written over disk — on 2026-08-17T13:53:42Z that vehicle
+    // carried `liveTradeEquitiesTradier:false` into a live-equities demotion
+    // attempt on the pinned operator (repaired by the TRA-2649 write-path arm;
+    // durable ledger row on bqb1). The server PUT merges a partial body
+    // against the persisted snapshot (TRA-485, same contract the
+    // AccountModeSwitcher's `{mode}` body relies on), so an untouched field is
+    // now simply never sent and cannot demote anything.
+    const payload = diffSettingsForSave(settings, lastSavedSettings);
     try {
       const r = await fetch(`${httpUrl}/api/account/settings`, {
         method: 'PUT',
@@ -1512,7 +1547,7 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify(settings),
+        body: JSON.stringify(payload),
       });
       if (r.ok) {
         // TRA-327 — read the server-clamped settings back from the response so
@@ -1530,6 +1565,27 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
         setLastSavedSettings(mergedPersisted);
         setSavedAtMs(Date.now());
         setSaveStatus('saved');
+        // TRA-3833 — report what the server DID, not what we asked. A 200 with
+        // a sent field returned different means the server clamped it (the
+        // TRA-2649 arm re-convergence, range clamps, preset fallback); a 200
+        // with no settings object at all is a THIRD state — outcome
+        // unobserved — and is only escalated when the save touched a live-arm
+        // field, where an unverified claim is the exact TRA-3809 bug.
+        const clamped = resolveClampedFields(payload, data?.settings);
+        if (clamped === null) {
+          if (touchesLiveArmField(payload)) {
+            logger.warn('settings', 'save touched a live-arm field but the 200 carried no settings — outcome unverified');
+            setSaveClampNotice({ kind: 'unverified' });
+          }
+        } else if (clamped.length > 0) {
+          const { armClamped, otherClamped } = partitionArmClamps(clamped);
+          if (armClamped.length > 0) {
+            logger.warn('settings', `server kept live-arm field(s) on the ratified arm: ${armClamped.join(', ')}`);
+            setSaveClampNotice({ kind: 'arm', fields: armClamped });
+          } else {
+            setSaveClampNotice({ kind: 'other', fields: otherClamped });
+          }
+        }
         onModeChange?.(persisted.mode);
         onSettingsSaved?.(persisted);
       } else {
@@ -2633,6 +2689,31 @@ export default function SettingsPage({ token, httpUrl, context, onModeChange, on
           {saveStatus !== 'saving' && saveStatus !== 'error' && savedAtLabel && !hasUnsavedChanges && (
             <span className="save-success" data-testid="settings-save-state">
               Saved at {savedAtLabel}
+            </span>
+          )}
+          {/* TRA-3833 — the server clamped a field we sent, or (for a live-arm
+              field) never reported the outcome. Rendered ALONGSIDE the saved
+              pill, not instead of it: the save DID persist, but not with the
+              values the user asked for, and for the real-money arm that
+              difference must be said out loud rather than shown only as a
+              checkbox quietly flipping back (same defect class as TRA-3809's
+              "Switched to Demo account" over a clamped live arm). */}
+          {saveStatus === 'saved' && saveClampNotice?.kind === 'arm' && (
+            <span className="save-error" role="alert" data-testid="settings-arm-clamp-notice">
+              {`The server kept ${saveClampNotice.fields.map(f => `“${LIVE_ARM_FIELD_LABELS[f]}”`).join(', ')} on the board-ratified live arm — this account is still trading live equities. `}
+              A settings save cannot stand this arm down; the supported de-escalation is clearing{' '}
+              <code>LIVE_EQUITY_BOOT_USER</code> on the service. Your other changes were saved.
+            </span>
+          )}
+          {saveStatus === 'saved' && saveClampNotice?.kind === 'unverified' && (
+            <span className="save-error" role="alert" data-testid="settings-arm-clamp-notice">
+              Save accepted, but the server did not report the resulting settings. This save touched a
+              live-trading field — reload and re-check it before trusting what the form shows.
+            </span>
+          )}
+          {saveStatus === 'saved' && saveClampNotice?.kind === 'other' && (
+            <span className="save-unsaved" data-testid="settings-clamp-notice">
+              {`Saved — the server adjusted ${saveClampNotice.fields.join(', ')}; the form now shows the persisted values.`}
             </span>
           )}
 
