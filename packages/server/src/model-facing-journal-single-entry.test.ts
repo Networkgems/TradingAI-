@@ -29,13 +29,32 @@ import { describe, expect, it } from 'vitest';
 /** The module that composes load+predicate; it alone may name the raw loader. */
 const OWNER = 'model-facing-journal.ts';
 
-/** The composed entry points every model-facing consumer must come through. */
-const ENTRIES = [
+/**
+ * TRA-3831 — the entry points that carry BOTH axes of the basis: the demo `mode`
+ * pin AND the desk+unattributed account-class predicate.
+ *
+ * `applyModelFacingBasis` is deliberately NOT in this list. It calls
+ * `excludeTestAccountRows` and never looks at `mode`; the mode pin lives one layer
+ * ABOVE it (the store filter in `loadModelFacingJournal`). Treating it as an entry
+ * point is what let `/api/health/option-journal` fold a POOLED, live-row-admitting
+ * population and still satisfy the check at the bottom of this file — the guard
+ * matched the name and went quiet on exactly the shape it exists to catch.
+ */
+const MODE_PINNED_ENTRIES = [
   'loadModelFacingJournal',
   'loadModelFacingJournalRows',
   'foldModelFacingEodJournal',
-  'applyModelFacingBasis',
+  'applyModelFacingFoldBasis',
 ] as const;
+
+/**
+ * The composed entry points every model-facing consumer must come through. The
+ * mode-pinned ones plus `applyModelFacingBasis`, which is a legitimate entry for a
+ * consumer that is ACCOUNT-class-facing and folds modes deliberately (the tape
+ * expectancy cache censuses `byMode` off exactly that population) — but which is
+ * NOT sufficient for a learned-weights fold. See the last test below.
+ */
+const ENTRIES = [...MODE_PINNED_ENTRIES, 'applyModelFacingBasis'] as const;
 
 /** The raw loader. Reaching it directly folds the pooled population. */
 const RAW_LOADER = 'listOptionTradeJournal';
@@ -182,10 +201,16 @@ describe('TRA-2214: model-facing journal folds have one entry point', () => {
     // on a bare read whenever the weights cache was cold — one field, two bases,
     // switching on cache warmth. Any module that both loads the journal AND folds
     // weights must name the predicate.
+    //
+    // TRA-3831 — the predicate has to be a MODE-PINNED one. This assertion used to
+    // accept any of `ENTRIES`, and health-routes.ts named `applyModelFacingBasis`,
+    // so the guard passed while that fallback folded a pooled, live-row-admitting
+    // population. Account class and mode are independent axes and only one of them
+    // is stated on the wire (`weightsBasis: 'desk+unattributed'`).
     const offenders = files
       .filter((f) => f.path !== OWNER)
       .filter((f) => f.code.includes(RAW_LOADER) && f.code.includes('computeOptionLearnedWeights('))
-      .filter((f) => !ENTRIES.some((e) => f.code.includes(e)))
+      .filter((f) => !MODE_PINNED_ENTRIES.some((e) => f.code.includes(e)))
       .map((f) => f.path);
     expect(offenders).toEqual([]);
   });

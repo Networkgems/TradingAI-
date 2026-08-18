@@ -50,6 +50,27 @@ export const MODEL_FACING_JOURNAL_BASIS = 'desk+unattributed' as const;
 
 export type ModelFacingJournalBasis = typeof MODEL_FACING_JOURNAL_BASIS;
 
+/**
+ * TRA-3831 — the MODE pin, as a single literal.
+ *
+ * `MODEL_FACING_JOURNAL_BASIS` names the ACCOUNT-CLASS basis and nothing else;
+ * it is emitted on the wire as `weightsBasis` and says *desk + unattributed*,
+ * which is silent about `mode`. The two are independent axes and were being read
+ * as one: a payload labelled `desk+unattributed` was taken to mean "the demo
+ * fold", so a fold that admitted `mode:'live'` rows had no tell.
+ *
+ * Pinned here rather than inline so the store-level filter in
+ * {@link loadModelFacingJournal} and the in-memory filter in
+ * {@link applyModelFacingFoldBasis} cannot drift apart. `listOptionTradeJournal`
+ * filters with `r.mode === mode`, so the two are the same test by construction.
+ */
+export const MODEL_FACING_JOURNAL_MODE = 'demo' as const;
+
+/** The row-level form of the {@link MODEL_FACING_JOURNAL_MODE} pin. */
+export function isModelFacingModeRow(row: Pick<OptionTradeJournalRecord, 'mode'>): boolean {
+  return row.mode === MODEL_FACING_JOURNAL_MODE;
+}
+
 /** Rows on the model-facing basis, plus the census that explains them. */
 export interface ModelFacingJournal {
   /** The rows to fold. QA/test books removed; unattributed rows kept. */
@@ -88,20 +109,59 @@ export function applyModelFacingBasis(
   };
 }
 
+/** A {@link ModelFacingJournal} that also states how many rows the mode pin dropped. */
+export interface ModelFacingFold extends ModelFacingJournal {
+  /**
+   * Rows removed by the {@link MODEL_FACING_JOURNAL_MODE} pin — i.e. `mode:'live'`
+   * rows that reached a model-facing fold site. Non-zero is not an error (the
+   * caller handed us a pooled list, which is what this function is for) but it is
+   * the number that separates a demo fold from a pooled one, and it is counted
+   * BEFORE the account-class predicate so it cannot be confused with
+   * `counts.fixtureExcluded`.
+   */
+  modeExcluded: number;
+}
+
+/**
+ * TRA-3831 — the fold basis for a caller that ALREADY HOLDS pooled rows.
+ *
+ * {@link applyModelFacingBasis} equalizes the ACCOUNT-CLASS axis only — it never
+ * looks at `mode`. A model-facing fold needs BOTH axes, and the mode pin used to
+ * live one layer above, in {@link loadModelFacingJournal}, reachable only by a
+ * caller that let this module do the loading. A site holding its own rows (the
+ * `/api/health/option-journal` weights fallback) therefore folded a POOLED
+ * population under the same field name and the same `desk+unattributed` label
+ * as the mode-pinned path — one field, two bases, with no tell on the wire.
+ *
+ * This is that missing composition: mode pin THEN account-class predicate, over
+ * rows the caller supplies. Use it wherever the rows did not come from
+ * {@link loadModelFacingJournal}.
+ */
+export function applyModelFacingFoldBasis(
+  rows: readonly OptionTradeJournalRecord[],
+  opts: { includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
+): ModelFacingFold {
+  const demo = rows.filter(isModelFacingModeRow);
+  return { ...applyModelFacingBasis(demo, opts), modeExcluded: rows.length - demo.length };
+}
+
 /**
  * TRA-2214 — load the journal for a MODEL-FACING fold: demo-only, QA fixtures
  * removed, unattributed rows kept.
  *
- * `mode: 'demo'` is pinned here and is NOT a caller option. Every consumer of
- * this module trains or reports a demo number; the moment Tradier SANDBOX/live
- * journaling starts writing (TRA-2134) a live row must not silently enter a
- * demo fold, and there is no wire-format tell if it does.
+ * `mode` is pinned to {@link MODEL_FACING_JOURNAL_MODE} here and is NOT a caller
+ * option. Every consumer of this module trains or reports a demo number; the
+ * moment Tradier SANDBOX/live journaling starts writing (TRA-2134) a live row
+ * must not silently enter a demo fold, and there is no wire-format tell if it
+ * does. TRA-3831 — the pin is at the STORE filter here and at
+ * {@link applyModelFacingFoldBasis} for callers that hold their own rows; both
+ * read the same literal, and `applyModelFacingBasis` alone carries NEITHER.
  */
 export async function loadModelFacingJournal(
   opts: { from?: number; to?: number; includeTest?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): Promise<ModelFacingJournal> {
   const { from, to, ...basisOpts } = opts;
-  const rows = await listOptionTradeJournal({ from, to, mode: 'demo' });
+  const rows = await listOptionTradeJournal({ from, to, mode: MODEL_FACING_JOURNAL_MODE });
   return applyModelFacingBasis(rows, basisOpts);
 }
 

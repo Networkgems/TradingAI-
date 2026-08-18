@@ -2174,6 +2174,65 @@ describe('buildOptionJournalReport', () => {
     expect(report.summary.byStructure).toHaveLength(0);
   });
 
+  // TRA-3831 — the weights fold is DEMO-ONLY on BOTH branches.
+  //
+  // The route hands this function its own POOLED `listOptionTradeJournal()` read
+  // (health-routes.ts, `const rows = await listOptionTradeJournal()`), because
+  // `summary` publishes the pooled TRA-2193 account-class census and the TRA-3381
+  // mode partition. The learned-weights fold must NOT inherit that population.
+  //
+  // This is a POSITIVE CONTROL: the input CONTAINS a `mode:'live'` row that is
+  // desk/unattributed and therefore survives `excludeTestAccountRows`, so it WOULD
+  // move `generatedFrom.rows` if admitted. A test that merely omitted live rows
+  // would pass on the pooled code and prove nothing. The assertions on `summary`
+  // below pin that the row really was in the input and really is in the pooled
+  // fold — without them a bug that dropped the row upstream would read as a pass.
+  it('folds learned weights over demo rows only, even on the cold-cache fallback', () => {
+    const rows: OptionTradeJournalRecord[] = [
+      { ...closedRow, id: 'demo-1' },
+      { ...closedRow, id: 'demo-2', openTs: NOW - 172_800_000 },
+      { ...closedRow, id: 'live-1', mode: 'live', realizedPnlUsd: 5_000, realizedR: 4 },
+    ];
+
+    // No `cached` — this is the fallback branch, the one that used to refold POOLED.
+    const report = buildOptionJournalReport(rows, NOW, true);
+
+    // The live row is in the input and in the pooled readouts (the control).
+    expect(report.summary.total).toBe(3);
+    expect(report.summary.byMode.live.closed).toBe(1);
+    expect(report.summary.byMode.demo.closed).toBe(2);
+
+    // …and is NOT in the weights fold. 3 here is the pooled defect.
+    expect(report.weights.generatedFrom.rows).toBe(2);
+    expect(report.weights.generatedFrom.resolved).toBe(2);
+
+    // The label on the wire states the ACCOUNT-CLASS axis only, which is why the
+    // mode axis has to be enforced by the fold path rather than read off `weightsBasis`.
+    expect(report.weightsBasis).toBe('desk+unattributed');
+  });
+
+  // TRA-3831 — the same invariant on the CACHED branch, so the two are pinned to
+  // one number rather than each to its own. `cached` is served verbatim, so what
+  // this asserts is that the route publishes the cache's fold and does not silently
+  // refold: a regression that dropped back to a local fold would return 3.
+  it('serves the cached fold verbatim, so both branches publish one number', () => {
+    const rows: OptionTradeJournalRecord[] = [
+      { ...closedRow, id: 'demo-1' },
+      { ...closedRow, id: 'demo-2', openTs: NOW - 172_800_000 },
+      { ...closedRow, id: 'live-1', mode: 'live', realizedPnlUsd: 5_000, realizedR: 4 },
+    ];
+    const fallback = buildOptionJournalReport(rows, NOW, true);
+    const cached = {
+      weights: fallback.weights,
+      freshness: { computedAt: NOW, generation: 7, ageMs: 0, ttlMs: 60_000, dirty: false },
+    };
+
+    const report = buildOptionJournalReport(rows, NOW, true, cached);
+
+    expect(report.weights.generatedFrom.rows).toBe(2);
+    expect(report.weightsFreshness?.generation).toBe(7);
+  });
+
   // TRA-1661 (TRA-1647A) — the byDelta rollup must reach the WIRE, per structure and
   // in both R bases. Without it QuantTrader cannot set the win-probability knob and
   // the cost-aware gate cannot be validated at all, so this is the load-bearing

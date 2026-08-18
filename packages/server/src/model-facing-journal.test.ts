@@ -15,9 +15,11 @@ import { join } from 'path';
 import { rm } from 'fs/promises';
 import {
   applyModelFacingBasis,
+  applyModelFacingFoldBasis,
   loadModelFacingJournal,
   loadModelFacingJournalRows,
   MODEL_FACING_JOURNAL_BASIS,
+  MODEL_FACING_JOURNAL_MODE,
 } from './model-facing-journal.js';
 import {
   recordOptionTradeOpen,
@@ -138,6 +140,69 @@ describe('TRA-2214 applyModelFacingBasis — the account-class predicate + censu
     const out = applyModelFacingBasis([closedRow(FIXTURE), closedRow(FIXTURE)], { env: {} });
     expect(out.rows).toEqual([]);
     expect(out.counts).toEqual({ desk: 0, unattributed: 0, fixtureExcluded: 2 });
+  });
+
+  // TRA-3831 — the axis this function does NOT cover, stated as a test so the next
+  // caller cannot mistake it for the whole basis. This is the defect verbatim: the
+  // `/api/health/option-journal` weights fallback called `applyModelFacingBasis` on
+  // its own pooled read and published the result under `weightsBasis:
+  // 'desk+unattributed'`, which says nothing about mode.
+  it('does NOT pin mode — a live row survives it (the axis it does not cover)', () => {
+    const out = applyModelFacingBasis(
+      [closedRow(DESK), closedRow({ ...DESK, mode: 'live' })],
+      { env: {} },
+    );
+    expect(out.rows).toHaveLength(2);
+    expect(out.rows.filter((r) => r.mode === 'live')).toHaveLength(1);
+  });
+});
+
+describe('TRA-3831 applyModelFacingFoldBasis — mode pin + account class, for caller-held rows', () => {
+  it('drops live rows BEFORE the account predicate and counts them separately', () => {
+    // A POSITIVE CONTROL: the live rows here are desk/unattributed, so they survive
+    // `excludeTestAccountRows` and can only be removed by the mode pin. If the pin
+    // regressed, `rows` would be 4 and `modeExcluded` 0 — not a silently equal number.
+    const rows = [
+      closedRow(DESK),
+      closedRow(UNATTRIBUTED),
+      closedRow({ ...DESK, mode: 'live' }),
+      closedRow({ ...UNATTRIBUTED, mode: 'live' }),
+      closedRow(FIXTURE),
+      closedRow({ ...FIXTURE, mode: 'live' }),
+    ];
+
+    const out = applyModelFacingFoldBasis(rows, { env: {} });
+
+    expect(out.rows).toHaveLength(2);
+    expect(out.rows.every((r) => r.mode === MODEL_FACING_JOURNAL_MODE)).toBe(true);
+    expect(out.modeExcluded).toBe(3);
+    expect(out.basis).toBe(MODEL_FACING_JOURNAL_BASIS);
+    // `counts` describes the POST-mode-pin population, so its three classes sum to
+    // the demo rows only. `modeExcluded` is the fourth number and is deliberately
+    // not folded into `fixtureExcluded` — "dropped as QA churn" and "dropped as
+    // real money" are opposite facts and must not render the same.
+    expect(out.counts).toEqual({ desk: 1, unattributed: 1, fixtureExcluded: 1 });
+    expect(out.counts.desk + out.counts.unattributed + out.counts.fixtureExcluded + out.modeExcluded)
+      .toBe(rows.length);
+  });
+
+  it('agrees with the loader path row-for-row on a pooled input', () => {
+    // The two places the pin lives must be the same test. `loadModelFacingJournal`
+    // pins at the STORE (`listOptionTradeJournal({ mode })`); this pins in memory.
+    // `listOptionTradeJournal` filters with `r.mode === mode`, so equality here is
+    // the assertion that neither has drifted to a looser comparison.
+    const pooled = [
+      closedRow(DESK),
+      closedRow({ ...DESK, mode: 'live' }),
+      closedRow(UNATTRIBUTED),
+    ];
+    const viaFold = applyModelFacingFoldBasis(pooled, { env: {} });
+    const viaStoreEquivalent = applyModelFacingBasis(
+      pooled.filter((r) => r.mode === MODEL_FACING_JOURNAL_MODE),
+      { env: {} },
+    );
+    expect(viaFold.rows.map((r) => r.id)).toEqual(viaStoreEquivalent.rows.map((r) => r.id));
+    expect(viaFold.counts).toEqual(viaStoreEquivalent.counts);
   });
 });
 

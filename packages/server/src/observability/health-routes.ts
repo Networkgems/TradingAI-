@@ -19,9 +19,12 @@ import {
   type TestAccountClassifierIdentity,
 } from '../test-accounts.js'; // TRA-1949, TRA-2524, TRA-2660
 import {
-  applyModelFacingBasis,
+  // TRA-3831 — the MODE-PINNED composition. `applyModelFacingBasis` is
+  // deliberately NOT imported here: it carries the account-class axis only, and
+  // this module holds its own POOLED `listOptionTradeJournal()` rows.
+  applyModelFacingFoldBasis,
   MODEL_FACING_JOURNAL_BASIS,
-} from '../model-facing-journal.js'; // TRA-2214
+} from '../model-facing-journal.js'; // TRA-2214, TRA-3831
 import { resolveBuildInfo } from './build-info.js';
 import { summarizeLiveHealth, summarizeFeed } from './live-health.js';
 import { evaluateEnvDrift, loadRenderBlueprint } from './env-drift.js'; // TRA-2209
@@ -2701,14 +2704,32 @@ export function buildOptionJournalReport(
         + 'axes cannot be mixed in one request; on the exit axis rows still OPEN are excluded '
         + 'by construction. TRA-3715.',
     },
-    // TRA-2214 — BOTH branches must fold on the same basis. The cached branch is
-    // the `OptionWeightsCache`, which is now desk+unattributed; a cold cache used
-    // to fall through to a POOLED refold of the same field. One field, two bases,
-    // switching on cache warmth, with no tell in the payload — so the fallback is
-    // routed through the same predicate. `summary` above stays deliberately POOLED
-    // (this is the readout that publishes the TRA-2193 account-class census), which
-    // is why `weightsBasis` is stated separately rather than assumed to cover both.
-    weights: cached?.weights ?? computeOptionLearnedWeights(applyModelFacingBasis(rows).rows),
+    // TRA-2214 / TRA-3831 — BOTH branches must fold on the same basis, and the
+    // basis has TWO axes: account class AND mode. The enforced invariant is that
+    // whichever branch runs, the rows folded here have passed the demo `mode` pin
+    // and then the desk+unattributed account-class predicate.
+    //
+    //   • cached branch — `OptionWeightsCache`, whose default load is
+    //     `loadModelFacingJournalRows()`. The mode pin is the STORE filter inside
+    //     `loadModelFacingJournal` (`model-facing-journal.ts`), one layer ABOVE
+    //     `applyModelFacingBasis`.
+    //   • fallback branch — `rows` is the route's own POOLED
+    //     `listOptionTradeJournal()` read, so it never reaches that layer. It is
+    //     routed through `applyModelFacingFoldBasis`, which composes the SAME mode
+    //     literal (`MODEL_FACING_JOURNAL_MODE`) with the same account predicate.
+    //
+    // `applyModelFacingBasis` ALONE is not sufficient and was what used to be here:
+    // it calls `excludeTestAccountRows` and never looks at `mode`, so the fallback
+    // folded a pooled population — including live rows — under one field name and
+    // the `weightsBasis: 'desk+unattributed'` label, which is a statement about
+    // account class only. One field, two bases, switching on cache warmth, with no
+    // tell in the payload. (Dead today: the only production caller always supplies
+    // `cached`. The defence was one call site, not an invariant.)
+    //
+    // `summary` above stays deliberately POOLED — it is the readout that publishes
+    // the TRA-2193 account-class census and the TRA-3381 mode partition — which is
+    // why `weightsBasis` is stated separately rather than assumed to cover both.
+    weights: cached?.weights ?? computeOptionLearnedWeights(applyModelFacingFoldBasis(rows).rows),
     weightsBasis: MODEL_FACING_JOURNAL_BASIS,
     ...(cached ? { weightsFreshness: cached.freshness } : {}),
     ...(sinceTs === undefined ? {} : { sinceTs }),
