@@ -2682,6 +2682,44 @@ export interface OptionPosition {
    */
   importedFromTradier?: boolean;
   /**
+   * TRA-3829 — MAY THE ENGINE ACT ON THIS ROW? Stamped once, at adoption, from
+   * the TRA-3553 provenance oracle's verdict.
+   *
+   * ── Why this could not be {@link importedFromTradier} ────────────────────
+   * That flag is a RECONCILIATION claim and says so at `options-account.ts`
+   * `:7117-7127`: *"not a provenance claim, it is a BOOKKEEPING claim — the
+   * broker payload is the authority on whether this row still exists"*. Every
+   * consumer that reads it reads it to answer "whose cash bucket does this
+   * settle into?". Not one reads it to answer "did a human hand this position
+   * to the engine?". An adopted row RECONCILES BY CONSTRUCTION — that is what
+   * adoption means — so reconciliation can never evidence authorisation, and
+   * leaning harder on `importedFromTradier` cannot separate them. This field
+   * is the authorisation half, kept deliberately separate so both stay true.
+   *
+   * ── The values ──────────────────────────────────────────────────────────
+   *   • `engine_origin` — the oracle PROVED the app placed this contract and
+   *                       the local row was lost (fill poll did not terminate
+   *                       in the wait window, or a reboot). TRA-2820's two
+   *                       TSLA contracts. The engine opened it, so the engine
+   *                       may manage it: this is the value that keeps
+   *                       TRA-2820's fix alive under the TRA-3829 guard.
+   *   • `foreign`       — the oracle is HEALTHY and has no record of us
+   *                       opening it ⇒ genuinely someone else's position.
+   *                       The 2026-08-17 ***0154 case. NEVER actioned.
+   *   • `unresolved`    — the oracle could not answer (ledger never hydrated,
+   *                       `DATA_DIR` unreadable, retention aged the row out).
+   *                       FAILS CLOSED to not-actioned: we do not know it is
+   *                       ours, and acting on an absent discriminator is the
+   *                       TRA-3826 mistake ("an absent discriminator is not a
+   *                       negative result — it is no result").
+   *
+   * Absent ⇔ the row did not come through the adoption path at all, i.e. a
+   * plain engine-opened position. Absent is NOT a fourth authorisation state
+   * and must never be defaulted to one: read it only on rows where
+   * `importedFromTradier` is true.
+   */
+  adoptionAuthority?: 'engine_origin' | 'foreign' | 'unresolved';
+  /**
    * TRA-3078 — the option-trade-journal row id this position's PARTIAL and
    * CLOSE rows must be written to. Absent ⇔ unresolved; present and equal to
    * {@link id} ⇔ resolved to identity, which is the case for every
@@ -2743,8 +2781,22 @@ export interface OptionPosition {
    * exact misreading that let TRA-2820's 8 live contracts sit unstopped and be
    * filed as working-as-intended. A row carrying this reason is NOT explained;
    * it is flagged, and it wants an operator.
+   *
+   * TRA-3829 — `adopted_not_authorized` is a FOURTH kind again, and it is the
+   * only one that is not about risk-schedule arithmetic at all. The other three
+   * answer "can we compute a sane stop for this row?". This one answers "is
+   * this row ours to act on?" and the answer is no — see
+   * {@link OptionPosition.adoptionAuthority}. It is stamped on `foreign` and
+   * `unresolved` adoptions whenever the engine is not explicitly armed to act
+   * on adopted inventory, which is the default. A row carrying it is working
+   * exactly as intended and does NOT want an operator, which is what separates
+   * it from `provenance_unresolved`.
    */
-  riskUnmanagedReason?: 'auto_manage_off' | 'sub_floor_premium' | 'provenance_unresolved';
+  riskUnmanagedReason?:
+    | 'auto_manage_off'
+    | 'sub_floor_premium'
+    | 'provenance_unresolved'
+    | 'adopted_not_authorized';
   /**
    * TRA-3553 (TRA-2820 ask 2) — why {@link underlyingEntryPrice} is `0` on a
    * reconstructed row, when it is.

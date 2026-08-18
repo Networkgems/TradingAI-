@@ -62,12 +62,13 @@ function snapshotOf(positions: OptionPosition[]) {
 
 describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
   it('sums premiumPaid × contractsRemaining × 100 over the open rows', () => {
-    expect(foldOpenPremiumAtRisk([pos()])).toEqual({ usd: 150, rows: 1, unpricedRows: 0 });
+    expect(foldOpenPremiumAtRisk([pos()]))
+      .toEqual({ usd: 150, rows: 1, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
     expect(foldOpenPremiumAtRisk([
       pos({ id: 'a' }),
       pos({ id: 'b', premiumPaid: 0.82 }),
       pos({ id: 'c', premiumPaid: 2.00, contracts: 2, contractsRemaining: 2 }),
-    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0 });
+    ])).toEqual({ usd: 150 + 82 + 400, rows: 3, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
   });
 
   it('uses REMAINING contracts, so a TP1 partial releases the headroom it freed', () => {
@@ -93,11 +94,66 @@ describe('foldOpenPremiumAtRisk (TRA-3445)', () => {
     ]);
     // A silent skip would leave `usd: 150, rows: 1` — indistinguishable from a
     // book that really holds one position. `unpricedRows` is the discriminator.
-    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3 });
+    expect(fold).toEqual({ usd: 150, rows: 1, unpricedRows: 3, adoptedUsd: 0, adoptedRows: 0 });
+  });
+
+  it('TRA-3829 — an ADOPTED row counts toward the TOTAL but is attributed away from the engine', () => {
+    // The cap bounds what the ENGINE may spend. A position the account owner
+    // placed by hand on the broker is not engine spend, but it IS real exposure
+    // on the same account — so the fold must report both, and the caller
+    // subtracts. Reporting only the total let $691.00 of the owner's own money
+    // consume the engine's entry budget on 2026-08-17; reporting only the
+    // engine's figure would understate what the account is actually carrying.
+    const fold = foldOpenPremiumAtRisk(
+      [
+        pos({ id: 'engine' }),
+        pos({
+          id: 'hand-placed',
+          optionSymbol: 'PLTR260821C00180000',
+          premiumPaid: 1.435,
+          contracts: 2,
+          contractsRemaining: 2,
+          importedFromTradier: true,
+          adoptionAuthority: 'foreign',
+          tradierEnv: 'production',
+        }),
+      ],
+      /* armed */ false,
+    );
+    expect(fold.usd).toBeCloseTo(150 + 287, 2);
+    expect(fold.rows).toBe(2);
+    expect(fold.adoptedUsd).toBeCloseTo(287, 2);
+    expect(fold.adoptedRows).toBe(1);
+    // What the cap should be enforced against.
+    expect(fold.usd - fold.adoptedUsd).toBeCloseTo(150, 2);
+
+    // ARMED, the same row is the engine's to spend, and the split collapses —
+    // the attribution follows the authorisation rather than being a second,
+    // independently-drifting opinion about the same row.
+    const armed = foldOpenPremiumAtRisk(
+      [
+        pos({ id: 'engine' }),
+        pos({
+          id: 'hand-placed',
+          optionSymbol: 'PLTR260821C00180000',
+          premiumPaid: 1.435,
+          contracts: 2,
+          contractsRemaining: 2,
+          importedFromTradier: true,
+          adoptionAuthority: 'foreign',
+          tradierEnv: 'production',
+        }),
+      ],
+      /* armed */ true,
+    );
+    expect(armed.usd).toBeCloseTo(150 + 287, 2);
+    expect(armed.adoptedUsd).toBe(0);
+    expect(armed.adoptedRows).toBe(0);
   });
 
   it('an EMPTY book is $0 at risk with zero rows — not a null or a synthetic bucket', () => {
-    expect(foldOpenPremiumAtRisk([])).toEqual({ usd: 0, rows: 0, unpricedRows: 0 });
+    expect(foldOpenPremiumAtRisk([]))
+      .toEqual({ usd: 0, rows: 0, unpricedRows: 0, adoptedUsd: 0, adoptedRows: 0 });
   });
 });
 

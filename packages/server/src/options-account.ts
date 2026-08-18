@@ -54,6 +54,9 @@ import {
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
 import { appendEngineBasisRestatement } from './engine-basis-restatement-log.js';
+// TRA-3829 — the adoption AUTHORISATION predicate. `option-exec-flag.ts` imports
+// nothing from this module, so this direction is acyclic.
+import { engineMayActOnAdoptedRow, isEngineActionOnAdoptedRowsArmed } from './option-exec-flag.js';
 import {
   type MarketableOpenMtmConfig,
   DEFAULT_MARKETABLE_OPEN_MTM_CONFIG,
@@ -646,8 +649,21 @@ function applyImportedRiskThresholds(
   opt: OptionPosition,
   rvRiskParams: RvRiskParams,
   autoManage: boolean,
+  /**
+   * TRA-3829 — the engine is not authorised to act on this adopted row (see
+   * {@link engineMayActOnAdoptedRow}). A THIRD, independent reason to install
+   * the sentinel schedule.
+   *
+   * Passed separately rather than `&&`-ed into `autoManage` by the caller, and
+   * that distinction is the whole of this parameter's reason for existing: the
+   * composed form makes an unauthorised row report `auto_manage_off`, which
+   * asserts a user turned a setting off. Nobody did. It also swallowed
+   * `sub_floor_premium` on cheap contracts. A guard that falsifies the label
+   * explaining it is the TRA-2820 shape — a zero stop nobody can attribute.
+   */
+  unauthorized = false,
 ): void {
-  if (!autoManage || opt.premiumPaid < RV_MIN_MARK_FLOOR) {
+  if (unauthorized || !autoManage || opt.premiumPaid < RV_MIN_MARK_FLOOR) {
     opt.tp1Premium = Number.POSITIVE_INFINITY;
     opt.tp1Hit = false;
     opt.stopLossPremium = 0;
@@ -656,7 +672,21 @@ function applyImportedRiskThresholds(
     // TRA-2820 — stamp WHY, so a zero stop is never a silent zero. `0` and
     // "deliberately unmanaged" are the same bytes in the payload; only this
     // field separates them, and `/api/health/options-live` counts it.
-    opt.riskUnmanagedReason = !autoManage ? 'auto_manage_off' : 'sub_floor_premium';
+    //
+    // TRA-3829 — precedence is deliberate and the new reason is placed LAST:
+    // `auto_manage_off` (a user's decision) and `sub_floor_premium` (an
+    // arithmetic fact about this contract) are both true regardless of the
+    // authorisation guard and are strictly more specific, so they keep the
+    // label they have always had. `adopted_not_authorized` is stamped ONLY on
+    // the population that previously carried NO reason at all — an above-floor
+    // adoption on a book with auto-manage on, which is exactly the row that
+    // used to get an armed stop and be exited. Nothing is relabelled; a case is
+    // added.
+    opt.riskUnmanagedReason = !autoManage
+      ? 'auto_manage_off'
+      : opt.premiumPaid < RV_MIN_MARK_FLOOR
+        ? 'sub_floor_premium'
+        : 'adopted_not_authorized';
     return;
   }
   opt.stopLossPremium = rvStopLossPremium(opt.premiumPaid, rvRiskParams);
@@ -908,6 +938,17 @@ export interface LiveStopActionabilityContext {
   brokerMirroring: boolean;
   /** TRA-361 — `PaperOptionsAccount.autoManageImportedTradierOptions`, resolved. */
   autoManageImportedTradierOptions: boolean;
+  /**
+   * TRA-3829 — `PaperOptionsAccount.actOnAdoptedBrokerRows`, resolved.
+   *
+   * REQUIRED, not optional-defaulting-to-true. An optional field here would
+   * make every existing caller silently claim the engine is armed to act on
+   * adopted rows, which is the opposite of the shipped default and would make
+   * this summary — the thing `/api/health/options-live` publishes — assert
+   * `actionable` on exactly the rows the engine now refuses. The compiler
+   * naming every call site is the point.
+   */
+  actOnAdoptedBrokerRows: boolean;
   /** TRA-483 — the resolved knob, NOT the `options-account.ts` field default. */
   holdLiveOptionsOvernightForPdt: boolean;
   /** TRA-1136 — the resolved knob. */
@@ -930,6 +971,18 @@ export type LiveStopInertReason =
   | 'imported_auto_manage_off'
   /** TRA-361 (`:4727`) — imported row, no broker mirror to route the exit through. */
   | 'imported_no_broker_mirror'
+  /**
+   * TRA-3829 — an ADOPTED row the engine cannot prove it opened, on a
+   * deployment that is not explicitly armed to act on adopted inventory.
+   *
+   * ⚠️ Read this one differently from its neighbours. Every other reason here
+   * is a SUPPRESSION — a stop we intend to fire, held back by a breaker, a
+   * hold or a missing mirror — and a rising count is something to chase. This
+   * one is a REFUSAL, and a rising count means the guard is doing its job on
+   * an account whose owner is trading by hand. It is the healthy state, not a
+   * backlog, and it has no release horizon because there is nothing pending.
+   */
+  | 'adopted_not_authorized'
   /** TRA-450 (`:5016`) — the close-reject circuit breaker has withdrawn staging. */
   | 'close_reject_breaker'
   /** TRA-2984 (`:5025`) — the expiry breaker has withdrawn staging. */
@@ -1081,6 +1134,12 @@ export function summarizeLiveStopActionability(
       reason = 'imported_auto_manage_off';
     } else if (opt.importedFromTradier === true && !ctx.brokerMirroring) {
       reason = 'imported_no_broker_mirror';
+    } else if (!engineMayActOnAdoptedRow(opt, ctx.actOnAdoptedBrokerRows)) {
+      // TRA-3829 — same predicate, same position in the walk as the `continue`
+      // in `checkExits`. Not a re-implementation: both call the one exported
+      // function, so this summary cannot drift from the gate it is claiming to
+      // predict (the failure mode TRA-3822's docblock calls out).
+      reason = 'adopted_not_authorized';
     } else if (opt.pendingExit) {
       // NOT inert — TRA-354 holds the row because an exit is already in flight.
       inFlight += 1;
@@ -1597,6 +1656,13 @@ interface OptionsAccountConfig {
    */
   autoManageImportedTradierOptions?: boolean;
   /**
+   * TRA-3829 — override the adopted-row action arm for this account. Absent ⇔
+   * read {@link ENGINE_ACT_ON_ADOPTED_FLAG} from the process env, which is off
+   * by default. Exists so tests and the AC4 positive control can drive BOTH
+   * directions without mutating `process.env` under a running engine.
+   */
+  actOnAdoptedBrokerRows?: boolean;
+  /**
    * TRA-374 — demo-only slippage haircut applied to per-share premium at
    * BOTH open and close paths so the demo book doesn't systematically over-
    * state P&L vs. live (where Tradier pays the real spread). Entry bumps
@@ -1681,6 +1747,36 @@ export interface OpenPremiumAtRisk {
    * exists to make visible.
    */
   unpricedRows: number;
+  /**
+   * TRA-3829 (AC5) — the ADOPTED subset of `usd`: premium sitting in rows the
+   * engine adopted from the broker and cannot prove it opened.
+   *
+   * ── Why this had to be published rather than just subtracted ─────────────
+   * `usd` is the number the live order site enforces the aggregate cap against
+   * (`signal-engine.ts` `fitsLiveOptionTestAggregateCap`) and the number
+   * `/api/health/options-live` publishes as `openPremiumAtRiskUsd`. Before this
+   * field, a hand-placed position and an engine-placed position of the same
+   * size were the SAME BYTES in both, so:
+   *   • the owner buying $691.00 of their own options consumed $691.00 of the
+   *     ENGINE's entry budget, and the engine then refused its own authorised
+   *     entries with `over_aggregate_cap` — blaming a cap that was never
+   *     breached by anything the engine did; and
+   *   • any ceiling read off that figure (TRA-3827's `<=$100` attended-canary
+   *     bound) counted the owner's discretionary money as canary spend.
+   * Both are the same defect — RECONCILED read as AUTHORIZED — and neither is
+   * fixable downstream, because by the time the number arrives the two kinds
+   * have already been added together.
+   *
+   * ⚠️ SUBTRACT, do not filter, when you need the engine's own figure:
+   * `usd - adoptedUsd`. Publishing both keeps the total honest as a statement
+   * about the ACCOUNT (which is what a risk reader wants) while making the
+   * engine-attributable figure derivable (which is what a cap wants). A fold
+   * that simply dropped adopted rows would understate real exposure on a live
+   * account, which is the failure in the other direction.
+   */
+  adoptedUsd: number;
+  /** TRA-3829 (AC5) — the ADOPTED subset of `rows`. Same discipline as {@link adoptedUsd}. */
+  adoptedRows: number;
 }
 
 /**
@@ -1701,10 +1797,19 @@ export interface OpenPremiumAtRisk {
  */
 export function foldOpenPremiumAtRisk(
   positions: readonly OptionPosition[],
+  /**
+   * TRA-3829 — the deployment's adopted-row action arm, for the `adoptedUsd` /
+   * `adoptedRows` split only. Defaults to the process env flag (off), so the
+   * split is populated correctly for every existing caller without touching
+   * `usd` / `rows` / `unpricedRows`, whose values are unchanged by this ticket.
+   */
+  armed: boolean = isEngineActionOnAdoptedRowsArmed(),
 ): OpenPremiumAtRisk {
   let usd = 0;
   let rows = 0;
   let unpricedRows = 0;
+  let adoptedUsd = 0;
+  let adoptedRows = 0;
   for (const p of positions) {
     const remaining = p.contractsRemaining ?? p.contracts;
     if (
@@ -1714,10 +1819,27 @@ export function foldOpenPremiumAtRisk(
       unpricedRows += 1;
       continue;
     }
-    usd += p.premiumPaid * remaining * 100;
+    const rowUsd = p.premiumPaid * remaining * 100;
+    usd += rowUsd;
     rows += 1;
+    // TRA-3829 (AC5) — attribute the row. `engineMayActOnAdoptedRow` is reused
+    // rather than testing `importedFromTradier` directly so that "the engine
+    // may act on it" and "it counts as the engine's exposure" are one question
+    // with one answer. In particular a TRA-2820 re-adopted ENGINE row is ours
+    // by both readings, and a sandbox import is ours by both readings — a hand
+    // -rolled `importedFromTradier` test here would have split them.
+    if (!engineMayActOnAdoptedRow(p, armed)) {
+      adoptedUsd += rowUsd;
+      adoptedRows += 1;
+    }
   }
-  return { usd: Math.round(usd * 100) / 100, rows, unpricedRows };
+  return {
+    usd: Math.round(usd * 100) / 100,
+    rows,
+    unpricedRows,
+    adoptedUsd: Math.round(adoptedUsd * 100) / 100,
+    adoptedRows,
+  };
 }
 
 export class PaperOptionsAccount {
@@ -1867,6 +1989,18 @@ export class PaperOptionsAccount {
    * {@link checkExits} (per-tick gate).
    */
   private autoManageImportedTradierOptions: boolean;
+  /**
+   * TRA-3829 — is this deployment EXPLICITLY armed to act on adopted broker
+   * inventory? Resolved once at construction from
+   * {@link ENGINE_ACT_ON_ADOPTED_FLAG}; default `false`.
+   *
+   * Read at construction rather than per-tick on purpose. A safety posture that
+   * can change under a running book means the row that was adopted unmanaged and
+   * the row that is now being exited were governed by two different answers, and
+   * nothing in the book would record which. Flipping it is a deploy, which is
+   * the same ceremony every other real-money arm on this box already requires.
+   */
+  private actOnAdoptedBrokerRows: boolean;
   /**
    * TRA-367 — per-date sum of realtime-attributed P&L for Tradier-imported
    * closes (from {@link recordImportedFill} and {@link finalizePendingExit}
@@ -2110,6 +2244,11 @@ export class PaperOptionsAccount {
     }
     this.tradierEnv = config.tradierEnv ?? null;
     this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions ?? true;
+    // TRA-3829 — `?? isEngineActionOnAdoptedRowsArmed()`, not `?? true`. The
+    // config override exists for tests and for the positive control; the SHIPPED
+    // default comes from an env flag that is off unless someone sets it.
+    this.actOnAdoptedBrokerRows =
+      config.actOnAdoptedBrokerRows ?? isEngineActionOnAdoptedRowsArmed();
     // TRA-374 — start at 0/0 by default so the cost model is opt-in until
     // the user (or QA) deliberately flips it on via AccountSettings.
     this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, 0);
@@ -2661,6 +2800,12 @@ export class PaperOptionsAccount {
     if (config.autoManageImportedTradierOptions !== undefined) {
       this.autoManageImportedTradierOptions = config.autoManageImportedTradierOptions;
     }
+    // TRA-3829 — `reset` wipes `openOptions`, so there is no re-application pass
+    // to do here (unlike `updateConfig`); the field just has to follow the
+    // config so a reset book does not silently revert to the env default.
+    if (config.actOnAdoptedBrokerRows !== undefined) {
+      this.actOnAdoptedBrokerRows = config.actOnAdoptedBrokerRows;
+    }
     if (config.demoSlippagePct !== undefined) {
       this.demoSlippagePct = normalizeNonNegative(config.demoSlippagePct, this.demoSlippagePct);
     }
@@ -2709,6 +2854,25 @@ export class PaperOptionsAccount {
     if (config.optionsDailyTradesLimit !== undefined) this.optionsDailyTradesLimit = config.optionsDailyTradesLimit;
     if (config.otmRiskParams !== undefined) this.otmRiskParams = config.otmRiskParams;
     if (config.rvRiskParams !== undefined) this.rvRiskParams = config.rvRiskParams;
+    // TRA-3829 — take the arm BEFORE the auto-manage block below, because that
+    // block re-applies schedules and must see the new value. Changing it also
+    // re-applies on its own, so that turning the guard ON disarms the stops the
+    // engine had already written onto foreign rows rather than leaving them
+    // armed until the next reconcile sweep happens to touch them.
+    if (config.actOnAdoptedBrokerRows !== undefined
+        && config.actOnAdoptedBrokerRows !== this.actOnAdoptedBrokerRows) {
+      this.actOnAdoptedBrokerRows = config.actOnAdoptedBrokerRows;
+      for (const opt of this.openOptions.values()) {
+        if (!opt.importedFromTradier) continue;
+        if (opt.engineOriginSleeve) continue;
+        applyImportedRiskThresholds(
+          opt,
+          this.rvRiskParams,
+          this.autoManageImportedTradierOptions,
+          !engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows),
+        );
+      }
+    }
     if (config.autoManageImportedTradierOptions !== undefined) {
       const next = config.autoManageImportedTradierOptions;
       const prev = this.autoManageImportedTradierOptions;
@@ -2730,7 +2894,18 @@ export class PaperOptionsAccount {
             applyEngineOriginRiskThresholds(opt, opt.engineOriginSleeve, this.otmRiskParams, this.rvRiskParams);
             continue;
           }
-          applyImportedRiskThresholds(opt, this.rvRiskParams, next);
+          // TRA-3829 — the Settings toggle must not re-arm a stop on inventory
+          // the engine is not authorised to act on. Without this `&&`, flipping
+          // "auto-manage imported positions" back ON in the UI writes a live RV
+          // stop onto every foreign row, and the `checkExits` guard is then the
+          // only thing standing between it and a `sell_to_close`. Same composed
+          // predicate as `installReconcileRiskThresholds`, for the same reason.
+          applyImportedRiskThresholds(
+            opt,
+            this.rvRiskParams,
+            next,
+            !engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows),
+          );
         }
       }
     }
@@ -2965,6 +3140,10 @@ export class PaperOptionsAccount {
   openPremiumAtRiskForMode(mode: AccountMode): OpenPremiumAtRisk {
     return foldOpenPremiumAtRisk(
       Array.from(this.openOptions.values()).filter((p) => (p.mode ?? 'demo') === mode),
+      // TRA-3829 — this account's resolved arm, not the raw env read, so a book
+      // constructed with an explicit `actOnAdoptedBrokerRows` override reports
+      // the split the SAME way its own exit path decides.
+      this.actOnAdoptedBrokerRows,
     );
   }
 
@@ -5034,6 +5213,19 @@ export class PaperOptionsAccount {
         // phantom realized P&L on a position still open at Tradier, so we skip.
         if (!this.autoManageImportedTradierOptions) continue;
         if (!waitAndHold) continue;
+        // TRA-3829 — and the one that actually matters on a hand-traded
+        // production account: the engine does not exit a position it cannot
+        // prove it opened. Placed AFTER the two TRA-361 gates so the loop-order
+        // walk in `summarizeLiveStopActionability` stays byte-faithful to this
+        // sequence — the health route names the FIRST gate that refuses, and it
+        // is only honest if the order matches.
+        //
+        // This is the last line between a hand-placed real-money option and a
+        // `sell_to_close` nobody ordered. Everything upstream (the sentinel
+        // schedule at `installReconcileRiskThresholds`) is defence in depth; a
+        // row that arrived on an older build, or was rebound rather than minted,
+        // can still be carrying an armed stop when it reaches here.
+        if (!engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows)) continue;
       }
       // TRA-354 — a Tradier sell_to_close is already in flight; don't
       // re-fire the same exit or mutate the paper book until the engine's
@@ -7038,6 +7230,23 @@ export class PaperOptionsAccount {
    */
   private installReconcileRiskThresholds(opt: OptionPosition, mode: AccountMode): void {
     const verdict = this.liveOpenProvenanceFor(opt, mode);
+    // TRA-3829 — stamp the AUTHORISATION half of the adoption before anything
+    // else reads it. The verdict is already computed here; the only thing that
+    // was missing was that nobody ever wrote it down, so by the time `checkExits`
+    // ran, the one fact that separates "the engine lost track of its own order"
+    // from "a human bought this on their phone" had been thrown away.
+    //
+    // `null` (the demo book, or a row with no OCC) maps to `unresolved` rather
+    // than to a fourth state: the honest reading of "not asked" is "we do not
+    // know", and `engineMayActOnAdoptedRow` treats not-knowing as not-acting.
+    // The sandbox exemption lives in that helper, keyed on `tradierEnv`, so it
+    // cannot be reached by mislabelling the verdict here.
+    opt.adoptionAuthority =
+      verdict?.kind === 'engine'
+        ? 'engine_origin'
+        : verdict?.kind === 'foreign'
+          ? 'foreign'
+          : 'unresolved';
     if (verdict?.kind === 'engine') {
       applyEngineOriginRiskThresholds(opt, verdict.sleeve, this.otmRiskParams, this.rvRiskParams);
       accountLog.info('reconcile adopted an ENGINE-OPENED live option as an import', {
@@ -7050,7 +7259,21 @@ export class PaperOptionsAccount {
       });
       return;
     }
-    applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions);
+    // TRA-3829 — an unauthorised adoption gets the SENTINEL schedule, not the
+    // RV one. Composed with `&&` rather than replacing the TRA-361 flag: both
+    // have to allow it, and either one refusing is enough. The row is still
+    // adopted, still reconciled and still visible — only the arming of a stop
+    // that the engine would then fire is withheld.
+    //
+    // Installing the sentinel here is belt-and-braces with the `checkExits`
+    // gate, and deliberately so: an armed `stopLossPremium` on a foreign row is
+    // itself a hazard even when the exit path refuses it, because it is what
+    // `summarizeLiveStopActionability` counts as `breached` and what a reader
+    // of `/api/state` sees as a stop the engine is minding. Two mechanisms, one
+    // decision — and the decision is read from ONE predicate so they cannot
+    // drift apart.
+    const mayAct = engineMayActOnAdoptedRow(opt, this.actOnAdoptedBrokerRows);
+    applyImportedRiskThresholds(opt, this.rvRiskParams, this.autoManageImportedTradierOptions, !mayAct);
     // TRA-3553 — the oracle could not answer, so we do NOT know that this row
     // is foreign. Overwrite whichever confident reason the import path just
     // stamped: `sub_floor_premium` and `auto_manage_off` both assert we know
@@ -7058,6 +7281,13 @@ export class PaperOptionsAccount {
     // read as working-as-intended for a session. The SCHEDULE is unchanged —
     // the sentinel is the safe state and guessing a stop on a contract of
     // unknown origin would be worse — but the LABEL now says "unknown".
+    // TRA-3829 — this still wins over `adopted_not_authorized`, and must. A sick
+    // oracle WANTS AN OPERATOR; an unauthorised adoption is working as intended
+    // and wants nobody. Masking the admission behind the healthy-state label is
+    // precisely how TRA-2820's 8 unstopped live contracts read as
+    // working-as-intended for a session — so the more alarming label wins, and
+    // the guard's own effect on such a row is visible in
+    // `summarizeLiveStopActionability` regardless of what this field says.
     if (verdict?.kind === 'unresolved') {
       opt.riskUnmanagedReason = 'provenance_unresolved';
     }
@@ -7357,6 +7587,11 @@ export class PaperOptionsAccount {
     return summarizeLiveStopActionability(this.openOptions.values(), {
       brokerMirroring: opts.brokerMirroring,
       autoManageImportedTradierOptions: this.autoManageImportedTradierOptions,
+      // TRA-3829 — this account's RESOLVED arm, for the same reason the docblock
+      // above gives for the other three terms: re-deriving it from the env here
+      // would ignore a per-account override and report a refusal the exit path
+      // is not making (or miss one it is).
+      actOnAdoptedBrokerRows: this.actOnAdoptedBrokerRows,
       holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
       swingHoldOptions: this.swingHoldOptions,
       now: opts.now,

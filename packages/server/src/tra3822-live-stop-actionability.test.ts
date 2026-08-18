@@ -47,6 +47,21 @@ const RELEASE_ISO = '2026-08-18T00:00:00.000Z';
 const MONEY_BOOK: LiveStopActionabilityContext = {
   brokerMirroring: true,
   autoManageImportedTradierOptions: true,
+  // TRA-3829 — `true` PINS THIS FILE TO THE PRE-TRA-3829 POSTURE, on purpose.
+  //
+  // TRA-3829 adds an `adopted_not_authorized` gate that sits AHEAD of
+  // `pdt_hold_today` in the walk, so on the shipped TRA-3829 default every
+  // assertion below would re-attribute to the new gate. That would silently
+  // rewrite TRA-3822's finding — which is a statement about what the box did on
+  // 2026-08-17, and is still `in_review` — into a statement about a build that
+  // did not exist that day.
+  //
+  // The 08-17 box behaved exactly as `armed: true` describes: it WOULD have
+  // acted on these adopted rows, and the only thing that stopped it was the PDT
+  // hold releasing at 00:00Z. So this is not a fudge to keep tests green, it is
+  // the literal 08-17 configuration. The disarmed direction is graded in
+  // `tra3829-adopted-row-authorization.test.ts`, against these same two rows.
+  actOnAdoptedBrokerRows: true,
   holdLiveOptionsOvernightForPdt: true,
   swingHoldOptions: false,
   now: MEASURED_AT,

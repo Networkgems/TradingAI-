@@ -31,6 +31,111 @@ export function isOptionExecEnabled(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 // --------------------------------------------------------------------------
+// TRA-3829 — may the engine ACT on broker inventory it did not open?
+//
+// The reconcile ADOPTS any option in the broker payload that has no local row
+// (`options-account.ts:6976`). On a hand-traded account that is not an edge
+// case: production Tradier `***0154` is the account owner's personal account
+// AND the go-live account, with 118 hand-traded closed lots since 2026-05-08.
+// On 2026-08-17 they placed six tickets in Tradier's own web UI; the engine
+// adopted them and, with the shipped defaults, would have run its exit logic
+// against them and sold them at the next open. No arm, no deploy, no code
+// change and no human decision was required for that.
+//
+// ── Why a NEW flag and not `autoManageImportedTradierOptions` ─────────────
+// That setting exists and would have prevented this, but it cannot be the
+// guard, for three reasons:
+//   1. It DEFAULTS ON, in three places, and `resolveAutoManageImportedTradier
+//      Options` reads `!== false` — so a snapshot that predates the setting
+//      auto-manages. A safety property must not depend on a field being
+//      present.
+//   2. It is a per-BOOK user preference on the Settings page. Whether the
+//      engine may liquidate a human's discretionary position is not a user
+//      preference; it is a deployment posture, which is what an env flag is.
+//   3. It is undifferentiated. Turning it off ALSO stops managing rows the
+//      ENGINE opened and then lost the local row for — which is TRA-2820, 8
+//      live contracts left with no stop for a session. The guard has to keep
+//      those managed, so it cannot key on the same bit.
+//
+// So this flag composes with, rather than replaces, TRA-361's setting: the
+// engine acts on an adopted row only when BOTH allow it, and this one is
+// keyed on PROVENANCE (`OptionPosition.adoptionAuthority`) rather than on the
+// `importedFromTradier` bookkeeping bit.
+//
+// ⚠️ DEFAULT-SAFE AND DEFAULT-OFF, deliberately: `flagOn` returns false for
+// absent, empty, misspelled and every non-truthy value, so the failure mode of
+// this flag is "the engine does not touch the human's money". The expensive
+// direction here is acting, not refusing — refusing leaves a position exactly
+// where its owner put it, whereas acting realises a loss on a trade nobody
+// assigned to the engine.
+//
+// ⚠️ This gates ACTING (exits) only. It does not stop adoption, and must not
+// be read as doing so: an adopted row is still reconciled, still visible, and
+// still costs the reader nothing to see. Whether adopted rows should leave the
+// live book altogether is the AC2 board question (option C), not this flag.
+export const ENGINE_ACT_ON_ADOPTED_FLAG = 'ENABLE_ENGINE_ACT_ON_ADOPTED_BROKER_OPTIONS';
+
+/**
+ * TRA-3829 — true iff the engine is EXPLICITLY armed to run its exit logic
+ * against option rows it adopted from the broker but cannot prove it opened.
+ *
+ * Default **false**. See {@link ENGINE_ACT_ON_ADOPTED_FLAG} for why the default
+ * direction is the non-acting one, and why this is not
+ * `autoManageImportedTradierOptions`.
+ */
+export function isEngineActionOnAdoptedRowsArmed(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return flagOn(env[ENGINE_ACT_ON_ADOPTED_FLAG]);
+}
+
+/**
+ * TRA-3829 — the single decision point: may the engine act on THIS row?
+ *
+ * Deliberately total over the input space, and deliberately written as an
+ * allow-list rather than a deny-list. A deny-list (`authority === 'foreign'`)
+ * would admit `undefined` — which is what an adopted row persisted by an older
+ * build carries — and those are exactly the rows this exists to refuse. The
+ * allow-list makes "a shape I do not recognise" refuse by construction.
+ *
+ * - Not an adopted row at all (`imported` false) ⇒ **true**. Engine-opened
+ *   positions are untouched by this ticket; the guard must never widen onto
+ *   them.
+ * - `tradierEnv === 'sandbox'` ⇒ **true**. See the partition note below.
+ * - `engine_origin` ⇒ **true**. The oracle PROVED we placed it. TRA-2820's fix
+ *   stands: a live row whose local record was lost keeps its stops.
+ * - `foreign` / `unresolved` / absent / anything else ⇒ **`armed`**, i.e. false
+ *   unless the deployment has explicitly opted in.
+ *
+ * ── Why the partition is `tradierEnv` and NOT `mode` ──────────────────────
+ * ⛔ TRA-3112 item 3: on an imported row `mode` is stamped `'live'`
+ * UNCONDITIONALLY by the sync route, so a DEMO book importing its own SANDBOX
+ * account produces rows whose `mode` says `'live'`. Keying this guard on `mode`
+ * would therefore be wrong in both directions at once — it would catch every
+ * sandbox import (regressing the TRA-323/TRA-361 path, whose whole stated use
+ * case is *"opened directly on the broker, e.g. on the broker's Sandbox web
+ * UI"*) while telling us nothing about whether real money is involved.
+ * `tradierEnv` is minted from the owning bucket and is the documented-correct
+ * partition for exactly this question.
+ *
+ * ABSENT `tradierEnv` is guarded, not exempted. The mint at
+ * `options-account.ts:7002` only stamps the field when the account carries one,
+ * so absent means "unknown env", and unknown env on real money is the case this
+ * ticket exists to refuse. Sandbox has to say so to be let through — which
+ * costs a legacy sandbox row nothing but a stop it never needed, and is the
+ * cheap direction of the two.
+ */
+export function engineMayActOnAdoptedRow(
+  row: { importedFromTradier?: boolean; adoptionAuthority?: string; tradierEnv?: string },
+  armed: boolean,
+): boolean {
+  if (row.importedFromTradier !== true) return true;
+  if (row.tradierEnv === 'sandbox') return true;
+  if (row.adoptionAuthority === 'engine_origin') return true;
+  return armed;
+}
+
+// --------------------------------------------------------------------------
 // TRA-1114 — demo-only deterministic directional call/put entry.
 //
 // Board escalation (3rd time: TRA-1021 → TRA-1113). The board keeps reporting

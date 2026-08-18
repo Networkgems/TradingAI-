@@ -64,6 +64,9 @@ function throughDisk(acct: PaperOptionsAccount): PaperOptionsAccount {
     initialEquity: 25_000,
     tradierEnv: 'production',
     resolveLiveOpenSleeve: () => null,
+    // TRA-3829 — armed, so the round-trip stays the subject. See the note on
+    // `subFloorImportAccount` below.
+    actOnAdoptedBrokerRows: true,
   });
   restored.importSnapshot(onDisk);
   return restored;
@@ -75,6 +78,14 @@ function subFloorImportAccount(): PaperOptionsAccount {
     tradierEnv: 'production',
     // Answers null ⇒ no ledger provenance ⇒ TRA-462's sub-floor sentinel path.
     resolveLiveOpenSleeve: () => null,
+    // TRA-3829 — armed, on purpose. This file grades the TP1 SENTINEL: that
+    // `+Infinity` survives a JSON round-trip as "never" rather than inverting to
+    // "always". TRA-3829's authorisation guard sits ahead of the TP1 branch, so
+    // on the shipped default the managed-row control could not stage its TP1 and
+    // every sentinel assertion would pass without the comparison ever running —
+    // a suite that is green because nothing executes. The two concerns are
+    // independent; this file keeps the one it was written for.
+    actOnAdoptedBrokerRows: true,
   });
   acct.reconcileTradierPositions([buildTslaImport()], 'live');
   return acct;
@@ -181,6 +192,10 @@ describe('TRA-2957 — the unmanaged sentinel must survive a persistence round-t
       initialEquity: 25_000,
       tradierEnv: 'production',
       resolveLiveOpenSleeve: () => null,
+      // TRA-3829 — armed at ADOPTION time, not just at restore: the schedule is
+      // written by `reconcileTradierPositions`, so an unarmed book here mints the
+      // sentinel and there is no finite TP1 left for the round-trip to preserve.
+      actOnAdoptedBrokerRows: true,
     });
     acct.reconcileTradierPositions([buildTslaImport({ premiumPaid: 0.6 })], 'live');
 

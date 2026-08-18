@@ -77,6 +77,16 @@ function accountHolding(...rows: OptionPosition[]): PaperOptionsAccount {
     // No ledger provenance — these rows reach the IMPORT schedule, which is the
     // path that produces the sentinel at all.
     resolveLiveOpenSleeve: () => null,
+    // TRA-3829 — armed, so this file keeps grading what it was written to grade.
+    // TRA-3829 adds a `continue` in `checkExits` ahead of the trail block for
+    // adopted rows the engine cannot prove it opened. On the shipped default
+    // these rows are refused outright, which would make the trail-disarm
+    // assertions below pass VACUOUSLY (the trail is never touched because the
+    // row is never reached) and the CONTROL fail. Both outcomes would destroy
+    // this file's value: it exists to prove the sentinel disarms a latched
+    // trail, and that is a statement about the trail code, not about
+    // authorisation. Arming keeps the subject reachable.
+    actOnAdoptedBrokerRows: true,
   });
   acct.importSnapshot({
     openOptions: rows,
