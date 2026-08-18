@@ -198,6 +198,7 @@ import {
   DIRECTIONAL_STRUCTURE_LABEL, // TRA-2345 — moved here from this module; see below.
 } from './option-spread-cost.js';
 import { recordLiveEnforceDecision, type LiveEnforceNominator } from './live-enforce-gate-ledger.js';
+import { resolveCanaryCeiling, gradeCanaryCeiling } from './canary-ceiling.js';
 import { recordGiveBackState, getBookSessionPeak, type BookGiveBackSnapshot } from './giveback-arm-floor-ledger.js';
 import { recordOptionsBreakerState, getOptionsBreakerRestoreState } from './options-breaker-ledger.js'; // TRA-3218
 import { recordMarkObservation } from './option-mark-sanity.js'; // TRA-2927
@@ -10113,6 +10114,45 @@ export class SignalEngine {
     // flag is off, and best-effort so it can never delay or throw into the fill path.
     void this.recordOptionLiquidityShadow(opened);
     const notionalCost = opened.premiumPaid * opened.contracts * 100;
+
+    // TRA-3836 (parent TRA-3827) — the board's ratified <=$100 attended-canary
+    // premium ceiling, enforced HERE because this is the one seam every live
+    // buy_to_open passes (RV :9931, OTM :10990, directional :12284) — the
+    // sleeve caps upstream cover the OTM sleeve only, and the BP checks below
+    // are SOLVENCY, not posture: a $691 order on a $946 book clears both,
+    // which is exactly the 2026-08-17 breach. Refuse, never clamp (TRA-3688);
+    // an unreadable ceiling or an unpriced open row refuses too (TRA-3486
+    // posture — no input yields "uncapped"). Recorded on BOTH verdicts so the
+    // census `evaluated` denominator tells "never had to bite" apart from
+    // "never wired in" (TRA-3216).
+    const canaryCeiling = resolveCanaryCeiling(process.env);
+    const canaryAtRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+    const canaryVerdict = gradeCanaryCeiling(notionalCost, canaryAtRisk, canaryCeiling);
+    recordLiveEnforceDecision(
+      'canary_ceiling',
+      opts?.sleeve ?? 'unattributed',
+      !canaryVerdict.allowed,
+      etDateString(new Date()),
+      canaryVerdict.reason,
+      Date.now(),
+      {
+        reasonCode: canaryVerdict.allowed ? undefined : canaryVerdict.reasonCode,
+        book: this.alertUsername ?? null,
+      },
+    );
+    if (!canaryVerdict.allowed) {
+      log.info('live option open REFUSED by canary ceiling (TRA-3836)', {
+        optionSymbol: opened.optionSymbol,
+        notionalCost,
+        openPremiumAtRiskUsd: canaryAtRisk.usd,
+        openRows: canaryAtRisk.rows,
+        unpricedOpenRows: canaryAtRisk.unpricedRows,
+        reasonCode: canaryVerdict.reasonCode,
+        username: this.alertUsername ?? null,
+      });
+      tradierVoid(canaryVerdict.reason!);
+      return false;
+    }
 
     // Pre-check: bail before submitting an order we know will be rejected.
     // `optionBuyingPower` is `null` for cash accounts on a raw payload — fall

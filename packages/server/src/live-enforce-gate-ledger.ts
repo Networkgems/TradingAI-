@@ -93,7 +93,8 @@ export type LiveEnforceGate =
   | 'universe'
   | 'entry_delta_ceiling'
   | 'entry_delta_ceiling_shadow'
-  | 'aggregate_cap';
+  | 'aggregate_cap'
+  | 'canary_ceiling';
 
 /** One durable ARMED-LIVE enforcement decision — a write-through of the verdict. */
 export interface LiveEnforceRecord {
@@ -467,6 +468,12 @@ const GATES: LiveEnforceGate[] = [
   // TRA-3445 — same reasoning: publish a zero row so an aggregate cap that has
   // never been reached is distinguishable from one that is not wired in.
   'aggregate_cap',
+  // TRA-3836 (parent TRA-3827) — the board's <=$100 attended-canary premium
+  // ceiling at the mirrorLiveOptionOpen seam. Listed so the deployed build
+  // prints `evaluated: 0` before the first live nominee reaches the seam —
+  // the key's PRESENCE in this census is the env-independent deployed-bytes
+  // proof the control shipped, and its ABSENCE proves it did not.
+  'canary_ceiling',
 ];
 
 /** Apply one decision to the in-memory tallies (shared by record + hydrate). */

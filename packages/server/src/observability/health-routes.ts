@@ -111,6 +111,7 @@ import { summarizeEntryGreeksGate } from '../entry-greeks-ledger.js';
 import { RV_LONG_DELTA_FLOOR } from '@trading-app/engine';
 import { summarizeCostAwareGate } from '../cost-aware-gate-ledger.js';
 import { summarizeLiveEnforceGate } from '../live-enforce-gate-ledger.js'; // TRA-2048
+import { gradeCanaryCeilingHealth } from '../canary-ceiling.js'; // TRA-3836
 import {
   summarizeEodArchiveParticipation,
   type EodParticipationSessionAnomaly,
@@ -4545,6 +4546,16 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
         aggregateCapLive, // the SAME resolved A the route publishes above
         resolveLiveOptionTestFleetRiskFraction(liveEnv),
       ),
+      // TRA-3836 (parent TRA-3827) — the board's <=$100 attended-canary
+      // ceiling, from the SAME exposure snapshot as the two graders above.
+      // ⭐ The PRESENCE of this key is the deployed-bytes proof the control
+      // shipped (assert with `hasOwnProperty`; a build without the module
+      // lacks the key entirely). Read `verdict` and the per-book SIGNED
+      // `signedResidualUsd` — negative = dollars OVER the ceiling. The floored
+      // `headroomUsd` on `aggregateExposure` rows cannot express a breach
+      // (Math.max(0, …) is why 08-17's 6.91x published as "within"); this
+      // block exists so that state has a byte that differs.
+      canaryCeiling: gradeCanaryCeilingHealth(aggregateExposureRows, liveEnv),
       // The ACTUAL arm each order site consults: raw flag AND the window. `windowOpen`
       // false ⇒ both sleeves read OFF regardless of their booleans (fail-closed).
       arm: {
