@@ -211,6 +211,10 @@ import {
 } from './conviction-dca-ledger.js';
 import { isScaleoutLadderEnabled } from './scaleout-ladder-flag.js';
 import { isDecoupledExitCadenceEnabled } from './exit-cadence-flag.js';
+// TRA-3839 - the exit-pass REACH half of `liveStopActionability`. Shared with the
+// `runOptionsExitPass` call site below so the health readout and the gate it
+// predicts are one expression, not two.
+import { optionsExitPassRuns, resolveLiveExitPassStatus } from './exit-pass-reach.js';
 import { runScaleoutLadderObservePass } from './scaleout-ladder-ledger.js';
 // TRA-1768 — READ-ONLY equity entry funnel counters. Pure side-effecting counters:
 // every call below is a no-op on the entry decision, and deleting them all must not
@@ -312,7 +316,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -1094,6 +1098,7 @@ const EXIT_MIN_GAP_MS = 8_000;
 // doTick's own inline pass (which fetches fresh quotes) remains the only exit path
 // — i.e. it fails back to TODAY's behaviour, never to a worse one.
 const EXIT_PRICE_MAX_AGE_MS = 5 * 60_000;
+
 
 // TRA-2200 — only exit-evaluation intervals at or above this land on the Render
 // tape. Set BELOW the 30s invalidation bar so an interval approaching the bar is
@@ -5548,7 +5553,10 @@ export class SignalEngine {
       this.mode === 'demo' && isMultiLegExitEnabled(this.resolveDemoFlagEnv())
         ? DEFAULT_MULTILEG_EXIT_PARAMS
         : undefined;
-    const optionsExitsActive = this.mode === 'demo' || isStockMarketOpen();
+    // TRA-3839 — the SAME expression `getLiveExitPassStatus()` publishes, via the
+    // one shared helper, so the health route's claim about whether a pass reaches
+    // these rows cannot drift from the site that decides it.
+    const optionsExitsActive = optionsExitPassRuns(this.mode);
     const optsClosed = optionsExitsActive
       ? this.optionsAccount.checkExits(
           prices,
@@ -8707,17 +8715,65 @@ export class SignalEngine {
    * duplicated as an expression rather than routed through a shared helper, so
    * that it stays byte-comparable to the call site it is claiming to predict.
    *
-   * ⚠️ This grades the ROWS, not the cadence. A book whose `doTick` is not
-   * running at all still reports `actionable` here — that is the correct
-   * division of labour (`/api/health/exit-cadence` grades the pass; TRA-3821
-   * is the ruling on why `armedEngineCount: 0` is not the same question), but
-   * do not read a zero `inert` as "exits are firing".
+   * TRA-3839 — the ROW half only. It answers "would `checkExits` act on this
+   * row **if a pass executed**", which is not the question a reader asks. Use
+   * {@link getLiveStopActionability}, which joins this to
+   * {@link getLiveExitPassStatus} and publishes `unacted`. This one stays
+   * separate and unwidened because TRA-3829 depends on its nine-reason walk and
+   * a 26-test suite pins `actionable`'s meaning.
    */
-  getLiveStopActionability(): LiveStopActionabilitySummary {
+  getLiveStopActionabilityRows(now?: number): LiveStopActionabilitySummary {
     return this.optionsAccount.liveStopActionabilitySummary({
       brokerMirroring:
         this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+      ...(now === undefined ? {} : { now }),
     });
+  }
+
+  /**
+   * TRA-3839 — does an options exit pass currently REACH this book's live rows?
+   *
+   * The walk is outermost-first, so `blockedBy` names the thing that would still
+   * be refusing if everything below it cleared — the same "first refusing gate"
+   * discipline `LiveStopInertReason` uses one level down.
+   *
+   *   1. `no_pass_observed`  — nothing has stamped since boot.
+   *   2. `pass_stalled`      — the tick loop has gone quiet (see EXIT_PASS_STALE_MS).
+   *   3. `engine_mode_demo`  — the pass runs but `checkExits` is handed `'demo'`
+   *                            and mode-skips every live row.
+   *   4. `market_closed`     — on a live book `checkExits` is not called at all
+   *                            outside RTH. The only blocker with a clock.
+   *
+   * ⚠️ `armedEngineCount` / `timerArmed` off `/api/health/exit-cadence` is NOT
+   * in this walk and must not be added to it. That route grades the DECOUPLED
+   * hoist; `doTick` calls `runOptionsExitPass` unconditionally at `:5905`, and
+   * TRA-3821 measured three live engines at `armedEngineCount: 0` next to
+   * `tickPassCount` 251/253/250. Keying this on the timer arm would report every
+   * healthy live book as unattended.
+   */
+  getLiveExitPassStatus(now: number = Date.now()): LiveExitPassStatus {
+    return resolveLiveExitPassStatus({
+      mode: this.mode,
+      exitPassCount: this.exitPassCount,
+      lastExitPassAt: this.lastExitPassAt,
+      now,
+    });
+  }
+
+  /**
+   * TRA-3839 — the JOIN, and the thing `/api/health/options-live` publishes.
+   *
+   * `actionable` on its own reads as an all-clear and is not one: it means the
+   * row would reach the hard-SL branch IF a pass executed on this book. `unacted`
+   * is the composite — breached live rows nothing will act on, whether because a
+   * `continue` refused them (`inert`) or because no pass reaches them at all.
+   */
+  getLiveStopActionability(now?: number): LiveStopActionabilityQualified {
+    const at = now ?? Date.now();
+    return qualifyLiveStopActionability(
+      this.getLiveStopActionabilityRows(at),
+      this.getLiveExitPassStatus(at),
+    );
   }
 
   /**

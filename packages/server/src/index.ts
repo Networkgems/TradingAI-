@@ -293,7 +293,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeLiveStopActionability } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability } from './options-account.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   summarizeLiveBrokerPositionDrift,
@@ -10449,13 +10449,34 @@ app.get('/api/health/options-live', async (_req, res) => {
       // canary), and overloading either would have destroyed a live signal to
       // manufacture this one. New field, new name.
       //
-      // **`inert` is the number.** It is the count of live rows through an armed
-      // stop that `checkExits` cannot act on because a `continue` fires before
-      // the SL branch. `releasesAt` answers the question the desk actually has —
-      // *"this stop cannot fire before when?"* — and it is a **UTC** day roll,
-      // not ET midnight, because that is what `toDateKey` compares.
+      // TRA-3839 — **`unacted` is the number.** `inert` was the number until
+      // 2026-08-18, and it was half of one: it counts live rows a RUNNING
+      // `checkExits` refused, and it is structurally unable to see whether a
+      // pass runs at all. At 21:03Z that day this route published
+      // `actionable: 0, inert: 0` beside `/api/health/exit-cadence`'s
+      // `books.live: armedEngineCount 0 of 3, "disarmed"` — two fields, each
+      // correct against its own spec, and "is a live row through its stop with
+      // nothing to act on it" contained by neither. A reader had to know to
+      // join two no-auth routes and which way the join ran.
       //
-      // Counts, reasons and two timestamps. No OCC symbols: no-auth route,
+      //   unacted = inert                       (a `continue` refused the row)
+      //           + noExitPass                  (no pass reaches the row at all)
+      //
+      // `exitPassBlockedBy` names the second cause, and `exitPassResumesAt` is
+      // the desk-facing horizon for the one blocker that has a clock: outside
+      // RTH a LIVE book does not call `checkExits` at all (`:5551`, TRA-726).
+      //
+      // ⚠️ The cause 2 term is deliberately NOT keyed on `armedEngineCount` /
+      // `timerArmed`. Those grade the DECOUPLED hoist, `doTick` calls the exit
+      // pass unconditionally, and TRA-3821 measured three live engines at
+      // `armedEngineCount: 0` with `tickPassCount` 251/253/250 — keying on the
+      // arm would flag the whole healthy fleet.
+      //
+      // `releasesAt` still answers the row-gate half — *"this stop cannot fire
+      // before when?"* — and it is a **UTC** day roll, not ET midnight, because
+      // that is what `toDateKey` compares.
+      //
+      // Counts, reasons and timestamps. No OCC symbols: no-auth route,
       // TRA-2163 standing.
       //
       // Wrapped because this route is the instrument every other grader reads
@@ -10466,7 +10487,7 @@ app.get('/api/health/options-live', async (_req, res) => {
       liveStopActionability: (() => {
         try {
           return {
-            ...mergeLiveStopActionability(
+            ...mergeQualifiedLiveStopActionability(
               getAllUserContexts().map(c => c.engine.getLiveStopActionability()),
             ),
             instrumentBlind: false as const,
@@ -10482,6 +10503,16 @@ app.get('/api/health/options-live', async (_req, res) => {
             releasesAt: null,
             fullyReleasesAt: null,
             indefinite: null,
+            // TRA-3839 — the join nulls with the rest of them. A blind
+            // instrument publishing `unacted: 0` would be the very reading
+            // this field exists to stop anyone making.
+            unacted: null,
+            unactedByCause: null,
+            booksGraded: null,
+            booksWithoutExitPass: null,
+            exitPassBlockedBy: null,
+            exitPassResumesAt: null,
+            exitPassIndefinite: null,
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

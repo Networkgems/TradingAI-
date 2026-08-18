@@ -1248,6 +1248,230 @@ export function mergeLiveStopActionability(
 }
 
 /**
+ * TRA-3839 — the first thing that stops an options exit pass from EVALUATING a
+ * given book's live rows, named in the order the code refuses, outermost first.
+ *
+ * Every value here sits UPSTREAM of the nine `LiveStopInertReason` gates: those
+ * are reasons a running `checkExits` declined to act on a ROW, these are reasons
+ * `checkExits` never looked at the row at all. The two axes are independent and
+ * a row can be perfectly clean on the first while nothing whatsoever is running.
+ */
+export type LiveExitPassBlocker =
+  /**
+   * No exit pass has been stamped on this engine since boot
+   * (`exitPassCount === 0`). Distinct from `pass_stalled`: we have not observed
+   * a cadence to be late against. On a freshly booted box this is the honest
+   * reading for the first tick interval, and it costs nothing because the
+   * counts it qualifies are ROW-gated — with no breached row it contributes 0.
+   */
+  | 'no_pass_observed'
+  /**
+   * `now - lastExitPassAt` exceeds the stale bound: `doTick` is not running.
+   * `stampExitPass('tick')` fires unconditionally at the end of every tick's
+   * exit bracket (`signal-engine.ts:5910`), so a stamp going quiet is the one
+   * unambiguous witness that the tick loop itself has stopped.
+   */
+  | 'pass_stalled'
+  /**
+   * The engine driving this book is in `demo` mode, so `checkExits` is handed
+   * `mode: 'demo'` and SKIPS every `mode: 'live'` row outright
+   * (`options-account.ts:5157-5163`, the TRA-231 mode filter — the same skip
+   * that populates `modeSkippedLiveOptionSymbols`). The pass runs; it just
+   * never sees these rows. No clock releases this — a human must flip the book.
+   */
+  | 'engine_mode_demo'
+  /**
+   * `optionsExitsActive` is false: on a LIVE book `checkExits` is called only
+   * while `isStockMarketOpen()` (`signal-engine.ts:5551-5563`, TRA-726's
+   * no-day-trading hold). This is the one blocker with a clock — see
+   * `resumesAt`.
+   */
+  | 'market_closed';
+
+/**
+ * TRA-3839 — whether an options exit pass currently REACHES this book's live
+ * rows, and if not, what is stopping it and when that lifts.
+ */
+export interface LiveExitPassStatus {
+  /**
+   * `true` ⇔ a pass is running AND `checkExits` is being called AND it is being
+   * handed a `mode` that admits live rows. The qualifier for every row-level
+   * verdict on the same book: `actionable` means "would reach the hard-SL
+   * branch **if a pass executed**", and this is the "if".
+   */
+  reaches: boolean;
+  /** The FIRST blocker in the walk above. `null` ⇔ `reaches`. */
+  blockedBy: LiveExitPassBlocker | null;
+  /**
+   * ISO of the instant a pass next reaches these rows. Non-null ONLY for
+   * `market_closed`, which is the only blocker with a clock; the other three
+   * need a human and publishing any timestamp for them would advertise an
+   * all-clear that nothing is scheduled to deliver.
+   *
+   * ⚠️ Computed by {@link nextStockMarketOpen}, which is defined BY
+   * `isStockMarketOpen` and therefore inherits its holiday blindness. It
+   * predicts when the CODE resumes evaluating, which is the question here.
+   */
+  resumesAt: string | null;
+  /** Age of the last stamped exit pass in ms. `null` ⇔ none stamped since boot. */
+  lastPassAgeMs: number | null;
+}
+
+/**
+ * TRA-3839 — the row grade JOINED to the cadence fact.
+ *
+ * ## Why the join is the deliverable
+ *
+ * TRA-3822 shipped `liveStopActionability`, which grades ROWS: for a breached
+ * live stop it walks the nine `checkExits` gates and names the first that
+ * refuses. It is correct and controlled in both directions, and it is
+ * STRUCTURALLY unable to see whether `checkExits` runs at all — its own
+ * docblock says so. On the live money book at 2026-08-18T21:03Z that produced:
+ *
+ *   /api/health/options-live   liveStopActionability: breached 0, actionable 0
+ *   /api/health/exit-cadence   books.live: armedEngineCount 0 of 3, "disarmed"
+ *
+ * so the next live row to open and breach with none of the nine gates set would
+ * publish `inert: 0, actionable: 1` — a clean bill of health — with no exit pass
+ * evaluating it. **That is TRA-3822's own thesis one level up: two fields, each
+ * correct against its own spec, and the composite claim contained by neither.**
+ *
+ * ## What the cadence fact is NOT
+ *
+ * It is **not** `armedEngineCount` / `timerArmed` off `/api/health/exit-cadence`,
+ * and grading those would have shipped the inverse defect. TRA-3821 measured
+ * three live engines reading `armedEngineCount: 0` next to `tickPassCount`
+ * 251/253/250: that route grades the DECOUPLED hoist
+ * (`ENABLE_DECOUPLED_EXIT_CADENCE`), while `doTick` calls `runOptionsExitPass`
+ * unconditionally at `signal-engine.ts:5905`. A detector keyed on the timer arm
+ * would flag every healthy live book on the fleet as unattended — an over-match
+ * that voids every future clean read, which is strictly worse than the
+ * blindness it replaces.
+ *
+ * The real discriminators are the three in {@link LiveExitPassBlocker}, and the
+ * decisive one is not on the exit-cadence route at all: on a live book
+ * `checkExits` is called only inside `isStockMarketOpen()`.
+ */
+export interface LiveStopActionabilityQualified extends LiveStopActionabilitySummary {
+  exitPass: LiveExitPassStatus;
+  /**
+   * **The number this ticket exists for.** Breached live rows that NOTHING will
+   * act on, covering both causes at once: `inert + unactedByCause.noExitPass`.
+   *
+   * `unacted: 0` is the only reading that means "every breached live stop has
+   * something working on it". `inert: 0` alone never meant that.
+   */
+  unacted: number;
+  /**
+   * `unacted` split by which of the two independent causes produced it.
+   *
+   * ⚠️ `inFlight` rows are deliberately EXCLUDED from both terms even when
+   * `exitPass.reaches` is false. A row carrying a `pendingExit` has a working
+   * order at the broker, and whether that order is stalling is a different
+   * measurement with its own instruments on this same route
+   * (`staleWorkingExits` / `abandonedStagedExits`). Folding them in here would
+   * double-book one incident across three counters and re-create the
+   * over-matching this detector is built to avoid.
+   */
+  unactedByCause: {
+    /** A running pass looked at the row and a `continue` refused it. `=== inert`. */
+    rowGate: number;
+    /** No pass reaches the row. `=== reaches ? 0 : actionable`. */
+    noExitPass: number;
+  };
+}
+
+/**
+ * TRA-3839 — qualify one book's row grade with that book's cadence fact.
+ *
+ * Deliberately a SEPARATE function taking the TRA-3822 summary as an input
+ * rather than an extension of {@link summarizeLiveStopActionability}: that
+ * function's nine-reason walk is depended on by TRA-3829 and pinned by a
+ * 26-test suite, and `actionable` must keep meaning exactly "would reach the
+ * hard-SL branch if a pass executed". This composes on top of that meaning
+ * instead of widening it, so the join can be graded without re-grading the
+ * thing it joins.
+ */
+export function qualifyLiveStopActionability(
+  summary: LiveStopActionabilitySummary,
+  exitPass: LiveExitPassStatus,
+): LiveStopActionabilityQualified {
+  const noExitPass = exitPass.reaches ? 0 : summary.actionable;
+  return {
+    ...summary,
+    exitPass,
+    unacted: summary.inert + noExitPass,
+    unactedByCause: { rowGate: summary.inert, noExitPass },
+  };
+}
+
+/**
+ * TRA-3839 — the fleet fold of {@link qualifyLiveStopActionability}, published
+ * on the no-auth `/api/health/options-live`.
+ *
+ * Counts sum. The book-level cadence terms count only books that actually
+ * CONTRIBUTE `noExitPass > 0`: most of the fleet is demo-mode engines holding
+ * no live rows, and counting their (perfectly expected) `engine_mode_demo`
+ * status would put a permanent ~64 next to a number whose whole job is to be 0.
+ */
+export interface FleetLiveStopActionability extends LiveStopActionabilitySummary {
+  unacted: number;
+  unactedByCause: { rowGate: number; noExitPass: number };
+  /** Books folded, contributing or not — the denominator, so a 0 is readable. */
+  booksGraded: number;
+  /** Books contributing `noExitPass > 0`. */
+  booksWithoutExitPass: number;
+  /** Those books split by their first blocker. */
+  exitPassBlockedBy: Partial<Record<LiveExitPassBlocker, number>>;
+  /**
+   * Earliest instant a pass resumes on a CONTRIBUTING book — when the pile
+   * starts moving. Earliest, so (like `releasesAt`) an indefinite sibling does
+   * not null it; `exitPassIndefinite` is what says the pile does not fully
+   * clear on a clock.
+   */
+  exitPassResumesAt: string | null;
+  /** Contributing books whose blocker has no clock and needs a human. */
+  exitPassIndefinite: number;
+}
+
+export function mergeQualifiedLiveStopActionability(
+  qualified: Iterable<LiveStopActionabilityQualified>,
+): FleetLiveStopActionability {
+  const rows = [...qualified];
+  const exitPassBlockedBy: Partial<Record<LiveExitPassBlocker, number>> = {};
+  let unacted = 0;
+  let rowGate = 0;
+  let noExitPass = 0;
+  let booksGraded = 0;
+  let booksWithoutExitPass = 0;
+  let exitPassIndefinite = 0;
+  let resumesAt: string | null = null;
+  for (const q of rows) {
+    booksGraded += 1;
+    unacted += q.unacted;
+    rowGate += q.unactedByCause.rowGate;
+    noExitPass += q.unactedByCause.noExitPass;
+    if (q.unactedByCause.noExitPass === 0) continue;
+    booksWithoutExitPass += 1;
+    if (q.exitPass.blockedBy !== null) {
+      exitPassBlockedBy[q.exitPass.blockedBy] = (exitPassBlockedBy[q.exitPass.blockedBy] ?? 0) + 1;
+    }
+    if (q.exitPass.resumesAt === null) exitPassIndefinite += 1;
+    else if (resumesAt === null || q.exitPass.resumesAt < resumesAt) resumesAt = q.exitPass.resumesAt;
+  }
+  return {
+    ...mergeLiveStopActionability(rows),
+    unacted,
+    unactedByCause: { rowGate, noExitPass },
+    booksGraded,
+    booksWithoutExitPass,
+    exitPassBlockedBy,
+    exitPassResumesAt: resumesAt,
+    exitPassIndefinite,
+  };
+}
+
+/**
  * TRA-3822 — 00:00:00.000Z of the UTC day AFTER `ts`'s UTC day. This is the
  * literal expiry of a `toDateKey(openedAt) === toDateKey(now)` latch, because
  * {@link toDateKey} is `toISOString().slice(0, 10)` — a **UTC** calendar day.

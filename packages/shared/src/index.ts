@@ -2423,6 +2423,61 @@ export function isStockMarketOpen(utcMs: number = Date.now()): boolean {
   return etMinutes >= 9 * 60 + 30 && etMinutes < 16 * 60;
 }
 
+/** How far ahead {@link nextStockMarketOpen} will look before giving up. */
+const NEXT_MARKET_OPEN_SEARCH_MS = 10 * 24 * 60 * 60 * 1000;
+
+/**
+ * TRA-3839 — the next instant at or after `utcMs` for which
+ * {@link isStockMarketOpen} is **true**. Returns `utcMs` itself when the market
+ * is already open, and `null` when no such instant is found inside ten days.
+ *
+ * ## Why this is a search and not a formula
+ *
+ * The obvious implementation computes "9:30 ET on the next weekday" from
+ * {@link getEasternUtcOffset} directly. That is a SECOND model of the session
+ * boundary sitting beside the first, and the two only have to disagree once —
+ * across a DST transition, or the day someone adds a holiday calendar to
+ * `isStockMarketOpen` and not to its horizon — for this function to publish an
+ * all-clear instant the gate it is predicting will still be refusing at. That
+ * is the exact defect class TRA-3839 exists to close, so it is not a shape to
+ * reproduce inside the remedy.
+ *
+ * Instead the horizon is DEFINED by the predicate: coarse-scan forward in
+ * 30-minute steps until `isStockMarketOpen` reads true, then walk back a minute
+ * at a time to the boundary. ~230 calls of a pure arithmetic function in the
+ * worst case (a Friday evening over a long weekend), and it cannot drift from
+ * the gate because it has no independent notion of when a session starts.
+ *
+ * ⚠️ It inherits every limitation of {@link isStockMarketOpen}, and that is the
+ * point rather than an oversight: that function does NOT know about market
+ * holidays, so this will happily name 9:30 ET on Thanksgiving. It is a
+ * prediction of **when the code resumes evaluating**, not of when the exchange
+ * opens, and those are the same question for every caller it has.
+ *
+ * Returns `null` rather than a plausible-looking guess when the scan runs out —
+ * "could not measure" must not share a reading with a measurement.
+ */
+export function nextStockMarketOpen(utcMs: number = Date.now()): number | null {
+  if (!Number.isFinite(utcMs)) return null;
+  const coarseMs = 30 * 60 * 1000;
+  const minuteMs = 60 * 1000;
+  const deadline = utcMs + NEXT_MARKET_OPEN_SEARCH_MS;
+  let probe = utcMs;
+  while (probe <= deadline) {
+    if (isStockMarketOpen(probe)) {
+      // Walk back to the first open minute. The coarse step can only have
+      // overshot by less than one step, so this is bounded by `coarseMs`.
+      let back = probe;
+      while (back - minuteMs >= utcMs && isStockMarketOpen(back - minuteMs)) {
+        back -= minuteMs;
+      }
+      return back;
+    }
+    probe += coarseMs;
+  }
+  return null;
+}
+
 /**
  * Minutes remaining until the 4:00 PM ET regular-session close. Returns 0 on
  * weekends, before 9:30 AM ET, and at/after the close. DST-aware via
