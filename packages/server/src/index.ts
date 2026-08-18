@@ -1571,7 +1571,13 @@ async function drainDenominatorFlipTapeFor(
     // TRA-3116 (2d) — `drain()` reset the ring before the write was attempted,
     // so a failed write would otherwise destroy the session even though this
     // process is still alive to try again at the next trigger.
-    if (!result.written && dump.rows.length > 0) {
+    //
+    // TRA-3844 — `skipped` is EXCLUDED, and the exclusion is the point. A
+    // non-market-date drain is refused, not failed: re-admitting its rows would
+    // hold weekend/holiday noise in the ring until the next drain, which is a
+    // real trading session, and merge it into that session's file. The writer
+    // has already named the discard in its own warn.
+    if (!result.written && !result.skipped && dump.rows.length > 0) {
       ctx.engine.readmitDenominatorFlipRows(dump.rows);
       log.warn('TRA-3116 tape write failed — rows re-admitted to the ring', {
         username: ctx.username,

@@ -31,6 +31,8 @@ import {
   type DenominatorFlipTapeFile,
 } from './denominator-flip-tape-writer.js';
 import { etWallClockToUtcMs } from './et-clock.js';
+// TRA-3844 — the writer's gate must be the READER's predicate, not a copy of it.
+import { isMarketDayIso } from './scheduler.js';
 import {
   summarizeDenominatorFlipTape,
   gradeTapeSession,
@@ -1215,5 +1217,172 @@ describe('TRA-3494 — the bar counts market DAYS on the live-money cohort', () 
     // The trap: a future writer's mode string falls out of the live cohort, every
     // day reads `vacuous`, and the header still looks orderly.
     expect(summary.unclassifiedModes).toEqual(['live-options']);
+  });
+});
+
+/**
+ * TRA-3844 — the WRITER's market-day gate.
+ *
+ * The incident: on Sunday 2026-08-16 a redeploy's shutdown drain minted 67
+ * ledger-bearing `tape/2026-08-16.json` files, one per book, `segmentCount != null`
+ * on 67 of 67 — a real segment ledger over a session that never opened. The bar was
+ * not corrupted, because the READER filters `barDays[]` through `isMarketDayIso`
+ * independently. That filter was the only thing holding the line, and nothing bound
+ * it to the writer.
+ *
+ * Read every arm as a PAIR. A gate that refuses everything is exactly as useless as
+ * no gate — it would simply stop the tape accruing and read as "no weekend files"
+ * forever — so each refusal arm has a market-day known-good beside it proving the
+ * ordinary drain still lands.
+ */
+describe('TRA-3844 — the writer refuses to mint a session file on a non-market date', () => {
+  const rowsOf = (n: number, tag: string) => {
+    const rows: DenominatorFlipCandidate[] = [];
+    for (let i = 0; i < n; i += 1) {
+      rows.push(buildDenominatorFlipCandidate({
+        symbol: `${tag}${i}`,
+        prev: { price: 1, change: 0.1, changePct: 10, lastUpdated: T_JUL28_1500ET, quoteStatus: 'ok', moveSuspect: false },
+        next: { price: 1, change: 0.2, changePct: 20 },
+        now: T_JUL28_1505ET,
+      }));
+    }
+    return rows;
+  };
+  const dumpOf = (rows: DenominatorFlipCandidate[]) => ({
+    rows, droppedCandidates: 0, saturated: false,
+    capacity: DENOM_FLIP_TAPE_CAPACITY, admitted: rows.length,
+  });
+  const flushOn = (
+    dir: string,
+    date: string,
+    rows: DenominatorFlipCandidate[],
+    opts: { trigger?: 'eod' | 'shutdown'; startedAt: string; now: number },
+  ) => flushDenominatorFlipTape({
+    targetDir: dir,
+    date,
+    dump: dumpOf(rows),
+    admissionRule: { changePctDeltaPp: DENOM_FLIP_CHANGEPCT_DELTA_PP, capacity: DENOM_FLIP_TAPE_CAPACITY },
+    trigger: opts.trigger ?? 'shutdown',
+    processStartedAt: opts.startedAt,
+    now: opts.now,
+  });
+  const tapeNames = async (dir: string) => {
+    try {
+      return (await readdir(join(dir, 'tape'))).sort();
+    } catch (err: unknown) {
+      // The bucket must not even be CREATED by a refused drain — an empty
+      // `tape/` would be indistinguishable from a drain that ran and found
+      // nothing, which is the ambiguity TRA-3116 spent a whole ticket removing.
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+      throw err;
+    }
+  };
+
+  it('ACCEPTANCE — the exact 2026-08-16 shape writes NO file and creates no bucket', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-'));
+    // The incident's own numbers: a process booted before the notional 13:30Z
+    // "open", drained at 14:44:00.769Z on a Sunday, holding 7 rows.
+    const res = await flushOn(dir, '2026-08-16', rowsOf(7, 'SUN'), {
+      trigger: 'shutdown',
+      startedAt: '2026-08-16T12:00:00.000Z',
+      now: Date.parse('2026-08-16T14:44:00.769Z'),
+    });
+    expect(res.written).toBe(false);
+    expect(res.skipped).toBe(true);
+    expect(res.skipReason).toBe('non-market-day');
+    expect(await tapeNames(dir)).toBeNull();
+  });
+
+  it('CONTROL — the SAME drain one day later, on the Monday, writes normally', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-'));
+    const res = await flushOn(dir, '2026-08-17', rowsOf(7, 'MON'), {
+      trigger: 'shutdown',
+      startedAt: '2026-08-17T12:00:00.000Z',
+      now: Date.parse('2026-08-17T14:44:00.769Z'),
+    });
+    expect(res.written).toBe(true);
+    expect(res.skipped).toBeUndefined();
+    expect(res.rows).toBe(7);
+    expect(await tapeNames(dir)).toEqual(['2026-08-17.json']);
+  });
+
+  it('a HOLIDAY is refused too — the predicate is the calendar, not day-of-week', async () => {
+    // 2026-09-07 is Labor Day: a Monday. A weekday-only gate passes it, and the
+    // reader would still drop the file — re-opening the same writer/reader split
+    // this closes, just on ten days a year instead of a hundred.
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-'));
+    const holiday = await flushOn(dir, '2026-09-07', rowsOf(2, 'LBR'), {
+      startedAt: '2026-09-07T12:00:00.000Z', now: Date.parse('2026-09-07T20:05:00.000Z'),
+    });
+    expect(holiday.written).toBe(false);
+    expect(holiday.skipReason).toBe('non-market-day');
+    // Known-good: the very next session day is an ordinary trading day.
+    const after = await flushOn(dir, '2026-09-08', rowsOf(2, 'TUE'), {
+      startedAt: '2026-09-08T12:00:00.000Z', now: Date.parse('2026-09-08T20:05:00.000Z'),
+    });
+    expect(after.written).toBe(true);
+    expect(await tapeNames(dir)).toEqual(['2026-09-08.json']);
+  });
+
+  it('the writer accepts EXACTLY the dates the reader banks — one predicate, no drift', async () => {
+    // The defect was never "the writer is wrong about Sundays". It was that the
+    // writer and the reader answered the calendar question in different modules,
+    // so the artifact and the grade could disagree and nothing would notice.
+    // This arm asserts they are the same function over a span that contains a
+    // weekend, so a future edit to either side that re-opens the gap goes red.
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-span-'));
+    const span = ['2026-08-13', '2026-08-14', '2026-08-15', '2026-08-16', '2026-08-17'];
+    const written: string[] = [];
+    for (const date of span) {
+      const res = await flushOn(dir, date, rowsOf(1, 'X'), {
+        trigger: 'eod',
+        startedAt: `${date}T12:00:00.000Z`,
+        now: Date.parse(`${date}T20:05:00.000Z`),
+      });
+      expect(res.written).toBe(isMarketDayIso(date));
+      if (res.written) written.push(`${date}.json`);
+    }
+    expect(written).toEqual(['2026-08-13.json', '2026-08-14.json', '2026-08-17.json']);
+    expect(await tapeNames(dir)).toEqual(written);
+    // And the reader, asked independently, banks exactly that set.
+    const graded = computeBarDays(
+      span.map((date): TapeSessionSummary => ({
+        username: 'admin', mode: 'live', date, generatedAt: `${date}T20:05:00.000Z`,
+        rows: 1, admitted: 1, droppedCandidates: 0, truncatedForSize: 0,
+        droppedOnMerge: 0, saturated: false, segmentCount: 1, restartBoundaries: 0,
+        coverageComplete: true, observedMs: 23_400_000, uncoveredMs: 0,
+        rowsLostToRestart: 0, eodFlushed: true, mergeDegraded: false,
+        countsTowardBar: true, disqualifiers: [],
+      })),
+      [],
+    );
+    expect(graded.map(d => d.date)).toEqual(['2026-08-13', '2026-08-14', '2026-08-17']);
+  });
+
+  it('a refused drain is NOT an error — its rows must not be re-admitted to the ring', async () => {
+    // The caller's re-admission contract (TRA-3116, 2d) keys on a FAILED write:
+    // those rows are real session rows and the ring is the only place they
+    // survive. A refused weekend drain is the opposite — re-admitting would hold
+    // Sunday noise until the next drain, which is Monday's real session, and
+    // merge it in. That upgrades disk residue into bar contamination.
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-'));
+    const res = await flushOn(dir, '2026-08-16', rowsOf(4, 'SUN'), {
+      startedAt: '2026-08-16T12:00:00.000Z', now: Date.parse('2026-08-16T14:44:00.769Z'),
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.skipped).toBe(true);
+    // No silent caps: the discard has its own name and its own count. A dropped
+    // row nothing reports is the same fail-open as `droppedCandidates: 0`.
+    expect(res.discardedRows).toBe(4);
+  });
+
+  it('a malformed date key is refused, not written under a name no reader can grade', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tra3844-'));
+    const res = await flushOn(dir, 'not-a-date', rowsOf(1, 'Z'), {
+      startedAt: '2026-08-17T12:00:00.000Z', now: Date.parse('2026-08-17T20:05:00.000Z'),
+    });
+    expect(res.written).toBe(false);
+    expect(res.skipReason).toBe('non-market-day');
+    expect(await tapeNames(dir)).toBeNull();
   });
 });

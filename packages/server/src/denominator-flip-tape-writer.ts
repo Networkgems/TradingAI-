@@ -95,11 +95,53 @@
  * A zero-row file under `coverageComplete === true` COUNTS: a proven-full-
  * coverage session with no candidates is a real observation of the quantity
  * being measured, and coverage is what makes that absence meaningful.
+ *
+ * ## TRA-3844 — the writer now owns the market-day predicate too
+ *
+ * Every window in this file was pure ET WALL-CLOCK: `RTH_OPEN_ET` /
+ * `RTH_CLOSE_ET` applied to whatever date key the caller handed down, with no
+ * calendar predicate anywhere. `isMarketDayIso` lived only in the READER
+ * (`denominator-flip-tape-summary.ts`), so the reader dropped weekend and
+ * holiday files out of `barDays[]` while the writer kept minting them.
+ *
+ * That is not a cosmetic split. On Sunday 2026-08-16 a redeploy's shutdown
+ * drain minted **67 ledger-bearing session files**, one per book, each carrying
+ * a real segment ledger over a notional Sunday RTH window — `observedMs`
+ * 4,440,769 ms (13:30:00Z to the 14:44Z drain) against an `uncoveredMs` that
+ * summed with it to exactly the 6.5 h session. The bar was not corrupted,
+ * because the reader's independent filter held; but the tape's own artifact
+ * asserted a session that never existed, and the only thing standing between
+ * that and a bar defect was a filter in a different module that nothing binds
+ * to this one. Same defect class as TRA-3267, where the two halves of a
+ * predicate disagreed about what day it was.
+ *
+ * So the gate is here, at the seam, keyed on the SAME `isMarketDayIso` the
+ * reader uses — not a second hand-rolled copy that can drift from it. The
+ * consequence is that `tape/<date>.json` existing is now itself the claim "this
+ * date was an NYSE session", which is what a reader was always entitled to
+ * assume from a file named after a trading day.
+ *
+ * ### Why a skipped drain DISCARDS its rows rather than re-admitting them
+ *
+ * The re-admission contract (2d) exists for a write that FAILED while the
+ * process is still alive to retry — the rows are real session rows and the ring
+ * is the only place they survive. A non-market date is the opposite case: the
+ * rows are weekend/holiday noise, and re-admitting them leaves them in the ring
+ * to be merged into the NEXT drain, which is a real trading session. That would
+ * take a bounded disk-residue defect and turn it into contamination of a
+ * bar-eligible file — strictly worse than what this fixes.
+ *
+ * They are therefore dropped, and dropped LOUDLY: `skipped` + `skipReason` on
+ * the result and a warn carrying the row count, because "no silent caps" binds
+ * this exit as much as the other three. A discarded row that nothing names is
+ * the same fail-open as the `droppedCandidates: 0` this module was built to
+ * kill.
  */
 
 import { writeFile, readFile, rename, mkdir, readdir, unlink } from 'fs/promises';
 import { join } from 'path';
 import { etWallClockToUtcMs } from './et-clock.js';
+import { isMarketDayIso } from './scheduler.js';
 import type { DenominatorFlipTapeDump, DenominatorFlipCandidate } from './denominator-flip-tape.js';
 
 /** Sub-directory of the report bucket the tape lives in. */
@@ -238,6 +280,19 @@ export interface FlushResult {
   prunedFiles: number;
   /** Set when the flush failed; the caller logs it and RE-ADMITS the rows. */
   error?: string;
+  /**
+   * TRA-3844 — the drain was REFUSED on a calendar predicate, not attempted and
+   * failed. Distinct from `error` because the two demand opposite caller
+   * behaviour: `error` means retry-worthy session rows are sitting in the
+   * caller's hand and must go back on the ring; `skipped` means the rows are
+   * off-session noise and must NOT, or they contaminate the next real session's
+   * merge. A caller that keys re-admission on `!written` alone gets the wrong
+   * one of those.
+   */
+  skipped?: boolean;
+  skipReason?: string;
+  /** Rows discarded by a skip. Named, never folded into another counter. */
+  discardedRows?: number;
 }
 
 /** UTF-8 byte length — the ceiling is bytes on disk, not JS string length. */
@@ -490,6 +545,25 @@ export async function flushDenominatorFlipTape(args: {
     coverageComplete: false,
     prunedFiles: 0,
   };
+
+  // TRA-3844 — the calendar predicate, ahead of every path that touches disk
+  // (including `mkdir`, so a weekend drain does not even create the bucket).
+  // Same `isMarketDayIso` the reader filters `barDays[]` with: one predicate,
+  // one calendar, no second copy to drift. A malformed date key fails this test
+  // too, which is correct — there is no session window to measure against.
+  if (!isMarketDayIso(date)) {
+    args.log?.warn(
+      'TRA-3844 denominator-flip tape drain on a NON-MARKET ET date — refusing to mint a session file; rows DISCARDED (not re-admitted: they would merge into the next real session)',
+      { date, trigger, rows: dump.rows.length, droppedCandidates: dump.droppedCandidates },
+    );
+    return {
+      ...base,
+      skipped: true,
+      skipReason: 'non-market-day',
+      discardedRows: dump.rows.length,
+    };
+  }
+
   try {
     const dir = join(targetDir, DENOM_FLIP_TAPE_DIR);
     await mkdir(dir, { recursive: true });
