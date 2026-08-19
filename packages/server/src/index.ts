@@ -26,6 +26,7 @@ import {
 } from './http-security.js';
 import { cspReportRouter, initCspReportStore } from './csp-report-collector.js';
 import { generateEodReport, wouldClobberSettledReport } from './reports/eod-report.js';
+import { decideEodReportWrite } from './reports/eod-write-gate.js';
 // TRA-2631 / TRA-3063 — read-time provenance stamp for stored top-movers rows.
 import { annotateReportProvenance } from './reports/mover-provenance.js';
 import {
@@ -1605,11 +1606,84 @@ async function drainDenominatorFlipTapeFor(
   }
 }
 
+/**
+ * TRA-3848 — why `generateAndSaveReport` reports an outcome instead of `void`.
+ *
+ * It has three ways to not write, and before this they were indistinguishable
+ * from a write at every call site: the market-day refusal below, TRA-1398's
+ * settled-report clobber guard (~line 2140), and a plain success. The route
+ * `POST /api/reports/generate` answered `{ ok: true, message: 'EOD report
+ * generated successfully' }` in all three cases, so a human pressing the button
+ * on a Saturday was told the report was generated. A manual control that
+ * silently no-ops is its own defect, and it is the one that would have kept
+ * this gate invisible.
+ *
+ * `skipReason` is a field of its own rather than an `error`, for TRA-3844's
+ * reason: a refused Saturday and a genuine failure must not read alike.
+ */
+type EodReportOutcome =
+  | { written: true; date: string }
+  | { written: false; date: string; skipReason: 'non_market_day' | 'settled_report_clobber' };
+
 async function generateAndSaveReport(
   ctx: UserContext,
   opts: { asOfDate?: string } = {},
-): Promise<void> {
+): Promise<EodReportOutcome> {
   const backfill = opts.asOfDate != null;
+
+  // ── TRA-3848 — THE MARKET-DAY GATE ──────────────────────────────────────────
+  //
+  // This function had ZERO calendar references in its body. Every market-day
+  // predicate that governs it lived in a CALLER, and of the three callers one
+  // had none: `POST /api/reports/generate` (:11744) passes no `asOfDate`, so the
+  // date fell through to today's ET date, whatever day that was. Pressing
+  // "Generate EOD report" on a Saturday minted, for a date that was never an
+  // NYSE session: the archive cell `<targetDir>/<date>.json`, an OVERWRITE of
+  // `latest.json`, and the daily equity snapshot — which is also the TRA-2817
+  // "ledger row" (`eod-ledger-gap.ts`: "`days[]` … is built FROM the persisted
+  // snapshots"; the file-write catch at :2176 books "the ledger row" when the
+  // files fail). Three distinct writes, not the four the filing counted.
+  //
+  // ── WHY THE SEAM AND NOT THE ROUTE ──────────────────────────────────────────
+  // TRA-3847 put the sibling `closes/` gate in its writer for the same reason,
+  // but here the census makes the argument concrete rather than prophylactic.
+  // The complete ledger census (below) found 83 non-session rows across 63
+  // books, and 82 of them are SUNDAYS booked FLEET-WIDE — which no per-caller
+  // manual route can produce. That is the mechanism `isMarketDay`'s own docs
+  // name: "'Monday' for Sunday evening (booking a phantom Sunday session,
+  // 2026-08-09)", i.e. TRA-3267, arriving through caller 2 while caller 2's
+  // gate was reading a host-local weekday. A gate on the route would not have
+  // refused a single one of those rows. This gate would have refused all 83.
+  //
+  // ── WHY IT IS SAFE FOR THE BACKFILL ─────────────────────────────────────────
+  // Caller 1 (`catchUpMissedEodReports`, :2643) legitimately writes a named past
+  // date. Its dates come from `missedTradingDays`, which filters `isMarketDayIso`
+  // (scheduler.ts:156) — verified, not assumed, and pinned by an arm. So this
+  // gate is a no-op on that path by construction. It is deliberately NOT
+  // `if (!backfill)`: a backfill that somehow named a non-session would be
+  // writing the same phantom cell, and there is no date for which minting one is
+  // correct.
+  //
+  // ── ONE DERIVATION OF THE DATE, NOT TWO ─────────────────────────────────────
+  // `decideEodReportWrite` RESOLVES the date and it is handed to
+  // `generateEodReport` below, which otherwise re-derives the identical
+  // `toLocaleDateString('en-CA', …)` fallback itself (eod-report.ts:1244). Two
+  // independent reads of the ET clock straddling midnight would let the gate
+  // grade Friday and the writer stamp Saturday — the TRA-2498 failure shape, at
+  // the one seam where it would defeat the gate silently. The decision lives in
+  // `reports/eod-write-gate.ts` because nothing can import this file to test it.
+  const decision = decideEodReportWrite(opts);
+  const reportDate = decision.date;
+  if (!decision.write) {
+    log.warn('TRA-3848 EOD report refused — not an NYSE session', {
+      username: ctx.username,
+      date: reportDate,
+      backfill,
+      skipReason: decision.skipReason,
+    });
+    return { written: false, date: reportDate, skipReason: decision.skipReason };
+  }
+
   // TRA-244 — write under the active stocks bucket (demo / live / sandbox)
   // so the per-account calendar shows only the rows that belong to it.
   const settings = getSettings(ctx.username);
@@ -1804,7 +1878,9 @@ async function generateAndSaveReport(
   // the same path, and the two must not be indistinguishable in the tape.
   let ledgerSource: string = 'not_attempted';
   {
-    const reportDate = opts.asOfDate ?? etDateString();
+    // TRA-3848 — uses the SINGLE `reportDate` resolved at the top of the
+    // function. This used to re-derive it, which meant the adjacency lookup and
+    // the gate could disagree about the date across an ET midnight.
     const prevSession = previousMarketDayIso(reportDate);
     if (prevSession) {
       // Preferred: the prior session's close ledger. A ledger that exists and
@@ -1915,7 +1991,13 @@ async function generateAndSaveReport(
   }
   finalSnapshot.knownSplits = knownSplits;
 
-  let finalReport = generateEodReport(finalSnapshot, opts.asOfDate);
+  // TRA-3848 — pass the ALREADY-RESOLVED `reportDate`, not `opts.asOfDate`. When
+  // `asOfDate` is absent this argument used to be `undefined` and
+  // `generateEodReport` re-read the ET clock itself, so the date the gate above
+  // graded and the date stamped into `finalReport` were two separate readings.
+  // Identical value, one derivation: the gate resolves `asOfDate` or today's ET
+  // date, and `etDateString` is byte-identical to eod-report.ts:1244's fallback.
+  let finalReport = generateEodReport(finalSnapshot, reportDate);
 
   // TRA-2314 (parent TRA-2297, split from TRA-2302) — re-source the day-only
   // realized options P&L from the DURABLE option-trade journal.
@@ -2140,7 +2222,7 @@ async function generateAndSaveReport(
         date: finalReport.date,
         datePath,
       });
-      return;
+      return { written: false, date: finalReport.date, skipReason: 'settled_report_clobber' };
     }
   }
 
@@ -2362,6 +2444,8 @@ async function generateAndSaveReport(
   if (!backfill) {
     broadcastToUser(ctx.username, JSON.stringify({ type: 'eod_report', payload: finalReport }));
   }
+
+  return { written: true, date: finalReport.date };
 }
 
 /**
@@ -2642,7 +2726,17 @@ async function catchUpMissedEodReports(): Promise<void> {
       });
       for (const date of missed) {
         try {
-          await generateAndSaveReport(ctx, { asOfDate: date });
+          // TRA-3848 — `missed` comes from `missedTradingDays`, which filters
+          // `isMarketDayIso`, so the gate inside can never fire on this path. If it
+          // ever does, the two calendars have drifted and the backfill is silently
+          // writing nothing — the one failure this path must not be quiet about.
+          const eod = await generateAndSaveReport(ctx, { asOfDate: date });
+          if (!eod.written && eod.skipReason === 'non_market_day') {
+            log.error('TRA-3848 catch-up named a non-session — calendar drift between missedTradingDays and the write gate', {
+              username: ctx.username,
+              date,
+            });
+          }
         } catch (err) {
           log.error('reports catch-up failed', {
             username: ctx.username,
@@ -4933,8 +5027,25 @@ async function runDailyCloseForAllUsers(): Promise<void> {
       // 1a. Stocks EOD — only on trading days (Mon–Fri, non-holiday).
       if (stocksMarketDay) {
         try {
-          await generateAndSaveReport(ctx);
-          outcome = 'participated';
+          // TRA-3848 — grade the OUTCOME, not the absence of a throw. `stocksMarketDay`
+          // is resolved once at the head of the pass and the gate inside re-reads the
+          // ET clock per book, so a pass that straddles ET midnight into a Saturday
+          // can enter this branch and be refused. Recording `participated` there would
+          // book a participation row for a report that was never written — precisely
+          // the never-measured-vs-clean conflation TRA-2930 exists to end.
+          const eod = await generateAndSaveReport(ctx);
+          if (eod.written) {
+            outcome = 'participated';
+          } else if (eod.skipReason === 'non_market_day') {
+            outcome = 'skipped_not_market_day';
+            outcomeReason = `gate refused ${eod.date} (pass opened on a market day)`;
+          } else {
+            // TRA-1398 declined to clobber a settled report. Not a miss — the row it
+            // protects is already on disk — so it keeps the participated label, with
+            // the reason recorded so a reader can tell the two apart.
+            outcome = 'participated';
+            outcomeReason = `TRA-1398 clobber guard held ${eod.date}`;
+          }
         } catch (err) {
           outcomeReason = err instanceof Error ? err.message : String(err);
           outcome = 'report_threw'; // TRA-2930 candidate (b)
@@ -11746,11 +11857,38 @@ app.get('/api/reports/:date', requireAuth, async (req, res) => {
   );
 });
 
+// TRA-3848 — the manual "Generate EOD report" button. It takes no date and
+// therefore always means TODAY; on a non-session `generateAndSaveReport` now
+// refuses, and this route reports the refusal rather than answering `ok: true`.
+//
+// ⛔ WHY THIS REFUSES INSTEAD OF REBUILDING THE PREVIOUS SESSION. A regenerate
+// pressed on a Saturday plausibly means "rebuild Friday's cell", and an
+// `asOfDate`-aware route would be the fix if it did. It is not: this function
+// reconstructs the report from the engine's CURRENT state (`getReportSnapshot`,
+// `state.symbols`, the live equity snapshot), so stamping it with Friday's date
+// would restate a banked session from today's numbers — the same "a ledger whose
+// dates lie" rule TRA-2688 applies to `closes/`, and squarely inside this
+// ticket's DO-NOT ("no banked day re-graded"). The legitimate need — a session
+// whose 21:00 ET tick was missed — already has an owner in
+// `catchUpMissedEodReports`, which runs on every boot and whose dates come from
+// `missedTradingDays`. So the honest answer here is 409 + the reason + a pointer,
+// not a silent no-op and not a restatement.
 app.post('/api/reports/generate', requireAuth, async (_req, res) => {
   try {
     const ctx = await userCtx(res);
-    await generateAndSaveReport(ctx);
-    res.json({ ok: true, message: 'EOD report generated successfully' });
+    const outcome = await generateAndSaveReport(ctx);
+    if (!outcome.written) {
+      res.status(409).json({
+        ok: false,
+        date: outcome.date,
+        skipReason: outcome.skipReason,
+        error: outcome.skipReason === 'non_market_day'
+          ? `${outcome.date} was not an NYSE session, so no EOD report was written. Reports exist only for sessions; a session whose 21:00 ET tick was missed is backfilled automatically on the next boot.`
+          : `A settled report already exists for ${outcome.date} and this regeneration carried no activity, so it was not overwritten (TRA-1398).`,
+      });
+      return;
+    }
+    res.json({ ok: true, date: outcome.date, message: 'EOD report generated successfully' });
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
