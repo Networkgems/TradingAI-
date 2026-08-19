@@ -22,7 +22,6 @@ import path from 'node:path';
 
 const GRADER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'tra3417-grade.mjs');
 const ET_DAY = '2026-08-13';
-const OPEN = `${ET_DAY}T13:30:00Z`;
 
 // ── payload fixtures, shaped from the REAL 2026-08-13 live reads ────────────
 const version = (startedAt) => ({

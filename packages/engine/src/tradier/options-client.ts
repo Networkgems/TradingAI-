@@ -1329,8 +1329,12 @@ export function isCapitalMovement(type: string): boolean {
     case 'check':
     case 'deposit':
     case 'withdrawal':
+      return true;
+
     // A journal moves cash between accounts under the same ownership. It is a
-    // transfer, not something the book earned.
+    // transfer, not something the book earned — same funding classification as
+    // the group above; it stands alone only so this comment can sit on the case
+    // without reading as a fallthrough (TRA-3846).
     case 'journal':
       return true;
 

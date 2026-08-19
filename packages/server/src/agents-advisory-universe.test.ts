@@ -6,7 +6,7 @@
 // PASSES a known-good, and vice versa. The auto-confirm block below is the sharp end
 // of that — a clause that refused everything would satisfy "provably does not fire on
 // llmUsed === false" while silently killing the whole demo auto-confirm rail.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   shouldAutoConfirm,
   AUTO_CONFIRM_MIN_CONVICTION,

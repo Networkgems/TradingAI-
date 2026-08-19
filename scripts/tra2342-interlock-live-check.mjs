@@ -397,7 +397,12 @@ function selfTest() {
 async function main() {
   if (argv.includes('--self-test')) selfTest();
   console.log(`[tra2342] interlock ${INTERLOCK_TICKET} / commit ${INTERLOCK_COMMIT.slice(0, 7)}`);
-  console.log(`[tra2342] host      ${BASE}\n`);
+  console.log(`[tra2342] host      ${BASE}`);
+  // TRA-3846 — say the checkout shape up front, same as tra2325 does: every
+  // ancestry answer below is graded through gradedAncestry, and on a shallow
+  // graft a negative is BLIND, not FAIL (TRA-3699/TRA-3722). A reader of a
+  // BLIND verdict should not have to re-derive why from the exit code alone.
+  console.log(`[tra2342] checkout  ${isShallowCheckout() ? 'SHALLOW — a negative ancestry answer is BLIND here (TRA-3699)' : 'complete'}\n`);
 
   // ---- read the SHA the box actually reports -------------------------------
   let live;

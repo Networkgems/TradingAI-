@@ -178,7 +178,7 @@ describe('TRA-2819 — abandoned staged exits are reaped, not left to strand', (
   });
 
   it('restores the TRA-2799 broker-flat sweep on a live row', () => {
-    const { acct, id } = strand('live');
+    const { acct } = strand('live');
     // Past both the reap gate and BROKER_MISSING_MIN_AGE_MS (5 min).
     vi.advanceTimersByTime(REAP_AGE_MS + 1_000);
 

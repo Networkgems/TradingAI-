@@ -152,11 +152,6 @@
  */
 
 import { gradedAncestry } from './lib/shallow-ancestry.mjs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const REPO = path.resolve(HERE, '..');
 
 // ── configuration ──────────────────────────────────────────────────────────
 

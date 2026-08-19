@@ -3594,7 +3594,7 @@ describe('PaperOptionsAccount.reconcileTradierPositions — stranded engine rows
   }
 
   it('closes an engine-opened live row after two consecutive sweeps miss it, at BREAK-EVEN (TRA-2801)', () => {
-    const { acct, contracts } = openStrandedLive(1.5);
+    const { acct } = openStrandedLive(1.5);
 
     // First miss only arms the counter — one blank snapshot is not proof.
     const first = acct.reconcileTradierPositions([], 'live');
@@ -3810,7 +3810,7 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
   it('anchors an imported put at the current spot and does NOT exit it', () => {
     const { acct, sym } = importPut();
     const staged = acct.checkExits(
-      new Map([['QQQ', SPOT]]), new Map([[sym, 1.45]]), 'demo', HOLD, undefined, RISK,
+      new Map([['QQQ', SPOT]]), new Map([[sym, MARK]]), 'demo', HOLD, undefined, RISK,
     );
     expect(staged).toHaveLength(0);
     const open = acct.getState().openOptions[0];
@@ -3832,7 +3832,7 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
     row.chandelierStop = 18;
 
     const staged = acct.checkExits(
-      new Map([['QQQ', SPOT]]), new Map([[sym, 1.45]]), 'demo', HOLD, undefined, RISK,
+      new Map([['QQQ', SPOT]]), new Map([[sym, MARK]]), 'demo', HOLD, undefined, RISK,
     );
     expect(staged).toHaveLength(0);
     const open = acct.getState().openOptions[0];
@@ -3845,7 +3845,7 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
   // genuine rebound through the trail still exits, and still books as a trail.
   it('still exits an imported put on a REAL trail break', () => {
     const { acct, sym } = importPut();
-    const marks = new Map([[sym, 1.45]]);
+    const marks = new Map([[sym, MARK]]);
 
     // Thesis works: spot falls 700 → 690. Trough 690 ⇒ stop 708.
     expect(acct.checkExits(new Map([['QQQ', 700]]), marks, 'demo', HOLD, undefined, RISK)).toHaveLength(0);
@@ -3864,7 +3864,7 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
     const { acct, sym } = importPut({
       optionSymbol: 'QQQ260807C00700000', optionType: 'call',
     });
-    const marks = new Map([[sym, 1.45]]);
+    const marks = new Map([[sym, MARK]]);
     expect(acct.checkExits(new Map([['QQQ', 700]]), marks, 'demo', HOLD, undefined, RISK)).toHaveLength(0);
     const open = acct.getState().openOptions[0];
     expect(open.peakUnderlying).toBe(700);
@@ -3878,7 +3878,7 @@ describe('TRA-2893 — chandelier anchor on imported positions', () => {
   // The second, lower-severity consequence of the same unseeded field: with no
   // live mark, the delta extrapolation treats the WHOLE spot as the move.
   it('refuses to fabricate a mark for an imported row with no anchor', () => {
-    const { acct, sym, row } = importPut();
+    const { acct, row } = importPut();
     expect(row.stopLossPremium).toBeGreaterThan(0.01); // auto-managed ⇒ a real SL
 
     // Pre-fix arithmetic, stated so the RED is auditable:

@@ -55,7 +55,6 @@ import {
   planEodReportOptionsSync,
   syncEodReportOptionsLegs,
   type OptionsDailyPnlDecision,
-  type PatchableEodReport,
 } from './options-daily-pnl-source.js';
 // TRA-2829 — the EOD row back-fill: planner (always), writer (flag-gated).
 import {

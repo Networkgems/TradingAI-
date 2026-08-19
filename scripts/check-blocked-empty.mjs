@@ -481,7 +481,7 @@ const MOVED_TO_BLOCKED = /moving it to\s*`?blocked`?/i;
 // The id segment is matched as "whatever is left in the path", NOT as a uuid — a
 // uuid-shaped pattern silently captured nothing on a non-uuid id and the branch
 // lost its owner name while still reading as a clean RECOVERY-BLOCKED.
-const OWNER_LINK = /Recovery owner:\s*\[([^\]]+)\]\([^)]*agents\/([^)\/\s]+)\)/;
+const OWNER_LINK = /Recovery owner:\s*\[([^\]]+)\]\([^)]*agents\/([^)/\s]+)\)/;
 
 /**
  * ⛔ The authorship gate. `authorType === 'system'` is the real signal; the
@@ -1874,6 +1874,31 @@ const CASES = [
         w.stale === false &&
         w.suppresses === true &&
         w.attemptCount === 4 &&
+        w.ageHours < 1 &&
+        /platform wake ACTIVE and ADVANCING/.test(out) &&
+        /do NOT route/.test(out)
+      );
+    },
+  },
+  {
+    // The other half of the ADVANCE gate's control, and what NOW_FRESH exists
+    // for (TRA-3846): a wake minted 21m ago at attempt 1, advance stamp = birth.
+    // The case above proves a recent RETRY suppresses on an old mint; this one
+    // proves a recent MINT suppresses on its own — without it, a regression
+    // that pages on every newborn recovery action (age < bound on BOTH stamps)
+    // has no control that goes red.
+    name: 'TRA-3451 — a wake minted 21m ago (attempt 1) is fresh and suppresses: the sweep must not page on a newborn recovery action',
+    expect: 'FINDINGS',
+    opts: { now: NOW_FRESH },
+    build: () => transportFor(fakeBoard([recoveryStrand('s1', 'TRA-8615', 'agent-cfo')])),
+    assert: (r) => {
+      const out = renderReport(r).join('\n');
+      const w = r.findings[0].platformWake;
+      return (
+        r.findings.length === 1 &&
+        w.stale === false &&
+        w.suppresses === true &&
+        w.attemptCount === 1 &&
         w.ageHours < 1 &&
         /platform wake ACTIVE and ADVANCING/.test(out) &&
         /do NOT route/.test(out)

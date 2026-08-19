@@ -559,7 +559,7 @@ describe('TRA-2956 — a working exit that cannot fill is withdrawn, not held fo
     acct.listStaleWorkingExits().find(s => s.id === id)!;
 
   it('does not let a paper row explain a detached live position', () => {
-    const { acct, paper, live } = latchMixedBook();
+    const { acct, paper } = latchMixedBook();
     vi.advanceTimersByTime(WORKING_AGE_MS + 1_000);
 
     // Guard 1 declines on the PAPER row: it has fills, cancelling would strand

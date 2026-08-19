@@ -510,9 +510,11 @@ async function selfTest() {
     return p;
   };
 
-  // walkInodes for the live stub = 10454+2229+6576+2000+1351+54+76+112 = 22852
-  const LIVE_WALK = 22852;
-  const LIVE_USED = 65536 - 42466; // 23070 → residual 218 (0.94%), inside the 5% limit
+  // For the record, the live stub's derived numbers (nothing below consumes
+  // them — sampleLine computes walkInodes from `entries` directly, and the
+  // residual check is the grader's, not the fixture's):
+  //   walkInodes = 10454+2229+6576+2000+1351+54+76+112 = 22852
+  //   inodesUsed = 65536 − 42466 = 23070 → residual 218 (0.94%), inside the 5% limit
 
   const CASES = [
     [
