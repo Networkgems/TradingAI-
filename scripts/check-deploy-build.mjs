@@ -59,6 +59,11 @@
 // costs ~70s and removes both. `--worktree` grades the tree in place for fast local
 // iteration and says so loudly; the hook never uses it.
 //
+// Isolation is only real if the RESOLUTION GRAPH stays inside the worktree: pnpm's
+// workspace links are absolute junctions back into this checkout, so they are re-rooted
+// onto the subject's own packages and then VERIFIED, with any escape reading BLIND
+// (TRA-3858 — see NODE_MODULES_DIRS below for the incident).
+//
 // EXIT CODES — four states, on purpose
 //   0  CLEAN   the subject commit builds with the deploy's own command
 //   1  BROKEN  it does not — THE INCIDENT. This is the only code that should refuse a push.
@@ -76,7 +81,7 @@
 //   node scripts/check-deploy-build.mjs --verify-hook  # is the gate actually INSTALLED?
 //   node scripts/check-deploy-build.mjs --selftest     # both-direction controls
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,7 +110,135 @@ const SEGMENT_SHAPE = /^pnpm\s+(?:-r\s+)?--filter\s+\S+/;
 // Junctioned into the throwaway worktree so the isolated build does not need an install.
 // Relative depth is preserved, so the `../../../node_modules/.pnpm/...` links pnpm writes
 // inside each package resolve back through the root junction.
+//
+// TRA-3858 — the junction alone is NOT isolation for WORKSPACE deps. pnpm writes each
+// `@trading-app/*` entry as an ABSOLUTE junction back into THIS checkout's `packages/*`,
+// so a wholesale `node_modules` junction hands the subject worktree the MAIN checkout's
+// `packages/shared/dist` (and siblings) — whatever the local tree last built, at whatever
+// rev it happens to sit. Measured grading TRA-3857: a checkout 10 commits behind
+// manufactured 10 `has no exported member` errors against a commit that builds CLEAN from
+// a fresh clone. The other direction is worse: a local dist CARRYING a symbol the subject
+// lacks would wave a deploy-killing commit through — TRA-3695 again, through the gate
+// built for TRA-3695.
+//
+// So: entries whose real path stays inside a `node_modules` (the shared store) are linked
+// as before, and entries that resolve to a WORKSPACE PACKAGE are RE-ROOTED onto the
+// worktree's own copy — which the graded chain then builds from the subject's source,
+// shared-before-server, exactly as the deploy does. And because the rewiring is itself a
+// claim, it is VERIFIED after the fact: any `@trading-app/*` whose realpath still escapes
+// the worktree is BLIND, never a grade.
 const NODE_MODULES_DIRS = ['', 'packages/agents', 'packages/backtest', 'packages/engine', 'packages/server', 'packages/shared', 'apps/desktop'];
+
+// Case-insensitive containment with a path-separator boundary (Windows paths; a sibling
+// checkout named `<root>2` must not read as inside `<root>`).
+function pathContains(parent, child) {
+  const p = parent.toLowerCase().replace(/[\\/]+$/, '');
+  const c = child.toLowerCase();
+  return c === p || c.startsWith(`${p}\\`) || c.startsWith(`${p}/`);
+}
+
+// A workspace link is an entry whose REAL path lands inside this checkout but not inside
+// any `node_modules` — i.e. pnpm's direct junction to `packages/<name>`. Store links
+// (`zod -> ../../../node_modules/.pnpm/...`) real-path INTO a node_modules and are shared.
+function workspaceRealTarget(p) {
+  let real;
+  try {
+    real = realpathSync(p);
+  } catch {
+    return null;
+  }
+  if (!pathContains(REPO_ROOT, real)) return null;
+  const rel = real.slice(REPO_ROOT.length);
+  return rel.split(/[\\/]/).includes('node_modules') ? null : real;
+}
+
+function findWorkspaceLinks(realNm) {
+  const hits = [];
+  for (const entry of readdirSync(realNm)) {
+    const p = join(realNm, entry);
+    const st = lstatSync(p);
+    if (st.isSymbolicLink()) {
+      if (workspaceRealTarget(p)) hits.push(entry);
+      continue;
+    }
+    if (entry.startsWith('@') && st.isDirectory()) {
+      for (const c of readdirSync(p)) {
+        const cp = join(p, c);
+        if (lstatSync(cp).isSymbolicLink() && workspaceRealTarget(cp)) hits.push(`${entry}/${c}`);
+      }
+    }
+  }
+  return hits;
+}
+
+// Mirror one node_modules entry into the worktree: files are copied, store dirs are
+// junctioned to their real path, and workspace packages are re-rooted onto the worktree's
+// own `packages/<name>`. A workspace package with no counterpart at the subject rev is
+// skipped — nothing AT the subject can import a package the subject does not have.
+function linkEntry(realEntryPath, linkPath, wt) {
+  const st = lstatSync(realEntryPath);
+  if (st.isFile()) {
+    copyFileSync(realEntryPath, linkPath);
+    return;
+  }
+  const wsReal = workspaceRealTarget(realEntryPath);
+  if (wsReal) {
+    const rel = wsReal.slice(REPO_ROOT.length).replace(/^[\\/]+/, '');
+    const target = join(wt, rel);
+    if (!existsSync(target)) return;
+    symlinkSync(target, linkPath, 'junction');
+    return;
+  }
+  symlinkSync(realpathSync(realEntryPath), linkPath, 'junction');
+}
+
+function populateNodeModules(realNm, wtNm, wt) {
+  mkdirSync(wtNm, { recursive: true });
+  for (const entry of readdirSync(realNm)) {
+    const realEntry = join(realNm, entry);
+    const linkPath = join(wtNm, entry);
+    const st = lstatSync(realEntry);
+    if (entry.startsWith('@') && st.isDirectory() && !st.isSymbolicLink()) {
+      mkdirSync(linkPath, { recursive: true });
+      for (const child of readdirSync(realEntry)) {
+        linkEntry(join(realEntry, child), join(linkPath, child), wt);
+      }
+      continue;
+    }
+    linkEntry(realEntry, linkPath, wt);
+  }
+}
+
+// The fail-closed arm. The rewiring above is what SHOULD make every workspace dep resolve
+// inside the worktree; this is what proves it did. If any `@trading-app/*` still real-paths
+// outside the subject, the verdict would grade the main checkout's dist and not the commit
+// — which must read BLIND, because "could not check" and "checked" never share an exit code.
+function assertWorkspaceResolutionInside(wt) {
+  const escapes = [];
+  let seen = 0;
+  for (const d of NODE_MODULES_DIRS) {
+    const scope = join(wt, d, 'node_modules', '@trading-app');
+    if (!existsSync(scope)) continue;
+    for (const c of readdirSync(scope)) {
+      seen += 1;
+      let real;
+      try {
+        real = realpathSync(join(scope, c));
+      } catch (e) {
+        escapes.push(`${d || '<root>'}/node_modules/@trading-app/${c} (unresolvable: ${e.message})`);
+        continue;
+      }
+      if (!pathContains(wt, real)) escapes.push(`${d || '<root>'}/node_modules/@trading-app/${c} -> ${real}`);
+    }
+  }
+  if (escapes.length) {
+    throw new Blind(
+      'workspace deps resolve OUTSIDE the subject worktree — the verdict would track the MAIN ' +
+        `checkout's dist, not the commit (TRA-3858):\n    ${escapes.join('\n    ')}`,
+    );
+  }
+  return seen;
+}
 
 const HOOK_REL = '.githooks/pre-push';
 const HOOKS_PATH = '.githooks';
@@ -245,29 +378,100 @@ function makeIsolatedSubject(rev) {
     const link = join(wt, d, 'node_modules');
     mkdirSync(dirname(link), { recursive: true });
     try {
-      symlinkSync(target, link, 'junction');
+      // TRA-3858: a node_modules carrying workspace links cannot be junctioned wholesale —
+      // that resolves `@trading-app/*` back into THIS checkout. Mirror it entry-by-entry,
+      // re-rooting workspace packages onto the worktree's own copies.
+      if (findWorkspaceLinks(target).length === 0) {
+        symlinkSync(target, link, 'junction');
+      } else {
+        populateNodeModules(target, link, wt);
+      }
     } catch (e) {
       cleanupIsolatedSubject({ dir, wt });
       throw new Blind(`cannot link node_modules for \`${d || '<root>'}\`: ${e.message} — run \`pnpm install\` first`);
     }
   }
+  try {
+    assertWorkspaceResolutionInside(wt);
+  } catch (e) {
+    cleanupIsolatedSubject({ dir, wt });
+    throw e;
+  }
   return { dir, wt, sha: sha.out };
+}
+
+// Unlink one materialised node_modules without EVER recursing through a junction — level
+// by level, reparse points are removed as links and real directories with `rmdirSync`
+// (rmSync refuses a directory without `recursive`, and `recursive` is exactly what must
+// never run here). EVERY step has its own catch: one stubborn entry must not strand the
+// rest, because a stranded junction is a live path into the real pnpm store.
+function removeLinkedNodeModules(nmPath) {
+  const rmEntry = (p, st) => {
+    try {
+      if (!st.isSymbolicLink() && st.isDirectory()) rmdirSync(p);
+      else rmSync(p, { recursive: false, force: true });
+    } catch {
+      /* best effort — the Node-only recursive fallback in cleanup handles leftovers */
+    }
+  };
+  let st;
+  try {
+    st = lstatSync(nmPath);
+  } catch {
+    return;
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    rmEntry(nmPath, st);
+    return;
+  }
+  let entries;
+  try {
+    entries = readdirSync(nmPath);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const p = join(nmPath, entry);
+    let es;
+    try {
+      es = lstatSync(p);
+    } catch {
+      continue;
+    }
+    if (es.isDirectory() && !es.isSymbolicLink()) {
+      let children;
+      try {
+        children = readdirSync(p);
+      } catch {
+        children = [];
+      }
+      for (const c of children) {
+        const cp = join(p, c);
+        try {
+          rmEntry(cp, lstatSync(cp));
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+    rmEntry(p, es);
+  }
+  rmEntry(nmPath, st);
 }
 
 function cleanupIsolatedSubject(sub) {
   if (!sub) return;
   // Remove the junctions before the tree, so a recursive delete can never walk INTO the
-  // real node_modules. `git worktree remove --force` does the right thing here, but the
-  // rmSync fallback below must not be given the chance to be wrong.
+  // real node_modules.
   for (const d of NODE_MODULES_DIRS) {
-    const link = join(sub.wt, d, 'node_modules');
-    try {
-      if (existsSync(link)) rmSync(link, { recursive: false, force: true });
-    } catch {
-      /* best effort */
-    }
+    removeLinkedNodeModules(join(sub.wt, d, 'node_modules'));
   }
-  git(['worktree', 'remove', '--force', sub.wt]);
+  // ⛔ `git worktree remove --force` must NEVER run here. Git for Windows treats a junction
+  // as a plain directory and RECURSES THROUGH IT — on 2026-08-19 one leftover junction let
+  // it gut the real `.pnpm` store contents for every direct dep of five packages
+  // (TRA-3858). Node's `fs.rm` unlinks reparse points instead of following them (verified
+  // empirically on this box), so the recursive delete below is safe even if a junction
+  // survived the sweep above; `git worktree prune` then drops the bookkeeping.
   try {
     rmSync(sub.dir, { recursive: true, force: true });
   } catch {
@@ -570,6 +774,49 @@ function selftest() {
 
   // -- Control 4: hook verification is load-bearing in BOTH directions.
   check('the committed hook + `prepare` wiring verify', verifyHook({ requireConfig: false }) === EXIT_CLEAN);
+
+  // -- Control 7 (TRA-3858): worktree isolation must hold for WORKSPACE deps, both ways.
+  // 7a is the fix (every `@trading-app/*` real-paths INSIDE the worktree — and the count is
+  // asserted non-zero, so an empty scope cannot pass vacuously). 7b recreates the exact
+  // pre-fix contamination — a junction from the subject back into this checkout's
+  // `packages/shared` — and asserts the verifier reads it BLIND rather than grading.
+  {
+    let sub = null;
+    try {
+      sub = makeIsolatedSubject('HEAD');
+      const escaped = [];
+      let seen = 0;
+      for (const d of NODE_MODULES_DIRS) {
+        const scope = join(sub.wt, d, 'node_modules', '@trading-app');
+        if (!existsSync(scope)) continue;
+        for (const c of readdirSync(scope)) {
+          seen += 1;
+          const real = realpathSync(join(scope, c));
+          if (!pathContains(sub.wt, real)) escaped.push(`${d}/@trading-app/${c} -> ${real}`);
+        }
+      }
+      check(
+        'workspace deps resolve INSIDE the subject worktree, not the main checkout',
+        seen > 0 && escaped.length === 0,
+        escaped.length ? escaped.join('; ') : `${seen} workspace links checked`,
+      );
+
+      const plant = join(sub.wt, 'packages/server', 'node_modules', '@trading-app', 'shared');
+      rmSync(plant, { recursive: false, force: true });
+      symlinkSync(join(REPO_ROOT, 'packages', 'shared'), plant, 'junction');
+      let blind = false;
+      try {
+        assertWorkspaceResolutionInside(sub.wt);
+      } catch (e) {
+        blind = e instanceof Blind;
+      }
+      check('a workspace dep escaping to the main checkout reads BLIND, never a grade', blind, blind ? '' : 'the contamination was allowed to grade');
+    } catch (e) {
+      check('TRA-3858 worktree-isolation controls', false, e.message);
+    } finally {
+      cleanupIsolatedSubject(sub);
+    }
+  }
 
   // -- Control 5 (NEGATIVE, on live history): the commit that actually broke the deploy
   // must read BROKEN here, with the Render log's own error.

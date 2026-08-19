@@ -93,6 +93,13 @@ directions: an unstaged fix passes a broken commit, and an unrelated dirty file 
 and a gate that is red for reasons you did not cause gets `--no-verify`'d on day one, which is the
 same end state as no gate.
 
+The junction alone is not isolation: pnpm's `@trading-app/*` workspace links are absolute
+junctions back into the main checkout, so a wholesale-junctioned `node_modules` graded the LOCAL
+tree's `packages/*/dist`, not the commit (TRA-3858 — a checkout 10 commits behind manufactured 10
+false errors against a clean commit; the reverse direction would wave a broken one through).
+Workspace deps are therefore re-rooted onto the worktree's own packages and the resolution is
+verified: any `@trading-app/*` realpath escaping the worktree reads BLIND, never a grade.
+
 `core.hooksPath` is **local** config and is not committed, so the hook file is inert until something
 arms it. That is `prepare` → `pnpm hooks:install`, run by `pnpm install`. Whether it is actually
 armed is **measured**, never assumed:
