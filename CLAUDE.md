@@ -27,11 +27,25 @@ file that plainly exported it.)
 Use instead:
 
 ```bash
-pnpm typecheck   # tsc --noEmit, honours tsconfig
-pnpm build       # tsc -b, emits to dist/
+pnpm typecheck   # builds the packages, then tsc --noEmit across the workspace
+pnpm build       # tsc -b over the five @trading-app/* packages, emits to dist/
 ```
 
 Both read `tsconfig.json` and emit to `dist/`, never into `src/`.
+
+Until TRA-3720 (2026-08-19) this block was **aspirational**: root `build` read
+`pnpm --filter desktop tauri build`, and `desktop` has no `tauri` script — `pnpm --filter <pkg> <name>`
+runs a *script* called `<name>`, while `dev`/`build` there invoke the tauri *binary*. So the prescribed
+safe command died in pnpm with `ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`, exit 1, without starting a compiler.
+It now runs `tsc -b` for real (negative control: a planted `TS2322` exits 1 and names the file). The
+tauri desktop build is not vestigial — `apps/desktop/src-tauri/` is real — and moved to
+**`pnpm desktop:build`** / **`pnpm desktop:dev`**, with the same script-vs-binary bug fixed.
+
+⚠️ **Never single-quote a `--filter` inside a `package.json` script.** pnpm runs scripts through
+`cmd.exe` on Windows, where `'` is not a quote character, so pnpm receives the quotes as part of the
+pattern, matches nothing, and **exits 0**. `web:build` carried `'./packages/**'` and therefore compiled
+**zero packages while reporting success** on every Windows checkout — the silent-green direction this
+whole file is about. Double quotes are honoured by `sh` and `cmd.exe` alike.
 
 ### The guard
 
@@ -59,7 +73,10 @@ explicitly non-blocking:
 [render-build] lint reported issues (non-blocking for deploy; fix via CI/pre-commit)
 ```
 
-…while the *blocking* one — `pnpm build`, i.e. `tsc -b --force` — ran only at deploy time. CI does
+…while the *blocking* one — the packages' own `tsc -b` / `tsc -b --force`, as invoked by the deploy's
+`render-build` — ran only at deploy time. (This sentence used to name `pnpm build` as that compile. It
+never was: root `build` was the dead tauri verb, and even now it is a *local* verb, not on any deploy
+chain. TRA-3720.) CI does
 compile the packages, but CI runs **on push to main**, which is after the commit is on the branch
 the deploy pulls from. A detector behind the branch is what we already had.
 
