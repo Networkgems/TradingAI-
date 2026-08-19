@@ -46,6 +46,10 @@ import {
 // session visible. See `eod-ledger-gap.ts` for why no presence axis before it
 // could fire on one.
 import { detectEodInteriorAbsence, summarizeEodInteriorAbsence } from './eod-ledger-gap.js';
+// TRA-3849 — the OPPOSITE direction from `eod-ledger-gap.ts`: a ledger row on a
+// date that was never a session. No axis on this endpoint graded `days[].date`
+// against the exchange calendar at all before this.
+import { summarizeNonSessionLedgerRows } from './eod-nonsession-row.js';
 // TRA-2314 — the day cell's realized options P&L is sourced HERE, in one place,
 // so the report file and the daily snapshot can never be booked differently.
 import {
@@ -6378,6 +6382,23 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
         return measured.length === 0 ? null : Math.max(...measured);
       })(),
       ...summarizeLiveEodRowPresence(engines),
+      // TRA-3849 — THE CALENDAR AXIS, and it runs the other way from all three
+      // axes above. They ask "is a session missing its row?"; this asks "is
+      // there a row on a date that was never a session?" — and nothing on this
+      // endpoint has ever asked it, so `days[]` has carried phantom date keys
+      // since 2026-05-03 with every axis reading them as ordinary rows.
+      //
+      // Folded over the WHOLE fleet, not the live cohort: the population spans
+      // live, sandbox and demo, and 63 of the 83 rows landed in a single
+      // 2026-08-09 sweep that a live-only fold would report as ~20.
+      //
+      // ⛔ RED IS THE EXPECTED STEADY STATE HERE. The 83 rows are deliberately
+      // left in place — `ENABLE_EOD_ROW_BACKFILL` is false and the
+      // TRA-2886/TRA-2888 ruling against restating banked rows stands — so this
+      // is not an outage to clear. What is actionable is the population MOVING,
+      // in EITHER direction, which is why it is published as named rows rather
+      // than a scalar. `pnpm check:nonsession-rows` does the diff.
+      ...summarizeNonSessionLedgerRows(engines),
       // TRA-3517 — THE `combinedPnl` AGREEMENT AXIS, at the head because it is
       // the reader that replaces `drift` on the live broker-shaped rows where
       // TRA-3349 suppressed it. Before this the field had NO reader on a live

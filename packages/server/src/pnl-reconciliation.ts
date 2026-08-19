@@ -10,6 +10,9 @@ import {
   PNL_EOD_INTERIOR_RETIREMENT_NOTE,
   sessionsInRange,
 } from './eod-ledger-gap.js';
+// TRA-3849 — the caveat only. The FOLD lives in that module and is called by the
+// route, not from here: this function grades one book and has no fleet to fold.
+import { NON_SESSION_LEDGER_ROW_CAVEAT } from './eod-nonsession-row.js';
 
 /**
  * TRA-3589 — the era label a row carries when it predates the
@@ -279,6 +282,7 @@ export const PNL_RECONCILIATION_CAVEATS = [
   PNL_EOD_INTERIOR_ACKNOWLEDGED_NOTE,
   PNL_COMBINED_AGREEMENT_NOTE,
   PNL_EQUITY_SOURCE_ERA_NOTE,
+  NON_SESSION_LEDGER_ROW_CAVEAT,
 ];
 
 /**
@@ -889,6 +893,32 @@ export interface PnlReconcileDay {
    */
   eodRowMissing: boolean;
   /**
+   * TRA-3849 — TRUE when this row's DATE was never an NYSE session.
+   *
+   * The opposite direction from {@link PnlReconcileDay.eodRowMissing} and from
+   * every other EOD presence axis on this endpoint, all of which grade a
+   * SESSION for a missing row. `days[]` is built from the persisted snapshots,
+   * so a phantom date key enters it unchallenged and nothing downstream has ever
+   * questioned it — including the pairing passes that walk `days[i-1]`.
+   *
+   * `null` = NOT MEASURED (no `tailCalendar` supplied), never a pass.
+   *
+   * Live on `b70404f`: 83 such rows over 918, across 63 books and 11 date keys,
+   * 82 of them Sundays. See `eod-nonsession-row.ts` for the fold, the standing
+   * board question, and why a red here is the expected steady state.
+   */
+  nonSessionRow: boolean | null;
+  /**
+   * TRA-3849 — TRUE when {@link PnlReconcileDay.nonSessionRow} is true AND the
+   * row carries a materially non-zero `eodCombined`, `stockDaily` or
+   * `optionsDaily`. `null` when the axis is not measured.
+   *
+   * Split out because the retraction question is not the same question for an
+   * inert row and for one whose figure every weekly/monthly/yearly window has
+   * already summed. See `NON_SESSION_MONEY_PREDICATE`.
+   */
+  nonSessionRowMoneyBearing: boolean | null;
+  /**
    * TRA-3517 — **the reader that replaces `drift` on a broker-shaped row.**
    *
    * `drift` grades `eodCombined == stockDaily + optionsDaily`, an ENGINE-book
@@ -1021,6 +1051,37 @@ export interface PnlReconcileResult {
    * `eodRowsPresentOk` for the verdict.
    */
   eodRowMissingDates: string[];
+  /**
+   * TRA-3849 — dates in `days[]` that the exchange calendar says were never
+   * sessions. Empty when the axis is not measured — read
+   * `nonSessionRowGradeableCount` to tell "none found" from "nothing looked at".
+   *
+   * NOT baseline-gated, unlike every other list on this result: a phantom row is
+   * a phantom row whatever the baseline says about its numbers, and 9 of the 11
+   * live date keys predate most books' baselines.
+   */
+  nonSessionRowDates: string[];
+  /**
+   * TRA-3849 — the money-bearing subset of {@link nonSessionRowDates}. See
+   * `NON_SESSION_MONEY_PREDICATE` in `eod-nonsession-row.ts`.
+   */
+  nonSessionRowMoneyBearingDates: string[];
+  /**
+   * TRA-3849 — rows this book actually graded on the calendar axis:
+   * `days.length` when a calendar was supplied, `0` when none was. THE
+   * DENOMINATOR. `nonSessionRowDates: []` with a `0` here is not a clean book,
+   * it is an unexamined one.
+   */
+  nonSessionRowGradeableCount: number;
+  /**
+   * TRA-3849 — TRI-STATE. `false` = this book holds a non-session row.
+   * `true` = rows were graded and none is. `null` = NOT MEASURED (no calendar).
+   *
+   * ⛔ A `false` here is the EXPECTED STEADY STATE on this fleet, not an outage:
+   * the 83 known rows are deliberately left in place pending a board ruling. The
+   * actionable signal is the population MOVING; see `eod-nonsession-row.ts`.
+   */
+  nonSessionRowsOk: boolean | null;
   /**
    * TRA-2637 — TRI-STATE verdict on EOD-row presence over the sessions that had
    * something to reconcile:
@@ -3080,9 +3141,36 @@ export function reconcilePnl(
         counterFrozen: null,
         drift,
         eodRowMissing: eodCombined == null,
+        // TRA-3849 — filled in by the calendar pass below. Starts NOT MEASURED
+        // rather than `false`: without a calendar there is nothing to grade
+        // against, and a `false` here would publish "this date is a session" as
+        // a positive claim the code never made.
+        nonSessionRow: null,
+        nonSessionRowMoneyBearing: null,
         belowBaseline,
       };
     });
+
+  // TRA-3849 — THE CALENDAR PASS. Grade every row's own date against the
+  // exchange calendar.
+  //
+  // Runs over `days` in full, NOT over `evaluated`. Every other verdict in this
+  // file is baseline-gated because a drift figure computed over pre-baseline
+  // data is not trustworthy; that reasoning does not transfer. A row on a date
+  // that was never a session is residue whatever the baseline says about its
+  // numbers, and 9 of the 11 live date keys are May/June — gating would drop
+  // most of the population and then report the remainder as the total.
+  if (tailCalendar) {
+    for (const d of days) {
+      const nonSession = !tailCalendar.isMarketDay(d.date);
+      d.nonSessionRow = nonSession;
+      d.nonSessionRowMoneyBearing =
+        nonSession
+        && ((d.eodCombined != null && Math.abs(d.eodCombined) > PNL_RECONCILE_TOLERANCE_USD)
+          || Math.abs(d.stockDaily) > PNL_RECONCILE_TOLERANCE_USD
+          || Math.abs(d.optionsDaily) > PNL_RECONCILE_TOLERANCE_USD);
+    }
+  }
 
   // TRA-2630 AC3 — second pass for the T+1 credit-lag tripwire, which is the one
   // property here that needs the PREVIOUS session's row. `days` is already
@@ -3261,6 +3349,16 @@ export function reconcilePnl(
       || Math.abs(d.stockDaily) > PNL_RECONCILE_TOLERANCE_USD,
   );
   const eodRowMissingDates = eodRowGradeable.filter(d => d.eodRowMissing).map(d => d.date);
+  // TRA-3849 — the calendar axis, folded per book. `nonSessionRowGradeableCount`
+  // is `days.length` under a calendar and `0` without one, which is what keeps
+  // `nonSessionRowsOk: null` distinguishable from a graded clean book.
+  const nonSessionRowGradeableCount = tailCalendar ? days.length : 0;
+  const nonSessionRowDates = days.filter(d => d.nonSessionRow === true).map(d => d.date);
+  const nonSessionRowMoneyBearingDates = days
+    .filter(d => d.nonSessionRowMoneyBearing === true)
+    .map(d => d.date);
+  const nonSessionRowsOk: boolean | null =
+    nonSessionRowGradeableCount === 0 ? null : nonSessionRowDates.length === 0;
   // TRA-2817 — THE TAIL. Anchored on the newest row in `days`, INCLUDING
   // below-baseline ones: the baseline is a data-integrity cutoff for grading
   // drift, not evidence that the writer was dead. Anchoring on `evaluated`
@@ -3697,6 +3795,10 @@ export function reconcilePnl(
     eodRowMissingDates,
     eodRowsPresentOk,
     eodRowGradeableCount: eodRowGradeable.length,
+    nonSessionRowDates,
+    nonSessionRowMoneyBearingDates,
+    nonSessionRowGradeableCount,
+    nonSessionRowsOk,
     combinedAgreementOk,
     combinedAgreementGradeableCount: combinedAgreementGraded.length,
     combinedAgreementDiscriminatingCount: combinedAgreementDiscriminatingRows.length,

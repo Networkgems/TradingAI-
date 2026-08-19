@@ -1,0 +1,523 @@
+{
+  "README": "TRA-3849 BASELINE MANIFEST — the 83 non-session rows in the durable EOD ledger series, as they stood on live b70404f at capture. THIS FILE IS NOT A TODO LIST AND NOT A DELETION PLAN. The rows are deliberately LEFT IN PLACE: ENABLE_EOD_ROW_BACKFILL is false and the TRA-2886/TRA-2888 ruling against restating banked rows stands. Whether any of them should ever be retracted is a BOARD question. What this file exists for is the DIFF. `pnpm check:nonsession-rows` grades the live series against the exchange calendar and compares the result to these names, because a bare count is not forward-safe in either direction: a GROWING population means some writer is minting phantoms again on a path nobody gated (a TRA-3267-class regression), and a SHRINKING one is NOT automatically a repair — a book leaving getAllUserContexts(), a stale holiday table re-grading a Sunday as a session, or a truncated census all push the count down with nothing retracted. Only a ruled retraction may edit this file, and the edit must cite the ruling.",
+  "issue": "TRA-3849",
+  "capturedAtIso": "2026-08-18T20:47Z",
+  "liveBuild": "b70404f3c07bbb59dc9babc5b0049324e1a1be10",
+  "denominatorRows": 918,
+  "denominatorBooks": 67,
+  "rowCount": 83,
+  "moneyBearingRowCount": 26,
+  "dateKeys": [
+    "2026-05-03",
+    "2026-05-10",
+    "2026-05-17",
+    "2026-05-24",
+    "2026-05-31",
+    "2026-06-07",
+    "2026-06-14",
+    "2026-06-21",
+    "2026-07-05",
+    "2026-07-25",
+    "2026-08-09"
+  ],
+  "rows": [
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-05-03",
+      "moneyBearing": false
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-05-03",
+      "moneyBearing": true
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-05-10",
+      "moneyBearing": true
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-05-10",
+      "moneyBearing": true
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-05-17",
+      "moneyBearing": false
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-05-17",
+      "moneyBearing": true
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-05-24",
+      "moneyBearing": false
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-05-24",
+      "moneyBearing": true
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-05-31",
+      "moneyBearing": true
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-05-31",
+      "moneyBearing": true
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-06-07",
+      "moneyBearing": false
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-06-07",
+      "moneyBearing": false
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-06-14",
+      "moneyBearing": true
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-06-14",
+      "moneyBearing": false
+    },
+    {
+      "username": "Richard",
+      "mode": "sandbox",
+      "date": "2026-06-14",
+      "moneyBearing": false
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-06-21",
+      "moneyBearing": false
+    },
+    {
+      "username": "Richard",
+      "mode": "sandbox",
+      "date": "2026-06-21",
+      "moneyBearing": false
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-07-05",
+      "moneyBearing": false
+    },
+    {
+      "username": "Richard",
+      "mode": "sandbox",
+      "date": "2026-07-05",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2284",
+      "mode": "demo",
+      "date": "2026-07-25",
+      "moneyBearing": false
+    },
+    {
+      "username": "admin",
+      "mode": "live",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ceo2251v130001",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_2218_230da93",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_2225_1784856407",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_2225b_1784856491",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_qa_tra2406b",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_qa2407v1785284396",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_qt2331b",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2211",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2227",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2284",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2329",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2331_scope_probe",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2331b",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_tra2331d",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2331",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2333",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2341",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2354",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_tra2356v",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2388",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2388s",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2388w195221",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2388w195302",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2388w",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_tra2406",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_tra2416",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "ctoverify_tra2439a",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "ctoverify_tra2449",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "enock",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_mirror_1578_38096",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_reg_0710202220",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra1475_1783821169",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2251_7b0483ee",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2282_5beed8b8",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2407_ms5ajurt",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2407_ms6342f6",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2407_ms6395jy",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2485_ex_1785284987",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2485_inv_1785284987",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2490_ex_1785285303",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2490_inv_1785285303",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2490_neg_1785285303",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2491_ex_1785285868",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2491_inv_1785285868",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2491_neg_1785285984",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2492_ctl_1785285374",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2492_del_1785285374",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2492_ex_1785285374",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2492_inv_1785285374",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa_tra2511_114524",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qa_tra2511_v2",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa2395_1785337210",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa2716t0730a",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qa3120t0806a",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qtprobe3",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qtverify_1785048357",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qtverify_1785371176",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": true
+    },
+    {
+      "username": "qtverify_1785371190",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "qtverify_tra2331_0729a",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "Richard",
+      "mode": "sandbox",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "tra2339v66f17374",
+      "mode": "demo",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    },
+    {
+      "username": "v0nni",
+      "mode": "live",
+      "date": "2026-08-09",
+      "moneyBearing": false
+    }
+  ]
+}
