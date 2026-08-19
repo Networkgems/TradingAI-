@@ -1434,6 +1434,48 @@ export interface FleetLiveStopActionability extends LiveStopActionabilitySummary
   exitPassIndefinite: number;
 }
 
+/**
+ * TRA-3839 — the BLIND reading of `liveStopActionability`, as a value whose type
+ * is derived from {@link FleetLiveStopActionability} itself.
+ *
+ * "Could not measure" and "measured zero" must not share a reading, and on a
+ * no-auth route the difference is carried entirely by whether a key is `null` or
+ * a number. The failure mode this exists to make impossible is not a wrong
+ * value, it is an ABSENT one: the route's blind branch was a hand-written object
+ * literal listing every published key, so the next field added to the success
+ * branch would have been published as a number when the instrument worked and
+ * would have been MISSING when it was blind — and a missing key deserialises as
+ * `undefined`, which every reader coerces to 0. A blind instrument would then
+ * read `unacted: 0`, which is precisely the all-clear this ticket was filed to
+ * abolish, one level up again.
+ *
+ * The mapped type is the control: adding a field to `FleetLiveStopActionability`
+ * fails `pnpm typecheck` here until the blind shape names it too (missing key →
+ * error; extra key → excess-property error). It cannot be satisfied by a value
+ * that is merely plausible.
+ */
+export type BlindLiveStopActionability = { [K in keyof FleetLiveStopActionability]: null };
+
+export function blindLiveStopActionability(): BlindLiveStopActionability {
+  return {
+    breached: null,
+    actionable: null,
+    inFlight: null,
+    inert: null,
+    byReason: null,
+    releasesAt: null,
+    fullyReleasesAt: null,
+    indefinite: null,
+    unacted: null,
+    unactedByCause: null,
+    booksGraded: null,
+    booksWithoutExitPass: null,
+    exitPassBlockedBy: null,
+    exitPassResumesAt: null,
+    exitPassIndefinite: null,
+  };
+}
+
 export function mergeQualifiedLiveStopActionability(
   qualified: Iterable<LiveStopActionabilityQualified>,
 ): FleetLiveStopActionability {

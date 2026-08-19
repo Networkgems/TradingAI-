@@ -300,7 +300,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability } from './options-account.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   summarizeLiveBrokerPositionDrift,
@@ -10640,25 +10640,15 @@ app.get('/api/health/options-live', async (_req, res) => {
             blindReason: null,
           };
         } catch (err) {
+          // TRA-3839 — the join nulls with the rest of them, and the shape is
+          // NOT hand-written here: `blindLiveStopActionability()` is typed off
+          // `FleetLiveStopActionability`, so the next field added to the
+          // success branch above cannot ship without a null twin in this one.
+          // A key that is present-and-numeric when the instrument works and
+          // ABSENT when it is blind reads as `undefined` → 0 to every consumer,
+          // which is this ticket's own defect one level up.
           return {
-            breached: null,
-            actionable: null,
-            inFlight: null,
-            inert: null,
-            byReason: null,
-            releasesAt: null,
-            fullyReleasesAt: null,
-            indefinite: null,
-            // TRA-3839 — the join nulls with the rest of them. A blind
-            // instrument publishing `unacted: 0` would be the very reading
-            // this field exists to stop anyone making.
-            unacted: null,
-            unactedByCause: null,
-            booksGraded: null,
-            booksWithoutExitPass: null,
-            exitPassBlockedBy: null,
-            exitPassResumesAt: null,
-            exitPassIndefinite: null,
+            ...blindLiveStopActionability(),
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

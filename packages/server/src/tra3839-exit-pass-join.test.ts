@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   qualifyLiveStopActionability,
   mergeQualifiedLiveStopActionability,
+  blindLiveStopActionability,
   type LiveStopActionabilitySummary,
   type LiveExitPassStatus,
   type LiveStopActionabilityQualified,
@@ -330,5 +331,58 @@ describe('TRA-3839 mergeQualifiedLiveStopActionability', () => {
       exitPassResumesAt: null,
       exitPassIndefinite: 0,
     });
+  });
+});
+
+/**
+ * TRA-3839 — the BLIND reading must publish the same KEY SET as the measured
+ * one, or "could not measure" and "measured zero" collapse into one reading on
+ * the wire.
+ *
+ * The mapped type on `BlindLiveStopActionability` already fails the typecheck if
+ * the two shapes diverge. This is the second direction: a `as any` / `as const`
+ * cast at either site satisfies the compiler and would ship a blind object
+ * missing a key, and an absent key deserialises to `undefined`, which every
+ * consumer coerces to 0. That is the all-clear this whole ticket abolishes,
+ * re-created inside the error branch that exists to prevent it.
+ */
+describe('TRA-3839 blind/measured key parity — a missing key IS a false zero', () => {
+  it('publishes exactly the measured key set, all null', () => {
+    const blind = blindLiveStopActionability();
+    expect(Object.keys(blind).sort()).toEqual(Object.keys(mergeQualifiedLiveStopActionability([])).sort());
+    expect(Object.values(blind).every(v => v === null)).toBe(true);
+  });
+
+  it('names every field the join added, not just the TRA-3822 eight', () => {
+    // Pinned by NAME so a rename cannot pass by keeping the count: the fold's
+    // own key set is the other side of the equality above, and a rename on BOTH
+    // sides would move together and say nothing.
+    expect(Object.keys(blindLiveStopActionability())).toEqual(
+      expect.arrayContaining([
+        'unacted', 'unactedByCause', 'booksGraded', 'booksWithoutExitPass',
+        'exitPassBlockedBy', 'exitPassResumesAt', 'exitPassIndefinite',
+      ]),
+    );
+  });
+
+  it('is not confusable with a measured zero: no key holds 0, {} or a count', () => {
+    const blind: Record<string, unknown> = blindLiveStopActionability();
+    const measured: Record<string, unknown> = { ...mergeQualifiedLiveStopActionability([]) };
+    // The measured EMPTY fleet is the worst-case look-alike: all zeros and empty
+    // objects, and it is a genuine measurement. Every key it reports as a value
+    // must be null here, so no counter can be read off a blind instrument.
+    //
+    // The keys measured as `null` themselves (`releasesAt`, `fullyReleasesAt`,
+    // `exitPassResumesAt` — horizons that legitimately have no value) CANNOT be
+    // told apart by their own value in either direction, which is exactly why
+    // `instrumentBlind` exists and why it is the flag readers must branch on.
+    // Asserted here so that reason is written down at the control, not inferred.
+    for (const k of Object.keys(measured)) {
+      expect(blind[k], `blind.${k} must not read like a measurement`).toBeNull();
+      if (measured[k] !== null) expect(blind[k]).not.toEqual(measured[k]);
+    }
+    expect(Object.keys(measured).filter(k => measured[k] === null).sort()).toEqual([
+      'exitPassResumesAt', 'fullyReleasesAt', 'releasesAt',
+    ]);
   });
 });
