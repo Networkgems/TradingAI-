@@ -10,6 +10,7 @@ import { mkdir, writeFile, readFile, readdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { assessLevelContinuity } from '@trading-app/shared';
+import { isMarketDayIso, previousMarketDayIso } from './scheduler.js';
 import type { SymbolState } from './signal-engine.js';
 import {
   writeCloseLedger,
@@ -357,5 +358,122 @@ describe('TRA-2688 row projection', () => {
     expect(r.changePct).toBe(0);
     // Which the reader then refuses.
     expect(usableLedgerRows([r])).toEqual([]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// TRA-3847 — the WRITER's market-day gate (leg 1's copy of TRA-3844's)
+//
+// Read as PAIRS. A gate that refuses everything is exactly as useless as no
+// gate, so every refusal arm below is joined to the adjacent session that must
+// still write, over the same target and the same symbols.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-3847 — the close-ledger writer refuses a non-market date', () => {
+  const one = [sym({ symbol: 'AAPL', price: 200, lastUpdated: 1_754_000_000_000 })];
+
+  it('a Saturday is refused and does not even create the bucket; the Friday beside it writes', async () => {
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+
+    // 2026-08-15 — the Saturday inside the weekend leg 2's shutdown drain minted
+    // 67 tape files across (TRA-3844). This writer has no shutdown path, so the
+    // reachable shape is `POST /api/reports/generate`, which passes no
+    // `asOfDate` and therefore hands down TODAY's ET date.
+    const sat = await writeCloseLedger({
+      targetDir: dir, date: '2026-08-15', symbols: one, usersRoot: usersRoot(),
+    });
+    expect(sat.written).toBe(false);
+    expect(sat.skipped).toBe(true);
+    expect(sat.skipReason).toBe('non-market-day');
+    // A refusal is NOT a failure. The distinction is the whole reason the two
+    // fields are separate — see `CloseLedgerWriteResult`.
+    expect(sat.error).toBeUndefined();
+    // Ahead of `mkdir`: a refused write leaves no trace at all, not an empty
+    // bucket a later reader has to interpret.
+    await expect(readdir(join(dir, CLOSE_LEDGER_DIR))).rejects.toThrow();
+
+    // …and the pair. Same target, same symbols, the adjacent session.
+    const fri = await writeCloseLedger({
+      targetDir: dir, date: '2026-08-14', symbols: one, usersRoot: usersRoot(),
+    });
+    expect(fri.written).toBe(true);
+    expect(fri.skipped).toBeUndefined();
+    expect((await readdir(join(dir, CLOSE_LEDGER_DIR))).sort()).toEqual(['2026-08-14.json']);
+    expect((await readLedger(dir, '2026-08-14')).rows).toHaveLength(1);
+  });
+
+  it('Labor Day is refused too — the predicate is the CALENDAR, not day-of-week', async () => {
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+    // 2026-09-07 is a Monday. A day-of-week gate would happily write it.
+    const holiday = await writeCloseLedger({
+      targetDir: dir, date: '2026-09-07', symbols: one, usersRoot: usersRoot(),
+    });
+    expect(holiday.written).toBe(false);
+    expect(holiday.skipReason).toBe('non-market-day');
+
+    const tuesday = await writeCloseLedger({
+      targetDir: dir, date: '2026-09-08', symbols: one, usersRoot: usersRoot(),
+    });
+    expect(tuesday.written).toBe(true);
+    expect((await readdir(join(dir, CLOSE_LEDGER_DIR))).sort()).toEqual(['2026-09-08.json']);
+  });
+
+  it('a malformed date key is refused rather than written under a name no reader can resolve', async () => {
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+    for (const bad of ['2026-8-15', 'today', '']) {
+      const w = await writeCloseLedger({
+        targetDir: dir, date: bad, symbols: one, usersRoot: usersRoot(),
+      });
+      expect(w.written).toBe(false);
+      expect(w.skipReason).toBe('non-market-day');
+    }
+    await expect(readdir(join(dir, CLOSE_LEDGER_DIR))).rejects.toThrow();
+  });
+
+  it('over 08-13..08-17 the written set EQUALS `isMarketDayIso` — the writer/reader drift test', async () => {
+    // The defect itself was writer and reader disagreeing about what day it is.
+    // Asserting the two sets rather than five individual outcomes is what makes
+    // this a drift test instead of five restatements of the gate.
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+    const span = ['2026-08-13', '2026-08-14', '2026-08-15', '2026-08-16', '2026-08-17'];
+    for (const d of span) {
+      await writeCloseLedger({ targetDir: dir, date: d, symbols: one, usersRoot: usersRoot() });
+    }
+    const onDisk = (await readdir(join(dir, CLOSE_LEDGER_DIR))).sort().map(n => n.replace('.json', ''));
+    expect(onDisk).toEqual(span.filter(isMarketDayIso));
+    expect(onDisk).toEqual(['2026-08-13', '2026-08-14', '2026-08-17']);
+  });
+
+  it('AC4 — `priorSessionLedgerMovers` still ANSWERS across the weekend gap', async () => {
+    // The reason the gate cannot blind the reader is structural, not empirical:
+    // `index.ts` only ever asks for `previousMarketDayIso(reportDate)`, so the
+    // dates it can request are a SUBSET of the ones this gate admits. A weekend
+    // ledger was unreachable residue even before the gate — nothing could ask
+    // for it. This arm walks the exact Fri→Sat→Sun→Mon sequence.
+    const dir = bucket();
+    await mkdir(dir, { recursive: true });
+    await writeCloseLedger({
+      targetDir: dir, date: '2026-08-14', usersRoot: usersRoot(),
+      symbols: [
+        sym({ symbol: 'AAPL', price: 200, changePct: 1.5, lastUpdated: 1_754_000_000_000 }),
+        sym({ symbol: 'MSFT', price: 410, changePct: -0.4, lastUpdated: 1_754_000_000_000 }),
+      ],
+    });
+    // Two ungated manual generates over the weekend, both refused.
+    for (const d of ['2026-08-15', '2026-08-16']) {
+      expect((await writeCloseLedger({ targetDir: dir, date: d, symbols: one, usersRoot: usersRoot() })).skipped).toBe(true);
+    }
+
+    // Monday's session asks the question exactly as `generateAndSaveReport` does.
+    const prevSession = previousMarketDayIso('2026-08-17');
+    expect(prevSession).toBe('2026-08-14');
+    const prior = await priorSessionLedgerMovers({ targetDir: dir, prevSession: prevSession! });
+    expect(prior.source).toBe('close_ledger');
+    expect(prior.movers?.map(m => m.symbol).sort()).toEqual(['AAPL', 'MSFT']);
+    expect(prior.rowsUsable).toBe(2);
   });
 });

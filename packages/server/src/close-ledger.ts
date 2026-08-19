@@ -82,11 +82,64 @@
  * so leg 2 can MEASURE staleness instead of inferring it from equal prices;
  * turning that measurement into a verdict is leg 2's job, not this one's.
  * ⛔ Do not "simplify" the reader by dropping the freshness filter.
+ *
+ * ## TRA-3847 — the writer owns the market-day predicate, same as leg 2
+ *
+ * TRA-3844 put a calendar gate in leg 2's writer after a Sunday redeploy's
+ * shutdown drain minted 67 ledger-bearing `tape/<date>.json` files. This writer
+ * was deliberately shaped like that one and had **none** — `grep -c isMarketDay
+ * close-ledger.ts` was 0 — so the two legs of TRA-2654 were asymmetric on the
+ * calendar, which is the shape both TRA-3844 and TRA-3267 were raised on.
+ *
+ * ### The exposure was NARROWER than leg 2's, and it was still real
+ *
+ * There is no shutdown path here. `writeCloseLedger` is reached only from
+ * `generateAndSaveReport`, whose callers are the backfill (close-ledger is
+ * explicitly skipped), the EOD archive sweep (already gated `if
+ * (stocksMarketDay)`), and `POST /api/reports/generate` — which had **no gate at
+ * all**. A human hitting *Generate EOD report* on a Saturday minted
+ * `closes/<saturday>.json`, and nothing downstream re-checked the calendar the
+ * way `denominator-flip-tape-summary.ts` does for the tape.
+ *
+ * The census run for TRA-3847 over the writer's ENTIRE deployed lifetime (live
+ * since deploy `4dac411`, 2026-08-13T11:20Z; Render's 30-day log retention
+ * therefore covers 100% of it, so this is a complete count and not a floor)
+ * found **201 writes across exactly three date keys — 2026-08-13, 08-14 and
+ * 08-17, 67 books each, every one an NYSE session. Zero non-market dates, so
+ * zero inert files and zero ledger-bearing ones.** The Sunday 2026-08-16
+ * 14:44Z redeploy that minted leg 2's 67 weekend tape files minted **no** close
+ * ledger, which is the paired control on "there is no shutdown path here".
+ *
+ * So this gate is prophylactic rather than a cleanup, and it is still worth its
+ * lines: the defect TRA-3844 closed was a writer that could be *made* to mint a
+ * false session by any caller, and closing it on the route alone would leave
+ * exactly that.
+ *
+ * ### Why the gate is HERE and not on the route
+ *
+ * At the seam it covers all three present callers and every future one. On the
+ * route it would cover one caller, leave the writer mintable, and additionally
+ * refuse the ARCHIVE `<date>.json` write — a different artifact, with its own
+ * calendar history (TRA-3267/TRA-3298) and its own owner. Narrowest correct fix
+ * wins: `closes/<date>.json` existing is now itself the claim "this date was an
+ * NYSE session", which is what a reader was always entitled to assume of a file
+ * named after a trading day.
+ *
+ * ### The gate cannot blind the reader, STRUCTURALLY
+ *
+ * {@link priorSessionLedgerMovers} is only ever asked for
+ * `previousMarketDayIso(reportDate)` (`index.ts`), so the set of dates the
+ * reader can request is a SUBSET of the market days this gate admits, and the
+ * set it refuses is one the reader can never ask for. A weekend ledger was
+ * therefore unreadable residue even before this: nothing could reach it. Live
+ * confirmation on the weekend that matters — Monday 2026-08-17's EOD read
+ * `prior=2026-08-14`, `source=close_ledger`, on 67 of 67 books.
  */
 
 import { writeFile, readFile, readdir, unlink, mkdir, stat } from 'fs/promises';
 import { join } from 'path';
 import { isMoveSuspect } from '@trading-app/shared';
+import { isMarketDayIso } from './scheduler.js';
 import type { SymbolState } from './signal-engine.js';
 
 /** Sub-directory of the report bucket the ledger lives in. */
@@ -190,6 +243,16 @@ export interface CloseLedgerWriteResult {
   aggregateBytes?: number;
   /** Set when the write failed. The caller logs it; the report proceeds. */
   error?: string;
+  /**
+   * TRA-3847 — the write was REFUSED on the calendar predicate, not attempted
+   * and failed. Kept separate from `error` for the same reason leg 2 keeps them
+   * separate: `error` is "a real session's rows did not reach disk", which is
+   * something to chase; `skipped` is "there was no session", which is the
+   * writer working. A caller that read `!written` alone could not tell a
+   * refused Saturday from an ENOSPC on a Tuesday.
+   */
+  skipped?: boolean;
+  skipReason?: string;
 }
 
 interface LedgerLog {
@@ -284,6 +347,31 @@ export async function writeCloseLedger(args: {
     prunedForAggregate: 0,
     aggregateSweep: 'skipped_no_root',
   };
+
+  // TRA-3847 — the calendar predicate, ahead of every path that touches disk
+  // (including `mkdir`, so a refused write does not even create the bucket).
+  // The SAME `isMarketDayIso` leg 2's writer gates on and the reader filters
+  // `barDays[]` with: one predicate, one calendar, no second copy to drift.
+  //
+  // A malformed date key fails this test too, and that is the right answer
+  // rather than an accident of the regex: a file named something no reader can
+  // resolve to a session is worse than no file, and `readCloseLedger` would
+  // never ask for it anyway.
+  //
+  // NOTHING IS LOST BY REFUSING. Unlike leg 2, this writer holds no ring — every
+  // row is projected from `state.symbols`, which is still in memory and will be
+  // re-projected at the next real session's close. There is no re-admission
+  // question here, so there is nothing to discard; the count is still named in
+  // the warn, because a write that did not happen and nothing said so is the
+  // same fail-open the rest of this module is built against.
+  if (!isMarketDayIso(date)) {
+    args.log?.warn(
+      'TRA-3847 close-ledger write on a NON-MARKET ET date — refusing to mint a session file (no rows are lost: they re-project from `state.symbols` at the next session)',
+      { date, symbolsInState: symbols.length, dir: join(targetDir, CLOSE_LEDGER_DIR) },
+    );
+    return { ...base, skipped: true, skipReason: 'non-market-day' };
+  }
+
   try {
     const dir = join(targetDir, CLOSE_LEDGER_DIR);
     await mkdir(dir, { recursive: true });
