@@ -32,7 +32,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 const BQB1 = 'https://tradingai-bqb1.onrender.com';
@@ -134,17 +134,19 @@ say(`    local HEAD   ${localSha}`);
 if (localSha !== pin0.commit) {
   say('    (SHA differs — admissibility is decided by the byte-for-byte replay below, not by this line.)');
 }
+// `import()` of a bare Windows path resolves as protocol `c:` — pathToFileURL
+// or this reads BLIND on every Windows checkout for a reason that has nothing
+// to do with the axis.
+const FOLD_DIST = pathToFileURL(path.join(REPO, 'packages/server/dist/pnl-reconciliation.js')).href;
 let summarize;
 try {
-  ({ summarizeJournalDayCellAgreement: summarize } =
-    await import(path.join(REPO, 'packages/server/dist/pnl-reconciliation.js')));
-} catch {
-  try {
-    ({ summarizeJournalDayCellAgreement: summarize } =
-      await import(path.join(REPO, 'packages/server/src/pnl-reconciliation.ts')));
-  } catch (e) {
-    die(3, `BLIND: cannot load the fold to replay it (${e.message}). Run \`pnpm --filter @trading-app/server build\`.`);
-  }
+  ({ summarizeJournalDayCellAgreement: summarize } = await import(FOLD_DIST));
+} catch (e) {
+  die(3, `BLIND: cannot load the fold to replay it (${e.message}). `
+    + 'Run `pnpm --filter @trading-app/server build` first.');
+}
+if (typeof summarize !== 'function') {
+  die(3, `BLIND: ${FOLD_DIST} exports no summarizeJournalDayCellAgreement.`);
 }
 const rows = engines.map(e => ({
   username: e.username,
