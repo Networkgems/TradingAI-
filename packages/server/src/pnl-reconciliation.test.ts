@@ -5,6 +5,7 @@ import {
   foldJournalClosesByEtDay,
   liveOptionsOnsetEtDate,
   summarizeLiveLagTripwire,
+  summarizeJournalDayCellAgreement,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
   summarizeLiveCombinedAgreement,
@@ -3584,5 +3585,242 @@ describe('TRA-3517 — a 0.00-vs-0.00 agreement is a MEASUREMENT, not evidence',
     expect(r.liveCombinedAgreementGradedCount).toBe(2);
     expect(r.liveCombinedAgreementDiscriminatingCount).toBe(1);
     expect(r.liveCombinedAgreementOk).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3864 AC1 — the day cell vs the JOURNAL, subtracted.
+//
+// `optionsDaily` is PERSISTED at the 21:00 ET archive. `journalOptionsPnl` is
+// RECOMPUTED per request from the append-only journal. The TRA-2819 close-basis
+// restatement (applied in bulk by the TRA-3730 sweep) moves the journal row
+// AFTERWARDS, so the two diverge — and both numbers rode the same published
+// object with nothing subtracting them.
+//
+// Live on bqb1 build `bc92e57109c1`, 2026-08-19T21:2xZ: 985 day cells, 853
+// journal-authoritative, 3 divergent — TWO on the live money book.
+//
+//   admin/live 2026-08-18   optionsDaily -393.00   journal -271.23   delta -121.77
+//   admin/live 2026-08-11   optionsDaily  -16.00   journal  -16.86   delta   +0.86
+//
+// The 08-18 delta is the `SPY260821C00777000` restatement -278.00 -> -156.23 to
+// the cent. Every fixture below is those live numbers, not a synthetic shape.
+//
+// ⚠️ `optionsLegDrift` reads 0.00 on all three and is CORRECT to — TRA-2641's
+// `syncEodReportOptionsLegs` writes the day cell INTO the report file's options
+// leg on exactly this cohort, so that axis has no failing state here. The last
+// test in this block pins that, so a future reader cannot mistake the two.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('TRA-3864 AC1 — a superseded day cell is published, not left unread', () => {
+  const journalSnap = (
+    date: string,
+    optionsDailyPnl: number,
+    source: string | null = 'journal',
+  ): DailySnapshot => ({
+    ...snap(date, 0, optionsDailyPnl),
+    optionsDailyPnlSource: source,
+  } as DailySnapshot);
+  const census = (rows: Array<[string, number, number]>) =>
+    new Map(rows.map(([d, closes, pnl]) =>
+      [d, { closes, partialCloses: 0, realizedPnlUsd: pnl }]));
+
+  it('flags BOTH live cells, with the delta to the cent', () => {
+    const r = reconcilePnl(
+      [journalSnap('2026-08-11', -16), journalSnap('2026-08-18', -393)],
+      new Map(),
+      null,
+      census([['2026-08-11', 1, -16.86], ['2026-08-18', 2, -271.23]]),
+    );
+
+    expect(r.journalSupersededDates).toEqual(['2026-08-11', '2026-08-18']);
+    expect(r.journalAgreementOk).toBe(false);
+    expect(r.journalAgreementGradeableCount).toBe(2);
+    expect(r.maxJournalSupersessionUsd).toBe(121.77);
+    expect(r.days[0]).toMatchObject({
+      journalOptionsPnlDeltaUsd: 0.86,
+      optionsDailySupersededByJournal: true,
+    });
+    expect(r.days[1]).toMatchObject({
+      journalOptionsPnlDeltaUsd: -121.77,
+      optionsDailySupersededByJournal: true,
+    });
+    // Untouched: this is not a claim about the drift identity.
+    expect(r.optionsFalseZeroOk).toBe(true);
+  });
+
+  it('MUTATION: the SAME cell carrying the restated figure is clean, not silent', () => {
+    // Only `optionsDaily` moves vs the case above. A green here has to be a real
+    // pass — the gradeable count is what proves something was looked at.
+    const r = reconcilePnl(
+      [journalSnap('2026-08-18', -271.23)],
+      new Map(),
+      null,
+      census([['2026-08-18', 2, -271.23]]),
+    );
+    expect(r.journalSupersededDates).toEqual([]);
+    expect(r.journalAgreementOk).toBe(true);
+    expect(r.journalAgreementGradeableCount).toBe(1);
+    expect(r.maxJournalSupersessionUsd).toBe(0);
+    expect(r.days[0].journalOptionsPnlDeltaUsd).toBe(0);
+    expect(r.days[0].optionsDailySupersededByJournal).toBe(false);
+  });
+
+  it('catches a ONE-CENT divergence — the tolerance is half a cent, not one cent', () => {
+    // Both operands are round2-ed, so 0.01 is the smallest disagreement this axis
+    // can express. Reusing `PNL_RECONCILE_TOLERANCE_USD` (1c, strict >) would
+    // leave the boundary with no failing state and silence exactly the one-cent
+    // restatement deltas the TRA-3730 cohort is made of.
+    const r = reconcilePnl(
+      [journalSnap('2026-08-06', -16.85)],
+      new Map(),
+      null,
+      census([['2026-08-06', 1, -16.86]]),
+    );
+    expect(r.days[0].journalOptionsPnlDeltaUsd).toBe(0.01);
+    expect(r.journalSupersededDates).toEqual(['2026-08-06']);
+    expect(r.journalAgreementOk).toBe(false);
+  });
+
+  it('grades `journal-repair` too, and ABSTAINS on a bucket-sourced cell', () => {
+    // `isJournalAuthoritativeSource` is the ONE shared predicate. A `bucket-*`
+    // row is one the report file is the better record for — a difference there is
+    // not an accusation, so it must read NOT MEASURED rather than clean or red.
+    const r = reconcilePnl(
+      [
+        journalSnap('2026-08-11', -16, 'journal-repair'),
+        journalSnap('2026-08-12', -16, 'bucket-journal-silent'),
+        journalSnap('2026-08-13', -16, null),
+      ],
+      new Map(),
+      null,
+      census([['2026-08-11', 1, -16.86], ['2026-08-12', 1, -16.86], ['2026-08-13', 1, -16.86]]),
+    );
+    expect(r.journalSupersededDates).toEqual(['2026-08-11']);
+    expect(r.journalAgreementGradeableCount).toBe(1);
+    expect(r.days[1].journalOptionsPnlDeltaUsd).toBeNull();
+    expect(r.days[1].optionsDailySupersededByJournal).toBe(false);
+    expect(r.days[2].journalOptionsPnlDeltaUsd).toBeNull();
+  });
+
+  it('NOT MEASURED, never 0, when no census was supplied', () => {
+    // The default call shape. A `0` delta here is byte-identical to perfect
+    // agreement — the collapse TRA-2637 fixed on `drift` and TRA-3517 on
+    // `combinedAgreementDeltaUsd`.
+    const r = reconcilePnl([journalSnap('2026-08-18', -393)], new Map());
+    expect(r.days[0].journalOptionsPnlDeltaUsd).toBeNull();
+    expect(r.days[0].optionsDailySupersededByJournal).toBe(false);
+    expect(r.journalAgreementGradeableCount).toBe(0);
+    expect(r.journalAgreementOk).toBeNull();
+    expect(r.maxJournalSupersessionUsd).toBeNull();
+  });
+
+  it('is NOT baseline-gated — a superseded cell below the baseline still counts', () => {
+    // The TRA-1636 baseline keeps PRE-FIX rows out of the drift verdict. It has
+    // nothing to say here: the gate is the provenance stamp, which post-dates
+    // TRA-2314, so a row old enough for the baseline to matter is already outside
+    // the cohort. Gating on it would shrink the denominator by an unrelated rule
+    // and stop the published set matching the hand-run repro.
+    const r = reconcilePnl(
+      [journalSnap('2026-07-28', 48.5)],
+      new Map(),
+      '2026-08-01',
+      census([['2026-07-28', 4, 111.5]]),
+    );
+    expect(r.belowBaselineCount).toBe(1);
+    expect(r.journalSupersededDates).toEqual(['2026-07-28']);
+    expect(r.days[0].journalOptionsPnlDeltaUsd).toBe(-63);
+  });
+
+  it('the SLAVED leg reads 0.00 on the very same row — this axis is the independent one', () => {
+    // TRA-2630/TRA-2641: `syncEodReportOptionsLegs` writes the day cell into the
+    // report file's options leg on every journal-authoritative row, so
+    // `eodOptionsPnl - optionsDaily` compares a source against a copy of itself.
+    // QA swept for that ruling before filing; this pins WHY the old reader was
+    // blind, so nobody re-raises the finding as an `optionsLegDrift` bug.
+    const r = reconcilePnl(
+      [journalSnap('2026-08-18', -393)],
+      new Map(),
+      null,
+      census([['2026-08-18', 2, -271.23]]),
+      new Map([['2026-08-18', -393]]), // the file leg, slaved to the cell
+    );
+    expect(r.days[0].optionsLegDrift).toBe(0);
+    expect(r.days[0].journalOptionsPnlDeltaUsd).toBe(-121.77);
+    expect(r.journalAgreementOk).toBe(false);
+  });
+});
+
+describe('TRA-3864 — the fleet fold names the LIVE books', () => {
+  const book = (
+    username: string,
+    mode: string,
+    dates: string[],
+    gradeable: number,
+    maxDelta: number | null,
+  ) => ({
+    username,
+    mode,
+    journalAgreementOk: dates.length > 0 ? false : gradeable > 0 ? true : null,
+    journalSupersededDates: dates,
+    journalAgreementGradeableCount: gradeable,
+    maxJournalSupersessionUsd: maxDelta,
+  });
+
+  it('reproduces the filed fleet measurement: 853 gradeable, 3 divergent, 2 live', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('admin', 'live', ['2026-08-11', '2026-08-18'], 67, 121.77),
+      book('qa_mirror_1578_38096', 'demo', ['2026-07-28'], 40, 63),
+      book('v0nni', 'live', [], 20, 0),
+      book('quiet', 'demo', [], 726, 0),
+    ]);
+    expect(s.journalDayCellAgreementOk).toBe(false);
+    expect(s.journalDayCellGradeableCount).toBe(853);
+    expect(s.journalDayCellSupersededCount).toBe(3);
+    expect(s.liveJournalDayCellAgreementOk).toBe(false);
+    // The question a desk asks first: which of these is REAL MONEY.
+    expect(s.liveJournalDayCellSupersededBooks).toEqual([
+      { username: 'admin', dates: ['2026-08-11', '2026-08-18'] },
+    ]);
+    expect(s.liveJournalDayCellGradeableBookCount).toBe(2);
+  });
+
+  it('a demo-only divergence goes RED fleet-wide and stays GREEN on the live cohort', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('qa_mirror_1578_38096', 'demo', ['2026-07-28'], 40, 63),
+      book('admin', 'live', [], 67, 0),
+    ]);
+    expect(s.journalDayCellAgreementOk).toBe(false);
+    expect(s.liveJournalDayCellAgreementOk).toBe(true);
+    expect(s.liveJournalDayCellSupersededBooks).toEqual([]);
+  });
+
+  it('an EMPTY live cohort reads NOT MEASURED, never OK', () => {
+    // `every` is true on the empty set — the manufactured green this endpoint has
+    // already shipped twice (TRA-2924 on `optionsLegOk`, TRA-2630 AC2 on the lag
+    // tripwire). bqb1 serves an empty live cohort on a boot-arm miss.
+    const s = summarizeJournalDayCellAgreement([book('someone', 'demo', [], 12, 0)]);
+    expect(s.liveJournalDayCellAgreementOk).toBeNull();
+    expect(s.liveJournalDayCellGradeableBookCount).toBe(0);
+    expect(s.journalDayCellAgreementOk).toBe(true);
+  });
+
+  it('a fleet where nobody was gradeable reads NOT MEASURED, not a pass', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('a', 'live', [], 0, null),
+      book('b', 'demo', [], 0, null),
+    ]);
+    expect(s.journalDayCellAgreementOk).toBeNull();
+    expect(s.journalDayCellGradeableCount).toBe(0);
+    expect(s.journalDayCellGradeableBookCount).toBe(0);
+  });
+
+  it('RED wins over NOT MEASURED — an ungradeable book cannot mask a superseded one', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('a', 'live', ['2026-08-18'], 5, 121.77),
+      book('b', 'live', [], 0, null),
+    ]);
+    expect(s.liveJournalDayCellAgreementOk).toBe(false);
+    expect(s.journalDayCellAgreementOk).toBe(false);
   });
 });

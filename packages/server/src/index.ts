@@ -35,6 +35,7 @@ import {
   foldJournalClosesByEtDay,
   liveOptionsOnsetEtDate,
   summarizeLiveLagTripwire,
+  summarizeJournalDayCellAgreement,
   summarizeLiveCohortIntegrity,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
@@ -6307,6 +6308,17 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // `mode: live` in the 02:08Z and 03:52Z pulls. `liveBookCount` is what makes
       // the two states distinguishable; `null` means NOT MEASURED, never a pass.
       ...summarizeLiveLagTripwire(engines),
+      // TRA-3864 — the day cell vs the JOURNAL, subtracted. Both numbers were
+      // already on every `days[]` row and nothing compared them, which is how the
+      // TRA-2819/TRA-3730 close-basis restatement corrected the journal and left
+      // two LIVE money-book cells publishing the superseded figure (`admin`
+      // 2026-08-18 -393.00 vs -271.23, 2026-08-11 -16.00 vs -16.86) under an
+      // `optionsDailyPnlSource: 'journal'` label, for a day, unread. The obvious
+      // reader could not see it: `optionsLegDrift` is 0.00 on those rows and is
+      // CORRECT to be (TRA-2641 slaving — see the note on the summarizer).
+      // Read `journalDayCellGradeableCount` beside the verdict: green over an
+      // empty cohort is the manufactured pass this endpoint has shipped twice.
+      ...summarizeJournalDayCellAgreement(engines),
       // TRA-2635 (CEO) — THE MONEY QUESTION, and it is a different question from
       // the tripwire above. The lag signature reads CLEAN on a book where the
       // credit path never fired, so grading the live book off it alone graded it

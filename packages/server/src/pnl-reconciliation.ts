@@ -245,7 +245,7 @@ export const PNL_FROZEN_COUNTER_NOTE =
   'TRA-2658: a FROZEN `optionsCreditedCumulative` is invisible to the reset signatures. `counterDurable` graded non-durability off `lagsPriorOptionsDaily` and a NEGATIVE window, and both are MOTION detectors — a counter stuck at exactly 0 never decreases and never pushes a credit into the stock leg, because `openingEquity` absorbed the credit across a boot before the 21:00 close ran. Live bqb1 2026-07-30T14:08Z: `admin` served `counterDurable: true` with `counterResetDates: []` and `optionsCreditedCumulative: 0` on 07-27, 07-28 AND 07-29, while $254.00 of option credit had demonstrably reached its equity ($2,008.29 -> $2,243.48 against a -$18.81 stock leg). So the predicate TRA-2658 AC2 grades had NO FAILING STATE on the one book that mattered. The third signature is `unbookedEquityMoveUsd` = (closingEquity - prevClosingEquity) - stockDaily - optionsCreditedInWindow, which is algebraically `openingEquity - prevClosingEquity` and is 0 on a continuously-run book; it read +140.00 on 07-28 (= 07-27 `optionsDaily` to the cent) and +114.00 on 07-29. Its operands are three durable snapshot fields that NO writer joins, so it cannot go self-confirming the way TRA-2641 `optionsLegDrift` did. It now folds into `counterDurable` via `counterFrozenDates`; read `counterNonDurableDates` for the union and `counterResetDates` for the original narrower meaning — a ZEROED counter and a FROZEN one need OPPOSITE remediations, because a zeroed counter has already double-booked the credit into `stockDaily` (making `uncreditedOptionsUsd` an upper bound) while a frozen one leaves the stock leg exact and the credit present in `closingEquity` but absent from every daily row. `unbookedEquityMoveDates` additionally publishes un-attributed moves (a starting-balance edit via `PaperAccount.applyEquity` is the benign cause) WITHOUT folding them into the verdict. TRA-2926: the accusation is GAP-GATED — a row whose `priorSessionAdjacent` is false (its prior ROW sits across the permanent TRA-2888 hole) reads `counterFrozen: null` (NOT MEASURED), because `prevClosingEquity` there spans several settled sessions and real gap-session P&L lands as "unbooked" (2026-08-04: 36/36 unbooked rows and 12/12 frozen rows were non-adjacent). The raw `unbookedEquityMoveUsd` stays published on suppressed rows; read `counterFrozenGradeableDates` for the detector\'s denominator and `counterGapSuppressedDates` for the suppressed set. `counterDurable` is `null`, never green, when that denominator is empty.';
 
 export const PNL_LIVE_MODE_SPAN_NOTE =
-  'TRA-2831: the live COHORT is keyed on the book\'s mode TODAY (`stockModeKey(loadSettings(username))`, read per request) while the day-cell options ledger under it is per-BOOK and MODE-BLIND for all time. On any book that flipped demo -> live mid-series those compose into a silent attribution defect: the whole pre-flip DEMO history folds into every `live*` credit metric. Live bqb1 2026-08-04T22:22Z: `liveUncreditedOptionsUsd` published 733.60 as a live-money shortfall, whose numerator `postBaselineOptionsRealized` 987.60 is the sum of eleven `journal-repair` cells dated 2026-07-15..2026-07-29 — a window in which the live book (`admin`) held ZERO live options, its first having opened 2026-07-30 09:36 ET. Those 987.60 are admin\'s own DEMO option P&L: summing every book\'s `journal-repair` cells fleet-wide reproduces the demo-mode fleet total to the cent (07-15 301.30, 07-17 102.00, 07-22 4919.50), with admin contributing 17.00 / 217.50 / 54.40. The equality to `eodCombined` on those rows is NOT independent corroboration — it is the TRA-2641 slaving (`syncEodReportOptionsLegs` writes the day cell into the report file\'s options leg on every `journal`/`journal-repair` row) plus a 0.00 stock leg on 9 of the 11. `liveUncreditedOptionsUsd` is now null (NOT MEASURED) whenever any contributing book carries pre-onset options money. DO NOT FALL BACK TO `liveUncreditedOptionsUsdUnscoped` -- an earlier revision of this note pointed readers at it "for the arithmetic" and that instruction is WITHDRAWN by TRA-2922 (CFO ruling, 2026-08-05), which made the suspension PERMANENT and keyed it to an IDENTITY rather than to a dollar figure: while `optionsRealizedBeforeLiveOnsetUsd >= postBaselineOptionsRealized` on a book, that book\'s `uncreditedOptionsUsd` carries ZERO live-onset options money and MUST NOT be reported, escalated or budgeted as a live-money shortfall, at ANY value, under any name. `*Unscoped` is that same suspended measurement under a different key and is published as EVIDENCE ONLY. The decisive leg is an inequality, not a magnitude: the pre-onset window 07-15..07-29 is a strict SUBSET of the post-baseline window, so `preOnset <= postBaseline` must hold and it does not (987.60 > 985.60 on 2026-08-05) -- MORE than 100 percent of the numerator predates onset, and zero of it is live-onset money. A rule keyed to the value would have expired on contact: the same contaminated measurement rendered 733.60 (08-04), 371.59 (08-05) and -52.41 (08-06), so it has already changed SIGN and any consumer still reading it would now report the live book as OVER-credited. Read `liveUncreditedOptionsGradeable` for the denominator -- print that denominator alongside any verdict, because exactly ONE book (`admin`) of the two live books carries a non-null `liveOptionsOnsetDate`, so an "all live books pass" predicate is TRUE on a cohort of one and would stay TRUE on a cohort of ZERO -- and `liveModeSpanContaminatedBooks` for the attribution. For an actual live-money number read `engines[].postOnsetCredit` (TRA-2919), never this key. Completing TRA-2827\'s 07-30/07-31/08-03 back-fill does NOT discharge this: those rows are post-onset and add a live term without removing the 987.60 pre-onset term. NOTE also that `optionsDailyPnl` is not a field on the published day rows at all — the durable snapshot field of that name surfaces as `optionsDaily`, and querying the published shape for `optionsDailyPnl` returns null on all 67 admin cells (and on every cell of every book) as a NAME MISS, not as a TRA-2629-style dropped field; the values are present and journal-sourced (`optionsDaily === journalOptionsPnl` on all 11 repaired cells, where `journalOptionsPnl` is recomputed per request straight from the journal).';
+  'TRA-2831: the live COHORT is keyed on the book\'s mode TODAY (`stockModeKey(loadSettings(username))`, read per request) while the day-cell options ledger under it is per-BOOK and MODE-BLIND for all time. On any book that flipped demo -> live mid-series those compose into a silent attribution defect: the whole pre-flip DEMO history folds into every `live*` credit metric. Live bqb1 2026-08-04T22:22Z: `liveUncreditedOptionsUsd` published 733.60 as a live-money shortfall, whose numerator `postBaselineOptionsRealized` 987.60 is the sum of eleven `journal-repair` cells dated 2026-07-15..2026-07-29 — a window in which the live book (`admin`) held ZERO live options, its first having opened 2026-07-30 09:36 ET. Those 987.60 are admin\'s own DEMO option P&L: summing every book\'s `journal-repair` cells fleet-wide reproduces the demo-mode fleet total to the cent (07-15 301.30, 07-17 102.00, 07-22 4919.50), with admin contributing 17.00 / 217.50 / 54.40. The equality to `eodCombined` on those rows is NOT independent corroboration — it is the TRA-2641 slaving (`syncEodReportOptionsLegs` writes the day cell into the report file\'s options leg on every `journal`/`journal-repair` row) plus a 0.00 stock leg on 9 of the 11. `liveUncreditedOptionsUsd` is now null (NOT MEASURED) whenever any contributing book carries pre-onset options money. DO NOT FALL BACK TO `liveUncreditedOptionsUsdUnscoped` -- an earlier revision of this note pointed readers at it "for the arithmetic" and that instruction is WITHDRAWN by TRA-2922 (CFO ruling, 2026-08-05), which made the suspension PERMANENT and keyed it to an IDENTITY rather than to a dollar figure: while `optionsRealizedBeforeLiveOnsetUsd >= postBaselineOptionsRealized` on a book, that book\'s `uncreditedOptionsUsd` carries ZERO live-onset options money and MUST NOT be reported, escalated or budgeted as a live-money shortfall, at ANY value, under any name. `*Unscoped` is that same suspended measurement under a different key and is published as EVIDENCE ONLY. The decisive leg is an inequality, not a magnitude: the pre-onset window 07-15..07-29 is a strict SUBSET of the post-baseline window, so `preOnset <= postBaseline` must hold and it does not (987.60 > 985.60 on 2026-08-05) -- MORE than 100 percent of the numerator predates onset, and zero of it is live-onset money. A rule keyed to the value would have expired on contact: the same contaminated measurement rendered 733.60 (08-04), 371.59 (08-05) and -52.41 (08-06), so it has already changed SIGN and any consumer still reading it would now report the live book as OVER-credited. Read `liveUncreditedOptionsGradeable` for the denominator -- print that denominator alongside any verdict, because exactly ONE book (`admin`) of the two live books carries a non-null `liveOptionsOnsetDate`, so an "all live books pass" predicate is TRUE on a cohort of one and would stay TRUE on a cohort of ZERO -- and `liveModeSpanContaminatedBooks` for the attribution. For an actual live-money number read `engines[].postOnsetCredit` (TRA-2919), never this key. Completing TRA-2827\'s 07-30/07-31/08-03 back-fill does NOT discharge this: those rows are post-onset and add a live term without removing the 987.60 pre-onset term. NOTE also that `optionsDailyPnl` is not a field on the published day rows at all — the durable snapshot field of that name surfaces as `optionsDaily`, and querying the published shape for `optionsDailyPnl` returns null on all 67 admin cells (and on every cell of every book) as a NAME MISS, not as a TRA-2629-style dropped field; the values are present and journal-sourced (`optionsDaily === journalOptionsPnl` on all 11 repaired cells, where `journalOptionsPnl` is recomputed per request straight from the journal). TRA-3864 CORRECTION (2026-08-19) — that last identity is asserted too broadly and is now FALSE ON THE LIVE MONEY BOOK. It held when it was written and it still holds on those 11 cells; it does NOT hold as a standing property of journal-authoritative cells, because a day cell is PERSISTED at the 21:00 ET archive while `journalOptionsPnl` is RECOMPUTED per request, and the TRA-2819 close-basis restatement (applied in bulk by the TRA-3730 sweep) moves the journal row AFTERWARDS. Nothing propagates the correction into the cell and — until TRA-3864 — nothing subtracted the two numbers this object publishes side by side. Measured on bqb1 build `bc92e57109c1` 2026-08-19T21:2xZ: 985 day cells fleet-wide, 853 journal-authoritative, 3 divergent — `admin`/live 2026-08-18 `optionsDaily` -393.00 vs `journalOptionsPnl` -271.23 (delta -121.77, the `SPY260821C00777000` restatement -278.00 -> -156.23 EXACTLY), `admin`/live 2026-08-11 -16.00 vs -16.86 (delta +0.86, a commission from the TRA-3730 cohort), `qa_mirror_1578_38096`/demo 2026-07-28 48.50 vs 111.50. 850/853 holding the identity is what makes those 3 real rather than reader noise. DO NOT read `optionsLegDrift` for this — it is 0.00 on all three and CORRECTLY so, per the TRA-2641 slaving ruling above; that leg has no failing state on this cohort by construction. THE RULING: the cell is FROZEN at archive time, not re-derived (silently rewriting a non-zero booked figure is what `planOptionsDailyPnlRepair` already refuses to do, TRA-2079), and `optionsDailyPnlSource` names WHICH WRITER BOOKED THE NUMBER — it is not, and never was, a claim that the number is still current. Currency is now a first-class field: read `days[].optionsDailySupersededByJournal` and `days[].journalOptionsPnlDeltaUsd` per row, `engines[].journalSupersededDates` / `journalAgreementOk` / `journalAgreementGradeableCount` per book, and `journalDayCellAgreementOk` / `journalDayCellGradeableCount` / `liveJournalDayCellSupersededBooks` fleet-wide. Quote the GRADEABLE COUNT beside any green: this axis is tri-state and `null` means nobody looked.';
 
 export const PNL_POST_ONSET_JOURNAL_CREDIT_NOTE =
   'TRA-2919: the live credit axis TRA-2630 named as the INDEPENDENT signal was PERMANENTLY ungradeable after TRA-2831, and is now re-sourced from the option-trade JOURNAL. TRA-2831 was right to suspend `liveUncreditedOptionsUsd` (its numerator was 987.60 of admin\'s own DEMO option P&L), but its gate keys on `optionsRealizedBeforeLiveOnsetUsd`, which is DURABLE history and does not age out -- so the axis could never flip back. DO NOT "fix" this by scoping the existing day-cell numerator to post-onset dates. Measured on bqb1 2026-08-05: admin had exactly ONE post-onset day cell (2026-08-04, `optionsDaily` -2.00, source `bucket-journal-silent`), so a day-cell post-onset numerator publishes -2.00 while the live book actually realized +739.00 on 2026-07-31 across 3 journal closes -- money booked to NO day cell at all, because 07-30/07-31/08-03 are the permanent TRA-2888 hole and back-fill is refused. A wrong number carrying `gradeable: true` is strictly worse than the honest null. The journal is append-only, is keyed by CLOSE timestamp rather than by the existence of a snapshot row, and survived the ENOSPC window with `corruptLines 0`; it is the only surviving source. Read `engines[].postOnsetCredit` per book and `liveOnsetOptionsRealizedJournalUsd` fleet-wide; `liveOnsetOptionsDayCellUsd` publishes the day-cell FOIL over the same window so the rejected arithmetic stays visible. THE COMPARISON IS A SEPARATE QUESTION: the equity leg is holed over the same window, so `liveOnsetUncreditedOptionsUsd` (= journal numerator + post-onset stockDaily - post-onset equity delta) is null whenever an expected NYSE session inside the anchor window `(leftAnchor, rightAnchor]` has no ledger row -- reason `equity-anchor-spans-absent-session`, which is admin\'s standing state. Absence is enumerated from the exchange calendar and diffed against the rows, deliberately NOT from the three known gap dates: a hard-coded list goes green by EVICTION the moment a newer row advances past it (exactly how TRA-2888 retired `liveEodTailStaleBooks`) and is blind to the next hole. `liveUncreditedOptionsGradeable` is REDEFINED by this ticket to mean "some live book has a journal-sourced post-onset numerator", i.e. ATTRIBUTION only; it is NOT a claim that the dollar comparison exists, and `true` alongside `liveOnsetUncreditedOptionsUsd: null` is the correct standing read. A gate wanting the money verdict must require BOTH that boolean AND `liveOnsetCreditNotMeasuredBooks` to be EMPTY. The day-cell fields `liveUncreditedOptionsUsd` / `liveUncreditedOptionsUsdUnscoped` / `liveModeSpanContaminatedBooks` are UNCHANGED and stay published as the evidence the TRA-2831 suspension rests on. TRA-3288 UPDATE: `equity-anchor-spans-absent-session` was a HOLE gate that was right by accident -- `closingEquity` on every RECORDED row is the engine\'s DEMO PaperAccount (frozen on a live book by design), so a hole-free window still grades broker-journal dollars against demo-book dollars. A live book\'s comparison is now refused with `equity-anchor-not-broker-sourced` (precedence over the absence reason) unless BOTH anchor rows carry `closingEquityBasis: \'broker-eod-balance\'`; recorded rows now stamp `\'engine-paper-account\'`, and an ABSENT basis reads as NOT broker-sourced. This is admin\'s and v0nni\'s standing state and it is PERMANENT for admin (its left anchor is a demo-book row and back-fill is refused); the axis becomes measurable only on rows written broker-sourced going forward.';
@@ -546,6 +546,81 @@ export interface PnlReconcileDay {
   journalPartialCloses: number | null;
   /** TRA-2302 — Σ realized options P&L the journal recorded for this ET day. */
   journalOptionsPnl: number | null;
+  /**
+   * TRA-3864 — `optionsDaily − journalOptionsPnl` on rows the JOURNAL is the
+   * authority for, i.e. the one comparison on this row whose two operands are
+   * genuinely independent: `optionsDaily` is the figure PERSISTED at the 21:00
+   * ET archive, `journalOptionsPnl` is recomputed per request straight from the
+   * append-only journal.
+   *
+   * Both numbers were already published side by side and NOTHING SUBTRACTED
+   * THEM. That is how the TRA-2819 / TRA-3730 close-basis restatement came to
+   * correct the journal and leave two live money-book day cells booking the
+   * pre-restatement figure, unread, for a day: `admin` / `live` 2026-08-18 at
+   * −393.00 vs −271.23 (delta −121.77, the `SPY260821C00777000` restatement
+   * −278.00 → −156.23 exactly) and 2026-08-11 at −16.00 vs −16.86 (delta +0.86,
+   * a commission from the TRA-3730 cohort). Found by QA on live bqb1 build
+   * `bc92e57109c1`, 2026-08-19; 850 of the 853 journal-authoritative cells on
+   * the box held the identity, so the reader was controlled and the three (the
+   * two above plus `qa_mirror_1578_38096` / demo 2026-07-28) are real.
+   *
+   * `null` = NOT MEASURED, on exactly two inputs: the row is not
+   * journal-authoritative (`optionsDailyPnlSource` outside `journal` /
+   * `journal-repair` — the file, not the journal, is the better record there),
+   * or no census was supplied. NEVER `0` on an unmeasured row: `0` is
+   * byte-identical to perfect agreement, the collapse TRA-2637 fixed on `drift`
+   * and TRA-3517 fixed on `combinedAgreementDeltaUsd`.
+   *
+   * ⚠️ This is NOT `optionsLegDrift`, which reads 0 on all three divergent rows
+   * and is CORRECT to. TRA-2630 / TRA-2641 ruled that leg self-confirming:
+   * `syncEodReportOptionsLegs` writes the day cell INTO the report file's
+   * options leg on every journal-authoritative row, so `eodOptionsPnl −
+   * optionsDaily` compares a source against a copy of itself and has no failing
+   * state here by construction. This axis is the independent one.
+   */
+  journalOptionsPnlDeltaUsd: number | null;
+  /**
+   * TRA-3864 — TRUE when this day cell publishes a figure the journal has since
+   * MOVED AWAY FROM: journal-authoritative provenance, and
+   * {@link journalOptionsPnlDeltaUsd} outside tolerance.
+   *
+   * ── Why the cell is not silently re-derived ──────────────────────────────
+   *
+   * QA offered two discharges — propagate the restatement into the cell, or
+   * freeze the archive-time value and say so — and left the choice here. FROZEN,
+   * and this field is the "say so".
+   *
+   * The propagate branch is already ruled against, in code: the historical
+   * repair (`planOptionsDailyPnlRepair`) moves a day cell ONLY from an exact
+   * `0.00`, and names any non-zero disagreement in `leftAloneDates` instead,
+   * "because that number may be right and silently rewriting it is precisely the
+   * unannounced correction the ticket forbids (TRA-2079)". A day cell is the
+   * durable record of what the book published that evening. Restating it in
+   * place would destroy the only copy of the figure every downstream consumer —
+   * the EOD report file the sync slaves to it, the credit axis, any grade cited
+   * off a past read — was computed from, to gain nothing this field does not
+   * already give.
+   *
+   * ── Why the provenance label still reads `journal` ────────────────────────
+   *
+   * QA also asked that a frozen cell stop labelling itself
+   * `optionsDailyPnlSource: 'journal'`. It does not, and the reason is a
+   * behaviour dependency rather than a preference:
+   * {@link isJournalAuthoritativeSource} is ONE definition with TWO consumers —
+   * it gates `syncEodReportOptionsLegs` (which writer owns the report file's
+   * options leg) and it scopes the `optionsLegOk` denominator. Moving a live
+   * money-book row out of that predicate to relabel it would hand the report
+   * file's options leg back to a different writer mid-series and silently change
+   * what `optionsLegOk` is measured over — a live behaviour change smuggled in
+   * as a rename.
+   *
+   * `optionsDailyPnlSource` names WHICH WRITER BOOKED THE NUMBER. It never
+   * claimed the number was still current, and the false reading QA hit came from
+   * there being no field that answered currency at all. That is now this field,
+   * on the same object, always present, and `false` on a measured row is a real
+   * pass rather than an absence.
+   */
+  optionsDailySupersededByJournal: boolean;
   /**
    * TRA-2302 — TRUE when this day's `optionsDailyPnl` is 0.00 while the journal
    * recorded at least one option close on it. That combination cannot be a real
@@ -1042,6 +1117,42 @@ export interface PnlReconcileResult {
   falseZeroDates: string[];
   /** TRA-2302 — false iff at least one `falseZeroDates` entry was found. */
   optionsFalseZeroOk: boolean;
+  /**
+   * TRA-3864 — dates whose persisted `optionsDaily` has been SUPERSEDED by a
+   * later journal restatement, i.e. rows where
+   * {@link PnlDayRow.optionsDailySupersededByJournal} is true.
+   *
+   * NOT baseline-gated, and NOT folded into `ok` — same additive discipline as
+   * `falseZeroDates`. A superseded cell says nothing about the
+   * `eodCombined == stockDaily + optionsDaily` identity `ok` grades.
+   */
+  journalSupersededDates: string[];
+  /**
+   * TRA-3864 — the DENOMINATOR, and the reason a zero here is worth anything.
+   * How many of this book's day cells could have read superseded at all:
+   * journal-authoritative provenance AND a census to compare against.
+   *
+   * Publish it beside the verdict. An empty `journalSupersededDates` on a book
+   * with `journalAgreementGradeableCount: 0` is "nothing was looked at", which
+   * is the manufactured green this module has already shipped twice
+   * (`optionsLegOk` under TRA-2924, `livePriorOptionsLagOk` under TRA-2630 AC2).
+   * QA's live measurement was 853 gradeable cells fleet-wide with 3 divergent —
+   * grade against that denominator, not against the 3.
+   */
+  journalAgreementGradeableCount: number;
+  /**
+   * TRA-3864 — TRI-STATE, folded the same way every other verdict on this
+   * result is: `false` (a superseded cell exists) wins outright, `null` means
+   * NOT MEASURED (no gradeable cell on this book) and is NEVER a pass, `true`
+   * means at least one cell could have diverged and none did.
+   */
+  journalAgreementOk: boolean | null;
+  /**
+   * TRA-3864 — the largest |`optionsDaily` − `journalOptionsPnl`| over the
+   * gradeable cohort, USD. `null` when the cohort is empty — `0` there would be
+   * indistinguishable from a perfectly-agreeing book.
+   */
+  maxJournalSupersessionUsd: number | null;
   /**
    * TRA-2637 — evaluated sessions that HAD activity (a journal close, or a
    * non-zero P&L leg) and yet have **no EOD report row at all**. This is the
@@ -1628,6 +1739,101 @@ export function summarizeLiveLagTripwire(
     livePriorOptionsLagOk:
       offenders.length > 0 ? false : gradeable.length === 0 ? null : true,
     livePriorOptionsLagBooks: offenders,
+  };
+}
+
+/**
+ * TRA-3864 — the fleet fold of the day-cell / journal agreement axis.
+ *
+ * ── What this exists to catch ────────────────────────────────────────────────
+ *
+ * A day cell persisted at the 21:00 ET archive from the journal, whose journal
+ * row was LATER restated (TRA-2819's close-basis correction, applied in bulk by
+ * TRA-3730's self-driving sweep). The cell keeps the pre-restatement figure.
+ * Nothing propagates, and — until this fold — nothing compared, even though both
+ * numbers rode the same published object.
+ *
+ * ── Why the obvious reader was blind ─────────────────────────────────────────
+ *
+ * `optionsLegDrift` reads exactly 0.00 on every one of these rows and is RIGHT
+ * to: TRA-2641's `syncEodReportOptionsLegs` writes the day cell into the report
+ * file's options leg on precisely the journal-authoritative cohort, so that leg
+ * compares a source against a copy of itself (TRA-2630 ruled it self-confirming
+ * and NOT gradeable). Re-reading a slaved axis harder would never have found
+ * this. The operand that IS independent — `journalOptionsPnl`, recomputed per
+ * request from the append-only journal — sat unread in the same object.
+ *
+ * ── Verdict discipline ───────────────────────────────────────────────────────
+ *
+ * Tri-state and folded RED > NOT MEASURED > GREEN, and `engines.every(...)` is
+ * the WRONG spelling here for the reason TRA-2633 already had to fix once: it
+ * coerces a `null` book to `false` and invents a fleet regression out of "nobody
+ * looked". `gradeableBookCount` is published because a green over an EMPTY
+ * cohort is the manufactured pass this module has shipped twice
+ * (`optionsLegOk` / TRA-2924, `livePriorOptionsLagOk` / TRA-2630 AC2).
+ *
+ * The LIVE cohort is folded separately and named per book. The 2026-08-19 finding
+ * was two live money-book cells (`admin` 08-18 at −121.77 and 08-11 at +0.86)
+ * against one demo mirror cell — a fleet-only count of 3 does not say that, and
+ * "which of these is real money" is the only question a desk asks first.
+ */
+export function summarizeJournalDayCellAgreement(
+  engines: ReadonlyArray<{
+    username: string;
+    mode: string;
+    journalAgreementOk: boolean | null;
+    journalSupersededDates: string[];
+    journalAgreementGradeableCount: number;
+    maxJournalSupersessionUsd: number | null;
+  }>,
+): {
+  journalDayCellAgreementOk: boolean | null;
+  journalDayCellGradeableCount: number;
+  journalDayCellGradeableBookCount: number;
+  journalDayCellSupersededCount: number;
+  journalDayCellSupersededBooks: Array<{
+    username: string;
+    mode: string;
+    dates: string[];
+    maxDeltaUsd: number | null;
+  }>;
+  liveJournalDayCellAgreementOk: boolean | null;
+  liveJournalDayCellGradeableBookCount: number;
+  liveJournalDayCellSupersededBooks: Array<{ username: string; dates: string[] }>;
+} {
+  const fold = (cohort: ReadonlyArray<(typeof engines)[number]>): boolean | null =>
+    cohort.some(e => e.journalAgreementOk === false)
+      ? false
+      : cohort.some(e => e.journalAgreementGradeableCount > 0)
+        ? true
+        : null;
+  const offenders = engines.filter(e => e.journalSupersededDates.length > 0);
+  const liveBooks = engines.filter(e => e.mode === 'live');
+  return {
+    journalDayCellAgreementOk: fold(engines),
+    journalDayCellGradeableCount: engines.reduce(
+      (n, e) => n + e.journalAgreementGradeableCount,
+      0,
+    ),
+    journalDayCellGradeableBookCount: engines.filter(e => e.journalAgreementGradeableCount > 0)
+      .length,
+    journalDayCellSupersededCount: offenders.reduce(
+      (n, e) => n + e.journalSupersededDates.length,
+      0,
+    ),
+    journalDayCellSupersededBooks: offenders.map(e => ({
+      username: e.username,
+      mode: e.mode,
+      dates: e.journalSupersededDates,
+      maxDeltaUsd: e.maxJournalSupersessionUsd,
+    })),
+    liveJournalDayCellAgreementOk: fold(liveBooks),
+    liveJournalDayCellGradeableBookCount: liveBooks.filter(
+      e => e.journalAgreementGradeableCount > 0,
+    ).length,
+    liveJournalDayCellSupersededBooks: liveBooks
+      .filter(e => e.journalSupersededDates.length > 0)
+      .map(e => ({ username: e.username, dates: e.journalSupersededDates })),
   };
 }
 
@@ -3025,6 +3231,23 @@ export function reconcilePnl(
       const journalPartialCloses = journalClosesByDate == null ? null : (census?.partialCloses ?? 0);
       const journalOptionsPnl =
         journalClosesByDate == null ? null : round2(census?.realizedPnlUsd ?? 0);
+      // TRA-3864 — the one INDEPENDENT comparison available on this row, finally
+      // subtracted. Gated on journal authority, because on a `bucket-*` row the
+      // report file is the better record and a non-zero difference there is not
+      // an accusation. `null` = NOT MEASURED, never 0 (TRA-2637 / TRA-3517).
+      const journalOptionsPnlDeltaUsd =
+        isJournalAuthoritativeSource(s.optionsDailyPnlSource) && journalOptionsPnl !== null
+          ? round2(optionsDaily - journalOptionsPnl)
+          : null;
+      // Threshold is HALF a cent, deliberately NOT `PNL_RECONCILE_TOLERANCE_USD`
+      // (1c). Both operands are already `round2`-ed, so the smallest disagreement
+      // this axis can ever express IS one cent — and `> 0.01` would therefore
+      // have no failing state at the boundary, silencing exactly the one-cent
+      // restatement deltas TRA-3730's cohort is made of. Same predicate QA filed
+      // the repro with (`abs(...) >= 0.005`), so the published set and the
+      // hand-run set are the same set by construction.
+      const optionsDailySupersededByJournal =
+        journalOptionsPnlDeltaUsd !== null && Math.abs(journalOptionsPnlDeltaUsd) >= 0.005;
       // TRA-2642 (found grading TRA-2625) — a day whose closes net EXACTLY $0.00
       // books 0.00 correctly: the snapshot and the journal AGREE, and agreement at
       // zero is not a false zero. Without the `journalOptionsPnl !== 0` term such a
@@ -3078,6 +3301,8 @@ export function reconcilePnl(
         journalCloses,
         journalPartialCloses,
         journalOptionsPnl,
+        journalOptionsPnlDeltaUsd,
+        optionsDailySupersededByJournal,
         optionsFalseZero,
         eodOptionsPnl,
         optionsDailyPnlSource: s.optionsDailyPnlSource ?? null,
@@ -3532,6 +3757,17 @@ export function reconcilePnl(
   // option close is a different defect, and silencing it before 2026-07-12
   // would hide exactly the history the parent (TRA-2297) is arguing about.
   const falseZeroDates = days.filter(d => d.optionsFalseZero).map(d => d.date);
+  // TRA-3864 — over ALL days, not `evaluated`. The baseline (TRA-1636) exists to
+  // keep pre-fix ROWS out of the drift verdict; it does not apply here because
+  // the gate is the provenance stamp itself, which post-dates TRA-2314 — a row
+  // old enough for the baseline to matter carries a null `optionsDailyPnlSource`
+  // and is already outside the cohort. Grading `evaluated` instead would silently
+  // shrink the denominator by a rule that has nothing to say about this axis, and
+  // would stop the published set matching the hand-run repro.
+  const journalAgreementGradeable = days.filter(d => d.journalOptionsPnlDeltaUsd !== null);
+  const journalSupersededDates = days
+    .filter(d => d.optionsDailySupersededByJournal)
+    .map(d => d.date);
   // TRA-2635 — the CREDIT-REACHED-EQUITY cohort and verdict. Baseline-gated
   // (`evaluated`) because the bridge did not exist pre-baseline, so a pre-fix row
   // carrying no credit is correct behaviour, not a failure.
@@ -3792,6 +4028,23 @@ export function reconcilePnl(
     belowBaselineCount: days.length - evaluated.length,
     falseZeroDates,
     optionsFalseZeroOk: falseZeroDates.length === 0,
+    journalSupersededDates,
+    journalAgreementGradeableCount: journalAgreementGradeable.length,
+    journalAgreementOk:
+      journalSupersededDates.length > 0
+        ? false
+        : journalAgreementGradeable.length === 0
+          ? null
+          : true,
+    maxJournalSupersessionUsd:
+      journalAgreementGradeable.length === 0
+        ? null
+        : round2(
+          journalAgreementGradeable.reduce(
+            (m, d) => Math.max(m, Math.abs(d.journalOptionsPnlDeltaUsd ?? 0)),
+            0,
+          ),
+        ),
     eodRowMissingDates,
     eodRowsPresentOk,
     eodRowGradeableCount: eodRowGradeable.length,

@@ -363,3 +363,86 @@ describe('TRA-3860 — the book wins over its journal twin', () => {
     expect(served[0]!.symbol).toBe('SPY260821C00777000');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3864 AC2 — `fees_usd: 0` / `gross === net` on every journal-sourced row.
+//
+// `rowFromJournalRecord` inherited `export.ts`'s premise ("the engine does not
+// record a per-trade commission on `Position`/`OptionPosition`, so `fees_usd` is
+// always 0"). True of the BOOK; false of the JOURNAL, which has carried
+// `feesUsd` since TRA-2819 and got it on the live money book via the TRA-3730
+// sweep.
+//
+// The fixture is the live row as the journal holds it TODAY (build
+// `bc92e57109c1`, measured 2026-08-19), deliberately distinct from `LIVE_0818`
+// above, which stays pinned to the pre-restatement figures TRA-3860 was filed
+// against.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `SPY260821C00777000` as the live journal holds it AFTER the restatement. */
+const SPY_RESTATED = journalRow({
+  id: 'row-2',
+  symbol: 'SPY',
+  optionSymbol: 'SPY260821C00777000',
+  openTs: Date.parse('2026-08-17T17:04:49.377Z'),
+  closeTs: Date.parse('2026-08-18T13:45:40.706Z'),
+  atRiskUsd: 219,
+  realizedPnlUsd: -156.23,
+  realizedR: -1.269406392694064,
+  pnlBasis: 'broker-fill',
+  feesUsd: 0.23,
+  realizedPnlUsdBeforeRestatement: -278,
+} as Partial<OptionTradeJournalRecord>);
+
+describe('TRA-3864 AC2 — a restated journal row exports the fee it actually paid', () => {
+  it('publishes the measured fee and a gross that is net + fees', () => {
+    const row = rowFromJournalRecord(SPY_RESTATED);
+    // The number the route published before this fix was 0 on a row whose fee
+    // was measured. In an audit export that is indistinguishable from a trade
+    // that genuinely paid nothing.
+    expect(row.fees_usd).toBe(0.23);
+    // `realizedPnlUsd` is NET of `feesUsd`, so it is untouched...
+    expect(row.net_pnl_usd).toBe(-156.23);
+    // ...and gross is reconstructed rather than copied from net.
+    expect(row.gross_pnl_usd).toBe(-156);
+    // The identity now has CONTENT. Before the fix it held vacuously, because
+    // both operands were the same number and the subtrahend was 0.
+    expect(row.gross_pnl_usd! - row.fees_usd).toBeCloseTo(row.net_pnl_usd!, 10);
+    expect(row.gross_pnl_usd).not.toBe(row.net_pnl_usd);
+  });
+
+  it('leaves an UNRESTATED row at 0 rather than inventing a fee', () => {
+    // `feesUsd` is set ONLY alongside `pnlBasis: 'broker-fill'`. The PLTR row on
+    // the same live day carries neither, and QA graded its 0 as correct.
+    const row = rowFromJournalRecord(journalRow());
+    expect(row.fees_usd).toBe(0);
+    expect(row.gross_pnl_usd).toBe(-115);
+    expect(row.net_pnl_usd).toBe(-115);
+  });
+
+  it('rolls the fee into the export summary instead of totalling 0', () => {
+    const filters: ExportFilters = {
+      markets: ['options'],
+      modes: ['live'],
+      ...day('2026-08-18'),
+    };
+    const { rows, summary } = buildExport(
+      { preMappedRows: selectJournalExportRows([journalRow(), SPY_RESTATED], new Set()) },
+      filters,
+    );
+    expect(rows).toHaveLength(2);
+    // The live day as the journal now holds it: -115.00 + -156.23.
+    expect(summary.totals.net_pnl_usd).toBe(-271.23);
+    expect(summary.totals.fees_usd).toBe(0.23);
+    expect(summary.totals.gross_pnl_usd).toBe(-271);
+  });
+
+  it('does not disturb a null P&L row', () => {
+    // A row with no `realizedPnlUsd` must not acquire a gross of `0 + fees`.
+    const row = rowFromJournalRecord(
+      journalRow({ realizedPnlUsd: undefined, feesUsd: 0.23 } as Partial<OptionTradeJournalRecord>),
+    );
+    expect(row.net_pnl_usd).toBeNull();
+    expect(row.gross_pnl_usd).toBeNull();
+  });
+});

@@ -361,9 +361,34 @@ export function checkExportRangeServable(
  * null on rows (e.g. `tradier_import`) that carried no fill mark. A fabricated
  * price in an audit export is worse than a blank one; a blank is also what makes
  * a journal-recovered row visually distinguishable from a book row.
+ *
+ * ── TRA-3864 — `fees_usd` is a JOURNAL field, not a book field ───────────────
+ *
+ * This function was written against the row shape `export.ts` defines, and took
+ * its `fees_usd: 0` / `gross === net` premise with it. That premise is a true
+ * statement about `Position` / `OptionPosition` (the engine records no
+ * per-trade commission) and a FALSE one about the journal: `feesUsd` has been on
+ * the journal row since TRA-2819, and TRA-3730's sweep put it on the live money
+ * book. Measured live 2026-08-19 on `SPY260821C00777000` (2026-08-18): the
+ * journal held `feesUsd 0.23`, `realizedPnlUsd -156.23`, `pnlBasis
+ * 'broker-fill'`; the export published `fees_usd 0` and
+ * `gross_pnl_usd -156.23 === net_pnl_usd`. `net` was right and both other
+ * columns were wrong, so `gross - fees = net` held only vacuously.
+ *
+ * `realizedPnlUsd` is NET of `feesUsd` (see `OptionTradeJournalRecord.feesUsd`),
+ * so gross is reconstructed as `net + fees` rather than measured separately.
+ *
+ * A row with no `feesUsd` (no `pnlBasis: 'broker-fill'`, i.e. never restated)
+ * keeps `fees_usd: 0` and `gross === net`. That is the pre-existing behaviour
+ * and it is NOT a claim the trade was free — the journal simply has no fee
+ * measurement for it. The rounding is applied to `fees` and to `gross`
+ * independently rather than to `net + fees` alone, so the published columns
+ * satisfy `gross - fees === net` exactly at cent precision.
  */
 export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRow {
   const net = isFiniteNumber(r.realizedPnlUsd) ? Math.round((r.realizedPnlUsd + Number.EPSILON) * 100) / 100 : null;
+  const fees = isFiniteNumber(r.feesUsd) ? Math.round((r.feesUsd + Number.EPSILON) * 100) / 100 : 0;
+  const gross = net === null ? null : Math.round((net + fees + Number.EPSILON) * 100) / 100;
   return {
     symbol: r.optionSymbol ?? r.symbol,
     market: 'options',
@@ -378,8 +403,8 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     exit_time: isFiniteNumber(r.closeTs) ? new Date(r.closeTs).toISOString() : '',
     exit_price: null,
     exit_reason: r.exitReason ?? '',
-    gross_pnl_usd: net,
-    fees_usd: 0,
+    gross_pnl_usd: gross,
+    fees_usd: fees,
     net_pnl_usd: net,
     pnl_r: isFiniteNumber(r.realizedR) ? Math.round((r.realizedR + Number.EPSILON) * 1000) / 1000 : null,
     hold_duration: formatHoldDuration(r.openTs, r.closeTs),

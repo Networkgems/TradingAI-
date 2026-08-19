@@ -10,11 +10,27 @@ import type { Position, OptionPosition, AccountMode } from '@trading-app/shared'
 // document with a summary header.
 //
 // Field notes:
-//   * fees_usd — the engine does not record a per-trade commission/fee on
-//     `Position`/`OptionPosition`, so `fees_usd` is always 0 and
-//     `gross_pnl_usd === net_pnl_usd === pnl`. The column is kept in the schema
-//     (design §2.3) so a future fee-tracking change is purely additive and the
-//     CSV header never has to change.
+//   * fees_usd — SCOPED, since TRA-3864, to BOOK-SOURCED rows only. On a row
+//     built from `Position` / `OptionPosition` (`rowFromStock`, `rowFromCrypto`,
+//     `rowFromOption`) the engine records no per-trade commission, so `fees_usd`
+//     is 0 and `gross_pnl_usd === net_pnl_usd === pnl`. That was the whole of
+//     this route's input when the note was written and it is still true of the
+//     book. It is NOT true of the option-trade JOURNAL, which has carried a
+//     measured `feesUsd` on every TRA-2819 close-basis restatement since
+//     2026-08-06 — and `rowFromJournalRecord` (`export-history.ts`) inherited
+//     this premise along with the row shape, publishing `fees_usd: 0` and a
+//     `gross` equal to `net` on a row whose fee was measured at $0.23. See
+//     {@link rowFromJournalRecord}: journal-sourced rows now carry the measured
+//     fee, and `gross_pnl_usd = net_pnl_usd + fees_usd` there is an identity
+//     with content rather than a vacuous one.
+//     Residual, deliberately NOT papered over: a journal row with no
+//     `pnlBasis: 'broker-fill'` carries no fee MEASUREMENT at all, and exports 0
+//     — the same value a genuinely fee-free trade exports. Distinguishing those
+//     needs a provenance column, which would change the §2.3 CSV header; the
+//     journal row's `pnlBasis` is the surface that already separates them.
+//     The column is kept in the schema (design §2.3) so a future fee-tracking
+//     change on the BOOK side stays purely additive and the CSV header never has
+//     to change.
 //   * pnl_r — R-multiple is derived from the entry→stop distance (the trade's
 //     initial risk), not stored. Null when the stop is absent/zero.
 //   * hold_duration — human string ("2h 14m") derived from openedAt→closedAt.
