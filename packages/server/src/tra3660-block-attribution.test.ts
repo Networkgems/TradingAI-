@@ -6,8 +6,19 @@
 // name the gap (classifyBlockAttribution), measure the thing no phase can see
 // (meterStream), and stop producing the storm that exposes us (recordPreFanoutDrop).
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { classifyBlockAttribution, ATTRIBUTION_EXPLAINED_MIN } from './event-loop-watchdog.js';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  classifyBlockAttribution,
+  ATTRIBUTION_EXPLAINED_MIN,
+  summarizeLagLedger,
+  startEventLoopWatchdog,
+  getWatchdogStatus,
+  _resetWatchdogForTests,
+  LAG_LEDGER_NO_PHASE,
+  LAG_LEDGER_RING_MAX,
+  DEFAULT_WATCHDOG,
+  type LagLedgerSample,
+} from './event-loop-watchdog.js';
 import {
   emitterTag,
   meterStream,
@@ -322,5 +333,229 @@ describe('AC3 — the watchdog block threshold is NOT moved by this ticket', () 
     // and buy a quieter graph with the same frozen exits. This test is the latch.
     const { DEFAULT_WATCHDOG } = await import('./event-loop-watchdog.js');
     expect(DEFAULT_WATCHDOG.lagMaxMs).toBe(4_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TRA-3660 SECOND INSTANCE (2026-08-18T13:57:33Z) — the lag ledger.
+//
+// The 08-18 trip proved the AC1 instrument is live and proved it is not enough:
+// it recorded `attribution.verdict: unattributed-none` and stopped there. That is
+// not a tuning miss, it is structural — classifyBlockAttribution has exactly one
+// input, `slowSyncPhase`, so a stall built from many sub-threshold sync chunks is
+// unattributable BY CONSTRUCTION. The live reading says that is the shape we
+// have: lagMaxMs 4008 with lagMeanMs 1448, i.e. the loop was delayed ~1.4s on
+// AVERAGE across the window. One clean 4s block cannot produce that mean.
+// ---------------------------------------------------------------------------
+describe('summarizeLagLedger (TRA-3660 second instance)', () => {
+  const S = (over: Partial<LagLedgerSample> = {}): LagLedgerSample => ({
+    atMs: 1_000_000,
+    lagMeanMs: 10,
+    lagMaxMs: 20,
+    phase: 'signal.doTick.otm-scan',
+    phaseElapsedMs: 30_000,
+    ...over,
+  });
+
+  it('names the phase the four verdicts cannot: many sub-threshold chunks, no slow sync phase', () => {
+    // The 08-18 shape, reconstructed: six starved samples inside the window, all
+    // under otm-scan, none of which contains a single nameable sync block.
+    const tripAtMs = 1_000_000;
+    const samples = [
+      ...Array.from({ length: 6 }, (_, i) => S({ atMs: tripAtMs - 5_000 + i * 1_000, lagMeanMs: 1_448, lagMaxMs: 4_008 })),
+    ];
+    const v = summarizeLagLedger({ samples, atMs: tripAtMs, windowMs: 6_008, ringFull: false });
+    expect(v.coverage).toBe('complete');
+    expect(v.top?.name).toBe('signal.doTick.otm-scan');
+    expect(v.top?.share).toBe(1);
+    // And the record it rides on still says the sync instrument found nothing —
+    // the ledger ADDS a name, it does not overwrite the honest null.
+    const classic = classifyBlockAttribution({ reason: 'block', tripAtMs, lagMaxMs: 4_008, sampleMs: 1_000, slowSyncPhase: null });
+    expect(classic.verdict).toBe('unattributed-none');
+  });
+
+  it('splits the lag across phases by SHARE, so the loudest phase is not automatically the culprit', () => {
+    const tripAtMs = 1_000_000;
+    const samples = [
+      S({ atMs: tripAtMs - 3_000, phase: 'signal.doTick.otm-scan', lagMeanMs: 1_400 }),
+      S({ atMs: tripAtMs - 2_000, phase: 'signal.doTick.otm-scan', lagMeanMs: 1_400 }),
+      S({ atMs: tripAtMs - 1_000, phase: 'signal.doTick.quote-batch', lagMeanMs: 200 }),
+    ];
+    const v = summarizeLagLedger({ samples, atMs: tripAtMs, windowMs: 6_000, ringFull: false });
+    expect(v.entries.map((e) => e.name)).toEqual(['signal.doTick.otm-scan', 'signal.doTick.quote-batch']);
+    expect(v.top!.share).toBeCloseTo(2_800 / 3_000, 6);
+    expect(v.lagSumMs).toBe(3_000);
+  });
+
+  it('counts a phase that STARTED AFTER the block as non-straddling — what ran next is not what blocked', () => {
+    // The watchdog timer cannot fire during a block, so the sample lands just
+    // after the loop frees up. A phase 5ms old at that instant did not cause a
+    // 4s stall; folding it in would publish a confident name for innocent code —
+    // the same fossil-vs-fresh error classifyBlockAttribution guards against.
+    const tripAtMs = 1_000_000;
+    const v = summarizeLagLedger({
+      samples: [S({ atMs: tripAtMs - 500, lagMeanMs: 1_400, lagMaxMs: 4_008, phaseElapsedMs: 5 })],
+      atMs: tripAtMs,
+      windowMs: 6_000,
+      ringFull: false,
+    });
+    expect(v.top!.name).toBe('signal.doTick.otm-scan');
+    expect(v.top!.straddleSamples).toBe(0);
+    expect(v.entries[0].samples).toBe(1);
+  });
+
+  it('reports EMPTY rather than a clean-looking zero when no sample falls in the window', () => {
+    // An empty ledger and a ledger that measured no lag are different facts, and
+    // only one of them is evidence. `entries: []` with `top: null` must not be
+    // readable as "no phase was responsible".
+    const v = summarizeLagLedger({
+      samples: [S({ atMs: 1_000_000 - 60_000 })],
+      atMs: 1_000_000,
+      windowMs: 6_000,
+      ringFull: false,
+    });
+    expect(v.coverage).toBe('empty');
+    expect(v.top).toBeNull();
+    expect(v.samples).toBe(0);
+  });
+
+  it('reports TRUNCATED when the ring wrapped and cannot cover the whole window', () => {
+    // Shares over a partially-observed window are a floor, not a measurement.
+    const tripAtMs = 1_000_000;
+    const v = summarizeLagLedger({
+      samples: [S({ atMs: tripAtMs - 2_000 }), S({ atMs: tripAtMs - 1_000 })],
+      atMs: tripAtMs,
+      windowMs: 30_000,
+      ringFull: true,
+    });
+    expect(v.coverage).toBe('truncated');
+    // Same held samples, ring never wrapped ⇒ nothing was lost ⇒ complete.
+    const notFull = summarizeLagLedger({
+      samples: [S({ atMs: tripAtMs - 2_000 }), S({ atMs: tripAtMs - 1_000 })],
+      atMs: tripAtMs,
+      windowMs: 30_000,
+      ringFull: false,
+    });
+    expect(notFull.coverage).toBe('complete');
+  });
+
+  it('never publishes a 100% share off a zero denominator', () => {
+    const tripAtMs = 1_000_000;
+    const v = summarizeLagLedger({
+      samples: [S({ atMs: tripAtMs - 1_000, lagMeanMs: 0, lagMaxMs: 0 })],
+      atMs: tripAtMs,
+      windowMs: 6_000,
+      ringFull: false,
+    });
+    expect(v.top!.share).toBeNull();
+  });
+
+  it('buckets an unnamed phase under a sentinel instead of dropping the sample', () => {
+    // Lag with nothing in flight is itself a finding (GC, native, write(2)); a
+    // dropped sample would inflate every named phase's share.
+    const tripAtMs = 1_000_000;
+    const v = summarizeLagLedger({
+      samples: [
+        S({ atMs: tripAtMs - 2_000, phase: null, phaseElapsedMs: null, lagMeanMs: 900 }),
+        S({ atMs: tripAtMs - 1_000, lagMeanMs: 100 }),
+      ],
+      atMs: tripAtMs,
+      windowMs: 6_000,
+      ringFull: false,
+    });
+    expect(v.top!.name).toBe(LAG_LEDGER_NO_PHASE);
+    expect(v.lagSumMs).toBe(1_000);
+  });
+
+  it('holds a window wide enough for the ring, so a live trip window always fits', () => {
+    // classifyBlockAttribution's widest realistic window is lagMaxMs + sampleMs +
+    // 1000ms slack. At the shipped 4000ms threshold that is ~6s; the ring holds
+    // LAG_LEDGER_RING_MAX samples. If the ring ever shrinks below the window the
+    // trip summary silently degrades to `truncated` on every trip.
+    expect(LAG_LEDGER_RING_MAX * DEFAULT_WATCHDOG.sampleMs).toBeGreaterThan(
+      DEFAULT_WATCHDOG.lagMaxMs + DEFAULT_WATCHDOG.sampleMs + 1_000,
+    );
+  });
+});
+
+describe('the lag ledger is WIRED, not just implemented (TRA-3660)', () => {
+  afterEach(() => {
+    _resetWatchdogForTests();
+  });
+
+  const attributionWith = (activePhase: { name: string; elapsedMs: number } | null) => () => ({
+    lastSlowPhase: null,
+    lastSlowSyncPhase: null,
+    recentSlowPhases: [],
+    activePhase,
+  });
+
+  it('publishes a live ledger naming the in-flight phase, without any trip', () => {
+    // The whole point of reading this off /api/health/watchdog: a subsystem
+    // bleeding lag under the 4s acute threshold is invisible to every trip-based
+    // instrument, so the ledger has to be readable on a box that never tripped.
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 400e6 }),
+      readPhaseAttribution: attributionWith({ name: 'signal.doTick.otm-scan', elapsedMs: 12_837 }),
+      onTrip: () => {},
+    });
+    handle!.sampleNow();
+    handle!.sampleNow();
+    const ledger = getWatchdogStatus()?.lagLedger;
+    expect(ledger).toBeDefined();
+    expect(ledger!.samples).toBe(2);
+    expect(ledger!.entries.map((e) => e.name)).toEqual(['signal.doTick.otm-scan']);
+    expect(getWatchdogStatus()?.tripped).toBe(false);
+    handle!.stop();
+  });
+
+  it('records QUIET samples too — they are the denominator every share is computed against', () => {
+    // If only heavy windows were recorded (the recentHighLag ring's rule), any
+    // phase that ever stalled would read as 100% of the lag and the ledger would
+    // be a list of names, not a measurement.
+    let phase = 'signal.doTick.quote-batch';
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BOOT_GRACE_MS: '0' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 400e6 }),
+      readPhaseAttribution: () => ({
+        lastSlowPhase: null,
+        lastSlowSyncPhase: null,
+        recentSlowPhases: [],
+        activePhase: { name: phase, elapsedMs: 1_000 },
+      }),
+      onTrip: () => {},
+    });
+    handle!.sampleNow();
+    phase = 'signal.doTick.otm-scan';
+    handle!.sampleNow();
+    handle!.sampleNow();
+    const ledger = getWatchdogStatus()!.lagLedger!;
+    expect(ledger.samples).toBe(3);
+    const byName = Object.fromEntries(ledger.entries.map((e) => [e.name, e.samples]));
+    expect(byName['signal.doTick.quote-batch']).toBe(1);
+    expect(byName['signal.doTick.otm-scan']).toBe(2);
+    handle!.stop();
+  });
+
+  it('holds the ledger back during boot grace, then starts once grace expires', () => {
+    // Warmup's legitimate synchronous candle-load blocks must not enter the
+    // evidence — same rule peakSinceBoot already follows. The second half of this
+    // test is what keeps the first half from being vacuous: an instrument that
+    // NEVER records would also pass a bare toBeUndefined().
+    let clock = 1_000_000;
+    const handle = startEventLoopWatchdog({
+      env: { WATCHDOG_BOOT_GRACE_MS: '120000' },
+      readHeap: () => ({ usedBytes: 100e6, limitBytes: 1536e6, rssBytes: 400e6 }),
+      readPhaseAttribution: attributionWith({ name: 'boot.candle-load', elapsedMs: 9_000 }),
+      now: () => clock,
+      onTrip: () => {},
+    });
+    handle!.sampleNow();
+    expect(getWatchdogStatus()?.lagLedger).toBeUndefined();
+    clock += 120_001;
+    handle!.sampleNow();
+    expect(getWatchdogStatus()?.lagLedger?.samples).toBe(1);
+    handle!.stop();
   });
 });

@@ -180,6 +180,20 @@ export interface BlockAttribution {
   syncPhaseAgeMs: number | null;
   /** Share of the measured lag the considered `sync` phase accounts for, or null. */
   explainedFraction: number | null;
+  /**
+   * TRA-3660 (2026-08-19, second instance) — the SAMPLER's own view of the same
+   * window, which does not depend on a slow sync phase existing at all.
+   *
+   * The four verdicts above have exactly one input: `slowSyncPhase`. That field is
+   * written only when a SINGLE synchronous section crosses the slow threshold, so
+   * a stall assembled from many sub-threshold chunks is `unattributed-none` by
+   * construction — no threshold tuning reaches it, and both live instances read
+   * exactly that. The lag ledger closes that class: the watchdog already samples
+   * loop delay every `sampleMs` and already knows which phase was in flight, so
+   * summing lag per active phase names the subsystem even when no individual
+   * chunk is nameable. Absent when the ledger is not being kept.
+   */
+  sampler?: SamplerAttribution;
 }
 
 /**
@@ -230,6 +244,139 @@ export function classifyBlockAttribution(input: {
     return { verdict: 'partial', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
   }
   return { verdict: 'attributed', windowMs, syncPhaseAgeMs: ageMs, explainedFraction: explained };
+}
+
+/**
+ * TRA-3660 — one watchdog sample, tagged with the phase that was in flight when
+ * it fired. The ledger is built from these; keeping the raw samples (rather than
+ * only running totals) is what lets the trip record re-summarize over the trip's
+ * own candidate window instead of over all of uptime.
+ */
+export interface LagLedgerSample {
+  atMs: number;
+  lagMeanMs: number;
+  lagMaxMs: number;
+  /** Active phase name at sample time, or null when nothing was in flight. */
+  phase: string | null;
+  /** How long that phase had been running at sample time, or null. */
+  phaseElapsedMs: number | null;
+}
+
+/** Per-phase roll-up of {@link LagLedgerSample}s inside one window. */
+export interface LagLedgerEntry {
+  name: string;
+  samples: number;
+  /** Σ `lagMeanMs` over this phase's samples — the phase's share of the stall. */
+  lagSumMs: number;
+  /** Worst single-sample `lagMaxMs` seen under this phase. */
+  lagMaxMs: number;
+  /**
+   * How many of `samples` had the phase ALREADY RUNNING when their block began
+   * (`phaseElapsedMs >= lagMaxMs`). This is the honesty check on the whole
+   * instrument: the watchdog timer cannot fire during a block, so a sample lands
+   * just after the loop frees up. If the phase started after the block did, it
+   * cannot be the culprit — it is merely what ran next. Only straddling samples
+   * support a causal read; the rest are coincidence and are counted separately
+   * rather than quietly folded in.
+   */
+  straddleSamples: number;
+}
+
+/**
+ * TRA-3660 — the sampler's attribution of a window's lag, by active phase.
+ */
+export interface SamplerAttribution {
+  /** How far back from `atMs` the window reaches. */
+  windowMs: number;
+  /** Samples that fell inside the window. */
+  samples: number;
+  /** Σ `lagMeanMs` across those samples. */
+  lagSumMs: number;
+  /**
+   * - `empty`     — no samples in the window; the ledger says NOTHING. Never read
+   *                 this as "no phase was responsible".
+   * - `truncated` — the ring was full and its oldest sample is NEWER than the
+   *                 window start, so samples that belong in the window were
+   *                 evicted. Shares computed over a truncated window are a floor,
+   *                 not a measurement.
+   * - `complete`  — the ring covers the whole window.
+   */
+  coverage: 'empty' | 'truncated' | 'complete';
+  /** Phases sorted by `lagSumMs`, descending. */
+  entries: LagLedgerEntry[];
+  /**
+   * The heaviest phase and its share of `lagSumMs`, or null when the window is
+   * empty. Null share when `lagSumMs` is 0 — a share of nothing is not 100%.
+   */
+  top: { name: string; lagSumMs: number; share: number | null; straddleSamples: number } | null;
+}
+
+/** Sentinel for samples that fired with no phase in flight. */
+export const LAG_LEDGER_NO_PHASE = '(no-phase)';
+
+/**
+ * How many samples the ledger ring holds. At the default 1000ms sampling that is
+ * ~64s of history, which covers any candidate window `classifyBlockAttribution`
+ * can produce (`lagMaxMs + sampleMs + 1000ms`) with room to spare, while staying
+ * a fixed, bounded cost that cannot leak with uptime.
+ */
+export const LAG_LEDGER_RING_MAX = 64;
+
+/**
+ * Roll a ledger ring up into a per-phase attribution over `[atMs - windowMs, atMs]`.
+ * Pure, for the same reason {@link classifyBlockAttribution} is: the verdict must
+ * be assertable without timers, a live process, or a real stall.
+ *
+ * `ringFull` is passed in rather than inferred from `samples.length` because a
+ * ring that has never wrapped and one that just wrapped are indistinguishable by
+ * length alone, and only the second can be silently missing history.
+ */
+export function summarizeLagLedger(input: {
+  samples: readonly LagLedgerSample[];
+  atMs: number;
+  windowMs: number;
+  ringFull: boolean;
+}): SamplerAttribution {
+  const windowMs = Math.max(0, input.windowMs);
+  const startMs = input.atMs - windowMs;
+  const inWindow = input.samples.filter((s) => s.atMs >= startMs && s.atMs <= input.atMs);
+  if (inWindow.length === 0) {
+    return { windowMs, samples: 0, lagSumMs: 0, coverage: 'empty', entries: [], top: null };
+  }
+  const oldestHeldMs = input.samples.length > 0 ? Math.min(...input.samples.map((s) => s.atMs)) : input.atMs;
+  const coverage: SamplerAttribution['coverage'] = input.ringFull && oldestHeldMs > startMs ? 'truncated' : 'complete';
+
+  const byPhase = new Map<string, LagLedgerEntry>();
+  let lagSumMs = 0;
+  for (const s of inWindow) {
+    const lagMean = Number.isFinite(s.lagMeanMs) ? Math.max(0, s.lagMeanMs) : 0;
+    const lagMax = Number.isFinite(s.lagMaxMs) ? Math.max(0, s.lagMaxMs) : 0;
+    lagSumMs += lagMean;
+    const name = s.phase ?? LAG_LEDGER_NO_PHASE;
+    const entry = byPhase.get(name) ?? { name, samples: 0, lagSumMs: 0, lagMaxMs: 0, straddleSamples: 0 };
+    entry.samples += 1;
+    entry.lagSumMs += lagMean;
+    if (lagMax > entry.lagMaxMs) entry.lagMaxMs = lagMax;
+    if (s.phaseElapsedMs != null && s.phaseElapsedMs >= lagMax) entry.straddleSamples += 1;
+    byPhase.set(name, entry);
+  }
+  const entries = [...byPhase.values()].sort((a, b) => b.lagSumMs - a.lagSumMs || a.name.localeCompare(b.name));
+  const head = entries[0];
+  return {
+    windowMs,
+    samples: inWindow.length,
+    lagSumMs,
+    coverage,
+    entries,
+    top: head
+      ? {
+          name: head.name,
+          lagSumMs: head.lagSumMs,
+          share: lagSumMs > 0 ? head.lagSumMs / lagSumMs : null,
+          straddleSamples: head.straddleSamples,
+        }
+      : null,
+  };
 }
 
 // TRA-1463 — periodic LIVENESS breadcrumb. `lastTrip` above only records a
@@ -951,6 +1098,14 @@ export interface WatchdogStatus {
    * single `/api/health/watchdog` poll. Absent when the meter is not installed.
    */
   stdio?: StdioBlockSnapshot;
+  /**
+   * TRA-3660 — live per-phase lag ledger over the ring's own span, readable
+   * WITHOUT waiting for a trip. A subsystem that is bleeding 1.4s of mean lag per
+   * sample but never crosses the 4s acute threshold is invisible to every
+   * trip-based instrument and shows up here immediately. Absent until the first
+   * post-grace sample.
+   */
+  lagLedger?: SamplerAttribution;
 }
 
 export interface WatchdogHandle {
@@ -1117,6 +1272,13 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
   let peakSinceBoot: { lagMaxMs: number; lagMeanMs: number; atMs: number } | null = null;
   let peakRssSinceBoot: { rssBytes: number; externalBytes?: number; arrayBuffersBytes?: number; atMs: number } | null = null;
   const recentHighLag: Array<{ lagMaxMs: number; lagMeanMs: number; atMs: number }> = [];
+  // TRA-3660 — the lag ledger ring. Every post-grace sample is tagged with the
+  // phase in flight, so lag can be summed PER PHASE. This is the only instrument
+  // here that can name a stall assembled from many sub-threshold sync chunks,
+  // which is the shape both live instances had (`slowSyncPhase: null` with a
+  // 1448ms MEAN lag — sustained degradation, not one clean block).
+  const lagLedger: LagLedgerSample[] = [];
+  let lagLedgerFull = false;
 
   function publish(sample: WatchdogSample): void {
     const atMs = Date.now();
@@ -1146,6 +1308,21 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       if (sample.lagMaxMs >= HIGH_LAG_RECORD_MS) {
         recentHighLag.push({ lagMaxMs: sample.lagMaxMs, lagMeanMs: sample.lagMeanMs, atMs });
         if (recentHighLag.length > HIGH_LAG_RING_MAX) recentHighLag.shift();
+      }
+      // TRA-3660 — tag EVERY post-grace sample, not just the heavy ones. The
+      // recentHighLag ring above only keeps >=1000ms windows, so it cannot
+      // measure a phase's SHARE of the lag: without the quiet samples in the
+      // denominator every phase that ever stalled reads as 100%.
+      lagLedger.push({
+        atMs,
+        lagMeanMs: sample.lagMeanMs,
+        lagMaxMs: sample.lagMaxMs,
+        phase: phaseAttribution.activePhase?.name ?? null,
+        phaseElapsedMs: phaseAttribution.activePhase?.elapsedMs ?? null,
+      });
+      if (lagLedger.length > LAG_LEDGER_RING_MAX) {
+        lagLedger.shift();
+        lagLedgerFull = true;
       }
     }
     // TRA-1463 — throttled last-known-alive heartbeat to the DATA_DIR disk. Written
@@ -1190,6 +1367,18 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
       priorLiveness,
       phaseAttribution,
       ...(livePublishStdio ? { stdio: livePublishStdio } : {}),
+      ...(lagLedger.length > 0
+        ? {
+            lagLedger: summarizeLagLedger({
+              samples: lagLedger,
+              atMs,
+              // The ring's own span: a live read is "where did lag go recently",
+              // not a trip window. +1 sample so the oldest entry is inside it.
+              windowMs: (LAG_LEDGER_RING_MAX + 1) * cfg.sampleMs,
+              ringFull: lagLedgerFull,
+            }),
+          }
+        : {}),
     };
   }
 
@@ -1268,6 +1457,17 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
           sampleMs: cfg.sampleMs,
           slowSyncPhase: tripAttribution.lastSlowSyncPhase,
         });
+        // TRA-3660 — attach the sampler's own view of the SAME candidate window.
+        // `publish(sample)` ran on line ~1250 above, so this trip's sample is
+        // already in the ring and the ledger includes the stalling window itself.
+        if (decision.reason === 'block' || decision.reason === 'lag') {
+          attribution.sampler = summarizeLagLedger({
+            samples: lagLedger,
+            atMs: tripAtMs,
+            windowMs: attribution.windowMs,
+            ringFull: lagLedgerFull,
+          });
+        }
         const stdio = readStdio();
         if (attribution.verdict.startsWith('unattributed') || attribution.verdict === 'partial') {
           // The one line a future reader needs in the Render tape when the durable
@@ -1283,6 +1483,15 @@ export function startEventLoopWatchdog(opts: StartWatchdogOptions = {}): Watchdo
             stdioSlowWrites: stdio?.slowWrites ?? null,
             topEmitters: stdio?.topEmitters ?? null,
             windowLines: stdio?.windowLines ?? null,
+            // TRA-3660 — the sampler's answer rides the SAME line. `verdict`
+            // above says only that no sync phase explains it; these say which
+            // subsystem was holding the loop while it went unexplained. Message
+            // text is unchanged so existing log graders keep matching.
+            samplerCoverage: attribution.sampler?.coverage ?? null,
+            samplerTopPhase: attribution.sampler?.top?.name ?? null,
+            samplerTopShare: attribution.sampler?.top?.share ?? null,
+            samplerTopStraddleSamples: attribution.sampler?.top?.straddleSamples ?? null,
+            samplerSamples: attribution.sampler?.samples ?? null,
           });
         }
         persistTripRecord(
