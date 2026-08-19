@@ -70,6 +70,26 @@ export function engineBasisRestatementLogPath(dir: string): string {
   return join(dir, ENGINE_BASIS_RESTATEMENT_FILENAME);
 }
 
+/**
+ * TRA-3846 — the persistence root, bound ONCE at boot by `index.ts` from
+ * `resolveDataDir()` (the TRA-522/TRA-2603 guarded resolver; a raw env read
+ * here would take a present-but-blank `DATA_DIR` at face value and mint a
+ * directory literally named `" "`). Mirrors the
+ * fee/slippage ledger's design: a process that never booted the server — unit
+ * tests, ad-hoc CLIs — leaves this null and the append below stays a no-op,
+ * so exercising an account in a test cannot write into a real data root.
+ */
+let configuredDataDir: string | null = null;
+
+export function configureEngineBasisRestatementLog(dir: string): void {
+  configuredDataDir = dir;
+}
+
+/** The boot-configured root, or undefined before/without boot (append skips). */
+export function engineBasisRestatementDataDir(): string | undefined {
+  return configuredDataDir ?? undefined;
+}
+
 /** Test seam. */
 export function clearEngineBasisRestatementLogErrors(): void {
   appendErrors = 0;

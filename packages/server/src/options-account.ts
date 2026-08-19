@@ -53,7 +53,7 @@ import {
   recordedOpenFillCount,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
-import { appendEngineBasisRestatement } from './engine-basis-restatement-log.js';
+import { appendEngineBasisRestatement, engineBasisRestatementDataDir } from './engine-basis-restatement-log.js';
 // TRA-3829 — the adoption AUTHORISATION predicate. `option-exec-flag.ts` imports
 // nothing from this module, so this direction is acyclic.
 import { engineMayActOnAdoptedRow, isEngineActionOnAdoptedRowsArmed } from './option-exec-flag.js';
@@ -7169,7 +7169,7 @@ export class PaperOptionsAccount {
     // rows arrive at most ~once a day, so an in-memory-only record would very
     // likely be wiped before it was ever read — and an empty buffer after a
     // restart reads exactly like "the restatement never fired".
-    appendEngineBasisRestatement(process.env['DATA_DIR'], { ...rec });
+    appendEngineBasisRestatement(engineBasisRestatementDataDir(), { ...rec });
   }
 
   /**

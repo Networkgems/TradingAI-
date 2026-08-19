@@ -259,7 +259,10 @@ import { hydrateCostAwareGateFromDisk } from './cost-aware-gate-ledger.js';
 // admits on. Without it the first candidates after every process start decline
 // blind under a reason code that reads exactly like a measured verdict.
 import { initTapeExpectancyCache } from './option-tape-expectancy-cache.js';
-import { readEngineBasisRestatements } from './engine-basis-restatement-log.js';
+import {
+  configureEngineBasisRestatementLog,
+  readEngineBasisRestatements,
+} from './engine-basis-restatement-log.js';
 import { hydrateGiveBackArmFloorFromDisk, summarizeGiveBackArmFloor } from './giveback-arm-floor-ledger.js';
 // TRA-3810 — the DURABLE record of live-arm demotion attempts, and the three-state
 // instrument that replaces the since-boot `bootArmWriteRepairs` counter as an alarm basis.
@@ -4693,6 +4696,12 @@ async function runHourlyCryptoRegimeTsmom(): Promise<void> {
     });
   }
 }
+
+// TRA-3846 — bind the TRA-3010 engine-basis restatement ledger to the same resolved
+// root the read route uses, so writer and reader can never disagree on the path. A
+// process that skips boot (tests, CLIs) leaves the log unconfigured and its append
+// stays a no-op.
+configureEngineBasisRestatementLog(DATA_DIR);
 
 // TRA-2810 — the fee back-fill pass resolves the live operator's PRODUCTION options
 // client exactly like the TRA-1954 admin reconcile route. Null when no production
@@ -13690,7 +13699,7 @@ app.get('/api/options/basis-restatements', requireAuth, async (req, res) => {
       : (settings.liveTradierEnvOptions ?? 'sandbox');
   const memory = ctx.engine.getEngineBasisRestatementCensus(env);
   const sweeps = ctx.engine.getEngineBasisSweepWitness();
-  const durable = readEngineBasisRestatements(process.env['DATA_DIR']);
+  const durable = readEngineBasisRestatements(DATA_DIR);
   res.json({
     ok: true,
     env,
