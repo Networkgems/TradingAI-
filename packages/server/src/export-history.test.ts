@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildExport, type ExportFilters } from './export.js';
 import {
   checkExportRangeServable,
+  coverageHeaderValue,
   journalFloorForMode,
   resolveExportCoverage,
   rowFromJournalRecord,
@@ -20,6 +21,14 @@ import type { OptionTradeJournalRecord } from './option-trade-journal.js';
 // from the in-memory book four hours before QA ran the export. Every assertion in
 // AC1 is against those exact values rather than a synthetic shape, so a change
 // that merely makes ranges non-empty cannot satisfy it.
+//
+// ⚠️ The SPY row's -$278 is the value AS FILED, and the live journal no longer
+// holds it: TRA-2819/TRA-3730's close-basis restatement has since rewritten that
+// row to -$156.23 (`feesUsd: 0.23`, `realizedPnlUsdBeforeRestatement: -278`), so
+// the live export totals -$271.23 rather than -$393. That is a different ticket's
+// writer moving the money, not this route mis-reading it — and these fixtures are
+// deliberately pinned to the filed numbers so this suite keeps testing THIS
+// change instead of tracking someone else's restatements.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The 2026-08-19T01:00:06.467Z archive tick from the incident log line. */
@@ -30,7 +39,7 @@ const PROCESS_START = Date.parse('2026-08-19T05:00:00.000Z');
 function journalRow(over: Partial<OptionTradeJournalRecord> = {}): OptionTradeJournalRecord {
   return {
     id: 'row-1',
-    openTs: Date.parse('2026-08-17T14:26:42.923Z'),
+    openTs: Date.parse('2026-08-17T13:46:42.923Z'),
     symbol: 'PLTR',
     structure: 'tradier_import',
     mode: 'live',
@@ -42,7 +51,7 @@ function journalRow(over: Partial<OptionTradeJournalRecord> = {}): OptionTradeJo
     atRiskUsd: 152,
     account: 'admin',
     outcome: 'LOSS',
-    closeTs: Date.parse('2026-08-18T14:50:14.833Z'),
+    closeTs: Date.parse('2026-08-18T13:30:14.833Z'),
     realizedPnlUsd: -115.00000000000001,
     realizedR: -0.7565789473684211,
     exitReason: 'sl',
@@ -59,8 +68,8 @@ const LIVE_0818: OptionTradeJournalRecord[] = [
     id: 'row-2',
     symbol: 'SPY',
     optionSymbol: 'SPY260821C00777000',
-    openTs: Date.parse('2026-08-17T17:44:49.377Z'),
-    closeTs: Date.parse('2026-08-18T15:05:40.706Z'),
+    openTs: Date.parse('2026-08-17T17:04:49.377Z'),
+    closeTs: Date.parse('2026-08-18T13:45:40.706Z'),
     atRiskUsd: 219,
     realizedPnlUsd: -278,
     realizedR: -1.269406392694064,
@@ -98,7 +107,7 @@ describe('TRA-3860 AC1 — an archived day is served, with its exit reasons', ()
     // The floor moved back to the earliest event the journal holds for this
     // book — the PLTR open — not to the earliest close, which sits nine hours
     // INSIDE the requested day and would refuse the very query QA filed.
-    expect(coverage.options.since).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    expect(coverage.options.since).toBe(Date.parse('2026-08-17T13:46:42.923Z'));
     expect(coverage.options.source).toBe('option-trade-journal');
 
     expect(checkExportRangeServable(filters, coverage).ok).toBe(true);
@@ -142,7 +151,7 @@ describe('TRA-3860 AC1 — an archived day is served, with its exit reasons', ()
 
 describe('TRA-3860 AC2 — the fix must DISCRIMINATE, not just return more rows', () => {
   it('a day fully INSIDE coverage that genuinely had no trades is served as 0', () => {
-    // 2026-08-19 sits after the journal's floor for this book (2026-08-17T14:26Z)
+    // 2026-08-19 sits after the journal's floor for this book (2026-08-17T13:46Z)
     // and nothing closed on it. Served, and EMPTY — that is the answer, not the
     // bug. This is the assertion that fails a "make every range non-empty"
     // change, which the filing ticket called out as worse than the defect.
@@ -243,9 +252,9 @@ describe('TRA-3860 — the coverage floor itself', () => {
     const coverage = coverageFor(rows, filters);
 
     expect(journalFloorForMode(rows, 'demo')).toBe(Date.parse('2026-08-10T18:00:00.000Z'));
-    expect(journalFloorForMode(rows, 'live')).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    expect(journalFloorForMode(rows, 'live')).toBe(Date.parse('2026-08-17T13:46:42.923Z'));
     // MAX, not MIN.
-    expect(coverage.options.since).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    expect(coverage.options.since).toBe(Date.parse('2026-08-17T13:46:42.923Z'));
     expect(checkExportRangeServable(filters, coverage).ok).toBe(false);
 
     // Ask for demo alone and the same `from` IS servable.
@@ -286,6 +295,62 @@ describe('TRA-3860 — the coverage floor itself', () => {
       'PLTR260821C00180000',
       'SPY260821C00777000',
     ]);
+  });
+});
+
+describe('TRA-3860 — the X-Export-Coverage header value', () => {
+  // Regression, measured on live bqb1: the first cut set the header to a bare
+  // `JSON.stringify(coverage)`. `res.setHeader` rejects any character outside
+  // latin1 with ERR_INVALID_CHAR, and the coverage note is human prose carrying
+  // an em-dash — so EVERY CSV export, the route's DEFAULT format, returned 500.
+  it('is pure printable ASCII even when the coverage note is not', () => {
+    const coverage = coverageFor(LIVE_0818, { markets: ['options'], modes: ['live'] });
+    // The note really does contain the character that broke it.
+    expect(coverage.note).toMatch(/[^\x20-\x7E]/);
+
+    const header = coverageHeaderValue(coverage);
+    expect(header).not.toMatch(/[^\x20-\x7E]/);
+    // Still machine-readable, and still carries the floors a reader needs.
+    const parsed = JSON.parse(header);
+    expect(parsed.options.sinceIso).toBe('2026-08-17T13:46:42.923Z');
+    expect(parsed.options.source).toBe('option-trade-journal');
+    // The prose lives in the JSON body, not on every CSV response.
+    expect(parsed.note).toBeUndefined();
+    expect(parsed.noteIn).toContain('summary.coverage.note');
+  });
+
+  it('survives a note deliberately seeded with astral and control characters', () => {
+    const coverage = coverageFor([], { markets: ['options'], modes: ['live'] });
+    const header = coverageHeaderValue({ ...coverage, note: 'x\u{1F600} —y' });
+    expect(header).not.toMatch(/[^\x20-\x7E]/);
+    expect(() => JSON.parse(header)).not.toThrow();
+  });
+});
+
+describe('TRA-3860 — the refusal names the constraint that actually binds', () => {
+  it('blames the journal floor for options and the archive for stocks', () => {
+    const optionsOnly: ExportFilters = {
+      markets: ['options'],
+      modes: ['live'],
+      from: Date.parse('2026-07-01T00:00:00.000Z'),
+    };
+    const o = checkExportRangeServable(optionsOnly, coverageFor(LIVE_0818, optionsOnly));
+    expect(o.ok).toBe(false);
+    if (o.ok) return;
+    // Sending a reader to the archive for a journal-bound refusal is the same
+    // class of defect as the empty 200 this route is being fixed for.
+    expect(o.refusal.detail).toContain('option-trade journal only begins recording');
+    expect(o.refusal.detail).not.toContain('21:00 ET archive');
+
+    const stocksOnly: ExportFilters = {
+      markets: ['stocks'],
+      modes: ['live'],
+      from: Date.parse('2026-08-18T00:00:00.000Z'),
+    };
+    const s = checkExportRangeServable(stocksOnly, coverageFor(LIVE_0818, stocksOnly));
+    expect(s.ok).toBe(false);
+    if (s.ok) return;
+    expect(s.refusal.detail).toContain('21:00 ET archive');
   });
 });
 

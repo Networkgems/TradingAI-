@@ -740,6 +740,7 @@ import {
 // answering an unservable historical range with an empty 200.
 import {
   checkExportRangeServable,
+  coverageHeaderValue,
   resolveExportCoverage,
   selectJournalExportRows,
 } from './export-history.js';
@@ -9488,7 +9489,12 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       // complete record. The RFC-4180 body is deliberately left byte-identical —
       // a comment line ahead of the header row would break every consumer that
       // parses it, and the column list is the published §2.3 schema.
-      res.setHeader('X-Export-Coverage', JSON.stringify(coverage));
+      //
+      // ⚠️ Through `coverageHeaderValue`, NEVER a bare `JSON.stringify`.
+      // `setHeader` rejects non-latin1, the coverage note is prose and holds an
+      // em-dash, and the first cut of this line made every CSV export — the
+      // route's DEFAULT format — a 500 on live bqb1.
+      res.setHeader('X-Export-Coverage', coverageHeaderValue(coverage));
       res.send(toCsv(rows));
     }
   } catch (err) {

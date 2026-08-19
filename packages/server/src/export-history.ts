@@ -232,6 +232,38 @@ export function resolveExportCoverage(input: CoverageInput): ExportCoverage {
   };
 }
 
+/**
+ * The `X-Export-Coverage` header value: the coverage floors as compact,
+ * GUARANTEED-ASCII JSON.
+ *
+ * Two things this exists to prevent, both measured on live bqb1:
+ *
+ * **1. It must not throw.** `res.setHeader` rejects any character outside
+ * latin1 with `ERR_INVALID_CHAR`. {@link ExportCoverage.note} is human prose and
+ * contains an em-dash (U+2014), so passing the whole object through
+ * `JSON.stringify` turned EVERY CSV export — the route's DEFAULT format — into a
+ * `500`. Escaping is done here, once, rather than trusting future edits of a
+ * prose string to stay ASCII: the note is written to be read by humans and will
+ * drift again.
+ *
+ * **2. It must stay a header.** The prose `note` is dropped, not escaped into
+ * the header: a header is for the machine-readable floors, the JSON body carries
+ * the full statement, and a multi-hundred-byte prose blob on every CSV response
+ * is a cost with no reader. `noteIn` names where to find it.
+ */
+export function coverageHeaderValue(coverage: ExportCoverage): string {
+  const { note: _note, ...floors } = coverage;
+  const json = JSON.stringify({
+    ...floors,
+    noteIn: 'summary.coverage.note of the JSON export (TRA-3860)',
+  });
+  // `\uXXXX`-escape everything outside printable ASCII. JSON parses the escapes
+  // back to the identical string, so the value stays machine-readable.
+  return json.replace(/[^\x20-\x7E]/g, ch =>
+    `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 export interface RangeRefusal {
   error: string;
   detail: string;
@@ -275,15 +307,40 @@ export function checkExportRangeServable(
       : `${m}: coverage begins ${c.sinceIso} (${c.source})`;
   });
 
+  // Name the constraint that ACTUALLY binds, per market. Blaming the archive for
+  // an options refusal — whose floor is the journal's start — would send a reader
+  // to the wrong cause, which is the same class of defect as the empty 200 this
+  // route is being fixed for.
+  const sources = new Set(unservable.map(m => coverage[m].source));
+  const causes: string[] = [];
+  if (sources.has('archive-boundary')) {
+    causes.push(
+      'the daily 21:00 ET archive (TRA-219) clears the in-memory closed-trade buckets',
+    );
+  }
+  if (sources.has('process-start')) {
+    causes.push(
+      'this process has not yet observed an archive tick on this book, so it can only attest '
+      + 'from its own start (conservative — it refuses some ranges it may in fact hold)',
+    );
+  }
+  if (sources.has('option-trade-journal')) {
+    causes.push(
+      'the durable option-trade journal only begins recording this book at the date above',
+    );
+  }
+  if (sources.has('unknown')) {
+    causes.push('there is no boundary this route can attest with at all');
+  }
+
   return {
     ok: false,
     refusal: {
       error: 'from is earlier than this export can attest to',
       detail:
         `Requested from=${new Date(from).toISOString()}. ${parts.join('; ')}. `
-        + 'The daily 21:00 ET archive (TRA-219) clears the in-memory closed-trade buckets, so '
-        + 'this route cannot serve a range that starts before the boundary for the markets '
-        + 'listed. It refuses rather than returning 0 trades, because an empty result over an '
+        + `Cause: ${causes.join('; ')}. `
+        + 'It refuses rather than returning 0 trades, because an empty result over an '
         + 'unservable range is indistinguishable from a range that genuinely had no trades '
         + '(TRA-3860). Narrow `from`, drop the unservable markets, or read the archived day '
         + 'from the EOD report / option-trade journal.',
