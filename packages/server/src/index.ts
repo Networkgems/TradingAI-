@@ -6318,6 +6318,20 @@ app.get('/api/health/pnl-reconciliation', async (_req, res) => {
       // CORRECT to be (TRA-2641 slaving — see the note on the summarizer).
       // Read `journalDayCellGradeableCount` beside the verdict: green over an
       // empty cohort is the manufactured pass this endpoint has shipped twice.
+      //
+      // ⛔ TRA-3867 — DO NOT BIND A GATE OR A DASHBOARD LIGHT TO
+      // `journalDayCellAgreementOk` / `liveJournalDayCellAgreementOk`. TRA-3864
+      // was ruled (b) FREEZE, and `planOptionsDailyPnlRepair` moves a cell only
+      // from an exact 0.00 (TRA-2079), so the 3 ruled cells can NEVER retire and
+      // those two fields are `false` PERMANENTLY on a correctly behaving box.
+      // They are the raw identity, kept so the divergence stays visible.
+      //
+      // Gate on `journalDayCellNoNewSupersessionOk` (and its `live*` twin)
+      // instead: it grades only cells OUTSIDE the pinned, published
+      // `journalDayCellAcknowledgedCells` set, so `false` means a NEW, UNRULED
+      // divergence arrived and `true` is reachable. The 3 keep publishing in
+      // `journalDayCellSupersededBooks`/`journalDayCellSupersededCount` under
+      // both — the exemption suppresses a verdict, never a row.
       ...summarizeJournalDayCellAgreement(engines),
       // TRA-2635 (CEO) — THE MONEY QUESTION, and it is a different question from
       // the tripwire above. The lag signature reads CLEAN on a book where the

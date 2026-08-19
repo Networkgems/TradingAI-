@@ -6,6 +6,7 @@ import {
   liveOptionsOnsetEtDate,
   summarizeLiveLagTripwire,
   summarizeJournalDayCellAgreement,
+  ACKNOWLEDGED_JOURNAL_DAY_CELL_SUPERSESSIONS,
   summarizeLiveCreditObservation,
   summarizeLiveEodRowPresence,
   summarizeLiveCombinedAgreement,
@@ -3822,5 +3823,168 @@ describe('TRA-3864 — the fleet fold names the LIVE books', () => {
     ]);
     expect(s.liveJournalDayCellAgreementOk).toBe(false);
     expect(s.journalDayCellAgreementOk).toBe(false);
+  });
+});
+describe('TRA-3867 — the gateable verdict subtracts the RULED set, and only that set', () => {
+  // Same shape as the TRA-3864 helper above, re-declared so this block reads
+  // standalone and a later edit to that one cannot silently move these.
+  const book = (
+    username: string,
+    mode: string,
+    dates: string[],
+    gradeable: number,
+    maxDelta: number | null,
+  ) => ({
+    username,
+    mode,
+    journalAgreementOk: dates.length > 0 ? false : gradeable > 0 ? true : null,
+    journalSupersededDates: dates,
+    journalAgreementGradeableCount: gradeable,
+    maxJournalSupersessionUsd: maxDelta,
+  });
+
+  /** The 2026-08-19T22:5xZ live bqb1 fleet, to the cell. */
+  const LIVE_FLEET = () => [
+    book('admin', 'live', ['2026-08-11', '2026-08-18'], 67, 121.77),
+    book('qa_mirror_1578_38096', 'demo', ['2026-07-28'], 40, 63),
+    book('v0nni', 'live', [], 20, 0),
+    book('quiet', 'demo', [], 726, 0),
+  ];
+
+  it('the live fleet as it stands: raw identity RED, gateable verdict GREEN', () => {
+    const s = summarizeJournalDayCellAgreement(LIVE_FLEET());
+    // The raw identity is unmoved and STILL RED — the 3 are not hidden.
+    expect(s.journalDayCellAgreementOk).toBe(false);
+    expect(s.liveJournalDayCellAgreementOk).toBe(false);
+    expect(s.journalDayCellSupersededCount).toBe(3);
+    expect(s.journalDayCellSupersededBooks).toEqual([
+      { username: 'admin', mode: 'live', dates: ['2026-08-11', '2026-08-18'], maxDeltaUsd: 121.77 },
+      { username: 'qa_mirror_1578_38096', mode: 'demo', dates: ['2026-07-28'], maxDeltaUsd: 63 },
+    ]);
+    // ...and the gateable one is reachable-green, because all 3 are ruled.
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(true);
+    expect(s.liveJournalDayCellNoNewSupersessionOk).toBe(true);
+    expect(s.journalDayCellUnacknowledgedCount).toBe(0);
+    expect(s.journalDayCellUnacknowledgedBooks).toEqual([]);
+    expect(s.liveJournalDayCellUnacknowledgedBooks).toEqual([]);
+    expect(s.journalDayCellStaleAcknowledgements).toEqual([]);
+  });
+
+  // ── THE WHOLE POINT OF THE TICKET ────────────────────────────────────────
+  // A 4th cell arriving must be distinguishable FROM THE FIELD A GATE BINDS TO.
+  // Before this change both states rendered `journalDayCellAgreementOk: false`.
+  it('a 4th, UNRULED divergence flips the gateable verdict while the raw one cannot move', () => {
+    const before = summarizeJournalDayCellAgreement(LIVE_FLEET());
+    const after = summarizeJournalDayCellAgreement([
+      book('admin', 'live', ['2026-08-11', '2026-08-18', '2026-08-19'], 68, 121.77),
+      book('qa_mirror_1578_38096', 'demo', ['2026-07-28'], 40, 63),
+      book('v0nni', 'live', [], 20, 0),
+      book('quiet', 'demo', [], 726, 0),
+    ]);
+    // The old field is INDISTINGUISHABLE across the two states. That is the bug.
+    expect(before.journalDayCellAgreementOk).toBe(after.journalDayCellAgreementOk);
+    expect(before.liveJournalDayCellAgreementOk).toBe(after.liveJournalDayCellAgreementOk);
+    // The new one is not.
+    expect(before.journalDayCellNoNewSupersessionOk).toBe(true);
+    expect(after.journalDayCellNoNewSupersessionOk).toBe(false);
+    expect(after.liveJournalDayCellNoNewSupersessionOk).toBe(false);
+    expect(after.journalDayCellUnacknowledgedCount).toBe(1);
+    expect(after.journalDayCellUnacknowledgedBooks).toEqual([
+      { username: 'admin', mode: 'live', dates: ['2026-08-19'] },
+    ]);
+    expect(after.liveJournalDayCellUnacknowledgedBooks).toEqual([
+      { username: 'admin', dates: ['2026-08-19'] },
+    ]);
+    // ...and the 3 ruled cells STILL publish. The exemption suppresses a
+    // verdict, never a row: the count must read 4, not 1.
+    expect(after.journalDayCellSupersededCount).toBe(4);
+  });
+
+  it('a 4th on a DEMO book goes red fleet-wide and leaves the live verdict green', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('admin', 'live', ['2026-08-11', '2026-08-18'], 67, 121.77),
+      book('some_demo', 'demo', ['2026-08-19'], 12, 5),
+    ]);
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(false);
+    expect(s.liveJournalDayCellNoNewSupersessionOk).toBe(true);
+    expect(s.liveJournalDayCellUnacknowledgedBooks).toEqual([]);
+  });
+
+  // The acknowledgement is keyed on username|mode|date, all three. A ruled cell
+  // is a ruled CELL, not a ruled book and not a ruled date.
+  it('the exemption does not leak across book, mode, or date', () => {
+    const notTheSameBook = summarizeJournalDayCellAgreement([
+      book('someone_else', 'live', ['2026-08-18'], 5, 121.77),
+    ]);
+    expect(notTheSameBook.journalDayCellNoNewSupersessionOk).toBe(false);
+
+    const notTheSameMode = summarizeJournalDayCellAgreement([
+      book('admin', 'demo', ['2026-08-18'], 5, 121.77),
+    ]);
+    expect(notTheSameMode.journalDayCellNoNewSupersessionOk).toBe(false);
+
+    const notTheSameDate = summarizeJournalDayCellAgreement([
+      book('admin', 'live', ['2026-08-12'], 5, 121.77),
+    ]);
+    expect(notTheSameDate.journalDayCellNoNewSupersessionOk).toBe(false);
+  });
+
+  it('NOT MEASURED, never a pass: an empty/ungradeable fleet is null on BOTH verdicts', () => {
+    // `[].some(...)` is false, so a naive spelling would call this GREEN — the
+    // manufactured pass this module has shipped twice (TRA-2924, TRA-2630 AC2).
+    const s = summarizeJournalDayCellAgreement([book('a', 'live', [], 0, null)]);
+    expect(s.journalDayCellNoNewSupersessionOk).toBeNull();
+    expect(s.liveJournalDayCellNoNewSupersessionOk).toBeNull();
+    expect(summarizeJournalDayCellAgreement([]).journalDayCellNoNewSupersessionOk).toBeNull();
+    expect(summarizeJournalDayCellAgreement([]).liveJournalDayCellNoNewSupersessionOk).toBeNull();
+  });
+
+  it('an unruled cell wins over an ungradeable book — red beats NOT MEASURED', () => {
+    const s = summarizeJournalDayCellAgreement([
+      book('nobody', 'live', ['2026-08-19'], 5, 9),
+      book('b', 'live', [], 0, null),
+    ]);
+    expect(s.liveJournalDayCellNoNewSupersessionOk).toBe(false);
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(false);
+  });
+
+  it('the exemption is PUBLISHED on the wire, so it can be audited without reading source', () => {
+    const s = summarizeJournalDayCellAgreement(LIVE_FLEET());
+    expect(s.journalDayCellAcknowledgedCount).toBe(3);
+    expect(s.journalDayCellAcknowledgedCells).toEqual([
+      { username: 'admin', mode: 'live', date: '2026-08-11', ticket: 'TRA-3864' },
+      { username: 'admin', mode: 'live', date: '2026-08-18', ticket: 'TRA-3864' },
+      { username: 'qa_mirror_1578_38096', mode: 'demo', date: '2026-07-28', ticket: 'TRA-3864' },
+    ]);
+    // Every entry cites the ruling that froze it. An uncited exemption is a
+    // ban-list row (TRA-3831) wearing the name of this axis.
+    for (const a of ACKNOWLEDGED_JOURNAL_DAY_CELL_SUPERSESSIONS) {
+      expect(a.ticket).toMatch(/^TRA-\d+$/);
+      expect(a.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(a.note.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('a stale acknowledgement is PUBLISHED, not dropped — it pre-exempts that cell', () => {
+    // The QA mirror leaves the fleet. Its acknowledgement stays in the pinned
+    // list and would silently exempt a future re-divergence on that same cell.
+    const s = summarizeJournalDayCellAgreement([
+      book('admin', 'live', ['2026-08-11', '2026-08-18'], 67, 121.77),
+    ]);
+    expect(s.journalDayCellStaleAcknowledgements).toEqual([
+      { username: 'qa_mirror_1578_38096', mode: 'demo', date: '2026-07-28', ticket: 'TRA-3864' },
+    ]);
+    // ...but a stale entry is not an incident on its own, so it must not page.
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(true);
+  });
+
+  it('an EMPTY acknowledged set degenerates to the raw identity — no vacuous green', () => {
+    // The control in the other direction: if the set were ever emptied, the new
+    // verdict must go red on the live fleet, not stay green.
+    const s = summarizeJournalDayCellAgreement(LIVE_FLEET(), []);
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(false);
+    expect(s.journalDayCellNoNewSupersessionOk).toBe(s.journalDayCellAgreementOk);
+    expect(s.journalDayCellUnacknowledgedCount).toBe(3);
+    expect(s.journalDayCellAcknowledgedCount).toBe(0);
   });
 });

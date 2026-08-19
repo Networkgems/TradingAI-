@@ -1145,6 +1145,13 @@ export interface PnlReconcileResult {
    * result is: `false` (a superseded cell exists) wins outright, `null` means
    * NOT MEASURED (no gradeable cell on this book) and is NEVER a pass, `true`
    * means at least one cell could have diverged and none did.
+   *
+   * ⛔ TRA-3867 — this is the RAW IDENTITY and it is NOT gateable. The cells the
+   * TRA-3864 (b) ruling froze can never be retired (TRA-2079 refuses to move a
+   * non-zero cell), so on `admin`/live this reads `false` permanently while the
+   * box is behaving correctly. The gateable fleet verdict is
+   * `journalDayCellNoNewSupersessionOk`, which subtracts the ruled set — see
+   * {@link ACKNOWLEDGED_JOURNAL_DAY_CELL_SUPERSESSIONS}.
    */
   journalAgreementOk: boolean | null;
   /**
@@ -1776,7 +1783,98 @@ export function summarizeLiveLagTripwire(
  * was two live money-book cells (`admin` 08-18 at −121.77 and 08-11 at +0.86)
  * against one demo mirror cell — a fleet-only count of 3 does not say that, and
  * "which of these is real money" is the only question a desk asks first.
+ *
+ * ── TRA-3867: why `journalDayCellAgreementOk` is NOT the field to gate on ─────
+ *
+ * TRA-3864 was ruled **(b) freeze, and say so** — the archived cell keeps its
+ * archive-time figure and the divergence is published rather than silently
+ * corrected, because `planOptionsDailyPnlRepair` moves a cell only from an exact
+ * `0.00` and puts every non-zero disagreement in `leftAloneDates` (TRA-2079).
+ *
+ * The arithmetic consequence nobody wrote down: **nothing in the system can ever
+ * retire those 3 cells**, so `journalDayCellAgreementOk` and
+ * `liveJournalDayCellAgreementOk` are `false` PERMANENTLY, on a correctly
+ * behaving box. As shipped, the verdict field could not distinguish "the 3 known,
+ * ruled, frozen cells" from "a 4th one arrived overnight and nobody looked" —
+ * both render `false`. An alarm that is always firing is exactly as uninformative
+ * as one that never fires; it is TRA-3827's clamped metric approached from the
+ * other side, and the observed end state is that the axis gets routed around.
+ *
+ * So the two questions are SPLIT, and neither number already on the wire moves:
+ *
+ *   `journalDayCellAgreementOk`         RAW IDENTITY. "Does every gradeable cell
+ *                                       equal its journal?" Permanently `false`
+ *                                       while any ruled cell is frozen. ⛔ DO NOT
+ *                                       BIND A GATE OR A DASHBOARD LIGHT TO IT.
+ *   `journalDayCellNoNewSupersessionOk` THE GATEABLE VERDICT. "Is every divergent
+ *                                       cell one that was ruled and accepted?"
+ *                                       `false` means NEW, UNRULED divergence.
+ *                                       Reachable-green on a healthy box.
+ *
+ * The acknowledged set is a NAMED, PINNED list, not a high-water count. A count
+ * of 3 would let a 4th arrive while one of the 3 retired and still read green —
+ * and these cells cannot retire, so a count carries no information the names do
+ * not. Every acknowledged cell keeps publishing in `journalDayCellSupersededBooks`
+ * and keeps being counted by `journalDayCellSupersededCount`: the exemption
+ * suppresses a VERDICT, never a row.
+ *
+ * ⚠️ The standing hazard with any name list is TRA-3831's: a ban list is *names*
+ * while the invariant is a *property*, so the list goes quiet on its own shape as
+ * it grows. Three things hold that down here and all three are load-bearing:
+ * (1) the set is a source constant with NO env override, so widening it costs a
+ * commit and a review exactly as the ruling did; (2) the set is PUBLISHED on the
+ * wire (`journalDayCellAcknowledgedCells`), so the exemption is auditable without
+ * reading source; (3) an entry naming a cell that is no longer superseded is
+ * published as `journalDayCellStaleAcknowledgements` rather than dropped, because
+ * a dead entry silently pre-exempts a future re-divergence on that same cell.
  */
+
+/**
+ * TRA-3867 — the ruled-and-accepted day-cell supersessions, keyed
+ * `username|mode|date`. Membership here suppresses ONLY
+ * `journalDayCellNoNewSupersessionOk`; the cell still publishes in every count
+ * and every date list.
+ *
+ * ⛔ Adding a row here says "the board ruled this specific historical cell frozen
+ * and it will never converge". It does NOT mean "this is noisy". A cell that
+ * could still be repaired belongs in `planOptionsDailyPnlRepair`, not here.
+ */
+export const ACKNOWLEDGED_JOURNAL_DAY_CELL_SUPERSESSIONS: ReadonlyArray<{
+  username: string;
+  mode: string;
+  date: string;
+  /** The issue that ruled this cell frozen. Every entry cites one. */
+  ticket: string;
+  note: string;
+}> = [
+  {
+    username: 'admin',
+    mode: 'live',
+    date: '2026-08-11',
+    ticket: 'TRA-3864',
+    note: 'Live money cell, +0.86 (−16.00 archived vs −16.86 restated). Frozen '
+      + 'under the TRA-3864 (b) ruling; non-zero, so TRA-2079 refuses to move it.',
+  },
+  {
+    username: 'admin',
+    mode: 'live',
+    date: '2026-08-18',
+    ticket: 'TRA-3864',
+    note: 'Live money cell, −121.77 (−393.00 archived vs −271.23 restated). '
+      + 'Frozen under the TRA-3864 (b) ruling; TRA-2819/TRA-3730 close-basis.',
+  },
+  {
+    username: 'qa_mirror_1578_38096',
+    mode: 'demo',
+    date: '2026-07-28',
+    ticket: 'TRA-3864',
+    note: 'QA mirror cell, −63.00. Same restatement, demo cohort.',
+  },
+];
+
+const dayCellKey = (username: string, mode: string, date: string): string =>
+  `${username}|${mode}|${date}`;
+
 export function summarizeJournalDayCellAgreement(
   engines: ReadonlyArray<{
     username: string;
@@ -1786,6 +1884,12 @@ export function summarizeJournalDayCellAgreement(
     journalAgreementGradeableCount: number;
     maxJournalSupersessionUsd: number | null;
   }>,
+  acknowledged: ReadonlyArray<{
+    username: string;
+    mode: string;
+    date: string;
+    ticket: string;
+  }> = ACKNOWLEDGED_JOURNAL_DAY_CELL_SUPERSESSIONS,
 ): {
   journalDayCellAgreementOk: boolean | null;
   journalDayCellGradeableCount: number;
@@ -1800,6 +1904,28 @@ export function summarizeJournalDayCellAgreement(
   liveJournalDayCellAgreementOk: boolean | null;
   liveJournalDayCellGradeableBookCount: number;
   liveJournalDayCellSupersededBooks: Array<{ username: string; dates: string[] }>;
+  journalDayCellNoNewSupersessionOk: boolean | null;
+  liveJournalDayCellNoNewSupersessionOk: boolean | null;
+  journalDayCellUnacknowledgedCount: number;
+  journalDayCellUnacknowledgedBooks: Array<{
+    username: string;
+    mode: string;
+    dates: string[];
+  }>;
+  liveJournalDayCellUnacknowledgedBooks: Array<{ username: string; dates: string[] }>;
+  journalDayCellAcknowledgedCount: number;
+  journalDayCellAcknowledgedCells: Array<{
+    username: string;
+    mode: string;
+    date: string;
+    ticket: string;
+  }>;
+  journalDayCellStaleAcknowledgements: Array<{
+    username: string;
+    mode: string;
+    date: string;
+    ticket: string;
+  }>;
 } {
   const fold = (cohort: ReadonlyArray<(typeof engines)[number]>): boolean | null =>
     cohort.some(e => e.journalAgreementOk === false)
@@ -1809,6 +1935,37 @@ export function summarizeJournalDayCellAgreement(
         : null;
   const offenders = engines.filter(e => e.journalSupersededDates.length > 0);
   const liveBooks = engines.filter(e => e.mode === 'live');
+
+  // TRA-3867 — the UNACKNOWLEDGED residue, per book. Same tri-state fold as the
+  // raw identity above, and deliberately the same shape: `false` (a new,
+  // unruled divergence) wins outright, `null` means NOBODY WAS GRADEABLE and is
+  // never a pass, `true` means at least one cell could have diverged and every
+  // cell that did was already ruled.
+  const ackKeys = new Set(acknowledged.map(a => dayCellKey(a.username, a.mode, a.date)));
+  const unacknowledgedByBook = offenders
+    .map(e => ({
+      username: e.username,
+      mode: e.mode,
+      dates: e.journalSupersededDates.filter(
+        d => !ackKeys.has(dayCellKey(e.username, e.mode, d)),
+      ),
+    }))
+    .filter(b => b.dates.length > 0);
+  const unackKeys = new Set(unacknowledgedByBook.map(b => `${b.username}|${b.mode}`));
+  const foldNoNew = (cohort: ReadonlyArray<(typeof engines)[number]>): boolean | null =>
+    cohort.some(e => unackKeys.has(`${e.username}|${e.mode}`))
+      ? false
+      : cohort.some(e => e.journalAgreementGradeableCount > 0)
+        ? true
+        : null;
+  // An acknowledgement whose cell no longer reads superseded. Published, never
+  // dropped: a dead entry is a standing pre-exemption for that exact cell, so it
+  // has to be visible to whoever audits the list. NOT folded into the verdict —
+  // a book leaving the fleet (a retired QA mirror) is not an incident.
+  const supersededKeys = new Set(
+    offenders.flatMap(e => e.journalSupersededDates.map(d => dayCellKey(e.username, e.mode, d))),
+  );
+
   return {
     journalDayCellAgreementOk: fold(engines),
     journalDayCellGradeableCount: engines.reduce(
@@ -1834,6 +1991,26 @@ export function summarizeJournalDayCellAgreement(
     liveJournalDayCellSupersededBooks: liveBooks
       .filter(e => e.journalSupersededDates.length > 0)
       .map(e => ({ username: e.username, dates: e.journalSupersededDates })),
+    journalDayCellNoNewSupersessionOk: foldNoNew(engines),
+    liveJournalDayCellNoNewSupersessionOk: foldNoNew(liveBooks),
+    journalDayCellUnacknowledgedCount: unacknowledgedByBook.reduce(
+      (n, b) => n + b.dates.length,
+      0,
+    ),
+    journalDayCellUnacknowledgedBooks: unacknowledgedByBook,
+    liveJournalDayCellUnacknowledgedBooks: unacknowledgedByBook
+      .filter(b => b.mode === 'live')
+      .map(b => ({ username: b.username, dates: b.dates })),
+    journalDayCellAcknowledgedCount: acknowledged.length,
+    journalDayCellAcknowledgedCells: acknowledged.map(a => ({
+      username: a.username,
+      mode: a.mode,
+      date: a.date,
+      ticket: a.ticket,
+    })),
+    journalDayCellStaleAcknowledgements: acknowledged
+      .filter(a => !supersededKeys.has(dayCellKey(a.username, a.mode, a.date)))
+      .map(a => ({ username: a.username, mode: a.mode, date: a.date, ticket: a.ticket })),
   };
 }
 
