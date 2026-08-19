@@ -6265,6 +6265,56 @@ describe('SignalEngine — SupertrendConfluence shadow channel (TRA-787)', () =>
     expect(restored.exportTradeSnapshot().supertrendPaperClosed).toHaveLength(1);
   });
 
+  // TRA-3860 — the archive boundary is `/api/trades/export`'s coverage floor:
+  // the route filters `from`/`to` over the in-memory closed-trade buckets that
+  // this archive empties, so without a recorded boundary an archived day and an
+  // empty day are the same `200 {"trades": []}`.
+  it('TRA-3860: archiveClosedTrades stamps a durable boundary, even on a tick that archived nothing', () => {
+    const engine = new SignalEngine();
+
+    // Never archived ⇒ null, NOT 0. An epoch-0 floor would read as "this export
+    // covers all of history", which is the one wrong answer the field prevents.
+    expect(engine.exportTradeSnapshot().lastArchivedAt).toBeNull();
+
+    // A tick that archived ZERO rows still resets what the export can attest to,
+    // so it must stamp. Gating the stamp on `positions + options > 0` would leave
+    // a quiet day's boundary unrecorded and hand the route a floor older than the
+    // truth — the direction that lets an unservable range be answered.
+    const at = Date.parse('2026-08-19T01:00:06.467Z');
+    const counts = engine.archiveClosedTrades(at);
+    expect(counts).toEqual({ positions: 0, options: 0 });
+    expect(engine.exportTradeSnapshot().lastArchivedAt).toBe(at);
+
+    // It survives a redeploy: the archive runs once a day, so a boundary that
+    // reset on every restart would drop the export back to its conservative
+    // process-start floor several times a week.
+    const snap = engine.exportTradeSnapshot();
+    const restored = new SignalEngine();
+    restored.importTradeSnapshot({
+      closedPositions: snap.closedPositions,
+      recentSignals: snap.recentSignals,
+      dailySignals: snap.dailySignals,
+      positionSignalType: snap.positionSignalType,
+      account: snap.account,
+      options: snap.options,
+      lastArchivedAt: snap.lastArchivedAt,
+    });
+    expect(restored.exportTradeSnapshot().lastArchivedAt).toBe(at);
+
+    // A pre-TRA-3860 snapshot omits the key entirely. It must restore as null
+    // (= no observed boundary), never as 0.
+    const legacy = new SignalEngine();
+    legacy.importTradeSnapshot({
+      closedPositions: snap.closedPositions,
+      recentSignals: snap.recentSignals,
+      dailySignals: snap.dailySignals,
+      positionSignalType: snap.positionSignalType,
+      account: snap.account,
+      options: snap.options,
+    });
+    expect(legacy.exportTradeSnapshot().lastArchivedAt).toBeNull();
+  });
+
   // TRA-1082 — the full-universe shadow sweep must YIELD to the libuv event loop
   // mid-pass so the per-symbol supertrend()/confluenceSide() indicator math can't
   // run as one uninterrupted synchronous burst (the residual root cause of the

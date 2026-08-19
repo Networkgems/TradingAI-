@@ -107,6 +107,7 @@ import {
   getOptionTradeVoids,
   recordOptionTradeCloseBasis,
   getOptionTradeCloseBasisAmends,
+  type OptionTradeJournalRecord,
 } from './option-trade-journal.js';
 // TRA-2819 — the money-side sibling of the repair below. That one decides
 // whether a stale OPEN row is a trade at all; this one takes rows that are
@@ -732,7 +733,16 @@ import {
   type ExportFilters,
   type ExportFormat,
   type ExportMarket,
+  type ExportSummary,
+  type ExportTradeRow,
 } from './export.js';
+// TRA-3860 — the coverage floor + refusal that stop `/api/trades/export` from
+// answering an unservable historical range with an empty 200.
+import {
+  checkExportRangeServable,
+  resolveExportCoverage,
+  selectJournalExportRows,
+} from './export-history.js';
 import { TradierRelativeValueScannerService } from './relative-value-scanner.js';
 import { applyTheoFloor, OTM_PANEL_THEO_FLOOR } from './otm-theo-floor.js';
 import { applyDeltaFloor, OTM_PANEL_DELTA_FLOOR } from './otm-delta-floor.js';
@@ -9355,6 +9365,17 @@ function collectClosedCrypto(snap: CryptoTradeSnapshot | null): Position[] {
   return Array.from(byId.values());
 }
 
+/**
+ * TRA-3860 — process start, the CONSERVATIVE coverage floor used by
+ * `/api/trades/export` when a book has no observed archive boundary yet.
+ *
+ * Deliberately captured at module load rather than derived per request from
+ * `process.uptime()`: the two agree, but a value that is re-derived on every
+ * call invites a later "refresh" that would walk the floor forward while the
+ * data behind it stayed put.
+ */
+const PROCESS_START_MS = Date.now();
+
 app.get('/api/trades/export', requireAuth, async (req, res, next) => {
   try {
     const username = res.locals['authUser'] as string;
@@ -9384,23 +9405,90 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
       loadCryptoTradeSnapshot(username),
     ]);
 
+    // TRA-3860 — the durable per-close ledger that lets an ARCHIVED option day
+    // stay readable. Best-effort: the journal is default-OFF and its file may be
+    // absent or unreadable, and a failure here must degrade to "no journal
+    // coverage" (which makes the route REFUSE historical ranges) rather than
+    // throw. It must never degrade to "coverage unbounded".
+    //
+    // Scoped through `journalRowsForBook` + the deletion tombstone, exactly as
+    // every other per-book journal fold is (TRA-2421): the journal is firm-wide
+    // and outlives an account wipe, so a plain `account === username` test would
+    // hand a recycled username its predecessor's trades.
+    let bookJournalRows: OptionTradeJournalRecord[] = [];
+    try {
+      bookJournalRows = journalRowsForBook(
+        await listOptionTradeJournal(),
+        username,
+        accountDeletedAt(username),
+      );
+    } catch (err) {
+      log.warn('trades export: option-trade journal unreadable; history coverage not extended', {
+        username,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const optionsClosed = collectClosedOptions(stocksSnap);
+    const coverage = resolveExportCoverage({
+      archiveBoundaryMs: stocksSnap?.lastArchivedAt ?? null,
+      processStartMs: PROCESS_START_MS,
+      journalRows: bookJournalRows,
+      filters,
+    });
+
+    // The refusal. An explicit `from` below a requested market's floor is a
+    // request for history this route does not hold; answering it with `[]` is
+    // the defect (an archived day read byte-identically to an empty one).
+    const servable = checkExportRangeServable(filters, coverage);
+    if (!servable.ok) {
+      res.status(400).json(servable.refusal);
+      return;
+    }
+
+    // Journal rows are de-duped against the book by trade id (the journal is
+    // keyed on `position.id`), and the BOOK copy wins — it carries the exit
+    // premium the journal never recorded.
+    const journalExportRows = selectJournalExportRows(
+      bookJournalRows,
+      new Set(optionsClosed.map(o => o.id)),
+    );
+
     const { rows, summary } = buildExport(
       {
         stocksClosed: stocksSnap?.closedPositions ?? [],
         cryptoClosed: collectClosedCrypto(cryptoSnap),
-        optionsClosed: collectClosedOptions(stocksSnap),
+        optionsClosed,
+        preMappedRows: journalExportRows,
       },
       filters,
     );
+
+    // Provenance census over the SERVED rows, not the candidates: a filter that
+    // drops every journal row must report 0, not the number we offered up.
+    const journalRowSet = new Set<ExportTradeRow>(journalExportRows);
+    const journalServed = rows.reduce((n, r) => n + (journalRowSet.has(r) ? 1 : 0), 0);
+    const summaryWithCoverage: ExportSummary = {
+      ...summary,
+      coverage,
+      sources: { book: rows.length - journalServed, journal: journalServed },
+    };
 
     const stamp = new Date().toISOString().slice(0, 10);
     if (format === 'json') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="trades-export-${stamp}.json"`);
-      res.send(JSON.stringify({ summary, trades: rows }, null, 2));
+      res.send(JSON.stringify({ summary: summaryWithCoverage, trades: rows }, null, 2));
     } else {
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', `attachment; filename="trades-export-${stamp}.csv"`);
+      // TRA-3860 — CSV has no summary object, so the coverage statement rides on
+      // a header. Without it the CSV form would keep the exact property this
+      // ticket removes from the JSON form: an empty body that reads as a
+      // complete record. The RFC-4180 body is deliberately left byte-identical —
+      // a comment line ahead of the header row would break every consumer that
+      // parses it, and the column list is the published §2.3 schema.
+      res.setHeader('X-Export-Coverage', JSON.stringify(coverage));
       res.send(toCsv(rows));
     }
   } catch (err) {

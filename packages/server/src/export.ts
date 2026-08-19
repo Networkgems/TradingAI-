@@ -83,6 +83,62 @@ export interface ExportInput {
   stocksClosed?: Position[];
   cryptoClosed?: Position[];
   optionsClosed?: OptionPosition[];
+  /**
+   * TRA-3860 — rows recovered from a durable ledger rather than an in-memory
+   * book, already mapped (see `export-history.ts`). They join the same filter
+   * and summary pass as the buckets above, so a historical row cannot be counted
+   * by one and missed by the other. The caller de-dupes them against the buckets
+   * by trade id before passing them in.
+   */
+  preMappedRows?: ExportTradeRow[];
+}
+
+/**
+ * TRA-3860 — where a market's coverage floor came from. Published on the wire
+ * because the four are NOT interchangeable: a reader deciding whether to trust an
+ * empty result needs to know which one produced the bound. Full rationale and the
+ * resolution rules live in `export-history.ts`.
+ */
+export type ExportCoverageSource =
+  /** A real archive tick was observed on this book; the floor is exact. */
+  | 'archive-boundary'
+  /** No archive tick observed yet; falls back to process start (conservative). */
+  | 'process-start'
+  /** The durable per-close journal extends this market's floor past the archive. */
+  | 'option-trade-journal'
+  /** Nothing to attest with. Any explicit `from` is refused. */
+  | 'unknown';
+
+export interface ExportMarketCoverage {
+  /** Earliest exit time (epoch ms) this export can attest to; null ⇒ unknown. */
+  since: number | null;
+  /** `since` as ISO-8601, or null. Convenience for humans reading the document. */
+  sinceIso: string | null;
+  source: ExportCoverageSource;
+}
+
+/**
+ * TRA-3860 — the window this export speaks for, per market. Carried on EVERY
+ * response (served or refused) so an empty result is always qualified: before
+ * this, `trades: []` over an archived day was byte-identical to a day that had no
+ * trades.
+ */
+export interface ExportCoverage {
+  stocks: ExportMarketCoverage;
+  crypto: ExportMarketCoverage;
+  options: ExportMarketCoverage;
+  /** The modes these floors were computed for (the request's, or all of them). */
+  modes: AccountMode[];
+  /** Plain-language statement of the bound, carried on every response. */
+  note: string;
+}
+
+/** TRA-3860 — row-provenance census, so a mixed export is legible. */
+export interface ExportSourceCounts {
+  /** Rows from the live in-memory book (full premiums). */
+  book: number;
+  /** Rows recovered from the durable option-trade journal (no exit premium). */
+  journal: number;
 }
 
 export interface ExportSummary {
@@ -96,6 +152,15 @@ export interface ExportSummary {
   win_rate: number;
   /** Echo of the filters that produced this export. */
   filters: ExportFilters;
+  /**
+   * TRA-3860 — the window this document attests to. Optional on the TYPE only so
+   * the pure `summarize()` (which has no access to the archive boundary or the
+   * journal) still type-checks; the HTTP route attaches it unconditionally, and
+   * an absent block means the summary did not come from the route.
+   */
+  coverage?: ExportCoverage;
+  /** TRA-3860 — how many served rows came from the book vs the durable journal. */
+  sources?: ExportSourceCounts;
 }
 
 export interface ExportDocument {
@@ -220,6 +285,9 @@ export function buildRows(input: ExportInput): ExportTradeRow[] {
   for (const p of input.stocksClosed ?? []) rows.push(rowFromPosition(p, 'stocks'));
   for (const p of input.cryptoClosed ?? []) rows.push(rowFromPosition(p, 'crypto'));
   for (const o of input.optionsClosed ?? []) rows.push(rowFromOption(o));
+  // TRA-3860 — durable-ledger rows last, so a book row and its journal twin can
+  // never reorder relative to each other between two calls.
+  for (const r of input.preMappedRows ?? []) rows.push(r);
   return rows;
 }
 

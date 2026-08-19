@@ -173,6 +173,21 @@ export interface StocksTradeSnapshot {
   options: OptionsBucketSnapshot;
   /** TRA-233 — per-env options buckets (sandbox + production). */
   optionsByEnv?: Record<TradierEnv, OptionsBucketSnapshot>;
+  /**
+   * TRA-3860 — epoch ms of the last daily archive tick observed on this book,
+   * and therefore the earliest exit time `/api/trades/export` can attest to for
+   * stocks and crypto. The archive (TRA-219) empties `closedPositions` and the
+   * options buckets wholesale, so a range starting before this is unservable and
+   * the route refuses it instead of answering `trades: []` — which was
+   * indistinguishable from a day that genuinely had no trades.
+   *
+   * Optional, and absent on every snapshot written before this ticket. ABSENT
+   * MEANS "no boundary has been observed on this book", which routes the export
+   * onto a conservative process-start floor. Do NOT default it to 0 at any read
+   * site: an epoch-0 floor reads as "this export covers all of history", which is
+   * the one wrong answer this field exists to prevent.
+   */
+  lastArchivedAt?: number | null;
   account: {
     cash: number;
     equity: number;

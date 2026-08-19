@@ -3063,6 +3063,24 @@ export class SignalEngine {
   private sma200LastFired: Map<string, number> = new Map();
   private allClosedPositions: Position[] = [];
   /**
+   * TRA-3860 — epoch ms of the last {@link archiveClosedTrades} tick observed on
+   * this book, or null if this build has never seen one.
+   *
+   * This is the COVERAGE FLOOR of `/api/trades/export`. That route filters
+   * `from`/`to` over the in-memory closed-trade buckets, which this archive
+   * empties wholesale (TRA-219) — so without a recorded boundary the route could
+   * not tell "that day had no trades" from "that day's trades were deleted four
+   * hours ago", and answered both with `200 {"trades": []}`.
+   *
+   * Persisted on the snapshot so it survives a restart: the archive runs once a
+   * day, and a boundary that reset on every redeploy would send the export back
+   * to its conservative process-start fallback several times a week. Null is a
+   * real and meaningful value — it means exactly "no archive tick has been
+   * observed", never "archived at epoch 0" — which is why it is not seeded to a
+   * timestamp at construction.
+   */
+  private lastArchivedAt: number | null = null;
+  /**
    * TRA-936 — DURABLE cumulative ledger of closed SupertrendConfluence paper
    * forward-test trades, kept SEPARATE from {@link allClosedPositions}.
    *
@@ -18359,9 +18377,14 @@ export class SignalEngine {
      * so the Stage-2 paper count survives the nightly archive and a redeploy.
      */
     supertrendPaperClosed: Position[];
+    /**
+     * TRA-3860 — the export's coverage floor. See {@link SignalEngine.lastArchivedAt}.
+     */
+    lastArchivedAt: number | null;
   } {
     return {
       closedPositions: [...this.allClosedPositions],
+      lastArchivedAt: this.lastArchivedAt,
       recentSignals: [...this.recentSignals],
       dailySignals: [...this.dailySignals],
       positionSignalType: Array.from(this.positionSignalType.entries()),
@@ -18418,12 +18441,20 @@ export class SignalEngine {
    * bucket, surfacing demo/sandbox P&L under the Live Production header even
    * though no Tradier production order had ever been placed.
    */
-  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv' | 'supertrendPaper' | 'supertrendPaperClosed'> & {
+  importTradeSnapshot(snap: Omit<ReturnType<SignalEngine['exportTradeSnapshot']>, 'optionsByEnv' | 'supertrendPaper' | 'supertrendPaperClosed' | 'lastArchivedAt'> & {
     optionsByEnv?: Record<TradierEnv, ReturnType<PaperOptionsAccount['exportSnapshot']>>;
     /** TRA-801 — optional so legacy snapshots written before the forward-test book still load. */
     supertrendPaper?: ReturnType<PaperAccount['exportSnapshot']>;
     /** TRA-936 — optional so legacy snapshots written before the durable forward-test ledger still load. */
     supertrendPaperClosed?: Position[];
+    /**
+     * TRA-3860 — optional, and absent on every snapshot written before this
+     * ticket. Absent must keep meaning "this book has no observed archive
+     * boundary" and route the export onto its conservative process-start
+     * fallback; collapsing it to a number here would manufacture a floor the
+     * book never measured.
+     */
+    lastArchivedAt?: number | null;
   }): void {
     // TRA-1053 (TRA-1045 R3) — bound the closed-position history rehydrated at
     // boot so engine memory cannot scale with an abnormally large snapshot.
@@ -18458,6 +18489,13 @@ export class SignalEngine {
     }
     this.dailySignals = [...snap.dailySignals];
     this.positionSignalType = new Map(snap.positionSignalType);
+    // TRA-3860 — restore the export's coverage floor. A non-finite or absent
+    // value restores as null (= no observed boundary), never as 0: an epoch-0
+    // floor would read as "this export covers all of history".
+    this.lastArchivedAt =
+      typeof snap.lastArchivedAt === 'number' && Number.isFinite(snap.lastArchivedAt)
+        ? snap.lastArchivedAt
+        : null;
     this.account.importSnapshot(snap.account);
     // TRA-801 — restore the SupertrendConfluence paper forward-test book so open
     // positions survive a redeploy; absent on legacy snapshots (starts empty).
@@ -19359,7 +19397,15 @@ export class SignalEngine {
    * Options pages start the next session blank. EOD reports persisted under
    * `reports/<date>.json` still hold the trades for the Calendar tab to load.
    */
-  archiveClosedTrades(): { positions: number; options: number } {
+  archiveClosedTrades(now: number = Date.now()): { positions: number; options: number } {
+    // TRA-3860 — stamp the boundary BEFORE the lists are emptied, and stamp it
+    // UNCONDITIONALLY, including on an archive that dropped nothing. A tick that
+    // archived 0 rows still resets what the export can attest to going forward
+    // (everything retained after it closed after it), so gating the stamp on
+    // `positions + options > 0` would leave a quiet day's boundary unrecorded and
+    // hand `/api/trades/export` a floor older than the truth — the one direction
+    // that lets an unservable range be answered instead of refused.
+    this.lastArchivedAt = now;
     const positions = this.allClosedPositions.length;
     const closedIds = new Set(this.allClosedPositions.map(p => p.id));
     this.allClosedPositions = [];

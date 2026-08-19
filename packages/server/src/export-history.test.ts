@@ -1,0 +1,300 @@
+import { describe, it, expect } from 'vitest';
+import { buildExport, type ExportFilters } from './export.js';
+import {
+  checkExportRangeServable,
+  journalFloorForMode,
+  resolveExportCoverage,
+  rowFromJournalRecord,
+  selectJournalExportRows,
+} from './export-history.js';
+import type { OptionTradeJournalRecord } from './option-trade-journal.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3860 — `/api/trades/export` accepted a historical `from`/`to` range it
+// could not serve and answered it with `200 {"trades": []}`, byte-identical to a
+// day that genuinely had no trades.
+//
+// The fixtures below are the FILED INCIDENT, to the millisecond: bqb1's two live
+// option closes on ET 2026-08-18 (PLTR + SPY, both `exitReason: "sl"`, -$115 and
+// -$278 = -$393), and the 2026-08-19T01:00:06.467Z archive tick that deleted them
+// from the in-memory book four hours before QA ran the export. Every assertion in
+// AC1 is against those exact values rather than a synthetic shape, so a change
+// that merely makes ranges non-empty cannot satisfy it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The 2026-08-19T01:00:06.467Z archive tick from the incident log line. */
+const ARCHIVE_BOUNDARY = Date.parse('2026-08-19T01:00:06.467Z');
+/** Process start, well after the boundary — the conservative fallback floor. */
+const PROCESS_START = Date.parse('2026-08-19T05:00:00.000Z');
+
+function journalRow(over: Partial<OptionTradeJournalRecord> = {}): OptionTradeJournalRecord {
+  return {
+    id: 'row-1',
+    openTs: Date.parse('2026-08-17T14:26:42.923Z'),
+    symbol: 'PLTR',
+    structure: 'tradier_import',
+    mode: 'live',
+    ivRank: null,
+    trend: 'unknown',
+    sentiment: null,
+    entryDelta: 0,
+    entryDte: 4,
+    atRiskUsd: 152,
+    account: 'admin',
+    outcome: 'LOSS',
+    closeTs: Date.parse('2026-08-18T14:50:14.833Z'),
+    realizedPnlUsd: -115.00000000000001,
+    realizedR: -0.7565789473684211,
+    exitReason: 'sl',
+    optionSymbol: 'PLTR260821C00180000',
+    contracts: 1,
+    ...over,
+  } as OptionTradeJournalRecord;
+}
+
+/** The two live closes bqb1 archived on 2026-08-19T01:00Z, as the journal holds them. */
+const LIVE_0818: OptionTradeJournalRecord[] = [
+  journalRow(),
+  journalRow({
+    id: 'row-2',
+    symbol: 'SPY',
+    optionSymbol: 'SPY260821C00777000',
+    openTs: Date.parse('2026-08-17T17:44:49.377Z'),
+    closeTs: Date.parse('2026-08-18T15:05:40.706Z'),
+    atRiskUsd: 219,
+    realizedPnlUsd: -278,
+    realizedR: -1.269406392694064,
+  }),
+];
+
+/** Whole-UTC-day bounds, exactly as `parseExportBoundary` produces them. */
+function day(date: string): { from: number; to: number } {
+  const from = Date.parse(date);
+  return { from, to: from + 86_400_000 - 1 };
+}
+
+function coverageFor(
+  rows: readonly OptionTradeJournalRecord[],
+  filters: Pick<ExportFilters, 'modes' | 'markets'>,
+  archiveBoundaryMs: number | null = ARCHIVE_BOUNDARY,
+) {
+  return resolveExportCoverage({
+    archiveBoundaryMs,
+    processStartMs: PROCESS_START,
+    journalRows: rows,
+    filters,
+  });
+}
+
+describe('TRA-3860 AC1 — an archived day is served, with its exit reasons', () => {
+  it('returns both 2026-08-18 live closes with exit_reason after the archive deleted them', () => {
+    const filters: ExportFilters = {
+      markets: ['options'],
+      modes: ['live'],
+      ...day('2026-08-18'),
+    };
+    const coverage = coverageFor(LIVE_0818, filters);
+
+    // The floor moved back to the earliest event the journal holds for this
+    // book — the PLTR open — not to the earliest close, which sits nine hours
+    // INSIDE the requested day and would refuse the very query QA filed.
+    expect(coverage.options.since).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    expect(coverage.options.source).toBe('option-trade-journal');
+
+    expect(checkExportRangeServable(filters, coverage).ok).toBe(true);
+
+    const { rows, summary } = buildExport(
+      {
+        // The book is EMPTY — this is the post-archive state QA measured.
+        stocksClosed: [],
+        cryptoClosed: [],
+        optionsClosed: [],
+        preMappedRows: selectJournalExportRows(LIVE_0818, new Set()),
+      },
+      filters,
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(rows.map(r => r.symbol).sort()).toEqual([
+      'PLTR260821C00180000',
+      'SPY260821C00777000',
+    ]);
+    expect(rows.map(r => r.exit_reason)).toEqual(['sl', 'sl']);
+    expect(rows.every(r => r.mode === 'live' && r.market === 'options')).toBe(true);
+    // -$393 to the cent — the figure the filing ticket published.
+    expect(summary.totals.net_pnl_usd).toBe(-393);
+  });
+
+  it('does not fabricate the prices the journal never recorded', () => {
+    const row = rowFromJournalRecord(journalRow());
+    // `tradier_import` rows carry no fill mark, and the journal records no exit
+    // premium for ANY row. Blank, never a stand-in — a fabricated price in an
+    // audit export is worse than a missing one.
+    expect(row.entry_price).toBeNull();
+    expect(row.exit_price).toBeNull();
+    // What it DOES know is carried exactly.
+    expect(row.exit_reason).toBe('sl');
+    expect(row.quantity).toBe(1);
+    expect(row.net_pnl_usd).toBe(-115);
+    expect(row.strategy).toBe('tradier_import');
+  });
+});
+
+describe('TRA-3860 AC2 — the fix must DISCRIMINATE, not just return more rows', () => {
+  it('a day fully INSIDE coverage that genuinely had no trades is served as 0', () => {
+    // 2026-08-19 sits after the journal's floor for this book (2026-08-17T14:26Z)
+    // and nothing closed on it. Served, and EMPTY — that is the answer, not the
+    // bug. This is the assertion that fails a "make every range non-empty"
+    // change, which the filing ticket called out as worse than the defect.
+    const filters: ExportFilters = {
+      markets: ['options'],
+      modes: ['live'],
+      ...day('2026-08-19'),
+    };
+    const coverage = coverageFor(LIVE_0818, filters);
+    expect(checkExportRangeServable(filters, coverage).ok).toBe(true);
+
+    const { rows, summary } = buildExport(
+      { preMappedRows: selectJournalExportRows(LIVE_0818, new Set()) },
+      filters,
+    );
+    expect(rows).toHaveLength(0);
+    expect(summary.count).toBe(0);
+  });
+
+  it('a day BEFORE coverage is refused, not answered with the same 0', () => {
+    // The discriminator. 2026-08-16 predates the journal's floor for this book,
+    // so the honest answer is "cannot say" — and it must not share a response
+    // shape with the servable empty day above.
+    const filters: ExportFilters = {
+      markets: ['options'],
+      modes: ['live'],
+      ...day('2026-08-16'),
+    };
+    const verdict = checkExportRangeServable(filters, coverageFor(LIVE_0818, filters));
+    expect(verdict.ok).toBe(false);
+  });
+});
+
+describe('TRA-3860 AC3 — an unservable range is refused, naming the limit', () => {
+  it('refuses a from earlier than the stocks/crypto archive boundary', () => {
+    const filters: ExportFilters = {
+      markets: ['stocks'],
+      modes: ['live'],
+      ...day('2026-08-18'),
+    };
+    const coverage = coverageFor(LIVE_0818, filters);
+    const verdict = checkExportRangeServable(filters, coverage);
+
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.refusal.unservableMarkets).toEqual(['stocks']);
+    // The limit is NAMED, with its provenance, not just asserted.
+    expect(verdict.refusal.detail).toContain('2026-08-19T01:00:06.467Z');
+    expect(verdict.refusal.detail).toContain('archive-boundary');
+    expect(verdict.refusal.coverage.stocks.since).toBe(ARCHIVE_BOUNDARY);
+  });
+
+  it('the option journal extends OPTIONS only — stocks in the same request still refuse', () => {
+    // The failure mode this guards: options history is recoverable and stocks
+    // history is not, so a request spanning both must not be half-answered behind
+    // a 200. `markets` unset ⇒ all three.
+    const filters: ExportFilters = { modes: ['live'], ...day('2026-08-18') };
+    const coverage = coverageFor(LIVE_0818, filters);
+    const verdict = checkExportRangeServable(filters, coverage);
+
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.refusal.unservableMarkets).toEqual(['stocks', 'crypto']);
+    expect(coverage.options.source).toBe('option-trade-journal');
+  });
+
+  it('an UNBOUNDED export is not refused, but states its coverage', () => {
+    // The UI's own export button sends no `from`. Refusing it would break every
+    // caller who never asked for history; the coverage block is what stops the
+    // emptiness from reading as a complete record.
+    const filters: ExportFilters = { markets: ['options'], modes: ['live'] };
+    const coverage = coverageFor([], filters);
+    expect(checkExportRangeServable(filters, coverage).ok).toBe(true);
+    expect(coverage.options.since).toBe(ARCHIVE_BOUNDARY);
+    expect(coverage.note).toContain('refused with 400');
+  });
+});
+
+describe('TRA-3860 — the coverage floor itself', () => {
+  it('takes the MAX across requested modes, so a partial leg is refused not served', () => {
+    // demo history back to 08-10, live only from 08-18. A `from` of 08-12 is
+    // servable for demo and NOT for live; answering it would put a silently
+    // partial live leg behind a 200 — the original defect with extra steps.
+    const rows = [
+      journalRow({
+        id: 'demo-1',
+        mode: 'demo',
+        openTs: Date.parse('2026-08-10T18:00:00.000Z'),
+        closeTs: Date.parse('2026-08-10T19:00:00.000Z'),
+      }),
+      ...LIVE_0818,
+    ];
+    const filters: ExportFilters = {
+      markets: ['options'],
+      modes: ['demo', 'live'],
+      from: Date.parse('2026-08-12T00:00:00.000Z'),
+    };
+    const coverage = coverageFor(rows, filters);
+
+    expect(journalFloorForMode(rows, 'demo')).toBe(Date.parse('2026-08-10T18:00:00.000Z'));
+    expect(journalFloorForMode(rows, 'live')).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    // MAX, not MIN.
+    expect(coverage.options.since).toBe(Date.parse('2026-08-17T14:26:42.923Z'));
+    expect(checkExportRangeServable(filters, coverage).ok).toBe(false);
+
+    // Ask for demo alone and the same `from` IS servable.
+    const demoOnly: ExportFilters = { ...filters, modes: ['demo'] };
+    expect(checkExportRangeServable(demoOnly, coverageFor(rows, demoOnly)).ok).toBe(true);
+  });
+
+  it('falls back to process start — never epoch 0 — when no archive has been observed', () => {
+    // A snapshot written before this ticket has no boundary. The floor must be
+    // conservative (refuse), not permissive: an epoch-0 default would read as
+    // "this export covers all of history", which is the one wrong answer.
+    const coverage = coverageFor([], { markets: ['stocks'], modes: ['live'] }, null);
+    expect(coverage.stocks.since).toBe(PROCESS_START);
+    expect(coverage.stocks.source).toBe('process-start');
+
+    const filters: ExportFilters = {
+      markets: ['stocks'],
+      modes: ['live'],
+      from: Date.parse('2026-08-19T04:00:00.000Z'),
+    };
+    expect(checkExportRangeServable(filters, coverageFor([], filters, null)).ok).toBe(false);
+  });
+
+  it('an OPEN journal row EXTENDS the floor but is never exported', () => {
+    // An open row at time T is positive evidence the journal was capturing this
+    // book at T — so it moves the floor. It has no exit, so it is not a trade the
+    // export can list; the two facts are deliberately decoupled.
+    const open = journalRow({
+      id: 'open-1',
+      outcome: 'OPEN',
+      closeTs: undefined,
+      exitReason: undefined,
+      openTs: Date.parse('2026-08-01T14:00:00.000Z'),
+    });
+    const rows = [open, ...LIVE_0818];
+    expect(journalFloorForMode(rows, 'live')).toBe(Date.parse('2026-08-01T14:00:00.000Z'));
+    expect(selectJournalExportRows(rows, new Set()).map(r => r.symbol)).toEqual([
+      'PLTR260821C00180000',
+      'SPY260821C00777000',
+    ]);
+  });
+});
+
+describe('TRA-3860 — the book wins over its journal twin', () => {
+  it('drops the journal row whose id the in-memory book still holds', () => {
+    // Same trade, two records. Serving both would double-count the day's P&L in
+    // an export a human reconciles against a broker statement.
+    const served = selectJournalExportRows(LIVE_0818, new Set(['row-1']));
+    expect(served).toHaveLength(1);
+    expect(served[0]!.symbol).toBe('SPY260821C00777000');
+  });
+});

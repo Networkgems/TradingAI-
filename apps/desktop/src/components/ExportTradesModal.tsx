@@ -125,6 +125,13 @@ export function ExportTradesModal({ token, httpUrl, onClose }: {
         try {
           const body = await res.json();
           if (body?.error) msg = String(body.error);
+          // TRA-3860 — the range refusal carries the LIMIT in `detail` (which
+          // markets, and the date each can attest back to). `error` alone says
+          // the request was rejected without saying what to change, and this
+          // rejection is the one the user is now most likely to hit: the "This
+          // year" preset asks for history the route cannot serve. Before this
+          // ticket that request came back 200 with a silently truncated file.
+          if (body?.detail) msg = `${msg} ${String(body.detail)}`;
         } catch {
           /* non-JSON error body — keep the generic message */
         }

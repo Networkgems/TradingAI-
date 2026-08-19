@@ -1114,6 +1114,11 @@ async function createUserContext(username: string): Promise<UserContext> {
         // TRA-936 — restore the durable cumulative closed forward-test ledger so
         // the Stage-2 paper count survives the nightly archive and a redeploy.
         ...(stocksSnap.supertrendPaperClosed ? { supertrendPaperClosed: stocksSnap.supertrendPaperClosed } : {}),
+        // TRA-3860 — restore the export's archive-boundary coverage floor.
+        // Spread conditionally so an absent key stays absent rather than
+        // arriving as an explicit `undefined`: both restore as null, but only
+        // the absent form keeps the pre-TRA-3860 snapshot readable as one.
+        ...(stocksSnap.lastArchivedAt != null ? { lastArchivedAt: stocksSnap.lastArchivedAt } : {}),
       });
       log.info('Restored stocks trade history', {
         username,
@@ -1322,6 +1327,11 @@ export async function persistStocksNow(ctx: UserContext): Promise<void> {
       // TRA-936 — persist the durable cumulative closed forward-test ledger so
       // the Stage-2 paper count survives the nightly archive and a redeploy.
       supertrendPaperClosed: snap.supertrendPaperClosed,
+      // TRA-3860 — persist the archive boundary. It is written once a day, so a
+      // boundary that lived only in memory would fall back to process-start on
+      // every redeploy and make `/api/trades/export` refuse ranges it could have
+      // served several times a week.
+      lastArchivedAt: snap.lastArchivedAt,
     });
     // TRA-3407 — AFTER the await resolves, never before. `saveStocksTradeSnapshot`
     // is an atomic write-then-rename; recording success on entry would book a
