@@ -1,0 +1,33 @@
+{
+  "_readme": [
+    "TRA-3852. Acknowledgement ledger for scripts/check-boot-arm-repairs.mjs (arm B of the",
+    "TRA-2649/TRA-3810 boot-arm daily guard).",
+    "",
+    "An entry here clears exactly ONE recorded demotion attempt from the exit code. It never",
+    "hides it: an acknowledged event is still printed in full on every fire, tagged with the",
+    "issue that settled it.",
+    "",
+    "Matching is by IDENTITY, not by class: at + origin + repaired SET + bodyFieldCount must",
+    "all match. A new attempt from the same writer doing the same thing has a different `at`",
+    "and still exits 1.",
+    "",
+    "`fixCommit` must be an ANCESTOR OF THE COMMIT THE SERVICE IS SERVING. If a deploy rolls",
+    "the fix back, the ack goes VOID and the event alarms again. If ancestry cannot be",
+    "determined (no git, unknown sha, no serving commit), the ack does NOT apply -- fail closed.",
+    "",
+    "Do not add an entry for an attempt you have not root-caused and fixed. `issue` must name a",
+    "settled issue and `fixCommit` the commit that made a recurrence impossible by that path.",
+    "Attribution alone ('we know who did it') is NOT grounds for an ack."
+  ],
+  "acks": [
+    {
+      "at": "2026-08-17T13:53:42.411Z",
+      "origin": "settings_write",
+      "repaired": ["liveTradeEquitiesTradier"],
+      "bodyFieldCount": 61,
+      "issue": "TRA-3833",
+      "fixCommit": "0ce7226",
+      "note": "Settings page handleSave posted JSON.stringify(settings) -- the whole form state -- so every full save re-sent a stale liveTradeEquitiesTradier:false and the TRA-2649 write path repaired it back. Fixed sender-side by diffSettingsForSave (delta save) plus an honest clamp report. Pages bundle verified 2026-08-18; the bqb1-served copy carries it from the 2026-08-18T20:41Z boot (serving b70404f)."
+    }
+  ]
+}

@@ -39,18 +39,50 @@
 // Ranking blind first would let a stray `appendErrors` demote a real live-money demotion
 // attempt into a plumbing complaint.
 //
+// ── ACKNOWLEDGEMENTS (TRA-3852) ──────────────────────────────────────────────
+// `retentionDays` is 180 and the grade was `attempts > 0 → exit 1`, so ONE settled event
+// pinned the alarm ON for half a year. The 2026-08-17 event (TRA-3833) did exactly that:
+// every daily fire from 2026-08-19 would have shouted ATTEMPTS about an already-fixed
+// cause, and the sixth recurrence of the boot-arm family would have arrived inside that
+// noise. An alarm nobody can read is not an alarm.
+//
+// An ack pins ONE event and self-voids. It is deliberately built to LOOSEN the pass in the
+// narrowest possible way while TIGHTENING the fail:
+//   • Identity, never class. Matched on exact `at` + `origin` + `repaired` SET +
+//     `bodyFields.length`. A NEW attempt has a different timestamp and still exits 1, even
+//     if it is the same writer doing the same thing.
+//   • `fixCommit` must be an ANCESTOR OF THE SERVING COMMIT. Roll the fix back and every
+//     ack it underwrites goes void and the event alarms again — a rollback the old
+//     unconditional exit 1 could not have distinguished from the steady state.
+//   • Undeterminable ancestry (no git, unknown sha, no serving commit) does NOT apply the
+//     ack. Fail closed.
+//   • Acked events are still PRINTED in full, every fire. An ack changes the exit code and
+//     nothing else; the record is never erased.
+//   • `events.length !== attempts` (truncation/retention) means the un-acked ones cannot be
+//     enumerated, so no ack can clear the ledger. Fail closed.
+//   • An all-acked ledger is asserting an ABSENCE of NEW attempts, so it falls through into
+//     the blindness and window-floor checks that guard every other absence here. A blind or
+//     unmeasured instrument can never reach the acknowledged pass.
+//
 // USAGE
 //   node scripts/check-boot-arm-repairs.mjs                    # grade live bqb1
 //   node scripts/check-boot-arm-repairs.mjs --host=https://…   # grade another service
 //   node scripts/check-boot-arm-repairs.mjs --payload=f.json   # grade a saved pull
 //   node scripts/check-boot-arm-repairs.mjs --min-window-days=7
+//   node scripts/check-boot-arm-repairs.mjs --acks=path.json   # default: scripts/boot-arm-repair-acks.json
+//   node scripts/check-boot-arm-repairs.mjs --no-acks          # grade as if nothing were acked
+//   node scripts/check-boot-arm-repairs.mjs --serving-commit=<sha>   # required with --payload
 //   node scripts/check-boot-arm-repairs.mjs --selftest         # controls, all directions
 //
 // EXIT CODES — every verdict is PRINTED before any return, so a caller reading stdout is
 // never at the mercy of which axis won the exit code (the TRA-2642 lesson).
 //   0  CLEAN        — zero attempts, instrument sound, over a window ≥ the floor.
 //                     The ONLY pass, and the only one with a non-empty denominator.
-//   1  ATTEMPTS     — ≥ 1 durable demotion attempt on record. THE alarm.
+//                     Also the verdict ATTEMPTS-ACKNOWLEDGED: history on record, every
+//                     event pinned to a settled issue whose fix is STILL SERVING, and no
+//                     new one since — over a real window, on a sound instrument.
+//   1  ATTEMPTS     — ≥ 1 durable demotion attempt on record that is not acknowledged (or
+//                     whose ack has gone void). THE alarm.
 //   2  NOT MEASURED — instrument sound, zero attempts, but the observation window is
 //                     absent or shorter than the floor. Vacuous. Never a pass.
 //   3  BLIND        — the record cannot be trusted (not hydrated / ephemeral DATA_DIR /
@@ -84,13 +116,72 @@ const BLIND_REASON_TEXT = {
     + 'as check-boot-arm.mjs control 3.',
 };
 
+const ACK_REQUIRED_KEYS = ['at', 'origin', 'repaired', 'bodyFieldCount', 'issue', 'fixCommit'];
+
+/** Identity of ONE ledger event. Deliberately includes the timestamp: acks never generalise. */
+function eventFingerprint(e) {
+  const repaired = Array.isArray(e?.repaired) ? [...e.repaired].sort() : [];
+  const bodyFieldCount = Array.isArray(e?.bodyFields) ? e.bodyFields.length : 0;
+  return JSON.stringify([String(e?.at ?? ''), String(e?.origin ?? ''), repaired, bodyFieldCount]);
+}
+
+function ackFingerprint(a) {
+  const repaired = Array.isArray(a?.repaired) ? [...a.repaired].sort() : [];
+  return JSON.stringify([String(a?.at ?? ''), String(a?.origin ?? ''), repaired, Number(a?.bodyFieldCount)]);
+}
+
+/**
+ * Decide which acks actually apply. `isFixServing(sha)` returns true / false / null, where
+ * null means "could not determine" — which does NOT apply the ack. Every rejection path
+ * here is reported by the caller; an ack is never silently dropped.
+ */
+export function classifyAcks(events, acks, isFixServing) {
+  const byFingerprint = new Map();
+  for (const e of events) byFingerprint.set(eventFingerprint(e), e);
+
+  const applied = new Set();   // fingerprints cleared
+  const accepted = [];         // { ack, event }
+  const malformed = [];        // { ack, why }
+  const voided = [];           // { ack, why } — matched an event but the fix is not serving
+  const orphaned = [];         // { ack } — well-formed, fix serving, but no such event
+
+  for (const ack of acks) {
+    const missing = ACK_REQUIRED_KEYS.filter((k) => ack?.[k] === undefined || ack?.[k] === null);
+    if (missing.length > 0 || !Array.isArray(ack.repaired) || !Number.isFinite(Number(ack.bodyFieldCount))) {
+      malformed.push({ ack, why: missing.length > 0 ? `missing ${missing.join(', ')}` : 'repaired must be an array and bodyFieldCount a number' });
+      continue;
+    }
+    const serving = isFixServing(String(ack.fixCommit));
+    if (serving !== true) {
+      voided.push({
+        ack,
+        why: serving === false
+          ? `fixCommit ${ack.fixCommit} is NOT an ancestor of the serving commit — the fix ROLLED BACK`
+          : `could not determine whether fixCommit ${ack.fixCommit} is in the serving build`,
+      });
+      continue;
+    }
+    const fp = ackFingerprint(ack);
+    const event = byFingerprint.get(fp);
+    if (!event) { orphaned.push({ ack }); continue; }
+    applied.add(fp);
+    accepted.push({ ack, event });
+  }
+  return { applied, accepted, malformed, voided, orphaned };
+}
+
 /**
  * Pure grader. `payload` is the parsed `/api/health/options-live` body, or null when the
  * fetch itself failed. Returns { exit, verdict, lines[] } — the selftest drives this
  * EXACT function, so a control can never pass against a different code path than live.
+ *
+ * `opts.acks` / `opts.isFixServing` carry the TRA-3852 acknowledgement ledger; omitting
+ * them grades exactly as the pre-TRA-3852 guard did (nothing acknowledged).
  */
 export function gradeBootArmRepairs(payload, opts = {}) {
   const minWindowDays = opts.minWindowDays ?? DEFAULT_MIN_WINDOW_DAYS;
+  const acks = Array.isArray(opts.acks) ? opts.acks : [];
+  const isFixServing = typeof opts.isFixServing === 'function' ? opts.isFixServing : () => null;
   const lines = [];
 
   if (payload == null || typeof payload !== 'object') {
@@ -132,15 +223,47 @@ export function gradeBootArmRepairs(payload, opts = {}) {
   lines.push(`(cross-check) bootArmWriteRepairs=${JSON.stringify(payload.bootArmWriteRepairs)} `
     + `lastWriteRepairAt=${JSON.stringify(payload.bootArmLastWriteRepairAt)}`);
 
-  // ── 1. ATTEMPTS. Outranks everything, including blindness. ──
-  if (state === 'attempts_recorded' || attempts > 0) {
+  // ── 1. ATTEMPTS. An UNACKNOWLEDGED attempt outranks everything, blindness included. ──
+  const ackReport = classifyAcks(events, acks, isFixServing);
+  let acknowledgedPass = false;
+
+  if (ackReport.malformed.length > 0 || ackReport.voided.length > 0 || ackReport.orphaned.length > 0) {
     lines.push('');
-    lines.push(`ATTEMPTS — ${attempts} DURABLE attempt(s) to demote the pinned real-money operator`);
-    lines.push('  off the board-ratified live-broker arm. The arm held (it re-converges before');
-    lines.push('  the persist), but something tried, and each one needs attribution.');
+    lines.push('ACK LEDGER — entries that did NOT clear anything (an ack is never dropped silently):');
+    for (const { ack, why } of ackReport.malformed) {
+      lines.push(`  MALFORMED  ${JSON.stringify(ack).slice(0, 160)}`);
+      lines.push(`             ${why}`);
+    }
+    for (const { ack, why } of ackReport.voided) {
+      lines.push(`  VOID       ${ack.at} (${ack.issue ?? 'no issue'}) — ${why}`);
+    }
+    for (const { ack } of ackReport.orphaned) {
+      lines.push(`  ORPHANED   ${ack.at} (${ack.issue}) matches NO event in this ledger.`);
+      lines.push('             Either the event aged past retentionDays, or this ack was written');
+      lines.push('             against a fingerprint that never existed. Reconcile it by hand —');
+      lines.push('             an ack for nothing is a claim nobody checked.');
+    }
+  }
+
+  if (state === 'attempts_recorded' || attempts > 0) {
+    const enumerable = events.length === attempts;
+    const unacked = events.filter((e) => !ackReport.applied.has(eventFingerprint(e)));
+    acknowledgedPass = enumerable && unacked.length === 0 && attempts > 0;
+
+    lines.push('');
+    if (acknowledgedPass) {
+      lines.push(`ATTEMPTS-ACKNOWLEDGED — ${attempts} DURABLE attempt(s) on record, every one pinned`);
+      lines.push('  to a settled issue whose fix is STILL IN THE SERVING BUILD, and none since. The');
+      lines.push('  history stands and is reprinted below in full; only the exit code is cleared.');
+    } else {
+      lines.push(`ATTEMPTS — ${attempts} DURABLE attempt(s) to demote the pinned real-money operator`);
+      lines.push('  off the board-ratified live-broker arm. The arm held (it re-converges before');
+      lines.push(`  the persist), but something tried, and ${unacked.length} of them is/are UNACKNOWLEDGED.`);
+    }
     lines.push('');
     for (const e of events.slice(0, 20)) {
       const ro = e.requestOrigin;
+      const hit = ackReport.accepted.find((a) => a.event === e);
       lines.push(`  ${e.at}  origin=${e.origin}  repaired=${JSON.stringify(e.repaired)}`
         + `  bodyFields=${JSON.stringify(e.bodyFields ?? [])}`
         + `${e.survivedRestart ? '  [SURVIVED A RESTART]' : ''}`);
@@ -151,17 +274,31 @@ export function gradeBootArmRepairs(payload, opts = {}) {
         lines.push('      no request behind it — the boot-arm found the PERSISTED operator already');
         lines.push('      demoted. Something reached DISK by a path that is not the settings PUT.');
       }
+      lines.push(hit
+        ? `      ACKNOWLEDGED by ${hit.ack.issue} (fix ${hit.ack.fixCommit}, verified in the serving build)`
+        : '      UNACKNOWLEDGED — this one needs attribution.');
     }
     if (events.length > 20) lines.push(`  … and ${events.length - 20} older event(s), see the raw payload.`);
     lines.push('');
     lines.push(`  distinct request origins: ${ledger.distinctRequestOrigins ?? '(absent)'}`);
     lines.push('  > 1 means MORE THAN ONE writer — do not close on a single attribution.');
+
+    if (!enumerable) {
+      lines.push('');
+      lines.push(`  ⚠ attempts=${attempts} but only ${events.length} event(s) are enumerable, so the`);
+      lines.push('  unlisted ones CANNOT be acknowledged. No ack can clear this ledger while the');
+      lines.push('  count and the list disagree.');
+    }
     if (blindReasons.length > 0) {
       lines.push('');
       lines.push(`  ⚠ the instrument is ALSO blind (${JSON.stringify(blindReasons)}), so ${attempts} is a`);
       lines.push('  LOWER BOUND, not the count. Fix the blindness before believing the number.');
     }
-    return { exit: EXIT_ATTEMPTS, verdict: 'ATTEMPTS', lines };
+
+    if (!acknowledgedPass) return { exit: EXIT_ATTEMPTS, verdict: 'ATTEMPTS', lines };
+    // Every recorded attempt is settled, so what is left is an ABSENCE claim about NEW
+    // attempts — and an absence only passes here if it was actually measured. Fall through
+    // into the same blindness and window-floor gates that guard CLEAN.
   }
 
   // ── 2. BLIND. Zero attempts, but the zero is not readable as a measurement. ──
@@ -178,17 +315,19 @@ export function gradeBootArmRepairs(payload, opts = {}) {
     return { exit: EXIT_BLIND, verdict: 'BLIND', lines };
   }
 
-  // ── 3. Sound instrument, zero attempts. Is the window real? ──
-  if (state !== 'no_attempt_observed') {
+  // ── 3. Sound instrument, no UNACKNOWLEDGED attempts. Is the window real? ──
+  if (state !== 'no_attempt_observed' && !acknowledgedPass) {
     lines.push('');
     lines.push(`BLIND — unrecognized state ${JSON.stringify(state)}. A grader that does not`);
     lines.push('  understand its own input must not emit a pass.');
     return { exit: EXIT_BLIND, verdict: 'BLIND', lines };
   }
 
+  const absenceSubject = acknowledgedPass ? 'zero NEW attempts' : 'zero attempts';
+
   if (observingDays == null) {
     lines.push('');
-    lines.push('NOT MEASURED — zero attempts, but `observingDays` is null: no observation marker');
+    lines.push(`NOT MEASURED — ${absenceSubject}, but \`observingDays\` is null: no observation marker`);
     lines.push('  is on record, so there is no window over which the absence is asserted. This is');
     lines.push('  an assertion about nothing. Expect it to clear on the next boot, which writes');
     lines.push('  the marker; if it persists, the marker append is failing silently.');
@@ -197,7 +336,7 @@ export function gradeBootArmRepairs(payload, opts = {}) {
 
   if (Number(observingDays) < minWindowDays) {
     lines.push('');
-    lines.push(`NOT MEASURED — zero attempts over only ${observingDays}d, under the ${minWindowDays}d floor.`);
+    lines.push(`NOT MEASURED — ${absenceSubject} over only ${observingDays}d, under the ${minWindowDays}d floor.`);
     lines.push('  A ledger that started watching moments ago has seen nothing BECAUSE it has');
     lines.push('  barely looked, which is exactly the post-redeploy state that made the old');
     lines.push('  since-boot counter useless. Not a pass; re-read after the floor elapses.');
@@ -205,6 +344,14 @@ export function gradeBootArmRepairs(payload, opts = {}) {
   }
 
   lines.push('');
+  if (acknowledgedPass) {
+    lines.push(`ATTEMPTS-ACKNOWLEDGED — ${attempts} settled attempt(s) and zero NEW ones across`);
+    lines.push(`  ${observingDays} day(s) of continuous observation (${ledger.observationBoots} process lifetime(s)), on a`);
+    lines.push('  NON-ephemeral path, with an ELIGIBLE arm and no swallowed appends. This is a pass');
+    lines.push('  ONLY because each recorded event names a settled issue whose fix is still an');
+    lines.push('  ancestor of the serving commit — roll one back and this goes red again.');
+    return { exit: EXIT_CLEAN, verdict: 'ATTEMPTS-ACKNOWLEDGED', lines };
+  }
   lines.push(`CLEAN — zero durable demotion attempts across ${observingDays} day(s) of continuous`);
   lines.push(`  observation (${ledger.observationBoots} process lifetime(s)), on a NON-ephemeral path,`);
   lines.push('  with an ELIGIBLE arm and no swallowed appends. The denominator is real: this');
@@ -370,9 +517,87 @@ if (process.argv.includes('--selftest')) {
     ['13 blind: unrecognized state', wrap(soundLedger({ state: 'probably_fine' })), EXIT_BLIND],
   ];
 
+  // ── TRA-3852 acknowledgement controls ─────────────────────────────────────
+  // Control 1 above ALREADY pins the floor: the incident with NO acks passes no options
+  // and must stay RED. Everything here is about not letting an ack become a mute button.
+  const attemptsLedger = (over = {}) => soundLedger({
+    state: 'attempts_recorded',
+    events: [theIncident],
+    attempts: 1,
+    attemptsByOrigin: { settings_write: 1, boot: 0 },
+    distinctRequestOrigins: 1,
+    lastAttemptAt: theIncident.ts,
+    durability: { ...soundLedger().durability, hydratedRepairs: 1, hydratedRecords: 48 },
+    ...over,
+  });
+  const goodAck = {
+    at: '2026-08-16T18:42:20.569Z',
+    origin: 'settings_write',
+    repaired: ['mode'],
+    bodyFieldCount: 1,
+    issue: 'TRA-3833',
+    fixCommit: '0ce7226',
+  };
+  const SERVING = () => true;
+  const ROLLED_BACK = () => false;
+  const UNKNOWN = () => null;
+  // A second attempt of the SAME SHAPE, one day later. The ack must not reach it.
+  const copycat = { ...theIncident, ts: theIncident.ts + DAY, at: '2026-08-17T18:42:20.569Z' };
+
+  const ackControls = [
+    ['14 ack: settled event, fix in the serving build → cleared',
+      wrap(attemptsLedger()), EXIT_CLEAN, { acks: [goodAck], isFixServing: SERVING }],
+
+    // THE tightening. Today an unconditional exit 1 could not tell a rollback from steady
+    // state; an ack that self-voids on rollback can.
+    ['15 ack VOID: the fix rolled out of the serving build → RED again',
+      wrap(attemptsLedger()), EXIT_ATTEMPTS, { acks: [goodAck], isFixServing: ROLLED_BACK }],
+
+    ['16 ack VOID: ancestry undeterminable → fails CLOSED',
+      wrap(attemptsLedger()), EXIT_ATTEMPTS, { acks: [goodAck], isFixServing: UNKNOWN }],
+
+    // Identity, never class: same writer, same body, same repaired field, new timestamp.
+    ['17 ack is per-EVENT: an identical-shaped NEW attempt still alarms',
+      wrap(attemptsLedger({ events: [theIncident, copycat], attempts: 2, lastAttemptAt: copycat.ts })),
+      EXIT_ATTEMPTS, { acks: [goodAck], isFixServing: SERVING }],
+
+    // An all-acked ledger asserts an ABSENCE of new attempts, so coverage now binds it.
+    ['18 acked + blind instrument → BLIND, not a pass',
+      wrap(attemptsLedger({ blindReasons: ['append_errors'], durability: { ...soundLedger().durability, appendErrors: 2 } })),
+      EXIT_BLIND, { acks: [goodAck], isFixServing: SERVING }],
+
+    ['19 acked + no observation window → NOT MEASURED, not a pass',
+      wrap(attemptsLedger({ observingSinceMs: null, observingDays: null, observationBoots: 0 })),
+      EXIT_NOT_MEASURED, { acks: [goodAck], isFixServing: SERVING }],
+
+    // The count and the list disagree ⇒ the unlisted attempts are unackable.
+    ['20 acked but attempts > enumerable events → RED',
+      wrap(attemptsLedger({ attempts: 2, attemptsByOrigin: { settings_write: 2, boot: 0 } })),
+      EXIT_ATTEMPTS, { acks: [goodAck], isFixServing: SERVING }],
+
+    ['21 malformed ack (no fixCommit) clears nothing',
+      wrap(attemptsLedger()), EXIT_ATTEMPTS,
+      { acks: [{ ...goodAck, fixCommit: undefined }], isFixServing: SERVING }],
+
+    ['22 wrong-shape ack (bodyFieldCount off by one) clears nothing',
+      wrap(attemptsLedger()), EXIT_ATTEMPTS,
+      { acks: [{ ...goodAck, bodyFieldCount: 61 }], isFixServing: SERVING }],
+
+    // An ack pointing at nothing must not quietly disappear — but a zero-attempt ledger is
+    // still CLEAN, because the ack cleared no alarm to begin with.
+    ['23 orphaned ack on a clean ledger is reported, not fatal',
+      wrap(soundLedger()), EXIT_CLEAN, { acks: [goodAck], isFixServing: SERVING }],
+  ];
+
   let failed = 0;
   for (const [name, payload, want] of controls) {
     const got = gradeBootArmRepairs(payload, { minWindowDays: DEFAULT_MIN_WINDOW_DAYS }).exit;
+    const ok = got === want;
+    if (!ok) failed += 1;
+    console.log(`${ok ? 'ok  ' : 'FAIL'}  control ${name} → exit ${got} (want ${want})`);
+  }
+  for (const [name, payload, want, ackOpts] of ackControls) {
+    const got = gradeBootArmRepairs(payload, { minWindowDays: DEFAULT_MIN_WINDOW_DAYS, ...ackOpts }).exit;
     const ok = got === want;
     if (!ok) failed += 1;
     console.log(`${ok ? 'ok  ' : 'FAIL'}  control ${name} → exit ${got} (want ${want})`);
@@ -392,6 +617,20 @@ if (process.argv.includes('--selftest')) {
       gradeBootArmRepairs(controls[4][1]), 'DATA_DIR=/data'],
     ['discloses the lower-bound caveat when blind AND holding an attempt',
       gradeBootArmRepairs(controls[8][1]), 'LOWER BOUND'],
+    // The acked pass must still SHOW the history — an ack that hides the event would be
+    // worse than the pinned alarm it replaces.
+    ['still prints the acked event and names its settling issue',
+      gradeBootArmRepairs(ackControls[0][1], ackControls[0][3]), 'ACKNOWLEDGED by TRA-3833'],
+    ['still prints the acked event timestamp on the pass',
+      gradeBootArmRepairs(ackControls[0][1], ackControls[0][3]), '2026-08-16T18:42:20.569Z'],
+    ['names a rolled-back fix as the reason the ack went void',
+      gradeBootArmRepairs(ackControls[1][1], ackControls[1][3]), 'ROLLED BACK'],
+    ['marks the un-acked copycat attempt as UNACKNOWLEDGED',
+      gradeBootArmRepairs(ackControls[3][1], ackControls[3][3]), 'UNACKNOWLEDGED'],
+    ['reports an orphaned ack rather than swallowing it',
+      gradeBootArmRepairs(ackControls[9][1], ackControls[9][3]), 'ORPHANED'],
+    ['the acked pass declares its own precondition',
+      gradeBootArmRepairs(ackControls[0][1], ackControls[0][3]), 'ancestor of the serving commit'],
   ];
   for (const [name, result, want] of textChecks) {
     const ok = result.lines.join('\n').includes(want);
@@ -431,6 +670,33 @@ if (!Number.isFinite(minWindowDays) || minWindowDays < 0) {
   process.exit(EXIT_BLIND);
 }
 
+// ── acknowledgement ledger (TRA-3852) ───────────────────────────────────────
+const ackPathArg = args.find((a) => a.startsWith('--acks='))?.slice('--acks='.length);
+const noAcks = args.includes('--no-acks');
+const servingCommitArg = args.find((a) => a.startsWith('--serving-commit='))?.slice('--serving-commit='.length);
+
+let acks = [];
+if (!noAcks) {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const path = await import('node:path');
+  const defaultAckPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'boot-arm-repair-acks.json');
+  const ackPath = ackPathArg ?? defaultAckPath;
+  try {
+    const parsed = JSON.parse(readFileSync(ackPath, 'utf-8'));
+    acks = Array.isArray(parsed) ? parsed : (parsed.acks ?? []);
+    console.log(`acks:   ${ackPath} (${acks.length} entr${acks.length === 1 ? 'y' : 'ies'})`);
+  } catch (err) {
+    // A missing file is the normal empty case. An unreadable one must NOT be, because a
+    // silently-empty ack list still grades correctly (RED) — but a silently-empty list that
+    // was supposed to hold entries would hide that they stopped being checked.
+    if (ackPathArg || err.code !== 'ENOENT') console.log(`acks:   could not read ${ackPath}: ${err.message} — grading with NO acknowledgements`);
+    acks = [];
+  }
+} else {
+  console.log('acks:   --no-acks — grading as if nothing were acknowledged');
+}
+
 let payload = null;
 if (payloadArg) {
   try {
@@ -451,5 +717,38 @@ if (payloadArg) {
     console.log(`probe unreachable: ${err.message}`);
   }
 }
+// Resolve the commit the service is actually SERVING, then answer ancestry from the local
+// checkout. Anything unknown here answers `null`, which applies no ack.
+let servingCommit = servingCommitArg ?? null;
+if (acks.length > 0 && !servingCommit && !payloadArg) {
+  try {
+    const res = await fetch(`${host}/api/health/version`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    if (res.ok) servingCommit = (await res.json()).commit ?? null;
+  } catch { /* leave null — acks will not apply */ }
+}
+if (acks.length > 0) {
+  console.log(`serving: ${servingCommit ?? '(unknown — no ack can apply)'}`);
+}
+
+const { spawnSync } = await import('node:child_process');
+const { fileURLToPath: toPath } = await import('node:url');
+const nodePath = await import('node:path');
+const repoRoot = nodePath.resolve(nodePath.dirname(toPath(import.meta.url)), '..');
+
+const ancestryCache = new Map();
+const isFixServing = (sha) => {
+  if (!servingCommit) return null;
+  const key = `${sha}..${servingCommit}`;
+  if (ancestryCache.has(key)) return ancestryCache.get(key);
+  let answer = null;
+  try {
+    const probe = spawnSync('git', ['merge-base', '--is-ancestor', sha, servingCommit], { encoding: 'utf-8', cwd: repoRoot });
+    // 0 = ancestor, 1 = not an ancestor, anything else (unknown sha, no repo) = cannot tell.
+    if (probe.error == null && (probe.status === 0 || probe.status === 1)) answer = probe.status === 0;
+  } catch { answer = null; }
+  ancestryCache.set(key, answer);
+  return answer;
+};
+
 console.log('');
-process.exit(report(gradeBootArmRepairs(payload, { minWindowDays })));
+process.exit(report(gradeBootArmRepairs(payload, { minWindowDays, acks, isFixServing })));
