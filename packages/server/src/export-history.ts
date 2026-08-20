@@ -5,6 +5,7 @@ import type {
   ExportFilters,
   ExportMarket,
   ExportMarketCoverage,
+  ExportMoneyRestatement,
   ExportTradeRow,
 } from './export.js';
 import { formatHoldDuration } from './export.js';
@@ -14,6 +15,7 @@ export type {
   ExportCoverage,
   ExportCoverageSource,
   ExportMarketCoverage,
+  ExportMoneyRestatement,
   ExportSourceCounts,
 } from './export.js';
 
@@ -386,6 +388,7 @@ export function checkExportRangeServable(
  * satisfy `gross - fees === net` exactly at cent precision.
  */
 export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRow {
+  const restated = r.pnlBasis === 'broker-fill';
   const net = isFiniteNumber(r.realizedPnlUsd) ? Math.round((r.realizedPnlUsd + Number.EPSILON) * 100) / 100 : null;
   const fees = isFiniteNumber(r.feesUsd) ? Math.round((r.feesUsd + Number.EPSILON) * 100) / 100 : 0;
   const gross = net === null ? null : Math.round((net + fees + Number.EPSILON) * 100) / 100;
@@ -399,16 +402,83 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
     strategy: r.structure,
     quantity: isFiniteNumber(r.contracts) ? r.contracts : 0,
     entry_time: isFiniteNumber(r.openTs) ? new Date(r.openTs).toISOString() : '',
-    entry_price: isFiniteNumber(r.entryMarkUsd) ? r.entryMarkUsd : null,
+    // TRA-3875 — on a RESTATED row the broker's own entry fill is the basis the
+    // published `net` was computed against (`tra2819-close-basis-restate.ts:386`,
+    // `entryCost / contracts / 100` — per share, same unit as `entryMarkUsd` and
+    // as `rowFromOption`'s `premiumPaid`). Publishing the pre-trade MID next to a
+    // broker-settled P&L is the same internal contradiction this ticket is about,
+    // one column over. Unrestated rows keep the mark, unchanged.
+    entry_price: restated && isFiniteNumber(r.entryFillPremium)
+      ? r.entryFillPremium
+      : (isFiniteNumber(r.entryMarkUsd) ? r.entryMarkUsd : null),
     exit_time: isFiniteNumber(r.closeTs) ? new Date(r.closeTs).toISOString() : '',
-    exit_price: null,
+    // TRA-3875 — and the exit premium the doc-comment above says the journal
+    // "never recorded" IS recorded, on restated rows only, as `exitFillPremium`.
+    // That single fact is why TRA-3860's dedupe (book wins, because only the book
+    // has the exit premium) had to be re-ruled: on a restated row the journal does
+    // not tie the book here, it beats it — a broker fill against a last mark. The
+    // "a blank beats a fabricated price" rule still holds for every other row,
+    // because a measured fill is not a fabrication.
+    exit_price: restated && isFiniteNumber(r.exitFillPremium) ? r.exitFillPremium : null,
     exit_reason: r.exitReason ?? '',
     gross_pnl_usd: gross,
     fees_usd: fees,
     net_pnl_usd: net,
     pnl_r: isFiniteNumber(r.realizedR) ? Math.round((r.realizedR + Number.EPSILON) * 1000) / 1000 : null,
     hold_duration: formatHoldDuration(r.openTs, r.closeTs),
+    source: 'journal',
+    pnl_basis: restated ? 'broker-fill' : 'book',
   };
+}
+
+/**
+ * TRA-3875 — the restatements a book row must adopt, keyed by trade id.
+ *
+ * ⚠️ Same precondition as {@link selectJournalExportRows} — `rows` must ALREADY
+ * be book-scoped by `journalRowsForBook`, or one account's restatement lands on
+ * another's book row.
+ *
+ * `bookIds` is the in-memory book's id set: this is deliberately the COMPLEMENT
+ * of the set `selectJournalExportRows` serves. Every closed journal row either
+ * (a) has no book twin and is served directly by that function, carrying its own
+ * restated money, or (b) has a book twin, is dropped there, and its money is
+ * carried over HERE. Exactly one path handles each row, so no restatement is
+ * double-counted and none is lost.
+ *
+ * Only `pnlBasis: 'broker-fill'` rows produce an entry. A journal row without it
+ * holds the engine's own figure — the same figure the book holds — so there is
+ * nothing to supersede, and manufacturing an entry would replace a number with
+ * itself while incrementing `supersededRowCount`. A restatement is a MEASURED
+ * disagreement or it is not published.
+ *
+ * `feesUsd` is set only alongside `pnlBasis` (TRA-2819, never zero-filled), so
+ * the `fees_usd: 0` fallback here is unreachable in practice and is kept only so
+ * the type is total.
+ */
+export function collectJournalMoneyRestatements(
+  rows: readonly OptionTradeJournalRecord[],
+  bookIds: ReadonlySet<string>,
+): Map<string, ExportMoneyRestatement> {
+  const out = new Map<string, ExportMoneyRestatement>();
+  for (const r of rows) {
+    if (r.outcome === 'OPEN') continue;
+    if (!isFiniteNumber(r.closeTs)) continue;
+    if (!bookIds.has(r.id)) continue;
+    if (r.pnlBasis !== 'broker-fill') continue;
+    const mapped = rowFromJournalRecord(r);
+    out.set(r.id, {
+      gross_pnl_usd: mapped.gross_pnl_usd,
+      fees_usd: mapped.fees_usd,
+      net_pnl_usd: mapped.net_pnl_usd,
+      // The restatement re-derives `realizedR` in the same write that moves the
+      // money (`option-trade-journal.ts`), so R travels with it. Keeping the
+      // book's R would publish an R computed from the number just replaced.
+      pnl_r: mapped.pnl_r,
+      exit_price: mapped.exit_price,
+      entry_price: mapped.entry_price,
+    });
+  }
+  return out;
 }
 
 /**
@@ -422,10 +492,20 @@ export function rowFromJournalRecord(r: OptionTradeJournalRecord): ExportTradeRo
  *
  * `excludeIds` is the in-memory book's id set. The journal is keyed on the
  * position id (`recordOptionTradeOpen({ id: position.id })`), so an id present in
- * both is the SAME trade — and the book's copy wins because it carries the exit
- * premium the journal never recorded. Dropping the journal twin here rather than
- * merging field-by-field keeps a recovered row from silently inheriting a richer
- * provenance than it has.
+ * both is the SAME trade, and exactly one of the two copies may be served or the
+ * day double-counts. The BOOK copy is the one that survives — it carries the
+ * exit premium, the exit reason and the strategy label.
+ *
+ * ⚠️ TRA-3875 — dropping the twin used to drop its MONEY with it, and that cost
+ * the close basis: a restated journal figure (-156.23) was discarded in favour of
+ * the book's superseded one (-278.00) for as long as the book twin existed, i.e.
+ * until the 21:00 ET archive. The row-level drop is still right; what was wrong
+ * was that it was TOTAL. {@link collectJournalMoneyRestatements} now carries the
+ * restated money columns across onto the surviving book row, and
+ * `summary.supersededRowCount` publishes how often that happened. The original
+ * objection to merging — "a recovered row silently inheriting a richer provenance
+ * than it has" — is met by the `source`/`pnl_basis` fields, not by refusing to
+ * merge: the merge is now stated on every row it touched.
  */
 export function selectJournalExportRows(
   rows: readonly OptionTradeJournalRecord[],

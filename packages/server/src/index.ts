@@ -734,12 +734,13 @@ import {
   type ExportFilters,
   type ExportFormat,
   type ExportSummary,
-  type ExportTradeRow,
 } from './export.js';
 // TRA-3860 — the coverage floor + refusal that stop `/api/trades/export` from
 // answering an unservable historical range with an empty 200.
 import {
   checkExportRangeServable,
+  // TRA-3875 — the restated money columns a surviving BOOK row must adopt.
+  collectJournalMoneyRestatements,
   coverageHeaderValue,
   resolveExportCoverage,
   selectJournalExportRows,
@@ -9500,12 +9501,19 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
     }
 
     // Journal rows are de-duped against the book by trade id (the journal is
-    // keyed on `position.id`), and the BOOK copy wins — it carries the exit
-    // premium the journal never recorded.
-    const journalExportRows = selectJournalExportRows(
-      bookJournalRows,
-      new Set(optionsClosed.map(o => o.id)),
-    );
+    // keyed on `position.id`), and the BOOK copy wins the ROW — it carries the
+    // exit premium, the exit reason and the strategy label.
+    const bookOptionIds = new Set(optionsClosed.map(o => o.id));
+    const journalExportRows = selectJournalExportRows(bookJournalRows, bookOptionIds);
+
+    // TRA-3875 — ...but it does NOT win the MONEY. TRA-3730's sweep restates the
+    // journal and never touches `OptionPosition.pnl`, so for as long as the book
+    // twin existed (i.e. until the 21:00 ET archive) this route published the
+    // SUPERSEDED close basis, and the restated one only afterwards: -278.00 vs
+    // -156.23 on `SPY260821C00777000`, same route, same query, selected by the
+    // hour of the read. The restated columns are carried onto the surviving book
+    // row here, so the answer no longer moves on a clock.
+    const optionMoneyRestatements = collectJournalMoneyRestatements(bookJournalRows, bookOptionIds);
 
     const { rows, summary } = buildExport(
       {
@@ -9513,18 +9521,20 @@ app.get('/api/trades/export', requireAuth, async (req, res, next) => {
         cryptoClosed: collectClosedCrypto(cryptoSnap),
         optionsClosed,
         preMappedRows: journalExportRows,
+        optionMoneyRestatements,
       },
       filters,
     );
 
     // Provenance census over the SERVED rows, not the candidates: a filter that
-    // drops every journal row must report 0, not the number we offered up.
-    const journalRowSet = new Set<ExportTradeRow>(journalExportRows);
-    const journalServed = rows.reduce((n, r) => n + (journalRowSet.has(r) ? 1 : 0), 0);
+    // drops every journal row must report 0, not the number we offered up. It is
+    // computed inside `summarize()` since TRA-3875 (off each row's own `source`)
+    // rather than by object identity against `journalExportRows` — the identity
+    // test could not survive a row being COPIED, which the restatement overlay
+    // now does, and would have silently re-attributed every restated book row.
     const summaryWithCoverage: ExportSummary = {
       ...summary,
       coverage,
-      sources: { book: rows.length - journalServed, journal: journalServed },
       filtersRequested,
     };
 

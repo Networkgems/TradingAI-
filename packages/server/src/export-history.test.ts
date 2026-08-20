@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildExport, type ExportFilters } from './export.js';
+import type { OptionPosition } from '@trading-app/shared';
+import { buildExport, toCsv, EXPORT_COLUMNS, type ExportFilters } from './export.js';
 import {
   checkExportRangeServable,
+  collectJournalMoneyRestatements,
   coverageHeaderValue,
   journalFloorForMode,
   resolveExportCoverage,
@@ -136,9 +138,11 @@ describe('TRA-3860 AC1 — an archived day is served, with its exit reasons', ()
 
   it('does not fabricate the prices the journal never recorded', () => {
     const row = rowFromJournalRecord(journalRow());
-    // `tradier_import` rows carry no fill mark, and the journal records no exit
-    // premium for ANY row. Blank, never a stand-in — a fabricated price in an
-    // audit export is worse than a missing one.
+    // `tradier_import` rows carry no fill mark, and an UNRESTATED journal row
+    // records no exit premium. Blank, never a stand-in — a fabricated price in an
+    // audit export is worse than a missing one. (A row RESTATED from the fill
+    // ledger does hold measured broker fills; see the TRA-3875 block below. A
+    // measured fill is not a fabrication, and this row has neither.)
     expect(row.entry_price).toBeNull();
     expect(row.exit_price).toBeNull();
     // What it DOES know is carried exactly.
@@ -444,5 +448,328 @@ describe('TRA-3864 AC2 — a restated journal row exports the fee it actually pa
     );
     expect(row.net_pnl_usd).toBeNull();
     expect(row.gross_pnl_usd).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRA-3875 — the route published TWO P&L figures for one contract, selected by
+// nothing but the HOUR of the read.
+//
+// `SPY260821C00777000`, live money, closed 2026-08-18: **-278.00** before the
+// 21:00 ET archive and **-156.23** after it. Day total -393.00 then -271.23. A
+// $121.77 swing, same route, same query, same trade — and the half served during
+// the trading day, the one a desk actually reads, was the SUPERSEDED one.
+//
+// Two correct tickets composing into a hole:
+//   1. TRA-2819/TRA-3730 restate the JOURNAL and deliberately never touch
+//      `OptionPosition.pnl` on the in-memory book.
+//   2. TRA-3860's dedupe drops the journal twin whenever the book still holds the
+//      same `position.id` — and dropped its restated MONEY with it.
+//   3. `archiveClosedOptions()` empties `closedOptions` at 21:00 ET, so the book
+//      twin, and with it the superseded figure, vanishes on a clock.
+//
+// The worst part is the reconciliation inversion: pre-archive the export total
+// (-393.00) MATCHED the frozen day cell (-393.00), so an export-vs-day-cell check
+// came back GREEN during the trading day and RED after it — and the RED one is
+// the correct state, because TRA-3864 ruled (b) FREEZE so the divergence stays
+// visible. Two surfaces sharing one superseded number is not corroboration.
+//
+// ## The pre-registered read this suite stands in for
+//
+// QA could not measure the pre-archive half: the 21:00 ET archive had already run
+// and `closedOptions` was 0 across every book, so no book twin was left to serve.
+// The claim was filed DERIVED, with the confirming read pre-registered for the
+// next ET day carrying an imported option close. These fixtures ARE that read,
+// constructed from the deployed source: `BOOK_SPY` is the book twin as
+// `archiveClosedOptions()` had already deleted it, and every number in it is an
+// incident anchor. The suite therefore runs the pre-archive half that the live
+// box will not offer again until the next imported close.
+//
+// **Both halves are asserted in the same test.** The defect is not that either
+// figure is wrong on its own — it is that the two DISAGREE and are never on
+// screen together. A suite that measured one hour would reproduce exactly the
+// blindness being fixed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The SPY book twin as bqb1 held it before the 2026-08-19T01:00Z archive.
+ *
+ * `pnl: -278` is the engine's own close arithmetic and the value the frozen day
+ * cell is built from (-115.00 + -278.00 = -393.00). The premiums reconstruct it
+ * exactly: (1.41 − 4.19) × 1 × 100 = -278. `stopLossPremium: 2` reproduces the
+ * journal's `atRiskUsd: 219`, so the book's own R is -278/219 = -1.269 — which is
+ * what makes the R assertion below discriminating rather than decorative.
+ */
+function bookSpy(overrides: Partial<OptionPosition> = {}): OptionPosition {
+  return {
+    id: 'row-2',
+    symbol: 'SPY',
+    optionSymbol: 'SPY260821C00777000',
+    optionType: 'call',
+    strike: 777,
+    expiration: '2026-08-21',
+    contracts: 1,
+    contractsRemaining: 0,
+    premiumPaid: 4.19,
+    currentPremium: 1.41,
+    stopLossPremium: 2,
+    openedAt: Date.parse('2026-08-17T17:04:49.377Z'),
+    closedAt: Date.parse('2026-08-18T13:45:40.706Z'),
+    pnl: -278,
+    signalType: 'tradier_import',
+    exitReason: 'sl',
+    mode: 'live',
+    ...overrides,
+  } as OptionPosition;
+}
+
+/** The PLTR book twin. Its journal row was never restated — nothing to supersede. */
+function bookPltr(overrides: Partial<OptionPosition> = {}): OptionPosition {
+  return {
+    id: 'row-1',
+    symbol: 'PLTR',
+    optionSymbol: 'PLTR260821C00180000',
+    optionType: 'call',
+    strike: 180,
+    expiration: '2026-08-21',
+    contracts: 1,
+    contractsRemaining: 0,
+    premiumPaid: 3.04,
+    currentPremium: 1.89,
+    stopLossPremium: 1.52,
+    openedAt: Date.parse('2026-08-17T13:46:42.923Z'),
+    closedAt: Date.parse('2026-08-18T13:30:14.833Z'),
+    pnl: -115,
+    signalType: 'tradier_import',
+    exitReason: 'sl',
+    mode: 'live',
+    ...overrides,
+  } as OptionPosition;
+}
+
+/**
+ * `SPY260821C00777000` as the journal holds it after the TRA-3730 sweep, WITH the
+ * broker fills the restatement measures (`tra2819-close-basis-restate.ts` —
+ * `entryCost / contracts / 100`, per share).
+ *
+ * `realizedR` is re-derived by the restatement in the same write that moves the
+ * money (`option-trade-journal.ts`), so it is -156.23/219 = -0.713 here, NOT the
+ * -1.269 the book still carries. `SPY_RESTATED` above keeps the book's R because
+ * TRA-3864 only ever read `feesUsd` off it; this fixture is the one that has to
+ * be right about R.
+ */
+const SPY_RESTATED_WITH_FILLS = journalRow({
+  id: 'row-2',
+  symbol: 'SPY',
+  optionSymbol: 'SPY260821C00777000',
+  openTs: Date.parse('2026-08-17T17:04:49.377Z'),
+  closeTs: Date.parse('2026-08-18T13:45:40.706Z'),
+  atRiskUsd: 219,
+  realizedPnlUsd: -156.23,
+  realizedR: -0.7133789954337899,
+  pnlBasis: 'broker-fill',
+  feesUsd: 0.23,
+  entryFillPremium: 3.2,
+  exitFillPremium: 1.64,
+  realizedPnlUsdBeforeRestatement: -278,
+} as Partial<OptionTradeJournalRecord>);
+
+/** The live journal for ET 2026-08-18: PLTR unrestated, SPY restated. */
+const JOURNAL_0818 = [journalRow(), SPY_RESTATED_WITH_FILLS];
+
+const DAY_0818: ExportFilters = {
+  markets: ['options'],
+  modes: ['live'],
+  ...day('2026-08-18'),
+};
+
+/**
+ * One export, at one of the two hours. `archived` is the ONLY thing that varies —
+ * it is exactly what `archiveClosedOptions()` does at 21:00 ET, and the whole
+ * ticket is the claim that it must not change the money.
+ */
+function exportAt({ archived }: { archived: boolean }) {
+  const optionsClosed = archived ? [] : [bookPltr(), bookSpy()];
+  const bookIds = new Set(optionsClosed.map(o => o.id));
+  return buildExport(
+    {
+      stocksClosed: [],
+      cryptoClosed: [],
+      optionsClosed,
+      preMappedRows: selectJournalExportRows(JOURNAL_0818, bookIds),
+      optionMoneyRestatements: collectJournalMoneyRestatements(JOURNAL_0818, bookIds),
+    },
+    DAY_0818,
+  );
+}
+
+const spyRow = (rows: ReturnType<typeof exportAt>['rows']) =>
+  rows.find(r => r.symbol === 'SPY260821C00777000')!;
+const pltrRow = (rows: ReturnType<typeof exportAt>['rows']) =>
+  rows.find(r => r.symbol === 'PLTR260821C00180000')!;
+
+describe('TRA-3875 AC1 — the money columns do not move on the clock', () => {
+  it('serves -156.23 / -271.23 BOTH before and after the 21:00 ET archive', () => {
+    const before = exportAt({ archived: false });
+    const after = exportAt({ archived: true });
+
+    // The pre-archive half is the one that was wrong. It published -278.00 and a
+    // day of -393.00 — the arithmetic sum of the two BOOK figures, which is also
+    // the frozen day cell, which is why the reconciliation came back GREEN for
+    // the wrong reason.
+    expect(spyRow(before.rows).net_pnl_usd).toBe(-156.23);
+    expect(before.summary.totals.net_pnl_usd).toBe(-271.23);
+
+    // The post-archive half was already right and must stay untouched.
+    expect(spyRow(after.rows).net_pnl_usd).toBe(-156.23);
+    expect(after.summary.totals.net_pnl_usd).toBe(-271.23);
+
+    // The defect itself, stated as one assertion: the two hours agree.
+    expect(before.summary.totals).toEqual(after.summary.totals);
+  });
+
+  it('carries fees and gross across too, not just net', () => {
+    const before = exportAt({ archived: false }).summary;
+    const after = exportAt({ archived: true }).summary;
+    // The book records no per-trade commission, so pre-archive this totalled 0
+    // fees on a day whose fee was MEASURED at $0.23 (TRA-3864, one surface over).
+    expect(before.totals.fees_usd).toBe(0.23);
+    expect(after.totals.fees_usd).toBe(0.23);
+    expect(before.totals.gross_pnl_usd).toBe(-271);
+    // gross − fees === net, with content rather than vacuously.
+    const spy = spyRow(exportAt({ archived: false }).rows);
+    expect(spy.gross_pnl_usd).toBe(-156);
+    expect(spy.fees_usd).toBe(0.23);
+    expect(spy.gross_pnl_usd! - spy.fees_usd).toBeCloseTo(spy.net_pnl_usd!, 10);
+  });
+
+  it('moves pnl_r with the money instead of leaving an R computed from the figure it replaced', () => {
+    const spy = spyRow(exportAt({ archived: false }).rows);
+    // The book's own R is -278/219 = -1.269 and would be arithmetically
+    // inconsistent with a net of -156.23 sitting in the next column.
+    expect(spy.pnl_r).toBe(-0.713);
+    expect(spy.pnl_r).not.toBe(-1.269);
+  });
+});
+
+describe('TRA-3875 AC2 — the exit premium is NOT the price of the fix', () => {
+  it('keeps a measured exit price on the restated row, from the broker fill', () => {
+    const before = spyRow(exportAt({ archived: false }).rows);
+    const after = spyRow(exportAt({ archived: true }).rows);
+    // TRA-3860's dedupe existed because "only the book has the exit premium".
+    // On a RESTATED row that is false: the restatement measures `exitFillPremium`,
+    // a broker fill, which beats the book's last mark of 1.41.
+    expect(before.exit_price).toBe(1.64);
+    expect(after.exit_price).toBe(1.64);
+    expect(before.entry_price).toBe(3.2);
+    // So option (2) "journal wins outright, accept a null exit_price" would have
+    // paid a price this route does not actually have to pay.
+    expect(before.exit_price).not.toBeNull();
+  });
+
+  it('leaves the columns the journal does not restate to the book', () => {
+    const before = spyRow(exportAt({ archived: false }).rows);
+    // `closeTs`, `exitReason` and the strategy label are carried through the
+    // restatement by the spread and deliberately not restated.
+    expect(before.exit_reason).toBe('sl');
+    expect(before.strategy).toBe('tradier_import');
+    expect(before.exit_time).toBe('2026-08-18T13:45:40.706Z');
+    expect(before.quantity).toBe(1);
+  });
+});
+
+describe('TRA-3875 AC3 — an UNRESTATED twin is left exactly as it was', () => {
+  it('does not touch PLTR, whose journal row carries no pnlBasis', () => {
+    const before = pltrRow(exportAt({ archived: false }).rows);
+    expect(before.net_pnl_usd).toBe(-115);
+    expect(before.fees_usd).toBe(0);
+    expect(before.pnl_basis).toBe('book');
+    // The BOOK's mark survives, because there is no broker fill to prefer.
+    expect(before.exit_price).toBe(1.89);
+    expect(before.entry_price).toBe(3.04);
+  });
+
+  it('reports no restatement for a row with no measured disagreement', () => {
+    const restatements = collectJournalMoneyRestatements(
+      [journalRow()],
+      new Set(['row-1']),
+    );
+    // Manufacturing an entry here would replace a number with itself while
+    // incrementing `supersededRowCount` — a fabricated conflict.
+    expect(restatements.size).toBe(0);
+  });
+});
+
+describe('TRA-3875 AC4 — the two paths PARTITION the journal, so nothing doubles', () => {
+  it('still drops the journal twin: two rows, never four', () => {
+    expect(exportAt({ archived: false }).rows).toHaveLength(2);
+    expect(exportAt({ archived: true }).rows).toHaveLength(2);
+  });
+
+  it('routes a row with NO book twin to the served path, not the restatement path', () => {
+    // Post-archive: `bookIds` is empty, so the restatement map must be empty and
+    // the row must instead be SERVED by `selectJournalExportRows` carrying its own
+    // restated money. Exactly one path per row, in both directions.
+    expect(collectJournalMoneyRestatements(JOURNAL_0818, new Set()).size).toBe(0);
+    expect(selectJournalExportRows(JOURNAL_0818, new Set())).toHaveLength(2);
+
+    // Pre-archive: the mirror. The restatement path takes SPY, the served path
+    // takes neither.
+    const bookIds = new Set(['row-1', 'row-2']);
+    expect([...collectJournalMoneyRestatements(JOURNAL_0818, bookIds).keys()]).toEqual(['row-2']);
+    expect(selectJournalExportRows(JOURNAL_0818, bookIds)).toHaveLength(0);
+  });
+});
+
+describe('TRA-3875 AC5 — the merge is PUBLISHED, not silent', () => {
+  it('states source and pnl_basis on every row, and counts the supersession', () => {
+    const before = exportAt({ archived: false }).summary;
+    const after = exportAt({ archived: true }).summary;
+
+    expect(before.sources).toEqual({ book: 2, journal: 0 });
+    expect(after.sources).toEqual({ book: 0, journal: 2 });
+
+    // The row is book-IDENTITY carrying broker-settled MONEY — the two are
+    // independent, which is the whole reason both fields exist.
+    const spy = spyRow(exportAt({ archived: false }).rows);
+    expect(spy.source).toBe('book');
+    expect(spy.pnl_basis).toBe('broker-fill');
+
+    // One row disagreed and the journal won. After the archive there is no book
+    // twin left to disagree — the 0 means "nothing to supersede", not "resolved".
+    expect(before.supersededRowCount).toBe(1);
+    expect(after.supersededRowCount).toBe(0);
+  });
+
+  it('counts over the SERVED rows, so a filter that drops the restated row reports 0', () => {
+    const { summary } = buildExport(
+      {
+        optionsClosed: [bookPltr(), bookSpy()],
+        optionMoneyRestatements: collectJournalMoneyRestatements(
+          JOURNAL_0818,
+          new Set(['row-1', 'row-2']),
+        ),
+      },
+      // A window that excludes SPY's 13:45 close but keeps PLTR's 13:30 one.
+      { markets: ['options'], modes: ['live'], from: day('2026-08-18').from, to: Date.parse('2026-08-18T13:40:00.000Z') },
+    );
+    expect(summary.count).toBe(1);
+    expect(summary.supersededRowCount).toBe(0);
+  });
+});
+
+describe('TRA-3875 AC6 — the design §2.3 CSV header is byte-identical', () => {
+  it('adds the provenance fields to JSON only', () => {
+    const { rows } = exportAt({ archived: false });
+    const csv = toCsv(rows);
+    const header = csv.split('\r\n')[0];
+    expect(header).toBe(EXPORT_COLUMNS.join(','));
+    expect(header).not.toContain('source');
+    expect(header).not.toContain('pnl_basis');
+    // And no row leaks a value into the body either.
+    expect(csv).not.toContain('broker-fill');
+    // The restated money DOES reach the CSV — it is a money column, not a new one.
+    expect(csv).toContain('-156.23');
+    expect(csv).not.toContain('-278');
   });
 });
