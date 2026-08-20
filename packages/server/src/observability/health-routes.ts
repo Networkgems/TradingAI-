@@ -4516,6 +4516,15 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // Tradier balance and there is no fleet accumulator. TRA-3674 made each
       // row's `capUsd` `min(φ · availableCashUsd, fleetCapUsd)`.
       //
+      // TRA-3879 — each row now also carries `fleetRiskFractionEffective`,
+      // `fleetCapitalUsd`, `fleetCapitalBooks` and `fleetSizingReason`. There is
+      // still no accumulator: `φ_eff = min(φ, A / Σ E_i)` is a READ of the other
+      // books' balances, and `capUsd` here resolves through the SAME read the
+      // order site sizes on, so this column cannot publish a budget the order
+      // site would not honour. ⭐ Read `fleetSizingReason`, not the φ alone:
+      // `fleet_capital_unreadable` is the one value under which `Σ B_i` is
+      // unbounded again, and a budget resolved that way looks entirely normal.
+      //
       // ⚠⚠ TRA-3723 — this note used to continue "so `Σ B_i ≤ φ · Σ E_i ≡ A` —
       // the fleet bound falls out of the arithmetic and no cross-engine state is
       // needed to hold it." THAT WAS FALSE and it is deleted rather than
@@ -4538,9 +4547,19 @@ export function registerLiveHealthRoutes(app: Express, deps: LiveHealthDeps): vo
       // TRA-3723 — the sum taken FOR the reader, and graded. `aggregateExposure`
       // above published every term needed to catch the fail-open and nobody
       // took the sum, which is the whole reason it shipped believed-safe. This
-      // is a DETECTOR, not a bound: no order site consults it, so a `breach`
-      // means money is already authorized past the board's figure — it does not
-      // mean anything stopped. `blind` ⇒ could not grade; never read it as fine.
+      // is a DETECTOR, not a bound: no order site consults THIS OBJECT, so a
+      // `breach` means money is already authorized past the board's figure — it
+      // does not mean anything stopped. `blind` ⇒ could not grade; never read it
+      // as fine.
+      //
+      // ⭐ TRA-3879 — the order site now bounds the sum itself
+      // (`φ_eff = min(φ, A / Σ E_i)`), so this SHOULD read `within`. It is kept,
+      // and kept independent, for three states it still owns: the bound is only
+      // as fresh as the last balance read; `fleetSizingReason:
+      // 'fleet_capital_unreadable'` on the rows above means the fleet read was
+      // unusable and the sum is unbounded again; and a future regression at the
+      // order site is invisible to every test that trusts the order site. A fix
+      // that also retired its own detector would have removed the evidence too.
       aggregateFleetBound: gradeLiveOtmFleetBound(
         aggregateExposureRows,
         aggregateCapLive, // the SAME resolved A the route publishes above

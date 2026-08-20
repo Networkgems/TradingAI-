@@ -119,7 +119,13 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction } from './option-exec-flag.js';
+import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason } from './option-exec-flag.js';
+// TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
+// A read of a derived scalar, not the shared mutable accumulator TRA-3445
+// avoided; unwired it returns `null` and sizing falls back to the per-book
+// bound already in force (it never darks a book).
+import { readLiveOtmFleetCapitalRows } from './live-otm-fleet-capital.js';
 import { lastRecordedOpenSleeve, recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
@@ -8827,6 +8833,36 @@ export class SignalEngine {
     return candidates.length === 0 ? null : Math.min(...candidates);
   }
 
+  /**
+   * TRA-3879 — this book's contribution to `Σ E_i`, balances ONLY.
+   *
+   * The fleet read (`live-otm-fleet-capital.ts`) folds these across engines so
+   * the order site can resolve `φ_eff = min(φ, A / Σ E_i)`. It must NOT carry a
+   * budget: a budget is now a function of the fleet sum, so a row carrying one
+   * would make resolving a budget re-enter this read.
+   *
+   * `liveEntryGateOpen` is derived HERE and consumed by
+   * {@link getLiveOtmAggregateExposure} below, so the two rows cannot drift
+   * apart into a fleet summed on one predicate and graded on another.
+   */
+  getLiveOtmFleetCapitalRow(): LiveOtmFleetCapitalRow {
+    return {
+      book: this.alertUsername ?? null,
+      // ⚠ SUM THE FLEET ON **THIS**, NOT ON `mode`. Measured on bqb1 the night
+      // TRA-3674 shipped: THREE books read `mode: 'live'` (admin, Richard,
+      // v0nni) while only TWO can place a live options order — Richard is
+      // live-mode on SANDBOX with no options client. A fleet worst case taken
+      // off `mode` reads $2,250; the true figure is $1,500. The engine mode is
+      // not the arm, and the two are indistinguishable without this field.
+      // `/api/health/options-live` → `liveArmCensus.books[].realMoneyArmed` is
+      // the authoritative predicate (it also sees production-vs-sandbox creds);
+      // this is the same gate as the engine itself holds it.
+      liveEntryGateOpen:
+        this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+      availableCashUsd: this.liveAvailableCashUsd(),
+    };
+  }
+
   getLiveOtmAggregateExposure(): {
     book: string | null;
     mode: 'demo' | 'live';
@@ -8834,6 +8870,10 @@ export class SignalEngine {
     capUsd: number;
     fleetCapUsd: number;
     fleetRiskFraction: number;
+    fleetRiskFractionEffective: number;
+    fleetCapitalUsd: number | null;
+    fleetCapitalBooks: number;
+    fleetSizingReason: LiveOtmFleetSizingReason;
     availableCashUsd: number | null;
     openPremiumAtRiskUsd: number;
     openRows: number;
@@ -8847,9 +8887,18 @@ export class SignalEngine {
     // verdict the order site reaches at `no_balance_snapshot`.
     const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
     const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
-    const availableCashUsd = this.liveAvailableCashUsd();
+    const selfRow = this.getLiveOtmFleetCapitalRow();
+    const availableCashUsd = selfRow.availableCashUsd;
+    // TRA-3879 — the row must publish the budget the ORDER SITE would honour,
+    // so it resolves through the SAME fleet read. A row computed on the
+    // per-book φ while the order site sized on `φ_eff` would republish the
+    // fail-open this ticket closes, and the TRA-3737 reader grades THIS column.
+    const fleet = sumLiveOtmFleetCapitalUsd(readLiveOtmFleetCapitalRows(), selfRow);
+    const sizing = resolveEffectiveFleetRiskFraction(
+      fleetRiskFraction, fleetCapUsd, fleet.fleetCapitalUsd, fleet.books,
+    );
     const capUsd = resolveLiveOptionTestBookAggregateCapUsd(
-      availableCashUsd, fleetCapUsd, fleetRiskFraction,
+      availableCashUsd, fleetCapUsd, fleetRiskFraction, fleet.fleetCapitalUsd,
     );
     const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
     return {
@@ -8864,11 +8913,20 @@ export class SignalEngine {
       // `/api/health/options-live` → `liveArmCensus.books[].realMoneyArmed` is
       // the authoritative predicate (it also sees production-vs-sandbox creds);
       // this is the same gate as the engine itself holds it.
-      liveEntryGateOpen:
-        this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
+      liveEntryGateOpen: selfRow.liveEntryGateOpen,
       capUsd,
       fleetCapUsd,
       fleetRiskFraction,
+      // TRA-3879 — the φ ACTUALLY IN FORCE, the capital it was derived from,
+      // and WHY. `fleetRiskFraction` alone cannot tell "φ binds" from "φ is
+      // stale and A/ΣE_i is doing the work", and `fleetSizingReason`
+      // `fleet_capital_unreadable` is the one state where the SUM is
+      // unbounded again — it must be readable as itself, not inferred from a
+      // number that looks normal (AC4).
+      fleetRiskFractionEffective: sizing.phiEffective,
+      fleetCapitalUsd: sizing.fleetCapitalUsd,
+      fleetCapitalBooks: sizing.fleetCapitalBooks,
+      fleetSizingReason: sizing.reason,
       availableCashUsd,
       openPremiumAtRiskUsd: atRisk.usd,
       openRows: atRisk.rows,
@@ -11004,11 +11062,13 @@ export class SignalEngine {
           // night it shipped ($1,543.96), less the 11¢ that rounding φ UP
           // costs. Grow admin to $2,000 and the fleet admits
           // $750.00 + $194.32 = $944.32 against a $750 authorization, with no
-          // edit and no env write: A DEPOSIT IS THE TRIGGER. Nothing at this
-          // site can see the other books, so nothing here refuses it; the
-          // breach is DETECTED and published as `aggregateFleetBound` on
+          // edit and no env write. Between TRA-3723 and TRA-3879 nothing at
+          // this site could see the other books, so nothing here refused it:
+          // the breach was DETECTED and published as `aggregateFleetBound` on
           // `GET /api/health/live-options-fee-slippage`
-          // (`gradeLiveOtmFleetBound`). Detector, not bound.
+          // (`gradeLiveOtmFleetBound`) — a detector, not a bound. ⚠ That is
+          // NO LONGER the whole story; read the TRA-3879 note below before
+          // citing this paragraph. The grader stays, and stays independent.
           //
           // The note this replaces read "two armed books admit $750 each … the
           // fleet number is DISCLOSED, not silently assumed to be $750". The
@@ -11026,10 +11086,40 @@ export class SignalEngine {
           // Utilization is still derived from the OPEN POSITIONS, never from a
           // since-boot counter: this box restarted six times on 2026-08-12 and a
           // reset counter reads identically to a flat book.
+          //
+          // TRA-3879 — AND NOW THE SUM IS BOUNDED. `φ_eff = min(φ, A/Σ E_i)`,
+          // so `Σ_i B_i ≤ φ_eff · Σ E_i ≤ A` STRUCTURALLY, at any balances —
+          // the detector above stops being the only thing standing between the
+          // fleet and its authorization. Measured 2026-08-20T03:12Z the live
+          // fleet was ALREADY over: Σ B_i $558.68 vs A $500 (φ 0.4858 stale
+          // against capital $1,150.04), with the OTM sleeve ARMED. Nobody
+          // deposited anything and nobody edited anything — `A` came down
+          // (TRA-3827) and the basis drifted up. The precondition was crossed
+          // by the PASSAGE OF TIME, which is why it could not be gated on an
+          // event.
+          //
+          // `Σ E_i` is a cross-engine READ (`live-otm-fleet-capital.ts`), not
+          // the shared mutable accumulator TRA-3445 avoided: nothing is
+          // written, nothing is ordered, and an unreadable fleet degrades to
+          // `min(φ·E_i, A)` — the bound in force before this line — rather than
+          // to a dark book. That fallback is published as
+          // `fleetSizingReason: 'fleet_capital_unreadable'` and it is the one
+          // state where the SUM is unbounded again, so it must never be
+          // inferred from a budget that merely looks normal.
           const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
           const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
+          const fleetCapital = sumLiveOtmFleetCapitalUsd(readLiveOtmFleetCapitalRows(), {
+            book: this.alertUsername ?? null,
+            // The SAME balance sized against above — the fleet sum must contain
+            // the basis it is about to bound, or it understates `Σ E_i` and the
+            // bound comes out LOOSE.
+            availableCashUsd: availableCash,
+          });
+          const fleetSizing = resolveEffectiveFleetRiskFraction(
+            fleetRiskFraction, fleetCapUsd, fleetCapital.fleetCapitalUsd, fleetCapital.books,
+          );
           const aggregateCapUsd = resolveLiveOptionTestBookAggregateCapUsd(
-            availableCash, fleetCapUsd, fleetRiskFraction,
+            availableCash, fleetCapUsd, fleetRiskFraction, fleetCapital.fleetCapitalUsd,
           );
           const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
           const fitsAggregate = fitsLiveOptionTestAggregateCap(
@@ -11045,9 +11135,17 @@ export class SignalEngine {
             : `OTM live test skipped — aggregate cap: $${atRisk.usd.toFixed(2)} already at risk across `
               + `${atRisk.rows} open live position(s) + this $${testNotional.toFixed(2)} entry exceeds this `
               + `book's $${aggregateCapUsd.toFixed(2)} budget `
-              + `(= min(φ ${fleetRiskFraction} × available cash $${availableCash.toFixed(2)}, `
+              + `(= min(φ_eff ${fleetSizing.phiEffective} × available cash $${availableCash.toFixed(2)}, `
               + `$${fleetCapUsd.toFixed(2)} fleet total authorized)) `
-              + `(board TRA-3384 option A, TRA-3445, capital-proportional per TRA-3674)`;
+              // TRA-3879 — φ_eff and WHY, on the same line as the refusal. A
+              // budget that came out small because the FLEET is near its
+              // authorization is a different incident from a book that spent
+              // its own, and `φ_eff` alone reads the same in both.
+              + `[φ configured ${fleetSizing.phiConfigured}, sizing ${fleetSizing.reason}, `
+              + `fleet capital $${fleetSizing.fleetCapitalUsd?.toFixed(2) ?? 'unreadable'} `
+              + `over ${fleetSizing.fleetCapitalBooks} book(s)] `
+              + `(board TRA-3384 option A, TRA-3445, capital-proportional per TRA-3674, `
+              + `fleet-bounded per TRA-3879)`;
           // Recorded on BOTH verdicts. A guard whose rejects are invisible is
           // indistinguishable from an inert one (TRA-3216), and the admits are
           // what supply the `evaluated` denominator that tells "never had to
@@ -11071,6 +11169,16 @@ export class SignalEngine {
                 fleetCapUsd,
                 fleetRiskFraction,
                 availableCashUsd: availableCash,
+                // TRA-3879 — on BOTH verdicts, for the same reason the three
+                // terms above are: without `fleetSizingReason` in the ledger,
+                // a day on which the fleet read was unwired (⇒ the SUM was
+                // unbounded again) is indistinguishable, after the fact, from
+                // a day on which it bound. The admits are what carry it —
+                // `reason` is only retained on blocks.
+                fleetRiskFractionEffective: fleetSizing.phiEffective,
+                fleetCapitalUsd: fleetSizing.fleetCapitalUsd,
+                fleetCapitalBooks: fleetSizing.fleetCapitalBooks,
+                fleetSizingReason: fleetSizing.reason,
               },
             },
           );
@@ -11089,6 +11197,11 @@ export class SignalEngine {
               fleetCapUsd,
               fleetRiskFraction,
               availableCash,
+              // TRA-3879 — plus the fleet terms, same reason.
+              fleetRiskFractionEffective: fleetSizing.phiEffective,
+              fleetCapitalUsd: fleetSizing.fleetCapitalUsd,
+              fleetCapitalBooks: fleetSizing.fleetCapitalBooks,
+              fleetSizingReason: fleetSizing.reason,
               username: this.alertUsername ?? null,
             });
             scanRun.reject('over_aggregate_cap');

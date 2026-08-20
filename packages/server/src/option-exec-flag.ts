@@ -910,13 +910,25 @@ export function resolveLiveOptionTestAggregateCapUsd(
 //     v0nni at $  400 : min(0.4858 ×  400, 750) = 194.32
 //     fleet                                       $944.32   vs a $750 authorization
 //
-// Bounding the SUM itself needs the cross-engine accumulator TRA-3445
-// deliberately avoided. TRA-3723 took the other option (its option (c)): the
-// fail-open is now DETECTED AND PUBLISHED rather than assumed away — see
-// `gradeLiveOtmFleetBound` below, served as `aggregateFleetBound` on
-// `GET /api/health/live-options-fee-slippage`. Be exact about what that buys:
-// it is a DETECTOR, not a bound. It makes the breach visible; it does not stop
-// it. The bound in force is still per book.
+// TRA-3723 took its option (c): the fail-open is DETECTED AND PUBLISHED rather
+// than assumed away — see `gradeLiveOtmFleetBound` below, served as
+// `aggregateFleetBound` on `GET /api/health/live-options-fee-slippage`. Be
+// exact about what that buys: a DETECTOR, not a bound. It made the breach
+// visible; it did not stop it — and on 2026-08-20 it published `breach` on
+// ARMED real money (Σ B_i $558.68 vs A $500) for six days into an empty room
+// until TRA-3737 gave it a reader.
+//
+// ⭐ TRA-3879 CLOSED THE FAIL-OPEN ITSELF: `φ_eff = min(φ, A / Σ E_i)`, so
+// `Σ_i B_i ≤ A` now holds STRUCTURALLY at any balances — see
+// {@link resolveEffectiveFleetRiskFraction}. Two things that were true above
+// are no longer true and are corrected rather than softened: bounding the sum
+// did NOT require the mutable cross-engine accumulator TRA-3445 avoided (a READ
+// of one derived scalar is enough), and the bound in force is no longer per
+// book. ⚠ WITH ONE EXCEPTION, and it is the reason the detector stays: when the
+// fleet read is unusable, sizing falls back to the per-book bound and the SUM is
+// unbounded again — published as `fleetSizingReason: 'fleet_capital_unreadable'`
+// rather than left to be inferred. The bound is also only ever as fresh as the
+// last balance read.
 //
 // Two properties worth naming because they are the reason to prefer this over a
 // smaller flat cap:
@@ -990,9 +1002,171 @@ export function resolveLiveOptionTestFleetRiskFraction(
   return Math.min(n, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING);
 }
 
+// --------------------------------------------------------------------------
+// TRA-3879 — remedy (f): BOUND THE SUM by re-deriving φ from LIVE capital.
+//
+//     φ_eff = min( φ , A / Σ_i E_i )      ⇒      Σ_i B_i ≤ φ_eff · Σ_i E_i ≤ A
+//
+// structurally, at ANY balances. It is not a tighter fitting of φ; it removes
+// the fitting from the bound entirely. φ stays as the CONCENTRATION policy (no
+// book may risk more than that share of itself) and `A` becomes what the board
+// ratified it to be: a bound on the fleet.
+//
+// Why this shape and not the other two candidates (the board call on TRA-3879):
+//   • (a) a cross-engine ACCUMULATOR at the order site bounds the true sum
+//     under arbitrary balances, but puts shared MUTABLE state on the order
+//     path — the thing TRA-3445 avoided on purpose.
+//   • (e) a DECLARED per-book basis `D_i` is structurally exact with zero
+//     cross-engine state, but a book missing from the declaration map has no
+//     `D_i` and the fail-closed default DARKS it silently — indistinguishable
+//     from "the market offered nothing".
+//   • (f) — this — needs a cross-engine READ of one derived scalar, and its
+//     only failure mode is SIZING SMALLER THAN EXPECTED. It cannot dark a
+//     book: `φ_eff > 0` whenever `A > 0`, and an unreadable fleet degrades to
+//     the per-book bound already in force (see `fleet_capital_unreadable`).
+//
+// ⚠ IT IS ONLY AS FRESH AS THE LAST BALANCE READ. That is the honest weakness
+// versus (e): between a deposit and the next balance snapshot, `Σ E_i` is
+// understated and the bound is loose by that delta. The TRA-3737 reader is the
+// backstop for exactly that window, which is why AC3 forbids blinding it.
+// --------------------------------------------------------------------------
+
 /**
- * This book's aggregate premium-at-risk budget `B_i = min(φ · availableCash, A)`,
- * USD, rounded DOWN to whole cents.
+ * One book's contribution to `Σ E_i`, as the cross-engine read publishes it.
+ *
+ * ⚠ BALANCES ONLY. Deliberately NOT the full `LiveOtmFleetBoundRow` (no
+ * `capUsd`): a budget is now a function of the fleet sum, so a row carrying a
+ * budget would make resolving one re-enter the read that produced it.
+ */
+export interface LiveOtmFleetCapitalRow {
+  /** `alertUsername`. */
+  book: string | null;
+  /** Summed on THIS, never on `mode` (TRA-3445: three `live` books, two armed). */
+  liveEntryGateOpen: boolean;
+  /** `E_i`. `null` ⇒ no usable snapshot ⇒ contributes nothing and can spend nothing. */
+  availableCashUsd: number | null;
+}
+
+/** Why the φ in force is what it is. Published so a small budget is attributable. */
+export type LiveOtmFleetSizingReason =
+  /** `φ` binds: the live fleet still fits under `A/φ`. The pre-TRA-3879 posture. */
+  | 'phi_configured'
+  /** `A / Σ E_i` binds: φ is STALE against live capital and would have failed open. */
+  | 'phi_fleet_derived'
+  /**
+   * The fleet read is unwired / threw / summed to nothing usable, so only THIS
+   * book's basis was visible. Sizing falls back to `min(φ·E_i, A)` — the bound
+   * in force before this ticket, NOT zero. A book is never darked by a missing
+   * fleet read (TRA-3879 AC4); the TRA-3737 reader stays the backstop.
+   */
+  | 'fleet_capital_unreadable';
+
+/** The φ actually used to size, with everything it was derived from. */
+export interface LiveOtmFleetSizing {
+  /** `φ_eff` — full precision, NOT rounded to φ's published 4 places. */
+  phiEffective: number;
+  /** φ as resolved from env/compiled default, after the ceiling clamp. */
+  phiConfigured: number;
+  /** `Σ E_i` the derivation used. `null` ⇒ nothing usable was visible. */
+  fleetCapitalUsd: number | null;
+  /** How many books that sum covered (self included). */
+  fleetCapitalBooks: number;
+  reason: LiveOtmFleetSizingReason;
+}
+
+/**
+ * Sum `Σ E_i` over the gate-open books with a readable balance.
+ *
+ * `self` is folded in EXPLICITLY: if the caller's own book is absent from the
+ * rows (unwired provider, a race at boot before this engine registered, a
+ * predicate that disagrees), the sum would be missing the very basis about to
+ * be sized against — which understates `Σ E_i` and LOOSENS the bound. The one
+ * failure this function must not have is an optimistic one.
+ *
+ * `fleetCapitalUsd: null` = "could not read", never 0: a zero would make
+ * `A / Σ E_i` infinite, i.e. unlimited headroom.
+ */
+export function sumLiveOtmFleetCapitalUsd(
+  rows: readonly LiveOtmFleetCapitalRow[] | null | undefined,
+  self?: { book: string | null; availableCashUsd: number | null } | null,
+): { fleetCapitalUsd: number | null; books: number; selfIncluded: boolean } {
+  const usable = (v: number | null | undefined): v is number =>
+    typeof v === 'number' && Number.isFinite(v) && v >= 0;
+  const selfCash = self && usable(self.availableCashUsd) ? self.availableCashUsd : null;
+
+  if (!Array.isArray(rows)) {
+    // Unwired ⇒ the fleet is at least us. `min(φ·E_self, A)` — today's bound.
+    return selfCash === null
+      ? { fleetCapitalUsd: null, books: 0, selfIncluded: false }
+      : { fleetCapitalUsd: selfCash, books: 1, selfIncluded: true };
+  }
+
+  const open = rows.filter(r => r?.liveEntryGateOpen === true && usable(r?.availableCashUsd));
+  let cents = 0;
+  let books = 0;
+  let selfIncluded = false;
+  for (const r of open) {
+    cents += Math.round((r.availableCashUsd as number) * 100);
+    books += 1;
+    if (self && r.book !== null && r.book === self.book) selfIncluded = true;
+  }
+  if (selfCash !== null && !selfIncluded) {
+    cents += Math.round(selfCash * 100);
+    books += 1;
+    selfIncluded = true;
+  }
+  if (books === 0) return { fleetCapitalUsd: null, books: 0, selfIncluded: false };
+  return { fleetCapitalUsd: cents / 100, books, selfIncluded };
+}
+
+/**
+ * `φ_eff = min(φ, A / Σ E_i)` — the fraction that makes `Σ B_i ≤ A` STRUCTURAL
+ * instead of fitted.
+ *
+ * Degrades to `φ` (never to 0) on an unusable `Σ E_i`, and passes an unusable φ
+ * straight through so {@link resolveLiveOptionTestBookAggregateCapUsd} keeps
+ * its existing fail-closed verdict rather than acquiring a second one here.
+ */
+export function resolveEffectiveFleetRiskFraction(
+  fleetRiskFraction: number,
+  fleetCapUsd: number,
+  fleetCapitalUsd: number | null | undefined,
+  fleetCapitalBooks = 0,
+): LiveOtmFleetSizing {
+  const phiConfigured =
+    Number.isFinite(fleetRiskFraction) && fleetRiskFraction > 0
+      ? Math.min(fleetRiskFraction, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING)
+      : fleetRiskFraction;
+  const unreadable: LiveOtmFleetSizing = {
+    phiEffective: phiConfigured,
+    phiConfigured,
+    fleetCapitalUsd: null,
+    fleetCapitalBooks: 0,
+    reason: 'fleet_capital_unreadable',
+  };
+  if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) return unreadable;
+  if (!Number.isFinite(phiConfigured) || phiConfigured <= 0) return unreadable;
+  if (
+    typeof fleetCapitalUsd !== 'number'
+    || !Number.isFinite(fleetCapitalUsd)
+    || fleetCapitalUsd <= 0
+  ) {
+    return unreadable;
+  }
+  const phiFleet = fleetCapUsd / fleetCapitalUsd;
+  const derived = phiFleet < phiConfigured;
+  return {
+    phiEffective: derived ? phiFleet : phiConfigured,
+    phiConfigured,
+    fleetCapitalUsd,
+    fleetCapitalBooks,
+    reason: derived ? 'phi_fleet_derived' : 'phi_configured',
+  };
+}
+
+/**
+ * This book's aggregate premium-at-risk budget
+ * `B_i = min(φ_eff · availableCash, A)`, USD, rounded DOWN to whole cents.
  *
  * FAILS CLOSED to `0` — which {@link fitsLiveOptionTestAggregateCap} rejects on
  * — for every unusable input: an absent / non-finite / negative balance, a
@@ -1001,20 +1175,31 @@ export function resolveLiveOptionTestFleetRiskFraction(
  * `no_balance_snapshot`; this is the same verdict re-derived here so the health
  * route's row cannot publish a budget the order site would not honour.)
  *
+ * ⚠ TRA-3879 — `fleetCapitalUsd` is REQUIRED, not optional with a status-quo
+ * default. An optional argument would let a new call site silently inherit the
+ * unbounded-sum behaviour, which is the TRA-3723 shape (a fleet bound nobody
+ * had to state). `null` is a legal, explicit answer meaning "per book only";
+ * the compiler makes every caller say which one it means.
+ *
  * Floored, not rounded: `Math.round` would widen the budget by up to half a
- * cent, and TRA-3674 is a TIGHTENING-ONLY change — for every book
- * `B_i ≤ A`, the bound in force before it.
+ * cent, and this is a TIGHTENING-ONLY change — for every book `B_i ≤ A`, the
+ * bound in force before it, and now `Σ_i B_i ≤ A` as well whenever the fleet
+ * sum is readable. The floor is also what absorbs the float error in
+ * `A / Σ E_i`: `Σ floor(φ_eff·E_i)` ≤ `φ_eff·Σ E_i` = `A` exactly.
  */
 export function resolveLiveOptionTestBookAggregateCapUsd(
   availableCashUsd: number | null | undefined,
   fleetCapUsd: number,
   fleetRiskFraction: number,
+  fleetCapitalUsd: number | null,
 ): number {
   if (typeof availableCashUsd !== 'number') return 0;
   if (!Number.isFinite(availableCashUsd) || availableCashUsd < 0) return 0;
   if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) return 0;
   if (!Number.isFinite(fleetRiskFraction) || fleetRiskFraction <= 0) return 0;
-  const phi = Math.min(fleetRiskFraction, LIVE_OPTION_TEST_FLEET_RISK_FRACTION_CEILING);
+  const phi = resolveEffectiveFleetRiskFraction(
+    fleetRiskFraction, fleetCapUsd, fleetCapitalUsd,
+  ).phiEffective;
   const proRata = Math.floor(availableCashUsd * phi * 100) / 100;
   return Math.min(proRata, fleetCapUsd);
 }

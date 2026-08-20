@@ -490,17 +490,17 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
 
   it('is pro-rata on the book\'s own cash, floored to whole cents', () => {
     // The two live books, verified 2026-08-14T01:0xZ off `liveArmCensus`.
-    expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI)).toBe(555.73);
-    expect(resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI)).toBe(194.32);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI, null)).toBe(555.73);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI, null)).toBe(194.32);
   });
 
   it('keeps min(…, A) — no single book may hold the whole authorization at any φ', () => {
     // A book far larger than the fleet: pro-rata would hand it $4,858.
-    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, PHI)).toBe(750);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, PHI, null)).toBe(750);
     // …and at the ceiling φ, still clamped.
-    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, 1.0)).toBe(750);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 750, 1.0, null)).toBe(750);
     // The env-tightened fleet cap (the TRA-3664 interim, 375) binds too.
-    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 375, PHI)).toBe(375);
+    expect(resolveLiveOptionTestBookAggregateCapUsd(10_000, 375, PHI, null)).toBe(375);
   });
 
   it('TIGHTENING ONLY — B_i never exceeds the flat bound it replaces', () => {
@@ -508,7 +508,7 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
     // balance range that spans both live books and well beyond.
     for (const cash of [0, 1, 100, 400, 750, 1143.96, 1543.96, 5000, 100_000]) {
       for (const phi of [0.0001, 0.25, PHI, 0.9, 1.0]) {
-        expect(resolveLiveOptionTestBookAggregateCapUsd(cash, 750, phi))
+        expect(resolveLiveOptionTestBookAggregateCapUsd(cash, 750, phi, null))
           .toBeLessThanOrEqual(750);
       }
     }
@@ -518,7 +518,7 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
     // This is the `no_balance_snapshot` verdict re-derived; `null` is what
     // `liveAvailableCashUsd()` returns when the broker reported nothing usable.
     for (const bad of [null, undefined, Number.NaN, Number.POSITIVE_INFINITY, -1, -0.01]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(bad, 750, PHI)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(bad, 750, PHI, null)).toBe(0);
     }
     // …and 0 is a BLOCK downstream, not an unbounded pass.
     expect(fitsLiveOptionTestAggregateCap(0, 0.01, 0)).toBe(false);
@@ -526,18 +526,18 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
 
   it('FAILS CLOSED to 0 on an unusable fleet cap or φ', () => {
     for (const badCap of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, badCap, PHI)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, badCap, PHI, null)).toBe(0);
     }
     for (const badPhi of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, badPhi)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, badPhi, null)).toBe(0);
     }
   });
 
   it('EQUALIZES concentration — every book lands on the same fraction of itself', () => {
     // The property that fixes v0nni: under the flat cap admin was bounded at
     // 65.6% of its account and v0nni at 100%. Under pro-rata both land on φ.
-    const admin = resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI) / 1143.96;
-    const v0nni = resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI) / 400;
+    const admin = resolveLiveOptionTestBookAggregateCapUsd(1143.96, 750, PHI, null) / 1143.96;
+    const v0nni = resolveLiveOptionTestBookAggregateCapUsd(400, 750, PHI, null) / 400;
     expect(admin).toBeCloseTo(PHI, 4);
     expect(v0nni).toBeCloseTo(PHI, 4);
     expect(Math.abs(admin - v0nni)).toBeLessThan(0.0001);
@@ -550,7 +550,7 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
     // The flat cap does the reverse: as a book shrinks, $750 becomes an ever
     // larger fraction of it, which is precisely how v0nni reached 100%.
     const shrinking = [1143.96, 800, 400, 200, 100].map((e) =>
-      resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI),
+      resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI, null),
     );
     for (let i = 1; i < shrinking.length; i += 1) {
       expect(shrinking[i]).toBeLessThan(shrinking[i - 1]);
@@ -567,7 +567,7 @@ describe('resolveLiveOptionTestBookAggregateCapUsd (TRA-3674)', () => {
     // Each engine used only its OWN balance to compute its own row.
     const fleet = [1143.96, 400];
     const sum = fleet.reduce(
-      (acc, e) => acc + resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI), 0,
+      (acc, e) => acc + resolveLiveOptionTestBookAggregateCapUsd(e, 750, PHI, null), 0,
     );
     // 555.73 + 194.32. Five cents over $750 because φ = 0.4858 is 750/1543.96
     // rounded UP at the 4th place — an artifact of φ's precision, disclosed at

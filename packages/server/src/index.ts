@@ -851,6 +851,9 @@ import {
   type CryptoModeKey,
   type UserContext,
 } from './user-context.js';
+// TRA-3879 — the cross-engine fleet-capital read (`Σ E_i`) behind
+// `φ_eff = min(φ, A / Σ E_i)`. Wired near `liveOtmAggregateExposure` below.
+import { setLiveOtmFleetCapitalProvider } from './live-otm-fleet-capital.js';
 import {
   resolveTradierOptionsCreds,
   isLiveTradierOptionsEnabled,
@@ -5925,6 +5928,27 @@ registerLiveHealthRoutes(app, {
   liveOtmAggregateExposure: () =>
     getAllUserContexts().map(ctx => ctx.engine.getLiveOtmAggregateExposure()),
 });
+
+// TRA-3879 — WIRE THE FLEET READ. `φ_eff = min(φ, A / Σ E_i)` is what makes
+// `Σ_i B_i ≤ A` structural instead of fitted to one night's balances, and it
+// needs the one thing the order site cannot see: the other books' capital.
+//
+// Wired HERE because this is the only module that can enumerate every engine
+// without an import cycle, and it is wired ONCE at boot rather than passed down
+// the call chain, so a new order site cannot come into existence unwired.
+//
+// ⚠ BALANCES ONLY — `getLiveOtmFleetCapitalRow()`, never
+// `getLiveOtmAggregateExposure()`. The exposure row's `capUsd` is now a
+// function of this sum, so returning it here would make resolving a budget
+// re-enter this read.
+//
+// ⚠ WHOLE FLEET, BOTH MODES — no `.filter(mode === 'live')`. The rows carry
+// `liveEntryGateOpen` and the SUM is taken on that; a filter applied in this
+// caller would silently change the denominator of the bound, invisibly to every
+// unit test (the TRA-2650 `fleetBooks` lesson, ~20 lines up).
+setLiveOtmFleetCapitalProvider(() =>
+  getAllUserContexts().map(ctx => ctx.engine.getLiveOtmFleetCapitalRow()),
+);
 
 // TRA-1004 — autonomous demo-loop status. Unauthenticated by design (parity with
 // the other `/api/health/*` probes): the snapshot carries only the flag state,

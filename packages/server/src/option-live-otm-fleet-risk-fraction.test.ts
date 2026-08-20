@@ -50,7 +50,7 @@ function admits(
 ): boolean {
   const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(env);
   const phi = resolveLiveOptionTestFleetRiskFraction(env);
-  const budget = resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, fleetCapUsd, phi);
+  const budget = resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, fleetCapUsd, phi, null);
   return fitsLiveOptionTestAggregateCap(openAtRiskUsd, entryUsd, budget);
 }
 
@@ -59,6 +59,7 @@ function budgetOf(env: NodeJS.ProcessEnv, availableCashUsd: number | null): numb
     availableCashUsd,
     resolveLiveOptionTestAggregateCapUsd(env),
     resolveLiveOptionTestFleetRiskFraction(env),
+    null, // TRA-3879 — PER BOOK only: no fleet basis
   );
 }
 

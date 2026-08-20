@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { summarizeCostAwareGate, clearCostAwareGateLedger } from './cost-aware-gate-ledger.js';
 // TRA-2945 — read the per-book mark tape the engine is supposed to WRITE.
 import { summarizeMarkSanity, clearMarkSanityTape } from './option-mark-sanity.js';
+// TRA-3879 — the cross-engine fleet-capital read. Wired per-test so the ORDER
+// SITE can be shown to consult it; a resolver-only suite cannot see that seam.
+import { setLiveOtmFleetCapitalProvider } from './live-otm-fleet-capital.js';
 import type { PaperOptionsAccount } from './options-account.js'; // TRA-3445
 import { etDateString } from './scheduler.js';
 // TRA-1226 — evaluateIvRvScan now backfills the underlying's daily closes from
@@ -8376,6 +8379,15 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         book: 'admin', mode: 'live', liveEntryGateOpen: true, capUsd: 750,
         fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 10_000,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
+        // TRA-3879 — the fleet read is UNWIRED in this unit (no `index.ts`), so
+        // `Σ E_i` is this book alone: $10,000 ⇒ `φ_eff = A/ΣE = 0.075`, far
+        // below φ, and `capUsd` is UNCHANGED at $750 because `min(…, A)` was
+        // already binding. That is the whole shape of remedy (f) in one row —
+        // it can only ever size DOWN, and here there was nothing to take.
+        fleetRiskFractionEffective: 0.075,
+        fleetCapitalUsd: 10_000,
+        fleetCapitalBooks: 1,
+        fleetSizingReason: 'phi_fleet_derived',
       });
 
       seedOpenLivePremium(engine, 700);
@@ -8406,6 +8418,86 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         .toMatchObject({ capUsd: 194.32, availableCashUsd: 400, headroomUsd: 194.32 });
       // Under the flat cap BOTH of these read `capUsd: 750`, and the route was
       // structurally unable to tell the two books apart. That is the defect.
+    });
+
+    // ── TRA-3879 ────────────────────────────────────────────────────────────
+    // `Σ B_i` was bounded by NOTHING: `min(…, A)` is a per-book clamp. Remedy
+    // (f) re-derives φ from LIVE capital — `φ_eff = min(φ, A / Σ E_i)` — so the
+    // sum is bounded structurally at any balances. These run against the ENGINE
+    // because the resolver suite cannot catch the failure that matters: an
+    // order site that never consults the fleet read passes every arithmetic
+    // test there is (that is exactly how TRA-3674 shipped believed-safe).
+    it('the fleet read SHRINKS this book\'s budget — Σ B_i fits A across the arm', () => {
+      try {
+        // The live 2026-08-14 arm plus a third book joining it. Under the
+        // per-book bound alone these sum to $881.03 against A = $750.
+        setLiveOtmFleetCapitalProvider(() => [
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 1143.96 },
+          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400 },
+          { book: 'newcomer', liveEntryGateOpen: true, availableCashUsd: 5000 },
+        ]);
+        const admin = bookWithCash(liveStub(), 1143.96).getLiveOtmAggregateExposure();
+        expect(admin.fleetSizingReason).toBe('phi_fleet_derived');
+        expect(admin.fleetCapitalUsd).toBeCloseTo(6543.96, 2);
+        expect(admin.fleetCapitalBooks).toBe(3);
+        // Strictly smaller than the $555.73 the same book got with no fleet read.
+        expect(admin.capUsd).toBeLessThan(555.73);
+        // …and the FLEET now fits: every book sized on the same φ_eff.
+        const fleetSum = [1143.96, 400, 5000]
+          .map(cash => bookWithCash(liveStub(), cash).getLiveOtmAggregateExposure().capUsd)
+          .reduce((a, b) => a + b, 0);
+        expect(fleetSum).toBeLessThanOrEqual(750);
+      } finally {
+        setLiveOtmFleetCapitalProvider(null);
+      }
+    });
+
+    // THE discriminator for TRA-3879, and the one assertion that cannot pass on
+    // a build where the order site ignores the fleet: the book, the balance, the
+    // already-at-risk figure, the candidate and φ are all held FIXED — only the
+    // other books' capital moves — and the admit decision at the ORDER SITE
+    // flips with it. Both verdicts are asserted, so "blocks everything" cannot
+    // pass as success.
+    it('VACUITY CONTROL — another book\'s capital moves the ADMIT DECISION', async () => {
+      const VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
+      const saved = process.env[VAR];
+      try {
+        // φ = 1 and a $100 book: budget $100, so $10 at risk + an $82 entry is
+        // ADMITTED and reaches the broker. (The TRA-3674 control above, verbatim.)
+        process.env[VAR] = '1';
+        const looseStub = liveStub();
+        const loose = bookWithCash(looseStub, 100);
+        seedOpenLivePremium(loose, 10);
+        await runOtm(loose, ['AAPL']);
+        expect(looseStub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        const admitted = gateOf('aggregate_cap');
+
+        // Now a SECOND book appears holding $10,000. Nothing about the first
+        // book changed — not its cash, not its exposure, not φ, not the
+        // candidate. But the fleet would now authorize $10,100 against a $750
+        // board figure, so φ_eff = 750/10,100 = 0.0743 and the SAME entry is
+        // REFUSED. This is the fail-open TRA-3723 could only detect.
+        setLiveOtmFleetCapitalProvider(() => [
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100 },
+          { book: 'whale', liveEntryGateOpen: true, availableCashUsd: 10_000 },
+        ]);
+        const tightStub = liveStub();
+        const tight = bookWithCash(tightStub, 100);
+        seedOpenLivePremium(tight, 10);
+        await runOtm(tight, ['AAPL']);
+        expect(tightStub.buyContractsLimit).not.toHaveBeenCalled();
+        expect(gateOf('aggregate_cap')).toMatchObject({
+          evaluated: admitted.evaluated + 1, blocked: admitted.blocked + 1,
+        });
+        // The refusal is ATTRIBUTABLE to the fleet, not to this book's balance.
+        expect(tight.getLiveOtmAggregateExposure()).toMatchObject({
+          fleetSizingReason: 'phi_fleet_derived', fleetCapitalBooks: 2,
+        });
+      } finally {
+        setLiveOtmFleetCapitalProvider(null);
+        if (saved === undefined) delete process.env[VAR];
+        else process.env[VAR] = saved;
+      }
     });
 
     it('FAILS CLOSED with no balance snapshot — budget 0, cash null, not a silent $750', () => {

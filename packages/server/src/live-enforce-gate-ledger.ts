@@ -205,6 +205,24 @@ export interface LiveEnforceRecord {
     fleetRiskFraction: number;
     /** `min(optionBuyingPower, totalCash, totalEquity)` for this book at decision time, USD. */
     availableCashUsd: number;
+    /**
+     * TRA-3879 — `φ_eff = min(φ, A / Σ E_i)`, the fraction the budget was
+     * ACTUALLY sized on. Equal to `fleetRiskFraction` while φ binds; below it
+     * once φ is stale against live fleet capital.
+     */
+    fleetRiskFractionEffective?: number;
+    /** `Σ E_i` the derivation used. `null` ⇒ the fleet read was unusable. */
+    fleetCapitalUsd?: number | null;
+    /** How many books that sum covered (this one included). */
+    fleetCapitalBooks?: number;
+    /**
+     * WHY the φ in force is what it is. ⭐ THE FIELD TO GRADE: its PRESENCE is
+     * the deployed-bytes proof that the fleet bound shipped, and the value
+     * `fleet_capital_unreadable` is the single state in which `Σ B_i` is
+     * unbounded again. Absent ⇒ a row written before TRA-3879, i.e. a row from
+     * a build with a PER-BOOK bound only — never read it as "it bound".
+     */
+    fleetSizingReason?: 'phi_configured' | 'phi_fleet_derived' | 'fleet_capital_unreadable';
   };
   /**
    * TRA-3510 — WHICH NOMINATOR BRANCH produced the candidate this verdict ruled
