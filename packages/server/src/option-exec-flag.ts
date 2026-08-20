@@ -1043,8 +1043,24 @@ export interface LiveOtmFleetCapitalRow {
   book: string | null;
   /** Summed on THIS, never on `mode` (TRA-3445: three `live` books, two armed). */
   liveEntryGateOpen: boolean;
-  /** `E_i`. `null` ⇒ no usable snapshot ⇒ contributes nothing and can spend nothing. */
+  /**
+   * The CASH half of `E_i`. `null` ⇒ no usable snapshot ⇒ contributes nothing
+   * and can spend nothing.
+   *
+   * ⚠ TRA-3897 — this is no longer `E_i` on its own. `E_i` is
+   * {@link resolveLiveOtmSizingBasisUsd}`(availableCashUsd, openPremiumAtRiskUsd)`.
+   */
   availableCashUsd: number | null;
+  /**
+   * TRA-3897 — the PREMIUM half of `E_i`: this book's open live option premium
+   * at ENTRY cost (`foldOpenPremiumAtRisk().usd`).
+   *
+   * Required, not optional-with-a-default, for the same reason `fleetCapitalUsd`
+   * is required on {@link resolveLiveOptionTestBookAggregateCapUsd}: an optional
+   * operand lets a new producer silently re-introduce the cash-only basis, and
+   * the cash-only basis is the defect. The compiler makes every producer say.
+   */
+  openPremiumAtRiskUsd: number;
 }
 
 /** Why the φ in force is what it is. Published so a small budget is attributable. */
@@ -1075,6 +1091,69 @@ export interface LiveOtmFleetSizing {
 }
 
 /**
+ * TRA-3897 — `E_i`, the SIZING BASIS: `availableCash_i + openPremiumAtRisk_i`.
+ *
+ * ── Why the basis had to stop being cash ────────────────────────────────────
+ * `capUsd = φ · availableCash` was a ceiling on a book's TOTAL at-risk
+ * (`fitsLiveOptionTestAggregateCap` is `atRisk + entry ≤ cap`), while the thing
+ * it bounded was measured on the OTHER SIDE of the same transaction. Buying an
+ * option for `x` moves `atRisk` UP by `x` and moves `cap` DOWN by `φ·x`,
+ * because the cash that funded it left the basis. Two consequences, both
+ * measured live on `1fed3f51c65c` 2026-08-20:
+ *
+ *   • THE FLEET METRIC MOVED THE WRONG WAY WHEN RISK WAS TAKEN. At 03:07Z
+ *     `aggregateFleetBound.verdict` was `breach`, Σ B_i $558.68 vs A $500. At
+ *     20:33Z the same field read `within`, Σ B_i $327.75 — with NO fix shipped
+ *     in between. The sleeve had converted $273.00 of cash into two real-money
+ *     contracts. A reader grepping the route would have closed the breach on a
+ *     self-healed symptom.
+ *   • ANY BOOK SPENDING MORE THAN `φ/(1+φ)` OF ITS CASH ENDED UP PERMANENTLY
+ *     OVER ITS OWN PUBLISHED CAP, BY CONSTRUCTION — 32.7% at φ 0.4858. `admin`
+ *     spent $273.00 against a $199.02 threshold and carried
+ *     `openPremiumAtRiskUsd $334.00` against `capUsd $133.43`. Not a gate
+ *     failure: at order time the entries fit the then-current cap. The basis
+ *     moved out from under the position after it was opened.
+ *
+ * `cash + atRisk` is the only candidate that is INVARIANT UNDER THE ACT OF
+ * TAKING RISK, and it is invariant EXACTLY — not approximately — because
+ * `foldOpenPremiumAtRisk` bases on the ENTRY premium (`premiumPaid`), never the
+ * mark. Buying moves `cash` down by `x` and `atRisk` up by the same `x`, so the
+ * basis is unchanged and the cap does not drift under an open position. A
+ * mark-based at-risk figure would have re-created the defect in the other
+ * direction, authorizing new entries out of unrealized gains.
+ *
+ * ── The two fail-modes, and why both are conservative ───────────────────────
+ * `null` (never 0) when CASH is unreadable: unchanged from the cash-only
+ * resolver, so `no_balance_snapshot` keeps its existing fail-closed verdict and
+ * this function does not acquire a second one.
+ *
+ * An unreadable / negative / non-finite `openPremiumAtRiskUsd` coerces to **0**
+ * rather than darking the book. That is deliberate and it is bounded: it can
+ * only UNDERSTATE `E_i`, and the worst case it degrades to — `φ · cash` — is
+ * exactly the bound in force before this ticket. Per TRA-3879's rule, a missing
+ * operand costs the fleet its improvement, never its floor.
+ *
+ * ⚠ `foldOpenPremiumAtRisk` counts an UNPRICED row as $0 toward `usd`, so an
+ * imported row with no cost basis understates this basis too. Same direction:
+ * the cap comes out tighter, never looser. `unpricedOpenRows` is published
+ * beside it so the understatement is readable rather than assumed away.
+ */
+export function resolveLiveOtmSizingBasisUsd(
+  availableCashUsd: number | null | undefined,
+  openPremiumAtRiskUsd: number | null | undefined,
+): number | null {
+  if (typeof availableCashUsd !== 'number') return null;
+  if (!Number.isFinite(availableCashUsd) || availableCashUsd < 0) return null;
+  const atRisk =
+    typeof openPremiumAtRiskUsd === 'number'
+    && Number.isFinite(openPremiumAtRiskUsd)
+    && openPremiumAtRiskUsd > 0
+      ? openPremiumAtRiskUsd
+      : 0;
+  return (Math.round(availableCashUsd * 100) + Math.round(atRisk * 100)) / 100;
+}
+
+/**
  * Sum `Σ E_i` over the gate-open books with a readable balance.
  *
  * `self` is folded in EXPLICITLY: if the caller's own book is absent from the
@@ -1088,17 +1167,24 @@ export interface LiveOtmFleetSizing {
  */
 export function sumLiveOtmFleetCapitalUsd(
   rows: readonly LiveOtmFleetCapitalRow[] | null | undefined,
-  self?: { book: string | null; availableCashUsd: number | null } | null,
+  self?: {
+    book: string | null;
+    availableCashUsd: number | null;
+    /** TRA-3897 — the premium half of self's basis. Absent ⇒ 0, i.e. cash-only. */
+    openPremiumAtRiskUsd?: number | null;
+  } | null,
 ): { fleetCapitalUsd: number | null; books: number; selfIncluded: boolean } {
   const usable = (v: number | null | undefined): v is number =>
     typeof v === 'number' && Number.isFinite(v) && v >= 0;
-  const selfCash = self && usable(self.availableCashUsd) ? self.availableCashUsd : null;
+  const selfBasis = self
+    ? resolveLiveOtmSizingBasisUsd(self.availableCashUsd, self.openPremiumAtRiskUsd)
+    : null;
 
   if (!Array.isArray(rows)) {
     // Unwired ⇒ the fleet is at least us. `min(φ·E_self, A)` — today's bound.
-    return selfCash === null
+    return selfBasis === null
       ? { fleetCapitalUsd: null, books: 0, selfIncluded: false }
-      : { fleetCapitalUsd: selfCash, books: 1, selfIncluded: true };
+      : { fleetCapitalUsd: selfBasis, books: 1, selfIncluded: true };
   }
 
   const open = rows.filter(r => r?.liveEntryGateOpen === true && usable(r?.availableCashUsd));
@@ -1106,12 +1192,18 @@ export function sumLiveOtmFleetCapitalUsd(
   let books = 0;
   let selfIncluded = false;
   for (const r of open) {
-    cents += Math.round((r.availableCashUsd as number) * 100);
+    // TRA-3897 — `E_i` is CAPITAL (cash + premium already at risk), not cash.
+    // Summing cash alone made `Σ E_i` — and therefore φ_eff and every budget
+    // derived from it — SHRINK the moment the fleet converted cash into open
+    // premium, i.e. the fleet read more compliant precisely as it took risk.
+    cents += Math.round(
+      (resolveLiveOtmSizingBasisUsd(r.availableCashUsd, r.openPremiumAtRiskUsd) as number) * 100,
+    );
     books += 1;
     if (self && r.book !== null && r.book === self.book) selfIncluded = true;
   }
-  if (selfCash !== null && !selfIncluded) {
-    cents += Math.round(selfCash * 100);
+  if (selfBasis !== null && !selfIncluded) {
+    cents += Math.round(selfBasis * 100);
     books += 1;
     selfIncluded = true;
   }
@@ -1166,7 +1258,18 @@ export function resolveEffectiveFleetRiskFraction(
 
 /**
  * This book's aggregate premium-at-risk budget
- * `B_i = min(φ_eff · availableCash, A)`, USD, rounded DOWN to whole cents.
+ * `B_i = min(φ_eff · E_i, A)`, USD, rounded DOWN to whole cents, where
+ * `E_i = availableCash_i + openPremiumAtRisk_i` ({@link resolveLiveOtmSizingBasisUsd}).
+ *
+ * ⚠ TRA-3897 — `E_i` used to be `availableCash` alone, which made this cap
+ * FALL as the book spent, on the same transaction that raised the figure the
+ * cap is compared against. See {@link resolveLiveOtmSizingBasisUsd} for the
+ * measurement. Under the capital basis the cap is invariant across an admitted
+ * entry, so a book that was inside its cap at order time stays inside it:
+ * admitting `x` requires `atRisk + x ≤ φ·E`, and `E` does not move when the
+ * order fills, hence `atRisk' ≤ cap' `. The pre-existing overage on `admin` is
+ * NOT retroactively cleared by this — those entries were admitted under the
+ * cash basis at a moment when the cap was larger.
  *
  * FAILS CLOSED to `0` — which {@link fitsLiveOptionTestAggregateCap} rejects on
  * — for every unusable input: an absent / non-finite / negative balance, a
@@ -1189,18 +1292,24 @@ export function resolveEffectiveFleetRiskFraction(
  */
 export function resolveLiveOptionTestBookAggregateCapUsd(
   availableCashUsd: number | null | undefined,
+  /**
+   * TRA-3897 — the premium half of `E_i`. REQUIRED and positional-second so the
+   * two operands of the basis sit adjacent at every call site and the compiler
+   * refuses the old 4-argument (cash-only) call outright.
+   */
+  openPremiumAtRiskUsd: number | null | undefined,
   fleetCapUsd: number,
   fleetRiskFraction: number,
   fleetCapitalUsd: number | null,
 ): number {
-  if (typeof availableCashUsd !== 'number') return 0;
-  if (!Number.isFinite(availableCashUsd) || availableCashUsd < 0) return 0;
+  const basisUsd = resolveLiveOtmSizingBasisUsd(availableCashUsd, openPremiumAtRiskUsd);
+  if (basisUsd === null) return 0;
   if (!Number.isFinite(fleetCapUsd) || fleetCapUsd <= 0) return 0;
   if (!Number.isFinite(fleetRiskFraction) || fleetRiskFraction <= 0) return 0;
   const phi = resolveEffectiveFleetRiskFraction(
     fleetRiskFraction, fleetCapUsd, fleetCapitalUsd,
   ).phiEffective;
-  const proRata = Math.floor(availableCashUsd * phi * 100) / 100;
+  const proRata = Math.floor(basisUsd * phi * 100) / 100;
   return Math.min(proRata, fleetCapUsd);
 }
 
@@ -1710,6 +1819,15 @@ export function fitsLiveOptionTestAggregateCap(
  * armed, headroom $0" are the two states a reader needs to tell apart, and a
  * cap value alone reads identically in both. Non-finite / negative at-risk ⇒
  * `null` (unreadable is not "full headroom").
+ *
+ * ⚠ STILL FLOORED, ON PURPOSE. TRA-3897 AC2 wanted the true signed value
+ * readable; it did NOT want this field's range widened underneath consumers
+ * that have only ever seen a non-negative number. The signed figure ships as
+ * the SIBLING {@link liveOptionTestAggregateHeadroomSignedUsd} instead, so the
+ * disambiguation arrives additively. The floor here remains a real defect
+ * surface — it is why `admin` at −$200.57 published `0`, byte-identical to a
+ * book exactly at its cap (the TRA-3827 shape, and the 08-17 breach in
+ * `canary-ceiling.ts`'s header) — and the sibling is what closes it.
  */
 export function liveOptionTestAggregateHeadroomUsd(
   openPremiumAtRiskUsd: number,
@@ -1718,6 +1836,33 @@ export function liveOptionTestAggregateHeadroomUsd(
   if (!Number.isFinite(openPremiumAtRiskUsd) || openPremiumAtRiskUsd < 0) return null;
   if (!Number.isFinite(capUsd) || capUsd <= 0) return null;
   return Math.max(0, Math.round((capUsd - openPremiumAtRiskUsd) * 100) / 100);
+}
+
+/**
+ * TRA-3897 (AC2) — the SAME quantity as
+ * {@link liveOptionTestAggregateHeadroomUsd}, UNCLAMPED: negative when the book
+ * is over its own cap.
+ *
+ * A clamped metric is a deleted alarm. `Math.max(0, …)` made "exactly full" and
+ * "over by $200.57" the same bytes on the route, so no reader could tell a book
+ * that had run out of budget from one that had blown through it without
+ * re-deriving `cap − atRisk` by hand — and a figure a reader has to re-derive
+ * is a figure most readers will not derive.
+ *
+ * Deliberately a SECOND function rather than a flag on the first: a boolean
+ * parameter would let a caller pick the clamped answer by accident, and every
+ * caller that wants the clamp already has it by name.
+ *
+ * `null` on the same unreadable inputs as its sibling — the two must never
+ * disagree about whether a reading exists, only about its sign.
+ */
+export function liveOptionTestAggregateHeadroomSignedUsd(
+  openPremiumAtRiskUsd: number,
+  capUsd: number,
+): number | null {
+  if (!Number.isFinite(openPremiumAtRiskUsd) || openPremiumAtRiskUsd < 0) return null;
+  if (!Number.isFinite(capUsd) || capUsd <= 0) return null;
+  return Math.round((capUsd - openPremiumAtRiskUsd) * 100) / 100;
 }
 
 /**

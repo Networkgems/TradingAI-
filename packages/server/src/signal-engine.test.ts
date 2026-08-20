@@ -8379,6 +8379,11 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         book: 'admin', mode: 'live', liveEntryGateOpen: true, capUsd: 750,
         fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 10_000,
         openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 750,
+        // TRA-3897 — the book is FLAT, so the capital basis IS the cash and the
+        // signed headroom IS the clamped one. Both unchanged here by design:
+        // the basis change is a strict generalization, and this row is the
+        // degenerate case that proves it on the ENGINE rather than the resolver.
+        headroomSignedUsd: 750, sizingBasisUsd: 10_000,
         // TRA-3879 — the fleet read is UNWIRED in this unit (no `index.ts`), so
         // `Σ E_i` is this book alone: $10,000 ⇒ `φ_eff = A/ΣE = 0.075`, far
         // below φ, and `capUsd` is UNCHANGED at $750 because `min(…, A)` was
@@ -8392,7 +8397,15 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
 
       seedOpenLivePremium(engine, 700);
       expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
-        openPremiumAtRiskUsd: 700, openRows: 1, headroomUsd: 50,
+        // TRA-3897 — $49.99, one cent under the $50.00 this read before the
+        // basis change, and the cent is CORRECT. `Σ E_i` is now $10,700, so
+        // `φ_eff = 750/10,700` is not exactly representable and
+        // `floor(10,700 × φ_eff)` lands on $749.99 rather than $750.00. That
+        // floor is the documented TIGHTENING-ONLY absorber for exactly this
+        // float error (see `resolveLiveOptionTestBookAggregateCapUsd`); it
+        // simply never bit while `Σ E_i` happened to be a round $10,000.
+        openPremiumAtRiskUsd: 700, openRows: 1, headroomUsd: 49.99,
+        sizingBasisUsd: 10_700, headroomSignedUsd: 49.99,
       });
     });
 
@@ -8432,9 +8445,11 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // The live 2026-08-14 arm plus a third book joining it. Under the
         // per-book bound alone these sum to $881.03 against A = $750.
         setLiveOtmFleetCapitalProvider(() => [
-          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 1143.96 },
-          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400 },
-          { book: 'newcomer', liveEntryGateOpen: true, availableCashUsd: 5000 },
+          // TRA-3897 — flat books (`openPremiumAtRiskUsd: 0`), so the capital
+          // basis reduces to cash and every number below is unchanged.
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0 },
+          { book: 'v0nni', liveEntryGateOpen: true, availableCashUsd: 400, openPremiumAtRiskUsd: 0 },
+          { book: 'newcomer', liveEntryGateOpen: true, availableCashUsd: 5000, openPremiumAtRiskUsd: 0 },
         ]);
         const admin = bookWithCash(liveStub(), 1143.96).getLiveOtmAggregateExposure();
         expect(admin.fleetSizingReason).toBe('phi_fleet_derived');
@@ -8478,8 +8493,13 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         // board figure, so φ_eff = 750/10,100 = 0.0743 and the SAME entry is
         // REFUSED. This is the fail-open TRA-3723 could only detect.
         setLiveOtmFleetCapitalProvider(() => [
-          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100 },
-          { book: 'whale', liveEntryGateOpen: true, availableCashUsd: 10_000 },
+          // TRA-3897 — the declared rows carry the PREMIUM half of the basis
+          // too. `admin` is the book under test and it is holding $10 of open
+          // premium (seeded above), so its declared row says so: `E_admin` is
+          // $110 of CAPITAL, not $100 of cash. Declaring 0 here would have the
+          // fleet read contradict the book it is reading.
+          { book: 'admin', liveEntryGateOpen: true, availableCashUsd: 100, openPremiumAtRiskUsd: 10 },
+          { book: 'whale', liveEntryGateOpen: true, availableCashUsd: 10_000, openPremiumAtRiskUsd: 0 },
         ]);
         const tightStub = liveStub();
         const tight = bookWithCash(tightStub, 100);
@@ -8498,6 +8518,72 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         if (saved === undefined) delete process.env[VAR];
         else process.env[VAR] = saved;
       }
+    });
+
+    // ─── TRA-3897 — the sizing basis at the ORDER SITE ─────────────────────
+    //
+    // The resolver suite (`option-live-otm-sizing-basis-tra3897.test.ts`)
+    // proves the arithmetic. These two run against the ENGINE because that is
+    // the only place the claim that matters can be false: an order site that
+    // resolves its budget from cash while the health route publishes capital
+    // would pass every arithmetic test there is, and would be invisible on the
+    // route. That is precisely how TRA-3674 shipped believed-safe.
+    //
+    // ⚠ BOTH VERDICTS ARE ASSERTED. A basis change that simply blocked more
+    // would pass a one-sided test and be a different, worse defect.
+    it('TRA-3897 — the ADMIT DECISION moves with the CAPITAL basis, not the cash left', async () => {
+      // ONE book, held fixed except for the conversion: capital $1,000, of
+      // which $400 is already open premium and $600 is still cash. φ 0.4858 ⇒
+      // the ratified allowance is $485.80 of at-risk, and $400 + this $82
+      // candidate is $482 — INSIDE it.
+      //
+      // On the CASH basis the same book sized $291.48 (φ × the $600 that was
+      // left) and refused, because it had spent 40% of its capital and 40% is
+      // past the φ/(1+φ) = 32.7% tipping point. It broke no gate to get there.
+      const stub = liveStub();
+      const engine = bookWithCash(stub, 600);
+      seedOpenLivePremium(engine, 400);
+
+      const row = engine.getLiveOtmAggregateExposure();
+      expect(row).toMatchObject({
+        availableCashUsd: 600,
+        openPremiumAtRiskUsd: 400,
+        // ⭐ The basis is the CAPITAL, published so it is auditable directly.
+        sizingBasisUsd: 1000,
+        capUsd: 485.8,
+      });
+      // …and the cash basis would have put this book $108.52 OVER its own cap.
+      expect(Math.floor(600 * 0.4858 * 100) / 100).toBe(291.48);
+      expect(row.headroomSignedUsd).toBeCloseTo(85.8, 2);
+
+      await runOtm(engine, ['AAPL']);
+      expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+      expect(gateOf('aggregate_cap')).toMatchObject({ blocked: 0 });
+    });
+
+    it('TRA-3897 — and it still REFUSES a book genuinely past its capital allowance', async () => {
+      // Same shape, $500 of capital: $100 cash + $400 open premium. The
+      // allowance is φ × 500 = $242.90 and the book is ALREADY $157.10 past it,
+      // so the $82 candidate must not reach the broker. The capital basis is a
+      // correction, not a relaxation — it does not hand an over-exposed book a
+      // bigger budget, it stops manufacturing over-exposure out of arithmetic.
+      const stub = liveStub();
+      const engine = bookWithCash(stub, 100);
+      seedOpenLivePremium(engine, 400);
+
+      const row = engine.getLiveOtmAggregateExposure();
+      expect(row).toMatchObject({ sizingBasisUsd: 500, capUsd: 242.9, openPremiumAtRiskUsd: 400 });
+      // ⭐ AC2 ON THE ROUTE. The clamped field says `0`, which reads
+      // byte-identically to a book that spent its budget to the cent; the
+      // signed sibling says the book is $157.10 UNDER WATER. `admin` served
+      // exactly this pair (0 vs −$200.57) on 2026-08-20 and nothing could tell.
+      expect(row.headroomUsd).toBe(0);
+      expect(row.headroomSignedUsd).toBeCloseTo(-157.1, 2);
+
+      const before = gateOf('aggregate_cap');
+      await runOtm(engine, ['AAPL']);
+      expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+      expect(gateOf('aggregate_cap')).toMatchObject({ blocked: before.blocked + 1 });
     });
 
     it('FAILS CLOSED with no balance snapshot — budget 0, cash null, not a silent $750', () => {
@@ -8543,13 +8629,20 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
         const looseStub = liveStub();
         const loose = bookWithCash(looseStub, 100);
         seedOpenLivePremium(loose, 10);
+        // TRA-3897 — read the row BEFORE the fill. `capUsd` is $110, not $100:
+        // the basis is CAPITAL, and this book's capital is its $100 of cash
+        // plus the $10 of premium it is already holding. (Read after the fill
+        // it would be higher still, because this harness's stubbed balance does
+        // not decrease when the order fills the way a real broker's does — so a
+        // post-fill `capUsd` here is an artifact of the stub, not of the gate.)
+        expect(loose.getLiveOtmAggregateExposure()).toMatchObject({
+          capUsd: 110, sizingBasisUsd: 110, fleetRiskFraction: 1,
+        });
         await runOtm(loose, ['AAPL']);
         // `evaluated` advances, `blocked` does NOT — the delta is the admit.
         expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 2, blocked: 1 });
         expect(looseStub.buyContractsLimit).toHaveBeenCalledTimes(1);
-        expect(loose.getLiveOtmAggregateExposure()).toMatchObject({
-          capUsd: 100, fleetRiskFraction: 1,
-        });
+        expect(loose.getLiveOtmAggregateExposure()).toMatchObject({ fleetRiskFraction: 1 });
       } finally {
         if (saved === undefined) delete process.env[VAR];
         else process.env[VAR] = saved;

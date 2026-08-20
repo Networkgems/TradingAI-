@@ -50,13 +50,19 @@ function admits(
 ): boolean {
   const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(env);
   const phi = resolveLiveOptionTestFleetRiskFraction(env);
-  const budget = resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, fleetCapUsd, phi, null);
+  const budget = resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, 0, fleetCapUsd, phi, null);
   return fitsLiveOptionTestAggregateCap(openAtRiskUsd, entryUsd, budget);
 }
 
 function budgetOf(env: NodeJS.ProcessEnv, availableCashUsd: number | null): number {
   return resolveLiveOptionTestBookAggregateCapUsd(
     availableCashUsd,
+    // TRA-3897 — 0, i.e. a FLAT book, which pins the capital basis to cash and
+    // keeps every TRA-3674 claim in this file EXACTLY as it was measured. The
+    // basis change is graded on a physically coherent book (cash goes DOWN by
+    // what at-risk goes UP) in `option-live-otm-sizing-basis-tra3897.test.ts` —
+    // NOT here, by re-basing an existing control's expected numbers.
+    0,
     resolveLiveOptionTestAggregateCapUsd(env),
     resolveLiveOptionTestFleetRiskFraction(env),
     null, // TRA-3879 — PER BOOK only: no fleet basis

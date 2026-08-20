@@ -5874,6 +5874,11 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
       fleetCapUsd: number; fleetRiskFraction: number; availableCashUsd: number | null;
       openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
       headroomUsd: number | null;
+      // TRA-3897 — the signed headroom and the sizing basis the row was capped
+      // on. Widened here rather than made optional on `LiveOtmAggregateExposure`:
+      // an optional field is one a producer can forget, and the whole point of
+      // `headroomSignedUsd` is that a reader can rely on it being there.
+      headroomSignedUsd: number | null; sizingBasisUsd: number | null;
     }>,
   ) {
     const { app, routes } = fakeApp();
@@ -5915,9 +5920,9 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
     // the real balances (admin $1,143.96 / v0nni $400.00) and the TRA-3674
     // per-book budgets they resolve to. Sum on `liveEntryGateOpen`, not `mode`.
     const rows = [
-      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 405.73 },
-      { book: 'Richard', mode: 'live' as const, liveEntryGateOpen: false, capUsd: 0, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: null, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: null },
-      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 194.32, openRows: 2, unpricedOpenRows: 0, headroomUsd: 0 },
+      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 150, openRows: 1, unpricedOpenRows: 0, headroomUsd: 405.73, headroomSignedUsd: 405.73, sizingBasisUsd: 1293.96 },
+      { book: 'Richard', mode: 'live' as const, liveEntryGateOpen: false, capUsd: 0, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: null, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: null, headroomSignedUsd: null, sizingBasisUsd: null },
+      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 194.32, openRows: 2, unpricedOpenRows: 0, headroomUsd: 0, headroomSignedUsd: 0, sizingBasisUsd: 594.32 },
     ];
     const body = serveFeeSlippage(() => rows);
     expect(body.aggregateExposure).toEqual(rows);
@@ -5936,8 +5941,8 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
   // armed books apart, which is the read the ticket is graded on.
   it('gives the two live books DISTINCT, readable budgets', () => {
     const rows = [
-      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 555.73 },
-      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 194.32 },
+      { book: 'admin', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 555.73, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 1143.96, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 555.73, headroomSignedUsd: 555.73, sizingBasisUsd: 1143.96 },
+      { book: 'v0nni', mode: 'live' as const, liveEntryGateOpen: true, capUsd: 194.32, fleetCapUsd: 750, fleetRiskFraction: 0.4858, availableCashUsd: 400, openPremiumAtRiskUsd: 0, openRows: 0, unpricedOpenRows: 0, headroomUsd: 194.32, headroomSignedUsd: 194.32, sizingBasisUsd: 400 },
     ];
     const served = serveFeeSlippage(() => rows).aggregateExposure as typeof rows;
     expect(served[0]!.capUsd).not.toBe(served[1]!.capUsd);
@@ -6009,6 +6014,8 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
       fleetCapUsd: number; fleetRiskFraction: number; availableCashUsd: number | null;
       openPremiumAtRiskUsd: number; openRows: number; unpricedOpenRows: number;
       headroomUsd: number | null;
+      /** TRA-3897 — unclamped headroom + the basis `capUsd` was sized on. */
+      headroomSignedUsd: number | null; sizingBasisUsd: number | null;
     };
     const row = (
       book: string, liveEntryGateOpen: boolean, capUsd: number, availableCashUsd: number | null,
@@ -6016,6 +6023,11 @@ describe('GET /api/health/live-options-fee-slippage — aggregate cap (TRA-3445)
       book, mode: 'live', liveEntryGateOpen, capUsd, fleetCapUsd: 750,
       fleetRiskFraction: 0.4858, availableCashUsd, openPremiumAtRiskUsd: 0, openRows: 0,
       unpricedOpenRows: 0, headroomUsd: capUsd,
+      // TRA-3897 — these rows are FLAT (`openPremiumAtRiskUsd: 0`), so the
+      // signed headroom equals the clamped one and the basis equals the cash.
+      // The fleet grade's claims below are therefore unchanged by the basis
+      // change, which is the point of leaving them flat.
+      headroomSignedUsd: capUsd, sizingBasisUsd: availableCashUsd,
     });
     const bound = (rows?: Row[]) =>
       (serveFeeSlippage(rows ? () => rows : undefined) as unknown as {

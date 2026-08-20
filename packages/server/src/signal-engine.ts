@@ -119,7 +119,7 @@ import {
   PCS_ENTRY_DTE_BAND,
 } from './pcs-shadow-ledger.js';
 import { selectWeeklyPcs } from '@trading-app/engine';
-import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction } from './option-exec-flag.js';
+import { isOptionExecEnabled, isOptionEmaPullbackEnabled, isOptionVolumeBreakoutEnabled, resolveRvLongDteOverride, resolveRvMinDailyVolume, isOptionDemoDirectionalEnabled, isOptionIvRvScannerEnabled, isOptionIvRvRoutingEnabled, resolveIvRvRoutingOverride, isOptionShortPremiumScannerEnabled, isOptionWheelRoutingEnabled, isWheelIvEntryFilterEnabled, isOptionLiveRvLongEnabled, isOptionLiveRvLongArmed, isOptionLiveOtmArmed, isOptionLiveDirectionalEnabled, isOptionCostGateLiveEnforceEnabled, isOptionLiquidityLiveEnforceEnabled, isOptionOtmDeltaFloorLiveEnforceEnabled, resolveOptionOtmDeltaFloorLive, resolveLiveOptionTestNotionalCapUsd, resolveLiveOptionTestMaxContracts, resolveLiveOptionTestContracts, resolveLiveOptionTestAggregateCapUsd, fitsLiveOptionTestAggregateCap, liveOptionTestAggregateHeadroomUsd, liveOptionTestAggregateHeadroomSignedUsd, resolveLiveOptionTestFleetRiskFraction, resolveLiveOptionTestBookAggregateCapUsd, sumLiveOtmFleetCapitalUsd, resolveEffectiveFleetRiskFraction, resolveLiveOtmSizingBasisUsd } from './option-exec-flag.js';
 import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason } from './option-exec-flag.js';
 // TRA-3879 — the cross-engine balance READ that makes `Σ B_i ≤ A` structural.
 // A read of a derived scalar, not the shared mutable accumulator TRA-3445
@@ -8875,6 +8875,12 @@ export class SignalEngine {
       liveEntryGateOpen:
         this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
       availableCashUsd: this.liveAvailableCashUsd(),
+      // TRA-3897 — the PREMIUM half of `E_i`. Without it `Σ E_i` fell by the
+      // exact amount the fleet had just put at risk, so φ_eff was re-derived
+      // against a basis that shrank whenever the fleet took a position. Same
+      // fold the order site and the exposure row use, so the three cannot
+      // disagree about what this book's basis is.
+      openPremiumAtRiskUsd: this.optionsAccount.openPremiumAtRiskForMode('live').usd,
     };
   }
 
@@ -8894,6 +8900,10 @@ export class SignalEngine {
     openRows: number;
     unpricedOpenRows: number;
     headroomUsd: number | null;
+    /** TRA-3897 (AC2) — unclamped `capUsd − openPremiumAtRiskUsd`; negative ⇒ over cap. */
+    headroomSignedUsd: number | null;
+    /** TRA-3897 — `E_i = availableCashUsd + openPremiumAtRiskUsd`, the sizing basis. */
+    sizingBasisUsd: number | null;
   } {
     // TRA-3674 — the RESOLVED PER-BOOK budget, not the fleet scalar. Before
     // this, all 67 rows reported a uniform `capUsd: 750`, so the route could
@@ -8912,10 +8922,14 @@ export class SignalEngine {
     const sizing = resolveEffectiveFleetRiskFraction(
       fleetRiskFraction, fleetCapUsd, fleet.fleetCapitalUsd, fleet.books,
     );
-    const capUsd = resolveLiveOptionTestBookAggregateCapUsd(
-      availableCashUsd, fleetCapUsd, fleetRiskFraction, fleet.fleetCapitalUsd,
-    );
     const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+    // TRA-3897 — sized on CAPITAL (`cash + atRisk`), not cash. `selfRow` already
+    // carries the same at-risk figure, so the basis this row publishes is the
+    // one that went into `Σ E_i` above and the one the order site resolves.
+    const sizingBasisUsd = resolveLiveOtmSizingBasisUsd(availableCashUsd, atRisk.usd);
+    const capUsd = resolveLiveOptionTestBookAggregateCapUsd(
+      availableCashUsd, atRisk.usd, fleetCapUsd, fleetRiskFraction, fleet.fleetCapitalUsd,
+    );
     return {
       book: this.alertUsername ?? null,
       mode: this.mode,
@@ -8947,6 +8961,16 @@ export class SignalEngine {
       openRows: atRisk.rows,
       unpricedOpenRows: atRisk.unpricedRows,
       headroomUsd: liveOptionTestAggregateHeadroomUsd(atRisk.usd, capUsd),
+      // TRA-3897 (AC2) — the SIGNED headroom. `headroomUsd` floors at 0, so a
+      // book over its own cap published byte-identically to one exactly at it:
+      // `admin` served `0` while its true headroom was −$200.57. A reader must
+      // be able to tell those apart ON THE ROUTE, without arithmetic.
+      headroomSignedUsd: liveOptionTestAggregateHeadroomSignedUsd(atRisk.usd, capUsd),
+      // TRA-3897 — `E_i` as this row was sized on, published so the basis is
+      // auditable rather than inferred from `capUsd / φ_eff`. It is exactly
+      // `availableCashUsd + openPremiumAtRiskUsd` whenever cash is readable,
+      // and `null` on the same fail-closed branch that zeroes `capUsd`.
+      sizingBasisUsd,
     };
   }
 
@@ -11123,20 +11147,38 @@ export class SignalEngine {
           // inferred from a budget that merely looks normal.
           const fleetCapUsd = resolveLiveOptionTestAggregateCapUsd(process.env);
           const fleetRiskFraction = resolveLiveOptionTestFleetRiskFraction(process.env);
+          //
+          // TRA-3897 — AND THE BASIS IS NOW CAPITAL, NOT CASH.
+          // `E_i = availableCash_i + openPremiumAtRisk_i`. The cash-only basis
+          // was measured on the OPPOSITE SIDE of the transaction it bounded:
+          // buying for `x` raised `atRisk` by `x` and lowered the cap by `φ·x`,
+          // so a book spending more than `φ/(1+φ)` of its cash (32.7% at φ
+          // 0.4858) ended up permanently over its own published cap BY
+          // CONSTRUCTION, having broken no gate. It also made the FLEET metric
+          // move the wrong way as risk was taken — Σ B_i fell from $558.68 to
+          // $327.75 on 2026-08-20 with no fix shipped, purely because $273.00
+          // of cash became two real-money contracts. `premiumPaid`, not the
+          // mark, so the basis is invariant across the fill EXACTLY and a cap
+          // can never relax out of unrealized gains.
+          //
+          // ⚠ `atRisk` is resolved BEFORE the sizing now, not after: it is an
+          // input to the basis, not merely the quantity compared against it.
+          const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
           const fleetCapital = sumLiveOtmFleetCapitalUsd(readLiveOtmFleetCapitalRows(), {
             book: this.alertUsername ?? null,
             // The SAME balance sized against above — the fleet sum must contain
             // the basis it is about to bound, or it understates `Σ E_i` and the
             // bound comes out LOOSE.
             availableCashUsd: availableCash,
+            openPremiumAtRiskUsd: atRisk.usd,
           });
           const fleetSizing = resolveEffectiveFleetRiskFraction(
             fleetRiskFraction, fleetCapUsd, fleetCapital.fleetCapitalUsd, fleetCapital.books,
           );
+          const aggregateBasisUsd = resolveLiveOtmSizingBasisUsd(availableCash, atRisk.usd);
           const aggregateCapUsd = resolveLiveOptionTestBookAggregateCapUsd(
-            availableCash, fleetCapUsd, fleetRiskFraction, fleetCapital.fleetCapitalUsd,
+            availableCash, atRisk.usd, fleetCapUsd, fleetRiskFraction, fleetCapital.fleetCapitalUsd,
           );
-          const atRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
           const fitsAggregate = fitsLiveOptionTestAggregateCap(
             atRisk.usd, testNotional, aggregateCapUsd,
           );
@@ -11150,7 +11192,12 @@ export class SignalEngine {
             : `OTM live test skipped — aggregate cap: $${atRisk.usd.toFixed(2)} already at risk across `
               + `${atRisk.rows} open live position(s) + this $${testNotional.toFixed(2)} entry exceeds this `
               + `book's $${aggregateCapUsd.toFixed(2)} budget `
-              + `(= min(φ_eff ${fleetSizing.phiEffective} × available cash $${availableCash.toFixed(2)}, `
+              // TRA-3897 — name the BASIS and both of its halves. "× available
+              // cash" was the old, wrong sizing and a refusal quoting it would
+              // send a reader to reconcile a number the gate no longer uses.
+              + `(= min(φ_eff ${fleetSizing.phiEffective} × capital `
+              + `$${aggregateBasisUsd?.toFixed(2) ?? 'unreadable'} `
+              + `[cash $${availableCash.toFixed(2)} + at risk $${atRisk.usd.toFixed(2)}], `
               + `$${fleetCapUsd.toFixed(2)} fleet total authorized)) `
               // TRA-3879 — φ_eff and WHY, on the same line as the refusal. A
               // budget that came out small because the FLEET is near its

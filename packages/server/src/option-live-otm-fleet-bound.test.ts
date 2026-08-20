@@ -51,7 +51,7 @@ function bookRow(
     book,
     liveEntryGateOpen,
     availableCashUsd,
-    capUsd: resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, A, PHI, null),
+    capUsd: resolveLiveOptionTestBookAggregateCapUsd(availableCashUsd, 0, A, PHI, null),
   };
 }
 
@@ -75,7 +75,7 @@ describe('TRA-3723 — the fleet fail-open the per-book clamp cannot catch', () 
     // This is the true half of the claim, and it is why the defect survived
     // review: every per-book assertion anyone could write passes.
     for (const cash of [400, 1143.96, 2000, 25_000, 10_000_000]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(cash, A, PHI, null)).toBeLessThanOrEqual(A);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(cash, 0, A, PHI, null)).toBeLessThanOrEqual(A);
     }
   });
 

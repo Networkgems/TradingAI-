@@ -485,8 +485,27 @@ export interface LiveOtmAggregateExposure {
   openRows: number;
   /** > 0 ⇒ the enforced figure is known to UNDERSTATE exposure (see `foldOpenPremiumAtRisk`). */
   unpricedOpenRows: number;
-  /** `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable. */
+  /**
+   * `capUsd − openPremiumAtRiskUsd`, floored at 0; `null` when unreadable.
+   *
+   * ⚠ THE FLOOR IS LOSSY. A book over its cap publishes `0` here, which is
+   * byte-identical to a book exactly at it — read {@link headroomSignedUsd}
+   * instead when you need to tell those apart (TRA-3897 AC2).
+   */
   headroomUsd: number | null;
+  /**
+   * TRA-3897 (AC2) — the same figure UNCLAMPED. **Negative ⇒ this book is over
+   * its own published cap.** `null` on exactly the same unreadable inputs as
+   * `headroomUsd`; the two never disagree about whether a reading exists.
+   */
+  headroomSignedUsd: number | null;
+  /**
+   * TRA-3897 — `E_i`, the basis `capUsd` was sized on:
+   * `availableCashUsd + openPremiumAtRiskUsd`. Published so the basis is
+   * auditable directly instead of back-derived from `capUsd / φ_eff`.
+   * `null` on the same fail-closed branch that zeroes `capUsd`.
+   */
+  sizingBasisUsd: number | null;
 }
 
 /** TRA-3218 — one engine's options-halt readout (see `SignalEngine.getOptionsHaltState`). */

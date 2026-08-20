@@ -72,6 +72,11 @@ function capitalRows(
     book: b.book,
     liveEntryGateOpen: b.open ?? true,
     availableCashUsd: b.availableCashUsd,
+    // TRA-3897 — this file's fleet is FLAT by construction (it varies balances
+    // only), and on a flat fleet the capital basis `cash + atRisk` reduces to
+    // `cash` EXACTLY. Every claim below is therefore preserved verbatim across
+    // the basis change; that is the strict-generalization proof, not a re-base.
+    openPremiumAtRiskUsd: 0,
   }));
 }
 
@@ -101,7 +106,7 @@ function sumBudgets(
           acc
           + Math.round(
             resolveLiveOptionTestBookAggregateCapUsd(
-              r.availableCashUsd, A, PHI, fleetCapitalUsd,
+              r.availableCashUsd, r.openPremiumAtRiskUsd, A, PHI, fleetCapitalUsd,
             ) * 100,
           ),
         0,
@@ -122,7 +127,7 @@ function boundRows(
     liveEntryGateOpen: r.liveEntryGateOpen,
     availableCashUsd: r.availableCashUsd,
     capUsd: resolveLiveOptionTestBookAggregateCapUsd(
-      r.availableCashUsd, A, PHI, fleetCapitalUsd,
+      r.availableCashUsd, r.openPremiumAtRiskUsd, A, PHI, fleetCapitalUsd,
     ),
   }));
 }
@@ -211,7 +216,7 @@ describe('TRA-3879 AC2 — the bound is STRUCTURAL, not fitted', () => {
     ];
     const basis = sumLiveOtmFleetCapitalUsd(capitalRows(fleet)).fleetCapitalUsd;
     const budgets = fleet.map(
-      b => resolveLiveOptionTestBookAggregateCapUsd(b.availableCashUsd, A, PHI, basis),
+      b => resolveLiveOptionTestBookAggregateCapUsd(b.availableCashUsd, 0, A, PHI, basis),
     );
     for (const b of budgets) expect(b).toBeLessThanOrEqual(A); // min(…, A) survives
     // Same fraction of itself for every book — the concentration property.
@@ -220,7 +225,7 @@ describe('TRA-3879 AC2 — the bound is STRUCTURAL, not fitted', () => {
     // Never larger than the pre-fix budget for the same book.
     fleet.forEach((b, i) => {
       expect(budgets[i]).toBeLessThanOrEqual(
-        resolveLiveOptionTestBookAggregateCapUsd(b.availableCashUsd, A, PHI, null),
+        resolveLiveOptionTestBookAggregateCapUsd(b.availableCashUsd, 0, A, PHI, null),
       );
     });
   });
@@ -301,7 +306,7 @@ describe('TRA-3879 AC4 — no book is darked, and the fallback says so', () => {
     // darking a book silently, indistinguishable from "the market offered
     // nothing". (f) cannot produce it — φ_eff > 0 whenever A > 0.
     for (const basis of [null, 1150.04, 10_000, 10_000_000, 0, Number.NaN]) {
-      const b = resolveLiveOptionTestBookAggregateCapUsd(750.04, A, PHI, basis as number | null);
+      const b = resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, A, PHI, basis as number | null);
       expect(b, `basis ${String(basis)}`).toBeGreaterThan(0);
     }
   });
@@ -313,7 +318,7 @@ describe('TRA-3879 AC4 — no book is darked, and the fallback says so', () => {
     expect(sizing.fleetCapitalUsd).toBeNull();
     // Identical to the bound in force before this ticket — the fallback is the
     // status quo, not a new posture.
-    expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, A, PHI, null))
+    expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, A, PHI, null))
       .toBe(Math.min(Math.floor(750.04 * PHI * 100) / 100, A));
   });
 
@@ -335,13 +340,13 @@ describe('TRA-3879 AC4 — no book is darked, and the fallback says so', () => {
 
   it('the unusable-input verdicts are unchanged — still fail CLOSED at 0', () => {
     for (const bad of [null, undefined, Number.NaN, -1]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(bad, A, PHI, 1150.04)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(bad, 0, A, PHI, 1150.04)).toBe(0);
     }
     for (const badCap of [0, -1, Number.NaN]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, badCap, PHI, 1150.04)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, badCap, PHI, 1150.04)).toBe(0);
     }
     for (const badPhi of [0, -1, Number.NaN]) {
-      expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, A, badPhi, 1150.04)).toBe(0);
+      expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, A, badPhi, 1150.04)).toBe(0);
     }
   });
 });
@@ -364,8 +369,8 @@ describe('TRA-3879 — the cross-engine READ itself', () => {
       book: 'admin', availableCashUsd: 750.04,
     });
     expect(fleet.fleetCapitalUsd).toBe(750.04);
-    expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, A, PHI, fleet.fleetCapitalUsd))
-      .toBe(resolveLiveOptionTestBookAggregateCapUsd(750.04, A, PHI, null));
+    expect(resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, A, PHI, fleet.fleetCapitalUsd))
+      .toBe(resolveLiveOptionTestBookAggregateCapUsd(750.04, 0, A, PHI, null));
   });
 
   it('a wired provider is summed on liveEntryGateOpen, never on book count', () => {
