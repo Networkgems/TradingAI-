@@ -100,7 +100,7 @@ if (asJson) {
 } else {
   // UNBOUND goes to stderr with the rest of the detail still on stdout: it is not
   // a pass, and a non-pass that prints only to stdout gets skimmed past.
-  if (verdict === 'UNBOUND') console.error(`UNBOUND — ${out.reason}`);
+  if (verdict === 'UNBOUND' || verdict === 'EXPOSURE') console.error(`${verdict} — ${out.reason}`);
   else console.log(`${verdict} — ${out.reason}`);
   console.log(`  source  ${out.source}`);
   console.log(`  build   ${out.build.commitShort} startedAt ${out.build.startedAt} (pid ${out.build.pid} — NOT a restart discriminator)`);
@@ -129,6 +129,23 @@ if (asJson) {
     + `   |   sized phi_eff*SumE: max SumB $${fc.sizedMaxSumUsd ?? 'n/a'} headroom $${fc.sizedHeadroomUsd ?? 'n/a'}`,
   );
   if (fc.doNotEscalate) console.log(`          ${fc.doNotEscalate}`);
+  // ⭐ Print on EVERY verdict, same reason as `bound in force` above. Σ B_i is
+  // the fleet's UNSPENT BUDGET; this is what it can actually be on the hook for,
+  // and the two diverge the moment anything is bought. On a flat fleet they are
+  // equal by construction, so this line is not noise — it is only ever news.
+  const re = out.reachableExposure ?? {};
+  if (re.graded) {
+    console.log(`  reach   $${re.reachableUsd.toFixed(2)} = Sum max(cap_i, atRisk_i)  vs A $${re.fleetCapUsd.toFixed(2)}${re.breach ? `   OVER BY $${re.overageUsd.toFixed(2)}` : ''}`);
+    for (const b of re.perBook) {
+      console.log(
+        `          ${b.book}: cap $${b.capUsd.toFixed(2)} at-risk $${b.openPremiumAtRiskUsd.toFixed(2)}`
+        + ` -> reachable $${b.reachableUsd.toFixed(2)}   true headroom $${b.trueHeadroomUsd.toFixed(2)}`
+        + ` (route publishes ${b.servedHeadroomUsd}${b.overCapUsd > 0 ? ' -- CLAMPED, this book is OVER its own cap' : ''})`,
+      );
+    }
+  } else {
+    console.log(`  reach   not graded: ${re.reason}`);
+  }
   if (out.partial) console.log(`  ${out.partial}`);
 }
 process.exit(code);

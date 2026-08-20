@@ -17,7 +17,9 @@
 //   1 BREACH   Σ B_i > A + slack — the fleet fail-open, live
 //   3 BLIND    unreachable, unparseable, un-wired, or the pin did not match
 //   3 UNBOUND  Σ B_i fits, but the BOUND THAT MAKES IT FIT IS NOT IN FORCE (below)
-//   Precedence BLIND > BREACH > CLEAN; UNBOUND only ever upgrades a CLEAN.
+//   1 EXPOSURE Σ B_i fits and the bound is in force, but the fleet's REACHABLE
+//              exposure — Σ max(cap_i, atRisk_i) — is over A anyway (below)
+//   Precedence BLIND > BREACH > EXPOSURE > UNBOUND > CLEAN.
 
 export const EXIT = {
   CLEAN: 0,
@@ -32,6 +34,14 @@ export const EXIT = {
    * needs.
    */
   UNBOUND: 3,
+  /**
+   * Deliberately the SAME code as BREACH. An exposure overage is a DEFINITE
+   * finding about live money — the fleet can reach a total the board did not
+   * authorize — not a could-not-certify, so it belongs with BREACH and not with
+   * BLIND/UNBOUND. Same rule as UNBOUND, applied in the other direction: reuse
+   * the existing non-pass code, let the VERDICT STRING carry the discrimination.
+   */
+  EXPOSURE: 1,
 };
 
 /** Cent-exact sum, so 0.1+0.2 never manufactures or hides a breach. */
@@ -134,6 +144,113 @@ function gradeBoundInForce(armed, A, eligibleBooks) {
     // Evidence, never the test.
     sizingReasons,
     failures,
+  };
+}
+
+/**
+ * TRA-3737 §3 — grade the fleet's REACHABLE EXPOSURE, not its unspent budget.
+ *
+ * `Σ B_i` answers "how much MORE is the fleet authorized to size?" It does not
+ * answer "how much can the fleet be on the hook for?", and only the second
+ * question is what `A` was ratified to bound. The gap between them is not
+ * academic — it is signed, and it points the wrong way:
+ *
+ *   `capUsd` is a ceiling on a book's TOTAL at-risk, not a budget for
+ *   additional entries (`fitsLiveOptionTestAggregateCap` is
+ *   `atRisk + entry <= cap`), AND `capUsd = φ · availableCash`. So buying an
+ *   option moves at-risk UP by `x` and the cap DOWN by `φ·x`.
+ *   **`Σ B_i` therefore FALLS as the fleet takes risk, and the metric reads
+ *   MORE compliant precisely when exposure grows.** (CEO, TRA-3737
+ *   2026-08-20T20:33Z, measured on live money: the 03:07Z `breach` at
+ *   Σ B_i $558.68 became a `within` at $327.75 with no fix shipped, because
+ *   the sleeve had converted $273 of cash into open premium.)
+ *
+ * A book's maximum reachable exposure is `max(cap_i, atRisk_i)` — NOT the sum.
+ * Below its cap a book can still size up to the cap; above it (which the cash
+ * basis makes routine, see below) it can add nothing, so it stays where it is.
+ * The fleet's worst case is the sum of those, and `Σ max(cap_i, atRisk_i) ≤ A`
+ * is the property `A` was supposed to name.
+ *
+ * ⭐ THIS IS A STRICT GENERALIZATION, WHICH IS WHY IT ADDS NO FALSE-ALARM
+ * SURFACE. On a flat fleet every `atRisk_i` is 0, `max(cap_i, 0) == cap_i`, and
+ * the sum is `Σ B_i` exactly — i.e. it reduces to the check already shipped and
+ * cannot turn a clean flat reading red. It can only fire on exposure that is
+ * genuinely outstanding.
+ *
+ * ⚠ `headroomUsd` on the served row is `Math.max(0, cap − atRisk)`. A book over
+ * its own cap publishes `0`, identical to a book exactly at it — so the overage
+ * is invisible on the route. A clamped metric is a deleted alarm (TRA-3827).
+ * `trueHeadroomUsd` here is UNCLAMPED and is the number to read.
+ *
+ * ⚠ UNGRADED, NOT RED, when any armed row omits `openPremiumAtRiskUsd`
+ * (pre-TRA-3445 bytes). Same discipline as `inForce: null`: a reader that goes
+ * red on every old build gets muted, and a muted reader is the empty room this
+ * whole ticket exists to close.
+ */
+function gradeReachableExposure(armed, A) {
+  if (armed.length === 0 || !usable(A)) {
+    return { graded: false, reason: 'no armed books, or no usable A on this build', perBook: [] };
+  }
+  const missing = armed.filter(r => !Number.isFinite(r?.openPremiumAtRiskUsd));
+  if (missing.length > 0) {
+    return {
+      graded: false,
+      reason:
+        `${missing.map(r => r?.book ?? '<unnamed>').join(', ')} publish no openPremiumAtRiskUsd — `
+        + 'pre-TRA-3445 bytes, so reachable exposure cannot be summed on this reading',
+      perBook: [],
+    };
+  }
+
+  const perBook = armed.map(r => {
+    const cap = Number.isFinite(r.capUsd) ? r.capUsd : 0;
+    const atRisk = r.openPremiumAtRiskUsd;
+    return {
+      book: r.book ?? '<unnamed>',
+      capUsd: cap,
+      openPremiumAtRiskUsd: atRisk,
+      reachableUsd: Math.max(cap, atRisk),
+      // UNCLAMPED — the served `headroomUsd` floors at 0 and deletes this.
+      trueHeadroomUsd: Math.round((cap - atRisk) * 100) / 100,
+      overCapUsd: Math.round(Math.max(0, atRisk - cap) * 100) / 100,
+      servedHeadroomUsd: r.headroomUsd ?? null,
+    };
+  });
+
+  const reachableUsd = sumCents(perBook, 'reachableUsd');
+  // ⚠ THE SAME φ-ROUNDING SLACK THE Σ B_i CHECK USES, OR THIS RE-PAGES ON THE
+  // DISCLOSED 5¢. On a flat fleet `reachable ≡ Σ B_i`, so a float epsilon here
+  // would fire EXPOSURE on exactly the `rounding_only` reading that verdict
+  // exists to keep un-spendable in either direction — caught by the pre-existing
+  // control, which is what a control suite is for.
+  //
+  // Scaled to `Σ E_i` and NOT to `reachable`: φ's 4th-place rounding is
+  // multiplied by cash (`cap_i = φ · E_i`), and at-risk dollars are actual fills
+  // carrying no φ error at all, so including them would inflate the tolerance
+  // with the very quantity this check exists to catch. Never a FLAT dollar
+  // figure — that would repeat φ's own mistake (a constant fitted to one night's
+  // balances) one level up.
+  //
+  // Computed, never read off the served `roundingAllowanceUsd`: a suppression
+  // that trusts a served field can be bought by inflating that field
+  // (TRA-3881 — suppress on arithmetic, never on a name).
+  const slack = Math.round(1e-4 * sumCents(armed, 'availableCashUsd') * 100) / 100;
+  const overageUsd = Math.round(Math.max(0, reachableUsd - A) * 100) / 100;
+  const breach = reachableUsd > A + slack;
+  const overCap = perBook.filter(b => b.overCapUsd > 0);
+
+  return {
+    graded: true,
+    breach,
+    reachableUsd,
+    fleetCapUsd: A,
+    overageUsd,
+    slackUsd: slack,
+    perBook,
+    booksOverOwnCap: overCap.map(b => `${b.book} at-risk $${b.openPremiumAtRiskUsd.toFixed(2)} vs cap $${b.capUsd.toFixed(2)} (over by $${b.overCapUsd.toFixed(2)}, route publishes headroom ${b.servedHeadroomUsd})`),
+    reason: breach
+      ? `REACHABLE EXPOSURE $${reachableUsd.toFixed(2)} = Σ max(cap_i, atRisk_i) EXCEEDS A $${A.toFixed(2)} by $${overageUsd.toFixed(2)}`
+      : `Σ max(cap_i, atRisk_i) $${reachableUsd.toFixed(2)} fits A $${A.toFixed(2)}`,
   };
 }
 
@@ -334,6 +451,32 @@ export function gradeFleetBound({ live, fee, expectCommit = null, measuredAt }) 
       + `Sizing reason(s) served: ${out.boundInForce.sizingReasons.map(r => r ?? 'absent').join(', ')}. `
       + 'A deposit — or nothing at all, as on 2026-08-20 — puts Σ B_i past the authorization with no '
       + 'further warning. This is exit 3, NOT a pass.';
+  }
+
+  // TRA-3737 §3 — published on EVERY verdict, for the same reason boundInForce
+  // is: "what can the fleet reach" is evidence a CLEAN reading needs, and a
+  // BREACH reading is entitled to be judged against it too.
+  out.reachableExposure = gradeReachableExposure(armed, typeof A === 'number' ? A : NaN);
+
+  // EXPOSURE upgrades a CLEAN **and an UNBOUND** — it outranks UNBOUND because
+  // it is a DEFINITE finding ("the fleet can reach $X > A") against a
+  // could-not-certify ("the bound that makes Σ B_i fit was not binding"). It
+  // must NOT touch a BREACH: Σ B_i is already over and unconditionally so, and
+  // re-labelling a live fail-open with a longer word is how a loud finding gets
+  // re-read as a caveat. It must not touch a BLIND either — we do not know what
+  // we measured. Same discipline as UNBOUND and the partial marker.
+  if ((verdict === 'CLEAN' || verdict === 'UNBOUND') && out.reachableExposure.breach === true) {
+    out.priorVerdict = verdict;
+    out.priorReason = out.reason;
+    verdict = 'EXPOSURE';
+    code = EXIT.EXPOSURE;
+    const re = out.reachableExposure;
+    out.reason =
+      `${re.reason}. Σ B_i $${localSum.toFixed(2)} fits A, but Σ B_i is the fleet's UNSPENT BUDGET, not its `
+      + 'EXPOSURE: capUsd is a ceiling on TOTAL at-risk and is itself φ · availableCash, so buying moves '
+      + `at-risk up by x and the cap down by φ·x. ${re.booksOverOwnCap.length > 0 ? `Over own cap: ${re.booksOverOwnCap.join('; ')}. ` : ''}`
+      + 'The route publishes a clamped headroom (max(0, cap - atRisk)) and therefore shows none of this. '
+      + 'This is exit 1, NOT a pass.';
   }
 
   out.verdict = verdict;

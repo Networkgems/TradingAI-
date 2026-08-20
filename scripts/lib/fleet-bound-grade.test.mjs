@@ -80,12 +80,52 @@ test('the client fallback ALSO catches the breach on a pre-fix build — the det
   assert.equal(code, EXIT.BREACH);
 });
 
+// ⚠ RE-BASED onto the GREEN capture by TRA-3737 §3. It used to relabel the
+// BREACH capture, whose rows sum to $558.68 against A $500 — and §3 reads the
+// ROWS, so that premise became self-contradictory ("the served label says fine"
+// vs "the books plainly reach past A") and the reader correctly refused it. The
+// claim under test here is the SERVED-VERDICT MAPPING, so it belongs on a
+// fixture whose rows genuinely fit. The behaviour that flipped is asserted
+// deliberately in the next test rather than deleted with the premise.
 test('a served `rounding_only` is not a breach — the disclosed slack must not page', () => {
-  const fee = clone().fee;
+  const fee = cloneFixed().fee;
   fee.aggregateFleetBound.verdict = 'rounding_only';
-  const { verdict, code } = gradeFleetBound({ live: clone().live, fee, measuredAt: AT });
+  const { verdict, code } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
   assert.equal(verdict, 'CLEAN');
   assert.equal(code, EXIT.CLEAN);
+});
+
+test('a soothing LABEL does not buy silence over rows that reach past A', () => {
+  // TRA-3881's rule, applied to the new verdict: suppress on ARITHMETIC, never
+  // on a reason name. Relabelling a $558.68 fleet `rounding_only` must not make
+  // it read clean, or a regression at the order site can purchase its own quiet
+  // by renaming itself.
+  const fee = clone().fee;
+  fee.aggregateFleetBound.verdict = 'rounding_only';
+  const { verdict, code, out } = gradeFleetBound({ live: clone().live, fee, measuredAt: AT });
+  assert.equal(verdict, 'EXPOSURE');
+  assert.equal(code, 1);
+  assert.equal(out.priorVerdict, 'CLEAN', 'the served label DID map to a pass — the rows overrode it');
+  assert.ok(out.reachableExposure.reachableUsd > out.reachableExposure.fleetCapUsd);
+});
+
+test('the φ-rounding slack is honoured: A + 5¢ on a FLAT fleet is not an exposure finding', () => {
+  // The bug this pair caught. On a flat fleet `reachable ≡ Σ B_i`, so a float
+  // epsilon here would page on exactly the disclosed 5¢ that `rounding_only`
+  // exists to keep un-spendable in either direction.
+  const fee = cloneFixed().fee;
+  const A = fee.aggregateCapUsd;
+  const armed = armedOf(fee);
+  armed[0].capUsd = Math.round((armed[0].capUsd + (A + 0.05 - fee.aggregateFleetBound.sumBookCapUsd)) * 100) / 100;
+  const { out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(out.reachableExposure.reachableUsd, A + 0.05, 'set up 5¢ over A');
+  assert.ok(out.reachableExposure.slackUsd >= 0.05, `slack ${out.reachableExposure.slackUsd} must cover the disclosed rounding`);
+  assert.equal(out.reachableExposure.breach, false);
+  // …and the slack is SCALED, not flat: a dollar over is still a finding.
+  armed[0].capUsd = Math.round((armed[0].capUsd + 1) * 100) / 100;
+  const g2 = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(g2.out.reachableExposure.breach, true, 'the tolerance must not swallow a real dollar');
+  assert.equal(g2.verdict, 'EXPOSURE');
 });
 
 test('a served `blind` is BLIND, never CLEAN — could-not-check must not share a code with fine', () => {
@@ -137,11 +177,21 @@ test('BLIND: the host is unreachable — the fetch throws, and the caller must n
   assert.equal(code, EXIT.BLIND);
 });
 
+// ⚠ RE-BASED onto the GREEN capture by TRA-3737 §3, same reason as the
+// `rounding_only` control above: the claim under test is the PARTIAL MARKER, and
+// riding a row set that reaches $558.68 past A made the expected CLEAN
+// self-contradictory once the reader started reading rows.
 test('COVERAGE is graded separately from CORRECTNESS — a pass one book short says so', () => {
-  const fee = clone().fee;
+  const fee = cloneFixed().fee;
   fee.aggregateFleetBound.verdict = 'within';
-  fee.aggregateFleetBound.unreadableBalanceBooks = ['v0nni'];
-  const { verdict, out } = gradeFleetBound({ live: clone().live, fee, measuredAt: AT });
+  fee.aggregateFleetBound.unreadableBalanceBooks = ['ghost'];
+  // The third eligible book must also be inside the fleet read's own coverage
+  // claim, or TRA-3880's `fleetCapitalBooks >= eligibleBooks` fires and the
+  // reading is UNBOUND for a reason that has nothing to do with the marker under
+  // test. Isolating the claim, not weakening it — the coverage check has its own
+  // controls above.
+  for (const r of armedOf(fee)) r.fleetCapitalBooks = 3;
+  const { verdict, out } = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
   assert.equal(verdict, 'CLEAN');
   assert.match(out.partial, /covers 2\/3 of the arm/);
   assert.equal(out.coverage.eligibleBooks, 3);
@@ -451,4 +501,127 @@ test('TRA-3881 — the fleetCapital block is published on EVERY verdict, breach 
   // as a caveat (TRA-3723).
   assert.equal(grade().verdict, 'BREACH');
   assert.equal(grade().out.fleetCapital.doNotEscalate, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// TRA-3737 §3 — REACHABLE EXPOSURE.
+//
+// The THIRD real capture: bqb1 `1fed3f51c65c` at 2026-08-20T20:5xZ, serving
+// `within` at Σ B_i $327.75 while the fleet could reach $528.32 against a $500
+// authorization. The CEO's 20:33Z finding is that the 03:07Z breach "cleared"
+// with no fix shipped, because the sleeve converted $273 of cash into open
+// premium and the basis is cash-only — so the metric moved the WRONG WAY as
+// risk was taken. This capture is that state, verbatim.
+// ---------------------------------------------------------------------------
+
+const EXPOSED = path.join(HERE, '..', 'fixtures', 'tra3737-live-exposure-2026-08-20.json');
+const exposed = JSON.parse(fs.readFileSync(EXPOSED, 'utf8'));
+const cloneExposed = () => JSON.parse(JSON.stringify(exposed));
+const gradeExposed = over => gradeFleetBound({ ...cloneExposed(), expectCommit: null, measuredAt: AT, ...over });
+
+test('the exposure capture really is the state the CEO measured — otherwise the controls below are vacuous', () => {
+  assert.equal(exposed.live.build.commitShort, '1fed3f51c65c');
+  assert.equal(exposed.fee.aggregateFleetBound.verdict, 'within', 'the ROUTE calls this healthy — that is the defect');
+  assert.equal(exposed.fee.aggregateFleetBound.sumBookCapUsd, 327.75);
+  assert.equal(exposed.fee.aggregateCapUsd, 500);
+  assert.equal(exposed.fee.arm.otmArmed, true, 'ARMED — real-money path');
+  const admin = exposed.fee.aggregateExposure.find(r => r.book === 'admin');
+  assert.equal(admin.openPremiumAtRiskUsd, 334, 'the $334 the CEO measured, outside the basis');
+  assert.equal(admin.headroomUsd, 0, 'CLAMPED — max(0, cap - atRisk) deletes a $200.57 overage');
+});
+
+test('POSITIVE CONTROL: a served `within` over a fleet that can reach past A exits 1 as EXPOSURE', () => {
+  const { verdict, code, out } = gradeExposed();
+  assert.equal(verdict, 'EXPOSURE');
+  assert.equal(code, EXIT.EXPOSURE);
+  assert.equal(code, 1, 'reuses the BREACH code — a definite finding, not a could-not-certify');
+  assert.equal(out.priorVerdict, 'CLEAN', 'the reader used to pass this reading');
+  assert.equal(out.reachableExposure.reachableUsd, 528.32);
+  assert.equal(out.reachableExposure.overageUsd, 28.32);
+  assert.match(out.reason, /REACHABLE EXPOSURE/);
+  assert.match(out.reason, /NOT a pass/);
+});
+
+test('the served verdict AND the bound both say healthy — so neither pre-existing check could have caught this', () => {
+  // This is the whole argument for the new verdict. If either existing signal
+  // already flagged it, §3 would be redundant.
+  const { out } = gradeExposed();
+  assert.equal(out.servedVerdict, 'within');
+  assert.equal(out.boundInForce.inForce, true, 'TRA-3879/TRA-3880 grade this as FINE');
+  assert.equal(out.coverage.armedBooksCovered, out.coverage.eligibleBooks, '2/2 — not a coverage artifact');
+  assert.equal(out.reachableExposure.perBook.find(b => b.book === 'admin').trueHeadroomUsd, -200.57);
+});
+
+test('NEGATIVE CONTROL: on a FLAT fleet the new check reduces to Σ B_i exactly and stays green', () => {
+  // ⭐ The strict-generalization property, demonstrated on a REAL capture rather
+  // than asserted in prose: every atRisk_i is 0, so Σ max(cap_i, 0) ≡ Σ B_i and
+  // the reader cannot turn a clean flat reading red. This is what stops the new
+  // verdict from becoming a permanent alarm — and a permanent alarm is a deleted
+  // alarm (TRA-3881).
+  const { verdict, code, out } = gradeFixed();
+  assert.equal(verdict, 'CLEAN');
+  assert.equal(code, EXIT.CLEAN);
+  for (const b of out.reachableExposure.perBook) assert.equal(b.openPremiumAtRiskUsd, 0);
+  assert.equal(out.reachableExposure.reachableUsd, out.sumBookCapUsd, 'identical, to the cent');
+  assert.equal(out.reachableExposure.breach, false);
+});
+
+test('EXPOSURE never hedges a BREACH — the overage is unconditional', () => {
+  // Same discipline as UNBOUND and the partial marker: re-labelling a live
+  // fail-open with a longer word is how a loud finding gets re-read as a caveat.
+  const { verdict, out } = grade();
+  assert.equal(verdict, 'BREACH');
+  assert.equal(out.reachableExposure.breach, true, 'reachable exposure IS also over on the breach capture');
+  assert.equal(out.priorVerdict, undefined, 'and it did NOT rewrite the verdict');
+  assert.match(out.reason, /FLEET FAIL-OPEN/);
+});
+
+test('EXPOSURE outranks UNBOUND — a definite finding beats a could-not-certify', () => {
+  const fee = cloneExposed().fee;
+  for (const r of armedOf(fee)) r.fleetCapitalUsd = null;   // force bound-not-in-force
+  const g = gradeFleetBound({ live: cloneExposed().live, fee, measuredAt: AT });
+  assert.equal(g.out.boundInForce.inForce, false, 'the UNBOUND precondition really is met here');
+  assert.equal(g.verdict, 'EXPOSURE');
+  assert.equal(g.out.priorVerdict, 'UNBOUND');
+  assert.equal(g.code, 1, 'and it escalates 3 -> 1, never the reverse');
+});
+
+test('EXPOSURE never touches a BLIND — we do not know what we measured', () => {
+  const g = gradeFleetBound({ live: cloneExposed().live, fee: cloneExposed().fee, expectCommit: 'deadbeef0000', measuredAt: AT });
+  assert.equal(g.verdict, 'BLIND');
+  assert.equal(g.code, EXIT.BLIND);
+});
+
+test('the fold is max(cap, atRisk), NOT cap + atRisk — capUsd is a ceiling on TOTAL at-risk', () => {
+  // `fitsLiveOptionTestAggregateCap` is `atRisk + entry <= cap`, so a book above
+  // its cap can add nothing and a book below it can only climb TO the cap.
+  // Summing the two would double-count and manufacture an overage on any healthy
+  // fleet that happens to hold something — the false-alarm direction.
+  const { out } = gradeExposed();
+  const byBook = Object.fromEntries(out.reachableExposure.perBook.map(b => [b.book, b]));
+  assert.equal(byBook.admin.reachableUsd, 334, 'over its cap -> pinned at at-risk');
+  assert.equal(byBook.v0nni.reachableUsd, 194.32, 'under its cap -> can still climb to the cap');
+  const naiveSum = out.reachableExposure.perBook.reduce((s, b) => s + b.capUsd + b.openPremiumAtRiskUsd, 0);
+  assert.ok(naiveSum > out.reachableExposure.reachableUsd, 'cap+atRisk would overstate');
+});
+
+test('UNGRADED, not red, when a build publishes no openPremiumAtRiskUsd', () => {
+  // Pre-TRA-3445 bytes. A reader that goes red on every old build gets muted,
+  // and a muted reader is the empty room this ticket exists to close.
+  const fee = cloneFixed().fee;
+  for (const r of armedOf(fee)) delete r.openPremiumAtRiskUsd;
+  const g = gradeFleetBound({ live: cloneFixed().live, fee, measuredAt: AT });
+  assert.equal(g.out.reachableExposure.graded, false);
+  assert.match(g.out.reachableExposure.reason, /pre-TRA-3445/);
+  assert.equal(g.verdict, 'CLEAN', 'not graded is not a finding');
+  assert.equal(g.code, EXIT.CLEAN);
+});
+
+test('the reachableExposure block is published on EVERY verdict, breach included', () => {
+  // A field that appears only when it is bad cannot be asserted on, and its
+  // absence reads as "fine" rather than "not measured".
+  for (const g of [grade(), gradeFixed(), gradeExposed()]) {
+    assert.ok(Object.prototype.hasOwnProperty.call(g.out, 'reachableExposure'), `missing on ${g.verdict}`);
+    assert.ok('graded' in g.out.reachableExposure);
+  }
 });
