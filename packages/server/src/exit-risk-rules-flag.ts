@@ -558,3 +558,62 @@ export function resolveOptionOpeningRangeMin(env: NodeJS.ProcessEnv = process.en
   const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : OPTION_OPENING_RANGE_MIN_DEFAULT;
 }
+
+// TRA-3902 — the LIVE hard-stop policy, ruled by the board on 2026-08-20
+// (interaction d7776ac1, option B). `sl` is the most expensive exit on the
+// books (588 closes, 4.4% win rate, −$23.4k, avg hold 0.15 days): an intraday
+// −20% premium stop on a single-leg option is a stop on NOISE, and the opening-
+// range hold alone does not let a trade breathe 2–3 days. Under `daily_close`:
+//
+//   • the −20% stop (`stopLossPremium`) is read ONLY inside the last
+//     `closeWindowMin` minutes of RTH (default 30 → 15:30–16:00 ET), so a
+//     position that is through its stop at 10:00 and back above it by the close
+//     is never sold;
+//   • intraday, only a CATASTROPHIC stop fires — mark ≤ premiumPaid ×
+//     (1 − `catastrophicLossPct`), default −50% — and it fires at the mark;
+//   • the opening-range hold still applies to both (the opening print is the
+//     widest quote of the session, and TRA-3902's first fix stands);
+//   • outside RTH nothing fires (marks are stale and no exit can route).
+//
+// `intraday` is the pre-ruling behaviour (stop read every tick after the
+// opening window) and is what `checkExits` does when no policy is handed to it,
+// so every demo row and every existing test is byte-identical. The ENGINE reads
+// the env and hands the resolved policy to the live pass and to the health-route
+// walk; an absent/garbage value means the ruling (`daily_close`), never the
+// legacy, because a silently legacy box would sell the owner's position at
+// 10:01 and read identically to a healthy one until it did.
+export type LiveOptionStopPolicyName = 'daily_close' | 'intraday';
+export interface LiveOptionStopPolicy {
+  policy: LiveOptionStopPolicyName;
+  /** Minutes before the 16:00 ET close during which the −20% stop is read. */
+  closeWindowMin: number;
+  /** Fraction of `premiumPaid` lost at which the intraday catastrophic stop fires. */
+  catastrophicLossPct: number;
+}
+export const OPTION_LIVE_STOP_POLICY_VALUE = 'OPTION_LIVE_STOP_POLICY';
+export const OPTION_LIVE_STOP_CLOSE_WINDOW_MIN_VALUE = 'OPTION_LIVE_STOP_CLOSE_WINDOW_MIN';
+export const OPTION_LIVE_STOP_CATASTROPHIC_PCT_VALUE = 'OPTION_LIVE_STOP_CATASTROPHIC_PCT';
+export const OPTION_LIVE_STOP_POLICY_DEFAULT: LiveOptionStopPolicy = Object.freeze({
+  policy: 'daily_close',
+  closeWindowMin: 30,
+  catastrophicLossPct: 0.5,
+});
+
+export function resolveLiveOptionStopPolicy(env: NodeJS.ProcessEnv = process.env): LiveOptionStopPolicy {
+  const rawPolicy = env[OPTION_LIVE_STOP_POLICY_VALUE]?.trim().toLowerCase();
+  const policy: LiveOptionStopPolicyName = rawPolicy === 'intraday' ? 'intraday' : 'daily_close';
+  const rawWindow = env[OPTION_LIVE_STOP_CLOSE_WINDOW_MIN_VALUE]?.trim();
+  const parsedWindow = rawWindow ? Number(rawWindow) : Number.NaN;
+  // Bounded to the session: a window ≥ 390 min would read the stop all day,
+  // which is `intraday` spelled differently; ≤ 0 would never read it, which is
+  // option C (no engine stop) spelled differently. Neither is this knob's job.
+  const closeWindowMin = Number.isFinite(parsedWindow) && parsedWindow > 0 && parsedWindow < 390
+    ? parsedWindow
+    : OPTION_LIVE_STOP_POLICY_DEFAULT.closeWindowMin;
+  const rawPct = env[OPTION_LIVE_STOP_CATASTROPHIC_PCT_VALUE]?.trim();
+  const parsedPct = rawPct ? Number(rawPct) : Number.NaN;
+  const catastrophicLossPct = Number.isFinite(parsedPct) && parsedPct > 0 && parsedPct < 1
+    ? parsedPct
+    : OPTION_LIVE_STOP_POLICY_DEFAULT.catastrophicLossPct;
+  return { policy, closeWindowMin, catastrophicLossPct };
+}

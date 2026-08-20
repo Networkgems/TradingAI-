@@ -303,6 +303,7 @@ import {
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
+import { resolveLiveOptionStopPolicy } from './exit-risk-rules-flag.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   foldLiveBrokerDriftStatuses,
@@ -10831,6 +10832,11 @@ app.get('/api/health/options-live', async (_req, res) => {
       // an explicit `instrumentBlind: true` with the counts NULLED rather than
       // zeroed — "could not measure" and "measured zero" must never share a
       // reading (the repo rule that BLIND > CLEAN).
+      // TRA-3902 (board ruling B) — the LIVE hard-stop policy in force on this
+      // box, so "the stop is held" and "the stop was never read" are
+      // distinguishable from outside: `daily_close` reads the −20% stop only in
+      // the last `closeWindowMin` minutes of RTH; `intraday` is the legacy.
+      liveStopPolicy: resolveLiveOptionStopPolicy(),
       liveStopActionability: (() => {
         try {
           return {

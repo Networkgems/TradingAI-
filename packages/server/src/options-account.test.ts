@@ -4102,6 +4102,153 @@ describe('TRA-3217 — stale-breach veto + opening-range window', () => {
     expect(fired[0].exitReason).toBe('sl');
   });
 
+  // ── TRA-3902 (board ruling B, 2026-08-20, interaction d7776ac1) ─────────────
+  // The live DAILY-CLOSE stop: −20% read only in the last 30 min of RTH;
+  // intraday only a −50% catastrophic stop; demo rows and policy-less callers
+  // byte-identical to the legacy intraday stop.
+  const DAILY_CLOSE = { policy: 'daily_close' as const, closeWindowMin: 30, catastrophicLossPct: 0.5 };
+  const D1_CLOSE_WINDOW = D1_OPEN + 360 * 60_000; // 15:30 ET
+  const D1_CLOSE = D1_OPEN + 390 * 60_000;        // 16:00 ET
+
+  it('TRA-3902/B — a −20% breach at 10:30 ET is HELD all session and fires as `sl_daily_close` only inside the last 30 min', () => {
+    const { acct, row } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    // 10:30 ET, mark 0.75 < stop 0.80 — on the legacy build this is a fire.
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    expect(tickAt(0.75)).toHaveLength(0);
+    expect(row().slHeldForDailyClose).toBe('2024-06-05');
+    expect(acct.getSlDailyCloseHolds()).toBe(1);
+    // Noon, still through: held, and the latch means no second log/count.
+    vi.setSystemTime(D1_OPEN + 150 * 60_000);
+    expect(tickAt(0.70)).toHaveLength(0);
+    expect(acct.getSlDailyCloseHolds()).toBe(1);
+    // 15:29 ET — one minute before the window: still held.
+    vi.setSystemTime(D1_CLOSE_WINDOW - 60_000);
+    expect(tickAt(0.70)).toHaveLength(0);
+    // 15:31 ET — inside the window and still through: fires at the stop level.
+    vi.setSystemTime(D1_CLOSE_WINDOW + 60_000);
+    const closed = tickAt(0.70);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('sl_daily_close');
+    expect(closed[0].slHeldForDailyClose).toBeUndefined();
+  });
+
+  it('TRA-3902/B — a breach that recovers by the close window never sells (the noise case the ruling is for)', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    expect(tickAt(0.72)).toHaveLength(0);
+    vi.setSystemTime(D1_CLOSE_WINDOW + 5 * 60_000);
+    expect(tickAt(0.85)).toHaveLength(0);
+    vi.setSystemTime(D1_CLOSE - 60_000);
+    expect(tickAt(0.82)).toHaveLength(0);
+    expect(acct.getState().openOptions).toHaveLength(1);
+  });
+
+  it('TRA-3902/B — the intraday CATASTROPHIC stop (−50%) fires at the MARK, outside the close window', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    // −45%: through the −20% stop, above the catastrophic level → held.
+    expect(tickAt(0.55)).toHaveLength(0);
+    // −52%: through the catastrophic level → fires now, at the mark, not at 0.80.
+    const closed = tickAt(0.48);
+    expect(closed).toHaveLength(1);
+    expect(closed[0].exitReason).toBe('sl_catastrophic');
+    expect(closed[0].currentPremium).toBeCloseTo(0.48, 6);
+  });
+
+  it('TRA-3902/B — the catastrophic stop is still HELD inside the opening-range window, and nothing fires outside RTH', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const tickAt = (mark: number) => acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, mark]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    // 09:35 ET, −52% on the opening print: opening-range hold wins.
+    vi.setSystemTime(D1_OPEN + 5 * 60_000);
+    expect(tickAt(0.48)).toHaveLength(0);
+    expect(acct.getSlOpeningRangeHolds()).toBe(1);
+    // 16:05 ET, after the close: nothing fires (stale mark, nothing routes).
+    vi.setSystemTime(D1_CLOSE + 5 * 60_000);
+    expect(tickAt(0.48)).toHaveLength(0);
+    // 09:50 ET next day (after the opening window): catastrophic fires.
+    vi.setSystemTime(D1_OPEN + 24 * 60 * 60_000 + 20 * 60_000);
+    expect(tickAt(0.48)).toHaveLength(1);
+  });
+
+  it('TRA-3902/B — `intraday` policy is the legacy stop; a demo row under `daily_close` still stops intraday', () => {
+    const a = liveAccount();
+    const aSym = a.acct.getState().openOptions[0].optionSymbol!;
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    const legacy = a.acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[aSym, 0.75]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: { ...DAILY_CLOSE, policy: 'intraday' } }, undefined, RISK_GUARDED,
+    );
+    expect(legacy).toHaveLength(1);
+    expect(legacy[0].exitReason).toBe('sl');
+
+    const demo = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
+    const pos = demo.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');
+    const demoClosed = demo.checkExits(
+      new Map([['AAPL', 200]]), new Map([[pos!.optionSymbol!, 0.75]]), 'demo',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    expect(demoClosed).toHaveLength(1);
+    expect(demoClosed[0].exitReason).toBe('sl');
+  });
+
+  it('TRA-3902/B — the health route names `daily_close_hold` with the window start as release, and ACTIONABLE inside the window / through the catastrophic level', () => {
+    const { acct } = liveAccount();
+    const sym = acct.getState().openOptions[0].optionSymbol!;
+    const at = (now: number) => acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15, liveStopPolicy: DAILY_CLOSE, now,
+    });
+    vi.setSystemTime(D1_OPEN + 60 * 60_000);
+    acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, 0.75]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: DAILY_CLOSE }, undefined, RISK_GUARDED,
+    );
+    const mid = at(D1_OPEN + 60 * 60_000);
+    expect(mid.breached).toBe(1);
+    expect(mid.byReason).toEqual({ daily_close_hold: 1 });
+    expect(mid.releasesAt).toBe(new Date(D1_CLOSE_WINDOW).toISOString());
+    expect(mid.indefinite).toBe(0);
+    // Inside the close window the same row is actionable.
+    const inWindow = at(D1_CLOSE_WINDOW + 60_000);
+    expect(inWindow.actionable).toBe(1);
+    expect(inWindow.inert).toBe(0);
+    // After the close: held, releasing at the NEXT day's window start.
+    const after = at(D1_CLOSE + 5 * 60_000);
+    expect(after.byReason).toEqual({ daily_close_hold: 1 });
+    expect(after.releasesAt).toBe(new Date(D1_CLOSE_WINDOW + 24 * 60 * 60_000).toISOString());
+    // Through the catastrophic level mid-session: actionable.
+    acct.checkExits(
+      new Map([['AAPL', 200]]), new Map([[sym, 0.48]]), 'live',
+      { openingRangeHoldMin: 15, liveStopPolicy: { ...DAILY_CLOSE, catastrophicLossPct: 0.9 } }, undefined, RISK_GUARDED,
+    );
+    const cat = at(D1_OPEN + 60 * 60_000);
+    expect(cat.actionable).toBe(1);
+    // Legacy policy: actionable mid-session, as before the ruling.
+    const legacy = acct.liveStopActionabilitySummary({
+      brokerMirroring: true, openingRangeGuardMin: 15,
+      liveStopPolicy: { ...DAILY_CLOSE, policy: 'intraday' }, now: D1_OPEN + 60 * 60_000,
+    });
+    expect(legacy.actionable).toBe(1);
+  });
+
   it('TRA-3902 — the hard-stop hold is live-only: a demo row still stops out at the open', () => {
     const acct = new PaperOptionsAccount({ initialEquity: 50_000, managedAccountRatio: 0.5 });
     const pos = acct.openOptionFromCandidate(buildSignal({ mark: 1.0 }), 'demo');

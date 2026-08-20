@@ -3107,6 +3107,14 @@ export interface OptionPosition {
    */
   slHeldInOpeningRange?: boolean;
   /**
+   * TRA-3902 (board ruling B) — the ET date key on which this live row's
+   * breached −20% stop was last HELD until the daily-close window (so the log
+   * and counter say "held" once per day, not once per tick). Cleared when the
+   * stop fires (`sl_daily_close` / `sl_catastrophic`). Persisted so a restart
+   * cannot launder the hold into a fire.
+   */
+  slHeldForDailyClose?: string;
+  /**
    * TRA-3217 — provenance note for the chandelier trail, so a later
    * `chandelier` exit can say which trail actually fired (three mechanisms
    * shared one label before this):

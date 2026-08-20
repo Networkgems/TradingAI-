@@ -21,6 +21,7 @@ import type {
 } from '@trading-app/shared';
 import { computePortfolioGreeks } from './reports/portfolio-greeks.js';
 import { etDateKey, etWallClockToUtcMs } from './et-clock.js';
+import type { LiveOptionStopPolicy } from './exit-risk-rules-flag.js';
 import type { SpotResolver, PortfolioGreeksOptions } from './reports/portfolio-greeks.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -573,6 +574,46 @@ function minutesSinceRthOpen(now: number): number | null {
   return (now - openMs) / 60_000;
 }
 
+/** Minutes in a regular 9:30–16:00 ET session. */
+const RTH_SESSION_MIN = 390;
+
+/**
+ * TRA-3902 (board ruling B) — where instant `now` sits relative to the
+ * `daily_close` stop window, and when the −20% stop is NEXT read.
+ *
+ * `inCloseWindow` is the only phase in which `stopLossPremium` is read on a
+ * live row under `daily_close`. `inSession` (RTH, outside the close window) is
+ * where ONLY the catastrophic stop may fire. `releaseAt` is the start of the
+ * next close window — today's if it has not opened yet, otherwise the next
+ * calendar day's (a weekend/holiday row therefore reports a release that is a
+ * day or two early; it is a horizon for the health route, not a schedule).
+ * `null` only if the ET calendar math fails, and `null` never reads as "in".
+ *
+ * One helper, used by BOTH `checkExits` and the `liveStopActionability` walk,
+ * so the health route cannot disagree with the exit pass about whether the
+ * stop is being read right now — the failure mode TRA-3822 exists to name.
+ */
+function resolveDailyCloseStopPhase(
+  now: number,
+  closeWindowMin: number,
+): { inSession: boolean; inCloseWindow: boolean; releaseAt: number | null } | null {
+  const mins = minutesSinceRthOpen(now);
+  if (mins === null) return null;
+  const windowStartMin = RTH_SESSION_MIN - closeWindowMin;
+  const inSession = mins >= 0 && mins < RTH_SESSION_MIN;
+  const inCloseWindow = inSession && mins >= windowStartMin;
+  let releaseAt: number | null;
+  if (inCloseWindow) {
+    releaseAt = now;
+  } else if (mins < windowStartMin) {
+    releaseAt = now + (windowStartMin - mins) * 60_000;
+  } else {
+    const nextOpen = etWallClockToUtcMs(etDateKey(now + 24 * 60 * 60_000), 9, 30);
+    releaseAt = nextOpen == null ? null : nextOpen + windowStartMin * 60_000;
+  }
+  return { inSession, inCloseWindow, releaseAt };
+}
+
 /**
  * TRA-374 — coerce a config knob to a finite, non-negative number. Used so
  * a fat-finger AccountSettings save can't accidentally invert the demo cost
@@ -970,6 +1011,13 @@ export interface LiveStopActionabilityContext {
    * ever held at the open, which is the opposite of the shipped default.
    */
   openingRangeGuardMin: number;
+  /**
+   * TRA-3902 (ruling B) — the live stop policy the exit pass is running under.
+   * Absent ⇒ `intraday` (legacy), which is what an account-level caller that
+   * does not hand one to `checkExits` actually gets — so the walk and the pass
+   * agree by construction. The engine always passes the env-resolved policy.
+   */
+  liveStopPolicy?: LiveOptionStopPolicy;
   /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
   now?: number;
 }
@@ -1014,7 +1062,15 @@ export type LiveStopInertReason =
    * above it is a DEFERRAL of a stop we intend to fire, and the stop is
    * re-read against the live mark the moment the window closes.
    */
-  | 'opening_range_hold';
+  | 'opening_range_hold'
+  /**
+   * TRA-3902 (ruling B) — the live `daily_close` policy: the −20% stop is read
+   * only inside the last `closeWindowMin` minutes of RTH, and this row is
+   * through it but NOT through the intraday catastrophic level. Has a known
+   * release: the start of the next close window. A row through the
+   * catastrophic level inside the session is `actionable`, not this.
+   */
+  | 'daily_close_hold';
 
 /** TRA-3822 — see {@link summarizeLiveStopActionability}. */
 export interface LiveStopActionabilitySummary {
@@ -1132,6 +1188,11 @@ export function summarizeLiveStopActionability(
   // per pass. `null` when the window is off (0) or the ET calendar math fails,
   // and `null` never reads as "inside".
   const openingRangeMins = ctx.openingRangeGuardMin > 0 ? minutesSinceRthOpen(now) : null;
+  // TRA-3902 (ruling B) — the SAME helper `checkExits` resolves its phase from.
+  const dailyClosePhase =
+    ctx.liveStopPolicy?.policy === 'daily_close'
+      ? resolveDailyCloseStopPhase(now, ctx.liveStopPolicy.closeWindowMin)
+      : null;
   const byReason: Partial<Record<LiveStopInertReason, number>> = {};
   let breached = 0;
   let actionable = 0;
@@ -1190,6 +1251,13 @@ export function summarizeLiveStopActionability(
       // pre-open tick, negative minutes, counts as inside), and the same
       // position in the walk: it sits AT the SL branch, after every `continue`.
       reason = 'opening_range_hold';
+    } else if (dailyClosePhase !== null && !dailyClosePhase.inCloseWindow) {
+      // TRA-3902 (ruling B) — same predicate as the `daily_close` branch in
+      // `checkExits`: outside the close window, only the catastrophic level
+      // fires, and only inside the session.
+      const catastrophicLevel = opt.premiumPaid * (1 - ctx.liveStopPolicy!.catastrophicLossPct);
+      const catastrophic = opt.premiumPaid > 0 && mark <= catastrophicLevel;
+      if (!(dailyClosePhase.inSession && catastrophic)) reason = 'daily_close_hold';
     }
 
     if (reason === null) {
@@ -1209,6 +1277,11 @@ export function summarizeLiveStopActionability(
     } else if (reason === 'opening_range_hold') {
       // TRA-3902 — releases when the window closes: now + (window − elapsed).
       const release = now + (ctx.openingRangeGuardMin - (openingRangeMins as number)) * 60_000;
+      if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+      if (latestRelease === null || release > latestRelease) latestRelease = release;
+    } else if (reason === 'daily_close_hold' && dailyClosePhase?.releaseAt != null) {
+      // TRA-3902 (ruling B) — releases when the close window opens.
+      const release = dailyClosePhase.releaseAt;
       if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
       if (latestRelease === null || release > latestRelease) latestRelease = release;
     } else {
@@ -2759,6 +2832,8 @@ export class PaperOptionsAccount {
   private chandelierStaleBreachVetoes = 0;
   /** TRA-3902 — since-boot count of hard stops HELD inside the live opening-range window (one per row per window). */
   private slOpeningRangeHolds = 0;
+  /** TRA-3902 (ruling B) — live rows held until the daily-close window, one per row per ET day. */
+  private slDailyCloseHolds = 0;
   /**
    * TRA-483 — overnight-hold gate for live positions opened today. Default
    * `true`: refuse to fire same-day TP1/SL/trail exits on live positions so
@@ -5697,6 +5772,13 @@ export class PaperOptionsAccount {
        * this field.
        */
       openingRangeHoldMin?: number;
+      /**
+       * TRA-3902 (board ruling B) — the LIVE hard-stop policy. Absent ⇒
+       * `intraday` (the −20% stop read on every tick after the opening window —
+       * the pre-ruling behaviour, and what every demo row still gets). The
+       * engine hands the env-resolved policy (default `daily_close`).
+       */
+      liveStopPolicy?: LiveOptionStopPolicy;
     } = {},
     /**
      * TRA-1025 (TRA-1023 item 4) — per-position {@link ExitState} for single-leg
@@ -5755,6 +5837,17 @@ export class PaperOptionsAccount {
     const openingRangeMins = openingRangeGuardMin > 0 ? minutesSinceRthOpen(Date.now()) : null;
     const withinOpeningRange =
       openingRangeGuardMin > 0 && openingRangeMins !== null && openingRangeMins < openingRangeGuardMin;
+    // TRA-3902 (board ruling B) — the live `daily_close` stop phase, resolved
+    // ONCE per pass from the same clock. `null` when the policy is absent or
+    // `intraday` (legacy: the stop is read on every tick after the opening
+    // window), or when the ET calendar math fails — and `null` falls through
+    // to the legacy branch, because "could not tell the time" must not turn a
+    // stop off (that would be option C by accident).
+    const liveStopPolicy = options.liveStopPolicy;
+    const dailyClosePhase =
+      liveStopPolicy?.policy === 'daily_close'
+        ? resolveDailyCloseStopPhase(Date.now(), liveStopPolicy.closeWindowMin)
+        : null;
     // TRA-949 — roll the ET-day before any auto-exit books realized P&L. The
     // opening baseline (openingOptionsPnlByMode) previously only advanced on an
     // ENTRY path; a day whose only options activity is a CLOSE (the demo
@@ -6483,6 +6576,61 @@ export class PaperOptionsAccount {
               stopLossPremium: opt.stopLossPremium,
               minutesSinceOpen: openingRangeMins,
               windowMin: openingRangeGuardMin,
+            });
+          }
+        } else if (slBreached && dailyClosePhase !== null && positionIsLive) {
+          // TRA-3902 (board ruling B, 2026-08-20, interaction d7776ac1) — the
+          // live DAILY-CLOSE stop. The −20% premium stop is a level on the
+          // CLOSE, not on every print: it is read only inside the last
+          // `closeWindowMin` minutes of RTH. Intraday, the only engine exit on
+          // a live single-leg is the CATASTROPHIC stop (−`catastrophicLossPct`
+          // of premium, default −50%), which fires at the mark because a limit
+          // at the −20% level would sit above the market and never fill.
+          // Outside RTH nothing fires: the mark is stale and no exit routes.
+          //
+          // Why: `sl` is the most expensive exit on the books — 588 closes,
+          // 4.4% win rate, −$23.4k, average hold 0.15 days. A −20% intraday
+          // stop on a single-leg option is a stop on noise, and the opening-
+          // range hold above only moves the noise 15 minutes later. The owner
+          // asked for positions to be held 2–3 days if needed; this is the
+          // policy that lets them breathe while still bounding a day's loss.
+          const dayKey = etDateKey(Date.now());
+          const catastrophicLevel = opt.premiumPaid * (1 - liveStopPolicy!.catastrophicLossPct);
+          const catastrophic = opt.premiumPaid > 0 && mark <= catastrophicLevel;
+          if (dailyClosePhase.inCloseWindow) {
+            exitPremium = opt.stopLossPremium;
+            exitKind = 'sl';
+            exitJournalReason = 'sl_daily_close';
+            delete opt.slHeldForDailyClose;
+          } else if (dailyClosePhase.inSession && catastrophic) {
+            exitPremium = mark;
+            exitKind = 'sl';
+            exitJournalReason = 'sl_catastrophic';
+            delete opt.slHeldForDailyClose;
+            accountLog.warn('CATASTROPHIC stop fired intraday on a live row (daily-close policy)', {
+              issue: 'TRA-3902',
+              optionSymbol: opt.optionSymbol,
+              mark,
+              premiumPaid: opt.premiumPaid,
+              catastrophicLevel,
+              stopLossPremium: opt.stopLossPremium,
+            });
+          } else if (opt.slHeldForDailyClose !== dayKey) {
+            // Held until the close window. Latched once per row per ET day so
+            // the log and the counter say "held" once, not once per tick; the
+            // latch is persisted so a restart cannot launder the hold into a
+            // fire. The health route names this as `daily_close_hold` with the
+            // window's start as the release.
+            opt.slHeldForDailyClose = dayKey;
+            this.slDailyCloseHolds += 1;
+            accountLog.warn('hard stop HELD until the daily-close window (live daily-close policy)', {
+              issue: 'TRA-3902',
+              optionSymbol: opt.optionSymbol,
+              mark,
+              stopLossPremium: opt.stopLossPremium,
+              catastrophicLevel,
+              closeWindowMin: liveStopPolicy!.closeWindowMin,
+              releasesAt: dailyClosePhase.releaseAt === null ? null : new Date(dailyClosePhase.releaseAt).toISOString(),
             });
           }
         } else if (slBreached) {
@@ -7519,6 +7667,15 @@ export class PaperOptionsAccount {
    */
   getSlOpeningRangeHolds(): number {
     return this.slOpeningRangeHolds;
+  }
+
+  /**
+   * TRA-3902 (ruling B) — how many times this process HELD a breached hard stop
+   * on a live row until the daily-close window (one per row per ET day).
+   * Since-boot; the live read is `liveStopActionability.byReason.daily_close_hold`.
+   */
+  getSlDailyCloseHolds(): number {
+    return this.slDailyCloseHolds;
   }
 
   /**
@@ -8591,10 +8748,17 @@ export class PaperOptionsAccount {
    * re-deriving it anywhere else would invert the answer.
    */
   liveStopActionabilitySummary(
-    opts: { brokerMirroring: boolean; openingRangeGuardMin: number; now?: number },
+    opts: {
+      brokerMirroring: boolean;
+      openingRangeGuardMin: number;
+      liveStopPolicy?: LiveOptionStopPolicy;
+      now?: number;
+    },
   ): LiveStopActionabilitySummary {
     return summarizeLiveStopActionability(this.openOptions.values(), {
       brokerMirroring: opts.brokerMirroring,
+      // TRA-3902 (ruling B) — from the ENGINE, like the window above.
+      ...(opts.liveStopPolicy === undefined ? {} : { liveStopPolicy: opts.liveStopPolicy }),
       // TRA-3902 — from the ENGINE, like `brokerMirroring`: the window is a
       // per-pass argument to `checkExits` and the account does not hold it.
       openingRangeGuardMin: opts.openingRangeGuardMin,

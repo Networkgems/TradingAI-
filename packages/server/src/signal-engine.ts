@@ -170,7 +170,7 @@ import {
 } from './wheel-iv-entry-filter.js';
 import { recordWheelBookSnapshot } from './wheel-promotion-gate-store.js';
 import type { WheelBookPosition } from './wheel-vol-stress-harness.js';
-import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
+import { isExitRiskRulesEnabled, isLiveEquityStopModifyEnabled, isTakeProfitEarlyEnabled, isTakeProfitEarlyLiveEnabled, isEntryGreeksGateEnabled, isCorrelatedExposureCapEnabled, isOtmDeltaFloorEnabled, resolveOtmDeltaFloor, entryDeltaCeilingVerdict, isRvExitRetuneEnabled, resolveRvExitConfirmBars, resolveRvExitFlipMinLossPct, isRvExitRetuneLiveEnabled, RV_EXIT_RETUNE_LIVE_CONFIRM_BARS, RV_EXIT_RETUNE_LIVE_FLIP_MIN_LOSS_PCT, resolveSwingTimeStopTradingDays, OPTION_SWING_TIME_STOP_TRADING_DAYS_DEFAULT, resolveOptionOpeningRangeMin, resolveLiveOptionStopPolicy, isBookGiveBackArmFloorEnabled, isOptionsSleeveHaltScope, resolveOptionsHaltScope, type OptionsHaltScopeResolution } from './exit-risk-rules-flag.js';
 // TRA-3401 — nominate an OTM strike inside the band the cost bar can admit.
 import { selectAdmissibleOtmCandidate, isOtmAdmissibleStrikeEnabled, resolveAdmissibleBand } from './otm-admissible-strike.js';
 import { recordCorrelatedExposureBinding, type CorrelatedExposureVenue } from './correlated-exposure-ledger.js';
@@ -5600,7 +5600,13 @@ export class SignalEngine {
           // TRA-3902 — the opening-range hold on the hard stop rides the options
           // bag rather than `optionExitRisk`, which is absent whenever no
           // underlying has 15 cached bars; the hold must not depend on an ATR.
-          { waitAndHold: liveOptionsMirroring, openingRangeHoldMin: resolveOptionOpeningRangeMin() },
+          {
+            waitAndHold: liveOptionsMirroring,
+            openingRangeHoldMin: resolveOptionOpeningRangeMin(),
+            // TRA-3902 (board ruling B) — the live daily-close stop policy, env-
+            // resolved per pass like the window. Demo rows ignore it.
+            liveStopPolicy: resolveLiveOptionStopPolicy(),
+          },
           rvStructuralExitStates,
           optionExitRisk,
           rvExitParams,
@@ -8766,6 +8772,9 @@ export class SignalEngine {
         this.mode === 'live' && this.tradierLiveOptionsEnabled && this.tradierLiveClient !== null,
       // TRA-3902 — the same resolver the exit pass hands `checkExits`.
       openingRangeGuardMin: resolveOptionOpeningRangeMin(),
+      // TRA-3902 (ruling B) — the same resolver again, so the health route and
+      // the exit pass cannot disagree about whether the stop is being read.
+      liveStopPolicy: resolveLiveOptionStopPolicy(),
       ...(now === undefined ? {} : { now }),
     });
   }
