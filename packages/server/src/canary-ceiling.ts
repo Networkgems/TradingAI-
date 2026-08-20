@@ -29,21 +29,43 @@
 //     ceiling — imported/desk rows are exactly the ones that arrive with no
 //     cost basis (TRA-3829).
 //
-// This ceiling COMPOSES with the existing $350/$750 OTM-sleeve caps under AND.
+// This ceiling COMPOSES with the existing OTM-sleeve caps under AND.
 // It does not narrow those in place (the TRA-3592 ratification stamp stays
 // truthful) — it binds at the ONE seam every live buy_to_open passes
 // (`mirrorLiveOptionOpen`), so RV and directional are covered too, which the
 // sleeve caps never did.
-
-/** Compiled default, USD. THE ratified number (board, go-live week). */
-export const CANARY_CEILING_DEFAULT_USD = 100;
+//
+// TRA-3870 (board, 2026-08-19, comments 64f3838d + 5fc18af7) RE-RATIFIED the
+// numbers for the small-account posture: per-order $300 ("look for cheaper,
+// $100–$300"), aggregate $500 ("$500 Max"). The two scopes now carry DIFFERENT
+// values, which is why they are separate constants below — the original $100
+// ceiling used one number for both. Raising either still requires a reviewed
+// deploy of these constants, exactly as before.
 
 /**
- * Hard max, USD — equal to the default ON PURPOSE. An env value above it
- * clamps DOWN to here; raising the ceiling above $100 requires a reviewed
+ * Compiled per-order default, USD. THE ratified number — board's "$100–$300
+ * entries" (TRA-3870, 2026-08-19; supersedes the $100 go-live-week canary).
+ */
+export const CANARY_CEILING_DEFAULT_USD = 300;
+
+/**
+ * Per-order hard max, USD — equal to the default ON PURPOSE. An env value above
+ * it clamps DOWN to here; raising the ceiling above $300 requires a reviewed
  * deploy of this constant, never an env write.
  */
-export const CANARY_CEILING_HARD_MAX_USD = 100;
+export const CANARY_CEILING_HARD_MAX_USD = 300;
+
+/**
+ * Compiled AGGREGATE default, USD — board's "$500 Max" total open live option
+ * premium (TRA-3870, 2026-08-19). Graded per account at the entry seam.
+ */
+export const CANARY_AGGREGATE_DEFAULT_USD = 500;
+
+/**
+ * Aggregate hard max, USD — equal to the aggregate default ON PURPOSE, same
+ * posture as the per-order pair: env may only LOWER, never raise.
+ */
+export const CANARY_AGGREGATE_HARD_MAX_USD = 500;
 
 export const CANARY_CEILING_VAR = 'LIVE_OPTION_CANARY_CEILING_USD';
 
@@ -60,9 +82,9 @@ export interface CanaryCeiling {
  * Resolve the ceiling. `null` means UNREADABLE and the caller MUST refuse —
  * never treat `null` as "no ceiling".
  *
- *   unset            → the compiled $100 default (the shipped, armed state)
- *   valid ≤ 100      → that value (env may only lower)
- *   valid > 100      → clamped to $100
+ *   unset            → the compiled defaults ($300 per order / $500 aggregate)
+ *   valid value      → per-order min(n, $300), aggregate min(n, $500) — the one
+ *                      env var may only LOWER each scope below its hard max
  *   malformed / ≤ 0 / non-finite / empty → `null` (refuse-all)
  */
 export function resolveCanaryCeiling(
@@ -72,7 +94,7 @@ export function resolveCanaryCeiling(
   if (raw === undefined) {
     return {
       perOrderUsd: CANARY_CEILING_DEFAULT_USD,
-      aggregateUsd: CANARY_CEILING_DEFAULT_USD,
+      aggregateUsd: CANARY_AGGREGATE_DEFAULT_USD,
       source: 'compiled_default',
     };
   }
@@ -80,8 +102,11 @@ export function resolveCanaryCeiling(
   // `!(n > 0)` and not `n <= 0`: NaN (malformed text, empty string via the
   // `Number('') === 0` quirk) must land HERE, in the refusing branch.
   if (!(n > 0) || !Number.isFinite(n)) return null;
-  const usd = Math.min(n, CANARY_CEILING_HARD_MAX_USD);
-  return { perOrderUsd: usd, aggregateUsd: usd, source: 'env' };
+  return {
+    perOrderUsd: Math.min(n, CANARY_CEILING_HARD_MAX_USD),
+    aggregateUsd: Math.min(n, CANARY_AGGREGATE_HARD_MAX_USD),
+    source: 'env',
+  };
 }
 
 export type CanaryCeilingReasonCode =
@@ -138,7 +163,7 @@ export function gradeCanaryCeiling(
       reason:
         `canary ceiling REFUSED — this order's premium $${notionalCostUsd.toFixed(2)} exceeds the `
         + `ratified per-order ceiling $${ceiling.perOrderUsd.toFixed(2)} `
-        + `(source: ${ceiling.source}; board <=$100 attended canary, TRA-3827)`,
+        + `(source: ${ceiling.source}; board $100-$300 entries, TRA-3870)`,
     };
   }
   if (!(atRisk.unpricedRows === 0)) {
@@ -184,8 +209,12 @@ export interface CanaryCeilingBookResidual {
 export interface CanaryCeilingHealth {
   /** `null` ⇒ env set but unreadable ⇒ the entry path is refusing everything. */
   resolved: CanaryCeiling | null;
+  /** Per-order pair (TRA-3870: $300/$300). */
   defaultUsd: number;
   hardMaxUsd: number;
+  /** Aggregate pair (TRA-3870: $500/$500). */
+  aggregateDefaultUsd: number;
+  aggregateHardMaxUsd: number;
   envVar: string;
   /** What the live entry path does right now under `resolved`. */
   entryPathBehavior: 'enforcing' | 'refuse_all_unreadable';
@@ -229,6 +258,8 @@ export function gradeCanaryCeilingHealth(
     resolved,
     defaultUsd: CANARY_CEILING_DEFAULT_USD,
     hardMaxUsd: CANARY_CEILING_HARD_MAX_USD,
+    aggregateDefaultUsd: CANARY_AGGREGATE_DEFAULT_USD,
+    aggregateHardMaxUsd: CANARY_AGGREGATE_HARD_MAX_USD,
     envVar: CANARY_CEILING_VAR,
   };
   if (resolved === null) {

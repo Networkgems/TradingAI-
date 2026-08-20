@@ -310,3 +310,95 @@ describe('strikesInBand — the pre-classification band count (TRA-3619)', () =>
     }
   });
 });
+
+// ── TRA-3870: the small-account budget preference ────────────────────────────
+//
+// The board's 2026-08-19 posture: entries $100–$300, $500 max total. Without a
+// budget the strongest in-band read (an $800–$1,819 SPY/QQQ contract on the
+// measured live chains) permanently shadows a fundable in-band strike further
+// down the SAME chain, and sizing returns 0 contracts forever — the screen/gate
+// no-intersection zero, one wall later.
+describe('maxEntryUsd — funding-aware nomination within a tier (TRA-3870)', () => {
+  const priced = (delta: number, ask: number, classification = 'fair') =>
+    ({ delta, classification, ask });
+
+  it('prefers the strongest FUNDABLE in-band read over a stronger unfundable one', () => {
+    // Rank order: $9.19 SPY-shaped contract first (stronger mispricing), $2.50
+    // KHC-shaped one second. Budget $300 ⇒ nominate the $2.50 (=$250 notional).
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.51, 9.19), priced(0.52, 2.5)],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.ask).toBe(2.5);
+    expect(got.selection).toBe('in_band_fair');
+    expect(got.fundableInBand).toBe(1);
+  });
+
+  it('preserves rank order AMONG fundable candidates', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.51, 9.19), priced(0.52, 2.5), priced(0.50, 1.2)],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.ask).toBe(2.5); // the earlier (stronger) fundable read
+    expect(got.fundableInBand).toBe(2);
+  });
+
+  it('applies the preference INSIDE each tier — a fundable `fair` never outranks tier-1 `cheap`', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.52, 2.5, 'fair'), priced(0.51, 9.19, 'cheap')],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    // Tier 1 wins even though its only member is unfundable; the funding
+    // refusal downstream stays on the ledger where it is visible.
+    expect(got.candidate!.classification).toBe('cheap');
+    expect(got.selection).toBe('in_band');
+  });
+
+  it('nothing fundable ⇒ the tier top pick is still nominated (refusal stays visible), fundableInBand 0', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.51, 9.19), priced(0.52, 12.0)],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.ask).toBe(9.19);
+    expect(got.fundableInBand).toBe(0);
+  });
+
+  it('exactly-at-budget fits (<=, matching the sizing rule), one cent over does not', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.51, 3.01), priced(0.52, 3.0)],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.ask).toBe(3.0);
+    expect(got.fundableInBand).toBe(1);
+  });
+
+  it('an unpriced/zero ask cannot prove it fits — it fails the preference, not the nomination', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.51, 0), priced(0.52, 2.5)],
+      { enabled: true, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.ask).toBe(2.5);
+    expect(got.fundableInBand).toBe(1);
+  });
+
+  it('no budget ⇒ behaviour byte-identical to pre-TRA-3870, fundableInBand null (absent ≠ 0)', () => {
+    for (const maxEntryUsd of [undefined, null, Number.NaN, 0, -5, Number.POSITIVE_INFINITY]) {
+      const got = selectAdmissibleOtmCandidate(
+        [priced(0.51, 9.19), priced(0.52, 2.5)],
+        { enabled: true, band, maxEntryUsd: maxEntryUsd as number | null | undefined },
+      );
+      expect(got.candidate!.ask).toBe(9.19); // rank order, budget never consulted
+      expect(got.fundableInBand).toBeNull();
+    }
+  });
+
+  it('DISARMED ignores the budget entirely — legacy stays byte-identical', () => {
+    const got = selectAdmissibleOtmCandidate(
+      [priced(0.03, 9.19, 'cheap'), priced(0.52, 2.5, 'cheap')],
+      { enabled: false, band, maxEntryUsd: 300 },
+    );
+    expect(got.candidate!.delta).toBe(0.03);
+    expect(got.selection).toBe('legacy');
+    expect(got.fundableInBand).toBeNull();
+  });
+});

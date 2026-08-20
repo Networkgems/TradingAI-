@@ -10566,6 +10566,21 @@ export class SignalEngine {
         // else NO nominee. The old armed fallback handed the gates a far-OTM
         // strike they must reject (766/766 blocked 08-05→08-19), which made the
         // sleeve's zero read as gate strictness instead of selector output.
+        // TRA-3870 — the board's small-account per-entry bound (2026-08-19:
+        // entries $100–$300, $500 max total). Within a tier the selector
+        // prefers an in-band strike ONE contract can pay for under
+        // min(per-entry cap, canary per-order ceiling); otherwise the
+        // strongest in-band read ($800+ on the measured live chains) shadows
+        // a fundable one down the same chain and sizing returns 0 forever.
+        // Deliberately the LIVE policy budget in BOTH modes: demo is the
+        // rehearsal surface for the funding decision, so it must nominate
+        // what live could actually buy. An unreadable canary ceiling
+        // contributes no bound here — the entry path refuses everything in
+        // that state anyway, and the budget is a preference, not a gate.
+        const nomineeBudgetUsd = Math.min(
+          resolveLiveOptionTestNotionalCapUsd(process.env),
+          resolveCanaryCeiling(process.env)?.perOrderUsd ?? Number.POSITIVE_INFINITY,
+        );
         const otmPick = selectAdmissibleOtmCandidate(result.candidates, {
           enabled: isOtmAdmissibleStrikeEnabled(
             this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
@@ -10573,6 +10588,7 @@ export class SignalEngine {
           band: resolveAdmissibleBand(
             this.mode === 'demo' ? this.resolveDemoFlagEnv() : process.env,
           ),
+          maxEntryUsd: Number.isFinite(nomineeBudgetUsd) ? nomineeBudgetUsd : null,
         });
         // May be an `in_band_fair` nominee since TRA-3856; the name survives
         // because everything below reads it as "the pick", not as a class label.

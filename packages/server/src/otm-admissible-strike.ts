@@ -80,6 +80,11 @@ export interface AdmissibleStrikeCandidate {
   /** Sign-adjusted Black-Scholes delta — negative for puts, hence the abs. */
   delta: number;
   classification: string;
+  /**
+   * TRA-3870 — per-contract ask, USD (option quote units, ×100 for notional).
+   * Optional: a caller that passes no `maxEntryUsd` never reads it.
+   */
+  ask?: number;
 }
 
 export const OTM_ADMISSIBLE_STRIKE_FLAG = 'ENABLE_OTM_ADMISSIBLE_STRIKE_SELECT';
@@ -214,6 +219,13 @@ export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
   strikesInBand: number;
   /** The band applied, echoed so a verdict is readable without re-deriving it. */
   band: AdmissibleBand;
+  /**
+   * TRA-3870 — in-band candidates whose ONE-CONTRACT ask notional (`ask × 100`)
+   * fits the caller's `maxEntryUsd` budget. `null` ⇔ no budget was applied
+   * (absent ≠ 0: a 0 here is a measured "nothing in band is fundable", which is
+   * the wall-2/3 diagnosis, while `null` is "affordability was never graded").
+   */
+  fundableInBand: number | null;
 }
 
 /**
@@ -247,12 +259,32 @@ export interface AdmissibleStrikeResult<T extends AdmissibleStrikeCandidate> {
  *
  * A non-finite `delta` fails the band (matching TRA-1407's engine-side
  * predicate): an un-scored contract has no business clearing a distance gate.
+ *
+ * ## Budget preference (TRA-3870)
+ *
+ * `maxEntryUsd`, when set, is the board's small-account per-entry bound ($300,
+ * 2026-08-19). WITHIN each tier the selector prefers the strongest mispricing
+ * read whose one-contract ask notional fits it. Without this, the strongest
+ * in-band read (an $800–$1,819 SPY/QQQ contract on the measured live chains)
+ * permanently shadows a fundable in-band strike further down the SAME chain —
+ * sizing returns 0 contracts and the sleeve re-creates the screen/gate
+ * no-intersection zero one wall later. When NOTHING in the tier fits, the
+ * tier's top pick is still nominated (unchanged behaviour): the funding
+ * refusal downstream stays visible on the ledger instead of being converted
+ * into a silent abstention. No budget (`null`/absent) ⇒ behaviour is
+ * byte-identical to pre-TRA-3870.
  */
 export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate>(
   candidates: readonly T[],
-  opts: { enabled: boolean; band: AdmissibleBand },
+  opts: { enabled: boolean; band: AdmissibleBand; maxEntryUsd?: number | null },
 ): AdmissibleStrikeResult<T> {
   const { enabled, band } = opts;
+  // A budget must be a positive finite dollar figure to grade anything; every
+  // other shape means "no budget applied", never "budget 0" (absent ≠ 0).
+  const budgetUsd =
+    typeof opts.maxEntryUsd === 'number' && Number.isFinite(opts.maxEntryUsd) && opts.maxEntryUsd > 0
+      ? opts.maxEntryUsd
+      : null;
   const cheap = candidates.filter((c) => c.classification === 'cheap');
 
   if (!enabled) {
@@ -265,6 +297,7 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
       strikesConsidered: candidates.length,
       strikesInBand: 0,
       band,
+      fundableInBand: null,
     };
   }
 
@@ -282,20 +315,48 @@ export function selectAdmissibleOtmCandidate<T extends AdmissibleStrikeCandidate
   const strikesInBand = bandCandidates.length;
   const inBandCheap = bandCandidates.filter((c) => c.classification === 'cheap');
 
+  // TRA-3870 — does ONE contract fit the budget? Requires a readable positive
+  // ask: an unpriced candidate cannot prove it fits, so it fails the preference
+  // (it stays nominable through the no-fundable fallback, never silently).
+  const fitsBudget = (c: AdmissibleStrikeCandidate): boolean =>
+    budgetUsd !== null
+    && typeof c.ask === 'number'
+    && Number.isFinite(c.ask)
+    && c.ask > 0
+    && c.ask * 100 <= budgetUsd;
+  const fundableInBand = budgetUsd === null ? null : bandCandidates.filter(fitsBudget).length;
+
+  // Rank order (strongest |mispricingPct| first) is preserved by `find`, so the
+  // preferred pick is the strongest FUNDABLE read; the tier's top pick is the
+  // fallback when nothing in the tier fits.
+  const pickPreferringBudget = (tier: readonly T[]): T =>
+    (budgetUsd === null ? tier[0] : (tier.find(fitsBudget) ?? tier[0]));
+
   const shape = {
     cheapConsidered: cheap.length,
     strikesConsidered: candidates.length,
     strikesInBand,
     band,
+    fundableInBand,
   };
 
   if (inBandCheap.length > 0) {
-    return { candidate: inBandCheap[0], selection: 'in_band', cheapInBand: inBandCheap.length, ...shape };
+    return {
+      candidate: pickPreferringBudget(inBandCheap),
+      selection: 'in_band',
+      cheapInBand: inBandCheap.length,
+      ...shape,
+    };
   }
 
   const inBandFair = bandCandidates.filter((c) => c.classification === 'fair');
   if (inBandFair.length > 0) {
-    return { candidate: inBandFair[0], selection: 'in_band_fair', cheapInBand: 0, ...shape };
+    return {
+      candidate: pickPreferringBudget(inBandFair),
+      selection: 'in_band_fair',
+      cheapInBand: 0,
+      ...shape,
+    };
   }
 
   // An empty chain is a fact about the market data ('none'); a surveyed chain
