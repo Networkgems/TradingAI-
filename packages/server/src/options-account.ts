@@ -1248,6 +1248,176 @@ export function mergeLiveStopActionability(
 }
 
 /**
+ * TRA-3892 — premium on live rows whose stop CANNOT fire today, breached or not.
+ *
+ * ## Why this is a new field and not a widening of `liveStopActionability`
+ *
+ * On 2026-08-20 the unattended `single_leg_otm` sleeve opened two real-money
+ * rows at 13:35Z/13:36Z ($273 of premium) and one breached its stop during the
+ * session. `liveStopActionability` reported it faithfully — `inert: 1,
+ * pdt_hold_today` — but that counter is keyed on a BREACH, so for the ~7 hours
+ * before the breach it read a clean 0 over the same two rows, and it reads 0
+ * again tomorrow over any row opened tomorrow until the mark crosses. It answers
+ * "is a stop that is already through going to be acted on". It cannot answer the
+ * question the sizing model and the board need answered BEFORE the breach:
+ *
+ *   > how much premium is currently held under a stop that is decorative by
+ *   > construction?
+ *
+ * `holdLiveOptionsOvernightForPdt` (TRA-483, default ON) refuses every engine
+ * exit on a live row opened today, and the swing hold (TRA-495/TRA-1136) does
+ * the same for RV regardless of the knob. Both are CORRECT and neither is
+ * weakened here — TRA-2983 treats the opposite outcome (a same-day round trip
+ * on a sub-$25k account) as the regression. But composed with "an unattended
+ * entry may be placed at any hour of the session", they mean that on day 1 the
+ * realistic downside of every live option row is the **full premium**, not the
+ * stop distance: there is no lever between a breach and the next UTC day.
+ *
+ * The backtest the OTM sleeve was admitted on (TRA-375, "~59% hard-SL rate",
+ * `OTM_OPTIONS_SL_PCT` 0.20) fires that stop intraday. The live sleeve cannot.
+ * Nothing in the codebase recorded that gap; this summary is the record.
+ *
+ * ## Both directions
+ *
+ * Counts rows the date-keyed holds currently bind — live, open, opened in the
+ * current UTC day, and either the PDT knob is on or the row is RV. A row opened
+ * yesterday contributes nothing even if it is inert for another reason (that is
+ * `liveStopActionability.indefinite`'s job). A demo row contributes nothing. A
+ * row with a working exit IS counted: the premium is at risk until the fill, and
+ * the whole point of this figure is that it must not improve on an intention.
+ *
+ * `premiumAtRiskUsd` is `premiumPaid × contractsRemaining × 100` — entry basis,
+ * not mark. The figure is what can be LOST before the stop becomes available,
+ * and that is the premium paid, whatever the mark reads this tick.
+ *
+ * ## Disclosure
+ *
+ * Dollars, a count, one timestamp, and a per-sleeve split keyed on
+ * `signalType`. **Never OCC symbols** — same no-auth route, same TRA-2163
+ * standing. The sleeve split exists because Q3 of TRA-3892 asks whether the
+ * hole is OTM-specific; it is not (the hold is `signalType`-blind), and the
+ * split is how a reader sees which sleeve is actually carrying it.
+ */
+export interface DayOneStopPosture {
+  /**
+   * Always `'full_premium'`. Published as a literal so a consumer that joins
+   * this to a sizing model cannot mistake it for a stop-distance basis.
+   */
+  stopBasis: 'full_premium';
+  /** Live open rows currently bound by a date-keyed hold, breached or not. */
+  rows: number;
+  /** Σ `premiumPaid × contractsRemaining × 100` over those rows, 2dp. */
+  premiumAtRiskUsd: number;
+  /** `premiumAtRiskUsd` split by `signalType` (`otm_mispricing`, `relative_value`, ...). */
+  premiumBySleeveUsd: Record<string, number>;
+  /**
+   * ISO of the instant the EARLIEST of these rows becomes actionable — the next
+   * 00:00Z after its open (UTC day key, NOT ET midnight). `null` when `rows` is 0.
+   */
+  releasesAt: string | null;
+}
+
+/** TRA-3892 — see {@link summarizeDayOneStopPosture}. */
+export interface DayOneStopPostureContext {
+  /** TRA-483 — the resolved knob, NOT the `options-account.ts` field default. */
+  holdLiveOptionsOvernightForPdt: boolean;
+  /** Evaluation instant. Defaults to `Date.now()`; injected by the controls. */
+  now?: number;
+}
+
+function r2usd(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** TRA-3892 — see {@link DayOneStopPosture}. */
+export function summarizeDayOneStopPosture(
+  positions: Iterable<OptionPosition>,
+  ctx: DayOneStopPostureContext,
+): DayOneStopPosture {
+  const now = ctx.now ?? Date.now();
+  const nowKey = toDateKey(now);
+  const premiumBySleeveUsd: Record<string, number> = {};
+  let rows = 0;
+  let premiumAtRiskUsd = 0;
+  let earliestRelease: number | null = null;
+  for (const opt of positions) {
+    if ((opt.mode ?? 'demo') !== 'live') continue;
+    if (opt.closedAt !== undefined) continue;
+    if (toDateKey(opt.openedAt) !== nowKey) continue;
+    // The SAME two predicates as `pdtHeldToday` / `swingHeldToday` in
+    // `checkExits` (`positionIsLive` is already established above, and
+    // `swingHeldToday` is `(positionIsLive || swingHoldOptions)`, so the knob
+    // cannot un-latch a live RV row).
+    const held =
+      ctx.holdLiveOptionsOvernightForPdt || opt.signalType === 'relative_value';
+    if (!held) continue;
+    const remaining = Number.isFinite(opt.contractsRemaining) ? opt.contractsRemaining : 0;
+    const premium = Number.isFinite(opt.premiumPaid) ? opt.premiumPaid : 0;
+    const usd = premium * remaining * 100;
+    rows += 1;
+    premiumAtRiskUsd += usd;
+    const sleeve = opt.signalType ?? 'unknown';
+    premiumBySleeveUsd[sleeve] = (premiumBySleeveUsd[sleeve] ?? 0) + usd;
+    const release = nextUtcDayStart(opt.openedAt);
+    if (earliestRelease === null || release < earliestRelease) earliestRelease = release;
+  }
+  for (const k of Object.keys(premiumBySleeveUsd)) {
+    premiumBySleeveUsd[k] = r2usd(premiumBySleeveUsd[k]);
+  }
+  return {
+    stopBasis: 'full_premium',
+    rows,
+    premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
+    premiumBySleeveUsd,
+    releasesAt: earliestRelease === null ? null : new Date(earliestRelease).toISOString(),
+  };
+}
+
+/** TRA-3892 — fold per-book postures into the fleet figure the no-auth route publishes. */
+export function mergeDayOneStopPosture(
+  summaries: Iterable<DayOneStopPosture>,
+): DayOneStopPosture {
+  const premiumBySleeveUsd: Record<string, number> = {};
+  let rows = 0;
+  let premiumAtRiskUsd = 0;
+  let earliest: string | null = null;
+  for (const s of summaries) {
+    rows += s.rows;
+    premiumAtRiskUsd += s.premiumAtRiskUsd;
+    for (const [k, v] of Object.entries(s.premiumBySleeveUsd)) {
+      premiumBySleeveUsd[k] = r2usd((premiumBySleeveUsd[k] ?? 0) + v);
+    }
+    if (s.releasesAt !== null && (earliest === null || s.releasesAt < earliest)) {
+      earliest = s.releasesAt;
+    }
+  }
+  return {
+    stopBasis: 'full_premium',
+    rows,
+    premiumAtRiskUsd: r2usd(premiumAtRiskUsd),
+    premiumBySleeveUsd,
+    releasesAt: earliest,
+  };
+}
+
+/**
+ * TRA-3892 — the BLIND twin of {@link mergeDayOneStopPosture}'s output, for the
+ * route's catch branch. Nulled, not zeroed: "could not measure" and "measured
+ * zero premium under a decorative stop" must never share a reading.
+ */
+export function blindDayOneStopPosture(): {
+  [K in keyof DayOneStopPosture]: K extends 'stopBasis' ? 'full_premium' : null
+} {
+  return {
+    stopBasis: 'full_premium',
+    rows: null,
+    premiumAtRiskUsd: null,
+    premiumBySleeveUsd: null,
+    releasesAt: null,
+  };
+}
+
+/**
  * TRA-3839 — the first thing that stops an options exit pass from EVALUATING a
  * given book's live rows, named in the order the code refuses, outermost first.
  *
@@ -7898,6 +8068,17 @@ export class PaperOptionsAccount {
       holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
       swingHoldOptions: this.swingHoldOptions,
       now: opts.now,
+    });
+  }
+
+  /**
+   * TRA-3892 — premium this book holds under a stop that cannot fire today.
+   * Reads the RESOLVED PDT knob for the same reason the method above does.
+   */
+  dayOneStopPosture(now?: number): DayOneStopPosture {
+    return summarizeDayOneStopPosture(this.openOptions.values(), {
+      holdLiveOptionsOvernightForPdt: this.holdLiveOptionsOvernightForPdt,
+      now,
     });
   }
 

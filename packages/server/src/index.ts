@@ -302,7 +302,7 @@ import {
   summarizeLiveOptionsFeeSlippage,
 } from './live-options-fee-slippage-ledger.js';
 // TRA-2820 — live-book "is it actually stopped?" counter for /api/health/options-live.
-import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability } from './options-account.js';
+import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability, mergeDayOneStopPosture, blindDayOneStopPosture } from './options-account.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
   foldLiveBrokerDriftStatuses,
@@ -10850,6 +10850,31 @@ app.get('/api/health/options-live', async (_req, res) => {
           // which is this ticket's own defect one level up.
           return {
             ...blindLiveStopActionability(),
+            instrumentBlind: true as const,
+            blindReason: err instanceof Error ? err.message : String(err),
+          };
+        }
+      })(),
+      // TRA-3892 — premium currently held under a DECORATIVE day-1 stop,
+      // breached or not. `liveStopActionability` above is keyed on a breach and
+      // read a clean 0 over the 2026-08-20 ***0154 pair for the ~7 hours before
+      // one of them crossed; this is the figure that was non-zero ($273) the
+      // whole time. Every live option row opened today has a full-premium
+      // downside until the next 00:00Z — that is `holdLiveOptionsOvernightForPdt`
+      // doing its job (TRA-2983), composed with an entry path that may open at
+      // any hour. Same blind/zero discipline as its neighbour.
+      liveDayOneStopPosture: (() => {
+        try {
+          return {
+            ...mergeDayOneStopPosture(
+              getAllUserContexts().map(c => c.engine.getDayOneStopPosture()),
+            ),
+            instrumentBlind: false as const,
+            blindReason: null,
+          };
+        } catch (err) {
+          return {
+            ...blindDayOneStopPosture(),
             instrumentBlind: true as const,
             blindReason: err instanceof Error ? err.message : String(err),
           };

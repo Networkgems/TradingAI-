@@ -322,7 +322,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -8803,6 +8803,16 @@ export class SignalEngine {
       this.getLiveStopActionabilityRows(at),
       this.getLiveExitPassStatus(at),
     );
+  }
+
+  /**
+   * TRA-3892 — premium this book holds under a DECORATIVE day-1 stop (the
+   * date-keyed holds refuse every engine exit until the next 00:00Z). Breached
+   * or not — see `summarizeDayOneStopPosture` for why this is not a widening of
+   * `getLiveStopActionability`.
+   */
+  getDayOneStopPosture(now?: number): DayOneStopPosture {
+    return this.optionsAccount.dayOneStopPosture(now);
   }
 
   /**
