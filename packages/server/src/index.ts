@@ -11076,6 +11076,20 @@ app.get('/api/health/options-live', async (_req, res) => {
               driftChecks: acc.driftChecks + s.driftChecks,
               cleanChecks: acc.cleanChecks + s.cleanChecks,
               excessChecks: acc.excessChecks + s.excessChecks,
+              // TRA-3896 — the ABSORBED class: an engine-origin row carrying
+              // contracts this engine never bought. Distinct from `excess`
+              // (broker holds more than us, row basis still its own): by the
+              // time a row is absorbed, row and broker AGREE and every
+              // broker-vs-engine number below reads clean over it.
+              absorbedChecks: acc.absorbedChecks + s.absorbedChecks,
+              absorbedContractsLast: acc.absorbedContractsLast + last.absorbedContracts,
+              engineOriginImportedRowsCheckedLast:
+                acc.engineOriginImportedRowsCheckedLast + last.engineOriginImportedRowsChecked,
+              // ⚠️ Read WITH `absorbedContractsLast`. Non-zero means the fill
+              // ledger could not answer for that many engine-origin rows, so a
+              // 0 above is not an all-clear over them.
+              absorptionUnresolvedRowsLast:
+                acc.absorptionUnresolvedRowsLast + last.absorptionUnresolvedRows,
               outOfBandChecks: acc.outOfBandChecks + s.outOfBandChecks,
               outOfBandContractsMax: Math.max(acc.outOfBandContractsMax, s.outOfBandContractsMax),
               outOfBandContractsLast: acc.outOfBandContractsLast + last.outOfBandContracts,
@@ -11101,6 +11115,10 @@ app.get('/api/health/options-live', async (_req, res) => {
             driftChecks: 0,
             cleanChecks: 0,
             excessChecks: 0,
+            absorbedChecks: 0,
+            absorbedContractsLast: 0,
+            engineOriginImportedRowsCheckedLast: 0,
+            absorptionUnresolvedRowsLast: 0,
             outOfBandChecks: 0,
             outOfBandContractsMax: 0,
             outOfBandContractsLast: 0,
@@ -13974,6 +13992,76 @@ app.post('/api/options/:id/cancel-pending-exit', requireAuth, async (req, res) =
     return;
   }
   res.status(502).json({ error: `Tradier cancel failed: ${outcome.reason}`, ...(outcome.orderId !== undefined ? { orderId: outcome.orderId } : {}) });
+});
+
+/**
+ * TRA-3896 part 1 — restore an OPEN engine row's cost basis to the fill this
+ * engine recorded paying, and re-derive its risk schedule off the corrected
+ * number.
+ *
+ * ── Why this route has to exist ────────────────────────────────────────────
+ * The complete write surface of `packages/server/src` contains no route that
+ * mutates `premiumPaid` or `contracts` on an open option row. The only writes
+ * reaching an open position are `POST /api/options/:id/close` (a real
+ * `sell_to_close`), `/cancel-pending-exit`, and `/api/tradier/positions/sync`
+ * (the reconcile that produced the damage). `close-basis-repair` above repairs
+ * the journal's CLOSED basis, not an open row. TRA-3895 framed the correction as
+ * "one hand correction"; that premise does not survive contact with source.
+ *
+ * ── What it repairs ────────────────────────────────────────────────────────
+ * A desk-side add makes Tradier's `/positions` row a BLEND across every contract
+ * in the account on that OCC symbol, and the TRA-2889 restatement wrote that
+ * blend onto the engine's smaller lot ($1.65 → $1.41 on BAC, 2026-08-20).
+ * TRA-3890's `quantity_mismatch` refusal stops it recurring — and by refusing,
+ * freezes the wrong number in place, because nothing in the running system will
+ * write the right one back.
+ *
+ * ── The number is NOT yours to supply ──────────────────────────────────────
+ * There is no request body. The basis comes from the live fee/slippage ledger's
+ * own `buy_to_open` records — written at fill time, carrying the broker's
+ * average fill price and order id. An operator-typed basis would be a second way
+ * to get a number nobody paid onto the row, which is the defect being repaired.
+ * The caller chooses the ROW; it cannot choose the PRICE.
+ *
+ * ── Reading the response ───────────────────────────────────────────────────
+ * `status` is four-valued and a silent no-op is impossible:
+ *   • `repaired`        200 — `before`/`after` carry all four levels.
+ *   • `already_correct` 200 — idempotent re-run; NOTHING was written, and it is
+ *     deliberately not `repaired` with a zero delta.
+ *   • `refused`         409 — a named precondition failed. Read `reason`.
+ *   • `not_found`       404.
+ *
+ * `confirm=TRA-3896` is required to write. Without it the SAME code path runs
+ * every precondition and returns `would_repair` with the levels it would
+ * install, writing nothing — one implementation of the refusal set, so a dry run
+ * cannot disagree with the write it is previewing.
+ */
+app.post('/api/options/:id/repair-engine-basis', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params as Record<string, string>;
+  const ctx = await userCtx(res);
+  const apply = (req.query as Record<string, unknown>)['confirm'] === 'TRA-3896';
+
+  const outcome = ctx.engine.repairEngineBasisFromRecordedFill(id, { apply });
+  if (outcome.status === 'would_repair') {
+    res.json({ ok: true, dryRun: true, confirmWith: 'confirm=TRA-3896', ...outcome });
+    return;
+  }
+  if (outcome.status === 'not_found') {
+    res.status(404).json({ ok: false, ...outcome });
+    return;
+  }
+  if (outcome.status === 'refused') {
+    // 409, not 400: the request is well-formed and the row exists. The state is
+    // what refuses, and the reason is the payload.
+    res.status(409).json({ ok: false, ...outcome });
+    return;
+  }
+  if (outcome.status === 'repaired') {
+    // The row's stop just moved on a real-money position. Push it to every
+    // connected reader immediately rather than waiting for the next tick.
+    broadcastEngineState(ctx);
+  }
+  res.json({ ok: true, ...outcome });
 });
 
 /**

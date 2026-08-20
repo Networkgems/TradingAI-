@@ -126,7 +126,13 @@ import type { LiveOtmFleetCapitalRow, LiveOtmFleetSizingReason } from './option-
 // avoided; unwired it returns `null` and sizing falls back to the per-book
 // bound already in force (it never darks a book).
 import { readLiveOtmFleetCapitalRows } from './live-otm-fleet-capital.js';
-import { lastRecordedOpenSleeve, recordLiveOptionFill, type LiveFillSleeve } from './live-options-fee-slippage-ledger.js';
+import {
+  lastRecordedOpenSleeve,
+  recordLiveOptionFill,
+  // TRA-3896 — the absorption oracle for the broker-drift check.
+  recordedEngineOpenBasis,
+  type LiveFillSleeve,
+} from './live-options-fee-slippage-ledger.js';
 import { scanIvRvFromSnapshot, recordIvRvScan } from './iv-rv-scanner.js';
 // TRA-2193 — per-scan liveness for the paths that journal `single_leg_rv`.
 import { beginRvScan } from './rv-scan-telemetry.js';
@@ -322,7 +328,7 @@ import {
 import { fetchStockTwitsStream, fetchStockTwitsUserStream, getCuratedStockTwitsAccounts } from './stocktwits-feed.js';
 import { evaluateFeedFreshness } from './feed-freshness.js';
 import { PaperAccount, type EquityExitRiskInput } from './paper-account.js';
-import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture } from './options-account.js';
+import { PaperOptionsAccount, qualifyLiveStopActionability, type OptionTradeJournalSetup, type OptionExitRiskInput, type LiveStopActionabilitySummary, type LiveStopActionabilityQualified, type LiveExitPassStatus, type DayOneStopPosture, type EngineBasisRepairOutcome } from './options-account.js';
 import { bindOptionsPnlToEquityBook } from './options-equity-bridge.js';
 import {
   PENDING_CLOSE_MAX_REPRICE_STEPS,
@@ -3578,6 +3584,8 @@ export class SignalEngine {
     /** TRA-3890 — counted, not derived by subtraction. */
     cleanChecks: number;
     excessChecks: number;
+    /** TRA-3896 — engine-origin rows found holding foreign contracts. */
+    absorbedChecks: number;
   } = {
     last: null,
     checks: 0,
@@ -3590,6 +3598,7 @@ export class SignalEngine {
     darkChecks: 0,
     cleanChecks: 0,
     excessChecks: 0,
+    absorbedChecks: 0,
   };
   /**
    * TRA-335 — open equity positions opened against Tradier Live. We keep
@@ -16985,6 +16994,29 @@ export class SignalEngine {
    *    retry once Tradier is reachable again. HTTP returns 502 with the
    *    surfaced reason.
    */
+  /**
+   * TRA-3896 part 1 — restore an open engine row's basis to the fill this engine
+   * recorded paying. See `PaperOptionsAccount.repairEngineBasisFromRecordedFill`
+   * for the full rationale and the refusal set.
+   *
+   * Searched across both Tradier envs by position id, the same way
+   * {@link cancelManualPendingExit} does: the caller has a row id from
+   * `/api/state` and does not know which account holds it. `env` comes back on
+   * the outcome so the responder can see which book was written.
+   */
+  repairEngineBasisFromRecordedFill(
+    optionId: string,
+    opts: { apply?: boolean } = {},
+  ): EngineBasisRepairOutcome & { env: TradierEnv | null } {
+    for (const env of ['sandbox', 'production'] as const) {
+      const outcome = this.optionsAccounts[env].repairEngineBasisFromRecordedFill(optionId, opts);
+      // `not_found` means this account does not hold the row — keep looking.
+      // Every other status is a real verdict from the account that DOES hold it.
+      if (outcome.status !== 'not_found') return { ...outcome, env };
+    }
+    return { status: 'not_found', positionId: optionId, env: null };
+  }
+
   async cancelManualPendingExit(optionId: string): Promise<
     | { status: 'cancelled'; orderId?: string | number }
     | { status: 'not_pending' }
@@ -17525,6 +17557,7 @@ export class SignalEngine {
       if (report.status === 'drift') state.driftChecks += 1;
       if (report.status === 'clean') state.cleanChecks += 1;
       if (report.status === 'excess') state.excessChecks += 1;
+      if (report.status === 'absorbed') state.absorbedChecks += 1;
       if (report.outOfBandContracts > 0) {
         state.outOfBandChecks += 1;
         state.lastOutOfBandAt = report.checkedAt;
@@ -17576,7 +17609,56 @@ export class SignalEngine {
     }
     this.lastBrokerPositionDriftCheckAt = now;
 
-    const report = record(diffLiveBrokerPositions(read, rows, now));
+    // TRA-3896 — the absorption oracle: this engine's OWN `buy_to_open` records.
+    // A third source, so that once the reconcile has copied a foreign contract
+    // onto an engine-origin row (making row and broker agree) there is still
+    // something that can see it. `null` is UNRESOLVED and the detector reports
+    // it as a coverage hole rather than as an all-clear.
+    const report = record(
+      diffLiveBrokerPositions(read, rows, now, sym => {
+        const recorded = recordedEngineOpenBasis(sym);
+        if (!recorded || recorded.unpricedFills > 0) return null;
+        return recorded.contracts;
+      }),
+    );
+
+    if (report.absorbedContracts > 0) {
+      // ERROR, not warn: an engine-origin row is carrying contracts this engine
+      // never bought, which means its basis is a blend of somebody else's fill
+      // and its stop is derived from that blend. Real money, wrong level.
+      log.error('engine-origin row has ABSORBED contracts this engine did not buy', {
+        component: 'broker-position-drift',
+        env,
+        absorbedContracts: report.absorbedContracts,
+        engineOriginImportedRowsChecked: report.engineOriginImportedRowsChecked,
+        absorptionUnresolvedRows: report.absorptionUnresolvedRows,
+        absorbed: report.absorbed
+          .filter(a => a.absorbedContracts > 0)
+          .map(a => ({
+            optionSymbol: a.optionSymbol,
+            rowContracts: a.rowContracts,
+            recordedContracts: a.recordedContracts,
+            absorbedContracts: a.absorbedContracts,
+            rowIds: a.rowIds,
+          })),
+        action:
+          'none — read-only detector. The TRA-3896 reconcile refusal stops FURTHER absorption; '
+          + 'an already-absorbed row needs a decision, not an automatic write.',
+        issue: 'TRA-3896',
+      });
+    } else if (report.absorptionUnresolvedRows > 0) {
+      // Not an alarm, but it must not read as coverage. `absorbedContracts: 0`
+      // over rows the oracle could not answer for is exactly the vacuous green
+      // this module exists to refuse.
+      log.warn('absorption check could not answer for some engine-origin rows', {
+        component: 'broker-position-drift',
+        env,
+        absorptionUnresolvedRows: report.absorptionUnresolvedRows,
+        engineOriginImportedRowsChecked: report.engineOriginImportedRowsChecked,
+        note: 'the fill ledger holds no usable `buy_to_open` for these symbols; 0 absorbed is NOT an all-clear over them',
+        issue: 'TRA-3896',
+      });
+    }
 
     if (report.outOfBandContracts > 0) {
       // ERROR, not warn: real contracts left a real-money account with no order
@@ -17647,6 +17729,8 @@ export class SignalEngine {
     /** TRA-3890 — counted, not derived by subtraction. */
     cleanChecks: number;
     excessChecks: number;
+    /** TRA-3896 — engine-origin rows found holding foreign contracts. */
+    absorbedChecks: number;
   } {
     return {
       ...this.brokerPositionDrift,

@@ -51,9 +51,18 @@ import {
   lastRecordedOpenSleeve,
   lastRecordedOpenFill,
   recordedOpenFillCount,
+  // TRA-3896 — "what did WE pay, and for how many". The one number both halves
+  // of this ticket turn on, and the only source for it that is neither the
+  // broker's blend nor a request body.
+  recordedEngineOpenBasis,
+  type RecordedEngineOpenBasis,
   type LiveFillSleeve,
 } from './live-options-fee-slippage-ledger.js';
-import { appendEngineBasisRestatement, engineBasisRestatementDataDir } from './engine-basis-restatement-log.js';
+import {
+  appendEngineBasisRestatement,
+  engineBasisRestatementDataDir,
+  type EngineBasisRestatementSource,
+} from './engine-basis-restatement-log.js';
 // TRA-3829 — the adoption AUTHORISATION predicate. `option-exec-flag.ts` imports
 // nothing from this module, so this direction is acyclic.
 import { engineMayActOnAdoptedRow, isEngineActionOnAdoptedRowsArmed } from './option-exec-flag.js';
@@ -1960,6 +1969,13 @@ export interface EngineBasisRestatement {
   ratio: number;
   /** Reconstructed broker cost basis in dollars, for the cent-level compare. */
   brokerCostBasisUsd: number;
+  /**
+   * TRA-3896 — which mechanism moved the basis. See
+   * {@link EngineBasisRestatementSource}: a `broker_reconcile` row on a blended
+   * symbol after TRA-3890 means the `quantity_mismatch` refusal regressed, and
+   * `recorded_fill_repair` is the admin repair sourced from our own fills.
+   */
+  source: EngineBasisRestatementSource;
   tp1PremiumBefore: number;
   tp1PremiumAfter: number;
   stopLossPremiumBefore: number;
@@ -2010,6 +2026,82 @@ export type EngineBasisSkipReason =
 
 /** TRA-3010 — bounded so a long-lived process cannot grow this without limit. */
 const ENGINE_BASIS_RESTATEMENT_LOG_CAP = 50;
+
+/**
+ * TRA-3896 — why {@link OptionsAccount.repairEngineBasisFromRecordedFill}
+ * declined.
+ *
+ * Enumerated rather than a free-text string because the route publishes it and
+ * the whole point of the repair is that a no-op must not read like a success.
+ * A caller can branch on these; it cannot branch on prose.
+ */
+export type EngineBasisRepairRefusal =
+  | 'not_live'
+  | 'no_occ'
+  | 'multi_leg'
+  | 'covered_write'
+  | 'in_flight'
+  /** The row's own `premiumPaid` is unreadable, so the rescale has no anchor. */
+  | 'persisted_basis_unreadable'
+  /** This engine recorded no `buy_to_open` for the contract's current episode. */
+  | 'no_recorded_fill'
+  /** It recorded one, but not at a price complete enough to weight. */
+  | 'recorded_fill_price_unusable'
+  /** ★ The row and our own fills disagree on lot size. See the method doc. */
+  | 'quantity_mismatch';
+
+/** The four numbers the repair moves, before and after. */
+export interface EngineBasisRepairSchedule {
+  premiumPaid: number;
+  stopLossPremium: number;
+  tp1Premium: number;
+  trailingStopPremium: number;
+}
+
+/**
+ * TRA-3896 — the repair's verdict. Four terminal states, none of which can be
+ * confused for another:
+ *
+ *   • `not_found`      — no such row in this book.
+ *   • `refused`        — a named precondition failed. NOTHING was written.
+ *   • `already_correct` — the row is already at its recorded fill. Idempotent
+ *     re-run; distinct from `repaired` so a second call cannot read as a first.
+ *   • `would_repair`   — `apply: false`. Every precondition passed and the write
+ *     was withheld. Carries the levels the write would install.
+ *   • `repaired`       — basis moved and the schedule re-derived off it.
+ */
+export type EngineBasisRepairOutcome =
+  | { status: 'not_found'; positionId: string }
+  | {
+      status: 'refused';
+      reason: EngineBasisRepairRefusal;
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      detail: string;
+      recorded?: RecordedEngineOpenBasis;
+      /** Only on `no_recorded_fill`: the ORACLE-HEALTH probe. 0 ⇒ empty ledger. */
+      recordedOpenFills?: number;
+    }
+  | {
+      status: 'already_correct';
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      recorded: RecordedEngineOpenBasis;
+    }
+  | {
+      status: 'repaired' | 'would_repair';
+      positionId: string;
+      optionSymbol: string;
+      persistedPremiumPaid: number;
+      persistedContracts: number;
+      recorded: RecordedEngineOpenBasis;
+      before: EngineBasisRepairSchedule;
+      after: EngineBasisRepairSchedule;
+    };
 
 function restateEngineOpenedBasis(opt: OptionPosition, brokerPremium: number): void {
   const previous = opt.premiumPaid;
@@ -2335,6 +2427,28 @@ export class PaperOptionsAccount {
    * for why this cannot be reconstructed from a later read of the row.
    */
   private engineBasisRestatements: EngineBasisRestatement[] = [];
+  /**
+   * TRA-3896 — engine-origin IMPORTED rows on which the broker reported a lot
+   * larger than the row held, and this engine's own fills could not account for
+   * the increase. The absorption was refused.
+   *
+   * Counted with its denominator ({@link importedAbsorptionCandidates}) for the
+   * usual reason: a refusal counter alone cannot distinguish "the refusal is
+   * armed and nothing has tried" from "the refusal never runs". Both publish 0.
+   */
+  private importedAbsorptionRefusals = 0;
+  /**
+   * TRA-3896 — engine-origin imported rows that reached the quantity test with
+   * an INCREASE to consider, refused or allowed. The denominator.
+   */
+  private importedAbsorptionCandidates = 0;
+  /**
+   * TRA-3896 — increases this engine's own `buy_to_open` records DID account
+   * for, so the copy proceeded: a genuine partial-fill top-up. Published so
+   * "the refusal is too tight and is eating real top-ups" is measurable rather
+   * than argued about.
+   */
+  private importedAbsorptionAllowed = 0;
   /**
    * TRA-3010 — per-reason counts of engine-opened rows the restatement branch
    * matched but declined. Publishing this is what stops an empty ledger from
@@ -7443,7 +7557,13 @@ export class PaperOptionsAccount {
    * post half is filled in by {@link finishEngineBasisRestatement} against the
    * same object, so the two sides can never be stitched from different rows.
    */
-  private recordEngineBasisRestatement(opt: OptionPosition, brokerPremium: number): void {
+  private recordEngineBasisRestatement(
+    opt: OptionPosition,
+    brokerPremium: number,
+    // TRA-3896 — defaulted rather than required so the reconcile call site reads
+    // unchanged, and so a future third mechanism has to name itself explicitly.
+    source: EngineBasisRestatementSource = 'broker_reconcile',
+  ): void {
     const before = opt.premiumPaid;
     // Ratios are only meaningful against a positive basis; the caller has
     // already refused a non-positive `premiumPaid`, but a sentinel threshold
@@ -7459,6 +7579,7 @@ export class PaperOptionsAccount {
       premiumPaidAfter: Number.NaN,
       ratio: brokerPremium / before,
       brokerCostBasisUsd: brokerPremium * opt.contracts * 100,
+      source,
       tp1PremiumBefore: opt.tp1Premium,
       tp1PremiumAfter: Number.NaN,
       stopLossPremiumBefore: opt.stopLossPremium,
@@ -7518,6 +7639,245 @@ export class PaperOptionsAccount {
       retentionCap: ENGINE_BASIS_RESTATEMENT_LOG_CAP,
       skips: { ...this.engineBasisSkips },
       restatements: this.engineBasisRestatements.map(r => ({ ...r })),
+    };
+  }
+
+  /**
+   * TRA-3896 — the read side of the engine-origin absorption refusal.
+   *
+   * `candidates` is the denominator and it is the load-bearing number: a
+   * `refusals: 0` with `candidates: 0` means nothing has tried to widen an
+   * engine-origin row, which is fine; `refusals: 0` with `candidates > 0` means
+   * every increase was accounted for by our own fills. Without the denominator
+   * both read as "no refusals", and so does a branch that never runs at all.
+   */
+  getImportedAbsorptionCensus(): {
+    candidates: number;
+    refusals: number;
+    allowed: number;
+  } {
+    return {
+      candidates: this.importedAbsorptionCandidates,
+      refusals: this.importedAbsorptionRefusals,
+      allowed: this.importedAbsorptionAllowed,
+    };
+  }
+
+  /**
+   * TRA-3896 part 1 — restore an open engine row's basis to the fill THIS ENGINE
+   * recorded paying, and re-derive its risk schedule off the corrected number.
+   *
+   * ── Why a code path and not a hand correction ───────────────────────────────
+   * The complete write surface of `packages/server/src` contains no route that
+   * mutates `premiumPaid` or `contracts` on an open option row. The only writes
+   * reaching an open position are `close` (a real `sell_to_close`),
+   * `cancel-pending-exit`, and the Tradier reconcile — which is what produced
+   * the damage. `close-basis-repair` repairs the journal's CLOSED basis, not an
+   * open row.
+   *
+   * ── The state this repairs ─────────────────────────────────────────────────
+   * On 2026-08-20 the desk added 1 BAC contract at $1.17 at 19:36Z. Tradier's
+   * `/positions` is one row per OCC symbol, so `cost_basis / quantity` became a
+   * 2-lot BLEND, and the TRA-2889 restatement wrote $1.41 onto the engine's
+   * 1-lot row whose real fill was $1.65. TRA-3890's `quantity_mismatch` refusal
+   * stops that happening again — and by stopping it, freezes $1.41 in place:
+   * nothing in the running system will ever write $1.65 back. The stop is
+   * anchored to a basis nobody paid, so the engine's first live round trip would
+   * book its loss ~$24 light into the TRA-3664 / TRA-3789 acceptance record.
+   *
+   * ── Where the number comes from, and where it must NOT ──────────────────────
+   * {@link recordedEngineOpenBasis} — this engine's own `buy_to_open` records,
+   * written at fill time with the broker's average fill price and order id. NOT
+   * the broker's blend (that is the poison), and NOT a value in a request body:
+   * an operator-supplied basis is a second way to get a number nobody paid onto
+   * the row, which is the defect being repaired. The caller cannot influence the
+   * figure at all — only which row is repaired.
+   *
+   * ── Every refusal is explicit ──────────────────────────────────────────────
+   * A silent no-op here reads exactly like a successful repair, so there is no
+   * `return` that does nothing without naming itself. In particular
+   * `quantity_mismatch` is a REFUSAL, not a warning: repairing a basis onto a
+   * row whose quantity we cannot account for is the original blending error run
+   * backwards. That is what holds the XLF row (2 ct persisted, 1 ct recorded)
+   * out of this path while it holds BAC (1 ct / 1 ct) in.
+   *
+   * Idempotent: a row already sitting at the recorded fill returns
+   * `already_correct` and writes nothing — including no restatement record, so
+   * re-running the repair cannot inflate the ledger it is audited by.
+   *
+   * `apply: false` runs every precondition and returns `would_repair` in place
+   * of `repaired`, writing nothing. It is the SAME code path deliberately — a
+   * separate preview function would be a second implementation of the refusal
+   * set, free to drift from the one that actually guards the write, and a dry
+   * run that disagrees with the real thing is worse than no dry run.
+   */
+  repairEngineBasisFromRecordedFill(
+    positionId: string,
+    opts: { apply?: boolean } = {},
+  ): EngineBasisRepairOutcome {
+    const apply = opts.apply ?? true;
+    const opt = this.openOptions.get(positionId);
+    if (!opt) return { status: 'not_found', positionId };
+
+    const optionSymbol = opt.optionSymbol ?? '';
+    const persistedContracts = opt.contractsRemaining ?? opt.contracts;
+    const context = {
+      positionId,
+      optionSymbol,
+      persistedPremiumPaid: opt.premiumPaid,
+      persistedContracts,
+    };
+
+    // Live only. The demo book pays a MODELLED cost and writes nothing to the
+    // fill ledger, so the oracle would answer `null` for every demo row and the
+    // refusal below would be the only outcome — say why up front instead.
+    if ((opt.mode ?? 'demo') !== 'live') {
+      return { status: 'refused', reason: 'not_live', ...context, detail: 'the fee/slippage ledger records LIVE fills only; a demo row has no recorded fill to restore.' };
+    }
+    if (optionSymbol === '') {
+      return { status: 'refused', reason: 'no_occ', ...context, detail: 'the row carries no OCC symbol, so the fill ledger cannot be joined to it.' };
+    }
+    if (opt.legs && opt.legs.length > 0) {
+      return { status: 'refused', reason: 'multi_leg', ...context, detail: 'a combo is not one OCC row; its basis is not one number to restate.' };
+    }
+    if (opt.coveredWrite) {
+      return { status: 'refused', reason: 'covered_write', ...context, detail: 'a covered write is short; its premium is credit received, not a debit basis.' };
+    }
+    // In flight is a refusal for the same reason the reconcile skips it: the
+    // exit/close pollers are about to compute realized P&L against this basis
+    // from the broker's ORDER status. Moving it underneath them changes a number
+    // they have already begun to derive.
+    if (opt.pendingExit || opt.pendingCloseOrderId !== undefined) {
+      return { status: 'refused', reason: 'in_flight', ...context, detail: 'an exit or close is in flight; the pollers own this row\'s basis until it resolves.' };
+    }
+    if (!Number.isFinite(opt.premiumPaid) || opt.premiumPaid <= 0) {
+      // Half of the "must refuse when BOTH cannot be read" requirement. Without
+      // a readable persisted basis there is no ratio, so `restateEngineOpenedBasis`
+      // would return having done nothing — a silent no-op wearing a 200.
+      return { status: 'refused', reason: 'persisted_basis_unreadable', ...context, detail: 'the row\'s own `premiumPaid` is not a positive finite number, so the threshold rescale has no anchor.' };
+    }
+
+    const recorded = recordedEngineOpenBasis(optionSymbol);
+    if (!recorded) {
+      // The oracle's silence is three-valued and this is the honest reading of
+      // it: an EMPTY ledger (never hydrated, DATA_DIR unreadable, retention aged
+      // the rows out) answers `null` for every symbol including ones we did
+      // open. `recordedOpenFillCount` is what separates the two, and it is
+      // reported so the caller sees WHICH silence this was.
+      return {
+        status: 'refused',
+        reason: 'no_recorded_fill',
+        ...context,
+        recordedOpenFills: recordedOpenFillCount(),
+        detail:
+          'the live fill ledger holds no `buy_to_open` for this contract in the current open episode. '
+          + 'If `recordedOpenFills` is 0 the ORACLE is empty (the engine cannot answer for any symbol); '
+          + 'if it is non-zero the ledger is populated and genuinely never recorded us opening this one.',
+      };
+    }
+    if (recorded.unpricedFills > 0) {
+      return {
+        status: 'refused',
+        reason: 'recorded_fill_price_unusable',
+        ...context,
+        recorded,
+        detail: `${recorded.unpricedFills} of ${recorded.fills} recorded open fills carry no usable \`filledPrice\`, so the weighted basis would silently be an average over the priced subset only.`,
+      };
+    }
+    if (!Number.isFinite(recorded.premiumPaid) || recorded.premiumPaid <= 0) {
+      return { status: 'refused', reason: 'recorded_fill_price_unusable', ...context, recorded, detail: 'the recorded fill weighted average is not a positive finite number.' };
+    }
+    if (recorded.contracts !== persistedContracts) {
+      // ★ The load-bearing refusal. The row and our own record disagree on how
+      // many contracts this basis is FOR, so one of them describes a lot the
+      // other does not. Writing a per-contract basis derived from N contracts
+      // onto a row holding M is exactly TRA-3890's blend, with our number
+      // instead of the broker's — and it would silently re-anchor the stop on a
+      // real-money position. This is the branch that holds the XLF row out.
+      return {
+        status: 'refused',
+        reason: 'quantity_mismatch',
+        ...context,
+        recorded,
+        detail:
+          `the row holds ${persistedContracts} contract(s) and this engine's own fills account for `
+          + `${recorded.contracts}. A per-contract basis derived from one lot size is not the basis of `
+          + 'the other, so the repair is declined rather than applied to a quantity it does not describe. '
+          + (recorded.stoppedAtClose
+            ? 'The recorded window stopped at a `sell_to_close`, so a partial close may have truncated it.'
+            : 'The excess belongs in `brokerPositionDrift`, not on this row.'),
+      };
+    }
+    if (Math.abs(opt.premiumPaid - recorded.premiumPaid) <= 1e-6) {
+      // Idempotence. Deliberately NOT `repaired` with a zero delta: a second run
+      // must be distinguishable from the first, or "the repair worked" and "the
+      // repair never needed to run" publish the same 200.
+      return { status: 'already_correct', ...context, recorded };
+    }
+
+    const before = {
+      premiumPaid: opt.premiumPaid,
+      stopLossPremium: opt.stopLossPremium,
+      tp1Premium: opt.tp1Premium,
+      trailingStopPremium: opt.trailingStopPremium,
+    };
+
+    if (!apply) {
+      // The dry run reports the levels the write WOULD install, derived the same
+      // way `restateEngineOpenedBasis` derives them (rescale by `new / old`) so
+      // the preview cannot claim a schedule the write would not produce.
+      const ratio = recorded.premiumPaid / before.premiumPaid;
+      return {
+        status: 'would_repair',
+        ...context,
+        recorded,
+        before,
+        after: {
+          premiumPaid: recorded.premiumPaid,
+          stopLossPremium: before.stopLossPremium * ratio,
+          tp1Premium: before.tp1Premium * ratio,
+          trailingStopPremium: before.trailingStopPremium * ratio,
+        },
+      };
+    }
+
+    // Same three calls the reconcile makes, in the same order, tagged with a
+    // different `source` so the durable ledger cannot conflate this repair with
+    // a broker restatement (which after TRA-3890 would mean a regression).
+    // `restateEngineOpenedBasis` RESCALES the schedule by `new / old`, which is
+    // what re-derives the stop off the corrected basis: BAC 1.41 -> 1.65 carries
+    // the 0.80 stop to 1.32 and the 1.50 TP1 to 2.475.
+    this.recordEngineBasisRestatement(opt, recorded.premiumPaid, 'recorded_fill_repair');
+    restateEngineOpenedBasis(opt, recorded.premiumPaid);
+    this.finishEngineBasisRestatement(opt);
+
+    accountLog.warn('engine row basis REPAIRED from this engine\'s own recorded fill', {
+      issue: 'TRA-3896',
+      positionId,
+      optionSymbol,
+      contracts: persistedContracts,
+      premiumPaidBefore: before.premiumPaid,
+      premiumPaidAfter: opt.premiumPaid,
+      stopLossPremiumBefore: before.stopLossPremium,
+      stopLossPremiumAfter: opt.stopLossPremium,
+      tp1PremiumBefore: before.tp1Premium,
+      tp1PremiumAfter: opt.tp1Premium,
+      orderIds: recorded.orderIds,
+      source: 'recorded_fill_repair',
+      note: 'sourced from the live fee/slippage ledger, NOT from the broker blend and NOT from a request body',
+    });
+
+    return {
+      status: 'repaired',
+      ...context,
+      recorded,
+      before,
+      after: {
+        premiumPaid: opt.premiumPaid,
+        stopLossPremium: opt.stopLossPremium,
+        tp1Premium: opt.tp1Premium,
+        trailingStopPremium: opt.trailingStopPremium,
+      },
     };
   }
 
@@ -7710,6 +8070,88 @@ export class PaperOptionsAccount {
         // in-memory map, and a row that resolves once is skipped from then on.
         if (existing.journalId === undefined) {
           this.queueJournalImportOpen(existing, 'reconcile_repair');
+        }
+        // ── TRA-3896 part 2 ──────────────────────────────────────────────────
+        // An `engine_origin` imported row must not silently take on a broker lot
+        // LARGER than this engine can account for having bought.
+        //
+        // The copy below is unconditional and runs on every reconcile — and
+        // reconcile runs ON BOOT. On 2026-08-20 that made decision B (the desk's
+        // adds are the desk's) unrepresentable for XLF: the row was adopted at 1
+        // contract, the desk added 1 at 19:36Z, and the copy took the broker's 2
+        // and the blended $0.965 onto the engine's row, then re-derived the stop
+        // off the blend. Any hand correction reverts within hours.
+        //
+        // ⚠️ NOT a mechanical copy of the engine-opened branch's refusal. Three
+        // things have to keep working, and each is a real live behaviour:
+        //   • a DECREASE is a real partial close — the broker is authority on
+        //     what is left, and refusing it would strand a row believing it
+        //     holds contracts that are gone. Untouched, deliberately.
+        //   • a genuine partial-fill TOP-UP on an engine-origin row is a
+        //     legitimate increase. Our own ledger is what tells the two apart:
+        //     if this engine's `buy_to_open` records account for the whole
+        //     incoming quantity, the extra contracts are OURS and the copy
+        //     proceeds exactly as before.
+        //   • a row we cannot classify is left alone rather than widened. The
+        //     refusal keeps the row's own basis and stop and says so loudly; it
+        //     never closes anything and never touches the desk's contracts.
+        //
+        // The safe default is REFUSE-AND-REPORT: the failure mode being
+        // prevented is a stop computed off somebody else's fill on a real-money
+        // row, and the cost of a wrong refusal is a log line plus an `excess`
+        // finding on a row that keeps working.
+        const heldContracts = existing.contractsRemaining ?? existing.contracts;
+        if (
+          existing.adoptionAuthority === 'engine_origin' &&
+          Number.isFinite(incoming.contracts) &&
+          incoming.contracts > heldContracts
+        ) {
+          this.importedAbsorptionCandidates += 1;
+          const recorded = existing.optionSymbol
+            ? recordedEngineOpenBasis(existing.optionSymbol)
+            : null;
+          // `null` (no record at all) is NOT permission. It is the oracle unable
+          // to answer, and the fail-open reading of it is what put a foreign
+          // contract on this row in the first place.
+          const engineAccountsFor = recorded && recorded.unpricedFills === 0 ? recorded.contracts : null;
+          if (engineAccountsFor === null || incoming.contracts > engineAccountsFor) {
+            this.importedAbsorptionRefusals += 1;
+            accountLog.warn(
+              'engine-origin imported row: broker lot is LARGER than this engine can account for — absorption REFUSED',
+              {
+                issue: 'TRA-3896',
+                positionId: existing.id,
+                optionSymbol: existing.optionSymbol,
+                heldContracts,
+                brokerContracts: incoming.contracts,
+                engineRecordedContracts: engineAccountsFor,
+                oracle:
+                  recorded === null
+                    ? 'no `buy_to_open` recorded for this contract — UNRESOLVED, not permission'
+                    : recorded.unpricedFills > 0
+                      ? 'recorded fills carry no usable price — cannot account for the lot'
+                      : 'recorded fills account for fewer contracts than the broker reports',
+                enginePremiumPaid: existing.premiumPaid,
+                brokerBlendedPremium: incoming.premiumPaid,
+                action:
+                  'row keeps its own contracts, basis and stop; the excess is a `brokerPositionDrift` finding, not this row\'s',
+                note: 'nothing was closed and the desk\'s contracts were not touched',
+              },
+            );
+            continue;
+          }
+          // Our own fills cover the whole incoming lot ⇒ a genuine top-up on an
+          // engine-origin row. Counted so the refusal's tightness is measurable.
+          this.importedAbsorptionAllowed += 1;
+          accountLog.info('engine-origin imported row: quantity increase accounted for by this engine\'s own fills — allowed', {
+            issue: 'TRA-3896',
+            positionId: existing.id,
+            optionSymbol: existing.optionSymbol,
+            heldContracts,
+            brokerContracts: incoming.contracts,
+            engineRecordedContracts: engineAccountsFor,
+            orderIds: recorded?.orderIds ?? [],
+          });
         }
         const contractsChanged = existing.contracts !== incoming.contracts;
         const premiumChanged = Math.abs(existing.premiumPaid - incoming.premiumPaid) > 1e-6;

@@ -33,6 +33,26 @@ const log = logger.child({ module: 'engine-basis-restatement-log' });
 
 export const ENGINE_BASIS_RESTATEMENT_FILENAME = 'engine-basis-restatements.jsonl';
 
+/**
+ * TRA-3896 — WHICH mechanism moved the basis.
+ *
+ * Both write the same shape, and without this field a reader of the ledger sees
+ * "1.41 → 1.65" and cannot tell them apart — which matters enormously, because
+ * they mean opposite things:
+ *
+ *   • `broker_reconcile` — the TRA-2889 sweep restated to Tradier's
+ *     `cost_basis / quantity`. On a symbol where the broker's lot is a BLEND,
+ *     a record of this kind AFTER TRA-3890 shipped means the `quantity_mismatch`
+ *     refusal regressed.
+ *   • `recorded_fill_repair` — the TRA-3896 admin repair, sourced from this
+ *     engine's OWN `buy_to_open` records. Ordered by a human, once.
+ *
+ * Optional because every record written before this ticket carries neither, and
+ * back-filling a guess onto them would be inventing provenance. Absent reads as
+ * "pre-TRA-3896, therefore `broker_reconcile`" — the only mechanism that existed.
+ */
+export type EngineBasisRestatementSource = 'broker_reconcile' | 'recorded_fill_repair';
+
 /** One witnessed restatement: both sides of an edit that is otherwise unobservable. */
 export interface EngineBasisRestatementRecord {
   ts: number;
@@ -45,6 +65,8 @@ export interface EngineBasisRestatementRecord {
   premiumPaidAfter: number;
   ratio: number;
   brokerCostBasisUsd: number;
+  /** TRA-3896 — see {@link EngineBasisRestatementSource}. Absent on pre-3896 rows. */
+  source?: EngineBasisRestatementSource;
   tp1PremiumBefore: number;
   tp1PremiumAfter: number;
   stopLossPremiumBefore: number;

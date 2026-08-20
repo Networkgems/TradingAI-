@@ -312,6 +312,117 @@ export function lastRecordedOpenFill(optionSymbol: string): LiveOptionFillRecord
 }
 
 /**
+ * TRA-3896 — what the ENGINE ITSELF paid for its current open episode on a
+ * contract: quantity and quantity-weighted basis, sourced from this ledger's own
+ * `buy_to_open` rows.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * Tradier's `/positions` is ONE row per OCC symbol, so `cost_basis / quantity`
+ * is a BLEND across every contract in the account on that symbol — the engine's
+ * and anybody else's. TRA-3890 showed both directions of the damage on
+ * 2026-08-20: a desk-side add of 1 BAC at $1.17 turned the engine's $1.65 fill
+ * into a booked $1.41 (basis), and the same reconcile copied a 2-contract broker
+ * lot onto an engine-origin XLF row that was adopted at 1 (quantity).
+ *
+ * Every repair for that class needs the same number — "what did WE actually buy,
+ * and how much of it" — and it must come from a record the engine wrote at fill
+ * time, never from the broker's blend and never from a request body. A typed-in
+ * basis is a second way to get a number nobody paid onto the row, which is the
+ * defect being repaired.
+ *
+ * ── The episode window, and why it stops at a close ─────────────────────────
+ * Walks BACKWARD and stops at the first `sell_to_close` on the symbol, so the
+ * result covers the CURRENT open episode only. Summing across a completed round
+ * trip would blend a position we no longer hold into the basis of the one we do
+ * — the same blending error one level up.
+ *
+ * A PARTIAL close inside the episode also truncates the window, so `contracts`
+ * can come back SHORT of what the row holds. That is deliberate: every caller
+ * treats a quantity it cannot fully account for as a REFUSAL, so truncation
+ * fails closed (no write) rather than open (a basis derived from part of the
+ * lot).
+ *
+ * `unpricedFills` is the honest-null discipline this module is built on: a
+ * `buy_to_open` with `filledPrice: null` is a contract we cannot price, so the
+ * weighted average would silently be an average over the priced subset. Callers
+ * must refuse on `unpricedFills > 0` rather than read `premiumPaid` as complete.
+ */
+export interface RecordedEngineOpenBasis {
+  /** Contracts the engine's own priced fills account for in this episode. */
+  contracts: number;
+  /** Quantity-weighted average `filledPrice` over those fills, per contract. */
+  premiumPaid: number;
+  /** `premiumPaid × contracts × 100` — the engine's own cost basis, USD. */
+  costBasisUsd: number;
+  /** How many `buy_to_open` records went into the average. */
+  fills: number;
+  /** Broker order ids seen, oldest-first. The durable handle back to the order. */
+  orderIds: number[];
+  /**
+   * `buy_to_open` rows in the episode carrying `filledPrice: null`. Non-zero
+   * means the basis above is INCOMPLETE — refuse, do not round.
+   */
+  unpricedFills: number;
+  /** Whether the backward walk stopped at a `sell_to_close` (episode boundary). */
+  stoppedAtClose: boolean;
+  /** Fill time of the newest `buy_to_open` in the episode, ms epoch. */
+  lastTs: number;
+}
+
+/**
+ * TRA-3896 — see {@link RecordedEngineOpenBasis}. `null` when this ledger holds
+ * no `buy_to_open` for the symbol at all, which is the "oracle cannot answer"
+ * state and must NOT be read as "the engine bought nothing" (see
+ * {@link recordedOpenFillCount} for why those two are different).
+ */
+export function recordedEngineOpenBasis(optionSymbol: string): RecordedEngineOpenBasis | null {
+  const episode: LiveOptionFillRecord[] = [];
+  let stoppedAtClose = false;
+  for (let i = fills.length - 1; i >= 0; i--) {
+    const f = fills[i]!;
+    if (f.optionSymbol !== optionSymbol) continue;
+    if (f.side === 'sell_to_close') {
+      stoppedAtClose = true;
+      break;
+    }
+    if (f.side === 'buy_to_open') episode.push(f);
+  }
+  if (episode.length === 0) return null;
+  episode.reverse(); // oldest-first, so `orderIds` reads in fill order
+
+  let contracts = 0;
+  let costBasisUsd = 0;
+  let unpricedFills = 0;
+  let lastTs = 0;
+  const orderIds: number[] = [];
+  for (const f of episode) {
+    const qty = typeof f.contracts === 'number' && Number.isFinite(f.contracts) ? f.contracts : 0;
+    const price = f.filledPrice;
+    if (typeof f.orderId === 'number' && Number.isFinite(f.orderId)) orderIds.push(f.orderId);
+    if (f.ts > lastTs) lastTs = f.ts;
+    if (!(qty > 0) || typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
+      unpricedFills += 1;
+      continue;
+    }
+    contracts += qty;
+    costBasisUsd += price * qty * 100;
+  }
+  return {
+    contracts,
+    // Guard the divide rather than emit NaN: `contracts === 0` means every fill
+    // in the episode was unpriced, and a NaN basis downstream reads as a number
+    // until something compares it.
+    premiumPaid: contracts > 0 ? costBasisUsd / (contracts * 100) : 0,
+    costBasisUsd,
+    fills: episode.length,
+    orderIds,
+    unpricedFills,
+    stoppedAtClose,
+    lastTs,
+  };
+}
+
+/**
  * TRA-3553 — how many `buy_to_open` rows the ledger currently holds.
  *
  * This is the ORACLE-HEALTH probe, and it exists because

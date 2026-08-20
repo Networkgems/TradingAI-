@@ -95,6 +95,16 @@ export type BrokerReadFailure = 'http_status' | 'transport' | 'malformed';
  *   • `imported`    — a `tradier_import` row is foreign inventory whose
  *     disappearance is already booked by the imported branch of the reconcile.
  *     Its absence is not evidence about an engine order.
+ *
+ *     ⚠️ TRA-3896 narrows this. It used to swallow EVERY imported row, including
+ *     one the reconcile itself classified `adoptionAuthority: 'engine_origin'` —
+ *     a contract this engine placed, lost the row for, and re-adopted through
+ *     the import path. Those are engine-managed positions with engine stops, and
+ *     excluding them left the live check reading `engineRowsChecked: 1` over a
+ *     two-row live book. The collision that got REFUSED (BAC) was reported; the
+ *     one that got ABSORBED (XLF, a desk contract copied onto the engine's row)
+ *     had no instrument on it at all. Engine-origin imports are now in the
+ *     denominator; `imported` counts only foreign/unresolved ones.
  *   • `multi_leg`   — a combo is not one OCC row in `/positions`.
  *   • `covered_write` — short; `/positions` short legs are dropped at the
  *     parser, so a short row is absent from the payload by construction.
@@ -175,6 +185,43 @@ export interface BrokerExcess {
 }
 
 /**
+ * TRA-3896 — one engine-origin row holding MORE contracts than this engine can
+ * account for having bought.
+ *
+ * ── Why `excess` cannot find this ───────────────────────────────────────────
+ * `excess` compares the BROKER to the ROW. It fires only while the row has not
+ * yet taken the foreign contract in. The moment the reconcile copies the
+ * broker's quantity onto the row — which the imported branch did unconditionally
+ * until TRA-3896, on every reconcile including the one at boot — row and broker
+ * AGREE, and the comparison reads `clean` over the exact state that is wrong.
+ *
+ * That is the XLF row on 2026-08-20: adopted at 1 contract, 2 at the broker
+ * after the desk's 19:36Z add, persisted 2 @ $0.965 with a stop derived from the
+ * blend. Every broker-vs-engine instrument called it healthy, because by the
+ * time they looked the engine's book had already agreed to the wrong number.
+ *
+ * So this compares the row against a THIRD source neither of those two can
+ * contaminate: this engine's own `buy_to_open` records. `recordedContracts` is
+ * what we can prove we bought; anything the row holds beyond it is somebody
+ * else's contract wearing our stop.
+ */
+export interface EngineOriginAbsorption {
+  optionSymbol: string;
+  /** Contracts the row currently holds (`contractsRemaining`). */
+  rowContracts: number;
+  /**
+   * Contracts this engine's own fill ledger accounts for, or `null` when the
+   * ledger cannot answer. `null` is UNRESOLVED — reported, never counted as an
+   * absorption, because "we have no record" is also what an empty ledger says
+   * about a contract we really did buy.
+   */
+  recordedContracts: number | null;
+  /** `rowContracts − recordedContracts`, or 0 when unresolved. */
+  absorbedContracts: number;
+  rowIds: string[];
+}
+
+/**
  * The verdict. Five states, because "we could not look", "there was nothing to
  * look at", and "we looked and it agreed" have three different remedies and
  * must never collapse into one green.
@@ -198,9 +245,24 @@ export interface BrokerExcess {
  *     basis and for an exit that sells only part of the broker's lot, so it is
  *     a finding, ranked below `drift` (nothing LEFT the account) and above
  *     `blind`.
+ *   • `absorbed` — TRA-3896: at least one engine-origin row holding more
+ *     contracts than this engine's own fills account for. Ranked ABOVE `excess`
+ *     because it is the same collision one step further along: `excess` is the
+ *     broker holding more than us (a precondition, and the row's own basis and
+ *     stop are still its own), while `absorbed` means the row has already TAKEN
+ *     the foreign contract in and is running a stop derived from a blend of
+ *     somebody else's fill. Below `drift`, which is still the only state where
+ *     contracts left the account.
  *   • `drift`   — at least one symbol where the broker is short.
  */
-export type LiveBrokerDriftStatus = 'dark' | 'blind' | 'vacuous' | 'clean' | 'excess' | 'drift';
+export type LiveBrokerDriftStatus =
+  | 'dark'
+  | 'blind'
+  | 'vacuous'
+  | 'clean'
+  | 'excess'
+  | 'absorbed'
+  | 'drift';
 
 export interface LiveBrokerPositionDriftReport {
   status: LiveBrokerDriftStatus;
@@ -230,6 +292,22 @@ export interface LiveBrokerPositionDriftReport {
   tooYoungSymbols: number;
   excess: BrokerExcess[];
   excessContracts: number;
+  /** TRA-3896 — engine-origin rows holding more than our own fills account for. */
+  absorbed: EngineOriginAbsorption[];
+  absorbedContracts: number;
+  /**
+   * TRA-3896 — engine-origin imported rows now IN the denominator. Reported
+   * separately from `engineRowsChecked` so extending the coverage cannot be
+   * mistaken for the engine having opened more rows than it did.
+   */
+  engineOriginImportedRowsChecked: number;
+  /**
+   * TRA-3896 — engine-origin rows the fill ledger could not answer for. NOT
+   * absorptions: an empty ledger says exactly this about a contract we did buy.
+   * Non-zero means the absorption check has a coverage hole, and a reader must
+   * not take `absorbedContracts: 0` as an all-clear over these rows.
+   */
+  absorptionUnresolvedRows: number;
 }
 
 const EMPTY_INELIGIBLE: Record<DriftIneligibleReason, number> = {
@@ -274,6 +352,10 @@ export function darkBrokerPositionDriftReport(
     tooYoungSymbols: 0,
     excess: [],
     excessContracts: 0,
+    absorbed: [],
+    absorbedContracts: 0,
+    engineOriginImportedRowsChecked: 0,
+    absorptionUnresolvedRows: 0,
   };
 }
 
@@ -334,10 +416,39 @@ function hasStagedNeverSubmitted(opt: OptionPosition): boolean {
  *              caller)
  * @param now   epoch ms, for the age floor
  */
+/**
+ * TRA-3896 — "how many contracts does this engine's OWN fill ledger account for
+ * on this symbol", or `null` when the ledger cannot answer.
+ *
+ * Injected rather than imported so this module stays pure and testable. The
+ * default is a function that answers `null` for everything, which makes the
+ * absorption check report `absorptionUnresolvedRows` instead of silently
+ * grading rows against an oracle nobody wired — the same refusal-to-guess the
+ * rest of the module makes.
+ */
+export type RecordedEngineContractsOracle = (optionSymbol: string) => number | null;
+
+const NO_RECORDED_CONTRACTS_ORACLE: RecordedEngineContractsOracle = () => null;
+
+/**
+ * TRA-3896 — a row the engine is MANAGING, whichever path it arrived by.
+ *
+ * An `engine_origin` import is a contract this engine placed, lost the row for,
+ * and re-adopted (TRA-3553/TRA-3829 stamp the verdict at adoption). It carries
+ * an engine stop and an engine schedule, so the broker-vs-engine comparison
+ * applies to it exactly as it does to a row that never left. `foreign` and
+ * `unresolved` imports stay out: those are the desk's inventory, and their
+ * absence from a payload is not evidence about any order of ours.
+ */
+function isEngineManagedRow(opt: OptionPosition): boolean {
+  return !opt.importedFromTradier || opt.adoptionAuthority === 'engine_origin';
+}
+
 export function diffLiveBrokerPositions(
   read: BrokerPositionsRead,
   rows: readonly OptionPosition[],
   now: number,
+  recordedEngineContracts: RecordedEngineContractsOracle = NO_RECORDED_CONTRACTS_ORACLE,
 ): LiveBrokerPositionDriftReport {
   const base: LiveBrokerPositionDriftReport = {
     status: 'clean',
@@ -358,6 +469,10 @@ export function diffLiveBrokerPositions(
     tooYoungSymbols: 0,
     excess: [],
     excessContracts: 0,
+    absorbed: [],
+    absorbedContracts: 0,
+    engineOriginImportedRowsChecked: 0,
+    absorptionUnresolvedRows: 0,
   };
 
   if (!read.ok) {
@@ -384,6 +499,9 @@ export function diffLiveBrokerPositions(
     stagedNeverSubmitted: boolean;
     oldestOpenedAt: number;
     rowIds: string[];
+    /** TRA-3896 — contracts on this symbol carried by engine-ORIGIN imports. */
+    engineOriginImportedContracts: number;
+    engineOriginImportedRowIds: string[];
   }
   const engineBySymbol = new Map<string, SymbolAgg>();
 
@@ -392,7 +510,9 @@ export function diffLiveBrokerPositions(
       base.ineligible.not_live += 1;
       continue;
     }
-    if (opt.importedFromTradier) {
+    // TRA-3896 — an engine-ORIGIN import is an engine-managed row and belongs in
+    // the denominator; only genuinely foreign/unresolved imports are excluded.
+    if (!isEngineManagedRow(opt)) {
       base.ineligible.imported += 1;
       continue;
     }
@@ -421,6 +541,8 @@ export function diffLiveBrokerPositions(
       stagedNeverSubmitted: false,
       oldestOpenedAt: Number.POSITIVE_INFINITY,
       rowIds: [],
+      engineOriginImportedContracts: 0,
+      engineOriginImportedRowIds: [],
     };
     agg.engineContracts += contracts;
     agg.submittedContracts += engineSubmittedContracts(opt);
@@ -428,11 +550,55 @@ export function diffLiveBrokerPositions(
     const openedAt = typeof opt.openedAt === 'number' && Number.isFinite(opt.openedAt) ? opt.openedAt : now;
     agg.oldestOpenedAt = Math.min(agg.oldestOpenedAt, openedAt);
     agg.rowIds.push(opt.id);
+    if (opt.importedFromTradier) {
+      agg.engineOriginImportedContracts += contracts;
+      agg.engineOriginImportedRowIds.push(opt.id);
+      base.engineOriginImportedRowsChecked += 1;
+    }
     engineBySymbol.set(occ, agg);
     base.engineRowsChecked += 1;
     base.engineContractsChecked += contracts;
   }
   base.engineSymbolsChecked = engineBySymbol.size;
+
+  // ── TRA-3896: the absorption check ────────────────────────────────────────
+  // Runs against the fill LEDGER, not against the broker, and that is the whole
+  // point: once the reconcile has copied a foreign contract onto an engine-origin
+  // row, the row and the broker AGREE and every broker-vs-engine comparison below
+  // reads clean over it. Only a third source that neither of them wrote can see
+  // it. Scoped to engine-origin IMPORTS because an engine-opened row was never
+  // exposed to the unconditional copy — its branch has refused a mismatched lot
+  // since TRA-3890 — and widening the scope would start grading rows whose basis
+  // the ledger legitimately does not cover.
+  for (const [symbol, agg] of engineBySymbol) {
+    if (agg.engineOriginImportedContracts <= 0) continue;
+    const recorded = recordedEngineContracts(symbol);
+    if (recorded === null || !Number.isFinite(recorded)) {
+      // UNRESOLVED. Reported, never counted as an absorption: an empty or
+      // unhydrated ledger says exactly this about a contract we really did buy,
+      // and calling that an absorption would alarm on every row after a restart
+      // that lost the ledger.
+      base.absorptionUnresolvedRows += agg.engineOriginImportedRowIds.length;
+      base.absorbed.push({
+        optionSymbol: symbol,
+        rowContracts: agg.engineOriginImportedContracts,
+        recordedContracts: null,
+        absorbedContracts: 0,
+        rowIds: [...agg.engineOriginImportedRowIds],
+      });
+      continue;
+    }
+    if (agg.engineOriginImportedContracts <= recorded) continue;
+    const absorbedContracts = agg.engineOriginImportedContracts - recorded;
+    base.absorbed.push({
+      optionSymbol: symbol,
+      rowContracts: agg.engineOriginImportedContracts,
+      recordedContracts: recorded,
+      absorbedContracts,
+      rowIds: [...agg.engineOriginImportedRowIds],
+    });
+    base.absorbedContracts += absorbedContracts;
+  }
 
   let brokerOnly = 0;
   for (const symbol of brokerBySymbol.keys()) {
@@ -514,9 +680,21 @@ export function diffLiveBrokerPositions(
   }
 
   const drifted = base.shortfalls.some(s => s.reason !== 'too_young');
-  // A shortfall outranks an excess on the same read: contracts that LEFT are
-  // the louder event. Excess is still carried in `excess[]` either way.
-  return { ...base, status: drifted ? 'drift' : base.excessContracts > 0 ? 'excess' : 'clean' };
+  // A shortfall outranks an absorption outranks an excess on the same read.
+  // Contracts that LEFT are the loudest; a foreign contract already ON an engine
+  // row (running our stop, blended into our basis) is louder than one merely
+  // sitting beside it at the broker. All three arrays are carried either way, so
+  // a lower-ranked finding is never lost to the headline.
+  return {
+    ...base,
+    status: drifted
+      ? 'drift'
+      : base.absorbedContracts > 0
+        ? 'absorbed'
+        : base.excessContracts > 0
+          ? 'excess'
+          : 'clean',
+  };
 }
 
 /**
@@ -535,7 +713,9 @@ export function diffLiveBrokerPositions(
  * or `dark`, which is how an aggregate turns a coverage hole into a green.
  */
 const DRIFT_STATUS_RANK: Record<LiveBrokerDriftStatus | 'never_ran', number> = {
-  drift: 7,
+  drift: 8,
+  // TRA-3896 — above `excess` and below `drift`; see `LiveBrokerDriftStatus`.
+  absorbed: 7,
   excess: 6,
   blind: 5,
   dark: 4,
@@ -590,6 +770,7 @@ export function foldLiveBrokerDriftStatuses(
     vacuous: 0,
     clean: 0,
     excess: 0,
+    absorbed: 0,
     drift: 0,
   };
   // Seeded with null, not 'never_ran': the rank treats never_ran as a gap that
@@ -634,6 +815,10 @@ export function summarizeLiveBrokerPositionDrift(
   tooYoungSymbols: number;
   excessContracts: number;
   brokerOnlySymbols: number;
+  /** TRA-3896 — engine-origin rows holding more than our own fills account for. */
+  absorbedContracts: number;
+  engineOriginImportedRowsChecked: number;
+  absorptionUnresolvedRows: number;
 } {
   if (!report) {
     // `never_ran` is its own state on purpose. A boot that has not reached the
@@ -652,6 +837,9 @@ export function summarizeLiveBrokerPositionDrift(
       tooYoungSymbols: 0,
       excessContracts: 0,
       brokerOnlySymbols: 0,
+      absorbedContracts: 0,
+      engineOriginImportedRowsChecked: 0,
+      absorptionUnresolvedRows: 0,
     };
   }
   return {
@@ -667,5 +855,8 @@ export function summarizeLiveBrokerPositionDrift(
     tooYoungSymbols: report.tooYoungSymbols,
     excessContracts: report.excessContracts,
     brokerOnlySymbols: report.brokerOnlySymbols,
+    absorbedContracts: report.absorbedContracts,
+    engineOriginImportedRowsChecked: report.engineOriginImportedRowsChecked,
+    absorptionUnresolvedRows: report.absorptionUnresolvedRows,
   };
 }
