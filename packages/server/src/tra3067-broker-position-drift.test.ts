@@ -34,6 +34,7 @@ import {
   DRIFT_MIN_ROW_AGE_MS,
   type DriftShortfallReason,
   type LiveBrokerDriftStatus,
+  foldLiveBrokerDriftStatuses,
 } from './live-broker-position-drift.js';
 
 const NOW = Date.parse('2026-08-04T18:00:00Z');
@@ -80,7 +81,7 @@ function brokerPos(optionSymbol: string, contracts: number): TradierOpenOptionPo
 }
 
 /** Every arm the checker can take. A new one with no fixture fails below. */
-const ALL_STATUSES: readonly LiveBrokerDriftStatus[] = ['dark', 'blind', 'vacuous', 'clean', 'drift'];
+const ALL_STATUSES: readonly LiveBrokerDriftStatus[] = ['dark', 'blind', 'vacuous', 'clean', 'excess', 'drift'];
 const ALL_REASONS: readonly DriftShortfallReason[] = [
   'out_of_band',
   'staged_never_submitted',
@@ -238,13 +239,17 @@ describe('TRA-3067 — every exit is reachable', () => {
     seenReasons.add('too_young');
   });
 
-  it('excess: the broker holds MORE than the engine — reported, not alarmed', () => {
+  it('excess: the broker holds MORE than the engine — a finding, not clean (TRA-3890)', () => {
     const report = diffLiveBrokerPositions(
       { ok: true, positions: [brokerPos(PLTR, 5)] },
       [row({ id: 'r1', contracts: 2, contractsRemaining: 2 })],
       NOW,
     );
-    expect(report.status).toBe('clean');
+    // 2026-08-20: a desk-side add made the broker's BAC lot 2 against the
+    // engine's 1; this read `clean` while the basis restatement wrote the
+    // 2-lot blend onto the 1-lot row. Excess is what makes that happen.
+    expect(report.status).toBe('excess');
+    seenStatuses.add(report.status);
     expect(report.excessContracts).toBe(3);
     expect(report.excess[0]).toMatchObject({ optionSymbol: PLTR, excessContracts: 3 });
     expect(report.outOfBandContracts).toBe(0);
@@ -648,7 +653,40 @@ describe('TRA-3067 — the published projection', () => {
     expect(summary.outOfBandContracts).toBe(1);
   });
 
+  it('TRA-3890: the fleet fold keeps the live book verdict apart from demo contexts that are dark', () => {
+    const demoDark = darkBrokerPositionDriftReport('not_live', NOW);
+    const noClient = darkBrokerPositionDriftReport('no_client', NOW);
+    const liveExcess = diffLiveBrokerPositions(
+      { ok: true, positions: [brokerPos(PLTR, 2)] },
+      [row({ id: 'r1', contracts: 1, contractsRemaining: 1 })],
+      NOW,
+    );
+    const liveClean = diffLiveBrokerPositions({ ok: true, positions: [brokerPos(PLTR, 1)] }, [row({ id: 'r1' })], NOW);
+    // The 08-20 shape: nine demo contexts dark, one live context with a finding.
+    const fold = foldLiveBrokerDriftStatuses([...Array.from({ length: 9 }, () => demoDark), liveExcess]);
+    expect(fold.status).toBe('excess'); // excess outranks dark fleet-wide too
+    expect(fold.liveBookStatus).toBe('excess');
+    expect(fold.liveContexts).toBe(1);
+    expect(fold.notLiveContexts).toBe(9);
+    expect(fold.contextsByLastStatus).toMatchObject({ dark: 9, excess: 1, clean: 0 });
+    // A clean live book next to dark demo contexts: headline stays dark (the
+    // fold's contract), but the live book is visibly clean — not inferred.
+    const fold2 = foldLiveBrokerDriftStatuses([demoDark, liveClean]);
+    expect(fold2.status).toBe('dark');
+    expect(fold2.liveBookStatus).toBe('clean');
+    // A live book with NO broker client is a hole in the live book, not a demo.
+    const fold3 = foldLiveBrokerDriftStatuses([demoDark, noClient]);
+    expect(fold3.liveBookStatus).toBe('dark');
+    expect(fold3.liveContexts).toBe(1);
+    // No context at all: never_ran, never clean.
+    expect(foldLiveBrokerDriftStatuses([]).liveBookStatus).toBe('never_ran');
+    expect(foldLiveBrokerDriftStatuses([null]).contextsByLastStatus.never_ran).toBe(1);
+  });
+
   it('the aggregate never lets one clean book hide another that is blind or dark', () => {
+    expect(worseBrokerDriftStatus('clean', 'excess')).toBe('excess');
+    expect(worseBrokerDriftStatus('excess', 'drift')).toBe('drift');
+    expect(worseBrokerDriftStatus('blind', 'excess')).toBe('excess');
     expect(worseBrokerDriftStatus('clean', 'blind')).toBe('blind');
     expect(worseBrokerDriftStatus('clean', 'dark')).toBe('dark');
     expect(worseBrokerDriftStatus('clean', 'vacuous')).toBe('vacuous');

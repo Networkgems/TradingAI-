@@ -1052,6 +1052,21 @@ export interface LedgerCoverageResult {
   missingContracts: number;
   /** Rows appended this pass to close the shortfall. */
   importedRows: number;
+  /**
+   * TRA-3890 — what `missingContracts: 0` actually rests on. On 2026-08-20 the
+   * broker took 4 fills, the ledger held 2, and this read `{0,0,0,0}`: same-day
+   * groups are skipped by design and `/history` had not yet published the day,
+   * so the zero was an EMPTY DENOMINATOR, not a complete ledger.
+   *   • `unmeasured` — no prior-day broker contracts in the window; nothing was
+   *     compared and the zero proves nothing.
+   *   • `complete`   — prior-day groups compared and every contract is covered.
+   *   • `missing`    — a shortfall was found (and imported).
+   */
+  verdict: 'unmeasured' | 'complete' | 'missing';
+  /** Prior-day broker contracts actually compared (the denominator of `verdict`). */
+  comparedContracts: number;
+  /** Same-day broker contracts deliberately left to the fill-time recorders. */
+  sameDayContractsExcluded: number;
 }
 
 /** A price the ledger already holds, for the cancellation below. `null` = row carries no price. */
@@ -1189,9 +1204,16 @@ export function diffMissingFillsFromHistory(
 
   const inputs: LiveOptionFillInput[] = [];
   let missingContracts = 0;
+  let comparedContracts = 0;
+  let sameDayContractsExcluded = 0;
   for (const [key, g] of histGroups) {
     const day = g.fills[0]!.date;
-    if (day >= todayEt) continue; // intraday fills belong to the fill-time recorders
+    if (day >= todayEt) {
+      // intraday fills belong to the fill-time recorders — counted, not dropped
+      sameDayContractsExcluded += g.qty;
+      continue;
+    }
+    comparedContracts += g.qty;
     let shortfall = g.qty - (ledgerQtyByKey.get(key) ?? 0);
     if (shortfall <= 0) continue;
     missingContracts += shortfall;
@@ -1251,7 +1273,15 @@ export function diffMissingFillsFromHistory(
   }
   return {
     inputs,
-    coverage: { brokerContracts, ledgerContracts, missingContracts, importedRows: inputs.length },
+    coverage: {
+      brokerContracts,
+      ledgerContracts,
+      missingContracts,
+      importedRows: inputs.length,
+      verdict: comparedContracts === 0 ? 'unmeasured' : missingContracts > 0 ? 'missing' : 'complete',
+      comparedContracts,
+      sameDayContractsExcluded,
+    },
   };
 }
 

@@ -185,11 +185,22 @@ export interface BrokerExcess {
  *   • `vacuous` — the read succeeded and the engine holds no eligible live
  *     row, so the comparison had an empty denominator. Read `ineligible` to
  *     see whether that is genuinely an empty book or a filter eating it.
- *   • `clean`   — at least one eligible row, and the broker matches or exceeds
- *     on every one of them.
+ *   • `clean`   — at least one eligible row, and the broker matches on every
+ *     one of them.
+ *   • `excess`  — TRA-3890: at least one engine-owned symbol where the broker
+ *     holds MORE than the engine. Until 2026-08-20 this was folded into
+ *     `clean` ("reported, not alarmed"). The first live OTM session showed why
+ *     it must not be: a desk-side add of 1 BAC contract at 19:36Z made the
+ *     broker's `/positions` row a 2-lot blend, and the TRA-2889 basis
+ *     restatement wrote that blended average ($1.41) onto the engine's 1-lot
+ *     row whose real fill was $1.65 — while this detector read `clean` over the
+ *     exact state that caused it. Excess is the precondition for a wrong
+ *     basis and for an exit that sells only part of the broker's lot, so it is
+ *     a finding, ranked below `drift` (nothing LEFT the account) and above
+ *     `blind`.
  *   • `drift`   — at least one symbol where the broker is short.
  */
-export type LiveBrokerDriftStatus = 'dark' | 'blind' | 'vacuous' | 'clean' | 'drift';
+export type LiveBrokerDriftStatus = 'dark' | 'blind' | 'vacuous' | 'clean' | 'excess' | 'drift';
 
 export interface LiveBrokerPositionDriftReport {
   status: LiveBrokerDriftStatus;
@@ -503,7 +514,9 @@ export function diffLiveBrokerPositions(
   }
 
   const drifted = base.shortfalls.some(s => s.reason !== 'too_young');
-  return { ...base, status: drifted ? 'drift' : 'clean' };
+  // A shortfall outranks an excess on the same read: contracts that LEFT are
+  // the louder event. Excess is still carried in `excess[]` either way.
+  return { ...base, status: drifted ? 'drift' : base.excessContracts > 0 ? 'excess' : 'clean' };
 }
 
 /**
@@ -522,7 +535,8 @@ export function diffLiveBrokerPositions(
  * or `dark`, which is how an aggregate turns a coverage hole into a green.
  */
 const DRIFT_STATUS_RANK: Record<LiveBrokerDriftStatus | 'never_ran', number> = {
-  drift: 6,
+  drift: 7,
+  excess: 6,
   blind: 5,
   dark: 4,
   never_ran: 3,
@@ -533,6 +547,76 @@ const DRIFT_STATUS_RANK: Record<LiveBrokerDriftStatus | 'never_ran', number> = {
 /** Fold two statuses, keeping the one that most demands a look. */
 export function worseBrokerDriftStatus<T extends LiveBrokerDriftStatus | 'never_ran'>(a: T, b: T): T {
   return DRIFT_STATUS_RANK[b] > DRIFT_STATUS_RANK[a] ? b : a;
+}
+
+export type LiveBrokerDriftFoldStatus = LiveBrokerDriftStatus | 'never_ran';
+
+/**
+ * TRA-3890 — the fleet fold, with the live book's own verdict kept separate.
+ *
+ * `worseBrokerDriftStatus` is correct for what it was built for: one `clean`
+ * book must never hide another that is `blind`. But the no-auth route folds
+ * EVERY user context through it, and a demo-mode context reports `dark`
+ * (`not_live`) on every check, forever. So on 2026-08-20 the route read
+ * `status: "dark", driftChecks 0` across the first live OTM session while the
+ * admin engine's live check had run ~330 times and was, at that moment,
+ * computing `excess: [BAC engine 1 / broker 2]` — and calling it `clean`.
+ * "Dark" and "watching, found something" were the same payload.
+ *
+ * Two things fix that without weakening the fold:
+ *   • `liveBookStatus` — the same fold over only the contexts whose check is
+ *     structurally able to run (everything except `dark`/`not_live`). A
+ *     `no_client` dark still counts: a live book with no broker client IS a
+ *     coverage hole on the live book.
+ *   • `contextsByLastStatus` — how many contexts sit in each state, so a reader
+ *     can see "1 live context clean, 9 demo contexts dark" instead of one word.
+ *
+ * `liveContexts === 0` means there is no live book at all; `liveBookStatus` is
+ * then `never_ran`, which the rank treats as a coverage gap, not a green.
+ */
+export function foldLiveBrokerDriftStatuses(
+  lasts: readonly (Pick<LiveBrokerPositionDriftReport, 'status' | 'darkReason'> | null)[],
+): {
+  status: LiveBrokerDriftFoldStatus;
+  liveBookStatus: LiveBrokerDriftFoldStatus;
+  liveContexts: number;
+  notLiveContexts: number;
+  contextsByLastStatus: Record<LiveBrokerDriftFoldStatus, number>;
+} {
+  const contextsByLastStatus: Record<LiveBrokerDriftFoldStatus, number> = {
+    never_ran: 0,
+    dark: 0,
+    blind: 0,
+    vacuous: 0,
+    clean: 0,
+    excess: 0,
+    drift: 0,
+  };
+  // Seeded with null, not 'never_ran': the rank treats never_ran as a gap that
+  // outranks clean, so a seed of never_ran could never be lowered by a context
+  // that actually ran clean.
+  let status: LiveBrokerDriftFoldStatus | null = null;
+  let liveBookStatus: LiveBrokerDriftFoldStatus | null = null;
+  let liveContexts = 0;
+  let notLiveContexts = 0;
+  for (const last of lasts) {
+    const s: LiveBrokerDriftFoldStatus = last ? last.status : 'never_ran';
+    contextsByLastStatus[s] += 1;
+    status = status === null ? s : worseBrokerDriftStatus(status, s);
+    if (last && last.status === 'dark' && last.darkReason === 'not_live') {
+      notLiveContexts += 1;
+      continue;
+    }
+    liveContexts += 1;
+    liveBookStatus = liveBookStatus === null ? s : worseBrokerDriftStatus(liveBookStatus, s);
+  }
+  return {
+    status: status ?? 'never_ran',
+    liveBookStatus: liveBookStatus ?? 'never_ran',
+    liveContexts,
+    notLiveContexts,
+    contextsByLastStatus,
+  };
 }
 
 export function summarizeLiveBrokerPositionDrift(

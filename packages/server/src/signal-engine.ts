@@ -3578,6 +3578,9 @@ export class SignalEngine {
     blindChecks: number;
     vacuousChecks: number;
     darkChecks: number;
+    /** TRA-3890 — counted, not derived by subtraction. */
+    cleanChecks: number;
+    excessChecks: number;
   } = {
     last: null,
     checks: 0,
@@ -3588,6 +3591,8 @@ export class SignalEngine {
     blindChecks: 0,
     vacuousChecks: 0,
     darkChecks: 0,
+    cleanChecks: 0,
+    excessChecks: 0,
   };
   /**
    * TRA-335 — open equity positions opened against Tradier Live. We keep
@@ -17459,6 +17464,8 @@ export class SignalEngine {
       if (report.status === 'blind') state.blindChecks += 1;
       if (report.status === 'vacuous') state.vacuousChecks += 1;
       if (report.status === 'drift') state.driftChecks += 1;
+      if (report.status === 'clean') state.cleanChecks += 1;
+      if (report.status === 'excess') state.excessChecks += 1;
       if (report.outOfBandContracts > 0) {
         state.outOfBandChecks += 1;
         state.lastOutOfBandAt = report.checkedAt;
@@ -17578,6 +17585,9 @@ export class SignalEngine {
     blindChecks: number;
     vacuousChecks: number;
     darkChecks: number;
+    /** TRA-3890 — counted, not derived by subtraction. */
+    cleanChecks: number;
+    excessChecks: number;
   } {
     return {
       ...this.brokerPositionDrift,

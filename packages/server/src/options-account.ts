@@ -1796,7 +1796,18 @@ export type EngineBasisSkipReason =
   | 'covered_write'
   | 'in_flight'
   | 'broker_premium_unusable'
-  | 'zero_delta';
+  | 'zero_delta'
+  /**
+   * TRA-3890 — the broker's lot is a different size from the engine's row.
+   * Tradier's `/positions` is ONE row per OCC symbol, so `cost_basis / quantity`
+   * is a BLEND across every contract in the account on that symbol. Writing
+   * that blend onto a row of a different size restates the engine's contract
+   * to a price nobody paid for it: on 2026-08-20 a desk-side add of 1 BAC at
+   * $1.17 turned the engine's $1.65 fill into a booked $1.41. Declined, and
+   * counted — the row keeps its own fill, and the mismatch is the drift
+   * detector's `excess` finding, not this sweep's to paper over.
+   */
+  | 'quantity_mismatch';
 
 /** TRA-3010 — bounded so a long-lived process cannot grow this without limit. */
 const ENGINE_BASIS_RESTATEMENT_LOG_CAP = 50;
@@ -2137,6 +2148,7 @@ export class PaperOptionsAccount {
     in_flight: 0,
     broker_premium_unusable: 0,
     zero_delta: 0,
+    quantity_mismatch: 0,
   };
   /** TRA-3010 — engine-opened rows the branch reached at all (the denominator). */
   private engineBasisCandidates = 0;
@@ -7384,6 +7396,22 @@ export class PaperOptionsAccount {
           }
           if (!Number.isFinite(incoming.premiumPaid) || incoming.premiumPaid <= 0) {
             this.engineBasisSkips.broker_premium_unusable += 1;
+            continue;
+          }
+          if (incoming.contracts !== (existing.contractsRemaining ?? existing.contracts)) {
+            // TRA-3890 — see `quantity_mismatch` on the skip union. The blended
+            // broker average is the right basis for the broker's LOT, not for
+            // this row; leave the row's own fill in place and say so.
+            this.engineBasisSkips.quantity_mismatch += 1;
+            accountLog.warn('engine-opened live option: broker lot size differs from the engine row — basis NOT restated', {
+              issue: 'TRA-3890',
+              optionSymbol: existing.optionSymbol,
+              engineContracts: existing.contractsRemaining ?? existing.contracts,
+              brokerContracts: incoming.contracts,
+              enginePremiumPaid: existing.premiumPaid,
+              brokerBlendedPremium: incoming.premiumPaid,
+              note: 'a contract on this symbol was opened or closed outside this engine; see brokerPositionDrift.excess',
+            });
             continue;
           }
           if (Math.abs(existing.premiumPaid - incoming.premiumPaid) <= 1e-6) {

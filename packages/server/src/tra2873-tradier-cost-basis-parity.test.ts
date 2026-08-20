@@ -335,6 +335,12 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
 
       // Broker reports a DIFFERENT quantity — the partial-close bookkeeping
       // owns that field, not the reconcile.
+      //
+      // TRA-3890 — and the PRICE is not restated either. This test used to
+      // assert the opposite (quantity kept, blended price written), which is
+      // exactly what booked BAC at $1.41 against a $1.65 fill on 2026-08-20:
+      // a 99-lot broker average is not the basis of this row's lot.
+      const premiumBefore = before.premiumPaid;
       acct.reconcileTradierPositions([
         { ...buildBrokerPosition(aapl), contracts: 99 },
       ]);
@@ -342,7 +348,8 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
       const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
       expect(after.contracts).toBe(contracts);
       expect(after.contractsRemaining).toBe(contractsRemaining);
-      expect(after.premiumPaid).toBeCloseTo(aapl.brokerCostPerShare, 6);
+      expect(after.premiumPaid).toBe(premiumBefore);
+      expect(acct.getEngineBasisRestatementCensus().skips.quantity_mismatch).toBe(1);
     });
 
     it('leaves an in-flight row alone — the exit poller books the real fill', () => {
@@ -452,6 +459,36 @@ describe('TRA-2873 — live cost basis diverges from Tradier `cost_basis`', () =
       expect(census.restatements).toHaveLength(0);
     });
 
+    it('TRA-3890: refuses to write a blended multi-lot broker average onto a smaller engine row', () => {
+      // 2026-08-20, BAC260925C00063000: the engine filled 1 @ 1.65, a desk-side
+      // add of 1 @ 1.17 made the broker's row 2 contracts / cost_basis 282,
+      // and the restatement wrote 282/2/100 = 1.41 onto the engine's 1-lot row.
+      const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
+      openLive(acct, aapl);
+      const before = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      const premiumBefore = before.premiumPaid;
+      const stopBefore = before.stopLossPremium;
+      const contractsBefore = before.contracts;
+
+      const blended = (aapl.brokerCostPerShare * aapl.contracts + 1.17 * 1) / (aapl.contracts + 1);
+      const summary = acct.reconcileTradierPositions([
+        { ...buildBrokerPosition(aapl), contracts: aapl.contracts + 1, premiumPaid: blended },
+      ]);
+
+      const after = acct.getState().openOptions.find(o => o.optionSymbol === aapl.optionSymbol)!;
+      expect(after.premiumPaid).toBe(premiumBefore);
+      expect(after.stopLossPremium).toBe(stopBefore);
+      expect(after.contracts).toBe(contractsBefore);
+      expect(summary.updated).toBe(0);
+      const census = acct.getEngineBasisRestatementCensus();
+      expect(census.candidates).toBe(1);
+      expect(census.restated).toBe(0);
+      expect(census.skips.quantity_mismatch).toBe(1);
+      expect(census.skips.zero_delta).toBe(0);
+      // NEGATIVE CONTROL: same lot size ⇒ the restatement still runs.
+      acct.reconcileTradierPositions([buildBrokerPosition(aapl)]);
+      expect(acct.getEngineBasisRestatementCensus().restated).toBe(1);
+    });
     it('counts a declined carve-out instead of dropping it silently', () => {
       const acct = new PaperOptionsAccount({ initialEquity: 50_000, tradierEnv: 'production' });
       const opened = openLive(acct, aapl)!;

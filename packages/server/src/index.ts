@@ -305,8 +305,8 @@ import {
 import { summarizeLiveUnmanagedRisk, summarizeLiveExitErrors, mergeQualifiedLiveStopActionability, blindLiveStopActionability } from './options-account.js';
 // TRA-3067 — counts-only projection of the out-of-band-close detector.
 import {
+  foldLiveBrokerDriftStatuses,
   summarizeLiveBrokerPositionDrift,
-  worseBrokerDriftStatus,
 } from './live-broker-position-drift.js';
 // TRA-3117 — per-book live-arm census for /api/health/options-live.
 import { summarizeLiveArmCensus } from './live-arm-census.js';
@@ -11032,49 +11032,65 @@ app.get('/api/health/options-live', async (_req, res) => {
       // Counts only — no OCC symbols. Same TRA-2163 disclosure rule as above;
       // the symbols are in the process log under
       // `component: 'broker-position-drift'` and in authenticated `/api/state`.
-      brokerPositionDrift: getAllUserContexts().reduce(
-        (acc, c) => {
-          const s = c.engine.getLiveBrokerPositionDriftState();
-          const last = summarizeLiveBrokerPositionDrift(s.last);
-          return {
-            status: worseBrokerDriftStatus(acc.status, last.status),
-            checks: acc.checks + s.checks,
-            driftChecks: acc.driftChecks + s.driftChecks,
-            outOfBandChecks: acc.outOfBandChecks + s.outOfBandChecks,
-            outOfBandContractsMax: Math.max(acc.outOfBandContractsMax, s.outOfBandContractsMax),
-            outOfBandContractsLast: acc.outOfBandContractsLast + last.outOfBandContracts,
-            explainedContractsLast: acc.explainedContractsLast + last.explainedContracts,
-            engineRowsCheckedLast: acc.engineRowsCheckedLast + last.engineRowsChecked,
-            blindChecks: acc.blindChecks + s.blindChecks,
-            vacuousChecks: acc.vacuousChecks + s.vacuousChecks,
-            darkChecks: acc.darkChecks + s.darkChecks,
-            lastOutOfBandAt:
-              s.lastOutOfBandAt !== null &&
-              (acc.lastOutOfBandAt === null || s.lastOutOfBandAt > acc.lastOutOfBandAt)
-                ? s.lastOutOfBandAt
-                : acc.lastOutOfBandAt,
-            checkedAt:
-              last.checkedAt !== null && (acc.checkedAt === null || last.checkedAt > acc.checkedAt)
-                ? last.checkedAt
-                : acc.checkedAt,
-          };
-        },
-        {
-          status: 'never_ran' as ReturnType<typeof summarizeLiveBrokerPositionDrift>['status'],
-          checks: 0,
-          driftChecks: 0,
-          outOfBandChecks: 0,
-          outOfBandContractsMax: 0,
-          outOfBandContractsLast: 0,
-          explainedContractsLast: 0,
-          engineRowsCheckedLast: 0,
-          blindChecks: 0,
-          vacuousChecks: 0,
-          darkChecks: 0,
-          lastOutOfBandAt: null as number | null,
-          checkedAt: null as number | null,
-        },
-      ),
+      //
+      // TRA-3890 — `status` is the worst over EVERY user context, and a demo
+      // context is `dark` (`not_live`) on every check, so the headline read
+      // "dark" across the whole first live OTM session while the admin live
+      // check was running and (under the old rule) calling a broker EXCESS
+      // `clean`. Read `liveBookStatus` for the live book's own verdict and
+      // `contextsByLastStatus` for who is dark; `cleanChecks`/`excessChecks`
+      // are counted, so a clean run is no longer inferred by subtraction.
+      brokerPositionDrift: (() => {
+        const states = getAllUserContexts().map(c => c.engine.getLiveBrokerPositionDriftState());
+        const fold = foldLiveBrokerDriftStatuses(states.map(s => s.last));
+        const agg = states.reduce(
+          (acc, s) => {
+            const last = summarizeLiveBrokerPositionDrift(s.last);
+            return {
+              checks: acc.checks + s.checks,
+              driftChecks: acc.driftChecks + s.driftChecks,
+              cleanChecks: acc.cleanChecks + s.cleanChecks,
+              excessChecks: acc.excessChecks + s.excessChecks,
+              outOfBandChecks: acc.outOfBandChecks + s.outOfBandChecks,
+              outOfBandContractsMax: Math.max(acc.outOfBandContractsMax, s.outOfBandContractsMax),
+              outOfBandContractsLast: acc.outOfBandContractsLast + last.outOfBandContracts,
+              excessContractsLast: acc.excessContractsLast + last.excessContracts,
+              explainedContractsLast: acc.explainedContractsLast + last.explainedContracts,
+              engineRowsCheckedLast: acc.engineRowsCheckedLast + last.engineRowsChecked,
+              blindChecks: acc.blindChecks + s.blindChecks,
+              vacuousChecks: acc.vacuousChecks + s.vacuousChecks,
+              darkChecks: acc.darkChecks + s.darkChecks,
+              lastOutOfBandAt:
+                s.lastOutOfBandAt !== null &&
+                (acc.lastOutOfBandAt === null || s.lastOutOfBandAt > acc.lastOutOfBandAt)
+                  ? s.lastOutOfBandAt
+                  : acc.lastOutOfBandAt,
+              checkedAt:
+                last.checkedAt !== null && (acc.checkedAt === null || last.checkedAt > acc.checkedAt)
+                  ? last.checkedAt
+                  : acc.checkedAt,
+            };
+          },
+          {
+            checks: 0,
+            driftChecks: 0,
+            cleanChecks: 0,
+            excessChecks: 0,
+            outOfBandChecks: 0,
+            outOfBandContractsMax: 0,
+            outOfBandContractsLast: 0,
+            excessContractsLast: 0,
+            explainedContractsLast: 0,
+            engineRowsCheckedLast: 0,
+            blindChecks: 0,
+            vacuousChecks: 0,
+            darkChecks: 0,
+            lastOutOfBandAt: null as number | null,
+            checkedAt: null as number | null,
+          },
+        );
+        return { status: fold.status, liveBookStatus: fold.liveBookStatus, liveContexts: fold.liveContexts, notLiveContexts: fold.notLiveContexts, contextsByLastStatus: fold.contextsByLastStatus, ...agg };
+      })(),
       // TRA-2984 — staged exits that reached Tradier and EXPIRED unfilled.
       //
       // This is the one exit failure with no ledger footprint. A fill appends a
