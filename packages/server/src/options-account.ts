@@ -3402,10 +3402,19 @@ export class PaperOptionsAccount {
    * `mode`, the utilization side of the board's aggregate live-OTM cap. See
    * {@link foldOpenPremiumAtRisk} for why this is derived from the open rows
    * and not accumulated in a counter.
+   *
+   * `excludePositionId` (TRA-3872) exists for graders that run AFTER the paper
+   * open has landed on the book but want the at-risk figure WITHOUT the row
+   * being graded: the canary-ceiling seam projects `atRisk + thisOrder`, so a
+   * fold that already contains the order double-counts it — on a flat book a
+   * $82 open graded itself as $164 and refused (the ratified <=$100 canary
+   * order would have refused itself).
    */
-  openPremiumAtRiskForMode(mode: AccountMode): OpenPremiumAtRisk {
+  openPremiumAtRiskForMode(mode: AccountMode, excludePositionId?: string): OpenPremiumAtRisk {
     return foldOpenPremiumAtRisk(
-      Array.from(this.openOptions.values()).filter((p) => (p.mode ?? 'demo') === mode),
+      Array.from(this.openOptions.values()).filter(
+        (p) => (p.mode ?? 'demo') === mode && (excludePositionId === undefined || p.id !== excludePositionId),
+      ),
       // TRA-3829 — this account's resolved arm, not the raw env read, so a book
       // constructed with an explicit `actOnAdoptedBrokerRows` override reports
       // the split the SAME way its own exit path decides.

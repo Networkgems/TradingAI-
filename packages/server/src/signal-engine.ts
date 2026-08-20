@@ -10200,7 +10200,13 @@ export class SignalEngine {
     // census `evaluated` denominator tells "never had to bite" apart from
     // "never wired in" (TRA-3216).
     const canaryCeiling = resolveCanaryCeiling(process.env);
-    const canaryAtRisk = this.optionsAccount.openPremiumAtRiskForMode('live');
+    // TRA-3872 — exclude the row being graded: every caller of this seam opens
+    // the paper position BEFORE mirroring (that is what tradierVoid rolls
+    // back), so a bare fold here already contains this order and
+    // `gradeCanaryCeiling`'s `atRisk + notional` projection double-counted it.
+    // On a flat book that graded an $82 open as $164 — the ratified <=$100
+    // canary order would have been refused by its own ceiling.
+    const canaryAtRisk = this.optionsAccount.openPremiumAtRiskForMode('live', opened.id);
     const canaryVerdict = gradeCanaryCeiling(notionalCost, canaryAtRisk, canaryCeiling);
     recordLiveEnforceDecision(
       'canary_ceiling',

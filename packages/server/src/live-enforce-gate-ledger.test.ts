@@ -44,8 +44,13 @@ describe('live-enforce-gate-ledger', () => {
     // total" bound will spend most of its life at `evaluated > 0, blocked = 0`
     // (the sleeve rarely fills), which is precisely the reading an absent row
     // would forge.
+    // TRA-3836 — `canary_ceiling` joins the census for the strongest version of
+    // the same reason: the key's PRESENCE at `evaluated: 0` is the deployed-bytes
+    // proof the board's <=$100 attended-canary ceiling shipped, before any live
+    // nominee has reached the seam.
     expect(s.byGate.map((g) => g.gate).sort()).toEqual([
       'aggregate_cap',
+      'canary_ceiling',
       'cost_bar',
       'entry_delta_ceiling',
       'entry_delta_ceiling_shadow',

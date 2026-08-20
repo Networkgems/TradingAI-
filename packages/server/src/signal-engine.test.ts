@@ -1694,7 +1694,12 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     return engine;
   }
 
-  function freshScanner(mark = 1.20): StubScanner {
+  // TRA-3872 — mark 0.90 (was 1.20): one contract is $90 of premium, inside the
+  // TRA-3836 <=$100 canary ceiling every live open is now graded against. These
+  // tests exercise MIRROR mechanics, not the ceiling, so their subject order
+  // must be one production could actually place; at $121 the ceiling refused
+  // every open before the broker stub could see it.
+  function freshScanner(mark = 0.90): StubScanner {
     const scanner = new StubScanner();
     scanner.scan.mockResolvedValue({
       symbol: 'AAPL',
@@ -1707,18 +1712,18 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   }
 
   /**
-   * TRA-374 — quote that yields mid 1.20 (matches the scanner's mark) so the
+   * TRA-374 — quote that yields mid 0.90 (matches the scanner's mark) so the
    * smart-open walk submits at mid + 1¢ on the first attempt and a stub fill
-   * at 1.21 reflects what the broker would have given us.
+   * at 0.91 reflects what the broker would have given us.
    */
   function tightQuote() {
-    return { symbol: 'AAPL240705C00200000', bid: 1.15, ask: 1.25 };
+    return { symbol: 'AAPL240705C00200000', bid: 0.85, ask: 0.95 };
   }
 
   it('voids the paper open, surfaces a skip-reason signal, and frees the slot when Tradier ends in canceled', async () => {
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({
-        totalEquity: 1000, totalCash: 300, optionBuyingPower: 999_999,
+        totalEquity: 1000, totalCash: 300, optionBuyingPower: 25_000,
       }),
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 7, status: 'ok' }),
@@ -1729,10 +1734,13 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     };
     const engine = setupLiveEngine(stub, freshScanner());
     // Prime a balance so live-mode sizing has equity to work with. OBP is
-    // intentionally inflated so the pre-checks pass and the test exercises
-    // the post-submit reconciliation path.
+    // comfortably above the order so the pre-checks pass and the test exercises
+    // the post-submit reconciliation path — but NOT the old 999_999: sizing
+    // keys off OBP (cash-account semantics), and that figure sized a 55-contract
+    // ($4,950) ticket the TRA-3836 canary ceiling refuses before the broker
+    // (TRA-3872). $25K sizes to the $150 ticket floor → 1 contract, $90.
     (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
-      totalEquity: 1000, totalCash: 300, optionBuyingPower: 999_999,
+      totalEquity: 1000, totalCash: 300, optionBuyingPower: 25_000,
     };
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
@@ -1838,7 +1846,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
   // candidate — dead centre of the selector's own 0.55–0.65 target — must open.
   it('armed live RV long admits the selector-targeted 0.60 delta (delta band is the RV long own, not the short-premium band)', async () => {
     const stub: TradierLiveStub = {
-      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000 }),
+      getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
@@ -1846,9 +1854,13 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
     };
     // 0.60 delta is the makeCandidate default and sits inside the selector's
     // 0.55–0.65 target band — the gate must not treat it as out-of-band.
+    // TRA-3872 — $25K equity (was $100K): sizing at $100K wants 5 contracts
+    // ($450), which the TRA-3836 canary ceiling refuses before the broker; this
+    // test's subject is the DELTA BAND, so size to the 1 contract ($90) that
+    // can actually reach the seam.
     const engine = setupLiveEngine(stub, freshScanner());
     (engine as unknown as { liveTradierBalance: unknown }).liveTradierBalance = {
-      totalEquity: 100_000, totalCash: 100_000, optionBuyingPower: 100_000,
+      totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
     };
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
@@ -1914,7 +1926,7 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 21, status: 'ok' }),
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
-        id: 21, status: 'filled', exec_quantity: 1, avg_fill_price: 1.21,
+        id: 21, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91,
       })),
     };
     const engine = setupLiveEngine(stub, freshScanner());
@@ -2051,10 +2063,17 @@ describe('SignalEngine — TRA-319 live RV mirror reconciliation', () => {
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 11, status: 'ok' }),
       cancelOrder: vi.fn(),
       waitForOrderTerminalStatus: vi.fn(async (_id: number, _opts?: WaitOpts) => ({
-        id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 1.21,
+        id: 11, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91,
       })),
     };
     const engine = setupLiveEngine(stub, freshScanner());
+    // TRA-3872 — cache the balance like every other armed test here: without it
+    // sizing falls back to PAPER equity (25K × 2% demo risk = $250 → 2
+    // contracts, $180), which the TRA-3836 canary ceiling refuses at the seam.
+    // Live sizing off $25K is the $150 ticket floor → 1 contract, $90.
+    (engine as unknown as { liveTradierBalance: { totalEquity: number; totalCash: number; optionBuyingPower: number } | null }).liveTradierBalance = {
+      totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000,
+    };
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
     expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
@@ -2231,7 +2250,19 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
     expect(state.signals[0].liveSkipReason).toBeUndefined();
   });
 
-  it('opens a sized position when live equity is sufficient (regression check on the override path)', async () => {
+  it('sizes off live equity — and the TRA-3836 canary ceiling refuses the multi-contract order it produces at the broker seam', async () => {
+    // TRA-3872 — this used to assert the sized 2-contract order REACHED the
+    // broker. Under the board's ratified <=$100 attended-canary premium ceiling
+    // (TRA-3836/TRA-3827, compiled default == hard max, env can only lower) a
+    // $200 order can never reach a broker in production, so "the mirror submits
+    // the sized count" is no longer a property live code has — the walk-level
+    // passthrough keeps that coverage in tradier-smart-open.test.ts. What this
+    // test still proves, on the SAME fixture: sizing used the REAL $50K Tradier
+    // equity (the refusal names $200.00 — exactly 2 × $100, a figure the stale
+    // $25K paper equity cannot produce), and the ceiling refuses at the seam
+    // with the order voided rather than clamped (TRA-3688: refuse, never
+    // resize).
+    clearLiveEnforceGateLedger();
     const stub: TradierLiveStub = {
       getAccountBalance: vi.fn(),
       getOptionQuote: vi.fn().mockResolvedValue(tightQuote()),
@@ -2251,12 +2282,25 @@ describe('SignalEngine — TRA-332 live sizing uses real Tradier equity', () => 
 
     await (engine as unknown as { runRelativeValueScan: (s: string[]) => Promise<void> }).runRelativeValueScan(['AAPL']);
 
-    expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+    // Refused BEFORE the broker: no order, no phantom position, slot freed.
+    expect(stub.buyContractsLimit).not.toHaveBeenCalled();
     const state = engine.getState();
-    expect(state.options.openOptions).toHaveLength(1);
-    expect(state.options.openOptions[0].contracts).toBe(2);
+    expect(state.options.openOptions).toHaveLength(0);
+    expect(state.options.dailyOptionsCount).toBe(0);
+    // The reason discloses the sized notional — $200.00 IS the live-equity
+    // sizing assertion — and names the ratified ceiling it exceeded.
     expect(state.signals).toHaveLength(1);
-    expect(state.signals[0].liveSkipReason).toBeUndefined();
+    expect(state.signals[0].liveSkipReason).toContain('canary ceiling REFUSED');
+    expect(state.signals[0].liveSkipReason).toContain('$200.00');
+    expect(state.signals[0].liveSkipReason).toContain('$100.00');
+    // The refusal is on the census with its own reasonCode, so a per-order
+    // bite is distinguishable from an aggregate one.
+    const canary = summarizeLiveEnforceGate('1970-01-01').retained.byGate
+      .find((g) => g.gate === 'canary_ceiling')!;
+    expect(canary).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
+    expect(canary.byReason).toEqual([
+      { reasonCode: 'canary_ceiling_per_order', blocked: 1, share: 1 },
+    ]);
   });
 
   it('falls back to paper equity when tradierLiveOptionsEnabled is false (TRA-357 defense-in-depth gate)', async () => {
@@ -6772,9 +6816,13 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     return closes;
   }
   // Liquid delta-laddered chain around `spot`, ~45 DTE from the trading clock.
-  function chainRows(sym: string, spot: number, iv = 0.45) {
+  // TRA-3872 — `atmPrem` parameterizes the ATM extrinsic: the LIVE tests below
+  // pass 0.9 so a 1-contract open is ~$90 of premium, inside the TRA-3836
+  // <=$100 canary ceiling (at the old flat 2.0 the ~$200 order was refused at
+  // the broker seam before the stub could witness it). Demo tests keep 2.0.
+  function chainRows(sym: string, spot: number, iv = 0.45, atmPrem = 2.0) {
     const rows = [];
-    const extrinsic = (kStrike: number) => Math.max(0.3, 2.0 - 0.08 * Math.abs(kStrike - spot));
+    const extrinsic = (kStrike: number) => Math.max(0.3, atmPrem - 0.08 * Math.abs(kStrike - spot));
     for (let kStrike = spot - 20; kStrike <= spot + 20; kStrike += 1) {
       const putMid = Math.max(kStrike - spot, 0) + extrinsic(kStrike);
       const callMid = Math.max(spot - kStrike, 0) + extrinsic(kStrike);
@@ -7081,13 +7129,14 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
     const stub: DirLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
-      // Tight quote around the ATM call mark (~2.0) so the smart-open walk fills.
-      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 1.96, ask: 2.04 }),
+      // Tight quote around the ATM call mark (~0.9 — see chainRows/TRA-3872) so
+      // the smart-open walk fills inside the <=$100 canary ceiling.
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 0.86, ask: 0.94 }),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 55, status: 'ok' }),
       cancelOrder: vi.fn(),
-      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 55, status: 'filled', exec_quantity: 1, avg_fill_price: 2.01 })),
+      waitForOrderTerminalStatus: vi.fn(async () => ({ id: 55, status: 'filled', exec_quantity: 1, avg_fill_price: 0.91 })),
     };
-    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100, 0.45, 0.9) } });
     const engine = liveDirEngine(svc, stub);
     seedTrend(engine, 'UPP', sawUp(480));
 
@@ -7104,12 +7153,14 @@ describe('SignalEngine — demo directional option entry (TRA-1114)', () => {
     process.env[OPTION_LIVE_DIRECTIONAL_FLAG] = '1';
     const stub: DirLiveStub = {
       getAccountBalance: vi.fn().mockResolvedValue({ totalEquity: 25_000, totalCash: 25_000, optionBuyingPower: 25_000 }),
-      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 1.96, ask: 2.04 }),
+      // ~0.9 ATM (TRA-3872) — the order must clear the canary ceiling so the
+      // broker REJECT below is what this test exercises, not the ceiling.
+      getOptionQuote: vi.fn().mockResolvedValue({ symbol: 'UPPC100', bid: 0.86, ask: 0.94 }),
       buyContractsLimit: vi.fn().mockResolvedValue({ id: 56, status: 'ok' }),
       cancelOrder: vi.fn().mockResolvedValue(undefined),
       waitForOrderTerminalStatus: vi.fn(async () => ({ id: 56, status: 'canceled', reason_description: 'insufficient buying power' })),
     };
-    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100) } });
+    const svc = scannerFor({ UPP: { symbol: 'UPP', spot: 100, expiration: '2024-07-19', rows: chainRows('UPP', 100, 0.45, 0.9) } });
     const engine = liveDirEngine(svc, stub);
     seedTrend(engine, 'UPP', sawUp(480));
 
@@ -7961,7 +8012,11 @@ describe('SignalEngine — TRA-2763 live OTM entry delta floor', () => {
     // by name rather than loosening the total, so the next gate to start
     // recording here is caught the same way these two were.
     expect(retained.find((g) => g.gate === 'aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0 });
-    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(2);
+    // TRA-3836 — and a THIRD: the <=$100 canary ceiling grades every live open
+    // at the broker seam and records BOTH verdicts (an $82 entry on an empty
+    // book is an ADMIT). Same discipline: named row, exact total.
+    expect(retained.find((g) => g.gate === 'canary_ceiling')).toMatchObject({ evaluated: 1, blocked: 0 });
+    expect(summarizeLiveEnforceGate('1970-01-01').decisionsRecorded).toBe(3);
   });
 
   it('flag ON + below-floor live candidate: NO broker order, reason surfaced, ledger counts the REJECT', async () => {
@@ -8259,9 +8314,17 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
     });
 
     it('ADMITS an entry that lands EXACTLY on the cap — boundary inclusive', async () => {
+      // TRA-3872 — the boundary used to be probed at the $750 default (668 + 82),
+      // but an entry landing there is now refused DOWNSTREAM by the TRA-3836
+      // <=$100 canary ceiling, so the broker call this test pins never fires.
+      // Inclusivity is a property of the comparison, not of the number: probe it
+      // at a lowered cap ($8 + $82 = $90 exactly) that fits inside the canary.
+      // The $750 default itself stays pinned by the clamp test below and the
+      // headroom test's `capUsd: 750`.
+      process.env[AGG_VAR] = '90';
       const stub = liveStub();
       const engine = richEngine(stub);
-      seedOpenLivePremium(engine, 750 - ENTRY_USD); // 668 + 82 = 750 exactly
+      seedOpenLivePremium(engine, 90 - ENTRY_USD); // 8 + 82 = 90 exactly
       await runOtm(engine, ['AAPL']);
 
       expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
@@ -8385,29 +8448,34 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
       const VAR = 'LIVE_OPTION_TEST_FLEET_RISK_FRACTION';
       const saved = process.env[VAR];
       try {
-        // A $400 book (v0nni's balance) with $150 already at risk. At the
-        // default φ the budget is $194.32, so a further entry is BLOCKED — and
-        // no broker order is placed.
+        // TRA-3872 — rescaled from v0nni's real $400/$150 shape (loose-side
+        // projection $232 is now refused downstream by the <=$100 canary
+        // ceiling, so the admit this control turns on could never reach the
+        // broker). The discriminating structure is unchanged: same book twice,
+        // only φ moves, and the verdict at the order site flips with it.
+        // A $100 book with $10 already at risk. At the default φ the budget is
+        // $48.58, so a further $82 entry is BLOCKED — no broker order.
         const tightStub = liveStub();
-        const tight = bookWithCash(tightStub, 400);
-        seedOpenLivePremium(tight, 150);
+        const tight = bookWithCash(tightStub, 100);
+        seedOpenLivePremium(tight, 10);
         await runOtm(tight, ['AAPL']);
         expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 1 });
         expect(tightStub.buyContractsLimit).not.toHaveBeenCalled();
 
         // Same book, same balance, same already-at-risk, same candidate — the
-        // ONLY thing that changes is the env scalar. φ=1 ⇒ budget $400 ⇒ the
-        // SAME entry is now ADMITTED and the order goes to the broker.
+        // ONLY thing that changes is the env scalar. φ=1 ⇒ budget $100 ⇒ the
+        // SAME entry ($10 + $82 = $92) is now ADMITTED and goes to the broker
+        // (inside the canary ceiling too, so nothing downstream re-refuses it).
         process.env[VAR] = '1';
         const looseStub = liveStub();
-        const loose = bookWithCash(looseStub, 400);
-        seedOpenLivePremium(loose, 150);
+        const loose = bookWithCash(looseStub, 100);
+        seedOpenLivePremium(loose, 10);
         await runOtm(loose, ['AAPL']);
         // `evaluated` advances, `blocked` does NOT — the delta is the admit.
         expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 2, blocked: 1 });
         expect(looseStub.buyContractsLimit).toHaveBeenCalledTimes(1);
         expect(loose.getLiveOtmAggregateExposure()).toMatchObject({
-          capUsd: 400, fleetRiskFraction: 1,
+          capUsd: 100, fleetRiskFraction: 1,
         });
       } finally {
         if (saved === undefined) delete process.env[VAR];
@@ -8432,6 +8500,69 @@ describe('SignalEngine — TRA-3216 live OTM underlying allowlist', () => {
       const engine = engineFor('demo', liveStub());
       expect(engine.getLiveOtmAggregateExposure()).toMatchObject({
         mode: 'demo', liveEntryGateOpen: false,
+      });
+    });
+
+    // ── TRA-3872 (parent TRA-3836) — the <=$100 canary ceiling at the SAME
+    // seam, engine-level. The pure grader has its own suite
+    // (canary-ceiling.test.ts); these pin the one thing that suite cannot see
+    // and that shipped wrong: what the CALL SITE feeds it. Every caller opens
+    // the paper row BEFORE mirroring, so a bare fold already contained the
+    // order and the projection double-counted it — an $82 open on a FLAT book
+    // graded as $164 and refused itself (the ratified canary order included).
+    describe('composes with the <=$100 canary ceiling (TRA-3836/TRA-3872)', () => {
+      it('REFUSES on the true aggregate: $30 held + $82 entry = $112 > $100, with its own reasonCode', async () => {
+        const stub = liveStub();
+        const engine = richEngine(stub);
+        seedOpenLivePremium(engine, 30);
+        await runOtm(engine, ['AAPL']);
+
+        // Refused at the broker seam — the sleeve cap upstream ADMITTED it
+        // ($112 <= $750), so the block is attributable to the canary alone.
+        expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+        expect(gateOf('aggregate_cap')).toMatchObject({ evaluated: 1, blocked: 0 });
+        const canary = gateOf('canary_ceiling');
+        expect(canary).toMatchObject({ evaluated: 1, blocked: 1, blockRate: 1 });
+        expect(canary.byReason).toEqual([
+          { reasonCode: 'canary_ceiling_aggregate', blocked: 1, share: 1 },
+        ]);
+        // The paper open is VOIDED (only the seed remains) and the reason
+        // discloses the true held figure — $30, not a self-inclusive $112.
+        expect(engine.getState().options.openOptions).toHaveLength(1);
+        const sig = engine.getState().signals.find((s) => s.symbol === 'AAPL')!;
+        expect(sig.liveSkipReason).toContain('canary ceiling REFUSED');
+        expect(sig.liveSkipReason).toContain('$30 already at risk');
+      });
+
+      it('ADMITS exactly at the ceiling — $18 held + $82 entry = $100 (the graded order is not double-counted)', async () => {
+        // THE TRA-3872 regression: pre-fix the fold already contained the $82
+        // paper open, so this graded as $18 + $82 + $82 = $182 and refused.
+        const stub = liveStub();
+        const engine = richEngine(stub);
+        seedOpenLivePremium(engine, 18);
+        await runOtm(engine, ['AAPL']);
+
+        expect(stub.buyContractsLimit).toHaveBeenCalledTimes(1);
+        expect(gateOf('canary_ceiling')).toMatchObject({ evaluated: 1, blocked: 0, blockRate: 0 });
+        expect(engine.getState().options.openOptions).toHaveLength(2);
+      });
+
+      it('REFUSES while any OTHER open live row is unpriced — an understated aggregate cannot be graded', async () => {
+        const stub = liveStub();
+        const engine = richEngine(stub);
+        seedOpenLivePremium(engine, 30);
+        // Strip the seed's cost basis: the shape imported/desk rows arrive in
+        // (TRA-3829). It now counts $0 toward the fold, so the fold UNDERSTATES.
+        const acct = (engine as unknown as { optionsAccount: PaperOptionsAccount }).optionsAccount;
+        acct.getState().openOptions[0]!.premiumPaid = 0;
+        await runOtm(engine, ['AAPL']);
+
+        expect(stub.buyContractsLimit).not.toHaveBeenCalled();
+        const canary = gateOf('canary_ceiling');
+        expect(canary).toMatchObject({ evaluated: 1, blocked: 1 });
+        expect(canary.byReason).toEqual([
+          { reasonCode: 'canary_ceiling_unpriced_rows', blocked: 1, share: 1 },
+        ]);
       });
     });
   });
